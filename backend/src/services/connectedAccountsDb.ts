@@ -1053,7 +1053,7 @@ const HUBSPOT_PORTAL_MAP_TTL_MS = 5 * 60 * 1000;
 // found within seconds, not minutes (the webhook handler drops events for an unknown portal).
 const HUBSPOT_PORTAL_MISS_REFRESH_MS = 30 * 1000;
 let hubspotPortalMapGeneration = 0;
-type HubSpotPortalMap = { byPortal: Map<unknown, string>; at: number };
+type HubSpotPortalMap = { byPortal: Map<unknown, string>; at: number; invalidated?: boolean };
 let hubspotPortalMap: HubSpotPortalMap | null = null;
 let hubspotPortalMapInflight: Promise<HubSpotPortalMap> | null = null;
 
@@ -1118,9 +1118,17 @@ export const getUserIdByHubSpotPortalId = async (portalId: number): Promise<stri
     const hit = cached.byPortal.get(portalId);
     if (hit !== undefined) {
       if ((await ownerStillHoldsPortal(hit, portalId)) !== false) return hit;
-      // The cached owner no longer holds this portal: drop the snapshot and rebuild below.
+      // The cached owner no longer holds this portal. Invalidate THIS snapshot once, however many
+      // callers notice: the first one drops any rebuild that started before the change (so it can
+      // neither be joined nor published) and starts a fresh one; the rest join that rebuild instead
+      // of each forcing another full scan. The snapshot itself is kept as the fallback, so other
+      // portals keep resolving if the rebuild fails.
       cachedOwnerIsStale = true;
-      clearHubSpotPortalCache();
+      if (!cached.invalidated) {
+        cached.invalidated = true;
+        hubspotPortalMapGeneration++;
+        hubspotPortalMapInflight = null;
+      }
     } else if (Date.now() - cached.at < HUBSPOT_PORTAL_MISS_REFRESH_MS) {
       return null;
     }
