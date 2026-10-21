@@ -12,7 +12,7 @@
  * What it proves: on Stripe's own Basil invoice fixture the legacy fields are gone (`invoice.subscription`,
  * `line.price`), the new ones exist where the helper reads them (`parent.subscription_details.subscription`
  * as an id or, expanded, an object; `line.pricing`), and the real paid-invoice handler resolves the
- * subscription from that payload and syncs it through a `subscriptions.retrieve` stripe-mock accepts.
+ * subscription from that payload and syncs it from stripe-mock's subscription fixture.
  * It also covers the Basil `discounts` move found while fixing ENG-2599: a subscription retrieved or
  * listed with the `discounts` / `data.discounts` expansion has a `discounts` array and no `discount`, a
  * Discount embeds `coupon` directly (no `source` wrapper in this version), and the real subscription
@@ -91,7 +91,8 @@ suite('ENG-2599 Basil invoice fields on stripe-mock', () => {
 
     const update = (userDb.updateUser as jest.Mock).mock.calls[0][1];
     expect(update.stripe_subscription_id).toBe(invoice.parent?.subscription_details?.subscription);
-    // subscriptions.retrieve (with its discounts expansion) was accepted: no sync-failure warning.
+    // The sync ran (no sync-failure warning). stripe-mock accepts any expand path on reads, so this does
+    // not validate `discounts` as an expansion; that rests on the SDK docs (Subscriptions.d.ts `discounts`).
     expect(warn).not.toHaveBeenCalledWith(expect.stringContaining('period_end sync'));
     expect(update.current_period_end).toEqual(expect.any(String));
   });

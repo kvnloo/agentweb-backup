@@ -6,7 +6,7 @@
  * (stripe/types/Discounts.d.ts). The old code read `subscription.discount` and expanded `discount.coupon`,
  * so every offer was stored as null. Legacy-shaped coverage stays in stripeOfferSync.test.ts.
  *
- * Rules under test: the first entry of `discounts` (Stripe's order) wins; the legacy `discount` is the
+ * Rules under test: the first listed entry of `discounts` wins (deterministic); the legacy `discount` is the
  * fallback when that entry is not expanded; an id-only discount in a webhook payload is fetched expanded,
  * and a failed fetch leaves activeOffer unchanged rather than clearing it.
  */
@@ -149,7 +149,7 @@ describe('handleSubscriptionUpdated — Basil discounts', () => {
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('activeOffer left unchanged'));
   });
 
-  it('several discounts: the first in Stripe order wins, deterministically', async () => {
+  it('several discounts: the first listed wins, deterministically', async () => {
     await handleSubscriptionUpdated(basilSubscription([
       discount('di_first', coupon('coup_first', { percent_off: 20 })),
       discount('di_second', coupon('coup_second', { percent_off: 50 })),
