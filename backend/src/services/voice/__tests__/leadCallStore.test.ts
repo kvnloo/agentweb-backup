@@ -40,6 +40,7 @@ function installFakeDb(leads: Record<string, Row>) {
     async (l: string, i: string, key: string, op: Row) => {
       const rec = rowOf(l, i)?.system?.[key];
       if (!rec || !op.stateIn.includes(rec.state)) return false;
+      for (const [field, expected] of Object.entries<unknown>(op.whenEquals ?? {})) if (rec[field] !== expected) return false;
       for (const [field, entries] of Object.entries<Record<string, number>>(op.maxIn ?? {})) {
         for (const [k, n] of Object.entries(entries)) {
           if (rec[field][k] !== undefined && !(rec[field][k] < n)) return false;
@@ -180,6 +181,13 @@ describe('leadCallStore transition', () => {
     expect((await store.get(LIST, LEAD))?.attemptNo).toBe(1);
     expect(await store.transition(LIST, LEAD, ['dialing'], { state: 'between_attempts', attemptNo: 2, memberId: 'mbbbbbbb', triedMemberIds: ['mbbbbbbb'] })).toBe(true);
     expect(await store.get(LIST, LEAD)).toMatchObject({ attemptNo: 2, memberId: 'mbbbbbbb', triedMemberIds: ['maaaaaaa', 'mbbbbbbb'] });
+  });
+
+  it('applies a patch that names an attempt only while the record is on that attempt', async () => {
+    const store = getLeadCallStore();
+    expect(await store.transition(LIST, LEAD, ['dialing'], { state: 'between_attempts', ifAttemptNo: 2 })).toBe(false);
+    expect((await store.get(LIST, LEAD))?.state).toBe('dialing');
+    expect(await store.transition(LIST, LEAD, ['dialing'], { state: 'between_attempts', ifAttemptNo: 1 })).toBe(true);
   });
 
   it('seeds triedMemberIds on create so later appends have a list to extend', async () => {

@@ -18,6 +18,8 @@ import { crmDb, userDb, orgDb } from '../services/db';
 import * as queue from '../services/asyncJobQueue';
 import { processHotLeadCallJob, registerHotLeadCallProcessor } from '../services/hotLeadCallService';
 import { processHotLeadCallNextAttempt, requestNextHotLeadCallAttempt } from '../services/hotLeadCallAttempts';
+import { placeMemberCall } from '../services/hotLeadCallPlacement';
+import { hotLeadCallConfigOf } from '../services/hotLeadCallConfig';
 import { setHotLeadCallEnabledOverride } from '../services/voice/hotLeadCallMode';
 import { setHotLeadCallEntitledOverride } from '../services/voice/hotLeadCallEntitlement';
 import { FakeVoiceProvider } from './helpers/fakeVoiceProvider';
@@ -319,6 +321,18 @@ describe('processHotLeadCallNextAttempt', () => {
     await processHotLeadCallNextAttempt(nextJob(record));
     expect(provider.placedCalls).toHaveLength(2);
     expect(store.record).toMatchObject({ state: 'member_ringing', attemptNo: 2 });
+  });
+
+  it('a stale job cannot take the lock of a record that has moved on to a later attempt', async () => {
+    const record = await firstAttemptEnds();
+    // The record has since gone on to attempt 3 and is waiting again; the stale job still believes attempt 1 just ended.
+    store.record = { ...store.record!, attemptNo: 3, state: 'between_attempts', triedMemberIds: [ID.c, ID.d, ID.e] };
+    await placeMemberCall({
+      orgId: 'org-a', listId: 'list-a', leadId: 'lead-a', jobKey: record.jobKey, config: hotLeadCallConfigOf(org.hotLeadCall)!,
+      callerNumber: '+14155550111', candidates: [referenceMember('b', '00:00', '24:00')], attemptNo: 2,
+    });
+    expect(provider.placedCalls).toHaveLength(1);
+    expect(store.record).toMatchObject({ state: 'between_attempts', attemptNo: 3 });
   });
 
   describe('when closing the waiting record fails', () => {

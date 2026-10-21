@@ -38,6 +38,7 @@ export class FakeLeadCallStore implements LeadCallStore {
     if ((patch.clear ?? []).some((f) => patch[f] !== undefined)) throw new Error(`${patch.clear} is both set and cleared`);
     const r = this.record;
     if (!r || from.length === 0 || from.some((s) => TERMINAL.includes(s)) || !from.includes(r.state)) return false;
+    if (patch.ifAttemptNo !== undefined && r.attemptNo !== patch.ifAttemptNo) return false;
     const seq = patch.lastSequence ?? {};
     if (Object.entries(seq).some(([k, v]) => r.lastSequence?.[k] !== undefined && r.lastSequence[k] >= v)) return false;
     const legs = [...new Set(patch.meteredLegs ?? [])];

@@ -22,6 +22,7 @@ interface UpdateOp {
   stateIn: string[];
   set?: Json;
   remove?: string[];
+  whenEquals?: Record<string, string | number>;
   maxIn?: Record<string, Record<string, number>>;
   appendNew?: Record<string, string[]>;
 }
@@ -109,6 +110,7 @@ export class FakeCrm {
       const rec = this.leadOf(listId, leadId)?.system?.[key] as Json | undefined;
       if (!rec || op.stateIn.length === 0 || !op.stateIn.includes(rec.state as string)) return false;
       // Check every condition before writing anything, like one conditional UpdateItem.
+      for (const [field, expected] of Object.entries(op.whenEquals ?? {})) if (rec[field] !== expected) return false;
       for (const [field, entries] of Object.entries(op.maxIn ?? {})) {
         if (Object.keys(entries).length && (typeof rec[field] !== 'object' || rec[field] === null)) throw new Error(`maxIn map ${field} was not initialised`);
         for (const [entry, n] of Object.entries(entries)) {

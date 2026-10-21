@@ -98,6 +98,7 @@ class DynamoLeadCallStore implements LeadCallStore {
       stateIn: from,
       set: { ...scalarFields(patch), updatedAt: new Date().toISOString() },
       remove: patch.clear,
+      whenEquals: patch.ifAttemptNo === undefined ? undefined : { attemptNo: patch.ifAttemptNo },
       maxIn: patch.lastSequence ? { lastSequence: patch.lastSequence } : undefined,
       appendNew: { meteredLegs: legs, triedMemberIds: [...new Set(patch.triedMemberIds ?? [])] },
     });

@@ -17,6 +17,7 @@ import { selectHotLeadCallCandidates } from './hotLeadCallRoster';
 import { NEXT_ATTEMPT_SOURCE, processHotLeadCallNextAttempt } from './hotLeadCallAttempts';
 import { holdsClaim, placeMemberCall, type PlacementResult } from './hotLeadCallPlacement';
 import { runQueuedHotLeadJob } from './hotLeadCallQueue';
+import { nextAttemptOrFinish } from './voice/callFinalisation';
 import { errorText, isNonEmpty, MINUTE_MS } from './hotLeadCallText';
 // This file must not import orgLeadNotificationService: that module calls dispatchHotLeadCall.
 
@@ -210,6 +211,18 @@ async function reserveAndPlace(job: HotLeadCallJob, reviewed: Reviewed & { candi
 }
 
 /**
+ * A queue poller re-runs a job whose process died. When this job's own record is waiting between attempts (its first
+ * member was rejected and the pass did not get further) nothing else will ever move it: no call is in flight, so no
+ * callback will come. It is handed to the next-attempt path, which queues the next member or finishes the record.
+ */
+async function resumedWaitingRecord(job: HotLeadCallJob): Promise<boolean> {
+  const record = await getLeadCallStore().get(job.listId, job.leadId);
+  if (!record || record.jobKey !== keyOf(job) || record.state !== 'between_attempts') return false;
+  await nextAttemptOrFinish({ listId: job.listId, leadId: job.leadId, jobKey: record.jobKey, leg: 'member' }, record.outcome ?? 'place_rejected');
+  return true;
+}
+
+/**
  * Re-runs the gates, then rings the first available member, at most once per lead. The call record is the
  * at-most-once control: store.create is create-if-absent, so a lost create means a record already exists for
  * this lead and we never dial, and a throw means nothing was dialed and the job fails (the queue row dedupes
@@ -218,6 +231,7 @@ async function reserveAndPlace(job: HotLeadCallJob, reviewed: Reviewed & { candi
  */
 export async function processHotLeadCallJob(job: HotLeadCallJob): Promise<void> {
   if (!job || !isNonEmpty(job.orgId) || !isNonEmpty(job.listId) || !isNonEmpty(job.leadId)) throw new Error('Invalid hot lead call job');
+  if (await resumedWaitingRecord(job)) return;
   const ready = await preflight(job);
   if (ready) await reserveAndPlace(job, ready);
 }

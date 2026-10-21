@@ -83,7 +83,12 @@ export type HotLeadCallEventType =
 type ClearableField = 'memberCallSid' | 'outcome';
 
 /** What a transition changes. `clear` removes fields; a field cannot be both set and cleared in one patch. */
-export type HotLeadCallPatch = Partial<HotLeadCallRecord> & { state: HotLeadCallState; clear?: ClearableField[] };
+export type HotLeadCallPatch = Partial<HotLeadCallRecord> & {
+  state: HotLeadCallState;
+  clear?: ClearableField[];
+  /** Applies only while the record is on this attempt, so a stale writer cannot move a record that has gone on. */
+  ifAttemptNo?: number;
+};
 
 export interface LeadCallStore {
   get(listId: string, leadId: string): Promise<HotLeadCallRecord | null>;

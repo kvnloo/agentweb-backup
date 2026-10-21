@@ -154,6 +154,8 @@ async function tryMember(
       // The new attempt starts without the previous attempt's call sid and outcome.
       : await store.transition(listId, leadId, ['between_attempts'], {
         state: 'dialing', attemptNo, memberId: member.id, triedMemberIds: [member.id], claimToken, clear: ['memberCallSid', 'outcome'],
+        // Only from the attempt just before this one: a stale job cannot take a record that has gone on or ended later.
+        ifAttemptNo: attemptNo - 1,
       });
   } catch (err) {
     failure = err;
@@ -211,18 +213,27 @@ export async function placeMemberCall(input: PlacementInput): Promise<PlacementR
   let attemptNo = input.attemptNo;
   let rejected = false;
 
-  for (const member of input.candidates) {
-    if (attemptNo > config.maxAttemptsPerLead) break;
-    const turn = await tryMember(context, member, attemptNo, pendingCreate);
-    if (turn === 'cooldown') continue;
-    if (turn !== 'rejected') return turn;
-    pendingCreate = undefined;
-    recordExists = true;
-    rejected = true;
-    attemptNo++;
+  try {
+    for (const member of input.candidates) {
+      if (attemptNo > config.maxAttemptsPerLead) break;
+      const turn = await tryMember(context, member, attemptNo, pendingCreate);
+      if (turn === 'cooldown') continue;
+      if (turn !== 'rejected') return turn;
+      pendingCreate = undefined;
+      recordExists = true;
+      rejected = true;
+      attemptNo++;
+    }
+    if (!recordExists) return 'none';
+    await closeBetweenAttempts(context.store, listId, leadId, rejected ? 'place_rejected' : 'no_member_available', rejected ? 'rejected' : 'completed');
+    return 'closed';
+  } catch (err) {
+    // After a rejected call the record waits between attempts with no call in flight, so no callback will ever come
+    // for it: whatever broke the pass, the record is closed here (a first attempt's job and a next attempt's alike).
+    if (rejected) {
+      await closeBetweenAttempts(context.store, listId, leadId, 'next_attempt_failed', 'errored')
+        .catch((closeErr) => console.warn('[hotLeadCall] call record not closed', { listId, leadId, error: errorText(closeErr) }));
+    }
+    throw err;
   }
-
-  if (!recordExists) return 'none';
-  await closeBetweenAttempts(context.store, listId, leadId, rejected ? 'place_rejected' : 'no_member_available', rejected ? 'rejected' : 'completed');
-  return 'closed';
 }

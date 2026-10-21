@@ -98,6 +98,14 @@ suite('hot-lead call store against DynamoDB Local', () => {
     await expect(store.transition(LIST, leadId, ['dialing'], { state: 'dialing', memberCallSid: SID_B, clear: ['memberCallSid'] })).rejects.toThrow('both set and removed');
   });
 
+  it('applies a patch that names an attempt only while the record is on that attempt (a real equality condition)', async () => {
+    const leadId = await newLead();
+    await store.create(LIST, leadId, baseRecord);
+    expect(await store.transition(LIST, leadId, ['dialing'], { state: 'between_attempts', ifAttemptNo: 2 })).toBe(false);
+    expect((await store.get(LIST, leadId))?.state).toBe('dialing');
+    expect(await store.transition(LIST, leadId, ['dialing'], { state: 'between_attempts', ifAttemptNo: 1 })).toBe(true);
+  });
+
   it('keeps sibling system keys when creating', async () => {
     const leadId = await newLead({ system: { linkedInConnectionNotifiedAt: 'x' } });
     expect(await store.create(LIST, leadId, baseRecord)).toBe(true);

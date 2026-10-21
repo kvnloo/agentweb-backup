@@ -14,7 +14,8 @@ jest.mock('../services/leadNotificationLookup', () => ({ notificationLookup: { p
 jest.mock('@slack/web-api', () => ({ WebClient: jest.fn() }));
 
 import * as queue from '../services/asyncJobQueue';
-import { chicago, flush, installWorld, nthCall, record, rungPhones, setClock, submitLead, usageSummary, world } from './helpers/hotLeadCallE2eWorld';
+import { processHotLeadCallJob } from '../services/hotLeadCallService';
+import { LIST, chicago, flush, installWorld, nthCall, record, rungPhones, setClock, submitLead, usageSummary, world } from './helpers/hotLeadCallE2eWorld';
 import { REFERENCE_ID as ID, REFERENCE_PHONE as PHONE, referenceTeam } from './helpers/hotLeadCallFixtures';
 
 installWorld();
@@ -206,6 +207,53 @@ describe.each(['before', 'after', 'afterFalse'] as const)('a rejected placement 
   });
 });
 
+describe('a rejected placement followed by a failure in the same first-attempt job', () => {
+  it.each([
+    ['before', [PHONE.c], 'failed'],
+    ['after', [PHONE.c, PHONE.d], 'member_ringing'],
+    ['afterFalse', [PHONE.c, PHONE.d], 'member_ringing'],
+  ] as const)('the next member\'s lock write fails (%s): the record is not left waiting', async (mode, phones, state) => {
+    setClock(chicago('16:00'));
+    world.provider.failNextPlaceCall('no'); // C is rejected
+    arm('updateLeadSystemRecordIf', 2, mode); // 1 = the rejection is recorded, 2 = D's lock
+    await submitLead('lead-a');
+    expect(rungPhones()).toEqual(phones);
+    expect(record().state).toBe(state);
+    if (state === 'failed') expect(record().outcome).toBe('next_attempt_failed');
+  });
+
+  it('the limit store fails when the next member\'s cooldown is claimed: the record is closed, nobody else is rung', async () => {
+    setClock(chicago('16:00'));
+    world.provider.failNextPlaceCall('no');
+    const claim = world.limits.claim.bind(world.limits);
+    let claims = 0;
+    jest.spyOn(world.limits, 'claim').mockImplementation(async (...args) => {
+      if (++claims === 3) throw new Error('limit store down'); // 1 = phone marker, 2 = C's cooldown, 3 = D's cooldown
+      return claim(...args);
+    });
+    await submitLead('lead-a');
+    expect(rungPhones()).toEqual([PHONE.c]);
+    expect(record()).toMatchObject({ state: 'failed', outcome: 'next_attempt_failed' });
+  });
+
+  it('the job dies with the record waiting (the close fails too): the poller\'s re-run hands it on instead of losing it', async () => {
+    setClock(chicago('16:00'));
+    world.provider.failNextPlaceCall('no');
+    failLockWriteOnce();
+    failClosingWrites(2);
+    await submitLead('lead-a');
+    expect(record().state).toBe('between_attempts');
+
+    // What the queue poller does with a row left processing: run the same job again.
+    await processHotLeadCallJob({ orgId: 'org-a', listId: LIST, leadId: 'lead-a', origin: 'form_fill' });
+    await flush();
+    await noAnswerChain();
+
+    expect(['finished', 'failed']).toContain(record().state);
+    expect(new Set(rungPhones()).size).toBe(rungPhones().length);
+  });
+});
+
 describe('a write that did not land', () => {
   it('/gather: a bridging transition that failed hangs up and leaves the member leg to hand over', async () => {
     setClock(chicago('16:00'));
@@ -283,7 +331,7 @@ describe('a double fault: the lock write fails and so do both writes that close 
     await retrying(() => nthCall(1).memberLegEnds('completed', '9'));
     await noAnswerChain();
 
-    expect(['finished', 'failed']).toContain(record().state);
+    expect(record().state).toBe('finished');
     expect(new Set(rungPhones()).size).toBe(rungPhones().length);
   });
 

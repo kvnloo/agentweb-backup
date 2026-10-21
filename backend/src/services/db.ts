@@ -5455,6 +5455,8 @@ interface LeadRecordUpdateOp {
   stateIn: string[];
   set?: Record<string, unknown>;
   remove?: string[];
+  /** Fields that must currently hold exactly these values. */
+  whenEquals?: Record<string, string | number>;
   maxIn?: Record<string, Record<string, number>>;
   appendNew?: Record<string, string[]>;
 }
@@ -5478,6 +5480,15 @@ const addSetClauses = (p: ExpressionParts, set: Record<string, unknown>): void =
     p.names[`#f${p.n}`] = field;
     p.values[`:v${p.n}`] = v;
     p.set.push(`#system.#k.#f${p.n} = :v${p.n}`);
+    p.n++;
+  }
+};
+
+const addEqualsConditions = (p: ExpressionParts, whenEquals: Record<string, string | number>): void => {
+  for (const [field, expected] of Object.entries(whenEquals)) {
+    p.names[`#f${p.n}`] = field;
+    p.values[`:v${p.n}`] = expected;
+    p.conditions.push(`#system.#k.#f${p.n} = :v${p.n}`);
     p.n++;
   }
 };
@@ -5541,6 +5552,7 @@ function leadRecordUpdateExpression(key: string, op: LeadRecordUpdateOp) {
   op.stateIn.forEach((s, i) => { p.values[`:from${i}`] = s; });
   addSetClauses(p, op.set ?? {});
   addRemoveClauses(p, op.remove ?? []);
+  addEqualsConditions(p, op.whenEquals ?? {});
   addMaxInClauses(p, op.maxIn ?? {});
   addAppendClauses(p, op.appendNew ?? {});
   return {
@@ -11088,6 +11100,7 @@ export const crmDb = {
    * no-op rather than a partial write:
    *  - `stateIn`: the record's current `state` must be one of these (a missing record fails too);
    *  - `set`: plain field overwrites (undefined values are skipped);
+   *  - `whenEquals`: fields that must currently hold exactly these values, else nothing is written;
    *  - `remove`: fields deleted from the record (absent ones are fine); a field that is also in `set` is refused;
    *  - `maxIn`: per-entry numeric maps, e.g. { lastSequence: { [callSid]: 3 } }; an entry is written only
    *    if it is higher than the stored one (or absent), otherwise the whole patch fails;
