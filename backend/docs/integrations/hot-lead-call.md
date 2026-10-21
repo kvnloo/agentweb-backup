@@ -165,10 +165,15 @@ next attempt again. That request is idempotent (the queue key, then the
 the same payload; a row that failed is not reclaimed (both sources run with `maxAttempts: 1`). For a first-attempt
 job (`hot_lead_call`) a re-run finds the lead's record already created, so it dials nothing: it only resumes the case
 above (its own record waiting between attempts). A record left `dialing` by a first attempt that died is not retried
-(see Stuck records). For a next-attempt job (`hot_lead_call_next`) a re-run acts only on a record that is still
-`between_attempts` for the same attempt number: if the lock had not been taken it carries on and places the call; if it
-had, it stops and the record is a Stuck-records case (and if that attempt was then rejected, the record waits at the
-next attempt number and the re-run returns silently: see the `between_attempts` bullet there).
+(see Stuck records). For a next-attempt job (`hot_lead_call_next`) a re-run acts on a record of the same call that is
+`between_attempts` at the job's attempt number or at a LATER one. At the job's number the lock had not been taken, so
+it carries on and places the call. At a later number the job's own earlier run took the lock for the next attempt,
+Twilio rejected that placement and the process died before the record was closed; such a record has no call sid, so no
+callback can ever resolve it, and the re-run carries the chain on from the record's current attempt (members already
+tried are excluded; `maxAttemptsPerLead`, the lead's age, the calling hours, the kill switch and the plan are checked
+again, and it closes the record when nobody is left). It leaves alone a record at an earlier attempt number, a record
+of another call and a record that is not waiting. If the earlier run's call was placed (the record is `dialing` or
+further on) the re-run stops and the record is a Stuck-records case.
 
 **Writes that commit and then report an error.** A store write can apply and still throw (a timeout after the
 commit). The steps that decide who dials write a random `claimToken` onto the record: creating the record (first
@@ -192,8 +197,8 @@ outcome `place_rejected` where it stands (no call exists, so nothing else would 
 unreadable record, or one that is not ours, is left alone and the pass ends: that is the `dialing` stuck-record case below.
 
 Closing a waiting record is tried twice and then thrown, so the job fails (the queue row is marked failed) instead of
-reporting a close that did not happen, and the record stays `between_attempts`. A replayed final callback of the attempt
-that ended then asks for the next attempt again: the queue key is a duplicate, and a duplicate whose row FAILED is
+reporting a close that did not happen, and the record stays `between_attempts`. When the record waits right after an
+attempt that had a call, a replayed final callback of that attempt then asks for the next attempt again: the queue key is a duplicate, and a duplicate whose row FAILED is
 cleared and queued again (a pending, running or completed row is left alone), so the job runs once more. That needs a
 replay: Twilio redelivers a final status callback only when we answered it with a 5xx, so a record whose failure
 happened after we answered 200 waits until someone replays the callback (or it is repaired as under Stuck records).
@@ -867,12 +872,14 @@ mid-call. No cron cleans these up and no operator tool lists them.
   of the leg's final callback re-drives the job (a failed queue row is cleared and
   queued again). Twilio replays only after a 5xx, so otherwise it stays until someone
   replays the callback or the record is repaired. A job whose process died is re-run by
-  the queue poller after 5 minutes (see What the queue poller does). That resumes a first-attempt job's own
-  waiting record and a next-attempt job that had not yet taken the lock. It does not help when the next-attempt
-  job HAD taken the lock and its attempt was then rejected: the record waits at the next attempt number, the
-  re-run is for the earlier number and returns silently (attempt mismatch). The recovery then is to replay the final
-  status callback of the last attempt that had a call (its `<sid>#ended` marker is what the replay finds), which asks for
-  the next attempt again. No call is in flight; the lead is simply not called again until then.
+  the queue poller after 5 minutes (see What the queue poller does), which resumes a first-attempt job's own
+  waiting record and carries a next-attempt job on, including the case where the job's own lock was rejected and the
+  record now waits at a later attempt number with no call sid (a replayed callback cannot help that one: `/status`
+  acknowledges a callback for a record that has no call sid, so only the job's re-run recovers it). A row that
+  FAILED is not re-run by the poller: its error path normally closed the record already, and if that close failed too
+  the record is repaired by hand when it has no call sid (Harsha's approval), or healed by replaying the final callback
+  when it waits right after an attempt that had a call (a failed row is then cleared and queued again). No call is in
+  flight; the lead is simply not called again until then.
 - `bridging` with no `leadCallSid`, and older than 10 minutes: the member pressed 1 and the move to `bridging` may have
   landed with its re-reads failing, so the member was hung up on and no lead leg exists. To find either this or the
   `dialing` case above, run the read-only scan above with `:cutoff` set to 10 minutes ago, keep the rows where

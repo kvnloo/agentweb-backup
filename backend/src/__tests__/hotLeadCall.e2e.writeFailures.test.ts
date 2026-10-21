@@ -15,8 +15,9 @@ jest.mock('@slack/web-api', () => ({ WebClient: jest.fn() }));
 
 import * as queue from '../services/asyncJobQueue';
 import { processHotLeadCallJob } from '../services/hotLeadCallService';
+import { processHotLeadCallNextAttempt as processNextAttemptJob } from '../services/hotLeadCallAttempts';
 import { LIST, chicago, flush, installWorld, nthCall, record, rungPhones, setClock, submitLead, usageSummary, world } from './helpers/hotLeadCallE2eWorld';
-import { REFERENCE_ID as ID, REFERENCE_PHONE as PHONE, referenceTeam } from './helpers/hotLeadCallFixtures';
+import { REFERENCE_ID as ID, REFERENCE_PHONE as PHONE, referenceMember, referenceTeam } from './helpers/hotLeadCallFixtures';
 
 installWorld();
 beforeEach(() => {
@@ -59,6 +60,9 @@ function countWrites(): () => Record<Target, number> {
   return () => counts;
 }
 
+/** How many member calls Twilio accepted (a rejected placement is not a call). */
+const acceptedCalls = () => world.provider.placedSids.filter((sid) => sid !== null).length;
+
 /** Sends a webhook, and sends it again (as Twilio does for a 5xx) until it is answered. */
 const retrying = async (send: () => Promise<{ status: number }>): Promise<void> => {
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -70,8 +74,8 @@ const retrying = async (send: () => Promise<{ status: number }>): Promise<void> 
 
 const noAnswerChain = async (): Promise<void> => {
   const done = new Set<number>();
-  for (let round = 0; round < 8 && done.size < world.provider.placedCalls.length; round++) {
-    for (let n = 1; n <= world.provider.placedCalls.length; n++) {
+  for (let round = 0; round < 8 && done.size < acceptedCalls(); round++) {
+    for (let n = 1; n <= acceptedCalls(); n++) {
       if (done.has(n)) continue;
       done.add(n);
       await retrying(() => nthCall(n).memberLegEnds('no-answer', '0'));
@@ -83,7 +87,7 @@ const noAnswerChain = async (): Promise<void> => {
 const scripts = {
   noAnswerChain,
   declineChain: async (): Promise<void> => {
-    if (world.provider.placedCalls.length > 0) {
+    if (acceptedCalls() > 0) {
       const call = nthCall(1);
       // A prompt that was not served (the call was aborted) leaves nothing to press.
       if ((await call.memberAnswers()).body.includes('<Gather')) await call.memberPresses('2');
@@ -92,7 +96,7 @@ const scripts = {
     await noAnswerChain();
   },
   connectChain: async (): Promise<void> => {
-    if (world.provider.placedCalls.length > 0) {
+    if (acceptedCalls() > 0) {
       const call = nthCall(1);
       let dialled = false;
       if ((await call.memberAnswers()).body.includes('<Gather')) {
@@ -316,6 +320,42 @@ describe('a rejected placement whose record update fails more than once', () => 
       });
     }
   }
+});
+
+describe('a next-attempt job that dies after its own lock was rejected', () => {
+  // Attempt 1 (C) rings and ends; the job for attempt 1 locks attempt 2 (D), Twilio rejects it, and the pass hangs at
+  // the next member's cooldown claim (the process dies there). The record waits at a later attempt with no call sid.
+  it.each([1, 2])('%i rejected placement(s): the poller\'s re-run of the attempt-1 job carries the chain on', async (rejections) => {
+    const org = world.crm.orgs.get('org-a') as { hotLeadCall: Record<string, unknown> };
+    org.hotLeadCall = { ...org.hotLeadCall, team: [referenceMember('c', '15:00', '18:00'), referenceMember('d', '14:00', '19:00'), referenceMember('e', '09:00', '19:00'), referenceMember('a', '09:00', '19:00')], maxAttemptsPerLead: 4 };
+    setClock(chicago('16:00'));
+    await submitLead('lead-a');
+    for (let i = 0; i < rejections; i++) world.provider.failNextPlaceCall('no');
+    const claim = world.limits.claim.bind(world.limits);
+    let claims = 0;
+    const spy = jest.spyOn(world.limits, 'claim').mockImplementation((...args) => (++claims > rejections ? new Promise<boolean>(() => undefined) : claim(...args)));
+    await nthCall(1).memberLegEnds('no-answer', '0');
+    await flush();
+    const waiting = record();
+    expect(waiting).toMatchObject({ state: 'between_attempts', attemptNo: 1 + rejections });
+    expect(waiting.memberCallSid).toBeUndefined();
+
+    // A replay of the final callback cannot help (the record has no call sid); only the job can.
+    await nthCall(1).memberLegEnds('no-answer', '0');
+    await flush();
+    expect(record()).toMatchObject({ state: 'between_attempts', attemptNo: 1 + rejections });
+
+    spy.mockRestore();
+    await processNextAttemptJob({ orgId: 'org-a', listId: LIST, leadId: 'lead-a', jobKey: String(waiting.jobKey), attemptNo: 1 });
+    await flush();
+
+    const phones = rungPhones();
+    expect(new Set(phones).size).toBe(phones.length);
+    expect(phones.length).toBeLessThanOrEqual(4);
+    expect(record()).toMatchObject({ state: 'member_ringing', attemptNo: 2 + rejections });
+    await noAnswerChain();
+    expect(['finished', 'failed']).toContain(record().state);
+  });
 });
 
 describe('a write that did not land', () => {

@@ -58,7 +58,7 @@ type Closing = 'completed' | 'rejected' | 'errored';
  * caller believes it was closed; the record stays between_attempts, where a redelivered callback can still resolve it.
  */
 export async function closeBetweenAttempts(
-  store: LeadCallStore, listId: string, leadId: string, attemptNo: number, outcome: string, closing: Closing,
+  store: LeadCallStore, listId: string, leadId: string, attemptNo: number | undefined, outcome: string, closing: Closing,
 ): Promise<void> {
   // Only the record of the attempt that ended: a stale job cannot close a later attempt's waiting record.
   const patch = { state: closing === 'completed' ? 'finished' as const : 'failed' as const, outcome, ifAttemptNo: attemptNo };

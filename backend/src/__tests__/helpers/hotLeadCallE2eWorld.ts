@@ -210,8 +210,16 @@ export function twilioCall(placed: WebhookCall, memberSid = 'CA00000001', leadSi
   };
 }
 
-/** The nth member call the orchestrator placed (1-based), as Twilio plays it: sids CA0000000n and CAL000000n. */
-export const nthCall = (n: number) => twilioCall(placedCall(n - 1), `CA${String(n).padStart(8, '0')}`, `CAL${String(n).padStart(7, '0')}`);
+/**
+ * The nth member call that Twilio accepted (1-based; a rejected placement has no call), as Twilio plays it: with the
+ * sid the provider issued for it and CAL000000n for its lead leg.
+ */
+export function nthCall(n: number) {
+  const accepted = world.provider.placedSids.flatMap((sid, index) => (sid === null ? [] : [{ sid, index }]));
+  const call = accepted[n - 1];
+  if (!call) throw new Error(`Twilio accepted only ${accepted.length} member calls, not ${n}`);
+  return twilioCall(placedCall(call.index), call.sid, `CAL${String(n).padStart(7, '0')}`);
+}
 
 /** Rings the member, who presses 1, and the lead answers and presses 1: the call is bridged. Returns the live call. */
 export async function bridgedCall(leadId = 'lead-a') {

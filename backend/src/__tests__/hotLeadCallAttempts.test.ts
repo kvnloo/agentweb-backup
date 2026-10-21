@@ -338,9 +338,7 @@ describe('processHotLeadCallNextAttempt', () => {
   it('a stale job cannot close the waiting record of a later attempt', async () => {
     const record = await firstAttemptEnds();
     store.record = { ...store.record!, attemptNo: 3, state: 'between_attempts', triedMemberIds: [ID.c, ID.d, ID.e] };
-    setHotLeadCallEnabledOverride(false);
-    await processHotLeadCallNextAttempt(nextJob(record)); // believes attempt 1 just ended
-    expect(store.record).toMatchObject({ state: 'between_attempts', attemptNo: 3 });
+    expect(record.attemptNo).toBe(1);
     await closeBetweenAttempts(store, 'list-a', 'lead-a', 2, 'no_member_available', 'completed');
     expect(store.record!.state).toBe('between_attempts');
     await closeBetweenAttempts(store, 'list-a', 'lead-a', 3, 'no_member_available', 'completed');
@@ -454,15 +452,32 @@ describe('processHotLeadCallNextAttempt', () => {
     expect(placedTo()).toEqual([PHONE.c, PHONE.d]);
   });
 
-  it('ignores a stale job for an earlier attempt while the record waits after a later one', async () => {
+  it('carries on from a later attempt of the same call when its own earlier run died there, without re-ringing anyone', async () => {
     useConfig({ team: [referenceMember('c', '15:00', '18:00'), referenceMember('d', '14:00', '19:00'), referenceMember('e', '15:00', '18:00')] });
     const first = structuredClone(await firstAttemptEnds());
     await processHotLeadCallNextAttempt(nextJob(first));
     await endCurrentAttempt();
     expect(store.record).toMatchObject({ state: 'between_attempts', attemptNo: 2 });
-    await processHotLeadCallNextAttempt(nextJob(first)); // the job for attempt 1, replayed late
+    await processHotLeadCallNextAttempt(nextJob(first)); // the job for attempt 1, run again by the poller
+    expect(placedTo()).toEqual([PHONE.c, PHONE.d, PHONE.e]);
+    expect(store.record).toMatchObject({ state: 'member_ringing', attemptNo: 3, triedMemberIds: [ID.c, ID.d, ID.e] });
+  });
+
+  it('closes, rather than exceeds, maxAttemptsPerLead when it carries on from a later attempt', async () => {
+    useConfig({ team: [referenceMember('c', '15:00', '18:00'), referenceMember('d', '14:00', '19:00'), referenceMember('e', '15:00', '18:00')], maxAttemptsPerLead: 2 });
+    const first = structuredClone(await firstAttemptEnds());
+    await processHotLeadCallNextAttempt(nextJob(first));
+    await endCurrentAttempt();
+    await processHotLeadCallNextAttempt(nextJob(first));
     expect(placedTo()).toEqual([PHONE.c, PHONE.d]);
-    expect(store.record).toMatchObject({ state: 'between_attempts', attemptNo: 2 });
+    expect(store.record).toMatchObject({ state: 'finished', outcome: 'no_member_available', attemptNo: 2 });
+  });
+
+  it('leaves alone a record waiting at an EARLIER attempt than the job\'s, and one of another call', async () => {
+    const record = await firstAttemptEnds();
+    await processHotLeadCallNextAttempt({ ...nextJob(record), attemptNo: 2 });
+    expect(placedTo()).toEqual([PHONE.c]);
+    expect(store.record).toMatchObject({ state: 'between_attempts', attemptNo: 1 });
   });
 
   it('ignores a job for another call of the same lead and for a terminal record', async () => {

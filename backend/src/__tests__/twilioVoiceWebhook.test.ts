@@ -21,6 +21,7 @@ jest.mock('../services/hotLeadCallAttempts', () => ({ requestNextHotLeadCallAtte
 import { crmDb, orgDb, userDb } from '../services/db';
 import { recordCallUsage } from '../services/voice/voiceUsage';
 import { requestNextHotLeadCallAttempt } from '../services/hotLeadCallAttempts';
+import { nextAttemptOrFinish } from '../services/voice/callFinalisation';
 import { leadPhoneMacOf } from '../services/voice/leadPhoneMac';
 import { setHotLeadCallEnabledOverride } from '../services/voice/hotLeadCallMode';
 import { setLeadCallStoreForTests } from '../services/voice/leadCallStore';
@@ -883,6 +884,18 @@ describe('member attempt finalisation', () => {
     const logs = JSON.stringify(logSpy.flatMap((s) => s.mock.calls));
     expect(logs).toContain('next attempt request failed');
     noPhoneIn(logs);
+  });
+
+  it('finishing a waiting record applies only to the attempt that was read: a record that moved on is not finished', async () => {
+    seed('between_attempts', { outcome: 'member_no_answer', meteredLegs: ['member:1'] });
+    const realGet = store.get.bind(store);
+    store.get = async () => {
+      const record = await realGet();
+      store.record!.attemptNo = 2; // another worker took the next attempt and it ended again, after this read
+      return record;
+    };
+    await nextAttemptOrFinish({ listId: LIST, leadId: LEAD, jobKey: JOB, leg: 'member' }, 'member_no_answer');
+    expect(store.record).toMatchObject({ state: 'between_attempts', attemptNo: 2 });
   });
 
   it('bills and writes once for a replayed or concurrent final callback; the hand-over request is repeated (the queue key dedupes it)', async () => {

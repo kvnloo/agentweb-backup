@@ -6,6 +6,8 @@ import { VoiceCallError, type BuyNumberParams, type PlaceCallParams, type Valida
  */
 export class FakeVoiceProvider implements VoiceProvider {
   readonly placedCalls: PlaceCallParams[] = [];
+  /** The sid each entry of placedCalls was given, or null when Twilio rejected it (a rejected call has no sid). */
+  readonly placedSids: Array<string | null> = [];
   readonly boughtNumbers: BuyNumberParams[] = [];
   readonly releasedNumbers: string[] = [];
   readonly signatureChecks: ValidateSignatureParams[] = [];
@@ -58,8 +60,14 @@ export class FakeVoiceProvider implements VoiceProvider {
     if ((p.url === undefined) === (p.twiml === undefined)) throw new Error('FakeVoiceProvider: placeCall needs exactly one of url and twiml');
     this.placedCalls.push(p);
     const failure = this.placeCallFailures.shift();
-    if (failure) throw failure;
-    return { callSid: `CA${String(++this.callSeq).padStart(8, '0')}` };
+    if (failure) {
+      // A definite rejection issues no sid; an ambiguous one may have made a live call whose sid the caller never saw.
+      this.placedSids.push(failure.placed === 'no' ? null : `CA${String(this.callSeq + 1).padStart(8, '0')}`);
+      throw failure;
+    }
+    const callSid = `CA${String(++this.callSeq).padStart(8, '0')}`;
+    this.placedSids.push(callSid);
+    return { callSid };
   }
 
   async buyNumber(p: BuyNumberParams): Promise<{ numberSid: string; phoneNumber: string }> {

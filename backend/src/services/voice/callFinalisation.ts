@@ -199,7 +199,7 @@ export async function nextAttemptOrFinish(q: CallQuery, attemptOutcome: string):
     console.error('[hotLeadCall] next attempt request failed:', errorName(err));
   }
   const outcome = record.attemptNo > 1 ? 'no_member_available' : attemptOutcome;
-  if (await store.transition(q.listId, q.leadId, ['between_attempts'], { state: 'finished', outcome })) {
+  if (await store.transition(q.listId, q.leadId, ['between_attempts'], { state: 'finished', outcome, ifAttemptNo: record.attemptNo })) {
     await store.addEvent(q.listId, q.leadId, 'call.completed', { outcome });
   }
 }

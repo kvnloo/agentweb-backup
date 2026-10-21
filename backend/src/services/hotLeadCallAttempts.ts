@@ -105,45 +105,55 @@ export async function requestNextHotLeadCallAttempt(args: {
 export async function processHotLeadCallNextAttempt(job: NextAttemptJob): Promise<void> {
   if (!job || !isNonEmpty(job.orgId) || !isNonEmpty(job.listId) || !isNonEmpty(job.leadId) || !isNonEmpty(job.jobKey)
     || !Number.isInteger(job.attemptNo) || job.attemptNo < 1) throw new Error('Invalid hot lead call next attempt job');
+  const progress = { endedAttempt: job.attemptNo };
   try {
-    await placeNextAttempt(job);
+    await placeNextAttempt(job, progress);
   } catch (err) {
     // The original error is the one to report; a close that fails as well leaves the record for a redelivery to heal.
-    await closeBetweenAttempts(getLeadCallStore(), job.listId, job.leadId, job.attemptNo, 'next_attempt_failed', 'errored')
+    await closeBetweenAttempts(getLeadCallStore(), job.listId, job.leadId, progress.endedAttempt, 'next_attempt_failed', 'errored')
       .catch((closeErr) => console.warn('[hotLeadCall] call record not closed', { listId: job.listId, leadId: job.leadId, error: errorText(closeErr) }));
     throw err;
   }
 }
 
-async function placeNextAttempt(job: NextAttemptJob): Promise<void> {
+/**
+ * `progress.endedAttempt` is the attempt the record is waiting after: the job's own, or a later one when this job's
+ * earlier run took the lock for the next attempt, had that call rejected, and died before it closed the record. Such
+ * a record has no call sid, so no callback will ever come for it and only this job can carry it on.
+ */
+async function placeNextAttempt(job: NextAttemptJob, progress: { endedAttempt: number }): Promise<void> {
   const { listId, leadId } = job;
   const store = getLeadCallStore();
   if (!await isHotLeadCallEnabled()) {
     // No read and no call, but the record must not wait for a next attempt that will never come: one conditional
     // write closes it if (and only if) it is waiting between attempts.
-    await closeBetweenAttempts(store, listId, leadId, job.attemptNo, 'disabled', 'completed');
+    // Without a read there is no attempt number to guard with: any waiting record of the lead is closed.
+    await closeBetweenAttempts(store, listId, leadId, undefined, 'disabled', 'completed');
     return;
   }
 
   const record = await store.get(listId, leadId);
-  // Another worker (or a replay) already moved this attempt on, or the record belongs to a different call.
-  if (!record || record.state !== 'between_attempts' || record.jobKey !== job.jobKey || record.attemptNo !== job.attemptNo) return;
+  // Another worker (or a replay) already moved this attempt on, or the record belongs to a different call. A record
+  // waiting after a LATER attempt of the same call is this job's own earlier progress: carry on from there.
+  if (!record || record.state !== 'between_attempts' || record.jobKey !== job.jobKey || record.attemptNo < job.attemptNo) return;
+  const ended = record.attemptNo;
+  progress.endedAttempt = ended;
 
   const loaded = await loadNextAttemptContext(listId, record, job.orgId);
   if ('refusal' in loaded) {
-    await closeBetweenAttempts(store, listId, leadId, job.attemptNo, loaded.refusal === 'disabled' ? 'disabled' : 'no_member_available', 'completed');
+    await closeBetweenAttempts(store, listId, leadId, ended, loaded.refusal === 'disabled' ? 'disabled' : 'no_member_available', 'completed');
     return;
   }
   const { ctx: { config }, now } = loaded;
   const callerNumber = config.twilioNumber;
   if (!callerNumber) {
-    await closeBetweenAttempts(store, listId, leadId, job.attemptNo, 'no_member_available', 'completed');
+    await closeBetweenAttempts(store, listId, leadId, ended, 'no_member_available', 'completed');
     return;
   }
 
   await placeMemberCall({
     orgId: job.orgId, listId, leadId, jobKey: record.jobKey, config, callerNumber,
     candidates: selectHotLeadCallCandidates(config, now, record.triedMemberIds),
-    attemptNo: job.attemptNo + 1,
+    attemptNo: ended + 1,
   });
 }
