@@ -407,6 +407,55 @@ describe('agentToolGatewayService', () => {
         });
       });
 
+      describe('client_id -> client_name_or_email (ENG-2610)', () => {
+        // Repro: monitor_lead_volume {"client_id":"juan@usehaven.ai"} -> Missing required argument "client_name_or_email".
+        const clientSchema = {
+          type: 'object',
+          properties: {
+            client_name_or_email: { type: 'string' },
+            since: { type: 'string' },
+          },
+          required: ['client_name_or_email'],
+        };
+
+        it.each(['client_id', 'clientId', 'client_email', 'client'])('maps %s to client_name_or_email', (alias) => {
+          const result = validateAndRepairToolArgs({
+            toolName: 'monitor_lead_volume',
+            args: { [alias]: 'juan@usehaven.ai' },
+            inputSchema: clientSchema,
+            effect: 'read',
+          });
+          expect(result.status).toBe('repaired');
+          expect(result.args).toEqual({ client_name_or_email: 'juan@usehaven.ai' });
+        });
+
+        it('does not overwrite an existing client_name_or_email', () => {
+          const result = validateAndRepairToolArgs({
+            toolName: 'monitor_lead_volume',
+            args: { client_name_or_email: 'a@x.com', client_id: 'b@x.com' },
+            inputSchema: clientSchema,
+            effect: 'read',
+          });
+          expect(result.args).toMatchObject({ client_name_or_email: 'a@x.com' });
+          expect(result.repairs).not.toEqual(expect.arrayContaining(['client_id->client_name_or_email']));
+        });
+
+        it('leaves client_id alone when it is a real schema property', () => {
+          const result = validateAndRepairToolArgs({
+            toolName: 'other_tool',
+            args: { client_id: 'c1' },
+            inputSchema: {
+              type: 'object',
+              properties: { client_id: { type: 'string' }, client_name_or_email: { type: 'string' } },
+              required: ['client_name_or_email'],
+            },
+            effect: 'read',
+          });
+          expect(result.args).toMatchObject({ client_id: 'c1' });
+          expect(result.args).not.toHaveProperty('client_name_or_email');
+        });
+      });
+
       describe('evaluate IIFE / bare expression wrap (ENG-2572)', () => {
         // Live repros (Dev-AW-LoopEvents 2026-10-14..18): "TypeError: result is not a function".
         const evaluateSchema = {
