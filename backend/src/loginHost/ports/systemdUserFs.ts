@@ -28,6 +28,12 @@ export interface SystemdPortConfig {
   commandTimeoutMs: number;
   /** Per-uid disk quota on the homes filesystem (1 KiB blocks, inodes). Omitted: no quota is set. When given, failing to set it is an error. */
   quota?: { blocksKb: number; inodes: number };
+  /**
+   * Network isolation: returns the egress-proxy directory THIS uid's units get bound in (creating the uid's own proxy socket first,
+   * synchronously). One socket per uid is what lets the proxy cap and account for each customer separately: a customer can only ever
+   * reach its own socket, so it can exhaust its own share and nobody else's. Absent = `paths.net.dir` is used as given (tests).
+   */
+  egressFor?: (uid: number) => string;
 }
 
 const ACTIVE_STATES = new Set(["active", "activating", "deactivating", "reloading", "refreshing"]);
@@ -312,7 +318,8 @@ export class SystemdUserFs implements UserFsPort {
     if ((this.gate.get(uid) ?? 0) > 0) throw new Error("uid_gated"); // a kill of this uid is in flight
     const refDir = this.layout.refDir(uid, kind, ref);
     const unitName = this.layout.unitName(uid, this.hex(8));
-    const args = systemRunArgs(this.layout, { uid, unitName, refDir, file: spec.file, args: spec.args, env: spec.env, cwd: spec.cwd }, this.cfg.limits, this.cfg.paths);
+    const net = this.cfg.paths.net && this.cfg.egressFor ? { ...this.cfg.paths.net, dir: this.cfg.egressFor(uid) } : this.cfg.paths.net;
+    const args = systemRunArgs(this.layout, { uid, unitName, refDir, file: spec.file, args: spec.args, env: spec.env, cwd: spec.cwd }, this.cfg.limits, { ...this.cfg.paths, ...(net ? { net } : {}) });
     const client = this.cmd.start(this.cfg.paths.systemRun, args);
     const set = this.clients.get(uid) ?? new Set<RunningCommand>();
     this.clients.set(uid, set);

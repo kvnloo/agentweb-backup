@@ -22,6 +22,10 @@ export const TRACE_LIMITS = {
   degradedResultChars: 1500,
   errorChars: 500,
   finalResponseChars: 60_000,
+  timelineUserChars: 1000,
+  timelineAgentChars: 800,
+  /** Above this many timeline entries, the middle is dropped (the first and last ones are kept). */
+  maxTimelineEntries: 400,
   maxCalls: 200,
   /** Above this many result characters in total, every result is cut to degradedResultChars. */
   resultBudgetChars: 300_000,
@@ -77,6 +81,9 @@ export interface AgentRunTraceStep {
   closedWithoutCalls: boolean;
 }
 
+/** One entry of the run in order: a user message, an agent message, or a tool call (by id). */
+export type TraceTimelineEntry = { kind: 'user' | 'agent'; text: string } | { kind: 'call'; callId: string };
+
 export interface AgentRunTrace {
   sessionId: string;
   found: boolean;
@@ -95,6 +102,15 @@ export interface AgentRunTrace {
   calls: AgentRunTraceCall[];
   callsTruncated: boolean;
   resultsDegraded: boolean;
+  /** Set by the caller that read the messages (routes/agentRuns.ts) when its read cap cut the session. */
+  messagesTruncated?: boolean;
+  /**
+   * Every user and agent message and every call, in order (text capped and redacted). What the
+   * labeller reads as the transcript; `followUpAsks` is only the distinct later asks.
+   */
+  timeline: TraceTimelineEntry[];
+  /** How many middle entries were dropped to keep the timeline within maxTimelineEntries. */
+  timelineOmitted: number;
   usage?: { promptTokens: number; completionTokens: number; estimatedCostUsd: number };
   finalResponse?: { html: string; truncated: boolean };
 }
@@ -161,6 +177,7 @@ export function buildAgentRunTrace(input: {
     calls,
     callsTruncated,
     resultsDegraded: degraded,
+    ...buildTimeline(inRun, calls),
     ...usageOf(inRun),
     ...(finalText ? { finalResponse: (({ text, truncated }) => ({ html: text, truncated }))(capRedacted(finalText, TRACE_LIMITS.finalResponseChars)) } : {}),
   };
@@ -333,6 +350,29 @@ function buildCalls(messages: NormalizedMessage[]): { calls: AgentRunTraceCall[]
     if (recovery) call.recoveredByCallId = recovery.id;
   }
   return { calls, rawArgs: new Map(issued.map((tc) => [tc.id, tc.arguments])), truncated, degraded };
+}
+
+/**
+ * The run in order. Each assistant message's tool calls map, in order, onto `calls` (built from the
+ * same messages in the same order, so the nth issued call is calls[n]); calls past the cap are left
+ * out. Over maxTimelineEntries, the middle is dropped and counted.
+ */
+function buildTimeline(messages: NormalizedMessage[], calls: AgentRunTraceCall[]): { timeline: TraceTimelineEntry[]; timelineOmitted: number } {
+  const entries: TraceTimelineEntry[] = [];
+  let next = 0;
+  for (const m of messages) {
+    const text = m.role === 'user' || m.role === 'assistant' ? textOf(m.content) : undefined;
+    if (text && m.role === 'user') entries.push({ kind: 'user', text: capRedacted(text, TRACE_LIMITS.timelineUserChars).text });
+    if (text && m.role === 'assistant') entries.push({ kind: 'agent', text: capRedacted(text, TRACE_LIMITS.timelineAgentChars).text });
+    for (let i = 0; i < m.toolCalls.length; i++) {
+      if (next < calls.length) entries.push({ kind: 'call', callId: calls[next].id });
+      next += 1;
+    }
+  }
+  const max = TRACE_LIMITS.maxTimelineEntries;
+  if (entries.length <= max) return { timeline: entries, timelineOmitted: 0 };
+  const head = Math.floor(max * 0.4);
+  return { timeline: [...entries.slice(0, head), ...entries.slice(entries.length - (max - head))], timelineOmitted: entries.length - max };
 }
 
 /**

@@ -676,7 +676,8 @@ export interface User {
   subscription_amount?: number; // Most recent invoice amount paid, in cents (e.g. 4900 = $49.00)
   /**
    * Active Stripe coupon/discount applied to the subscription (e.g., 90% off for 6 months).
-   * Synced from subscription.discount on all webhook and reconcile paths.
+   * Synced from the subscription's first listed `discounts` entry (Basil; the
+   * legacy subscription.discount is a fallback) on all webhook and reconcile paths.
    * Set to null when the discount is removed from the subscription.
    */
   activeOffer?: {
@@ -686,7 +687,7 @@ export interface User {
     amountOff: number | null; // in cents
     duration: 'forever' | 'once' | 'repeating';
     durationInMonths: number | null; // only set when duration = 'repeating'
-    endsAt: string | null; // ISO date when the discount expires (from subscription.discount.end)
+    endsAt: string | null; // ISO date when the discount expires (from the discount's `end`)
   } | null;
   /**
    * A scheduled subscription change queued in Stripe (e.g., scheduled downgrade
