@@ -21,6 +21,8 @@ The misses are semantic, so step statuses and the call ledger can't capture them
   - Stdout carries case ids, verdicts, the running cost and why a case errored; `--out` (judge reasons) is rewritten after every case.
 - The verdict parser scans each `{` forward to its matching `}` and tries at most 200. The first version looped forever on a reply that started with `{` but held no verdict object, which is what a reply cut off at the output limit looks like. The output limit is now 6000 tokens: at 3000, 2 of 60 judged replies on long sessions were still cut off.
 
+- `--labeller` mode in the trial script: `labelTaskSuccess` labels sessions blind with the rubric a human labeller sees (no judge checklist), on GPT-5.4 by default. It refuses Claude (the judge's family) and Gemini (the agent's). Its labels are a cross-family check on the judge; they never go into the golden set.
+
 **Next.**
 1. Run the trial on dev and test, about $2 for all 80 work-plan cases, and compare against the blind AI labels.
 2. If kappa ≥ 0.6, a person labels 30 test cases for the real validation.
