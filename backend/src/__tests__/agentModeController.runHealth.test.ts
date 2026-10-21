@@ -124,6 +124,8 @@ describe('computeScheduleRunHealth', () => {
         lastRunStatus: 'success', lastRunAt: '2026-08-01T11:00:00.000Z', consecutiveFailures: 0,
         lastRunBlockedBy: 'linkedin_search_unavailable',
       });
+      // A stray blockedModel on an UNBLOCKED run (no blockedBy) is never surfaced.
+      expect('lastRunBlockedModel' in computeScheduleRunHealth([{ ...run('success', '2026-08-01T11:00:00.000Z'), blockedModel: 'agentweb-model' }])).toBe(false);
       for (const bad of ['', 5, null]) {
         expect('lastRunBlockedModel' in computeScheduleRunHealth([blocked({ blockedModel: bad })])).toBe(false);
       }

@@ -1122,14 +1122,47 @@ describe('runVerifiedChat with NO model (Slack, revisions, human-eval): a stored
     expect(workerCall().modelRouting.llmRoutingReason).toContain(taskType);
   });
 
-  it('after a rollback (switch off): refused visibly, the selection is kept, nothing runs on another model', async () => {
+  /** The refusals runVerifiedChat saved to the chat (error messages). */
+  const savedRefusals = () => mockChatbotDb.addMessageToSession.mock.calls
+    .map(([, message]) => message as any)
+    .filter((message) => message?.metadata?.isErrorMessage === true);
+
+  // rv-3681: refused, never swapped, and the refusal is saved to the chat (once) so the owner sees why; the headless
+  // callers present the rethrown error (revisionService / humanEvalActionService / slack tests).
+  it.each([
+    ['after a rollback (switch off)', 'update_html_file', () => undefined, 'not_served', AW_UNAVAILABLE],
+    ['after a rollback (switch off)', 'generate_image', () => undefined, 'not_served', AW_UNAVAILABLE],
+    ['with the router unavailable for the tier', 'generate_image', () => {
+      turnOn({ ...TABLE, routes: { image: ROUTED_SCHEDULED } });
+      allowlist([AW, ROUTED_CHAT]);
+    }, 'not_served', AW_UNAVAILABLE],
+    ['with the user\'s own pick outside the plan', 'generate_image', () => {
+      turnOn();
+      allowlist([ROUTED_CHAT, ROUTED_SCHEDULED]);
+    }, 'not_in_plan', 'The model you selected (AgentWeb Model) isn\'t included in your plan'],
+  ])('%s, %s: refused visibly, the refusal saved to the chat once, the selection kept, nothing run', async (_label, tool, setUp, reason, sentence) => {
+    setUp();
     const store = storeSession(baseSession(AW, { llmModelSource: 'user' }));
-    workerReturns('update_html_file');
-    const error = await verified('update_html_file').then(() => null, (e) => e);
+    workerReturns(tool);
+    const error = await verified(tool).then(() => null, (e) => e);
+    expect(error).toMatchObject({ code: 'model_unavailable', requestedModel: AW, reason });
     expect(writtenModels()).not.toContain(REPORT_DEFAULT);
     expect(store.get()).toMatchObject({ llmModel: AW, llmModelSource: 'user' });
     expect(mockWorker.runInWorker).not.toHaveBeenCalled();
-    expect(error).toMatchObject({ code: 'model_unavailable', requestedModel: AW, reason: 'not_served' });
+    const refusals = savedRefusals();
+    expect(refusals).toHaveLength(1);
+    expect(refusals[0]).toMatchObject({ role: 'assistant' });
+    expect(refusals[0].content).toContain(sentence);
+    expect(refusals[0].content).not.toContain(AW);
+  });
+
+  it('a non-model failure is not saved as a refusal (unchanged)', async () => {
+    turnOn();
+    storeSession(baseSession(AW, { llmModelSource: 'user' }));
+    mockWorker.runInWorker.mockRejectedValue(new Error('LLM provider exploded'));
+    const error = await verified('update_html_file').then(() => null, (e) => e);
+    expect(error?.message).toContain('LLM provider exploded');
+    expect(savedRefusals()).toHaveLength(0);
   });
 
   it('non-router parity: a stored concrete model is still replaced by the task-type default, as before', async () => {

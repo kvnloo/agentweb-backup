@@ -4966,8 +4966,9 @@ async function runVerifiedChatInner(
       // ENG-669 PR-C: a stored AgentWeb Model selection is the customer's choice: never overwritten with a task-type
       // default (that was a silent swap, and with the switch off it lost the selection for good). It runs as the
       // selection, routed on the task's route (generateSessionResponse routes it, or refuses it visibly when the switch
-      // is off or the router cannot serve it). Every routed target can call tools (the routing table refuses one that
-      // cannot), so the run's required functions stay callable.
+      // is off or the router cannot serve it; the catch below saves that refusal to the chat). Every routed target
+      // supports tool calling (the routing table refuses one that does not); like on any model, the tool list a turn
+      // sends may still be truncated (maxTools), which this does not change.
       routerTaskType = shouldUseReportGenerationModel ? 'report'
         : shouldUseImageGenerationModel ? 'image'
           : shouldUseVideoGenerationModel ? 'video'
@@ -5996,6 +5997,13 @@ async function runVerifiedChatInner(
 
     } catch (error) {
       console.error(`Run verified chat attempt ${attempt} failed:`, error);
+      // ENG-669 PR-C: a refused model (the stored AgentWeb Model selection with the switch off or unavailable for the
+      // owner, or a selection outside the plan) is never retried; it is saved to the chat (once per error) so the owner
+      // sees why, and every caller (Slack, revisions, human-eval) gets it to present as a refusal, not an outage.
+      if (isModelUnavailableError(error)) {
+        await recordModelRefusal(sessionId, error);
+        throw error;
+      }
       if (isZeroAssistantOutputError(error)) {
         if (attempt === maxAttempts) {
           throw error;

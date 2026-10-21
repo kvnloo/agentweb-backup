@@ -174,14 +174,11 @@ export interface AgentWebModelAvailability {
  */
 export async function describeAgentWebModelAvailability(ownerUserId: string): Promise<AgentWebModelAvailability | null> {
   if (!(await agentWebModelRouter.isEnabled())) return null;
-  const inPlan = (await modelAccess.filterAllowedModels(ownerUserId, [AGENTWEB_MODEL_ID])).includes(AGENTWEB_MODEL_ID);
+  if (await offersAgentWebModel(ownerUserId)) return { offered: true };
+  // Not offered: AgentWeb's own pin of it still runs only if the router serves the tier with every route inside the
+  // owner's live allowlist (routeAgentWebModelSelection's check; the load-time tier check skips a tier that does not
+  // list the AgentWeb Model). That can hold only when the plan does not list it (were it listed, it would be offered).
   const access = await modelAccess.getModelAccess(ownerUserId);
-  const validForTier = await agentWebModelRouter.isAvailableFor(access.tier);
-  // `offered` is exactly offersAgentWebModel's answer.
-  if (inPlan && validForTier) return { offered: true };
-  if (inPlan || !validForTier) return { offered: false, reason: 'unavailable_for_tier' };
-  // Outside the plan: AgentWeb's own pin runs only if every route is inside the owner's live allowlist (routeAgentWeb-
-  // ModelSelection's check; the load-time tier check skips a tier that does not list the AgentWeb Model).
   const allowedModels = (await modelAccess.isEnabled()) && !access.isAdmin ? access.allowedModels : ALL_MODELS;
   return (await agentWebModelRouter.isAvailableFor(access.tier, allowedModels))
     ? { offered: false, reason: 'not_in_plan' }
