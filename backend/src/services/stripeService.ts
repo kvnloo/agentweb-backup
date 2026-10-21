@@ -1085,6 +1085,33 @@ export async function handleSubscriptionUpdated(
 const LIVE_SUBSCRIPTION_STATUSES: ReadonlySet<string> = new Set(['active', 'trialing', 'past_due']);
 
 /**
+ * Subscription statuses that have ended for good: paying one's (final) invoice
+ * does not make the customer active again. `incomplete` / `unpaid` are not
+ * here — paying their invoice is what activates them.
+ */
+const ENDED_SUBSCRIPTION_STATUSES: ReadonlySet<string> = new Set(['canceled', 'incomplete_expired']);
+
+/**
+ * The customer's live subscription (discounts expanded), or null. Same pick as
+ * reconcileStripeUser / syncSubscriptionFromStripe: active > trialing >
+ * past_due, and within a status the newest (Stripe lists newest first; the
+ * sort is stable).
+ */
+async function findLiveCustomerSubscription(s: Stripe, customerId: string): Promise<Stripe.Subscription | null> {
+  const subscriptions = await s.subscriptions.list({
+    customer: customerId,
+    status: 'all',
+    limit: 10,
+    expand: ['data.discounts'],
+  });
+  const statusPriority: Record<string, number> = { active: 0, trialing: 1, past_due: 2 };
+  const live = subscriptions.data
+    .filter((sub) => LIVE_SUBSCRIPTION_STATUSES.has(sub.status))
+    .sort((a, b) => statusPriority[a.status] - statusPriority[b.status]);
+  return live[0] ?? null;
+}
+
+/**
  * Handle invoice.payment_succeeded — confirm subscription is active and sync payment info.
  */
 export async function handleInvoicePaymentSucceeded(invoice: any): Promise<void> {
@@ -1104,64 +1131,91 @@ export async function handleInvoicePaymentSucceeded(invoice: any): Promise<void>
   }
 
   const subscriptionId = invoiceSubscriptionId(invoice);
+  const storedSubId: string | null = user.stripe_subscription_id || null;
 
   const updateData: Record<string, any> = {
-    subscription_status: 'active',
     has_payment_method: true,
   };
-
-  // Backfill stripe_subscription_id if user doesn't have one yet
-  if (!user.stripe_subscription_id && subscriptionId) {
-    updateData.stripe_subscription_id = subscriptionId;
-  }
 
   // Store the amount paid so it can be displayed in the admin Users tab
   if (typeof invoice.amount_paid === 'number' && invoice.amount_paid > 0) {
     updateData.subscription_amount = invoice.amount_paid;
   }
 
-  // Sync current_period_end and activeOffer from the live subscription. The
-  // user's stored subscription stays authoritative while it is live, so an
-  // older, replaced sub's invoice cannot overwrite the current sub's period end
-  // or offer. When the stored one is no longer live and the invoice's own
-  // subscription is (a resubscribe whose invoice.paid beats
-  // checkout.session.completed / customer.subscription.created), sync from the
-  // invoice's. Only that differing case costs a second retrieve; if it fails,
-  // the stored subscription is synced as before.
-  const subIdToFetch = user.stripe_subscription_id || subscriptionId;
-  if (subIdToFetch) {
+  // Pick the subscription to sync current_period_end / activeOffer from and,
+  // when the row has none, to backfill stripe_subscription_id with:
+  //  - A live stored subscription stays authoritative (an older, replaced
+  //    sub's final invoice, or a second live sub, cannot overwrite it).
+  //  - A non-subscription invoice (one-off, quote, PAYG) syncs the stored sub.
+  //  - Otherwise prefer the invoice's own subscription when it is live (a
+  //    resubscribe whose invoice.paid beats checkout.session.completed /
+  //    customer.subscription.created), else the customer's live subscription.
+  //  - With none live, nothing is backfilled; the stored sub (if any) is
+  //    synced as before. If the invoice's own sub has ENDED (a redelivered
+  //    final invoice of a canceled sub), the user is not flipped to active.
+  // stripe_subscription_id is only ever backfilled from a LIVE subscription.
+  let syncFrom: Stripe.Subscription | null = null;
+  let reactivate = true;
+  const primaryId = storedSubId || subscriptionId;
+  if (primaryId) {
     try {
       const s = getStripeOrThrow();
-      let subscription = await s.subscriptions.retrieve(subIdToFetch, { expand: ['discounts'] }) as any;
-      if (
-        subscriptionId &&
-        subscriptionId !== subIdToFetch &&
-        !LIVE_SUBSCRIPTION_STATUSES.has(subscription?.status)
-      ) {
-        try {
-          const invoiceSubscription = await s.subscriptions.retrieve(subscriptionId, { expand: ['discounts'] });
-          if (LIVE_SUBSCRIPTION_STATUSES.has(invoiceSubscription.status)) {
-            subscription = invoiceSubscription;
+      const retrieve = (id: string) => s.subscriptions.retrieve(id, { expand: ['discounts'] });
+      const primary = await retrieve(primaryId);
+      if (LIVE_SUBSCRIPTION_STATUSES.has(primary.status) || !subscriptionId) {
+        syncFrom = primary;
+      } else {
+        let own: Stripe.Subscription | null = subscriptionId === primaryId ? primary : null;
+        if (!own) {
+          try {
+            own = await retrieve(subscriptionId);
+          } catch (err) {
+            console.warn(`[STRIPE] Failed to fetch invoice subscription ${subscriptionId}: ${err}`);
           }
-        } catch (err) {
-          console.warn(`[STRIPE] Failed to fetch invoice subscription ${subscriptionId}; syncing stored ${subIdToFetch}: ${err}`);
+        }
+        if (own && LIVE_SUBSCRIPTION_STATUSES.has(own.status)) {
+          syncFrom = own;
+        } else {
+          syncFrom = await findLiveCustomerSubscription(s, customerId);
+          if (!syncFrom) {
+            if (storedSubId) syncFrom = primary;
+            if (own && ENDED_SUBSCRIPTION_STATUSES.has(own.status)) reactivate = false;
+          }
         }
       }
-      const invoicePeriodEndIso = getSubscriptionPeriodEndIso(subscription);
-      if (invoicePeriodEndIso) {
-        updateData.current_period_end = invoicePeriodEndIso;
-      }
-      updateData.activeOffer = extractActiveOffer(subscription);
     } catch (err) {
-      console.warn(`[STRIPE] Failed to fetch subscription ${subIdToFetch} for period_end sync: ${err}`);
+      console.warn(`[STRIPE] Failed to fetch subscription ${primaryId} for period_end sync: ${err}`);
     }
   }
 
+  if (syncFrom) {
+    const invoicePeriodEndIso = getSubscriptionPeriodEndIso(syncFrom);
+    if (invoicePeriodEndIso) {
+      updateData.current_period_end = invoicePeriodEndIso;
+    }
+    updateData.activeOffer = extractActiveOffer(syncFrom);
+  }
+
+  // Backfill stripe_subscription_id if user doesn't have one yet — only with a live subscription
+  if (!storedSubId && syncFrom && LIVE_SUBSCRIPTION_STATUSES.has(syncFrom.status)) {
+    updateData.stripe_subscription_id = syncFrom.id;
+  }
+
+  if (reactivate) {
+    updateData.subscription_status = 'active';
+  } else {
+    console.log(
+      `[STRIPE] Invoice ${invoice.id} paid for ended subscription ${subscriptionId} and customer ${customerId} has no live subscription; user ${user.userId} status left unchanged`
+    );
+  }
+
   await userDb.updateUser(user.userId, updateData);
-  syncUserUpdateToLeadList(user.email, { subscription_status: 'active' });
+  if (reactivate) {
+    syncUserUpdateToLeadList(user.email, { subscription_status: 'active' });
+  }
 
   console.log(
-    `[STRIPE] Invoice payment succeeded: user ${user.userId} → status=active, has_payment_method=true${updateData.stripe_subscription_id ? `, backfilled sub=${subscriptionId}` : ''}${updateData.subscription_amount ? `, amount=${updateData.subscription_amount}` : ''}${updateData.current_period_end ? `, periodEnd=${updateData.current_period_end}` : ''}`
+    `[STRIPE] Invoice payment succeeded: user ${user.userId} → status=${reactivate ? 'active' : 'unchanged'}, has_payment_method=true${updateData.stripe_subscription_id ? `, backfilled sub=${updateData.stripe_subscription_id}` : ''}${updateData.subscription_amount ? `, amount=${updateData.subscription_amount}` : ''}${updateData.current_period_end ? `, periodEnd=${updateData.current_period_end}` : ''}`
   );
 }
 
