@@ -9,6 +9,8 @@
 - Admin API:
   - `PUT /api/admin/eval/golden-cases/:caseId/exclusion` with `{ reason }` excludes a case; `DELETE` on the same path restores it.
   - `GET /` takes `includeExcluded=true`.
+  - Both actions write an `[admin-audit]` line (`golden_case_exclude`, `golden_case_restore`). The restore line carries the exclusion it removed, so who excluded a case is not lost.
+  - A case id over DynamoDB's 2,048-byte key limit is a 400 on every `:caseId` route.
 - The work-plan seed source skips sessions whose `updatedAt` is not after `createdAt`. This separates the 20 from the 60 used sessions exactly.
 
 **After deploy.** Exclude the 20 cases with reason `empty_session`.
