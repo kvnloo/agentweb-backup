@@ -4,10 +4,10 @@
  * bounded in every dimension, never echoing URLs or bodies.
  */
 import { mkdtempSync, rmSync, statSync, writeFileSync, existsSync } from "fs";
-import { createServer, connect as netConnect, type Server, type Socket } from "net";
+import { createServer, connect as netConnect, Socket, type Server } from "net";
 import { tmpdir } from "os";
 import { join } from "path";
-import { EgressSocketInUseError, isForbiddenAddress, startEgressProxy, type EgressProxyHandle, type EgressProxyOptions } from "../../egress/egressProxy";
+import { EgressSocketInUseError, isForbiddenAddress, isLinkLocalAddress, parseClientHelloSni, startEgressProxy, type EgressProxyHandle, type EgressProxyOptions } from "../../egress/egressProxy";
 
 const dirs: string[] = [];
 afterAll(() => dirs.forEach((d) => rmSync(d, { recursive: true, force: true })));
@@ -82,6 +82,30 @@ function talk(sock: string, bytes: string | Buffer, waitMs = 400): Promise<{ tex
     setTimeout(() => resolve({ text, client, closed }), waitMs);
   });
 }
+/** A hand-built TLS ClientHello record. `sni: null` = no server_name extension; `extraExts` are appended raw; `split` is not applied here. */
+function clientHello(sni: string | null, over: { extraExts?: Buffer[]; sessionId?: number; noExtensions?: boolean; rawServerNameList?: Buffer } = {}): Buffer {
+  const u16 = (n: number) => Buffer.from([n >> 8, n & 0xff]);
+  const exts: Buffer[] = [];
+  if (over.rawServerNameList) exts.push(Buffer.concat([u16(0), u16(over.rawServerNameList.length + 2), u16(over.rawServerNameList.length), over.rawServerNameList]));
+  else if (sni !== null) {
+    const name = Buffer.from(sni, "latin1");
+    const entry = Buffer.concat([Buffer.from([0]), u16(name.length), name]);
+    exts.push(Buffer.concat([u16(0), u16(entry.length + 2), u16(entry.length), entry]));
+  }
+  exts.push(Buffer.concat([u16(0x002b), u16(3), Buffer.from([2, 3, 4])])); // supported_versions
+  exts.push(...(over.extraExts ?? []));
+  const extBlock = Buffer.concat(exts);
+  const sid = Buffer.alloc(over.sessionId ?? 0, 7);
+  const body = Buffer.concat([
+    Buffer.from([3, 3]), Buffer.alloc(32, 1), Buffer.from([sid.length]), sid,
+    u16(2), Buffer.from([0x13, 0x01]), Buffer.from([1, 0]),
+    ...(over.noExtensions ? [] : [u16(extBlock.length), extBlock]),
+  ]);
+  const hs = Buffer.concat([Buffer.from([1, 0, body.length >> 8, body.length & 0xff]), body]);
+  return Buffer.concat([Buffer.from([0x16, 3, 1]), u16(hs.length), hs]);
+}
+/** CONNECT to `host:443` followed straight away by a ClientHello that names `host` (what a real TLS client does). */
+const hi = (host: string, sni: string | null = host) => Buffer.concat([Buffer.from(connectReq(`${host}:443`)), clientHello(sni)]);
 const connectReq = (target: string, extra = "") => `CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n${extra}\r\n`;
 
 describe("isForbiddenAddress", () => {
@@ -99,23 +123,23 @@ describe("CONNECT", () => {
 
   it("tunnels bytes both ways to an allowed host, connecting to the vetted address", async () => {
     r = await rig();
-    const { client, text } = await talk(r.sock, connectReq("api.anthropic.com:443"));
+    const { client, text } = await talk(r.sock, hi("api.anthropic.com"));
     expect(text).toContain("HTTP/1.1 200 Connection established");
     expect(text).toContain("HELLO");
     client.write("ping");
     await sleep(150);
     client.destroy();
-    expect(Buffer.concat(r.up.received).toString()).toBe("ping");
+    expect(Buffer.concat(r.up.received)).toEqual(Buffer.concat([clientHello("api.anthropic.com"), Buffer.from("ping")])); // the hello is forwarded untouched
     expect(r.connects).toEqual([{ port: 443, ip: "160.79.104.10" }]); // the address that was checked, not the name
     expect(r.proxy.stats().allowed).toBe(1);
   });
 
   it("is case-insensitive on the host and forwards bytes the client sent right behind the request", async () => {
     r = await rig();
-    const { text, client } = await talk(r.sock, connectReq("API.Anthropic.COM:443") + "early");
+    const { text, client } = await talk(r.sock, Buffer.concat([Buffer.from(connectReq("API.Anthropic.COM:443")), clientHello("api.anthropic.com")]));
     expect(text).toContain("200 Connection established");
     await sleep(100);
-    expect(Buffer.concat(r.up.received).toString()).toBe("early");
+    expect(Buffer.concat(r.up.received)).toEqual(clientHello("api.anthropic.com"));
     client.destroy();
   });
 
@@ -264,7 +288,7 @@ describe("bounds", () => {
 
   it("closes an idle tunnel", async () => {
     r = await rig({ idleMs: 150 });
-    const { client } = await talk(r.sock, connectReq("api.anthropic.com:443"), 100);
+    const { client } = await talk(r.sock, hi("api.anthropic.com"), 100);
     let closed = false;
     client.on("close", () => (closed = true));
     await sleep(500);
@@ -273,7 +297,7 @@ describe("bounds", () => {
 
   it("closes a busy tunnel at its maximum lifetime", async () => {
     r = await rig({ idleMs: 10_000, maxLifetimeMs: 250 });
-    const { client } = await talk(r.sock, connectReq("api.anthropic.com:443"), 100);
+    const { client } = await talk(r.sock, hi("api.anthropic.com"), 100);
     let closed = false;
     client.on("close", () => (closed = true));
     const t = setInterval(() => client.write("x"), 30);
@@ -284,19 +308,19 @@ describe("bounds", () => {
 
   it("answers 503 beyond the connection cap and recovers when a slot frees", async () => {
     r = await rig({ maxConnections: 2 });
-    const a = await talk(r.sock, connectReq("api.anthropic.com:443"), 150);
-    const b = await talk(r.sock, connectReq("claude.ai:443"), 150);
+    const a = await talk(r.sock, hi("api.anthropic.com"), 150);
+    const b = await talk(r.sock, hi("claude.ai"), 150);
     expect(r.proxy.stats().active).toBe(2);
-    expect((await talk(r.sock, connectReq("api.anthropic.com:443"), 150)).text).toContain("503");
+    expect((await talk(r.sock, hi("api.anthropic.com"), 150)).text).toContain("503");
     a.client.destroy();
     await sleep(100);
-    expect((await talk(r.sock, connectReq("api.anthropic.com:443"), 150)).text).toContain("200 Connection established");
+    expect((await talk(r.sock, hi("api.anthropic.com"), 150)).text).toContain("200 Connection established");
     b.client.destroy();
   });
 
   it("close() destroys active tunnels and removes the socket", async () => {
     r = await rig();
-    const { client } = await talk(r.sock, connectReq("api.anthropic.com:443"), 150);
+    const { client } = await talk(r.sock, hi("api.anthropic.com"), 150);
     let closed = false;
     client.on("close", () => (closed = true));
     await r.proxy.close();
@@ -326,11 +350,299 @@ describe("the socket", () => {
 
   it("counts allowed and denied separately", async () => {
     const r = await rig();
-    const ok = await talk(r.sock, connectReq("api.anthropic.com:443"), 100);
+    const ok = await talk(r.sock, hi("api.anthropic.com"), 100);
     await talk(r.sock, connectReq("example.com:443"), 100);
     await talk(r.sock, connectReq("evil.example.com:443"), 100);
     expect(r.proxy.stats()).toMatchObject({ allowed: 1, denied: 2 });
     ok.client.destroy();
     await r.close();
+  });
+});
+
+/** An upstream whose "connect" completes only after `ms`, like a slow network. */
+const slowConnect = (up: { port: number }, ms: number) => (): Socket => {
+  const s = new Socket();
+  setTimeout(() => s.connect(up.port, "127.0.0.1"), ms);
+  return s;
+};
+/** Writes the given chunks to the proxy socket `gapMs` apart and collects what comes back. */
+function trickle(sock: string, chunks: Array<string | Buffer>, gapMs: number, waitMs = 600): Promise<{ text: string; client: Socket; closed: boolean }> {
+  return new Promise((resolve) => {
+    const client = netConnect(sock);
+    let text = "";
+    let closed = false;
+    client.on("data", (d) => (text += d.toString("latin1")));
+    client.on("error", () => undefined);
+    client.on("close", () => (closed = true));
+    client.on("connect", () => {
+      chunks.forEach((c, i) => setTimeout(() => client.write(c), i * gapMs));
+    });
+    setTimeout(() => resolve({ text, client, closed }), waitMs);
+  });
+}
+
+describe("bytes sent while the upstream connect is in progress are kept (not dropped by a flowing, unlistened socket)", () => {
+  let r: Rig;
+  afterEach(async () => r && (await r.close()));
+
+  it("CONNECT: the rest of the ClientHello and what follows it arrive upstream in order", async () => {
+    r = await rig();
+    await r.proxy.close(); // keep only the fake upstream; the proxy under test is built below with a slow connect
+    const dir = mkdtempSync(join(tmpdir(), "egress-slow-"));
+    dirs.push(dir);
+    const sock = join(dir, "p.sock");
+    const proxy = await startEgressProxy({ socketPath: sock, allow: ["api.anthropic.com:443"], resolve: async () => ["160.79.104.10"], connect: slowConnect(r.up, 250) });
+    const hello = clientHello("api.anthropic.com");
+    const half = Math.floor(hello.length / 2);
+    const t = await trickle(sock, [Buffer.concat([Buffer.from(connectReq("api.anthropic.com:443")), hello.subarray(0, half)]), hello.subarray(half), "tail-bytes"], 80, 900);
+    expect(t.text).toContain("200 Connection established");
+    expect(Buffer.concat(r.up.received)).toEqual(Buffer.concat([hello, Buffer.from("tail-bytes")]));
+    t.client.destroy();
+    await proxy.close();
+  });
+
+  it("plain-http bridge: a body written separately from the head, during a slow connect, still reaches the bridge", async () => {
+    r = await rig();
+    await r.proxy.close();
+    const dir = mkdtempSync(join(tmpdir(), "egress-slow-"));
+    dirs.push(dir);
+    const sock = join(dir, "p.sock");
+    const proxy = await startEgressProxy({ socketPath: sock, allow: [], bridge: { host: "127.0.0.1", port: 3991 }, connect: slowConnect(r.up, 250) });
+    const head = "POST http://127.0.0.1:3991/mcp HTTP/1.1\r\nHost: 127.0.0.1:3991\r\nContent-Length: 11\r\n\r\n";
+    const t = await trickle(sock, [head, "hello world"], 80, 900);
+    void t;
+    const got = Buffer.concat(r.up.received).toString();
+    expect(got.startsWith("POST /mcp HTTP/1.1\r\n")).toBe(true);
+    expect(got.endsWith("\r\n\r\nhello world")).toBe(true);
+    t.client.destroy();
+    await proxy.close();
+  });
+});
+
+describe("SNI pinning: the TLS ClientHello must name the CONNECT host", () => {
+  let r: Rig;
+  afterEach(async () => r && (await r.close()));
+  const denied = () => r.warnings.filter((w) => w.event === "egress_denied").map((w) => w.fields.reason);
+
+  it("passes a matching name, normalising case and a trailing dot", async () => {
+    r = await rig();
+    for (const sni of ["api.anthropic.com", "API.Anthropic.COM", "api.anthropic.com."]) {
+      const t = await talk(r.sock, hi("api.anthropic.com", sni), 200);
+      expect(t.closed).toBe(false);
+      t.client.destroy();
+    }
+    expect(r.proxy.stats().allowed).toBe(3);
+    expect(denied()).toEqual([]);
+  });
+
+  it("refuses a different name on the same allowed host:port (shared CDN edge), closing both sides and logging only host:port + reason", async () => {
+    r = await rig();
+    const t = await talk(r.sock, hi("claude.ai", "evil.example.org"), 300);
+    expect(t.closed).toBe(true);
+    expect(denied()).toEqual(["sni_mismatch"]);
+    expect(r.warnings[0].fields).toEqual({ target: "claude.ai:443", reason: "sni_mismatch" });
+    expect(r.up.received).toHaveLength(0); // not a single byte reached the upstream
+    expect(r.proxy.stats()).toMatchObject({ allowed: 0, denied: 1 });
+  });
+
+  it.each([
+    ["no server_name at all", clientHello("api.anthropic.com", { rawServerNameList: undefined }).length && clientHello(null), "no_sni"],
+    ["an HTTP request instead of TLS", Buffer.from("GET / HTTP/1.1\r\nHost: api.anthropic.com\r\n\r\n"), "not_tls"],
+    ["garbage bytes", Buffer.from([1, 2, 3, 4, 5, 6, 7, 8]), "not_tls"],
+    ["a hello that is not a ClientHello", Buffer.concat([Buffer.from([0x16, 3, 1, 0, 5]), Buffer.from([2, 0, 0, 1, 0])]), "not_client_hello"],
+    ["an oversized record", Buffer.from([0x16, 3, 1, 0xff, 0xff, 1]), "oversize"],
+  ])("refuses %s", async (_n, bytes, reason) => {
+    r = await rig();
+    const t = await talk(r.sock, Buffer.concat([Buffer.from(connectReq("api.anthropic.com:443")), bytes as Buffer]), 300);
+    expect(t.closed).toBe(true);
+    expect(denied()).toEqual([reason]);
+    expect(r.up.received).toHaveLength(0);
+  });
+
+  it("accepts a ClientHello split across several TCP writes", async () => {
+    r = await rig();
+    const hello = clientHello("api.anthropic.com", { sessionId: 32 });
+    const parts = [Buffer.from(connectReq("api.anthropic.com:443")), hello.subarray(0, 3), hello.subarray(3, 20), hello.subarray(20, 60), hello.subarray(60)];
+    const t = await trickle(r.sock, parts, 40, 500);
+    expect(t.closed).toBe(false);
+    expect(Buffer.concat(r.up.received)).toEqual(hello);
+    t.client.destroy();
+  });
+
+  it("drops a hello that never completes (timer) without reaching the upstream", async () => {
+    r = await rig({ sniMs: 150 });
+    const hello = clientHello("api.anthropic.com");
+    const t = await talk(r.sock, Buffer.concat([Buffer.from(connectReq("api.anthropic.com:443")), hello.subarray(0, 30)]), 500);
+    expect(t.closed).toBe(true);
+    expect(denied()).toEqual(["hello_timeout"]);
+    expect(r.up.received).toHaveLength(0);
+  });
+
+  it("is not applied to the tool bridge (it may be an IP or a private name)", async () => {
+    r = await rig({ bridge: { host: "127.0.0.1", port: 3991 } });
+    const t = await talk(r.sock, connectReq("127.0.0.1:3991") + "not-tls-at-all", 300);
+    expect(t.closed).toBe(false);
+    expect(Buffer.concat(r.up.received).toString()).toBe("not-tls-at-all");
+    t.client.destroy();
+  });
+});
+
+describe("parseClientHelloSni (strict)", () => {
+  it("needs more bytes until the record is complete, then returns the name", () => {
+    const h = clientHello("api.anthropic.com");
+    for (const n of [0, 1, 4, 5, h.length - 1]) expect(parseClientHelloSni(h.subarray(0, n)).s).toBe("more");
+    expect(parseClientHelloSni(h)).toEqual({ s: "ok", sni: "api.anthropic.com" });
+  });
+  it("returns null for a hello with no server_name or no extensions", () => {
+    expect(parseClientHelloSni(clientHello(null))).toEqual({ s: "ok", sni: null });
+    expect(parseClientHelloSni(clientHello(null, { noExtensions: true }))).toEqual({ s: "ok", sni: null });
+  });
+  it("refuses trailing bytes inside the record, a hello spread over records, duplicate or odd server_name entries, IP names", () => {
+    const h = clientHello("api.anthropic.com");
+    const spread = Buffer.from(h); // claims a handshake longer than the record
+    spread.writeUIntBE(h.readUIntBE(6, 3) + 10, 6, 3);
+    expect(parseClientHelloSni(spread)).toMatchObject({ s: "bad", reason: "fragmented_hello" });
+    const u16 = (n: number) => Buffer.from([n >> 8, n & 0xff]);
+    const name = Buffer.from("a.example.com");
+    const entry = Buffer.concat([Buffer.from([0]), u16(name.length), name]);
+    expect(parseClientHelloSni(clientHello(null, { rawServerNameList: Buffer.concat([entry, entry]) }))).toMatchObject({ s: "bad", reason: "multiple_names" });
+    expect(parseClientHelloSni(clientHello(null, { rawServerNameList: Buffer.concat([Buffer.from([1]), u16(name.length), name]) }))).toMatchObject({ s: "bad" });
+    const dup = Buffer.concat([u16(0), u16(entry.length + 2), u16(entry.length), entry]);
+    expect(parseClientHelloSni(clientHello("a.example.com", { extraExts: [dup] }))).toMatchObject({ s: "bad", reason: "duplicate_sni" });
+    expect(parseClientHelloSni(clientHello("10.1.2.3"))).toMatchObject({ s: "bad", reason: "bad_sni" });
+    expect(parseClientHelloSni(clientHello("bad name"))).toMatchObject({ s: "bad", reason: "bad_sni" });
+  });
+});
+
+describe("connection cap: no socket is ever left open or untracked", () => {
+  let r: Rig;
+  afterEach(async () => r && (await r.close()));
+
+  it("over-cap connections get 503 and are closed by the proxy even if the peer never reads or closes", async () => {
+    r = await rig({ maxConnections: 2 });
+    await talk(r.sock, hi("api.anthropic.com"), 100);
+    await talk(r.sock, hi("claude.ai"), 100);
+    const extras: Socket[] = [];
+    let closed = 0;
+    for (let i = 0; i < 6; i++) {
+      const c = netConnect({ path: r.sock, allowHalfOpen: true });
+      c.on("error", () => undefined);
+      c.on("close", () => closed++);
+      c.resume(); // reads the 503 and the proxy's FIN, but never closes its own side
+      extras.push(c);
+    }
+    await sleep(1_000);
+    expect(closed).toBe(0); // not yet: the proxy gives the 503 a moment to be read ...
+    await sleep(1_700);
+    extras.forEach((c) => c.write("x")); // ... then it has dropped the socket: a write to it is reset
+    await sleep(300);
+    expect(closed).toBe(6);
+    expect(r.proxy.stats().active).toBe(2);
+    extras.forEach((c) => c.destroy());
+  }, 10_000);
+
+  it("close() resolves promptly even while over-cap sockets are still open", async () => {
+    r = await rig({ maxConnections: 1 });
+    await talk(r.sock, hi("api.anthropic.com"), 100);
+    for (let i = 0; i < 5; i++) {
+      const c = netConnect(r.sock);
+      c.on("error", () => undefined);
+      c.pause();
+    }
+    await sleep(100);
+    const started = Date.now();
+    await r.proxy.close();
+    expect(Date.now() - started).toBeLessThan(1_000);
+    await r.up.close();
+    r = undefined as never;
+  });
+});
+
+describe("vetted addresses, link-local and the DNS cache", () => {
+  let r: Rig;
+  afterEach(async () => r && (await r.close()));
+
+  it("falls back to the next vetted address when connecting to the first fails", async () => {
+    const attempts: string[] = [];
+    r = await rig(
+      {
+        connect: (port, ip) => {
+          attempts.push(ip);
+          return ip === "160.79.104.50" ? netConnect({ port: 1, host: "127.0.0.1" }) : netConnect({ port: r.up.port, host: "127.0.0.1" });
+        },
+      },
+      { "api.anthropic.com": ["160.79.104.50", "160.79.104.51"] },
+    );
+    const t = await talk(r.sock, hi("api.anthropic.com"), 400);
+    expect(t.text).toContain("200 Connection established");
+    expect(attempts).toEqual(["160.79.104.50", "160.79.104.51"]);
+    t.client.destroy();
+  });
+
+  it("answers 502 when every vetted address fails", async () => {
+    r = await rig({ connect: () => netConnect({ port: 1, host: "127.0.0.1" }) }, { "api.anthropic.com": ["160.79.104.50", "160.79.104.51"] });
+    expect((await talk(r.sock, connectReq("api.anthropic.com:443"), 500)).text).toContain("502");
+  });
+
+  it("a hanging first address is abandoned after the attempt timer", async () => {
+    const attempts: string[] = [];
+    r = await rig(
+      {
+        connectAttemptMs: 100,
+        connect: (_port, ip) => {
+          attempts.push(ip);
+          if (ip === "160.79.104.50") return new Socket(); // never connects
+          return netConnect({ port: r.up.port, host: "127.0.0.1" });
+        },
+      },
+      { "api.anthropic.com": ["160.79.104.50", "160.79.104.51"] },
+    );
+    const t = await talk(r.sock, hi("api.anthropic.com"), 500);
+    expect(t.text).toContain("200 Connection established");
+    expect(attempts).toHaveLength(2);
+    t.client.destroy();
+  });
+
+  it("never reaches a link-local address, not even for the bridge (a bridge NAME pointing at the metadata service, or the literal)", async () => {
+    r = await rig({ bridge: { host: "bridge.internal.test", port: 3001 } }, { "bridge.internal.test": ["169.254.169.254"] });
+    expect((await talk(r.sock, connectReq("bridge.internal.test:3001"))).text).toContain("403");
+    expect(r.warnings.at(-1)?.fields.reason).toBe("bridge_link_local");
+    expect(r.connects).toHaveLength(0);
+    await r.close();
+    r = await rig({ bridge: { host: "169.254.169.254", port: 80 } });
+    expect((await talk(r.sock, "GET http://169.254.169.254/latest/meta-data/ HTTP/1.1\r\nHost: 169.254.169.254\r\n\r\n")).text).toContain("403");
+    expect(r.connects).toHaveLength(0);
+  });
+
+  it("isLinkLocalAddress knows the v4, v6 and mapped forms", () => {
+    for (const ip of ["169.254.169.254", "169.254.0.1", "fe80::1", "febf::1", "::ffff:169.254.169.254"]) expect(isLinkLocalAddress(ip)).toBe(true);
+    for (const ip of ["127.0.0.1", "10.0.0.1", "169.253.0.1", "fec0::1", "8.8.8.8", "2607:6bc0::10", "not-an-ip"]) expect(isLinkLocalAddress(ip)).toBe(false);
+  });
+
+  it("caches the vetted answer of an allowlisted name for the TTL (one resolve), then resolves again; the bridge is never cached", async () => {
+    let t = 1_000;
+    r = await rig({ now: () => t, dnsCacheTtlMs: 30_000, bridge: { host: "bridge.internal.test", port: 3001 } }, { "bridge.internal.test": ["10.9.9.9"] });
+    for (let i = 0; i < 3; i++) (await talk(r.sock, hi("api.anthropic.com"), 120)).client.destroy();
+    expect(r.resolved.filter((h) => h === "api.anthropic.com")).toHaveLength(1);
+    t += 31_000;
+    (await talk(r.sock, hi("api.anthropic.com"), 120)).client.destroy();
+    expect(r.resolved.filter((h) => h === "api.anthropic.com")).toHaveLength(2);
+    for (let i = 0; i < 2; i++) (await talk(r.sock, connectReq("bridge.internal.test:3001"), 100)).client.destroy();
+    expect(r.resolved.filter((h) => h === "bridge.internal.test")).toHaveLength(2);
+  });
+
+  it("does not cache a refused answer, so a name that turns private is caught on the next request", async () => {
+    let answer = ["160.79.104.10"];
+    r = await rig({ resolve: async () => answer, dnsCacheTtlMs: 30_000 });
+    (await talk(r.sock, hi("api.anthropic.com"), 120)).client.destroy();
+    answer = ["10.0.0.5"];
+    await sleep(10);
+    // still cached for the TTL (documented), but a different name resolving privately is refused and never cached
+    const t = await talk(r.sock, hi("claude.ai"), 150);
+    expect(t.text).toContain("403");
+    answer = ["160.79.104.11"];
+    const t2 = await talk(r.sock, hi("claude.ai"), 150);
+    expect(t2.text).toContain("200 Connection established");
+    t2.client.destroy();
   });
 });
