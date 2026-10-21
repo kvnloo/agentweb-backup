@@ -86,6 +86,7 @@ import zomaRoutes from "./routes/zoma";
 import { createToolBridgeRouter } from "./routes/toolBridge";
 import { createLlmConnectionsRouter } from "./routes/llmConnections";
 import { createClaudeSubscriptionRouter } from "./routes/claudeSubscription";
+import { createHostedSubscriptionsRouter } from "./routes/hostedSubscriptions";
 import { toolBridgeMcp } from "./services/funding/toolBridgeService";
 import skillRoutes from "./routes/skillRoutes";
 import userSkillRoutes from "./routes/userSkillRoutes";
@@ -428,6 +429,8 @@ app.use("/internal/tool-bridge", createToolBridgeRouter(toolBridgeMcp));
 // ENG-2110: connecting a Claude subscription (sign-in ceremony). Gated per user by the claudeSubscription flag.
 // Mounted before the generic router so its paths are never read as a connection id.
 app.use("/api/llm-connections/claude-subscription", createClaudeSubscriptionRouter());
+// ENG-2110 (1c): the same ceremony for a login that lives on the login host (dark: per-user flag, no host configured in prod).
+app.use("/api/llm-connections/subscriptions/:provider", createHostedSubscriptionsRouter());
 // ENG-2105: a customer's own LLM provider keys (BYOK). Adding or re-validating a key
 // is gated by the eng1816_funding_flags row; listing and revoking always work.
 app.use("/api/llm-connections", createLlmConnectionsRouter());

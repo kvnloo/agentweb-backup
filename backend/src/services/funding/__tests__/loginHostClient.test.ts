@@ -285,6 +285,86 @@ describe("login host client", () => {
       expect(await runHostTurn(new LoginHostClient(early), turnReq("c1", 1), { sleep: noSleep })).toMatchObject({ kind: "unknown_outcome", reason: "stream_dropped" });
     });
 
+    it("a result that arrived before the connection dropped stands as the answer", async () => {
+      await boot();
+      await signIn();
+      const real = transport;
+      const lateDrop: HostTransport = {
+        json: (r, b) => real.json(r, b),
+        stream: async (r, b) => {
+          const reply = await real.stream(r, b);
+          const it = reply.lines[Symbol.asyncIterator]();
+          let n = 0;
+          // accepted, text, result, then the connection dies instead of ending cleanly
+          return { close: () => reply.close(), lines: { [Symbol.asyncIterator]: () => ({ next: async () => (++n <= 3 ? it.next() : Promise.reject(new LoginHostError("UNREACHABLE"))) }) } };
+        },
+      };
+      const seen: string[] = [];
+      const out = await runHostTurn(new LoginHostClient(lateDrop), turnReq("c1", 1), { sleep: noSleep, onEvent: (e) => void seen.push(e.type) });
+      expect(out).toMatchObject({ kind: "completed", result: { type: "result", ok: true, text: "hi" } });
+      expect(seen).toEqual(["text", "result"]);
+    });
+
+    it("an error thrown by the caller's onEvent reaches the caller even when it looks like a transport error", async () => {
+      await boot();
+      await signIn();
+      rig.script.turnEvents = [{ type: "text", delta: "a" }, { wait: new Promise<void>(() => undefined) }];
+      await expect(
+        runHostTurn(client, turnReq("c1", 1), {
+          sleep: noSleep,
+          onEvent: () => {
+            throw new LoginHostError("TIMEOUT");
+          },
+        }),
+      ).rejects.toMatchObject({ code: "TIMEOUT" });
+    });
+
+    it("learns a short host lease before the first wait, so a 3 s lease survives a long turn", async () => {
+      await boot({ config: { leaseMs: 3_000 } });
+      await signIn();
+      rig.script.turnEvents = [{ wait: new Promise<void>(() => undefined) }];
+      const abort = new AbortController();
+      let rounds = 0;
+      const out = await runHostTurn(client, turnReq("c1", 1), {
+        signal: abort.signal,
+        sleep: async (ms) => {
+          rig.clock.advance(ms);
+          rig.mgr.tick();
+          await new Promise((r) => setTimeout(r, 10));
+          if (++rounds === 12) abort.abort(); // ~12 s of host time against a 3 s lease
+        },
+      });
+      expect(out).toMatchObject({ kind: "completed", result: { aborted: "interrupted" } });
+    });
+
+    it("returns promptly when a renew is still in flight at the end of the turn", async () => {
+      await boot();
+      await signIn();
+      jest.spyOn(client, "turnRenew").mockImplementation(() => new Promise(() => undefined)); // never answers
+      const started = Date.now();
+      expect(await runHostTurn(client, turnReq("c1", 1), { sleep: noSleep })).toMatchObject({ kind: "completed" });
+      expect(Date.now() - started).toBeLessThan(2_000);
+    });
+
+    it("rejects a known event with wrong fields instead of passing it on as the declared type", async () => {
+      await boot();
+      await signIn();
+      const real = transport;
+      const bad: HostTransport = {
+        json: (r, b) => real.json(r, b),
+        stream: async () => ({
+          close: () => undefined,
+          lines: (async function* () {
+            yield { type: "accepted", turnId: "t1", duplicate: false };
+            yield { type: "result" }; // no ok, no text
+          })(),
+        }),
+      };
+      const stream = await new LoginHostClient(bad).turnRun(turnReq("c1", 1));
+      await expect((async () => { for await (const e of stream.events) void e; })()).rejects.toMatchObject({ code: "BAD_RESPONSE" });
+      expect(await runHostTurn(new LoginHostClient(bad), turnReq("c1", 1), { sleep: noSleep })).toMatchObject({ kind: "unknown_outcome", reason: "stream_dropped" });
+    });
+
     it("a caller that throws in onEvent interrupts the turn and gets its own error back", async () => {
       await boot();
       await signIn();
