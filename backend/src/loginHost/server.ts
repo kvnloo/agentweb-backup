@@ -12,6 +12,8 @@
  */
 import { chmodSync, existsSync, rmSync } from "fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "http";
+import { createServer as createHttpsServer } from "https";
+import type { TLSSocket } from "tls";
 import { connect } from "net";
 import { ZodError } from "zod";
 import type { ConnectionManager } from "./connectionManager";
@@ -34,6 +36,11 @@ export interface HostServerOptions {
   bodyIdleMs?: number;
   /** A turn stream the reader stops draining for this long is cut, which also ends the turn (default 30 s). */
   streamStallMs?: number;
+  /**
+   * A second listener for a backend on ANOTHER machine: mutual TLS only (TLS 1.3, a client certificate signed by `ca` is REQUIRED, and its
+   * subject CN must be one of `clientCommonNames`). Same closed API, same handler; the unix socket stays as it is.
+   */
+  tls?: { host: string; port: number; cert: string | Buffer; key: string | Buffer; ca: string | Buffer; clientCommonNames: string[]; maxConnections?: number; handshakeMs?: number };
 }
 
 export class SocketInUseError extends Error {
@@ -57,6 +64,10 @@ function socketIsLive(path: string): Promise<boolean> {
 
 export interface HostServerHandle {
   server: Server;
+  /** The mutual-TLS listener, when configured. */
+  tlsServer?: Server;
+  /** The port the TLS listener actually bound (differs from the configured one only when that was 0, in tests). */
+  tlsPort?: number;
   close(): Promise<void>;
 }
 
@@ -81,18 +92,58 @@ export async function startHostServer(manager: ConnectionManager, opts: HostServ
     server.listen(opts.socketPath, () => resolve());
   });
   chmodSync(opts.socketPath, opts.socketMode ?? 0o660);
+  let tlsServer: Server | undefined;
+  let tlsPort: number | undefined;
+  if (opts.tls) {
+    const t = opts.tls;
+    const allowed = new Set(t.clientCommonNames);
+    const secure = createHttpsServer(
+      { cert: t.cert, key: t.key, ca: t.ca, requestCert: true, rejectUnauthorized: true, minVersion: "TLSv1.3", handshakeTimeout: t.handshakeMs ?? 10_000 },
+      (req, res) => {
+        void handle(manager, req, res, opts.bodyIdleMs ?? BODY_IDLE_MS, opts.streamStallMs ?? 30_000).catch(() => {
+          if (!res.headersSent) sendError(res, new HostError("EINTERNAL"));
+          else res.end();
+        });
+      },
+    );
+    // A certificate the CA signed is necessary, not sufficient: the caller must be the backend's identity.
+    secure.on("secureConnection", (socket: TLSSocket) => {
+      const cn = socket.getPeerCertificate().subject?.CN;
+      if (typeof cn !== "string" || !allowed.has(cn)) socket.destroy();
+    });
+    secure.on("tlsClientError", () => undefined); // a failed handshake is the client's problem; never an unhandled event
+    secure.on("clientError", (_err, socket) => socket.destroy());
+    secure.requestTimeout = 0;
+    secure.headersTimeout = 10_000;
+    secure.maxConnections = t.maxConnections ?? 64;
+    await new Promise<void>((resolve, reject) => {
+      secure.once("error", reject);
+      secure.listen(t.port, t.host, () => resolve());
+    });
+    tlsServer = secure;
+    tlsPort = (secure.address() as { port: number }).port;
+  }
   const tick = setInterval(() => manager.tick(), opts.tickMs ?? 5_000);
   const sweep = setInterval(() => void manager.sweep().catch(() => undefined), opts.sweepMs ?? 60_000);
   tick.unref();
   sweep.unref();
   return {
     server,
+    ...(tlsServer ? { tlsServer, tlsPort } : {}),
     close: () =>
       new Promise<void>((resolve) => {
         clearInterval(tick);
         clearInterval(sweep);
-        server.close(() => resolve());
+        let open = tlsServer ? 2 : 1;
+        const done = () => {
+          if (--open === 0) resolve();
+        };
+        server.close(done);
         server.closeAllConnections?.();
+        if (tlsServer) {
+          tlsServer.close(done);
+          (tlsServer as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();
+        }
       }),
   };
 }

@@ -74,6 +74,23 @@ const schema = z
       })
       .strict(),
     /**
+     * Mutual-TLS listener for a backend on ANOTHER machine (PR 3). Optional: the unix socket alone is enough on a single box (the test
+     * environment). The files are root-owned (the key 0600), written at deploy time from Secrets Manager; they are read once at start-up.
+     */
+    tls: z
+      .object({
+        /** The private address to bind (never 0.0.0.0 by accident): an IPv4 literal. */
+        host: z.string().regex(/^(?:\d{1,3}\.){3}\d{1,3}$/, "an IPv4 address"),
+        port: z.number().int().min(1024).max(65535).default(8443),
+        certPath: absPath,
+        keyPath: absPath,
+        caPath: absPath,
+        /** The subject CN(s) the backend's client certificate must carry (the CA signing it is necessary, not sufficient). */
+        clientCommonNames: z.array(z.string().regex(/^[A-Za-z0-9._-]{1,64}$/)).min(1).max(5),
+      })
+      .strict()
+      .optional(),
+    /**
      * Network isolation (PR 2): every customer unit runs with PrivateNetwork=yes (loopback only) and reaches the world ONLY through the
      * host's allowlisting proxy over a unix socket. `allow` is the complete list of `host:port` targets a customer process may reach
      * (the Emma tool bridge from `claude.bridgeUrl` is added automatically). There is no default: a host with no policy does not start.
@@ -128,6 +145,7 @@ export function parseHostConfig(raw: unknown): HostConfig {
     if (!Number.isInteger(port) || port < 1 || port > 65535) throw new HostConfigError(`egress.allow: bad port in ${t}`);
     if (/^[0-9.]+:/.test(t) || t.startsWith("[")) throw new HostConfigError(`egress.allow: literal IP targets are not allowed (${t})`);
   }
+  if (c.tls && (c.tls.host === "0.0.0.0" || c.tls.host.startsWith("127."))) throw new HostConfigError("tls.host must be the machine's private address (not 0.0.0.0 or loopback)");
   const egressDir = `/run/aw-egress-${c.env}`;
   return { ...c, stateRoot, socketPath: `${c.socket.dir}/host.sock`, egressDir, egressSocketPath: `${egressDir}/proxy.sock` };
 }

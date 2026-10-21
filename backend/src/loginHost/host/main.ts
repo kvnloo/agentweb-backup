@@ -8,7 +8,7 @@
  * allocated uid, parks swaps that were interrupted), (4) only then the socket is created.
  */
 import { randomBytes } from "crypto";
-import { chmodSync, chownSync, existsSync, mkdirSync, readFileSync, rmSync } from "fs";
+import { chmodSync, chownSync, existsSync, mkdirSync, readFileSync, rmSync, statSync } from "fs";
 import { ClaudeAdapter } from "../adapters/claudeAdapter";
 import type { SubscriptionProviderAdapter } from "../adapter";
 import { ConnectionManager, DEFAULT_CONFIG, type ManagerConfig } from "../connectionManager";
@@ -40,6 +40,9 @@ export interface HostDeps {
   socketDir?: string;
   /** Tests run unprivileged: a temp directory instead of /run/aw-egress-<env> for the egress proxy socket. */
   egressDir?: string;
+  /** Tests: bind the mutual-TLS listener to this address/port (port 0 = any) instead of the configured private address. */
+  tlsHost?: string;
+  tlsPort?: number;
   /** Tests: the egress proxy's name resolution and upstream connect (no real network). */
   egressResolve?: (host: string) => Promise<string[]>;
   managerOverrides?: Partial<ManagerConfig>;
@@ -197,7 +200,11 @@ export async function startHost(cfg: HostConfig, binary: VerifiedBinary, deps: H
       chownSync(sockDir, 0, cfg.socket.gid);
       chmodSync(sockDir, 0o750);
     }
-    const handle = await startHostServer(built.manager, { socketPath: sockPath, socketMode: cfg.socket.mode });
+    const handle = await startHostServer(built.manager, {
+      socketPath: sockPath,
+      socketMode: cfg.socket.mode,
+      ...(cfg.tls ? { tls: { host: deps.tlsHost ?? cfg.tls.host, port: deps.tlsPort ?? cfg.tls.port, cert: readFileSync(cfg.tls.certPath), key: readFileSync(cfg.tls.keyPath), ca: readFileSync(cfg.tls.caPath), clientCommonNames: cfg.tls.clientCommonNames } } : {}),
+    });
     if (deps.chownSocket !== false) {
       chownSync(sockPath, 0, cfg.socket.gid);
       chmodSync(sockPath, cfg.socket.mode);
@@ -239,7 +246,11 @@ export async function runMain(argv: string[] = process.argv): Promise<void> {
     assertTrustedPath(configPath); // the config is root-owned and not writable by anyone else, like everything it points to
     const cfg = parseHostConfig(JSON.parse(readFileSync(configPath, "utf8")));
     // Everything the host or a customer unit executes or reads as policy must be root-controlled too.
-    for (const p of [cfg.claude.turnWrapperPath, cfg.egress.launcherPath, cfg.egress.socat, cfg.claude.systemPromptFile, cfg.tools.writeFileHelper, cfg.tools.systemRun, cfg.tools.systemctl, cfg.tools.setpriv, cfg.tools.env, cfg.tools.rm, cfg.tools.find, ...(cfg.quota ? [cfg.tools.setquota] : [])]) assertTrustedPath(p);
+    for (const p of [...(cfg.tls ? [cfg.tls.certPath, cfg.tls.keyPath, cfg.tls.caPath] : []), cfg.claude.turnWrapperPath, cfg.egress.launcherPath, cfg.egress.socat, cfg.claude.systemPromptFile, cfg.tools.writeFileHelper, cfg.tools.systemRun, cfg.tools.systemctl, cfg.tools.setpriv, cfg.tools.env, cfg.tools.rm, cfg.tools.find, ...(cfg.quota ? [cfg.tools.setquota] : [])]) assertTrustedPath(p);
+    if (cfg.tls) {
+      // The private key must not be readable by anyone but root (assertTrustedPath only rules out WRITE access).
+      if (statSync(cfg.tls.keyPath).mode & 0o077) throw new HostConfigError(`${cfg.tls.keyPath} must be mode 0600`);
+    }
     if (existsSync("/etc/subuid")) assertNoSubuidOverlap(readFileSync("/etc/subuid", "utf8"), cfg.uidMin, cfg.uidMax);
     registerRange(`${cfg.sharedParent}/ranges`, { env: cfg.env, uidMin: cfg.uidMin, uidMax: cfg.uidMax });
     assertHomesMount(parseMounts(readFileSync("/proc/mounts", "utf8")), `${cfg.stateRoot}/u`, !!cfg.quota);

@@ -60,6 +60,21 @@ describe("host config (a CLOSED schema)", () => {
     const cfg = parseHostConfig(base());
     expect(portConfigFor(cfg).paths.net).toEqual({ dir: "/run/aw-egress-test1", launcher: "/opt/aw-login-host/aw-net.sh", socat: "/usr/bin/socat" });
   });
+  describe("mutual TLS listener (PR 3)", () => {
+    const tls = { host: "172.31.30.50", port: 8443, certPath: "/etc/aw-login-host/tls/server.crt", keyPath: "/etc/aw-login-host/tls/server.key", caPath: "/etc/aw-login-host/tls/ca.crt", clientCommonNames: ["agentweb-backend-prod"] };
+    it("is optional and absent by default", () => expect(parseHostConfig(base()).tls).toBeUndefined());
+    it("accepts a private address with the files and the pinned client identity", () => expect(parseHostConfig({ ...base(), tls }).tls).toMatchObject({ host: "172.31.30.50", port: 8443, clientCommonNames: ["agentweb-backend-prod"] }));
+    it.each([
+      ["0.0.0.0", { host: "0.0.0.0" }],
+      ["loopback", { host: "127.0.0.1" }],
+      ["a hostname", { host: "worker.internal" }],
+      ["a privileged port", { port: 443 }],
+      ["no client identity", { clientCommonNames: [] }],
+      ["a client identity with odd characters", { clientCommonNames: ["a b"] }],
+      ["an unknown key", { extra: 1 }],
+      ["a relative cert path", { certPath: "server.crt" }],
+    ])("rejects %s", (_n, over) => expect(bad({ tls: { ...tls, ...over } })).toThrow(HostConfigError));
+  });
   it("rejects unknown keys anywhere (nothing is silently ignored)", () => {
     expect(bad({ extra: 1 })).toThrow(HostConfigError);
     expect(bad({ limits: { memoryMax: "1G", nope: 1 } })).toThrow(HostConfigError);
