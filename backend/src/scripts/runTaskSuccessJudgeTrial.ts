@@ -15,9 +15,13 @@
  *
  * Usage (default AWS profile; needs EVAL_GOLDEN_CASES_TABLE and an OpenRouter key):
  *   npx ts-node --transpile-only src/scripts/runTaskSuccessJudgeTrial.ts --split test [--max-usd 3] \
- *     [--model anthropic.claude-sonnet-5] [--all-agent-cases] [--out verdicts.json]
+ *     [--model anthropic.claude-sonnet-5] [--all-agent-cases] [--out verdicts.json] [--labeller]
+ *
+ * --labeller runs the blind cross-family labeller (GPT-5.4 by default) instead of the judge, to give
+ * the judge's trial a set of labels from outside both its family and the agent's.
  */
 import AWS from 'aws-sdk';
+import { createHash } from 'node:crypto';
 import { writeFileSync } from 'node:fs';
 import { argv, exit } from 'node:process';
 import { goldenSetStoreFromEnv, GOLDEN_CASES_TABLE_ENV } from '../loops/eval/goldenSetStore';
@@ -25,21 +29,29 @@ import { loadTraceForGrading } from '../loops/eval/runValidation';
 import type { ReadOnlyDocReader } from '../loops/eval/agentGraderLoader';
 import { LLM_MODEL_REGISTRY } from '../services/agentMode/llmModelRegistry';
 import { readChatCompletion, type RubricJudgeLlm } from '../services/creativeRubricJudge';
-import { DEFAULT_TASK_SUCCESS_JUDGE_MODEL, judgeTaskSuccess, TASK_SUCCESS_JUDGE_VERSION } from '../services/taskSuccessJudge';
+import {
+  DEFAULT_TASK_SUCCESS_JUDGE_MODEL,
+  DEFAULT_TASK_SUCCESS_LABELLER_MODEL,
+  judgeTaskSuccess,
+  labelTaskSuccess,
+  TASK_SUCCESS_JUDGE_VERSION,
+  TASK_SUCCESS_LABELLER_PROMPT,
+} from '../services/taskSuccessJudge';
 
 export interface TrialArgs {
   split: 'dev' | 'test';
   maxUsd: number;
   model: string;
   allAgentCases: boolean;
+  labeller: boolean;
   out?: string;
 }
 
 const USAGE =
-  'Usage: runTaskSuccessJudgeTrial.ts --split dev|test [--max-usd 3] [--model <id>] [--all-agent-cases] [--out <file>]';
+  'Usage: runTaskSuccessJudgeTrial.ts --split dev|test [--max-usd 3] [--model <id>] [--all-agent-cases] [--out <file>] [--labeller]';
 
 export function parseTrialArgs(raw: string[]): TrialArgs {
-  const args: TrialArgs = { split: 'test', maxUsd: 3, model: DEFAULT_TASK_SUCCESS_JUDGE_MODEL, allAgentCases: false };
+  const args: TrialArgs = { split: 'test', maxUsd: 3, model: '', allAgentCases: false, labeller: false };
   for (let i = 0; i < raw.length; i++) {
     const flag = raw[i];
     const value = raw[i + 1];
@@ -48,8 +60,10 @@ export function parseTrialArgs(raw: string[]): TrialArgs {
     else if (flag === '--model' && value) (args.model = value), i++;
     else if (flag === '--out' && value) (args.out = value), i++;
     else if (flag === '--all-agent-cases') args.allAgentCases = true;
+    else if (flag === '--labeller') args.labeller = true;
     else throw new Error(`${USAGE}\nunknown or invalid argument: ${flag}`);
   }
+  if (!args.model) args.model = args.labeller ? DEFAULT_TASK_SUCCESS_LABELLER_MODEL : DEFAULT_TASK_SUCCESS_JUDGE_MODEL;
   return args;
 }
 
@@ -111,7 +125,11 @@ async function main(): Promise<void> {
     if (args.out) writeFileSync(args.out, JSON.stringify(out, null, 1));
   };
   let outcome = 'aborted';
-  console.log(`judge ${TASK_SUCCESS_JUDGE_VERSION} model ${args.model} split ${args.split}: ${cases.length} cases, cap $${args.maxUsd}`);
+  const label = args.labeller
+    ? `labeller prompt-sha256:${createHash('sha256').update(TASK_SUCCESS_LABELLER_PROMPT).digest('hex').slice(0, 12)}`
+    : `judge ${TASK_SUCCESS_JUDGE_VERSION}`;
+  const run = args.labeller ? labelTaskSuccess : judgeTaskSuccess;
+  console.log(`${label} model ${args.model} split ${args.split}: ${cases.length} cases, cap $${args.maxUsd}`);
   try {
     for (const c of cases) {
       // Stop before a call that would pass the cap: assume the next costs what the average one did.
@@ -129,7 +147,7 @@ async function main(): Promise<void> {
         save();
         continue;
       }
-      const result = await judgeTaskSuccess(loaded, { llm, model: args.model });
+      const result = await run(loaded, { llm, model: args.model });
       if (result.status === 'error' && /reported no cost/.test(result.reason)) throw new Error(result.reason);
       judged += 1;
       const key = result.status === 'ok' ? result.verdict : 'error';
