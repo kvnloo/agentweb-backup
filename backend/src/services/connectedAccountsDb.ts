@@ -1036,11 +1036,17 @@ export const getAccountByIdConsistent = async (
  * ENG-2605. There is no GSI on connected_accounts, so resolving a portal means reading every user.
  * The webhook handler called this once per changed contact: a delivery of N contacts was N full
  * scans of AW-Users (~4 MB each). One snapshot of portal -> owner is now shared by every caller on
- * the instance and rebuilt at most once per HUBSPOT_PORTAL_MAP_TTL_MS, whether a lookup hits or
- * misses (a miss must not rescan: portals that installed the app but are unknown here are the
- * common case). A concurrent rebuild is shared. If a rebuild fails, a stale snapshot still
- * answers. A portal connected inside the window is picked up at the next rebuild, or at once on
- * the instance that took the connection.
+ * the instance. It is rebuilt when it is older than HUBSPOT_PORTAL_MAP_TTL_MS (5 min), or when a
+ * lookup MISSES on a snapshot older than HUBSPOT_PORTAL_MISS_REFRESH_MS (30 s): portals that
+ * installed the app but are unknown here are the common case, so a miss may not rescan on every
+ * event, but a portal connected on another instance must be found within seconds. Concurrent
+ * rebuilds are shared; if a rebuild fails a stale snapshot still answers; connecting a HubSpot
+ * account clears it at once on that instance.
+ *
+ * A cached HIT is verified before it is returned: one by-id read of the cached owner confirms that
+ * user still holds the portal. A portal that moved to another user or was disconnected therefore
+ * resolves correctly at once instead of routing events to the former owner for the rest of the TTL.
+ * If that read fails, the snapshot is trusted.
  */
 const HUBSPOT_PORTAL_MAP_TTL_MS = 5 * 60 * 1000;
 // A miss on a snapshot older than this rebuilds once: a portal connected on another instance is then
@@ -1091,19 +1097,42 @@ const loadHubSpotPortalMap = (): Promise<HubSpotPortalMap> => {
   return hubspotPortalMapInflight;
 };
 
+/** false = the user is gone or no longer holds the portal; undefined = could not tell (trust the snapshot). */
+const ownerStillHoldsPortal = async (ownerId: string, portalId: unknown): Promise<boolean | undefined> => {
+  try {
+    const { userDb } = await import('./db');
+    const owner: any = await userDb.getUserById(ownerId);
+    if (!owner) return false;
+    return (Array.isArray(owner.connected_accounts) ? owner.connected_accounts : []).some(
+      (a: any) => a?.platform === 'hubspot' && a?.config?.hub_id === portalId,
+    );
+  } catch {
+    return undefined;
+  }
+};
+
 export const getUserIdByHubSpotPortalId = async (portalId: number): Promise<string | null> => {
   const cached = hubspotPortalMap;
+  let cachedOwnerIsStale = false;
   if (cached && Date.now() - cached.at < HUBSPOT_PORTAL_MAP_TTL_MS) {
     const hit = cached.byPortal.get(portalId);
-    if (hit !== undefined || Date.now() - cached.at < HUBSPOT_PORTAL_MISS_REFRESH_MS) return hit ?? null;
+    if (hit !== undefined) {
+      if ((await ownerStillHoldsPortal(hit, portalId)) !== false) return hit;
+      // The cached owner no longer holds this portal: drop the snapshot and rebuild below.
+      cachedOwnerIsStale = true;
+      clearHubSpotPortalCache();
+    } else if (Date.now() - cached.at < HUBSPOT_PORTAL_MISS_REFRESH_MS) {
+      return null;
+    }
     // A miss on a snapshot older than the refresh age falls through to one shared rebuild.
   }
   try {
     return (await loadHubSpotPortalMap()).byPortal.get(portalId) ?? null;
   } catch (error) {
     console.error('Error resolving HubSpot Portal ID to User ID:', error);
-    // A stale answer beats dropping a webhook delivery because one rebuild was throttled.
-    return cached?.byPortal.get(portalId) ?? null;
+    // A stale answer beats dropping a webhook delivery because one rebuild was throttled, but never
+    // an owner we have just seen no longer holds the portal.
+    return cachedOwnerIsStale ? null : (cached?.byPortal.get(portalId) ?? null);
   }
 };
 
