@@ -141,7 +141,16 @@ main()
       }
     }
     await svc.shutdown();
-    for (const id of [...touched, `limit#${OWNER}`]) await dc.delete({ TableName: LLM_CONNECTIONS_TABLE, Key: { connectionId: id } }).promise().catch(() => undefined);
+    // Delete a row only once its disconnect is CONFIRMED: an unconfirmed row is the sweeper's only retry record for a login that may still be on the host.
+    for (const id of touched) {
+      const r = await db.get(id).catch(() => null);
+      if (r && r.status !== "revoked") {
+        console.log(`cleanup: ${id} is ${r.status}, NOT deleted (the sweeper still needs it; remove it by hand after the host confirms)`);
+        continue;
+      }
+      await dc.delete({ TableName: LLM_CONNECTIONS_TABLE, Key: { connectionId: id } }).promise().catch(() => undefined);
+    }
+    await dc.delete({ TableName: LLM_CONNECTIONS_TABLE, Key: { connectionId: `limit#${OWNER}` } }).promise().catch(() => undefined);
     const failed = results.filter((r) => !r.ok);
     console.log(`\n${results.length - failed.length}/${results.length} checks passed${failed.length ? "; FAILED: " + failed.map((f) => f.name).join(", ") : ""}`);
     process.exit(failed.length ? 1 : 0);

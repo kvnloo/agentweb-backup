@@ -7,7 +7,7 @@
  *   sudo node netIsolationLive.js        (the host aw-login-host@test1 must be running: it owns the proxy)
  */
 import { execFileSync, spawn, spawnSync } from "child_process";
-import { chmodSync, chownSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "fs";
+import { chmodSync, chownSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "fs";
 import { createServer, type Server } from "net";
 import { parseHostConfig } from "../../host/hostConfig";
 import { startEgressProxy, type EgressProxyHandle } from "../../egress/egressProxy";
@@ -74,9 +74,18 @@ function makeRefDir(uid: number): void {
   }
 }
 
+const ownedUids = new Set<number>(); // only what THIS run created is ever stopped or deleted
+
 async function main() {
+  // The probe uses two uids at the top of the host's range. If either already has a directory (the host may have allocated it to a
+  // real connection), do nothing: stopping its slice or deleting its directory would destroy a customer's data.
+  for (const u of [UID, UID_B]) {
+    if (existsSync(layout.uidDir(u))) throw new Error(`refusing: uid ${u} already has a directory (in use by the host?)`);
+  }
   makeRefDir(UID);
   makeRefDir(UID_B);
+  ownedUids.add(UID);
+  ownedUids.add(UID_B);
   rmSync(PROBE_DIR, { recursive: true, force: true });
   mkdirSync(PROBE_DIR, { recursive: true, mode: 0o755 });
   proxy = await startEgressProxy({
@@ -168,7 +177,7 @@ main()
     } catch {
       /* nothing to stop */
     }
-    for (const u of [UID, UID_B]) {
+    for (const u of ownedUids) {
       try {
         execFileSync(port.paths.systemRun.replace("systemd-run", "systemctl"), ["stop", layout.sliceName(u)], { stdio: "ignore" });
       } catch {
