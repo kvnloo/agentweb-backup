@@ -1,6 +1,6 @@
 import { MetaService } from '../services/metaService';
 import { AdAccount } from 'facebook-nodejs-business-sdk';
-import { findUnappliedCreativeFields } from '../services/agentMode/metaCreativeFieldsCheck';
+import { buildUnappliedFieldsMessage, findUnappliedCreativeFields } from '../services/agentMode/metaCreativeFieldsCheck';
 
 jest.mock('facebook-nodejs-business-sdk', () => ({
   FacebookAdsApi: { init: jest.fn() },
@@ -94,3 +94,32 @@ describe('findUnappliedCreativeFields', () => {
     expect(findUnappliedCreativeFields(req, undefined)).toEqual([]);
   });
 });
+
+describe('findUnappliedCreativeFields comparison and precedence', () => {
+  it('ignores edge whitespace and number-vs-string instagram ids', () => {
+    expect(findUnappliedCreativeFields({ instagram_user_id: '178', description: ' D ' }, {
+      object_story_spec: { instagram_user_id: 178 as unknown as string, link_data: { description: 'D' } },
+    })).toEqual([]);
+  });
+
+  it('checks a video+carousel request as video, the way the writer builds it', () => {
+    expect(findUnappliedCreativeFields({ description: 'D', video_id: 'v', carousel_cards: [{}] },
+      { object_story_spec: { video_data: { link_description: 'D' } } })).toEqual([]);
+  });
+});
+
+describe('buildUnappliedFieldsMessage', () => {
+  const creative = { id: 'c9', name: 'N' };
+  it('names the id and says to fix rather than duplicate for a genuine drop', () => {
+    const m = buildUnappliedFieldsMessage(creative, { description: 'D' }, ['description']);
+    expect(m).toContain('id c9');
+    expect(m).toContain('Meta did NOT store: description');
+    expect(m).not.toMatch(/recreate it/i);
+  });
+  it('does not blame Meta or suggest recreating for a carousel description', () => {
+    const m = buildUnappliedFieldsMessage(creative, { description: 'D', carousel_cards: [{}, {}] }, ['description']);
+    expect(m).toContain('carousel_cards[].description');
+    expect(m).not.toContain('Meta did NOT store');
+  });
+});
+
