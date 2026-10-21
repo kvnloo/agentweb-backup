@@ -73,13 +73,21 @@ export function installWorld(): void {
     setHotLeadCallEntitledOverride(true);
     world.twilio = new TwilioCaller();
 
-    // The queue's permanent job row: a second enqueue of the same source+key is a duplicate.
-    const seen = new Set<string>();
+    // The queue's permanent job row: a second enqueue of the same source+key is a duplicate until a failed row is cleared.
+    const rows = new Map<string, 'live' | 'failed' | 'done'>();
     mock(queue.enqueueJob).mockImplementation(async (source: string, key: string) => {
       const job = `${source}:${key}`;
-      if (seen.has(job)) return 'duplicate';
-      seen.add(job);
+      if (rows.has(job)) return 'duplicate';
+      rows.set(job, 'live');
       return 'enqueued';
+    });
+    mock(queue.markJobFailed).mockImplementation(async (source: string, key: string) => { rows.set(`${source}:${key}`, 'failed'); });
+    mock(queue.markJobComplete).mockImplementation(async (source: string, key: string) => { rows.set(`${source}:${key}`, 'done'); });
+    mock(queue.clearFailedJob).mockImplementation(async (source: string, key: string) => {
+      const job = `${source}:${key}`;
+      if (rows.get(job) !== 'failed') return 'not-failed';
+      rows.delete(job);
+      return 'cleared';
     });
     mock(queue.startHeartbeat).mockReturnValue(jest.fn());
     mock(notificationLookup.campaigns).mockResolvedValue({ rows: [], truncated: false });

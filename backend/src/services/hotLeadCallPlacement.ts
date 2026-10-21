@@ -6,7 +6,7 @@ import { errorText } from './hotLeadCallText';
 import { buildVoiceWebhookUrl } from './voice/voiceUrls';
 import { claimMemberCooldown } from './voice/hotLeadCallLimits';
 import { getLeadCallStore } from './voice/leadCallStore';
-import type { HotLeadCallEventType, HotLeadCallPatch, LeadCallStore } from './voice/leadCallStore.types';
+import type { HotLeadCallEventType, HotLeadCallPatch, HotLeadCallRecord, LeadCallStore } from './voice/leadCallStore.types';
 
 const MEMBER_RING_TIMEOUT_SECONDS = 25;
 // The re-read that decides whether a write that reported a problem still landed: a read that fails is tried again.
@@ -103,13 +103,34 @@ async function settle(
 
 /** Whether the record carries this token: the write that was meant to put it there landed, whatever it reported. */
 export async function holdsClaim(store: LeadCallStore, listId: string, leadId: string, claimToken: string): Promise<boolean> {
+  return (await ownRecord(store, listId, leadId, claimToken)) !== null;
+}
+
+/** The record when it carries this token, else null. A read that fails is tried again, a few times. */
+async function ownRecord(store: LeadCallStore, listId: string, leadId: string, claimToken: string): Promise<HotLeadCallRecord | null> {
   for (let attempt = 1; ; attempt++) {
     try {
-      return (await store.get(listId, leadId))?.claimToken === claimToken;
+      const record = await store.get(listId, leadId);
+      return record?.claimToken === claimToken ? record : null;
     } catch (err) {
       if (attempt >= CLAIM_READ_ATTEMPTS) throw err;
     }
   }
+}
+
+/**
+ * Records that Twilio definitely rejected this attempt's call (dialing -> between_attempts). A write that reported
+ * a problem may still have landed, and one that did not land leaves `dialing` with no call and no callback ever
+ * coming, so the record is read back (it keeps this attempt's token) and the move is made once more if it is
+ * still `dialing`. False only when the record cannot be moved on.
+ */
+async function settleRejection(c: PlacementContext, claimToken: string, detail: Record<string, string | number>): Promise<boolean> {
+  const patch = { state: 'between_attempts', outcome: 'place_rejected' } as const;
+  const event = { reason: 'place_rejected', ...detail };
+  if (await settle(c, patch, 'call.failed', event)) return true;
+  const own = await ownRecord(c.store, c.listId, c.leadId, claimToken).catch(() => null);
+  if (own?.state === 'between_attempts') return true;
+  return own?.state === 'dialing' && await settle(c, patch, 'call.failed', event);
 }
 
 /**
@@ -158,9 +179,7 @@ async function tryMember(
     if (err instanceof VoiceCallError && err.placed === 'no') {
       console.warn('[hotLeadCall] member call rejected', { listId, leadId, to: redactPhone(member.phone) });
       // This attempt is dead and nobody was rung.
-      return await settle(c, { state: 'between_attempts', outcome: 'place_rejected' }, 'call.failed', { reason: 'place_rejected', ...detail })
-        ? 'rejected'
-        : 'stopped';
+      return await settleRejection(c, claimToken, detail) ? 'rejected' : 'stopped';
     }
     // The call may be live: stay non-terminal so the webhooks can still adopt and meter it. Never retried.
     console.warn('[hotLeadCall] member call placement unknown', { listId, leadId, to: redactPhone(member.phone) });

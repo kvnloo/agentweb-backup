@@ -11,7 +11,7 @@ jest.mock('../services/subscriptionService', () => ({
 }));
 jest.mock('../services/asyncJobQueue', () => ({
   enqueueJob: jest.fn(), markJobComplete: jest.fn(), markJobFailed: jest.fn(),
-  startHeartbeat: jest.fn(), registerProcessor: jest.fn(),
+  startHeartbeat: jest.fn(), registerProcessor: jest.fn(), clearFailedJob: jest.fn(),
 }));
 const callerless = { on: false };
 jest.mock('../services/voice/hotLeadCallContext', () => ({
@@ -342,6 +342,25 @@ describe('processHotLeadCallJob', () => {
     expect(provider.placedCalls).toHaveLength(0);
     expect(store.events).toEqual([]);
     expect(store.record.jobKey).toBe('old');
+  });
+
+  it('treats a create that answers false as a lost race when the record carries another claim token: nothing is dialled', async () => {
+    store.record = callRecord({ state: 'dialing', jobKey: 'other-dispatch', claimToken: 'someone-elses' });
+    await processHotLeadCallJob(jobOf());
+    expect(provider.placedCalls).toHaveLength(0);
+    expect({ counters: [...limits.counters.values()], claims: limits.claims.size }).toEqual({ counters: [0, 0], claims: 0 });
+  });
+
+  it('goes on when a create that answers false actually committed this dispatch\'s own record (an SDK retry lost its response)', async () => {
+    const create = store.create.bind(store);
+    store.create = async (listId, leadId, record) => {
+      await create(listId, leadId, record);
+      return false;
+    };
+    await processHotLeadCallJob(jobOf());
+    expect(provider.placedCalls).toHaveLength(1);
+    expect(store.record).toMatchObject({ state: 'member_ringing', attemptNo: 1 });
+    expect([...limits.counters.values()]).toEqual([1, 1]);
   });
 
   it.each([

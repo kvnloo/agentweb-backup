@@ -26,7 +26,7 @@ jest.mock('../services/db', () => ({
 }));
 jest.mock('../services/asyncJobQueue', () => ({
   enqueueJob: jest.fn(), markJobComplete: jest.fn(), markJobFailed: jest.fn(),
-  startHeartbeat: jest.fn(() => jest.fn()), registerProcessor: jest.fn(),
+  startHeartbeat: jest.fn(() => jest.fn()), registerProcessor: jest.fn(), clearFailedJob: jest.fn(),
 }));
 import { WebClient } from '@slack/web-api';
 import { crmDb, userDb, orgDb } from '../services/db';

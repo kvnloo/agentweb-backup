@@ -7,7 +7,7 @@
  */
 jest.mock('../services/db', () => ({ ENGAGED_EVENT_KEYWORDS: jest.requireActual('../services/db').ENGAGED_EVENT_KEYWORDS, ...jest.requireActual('./helpers/hotLeadCallFakeCrm').dbMock }));
 jest.mock('../services/asyncJobQueue', () => ({
-  enqueueJob: jest.fn(), markJobComplete: jest.fn(), markJobFailed: jest.fn(), startHeartbeat: jest.fn(), registerProcessor: jest.fn(),
+  enqueueJob: jest.fn(), markJobComplete: jest.fn(), markJobFailed: jest.fn(), startHeartbeat: jest.fn(), registerProcessor: jest.fn(), clearFailedJob: jest.fn(),
 }));
 jest.mock('../services/usageRecorderService', () => ({ ...jest.requireActual('../services/usageRecorderService'), recordVendorUsage: jest.fn() }));
 jest.mock('../services/leadNotificationLookup', () => ({ notificationLookup: { pages: jest.fn(), campaigns: jest.fn() } }));
@@ -15,12 +15,10 @@ jest.mock('@slack/web-api', () => ({ WebClient: jest.fn() }));
 
 import * as queue from '../services/asyncJobQueue';
 import { chicago, flush, installWorld, nthCall, record, rungPhones, setClock, submitLead, usageSummary, world } from './helpers/hotLeadCallE2eWorld';
-import { referenceTeam } from './helpers/hotLeadCallFixtures';
+import { REFERENCE_ID as ID, REFERENCE_PHONE as PHONE, referenceTeam } from './helpers/hotLeadCallFixtures';
 
 installWorld();
 beforeEach(() => {
-  jest.mocked(queue.markJobFailed).mockResolvedValue(undefined);
-  jest.mocked(queue.markJobComplete).mockResolvedValue(undefined);
   const org = world.crm.orgs.get('org-a') as { hotLeadCall: Record<string, unknown> };
   org.hotLeadCall = { ...org.hotLeadCall, team: referenceTeam(), maxAttemptsPerLead: 3, callingHours: { start: '09:00', end: '18:00', timezone: 'America/Chicago' } };
 });
@@ -197,6 +195,17 @@ describe.each(['after', 'afterFalse'] as const)('a write that committed and then
   });
 });
 
+describe.each(['before', 'after', 'afterFalse'] as const)('a rejected placement whose record update fails (%s)', (mode) => {
+  it('is recorded anyway and the pass goes on to the next member', async () => {
+    setClock(chicago('16:00'));
+    world.provider.failNextPlaceCall('no'); // C is rejected
+    arm('updateLeadSystemRecordIf', 1, mode); // 1 = the move dialing -> between_attempts
+    await submitLead('lead-a');
+    expect(rungPhones()).toEqual([PHONE.c, PHONE.d]); // C was tried and rejected
+    expect(record()).toMatchObject({ state: 'member_ringing', attemptNo: 2, memberId: ID.d });
+  });
+});
+
 describe('a write that did not land', () => {
   it('/gather: a bridging transition that failed hangs up and leaves the member leg to hand over', async () => {
     setClock(chicago('16:00'));
@@ -215,6 +224,85 @@ describe('a write that did not land', () => {
     setClock(chicago('16:00'));
     await submitLead('lead-a');
     await submitLead('lead-a', { submission: true });
+    expect(rungPhones()).toHaveLength(1);
+  });
+});
+
+/** Makes the write that takes the next attempt (between_attempts -> dialing) fail before it applies, once. */
+function failLockWriteOnce(): void {
+  const original = writers().updateLeadSystemRecordIf.bind(world.crm.crmDb);
+  let failed = false;
+  writers().updateLeadSystemRecordIf = async (...args) => {
+    const op = args[3] as { stateIn: string[]; set?: { state?: string } };
+    if (!failed && op.stateIn.includes('between_attempts') && op.set?.state === 'dialing') {
+      failed = true;
+      throw new Error('injected');
+    }
+    return original(...args);
+  };
+}
+
+/** Makes the next `times` writes that close a record waiting between attempts fail before they apply. */
+function failClosingWrites(times: number): void {
+  const original = writers().updateLeadSystemRecordIf.bind(world.crm.crmDb);
+  let left = times;
+  writers().updateLeadSystemRecordIf = async (...args) => {
+    const op = args[3] as { stateIn: string[]; set?: { state?: string } };
+    const closes = op.stateIn.length === 1 && op.stateIn[0] === 'between_attempts' && (op.set?.state === 'finished' || op.set?.state === 'failed');
+    if (closes && left > 0) {
+      left--;
+      throw new Error('injected');
+    }
+    return original(...args);
+  };
+}
+
+describe('a double fault: the lock write fails and so do both writes that close the record', () => {
+  const endsFirstAttempt: Record<string, () => Promise<unknown>> = {
+    'the member did not answer': () => nthCall(1).memberLegEnds('no-answer', '0'),
+    'the member pressed 2': async () => {
+      const call = nthCall(1);
+      await call.memberAnswers();
+      await call.memberPresses('2');
+      return call.memberLegEnds('completed', '9');
+    },
+  };
+
+  it.each(Object.keys(endsFirstAttempt))('%s: the lock fails, the close fails twice, and the replayed final callback still ends the record', async (how) => {
+    setClock(chicago('16:00'));
+    failLockWriteOnce();
+    failClosingWrites(2);
+    await submitLead('lead-a');
+    await endsFirstAttempt[how]();
+    await flush();
+    // Nothing is left to run by itself: the record waits between attempts and the queue row is failed.
+    expect(record().state).toBe('between_attempts');
+    expect(rungPhones()).toHaveLength(1);
+
+    // Twilio (or an operator) replays the final callback of the attempt that ended.
+    await retrying(() => nthCall(1).memberLegEnds('completed', '9'));
+    await noAnswerChain();
+
+    expect(['finished', 'failed']).toContain(record().state);
+    expect(new Set(rungPhones()).size).toBe(rungPhones().length);
+  });
+
+  it('a running next-attempt job is left alone by a replayed callback', async () => {
+    setClock(chicago('16:00'));
+    await submitLead('lead-a');
+    // The job starts and then waits for ever on the member's cooldown, like a worker that is still busy.
+    jest.spyOn(world.limits, 'claim').mockImplementation(() => new Promise<boolean>(() => undefined));
+    await nthCall(1).memberLegEnds('no-answer', '0');
+    await flush();
+    expect(record().state).toBe('between_attempts');
+    const before = JSON.stringify(record());
+
+    await nthCall(1).memberLegEnds('no-answer', '0');
+    await flush();
+
+    expect(queue.clearFailedJob).toHaveBeenCalledTimes(1);
+    await expect(jest.mocked(queue.clearFailedJob).mock.results[0].value).resolves.toBe('not-failed');
+    expect(JSON.stringify(record())).toBe(before);
     expect(rungPhones()).toHaveLength(1);
   });
 });

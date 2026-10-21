@@ -84,7 +84,7 @@ export async function requestNextHotLeadCallAttempt(args: {
     const job: NextAttemptJob = { orgId: loaded.ctx.orgId, listId, leadId, jobKey: record.jobKey, attemptNo: record.attemptNo };
     // Not awaited to the end: the webhook answers Twilio at once.
     await runQueuedHotLeadJob({
-      source: NEXT_ATTEMPT_SOURCE, key: keyOf(job), job, process: processHotLeadCallNextAttempt, label: 'Hot lead call next attempt', background: true,
+      source: NEXT_ATTEMPT_SOURCE, key: keyOf(job), job, process: processHotLeadCallNextAttempt, label: 'Hot lead call next attempt', background: true, redriveFailed: true,
     });
     return { enqueued: true };
   } catch (err) {

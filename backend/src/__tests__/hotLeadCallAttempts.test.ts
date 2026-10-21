@@ -11,7 +11,7 @@ jest.mock('../services/subscriptionService', () => ({
 }));
 jest.mock('../services/asyncJobQueue', () => ({
   enqueueJob: jest.fn(), markJobComplete: jest.fn(), markJobFailed: jest.fn(),
-  startHeartbeat: jest.fn(), registerProcessor: jest.fn(),
+  startHeartbeat: jest.fn(), registerProcessor: jest.fn(), clearFailedJob: jest.fn(),
 }));
 import { createHash } from 'crypto';
 import { crmDb, userDb, orgDb } from '../services/db';
