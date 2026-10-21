@@ -26,6 +26,7 @@ Eval v2 tab lists every grader with its version.
 | finalize-guard | agent | LLM judge | gemini-3.1-flash-lite (Gemini), off in prod | no |
 | agent-run-verdict | agent | code | — | no |
 | agent-task-success | agent | code, offline | — | no |
+| agent-task-success-judge | agent | LLM judge, offline | anthropic.claude-sonnet-5 (Claude) | advisory: cross-family AI labels (ENG-2591), not human; cannot gate |
 | agent-tool-correctness | agent | code, offline | — | no |
 | agent-groundedness-offline | agent | code, offline (finalize-guard lexicon) | — | no |
 | agent-reply-length-adherence | agent | code, real turns (ENG-2189) | — | no |
@@ -98,6 +99,29 @@ failure classes, plus ad-platform writes never read back — the grader side of 
 successful task. `scripts/evalAgentGraders.ts` runs them read-only over a date range and prints
 results per model × task type with n and a Wilson CI. None is validated; pass^k needs the sandbox
 (ENG-1906).
+
+### LLM task-success judge (ENG-2591)
+
+`agent-task-success` trusts the plan's own step checkmarks, and measured kappa 0.20 against blind
+labels on the 40 test work-plan cases; a rule-based v2 reached 0.28 on test. `agent-task-success-judge`
+(`services/taskSuccessJudge.ts`) reads the session as an ordered timeline (`agentRunTrace.ts`) and
+asks Claude Sonnet 5 for `task_success` with the human labelling rubric and a deliverable /
+requirement / fabrication checklist.
+
+Trial (2026-10-21, `scripts/runTaskSuccessJudgeTrial.ts`; read-only, no spend rows) on the test split:
+
+| Labels | n | Kappa |
+| --- | --- | --- |
+| Blind Claude labels | 38 | 0.77 |
+| Blind GPT-5.4 labels (`--labeller`, rubric only) | 39 | 0.88 |
+| Cases where GPT and Claude labels agree | 34 | 0.93 |
+
+The two label sets agree with each other at kappa 0.73 (n=40). Dev is smaller and noisier: 0.52 vs GPT, 0.66 on consensus (n=15–19).
+
+This is **not** a validation under the rule above: the labels are AI labels, so `validation` is not
+recorded and `mayGate` stays false. The judge may report `task_success` as advisory. Gating needs a
+human to adjudicate the cases where the labels disagree. Evidence: [ENG-2591](https://linear.app/emmabyaw/issue/ENG-2591/agent-task-success-grader-stop-trusting-step-checkmarks-kappa-020-in#comment-ea8be576).
+20 of the 80 work-plan golden cases are empty sessions (0 messages) and should be dropped from the set.
 
 ## Instruction adherence and escalation (ENG-2189)
 
