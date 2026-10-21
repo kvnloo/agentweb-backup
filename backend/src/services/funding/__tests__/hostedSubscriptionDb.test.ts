@@ -13,7 +13,7 @@ describe("hostedBeginRevoke", () => {
   it.each(["active", "invalid", "disabled", "expired"] as const)("starts from %s: fences at the new epoch, becomes revoking, drops the org share", async (status) => {
     const { db } = makeDb();
     await db.create(hosted({ status, orgId: "org-1" }));
-    expect(await db.hostedBeginRevoke("h-1", 2, by, LATER)).toBe("started");
+    expect((await db.hostedBeginRevoke("h-1", 2, by, LATER)).result).toBe("started");
     const row = (await db.get("h-1"))!;
     expect(row).toMatchObject({ status: "revoking", subHostEpoch: 2, subRevokeStartedAt: LATER, revokedByUserId: "user-1" });
     expect(row.orgId).toBeUndefined();
@@ -25,19 +25,25 @@ describe("hostedBeginRevoke", () => {
     await db.create(hosted({ status: "revoking" }));
     await db.create(hosted({ connectionId: "h-2", status: "revoked", revokedAt: NOW }));
     await db.create(hosted({ connectionId: "b3", subHosted: undefined, subHostEpoch: undefined }));
-    expect(await db.hostedBeginRevoke("h-1", 2, by, LATER)).toBe("already");
-    expect(await db.hostedBeginRevoke("h-2", 2, by, LATER)).toBe("already");
-    expect(await db.hostedBeginRevoke("nope", 2, by, LATER)).toBe("missing");
-    expect(await db.hostedBeginRevoke("b3", 2, by, LATER)).toBe("not_hosted");
+    expect((await db.hostedBeginRevoke("h-1", 2, by, LATER)).result).toBe("already");
+    expect((await db.hostedBeginRevoke("h-2", 2, by, LATER)).result).toBe("already");
+    expect((await db.hostedBeginRevoke("nope", 2, by, LATER)).result).toBe("missing");
+    expect((await db.hostedBeginRevoke("b3", 2, by, LATER)).result).toBe("not_hosted");
     expect((await db.get("b3"))!.status).toBe("active");
   });
 
-  it("never lowers or repeats the epoch (a stale caller cannot start over a newer state)", async () => {
+  it("a caller with a stale epoch fences ABOVE the current one instead of being refused or lowering it", async () => {
     const { db } = makeDb();
     await db.create(hosted({ subHostEpoch: 5 }));
-    expect(await db.hostedBeginRevoke("h-1", 5, by, LATER)).toBe("already");
-    expect(await db.hostedBeginRevoke("h-1", 3, by, LATER)).toBe("already");
-    expect((await db.get("h-1"))!).toMatchObject({ status: "active", subHostEpoch: 5 });
+    expect(await db.hostedBeginRevoke("h-1", 3, by, LATER)).toEqual({ result: "started", epoch: 6 });
+    expect((await db.get("h-1"))!).toMatchObject({ status: "revoking", subHostEpoch: 6 });
+  });
+
+  it("reports the epoch of an already-revoking row and never changes it", async () => {
+    const { db } = makeDb();
+    await db.create(hosted({ status: "revoking", subHostEpoch: 4 }));
+    expect(await db.hostedBeginRevoke("h-1", 9, by, LATER)).toEqual({ result: "already", epoch: 4 });
+    expect((await db.get("h-1"))!.subHostEpoch).toBe(4);
   });
 
   it("records the delegated admin", async () => {
@@ -100,6 +106,14 @@ describe("hostedAdvanceEpoch / hostedMarkNeedsReconnect / hostedMarkReconnected"
     const row = (await db.get("h-1"))!;
     expect(row).toMatchObject({ status: "active", subNeedsReconnect: false, subType: "pro", subRefreshExpiresAtMs: 123, subAccountFingerprint: "fp" });
     expect(row.subReconnectReason).toBeUndefined();
+  });
+
+  it("the sweeper's needs-reconnect loses to any write made after it read the row", async () => {
+    const { db } = makeDb();
+    await db.create(hosted());
+    expect(await db.hostedMarkNeedsReconnect("h-1", 1, "epoch_mismatch", LATER, "2000-01-01T00:00:00.000Z")).toBe(false);
+    expect((await db.get("h-1"))!.status).toBe("active");
+    expect(await db.hostedMarkNeedsReconnect("h-1", 1, "epoch_mismatch", LATER, NOW)).toBe(true);
   });
 
   it("an expired hosted login can be reconnected", async () => {

@@ -38,10 +38,10 @@ async function main() {
 
   check("plain-revoke-refuses-hosted", !(await db.revoke(ids[0], { userId: OWNER }, NOW)));
   check("mark-revoked-needs-revoking", !(await db.hostedMarkRevoked(ids[0], NOW)));
-  check("begin-revoke-started", (await db.hostedBeginRevoke(ids[0], 3, { userId: OWNER, adminId: "zz-admin" }, NOW)) === "started");
-  check("begin-revoke-already", (await db.hostedBeginRevoke(ids[0], 4, { userId: OWNER }, NOW)) === "already");
-  check("begin-revoke-not-hosted", (await db.hostedBeginRevoke(ids[2], 2, { userId: OWNER }, NOW)) === "not_hosted");
-  check("begin-revoke-missing", (await db.hostedBeginRevoke("zz-live-hosted-none", 2, { userId: OWNER }, NOW)) === "missing");
+  check("begin-revoke-started", (await db.hostedBeginRevoke(ids[0], 3, { userId: OWNER, adminId: "zz-admin" }, NOW)).result === "started");
+  check("begin-revoke-already", (await db.hostedBeginRevoke(ids[0], 4, { userId: OWNER }, NOW)).result === "already");
+  check("begin-revoke-not-hosted", (await db.hostedBeginRevoke(ids[2], 2, { userId: OWNER }, NOW)).result === "not_hosted");
+  check("begin-revoke-missing", (await db.hostedBeginRevoke("zz-live-hosted-none", 2, { userId: OWNER }, NOW)).result === "missing");
   await db.hostedNoteRevokeAttempt(ids[0], NOW);
   await db.hostedNoteRevokeAttempt(ids[0], NOW);
   const revoking = await db.get(ids[0]);

@@ -244,7 +244,7 @@ export class LlmConnectionService {
     return { record, access };
   }
 
-  async revoke(actor: Actor, connectionId: string): Promise<void> {
+  async revoke(actor: Actor, connectionId: string): Promise<"revoked" | "revoking"> {
     const { record, access } = await this.visible(actor.userId, connectionId);
     const own = record.ownerUserId === actor.userId;
     if (!own && !access.canManage) throw new LlmConnectionError("forbidden");
@@ -252,12 +252,11 @@ export class LlmConnectionService {
       // A hosted login is owner-only and is wiped by the login host first; "revoking" is accepted work (the sweeper finishes it).
       if (!own || !this.deps.revokeHosted) throw new LlmConnectionError("forbidden");
       try {
-        await this.deps.revokeHosted(actor, connectionId);
+        return await this.deps.revokeHosted(actor, connectionId);
       } catch (err) {
         if ((err as { code?: string })?.code === "not_found") throw new LlmConnectionError("not_found");
         throw err;
       }
-      return;
     }
     // Already revoked is success: the caller wanted it gone and it is.
     const didRevoke = await this.deps.db.revoke(connectionId, { userId: actor.userId, adminId: actor.adminId }, this.deps.now());
@@ -272,6 +271,7 @@ export class LlmConnectionService {
       }
       await this.deps.db.releaseSlot(record.ownerUserId);
     }
+    return "revoked";
   }
 
   async setShared(actor: Actor, connectionId: string, shared: boolean): Promise<LlmConnectionView> {

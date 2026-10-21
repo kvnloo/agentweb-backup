@@ -8,9 +8,9 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { startHostServer, type HostServerHandle } from "../../../loginHost/server";
 import { makeRig, type Rig } from "../../../loginHost/__tests__/helpers";
-import { HostedSubscriptionError, HostedSubscriptionService, REVOKE_ALARM_ATTEMPTS, type HostedProvider } from "../hostedSubscriptionService";
+import { HostedSubscriptionError, HostedSubscriptionService, RECONCILE_GRACE_MS, REVOKE_ALARM_ATTEMPTS, type HostedProvider } from "../hostedSubscriptionService";
 import { LlmConnectionService } from "../llmConnectionService";
-import { LoginHostClient, UnixSocketTransport } from "../loginHostClient";
+import { LoginHostClient, LoginHostError, UnixSocketTransport } from "../loginHostClient";
 import { FakeKms, makeDb } from "./llmConnectionTestKit";
 
 const GOOD = "GOODCODE1#GOODSTATE1";
@@ -27,6 +27,8 @@ describe("hosted subscription service", () => {
   let svc: HostedSubscriptionService;
   let store: ReturnType<typeof makeDb>;
   let ids: number;
+  let nowMs: number;
+  let promoteLoses: boolean;
   const user = { userId: "user-1" };
 
   const provider = (): HostedProvider => ({ route: "claude", kind: "claude_subscription", recordProvider: "anthropic", hostProvider: "fake", isEnabledFor: async (u) => enabled.has(u) });
@@ -49,12 +51,26 @@ describe("hosted subscription service", () => {
     enabled = new Set(["user-1", "user-2"]);
     store = makeDb();
     ids = 0;
+    nowMs = Date.now();
+    promoteLoses = false;
     svc = new HostedSubscriptionService({
       db: store.db,
-      // A host that is "down" answers like an unreachable socket; "unconfigured" has no client at all.
-      client: () => (configured ? new LoginHostClient(new UnixSocketTransport(hostUp ? sock : join(dir, "nobody.sock"))) : undefined),
+      // A host that is "down" answers like an unreachable socket; "unconfigured" has no client at all. `promoteLoses`: the host
+      // applies a promote but its reply never arrives.
+      client: () => {
+        if (!configured) return undefined;
+        const real = new UnixSocketTransport(hostUp ? sock : join(dir, "nobody.sock"));
+        return new LoginHostClient({
+          stream: (r, b) => real.stream(r, b),
+          json: async (r, b) => {
+            const reply = await real.json(r, b);
+            if (promoteLoses && r === "login.promote") throw new LoginHostError("UNREACHABLE");
+            return reply;
+          },
+        });
+      },
       providers: { claude: provider() },
-      now: () => Date.now(),
+      now: () => nowMs,
       newId: () => `conn-${++ids}`,
       sleep: async () => undefined,
     });
@@ -112,6 +128,23 @@ describe("hosted subscription service", () => {
       const started = await svc.startLogin(user, "claude");
       expect(await codeOf(svc.completeLogin({ userId: "user-2" }, started.loginId, GOOD))).toBe("login_not_found");
       expect(await svc.completeLogin(user, started.loginId, GOOD)).toMatchObject({ status: "active" });
+    });
+
+    it("a double-submitted complete sends the single-use code once; the loser sees login_not_found and nothing is torn down", async () => {
+      const started = await svc.startLogin(user, "claude");
+      const results = await Promise.all([codeOf(svc.completeLogin(user, started.loginId, GOOD)), codeOf(svc.completeLogin(user, started.loginId, GOOD))]);
+      expect(results.sort()).toEqual(["login_not_found", "resolved"]);
+      expect(store.rows()).toHaveLength(1);
+      expect((await store.db.get("conn-1"))!.status).toBe("active");
+      expect(rig.mgr.status({ connectionId: "conn-1" }).state).toBe("active");
+    });
+
+    it("a promote whose reply was lost but which landed is a success, not a second sign-in", async () => {
+      promoteLoses = true;
+      const view = await connect();
+      expect(view.status).toBe("active");
+      expect(rig.mgr.status({ connectionId: view.connectionId })).toMatchObject({ state: "active", epoch: 1 });
+      expect((await store.db.get(view.connectionId))!.status).toBe("active");
     });
 
     it("a second start for the same user cancels the first sign-in on the host", async () => {
@@ -226,6 +259,25 @@ describe("hosted subscription service", () => {
       expect((await store.db.get(view.connectionId))!.status).toBe("revoked");
     });
 
+    it("a disconnect racing a reconnect fences above the reconnect's epoch and still ends revoked with the slot freed", async () => {
+      const view = await connect();
+      const realGet = store.db.get.bind(store.db);
+      let raced = false;
+      jest.spyOn(store.db, "get").mockImplementation(async (id: string) => {
+        const row = await realGet(id);
+        if (!raced) {
+          raced = true;
+          await store.db.hostedAdvanceEpoch(id, 1, 2, new Date().toISOString()); // a reconnect moves the record after we read epoch 1
+        }
+        return row;
+      });
+      expect(await svc.revokeRecord(user, view.connectionId)).toBe("revoked");
+      jest.restoreAllMocks();
+      expect((await store.db.get(view.connectionId))!).toMatchObject({ status: "revoked", subHostEpoch: 3 });
+      expect(rig.mgr.status({ connectionId: view.connectionId }).state).toBe("revoked");
+      expect(slots()).toBe(0);
+    });
+
     it("is NOT reported revoked while the host is unreachable: it stays revoking (slot already free) and the sweeper finishes it", async () => {
       const view = await connect();
       hostUp = false;
@@ -256,6 +308,15 @@ describe("hosted subscription service", () => {
       await rig.mgr.loginPromote({ connectionId: view.connectionId, loginRef: start.loginRef, epoch: 5 }); // record still says 1
       expect(await svc.revokeRecord(user, view.connectionId)).toBe("revoked");
       expect(rig.mgr.status({ connectionId: view.connectionId }).state).toBe("revoked");
+    });
+
+    it("does not say revoked when its own write did not make the record revoked", async () => {
+      const view = await connect();
+      jest.spyOn(store.db, "hostedMarkRevoked").mockResolvedValueOnce(false);
+      expect(await svc.revokeRecord(user, view.connectionId)).toBe("revoking");
+      jest.restoreAllMocks();
+      expect((await svc.sweepOnce()).revoked).toBe(1); // the next pass completes it
+      expect((await store.db.get(view.connectionId))!.status).toBe("revoked");
     });
 
     it("raises an alarm once a disconnect has failed REVOKE_ALARM_ATTEMPTS passes", async () => {
@@ -294,17 +355,27 @@ describe("hosted subscription service", () => {
   });
 
   describe("sweeper reconcile", () => {
-    beforeEach(() => boot());
+    beforeEach(async () => {
+      await boot();
+    });
+    const pastGrace = () => {
+      nowMs += RECONCILE_GRACE_MS + 1_000;
+    };
+    // The sweeper leaves very recent rows alone; most tests want it to judge a row that has settled.
+    const sweepLater = () => {
+      pastGrace();
+      return svc.sweepOnce();
+    };
 
     it("marks a record needing reconnect when the host lost it, and leaves healthy ones alone", async () => {
       const healthy = await connect();
       const lost = await connect();
       delete rig.store.get().connections[lost.connectionId];
-      const pass = await svc.sweepOnce();
+      const pass = await sweepLater();
       expect(pass.markedNeedsReconnect).toBe(1);
       expect((await store.db.get(lost.connectionId))!).toMatchObject({ status: "invalid", subNeedsReconnect: true, subReconnectReason: "host_lost" });
       expect((await store.db.get(healthy.connectionId))!.status).toBe("active");
-      expect((await svc.sweepOnce()).markedNeedsReconnect).toBe(0); // already flagged
+      expect((await sweepLater()).markedNeedsReconnect).toBe(0); // already flagged
     });
 
     it("marks a record whose epoch the host disagrees with as needing a reconnect (record and host must never drift apart)", async () => {
@@ -312,25 +383,67 @@ describe("hosted subscription service", () => {
       const start = await rig.mgr.loginStart({ connectionId: view.connectionId, provider: "fake", reconnect: true });
       await rig.mgr.loginComplete({ connectionId: view.connectionId, loginRef: start.loginRef, code: GOOD });
       await rig.mgr.loginPromote({ connectionId: view.connectionId, loginRef: start.loginRef, epoch: 4 });
-      expect((await svc.sweepOnce()).markedNeedsReconnect).toBe(1);
+      expect((await sweepLater()).markedNeedsReconnect).toBe(1);
       expect((await store.db.get(view.connectionId))!).toMatchObject({ status: "invalid", subNeedsReconnect: true, subReconnectReason: "epoch_mismatch" });
     });
 
     it("follows the host when it retired a login without us: record goes revoking, slot freed, then revoked", async () => {
       const view = await connect();
       await rig.mgr.revoke({ connectionId: view.connectionId, epoch: 1 });
-      await svc.sweepOnce();
+      await sweepLater();
       const row = (await store.db.get(view.connectionId))!;
       expect(["revoking", "revoked"]).toContain(row.status);
+      expect(slots()).toBe(0);
+      await sweepLater();
+      expect((await store.db.get(view.connectionId))!.status).toBe("revoked");
+    });
+
+    it("does not judge a row written within the grace window (its own sign-in may still be completing)", async () => {
+      const view = await connect();
+      delete rig.store.get().connections[view.connectionId]; // looks lost, but the row is brand new
+      expect((await svc.sweepOnce()).markedNeedsReconnect).toBe(0);
+      expect((await store.db.get(view.connectionId))!.status).toBe("active");
+      pastGrace();
+      expect((await svc.sweepOnce()).markedNeedsReconnect).toBe(1);
+    });
+
+    it("a flagged record whose host login was retired is disconnected (slot freed), not left waiting for a reconnect that can never work", async () => {
+      const view = await connect();
+      pastGrace();
+      await store.db.hostedMarkNeedsReconnect(view.connectionId, 1, "dead", new Date(nowMs).toISOString());
+      await rig.mgr.revoke({ connectionId: view.connectionId, epoch: 1 });
+      pastGrace();
+      await svc.sweepOnce();
       expect(slots()).toBe(0);
       await svc.sweepOnce();
       expect((await store.db.get(view.connectionId))!.status).toBe("revoked");
     });
 
+    it("a record the host lost can be reconnected: the host starts a fresh connection and the epoch still moves up", async () => {
+      const view = await connect();
+      delete rig.store.get().connections[view.connectionId];
+      const started = await svc.startLogin(user, "claude", { reconnectConnectionId: view.connectionId });
+      const after = await svc.completeLogin(user, started.loginId, GOOD);
+      expect(after.status).toBe("active");
+      expect((await store.db.get(view.connectionId))!.subHostEpoch).toBe(2);
+      expect(rig.mgr.status({ connectionId: view.connectionId })).toMatchObject({ state: "active", epoch: 2 });
+    });
+
+    it("the sweeper's verdict is conditional on the row it read (a later write wins)", async () => {
+      const view = await connect();
+      pastGrace();
+      delete rig.store.get().connections[view.connectionId];
+      const row = (await store.db.get(view.connectionId))!;
+      const spy = jest.spyOn(store.db, "hostedMarkNeedsReconnect");
+      await svc.sweepOnce();
+      expect(spy).toHaveBeenCalledWith(view.connectionId, 1, "host_lost", expect.any(String), row.updatedAt);
+      spy.mockRestore();
+    });
+
     it("an unreachable host changes nothing", async () => {
       const view = await connect();
       hostUp = false;
-      expect((await svc.sweepOnce()).hostUnavailable).toBe(true);
+      expect((await sweepLater()).hostUnavailable).toBe(true);
       expect((await store.db.get(view.connectionId))!.status).toBe("active");
     });
 
@@ -338,14 +451,14 @@ describe("hosted subscription service", () => {
       const view = await connect();
       configured = false;
       const err = jest.spyOn(console, "error").mockImplementation(() => undefined);
-      expect((await svc.sweepOnce()).hostUnavailable).toBe(true);
+      expect((await sweepLater()).hostUnavailable).toBe(true);
       err.mockRestore();
       expect((await store.db.get(view.connectionId))!.status).toBe("active");
     });
 
     it("ignores old sealed (B3) rows", async () => {
       await store.db.create({ connectionId: "old-b3", ownerUserId: "user-1", kind: "claude_subscription", provider: "anthropic", status: "active", keyLast4: "", createdAt: "x", updatedAt: "x" });
-      expect(await svc.sweepOnce()).toMatchObject({ revoking: 0, reconciled: 0 });
+      expect(await sweepLater()).toMatchObject({ revoking: 0, reconciled: 0 });
     });
   });
 });
