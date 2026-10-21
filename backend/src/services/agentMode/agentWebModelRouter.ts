@@ -17,12 +17,18 @@
  * cold-start read failure => off, and nothing here is read: the id is not offered and a selection of it is refused
  * exactly like any unknown id (byte-identical to before). Cached ~60s, last-known value on a failed refresh.
  *
- * Table: AW-Settings `agentweb_model_routing_table` (JSON, see `parseRoutingTable`). Every target is validated when the
- * table is loaded: a registry model (legacy aliases resolved), publicly selectable (not admin-only, internal-only or
- * live voice), priced, able to call tools, and inside the allowlist of every tier that may select the router (so the
- * router can never route a tier to a model its plan excludes). An invalid, missing or unreadable table makes the router
- * UNAVAILABLE (a visible 422 `model_unavailable` on selection, one deduped on-call alert), never a silent pick of
- * something else. Cached ~60s with the last good table kept on a failed read (same pattern as the switch).
+ * Table: AW-Settings `agentweb_model_routing_table` (JSON, see `parseRoutingTable`), validated when it is loaded, with
+ * the damage of a bad entry kept as narrow as possible (a mistake for one plan must not take the router away from
+ * every customer):
+ *  - a table that cannot be parsed at all (not JSON, wrong shape, unknown keys / task types, no version / default) makes
+ *    the router UNAVAILABLE for everyone;
+ *  - a target that is not a registered, publicly selectable (not admin-only, internal-only or live voice), priced,
+ *    tool-capable model makes only the ROUTES that resolve to it unavailable;
+ *  - a tier that may select the router but whose allowlist does not cover one of its resolved routes makes the router
+ *    unavailable for THAT tier only (it can never route a tier to a model its plan excludes).
+ * Unavailable always means a visible 422 `model_unavailable` on selection plus one deduped on-call alert naming what is
+ * broken, never a silent pick of something else (a broken route does not fall through to the next rule). Cached ~60s,
+ * the last good table kept on a failed read (same pattern as the switch).
  *
  * No dependency on the service graph (unit-testable); the process-wide instance lives in agentWebModelRouterInstance.ts.
  */
@@ -47,7 +53,14 @@ const CACHE_TTL_MS = 60_000;
 /** After a failed refresh, retry sooner than a full window but not on every request. */
 const ERROR_RETRY_MS = 5_000;
 const ALERT_WINDOW_MS = 60 * 60 * 1000;
+/** The whole table is unusable (unparseable, missing, unreadable). */
 export const ROUTER_UNAVAILABLE_ALERT_DEDUPE_KEY = 'agentweb_model_router:unavailable';
+/** Per model: a target that cannot be routed to (`${prefix}${model}`). */
+export const ROUTE_TARGET_ALERT_DEDUPE_PREFIX = 'agentweb_model_router:target:';
+/** Per tier: its allowlist does not cover its routes (`${prefix}${tier}`). */
+export const TIER_UNAVAILABLE_ALERT_DEDUPE_PREFIX = 'agentweb_model_router:tier:';
+/** Override keys that name no configured tier (nothing is unavailable; they just never apply). */
+export const TABLE_ISSUES_ALERT_DEDUPE_KEY = 'agentweb_model_router:table_issues';
 export const ROUTE_OUTSIDE_PLAN_ALERT_DEDUPE_KEY = 'agentweb_model_router:route_outside_plan';
 
 /** Whether a model id (request body, stored selection, pin) is the router's. Exact, after trimming. */
@@ -100,11 +113,19 @@ const isPlainObject = (value: unknown): value is Record<string, unknown> =>
  *   "tiers": { "Free": { "default": "gemini-3.1-flash-lite" }, "Pro": { "routes": { "chat": "gpt-5.5" } } } }
  * ```
  * A turn takes the first of: its tier's route for the task type, its tier's default, the table route for the task
- * type, the table default. Unknown keys and unknown task types are refused (a typo must not silently fall through
- * to the default); every target must pass `catalog.unsuitable` and is stored canonically.
+ * type, the table default.
+ *
+ * `errors` (the table cannot be used at all): not an object, unknown keys or task types (a typo must not silently fall
+ * through to another rule), no version, no default, a target that is not a non-empty string. `invalidTargets`: targets
+ * that are model ids but cannot be routed to (unregistered, `catalog.unsuitable`), keyed by the id as stored, with why;
+ * only the routes resolving to one are unavailable. Valid targets are stored canonically (legacy aliases resolved).
  */
-export function parseRoutingTable(raw: unknown, catalog: RouterModelCatalog): { ok: true; table: RoutingTable } | { ok: false; errors: string[] } {
+export function parseRoutingTable(
+  raw: unknown,
+  catalog: RouterModelCatalog,
+): { ok: true; table: RoutingTable; invalidTargets: Record<string, string> } | { ok: false; errors: string[] } {
   const errors: string[] = [];
+  const invalidTargets: Record<string, string> = {};
   if (!isPlainObject(raw)) return { ok: false, errors: ['the table must be a JSON object'] };
 
   const target = (where: string, value: unknown): string | undefined => {
@@ -112,16 +133,14 @@ export function parseRoutingTable(raw: unknown, catalog: RouterModelCatalog): { 
       errors.push(`${where} must be a model id`);
       return undefined;
     }
-    const canonical = catalog.canonical(value.trim());
+    const id = value.trim();
+    const canonical = catalog.canonical(id);
     if (!canonical) {
-      errors.push(`${where}: "${value.trim()}" is not a registered model`);
-      return undefined;
+      invalidTargets[id] = 'not a registered model';
+      return id;
     }
     const why = catalog.unsuitable(canonical);
-    if (why) {
-      errors.push(`${where}: "${canonical}" cannot be routed to (${why})`);
-      return undefined;
-    }
+    if (why) invalidTargets[canonical] = why;
     return canonical;
   };
   const routesOf = (where: string, value: unknown): TaskRoutes => {
@@ -168,10 +187,10 @@ export function parseRoutingTable(raw: unknown, catalog: RouterModelCatalog): { 
     }
   }
   if (errors.length > 0 || !fallback) return { ok: false, errors };
-  return { ok: true, table: { version, default: fallback, routes, tiers } };
+  return { ok: true, table: { version, default: fallback, routes, tiers }, invalidTargets };
 }
 
-/** The table's model for one turn, and which rule chose it. Pure; the table has been validated. */
+/** The table's model for one turn, and which rule chose it. Pure; never falls past the first matching rule. */
 export function routeFor(table: RoutingTable, tier: string | null, taskType: AgentWebTaskType): { model: string; reason: string } {
   const override = tier ? table.tiers[tier] : undefined;
   if (override?.routes[taskType]) return { model: override.routes[taskType]!, reason: `${taskType} task: tier "${tier}" route` };
@@ -181,32 +200,37 @@ export function routeFor(table: RoutingTable, tier: string | null, taskType: Age
 }
 
 /**
- * The tier-allowlist rule: for every tier that may select the router, every route it can take must be in its own
- * allowlist. A tier that does not list the router never routes; a wildcard tier allows everything. Override keys that
- * name no configured tier are refused (a misspelt tier would silently get the table routes). Returns the violations.
+ * The tier-allowlist rule, per tier: a tier that may select the router (its allowlist lists `agentweb-model`) must
+ * allow every model its routes resolve to. A tier that does not list the router never routes; a wildcard tier allows
+ * everything; a route to an invalid target is that route's problem, not the tier's. Returns the tiers that break the
+ * rule (tier -> what is wrong) and table issues that affect no tier (an override key naming no configured tier).
  */
-export function checkTableAgainstTiers(
+export function checkTiers(
   table: RoutingTable,
   tiers: readonly TierModelsConfig[],
   normalizeModelId: (id: string) => string,
-): string[] {
-  const errors: string[] = [];
+  invalidTargets: Readonly<Record<string, string>> = {},
+): { unavailableTiers: Record<string, string>; issues: string[] } {
+  const unavailableTiers: Record<string, string> = {};
+  const issues: string[] = [];
   const names = new Set(tiers.filter((t) => t && typeof t.name === 'string').map((t) => t.name));
   for (const tierName of Object.keys(table.tiers)) {
-    if (!names.has(tierName)) errors.push(`tiers.${tierName}: no subscription tier has this name`);
+    if (!names.has(tierName)) issues.push(`tiers.${tierName}: no subscription tier has this name, so this override never applies`);
   }
   for (const tier of tiers) {
     if (!tier || typeof tier.name !== 'string') continue;
     const allowed = normalizeAllowedModels(tier.allowedModels, normalizeModelId);
     if (allowed === ALL_MODELS || !allowed.includes(AGENTWEB_MODEL_ID)) continue;
+    const outside: string[] = [];
     for (const taskType of AGENTWEB_TASK_TYPES) {
       const { model } = routeFor(table, tier.name, taskType);
-      if (!allowed.includes(model)) {
-        errors.push(`tier "${tier.name}" may select ${AGENTWEB_MODEL_ID}, but its ${taskType} route "${model}" is not in its allowedModels`);
-      }
+      if (!invalidTargets[model] && !allowed.includes(model)) outside.push(`${taskType} -> "${model}"`);
+    }
+    if (outside.length > 0) {
+      unavailableTiers[tier.name] = `its allowedModels list ${AGENTWEB_MODEL_ID} but not the model(s) its routes use: ${outside.join(', ')}`;
     }
   }
-  return errors;
+  return { unavailableTiers, issues };
 }
 
 export interface AgentWebModelRoute {
@@ -233,8 +257,19 @@ export interface AgentWebModelRouterDeps {
 }
 
 type TableState =
-  | { status: 'ready'; table: RoutingTable }
+  | {
+      status: 'ready';
+      table: RoutingTable;
+      /** Targets no route may use (model -> why): the routes resolving to one are unavailable. */
+      invalidTargets: Record<string, string>;
+      /** Tiers the router is unavailable for (tier -> why). */
+      unavailableTiers: Record<string, string>;
+    }
   | { status: 'unavailable'; why: 'missing' | 'invalid' | 'unreadable'; errors?: string[] };
+
+const REFUSAL_FOOTER =
+  `While ${AGENTWEB_MODEL_ROUTER_SETTING} is on, the affected selections of the AgentWeb Model are refused with ` +
+  `model_unavailable (nothing is sent to a different model). Fix the table (or the tier's allowedModels), or turn the switch off.`;
 
 export function createAgentWebModelRouter(deps: AgentWebModelRouterDeps) {
   // ---- switch (same shape as modelAccess.ts / workPlanStepModels.ts) ----
@@ -270,22 +305,50 @@ export function createAgentWebModelRouter(deps: AgentWebModelRouterDeps) {
   let tableValidUntil = 0;
   let tableInFlight: Promise<void> | null = null;
 
+  function alert(subject: string, detail: string, dedupeKey: string): void {
+    void deps.alert({ subject, detail, dedupeKey, dedupeWindowMs: ALERT_WINDOW_MS })
+      .catch(() => { /* the alert sink must never fail a turn */ });
+  }
+
   function unavailable(why: 'missing' | 'invalid' | 'unreadable', errors?: string[]): TableState {
     const detail = why === 'missing'
       ? `The ${AGENTWEB_MODEL_ROUTING_TABLE_SETTING} setting is absent or empty.`
       : why === 'unreadable'
         ? `The ${AGENTWEB_MODEL_ROUTING_TABLE_SETTING} setting (or the subscription tiers) could not be read and no table was loaded before.`
-        : `The ${AGENTWEB_MODEL_ROUTING_TABLE_SETTING} setting is invalid:\n- ${(errors ?? []).join('\n- ')}`;
-    deps.log('AgentWebModel: routing table unavailable; selections of the AgentWeb Model are refused', { why, errors });
-    void deps.alert({
-      subject: 'AgentMode: AgentWeb Model router unavailable',
-      detail:
-        `${detail}\n\nWhile ${AGENTWEB_MODEL_ROUTER_SETTING} is on, every turn that selects the AgentWeb Model is refused with ` +
-        `model_unavailable (nothing is sent to a different model). Fix the table, or turn the switch off.`,
-      dedupeKey: ROUTER_UNAVAILABLE_ALERT_DEDUPE_KEY,
-      dedupeWindowMs: ALERT_WINDOW_MS,
-    }).catch(() => { /* the alert sink must never fail a turn */ });
+        : `The ${AGENTWEB_MODEL_ROUTING_TABLE_SETTING} setting cannot be used:\n- ${(errors ?? []).join('\n- ')}`;
+    deps.log('AgentWebModel: routing table unavailable; every selection of the AgentWeb Model is refused', { why, errors });
+    alert('AgentMode: AgentWeb Model router unavailable', `${detail}\n\nThis affects EVERY tier. ${REFUSAL_FOOTER}`, ROUTER_UNAVAILABLE_ALERT_DEDUPE_KEY);
     return { status: 'unavailable', why, ...(errors && { errors }) };
+  }
+
+  /** One alert per broken target (naming the routes that use it) and per unavailable tier (naming its models). */
+  function reportPartial(table: RoutingTable, invalidTargets: Record<string, string>, unavailableTiers: Record<string, string>, issues: string[]): void {
+    for (const [model, why] of Object.entries(invalidTargets)) {
+      deps.log('AgentWebModel: routes to an unusable model are unavailable', { model, why, version: table.version });
+      alert(
+        `AgentMode: AgentWeb Model route target "${model}" unusable`,
+        `Routing table ${table.version} routes to "${model}", which cannot be routed to (${why}). Every route that resolves to it ` +
+        `is unavailable; other routes keep working.\n\n${REFUSAL_FOOTER}`,
+        `${ROUTE_TARGET_ALERT_DEDUPE_PREFIX}${model}`,
+      );
+    }
+    for (const [tier, why] of Object.entries(unavailableTiers)) {
+      deps.log('AgentWebModel: router unavailable for a tier', { tier, why, version: table.version });
+      alert(
+        `AgentMode: AgentWeb Model unavailable for tier "${tier}"`,
+        `Tier "${tier}" ${why}. The router is unavailable for this tier's owners (routing table ${table.version}); other tiers keep ` +
+        `working.\n\n${REFUSAL_FOOTER}`,
+        `${TIER_UNAVAILABLE_ALERT_DEDUPE_PREFIX}${tier}`,
+      );
+    }
+    if (issues.length > 0) {
+      deps.log('AgentWebModel: routing table issues (nothing unavailable)', { issues, version: table.version });
+      alert(
+        'AgentMode: AgentWeb Model routing table issues',
+        `Routing table ${table.version}:\n- ${issues.join('\n- ')}\n\nNothing is unavailable because of these, but the overrides never apply.`,
+        TABLE_ISSUES_ALERT_DEDUPE_KEY,
+      );
+    }
   }
 
   async function refreshTable(now: number): Promise<void> {
@@ -322,15 +385,14 @@ export function createAgentWebModelRouter(deps: AgentWebModelRouterDeps) {
       state = unavailable('invalid', parsed.errors);
       return;
     }
-    const tierErrors = tiers ? checkTableAgainstTiers(parsed.table, tiers, deps.normalizeModelId) : [];
-    if (tierErrors.length > 0) {
-      state = unavailable('invalid', tierErrors);
-      return;
-    }
+    const { unavailableTiers, issues } = tiers
+      ? checkTiers(parsed.table, tiers, deps.normalizeModelId, parsed.invalidTargets)
+      : { unavailableTiers: {}, issues: [] };
+    reportPartial(parsed.table, parsed.invalidTargets, unavailableTiers, issues);
     if (state?.status !== 'ready' || state.table.version !== parsed.table.version) {
       deps.log('AgentWebModel: routing table loaded', { version: parsed.table.version });
     }
-    state = { status: 'ready', table: parsed.table };
+    state = { status: 'ready', table: parsed.table, invalidTargets: parsed.invalidTargets, unavailableTiers };
   }
 
   async function getTableState(): Promise<TableState> {
@@ -344,33 +406,41 @@ export function createAgentWebModelRouter(deps: AgentWebModelRouterDeps) {
 
   /**
    * The concrete model for one turn. Callers check `isEnabled()` first. Throws ModelUnavailableError(`not_served`)
-   * for the AgentWeb Model when the table is unavailable, or when the route is outside the owner's live allowlist
-   * (`allowedModels`: '*' when the tier allowlist is off). The table check at load makes the latter a config race
+   * for the AgentWeb Model when the table is unusable, the router is unavailable for this tier, the route resolves to
+   * an unusable target (never falling through to another rule), or the route is outside the owner's live allowlist
+   * (`allowedModels`: '*' when the tier allowlist is off). The tier check at load makes the last one a config race
    * (an allowlist edited after the table loaded); it is refused and alerted, never run.
    */
   async function route(input: { tier: string | null; taskType: AgentWebTaskType; allowedModels: AllowedModels }): Promise<AgentWebModelRoute> {
     const current = await getTableState();
     if (current.status !== 'ready') throw new ModelUnavailableError(AGENTWEB_MODEL_ID, 'not_served');
+    if (input.tier && current.unavailableTiers[input.tier]) throw new ModelUnavailableError(AGENTWEB_MODEL_ID, 'not_served');
     const { model, reason } = routeFor(current.table, input.tier, input.taskType);
+    if (current.invalidTargets[model]) throw new ModelUnavailableError(AGENTWEB_MODEL_ID, 'not_served');
     if (input.allowedModels !== ALL_MODELS && !input.allowedModels.includes(model)) {
       deps.log('AgentWebModel: route is outside the owner\'s plan; refused', { tier: input.tier, taskType: input.taskType, model });
-      void deps.alert({
-        subject: 'AgentMode: AgentWeb Model routed outside a plan',
-        detail:
-          `Routing table ${current.table.version} sends tier "${input.tier ?? 'unknown'}" ${input.taskType} tasks to "${model}", which ` +
-          `that tier's allowedModels does not include. The turn was refused (nothing ran on another model). Align the table ` +
-          `with the tier's allowedModels.`,
-        dedupeKey: ROUTE_OUTSIDE_PLAN_ALERT_DEDUPE_KEY,
-        dedupeWindowMs: ALERT_WINDOW_MS,
-      }).catch(() => { /* never fail a turn */ });
+      alert(
+        'AgentMode: AgentWeb Model routed outside a plan',
+        `Routing table ${current.table.version} sends tier "${input.tier ?? 'unknown'}" ${input.taskType} tasks to "${model}", which ` +
+        `that tier's allowedModels does not include. The turn was refused (nothing ran on another model). Align the table ` +
+        `with the tier's allowedModels.`,
+        ROUTE_OUTSIDE_PLAN_ALERT_DEDUPE_KEY,
+      );
       throw new ModelUnavailableError(AGENTWEB_MODEL_ID, 'not_served');
     }
     return { model, reason, tableVersion: current.table.version };
   }
 
-  /** Whether a selection of the router can be served right now (table loaded and valid). */
-  async function isAvailable(): Promise<boolean> {
-    return (await getTableState()).status === 'ready';
+  /**
+   * Whether the router is currently valid for this tier (null = no tier override applies): the table is usable, the
+   * tier is not unavailable, and every route the tier can take resolves to a usable target. The pickers offer the
+   * AgentWeb Model only then.
+   */
+  async function isAvailableFor(tier: string | null): Promise<boolean> {
+    const current = await getTableState();
+    if (current.status !== 'ready') return false;
+    if (tier && current.unavailableTiers[tier]) return false;
+    return AGENTWEB_TASK_TYPES.every((taskType) => !current.invalidTargets[routeFor(current.table, tier, taskType).model]);
   }
 
   /** Forget the switch and the table (tests). */
@@ -383,7 +453,7 @@ export function createAgentWebModelRouter(deps: AgentWebModelRouterDeps) {
     tableInFlight = null;
   }
 
-  return { isEnabled, isAvailable, route, getTableState, reset };
+  return { isEnabled, isAvailableFor, route, getTableState, reset };
 }
 
 export type AgentWebModelRouter = ReturnType<typeof createAgentWebModelRouter>;

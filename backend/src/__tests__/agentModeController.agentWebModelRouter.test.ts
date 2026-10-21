@@ -338,28 +338,92 @@ describe('switch ON', () => {
     spy.mockRestore();
   });
 
-  it('a table that routes a router tier outside its plan makes the router unavailable: 422, one alert, nothing ran', async () => {
-    allowlist([AW, ROUTED_SCHEDULED]); // Free may select the router, but chat routes to ROUTED_CHAT
+  /** The owner's subscription tier for the next reads (the access cache is reset). */
+  const ownerTier = (tier: string) => {
+    (getUserSubscriptionResolution as jest.Mock).mockResolvedValue({ subscriptionType: tier, resolved: true });
+    modelAccess.reset();
+  };
+  const turn = async (body: Record<string, unknown> = { llmModel: AW }) => {
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq(body), res);
+    return res;
+  };
+
+  it('narrowing ONE tier\'s allowedModels refuses only that tier (one alert naming it); other tiers route normally', async () => {
+    // Free may select the router but no longer allows the chat route's model; Team does; Pro is a wildcard.
+    allowlist([AW, ROUTED_SCHEDULED], [{ name: 'Pro', allowedModels: ['*'] }, { name: 'Team', allowedModels: [AW, ROUTED_CHAT, ROUTED_SCHEDULED] }]);
     for (let i = 0; i < 2; i++) {
-      const res = makeRes();
-      await agentModeController.generateResponse(generateReq({ llmModel: AW }), res);
+      const refused = await turn();
+      expect(refused.statusCode).toBe(422);
+      expect(refused.body).toEqual(buildModelUnavailableBody(new ModelUnavailableError(AW, 'not_served')));
+    }
+    expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+
+    for (const tier of ['Pro', 'Team']) {
+      ownerTier(tier);
+      const ok = await turn();
+      expect(ok.statusCode).toBe(200);
+    }
+    expect(mockWorker.runInWorker.mock.calls.map((c) => (c[0] as any).llmModel)).toEqual([ROUTED_CHAT, ROUTED_CHAT]);
+
+    const routerAlerts = mockAlert.mock.calls.map(([a]) => a).filter((a) => String(a.dedupeKey).startsWith('agentweb_model_router:'));
+    expect(routerAlerts.map((a) => a.dedupeKey)).toEqual(['agentweb_model_router:tier:Free']);
+    expect(routerAlerts[0].subject).toBe('AgentMode: AgentWeb Model unavailable for tier "Free"');
+    expect(routerAlerts[0].message).toContain(`chat -> "${ROUTED_CHAT}"`);
+  });
+
+  it('an unusable target used by ONE route refuses only that route; other routes keep working', async () => {
+    // Scheduled tasks route to an admin-only model; chat tasks are fine.
+    turnOn({ ...TABLE, routes: { scheduled: 'openrouter/anthropic/claude-sonnet-5.5' } });
+    expect((await turn()).statusCode).toBe(200);
+    expect(workerCall(0).llmModel).toBe(ROUTED_CHAT);
+
+    storeSession(baseSession(AW, { llmModelSource: 'user', sessionType: 'scheduled' }));
+    const error = await generateSessionResponse(SESSION_ID, 'hi', OWNER, AW).catch((e) => e);
+    expect(error).toMatchObject({ requestedModel: AW, reason: 'not_served' });
+    expect(mockWorker.runInWorker).toHaveBeenCalledTimes(1); // never sent to the table default instead
+
+    const routerAlerts = mockAlert.mock.calls.map(([a]) => a).filter((a) => String(a.dedupeKey).startsWith('agentweb_model_router:'));
+    expect(routerAlerts.map((a) => a.dedupeKey)).toEqual(['agentweb_model_router:target:openrouter/anthropic/claude-sonnet-5.5']);
+  });
+
+  it('an unparseable table refuses every tier, even where a stored model may fall back, with one alert', async () => {
+    turnOn({ ...TABLE, routes: { chats: ROUTED_CHAT } });
+    allowlist(['*']);
+    storeSession(baseSession(AW, { llmModelSource: 'user' }));
+    for (const tier of ['Free', 'Pro']) {
+      ownerTier(tier);
+      const res = await turn({}); // stored only: allowSilentSwap
       expect(res.statusCode).toBe(422);
-      expect(res.body).toEqual(buildModelUnavailableBody(new ModelUnavailableError(AW, 'not_served')));
+      expect(res.body).toMatchObject({ requestedModel: AW, reason: 'not_served' });
     }
     expect(mockWorker.runInWorker).not.toHaveBeenCalled();
     const routerAlerts = mockAlert.mock.calls.filter(([a]) => a.dedupeKey === ROUTER_UNAVAILABLE_ALERT_DEDUPE_KEY);
     expect(routerAlerts).toHaveLength(1);
-    expect(routerAlerts[0][0].message).toContain('tier "Free" may select agentweb-model');
+    expect(routerAlerts[0][0].message).toContain('unknown task type "chats"');
   });
 
-  it('an invalid table (an admin-only target) is refused the same way, even where a stored model may fall back', async () => {
-    turnOn({ ...TABLE, default: 'openrouter/anthropic/claude-sonnet-5.5' });
-    storeSession(baseSession(AW, { llmModelSource: 'user' }));
-    const res = makeRes();
-    await agentModeController.generateResponse(generateReq({}), res); // stored only: allowSilentSwap
-    expect(res.statusCode).toBe(422);
-    expect(res.body).toMatchObject({ requestedModel: AW, reason: 'not_served' });
-    expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+  it('the pickers offer it only to tiers it is currently valid for', async () => {
+    allowlist([AW, ROUTED_SCHEDULED], [{ name: 'Pro', allowedModels: ['*'] }]);
+    const options = async () => {
+      const res = makeRes();
+      await agentModeController.getModelOptions({ user: { userId: OWNER, isAdmin: false } } as any, res);
+      return res.body.allModels as string[];
+    };
+    expect(await options()).not.toContain(AW); // Free: unavailable for its tier
+    ownerTier('Pro');
+    expect(await options()).toContain(AW);
+  });
+
+  it('a failed tier read while the allowlist is OFF alerts about the router, not the allowlist', async () => {
+    (getUserSubscriptionResolution as jest.Mock).mockResolvedValue({ subscriptionType: 'Free', resolved: false });
+    const res = await turn();
+    expect(res.statusCode).toBe(200);
+    await new Promise((r) => setImmediate(r));
+    const tierAlerts = mockAlert.mock.calls.map(([a]) => a).filter((a) => a.dedupeKey === 'model_tier_allowlist:tier_unreadable');
+    expect(tierAlerts).toHaveLength(1);
+    expect(tierAlerts[0].subject).toBe('AgentMode: AgentWeb Model router could not read a subscription tier');
+    expect(tierAlerts[0].message).not.toMatch(/allowlist/i);
   });
 
   it('createSession stores the selection (not the routed model) with the routed decision', async () => {

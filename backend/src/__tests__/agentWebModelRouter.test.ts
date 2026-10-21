@@ -2,19 +2,23 @@
  * ENG-669 PR-C: the AgentWeb Model router (services/agentMode/agentWebModelRouter.ts), pure.
  *
  * Contract: switch `agentweb_model_router_enabled` exact 'true' = on, anything else / cold-start failure = off. The
- * routing table (`agentweb_model_routing_table`) is validated at load: every target a registered, publicly selectable,
- * priced, tool-capable model, and inside the allowlist of every tier that may select the router. An invalid, missing or
- * unreadable table makes the router unavailable (model_unavailable, one deduped alert), never a silent pick of another
- * model; a failed refresh keeps the last good table. Routing is deterministic: tier route > tier default > table route >
- * table default.
+ * routing table (`agentweb_model_routing_table`) is validated at load, with the damage kept narrow: an unparseable,
+ * missing or unreadable table makes the router unavailable for EVERYONE; a target that is not a registered, publicly
+ * selectable, priced, tool-capable model makes only the routes resolving to it unavailable; a tier whose allowlist does
+ * not cover its routes makes the router unavailable for THAT tier only. Unavailable = model_unavailable plus one deduped
+ * alert naming what broke, never a silent pick of another model; a failed refresh keeps the last good table. Routing is
+ * deterministic: tier route > tier default > table route > table default.
  */
 import {
   AGENTWEB_MODEL_ID,
   AGENTWEB_MODEL_ROUTER_SETTING,
   AGENTWEB_MODEL_ROUTING_TABLE_SETTING,
   ROUTE_OUTSIDE_PLAN_ALERT_DEDUPE_KEY,
+  ROUTE_TARGET_ALERT_DEDUPE_PREFIX,
   ROUTER_UNAVAILABLE_ALERT_DEDUPE_KEY,
-  checkTableAgainstTiers,
+  TABLE_ISSUES_ALERT_DEDUPE_KEY,
+  TIER_UNAVAILABLE_ALERT_DEDUPE_PREFIX,
+  checkTiers,
   createAgentWebModelRouter,
   isAgentWebModelId,
   messageRoutingOf,
@@ -68,6 +72,7 @@ describe('parseRoutingTable', () => {
         version: 'v1', default: 'good-a', routes: { report: 'good-a' },
         tiers: { Pro: { routes: { chat: 'good-c' } }, Free: { default: 'good-b', routes: {} } },
       },
+      invalidTargets: {},
     });
   });
 
@@ -77,7 +82,8 @@ describe('parseRoutingTable', () => {
     ['live-x', 'live voice'],
     ['unpriced-x', 'unpriced'],
     ['notools-x', 'cannot call tools'],
-  ])('refuses a target that is %s (%s), wherever it appears', (model, why) => {
+    ['gpt-nope', 'not a registered model'],
+  ])('a target that is %s (%s) is recorded as unusable, wherever it appears; the table still parses', (model, why) => {
     for (const table of [
       { ...TABLE, default: model },
       { ...TABLE, routes: { chat: model } },
@@ -85,18 +91,18 @@ describe('parseRoutingTable', () => {
       { ...TABLE, tiers: { Pro: { routes: { video: model } } } },
     ]) {
       const parsed = parseRoutingTable(table, catalog);
-      expect(parsed.ok).toBe(false);
-      expect((parsed as any).errors.join(' ')).toContain(why);
+      expect(parsed.ok).toBe(true);
+      expect((parsed as any).invalidTargets).toEqual({ [model]: why });
     }
   });
 
-  it('refuses an unregistered target, a missing default, a missing version, unknown keys and unknown task types', () => {
+  it('cannot parse: not an object, a missing default or version, unknown keys or task types, a non-string target', () => {
     const cases: Array<[unknown, string]> = [
-      [{ ...TABLE, default: 'gpt-nope' }, 'not a registered model'],
       [{ version: 'v1' }, 'default must be a model id'],
       [{ ...TABLE, version: ' ' }, 'version is required'],
       [{ ...TABLE, defualt: 'good-a' }, 'unknown key "defualt"'],
       [{ ...TABLE, routes: { reports: 'good-a' } }, 'unknown task type "reports"'],
+      [{ ...TABLE, routes: { chat: 42 } }, 'routes.chat must be a model id'],
       [{ ...TABLE, tiers: { Pro: { route: {} } } }, 'unknown key "route"'],
       [{ ...TABLE, tiers: ['Pro'] }, 'tiers must be an object'],
       [[TABLE], 'must be a JSON object'],
@@ -124,7 +130,7 @@ describe('routeFor: tier route > tier default > table route > table default', ()
   });
 });
 
-describe('checkTableAgainstTiers: the router never routes a tier to a model its plan excludes', () => {
+describe('checkTiers: the router never routes a tier to a model its plan excludes (per tier)', () => {
   const table = (parseRoutingTable(TABLE, catalog) as any).table;
   const id = (x: string) => x;
 
@@ -134,30 +140,32 @@ describe('checkTableAgainstTiers: the router never routes a tier to a model its 
       { name: 'Pro', allowedModels: ['*'] },
       { name: 'Team' },
     ];
-    expect(checkTableAgainstTiers(table, tiers, id)).toEqual([]);
+    expect(checkTiers(table, tiers, id)).toEqual({ unavailableTiers: {}, issues: [] });
   });
 
-  it('flags each route outside a router tier\'s allowlist', () => {
+  it('marks only the tier whose allowlist misses its routes, naming each task and model', () => {
     const tiers: TierModelsConfig[] = [
       { name: 'Free', allowedModels: [AGENTWEB_MODEL_ID, 'good-a'] }, // Free routes everything to good-b
-      { name: 'Pro', allowedModels: [AGENTWEB_MODEL_ID, 'good-c', 'good-a'] }, // Pro reports go to good-b
+      { name: 'Pro', allowedModels: [AGENTWEB_MODEL_ID, 'good-a', 'good-b', 'good-c'] },
     ];
-    const errors = checkTableAgainstTiers(table, tiers, id);
-    expect(errors).toEqual(expect.arrayContaining([
-      expect.stringContaining('tier "Free" may select agentweb-model, but its chat route "good-b"'),
-      expect.stringContaining('tier "Pro" may select agentweb-model, but its report route "good-b"'),
-    ]));
-    expect(errors.filter((e) => e.includes('"Free"'))).toHaveLength(6);
+    const { unavailableTiers } = checkTiers(table, tiers, id);
+    expect(Object.keys(unavailableTiers)).toEqual(['Free']);
+    expect(unavailableTiers.Free).toContain('chat -> "good-b"');
+    expect(unavailableTiers.Free).toContain('video -> "good-b"');
   });
 
-  it('ignores a tier that cannot select the router', () => {
-    const tiers: TierModelsConfig[] = [{ name: 'Free', allowedModels: ['good-a'] }, { name: 'Pro', allowedModels: ['*'] }];
-    expect(checkTableAgainstTiers(table, tiers, id)).toEqual([]);
+  it('ignores a tier that cannot select the router, and a route whose target is already unusable', () => {
+    const tiers: TierModelsConfig[] = [{ name: 'Free', allowedModels: ['good-a'] }, { name: 'Pro', allowedModels: [AGENTWEB_MODEL_ID, 'good-a', 'good-b'] }];
+    // Pro's chat route is good-c: unusable is that route's problem, not a reason to take the whole tier down.
+    expect(checkTiers(table, tiers, id, { 'good-c': 'unpriced' }).unavailableTiers).toEqual({});
+    expect(Object.keys(checkTiers(table, tiers, id).unavailableTiers)).toEqual(['Pro']);
   });
 
-  it('refuses an override for a tier that does not exist (a typo would silently get the table routes)', () => {
-    expect(checkTableAgainstTiers(table, [{ name: 'Pro', allowedModels: ['*'] }], id))
-      .toEqual(['tiers.Free: no subscription tier has this name']);
+  it('reports an override for a tier that does not exist as an issue (it never applies), without taking anything down', () => {
+    expect(checkTiers(table, [{ name: 'Pro', allowedModels: ['*'] }], id)).toEqual({
+      unavailableTiers: {},
+      issues: ['tiers.Free: no subscription tier has this name, so this override never applies'],
+    });
   });
 });
 
@@ -174,7 +182,7 @@ describe('createAgentWebModelRouter', () => {
       catalog,
       readTierAllowlists: jest.fn(async () => tiers),
       normalizeModelId: (x: string) => x,
-      alert: jest.fn(async () => undefined),
+      alert: jest.fn(async (_input: { subject: string; detail: string; dedupeKey: string; dedupeWindowMs: number }) => undefined),
       now: () => now,
       log: jest.fn(),
     } satisfies AgentWebModelRouterDeps;
@@ -187,6 +195,7 @@ describe('createAgentWebModelRouter', () => {
     };
   }
   const chat = { tier: null, taskType: 'chat' as const, allowedModels: ALL_MODELS };
+  const alertKeys = (deps: { alert: jest.Mock }) => deps.alert.mock.calls.map(([a]) => a.dedupeKey);
 
   it('switch: only the exact string "true" turns it on; a cold-start read failure is off', async () => {
     for (const value of ['TRUE', ' true', '1', true, undefined]) {
@@ -217,20 +226,23 @@ describe('createAgentWebModelRouter', () => {
     await t.router.route(chat);
     const tableReads = t.deps.getSetting.mock.calls.filter(([n]) => n === AGENTWEB_MODEL_ROUTING_TABLE_SETTING);
     expect(tableReads).toHaveLength(1);
+    expect(t.deps.alert).not.toHaveBeenCalled();
   });
 
   it.each([
     ['missing', undefined, 'absent or empty'],
     ['not JSON', '{nope', 'not valid JSON'],
-    ['invalid', JSON.stringify({ ...TABLE, default: 'admin-x' }), 'admin-only'],
-  ])('a %s table makes the router unavailable (not_served) with ONE alert, never a fallback', async (_label, table, detail) => {
+    ['unparseable', JSON.stringify({ ...TABLE, routes: { reports: 'good-a' } }), 'unknown task type "reports"'],
+  ])('a %s table makes the router unavailable for EVERY tier and route, with ONE alert', async (_label, table, detail) => {
     const t = makeDeps({ table });
-    for (let i = 0; i < 3; i++) {
-      const error = await t.router.route(chat).catch((e) => e);
-      expect(error).toBeInstanceOf(ModelUnavailableError);
-      expect(error).toMatchObject({ requestedModel: AGENTWEB_MODEL_ID, reason: 'not_served' });
+    for (const tier of [null, 'Free', 'Pro']) {
+      for (const taskType of ['chat', 'report'] as const) {
+        const error = await t.router.route({ tier, taskType, allowedModels: ALL_MODELS }).catch((e) => e);
+        expect(error).toBeInstanceOf(ModelUnavailableError);
+        expect(error).toMatchObject({ requestedModel: AGENTWEB_MODEL_ID, reason: 'not_served' });
+      }
+      expect(await t.router.isAvailableFor(tier)).toBe(false);
     }
-    expect(await t.router.isAvailable()).toBe(false);
     expect(t.deps.alert).toHaveBeenCalledTimes(1);
     expect(t.deps.alert).toHaveBeenCalledWith(expect.objectContaining({
       dedupeKey: ROUTER_UNAVAILABLE_ALERT_DEDUPE_KEY,
@@ -238,14 +250,52 @@ describe('createAgentWebModelRouter', () => {
     }));
   });
 
-  it('a table that routes a router tier outside its allowlist is invalid (tier allowlist on)', async () => {
-    const t = makeDeps({ tiers: [{ name: 'Free', allowedModels: [AGENTWEB_MODEL_ID, 'good-a'] }, { name: 'Pro', allowedModels: ['*'] }] });
-    await expect(t.router.route(chat)).rejects.toMatchObject({ reason: 'not_served' });
-    expect(t.deps.alert).toHaveBeenCalledWith(expect.objectContaining({ detail: expect.stringContaining('tier "Free" may select agentweb-model') }));
-    // Fixing the tier (allowing what the table routes it to) makes the router available on the next load.
-    t.setTiers([{ name: 'Free', allowedModels: [AGENTWEB_MODEL_ID, 'good-b'] }, { name: 'Pro', allowedModels: ['*'] }]);
+  it('an unusable target takes down ONLY the routes resolving to it, never falling through to another rule', async () => {
+    // Pro's chat route is admin-only; everything else still routes, and Pro chat is refused (not sent to the default).
+    const t = makeDeps({ table: JSON.stringify({ ...TABLE, tiers: { Pro: { routes: { chat: 'admin-x' } } } }) });
+    await expect(t.router.route({ ...chat, tier: 'Pro' })).rejects.toMatchObject({ requestedModel: AGENTWEB_MODEL_ID, reason: 'not_served' });
+    await expect(t.router.route({ ...chat, tier: 'Pro', taskType: 'report' })).resolves.toMatchObject({ model: 'good-b' });
+    await expect(t.router.route({ ...chat, tier: 'Free' })).resolves.toMatchObject({ model: 'good-a' });
+    await expect(t.router.route(chat)).resolves.toMatchObject({ model: 'good-a' });
+    expect(await t.router.isAvailableFor('Pro')).toBe(false);
+    expect(await t.router.isAvailableFor('Free')).toBe(true);
+    expect(await t.router.isAvailableFor(null)).toBe(true);
+    expect(alertKeys(t.deps)).toEqual([`${ROUTE_TARGET_ALERT_DEDUPE_PREFIX}admin-x`]);
+    expect(t.deps.alert.mock.calls[0][0].detail).toContain('admin-only');
+  });
+
+  it('a tier whose allowlist misses its routes is unavailable for THAT tier only, with one alert naming tier and model', async () => {
+    const t = makeDeps({
+      table: JSON.stringify({ ...TABLE, tiers: { Pro: { routes: { chat: 'good-c' } } } }),
+      tiers: [
+        { name: 'Free', allowedModels: [AGENTWEB_MODEL_ID, 'good-a'] }, // Free's report route is good-b
+        { name: 'Pro', allowedModels: ['*'] },
+        { name: 'Team', allowedModels: [AGENTWEB_MODEL_ID, 'good-a', 'good-b'] },
+      ],
+    });
+    for (const taskType of ['chat', 'report'] as const) {
+      await expect(t.router.route({ tier: 'Free', taskType, allowedModels: ALL_MODELS })).rejects.toMatchObject({ reason: 'not_served' });
+    }
+    await expect(t.router.route({ ...chat, tier: 'Pro' })).resolves.toMatchObject({ model: 'good-c' });
+    await expect(t.router.route({ ...chat, tier: 'Team', taskType: 'report' })).resolves.toMatchObject({ model: 'good-b' });
+    expect(await t.router.isAvailableFor('Free')).toBe(false);
+    expect(await t.router.isAvailableFor('Team')).toBe(true);
+    expect(alertKeys(t.deps)).toEqual([`${TIER_UNAVAILABLE_ALERT_DEDUPE_PREFIX}Free`]);
+    expect(t.deps.alert.mock.calls[0][0]).toMatchObject({
+      subject: 'AgentMode: AgentWeb Model unavailable for tier "Free"',
+      detail: expect.stringContaining('report -> "good-b"'),
+    });
+
+    // Fixing the tier (allowing what the table routes it to) restores it on the next load.
+    t.setTiers([{ name: 'Free', allowedModels: [AGENTWEB_MODEL_ID, 'good-a', 'good-b'] }, { name: 'Pro', allowedModels: ['*'] }, { name: 'Team' }]);
     t.advance(61_000);
-    await expect(t.router.route({ ...chat, tier: 'Free' })).resolves.toMatchObject({ model: 'good-b' });
+    await expect(t.router.route({ ...chat, tier: 'Free', taskType: 'report' })).resolves.toMatchObject({ model: 'good-b' });
+  });
+
+  it('an override naming no configured tier is reported, and nothing is taken down', async () => {
+    const t = makeDeps({ tiers: [{ name: 'Pro', allowedModels: ['*'] }] });
+    await expect(t.router.route({ ...chat, tier: 'Pro' })).resolves.toMatchObject({ model: 'good-c' });
+    expect(alertKeys(t.deps)).toEqual([TABLE_ISSUES_ALERT_DEDUPE_KEY]);
   });
 
   it('a failed table read keeps the last good table; a cold-start failure is unavailable', async () => {
@@ -259,7 +309,7 @@ describe('createAgentWebModelRouter', () => {
     const cold = makeDeps();
     cold.deps.readTierAllowlists.mockRejectedValue(new Error('tiers unreadable'));
     await expect(cold.router.route(chat)).rejects.toMatchObject({ reason: 'not_served' });
-    expect(cold.deps.alert).toHaveBeenCalledTimes(1);
+    expect(alertKeys(cold.deps)).toEqual([ROUTER_UNAVAILABLE_ALERT_DEDUPE_KEY]);
   });
 
   it('refuses (and alerts) a route outside the owner\'s live allowlist instead of running it', async () => {

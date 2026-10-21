@@ -31,16 +31,25 @@ a Compare column is rejected as unavailable). Only the switch is read, and only 
   `scheduled` (sessionType `scheduled`, and any schedule run), `report` (`report_generation`), `image`
   (`image-generation`), `video` (`video-generation`), `support` (portalType `emma-sidebar`). `taskTypeForSession`.
 - Precedence: the tier's route for the task type, the tier's `default`, the table route, the table `default`.
-- Validated on every load (~60s): `version` and `default` required; unknown keys / task types refused; every target a
-  registry model (legacy aliases resolved, stored canonically), publicly selectable (not admin-only, internal-only or
-  live voice), priced (`llmPricing.ts`), tool-capable. With the PR-A tier allowlist on: every route a tier that may
-  select the router (`allowedModels` lists `agentweb-model`) can take must be in that tier's `allowedModels`, and every
-  `tiers` key must name a configured tier. NOTE: PR-A's example of narrowing Free to `["agentweb-model"]` alone is
-  therefore an INVALID table for Free: list the routed models too (e.g. `["agentweb-model", "gemini-3.1-flash-lite"]`).
-- Invalid, missing or unreadable table = router UNAVAILABLE: every selection gets the visible 422 `not_served` (the
-  picker stops offering it), one on-call alert deduped 1h (`agentweb_model_router:unavailable`). Never a fallback.
-  A failed read keeps the last good table. A route outside the owner's LIVE allowlist (an allowlist edited inside the
-  cache window) is refused the same way (`agentweb_model_router:route_outside_plan`).
+- Validated on every load (~60s), with the damage kept as narrow as possible (one plan's mistake must not take the
+  router from every customer). A refusal is always the visible 422 `model_unavailable`/`not_served`, never a fallback
+  (a broken route does NOT fall through to the next rule), with one on-call alert deduped 1h:
+  - **Unparseable** (not JSON, not an object, unknown keys or task types, no `version` / `default`, a non-string
+    target), **missing** or (cold-start) **unreadable** table: unavailable for EVERYONE
+    (`agentweb_model_router:unavailable`).
+  - **Unusable target** (not a registry model, admin-only, internal-only, live voice, unpriced, cannot call tools): only
+    the routes that resolve to it are unavailable (`agentweb_model_router:target:<model>`, naming the model and why).
+  - **Tier allowlist** (PR-A on): a tier that may select the router (`allowedModels` lists `agentweb-model`) but does
+    not allow every model its routes resolve to is unavailable for THAT tier only
+    (`agentweb_model_router:tier:<tier>`, naming each task and model). Other tiers keep routing. NOTE: PR-A's example
+    of narrowing Free to `["agentweb-model"]` alone therefore makes the router unavailable for Free: list the routed
+    models too (e.g. `["agentweb-model", "gemini-3.1-flash-lite"]`).
+  - A `tiers` key naming no configured tier never applies; reported (`agentweb_model_router:table_issues`), nothing is
+    taken down.
+  - A failed read keeps the last good table. A route outside the owner's LIVE allowlist (an allowlist edited inside the
+    cache window) is refused too (`agentweb_model_router:route_outside_plan`).
+- A tier read that fails while routing (the router reads the owner's tier even with the allowlist off) alerts as
+  "AgentWeb Model router could not read a subscription tier"; the allowlist wording is used only when it is on.
 
 **Seeding.** Write the table row first, then the switch (`agentweb_model_router_enabled` = `true`). Check the logs for
 `AgentWebModel: routing table loaded` (or `routing table unavailable` with the reasons). Each routed turn logs
@@ -69,7 +78,8 @@ approval resumes, GTM, continuations) are routed inside `generateSessionResponse
 is on. Schedule BACKUP models stay concrete (the router is never offered as a backup).
 
 **Pickers.** `/model-options` (`allModels`, `selectableModels`) and `/public/llm-models` (signed-in only) list it right
-AFTER the first entry while the switch is on, the table is valid and the owner's tier includes it. Deliberately not
+AFTER the first entry while the switch is on, the owner's tier includes it, and the router is currently valid for that
+tier (usable table, tier not unavailable, every route the tier can take usable). Deliberately not
 first: the portal pre-selects index 0 (`useAgentModeSettings.ts`), which would make the router everyone's default.
 
 **Portal.** Display ("AgentWeb Model · via X" from `llmSelected` + `llm`, the picker entry's name/description) is a

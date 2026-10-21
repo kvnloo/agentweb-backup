@@ -135,12 +135,15 @@ export async function assertAgentWebModelSelectable(input: {
 
 /**
  * Whether the pickers offer the AgentWeb Model to this owner: the switch is on (off: nothing is read beyond the cached
- * switch), the router is available, and the owner's tier includes it. No owner (an anonymous catalog read) = not offered.
+ * switch), the owner's tier includes it, and the router is currently valid for that tier (usable table, tier not
+ * unavailable, every route it can take usable). No owner (an anonymous catalog read) = not offered.
  */
 export async function offersAgentWebModel(ownerUserId: string | null | undefined): Promise<boolean> {
   if (!(await agentWebModelRouter.isEnabled())) return false;
-  if (!(await agentWebModelRouter.isAvailable())) return false;
   if (!ownerUserId) return false;
   const allowed = await modelAccess.filterAllowedModels(ownerUserId, [AGENTWEB_MODEL_ID]);
-  return allowed.includes(AGENTWEB_MODEL_ID);
+  if (!allowed.includes(AGENTWEB_MODEL_ID)) return false;
+  // Valid for THIS owner's tier (another tier's broken override must not hide it here, and vice versa).
+  const access = await modelAccess.getModelAccess(ownerUserId);
+  return agentWebModelRouter.isAvailableFor(access.tier);
 }
