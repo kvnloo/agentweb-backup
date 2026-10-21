@@ -87,6 +87,7 @@ import { reconcileUnconsumedCursors, ROW_KEYS as LEDGER_ROW_KEYS } from './agent
 import { reconcileModelReassessAck, findLastAssistantModel } from '../utils/modelReassessRequest';
 import { reconcileModelMentionAck, buildModelMentionIndex, type ModelMentionIndex } from '../utils/modelMentionRequest';
 import { resolveTurnModelCorrection } from '../utils/modelCorrectionStamp';
+import type { MessageModelRouting } from './agentMode/agentWebModelRouter';
 import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
 // ENG-2103 (F2, Pattern A): resolveOrgProfileField's only 5 callers
 // (readBrandGuidelines/readMarketStrategy and friends) moved to
@@ -268,6 +269,7 @@ import * as twitterImpl from '../emma/impl/twitter';
 // ENG-2103 (F2): Meta/LinkedIn ads APIs tool cluster, same treatment as leadsImpl above.
 import * as adsApisImpl from '../emma/impl/adsApis';
 import { buildToolkitObjectiveGate, readBackMetaNode } from './agentMode/metaToolkitSeams';
+import { PAUSED_BUNDLE_ACTION, PausedMetaBundle, parsePausedMetaBundle, pausedBundleSummary, executePausedMetaBundle, assertPausedBundleUserCount, preflightPausedMetaCreatives } from './agentMode/metaPausedBundle';
 // ENG-2103 (F2): Google Ads + HubSpot/Attio CRM passthrough tool cluster,
 // same treatment as leadsImpl above.
 import * as adsCrmApisImpl from '../emma/impl/adsCrmApis';
@@ -361,7 +363,7 @@ const SKILL_NO_SUBSTITUTION =
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
 // mutation tool remains manage_predefined_work_plan.
-export const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'get_session_transcript', 'get_user_by_id', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
+export const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_user_funnel_status', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'get_session_transcript', 'get_user_by_id', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -582,6 +584,7 @@ type ApprovalDeckExecutionSummary = {
     stepId: string;
     status: 'verified' | 'failed';
     appliedObjectId?: string;
+    bundle?: { requested_ad_count: number; verified_ad_count: number; ledger: unknown[] };
     error?: string;
     mismatches?: Array<{ parameter: string; requested: unknown; applied: unknown }>;
   }>;
@@ -1738,6 +1741,7 @@ export class AgentModeService {
         await import('../emma/testAccountTools');
         await import('../emma/navigateTools');
         await import('../emma/connectAccountTool');
+        await import('../emma/linkedInAccountRevokeTools');
         await import('../emma/solveRecaptchaTool');
         await import('../emma/siteSigninTools');
         await import('../emma/verificationCodeTool');
@@ -3030,6 +3034,9 @@ export class AgentModeService {
     // false/undefined otherwise); every other caller of generateMarketingResponse
     // is an attended interactive path and leaves this undefined.
     isUnattendedRun?: boolean,
+    // ENG-669 PR-C: set when `llmModel` was routed by the AgentWeb Model (the selection, the table rule and version).
+    // Stamped on this turn's assistant messages beside `llm`, like the ENG-1205 correction.
+    modelRouting?: MessageModelRouting,
   ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; truncatedByStepBudget?: boolean; truncatedByTimeBudget?: boolean; persistedResponseCount?: number; workPlanTurnDisposition?: WorkPlanTurnDisposition; pendingApprovalDeck?: PendingApprovalDeck }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
@@ -4213,6 +4220,8 @@ export class AgentModeService {
 
         // Add LLM model to the response message
         responseMessage.llm = llmModel;
+        // ENG-669 PR-C: and, when the AgentWeb Model chose it, the selection and why.
+        if (modelRouting) Object.assign(responseMessage, modelRouting);
         // ENG-1205: and, when the model that ran is not the one that was asked
         // for, what was asked for — `llm` alone cannot distinguish "you picked
         // this" from "you were given this".
@@ -4927,6 +4936,7 @@ export class AgentModeService {
               role: 'assistant',
               content: staged.turnMessage,
               llm: llmModel,
+              ...modelRouting,
               metadata: { timestamp: new Date().toISOString(), awaitingUserConfirmation: true, approvalInboxManifestId: staged.manifestId },
             });
             if (onProgress) {
@@ -4973,6 +4983,7 @@ export class AgentModeService {
               role: 'assistant',
               content: deckPrompt,
               llm: llmModel,
+              ...modelRouting,
               // ENG-1635/1644 Phase B: no tool-call result carries the deck's data (unlike
               // ask_user_question, this halt is pushed as plain content) — this is the only
               // correlator the frontend has to know THIS message should render the
@@ -5010,6 +5021,7 @@ export class AgentModeService {
             role: 'assistant',
             content: confirmationPrompt,
             llm: llmModel,
+            ...modelRouting,
             metadata: { timestamp: new Date().toISOString(), awaitingUserConfirmation: true }
           });
           if (onProgress) {
@@ -5393,6 +5405,7 @@ export class AgentModeService {
             role: 'assistant',
             content,
             llm: llmModel,
+            ...modelRouting,
             metadata: { timestamp: new Date().toISOString() },
           });
         }
@@ -6457,6 +6470,9 @@ export class AgentModeService {
     'get_lead_lists',         // Lead management teaser
     'list_connected_accounts', // Social/ads integration teaser
     'connect_account',        // Read-only UI handoff when a required account is absent
+    // LinkedIn Outreach self-service (ENG-1153): caller-scoped inspect + confirm-gated revoke.
+    'inspect_linkedin_account',
+    'revoke_linkedin_account',
 
     'get_user_profile',         // Account info teaser
     'get_account_status',       // Self account status (plan, usage, api-key count) — wraps /api/auth/me, no args
@@ -6554,6 +6570,10 @@ export class AgentModeService {
     // only asks the current page to open the existing OAuth dialog; it does not
     // grant consent or connect an account by itself.
     'connect_account',
+    // LinkedIn Outreach inspect/revoke (ENG-1153) must survive a stale DB
+    // foundation_tools override, otherwise chat cannot reach them at all.
+    'inspect_linkedin_account',
+    'revoke_linkedin_account',
     // S3 overflow retrieval is infrastructure, not a skill: whenever a tool result
     // is offloaded to S3 the model is handed a "[Full response stored at S3 key: ...]"
     // pointer and MUST be able to resolve it. A DB `foundation_tools` setting that
@@ -10498,7 +10518,7 @@ export class AgentModeService {
 
   public async attachKnowledgeBaseFiles(
     taskId: string,
-    files: Array<{ name: string; content: string }>,
+    files: unknown,
     userId: string,
     sessionId: string
   ): Promise<any> {
@@ -13807,7 +13827,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
    * they don't publish to a campaign or destroy anything.
    */
   private static META_WRITE_ACTIONS: Record<string, string[]> = {
-    CAMPAIGN: ['CREATE', 'UPDATE', 'DELETE'],
+    CAMPAIGN: ['CREATE', 'UPDATE', 'DELETE', PAUSED_BUNDLE_ACTION],
     AD_SET: ['CREATE', 'UPDATE', 'DELETE'],
     AD: ['CREATE', 'UPDATE', 'DELETE', 'COPY_AD', 'RETAG_UTM'],
     // Account-level assets. CREATE publishes a creative; UPLOAD_USERS pushes PII
@@ -13917,6 +13937,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
     );
     const session = await chatbotDb.getChatSession(sessionId);
+    if (action === PAUSED_BUNDLE_ACTION && session?.userId !== userId) return { granted: false, digest, reason: 'not_approved' };
     // Session already recorded this exact digest consumed — a repeat of the
     // same call re-confirms rather than executing again (acceptance
     // criterion 3).
@@ -13939,6 +13960,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     // which IS the deck that was just answered.
     const outcome = findApprovalDeckAnswerForDigest(grantSourceDeck ?? session?.pendingApprovalDeck, digest);
     if (!outcome.granted) return { granted: false, digest, reason: 'not_approved' };
+    if (action === PAUSED_BUNDLE_ACTION && outcome.answer.answeredBy !== 'user') return { granted: false, digest, reason: 'not_approved' };
     const granted = await chatbotDb.claimMetaWriteManifestDigest(sessionId, digest);
     return granted ? { granted: true, digest } : { granted: false, digest, reason: 'already_consumed' };
   }
@@ -14869,6 +14891,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
 
   private metaMarketingApiDeps(): adsApisImpl.CallMetaMarketingApiDeps {
     return {
+      preparePausedMetaBundle: this.preparePausedMetaBundle.bind(this),
       resolveCampaignObjectiveGate: this.resolveCampaignObjectiveGate.bind(this),
       validateMetaActionParams: this.validateMetaActionParams.bind(this),
       claimMetaWriteManifestGrant: this.claimMetaWriteManifestGrant.bind(this),
@@ -14880,6 +14903,46 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       getMetaCredentials: this.getMetaCredentials.bind(this),
       checkMetaBudgetChange: this.checkMetaBudgetChange.bind(this),
     };
+  }
+
+  /** A brief is a write item, never a generic planning answer or an objective-only grant. */
+  private async preflightPausedMetaBundle(userId: string, sessionId: string | undefined, accountId: string, accessToken: string, bundle: PausedMetaBundle) {
+    const session = sessionId ? await chatbotDb.getChatSession(sessionId) : null;
+    if (!session || session.userId !== userId) throw new Error('A paused bundle needs an owned chat session and explicit review-card approval.');
+    assertPausedBundleUserCount(bundle, await chatbotDb.getMessagesFromMessagesTable(sessionId!));
+    return preflightPausedMetaCreatives(bundle, accountId, id => metaService.getAdCreative(accessToken, id));
+  }
+
+  private async preparePausedMetaBundle(userId: string, sessionId: string | undefined, accountId: string, input: unknown): Promise<any> {
+    try {
+      const bundle = parsePausedMetaBundle(input);
+      const session = sessionId ? await chatbotDb.getChatSession(sessionId) : null;
+      if (!session || session.userId !== userId) throw new Error('A paused bundle needs an owned chat session and explicit review-card approval.');
+      const creds = await this.getMetaCredentials(userId, accountId);
+      const { getMetaPagesAccessState, getMetaAdsNoPagesMessage } = await import('../utils/metaAdsScope');
+      if (getMetaPagesAccessState(creds.connection?.config) === 'missing') throw new Error(getMetaAdsNoPagesMessage(creds.connection?.config));
+      bundle.creative_preflight = await this.preflightPausedMetaBundle(userId, sessionId, creds.accountId, creds.accessToken, bundle);
+      const money = await this.normalizeMetaMoneyParams(creds.accountId, creds.accessToken,
+        bundle.campaign.advantage_campaign_budget ? bundle.campaign : bundle.ad_set);
+      // Frozen alongside the exact fields. A later currency/connection change invalidates the grant.
+      if (!money.currency) throw new Error('Account currency could not be verified.');
+      bundle.currency = money.currency;
+      const grant = await this.claimMetaWriteManifestGrant(userId, sessionId!, 'CAMPAIGN', PAUSED_BUNDLE_ACTION, creds.accountId, undefined, undefined, undefined, bundle);
+      if (grant.granted) return this.dispatchAuthorizedMetaWrite(userId, 'CAMPAIGN', PAUSED_BUNDLE_ACTION, creds.accountId, undefined, undefined, undefined, bundle, false, sessionId);
+      if (grant.reason === 'already_consumed') return { success: false, complete: false,
+        message: 'This exact paused bundle approval has already been claimed. No new writes or approval request were made. Use the persisted approval execution result; do not recreate it.' };
+      const summary = pausedBundleSummary(bundle, creds.accountId);
+      return {
+        success: true, awaitingUserConfirmation: true, requiresConfirmation: true,
+        summary, confirmationDetail: summary, confirmationPrompt: summary,
+        message: `${summary}\nSubmit the single review card. The server executes the stored brief; do not re-call individual creates or ask for the objective again.`,
+        target: { account_id: creds.accountId }, metaWriteManifestDigest: grant.digest,
+        metaWriteDispatch: { entity_type: 'CAMPAIGN', action: PAUSED_BUNDLE_ACTION, account_id: creds.accountId, resolvedAccountId: creds.accountId, params: bundle },
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Invalid paused bundle.';
+      return { success: false, message, error: `PAUSED_BUNDLE_REFUSED: ${message}` };
+    }
   }
 
   /**
@@ -14957,6 +15020,25 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     overrideApproved: boolean,
     sessionId: string | undefined,
   ): Promise<MetaApiResult> {
+    if (action === PAUSED_BUNDLE_ACTION) {
+      if (entity_type !== 'CAMPAIGN' || campaign_id || ad_set_id || ad_id || overrideApproved) throw new Error('Invalid paused-bundle scope.');
+      const creds = await this.getMetaCredentials(userId, account_id);
+      if (creds.accountId.replace(/^act_/, '') !== account_id.replace(/^act_/, '')) throw new Error('Approved bundle account changed.');
+      const { getMetaPagesAccessState, getMetaAdsNoPagesMessage } = await import('../utils/metaAdsScope');
+      if (getMetaPagesAccessState(creds.connection?.config) === 'missing') throw new Error(getMetaAdsNoPagesMessage(creds.connection?.config));
+      return executePausedMetaBundle(params, {
+        preflight: bundle => this.preflightPausedMetaBundle(userId, sessionId, creds.accountId, creds.accessToken, bundle),
+        normalize: p => this.normalizeMetaMoneyParams(creds.accountId, creds.accessToken, p),
+        write: (entity, p, campaign, adSet) => this.dispatchAuthorizedMetaWrite(userId, entity, 'CREATE', account_id, campaign, adSet, undefined, p, false, sessionId),
+        read: async (entity, id, fields) => {
+          if (entity === 'AD') return metaService.getAd(creds.accessToken, id, creds.accountId);
+          const rows = entity === 'CAMPAIGN'
+            ? (await metaService.listCampaigns(creds.accountId, creds.accessToken, { campaignId: id, fields })).campaigns
+            : (await metaService.listAdSets(creds.accountId, creds.accessToken, undefined, { adSetId: id, fields })).adSets;
+          return Array.isArray(rows) ? rows.find(row => row && typeof row === 'object' && !Array.isArray(row) && row.id === id) : null;
+        },
+      }) as Promise<MetaApiResult>;
+    }
     const budgetAnomaly = await this.checkMetaBudgetChange(
       userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params, sessionId,
     );
@@ -15190,7 +15272,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           // above correctly used the raw id (matching the digest's own input); this
           // is the one place that must use the resolved one.
           const dispatchResult = await this.dispatchAuthorizedMetaWrite(
-            userId, dispatch.entity_type, dispatch.action, dispatch.resolvedAccountId ?? dispatch.account_id,
+            userId, dispatch.entity_type, dispatch.action, dispatch.action === PAUSED_BUNDLE_ACTION ? dispatch.account_id : dispatch.resolvedAccountId ?? dispatch.account_id,
             dispatch.campaign_id, dispatch.ad_set_id, dispatch.ad_id, dispatch.params,
             false, sessionId,
           );
@@ -15221,6 +15303,11 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       // Emma never actually received anything more specific than "Invalid parameter."
       return { verified: false, error: result?.message || result?.error || 'Meta write failed' };
     }
+    // An accepted write whose verification failed is not a verified workflow checkpoint.
+    if (result.readBackVerified === false || result.budget_verification === 'UNCONFIRMED' ||
+        result.budget_verification === 'MISMATCH' || result.spend_cap_verified === false || result.verified === false) {
+      return { verified: false, error: result.message || 'Meta write could not be verified.' };
+    }
     // Reuses whatever read-back mismatch detection the underlying write
     // method already performs (Phase 1's existing resolver — today,
     // AD_SET CREATE's bid_strategy/budget/timing comparison; not yet a
@@ -15244,6 +15331,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       verified: true,
       verifiedFields: {
         appliedObjectId: AgentModeService.extractDispatchedObjectId(result),
+        ...((result as any).ledger ? { ledger: (result as any).ledger, requested_ad_count: (result as any).requested_ad_count, verified_ad_count: (result as any).verified_ad_count } : {}),
         ...(result.readBackVerified === true ? { readBack: result.readBack } : {}),
       },
     };
@@ -15279,6 +15367,11 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         outputs: [],
         requiredParameters: [],
         execute: async (): Promise<Record<string, unknown>> => {
+          if (dispatch.action === PAUSED_BUNDLE_ACTION) {
+            const digest = await this.resolveMetaWriteManifestDigest(userId, dispatch.entity_type, dispatch.action, dispatch.account_id,
+              dispatch.campaign_id, dispatch.ad_set_id, dispatch.ad_id, dispatch.params);
+            if (digest !== decision.metaWriteManifestDigest) throw new Error('Paused bundle scope changed after approval.');
+          }
           // Review fix: advanceIndependentWorkflow provides no mutual
           // exclusion between two concurrent drivers of the SAME run picking
           // the same un-checkpointed step (unlike buildMetaWriteWorkflowSteps
@@ -15321,7 +15414,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
             throw new StepContendedError('This write is already being dispatched by a concurrent request.');
           }
           const dispatchResult = await this.dispatchAuthorizedMetaWrite(
-            userId, dispatch.entity_type, dispatch.action, dispatch.resolvedAccountId ?? dispatch.account_id,
+            userId, dispatch.entity_type, dispatch.action, dispatch.action === PAUSED_BUNDLE_ACTION ? dispatch.account_id : dispatch.resolvedAccountId ?? dispatch.account_id,
             dispatch.campaign_id, dispatch.ad_set_id, dispatch.ad_id, dispatch.params,
             false, originSessionId,
           );
@@ -15918,7 +16011,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       stepId: c.stepId,
       status: c.status,
       ...(c.status === 'verified'
-        ? { appliedObjectId: (c.verifiedFields as any)?.appliedObjectId as string | undefined }
+        ? { appliedObjectId: (c.verifiedFields as any)?.appliedObjectId as string | undefined,
+          ...(c.verifiedFields?.ledger ? { bundle: { requested_ad_count: c.verifiedFields.requested_ad_count as number,
+            verified_ad_count: c.verifiedFields.verified_ad_count as number, ledger: c.verifiedFields.ledger as unknown[] } } : {}) }
         : {}),
       ...(c.status === 'failed'
         ? Array.isArray(c.discrepancy)

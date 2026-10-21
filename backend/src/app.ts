@@ -97,6 +97,7 @@ import adminWorkPlanRoutes from "./routes/adminWorkPlanRoutes";
 import adminLandingPagesRoutes from "./routes/adminLandingPages";
 import adminSessionCleanupRoutes from "./routes/adminSessionCleanup";
 import adminOrgDiagnosticsRoutes from "./routes/adminOrgDiagnostics";
+import adminScheduledChatsRoutes from "./routes/adminScheduledChats";
 import adminTrackingMonitorRoutes from "./routes/adminTrackingMonitor";
 import adminRenewalIntegrationHealthRoutes from "./routes/adminRenewalIntegrationHealth";
 import adminPromptTemplatesRoutes from "./routes/adminPromptTemplates";
@@ -332,6 +333,9 @@ app.use((req, res, next) => {
       // ENG-2315: the tracker SDK and its ingest are called from visitors' browsers on any customer
       // domain. Origins are enforced per list inside the route (trackingConfig.allowedOrigins), not here.
       req.path === '/api/track/event' ||
+      // ENG-2593: customer web forms on any domain POST leads here from the browser.
+      // Access is gated per list (publicAccessEnabled) inside routes/webhooks.ts.
+      req.path === '/api/webhooks/forward-lead' ||
       req.path.startsWith('/sdk/v1/') ||
       req.path.startsWith('/batch-review/')) {
     // Allow all origins for public endpoints
@@ -550,6 +554,8 @@ app.use("/api/admin/landing-pages", authenticateToken, isAdmin, adminLandingPage
 // ENG-2314 — dry-run-first merge/delete of LP session rows. Same admin double-gate as above.
 app.use("/api/admin/session-cleanup", authenticateToken, isAdmin, adminSessionCleanupRoutes);
 app.use("/api/admin/org-diagnostics", authenticateToken, isAdmin, adminOrgDiagnosticsRoutes);
+// ENG-778 — audited cross-owner scheduled-chat inspect + pause/resume (no edit/delete).
+app.use("/api/admin/scheduled-chats", authenticateToken, isAdmin, adminScheduledChatsRoutes);
 app.use("/api/admin/tracking-monitor", authenticateToken, isAdmin, adminTrackingMonitorRoutes);
 app.use("/api/admin/renewal-integration-health", authenticateToken, isAdmin, adminRenewalIntegrationHealthRoutes);
 app.use("/api/admin/prompt-templates", authenticateToken, isAdmin, adminPromptTemplatesRoutes);

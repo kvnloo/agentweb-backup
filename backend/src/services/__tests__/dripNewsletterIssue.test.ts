@@ -21,7 +21,7 @@ describe('validateNewsletterIssue (ENG-2552)', () => {
   });
 
   it('accepts Resend unsubscribe placeholder', () => {
-    expect(errs({ ...valid(), body: 'x {{{RESEND_UNSUBSCRIBE_URL}}}' })).toEqual([]);
+    expect(errs({ ...valid(), body: 'x <a href="{{{RESEND_UNSUBSCRIBE_URL}}}">Unsubscribe</a>' })).toEqual([]);
   });
 
   it('fails closed on invalid input', () => {
@@ -59,6 +59,21 @@ describe('validateNewsletterIssue (ENG-2552)', () => {
   it('validates subject', () => {
     expect(errs({ ...valid(), subject: '  ' })).toEqual(['subject_missing']);
     expect(errs({ ...valid(), subject: 'a'.repeat(NEWSLETTER_SUBJECT_MAX + 1) })).toEqual(['subject_too_long']);
+  });
+
+  it('ENG-2557 rejects unsubscribe text or placeholders that are not a link', () => {
+    for (const body of [
+      '<p>See /unsubscribe for help</p>',
+      '<p>{{unsubscribe_url}}</p>',
+      'x {{{RESEND_UNSUBSCRIBE_URL}}}',
+      '<a href="https://x.io/help">/unsubscribe</a>',
+    ]) {
+      expect(errs({ ...valid(), body })).toEqual(['unsubscribe_missing']);
+    }
+  });
+
+  it('ENG-2557 accepts an https unsubscribe URL in an href', () => {
+    expect(errs({ ...valid(), body: "<a class='u' href='https://x.io/unsubscribe?t=abc'>Unsub</a>" })).toEqual([]);
   });
 
   it('requires an unsubscribe link', () => {

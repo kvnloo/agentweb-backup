@@ -53,6 +53,8 @@ interface SubscriptionType {
   allowedSkills: string[];
   allowedConnectedAccounts?: string[];
   allowedFeatures?: string[];
+  /** ENG-669: chat models this tier may select (canonical ids, '*' = all, 'agentweb-model' reserved). Absent = all. */
+  allowedModels?: string[];
   monthlyTokenAllowance?: number | null;
   monthlyCostAllowance?: number | null;
   llmUsagePolicy?: {
@@ -81,6 +83,11 @@ interface SubscriptionType {
     priceCents: number;
     usageCreditMicroUsd: number;
     baseSeats: number;
+  };
+  /** ENG-668: pay-as-you-go overage tier config. Not editable here yet; carried through on save. */
+  paygOverage?: {
+    allowed: boolean;
+    markupBps: number;
   };
 }
 
@@ -155,6 +162,8 @@ const SubscriptionTypesTab: React.FC = () => {
   const [optimizationThresholdInput, setOptimizationThresholdInput] = useState('');
   const [hardThresholdInput, setHardThresholdInput] = useState('');
   const [optimizedModelsInput, setOptimizedModelsInput] = useState('');
+  // ENG-669: comma-separated allowedModels; blank = field absent (every model).
+  const [allowedModelsInput, setAllowedModelsInput] = useState('');
   const [optimizedDefaultInput, setOptimizedDefaultInput] = useState('');
   // Empty string means "not configured", which is NOT the same as the default
   // value. Storing 90 explicitly would freeze today's default onto the tier.
@@ -321,6 +330,7 @@ const SubscriptionTypesTab: React.FC = () => {
       setOptimizationThresholdInput(type.llmUsagePolicy ? String(type.llmUsagePolicy.optimizationCostThresholdMicroUsd / 1_000_000) : '');
       setHardThresholdInput(type.llmUsagePolicy ? String(type.llmUsagePolicy.hardCostThresholdMicroUsd / 1_000_000) : '');
       setOptimizedModelsInput(type.llmUsagePolicy?.optimizedModelIds.join(', ') || '');
+      setAllowedModelsInput(Array.isArray(type.allowedModels) ? type.allowedModels.join(', ') : '');
       setOptimizedDefaultInput(type.llmUsagePolicy?.optimizedDefaultModel || '');
       setAlertPercentInput(
         type.llmUsagePolicy?.alertUsagePercentThreshold != null
@@ -360,6 +370,7 @@ const SubscriptionTypesTab: React.FC = () => {
       setOptimizationThresholdInput('');
       setHardThresholdInput('');
       setOptimizedModelsInput('');
+      setAllowedModelsInput('');
       setOptimizedDefaultInput('');
       setAlertPercentInput('');
       setForecastAlertsEnabled(true);
@@ -394,6 +405,7 @@ const SubscriptionTypesTab: React.FC = () => {
     setOptimizationThresholdInput('');
     setHardThresholdInput('');
     setOptimizedModelsInput('');
+    setAllowedModelsInput('');
     setOptimizedDefaultInput('');
     setAlertPercentInput('');
     setForecastAlertsEnabled(true);
@@ -539,6 +551,13 @@ const SubscriptionTypesTab: React.FC = () => {
         return;
       }
 
+      // ENG-669: blank keeps the field absent (every model); the server canonicalises ids and rejects unknown ones.
+      // A stored empty list (only possible out of band) is sent back as-is, so the server refuses it and the admin
+      // decides, rather than this editor silently turning "no models" into "every model".
+      const typedModels = allowedModelsInput.split(/[,\n]/).map((model) => model.trim()).filter(Boolean);
+      const storedEmptyList = Array.isArray(editingType?.allowedModels) && editingType.allowedModels.length === 0;
+      const allowedModels: string[] | undefined = typedModels.length > 0 ? typedModels : (storedEmptyList ? [] : undefined);
+
       // Convert all selected items back to "*" if all are selected
       const dataToSave: SubscriptionType = {
         name: formData.name,
@@ -563,6 +582,10 @@ const SubscriptionTypesTab: React.FC = () => {
         ...(llmUsagePolicy ? { llmUsagePolicy } : {}),
         ...(llmUsageTopUp ? { llmUsageTopUp } : {}),
         ...(seatPricing ? { seatPricing } : {}),
+        // ENG-668: this form has no pay-as-you-go fields, and the tier is rebuilt from the form, so
+        // keep what the tier already has instead of dropping it on every edit.
+        ...(editingType?.paygOverage ? { paygOverage: editingType.paygOverage } : {}),
+        ...(allowedModels ? { allowedModels } : {}),
       };
 
       let updatedTypes = [...subscriptionTypes];
@@ -914,6 +937,24 @@ const SubscriptionTypesTab: React.FC = () => {
               disabled={!!editingType}
               helperText={editingType ? 'Name cannot be changed after creation' : ''}
             />
+
+            <Paper variant="outlined" sx={{ p: 2, mb: 3 }}>
+              <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                Chat models
+              </Typography>
+              <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+                Models customers on this tier may choose. Leave blank (or enter *) for every model. Enforced only
+                while the model_tier_allowlist_enabled setting is on; configured default models always run.
+              </Typography>
+              <TextField
+                fullWidth
+                label="Allowed model IDs"
+                value={allowedModelsInput}
+                onChange={(e) => setAllowedModelsInput(e.target.value)}
+                placeholder="* (every model)"
+                helperText="Comma-separated model IDs, e.g. gpt-5.5, gemini-3.5-flash. agentweb-model is reserved for the AgentWeb router."
+              />
+            </Paper>
 
             <Paper variant="outlined" sx={{ p: 2, mb: 3 }}>
               <FormControlLabel

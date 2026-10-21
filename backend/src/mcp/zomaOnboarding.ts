@@ -14,7 +14,7 @@
  * Reads never depend on this module. Writes (ENG-2303 P3) call `assertZomaWriteReady`.
  */
 import { userDb } from '../services/db';
-import { stripeService } from '../services/stripeService';
+import { stripeService, type UserPaymentMethod } from '../services/stripeService';
 import { buildMetaConnectUrl } from '../services/metaConnectUrl';
 import { getAccountsByUserIdIncludingOrgShared, type ConnectedAccount } from '../services/connectedAccountsDb';
 import { isMetaAdAccount } from '../services/metaTokenRefresh';
@@ -48,9 +48,9 @@ export interface ZomaReadiness {
 export interface ZomaOnboardingDeps {
   getUser: (userId: string) => Promise<any>;
   listAccounts: (userId: string) => Promise<ConnectedAccount[]>;
-  findCustomerIdsByUserId: (userId: string) => Promise<string[]>;
+  findLiveCustomerId: (user: any, userId: string) => Promise<string | null>;
   createCustomerForUser: (userId: string, email: string | undefined) => Promise<string>;
-  customerHasPaymentMethod: (customerId: string) => Promise<boolean>;
+  resolvePaymentMethod: (user: any, userId: string) => Promise<UserPaymentMethod>;
   createPaymentMethodSetupSession: (p: { stripeCustomerId: string; userId: string; successUrl: string; cancelUrl: string }) => Promise<{ url?: string | null }>;
   buildMetaConnectUrl: (userId: string) => Promise<string>;
   frontendUrl: () => string;
@@ -61,9 +61,9 @@ export interface ZomaOnboardingDeps {
 const defaultDeps: ZomaOnboardingDeps = {
   getUser: (userId) => userDb.getUserById(userId),
   listAccounts: getAccountsByUserIdIncludingOrgShared,
-  findCustomerIdsByUserId: (userId) => stripeService.findCustomerIdsByUserId(userId),
+  findLiveCustomerId: (user, userId) => stripeService.findLiveCustomerIdForUser(user, userId),
   createCustomerForUser: (userId, email) => stripeService.createCustomerForUser(userId, email),
-  customerHasPaymentMethod: (id) => stripeService.customerHasPaymentMethod(id),
+  resolvePaymentMethod: (user, userId) => stripeService.resolveUserPaymentMethod(user, userId),
   createPaymentMethodSetupSession: (p) => stripeService.createPaymentMethodSetupSession(p),
   buildMetaConnectUrl: (userId) => buildMetaConnectUrl(userId, 'marketing'),
   frontendUrl: () => process.env.CUSTOMER_FRONTEND_URL || 'https://app.agentweb.pro',
@@ -101,19 +101,12 @@ async function usableMetaAccounts(userId: string, deps: ZomaOnboardingDeps): Pro
 }
 
 /**
- * True when any Stripe customer for this user has a saved payment method. The user-row
- * flag (set by subscription webhooks) short-circuits; otherwise Stripe is asked live,
- * because a setup-mode checkout deliberately does not touch the user row.
+ * True when any Stripe customer for this user has a saved payment method, asked live every
+ * time (ENG-2571): the user-row `has_payment_method` flag is never cleared when a card or
+ * customer is removed, so it cannot make a user ready on its own.
  */
 async function hasPaymentMethod(user: any, userId: string, deps: ZomaOnboardingDeps): Promise<boolean> {
-  if (user?.has_payment_method === true) return true;
-  const ids = new Set<string>();
-  if (typeof user?.stripe_customer_id === 'string' && user.stripe_customer_id) ids.add(user.stripe_customer_id);
-  for (const id of await deps.findCustomerIdsByUserId(userId)) ids.add(id);
-  for (const id of ids) {
-    if (await deps.customerHasPaymentMethod(id)) return true;
-  }
-  return false;
+  return (await deps.resolvePaymentMethod(user, userId)).hasPaymentMethod;
 }
 
 async function paymentSetupLink(
@@ -122,10 +115,9 @@ async function paymentSetupLink(
   deps: ZomaOnboardingDeps,
   returnUrls?: { successUrl: string; cancelUrl: string },
 ): Promise<string> {
-  let customerId: string | undefined =
-    typeof user?.stripe_customer_id === 'string' && user.stripe_customer_id ? user.stripe_customer_id : undefined;
-  if (!customerId) customerId = (await deps.findCustomerIdsByUserId(userId))[0];
-  if (!customerId) customerId = await deps.createCustomerForUser(userId, user?.email);
+  // Deleted or unknown candidates are skipped (ENG-2571): a just-deleted customer can still
+  // come back from the eventually consistent search, and the row id can be stale.
+  const customerId = (await deps.findLiveCustomerId(user, userId)) ?? (await deps.createCustomerForUser(userId, user?.email));
   const base = deps.frontendUrl().replace(/\/+$/, '');
   const session = await deps.createPaymentMethodSetupSession({
     stripeCustomerId: customerId,

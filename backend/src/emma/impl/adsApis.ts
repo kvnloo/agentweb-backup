@@ -305,6 +305,7 @@ export type GetMetaAdsMetricsDeps = {
  * confirmed by grep to have real callers well beyond this one method.
  */
 export type CallMetaMarketingApiDeps = {
+  preparePausedMetaBundle?: (userId: string, sessionId: string | undefined, accountId: string, params: unknown) => Promise<MetaApiResult>;
   resolveCampaignObjectiveGate: (
     userId: string,
     sessionId: string | undefined,
@@ -1920,6 +1921,13 @@ export async function callMetaMarketingApi(
 ): Promise<MetaApiResult> {
   console.log(`AgentMode: callMetaMarketingApi -> ${entity_type} / ${action}`);
 
+  if (action === 'CREATE_PAUSED_BUNDLE') {
+    if (entity_type !== 'CAMPAIGN' || campaign_id || ad_set_id || ad_id || !deps.preparePausedMetaBundle) {
+      return { success: false, message: 'A paused bundle creates a new campaign, ad set and ads; existing target IDs are not allowed.' };
+    }
+    return deps.preparePausedMetaBundle(userId, sessionId, account_id, params);
+  }
+
   // Ensure params is an object
   params = params || {};
 
@@ -3478,6 +3486,18 @@ export async function callLinkedInMarketingApi(
         if (!result.success) throw new Error(result.error || 'Failed to retag creative UTMs');
         if (result.alreadyTagged) return { success: true, message: 'Creative already carries every UTM key — no change made.' };
         return { success: true, message: 'Creative retagged with UTMs' };
+      }
+      if (action === 'UPDATE') {
+        // ENG-2575: status change only (pause / resume / archive).
+        if (!params.creative_id) throw new Error('CREATIVE UPDATE requires params.creative_id');
+        const allowed = linkedInAdsService.CREATIVE_INTENDED_STATUSES as readonly string[];
+        const status = typeof params.status === 'string' ? params.status.trim().toUpperCase() : '';
+        if (!allowed.includes(status)) {
+          throw new Error(`CREATIVE UPDATE requires params.status, one of: ${allowed.join(', ')}`);
+        }
+        const result = await linkedInAdsService.updateCreativeStatus(accessToken, accountId, String(params.creative_id), status);
+        if (!result.success) throw new Error(result.error || 'Failed to update creative');
+        return { success: true, message: `Ad status set to ${status}`, result: result.data };
       }
       throw new Error(`Unknown action "${action}" for CREATIVE`);
     }

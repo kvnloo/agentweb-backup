@@ -23,7 +23,7 @@ import { loadSenderConfig as loadCrmSenderConfig } from './crmSenderService';
 import { CrmSender } from './crmSenderTypes';
 import { settingsService } from './settingsService';
 import { v4 as uuidv4 } from 'uuid';
-import { isSuspectedMachineEngagement } from './machineEngagement';
+import { isSuspectedMachineEngagement, parseResendTimestamp } from './machineEngagement';
 import { selectEngagementExitTrigger } from './dripEngagementExit';
 
 // Identifies this process for the claimedBy field — mirrors
@@ -548,7 +548,7 @@ async function checkExitConditions(
         // starts appearing, we will know rather than infer. Tracked separately.
         const t = trigger as any;
         const detail = t.data?.click || t.data?.open || {};
-        const sentAt = t.data?.created_at ? new Date(String(t.data.created_at).replace(' ', 'T')).getTime() : NaN;
+        const sentAt = parseResendTimestamp(t.data?.created_at) ?? NaN;
         const eventAt = new Date(t.createdAt).getTime();
         const gapSeconds = Number.isFinite(sentAt) ? Math.round((eventAt - sentAt) / 1000) : null;
 
@@ -568,6 +568,7 @@ async function checkExitConditions(
             eventType: t.eventType,
             gapFromSendMs: gapMs,
             userAgent: detail.userAgent || null,
+            ipAddress: detail.ipAddress || null,
           }));
         }
         return 'engagement';

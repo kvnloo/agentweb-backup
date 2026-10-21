@@ -329,6 +329,9 @@ export function applyDeckAnswers(
 
     const isDelegated = answer.delegated === true;
     let verdict = answer.verdict;
+    if (item.metaWriteDispatch?.action === 'CREATE_PAUSED_BUNDLE' && verdict === 'approve' && (answeredBy !== 'user' || isDelegated)) {
+      throw new ApprovalDeckError('A paused campaign bundle needs explicit user approval.');
+    }
     if (isDelegated) {
       // Deterministic, never re-inferred: a stray client-supplied verdict on a
       // delegated answer must never become a silent different choice — same

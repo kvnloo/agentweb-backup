@@ -5,6 +5,7 @@ import { skillService } from "./skillService";
 import { hasOwnLiveSubscription } from "./orgAuthz";
 import type { LlmUsagePolicy } from "./llmUsagePolicyService";
 import type { LlmUsageTopUpConfig } from './llmUsageTopUpService';
+import type { SubscriptionPaygOverageConfig } from './paygOverage';
 import type { SeatPricingConfig } from './orgSeatService';
 
 export interface SubscriptionType {
@@ -14,6 +15,13 @@ export interface SubscriptionType {
   allowedSkills: string[]; // Array of skill IDs (e.g., ["skill-uuid-1", "skill-uuid-2"]) or ["*"] for all
   allowedConnectedAccounts?: string[]; // Array of platform types (e.g., ["linkedin", "gmail"]) or ["*"] for all; undefined = all
   allowedFeatures?: string[]; // Stable product feature IDs or ["*"]; undefined = legacy row (all current features except the opt-in-only ones)
+  /**
+   * ENG-669: chat models this tier may select (canonical registry ids), or ["*"] for every non-admin catalog model.
+   * The reserved id "agentweb-model" names the future AgentWeb router and matches nothing runnable until it exists.
+   * undefined = every model. Enforced only while AW-Settings `model_tier_allowlist_enabled` is 'true'
+   * (services/agentMode/modelAccess.ts); system-chosen models (configured defaults) are always allowed.
+   */
+  allowedModels?: string[];
   allowedFunctionCalls?: string[]; // Deprecated — kept for on-read migration from old configs
   /** ENG-1978, observation only, never persisted: true when the stored row carried NO
    *  `allowedSkills` and it was defaulted to ["*"] on read. Set by getSubscriptionTypeConfig so
@@ -35,6 +43,8 @@ export interface SubscriptionType {
    * used for enforcement today; this field is not yet wired to replace it.
    */
   seatPricing?: SeatPricingConfig;
+  /** ENG-668: whether this tier's billing owners may opt into pay-as-you-go overages. Absent = not offered. */
+  paygOverage?: SubscriptionPaygOverageConfig;
 }
 
 // Default pages that are always available regardless of subscription type
@@ -491,6 +501,22 @@ async function readSubscriptionTypesSetting(): Promise<SubscriptionTypesSetting>
     }
     return last.setting;
   }
+}
+
+/**
+ * ENG-669: the raw `allowedModels` of one tier, for the tier model allowlist. Unlike getSubscriptionTypeConfig this
+ * keeps "the tier has no row" (`configured: false`: nothing narrows it, every model) apart from "the setting could
+ * not be read": that THROWS (after the same bounded last-known fallback as every entitlement read), so the caller can
+ * serve its own last-known answer instead of mistaking an outage for a configuration.
+ */
+export async function readTierAllowedModels(tierName: string): Promise<{ configured: boolean; allowedModels?: unknown }> {
+  const setting = await readSubscriptionTypesSetting();
+  if (!setting?.settingValue) return { configured: false };
+  const tiers: unknown = JSON.parse(setting.settingValue);
+  const tier = Array.isArray(tiers)
+    ? tiers.find((t: any) => t && typeof t === 'object' && t.name === tierName)
+    : undefined;
+  return tier ? { configured: true, allowedModels: (tier as SubscriptionType).allowedModels } : { configured: false };
 }
 
 /**

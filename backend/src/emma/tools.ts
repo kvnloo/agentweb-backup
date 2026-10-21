@@ -7,6 +7,7 @@ import { auditCampaigns } from '../services/adUtmAuditService';
 import type { AdPlatform } from '../utils/adUtm';
 import { metaAdReadPort, googleAdReadPort, linkedInAdReadPort } from '../services/adUtmAuditAdapters';
 import { accountMemoryDb, orgMemoryDb, userDb } from '../services/db';
+import { MEMORY_AUTOSPLIT_MAX_CHARS, splitMemoryContent } from '../utils/memoryContentLimit';
 import { crmDb } from '../services/db';
 import { askCrm } from '../services/askCrmService';
 import { createAskCrmLeadLoader, USER_LOOKUP_BUDGET } from '../services/askCrmLeadLoader';
@@ -17,7 +18,7 @@ import { chatbotDb } from '../services/chatbotService';
 import { incrementUserTokenUsage } from '../services/tokenUsageService';
 import { getExecutionsWithAssets } from '../routes/tasks';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
-import { getUserFunnelStatusIssueTags, getUserFunnelStatusLabel } from '../utils/userFunnelStatus';
+import { getUserFunnelStatusIssueTags, getUserFunnelStatusLabel, USER_FUNNEL_STATUS_VALUES } from '../utils/userFunnelStatus';
 import { humanEvalService, HumanEvalReviewType } from '../services/humanEvalService';
 import { enqueueAutoHumanEval, claimArtifactForHumanEval, releaseArtifactClaim } from '../services/autoHumanEvalService';
 import { type AskUserQuestionOption } from '../services/agentMode/core/askUserQuestion';
@@ -1542,7 +1543,7 @@ ACTION MATRIX (entity_type → supported actions):
   AD_ACCOUNT      → LIST
   CAMPAIGN_GROUP  → LIST, CREATE, UPDATE
   CAMPAIGN        → LIST, CREATE, UPDATE
-  CREATIVE        → LIST, CREATE, CREATE_INLINE, CREATE_DYNAMIC, RETAG_UTM
+  CREATIVE        → LIST, CREATE, CREATE_INLINE, CREATE_DYNAMIC, RETAG_UTM, UPDATE (creative_id + status ACTIVE|PAUSED|ARCHIVED|CANCELED|DRAFT)
   POST            → CREATE, GET (post_urn)
   TARGETING       → LIST_FACETS, SEARCH, ESTIMATE_REACH
   MEDIA           → UPLOAD_IMAGE, UPLOAD_VIDEO, UPLOAD_DOCUMENT
@@ -6728,8 +6729,8 @@ emmaToolRegistry.register({
       properties: {
         content: {
           type: 'string',
-          maxLength: 2000,
-          description: 'The fact to remember. Be specific and actionable. HARD LIMIT 2000 characters — content over it is REJECTED, not truncated. If you have more to record, split it into several save_memory calls of at most 2000 characters each rather than re-sending the same oversized text, which fails identically every time (ENG-908).'
+          maxLength: MEMORY_AUTOSPLIT_MAX_CHARS,
+          description: 'The fact to remember. Be specific and actionable. Keep each fact under 2000 characters; content up to 8000 characters is split automatically into several memories at paragraph/sentence boundaries (ENG-2574). Content over 8000 characters is rejected.'
         },
         category: {
           type: 'string',
@@ -6753,18 +6754,28 @@ emmaToolRegistry.register({
     // Embed at write time so the memory can later be retrieved by relevance, not just
     // recency. Best-effort: a failure must not block saving (read path falls back to recency).
     const { embedText } = await import('../utils/embeddings');
-    const embedding = (await embedText(args.content, { userId, feature: 'embeddings' })) ?? undefined;
-    const memory = await accountMemoryDb.addMemory(
-      userId,
-      args.category,
-      args.content,
-      context?.sessionId,
-      embedding
-    );
+    // ENG-2574: split oversized content into <=2000-char rows rather than rejecting it.
+    const chunks = splitMemoryContent(String(args.content ?? ''));
+    const memoryIds: string[] = [];
+    for (const chunk of chunks) {
+      const embedding = (await embedText(chunk, { userId, feature: 'embeddings' })) ?? undefined;
+      const memory = await accountMemoryDb.addMemory(
+        userId,
+        args.category,
+        chunk,
+        context?.sessionId,
+        embedding
+      );
+      memoryIds.push(memory.memoryId);
+    }
+    const preview = `"${args.content.substring(0, 80)}${args.content.length > 80 ? '...' : ''}"`;
     return {
       success: true,
-      memoryId: memory.memoryId,
-      message: `Saved memory: "${args.content.substring(0, 80)}${args.content.length > 80 ? '...' : ''}"`
+      memoryId: memoryIds[0],
+      ...(memoryIds.length > 1 ? { memoryIds } : {}),
+      message: memoryIds.length > 1
+        ? `Saved memory as ${memoryIds.length} parts (content exceeded 2000 characters): ${preview}`
+        : `Saved memory: ${preview}`
     };
   }
 });
@@ -6806,8 +6817,8 @@ emmaToolRegistry.register({
       properties: {
         content: {
           type: 'string',
-          maxLength: 2000,
-          description: 'The org-wide fact to remember. Be specific and actionable. HARD LIMIT 2000 characters — content over it is REJECTED, not truncated. If you have more to record, split it into several save_org_memory calls of at most 2000 characters each rather than re-sending the same oversized text, which fails identically every time (ENG-831).'
+          maxLength: MEMORY_AUTOSPLIT_MAX_CHARS,
+          description: 'The org-wide fact to remember. Be specific and actionable. Keep each fact under 2000 characters; content up to 8000 characters is split automatically into several org memories at paragraph/sentence boundaries (ENG-2574). Content over 8000 characters is rejected.'
         },
         category: {
           type: 'string',
@@ -6838,18 +6849,28 @@ emmaToolRegistry.register({
 
     // Embed at write time so the memory can later be retrieved by relevance (best-effort).
     const { embedText } = await import('../utils/embeddings');
-    const embedding = (await embedText(args.content, { userId, feature: 'embeddings' })) ?? undefined;
-    const memory = await orgMemoryDb.addMemory(
-      user.orgId,
-      args.category,
-      args.content,
-      userId,
-      embedding
-    );
+    // ENG-2574: split oversized content into <=2000-char rows rather than rejecting it.
+    const chunks = splitMemoryContent(String(args.content ?? ''));
+    const memoryIds: string[] = [];
+    for (const chunk of chunks) {
+      const embedding = (await embedText(chunk, { userId, feature: 'embeddings' })) ?? undefined;
+      const memory = await orgMemoryDb.addMemory(
+        user.orgId,
+        args.category,
+        chunk,
+        userId,
+        embedding
+      );
+      memoryIds.push(memory.memoryId);
+    }
+    const preview = `"${args.content.substring(0, 80)}${args.content.length > 80 ? '...' : ''}"`;
     return {
       success: true,
-      memoryId: memory.memoryId,
-      message: `Saved org memory: "${args.content.substring(0, 80)}${args.content.length > 80 ? '...' : ''}"`
+      memoryId: memoryIds[0],
+      ...(memoryIds.length > 1 ? { memoryIds } : {}),
+      message: memoryIds.length > 1
+        ? `Saved org memory as ${memoryIds.length} parts (content exceeded 2000 characters): ${preview}`
+        : `Saved org memory: ${preview}`
     };
   }
 });
@@ -7433,6 +7454,80 @@ mcpToolRegistry.register({
   },
 });
 
+mcpToolRegistry.register({
+  name: 'manage_user_funnel_status',
+  definition: {
+    name: 'manage_user_funnel_status',
+    description:
+      'Admin-only: resolve AgentWeb users by email and read, preview, or apply their funnelStatus ' +
+      '(same write as PUT /api/admin/users/:userId/funnel-status). Values are limited to the approved ' +
+      'stage vocabulary or null. Max 50 rows per call; preview first, apply is idempotent and audited ' +
+      '(actor, accountable owner, before, after, timestamp). Returns updated/skipped/unresolved rows.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        mode: { type: 'string', enum: ['read', 'preview', 'apply'], description: 'read current values, preview a change, or apply it.' },
+        rows: {
+          type: 'array',
+          maxItems: 50,
+          items: {
+            type: 'object',
+            properties: {
+              email: { type: 'string' },
+              funnel_status: { type: ['string', 'null'], enum: [...USER_FUNNEL_STATUS_VALUES, null], description: 'Target stage, or null to clear. Required for preview/apply.' },
+            },
+            required: ['email'],
+          },
+        },
+        accountable_owner: { type: 'string', description: 'Human accountable for an apply (defaults to the acting admin).' },
+      },
+      required: ['mode', 'rows'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+    if (context?.externalMcp === true) throw new Error('Admin access required to manage user funnel status');
+    const user = await userDb.getUserById(userId);
+    const delegatedAdmin = context?.isDelegatedAdmin === true;
+    if (user?.isAdmin !== true && !delegatedAdmin) {
+      throw new Error('Admin access required to manage user funnel status');
+    }
+    let actorEmail: string | undefined = delegatedAdmin ? context?.adminEmail : user?.email;
+    // Audit the delegating administrator, not the impersonated target user.
+    let actorUserId: string | undefined = delegatedAdmin ? undefined : userId;
+    if (delegatedAdmin && context?.sessionId) {
+      const session = await chatbotDb.getChatSession(context.sessionId);
+      if (session?.delegateInfo?.isDelegated) {
+        actorEmail ??= session.delegateInfo.adminEmail;
+        actorUserId = session.delegateInfo.adminUserId;
+      }
+    }
+    // The socket sidebar marks real admins isDelegatedAdmin without an adminEmail;
+    // a genuine admin row is its own actor.
+    if (user?.isAdmin === true) {
+      if (!actorEmail) actorEmail = user.email;
+      if (!actorUserId) actorUserId = userId;
+    }
+    if (!actorEmail || !actorUserId) throw new Error('Administrator identity unavailable');
+    const mode = args?.mode;
+    if (mode !== 'read' && mode !== 'preview' && mode !== 'apply') {
+      throw new Error('mode must be read, preview, or apply');
+    }
+    const { runFunnelStatusOperation } = await import('../services/adminFunnelStatusService');
+    const { recordAdminAudit } = await import('../services/adminAuditLog');
+    const owner = typeof args?.accountable_owner === 'string' && args.accountable_owner.trim() ? args.accountable_owner.trim() : actorEmail;
+    return runFunnelStatusOperation(mode, args?.rows, { actorUserId, actorEmail, accountableOwner: owner }, {
+      getUserByEmail: async (email) => {
+        const u: any = await userDb.getUserByEmail(email);
+        return u ? { userId: u.userId, email: u.email, funnelStatus: u.funnelStatus } : undefined;
+      },
+      updateFunnelStatus: (targetUserId, funnelStatus) => userDb.updateUser(targetUserId, { funnelStatus }),
+      audit: (event) => recordAdminAudit(event),
+    });
+  },
+});
+
 const bridgedToolNames = [
   // Scheduled Chat tools
   'list_scheduled_chats',
@@ -7474,6 +7569,7 @@ const bridgedToolNames = [
 const adminToolNames = [
   'manage_linear_governance_label',
   'read_linear_issues',
+  'manage_user_funnel_status',
   'list_predefined_work_plans',
   'manage_predefined_work_plan',
   'list_skills',
@@ -9615,9 +9711,11 @@ lists and list entries, mirroring call_hubspot_api's CONTACT_LIST actions.
 
 ENTITY_TYPE + ACTION MATRIX:
 
-  LIST_ENTRIES → COUNT (list_id) | ADD_ENTRIES (list_id, record_ids) | REMOVE_ENTRIES (list_id, record_ids)
+  LIST_ENTRIES → COUNT (list_id) | LIST (list_id, offset?) | ADD_ENTRIES (list_id, record_ids) | REMOVE_ENTRIES (list_id, record_ids)
                Entry-level actions scoped to one already-identified list.
                COUNT returns the number of entries (e.g. for CPL = spend / count).
+               LIST returns one page of entries (entryId, recordId, values);
+               pass the returned next_offset as offset for the next page.
                ADD_ENTRIES adds Attio Person record ids to the list.
                REMOVE_ENTRIES removes Person record ids from the list (looks up
                each person's entry in the list and deletes it).
@@ -9633,8 +9731,9 @@ ENTITY_TYPE + ACTION MATRIX:
       properties: {
         entity_type: { type: 'string', enum: ['LIST_ENTRIES', 'LISTS'], description: 'Attio resource to operate on.' },
         action:      { type: 'string', enum: ['COUNT', 'ADD_ENTRIES', 'REMOVE_ENTRIES', 'LIST', 'GET', 'CREATE'], description: 'Action to perform. See ACTION MATRIX.' },
-        list_id:     { type: 'string', description: 'Required for LIST_ENTRIES COUNT/ADD_ENTRIES/REMOVE_ENTRIES and LISTS GET. For LIST_ENTRIES actions, pass the AgentWeb lead list\'s id (e.g. from get_lead_lists/get_lead_details) — it is automatically resolved to that list\'s connected Attio deal-list id; a raw Attio list id also works. For LISTS actions, always a raw Attio list id (e.g. from LISTS LIST) — never an AgentWeb list id.' },
+        list_id:     { type: 'string', description: 'Required for LIST_ENTRIES COUNT/LIST/ADD_ENTRIES/REMOVE_ENTRIES and LISTS GET. For LIST_ENTRIES actions, pass the AgentWeb lead list\'s id (e.g. from get_lead_lists/get_lead_details) — it is automatically resolved to that list\'s connected Attio deal-list id; a raw Attio list id also works. For LISTS actions, always a raw Attio list id (e.g. from LISTS LIST) — never an AgentWeb list id.' },
         record_ids:  { type: 'array', items: { type: 'string' }, maxItems: 100, description: 'Attio record ids (Person or Company, matching the target list). Required for LIST_ENTRIES ADD_ENTRIES/REMOVE_ENTRIES. Max 100 per call.' },
+        offset:      { type: 'integer', description: 'LIST_ENTRIES LIST only: page offset; pass next_offset from the previous page.' },
         name:        { type: 'string', description: 'List display name. Required for LISTS CREATE.' },
         object_type: { type: 'string', enum: ['people', 'companies'], description: 'What kind of records the new list holds. LISTS CREATE only. Defaults to "people".' },
         account_id:  { type: 'string', description: 'Attio account ID. Required when the user has multiple Attio accounts connected — the error message will list them; ask the user which to use.' },

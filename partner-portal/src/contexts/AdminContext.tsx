@@ -110,9 +110,9 @@ interface AdminContextType {
   agentModeAnalytics: any;
   gtmAnalytics: any;
   crmAnalytics: any;
-  loadUsers: (hideBotLike?: boolean) => Promise<void>;
-  loadWaitlist: () => Promise<void>;
-  loadAnalytics: (startDate: string, endDate: string) => Promise<void>;
+  loadUsers: (hideBotLike?: boolean) => Promise<boolean>;
+  loadWaitlist: () => Promise<boolean>;
+  loadAnalytics: (startDate: string, endDate: string) => Promise<boolean>;
   updateWaitlistStatus: (email: string, status: string) => Promise<void>;
   updateWaitlistSupportNote: (
     email: string,
@@ -179,8 +179,10 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({
       });
       setUsers(response.data);
       setError(null);
+      return true;
     } catch (err: any) {
       setError(err.response?.data?.message || "Failed to load users");
+      return false;
     } finally {
       setLoading(false);
     }
@@ -198,8 +200,10 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({
       });
       setWaitlist(sortedWaitlist);
       setError(null);
+      return true;
     } catch (err: any) {
       setError(err.response?.data?.message || "Failed to load waitlist");
+      return false;
     } finally {
       setLoading(false);
     }
@@ -245,6 +249,7 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({
         setGtmAnalytics(gtmResponse.data);
         setCrmAnalytics(crmResponse.data);
         setError(null);
+        return true;
       } catch (err: any) {
         console.error('Error loading analytics:', err);
         const errorMessage = err.response?.data?.message || err.message || "Failed to load analytics";
@@ -327,6 +332,7 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({
           topToolsInRange: [],
           dailyGrowth: [],
         });
+        return false;
       } finally {
         setLoading(false);
       }

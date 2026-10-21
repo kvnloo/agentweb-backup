@@ -4894,7 +4894,7 @@ router.post("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId/start-ses
 
     const { agentModeService } = await import('../services/agentModeService');
     const modelToUse = await agentModeService.getDefaultModel();
-    await chatbotDb.updateSessionLlmModel(session.sessionId, modelToUse);
+    await chatbotDb.updateSessionLlmModel(session.sessionId, modelToUse, undefined, 'system');
     await chatbotDb.updateSessionGtmWorkItem(session.sessionId, { planId, phaseId, workItemId });
 
     // Build the initial message from work item title + description
@@ -5109,6 +5109,11 @@ router.get("/subscription-types", async (req, res) => {
         ...(type.llmUsagePolicy ? { llmUsagePolicy: type.llmUsagePolicy } : {}),
         ...(type.llmUsageTopUp ? { llmUsageTopUp: type.llmUsageTopUp } : {}),
         ...(type.seatPricing ? { seatPricing: type.seatPricing } : {}),
+        // ENG-668: round-trip it, or the admin UI's next save (which posts what this returned) drops it.
+        ...(type.paygOverage ? { paygOverage: type.paygOverage } : {}),
+        // ENG-669: returned as stored ("*" is NOT expanded: it must keep meaning "every model", including
+        // models added later). Absent stays absent (= every model), so a save round-trips it unchanged.
+        ...(Array.isArray(type.allowedModels) ? { allowedModels: type.allowedModels } : {}),
       };
     }));
 
@@ -5175,6 +5180,54 @@ async function findStrandedTiers(nextTierNames: string[]): Promise<Array<{ name:
       ).length,
     }))
     .filter((t) => t.userCount > 0);
+}
+
+/**
+ * ENG-669: a tier's `allowedModels` as it is stored: canonical registry ids (legacy aliases resolved), de-duplicated,
+ * in the admin's order; `"*"` alone when it is present (every model); the reserved `"agentweb-model"` kept as is.
+ * Throws (-> 400, nothing saved) when the value is not a list of strings, is empty (a tier that can choose no model is
+ * meaningless: use "*" or name the models), or names an id that is not served or that a customer can never select
+ * (admin-only, internal-only, live-voice).
+ */
+async function canonicalizeTierAllowedModels(tierName: string, raw: unknown): Promise<string[]> {
+  if (!Array.isArray(raw) || raw.some((entry) => typeof entry !== 'string')) {
+    throw new Error(`${tierName} allowedModels must be an array of model ids`);
+  }
+  const { ALL_MODELS, AGENTWEB_MODEL_ID } = await import('../services/agentMode/modelAccess');
+  const { agentModeService } = await import('../services/agentModeService');
+  const ids: string[] = [];
+  const unknown: string[] = [];
+  const notSelectable: string[] = [];
+  for (const entry of raw as string[]) {
+    const id = entry.trim();
+    if (!id) continue;
+    if (id === ALL_MODELS) return [ALL_MODELS];
+    if (id === AGENTWEB_MODEL_ID) {
+      if (!ids.includes(id)) ids.push(id);
+      continue;
+    }
+    const resolution = agentModeService.resolveGenerationModel(id);
+    if (resolution.fellBack) {
+      unknown.push(id);
+      continue;
+    }
+    if (!agentModeService.isModelSelectableBy(resolution.model, false)) {
+      notSelectable.push(id);
+      continue;
+    }
+    if (!ids.includes(resolution.model)) ids.push(resolution.model);
+  }
+  const list = (bad: string[]) => bad.map((id) => `'${id}'`).join(', ');
+  if (unknown.length > 0) {
+    throw new Error(`${tierName} allowedModels: unknown model id${unknown.length === 1 ? '' : 's'} ${list(unknown)}`);
+  }
+  if (notSelectable.length > 0) {
+    throw new Error(`${tierName} allowedModels: ${list(notSelectable)} cannot be selected by customers (admin-only, internal or live-voice)`);
+  }
+  if (ids.length === 0) {
+    throw new Error(`${tierName} allowedModels must name at least one model, or "*" for every model`);
+  }
+  return ids;
 }
 
 router.post("/subscription-types", async (req, res) => {
@@ -5321,6 +5374,26 @@ router.post("/subscription-types", async (req, res) => {
         }
       }
 
+      // ENG-668: whether this tier may opt into pay-as-you-go overages. This object is rebuilt from a
+      // whitelist and replaces the stored tier, so a field missing here is silently dropped on save.
+      // `markupBps` defaults to the tier's own additional-usage (top-up) markup floor, so overage is
+      // never priced below what a top-up of the same usage costs; with no top-up to inherit from it
+      // must be given explicitly — but only for a tier that offers PAYG (`allowed: true`): a tier that
+      // does not has nothing to price. Present-but-invalid values are rejected, never coerced.
+      let normalizedPaygOverage: any = undefined;
+      if (type.paygOverage != null) {
+        const { validatePaygOverageTierConfig } = await import('../services/paygOverage');
+        const markupBps = type.paygOverage.markupBps ?? normalizedLlmUsageTopUp?.minimumMarkupBps;
+        if (markupBps === undefined && type.paygOverage.allowed === true) {
+          throw new Error(`${type.name} pay-as-you-go: markupBps is required when the tier has no additional usage markup to inherit`);
+        }
+        normalizedPaygOverage = { allowed: type.paygOverage.allowed, ...(markupBps !== undefined ? { markupBps } : {}) };
+        const paygErrors = validatePaygOverageTierConfig(normalizedPaygOverage);
+        if (paygErrors.length > 0) {
+          throw new Error(`${type.name} pay-as-you-go: ${paygErrors.join('; ')}`);
+        }
+      }
+
       // Seat-based billing (ENG-2243..2246): admin-configured pricing for extra
       // org seats. priceCents is the full monthly per-seat charge; baseSeats
       // mirrors orgSeatService.baseSeatsForTier for display/config purposes.
@@ -5343,6 +5416,12 @@ router.post("/subscription-types", async (req, res) => {
         ? type.hiddenPages.filter((p: any) => typeof p === 'string')
         : [];
 
+      // ENG-669: this object REPLACES the stored tier, so an omitted allowedModels must stay omitted
+      // (= every model), never be materialised or dropped.
+      const normalizedAllowedModels = type.allowedModels != null
+        ? await canonicalizeTierAllowedModels(type.name, type.allowedModels)
+        : undefined;
+
       return {
         name: type.name,
         allowedPages: normalizedPages,
@@ -5355,6 +5434,8 @@ router.post("/subscription-types", async (req, res) => {
         ...(normalizedLlmUsagePolicy ? { llmUsagePolicy: normalizedLlmUsagePolicy } : {}),
         ...(normalizedLlmUsageTopUp ? { llmUsageTopUp: normalizedLlmUsageTopUp } : {}),
         ...(normalizedSeatPricing ? { seatPricing: normalizedSeatPricing } : {}),
+        ...(normalizedPaygOverage ? { paygOverage: normalizedPaygOverage } : {}),
+        ...(normalizedAllowedModels ? { allowedModels: normalizedAllowedModels } : {}),
       };
     }));
 

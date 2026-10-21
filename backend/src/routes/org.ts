@@ -3,6 +3,7 @@ import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { userDb, orgDb, Organization } from "../services/db";
 import { defaultShareSettings } from "../services/orgShareService";
 import { callerCan, can, roleOf, isBillingRoot } from "../services/orgAuthz";
+import { invalidateCachedPixels } from "../services/metaPixelsCache";
 import { v4 as uuidv4 } from "uuid";
 import crypto from "crypto";
 import { isCompanyEmail } from "../utils/validation";
@@ -1334,6 +1335,37 @@ router.get("/:orgId/connected-accounts", async (req: Request, res: Response) => 
   }
 });
 
+// ENG-2595: compare-and-swap on a member's whole connected_accounts list.
+// Both the share PATCH and the member DELETE read the list, change one entry,
+// and write the list back; without a condition, two near-simultaneous writes on
+// the same member silently drop one change. The write is conditioned on the
+// stored list still equalling what we read, and re-read/retried on conflict.
+// Operates on the RAW stored list (not a normalised copy) so legacy entries
+// with no config can still be removed.
+async function mutateMemberAccounts(
+  memberUserId: string,
+  mutate: (accounts: any[]) => any[] | null,
+): Promise<"ok" | "not_found"> {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const member = await userDb.getUserById(memberUserId);
+    const current = Array.isArray(member?.connected_accounts) ? (member!.connected_accounts as any[]) : [];
+    const next = mutate(current);
+    if (!next) return "not_found";
+    try {
+      await userDb.updateUser(memberUserId, { connected_accounts: next } as any, {
+        condition: current.length === 0
+          ? { expression: "attribute_not_exists(#caCas) OR size(#caCas) = :caZero", names: { "#caCas": "connected_accounts" }, values: { ":caZero": 0 } }
+          : { expression: "#caCas = :caPrev", names: { "#caCas": "connected_accounts" }, values: { ":caPrev": current } },
+      });
+      return "ok";
+    } catch (err: any) {
+      if (err?.code === "ConditionalCheckFailedException" || err?.name === "ConditionalCheckFailedException") continue;
+      throw err;
+    }
+  }
+  throw new Error("connected_accounts write kept conflicting");
+}
+
 // Toggle sharing a personal connected account with the org
 router.patch("/connected-accounts/:platform/:accountId/share", async (req: Request, res: Response) => {
   try {
@@ -1392,9 +1424,16 @@ router.patch("/connected-accounts/:platform/:accountId/share", async (req: Reque
       return res.status(403).json({ error: "Only the org owner can unshare an org-shared connected account" });
     }
 
-    const updated = [...accounts];
-    updated[idx] = { ...updated[idx], sharedWithOrg };
-    await userDb.updateUser(accountOwner.userId, { connected_accounts: updated } as any);
+    const result = await mutateMemberAccounts(accountOwner.userId, (list) => {
+      const i = list.findIndex((a: any) => a?.platform === platform && a?.account_id === accountId);
+      if (i === -1) return null;
+      const updated = [...list];
+      updated[i] = { ...updated[i], sharedWithOrg };
+      return updated;
+    });
+    if (result === "not_found") {
+      return res.status(404).json({ error: "Connected account not found" });
+    }
 
     return res.json({
       success: true,
@@ -1404,6 +1443,62 @@ router.patch("/connected-accounts/:platform/:accountId/share", async (req: Reque
     });
   } catch (error) {
     console.error("Error toggling connected account org sharing:", error);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ENG-2595: org owners/admins disconnect a *member's* connected account.
+// The personal DELETE /api/oauth/connected-accounts/:platform/:accountId only
+// touches the caller's own record, so an owner looking at a teammate's broken
+// account (e.g. Meta "Ads permission missing") had no way to remove it.
+// Scope: org-managers only, target must belong to a member of the caller's own
+// org, and the caller's own accounts keep using the personal route.
+// Platforms with remote-side cleanup (Calendly webhooks, Unipile sessions) are
+// refused here — that cleanup needs the owner's own credentials/context.
+const MEMBER_DISCONNECT_UNSUPPORTED_PLATFORMS = new Set(["calendly", "unipile"]);
+
+router.delete("/connected-accounts/:platform/:accountId", async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Not authenticated" });
+
+    const user = await userDb.getUserById(userId);
+    if (!user?.orgId) {
+      return res.status(403).json({ error: "You are not a member of any organization" });
+    }
+    const org = await orgDb.getOrgById(user.orgId);
+    if (!org) return res.status(404).json({ error: "Organization not found" });
+
+    if (!canManageOrgAccounts(user, org)) {
+      return res.status(403).json({ error: "Only the org owner can disconnect another member's connected account" });
+    }
+
+    const { platform, accountId } = req.params;
+    if (MEMBER_DISCONNECT_UNSUPPORTED_PLATFORMS.has(platform)) {
+      return res.status(409).json({ error: `Ask the member who connected this ${platform} account to disconnect it` });
+    }
+
+    const members = await orgDb.getOrgMembers(user.orgId);
+    const owner = members.find(
+      (m: any) => m.userId !== userId && m.orgId === user.orgId &&
+        (m.connected_accounts || []).some((a: any) => a.platform === platform && a.account_id === accountId)
+    );
+    if (!owner) {
+      return res.status(404).json({ error: "Connected account not found" });
+    }
+
+    const result = await mutateMemberAccounts(owner.userId, (list) => {
+      const next = list.filter((a: any) => !(a?.platform === platform && a?.account_id === accountId));
+      return next.length === list.length ? null : next;
+    });
+    if (result === "not_found") {
+      return res.status(404).json({ error: "Connected account not found" });
+    }
+    invalidateCachedPixels(owner.userId);
+    console.log(`[org] ENG-2595 member account disconnect: actor=${userId} org=${user.orgId} member=${owner.userId} platform=${platform} account=${accountId}`);
+    return res.json({ success: true, ownerUserId: owner.userId });
+  } catch (error) {
+    console.error("Error disconnecting member connected account:", error);
     return res.status(500).json({ error: "Internal server error" });
   }
 });

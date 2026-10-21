@@ -32,6 +32,8 @@ export class FakeFs implements UserFsPort {
   wipes: string[] = [];
   residue = new Map<number, number>();
   failWipes = false;
+  /** killAll waits for this (a slow kill). */
+  killGate?: Promise<void>;
   /** killAll throws once. */
   failKillOnce = false;
   /** promoteAttempt throws before doing anything. */
@@ -96,6 +98,7 @@ export class FakeFs implements UserFsPort {
     this.onWipe?.();
   }
   async killAll(uid: number): Promise<void> {
+    if (this.killGate) await this.killGate;
     if (this.failKillOnce) {
       this.failKillOnce = false;
       throw new Error("kill failed");

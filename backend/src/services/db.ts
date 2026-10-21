@@ -17,6 +17,7 @@ import { encryptPassword, decryptPassword } from "../utils/crypto";
 import type { AttributionTouch } from "../types/attribution";
 import type { OrgRole } from "./orgAuthz";
 import type { MonthlyLlmUsageCredits } from "./llmUsageCreditService";
+import type { PaygOverageSettings } from "./paygOverage";
 import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
 import { isEvaluationUser } from "./evaluationPolicy";
@@ -666,6 +667,8 @@ export interface User {
   tokenAllowanceBonus?: number; // One-time bonus tokens granted by admin (resets on monthly reset)
   /** Monthly purchase/migration credits. Raw provider spend remains in tokenUsage. */
   llmUsageCredits?: MonthlyLlmUsageCredits;
+  /** ENG-668: pay-as-you-go overage opt-in. Billing owners only; absent = never opted in. */
+  paygOverage?: PaygOverageSettings;
   stripe_subscription_id?: string; // Stripe subscription ID
   subscription_status?: string; // Stripe subscription status: active, trialing, past_due, canceled, canceling
   current_period_end?: string; // ISO date of current billing period end
@@ -3709,6 +3712,9 @@ export const scheduleDb = {
     type?: string;
     emailCampaignTaskId?: string;
     llmModel?: string;
+    // ENG-669: who chose `llmModel`: 'system' = inherited from an admin-authored schedule template (AgentWeb's
+    // choice, exempt from the tier model allowlist); 'user' or absent = the owner's pin. Additive, optional.
+    llmModelSource?: 'user' | 'system';
     llmBackupModel?: string;
     llmBackupSource?: 'user' | 'system';
     llmBackupNeedsConfirmation?: boolean;
@@ -6687,6 +6693,9 @@ export const crmDb = {
      *  name different people, create a separate row. Ignored when the caller supplies a leadId, when there is
      *  an email, or for any origin other than form_fill. */
     phoneUniqueCreate?: boolean;
+    /** ENG-2123: with phoneUniqueCreate, narrows the bucketed id to this seed (the normalized names of a row that
+     *  conflicts with the number's first row), so same-named racers collapse onto ONE separate row. */
+    phoneUniqueIdSeed?: string;
   }, origin?: LeadOrigin) {
     try {
       const emailKeyIds: EmailLeadIds | null =
@@ -6702,7 +6711,7 @@ export const crmDb = {
         : '';
       const phoneKeyIds: EmailLeadIds | null =
         leadData.phoneUniqueCreate && phoneKey && !leadData.leadId?.trim() && !emailKeyIds
-          ? phoneLeadIds(listId, phoneKey)
+          ? phoneLeadIds(listId, leadData.phoneUniqueIdSeed ? `${phoneKey}|${leadData.phoneUniqueIdSeed}` : phoneKey)
           : null;
       let leadId = leadData.leadId?.trim() || emailKeyIds?.leadId || phoneKeyIds?.leadId || `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 

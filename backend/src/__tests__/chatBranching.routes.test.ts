@@ -200,6 +200,31 @@ describe('POST /session/:id/branch', () => {
     expect(others()).toHaveLength(before);
   });
 
+  it('ENG-669: a branch INHERITING a stored model outside the owner\'s plan is a 422 at branch time; nothing is created', async () => {
+    const { ModelUnavailableError } = jest.requireActual('../services/agentMode/modelUnavailable');
+    mockResolve.mockRejectedValueOnce(new ModelUnavailableError('gpt-5.5', 'not_in_plan', {
+      model: 'gpt-5.5', tier: 'Free', allowedModels: ['gemini-3.5-flash'], upgradeRequired: ['Pro'],
+    }));
+    const out = await request(app).post(URL).set('Authorization', bearer('owner')).send({ messageIndex: 2 });
+    expect(out.status).toBe(422);
+    expect(out.body.code).toBe('model_unavailable');
+    // The inherited (stored) model is resolved as a non-explicit selection for the OWNER; the resolver's tier check
+    // applies to it anyway (proven in agentModeController.failLoudSelectedModel.test.ts), so it is never swapped.
+    expect(mockResolve).toHaveBeenCalledWith(expect.objectContaining({ userId: 'owner', requestedModel: 'gpt-5.5', allowSilentSwap: true }));
+    expect(others()).toEqual([]);
+    expect(mockClaimed.has('s-1')).toBe(false);
+  });
+
+  it('ENG-669 PR-C: a branch keeps the AgentWeb Model SELECTION, never the model it routed to', async () => {
+    mockResolve.mockImplementationOnce(async () => ({
+      requestedModel: 'agentweb-model', effectiveModel: 'gemini-3.5-flash', modelSelection: 'honored',
+      routedVia: 'agentweb-model', routingReason: 'chat task: table default', tableVersion: 't1',
+    }));
+    const out = await request(app).post(URL).set('Authorization', bearer('owner')).send({ messageIndex: 2, llmModel: 'agentweb-model' });
+    expect(out.status).toBe(201);
+    expect(mockFake.session(out.body.sessionId)!.llmModel).toBe('agentweb-model');
+  });
+
   it('409 SESSION_BUSY while the source is generating, and that lock is not released by the refused branch', async () => {
     mockClaimed.add('s-1');
     const out = await request(app).post(URL).set('Authorization', bearer('owner')).send({ messageIndex: 2 });

@@ -10,6 +10,32 @@ import { requireEmmaTokenBudget } from '../middleware/emmaTokenBudget';
 import { chatbotDb } from '../services/chatbotService';
 import { publishRevalidationForForwardedRun, publishWithdrawnMidFlight, SCHEDULED_SESSION_HEADER } from '../utils/scheduledPublishConsentGuard';
 import { getMetaAdsMetricsArgsSchema } from '../utils/metaCampaignIds';
+import { assertModelInOwnerPlan } from '../services/agentMode/modelAccessInstance';
+import { buildModelUnavailableBody, isModelUnavailableError, ModelUnavailableError } from '../services/agentMode/modelUnavailable';
+import { isAgentWebModelId } from '../services/agentMode/agentWebModelRouter';
+
+/**
+ * ENG-669: a model named in the request body runs on the caller's account, so it must be in the caller's plan (the
+ * tier model allowlist; switch off => no read). Answers the shared 422 and returns false when refused.
+ */
+async function modelInCallerPlan(req: Request, res: Response, rawModel: unknown): Promise<boolean> {
+  if (typeof rawModel !== 'string' || !rawModel.trim()) return true;
+  // ENG-669 PR-C: these routes call one model directly (no resolver, no router), so the AgentWeb Model can never run
+  // here; refused visibly (with the switch on or off) instead of silently running a default model.
+  if (isAgentWebModelId(rawModel)) {
+    res.status(422).json(buildModelUnavailableBody(new ModelUnavailableError(rawModel.trim(), 'not_selectable')));
+    return false;
+  }
+  try {
+    await assertModelInOwnerPlan({ ownerUserId: userId(req), model: rawModel });
+    return true;
+  } catch (error) {
+    if (!isModelUnavailableError(error)) throw error;
+    const svc = await getAgentModeService();
+    res.status(422).json(buildModelUnavailableBody(error, svc.getModelDisplayName?.(error.requestedModel)));
+    return false;
+  }
+}
 
 const router = Router();
 
@@ -202,6 +228,7 @@ router.post('/describe-media', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
     const { type, url, prompt, llm_model, return_transcript, return_scenes, start_time, end_time, session_id } = req.body;
+    if (type !== 'video' && !(await modelInCallerPlan(req, res, llm_model))) return;
     let result;
     if (type === 'video') {
       // ENG-1961: carry the session too, so analysis run through this API is
@@ -611,6 +638,7 @@ router.get('/html-templates', async (req: Request, res: Response) => {
 
 router.post('/create-html-from-template', async (req: Request, res: Response) => {
   try {
+    if (!(await modelInCallerPlan(req, res, req.body.llm_model))) return;
     const svc = await getAgentModeService();
     const result = await svc.createHtmlFromTemplate(
       req.body.llm_model, req.body.template_id,

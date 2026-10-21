@@ -211,7 +211,9 @@ router.get('/:sequenceId', authenticateToken, async (req: Request, res: Response
     const sequence = await dripSequenceDb.getSequence(req.params.sequenceId);
     if (!sequence) return res.status(404).json({ error: 'Sequence not found' });
     if (sequence.userId !== authReq.user!.userId) return res.status(403).json({ error: 'Forbidden' });
-    res.json({ sequence });
+    // ENG-2573: read-only hint so UI/Emma can warn that open/click exits may be machine-triggered.
+    const { machineSusceptibleExits } = await import('../services/exitConditionTrust');
+    res.json({ sequence, machineSusceptibleExits: machineSusceptibleExits(sequence.exitConditions) });
   } catch (err) {
     console.error('[sequences] getSequence error:', err);
     res.status(500).json({ error: 'Failed to fetch sequence' });

@@ -119,6 +119,8 @@ import {
   ContentCopy as ContentCopyIcon,
 } from "@mui/icons-material";
 import { staffOperatedBadge, type SelfActivitySignal } from "../utils/selfActivityBadge";
+import { ErrorState } from "../components/StatusState";
+import { withoutAgentWebModel } from "../utils/agentWebModel";
 
 interface TabPanelProps {
   children?: React.ReactNode;
@@ -3469,7 +3471,26 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
   const currentAdminTab = ADMIN_TABS.find((adminTab) => adminTab.value === tabValue);
 
   if (adminError) {
-    return <Alert severity="error">{adminError}</Alert>;
+    return (
+      <ErrorState
+        title="We couldn't load the admin dashboard"
+        description={adminError}
+        onRetry={async () => {
+          // ENG-2526: retry every load sequentially and stop at the first failure.
+          // Each loader clears the shared error on success, so parallel retries let
+          // a successful load hide a still-failing one (e.g. waitlist/analytics).
+          if (!(await loadUsers(userFilterHideBotLike))) return;
+          if (!(await loadWaitlist())) return;
+          // Analytics only loads on the Overview tab (matches the analytics effect).
+          if (tabValue === 0 && startDate && endDate) {
+            const startDateStr = format(startDate, "yyyy-MM-dd");
+            const endDateStr = format(endDate, "yyyy-MM-dd");
+            lastLoadedDatesRef.current = { startDate: startDateStr, endDate: endDateStr };
+            await loadAnalytics(startDateStr, endDateStr);
+          }
+        }}
+      />
+    );
   }
 
   return (
@@ -8732,8 +8753,11 @@ const AgentModeSettings = () => {
         headers: { Authorization: `Bearer ${token}` }
       });
       if (Array.isArray(response.data) && response.data.length > 0) {
-        setSupportedModels(response.data);
-        return response.data;
+        // ENG-669 PR-C: the configured default stands in when nothing was chosen, so it must be one concrete model, never
+        // the AgentWeb Model (a per-turn router).
+        const models = withoutAgentWebModel(response.data);
+        setSupportedModels(models);
+        return models;
       }
     } catch (error) {
       console.error('Error loading supported models:', error);

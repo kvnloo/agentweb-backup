@@ -59,7 +59,10 @@ const PICKER_FORM_ACTION = "'self' https://checkout.stripe.com https://www.faceb
 function page(res: Response, status: number, title: string, body: string, formAction = "'self'") {
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('Content-Security-Policy', `default-src 'none'; style-src 'unsafe-inline'; form-action ${formAction}`);
-  res.setHeader('Referrer-Policy', 'no-referrer');
+  // Not no-referrer: under that policy browsers send `Origin: null` on the picker's form POST, and
+  // the global CORS check rejects it with 403 Forbidden. same-origin still never leaks a referrer
+  // off api.agentweb.pro (to Meta or Stripe).
+  res.setHeader('Referrer-Policy', 'same-origin');
   return res
     .status(status)
     .type('html')
