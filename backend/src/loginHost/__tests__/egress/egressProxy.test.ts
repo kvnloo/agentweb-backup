@@ -724,6 +724,19 @@ describe("per-customer sockets (a customer can only exhaust its own share)", () 
     await own.close();
   });
 
+  it("modes are set explicitly: a restrictive process umask (the host service runs with 0077) cannot make the directory unusable", async () => {
+    const old = process.umask(0o077);
+    try {
+      const r = await perUidRig();
+      const d = r.proxy.listenFor(400001);
+      expect(statSync(d).mode & 0o777).toBe(0o755);
+      expect(statSync(join(d, "proxy.sock")).mode & 0o777).toBe(0o666);
+      await r.close();
+    } finally {
+      process.umask(old);
+    }
+  });
+
   it("rejects bad uids and forgetFor removes the directory and ends that customer's tunnels", async () => {
     const r = await perUidRig();
     expect(() => r.proxy.listenFor(0)).toThrow();

@@ -580,10 +580,14 @@ export async function startEgressProxy(opts: EgressProxyOptions): Promise<Egress
     // For a unix socket, bind() and listen() happen inside this call: the file exists, and is connectable, when it returns. The unit that
     // needs it is started only after. Until chown/chmod below the file is root-owned with the umask's mode (not connectable by others).
     server.listen(path);
+    // The process umask (the host's service unit sets 0077) must not decide who can traverse the directory: set every mode explicitly.
     if (opts.perUid.ownByUid !== false) {
+      chownSync(dir, uid, uid);
+      chmodSync(dir, 0o700); // only the customer (and root) can even enter its directory
       chownSync(path, uid, uid);
       chmodSync(path, 0o600);
     } else {
+      chmodSync(dir, 0o755);
       chmodSync(path, 0o666);
     }
     perUid.set(uid, { server, dir, path, mine });

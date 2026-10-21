@@ -135,6 +135,8 @@ async function main() {
   const sockA = `${proxy.listenFor(UID)}/proxy.sock`;
   const stA = statSync(sockA);
   check("own-socket-owned-by-the-customer-mode-0600", stA.uid === UID && (stA.mode & 0o777) === 0o600, `uid=${stA.uid} mode=${(stA.mode & 0o777).toString(8)}`);
+  const stDir = statSync(`${proxy.listenFor(UID)}`);
+  check("own-directory-owned-by-the-customer-mode-0700", stDir.uid === UID && (stDir.mode & 0o777) === 0o700, `uid=${stDir.uid} mode=${(stDir.mode & 0o777).toString(8)}`);
   const cross = spawnSync("/usr/bin/setpriv", [`--reuid=${UID_B}`, `--regid=${UID_B}`, "--clear-groups", "/usr/bin/socat", "-T2", "-", `UNIX-CONNECT:${sockA}`], { input: "", encoding: "utf8", timeout: 10_000 });
   check("another-customer-cannot-connect-to-it", cross.status !== 0 && /ermission denied/i.test(`${cross.stderr}`), `exit=${cross.status} ${String(cross.stderr).trim().slice(-60)}`);
 
