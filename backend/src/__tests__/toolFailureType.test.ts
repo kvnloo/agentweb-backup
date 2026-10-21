@@ -106,6 +106,11 @@ describe('classifyToolFailureType', () => {
         classifyToolFailureType('Error', "API error (400): 'x@y.com' is not a member of the page owner's organization"),
       ).toBe('by_design');
     });
+    it('classifies a Google Ads serving_chain state report as by_design (ENG-2611)', () => {
+      expect(classifyToolFailureType('Error', '{"customerId":"4149815605","state":"UNVERIFIED","campaigns":[]}')).toBe('by_design');
+      expect(classifyToolFailureType('Error', '{"customerId":"1","state":"BLOCKED_BY_POLICY","blockers":[]}')).toBe('by_design');
+      expect(classifyToolFailureType('Error', '{"customerId":"1","state":"DELIVERY_FAILED"}')).toBe('bug');
+    });
     it('classifies a landing-page authorization gap', () => {
       expect(classifyToolFailureType('Error', 'Not authorized to edit this landing page.')).toBe('config');
     });
