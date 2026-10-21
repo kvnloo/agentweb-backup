@@ -24,7 +24,7 @@ export const TASK_SUCCESS_JUDGE_GRADER_ID = 'agent-task-success-judge';
 export const DEFAULT_TASK_SUCCESS_JUDGE_MODEL = 'anthropic.claude-sonnet-5';
 
 const MAX_TRACE_CHARS = 60_000;
-const MAX_OUTPUT_TOKENS = 1_500;
+const MAX_OUTPUT_TOKENS = 3_000;
 const TIMEOUT_MS = 90_000;
 
 export const TASK_SUCCESS_JUDGE_PROMPT = `You label whether an AI marketing agent's session accomplished what the user asked. The criterion is task_success, with this rubric:
@@ -144,19 +144,43 @@ export function renderTraceForJudge(trace: AgentRunTrace, title?: string): strin
   return [...head, '', 'TIMELINE:', ...middle, ...notes, '', tail].join('\n');
 }
 
+/** Most '{' positions parseVerdict will try; a reply with more objects than this is not a verdict. */
+const MAX_PARSE_ATTEMPTS = 200;
+
+/** Index of the '}' that closes the object opening at `start`, skipping braces inside JSON strings; -1 if it never closes. */
+function objectEnd(text: string, start: number): number {
+  let depth = 0;
+  let inString = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (ch === '\\') i++;
+      else if (ch === '"') inString = false;
+    } else if (ch === '"') inString = true;
+    else if (ch === '{') depth++;
+    else if (ch === '}' && --depth === 0) return i;
+  }
+  return -1;
+}
+
 function parseVerdict(text: string): { verdict: TaskSuccessVerdict; reason: string; checklist: string[] } | string {
   const stripped = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
   // Try each '{' from the last one back, so prose or a second object after the answer can't hide it.
+  // Each try scans forward from its own '{', so a stray brace or quote in prose before the JSON doesn't matter.
   let record: Record<string, unknown> | undefined;
-  for (let start = stripped.lastIndexOf('{'); start >= 0 && !record; start = stripped.lastIndexOf('{', start - 1)) {
-    for (let end = stripped.lastIndexOf('}'); end > start && !record; end = stripped.lastIndexOf('}', end - 1)) {
+  let start = stripped.lastIndexOf('{');
+  for (let attempts = 0; start >= 0 && !record && attempts < MAX_PARSE_ATTEMPTS; attempts++) {
+    const end = objectEnd(stripped, start);
+    if (end > start) {
       try {
         const parsed = JSON.parse(stripped.slice(start, end + 1));
         if (parsed && typeof parsed === 'object' && 'verdict' in parsed) record = parsed as Record<string, unknown>;
       } catch {
-        // not a complete object; try a shorter or earlier span
+        // not valid JSON; try an earlier '{'
       }
     }
+    // lastIndexOf treats a negative fromIndex as 0, so stop explicitly at the start of the text.
+    start = start > 0 ? stripped.lastIndexOf('{', start - 1) : -1;
   }
   if (!record) return 'no JSON object with a verdict in the judge output';
   const verdict = typeof record.verdict === 'string' ? record.verdict.trim().toLowerCase() : record.verdict;
@@ -191,6 +215,11 @@ export async function judgeTaskSuccess(
     return { status: 'error', reason: `LLM call failed: ${err instanceof Error ? err.message : String(err)}`, model };
   }
   const parsed = parseVerdict(response.text);
-  if (typeof parsed === 'string') return { status: 'error', reason: parsed, model, ...(response.usage ? { usage: response.usage } : {}) };
+  if (typeof parsed === 'string') {
+    // A reply that used the whole output budget was cut off; say so rather than "no JSON".
+    const cutOff = (response.usage?.outputTokens ?? 0) >= MAX_OUTPUT_TOKENS;
+    const reason = cutOff ? `${parsed} (the reply hit the ${MAX_OUTPUT_TOKENS}-token output limit)` : parsed;
+    return { status: 'error', reason, model, ...(response.usage ? { usage: response.usage } : {}) };
+  }
   return { status: 'ok', ...parsed, model, ...(response.usage ? { usage: response.usage } : {}) };
 }

@@ -9,8 +9,9 @@
  * READ-ONLY. It reads the golden-set store, AW-ChatSessions and AW-ChatMessages and writes nothing
  * to them: the judge is called on OpenRouter directly rather than through `AgentModeService.callLLM`,
  * whose usage metering would write spend rows. It stops before the call that would pass --max-usd.
- * Stdout has case ids, verdicts and totals only — no transcript text or judge reasons; --out writes
- * the reasons (which can quote the session) to a local file.
+ * Stdout has case ids, verdicts, the running cost, totals and why a case errored — no transcript
+ * text or judge reasons; --out writes the reasons (which can quote the session) to a
+ * local file, rewritten after every case so a run that stops early keeps what it judged.
  *
  * Usage (default AWS profile; needs EVAL_GOLDEN_CASES_TABLE and an OpenRouter key):
  *   npx ts-node --transpile-only src/scripts/runTaskSuccessJudgeTrial.ts --split test [--max-usd 3] \
@@ -106,32 +107,50 @@ async function main(): Promise<void> {
   const out: Record<string, { verdict?: string; reason: string; status: string }> = {};
   const tally: Record<string, number> = {};
   let judged = 0;
+  const save = () => {
+    if (args.out) writeFileSync(args.out, JSON.stringify(out, null, 1));
+  };
+  let outcome = 'aborted';
   console.log(`judge ${TASK_SUCCESS_JUDGE_VERSION} model ${args.model} split ${args.split}: ${cases.length} cases, cap $${args.maxUsd}`);
-  for (const c of cases) {
-    // Stop before a call that would pass the cap: assume the next costs what the average one did.
-    const nextEstimate = judged ? cost.usd / judged : 0;
-    if (cost.usd + nextEstimate > args.maxUsd) {
-      console.log(`stopped at the cost cap after ${judged} cases ($${cost.usd.toFixed(3)})`);
-      break;
+  try {
+    for (const c of cases) {
+      // Stop before a call that would pass the cap: assume the next costs what the average one did.
+      const nextEstimate = judged ? cost.usd / judged : 0;
+      if (cost.usd + nextEstimate > args.maxUsd) {
+        console.log(`stopped at the cost cap after ${judged} cases ($${cost.usd.toFixed(3)})`);
+        outcome = 'stopped at cap';
+        break;
+      }
+      const loaded = await loadTraceForGrading(reader, tables, c.sourceRef.id);
+      if (!loaded) {
+        out[c.caseId] = { status: 'missing', reason: 'session not found' };
+        tally.missing = (tally.missing ?? 0) + 1;
+        console.log(`${c.caseId} missing`);
+        save();
+        continue;
+      }
+      const result = await judgeTaskSuccess(loaded, { llm, model: args.model });
+      if (result.status === 'error' && /reported no cost/.test(result.reason)) throw new Error(result.reason);
+      judged += 1;
+      const key = result.status === 'ok' ? result.verdict : 'error';
+      tally[key] = (tally[key] ?? 0) + 1;
+      out[c.caseId] = result.status === 'ok'
+        ? { status: 'ok', verdict: result.verdict, reason: result.reason }
+        : { status: 'error', reason: result.reason };
+      save();
+      // An invalid verdict quotes the model's text, which can quote the session: print only its kind.
+      const why = result.status === 'error' ? ` (${result.reason.replace(/^invalid verdict[\s\S]*/, 'invalid verdict').slice(0, 200)})` : '';
+      console.log(`${c.caseId} ${key} $${cost.usd.toFixed(3)}${why}`);
     }
-    const loaded = await loadTraceForGrading(reader, tables, c.sourceRef.id);
-    if (!loaded) {
-      out[c.caseId] = { status: 'missing', reason: 'session not found' };
-      tally.missing = (tally.missing ?? 0) + 1;
-      continue;
+    if (outcome === 'aborted') outcome = 'done';
+  } finally {
+    try {
+      save();
+    } catch (err) {
+      console.error(`could not write ${args.out}: ${err instanceof Error ? err.message : err}`);
     }
-    const result = await judgeTaskSuccess(loaded, { llm, model: args.model });
-    if (result.status === 'error' && /reported no cost/.test(result.reason)) throw new Error(result.reason);
-    judged += 1;
-    const key = result.status === 'ok' ? result.verdict : 'error';
-    tally[key] = (tally[key] ?? 0) + 1;
-    out[c.caseId] = result.status === 'ok'
-      ? { status: 'ok', verdict: result.verdict, reason: result.reason }
-      : { status: 'error', reason: result.reason };
-    console.log(`${c.caseId} ${key}`);
+    console.log(`${outcome}: ${JSON.stringify(tally)} cost $${cost.usd.toFixed(3)}${args.out ? ` (reasons in ${args.out})` : ''}`);
   }
-  if (args.out) writeFileSync(args.out, JSON.stringify(out, null, 1));
-  console.log(`done: ${JSON.stringify(tally)} cost $${cost.usd.toFixed(3)}${args.out ? ` (reasons in ${args.out})` : ''}`);
 }
 
 if (require.main === module) {
