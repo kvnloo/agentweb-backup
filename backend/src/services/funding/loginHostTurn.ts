@@ -1,0 +1,153 @@
+/**
+ * ENG-2110 PR 1c-i: runs ONE turn on the login host the way the host's contract requires.
+ *
+ *  - `EBUSY` (host or connection full) is retried with jittered backoff until `busyWaitMs` runs out.
+ *  - The turn lease (host default 30 s) is renewed on a timer. A renew the host cannot answer twice in a
+ *    row ends the turn here; "turn not found" / "stale epoch" mean it is already over or fenced, so the
+ *    timer just stops.
+ *  - An abort signal interrupts the turn, then drops the stream if the host does not finish in `abortGraceMs`.
+ *  - Never runs a turn twice. If no usable answer arrived the same idempotency key is asked ONCE: a host that
+ *    already has the key reports "unknown outcome" (its events cannot be replayed); a host that did not
+ *    admit it runs it now. A stream that ends without a `result` is also "unknown outcome". The caller must
+ *    treat unknown as unknown (reconcile or pause), never as failure and never retry under a new key.
+ */
+import type { ProviderEvent } from "../../loginHost/adapter";
+import type { RouteInput } from "../../loginHost/protocol";
+import { LoginHostError, type LoginHostClient, type TurnStream } from "./loginHostClient";
+
+export type ResultEvent = Extract<ProviderEvent, { type: "result" }>;
+
+export type HostTurnOutcome =
+  | { kind: "completed"; result: ResultEvent }
+  /** The turn may have run (or still be running); its output is lost. `status` is the host's view when it gave one. */
+  | { kind: "unknown_outcome"; reason: "duplicate" | "stream_dropped"; status?: "running" | "finished" | "failed" | "aborted" };
+
+export interface HostTurnOptions {
+  signal?: AbortSignal;
+  /** Called for each event as it arrives (nothing is buffered). A throw interrupts the turn, drops the stream and propagates. */
+  onEvent?: (event: ProviderEvent) => void | Promise<void>;
+  /** How long to keep retrying EBUSY. Default 20 s. */
+  busyWaitMs?: number;
+  /** Default 10 s; after the first renew it follows the host's `leaseMs / 3`. */
+  renewEveryMs?: number;
+  /** After an abort, how long the host gets to finish before the stream is dropped. Default 10 s. */
+  abortGraceMs?: number;
+  /** Test seams. */
+  sleep?: (ms: number) => Promise<void>;
+  random?: () => number;
+}
+
+const MIN_RENEW_MS = 1_000;
+const MAX_RENEW_MS = 10_000;
+const BUSY_BASE_MS = 250;
+const BUSY_MAX_MS = 2_000;
+
+const realSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms).unref?.());
+
+async function admit(client: LoginHostClient, req: RouteInput<"turn.run">, opts: HostTurnOptions): Promise<TurnStream> {
+  const sleep = opts.sleep ?? realSleep;
+  const random = opts.random ?? Math.random;
+  const deadline = Date.now() + (opts.busyWaitMs ?? 20_000);
+  let delay = BUSY_BASE_MS;
+  let probed = false;
+  for (;;) {
+    if (opts.signal?.aborted) throw new LoginHostError("EBUSY", "aborted_while_waiting");
+    try {
+      return await client.turnRun(req);
+    } catch (err) {
+      if (!(err instanceof LoginHostError)) throw err;
+      if (err.busy) {
+        if (Date.now() + delay > deadline) throw err;
+        await sleep(delay * (0.5 + random() / 2));
+        delay = Math.min(delay * 2, BUSY_MAX_MS);
+        continue;
+      }
+      // No usable answer: the host may have admitted the turn. Ask once more with the same key (see file header).
+      if (err.ambiguous && !probed) {
+        probed = true;
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+export async function runHostTurn(client: LoginHostClient, req: RouteInput<"turn.run">, opts: HostTurnOptions = {}): Promise<HostTurnOutcome> {
+  const stream = await admit(client, req, opts);
+  if (stream.duplicate) {
+    stream.close();
+    return { kind: "unknown_outcome", reason: "duplicate", ...(stream.status ? { status: stream.status } : {}) };
+  }
+
+  const ids = { connectionId: req.connectionId, turnId: req.turnId, epoch: req.epoch };
+  const sleep = opts.sleep ?? realSleep;
+  let stopped = false;
+  let wake!: () => void;
+  const stopSignal = new Promise<void>((resolve) => (wake = resolve));
+  let renewEvery = Math.min(Math.max(opts.renewEveryMs ?? MAX_RENEW_MS, MIN_RENEW_MS), MAX_RENEW_MS);
+  let interrupting: Promise<void> | undefined;
+
+  const interrupt = (): Promise<void> => {
+    interrupting ??= client.turnInterrupt(ids).then(
+      () => undefined,
+      () => undefined, // gone or fenced already, or the host is unreachable: the lease lapse ends the turn
+    );
+    return interrupting;
+  };
+
+  // Lease renewal. Its own loop (not setInterval) so a slow renew never overlaps the next one.
+  const renewLoop = (async () => {
+    let failures = 0;
+    while (!stopped) {
+      await Promise.race([sleep(renewEvery), stopSignal]);
+      if (stopped) return;
+      try {
+        const { leaseMs } = await client.turnRenew(ids);
+        failures = 0;
+        renewEvery = Math.min(Math.max(Math.floor(leaseMs / 3), MIN_RENEW_MS), MAX_RENEW_MS);
+      } catch (err) {
+        if (err instanceof LoginHostError && (err.code === "ENOTFOUND" || err.code === "ESTALE")) return; // the turn is over or fenced
+        if (++failures >= 2) {
+          void interrupt().then(() => stream.close());
+          return;
+        }
+      }
+    }
+  })();
+
+  let graceTimer: NodeJS.Timeout | undefined;
+  const onAbort = () => {
+    void interrupt();
+    graceTimer = setTimeout(() => stream.close(), opts.abortGraceMs ?? 10_000);
+    graceTimer.unref?.();
+  };
+  if (opts.signal?.aborted) onAbort();
+  else opts.signal?.addEventListener("abort", onAbort, { once: true });
+
+  try {
+    let result: ResultEvent | undefined;
+    try {
+      for await (const ev of stream.events) {
+        if (ev.type === "result") result = ev;
+        try {
+          await opts.onEvent?.(ev);
+        } catch (err) {
+          await interrupt();
+          stream.close();
+          throw err;
+        }
+      }
+    } catch (err) {
+      if (err instanceof LoginHostError && err.ambiguous) return { kind: "unknown_outcome", reason: "stream_dropped" };
+      throw err;
+    }
+    return result ? { kind: "completed", result } : { kind: "unknown_outcome", reason: "stream_dropped" };
+  } finally {
+    stopped = true;
+    wake();
+    if (graceTimer) clearTimeout(graceTimer);
+    opts.signal?.removeEventListener("abort", onAbort);
+    stream.close();
+    await renewLoop.catch(() => undefined);
+  }
+}
