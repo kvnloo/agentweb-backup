@@ -5,6 +5,7 @@
   "socket": { "dir": "/run/aw-login-host-test1", "gid": 990 },
   "limits": { "memoryMax": "1G", "tasksMax": 256, "tmpSize": "128M", "shmSize": "64M", "runtimeMaxSec": 7200 },
   "quota": { "blocksKb": 204800, "inodes": 20000 },
+  "egress": { "allow": ["api.anthropic.com:443", "platform.claude.com:443", "console.anthropic.com:443", "claude.ai:443"] },
   "claude": {
     "binaryPath": "/opt/aw-claude/2.1.294/claude",
     "expectedSha256": "<sha256 of that exact binary: sha256sum>",

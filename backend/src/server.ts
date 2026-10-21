@@ -602,6 +602,16 @@ createTestAccount().then(async () => {
     console.warn('Failed to register enrichment specialists:', (err as Error).message);
   }
 
+  // ENG-2271: load the admin vendor-rate overrides BEFORE listening, so no usage recording
+  // (HTTP request or queue processor) prices a Twilio unit at the defaults while an override
+  // exists. Bounded by the read's own 1.5s timeout; a settings outage must not block boot.
+  // Skipped under Jest (shouldBootstrapBackgroundJobs), where no settings I/O may happen.
+  // (refresh never rejects and logs its own failure once.)
+  if (shouldBootstrapBackgroundJobs()) {
+    const { refreshVendorRateOverrides } = await import('./utils/vendorRateCard');
+    await refreshVendorRateOverrides();
+  }
+
   server.listen(port, async () => {
     console.log(`Server is running on port ${port}`);
     console.log(`WebSocket server is ready`);
