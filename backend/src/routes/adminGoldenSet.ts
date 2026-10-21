@@ -7,7 +7,8 @@
  * through the existing admin APIs when it is shown, so nothing here returns or stores content.
  *
  * An admin can also exclude a case from the set with a reason, or restore it (ENG-2608); listing
- * leaves excluded cases out unless `includeExcluded=true`.
+ * leaves excluded cases out unless `includeExcluded=true`. Both are audited via recordAdminAudit, and a
+ * restore's audit line keeps the exclusion it removed.
  *
  * Admin-only, and delegated sessions are refused (middleware/admin.ts). Until OPS-2 (ENG-2147)
  * provisions the store every call except /status answers 503 golden_set_store_not_provisioned.
@@ -25,6 +26,7 @@ import {
   GoldenSetStoreNotProvisionedError,
   type GoldenSetStore,
 } from '../loops/eval/goldenSetStore';
+import { recordAdminAudit } from '../services/adminAuditLog';
 
 function sendError(res: Response, error: unknown, action: string): Response {
   if (error instanceof GoldenSetStoreNotProvisionedError) {
@@ -114,6 +116,7 @@ export function createAdminGoldenSetRouter(getStore: () => GoldenSetStore = gold
       const user = (req as AuthRequest).user;
       const by = user?.email || user?.userId || 'unknown-admin';
       const saved = await getStore().setExclusion(req.params.caseId, { reason, by, at: new Date().toISOString() });
+      recordAdminAudit({ actorUserId: user?.userId ?? 'unknown-admin', actorEmail: user?.email, action: 'golden_case_exclude', caseId: saved.caseId, reason });
       return res.json({ case: saved });
     } catch (error) {
       return sendError(res, error, 'exclude the golden case');
@@ -122,7 +125,19 @@ export function createAdminGoldenSetRouter(getStore: () => GoldenSetStore = gold
 
   router.delete('/:caseId/exclusion', async (req: Request, res: Response) => {
     try {
-      return res.json({ case: await getStore().setExclusion(req.params.caseId, null) });
+      const store = getStore();
+      const existing = await store.getCase(req.params.caseId);
+      if (!existing) return res.status(404).json({ error: 'not_found', message: 'Golden case not found' });
+      const saved = await store.setExclusion(existing.caseId, null);
+      const user = (req as AuthRequest).user;
+      recordAdminAudit({
+        actorUserId: user?.userId ?? 'unknown-admin',
+        actorEmail: user?.email,
+        action: 'golden_case_restore',
+        caseId: saved.caseId,
+        previousExclusion: existing.excluded,
+      });
+      return res.json({ case: saved });
     } catch (error) {
       return sendError(res, error, 'restore the golden case');
     }
