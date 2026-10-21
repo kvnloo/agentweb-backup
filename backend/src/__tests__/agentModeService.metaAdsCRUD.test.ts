@@ -1221,6 +1221,30 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
           }
         });
 
+        it('refuses a carousel description update before creating a creative (ENG-2609)', async () => {
+          const carousel = { page_id: 'page_123', link_data: { message: 'm', link: 'https://old.com', child_attachments: [{ image_hash: 'a' }, { image_hash: 'b' }] } };
+          mockSwap(carousel, carousel);
+          jest.mocked(metaService.createAdCreative).mockClear();
+
+          const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', { description: 'x' });
+
+          expect(result.success).toBe(false);
+          expect(result.error).toBe('CAROUSEL_DESCRIPTION_UNSUPPORTED');
+          expect(metaService.createAdCreative).not.toHaveBeenCalled();
+        });
+
+        it('carries the asset_feed_spec description when only placement_assets change (ENG-2609)', async () => {
+          mockSwap(OLD_LINK_SPEC, OLD_LINK_SPEC);
+          jest.mocked(metaService.getAdCreative).mockReset().mockResolvedValue({
+            id: 'old_creative_123', name: 'Old', object_story_spec: { page_id: 'page_123', link_data: { link: 'https://old.com' } },
+            asset_feed_spec: { descriptions: [{ text: 'Feed desc' }] },
+          } as never);
+
+          await agentModeService.updateMetaAdsAd('user123', 'ad_123', { placement_assets: [{ image_hash: 'a', is_default: true }, { image_hash: 'b', placements: ['story'] }] });
+
+          expect(sentCreative().description).toBe('Feed desc');
+        });
+
         it('fails with SWAP_NOT_REFLECTED and does not attach when the new creative still has the old image', async () => {
           mockSwap(OLD_LINK_SPEC, OLD_LINK_SPEC);
 

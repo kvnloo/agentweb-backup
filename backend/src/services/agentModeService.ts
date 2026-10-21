@@ -12701,13 +12701,17 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   /**
    * ENG-2609: link description + Instagram identity of an existing creative, for rebuilding it
    * (COPY_AD / swap). Carousels are skipped for description: they have no creative-level slot.
+   * `assetFeedSpec` is passed only when rebuilding a placement_assets creative, whose description
+   * lives in asset_feed_spec.descriptions rather than link_data / video_data.
    */
   private static carriedCreativeFields(
     spec: any,
     params: { description?: string; instagram_user_id?: string },
+    assetFeedSpec?: any,
   ): { description?: string; instagram_user_id?: string } {
     const carousel = !!spec?.link_data?.child_attachments;
     const description = params.description
+      ?? (assetFeedSpec ? assetFeedSpec.descriptions?.[0]?.text : undefined)
       ?? (carousel ? undefined : (spec?.video_data ? spec.video_data.link_description : spec?.link_data?.description));
     const instagramUserId = params.instagram_user_id ?? spec?.instagram_user_id;
     return {
@@ -13196,7 +13200,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         link_url: newLinkUrl || ld.link || vd.call_to_action?.value?.link || '',
         call_to_action_type: params.call_to_action_type || ld.call_to_action?.type || vd.call_to_action?.type,
         url_tags: carriedUrlTags,
-        ...AgentModeService.carriedCreativeFields(existingSpec, params),
+        ...AgentModeService.carriedCreativeFields(existingSpec, params, creativeData.asset_feed_spec),
       };
     } else if (existingSpec.video_data) {
       // Video creative
@@ -13221,6 +13225,15 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     } else if (existingSpec.link_data?.child_attachments) {
       // Carousel creative – update the main link and optionally per-card links
       const ld = existingSpec.link_data;
+      // A carousel has no creative-level description slot, so a swap could not apply it: refuse
+      // before creating a replacement creative that would silently leave the cards unchanged.
+      if (params.description) {
+        return {
+          success: false,
+          message: 'Carousel creatives have no creative-level description, so it cannot be updated here. Put per-card text in carousel_cards[].description instead.',
+          error: 'CAROUSEL_DESCRIPTION_UNSUPPORTED'
+        };
+      }
       const updatedCards = ld.child_attachments.map((card: any) => ({
         image_hash: card.image_hash,
         image_url: card.picture || card.image_url,
