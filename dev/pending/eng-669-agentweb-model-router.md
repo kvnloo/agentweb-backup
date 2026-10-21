@@ -80,9 +80,15 @@ tableVersion }` (checks of a pick being saved do not).
 **Who / what is checked.** The SELECTION against the owner's tier (PR-A gate: `agentweb-model` listed, or a wildcard
 tier); the routed model is AgentWeb's choice (provenance `system`, not tier-checked as a pick) but constrained by the
 table rules above. An admin-authored plan's router pin is not the launcher's pick, but at launch it must route for the
-LAUNCHER's tier (a visible 422 now, not at a step). Side channels that run `session.llmModel` without the resolver
-(Slack/transports, Emma email, approval resumes, GTM, continuations) are routed inside `generateSessionResponse`
-before anything is persisted.
+LAUNCHER's tier (a visible 422 now, not at a step). Callers that hand over the stored selection without resolving it
+are routed inside `generateSessionResponse` before anything is persisted: transports (sessionResponder) and Slack
+thread replies, approval-inbox resumes, the plan-launch first turn, runVerifiedChat callers that pass no model, and every
+auto continuation (media and work plan; from /generate, the interactive-share timeout and the getSession backstop).
+Emma email, GTM and result-endpoint turns run the configured default, never a selection. A continuation carries the
+SELECTION, not the routed model: it is a turn of its own, routed again (the same table routes it to the same model),
+so its replies are stamped and the switch / availability are re-checked each time; a refused continuation ends its
+chain with the refusal saved to the chat (and pushed live). An approval-inbox resume refused on the router saves the
+same visible refusal (as for `not_in_plan`); other models' refusals there keep the passive note only.
 
 **Where it can never run (refused visibly).** Compare columns (400 `agentweb_model_not_comparable` while the switch is
 on; off, the column is rejected as an unknown model, as before), and, switch on or off:
@@ -108,6 +114,8 @@ separate small customer-portal PR. Until it ships, keep the switch off: the stoc
 **Rollback.** Set `agentweb_model_router_enabled` to anything but `true` (within ~60s, no deploy). Every session, pin
 and schedule that stores `agentweb-model` keeps it (nothing is rewritten) and every turn on it is refused VISIBLY with
 the 422 "AgentWeb Model isn't available right now. Choose another model to continue." on every path: /generate (with
-or without a model in the body), verified-generate, interactive share, conversable, branch, side channels; a scheduled
-run fails with "AgentWeb Model is unavailable right now" (no page); a step pinned to it pauses its plan. Nothing is
+or without a model in the body), verified-generate, interactive share, conversable, branch, transports and Slack
+replies; an auto continuation or an approval-inbox resume saves the same refusal to the chat; a scheduled run fails
+with "AgentWeb Model is unavailable right now" (no page); a step pinned to it pauses its plan; an unattended plan launch
+pinned to it is refused (no page). Nothing is
 "corrected" to the default. Turning the switch back on resumes them unchanged; a user can pick another model any time.
