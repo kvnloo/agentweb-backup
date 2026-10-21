@@ -39,3 +39,12 @@ it('stores any other value as before', async () => {
   expect(res.status).toBe(200);
   expect(mockSetSetting).toHaveBeenCalledWith('agent_mode_default_model', 'gemini-3.8-flash', undefined, 'a@x.test');
 });
+
+it('POST /api/settings (create) refuses it the same way', async () => {
+  const res = await request(app).post('/api/settings').send({ settingName: 'agent_mode_default_model', settingValue: 'agentweb-model' });
+  expect(res.status).toBe(400);
+  expect(res.body.code).toBe('agentweb_model_not_configurable');
+  expect(mockSetSetting).not.toHaveBeenCalled();
+  const ok = await request(app).post('/api/settings').send({ settingName: 'agent_mode_default_model', settingValue: 'gemini-3.8-flash' });
+  expect(ok.status).toBe(200);
+});

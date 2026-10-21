@@ -863,3 +863,82 @@ describe('admin pickers', () => {
     expect(await offersAgentWebModel('admin-1')).toBe(true);
   });
 });
+
+/* ============ ENG-669 PR-C final review round (rv2-3677) ============ */
+import { resumeOriginSession } from '../services/approvalInboxExecution';
+
+const flushImmediates = async (rounds = 30) => { for (let i = 0; i < rounds; i++) await new Promise((r) => setImmediate(r)); };
+const DEFERRED_MEDIA = {
+  content: 'Two images are still rendering; continuing.',
+  toolCalls: [{ name: 'generate_image', result: { deferred: true, reason: 'media_generation_time_budget' } }],
+  knowledgeBaseQueries: [], sources: [], responseMessages: [],
+};
+const DONE = { content: 'Batch complete.', toolCalls: [], knowledgeBaseQueries: [], sources: [], responseMessages: [] };
+
+describe('auto continuations carry the SELECTION and are routed as turns of their own', () => {
+  it('a media continuation started by a routed /generate turn is routed again and its reply is stamped', async () => {
+    turnOn();
+    const store = storeSession(baseSession(AW, { llmModelSource: 'user' }));
+    mockWorker.runInWorker.mockResolvedValueOnce(DEFERRED_MEDIA as any).mockResolvedValueOnce(DONE as any);
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq({ llmModel: AW }), res);
+    expect(res.statusCode).toBe(200);
+    await flushImmediates();
+    expect(mockWorker.runInWorker).toHaveBeenCalledTimes(2);
+    expect(workerCall(1)).toMatchObject({ llmModel: ROUTED_CHAT, modelRouting: STAMP });
+    expect(store.get().llmModel).toBe(AW);
+  });
+
+  it('a rollback mid-chain stops the continuation VISIBLY: nothing runs on the old routed model, the refusal is saved and pushed', async () => {
+    turnOn();
+    storeSession(baseSession(AW, { llmModelSource: 'user' }));
+    mockWorker.runInWorker.mockImplementationOnce(async () => {
+      // The switch goes off while the first turn is running; the continuation that follows must notice.
+      delete mockSettings[AGENTWEB_MODEL_ROUTER_SETTING];
+      agentWebModelRouter.reset();
+      return DEFERRED_MEDIA as any;
+    });
+    await agentModeController.generateResponse(generateReq({ llmModel: AW }), makeRes());
+    await flushImmediates();
+    expect(mockWorker.runInWorker).toHaveBeenCalledTimes(1);
+    const refusals = mockChatbotDb.addMessageToSession.mock.calls
+      .map((c) => c[1] as any)
+      .filter((m) => m?.metadata?.isErrorMessage);
+    expect(refusals).toEqual([expect.objectContaining({ role: 'assistant', content: AW_UNAVAILABLE })]);
+  });
+
+  it('a concrete selection\'s continuation still runs that model, unstamped (unchanged)', async () => {
+    storeSession(baseSession(OTHER, { llmModelSource: 'user' }));
+    mockWorker.runInWorker.mockResolvedValueOnce(DEFERRED_MEDIA as any).mockResolvedValueOnce(DONE as any);
+    await agentModeController.generateResponse(generateReq({ llmModel: OTHER }), makeRes());
+    await flushImmediates();
+    expect(mockWorker.runInWorker).toHaveBeenCalledTimes(2);
+    expect(workerCall(1).llmModel).toBe(OTHER);
+    expect(workerCall(1).modelRouting).toBeUndefined();
+  });
+});
+
+describe('approval-inbox resume on an unservable AgentWeb Model selection', () => {
+  const refusalsSaved = () => mockChatbotDb.addMessageToSession.mock.calls
+    .map((c) => c[1] as any)
+    .filter((m) => m?.metadata?.isErrorMessage);
+
+  it.each([
+    ['the switch is off', () => { turnOn(); delete mockSettings[AGENTWEB_MODEL_ROUTER_SETTING]; agentWebModelRouter.reset(); }],
+    ['the router is unavailable', () => turnOn('{not json')],
+  ])('%s: nothing runs, and the visible refusal is saved (not only a passive note)', async (_label, setUp) => {
+    setUp();
+    storeSession(baseSession(AW, { llmModelSource: 'user' }));
+    (mockChatbotDb as any).getChatSessionRecord.mockResolvedValue(baseSession(AW));
+    await resumeOriginSession(SESSION_ID, 'Approved: send the email');
+    expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+    expect(refusalsSaved()).toEqual([expect.objectContaining({ role: 'assistant', content: AW_UNAVAILABLE })]);
+  });
+
+  it('switch-off parity for other models: a retired stored model still gets only the passive note', async () => {
+    storeSession(baseSession('retired-model-9', { llmModelSource: 'user' }));
+    (mockChatbotDb as any).getChatSessionRecord.mockResolvedValue(baseSession('retired-model-9'));
+    await resumeOriginSession(SESSION_ID, 'Approved: send the email');
+    expect(refusalsSaved()).toEqual([]);
+  });
+});
