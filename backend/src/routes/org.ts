@@ -9,7 +9,6 @@ import crypto from "crypto";
 import { isCompanyEmail } from "../utils/validation";
 import { getUserSubscriptionResolution, getUserSubscriptionType, getTierConfig } from "../services/subscriptionService";
 import { redactAccountSecrets } from "../utils/accountSecretRedaction";
-import { releaseNumberOfDeletedOrg } from "../services/voice/numberProvisioning";
 import { omit } from "../utils/omit";
 import { purchaseExtraSeat, removeExtraSeat } from "../services/orgSeatBillingService";
 import {
@@ -1186,6 +1185,9 @@ router.delete("/:orgId", async (req: Request, res: Response) => {
 
     // Delete the org
     await orgDb.deleteOrg(orgId);
+    // Loaded here, not at the top: the number provisioning chain reaches the Twilio and Secrets Manager clients, which the
+    // org routes (and every test that mounts them) should not load unless an organization is actually deleted.
+    const { releaseNumberOfDeletedOrg } = await import("../services/voice/numberProvisioning");
     await releaseNumberOfDeletedOrg(org);
 
     return res.json({ success: true, message: "Organization deleted" });
