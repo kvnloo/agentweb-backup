@@ -1043,6 +1043,10 @@ export const getAccountByIdConsistent = async (
  * the instance that took the connection.
  */
 const HUBSPOT_PORTAL_MAP_TTL_MS = 5 * 60 * 1000;
+// A miss on a snapshot older than this rebuilds once: a portal connected on another instance is then
+// found within seconds, not minutes (the webhook handler drops events for an unknown portal).
+const HUBSPOT_PORTAL_MISS_REFRESH_MS = 30 * 1000;
+let hubspotPortalMapGeneration = 0;
 type HubSpotPortalMap = { byPortal: Map<unknown, string>; at: number };
 let hubspotPortalMap: HubSpotPortalMap | null = null;
 let hubspotPortalMapInflight: Promise<HubSpotPortalMap> | null = null;
@@ -1050,11 +1054,15 @@ let hubspotPortalMapInflight: Promise<HubSpotPortalMap> | null = null;
 /** Drops the portal -> user snapshot (tests; a new HubSpot connection on this instance). */
 export const clearHubSpotPortalCache = (): void => {
   hubspotPortalMap = null;
+  // A rebuild already reading users must not publish its pre-change view after this clear.
+  hubspotPortalMapGeneration++;
+  hubspotPortalMapInflight = null;
 };
 
 const loadHubSpotPortalMap = (): Promise<HubSpotPortalMap> => {
   if (!hubspotPortalMapInflight) {
-    hubspotPortalMapInflight = (async () => {
+    const generation = hubspotPortalMapGeneration;
+    const inflight = (async () => {
       const { userDb } = await import('./db');
       const users = await userDb.getAllUsers();
       const byPortal = new Map<unknown, string>();
@@ -1072,11 +1080,13 @@ const loadHubSpotPortalMap = (): Promise<HubSpotPortalMap> => {
         }
       }
       const snapshot = { byPortal, at: Date.now() };
-      hubspotPortalMap = snapshot;
+      // Only publish if nothing cleared the cache while we were reading.
+      if (generation === hubspotPortalMapGeneration) hubspotPortalMap = snapshot;
       return snapshot;
     })().finally(() => {
-      hubspotPortalMapInflight = null;
+      if (hubspotPortalMapInflight === inflight) hubspotPortalMapInflight = null;
     });
+    hubspotPortalMapInflight = inflight;
   }
   return hubspotPortalMapInflight;
 };
@@ -1084,7 +1094,9 @@ const loadHubSpotPortalMap = (): Promise<HubSpotPortalMap> => {
 export const getUserIdByHubSpotPortalId = async (portalId: number): Promise<string | null> => {
   const cached = hubspotPortalMap;
   if (cached && Date.now() - cached.at < HUBSPOT_PORTAL_MAP_TTL_MS) {
-    return cached.byPortal.get(portalId) ?? null;
+    const hit = cached.byPortal.get(portalId);
+    if (hit !== undefined || Date.now() - cached.at < HUBSPOT_PORTAL_MISS_REFRESH_MS) return hit ?? null;
+    // A miss on a snapshot older than the refresh age falls through to one shared rebuild.
   }
   try {
     return (await loadHubSpotPortalMap()).byPortal.get(portalId) ?? null;
