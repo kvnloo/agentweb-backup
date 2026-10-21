@@ -120,6 +120,35 @@ describe('judgeTaskSuccess', () => {
     expect(await judgeTaskSuccess({ trace: emailRun() }, { llm: fakeLlm(text) })).toMatchObject({ status: 'ok', verdict: 'pass', checklist: ['a {nested} item'] });
   });
 
+  it('returns promptly for a reply that starts with "{" but never closes, and says it hit the output limit', async () => {
+    // Regression: the old scan looped forever once it reached the '{' at index 0.
+    const item = (i: number) => `"step ${i}: DELIVERED, update_record {\\"id\\":${i},\\"f\\":{\\"a\\":1}} ok"`;
+    const text = `{"checklist": [${Array.from({ length: 500 }, (_, i) => item(i)).join(', ')}, "step`;
+    const llm: RubricJudgeLlm = { complete: async () => ({ text, usage: { inputTokens: 100, outputTokens: 3_000 } }) };
+    const started = Date.now();
+    const result = await judgeTaskSuccess({ trace: emailRun() }, { llm });
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(result).toMatchObject({ status: 'error', reason: expect.stringMatching(/no JSON object.*3000-token output limit/) });
+  });
+
+  it('reads the verdict when a checklist item quotes braces and escaped quotes', async () => {
+    const text = '{"checklist":["update_record {\\"id\\":1} } ok","x"],"reason":"Done.","verdict":"pass"}';
+    expect(await judgeTaskSuccess({ trace: emailRun() }, { llm: fakeLlm(text) })).toMatchObject({ status: 'ok', verdict: 'pass' });
+  });
+
+  it.each([
+    ['an unclosed brace and quote in prose before the JSON', 'Note { the agent wrote "draft.\nFinal: {"checklist":["a"],"reason":"r","verdict":"pass"}'],
+    ['a half-quoted object in prose before the JSON', 'The tool returned {"status: ok} earlier.\n{"checklist":["a"],"reason":"r","verdict":"pass"}'],
+    ['60 nested objects in the checklist', `{"checklist":[${Array.from({ length: 60 }, (_, i) => `{"item":${i},"ok":true}`).join(',')}],"reason":"r","verdict":"pass"}`],
+  ])('reads the verdict despite %s', async (_, text) => {
+    expect(await judgeTaskSuccess({ trace: emailRun() }, { llm: fakeLlm(text) })).toMatchObject({ status: 'ok', verdict: 'pass' });
+  });
+
+  it('takes the last verdict object when the reply has two', async () => {
+    const text = 'Draft: {"reason":"First pass.","verdict":"pass"}\nFinal: {"reason":"The email failed.","verdict":"fail"}';
+    expect(await judgeTaskSuccess({ trace: emailRun() }, { llm: fakeLlm(text) })).toMatchObject({ status: 'ok', verdict: 'fail' });
+  });
+
   it('returns an error when the LLM call throws', async () => {
     const llm: RubricJudgeLlm = { complete: async () => { throw new Error('timeout'); } };
     expect(await judgeTaskSuccess({ trace: emailRun() }, { llm })).toMatchObject({ status: 'error', reason: 'LLM call failed: timeout' });
