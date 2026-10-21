@@ -517,7 +517,10 @@ export class HubSpotService {
     if (!this._userId || !this._accountId) {
       throw new Error('Cannot refresh: OAuth context missing on this instance.');
     }
-    const { account } = await resolveHubSpotAccount(this._userId, this._accountId);
+    // This instance is bound to its account's OWNER (see create). Re-resolve against that owner's own
+    // record only: if the owner has since removed the account, a teammate's shared copy of the same
+    // portal must not be picked up, because the refreshed tokens are written back to this._userId.
+    const { account } = await resolveHubSpotAccount(this._userId, this._accountId, 'own');
     const config = account.config as any;
     if (!config.refresh_token) {
       throw new Error('HubSpot access token expired and no refresh token is available. Please reconnect your HubSpot account.');
