@@ -3,13 +3,14 @@ import {
   judgeTaskSuccess,
   labelTaskSuccess,
   renderTraceForJudge,
+  taskSuccessModelProblem,
   TASK_SUCCESS_JUDGE_PROMPT,
   TASK_SUCCESS_JUDGE_VERSION,
   TASK_SUCCESS_LABELLER_PROMPT,
 } from '../services/taskSuccessJudge';
 import type { RubricJudgeLlm, RubricJudgeLlmRequest } from '../services/creativeRubricJudge';
 import { defaultGoldenCaseGraders, taskSuccessJudgeGrader } from '../loops/eval/runValidation';
-import { parseTrialArgs } from '../scripts/runTaskSuccessJudgeTrial';
+import { openRouterCallCostUsd, parseTrialArgs } from '../scripts/runTaskSuccessJudgeTrial';
 import type { GoldenCase } from '../loops/eval/goldenSet';
 
 let index = 0;
@@ -181,7 +182,7 @@ describe('labelTaskSuccess', () => {
   it('labels with the rubric-only prompt on GPT-5.4 by default, with room for reasoning', async () => {
     const llm = fakeLlm('{"reason":"The email never went out.","verdict":"fail"}');
     expect(await labelTaskSuccess({ trace: emailRun() }, { llm })).toMatchObject({ status: 'ok', verdict: 'fail', model: 'gpt-5.4' });
-    expect(llm.requests[0]).toMatchObject({ model: 'gpt-5.4', system: TASK_SUCCESS_LABELLER_PROMPT, maxTokens: 16_000 });
+    expect(llm.requests[0]).toMatchObject({ model: 'gpt-5.4', system: TASK_SUCCESS_LABELLER_PROMPT, maxTokens: 16_000, timeoutMs: 300_000 });
     expect(TASK_SUCCESS_LABELLER_PROMPT).not.toContain('checklist');
   });
 
@@ -191,6 +192,23 @@ describe('labelTaskSuccess', () => {
       expect(await labelTaskSuccess({ trace: emailRun() }, { llm, model })).toMatchObject({ status: 'error', reason: expect.stringMatching(/outside the judge's/) });
     }
     expect(llm.requests).toHaveLength(0);
+  });
+
+  it('checks a model for either role without a call, so the trial can refuse it up front', () => {
+    expect(taskSuccessModelProblem('anthropic.claude-sonnet-5', 'judge')).toBeUndefined();
+    expect(taskSuccessModelProblem('gpt-5.4', 'judge')).toMatch(/not a registered Claude model/);
+    expect(taskSuccessModelProblem('gpt-5.4', 'labeller')).toBeUndefined();
+    expect(taskSuccessModelProblem('openai/gpt-5.2', 'labeller')).toMatch(/registered model outside/);
+  });
+});
+
+describe('openRouterCallCostUsd', () => {
+  it("counts OpenRouter's charge, plus the upstream cost on our own provider key", () => {
+    expect(openRouterCallCostUsd({ usage: { cost: 0.02 } })).toBe(0.02);
+    expect(openRouterCallCostUsd({ usage: { cost: 0.001, cost_details: { upstream_inference_cost: 0.02 } }, openrouter_metadata: { is_byok: true } })).toBeCloseTo(0.021);
+    expect(openRouterCallCostUsd({ usage: { cost: 0, cost_details: { upstream_inference_cost: 0.02 } } })).toBe(0.02);
+    expect(openRouterCallCostUsd({ usage: {} })).toBeUndefined();
+    expect(openRouterCallCostUsd({})).toBeUndefined();
   });
 });
 
