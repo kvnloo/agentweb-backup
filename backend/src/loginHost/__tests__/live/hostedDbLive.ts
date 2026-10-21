@@ -50,6 +50,19 @@ async function main() {
   check("mark-revoked-twice", !(await db.hostedMarkRevoked(ids[0], NOW)));
   check("row-revoked", (await db.get(ids[0]))?.status === "revoked");
   const hostedList = (await db.listHosted()).map((r) => r.connectionId);
+  const dc = new AWS.DynamoDB.DocumentClient({ region: process.env.AWS_REGION || "us-west-2" });
+  const counter = async () => ((await dc.get({ TableName: LLM_CONNECTIONS_TABLE, Key: { connectionId: `limit#${OWNER}` } }).promise()).Item?.activeCount as number | undefined) ?? -1;
+  check("counter-two-slots", (await counter()) === 2);
+  check("release-slot", (await db.hostedReleaseSlot(ids[0], OWNER)) === "released");
+  check("release-slot-twice", (await db.hostedReleaseSlot(ids[0], OWNER)) === "already");
+  check("counter-after-release", (await counter()) === 1, `count=${await counter()}`);
+  check("release-flag-set", (await db.get(ids[0]))?.subSlotReleased === true);
+  check("release-not-hosted-row", (await db.hostedReleaseSlot(ids[2], OWNER)) === "already" && (await counter()) === 1);
+  check("reconnect-keeps-disabled", await (async () => {
+    await db.hostedAdvanceEpoch(ids[1], 1, 2, NOW);
+    const ok = await db.hostedMarkReconnected(ids[1], 2, { status: "disabled" }, NOW);
+    return ok && (await db.get(ids[1]))?.status === "disabled";
+  })());
   check("list-hosted", hostedList.includes(ids[0]) && hostedList.includes(ids[1]) && !hostedList.includes(ids[2]));
 }
 

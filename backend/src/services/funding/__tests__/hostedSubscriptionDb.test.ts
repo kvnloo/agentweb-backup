@@ -139,3 +139,38 @@ describe("revoke attempts and listing", () => {
     expect((await db.listHosted()).map((r) => r.connectionId)).toEqual(["h-1"]);
   });
 });
+
+describe("hostedReleaseSlot", () => {
+  const counter = (dynamo: ReturnType<typeof makeDb>["dynamo"]) => dynamo.items("AW-LlmConnections" as never).find((r) => r.connectionId === "limit#user-1")?.activeCount;
+
+  it("gives the slot back exactly once, flag and counter in one transaction", async () => {
+    const { db, dynamo } = makeDb();
+    expect(await db.createWithinLimit(hosted(), 10)).toBe(true);
+    expect(await db.createWithinLimit(hosted({ connectionId: "h-2" }), 10)).toBe(true);
+    expect(counter(dynamo)).toBe(2);
+    expect(await db.hostedReleaseSlot("h-1", "user-1")).toBe("released");
+    expect(await db.hostedReleaseSlot("h-1", "user-1")).toBe("already");
+    expect(counter(dynamo)).toBe(1);
+    expect((await db.get("h-1"))!.subSlotReleased).toBe(true);
+    expect((await db.get("h-2"))!.subSlotReleased).toBeUndefined();
+  });
+
+  it("with the counter already at zero it only records the release", async () => {
+    const { db, dynamo } = makeDb();
+    await db.createWithinLimit(hosted(), 10);
+    await db.releaseSlot("user-1");
+    expect(counter(dynamo)).toBe(0);
+    expect(await db.hostedReleaseSlot("h-1", "user-1")).toBe("released");
+    expect(counter(dynamo)).toBe(0);
+    expect((await db.get("h-1"))!.subSlotReleased).toBe(true);
+  });
+
+  it("never touches the counter for an old sealed row or a missing row", async () => {
+    const { db, dynamo } = makeDb();
+    await db.createWithinLimit(hosted(), 10);
+    await db.create(hosted({ connectionId: "b3", subHosted: undefined }));
+    expect(await db.hostedReleaseSlot("b3", "user-1")).toBe("already");
+    expect(await db.hostedReleaseSlot("nope", "user-1")).toBe("already");
+    expect(counter(dynamo)).toBe(1);
+  });
+});

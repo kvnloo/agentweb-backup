@@ -115,6 +115,8 @@ export interface LlmConnectionRecord {
   /** Non-secret account id the provider offers without reading tokens. */
   subAccountFingerprint?: string;
   subRevokeStartedAt?: string;
+  /** Set in the SAME transaction that gives the owner's slot back, so the slot is returned exactly once however often a disconnect is retried. */
+  subSlotReleased?: boolean;
   subRevokeAttempts?: number;
   subLastRevokeAttemptAt?: string;
 }
@@ -529,6 +531,57 @@ export class LlmConnectionDb {
     return { result: "contended", epoch: next };
   }
 
+  /**
+   * Gives the owner's slot back for a disconnecting hosted login, exactly once: the row's `subSlotReleased` flag and the counter
+   * decrement are ONE transaction, so a crash or a failed call between "revoking" and the release cannot leak the slot, and a retry
+   * (or the sweeper) cannot release it twice.
+   */
+  async hostedReleaseSlot(connectionId: string, ownerUserId: string): Promise<"released" | "already"> {
+    try {
+      await this.client
+        .transactWrite({
+          TransactItems: [
+            {
+              Update: {
+                TableName: LLM_CONNECTIONS_TABLE,
+                Key: { connectionId },
+                UpdateExpression: "SET #rel = :t",
+                ConditionExpression: "attribute_exists(connectionId) AND #hosted = :t AND attribute_not_exists(#rel)",
+                ExpressionAttributeNames: { "#rel": "subSlotReleased", "#hosted": "subHosted" },
+                ExpressionAttributeValues: { ":t": true },
+              },
+            },
+            {
+              Update: {
+                TableName: LLM_CONNECTIONS_TABLE,
+                Key: { connectionId: slotCounterKey(ownerUserId) },
+                UpdateExpression: "SET activeCount = activeCount - :one",
+                ConditionExpression: "attribute_exists(activeCount) AND activeCount > :zero",
+                ExpressionAttributeValues: { ":one": 1, ":zero": 0 },
+              },
+            },
+          ],
+        })
+        .promise();
+      return "released";
+    } catch (err) {
+      const reasons = (err as { code?: string; CancellationReasons?: { Code?: string }[] })?.CancellationReasons;
+      if ((err as { code?: string })?.code === "TransactionCanceledException" && Array.isArray(reasons)) {
+        if (reasons[0]?.Code === "ConditionalCheckFailed") return "already"; // flag already set (or not a hosted row): nothing to give back
+        if (reasons[1]?.Code === "ConditionalCheckFailed") {
+          // The counter is already at zero or missing: nothing to decrement, but record that this row's release is done.
+          await this.subUpdate(connectionId, {
+            update: "SET subSlotReleased = :t",
+            condition: "attribute_exists(connectionId) AND subHosted = :t AND attribute_not_exists(subSlotReleased)",
+            values: { ":t": true },
+          });
+          return "released";
+        }
+      }
+      throw err;
+    }
+  }
+
   /** The login host confirmed the wipe (or never had the home). Only moves `revoking` -> `revoked`. */
   async hostedMarkRevoked(connectionId: string, nowIso: string): Promise<boolean> {
     return this.subUpdate(connectionId, {
@@ -574,9 +627,10 @@ export class LlmConnectionDb {
   }
 
   /** Reconnect step 3: the host promoted the new login at `epoch`. */
-  async hostedMarkReconnected(connectionId: string, epoch: number, ready: { plan?: string; refreshExpiresAtMs?: number; fingerprint?: string }, nowIso: string): Promise<boolean> {
-    const sets = ["#status = :active", "subNeedsReconnect = :no", "updatedAt = :now"];
-    const values: Record<string, unknown> = { ":active": "active", ":no": false, ":now": nowIso, ":e": epoch, ":yes": true, ":invalid": "invalid", ":expired": "expired" };
+  async hostedMarkReconnected(connectionId: string, epoch: number, ready: { plan?: string; refreshExpiresAtMs?: number; fingerprint?: string; status?: "active" | "disabled" }, nowIso: string): Promise<boolean> {
+    // `status`: a host that deliberately keeps a replaced login disabled (an operator did that) stays disabled in the record too.
+    const sets = ["#status = :target", "subNeedsReconnect = :no", "updatedAt = :now"];
+    const values: Record<string, unknown> = { ":target": ready.status ?? "active", ":active": "active", ":no": false, ":now": nowIso, ":e": epoch, ":yes": true, ":invalid": "invalid", ":expired": "expired" };
     if (ready.plan) {
       sets.push("subType = :type");
       values[":type"] = ready.plan;

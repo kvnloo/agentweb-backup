@@ -211,6 +211,25 @@ describe("hosted subscription service", () => {
       expect((await store.db.get(view.connectionId))!.subHostEpoch).toBe(3);
     });
 
+    it("a store failure after the code was spent cancels the ready attempt, so the owner can sign in again at once", async () => {
+      const view = await connect();
+      const spy = jest.spyOn(store.db, "hostedAdvanceEpoch").mockRejectedValueOnce(new Error("dynamo blip"));
+      const started = await svc.startLogin(user, "claude", { reconnectConnectionId: view.connectionId });
+      await expect(svc.completeLogin(user, started.loginId, GOOD)).rejects.toThrow("dynamo blip");
+      spy.mockRestore();
+      const again = await svc.startLogin(user, "claude", { reconnectConnectionId: view.connectionId });
+      expect(await svc.completeLogin(user, again.loginId, GOOD)).toMatchObject({ status: "active" });
+    });
+
+    it("a host that keeps the replaced login disabled is accepted as a successful reconnect and the record stays disabled", async () => {
+      const view = await connect();
+      await rig.mgr.disable({ connectionId: view.connectionId, epoch: 1 });
+      const started = await svc.startLogin(user, "claude", { reconnectConnectionId: view.connectionId });
+      const after = await svc.completeLogin(user, started.loginId, GOOD);
+      expect(after.status).toBe("disabled");
+      expect((await store.db.get(view.connectionId))!).toMatchObject({ status: "disabled", subHostEpoch: 2, subNeedsReconnect: false });
+    });
+
     it("cannot reconnect someone else's, a revoking, or a non-hosted connection", async () => {
       const view = await connect();
       expect(await codeOf(svc.startLogin({ userId: "user-2" }, "claude", { reconnectConnectionId: view.connectionId }))).toBe("not_found");
@@ -317,6 +336,20 @@ describe("hosted subscription service", () => {
       jest.restoreAllMocks();
       expect((await svc.sweepOnce()).revoked).toBe(1); // the next pass completes it
       expect((await store.db.get(view.connectionId))!.status).toBe("revoked");
+    });
+
+    it("a failed slot release leaves the row revoking, never revoked; a retry or the sweeper gives the slot back exactly once", async () => {
+      const view = await connect();
+      const spy = jest.spyOn(store.db, "hostedReleaseSlot").mockRejectedValueOnce(new Error("dynamo blip"));
+      await expect(svc.revokeRecord(user, view.connectionId)).rejects.toThrow("dynamo blip");
+      expect((await store.db.get(view.connectionId))!.status).toBe("revoking");
+      expect(slots()).toBe(1);
+      expect((await svc.sweepOnce()).revoked).toBe(1); // the sweeper releases the slot, then finishes the wipe
+      spy.mockRestore();
+      expect(slots()).toBe(0);
+      expect((await store.db.get(view.connectionId))!).toMatchObject({ status: "revoked", subSlotReleased: true });
+      expect(await svc.revokeRecord(user, view.connectionId)).toBe("revoked");
+      expect(slots()).toBe(0);
     });
 
     it("raises an alarm once a disconnect has failed REVOKE_ALARM_ATTEMPTS passes", async () => {
@@ -438,6 +471,15 @@ describe("hosted subscription service", () => {
       await svc.sweepOnce();
       expect(spy).toHaveBeenCalledWith(view.connectionId, 1, "host_lost", expect.any(String), row.updatedAt);
       spy.mockRestore();
+    });
+
+    it("heals a record flagged by a lost final write when the host is serving it at the same epoch", async () => {
+      const view = await connect();
+      pastGrace();
+      await store.db.hostedMarkNeedsReconnect(view.connectionId, 1, "reconnect_write_lost", new Date(nowMs).toISOString());
+      pastGrace();
+      await svc.sweepOnce();
+      expect((await store.db.get(view.connectionId))!).toMatchObject({ status: "active", subNeedsReconnect: false });
     });
 
     it("an unreachable host changes nothing", async () => {

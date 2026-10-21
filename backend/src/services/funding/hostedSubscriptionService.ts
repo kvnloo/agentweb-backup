@@ -268,7 +268,7 @@ export class HostedSubscriptionService {
       await client.loginCancel({ connectionId, loginRef }).catch(() => undefined);
       throw new HostedSubscriptionError("limit_reached");
     }
-    if (!(await this.promote(client, connectionId, loginRef, 1))) {
+    if ((await this.promote(client, connectionId, loginRef, 1)) !== "active") {
       // A record with no home: put it through the normal disconnect so the slot is freed and the host cleans up.
       await this.revokeRecord(actor, connectionId).catch(() => undefined);
       throw new HostedSubscriptionError("host_unavailable");
@@ -280,25 +280,33 @@ export class HostedSubscriptionService {
   }
 
   private async finishReconnect(actor: Actor, p: HostedProvider, client: LoginHostClient, connectionId: string, loginRef: string, ready: { planLabel?: string; accountFingerprint?: string; refreshExpiresAtMs?: number }): Promise<LlmConnectionView> {
-    const current = await this.deps.db.get(connectionId);
-    if (!current || current.ownerUserId !== actor.userId || current.subHosted !== true || current.revokedAt || current.status === "revoking") {
-      await client.loginCancel({ connectionId, loginRef }).catch(() => undefined);
-      throw new HostedSubscriptionError("not_found");
+    let epoch: number;
+    try {
+      const current = await this.deps.db.get(connectionId);
+      if (!current || current.ownerUserId !== actor.userId || current.subHosted !== true || current.revokedAt || current.status === "revoking") {
+        await client.loginCancel({ connectionId, loginRef }).catch(() => undefined);
+        throw new HostedSubscriptionError("not_found");
+      }
+      epoch = current.subHostEpoch ?? 1;
+      // The record moves first: it must never be behind the host.
+      if (!(await this.deps.db.hostedAdvanceEpoch(connectionId, epoch, epoch + 1, this.nowIso()))) {
+        await client.loginCancel({ connectionId, loginRef }).catch(() => undefined);
+        throw new HostedSubscriptionError("busy");
+      }
+    } catch (err) {
+      // A store failure before the promote: the code is spent, so the ready attempt must not linger and block the next sign-in.
+      if (!(err instanceof HostedSubscriptionError)) await client.loginCancel({ connectionId, loginRef }).catch(() => undefined);
+      throw err;
     }
-    const epoch = current.subHostEpoch ?? 1;
-    // The record moves first: it must never be behind the host.
-    if (!(await this.deps.db.hostedAdvanceEpoch(connectionId, epoch, epoch + 1, this.nowIso()))) {
-      await client.loginCancel({ connectionId, loginRef }).catch(() => undefined);
-      throw new HostedSubscriptionError("busy");
-    }
-    if (!(await this.promote(client, connectionId, loginRef, epoch + 1))) {
+    const promoted = await this.promote(client, connectionId, loginRef, epoch + 1);
+    if (!promoted) {
       // The host keeps the ready attempt after a failed swap, and a new sign-in is refused while it exists: discard it (the owner
       // signs in again). If the promote in fact completed, there is no attempt left and this is a no-op.
       await client.loginCancel({ connectionId, loginRef }).catch(() => undefined);
       await this.deps.db.hostedMarkNeedsReconnect(connectionId, epoch + 1, "promote_failed", this.nowIso());
       throw new HostedSubscriptionError("host_unavailable");
     }
-    if (!(await this.deps.db.hostedMarkReconnected(connectionId, epoch + 1, { plan: ready.planLabel, refreshExpiresAtMs: ready.refreshExpiresAtMs, fingerprint: ready.accountFingerprint }, this.nowIso()))) {
+    if (!(await this.deps.db.hostedMarkReconnected(connectionId, epoch + 1, { plan: ready.planLabel, refreshExpiresAtMs: ready.refreshExpiresAtMs, fingerprint: ready.accountFingerprint, status: promoted }, this.nowIso()))) {
       console.error(`[hosted-subscription] reconnect applied on the host but the record moved on connection=${connectionId}`);
     }
     console.log(`[hosted-subscription] reconnected connection=${connectionId} epoch=${epoch + 1}`);
@@ -306,13 +314,13 @@ export class HostedSubscriptionService {
   }
 
   /** `login.promote` is idempotent for the same login and epoch, so a lost reply is simply asked again. */
-  private async promote(client: LoginHostClient, connectionId: string, loginRef: string, epoch: number): Promise<boolean> {
+  private async promote(client: LoginHostClient, connectionId: string, loginRef: string, epoch: number): Promise<"active" | "disabled" | false> {
     const sleep = this.deps.sleep ?? realSleep;
     let lastAmbiguous = false;
     for (let i = 0; i < PROMOTE_ATTEMPTS; i++) {
       try {
         const r = await client.loginPromote({ connectionId, loginRef, epoch });
-        return r.state === "active" && r.epoch === epoch;
+        return (r.state === "active" || r.state === "disabled") && r.epoch === epoch ? r.state : false;
       } catch (err) {
         // Definite refusals (stale, revoked, gone) will not change by asking again.
         if (err instanceof LoginHostError && !err.ambiguous && !err.busy && err.code !== "EINTERNAL") return false;
@@ -324,7 +332,7 @@ export class HostedSubscriptionService {
       // The last answers were lost, not refused: the promote may have landed. Ask the host before costing the owner another sign-in.
       try {
         const st = await client.connectionStatus({ connectionId });
-        return st.state === "active" && st.epoch === epoch;
+        return (st.state === "active" || st.state === "disabled") && st.epoch === epoch ? st.state : false;
       } catch {
         /* still unknown: treated as failed */
       }
@@ -371,8 +379,9 @@ export class HostedSubscriptionService {
     const began = await this.deps.db.hostedBeginRevoke(connectionId, (current.subHostEpoch ?? 0) + 1, { userId: actor.userId, adminId: actor.adminId }, this.nowIso());
     if (began.result === "missing" || began.result === "not_hosted") throw new HostedSubscriptionError("not_found");
     if (began.result === "contended") throw new HostedSubscriptionError("busy"); // the record kept moving under us: nothing was changed, try again
-    // Only the call that started the revoke owned that slot.
-    if (began.result === "started") await this.deps.db.releaseSlot(current.ownerUserId);
+    // Idempotent and atomic with the row's flag: a retry after a failed release gives the slot back, a repeat never gives it back twice.
+    // A failure here leaves the row `revoking`; the caller (or the sweeper) retries before anything is marked revoked.
+    await this.deps.db.hostedReleaseSlot(connectionId, current.ownerUserId);
     return (await this.finishRevoke(connectionId, began.epoch)) === "revoked" ? "revoked" : "revoking";
   }
 
@@ -433,6 +442,7 @@ export class HostedSubscriptionService {
       try {
         if (r.status === "revoking") {
           out.revoking++;
+          await this.deps.db.hostedReleaseSlot(r.connectionId, r.ownerUserId); // heals a release that failed or was lost to a crash
           const res = await this.finishRevoke(r.connectionId, r.subHostEpoch ?? 1);
           if (res === "host_down") out.hostUnavailable = true;
           if (res === "revoked") out.revoked++;
@@ -467,10 +477,14 @@ export class HostedSubscriptionService {
       // The host retired this login without us (e.g. an operator). Checked BEFORE the "already waiting for the owner" shortcut:
       // a flagged record on a retired login must still be disconnected so its slot is freed and reconnect stops failing.
       const began = await this.deps.db.hostedBeginRevoke(r.connectionId, Math.max(epoch, st.epoch) + 1, { userId: "host-sweeper" }, this.nowIso());
-      if (began.result === "started") await this.deps.db.releaseSlot(r.ownerUserId);
+      if (began.result === "started" || began.result === "already") await this.deps.db.hostedReleaseSlot(r.connectionId, r.ownerUserId);
       return false;
     }
-    if (r.status === "invalid" && r.subNeedsReconnect) return false; // already waiting for the owner
+    if (r.status === "invalid" && r.subNeedsReconnect) {
+      // Flagged, but the host serves it at this very epoch: a reconnect whose final record write was lost. Make the record follow the host.
+      if (st.state === "active" && st.epoch === epoch) await this.deps.db.hostedMarkReconnected(r.connectionId, epoch, {}, this.nowIso());
+      return false; // otherwise: already waiting for the owner
+    }
     if (st.epoch !== epoch) return this.markLost(r, epoch, "epoch_mismatch");
     if (st.state === "needs_reconnect" || st.state === "needs_attention") return this.markLost(r, epoch, st.reason ?? st.state);
     return false;
