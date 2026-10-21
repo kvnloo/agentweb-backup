@@ -21,6 +21,7 @@ import { LlmConnectionDb, type LlmConnectionRecord } from "./llmConnectionDb";
 import { MAX_ACTIVE_CONNECTIONS_PER_OWNER, toView, type Actor, type LlmConnectionView } from "./llmConnectionService";
 import type { LoginReady } from "../../loginHost/connectionManager";
 import { LoginHostClient, LoginHostError, UnixSocketTransport } from "./loginHostClient";
+import { getLoginHostProvider } from "./loginHostProvider";
 
 export type HostedErrorCode =
   | "disabled" | "forbidden" | "not_found" | "unsupported_provider" | "login_not_found" | "too_many_logins" | "bad_code_format"
@@ -496,10 +497,15 @@ export class HostedSubscriptionService {
   }
 }
 
-/** The host client for this deployment: only the test environment has one for now (socket bind-mounted into the backend container). */
+/**
+ * The host client for this deployment: the test environment's unix socket (bind-mounted into the backend container) when
+ * AW_LOGIN_HOST_SOCKET is set; otherwise the production worker over mutual TLS (address from AW-Settings, certificate from Secrets
+ * Manager), which is undefined until configured and loaded (every call then answers `host_unavailable`).
+ */
 function defaultClient(): LoginHostClient | undefined {
   const socket = process.env.AW_LOGIN_HOST_SOCKET;
-  return socket ? new LoginHostClient(new UnixSocketTransport(socket)) : undefined;
+  if (socket) return new LoginHostClient(new UnixSocketTransport(socket));
+  return getLoginHostProvider().client();
 }
 
 let defaultService: HostedSubscriptionService | null = null;
