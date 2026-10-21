@@ -78,11 +78,12 @@ export function parseTrialArgs(raw: string[]): TrialArgs {
  * codingAgentService). Undefined when the response reports no cost.
  */
 export function openRouterCallCostUsd(res: { usage?: unknown; openrouter_metadata?: { is_byok?: unknown } }): number | undefined {
-  const usage = res.usage as { cost?: unknown; cost_details?: { upstream_inference_cost?: unknown } } | undefined;
+  const usage = res.usage as { cost?: unknown; is_byok?: unknown; cost_details?: { upstream_inference_cost?: unknown } } | undefined;
   const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : undefined);
   const gateway = num(usage?.cost);
   const upstream = num(usage?.cost_details?.upstream_inference_cost);
-  const byok = res.openrouter_metadata?.is_byok === true || (gateway === 0 && (upstream ?? 0) > 0);
+  // OpenRouter flags BYOK in the usage block; the routing-metadata block (opt-in) carries it too.
+  const byok = usage?.is_byok === true || res.openrouter_metadata?.is_byok === true || (gateway === 0 && (upstream ?? 0) > 0);
   // On our own key without an upstream cost, what the provider billed is unknown, not zero.
   if (byok) return upstream === undefined ? undefined : (gateway ?? 0) + upstream;
   return gateway;
