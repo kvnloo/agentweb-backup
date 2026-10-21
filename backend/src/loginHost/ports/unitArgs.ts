@@ -40,6 +40,13 @@ export interface UnitPaths {
   env: string;
   /** Extra paths made inaccessible inside every unit (e.g. the host's own socket directory). */
   inaccessible: string[];
+  /**
+   * Network isolation (PR 2). When set, the unit gets its OWN network namespace (loopback only: no route anywhere, its own abstract
+   * unix sockets) and the host's egress-proxy socket directory read-only at /run/aw-egress; the process is started through `launcher`,
+   * which runs `socat` (a loopback TCP port -> the proxy socket) and exports the proxy environment. Absent = the shared host
+   * network (only for unit tests of the older shape; the host's config makes it mandatory).
+   */
+  net?: { dir: string; launcher: string; socat: string };
 }
 
 const SIZE = /^[1-9][0-9]{0,6}[KMG]$/;
@@ -89,6 +96,15 @@ export function unitProperties(layout: Layout, spec: UnitSpec, limits: UnitLimit
     "InaccessiblePaths=-/var/run/docker.sock",
     ...paths.inaccessible.map((p) => `InaccessiblePaths=-${assertAbsPath(p)}`),
     "IPAddressDeny=169.254.169.254 fd00:ec2::254",
+    ...(paths.net
+      ? [
+          // Own network namespace: loopback only, no route out, no shared abstract unix sockets with other customers.
+          "PrivateNetwork=yes",
+          // /run is replaced by an empty read-only tmpfs so no host socket is even visible; only the egress proxy socket directory is bound in.
+          "TemporaryFileSystem=/run:ro",
+          `BindReadOnlyPaths=${assertAbsPath(paths.net.dir)}:/run/aw-egress`,
+        ]
+      : []),
     `MemoryMax=${limits.memoryMax}`,
     `TasksMax=${limits.tasksMax}`,
     `RuntimeMaxSec=${limits.runtimeMaxSec}`,
@@ -131,6 +147,7 @@ export function systemRunArgs(layout: Layout, spec: UnitSpec, limits: UnitLimits
     "--",
     paths.env,
     `--chdir=${spec.cwd}`,
+    ...(paths.net ? [assertAbsPath(paths.net.launcher), assertAbsPath(paths.net.socat)] : []),
     spec.file,
     ...spec.args,
   ];

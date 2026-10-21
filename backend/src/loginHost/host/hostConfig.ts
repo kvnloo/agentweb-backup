@@ -68,6 +68,18 @@ const schema = z
         basePath: z.string().regex(/^[A-Za-z0-9._/:-]{1,200}$/).optional(),
       })
       .strict(),
+    /**
+     * Network isolation (PR 2): every customer unit runs with PrivateNetwork=yes (loopback only) and reaches the world ONLY through the
+     * host's allowlisting proxy over a unix socket. `allow` is the complete list of `host:port` targets a customer process may reach
+     * (the Emma tool bridge from `claude.bridgeUrl` is added automatically). There is no default: a host with no policy does not start.
+     */
+    egress: z
+      .object({
+        allow: z.array(z.string().regex(/^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?:[0-9]{1,5}$/, "lowercase host:port")).min(1).max(50),
+        launcherPath: absPath.default("/opt/aw-login-host/aw-net.sh"),
+        socat: absPath.default("/usr/bin/socat"),
+      })
+      .strict(),
     tools: z
       .object({
         systemRun: absPath.default("/usr/bin/systemd-run"),
@@ -84,7 +96,7 @@ const schema = z
   })
   .strict();
 
-export type HostConfig = z.infer<typeof schema> & { stateRoot: string; socketPath: string };
+export type HostConfig = z.infer<typeof schema> & { stateRoot: string; socketPath: string; egressDir: string; egressSocketPath: string };
 
 export class HostConfigError extends Error {
   constructor(readonly reason: string) {
@@ -106,7 +118,13 @@ export function parseHostConfig(raw: unknown): HostConfig {
   } catch (e) {
     throw new HostConfigError(e instanceof LayoutError ? e.reason : "path invalid");
   }
-  return { ...c, stateRoot, socketPath: `${c.socket.dir}/host.sock` };
+  for (const t of c.egress.allow) {
+    const port = Number(t.slice(t.lastIndexOf(":") + 1));
+    if (!Number.isInteger(port) || port < 1 || port > 65535) throw new HostConfigError(`egress.allow: bad port in ${t}`);
+    if (/^[0-9.]+:/.test(t) || t.startsWith("[")) throw new HostConfigError(`egress.allow: literal IP targets are not allowed (${t})`);
+  }
+  const egressDir = `/run/aw-egress-${c.env}`;
+  return { ...c, stateRoot, socketPath: `${c.socket.dir}/host.sock`, egressDir, egressSocketPath: `${egressDir}/proxy.sock` };
 }
 
 /** Parses /etc/subuid ("name:start:count" lines): the host's uid range must not overlap any of them. */
