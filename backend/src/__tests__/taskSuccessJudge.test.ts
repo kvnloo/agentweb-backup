@@ -124,11 +124,11 @@ describe('judgeTaskSuccess', () => {
     // Regression: the old scan looped forever once it reached the '{' at index 0.
     const item = (i: number) => `"step ${i}: DELIVERED, update_record {\\"id\\":${i},\\"f\\":{\\"a\\":1}} ok"`;
     const text = `{"checklist": [${Array.from({ length: 500 }, (_, i) => item(i)).join(', ')}, "step`;
-    const llm: RubricJudgeLlm = { complete: async () => ({ text, usage: { inputTokens: 100, outputTokens: 3_000 } }) };
+    const llm: RubricJudgeLlm = { complete: async () => ({ text, usage: { inputTokens: 100, outputTokens: 6_000 } }) };
     const started = Date.now();
     const result = await judgeTaskSuccess({ trace: emailRun() }, { llm });
     expect(Date.now() - started).toBeLessThan(1_000);
-    expect(result).toMatchObject({ status: 'error', reason: expect.stringMatching(/no JSON object.*3000-token output limit/) });
+    expect(result).toMatchObject({ status: 'error', reason: expect.stringMatching(/no JSON object.*6000-token output limit/) });
   });
 
   it('reads the verdict when a checklist item quotes braces and escaped quotes', async () => {
