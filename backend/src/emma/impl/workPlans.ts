@@ -547,9 +547,13 @@ export async function applyPredefinedWorkPlan(
         () => isUserAdminSafe(userId),
         predefinedPlan.defaultModel,
         tierOwner,
+        // ENG-669 PR-C: an admin plan's AgentWeb Model pin must still route for the launching user's tier.
+        userId || undefined,
       );
       if (stepModelsEnabled) {
-        stepModelIds = await resolvePlanStepModelsForLaunch(modelRegistry, () => isUserAdminSafe(userId), predefinedPlan.steps || [], tierOwner);
+        stepModelIds = await resolvePlanStepModelsForLaunch(
+          modelRegistry, () => isUserAdminSafe(userId), predefinedPlan.steps || [], tierOwner, userId || undefined,
+        );
       }
     } catch (launchModelError) {
       const stepError = isStepModelUnavailableError(launchModelError) ? launchModelError : undefined;

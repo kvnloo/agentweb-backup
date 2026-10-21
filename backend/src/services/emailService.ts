@@ -71,7 +71,11 @@ export type EmailSendOutcome = 'sent' | 'suppressed' | 'failed';
  */
 export type ScheduledRunFailureNotice =
   | { failedAttempts: number; failureClass: 'budget' | 'transient' | 'system' }
-  | { failureClass: 'model_unavailable'; modelLabel: string; reason: ModelUnavailableReason };
+  | {
+      failureClass: 'model_unavailable'; modelLabel: string; reason: ModelUnavailableReason;
+      /** ENG-669 PR-C: the saved model is the AgentWeb Model and the router is unavailable right now (not "gone"). */
+      routerUnavailable?: boolean;
+    };
 
 const EMPTY_RUN_DIGEST_PLACEHOLDER = '(This run produced no report content.)';
 
@@ -1027,7 +1031,7 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
     if (opts.failureClass === 'model_unavailable') {
       await this.sendModelUnavailableNoticeEmail(
         toEmails,
-        buildScheduleModelNotice({ scheduleName, modelLabel: opts.modelLabel, reason: opts.reason }),
+        buildScheduleModelNotice({ scheduleName, modelLabel: opts.modelLabel, reason: opts.reason, routerUnavailable: opts.routerUnavailable }),
         `schedule ${scheduleId}`,
       );
       return;
@@ -1123,6 +1127,8 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
       stepCount: number;
       modelLabel: string;
       reason: ModelUnavailableReason;
+      /** ENG-669 PR-C: the step is on the AgentWeb Model and its router is unavailable right now. */
+      routerUnavailable?: boolean;
       scheduleName?: string | null;
       sessionTitle?: string | null;
     },

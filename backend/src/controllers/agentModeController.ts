@@ -94,7 +94,7 @@ import {
   type BindingSource, type SystemModelSession,
 } from '../services/agentMode/modelAccessInstance';
 import {
-  AGENTWEB_MODEL_DISPLAY_NAME, AGENTWEB_MODEL_ID, isAgentWebModelId, messageRoutingOf, routingFieldsOf, selectionOf, type AgentWebTaskType, type MessageModelRouting, type ModelRouting,
+  AGENTWEB_MODEL_DISPLAY_NAME, AGENTWEB_MODEL_ID, isAgentWebModelId, messageRoutingOf, routingFieldsOf, storedModelFor, type AgentWebTaskType, type MessageModelRouting, type ModelRouting,
 } from '../services/agentMode/agentWebModelRouter';
 import {
   agentWebModelRouter, assertAgentWebModelSelectable, offersAgentWebModel, routeAgentWebModelSelection,
@@ -442,21 +442,26 @@ export async function resolveEffectiveModelForUser(rawInput: {
   // the router picks the concrete model for the task, and that model is resolved below as AgentWeb's choice (exempt
   // from the tier check as a pick, never silently swapped: an unavailable router or routed model is a visible 422).
   // No backup and no fallback: the routed model runs or the turn errors. A paused account keeps its plain 'blocked'
-  // decision (nothing runs, nothing is routed). Switch off: the id is an unknown model, exactly as before (only the
-  // cached switch is read, and only for this id).
+  // decision (nothing runs, nothing is routed). Switch off: an EXPLICIT selection is an unknown model, exactly as before
+  // (only the cached switch is read, and only for this id); a STORED one (left by a rollback) is refused visibly rather
+  // than "corrected" to the default, and the stored selection is left as it is.
   let routing: ModelRouting | undefined;
   let input = rawInput;
-  if (isAgentWebModelId(rawInput.requestedModel) && usage.mode.usageMode !== 'paused' && await agentWebModelRouter.isEnabled()) {
-    const routed = await routeAgentWebModelSelection({
-      ownerUserId: rawInput.userId,
-      session: rawInput.session,
-      taskType: rawInput.taskType,
-      modelSource: rawInput.modelSource,
-    });
-    routing = { routedVia: AGENTWEB_MODEL_ID, routingReason: routed.reason, tableVersion: routed.tableVersion };
-    input = {
-      ...rawInput, requestedModel: routed.model, backupModel: null, backupSource: null, allowSilentSwap: false, modelSource: 'system',
-    };
+  if (isAgentWebModelId(rawInput.requestedModel) && usage.mode.usageMode !== 'paused') {
+    if (await agentWebModelRouter.isEnabled()) {
+      const routed = await routeAgentWebModelSelection({
+        ownerUserId: rawInput.userId,
+        session: rawInput.session,
+        taskType: rawInput.taskType,
+        modelSource: rawInput.modelSource,
+      });
+      routing = { routedVia: AGENTWEB_MODEL_ID, routingReason: routed.reason, tableVersion: routed.tableVersion };
+      input = {
+        ...rawInput, requestedModel: routed.model, backupModel: null, backupSource: null, allowSilentSwap: false, modelSource: 'system',
+      };
+    } else if (rawInput.allowSilentSwap) {
+      throw new ModelUnavailableError(AGENTWEB_MODEL_ID, 'not_served');
+    }
   }
   // Older controller unit tests intentionally use partial service doubles.
   // The runtime service always has these methods; the identity fallbacks keep
@@ -655,6 +660,16 @@ export function modelUnavailableBody(err: ModelUnavailableError, audience: Model
   return buildModelUnavailableBody(err, displayName, 'selection', audience);
 }
 
+/**
+ * The customer-facing name of a model id, sanitized: the AgentWeb Model's display name (it is not a registry model, and
+ * customers never see the raw id), else the registry name, else the id itself.
+ */
+function modelDisplayLabel(modelId: string): string {
+  if (isAgentWebModelId(modelId)) return AGENTWEB_MODEL_DISPLAY_NAME;
+  const display = typeof agentModeService.getModelDisplayName === 'function' ? agentModeService.getModelDisplayName(modelId) : undefined;
+  return sanitizeModelLabel(display || modelId);
+}
+
 /** ENG-669: refusals already saved to the chat, keyed by the error, so a caller never saves (or emits) one twice. */
 const recordedRefusals = new WeakMap<ModelUnavailableError, { content: string; messageIndex?: number }>();
 
@@ -702,6 +717,15 @@ async function validateScheduleModelPin(userId: string, raw: unknown): Promise<s
   // ENG-669: `userId` is the schedule OWNER (every caller enforces ownership first), whose plan the
   // pin runs under, so a pin outside that plan is refused now (422 not_in_plan), not at run time.
   return validateModelPin(agentModeService, () => isUserAdmin(userId), raw, userId);
+}
+
+/**
+ * ENG-669 PR-C: a schedule's BACKUP model is always one concrete model (the AgentWeb Model is a per-turn router, never a
+ * backup), so a backup of `agentweb-model` is refused like an unselectable model, with the switch on or off.
+ */
+async function validateScheduleBackupPin(userId: string, raw: unknown): Promise<string> {
+  if (isAgentWebModelId(raw)) throw new ModelUnavailableError(AGENTWEB_MODEL_ID, 'not_selectable');
+  return validateScheduleModelPin(userId, raw);
 }
 
 async function resolveScheduleBackup(input: {
@@ -2145,7 +2169,7 @@ type WorkPlanStepModelTurn =
     }
   | { kind: 'restored'; decision: ResolvedStepDecision; source: ModelSource }
   | { kind: 'restoreFailed' }
-  | { kind: 'unavailable'; stepCount: number; model: string; label: string; reason: ModelUnavailableReason };
+  | { kind: 'unavailable'; stepCount: number; model: string; label: string; reason: ModelUnavailableReason; routerUnavailable?: boolean };
 
 async function resolveWorkPlanStepModelForTurn(
   session: SystemModelSession & { userId: string; llmModel?: string; workPlan?: any },
@@ -2237,12 +2261,20 @@ async function resolveWorkPlanStepModelForTurn(
       // follows the new step model, so the stamp is the engine's own from here on).
       const decision = await resolveHonored(pick, stepCount, 'user');
       // ENG-669 PR-C: the step adopts the SELECTION (a pick of the AgentWeb Model stays the router on that step).
-      return { kind: 'resolved', stepCount, decision, source: 'user', ...(ownModel && { updateStepModelTo: selectionOf(decision) }) };
+      return { kind: 'resolved', stepCount, decision, source: 'user', ...(ownModel && { updateStepModelTo: storedModelFor(decision, decision.effectiveModel) }) };
     }
     const display = typeof agentModeService.getModelDisplayName === 'function'
       ? agentModeService.getModelDisplayName(modelError.requestedModel)
       : undefined;
-    return { kind: 'unavailable', stepCount, model: candidate, label: sanitizeModelLabel(display || candidate), reason: modelError.reason };
+    // ENG-669 PR-C: a step on the AgentWeb Model is named by its display name, and an unavailable router is "unavailable
+    // right now", not a model that is gone.
+    const routerUnavailable = isAgentWebModelId(candidate) && modelError.reason !== 'not_in_plan';
+    return {
+      kind: 'unavailable', stepCount, model: candidate,
+      label: isAgentWebModelId(candidate) ? AGENTWEB_MODEL_DISPLAY_NAME : sanitizeModelLabel(display || candidate),
+      reason: modelError.reason,
+      ...(routerUnavailable && { routerUnavailable: true }),
+    };
   }
 }
 
@@ -2276,6 +2308,7 @@ async function notifyOwnerOfStepModelPause(
       stepCount: turn.stepCount,
       modelLabel: turn.label,
       reason: turn.reason,
+      ...(turn.routerUnavailable && { routerUnavailable: true }),
       scheduleName: ownSchedule?.scheduleName,
       sessionTitle: session?.title,
     });
@@ -2302,7 +2335,7 @@ async function pauseWorkPlanForUnavailableStepModel(
   turn: Extract<WorkPlanStepModelTurn, { kind: 'unavailable' }>,
   options: { emitToUser: boolean; unattended?: boolean },
 ): Promise<{ content: string; message?: any }> {
-  const content = buildStepModelPausedMessage(turn.stepCount, turn.label, turn.reason);
+  const content = buildStepModelPausedMessage(turn.stepCount, turn.label, turn.reason, turn.routerUnavailable);
   const session = await chatbotDb.getChatSession(sessionId);
   const last = session?.messages?.[session.messages.length - 1];
   const lastMeta = last?.metadata as any;
@@ -2339,7 +2372,9 @@ async function pauseWorkPlanForUnavailableStepModel(
   }
   if (notifyOwner) await notifyOwnerOfStepModelPause(sessionId, session, userId, turn);
   // ENG-669: a step model outside the owner's plan is the plan limit working as configured, not a fault: no page.
-  if (turn.reason === 'not_in_plan') return { content, message };
+  // ENG-669 PR-C: nor a step on an unavailable AgentWeb Model router (its own deduped alert covers a broken table; a
+  // switch-off is a deliberate rollback), so one fault never pages once per session.
+  if (turn.reason === 'not_in_plan' || turn.routerUnavailable) return { content, message };
   await sendAgentModeOncallAlert({
     subject: 'AgentMode: Work Plan paused - a step\'s model is no longer available',
     message:
@@ -4788,9 +4823,10 @@ async function runVerifiedChatInner(
     // this run. Passed through to the tool dispatcher so confirm=true edits of
     // the wrong source are rejected before execution.
     approvedRevisionImageSources?: string[];
-    // Admission decision snapshot used only for post-dispatch audit correction.
-    // Passing it explicitly avoids consulting the session object loaded before the
-    // caller's admission write (legacy sessions may not have a prior stamp).
+    // Admission decision snapshot for `llmModel`. Passing it explicitly avoids consulting the session object loaded
+    // before the caller's admission write (legacy sessions may not have a prior stamp). ENG-669 PR-C: also the only
+    // source of the AgentWeb Model routing provenance stamped on this run's replies (a decision for another model, e.g.
+    // after a task-type override, stamps nothing).
     modelPolicyDecisionForAudit?: EffectiveModelPolicyDecision;
   }
 ): Promise<RunVerifiedChatResult> {
@@ -5272,7 +5308,9 @@ async function runVerifiedChatInner(
           undefined, undefined, // approvalDeckAnswerMeta, approvalDeckCancelledMeta — not a deck reply
           // ENG-2072: propagate this run's unattended status into the continuation
           // turn's tool-dispatch context, same as the main attempt below.
-          isUnattendedRun
+          isUnattendedRun,
+          undefined, // explicitModelPick
+          params.modelPolicyDecisionForAudit, // ENG-669 PR-C: routing provenance on the replies
         );
         if (continuationResponse.content) {
           allContent += (allContent ? '\n\n' : '') + continuationResponse.content;
@@ -5409,7 +5447,9 @@ async function runVerifiedChatInner(
         // ENG-2072: true only for runScheduledChat's call (and the "Test run" path
         // that shares it); false for the interactive verifiedGenerate endpoint —
         // see ToolContext.isUnattendedRun.
-        isUnattendedRun
+        isUnattendedRun,
+        undefined, // explicitModelPick
+        params.modelPolicyDecisionForAudit, // ENG-669 PR-C: routing provenance on the replies
       );
 
       if (!hasAssistantOutput(response)) {
@@ -7122,12 +7162,17 @@ export async function runScheduledChat(
       if (!isModelUnavailableError(modelError)) throw modelError;
       const pinnedLabel = sanitizeModelLabel(modelError.requestedModel);
       const reasonText = describeModelUnavailableReason(modelError.reason);
+      // ENG-669 PR-C: a pin of the AgentWeb Model refused as unavailable is the ROUTER being unavailable (switched off,
+      // or its table broken for everyone / this plan / this task), not a model this schedule chose badly: say so, and
+      // do not page per schedule (the router's own deduped alert already covers a broken table; a switch-off is a
+      // deliberate rollback).
+      const routerUnavailable = isAgentWebModelId(modelError.requestedModel) && modelError.reason !== 'not_in_plan';
       console.error(
-        `runScheduledChat: schedule ${schedule.scheduleId} not run — pinned model "${pinnedLabel}" is ${reasonText}.`,
+        `runScheduledChat: schedule ${schedule.scheduleId} not run — pinned model "${pinnedLabel}" is ${routerUnavailable ? 'unavailable (the AgentWeb Model router is off or unavailable)' : reasonText}.`,
       );
       // ENG-669: a pin outside the owner's plan is the plan limit working as configured, not a
       // fault, so it fails the run visibly (below) without paging on-call.
-      if (modelError.reason !== 'not_in_plan') void sendAgentModeOncallAlert({
+      if (modelError.reason !== 'not_in_plan' && !routerUnavailable) void sendAgentModeOncallAlert({
         subject: 'AgentMode: unsupported model pinned on a scheduled chat',
         message:
           `Schedule "${schedule.scheduleName}" (${schedule.scheduleId}) pins model "${pinnedLabel}", which is ` +
@@ -7150,9 +7195,11 @@ export async function runScheduledChat(
         runId: preGeneratedRunId || require('uuid').v4(),
         status: 'failure' as const,
         passed: false,
-        actualResponse: modelError.reason === 'not_in_plan'
-          ? `model_unavailable: pinned model "${pinnedLabel}" is ${reasonText} — choose a model your plan includes for this schedule, or upgrade the plan`
-          : `model_unavailable: pinned model "${pinnedLabel}" is ${reasonText} — choose a served model for this schedule`,
+        actualResponse: routerUnavailable
+          ? `model_unavailable: ${AGENTWEB_MODEL_DISPLAY_NAME} is unavailable right now — choose another model for this schedule, or try again later`
+          : modelError.reason === 'not_in_plan'
+            ? `model_unavailable: pinned model "${modelDisplayLabel(modelError.requestedModel)}" is ${reasonText} — choose a model your plan includes for this schedule, or upgrade the plan`
+            : `model_unavailable: pinned model "${pinnedLabel}" is ${reasonText} — choose a served model for this schedule`,
         actualFunctionCalls: [],
         keywordMatches: [],
         keywordMisses: schedule.keywords || [],
@@ -7178,13 +7225,11 @@ export async function runScheduledChat(
         }
         const current = freshSchedule || schedule;
         if (isNewScheduleModelBlock(current.runResults, modelBlock)) {
-          const display = typeof agentModeService.getModelDisplayName === 'function'
-            ? agentModeService.getModelDisplayName(modelError.requestedModel)
-            : undefined;
           await notifyScheduleOwnerOfFailure(current, userId, {
             failureClass: 'model_unavailable',
-            modelLabel: sanitizeModelLabel(display || modelError.requestedModel),
+            modelLabel: modelDisplayLabel(modelError.requestedModel),
             reason: modelBlock.blockedReason,
+            ...(routerUnavailable && { routerUnavailable: true }),
           });
         }
       }
@@ -7520,7 +7565,7 @@ export async function runScheduledChat(
       sessionId,
       // ENG-669 PR-C: the run's session keeps the schedule's SELECTION (`agentweb-model` when routed); `modelToUse`
       // (the routed model) is what runs.
-      selectionOf(scheduleModelPolicy) as string,
+      storedModelFor(scheduleModelPolicy, modelToUse),
       toStoredModelPolicyDecision(scheduleModelPolicy),
       // ENG-669: an unpinned schedule (or one pinned by an admin-authored template) runs AgentWeb's choice.
       scheduleRunsSystemModel ? 'system' : 'user',
@@ -9377,6 +9422,10 @@ export async function generateSessionResponse(
   // session's stored stamp; the portal echoes the stamp otherwise). Overrides an UNAVAILABLE pending step model and
   // wins on a step with no model; never overrides an available step model.
   explicitModelPick?: string,
+  // ENG-669 PR-C: the decision the CALLER resolved for `llmModel` this turn. When it routed the AgentWeb Model to
+  // `llmModel`, the replies carry the selection and why; otherwise (or omitted) nothing is stamped. Never read back
+  // from the session's stored decision, which may describe an earlier turn.
+  turnModelDecision?: EffectiveModelPolicyDecision,
 ): Promise<{
   content: string;
   toolCalls: any[];
@@ -9434,15 +9483,15 @@ export async function generateSessionResponse(
   // to the concrete `llm`). A caller that runs the stored selection without the resolver (Slack and other transports,
   // Emma email, approval resumes, GTM turns, continuations) passes `agentweb-model` itself: it is routed here, before
   // anything is persisted. With the switch off it is refused like an unknown explicit model (never run on another).
-  // A caller that resolved first passes the routed model and recorded the routed decision on the session just before.
+  // A caller that resolved first passes the routed model with its own decision (`turnModelDecision`).
   let turnRouting: MessageModelRouting | undefined;
   if (isAgentWebModelId(llmModel)) {
     if (!(await agentWebModelRouter.isEnabled())) throw new ModelUnavailableError(AGENTWEB_MODEL_ID, 'not_served');
     const routed = await routeAgentWebModelSelection({ ownerUserId: session.userId, session });
     llmModel = routed.model;
     turnRouting = { llmSelected: AGENTWEB_MODEL_ID, llmRoutingReason: routed.reason, llmRoutingTableVersion: routed.tableVersion };
-  } else if (isAgentWebModelId(session.llmModel)) {
-    turnRouting = messageRoutingOf(session.llmUsagePolicyDecision, llmModel);
+  } else {
+    turnRouting = messageRoutingOf(turnModelDecision, llmModel);
   }
   // Some server-side callers (notably Slack) resume a persisted delegated
   // session without carrying the HTTP request's delegation flag. Preserve the
@@ -9732,7 +9781,7 @@ export async function generateSessionResponse(
     // ENG-669 PR-C: what the session and the engine's markers record is the SELECTION (`agentweb-model` for a routed
     // step), never the routed model: the stamp then still equals the engine's own marker on the next turn, so a routed
     // step is never mistaken for a user's pick of the concrete model. A routed decision is re-recorded every turn.
-    const stepSelection = selectionOf(stepModelTurn.decision);
+    const stepSelection = storedModelFor(stepModelTurn.decision, llmModel);
     if (updatedSession.llmModel !== stepSelection || stepModelTurn.decision.routedVia) {
       await chatbotDb.updateSessionLlmModel(sessionId, stepSelection, toStoredModelPolicyDecision(stepModelTurn.decision), stepModelTurn.source);
     }
@@ -10260,7 +10309,7 @@ export const agentModeController = {
         // Creating a session itself spends nothing. A paused account can still
         // open/read the session; provider admission remains blocked on send.
         // ENG-669 PR-C: the SELECTION is stored (a routed AgentWeb Model stays `agentweb-model`; each turn routes).
-        if (initialModelPolicy.effectiveModel) modelToUse = selectionOf(initialModelPolicy) as string;
+        if (initialModelPolicy.effectiveModel) modelToUse = storedModelFor(initialModelPolicy, initialModelPolicy.effectiveModel);
       }
       const welcomeMessage = skill?.welcomeMessage?.trim();
       // ENG-1107 Greptile P1: when a skill carries an openingAction, the
@@ -11056,7 +11105,7 @@ export const agentModeController = {
       }
       const modelToUse = modelPolicyDecision.effectiveModel;
       // ENG-669 PR-C: the session keeps the SELECTION (`agentweb-model` when routed); `modelToUse` is what runs.
-      const selectedModel = selectionOf(modelPolicyDecision) as string;
+      const selectedModel = storedModelFor(modelPolicyDecision, modelToUse);
       await chatbotDb.updateSessionLlmModel(
         sessionId,
         selectedModel,
@@ -11140,6 +11189,7 @@ export const agentModeController = {
         // ENG-2378: an explicit model pick = a request model that differs from the stored stamp (the portal echoes the stamp).
         // ENG-669 PR-C: the pick is the selection (the engine routes an AgentWeb Model pick itself).
         explicitModelSelection && selectedModel !== session.llmModel ? selectedModel : undefined,
+        modelPolicyDecision, // ENG-669 PR-C: this turn's decision (routing provenance on the replies)
       );
 
       let response: Awaited<ReturnType<typeof generateSessionResponse>>;
@@ -12549,7 +12599,7 @@ export const agentModeController = {
       const modelToUse = modelPolicyDecision.effectiveModel;
       if (typeof chatbotDb.updateSessionLlmModel === 'function') {
         // ENG-669 PR-C: the session keeps the SELECTION (`agentweb-model` when routed); `modelToUse` is what runs.
-        const selectedModel = selectionOf(modelPolicyDecision) as string;
+        const selectedModel = storedModelFor(modelPolicyDecision, modelToUse);
         await chatbotDb.updateSessionLlmModel(
           session.sessionId,
           selectedModel,
@@ -12596,6 +12646,8 @@ export const agentModeController = {
           // ENG-2072: a real person (the share-link viewer) is typing this turn —
           // never fall back to session.sessionType here either.
           false,
+          undefined, // explicitModelPick: the viewer picks nothing
+          modelPolicyDecision, // ENG-669 PR-C: this turn's decision (routing provenance on the replies)
         ),
         session.sessionId
       );
@@ -14065,7 +14117,7 @@ export const agentModeController = {
 
       // ENG-903: refuse an unservable/unselectable model pin at write time (422), not at run time.
       const validatedLlmModel = await validateScheduleModelPin(user.userId, llmModel);
-      const validatedBackupModel = await validateScheduleModelPin(user.userId, llmBackupModel);
+      const validatedBackupModel = await validateScheduleBackupPin(user.userId, llmBackupModel);
 
       // Create scheduled chat using the existing scheduleDb
       const scheduleId = require('uuid').v4();
@@ -14388,7 +14440,7 @@ export const agentModeController = {
       const backupUnchanged = requestedBackupWasProvided && incomingBackup !== '' && incomingBackup === String(existingBackupFields.llmBackupModel).trim();
       let scheduleBackup: Awaited<ReturnType<typeof resolveScheduleBackup>> = existingBackupFields;
       if (requestedBackupWasProvided && !backupUnchanged) {
-        const validatedBackup = await validateScheduleModelPin(user.userId, llmBackupModel);
+        const validatedBackup = await validateScheduleBackupPin(user.userId, llmBackupModel);
         scheduleBackup = await resolveScheduleBackup({ userId: user.userId, requestedBackupModel: validatedBackup });
       } else if (backupUnchanged) {
         // Same as before the retirement: keep refreshing source as before when still valid,
@@ -16120,8 +16172,8 @@ export const agentModeController = {
         return res.status(422).json(modelUnavailableBody(modelError, 'share_viewer'));
       }
       const modelToUse = conversablePolicy.effectiveModel || session.llmModel || defaultModel;
-      // ENG-669 PR-C: a routed turn records its decision (the session keeps the selection) so the reply carries
-      // which model the AgentWeb Model ran and why. Other turns write nothing here, as before.
+      // ENG-669 PR-C: a routed turn records its decision on the session (which model the AgentWeb Model ran and why;
+      // the session keeps the selection). Other turns write nothing here, as before.
       if (conversablePolicy.routedVia && conversablePolicy.effectiveModel) {
         await chatbotDb.updateSessionLlmModel(
           session.sessionId,
@@ -16146,7 +16198,11 @@ export const agentModeController = {
         userMessage,
         session.userId, // Use the original session owner's userId
         modelToUse,
-        attachments
+        attachments,
+        undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+        undefined, undefined, undefined, undefined, undefined,
+        undefined, // explicitModelPick: the visitor picks nothing
+        conversablePolicy, // ENG-669 PR-C: this turn's decision (routing provenance on the replies)
       );
 
       markProgressComplete(session.sessionId);
@@ -16471,9 +16527,10 @@ export const agentModeController = {
         // ENG-669: an admin-authored plan's pins are AgentWeb's choice (no tier check); any other plan's pins must be
         // in the LAUNCHING user's plan (an anonymous visitor: the Free tier's).
         const tierOwner = isSystemAuthoredPlan(predefinedPlan) ? undefined : userId;
-        planPinnedModel = await resolvePlanLaunchModel(agentModeService, isLauncherAdmin, predefinedPlan.defaultModel, tierOwner);
+        // ENG-669 PR-C: an admin plan's AgentWeb Model pin must still route for the LAUNCHER's tier (refused now, visibly).
+        planPinnedModel = await resolvePlanLaunchModel(agentModeService, isLauncherAdmin, predefinedPlan.defaultModel, tierOwner, userId);
         if (stepModelsEnabled) {
-          stepModelIds = await resolvePlanStepModelsForLaunch(agentModeService, isLauncherAdmin, predefinedPlan.steps || [], tierOwner);
+          stepModelIds = await resolvePlanStepModelsForLaunch(agentModeService, isLauncherAdmin, predefinedPlan.steps || [], tierOwner, userId);
         }
       } catch (launchModelError) {
         const stepError = isStepModelUnavailableError(launchModelError) ? launchModelError : undefined;
@@ -17010,6 +17067,7 @@ export const agentModeController = {
       // 409 / 429 leaves the stored model untouched.
       const explicitModel = normalizeRequestedLlmModel(req.body?.llmModel);
       let selectedModel: string | undefined;
+      let selectedModelDecision: EffectiveModelPolicyDecision | undefined;
       let persistSelectedModel: (() => Promise<void>) | undefined;
       const requestedModel = explicitModel || session.llmModel;
       if (requestedModel) {
@@ -17026,9 +17084,10 @@ export const agentModeController = {
           return res.status(422).json(modelUnavailableBody(modelError));
         }
         selectedModel = modelDecision.effectiveModel || session.llmModel || undefined;
+        selectedModelDecision = modelDecision;
         // ENG-669 PR-C: the session keeps the SELECTION (`agentweb-model` when routed), with the routed decision
         // recorded every turn (the routed model can change with the table); `selectedModel` above is what runs.
-        const storedSelection = modelDecision.effectiveModel ? selectionOf(modelDecision) : null;
+        const storedSelection = modelDecision.effectiveModel ? storedModelFor(modelDecision, modelDecision.effectiveModel) : null;
         if (storedSelection && (modelDecision.modelSelection === 'corrected' || modelDecision.routedVia || storedSelection !== session.llmModel)) {
           persistSelectedModel = async () => {
             await chatbotDb.updateSessionLlmModel(
@@ -17076,6 +17135,7 @@ export const agentModeController = {
         maxAttempts: maxAttemptsParam || 5,
         attachments: attachmentsArray,
         llmModel: selectedModel,
+        ...(selectedModelDecision && { modelPolicyDecisionForAudit: selectedModelDecision }),
         // ENG-636: interactive endpoint — the user's live session renders the
         // deck-of-one card, so a park reaches a human who can answer.
         parkNotifiable: true,
@@ -17776,7 +17836,7 @@ export const agentModeController = {
       // ENG-903: an explicit per-use override is validated like a direct create. The template's
       // own stored llmModel is deliberately not re-validated here (see dev note).
       const validatedOverrideModel = await validateScheduleModelPin(user.userId, overrideModel);
-      const validatedOverrideBackup = await validateScheduleModelPin(user.userId, overrideBackupModel);
+      const validatedOverrideBackup = await validateScheduleBackupPin(user.userId, overrideBackupModel);
       // ENG-669: a pin INHERITED from the template. An admin-authored (system) template's pin is AgentWeb's choice:
       // recorded as such on the schedule, so its runs are exempt from the tier model allowlist. A user-authored
       // template's pin becomes this user's pin, so it must be in their plan: refused now (422), not at every run.

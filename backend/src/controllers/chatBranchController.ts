@@ -42,7 +42,7 @@ import {
   parseBranchRateLimit,
 } from '../services/agentMode/chatBranching';
 import { v4 as uuidv4 } from 'uuid';
-import { selectionOf } from '../services/agentMode/agentWebModelRouter';
+import { storedModelFor } from '../services/agentMode/agentWebModelRouter';
 
 /**
  * Feature flag, AW-Settings (prod Elastic Beanstalk is at the env-var size limit, and a settings
@@ -133,7 +133,9 @@ function branchDeps(): BranchDeps {
           session,
         });
         // ENG-669 PR-C: the branch keeps the SELECTION (a routed AgentWeb Model stays `agentweb-model`).
-        const model = selectionOf(decision) ?? (await agentModeService.getDefaultModel());
+        const model = decision.effectiveModel
+          ? storedModelFor(decision, decision.effectiveModel)
+          : await agentModeService.getDefaultModel();
         return {
           ok: true,
           model,

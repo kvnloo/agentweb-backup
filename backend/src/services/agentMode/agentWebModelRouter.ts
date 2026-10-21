@@ -115,95 +115,123 @@ const isPlainObject = (value: unknown): value is Record<string, unknown> =>
  * A turn takes the first of: its tier's route for the task type, its tier's default, the table route for the task
  * type, the table default.
  *
- * `errors` (the table cannot be used at all): not an object, unknown keys or task types (a typo must not silently fall
- * through to another rule), no version, no default, a target that is not a non-empty string. `invalidTargets`: targets
- * that are model ids but cannot be routed to (unregistered, `catalog.unsuitable`), keyed by the id as stored, with why;
- * only the routes resolving to one are unavailable. Valid targets are stored canonically (legacy aliases resolved).
+ * Three kinds of problem, each contained as narrowly as it can be:
+ *  - `errors` (the table cannot be used at all): not an object, unknown top-level keys, a `routes` that is not an
+ *    object of known task types, a `tiers` that is not an object, no version, no default, a non-string target in the
+ *    table's own routes or default;
+ *  - `malformedTiers` (tier -> what is wrong): one tier override that is not an object, has unknown keys or task types,
+ *    or a non-string / empty target. Only that tier is unavailable; a typo for one plan never breaks the others;
+ *  - `invalidTargets` (model -> why): a model id that cannot be routed to (unregistered, `catalog.unsuitable`): only the
+ *    routes resolving to it are unavailable.
+ * Valid targets are stored canonically (legacy aliases resolved).
  */
 export function parseRoutingTable(
   raw: unknown,
   catalog: RouterModelCatalog,
-): { ok: true; table: RoutingTable; invalidTargets: Record<string, string> } | { ok: false; errors: string[] } {
-  const errors: string[] = [];
-  const invalidTargets: Record<string, string> = {};
+):
+  | { ok: true; table: RoutingTable; invalidTargets: Record<string, string>; malformedTiers: Record<string, string[]> }
+  | { ok: false; errors: string[] } {
   if (!isPlainObject(raw)) return { ok: false, errors: ['the table must be a JSON object'] };
 
-  const target = (where: string, value: unknown): string | undefined => {
-    if (typeof value !== 'string' || !value.trim()) {
-      errors.push(`${where} must be a model id`);
-      return undefined;
-    }
-    const id = value.trim();
-    const canonical = catalog.canonical(id);
-    if (!canonical) {
-      invalidTargets[id] = 'not a registered model';
-      return id;
-    }
-    const why = catalog.unsuitable(canonical);
-    if (why) invalidTargets[canonical] = why;
-    return canonical;
-  };
-  const routesOf = (where: string, value: unknown): TaskRoutes => {
-    const routes: TaskRoutes = {};
-    if (value === undefined) return routes;
-    if (!isPlainObject(value)) {
-      errors.push(`${where} must be an object of task type -> model`);
-      return routes;
-    }
-    for (const [taskType, model] of Object.entries(value)) {
-      if (!(AGENTWEB_TASK_TYPES as readonly string[]).includes(taskType)) {
-        errors.push(`${where}: unknown task type "${taskType}" (expected one of ${AGENTWEB_TASK_TYPES.join(', ')})`);
-        continue;
+  /** Reads one scope (the table, or one tier override) into its own error and unusable-target sinks. */
+  const reader = (errors: string[], invalidTargets: Record<string, string>) => {
+    const target = (where: string, value: unknown): string | undefined => {
+      if (typeof value !== 'string' || !value.trim()) {
+        errors.push(`${where} must be a model id`);
+        return undefined;
       }
-      const id = target(`${where}.${taskType}`, model);
-      if (id) routes[taskType as AgentWebTaskType] = id;
-    }
-    return routes;
-  };
-  const unknownKeys = (where: string, value: Record<string, unknown>, allowed: string[]) => {
-    for (const key of Object.keys(value)) if (!allowed.includes(key)) errors.push(`${where}: unknown key "${key}"`);
+      const id = value.trim();
+      const canonical = catalog.canonical(id);
+      if (!canonical) {
+        invalidTargets[id] = 'not a registered model';
+        return id;
+      }
+      const why = catalog.unsuitable(canonical);
+      if (why) invalidTargets[canonical] = why;
+      return canonical;
+    };
+    const routesOf = (where: string, value: unknown): TaskRoutes => {
+      const routes: TaskRoutes = {};
+      if (value === undefined) return routes;
+      if (!isPlainObject(value)) {
+        errors.push(`${where} must be an object of task type -> model`);
+        return routes;
+      }
+      for (const [taskType, model] of Object.entries(value)) {
+        if (!(AGENTWEB_TASK_TYPES as readonly string[]).includes(taskType)) {
+          errors.push(`${where}: unknown task type "${taskType}" (expected one of ${AGENTWEB_TASK_TYPES.join(', ')})`);
+          continue;
+        }
+        const id = target(`${where}.${taskType}`, model);
+        if (id) routes[taskType as AgentWebTaskType] = id;
+      }
+      return routes;
+    };
+    const unknownKeys = (where: string, value: Record<string, unknown>, allowed: string[]) => {
+      for (const key of Object.keys(value)) if (!allowed.includes(key)) errors.push(`${where}: unknown key "${key}"`);
+    };
+    return { target, routesOf, unknownKeys };
   };
 
-  unknownKeys('table', raw, ['version', 'default', 'routes', 'tiers']);
+  const errors: string[] = [];
+  const invalidTargets: Record<string, string> = {};
+  const top = reader(errors, invalidTargets);
+  top.unknownKeys('table', raw, ['version', 'default', 'routes', 'tiers']);
   const version = typeof raw.version === 'number' && Number.isFinite(raw.version) ? String(raw.version)
     : typeof raw.version === 'string' ? raw.version.trim() : '';
   if (!version) errors.push('version is required');
-  const fallback = target('default', raw.default);
-  const routes = routesOf('routes', raw.routes);
+  const fallback = top.target('default', raw.default);
+  const routes = top.routesOf('routes', raw.routes);
   const tiers: RoutingTable['tiers'] = {};
+  const malformedTiers: Record<string, string[]> = {};
   if (raw.tiers !== undefined) {
     if (!isPlainObject(raw.tiers)) {
       errors.push('tiers must be an object of tier name -> overrides');
     } else {
       for (const [tierName, override] of Object.entries(raw.tiers)) {
+        const tierErrors: string[] = [];
+        const tierInvalid: Record<string, string> = {};
+        const inTier = reader(tierErrors, tierInvalid);
         if (!isPlainObject(override)) {
-          errors.push(`tiers.${tierName} must be an object`);
+          malformedTiers[tierName] = [`tiers.${tierName} must be an object`];
           continue;
         }
-        unknownKeys(`tiers.${tierName}`, override, ['default', 'routes']);
-        const tierDefault = override.default === undefined ? undefined : target(`tiers.${tierName}.default`, override.default);
-        tiers[tierName] = { ...(tierDefault && { default: tierDefault }), routes: routesOf(`tiers.${tierName}.routes`, override.routes) };
+        inTier.unknownKeys(`tiers.${tierName}`, override, ['default', 'routes']);
+        const tierDefault = override.default === undefined ? undefined : inTier.target(`tiers.${tierName}.default`, override.default);
+        const tierRoutes = inTier.routesOf(`tiers.${tierName}.routes`, override.routes);
+        if (tierErrors.length > 0) {
+          malformedTiers[tierName] = tierErrors;
+          continue;
+        }
+        Object.assign(invalidTargets, tierInvalid);
+        tiers[tierName] = { ...(tierDefault && { default: tierDefault }), routes: tierRoutes };
       }
     }
   }
   if (errors.length > 0 || !fallback) return { ok: false, errors };
-  return { ok: true, table: { version, default: fallback, routes, tiers }, invalidTargets };
+  return { ok: true, table: { version, default: fallback, routes, tiers }, invalidTargets, malformedTiers };
 }
 
-/** The table's model for one turn, and which rule chose it. Pure; never falls past the first matching rule. */
+/**
+ * The table's model for one turn, and which rule chose it. Pure; never falls past the first matching rule. The reason
+ * names the task type and the KIND of rule only ("plan" = the owner's tier override), never a tier name: it is stored
+ * on replies that share viewers can read, and a viewer must not learn the owner's plan (logs carry the tier).
+ */
 export function routeFor(table: RoutingTable, tier: string | null, taskType: AgentWebTaskType): { model: string; reason: string } {
   const override = tier ? table.tiers[tier] : undefined;
-  if (override?.routes[taskType]) return { model: override.routes[taskType]!, reason: `${taskType} task: tier "${tier}" route` };
-  if (override?.default) return { model: override.default, reason: `${taskType} task: tier "${tier}" default` };
+  if (override?.routes[taskType]) return { model: override.routes[taskType]!, reason: `${taskType} task: plan route` };
+  if (override?.default) return { model: override.default, reason: `${taskType} task: plan default` };
   if (table.routes[taskType]) return { model: table.routes[taskType]!, reason: `${taskType} task: table route` };
   return { model: table.default, reason: `${taskType} task: table default` };
 }
 
 /**
- * The tier-allowlist rule, per tier: a tier that may select the router (its allowlist lists `agentweb-model`) must
- * allow every model its routes resolve to. A tier that does not list the router never routes; a wildcard tier allows
- * everything; a route to an invalid target is that route's problem, not the tier's. Returns the tiers that break the
- * rule (tier -> what is wrong) and table issues that affect no tier (an override key naming no configured tier).
+ * The tier-allowlist rule, checked per tier. Only tiers whose allowlist names `agentweb-model` can select the router, so
+ * only they are checked (a wildcard or absent allowlist allows every model, so nothing can fall outside it). For each
+ * such tier, every task type's resolved route must be in its allowlist; a route to an unusable target is skipped here
+ * (that route is refused on its own, see `invalidTargets`), so it never takes the whole tier down. Returns the tiers that
+ * break the rule (tier -> the task -> model pairs outside the plan) and table issues that take nothing down (an override
+ * key that names no configured tier, so it never applies).
  */
 export function checkTiers(
   table: RoutingTable,
@@ -253,7 +281,10 @@ export interface AgentWebModelRouterDeps {
   /** Deduped by the caller-supplied key; must not throw. */
   alert(input: { subject: string; detail: string; dedupeKey: string; dedupeWindowMs: number }): Promise<unknown>;
   now(): number;
+  /** Faults and refusals. */
   log(message: string, fields?: Record<string, unknown>): void;
+  /** Routine information (a table loaded). */
+  info(message: string, fields?: Record<string, unknown>): void;
 }
 
 type TableState =
@@ -316,15 +347,27 @@ export function createAgentWebModelRouter(deps: AgentWebModelRouterDeps) {
       : why === 'unreadable'
         ? `The ${AGENTWEB_MODEL_ROUTING_TABLE_SETTING} setting (or the subscription tiers) could not be read and no table was loaded before.`
         : `The ${AGENTWEB_MODEL_ROUTING_TABLE_SETTING} setting cannot be used:\n- ${(errors ?? []).join('\n- ')}`;
+    lastReport = '';
     deps.log('AgentWebModel: routing table unavailable; every selection of the AgentWeb Model is refused', { why, errors });
     alert('AgentMode: AgentWeb Model router unavailable', `${detail}\n\nThis affects EVERY tier. ${REFUSAL_FOOTER}`, ROUTER_UNAVAILABLE_ALERT_DEDUPE_KEY);
     return { status: 'unavailable', why, ...(errors && { errors }) };
   }
 
-  /** One alert per broken target (naming the routes that use it) and per unavailable tier (naming its models). */
+  /** What the last load reported, so a problem that persists across reloads is logged once (alerts dedupe in the sink). */
+  let lastReport = '';
+
+  /**
+   * One alert per broken target (naming the routes that use it) and per unavailable tier (naming its models). Alerts go
+   * out on every load (the sink dedupes them per hour, so a lasting fault re-pages hourly); logs only when what is
+   * broken changes.
+   */
   function reportPartial(table: RoutingTable, invalidTargets: Record<string, string>, unavailableTiers: Record<string, string>, issues: string[]): void {
+    const report = JSON.stringify([table.version, invalidTargets, unavailableTiers, issues]);
+    const changed = report !== lastReport;
+    lastReport = report;
+    const log = (message: string, fields: Record<string, unknown>) => { if (changed) deps.log(message, fields); };
     for (const [model, why] of Object.entries(invalidTargets)) {
-      deps.log('AgentWebModel: routes to an unusable model are unavailable', { model, why, version: table.version });
+      log('AgentWebModel: routes to an unusable model are unavailable', { model, why, version: table.version });
       alert(
         `AgentMode: AgentWeb Model route target "${model}" unusable`,
         `Routing table ${table.version} routes to "${model}", which cannot be routed to (${why}). Every route that resolves to it ` +
@@ -333,7 +376,7 @@ export function createAgentWebModelRouter(deps: AgentWebModelRouterDeps) {
       );
     }
     for (const [tier, why] of Object.entries(unavailableTiers)) {
-      deps.log('AgentWebModel: router unavailable for a tier', { tier, why, version: table.version });
+      log('AgentWebModel: router unavailable for a tier', { tier, why, version: table.version });
       alert(
         `AgentMode: AgentWeb Model unavailable for tier "${tier}"`,
         `Tier "${tier}" ${why}. The router is unavailable for this tier's owners (routing table ${table.version}); other tiers keep ` +
@@ -342,7 +385,7 @@ export function createAgentWebModelRouter(deps: AgentWebModelRouterDeps) {
       );
     }
     if (issues.length > 0) {
-      deps.log('AgentWebModel: routing table issues (nothing unavailable)', { issues, version: table.version });
+      log('AgentWebModel: routing table issues (nothing unavailable)', { issues, version: table.version });
       alert(
         'AgentMode: AgentWeb Model routing table issues',
         `Routing table ${table.version}:\n- ${issues.join('\n- ')}\n\nNothing is unavailable because of these, but the overrides never apply.`,
@@ -385,12 +428,17 @@ export function createAgentWebModelRouter(deps: AgentWebModelRouterDeps) {
       state = unavailable('invalid', parsed.errors);
       return;
     }
-    const { unavailableTiers, issues } = tiers
+    const checked = tiers
       ? checkTiers(parsed.table, tiers, deps.normalizeModelId, parsed.invalidTargets)
       : { unavailableTiers: {}, issues: [] };
-    reportPartial(parsed.table, parsed.invalidTargets, unavailableTiers, issues);
+    // A malformed override takes down only its own tier (and is reported as such, whatever the allowlist says).
+    const unavailableTiers: Record<string, string> = { ...checked.unavailableTiers };
+    for (const [tier, tierErrors] of Object.entries(parsed.malformedTiers)) {
+      unavailableTiers[tier] = `has a malformed override in the routing table: ${tierErrors.join('; ')}`;
+    }
+    reportPartial(parsed.table, parsed.invalidTargets, unavailableTiers, checked.issues);
     if (state?.status !== 'ready' || state.table.version !== parsed.table.version) {
-      deps.log('AgentWebModel: routing table loaded', { version: parsed.table.version });
+      deps.info('AgentWebModel: routing table loaded', { version: parsed.table.version });
     }
     state = { status: 'ready', table: parsed.table, invalidTargets: parsed.invalidTargets, unavailableTiers };
   }
@@ -466,12 +514,12 @@ export interface ModelRouting {
 }
 
 /**
- * The model to STORE for a decision (session.llmModel, the engine's step stamps): the selection. A routed decision
- * stores `agentweb-model`, never the concrete model it routed to (that is the user's pick, and storing the routed
- * model would turn the next turn into a pick of that model).
+ * The model to STORE for a turn that runs `ranModel` under `decision` (session.llmModel, the engine's step stamps): the
+ * selection. A routed decision stores `agentweb-model`, never the concrete model it routed to (that is the user's pick,
+ * and storing the routed model would turn the next turn into a pick of that model); otherwise the model that ran.
  */
-export function selectionOf<M extends string | null | undefined>(decision: { effectiveModel: M; routedVia?: string | null }): M | typeof AGENTWEB_MODEL_ID {
-  return decision.routedVia === AGENTWEB_MODEL_ID ? AGENTWEB_MODEL_ID : decision.effectiveModel;
+export function storedModelFor(decision: { routedVia?: string | null } | null | undefined, ranModel: string): string {
+  return decision?.routedVia === AGENTWEB_MODEL_ID ? AGENTWEB_MODEL_ID : ranModel;
 }
 
 /** The routing fields of a decision, for spreading into a stored decision or a response body ({} when not routed). */

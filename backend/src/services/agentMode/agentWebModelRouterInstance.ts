@@ -62,6 +62,7 @@ export const agentWebModelRouter: AgentWebModelRouter = createAgentWebModelRoute
   },
   now: () => Date.now(),
   log: (message, fields) => console.error(message, fields ?? {}),
+  info: (message, fields) => console.log(message, fields ?? {}),
 });
 
 export interface RoutedSelection extends AgentWebModelRoute {
@@ -85,6 +86,8 @@ export async function routeAgentWebModelSelection(input: {
   taskType?: AgentWebTaskType;
   modelSource?: BindingSource | (() => Promise<BindingSource>);
   skipTierCheck?: boolean;
+  /** A check of a selection that is being stored, not a turn: nothing runs, so nothing is logged as routed. */
+  dryRun?: boolean;
 }): Promise<RoutedSelection> {
   if (!input.skipTierCheck && input.modelSource !== 'system') {
     await modelAccess.assertModelAllowed({
@@ -104,19 +107,25 @@ export async function routeAgentWebModelSelection(input: {
     taskType,
     allowedModels: allowlistOn && !access.isAdmin ? access.allowedModels : ALL_MODELS,
   });
-  console.log('AgentWebModel: routed', {
-    owner: input.ownerUserId, tier: access.tier, taskType, model: route.model, reason: route.reason, tableVersion: route.tableVersion,
-  });
+  if (!input.dryRun) {
+    console.log('AgentWebModel: routed', {
+      owner: input.ownerUserId, tier: access.tier, taskType, model: route.model, reason: route.reason, tableVersion: route.tableVersion,
+    });
+  }
   return { ...route, taskType };
 }
 
 /**
- * Whether `agentweb-model` may be STORED as a selection (session PATCH, schedule / plan / step pins): the router is
- * available, and the selection is in `ownerUserId`'s plan (omitted = an admin-authored pin, AgentWeb's choice: only
- * availability is checked). The caller has checked the switch is on. Throws ModelUnavailableError like the turn would.
+ * Whether `agentweb-model` may be STORED as a selection (session PATCH, schedule / plan / step pins). The caller has
+ * checked the switch is on. Throws ModelUnavailableError exactly as the turn would.
+ *  - `ownerUserId`: whose pick it is; the selection must be in their plan, and the router must work for their tier.
+ *  - `routeForUserId` without an owner: an admin-authored pin (AgentWeb's choice, so the selection is not checked as a
+ *    pick) that this user is LAUNCHING: the router must work for their tier (a visible refusal now, not at a step).
+ *  - neither: an admin-authored pin being saved: only that the table can route at all.
  */
 export async function assertAgentWebModelSelectable(input: {
   ownerUserId?: string;
+  routeForUserId?: string;
   session?: SystemModelSession | null;
   taskType?: AgentWebTaskType;
 }): Promise<void> {
@@ -127,6 +136,13 @@ export async function assertAgentWebModelSelectable(input: {
       taskType: input.taskType,
       // A new pick: the user's choice (re-picking the stored selection keeps its stamp's source).
       modelSource: () => storedBindingSource(input.session, AGENTWEB_MODEL_ID, resolveLegacyModelAlias),
+      dryRun: true,
+    });
+    return;
+  }
+  if (input.routeForUserId) {
+    await routeAgentWebModelSelection({
+      ownerUserId: input.routeForUserId, session: input.session, taskType: input.taskType, modelSource: 'system', dryRun: true,
     });
     return;
   }

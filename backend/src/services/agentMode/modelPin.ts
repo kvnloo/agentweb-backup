@@ -81,6 +81,8 @@ export async function validateModelPin(
   isAdmin: () => Promise<boolean>,
   raw: unknown,
   tierOwnerUserId?: string,
+  /** ENG-669 PR-C: the user LAUNCHING an admin-authored plan (no tier owner): a router pin must route for their tier. */
+  launcherUserId?: string,
 ): Promise<string> {
   const requested = normalizeRequestedLlmModel(raw);
   if (!requested) return '';
@@ -90,7 +92,7 @@ export async function validateModelPin(
   if (requested === AGENTWEB_MODEL_ID) {
     const { agentWebModelRouter, assertAgentWebModelSelectable } = await import('./agentWebModelRouterInstance');
     if (await agentWebModelRouter.isEnabled()) {
-      await assertAgentWebModelSelectable({ ownerUserId: tierOwnerUserId });
+      await assertAgentWebModelSelectable({ ownerUserId: tierOwnerUserId, routeForUserId: launcherUserId });
       return AGENTWEB_MODEL_ID;
     }
   }
@@ -119,8 +121,10 @@ export async function resolvePlanLaunchModel(
   isAdmin: () => Promise<boolean>,
   rawPlanModel: unknown,
   tierOwnerUserId?: string,
+  /** ENG-669 PR-C: the launching user, when the plan is admin-authored (see validateModelPin). */
+  launcherUserId?: string,
 ): Promise<string | undefined> {
-  const pin = await validateModelPin(registry, isAdmin, rawPlanModel, tierOwnerUserId);
+  const pin = await validateModelPin(registry, isAdmin, rawPlanModel, tierOwnerUserId, launcherUserId);
   if (!pin) return undefined;
   // ENG-669 PR-C: the AgentWeb Model is stored as the selection; it is not a registry id.
   if (pin === AGENTWEB_MODEL_ID || typeof registry.resolveGenerationModel !== 'function') return pin;
@@ -206,6 +210,7 @@ export async function checkPlanDefaultModelWrite(
     const display = typeof agentModeService.getModelDisplayName === 'function'
       ? agentModeService.getModelDisplayName(error.requestedModel)
       : undefined;
+    // The AgentWeb Model's label is the builder's own (it is not a registry model).
     return { ok: false, body: buildModelUnavailableBody(error, display, 'work_plan_pin') };
   }
 }

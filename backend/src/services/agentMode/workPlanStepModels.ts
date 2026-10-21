@@ -339,6 +339,8 @@ export async function resolvePlanStepModelsForLaunch(
   isAdmin: () => Promise<boolean>,
   steps: ReadonlyArray<StepLike>,
   tierOwnerUserId?: string,
+  /** ENG-669 PR-C: the launching user, when the plan is admin-authored (see validateModelPin). */
+  launcherUserId?: string,
 ): Promise<Map<number, string>> {
   const canonical = new Map<number, string>();
   for (let i = 0; i < steps.length; i++) {
@@ -347,7 +349,7 @@ export async function resolvePlanStepModelsForLaunch(
     const raw = steps[i]?.model;
     if (raw === undefined || raw === null || (typeof raw === 'string' && !raw.trim())) continue;
     try {
-      const resolved = await resolvePlanLaunchModel(registry, isAdmin, raw, tierOwnerUserId);
+      const resolved = await resolvePlanLaunchModel(registry, isAdmin, raw, tierOwnerUserId, launcherUserId);
       if (resolved) canonical.set(i, resolved);
     } catch (error) {
       if (isModelUnavailableError(error)) throw new StepModelUnavailableError(stepNumber(steps[i], i), error);
@@ -370,9 +372,12 @@ export function isStepModelUnavailableError(error: unknown): error is StepModelU
 }
 
 /** Text shown in the chat when a plan is paused because the current step's model is no longer served (or, ENG-669, not in the plan). */
-export function buildStepModelPausedMessage(stepCount: number, modelLabel: string, reason?: string): string {
+export function buildStepModelPausedMessage(stepCount: number, modelLabel: string, reason?: string, routerUnavailable?: boolean): string {
   // Account-neutral: this text is saved to the chat, where the owner AND any share viewer read it.
-  const why = reason === 'not_in_plan' ? "which isn't included in this account's plan" : 'which is no longer available';
+  // ENG-669 PR-C: `routerUnavailable` = the step is on the AgentWeb Model and its router is off or unavailable right now.
+  const why = reason === 'not_in_plan'
+    ? "which isn't included in this account's plan"
+    : routerUnavailable ? 'which is unavailable right now' : 'which is no longer available';
   return `Step ${stepCount} uses ${modelLabel}, ${why}. Choose another model in the model picker and send again to resume this step. `
     + 'The plan is paused and nothing was sent to a different model.';
 }

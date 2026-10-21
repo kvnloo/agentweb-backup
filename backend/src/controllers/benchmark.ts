@@ -7,6 +7,16 @@ import { skillService } from '../services/skillService';
 import { AuthenticatedRequest, isRealAdmin } from '../middleware/auth';
 import { BenchmarkTest, CreateBenchmarkTestRequest, RunBenchmarkTestRequest } from '../types/benchmark';
 import { v4 as uuidv4 } from 'uuid';
+import { isAgentWebModelId } from '../services/agentMode/agentWebModelRouter';
+
+/**
+ * ENG-669 PR-C: a benchmark calls one concrete model directly (no resolver, no router), so the AgentWeb Model, which
+ * AgentWeb routes per chat turn, cannot be benchmarked; refused visibly instead of silently running the default.
+ */
+const AGENTWEB_MODEL_NOT_BENCHMARKABLE = {
+  message: 'AgentWeb Model picks a model per chat turn and can\'t be benchmarked. Choose a specific model.',
+  code: 'agentweb_model_not_benchmarkable',
+};
 
 // Create a new benchmark test from a session
 export async function createBenchmarkTest(req: AuthenticatedRequest, res: Response) {
@@ -20,6 +30,7 @@ export async function createBenchmarkTest(req: AuthenticatedRequest, res: Respon
         message: 'Only admin users can create benchmark tests'
       });
     }
+    if (isAgentWebModelId(llmModel)) return res.status(400).json(AGENTWEB_MODEL_NOT_BENCHMARKABLE);
 
     // Get the session to extract conversation history and user info
     const session = await chatbotDb.getChatSession(sessionId);
@@ -180,6 +191,7 @@ export async function updateBenchmarkTest(req: AuthenticatedRequest, res: Respon
         message: 'Only admin users can update benchmark tests'
       });
     }
+    if (isAgentWebModelId(updates?.llmModel)) return res.status(400).json(AGENTWEB_MODEL_NOT_BENCHMARKABLE);
 
     // Remove fields that shouldn't be updated
     delete updates.testId;
@@ -293,6 +305,7 @@ export async function runBenchmarkTest(req: AuthenticatedRequest, res: Response)
         message: 'Only admin users can run benchmark tests'
       });
     }
+    if (isAgentWebModelId(llmName)) return res.status(400).json(AGENTWEB_MODEL_NOT_BENCHMARKABLE);
 
     // Get the benchmark test
     const test = await benchmarkTestDb.getBenchmarkTest(testId);
