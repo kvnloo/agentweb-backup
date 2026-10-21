@@ -109,23 +109,17 @@ interface PendingChange {
   usdPerUnit: number | null;
 }
 
-/** Loads the rates and saves one change at a time; every message the tab shows comes from here. */
-function useVendorRates(token: string | null | undefined) {
+/** Loads the rates once on mount; `setData` takes the answer of a save. */
+function useRatesLoader(token: string | null | undefined) {
   const [loading, setLoading] = useState(true);
-  const [savingRow, setSavingRow] = useState<string | null>(null);
   const [loadError, setLoadError] = useState('');
-  const [error, setError] = useState('');
-  const [success, setSuccess] = useState('');
   const [data, setData] = useState<VendorRatesResponse | null>(null);
-  const [drafts, setDrafts] = useState<Record<string, string>>({});
-
-  const headers = { Authorization: `Bearer ${token}` };
 
   const load = async () => {
     try {
       setLoading(true);
       setLoadError('');
-      const { data: res } = await axios.get<unknown>(buildApiUrl('/api/admin/vendor-rates'), { headers });
+      const { data: res } = await axios.get<unknown>(buildApiUrl('/api/admin/vendor-rates'), { headers: { Authorization: `Bearer ${token}` } });
       if (!isVendorRatesResponse(res)) {
         setLoadError('Failed to load vendor rates: unexpected response from server');
         return;
@@ -141,6 +135,17 @@ function useVendorRates(token: string | null | undefined) {
   // Load once on mount: `load` is recreated every render and only reads state it sets itself, so listing it would refetch in a loop.
   useEffect(() => { load(); }, []); // eslint-disable-line react-hooks/exhaustive-deps -- load once on mount
 
+  return { loading, loadError, data, setData, load };
+}
+
+/** Loads the rates and saves one change at a time; every message the tab shows comes from here. */
+function useVendorRates(token: string | null | undefined) {
+  const { loading, loadError, data, setData, load } = useRatesLoader(token);
+  const [savingRow, setSavingRow] = useState<string | null>(null);
+  const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+
   useEffect(() => {
     if (success) {
       const t = setTimeout(() => setSuccess(''), 4000);
@@ -148,27 +153,25 @@ function useVendorRates(token: string | null | undefined) {
     }
   }, [success]);
 
+  const dismiss = () => { setError(''); setSuccess(''); };
+  const clearDraft = (id: string) => setDrafts((prev) => Object.fromEntries(Object.entries(prev).filter(([key]) => key !== id)));
+
   const put = async (rate: VendorRate, usdPerUnit: number | null) => {
     const id = rowId(rate);
     try {
       setSavingRow(id);
-      setError('');
-      setSuccess('');
+      dismiss();
       const { data: res } = await axios.put<unknown>(
         buildApiUrl('/api/admin/vendor-rates'),
         { provider: rate.provider, key: rate.key, usdPerUnit },
-        { headers },
+        { headers: { Authorization: `Bearer ${token}` } },
       );
       if (!isVendorRatesResponse(res)) {
         setError('Failed to save vendor rate: unexpected response from server');
         return;
       }
       setData(res);
-      setDrafts((prev) => {
-        const next = { ...prev };
-        delete next[id];
-        return next;
-      });
+      clearDraft(id);
       setSuccess(usdPerUnit === null ? `${id} reset to default` : `${id} saved`);
     } catch (err) {
       setError(serverError(err, 'Failed to save vendor rate'));
@@ -177,7 +180,7 @@ function useVendorRates(token: string | null | undefined) {
     }
   };
 
-  return { loading, savingRow, loadError, error, setError, success, setSuccess, data, drafts, setDrafts, load, put };
+  return { loading, savingRow, loadError, error, showError: setError, success, dismiss, data, drafts, setDrafts, load, put };
 }
 
 interface RateRowProps {
@@ -351,7 +354,7 @@ function ProviderRatesTable({ provider, rates, drafts, savingRow, setDrafts, onS
 
 export default function VendorRatesTab() {
   const { token } = useAuth();
-  const { loading, savingRow, loadError, error, setError, success, setSuccess, data, drafts, setDrafts, load, put } = useVendorRates(token);
+  const { loading, savingRow, loadError, error, showError, success, dismiss, data, drafts, setDrafts, load, put } = useVendorRates(token);
   const [pending, setPending] = useState<PendingChange | null>(null);
   // Dialog content renders from the last non-null change so the close
   // transition keeps its title and body instead of flashing an empty dialog.
@@ -359,13 +362,12 @@ export default function VendorRatesTab() {
   if (pending) lastPending.current = pending;
 
   const request = (rate: VendorRate, usdPerUnit: number | null) => {
-    setError('');
-    setSuccess('');
+    dismiss();
     setPending({ rate, usdPerUnit });
   };
   const requestSave = (rate: VendorRate) => {
     const value = parsePrice(drafts[rowId(rate)] ?? '');
-    if (value === null) setError(`Price must be a plain decimal greater than 0 and at most ${MAX_USD_PER_UNIT}, with at most 6 decimal places`);
+    if (value === null) showError(`Price must be a plain decimal greater than 0 and at most ${MAX_USD_PER_UNIT}, with at most 6 decimal places`);
     else request(rate, value);
   };
   const confirmPending = () => {

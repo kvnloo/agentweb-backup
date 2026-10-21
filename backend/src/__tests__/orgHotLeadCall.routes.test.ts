@@ -12,20 +12,17 @@ import { setHotLeadCallEntitledOverride } from '../services/voice/hotLeadCallEnt
 import { setVoiceProviderForTests } from '../services/voice/voiceProvider';
 import { FakeVoiceProvider } from './helpers/fakeVoiceProvider';
 import { installFakeOrgTable, type FakeOrgTable } from './helpers/fakeOrgTable';
-import { EVERY_DAY, teamMember } from './helpers/hotLeadCallFixtures';
+import { EVERY_DAY, storedHotLeadCallConfig, teamMember } from './helpers/hotLeadCallFixtures';
+import { spokenCode } from './helpers/spokenCode';
 
 const A = 'maaaaaaa';
 const B = 'mbbbbbbb';
 const BASE = '/api/orgs/me/hot-lead-call';
 const WEEKDAYS = { days: [1, 2, 3, 4, 5], start: '09:00', end: '17:00' };
 
-const stored = (extra: Record<string, unknown> = {}) => ({
-  enabled: false,
-  team: [teamMember('+14155550100'), teamMember('+14155550122', { id: B, name: 'Sam Ortiz', verifiedAt: undefined, windows: [WEEKDAYS] })],
-  twilioNumber: '+14155550111', twilioNumberSid: 'PN' + 'b'.repeat(32), leadTypes: ['form_fill'], maxAgeMinutes: 10, maxCallsPerHour: 6,
-  maxCallsPerDay: 20, memberCooldownMinutes: 2, maxAttemptsPerLead: 3, announcedName: 'Acme Plumbing',
-  callingHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' }, allowedCountries: ['US', 'CA'], ...extra,
-});
+const stored = (extra: Record<string, unknown> = {}) => storedHotLeadCallConfig({ enabled: false, ...extra }, [
+  teamMember('+14155550100'), teamMember('+14155550122', { id: B, name: 'Sam Ortiz', verifiedAt: undefined, windows: [WEEKDAYS] }),
+]);
 
 let table: FakeOrgTable;
 let fake: FakeVoiceProvider;
@@ -40,7 +37,7 @@ function makeApp(userId: string | null = 'u-1') {
 }
 const api = () => request(makeApp());
 const rev = () => hotLeadCallRevisionOf(table.org.hotLeadCall);
-const codeOfCall = (i = 0) => /code is ((?:\d ){5}\d)\./.exec((fake.placedCalls[i] as { twiml: string }).twiml)![1].replace(/ /g, '');
+const codeOfCall = (i = 0) => spokenCode(fake.placedCalls[i]);
 
 beforeAll(() => { process.env.JWT_SECRET = 'test-secret-not-real'; });
 beforeEach(() => {

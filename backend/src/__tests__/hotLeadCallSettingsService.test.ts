@@ -10,7 +10,7 @@ import {
 import { hotLeadCallConfigOf } from '../services/hotLeadCallConfig';
 import { setHotLeadCallEntitledOverride } from '../services/voice/hotLeadCallEntitlement';
 import { cloneJson, installFakeOrgTable, type FakeOrgTable } from './helpers/fakeOrgTable';
-import { EVERY_DAY, teamMember } from './helpers/hotLeadCallFixtures';
+import { EVERY_DAY, storedHotLeadCallConfig, teamMember } from './helpers/hotLeadCallFixtures';
 
 const OWNER = { userId: 'owner', orgRole: 'owner' };
 const A = 'maaaaaaa';
@@ -20,13 +20,9 @@ const PHONE_B = '+14155550122';
 const SID = 'PN' + 'b'.repeat(32);
 const WEEKDAYS = { days: [1, 2, 3, 4, 5], start: '09:00', end: '17:00' };
 
-const stored = (extra: Record<string, unknown> = {}) => ({
-  enabled: true,
-  team: [teamMember(PHONE_A), teamMember(PHONE_B, { id: B, name: 'Sam Ortiz', verifiedAt: undefined, windows: [WEEKDAYS] })],
-  twilioNumber: '+14155550111', twilioNumberSid: SID, leadTypes: ['form_fill'], maxAgeMinutes: 10, maxCallsPerHour: 6,
-  maxCallsPerDay: 20, memberCooldownMinutes: 2, maxAttemptsPerLead: 3, announcedName: 'Acme Plumbing',
-  callingHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' }, allowedCountries: ['US', 'CA'], ...extra,
-});
+const stored = (extra: Record<string, unknown> = {}) => storedHotLeadCallConfig(extra, [
+  teamMember(PHONE_A), teamMember(PHONE_B, { id: B, name: 'Sam Ortiz', verifiedAt: undefined, windows: [WEEKDAYS] }),
+]);
 
 let table: FakeOrgTable;
 // A snapshot, as a handler would have read it: later changes to the table must not alter what the service holds.

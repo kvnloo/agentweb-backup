@@ -40,3 +40,18 @@ export const flush = async (): Promise<void> => {
   for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
   await jest.advanceTimersByTimeAsync(0);
 };
+
+export const STORED_NUMBER_SID = 'PN' + 'b'.repeat(32);
+
+/**
+ * A complete stored `hotLeadCall` org attribute: enabled, a caller number, calling hours 08:00-21:00 in Chicago and
+ * every limit at its default. `extra` overrides any field; `team` replaces the one verified person.
+ */
+export function storedHotLeadCallConfig(extra: Record<string, unknown> = {}, team: HotLeadCallMember[] = [teamMember('+14155550100')]) {
+  return {
+    enabled: true, team,
+    twilioNumber: '+14155550111', twilioNumberSid: STORED_NUMBER_SID, leadTypes: ['form_fill'], maxAgeMinutes: 10, maxCallsPerHour: 6,
+    maxCallsPerDay: 20, memberCooldownMinutes: 2, maxAttemptsPerLead: 3, announcedName: 'Acme Plumbing',
+    callingHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' }, allowedCountries: ['US', 'CA'], ...extra,
+  };
+}

@@ -76,7 +76,7 @@ const app = (opts: { errorHandler?: (err: unknown) => void } = {}) => {
   a.use(express.urlencoded({ limit: '50mb', extended: true }));
   a.use(MOUNT, twilioVoiceWebhookRoutes);
   // Express only treats a 4-argument function as an error handler.
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- the 4-argument signature is what makes it an error handler
   a.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     opts.errorHandler?.(err);
     res.status(500).end();

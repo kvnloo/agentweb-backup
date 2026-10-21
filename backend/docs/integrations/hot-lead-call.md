@@ -143,17 +143,31 @@ makes one conditional write and no reads); no one available any more, attempts u
 up, the lead too old or no caller number -> `no_member_available`. The reason a
 further attempt was refused is logged by the webhook (`no further attempt: <reason>`).
 
-**Records stranded between attempts heal.** A job that breaks before it rang anyone
-(a store or config read failing, say) closes the record it was resolving as `failed`
-with outcome `next_attempt_failed` and a `call.failed` event (reason
-`next_attempt_failed`), then fails its queue row; a record that has already left
-`between_attempts` is not touched, because a call may be live on it. The other way to
-be stranded is a store error after the leg was metered but before the next attempt
+**Records stranded between attempts heal.** A record waits in `between_attempts` after a member leg ended (and was
+metered) or after Twilio rejected a call. What closes it depends on which job was working on it:
+- *The next-attempt job* (`processHotLeadCallNextAttempt`): any error before it rang anyone closes the record as `failed`
+  with outcome `next_attempt_failed` and a `call.failed` event (reason `next_attempt_failed`), then fails its queue row.
+- *The placement pass, in either job* (`placeMemberCall`, which the first-attempt job and the next-attempt job both run):
+  once a call has been rejected the record waits with no call in flight, so any error later in the same pass (the next
+  member's lock write, the limit store) closes it the same way. The first-attempt job used to leave it waiting.
+- *A re-run by the queue poller* (see below) of a first-attempt job that finds its own record (same job key) waiting
+  hands it to the next-attempt path, which queues the next member or finishes the record.
+A record that has already left `between_attempts` is never touched by these closes, because a call may be live on it.
+The other way to be stranded is a store error after the leg was metered but before the next attempt
 was requested. Twilio then redelivers the leg's final status callback (the
 `#rc=3&rp=5xx,ct` override), `/status` finds the leg already metered, the record
 still `between_attempts` and the leg's `<sid>#ended` marker present, and asks for the
 next attempt again. That request is idempotent (the queue key, then the
-`between_attempts` -> `dialing` lock) and nothing is billed twice.
+`between_attempts` -> `dialing` lock, which also names the attempt it follows) and nothing is billed twice.
+
+**What the queue poller does.** `pollAndProcessOnce` (`src/server.ts`, every 30 seconds) reclaims `processing` rows whose
+`updatedAt` is older than 5 minutes (the heartbeat stopped, so the process died) and runs the job's processor again with
+the same payload; a row that failed is not reclaimed (both sources run with `maxAttempts: 1`). For a first-attempt
+job (`hot_lead_call`) a re-run finds the lead's record already created, so it dials nothing: it only resumes the case
+above (its own record waiting between attempts). A record left `dialing` by a first attempt that died is not retried
+(see Stuck records). For a next-attempt job (`hot_lead_call_next`) a re-run acts only on a record that is still
+`between_attempts` for the same attempt number: if the lock had not been taken it carries on and places the call; if it
+had, it stops and the record is a Stuck-records case.
 
 **Writes that commit and then report an error.** A store write can apply and still throw (a timeout after the
 commit). The steps that decide who dials write a random `claimToken` onto the record: creating the record (first
@@ -830,12 +844,15 @@ mid-call. No cron cleans these up and no operator tool lists them.
 
 **What each state means and what to do:**
 
-- `dialing`, no `outcome`, no `memberCallSid`: the process died between creating
-  the record (or, for a later attempt, moving it from `between_attempts`) and `placeCall` (or the post-call update failed). No call was
-  placed, or an unrecorded one is still adoptable by its first member callback.
-  Safe. Do nothing: the Slack alert already went out, and by the once-per-lead
-  rule the lead is simply never called. (If the member did get a call, its
-  signed callbacks adopt the CallSid and the call proceeds normally.)
+- `dialing`, no `outcome`, no `memberCallSid`, and older than 10 minutes (a ring is 25 seconds; younger ones are being
+  placed): the process died between taking the record (the create, or the move from `between_attempts`) and recording
+  the call, or a deciding write may have landed and its re-reads failed (see Writes that commit and then report an
+  error). Always check the Twilio call log first for a call from the org's number to the member around `updatedAt`.
+  None: nothing was placed. The Slack alert already went out and by the once-per-lead rule the lead is simply never
+  called; leaving the record is safe (closing it as `failed`, outcome `store_error`, is a data repair that needs
+  Harsha's approval). One exists: it was billed and the record never learned its sid. Its first signed callback normally
+  adopts it and the call proceeds and is metered; if no callback ever arrived, meter it by hand as under Checking what
+  was billed.
 - `dialing` with `outcome=placement_unknown`: the placement was ambiguous. Check
   the Twilio call log for a call from the org's number to the member around
   `startedAt`. If one exists and its callbacks never arrived, Twilio billed it
@@ -846,21 +863,16 @@ mid-call. No cron cleans these up and no operator tool lists them.
   the record as `failed` / `next_attempt_failed`; if that close fails too, a REPLAY
   of the leg's final callback re-drives the job (a failed queue row is cleared and
   queued again). Twilio replays only after a 5xx, so otherwise it stays until someone
-  replays the callback or the record is repaired. It also stays when the process died
-  with the queue row still claimed. No call is in flight; the lead is simply not
-  called again.
-- `dialing` with no `memberCallSid` and no `outcome`, or `bridging` with no
-  `leadCallSid`, and older than 10 minutes (a ring is 25 seconds): a deciding write
-  may have landed and its re-reads failed (see Writes that commit and then report an
-  error). Find them with the read-only scan above, with `:cutoff` set to 10 minutes
-  ago, keeping the rows where `attribute_not_exists(#s.#k.memberCallSid)` for
-  `dialing` or `attribute_not_exists(#s.#k.leadCallSid)` for `bridging`. Steps:
-  (1) confirm in the Twilio call log that no call was placed from the org's number
-  around `startedAt` (a `dialing` record) or that the member's call ended without a
-  child call to the lead (a `bridging` one); (2) if a call exists, meter it by hand
-  as under Checking what was billed; (3) the lead is not called again by itself:
-  closing the record (state `failed`, outcome `store_error`) is a production data
-  change that needs Harsha's approval, like any repair below.
+  replays the callback or the record is repaired. A job whose process died is re-run by
+  the queue poller after 5 minutes (see What the queue poller does), which resumes it. No call is in
+  flight; the lead is simply not called again until then.
+- `bridging` with no `leadCallSid`, and older than 10 minutes: the member pressed 1 and the move to `bridging` may have
+  landed with its re-reads failing, so the member was hung up on and no lead leg exists. To find either this or the
+  `dialing` case above, run the read-only scan above with `:cutoff` set to 10 minutes ago, keep the rows where
+  `attribute_not_exists(#s.#k.memberCallSid)` (state `dialing`) or `attribute_not_exists(#s.#k.leadCallSid)` (state
+  `bridging`). Check the Twilio call log that the member's call ended without a child call to the lead; meter the
+  member's leg by hand if it was not metered. The lead is not called again by itself; closing the record is a data repair
+  that needs Harsha's approval.
 - `bridging` / `connected`: the bridge ended but a leg callback is missing; the
   call may be unmetered.
 

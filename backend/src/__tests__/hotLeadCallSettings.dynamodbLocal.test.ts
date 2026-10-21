@@ -14,6 +14,7 @@ jest.mock('../utils/awsHttpOptions', () => ({ buildAwsHttpOptions: () => ({}) })
 jest.mock('../services/usageRecorderService', () => ({ recordVendorUsage: jest.fn().mockResolvedValue(undefined) }));
 
 import { spokenCode } from './helpers/spokenCode';
+import { storedHotLeadCallConfig } from './helpers/hotLeadCallFixtures';
 
 export {};
 
@@ -24,16 +25,10 @@ const A = 'maaaaaaa';
 const B = 'mbbbbbbb';
 const EVERY_DAY = { days: [0, 1, 2, 3, 4, 5, 6], start: '00:00', end: '24:00' };
 
-const stored = () => ({
-  enabled: false,
-  team: [
-    { id: A, name: 'Dana Lee', phone: '+14155550100', windows: [EVERY_DAY] },
-    { id: B, name: 'Sam Ortiz', phone: '+14155550122', windows: [EVERY_DAY] },
-  ],
-  twilioNumber: '+14155550111', twilioNumberSid: 'PN' + 'b'.repeat(32), leadTypes: ['form_fill'], maxAgeMinutes: 10, maxCallsPerHour: 6,
-  maxCallsPerDay: 20, memberCooldownMinutes: 2, maxAttemptsPerLead: 3, announcedName: 'Acme Plumbing',
-  callingHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' }, allowedCountries: ['US', 'CA'],
-});
+const stored = () => storedHotLeadCallConfig({ enabled: false }, [
+  { id: A, name: 'Dana Lee', phone: '+14155550100', windows: [EVERY_DAY] },
+  { id: B, name: 'Sam Ortiz', phone: '+14155550122', windows: [EVERY_DAY] },
+]);
 
 suite('team settings and member verification against DynamoDB Local', () => {
   let ddb: any;

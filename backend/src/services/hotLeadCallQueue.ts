@@ -4,8 +4,9 @@ import { errorText } from './hotLeadCallText';
 /**
  * Queues a hot-lead-call job under its permanent key and runs it once in this process: claim on enqueue,
  * heartbeat while it works, then mark it complete or failed. A key that was queued before is `duplicate` and
- * nothing runs (unless `redriveFailed`). `background` returns once the job is queued instead of when it has finished. Throws when the
- * queue itself is unavailable; a failing `process` is recorded on the queue row and never thrown.
+ * nothing runs (unless `redriveFailed`). `background` returns once the job is queued instead of when it has
+ * finished. Throws when the queue itself is unavailable; a failing `process` is recorded on the queue row and never
+ * thrown.
  */
 export async function runQueuedHotLeadJob<J>(opts: {
   source: string;
@@ -16,8 +17,8 @@ export async function runQueuedHotLeadJob<J>(opts: {
   label: string;
   background?: boolean;
   /**
-   * For a job whose earlier run may have failed: when the key is already queued, a row that FAILED is cleared and the
-   * job queued again, while a pending, running or completed row is left alone (still `duplicate`).
+   * For a job whose earlier run may have failed: when the key is already queued, a row that FAILED is cleared and
+   * the job queued again, while a pending, running or completed row is left alone (still `duplicate`).
    */
   redriveFailed?: boolean;
 }): Promise<'duplicate' | 'started'> {
@@ -36,7 +37,8 @@ export async function runQueuedHotLeadJob<J>(opts: {
       await opts.process(job);
       await markJobComplete(source, key);
     } catch (err) {
-      await markJobFailed(source, key, new Error(`${opts.label} failed: ${errorText(err)}`)).catch(() => undefined);
+      await markJobFailed(source, key, new Error(`${opts.label} failed: ${errorText(err)}`))
+        .catch((markErr) => console.warn('[hotLeadCall] job not marked failed', { source, error: errorText(markErr) }));
     } finally { stop(); }
   };
   // A crash before a background run finishes is covered by the queue reclaiming the job.

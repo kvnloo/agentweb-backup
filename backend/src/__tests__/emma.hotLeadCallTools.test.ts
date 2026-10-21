@@ -7,26 +7,21 @@ import { join } from 'path';
 import { orgDb, userDb } from '../services/db';
 import '../emma/hotLeadCallTools';
 import { ConflictError } from '../services/hotLeadCallErrors';
-import { teamMember, MEMBER_ID, EVERY_DAY } from './helpers/hotLeadCallFixtures';
+import { teamMember, MEMBER_ID, EVERY_DAY, storedHotLeadCallConfig, STORED_NUMBER_SID } from './helpers/hotLeadCallFixtures';
 import { setHotLeadCallEntitledOverride } from '../services/voice/hotLeadCallEntitlement';
 import { SHARED_SESSION_BLOCKED_ORG_SETTINGS_TOOLS } from '../services/agentMode/core/toolDispatch';
 
 const get = (args: unknown = {}, context: unknown = { userId: 'owner' }) => handlers.get('get_hot_lead_call_settings')!.execute(args, context);
 const update = (args: unknown, context: unknown = { userId: 'owner' }) => handlers.get('update_hot_lead_call_settings')!.execute(args, context);
 const lastWrite = () => (orgDb.updateOrg as jest.Mock).mock.calls[0];
-const SID = 'PN' + 'b'.repeat(32);
+const SID = STORED_NUMBER_SID;
 
 let org: { orgId: string; hotLeadCall?: Record<string, unknown>; [k: string]: unknown };
 const cfg = (): Record<string, unknown> => {
   if (!org.hotLeadCall) throw new Error('test org has no stored hotLeadCall');
   return org.hotLeadCall;
 };
-const stored = () => ({
-  enabled: true, team: [teamMember('+14155550100')],
-  twilioNumber: '+14155550111', twilioNumberSid: SID, leadTypes: ['form_fill'], maxAgeMinutes: 10, maxCallsPerHour: 6,
-  maxCallsPerDay: 20, memberCooldownMinutes: 2, maxAttemptsPerLead: 3, announcedName: 'Acme Plumbing',
-  callingHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' }, allowedCountries: ['US', 'CA'],
-});
+const stored = () => storedHotLeadCallConfig();
 const team = () => cfg().team as Array<Record<string, unknown>>;
 beforeEach(() => {
   jest.clearAllMocks();

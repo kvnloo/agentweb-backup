@@ -31,7 +31,7 @@ const BRIDGED_CALL_TIME_LIMIT_SECONDS = 1800;
 
 const E164 = /^\+[1-9]\d{6,14}$/;
 // XML 1.0 forbids most control characters even when escaped; drop them rather than emit a document Twilio rejects.
-// eslint-disable-next-line no-control-regex
+// eslint-disable-next-line no-control-regex -- the control characters are exactly what this pattern removes
 const XML_FORBIDDEN = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/g;
 
 /** Escapes for both text nodes and double-quoted attribute values. */
