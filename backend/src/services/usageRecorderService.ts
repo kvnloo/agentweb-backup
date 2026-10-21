@@ -19,7 +19,7 @@ import {
   LLM_PRICE_BOOK_PROVENANCE,
 } from "../utils/llmPricing";
 import { usageRecordDb, CostSource } from "./usageRecordDb";
-import { getAllocatedRate, VendorRateProvider } from "../utils/vendorRateCard";
+import { getAllocatedRateWithVersion, VendorRateProvider } from "../utils/vendorRateCard";
 import {
   buildLlmSpendEvent,
   buildShadowEvent,
@@ -181,7 +181,7 @@ type VendorUsagePricing =
 export type RecordVendorUsageContext = VendorUsageFields & VendorUsagePricing;
 
 /** A vendor call once its cost is settled — what every write path below takes. */
-type ResolvedVendorUsageContext = VendorUsageFields & { costSource: CostSource; costUsd?: number };
+type ResolvedVendorUsageContext = VendorUsageFields & { costSource: CostSource; costUsd?: number; rateCardVersion?: string };
 
 /** provider:rateKey pairs already reported as unpriced by this process. */
 const reportedUnpricedRateKeys = new Set<string>();
@@ -199,8 +199,8 @@ function resolveVendorCost(ctx: RecordVendorUsageContext): ResolvedVendorUsageCo
   if (ctx.rateKey == null) return ctx as ResolvedVendorUsageContext;
 
   const { rateKey, ...fields } = ctx;
-  const rate = getAllocatedRate(ctx.provider as VendorRateProvider, rateKey);
-  if (rate === null) {
+  const priced = getAllocatedRateWithVersion(ctx.provider as VendorRateProvider, rateKey);
+  if (priced === null) {
     const key = `${ctx.provider}:${rateKey}`;
     if (!reportedUnpricedRateKeys.has(key)) {
       reportedUnpricedRateKeys.add(key);
@@ -212,7 +212,7 @@ function resolveVendorCost(ctx: RecordVendorUsageContext): ResolvedVendorUsageCo
     return { ...fields, costSource: "unpriced" };
   }
   const quantity = Number.isFinite(ctx.quantity) && ctx.quantity > 0 ? ctx.quantity : 0;
-  return { ...fields, costSource: "allocated", costUsd: quantity * rate };
+  return { ...fields, costSource: "allocated", costUsd: quantity * priced.rate, rateCardVersion: priced.version };
 }
 
 /** Test hook: forget which unpriced keys were already reported. */

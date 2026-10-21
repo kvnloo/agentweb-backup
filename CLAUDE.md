@@ -609,6 +609,7 @@ Secrets stored in AWS Secrets Manager (accessed at runtime):
 - `dev/AgentWeb/Webflow` or `dev/AgentWeb/Webflow/<userId>` - Webflow CMS credentials
 - `dev/AgentWeb/LinkedIn/Personal` - LinkedIn personal profile credentials
 - `dev/AgentWeb/LinkedIn/Company` - LinkedIn company page credentials
+- `dev/AgentWeb/Twilio` / `prod/AgentWeb/Twilio` - Twilio Voice credentials (JSON `accountSid`, `authToken`); `TWILIO_ACCOUNT_SID` + `TWILIO_AUTH_TOKEN` env vars override when both are set
 
 ### Agent Engine `.env`
 
