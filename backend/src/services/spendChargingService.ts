@@ -37,9 +37,8 @@ import {
   transitionSpendEvent,
 } from "./spendEventDb";
 import {
-  VENDOR_RATE_CARD_VERSION,
   VendorRateProvider,
-  getAllocatedRate,
+  getAllocatedRateWithVersion,
   getRecordingUnit,
 } from "../utils/vendorRateCard";
 
@@ -189,13 +188,15 @@ export function resolveCost(request: ChargeRequest): ResolvedCost {
     };
   }
 
-  const rate = getAllocatedRate(request.provider as VendorRateProvider, request.operation);
-  if (rate === null) throw new UnpricedSpendError(request.provider, request.operation);
+  // Rate and version come from one snapshot: the event is stamped with the version of the
+  // rate that priced it even if an admin override lands between two lookups.
+  const priced = getAllocatedRateWithVersion(request.provider as VendorRateProvider, request.operation);
+  if (priced === null) throw new UnpricedSpendError(request.provider, request.operation);
 
   return {
-    costMicroUsd: Math.round(quantity * rate * 1e6),
+    costMicroUsd: Math.round(quantity * priced.rate * 1e6),
     costSource: "allocated",
-    rateCardVersion: VENDOR_RATE_CARD_VERSION,
+    rateCardVersion: priced.version,
     unit: request.unit || getRecordingUnit(request.provider as VendorRateProvider, request.operation) || "call",
     quantity,
   };

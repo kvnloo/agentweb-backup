@@ -129,6 +129,7 @@
     "stripe": "^18.2.1",
     "svix": "^1.76.1",
     "tesseract.js": "^7.0.0",
+    "twilio": "^6.2.0",
     "twitter-api-v2": "^1.29.0",
     "typescript": "^5.3.3",
     "ulid": "^3.0.2",
@@ -161,6 +162,10 @@
     "typescript-eslint": "^8.18.2"
   },
   "overrides": {
+    "twilio": {
+      "axios": "^1.13.5",
+      "jsonwebtoken": "^9.0.3"
+    },
     "sanitize-html": {
       "htmlparser2": "10.1.0"
     }

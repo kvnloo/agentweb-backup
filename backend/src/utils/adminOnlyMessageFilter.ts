@@ -35,6 +35,7 @@ export interface AdminRedactionOptions {
    * returned rows. Set for viewers who are not the session owner (share / conversable links). Default false.
    * ENG-113: the same flag also drops `metadata.compareAlternatives` (the saved unchosen Compare answers are
    * owner-only) via the same mechanism. `compareAlternativesOmitted`/`compareId` carry no answer text and stay.
+   * ENG-669 PR-C: and the AgentWeb Model routing fields (`llmSelected`, `llmRoutingReason`, `llmRoutingTableVersion`).
    */
   omitBranchOrigin?: boolean;
 }
@@ -95,11 +96,20 @@ export function filterMessagesForClient(messages: any[], opts: AdminRedactionOpt
   // `omitBranchOrigin` is the legacy flag name for "this viewer is not the session owner": it strips BOTH owner-only
   // metadata keys (ENG-112 branchOrigin and ENG-113 compareAlternatives). Both share the one call-site rule on purpose
   // (every non-owner view must hide both); the adminOnlyMessageFilter tripwire tests pin each key.
+  // ENG-669 PR-C: the same viewers never get the AgentWeb Model's routing provenance either (`llmSelected`,
+  // `llmRoutingReason`, `llmRoutingTableVersion` beside `llm`): how the owner's turns were routed is the owner's.
   const stripOwnerOnlyMetadata = (message: any) => {
-    if (!opts.omitBranchOrigin || !message?.metadata) return message;
-    if (!('branchOrigin' in message.metadata) && !('compareAlternatives' in message.metadata)) return message;
-    const { branchOrigin: _origin, compareAlternatives: _alternatives, ...metadata } = message.metadata;
-    return { ...message, metadata };
+    if (!opts.omitBranchOrigin || !message || typeof message !== 'object') return message;
+    let out = message;
+    if ('llmSelected' in out || 'llmRoutingReason' in out || 'llmRoutingTableVersion' in out) {
+      const { llmSelected: _selected, llmRoutingReason: _reason, llmRoutingTableVersion: _version, ...rest } = out;
+      out = rest;
+    }
+    if (out.metadata && ('branchOrigin' in out.metadata || 'compareAlternatives' in out.metadata)) {
+      const { branchOrigin: _origin, compareAlternatives: _alternatives, ...metadata } = out.metadata;
+      out = { ...out, metadata };
+    }
+    return out;
   };
 
   return messages.filter((message, i) => {

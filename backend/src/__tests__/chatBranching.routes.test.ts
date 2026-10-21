@@ -215,6 +215,16 @@ describe('POST /session/:id/branch', () => {
     expect(mockClaimed.has('s-1')).toBe(false);
   });
 
+  it('ENG-669 PR-C: a branch keeps the AgentWeb Model SELECTION, never the model it routed to', async () => {
+    mockResolve.mockImplementationOnce(async () => ({
+      requestedModel: 'agentweb-model', effectiveModel: 'gemini-3.5-flash', modelSelection: 'honored',
+      routedVia: 'agentweb-model', routingReason: 'chat task: table default', tableVersion: 't1',
+    }));
+    const out = await request(app).post(URL).set('Authorization', bearer('owner')).send({ messageIndex: 2, llmModel: 'agentweb-model' });
+    expect(out.status).toBe(201);
+    expect(mockFake.session(out.body.sessionId)!.llmModel).toBe('agentweb-model');
+  });
+
   it('409 SESSION_BUSY while the source is generating, and that lock is not released by the refused branch', async () => {
     mockClaimed.add('s-1');
     const out = await request(app).post(URL).set('Authorization', bearer('owner')).send({ messageIndex: 2 });

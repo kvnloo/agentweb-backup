@@ -11,7 +11,8 @@ import { chatbotDb } from '../services/chatbotService';
 import { publishRevalidationForForwardedRun, publishWithdrawnMidFlight, SCHEDULED_SESSION_HEADER } from '../utils/scheduledPublishConsentGuard';
 import { getMetaAdsMetricsArgsSchema } from '../utils/metaCampaignIds';
 import { assertModelInOwnerPlan } from '../services/agentMode/modelAccessInstance';
-import { buildModelUnavailableBody, isModelUnavailableError } from '../services/agentMode/modelUnavailable';
+import { buildModelUnavailableBody, isModelUnavailableError, ModelUnavailableError } from '../services/agentMode/modelUnavailable';
+import { isAgentWebModelId } from '../services/agentMode/agentWebModelRouter';
 
 /**
  * ENG-669: a model named in the request body runs on the caller's account, so it must be in the caller's plan (the
@@ -19,6 +20,12 @@ import { buildModelUnavailableBody, isModelUnavailableError } from '../services/
  */
 async function modelInCallerPlan(req: Request, res: Response, rawModel: unknown): Promise<boolean> {
   if (typeof rawModel !== 'string' || !rawModel.trim()) return true;
+  // ENG-669 PR-C: these routes call one model directly (no resolver, no router), so the AgentWeb Model can never run
+  // here; refused visibly (with the switch on or off) instead of silently running a default model.
+  if (isAgentWebModelId(rawModel)) {
+    res.status(422).json(buildModelUnavailableBody(new ModelUnavailableError(rawModel.trim(), 'not_selectable')));
+    return false;
+  }
   try {
     await assertModelInOwnerPlan({ ownerUserId: userId(req), model: rawModel });
     return true;

@@ -90,3 +90,21 @@ it('switch off: the same requests run exactly as before', async () => {
   const image = await request(app).post('/api/emma/describe-media').send({ type: 'image', url: 'https://x/y.png', llm_model: 'premium-model' });
   expect(image.status).toBe(200);
 });
+
+describe('ENG-669 PR-C: the AgentWeb Model can never run on a single-call route', () => {
+  it.each([false, true])('refused with a visible 422 (allowlist on: %s); never falls back to the default model', async (allowlistOn) => {
+    if (allowlistOn) mockSettings.model_tier_allowlist_enabled = 'true';
+    const html = await request(app).post('/api/emma/create-html-from-template').send({ llm_model: 'agentweb-model', template_id: 't1' });
+    expect(html.status).toBe(422);
+    expect(html.body).toEqual({
+      error: 'AgentWeb Model can\'t be used here. Choose a specific model to continue.',
+      code: 'model_unavailable',
+      requestedModel: 'agentweb-model',
+      reason: 'not_selectable',
+    });
+    const image = await request(app).post('/api/emma/describe-media').send({ type: 'image', url: 'https://x/y.png', llm_model: 'agentweb-model' });
+    expect(image.status).toBe(422);
+    expect(mockService.createHtmlFromTemplate).not.toHaveBeenCalled();
+    expect(mockService.describeImage).not.toHaveBeenCalled();
+  });
+});
