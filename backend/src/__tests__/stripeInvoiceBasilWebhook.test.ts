@@ -115,12 +115,13 @@ describe('ENG-2599 invoice webhooks read Basil subscription and price fields', (
   beforeEach(() => {
     jest.clearAllMocks();
     jest.spyOn(console, 'log').mockImplementation(() => undefined);
-    mockSubscriptionsRetrieve.mockResolvedValue({
-      id: 'sub_basil',
+    // Stripe returns the subscription that was asked for.
+    mockSubscriptionsRetrieve.mockImplementation(async (id: string) => ({
+      id,
       status: 'active',
       items: { data: [{ current_period_end: PERIOD_END, price: { id: 'price_pro' } }] },
       discounts: [],
-    });
+    }));
   });
 
   it('paid Basil invoice, user WITHOUT stripe_subscription_id: backfills it and syncs period end', async () => {

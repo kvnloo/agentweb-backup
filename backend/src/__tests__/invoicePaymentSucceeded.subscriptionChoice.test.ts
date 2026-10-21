@@ -12,10 +12,11 @@
  * `stripe_subscription_id` itself is only ever backfilled when absent. Adapted from the PR #3680 review.
  */
 const mockRetrieve = jest.fn();
+const mockList = jest.fn();
 
 jest.mock('stripe', () =>
   jest.fn().mockImplementation(() => ({
-    subscriptions: { retrieve: mockRetrieve, list: jest.fn() },
+    subscriptions: { retrieve: mockRetrieve, list: mockList },
     paymentMethods: { list: jest.fn() },
     customers: { retrieve: jest.fn() },
   }))
@@ -33,6 +34,7 @@ process.env.STRIPE_SECRET_KEY = 'sk_test_fake_key';
 
 import { handleInvoicePaymentSucceeded } from '../services/stripeService';
 import { userDb } from '../services/db';
+import { syncUserUpdateToLeadList } from '../services/crmAutoSyncService';
 
 const OLD_END = 1760000000; // 2025-10-09, ended
 const NEW_END = 1790000000; // 2026-09-21
@@ -51,7 +53,11 @@ const subs: Record<string, ReturnType<typeof sub>> = {
   sub_trial: sub('sub_trial', 'trialing', NEW_END),
   sub_past_due: sub('sub_past_due', 'past_due', NEW_END),
   sub_other_live: sub('sub_other_live', 'active', OTHER_END, [disc('di_other', 'coup_other')]),
+  sub_incomplete: sub('sub_incomplete', 'incomplete', NEW_END),
 };
+
+/** The customer's subscriptions as `subscriptions.list` returns them (newest first). */
+let customerSubs: string[] = [];
 
 function basilInvoice(subscription: string | null) {
   return {
@@ -78,6 +84,8 @@ beforeEach(() => {
     if (!subs[id]) throw new Error(`No such subscription: ${id}`);
     return subs[id];
   });
+  customerSubs = [];
+  mockList.mockImplementation(async () => ({ data: customerSubs.map((id) => subs[id]), has_more: false }));
 });
 
 describe('handleInvoicePaymentSucceeded — which subscription is synced', () => {
@@ -188,5 +196,134 @@ describe('handleInvoicePaymentSucceeded — which subscription is synced', () =>
 
     expect(retrievedIds()).toEqual(['sub_new']);
     expect(update()).not.toHaveProperty('stripe_subscription_id');
+  });
+});
+
+describe('handleInvoicePaymentSucceeded — only a live subscription is backfilled or reactivates (Opslane P1)', () => {
+  it('Opslane: no stored id, redelivered final invoice of a canceled sub, customer has a live sub ⇒ the live sub is backfilled and synced', async () => {
+    givenUser(null);
+    customerSubs = ['sub_new', 'sub_old'];
+
+    await handleInvoicePaymentSucceeded(basilInvoice('sub_old'));
+
+    expect(mockList).toHaveBeenCalledWith({ customer: 'cus_1', status: 'all', limit: 10, expand: ['data.discounts'] });
+    expect(update().stripe_subscription_id).toBe('sub_new');
+    expect(update().subscription_status).toBe('active');
+    expect(update().current_period_end).toBe(iso(NEW_END));
+    expect(update().activeOffer).toMatchObject({ couponId: 'coup_new' });
+  });
+
+  it('several live subs: picks active over trialing/past_due, newest first (the reconcile order)', async () => {
+    givenUser(null);
+    customerSubs = ['sub_past_due', 'sub_trial', 'sub_other_live', 'sub_new', 'sub_old'];
+
+    await handleInvoicePaymentSucceeded(basilInvoice('sub_old'));
+
+    expect(update().stripe_subscription_id).toBe('sub_other_live');
+    expect(update().current_period_end).toBe(iso(OTHER_END));
+  });
+
+  it('no stored id, canceled invoice sub, no live sub ⇒ nothing backfilled or synced, status NOT flipped to active', async () => {
+    givenUser(null);
+    customerSubs = ['sub_old'];
+
+    await handleInvoicePaymentSucceeded(basilInvoice('sub_old'));
+
+    expect(update()).not.toHaveProperty('stripe_subscription_id');
+    expect(update()).not.toHaveProperty('subscription_status');
+    expect(update()).not.toHaveProperty('current_period_end');
+    expect(update()).not.toHaveProperty('activeOffer');
+    expect(update().has_payment_method).toBe(true);
+    expect(syncUserUpdateToLeadList).not.toHaveBeenCalled();
+  });
+
+  it('stored canceled sub, its own final invoice redelivered, no live sub ⇒ status NOT flipped, stored period synced as before', async () => {
+    givenUser('sub_old');
+    customerSubs = ['sub_old'];
+
+    await handleInvoicePaymentSucceeded(basilInvoice('sub_old'));
+
+    expect(update()).not.toHaveProperty('subscription_status');
+    expect(update().current_period_end).toBe(iso(OLD_END));
+    expect(update()).not.toHaveProperty('stripe_subscription_id');
+  });
+
+  it('stored canceled sub, its own final invoice, but the customer has a live sub ⇒ status active, live sub synced, stored id untouched', async () => {
+    givenUser('sub_old');
+    customerSubs = ['sub_new', 'sub_old'];
+
+    await handleInvoicePaymentSucceeded(basilInvoice('sub_old'));
+
+    expect(update().subscription_status).toBe('active');
+    expect(update().current_period_end).toBe(iso(NEW_END));
+    expect(update()).not.toHaveProperty('stripe_subscription_id');
+  });
+
+  it('a not-yet-active sub (incomplete) with no live sub: nothing backfilled, but status is still flipped (its invoice is being paid)', async () => {
+    givenUser(null);
+    customerSubs = ['sub_incomplete'];
+
+    await handleInvoicePaymentSucceeded(basilInvoice('sub_incomplete'));
+
+    expect(update()).not.toHaveProperty('stripe_subscription_id');
+    expect(update().subscription_status).toBe('active');
+  });
+
+  it('live invoice sub, no stored id ⇒ unchanged: backfilled from it, one retrieve, no list', async () => {
+    givenUser(null);
+
+    await handleInvoicePaymentSucceeded(basilInvoice('sub_new'));
+
+    expect(mockList).not.toHaveBeenCalled();
+    expect(update()).toMatchObject({ stripe_subscription_id: 'sub_new', subscription_status: 'active', current_period_end: iso(NEW_END) });
+  });
+
+  it('stored live sub ⇒ unchanged: no list, status active', async () => {
+    givenUser('sub_new');
+
+    await handleInvoicePaymentSucceeded(basilInvoice('sub_old'));
+
+    expect(mockList).not.toHaveBeenCalled();
+    expect(update()).toMatchObject({ subscription_status: 'active', current_period_end: iso(NEW_END) });
+  });
+
+  it('one-off invoice (parent null), stored canceled sub ⇒ unchanged: status active, stored synced, no list', async () => {
+    givenUser('sub_old');
+    customerSubs = ['sub_new', 'sub_old'];
+
+    await handleInvoicePaymentSucceeded(basilInvoice(null));
+
+    expect(mockList).not.toHaveBeenCalled();
+    expect(update()).toMatchObject({ subscription_status: 'active', current_period_end: iso(OLD_END) });
+  });
+
+  it('one-off invoice (parent null), no stored id ⇒ unchanged: status active, nothing fetched', async () => {
+    givenUser(null);
+
+    await handleInvoicePaymentSucceeded(basilInvoice(null));
+
+    expect(mockRetrieve).not.toHaveBeenCalled();
+    expect(mockList).not.toHaveBeenCalled();
+    expect(update()).toMatchObject({ subscription_status: 'active', has_payment_method: true });
+  });
+
+  it('no stored id and the invoice-sub retrieve fails ⇒ nothing backfilled, status active (as before)', async () => {
+    givenUser(null);
+
+    await handleInvoicePaymentSucceeded(basilInvoice('sub_missing'));
+
+    expect(update()).not.toHaveProperty('stripe_subscription_id');
+    expect(update().subscription_status).toBe('active');
+  });
+
+  it('the live-sub lookup fails ⇒ nothing backfilled, status active (cannot prove it ended), warning', async () => {
+    givenUser(null);
+    mockList.mockRejectedValue(new Error('rate limited'));
+
+    await handleInvoicePaymentSucceeded(basilInvoice('sub_old'));
+
+    expect(update()).not.toHaveProperty('stripe_subscription_id');
+    expect(update().subscription_status).toBe('active');
+    expect(warn).toHaveBeenCalled();
   });
 });
