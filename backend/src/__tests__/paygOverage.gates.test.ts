@@ -683,11 +683,11 @@ describe('ENG-668 PR-2 — the gate records what each month\'s admissions were m
   }
   const older = { month: '2000-02', capHighWaterMicroUsd: 1, tierPoolHighWaterMicroUsd: 1, markupBps: 10_000 };
 
-  it('the first PAYG admission of a month records its cap, plan pool and markup, newest first, keeping one earlier month', async () => {
+  it('the first PAYG admission of a month records its cap, plan pool and markup, newest first, keeping earlier months', async () => {
     setup({ spendUsd: 120 });
     const fake = stored(payg({ admittedMonths: [older, { ...older, month: '2000-01' }] }));
     expect((await checkTokenUsage(OWNER)).allowed).toBe(true);
-    expect(fake.row.paygOverage.admittedMonths).toEqual([entry(), older]);
+    expect(fake.row.paygOverage.admittedMonths).toEqual([entry(), older, { ...older, month: '2000-01' }]);
 
     // Later admissions against the same cap, pool and markup write nothing more.
     mockUpdateUser.mockClear();

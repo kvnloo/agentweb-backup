@@ -23,6 +23,7 @@ import {
   computePaygSettlementAmount,
   paygSettlementIdempotencyKey,
   paygSettlementMonthsToPrune,
+  paygMonthInputsFromRow,
   previousUsageMonth,
   type PaygSettlement,
 } from '../services/paygSettlement';
@@ -99,10 +100,11 @@ describe('ENG-668 settlement amount = the gate\'s measurement', () => {
       month, capHighWaterMicroUsd: gate.overage!.capMicroUsd, tierPoolHighWaterMicroUsd: 100 * USD, markupBps: 10_000,
     }]);
 
+    const afterGate = { ...input.account, ...written } as PaygOverageSettings;
     const settled = computePaygSettlementAmount({
       month,
-      account: { ...input.account, ...written } as PaygOverageSettings,
-      creditLedger: input.credits,
+      admitted: afterGate.admittedMonths![0],
+      inputs: paygMonthInputsFromRow({ llmUsageCredits: input.credits, paygOverage: afterGate }, month, month)!,
       settledMicroUsd: Math.round(input.spendUsd * USD),
     })!;
     expect(settled.netOverageMicroUsd).toBe(gate.overage!.overageMicroUsd);
@@ -111,48 +113,55 @@ describe('ENG-668 settlement amount = the gate\'s measurement', () => {
     expect(settled.overageCostMicroUsd).toBe(Math.min(gate.overage!.overageMicroUsd, gate.overage!.capMicroUsd));
   });
 
-  const admittedAt = (over: Record<string, unknown> = {}) => ({
+  const admittedAt = (over: Partial<PaygAdmittedMonth> = {}): PaygAdmittedMonth => ({
     month, capHighWaterMicroUsd: 50 * USD, tierPoolHighWaterMicroUsd: 100 * USD, markupBps: 15_000, ...over,
   });
+  const noCredits = { purchasedMicroUsd: 0, adminGrantedMicroUsd: 0, migrationOffsetMicroUsd: 0 };
+  const plain = { credits: noCredits, poolHighWater: { month, thresholdMicroUsd: 100 * USD } };
 
-  it('is null (hold, never guess) without an admission record, a usable pool, cap or price', () => {
-    const base = { month, creditLedger: undefined, settledMicroUsd: 130 * USD };
-    const withAdmitted = (entry: Record<string, unknown> | null, over: Partial<PaygOverageSettings> = {}) =>
-      account({ admittedMonths: entry ? [entry as unknown as PaygAdmittedMonth] : [], ...over });
-    expect(computePaygSettlementAmount({ ...base, account: withAdmitted(null) })).toBeNull();
-    expect(computePaygSettlementAmount({ ...base, account: withAdmitted(admittedAt({ tierPoolHighWaterMicroUsd: 0 })) })).toBeNull();
-    expect(computePaygSettlementAmount({ ...base, account: withAdmitted(admittedAt({ capHighWaterMicroUsd: 0 })) })).toBeNull();
-    expect(computePaygSettlementAmount({ ...base, account: withAdmitted(admittedAt({ markupBps: null })) })).toBeNull();
-    expect(computePaygSettlementAmount({ ...base, account: withAdmitted(admittedAt({ markupBps: 9_999 })) })).toBeNull();
+  it('is null (hold, never guess) without a usable pool, cap, price or baseline', () => {
+    const base = { month, inputs: plain, settledMicroUsd: 130 * USD };
+    expect(computePaygSettlementAmount({ ...base, admitted: admittedAt({ tierPoolHighWaterMicroUsd: 0 }) })).toBeNull();
+    expect(computePaygSettlementAmount({ ...base, admitted: admittedAt({ capHighWaterMicroUsd: 0 }) })).toBeNull();
+    expect(computePaygSettlementAmount({ ...base, admitted: admittedAt({ markupBps: null }) })).toBeNull();
+    expect(computePaygSettlementAmount({ ...base, admitted: admittedAt({ markupBps: 9_999 }) })).toBeNull();
     expect(computePaygSettlementAmount({
-      ...base, account: withAdmitted(admittedAt(), { optIn: { month, overageBaselineMicroUsd: Number.NaN } }),
+      ...base, admitted: admittedAt(), inputs: { ...plain, optIn: { month, overageBaselineMicroUsd: Number.NaN } },
     })).toBeNull();
   });
 
   it('applies the markup to the capped cost and rounds down to whole cents', () => {
     const amount = computePaygSettlementAmount({
-      month, account: account({ admittedMonths: [admittedAt({ markupBps: 12_345 })] }), creditLedger: undefined, settledMicroUsd: 133_333_333,
+      month, admitted: admittedAt({ markupBps: 12_345 }), inputs: plain, settledMicroUsd: 133_333_333,
     })!;
     // 33.333333 x 1.2345 = 41.149999... -> 41_149_999 micro-USD -> 4114 cents.
     expect(amount).toMatchObject({ overageCostMicroUsd: 33_333_333, billedMicroUsd: 41_149_999, amountCents: 4114, percentOfCap: 66 });
   });
 
-  it('reads the closed month\'s mark and opt-in, not the new month\'s', () => {
-    const amount = computePaygSettlementAmount({
-      month: '2026-09',
-      account: account({
+  it('reads the closed month\'s mark and opt-in from the row, not the new month\'s', () => {
+    const row = {
+      paygOverage: account({
         poolHighWater: { month: '2026-10', thresholdMicroUsd: 80 * USD },
         poolHighWaterClosed: { month: '2026-09', thresholdMicroUsd: 110 * USD },
         optIn: { month: '2026-10', overageBaselineMicroUsd: 0 },
         optInClosed: { month: '2026-09', overageBaselineMicroUsd: 5 * USD, poolAtOptInMicroUsd: 110 * USD },
-        admittedMonths: [{ month: '2026-09', capHighWaterMicroUsd: 55 * USD, tierPoolHighWaterMicroUsd: 100 * USD, markupBps: 10_000 }],
       }),
-      creditLedger: undefined,
+    };
+    const amount = computePaygSettlementAmount({
+      month: '2026-09',
+      admitted: { month: '2026-09', capHighWaterMicroUsd: 55 * USD, tierPoolHighWaterMicroUsd: 100 * USD, markupBps: 10_000 },
+      inputs: paygMonthInputsFromRow(row, '2026-09', '2026-09')!,
       settledMicroUsd: 130 * USD,
     })!;
     // Pool $110 (closed mark), $20 gross - $5 baseline = $15.
     expect(amount.poolMicroUsd).toBe(110 * USD);
     expect(amount.overageCostMicroUsd).toBe(15 * USD);
+  });
+
+  it('the row\'s inputs are trusted only for the month that just closed (older ones are gone from the row)', () => {
+    const row = { paygOverage: account() };
+    expect(paygMonthInputsFromRow(row, '2026-09', '2026-09')).not.toBeNull();
+    expect(paygMonthInputsFromRow(row, '2026-08', '2026-09')).toBeNull();
   });
 });
 
@@ -165,10 +174,13 @@ describe('ENG-668 admission record merge', () => {
     expect(withPaygAdmission([sept], { ...sept, tierPoolHighWaterMicroUsd: 90 * USD, markupBps: 12_000 }))
       .toEqual([{ ...sept, markupBps: 12_000 }]);
   });
-  it('a new month goes first and only two months are kept', () => {
-    const oct = { ...sept, month: '2026-10' };
+  it('a new month goes first and 13 months are kept (the current one and settlement\'s 12-month window)', () => {
+    const months = Array.from({ length: 13 }, (_, i) => ({ ...sept, month: `2025-${String(i % 12 + 1).padStart(2, '0')}-${i}` }));
     const nov = { ...sept, month: '2026-11' };
-    expect(withPaygAdmission([oct, sept], nov)).toEqual([nov, oct]);
+    const next = withPaygAdmission(months, nov)!;
+    expect(next).toHaveLength(13);
+    expect(next[0]).toEqual(nov);
+    expect(next[12]).toEqual(months[11]);
   });
 });
 

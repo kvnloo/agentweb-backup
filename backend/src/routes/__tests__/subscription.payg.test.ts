@@ -63,7 +63,7 @@ import {
 import { getCurrentUsageMonth } from '../../services/llmUsageCreditService';
 import { evaluateCondition, type UpdateUserOptions } from '../../__tests__/helpers/userRowFake';
 import { getEffectiveLlmUsagePolicy } from '../../services/llmUsagePolicyResolverService';
-import { computePaygSettlementAmount } from '../../services/paygSettlement';
+import { computePaygSettlementAmount, paygMonthInputsFromRow } from '../../services/paygSettlement';
 
 const USD = 1_000_000;
 const OWNER = 'owner-1';
@@ -412,7 +412,10 @@ describe('PUT /api/subscription/payg', () => {
     expect(usage.paygBlock).toEqual({ reason: 'payg_cap_reached' });
     // And settlement bills at most the cap.
     const amount = computePaygSettlementAmount({
-      month, account: users[OWNER].paygOverage, creditLedger: undefined, settledMicroUsd: 190 * USD,
+      month,
+      admitted: users[OWNER].paygOverage.admittedMonths[0],
+      inputs: paygMonthInputsFromRow(users[OWNER], month, month)!,
+      settledMicroUsd: 190 * USD,
     })!;
     expect(amount.overageCostMicroUsd).toBe(50 * USD);
   });

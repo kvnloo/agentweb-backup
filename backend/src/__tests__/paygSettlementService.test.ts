@@ -834,7 +834,7 @@ describe('ENG-668 settlement — Stripe total differs from the record (review M5
     expect(mockStripe.invoices.create).not.toHaveBeenCalled();
     expect(settlement()).toMatchObject({ status: 'held', heldReason: 'invoice_mismatch', invoiceId: 'in_9' });
     const [, alertBody] = (emailService.sendOncallAlert as jest.Mock).mock.calls[0];
-    expect(alertBody).toContain('Do NOT remove paygSettlements.2026-09');
+    expect(alertBody).toContain('Do NOT remove or retry paygSettlements.2026-09');
 
     // Stripe still collects it; the webhook records the outcome on the held record.
     await handleInvoicePaymentSucceeded({ ...mockStripeState.invoices.get('in_9')!, status: 'paid' });
@@ -948,7 +948,7 @@ describe('ENG-668 settlement — a recorded invoice that is void or gone is neve
     });
     expect(emailService.sendOncallAlert).toHaveBeenCalledTimes(1);
     const [, alertBody] = (emailService.sendOncallAlert as jest.Mock).mock.calls[0];
-    expect(alertBody).toContain('deleted or unknown to Stripe');
+    expect(alertBody).toContain('deleted or unknown, so nothing was collected');
     expect(alertBody).not.toContain('Do NOT remove');
     expect(mockStripe.invoices.create).toHaveBeenCalledTimes(1);
   });
@@ -974,7 +974,7 @@ describe('ENG-668 settlement — a recorded invoice that is void or gone is neve
     const summary = await runPaygSettlement(DAY2);
     errorLog.mockRestore();
     expect(summary).toMatchObject({ scanned: 2, failed: 1, outcomes: { invoiced: 1 } });
-    expect(summary.errors).toEqual([{ billingUserId: 'ghost', error: 'throttled' }]);
+    expect(summary.errors).toEqual([{ billingUserId: 'ghost', month: M, error: 'throttled' }]);
   });
 });
 
@@ -1009,5 +1009,137 @@ describe('ENG-668 webhooks — a failure after the paid webhook\'s read keeps PA
     await settlePaygOverageMonth(OWNER, M, DAY2);
     await handleInvoicePaymentFailed(mockStripeState.invoices.get('in_1')!);
     expect(store.row.paygOverage.suspended).toEqual({ reason: 'dispute', at: '2026-09-20T00:00:00.000Z', invoiceId: 'in_old' });
+  });
+});
+
+describe('ENG-668 webhooks — failure events can only suspend for a month that is unpaid on that invoice (rv3 MAJOR 1)', () => {
+  it('P1: a redelivered failure for a month already failed, landing between the paid read and the lift, does not strand the suspension', async () => {
+    setup();
+    await settlePaygOverageMonth(OWNER, M, DAY2);
+    const sep = mockStripeState.invoices.get('in_1')!;
+    await handleInvoicePaymentFailed(sep);
+    const paidRead = store.row; // the paid webhook's read: September failed, suspended
+    await handleInvoicePaymentFailed(sep); // Stripe redelivers / retries the charge meanwhile
+    (userDb.getUserByIdConsistent as jest.Mock).mockResolvedValueOnce(paidRead);
+    await handleInvoicePaymentSucceeded({ ...sep, status: 'paid' });
+    expect(store.row.paygSettlements[M].status).toBe('paid');
+    expect(Object.values(store.row.paygSettlements).filter((r) => (r as { status: string }).status === 'failed')).toHaveLength(0);
+    expect(store.row.paygOverage.suspended).toBeUndefined();
+  });
+
+  it('P2: a failure that read `invoiced` but lands after the payment does not suspend', async () => {
+    setup();
+    await settlePaygOverageMonth(OWNER, M, DAY2);
+    const sep = mockStripeState.invoices.get('in_1')!;
+    const failureRead = store.row; // status invoiced
+    await handleInvoicePaymentSucceeded({ ...sep, status: 'paid' });
+    (userDb.getUserByIdConsistent as jest.Mock).mockResolvedValueOnce(failureRead);
+    await handleInvoicePaymentFailed(sep);
+    expect(store.row.paygSettlements[M].status).toBe('paid');
+    expect(store.row.paygOverage.suspended).toBeUndefined();
+  });
+
+  it('a failure that newly fails a month still suspends (and re-stamps an existing payment-failure suspension)', async () => {
+    setup(ownerRow({ paygOverage: payg({ suspended: { reason: 'payment_failed', at: '2026-09-05T00:00:00.000Z', invoiceId: 'in_old' } }) }));
+    await settlePaygOverageMonth(OWNER, M, DAY2);
+    await handleInvoicePaymentFailed(mockStripeState.invoices.get('in_1')!);
+    expect(store.row.paygOverage.suspended).toMatchObject({ reason: 'payment_failed', invoiceId: 'in_1' });
+  });
+});
+
+describe('ENG-668 settlement — set-aside invoices and recovery (rv3 MINOR 2/3/4)', () => {
+  /** September pending on draft in_1 (the run died after the line item), then voided by hand in Stripe. */
+  async function heldOnVoid() {
+    setup();
+    mockStripeState.loseResponse.add('invoiceItems.create');
+    await expect(settlePaygOverageMonth(OWNER, M, DAY2)).rejects.toThrow('socket hang up');
+    mockStripeState.invoices.get('in_1')!.status = 'void';
+    (emailService.sendOncallAlert as jest.Mock).mockClear();
+    expect(await settlePaygOverageMonth(OWNER, M, new Date('2026-10-03T12:00:00.000Z'))).toBe('held');
+  }
+
+  it('P3: a late payment_failed for the voided invoice is ignored — no failed month, no suspension', async () => {
+    await heldOnVoid();
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    await handleInvoicePaymentFailed(mockStripeState.invoices.get('in_1')!);
+    await handleInvoicePaymentSucceeded({ ...mockStripeState.invoices.get('in_1')!, status: 'paid' });
+    warn.mockRestore();
+    expect(settlement()).toMatchObject({ status: 'held' });
+    expect(store.row.paygOverage.suspended).toBeUndefined();
+  });
+
+  it('a dispute or refund event naming the set-aside invoice is ignored too: nothing suspended or recorded', async () => {
+    await heldOnVoid();
+    const voided = clone(mockStripeState.invoices.get('in_1')!);
+    mockStripe.invoicePayments.list.mockResolvedValue({ data: [{ invoice: voided }] });
+    mockStripe.charges.retrieve.mockResolvedValue({ id: 'ch_v', customer: 'cus_card', amount: 4500, currency: 'usd', payment_intent: 'pi_v', metadata: {} });
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    await handleChargeDisputeCreated({ id: 'dp_v', charge: 'ch_v', amount: 4500, currency: 'usd' });
+    await handleChargeRefunded({ id: 'ch_v', customer: 'cus_card', amount: 4500, amount_refunded: 4500, refunded: true, currency: 'usd', payment_intent: 'pi_v', metadata: {} });
+    warn.mockRestore();
+    expect(store.row.paygOverage.suspended).toBeUndefined();
+    expect(settlement()).not.toHaveProperty('dispute');
+    expect(settlement()).not.toHaveProperty('refundedCents');
+  });
+
+  it('P8: the void alert says the invoice was finalized and voided, and to check for payments — not "nothing was finalized"', async () => {
+    await heldOnVoid();
+    const [, body] = (emailService.sendOncallAlert as jest.Mock).mock.calls[0];
+    expect(body).toContain('was finalized and later voided');
+    expect(body).toContain('whether any payment was taken on it');
+    expect(body).not.toContain('No invoice was finalized');
+    expect(body).toContain(`set paygSettlements.${M}.status to "retry"`);
+  });
+
+  it('P4: retry within the next month issues ONE fresh live invoice', async () => {
+    await heldOnVoid();
+    store.row = { ...store.row, paygSettlements: { [M]: { ...store.row.paygSettlements[M], status: 'retry' } } };
+    const summary = await runPaygSettlement(new Date('2026-10-04T12:00:00.000Z'));
+    expect(summary.outcomes).toEqual({ invoiced: 1 });
+    const live = [...mockStripeState.invoices.values()].filter((i) => i.status !== 'void' && i.metadata.month === M);
+    expect(live).toHaveLength(1);
+    expect(live[0]).toMatchObject({ status: 'open', total: 4500 });
+    expect(settlement()).toMatchObject({ status: 'invoiced', invoiceId: live[0].id, retriedAt: '2026-10-04T12:00:00.000Z' });
+  });
+
+  it('P5: a month held long after it closed is re-settled on retry from the inputs frozen on its record', async () => {
+    await heldOnVoid();
+    expect(settlement()?.inputs).toEqual({
+      credits: { purchasedMicroUsd: 0, adminGrantedMicroUsd: 0, migrationOffsetMicroUsd: 0 },
+      poolHighWater: { month: M, thresholdMicroUsd: 100 * USD },
+    });
+    // Two months on, the row no longer holds September's mark (or credits); on-call sets retry in December.
+    store.row = {
+      ...store.row,
+      paygOverage: { ...store.row.paygOverage, poolHighWater: { month: '2026-12', thresholdMicroUsd: 10 * USD }, poolHighWaterClosed: undefined },
+      paygSettlements: { [M]: { ...store.row.paygSettlements[M], status: 'retry' } },
+    };
+    const summary = await runPaygSettlement(new Date('2026-12-02T12:00:00.000Z'));
+    expect(summary.outcomes).toMatchObject({ invoiced: 1 });
+    // Billed on September's own $100 pool: $30 x 1.5, exactly as the first measurement had it.
+    expect(settlement()).toMatchObject({ status: 'invoiced', amountCents: 4500 });
+    expect([...mockStripeState.invoices.values()].filter((i) => i.status !== 'void' && i.metadata.month === M)).toHaveLength(1);
+  });
+
+  it('an admitted month with no record, older than the month that just closed, is held (inputs gone) — loudly, never billed blind', async () => {
+    // e.g. settlement switched on late, or a record deleted by hand instead of set to retry.
+    setup(ownerRow({ paygOverage: payg({ admittedMonths: [admitted(M)] }) }));
+    const summary = await runPaygSettlement(new Date('2026-11-02T12:00:00.000Z'));
+    expect(store.row.paygSettlements[M]).toMatchObject({ status: 'held', heldReason: 'inputs_unavailable' });
+    expect(summary.outcomes).toMatchObject({ held: 1 });
+    expect(mockStripe.invoices.create.mock.calls.every(([params]) => params.metadata?.month !== M)).toBe(true);
+    const [subject, body] = (emailService.sendOncallAlert as jest.Mock).mock.calls.find(([s]) => String(s).includes(M))!;
+    expect(subject).toContain('inputs_unavailable');
+    expect(body).toContain('No invoice was created and nothing was collected');
+  });
+
+  it('a retry is only acted on while the record still says retry, and is not re-run afterwards', async () => {
+    await heldOnVoid();
+    store.row = { ...store.row, paygSettlements: { [M]: { ...store.row.paygSettlements[M], status: 'retry' } } };
+    await runPaygSettlement(new Date('2026-10-04T12:00:00.000Z'));
+    mockStripe.invoices.create.mockClear();
+    const again = await runPaygSettlement(new Date('2026-10-05T12:00:00.000Z'));
+    expect(again.outcomes).toEqual({});
+    expect(mockStripe.invoices.create).not.toHaveBeenCalled();
   });
 });
