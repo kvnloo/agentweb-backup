@@ -1,4 +1,5 @@
 import express, { Request, Response } from 'express';
+import { statusAfterReviewedSend } from '../utils/leadSchema';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { crmDb, taskDb, subscriberDb, userDb, orgDb } from '../services/db';
 import { resolveOrgProfileField } from '../services/orgProfileResolver';
@@ -6549,10 +6550,13 @@ router.post('/lists/:listId/leads/:leadId/send-email', async (req: Request, res:
       return res.status(500).json({ message: error.message || 'Failed to send email' });
     }
 
-    // Remove the email draft after successfully sending
-    await crmDb.updateLead(listId, leadId, {
-      emailDraft: null
-    });
+    // Remove the email draft after successfully sending. A lead that was waiting in
+    // Pending Review has now been contacted, so move it out of the review queue —
+    // otherwise a manual send from the lead panel leaves it stuck there.
+    const postSendUpdates: Record<string, unknown> = { emailDraft: null };
+    const nextStatus = statusAfterReviewedSend(lead.status, list.statusConfig, list.listType);
+    if (nextStatus) postSendUpdates.status = nextStatus;
+    await crmDb.updateLead(listId, leadId, postSendUpdates);
 
     res.json({
       message: 'Email sent successfully',
