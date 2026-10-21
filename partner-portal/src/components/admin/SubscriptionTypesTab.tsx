@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import {
   Box,
   Button,
@@ -95,6 +95,8 @@ interface AvailableFeature {
   id: string;
   label: string;
   description: string;
+  /** Costs AgentWeb money per use: never ticked by default, only by an explicit admin choice. */
+  optInOnly?: boolean;
 }
 
 const AVAILABLE_CONNECTED_ACCOUNTS = [
@@ -134,6 +136,10 @@ const SubscriptionTypesTab: React.FC = () => {
   const [availableSkills, setAvailableSkills] = useState<AvailableSkill[]>([]);
   const [availablePages, setAvailablePages] = useState<CustomerPortalPage[]>([]);
   const [availableFeatures, setAvailableFeatures] = useState<AvailableFeature[]>([]);
+  const defaultFeatureIds = useMemo(
+    () => availableFeatures.filter((feature) => !feature.optInOnly).map((feature) => feature.id),
+    [availableFeatures],
+  );
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
@@ -245,7 +251,7 @@ const SubscriptionTypesTab: React.FC = () => {
             allowedPages: availablePages.map((p) => p.path),
             hiddenPages: [],
             allowedSkills: availableSkills.map((s) => s.skillId),
-            allowedFeatures: availableFeatures.map((feature) => feature.id),
+            allowedFeatures: defaultFeatureIds,
           }));
         }
       } else if (editingType.allowedSkills.includes('*')) {
@@ -272,11 +278,11 @@ const SubscriptionTypesTab: React.FC = () => {
       if (editingType && !Array.isArray(editingType.allowedFeatures) && availableFeatures.length > 0) {
         setFormData((prev) => ({
           ...prev,
-          allowedFeatures: availableFeatures.map((feature) => feature.id),
+          allowedFeatures: defaultFeatureIds,
         }));
       }
     }
-  }, [availableSkills, availablePages, availableFeatures, editDialogOpen, editingType]);
+  }, [availableSkills, availablePages, availableFeatures, defaultFeatureIds, editDialogOpen, editingType]);
 
   const handleOpenEditDialog = (type?: SubscriptionType) => {
     if (type) {
@@ -312,7 +318,7 @@ const SubscriptionTypesTab: React.FC = () => {
         allowedConnectedAccounts: expandedConnectedAccounts,
         allowedFeatures: Array.isArray(type.allowedFeatures)
           ? type.allowedFeatures
-          : availableFeatures.map((feature) => feature.id),
+          : defaultFeatureIds,
         monthlyTokenAllowance: type.monthlyTokenAllowance ?? null,
         monthlyCostAllowance: type.monthlyCostAllowance ?? null,
       };
@@ -353,7 +359,7 @@ const SubscriptionTypesTab: React.FC = () => {
         hiddenPages: [],
         allowedSkills: availableSkills.map((s) => s.skillId),
         allowedConnectedAccounts: AVAILABLE_CONNECTED_ACCOUNTS.map((a) => a.id),
-        allowedFeatures: availableFeatures.map((feature) => feature.id),
+        allowedFeatures: defaultFeatureIds,
         monthlyTokenAllowance: null,
         monthlyCostAllowance: null,
       });
@@ -1136,6 +1142,11 @@ const SubscriptionTypesTab: React.FC = () => {
                       <Typography variant="caption" color="text.secondary">
                         {feature.description}
                       </Typography>
+                      {feature.optInOnly && (
+                        <Typography variant="caption" color="warning.main" display="block">
+                          Costs AgentWeb money per use — tick only for paid plans
+                        </Typography>
+                      )}
                     </Box>
                   )}
                 />

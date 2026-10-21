@@ -9,6 +9,7 @@ Install checklist (test instance first; production needs the network-isolation P
 3. Homes filesystem: a fixed-size loop image mounted at `/var/lib/aw-login-host/<env>/u` with `nosuid,nodev,usrquota` (the host refuses to start otherwise); run `quotacheck`/`quotaon`.
 4. `/etc/aw-login-host/<env>.json` root-owned 0600, uid range disjoint from every other env and `/etc/subuid` (the host enforces both).
 5. `systemctl enable --now aw-login-host@<env>`; the socket dir `/run/aw-login-host-<env>` is the access gate (group = the backend's gid).
+6. Network isolation (PR 2, mandatory): `socat` installed (`/usr/bin/socat`), `aw-net.sh` next to `claude-turn.sh` (root-owned 0755), and an `egress.allow` list in the config. Every customer unit then runs with `PrivateNetwork=yes` (loopback only) and reaches ONLY the host's allowlisting proxy (`/run/aw-egress-<env>/proxy.sock`, started and owned by the host process); the Emma tool bridge from `claude.bridgeUrl` is allowed automatically. The proxy refuses anything not on the list and any name that resolves to a private/loopback/metadata address.
 Config is a CLOSED schema: unknown keys fail start-up. See `host/hostConfig.ts`.
 
 ## Test instance only

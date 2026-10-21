@@ -33,7 +33,7 @@ import {
   type OutcomeVerdict,
 } from './outcomeLedger';
 
-const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+import { TABLE_PREFIX } from '../config/constants';
 export const OUTCOME_LEDGER_TABLE = `${TABLE_PREFIX}AW-AdsOutcomeLedger`;
 export const STATUS_EVALUATION_DATE_INDEX = 'StatusEvaluationDateIndex';
 

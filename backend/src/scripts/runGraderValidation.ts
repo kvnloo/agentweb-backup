@@ -15,7 +15,7 @@
 
 import { goldenSetStoreFromEnv, GOLDEN_CASES_TABLE_ENV } from '../loops/eval/goldenSetStore';
 import { defaultGoldenCaseGraders, MIN_CLASS_EXAMPLES, runValidation } from '../loops/eval/runValidation';
-import { isQualifyingValidation } from '../loops/eval/evalRegistry';
+import { getGrader, isQualifyingValidation } from '../loops/eval/evalRegistry';
 import type { GoldenSplit } from '../loops/eval/goldenSet';
 
 async function main(): Promise<void> {
@@ -36,7 +36,15 @@ async function main(): Promise<void> {
     console.error(`Golden-set store not provisioned: set ${GOLDEN_CASES_TABLE_ENV} (OPS-2 / ENG-2147).`);
     process.exit(1);
   }
-  const run = await runValidation({ graderId, store, graders: defaultGoldenCaseGraders(), evidence, split, includeAiLabels });
+  const run = await runValidation({
+    graderId,
+    store,
+    // LLM judges cost a call per case: build them only when one is the grader being validated.
+    graders: defaultGoldenCaseGraders({ llmJudges: getGrader(graderId)?.graderType === 'llm_judge' }),
+    evidence,
+    split,
+    includeAiLabels,
+  });
   console.log(JSON.stringify(run, null, 2));
   if (run.labelSource === 'human+ai') {
     console.log(`${graderId}: ADVISORY — includes ${run.aiLabelledCases} AI-written label(s); not human agreement and not a registry-eligible validation (mayGate stays false).`);

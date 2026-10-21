@@ -331,6 +331,7 @@ export const METERED_VENDOR_PROVIDERS = [
   "elevenlabs",
   "2captcha",
   "placid",
+  "twilio",
 ] as const;
 
 /** Non-vendor scopes the aggregation accepts alongside a vendor key. */

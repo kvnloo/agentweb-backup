@@ -26,6 +26,7 @@ import {
 } from './compareProviderPolicy';
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'crypto';
 import type { ChatMessage } from '../chatbotService';
+import { AGENTWEB_MODEL_ID } from './modelAccess';
 import { classifyToolErrorClass } from '../../utils/toolErrorClassifier';
 import type { UsageBlockPaygInput } from '../../utils/usageBlockCopy';
 import {
@@ -167,6 +168,12 @@ export interface CompareDeps {
    * blocked (also while the tier allowlist is off). Omitted = not gated.
    */
   getTierCompareBlock?(ownerUserId: string): Promise<{ tier: string | null; upgradeRequired: string[] } | null>;
+  /**
+   * ENG-669 PR-C: whether the AgentWeb Model router is on. While it is, `agentweb-model` is refused as a Compare column
+   * (it is a router, not one model; v0 compares concrete models only). Read only when a column names it.
+   * Omitted = off (the id is an unknown model, rejected per column as before).
+   */
+  isAgentWebModelRouterEnabled?(): Promise<boolean>;
   getSession(sessionId: string): Promise<CompareSession | null>;
   checkUsage(userId: string): Promise<CompareUsageStatus>;
   /** Builds the 429 body fields shared with /generate (message + structured usageBlock). */
@@ -616,6 +623,13 @@ export async function compareModels(
   const parsed = validateCompareRequest(input.body);
   if (!parsed.ok) return parsed.outcome;
   const { sessionId, prompt, models } = parsed.value;
+  if (models.includes(AGENTWEB_MODEL_ID) && deps.isAgentWebModelRouterEnabled && await deps.isAgentWebModelRouterEnabled()) {
+    return fail(
+      400,
+      'The AgentWeb Model picks a different model per task, so it cannot be a comparison column. Compare specific models instead.',
+      'agentweb_model_not_comparable',
+    );
+  }
 
   const session = await deps.getSession(sessionId);
   if (!session) return fail(404, 'Session not found', 'session_not_found');

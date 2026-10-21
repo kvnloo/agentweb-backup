@@ -21,27 +21,39 @@ import {
 
 export { isSystemAuthoredPlan };
 
+/** Every configured subscription tier (admin order) with its raw `allowedModels`. Throws when the setting is unreadable. */
+export async function listSubscriptionTiers(): Promise<TierModelsConfig[]> {
+  const { settingsService } = await import('../settingsService');
+  const setting = await settingsService.getSetting('subscription_types');
+  const parsed: unknown = setting?.settingValue ? JSON.parse(setting.settingValue) : [];
+  return Array.isArray(parsed) ? (parsed as TierModelsConfig[]) : [];
+}
+
 export const modelAccess: ModelAccessService = createModelAccess({
   getSetting: async (name) => (await import('../settingsService')).settingsService.getSetting(name),
   getUser: async (userId) => (await import('../db')).userDb.getUserById(userId),
   resolveTier: async (userId) => (await import('../subscriptionService')).getUserSubscriptionResolution(userId),
   readTierModels: async (tierName) => (await import('../subscriptionService')).readTierAllowedModels(tierName),
-  listTiers: async () => {
-    const { settingsService } = await import('../settingsService');
-    const setting = await settingsService.getSetting('subscription_types');
-    const parsed: unknown = setting?.settingValue ? JSON.parse(setting.settingValue) : [];
-    return Array.isArray(parsed) ? (parsed as TierModelsConfig[]) : [];
-  },
+  listTiers: () => listSubscriptionTiers(),
   // The same alias table agentModeService.normalizeModelId applies (a pure module, no service graph).
   normalizeModelId: resolveLegacyModelAlias,
   alertTierUnreadable: async ({ ownerUserId, tier, dedupeKey, dedupeWindowMs }) => {
     const { sendAgentModeOncallAlert } = await import('../../utils/agentModeAlerts');
-    return sendAgentModeOncallAlert({
-      subject: 'AgentMode: tier model allowlist could not read a subscription tier',
-      message:
-        'The tier model allowlist (model_tier_allowlist_enabled) could not read the owner\'s subscription tier and ' +
+    // The tier is also read by the AgentWeb Model router (ENG-669 PR-C) for its per-tier routes, with the allowlist on
+    // or off: only name the allowlist when it is the one reading (a failed switch read counts as off).
+    const allowlistOn = await modelAccess.isEnabled().catch(() => false);
+    const consequence = allowlistOn
+      ? 'The tier model allowlist (model_tier_allowlist_enabled) could not read the owner\'s subscription tier and ' +
         'had no last-known answer, so the requested model was ALLOWED (the gate never blocks on an infrastructure ' +
-        'failure). Check the subscription_types setting and the user/org reads.\n\nNOTE: deduped; further ' +
+        'failure).'
+      : 'The AgentWeb Model router could not read the owner\'s subscription tier and had no last-known answer, so ' +
+        'the turn was routed without a confirmed tier (that tier\'s overrides in the routing table may not have applied).';
+    return sendAgentModeOncallAlert({
+      subject: allowlistOn
+        ? 'AgentMode: tier model allowlist could not read a subscription tier'
+        : 'AgentMode: AgentWeb Model router could not read a subscription tier',
+      message:
+        `${consequence} Check the subscription_types setting and the user/org reads.\n\nNOTE: deduped; further ` +
         'occurrences in the next hour are suppressed (grep "ModelAccess: tier unreadable" in the logs).',
       context: { Owner: ownerUserId, Tier: tier ?? 'unknown' },
       dedupeKey,

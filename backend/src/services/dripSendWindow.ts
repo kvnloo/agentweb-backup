@@ -55,7 +55,8 @@ interface LocalParts {
 
 const WEEKDAYS: Record<string, number> = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
 
-function localParts(ms: number, tz: string): LocalParts {
+/** Wall-clock fields of an instant in an IANA zone; Intl applies that zone's DST rules for that very instant. */
+export function localParts(ms: number, tz: string): LocalParts {
   const fmt = new Intl.DateTimeFormat('en-US', {
     timeZone: tz,
     hourCycle: 'h23',
@@ -73,7 +74,7 @@ function localParts(ms: number, tz: string): LocalParts {
     year: Number(p.year),
     month: Number(p.month),
     day: Number(p.day),
-    hour: Number(p.hour),
+    hour: Number(p.hour) % 24, // some Node/ICU builds print midnight as 24 even with h23
     minute: Number(p.minute),
     second: Number(p.second),
     weekday: WEEKDAYS[p.weekday],

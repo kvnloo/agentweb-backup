@@ -1457,3 +1457,36 @@ describe('ENG-669 tier model allowlist', () => {
     expect(resolveModel).toHaveBeenCalledWith({ userId: OWNER.userId, requestedModel: 'gpt-5.5' });
   });
 });
+
+/**
+ * ENG-669 PR-C: the AgentWeb Model is a router, not one model, so v0 refuses it as a Compare column (400, before any
+ * read or spend) while its switch is on. Off, it is an unknown id exactly as before (rejected per column).
+ */
+describe('ENG-669 PR-C AgentWeb Model column', () => {
+  it('switch on: 400 agentweb_model_not_comparable before any session read, usage read or model call', async () => {
+    const isAgentWebModelRouterEnabled = jest.fn(async () => true);
+    const { deps, callLLM } = makeDeps({ isAgentWebModelRouterEnabled });
+    const out = await run(deps, body({ models: ['agentweb-model', 'gpt-5.5'] }));
+    expect(out.status).toBe(400);
+    expect(res(out)).toEqual({
+      error: 'The AgentWeb Model picks a different model per task, so it cannot be a comparison column. Compare specific models instead.',
+      code: 'agentweb_model_not_comparable',
+    });
+    expect(deps.getSession).not.toHaveBeenCalled();
+    expect(deps.checkUsage).not.toHaveBeenCalled();
+    expect(callLLM).not.toHaveBeenCalled();
+  });
+
+  it('switch off: unchanged (the id is an unknown model, rejected as a column); other requests never read the switch', async () => {
+    const isAgentWebModelRouterEnabled = jest.fn(async () => false);
+    const { deps, callLLM } = makeDeps({ isAgentWebModelRouterEnabled });
+    const out = await run(deps, body({ models: ['agentweb-model', 'gpt-5.5'] }));
+    expect(out.status).toBe(200);
+    expect(res(out).results[0]).toMatchObject({ model: 'agentweb-model', status: 'rejected', errorCode: 'model_unavailable' });
+    expect(callLLM).toHaveBeenCalledTimes(1);
+
+    isAgentWebModelRouterEnabled.mockClear();
+    await run(makeDeps({ isAgentWebModelRouterEnabled }).deps, body());
+    expect(isAgentWebModelRouterEnabled).not.toHaveBeenCalled();
+  });
+});

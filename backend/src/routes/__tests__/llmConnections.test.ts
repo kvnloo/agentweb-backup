@@ -124,6 +124,16 @@ describe('/api/llm-connections', () => {
     expect((await request(app).delete('/api/llm-connections/conn-1')).status).toBe(204);
   });
 
+  it('answers 202 when a hosted login is fenced but the login host has not yet confirmed the wipe, 204 once it has', async () => {
+    const { app, service } = makeApp();
+    service.revoke.mockResolvedValueOnce('revoking' as never);
+    const pending = await request(app).delete('/api/llm-connections/conn-1');
+    expect(pending.status).toBe(202);
+    expect(pending.body).toEqual({ status: 'revoking' });
+    service.revoke.mockResolvedValueOnce('revoked' as never);
+    expect((await request(app).delete('/api/llm-connections/conn-1')).status).toBe(204);
+  });
+
   it('rate-limits per user', async () => {
     const { app } = makeApp();
     let last = 200;

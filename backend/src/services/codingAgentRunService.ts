@@ -2,7 +2,7 @@ import AWS from 'aws-sdk';
 import { v4 as uuidv4 } from 'uuid';
 import type { AcceptanceVerificationResult } from './codingAgentAcceptance';
 
-const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+import { TABLE_PREFIX } from '../config/constants';
 const RUNS_TABLE = `${TABLE_PREFIX}AW-CodingAgentRuns`;
 
 const dynamodb = new AWS.DynamoDB.DocumentClient({

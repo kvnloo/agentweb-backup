@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { resolveModelForUser } from './modelRoles';
 import { OUTCOME_JUDGE_SHADOW_FEATURE, assertOutcomeJudgeModelAllowed, DEFAULT_OUTCOME_JUDGE_MODEL, isInShadowSample } from './outcomeJudge';
 import { chatbotDb, ChatSession, ChatMessage } from "./chatbotService";
+import { isTestScheduledSession } from "../utils/scheduledTestRunSession";
 import { summarizeAiStyleTells } from "./aiStyleGuard";
 import {
   appendConfirmedPublishNotice,
@@ -934,27 +935,6 @@ function classifyTurnlessSession(session: ChatSession): "in-flight" | "failed" {
   if (Number.isNaN(updatedAtMs)) return "failed";
   const age = Date.now() - updatedAtMs;
   return age <= IN_FLIGHT_GRACE_MS ? "in-flight" : "failed";
-}
-
-/**
- * Whether this session is a manual "Test this schedule" run rather than a real
- * scheduled execution. Test runs are triggered interactively by the user, who
- * watches the outcome live, and are deliberately excluded from the durable
- * lease/reconciler recovery path (agentModeController.runScheduledChat) — a test
- * click must never requeue. They are QA actions, not production runs, so a test
- * that crashes must not be scored or surfaced as a satisfaction reliability
- * failure: doing so pollutes the cohort and files recurring product tickets for
- * what the user already saw fail in the UI (ENG-499).
- *
- * runScheduledChat prefixes the pageIdentifier (and title) with "Test: " for a
- * test run and "Scheduled: " for a real run, so the prefix is a reliable marker
- * fixed at session creation. A schedule literally named "Test: …" produces a real
- * run titled "Scheduled: Test: …", which correctly does NOT match.
- */
-function isTestScheduledSession(session: ChatSession): boolean {
-  if (session.sessionType !== "scheduled") return false;
-  const marker = session.pageIdentifier ?? session.title ?? "";
-  return marker.startsWith("Test: ");
 }
 
 // ENG-803/ENG-1245: the exact terminal sentence a scheduled run is instructed to end
