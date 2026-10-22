@@ -14,14 +14,20 @@ pins, sha256 of every file), `check-config.js` (the host's own config parser), t
 the worker's own private address is read at install time.
 
 ## Deploy
-Upload the tarball to `s3://agentweb-login-host-992382574572/prod/builds/` and run the SSM document `AW-LoginHost-Deploy-Prod` with `BuildKey` and `Sha256`.
-Who may upload and run it is deliberately NOT decided here (Harsha/Yugo: a deploy path is root on the machine that holds customer logins).
+**Automatic.** A merge to `main` that touches the host runs `.github/workflows/login-host-deploy.yml`: build (the gate), sign with KMS, upload, and run the SSM document
+`AW-LoginHost-Deploy-Prod`, whose body is `ssm-run.sh` in this folder. The document verifies the signature before it unpacks anything, then runs the build's `deploy.sh`:
+install (switch the active release; the running host is untouched) -> **wait for an idle moment** (no turn running, nobody mid sign-in; never forced) -> refuse new work for the
+seconds of the restart -> restart -> health check -> **roll back by itself** if unhealthy. A signed build older than the one deployed is refused (no downgrades).
+No person approves a deploy and no vendor takes part. One-time setup and the residual risk: `../aws/README.md`.
 
-**Requirement for whoever maintains the SSM document:** (1) verify the sha256 of the downloaded file against the `Sha256` parameter BEFORE extracting anything;
-(2) extract into a FRESH, root-owned `mktemp -d` directory with mode 0700 (never a predictable or shared path), AFTER the hash check; (3) run `install.sh` from
-that directory as root; (4) only if `install.sh` exits 0 (or 3, see below) `systemctl restart aw-login-host@prod`, then wait for the journal line
-`host_started` (or call `connection.status` for a made-up id over the unix socket and expect `ENOTFOUND`); "the unit is active" is NOT enough: `Type=simple`
-is active for the first seconds of a crash loop. (5) put the document itself in the repo (it is not there yet) so deploys can be reviewed.
+`deploy.sh` exit codes: 0 deployed | 75 host stayed busy, nothing changed (the workflow retries, then asks you to re-run) | 1 bad build, rolled back | 2 bad build and the
+rollback failed: the host is DOWN | 3 bridge URL missing | 4 older than the deployed build, refused. `--force` (a person, on a shell, never the pipeline) skips the idle wait
+for an emergency fix and cuts running turns off.
+
+**By hand** (break glass, on a Session Manager shell as root): extract a build tarball into a fresh `mktemp -d` and run `./deploy.sh` from it.
+
+**What a customer sees during a deploy:** nothing, normally. If a chat message starts in the few seconds of the restart it waits (the backend retries "draining" and "worker not
+reachable" for up to 40 s) and then runs once; a sign-in started in that window asks the customer to try again. Running turns and sign-ins in progress are never interrupted.
 
 ## Worker layout (what `install.sh` creates)
 ```
@@ -85,11 +91,12 @@ turn = ~2.4 GB, plus ~200 MB per sign-in process: it fits only just. If you rais
 - **Recovery policy: everyone re-signs in.** A refresh token rotates and can only be used once, so a snapshot of the data disk is dead for any customer whose login refreshed
   after it was taken, and the state file (`/var/lib/aw-login-host/prod/state`) lives on the ROOT disk. If the data or root disk is lost, accepted recovery is: every
   affected customer reconnects (their records become `needs reconnect` when the sweeper finds the home lost). Tell customers this up front.
-- **Deploy order across a protocol change.** The backend deploys on every merge to main; the worker deploys by hand. Request-shape changes (new/changed request fields or
+- **Deploy order across a protocol change.** The backend and the worker both deploy automatically on a merge to main, in parallel. Request-shape changes (new/changed request fields or
   routes): deploy the WORKER first, then the backend. Reply-shape changes (new reply fields the backend reads): deploy the BACKEND first. Until there is a version handshake,
   an unknown route answers like "connection not found" (`ENOTFOUND`), which the revoke path treats as "nothing to wipe": never ship a backend that needs a route to a worker
   that does not have it yet.
-- **Redeploys restart the host**, which ends in-flight turns and pending sign-ins (start-up stops every customer unit). Deploy in a quiet moment until a drain mode exists.
+- **A redeploy waits for the host to be idle** (`host.drain`, unix socket only) and then restarts it, so it does not end in-flight turns or sign-ins. Anything that restarts the host
+  by other means (`systemctl restart`, a reboot, a crash) still does: start-up stops every customer unit.
 
 ## Before the first real start
 Create `/etc/aw-login-host/bridge-url` (one line): the **https** URL of the backend's tool bridge as reachable from the worker. It is decided with the B4 turn path.

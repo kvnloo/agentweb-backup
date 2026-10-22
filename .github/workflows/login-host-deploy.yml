@@ -1,0 +1,108 @@
+name: Login host deploy
+
+# ENG-2110: ships the login host to the prod worker, automatically, with no human approval per deploy and no vendor in the loop.
+#
+# The gate is the REVIEWED MERGE, not a click: this only runs for code that is already on main. What stops a bad or hostile build from reaching the
+# machine that holds customers' Claude logins is checked by machines, in this order:
+#   1. the build script refuses to package unless the host/deploy/mutual-TLS tests pass, the tree is clean and the lockfile matches;
+#   2. the build is signed with a KMS key ONLY this workflow's role can use (the role's trust is pinned to the `login-host-prod` environment, which only
+#      accepts runs from `main`); the worker's SSM document verifies that signature before it unpacks a byte, and refuses a build older than the one running;
+#   3. the worker waits for an idle moment (running turns and sign-ins finish; nothing is ever cut off), restarts, checks health, and rolls back by itself.
+# Set up ONCE by someone with IAM rights: backend/src/loginHost/deploy/aws/README.md. Nothing here needs that person again.
+#
+# Backend-only merges do not trigger this (path filter). A change that needs the worker to be new BEFORE the backend (a new request field or route, see
+# PROTOCOL_VERSION in loginHost/protocol.ts) must be merged in two steps: worker side first, backend side after this run is green.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'backend/src/loginHost/**'
+      - 'backend/scripts/build-login-host.sh'
+      - 'backend/scripts/sign-login-host.sh'
+      - 'backend/package-lock.json'
+      - '.github/workflows/login-host-deploy.yml'
+      - '.github/scripts/login-host-run-deploy.sh'
+  workflow_dispatch:
+    inputs:
+      max_wait_seconds:
+        description: 'How long the worker may wait for an idle moment before giving up (it never forces a restart)'
+        required: false
+        default: '1800'
+        type: string
+
+# One at a time, newest wins; a running deploy is never cancelled half-way.
+concurrency:
+  group: login-host-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-west-2
+  ROLE_ARN: arn:aws:iam::992382574572:role/aw-login-host-ci
+  BUCKET: agentweb-login-host-992382574572
+  KMS_KEY: alias/aw-login-host-signing
+  INSTANCE_ID: i-033394e5467b48e94
+
+jobs:
+  deploy:
+    name: Build, sign, deploy
+    # Only ever from main, whatever started it (a manual run from another branch would also be refused by the environment and by AWS).
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: login-host-prod
+    timeout-minutes: 300
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the build records the commit time; the worker refuses to go back to an older build
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Build (runs the gate tests; refuses a dirty tree or a lockfile mismatch)
+        working-directory: backend
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+        run: bash scripts/build-login-host.sh --out "$RUNNER_TEMP/out"
+
+      - name: Configure AWS credentials (OIDC, no stored keys)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 3600
+
+      - name: Sign the build with KMS
+        working-directory: backend
+        run: |
+          tar_file=$(ls "$RUNNER_TEMP"/out/login-host-*.tar.gz)
+          bash scripts/sign-login-host.sh "$tar_file" "$KMS_KEY"
+
+      - name: Upload the build and its signature
+        run: |
+          tar_file=$(ls "$RUNNER_TEMP"/out/login-host-*.tar.gz)
+          name=$(basename "$tar_file")
+          # The build first, then the signature: the worker needs both, and is only asked after both are there.
+          aws s3 cp --only-show-errors "$tar_file" "s3://$BUCKET/prod/builds/$name"
+          aws s3 cp --only-show-errors "$tar_file.sig" "s3://$BUCKET/prod/builds/$name.sig"
+          echo "BUILD_KEY=prod/builds/$name" >>"$GITHUB_ENV"
+
+      - name: Deploy on the worker (waits for an idle moment, health-checks, rolls back by itself)
+        env:
+          # Passed through the environment, never interpolated into the script text; the worker's document also constrains it to digits.
+          MAX_WAIT: ${{ inputs.max_wait_seconds || '1800' }}
+        run: bash .github/scripts/login-host-run-deploy.sh "$BUILD_KEY" "$MAX_WAIT"

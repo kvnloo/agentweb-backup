@@ -609,6 +609,19 @@ case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${
     expect(text(join(pkg, "versions.env"))).not.toMatch(/172\.31\.30\.50/);
   });
 
+  it("the real tarball passes the SSM document's own layout rule: one top directory named after the build, no absolute or parent paths, a deploy.sh that is a regular file", () => {
+    const tgz = readdirSync(tarDir).find((f) => f.endsWith(".tar.gz"))!;
+    const name = tgz.replace(/\.tar\.gz$/, "");
+    const entries = spawnSync("tar", ["-tzf", join(tarDir, tgz)], { encoding: "utf8" }).stdout.split("\n").filter(Boolean);
+    expect(entries.length).toBeGreaterThan(10);
+    for (const e of entries) {
+      expect({ e, unsafe: e.startsWith("/") || e.includes("..") }).toEqual({ e, unsafe: false });
+      expect({ e, inside: e === name || e.startsWith(`${name}/`) }).toEqual({ e, inside: true });
+    }
+    expect(lstatSync(join(pkg, "deploy.sh")).isFile()).toBe(true);
+    expect(text(join(pkg, "MANIFEST"))).toMatch(/^commit_time=\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/m); // deploy.sh's no-downgrade rule reads this
+  });
+
   it("FIRST install: a complete, validated release is switched in atomically; the unit, slice and config are in place; nothing was disabled", () => {
     const b = box();
     const r = run(b);

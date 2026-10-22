@@ -22,6 +22,10 @@ interface Scenario {
   health?: number[];
   rollbackRc?: number;
   hasPrevious?: boolean;
+  /** the build's commit_time in its MANIFEST (omit the file with null) */
+  buildTime?: string | null;
+  /** the commit time (epoch) of the build the worker last finished deploying */
+  lastDeployedEpoch?: number;
 }
 
 describe("deploy.sh", () => {
@@ -51,6 +55,10 @@ describe("deploy.sh", () => {
     copyFileSync(DEPLOY_SH, join(pkg, "deploy.sh"));
     chmodSync(join(pkg, "deploy.sh"), 0o755);
     writeFileSync(join(pkg, ".aw-test-mode"), "");
+    if (sc.buildTime !== null) writeFileSync(join(pkg, "MANIFEST"), `name=x\ncommit_time=${sc.buildTime ?? "2026-10-22T10:00:00Z"}\n`);
+    mkdirSync(join(dir, "state"), { recursive: true });
+    rmSync(join(dir, "state/deployed-commit-time"), { force: true });
+    if (sc.lastDeployedEpoch !== undefined) writeFileSync(join(dir, "state/deployed-commit-time"), `${sc.lastDeployedEpoch}\n`);
     writeFileSync(join(pkg, "deployctl.js"), ""); // only the fake node reads its arguments
     // install.sh: logs, honours the scenario
     writeFileSync(
@@ -101,6 +109,7 @@ exit 0
         AW_DEPLOY_LOCK: join(dir, "deploy.lock"),
         AW_NODE: join(bin, "node"),
         AW_OPT: join(dir, "opt"),
+        AW_STATE_DIR: join(dir, "state"),
         AW_HEALTH_TIMEOUT: "5",
         ...extraEnv,
       },
@@ -218,6 +227,53 @@ exit 0
     expect(r.rc).toBe(1);
     expect(r.out).toContain("another deploy is running");
     expect(restarts(log())).toBe(0);
+  });
+
+  describe("no downgrades (a validly signed OLD build is still a downgrade)", () => {
+    const T = "2026-10-22T10:00:00Z";
+    const epoch = Date.parse(T) / 1000;
+    const recorded = () => {
+      try {
+        return Number(readFileSync(join(dir, "state/deployed-commit-time"), "utf8"));
+      } catch {
+        return undefined;
+      }
+    };
+
+    it("refuses a build older than the one deployed: exit 4, and NOTHING runs (not even the installer)", () => {
+      const r = run({ lastDeployedEpoch: epoch + 60 });
+      expect(r.rc).toBe(4);
+      expect(log().filter((c) => !c.startsWith("systemctl is-active"))).toEqual([]);
+      expect(r.out).toContain("REFUSED");
+      expect(recorded()).toBe(epoch + 60);
+    });
+    it("accepts the same commit again (a redeploy) and a newer one, and records the time only AFTER the host is healthy", () => {
+      expect(run({ lastDeployedEpoch: epoch }).rc).toBe(0);
+      expect(run({ lastDeployedEpoch: epoch - 3600 }).rc).toBe(0);
+      expect(recorded()).toBe(epoch);
+    });
+    it("first ever deploy records its time", () => {
+      expect(run({}).rc).toBe(0);
+      expect(recorded()).toBe(epoch);
+    });
+    it("a failed or rolled-back deploy does not move the mark forward", () => {
+      expect(run({ lastDeployedEpoch: epoch - 100, health: [1, 0] }).rc).toBe(1);
+      expect(recorded()).toBe(epoch - 100);
+      expect(run({ lastDeployedEpoch: epoch - 100, acquireRc: 75 }).rc).toBe(75);
+      expect(recorded()).toBe(epoch - 100);
+    });
+    it("the mark never moves backwards, even with --allow-older", () => {
+      expect(run({ lastDeployedEpoch: epoch + 500 }, ["--allow-older"]).rc).toBe(0);
+      expect(recorded()).toBe(epoch + 500);
+    });
+    it("--allow-older lets a person step back on purpose", () => {
+      expect(run({ lastDeployedEpoch: epoch + 60 }, ["--allow-older"]).rc).toBe(0);
+    });
+    it("a build whose MANIFEST has no readable commit time is refused", () => {
+      expect(run({ buildTime: null }).rc).toBe(4);
+      expect(run({ buildTime: "not a date" }).rc).toBe(4);
+      expect(log().filter((c) => !c.startsWith("systemctl is-active"))).toEqual([]);
+    });
   });
 
   it("refuses a nonsense wait limit and unknown arguments before doing anything", () => {

@@ -14,8 +14,8 @@
 import { z } from "zod";
 
 /**
- * The version of THIS protocol (routes, request and reply shapes). The backend deploys automatically on every merge while the worker is
- * deployed by hand, so the two are routinely built from different commits. Bump it whenever a route or a field is added, removed or
+ * The version of THIS protocol (routes, request and reply shapes). The backend and the worker both deploy automatically on a merge to main, but
+ * as separate pipelines that finish at different times (the worker also waits for an idle moment), so they routinely run different commits. Bump it whenever a route or a field is added, removed or
  * changes meaning, and keep the deploy order in mind:
  *   - a change to what the backend SENDS (a new route or request field): deploy the WORKER first (an old worker refuses unknown fields);
  *   - a change to what the worker REPLIES (a new reply field the backend starts relying on): deploy the BACKEND first (its reply shapes

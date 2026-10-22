@@ -5,12 +5,12 @@
  *   node hostClientLive.js            no login needed: error mapping, validation, unreachable socket, a real login.start/cancel
  *   node hostClientLive.js --login    also a REAL sign-in (you run it, in your own terminal; the code is typed hidden):
  *                                     turn + lease renewal, EBUSY retry (4 concurrent turns on a 3-process home),
- *                                     duplicate key, abort, revoke
+ *                                     duplicate key, abort, revoke, and a deploy drain with a REAL turn running (it must not be cut off)
  *
  * Credential rules as hostLiveAuth: the code goes only to the host API, is never printed or written; this script never opens a
  * credential file; output is redacted. The "Open this URL" line must not be pasted anywhere. It always cancels/revokes on failure.
  */
-import { createServer } from "http";
+import { createServer, request as httpRequest } from "http";
 import { LoginHostClient, LoginHostError, UnixSocketTransport } from "../../../services/funding/loginHostClient";
 import { runHostTurn, type HostTurnOutcome } from "../../../services/funding/loginHostTurn";
 
@@ -73,6 +73,17 @@ const bridge = createServer((req, res) => {
 });
 
 const client = new LoginHostClient(new UnixSocketTransport(SOCK));
+/** `host.drain` is a unix-socket-only operator route, so it is not part of the backend's client: call it directly, as the deploy script does. */
+const drainCall = (mode: "off" | "soft" | "strict", ttlSec = 60) =>
+  new Promise<{ ok: boolean; mode: string; running: number }>((resolve, reject) => {
+    const req = httpRequest({ socketPath: SOCK, method: "POST", path: "/v1/host.drain", headers: { "content-type": "application/json" } }, (res) => {
+      let b = "";
+      res.on("data", (d) => (b += d));
+      res.on("end", () => (res.statusCode === 200 ? resolve(JSON.parse(b)) : reject(new Error(`drain ${res.statusCode}`))));
+    });
+    req.on("error", reject);
+    req.end(JSON.stringify({ mode, ttlSec }));
+  });
 let n = 0;
 const turnReq = (cid: string, epoch: number, prompt: string, extra: Record<string, unknown> = {}) => {
   n++;
@@ -137,6 +148,26 @@ async function loginChecks() {
   await sleep(2_000);
   const st = await client.connectionStatus({ connectionId: cid });
   check("no-turn-left-running", st.runningTurns === 0, `running=${st.runningTurns}`);
+
+  // A deploy drains the host and waits for idle: a REAL turn that is running must be left alone, must block a strict drain, and must finish normally.
+  await sleep(3_000);
+  const longTurn = runHostTurn(client, turnReq(cid, 1, "Write a 250 word story about a lighthouse keeper. Plain prose only."), { sleep });
+  for (let i = 0; i < 40 && (await client.connectionStatus({ connectionId: cid })).runningTurns === 0; i++) await sleep(250);
+  const strictBusy = await drainCall("strict");
+  check("drain-strict-refused-while-a-real-turn-runs", !strictBusy.ok && strictBusy.running >= 1, `ok=${strictBusy.ok} running=${strictBusy.running}`);
+  await drainCall("soft");
+  const during = await runHostTurn(client, turnReq(cid, 1, "Reply with exactly the word FINE and nothing else."), { busyWaitMs: 60_000, sleep });
+  check("interactive-turn-still-served-under-soft-drain", during.kind === "completed" && during.result.ok, describe(during));
+  const long = await longTurn;
+  check("the-running-turn-was-not-cut-off-by-the-drain", long.kind === "completed" && long.result.ok, describe(long));
+  await sleep(1_500);
+  const idle = await drainCall("strict");
+  check("drain-strict-succeeds-once-idle", idle.ok && idle.mode === "strict", `ok=${idle.ok} mode=${idle.mode}`);
+  const refusedWhileDrained = await fails(client.turnRun(turnReq(cid, 1, "hi")));
+  check("new-turn-is-refused-as-draining-retryable", refusedWhileDrained === "EBUSY/draining", refusedWhileDrained);
+  await drainCall("off");
+  const after = await runHostTurn(client, turnReq(cid, 1, "Reply with exactly the word BACK and nothing else."), { sleep });
+  check("turns-resume-after-the-drain-is-lifted", after.kind === "completed" && after.result.ok, describe(after));
 
   const rev = await client.connectionRevoke({ connectionId: cid, epoch: 2 });
   cleanup.revoked = true;
