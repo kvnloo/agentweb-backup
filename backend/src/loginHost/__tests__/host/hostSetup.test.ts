@@ -1,3 +1,5 @@
+// The test-only TLS keys and certificates are generated on first use (they are not committed): this import must come first.
+import "../fixtures/tls/ensureFixtures";
 import { X509Certificate } from "crypto";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
