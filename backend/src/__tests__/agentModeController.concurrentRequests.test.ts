@@ -12,6 +12,7 @@ jest.mock('../services/chatbotService', () => ({
     updateSessionTitle: jest.fn(),
     createOrReuseInteractiveShare: jest.fn(),
     getMessagesFromMessagesTable: jest.fn(),
+    updateSessionLlmModel: jest.fn(),
   },
   updateTaskExecutionStatus: jest.fn(),
 }));
@@ -73,10 +74,13 @@ jest.mock('../utils/agentModeAlerts', () => ({
 }));
 
 jest.mock('../utils/agentModeErrors', () => ({
+  // Spread the real module so new exports (e.g. isProviderUnavailableError) never leave the controller error handler calling undefined.
+  ...jest.requireActual('../utils/agentModeErrors'),
   isContextLimitError: jest.fn().mockReturnValue(false),
   isSessionLimitError: jest.fn().mockReturnValue(false),
   isTransientLLMError: jest.fn().mockReturnValue(false),
   isWorkerShutdownError: jest.fn().mockReturnValue(false),
+  isProviderNoEndpointsError: jest.fn().mockReturnValue(false),
 }));
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
@@ -124,6 +128,17 @@ describe('AgentModeController - Concurrent Request Handling', () => {
     mockChatbotDb.updateSessionTitle.mockResolvedValue(undefined as any);
   });
 
+  // Wait until the first, deliberately never-resolving request has actually claimed the session lock. These
+  // tests used to assume the claim happens within ONE microtask of calling generateResponse; the model is now
+  // validated before any session write (ENG-903), which sits ahead of the claim, so the claim lands a few
+  // ticks later. Waiting for the lock itself tests the same invariant without depending on tick counts.
+  const waitForLock = async (sessionId: string) => {
+    for (let i = 0; i < 100 && !activeSessionGenerations.has(sessionId); i++) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    expect(activeSessionGenerations.has(sessionId)).toBe(true);
+  };
+
   describe('409 when session is already generating', () => {
     it('should return 409 Conflict when the same session is already generating', async () => {
       // First request: never resolves (simulates long-running generation)
@@ -139,8 +154,8 @@ describe('AgentModeController - Concurrent Request Handling', () => {
       // Start first request but don't await — the synchronous part adds the sessionId to the lock set
       const firstCall = agentModeController.generateResponse(makeReq(mockSessionId), res1);
 
-      // Yield to let the first call progress past synchronous code up to first await
-      await Promise.resolve();
+      // Wait until the first call has claimed the session lock (see waitForLock)
+      await waitForLock(mockSessionId);
 
       // Second request for the same session while first is active
       await agentModeController.generateResponse(req, res2);
@@ -162,7 +177,7 @@ describe('AgentModeController - Concurrent Request Handling', () => {
       const res2 = makeRes();
 
       const firstCall = agentModeController.generateResponse(makeReq(mockSessionId), res1);
-      await Promise.resolve();
+      await waitForLock(mockSessionId);
 
       await agentModeController.generateResponse(makeReq(mockSessionId), res2);
 
@@ -184,7 +199,7 @@ describe('AgentModeController - Concurrent Request Handling', () => {
       const res2 = makeRes();
 
       const firstCall = agentModeController.generateResponse(makeReq(mockSessionId), res1);
-      await Promise.resolve();
+      await waitForLock(mockSessionId);
 
       await agentModeController.generateResponse(makeReq(mockSessionId), res2);
 
@@ -219,7 +234,7 @@ describe('AgentModeController - Concurrent Request Handling', () => {
 
       // Start session A (long-running)
       const callA = agentModeController.generateResponse(makeReq(sessionA), resA);
-      await Promise.resolve();
+      await waitForLock(sessionA);
 
       // Session B should not be blocked
       await agentModeController.generateResponse(makeReq(sessionB), resB);

@@ -289,6 +289,18 @@ describe('CORS Access-Control-Allow-Methods', () => {
     });
   });
 
+  // ENG-2418: the portal (app.agentweb.pro) reads with-images paging metadata from
+  // response headers cross-origin; browsers hide non-safelisted headers unless exposed.
+  it('exposes the with-images paging headers to allowed cross-origin callers', async () => {
+    const res = await request(app)
+      .get('/api/loop-events')
+      .set('Origin', 'https://app.agentweb.pro');
+
+    const exposed = String(res.headers['access-control-expose-headers'] || '');
+    expect(exposed).toContain('X-Total-Tasks');
+    expect(exposed).toContain('X-Next-Cursor');
+  });
+
   it('public endpoints should only advertise GET, POST, OPTIONS methods', async () => {
     const res = await request(app)
       .options('/api/lead-magnet/test')
@@ -305,5 +317,45 @@ describe('CORS Access-Control-Allow-Methods', () => {
     expect(methods).not.toContain('PUT');
     expect(methods).not.toContain('PATCH');
     expect(methods).not.toContain('DELETE');
+  });
+});
+
+// ENG-2593: customer sites on arbitrary domains (e.g. nuerraa.com) POST web-form leads
+// straight to /api/webhooks/forward-lead from the browser. The global allowlist rejected
+// their preflight, so the route's own `*` CORS headers never ran. Access is gated per list
+// (publicAccessEnabled) inside the route, not by origin.
+describe('ENG-2593 public CORS for /api/webhooks/forward-lead', () => {
+  const customerOrigin = 'https://www.nuerraa.com';
+
+  it('answers the preflight from an arbitrary customer origin with open CORS', async () => {
+    const res = await request(app)
+      .options('/api/webhooks/forward-lead')
+      .set('Origin', customerOrigin)
+      .set('Access-Control-Request-Method', 'POST')
+      .set('Access-Control-Request-Headers', 'Content-Type');
+
+    expect(res.status).toBe(200);
+    expect(res.headers['access-control-allow-origin']).toBe('*');
+    expect(res.headers['access-control-allow-methods']).toContain('POST');
+    expect(res.headers['access-control-allow-headers']).toContain('Content-Type');
+  });
+
+  it('returns open CORS on the POST itself from an arbitrary origin', async () => {
+    const res = await request(app)
+      .post('/api/webhooks/forward-lead')
+      .set('Origin', customerOrigin)
+      .send({});
+
+    expect(res.status).toBe(400); // listId missing — reached the route, not blocked by CORS
+    expect(res.headers['access-control-allow-origin']).toBe('*');
+  });
+
+  it('does not open other webhook routes to arbitrary origins', async () => {
+    const res = await request(app)
+      .options('/api/webhooks/hubspot')
+      .set('Origin', 'https://evil.example.com')
+      .set('Access-Control-Request-Method', 'POST');
+
+    expect(res.headers['access-control-allow-origin']).toBeUndefined();
   });
 });

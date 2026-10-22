@@ -947,6 +947,8 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
         ].join('\n'),
         {
           'Alert Class': TOKEN_ALERT_CLASS,
+          // ENG-2267: one canonical per ad account, not one per class fleet-wide.
+          'Alert Scope': `meta-ad-account:${adAccountId}`,
           'Alert Priority': 'high',
           'Ad Account': adAccountId,
           'Owner User Id': user?.userId,
@@ -1068,6 +1070,8 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
       ].join('\n'),
       {
         'Alert Class': BLACKOUT_ALERT_CLASS,
+        // ENG-2267: one canonical per ad account, not one per class fleet-wide.
+        'Alert Scope': `meta-ad-account:${adAccountId}`,
         'Alert Priority': 'high',
         'Consecutive Days': verdict.consecutiveBlackoutDays,
         'Spend In Blackout': verdict.spendInBlackout.toFixed(2),
@@ -1286,6 +1290,8 @@ async function checkOptimisationCoverage(
       ].join('\n'),
       {
         'Alert Class': OPTIMISATION_ALERT_CLASS,
+        // ENG-2267: one canonical per ad account, not one per class fleet-wide.
+        'Alert Scope': `meta-ad-account:${adAccountId}`,
         'Alert Priority': 'high',
         'Ad Account': adAccountId,
         'Owner User Id': user?.userId,
@@ -1414,6 +1420,8 @@ async function checkDestinationCoverage(
       ].join('\n'),
       {
         'Alert Class': DESTINATION_ALERT_CLASS,
+        // ENG-2267: one canonical per ad account, not one per class fleet-wide.
+        'Alert Scope': `meta-ad-account:${adAccountId}`,
         'Alert Priority': 'high',
         'Ad Account': adAccountId,
         'Owner User Id': user?.userId,
@@ -1446,6 +1454,11 @@ async function checkDestinationCoverage(
  * instead would silently change what `evaluateAdAccountDays` streaks over, and that function
  * decides whether a customer gets paged.
  */
+/** Internal AgentWeb accounts (ENG-2124): excluded from the customer landing-page rollup. */
+function isInternalAgentWebEmail(email?: string | null): boolean {
+  return /@agentweb\.pro$/i.test(String(email ?? '').trim());
+}
+
 /**
  * ONE alert for every generated landing page across the whole fleet that cannot report a
  * conversion — not one per customer.
@@ -1463,7 +1476,11 @@ export async function raiseLandingPageRollup(
   findings: MonitorSummary['landingPageFindings'],
   opts: { transport?: AlertTransport; dryRun?: boolean; now?: number } = {},
 ): Promise<void> {
-  if (!findings?.length) return;
+  // ENG-2124: AgentWeb's own accounts (test/verification and internal webinar sites) are not
+  // customers. With no ad pointing at them this alert is pure noise that recurs weekly, so they
+  // are dropped here; real customers still roll up exactly as before.
+  findings = (findings ?? []).filter((f) => !isInternalAgentWebEmail(f.email));
+  if (!findings.length) return;
   const now = opts.now ?? Date.now();
   const dryRun = opts.dryRun === true;
   const sink: AlertSink = {
@@ -1685,6 +1702,8 @@ async function checkEventMixCoverage(
       ].join('\n'),
       {
         'Alert Class': EVENT_MIX_ALERT_CLASS,
+        // ENG-2267: one canonical per ad account, not one per class fleet-wide.
+        'Alert Scope': `meta-ad-account:${adAccountId}`,
         'Alert Priority': 'high',
         'Ad Account': adAccountId,
         'Owner User Id': user?.userId,

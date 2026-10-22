@@ -669,6 +669,7 @@ const SIDE_EFFECTING_PREFIXES = [
 export const EXTERNAL_SEND_TOOLS = new Set([
   'send_email',
   'linkedin_outreach',
+  'manage_crm_sequence', // ENG-964: activation starts drip email to real leads
 ]);
 
 export const EXTERNAL_PUBLISH_TOOLS = new Set([
@@ -744,6 +745,11 @@ const DEFAULT_ARG_ALIASES: Record<string, string[]> = {
   page_id: ['pageId', 'landing_page_id', 'landingPageId'],
   task_description: ['instructions', 'instruction', 'prompt', 'task', 'description'],
   operations_json: ['replacement_json', 'operations', 'replacements', 'replacement_instructions'],
+  // playwright_browser_evaluate requires `function`; models send `expression`/`script` (ENG-2473).
+  function: ['expression', 'script', 'js', 'code'],
+  // monitor_lead_volume / assess_client_health etc. require `client_name_or_email`;
+  // scheduled report runs send `client_id: "<email>"` (ENG-2610).
+  client_name_or_email: ['client_id', 'client_email', 'client'],
 };
 
 export function evaluateAgentToolPolicy(input: AgentToolPolicyInput): AgentToolPolicyDecision {
@@ -796,6 +802,113 @@ export function evaluateAgentToolPolicy(input: AgentToolPolicyInput): AgentToolP
   };
 }
 
+// ENG-2570: call_hubspot_api CONTACT_LIST GET — models put the list id in
+// `query` ({listId:"17"}, "listId=17", 17) instead of `list_id`, then loop to
+// repeated_failure (prod session 6935593b, 2026-10-17). Move an unambiguous id
+// into list_id. Scoped to this tool/action; never overwrites list_id and never
+// touches free-text queries.
+const HUBSPOT_QUERY_ID_KEYS = ['list_id', 'listId', 'listid', 'id'];
+function extractHubSpotListIdFromQuery(query: unknown): string | null {
+  if (typeof query === 'number') {
+    return Number.isSafeInteger(query) && query > 0 ? String(query) : null;
+  }
+  if (typeof query === 'string') {
+    const trimmed = query.trim();
+    if (/^\d+$/.test(trimmed)) return trimmed;
+    const kv = /^(?:list_?id|id)\s*[=:]\s*["']?(\d+)["']?$/i.exec(trimmed);
+    return kv ? kv[1] : null;
+  }
+  if (query && typeof query === 'object' && !Array.isArray(query)) {
+    const obj = query as Record<string, unknown>;
+    const keys = Object.keys(obj);
+    if (keys.length !== 1 || !HUBSPOT_QUERY_ID_KEYS.includes(keys[0])) return null;
+    return extractHubSpotListIdFromQuery(obj[keys[0]]);
+  }
+  return null;
+}
+
+function repairHubSpotListIdFromQuery(
+  toolName: string,
+  args: Record<string, unknown>,
+  properties: Record<string, unknown>,
+): string | null {
+  if (toolName !== 'call_hubspot_api' || !properties.list_id) return null;
+  if (String(args.entity_type ?? '').toUpperCase() !== 'CONTACT_LIST') return null;
+  if (String(args.action ?? '').toUpperCase() !== 'GET') return null;
+  if (args.list_id !== undefined && args.list_id !== null && args.list_id !== '') return null;
+  const listId = extractHubSpotListIdFromQuery(args.query);
+  if (!listId) return null;
+  args.list_id = listId;
+  delete args.query;
+  return 'query->list_id';
+}
+
+// ENG-2572: playwright_browser_evaluate calls the value of `function`. Models often send an
+// IIFE (`(() => {...})()`) or a bare expression (`JSON.stringify({...})`), which Playwright
+// evaluates and then fails on with "TypeError: result is not a function". Wrap those
+// values in a zero-arg arrow. Values that are already function sources are left unchanged.
+const FUNCTION_SOURCE_RE = /^(?:async\s+)?(?:function\b|[A-Za-z_$][\w$]*\s*=>)/;
+
+// Arrow functions whose parameter list nests parens/brackets, e.g.
+// `async (x = Promise.resolve(1)) => x`, need a balanced scan, not a regex.
+function isParenArrowFunctionSource(source: string): boolean {
+  const body = source.replace(/^async\s*/, '');
+  if (!body.startsWith('(')) return false;
+  let depth = 0;
+  let quote: string | null = null;
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i];
+    if (quote) {
+      if (ch === '\\') i++;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') quote = ch;
+    else if (ch === '(' || ch === '[' || ch === '{') depth++;
+    else if (ch === ')' || ch === ']' || ch === '}') {
+      depth--;
+      if (depth === 0) return /^\s*=>/.test(body.slice(i + 1));
+    }
+  }
+  return false;
+}
+
+export function repairEvaluateFunctionArg(
+  toolName: string,
+  args: Record<string, unknown>,
+): string | null {
+  if (toolName !== 'playwright_browser_evaluate') return null;
+  const value = args.function;
+  if (typeof value !== 'string') return null;
+  const source = value.trim();
+  if (!source || FUNCTION_SOURCE_RE.test(source) || isParenArrowFunctionSource(source)) return null;
+  args.function = `() => (${source.replace(/;\s*$/, '')})`;
+  return 'function:wrap_expression';
+}
+
+// ENG-2581: GAQL has no `quality_info.ad_relevance`; Google's ad-relevance
+// component is `quality_info.creative_quality_score`. Models keep emitting the
+// former despite tool-description guidance, so rewrite it (or drop it when the
+// real field is already selected).
+const GAQL_AD_RELEVANCE_RE = /\b((?:ad_group_criterion\.)?quality_info\.)ad_relevance\b/g;
+
+export function repairGaqlAdRelevance(
+  toolName: string,
+  args: Record<string, unknown>,
+): string | null {
+  if (toolName !== 'call_google_ads_reporting_api') return null;
+  const query = args.query;
+  if (typeof query !== 'string' || !/quality_info\.ad_relevance\b/.test(query)) return null;
+  if (/quality_info\.creative_quality_score\b/.test(query)) {
+    args.query = query
+      .replace(/,\s*(?:ad_group_criterion\.)?quality_info\.ad_relevance\b/g, '')
+      .replace(/(?:ad_group_criterion\.)?quality_info\.ad_relevance\b\s*,\s*/g, '');
+  } else {
+    args.query = query.replace(GAQL_AD_RELEVANCE_RE, '$1creative_quality_score');
+  }
+  return 'query:gaql_ad_relevance';
+}
+
 export function validateAndRepairToolArgs(
   input: AgentToolContractValidationInput,
 ): AgentToolContractValidationResult {
@@ -818,6 +931,15 @@ export function validateAndRepairToolArgs(
   const repairs: string[] = [];
 
   if (!schema || schema.type !== 'object') {
+    // ENG-2572: the playwright evaluate repair must not depend on a resolved
+    // schema — MCP tools often arrive here with no inputSchema.
+    if (input.args && typeof input.args === 'object' && !Array.isArray(input.args)) {
+      const evalArgs: Record<string, unknown> = { ...(input.args as Record<string, unknown>) };
+      const evalRepair = repairEvaluateFunctionArg(input.toolName, evalArgs);
+      if (evalRepair) return { status: 'repaired', args: evalArgs, issues, repairs: [evalRepair] };
+      const gaqlRepair = repairGaqlAdRelevance(input.toolName, evalArgs);
+      if (gaqlRepair) return { status: 'repaired', args: evalArgs, issues, repairs: [gaqlRepair] };
+    }
     return { status: 'valid', args: input.args, issues, repairs };
   }
 
@@ -851,7 +973,7 @@ export function validateAndRepairToolArgs(
   const lowRiskRepairAllowed = (input.effect ?? classifyToolEffect(input.toolName, input.args)) === 'read';
 
   for (const key of Object.keys(repairedArgs)) {
-    if (properties[key]) continue;
+    if (Object.prototype.hasOwnProperty.call(properties, key)) continue;
 
     // ENG-1668: a common LLM mistake — inventing a wrapper object (e.g.
     // `params: { criterion_resource_name: ... }`) around fields that actually
@@ -931,6 +1053,9 @@ export function validateAndRepairToolArgs(
     }
   }
 
+  const hubspotListIdRepair = repairHubSpotListIdFromQuery(input.toolName, repairedArgs, properties);
+  if (hubspotListIdRepair) repairs.push(hubspotListIdRepair);
+
   const missingRequiredUrlTargetCount = required.filter((name: string) =>
     isMissingRequiredValue(repairedArgs[name], properties[name]) &&
     (name === 'url' || name.endsWith('_url') || name.endsWith('Url'))
@@ -955,6 +1080,11 @@ export function validateAndRepairToolArgs(
       repairs.push(`${aliasSource}->${name}`);
     }
   }
+
+  const evaluateRepair = repairEvaluateFunctionArg(input.toolName, repairedArgs);
+  if (evaluateRepair) repairs.push(evaluateRepair);
+  const gaqlAdRelevanceRepair = repairGaqlAdRelevance(input.toolName, repairedArgs);
+  if (gaqlAdRelevanceRepair) repairs.push(gaqlAdRelevanceRepair);
 
   for (const name of required) {
     if (isMissingRequiredValue(repairedArgs[name], properties[name])) {
@@ -982,6 +1112,12 @@ export function validateAndRepairToolArgs(
   // scalar type so the call succeeds instead of bouncing back to the model.
   for (const [name, propSchema] of Object.entries(properties)) {
     if (repairedArgs[name] === undefined || repairedArgs[name] === null) continue;
+    const idString = coerceIdIntegerToString(name, repairedArgs[name], propSchema);
+    if (idString.changed) {
+      repairedArgs[name] = idString.value;
+      repairs.push(`${name}:scalar_coerce`);
+      continue;
+    }
     const coerced = coerceScalarForSchema(repairedArgs[name], propSchema);
     if (coerced.changed) {
       repairedArgs[name] = coerced.value;
@@ -1377,6 +1513,8 @@ function findKnownAliasSource(input: {
     ].map(normalizeArgName);
     for (const key of Object.keys(input.existingArgs)) {
       if (key === input.target) continue;
+      // A key that is a real schema property is the caller's own argument, not an alias (ENG-2610).
+      if (Object.prototype.hasOwnProperty.call(input.properties, key)) continue;
       if (targetAliases.includes(normalizeArgName(key))) return key;
     }
   }
@@ -1395,6 +1533,13 @@ function findKnownAliasSource(input: {
 }
 
 function validateJsonSchemaType(name: string, value: unknown, schema: any): AgentToolContractIssue | null {
+  if (schema === false) {
+    return {
+      code: 'invalid_args',
+      path: `$.${name}`,
+      message: `Argument "${name}" is not allowed by the tool schema.`,
+    };
+  }
   const expected = schema?.type;
   if (!expected) return null;
   const expectedTypes = Array.isArray(expected) ? expected : [expected];
@@ -1415,6 +1560,34 @@ function validateJsonSchemaType(name: string, value: unknown, schema: any): Agen
     path: `$.${name}`,
     message: `Argument "${name}" has the wrong type. Expected ${expectedTypes.join(' or ')}.`,
   };
+}
+
+/**
+ * Lossless integer -> string repair for identifier fields (ENG-2472). Models emit
+ * IDs as bare integers (live repro: call_hubspot_api `list_id: 17`) where the
+ * schema declares `string`, and then retry the same shape until the run is
+ * classified degraded. Deliberately narrow so a genuinely wrong primitive still
+ * surfaces as type_mismatch: only id-named fields (`id`, `*_id`, `*Id`), only
+ * safe integers, only when `string` is the sole accepted type, and — because
+ * enum is not validated downstream — only when any declared enum contains the
+ * coerced value.
+ */
+function coerceIdIntegerToString(name: string, value: unknown, schema: any): { changed: boolean; value: unknown } {
+  // ENG-2509: finite non-integer decimals and booleans are lossless and unambiguous
+  // as strings (`ratio: 1.5` -> "1.5", `flag: true` -> "true"), so they coerce for
+  // any field. Bare integers stay limited to id-named fields: an integer in a
+  // non-id string field (`file_url: 123`, `action: 7`) usually means the model
+  // filled the wrong field and must keep surfacing as type_mismatch.
+  const isDecimal = typeof value === 'number' && Number.isFinite(value) && !Number.isInteger(value);
+  const isBoolean = typeof value === 'boolean';
+  const isIdInteger = typeof value === 'number' && Number.isSafeInteger(value) && /(^id$|_id$|[a-z]Id$)/.test(name);
+  if (!isDecimal && !isBoolean && !isIdInteger) return { changed: false, value };
+  const expected = schema?.type;
+  const expectedTypes = Array.isArray(expected) ? expected : [expected];
+  if (expectedTypes.length !== 1 || expectedTypes[0] !== 'string') return { changed: false, value };
+  const coerced = String(value);
+  if (Array.isArray(schema?.enum) && !schema.enum.includes(coerced)) return { changed: false, value };
+  return { changed: true, value: coerced };
 }
 
 /**

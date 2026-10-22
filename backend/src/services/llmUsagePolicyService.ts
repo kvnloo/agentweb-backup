@@ -73,7 +73,9 @@ export interface LlmUsageModeDecision {
     | "hard_cap_only"
     | "below_optimization_threshold"
     | "optimization_threshold_reached"
-    | "hard_threshold_reached";
+    | "hard_threshold_reached"
+    // ENG-668: past the hard threshold, admitted on the account's pay-as-you-go opt-in (paygOverage.ts).
+    | "payg_overage";
 }
 
 export interface PolicyModelDecision {

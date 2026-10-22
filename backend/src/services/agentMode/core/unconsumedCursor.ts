@@ -42,8 +42,12 @@ export interface UnconsumedCursor {
 /** Result keys a tool may hand a continuation back under. */
 const CURSOR_RESULT_KEYS = ['next_cursor', 'nextCursor'] as const;
 
-/** Row-bearing keys, so "how much did we actually read" is answerable. */
-const ROW_KEYS = ['leads', 'engagements', 'results', 'items', 'rows'] as const;
+/**
+ * Row-bearing keys, so "how much did we actually read" is answerable. Exported because the ledger minimizer
+ * (AgentModeService.extractMinimalToolResult) must count the SAME keys: it strips the arrays and keeps only
+ * `rowCount`, so a key listed here but not there is counted as 0 rows in the notice (ENG-2338: `guests`).
+ */
+export const ROW_KEYS = ['leads', 'engagements', 'results', 'items', 'rows', 'guests', 'events'] as const;
 
 /**
  * The tool's name, or null when the entry does not carry one.

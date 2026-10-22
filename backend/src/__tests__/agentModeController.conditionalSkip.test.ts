@@ -420,6 +420,7 @@ describe('scheduledRunSignalsConditionalSkip', () => {
         'call_google_ads_reporting_api',
         'call_linkedin_ads_insights_api',
         'perform_deep_research',
+        'scan_website_links', // ENG-1098: site-wide broken-link scan, fetches pages only
       ]);
       for (const tool of readOnlyTools) {
         const enumValues = collectEnumValues(tool.definition?.inputSchema);

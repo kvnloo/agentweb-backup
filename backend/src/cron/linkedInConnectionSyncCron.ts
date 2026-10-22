@@ -542,9 +542,10 @@ export async function notifyNewConnections(newConnections: UnipileConnection[]):
             continue;
           }
           // Mark as notified before sending — prevents duplicate sends if this throws.
-          await crmDb.updateLead(lead.listId, lead.leadId, {
-            system: { ...((lead.system as Record<string, any>) ?? {}), linkedInConnectionNotifiedAt: new Date().toISOString() },
-            skipFieldNamesUpdate: true,
+          // Per-key write: updateLead would replace the whole `system` map from this (possibly stale)
+          // snapshot and erase markers other writers own, e.g. a live hot-lead call record.
+          await crmDb.setLeadFields(lead.listId, lead.leadId, {
+            system: { linkedInConnectionNotifiedAt: new Date().toISOString() },
           });
           // Generate a follow-up draft before notifying so the panel is pre-filled.
           await generateConnectionFollowUpDraft(lead, list).catch(err =>

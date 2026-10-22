@@ -1,4 +1,4 @@
-import type { LeadNotificationsConfig } from './orgLeadNotificationService';
+import type { LeadNotificationsConfig, LeadOrigin } from './leadNotificationConfig';
 import { writeWithEvaluationGuard } from './evaluationPersistence';
 import AWS from "aws-sdk";
 import { buildAwsHttpOptions } from "../utils/awsHttpOptions";
@@ -17,12 +17,17 @@ import { encryptPassword, decryptPassword } from "../utils/crypto";
 import type { AttributionTouch } from "../types/attribution";
 import type { OrgRole } from "./orgAuthz";
 import type { MonthlyLlmUsageCredits } from "./llmUsageCreditService";
+import type { PaygOverageSettings } from "./paygOverage";
+import type { PaygSettlements } from "./paygSettlement";
 import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
 import { isEvaluationUser } from "./evaluationPolicy";
-import { emailLeadIds, isEmailUniqueCreateEnabled, emailTxAllowed, tripEmailTxBreaker, type EmailLeadIds } from '../utils/emailLeadId';
+import { emailLeadIds, phoneLeadIds, isEmailUniqueCreateEnabled, emailTxAllowed, tripEmailTxBreaker, type EmailLeadIds } from '../utils/emailLeadId';
+import { phoneDedupeKey, PHONE_FANOUT_CAP } from '../utils/phoneLeadDedupe';
+import { isSmokeTestPhone } from '../utils/smokeTestLead';
 import { normalizeLinkedInUrl } from "./enrichmentGroups";
 import { isLinkedInPlaceholderName } from "../utils/anonymizedLinkedInLead";
+import { isConditionalFailure } from "./voice/setupWrites";
 import { MAX_ATOMIC_RUN_RESULT_REMOVALS, isDynamoItemSizeError, trimListToItemBudget } from "../utils/dynamoItemBudget";
 
 // Load environment variables from .env file
@@ -30,6 +35,9 @@ dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
 // Get table prefix based on NODE_ENV (defaults to empty string for production)
 const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+
+/** ENG-2123: until when getLeadIdsByPhoneKey should not try PhoneKeyIndex again (missing index / denied). */
+let phoneIndexUnavailableUntil = 0;
 
 /** One counter-guarded group of customFields for crmDb.mergeSessionLeadEvent. */
 type MonotonicPlan = { counterKey: string; counter: number; fields: Record<string, any> };
@@ -98,6 +106,15 @@ const handleDynamoDbError = (error: any, operation: string) => {
  * other error here is either permanent or the caller's own guard
  * (e.g. ConditionalCheckFailedException) firing correctly.
  */
+/** Thrown when updating a memory that does not exist (ENG-2404). */
+export class MemoryNotFoundError extends Error {
+  readonly code = 'MEMORY_NOT_FOUND';
+  constructor(memoryId: string) {
+    super(`Memory not found: ${memoryId}`);
+    this.name = 'MemoryNotFoundError';
+  }
+}
+
 const withTransactionConflictRetry = async <T>(
   fn: () => Promise<T>,
   maxAttempts = 4,
@@ -162,7 +179,8 @@ const dedupeLinkedInMessageEvents = <T extends { eventId?: string; eventType?: s
   });
 };
 
-const ENGAGED_EVENT_KEYWORDS = ["clicked", "replied", "received"];
+/** Exported so callers that write engagement events can keep their payloads from raising isEngaged. */
+export const ENGAGED_EVENT_KEYWORDS = ["clicked", "replied", "received"];
 
 /**
  * Engagement count at which a lead is logged as approaching the 400 KB DynamoDB
@@ -178,6 +196,31 @@ const engagementMatchesKeyword = (engagement: any): boolean => {
     (keyword) => eventType.includes(keyword) || eventData.includes(keyword)
   );
 };
+
+/**
+ * Makes sure `lead.system` exists so a document-path SET under it cannot throw. Returns false when the
+ * lead itself does not exist (the condition keeps a deleted row from being resurrected as a bare item).
+ */
+async function ensureLeadSystemMap(listId: string, leadId: string, caller: string): Promise<boolean> {
+  try {
+    await dynamodb.update({
+      TableName: `${TABLE_PREFIX}AW-Leads`,
+      Key: { listId, leadId },
+      // `system` is a DynamoDB reserved keyword — confirmed live against a real table:
+      // unescaped, this throws ValidationException, invisible to unit tests since they mock
+      // dynamodb.update() and never validate expression syntax against the reserved-word list.
+      UpdateExpression: 'SET #system = if_not_exists(#system, :emptyMap)',
+      ExpressionAttributeNames: { '#system': 'system' },
+      ExpressionAttributeValues: { ':emptyMap': {} },
+      ConditionExpression: 'attribute_exists(leadId)',
+    }).promise();
+    return true;
+  } catch (err) {
+    if (isConditionalFailure(err)) return false;
+    handleDynamoDbError(err, `${caller}:bootstrap`);
+    throw err;
+  }
+}
 
 // Ensure the User interface is exported
 export interface User {
@@ -203,6 +246,7 @@ export interface User {
   displayName?: string;
   emailNotificationsEnabled?: boolean; // Portal Settings > Preferences toggle (ENG-1316). Absent = enabled (default).
   emmaTipsEnabled?: boolean; // Portal Settings > Preferences toggle + tip-card "don't show again" (ENG-188). Absent = enabled (default).
+  showModelCompare?: boolean; // Portal Settings > Preferences "Compare models" toggle (ENG-113). Display choice only — shows/hides the chat Compare button; entitlement and /compare enforcement are unaffected. Absent = shown (default).
   stripe_customer_id?: string;
   adAccount?: string; // Meta ad account ID
   emailDomain?: string; // @deprecated legacy single sending domain — kept for the task/subscriber-notification fallback sender (emailService.ts, dripSequenceWorker.ts legacyDefaultSender); CRM sending domains live in emailDomains[] (ENG-265)
@@ -224,6 +268,13 @@ export interface User {
     enabled: boolean;
     optIn?: { at: string; source: string; verifiedAt?: string }; // Required before first send where the channel demands it; verifiedAt = proved control of the number
   }>;
+  /**
+   * Why this account has no WhatsApp number any more (ENG-273). Written when a number is
+   * removed — by the customer's STOP, the customer in Settings, or an admin — and cleared
+   * when a number is verified. Lets support see "Not connected, because STOP on <date>"
+   * instead of a bare "Not connected". Display only: nothing decides delivery from it.
+   */
+  whatsappDisconnect?: { reason: 'stop' | 'customer' | 'admin'; at: string; last4?: string } | null;
   secrets?: Record<string, string>; // Encrypted per-user secrets (key → encrypted value)
   landerUtmDefault?: import("../utils/landerUtm").UtmConfig; // Customer-level UTM default for generated landers (ENG-724); read/write only via landerUtmStore
   seoDomains?: string[]; // SEO domains to track (e.g., ["example.com", "subdomain.example.com"])
@@ -618,6 +669,15 @@ export interface User {
   tokenAllowanceBonus?: number; // One-time bonus tokens granted by admin (resets on monthly reset)
   /** Monthly purchase/migration credits. Raw provider spend remains in tokenUsage. */
   llmUsageCredits?: MonthlyLlmUsageCredits;
+  /**
+   * ENG-668: the previous month's credit ledger, kept when a new month's first write replaces
+   * `llmUsageCredits` — month-end PAYG settlement measures the closed month against it. One month only.
+   */
+  llmUsageCreditsClosed?: MonthlyLlmUsageCredits;
+  /** ENG-668: pay-as-you-go overage opt-in. Billing owners only; absent = never opted in. */
+  paygOverage?: PaygOverageSettings;
+  /** ENG-668 PR-2: month-end PAYG settlement records by UTC `YYYY-MM` (last 12 months). Never sent to customers. */
+  paygSettlements?: PaygSettlements;
   stripe_subscription_id?: string; // Stripe subscription ID
   subscription_status?: string; // Stripe subscription status: active, trialing, past_due, canceled, canceling
   current_period_end?: string; // ISO date of current billing period end
@@ -625,7 +685,8 @@ export interface User {
   subscription_amount?: number; // Most recent invoice amount paid, in cents (e.g. 4900 = $49.00)
   /**
    * Active Stripe coupon/discount applied to the subscription (e.g., 90% off for 6 months).
-   * Synced from subscription.discount on all webhook and reconcile paths.
+   * Synced from the subscription's first listed `discounts` entry (Basil; the
+   * legacy subscription.discount is a fallback) on all webhook and reconcile paths.
    * Set to null when the discount is removed from the subscription.
    */
   activeOffer?: {
@@ -635,7 +696,7 @@ export interface User {
     amountOff: number | null; // in cents
     duration: 'forever' | 'once' | 'repeating';
     durationInMonths: number | null; // only set when duration = 'repeating'
-    endsAt: string | null; // ISO date when the discount expires (from subscription.discount.end)
+    endsAt: string | null; // ISO date when the discount expires (from the discount's `end`)
   } | null;
   /**
    * A scheduled subscription change queued in Stripe (e.g., scheduled downgrade
@@ -820,6 +881,11 @@ export interface User {
 export interface Organization {
   modelRoles?: import('./modelRoles').ModelRoles;
   leadNotifications?: LeadNotificationsConfig;
+  hotLeadCall?: import('./hotLeadCallConfig').HotLeadCallConfig;
+  /** System-managed pending team-member phone verification (hash only); see services/voice/memberVerification.ts. */
+  hotLeadCallVerification?: import('./voice/memberVerification').HotLeadCallVerification;
+  /** System-managed purchase/release history (cost caps); same family as hotLeadCallVerification, see services/voice/numberProvisioning.ts. */
+  hotLeadCallProvisioning?: import('./voice/numberProvisioning').HotLeadCallProvisioning;
   /**
    * Optimistic-concurrency counter for owner-losing operations. Absent until
    * the first one; see orgDb.claimOwnerChange.
@@ -1704,6 +1770,30 @@ export class UserDB {
         names?: { [key: string]: string };
         values?: { [key: string]: any };
       };
+      /**
+       * Replace single elements of a list attribute in place
+       * (`SET #a.#b[3] = :v`) instead of rewriting the whole list. Two writers
+       * touching DIFFERENT elements then never overwrite each other, which a
+       * read-modify-write of the full list cannot guarantee. `path` is the
+       * attribute (and optional nested key) holding the list. Pair it with a
+       * `condition` on the element: DynamoDB appends when the index is past the
+       * end of the list, so an index that was valid at read time must be
+       * re-asserted at write time.
+       */
+      elementSets?: Array<{ path: [string] | [string, string]; index: number; value: any }>;
+      /**
+       * Set / remove a value at an arbitrary document path, e.g.
+       * `["icpResult", 2, "pain"]` -> `SET #icpResult[2].#pain = :v`. A string
+       * segment is an attribute name, a number is a list index. Unlike
+       * rewriting the parent, this touches only that one value, so writers
+       * working on different values never overwrite each other, and the
+       * `condition` only has to assert what THIS write depends on (for a list
+       * element, that it is still the element that was read). Removing a list
+       * element shifts every later element down, so pair a remove with a
+       * condition on the element's identity.
+       */
+      pathSets?: Array<{ path: Array<string | number>; value: any }>;
+      pathRemoves?: Array<{ path: Array<string | number> }>;
     }
   ) {
     // First, get the user by userId to ensure they exist and to get their email
@@ -1721,7 +1811,12 @@ export class UserDB {
       ...updatableFields
     } = updates;
 
-    if (Object.keys(updatableFields).length === 0) {
+    if (
+      Object.keys(updatableFields).length === 0 &&
+      !options?.elementSets?.length &&
+      !options?.pathSets?.length &&
+      !options?.pathRemoves?.length
+    ) {
       return user; // Return the fetched user object if no updates are needed
     }
 
@@ -1743,6 +1838,49 @@ export class UserDB {
         setExpressions.push(`#${key} = :${key}`);
         expressionAttributeValues[`:${key}`] = value;
       }
+    });
+
+    (options?.elementSets ?? []).forEach((el, n) => {
+      if (!Number.isInteger(el.index) || el.index < 0) {
+        throw new Error(`updateUser elementSets[${n}]: index must be a non-negative integer`);
+      }
+      const pathNames = el.path.map((segment, k) => {
+        const placeholder = `#el${n}p${k}`;
+        expressionAttributeNames[placeholder] = segment;
+        return placeholder;
+      });
+      expressionAttributeValues[`:el${n}`] = el.value;
+      setExpressions.push(`${pathNames.join(".")}[${el.index}] = :el${n}`);
+    });
+
+    const compilePath = (kind: string, n: number, path: Array<string | number>): string => {
+      if (!Array.isArray(path) || path.length === 0 || typeof path[0] !== "string") {
+        throw new Error(`updateUser ${kind}[${n}]: path must start with an attribute name`);
+      }
+      let out = "";
+      path.forEach((segment, k) => {
+        if (typeof segment === "number") {
+          if (!Number.isInteger(segment) || segment < 0) {
+            throw new Error(`updateUser ${kind}[${n}]: list index must be a non-negative integer`);
+          }
+          out += `[${segment}]`;
+        } else if (typeof segment === "string" && segment.length > 0) {
+          const placeholder = `#${kind}${n}p${k}`;
+          expressionAttributeNames[placeholder] = segment;
+          out += (out ? "." : "") + placeholder;
+        } else {
+          throw new Error(`updateUser ${kind}[${n}]: invalid path segment`);
+        }
+      });
+      return out;
+    };
+    (options?.pathSets ?? []).forEach((ps, n) => {
+      const target = compilePath("ps", n, ps.path);
+      expressionAttributeValues[`:ps${n}`] = ps.value;
+      setExpressions.push(`${target} = :ps${n}`);
+    });
+    (options?.pathRemoves ?? []).forEach((pr, n) => {
+      removeExpressions.push(compilePath("pr", n, pr.path));
     });
 
     if (setExpressions.length === 0 && removeExpressions.length === 0) {
@@ -3310,6 +3448,8 @@ export const taskDb = {
           name: task.name,
           knowledgeBaseSize: size,
           knowledgeBaseType: task.knowledgeBaseType || 'private',
+          // ENG-427: keep the signed URL so list_knowledge_base_files can link private KBs
+          knowledgeBase: task.knowledgeBase || null,
           knowledgeBaseFiles: task.knowledgeBaseFiles || [],
           knowledgeBaseUpdatedAt: task.knowledgeBaseUpdatedAt || task.updatedAt || task.createdAt,
           // Include additional fields that might be useful
@@ -3574,11 +3714,17 @@ export const scheduleDb = {
     // transition email specifically (does not affect the schedule-card badge,
     // per-run emails, or run history).
     disableSourcingBlockAlerts?: boolean;
+    // ENG-2493: the owner explicitly declined email (MCP `email_notifications: []`).
+    // Absent = false. Alert senders skip their owner-address fallback when true.
+    emailOptOut?: boolean;
     updatedAt?: string;
     sessionId?: string | null;
     type?: string;
     emailCampaignTaskId?: string;
     llmModel?: string;
+    // ENG-669: who chose `llmModel`: 'system' = inherited from an admin-authored schedule template (AgentWeb's
+    // choice, exempt from the tier model allowlist); 'user' or absent = the owner's pin. Additive, optional.
+    llmModelSource?: 'user' | 'system';
     llmBackupModel?: string;
     llmBackupSource?: 'user' | 'system';
     llmBackupNeedsConfirmation?: boolean;
@@ -5321,6 +5467,118 @@ class BenchmarkTestDB {
 export const benchmarkTestDb = new BenchmarkTestDB();
 
 // CRM Database Service
+interface LeadRecordUpdateOp {
+  stateIn: string[];
+  set?: Record<string, unknown>;
+  remove?: string[];
+  /** Fields that must currently hold exactly these values. */
+  whenEquals?: Record<string, string | number>;
+  maxIn?: Record<string, Record<string, number>>;
+  appendNew?: Record<string, string[]>;
+}
+
+// Every name and value of the expression goes through a generated placeholder. A placeholder that is declared but
+// not used (or used but not declared) is a ValidationException, which the mocked unit tests cannot see, so each is
+// created only where its clause is emitted: one name per field, one per map entry.
+interface ExpressionParts {
+  names: Record<string, string>;
+  values: Record<string, unknown>;
+  set: string[];
+  remove: string[];
+  conditions: string[];
+  /** Next placeholder number. */
+  n: number;
+}
+
+const addSetClauses = (p: ExpressionParts, set: Record<string, unknown>): void => {
+  for (const [field, v] of Object.entries(set)) {
+    if (v === undefined) continue;
+    p.names[`#f${p.n}`] = field;
+    p.values[`:v${p.n}`] = v;
+    p.set.push(`#system.#k.#f${p.n} = :v${p.n}`);
+    p.n++;
+  }
+};
+
+const addEqualsConditions = (p: ExpressionParts, whenEquals: Record<string, string | number>): void => {
+  for (const [field, expected] of Object.entries(whenEquals)) {
+    p.names[`#f${p.n}`] = field;
+    p.values[`:v${p.n}`] = expected;
+    p.conditions.push(`#system.#k.#f${p.n} = :v${p.n}`);
+    p.n++;
+  }
+};
+
+const addRemoveClauses = (p: ExpressionParts, remove: string[]): void => {
+  for (const field of new Set(remove)) {
+    p.names[`#f${p.n}`] = field;
+    p.remove.push(`#system.#k.#f${p.n}`);
+    p.n++;
+  }
+};
+
+/** Per-entry maps: an entry is written only if it is higher than the stored one (or absent). */
+const addMaxInClauses = (p: ExpressionParts, maxIn: Record<string, Record<string, number>>): void => {
+  for (const [field, entries] of Object.entries(maxIn)) {
+    const entryList = Object.entries(entries);
+    if (entryList.length === 0) continue;
+    const fieldName = `#f${p.n}`;
+    p.names[fieldName] = field;
+    p.n++;
+    for (const [entryKey, num] of entryList) {
+      p.names[`#e${p.n}`] = entryKey;
+      p.values[`:v${p.n}`] = num;
+      const path = `#system.#k.${fieldName}.#e${p.n}`;
+      p.set.push(`${path} = :v${p.n}`);
+      p.conditions.push(`(attribute_not_exists(${path}) OR ${path} < :v${p.n})`);
+      p.n++;
+    }
+  }
+};
+
+/** Lists: new values are appended, and any value already present fails the whole write. */
+const addAppendClauses = (p: ExpressionParts, appendNew: Record<string, string[]>): void => {
+  for (const [field, listed] of Object.entries(appendNew)) {
+    const items = [...new Set(listed)];
+    if (items.length === 0) continue;
+    const path = `#system.#k.#f${p.n}`;
+    p.names[`#f${p.n}`] = field;
+    p.values[`:v${p.n}`] = items;
+    p.set.push(`${path} = list_append(${path}, :v${p.n})`);
+    items.forEach((item, i) => {
+      p.values[`:v${p.n}_${i}`] = item;
+      p.conditions.push(`NOT contains(${path}, :v${p.n}_${i})`);
+    });
+    p.n++;
+  }
+};
+
+function leadRecordUpdateExpression(key: string, op: LeadRecordUpdateOp) {
+  // DynamoDB rejects an expression that touches one path twice; say so before the round trip.
+  const overlap = (op.remove ?? []).find((f) => op.set?.[f] !== undefined);
+  if (overlap) throw new Error(`updateLeadSystemRecordIf: ${overlap} is both set and removed`);
+  const p: ExpressionParts = {
+    names: { '#system': 'system', '#k': key, '#state': 'state' },
+    values: { ':ts': new Date().toISOString() },
+    set: ['updatedAt = :ts'],
+    remove: [],
+    conditions: [`#system.#k.#state IN (${op.stateIn.map((_, i) => `:from${i}`).join(', ')})`],
+    n: 0,
+  };
+  op.stateIn.forEach((s, i) => { p.values[`:from${i}`] = s; });
+  addSetClauses(p, op.set ?? {});
+  addRemoveClauses(p, op.remove ?? []);
+  addEqualsConditions(p, op.whenEquals ?? {});
+  addMaxInClauses(p, op.maxIn ?? {});
+  addAppendClauses(p, op.appendNew ?? {});
+  return {
+    UpdateExpression: `SET ${p.set.join(', ')}${p.remove.length ? ` REMOVE ${p.remove.join(', ')}` : ''}`,
+    ConditionExpression: p.conditions.join(' AND '),
+    ExpressionAttributeNames: p.names,
+    ExpressionAttributeValues: p.values,
+  };
+}
+
 export const crmDb = {
   // Lead List operations
   async createLeadList(
@@ -6439,13 +6697,33 @@ export const crmDb = {
      *  `duplicateEmail` error the pre-check does. Ignored when the caller supplies a leadId, when
      *  there is no email, or when LEAD_EMAIL_UNIQUE_CREATE=false (random-id path, unchanged). */
     emailUniqueCreate?: boolean;
-  }) {
+    /** ENG-2123: the phone twin of emailUniqueCreate, for an EMAIL-LESS form capture whose number passes
+     *  phoneDedupeKey. Same bucketed deterministic id + adjacent-bucket transaction; a loser throws the
+     *  typed `duplicatePhone` (carrying the winner) so the caller can adopt it or, when the two submissions
+     *  name different people, create a separate row. Ignored when the caller supplies a leadId, when there is
+     *  an email, or for any origin other than form_fill. */
+    phoneUniqueCreate?: boolean;
+    /** ENG-2123: with phoneUniqueCreate, narrows the bucketed id to this seed (the normalized names of a row that
+     *  conflicts with the number's first row), so same-named racers collapse onto ONE separate row. */
+    phoneUniqueIdSeed?: string;
+  }, origin?: LeadOrigin) {
     try {
       const emailKeyIds: EmailLeadIds | null =
         leadData.emailUniqueCreate && !leadData.leadId?.trim() && leadData.email?.trim() && isEmailUniqueCreateEnabled()
           ? emailLeadIds(listId, leadData.email.trim().toLowerCase())
           : null;
-      let leadId = leadData.leadId?.trim() || emailKeyIds?.leadId || `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      // ENG-2123. phoneKey: the sparse identity of an email-less FORM capture (never '' - DynamoDB rejects an
+      // empty index key). Written whenever it applies, independent of any rollout mode, so the key exists
+      // before the lookup index does. Other origins (LinkedIn mirror, manual, imports) never write one.
+      const phoneKey = origin === 'form_fill' && !leadData.email?.trim() && !leadData.linkedin?.trim()
+        && !(leadData.syncMetadata && Object.keys(leadData.syncMetadata).length > 0)
+        ? (isSmokeTestPhone(leadData.phone) ? '' : phoneDedupeKey(leadData.phone))
+        : '';
+      const phoneKeyIds: EmailLeadIds | null =
+        leadData.phoneUniqueCreate && phoneKey && !leadData.leadId?.trim() && !emailKeyIds
+          ? phoneLeadIds(listId, leadData.phoneUniqueIdSeed ? `${phoneKey}|${leadData.phoneUniqueIdSeed}` : phoneKey)
+          : null;
+      let leadId = leadData.leadId?.trim() || emailKeyIds?.leadId || phoneKeyIds?.leadId || `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
       // Check for duplicate email if email is provided
       if (!leadData.skipEmailDuplicateCheck && leadData.email && leadData.email.trim()) {
@@ -6498,6 +6776,9 @@ export const crmDb = {
 
       if (emailValue) {
         item.email = emailValue;
+      }
+      if (phoneKey) {
+        item.phoneKey = phoneKey;
       }
       // Keep linkedin sparse so LinkedinLookupIndex GSI only indexes leads
       // with a real value (empty-string HASH keys are wasteful in the GSI).
@@ -6613,12 +6894,14 @@ export const crmDb = {
 
       if (emailKeyIds) {
         leadId = await this.putEmailKeyedLead(params, emailKeyIds);
+      } else if (phoneKeyIds) {
+        leadId = await this.putPhoneKeyedLead(params, phoneKeyIds);
       } else {
         await dynamodb.put(params).promise();
       }
       // Covers landing-page form capture and every single CRM insert. Never await Slack.
       void import('./orgLeadNotificationService')
-        .then(({ dispatchLeadCreated }) => dispatchLeadCreated(listId, leadId))
+        .then(({ dispatchLeadCreated }) => dispatchLeadCreated(listId, leadId, origin))
         .catch(() => console.warn('[leadNotifications] hook failed', { listId, leadId }));
 
       // Extract field names from lead data
@@ -6713,6 +6996,25 @@ export const crmDb = {
    * never reach the caller: a duplicate row is recoverable, a dropped lead is not.
    */
   async putEmailKeyedLead(params: any, ids: EmailLeadIds): Promise<string> {
+    return this.putBucketKeyedLead(params, ids, (existing) => {
+      const duplicateErr: any = new Error(`Lead with email "${params.Item.email}" already exists in this list`);
+      duplicateErr.duplicateEmail = true;
+      duplicateErr.existingLead = existing;
+      return duplicateErr;
+    });
+  },
+
+  /** ENG-2123: the phone twin of putEmailKeyedLead. A loser throws a typed `duplicatePhone`. */
+  async putPhoneKeyedLead(params: any, ids: EmailLeadIds): Promise<string> {
+    return this.putBucketKeyedLead(params, ids, (existing) => {
+      const duplicateErr: any = new Error('Lead with this phone number already exists in this list');
+      duplicateErr.duplicatePhone = true;
+      duplicateErr.existingLead = existing;
+      return duplicateErr;
+    });
+  },
+
+  async putBucketKeyedLead(params: any, ids: EmailLeadIds, makeDuplicate: (existing: any) => Error): Promise<string> {
     const table = params.TableName;
     const listId = params.Item.listId;
     const nonexistent = (leadId: string) => ({
@@ -6721,12 +7023,7 @@ export const crmDb = {
     const adoptOrThrow = async (err: any): Promise<void> => {
       for (const id of [ids.prevLeadId, ids.leadId, ids.nextLeadId]) {
         const existing = await this.getLeadById(listId, id, { consistentRead: true });
-        if (existing) {
-          const duplicateErr: any = new Error(`Lead with email "${params.Item.email}" already exists in this list`);
-          duplicateErr.duplicateEmail = true;
-          duplicateErr.existingLead = existing;
-          throw duplicateErr;
-        }
+        if (existing) throw makeDuplicate(existing);
       }
       if (err) throw err;
     };
@@ -7410,6 +7707,36 @@ export const crmDb = {
     return results;
   },
 
+  /**
+   * ENG-2123: ids of the email-less form captures in a list that share a phoneKey, via PhoneKeyIndex
+   * (HASH listId, RANGE phoneKey, KEYS_ONLY, eventually consistent - callers re-read and VALIDATE each
+   * row). Returns `available:false` instead of throwing when the index does not exist yet or the role may
+   * not query it, remembered for 10 minutes so a missing index costs one warning, not one per capture.
+   * Any other error propagates: a bad expression must not silently disable dedupe forever.
+   */
+  async getLeadIdsByPhoneKey(listId: string, phoneKey: string): Promise<{ available: boolean; leadIds: string[]; capped: boolean }> {
+    if (Date.now() < phoneIndexUnavailableUntil) return { available: false, leadIds: [], capped: false };
+    try {
+      const result = await dynamodb.query({
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        IndexName: 'PhoneKeyIndex',
+        KeyConditionExpression: 'listId = :l AND phoneKey = :k',
+        ExpressionAttributeValues: { ':l': listId, ':k': phoneKey },
+        Limit: PHONE_FANOUT_CAP + 1,
+      }).promise();
+      const ids = (result.Items || []).map((i: any) => String(i.leadId));
+      return { available: true, leadIds: ids, capped: ids.length > PHONE_FANOUT_CAP };
+    } catch (error: any) {
+      const missingIndex = error?.code === 'ValidationException' && /specified index|backfilling/i.test(String(error?.message));
+      if (missingIndex || error?.code === 'AccessDeniedException') {
+        phoneIndexUnavailableUntil = Date.now() + 10 * 60 * 1000;
+        console.warn(`[phone-dedupe] PhoneKeyIndex unavailable (${error.code}); phone lookup disabled for 10 minutes.`);
+        return { available: false, leadIds: [], capped: false };
+      }
+      throw error;
+    }
+  },
+
   async getLeadByEmail(listId: string, email: string) {
     try {
       // Use email-index GSI to query by listId and email
@@ -7722,12 +8049,14 @@ export const crmDb = {
           }
           // NO lifecycle stamp here, deliberately. An earlier version wrote
           // `lifecycle = if_not_exists(lifecycle, 'inbox')` alongside the domain
-          // derivation. That looked harmless and was not: askCrmService reads
-          // `lead.lifecycle ?? computeLifecycle(...)`, so a STORED value short-circuits the
-          // live computation — and nothing in production advances the stored one
-          // (lifecycleService.applyAndUpdate has no production callers). A lead with an
-          // open deal, once enriched with an email, would answer "inbox" where it had
-          // answered "in_deal".
+          // derivation. That looked harmless and was not: askCrmService only trusts a
+          // live recompute over the stored value when a positive signal justifies it
+          // (ENG-2155's gate in deriveScores) — nothing in production otherwise advances
+          // the stored value on its own (lifecycleService.applyAndUpdate has no
+          // production callers). A lead stamped "inbox" here with no live signal the
+          // gate recognizes yet (e.g. an open deal not reflected in a live
+          // getDealsByOwner read) would keep answering "inbox" where it should answer
+          // "in_deal".
           //
           // The justification for stamping it here was that a missing lifecycle made the
           // row invisible to getLeadsByStatus — which is false; that function reads
@@ -7759,8 +8088,9 @@ export const crmDb = {
           // buildLeadCrmFields and throws; before this handler existed a `lifecycle` key
           // on an update was silently dropped, so nothing had to validate it. Now that it
           // is written, an arbitrary string would become permanent for the lead —
-          // askCrmService reads `lead.lifecycle ?? computeLifecycle(...)`, so a stored
-          // junk value outranks the live computation forever.
+          // askCrmService's deriveScores gate (ENG-2155) only overrides the stored
+          // value when a positive live signal justifies it, so a stored junk value can
+          // still outrank the live computation forever whenever no such signal fires.
           if (!isValidLeadLifecycle(lifecycleValue)) {
             throw new Error(`Invalid lead lifecycle: ${lifecycleValue}`);
           }
@@ -8504,6 +8834,7 @@ export const crmDb = {
      *  lead-filter UI. */
     system?: Record<string, any>;
   }>, options: {
+    origin?: LeadOrigin;
     /**
      * Wall-clock budget for this import (ENG-1133). When it runs out, the
      * importer stops between units of work and leaves the rows it never reached
@@ -8825,10 +9156,11 @@ export const crmDb = {
           // is a deliberate divergence from createLead (it honours both via
           // buildLeadCrmFields). Neither is in this function's input type, but
           // crm.ts's bulk-import spreads `...rest` from the request body, so both can
-          // arrive at runtime. `lifecycle` is a one-way door — askCrmService reads
-          // `lead.lifecycle ?? computeLifecycle(...)`, so a stored value outranks the
-          // computation for the life of the lead — and accepting an unvalidated one from
-          // a bulk import is not a door worth opening. Pinned by test.
+          // arrive at runtime. `lifecycle` is still mostly a one-way door — askCrmService's
+          // deriveScores gate (ENG-2155) only recomputes it when a positive live signal
+          // justifies the override, so a stored value can still outrank the computation
+          // for the life of the lead whenever no such signal fires — and accepting an
+          // unvalidated one from a bulk import is not a door worth opening. Pinned by test.
           const derivedDomain = emailValue ? extractDomainFromEmail(emailValue) : null;
           if (derivedDomain) {
             item.domain = derivedDomain;
@@ -8837,13 +9169,15 @@ export const crmDb = {
           // which this originally contradicted. An earlier version of this block wrote
           // `lifecycle = 'inbox'` for any contactable lead, and that is worse here than
           // anywhere else: this is the path the HubSpot pull, the Attio pull and CSV import
-          // use, so it creates most leads. askCrmService reads
-          // `lead.lifecycle ?? computeLifecycle(...)`, nothing in production advances a
-          // stored value (lifecycleService.applyAndUpdate has no production callers), and
-          // backfill-crm-scores.ts only writes `if (lead.lifecycle == null)` — so every
-          // bulk-imported lead would have answered "inbox" for the rest of its life, no
-          // matter what it became. Before this PR those rows stored nothing and were
-          // computed correctly; stamping them would have been a regression.
+          // use, so it creates most leads. askCrmService's deriveScores gate (ENG-2155)
+          // only recomputes a stored value when a positive live signal justifies it —
+          // nothing in production otherwise advances a stored value on its own
+          // (lifecycleService.applyAndUpdate has no production callers), and
+          // backfill-crm-scores.ts only writes `if (lead.lifecycle == null)` — so a
+          // bulk-imported lead stamped "inbox" here would answer "inbox" for the rest of
+          // its life unless/until a live signal the gate recognizes (subscription, open
+          // deal, signup, churn) fires. Before this PR those rows stored nothing and were
+          // computed correctly every time; stamping them would have been a regression.
           //
           // `domain` above is different and is kept: it is derived once from the email and
           // nothing recomputes it, so storing it cannot disagree with anything.
@@ -8895,7 +9229,7 @@ export const crmDb = {
       // Notification delivery must never delay or fail the import save.
       if (results.created.length) {
         void import('./orgLeadNotificationService')
-          .then(({ dispatchLeadsCreated }) => dispatchLeadsCreated(listId, results.created.map(row => row.leadId)))
+          .then(({ dispatchLeadsCreated }) => dispatchLeadsCreated(listId, results.created.map(row => row.leadId), options.origin))
           .catch(() => console.warn('[leadNotifications] batch hook failed', { listId }));
       }
 
@@ -10706,24 +11040,7 @@ export const crmDb = {
   async claimLeadStepOnce(listId: string, leadId: string, key: string): Promise<boolean> {
     const tableName = `${TABLE_PREFIX}AW-Leads`;
     const dynKey = { listId, leadId };
-    try {
-      await dynamodb.update({
-        TableName: tableName,
-        Key: dynKey,
-        // `system` is a DynamoDB reserved keyword — confirmed live against a real
-        // table (round 15/16 smoke test): unescaped, this throws ValidationException,
-        // invisible to unit tests since they mock dynamodb.update() and never
-        // validate expression syntax against DynamoDB's actual reserved-word list.
-        UpdateExpression: 'SET #system = if_not_exists(#system, :emptyMap)',
-        ExpressionAttributeNames: { '#system': 'system' },
-        ExpressionAttributeValues: { ':emptyMap': {} },
-        ConditionExpression: 'attribute_exists(leadId)',
-      }).promise();
-    } catch (err: any) {
-      if (err.code === 'ConditionalCheckFailedException') return false;
-      handleDynamoDbError(err, 'claimLeadStepOnce:bootstrap');
-      throw err;
-    }
+    if (!(await ensureLeadSystemMap(listId, leadId, 'claimLeadStepOnce'))) return false;
 
     // Greptile P1 on #2291 (round 17): the release-on-failure write in
     // calendlyWebhook.ts's runStepOnce is itself best-effort (swallows its own
@@ -10760,6 +11077,71 @@ export const crmDb = {
     } catch (err: any) {
       if (err.code === 'ConditionalCheckFailedException') return false;
       handleDynamoDbError(err, 'claimLeadStepOnce');
+      throw err;
+    }
+  },
+
+  /**
+   * Creates the object `record` at `lead.system[key]` ONLY if that key is absent, returning whether THIS
+   * caller created it. Unlike claimLeadStepOnce there is no stale-reclaim: an existing record is never
+   * overwritten, so the single winner of two racing creators is decided by DynamoDB, not by a read.
+   * False also covers a lead that does not exist.
+   */
+  async createLeadSystemRecordOnce(
+    listId: string,
+    leadId: string,
+    key: string,
+    record: Record<string, unknown>,
+  ): Promise<boolean> {
+    if (!(await ensureLeadSystemMap(listId, leadId, 'createLeadSystemRecordOnce'))) return false;
+    const tableName = `${TABLE_PREFIX}AW-Leads`;
+    const dynKey = { listId, leadId };
+    try {
+      await dynamodb.update({
+        TableName: tableName,
+        Key: dynKey,
+        UpdateExpression: 'SET #system.#k = :rec, updatedAt = :ts',
+        ExpressionAttributeNames: { '#system': 'system', '#k': key },
+        ExpressionAttributeValues: { ':rec': record, ':ts': new Date().toISOString() },
+        ConditionExpression: 'attribute_not_exists(#system.#k)',
+      }).promise();
+      return true;
+    } catch (err) {
+      if (isConditionalFailure(err)) return false;
+      handleDynamoDbError(err, 'createLeadSystemRecordOnce');
+      throw err;
+    }
+  },
+
+  /**
+   * Conditional patch of the object record at `lead.system[key]`, applied in ONE UpdateItem. Returns
+   * false (nothing written) when ANY condition fails, so a replayed or out-of-order caller is a clean
+   * no-op rather than a partial write:
+   *  - `stateIn`: the record's current `state` must be one of these (a missing record fails too);
+   *  - `set`: plain field overwrites (undefined values are skipped);
+   *  - `whenEquals`: fields that must currently hold exactly these values, else nothing is written;
+   *  - `remove`: fields deleted from the record (absent ones are fine); a field that is also in `set` is refused;
+   *  - `maxIn`: per-entry numeric maps, e.g. { lastSequence: { [callSid]: 3 } }; an entry is written only
+   *    if it is higher than the stored one (or absent), otherwise the whole patch fails;
+   *  - `appendNew`: values appended to a list field; if any is already in the list the whole patch fails.
+   * A list named in `appendNew` must already exist on the record (the creator initialises it).
+   * A `maxIn` map must exist too, but its ENTRIES need not.
+   */
+  async updateLeadSystemRecordIf(
+    listId: string,
+    leadId: string,
+    key: string,
+    op: LeadRecordUpdateOp,
+  ): Promise<boolean> {
+    if (op.stateIn.length === 0) return false; // an empty IN () is invalid syntax
+    const expression = leadRecordUpdateExpression(key, op);
+
+    try {
+      await dynamodb.update({ TableName: `${TABLE_PREFIX}AW-Leads`, Key: { listId, leadId }, ...expression }).promise();
+      return true;
+    } catch (err) {
+      if (isConditionalFailure(err)) return false;
+      handleDynamoDbError(err, 'updateLeadSystemRecordIf');
       throw err;
     }
   },
@@ -11190,10 +11572,16 @@ export const accountMemoryDb = {
         UpdateExpression: `SET ${expressions.join(', ')}`,
         ExpressionAttributeNames: names,
         ExpressionAttributeValues: values,
+        // UpdateItem upserts: without this, editing a memory deleted
+        // elsewhere silently re-creates it (ENG-2404).
+        ConditionExpression: 'attribute_exists(memoryId)',
         ReturnValues: 'ALL_NEW',
       }).promise();
       return result.Attributes;
-    } catch (error) {
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') {
+        throw new MemoryNotFoundError(memoryId);
+      }
       handleDynamoDbError(error, 'updateMemory');
       throw error;
     }
@@ -11355,10 +11743,16 @@ export const orgMemoryDb = {
         UpdateExpression: `SET ${expressions.join(', ')}`,
         ExpressionAttributeNames: names,
         ExpressionAttributeValues: values,
+        // UpdateItem upserts: without this, editing a memory deleted
+        // elsewhere silently re-creates it (ENG-2404).
+        ConditionExpression: 'attribute_exists(memoryId)',
         ReturnValues: 'ALL_NEW',
       }).promise();
       return result.Attributes;
-    } catch (error) {
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') {
+        throw new MemoryNotFoundError(memoryId);
+      }
       handleDynamoDbError(error, 'updateOrgMemory');
       throw error;
     }
@@ -11720,10 +12114,11 @@ export const orgDb = {
   // ProjectionExpression) for call sites that only need a few fields off an
   // otherwise large org record (brandGuidelines, competitors, etc). Omit it
   // to fetch the full item as before — every existing caller is unaffected.
-  async getOrgById(orgId: string, fields?: string[]): Promise<Organization | null> {
+  async getOrgById(orgId: string, fields?: string[], consistent = false): Promise<Organization | null> {
     const params: any = {
       TableName: ORGS_TABLE,
       Key: { orgId },
+      ...(consistent ? { ConsistentRead: true } : {}),
     };
     if (fields && fields.length > 0) {
       const names: Record<string, string> = {};

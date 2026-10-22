@@ -1467,7 +1467,7 @@ router.post("/:planId/phases/:phaseId/work-items/:workItemId/start-session", aut
 
     // Set default model and attach GTM work item metadata to the session
     const modelToUse = await agentModeService.getDefaultModel();
-    await chatbotDb.updateSessionLlmModel(session.sessionId, modelToUse);
+    await chatbotDb.updateSessionLlmModel(session.sessionId, modelToUse, undefined, 'system');
     await chatbotDb.updateSessionGtmWorkItem(session.sessionId, { planId, phaseId, workItemId });
 
     // Build the initial message from work item title + description

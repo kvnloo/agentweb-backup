@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import {
   Box,
   Button,
@@ -53,6 +53,8 @@ interface SubscriptionType {
   allowedSkills: string[];
   allowedConnectedAccounts?: string[];
   allowedFeatures?: string[];
+  /** ENG-669: chat models this tier may select (canonical ids, '*' = all, 'agentweb-model' reserved). Absent = all. */
+  allowedModels?: string[];
   monthlyTokenAllowance?: number | null;
   monthlyCostAllowance?: number | null;
   llmUsagePolicy?: {
@@ -82,12 +84,19 @@ interface SubscriptionType {
     usageCreditMicroUsd: number;
     baseSeats: number;
   };
+  /** ENG-668: pay-as-you-go overage tier config. Not editable here yet; carried through on save. */
+  paygOverage?: {
+    allowed: boolean;
+    markupBps: number;
+  };
 }
 
 interface AvailableFeature {
   id: string;
   label: string;
   description: string;
+  /** Costs AgentWeb money per use: never ticked by default, only by an explicit admin choice. */
+  optInOnly?: boolean;
 }
 
 const AVAILABLE_CONNECTED_ACCOUNTS = [
@@ -127,6 +136,10 @@ const SubscriptionTypesTab: React.FC = () => {
   const [availableSkills, setAvailableSkills] = useState<AvailableSkill[]>([]);
   const [availablePages, setAvailablePages] = useState<CustomerPortalPage[]>([]);
   const [availableFeatures, setAvailableFeatures] = useState<AvailableFeature[]>([]);
+  const defaultFeatureIds = useMemo(
+    () => availableFeatures.filter((feature) => !feature.optInOnly).map((feature) => feature.id),
+    [availableFeatures],
+  );
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
@@ -149,6 +162,8 @@ const SubscriptionTypesTab: React.FC = () => {
   const [optimizationThresholdInput, setOptimizationThresholdInput] = useState('');
   const [hardThresholdInput, setHardThresholdInput] = useState('');
   const [optimizedModelsInput, setOptimizedModelsInput] = useState('');
+  // ENG-669: comma-separated allowedModels; blank = field absent (every model).
+  const [allowedModelsInput, setAllowedModelsInput] = useState('');
   const [optimizedDefaultInput, setOptimizedDefaultInput] = useState('');
   // Empty string means "not configured", which is NOT the same as the default
   // value. Storing 90 explicitly would freeze today's default onto the tier.
@@ -236,13 +251,10 @@ const SubscriptionTypesTab: React.FC = () => {
             allowedPages: availablePages.map((p) => p.path),
             hiddenPages: [],
             allowedSkills: availableSkills.map((s) => s.skillId),
-            allowedFeatures: availableFeatures.map((feature) => feature.id),
+            allowedFeatures: defaultFeatureIds,
           }));
         }
-      } else if (
-        editingType.allowedSkills.includes('*') ||
-        editingType.allowedSkills.length === 0
-      ) {
+      } else if (editingType.allowedSkills.includes('*')) {
         // If editing a type that had "*" and skills just loaded, update formData
         if (availableSkills.length > 0) {
           setFormData((prev) => ({
@@ -266,11 +278,11 @@ const SubscriptionTypesTab: React.FC = () => {
       if (editingType && !Array.isArray(editingType.allowedFeatures) && availableFeatures.length > 0) {
         setFormData((prev) => ({
           ...prev,
-          allowedFeatures: availableFeatures.map((feature) => feature.id),
+          allowedFeatures: defaultFeatureIds,
         }));
       }
     }
-  }, [availableSkills, availablePages, availableFeatures, editDialogOpen, editingType]);
+  }, [availableSkills, availablePages, availableFeatures, defaultFeatureIds, editDialogOpen, editingType]);
 
   const handleOpenEditDialog = (type?: SubscriptionType) => {
     if (type) {
@@ -298,13 +310,15 @@ const SubscriptionTypesTab: React.FC = () => {
         name: type.name,
         allowedPages: normalizedPages,
         hiddenPages: type.hiddenPages || [],
-        allowedSkills: type.allowedSkills.includes('*') || type.allowedSkills.length === 0
+        // ENG-1978: an empty list means NO skills (the runtime no longer reads [] as wildcard),
+        // so only an explicit '*' expands to every skill here.
+        allowedSkills: type.allowedSkills.includes('*')
           ? availableSkills.map((s) => s.skillId)
           : type.allowedSkills,
         allowedConnectedAccounts: expandedConnectedAccounts,
         allowedFeatures: Array.isArray(type.allowedFeatures)
           ? type.allowedFeatures
-          : availableFeatures.map((feature) => feature.id),
+          : defaultFeatureIds,
         monthlyTokenAllowance: type.monthlyTokenAllowance ?? null,
         monthlyCostAllowance: type.monthlyCostAllowance ?? null,
       };
@@ -316,6 +330,7 @@ const SubscriptionTypesTab: React.FC = () => {
       setOptimizationThresholdInput(type.llmUsagePolicy ? String(type.llmUsagePolicy.optimizationCostThresholdMicroUsd / 1_000_000) : '');
       setHardThresholdInput(type.llmUsagePolicy ? String(type.llmUsagePolicy.hardCostThresholdMicroUsd / 1_000_000) : '');
       setOptimizedModelsInput(type.llmUsagePolicy?.optimizedModelIds.join(', ') || '');
+      setAllowedModelsInput(Array.isArray(type.allowedModels) ? type.allowedModels.join(', ') : '');
       setOptimizedDefaultInput(type.llmUsagePolicy?.optimizedDefaultModel || '');
       setAlertPercentInput(
         type.llmUsagePolicy?.alertUsagePercentThreshold != null
@@ -344,7 +359,7 @@ const SubscriptionTypesTab: React.FC = () => {
         hiddenPages: [],
         allowedSkills: availableSkills.map((s) => s.skillId),
         allowedConnectedAccounts: AVAILABLE_CONNECTED_ACCOUNTS.map((a) => a.id),
-        allowedFeatures: availableFeatures.map((feature) => feature.id),
+        allowedFeatures: defaultFeatureIds,
         monthlyTokenAllowance: null,
         monthlyCostAllowance: null,
       });
@@ -355,6 +370,7 @@ const SubscriptionTypesTab: React.FC = () => {
       setOptimizationThresholdInput('');
       setHardThresholdInput('');
       setOptimizedModelsInput('');
+      setAllowedModelsInput('');
       setOptimizedDefaultInput('');
       setAlertPercentInput('');
       setForecastAlertsEnabled(true);
@@ -389,6 +405,7 @@ const SubscriptionTypesTab: React.FC = () => {
     setOptimizationThresholdInput('');
     setHardThresholdInput('');
     setOptimizedModelsInput('');
+    setAllowedModelsInput('');
     setOptimizedDefaultInput('');
     setAlertPercentInput('');
     setForecastAlertsEnabled(true);
@@ -527,15 +544,40 @@ const SubscriptionTypesTab: React.FC = () => {
         seatPricing = { priceCents, usageCreditMicroUsd, baseSeats };
       }
 
+      // ENG-1978: a NEW tier saved before the skill list loads would store [] (no skills) without the
+      // admin ever seeing a skill to tick, so make them wait instead.
+      if (availableSkills.length === 0 && !editingType) {
+        setError('Skills are still loading — try again in a moment');
+        return;
+      }
+
+      // ENG-669: blank keeps the field absent (every model); the server canonicalises ids and rejects unknown ones.
+      // A stored empty list (only possible out of band) is sent back as-is, so the server refuses it and the admin
+      // decides, rather than this editor silently turning "no models" into "every model".
+      const typedModels = allowedModelsInput.split(/[,\n]/).map((model) => model.trim()).filter(Boolean);
+      // Something was typed but it names no model (only commas, line breaks or spaces): refuse it rather than save it as
+      // "every model", which is the opposite of what a narrowing edit meant.
+      if (allowedModelsInput.trim() && typedModels.length === 0) {
+        setError('Allowed models names no model: list model ids separated by commas, use * for every model, or leave it blank');
+        return;
+      }
+      const storedEmptyList = Array.isArray(editingType?.allowedModels) && editingType.allowedModels.length === 0;
+      const allowedModels: string[] | undefined = typedModels.length > 0 ? typedModels : (storedEmptyList ? [] : undefined);
+
       // Convert all selected items back to "*" if all are selected
       const dataToSave: SubscriptionType = {
         name: formData.name,
         allowedPages: formData.allowedPages,
         hiddenPages: formData.hiddenPages || [],
+        // ENG-1978: [] now means NO skills, so an unloaded skill list must never be saved over an
+        // existing tier (a '*' tier opens with no checked skills when the list is empty, and
+        // saving that would silently revoke everything). Keep what the tier already has.
         allowedSkills:
-          formData.allowedSkills.length === availableSkills.length && availableSkills.length > 0
-            ? ['*']
-            : formData.allowedSkills,
+          availableSkills.length === 0 && editingType
+            ? editingType.allowedSkills
+            : formData.allowedSkills.length === availableSkills.length && availableSkills.length > 0
+              ? ['*']
+              : formData.allowedSkills,
         allowedConnectedAccounts:
           (formData.allowedConnectedAccounts?.length ?? 0) === AVAILABLE_CONNECTED_ACCOUNTS.length
             ? ['*']
@@ -546,6 +588,10 @@ const SubscriptionTypesTab: React.FC = () => {
         ...(llmUsagePolicy ? { llmUsagePolicy } : {}),
         ...(llmUsageTopUp ? { llmUsageTopUp } : {}),
         ...(seatPricing ? { seatPricing } : {}),
+        // ENG-668: this form has no pay-as-you-go fields, and the tier is rebuilt from the form, so
+        // keep what the tier already has instead of dropping it on every edit.
+        ...(editingType?.paygOverage ? { paygOverage: editingType.paygOverage } : {}),
+        ...(allowedModels ? { allowedModels } : {}),
       };
 
       let updatedTypes = [...subscriptionTypes];
@@ -821,9 +867,10 @@ const SubscriptionTypesTab: React.FC = () => {
                       )}
                     </TableCell>
                     <TableCell>
-                      {type.allowedSkills.includes('*') ||
-                      type.allowedSkills.length === 0 ? (
+                      {type.allowedSkills.includes('*') ? (
                         <Chip label="All Skills" color="primary" size="small" />
+                      ) : type.allowedSkills.length === 0 ? (
+                        <Chip label="No skills" color="warning" size="small" />
                       ) : (
                         <Typography variant="body2" color="text.secondary">
                           {type.allowedSkills.length} skill
@@ -896,6 +943,24 @@ const SubscriptionTypesTab: React.FC = () => {
               disabled={!!editingType}
               helperText={editingType ? 'Name cannot be changed after creation' : ''}
             />
+
+            <Paper variant="outlined" sx={{ p: 2, mb: 3 }}>
+              <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                Chat models
+              </Typography>
+              <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+                Models customers on this tier may choose. Leave blank (or enter *) for every model. Enforced only
+                while the model_tier_allowlist_enabled setting is on; configured default models always run.
+              </Typography>
+              <TextField
+                fullWidth
+                label="Allowed model IDs"
+                value={allowedModelsInput}
+                onChange={(e) => setAllowedModelsInput(e.target.value)}
+                placeholder="* (every model)"
+                helperText="Comma-separated model IDs, e.g. gpt-5.5, gemini-3.5-flash. agentweb-model is reserved for the AgentWeb router."
+              />
+            </Paper>
 
             <Paper variant="outlined" sx={{ p: 2, mb: 3 }}>
               <FormControlLabel
@@ -1083,6 +1148,11 @@ const SubscriptionTypesTab: React.FC = () => {
                       <Typography variant="caption" color="text.secondary">
                         {feature.description}
                       </Typography>
+                      {feature.optInOnly && (
+                        <Typography variant="caption" color="warning.main" display="block">
+                          Costs AgentWeb money per use — tick only for paid plans
+                        </Typography>
+                      )}
                     </Box>
                   )}
                 />
@@ -1187,6 +1257,12 @@ const SubscriptionTypesTab: React.FC = () => {
             <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
               Select which Agent Mode skills users with this subscription type can access. Each skill groups related tools together.
             </Typography>
+            {availableSkills.length > 0 && formData.allowedSkills.length === 0 && (
+              <Alert severity="warning" sx={{ mb: 2 }}>
+                No skills are selected. Users on this tier get the built-in basic tools only. An empty
+                list no longer means "all skills"; select every skill (or Select All Skills) to grant them all.
+              </Alert>
+            )}
             <Box
               sx={{
                 maxHeight: 400,

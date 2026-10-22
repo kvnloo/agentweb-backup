@@ -31,6 +31,8 @@
 import { userDb } from '../services/db';
 import { paymentHistoryDb } from '../services/paymentHistoryDb';
 import { adsMetricsDb } from '../services/adsMetricsDb';
+import { googleAdsService } from '../services/googleAdsService';
+import type { CampaignDeliveryInput } from '../services/accountHealthClassifier';
 import { isEvaluationUser } from '../services/evaluationPolicy';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { emailService } from '../services/emailService';
@@ -265,11 +267,32 @@ async function readTracking(user: AccountHealthUser): Promise<TrackingInput | nu
 }
 
 /**
+ * ENG-1913: live per-campaign delivery for every connected Google Ads account (read-only GAQL).
+ * null when the user has no Google Ads account or any account read fails — unread, never zero.
+ */
+async function readCampaignDelivery(user: AccountHealthUser, nowMs: number): Promise<CampaignDeliveryInput[] | null> {
+  const customerIds = [...new Set(
+    (user.connected_accounts ?? [])
+      .filter((acc: any) => acc?.platform === 'google_ads')
+      .map((acc: any) => String(acc.account_id || acc.config?.customer_id || '').trim())
+      .filter(Boolean),
+  )];
+  if (customerIds.length === 0) return null;
+  try {
+    const perAccount = await Promise.all(customerIds.map((id) => googleAdsService.getCampaignDelivery(user.userId, id, nowMs)));
+    return perAccount.flat();
+  } catch (error) {
+    console.error(`${TAG} Google Ads delivery read failed for user ${user.userId}:`, error);
+    return null;
+  }
+}
+
+/**
  * Reads every signal for one account. A failed read becomes null (unknown), which the classifier
  * reports as a gap rather than as evidence either way.
  */
 export async function gatherAccountHealthSignals(user: AccountHealthUser, nowMs: number): Promise<GatheredAccountHealth> {
-  const [capabilityRow, payments, adDays, feedback, tracking] = await Promise.all([
+  const [capabilityRow, payments, adDays, feedback, tracking, campaigns] = await Promise.all([
     getAccountCapabilityRequirement(user.userId, 'ad_platform_integration').catch((error: unknown) => {
       console.error(`${TAG} capability read failed for user ${user.userId}:`, error);
       return null;
@@ -281,6 +304,7 @@ export async function gatherAccountHealthSignals(user: AccountHealthUser, nowMs:
     readAdDays(user.userId, nowMs),
     readFeedback(user.userId, nowMs),
     readTracking(user),
+    readCampaignDelivery(user, nowMs),
   ]);
   // Summed across account currencies, so it only answers "was anything spent" (> 0), not how much.
   const recentAdSpend = adDays ? adDays.reduce((sum, day) => sum + day.spend, 0) : null;
@@ -294,9 +318,8 @@ export async function gatherAccountHealthSignals(user: AccountHealthUser, nowMs:
       subscriptionStatus: user.subscription_status,
       currentPeriodEnd: user.current_period_end,
       payments,
-      // No stored per-campaign status/budget exists yet (AW-AdsMetricsSnapshots only records
-      // campaigns that delivered), so the ENG-1913 zero-delivery check has no live input here.
-      campaigns: null,
+      // ENG-1913: live Google Ads read (Meta has no per-campaign delivery input yet).
+      campaigns,
       recentAdSpend,
       lastActiveAt: user.lastActiveAt,
       adDays,
@@ -432,6 +455,10 @@ export interface AccountHealthSweepSummary {
   captured?: Array<{ userId: string; state: string; channel: AccountHealthChannel; reason: AccountHealthSignalReason; codes: EvidenceCode[] }>;
 }
 
+/**
+ * NOTE: `dryRun` skips alerts and writes but still reads live Google Ads delivery (read-only GAQL
+ * searches, one set per connected Google account), so a dry run consumes Google API quota.
+ */
 export async function runAccountHealthClassifier(
   opts: { dryRun?: boolean; now?: number } = {},
 ): Promise<AccountHealthSweepSummary> {

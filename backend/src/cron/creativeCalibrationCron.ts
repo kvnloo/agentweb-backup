@@ -171,7 +171,8 @@ export async function runCreativeCalibration(
 
   const excludeCaseIds = new Set<string>();
   if (deps.store.isProvisioned()) {
-    const pairCases = (await deps.store.listCases('creative')).filter((c) => c.pair !== undefined);
+    // Excluded pairs too (ENG-2608): they still fill their batch and must never be drawn again.
+    const pairCases = (await deps.store.listCases('creative', { includeExcluded: true })).filter((c) => c.pair !== undefined);
     const thisBatch = pairCases.filter((c) => c.pair?.batch === batch);
     const expected = thisBatch[0]?.pair?.batchSize;
     if (expected !== undefined && thisBatch.length >= expected) {

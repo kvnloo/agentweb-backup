@@ -121,6 +121,19 @@ export async function getApproverEmail(approver: ApprovalDecisionApprover): Prom
   }
 }
 
+/** Who a newly-created decision is assigned to when the producer doesn't name
+ *  a specific person — one routing rule in one place, same idea as the eval
+ *  queue's getReviewerForType (humanEvalService.ts): the TYPE of work decides
+ *  the reviewer. Meta Ads writes (campaign/ad set/budget/status) are Matt's —
+ *  matching where creative/landing-page evals already go in #eval-queue.
+ *  Fangfang owns lead-enrichment review there; no Approval Desk gate type
+ *  covers that yet, so nothing routes to her until one does. Never Harsha by
+ *  default — he's only ever assigned explicitly. */
+export function getDefaultApproverForGate(gateType: 'meta_write' | 'plan_choice' | string): ApprovalDecisionApprover {
+  void gateType;
+  return 'matt';
+}
+
 /** The reverse lookup every new Approval Desk route needs: a logged-in
  *  partner-portal user's email -> which of the three approvers they are, or
  *  undefined if they're not a named approver at all (an admin who isn't

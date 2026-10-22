@@ -55,6 +55,11 @@ jest.mock('../services/agentModeService', () => ({
   },
 }));
 
+const mockGetSetting = jest.fn();
+jest.mock('../services/settingsService', () => ({
+  settingsService: { getSetting: (...a: unknown[]) => mockGetSetting(...a) },
+}));
+
 jest.mock('../services/generateMarketingResponseWorkerService', () => ({
   generateMarketingResponseWorkerService: { runInWorker: jest.fn(), releaseSessionClients: jest.fn() },
 }));
@@ -120,6 +125,7 @@ import { agentModeController, runScheduledChat } from '../controllers/agentModeC
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { checkTokenUsage } from '../services/tokenUsageService';
 import { getEffectiveLlmUsagePolicy } from '../services/llmUsagePolicyResolverService';
+import { LEGACY_MODEL_ALIASES, LLM_MODEL_REGISTRY } from '../services/agentMode/llmModelRegistry';
 
 const mockAlert = sendAgentModeOncallAlert as jest.MockedFunction<typeof sendAgentModeOncallAlert>;
 
@@ -199,11 +205,16 @@ describe('runScheduledChat — stamps the model that will actually run (ENG-892)
     } as any);
   });
 
-  it('does not stamp an unserved schedule model — records the fallback generation resolves to', async () => {
-    await runScheduledChat({ ...baseSchedule, llmModel: 'claude-sonnet-4-5' } as any, 'test-user-123', false);
+  // FAIL-LOUD (WP-G): this used to assert the silent swap to the fallback. An explicit
+  // pin that is not served now ends the run failed, before any session exists, so
+  // nothing is stamped and nothing runs on a different model.
+  it('does not run an unserved schedule model on the fallback — fails the run, nothing stamped', async () => {
+    const result: any = await runScheduledChat({ ...baseSchedule, llmModel: 'claude-sonnet-4-5' } as any, 'test-user-123', false);
 
-    expect(stampedModel()).toBe(FALLBACK);
-    expect(stampedModel()).not.toBe('claude-sonnet-4-5');
+    expect(result.status).toBe('failure');
+    expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+    expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
+    expect(mockWorker.runInWorker).not.toHaveBeenCalled();
   });
 
   it('stamps the canonical id for a legacy alias, not the alias', async () => {
@@ -235,7 +246,9 @@ describe('runScheduledChat — stamps the model that will actually run (ENG-892)
     const alert = mockAlert.mock.calls[0][0];
     expect(alert.subject).toContain('unsupported');
     expect(alert.message).toContain('claude-sonnet-4-5');
-    expect(alert.message).toContain(FALLBACK);
+    // FAIL-LOUD (WP-G): the run no longer continues on a fallback model.
+    expect(alert.message).toContain('FAILED');
+    expect(alert.message).not.toContain(FALLBACK);
     // Deduped per (schedule, bad value) so a daily schedule cannot flood oncall.
     expect(alert.dedupeKey).toBe('schedule_model_invalid:sched-1:claude-sonnet-4-5');
   });
@@ -341,6 +354,196 @@ describe('getModelOptions — authoritative model discovery', () => {
       allModels: ['anthropic.claude-opus-5', 'openrouter/x-ai/grok-4.6', 'openrouter/x-ai/grok-4.7'],
       scheduleBackupModels: ['openrouter/x-ai/grok-4.7'],
     }));
+  });
+
+  // ENG-112: additive capability hint for "Branch from here". Default OFF; only the exact value "true" turns it on.
+  describe('chatBranchingEnabled hint (ENG-112)', () => {
+    const optionsBody = async () => {
+      mockAgentModeService.getSupportedModels.mockResolvedValue(['gpt-a'] as any);
+      mockGetEffectiveLlmUsagePolicy.mockResolvedValue({
+        billingUserId: 'test-user-123', policy: null, costUsedMicroUsd: 0, creditsApplied: false,
+        mode: { usageMode: 'full_choice', admissionAllowed: true, reason: 'policy_not_enforced' },
+      });
+      const json = jest.fn();
+      await agentModeController.getModelOptions(
+        { user: { userId: 'test-user-123', isAdmin: false } } as any,
+        { json, status: jest.fn(() => ({ json })) } as any,
+      );
+      return json.mock.calls[0][0];
+    };
+
+    it.each([[null], [{ settingValue: 'false' }], [{ settingValue: '' }], [{ settingValue: 'yes' }]])('is false when the setting is %j', async (row) => {
+      mockGetSetting.mockResolvedValue(row);
+      expect((await optionsBody()).chatBranchingEnabled).toBe(false);
+    });
+
+    it('is true only for "true"', async () => {
+      mockGetSetting.mockResolvedValue({ settingValue: 'true' });
+      expect((await optionsBody()).chatBranchingEnabled).toBe(true);
+      expect(mockGetSetting).toHaveBeenCalledWith('chat_branching_enabled');
+    });
+
+    it('fails closed (false) when the settings read throws, without failing the model options', async () => {
+      mockGetSetting.mockRejectedValue(new Error('ddb down'));
+      const body = await optionsBody();
+      expect(body.chatBranchingEnabled).toBe(false);
+      expect(body.allModels).toEqual(['gpt-a']);
+    });
+  });
+
+  // ENG-2379: the legacy id -> current id map the server resolves pins with, served so clients stop hand-copying it.
+  describe('legacyModelAliases (ENG-2379)', () => {
+    const optionsBody = async () => {
+      mockAgentModeService.getSupportedModels.mockResolvedValue(['gpt-a'] as any);
+      mockGetEffectiveLlmUsagePolicy.mockResolvedValue({
+        billingUserId: 'test-user-123', policy: null, costUsedMicroUsd: 0, creditsApplied: false,
+        mode: { usageMode: 'full_choice', admissionAllowed: true, reason: 'policy_not_enforced' },
+      });
+      const json = jest.fn();
+      await agentModeController.getModelOptions(
+        { user: { userId: 'test-user-123', isAdmin: false } } as any,
+        { json, status: jest.fn(() => ({ json })) } as any,
+      );
+      return json.mock.calls[0][0];
+    };
+
+    it('serves exactly the registry map the server resolves legacy ids with, including the Qwen rename', async () => {
+      const body = await optionsBody();
+      expect(body.legacyModelAliases).toEqual(LEGACY_MODEL_ALIASES);
+      expect(body.legacyModelAliases['openrouter/qwen/qwen3.8-max']).toBe('openrouter/qwen/qwen3.8-max-0902');
+    });
+
+    it('is a copy: mutating the response cannot change the server-side map', async () => {
+      const body = await optionsBody();
+      body.legacyModelAliases['gpt-4o-mini'] = 'tampered';
+      expect(LEGACY_MODEL_ALIASES['gpt-4o-mini']).toBe('openrouter/openai/gpt-4o-mini');
+    });
+
+    it('is additive: the existing fields are all still present', async () => {
+      const body = await optionsBody();
+      expect(Object.keys(body)).toEqual(expect.arrayContaining([
+        'usageMode', 'canGenerate', 'allModels', 'selectableModels', 'scheduleBackupModels',
+        'optimizedDefaultModel', 'usagePolicyVersion', 'chatBranchingEnabled', 'compareSaveAlternatives',
+      ]));
+    });
+
+    it('every served alias points at a live registry model and no alias is itself registered (no dead or looping entries)', () => {
+      for (const [legacy, current] of Object.entries(LEGACY_MODEL_ALIASES)) {
+        expect(LLM_MODEL_REGISTRY[current]).toBeDefined();
+        expect(LLM_MODEL_REGISTRY[legacy]).toBeUndefined();
+      }
+    });
+  });
+
+  // ENG-113: additive capability hint for saving the unchosen Compare answers. Default OFF; only the exact value "true" turns it on.
+  describe('compareSaveAlternatives hint (ENG-113)', () => {
+    let clock = Date.now() + 1_000 * 60_000;
+    beforeEach(() => {
+      clock += 10 * 60_000; // the reader caches for ~60s at module level
+      jest.spyOn(Date, 'now').mockImplementation(() => clock);
+    });
+    afterEach(() => jest.restoreAllMocks());
+    const optionsBody = async () => {
+      mockAgentModeService.getSupportedModels.mockResolvedValue(['gpt-a'] as any);
+      mockGetEffectiveLlmUsagePolicy.mockResolvedValue({
+        billingUserId: 'test-user-123', policy: null, costUsedMicroUsd: 0, creditsApplied: false,
+        mode: { usageMode: 'full_choice', admissionAllowed: true, reason: 'policy_not_enforced' },
+      });
+      const json = jest.fn();
+      await agentModeController.getModelOptions(
+        { user: { userId: 'test-user-123', isAdmin: false } } as any,
+        { json, status: jest.fn(() => ({ json })) } as any,
+      );
+      return json.mock.calls[0][0];
+    };
+    const row = (value: unknown) =>
+      mockGetSetting.mockImplementation(async (name: string) => (name === 'compare_save_alternatives' && value !== null ? { settingValue: value } : null));
+
+    it.each([[null], ['false'], [''], ['yes'], ['TRUE']])('is false when the setting is %j', async (value) => {
+      row(value);
+      expect((await optionsBody()).compareSaveAlternatives).toBe(false);
+    });
+    it('is true only for exactly "true"', async () => {
+      row('true');
+      expect((await optionsBody()).compareSaveAlternatives).toBe(true);
+    });
+    it('a settings outage keeps the last-known value and never fails the model options (cold start => off is unit-tested)', async () => {
+      row('true');
+      expect((await optionsBody()).compareSaveAlternatives).toBe(true);
+      clock += 10 * 60_000;
+      mockGetSetting.mockRejectedValue(new Error('ddb down'));
+      const body = await optionsBody();
+      expect(body.compareSaveAlternatives).toBe(true);
+      expect(body.allModels).toEqual(['gpt-a']);
+    });
+  });
+
+  // ENG-2378: additive capability hint for the per-step work-plan model. Default OFF; only the exact value "true" turns it on.
+  describe('workPlanStepModelsEnabled hint (ENG-2378)', () => {
+    let clock = Date.now() + 5_000 * 60_000;
+    beforeEach(() => {
+      clock += 10 * 60_000; // the reader caches for ~60s at module level
+      jest.spyOn(Date, 'now').mockImplementation(() => clock);
+    });
+    afterEach(() => jest.restoreAllMocks());
+    const optionsBody = async () => {
+      mockAgentModeService.getSupportedModels.mockResolvedValue(['gpt-a'] as any);
+      mockGetEffectiveLlmUsagePolicy.mockResolvedValue({
+        billingUserId: 'test-user-123', policy: null, costUsedMicroUsd: 0, creditsApplied: false,
+        mode: { usageMode: 'full_choice', admissionAllowed: true, reason: 'policy_not_enforced' },
+      });
+      const json = jest.fn();
+      await agentModeController.getModelOptions(
+        { user: { userId: 'test-user-123', isAdmin: false } } as any,
+        { json, status: jest.fn(() => ({ json })) } as any,
+      );
+      return json.mock.calls[0][0];
+    };
+    const row = (value: unknown) =>
+      mockGetSetting.mockImplementation(async (name: string) => (name === 'work_plan_step_models_enabled' && value !== null ? { settingValue: value } : null));
+
+    it.each([[null], ['false'], [''], ['yes'], ['TRUE'], [' true']])('is false when the setting is %j', async (value) => {
+      row(value);
+      expect((await optionsBody()).workPlanStepModelsEnabled).toBe(false);
+    });
+    it('is true only for exactly "true", and sits next to the other hints', async () => {
+      row('true');
+      const body = await optionsBody();
+      expect(body.workPlanStepModelsEnabled).toBe(true);
+      expect(body).toHaveProperty('chatBranchingEnabled');
+      expect(body).toHaveProperty('compareSaveAlternatives');
+    });
+    it('a settings outage keeps the last-known value and never fails the model options', async () => {
+      row('true');
+      expect((await optionsBody()).workPlanStepModelsEnabled).toBe(true);
+      clock += 10 * 60_000;
+      mockGetSetting.mockRejectedValue(new Error('ddb down'));
+      const body = await optionsBody();
+      expect(body.workPlanStepModelsEnabled).toBe(true);
+      expect(body.allModels).toEqual(['gpt-a']);
+    });
+  });
+
+  it('never offers a live-voice model: every consumer is a text-chat picker and an explicit live pick now 422s', async () => {
+    mockAgentModeService.getSupportedModels.mockResolvedValue(['gpt-a', 'live-voice-1', 'gpt-b'] as any);
+    (mockAgentModeService as any).isLiveModel = jest.fn((id: string) => id === 'live-voice-1');
+    mockGetEffectiveLlmUsagePolicy.mockResolvedValue({
+      billingUserId: 'test-user-123', policy: null, costUsedMicroUsd: 0, creditsApplied: false,
+      mode: { usageMode: 'full_choice', admissionAllowed: true, reason: 'policy_not_enforced' },
+    });
+    const json = jest.fn();
+    try {
+      await agentModeController.getModelOptions(
+        { user: { userId: 'test-user-123', isAdmin: false } } as any,
+        { json, status: jest.fn(() => ({ json })) } as any,
+      );
+    } finally {
+      delete (mockAgentModeService as any).isLiveModel;
+    }
+    const body = json.mock.calls[0][0];
+    expect(body.allModels).toEqual(['gpt-a', 'gpt-b']);
+    expect(body.selectableModels).toEqual(['gpt-a', 'gpt-b']);
+    expect(body.scheduleBackupModels).not.toContain('live-voice-1');
   });
 });
 

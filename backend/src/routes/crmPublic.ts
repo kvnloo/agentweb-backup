@@ -201,7 +201,7 @@ router.post('/leads/:listId', async (req: Request, res: Response) => {
     let lead: any;
     try {
       // ENG-2321: concurrent same-email posts resolve to one row (an ordinary list; session lists are untouched).
-      lead = await crmDb.createLead(listId, (suppressSideEffects ? { ...leadData, suppressSideEffects: true } : { ...leadData, emailUniqueCreate: true }) as any);
+      lead = await crmDb.createLead(listId, (suppressSideEffects ? { ...leadData, suppressSideEffects: true } : { ...leadData, emailUniqueCreate: true }) as any, 'form_fill');
     } catch (createErr: any) {
       if (!createErr?.duplicateEmail) throw createErr;
       // The email is already on this list (a repeat submission, or a concurrent one that won
@@ -235,7 +235,13 @@ router.post('/leads/:listId', async (req: Request, res: Response) => {
 router.post('/lists/:listId/leads/:leadId/group-email-unsubscribe', async (req: Request, res: Response) => {
   try {
     const { listId, leadId } = req.params;
-    const { email, feedback, sig } = req.body;
+    // ENG-2367: RFC 8058 one-click POSTs carry only `List-Unsubscribe=One-Click` in a
+    // form-encoded body, so email/sig come from the signed header URL's query string.
+    const body = req.body || {};
+    const queryStr = (v: unknown) => (typeof v === 'string' ? v : undefined);
+    const email = body.email ?? queryStr(req.query.email);
+    const sig = body.sig ?? queryStr(req.query.sig);
+    const { feedback } = body;
 
     if (!email) {
       return res.status(400).json({ message: 'Email is required' });

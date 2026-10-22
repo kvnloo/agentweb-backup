@@ -37,6 +37,13 @@ import {
   WhatsAppUndeliverableError,
   WhatsAppRateLimitError,
   TEMPLATES,
+  sendOptOutConfirmation,
+  OPT_OUT_CONFIRMATION,
+  bindPhoneToUser,
+  claimPhoneForUser,
+  unbindPhone,
+  resolveUserIdByPhone,
+  sendInteractiveButtons,
 } from '../services/whatsappService';
 import { MessagingChannelError } from '../services/messagingChannelService';
 
@@ -45,14 +52,20 @@ jest.mock('../services/settingsService', () => ({
     getSetting: jest.fn(),
     setSetting: jest.fn(),
     deleteSetting: jest.fn(),
+    deleteSettingIfValueMatches: jest.fn(),
+    setSettingIfAbsent: jest.fn(),
   },
 }));
 jest.mock('../utils/secretsManager', () => ({
   getWhatsAppCredentials: jest.fn(),
 }));
+jest.mock('../services/db', () => ({
+  userDb: { getUserById: jest.fn() },
+}));
 
 const { settingsService } = require('../services/settingsService');
 const { getWhatsAppCredentials } = require('../utils/secretsManager');
+const { userDb } = require('../services/db');
 
 const OK_RESPONSE = { messages: [{ id: 'wamid.TEST1' }] };
 
@@ -310,6 +323,22 @@ describe('template registry', () => {
     const body = JSON.parse(fetchMock.mock.calls[0][1].body);
     const bodyComponent = body.template.components.find((c: any) => c.type === 'body');
     expect(bodyComponent.parameters.map((p: any) => p.text)).toEqual(['Dark mode', 'https://x/y']);
+  });
+
+  it('addresses each quick-reply button by index with its payload', async () => {
+    await sendTemplate('+14155550123', TEMPLATES.APPROVAL_REQUEST_BUTTONS, ['image', 'a.png', 'https://x/a.png']);
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    const buttons = body.template.components.filter((c: any) => c.type === 'button');
+    expect(buttons).toEqual([
+      { type: 'button', sub_type: 'quick_reply', index: '0', parameters: [{ type: 'payload', payload: 'approve' }] },
+      { type: 'button', sub_type: 'quick_reply', index: '1', parameters: [{ type: 'payload', payload: 'reject' }] },
+    ]);
+  });
+
+  it('adds no button components to a template without quick replies', async () => {
+    await sendTemplate('+14155550123', TEMPLATES.SHIP_NOTIFY, ['a', 'b']);
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body.template.components.filter((c: any) => c.type === 'button')).toEqual([]);
   });
 
   it('rejects a variable-count mismatch rather than sending a broken template', async () => {
@@ -593,5 +622,325 @@ describe('Graph request shape', () => {
     const body = JSON.parse(fetchMock.mock.calls[0][1].body);
     expect(body.messaging_product).toBe('whatsapp');
     expect(body.to).toBe('+14155550123');
+  });
+});
+
+// ── Opt-out confirmation ───────────────────────────────────────────────────
+
+describe('sendOptOutConfirmation', () => {
+  const PHONE = '+14155550123';
+
+  const windowOpenAndOptedOut = () =>
+    settingsService.getSetting.mockImplementation(async (k: string) => {
+      if (k.startsWith('whatsapp:window:')) return { settingValue: new Date().toISOString() };
+      if (k.startsWith('whatsapp:optout:')) return { settingValue: 'x' };
+      return null;
+    });
+
+  it('delivers to a number that has JUST opted out', async () => {
+    windowOpenAndOptedOut();
+
+    // This is the whole point of the function. Every other send path refuses an
+    // opted-out number through assertSendable; a STOP answered with silence is
+    // indistinguishable, to the sender, from a STOP that was dropped.
+    await expect(sendOptOutConfirmation(PHONE)).resolves.toEqual({ messageId: 'wamid.TEST1' });
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body.to).toBe(PHONE);
+    expect(body.type).toBe('text');
+    expect(body.text.body).toBe(OPT_OUT_CONFIRMATION);
+  });
+
+  it('tells the customer how to come back', async () => {
+    // The confirmation is the only message they will get after opting out, so it has to
+    // carry the re-subscribe keyword the webhook actually honours — START, the same word
+    // the portal tells an opted-out customer to send, so the two never disagree.
+    expect(OPT_OUT_CONFIRMATION).toMatch(/Reply START\b/);
+    expect(OPT_OUT_CONFIRMATION).not.toMatch(/UNSTOP/);
+    // It must not leave the customer believing they are still connected.
+    expect(OPT_OUT_CONFIRMATION).toMatch(/no longer connected/i);
+  });
+
+  it('still refuses when the service window is shut', async () => {
+    settingsService.getSetting.mockImplementation(async (k: string) =>
+      k.startsWith('whatsapp:optout:') ? { settingValue: 'x' } : null,
+    );
+
+    // The bypass is scoped to the opt-out check alone. Meta's window rule is theirs,
+    // not ours, and an inbound STOP has always just opened it — so reaching this branch
+    // means something other than a STOP called in, and it must not get a free send.
+    await expect(sendOptOutConfirmation(PHONE)).rejects.toBeInstanceOf(WhatsAppWindowClosedError);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects a destination that is not a valid phone number', async () => {
+    await expect(sendOptOutConfirmation('not-a-number')).rejects.toBeInstanceOf(WhatsAppError);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps the raw number out of its refusal messages (CWE-532)', async () => {
+    settingsService.getSetting.mockResolvedValue(null);
+    await expect(sendOptOutConfirmation(PHONE)).rejects.toThrow(
+      expect.objectContaining({ message: expect.not.stringContaining('4155550123') }),
+    );
+  });
+
+  it('cannot be repurposed to send arbitrary text', () => {
+    // Guards the design: the moment this takes a caller-supplied body it stops being an
+    // acknowledgement and becomes a way to message people who opted out.
+    expect(sendOptOutConfirmation).toHaveLength(1);
+  });
+});
+
+// ── Sender identity (phone -> user) ────────────────────────────────────────
+
+describe('phone -> user index', () => {
+  const PHONE = '+918005326946';
+  const KEY = `whatsapp:phone-user:${PHONE}`;
+
+  const boundUser = (destination: string = PHONE) => ({
+    userId: 'user-1',
+    messagingChannels: [
+      {
+        channel: 'whatsapp',
+        destination,
+        enabled: true,
+        optIn: { at: 'x', source: 'inbound_verification', verifiedAt: 'y' },
+      },
+    ],
+  });
+
+  it('writes the index under a phone-keyed setting', async () => {
+    await bindPhoneToUser(PHONE, 'user-1');
+    expect(settingsService.setSetting).toHaveBeenCalledWith(
+      KEY,
+      'user-1',
+      expect.any(String),
+      'system',
+    );
+  });
+
+  describe('claimPhoneForUser', () => {
+    it('takes a free number with one atomic put-if-absent', async () => {
+      (settingsService.setSettingIfAbsent as jest.Mock).mockResolvedValue(true);
+      await expect(claimPhoneForUser(PHONE, 'user-1')).resolves.toBe('claimed');
+      expect(settingsService.setSettingIfAbsent).toHaveBeenCalledWith(KEY, 'user-1', expect.any(String), 'system');
+    });
+
+    it('recognises its own earlier claim (a retried verification)', async () => {
+      (settingsService.setSettingIfAbsent as jest.Mock).mockResolvedValue(false);
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({ settingValue: 'user-1' });
+      await expect(claimPhoneForUser(PHONE, 'user-1')).resolves.toBe('already_yours');
+    });
+
+    it('refuses a number another account still really holds', async () => {
+      (settingsService.setSettingIfAbsent as jest.Mock).mockResolvedValue(false);
+      (settingsService.getSetting as jest.Mock)
+        .mockResolvedValueOnce({ settingValue: 'user-2' }) // the claim row
+        .mockResolvedValueOnce({ settingValue: 'user-2' }); // resolveUserIdByPhone's read
+      (userDb.getUserById as jest.Mock).mockResolvedValue(boundUser());
+      await expect(claimPhoneForUser(PHONE, 'user-1')).resolves.toBe('held_by_other');
+    });
+
+    it('takes over a stale row whose account no longer has the number, with a second atomic attempt', async () => {
+      (settingsService.setSettingIfAbsent as jest.Mock).mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({ settingValue: 'user-2' });
+      (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'user-2', messagingChannels: [] });
+      await expect(claimPhoneForUser(PHONE, 'user-1')).resolves.toBe('claimed');
+      expect(settingsService.setSettingIfAbsent).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not heal away a claim made moments ago (its owner has not saved yet)', async () => {
+      (settingsService.setSettingIfAbsent as jest.Mock).mockResolvedValue(false);
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: 'user-2',
+        updatedAt: new Date().toISOString(),
+      });
+      (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'user-2', messagingChannels: [] });
+      await expect(claimPhoneForUser(PHONE, 'user-1')).resolves.toBe('held_by_other');
+      expect(settingsService.deleteSettingIfValueMatches).not.toHaveBeenCalled();
+      expect(settingsService.setSettingIfAbsent).toHaveBeenCalledTimes(1);
+    });
+
+    it('takes over a claim that has been abandoned for longer than the grace period', async () => {
+      (settingsService.setSettingIfAbsent as jest.Mock).mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: 'user-2',
+        updatedAt: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+      });
+      (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'user-2', messagingChannels: [] });
+      await expect(claimPhoneForUser(PHONE, 'user-1')).resolves.toBe('claimed');
+    });
+
+    it('loses cleanly when a racing account wins the second attempt too', async () => {
+      (settingsService.setSettingIfAbsent as jest.Mock).mockResolvedValue(false);
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({ settingValue: 'user-2' });
+      (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'user-2', messagingChannels: [] });
+      await expect(claimPhoneForUser(PHONE, 'user-1')).resolves.toBe('held_by_other');
+    });
+  });
+
+  it('clears the index', async () => {
+    await unbindPhone(PHONE);
+    expect(settingsService.deleteSetting).toHaveBeenCalledWith(KEY);
+  });
+
+  it('clears the index only if it still points at the account asking, atomically', async () => {
+    settingsService.deleteSettingIfValueMatches.mockResolvedValue(undefined);
+    await unbindPhone(PHONE, 'user-1');
+    expect(settingsService.deleteSettingIfValueMatches).toHaveBeenCalledWith(KEY, 'user-1');
+    expect(settingsService.deleteSetting).not.toHaveBeenCalled();
+  });
+
+  it('leaves the index alone when the number has been re-bound to someone else', async () => {
+    // An old account disconnecting must not break the new owner's inbound taps.
+    settingsService.deleteSettingIfValueMatches.mockRejectedValue(
+      Object.assign(new Error('cond'), { code: 'ConditionalCheckFailedException' }),
+    );
+    await expect(unbindPhone(PHONE, 'user-1')).resolves.toBeUndefined();
+    expect(settingsService.deleteSetting).not.toHaveBeenCalled();
+  });
+
+  it('surfaces a real failure rather than swallowing it', async () => {
+    settingsService.deleteSettingIfValueMatches.mockRejectedValue(
+      Object.assign(new Error('x'), { code: 'ProvisionedThroughputExceededException' }),
+    );
+    await expect(unbindPhone(PHONE, 'user-1')).rejects.toThrow('x');
+  });
+
+  it('resolves a bound number to its user', async () => {
+    settingsService.getSetting.mockResolvedValue({ settingValue: 'user-1' });
+    userDb.getUserById.mockResolvedValue(boundUser());
+    await expect(resolveUserIdByPhone(PHONE)).resolves.toBe('user-1');
+  });
+
+  it('resolves to nothing when no index row exists', async () => {
+    settingsService.getSetting.mockResolvedValue(null);
+    await expect(resolveUserIdByPhone(PHONE)).resolves.toBeNull();
+    expect(userDb.getUserById).not.toHaveBeenCalled();
+  });
+
+  it('refuses a number the user no longer holds, and self-heals', async () => {
+    // The index outlived its binding — a crash between two writes, or a number that
+    // moved to another account. Trusting the row here would let one customer answer
+    // another customer's approval, so the user record is the authority and the stale
+    // row is cleared on the way out.
+    settingsService.getSetting.mockResolvedValue({ settingValue: 'user-1' });
+    userDb.getUserById.mockResolvedValue(boundUser('+14155550000'));
+
+    await expect(resolveUserIdByPhone(PHONE)).resolves.toBeNull();
+    // Atomic and scoped to the stale value it saw: a number re-bound since is left alone.
+    expect(settingsService.deleteSettingIfValueMatches).toHaveBeenCalledWith(KEY, 'user-1');
+  });
+
+  it('refuses a number whose entry is not yet verified', async () => {
+    settingsService.getSetting.mockResolvedValue({ settingValue: 'user-1' });
+    userDb.getUserById.mockResolvedValue({
+      userId: 'user-1',
+      messagingChannels: [
+        { channel: 'whatsapp', destination: PHONE, enabled: true, optIn: { at: 'x', source: 's' } },
+      ],
+    });
+    await expect(resolveUserIdByPhone(PHONE)).resolves.toBeNull();
+  });
+
+  it('refuses a number whose entry is disabled', async () => {
+    settingsService.getSetting.mockResolvedValue({ settingValue: 'user-1' });
+    userDb.getUserById.mockResolvedValue({
+      userId: 'user-1',
+      messagingChannels: [
+        { channel: 'whatsapp', destination: PHONE, enabled: false, optIn: { verifiedAt: 'y' } },
+      ],
+    });
+    await expect(resolveUserIdByPhone(PHONE)).resolves.toBeNull();
+  });
+
+  it('resolves to nothing when the user record has vanished', async () => {
+    settingsService.getSetting.mockResolvedValue({ settingValue: 'user-1' });
+    userDb.getUserById.mockResolvedValue(null);
+    await expect(resolveUserIdByPhone(PHONE)).resolves.toBeNull();
+  });
+});
+
+// ── Interactive reply buttons ──────────────────────────────────────────────
+
+describe('sendInteractiveButtons', () => {
+  const PHONE = '+14155550123';
+  const BUTTONS = [
+    { id: 'approve', title: 'Approve' },
+    { id: 'reject', title: 'Reject' },
+  ];
+  const openWindow = () =>
+    settingsService.getSetting.mockImplementation(async (k: string) =>
+      k.startsWith('whatsapp:window:') ? { settingValue: new Date().toISOString() } : null,
+    );
+
+  it('sends the interactive shape Meta expects', async () => {
+    openWindow();
+    await sendInteractiveButtons(PHONE, 'Asset waiting', BUTTONS);
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body.type).toBe('interactive');
+    expect(body.interactive.type).toBe('button');
+    expect(body.interactive.body.text).toBe('Asset waiting');
+    expect(body.interactive.action.buttons).toEqual([
+      { type: 'reply', reply: { id: 'approve', title: 'Approve' } },
+      { type: 'reply', reply: { id: 'reject', title: 'Reject' } },
+    ]);
+  });
+
+  it('refuses outside the service window — out there a template is required', async () => {
+    settingsService.getSetting.mockResolvedValue(null);
+    await expect(sendInteractiveButtons(PHONE, 'x', BUTTONS)).rejects.toBeInstanceOf(
+      WhatsAppWindowClosedError,
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('refuses more than three buttons', async () => {
+    openWindow();
+    const four = ['a', 'b', 'c', 'd'].map((x) => ({ id: x, title: x }));
+    await expect(sendInteractiveButtons(PHONE, 'x', four)).rejects.toBeInstanceOf(WhatsAppError);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('refuses an empty button list', async () => {
+    openWindow();
+    await expect(sendInteractiveButtons(PHONE, 'x', [])).rejects.toBeInstanceOf(WhatsAppError);
+  });
+
+  it('refuses duplicate titles, which Meta rejects', async () => {
+    openWindow();
+    await expect(
+      sendInteractiveButtons(PHONE, 'x', [
+        { id: 'a', title: 'Same' },
+        { id: 'b', title: 'Same' },
+      ]),
+    ).rejects.toBeInstanceOf(WhatsAppError);
+  });
+
+  it('refuses a title over 20 characters', async () => {
+    openWindow();
+    await expect(
+      sendInteractiveButtons(PHONE, 'x', [{ id: 'a', title: 'x'.repeat(21) }]),
+    ).rejects.toBeInstanceOf(WhatsAppError);
+  });
+
+  it('refuses an opted-out number like every other send', async () => {
+    settingsService.getSetting.mockImplementation(async (k: string) => {
+      if (k.startsWith('whatsapp:optout:')) return { settingValue: 'x' };
+      if (k.startsWith('whatsapp:window:')) return { settingValue: new Date().toISOString() };
+      return null;
+    });
+    await expect(sendInteractiveButtons(PHONE, 'x', BUTTONS)).rejects.toBeInstanceOf(
+      WhatsAppOptedOutError,
+    );
+  });
+
+  it('strips invisible characters from the body', async () => {
+    openWindow();
+    await sendInteractiveButtons(PHONE, 'he\u200Bllo', BUTTONS);
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body.interactive.body.text).toBe('hello');
   });
 });

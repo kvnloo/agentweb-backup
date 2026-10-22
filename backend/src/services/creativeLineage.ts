@@ -108,6 +108,18 @@ export interface MetaAdLinkEnd {
   endedAt: string;
 }
 
+/**
+ * ENG-2235: a Google Ads ad that uses this generated image. Google has no per-ad "creative" object;
+ * the image is uploaded as an asset (customers/{c}/assets/{id}) and ads reference that asset.
+ */
+export interface GoogleAdLink {
+  customerId: string;
+  /** customers/{c}/adGroupAds/{adGroupId}~{adId} — the key ENG-2215's ad metrics join on. */
+  adResourceName: string;
+  assetResourceName: string;
+  linkedAt: string;
+}
+
 export interface CreativeLineageRecord {
   creativeId: string;
   userId: string;
@@ -130,6 +142,11 @@ export interface CreativeLineageRecord {
   /** Ad ids in metaAdLinks (string set), so a later creative change on the ad can find this record. */
   metaAdIds?: AWS.DynamoDB.DocumentClient.DynamoDbSet;
   metaAdLinkEnds?: MetaAdLinkEnd[];
+  /** ENG-2235: Google Ads image-asset resource names this image was uploaded as (string set). */
+  googleAssetResourceNames?: AWS.DynamoDB.DocumentClient.DynamoDbSet;
+  googleAdLinks?: GoogleAdLink[];
+  /** Ad resource names in googleAdLinks (string set), for idempotency and later lookups. */
+  googleAdResourceNames?: AWS.DynamoDB.DocumentClient.DynamoDbSet;
   schemaVersion: number;
   createdAt: string;
   updatedAt: string;
@@ -423,7 +440,7 @@ export function collectCreativeMedia(params: MetaCreativeMediaParams): { imageUr
   return { imageUrls: [...imageUrls], imageHashes: [...imageHashes] };
 }
 
-type LookupAttribute = 'metaImageHashes' | 'metaCreativeIds' | 'metaAdIds';
+type LookupAttribute = 'metaImageHashes' | 'metaCreativeIds' | 'metaAdIds' | 'googleAssetResourceNames';
 
 /** This user's creative records (within the lookup window) whose string set holds `value`. */
 async function findUserCreativesContaining(
@@ -704,6 +721,112 @@ export async function stampMetaAdCreativeChanged(
     }, concatIds);
   } catch (err) {
     warn(`ad creative change stamp failed (non-fatal)`, err);
+    return [];
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Google Ads (ENG-2235)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Stamps a Google Ads image-asset upload: the uploaded URL resolves to its creative, which gains
+ * the asset resource name. Buffer uploads (no URL) cannot be linked. Returns the creativeId stamped,
+ * or null. Never throws.
+ */
+export async function stampGoogleAssetUpload(
+  input: { userId: string; imageUrl: string; assetResourceName: string },
+  deps: CreativeLineageDeps = {},
+): Promise<string | null> {
+  const ctx = resolveDeps(deps);
+  if (!ctx) return null;
+  const creativeId = creativeIdForUrl(input.imageUrl);
+  if (!creativeId || !input.assetResourceName || !input.userId) return null;
+  try {
+    await serialized(input.userId, () => ctx.db.update({
+      TableName: ctx.table,
+      Key: { creativeId },
+      UpdateExpression: 'ADD googleAssetResourceNames :asset SET updatedAt = :now',
+      ConditionExpression: 'attribute_exists(creativeId) AND userId = :userId',
+      ExpressionAttributeValues: {
+        ':asset': ctx.db.stringSet([input.assetResourceName]),
+        ':now': ctx.now().toISOString(),
+        ':userId': input.userId,
+      },
+    }));
+    return creativeId;
+  } catch (err) {
+    if (!isConditionFailure(err)) warn(`google asset upload stamp for ${creativeId} failed (non-fatal)`, err);
+    return null;
+  }
+}
+
+/**
+ * Stamps a created Google Ads ad on every generated creative whose uploaded asset it uses.
+ * Returns the creativeIds stamped (empty when lineage is off or no asset was ours). Never throws.
+ */
+export async function stampGoogleAdCreated(
+  input: { userId: string; customerId: string; adResourceName: string; assetResourceNames: string[] | undefined },
+  deps: CreativeLineageDeps = {},
+): Promise<string[]> {
+  const ctx = resolveDeps(deps);
+  const assets = [...new Set((input.assetResourceNames ?? []).filter((a) => typeof a === 'string' && a))];
+  if (!ctx || !input.userId || !input.adResourceName || assets.length === 0) return [];
+  const done = new Set<string>();
+  // GSI reads are eventually consistent: keep retrying while ANY asset is still unmatched.
+  const resolvedAssets = new Set<string>();
+  try {
+    return await withLookupRetry(ctx, input.userId, async () => {
+      const stamped: string[] = [];
+      for (const assetResourceName of assets) {
+        if (resolvedAssets.has(assetResourceName)) continue;
+        const records = await findUserCreativesContaining(ctx, input.userId, 'googleAssetResourceNames', assetResourceName);
+        if (records.length > 0) resolvedAssets.add(assetResourceName);
+        for (const record of records) {
+          if (done.has(record.creativeId)) continue;
+          if ((record.googleAdLinks ?? []).some((l) => l.adResourceName === input.adResourceName)) {
+            done.add(record.creativeId);
+            stamped.push(record.creativeId);
+            continue;
+          }
+          const linkedAt = ctx.now().toISOString();
+          const link: GoogleAdLink = { customerId: input.customerId, adResourceName: input.adResourceName, assetResourceName, linkedAt };
+          try {
+            await ctx.db.update({
+              TableName: ctx.table,
+              Key: { creativeId: record.creativeId },
+              UpdateExpression:
+                'ADD googleAdResourceNames :adSet SET googleAdLinks = list_append(if_not_exists(googleAdLinks, :empty), :link), updatedAt = :now',
+              // Reject a duplicate link atomically (concurrent stamps may both read pre-link state).
+              ConditionExpression:
+                'attribute_exists(creativeId) AND userId = :userId AND NOT contains(googleAdResourceNames, :adName)',
+              ExpressionAttributeValues: {
+                ':adSet': ctx.db.stringSet([input.adResourceName]),
+                ':adName': input.adResourceName,
+                ':empty': [],
+                ':link': [link],
+                ':now': linkedAt,
+                ':userId': input.userId,
+              },
+            });
+            done.add(record.creativeId);
+            stamped.push(record.creativeId);
+          } catch (err) {
+            if (isConditionFailure(err)) {
+              // Record came from a user-scoped lookup, so the failure is the duplicate-link guard:
+              // the ad is already linked on this creative.
+              done.add(record.creativeId);
+              stamped.push(record.creativeId);
+            } else {
+              warn(`google ad stamp for ${record.creativeId} failed (non-fatal)`, err);
+            }
+          }
+        }
+      }
+      return { result: stamped, retry: resolvedAssets.size < assets.length };
+    }, concatIds);
+  } catch (err) {
+    warn(`google ad stamp failed (non-fatal)`, err);
     return [];
   }
 }

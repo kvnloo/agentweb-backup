@@ -101,6 +101,16 @@ describe('classifyToolFailureType', () => {
     it('classifies the Slack bot not being in the channel', () => {
       expect(classifyToolFailureType('Error', 'The Slack bot is not a member of channel C09JU')).toBe('config');
     });
+    it('classifies the landing-page share non-member refusal as by_design (ENG-2585)', () => {
+      expect(
+        classifyToolFailureType('Error', "API error (400): 'x@y.com' is not a member of the page owner's organization"),
+      ).toBe('by_design');
+    });
+    it('classifies a Google Ads serving_chain state report as by_design (ENG-2611)', () => {
+      expect(classifyToolFailureType('Error', '{"customerId":"4149815605","state":"UNVERIFIED","campaigns":[]}')).toBe('by_design');
+      expect(classifyToolFailureType('Error', '{"customerId":"1","state":"BLOCKED_BY_POLICY","blockers":[]}')).toBe('by_design');
+      expect(classifyToolFailureType('Error', '{"customerId":"1","state":"DELIVERY_FAILED"}')).toBe('bug');
+    });
     it('classifies a landing-page authorization gap', () => {
       expect(classifyToolFailureType('Error', 'Not authorized to edit this landing page.')).toBe('config');
     });
@@ -241,5 +251,34 @@ describe('quota_exceeded → config, not bug (ENG-1220)', () => {
 
   it('does NOT fall through to bug — the automated tool-failure proposal system reads failureType to decide "investigate the handler" vs. "resolve the account"', () => {
     expect(classifyToolFailureType('quota_exceeded', 'gpt-image-2 API failed: Request failed with status code 429')).not.toBe('bug');
+  });
+});
+
+describe('ENG-2583 — unconnected integrations / unconfigured resources / CRM role refusals', () => {
+  it('"<Service> not connected … Connected Accounts" is config, not bug', () => {
+    expect(
+      classifyToolFailureType('Error', 'Google Drive not connected. Connect Google Drive in Settings → Connected Accounts.'),
+    ).toBe('config');
+  });
+
+  it('"No <thing> is configured" is config, not bug', () => {
+    expect(
+      classifyToolFailureType('Error', 'No Slack channel is configured for your account. Ask your admin to set one up.'),
+    ).toBe('config');
+  });
+
+  it('CRM list role refusal is by_design (role boundary working as designed)', () => {
+    expect(
+      classifyToolFailureType(
+        'Error',
+        'Only the list owner, the org owner, or a listed CRM editor can do this. Ask your org admin to add you as a CRM editor.',
+      ),
+    ).toBe('by_design');
+  });
+
+  it('does not reclassify unrelated messages that merely mention connection/configuration', () => {
+    expect(classifyToolFailureType('Error', 'socket hang up: connection reset by peer')).toBe('bug');
+    expect(classifyToolFailureType('Error', 'Webhook configured successfully but delivery returned 500')).toBe('bug');
+    expect(classifyToolFailureType('Error', 'Client disconnected unexpectedly')).toBe('bug');
   });
 });

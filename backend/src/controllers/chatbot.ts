@@ -2,23 +2,38 @@ import { Request, Response } from 'express';
 import { AuthenticatedRequest } from '../middleware/auth';
 import { redactAdminActivity } from '../utils/adminOnlyMessageFilter';
 import { ADMIN_SKILL_TOOL_NAMES } from '../services/agentModeService';
+import { redactWorkPlanProvenance } from '../utils/workPlanProvenance';
 
 // ENG-2163: redact delegated-admin activity from a session before returning it to a viewer.
 // The chatbot serve paths historically return raw messages and read the SAME store as agent mode,
 // so a customer can fetch a session where an admin ran admin tools. Fails closed (non-admin) when
 // delegateInfo is absent. Mutates and returns the session for convenience.
+// ENG-669: a non-admin viewer also never gets the work plan's model provenance bookkeeping (as on agent mode's reads).
 function redactSessionForViewer<T extends { messages?: any[] } | null | undefined>(session: T, req: AuthenticatedRequest): T {
+  const viewerIsAdmin = !!(req.user?.isAdmin || (req as any).delegateInfo?.isDelegated);
   if (session && Array.isArray((session as any).messages)) {
-    const viewerIsAdmin = !!(req.user?.isAdmin || (req as any).delegateInfo?.isDelegated);
     (session as any).messages = redactAdminActivity((session as any).messages, { viewerIsAdmin, adminToolNames: ADMIN_SKILL_TOOL_NAMES });
+  }
+  if (session && !viewerIsAdmin && (session as any).workPlan) {
+    (session as any).workPlan = redactWorkPlanProvenance((session as any).workPlan);
   }
   return session;
 }
 import { chatbotDb, generateChatResponse } from '../services/chatbotService';
-import { checkTokenUsage, toCustomerTokenUsage } from '../services/tokenUsageService';
+import { checkTokenUsage, TURN_ADMISSION, toCustomerTokenUsage } from '../services/tokenUsageService';
 import { buildUsageBlockCopy } from '../utils/usageBlockCopy';
 import { userDb } from '../services/db';
 import { resolveRunFunding, withRunFunding } from '../services/funding/runFunding';
+import { isAgentWebModelId } from '../services/agentMode/agentWebModelRouter';
+import { buildModelUnavailableBody, ModelUnavailableError } from '../services/agentMode/modelUnavailable';
+
+/**
+ * ENG-669 PR-C: the sidebar chatbot calls one model directly (no resolver, no router), so a request naming the AgentWeb
+ * Model is refused visibly (the shared 422 shape) instead of failing deep inside the gateway.
+ */
+function agentWebModelNotUsableHereBody() {
+  return buildModelUnavailableBody(new ModelUnavailableError('agentweb-model', 'not_selectable'));
+}
 
 // Create a new chat session
 export const createChatSession = async (req: AuthenticatedRequest, res: Response) => {
@@ -101,14 +116,9 @@ export const listEmmaSessions = async (req: AuthenticatedRequest, res: Response)
     const pageId = (req.query.pageIdentifier as string) || 'customer-portal';
     const sessions = await chatbotDb.getEmmaSessions(userId, limit, pageId);
     // Strip heavy fields not needed for the history list
-    const viewerIsAdminList = !!(req.user?.isAdmin || (req as any).delegateInfo?.isDelegated);
-    const sanitized = sessions.map(({ pageContent, contextChunks, ...rest }: any) => {
-      // ENG-2163: this list returns full message bodies — redact admin activity per session.
-      if (Array.isArray(rest.messages)) {
-        rest.messages = redactAdminActivity(rest.messages, { viewerIsAdmin: viewerIsAdminList, adminToolNames: ADMIN_SKILL_TOOL_NAMES });
-      }
-      return rest;
-    });
+    // ENG-2163: this list returns full message bodies — redact admin activity per session (and, ENG-669, the work
+    // plan's model provenance bookkeeping).
+    const sanitized = sessions.map(({ pageContent, contextChunks, ...rest }: any) => redactSessionForViewer(rest, req));
     res.status(200).json(sanitized);
   } catch (error) {
     console.error('Error listing Emma sessions:', error);
@@ -138,12 +148,8 @@ export const getChatSession = async (req: AuthenticatedRequest, res: Response) =
     // ENG-2163: this endpoint reads the SAME session store as agent mode and is owner-gated
     // only, so a customer can fetch a session in which a delegated admin ran admin tools. Redact
     // that admin activity for a non-admin viewer (fails closed when delegateInfo is absent).
-    const viewerIsAdmin = !!(req.user?.isAdmin || (req as any).delegateInfo?.isDelegated);
-    if (Array.isArray((sanitizedSession as any).messages)) {
-      (sanitizedSession as any).messages = redactAdminActivity((sanitizedSession as any).messages, { viewerIsAdmin, adminToolNames: ADMIN_SKILL_TOOL_NAMES });
-    }
-
-    res.status(200).json(sanitizedSession);
+    // ENG-669: and the work plan's model provenance bookkeeping.
+    res.status(200).json(redactSessionForViewer(sanitizedSession, req));
   } catch (error) {
     console.error('Error getting chat session:', error);
     res.status(500).json({ error: 'Failed to get chat session' });
@@ -156,6 +162,7 @@ export const sendMessage = async (req: AuthenticatedRequest, res: Response) => {
     const sessionId = req.params.sessionId;
     const { message, currentUrl, pageContext, structuredContext, screenshot, model } = req.body;
     const portal = req.query.portal as string | undefined;
+    if (isAgentWebModelId(model)) return res.status(422).json(agentWebModelNotUsableHereBody());
 
     let portalType: 'customer' | 'partner' = 'partner'; // Default to partner
     if (portal === 'customer') {
@@ -185,12 +192,12 @@ export const sendMessage = async (req: AuthenticatedRequest, res: Response) => {
 
     // Check token usage limits
     if (userId) {
-      const usageStatus = await checkTokenUsage(userId);
+      const usageStatus = await checkTokenUsage(userId, TURN_ADMISSION);
       if (!usageStatus.allowed) {
         // ENG-1344 AC6: one producer for the refusal, shared with the portal
         // modal, the MCP 429 and the socket error. Composed once so the flat
         // string and the structured copy cannot disagree.
-        const blockCopy = buildUsageBlockCopy({ month: usageStatus.month });
+        const blockCopy = buildUsageBlockCopy({ month: usageStatus.month, paygBlock: usageStatus.paygBlock });
         return res.status(429).json({
           error: blockCopy.message,
           usageBlock: blockCopy,
@@ -255,6 +262,10 @@ export const sendMessageStream = async (req: AuthenticatedRequest, res: Response
   const sessionId = req.params.sessionId;
   const { message, currentUrl, pageContext, structuredContext, screenshot, model } = req.body;
   const portal = req.query.portal as string | undefined;
+  if (isAgentWebModelId(model)) {
+    res.status(422).json(agentWebModelNotUsableHereBody());
+    return;
+  }
 
   const portalType: 'customer' | 'partner' = portal === 'customer' ? 'customer' : 'partner';
 
@@ -271,9 +282,9 @@ export const sendMessageStream = async (req: AuthenticatedRequest, res: Response
   }
 
   // Check token usage limits
-  const usageStatus = await checkTokenUsage(userId);
+  const usageStatus = await checkTokenUsage(userId, TURN_ADMISSION);
   if (!usageStatus.allowed) {
-    const blockCopy = buildUsageBlockCopy({ month: usageStatus.month });
+    const blockCopy = buildUsageBlockCopy({ month: usageStatus.month, paygBlock: usageStatus.paygBlock });
     res.status(429).json({
       error: blockCopy.message,
       usageBlock: blockCopy,

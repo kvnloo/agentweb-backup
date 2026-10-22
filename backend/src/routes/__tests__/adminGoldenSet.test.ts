@@ -6,7 +6,7 @@
 import express, { type NextFunction, type Request, type Response } from 'express';
 import request from 'supertest';
 import { newCreativePairCase, newGoldenCase } from '../../loops/eval/goldenSet';
-import { createGoldenSetStore, type GoldenSetStore } from '../../loops/eval/goldenSetStore';
+import { createGoldenSetStore, GoldenCaseNotFoundError, type GoldenSetStore } from '../../loops/eval/goldenSetStore';
 
 interface TestUser {
   userId: string;
@@ -28,7 +28,9 @@ jest.mock('../../middleware/auth', () => ({
     next();
   },
 }));
+jest.mock('../../services/adminAuditLog', () => ({ recordAdminAudit: jest.fn() }));
 
+import { recordAdminAudit } from '../../services/adminAuditLog';
 import { createAdminGoldenSetRouter } from '../adminGoldenSet';
 
 const ADMIN = JSON.stringify({ userId: 'admin-1', email: 'admin@example.com', isAdmin: true });
@@ -46,6 +48,10 @@ function fakeStore(overrides: Partial<GoldenSetStore> = {}): jest.Mocked<GoldenS
     listCases: jest.fn(async () => [CASE]),
     createCase: jest.fn(async () => 'created' as const),
     saveLabels: jest.fn(async (_id, update, labeller) => ({ ...CASE, labels: update.labels, labeller, version: update.expectedVersion + 1 })),
+    setExclusion: jest.fn(async (id, exclusion) => {
+      if (id !== CASE.caseId) throw new GoldenCaseNotFoundError(id);
+      return exclusion ? { ...CASE, excluded: exclusion } : CASE;
+    }),
     ...overrides,
   } as jest.Mocked<GoldenSetStore>;
 }
@@ -90,6 +96,62 @@ describe('admin golden-set routes: behaviour', () => {
     expect(store.listCases).toHaveBeenCalledWith('agent', { split: 'test' });
     expect((await request(app(store)).get(`${base}?surface=ads`).set('x-test-user', ADMIN)).status).toBe(400);
     expect((await request(app(store)).get(`${base}?surface=agent&split=train`).set('x-test-user', ADMIN)).status).toBe(400);
+  });
+
+  it('lists excluded cases only when asked (ENG-2608)', async () => {
+    const store = fakeStore();
+    await request(app(store)).get(`${base}?surface=agent&includeExcluded=true`).set('x-test-user', ADMIN);
+    expect(store.listCases).toHaveBeenCalledWith('agent', { includeExcluded: true });
+    expect((await request(app(store)).get(`${base}?surface=agent&includeExcluded=yes`).set('x-test-user', ADMIN)).status).toBe(400);
+  });
+
+  it('excludes a case with a reason as the admin, and restores it (ENG-2608)', async () => {
+    const store = fakeStore();
+    const path = `${base}/${encodeURIComponent(CASE.caseId)}/exclusion`;
+    const res = await request(app(store)).put(path).set('x-test-user', ADMIN).send({ reason: 'empty_session' });
+    expect(res.status).toBe(200);
+    expect(store.setExclusion).toHaveBeenCalledWith(CASE.caseId, { reason: 'empty_session', by: 'admin@example.com', at: expect.any(String) });
+    expect(res.body.case.excluded).toMatchObject({ reason: 'empty_session', by: 'admin@example.com' });
+
+    const restored = await request(app(store)).delete(path).set('x-test-user', ADMIN);
+    expect(restored.status).toBe(200);
+    expect(store.setExclusion).toHaveBeenLastCalledWith(CASE.caseId, null);
+
+    expect((await request(app(store)).put(path).set('x-test-user', ADMIN).send({})).status).toBe(400);
+    expect((await request(app(store)).put(path).set('x-test-user', ADMIN).send({ reason: 'x'.repeat(201) })).status).toBe(400);
+    expect((await request(app(store)).put(`${base}/nope/exclusion`).set('x-test-user', ADMIN).send({ reason: 'empty_session' })).status).toBe(404);
+    expect((await request(app(store)).put(path).set('x-test-user', CUSTOMER).send({ reason: 'empty_session' })).status).toBe(403);
+  });
+
+  it('audits each exclude and restore, keeping who excluded the case once it is restored (ENG-2608)', async () => {
+    (recordAdminAudit as jest.Mock).mockClear();
+    const exclusion = { reason: 'empty_session', by: 'other-admin@example.com', at: '2026-10-01T00:00:00.000Z' };
+    const store = fakeStore();
+    (store.getCase as jest.Mock).mockResolvedValue({ ...CASE, excluded: exclusion });
+    const path = `${base}/${encodeURIComponent(CASE.caseId)}/exclusion`;
+
+    await request(app(store)).put(path).set('x-test-user', ADMIN).send({ reason: 'empty_session' });
+    expect(recordAdminAudit).toHaveBeenLastCalledWith({
+      actorUserId: 'admin-1', actorEmail: 'admin@example.com', action: 'golden_case_exclude', caseId: CASE.caseId, reason: 'empty_session',
+    });
+
+    await request(app(store)).delete(path).set('x-test-user', ADMIN);
+    expect(recordAdminAudit).toHaveBeenLastCalledWith({
+      actorUserId: 'admin-1', actorEmail: 'admin@example.com', action: 'golden_case_restore', caseId: CASE.caseId, previousExclusion: exclusion,
+    });
+
+    await request(app(store)).put(`${base}/nope/exclusion`).set('x-test-user', ADMIN).send({ reason: 'empty_session' });
+    expect(recordAdminAudit).toHaveBeenCalledTimes(2);
+  });
+
+  it('answers 400, not 500, for a case id longer than DynamoDB allows, before touching the store (ENG-2608)', async () => {
+    const store = fakeStore();
+    const long = encodeURIComponent('x'.repeat(2049));
+    expect((await request(app(store)).put(`${base}/${long}/exclusion`).set('x-test-user', ADMIN).send({ reason: 'empty_session' })).status).toBe(400);
+    expect((await request(app(store)).delete(`${base}/${long}/exclusion`).set('x-test-user', ADMIN)).status).toBe(400);
+    expect((await request(app(store)).get(`${base}/${long}`).set('x-test-user', ADMIN)).status).toBe(400);
+    expect(store.setExclusion).not.toHaveBeenCalled();
+    expect(store.getCase).not.toHaveBeenCalled();
   });
 
   it('saves labels as the admin, validating them against the case surface', async () => {

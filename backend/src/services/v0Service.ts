@@ -430,6 +430,50 @@ export function setVercelPollConfig(intervalMs: number, maxAttempts: number) {
   vercelPollMaxAttempts = maxAttempts;
 }
 
+export const V0_RATE_LIMITED_CODE = "V0_RATE_LIMITED";
+/** Minimum wait before retrying a 429 that carries no Retry-After (ENG-949). */
+let rateLimitFloorMs = 20_000;
+/** Ceiling on any single 429 wait, so a hostile/huge Retry-After cannot hang a build. */
+let rateLimitCapMs = 120_000;
+
+/** Test hook for the ENG-949 rate-limit backoff bounds. */
+export function setRateLimitBackoffConfig(floorMs: number, capMs: number): void {
+  rateLimitFloorMs = floorMs;
+  rateLimitCapMs = capMs;
+}
+
+function isRateLimitDetail(detail: string): boolean {
+  return /\bHTTP 429\b/.test(detail);
+}
+
+/**
+ * Parse a Retry-After value (delta-seconds or HTTP-date) into ms, from the error's response
+ * headers if present, else from a `retry-after`/`retryAfter` field in the SDK's error body.
+ */
+export function parseRetryAfterMs(err: any, detail: string, now = Date.now()): number | undefined {
+  const headers = err?.response?.headers;
+  let raw: unknown =
+    (typeof headers?.get === "function" ? headers.get("retry-after") : undefined) ??
+    headers?.["retry-after"] ??
+    headers?.["Retry-After"];
+  if (raw === undefined || raw === null) {
+    const m = /retry[-_ ]?after"?\s*[:=]\s*"?([^",}\s][^",}]*)/i.exec(detail);
+    raw = m?.[1];
+  }
+  if (raw === undefined || raw === null) return undefined;
+  const str = String(raw).trim();
+  if (/^\d+(\.\d+)?$/.test(str)) return Math.round(parseFloat(str) * 1000);
+  const date = Date.parse(str);
+  if (!Number.isNaN(date)) return Math.max(0, date - now);
+  return undefined;
+}
+
+function rateLimitDelayMs(err: any, detail: string, attempt: number, baseDelayMs: number): number {
+  const retryAfter = parseRetryAfterMs(err, detail);
+  const fallback = Math.max(rateLimitFloorMs, baseDelayMs * Math.pow(2, attempt - 1));
+  return Math.min(rateLimitCapMs, retryAfter !== undefined ? retryAfter : fallback);
+}
+
 export async function withRetry<T>(
   fn: () => Promise<T>,
   label: string,
@@ -481,11 +525,25 @@ export async function withRetry<T>(
         if (err && typeof err === "object" && detail && detail !== err.message) {
           try { err.message = detail; } catch { /* frozen error — leave as-is */ }
         }
+        // ENG-949: a rate limit that outlived the retry budget is a distinct, recoverable
+        // terminal state — tag it so callers/users see "rate limited, retry later", not a
+        // generic generation failure.
+        if (isRateLimitDetail(detail) && err && typeof err === "object") {
+          try {
+            err.code = V0_RATE_LIMITED_CODE;
+            err.message = `v0 rate limit reached (HTTP 429) after ${attempt} attempt(s); retry the generation in a few minutes. ${detail}`;
+          } catch { /* frozen error — leave as-is */ }
+        }
         throw err;
       }
 
       const jitter = Math.random() * 500;
-      const delay = baseDelayMs * Math.pow(2, attempt - 1) + jitter;
+      // ENG-949: 429s used the generic 2s/4s backoff, so a minute-scale provider window
+      // exhausted all retries in ~6s. Honour Retry-After when the provider sends it, and
+      // otherwise wait at least the rate-limit floor; both are capped.
+      const delay = isRateLimitDetail(detail)
+        ? rateLimitDelayMs(err, detail, attempt, baseDelayMs) + jitter
+        : baseDelayMs * Math.pow(2, attempt - 1) + jitter;
       console.warn(
         `[V0 SERVICE] ${label} attempt ${attempt}/${maxRetries} failed (${detail}), retrying in ${delay}ms...`
       );

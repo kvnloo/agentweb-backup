@@ -19,7 +19,7 @@
 
 import { dynamodb } from '../config/aws';
 
-const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+import { TABLE_PREFIX } from '../config/constants';
 export const CONTACT_EVENTS_TABLE = `${TABLE_PREFIX}AW-ContactEvents`;
 export const CONTACT_EVENTS_SOURCE_RECORD_INDEX = 'sourceRecordId-index';
 const TABLE_NAME = CONTACT_EVENTS_TABLE;

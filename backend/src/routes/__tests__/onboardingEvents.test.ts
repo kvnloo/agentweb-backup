@@ -47,7 +47,7 @@ jest.mock("../../services/onboardingLeadSync", () => ({
   mirrorOnboardingEventToLead: (...args: any[]) => mockMirrorOnboardingEventToLead(...args),
 }));
 
-import onboardingEventsRouter from "../onboardingEvents";
+import onboardingEventsRouter, { capEventLog } from "../onboardingEvents";
 
 function makeApp() {
   const app = express();
@@ -116,6 +116,21 @@ describe("POST /api/onboarding/events", () => {
     expect(mockMirrorOnboardingEventToLead).toHaveBeenCalledWith(
       expect.objectContaining({ onboardingStage: null }),
     );
+    expect(mockOnOnboardingStageChanged).not.toHaveBeenCalled();
+  });
+
+  it("a review-screen click does not move an existing lifecycle stage or fire contact automation", async () => {
+    mockGetUserById.mockResolvedValueOnce({
+      userId: "user-123",
+      email: "user@example.com",
+      onboardingStage: "brand_submitted",
+      onboardingEvents: [{ event: "brand_submitted", ts: "2026-04-18T10:00:00Z" }],
+    });
+    const res = await request(makeApp())
+      .post("/api/onboarding/events")
+      .send({ event: "brand_review_icp_regenerate", data: { icpId: "icp_1" } });
+    expect(res.status).toBe(200);
+    expect(res.body.onboardingStage).toBe("brand_submitted");
     expect(mockOnOnboardingStageChanged).not.toHaveBeenCalled();
   });
 
@@ -256,6 +271,63 @@ describe("POST /api/onboarding/events", () => {
     expect(res.body.message).toMatch(/exceeds/);
   });
 
+  it("a click-level event at the cap does not evict the user's lifecycle events from the stored log", async () => {
+    const existing = [
+      { event: "goal_selected", ts: "2026-04-01T00:00:00Z" },
+      ...Array.from({ length: 49 }, (_, i) => ({ event: "brand_review_icp_edit", ts: `2026-04-01T00:01:${String(i).padStart(2, "0")}Z` })),
+    ];
+    mockGetUserById.mockResolvedValueOnce({
+      userId: "user-123",
+      email: "user@example.com",
+      onboardingStage: "goal_selected",
+      onboardingEvents: existing,
+    });
+    const res = await request(makeApp()).post("/api/onboarding/events").send({ event: "brand_review_icp_regenerate" });
+    expect(res.status).toBe(200);
+    const stored = mockUpdateUser.mock.calls[0][1].onboardingEvents;
+    expect(stored).toHaveLength(50);
+    expect(stored.map((e: any) => e.event)).toContain("goal_selected");
+    expect(stored[stored.length - 1].event).toBe("brand_review_icp_regenerate");
+  });
+
+  describe("capEventLog — click-level events are trimmed before lifecycle events", () => {
+    const ev = (event: string, i: number) => ({ event, ts: `2026-04-01T00:00:${String(i).padStart(2, "0")}Z` });
+
+    it("keeps goal_selected and brand_submitted when 50 review clicks overflow the log", () => {
+      const log = [
+        ev("goal_selected", 0),
+        ev("brand_submitted", 1),
+        ...Array.from({ length: 49 }, (_, i) => ev("brand_review_icp_edit", i + 2)),
+        ev("brand_review_icp_regenerate", 60),
+      ];
+      const capped = capEventLog(log, 50);
+      expect(capped).toHaveLength(50);
+      expect(capped.map((e) => e.event)).toContain("goal_selected");
+      expect(capped.map((e) => e.event)).toContain("brand_submitted");
+      // The newest event always survives.
+      expect(capped[capped.length - 1].event).toBe("brand_review_icp_regenerate");
+    });
+
+    it("falls back to dropping the oldest events when there are no click-level ones to drop", () => {
+      const log = Array.from({ length: 52 }, (_, i) => ev("goal_selected", i));
+      const capped = capEventLog(log, 50);
+      expect(capped).toHaveLength(50);
+      expect(capped[0].ts).toBe(log[2].ts);
+    });
+
+    it("never drops the event just appended, even when it is click-level", () => {
+      const log = [...Array.from({ length: 50 }, (_, i) => ev("goal_selected", i)), ev("brand_review_confirmed", 99)];
+      const capped = capEventLog(log, 50);
+      expect(capped[capped.length - 1].event).toBe("brand_review_confirmed");
+      expect(capped).toHaveLength(50);
+    });
+
+    it("returns the log untouched when under the cap", () => {
+      const log = [ev("goal_selected", 0)];
+      expect(capEventLog(log, 50)).toBe(log);
+    });
+  });
+
   it("caps the event log at the last 50 events (FIFO drop)", async () => {
     const existing = Array.from({ length: 50 }, (_, i) => ({
       event: "goal_selected",
@@ -357,6 +429,18 @@ describe("POST /api/onboarding/events", () => {
     "voice_onboarding_presented",
     "voice_onboarding_started",
     "voice_onboarding_text_fallback",
+    // ENG-2308: the portal sent these on every review-screen click and got a
+    // 400 because they were never declared.
+    "brand_review_brand_edit",
+    "brand_review_confirmed",
+    "brand_review_icp_edit",
+    "brand_review_icp_regenerate",
+    "brand_review_icp_remove",
+    "brand_review_valueprop_edit",
+    "phase3_generate_ads",
+    "phase3_icp_selected",
+    "phase3_pick_for_me",
+    "phase3_summary_confirmed",
   ])(
     "records %s without initializing lifecycle stage or firing contact automation",
     async (event) => {

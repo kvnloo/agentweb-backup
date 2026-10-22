@@ -8,12 +8,15 @@ import { AuthRequest } from '../types/express';
 import { Request, Response, NextFunction } from 'express';
 import { AuthenticatedRequest } from '../middleware/auth';
 import { ChatbotDB } from '../services/chatbotService';
+import { withoutWorkPlanProvenance } from '../utils/workPlanProvenance';
 import * as authController from '../controllers/auth';
 import rateLimit from 'express-rate-limit';
 import { resolveAnalyticsConfig, resolveConfigTarget } from '../services/analyticsConfigResolver';
 import { resolveOrgProfileField } from '../services/orgProfileResolver';
 import { EvaluationDenied, isEvaluationUser, requireActiveEvaluation, sandboxInfo as buildSandboxInfo } from '../services/evaluationPolicy';
 import { sanitizeUserForResponse } from '../utils/accountSecretRedaction';
+import { modelCompareEntitlement } from '../services/agentMode/modelCompareEntitlement';
+import { getTierCompareBlock, modelAccess } from '../services/agentMode/modelAccessInstance';
 
 const router = express.Router();
 
@@ -136,7 +139,9 @@ router.get('/me', authenticateToken, async (req, res) => {
         response.hiddenPages = await getHiddenPages(userId);
 
         // Get allowed skills resolved to { skillId, name } for display
-        const allowedSkillIds = await getAllowedSkills(userId);
+        // ENG-1978: null = entitlement unresolved. Show no tier-granted skills rather than all of
+        // them; this list drives what the UI advertises as available.
+        const allowedSkillIds = (await getAllowedSkills(userId)) ?? [];
         const publishedSkills = await skillService.getPublishedSkills();
         const isWildcard = allowedSkillIds.includes("*");
         const allowedSet = new Set(allowedSkillIds);
@@ -181,6 +186,26 @@ router.get('/me', authenticateToken, async (req, res) => {
         response.allowedSkills = [];
         response.allowedFeatures = [];
       }
+    }
+
+    // Plan add-on hint for the Compare models button. Additive, computed per request, never stored.
+    // The server enforces the same rule on /compare, so a missing hint (error here, older backend) is safe.
+    try {
+      response.modelCompareEntitled = await modelCompareEntitlement.isEntitled({
+        userId,
+        isAdmin: authenticatedReq.user?.isAdmin === true,
+      });
+    } catch (error) {
+      console.error('Error resolving model compare entitlement hint:', error);
+    }
+    // ENG-669 (D3) hint: the plan runs fewer than two models, so /compare answers 403
+    // compare_not_available_for_tier. Present only while the tier allowlist is on; same rule as the server.
+    try {
+      if (await modelAccess.isEnabled()) {
+        response.modelCompareTierBlocked = (await getTierCompareBlock(userId)) !== null;
+      }
+    } catch (error) {
+      console.error('Error resolving model compare tier hint:', error);
     }
 
     response.hasBrandGuidelines = !!(user.brandGuidelines?.brandData?.brandName);
@@ -451,7 +476,9 @@ router.get('/:userId/chat-sessions', authenticateToken, async (req, res) => {
 
   try {
     const sessions = await chatbotDb.getUserSessions(userId);
-    res.json(sessions);
+    // ENG-669: a non-admin never gets the work plan's model provenance bookkeeping (as on agent mode's reads).
+    const viewerIsAdmin = !!(authenticatedReq.user.isAdmin || authenticatedReq.delegateInfo?.isDelegated);
+    res.json({ ...sessions, sessions: sessions.sessions.map((session) => withoutWorkPlanProvenance(session, viewerIsAdmin)) });
   } catch (error) {
     console.error('Error fetching user chat sessions:', error);
     res.status(500).json({ message: 'Failed to fetch chat sessions' });

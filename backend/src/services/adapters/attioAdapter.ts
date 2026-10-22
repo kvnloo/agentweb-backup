@@ -586,7 +586,7 @@ export class AttioAdapter implements CrmAdapter {
             }
 
             if (pageLeadData.length > 0) {
-                const batchResult = await crmDb.batchCreateLeads(listId, pageLeadData);
+                const batchResult = await crmDb.batchCreateLeads(listId, pageLeadData, { origin: 'integration' });
                 result.successCount += batchResult.successCount;
                 result.newCount += batchResult.newCount;
                 result.updatedCount += batchResult.mergedCount;
