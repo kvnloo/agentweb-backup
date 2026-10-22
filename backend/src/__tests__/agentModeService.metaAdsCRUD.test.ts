@@ -1277,6 +1277,28 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
           }));
         });
 
+        it('retries the attach while Meta still answers 1772103 for a just-created creative, but not other errors (ENG-2623)', async () => {
+          mockSwap(OLD_LINK_SPEC, OLD_LINK_SPEC);
+          const sleep = jest.spyOn(agentModeService as any, 'sleep').mockResolvedValue(undefined);
+          const notReady = Object.assign(new Error('Invalid parameter'), { structuredError: { error_subcode: 1772103 } });
+          jest.mocked(metaService.updateAd).mockRejectedValueOnce(notReady).mockRejectedValueOnce(notReady);
+
+          const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', { title: 'New title' });
+
+          expect(result.success).toBe(true);
+          expect(attachCalls().length).toBeGreaterThanOrEqual(3);
+          expect(sleep).toHaveBeenCalledWith(30_000);
+
+          jest.mocked(metaService.updateAd).mockReset();
+          mockSwap(OLD_LINK_SPEC, OLD_LINK_SPEC);
+          sleep.mockClear();
+          jest.mocked(metaService.updateAd).mockRejectedValueOnce(new Error('Permissions error'));
+          const other = await agentModeService.updateMetaAdsAd('user123', 'ad_123', { title: 'New title' });
+          expect(other.success).toBe(false);
+          expect(sleep).not.toHaveBeenCalledWith(30_000);
+          sleep.mockRestore();
+        });
+
         it('fails with SWAP_NOT_REFLECTED and does not attach when the new creative still has the old image', async () => {
           mockSwap(OLD_LINK_SPEC, OLD_LINK_SPEC);
 
