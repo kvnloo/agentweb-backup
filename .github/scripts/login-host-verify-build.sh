@@ -68,7 +68,7 @@ declare -A SRC=(
   [files/aw-env.slice.template]="$D/aw-env.slice.example" [files/host-config.template.json]="$P/host-config.template.json" [files/system-prompt.txt]="$P/system-prompt.txt"
 )
 for rel in "${!SRC[@]}"; do
-  [ -f "$PKG/$rel" ] && [ ! -L "$PKG/$rel" ] || fail "the build is missing $rel"
+  if [ ! -f "$PKG/$rel" ] || [ -L "$PKG/$rel" ]; then fail "the build is missing $rel (or it is not a plain file)"; fi
   cmp -s "$PKG/$rel" "${SRC[$rel]}" || fail "$rel in the build differs from the reviewed file in this commit"
 done
 
