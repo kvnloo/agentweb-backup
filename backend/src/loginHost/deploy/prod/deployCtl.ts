@@ -12,7 +12,7 @@
  */
 import { request } from "http";
 import { PROTOCOL_VERSION } from "../../protocol";
-import { acquireIdle, DEFAULT_GATE, isNotReady, waitHealthy, type DrainReply } from "./drainGate";
+import { acquireIdle, DEFAULT_GATE, waitHealthy, type DrainReply } from "./drainGate";
 
 function call<T>(socketPath: string, route: string, body: unknown): Promise<T> {
   return new Promise((resolve, reject) => {
