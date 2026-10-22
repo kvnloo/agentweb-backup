@@ -12,8 +12,8 @@ export async function runNumberRentCron(): Promise<NumberRentSweepSummary> {
   const summary = await runNumberRentSweep();
   if (!summary.enabled) {
     console.info(`${TAG} number rent sweep skipped: HOT_LEAD_CALL_RENT_METERING is off`);
-  } else if (summary.failed > 0) {
-    console.error(`${TAG} number rent sweep completed with failures`, summary);
+  } else if (summary.failed + summary.skippedNoOwner + summary.skippedInvalidSid + summary.skippedNoRateUnit > 0) {
+    console.error(`${TAG} number rent sweep completed with skipped or failed orgs`, summary);
   } else {
     console.info(`${TAG} number rent sweep completed`, summary);
   }

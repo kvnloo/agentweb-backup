@@ -100,9 +100,6 @@ async function persisted(orgId: string, sid: string): Promise<boolean | 'unreada
   }
 }
 
-/** Billed the moment the number was bought, so metered before anything that can fail or discard it. */
-const meterRent = (userId: string, sid: string) => meterNumberRent(userId, sid);
-
 export async function provisionNumber(p: { org: Organization; config: HotLeadCallConfig; userId: string; areaCode?: string }) {
   const { org, config } = p;
   if (config.twilioNumber || config.twilioNumberSid) {
@@ -122,7 +119,12 @@ export async function provisionNumber(p: { org: Organization; config: HotLeadCal
     throw new Error('The phone provider did not confirm whether a number was bought, so one may have been bought and billed. Do not retry; contact support.');
   }
 
-  await meterRent(p.userId, bought.numberSid);
+  // Billed the moment the number was bought, so metered before anything that can fail or discard it. Rent is
+  // always charged to the org owner, like the monthly sweep, so both land in the same billing partition.
+  if (!org.ownerUserId) {
+    console.error(`[hotLeadCall] org ${org.orgId} has no owner; the first month's rent is charged to the acting user and the monthly sweep will skip it`);
+  }
+  await meterNumberRent(org.ownerUserId || p.userId, bought.numberSid);
 
   const next = hotLeadCallConfigOf({ ...config, twilioNumber: bought.phoneNumber, twilioNumberSid: bought.numberSid });
   if (!next) {

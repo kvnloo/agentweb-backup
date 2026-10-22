@@ -61,6 +61,10 @@ export interface NumberRentSweepSummary {
 }
 
 /** Meters the current month's rent for every org that holds a number. One org's failure never stops the rest. */
+/** A skipped org is a missed charge, so each one is logged loudly with its reason (no phone number). */
+const logSkip = (orgId: string, reason: string) =>
+  console.error(`[hotLeadCall] number rent NOT metered for org ${orgId}: ${reason}`);
+
 export async function runNumberRentSweep(now: Date = new Date()): Promise<NumberRentSweepSummary> {
   const summary: NumberRentSweepSummary = {
     enabled: isRentMeteringEnabled(), scanned: 0, withNumber: 0, metered: 0,
@@ -74,11 +78,11 @@ export async function runNumberRentSweep(now: Date = new Date()): Promise<Number
       const sid = org.hotLeadCall?.twilioNumberSid;
       if (!sid) continue;
       summary.withNumber++;
-      if (!isTwilioNumberSid(sid)) { summary.skippedInvalidSid++; continue; }
-      if (!org.ownerUserId) { summary.skippedNoOwner++; continue; }
+      if (!isTwilioNumberSid(sid)) { summary.skippedInvalidSid++; logSkip(org.orgId, 'stored number sid is invalid'); continue; }
+      if (!org.ownerUserId) { summary.skippedNoOwner++; logSkip(org.orgId, 'org has no owner'); continue; }
       const result = await meterNumberRent(org.ownerUserId, sid, now);
       if (result === 'recorded') summary.metered++;
-      else if (result === 'no_rate_unit') summary.skippedNoRateUnit++;
+      else if (result === 'no_rate_unit') { summary.skippedNoRateUnit++; logSkip(org.orgId, 'rate card has no number_monthly_rent unit'); }
       else summary.failed++;
     } catch (err) {
       summary.failed++;
