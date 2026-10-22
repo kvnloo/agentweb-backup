@@ -1,6 +1,10 @@
 /**
  * ENG-668 PR-2: every customer-facing sentence month-end pay-as-you-go settlement produces, in one
- * place for copy review — the two owner emails, and the description Stripe prints on the invoice.
+ * place for copy review — the owner emails, and the description Stripe prints on the invoice.
+ *
+ * Customers see this feature as "Extra usage", never "pay-as-you-go" (ENG-668 copy, matching the portal's
+ * `paygCopy.ts`): ENG-2571 already shows "Pay as you go" for a card on file with no subscription. "payg"
+ * survives only in identifiers, settings keys, metadata and internal alerts.
  *
  * Percentages only, never dollars, in anything AgentWeb writes: the Stripe invoice is the one place the
  * amount appears, the same rule the PAYG settings and the 429 follow ("N% of your limit"). The invoice
@@ -22,8 +26,8 @@ export function formatUsageMonth(month: string): string {
 export function paygOverageInvoiceCopy(month: string): { description: string; lineDescription: string } {
   const label = formatUsageMonth(month);
   return {
-    description: `AgentWeb pay-as-you-go usage for ${label}`,
-    lineDescription: `AI usage beyond your plan's included usage, ${label} (pay-as-you-go)`,
+    description: `AgentWeb extra usage for ${label}`,
+    lineDescription: `Extra usage beyond your plan's included AI usage, ${label}`,
   };
 }
 
@@ -33,7 +37,7 @@ export interface PaygSettlementEmailCopy {
   paragraphs: string[];
   /** Link text for the Stripe-hosted invoice, when there is one. */
   invoiceLinkLabel?: string;
-  /** Link text for the pay-as-you-go settings. */
+  /** Link text for the extra usage settings. */
   settingsLinkLabel: string;
 }
 
@@ -46,18 +50,18 @@ export function paygInvoiceCreatedEmailCopy(input: { month: string; percentOfCap
   const label = formatUsageMonth(input.month);
   const percent = Math.max(0, Math.min(100, Math.floor(input.percentOfCap)));
   return {
-    subject: `Your pay-as-you-go invoice for ${label}`,
-    headline: `Pay-as-you-go invoice for ${label}`,
+    subject: `Your extra usage invoice for ${label}`,
+    headline: `Extra usage invoice for ${label}`,
     paragraphs: [
       // The bill is measured against the highest limit in force during the month (the limit is a monthly
       // total), so the percentage is of that limit — the one the amount actually follows.
-      `In ${label} your team kept working past the AI usage included in your plan, using ${percent}% of the highest pay-as-you-go limit you had set that month.`,
+      `In ${label} your team kept working past the AI usage included in your plan, using ${percent}% of the highest extra usage limit you had set that month.`,
       input.paid
         ? 'Stripe has issued an invoice for that usage, and it has already been paid. The invoice shows the amount.'
         : 'Stripe has issued an invoice for that usage and will charge the payment method on file. The invoice shows the amount.',
     ],
     invoiceLinkLabel: 'View your invoice',
-    settingsLinkLabel: 'Review your pay-as-you-go settings',
+    settingsLinkLabel: 'Review your extra usage settings',
   };
 }
 
@@ -68,14 +72,14 @@ export function paygInvoiceCreatedEmailCopy(input: { month: string; percentOfCap
 export function paygPaymentActionRequiredEmailCopy(input: { month: string }): PaygSettlementEmailCopy {
   const label = formatUsageMonth(input.month);
   return {
-    subject: `Confirm your pay-as-you-go payment for ${label}`,
+    subject: `Confirm your extra usage payment for ${label}`,
     headline: 'Your bank needs you to confirm a payment',
     paragraphs: [
-      `Your bank asked for confirmation before charging your card for your pay-as-you-go usage in ${label}.`,
-      'Open the invoice to confirm the payment. Pay-as-you-go stays on while it is pending.',
+      `Your bank asked for confirmation before charging your card for your extra usage in ${label}.`,
+      'Open the invoice to confirm the payment. Extra usage stays on while it is pending.',
     ],
     invoiceLinkLabel: 'Confirm your payment',
-    settingsLinkLabel: 'Review your pay-as-you-go settings',
+    settingsLinkLabel: 'Review your extra usage settings',
   };
 }
 
@@ -83,12 +87,12 @@ export function paygPaymentActionRequiredEmailCopy(input: { month: string }): Pa
 export function paygPaymentFailedEmailCopy(input: { month: string }): PaygSettlementEmailCopy {
   const label = formatUsageMonth(input.month);
   return {
-    subject: `Action needed: your pay-as-you-go payment for ${label} didn't go through`,
-    headline: 'Pay-as-you-go is on hold',
+    subject: `Action needed: your extra usage payment for ${label} didn't go through`,
+    headline: 'Extra usage is on hold',
     paragraphs: [
-      `We couldn't collect the payment for your pay-as-you-go usage in ${label}.`,
-      "Pay-as-you-go is on hold until it's resolved: once your plan's included AI usage runs out, AI usage pauses instead of continuing.",
-      'Update your payment method and pay the invoice to resume pay-as-you-go.',
+      `We couldn't collect the payment for your extra usage in ${label}.`,
+      "Extra usage is on hold until it's resolved: once your plan's included AI usage runs out, AI usage pauses instead of continuing.",
+      'Update your payment method and pay the invoice to resume extra usage.',
     ],
     invoiceLinkLabel: 'View and pay your invoice',
     settingsLinkLabel: 'Update your payment method',
@@ -103,14 +107,14 @@ export function paygPaymentFailedEmailCopy(input: { month: string }): PaygSettle
 export function paygPaymentUnconfirmedEmailCopy(input: { month: string }): PaygSettlementEmailCopy {
   const label = formatUsageMonth(input.month);
   return {
-    subject: `Action needed: please confirm your pay-as-you-go payment for ${label}`,
-    headline: 'Pay-as-you-go is on hold',
+    subject: `Action needed: please confirm your extra usage payment for ${label}`,
+    headline: 'Extra usage is on hold',
     paragraphs: [
-      `Your bank is still waiting for you to confirm the payment for your pay-as-you-go usage in ${label}.`,
-      "Pay-as-you-go is on hold until it's confirmed: once your plan's included AI usage runs out, AI usage pauses instead of continuing.",
-      'Open the invoice to confirm the payment and resume pay-as-you-go.',
+      `Your bank is still waiting for you to confirm the payment for your extra usage in ${label}.`,
+      "Extra usage is on hold until it's confirmed: once your plan's included AI usage runs out, AI usage pauses instead of continuing.",
+      'Open the invoice to confirm the payment and resume extra usage.',
     ],
     invoiceLinkLabel: 'Confirm your payment',
-    settingsLinkLabel: 'Review your pay-as-you-go settings',
+    settingsLinkLabel: 'Review your extra usage settings',
   };
 }
