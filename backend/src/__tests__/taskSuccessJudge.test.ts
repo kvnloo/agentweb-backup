@@ -10,7 +10,7 @@ import {
 } from '../services/taskSuccessJudge';
 import type { RubricJudgeLlm, RubricJudgeLlmRequest } from '../services/creativeRubricJudge';
 import { defaultGoldenCaseGraders, taskSuccessJudgeGrader } from '../loops/eval/runValidation';
-import { openRouterCallCostUsd, parseTrialArgs, requireReportedCostUsd } from '../scripts/runTaskSuccessJudgeTrial';
+import { createAvoidingRefusingProvider, openRouterCallCostUsd, parseTrialArgs, requireReportedCostUsd } from '../scripts/runTaskSuccessJudgeTrial';
 import type { GoldenCase } from '../loops/eval/goldenSet';
 
 let index = 0;
@@ -251,6 +251,34 @@ describe('labelTaskSuccess', () => {
     expect(taskSuccessModelProblem('gpt-5.4', 'judge')).toMatch(/not a registered Claude model/);
     expect(taskSuccessModelProblem('gpt-5.4', 'labeller')).toBeUndefined();
     expect(taskSuccessModelProblem('openai/gpt-5.2', 'labeller')).toMatch(/registered model outside/);
+  });
+});
+
+describe('createAvoidingRefusingProvider', () => {
+  const refusal = (provider?: string) =>
+    Object.assign(new Error('400 Provider returned error'), { status: 400, error: { message: 'Provider returned error', ...(provider ? { metadata: { provider_name: provider } } : {}) } });
+
+  it('retries a call one provider refuses with a 400 on the others, once (ENG-2625)', async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const create = async (body: Record<string, unknown>) => {
+      bodies.push(body);
+      if (bodies.length === 1) throw refusal('Azure');
+      return { choices: [] };
+    };
+    expect(await createAvoidingRefusingProvider(create, { model: 'openai/gpt-5.4' })).toEqual({ choices: [] });
+    expect(bodies).toEqual([{ model: 'openai/gpt-5.4' }, { model: 'openai/gpt-5.4', provider: { ignore: ['Azure'] } }]);
+  });
+
+  it("passes on any other failure, and the retry's own failure, without another call (ENG-2625)", async () => {
+    for (const err of [refusal(), Object.assign(new Error('500'), { status: 500, error: { metadata: { provider_name: 'Azure' } } }), new Error('timeout')]) {
+      let calls = 0;
+      await expect(createAvoidingRefusingProvider(async () => { calls++; throw err; }, {})).rejects.toBe(err);
+      expect(calls).toBe(1);
+    }
+    let calls = 0;
+    const second = refusal('OpenAI');
+    await expect(createAvoidingRefusingProvider(async () => { calls++; throw calls === 1 ? refusal('Azure') : second; }, {})).rejects.toBe(second);
+    expect(calls).toBe(2);
   });
 });
 
