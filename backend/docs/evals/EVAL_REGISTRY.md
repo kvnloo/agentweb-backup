@@ -118,6 +118,25 @@ Trial (2026-10-21, `scripts/runTaskSuccessJudgeTrial.ts`; read-only, no spend ro
 
 The two label sets agree with each other at kappa 0.73 (n=40). Dev is smaller and noisier: 0.52 vs GPT, 0.66 on consensus (n=15–19).
 
+Rerun (2026-10-22) on the refreshed set: 80 active work-plan cases, 51 test and 29 dev. The 20 empty cases were
+excluded and 20 used ones seeded (ENG-2608), and the run used the provider-error retry (ENG-2620). Fresh GPT-5.4 labels:
+
+| Judge vs GPT-5.4 labels | n | Agreement | Kappa |
+| --- | --- | --- | --- |
+| Test | 49 | 92% | 0.83 |
+| Dev | 29 | 79% | 0.58 |
+| All | 78 | 87% | 0.73 |
+| The 19 newly seeded cases | 19 | 89% | 0.78 |
+| Test cases where both GPT label runs agree | 38 | 95% | 0.88 |
+
+Reruns are stable:
+- GPT-5.4 gave the same label on 58 of its previous 60 (kappa 0.92).
+- The judge gave the same verdict on 55 of 58 (kappa 0.88).
+
+In 8 of the 10 disagreements the judge says fail where GPT says pass, so the judge is the stricter of the two.
+Azure refused one case (`fb513a4b`) for the labeller every time. The trial now retries a call a provider refuses with
+a 400 on the other providers serving the model (ENG-2625). Evidence: [ENG-2591](https://linear.app/emmabyaw/issue/ENG-2591/agent-task-success-grader-stop-trusting-step-checkmarks-kappa-020-in#comment-055876c6).
+
 This is **not** a validation under the rule above: the labels are AI labels, so `validation` is not
 recorded and `mayGate` stays false. The judge may report `task_success` as advisory. Gating needs a
 human to adjudicate the cases where the labels disagree. Evidence: [ENG-2591](https://linear.app/emmabyaw/issue/ENG-2591/agent-task-success-grader-stop-trusting-step-checkmarks-kappa-020-in#comment-ea8be576).
