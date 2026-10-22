@@ -68,7 +68,7 @@ describe('ensureCriticalTables', () => {
 
     it('enables protection on an existing unprotected ledger', async () => {
       const { client, updated } = existingLedgerDynamo({ protected: false });
-      await ensureCriticalTables(client as any);
+      await ensureCriticalTables(client as any, { sleep: async () => {} });
       expect(updated).toContain('AW-SpendEvents');
       const call = client.updateTable.mock.calls.find((c: any) => c[0].TableName === 'AW-SpendEvents');
       expect(call).toBeDefined();
@@ -77,20 +77,23 @@ describe('ensureCriticalTables', () => {
 
     it('does NOT write when protection is already on — describe-first, no churn', async () => {
       const { client } = existingLedgerDynamo({ protected: true });
-      await ensureCriticalTables(client as any);
+      await ensureCriticalTables(client as any, { sleep: async () => {} });
       expect(client.updateTable).not.toHaveBeenCalled();
     });
 
     it('never throws when the role lacks UpdateTable — the flag is additive, startup must survive', async () => {
       const { client } = existingLedgerDynamo({ protected: false, canUpdate: false });
-      await expect(ensureCriticalTables(client as any)).resolves.toBeUndefined();
+      await expect(ensureCriticalTables(client as any, { sleep: async () => {} })).resolves.toBeUndefined();
     });
 
     it('only reconciles tables whose spec requests protection', async () => {
       // The two money tables carry DeletionProtectionEnabled: the event ledger
       // and the §3b projection. Both are authoritative and hard to rebuild.
+      // ENG-2105 adds the customer LLM key store: losing it makes every customer
+      // re-enter their provider keys. ENG-2106 adds the customer-funded usage journal,
+      // the history behind the per-connection usage bar.
       const guarded = CRITICAL_TABLE_SPECS.filter((s) => (s as any).DeletionProtectionEnabled);
-      expect(guarded.map((s) => s.TableName).sort()).toEqual(['AW-SpendEvents', 'AW-SpendProjection']);
+      expect(guarded.map((s) => s.TableName).sort()).toEqual(['AW-AttemptUsage', 'AW-LlmConnections', 'AW-SpendEvents', 'AW-SpendProjection']);
     });
   });
 
@@ -190,5 +193,153 @@ describe('ensureCriticalTables', () => {
     expect(gsi!.KeySchema).toEqual([{ AttributeName: 'sourceRecordId', KeyType: 'HASH' }]);
     expect(gsi!.Projection).toEqual({ ProjectionType: 'ALL' });
     expect(ce!.BillingMode).toBe('PAY_PER_REQUEST');
+  });
+  describe('TTL and point-in-time recovery on the attempt journal (ENG-2106)', () => {
+    const TABLE = 'AW-AttemptUsage';
+
+    // Every table "already exists"; only the attempt journal's settings are modeled.
+    function settingsDynamo(opts: {
+      statuses?: string[]; // successive describeTable answers for the journal; last repeats
+      ttl?: { status: string; attribute?: string };
+      pitr?: string;
+      ttlDenied?: boolean;
+      pitrDenied?: boolean;
+      describeFails?: boolean;
+    }) {
+      const calls: Record<string, any[]> = { updateTimeToLive: [], updateContinuousBackups: [] };
+      let polls = 0;
+      const denied = () => Object.assign(new Error('not authorized'), { code: 'AccessDeniedException' });
+      const client = {
+        createTable: jest.fn(() => ({ promise: async () => { throw Object.assign(new Error('exists'), { code: 'ResourceInUseException' }); } })),
+        describeTable: jest.fn((p: any) => ({
+          promise: async () => {
+            if (opts.describeFails) throw denied();
+            const statuses = opts.statuses ?? ['ACTIVE'];
+            // Only the journal's answers are scripted; other guarded tables are ACTIVE.
+            const status = p.TableName === TABLE ? statuses[Math.min(polls++, statuses.length - 1)] : 'ACTIVE';
+            return { Table: { TableName: p.TableName, TableStatus: status, DeletionProtectionEnabled: true } };
+          },
+        })),
+        updateTable: jest.fn(() => ({ promise: async () => ({}) })),
+        describeTimeToLive: jest.fn(() => ({
+          promise: async () => ({
+            TimeToLiveDescription: { TimeToLiveStatus: opts.ttl?.status ?? 'DISABLED', AttributeName: opts.ttl?.attribute },
+          }),
+        })),
+        updateTimeToLive: jest.fn((p: any) => ({
+          promise: async () => {
+            if (opts.ttlDenied) throw denied();
+            calls.updateTimeToLive.push(p);
+            return {};
+          },
+        })),
+        describeContinuousBackups: jest.fn(() => ({
+          promise: async () => ({
+            ContinuousBackupsDescription: { PointInTimeRecoveryDescription: { PointInTimeRecoveryStatus: opts.pitr ?? 'DISABLED' } },
+          }),
+        })),
+        updateContinuousBackups: jest.fn((p: any) => ({
+          promise: async () => {
+            if (opts.pitrDenied) throw denied();
+            calls.updateContinuousBackups.push(p);
+            return {};
+          },
+        })),
+      };
+      return { client, calls };
+    }
+
+    const sleep = jest.fn(async () => undefined);
+    let errorSpy: jest.SpyInstance;
+    beforeEach(() => {
+      sleep.mockClear();
+      jest.spyOn(console, 'log').mockImplementation(() => {});
+      errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    });
+    afterEach(() => jest.restoreAllMocks());
+
+    it('turns on TTL for the ttl attribute and point-in-time recovery when both are off', async () => {
+      const { client, calls } = settingsDynamo({});
+      await ensureCriticalTables(client as any, { sleep });
+      expect(calls.updateTimeToLive).toEqual([
+        { TableName: TABLE, TimeToLiveSpecification: { Enabled: true, AttributeName: 'ttl' } },
+      ]);
+      expect(calls.updateContinuousBackups).toEqual([
+        { TableName: TABLE, PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true } },
+      ]);
+    });
+
+    it('waits for a table that was just created to become ACTIVE before touching its settings', async () => {
+      const { client, calls } = settingsDynamo({ statuses: ['ACTIVE', 'CREATING', 'CREATING', 'ACTIVE'] }) // first answer is the deletion-protection check;
+      await ensureCriticalTables(client as any, { sleep });
+      expect(sleep).toHaveBeenCalledTimes(2);
+      expect(calls.updateTimeToLive).toHaveLength(1);
+      expect(calls.updateContinuousBackups).toHaveLength(1);
+    });
+
+    it('does nothing, and writes nothing, when both are already on', async () => {
+      const { client, calls } = settingsDynamo({ ttl: { status: 'ENABLED', attribute: 'ttl' }, pitr: 'ENABLED' });
+      await ensureCriticalTables(client as any, { sleep });
+      expect(calls.updateTimeToLive).toHaveLength(0);
+      expect(calls.updateContinuousBackups).toHaveLength(0);
+    });
+
+    it('also treats TTL that is still switching on as done', async () => {
+      const { client, calls } = settingsDynamo({ ttl: { status: 'ENABLING', attribute: 'ttl' } });
+      await ensureCriticalTables(client as any, { sleep });
+      expect(calls.updateTimeToLive).toHaveLength(0);
+    });
+
+    it('corrects TTL that is on for a different attribute', async () => {
+      const { client, calls } = settingsDynamo({ ttl: { status: 'ENABLED', attribute: 'expiresAt' } });
+      await ensureCriticalTables(client as any, { sleep });
+      expect(calls.updateTimeToLive).toHaveLength(1);
+    });
+
+    it('says loudly, with the command to run, when the role may not enable TTL, and still tries recovery', async () => {
+      const { client, calls } = settingsDynamo({ ttlDenied: true });
+      await expect(ensureCriticalTables(client as any, { sleep })).resolves.toBeUndefined();
+      const message = errorSpy.mock.calls.map((c) => c.join(' ')).join('\n');
+      expect(message).toContain('could NOT enable TTL on AW-AttemptUsage');
+      expect(message).toContain('aws dynamodb update-time-to-live --table-name AW-AttemptUsage');
+      expect(calls.updateContinuousBackups).toHaveLength(1);
+    });
+
+    it('says loudly, with the command to run, when the role may not enable recovery, and still sets TTL', async () => {
+      const { client, calls } = settingsDynamo({ pitrDenied: true });
+      await expect(ensureCriticalTables(client as any, { sleep })).resolves.toBeUndefined();
+      const message = errorSpy.mock.calls.map((c) => c.join(' ')).join('\n');
+      expect(message).toContain('could NOT enable point-in-time recovery on AW-AttemptUsage');
+      expect(message).toContain('aws dynamodb update-continuous-backups --table-name AW-AttemptUsage');
+      expect(calls.updateTimeToLive).toHaveLength(1);
+    });
+
+    it('waits out the short window after creation when continuous backups are not available yet', async () => {
+      const { client, calls } = settingsDynamo({});
+      let n = 0;
+      (client as any).describeContinuousBackups = jest.fn(() => ({
+        promise: async () => {
+          if (n++ < 2) throw Object.assign(new Error('not yet'), { code: 'ContinuousBackupsUnavailableException' });
+          return { ContinuousBackupsDescription: { PointInTimeRecoveryDescription: { PointInTimeRecoveryStatus: 'DISABLED' } } };
+        },
+      }));
+      await ensureCriticalTables(client as any, { sleep });
+      expect(calls.updateContinuousBackups).toHaveLength(1);
+      expect((client as any).describeContinuousBackups).toHaveBeenCalledTimes(3);
+    });
+
+    it('gives up quietly for this boot, and retries next boot, if the table never becomes ACTIVE', async () => {
+      const { client, calls } = settingsDynamo({ statuses: ['CREATING'] });
+      await expect(ensureCriticalTables(client as any, { sleep })).resolves.toBeUndefined();
+      expect(calls.updateTimeToLive).toHaveLength(0);
+      expect(calls.updateContinuousBackups).toHaveLength(0);
+      expect(errorSpy.mock.calls.map((c) => c.join(' ')).join('\n')).toContain('was not ACTIVE in time');
+    });
+
+    it('does not throw when the table cannot even be described', async () => {
+      const { client } = settingsDynamo({ describeFails: true });
+      await expect(ensureCriticalTables(client as any, { sleep })).resolves.toBeUndefined();
+      expect(errorSpy.mock.calls.map((c) => c.join(' ')).join('\n')).toContain('could NOT check AW-AttemptUsage');
+    });
   });
 });

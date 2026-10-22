@@ -23,6 +23,8 @@
 export interface TableKeySchema {
   hash: string;
   range?: string;
+  /** Global secondary indexes, by IndexName. Items lacking the index's hash attribute are not in it. */
+  indexes?: Record<string, { hash: string; range?: string }>;
 }
 
 /**
@@ -103,6 +105,14 @@ function evaluateClause(
       }
     }
 
+    // A bare top-level OR (not already inside its own parens, which the branch above
+    // handles) -- DynamoDB's real precedence is more general than this, but every
+    // condition in this codebase is either a single clause, an AND of clauses, or
+    // (as of the per-owner slot counter) one unparenthesized OR of two clauses.
+    if (/\s+OR\s+/i.test(clause)) {
+      return clause.split(/\s+OR\s+/i).some((part) => evaluateClause(part.trim(), item, names, values));
+    }
+
     let match = clause.match(/^attribute_not_exists\(\s*([^)]+?)\s*\)$/i);
     if (match) {
       const attr = resolveName(match[1], names);
@@ -127,11 +137,78 @@ function evaluateClause(
       return item?.[attr] === values[match[2]];
     }
 
+    match = clause.match(/^([#A-Za-z0-9_.[\]]+)\s*([<>])\s*(:[A-Za-z0-9_]+)$/);
+    if (match) {
+      const attr = resolveName(match[1], names);
+      const left = item?.[attr];
+      if (typeof left !== 'number') return false;
+      return match[2] === '<' ? left < values[match[3]] : left > values[match[3]];
+    }
+
     throw new Error(`inMemoryDynamo: unsupported ConditionExpression clause: ${clause}`);
   }
 }
 
 /** `SET a = :x, b = :y REMOVE #c, #d` — the only forms this codebase emits. */
+/**
+ * Splits a SET clause's assignments on top-level commas only. A plain `.split(',')`
+ * would also split inside a function call's own argument list -- exactly what
+ * `if_not_exists(activeCount, :zero)` has -- cutting one assignment into two
+ * unparseable halves instead of separating two assignments.
+ */
+function splitTopLevelCommas(expression: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < expression.length; i++) {
+    const ch = expression[i];
+    if (ch === '(') depth++;
+    else if (ch === ')') depth--;
+    else if (ch === ',' && depth === 0) {
+      parts.push(expression.slice(start, i));
+      start = i + 1;
+    }
+  }
+  parts.push(expression.slice(start));
+  return parts;
+}
+
+/**
+ * The right-hand side of one SET assignment. Supports exactly the forms this
+ * codebase writes: a bare placeholder, `attr +/- :delta`, and the counter pattern
+ * `if_not_exists(attr, :default) +/- :delta`. Anything else throws loudly rather
+ * than silently computing the wrong number.
+ */
+function evaluateSetValue(
+  rawValue: string,
+  item: Record<string, any>,
+  names: Record<string, string>,
+  values: Record<string, any>,
+): any {
+  let match = rawValue.match(
+    /^if_not_exists\(\s*([^,]+?)\s*,\s*(:[A-Za-z0-9_]+)\s*\)\s*([+-])\s*(:[A-Za-z0-9_]+)$/i,
+  );
+  if (match) {
+    const attr = resolveName(match[1], names);
+    const base = item[attr] !== undefined ? item[attr] : values[match[2]];
+    const delta = values[match[4]];
+    return match[3] === '+' ? base + delta : base - delta;
+  }
+
+  match = rawValue.match(/^(#?[A-Za-z0-9_]+)\s*([+-])\s*(:[A-Za-z0-9_]+)$/);
+  if (match) {
+    const attr = resolveName(match[1], names);
+    if (item[attr] === undefined) {
+      throw new Error(`inMemoryDynamo: SET arithmetic on a missing attribute: ${rawValue}`);
+    }
+    const delta = values[match[3]];
+    return match[2] === '+' ? item[attr] + delta : item[attr] - delta;
+  }
+
+  if (/^:[A-Za-z0-9_]+$/.test(rawValue)) return values[rawValue];
+  throw new Error(`inMemoryDynamo: unsupported SET value: ${rawValue}`);
+}
+
 function applyUpdateExpression(
   item: Record<string, any>,
   expression: string,
@@ -152,13 +229,13 @@ function applyUpdateExpression(
   }
 
   if (setMatch?.[1]) {
-    for (const assignment of setMatch[1].split(',')) {
+    for (const assignment of splitTopLevelCommas(setMatch[1])) {
       const [rawTarget, rawValue] = assignment.split('=').map((part) => part.trim());
       if (!rawTarget || !rawValue) continue;
-      if (/list_append|if_not_exists/i.test(rawValue)) {
+      if (/list_append/i.test(rawValue)) {
         throw new Error(`inMemoryDynamo: unsupported SET function: ${rawValue}`);
       }
-      item[resolveName(rawTarget, names)] = values[rawValue];
+      item[resolveName(rawTarget, names)] = evaluateSetValue(rawValue, item, names, values);
     }
   }
 
@@ -273,7 +350,11 @@ export class InMemoryDynamo {
       query(params: any) {
         return {
           promise: async () => {
-            const schema = self.schema(params.TableName);
+            const tableSchema = self.schema(params.TableName);
+            const schema = params.IndexName ? tableSchema.indexes?.[params.IndexName] : tableSchema;
+            if (!schema) {
+              throw new Error(`inMemoryDynamo: no index ${params.IndexName} registered for ${params.TableName}`);
+            }
             const values = params.ExpressionAttributeValues || {};
             const names = params.ExpressionAttributeNames || {};
             assertPlaceholdersResolved(params.KeyConditionExpression, values);
@@ -332,6 +413,68 @@ export class InMemoryDynamo {
         return {
           promise: async () => {
             self.store(params.TableName).delete(keyOf(self.schema(params.TableName), params.Key));
+            return {};
+          },
+        };
+      }
+
+      /**
+       * Evaluates every item's condition against the CURRENT state before applying any
+       * write, matching DynamoDB's all-or-nothing semantics. Nothing here `await`s
+       * mid-check, so two calls racing through the real event loop still serialize at
+       * this boundary exactly as the real service does -- any race survives only in the
+       * caller's own `await`s around the transaction, which is the thing a concurrency
+       * test here is checking is actually closed.
+       */
+      transactWrite(params: { TransactItems: any[] }) {
+        return {
+          promise: async () => {
+            const reasons: Array<{ Code?: string }> = [];
+            const apply: Array<() => void> = [];
+            let failed = false;
+            for (const entry of params.TransactItems) {
+              const [kind, op] = Object.entries(entry)[0] as [string, any];
+              const schema = self.schema(op.TableName);
+              const store = self.store(op.TableName);
+              const key = keyOf(schema, kind === 'Put' ? op.Item : op.Key);
+              const names = op.ExpressionAttributeNames || {};
+              const values = op.ExpressionAttributeValues || {};
+              const existing = store.get(key);
+              if (kind === 'Update') assertPlaceholdersResolved(op.UpdateExpression, values);
+              assertPlaceholdersResolved(op.ConditionExpression, values);
+              const ok = evaluateCondition(op.ConditionExpression, existing, names, values);
+              reasons.push(ok ? {} : { Code: 'ConditionalCheckFailed' });
+              if (!ok) {
+                failed = true;
+                continue;
+              }
+              if (kind === 'Put') {
+                apply.push(() => {
+                  const stored: Record<string, any> = {};
+                  for (const [k, v] of Object.entries(op.Item)) if (v !== undefined) stored[k] = v;
+                  store.set(key, stored);
+                });
+              } else if (kind === 'Update') {
+                apply.push(() => {
+                  const item = { ...(existing || op.Key) };
+                  applyUpdateExpression(item, op.UpdateExpression, names, values);
+                  store.set(key, item);
+                });
+              } else if (kind === 'Delete') {
+                apply.push(() => store.delete(key));
+              } else if (kind === 'ConditionCheck') {
+                // nothing to apply; the condition above is the whole point
+              } else {
+                throw new Error(`inMemoryDynamo: unsupported TransactItem: ${kind}`);
+              }
+            }
+            if (failed) {
+              throw Object.assign(new Error('Transaction cancelled'), {
+                code: 'TransactionCanceledException',
+                CancellationReasons: reasons,
+              });
+            }
+            for (const run of apply) run();
             return {};
           },
         };

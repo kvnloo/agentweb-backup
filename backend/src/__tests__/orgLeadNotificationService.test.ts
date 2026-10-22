@@ -21,6 +21,8 @@ jest.mock('../services/emailService', () => ({ emailService: {
 } }));
 jest.mock('../services/messagingChannelService', () => ({
   bootstrapMessagingChannels: jest.fn(), resolveDestination: jest.fn(),
+  // These accounts are Slack customers; a real answer to "is this one on WhatsApp" is false.
+  hasVerifiedWhatsApp: jest.fn().mockReturnValue(false),
 }));
 jest.mock('../services/whatsappService', () => ({ TEMPLATES: {} }));
 import { WebClient } from '@slack/web-api';
@@ -32,7 +34,7 @@ import { sendLeadNotification } from '../services/slackService';
 import { emailService } from '../services/emailService';
 import { FOUNDERS_USERID, FOUNDERS_SIGNUPS_LIST_NAME } from '../services/signupAutoEnrollService';
 const mock = (fn: unknown) => fn as jest.Mock;
-const job = { orgId: 'org-a', listId: 'list-a', leadId: 'lead-a' };
+const job = { origin: 'form_fill' as const, orgId: 'org-a', listId: 'list-a', leadId: 'lead-a' };
 let org: any;
 let lead: any;
 
@@ -71,7 +73,7 @@ it('masks all but the last four phone digits; short values never leak', () => {
   expect(maskLeadPhone('123')).toBe('***');
 });
 it('posts correct fields and CRM deep link through the org bot', async () => {
-  await dispatchLeadCreated('list-a', 'lead-a');
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
   const message = postMessage.mock.calls[0][0];
   expect(clients).toEqual(['xoxb-org-a']);
   expect(message).toMatchObject({ channel: 'C123', unfurl_links: false, unfurl_media: false, parse: 'none' });
@@ -86,13 +88,13 @@ it('posts correct fields and CRM deep link through the org bot', async () => {
 it('hides matching placeholder emails without dropping the lead notification', async () => {
   org.leadNotifications.excludeEmailPatterns = ['noemail+*@waterheater.app'];
   lead.email = 'NOEMAIL+15551234@waterheater.app';
-  await dispatchLeadCreated('list-a', 'lead-a');
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
   expect(postMessage).toHaveBeenCalledTimes(1);
   expect(postMessage.mock.calls[0][0].text).not.toContain(lead.email);
   expect(postMessage.mock.calls[0][0].text).toContain('Jane Doe');
   expect(postMessage.mock.calls[0][0].text).toContain('+1 (415) 555-1234');
   lead.email = 'noemail+123@waterheaterXapp';
-  await dispatchLeadCreated('list-a', 'lead-a');
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
   expect(postMessage).toHaveBeenCalledTimes(2);
   expect(postMessage.mock.calls[1][0].text).toContain(lead.email);
 });
@@ -100,16 +102,16 @@ it('filters by source, including malformed and missing source values', async () 
   org.leadNotifications.sources = ['waterheater-landing'];
   for (const source of ['crm', undefined, {}, 17]) {
     lead.customFields.source = source;
-    await dispatchLeadCreated('list-a', 'lead-a');
+    await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
   }
   expect(postMessage).not.toHaveBeenCalled();
   lead.customFields.source = 'waterheater-landing';
-  await dispatchLeadCreated('list-a', 'lead-a');
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
   expect(postMessage).toHaveBeenCalledTimes(1);
 });
 it('suppresses duplicate dispatches and completed-job recovery', async () => {
   mock(queue.enqueueJob).mockResolvedValueOnce('enqueued').mockResolvedValue('duplicate');
-  await Promise.all([dispatchLeadCreated('list-a', 'lead-a'), dispatchLeadCreated('list-a', 'lead-a')]);
+  await Promise.all([dispatchLeadCreated('list-a', 'lead-a', 'form_fill'), dispatchLeadCreated('list-a', 'lead-a', 'form_fill')]);
   expect(postMessage).toHaveBeenCalledTimes(1);
   lead.system = { leadNotification_org_a: 'unused' };
   mock(crmDb.claimLeadStepOnce).mockResolvedValue(false);
@@ -123,14 +125,14 @@ it('refuses a queued job after the list moves to another org', async () => {
 });
 it('never falls back to the shared bot or another org connection', async () => {
   org.connected_accounts = [null, { platform: 'slack', config: 'truthy-malformed' }];
-  await dispatchLeadCreated('list-a', 'lead-a');
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
   expect(postMessage).not.toHaveBeenCalled();
   expect(clients).toEqual([]);
 });
 it('rejects a bot authenticated to the wrong workspace', async () => {
   jest.useFakeTimers();
   authTest.mockResolvedValue({ ok: true, team_id: 'T-other', bot_id: 'B-other' });
-  const work = dispatchLeadCreated('list-a', 'lead-a');
+  const work = dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
   await jest.runAllTimersAsync();
   await work;
   expect(postMessage).not.toHaveBeenCalled();
@@ -138,7 +140,7 @@ it('rejects a bot authenticated to the wrong workspace', async () => {
 it('retries transient Slack failure with backoff and succeeds inside 60 seconds', async () => {
   jest.useFakeTimers();
   postMessage.mockRejectedValueOnce(new Error('offline'));
-  const work = dispatchLeadCreated('list-a', 'lead-a');
+  const work = dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
   await jest.advanceTimersByTimeAsync(0);
   expect(postMessage).toHaveBeenCalledTimes(1);
   await jest.advanceTimersByTimeAsync(999);
@@ -151,7 +153,7 @@ it('retries transient Slack failure with backoff and succeeds inside 60 seconds'
 it('contains exhausted Slack failures for durable recovery', async () => {
   jest.useFakeTimers();
   postMessage.mockRejectedValue(new Error('offline'));
-  const work = dispatchLeadCreated('list-a', 'lead-a');
+  const work = dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
   await jest.runAllTimersAsync();
   await expect(work).resolves.toBeUndefined();
   expect(postMessage).toHaveBeenCalledTimes(3);
@@ -159,21 +161,21 @@ it('contains exhausted Slack failures for durable recovery', async () => {
 });
 it('fails closed if the durable dedupe store is unavailable', async () => {
   mock(queue.enqueueJob).mockResolvedValue('unavailable');
-  await expect(dispatchLeadCreated('list-a', 'lead-a')).resolves.toBeUndefined();
+  await expect(dispatchLeadCreated('list-a', 'lead-a', 'form_fill')).resolves.toBeUndefined();
   expect(postMessage).not.toHaveBeenCalled();
 });
 it('keeps the same lead ID in different orgs independently scoped', async () => {
-  await dispatchLeadCreated('list-a', 'lead-a');
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
   org.orgId = 'org-b';
   mock(userDb.getUserById).mockResolvedValue({ userId: 'owner-a', orgId: 'org-b' });
-  await dispatchLeadCreated('list-a', 'lead-a');
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
   expect(mock(queue.enqueueJob).mock.calls[0][1]).not.toEqual(mock(queue.enqueueJob).mock.calls[1][1]);
 });
 
 it('does not resend an acknowledged message when persisting its marker needs a retry', async () => {
   jest.useFakeTimers();
   mock(crmDb.setLeadFields).mockRejectedValueOnce(new Error('throttled'));
-  const work = dispatchLeadCreated('list-a', 'lead-a');
+  const work = dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
   await jest.runAllTimersAsync();
   await work;
   expect(postMessage).toHaveBeenCalledTimes(1);
@@ -188,7 +190,7 @@ it('rejects malformed config arrays and connections without external calls', asy
     { mentions: ['<!channel>'] }, { enabled: 'true' }, { maskPhone: 'false' },
   ]) {
     org.leadNotifications = { enabled: true, slackChannelId: 'C123', maskPhone: true, ...patch };
-    await dispatchLeadCreated('list-a', 'lead-a');
+    await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
   }
   expect(postMessage).not.toHaveBeenCalled();
   expect(queue.enqueueJob).not.toHaveBeenCalled();
@@ -197,7 +199,7 @@ it('escapes lead-supplied Slack markup and allows only configured mentions', asy
   org.leadNotifications.mentions = ['U123'];
   org.leadNotifications.maskPhone = false;
   lead.firstName = '<!channel>';
-  await dispatchLeadCreated('list-a', 'lead-a');
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
   const text = postMessage.mock.calls[0][0].text;
   expect(text).toContain('&lt;!channel&gt;');
   expect(text).not.toContain('<!channel>');
@@ -207,7 +209,7 @@ it('escapes lead-supplied Slack markup and allows only configured mentions', asy
 it('ignores caller-provided tenant and user IDs on a lead', async () => {
   lead.tenantId = 'org-b';
   lead.userId = 'owner-b';
-  await dispatchLeadCreated('list-a', 'lead-a');
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
   expect(userDb.getUserById).toHaveBeenCalledWith('owner-a');
   expect(orgDb.getOrgById).toHaveBeenCalledWith('org-a');
   expect(clients).toEqual(['xoxb-org-a']);
@@ -215,7 +217,7 @@ it('ignores caller-provided tenant and user IDs on a lead', async () => {
 it('completes the job after Slack acknowledgement even when all marker writes fail', async () => {
   jest.useFakeTimers();
   mock(crmDb.setLeadFields).mockRejectedValue(new Error('database unavailable'));
-  const work = dispatchLeadCreated('list-a', 'lead-a');
+  const work = dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
   await jest.runAllTimersAsync();
   await work;
   expect(postMessage).toHaveBeenCalledTimes(1);
@@ -254,7 +256,7 @@ describe('AgentWeb uses the same org notification mechanism', () => {
 
   it.each(lists)('routes $name through generic dispatch, without a second legacy Slack send', async entry => {
     const list = configureList(entry);
-    await dispatchLeadCreated(list.listId, lead.leadId);
+    await dispatchLeadCreated(list.listId, lead.leadId, 'form_fill');
     await legacyAlert(list);
 
     expect(clients).toEqual(['xoxb-agentweb-fixture']);
@@ -267,7 +269,7 @@ describe('AgentWeb uses the same org notification mechanism', () => {
     expect(postMessage.mock.calls[0][0].text).toContain('+1 (415) 555-1234');
     expect(postMessage.mock.calls[0][0].text).toContain(`/crm?listId=${list.listId}&leadId=lead-a`);
     expect(queue.enqueueJob).toHaveBeenCalledWith('org_lead_notification', expect.any(String), {
-      orgId: org.orgId, listId: list.listId, leadId: lead.leadId,
+      orgId: org.orgId, listId: list.listId, leadId: lead.leadId, origin: 'form_fill',
     }, { claimImmediately: true });
     expect(sendLeadNotification).not.toHaveBeenCalled();
     expect(emailService.sendEmail).toHaveBeenCalledTimes(1);
@@ -277,7 +279,7 @@ describe('AgentWeb uses the same org notification mechanism', () => {
     const list = configureList();
     if (restriction === 'source') org.leadNotifications.sources = ['different-source'];
     if (restriction === 'connection') org.connected_accounts = [];
-    await dispatchLeadCreated(list.listId, lead.leadId);
+    await dispatchLeadCreated(list.listId, lead.leadId, 'form_fill');
     await legacyAlert(list);
     expect(postMessage).not.toHaveBeenCalled();
     expect(sendLeadNotification).not.toHaveBeenCalled();
@@ -288,7 +290,7 @@ describe('AgentWeb uses the same org notification mechanism', () => {
   it('hides AgentWeb placeholder email while sending exactly one generic alert', async () => {
     const list = configureList();
     lead.email = 'noemail+123@waterheater.app';
-    await dispatchLeadCreated(list.listId, lead.leadId);
+    await dispatchLeadCreated(list.listId, lead.leadId, 'form_fill');
     await legacyAlert(list);
     expect(postMessage).toHaveBeenCalledTimes(1);
     expect(postMessage.mock.calls[0][0].text).not.toContain(lead.email);
@@ -307,19 +309,19 @@ describe('AgentWeb uses the same org notification mechanism', () => {
 
 it.each([' LIST-A ', ' INBOUND ', ' WATERHEATER-LANDING '])('matches persisted list ID, list name or source: %s', async source => {
   org.leadNotifications.sources = [source];
-  await dispatchLeadCreated('list-a', 'lead-a');
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
   expect(postMessage).toHaveBeenCalledTimes(1);
 });
 it.each(['sourceId', 'landingPageId', 'lpId'])('matches persisted customFields.%s case-insensitively', async key => {
   org.leadNotifications.sources = ['LP-123'];
   lead.customFields = { [key]: 'lp-123' };
-  await dispatchLeadCreated('list-a', 'lead-a');
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
   expect(postMessage).toHaveBeenCalledTimes(1);
 });
 it.each([null, [], 'LP-123', 17, { source: {}, landingPageId: ['LP-123'], listId: 'LP-123', listName: 'LP-123' }])('ignores malformed or spoofed source containers %j', async customFields => {
   org.leadNotifications.sources = ['LP-123'];
   lead.customFields = customFields;
-  await dispatchLeadCreated('list-a', 'lead-a');
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
   expect(postMessage).not.toHaveBeenCalled();
 });
 it('renders LP, campaign, UTM and submitted form fields with bounded escaped values', async () => {
@@ -328,7 +330,7 @@ it('renders LP, campaign, UTM and submitted form fields with bounded escaped val
     heater_type: 'tankless', household_size: 4, needs_installation: false,
     'note<!channel>': '<@U999> & <https://evil.test|click> *bold* `code`',
     details: 'x'.repeat(1000) };
-  await dispatchLeadCreated('list-a', 'lead-a');
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
   const text = postMessage.mock.calls[0][0].text;
   for (const field of ['Campaign: water-heaters', 'Source / Medium: google / cpc', 'Heater type: tankless',
     'Household size: 4', 'Needs installation: false']) expect(text).toContain(field);
@@ -347,7 +349,7 @@ it('does not expose duplicate contact, internal, system or nested custom fields'
     accountOwnerUserId: 'owner-secret', tel: lead.phone, access_token: 'token-secret', password: 'password-secret',
     nested: { value: 'nested-secret' }, malformed: [null, { value: 'array-secret' }],
     note: `Contact ${lead.email} at ${lead.phone}` };
-  await dispatchLeadCreated('list-a', 'lead-a');
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
   const text = postMessage.mock.calls[0][0].text;
   for (const value of [lead.email, lead.phone, 'duplicate-name', 'duplicate-company', 'secret-owner',
     'secret-tenant', 'secret-list', 'nested-secret', 'private-note', 'debug-secret', 'internal-time',
@@ -357,7 +359,7 @@ it('does not expose duplicate contact, internal, system or nested custom fields'
 it('bounds total message size after escaping', async () => {
   lead.customFields = Object.fromEntries(Array.from({ length: 100 }, (_, i) => [`field${i}`, '&'.repeat(1000)]));
   org.leadNotifications.mentions = Array.from({ length: 50 }, (_, i) => `U${String(i).padStart(250, '1')}`);
-  await dispatchLeadCreated('list-a', 'lead-a');
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
   const text = postMessage.mock.calls[0][0].text;
   expect(text.length).toBeLessThanOrEqual(12000);
   expect(text).toContain('Open in CRM');
@@ -365,14 +367,14 @@ it('bounds total message size after escaping', async () => {
 });
 it('includes every submitted scalar field when the message budget allows', async () => {
   lead.customFields = Object.fromEntries(Array.from({ length: 100 }, (_, i) => [`field${i}`, 'value']));
-  await dispatchLeadCreated('list-a', 'lead-a');
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
   expect(postMessage.mock.calls[0][0].text.match(/Field\d+:/g)).toHaveLength(100);
 });
 
 it('renders structured first-touch UTM and LP attribution without duplicate custom values', async () => {
   lead.firstTouch = { utm: { source: 'google', campaign: 'launch', medium: 'cpc' }, landingUrl: 'https://example.com/lp' };
   lead.customFields = { UTM_SOURCE: 'duplicate-source', utm_campaign: 'duplicate-campaign', question: 'Replacement' };
-  await dispatchLeadCreated('list-a', 'lead-a');
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
   const text = postMessage.mock.calls[0][0].text;
   expect(text).toContain('Source / Medium: google');
   expect(text).toContain('Campaign: launch');
@@ -384,7 +386,7 @@ it.each([null, [], 'invalid', { utm: { source: {}, campaign: ['invalid'] }, land
   lead.firstTouch = firstTouch;
   lead.customFields = null;
   lead.utmSource = 'fallback-source';
-  await dispatchLeadCreated('list-a', 'lead-a');
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
   expect(postMessage).toHaveBeenCalledTimes(1);
   expect(postMessage.mock.calls[0][0].text).toContain('Source / Medium: fallback-source');
   expect(postMessage.mock.calls[0][0].text).not.toContain('[object Object]');
@@ -393,7 +395,7 @@ it.each([null, [], 'invalid', { utm: { source: {}, campaign: ['invalid'] }, land
 
 it('uses the exact contact-first layout and omits empty optional fields', async () => {
   lead.customFields = { empty: '', missing: null, whitespace: '   ' };
-  await dispatchLeadCreated('list-a', 'lead-a');
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
   expect(postMessage.mock.calls[0][0]).not.toHaveProperty('username');
   expect(postMessage.mock.calls[0][0].text).toBe([
     'New lead:', 'Name: Jane Doe', 'Phone: +1 (415) 555-1234', 'Email: jane@example.com', '',
@@ -405,18 +407,18 @@ it('omits absent contacts and hides only the waterheater placeholder by default'
   delete lead.firstName; delete lead.lastName; delete lead.phone;
   lead.email = 'noemail+123@waterheater.app';
   lead.customFields = {};
-  await dispatchLeadCreated('list-a', 'lead-a');
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
   const text = postMessage.mock.calls[0][0].text;
   expect(text).not.toMatch(/Name:|Phone:|Email:|Unknown|—/);
   org.leadNotifications.excludeEmailPatterns = ['*@example.com'];
   lead.email = 'real@example.com';
-  await dispatchLeadCreated('list-a', 'lead-a');
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
   expect(postMessage.mock.calls[1][0].text).toContain('Email: real@example.com');
 });
 it.each(['Haven', 'SWH', 'AgentWeb', 'Unknown org'])('notifies arbitrary unknown LPs for %s with no source filter or masking', async name => {
   org.name = name;
   lead.customFields = { source: 'never-registered-lp', landingPageName: 'Future page', landingPagePath: '/new-page' };
-  await dispatchLeadCreated('list-a', 'lead-a');
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
   expect(postMessage).toHaveBeenCalledTimes(1);
   expect(postMessage.mock.calls[0][0].text).toContain('Phone: +1 (415) 555-1234');
   expect(postMessage.mock.calls[0][0].text).toContain('Landing page: Future page');
@@ -426,7 +428,7 @@ it('includes all available detailed attribution and submitted fields', async () 
     clickIds: { fbclid: 'fb-click', gclid: 'g-click' }, referrer: 'https://referrer.test', landingUrl: 'https://lp.test/path',
     extraParams: { campaignName: 'Launch', campaignId: 'campaign-1', adId: 'ad-1' } };
   lead.customFields = { landingPageName: 'New LP', landingPagePath: '/path', answer: 'Yes' };
-  await dispatchLeadCreated('list-a', 'lead-a');
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
   const text = postMessage.mock.calls[0][0].text;
   for (const value of ['Landing page: New LP — https://lp.test/path', 'Campaign: Launch', 'Ad set: ad-set',
     'Ad: ad-1; fbclid=fb-click; gclid=g-click', 'Lead list: Inbound',
@@ -437,8 +439,8 @@ describe('progressive form notifications', () => {
   it.each(['create', 'batch', 'recovery'])('keeps email-stage drafts silent on %s', async path => {
     delete lead.firstName; delete lead.lastName; delete lead.phone;
     lead.customFields = { stage: 'email', source: 'booking_email_capture' };
-    if (path === 'create') await dispatchLeadCreated('list-a', 'lead-a');
-    else if (path === 'batch') await dispatchLeadsCreated('list-a', ['lead-a']);
+    if (path === 'create') await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
+    else if (path === 'batch') await dispatchLeadsCreated('list-a', ['lead-a'], 'form_fill');
     else await processLeadNotificationJob(job);
     expect(postMessage).not.toHaveBeenCalled();
     expect(queue.enqueueJob).not.toHaveBeenCalled();
@@ -448,22 +450,22 @@ describe('progressive form notifications', () => {
   it('sends full contacts once on completion and still notifies a distinct later submission', async () => {
     delete lead.firstName; delete lead.lastName; delete lead.phone;
     lead.customFields = { stage: 'email', source: 'booking_email_capture' };
-    await dispatchLeadCreated('list-a', 'lead-a');
+    await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
 
     Object.assign(lead, { firstName: 'Jane', lastName: 'Doe', phone: '+1 (415) 555-1234' });
     lead.customFields = { stage: 'questions', source: 'booking_email_capture', goal: 'Review my funnel' };
     const submission = { submissionId: 'completed-form', submittedAt: '2026-09-24T01:00:00Z' };
-    await dispatchLeadCreated('list-a', 'lead-a', submission);
+    await dispatchLeadCreated('list-a', 'lead-a', 'form_fill', submission);
     expect(postMessage).toHaveBeenCalledTimes(1);
     const text = postMessage.mock.calls[0][0].text;
     for (const contact of ['Name: Jane Doe', 'Phone: +1 (415) 555-1234', 'Email: jane@example.com',
       'Goal: Review my funnel']) expect(text).toContain(contact);
 
     lead.system = mock(crmDb.setLeadFields).mock.calls[0][2].system;
-    await dispatchLeadCreated('list-a', 'lead-a', submission);
+    await dispatchLeadCreated('list-a', 'lead-a', 'form_fill', submission);
     await processLeadNotificationJob({ ...job, ...submission });
     expect(postMessage).toHaveBeenCalledTimes(1);
-    await dispatchLeadCreated('list-a', 'lead-a', { ...submission, submissionId: 'later-form' });
+    await dispatchLeadCreated('list-a', 'lead-a', 'form_fill', { ...submission, submissionId: 'later-form' });
     expect(postMessage).toHaveBeenCalledTimes(2);
     expect(postMessage.mock.calls[1][0].client_msg_id).not.toBe(postMessage.mock.calls[0][0].client_msg_id);
   });
@@ -471,7 +473,7 @@ describe('progressive form notifications', () => {
   it.each([undefined, 'questions', 'Email', ' email ', null, {}, ['email']])(
     'preserves arbitrary LP notifications for stages other than exactly email: %j', async stage => {
       lead.customFields = { source: 'never-registered-lp', stage };
-      await dispatchLeadCreated('list-a', 'lead-a');
+      await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
       expect(postMessage).toHaveBeenCalledTimes(1);
     },
   );
@@ -479,11 +481,11 @@ describe('progressive form notifications', () => {
 
 it('deduplicates a submission retry while allowing separate submissions of the same lead', async () => {
   const first = { submissionId: 'submission-1', submittedAt: '2026-09-24T01:00:00Z' };
-  await dispatchLeadCreated('list-a', 'lead-a', first);
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill', first);
   const sent = mock(crmDb.setLeadFields).mock.calls[0][2].system;
   lead.system = sent;
   await processLeadNotificationJob({ ...job, ...first });
-  await dispatchLeadCreated('list-a', 'lead-a', { ...first, submissionId: 'submission-2' });
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill', { ...first, submissionId: 'submission-2' });
   expect(postMessage).toHaveBeenCalledTimes(2);
   expect(postMessage.mock.calls[0][0].client_msg_id).not.toBe(postMessage.mock.calls[1][0].client_msg_id);
   expect(postMessage.mock.calls[0][0].text).toContain('Submitted: Sep 23, 2026, 6:00 PM PT');
@@ -492,7 +494,7 @@ it('deduplicates a submission retry while allowing separate submissions of the s
 it.each([null, [], 'wrong-type', { fbclid: {}, gclid: ['bad'] }])('ignores malformed click-id and extra-param boundaries %j', async value => {
   lead.firstTouch = { clickIds: value, extraParams: value, referrer: {} };
   lead.clickIds = value;
-  await dispatchLeadCreated('list-a', 'lead-a');
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
   expect(postMessage).toHaveBeenCalledTimes(1);
   expect(postMessage.mock.calls[0][0].text).not.toMatch(/\[object Object\]|fbclid:|gclid:|referrer:/);
 });
@@ -500,14 +502,14 @@ it.each([null, [], 'wrong-type', { fbclid: {}, gclid: ['bad'] }])('ignores malfo
 it('retains available secondary-touch details when the preferred touch has missing or malformed values', async () => {
   lead.firstTouch = { utm: { campaign: 'first-campaign', content: {} }, clickIds: { fbclid: {} }, referrer: {} };
   lead.lastTouch = { utm: { content: 'last-ad' }, clickIds: { fbclid: 'last-click' }, referrer: 'https://referrer.test' };
-  await dispatchLeadCreated('list-a', 'lead-a');
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
   const text = postMessage.mock.calls[0][0].text;
   for (const value of ['Campaign: first-campaign', 'Ad: last-ad; fbclid=last-click', 'Referrer: https://referrer.test']) expect(text).toContain(value);
 });
 it('keeps full contact values and only strips exact placeholder addresses from form text', async () => {
   lead.firstName = 'N'.repeat(310);
   lead.customFields = { note: 'realnoemail+x@waterheater.app noemail+x@waterheater.app.evil noemail+x@waterheater.app', placeholder: 'noemail+x@waterheater.app' };
-  await dispatchLeadCreated('list-a', 'lead-a');
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
   const text = postMessage.mock.calls[0][0].text;
   expect(text).toContain(`Name: ${lead.firstName} Doe`);
   expect(text).toContain('Note: realnoemail+x@waterheater.app noemail+x@waterheater.app.evil');
@@ -516,6 +518,7 @@ it('keeps full contact values and only strips exact placeholder addresses from f
 
 
 describe('bounded import notifications', () => {
+  beforeEach(() => { org.leadNotifications.leadTypes = ['enrichment_import']; });
   const ids = Array.from({ length: 13 }, (_, i) => `lead-${i}`);
   beforeEach(() => {
     mock(crmDb.getLeadById).mockImplementation(async (_listId, leadId) => ({ ...lead, leadId }));
@@ -523,7 +526,7 @@ describe('bounded import notifications', () => {
 
   it('resolves routing once and stops disabled imports before reading any leads', async () => {
     org.leadNotifications.enabled = false;
-    await dispatchLeadsCreated('list-a', ids);
+    await dispatchLeadsCreated('list-a', ids, 'enrichment_import');
     expect(crmDb.getLeadListById).toHaveBeenCalledTimes(1);
     expect(userDb.getUserById).toHaveBeenCalledTimes(1);
     expect(orgDb.getOrgById).toHaveBeenCalledTimes(1);
@@ -544,7 +547,7 @@ describe('bounded import notifications', () => {
         resolve({ ok: true, ts: '123' });
       }));
     });
-    const work = dispatchLeadsCreated('list-a', ids);
+    const work = dispatchLeadsCreated('list-a', ids, 'enrichment_import');
     await new Promise(resolve => setImmediate(resolve));
     expect(postMessage).toHaveBeenCalledTimes(5);
     expect(queue.enqueueJob).toHaveBeenCalledTimes(5);
@@ -555,15 +558,15 @@ describe('bounded import notifications', () => {
     await work;
     expect(peak).toBe(5);
     expect(postMessage).toHaveBeenCalledTimes(ids.length);
-    expect(crmDb.getLeadListById).toHaveBeenCalledTimes(1);
-    expect(userDb.getUserById).toHaveBeenCalledTimes(1);
-    expect(orgDb.getOrgById).toHaveBeenCalledTimes(1);
+    expect(crmDb.getLeadListById).toHaveBeenCalledTimes(ids.length + 1);
+    expect(userDb.getUserById).toHaveBeenCalledTimes(ids.length + 1);
+    expect(orgDb.getOrgById).toHaveBeenCalledTimes(ids.length + 1);
   });
 
   it('retains per-lead dedupe keys, retries and durable recovery after a failed delivery', async () => {
     jest.useFakeTimers();
     postMessage.mockRejectedValue(new Error('offline'));
-    const work = dispatchLeadsCreated('list-a', ['lead-a']);
+    const work = dispatchLeadsCreated('list-a', ['lead-a'], 'enrichment_import');
     await jest.runAllTimersAsync();
     await work;
     expect(postMessage).toHaveBeenCalledTimes(3);
@@ -579,17 +582,17 @@ describe('bounded import notifications', () => {
     expect(postMessage).toHaveBeenCalledTimes(4);
     org.leadNotifications.enabled = true;
     mock(queue.enqueueJob).mockResolvedValue('duplicate');
-    await dispatchLeadCreated('list-a', 'lead-a');
+    await dispatchLeadCreated('list-a', 'lead-a', 'enrichment_import');
     expect(queue.enqueueJob).toHaveBeenLastCalledWith(source, key, queuedJob, { claimImmediately: true });
     expect(postMessage).toHaveBeenCalledTimes(4);
   });
 
   it('contains routing and individual lead failures without abandoning other leads', async () => {
     mock(crmDb.getLeadById).mockRejectedValueOnce(new Error('read failed'));
-    await expect(dispatchLeadsCreated('list-a', ids)).resolves.toBeUndefined();
+    await expect(dispatchLeadsCreated('list-a', ids, 'enrichment_import')).resolves.toBeUndefined();
     expect(postMessage).toHaveBeenCalledTimes(ids.length - 1);
     mock(orgDb.getOrgById).mockRejectedValueOnce(new Error('offline'));
-    await expect(dispatchLeadsCreated('list-a', ids)).resolves.toBeUndefined();
+    await expect(dispatchLeadsCreated('list-a', ids, 'enrichment_import')).resolves.toBeUndefined();
   });
 });
 
@@ -601,9 +604,9 @@ describe('reserved smoke lead suppression', () => {
     { phone: '+1 (415) 555-0199' },
   ])('skips create, repeat, batch and recovered jobs for %j', async marker => {
     Object.assign(lead, marker);
-    await dispatchLeadCreated('list-a', 'lead-a');
-    await dispatchLeadCreated('list-a', 'lead-a', { submissionId: 'repeat', submittedAt: 'now' });
-    await dispatchLeadsCreated('list-a', ['lead-a']);
+    await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
+    await dispatchLeadCreated('list-a', 'lead-a', 'form_fill', { submissionId: 'repeat', submittedAt: 'now' });
+    await dispatchLeadsCreated('list-a', ['lead-a'], 'form_fill');
     await processLeadNotificationJob(job);
     await processLeadNotificationJob({ ...job, submissionId: 'repeat', submittedAt: 'now' });
     expect(queue.enqueueJob).not.toHaveBeenCalled();
@@ -617,7 +620,7 @@ describe('reserved smoke lead suppression', () => {
     { email: 'noemail+123@waterheater.app', phone: '+14155551234' },
   ])('keeps nonreserved leads eligible: %j', async contact => {
     Object.assign(lead, contact);
-    await dispatchLeadCreated('list-a', 'lead-a');
+    await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
     expect(postMessage).toHaveBeenCalledTimes(1);
   });
 });
@@ -633,7 +636,7 @@ describe('ENG-2120 exact readable layout', () => {
       utm: { campaign: 'campaign-1', content: 'Video A', term: 'Property managers', source: 'facebook', medium: 'paid_social' },
       referrer: 'https://facebook.com/' };
     lead.customFields = { utm_campaign: 'duplicate', number_of_units: 1000, wantsDemo: false, empty: '', stage: 'questions' };
-    await dispatchLeadCreated('list-a', 'lead-a');
+    await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
     expect(postMessage.mock.calls[0][0].text).toBe([
       'New lead:', 'Name: Jane Doe', 'Phone: +1 (415) 555-1234', 'Email: jane@example.com', '',
       'Attribution:', 'Landing page: Haven demo — https://learn.usehaven.ai/?utm_campaign=campaign-1',
@@ -649,7 +652,7 @@ describe('ENG-2120 exact readable layout', () => {
     lead.customFields = { landing_page_name: 'Any new page', landing_page_url: 'https://EXAMPLE.com:443/demo?q=one&x=two',
       landing_page: '/', campaign_id: 'unknown-campaign', ad_set_id: 'unknown-set', ad_id: 'unknown-ad', utm_source: 'google', utm_medium: 'cpc',
       referrer: 'https://example.org/', preferred_time: 'Morning' };
-    await dispatchLeadCreated('list-a', 'lead-a');
+    await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
     expect(postMessage.mock.calls[0][0].text).toBe([
       'New lead:', 'Name: Jane Doe', 'Phone: +1 (415) 555-1234', 'Email: jane@example.com', '',
       'Attribution:', 'Landing page: Any new page — https://example.com/demo?q=one&amp;x=two',
@@ -664,7 +667,7 @@ describe('ENG-2120 exact readable layout', () => {
     mock(notificationLookup.pages).mockRejectedValue(new Error('offline'));
     mock(notificationLookup.campaigns).mockRejectedValue(new Error('offline'));
     lead.firstTouch = { landingUrl: url, utm: { campaign: 'raw' }, clickIds: { fbclid: 'fb-click', gclid: 'g-click' } };
-    await dispatchLeadCreated('list-a', 'lead-a');
+    await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
     expect(postMessage.mock.calls[0][0].text).toBe([
       'New lead:', 'Name: Jane Doe', 'Phone: +1 (415) 555-1234', 'Email: jane@example.com', '',
       'Attribution:', 'Landing page: ' + url, 'Lead list: Inbound', 'Campaign: raw',
@@ -677,7 +680,7 @@ describe('ENG-2120 exact readable layout', () => {
 it('preserves form questions with attribution-like prefixes and exact URL punctuation', async () => {
   lead.firstTouch = { landingUrl: 'https://example.com/_offer?q=*special*&other=one_two' };
   lead.customFields = { campaignGoal: 'More demos', adsetPreference: 'Owners', landingPageFeedback: 'Helpful' };
-  await dispatchLeadCreated('list-a', 'lead-a');
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
   const text = postMessage.mock.calls[0][0].text;
   expect(text).toContain('Landing page: https://example.com/_offer?q=*special*&amp;other=one_two');
   expect(text).toContain('Campaign goal: More demos');
@@ -686,7 +689,7 @@ it('preserves form questions with attribution-like prefixes and exact URL punctu
 });
 it('reserves the CRM link even when attribution alone consumes the message budget', async () => {
   lead.firstTouch = { landingUrl: 'https://example.com/?q=' + 'x'.repeat(11800) };
-  await dispatchLeadCreated('list-a', 'lead-a');
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
   const text = postMessage.mock.calls[0][0].text;
   expect(text.length).toBeLessThanOrEqual(12000);
   expect(text).toContain('Open in CRM');
@@ -696,7 +699,7 @@ it('uses repeat-submission attribution and humanizes duplicate answer labels onc
   lead.firstTouch = { utm: { campaign: 'old' }, landingUrl: 'https://example.com/old' };
   lead.lastTouch = { utm: { campaign: 'new' }, landingUrl: 'https://example.com/new' };
   lead.customFields = { preferredTime: 'Morning', preferred_time: 'Duplicate' };
-  await dispatchLeadCreated('list-a', 'lead-a', { submissionId: 'repeat', submittedAt: '2026-09-24T01:00:00Z' });
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill', { submissionId: 'repeat', submittedAt: '2026-09-24T01:00:00Z' });
   const text = postMessage.mock.calls[0][0].text;
   expect(text).toContain('Campaign: new');
   expect(text).toContain('Landing page: https://example.com/new');
@@ -712,7 +715,7 @@ it('renders resolved Meta campaign, ad set and ad names in the exact layout', as
   const request = jest.spyOn(global, 'fetch').mockResolvedValue({ ok: true, json: async () => ({ id: '456', account_id: '123', name: 'Demo video',
     campaign: { id: '789', name: 'Tenant launch' }, adset: { id: '234', name: 'Property managers' } }) } as Response);
   try {
-    await dispatchLeadCreated('list-a', 'lead-a');
+    await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
     expect(postMessage.mock.calls[0][0].text).toBe([
       'New lead:', 'Name: Jane Doe', 'Phone: +1 (415) 555-1234', 'Email: jane@example.com', '',
       'Attribution:', 'Lead list: Inbound', 'Campaign: Tenant launch', 'Ad set: Property managers', 'Ad: Demo video',
@@ -725,7 +728,7 @@ it('renders resolved Meta campaign, ad set and ad names in the exact layout', as
 
  it.each(['landingUrl', 'referrer'])('redacts private query values and fragments in %s', async key => {
    lead.firstTouch = { [key]: 'https://example.com/path?EMAIL=private%40example.com&phone=123&access_token=private-token&code=private-code&sessionId=private-session&auth=private-auth&password=private-password&secret=private-secret&api_key=private-key&utm_source=google&gclid=click#private-fragment' };
-   await dispatchLeadCreated('list-a', 'lead-a');
+   await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
    const text = postMessage.mock.calls[0][0].text;
    expect(text).not.toContain('private');
    expect(text).not.toContain('phone=123');
@@ -733,8 +736,83 @@ it('renders resolved Meta campaign, ad set and ad names in the exact layout', as
  });
  it('bounds each escaped URL while retaining path and safe attribution', async () => {
    lead.firstTouch = { landingUrl: 'https://example.com/path?utm_source=google&gclid=click&huge=' + '&x='.repeat(1000) };
-   await dispatchLeadCreated('list-a', 'lead-a');
+   await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
    const line = postMessage.mock.calls[0][0].text.split('\n').find((line: string) => line.startsWith('Landing page:'));
    expect(line).toContain('https://example.com/path?utm_source=google&amp;gclid=click');
    expect(line.length).toBeLessThanOrEqual(2048 + 'Landing page: '.length);
  });
+
+// Human acceptance contract: inbound-only defaults, explicit opt-in, and no import spam.
+describe('lead origin filter contract', () => {
+  it('includes form fills by default', async () => {
+    await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
+    expect(postMessage).toHaveBeenCalledTimes(1);
+  });
+  it.each(['linkedin', 'enrichment_import', 'manual', 'integration', undefined] as const)('excludes %s by default', async origin => {
+    await dispatchLeadCreated('list-a', 'lead-a', origin);
+    expect(queue.enqueueJob).not.toHaveBeenCalled();
+    expect(postMessage).not.toHaveBeenCalled();
+  });
+  it('honors an explicit list', async () => {
+    org.leadNotifications.leadTypes = ['linkedin'];
+    await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
+    expect(queue.enqueueJob).not.toHaveBeenCalled();
+    await dispatchLeadCreated('list-a', 'lead-a', 'linkedin');
+    expect(postMessage).toHaveBeenCalledTimes(1);
+  });
+  it('does not enqueue a batch import by default', async () => {
+    await dispatchLeadsCreated('list-a', ['lead-a'], 'enrichment_import');
+    expect(queue.enqueueJob).not.toHaveBeenCalled();
+    expect(crmDb.getLeadById).not.toHaveBeenCalled();
+  });
+});
+
+it('includes bookings and persists server origin into the queued job', async () => {
+  await dispatchLeadCreated('list-a', 'lead-a', 'booking');
+  expect(queue.enqueueJob).toHaveBeenCalledWith(expect.any(String), expect.any(String), { ...job, origin: 'booking' }, { claimImmediately: true });
+  expect(postMessage).toHaveBeenCalledTimes(1);
+});
+it.each([null, 'linkedin', ['typo'], [123], [{}], ['linkedin', 'linkedin']])('fails closed on malformed persisted leadTypes %j', async leadTypes => {
+  org.leadNotifications.leadTypes = leadTypes;
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
+  await processLeadNotificationJob(job);
+  expect(queue.enqueueJob).not.toHaveBeenCalled();
+  expect(postMessage).not.toHaveBeenCalled();
+});
+it('an explicit empty list disables all types and unknown origins never qualify', async () => {
+  org.leadNotifications.leadTypes = [];
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
+  expect(queue.enqueueJob).not.toHaveBeenCalled();
+  org.leadNotifications.leadTypes = ['form_fill', 'booking', 'linkedin', 'enrichment_import', 'manual', 'integration'];
+  await processLeadNotificationJob({ ...job, origin: undefined });
+  await processLeadNotificationJob({ ...job, origin: 'typo' as any });
+  expect(postMessage).not.toHaveBeenCalled();
+});
+it('rechecks the type filter after enqueue and during recovery', async () => {
+  mock(queue.enqueueJob).mockImplementation(async () => {
+    org.leadNotifications.leadTypes = ['linkedin'];
+    return 'enqueued';
+  });
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
+  expect(queue.enqueueJob).toHaveBeenCalledTimes(1);
+  expect(postMessage).not.toHaveBeenCalled();
+  await processLeadNotificationJob(job);
+  expect(postMessage).not.toHaveBeenCalled();
+});
+it('does not let lead or form fields override the trusted origin', async () => {
+  lead.origin = 'form_fill';
+  lead.customFields = { origin: 'form_fill', leadTypes: ['form_fill'], source: 'form_fill' };
+  await dispatchLeadCreated('list-a', 'lead-a', 'linkedin');
+  await dispatchLeadCreated('list-a', 'lead-a');
+  expect(queue.enqueueJob).not.toHaveBeenCalled();
+});
+it('rechecks an opted-in batch against changed settings before delivery', async () => {
+  org.leadNotifications.leadTypes = ['enrichment_import'];
+  mock(queue.enqueueJob).mockImplementation(async () => {
+    org.leadNotifications.leadTypes = [];
+    return 'enqueued';
+  });
+  await dispatchLeadsCreated('list-a', ['lead-a'], 'enrichment_import');
+  expect(queue.enqueueJob).toHaveBeenCalledTimes(1);
+  expect(postMessage).not.toHaveBeenCalled();
+});

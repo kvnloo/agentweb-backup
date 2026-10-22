@@ -24,7 +24,16 @@ import { authenticateToken } from '../middleware/auth';
 import { userDb } from '../services/db';
 import { explicitChannels, normalizeUserChannels } from '../services/messagingChannelService';
 import { getDisplayPhoneNumber, isOptedOut } from '../services/whatsappService';
-import { getVerificationStatus, startVerification } from '../services/whatsappVerificationService';
+import {
+  disconnectWhatsApp,
+  getVerificationStatus,
+  startVerification,
+} from '../services/whatsappVerificationService';
+import {
+  assertCanConnect,
+  getPlatformSummary,
+  PlatformConflictError,
+} from '../services/customerChannelPolicy';
 
 const router = express.Router();
 
@@ -46,7 +55,16 @@ router.get('/', authenticateToken, async (req: any, res: any) => {
           : {}),
       })),
     );
-    res.json({ success: true, channels: enriched });
+    // Which single platform this account is on (ENG-273), from the same policy that
+    // refuses a second one — so the portal can explain up front why WhatsApp is not
+    // offered to a Slack customer instead of letting them hit the refusal.
+    const summary = await getPlatformSummary(user);
+    res.json({
+      success: true,
+      channels: enriched,
+      platform: summary.platform,
+      platformSource: summary.source,
+    });
   } catch (error: any) {
     console.error('[messaging-channels] list failed:', error);
     res.status(500).json({ error: 'Failed to load messaging channels' });
@@ -71,6 +89,19 @@ router.post('/whatsapp/verification', authenticateToken, async (req: any, res: a
         error:
           'Explicit opt-in is required before WhatsApp messages can be sent to this number.',
       });
+    }
+
+    // One platform per customer: an account already on Slack cannot also connect
+    // WhatsApp. Checked before a code is issued, so they are told now rather than after
+    // texting a code that would then be refused.
+    const account = await userDb.getUserById(req.user.userId);
+    try {
+      await assertCanConnect(account, 'whatsapp');
+    } catch (conflict: any) {
+      if (conflict instanceof PlatformConflictError) {
+        return res.status(409).json({ error: conflict.message, code: 'platform_conflict', connected: conflict.connected });
+      }
+      throw conflict;
     }
 
     // Resolve the business number BEFORE issuing a code, so a failure here does not
@@ -124,14 +155,9 @@ router.get('/whatsapp/verification', authenticateToken, async (req: any, res: an
  */
 router.delete('/whatsapp', authenticateToken, async (req: any, res: any) => {
   try {
-    const user = await userDb.getUserById(req.user.userId);
-    if (!user) return res.status(404).json({ error: 'User not found' });
-
-    // Explicit entries only — see explicitChannels. Removing WhatsApp must not have
-    // the side effect of pinning the user's Slack destination.
-    const messagingChannels = explicitChannels(user).filter((c) => c.channel !== 'whatsapp');
-    await userDb.updateUser(req.user.userId, { messagingChannels } as any);
-    res.json({ success: true, channels: messagingChannels });
+    const result = await disconnectWhatsApp(req.user.userId);
+    if (!result) return res.status(404).json({ error: 'User not found' });
+    res.json({ success: true, channels: result.channels });
   } catch (error: any) {
     console.error('[messaging-channels] whatsapp delete failed:', error);
     res.status(500).json({ error: 'Failed to remove WhatsApp number' });

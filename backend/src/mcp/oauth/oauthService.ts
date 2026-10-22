@@ -223,6 +223,42 @@ export class McpOAuthService {
     return client;
   }
 
+  /**
+   * ENG-2496 — idempotently ensure a first-party public client (fixed id) exists and lists
+   * `redirectUri`, so a backend flow can reuse the portal sign-in + consent page. Writes a
+   * row of the existing client shape only; no schema change.
+   */
+  async ensureFirstPartyClient(clientId: string, clientName: string, redirectUri: string): Promise<void> {
+    const existing = await this.getClient(clientId);
+    if (existing?.redirectUris.includes(redirectUri)) return;
+    try {
+      if (!existing) {
+        const record: OAuthClient = {
+          clientId,
+          clientName,
+          redirectUris: [redirectUri],
+          grantTypes: ['authorization_code'],
+          responseTypes: ['code'],
+          tokenEndpointAuthMethod: 'none',
+          scope: 'mcp:tools',
+          createdAt: new Date().toISOString(),
+        };
+        await dynamodb.put({ TableName: this.clientsTable, Item: record, ConditionExpression: 'attribute_not_exists(clientId)' }).promise();
+      } else {
+        await dynamodb.update({
+          TableName: this.clientsTable,
+          Key: { clientId },
+          UpdateExpression: 'SET redirectUris = list_append(redirectUris, :uris)',
+          ConditionExpression: 'NOT contains(redirectUris, :uri)',
+          ExpressionAttributeValues: { ':uris': [redirectUri], ':uri': redirectUri },
+        }).promise();
+      }
+    } catch (error) {
+      // A concurrent caller won the write; the client now exists either way.
+      if ((error as { code?: string }).code !== 'ConditionalCheckFailedException') throw error;
+    }
+  }
+
   // ─── PKCE Validation ───────────────────────────────────────────────────
 
   validatePkce(codeVerifier: string, codeChallenge: string, method: string): boolean {

@@ -9,6 +9,7 @@ import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import {
   dripSequenceDb,
   SequenceNotFoundError,
+  SequenceStatus,
   SequenceAuthError,
   CreateSequenceInput,
   UpdateSequenceInput,
@@ -18,7 +19,7 @@ import { isSessionList, SESSION_LIST_SEQUENCE_ERROR } from '../utils/sessionList
 import { resolveSenderForSend } from '../services/crmSenderService';
 import { CrmSender } from '../services/crmSenderTypes';
 import { sendAsSender } from '../services/sendAsSender';
-import axios from 'axios';
+import { fetchPublicHtml, SsrfBlockedError } from '../utils/ssrfGuard';
 import { extractVariables, leadHasVariable, isSupportedVariable, injectUnsubscribeUrl, inlineEmailStyles, rewriteS3ImageUrls, normalizeYoutubeUrls } from '../utils/emailVariables';
 import { LLMService } from '../utils/llmService';
 import { LEAD_LIFECYCLES, defaultStatusConfigFor } from '../utils/leadSchema';
@@ -137,6 +138,41 @@ router.get('/', authenticateToken, async (req: Request, res: Response) => {
   }
 });
 
+// ENG-2205: a step's linkedInAccountId is the Unipile account the drip worker will SEND from.
+// It arrives in the request body, so it must be an account the caller owns or that is shared with
+// their org — otherwise any user could name the site-wide pool account (whose id is disclosed in
+// agent tool responses) or another customer's account and have the worker send from it. Same
+// check send-linkedin-message/-invite, withdraw and accept-invitation already apply.
+const LINKEDIN_STEP_ACCOUNT_ERROR = 'A LinkedIn step references an account that is not connected to your user.';
+
+// `alreadyPinned` (PUT only) holds the account ids already stored on the caller's own sequence. Those are not
+// re-validated: a user can legitimately have a sequence whose pinned account was later disconnected, and an
+// unrelated edit must still save. They cannot be abused to send, because the drip worker re-checks the pin at
+// send time. Only a NEW or CHANGED pin has to be an account the caller owns or shares.
+// Mirrors the drip worker's channel derivation (dripSequenceWorker.ts): a step is a LinkedIn step only when its
+// channel normalises to 'linkedin'. A pin left behind on an email step is never used to send, so it is neither
+// validated here nor trusted as an already-stored pin.
+const isLinkedInChannelStep = (step: any): boolean =>
+  String(step?.channel ?? 'email').trim().toLowerCase() === 'linkedin';
+
+async function stepsReferenceForeignLinkedInAccount(
+  userId: string,
+  steps: unknown,
+  alreadyPinned: ReadonlySet<string> = new Set(),
+): Promise<boolean> {
+  if (!Array.isArray(steps)) return false;
+  const { resolveLinkedInAccountForWrite } = await import('../services/agentMode/linkedInDailyVolumeGate');
+  for (const step of steps) {
+    if (!isLinkedInChannelStep(step)) continue; // pin on a non-LinkedIn step is inert
+    const id = step?.linkedInAccountId;
+    if (id === undefined || id === null || id === '') continue; // auto-resolved by the worker
+    if (typeof id !== 'string') return true;
+    if (alreadyPinned.has(id)) continue;
+    if (!(await resolveLinkedInAccountForWrite(userId, id))) return true;
+  }
+  return false;
+}
+
 // POST /api/crm/sequences
 router.post('/', authenticateToken, async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
@@ -146,6 +182,9 @@ router.post('/', authenticateToken, async (req: Request, res: Response) => {
   }
 
   try {
+    if (await stepsReferenceForeignLinkedInAccount(authReq.user!.userId, steps)) {
+      return res.status(403).json({ error: LINKEDIN_STEP_ACCOUNT_ERROR });
+    }
     const input: CreateSequenceInput = {
       userId: authReq.user!.userId,
       name: name.trim(),
@@ -172,7 +211,9 @@ router.get('/:sequenceId', authenticateToken, async (req: Request, res: Response
     const sequence = await dripSequenceDb.getSequence(req.params.sequenceId);
     if (!sequence) return res.status(404).json({ error: 'Sequence not found' });
     if (sequence.userId !== authReq.user!.userId) return res.status(403).json({ error: 'Forbidden' });
-    res.json({ sequence });
+    // ENG-2573: read-only hint so UI/Emma can warn that open/click exits may be machine-triggered.
+    const { machineSusceptibleExits } = await import('../services/exitConditionTrust');
+    res.json({ sequence, machineSusceptibleExits: machineSusceptibleExits(sequence.exitConditions) });
   } catch (err) {
     console.error('[sequences] getSequence error:', err);
     res.status(500).json({ error: 'Failed to fetch sequence' });
@@ -182,7 +223,7 @@ router.get('/:sequenceId', authenticateToken, async (req: Request, res: Response
 // PUT /api/crm/sequences/:sequenceId
 router.put('/:sequenceId', authenticateToken, async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
-  const { name, description, campaignType, enrollmentTrigger, enrollmentCondition, exitConditions, autoEnrollListIds, steps, status } = req.body;
+  const { name, description, campaignType, enrollmentTrigger, enrollmentCondition, exitConditions, autoEnrollListIds, steps, status, expectedUpdatedAt, requireStatusNot } = req.body;
   try {
     // ENG-2311: auto-enrolment is driven solely by autoEnrollListIds, so refusing a session
     // list HERE (the only writer besides by-list enrol, guarded below) keeps every enrol path
@@ -192,6 +233,21 @@ router.put('/:sequenceId', authenticateToken, async (req: Request, res: Response
         const bound = typeof lid === 'string' && lid ? await crmDb.getLeadListById(lid).catch(() => null) : null;
         if (isSessionList(bound)) return res.status(400).json({ error: SESSION_LIST_SEQUENCE_ERROR });
       }
+    }
+    // Only trust the stored pins of the CALLER's own sequence (updateSequence rejects anyone else below).
+    // A failed read is NOT treated as "no stored pins": that would turn a transient DynamoDB error into a
+    // misleading 403. It propagates to the generic handler (500, retryable) like updateSequence's own read would.
+    const stored = Array.isArray(steps) ? await dripSequenceDb.getSequence(req.params.sequenceId) : null;
+    const alreadyPinned = new Set<string>(
+      stored && stored.userId === authReq.user!.userId
+        ? (stored.steps ?? [])
+            .filter(isLinkedInChannelStep)
+            .map((st: any) => st?.linkedInAccountId)
+            .filter((v: unknown): v is string => typeof v === 'string' && !!v)
+        : [],
+    );
+    if (await stepsReferenceForeignLinkedInAccount(authReq.user!.userId, steps, alreadyPinned)) {
+      return res.status(403).json({ error: LINKEDIN_STEP_ACCOUNT_ERROR });
     }
     const input: UpdateSequenceInput = {
       name,
@@ -204,13 +260,16 @@ router.put('/:sequenceId', authenticateToken, async (req: Request, res: Response
       steps,
       status,
     };
-    const sequence = await dripSequenceDb.updateSequence(
-      req.params.sequenceId,
-      authReq.user!.userId,
-      input,
-    );
+    const guard: { expectedUpdatedAt?: string; requireStatusNot?: SequenceStatus } = {
+      ...(typeof expectedUpdatedAt === 'string' ? { expectedUpdatedAt } : {}),
+      ...(['draft', 'active', 'paused', 'archived'].includes(requireStatusNot) ? { requireStatusNot: requireStatusNot as SequenceStatus } : {}),
+    };
+    const sequence = Object.keys(guard).length > 0
+      ? await dripSequenceDb.updateSequence(req.params.sequenceId, authReq.user!.userId, input, guard)
+      : await dripSequenceDb.updateSequence(req.params.sequenceId, authReq.user!.userId, input);
     res.json({ sequence });
   } catch (err: any) {
+    if (err?.name === 'SequenceConflictError') return res.status(409).json({ error: err.message, code: 'sequence_conflict' });
     if (err instanceof SequenceNotFoundError) return res.status(404).json({ error: err.message });
     if (err instanceof SequenceAuthError) return res.status(403).json({ error: err.message });
     console.error('[sequences] updateSequence error:', err);
@@ -975,13 +1034,16 @@ router.post('/load-from-url', authenticateToken, async (req: Request, res: Respo
       return res.status(400).json({ message: 'Invalid URL format. Must be HTTP or HTTPS.' });
     }
 
-    const response = await axios.get(url, {
-      timeout: 15000,
-      responseType: 'text',
-      headers: { 'User-Agent': 'AgentWeb-Backend/1.0' },
-    });
-
-    const html = response.data as string;
+    // ENG-2425: SSRF-safe (DNS-pinned, per-hop re-validated, size-capped).
+    let html: string;
+    try {
+      html = await fetchPublicHtml(url);
+    } catch (fetchErr) {
+      if (fetchErr instanceof SsrfBlockedError) {
+        return res.status(400).json({ message: 'URL must point to a public internet address' });
+      }
+      throw fetchErr;
+    }
 
     // Extract title
     const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);

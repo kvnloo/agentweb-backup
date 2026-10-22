@@ -67,6 +67,23 @@ jest.mock('../services/linkedInOutreachService', () => ({
   },
 }));
 
+const mockSyncConnectionsForAccount = jest.fn();
+jest.mock('../cron/linkedInConnectionSyncCron', () => ({
+  syncConnectionsForAccount: (...args: any[]) => mockSyncConnectionsForAccount(...args),
+}));
+
+const mockResolveLinkedInAccountForWrite = jest.fn().mockResolvedValue({ ownerUserId: 'test-user-id' });
+const mockPaceLinkedInWrite = jest.fn().mockResolvedValue({ refusal: null });
+jest.mock('../services/agentMode/linkedInDailyVolumeGate', () => ({
+  resolveLinkedInAccountForWrite: (...args: any[]) => mockResolveLinkedInAccountForWrite(...args),
+  paceLinkedInWrite: (...args: any[]) => mockPaceLinkedInWrite(...args),
+}));
+const mockReserveWriteSlot = jest.fn().mockResolvedValue({ allowed: true });
+jest.mock('../services/linkedInWritePacer', () => ({
+  ...jest.requireActual('../services/linkedInWritePacer'),
+  reserveWriteSlot: (...args: any[]) => mockReserveWriteSlot(...args),
+}));
+
 jest.mock('../services/agentModeService', () => ({ agentModeService: {} }));
 jest.mock('../utils/llmService', () => ({ createLLMService: jest.fn() }));
 jest.mock('../services/settingsService', () => ({ settingsService: {} }));
@@ -120,6 +137,7 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-message', () =
     mockGetLeadListById.mockResolvedValue(OWNED_LIST);
     mockGetLeadById.mockResolvedValue(LEAD_WITH_LINKEDIN);
     mockResolveAccountId.mockResolvedValue('unipile-acct-1');
+    mockResolveLinkedInAccountForWrite.mockResolvedValue({ ownerUserId: 'test-user-id' });
     mockSendMessage.mockResolvedValue({ id: 'chat-abc' });
     mockAddLinkedInMessageEvent.mockResolvedValue(undefined);
   });
@@ -273,6 +291,80 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-message', () =
     );
   });
 
+  // ENG-2205 follow-up: a client-supplied accountId is untrusted (same hole as send-linkedin-invite).
+  // Auto-resolution is deliberately UNCHANGED: own account first, then the shared pool for users without one.
+  it('auto-resolves exactly as before when no account is supplied (own account, else the shared pool) and skips the ownership check', async () => {
+    const res = makeRes();
+    await handler!({ user: { userId: 'test-user-id' }, params: { listId: 'list-123', leadId: 'lead-456' }, body: { message: 'Hello!' } } as any, res as any);
+    expect(mockResolveAccountId).toHaveBeenCalledWith('test-user-id');
+    // ENG-2529: the account is looked up only to pace it — never a 403 on the auto-resolved path.
+    expect(res.status).not.toHaveBeenCalledWith(403);
+    expect(mockPaceLinkedInWrite).toHaveBeenCalledWith('send-message', expect.anything(), 'unipile-acct-1');
+    expect(mockSendMessage).toHaveBeenCalledWith('unipile-acct-1', expect.any(String), true, 'Hello!');
+  });
+
+  it('refuses with 429 before any send when the account is at its daily cap (ENG-2529)', async () => {
+    mockPaceLinkedInWrite.mockResolvedValueOnce({ refusal: { success: false, message: 'LinkedIn daily volume limit reached', error: 'cap', gate: 'daily_volume' } });
+    const res = makeRes();
+    await handler!({ user: { userId: 'test-user-id' }, params: { listId: 'list-123', leadId: 'lead-456' }, body: { message: 'hello', accountId: 'li-cap-world' } } as any, res as any);
+    expect(res.status).toHaveBeenCalledWith(429);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ message: 'LinkedIn daily volume limit reached' }));
+    expect(mockSendMessage).not.toHaveBeenCalled();
+    expect(mockAddLinkedInMessageEvent).not.toHaveBeenCalled();
+  });
+
+  it('refuses with 403 and sends nothing when the caller-specified account is not theirs', async () => {
+    mockResolveLinkedInAccountForWrite.mockResolvedValue(null);
+    const res = makeRes();
+    await handler!({ user: { userId: 'test-user-id' }, params: { listId: 'list-123', leadId: 'lead-456' }, body: { message: 'Hello!', accountId: 'someone-elses-acct' } } as any, res as any);
+    expect(mockResolveLinkedInAccountForWrite).toHaveBeenCalledWith('test-user-id', 'someone-elses-acct');
+    expect(res.status).toHaveBeenCalledWith(403);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'linkedin_account_not_connected', message: expect.stringContaining('not connected to your user') }));
+    expect(mockSendMessage).not.toHaveBeenCalled();
+    expect(mockAddLinkedInMessageEvent).not.toHaveBeenCalled();
+  });
+
+  it('sends from a caller-specified account the user owns or shares (portal default-account path)', async () => {
+    mockResolveLinkedInAccountForWrite.mockResolvedValue({ ownerUserId: 'test-user-id' });
+    const res = makeRes();
+    await handler!({ user: { userId: 'test-user-id' }, params: { listId: 'list-123', leadId: 'lead-456' }, body: { message: 'Hello!', accountId: 'my-default-acct' } } as any, res as any);
+    expect(mockSendMessage).toHaveBeenCalledWith('my-default-acct', 'https://www.linkedin.com/in/john-doe', true, 'Hello!');
+    expect(mockResolveAccountId).not.toHaveBeenCalled();
+    expect(res.status).not.toHaveBeenCalled();
+  });
+
+  // The message is already out when the engagement is recorded; reporting a failed send would make the user
+  // retry and message the lead twice.
+  // The message is already out when the engagement is recorded. A transient write failure is retried (keyed put with a
+  // fixed eventId, so a retry overwrites rather than duplicates); only a persistent failure is reported, and even then
+  // as success, because reporting a failed send would make the user message the lead twice.
+  it('recovers from a transient engagement-write failure: retried, recorded once with the SAME event, plain success', async () => {
+    mockAddLinkedInMessageEvent
+      .mockRejectedValueOnce(new Error('read ECONNRESET'))
+      .mockRejectedValueOnce(new Error('read ECONNRESET'))
+      .mockResolvedValueOnce(undefined);
+    const res = makeRes();
+    await handler!({ user: { userId: 'test-user-id' }, params: { listId: 'list-123', leadId: 'lead-456' }, body: { message: 'Hello!' } } as any, res as any);
+    expect(mockSendMessage).toHaveBeenCalledTimes(1);
+    expect(mockAddLinkedInMessageEvent).toHaveBeenCalledTimes(3);
+    const ids = new Set(mockAddLinkedInMessageEvent.mock.calls.map((c: any[]) => c[0].eventId));
+    const stamps = new Set(mockAddLinkedInMessageEvent.mock.calls.map((c: any[]) => c[0].timestamp));
+    expect(ids.size).toBe(1);
+    expect(stamps.size).toBe(1);
+    expect(res.status).not.toHaveBeenCalled();
+    expect(res.json).toHaveBeenCalledWith({ success: true });
+  });
+
+  it('still reports success (and does not invite a retry) when the engagement write keeps failing AFTER a successful send', async () => {
+    mockAddLinkedInMessageEvent.mockRejectedValue(new Error('read ECONNRESET'));
+    const res = makeRes();
+    await handler!({ user: { userId: 'test-user-id' }, params: { listId: 'list-123', leadId: 'lead-456' }, body: { message: 'Hello!' } } as any, res as any);
+    expect(mockSendMessage).toHaveBeenCalledTimes(1);
+    expect(mockAddLinkedInMessageEvent).toHaveBeenCalledTimes(3); // 1 try + 2 retries, then give up
+    expect(res.status).not.toHaveBeenCalled();
+    expect(res.json).toHaveBeenCalledWith({ success: true, engagementRecorded: false });
+  });
+
   it('sends message and records engagement on happy path', async () => {
     const req: any = {
       user: { userId: 'test-user-id' },
@@ -408,5 +500,74 @@ describe('send-linkedin-message identity cross-check (ENG-1026)', () => {
     await handler!(makeReq() as any, res as any);
     expect(mockSendMessage).toHaveBeenCalledTimes(1);
     expect(mockUpdateLead).not.toHaveBeenCalled();
+  });
+});
+
+
+// ENG-2205: resolveAccountId can now return an account whose probe was only
+// indeterminate, so the real call below it is the backstop. An infrastructure
+// failure there (Unipile credentials / gateway 5xx / timeout) must surface as a
+// handled 503 — never a 500 echoing the raw internal message.
+describe('LinkedIn routes: infrastructure failures are handled, not raw 500s (ENG-2205)', () => {
+  const sendHandler = findHandler(router, '/lists/:listId/leads/:leadId/send-linkedin-message', 'post');
+  const syncHandler = findHandler(router, '/lists/:listId/sync-linkedin-connections', 'post');
+  const CREDS = new Error('Failed to fetch Unipile credentials from Secrets Manager');
+  const GATEWAY = new Error('<html><head><title>502 Bad Gateway</title></head></html>');
+  const sendReq = () => ({
+    user: { userId: 'test-user-id' },
+    params: { listId: 'list-123', leadId: 'lead-456' },
+    body: { message: 'Hello!' },
+  });
+  const syncReq = () => ({ user: { userId: 'test-user-id' }, params: { listId: 'list-123' }, body: {} });
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockGetLeadListById.mockResolvedValue(OWNED_LIST);
+    mockGetLeadById.mockResolvedValue(LEAD_WITH_LINKEDIN);
+    mockResolveAccountId.mockResolvedValue('unindeterminate-acct');
+    mockGetLinkedInProfile.mockResolvedValue(null);
+  });
+
+  it.each([['credentials failure', CREDS], ['gateway 502', GATEWAY]])(
+    'send-linkedin-message returns 503 (no raw message, nothing recorded) on %s',
+    async (_label, err) => {
+      mockSendMessage.mockRejectedValue(err);
+      const res = makeRes();
+      await sendHandler!(sendReq() as any, res as any);
+      expect(res.status).toHaveBeenCalledWith(503);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'linkedin_unavailable' }));
+      expect(JSON.stringify((res.json as jest.Mock).mock.calls)).not.toMatch(/Secrets Manager|Bad Gateway/);
+      expect(mockAddLinkedInMessageEvent).not.toHaveBeenCalled();
+    },
+  );
+
+  it('send-linkedin-message keeps a plain 500 for a non-infrastructure error', async () => {
+    mockSendMessage.mockRejectedValue(new Error('something unrelated broke'));
+    const res = makeRes();
+    await sendHandler!(sendReq() as any, res as any);
+    expect(res.status).toHaveBeenCalledWith(500);
+  });
+
+  it.each([['credentials failure', CREDS], ['gateway 502', GATEWAY]])(
+    'sync-linkedin-connections returns 503 (no raw message) on %s',
+    async (_label, err) => {
+      mockSyncConnectionsForAccount.mockRejectedValue(err);
+      const res = makeRes();
+      await syncHandler!(syncReq() as any, res as any);
+      expect(res.status).toHaveBeenCalledWith(503);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'linkedin_unavailable' }));
+      expect(JSON.stringify((res.json as jest.Mock).mock.calls)).not.toMatch(/Secrets Manager|Bad Gateway/);
+    },
+  );
+
+  it('sync-linkedin-connections still succeeds and still 400s with no account', async () => {
+    mockSyncConnectionsForAccount.mockResolvedValue([1, 2]);
+    let res = makeRes();
+    await syncHandler!(syncReq() as any, res as any);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ synced: 2 }));
+    mockResolveAccountId.mockResolvedValue(null);
+    res = makeRes();
+    await syncHandler!(syncReq() as any, res as any);
+    expect(res.status).toHaveBeenCalledWith(400);
   });
 });

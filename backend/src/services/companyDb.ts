@@ -16,7 +16,7 @@
 
 import { dynamodb } from '../config/aws';
 
-const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+import { TABLE_PREFIX } from '../config/constants';
 const TABLE_NAME = `${TABLE_PREFIX}AW-CRMCompanies`;
 const LEADS_TABLE = `${TABLE_PREFIX}AW-Leads`;
 

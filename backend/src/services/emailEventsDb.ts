@@ -1,6 +1,6 @@
 import { dynamodb } from '../config/aws';
 import { ResendWebhookEvent } from './webhookService';
-const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+import { TABLE_PREFIX } from '../config/constants';
 const TABLE_NAME = `${TABLE_PREFIX}AW-EmailEvents`;
 
 export interface EmailEvent {

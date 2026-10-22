@@ -35,6 +35,7 @@
  * lockout with no admin override.
  */
 
+import { readUserForOwnership } from "../utils/readUserForOwnership";
 import { userDb, taskDb, orgDb } from "./db";
 import { resolveOrgProfileField } from "./orgProfileResolver";
 import { v4 as uuidv4 } from "uuid";
@@ -492,14 +493,14 @@ async function completeWithManualFallback(
     if (!writeResult?.success) {
       throw new Error(writeResult?.error || writeResult?.message || "failed to write fallback design.md");
     }
-    const fresh = (await userDb.getUserById(userId)) as any;
+    const fresh = (await readUserForOwnership(userId)) as any;
     const patch = buildReadyPatch(fresh?.designSystem as DesignSystemFields | undefined, "manual_fallback" as DesignSystemSource, taskId, now());
     if (patch) await userDb.updateUser(userId, patch as any);
   } catch (fallbackErr: any) {
     // Both the real scrape AND the manual fallback failed (e.g. Knowledge Base
     // write itself is down). Terminal failure so the UI's retry button
     // surfaces instead of an infinite spinner.
-    const fresh = (await userDb.getUserById(userId)) as any;
+    const fresh = (await readUserForOwnership(userId)) as any;
     const message = scrapeError
       ? `scrape failed (${scrapeError}); fallback also failed: ${fallbackErr?.message ?? String(fallbackErr)}`
       : `fallback failed: ${fallbackErr?.message ?? String(fallbackErr)}`;
@@ -525,7 +526,7 @@ export async function triggerDesignSystemBuildForUser(
   const fetchHtml = deps.fetchHtml ?? defaultFetchHtml;
   const updateKnowledgeBaseFile = deps.updateKnowledgeBaseFile ?? defaultUpdateKnowledgeBaseFile;
 
-  const user = await userDb.getUserById(userId);
+  const user = await readUserForOwnership(userId);
   if (!user) return;
 
   // brandGuidelines — the manual-fallback content source — is an
@@ -566,7 +567,7 @@ export async function triggerDesignSystemBuildForUser(
     if (!writeResult?.success) {
       throw new Error(writeResult?.error || writeResult?.message || "failed to write design.md to Knowledge Base");
     }
-    const fresh = (await userDb.getUserById(userId)) as any;
+    const fresh = (await readUserForOwnership(userId)) as any;
     const patch = buildReadyPatch(fresh?.designSystem as DesignSystemFields | undefined, "scrape" as DesignSystemSource, taskId, now());
     if (patch) await userDb.updateUser(userId, patch as any);
   } catch (e: any) {

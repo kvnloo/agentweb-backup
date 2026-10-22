@@ -1269,6 +1269,77 @@ describe('Predefined Work Plan MCP Tools', () => {
       expect(result.content[0].text).toContain('Onboarding');
     });
   });
+  // ENG-2378: a step's optional `model` must survive the tool (it is the layer that drops unknown keys silently).
+  describe('manage_predefined_work_plan - per-step model (ENG-2378)', () => {
+    const stored = {
+      planId: 'wp-m', title: 'Model Plan', steps_rev: 'rev-1',
+      steps: [
+        { stepCount: 1, title: 'One', description: 'd1', requiredFunctionCalls: [], skillIds: [], model: 'gpt-5-chat' },
+        { stepCount: 2, title: 'Two', description: 'd2', requiredFunctionCalls: [], skillIds: [] },
+      ],
+    };
+    const mockFetches = () =>
+      mockMcpFetch.mockImplementation(async (opts: any) => (opts.method === 'GET' ? JSON.parse(JSON.stringify(stored)) : { planId: 'wp-m' }));
+    const putBody = () => (mockMcpFetch.mock.calls.find((c: any) => c[0].method === 'PUT')![0] as any).body;
+
+    it('create passes step.model through to the route untouched', async () => {
+      mockMcpFetch.mockResolvedValue({ planId: 'wp-new' });
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'create', title: 'T', steps: [{ title: 'S1', model: 'claude-sonnet-4' }, { title: 'S2' }],
+      }, context);
+      expect((writeCalls()[0][0] as any).body.steps).toEqual([{ title: 'S1', model: 'claude-sonnet-4' }, { title: 'S2' }]);
+    });
+
+    it('replace update passes step.model through', async () => {
+      mockFetches();
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update', plan_id: 'wp-m',
+        steps: [{ stepCount: 1, title: 'One', description: 'd1', requiredFunctionCalls: [], skillIds: [], model: 'claude-sonnet-4' }, { stepCount: 2, title: 'Two', description: 'd2', requiredFunctionCalls: [], skillIds: [] }],
+      }, context);
+      expect(putBody().steps[0].model).toBe('claude-sonnet-4');
+    });
+
+    it('merge: amending another field keeps the stored model; supplying one sets it; a blank clears it', async () => {
+      mockFetches();
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update', plan_id: 'wp-m', steps_mode: 'merge',
+        steps: [{ stepCount: 1, description: 'amended' }, { stepCount: 2, model: 'claude-sonnet-4' }],
+      }, context);
+      expect(putBody().steps[0]).toMatchObject({ description: 'amended', model: 'gpt-5-chat' });
+      expect(putBody().steps[1].model).toBe('claude-sonnet-4');
+
+      mockMcpFetch.mockClear();
+      mockFetches();
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update', plan_id: 'wp-m', steps_mode: 'merge', confirm_step_removal: true,
+        steps: [{ stepCount: 1, model: '' }],
+      }, context);
+      expect('model' in putBody().steps[0]).toBe(false);
+    });
+
+    it('a replace built without models (the tool never shows them) carries the stored models instead of erasing them', async () => {
+      mockFetches();
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update', plan_id: 'wp-m',
+        steps: [{ stepCount: 1, title: 'One', description: 'd1' }, { stepCount: 2, title: 'Two', description: 'd2' }],
+      }, context);
+      expect(putBody().steps.map((s: any) => s.model)).toEqual(['gpt-5-chat', undefined]);
+    });
+
+    it('A7: an explicit blank model through a replace is the clear instruction: it is NOT re-filled from the stored plan', async () => {
+      mockFetches();
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update', plan_id: 'wp-m', confirm_step_removal: true,
+        steps: [{ stepCount: 1, title: 'One', description: 'd1', model: '' }, { stepCount: 2, title: 'Two', description: 'd2' }],
+      }, context);
+      expect(putBody().steps[0].model).toBe('');
+    });
+
+    it('the step schema documents model so an LLM caller can see it', () => {
+      const def = mcpToolRegistry.getToolDefinitions().find((d: any) => d.name === 'manage_predefined_work_plan') as any;
+      expect(def.inputSchema.properties.steps.items.properties.model).toMatchObject({ type: 'string' });
+    });
+  });
 });
 
 describe('Admin tools are NOT in chatbotService', () => {
@@ -1278,5 +1349,89 @@ describe('Admin tools are NOT in chatbotService', () => {
     const names = mcpToolRegistry.getToolNames();
     expect(names).toContain('list_predefined_work_plans');
     expect(names).toContain('manage_predefined_work_plan');
+  });
+
+  // ENG-1992: not_found configuration cluster — plan_id given as a title, stale, or missing.
+  describe('manage_predefined_work_plan - plan_id resolution (ENG-1992)', () => {
+    const context = { userId: 'user-123', agentUserId: 'user-123' };
+    beforeEach(() => jest.clearAllMocks());
+    const plans = [
+      { planId: 'wp-1', title: 'Weekly Report' },
+      { planId: 'wp-2', title: 'Ad Launch' },
+      { planId: 'wp-3', title: 'Ad Launch' },
+    ];
+    const notFound = () => new Error('API error (404): Work plan not found');
+    const parse = (r: any) => JSON.parse(r.content[0].text);
+
+    it('resolves a unique exact title to its id for get after a 404', async () => {
+      mockMcpFetch.mockImplementation(async (o: any) => {
+        if (o.path === '/api/admin/work-plans') return plans as any;
+        if (o.path === '/api/admin/work-plans/wp-1') return { planId: 'wp-1', title: 'Weekly Report' } as any;
+        throw notFound();
+      });
+      const r = await mcpToolRegistry.execute('manage_predefined_work_plan', { action: 'get', plan_id: 'weekly report' }, context);
+      expect(parse(r)).toMatchObject({ planId: 'wp-1' });
+    });
+
+    it('returns valid plan ids instead of a bare 404 for an unknown id', async () => {
+      mockMcpFetch.mockImplementation(async (o: any) => {
+        if (o.path === '/api/admin/work-plans') return plans as any;
+        throw notFound();
+      });
+      const r = parse(await mcpToolRegistry.execute('manage_predefined_work_plan', { action: 'get', plan_id: 'nope' }, context));
+      expect(r.error).toContain('No work plan with id "nope"');
+      expect(r.availablePlans.map((p: any) => p.id)).toEqual(['wp-1', 'wp-2', 'wp-3']);
+    });
+
+    it('never deletes by title', async () => {
+      mockMcpFetch.mockImplementation(async (o: any) => {
+        if (o.method === 'GET' && o.path === '/api/admin/work-plans') return plans as any;
+        throw notFound();
+      });
+      const r = parse(await mcpToolRegistry.execute('manage_predefined_work_plan', { action: 'delete', plan_id: 'Weekly Report' }, context));
+      expect(r.error).toContain('delete requires the exact plan id');
+      expect(mockMcpFetch.mock.calls.filter((c: any) => c[0].method === 'DELETE')).toHaveLength(1);
+    });
+
+    it('refuses an ambiguous title and lists the matches', async () => {
+      mockMcpFetch.mockImplementation(async (o: any) => {
+        if (o.path === '/api/admin/work-plans') return plans as any;
+        throw notFound();
+      });
+      const r = parse(await mcpToolRegistry.execute('manage_predefined_work_plan', { action: 'update', plan_id: 'Ad Launch', title: 'x' }, context));
+      expect(r.error).toContain('matches 2 work plans');
+      expect(r.matchingPlans.map((p: any) => p.id)).toEqual(['wp-2', 'wp-3']);
+      expect(mockMcpFetch.mock.calls.filter((c: any) => c[0].method === 'PUT')).toHaveLength(1);
+    });
+
+    it('missing plan_id lists valid plans without calling the plan route', async () => {
+      mockMcpFetch.mockResolvedValue(plans as any);
+      const r = parse(await mcpToolRegistry.execute('manage_predefined_work_plan', { action: 'get' }, context));
+      expect(r.error).toContain('plan_id is required');
+      expect(r.availablePlans).toHaveLength(3);
+      expect(mockMcpFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('resolves a title for a steps update instead of failing the pre-read', async () => {
+      mockMcpFetch.mockImplementation(async (o: any) => {
+        if (o.path === '/api/admin/work-plans') return plans as any;
+        if (o.method === 'GET' && o.path === '/api/admin/work-plans/wp-1') {
+          return { planId: 'wp-1', title: 'Weekly Report', steps: [{ stepCount: 1, description: 'a' }], steps_rev: 1 } as any;
+        }
+        if (o.method === 'PUT' && o.path === '/api/admin/work-plans/wp-1') return { planId: 'wp-1' } as any;
+        throw notFound();
+      });
+      const r = parse(await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update', plan_id: 'Weekly Report', steps: [{ stepCount: 1, description: 'b' }], steps_mode: 'merge',
+      }, context));
+      expect(JSON.stringify(r)).not.toContain('Cannot safely update');
+      expect(mockMcpFetch.mock.calls.some((c: any) => c[0].method === 'PUT' && c[0].path === '/api/admin/work-plans/wp-1')).toBe(true);
+    });
+
+    it('rethrows non-404 errors unchanged', async () => {
+      mockMcpFetch.mockRejectedValue(new Error('API error (500): boom'));
+      await expect(mcpToolRegistry.execute('manage_predefined_work_plan', { action: 'get', plan_id: 'wp-1' }, context))
+        .rejects.toThrow('API error (500): boom');
+    });
   });
 });

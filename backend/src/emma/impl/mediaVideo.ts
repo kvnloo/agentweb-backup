@@ -196,6 +196,7 @@ import {
 import { declaredPlacementField } from '../../services/agentMode/generateImagePlacement';
 import { recordGeneratedCreative } from '../../services/creativeLineage';
 import { resolveModelForUser } from '../../services/modelRoles';
+import { normalizeVideoModel, SEEDANCE_VIDEO_MODEL } from '../../services/videoModels';
 import { withTimeoutOrReject } from './shared/withTimeoutOrReject';
 import type { LLMUsageContext } from '../../utils/llmService';
 // Self-import: `callVisionLLMWithTimeout`/`generateImage` reach
@@ -877,13 +878,16 @@ export async function generateImage(
           success: false,
           message: `Image generation failed after primary and fallback attempts: ${result.error || 'Fallback image generation failed'}`,
           error: result.error,
-          primaryError
+          primaryError,
+          ...(result.errorClass ? { errorClass: result.errorClass } : {})
         };
       }
       return {
         success: false,
         message: result.error || 'Failed to generate image',
-        error: result.error
+        error: result.error,
+        // ENG-1535: typed class (transient/rate_limited/policy/config/...) for the gateway.
+        ...(result.errorClass ? { errorClass: result.errorClass } : {})
       };
     }
 
@@ -957,7 +961,10 @@ export async function generateVideo(
         // Session cost accounting (agent-mode chat). The per-user burn shadow record is
         // fired once at the generation SOURCE (videoService.generateVideo) so every caller
         // is metered exactly once — see llmPricing.videoGenerationCostUsd (ENG-200).
-        const videoCost = estimateVideoGenerationCost(videoModel || 'veo-3.1-generate-preview', durationSeconds);
+        // The service reports the model that actually produced the clip (after any
+        // Seedance→Omni fallback) and its actual cost when the provider returned usage.
+        const producedModel = result.model || normalizeVideoModel(videoModel) || SEEDANCE_VIDEO_MODEL;
+        const videoCost = result.costUsd ?? estimateVideoGenerationCost(producedModel, durationSeconds);
         chatbotDb.addToolCostToSession(sessionId, videoCost, 'generateVideo').catch((err) =>
           console.error('AgentMode: Failed to add video cost to session:', err)
         );
@@ -968,7 +975,7 @@ export async function generateVideo(
           filename: result.filename,
           generatedAt: new Date().toISOString(),
           prompt: prompt,
-          model: videoModel || 'veo-3.1-generate-preview'
+          model: producedModel
         };
 
         // Store video data in session metadata (optional)
@@ -994,7 +1001,7 @@ export async function generateVideo(
           ...(isComposed && { composedVideoUrl: (result as any).composedVideoUrl }),
           filename: result.filename,
           prompt: prompt,
-          model: videoModel || 'veo-3.1-generate-preview',
+          model: producedModel,
           composed: isComposed,
         };
       } else {
@@ -1324,6 +1331,22 @@ export async function removeC2PAFromImage(
 
     } catch (error: any) {
       console.error('AgentMode: Error removing C2PA metadata:', error);
+      // ENG-2584: a 4xx on the source download means the URL itself is
+      // unusable for a server-side fetch (expired signed CDN link, auth-gated
+      // asset). Retrying the same URL can never succeed, so say so explicitly.
+      const status = error?.response?.status;
+      if ([401, 403, 404, 410].includes(status)) {
+        return {
+          success: false,
+          message:
+            `Could not download the source image (HTTP ${status}). The URL is expired, private, or ` +
+            `forbidden for server-side download (signed CDN links such as fbcdn.net expire). Do not retry ` +
+            `this same URL. Fetch a fresh image URL from the source (e.g. re-query the ads API), use an ` +
+            `uploaded S3 copy, or ask the user to upload the image.`,
+          error: 'source_download_refused',
+          status,
+        };
+      }
       return {
         success: false,
         message: 'Failed to remove C2PA metadata from image',
@@ -1500,7 +1523,7 @@ export async function removeImageBackground(
     }
   }
 
-  /** Cost per video generation in USD. Veo bills per 8s clip, so longer videos cost proportionally more. */
+  /** Cost per video generation in USD. Video bills per clip, so longer videos cost proportionally more. */
 function estimateVideoGenerationCost(model: string, durationSeconds?: number): number {
     // Per-clip rates sourced from llmPricing (single source of truth).
     return videoGenerationCostUsd(model, durationSeconds);

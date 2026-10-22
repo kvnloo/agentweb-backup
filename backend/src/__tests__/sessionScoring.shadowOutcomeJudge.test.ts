@@ -119,6 +119,20 @@ describe('shadow outcome judge (ENG-2138)', () => {
     expect(result).toEqual(expect.objectContaining({ shadow: true, score: 4 }));
   });
 
+  it('stores the reply\'s one-decimal score unrounded, so a decimal rubric is measured on what it emitted (ENG-2138)', async () => {
+    mockCallLLM.mockResolvedValue({
+      choices: [{ message: { content: JSON.stringify({ reason: 'Delivered with minor gaps.', score: 4.6 }) } }],
+    } as never);
+
+    await scoreSessionWithJudgeIfNeeded(session(), shadowJudge());
+
+    expect(mockUpdateJudgeScore).toHaveBeenCalledWith(
+      'sess-1',
+      OUTCOME_SHADOW_JUDGE_ID,
+      expect.objectContaining({ score: 4.6, shadow: true }),
+    );
+  });
+
   it('asks for the three behaviour criteria and stores only real booleans from the reply (ENG-2189)', async () => {
     for (const field of ['arguedWithInstruction', 'escalatedWhenNotRequired', 'failedToEscalate']) {
       expect(OUTCOME_RUBRIC_B_PROMPT).toContain(`"${field}": <true|false>`);
@@ -182,6 +196,51 @@ describe('shadow outcome judge (ENG-2138)', () => {
     const stored = mockUpdateJudgeScore.mock.calls[0][2];
     expect(stored).not.toHaveProperty('shadow');
     expect(stored).not.toHaveProperty('model');
+  });
+
+  describe('promptVersion (ENG-2138)', () => {
+    const stored = async (judge: ScoringJudge) => {
+      mockUpdateJudgeScore.mockClear();
+      await scoreSessionWithJudgeIfNeeded(session(), judge);
+      return mockUpdateJudgeScore.mock.calls[0][2];
+    };
+
+    it('stamps a shadow score with a 12-hex digest of the system prompt, leaving score, reason and dimensions as the judge returned them', async () => {
+      const row = await stored(shadowJudge());
+      expect(row.promptVersion).toMatch(/^[0-9a-f]{12}$/);
+      expect(row).toEqual(expect.objectContaining({
+        score: 4,
+        reason: 'Post drafted and delivered in full.',
+        dimensions: { goalCompletion: 4, dataAccuracy: 4, outputQuality: 4 },
+      }));
+    });
+
+    it('is stable for the same prompt and differs between prompts', async () => {
+      const a1 = await stored(shadowJudge({ systemPrompt: 'Prompt A' }));
+      const a2 = await stored(shadowJudge({ systemPrompt: 'Prompt A' }));
+      const b = await stored(shadowJudge({ systemPrompt: 'Prompt B' }));
+      expect(a1.promptVersion).toBe(a2.promptVersion);
+      expect(b.promptVersion).not.toBe(a1.promptVersion);
+    });
+
+    it('is not written for a non-shadow custom judge', async () => {
+      const row = await stored({
+        id: 'judge-plain',
+        name: 'Plain',
+        systemPrompt: 'Rate 1-5.',
+        llmModel: 'gemini-3.5-flash',
+        sampleRate: 0,
+        createdAt: '2026-01-01T00:00:00Z',
+        updatedAt: '2026-01-01T00:00:00Z',
+      });
+      expect(row).not.toHaveProperty('promptVersion');
+    });
+
+    it('is not written for a shadow judge without a system prompt', async () => {
+      const row = await stored(shadowJudge({ systemPrompt: '' }));
+      expect(row.shadow).toBe(true);
+      expect(row).not.toHaveProperty('promptVersion');
+    });
   });
 });
 

@@ -213,6 +213,33 @@ describe("searchProspectsPreview", () => {
     }
   });
 
+  it("maps an infrastructure rejection to search_unavailable without leaking the raw message (ENG-2205)", async () => {
+    // handleError always throws (Promise<never>); a credential-fetch or gateway failure
+    // is the real production shape. The route turns search_unavailable into a friendly 503.
+    linkedInOutreachService.resolveAccountId.mockResolvedValue("acct-1");
+    getAccountsByUserId.mockResolvedValue([]);
+    for (const err of [
+      new Error("Failed to fetch Unipile credentials from Secrets Manager"),
+      new Error("<html><head><title>502 Bad Gateway</title></head></html>"),
+    ]) {
+      linkedInOutreachService.searchPeople.mockRejectedValueOnce(err);
+      const r = await searchProspectsPreview("user-1", { icp: "Founders", specifications: "B2B SaaS" });
+      expect(r).toEqual({ ok: false, error: "search_unavailable" });
+    }
+  });
+
+  it("keeps unipile_error (with its message) for a non-infrastructure rejection (ENG-2205)", async () => {
+    linkedInOutreachService.resolveAccountId.mockResolvedValue("acct-1");
+    getAccountsByUserId.mockResolvedValue([]);
+    linkedInOutreachService.searchPeople.mockRejectedValue(new Error("Unipile rate limited"));
+    const r = await searchProspectsPreview("user-1", { icp: "Founders", specifications: "B2B SaaS" });
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error).toBe("unipile_error");
+      expect(r.message).toContain("rate limited");
+    }
+  });
+
   it("returns mapped items + linkedinConnected=true when user has unipile account", async () => {
     linkedInOutreachService.resolveAccountId.mockResolvedValue("acct-1");
     getAccountsByUserId.mockResolvedValue([

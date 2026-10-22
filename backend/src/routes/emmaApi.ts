@@ -8,8 +8,34 @@ import { Router, Request, Response } from 'express';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { requireEmmaTokenBudget } from '../middleware/emmaTokenBudget';
 import { chatbotDb } from '../services/chatbotService';
-import { publishRevalidationForForwardedRun } from '../utils/scheduledPublishConsentGuard';
+import { publishRevalidationForForwardedRun, publishWithdrawnMidFlight, SCHEDULED_SESSION_HEADER } from '../utils/scheduledPublishConsentGuard';
 import { getMetaAdsMetricsArgsSchema } from '../utils/metaCampaignIds';
+import { assertModelInOwnerPlan } from '../services/agentMode/modelAccessInstance';
+import { buildModelUnavailableBody, isModelUnavailableError, ModelUnavailableError } from '../services/agentMode/modelUnavailable';
+import { isAgentWebModelId } from '../services/agentMode/agentWebModelRouter';
+
+/**
+ * ENG-669: a model named in the request body runs on the caller's account, so it must be in the caller's plan (the
+ * tier model allowlist; switch off => no read). Answers the shared 422 and returns false when refused.
+ */
+async function modelInCallerPlan(req: Request, res: Response, rawModel: unknown): Promise<boolean> {
+  if (typeof rawModel !== 'string' || !rawModel.trim()) return true;
+  // ENG-669 PR-C: these routes call one model directly (no resolver, no router), so the AgentWeb Model can never run
+  // here; refused visibly (with the switch on or off) instead of silently running a default model.
+  if (isAgentWebModelId(rawModel)) {
+    res.status(422).json(buildModelUnavailableBody(new ModelUnavailableError(rawModel.trim(), 'not_selectable')));
+    return false;
+  }
+  try {
+    await assertModelInOwnerPlan({ ownerUserId: userId(req), model: rawModel });
+    return true;
+  } catch (error) {
+    if (!isModelUnavailableError(error)) throw error;
+    const svc = await getAgentModeService();
+    res.status(422).json(buildModelUnavailableBody(error, svc.getModelDisplayName?.(error.requestedModel)));
+    return false;
+  }
+}
 
 const router = Router();
 
@@ -32,6 +58,43 @@ async function getAgentModeService() {
 
 function userId(req: Request): string {
   return (req as AuthenticatedRequest).user.userId;
+}
+
+/**
+ * Session-access gate for routes that act on a chat session named by `session_id` in the body.
+ *
+ * These routes are thin delegates to agentModeService, whose implementations load the session by
+ * id and read or write it (work plan, review metadata, transcript, cost) without knowing who is
+ * asking. The rule is the one agentModeController.getSession / generateResponse apply to the same
+ * sessions: the owner, or an admin. Delegate (support) tokens resolve `req.user` to the TARGET
+ * account in middleware/auth.ts, so a delegate passes on exactly the chats it can open and run.
+ *
+ * A missing session and a session the caller may not access both answer 404, so the response
+ * never confirms that another account's session id exists. Reads the session record only
+ * (getChatSessionRecord), never the message table, so a refused caller triggers no transcript read.
+ *
+ * `required`: the route cannot do anything without a session (400 when absent). Otherwise an
+ * absent/empty session_id keeps the route's existing no-session behaviour (MCP self-calls send none).
+ * Returns false when it has already answered the request.
+ */
+async function sessionAccessAllowed(req: Request, res: Response, sessionId: unknown, required: boolean): Promise<boolean> {
+  if (sessionId === undefined || sessionId === null || sessionId === '') {
+    if (!required) return true;
+    res.status(400).json({ message: 'session_id is required' });
+    return false;
+  }
+  if (typeof sessionId !== 'string') {
+    res.status(400).json({ message: 'session_id must be a string' });
+    return false;
+  }
+  const user = (req as AuthenticatedRequest).user;
+  // Strongly consistent: a session created just before this call must not read as missing (false 404).
+  const session = await chatbotDb.getChatSessionRecord(sessionId, true);
+  if (!session || (session.userId !== user.userId && !user.isAdmin)) {
+    res.status(404).json({ message: 'Session not found' });
+    return false;
+  }
+  return true;
 }
 
 // ─── Search & Research ──────────────────────────────────────────────────────
@@ -176,6 +239,7 @@ router.post('/generate-image', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
     const { prompt, filename, size, quality, input_images, session_id, image_model, logo_image, category } = req.body;
+    if (!(await sessionAccessAllowed(req, res, session_id, false))) return;
     const result = await svc.generateImage(
       prompt, filename, size || '1024x1024', quality || 'medium',
       input_images || [], userId(req), session_id || '',
@@ -191,6 +255,7 @@ router.post('/generate-video', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
     const { prompt, filename, session_id, video_model, start_frame, end_frame } = req.body;
+    if (!(await sessionAccessAllowed(req, res, session_id, false))) return;
     const result = await svc.generateVideo(prompt, filename, userId(req), session_id, video_model, start_frame, end_frame);
     res.json(result);
   } catch (err: any) {
@@ -202,6 +267,7 @@ router.post('/describe-media', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
     const { type, url, prompt, llm_model, return_transcript, return_scenes, start_time, end_time, session_id } = req.body;
+    if (type !== 'video' && !(await modelInCallerPlan(req, res, llm_model))) return;
     let result;
     if (type === 'video') {
       // ENG-1961: carry the session too, so analysis run through this API is
@@ -339,11 +405,57 @@ router.post('/post-on-account', async (req: Request, res: Response) => {
     const toolContext = buildScheduledPublishContext(req);
     const result = await svc.postOnConnectedAccount(
       userId(req), req.body.account_id, req.body.content, req.body.media_urls || [],
-      undefined, toolContext
+      undefined, toolContext,
+      req.body.save_as_draft === true || req.body.in_reply_to_post_id
+        ? { ...(req.body.save_as_draft === true ? { saveAsDraft: true } : {}), ...(typeof req.body.in_reply_to_post_id === 'string' && req.body.in_reply_to_post_id ? { inReplyToPostId: req.body.in_reply_to_post_id } : {}) }
+        : undefined
     );
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ message: err.message });
+  }
+});
+
+// ENG-1005: authenticated, metered counterparts of the internal blog tools.
+// Keep the existing service behavior and carry scheduled consent to the CMS write.
+router.post('/create-blog-article', async (req: Request, res: Response) => {
+  try {
+    const args = req.body;
+    if (![args.title_draft, args.content_draft].every(value => typeof value === 'string' && value.trim())) {
+      return res.status(400).json({ message: 'title_draft and content_draft are required.' });
+    }
+    const svc = await getAgentModeService();
+    const result = await svc.createBlogArticle(
+      args.title_draft, args.content_draft, args.length || 'medium',
+      args.researchContext || '', args.requirements || '',
+      userId(req), req.header(SCHEDULED_SESSION_HEADER) || '',
+      args.style || 'default', args.deep_research === true
+    );
+    return res.json(result);
+  } catch (err: any) {
+    return res.status(500).json({ message: err.message });
+  }
+});
+
+router.post('/publish-blog-article', async (req: Request, res: Response) => {
+  try {
+    const args = req.body;
+    if (![args.title, args.description, args.hero_image_url, args.blog_html_url].every(value => typeof value === 'string' && value.trim())) {
+      return res.status(400).json({ message: 'title, description, hero_image_url, and blog_html_url are required.' });
+    }
+    const status = args.status ?? 'draft';
+    if (status !== 'draft' && status !== 'published') return res.status(400).json({ message: 'status must be draft or published.' });
+    const publishContext = status === 'published' ? publishRevalidationForForwardedRun(req, 'publish_blog_article') : undefined;
+    const withdrawn = await publishWithdrawnMidFlight(publishContext);
+    if (withdrawn) return res.json(withdrawn);
+    const svc = await getAgentModeService();
+    return res.json(await svc.publishBlogArticle(
+      args.title, args.description, args.hero_image_url, args.blog_html_url,
+      userId(req), req.header(SCHEDULED_SESSION_HEADER) || '',
+      status, args.author, args.categories, publishContext?.assertPublishStillAuthorized
+    ));
+  } catch (err: any) {
+    return res.status(500).json({ message: err.message });
   }
 });
 
@@ -506,7 +618,7 @@ router.post('/data-analysis', async (req: Request, res: Response) => {
 router.post('/read-file', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
-    const result = await svc.readFileContent(req.body.file_url);
+    const result = await svc.readFileContent(req.body.file_url, { userId: userId(req) });
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ message: err.message });
@@ -520,7 +632,7 @@ router.post('/read-page', async (req: Request, res: Response) => {
       const result = await svc.extractCSSFromURL(req.body, userId(req));
       return res.json(result);
     }
-    const result = await svc.readFileContent(req.body.url);
+    const result = await svc.readFileContent(req.body.url, { userId: userId(req) });
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ message: err.message });
@@ -541,6 +653,7 @@ router.post('/save-file', async (req: Request, res: Response) => {
 
 router.post('/create-html', async (req: Request, res: Response) => {
   try {
+    if (!(await sessionAccessAllowed(req, res, req.body.session_id, false))) return;
     const svc = await getAgentModeService();
     const result = await svc.createHtmlFile(
       req.body.title, req.body.content_draft,
@@ -565,6 +678,7 @@ router.get('/html-templates', async (req: Request, res: Response) => {
 
 router.post('/create-html-from-template', async (req: Request, res: Response) => {
   try {
+    if (!(await modelInCallerPlan(req, res, req.body.llm_model))) return;
     const svc = await getAgentModeService();
     const result = await svc.createHtmlFromTemplate(
       req.body.llm_model, req.body.template_id,
@@ -579,6 +693,7 @@ router.post('/create-html-from-template', async (req: Request, res: Response) =>
 
 router.post('/create-html-template', async (req: Request, res: Response) => {
   try {
+    if (!(await sessionAccessAllowed(req, res, req.body.session_id, false))) return;
     const svc = await getAgentModeService();
     const result = await svc.createHtmlTemplate(
       req.body.html_source, req.body.template_id,
@@ -705,6 +820,7 @@ router.post('/books/:bookId/characters', async (req: Request, res: Response) => 
 
 router.post('/work-plans', async (req: Request, res: Response) => {
   try {
+    if (!(await sessionAccessAllowed(req, res, req.body.session_id, true))) return;
     const svc = await getAgentModeService();
     const result = await svc.createWorkPlan(req.body.title, req.body.steps, req.body.session_id);
     res.json(result);
@@ -715,6 +831,7 @@ router.post('/work-plans', async (req: Request, res: Response) => {
 
 router.put('/work-plans', async (req: Request, res: Response) => {
   try {
+    if (!(await sessionAccessAllowed(req, res, req.body.session_id, true))) return;
     const svc = await getAgentModeService();
     const result = await svc.modifyWorkPlan(req.body.steps, req.body.remove_step_counts || [], req.body.session_id);
     res.json(result);
@@ -725,6 +842,7 @@ router.put('/work-plans', async (req: Request, res: Response) => {
 
 router.patch('/work-plans/status', async (req: Request, res: Response) => {
   try {
+    if (!(await sessionAccessAllowed(req, res, req.body.session_id, true))) return;
     const svc = await getAgentModeService();
     const result = await svc.setWorkPlanStatus(req.body.updates, req.body.session_id);
     res.json(result);
@@ -737,6 +855,7 @@ router.patch('/work-plans/status', async (req: Request, res: Response) => {
 
 router.post('/send-for-review', async (req: Request, res: Response) => {
   try {
+    if (!(await sessionAccessAllowed(req, res, req.body.session_id, true))) return;
     const svc = await getAgentModeService();
     const result = await svc.sendForReview(
       req.body.subject, req.body.session_id || '',
@@ -764,6 +883,7 @@ router.post('/task-from-template', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
     const { template_id, parameters_json, session_id, attach_previous_task_results, attached_file_urls } = req.body;
+    if (!(await sessionAccessAllowed(req, res, session_id, false))) return;
     const result = await svc.createTaskFromTemplate(
       template_id, parameters_json, userId(req), session_id || '',
       attach_previous_task_results, attached_file_urls || [], req.body.async ?? false
@@ -778,6 +898,7 @@ router.post('/task-from-prompt', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
     const { task_name, prompt, category, session_id, attach_previous_task_results, attached_file_urls } = req.body;
+    if (!(await sessionAccessAllowed(req, res, session_id, false))) return;
     const result = await svc.createTaskFromPrompt(
       task_name, prompt, category, userId(req), session_id || '',
       attach_previous_task_results, attached_file_urls || [], req.body.async ?? false
@@ -792,6 +913,7 @@ router.post('/image-task-from-prompt', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
     const { task_name, prompt, category, session_id, attach_previous_task_results } = req.body;
+    if (!(await sessionAccessAllowed(req, res, session_id, false))) return;
     const result = await svc.createImageTaskFromPrompt(
       task_name, prompt, category, userId(req), session_id || '',
       attach_previous_task_results

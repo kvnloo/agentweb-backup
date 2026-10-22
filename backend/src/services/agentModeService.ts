@@ -1,4 +1,6 @@
 import { metaWriteRateShaper, META_BUDGET_THROTTLE_SUBCODE } from './agentMode/metaWriteRateShaper';
+import { normalizeSkillIdArg } from './agentMode/skillIdArg';
+import { applyProviderPolicy, CompareProviderPolicy } from './agentMode/compareProviderPolicy';
 import { classifyMetaBudgetChange } from './agentMode/metaBudgetAnomaly';
 import { deriveDominanceLegacyIds } from './agentMode/modelSupersession';
 import { budgetVerdictFields, hasBudgetField, verifyMetaBudget, type BudgetVerifyOptions } from './agentMode/metaBudgetReadBack';
@@ -40,8 +42,10 @@ import {
   buildImageSwapNotReflected, judgeImageSwap, readCreativeImage, selectSwapImageHash,
   type CreativeImageReadback, type ImageSwapExpectation, type ImageSwapVerdict,
 } from './agentMode/metaImageSwapCheck';
+import { buildUnappliedFieldsMessage, findUnappliedCreativeFields } from './agentMode/metaCreativeFieldsCheck';
 import { readAdmittedAuthorization } from '../utils/scheduledPublishConsentGuard';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
+import { createCrmEvidenceCollector, crmEvidenceFromEarlierInvocations, crmNumbersFromSessionHistory, runCrmFreshnessShadow, serializeCrmEvidence } from '../utils/crmFreshnessGuard';
 import {
   evaluateTurnTimeBudget,
   buildTurnTimeBudgetNudge,
@@ -50,7 +54,7 @@ import {
 import { isBookkeepingTool, reconcileFalseFailureReport } from '../utils/falseFailureReport';
 import { ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import { computeTermination } from './agentMode/core/agentStep';
-import { ANTI_LOOP_STOP_MESSAGE } from './agentMode/core/termination';
+import { ANTI_LOOP_STOP_MESSAGE, EMPTY_FINAL_RESPONSE_FALLBACK } from './agentMode/core/termination';
 import { sanitizeGeminiSchema } from './agentMode/core/geminiNativeClient';
 import {
   normalizeOpenRouterResponseMetadata,
@@ -68,6 +72,7 @@ import {
   type LLMModelConfig,
   type ModelProvider,
   type ModelTier,
+  LEGACY_MODEL_ALIASES,
 } from './agentMode/llmModelRegistry';
 import {
   isMalformedOpenRouterResponseError,
@@ -76,14 +81,15 @@ import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActions
 // ENG-2103 (F2 design-decision-list follow-up, Pattern A): agentMode/brandLogo's
 // 4 exports and agentMode/dataFabricationGuard's 5 exports were used only by
 // generateImage, which moved to emma/impl/mediaVideo.ts (imports them there directly).
-import { executePreparedTools, mediaGenProducedAsset, seedMediaCallKeysFromHistory, seedSearchCallCountFromHistory } from './agentMode/core/toolDispatch';
-import { computeCheckpointBatch } from './agentMode/incrementalPersist';
+import { executePreparedTools, mediaGenProducedAsset, seedMediaCallKeysFromHistory, seedSearchCallCountFromHistory, type ToolDispatchPorts } from './agentMode/core/toolDispatch';
+import { computeCheckpointBatch, isPersistedResponseMessage } from './agentMode/incrementalPersist';
 import { recoverLeadFromWrongList } from './agentMode/leadRecovery';
-import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
-import { reconcileUnconsumedCursors } from './agentMode/core/unconsumedCursor';
+import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, buildFinalizeJudgePrompt, parseFinalizeJudgeOutput, FINALIZE_JUDGE_MAX_COMPLETION_TOKENS } from './agentMode/core/finalizeGuard';
+import { reconcileUnconsumedCursors, ROW_KEYS as LEDGER_ROW_KEYS } from './agentMode/core/unconsumedCursor';
 import { reconcileModelReassessAck, findLastAssistantModel } from '../utils/modelReassessRequest';
 import { reconcileModelMentionAck, buildModelMentionIndex, type ModelMentionIndex } from '../utils/modelMentionRequest';
 import { resolveTurnModelCorrection } from '../utils/modelCorrectionStamp';
+import type { MessageModelRouting } from './agentMode/agentWebModelRouter';
 import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
 // ENG-2103 (F2, Pattern A): resolveOrgProfileField's only 5 callers
 // (readBrandGuidelines/readMarketStrategy and friends) moved to
@@ -134,6 +140,7 @@ import { startWorkflow, advanceIndependentWorkflow, type AdvanceIndependentOutco
 // dependency back on this file (verified), so this is a one-directional
 // import, not a cycle.
 import { approvalInboxService, type ApprovalDecision, type ApprovalDecisionApprover } from './approvalInboxService';
+import { getDefaultApproverForGate } from './approverDirectory';
 // Review fix: the manifest executor below needs the same active-resume
 // primitive approvalInboxExecution.ts already built for the per-decision
 // path — resumeOriginSession is exported from there specifically so this
@@ -167,7 +174,8 @@ import { meterUserUsage } from './usageRecorderService';
 import { meterUsageFromResponse } from '../utils/llmClients';
 import { pickTransport } from './funding/transport';
 import { currentRunFunding } from './funding/runFunding';
-import { recordLlmUsage } from './funding/recordLlmUsage';
+import { recordLlmUsage, customerUpstreamCost } from './funding/recordLlmUsage';
+import { resolveCallFunding, customerKeyBlocksTurn } from './funding/callFunding';
 import {
   getModelPrice,
   costScoreFromPrice,
@@ -263,6 +271,8 @@ import * as linkedinImpl from '../emma/impl/linkedin';
 import * as twitterImpl from '../emma/impl/twitter';
 // ENG-2103 (F2): Meta/LinkedIn ads APIs tool cluster, same treatment as leadsImpl above.
 import * as adsApisImpl from '../emma/impl/adsApis';
+import { buildToolkitObjectiveGate, readBackMetaNode } from './agentMode/metaToolkitSeams';
+import { PAUSED_BUNDLE_ACTION, PausedMetaBundle, parsePausedMetaBundle, pausedBundleSummary, executePausedMetaBundle, assertPausedBundleUserCount, preflightPausedMetaCreatives } from './agentMode/metaPausedBundle';
 // ENG-2103 (F2): Google Ads + HubSpot/Attio CRM passthrough tool cluster,
 // same treatment as leadsImpl above.
 import * as adsCrmApisImpl from '../emma/impl/adsCrmApis';
@@ -330,6 +340,7 @@ const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
  * files, not decoration — change it in both or in neither.
  */
 export const SKILL_UNRESOLVED_MARKER = "Could not resolve these skill IDs to any known skill";
+
 /*
  * The skill exists and the account is entitled to it, but nothing is installable behind it
  * right now — in practice an `__other_skills__` bundle whose unassociated-tool pool is empty.
@@ -356,11 +367,11 @@ const SKILL_NO_SUBSTITUTION =
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
 // mutation tool remains manage_predefined_work_plan.
-export const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'get_session_transcript', 'get_user_by_id', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
+export const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_user_funnel_status', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'get_session_transcript', 'get_user_by_id', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
-const MAX_TOOL_CONTENT_SIZE = 300_000;
+export const MAX_TOOL_CONTENT_SIZE = 300_000;
 
 // Floor above which trimToolMessagesForContext compresses an OLD tool result down to a
 // 200-char preview (per-tool allowances in LARGE_TOOL_RESULT_LIMIT may raise it, never lower it).
@@ -520,7 +531,8 @@ import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } fro
 import { assertPublicHostname } from '../utils/ssrfGuard';
 import { getJwtSecret } from '../config/jwt';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString } from '../utils/s3Utils';
-import { isTransientLLMError, extractAffordableTokens } from '../utils/agentModeErrors';
+import { isTransientLLMError, isProviderDeserializationError, extractAffordableTokens, PROVIDER_UNAVAILABLE_USER_MESSAGE } from '../utils/agentModeErrors';
+import { isLLMProviderOutage } from './agentMode/providerOutage';
 import { getAgentRunRecorder } from '../loops/instances/agent-mode';
 import { computeRunVerdict, type RunTerminalInfo } from '../loops/instances/agent-mode/runRecorder';
 // OTel spine (ENG-141) — inert no-ops unless exporter env config is present.
@@ -576,6 +588,7 @@ type ApprovalDeckExecutionSummary = {
     stepId: string;
     status: 'verified' | 'failed';
     appliedObjectId?: string;
+    bundle?: { requested_ad_count: number; verified_ad_count: number; ledger: unknown[] };
     error?: string;
     mismatches?: Array<{ parameter: string; requested: unknown; applied: unknown }>;
   }>;
@@ -1012,6 +1025,8 @@ export interface SupportedModelInfo {
 const PROMPT_CACHE_DEFAULT_TTL_MS = 5 * 60 * 1000;
 
 interface LLMCallOptions {
+  /** ENG-2108: set only by the agent's own working loop; lets this call use a customer key. */
+  customerRoutable?: boolean;
   tools?: any[] | null;
   tool_choice?: 'auto' | 'none' | any | null;
   /** Execute search through OpenRouter's provider-independent server tool. */
@@ -1045,6 +1060,11 @@ interface LLMCallOptions {
   timeoutMs?: number;
   /** Ordered logical model fallbacks executed by OpenRouter, never by AgentWeb. */
   fallbackModels?: string[];
+  /**
+   * ENG-55: Compare-only OpenRouter provider policy (`data_collection: 'deny'`), merged into
+   * `provider` next to the shared order/fallback preferences. Normal chat never sets it.
+   */
+  providerPolicy?: CompareProviderPolicy | null;
 }
 
 function nonNegativeTokenCount(value: unknown): number {
@@ -1115,24 +1135,6 @@ const FINALIZE_GUARD_JUDGE_MODEL = DIAGNOSIS_MODEL;
 // readFileContent, moved in the same cluster (describeVideo, cluster 21,
 // already carries its own separately-duplicated copy of IMAGE_EXTENSIONS).
 
-// Legacy model ids persisted by sessions/schedules created before a model was
-// renamed or fully retired. Maps the old id to its current registry key so old
-// sessions/schedules keep working instead of throwing "Invalid model". Opus 4.8
-// was renamed from the bare Vertex id "claude-opus-4-8" to the Bedrock id
-// "anthropic.claude-opus-4-8" in commit c86c8ec1. gpt-5-chat-2 and gpt-5.2-chat
-// were removed from the registry 2026-08-19 (Azure deployment retired/deprecated
-// during the migration off the Rui-owned Azure resource — see the registry
-// comment above the gpt-5.4 entry) and redirected to gpt-5.5, the current
-// non-legacy top of the same gpt5-chat family.
-const LEGACY_MODEL_ALIASES: Record<string, string> = {
-  'claude-opus-4-8': 'anthropic.claude-opus-4-8',
-  'gpt-5-chat-2': 'gpt-5.5',
-  'gpt-5.2-chat': 'gpt-5.5',
-  'gemini-2.5-flash': 'gemini-3.1-flash-lite',
-  // ENG-2178: schedules created before the OpenRouter migration pin the bare
-  // "gpt-4o-mini" id; the same model is now served via OpenRouter.
-  'gpt-4o-mini': 'openrouter/openai/gpt-4o-mini',
-};
 
 // Context passed to the diagnosis agent when the main agent fails
 export interface DiagnosisContext {
@@ -1224,6 +1226,16 @@ async function recordToolReliabilityEvent(params: {
   } catch (reliabilityErr) {
     console.warn('[AgentMode] H-LEARN reliability record skipped (non-fatal):', reliabilityErr);
   }
+}
+
+/** A plain title cut from the user's first message: no AI call, so nothing for AgentWeb to pay. */
+export function titleFromUserMessage(message: string): string {
+  const flat = message.replace(/[`*_#>\[\]{}"]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!flat) return 'Marketing Task';
+  if (flat.length <= 60) return flat;
+  const cut = flat.slice(0, 60);
+  const lastSpace = cut.lastIndexOf(' ');
+  return (lastSpace > 24 ? cut.slice(0, lastSpace) : cut).trim();
 }
 
 export class AgentModeService {
@@ -1725,6 +1737,7 @@ export class AgentModeService {
         await import('../mcp/server/evaluationTools');
         await import('../emma/tools');
         await import('../emma/fathomTools');
+        await import('../emma/lumaTools');
         await import('../emma/meetingActionRouter');
         await import('../emma/notionGuideTools');
         await import('../emma/slackMessageTools');
@@ -1732,6 +1745,7 @@ export class AgentModeService {
         await import('../emma/testAccountTools');
         await import('../emma/navigateTools');
         await import('../emma/connectAccountTool');
+        await import('../emma/linkedInAccountRevokeTools');
         await import('../emma/solveRecaptchaTool');
         await import('../emma/siteSigninTools');
         await import('../emma/verificationCodeTool');
@@ -2021,11 +2035,34 @@ export class AgentModeService {
     return null;
   }
 
+  /** Bad configured-default values already warned about (once per process each). */
+  private warnedUnusableDefaults = new Set<string>();
+
+  /** Selectable by a non-admin through the picker: served, not internalOnly/adminOnly/live. */
+  private isPubliclySelectable(modelId: string): boolean {
+    const config = this.llmModels[modelId];
+    return Boolean(config) && !config.internalOnly && !config.adminOnly && !config.isLive;
+  }
+
   async getDefaultModel(): Promise<string> {
-    return (
-      (await this.resolveConfiguredModel(this.defaultModelSettingName, 'default')) ??
-      this.default_model
-    );
+    const configured = await this.resolveConfiguredModel(this.defaultModelSettingName, 'default');
+    if (!configured) return this.default_model;
+    // The default stands in for every user, so it must be one the picker offers a
+    // non-admin (the same rules getSupportedModels(false) applies). Otherwise the
+    // usage policy rejects it ("system default model is not supported") and a turn
+    // with no stored/request model fails. Fall back to the code constant -- but only
+    // when that constant is itself usable; otherwise keep the existing behaviour.
+    if (!this.isPubliclySelectable(configured) && this.isPubliclySelectable(this.default_model)) {
+      if (!this.warnedUnusableDefaults.has(configured)) {
+        this.warnedUnusableDefaults.add(configured);
+        console.warn(
+          `AgentMode: ${this.defaultModelSettingName} "${configured}" is internal-only, admin-only, or a live-voice model ` +
+            `and cannot serve users; using "${this.default_model}" instead. Fix the AW-Settings row.`
+        );
+      }
+      return this.default_model;
+    }
+    return configured;
   }
 
   async getReportsModel(): Promise<string> {
@@ -2106,53 +2143,23 @@ export class AgentModeService {
   // directly. No test spies on it directly.
 
   async getVideoGenerationDefaultModel(): Promise<string> {
-    try {
-      const setting = await settingsService.getSetting(this.videoGenerationDefaultModelSettingName);
-      const configuredModel = setting?.settingValue?.trim();
-      if (configuredModel) {
-        if (this.llmModels[configuredModel]) {
-          return configuredModel;
-        }
-        console.warn(`AgentMode: Unsupported video generation default model "${configuredModel}" in settings; using fallback.`);
-      }
-    } catch (error) {
-      console.error('AgentMode: Error getting video generation default model setting:', error);
-    }
+    const configured = await this.resolveConfiguredModel(this.videoGenerationDefaultModelSettingName, 'video generation default');
+    if (configured) return configured;
     // Fall back to the general default model
     return this.getDefaultModel();
   }
 
   async getCustomerSupportDefaultModel(): Promise<string> {
-    try {
-      const setting = await settingsService.getSetting(this.customerSupportDefaultModelSettingName);
-      const configuredModel = setting?.settingValue?.trim();
-      if (configuredModel) {
-        if (this.llmModels[configuredModel]) {
-          return configuredModel;
-        }
-        console.warn(`AgentMode: Unsupported customer support default model "${configuredModel}" in settings; using fallback.`);
-      }
-    } catch (error) {
-      console.error('AgentMode: Error getting customer support default model setting:', error);
-    }
+    const configured = await this.resolveConfiguredModel(this.customerSupportDefaultModelSettingName, 'customer support default');
+    if (configured) return configured;
     // Fall back to the general default model
     return this.getDefaultModel();
   }
 
   async getCodingAgentDefaultModel(): Promise<string> {
     const fallbackModel = 'anthropic.claude-sonnet-4-6';
-    try {
-      const setting = await settingsService.getSetting(this.codingAgentDefaultModelSettingName);
-      const configuredModel = setting?.settingValue?.trim();
-      if (configuredModel) {
-        if (this.llmModels[configuredModel]) {
-          return configuredModel;
-        }
-        console.warn(`AgentMode: Unsupported coding agent default model "${configuredModel}" in settings; using fallback.`);
-      }
-    } catch (error) {
-      console.error('AgentMode: Error getting coding agent default model setting:', error);
-    }
+    const configured = await this.resolveConfiguredModel(this.codingAgentDefaultModelSettingName, 'coding agent default');
+    if (configured) return configured;
     // Fall back to Sonnet 4.6
     return fallbackModel;
   }
@@ -2165,18 +2172,8 @@ export class AgentModeService {
    */
   async getVisionModel(): Promise<string> {
     const fallbackModel = this.llmModels['anthropic.claude-opus-4-8'] ? 'anthropic.claude-opus-4-8' : this.default_model;
-    try {
-      const setting = await settingsService.getSetting(this.visionModelSettingName);
-      const configuredModel = setting?.settingValue?.trim();
-      if (configuredModel) {
-        if (this.llmModels[configuredModel]) {
-          return configuredModel;
-        }
-        console.warn(`AgentMode: Unsupported vision model "${configuredModel}" in settings; using fallback.`);
-      }
-    } catch (error) {
-      console.error('AgentMode: Error getting vision model setting:', error);
-    }
+    const configured = await this.resolveConfiguredModel(this.visionModelSettingName, 'vision');
+    if (configured) return configured;
     return fallbackModel;
   }
 
@@ -2193,8 +2190,6 @@ export class AgentModeService {
 
   private openrouter_client: OpenAI | null = null;
   private openrouter_client_promise: Promise<OpenAI> | null = null;
-  private vertex_client: any | null = null;
-  private vertex_client_promise: Promise<any> | null = null;
 
   // OpenRouter is an OpenAI-compatible endpoint. HTTP-Referer/X-Title identify
   // the app for OpenRouter's own analytics
@@ -2248,47 +2243,6 @@ export class AgentModeService {
     return this.openrouter_client_promise;
   }
 
-  /** Convert OpenAI-format content into Anthropic-native content blocks. */
-  private static convertContentToAnthropicBlocks(content: any): any[] {
-    if (content === null || content === undefined) return [{ type: 'text', text: '' }];
-    if (typeof content === 'string') return [{ type: 'text', text: content }];
-    if (!Array.isArray(content)) return [{ type: 'text', text: String(content) }];
-
-    const validMediaTypes = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
-    const blocks: any[] = [];
-    for (const item of content) {
-      if (typeof item === 'string') {
-        blocks.push({ type: 'text', text: item });
-      } else if (!item || typeof item !== 'object') {
-        blocks.push({ type: 'text', text: String(item ?? '') });
-      } else if (item.type === 'text') {
-        blocks.push({ type: 'text', text: item.text || '' });
-      } else if (item.type === 'image_url') {
-        const url = item.image_url?.url || '';
-        if (url.startsWith('data:')) {
-          const match = url.match(/^data:(image\/[\w+.-]+)(?:;[^;]*)*;base64,(.+)$/s);
-          if (match) {
-            let mediaType = match[1].toLowerCase();
-            if (mediaType === 'image/jpg') mediaType = 'image/jpeg';
-            if (!validMediaTypes.has(mediaType)) mediaType = 'image/jpeg';
-            blocks.push({
-              type: 'image',
-              source: { type: 'base64', media_type: mediaType, data: match[2] },
-            });
-          } else {
-            console.warn(`AgentMode: Could not parse data URI for Anthropic image block, url prefix="${url.substring(0, 60)}"`);
-          }
-        } else if (url) {
-          blocks.push({ type: 'image', source: { type: 'url', url } });
-        }
-      } else if (item.type === 'image' || item.type === 'tool_result' || item.type === 'tool_use' || item.type === 'document') {
-        blocks.push(item);
-      } else {
-        blocks.push({ type: 'text', text: JSON.stringify(item) });
-      }
-    }
-    return blocks.length > 0 ? blocks : [{ type: 'text', text: '.' }];
-  }
 
   // ENG-1670: a scheduled run's own tool-calling loop can fire several Gemini
   // calls back-to-back within one turn (prod-verified: 4 calls in ~22s on the
@@ -2355,17 +2309,49 @@ export class AgentModeService {
   }
 
   /**
-   * Would the model picker accept this id for this user? Mirrors the two gates
-   * `agentModeController.updateSessionLlmModel` applies, in the same order: the
-   * supported-model allow-list, then the non-admin Opus restriction. Kept next
-   * to the registry it reads so the two cannot drift.
+   * Registry display name for a model id, or undefined when the id is not a
+   * registry key (own-property check, so 'constructor' etc. don't match).
+   * Used only to word the fail-loud model_unavailable message.
+   */
+  getModelDisplayName(modelId: string): string | undefined {
+    if (!modelId || !Object.prototype.hasOwnProperty.call(this.llmModels, modelId)) return undefined;
+    return this.llmModels[modelId].name;
+  }
+
+  /** True for a live-voice registry model (never valid for a text chat). Own-property check. */
+  isLiveModel(modelId: string): boolean {
+    return Boolean(modelId && Object.prototype.hasOwnProperty.call(this.llmModels, modelId) && this.llmModels[modelId].isLive);
+  }
+
+  /**
+   * Would the model picker accept this id for this user? The single source of
+   * truth for "can this user pick this model" — internal/live exclusion and the
+   * adminOnly gate. `updateSessionLlmModel`
+   * / `updateSharedSessionLlmModel` call this directly (ENG-2293: they used to
+   * re-derive a subset inline — just the opus check — which let a non-admin
+   * who named an adminOnly auto-added model by id bypass it) so the two cannot
+   * drift again.
    */
   isModelSelectableBy(modelId: string, isAdmin: boolean): boolean {
     const config = this.llmModels[modelId];
     if (!config || config.internalOnly || config.isLive) return false;
     if (config.adminOnly && !isAdmin) return false;
-    if (modelId.includes('opus') && !isAdmin) return false;
     return true;
+  }
+
+  /**
+   * ENG-55: registry facts the model-compare feature needs (display name, lab, live
+   * flag) without exposing the registry. Null for ids that are not registry keys.
+   */
+  getModelCompareInfo(modelId: string): { name: string; provider: string; isLive: boolean; internalOnly: boolean } | null {
+    if (!Object.prototype.hasOwnProperty.call(this.llmModels, modelId)) return null;
+    const config = this.llmModels[modelId];
+    return {
+      name: config.name ?? modelId,
+      provider: config.provider ?? 'other',
+      isLive: config.isLive === true,
+      internalOnly: config.internalOnly === true,
+    };
   }
 
   /**
@@ -2437,7 +2423,7 @@ export class AgentModeService {
   }
 
   async getReportsModelOptions(isAdmin: boolean = false): Promise<string[]> {
-    return Object.keys(this.llmModels).filter(m => m.startsWith('anthropic.') && (isAdmin || (!this.llmModels[m].adminOnly && !m.includes('opus'))));
+    return Object.keys(this.llmModels).filter(m => m.startsWith('anthropic.') && (isAdmin || !this.llmModels[m].adminOnly));
   }
   /**
    * Make an LLM call with the specified model and parameters
@@ -2536,9 +2522,30 @@ export class AgentModeService {
       usageContext = null,
       humanPaced = false,
       timeoutMs,
-      fallbackModels,
+      fallbackModels: requestedFallbackModels,
+      customerRoutable = false,
       taskClass,
+      providerPolicy,
     } = options || {};
+
+    // ENG-2108: the funding for THIS call. A run starts AgentWeb-funded; this call moves
+    // to a customer key only when they have a usable key for this model's provider.
+    // Both the transport and the usage record below use this, not the run's ambient value.
+    const callFunding = await resolveCallFunding(currentRunFunding(), {
+      userId: usageContext?.userId,
+      modelLab: this.llmModels[model].provider,
+      customerRoutable,
+    });
+    // On a customer key the request may only stay with the customer's provider, so a
+    // fallback model from another lab is dropped rather than left to fail (or bill AgentWeb).
+    const fallbackModels =
+      callFunding?.route === 'api_key'
+        ? requestedFallbackModels?.filter((id) => {
+            const fallback = this.llmModels[this.normalizeModelId(id)];
+            // An unknown id is kept so it is rejected below exactly as on an AgentWeb call.
+            return !fallback || fallback.provider === this.llmModels[model].provider;
+          })
+        : requestedFallbackModels;
 
     // AgentWeb owns model selection; OpenRouter owns transport, provider
     // throttling, and provider fallback for every text/tool call.
@@ -2577,6 +2584,9 @@ export class AgentModeService {
       // proposed the slug form once already and was reverted for this reason
       // — verify empirically against live traffic before changing this line.
       params.provider.ignore = ignoredProviders;
+    }
+    if (providerPolicy) {
+      params.provider = applyProviderPolicy(params.provider, providerPolicy);
     }
     // OpenRouter reports its own billed amount as zero for BYOK requests even
     // though the upstream provider still bills the inference. Request the
@@ -2700,7 +2710,10 @@ export class AgentModeService {
       // this covers OpenRouter's malformed/empty-response failure classes,
       // which are not a rate limit, network blip, or 5xx by
       // classifyToolErrorClass's general taxonomy.
-      return isMalformedOpenRouterResponseError(error);
+      // ENG-503: a truncated provider body the SDK could not deserialize is the
+      // same "response cut mid-stream" class — one in-call retry (bounded by
+      // maxAttempts, before anything from this call is persisted).
+      return isMalformedOpenRouterResponseError(error) || isProviderDeserializationError(error);
     };
 
     // A single 1.5s retry wasn't enough to clear a burst-triggered 429 — prod
@@ -2726,7 +2739,7 @@ export class AgentModeService {
     // ENG-1816 F1: send/validate/retry mechanics live in OpenRouterPlatformTransport
     // now (relocated unchanged, not rewritten — see transport/openRouterPlatformTransport.ts).
     // pickTransport always resolves this same transport today; A2 adds ApiKeyTransport.
-    const res = await pickTransport(currentRunFunding(), model).send(client, model, params, {
+    const res = await pickTransport(callFunding, model).send(client, model, params, {
       timeoutMs: timeoutMs ?? 5 * 60 * 1000,
       maxAttempts,
       isRetryableError: isRetryableLlmCallError,
@@ -2798,7 +2811,7 @@ export class AgentModeService {
       const usage: any = (res as any)?.usage;
       if (usage) {
         const normalizedUsage = normalizeCallUsageTokens(usage, providerLabel);
-        recordLlmUsage(currentRunFunding(), {
+        recordLlmUsage(callFunding, {
           userId: usageContext?.userId,
           billingUserId: usageContext?.billingUserId,
           sessionId: usageContext?.sessionId,
@@ -2811,6 +2824,10 @@ export class AgentModeService {
           cacheReadTokens: normalizedUsage.cacheReadTokens,
           cacheWriteTokens: normalizedUsage.cacheWriteTokens,
           cacheWriteByTtl: usage.cache_creation_by_ttl,
+          // ENG-2106: only on a BYOK response, and only for the customer-funded branch of
+          // recordLlmUsage (it strips this before any AgentWeb rail). Not costUsdOverride:
+          // on a non-BYOK response that is AgentWeb's own cost.
+          ...customerUpstreamCost(usage),
           costUsdOverride:
             usage.is_byok === true
               ? typeof usage.cost_details?.upstream_inference_cost === 'number' &&
@@ -3021,6 +3038,9 @@ export class AgentModeService {
     // false/undefined otherwise); every other caller of generateMarketingResponse
     // is an attended interactive path and leaves this undefined.
     isUnattendedRun?: boolean,
+    // ENG-669 PR-C: set when `llmModel` was routed by the AgentWeb Model (the selection, the table rule and version).
+    // Stamped on this turn's assistant messages beside `llm`, like the ENG-1205 correction.
+    modelRouting?: MessageModelRouting,
   ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; truncatedByStepBudget?: boolean; truncatedByTimeBudget?: boolean; persistedResponseCount?: number; workPlanTurnDisposition?: WorkPlanTurnDisposition; pendingApprovalDeck?: PendingApprovalDeck }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
@@ -3122,6 +3142,15 @@ export class AgentModeService {
         console.warn(`[AgentMode] User ${userId} not found for admin check (orphaned schedule or deleted user)`);
       }
 
+      // ENG-1978: getAllowedSkills returns null when the tier could not be read or recognised.
+      // The RAW value (possibly null) is what reaches getFilteredTools below, which fails closed
+      // on it — that is the actual gate. The skill-catalog/context helpers further down only need
+      // a list to filter a catalog against, and for them an unresolved entitlement should show
+      // nothing extra rather than everything, so they get [] instead. Keeping the two separate
+      // matters: collapsing null to [] here would silently downgrade the gate to "no skills, but
+      // still hand over every foundation tool."
+      const userAllowedSkillIdsForDisplay: string[] = userAllowedSkillIds ?? [];
+
       const isAdmin = currentUser?.isAdmin === true;
 
       // ENG-1205: the correction this turn was admitted under, stamped onto the
@@ -3150,12 +3179,13 @@ export class AgentModeService {
       const isLegacySession = rawAssociatedSkills === undefined || rawAssociatedSkills === null;
       let associatedSkills: any[] = [];
       const sessionAssociatedSkillIds: string[] = Array.isArray(rawAssociatedSkills) ? rawAssociatedSkills : [];
+      let liveInstalledSkillIds: string[] = sessionAssociatedSkillIds;
       if (sessionAssociatedSkillIds.length) {
         associatedSkills = await skillService.getSkillsByIds(sessionAssociatedSkillIds);
       }
 
       // Build initial skill context
-      let { allowedToolNames, installedSkillContextMsg } = this.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, sessionAssociatedSkillIds, hasAdminAccess);
+      let { allowedToolNames, installedSkillContextMsg } = this.buildSkillContext(associatedSkills, userAllowedSkillIdsForDisplay, publishedSkills, sessionAssociatedSkillIds, hasAdminAccess);
 
       // 3. Build Initial Messages
       let effectiveMessageContent = messageContent;
@@ -3170,7 +3200,7 @@ export class AgentModeService {
       const marketingMessages = this.buildMarketingContext(effectiveMessageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl, currentSession?.calledFunctions, currentSession?.declinedWorkPlanRecommendations, openResearchRequests);
 
       // Build the "Available Skills" message (excluding already-associated skills, filtered by subscription)
-      let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIds, hasAdminAccess);
+      let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIdsForDisplay, hasAdminAccess);
 
       const today = new Date().toISOString().split('T')[0];
       // ENG-803: resolve this scheduled run's publish authorization from the schedule
@@ -3459,6 +3489,12 @@ export class AgentModeService {
       let content = '';
       const toolCalls: any[] = [];
       _toolCallsForTelemetry = toolCalls;
+      // ENG-2263: numbers the CRM tools actually returned this turn (the ledger above stores minimised results).
+      const crmEvidence = createCrmEvidenceCollector();
+      // ENG-2263: CRM tools that ran in earlier invocations of the task this one continues (auto-continuation, an answered
+      // question/approval card, "continue" after a time-limit partial). Their numbers are unrecoverable, so the check abstains.
+      const crmEarlier = crmEvidenceFromEarlierInvocations(sessionHistory);
+      const crmSessionNumbers = crmNumbersFromSessionHistory(sessionHistory);
       const knowledgeBaseQueries: string[] = [];
       const sources: string[] = [];
       // ENG-351: accumulates the web sources this message consults across all its search
@@ -3515,6 +3551,8 @@ export class AgentModeService {
       const mediaBudgetMs = parseInt(process.env.AGENT_MODE_MEDIA_BUDGET_MS || '420000', 10);
       const mediaGenerationDeadlineMs = mediaBudgetMs > 0 ? Date.now() + mediaBudgetMs : undefined;
       let mediaAssetsProducedThisRun = 0;
+      // ENG-922: sticky per-run flag — see priorMediaBudgetDeferred in toolDispatch.
+      let mediaBudgetDeferredThisRun = false;
       // ENG-510: the fixed soft budget above assumed fast images and leaves only ~3 min
       // of headroom below the controller's 10-min whole-turn hard cap. A single slow
       // high-quality image can take ~6–7 min, so the next variant slips past the fixed
@@ -3642,6 +3680,7 @@ export class AgentModeService {
       let lastToolSignature = '';
       let consecutiveRepeats = 0;
       const MAX_CONSECUTIVE_REPEATS = 3;
+      let antiLoopRepeatNudged = false;
       // Sliding-window loop detection: catches alternating/cycling patterns like
       // navigate→screenshot→navigate→screenshot that evade the consecutive check
       const toolSignatureHistory: string[] = [];
@@ -3728,7 +3767,9 @@ export class AgentModeService {
           const urgency = remaining <= 3
             ? `[SYSTEM WARNING] Only ${remaining} step${remaining === 1 ? '' : 's'} remaining. Stop all searching/pagination immediately. Complete any pending writes, then give your final response with what you have so far.`
             : `[SYSTEM] Step budget: ${iteration}/${maxIterations} used, ${remaining} steps remaining. Prefer batch operations, avoid unnecessary pagination, and wrap up soon.`;
-          (messages as any[]).push({ role: 'user', content: urgency });
+          // Opslane 2026-10-13: in-turn control text is role 'system' (as ENG-763 did for
+          // the cross-turn loop-breaker) — as 'user' the model attributes it to the user.
+          (messages as any[]).push({ role: 'system', content: urgency });
         }
 
         // ENG-907: same self-regulation for the wall-clock budget. The first iteration is
@@ -3752,13 +3793,13 @@ export class AgentModeService {
               'no longer honouring tool calls and forcing a final synthesis so the work so far is delivered'
             );
             (messages as any[]).push({
-              role: 'user',
+              role: 'system',
               content: buildTurnTimeBudgetNudge(timeBudget, 'final_synthesis'),
             });
           } else if (timeBudget.phase === 'wrap_up' && !timeBudgetWrapUpWarned) {
             timeBudgetWrapUpWarned = true;
             (messages as any[]).push({
-              role: 'user',
+              role: 'system',
               content: buildTurnTimeBudgetNudge(timeBudget, 'wrap_up'),
             });
           }
@@ -3770,6 +3811,7 @@ export class AgentModeService {
             // Refresh session and skills
             currentSession = await chatbotDb.getChatSession(sessionId);
             const updatedAssociatedSkillIds = currentSession?.associatedSkills || [];
+            liveInstalledSkillIds = updatedAssociatedSkillIds;
 
             if (updatedAssociatedSkillIds.length) {
               associatedSkills = await skillService.getSkillsByIds(updatedAssociatedSkillIds);
@@ -3778,7 +3820,7 @@ export class AgentModeService {
             }
 
             // Re-build context using helper
-            const skillContext = this.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, updatedAssociatedSkillIds, hasAdminAccess);
+            const skillContext = this.buildSkillContext(associatedSkills, userAllowedSkillIdsForDisplay, publishedSkills, updatedAssociatedSkillIds, hasAdminAccess);
             // ENG-893: a skill install that ADDS tools changes `toolConfig`, and
             // Bedrock chains its cache checkpoints tools -> system -> messages —
             // so the whole cached prefix dies and the next call re-writes it in
@@ -3808,7 +3850,7 @@ export class AgentModeService {
             installedSkillContextMsg = skillContext.installedSkillContextMsg;
 
             // Rebuild available skills (excluding newly associated ones, filtered by subscription)
-            availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, updatedAssociatedSkillIds, userAllowedSkillIds, hasAdminAccess);
+            availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, updatedAssociatedSkillIds, userAllowedSkillIdsForDisplay, hasAdminAccess);
 
             // Update messages using helper — track length change to keep initialMessageCount accurate
             const preUpdateLen = messages.length;
@@ -4014,6 +4056,7 @@ export class AgentModeService {
             // Scheduled and interactive conversations canary independently;
             // OpenRouter owns provider fallback once either class is enabled.
             taskClass: chatTaskClass,
+            customerRoutable: true,
             // ENG-2121: bound this call to whatever remains before the synthesis
             // reserve (computed above) instead of letting it run unbounded — see the
             // catch block below for what happens when this actually fires.
@@ -4060,7 +4103,7 @@ export class AgentModeService {
               'forcing a final synthesis so the work done so far is delivered instead of a hard failure'
             );
             (messages as any[]).push({
-              role: 'user',
+              role: 'system',
               content: buildTurnTimeBudgetNudge(
                 evaluateTurnTimeBudget({
                   startedAtMs: turnStartedAtMs,
@@ -4181,6 +4224,8 @@ export class AgentModeService {
 
         // Add LLM model to the response message
         responseMessage.llm = llmModel;
+        // ENG-669 PR-C: and, when the AgentWeb Model chose it, the selection and why.
+        if (modelRouting) Object.assign(responseMessage, modelRouting);
         // ENG-1205: and, when the model that ran is not the one that was asked
         // for, what was asked for — `llm` alone cannot distinguish "you picked
         // this" from "you were given this".
@@ -4694,6 +4739,7 @@ export class AgentModeService {
           publishedSkillsCount: publishedSkills.length,
           sessionAssociatedSkillIdsCount: sessionAssociatedSkillIds.length,
           allowedToolNames,
+          describeGateRefusal: (toolName: string) => this.describeToolGateRefusal(toolName, publishedSkills, liveInstalledSkillIds, userAllowedSkillIds),
           toolResponseS3Threshold: TOOL_RESPONSE_S3_THRESHOLD,
           maxToolContentSize: MAX_TOOL_CONTENT_SIZE,
           mediaGenerationDeadlineMs,
@@ -4704,37 +4750,17 @@ export class AgentModeService {
           priorMediaCallKeys: mediaCallKeysThisRun,
           approvedRevisionImageSources,
           priorSearchCallCount: searchCallCountThisRun,
-          ports: {
-            evaluateAgentToolPolicy,
-            validateAndRepairToolArgs,
-            getToolInputSchema: (toolName: string) => {
-              const toolDefinition = this.toolRegistry.getTool(toolName)?.definition;
-              return toolDefinition?.function?.parameters || toolDefinition?.inputSchema;
-            },
-            executeAgentToolThroughGateway,
-            executePreparedAgentTool: (toolInput: any) => this.executePreparedAgentTool(toolInput),
-            toolResultError,
-            // ENG-105: validate tool output against the minimum-output contract so
-            // an empty/undefined/invalid "success" becomes a structured tool
-            // failure (errorClass invalid_output) instead of feeding garbage to
-            // the model and counting as success.
-            validateToolOutput: (result: any) => validateToolOutputContract(result, extractToolContent),
-            recordToolTelemetry: (telemetryToolResults) =>
-              recordAgentModeToolTelemetry(agentRuntimeRunId, sessionId, iteration, telemetryToolResults as any, {
-                mediaAssetsProducedThisRun,
-                mediaGenerationDeadlineMs,
-              }, userId),
-            recordDuplicateSuppression: (entries) =>
-              recordAgentModeDuplicateSuppression(agentRuntimeRunId, sessionId, iteration, entries),
-            extractMinimalToolResult: (result: any, toolName: string) => this.extractMinimalToolResult(result, toolName),
-            extractToolContent,
-            formatToolError: (toolName: string, errorMessage: string) => this.formatToolError(toolName, errorMessage),
-            uploadScreenshotToS3,
-            uploadFileToS3WithPath,
-            buildCrmDataChangedPayload,
-            crmDataChangedEvent: CRM_DATA_CHANGED_EVENT,
+          priorMediaBudgetDeferred: mediaBudgetDeferredThisRun,
+          ports: this.buildToolDispatchPorts({
+            agentRuntimeRunId,
+            sessionId,
+            userId,
+            iteration,
+            mediaAssetsProducedThisRun,
+            mediaGenerationDeadlineMs,
+            observeFullToolResult: (toolName: string, fullResult: any) => crmEvidence.record(toolName, fullResult),
             socketEmit,
-          },
+          }),
         });
         const toolDispatchDurationMs = Date.now() - toolDispatchStart;
         if (toolDispatchDurationMs > longestToolDispatchMsThisRun) {
@@ -4747,6 +4773,10 @@ export class AgentModeService {
         // Carry the running per-run media-asset total forward so the next iteration's
         // budget decision knows whether this run has already produced ≥1 asset.
         mediaAssetsProducedThisRun += dispatchResult.mediaAssetsProduced;
+        // ENG-922: once any iteration defers media on the time budget, the batch is
+        // incomplete for the rest of this run — later iterations must not perform
+        // state-changing (Graph upload/creative/ad) calls against it.
+        if (dispatchResult.mediaBudgetDeferred) mediaBudgetDeferredThisRun = true;
         // ENG-426: carry the run-wide search-call count forward so the next iteration's
         // budget check sees calls made earlier THIS turn, on top of prior-turn history.
         searchCallCountThisRun += dispatchResult.searchCallsThisIteration;
@@ -4910,6 +4940,7 @@ export class AgentModeService {
               role: 'assistant',
               content: staged.turnMessage,
               llm: llmModel,
+              ...modelRouting,
               metadata: { timestamp: new Date().toISOString(), awaitingUserConfirmation: true, approvalInboxManifestId: staged.manifestId },
             });
             if (onProgress) {
@@ -4956,6 +4987,7 @@ export class AgentModeService {
               role: 'assistant',
               content: deckPrompt,
               llm: llmModel,
+              ...modelRouting,
               // ENG-1635/1644 Phase B: no tool-call result carries the deck's data (unlike
               // ask_user_question, this halt is pushed as plain content) — this is the only
               // correlator the frontend has to know THIS message should render the
@@ -4993,6 +5025,7 @@ export class AgentModeService {
             role: 'assistant',
             content: confirmationPrompt,
             llm: llmModel,
+            ...modelRouting,
             metadata: { timestamp: new Date().toISOString(), awaitingUserConfirmation: true }
           });
           if (onProgress) {
@@ -5008,10 +5041,13 @@ export class AgentModeService {
           .join('|') || '';
         if (currentToolSignature && currentToolSignature === lastToolSignature) {
           consecutiveRepeats++;
-          if (consecutiveRepeats >= MAX_CONSECUTIVE_REPEATS) {
+          // Once per turn: re-adding it on every identical step piles up copies of the
+          // same instruction (Opslane 2026-10-13); one standing system directive is enough.
+          if (consecutiveRepeats >= MAX_CONSECUTIVE_REPEATS && !antiLoopRepeatNudged) {
+            antiLoopRepeatNudged = true;
             console.warn(`AgentMode: Detected ${consecutiveRepeats} consecutive identical tool calls in session ${sessionId}, injecting anti-loop warning`);
             (messages as any[]).push({
-              role: 'user',
+              role: 'system',
               content: ANTI_LOOP_STOP_MESSAGE,
             });
           }
@@ -5037,7 +5073,7 @@ export class AgentModeService {
               console.warn(`AgentMode: Detected cycling tool call pattern (${maxCount}x in last ${SIGNATURE_HISTORY_WINDOW} steps) in session ${sessionId}, injecting anti-loop warning`);
               toolSignatureHistory.length = 0; // reset to avoid spamming
               (messages as any[]).push({
-                role: 'user',
+                role: 'system',
                 content: '[SYSTEM] You are stuck in a loop — you have been calling the same tools repeatedly without making meaningful progress. STOP. Do not navigate or take screenshots again. Provide your final response now based on what you have already observed.'
               });
             }
@@ -5095,6 +5131,7 @@ export class AgentModeService {
         try {
           const finalizeLedger: FinalizeLedgerEntry[] = toolCalls.map((tc: any): FinalizeLedgerEntry => ({
             toolName: tc.name,
+            args: tc.arguments,
             // A suppressed same-turn duplicate (duplicateOf) and a budget-deferred
             // media call never EXECUTED — neither may back a claim on its own (the
             // original executed call has its own ledger entry), so both map to
@@ -5140,6 +5177,11 @@ export class AgentModeService {
           // finalizeGuard.ts), so without this they'd be invisible even though
           // the whole point of the confidence tier is to surface them for
           // review instead of silently risking a false correction.
+          if (guardOutcome.discardedClaims) {
+            // Judge claims with no quoted statement or a class the lexicon did not surface are ignored (ENG-2459).
+            // Counted here so a judge whose output shape drifts shows up instead of silently disabling detection.
+            console.warn(`AgentMode: finalize guard discarded ${guardOutcome.discardedClaims} judge claim(s) in session ${sessionId} (no statement or non-candidate class)`);
+          }
           if (guardOutcome.ambiguousClaimClasses.length > 0) {
             console.warn(`AgentMode: finalize guard found AMBIGUOUS (uncorrected) claim(s) in session ${sessionId} — possible matcher coverage gap`, {
               ambiguousClaimClasses: guardOutcome.ambiguousClaimClasses,
@@ -5208,6 +5250,13 @@ export class AgentModeService {
             }
           }
         }
+      }
+
+      // ENG-2263 (log-only): a `[verified: <CRM tool>]` tag that no CRM call this turn can back —
+      // a carried-over number dressed as fresh. Measures how often it happens, per model, before
+      // anyone decides to enforce. Never edits `content`; kill switch AGENT_CRM_FRESHNESS_GUARD=off.
+      if (content && !wasCancelled && !mockMode) {
+        runCrmFreshnessShadow({ finalText: content, toolCalls, evidence: crmEvidence.snapshot(), earlier: crmEarlier, sessionNumbers: crmSessionNumbers, sessionId, model: llmModel });
       }
 
       // ENG-1207 AC3: a run must not finish silently on an unread page.
@@ -5337,6 +5386,35 @@ export class AgentModeService {
         }
       }
 
+      // Opslane 2026-10-13: persist exactly what is returned. The step-cap,
+      // content-filter and time-budget texts are assigned to `content` after the
+      // model's own (often empty) message was already appended, so the transcript
+      // kept "" while the user read the explanation. Reconcile once, here, after
+      // every content rewrite above. Never mutate a message incremental
+      // checkpointing already wrote — append a fresh one instead.
+      if (!wasCancelled) {
+        if (!content || !content.trim()) {
+          content = EMPTY_FINAL_RESPONSE_FALLBACK;
+        }
+        const persistedTail = messages.slice(initialMessageCount).filter(isPersistedResponseMessage);
+        const lastResponse: any = persistedTail[persistedTail.length - 1];
+        const lastIsUnflushedTextAnswer = !!lastResponse
+          && lastResponse.role === 'assistant'
+          && !(Array.isArray(lastResponse.tool_calls) && lastResponse.tool_calls.length > 0)
+          && persistedTail.length > persistedResponseCount;
+        if (lastIsUnflushedTextAnswer) {
+          if (lastResponse.content !== content) lastResponse.content = content;
+        } else {
+          (messages as any[]).push({
+            role: 'assistant',
+            content,
+            llm: llmModel,
+            ...modelRouting,
+            metadata: { timestamp: new Date().toISOString() },
+          });
+        }
+      }
+
       // Attach timing metadata, memory usage, and tool calls to the last assistant message
       if (messages.length > 0) {
         const lastAssistantIdx = messages.length - 1 - [...messages].reverse().findIndex((m: any) => m.role === 'assistant');
@@ -5367,14 +5445,18 @@ export class AgentModeService {
             memoryUsage,
             ...(toolCalls.length > 0 ? { toolCalls } : {}),
             ...(citations.length > 0 ? { citations } : {}),
+            // ENG-2263: the numbers (never text) this invocation's CRM tools returned, so a continuation of this task can check
+            // its totals against them. Additive and optional; bounded to 64 numbers + tool names. Off with the guard's kill switch.
+            ...(process.env.AGENT_CRM_FRESHNESS_GUARD === 'off' ? {} : (() => {
+              const ev = serializeCrmEvidence(crmEvidence.snapshot());
+              return ev ? { crmEvidence: ev } : {};
+            })()),
           };
         }
       }
-      // Filter out user messages from responseMessages since the controller already saved
-      // the user message before calling this function. Only return assistant/tool messages.
-      const responseMessages = messages.slice(initialMessageCount).filter(
-        (msg: any) => msg.role !== 'user'
-      );
+      // Only assistant/tool messages are persisted: the controller already saved the
+      // user message, and system messages are in-turn control nudges.
+      const responseMessages = messages.slice(initialMessageCount).filter(isPersistedResponseMessage);
 
       recordAgentModeRunCompleted(agentRuntimeRunId, {
         sessionId,
@@ -5446,6 +5528,12 @@ export class AgentModeService {
         userMessage = 'Your request took longer than expected. Please try again.';
       } else if (isContextLimit || httpStatus === 400) {
         userMessage = 'I encountered an issue processing your request. Please try rephrasing your question.';
+      } else if (isLLMProviderOutage(error)) {
+        // ENG-2381: a final upstream 5xx (e.g. OpenRouter "503 Provider returned error"
+        // after its own provider failover and callLLM's transient retry) is a provider
+        // outage, not an unknown bug. Name it so the controller answers 503 instead of
+        // paging oncall as an "Unknown Error".
+        userMessage = PROVIDER_UNAVAILABLE_USER_MESSAGE;
       } else {
         userMessage = 'I apologize, but I encountered an error processing your request. Please try again.';
       }
@@ -5459,7 +5547,7 @@ export class AgentModeService {
       const partialResponseMessages = _messages
         ? _messages
             .slice(_initialMessageCount)
-            .filter((msg: any) => msg.role !== 'user')
+            .filter(isPersistedResponseMessage)
             .slice(_persistedResponseCount)
             .filter((msg: any) => msg.usage)
         : [];
@@ -6386,6 +6474,9 @@ export class AgentModeService {
     'get_lead_lists',         // Lead management teaser
     'list_connected_accounts', // Social/ads integration teaser
     'connect_account',        // Read-only UI handoff when a required account is absent
+    // LinkedIn Outreach self-service (ENG-1153): caller-scoped inspect + confirm-gated revoke.
+    'inspect_linkedin_account',
+    'revoke_linkedin_account',
 
     'get_user_profile',         // Account info teaser
     'get_account_status',       // Self account status (plan, usage, api-key count) — wraps /api/auth/me, no args
@@ -6397,6 +6488,16 @@ export class AgentModeService {
     // Org Memory (shared facts for all org members)
     'save_org_memory',
     'delete_org_memory',
+
+    // Org notification preferences use the same org-settings authorization.
+    'get_lead_notification_settings',
+    'update_lead_notification_settings',
+    'get_hot_lead_call_settings',
+    'update_hot_lead_call_settings',
+    'provision_hot_lead_call_number',
+    'release_hot_lead_call_number',
+    'start_hot_lead_call_verification',
+    'confirm_hot_lead_call_verification',
 
     // Scheduled Chat Management
     'list_scheduled_chats',
@@ -6410,6 +6511,10 @@ export class AgentModeService {
     'fathom_get_meetings',
     'fathom_get_transcript',
     'fathom_get_onboarding_context',
+
+    // Luma API (ENG-2338): guest lists without a browser login
+    'luma_list_events',
+    'luma_get_guests',
 
     // Coding Agent (sub-agent for code editing tasks)
     'coding_agent',
@@ -6469,6 +6574,10 @@ export class AgentModeService {
     // only asks the current page to open the existing OAuth dialog; it does not
     // grant consent or connect an account by itself.
     'connect_account',
+    // LinkedIn Outreach inspect/revoke (ENG-1153) must survive a stale DB
+    // foundation_tools override, otherwise chat cannot reach them at all.
+    'inspect_linkedin_account',
+    'revoke_linkedin_account',
     // S3 overflow retrieval is infrastructure, not a skill: whenever a tool result
     // is offloaded to S3 the model is handed a "[Full response stored at S3 key: ...]"
     // pointer and MUST be able to resolve it. A DB `foundation_tools` setting that
@@ -6525,6 +6634,12 @@ export class AgentModeService {
     'fathom_get_meetings',
     'fathom_get_transcript',
     'fathom_get_onboarding_context',
+    // Luma API (ENG-2338). Force-merged for the same reason as the Fathom tools: a
+    // stale prod `foundation_tools` override would otherwise strip them. Like Fathom,
+    // they stay reachable with no key connected so the model gets the "connect Luma /
+    // fall back to the browser path" guidance instead of a generic not-available error.
+    'luma_list_events',
+    'luma_get_guests',
     // ENG-396/400: re-exposed after being found dormant-only in practice (a
     // user asking Emma to "confirm settings via a card before building"
     // couldn't get one at all — she has no way to render a real card and was
@@ -6694,6 +6809,7 @@ export class AgentModeService {
 
     // Add virtual other_skills if allowed, there are unassociated tools, AND it's not already installed
     if (!associatedSet.has(OTHER_SKILLS_VIRTUAL_ID) && (isWildcard || allowedSet.has(OTHER_SKILLS_VIRTUAL_ID))) {
+      // ENG-2299: use the full published catalog; scoping by the caller's tier would leak higher-tier tools into the catch-all.
       const unassociatedTools = this.getUnassociatedTools(publishedSkills);
 
       if (unassociatedTools.length > 0) {
@@ -6716,10 +6832,14 @@ export class AgentModeService {
    */
   private async loadAuthorizedSkillCatalog(userId?: string): Promise<{ skills: Skill[]; allowedIds: string[] }> {
     const userOrgId = userId ? (await resolveUserSkillAccess(userId)).sharedOrgId : undefined;
-    const [publishedSkills, userAllowedSkillIds] = await Promise.all([
+    const [publishedSkills, rawAllowedSkillIds] = await Promise.all([
       userId ? skillService.getSkillsAvailableToUser(userId, userOrgId) : skillService.getPublishedSkills(),
       userId ? getAllowedSkills(userId) : getPublicAllowedSkills()
     ]);
+    // ENG-1978: this is a catalog read (what may this user see/install?), not the execution gate.
+    // An unresolved entitlement lists nothing extra — the user still sees skills they own or that
+    // their org shares, which is correct: those grants do not come from the subscription tier.
+    const userAllowedSkillIds: string[] = rawAllowedSkillIds ?? [];
     const isWildcard = userAllowedSkillIds.includes("*");
     const allowedSet = new Set(userAllowedSkillIds);
     return { skills: publishedSkills.filter(s => (s.visibility !== 'pending_review' || s.ownerId === userId) && (isWildcard || allowedSet.has(s.skillId) || (userId !== undefined && s.ownerId === userId) || (userOrgId !== undefined && s.orgId === userOrgId))), allowedIds: userAllowedSkillIds };
@@ -6952,6 +7072,12 @@ export class AgentModeService {
         getAllowedSkills(userId),
         skillService.getPublishedSkills(),
       ]);
+      // ENG-1978: null = entitlement unresolved. This is refusal-*messaging* only; treating it as
+      // "no skills allowed" here would claim the customer's plan excludes the skill, which is
+      // exactly the unproven claim the catch below exists to avoid. Throw into that branch instead.
+      if (allowed === null) {
+        throw new Error('entitlement unresolved; cannot classify skill rejection');
+      }
       allowedIds = allowed;
       existingIds = new Set(published.map(s => s.skillId));
       // The virtual bundles are real ids with no catalog row; entitlement still governs them.
@@ -7056,6 +7182,8 @@ export class AgentModeService {
       if (!Array.isArray(skillIds) || skillIds.length === 0 || skillIds.some((id) => typeof id !== 'string')) {
         return { success: false, message: "skillIds must be a non-empty array of skill IDs." };
       }
+      // ENG-2612: models copy the catalog display line ("<uuid>- Skill Name") as the id.
+      skillIds = [...new Set(skillIds.map(normalizeSkillIdArg))];
 
       const availableSkills = await this.getSkillsForDisplay([], userId);
       const availableById = new Map(availableSkills.map(skill => [skill.skillId, skill]));
@@ -7087,6 +7215,7 @@ export class AgentModeService {
         if (rejectedSkillIds.length > 0) {
           const buckets = await this.classifySkillRejections(rejectedSkillIds, userId);
           const { unentitled, unavailable, unresolved, forbidden } = buckets;
+          await this.logInstallRefusal(sessionId, userId, skillIds, buckets, false);
           /*
            * `success: false` matters as much as the text: the success path returns
            * `success: true`, so a bare `{ message }` left `success` undefined and this refusal
@@ -7140,6 +7269,7 @@ export class AgentModeService {
          * ledger too.
          */
         const partialBuckets = await this.classifySkillRejections(rejectedSkillIds, userId);
+        await this.logInstallRefusal(sessionId, userId, skillIds, partialBuckets, true);
         /*
          * `noSubstitution` matters MORE here than on the full-refusal branch, not less. There,
          * the dispatcher's downgrade attaches an error class whose retryability line carries
@@ -7210,6 +7340,206 @@ export class AgentModeService {
   }
 
   /**
+   * ENG-2109: the ports `executePreparedTools` needs, built in one place so Emma's own
+   * loop and the tool bridge (a `claude -p` session calling tools one at a time) hand
+   * the dispatcher exactly the same ones.
+   */
+  public buildToolDispatchPorts(ctx: {
+    agentRuntimeRunId: string;
+    sessionId: string;
+    userId: string;
+    iteration: number;
+    mediaAssetsProducedThisRun: number;
+    mediaGenerationDeadlineMs?: number;
+    observeFullToolResult?: ToolDispatchPorts['observeFullToolResult'];
+    socketEmit?: ToolDispatchPorts['socketEmit'];
+  }): ToolDispatchPorts {
+    return {
+      evaluateAgentToolPolicy,
+      validateAndRepairToolArgs,
+      getToolInputSchema: (toolName: string) => {
+        const toolDefinition = this.toolRegistry.getTool(toolName)?.definition;
+        return toolDefinition?.function?.parameters || toolDefinition?.inputSchema;
+      },
+      executeAgentToolThroughGateway,
+      executePreparedAgentTool: (toolInput: any) => this.executePreparedAgentTool(toolInput),
+      toolResultError,
+      // ENG-105: validate tool output against the minimum-output contract so
+      // an empty/undefined/invalid "success" becomes a structured tool
+      // failure (errorClass invalid_output) instead of feeding garbage to
+      // the model and counting as success.
+      validateToolOutput: (result: any) => validateToolOutputContract(result, extractToolContent),
+      recordToolTelemetry: (telemetryToolResults) =>
+        recordAgentModeToolTelemetry(ctx.agentRuntimeRunId, ctx.sessionId, ctx.iteration, telemetryToolResults as any, {
+          mediaAssetsProducedThisRun: ctx.mediaAssetsProducedThisRun,
+          mediaGenerationDeadlineMs: ctx.mediaGenerationDeadlineMs,
+        }, ctx.userId),
+      recordDuplicateSuppression: (entries) =>
+        recordAgentModeDuplicateSuppression(ctx.agentRuntimeRunId, ctx.sessionId, ctx.iteration, entries),
+      observeFullToolResult: ctx.observeFullToolResult,
+      extractMinimalToolResult: (result: any, toolName: string) => this.extractMinimalToolResult(result, toolName),
+      extractToolContent,
+      formatToolError: (toolName: string, errorMessage: string) => this.formatToolError(toolName, errorMessage),
+      uploadScreenshotToS3,
+      uploadFileToS3WithPath,
+      buildCrmDataChangedPayload,
+      crmDataChangedEvent: CRM_DATA_CHANGED_EVENT,
+      socketEmit: ctx.socketEmit,
+    };
+  }
+
+  /**
+   * ENG-2109: the tool access Emma's loop would give this session right now — the
+   * skill-gated tool names and the filtered tool definitions sent to the model.
+   *
+   * Mirrors the loop's own steps (session skills -> buildSkillContext -> per-user MCP
+   * discovery -> getFilteredTools -> voice augment -> excludeTools) by calling the same
+   * helpers. The loop's turn-history-dependent filter (the ENG-763 loop breaker, which
+   * drops install_skills while a repetition loop is active) is not applied here.
+   * `funding/__tests__/emmaToolBridgeExecutor.integration.test.ts` compares this with
+   * what the loop sends, for a legacy and a skill-gated session.
+   */
+  public async resolveRunToolAccess(input: {
+    userId: string;
+    sessionId: string;
+    isDelegatedAccess?: boolean;
+    isInteractiveShare?: boolean;
+    excludeTools?: string[];
+  }): Promise<{
+    tools: any[];
+    allowedToolNames: Set<string>;
+    hasAdminAccess: boolean;
+    publishedSkillsCount: number;
+    sessionAssociatedSkillIdsCount: number;
+  }> {
+    const { userId, sessionId } = input;
+    const { userDb } = await import('./db');
+    const [currentSession, userAllowedSkillIds, publishedSkills, currentUser] = await Promise.all([
+      chatbotDb.getChatSession(sessionId),
+      getAllowedSkills(userId),
+      skillService.getPublishedSkills(),
+      userDb.getUserById(userId).catch((err) => {
+        console.error(`[AgentMode] Failed to fetch user ${userId} for admin check:`, err);
+        return null;
+      }),
+    ]);
+
+    const isAdmin = currentUser?.isAdmin === true;
+    const hasAdminAccess = (isAdmin || input.isDelegatedAccess === true) && input.isInteractiveShare !== true;
+
+    // ENG-1978: see the main turn handler's comment on the same split — this helper mirrors it,
+    // not `getFilteredTools` below, which gets the RAW (possibly null) value so it can fail closed.
+    const userAllowedSkillIdsForDisplay: string[] = userAllowedSkillIds ?? [];
+
+    const rawAssociatedSkills = currentSession?.associatedSkills;
+    const isLegacySession = rawAssociatedSkills === undefined || rawAssociatedSkills === null;
+    const sessionAssociatedSkillIds: string[] = Array.isArray(rawAssociatedSkills) ? rawAssociatedSkills : [];
+    const associatedSkills = sessionAssociatedSkillIds.length
+      ? await skillService.getSkillsByIds(sessionAssociatedSkillIds)
+      : [];
+    const { allowedToolNames } = this.buildSkillContext(
+      associatedSkills,
+      userAllowedSkillIdsForDisplay,
+      publishedSkills,
+      sessionAssociatedSkillIds,
+      hasAdminAccess,
+    );
+
+    try {
+      const discovered = await this.mcpClientService.discoverToolsForUser(userId, sessionId);
+      if (discovered > 0) {
+        for (const tool of this.mcpClientService.getTools()) {
+          if (!this.toolRegistry.getTool(tool.name)) this.toolRegistry.register(tool);
+        }
+      }
+    } catch (e) {
+      console.warn('[MCP-DISCOVER] Error discovering per-user MCP tools:', (e as Error).message);
+    }
+
+    const skillFilter = isLegacySession ? undefined : allowedToolNames;
+    let tools = await this.getFilteredTools(userId, skillFilter, userAllowedSkillIds);
+
+    if (currentSession?.sessionVoiceProfile?.voiceCard?.trim()) {
+      try {
+        const { augmentPublishToolDefinitions } = await import('./voiceProfileHooks');
+        tools = augmentPublishToolDefinitions(tools, currentSession.sessionVoiceProfile);
+      } catch (voiceToolErr) {
+        console.warn('[AgentMode] H-VOICE publish tool augment skipped (non-fatal):', voiceToolErr);
+      }
+    }
+
+    if (input.excludeTools?.length) {
+      const excludeSet = new Set(input.excludeTools);
+      tools = tools.filter((t: any) => !excludeSet.has(t.function?.name));
+    }
+
+    return {
+      tools,
+      allowedToolNames,
+      hasAdminAccess,
+      publishedSkillsCount: publishedSkills.length,
+      sessionAssociatedSkillIdsCount: sessionAssociatedSkillIds.length,
+    };
+  }
+
+  /** ENG-2299: one diagnostic line per install_skills rejection; never alters the result. */
+  private async logInstallRefusal(
+    sessionId: string,
+    userId: string,
+    requested: string[],
+    buckets: { unentitled: string[]; unavailable: string[]; unresolved: string[]; forbidden: string[] },
+    partial: boolean,
+  ): Promise<void> {
+    try {
+      const published = await skillService.getPublishedSkills();
+      console.warn('[install-refused]', JSON.stringify({
+        sessionId,
+        userId,
+        partial,
+        requested: requested.slice(0, 20),
+        unentitled: buckets.unentitled.slice(0, 20),
+        unavailable: buckets.unavailable.slice(0, 20),
+        unresolved: buckets.unresolved.slice(0, 20),
+        forbidden: buckets.forbidden.slice(0, 20),
+        catalogSize: published.length,
+        otherSkillsPoolSize: this.getUnassociatedToolNames(published).length,
+      }));
+    } catch { /* diagnostics must never change the refusal */ }
+  }
+
+  /**
+   * ENG-2299: facts needed to tell a missing install from catalog or entitlement drift when a
+   * "tool is not available" refusal is reported. Logged by the dispatch gate; changes no behavior.
+   */
+  public describeToolGateRefusal(
+    toolName: string,
+    publishedSkills: any[],
+    installedSkillIds: string[],
+    userAllowedSkillIds: string[] | null,
+  ): Record<string, unknown> {
+    const entitlementResolved = userAllowedSkillIds !== null && userAllowedSkillIds !== undefined;
+    const allowed = userAllowedSkillIds ?? [];
+    const isWildcard = allowed.includes('*');
+    const claimedBy = publishedSkills
+      .filter(s => s.isPublished === true && Array.isArray(s.toolNames) && s.toolNames.includes(toolName))
+      .map(s => ({
+        skillId: s.skillId,
+        installed: installedSkillIds.includes(s.skillId),
+        tierAllows: isWildcard || allowed.includes(s.skillId),
+      }));
+    return {
+      entitlementResolved,
+      installedSkillIds,
+      otherSkillsInstalled: installedSkillIds.includes(OTHER_SKILLS_VIRTUAL_ID),
+      tierAllowsOtherSkills: isWildcard || allowed.includes(OTHER_SKILLS_VIRTUAL_ID),
+      allowedSkillCount: allowed.length,
+      catalogSize: publishedSkills.length,
+      inOtherSkillsPool: this.getUnassociatedToolNames(publishedSkills).includes(toolName),
+      claimedBy,
+    };
+  }
+
+  /**
    * ENG-1222: the single source of truth for "which tools + skill-context text
    * does a session with these installed skills get". Was private to Agent Mode
    * until chatbotService.generateChatResponse (the Emma-widget path) started
@@ -7246,6 +7576,7 @@ export class AgentModeService {
 
     // Handle virtual other_skills (gated by subscription)
     if (sessionAssociatedSkillIds.includes(OTHER_SKILLS_VIRTUAL_ID) && (isWildcard || allowedSkillSet.has(OTHER_SKILLS_VIRTUAL_ID))) {
+      // ENG-2299: use the full published catalog; scoping by the caller's tier would leak higher-tier tools into the catch-all.
       const unassociatedTools = this.getUnassociatedTools(publishedSkills);
       unassociatedTools.forEach(t => allowedToolNames.add(t.name));
     }
@@ -7331,10 +7662,22 @@ export class AgentModeService {
     return { added, removed, changed: added > 0 || removed > 0 };
   }
 
+  /**
+   * ENG-1978: the toolset for the catch-all error path in getFilteredTools — `install_skills` and
+   * nothing else, enough to recover, not enough to act. (An unresolved entitlement is handled
+   * separately and is more generous: it keeps the foundation tools.) Deliberately silent: the
+   * caller's catch already logs the error, and an unresolved tier is recorded as a structured
+   * `[entitlement] ENTITLEMENT-DENIED` event where it failed to resolve.
+   */
+  private installSkillsOnlyToolset(): any[] {
+    const installSkillsTool = this.toolRegistry.getTool('install_skills');
+    return installSkillsTool ? [installSkillsTool.definition] : [];
+  }
+
   public async getFilteredTools(
     userId: string,
     precomputedAllowedSkillToolNames?: Set<string>,
-    precomputedAllowedSkillIds?: string[]  // Skill IDs from subscription, to avoid duplicate getAllowedSkills call
+    precomputedAllowedSkillIds?: string[] | null  // Skill IDs from subscription, to avoid duplicate getAllowedSkills call. null = unresolved (ENG-1978)
   ): Promise<any[]> {
     try {
 
@@ -7351,13 +7694,31 @@ export class AgentModeService {
       const definitions = contextAwareTools.map(t => t.definition);
 
       // 4. Apply Subscription Filtering
-      // Resolve skill IDs to tool names for the subscription filter step
-      const skillIds = precomputedAllowedSkillIds || await getAllowedSkills(userId);
+      // Resolve skill IDs to tool names for the subscription filter step.
+      // `!== undefined`, not `??`: a precomputed `null` (ENG-1978 — the caller already knows the
+      // entitlement is unresolved) must stay null, not silently re-fetch and double-report.
+      const skillIds = precomputedAllowedSkillIds !== undefined
+        ? precomputedAllowedSkillIds
+        : await getAllowedSkills(userId);
       // ENG-1978 (observation only): userId attributes `skill-to-tool-resolution-failed` — this
       // is the highest-frequency route to it (inside the agent iteration loop), and it is the one
       // reason that is ALWAYS a genuine full-registry grant, so leaving it unattributed here would
       // make the single most important signal in the 2-week analysis the one nobody can act on.
       const allowedFunctionCalls = await resolveSkillsToToolNames(skillIds, userId);
+
+      // ENG-1978: null means the entitlement could not be resolved — an unknown/malformed tier or
+      // a failed settings read. Fail closed: nothing the tier would have unlocked is granted.
+      // Foundation tools (plus install_skills, so the user can recover) are still returned: every
+      // tier, Free included, already gets them unconditionally on the normal path, so handing them
+      // to an unresolved tier grants nothing a plan-less user lacks — it just keeps the session
+      // usable through a blip instead of dead. Skill tools already installed in the session are
+      // NOT carried over: their entitlement is exactly what could not be confirmed.
+      if (allowedFunctionCalls === null) {
+        return filterFunctionCalls(definitions, [
+          ...AgentModeService.FOUNDATION_TOOLS,
+          'install_skills',
+        ]);
+      }
 
       // Foundation tools must always bypass subscription filtering — they are
       // core primitives (work plan, search, save) needed by every session.
@@ -7384,8 +7745,7 @@ export class AgentModeService {
       console.error('Error filtering tools:', error);
       // Fallback: return only install_skills to be safe, or empty array
       // DO NOT return all tools on error as it's a security risk
-      const installSkillsTool = this.toolRegistry.getTool('install_skills');
-      return installSkillsTool ? [installSkillsTool.definition] : [];
+      return this.installSkillsOnlyToolset();
     }
   }
 
@@ -7638,6 +7998,18 @@ export class AgentModeService {
       for (const field of keep) {
         if (result?.[field] !== undefined) minimal[field] = result[field];
       }
+      return minimal;
+    }
+
+    // ENG-2338: keep enough of a Luma result for the ledger to tell "pulled 0 guests" from "no key connected" (both
+    // would otherwise minimise to {}). `rowCount` is what the unread-page notice reads; rows themselves are dropped.
+    if (toolName === 'luma_get_guests' || toolName === 'luma_list_events') {
+      const rows = Array.isArray(result?.guests) ? result.guests : Array.isArray(result?.events) ? result.events : undefined;
+      const minimal: Record<string, any> = {};
+      for (const field of ['success', 'connected', 'nothing_pulled', 'reason', 'count', 'has_more', 'next_cursor', 'skipped_without_registration']) {
+        if (result?.[field] !== undefined) minimal[field] = result[field];
+      }
+      if (rows) minimal.rowCount = rows.length;
       return minimal;
     }
 
@@ -8126,7 +8498,7 @@ export class AgentModeService {
       // Zero is worse than silence in that sentence: it reads as "this found
       // nothing", the opposite of what happened.
       if (Object.keys(paginationMarkers).length > 0) {
-        for (const key of ['leads', 'engagements', 'results', 'items', 'rows']) {
+        for (const key of LEDGER_ROW_KEYS) {
           const value = (result as Record<string, unknown>)[key];
           if (Array.isArray(value)) { paginationMarkers.rowCount = value.length; break; }
         }
@@ -9913,6 +10285,7 @@ export class AgentModeService {
     status?: string;
     limit?: number;
     cursor?: string;
+    includeAllFields?: boolean;
   } = {}): Promise<any> {
     return leadsImpl.getLeads(listId, userId, options);
   }
@@ -10151,7 +10524,7 @@ export class AgentModeService {
 
   public async attachKnowledgeBaseFiles(
     taskId: string,
-    files: Array<{ name: string; content: string }>,
+    files: unknown,
     userId: string,
     sessionId: string
   ): Promise<any> {
@@ -10265,7 +10638,19 @@ export class AgentModeService {
     return tasksImpl.createImageTaskFromPrompt(taskName, prompt, category, userId, sessionId, attachPreviousTaskResults);
   }
 
-  async generateSessionTitle(userMessage: string, usageContext?: LLMUsageContext): Promise<string> {
+  /**
+   * `turnModel` is the model the user's turn (the one this title belongs to) will run on. When the
+   * user has switched on their own key for that model's provider and it cannot serve the turn, the
+   * turn fails closed, so AgentWeb must not spend an AI call on a title for it either: the title is
+   * cut from the message instead. Omitted by callers that have no customer-routable turn behind
+   * the title (the title is then always AgentWeb-funded, as before).
+   */
+  async generateSessionTitle(userMessage: string, usageContext?: LLMUsageContext, turnModel?: string): Promise<string> {
+    if (turnModel && usageContext?.userId) {
+      // Same alias map the turn itself uses, so a legacy model id resolves to the same provider.
+      const modelLab = this.llmModels[this.normalizeModelId(turnModel)]?.provider;
+      if (await customerKeyBlocksTurn(usageContext.userId, modelLab)) return titleFromUserMessage(userMessage);
+    }
     try {
       const defaultModel = await this.getDefaultModel();
 
@@ -10624,36 +11009,17 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     const response = await this.callLLM(FINALIZE_GUARD_JUDGE_MODEL, [
       {
         role: 'user',
-        content:
-          'You are auditing an AI assistant\'s reply for COMPLETED-ACTION claims — statements that an action already happened '
-          + '(not offers, plans, or suggestions). The possible claim classes are: '
-          + `${CLAIM_CLASSES.join(', ')}. Candidate classes detected in this reply: ${candidateClasses.join(', ')}.\n\n`
-          + 'Return ONLY a JSON array, one element per claimed completed action, each shaped '
-          + '{"claimClass":"<class>","statement":"<short quote from the reply>"}. '
-          + 'Return [] if the reply claims no completed action.\n\nReply to audit:\n'
-          + finalText,
+        content: buildFinalizeJudgePrompt(finalText, candidateClasses),
       },
     ], {
-      max_completion_tokens: 500,
+      max_completion_tokens: FINALIZE_JUDGE_MAX_COMPLETION_TOKENS,
       temperature: 0,
       taskClass: 'nonstandard_consumer',
       // ENG-1858: the guard audits the user's own reply, so the user's run pays.
       usageContext: usageContext ?? { feature: 'finalize_guard_judge' },
     });
 
-    const text = (response as any)?.choices?.[0]?.message?.content;
-    if (typeof text !== 'string' || !text.trim()) {
-      throw new Error('finalize-guard judge returned no content');
-    }
-    const match = text.match(/\[[\s\S]*\]/);
-    if (!match) {
-      throw new Error(`finalize-guard judge returned unparseable output: ${text.slice(0, 200)}`);
-    }
-    const parsed = JSON.parse(match[0]); // throws on invalid JSON → judge_error path
-    if (!Array.isArray(parsed)) {
-      throw new Error('finalize-guard judge output is not an array');
-    }
-    return (parsed as any[]).filter((c) => c && typeof c.claimClass === 'string');
+    return parseFinalizeJudgeOutput((response as any)?.choices?.[0]?.message?.content);
   }
 
   /**
@@ -11342,6 +11708,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           link_url: newLinkUrl || vd.call_to_action?.value?.link || '',
           call_to_action_type: params.call_to_action_type || vd.call_to_action?.type,
           url_tags: carriedUrlTags,
+          ...AgentModeService.carriedCreativeFields(existingSpec, params),
         };
       } else if (existingSpec.link_data?.child_attachments) {
         const ld = existingSpec.link_data;
@@ -11371,6 +11738,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           carousel_cards: updatedCards,
           call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
           url_tags: carriedUrlTags,
+          ...AgentModeService.carriedCreativeFields(existingSpec, params),
         };
       } else if (existingSpec.link_data) {
         const ld = existingSpec.link_data;
@@ -11391,6 +11759,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           link_url: newLinkUrl || ld.link || '',
           call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
           url_tags: carriedUrlTags,
+          ...AgentModeService.carriedCreativeFields(existingSpec, params),
         };
       } else {
         return {
@@ -12335,6 +12704,28 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   }
 
   /**
+   * ENG-2609: link description + Instagram identity of an existing creative, for rebuilding it
+   * (COPY_AD / swap). Carousels are skipped for description: they have no creative-level slot.
+   * `assetFeedSpec` is passed only when rebuilding a placement_assets creative, whose description
+   * lives in asset_feed_spec.descriptions rather than link_data / video_data.
+   */
+  private static carriedCreativeFields(
+    spec: any,
+    params: { description?: string; instagram_user_id?: string },
+    assetFeedSpec?: any,
+  ): { description?: string; instagram_user_id?: string } {
+    const carousel = !!spec?.link_data?.child_attachments;
+    const description = params.description
+      ?? (assetFeedSpec ? assetFeedSpec.descriptions?.[0]?.text : undefined)
+      ?? (carousel ? undefined : (spec?.video_data ? spec.video_data.link_description : spec?.link_data?.description));
+    const instagramUserId = params.instagram_user_id ?? spec?.instagram_user_id;
+    return {
+      ...(description ? { description } : {}),
+      ...(instagramUserId ? { instagram_user_id: instagramUserId } : {}),
+    };
+  }
+
+  /**
    * When a placement_assets creative serves Instagram placements, Meta requires
    * object_story_spec.instagram_user_id (else attaching it to an ad fails with subcode 1772103).
    * Resolve it from the Page if the caller didn't supply one.
@@ -12382,15 +12773,44 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       resolvedParams = await this.resolvePlacementAssetHashes(userId, resolvedParams, params.account_id);
       // IG placements require an instagram_user_id in object_story_spec — auto-resolve from the Page.
       resolvedParams = await this.resolvePlacementInstagramActor(resolvedParams, accessToken);
-      const creative = await metaService.createAdCreative(accountId, accessToken, resolvedParams);
+      const created = await metaService.createAdCreative(accountId, accessToken, resolvedParams);
+      // Meta's create response carries only the id; keep the name we sent so messages don't say "undefined".
+      const creative = created ? { ...created, name: created.name ?? resolvedParams.name } : created;
       // ENG-2141: link the generated images this creative uses to it (inert unless enabled).
       if (creative?.id) {
         void stampMetaCreativeCreated({ userId, accountId, metaCreativeId: String(creative.id), params: resolvedParams });
       }
 
+      // ENG-2596: a 200 doesn't prove Meta stored the IG identity / link description — read back.
+      // Only a caller-supplied IG id is checked: one auto-resolved for placement creatives was not asked for.
+      const requestedFields = { ...resolvedParams, instagram_user_id: params.instagram_user_id };
+      let unappliedFields: string[] = [];
+      let readbackUnavailable = false;
+      if (creative?.id && (requestedFields.instagram_user_id || requestedFields.description)) {
+        try {
+          const live = await metaService.getAdCreative(accessToken, String(creative.id));
+          unappliedFields = findUnappliedCreativeFields(requestedFields, live);
+        } catch (err: unknown) {
+          readbackUnavailable = true;
+          console.warn(`AgentMode: creative field read-back failed for ${creative.id}:`,
+            err instanceof Error ? err.message : err);
+        }
+      }
+      if (unappliedFields.length > 0) {
+        return {
+          success: true,
+          verified: false,
+          unapplied_fields: unappliedFields,
+          message: buildUnappliedFieldsMessage(creative, requestedFields, unappliedFields),
+          creative: creative
+        };
+      }
+
       return {
         success: true,
-        message: `Ad creative "${creative.name}" created successfully`,
+        message: `Ad creative "${creative.name}" created successfully` +
+          (readbackUnavailable ? ' (could not read it back to confirm description / instagram_user_id were stored)' : ''),
+        ...(readbackUnavailable ? { readback_unavailable: true } : {}),
         creative: creative
       };
     } catch (error: any) {
@@ -12487,7 +12907,11 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       const withBudget = (r: any) => {
         if (!budgetFields) return r;
         const { budget_message, error, ...rest } = budgetFields;
-        const out: any = { ...r, ...rest, message: `${r.message} — ${budget_message}` };
+        const out: any = {
+          ...r, ...rest,
+          success: r.success && rest.budget_verification === 'CONFIRMED',
+          message: rest.budget_verification === 'CONFIRMED' ? `${r.message} — ${budget_message}` : budget_message,
+        };
         if (error && !r.error) out.error = error;
         else if (error) out.budget_error = error;
         return out;
@@ -12585,8 +13009,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         (v: number) => normalizeMetaMoney(v, money.currency, 'minor').description
       );
       return {
-        success: true,
-        message: `Ad set updated successfully${money.confirmation} — ${budget_message}`,
+        success: verdict.budget_verification === 'CONFIRMED',
+        message: verdict.budget_verification === 'CONFIRMED'
+          ? `Ad set updated successfully${money.confirmation} — ${budget_message}` : budget_message,
         ...verdict,
       };
     } catch (error: any) {
@@ -12631,7 +13056,29 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   // silently drops it (see updateAd's params typing), so a UTM-only retag
   // (ENG-239 retrofit, agentModeService.retagMetaAdUtm) must also go through
   // the swap path. carriedUrlTags below already forwards it correctly.
-  private static CREATIVE_CONTENT_KEYS = ['link_url', 'destination', 'url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'call_to_action_type', 'placement_assets', 'url_tags'];
+  private static CREATIVE_CONTENT_KEYS = ['link_url', 'destination', 'url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'call_to_action_type', 'placement_assets', 'url_tags', 'description', 'instagram_user_id'];
+
+  /**
+   * A just-created placement-customized creative cannot be attached for ~20-30s: Meta answers
+   * 1772103 "Instagram Account Is Missing" until it has processed it (measured live, ENG-2623).
+   * Retry only that error; any other failure, or running out of attempts, is thrown as before.
+   * The backoff is 30s because Meta also allows only one update per ad per 30s (#613).
+   */
+  private async attachCreativeWhenReady(accessToken: string, adId: string, creativeId: string, accountId: string): Promise<void> {
+    const MAX_ATTEMPTS = 3;
+    const BACKOFF_MS = 30_000;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await metaService.updateAd(accessToken, adId, { creative: { creative_id: creativeId } }, accountId);
+        return;
+      } catch (err: any) {
+        const subcode = Number(err?.structuredError?.error_subcode ?? err?.response?.error?.error_subcode);
+        if (subcode !== 1772103 || attempt >= MAX_ATTEMPTS) throw err;
+        console.log(`AgentMode: creative ${creativeId} not yet attachable to ad ${adId} (1772103, attempt ${attempt}/${MAX_ATTEMPTS}). Retrying in ${BACKOFF_MS}ms.`);
+        await this.sleep(BACKOFF_MS);
+      }
+    }
+  }
 
   public async updateMetaAdsAd(userId: string, adId: string, params: any, account_id?: string): Promise<any> {
     try {
@@ -12773,15 +13220,18 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       // creative. Copy/link/CTA carry over from the existing creative unless overridden.
       const ld = existingSpec.link_data || {};
       const vd = existingSpec.video_data || {};
+      // A placement-customized source has no link_data / video_data: its copy lives in asset_feed_spec.
+      const afs = creativeData.asset_feed_spec || {};
       newCreativeParams = {
         name: params.name || `${creativeData.name || 'Creative'} (placement-customized)`,
         page_id: pageId,
         placement_assets: params.placement_assets,
-        body: params.body || ld.message || vd.message || creativeData.body || '',
-        title: params.title || ld.name || vd.title || creativeData.title || '',
-        link_url: newLinkUrl || ld.link || vd.call_to_action?.value?.link || '',
-        call_to_action_type: params.call_to_action_type || ld.call_to_action?.type || vd.call_to_action?.type,
+        body: params.body || ld.message || vd.message || afs.bodies?.[0]?.text || creativeData.body || '',
+        title: params.title || ld.name || vd.title || afs.titles?.[0]?.text || creativeData.title || '',
+        link_url: newLinkUrl || ld.link || vd.call_to_action?.value?.link || afs.link_urls?.[0]?.website_url || '',
+        call_to_action_type: params.call_to_action_type || ld.call_to_action?.type || vd.call_to_action?.type || afs.call_to_action_types?.[0],
         url_tags: carriedUrlTags,
+        ...AgentModeService.carriedCreativeFields(existingSpec, params, creativeData.asset_feed_spec),
       };
     } else if (existingSpec.video_data) {
       // Video creative
@@ -12798,6 +13248,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         link_url: newLinkUrl || vd.call_to_action?.value?.link || '',
         call_to_action_type: params.call_to_action_type || vd.call_to_action?.type,
         url_tags: carriedUrlTags,
+        ...AgentModeService.carriedCreativeFields(existingSpec, params),
       };
       if (params.image_hash || params.image_url) {
         imageSwap = { oldHash: vd.image_hash, oldUrl: vd.image_url, requestedHash: params.image_hash, requestedUrl: params.image_url };
@@ -12805,6 +13256,15 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     } else if (existingSpec.link_data?.child_attachments) {
       // Carousel creative – update the main link and optionally per-card links
       const ld = existingSpec.link_data;
+      // A carousel has no creative-level description slot, so a swap could not apply it: refuse
+      // before creating a replacement creative that would silently leave the cards unchanged.
+      if (params.description) {
+        return {
+          success: false,
+          message: 'Carousel creatives have no creative-level description, so it cannot be updated here. Put per-card text in carousel_cards[].description instead.',
+          error: 'CAROUSEL_DESCRIPTION_UNSUPPORTED'
+        };
+      }
       const updatedCards = ld.child_attachments.map((card: any) => ({
         image_hash: card.image_hash,
         image_url: card.picture || card.image_url,
@@ -12822,6 +13282,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         carousel_cards: updatedCards,
         call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
         url_tags: carriedUrlTags,
+        ...AgentModeService.carriedCreativeFields(existingSpec, params),
       };
     } else if (existingSpec.link_data) {
       // Single image creative
@@ -12837,6 +13298,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         link_url: newLinkUrl || ld.link || '',
         call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
         url_tags: carriedUrlTags,
+        ...AgentModeService.carriedCreativeFields(existingSpec, params),
       };
       if (params.image_hash || params.image_url) {
         imageSwap = {
@@ -12914,7 +13376,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     let verification: Awaited<ReturnType<AgentModeService['verifyCreativeSwap']>> | undefined;
 
     for (let attempt = 1; attempt <= SWAP_VERIFY_ATTEMPTS; attempt++) {
-      await metaService.updateAd(accessToken, adId, { creative: { creative_id: newCreativeId } }, accountId);
+      await this.attachCreativeWhenReady(accessToken, adId, newCreativeId, accountId);
       verification = await this.verifyCreativeSwap(accessToken, adId, newCreativeId, accountId, newLinkUrl);
 
       const destinationOk = !newLinkUrl || !verification.liveLinkUrl
@@ -13462,7 +13924,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
    * they don't publish to a campaign or destroy anything.
    */
   private static META_WRITE_ACTIONS: Record<string, string[]> = {
-    CAMPAIGN: ['CREATE', 'UPDATE', 'DELETE'],
+    CAMPAIGN: ['CREATE', 'UPDATE', 'DELETE', PAUSED_BUNDLE_ACTION],
     AD_SET: ['CREATE', 'UPDATE', 'DELETE'],
     AD: ['CREATE', 'UPDATE', 'DELETE', 'COPY_AD', 'RETAG_UTM'],
     // Account-level assets. CREATE publishes a creative; UPLOAD_USERS pushes PII
@@ -13572,6 +14034,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
     );
     const session = await chatbotDb.getChatSession(sessionId);
+    if (action === PAUSED_BUNDLE_ACTION && session?.userId !== userId) return { granted: false, digest, reason: 'not_approved' };
     // Session already recorded this exact digest consumed — a repeat of the
     // same call re-confirms rather than executing again (acceptance
     // criterion 3).
@@ -13594,6 +14057,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     // which IS the deck that was just answered.
     const outcome = findApprovalDeckAnswerForDigest(grantSourceDeck ?? session?.pendingApprovalDeck, digest);
     if (!outcome.granted) return { granted: false, digest, reason: 'not_approved' };
+    if (action === PAUSED_BUNDLE_ACTION && outcome.answer.answeredBy !== 'user') return { granted: false, digest, reason: 'not_approved' };
     const granted = await chatbotDb.claimMetaWriteManifestDigest(sessionId, digest);
     return granted ? { granted: true, digest } : { granted: false, digest, reason: 'already_consumed' };
   }
@@ -13726,24 +14190,44 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     sessionId: string,
     writeHalts: any[],
   ): Promise<{ manifestId: string; turnMessage: string } | null> {
-    const manifestId = uuidv4();
+    // One packet PER AD ACCOUNT: the Desk groups packets under an account and one Approve All
+    // dispatches a whole packet, so a single iteration that writes to two ad accounts must not
+    // become one packet shown under only the first account.
+    const manifestByAccount = new Map<string, string>();
+    const manifestFor = (r: any): string => {
+      const key = String(r?.metaWriteDispatch?.resolvedAccountId || r?.target?.account_id || r?.metaWriteDispatch?.account_id || 'unknown').replace(/^act_/, '');
+      if (!manifestByAccount.has(key)) manifestByAccount.set(key, uuidv4());
+      return manifestByAccount.get(key)!;
+    };
+    const manifestId = manifestFor(writeHalts[0]);
     // Same default window stage_pending_decision uses for a team decision —
     // one consistent "how long before this goes stale" answer across every
     // producer of this table.
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
 
+    // ENG-1853 follow-up: unlike the plan_choice producer (ask_user_question, which lets
+    // the model supply an explicit chat_url), this path never gave a reviewer any way
+    // back to the conversation that proposed a real Meta write — evidencePacket only
+    // ever carried researchSummary. sessionId is already a parameter here; the same
+    // ${CUSTOMER_FRONTEND_URL}/agent-mode/${sessionId} link agentModeController.ts
+    // already uses elsewhere for "go back to this session" is trivial to attach.
+    const chatUrl = `${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/agent-mode/${sessionId}`;
     const settled = await Promise.allSettled(
       writeHalts.map((r) =>
         approvalInboxService.createDecision({
           gateType: 'meta_write',
-          approver: 'matt',
+          approver: getDefaultApproverForGate('meta_write'),
           subjectLabel: `Meta Ads · Account ${r?.target?.account_id || r?.metaWriteDispatch?.account_id || 'unknown'}`,
           businessImpact: r?.confirmationDetail || r?.confirmationPrompt || r?.summary || 'A Meta Ads change is waiting for review.',
-          evidencePacket: { researchSummary: r?.summary },
+          // No separate researchSummary here: confirmationDetail (above) IS r.summary, so
+          // setting evidencePacket.researchSummary to r.summary as well rendered the exact
+          // same sentence twice on the card. There's no separate agent-authored rationale
+          // captured at this halt point to put here instead.
+          evidencePacket: { chatUrl },
           metaWriteManifestDigest: r.metaWriteManifestDigest,
           metaWriteDispatch: r.metaWriteDispatch,
           originSessionId: sessionId,
-          manifestId,
+          manifestId: manifestFor(r),
           expiresAt,
         }),
       ),
@@ -13781,7 +14265,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     // honestly rather than assuming uniformity.
     const manifestIds = [...new Set(staged.map((d) => d.manifestId))];
     const reportedManifestId = manifestIds.length === 1 ? manifestIds[0] : manifestId;
-    if (manifestIds.length > 1) {
+    // More than one manifest is EXPECTED when the batch spans several ad accounts (one packet per
+    // account); it is only suspicious when it exceeds that, i.e. pre-existing idempotent hits.
+    if (manifestIds.length > manifestByAccount.size) {
       // Second-review fix: this genuinely CAN'T be made fully correct
       // without a return-contract change (multiple real manifestIds, no
       // single one actually contains every staged decision) — nothing
@@ -13798,7 +14284,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     return {
       manifestId: reportedManifestId,
       turnMessage:
-        count === 1
+        manifestIds.length > 1
+          ? `These ${count} changes span ${manifestIds.length} ad accounts, so they were queued as ${manifestIds.length} separate packets (one per account) for the assigned approver in the Approval Desk. I'll resume automatically as each is resolved.`
+          : count === 1
           ? `This change needs review before it runs — queued for the assigned approver in the Approval Desk. I'll resume automatically once it's resolved.`
           : `This packet of ${count} change${count === 1 ? '' : 's'} needs review before ${count === 1 ? 'it runs' : 'they run'} — queued for the assigned approver in the Approval Desk. I'll resume automatically once it's resolved.`,
     };
@@ -13972,6 +14460,11 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
 
     const target: Record<string, any> = { entity_type, action, account_id: scopeAccountId };
     const lines: string[] = [];
+    // The entity being UPDATED (never set on a CREATE) — already fetched in full by
+    // resolveCampaign/resolveAdSet/resolveAd below for its .name, but every other field
+    // on it (current daily_budget, current status, ...) was being thrown away. Kept here
+    // so the Changes: line below can show what's actually changing, not just which keys.
+    let currentEntity: any;
 
     /*
      * Best-effort resolvers — each guarded so a Meta lookup failure never blocks the gate.
@@ -14041,6 +14534,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         lines.push(`Create a NEW campaign "${params.name}" (objective: ${params.objective || 'unspecified'}) in ad account ${scopeAccountId}.`);
       } else {
         const campaign = await resolveCampaign(campaign_id);
+        currentEntity = campaign;
         target.campaign = nameOf(campaign, campaign_id);
         target.campaign_id = campaign_id;
         lines.push(`${action} campaign ${target.campaign} in ad account ${scopeAccountId}.`);
@@ -14053,6 +14547,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         lines.push(`Create a NEW ad set "${params.name}" UNDER campaign ${target.campaign} (ad account ${scopeAccountId}).`);
       } else {
         const adSet = await resolveAdSet(ad_set_id);
+        currentEntity = adSet;
         const campaign = await resolveCampaign(adSet?.campaign_id);
         target.ad_set = nameOf(adSet, ad_set_id);
         target.campaign = campaign ? nameOf(campaign, adSet?.campaign_id) : undefined;
@@ -14086,6 +14581,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           + `which RESETS THE AD'S LEARNING PHASE and can hurt performance on a live client campaign.`);
       } else {
         const ad = await resolveAd(ad_id);
+        currentEntity = ad;
         const adSet = await resolveAdSet(ad?.adset_id);
         const campaign = await resolveCampaign(ad?.campaign_id);
         target.ad = nameOf(ad, ad_id);
@@ -14113,13 +14609,77 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     }
 
     // Surface content/destination changes so the user can catch a wrong-asset edit.
+    // Review fix (ENG-1853 follow-up): this used to list only the changed field NAMES
+    // ("Changes: daily_budget.") with neither the current nor the proposed value — a
+    // reviewer approving a real budget/status change had no way to tell $60→$110 from
+    // $6,000→$11,000 without leaving the page. currentEntity (already fetched above
+    // for its .name, previously discarded) supplies the "before" side; params supplies
+    // the "after" side — both were already right here.
+    // Every agent money input is in MAJOR units of the ad account's currency (ENG-2277:
+    // normalizeMetaMoneyParams) and Meta reports the current value in MINOR units as a numeric
+    // STRING ("3000"). Both sides go through the same normalizeMetaMoney the writers use, so the
+    // card shows exactly the amount that will be submitted — "daily_budget: 3000 (= $30.00) →
+    // 310000 (= $3,100.00)" — including for zero-decimal currencies. If the account currency
+    // can't be read, the raw value is shown and flagged rather than guessed.
+    const MONEY_KEYS = new Set(['daily_budget', 'lifetime_budget', 'bid_amount', 'budget_amount', 'spend_cap']);
+    let accountCurrency: string | undefined;
+    if (accessToken && [...MONEY_KEYS].some((k) => params?.[k] !== undefined)) {
+      // Bounded: this runs on the halt path, and a stalled Graph read must not hold the approval card up.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        accountCurrency = await Promise.race([
+          metaService.getAdAccountCurrency(scopeAccountId, accessToken),
+          new Promise<undefined>((resolve) => { timer = setTimeout(() => resolve(undefined), 5000); }),
+        ]);
+      } catch { /* shown as unverified below */ } finally { if (timer) clearTimeout(timer); }
+    }
+    let currencyUnverified = false;
+    const money = (value: any, unit: 'major' | 'minor'): string => {
+      try {
+        // Only Meta's own read-back ("3000") is a numeric string; the writers reject a string
+        // PROPOSAL, so the card must not quietly accept one.
+        const n = unit === 'minor' && typeof value === 'string' && /^\d+(\.\d+)?$/.test(value) ? Number(value) : value;
+        return normalizeMetaMoney(n, accountCurrency, unit).description;
+      } catch {
+        currencyUnverified = true;
+        return `${String(value)} (${unit} units, currency unverified)`;
+      }
+    };
+    const formatChange = (key: string, value: any, side: 'before' | 'after'): string => {
+      if (value === undefined || value === null) return 'unset';
+      const text = MONEY_KEYS.has(key) ? money(value, side === 'before' ? 'minor' : 'major')
+        : value !== null && typeof value === 'object' ? JSON.stringify(value) : String(value);
+      // Long copy and object-valued fields (placement_assets, adset_schedule) must not flood the card.
+      return text.length > 160 ? `${text.slice(0, 157)}...` : text;
+    };
     const contentChanges: Record<string, any> = {};
-    for (const key of ['link_url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'status', 'daily_budget', 'lifetime_budget', 'creative_id', 'placement_assets', 'adset_schedule', 'pacing_type']) {
-      if (params[key] !== undefined) contentChanges[key] = params[key];
+    const changeDescriptions: string[] = [];
+    // A rename is a real change a reviewer must see; on CREATE the name is already in the summary line.
+    const changeKeys = ['link_url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'status', 'daily_budget', 'lifetime_budget', 'budget_amount', 'bid_amount', 'spend_cap', 'creative_id', 'placement_assets', 'adset_schedule', 'pacing_type'];
+    if (action !== 'CREATE') changeKeys.unshift('name');
+    // Everything else the write will send must be visible too (targeting, start/end time, bid
+    // strategy, …) — a card that lists only a fixed allowlist lets a reviewer approve fields they
+    // never saw. Internal control params (override/confirmation tokens) are not Meta fields.
+    for (const key of Object.keys(params || {})) {
+      if (changeKeys.includes(key) || (action === 'CREATE' && (key === 'name' || key === 'objective'))) continue;
+      if (/token|override|confirm/i.test(key) || ['campaign_id', 'adset_id', 'ad_set_id', 'ad_id', 'account_id'].includes(key)) continue;
+      changeKeys.push(key);
+    }
+    for (const key of changeKeys) {
+      if (params[key] === undefined) continue;
+      contentChanges[key] = params[key];
+      const before = currentEntity?.[key === 'budget_amount' ? 'daily_budget' : key];
+      const after = formatChange(key, params[key], 'after');
+      changeDescriptions.push(
+        before !== undefined ? `${key}: ${formatChange(key, before, 'before')} → ${after}` : `${key} → ${after}`,
+      );
     }
     if (Object.keys(contentChanges).length > 0) {
       target.changes = contentChanges;
-      lines.push(`Changes: ${Object.keys(contentChanges).join(', ')}.`);
+      lines.push(`Changes: ${changeDescriptions.join(', ')}.`);
+    }
+    if (currencyUnverified) {
+      lines.push('WARNING: the ad account currency could not be verified, so the amounts above are NOT converted — confirm the real amounts before approving.');
     }
 
     /*
@@ -14519,7 +15079,12 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     params: any = {},
     sessionId?: string
   ): Promise<MetaApiResult> {
-    return adsApisImpl.callMetaMarketingApi(userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params, sessionId, {
+    return adsApisImpl.callMetaMarketingApi(userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params, sessionId, this.metaMarketingApiDeps());
+  }
+
+  private metaMarketingApiDeps(): adsApisImpl.CallMetaMarketingApiDeps {
+    return {
+      preparePausedMetaBundle: this.preparePausedMetaBundle.bind(this),
       resolveCampaignObjectiveGate: this.resolveCampaignObjectiveGate.bind(this),
       validateMetaActionParams: this.validateMetaActionParams.bind(this),
       claimMetaWriteManifestGrant: this.claimMetaWriteManifestGrant.bind(this),
@@ -14530,7 +15095,95 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       remedyFromScopeRefusal: AgentModeService.remedyFromScopeRefusal,
       getMetaCredentials: this.getMetaCredentials.bind(this),
       checkMetaBudgetChange: this.checkMetaBudgetChange.bind(this),
-    });
+    };
+  }
+
+  /** A brief is a write item, never a generic planning answer or an objective-only grant. */
+  private async preflightPausedMetaBundle(userId: string, sessionId: string | undefined, accountId: string, accessToken: string, bundle: PausedMetaBundle) {
+    const session = sessionId ? await chatbotDb.getChatSession(sessionId) : null;
+    if (!session || session.userId !== userId) throw new Error('A paused bundle needs an owned chat session and explicit review-card approval.');
+    assertPausedBundleUserCount(bundle, await chatbotDb.getMessagesFromMessagesTable(sessionId!));
+    return preflightPausedMetaCreatives(bundle, accountId, id => metaService.getAdCreative(accessToken, id));
+  }
+
+  private async preparePausedMetaBundle(userId: string, sessionId: string | undefined, accountId: string, input: unknown): Promise<any> {
+    try {
+      const bundle = parsePausedMetaBundle(input);
+      const session = sessionId ? await chatbotDb.getChatSession(sessionId) : null;
+      if (!session || session.userId !== userId) throw new Error('A paused bundle needs an owned chat session and explicit review-card approval.');
+      const creds = await this.getMetaCredentials(userId, accountId);
+      const { getMetaPagesAccessState, getMetaAdsNoPagesMessage } = await import('../utils/metaAdsScope');
+      if (getMetaPagesAccessState(creds.connection?.config) === 'missing') throw new Error(getMetaAdsNoPagesMessage(creds.connection?.config));
+      bundle.creative_preflight = await this.preflightPausedMetaBundle(userId, sessionId, creds.accountId, creds.accessToken, bundle);
+      const money = await this.normalizeMetaMoneyParams(creds.accountId, creds.accessToken,
+        bundle.campaign.advantage_campaign_budget ? bundle.campaign : bundle.ad_set);
+      // Frozen alongside the exact fields. A later currency/connection change invalidates the grant.
+      if (!money.currency) throw new Error('Account currency could not be verified.');
+      bundle.currency = money.currency;
+      const grant = await this.claimMetaWriteManifestGrant(userId, sessionId!, 'CAMPAIGN', PAUSED_BUNDLE_ACTION, creds.accountId, undefined, undefined, undefined, bundle);
+      if (grant.granted) return this.dispatchAuthorizedMetaWrite(userId, 'CAMPAIGN', PAUSED_BUNDLE_ACTION, creds.accountId, undefined, undefined, undefined, bundle, false, sessionId);
+      if (grant.reason === 'already_consumed') return { success: false, complete: false,
+        message: 'This exact paused bundle approval has already been claimed. No new writes or approval request were made. Use the persisted approval execution result; do not recreate it.' };
+      const summary = pausedBundleSummary(bundle, creds.accountId);
+      return {
+        success: true, awaitingUserConfirmation: true, requiresConfirmation: true,
+        summary, confirmationDetail: summary, confirmationPrompt: summary,
+        message: `${summary}\nSubmit the single review card. The server executes the stored brief; do not re-call individual creates or ask for the objective again.`,
+        target: { account_id: creds.accountId }, metaWriteManifestDigest: grant.digest,
+        metaWriteDispatch: { entity_type: 'CAMPAIGN', action: PAUSED_BUNDLE_ACTION, account_id: creds.accountId, resolvedAccountId: creds.accountId, params: bundle },
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Invalid paused bundle.';
+      return { success: false, message, error: `PAUSED_BUNDLE_REFUSED: ${message}` };
+    }
+  }
+
+  /**
+   * ENG-2303 P3 — the Meta Toolkit's preview of a guarded write: the same shared gate as
+   * callMetaMarketingApi (validation, Page check, ownership, budget anomaly, confirmation
+   * summary), sessionless so it can only halt with a preview and never dispatches. The one
+   * difference is the ENG-400 objective gate: an external agent has no Emma transcript or
+   * approval deck, so the objective must be supplied explicitly, is validated here, and is
+   * shown in the bound preview — the user's approval of that preview is the human choice.
+   * It never auto-provisions an Emma chat session.
+   */
+  public async previewToolkitMetaWrite(
+    userId: string, entity_type: any, action: string, account_id: string,
+    campaign_id?: string, ad_set_id?: string, ad_id?: string, params: any = {},
+  ): Promise<MetaApiResult> {
+    const deps = this.metaMarketingApiDeps();
+    deps.resolveCampaignObjectiveGate = buildToolkitObjectiveGate(AgentModeService.META_OBJECTIVE_VALUES);
+    return adsApisImpl.callMetaMarketingApi(userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params, undefined, deps);
+  }
+
+  /**
+   * ENG-2303 P3 — Meta Toolkit (external MCP) seams. The external agent's user approves a
+   * preview in their own conversation; the toolkit binds the confirm to that exact preview
+   * (HMAC, see mcp/metaToolkitWrites.ts) and then dispatches the SAME way an approved
+   * deck item does: through dispatchAuthorizedMetaWrite, so the budget-anomaly re-check,
+   * tracking pre-flight and rate shaper all stay in the path. These three methods perform
+   * no authorization of their own.
+   */
+  public async previewMetaMoneyParams(userId: string, account_id: string, params: any) {
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    return this.normalizeMetaMoneyParams(accountId, accessToken, params);
+  }
+
+  public async dispatchToolkitConfirmedMetaWrite(
+    userId: string,
+    dispatch: { entity_type: string; action: string; account_id: string; resolvedAccountId?: string; campaign_id?: string; ad_set_id?: string; ad_id?: string; params: any },
+  ): Promise<{ result: MetaApiResult; createdId?: string }> {
+    const result = await this.dispatchAuthorizedMetaWrite(
+      userId, dispatch.entity_type, dispatch.action, dispatch.resolvedAccountId || dispatch.account_id,
+      dispatch.campaign_id, dispatch.ad_set_id, dispatch.ad_id, dispatch.params, false, undefined,
+    );
+    return { result, createdId: AgentModeService.extractDispatchedObjectId(result) };
+  }
+
+  /** Read-back after a toolkit write: status + effective status + budgets, ownership-scoped. */
+  public async readBackMetaWriteTarget(userId: string, account_id: string, entity_type: string, id: string) {
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    return readBackMetaNode(metaService, accountId, accessToken, entity_type, id);
   }
 
   /**
@@ -14560,6 +15213,25 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     overrideApproved: boolean,
     sessionId: string | undefined,
   ): Promise<MetaApiResult> {
+    if (action === PAUSED_BUNDLE_ACTION) {
+      if (entity_type !== 'CAMPAIGN' || campaign_id || ad_set_id || ad_id || overrideApproved) throw new Error('Invalid paused-bundle scope.');
+      const creds = await this.getMetaCredentials(userId, account_id);
+      if (creds.accountId.replace(/^act_/, '') !== account_id.replace(/^act_/, '')) throw new Error('Approved bundle account changed.');
+      const { getMetaPagesAccessState, getMetaAdsNoPagesMessage } = await import('../utils/metaAdsScope');
+      if (getMetaPagesAccessState(creds.connection?.config) === 'missing') throw new Error(getMetaAdsNoPagesMessage(creds.connection?.config));
+      return executePausedMetaBundle(params, {
+        preflight: bundle => this.preflightPausedMetaBundle(userId, sessionId, creds.accountId, creds.accessToken, bundle),
+        normalize: p => this.normalizeMetaMoneyParams(creds.accountId, creds.accessToken, p),
+        write: (entity, p, campaign, adSet) => this.dispatchAuthorizedMetaWrite(userId, entity, 'CREATE', account_id, campaign, adSet, undefined, p, false, sessionId),
+        read: async (entity, id, fields) => {
+          if (entity === 'AD') return metaService.getAd(creds.accessToken, id, creds.accountId);
+          const rows = entity === 'CAMPAIGN'
+            ? (await metaService.listCampaigns(creds.accountId, creds.accessToken, { campaignId: id, fields })).campaigns
+            : (await metaService.listAdSets(creds.accountId, creds.accessToken, undefined, { adSetId: id, fields })).adSets;
+          return Array.isArray(rows) ? rows.find(row => row && typeof row === 'object' && !Array.isArray(row) && row.id === id) : null;
+        },
+      }) as Promise<MetaApiResult>;
+    }
     const budgetAnomaly = await this.checkMetaBudgetChange(
       userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params, sessionId,
     );
@@ -14793,7 +15465,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           // above correctly used the raw id (matching the digest's own input); this
           // is the one place that must use the resolved one.
           const dispatchResult = await this.dispatchAuthorizedMetaWrite(
-            userId, dispatch.entity_type, dispatch.action, dispatch.resolvedAccountId ?? dispatch.account_id,
+            userId, dispatch.entity_type, dispatch.action, dispatch.action === PAUSED_BUNDLE_ACTION ? dispatch.account_id : dispatch.resolvedAccountId ?? dispatch.account_id,
             dispatch.campaign_id, dispatch.ad_set_id, dispatch.ad_id, dispatch.params,
             false, sessionId,
           );
@@ -14824,6 +15496,11 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       // Emma never actually received anything more specific than "Invalid parameter."
       return { verified: false, error: result?.message || result?.error || 'Meta write failed' };
     }
+    // An accepted write whose verification failed is not a verified workflow checkpoint.
+    if (result.readBackVerified === false || result.budget_verification === 'UNCONFIRMED' ||
+        result.budget_verification === 'MISMATCH' || result.spend_cap_verified === false || result.verified === false) {
+      return { verified: false, error: result.message || 'Meta write could not be verified.' };
+    }
     // Reuses whatever read-back mismatch detection the underlying write
     // method already performs (Phase 1's existing resolver — today,
     // AD_SET CREATE's bid_strategy/budget/timing comparison; not yet a
@@ -14847,6 +15524,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       verified: true,
       verifiedFields: {
         appliedObjectId: AgentModeService.extractDispatchedObjectId(result),
+        ...((result as any).ledger ? { ledger: (result as any).ledger, requested_ad_count: (result as any).requested_ad_count, verified_ad_count: (result as any).verified_ad_count } : {}),
         ...(result.readBackVerified === true ? { readBack: result.readBack } : {}),
       },
     };
@@ -14882,6 +15560,11 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         outputs: [],
         requiredParameters: [],
         execute: async (): Promise<Record<string, unknown>> => {
+          if (dispatch.action === PAUSED_BUNDLE_ACTION) {
+            const digest = await this.resolveMetaWriteManifestDigest(userId, dispatch.entity_type, dispatch.action, dispatch.account_id,
+              dispatch.campaign_id, dispatch.ad_set_id, dispatch.ad_id, dispatch.params);
+            if (digest !== decision.metaWriteManifestDigest) throw new Error('Paused bundle scope changed after approval.');
+          }
           // Review fix: advanceIndependentWorkflow provides no mutual
           // exclusion between two concurrent drivers of the SAME run picking
           // the same un-checkpointed step (unlike buildMetaWriteWorkflowSteps
@@ -14924,7 +15607,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
             throw new StepContendedError('This write is already being dispatched by a concurrent request.');
           }
           const dispatchResult = await this.dispatchAuthorizedMetaWrite(
-            userId, dispatch.entity_type, dispatch.action, dispatch.resolvedAccountId ?? dispatch.account_id,
+            userId, dispatch.entity_type, dispatch.action, dispatch.action === PAUSED_BUNDLE_ACTION ? dispatch.account_id : dispatch.resolvedAccountId ?? dispatch.account_id,
             dispatch.campaign_id, dispatch.ad_set_id, dispatch.ad_id, dispatch.params,
             false, originSessionId,
           );
@@ -15521,7 +16204,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       stepId: c.stepId,
       status: c.status,
       ...(c.status === 'verified'
-        ? { appliedObjectId: (c.verifiedFields as any)?.appliedObjectId as string | undefined }
+        ? { appliedObjectId: (c.verifiedFields as any)?.appliedObjectId as string | undefined,
+          ...(c.verifiedFields?.ledger ? { bundle: { requested_ad_count: c.verifiedFields.requested_ad_count as number,
+            verified_ad_count: c.verifiedFields.verified_ad_count as number, ledger: c.verifiedFields.ledger as unknown[] } } : {}) }
         : {}),
       ...(c.status === 'failed'
         ? Array.isArray(c.discrepancy)
@@ -16053,6 +16738,13 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     }
     // manage_scheduled_chat validation errors — guide LLM to the exact fix instead of a generic retry
     if (toolName === 'manage_scheduled_chat') {
+      // ENG-1656: tool-side preflight already names the exact field to fix.
+      if (safeMessage.includes('Invalid manage_scheduled_chat arguments')) {
+        return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: Correct exactly the argument named above and retry immediately. Nothing was sent to the server, so no schedule was created or changed.`;
+      }
+      if (safeMessage.includes('Invalid nextRunTime') || safeMessage.includes('valid IANA timezone') || safeMessage.includes('Invalid status')) {
+        return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: next_run_time must be an ISO 8601 datetime, timezone a valid IANA identifier (e.g. America/Los_Angeles), and toggle status "active" or "paused". Correct the named value and retry immediately.`;
+      }
       if (safeMessage.includes('Missing required fields')) {
         return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: For action "create", schedule_name, starting_message, and schedule_frequency are all required. For action "update", these three fall back to the schedule's existing values if omitted, but at least one must resolve to a non-empty value. Add the missing field(s) named above and retry immediately.`;
       }
@@ -16738,8 +17430,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   // readFileContent.test.ts/emma.readFileContentTool.test.ts's direct
   // real-instance calls all call agentModeService.readFileContent(...)
   // directly.
-  public async readFileContent(fileUrl: string): Promise<any> {
-    return miscImpl.readFileContent(fileUrl);
+  public async readFileContent(fileUrl: string, caller?: miscImpl.ReadFileCallerContext): Promise<any> {
+    return miscImpl.readFileContent(fileUrl, caller);
   }
 
   // ENG-2103 (F2 design-decision-list follow-up, Pattern A): body moved
@@ -17369,8 +18061,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   // delegating wrapper — real callers beyond tools.ts: routes/emmaApi.ts's
   // POST /social-post handler, and many direct real-instance calls in
   // agentModeService.socialTools.test.ts.
-  async postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any): Promise<any> {
-    return linkedinImpl.postOnConnectedAccount(userId, accountId, content, mediaUrls, platform, toolContext);
+  async postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any, options?: { saveAsDraft?: boolean; inReplyToPostId?: string }): Promise<any> {
+    return linkedinImpl.postOnConnectedAccount(userId, accountId, content, mediaUrls, platform, toolContext, options);
   }
 
   /**

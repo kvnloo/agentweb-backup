@@ -1,6 +1,7 @@
 import { chatbotDb } from './chatbotService';
 import { approvalInboxService, type ApprovalDecision } from './approvalInboxService';
 import { agentModeService } from './agentModeService';
+import { isModelUnavailableError } from './agentMode/modelUnavailable';
 // A service importing from the controller layer is an already-established
 // pattern in this codebase (emmaEmailService.ts does the same), not a new
 // direction — generateSessionResponse is the one place session-history
@@ -12,9 +13,11 @@ import { agentModeService } from './agentModeService';
 // concurrently-running user turn on the same session.
 import {
   generateSessionResponse,
+  recordModelRefusal,
   tryClaimSessionGeneration,
   releaseSessionGeneration,
 } from '../controllers/agentModeController';
+import { isAgentWebModelId } from './agentMode/agentWebModelRouter';
 
 /**
  * ENG-1644 Phase D: what "executing" a resolved decision means, per gate
@@ -116,7 +119,7 @@ export async function resumeOriginSession(sessionId: string, messageContent: str
     return;
   }
 
-  if (!tryClaimSessionGeneration(sessionId)) {
+  if (!tryClaimSessionGeneration(sessionId, session.userId)) {
     console.warn(`[approval-inbox-execution] session ${sessionId} already generating — recording a passive note instead of actively resuming.`);
     await recordPassiveSessionNote(sessionId, messageContent);
     return;
@@ -154,6 +157,30 @@ export async function resumeOriginSession(sessionId: string, messageContent: str
   } catch (err: any) {
     console.warn('[approval-inbox-execution] active resume failed, recording a passive note instead:', sessionId, err?.message || err);
     await recordPassiveSessionNote(sessionId, messageContent);
+    // ENG-669: the resume was refused because the session's model is outside the owner's plan (only with the tier
+    // allowlist on). The note above is model-only context, so tell the user why Emma did not pick the work back up:
+    // exactly one saved refusal (reusing the one generateSessionResponse may already have saved) and one live update.
+    // ENG-669 PR-C: likewise when the session's selection is the AgentWeb Model and its router is switched off or
+    // unavailable (any reason). Other models' refusals keep their previous handling (the passive note only).
+    if (isModelUnavailableError(err) && (err.reason === 'not_in_plan' || isAgentWebModelId(err.requestedModel))) {
+      const refusal = await recordModelRefusal(sessionId, err);
+      if (refusal) {
+        try {
+          const { io } = await import('../server');
+          io.to(`user:${session.userId}`).emit('session-message-appended', {
+            sessionId,
+            message: {
+              role: 'assistant',
+              content: refusal.content,
+              ...(typeof refusal.messageIndex === 'number' && { messageIndex: refusal.messageIndex }),
+              metadata: { isErrorMessage: true },
+            },
+          });
+        } catch (emitErr: any) {
+          console.error('[approval-inbox-execution] failed to emit the model refusal:', sessionId, emitErr?.message || emitErr);
+        }
+      }
+    }
   } finally {
     releaseSessionGeneration(sessionId);
   }

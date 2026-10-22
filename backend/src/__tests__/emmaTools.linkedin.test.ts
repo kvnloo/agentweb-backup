@@ -84,6 +84,13 @@ describe('LinkedIn posting & outreach tool cluster (ENG-2103 F2)', () => {
       expect(result).toBe(expected);
     });
 
+    it('ENG-428: post_on_connected_account forwards save_as_draft as saveAsDraft', async () => {
+      (mockLinkedin.postOnConnectedAccount as jest.Mock).mockResolvedValue({ success: true, draft: true });
+      const context = { userId: 'u1' };
+      await emmaToolRegistry.getTool('post_on_connected_account')!.execute({ content: 'x', platform: 'linkedin', save_as_draft: true }, context);
+      expect(mockLinkedin.postOnConnectedAccount).toHaveBeenLastCalledWith('u1', undefined, 'x', undefined, 'linkedin', context, { saveAsDraft: true });
+    });
+
     it('linkedin_outreach calls linkedinImpl.linkedinOutreach with agentModeService.callLLM bound, not agentModeService.linkedinOutreach', async () => {
       const expected = { success: true, data: {} };
       mockLinkedin.linkedinOutreach.mockResolvedValue(expected);

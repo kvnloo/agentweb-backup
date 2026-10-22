@@ -31,6 +31,13 @@ instructions narrow and operational.
   cannot schedule a run at all — and on a stale draft-time run in which every job
   skipped. Exit 3 is `NO_EVIDENCE`, meaning nothing has ever executed against
   this head; it is not a pass and never satisfies the gate (ENG-757).
+- ENG-2116: PRs owned by Argusoft engineers (author `anurag-seth` /
+  `mananv-argusoft`, or branches `anurag/`, `manan/`, ...) return exit 5
+  `FOREIGN_OWNER`; agents must not merge, push to, or close them. Exception
+  (Harsha, 2026-10-13): an agent directed by the PR's own author may merge it on
+  the normal green gate. Run the gate with
+  `MERGE_EVIDENCE_DIRECTING_LOGIN=<your GitHub login>`; it must equal the PR
+  author exactly. Never set it to anyone but the human directing you.
 - Prefer the repository's configured GitHub auto-merge mechanism. If merge is
   blocked by a stale branch, merge queue state, flaky gate, or sync issue, fix
   that condition, rerun the affected gates, and merge once the latest head is

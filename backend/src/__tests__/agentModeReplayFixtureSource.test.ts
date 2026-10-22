@@ -22,6 +22,7 @@ function storeWithLinks(links: Array<[string, { sessionId: string; messageIndex:
     createCase: jest.fn(),
     saveLabels: jest.fn(),
     saveDraft: jest.fn(),
+    setExclusion: jest.fn(),
   };
 }
 

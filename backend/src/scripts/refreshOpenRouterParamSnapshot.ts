@@ -8,7 +8,8 @@
  *
  * Uses the public, unauthenticated `GET /api/v1/models/{id}/endpoints`, which
  * (unlike the `/models` list) follows aliases such as `qwen/qwen3.8-max` to the
- * dated snapshot OpenRouter actually routes to.
+ * dated snapshot OpenRouter actually routes to. openRouterRequestParams.registryGuard
+ * fails if a registry id resolves to a different id here (an alias = a stale registry id).
  */
 import * as fs from 'fs';
 import { fetchJson, parseEndpointProviders } from '../services/agentMode/frontierMonitor';

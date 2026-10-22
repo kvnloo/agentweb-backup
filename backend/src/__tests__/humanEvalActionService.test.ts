@@ -267,3 +267,32 @@ describe('runHumanEvalFeedbackAction', () => {
     expect(mockPostSlackMessage).not.toHaveBeenCalled();
   });
 });
+
+// ENG-669 PR-C (rv-3681): the ack promised a post-back; a refused chat model (model_unavailable) is posted with what to
+// do instead of being dropped by the caller's bare catch.
+import { ModelUnavailableError } from '../services/agentMode/modelUnavailable';
+
+describe('runHumanEvalFeedbackAction — the chat\'s model refused (model_unavailable)', () => {
+  const imageCandidate = (overrides: Partial<HumanEvalCandidate> = {}) => candidate({
+    reviewType: 'creative_image', userId: 'user-1', sessionId: 'session-1', artifactUrl: 'https://example.com/image.png',
+    action: { type: 'agent_mode_image_revision', userId: 'user-1', sessionId: 'session-1', artifactUrl: 'https://example.com/image.png', filename: 'image.png' },
+    ...overrides,
+  });
+
+  it('posts the refusal and what to do to the review thread, and does not throw', async () => {
+    (runVerifiedChat as jest.Mock).mockRejectedValueOnce(new ModelUnavailableError('agentweb-model', 'not_served'));
+    await expect(runHumanEvalFeedbackAction(imageCandidate(), feedback)).resolves.toBeUndefined();
+    expect(mockPostSlackMessage).toHaveBeenCalledTimes(1);
+    expect(mockPostSlackMessage).toHaveBeenCalledWith(
+      'C_EVAL',
+      expect.stringMatching(/AgentWeb Model isn't available right now.*choose another model for this chat in AgentWeb, then retry the feedback/s),
+      '178.0',
+    );
+  });
+
+  it('never posted to Slack: nothing to post to, and no throw', async () => {
+    (runVerifiedChat as jest.Mock).mockRejectedValueOnce(new ModelUnavailableError('agentweb-model', 'not_served'));
+    await expect(runHumanEvalFeedbackAction(imageCandidate({ slackChannel: undefined, slackMessageTs: undefined }), feedback)).resolves.toBeUndefined();
+    expect(mockPostSlackMessage).not.toHaveBeenCalled();
+  });
+});
