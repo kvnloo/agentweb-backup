@@ -367,6 +367,11 @@ async function findOrgSharedHubSpotAccounts(userId: string) {
   }
 }
 
+/** The org-shared HubSpot account with this id that `userId` may use, or null. */
+export async function findOrgSharedHubSpotAccountById(userId: string, accountId: string) {
+  return (await findOrgSharedHubSpotAccounts(userId)).find(acc => acc.account_id === accountId) ?? null;
+}
+
 /**
  * Which accounts may serve a call. 'any' (the default): the caller's own, then org-shared ones. 'own':
  * the caller's own only (exactly the pre-ENG-2605 behaviour). 'shared': only accounts an org admin
