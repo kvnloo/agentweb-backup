@@ -689,6 +689,20 @@ Rules the code enforces:
   **Kill switch:** set the environment variable `HOT_LEAD_CALL_RENT_METERING` to
   `0`, `false` or `off` and restart; it is on when unset. Events already written
   stay, and re-enabling later cannot double-charge.
+  Rent is always charged to the org owner, at purchase as well as in the sweep.
+  An org with no `ownerUserId` is charged to the buyer at purchase and then
+  skipped by the sweep; every skipped org is logged at error level with its
+  orgId and reason, and the cron's summary line is an error whenever anything
+  was skipped or failed. Known limits:
+  - If the org owner changes mid-month, the new owner's first sweep that month
+    writes a second event for the same number (a different billing partition).
+  - If the usage recorder has a partial outage and a later sweep succeeds, its
+    fallback path can add the usage aggregate a second time (recorder behaviour,
+    not specific to rent). The sweep reports `metered` without error in that case.
+  - A kill-switch value other than `0`, `false` or `off` (for example `no`)
+    leaves the sweep ON, the safe direction for a billing job.
+  - The timer is not stored or unref'd, and overlapping runs are harmless: the
+    conditional write makes the second one a no-op (same as the seat-credit job).
 - Calls made while the org is disabled or the switch is off (a call already in
   flight) are still metered from the list owner's id.
 
