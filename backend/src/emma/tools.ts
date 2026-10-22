@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
 import { MODIFY_WORK_PLAN_INPUT_SCHEMA, validateModifyWorkPlanArgs } from './impl/modifyWorkPlanArgs';
 import { agentModeService } from '../services/agentModeService';
+import { APPROVAL_KIND_RESERVED_PREFIX } from '../services/voice/hotLeadCallApprovalGate';
 import { getAccessToken as getClickUpAccessToken, createTaskInList as createClickUpTaskInList, getListCustomFields as getClickUpListCustomFields, ClickUpTaskError } from '../services/clickupService';
 import { emmaToolRegistry } from './registry';
 import { auditCampaigns } from '../services/adUtmAuditService';
@@ -250,6 +251,8 @@ emmaToolRegistry.register({
 // only widens Emma's OWN judgment-based use of the card within Meta; it does
 // not add a new hard-enforced gate for other Meta entities — that requires its
 // own dedicated gate, built the same way ENG-400 was, per irreversible action.
+const RESERVED_QUESTION_KIND_PREFIXES = [APPROVAL_KIND_RESERVED_PREFIX];
+
 emmaToolRegistry.register({
   name: 'ask_user_question',
   definition: {
@@ -310,6 +313,11 @@ If the user replies with a TYPED message instead of clicking an option, that ope
     const sessionId = context?.sessionId;
     if (!sessionId) {
       return { success: false, message: 'ask_user_question requires an active session.' };
+    }
+    // Cards with these kinds are written only by their own gate; a model-authored card could otherwise
+    // pass for the approval a gate waits for.
+    if (typeof args.kind === 'string' && RESERVED_QUESTION_KIND_PREFIXES.some(prefix => args.kind.startsWith(prefix))) {
+      return { success: false, message: `kind "${args.kind}" is reserved for a built-in approval card. Omit kind or use another value.` };
     }
     // Normalize incoming options: assign a stable id when the model omitted one —
     // same normalization present_question_deck's execute() applies.
