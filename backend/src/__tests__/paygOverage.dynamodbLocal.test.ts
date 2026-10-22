@@ -64,6 +64,7 @@ jest.mock('../services/stripeService', () => ({
     issuePaygOverageInvoice: jest.fn(),
     paygOverageInvoicePaymentState: jest.fn(),
     listChargeRefunds: jest.fn(),
+    retrievePaygOverageInvoice: jest.fn(),
   },
 }));
 jest.mock('../services/spendEventDb', () => ({
@@ -103,7 +104,7 @@ suite('PAYG conditional writes against DynamoDB Local', () => {
     tierName: jest.Mock; tierConfig: jest.Mock; getSetting: jest.Mock; spendBasis: jest.Mock;
     stripe: {
       resolveUserPaymentMethod: jest.Mock; findLiveCustomerIdForUser: jest.Mock; issuePaygOverageInvoice: jest.Mock;
-      paygOverageInvoicePaymentState: jest.Mock; listChargeRefunds: jest.Mock;
+      paygOverageInvoicePaymentState: jest.Mock; listChargeRefunds: jest.Mock; retrievePaygOverageInvoice: jest.Mock;
     };
     listSpendEvents: jest.Mock; getProjection: jest.Mock; paymentHistory: jest.Mock;
     email: {
@@ -257,6 +258,8 @@ suite('PAYG conditional writes against DynamoDB Local', () => {
     // A failed attempt is a decline unless a test says the bank awaits the owner's confirmation.
     mocks.stripe.paygOverageInvoicePaymentState.mockReset().mockResolvedValue('declined');
     mocks.stripe.listChargeRefunds.mockReset().mockResolvedValue([]);
+    // Stripe still has the invoice open unless a test says otherwise.
+    mocks.stripe.retrievePaygOverageInvoice.mockReset().mockImplementation(async (id: string) => ({ id, status: 'open', metadata: {} }));
     mocks.paymentHistory.mockResolvedValue({ written: true });
     mocks.email.sendOncallAlert.mockResolvedValue(undefined);
     mocks.email.sendPaygOverageInvoiceEmail.mockResolvedValue('sent');
@@ -1132,6 +1135,19 @@ suite('PAYG conditional writes against DynamoDB Local', () => {
       expect(mocks.email.sendOncallAlert).toHaveBeenCalledTimes(1);
     });
 
+    it('rv7 REVIEW: August paid between the won-dispute lift\'s read and its hand-over write => DynamoDB refuses the hand-over; the hold is removed', async () => {
+      const mixed = await failedMonths(['2026-08', M]);
+      await settlement.handlePaygOverageInvoicePaymentFailed(invoiceEvent(mixed, 'in_2026-08', '2026-08'));
+      await settlement.handlePaygOverageInvoicePaid(invoiceEvent(mixed, `in_${M}`));
+      await settlement.handlePaygOverageChargeDisputed({ id: 'dp_r' }, { id: 'ch_r' }, invoiceEvent(mixed, `in_${M}`));
+      // call 1 = recordDisputeClosed, call 2 = the lift's hand-over write
+      beforeWrite(2, () => settlement.handlePaygOverageInvoicePaid(invoiceEvent(mixed, 'in_2026-08', '2026-08')));
+      await settlement.handlePaygOverageChargeDisputeClosed({ id: 'dp_r', status: 'won' }, { id: 'ch_r' }, invoiceEvent(mixed, `in_${M}`));
+      const after = await row(mixed.email);
+      expect(after.paygSettlements['2026-08'].status).toBe('paid');
+      expect(after.paygOverage).not.toHaveProperty('suspended');
+    });
+
     it('the owner\'s invoice link: GET /payg and the turn gate\'s 429 read the failed month\'s hosted page from the row', async () => {
       const o = await failedMonths([M]);
       await settlement.handlePaygOverageInvoicePaymentFailed(invoiceEvent(o, `in_${M}`));
@@ -1412,6 +1428,23 @@ suite('PAYG conditional writes against DynamoDB Local', () => {
       expect(await record(o.email)).toMatchObject({ status: 'failed', invoiceId: 'in_new' });
     });
 
+    // rv7 MINOR: the expiry settles an invoice Stripe already voided / paid the way their webhooks would.
+    it.each([
+      ['void', 'written_off'],
+      ['paid', 'paid'],
+    ] as const)('rv7: overdue unconfirmed month whose invoice is already %s in Stripe -> %s, never held or emailed "confirm"', async (stripeStatus, statusAfter) => {
+      const FM = stripeStatus === 'void' ? '2031-09' : '2031-10';
+      const o = await owner({
+        paygSettlements: { [FM]: settle('invoiced', { invoiceId: `in_${stripeStatus}`, actionRequiredAt: '2031-01-01T00:00:00.000Z' }) },
+      }, { admittedMonths: [] });
+      mocks.stripe.retrievePaygOverageInvoice.mockImplementation(async (id: string) => ({ ...invoiceEvent(o, id, FM), status: stripeStatus }));
+      await settlement.runPaygSettlement(new Date('2031-11-02T12:00:00.000Z'));
+      const after = await row(o.email);
+      expect(after.paygSettlements[FM].status).toBe(statusAfter);
+      expect(after.paygOverage).not.toHaveProperty('suspended');
+      expect(mocks.email.sendPaygOveragePaymentUnconfirmedEmail.mock.calls.filter(([input]: [Json]) => input.to === o.email)).toHaveLength(0);
+    });
+
     // MINOR 5: the grace-period stamp (nested `IN` + `attribute_not_exists`) and the expiry's writes.
     it('rv6 MINOR 5: action required stamps `actionRequiredAt` once; 7 days on, the sweep fails the month, holds PAYG (unconfirmed) and emails once', async () => {
       const FM = '2031-07';
@@ -1419,6 +1452,7 @@ suite('PAYG conditional writes against DynamoDB Local', () => {
         paygSettlements: { [FM]: settle('invoiced', { invoiceId: 'in_unc', hostedInvoiceUrl: 'https://invoice.example/in_unc' }) },
       }, { admittedMonths: [] });
       mocks.stripe.paygOverageInvoicePaymentState.mockResolvedValue('action_required');
+      mocks.stripe.retrievePaygOverageInvoice.mockImplementation(async (id: string) => ({ ...invoiceEvent(o, id, FM), status: 'open' }));
       await settlement.handlePaygOverageInvoicePaymentActionRequired(invoiceEvent(o, 'in_unc', FM));
       const first = (await record(o.email, FM)).actionRequiredAt;
       expect(first).toEqual(expect.any(String));
