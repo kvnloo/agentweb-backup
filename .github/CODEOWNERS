@@ -1,5 +1,5 @@
 # Code owners for the hosted-login worker's deploy path.
-# Anything that can change what runs as root on the worker that holds customers' Claude logins needs one of these people to review it.
+# Anything that can change what runs as root on the worker that holds customers' Claude logins: these people are asked to look at it.
 # Owners are only asked to review (no blocking): "Require review from Code Owners" is deliberately OFF on main so deploys stay automatic.
 
 /backend/src/loginHost/deploy/ @mananv-argusoft @harshmoney123
