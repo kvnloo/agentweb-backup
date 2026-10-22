@@ -77,15 +77,23 @@ export interface SystemModelSession extends StoredModelRecord {
   } | null;
 }
 
-/** A model binding's provenance, as recorded when it was written (undefined = none recorded: a user's). */
+/**
+ * A model binding's provenance, as recorded when it was written. Undefined = none recorded (a legacy stamp written
+ * before provenance existed): checked like a user's pick, except that it may be the session kind's configured default
+ * (see isSystemChosen).
+ */
 export type BindingSource = ModelSource | undefined;
 
 /**
  * ENG-669: the ONE answer to "did AgentWeb choose this model?", the only exemption from the tier allowlist besides an
- * admin owner. True when the binding's provenance, recorded when it was written, says 'system', or the model is the
- * configured default for this session's kind (the interactive default everywhere; the scheduled / report / image /
- * video / customer-support default in such sessions). Nothing else is inferred at check time. An unreadable default
- * contributes nothing.
+ * admin owner. True when the binding's provenance, recorded when it was written, says 'system', or the model is a
+ * configured default that AgentWeb (not the user) put there:
+ *  - the interactive default, everywhere and whatever the source: a turn with no model runs it anyway;
+ *  - the scheduled / report / image / video / customer-support default in a session of that kind, only when the
+ *    binding is NOT the user's pick ('user' = a pick recorded as the user's, or a new pick such as a picker PATCH to
+ *    it). AgentWeb's own stamp of it is recorded 'system'; a legacy stamp with no record (undefined) is still taken as
+ *    AgentWeb's, as before provenance existed.
+ * Nothing else is inferred at check time. An unreadable default contributes nothing.
  */
 export async function isSystemChosen(
   canonicalModel: string,
@@ -97,14 +105,15 @@ export async function isSystemChosen(
   // Each read is isolated: one that throws (even synchronously) contributes nothing and blocks nothing.
   const read = (get: () => Promise<string | undefined | null>) => Promise.resolve().then(get);
   const reads = [read(() => agentModeService.getDefaultModel())];
-  const sessionType = session?.sessionType;
+  // A user's pick of a session kind's default is checked like any other pick (follow-up 1 of #3607).
+  const sessionType = source === 'user' ? undefined : session?.sessionType;
   if (sessionType === 'scheduled') reads.push(read(() => agentModeService.getScheduledChatsDefaultModel()));
   if (sessionType === 'report_generation') {
     reads.push(read(() => agentModeService.getReportsModel()), read(() => agentModeService.getReportGenerationDefaultModel()));
   }
   if (sessionType === 'image-generation') reads.push(read(() => agentModeService.getImageGenerationDefaultModel()));
   if (sessionType === 'video-generation') reads.push(read(() => agentModeService.getVideoGenerationDefaultModel()));
-  if (session?.portalType === 'emma-sidebar') reads.push(read(() => agentModeService.getCustomerSupportDefaultModel()));
+  if (source !== 'user' && session?.portalType === 'emma-sidebar') reads.push(read(() => agentModeService.getCustomerSupportDefaultModel()));
   for (const settled of await Promise.allSettled(reads)) {
     if (settled.status !== 'fulfilled' || typeof settled.value !== 'string' || !settled.value.trim()) continue;
     const resolution = agentModeService.resolveGenerationModel(settled.value.trim());
@@ -126,24 +135,28 @@ export function systemModelCheck(
 
 /**
  * The provenance of the session's STORED model when `model` is that model (re-sending or re-selecting it is not a new
- * pick), else 'user'. `canonical` maps an id to its registry id (legacy aliases resolved).
+ * pick), else 'user' (a new pick). `canonical` maps an id to its registry id (legacy aliases resolved).
+ * A stored model with no recorded source (legacy) follows storedModelSource's legacy rule, and the engine's stamp of a
+ * legacy plan's OWN pin the plan-pin legacy rule; when neither says 'system' it is undefined (none recorded, see
+ * BindingSource), never 'user', so a legacy stamp of the session kind's default stays AgentWeb's.
  */
 export async function storedBindingSource(
   session: SystemModelSession | null | undefined,
   model: string | null | undefined,
   canonical: (id: string) => string,
-): Promise<ModelSource> {
+): Promise<BindingSource> {
   const stored = session?.llmModel;
   const same = (a: unknown) => typeof a === 'string' && !!a.trim() && !!model && canonical(a.trim()) === canonical(model.trim());
   if (!stored || !same(stored)) return 'user';
-  const source = storedModelSource(session) ?? 'user';
+  if (session?.llmModelSource === 'user' || session?.llmModelSource === 'system') return session.llmModelSource;
+  if (storedModelSource(session) === 'system') return 'system';
   // Legacy (no source recorded): the engine's stamp of a legacy plan's OWN pin follows the plan-pin legacy rule.
   const plan = session?.workPlan;
-  if (source === 'user' && !session?.llmModelSource && plan && plan.planAuthor === undefined
+  if (plan && plan.planAuthor === undefined
     && (same(plan.planDefaultModel) || (Array.isArray(plan.steps) && plan.steps.some((step: any) => same(step?.model))))) {
     return legacyPlanPinSource(plan);
   }
-  return source;
+  return undefined;
 }
 
 /**

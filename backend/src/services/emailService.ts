@@ -75,6 +75,8 @@ export type ScheduledRunFailureNotice =
       failureClass: 'model_unavailable'; modelLabel: string; reason: ModelUnavailableReason;
       /** ENG-669 PR-C: the saved model is the AgentWeb Model and the router is unavailable right now (not "gone"). */
       routerUnavailable?: boolean;
+      /** The plans that include the model (the refusal's `upgradeRequired`); empty = none, so no upgrade is offered. */
+      upgradeRequired?: string[];
     };
 
 const EMPTY_RUN_DIGEST_PLACEHOLDER = '(This run produced no report content.)';
@@ -1031,7 +1033,9 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
     if (opts.failureClass === 'model_unavailable') {
       await this.sendModelUnavailableNoticeEmail(
         toEmails,
-        buildScheduleModelNotice({ scheduleName, modelLabel: opts.modelLabel, reason: opts.reason, routerUnavailable: opts.routerUnavailable }),
+        buildScheduleModelNotice({
+          scheduleName, modelLabel: opts.modelLabel, reason: opts.reason, routerUnavailable: opts.routerUnavailable, upgradeRequired: opts.upgradeRequired,
+        }),
         `schedule ${scheduleId}`,
       );
       return;
@@ -1131,6 +1135,8 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
       routerUnavailable?: boolean;
       scheduleName?: string | null;
       sessionTitle?: string | null;
+      /** The plans that include the model (the refusal's `upgradeRequired`); empty = none, so no upgrade is offered. */
+      upgradeRequired?: string[];
     },
   ) {
     await this.sendModelUnavailableNoticeEmail(toEmails, buildWorkPlanStepModelNotice(opts), `session ${opts.sessionId}`);

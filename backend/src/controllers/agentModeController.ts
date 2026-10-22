@@ -70,7 +70,7 @@ import { countCallsSatisfyingRequirement, RequiredCallLedgerEntry } from '../uti
 import { canonicalizeVisibility, resolveVisibilityUpdate } from '../utils/scheduleTemplateVisibility';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
 import { LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON } from '../utils/scheduleRunBlockedReason';
-import { isNewScheduleModelBlock, isScheduleModelBlockedRun, isUnattendedPause, scheduleModelBlockFields, STEP_MODEL_NOTICE_SENT_FLAG, wasStepModelNoticeSent } from '../utils/unattendedModelNotices';
+import { ENDED_BEFORE_MODEL_CHECK_FLAG, isNewScheduleModelBlock, isScheduleModelBlockedRun, isUnattendedPause, scheduleModelBlockFields, SCHEDULE_TEST_RUN_FLAG, STEP_MODEL_NOTICE_SENT_FLAG, wasStepModelNoticeSent } from '../utils/unattendedModelNotices';
 import { shouldRunPreCheckGate, shouldForceProceedAfterSkipStreak, countTrailingGateSkips, countTrailingNoActionableOutputRuns, resolvePreCheckDecision, ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import { ACCOUNT_DISCONNECTED_STATUS, MAX_CONSECUTIVE_ACCOUNT_SKIPS, AccountGateResult, buildAccountSkipReason, countTrailingAccountSkips, evaluateAccountGate } from '../utils/scheduledRunAccountGate';
 import { CapacityGateResult, SEND_CAPACITY_EXHAUSTED_STATUS, buildCapacitySkipReason, evaluateCapacityGate } from '../utils/scheduledRunCapacityGate';
@@ -103,6 +103,7 @@ import {
 import { modelSourceAfter as modelSourceAfterStamp, resolveLegacyModelAlias, type ModelSource, type StoredModelRecord } from '../services/agentMode/modelAccess';
 import {
   anyStepCarriesModel,
+  buildPlanModelRestoreFailedMessage,
   buildStepModelPausedMessage,
   currentPendingStep,
   isStepModelUnavailableError,
@@ -1860,7 +1861,11 @@ async function scheduleAutoMediaContinuation(
   sessionId: string,
   userId: string,
   llmModel: string,
-  round: number
+  round: number,
+  // ENG-669 (#3676 follow-up 2): whether nobody is reading the chat, as decided by the turn that STARTED the chain and
+  // carried through every round (never re-derived from the session's kind): an owner who reopened a scheduled chat is
+  // attended; a headless starter passes true.
+  isUnattendedRun: boolean,
 ): Promise<void> {
   if (round > AUTO_MEDIA_CONTINUATION_MAX_ROUNDS) {
     console.error(
@@ -1967,6 +1972,11 @@ async function scheduleAutoMediaContinuation(
       undefined, // publishAuthorizationOverride
       undefined, // approvedRevisionImageSources
       'auto-continuation', // ENG-1239: hide this server-authored turn in the chat UI
+      undefined, // requireWorkPlanDisposition
+      undefined, // clientId
+      undefined, // approvalDeckAnswerMeta
+      undefined, // approvalDeckCancelledMeta
+      isUnattendedRun, // ENG-669: the chain's attendance (its starting turn's)
     ),
     sessionId
   )
@@ -2061,7 +2071,7 @@ async function scheduleAutoMediaContinuation(
         // (the try/catch above now guards its one known throw point), but every
         // fire-and-forget call site catches defensively anyway, so a future,
         // unanticipated throw logs instead of becoming an unhandled rejection.
-        scheduleAutoMediaContinuation(sessionId, userId, llmModel, round + 1).catch((chainErr) =>
+        scheduleAutoMediaContinuation(sessionId, userId, llmModel, round + 1, isUnattendedRun).catch((chainErr) =>
           console.error(`AgentMode: media auto-continuation chain failed for session ${sessionId}:`, chainErr),
         );
       }
@@ -2165,6 +2175,24 @@ function redactWorkPlanForViewer(workPlan: any, options: { keepStepModels?: bool
   return options.keepStepModels ? rest : { ...rest, ...(Array.isArray(rest.steps) && { steps: withoutStepModels(rest.steps) }) };
 }
 
+/**
+ * ENG-669 (#3607 follow-up 6): a work plan as its OWNER (or anyone but an admin) reads it: without the engine's model
+ * provenance bookkeeping (`planAuthor`, `launchModelSource`, `planDefaultModelSource`, each step's `modelSource`). The
+ * customer portal reads none of these (it reads the step `model`s, `templatePlanId` and the session's own
+ * `llmModelSource`, which stays). Admin session reads keep them. Returns a copy; the stored plan is untouched.
+ */
+function redactWorkPlanProvenance(workPlan: any): any {
+  if (!workPlan || typeof workPlan !== 'object') return workPlan;
+  const { planAuthor: _pa, launchModelSource: _ls, planDefaultModelSource: _ps, ...rest } = workPlan;
+  if (!Array.isArray(rest.steps)) return rest;
+  return {
+    ...rest,
+    steps: rest.steps.map((s: any) => (s && typeof s === 'object' && 'modelSource' in s
+      ? (({ modelSource: _ms, ...step }) => step)(s)
+      : s)),
+  };
+}
+
 /** ENG-2378: public plan responses never expose step models (the plan-level defaultModel exposure is pre-existing). */
 function withoutStepModels(steps: any): any {
   return Array.isArray(steps)
@@ -2196,8 +2224,44 @@ type WorkPlanStepModelTurn =
       source: ModelSource | undefined;
     }
   | { kind: 'restored'; decision: ResolvedStepDecision; source: ModelSource }
-  | { kind: 'restoreFailed' }
-  | { kind: 'unavailable'; stepCount: number; model: string; label: string; reason: ModelUnavailableReason; routerUnavailable?: boolean };
+  /** The pre-plan model could not be restored (`model` refused for `reason`): the current model stays, visibly. */
+  | { kind: 'restoreFailed'; model: string; label: string; reason: ModelUnavailableReason }
+  | {
+      kind: 'unavailable'; stepCount: number; model: string; label: string; reason: ModelUnavailableReason; routerUnavailable?: boolean;
+      /** `not_in_plan` only: the plans that include the model (empty = none, so no upgrade is offered). */
+      upgradeRequired?: string[];
+    };
+
+/**
+ * ENG-669 (#3607 follow-up 4): the work plan finished, but the model the chat had before it could not be put back (it is
+ * outside the owner's plan, or no longer available). Leave a visible note in the chat, saved and pushed live, saying
+ * which model could not come back and which one the chat stays on, instead of keeping the plan's model silently.
+ * Best-effort: never throws (the turn itself goes ahead either way).
+ */
+async function recordPlanModelRestoreFailed(
+  sessionId: string,
+  userId: string,
+  turn: Extract<WorkPlanStepModelTurn, { kind: 'restoreFailed' }>,
+  currentLabel: string,
+): Promise<void> {
+  const content = buildPlanModelRestoreFailedMessage(turn.label, turn.reason, currentLabel);
+  const timestamp = new Date().toISOString();
+  const message = {
+    role: 'assistant' as const, content, timestamp, metadata: { timestamp, kind: 'work-plan-model-restore-failed', model: turn.model },
+  };
+  try {
+    await chatbotDb.addMessageToSession(sessionId, message);
+  } catch (saveErr) {
+    console.error(`AgentMode: failed to save the plan-model restore notice for session ${sessionId}:`, saveErr);
+    return;
+  }
+  try {
+    const { io } = await import('../server');
+    io.to(`user:${userId}`).emit('session-message-appended', { sessionId, message: { role: 'assistant', content } });
+  } catch (emitErr) {
+    console.error(`AgentMode: failed to emit the plan-model restore notice for session ${sessionId}:`, emitErr);
+  }
+}
 
 async function resolveWorkPlanStepModelForTurn(
   session: SystemModelSession & { userId: string; llmModel?: string; workPlan?: any },
@@ -2221,6 +2285,10 @@ async function resolveWorkPlanStepModelForTurn(
     return () => (legacyPinSource ??= legacyPlanPinSource(plan));
   };
   const launchSource: ModelSource = plan.launchModelSource === 'system' ? 'system' : 'user';
+  // The end-of-plan restore puts back the model the session had before the plan: AgentWeb's action, checked as the
+  // user's only when the launch recorded that model as the user's own pick. A plan launched before launchModelSource
+  // existed (legacy) cannot say, and its restore is not a pick the user is making now (#3607 follow-up 4).
+  const restoreSource: ModelSource = plan.launchModelSource === 'user' ? 'user' : 'system';
   const resolveHonored = async (
     model: string, stepCount: number, source: ModelSource | (() => Promise<ModelSource>),
   ): Promise<ResolvedStepDecision> => {
@@ -2242,12 +2310,13 @@ async function resolveWorkPlanStepModelForTurn(
     // ...nor when the stamp is a model the user picked during the plan (even if a resumed step adopted it as its own).
     if (plan.engineModel && plan.launchModel && session.llmModel === plan.engineModel && session.llmModel !== plan.pickedModel && !options.explicitPick) {
       try {
-        return { kind: 'restored', decision: await resolveHonored(plan.launchModel, 0, launchSource), source: launchSource };
+        return { kind: 'restored', decision: await resolveHonored(plan.launchModel, 0, restoreSource), source: restoreSource };
       } catch (restoreError) {
         if (!isModelUnavailableError(restoreError)) throw restoreError;
-        // The pre-plan model is gone: do not retry every turn. The caller clears the marker; this turn runs as requested.
+        // The pre-plan model is gone (or outside the plan): do not retry every turn. The caller clears the marker and
+        // tells the user (never silently); this turn runs as requested.
         console.warn(`AgentMode: pre-plan model "${sanitizeModelLabel(plan.launchModel)}" could not be restored after the work plan finished (${restoreError.reason}); keeping the current model.`);
-        return { kind: 'restoreFailed' };
+        return { kind: 'restoreFailed', model: plan.launchModel, label: modelDisplayLabel(plan.launchModel), reason: restoreError.reason };
       }
     }
     return { kind: 'none' };
@@ -2284,22 +2353,34 @@ async function resolveWorkPlanStepModelForTurn(
     };
   } catch (modelError) {
     if (!isModelUnavailableError(modelError)) throw modelError;
-    if (pick && candidate !== pick && options.viewerIsOwner !== false) {
-      // The plan's model is gone but the user chose another one: it runs, and the step adopts it (the engine marker then
-      // follows the new step model, so the stamp is the engine's own from here on).
-      const decision = await resolveHonored(pick, stepCount, 'user');
-      // ENG-669 PR-C: the step adopts the SELECTION (a pick of the AgentWeb Model stays the router on that step).
-      return { kind: 'resolved', stepCount, decision, source: 'user', ...(ownModel && { updateStepModelTo: storedModelFor(decision, decision.effectiveModel) }) };
-    }
     // ENG-669 PR-C: a step on the AgentWeb Model is named by its display name, and an unavailable router is "unavailable
     // right now", not a model that is gone.
     const routerUnavailable = isAgentWebModelId(candidate) && modelError.reason !== 'not_in_plan';
-    return {
+    const stepPaused: WorkPlanStepModelTurn = {
       kind: 'unavailable', stepCount, model: candidate,
       label: modelDisplayLabel(candidate),
       reason: modelError.reason,
       ...(routerUnavailable && { routerUnavailable: true }),
+      ...(modelError.plan && { upgradeRequired: [...modelError.plan.upgradeRequired] }),
     };
+    if (pick && candidate !== pick && options.viewerIsOwner !== false) {
+      // The plan's model is gone but the user chose another one: it runs, and the step adopts it (the engine marker then
+      // follows the new step model, so the stamp is the engine's own from here on).
+      let decision: ResolvedStepDecision;
+      try {
+        decision = await resolveHonored(pick, stepCount, 'user');
+      } catch (pickError) {
+        // #3607 follow-up 5: a STANDING pick (the stored stamp, not a model picked in this request) refused by the tier
+        // allowlist is not what this turn is about: the step's own model is, so the user gets that model's pause (e.g.
+        // "no longer available"), not "not in your plan" for a pick they did not make now. A pick made in this request is
+        // answered as such; any other refusal is unchanged (and with the allowlist off nothing here changes).
+        if (options.explicitPick || !isModelUnavailableError(pickError) || pickError.reason !== 'not_in_plan') throw pickError;
+        return stepPaused;
+      }
+      // ENG-669 PR-C: the step adopts the SELECTION (a pick of the AgentWeb Model stays the router on that step).
+      return { kind: 'resolved', stepCount, decision, source: 'user', ...(ownModel && { updateStepModelTo: storedModelFor(decision, decision.effectiveModel) }) };
+    }
+    return stepPaused;
   }
 }
 
@@ -2336,6 +2417,7 @@ async function notifyOwnerOfStepModelPause(
       ...(turn.routerUnavailable && { routerUnavailable: true }),
       scheduleName: ownSchedule?.scheduleName,
       sessionTitle: session?.title,
+      upgradeRequired: turn.upgradeRequired ?? [],
     });
   } catch (notifyError) {
     console.error(`Failed to send the step-model pause notice for session ${sessionId}:`, notifyError);
@@ -2429,7 +2511,9 @@ async function scheduleAutoWorkPlanContinuation(
   sessionId: string,
   userId: string,
   llmModel: string,
-  round: number
+  round: number,
+  // ENG-669 (#3676 follow-up 2): see scheduleAutoMediaContinuation.
+  isUnattendedRun: boolean,
 ): Promise<void> {
   if (round > AUTO_WORK_PLAN_CONTINUATION_MAX_ROUNDS) {
     console.error(
@@ -2551,9 +2635,9 @@ async function scheduleAutoWorkPlanContinuation(
         llmModelSource: currentSession.llmModelSource, llmUsagePolicyDecision: currentSession.llmUsagePolicyDecision,
       });
       if (stepTurn.kind === 'unavailable') {
-        // No per-turn attendance signal on this chain: the session's kind decides (isUnattendedPause).
+        // The chain's own attendance (its starting turn's), never the session's kind alone.
         await pauseWorkPlanForUnavailableStepModel(sessionId, userId, stepTurn, {
-          emitToUser: true, unattended: isUnattendedPause(currentSession),
+          emitToUser: true, unattended: isUnattendedPause(currentSession, isUnattendedRun),
         });
         autoContinuationSessions.delete(sessionId);
         releaseSessionGeneration(sessionId);
@@ -2628,6 +2712,11 @@ async function scheduleAutoWorkPlanContinuation(
       undefined, // publishAuthorizationOverride
       undefined, // approvedRevisionImageSources
       'auto-continuation', // ENG-1684: hide this server-authored turn in the chat UI
+      undefined, // requireWorkPlanDisposition
+      undefined, // clientId
+      undefined, // approvalDeckAnswerMeta
+      undefined, // approvalDeckCancelledMeta
+      isUnattendedRun, // ENG-669: the chain's attendance (its starting turn's)
     ),
     sessionId
   )
@@ -2698,7 +2787,7 @@ async function scheduleAutoWorkPlanContinuation(
       autoContinuationSessions.delete(sessionId);
       releaseSessionGeneration(sessionId);
       if (stillStalled) {
-        scheduleAutoWorkPlanContinuation(sessionId, userId, llmModel, round + 1).catch((chainErr) =>
+        scheduleAutoWorkPlanContinuation(sessionId, userId, llmModel, round + 1, isUnattendedRun).catch((chainErr) =>
           console.error(`AgentMode: work-plan auto-continuation chain failed for session ${sessionId}:`, chainErr),
         );
       }
@@ -6599,6 +6688,8 @@ export async function runScheduledChat(
       }
 
       const orphanedUserResult = {
+        // ENG-669: failed before the model check, so it says nothing about a model block (isNewScheduleModelBlock).
+        [ENDED_BEFORE_MODEL_CHECK_FLAG]: true,
         scheduleId: schedule.scheduleId,
         runId: preGeneratedRunId || require('uuid').v4(),
         status: 'failure' as const,
@@ -6629,6 +6720,8 @@ export async function runScheduledChat(
     const scheduledChatAccess = await userCanUseScheduledChats(userId);
     if (scheduledChatAccess === null) {
       const unresolvedEntitlementResult = {
+        // ENG-669: failed before the model check, so it says nothing about a model block (isNewScheduleModelBlock).
+        [ENDED_BEFORE_MODEL_CHECK_FLAG]: true,
         scheduleId: schedule.scheduleId,
         runId: preGeneratedRunId || require('uuid').v4(),
         status: 'failure' as const,
@@ -6656,6 +6749,8 @@ export async function runScheduledChat(
       }).catch((error) => console.error(`Failed to auto-pause schedule ${schedule.scheduleId}:`, error));
 
       const entitlementResult = {
+        // ENG-669: failed before the model check, so it says nothing about a model block (isNewScheduleModelBlock).
+        [ENDED_BEFORE_MODEL_CHECK_FLAG]: true,
         scheduleId: schedule.scheduleId,
         runId: preGeneratedRunId || require('uuid').v4(),
         status: 'failure' as const,
@@ -6706,6 +6801,8 @@ export async function runScheduledChat(
           eligibleRecipients: authz.authorized,
         });
         const withheldResult = {
+          // ENG-669: failed before the model check, so it says nothing about a model block (isNewScheduleModelBlock).
+          [ENDED_BEFORE_MODEL_CHECK_FLAG]: true,
           scheduleId: schedule.scheduleId,
           runId: withheldRunId,
           status: 'failure' as const,
@@ -6794,6 +6891,8 @@ export async function runScheduledChat(
       // schedule ran with every required function treated as permitted.
       if (allowedFunctionCalls === null) {
         const unresolvedResult = {
+          // ENG-669: failed before the model check, so it says nothing about a model block (isNewScheduleModelBlock).
+          [ENDED_BEFORE_MODEL_CHECK_FLAG]: true,
           scheduleId: schedule.scheduleId,
           runId: preGeneratedRunId || require('uuid').v4(),
           status: 'failure' as const,
@@ -6843,6 +6942,8 @@ export async function runScheduledChat(
         
         // Create failure result
         const errorResult = {
+          // ENG-669: failed before the model check, so it says nothing about a model block (isNewScheduleModelBlock).
+          [ENDED_BEFORE_MODEL_CHECK_FLAG]: true,
           scheduleId: schedule.scheduleId,
           runId: require('uuid').v4(),
           status: 'failure' as const,
@@ -6906,6 +7007,8 @@ export async function runScheduledChat(
       });
 
       const tokenLimitResult = {
+        // ENG-669: failed before the model check, so it says nothing about a model block (isNewScheduleModelBlock).
+        [ENDED_BEFORE_MODEL_CHECK_FLAG]: true,
         scheduleId: schedule.scheduleId,
         runId: require('uuid').v4(),
         status: 'failure' as const,
@@ -7240,6 +7343,8 @@ export async function runScheduledChat(
       // ENG-669 PR-D: behind the tier-allowlist switch (the refusals it makes common are what this exists for); off =>
       // the run result and the notifications are exactly as before.
       const modelBlock = await modelAccess.isEnabled() ? scheduleModelBlockFields(modelError) : undefined;
+      // The plans that include the refused model: when none does, nothing here suggests upgrading.
+      const upgradeRequired = modelError.plan?.upgradeRequired ?? [];
       const modelUnavailableResult = {
         scheduleId: schedule.scheduleId,
         runId: preGeneratedRunId || require('uuid').v4(),
@@ -7248,7 +7353,7 @@ export async function runScheduledChat(
         actualResponse: routerUnavailable
           ? `model_unavailable: ${AGENTWEB_MODEL_DISPLAY_NAME} is unavailable right now — choose another model for this schedule, or try again later`
           : modelError.reason === 'not_in_plan'
-            ? `model_unavailable: pinned model "${modelDisplayLabel(modelError.requestedModel)}" is ${reasonText} — choose a model your plan includes for this schedule, or upgrade the plan`
+            ? `model_unavailable: pinned model "${modelDisplayLabel(modelError.requestedModel)}" is ${reasonText} — choose a model your plan includes for this schedule${upgradeRequired.length > 0 ? ', or upgrade the plan' : ''}`
             : `model_unavailable: pinned model "${pinnedLabel}" is ${reasonText} — choose a served model for this schedule`,
         actualFunctionCalls: [],
         keywordMatches: [],
@@ -7261,11 +7366,14 @@ export async function runScheduledChat(
         createdAt: new Date().toISOString(),
         // ENG-669 PR-D: say WHY on the run, so runHealth.lastRunBlockedBy puts it on the schedule's card.
         ...modelBlock,
+        // A Test run never emails, so it must not count as the block the owner was told about (#3676 follow-up 3).
+        ...(modelBlock && isTest && { [SCHEDULE_TEST_RUN_FLAG]: true }),
       };
       // ENG-669 PR-D: the owner is the one who can fix this (choose another model, or upgrade), and nobody else is told
       // (a plan-limit refusal pages no one). Emailed once per change into the blocked state, not on every run. The
       // history is re-read first, as for the sourcing-block transition, so a run racing this one (a Test click over
       // the cron fire) is more likely to see the same edge. Never for a test run: the owner is watching it.
+      let notifySchedule: any = null;
       if (modelBlock && !isTest) {
         let freshSchedule: any = null;
         try {
@@ -7274,19 +7382,26 @@ export async function runScheduledChat(
           console.error(`Failed to re-fetch schedule ${schedule.scheduleId} for the model-unavailable notice:`, refetchError);
         }
         const current = freshSchedule || schedule;
-        if (isNewScheduleModelBlock(current.runResults, modelBlock)) {
-          await notifyScheduleOwnerOfFailure(current, userId, {
-            failureClass: 'model_unavailable',
-            modelLabel: modelDisplayLabel(modelError.requestedModel),
-            reason: modelBlock.blockedReason,
-            ...(routerUnavailable && { routerUnavailable: true }),
-          });
-        }
+        if (isNewScheduleModelBlock(current.runResults, modelBlock)) notifySchedule = current;
       }
+      let resultSaved = false;
       try {
         await scheduleDb.addRunResult(schedule.scheduleId, modelUnavailableResult);
+        resultSaved = true;
       } catch (saveError) {
         console.error(`Error saving model-unavailable run result for schedule ${schedule.scheduleId}:`, saveError);
+      }
+      // The saved blocked run is what tells the next run the owner was already emailed, so email only once it is on
+      // record: a run whose result cannot be saved sends nothing, and the next run (which still sees no block) does
+      // (#3676 follow-up 4: a save that keeps failing must not re-email on every run).
+      if (notifySchedule && resultSaved) {
+        await notifyScheduleOwnerOfFailure(notifySchedule, userId, {
+          failureClass: 'model_unavailable',
+          modelLabel: modelDisplayLabel(modelError.requestedModel),
+          reason: modelError.reason,
+          ...(routerUnavailable && { routerUnavailable: true }),
+          upgradeRequired,
+        });
       }
       return modelUnavailableResult;
     }
@@ -9851,6 +9966,9 @@ export async function generateSessionResponse(
       const { engineModel: _cleared, ...wpRest } = wpFailed;
       await chatbotDb.updateSessionWorkPlan(sessionId, wpRest);
     }
+    // #3607 follow-up 4: never silently: the chat says which model could not come back and that it stays on this one.
+    // Once per plan (the marker cleared above is what makes the restore run at all).
+    await recordPlanModelRestoreFailed(sessionId, userId, stepModelTurn, modelDisplayLabel(llmModel));
   }
   let ranModelDecision: EffectiveModelPolicyDecision | undefined;
   if (stepModelTurn.kind === 'resolved' || stepModelTurn.kind === 'restored') {
@@ -10553,6 +10671,7 @@ export const agentModeController = {
           session.userId,
           session.llmModel || agentModeService.default_model,
           1,
+          false, // the genuine owner is viewing the chat (genuineOwnerView): attended
         ).catch((err) =>
           console.error(`AgentMode: media auto-continuation (durability backstop) failed for session ${session.sessionId}:`, err),
         ));
@@ -10612,6 +10731,7 @@ export const agentModeController = {
         ...sessionForClient,
         ...(healedBranchedFrom ? { branchedFrom: healedBranchedFrom } : {}),
         messages: filterMessagesForClient(session.messages, { viewerIsAdmin }),
+        ...(session.workPlan && !viewerIsAdmin ? { workPlan: redactWorkPlanProvenance(session.workPlan) } : {}),
         hasActiveProgress: progressActive,
         // ENG-110: additive, owner-only. In-memory on THIS instance (an Immutable deploy overlap hides the
         // other instance's runs). Admins/delegates viewing someone else's session never get it.
@@ -11387,7 +11507,7 @@ export const agentModeController = {
               timedOutSession?.workPlan?.autocomplete === true &&
               workPlanHasUnfinishedAutocompleteWork(timedOutSession.workPlan, timedOutSession.calledFunctions)
             ) {
-              setImmediate(() => scheduleAutoWorkPlanContinuation(sessionId, session.userId, selectedModel, 1).catch((err) =>
+              setImmediate(() => scheduleAutoWorkPlanContinuation(sessionId, session.userId, selectedModel, 1, false).catch((err) =>
                 console.error(`AgentMode: work-plan auto-continuation (whole-turn timeout) failed for session ${sessionId}:`, err),
               ));
             }
@@ -11419,7 +11539,7 @@ export const agentModeController = {
               // slow turn that merely made images along the way doesn't get an unwanted
               // extra continuation call.
               if (hasPersistedMediaBudgetDeferral(timedOutSession?.messages, turnStartMs)) {
-                setImmediate(() => scheduleAutoMediaContinuation(sessionId, session.userId, selectedModel, 1).catch((err) =>
+                setImmediate(() => scheduleAutoMediaContinuation(sessionId, session.userId, selectedModel, 1, false).catch((err) =>
                   console.error(`AgentMode: media auto-continuation (whole-turn timeout) failed for session ${sessionId}:`, err),
                 ));
               }
@@ -11469,7 +11589,7 @@ export const agentModeController = {
       // past this request's own `finally` below, so scheduleAutoMediaContinuation
       // claims the generation lock only after THIS request has released it.
       if (hasDeferredMediaBudgetToolCall(response.toolCalls)) {
-        setImmediate(() => scheduleAutoMediaContinuation(sessionId, session.userId, selectedModel, 1).catch((err) =>
+        setImmediate(() => scheduleAutoMediaContinuation(sessionId, session.userId, selectedModel, 1, false).catch((err) =>
           console.error(`AgentMode: media auto-continuation (soft deferral) failed for session ${sessionId}:`, err),
         ));
       }
@@ -11481,7 +11601,7 @@ export const agentModeController = {
       // contract, and the session then sat idle for 3+ hours. Auto-fire the continuation
       // ourselves, same setImmediate-after-release pattern as the media case above.
       if (hasStalledAutocompleteWorkPlan(response.workPlan, response.toolCalls, response.calledFunctions)) {
-        setImmediate(() => scheduleAutoWorkPlanContinuation(sessionId, session.userId, selectedModel, 1).catch((err) =>
+        setImmediate(() => scheduleAutoWorkPlanContinuation(sessionId, session.userId, selectedModel, 1, false).catch((err) =>
           console.error(`AgentMode: work-plan auto-continuation failed for session ${sessionId}:`, err),
         ));
       } else if (response.workPlan?.autocomplete && hasNonRetryableWorkPlanStatusBlock(response.toolCalls)) {
@@ -11552,7 +11672,7 @@ export const agentModeController = {
         ...(Array.isArray(liveCitations) && liveCitations.length > 0 ? { citations: liveCitations } : {}),
         ...(typeof assistantMessageIndex === 'number' ? { messageIndex: assistantMessageIndex } : {}),
         ...(typeof response.userMessageIndex === 'number' ? { userMessageIndex: response.userMessageIndex } : {}),
-        workPlan: response.workPlan,
+        workPlan: redactWorkPlanProvenance(response.workPlan),
         skills: response.skills,
         ...(invalidations ? { invalidations } : {}),
         ...(response.workPlanTurnDisposition ? { workPlanTurnDisposition: response.workPlanTurnDisposition } : {}),
@@ -12827,7 +12947,7 @@ export const agentModeController = {
             if (hasPersistedMediaBudgetDeferral(timedOutSession?.messages, sharedTurnStartMs)) {
               const continuationUserId = timedOutSession!.userId;
               const continuationModel = timedOutSession!.llmModel || agentModeService.default_model;
-              setImmediate(() => scheduleAutoMediaContinuation(shareId, continuationUserId, continuationModel, 1).catch((err) =>
+              setImmediate(() => scheduleAutoMediaContinuation(shareId, continuationUserId, continuationModel, 1, false).catch((err) =>
                 console.error(`AgentMode: media auto-continuation (ishare whole-turn timeout) failed for session ${shareId}:`, err),
               ));
             }
@@ -13426,7 +13546,7 @@ export const agentModeController = {
       const existing = session.workPlan;
       const hasActivePlan = !!existing && Array.isArray(existing.steps) && existing.steps.length > 0;
       if (hasActivePlan && (existing as any).templatePlanId === planId) {
-        return res.status(200).json({ success: true, alreadyApplied: true, workPlan: existing });
+        return res.status(200).json({ success: true, alreadyApplied: true, workPlan: redactWorkPlanProvenance(existing) });
       }
 
       // ENG-2072: a real person just clicked this button — never force
@@ -13447,7 +13567,7 @@ export const agentModeController = {
           message: result.message,
         });
       }
-      return res.status(200).json({ success: true, alreadyApplied: false, workPlan: result.workPlan });
+      return res.status(200).json({ success: true, alreadyApplied: false, workPlan: redactWorkPlanProvenance(result.workPlan) });
     } catch (error) {
       console.error('AgentMode: Launch work plan error:', error);
       return res.status(500).json({ error: 'Failed to launch work plan' });
@@ -13514,7 +13634,7 @@ export const agentModeController = {
       const hasActivePlan = !!existingWorkPlan && Array.isArray(existingWorkPlan.steps) && existingWorkPlan.steps.length > 0;
       const alreadyApplied = hasActivePlan && (existingWorkPlan as any).templatePlanId === planId;
       if (alreadyApplied) {
-        return res.status(200).json({ success: true, alreadyApplied: true, workPlan: existingWorkPlan });
+        return res.status(200).json({ success: true, alreadyApplied: true, workPlan: redactWorkPlanProvenance(existingWorkPlan) });
       }
 
       // A DIFFERENT work plan is already active — conflict, never force-replace here.
@@ -13562,7 +13682,7 @@ export const agentModeController = {
         return res.status(404).json({ error: 'WORKPLAN_UNAVAILABLE', code: 'WORKPLAN_UNAVAILABLE', message: result.message });
       }
 
-      return res.status(200).json({ success: true, alreadyApplied: false, workPlan: result.workPlan });
+      return res.status(200).json({ success: true, alreadyApplied: false, workPlan: redactWorkPlanProvenance(result.workPlan) });
     } catch (error) {
       console.error('AgentMode: Accept work plan recommendation error:', error);
       res.status(500).json({ error: 'Failed to accept work plan recommendation' });

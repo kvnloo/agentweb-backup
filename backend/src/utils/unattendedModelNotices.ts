@@ -34,6 +34,28 @@ export function isScheduleModelBlockedRun(run: unknown): boolean {
 const PRE_MODEL_GATE_SKIP_STATUSES = new Set<string>([ACCOUNT_DISCONNECTED_STATUS, SEND_CAPACITY_EXHAUSTED_STATUS]);
 
 /**
+ * Set (true) on a run result that FAILED before the model was resolved (the usage limit, a required function the plan
+ * does not allow, missing variables, unresolved entitlements, a deleted owner): like the skips above, it says nothing
+ * about the model, so it neither continues nor ends a model block (#3676 follow-up 1: blocked, then a limit, then
+ * blocked again is one episode, one email).
+ */
+export const ENDED_BEFORE_MODEL_CHECK_FLAG = 'endedBeforeModelCheck';
+
+/**
+ * Set (true) on a model-blocked result of a manual Test run. A Test run never emails the owner (they are watching it),
+ * so it must not count as the block they were told about: the next cron run still emails (#3676 follow-up 3).
+ */
+export const SCHEDULE_TEST_RUN_FLAG = 'testRun';
+
+/** A prior run that tells nothing about whether the owner was told of a model block (see the flags above). */
+function isSilentOnModelBlock(run: object): boolean {
+  const flags = run as Record<string, unknown>;
+  return PRE_MODEL_GATE_SKIP_STATUSES.has(typeof flags.status === 'string' ? flags.status : '')
+    || flags[ENDED_BEFORE_MODEL_CHECK_FLAG] === true
+    || (flags[SCHEDULE_TEST_RUN_FLAG] === true && isScheduleModelBlockedRun(run));
+}
+
+/**
  * True when `block` is a change INTO the blocked state, so the owner is emailed: the most recent prior run that got as
  * far as the model was not blocked (it ran, or there is none), or was blocked on a different model or for a different
  * reason (the owner changed the pin to another model that is refused too, or the model went from "not in your plan" to
@@ -41,13 +63,14 @@ const PRE_MODEL_GATE_SKIP_STATUSES = new Set<string>([ACCOUNT_DISCONNECTED_STATU
  *
  * Edge-triggered on run history like didSourcingBlockStateChange, with no persisted "already emailed" flag: a run that
  * gets past the model check (the owner chose a model the plan includes, upgraded, or unpinned the schedule) ends the
- * state, and a later block emails again. `priorRunResults` is the history BEFORE this run.
+ * state, and a later block emails again. Runs that say nothing about it are passed over (isSilentOnModelBlock): the
+ * pre-model skips and failures, and a Test run's block. `priorRunResults` is the history BEFORE this run.
  */
 export function isNewScheduleModelBlock(priorRunResults: unknown, block: ScheduleModelBlock): boolean {
   const results = Array.isArray(priorRunResults) ? priorRunResults : [];
   for (let i = results.length - 1; i >= 0; i--) {
     const run = results[i];
-    if (!run || typeof run !== 'object' || PRE_MODEL_GATE_SKIP_STATUSES.has((run as { status?: string }).status ?? '')) continue;
+    if (!run || typeof run !== 'object' || isSilentOnModelBlock(run)) continue;
     if (!isScheduleModelBlockedRun(run)) return true;
     const prior = run as { blockedModel?: unknown; blockedReason?: unknown };
     return prior.blockedModel !== block.blockedModel || prior.blockedReason !== block.blockedReason;
