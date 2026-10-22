@@ -24,6 +24,7 @@ import {
   isSetupModeCheckoutSession,
   PAYG_OVERAGE_PURCHASE_TYPE,
 } from '../services/stripeService';
+import { invoiceLinePriceId, invoiceSubscriptionId } from '../utils/stripeInvoiceFields';
 
 const CUSTOMER_FRONTEND_URL =
   process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
@@ -328,8 +329,8 @@ async function handleInvoicePayment(
       currency: invoice.currency || 'usd',
       status: invoice.status || eventType,
       stripeInvoiceId: invoice.id,
-      stripeSubscriptionId: invoice.subscription || undefined,
-      priceId: invoice.lines?.data?.[0]?.price?.id || undefined,
+      stripeSubscriptionId: invoiceSubscriptionId(invoice) || undefined,
+      priceId: invoiceLinePriceId(invoice.lines?.data?.[0]) || undefined,
       planName: invoice.lines?.data?.[0]?.description || undefined,
     });
   } catch (err: any) {
@@ -354,9 +355,12 @@ async function sendStripeEventToCrm(event: any): Promise<void> {
   try {
     const obj = event?.data?.object || {};
     const customerId = typeof obj.customer === 'string' ? obj.customer : obj.customer?.id;
-    const subscriptionId = typeof obj.subscription === 'string'
-      ? obj.subscription
-      : obj.subscription?.id || (obj.object === 'subscription' ? obj.id : undefined);
+    // Basil moved an invoice's subscription under `parent` (ENG-2599).
+    const subscriptionId = obj.object === 'invoice'
+      ? invoiceSubscriptionId(obj) || undefined
+      : typeof obj.subscription === 'string'
+        ? obj.subscription
+        : obj.subscription?.id || (obj.object === 'subscription' ? obj.id : undefined);
 
     // Resolve email: prefer customer_details from checkout; fallback to user lookup by Stripe customer id.
     let email: string | undefined = obj.customer_details?.email || obj.customer_email || undefined;

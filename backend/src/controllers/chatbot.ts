@@ -19,6 +19,16 @@ import { checkTokenUsage, TURN_ADMISSION, toCustomerTokenUsage } from '../servic
 import { buildUsageBlockCopy } from '../utils/usageBlockCopy';
 import { userDb } from '../services/db';
 import { resolveRunFunding, withRunFunding } from '../services/funding/runFunding';
+import { isAgentWebModelId } from '../services/agentMode/agentWebModelRouter';
+import { buildModelUnavailableBody, ModelUnavailableError } from '../services/agentMode/modelUnavailable';
+
+/**
+ * ENG-669 PR-C: the sidebar chatbot calls one model directly (no resolver, no router), so a request naming the AgentWeb
+ * Model is refused visibly (the shared 422 shape) instead of failing deep inside the gateway.
+ */
+function agentWebModelNotUsableHereBody() {
+  return buildModelUnavailableBody(new ModelUnavailableError('agentweb-model', 'not_selectable'));
+}
 
 // Create a new chat session
 export const createChatSession = async (req: AuthenticatedRequest, res: Response) => {
@@ -156,6 +166,7 @@ export const sendMessage = async (req: AuthenticatedRequest, res: Response) => {
     const sessionId = req.params.sessionId;
     const { message, currentUrl, pageContext, structuredContext, screenshot, model } = req.body;
     const portal = req.query.portal as string | undefined;
+    if (isAgentWebModelId(model)) return res.status(422).json(agentWebModelNotUsableHereBody());
 
     let portalType: 'customer' | 'partner' = 'partner'; // Default to partner
     if (portal === 'customer') {
@@ -255,6 +266,10 @@ export const sendMessageStream = async (req: AuthenticatedRequest, res: Response
   const sessionId = req.params.sessionId;
   const { message, currentUrl, pageContext, structuredContext, screenshot, model } = req.body;
   const portal = req.query.portal as string | undefined;
+  if (isAgentWebModelId(model)) {
+    res.status(422).json(agentWebModelNotUsableHereBody());
+    return;
+  }
 
   const portalType: 'customer' | 'partner' = portal === 'customer' ? 'customer' : 'partner';
 

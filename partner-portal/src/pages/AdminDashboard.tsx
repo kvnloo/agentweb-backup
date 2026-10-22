@@ -76,6 +76,7 @@ import SpendLedgerBody, { SpendLedgerPayload } from "../components/admin/SpendLe
 import RevenueTab from "../components/admin/RevenueTab";
 import FunnelTab from "../components/admin/FunnelTab";
 import AlertEmailsTab from "../components/admin/AlertEmailsTab";
+import VendorRatesTab from "../components/admin/VendorRatesTab";
 import OnboardingTab from "../components/admin/OnboardingTab";
 import ConnectedAccountsTab from "../components/admin/ConnectedAccountsTab";
 import ContractorsTab from "../components/admin/ContractorsTab";
@@ -119,6 +120,7 @@ import {
 } from "@mui/icons-material";
 import { staffOperatedBadge, type SelfActivitySignal } from "../utils/selfActivityBadge";
 import { ErrorState } from "../components/StatusState";
+import { withoutAgentWebModel } from "../utils/agentWebModel";
 
 interface TabPanelProps {
   children?: React.ReactNode;
@@ -6841,6 +6843,10 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
         <TabPanel value={tabValue} index={26}>
           <EvalV2Tab />
         </TabPanel>
+
+        <TabPanel value={tabValue} index={27}>
+          <VendorRatesTab />
+        </TabPanel>
         </Box>
       </Box>
 
@@ -8747,8 +8753,11 @@ const AgentModeSettings = () => {
         headers: { Authorization: `Bearer ${token}` }
       });
       if (Array.isArray(response.data) && response.data.length > 0) {
-        setSupportedModels(response.data);
-        return response.data;
+        // ENG-669 PR-C: the configured default stands in when nothing was chosen, so it must be one concrete model, never
+        // the AgentWeb Model (a per-turn router).
+        const models = withoutAgentWebModel(response.data);
+        setSupportedModels(models);
+        return models;
       }
     } catch (error) {
       console.error('Error loading supported models:', error);

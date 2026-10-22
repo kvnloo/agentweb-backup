@@ -53,6 +53,9 @@ export interface GenerateMarketingResponseParams {
   // ENG-2072: tri-state — see ToolContext.isUnattendedRun in mcp/client/toolRegistry.ts.
   // Plain boolean, so it survives the IPC serialization to the worker process.
   isUnattendedRun?: boolean;
+  // ENG-669 PR-C: set when `llmModel` was routed by the AgentWeb Model: the selection and why, stamped on this turn's
+  // assistant messages beside `llm`. Plain data, so it survives the IPC serialization.
+  modelRouting?: import('./agentMode/agentWebModelRouter').MessageModelRouting;
 }
 
 export interface GenerateMarketingResponseResult {

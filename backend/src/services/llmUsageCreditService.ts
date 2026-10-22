@@ -2,7 +2,7 @@ import AWS from 'aws-sdk';
 import { userDb, type User } from './db';
 import { paymentHistoryDb } from './paymentHistoryDb';
 
-const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+import { TABLE_PREFIX } from '../config/constants';
 const USERS_TABLE = `${TABLE_PREFIX}AW-Users`;
 const PAYMENT_HISTORY_TABLE = `${TABLE_PREFIX}AW-PaymentHistory`;
 const docClient = new AWS.DynamoDB.DocumentClient();

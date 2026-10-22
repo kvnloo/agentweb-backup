@@ -9,7 +9,7 @@ const dynamodbConfig = {
 
 const dynamodb = new AWS.DynamoDB.DocumentClient(dynamodbConfig);
 
-const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+import { TABLE_PREFIX } from '../config/constants';
 const BATCH_REVIEWS_TABLE = `${TABLE_PREFIX}AW-BatchReviews`;
 
 export interface BatchReviewAsset {

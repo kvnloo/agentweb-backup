@@ -99,6 +99,11 @@ export interface LlmConnectionServiceDeps {
   newId: () => string;
   /** Best-effort, called after a connection is revoked. Must not throw into the request. */
   onRevoked?: (connectionId: string) => void;
+  /**
+   * Disconnects a HOSTED login (ENG-2110 1c): its home lives on the login host and must be wiped there before the record may say
+   * revoked, so the plain `db.revoke` write refuses such rows. Absent = hosted rows cannot be revoked through this service.
+   */
+  revokeHosted?: (actor: Actor, connectionId: string) => Promise<"revoked" | "revoking">;
 }
 
 interface Access {
@@ -108,7 +113,7 @@ interface Access {
   canManage: boolean;
 }
 
-function toView(record: LlmConnectionRecord, callerId: string): LlmConnectionView {
+export function toView(record: LlmConnectionRecord, callerId: string): LlmConnectionView {
   return {
     connectionId: record.connectionId,
     ownerUserId: record.ownerUserId,
@@ -239,10 +244,20 @@ export class LlmConnectionService {
     return { record, access };
   }
 
-  async revoke(actor: Actor, connectionId: string): Promise<void> {
+  async revoke(actor: Actor, connectionId: string): Promise<"revoked" | "revoking"> {
     const { record, access } = await this.visible(actor.userId, connectionId);
     const own = record.ownerUserId === actor.userId;
     if (!own && !access.canManage) throw new LlmConnectionError("forbidden");
+    if (record.subHosted) {
+      // A hosted login is owner-only and is wiped by the login host first; "revoking" is accepted work (the sweeper finishes it).
+      if (!own || !this.deps.revokeHosted) throw new LlmConnectionError("forbidden");
+      try {
+        return await this.deps.revokeHosted(actor, connectionId);
+      } catch (err) {
+        if ((err as { code?: string })?.code === "not_found") throw new LlmConnectionError("not_found");
+        throw err;
+      }
+    }
     // Already revoked is success: the caller wanted it gone and it is.
     const didRevoke = await this.deps.db.revoke(connectionId, { userId: actor.userId, adminId: actor.adminId }, this.deps.now());
     // Only the call that actually revoked it owned that slot; a second revoke of an
@@ -256,6 +271,7 @@ export class LlmConnectionService {
       }
       await this.deps.db.releaseSlot(record.ownerUserId);
     }
+    return "revoked";
   }
 
   async setShared(actor: Actor, connectionId: string, shared: boolean): Promise<LlmConnectionView> {
@@ -421,6 +437,9 @@ export function getLlmConnectionService(): LlmConnectionService {
       getOrg: async (orgId) => (await orgDb.getOrgById(orgId)) as AuthzOrg | null,
       now: () => new Date().toISOString(),
       newId: () => randomUUID(),
+      // A hosted login is wiped by the login host before its record may say revoked (ENG-2110 1c).
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      revokeHosted: (actor, id) => (require("./hostedSubscriptionService") as typeof import("./hostedSubscriptionService")).getHostedSubscriptionService().revokeRecord(actor, id),
       // A running turn on a revoked Claude login must stop now, not at its next heartbeat (ENG-2110).
       onRevoked: (id) => (require("./claudeSubscriptionService") as typeof import("./claudeSubscriptionService")).abortClaudeSubscriptionConnection(id),
     });

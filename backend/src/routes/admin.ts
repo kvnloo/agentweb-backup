@@ -5041,6 +5041,8 @@ router.get("/subscription-types", async (req, res) => {
     const allAvailableSkills = await subscriptionService.getAllAvailableSkills();
     const allAvailableConnectedAccounts = subscriptionService.getAllAvailableConnectedAccounts();
     const allAvailableFeatures: string[] = subscriptionService.getAllAvailableSubscriptionFeatures().map((feature) => feature.id);
+    // What a row without a saved feature list shows: never the opt-in-only (paid-vendor) features.
+    const defaultFeatures: string[] = subscriptionService.getDefaultSubscriptionFeatureIds();
 
     // If no subscription types exist, return default Basic type with actual lists
     if (subscriptionTypes.length === 0) {
@@ -5049,7 +5051,7 @@ router.get("/subscription-types", async (req, res) => {
         allowedPages: allAvailablePages, // All available pages (expanded)
         allowedSkills: allAvailableSkills, // All available skills (expanded)
         allowedConnectedAccounts: allAvailableConnectedAccounts, // All platforms (expanded)
-        allowedFeatures: allAvailableFeatures,
+        allowedFeatures: defaultFeatures,
       }];
     }
 
@@ -5083,10 +5085,12 @@ router.get("/subscription-types", async (req, res) => {
         normalizedConnectedAccounts = allAvailableConnectedAccounts;
       }
 
+      // A saved "*" is an explicit grant of everything; it must be expanded before the known-id filter
+      // would drop it, or the editor would show an empty list and a save would revoke the grant.
       let normalizedFeatures = Array.isArray(type.allowedFeatures)
         ? type.allowedFeatures.filter((feature: unknown) => typeof feature === 'string' && allAvailableFeatures.includes(feature as string))
-        : allAvailableFeatures;
-      if (normalizedFeatures.includes('*')) normalizedFeatures = allAvailableFeatures;
+        : defaultFeatures;
+      if (Array.isArray(type.allowedFeatures) && type.allowedFeatures.includes('*')) normalizedFeatures = allAvailableFeatures;
 
       // Pass through hiddenPages as-is (these are never wildcarded)
       const hiddenPages: string[] = Array.isArray(type.hiddenPages) ? type.hiddenPages : [];
@@ -5240,6 +5244,7 @@ router.post("/subscription-types", async (req, res) => {
     const allAvailableSkills = await subscriptionService.getAllAvailableSkills();
     const allAvailableConnectedAccounts = subscriptionService.getAllAvailableConnectedAccounts();
     const allAvailableFeatures: string[] = subscriptionService.getAllAvailableSubscriptionFeatures().map((feature) => feature.id);
+    const defaultFeatures: string[] = subscriptionService.getDefaultSubscriptionFeatureIds();
 
     // Validate subscription types structure, normalize paths, and expand "*" to actual lists
     const normalizedTypes = await Promise.all(subscriptionTypes.map(async (type: any) => {
@@ -5285,7 +5290,7 @@ router.post("/subscription-types", async (req, res) => {
 
       let normalizedFeatures = Array.isArray(type.allowedFeatures)
         ? type.allowedFeatures.filter((feature: unknown) => typeof feature === 'string' && allAvailableFeatures.includes(feature as string))
-        : allAvailableFeatures;
+        : defaultFeatures;
       if (type.allowedFeatures?.includes('*')) normalizedFeatures = allAvailableFeatures;
 
       // Parse monthlyTokenAllowance (preserve null for unlimited)

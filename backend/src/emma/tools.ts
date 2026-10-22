@@ -124,6 +124,8 @@ import * as miscImpl from './impl/misc';
 // Register browser cookie persistence tools
 import './browserCookieTools';
 import './leadNotificationTools';
+import './hotLeadCallTools';
+import './hotLeadCallSetupTools';
 
 // Register email lookup / find tool (provider-agnostic)
 import './emailLookupTool';
@@ -9718,6 +9720,12 @@ ENTITY_TYPE + ACTION MATRIX:
                REMOVE_ENTRIES removes Person record ids from the list (looks up
                each person's entry in the list and deletes it).
 
+  RECORDS → SEARCH (query, object_type?) | LIST (object_type?, offset?)
+               Read-only People/Company record lookup. SEARCH matches by name
+               (or by email when query contains @) and returns up to 25 records
+               with their recordId — use it to find record_ids for ADD_ENTRIES.
+               object_type: 'people' (default) or 'companies'.
+
   LISTS → LIST | GET (list_id) | CREATE (name, object_type?)
                Whole-list actions. LIST enumerates every list in the workspace.
                CREATE makes a new list (object_type: 'people' or 'companies',
@@ -9727,16 +9735,17 @@ ENTITY_TYPE + ACTION MATRIX:
     inputSchema: {
       type: 'object',
       properties: {
-        entity_type: { type: 'string', enum: ['LIST_ENTRIES', 'LISTS'], description: 'Attio resource to operate on.' },
-        action:      { type: 'string', enum: ['COUNT', 'ADD_ENTRIES', 'REMOVE_ENTRIES', 'LIST', 'GET', 'CREATE'], description: 'Action to perform. See ACTION MATRIX.' },
+        entity_type: { type: 'string', enum: ['RECORDS', 'LIST_ENTRIES', 'LISTS'], description: 'Attio resource to operate on.' },
+        action:      { type: 'string', enum: ['SEARCH', 'COUNT', 'ADD_ENTRIES', 'REMOVE_ENTRIES', 'LIST', 'GET', 'CREATE'], description: 'Action to perform. See ACTION MATRIX.' },
+        query:       { type: 'string', description: 'RECORDS SEARCH only: name, or email address, to look up.' },
         list_id:     { type: 'string', description: 'Required for LIST_ENTRIES COUNT/LIST/ADD_ENTRIES/REMOVE_ENTRIES and LISTS GET. For LIST_ENTRIES actions, pass the AgentWeb lead list\'s id (e.g. from get_lead_lists/get_lead_details) — it is automatically resolved to that list\'s connected Attio deal-list id; a raw Attio list id also works. For LISTS actions, always a raw Attio list id (e.g. from LISTS LIST) — never an AgentWeb list id.' },
         record_ids:  { type: 'array', items: { type: 'string' }, maxItems: 100, description: 'Attio record ids (Person or Company, matching the target list). Required for LIST_ENTRIES ADD_ENTRIES/REMOVE_ENTRIES. Max 100 per call.' },
         offset:      { type: 'integer', description: 'LIST_ENTRIES LIST only: page offset; pass next_offset from the previous page.' },
         name:        { type: 'string', description: 'List display name. Required for LISTS CREATE.' },
-        object_type: { type: 'string', enum: ['people', 'companies'], description: 'What kind of records the new list holds. LISTS CREATE only. Defaults to "people".' },
+        object_type: { type: 'string', enum: ['people', 'companies'], description: 'Record kind for LISTS CREATE and RECORDS SEARCH/LIST. Defaults to "people".' },
         account_id:  { type: 'string', description: 'Attio account ID. Required when the user has multiple Attio accounts connected — the error message will list them; ask the user which to use.' },
       },
-      required: ['entity_type', 'action'],
+      required: ['action'],
     },
   },
   execute: async (args: any, context?: any) => {

@@ -31,6 +31,7 @@
  */
 import { ModelUnavailableError } from './modelUnavailable';
 import { LEGACY_MODEL_ALIASES } from './llmModelRegistry';
+import { AGENTWEB_MODEL_ID } from './agentWebModelIds';
 
 /** The registry's legacy-alias table as a normaliser: a retired id maps to its current id, anything else is kept. */
 export function resolveLegacyModelAlias(id: string): string {
@@ -40,8 +41,8 @@ export function resolveLegacyModelAlias(id: string): string {
 export const MODEL_TIER_ALLOWLIST_SETTING = 'model_tier_allowlist_enabled';
 /** Every non-admin catalog model. */
 export const ALL_MODELS = '*' as const;
-/** Reserved for the AgentWeb router (PR-C). Not a registry key: matches nothing runnable until then. */
-export const AGENTWEB_MODEL_ID = 'agentweb-model';
+/** Reserved for the AgentWeb router (PR-C). Not a registry key. */
+export { AGENTWEB_MODEL_ID };
 
 export type AllowedModels = string[] | typeof ALL_MODELS;
 

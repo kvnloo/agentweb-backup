@@ -437,6 +437,10 @@ const runDrain = async (reason: string): Promise<void> => {
   await import('./services/funding/claudeSubscriptionService')
     .then((m) => m.shutdownClaudeSubscriptionService())
     .catch(() => undefined);
+  // ENG-2110 1c: pending hosted sign-ins are cancelled on the login host (it also expires them itself).
+  await import('./services/funding/hostedSubscriptionService')
+    .then((m) => m.shutdownHostedSubscriptionService())
+    .catch(() => undefined);
   if (!cronDrain.drained) {
     console.warn(
       `[gracefulShutdown] Cron drain ceiling reached — ${cronDrain.stuckCount} job(s) still in-flight:`,
@@ -596,6 +600,16 @@ createTestAccount().then(async () => {
     console.log('Enrichment specialists registered');
   } catch (err) {
     console.warn('Failed to register enrichment specialists:', (err as Error).message);
+  }
+
+  // ENG-2271: load the admin vendor-rate overrides BEFORE listening, so no usage recording
+  // (HTTP request or queue processor) prices a Twilio unit at the defaults while an override
+  // exists. Bounded by the read's own 1.5s timeout; a settings outage must not block boot.
+  // Skipped under Jest (shouldBootstrapBackgroundJobs), where no settings I/O may happen.
+  // (refresh never rejects and logs its own failure once.)
+  if (shouldBootstrapBackgroundJobs()) {
+    const { refreshVendorRateOverrides } = await import('./utils/vendorRateCard');
+    await refreshVendorRateOverrides();
   }
 
   server.listen(port, async () => {
@@ -1636,6 +1650,17 @@ createTestAccount().then(async () => {
           .catch((error) => console.error('[ClaudeSubscription] boot recovery failed:', (error as { code?: string })?.code || 'error'));
       } catch (error) {
         console.error('[ClaudeSubscription] Failed to initialize:', (error as { code?: string })?.code || 'error');
+      }
+
+      // Hosted subscription logins (ENG-2110 1c/1d): finish unconfirmed disconnects. Not flag-gated on purpose.
+      try {
+        const { scheduleHostedSubscriptionSweep } = await import('./cron/hostedSubscriptionSweepCron');
+        scheduleHostedSubscriptionSweep({
+          isCronEnabled,
+          track: (jobName, promise) => cronJobRegistry.track(jobName, promise),
+        });
+      } catch (error) {
+        console.error('[HostedSubscription] Failed to initialize sweep:', (error as { code?: string })?.code || 'error');
       }
 
       // Weekly Engineering Scoreboard — read-only backend replacement for the

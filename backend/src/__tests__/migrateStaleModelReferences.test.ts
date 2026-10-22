@@ -42,6 +42,10 @@ import {
 } from '../scripts/migrateStaleModelReferences';
 
 describe('planModelMigration (pure, ENG-9)', () => {
+  it('ENG-669 PR-C: the AgentWeb Model selection is never stale (it is not a registry id)', () => {
+    expect(planModelMigration('agentweb-model', new Set(['gpt-5.5']), (id) => id)).toEqual({ action: 'ok' });
+  });
+
   const validModelIds = new Set(['openrouter/x-ai/grok-4.6', 'gemini-3.5-flash']);
   const normalizeModelId = (id: string) => (id === 'legacy-alias-id' ? 'gemini-3.5-flash' : id);
 

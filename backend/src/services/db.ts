@@ -27,6 +27,7 @@ import { phoneDedupeKey, PHONE_FANOUT_CAP } from '../utils/phoneLeadDedupe';
 import { isSmokeTestPhone } from '../utils/smokeTestLead';
 import { normalizeLinkedInUrl } from "./enrichmentGroups";
 import { isLinkedInPlaceholderName } from "../utils/anonymizedLinkedInLead";
+import { isConditionalFailure } from "./voice/setupWrites";
 import { MAX_ATOMIC_RUN_RESULT_REMOVALS, isDynamoItemSizeError, trimListToItemBudget } from "../utils/dynamoItemBudget";
 
 // Load environment variables from .env file
@@ -178,7 +179,8 @@ const dedupeLinkedInMessageEvents = <T extends { eventId?: string; eventType?: s
   });
 };
 
-const ENGAGED_EVENT_KEYWORDS = ["clicked", "replied", "received"];
+/** Exported so callers that write engagement events can keep their payloads from raising isEngaged. */
+export const ENGAGED_EVENT_KEYWORDS = ["clicked", "replied", "received"];
 
 /**
  * Engagement count at which a lead is logged as approaching the 400 KB DynamoDB
@@ -194,6 +196,31 @@ const engagementMatchesKeyword = (engagement: any): boolean => {
     (keyword) => eventType.includes(keyword) || eventData.includes(keyword)
   );
 };
+
+/**
+ * Makes sure `lead.system` exists so a document-path SET under it cannot throw. Returns false when the
+ * lead itself does not exist (the condition keeps a deleted row from being resurrected as a bare item).
+ */
+async function ensureLeadSystemMap(listId: string, leadId: string, caller: string): Promise<boolean> {
+  try {
+    await dynamodb.update({
+      TableName: `${TABLE_PREFIX}AW-Leads`,
+      Key: { listId, leadId },
+      // `system` is a DynamoDB reserved keyword — confirmed live against a real table:
+      // unescaped, this throws ValidationException, invisible to unit tests since they mock
+      // dynamodb.update() and never validate expression syntax against the reserved-word list.
+      UpdateExpression: 'SET #system = if_not_exists(#system, :emptyMap)',
+      ExpressionAttributeNames: { '#system': 'system' },
+      ExpressionAttributeValues: { ':emptyMap': {} },
+      ConditionExpression: 'attribute_exists(leadId)',
+    }).promise();
+    return true;
+  } catch (err) {
+    if (isConditionalFailure(err)) return false;
+    handleDynamoDbError(err, `${caller}:bootstrap`);
+    throw err;
+  }
+}
 
 // Ensure the User interface is exported
 export interface User {
@@ -657,7 +684,8 @@ export interface User {
   subscription_amount?: number; // Most recent invoice amount paid, in cents (e.g. 4900 = $49.00)
   /**
    * Active Stripe coupon/discount applied to the subscription (e.g., 90% off for 6 months).
-   * Synced from subscription.discount on all webhook and reconcile paths.
+   * Synced from the subscription's first listed `discounts` entry (Basil; the
+   * legacy subscription.discount is a fallback) on all webhook and reconcile paths.
    * Set to null when the discount is removed from the subscription.
    */
   activeOffer?: {
@@ -667,7 +695,7 @@ export interface User {
     amountOff: number | null; // in cents
     duration: 'forever' | 'once' | 'repeating';
     durationInMonths: number | null; // only set when duration = 'repeating'
-    endsAt: string | null; // ISO date when the discount expires (from subscription.discount.end)
+    endsAt: string | null; // ISO date when the discount expires (from the discount's `end`)
   } | null;
   /**
    * A scheduled subscription change queued in Stripe (e.g., scheduled downgrade
@@ -852,6 +880,11 @@ export interface User {
 export interface Organization {
   modelRoles?: import('./modelRoles').ModelRoles;
   leadNotifications?: LeadNotificationsConfig;
+  hotLeadCall?: import('./hotLeadCallConfig').HotLeadCallConfig;
+  /** System-managed pending team-member phone verification (hash only); see services/voice/memberVerification.ts. */
+  hotLeadCallVerification?: import('./voice/memberVerification').HotLeadCallVerification;
+  /** System-managed purchase/release history (cost caps); same family as hotLeadCallVerification, see services/voice/numberProvisioning.ts. */
+  hotLeadCallProvisioning?: import('./voice/numberProvisioning').HotLeadCallProvisioning;
   /**
    * Optimistic-concurrency counter for owner-losing operations. Absent until
    * the first one; see orgDb.claimOwnerChange.
@@ -5433,6 +5466,118 @@ class BenchmarkTestDB {
 export const benchmarkTestDb = new BenchmarkTestDB();
 
 // CRM Database Service
+interface LeadRecordUpdateOp {
+  stateIn: string[];
+  set?: Record<string, unknown>;
+  remove?: string[];
+  /** Fields that must currently hold exactly these values. */
+  whenEquals?: Record<string, string | number>;
+  maxIn?: Record<string, Record<string, number>>;
+  appendNew?: Record<string, string[]>;
+}
+
+// Every name and value of the expression goes through a generated placeholder. A placeholder that is declared but
+// not used (or used but not declared) is a ValidationException, which the mocked unit tests cannot see, so each is
+// created only where its clause is emitted: one name per field, one per map entry.
+interface ExpressionParts {
+  names: Record<string, string>;
+  values: Record<string, unknown>;
+  set: string[];
+  remove: string[];
+  conditions: string[];
+  /** Next placeholder number. */
+  n: number;
+}
+
+const addSetClauses = (p: ExpressionParts, set: Record<string, unknown>): void => {
+  for (const [field, v] of Object.entries(set)) {
+    if (v === undefined) continue;
+    p.names[`#f${p.n}`] = field;
+    p.values[`:v${p.n}`] = v;
+    p.set.push(`#system.#k.#f${p.n} = :v${p.n}`);
+    p.n++;
+  }
+};
+
+const addEqualsConditions = (p: ExpressionParts, whenEquals: Record<string, string | number>): void => {
+  for (const [field, expected] of Object.entries(whenEquals)) {
+    p.names[`#f${p.n}`] = field;
+    p.values[`:v${p.n}`] = expected;
+    p.conditions.push(`#system.#k.#f${p.n} = :v${p.n}`);
+    p.n++;
+  }
+};
+
+const addRemoveClauses = (p: ExpressionParts, remove: string[]): void => {
+  for (const field of new Set(remove)) {
+    p.names[`#f${p.n}`] = field;
+    p.remove.push(`#system.#k.#f${p.n}`);
+    p.n++;
+  }
+};
+
+/** Per-entry maps: an entry is written only if it is higher than the stored one (or absent). */
+const addMaxInClauses = (p: ExpressionParts, maxIn: Record<string, Record<string, number>>): void => {
+  for (const [field, entries] of Object.entries(maxIn)) {
+    const entryList = Object.entries(entries);
+    if (entryList.length === 0) continue;
+    const fieldName = `#f${p.n}`;
+    p.names[fieldName] = field;
+    p.n++;
+    for (const [entryKey, num] of entryList) {
+      p.names[`#e${p.n}`] = entryKey;
+      p.values[`:v${p.n}`] = num;
+      const path = `#system.#k.${fieldName}.#e${p.n}`;
+      p.set.push(`${path} = :v${p.n}`);
+      p.conditions.push(`(attribute_not_exists(${path}) OR ${path} < :v${p.n})`);
+      p.n++;
+    }
+  }
+};
+
+/** Lists: new values are appended, and any value already present fails the whole write. */
+const addAppendClauses = (p: ExpressionParts, appendNew: Record<string, string[]>): void => {
+  for (const [field, listed] of Object.entries(appendNew)) {
+    const items = [...new Set(listed)];
+    if (items.length === 0) continue;
+    const path = `#system.#k.#f${p.n}`;
+    p.names[`#f${p.n}`] = field;
+    p.values[`:v${p.n}`] = items;
+    p.set.push(`${path} = list_append(${path}, :v${p.n})`);
+    items.forEach((item, i) => {
+      p.values[`:v${p.n}_${i}`] = item;
+      p.conditions.push(`NOT contains(${path}, :v${p.n}_${i})`);
+    });
+    p.n++;
+  }
+};
+
+function leadRecordUpdateExpression(key: string, op: LeadRecordUpdateOp) {
+  // DynamoDB rejects an expression that touches one path twice; say so before the round trip.
+  const overlap = (op.remove ?? []).find((f) => op.set?.[f] !== undefined);
+  if (overlap) throw new Error(`updateLeadSystemRecordIf: ${overlap} is both set and removed`);
+  const p: ExpressionParts = {
+    names: { '#system': 'system', '#k': key, '#state': 'state' },
+    values: { ':ts': new Date().toISOString() },
+    set: ['updatedAt = :ts'],
+    remove: [],
+    conditions: [`#system.#k.#state IN (${op.stateIn.map((_, i) => `:from${i}`).join(', ')})`],
+    n: 0,
+  };
+  op.stateIn.forEach((s, i) => { p.values[`:from${i}`] = s; });
+  addSetClauses(p, op.set ?? {});
+  addRemoveClauses(p, op.remove ?? []);
+  addEqualsConditions(p, op.whenEquals ?? {});
+  addMaxInClauses(p, op.maxIn ?? {});
+  addAppendClauses(p, op.appendNew ?? {});
+  return {
+    UpdateExpression: `SET ${p.set.join(', ')}${p.remove.length ? ` REMOVE ${p.remove.join(', ')}` : ''}`,
+    ConditionExpression: p.conditions.join(' AND '),
+    ExpressionAttributeNames: p.names,
+    ExpressionAttributeValues: p.values,
+  };
+}
+
 export const crmDb = {
   // Lead List operations
   async createLeadList(
@@ -10894,24 +11039,7 @@ export const crmDb = {
   async claimLeadStepOnce(listId: string, leadId: string, key: string): Promise<boolean> {
     const tableName = `${TABLE_PREFIX}AW-Leads`;
     const dynKey = { listId, leadId };
-    try {
-      await dynamodb.update({
-        TableName: tableName,
-        Key: dynKey,
-        // `system` is a DynamoDB reserved keyword — confirmed live against a real
-        // table (round 15/16 smoke test): unescaped, this throws ValidationException,
-        // invisible to unit tests since they mock dynamodb.update() and never
-        // validate expression syntax against DynamoDB's actual reserved-word list.
-        UpdateExpression: 'SET #system = if_not_exists(#system, :emptyMap)',
-        ExpressionAttributeNames: { '#system': 'system' },
-        ExpressionAttributeValues: { ':emptyMap': {} },
-        ConditionExpression: 'attribute_exists(leadId)',
-      }).promise();
-    } catch (err: any) {
-      if (err.code === 'ConditionalCheckFailedException') return false;
-      handleDynamoDbError(err, 'claimLeadStepOnce:bootstrap');
-      throw err;
-    }
+    if (!(await ensureLeadSystemMap(listId, leadId, 'claimLeadStepOnce'))) return false;
 
     // Greptile P1 on #2291 (round 17): the release-on-failure write in
     // calendlyWebhook.ts's runStepOnce is itself best-effort (swallows its own
@@ -10948,6 +11076,71 @@ export const crmDb = {
     } catch (err: any) {
       if (err.code === 'ConditionalCheckFailedException') return false;
       handleDynamoDbError(err, 'claimLeadStepOnce');
+      throw err;
+    }
+  },
+
+  /**
+   * Creates the object `record` at `lead.system[key]` ONLY if that key is absent, returning whether THIS
+   * caller created it. Unlike claimLeadStepOnce there is no stale-reclaim: an existing record is never
+   * overwritten, so the single winner of two racing creators is decided by DynamoDB, not by a read.
+   * False also covers a lead that does not exist.
+   */
+  async createLeadSystemRecordOnce(
+    listId: string,
+    leadId: string,
+    key: string,
+    record: Record<string, unknown>,
+  ): Promise<boolean> {
+    if (!(await ensureLeadSystemMap(listId, leadId, 'createLeadSystemRecordOnce'))) return false;
+    const tableName = `${TABLE_PREFIX}AW-Leads`;
+    const dynKey = { listId, leadId };
+    try {
+      await dynamodb.update({
+        TableName: tableName,
+        Key: dynKey,
+        UpdateExpression: 'SET #system.#k = :rec, updatedAt = :ts',
+        ExpressionAttributeNames: { '#system': 'system', '#k': key },
+        ExpressionAttributeValues: { ':rec': record, ':ts': new Date().toISOString() },
+        ConditionExpression: 'attribute_not_exists(#system.#k)',
+      }).promise();
+      return true;
+    } catch (err) {
+      if (isConditionalFailure(err)) return false;
+      handleDynamoDbError(err, 'createLeadSystemRecordOnce');
+      throw err;
+    }
+  },
+
+  /**
+   * Conditional patch of the object record at `lead.system[key]`, applied in ONE UpdateItem. Returns
+   * false (nothing written) when ANY condition fails, so a replayed or out-of-order caller is a clean
+   * no-op rather than a partial write:
+   *  - `stateIn`: the record's current `state` must be one of these (a missing record fails too);
+   *  - `set`: plain field overwrites (undefined values are skipped);
+   *  - `whenEquals`: fields that must currently hold exactly these values, else nothing is written;
+   *  - `remove`: fields deleted from the record (absent ones are fine); a field that is also in `set` is refused;
+   *  - `maxIn`: per-entry numeric maps, e.g. { lastSequence: { [callSid]: 3 } }; an entry is written only
+   *    if it is higher than the stored one (or absent), otherwise the whole patch fails;
+   *  - `appendNew`: values appended to a list field; if any is already in the list the whole patch fails.
+   * A list named in `appendNew` must already exist on the record (the creator initialises it).
+   * A `maxIn` map must exist too, but its ENTRIES need not.
+   */
+  async updateLeadSystemRecordIf(
+    listId: string,
+    leadId: string,
+    key: string,
+    op: LeadRecordUpdateOp,
+  ): Promise<boolean> {
+    if (op.stateIn.length === 0) return false; // an empty IN () is invalid syntax
+    const expression = leadRecordUpdateExpression(key, op);
+
+    try {
+      await dynamodb.update({ TableName: `${TABLE_PREFIX}AW-Leads`, Key: { listId, leadId }, ...expression }).promise();
+      return true;
+    } catch (err) {
+      if (isConditionalFailure(err)) return false;
+      handleDynamoDbError(err, 'updateLeadSystemRecordIf');
       throw err;
     }
   },
@@ -11920,10 +12113,11 @@ export const orgDb = {
   // ProjectionExpression) for call sites that only need a few fields off an
   // otherwise large org record (brandGuidelines, competitors, etc). Omit it
   // to fetch the full item as before — every existing caller is unaffected.
-  async getOrgById(orgId: string, fields?: string[]): Promise<Organization | null> {
+  async getOrgById(orgId: string, fields?: string[], consistent = false): Promise<Organization | null> {
     const params: any = {
       TableName: ORGS_TABLE,
       Key: { orgId },
+      ...(consistent ? { ConsistentRead: true } : {}),
     };
     if (fields && fields.length > 0) {
       const names: Record<string, string> = {};
