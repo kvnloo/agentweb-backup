@@ -5,7 +5,8 @@
  * for every customer process is the hardened one.
  */
 import { request } from "http";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "fs";
+import { LoginHostClient, MutualTlsTransport } from "../../../services/funding/loginHostClient";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { dirname, join } from "path";
 import type { ProviderEvent } from "../../adapter";
@@ -173,6 +174,47 @@ describe("the whole host over a real socket", () => {
   it("the socket directory is the gate: owner-only mode in tests, and the socket exists", async () => {
     rig = await boot();
     expect(statSync(rig.sock).isSocket()).toBe(true);
+  });
+
+  describe("mutual TLS (PR 3)", () => {
+    it("the host serves the closed API over mutual TLS next to the unix socket, from files it reads at start-up", async () => {
+      const dir = mkdtempSync(join(tmpdir(), "host-int-tls-"));
+      dirs.push(dir);
+      const F = join(__dirname, "../fixtures/tls");
+      for (const [src, dst] of [["server.pem", "server.crt"], ["server.key.pem", "server.key"], ["ca.pem", "ca.crt"]]) copyFileSync(join(F, src), join(dir, dst));
+      const sys = new FakeSystem();
+      const cfg = parseHostConfig({
+        env: "test1", uidMin: 400_000, uidMax: 410_000, socket: { dir: "/run/aw-login-host-test1", gid: 990 },
+        egress: { allow: ["api.anthropic.com:443"] },
+        tls: { host: "172.31.30.50", port: 8443, certPath: join(dir, "server.crt"), keyPath: join(dir, "server.key"), caPath: join(dir, "ca.crt"), clientCommonNames: ["agentweb-backend-test"] },
+        claude: { binaryPath: "/opt/a/claude", expectedSha256: "a".repeat(64), version: "1", systemPromptFile: "/opt/p", bridgeUrl: "http://127.0.0.1:1/mcp" },
+      });
+      const adapter = createFakeAdapter(newScript(), { singleUse: true });
+      const lines: Array<{ level: string; event: string; fields?: Record<string, unknown> }> = [];
+      const recording = { info: (event: string, fields?: Record<string, unknown>) => void lines.push({ level: "info", event, fields }), warn: (event: string, fields?: Record<string, unknown>) => void lines.push({ level: "warn", event, fields }) };
+      const host = await startHost(cfg, { path: cfg.claude.binaryPath, version: "1", digest: "sha256:" + "a".repeat(64) }, {
+        cmd: sys, root: sys, log: recording as never, stateDir: join(dir, "state"), adapters: new Map([["fake", adapter]]), chownSocket: false,
+        socketDir: join(dir, "run"), egressDir: join(dir, "egress"), tlsHost: "127.0.0.1", tlsPort: 0,
+      });
+      try {
+        expect(host.handle.tlsPort).toBeGreaterThan(0);
+        const c = new LoginHostClient(new MutualTlsTransport({ host: "127.0.0.1", port: host.handle.tlsPort!, cert: readFileSync(join(F, "client.pem")), key: readFileSync(join(F, "client.key.pem")), ca: readFileSync(join(F, "ca.pem")) }));
+        await expect(c.connectionStatus({ connectionId: "nope" })).rejects.toMatchObject({ code: "ENOTFOUND" }); // reached the host's handler over TLS
+        const viaSocket = await call(join(dir, "run", "host.sock"), "/v1/connection.status", { connectionId: "nope" });
+        expect(viaSocket.status).toBe(404); // the unix socket still works
+        // The host passes its logger to the server: a CA-signed client with the wrong identity is logged (rate limited, name only) ...
+        const other = new LoginHostClient(new MutualTlsTransport({ host: "127.0.0.1", port: host.handle.tlsPort!, cert: readFileSync(join(F, "other.pem")), key: readFileSync(join(F, "other.key.pem")), ca: readFileSync(join(F, "ca.pem")) }));
+        await other.connectionStatus({ connectionId: "nope" }).catch(() => undefined);
+        await new Promise((r) => setTimeout(r, 100));
+        expect(lines).toContainEqual({ level: "warn", event: "tls_client_rejected", fields: { reason: "identity", cn: "somebody-else" } });
+        // ... and the server certificate's remaining life is reported at start-up (day count only).
+        const expiry = lines.find((l) => l.event === "host_tls_cert_expiry");
+        expect(expiry?.fields?.daysLeft).toBeGreaterThan(30_000);
+        expect(JSON.stringify(lines)).not.toMatch(/BEGIN|PRIVATE|MII[A-Za-z0-9]/);
+      } finally {
+        await host.shutdown();
+      }
+    });
   });
 
   describe("network isolation (PR 2)", () => {

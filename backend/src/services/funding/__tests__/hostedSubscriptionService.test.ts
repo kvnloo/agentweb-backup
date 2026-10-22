@@ -10,7 +10,7 @@ import { startHostServer, type HostServerHandle } from "../../../loginHost/serve
 import { makeRig, type Rig } from "../../../loginHost/__tests__/helpers";
 import { HostedSubscriptionError, HostedSubscriptionService, RECONCILE_GRACE_MS, REVOKE_ALARM_ATTEMPTS, type HostedProvider } from "../hostedSubscriptionService";
 import { LlmConnectionService } from "../llmConnectionService";
-import { LoginHostClient, LoginHostError, UnixSocketTransport } from "../loginHostClient";
+import { LoginHostClient, LoginHostError, UnixSocketTransport, type HostTransport } from "../loginHostClient";
 import { FakeKms, makeDb } from "./llmConnectionTestKit";
 
 const GOOD = "GOODCODE1#GOODSTATE1";
@@ -502,5 +502,69 @@ describe("hosted subscription service", () => {
       await store.db.create({ connectionId: "old-b3", ownerUserId: "user-1", kind: "claude_subscription", provider: "anthropic", status: "active", keyLast4: "", createdAt: "x", updatedAt: "x" });
       expect(await sweepLater()).toMatchObject({ revoking: 0, reconciled: 0 });
     });
+  });
+});
+
+describe("protocol guard: ENOTFOUND means 'nothing to wipe / the host lost it' ONLY from a worker verified to speak our protocol", () => {
+  // An OLDER worker that lacks a route answered ENOTFOUND for it; a stub that always says ENOTFOUND stands for that (and for a real lost connection).
+  const notFound: HostTransport = { json: async () => ({ status: 404, json: { error: "ENOTFOUND" } }), stream: async () => { throw new Error("n/a"); } };
+  const DAY = 24 * 60 * 60 * 1000;
+  function setup(proto: () => boolean) {
+    const store = makeDb();
+    let t = Date.now();
+    const svc = new HostedSubscriptionService({
+      db: store.db,
+      client: () => new LoginHostClient(notFound),
+      providers: { claude: { route: "claude", kind: "claude_subscription", recordProvider: "anthropic", hostProvider: "fake", isEnabledFor: async () => true } },
+      now: () => t,
+      newId: () => "x",
+      workerSpeaksOurProtocol: proto,
+    });
+    const row = async (status: "active" | "revoking" = "active") => {
+      const iso = new Date(t - DAY).toISOString();
+      await store.db.create({ connectionId: "h1", ownerUserId: "user-1", kind: "claude_subscription", provider: "anthropic", status, keyLast4: "", createdAt: iso, updatedAt: iso, subHosted: true, subHostEpoch: 1, subNeedsReconnect: false });
+    };
+    return { store, svc, row, advance: (ms: number) => void (t += ms) };
+  }
+  const user = { userId: "user-1" };
+  beforeEach(() => void jest.spyOn(console, "error").mockImplementation(() => undefined));
+  afterEach(() => jest.restoreAllMocks());
+
+  it("a disconnect is NOT confirmed by an ENOTFOUND from a worker whose protocol is not verified: it stays revoking (and the alarm path keeps counting)", async () => {
+    const { store, svc, row } = setup(() => false);
+    await row();
+    expect(await svc.revokeRecord(user, "h1")).toBe("revoking");
+    const after = (await store.db.get("h1"))!;
+    expect(after.status).toBe("revoking");
+    expect(after.subRevokeAttempts).toBe(1);
+  });
+
+  it("the same ENOTFOUND from a verified worker means nothing to wipe: revoked", async () => {
+    const { store, svc, row } = setup(() => true);
+    await row();
+    expect(await svc.revokeRecord(user, "h1")).toBe("revoked");
+    expect((await store.db.get("h1"))!.status).toBe("revoked");
+  });
+
+  it("the sweeper does not mark a customer 'host_lost' on an ENOTFOUND from an unverified worker, but does from a verified one", async () => {
+    const unverified = setup(() => false);
+    await unverified.row();
+    expect((await unverified.svc.sweepOnce()).markedNeedsReconnect).toBe(0);
+    expect((await unverified.store.db.get("h1"))!.status).toBe("active");
+    const verified = setup(() => true);
+    await verified.row();
+    expect((await verified.svc.sweepOnce()).markedNeedsReconnect).toBe(1);
+    expect((await verified.store.db.get("h1"))!).toMatchObject({ status: "invalid", subReconnectReason: "host_lost" });
+  });
+
+  it("a verified-then-unverified worker (a redeploy to another protocol) flips the behaviour with no restart", async () => {
+    let ok = true;
+    const { store, svc, row } = setup(() => ok);
+    await row("revoking");
+    ok = false;
+    expect((await svc.sweepOnce()).revoked).toBe(0);
+    expect((await store.db.get("h1"))!.status).toBe("revoking");
+    ok = true;
+    expect((await svc.sweepOnce()).revoked).toBe(1);
   });
 });

@@ -8,4 +8,4 @@ Operate it: `backend/docs/integrations/hot-lead-call.md` (operator quick referen
 
 Data-plane items; they need Harsha's OK (data-plane) before merge. There are new persistent keys but no new tables or indexes: org attributes `hotLeadCall`, `hotLeadCallVerification`, `hotLeadCallProvisioning`; AW-Settings items `hot_lead_call_mode` and `vendor_rate_overrides`; the `lead.system.hot_lead_call` record (including its `claimToken`, a random id of the writer that took an exclusive step); and `hlc#` counter and claim items in the existing `AW-MCPSessions` table (confirm the table exists in prod with TTL on `ttl` and that the app role can write it).
 
-Not done / before general availability: a human-approval gate for the number provision/release tools, recurring monthly number-rent metering, compliance sign-off for calling leads, the real rate card from Harsha, a staging run with real phones.
+Not done / before general availability: recurring monthly number-rent metering, compliance sign-off for calling leads, the real rate card from Harsha, a staging run with real phones.
