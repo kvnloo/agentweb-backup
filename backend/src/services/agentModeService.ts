@@ -1,4 +1,5 @@
 import { metaWriteRateShaper, META_BUDGET_THROTTLE_SUBCODE } from './agentMode/metaWriteRateShaper';
+import { normalizeSkillIdArg } from './agentMode/skillIdArg';
 import { applyProviderPolicy, CompareProviderPolicy } from './agentMode/compareProviderPolicy';
 import { classifyMetaBudgetChange } from './agentMode/metaBudgetAnomaly';
 import { deriveDominanceLegacyIds } from './agentMode/modelSupersession';
@@ -338,6 +339,7 @@ const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
  * files, not decoration — change it in both or in neither.
  */
 export const SKILL_UNRESOLVED_MARKER = "Could not resolve these skill IDs to any known skill";
+
 /*
  * The skill exists and the account is entitled to it, but nothing is installable behind it
  * right now — in practice an `__other_skills__` bundle whose unassociated-tool pool is empty.
@@ -7179,6 +7181,8 @@ export class AgentModeService {
       if (!Array.isArray(skillIds) || skillIds.length === 0 || skillIds.some((id) => typeof id !== 'string')) {
         return { success: false, message: "skillIds must be a non-empty array of skill IDs." };
       }
+      // ENG-2612: models copy the catalog display line ("<uuid>- Skill Name") as the id.
+      skillIds = [...new Set(skillIds.map(normalizeSkillIdArg))];
 
       const availableSkills = await this.getSkillsForDisplay([], userId);
       const availableById = new Map(availableSkills.map(skill => [skill.skillId, skill]));
