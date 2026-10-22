@@ -140,6 +140,7 @@ import { startWorkflow, advanceIndependentWorkflow, type AdvanceIndependentOutco
 // dependency back on this file (verified), so this is a one-directional
 // import, not a cycle.
 import { approvalInboxService, type ApprovalDecision, type ApprovalDecisionApprover } from './approvalInboxService';
+import { getDefaultApproverForGate } from './approverDirectory';
 // Review fix: the manifest executor below needs the same active-resume
 // primitive approvalInboxExecution.ts already built for the per-decision
 // path — resumeOriginSession is exported from there specifically so this
@@ -14169,14 +14170,25 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     // producer of this table.
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
 
+    // ENG-1853 follow-up: unlike the plan_choice producer (ask_user_question, which lets
+    // the model supply an explicit chat_url), this path never gave a reviewer any way
+    // back to the conversation that proposed a real Meta write — evidencePacket only
+    // ever carried researchSummary. sessionId is already a parameter here; the same
+    // ${CUSTOMER_FRONTEND_URL}/agent-mode/${sessionId} link agentModeController.ts
+    // already uses elsewhere for "go back to this session" is trivial to attach.
+    const chatUrl = `${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/agent-mode/${sessionId}`;
     const settled = await Promise.allSettled(
       writeHalts.map((r) =>
         approvalInboxService.createDecision({
           gateType: 'meta_write',
-          approver: 'matt',
+          approver: getDefaultApproverForGate('meta_write'),
           subjectLabel: `Meta Ads · Account ${r?.target?.account_id || r?.metaWriteDispatch?.account_id || 'unknown'}`,
           businessImpact: r?.confirmationDetail || r?.confirmationPrompt || r?.summary || 'A Meta Ads change is waiting for review.',
-          evidencePacket: { researchSummary: r?.summary },
+          // No separate researchSummary here: confirmationDetail (above) IS r.summary, so
+          // setting evidencePacket.researchSummary to r.summary as well rendered the exact
+          // same sentence twice on the card. There's no separate agent-authored rationale
+          // captured at this halt point to put here instead.
+          evidencePacket: { chatUrl },
           metaWriteManifestDigest: r.metaWriteManifestDigest,
           metaWriteDispatch: r.metaWriteDispatch,
           originSessionId: sessionId,
@@ -14409,6 +14421,13 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
 
     const target: Record<string, any> = { entity_type, action, account_id: scopeAccountId };
     const lines: string[] = [];
+    // The entity being UPDATED (never set on a CREATE) — already fetched in full by
+    // resolveCampaign/resolveAdSet/resolveAd below for its .name, but every other field
+    // on it (current daily_budget, current status, ...) was being thrown away. Kept here
+    // so the Changes: line below can show what's actually changing, not just which keys.
+    let currentEntity: any;
+    // AD_SET CREATE only: the parent campaign, to tell whether the write path will drop the ad set's own budget.
+    let parentCampaignForCreate: any;
 
     /*
      * Best-effort resolvers — each guarded so a Meta lookup failure never blocks the gate.
@@ -14478,6 +14497,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         lines.push(`Create a NEW campaign "${params.name}" (objective: ${params.objective || 'unspecified'}) in ad account ${scopeAccountId}.`);
       } else {
         const campaign = await resolveCampaign(campaign_id);
+        currentEntity = campaign;
         target.campaign = nameOf(campaign, campaign_id);
         target.campaign_id = campaign_id;
         lines.push(`${action} campaign ${target.campaign} in ad account ${scopeAccountId}.`);
@@ -14485,11 +14505,13 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     } else if (entity_type === 'AD_SET') {
       if (action === 'CREATE') {
         const campaign = await resolveCampaign(campaign_id);
+        parentCampaignForCreate = campaign;
         target.campaign = nameOf(campaign, campaign_id);
         target.ad_set_name = params.name;
         lines.push(`Create a NEW ad set "${params.name}" UNDER campaign ${target.campaign} (ad account ${scopeAccountId}).`);
       } else {
         const adSet = await resolveAdSet(ad_set_id);
+        currentEntity = adSet;
         const campaign = await resolveCampaign(adSet?.campaign_id);
         target.ad_set = nameOf(adSet, ad_set_id);
         target.campaign = campaign ? nameOf(campaign, adSet?.campaign_id) : undefined;
@@ -14523,6 +14545,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           + `which RESETS THE AD'S LEARNING PHASE and can hurt performance on a live client campaign.`);
       } else {
         const ad = await resolveAd(ad_id);
+        currentEntity = ad;
         const adSet = await resolveAdSet(ad?.adset_id);
         const campaign = await resolveCampaign(ad?.campaign_id);
         target.ad = nameOf(ad, ad_id);
@@ -14550,13 +14573,73 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     }
 
     // Surface content/destination changes so the user can catch a wrong-asset edit.
+    // Review fix (ENG-1853 follow-up): this used to list only the changed field NAMES
+    // ("Changes: daily_budget.") with neither the current nor the proposed value — a
+    // reviewer approving a real budget/status change had no way to tell $60→$110 from
+    // $6,000→$11,000 without leaving the page. currentEntity (already fetched above
+    // for its .name, previously discarded) supplies the "before" side; params supplies
+    // the "after" side — both were already right here.
+    // Units differ by field AND entity, and a reviewer approving real spend must see the amount
+    // Meta will actually receive: Meta itself (the "before" side) always reports minor units, as
+    // numeric STRINGS ("3000"); CAMPAIGN daily/lifetime_budget and spend_cap are forwarded raw in
+    // minor units, but `budget_amount` and every AD_SET budget/bid are DOLLARS (the write path
+    // multiplies by 100). Treating them all as cents showed an ad-set "$60" proposal as "$0.60".
+    const MONEY_KEYS = new Set(['daily_budget', 'lifetime_budget', 'bid_amount', 'budget_amount', 'spend_cap']);
+    const proposedIsDollars = (key: string) =>
+      key === 'budget_amount' || (entity_type === 'AD_SET' && ['daily_budget', 'lifetime_budget', 'bid_amount'].includes(key));
+    const asWholeNumber = (v: any): number | undefined =>
+      typeof v === 'number' ? v : (typeof v === 'string' && /^\d+(\.\d+)?$/.test(v) ? Number(v) : undefined);
+    const usd = (cents: number) => `$${(cents / 100).toFixed(2)}`;
+    const formatBefore = (key: string, value: any): string => {
+      if (value === undefined || value === null) return 'unset';
+      const n = MONEY_KEYS.has(key) ? asWholeNumber(value) : undefined;
+      return n !== undefined ? usd(n) : String(value);
+    };
+    const formatAfter = (key: string, value: any): string => {
+      if (value === undefined || value === null) return 'unset';
+      const n = MONEY_KEYS.has(key) ? asWholeNumber(value) : undefined;
+      return n !== undefined ? usd(proposedIsDollars(key) ? Math.round(n * 100) : n) : String(value);
+    };
+    // Non-money values: objects (placement_assets, adset_schedule) must not render as
+    // "[object Object]", and long copy must not flood the card.
+    const plain = (key: string, value: any, format: (k: string, v: any) => string): string => {
+      const text = value !== null && typeof value === 'object' ? JSON.stringify(value) : format(key, value);
+      return text.length > 160 ? `${text.slice(0, 157)}...` : text;
+    };
+    // The write path silently DROPS some budget params; showing them as changes would
+    // tell a reviewer about an amount Meta never receives.
+    const notApplied: Record<string, string> = {};
+    if (action === 'CREATE' && entity_type === 'AD_SET' && (parentCampaignForCreate?.daily_budget || parentCampaignForCreate?.lifetime_budget)) {
+      notApplied.daily_budget = 'the campaign already carries the budget';
+      notApplied.lifetime_budget = 'the campaign already carries the budget';
+    }
+    if (action === 'CREATE' && entity_type === 'CAMPAIGN' && params.budget_amount !== undefined && !params.advantage_campaign_budget) {
+      notApplied.budget_amount = 'campaign budget only applies with advantage_campaign_budget';
+    }
+    if (action !== 'CREATE' && entity_type === 'CAMPAIGN' && params.budget_amount !== undefined) {
+      notApplied.daily_budget = 'budget_amount takes precedence';
+    }
     const contentChanges: Record<string, any> = {};
-    for (const key of ['link_url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'status', 'daily_budget', 'lifetime_budget', 'creative_id', 'placement_assets', 'adset_schedule', 'pacing_type']) {
-      if (params[key] !== undefined) contentChanges[key] = params[key];
+    const changeDescriptions: string[] = [];
+    // A rename is a real change a reviewer must see; on CREATE the name is already in the summary line.
+    const changeKeys = ['link_url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'status', 'daily_budget', 'lifetime_budget', 'budget_amount', 'bid_amount', 'spend_cap', 'creative_id', 'placement_assets', 'adset_schedule', 'pacing_type'];
+    if (action !== 'CREATE') changeKeys.unshift('name');
+    for (const key of changeKeys) {
+      if (params[key] === undefined || notApplied[key]) continue;
+      contentChanges[key] = params[key];
+      const before = currentEntity?.[key === 'budget_amount' ? 'daily_budget' : key];
+      const after = plain(key, params[key], formatAfter);
+      changeDescriptions.push(
+        before !== undefined ? `${key}: ${plain(key, before, formatBefore)} → ${after}` : `${key} → ${after}`,
+      );
     }
     if (Object.keys(contentChanges).length > 0) {
       target.changes = contentChanges;
-      lines.push(`Changes: ${Object.keys(contentChanges).join(', ')}.`);
+      lines.push(`Changes: ${changeDescriptions.join(', ')}.`);
+    }
+    const ignored = Object.keys(notApplied).filter((k) => params[k] !== undefined);
+    if (ignored.length > 0) {
+      lines.push(`Not applied: ${ignored.map((k) => `${k} (${notApplied[k]})`).join(', ')}.`);
     }
 
     /*

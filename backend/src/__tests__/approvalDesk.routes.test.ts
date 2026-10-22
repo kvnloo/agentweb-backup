@@ -155,6 +155,28 @@ describe('GET /manifest/:manifestId — Matt cannot see Harsha\'s items', () => 
     expect(res.body.decisions[0].decisionId).toBe('d1');
   });
 
+  it('passes a chatUrl on the customer-portal origin through, and drops any other (agent-authored) link', async () => {
+    const original = process.env.CUSTOMER_FRONTEND_URL;
+    process.env.CUSTOMER_FRONTEND_URL = 'https://app.agentweb.pro';
+    try {
+      mockListByManifest.mockResolvedValue([
+        decisionFor('d1', 'matt', { manifestId: 'm1', evidencePacket: { chatUrl: 'https://app.agentweb.pro/agent-mode/s1' } }),
+        decisionFor('d2', 'matt', { manifestId: 'm1', evidencePacket: { chatUrl: 'https://evil.example.com/agent-mode/s1', researchSummary: 'keep me' } }),
+        decisionFor('d3', 'matt', { manifestId: 'm1', evidencePacket: { chatUrl: 'javascript:alert(1)' } }),
+      ]);
+      const res = await request(app).get('/api/approval-desk/manifest/m1').set('Authorization', `Bearer ${mattToken}`);
+      expect(res.status).toBe(200);
+      const byId = Object.fromEntries(res.body.decisions.map((d: any) => [d.decisionId, d]));
+      expect(byId.d1.evidencePacket.chatUrl).toBe('https://app.agentweb.pro/agent-mode/s1');
+      expect(byId.d2.evidencePacket.chatUrl).toBeUndefined();
+      expect(byId.d2.evidencePacket.researchSummary).toBe('keep me');
+      expect(byId.d3.evidencePacket.chatUrl).toBeUndefined();
+    } finally {
+      if (original === undefined) delete process.env.CUSTOMER_FRONTEND_URL;
+      else process.env.CUSTOMER_FRONTEND_URL = original;
+    }
+  });
+
   it('404s when every item in the manifest belongs to a different approver', async () => {
     mockListByManifest.mockResolvedValue([decisionFor('d1', 'harsha', { manifestId: 'm1' })]);
     const res = await request(app).get('/api/approval-desk/manifest/m1').set('Authorization', `Bearer ${mattToken}`);

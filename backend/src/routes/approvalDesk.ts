@@ -27,9 +27,75 @@ async function resolveApprover(req: AuthenticatedRequest) {
   return getApproverForEmail(email);
 }
 
+// ENG-1853 follow-up: manifestId is the execution grouping (one Approve All
+// dispatches one manifest together) but Matt's own mental model is "which
+// ACCOUNTS need me" — the account-vs-manifest distinction only matters
+// operationally, not to how a reviewer wants to scan the queue. Real
+// account id already lives on every meta_write decision's own dispatch
+// payload (resolvedAccountId is the frozen, already-tenancy-checked value —
+// never account_id, the raw/unverified one); this just surfaces it instead
+// of leaving callers to regex it out of a free-text subjectLabel.
+function accountIdForManifest(decisions: ApprovalDecision[]): string | null {
+  const withAccount = decisions.find((d) => d.metaWriteDispatch?.resolvedAccountId);
+  return withAccount?.metaWriteDispatch?.resolvedAccountId || null;
+}
+
+// subjectLabel is producer-authored free text (see agentModeService.ts's
+// stageApprovalInboxMetaWriteManifest), typically "<Company> · Meta Ad
+// Account <id>" — strip the account-id suffix for a group header that reads
+// as a company/account name, not a repeat of the raw id shown right next to
+// it. Falls back to the raw account id if the label doesn't match that
+// shape (never blocks grouping on a label-parsing miss).
+function accountLabelForManifest(decisions: ApprovalDecision[], accountId: string | null): string {
+  const label = decisions.find((d) => d.metaWriteDispatch?.resolvedAccountId === accountId)?.subjectLabel;
+  const stripped = label?.split(/\s*·\s*Meta Ad Account\s/i)[0]?.trim();
+  return stripped || `Account ${accountId}`;
+}
+
+// chatUrl is agent-authored on the plan_choice path (taken from a model tool call) and is rendered
+// to an admin as a trusted "View the full conversation" link, so only a link back to our own
+// customer portal is passed through; anything else is dropped rather than shown.
+function customerPortalOrigin(): string {
+  try {
+    return new URL(process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174').origin;
+  } catch {
+    return '';
+  }
+}
+function withSafeChatUrl(decision: ApprovalDecision): ApprovalDecision {
+  const chatUrl = decision.evidencePacket?.chatUrl;
+  if (!chatUrl) return decision;
+  try {
+    if (new URL(chatUrl).origin === customerPortalOrigin()) return decision;
+  } catch {
+    // unparseable -> drop below
+  }
+  return { ...decision, evidencePacket: { ...decision.evidencePacket, chatUrl: undefined } };
+}
+
+// A meta_write summary reads "<verb> <entity> … in ad account X. Changes: key: before → after."
+// — the part a reviewer scans for is the TAIL, so a plain head-slice cut exactly that off for a
+// long campaign name. Keep a short head and the Changes tail; Array.from keeps surrogate pairs whole.
+const PREVIEW_MAX = 220;
+function previewOf(text: string): string {
+  const chars = Array.from(text);
+  if (chars.length <= PREVIEW_MAX) return text;
+  const at = text.indexOf('Changes:');
+  if (at > 0) {
+    const head = Array.from(text.slice(0, at).trim());
+    const tail = Array.from(text.slice(at));
+    const tailPart = tail.slice(0, 120).join('') + (tail.length > 120 ? '…' : '');
+    return `${head.slice(0, PREVIEW_MAX - 120 - 2).join('')}… ${tailPart}`;
+  }
+  return `${chars.slice(0, PREVIEW_MAX - 1).join('')}…`;
+}
+
 /** GET /api/approval-desk/queue — the caller's own pending decisions, grouped
  *  by manifestId (the "one decision surface per campaign/account" the ticket
- *  asks for, not a flat list of individual calls). */
+ *  asks for, not a flat list of individual calls), with each manifest's real
+ *  account id/label attached so the frontend can group manifests under
+ *  accounts (Matt's own mental model) without re-deriving it from decisions
+ *  it doesn't have here. */
 router.get('/queue', authenticateToken, isAdmin, async (req, res) => {
   try {
     const approver = await resolveApprover(req as AuthenticatedRequest);
@@ -52,14 +118,25 @@ router.get('/queue', authenticateToken, isAdmin, async (req, res) => {
       list.push(decision);
       byManifest.set(decision.manifestId, list);
     }
-    const manifests = [...byManifest.entries()].map(([manifestId, decisions]) => ({
-      manifestId,
-      // Display-only summary fields — the manifest detail route below is the
-      // source of truth for a reviewer actually acting on one.
-      subjectLabel: decisions[0]?.subjectLabel,
-      itemCount: decisions.length,
-      earliestExpiresAt: decisions.reduce((min, d) => (d.expiresAt < min ? d.expiresAt : min), decisions[0].expiresAt),
-    }));
+    const manifests = [...byManifest.entries()].map(([manifestId, decisions]) => {
+      const accountId = accountIdForManifest(decisions);
+      return {
+        manifestId,
+        // Display-only summary fields — the manifest detail route below is the
+        // source of truth for a reviewer actually acting on one.
+        subjectLabel: decisions[0]?.subjectLabel,
+        itemCount: decisions.length,
+        // One line per item so a packet row can say WHAT is inside instead of
+        // repeating the account name its accordion already shows.
+        itemPreviews: decisions.slice(0, 3).map((d) => previewOf(d.businessImpact)),
+        earliestExpiresAt: decisions.reduce((min, d) => (d.expiresAt < min ? d.expiresAt : min), decisions[0].expiresAt),
+        // null for a manifest with no meta_write items (e.g. a pure
+        // plan_choice packet) — those have no account to group under and
+        // the frontend buckets them separately rather than forcing a fake one.
+        accountId,
+        accountLabel: accountId ? accountLabelForManifest(decisions, accountId) : null,
+      };
+    });
     return res.json({ success: true, manifests });
   } catch (error: any) {
     console.error('[approval-desk] failed to list queue:', error?.message || error);
@@ -82,7 +159,7 @@ router.get('/manifest/:manifestId', authenticateToken, isAdmin, async (req, res)
     if (decisions.length === 0) {
       return res.status(404).json({ success: false, error: 'No decisions in this manifest are assigned to you.' });
     }
-    return res.json({ success: true, manifestId: req.params.manifestId, decisions });
+    return res.json({ success: true, manifestId: req.params.manifestId, decisions: decisions.map(withSafeChatUrl) });
   } catch (error: any) {
     console.error('[approval-desk] failed to load manifest:', error?.message || error);
     return res.status(500).json({ success: false, error: 'Failed to load this manifest.' });
@@ -121,7 +198,7 @@ router.post('/decision/:decisionId/verdict', authenticateToken, isAdmin, async (
 
     await executeResolvedDecision(claim.decision);
     const updated = await approvalInboxService.getDecision(req.params.decisionId);
-    return res.json({ success: true, decision: updated || claim.decision });
+    return res.json({ success: true, decision: withSafeChatUrl(updated || claim.decision) });
   } catch (error: any) {
     console.error('[approval-desk] failed to record verdict:', error?.message || error);
     return res.status(500).json({ success: false, error: 'Failed to record this verdict.' });
