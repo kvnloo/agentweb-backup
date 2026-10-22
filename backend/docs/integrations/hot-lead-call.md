@@ -379,8 +379,8 @@ turns) with "This needs a person to confirm in an interactive chat".
   still counts). A stored `hotLeadCallProvisioning` that is malformed makes both
   tools refuse ("Contact support"). `confirm` is advisory only: the model
   controls it, so it is not an authorization. An ambiguous buy failure is
-  logged as `ORPHAN RISK` and is not retried. Only the first month's rent is
-  metered.
+  logged as `ORPHAN RISK` and is not retried. The first month's rent is
+  metered at purchase and later months by the daily rent sweep (see Metering).
 - `release_hot_lead_call_number({})` turns calling off first, releases the
   number (a 404 from Twilio counts as already gone; any other failure keeps the
   number assigned), then clears `twilioNumber`/`twilioNumberSid`.
@@ -402,7 +402,7 @@ Order of setup, which the tool text also teaches Emma:
 
 Cost bound through these tools: 2 purchases at the card's $1.15 plus 5
 verification calls at $0.014 is about $2.37 per org per day at the provisional
-rates. First-month rent only; recurring rent is not metered.
+rates. The first month's rent is metered at purchase; later months by the daily rent sweep.
 
 General availability precondition: a human-approval gate (a deck-of-one approval
 per purchase or release, like `services/crmSequenceActivationGate.ts`) is NOT
@@ -603,6 +603,7 @@ No new table or index. The feature writes:
 | `hotLeadCallVerification` (per member: HMAC of pending code, attempts, start history; plus the org-wide start list) | org attribute | verification flow (REST and tools); cleared per member by settings edits |
 | `hotLeadCallProvisioning` (purchase/release timestamps for the daily caps) | org attribute | provisioning tools |
 | `hot_lead_call_mode` | AW-Settings item | operators |
+| `HOT_LEAD_CALL_RENT_METERING` | environment variable of the backend (unset means on; `0`/`false`/`off` stops the rent sweep) | operators |
 | `vendor_rate_overrides` | AW-Settings item | admin Vendor Rates tab |
 | `system.hot_lead_call` (call record: `state`, `jobKey`, `startedAt`, `updatedAt`, `attemptNo`, `memberId`, `triedMemberIds`, `leadPhoneMac` (keyed HMAC of the lead's phone, see Org config), `claimToken` (random id of the writer that took an exclusive step, see Writes that commit and then report an error), `memberCallSid`, `leadCallSid`, `outcome`, `meteredLegs` (`member:<attempt>` and `lead`), `lastSequence`) | on the lead row (AW-Leads), no phone number | orchestrator and webhooks |
 | Timeline events `call.*` | the lead's `engagements` list | `LeadCallStore.addEvent` |
@@ -634,7 +635,7 @@ Every Twilio call is billed to AgentWeb's account and recorded through
 | Rate key | Unit | Provisional default | Metered |
 | --- | --- | --- | --- |
 | `voice_minute_outbound` | minute | $0.014 | per leg, from the `/status` webhook |
-| `number_monthly_rent` | number_month | $1.15 | provisioning tool only, at purchase (first month) |
+| `number_monthly_rent` | number_month | $1.15 | at purchase (first month) and by the daily rent sweep (every later month), same key per number and month |
 
 The defaults are PROVISIONAL placeholders at Twilio's public US list price
 (checked 2026-10-19) pending the rate allocation from Harsha (get this before
@@ -669,9 +670,25 @@ Rules the code enforces:
 - The verification call has no status callback and is metered at an
   estimated one minute. A placement the provider did not confirm returns no CallSid, which
   the usage event is keyed by, so that start is not metered (at most one minute, and starts are capped per person and per day).
-- **Recurring number rent is NOT metered.** Only the first month is recorded at
-  purchase. A scheduled job that meters `twilio:number:<sid>:<YYYY-MM>` for every
-  stored `twilioNumberSid` each month is a follow-up (see below).
+- **Recurring number rent is metered by a daily sweep** (ENG-2614). Rent is
+  billed per calendar UTC month with the key `twilio:number:<sid>:<YYYY-MM>`. The
+  purchase records the first month; `cron/numberRentCron.ts` runs once a day at
+  11:00 UTC (`services/voice/numberRent.ts`), reads every org, and for each org
+  that holds a `hotLeadCall.twilioNumberSid` records the current month against
+  `ownerUserId` with the same key and fields. In the purchase month that write
+  is a duplicate and changes nothing; a later month adds one event. A released
+  number (fields removed) and a deleted org are not charged from the next sweep
+  on, but a month already started stays billed. A number bought on the last day
+  of a month is charged twice within a day or two (that month and the next).
+  There is no backfill: months before the sweep was enabled are not recorded.
+  The recorder returns nothing, so the sweep cannot see a lost write; the next
+  daily run retries it, and the recorder's dropped-write alert reports it. The
+  sweep logs one line with counts (`[hotLeadCall] number rent sweep completed`:
+  orgs scanned, numbers found, metered, skipped without an owner, with an invalid
+  sid or without a rate-card unit, failed), never a phone number.
+  **Kill switch:** set the environment variable `HOT_LEAD_CALL_RENT_METERING` to
+  `0`, `false` or `off` and restart; it is on when unset. Events already written
+  stay, and re-enabling later cannot double-charge.
 - Calls made while the org is disabled or the switch is off (a call already in
   flight) are still metered from the list owner's id.
 
@@ -979,6 +996,13 @@ on anywhere.
 5. Rate card from Harsha: replace or confirm the provisional $0.014/minute and
    $1.15/month, using the Vendor Rates tab or a code change with a
    `VENDOR_RATE_CARD_VERSION` bump.
+   Before the rent sweep is first enabled in production, confirm which orgs
+   already hold a number (read-only; the sweep meters only the current month, so
+   any number bought before it has earlier unbilled months):
+   `aws dynamodb scan --table-name AW-Organizations --filter-expression "attribute_exists(hotLeadCall.twilioNumberSid)" --projection-expression "orgId" --select SPECIFIC_ATTRIBUTES`
+   (use `--select COUNT` for just the count; no output rows means none). Past
+   months of any number found would have to be written by hand, which is a
+   production data change that needs Harsha's approval.
 6. Deploy with `hot_lead_call_mode` OFF first and test the off switch: with it
    off, submit a test lead and confirm nothing is dialed; then flip it on and off
    again and time the effect (~30s). There is no operator route for it: set the
@@ -1012,8 +1036,7 @@ on anywhere.
     groups by rate-card version will see a new bucket.
 14. Known gaps accepted at launch, to be closed before general availability: the
     human-approval gate for provision/release (the tools refuse unattended runs
-    and are capped per org, nothing more); recurring number-rent metering is not
-    built (only the first month is recorded).
+    and are capped per org, nothing more).
 
 ## Not verified without a real Twilio account
 
@@ -1090,9 +1113,6 @@ Twilio's documentation and encoded in tests with synthetic payloads:
 
 ## Known follow-ups
 
-- **Recurring number rent metering.** A monthly job that records
-  `number_monthly_rent` for every stored `twilioNumberSid` (key
-  `twilio:number:<sid>:<YYYY-MM>`). Only the first month is metered today.
 - **Stuck-record cleanup.** A documented sweep for records live longer than a
   call can last (and reconciliation of their Twilio legs). No cron exists.
 - **Human-approval gate for paid tools (GA precondition).** None exists yet:
