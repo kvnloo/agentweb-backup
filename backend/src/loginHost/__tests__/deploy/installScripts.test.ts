@@ -668,7 +668,7 @@ case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${
       expect(run(b).status).toBe(0);
       const first = current(b);
       nextSecond();
-      writeFileSync(join(b.pkg, "MANIFEST"), text(join(b.pkg, "MANIFEST")).replace(/^[0-9a-f]{64}  \.\/dist\/loginHost\/host\/start\.js$/m, "f".repeat(64) + "  ./dist/loginHost/host/start.js"));
+      writeFileSync(join(b.pkg, "MANIFEST"), text(join(b.pkg, "MANIFEST")).replace(/^[0-9a-f]{64} {2}\.\/dist\/loginHost\/host\/start\.js$/m, "f".repeat(64) + "  ./dist/loginHost/host/start.js"));
       expect(run(b).status).toBe(0);
       expect(current(b)).not.toBe(first);
     });
