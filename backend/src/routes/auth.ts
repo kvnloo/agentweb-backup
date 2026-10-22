@@ -8,6 +8,7 @@ import { AuthRequest } from '../types/express';
 import { Request, Response, NextFunction } from 'express';
 import { AuthenticatedRequest } from '../middleware/auth';
 import { ChatbotDB } from '../services/chatbotService';
+import { withoutWorkPlanProvenance } from '../utils/workPlanProvenance';
 import * as authController from '../controllers/auth';
 import rateLimit from 'express-rate-limit';
 import { resolveAnalyticsConfig, resolveConfigTarget } from '../services/analyticsConfigResolver';
@@ -475,7 +476,9 @@ router.get('/:userId/chat-sessions', authenticateToken, async (req, res) => {
 
   try {
     const sessions = await chatbotDb.getUserSessions(userId);
-    res.json(sessions);
+    // ENG-669: a non-admin never gets the work plan's model provenance bookkeeping (as on agent mode's reads).
+    const viewerIsAdmin = !!(authenticatedReq.user.isAdmin || authenticatedReq.delegateInfo?.isDelegated);
+    res.json({ ...sessions, sessions: sessions.sessions.map((session) => withoutWorkPlanProvenance(session, viewerIsAdmin)) });
   } catch (error) {
     console.error('Error fetching user chat sessions:', error);
     res.status(500).json({ message: 'Failed to fetch chat sessions' });

@@ -68,6 +68,7 @@ import type { LLMUsageContext } from '../utils/llmService';
 import { toolCallSucceeded } from '../utils/toolCallOutcome';
 import { countCallsSatisfyingRequirement, RequiredCallLedgerEntry } from '../utils/requiredCallSatisfaction';
 import { canonicalizeVisibility, resolveVisibilityUpdate } from '../utils/scheduleTemplateVisibility';
+import { redactWorkPlanProvenance, withoutWorkPlanProvenance } from '../utils/workPlanProvenance';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
 import { LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON } from '../utils/scheduleRunBlockedReason';
 import { ENDED_BEFORE_MODEL_CHECK_FLAG, isNewScheduleModelBlock, isScheduleModelBlockedRun, isUnattendedPause, scheduleModelBlockFields, SCHEDULE_TEST_RUN_FLAG, STEP_MODEL_NOTICE_SENT_FLAG, wasStepModelNoticeSent } from '../utils/unattendedModelNotices';
@@ -2172,25 +2173,8 @@ function redactWorkPlanForViewer(workPlan: any, options: { keepStepModels?: bool
   const {
     launchModel: _l, launchModelSource: _ls, planAuthor: _pa, planDefaultModel: _p, planDefaultModelSource: _ps, engineModel: _e, pickedModel: _k, ...rest
   } = workPlan;
-  return options.keepStepModels ? rest : { ...rest, ...(Array.isArray(rest.steps) && { steps: withoutStepModels(rest.steps) }) };
-}
-
-/**
- * ENG-669 (#3607 follow-up 6): a work plan as its OWNER (or anyone but an admin) reads it: without the engine's model
- * provenance bookkeeping (`planAuthor`, `launchModelSource`, `planDefaultModelSource`, each step's `modelSource`). The
- * customer portal reads none of these (it reads the step `model`s, `templatePlanId` and the session's own
- * `llmModelSource`, which stays). Admin session reads keep them. Returns a copy; the stored plan is untouched.
- */
-function redactWorkPlanProvenance(workPlan: any): any {
-  if (!workPlan || typeof workPlan !== 'object') return workPlan;
-  const { planAuthor: _pa, launchModelSource: _ls, planDefaultModelSource: _ps, ...rest } = workPlan;
-  if (!Array.isArray(rest.steps)) return rest;
-  return {
-    ...rest,
-    steps: rest.steps.map((s: any) => (s && typeof s === 'object' && 'modelSource' in s
-      ? (({ modelSource: _ms, ...step }) => step)(s)
-      : s)),
-  };
+  // ENG-669: a launcher who may see the step models still never sees who chose them (step modelSource).
+  return options.keepStepModels ? redactWorkPlanProvenance(rest) : { ...rest, ...(Array.isArray(rest.steps) && { steps: withoutStepModels(rest.steps) }) };
 }
 
 /** ENG-2378: public plan responses never expose step models (the plan-level defaultModel exposure is pre-existing). */
@@ -10372,12 +10356,14 @@ export const agentModeController = {
       // history is loaded on-demand when a session is actually opened).
       const result = await chatbotDb.getUserSessions(user.userId, portalType, limit, true, lastEvaluatedKey, pageIdentifier, search, sessionTypeFilter);
 
+      // ENG-669: like getSession, a non-admin's list carries no work-plan model provenance bookkeeping.
+      const listViewerIsAdmin = !!(user?.isAdmin || (req as any).delegateInfo?.isDelegated);
       const listSessions = result.sessions.map(session => {
         // Derive previewText from first user message if not already stored
         const previewText: string | null = (session as any).previewText ||
           session.messages?.find((m: any) => m.role === 'user')?.content?.slice(0, 200) || null;
         const { messages: _, ...sessionWithoutMessages } = session as any;
-        return { ...sessionWithoutMessages, messages: [], previewText };
+        return { ...withoutWorkPlanProvenance(sessionWithoutMessages, listViewerIsAdmin), messages: [], previewText };
       });
 
       res.json({
@@ -10457,7 +10443,10 @@ export const agentModeController = {
             const existing = await chatbotDb.getChatSession(claim.sessionId);
             if (existing && existing.userId === user.userId) {
               // Duplicate of a completed create — attach to the winner's session.
-              return res.status(200).json({ ...existing, idempotentReplay: true });
+              return res.status(200).json({
+                ...withoutWorkPlanProvenance(existing, !!(user?.isAdmin || (req as any).delegateInfo?.isDelegated)),
+                idempotentReplay: true,
+              });
             }
           }
           return res.status(409).json({
