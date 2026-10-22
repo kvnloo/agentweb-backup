@@ -1,5 +1,7 @@
 # Login host deploy files (ENG-2110) — NOT installed by CI; DARK
 
+**Production worker: use `prod/install.sh` (built into a tarball by `backend/scripts/build-login-host.sh`); see `prod/README.md` for build, deploy, rollback, certificate rotation and the runbook.** The checklist below is the manual, test-instance view.
+
 Files: `aw-login-host@.service` (host, one instance per env), `aw-env.slice.example`, `host-config.example.json`,
 `claude-turn.sh` (per-turn wrapper), `aw-write-file.sh` (root helper that writes a file as a customer uid).
 
