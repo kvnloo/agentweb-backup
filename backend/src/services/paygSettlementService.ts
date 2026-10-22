@@ -49,7 +49,9 @@ import {
   paygSettlementMonthsToPrune,
   paygAdmittedMarkupBps,
   paygMonthInputsFromRow,
+  paygPaymentConfirmationOverdue,
   paygSpendDriftTolerable,
+  PAYG_PAYMENT_CONFIRMATION_GRACE_DAYS,
   previousUsageMonth,
   type PaygMonthInputs,
   type PaygDisputeRecord,
@@ -98,7 +100,9 @@ export type PaygSettlementOutcome =
   | 'held'
   | 'nothing_to_bill'
   | 'invoiced'
-  | 'paid';
+  | 'paid'
+  /** The sweep held PAYG for a payment left unconfirmed past the grace period (`expireUnconfirmedPayment`). */
+  | 'payment_unconfirmed';
 
 export interface PaygSettlementRunSummary {
   /** Why nothing ran, when nothing did. */
@@ -163,6 +167,16 @@ export async function runPaygSettlement(now: Date = new Date()): Promise<PaygSet
         summary.outcomes[outcome] = (summary.outcomes[outcome] ?? 0) + 1;
       } catch (error: unknown) {
         recordFailure(summary, billingUserId, settleMonth, error);
+      }
+    }
+    // A payment left waiting for the owner's confirmation past the grace period is treated as unpaid.
+    for (const [unconfirmedMonth, record] of Object.entries(owner.paygSettlements ?? {})) {
+      if (record?.status !== 'invoiced' || !paygPaymentConfirmationOverdue(record.actionRequiredAt, now)) continue;
+      try {
+        const outcome = await expireUnconfirmedPayment(billingUserId, unconfirmedMonth, now);
+        if (outcome) summary.outcomes[outcome] = (summary.outcomes[outcome] ?? 0) + 1;
+      } catch (error: unknown) {
+        recordFailure(summary, billingUserId, unconfirmedMonth, error);
       }
     }
   }
@@ -455,6 +469,7 @@ async function invoicePendingSettlement(
     billingUserId,
     month,
     idempotencyKey: record.idempotencyKey,
+    recordCreatedAt: record.createdAt,
   };
   const issued = await stripeService.issuePaygOverageInvoice({
     // Scoped to this record: retries of it replay Stripe's answers, while a record re-created after a
@@ -696,11 +711,14 @@ async function loadSettlementFor(invoice: OverageInvoiceEvent, event: string): P
     console.warn(`${TAG} ${event}: invoice ${ref.invoiceId} was set aside for settlement ${ref.month} (${record.uncollectedInvoice.reason}); ignored`);
     return null;
   }
-  // A record that names no invoice yet (a `pending` re-created after a `retry`, say) owns only an invoice
-  // its own run would adopt: one the Stripe search matches (this record's key in the metadata) that is
-  // not void — the search never adopts a void one. A late event about an older invoice of the month (a
-  // voided one above all) must never write off, fail or pay the new record.
-  if (!record.invoiceId && (invoice.status === 'void' || invoice.metadata?.idempotencyKey !== record.idempotencyKey)) {
+  // A record that names no invoice yet (a `pending` re-created after a `retry`, say) owns only the invoice
+  // its own run created: this record's key AND this record's `createdAt` in the metadata, and not void.
+  // The key alone is the same for every record of the month, so it cannot tell an earlier record's
+  // invoice from this one's. A late event about an older invoice of the month (a voided one, or a
+  // redelivered failure from before the void) must never write off, fail or pay the new record. An older
+  // live invoice the run's search adopts becomes this record's as soon as the run records its id.
+  if (!record.invoiceId && (invoice.status === 'void' || invoice.metadata?.idempotencyKey !== record.idempotencyKey
+    || invoice.metadata?.recordCreatedAt !== record.createdAt)) {
     console.warn(`${TAG} ${event}: settlement ${ref.month} for ${ref.billingUserId} names no invoice yet, and invoice ${ref.invoiceId} `
       + `(${invoice.status ?? 'status unknown'}) is not one it would adopt; ignored`);
     return null;
@@ -800,8 +818,15 @@ export async function handlePaygOverageInvoicePaymentFailed(invoice: OverageInvo
   const { ref, user, record } = loaded;
   if (record.status === 'paid') return; // an out-of-order failure for an invoice already paid
   // A failed lookup throws: the webhook answers 500 and Stripe redelivers — never guess either way.
-  if (await stripeService.paygOverageInvoicePaymentNeedsAction(ref.invoiceId)) {
+  const state = await stripeService.paygOverageInvoicePaymentState(ref.invoiceId);
+  if (state === 'in_progress') {
+    // The owner confirmed (or a debit is settling) after Stripe sent this: `invoice.paid` follows.
+    console.log(`${TAG} overage invoice ${ref.invoiceId}: a failure was reported but its payment has gone through or is processing: ${ref.billingUserId} ${ref.month}; not a failure`);
+    return;
+  }
+  if (state === 'action_required') {
     console.log(`${TAG} overage invoice ${ref.invoiceId} awaits the owner's confirmation (requires_action): ${ref.billingUserId} ${ref.month}; not a failure`);
+    await noteActionRequired(ref);
     await sendActionRequiredEmailOnce(user, ref, record, invoice);
     return;
   }
@@ -1051,14 +1076,21 @@ async function liftDisputeSuspension(billingUserId: string): Promise<void> {
     const disputes = records.flatMap((record) => Object.entries(record.disputes ?? {}));
     if (!suspended.disputeId || !disputes.some(([id]) => id === suspended.disputeId)) return;
     if (disputes.some(([, entry]) => !entry?.closedAt)) return; // another dispute is still open
-    const failed = records.find((record) => record.status === 'failed' && record.invoiceId);
+    const failed = Object.entries(user?.paygSettlements ?? {})
+      .find(([, record]) => record?.status === 'failed' && record.invoiceId);
     const names = { '#payg': 'paygOverage', '#suspended': 'suspended' };
     const condition = { expression: '#payg.#suspended = :seen', names, values: { ':seen': suspended } };
     try {
       await userDb.updateUser(billingUserId, {}, failed
         ? {
-            pathSets: [{ path: ['paygOverage', 'suspended'], value: { reason: 'payment_failed', at: new Date().toISOString(), invoiceId: failed.invoiceId } }],
-            condition,
+            pathSets: [{ path: ['paygOverage', 'suspended'], value: { reason: 'payment_failed', at: new Date().toISOString(), invoiceId: failed[1].invoiceId } }],
+            // ...and only while THAT month is still failed on that invoice: paid or voided after this read,
+            // it must not be handed a hold nothing would ever lift (the loop reads again).
+            condition: {
+              expression: '#payg.#suspended = :seen AND #settlements.#handedMonth.#status = :failed AND #settlements.#handedMonth.#invoiceId = :handedInvoice',
+              names: { ...names, '#settlements': 'paygSettlements', '#handedMonth': failed[0], '#status': 'status', '#invoiceId': 'invoiceId' },
+              values: { ':seen': suspended, ':failed': 'failed', ':handedInvoice': failed[1].invoiceId },
+            },
           }
         : { pathRemoves: [{ path: ['paygOverage', 'suspended'] }], condition });
       return;
@@ -1133,7 +1165,57 @@ export async function handlePaygOverageInvoicePaymentActionRequired(invoice: Ove
   const loaded = await loadSettlementFor(invoice, 'invoice payment action required');
   if (!loaded) return;
   const { ref, user, record } = loaded;
+  await noteActionRequired(ref);
   await sendActionRequiredEmailOnce(user, ref, record, invoice);
+}
+
+/**
+ * Stamp `actionRequiredAt` the first time the month's payment is reported waiting for the owner's
+ * confirmation — the start of `PAYG_PAYMENT_CONFIRMATION_GRACE_DAYS`. Only while the record names this
+ * invoice and is still being collected; never moved by a later report.
+ */
+async function noteActionRequired(ref: OverageInvoiceRef): Promise<void> {
+  try {
+    await userDb.updateUser(ref.billingUserId, {}, {
+      pathSets: [{ path: ['paygSettlements', ref.month, 'actionRequiredAt'], value: new Date().toISOString() }],
+      condition: {
+        expression: '#settlements.#month.#invoiceId = :invoiceId AND #settlements.#month.#status IN (:pending, :invoiced) '
+          + 'AND attribute_not_exists(#settlements.#month.#actionRequiredAt)',
+        names: { '#settlements': 'paygSettlements', '#month': ref.month, '#invoiceId': 'invoiceId', '#status': 'status', '#actionRequiredAt': 'actionRequiredAt' },
+        values: { ':invoiceId': ref.invoiceId, ':pending': 'pending', ':invoiced': 'invoiced' },
+      },
+    });
+  } catch (error: unknown) {
+    if (!isConditionalFailure(error)) throw error;
+  }
+}
+
+/**
+ * The sweep's check of a month whose payment has waited for the owner's confirmation past
+ * `PAYG_PAYMENT_CONFIRMATION_GRACE_DAYS`: if Stripe still has it waiting (or declined), the month is
+ * treated as unpaid — `failed`, PAYG held (`payment_failed`, `unconfirmed`), one email with the invoice
+ * to confirm it. Paying (confirming) it lifts the hold like any payment failure. A payment that went
+ * through or is processing is left for its `invoice.paid`. The `invoiced -> failed` write is the dedupe.
+ */
+async function expireUnconfirmedPayment(billingUserId: string, month: string, now: Date): Promise<PaygSettlementOutcome | null> {
+  const user = (await userDb.getUserByIdConsistent(billingUserId)) as User | undefined;
+  const record = user?.paygSettlements?.[month];
+  if (!user || !record || record.status !== 'invoiced' || !record.invoiceId) return null;
+  if (!paygPaymentConfirmationOverdue(record.actionRequiredAt, now)) return null;
+  const invoiceId = record.invoiceId;
+  if ((await stripeService.paygOverageInvoicePaymentState(invoiceId)) === 'in_progress') return null;
+  const at = now.toISOString();
+  const moved = await transitionSettlement(billingUserId, month, ['invoiced'], { status: 'failed', failedAt: at, paymentUnconfirmedAt: at });
+  if (!moved) return null;
+  await suspendForPaymentFailure(billingUserId, month, invoiceId, true, { unconfirmed: true });
+  const ref = { invoiceId, billingUserId, month };
+  await recordOverageInvoicePayment(ref, { amount_due: record.amountCents, currency: 'usd' }, 'payg_overage_payment_failed');
+  if (user.email) {
+    const { emailService } = await import('./emailService');
+    await emailService.sendPaygOveragePaymentUnconfirmedEmail({ to: user.email, month, invoiceUrl: record.hostedInvoiceUrl });
+  }
+  console.log(`${TAG} overage invoice ${invoiceId} still unconfirmed after ${PAYG_PAYMENT_CONFIRMATION_GRACE_DAYS} days: ${billingUserId} ${month}; PAYG held`);
+  return 'payment_unconfirmed';
 }
 
 /** The "confirm your payment" email, once per month, while the month is still being collected. */
@@ -1214,11 +1296,20 @@ export async function handlePaygOverageChargeRefunded(charge: OverageChargeEvent
  * retried failure for a month already `failed` changes nothing that is set, so it can never strand a
  * suspension that a payment is about to lift.
  */
-async function suspendForPaymentFailure(billingUserId: string, month: string, invoiceId: string, restamp: boolean): Promise<void> {
+async function suspendForPaymentFailure(
+  billingUserId: string,
+  month: string,
+  invoiceId: string,
+  restamp: boolean,
+  options: { unconfirmed?: boolean } = {},
+): Promise<void> {
   const failedOnThisInvoice = '#settlements.#month.#status = :failed AND #settlements.#month.#invoiceId = :invoiceId';
   try {
     await userDb.updateUser(billingUserId, {}, {
-      pathSets: [{ path: ['paygOverage', 'suspended'], value: { reason: 'payment_failed', at: new Date().toISOString(), invoiceId } }],
+      pathSets: [{
+        path: ['paygOverage', 'suspended'],
+        value: { reason: 'payment_failed', at: new Date().toISOString(), invoiceId, ...(options.unconfirmed ? { unconfirmed: true } : {}) },
+      }],
       condition: {
         expression: `attribute_exists(#payg) AND ${failedOnThisInvoice} AND `
           + (restamp

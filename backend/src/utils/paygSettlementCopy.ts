@@ -94,3 +94,23 @@ export function paygPaymentFailedEmailCopy(input: { month: string }): PaygSettle
     settingsLinkLabel: 'Update your payment method',
   };
 }
+
+/**
+ * Sent once, when a payment the bank held for the owner's confirmation (3-D Secure, a mandate) is still
+ * unconfirmed `PAYG_PAYMENT_CONFIRMATION_GRACE_DAYS` later and pay-as-you-go is put on hold. Confirming the
+ * payment on the invoice lifts the hold.
+ */
+export function paygPaymentUnconfirmedEmailCopy(input: { month: string }): PaygSettlementEmailCopy {
+  const label = formatUsageMonth(input.month);
+  return {
+    subject: `Action needed: please confirm your pay-as-you-go payment for ${label}`,
+    headline: 'Pay-as-you-go is on hold',
+    paragraphs: [
+      `Your bank is still waiting for you to confirm the payment for your pay-as-you-go usage in ${label}.`,
+      "Pay-as-you-go is on hold until it's confirmed: once your plan's included AI usage runs out, AI usage pauses instead of continuing.",
+      'Open the invoice to confirm the payment and resume pay-as-you-go.',
+    ],
+    invoiceLinkLabel: 'Confirm your payment',
+    settingsLinkLabel: 'Review your pay-as-you-go settings',
+  };
+}

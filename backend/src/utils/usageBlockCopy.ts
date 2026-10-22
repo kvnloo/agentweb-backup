@@ -58,11 +58,16 @@ export interface UsageBlockPaygInput {
   paygInactiveReason?: PaygInactiveReason;
   /** Only with `payg_suspended`: what put pay-as-you-go on hold, which decides what lifts it. */
   paygSuspendedReason?: PaygSuspendedReason;
+  /** Only with `payg_suspended`: the caller is a pooled member, so the billing owner resolves it. */
+  paygOwnerResolves?: boolean;
   openInvoiceUrl?: string;
 }
 
-/** `payment_failed`: paying the open invoice lifts the hold. `dispute`: a person lifts it. */
-export type PaygSuspendedReason = "payment_failed" | "dispute";
+/**
+ * `payment_failed`: paying the open invoice lifts the hold. `payment_unconfirmed`: confirming the payment
+ * on the open invoice lifts it. `dispute` / `dispute_lost`: a person lifts it.
+ */
+export type PaygSuspendedReason = "payment_failed" | "payment_unconfirmed" | "dispute" | "dispute_lost";
 
 const HEADLINE = "Your monthly AI usage is paused";
 const BODY = "You've used all of the AI usage included in your plan this month.";
@@ -79,29 +84,51 @@ const PAYG_CAP_REACHED_COPY: PaygCopy = {
 
 /**
  * ENG-668 PR-2: a hold says what actually lifts it. A payment-failure hold lifts when the open invoice is
- * paid (with any card, on its hosted page — updating the card alone does not pay it); a dispute hold is
- * lifted by a person, so the account owner is asked to contact us. With no reason recorded, the same.
+ * paid (with any card, on its hosted page — updating the card alone does not pay it); an unconfirmed
+ * payment lifts when the owner confirms it on that invoice; a dispute hold (open or lost) is lifted by a
+ * person, so the owner is asked to contact us. With no reason recorded, the same. A pooled member cannot
+ * do any of that: they are told the organization owner can resolve it.
  */
-const PAYG_SUSPENDED_COPY: Record<PaygSuspendedReason | "unknown", PaygCopy> = {
+const PAYG_SUSPENDED_CAUSE: Record<PaygSuspendedReason | "unknown", { cause: string; ownerAction: string; ownerUndatedAction: string }> = {
   payment_failed: {
-    headline: "Pay-as-you-go is on hold",
-    body: "You've used all of the AI usage included in your plan this month, and pay-as-you-go is on hold because a recent payment didn't go through.",
-    actionTail: "Pay the open invoice to resume pay-as-you-go.",
-    undated: "AI usage is paused: pay-as-you-go is on hold because a recent payment didn't go through. Pay the open invoice to resume it.",
+    cause: "because a recent payment didn't go through",
+    ownerAction: "Pay the open invoice to resume pay-as-you-go.",
+    ownerUndatedAction: "Pay the open invoice to resume it.",
+  },
+  payment_unconfirmed: {
+    cause: "because a recent payment is still waiting to be confirmed",
+    ownerAction: "Open the invoice to confirm the payment and resume pay-as-you-go.",
+    ownerUndatedAction: "Open the invoice to confirm the payment and resume it.",
   },
   dispute: {
-    headline: "Pay-as-you-go is on hold",
-    body: "You've used all of the AI usage included in your plan this month, and pay-as-you-go is on hold while a recent payment is under review with your bank.",
-    actionTail: "Please contact us to resume pay-as-you-go.",
-    undated: "AI usage is paused: pay-as-you-go is on hold while a recent payment is under review with your bank. Please contact us to resume it.",
+    cause: "while a recent payment is under review with your bank",
+    ownerAction: "Please contact us to resume pay-as-you-go.",
+    ownerUndatedAction: "Please contact us to resume it.",
+  },
+  dispute_lost: {
+    cause: "following a dispute about a recent payment",
+    ownerAction: "Please contact us to resume pay-as-you-go.",
+    ownerUndatedAction: "Please contact us to resume it.",
   },
   unknown: {
-    headline: "Pay-as-you-go is on hold",
-    body: "You've used all of the AI usage included in your plan this month, and pay-as-you-go is on hold because of a problem with a recent payment.",
-    actionTail: "Please contact us to resume pay-as-you-go.",
-    undated: "AI usage is paused: pay-as-you-go is on hold because of a payment problem. Please contact us to resume it.",
+    cause: "because of a problem with a recent payment",
+    ownerAction: "Please contact us to resume pay-as-you-go.",
+    ownerUndatedAction: "Please contact us to resume it.",
   },
 };
+const PAYG_OWNER_RESOLVES = "Your organization owner can resolve this.";
+
+function paygSuspendedCopy(block: UsageBlockPaygInput): PaygCopy {
+  const why = block.paygSuspendedReason;
+  const copy = PAYG_SUSPENDED_CAUSE[why && why in PAYG_SUSPENDED_CAUSE ? why : "unknown"];
+  const actionTail = block.paygOwnerResolves ? PAYG_OWNER_RESOLVES : copy.ownerAction;
+  return {
+    headline: "Pay-as-you-go is on hold",
+    body: `You've used all of the AI usage included in your plan this month, and pay-as-you-go is on hold ${copy.cause}.`,
+    actionTail,
+    undated: `AI usage is paused: pay-as-you-go is on hold ${copy.cause}. ${block.paygOwnerResolves ? PAYG_OWNER_RESOLVES : copy.ownerUndatedAction}`,
+  };
+}
 
 const PAYG_INACTIVE_COPY: Record<PaygInactiveReason, PaygCopy> = {
   no_payment_method: {
@@ -132,10 +159,7 @@ function paygCopyFor(block: UsageBlockPaygInput | null | undefined): PaygCopy | 
   if (block.reason === "payg_inactive") {
     return block.paygInactiveReason ? PAYG_INACTIVE_COPY[block.paygInactiveReason] : undefined;
   }
-  if (block.reason === "payg_suspended") {
-    const why = block.paygSuspendedReason;
-    return PAYG_SUSPENDED_COPY[why === "payment_failed" || why === "dispute" ? why : "unknown"];
-  }
+  if (block.reason === "payg_suspended") return paygSuspendedCopy(block);
   return block.reason === "payg_cap_reached" ? PAYG_CAP_REACHED_COPY : undefined;
 }
 

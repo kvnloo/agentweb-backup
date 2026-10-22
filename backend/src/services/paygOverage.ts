@@ -27,7 +27,7 @@
  */
 import type { LlmUsageModeDecision } from './llmUsagePolicyService';
 import { hasOwnLiveSubscription } from './orgAuthz';
-import type { PaygInactiveReason, UsageBlockReason } from '../utils/usageBlockCopy';
+import type { PaygInactiveReason, PaygSuspendedReason, UsageBlockReason } from '../utils/usageBlockCopy';
 
 export const PAYG_OVERAGE_SETTING = 'payg_overage_enabled';
 /**
@@ -127,6 +127,11 @@ export interface PaygSuspension {
   /** `dispute` only: a dispute was lost — never lifted automatically (a person removes the hold). */
   lost?: boolean;
   /**
+   * `payment_failed` only: the payment was never confirmed by the owner (3-D Secure) within
+   * `PAYG_PAYMENT_CONFIRMATION_GRACE_DAYS`. Lifted like any payment-failure hold: paying the invoice.
+   */
+  unconfirmed?: boolean;
+  /**
    * `dispute` only: when a month last FAILED while the dispute hold covered it. Written so a dispute lift
    * that read the row before that failure cannot remove the hold (its `= :seen` condition fails and it
    * re-reads, then hands the hold to the failed month).
@@ -134,11 +139,20 @@ export interface PaygSuspension {
   paymentFailedAt?: string;
 }
 
+/** What the 429 says about a hold: the stored reason, refined (an unconfirmed payment, a lost dispute). */
+export function paygSuspendedReasonOf(suspended: PaygSuspension | undefined): PaygSuspendedReason | undefined {
+  if (suspended?.reason === 'payment_failed') return suspended.unconfirmed ? 'payment_unconfirmed' : 'payment_failed';
+  if (suspended?.reason === 'dispute') return suspended.lost ? 'dispute_lost' : 'dispute';
+  return undefined;
+}
+
 /** Why a PAYG-enabled account is still blocked, when the reason is PAYG's own: drives the 429 copy. */
 export interface PaygBlock {
   reason: UsageBlockReason;
-  /** Only with `payg_suspended`: why — a payment that didn't go through, or a disputed one. */
-  paygSuspendedReason?: PaygSuspensionReason;
+  /** Only with `payg_suspended`: why, which decides what lifts it (see `PaygSuspendedReason`). */
+  paygSuspendedReason?: PaygSuspendedReason;
+  /** Only with `payg_suspended`, for a pooled member: the billing owner is the one who can resolve it. */
+  paygOwnerResolves?: boolean;
   /** Only with `payg_inactive`: which admission prerequisite is missing. */
   paygInactiveReason?: PaygInactiveReason;
   /**
@@ -420,15 +434,8 @@ export function evaluatePaygAdmission(input: {
   if (!overage) return keep;
 
   if (account.suspended) {
-    const suspendedReason = account.suspended.reason;
-    return {
-      ...keep,
-      overage,
-      block: {
-        reason: 'payg_suspended',
-        ...(suspendedReason === 'payment_failed' || suspendedReason === 'dispute' ? { paygSuspendedReason: suspendedReason } : {}),
-      },
-    };
+    const paygSuspendedReason = paygSuspendedReasonOf(account.suspended);
+    return { ...keep, overage, block: { reason: 'payg_suspended', ...(paygSuspendedReason ? { paygSuspendedReason } : {}) } };
   }
   if (input.hasPaymentMethod !== true) {
     return { ...keep, overage, block: { reason: 'payg_inactive', paygInactiveReason: 'no_payment_method' } };

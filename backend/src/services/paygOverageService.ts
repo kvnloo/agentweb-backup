@@ -12,7 +12,7 @@ import { getSubscriptionTypeConfig, getUserSubscriptionType } from './subscripti
 import { getCurrentMonth, resolveBillingUserId } from './tokenUsageService';
 import { getEffectiveLlmUsagePolicy } from './llmUsagePolicyResolverService';
 import { getCurrentUsageMonth, getRevocablePurchasedCreditMicroUsd } from './llmUsageCreditService';
-import { paygOpenInvoiceUrl } from './paygSettlement';
+import { isPaygDisputeHold, paygOpenInvoiceUrl } from './paygSettlement';
 import {
   createExactTrueSwitch,
   PAYG_OVERAGE_SETTING,
@@ -21,6 +21,7 @@ import {
   PAYG_SETTLEMENT_SETTING,
   paygGrossOverageMicroUsd,
   paygOverageThresholdMicroUsd,
+  paygSuspendedReasonOf,
   type PaygCapPercent,
   type PaygOverageSettings,
   type PaygSuspensionReason,
@@ -105,7 +106,10 @@ function toView(
     suspended: account?.suspended?.reason ?? null,
     // The owner's billing state is the owner's: a pooled member sees false, never the owner's card status.
     hasPaymentMethod: context.eligible && context.billingUser?.has_payment_method === true,
-    openInvoiceUrl: context.eligible ? paygOpenInvoiceUrl(context.billingUser?.paygSettlements) ?? null : null,
+    // Never under a dispute hold (paying does not lift it), the same rule as the 429's `usageBlock`.
+    openInvoiceUrl: context.eligible && !isPaygDisputeHold(paygSuspendedReasonOf(account?.suspended))
+      ? paygOpenInvoiceUrl(context.billingUser?.paygSettlements) ?? null
+      : null,
   };
 }
 

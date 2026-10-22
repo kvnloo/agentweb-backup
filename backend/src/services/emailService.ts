@@ -16,6 +16,7 @@ import {
   paygInvoiceCreatedEmailCopy,
   paygPaymentActionRequiredEmailCopy,
   paygPaymentFailedEmailCopy,
+  paygPaymentUnconfirmedEmailCopy,
   type PaygSettlementEmailCopy,
 } from '../utils/paygSettlementCopy';
 import { buildScheduleModelNotice, buildWorkPlanStepModelNotice, type ModelNoticeCopy } from '../utils/unattendedModelNoticeCopy';
@@ -2860,6 +2861,18 @@ View Session: ${sessionUrl}`;
     invoiceUrl?: string | null;
   }): Promise<EmailSendOutcome | void> {
     return this.sendPaygSettlementEmail(input.to, paygPaymentActionRequiredEmailCopy(input), input.invoiceUrl, '#1976d2');
+  },
+
+  /**
+   * ENG-668 PR-2: the owner's email when a payment waiting for their confirmation (3-D Secure) was not
+   * confirmed within the grace period and pay-as-you-go is put on hold. Sent once per month.
+   */
+  async sendPaygOveragePaymentUnconfirmedEmail(input: {
+    to: string;
+    month: string;
+    invoiceUrl?: string | null;
+  }): Promise<EmailSendOutcome | void> {
+    return this.sendPaygSettlementEmail(input.to, paygPaymentUnconfirmedEmailCopy(input), input.invoiceUrl, '#dc3545');
   },
 
   /** Renders the copy from `utils/paygSettlementCopy.ts`; no wording lives here. */

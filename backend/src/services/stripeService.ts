@@ -293,7 +293,21 @@ export interface PaygOverageInvoiceMetadata {
   billingUserId: string;
   month: string;
   idempotencyKey: string;
+  /**
+   * The `createdAt` of the settlement record that created the invoice. `idempotencyKey` is the same for
+   * every record of a month (a `retry` re-creates the record), so this is what tells an earlier record's
+   * invoice from this one's while the record names no invoice yet.
+   */
+  recordCreatedAt: string;
 }
+
+/**
+ * What an overage invoice's failed attempt actually is, from its PaymentIntent (see
+ * `paygOverageInvoicePaymentState`): `declined` (a decline, a failed authentication, a canceled
+ * attempt), `action_required` (waiting for the customer to confirm: 3-D Secure, a mandate), or
+ * `in_progress` (the payment went through or is still processing — `invoice.paid` follows).
+ */
+export type PaygOverageInvoicePaymentState = 'declined' | 'action_required' | 'in_progress';
 
 /**
  * Stripe Service — wraps Stripe SDK calls with validation.
@@ -661,34 +675,47 @@ export const stripeService = {
     const paymentIntent = typeof charge?.payment_intent === 'string' ? charge.payment_intent : charge?.payment_intent?.id;
     if (!paymentIntent) return null;
     const s = getStripeOrThrow();
+    // Every invoice payment of this PaymentIntent, not just the first one listed: the one that was paid
+    // (a refunded or disputed charge was collected) is preferred, then any other.
     const payments = await s.invoicePayments.list({
       payment: { type: 'payment_intent', payment_intent: paymentIntent },
-      limit: 1,
+      limit: 10,
       expand: ['data.invoice'],
     });
-    const linked = payments.data[0]?.invoice;
-    if (!linked) return null;
-    const invoice = typeof linked === 'string' ? await s.invoices.retrieve(linked) : linked;
-    if ((invoice as Stripe.DeletedInvoice).deleted) return null;
-    return (invoice as Stripe.Invoice).metadata?.purchaseType === PAYG_OVERAGE_PURCHASE_TYPE ? (invoice as Stripe.Invoice) : null;
+    const ordered = [...payments.data.filter((p) => p.status === 'paid'), ...payments.data.filter((p) => p.status !== 'paid')];
+    for (const payment of ordered) {
+      const linked = payment.invoice;
+      if (!linked) continue;
+      const invoice = typeof linked === 'string' ? await s.invoices.retrieve(linked) : linked;
+      if ((invoice as Stripe.DeletedInvoice).deleted) continue;
+      if ((invoice as Stripe.Invoice).metadata?.purchaseType === PAYG_OVERAGE_PURCHASE_TYPE) return invoice as Stripe.Invoice;
+    }
+    return null;
   },
 
   /**
-   * ENG-668 PR-2: whether an overage invoice's failed attempt is only waiting for the customer to confirm
-   * it (3-D Secure, a mandate) rather than declined. Stripe reports such an attempt with
-   * `invoice.payment_failed` too, the PaymentIntent then being `requires_action`. A decline — or an
-   * authentication the customer failed or abandoned — leaves it `requires_payment_method`, which is a
-   * failure. Since 2025-03-31.basil an invoice no longer names its PaymentIntent: it is the invoice's
-   * default invoice payment. Stripe errors propagate (the webhook is retried, never guessed).
+   * ENG-668 PR-2: what an overage invoice's payment is NOW, read from its PaymentIntent when a failure is
+   * reported (and by the sweep for a payment left unconfirmed). Since 2025-03-31.basil an invoice no
+   * longer names its PaymentIntent: it is the invoice's default invoice payment. PaymentIntent statuses
+   * (stripe@18 `PaymentIntent.Status`):
+   *   - `requires_action` — waiting for the customer (3-D Secure, a mandate): `action_required`. Stripe
+   *     sends `invoice.payment_failed` for it too, next to `invoice.payment_action_required`;
+   *   - `succeeded`, `processing`, `requires_capture` — the payment went through or is in flight (the
+   *     owner confirmed after the failure was sent; a bank debit settling): `in_progress`;
+   *   - `requires_payment_method` (a decline, or an authentication the customer failed), `canceled`,
+   *     `requires_confirmation`, or no PaymentIntent at all: `declined` — the failure Stripe reported.
+   * Stripe errors propagate (the webhook is retried, never guessed).
    */
-  async paygOverageInvoicePaymentNeedsAction(invoiceId: string): Promise<boolean> {
+  async paygOverageInvoicePaymentState(invoiceId: string): Promise<PaygOverageInvoicePaymentState> {
     const s = getStripeOrThrow();
     const payments = await s.invoicePayments.list({ invoice: invoiceId, limit: 10, expand: ['data.payment.payment_intent'] });
     const current = payments.data.find((payment) => payment.is_default) ?? payments.data[0];
     const intent = current?.payment?.payment_intent;
-    if (!intent) return false;
+    if (!intent) return 'declined';
     const paymentIntent = typeof intent === 'string' ? await s.paymentIntents.retrieve(intent) : intent;
-    return paymentIntent.status === 'requires_action';
+    if (paymentIntent.status === 'requires_action') return 'action_required';
+    if (paymentIntent.status === 'succeeded' || paymentIntent.status === 'processing' || paymentIntent.status === 'requires_capture') return 'in_progress';
+    return 'declined';
   },
 
   /**
@@ -1610,41 +1637,101 @@ export async function handleInvoicePaymentActionRequired(invoice: Stripe.Invoice
  * customer that is pinned to another method is therefore pointed at the one just saved (an open invoice's
  * `default_payment_method` stays editable after finalizing), and Stripe's next attempt charges it.
  *
- * Nothing else changes: no subscription, checkout or customer field is touched, and an account with no
- * open overage invoice costs one row read and no Stripe call. A failed row read is logged and the event
- * acknowledged, as before this handler existed; once an open overage invoice is known, a Stripe error
- * fails the webhook so Stripe redelivers. Requires `setup_intent.succeeded` on the webhook endpoint.
+ *   - Only to the customer's NEWEST attached card: events are not ordered, so a SetupIntent for an older
+ *     card that arrives late never moves the invoice back to it (and a detached or non-card method is
+ *     never used).
+ *   - Finding the invoices: a SetupIntent tagged with the user (Zoma's Checkout) reads that user's row
+ *     (the indexed read); an untagged one asks Stripe for the customer's open invoices (one list call;
+ *     AW-Users has no index on `stripe_customer_id`, and a scan per saved card is not acceptable). Either
+ *     way an invoice is touched only if its owner's settlement record still names it, unpaid.
+ *   - Stripe refusing one update (the card was detached meanwhile) is logged, the other invoices are
+ *     still re-pointed, and on-call is told once; the webhook is acknowledged.
+ *
+ * Nothing else changes: no subscription, checkout or customer field is touched. A failed lookup before any
+ * open overage invoice is known is logged and the event acknowledged, as before this handler existed.
+ * Requires `setup_intent.succeeded` on the webhook endpoint.
  */
 export async function handleSetupIntentSucceeded(setupIntent: Pick<Stripe.SetupIntent, 'id' | 'customer' | 'payment_method' | 'metadata'>): Promise<void> {
   const customerId = typeof setupIntent?.customer === 'string' ? setupIntent.customer : setupIntent?.customer?.id;
   const paymentMethodId = typeof setupIntent?.payment_method === 'string' ? setupIntent.payment_method : setupIntent?.payment_method?.id;
   if (!customerId || !paymentMethodId) return;
-  let user: { userId?: string; paygSettlements?: Record<string, { status?: string; invoiceId?: string }> } | null = null;
+  const s = getStripeOrThrow();
+  type SettlementRow = { userId?: string; paygSettlements?: Record<string, { status?: string; invoiceId?: string }> };
+  const unpaid = (row: SettlementRow | null | undefined, month: string | undefined, invoiceId: string) => {
+    const record = month ? row?.paygSettlements?.[month] : undefined;
+    return !!record && record.invoiceId === invoiceId && (record.status === 'invoiced' || record.status === 'failed');
+  };
+
+  // Discovery: which of this customer's invoices could be open overage invoices. A failure here is
+  // logged and the event acknowledged (most saved cards have nothing to do with PAYG).
+  let taggedUser: SettlementRow | null = null;
+  let listed: Stripe.Invoice[] = [];
+  const taggedUserId = String(setupIntent?.metadata?.userId || '');
   try {
-    // Zoma's setup Checkout tags the SetupIntent with the user; its customer need not be the row's.
-    const taggedUserId = String(setupIntent?.metadata?.userId || '');
-    user = (taggedUserId ? await userDb.getUserById(taggedUserId) : null) ?? (await findUserByStripeCustomerId(customerId));
+    if (taggedUserId) taggedUser = (await userDb.getUserById(taggedUserId)) as SettlementRow | null;
+    else listed = (await s.invoices.list({ customer: customerId, status: 'open', limit: 100 })).data
+      .filter((invoice) => invoice.metadata?.purchaseType === PAYG_OVERAGE_PURCHASE_TYPE);
   } catch (error: unknown) {
-    console.error(`[STRIPE] setup_intent.succeeded ${setupIntent?.id}: could not read the account; no overage invoice re-pointed:`,
+    console.error(`[STRIPE] setup_intent.succeeded ${setupIntent?.id}: could not look up open overage invoices; none re-pointed:`,
       error instanceof Error ? error.message : error);
     return;
   }
-  const settlements = user?.paygSettlements ?? {};
-  const open = Object.values(settlements)
-    .filter((record) => (record?.status === 'invoiced' || record?.status === 'failed') && typeof record.invoiceId === 'string');
-  if (!open.length) return;
-  const s = getStripeOrThrow();
-  for (const record of open) {
-    const invoice = await retrieveInvoiceIfExists(s, record.invoiceId!);
-    if (!invoice || invoice.status !== 'open') continue;
-    if (invoice.metadata?.purchaseType !== PAYG_OVERAGE_PURCHASE_TYPE || invoice.metadata?.billingUserId !== user?.userId) continue;
+  // From here an open overage invoice is known: a Stripe or row-read error fails the webhook so Stripe
+  // redelivers (the update itself never does — see below).
+  const invoices: Stripe.Invoice[] = [];
+  if (taggedUserId) {
+    for (const [month, record] of Object.entries(taggedUser?.paygSettlements ?? {})) {
+      if (typeof record?.invoiceId !== 'string' || !unpaid(taggedUser, month, record.invoiceId)) continue;
+      const invoice = await retrieveInvoiceIfExists(s, record.invoiceId);
+      if (invoice && invoice.metadata?.billingUserId === taggedUser?.userId) invoices.push(invoice);
+    }
+  } else {
+    for (const invoice of listed) {
+      const owner = (await userDb.getUserById(String(invoice.metadata?.billingUserId || ''))) as SettlementRow | null;
+      if (unpaid(owner, invoice.metadata?.month, invoice.id!)) invoices.push(invoice);
+    }
+  }
+  const pinnedElsewhere = invoices.filter((invoice) => {
     const invoiceCustomer = typeof invoice.customer === 'string' ? invoice.customer : invoice.customer?.id;
     const pinned = typeof invoice.default_payment_method === 'string' ? invoice.default_payment_method : invoice.default_payment_method?.id;
-    // Only a pin settlement set, on this customer's invoice, to another method. An unpinned invoice
-    // already follows the customer's own default.
-    if (invoiceCustomer !== customerId || !pinned || pinned === paymentMethodId) continue;
-    await s.invoices.update(invoice.id!, { default_payment_method: paymentMethodId }, { idempotencyKey: `payg-repoint:${invoice.id}:${paymentMethodId}` });
-    console.log(`[STRIPE] overage invoice ${invoice.id} (${user?.userId}) now charges the newly saved ${paymentMethodId} instead of ${pinned}`);
+    // Only a pin settlement set, on this customer's open overage invoice, to another method. An unpinned
+    // invoice already follows the customer's own default.
+    return invoice.status === 'open' && invoice.metadata?.purchaseType === PAYG_OVERAGE_PURCHASE_TYPE
+      && invoiceCustomer === customerId && !!pinned && pinned !== paymentMethodId;
+  });
+  if (!pinnedElsewhere.length) return;
+
+  // The newest card attached to the customer, so out-of-order events can only ever move forward.
+  const cards = (await s.paymentMethods.list({ customer: customerId, type: 'card', limit: 100 })).data;
+  const newest = [...cards].sort((a, b) => b.created - a.created)[0];
+  if (newest?.id !== paymentMethodId) {
+    console.log(`[STRIPE] setup_intent.succeeded ${setupIntent?.id}: ${paymentMethodId} is not ${customerId}'s newest attached card (${newest?.id ?? 'none'}); no overage invoice re-pointed`);
+    return;
+  }
+  const refused: Array<{ invoiceId: string; error: string }> = [];
+  for (const invoice of pinnedElsewhere) {
+    try {
+      await s.invoices.update(invoice.id!, { default_payment_method: paymentMethodId }, { idempotencyKey: `payg-repoint:${invoice.id}:${paymentMethodId}` });
+      console.log(`[STRIPE] overage invoice ${invoice.id} (${invoice.metadata?.billingUserId}) now charges the newly saved ${paymentMethodId}`);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[STRIPE] re-pointing overage invoice ${invoice.id} to ${paymentMethodId} was refused:`, message);
+      refused.push({ invoiceId: invoice.id!, error: message });
+    }
+  }
+  if (refused.length) {
+    try {
+      const { emailService } = await import('./emailService');
+      await emailService.sendOncallAlert(
+        `PAYG: ${refused.length} overage invoice(s) could not be moved to a newly saved card`,
+        `Customer ${customerId} saved ${paymentMethodId}, but Stripe refused to make it the payment method of `
+          + `${refused.map((r) => r.invoiceId).join(', ')}. Stripe keeps retrying the card pinned on those invoices; the `
+          + 'owner can still pay each on its hosted page. Check the card in Stripe and set the invoice\'s payment method by hand if needed.',
+        { 'Alert Class': 'payg-settlement-repoint', customerId, paymentMethodId, refused },
+      );
+    } catch (alertError: unknown) {
+      console.error('[STRIPE] re-point on-call alert failed:', alertError instanceof Error ? alertError.message : alertError);
+    }
   }
 }
 

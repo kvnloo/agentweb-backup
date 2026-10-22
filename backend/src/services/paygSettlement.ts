@@ -124,6 +124,14 @@ export interface PaygSettlement {
   emailedAt?: string;
   /** When the owner was asked to complete a payment their bank held for authentication (once). */
   actionRequiredEmailedAt?: string;
+  /**
+   * When Stripe first reported this month's payment waiting for the owner's confirmation (3-D Secure, a
+   * mandate). Still unconfirmed `PAYG_PAYMENT_CONFIRMATION_GRACE_DAYS` later, the sweep treats it as a
+   * failed payment (`paymentUnconfirmedAt`).
+   */
+  actionRequiredAt?: string;
+  /** When the sweep failed the month because its payment was never confirmed. */
+  paymentUnconfirmedAt?: string;
   /** Stripe gave up collecting automatically; the invoice can still be paid (the month stays `failed`). */
   uncollectibleAt?: string;
   writtenOffReason?: PaygWrittenOffReason;
@@ -157,6 +165,18 @@ export type PaygSettlements = Record<string, PaygSettlement>;
 export const PAYG_SETTLEMENT_MONTHS_KEPT = 12;
 
 /**
+ * How long a payment may wait for the owner's confirmation (3-D Secure, a mandate) before the month is
+ * treated as unpaid: pay-as-you-go is put on hold and the owner is emailed the invoice to confirm it.
+ */
+export const PAYG_PAYMENT_CONFIRMATION_GRACE_DAYS = 7;
+
+/** Whether a payment first reported waiting for confirmation at `actionRequiredAt` is past the grace period. */
+export function paygPaymentConfirmationOverdue(actionRequiredAt: string | undefined, now: Date): boolean {
+  const since = actionRequiredAt ? Date.parse(actionRequiredAt) : NaN;
+  return Number.isFinite(since) && now.getTime() - since >= PAYG_PAYMENT_CONFIRMATION_GRACE_DAYS * 24 * 60 * 60 * 1000;
+}
+
+/**
  * Stripe cannot charge less than $0.50 USD; an invoice under it is marked paid and the amount is pushed
  * onto the customer's NEXT invoice — the subscription's. A month under it is not billed at all.
  */
@@ -179,17 +199,26 @@ export function paygSpendDriftTolerable(settledMicroUsd: number, projectedMicroU
   return Math.abs(settledMicroUsd - projectedMicroUsd) <= toleranceMicroUsd;
 }
 
+/** A dispute hold (open or lost): paying an invoice does not lift it, so no invoice link is offered. */
+export function isPaygDisputeHold(paygSuspendedReason: string | undefined): boolean {
+  return paygSuspendedReason === 'dispute' || paygSuspendedReason === 'dispute_lost';
+}
+
 /**
- * The gate's PAYG block with the unpaid invoice's page added — only for a `payg_suspended` block, only
- * when the caller IS the billing owner (a pooled member is never shown the owner's invoice), and never
- * for a dispute hold (paying an invoice does not lift it; its copy asks the owner to contact us).
+ * The gate's PAYG block, made specific to who is asking. Only for a `payg_suspended` block:
+ *   - a pooled member (not the billing owner) is told the owner can resolve it (`paygOwnerResolves`),
+ *     and is never shown the owner's invoice;
+ *   - the billing owner gets the unpaid invoice's page — never for a dispute hold (paying an invoice
+ *     does not lift it; its copy asks the owner to contact us).
  */
-export function withOwnerOpenInvoice<T extends { reason: string; paygSuspendedReason?: string; openInvoiceUrl?: string }>(
+export function withOwnerOpenInvoice<T extends { reason: string; paygSuspendedReason?: string; paygOwnerResolves?: boolean; openInvoiceUrl?: string }>(
   block: T | null | undefined,
   callerIsBillingOwner: boolean,
   settlements: PaygSettlements | null | undefined,
 ): T | null | undefined {
-  if (!block || block.reason !== 'payg_suspended' || !callerIsBillingOwner || block.paygSuspendedReason === 'dispute') return block;
+  if (!block || block.reason !== 'payg_suspended') return block;
+  if (!callerIsBillingOwner) return { ...block, paygOwnerResolves: true };
+  if (isPaygDisputeHold(block.paygSuspendedReason)) return block;
   const openInvoiceUrl = paygOpenInvoiceUrl(settlements);
   return openInvoiceUrl ? { ...block, openInvoiceUrl } : block;
 }
