@@ -28,10 +28,9 @@ import { DAY_MS } from '../hotLeadCallText';
  * normally fails before buying; should two still reach buyNumber, the loser's number is released (its rent
  * metered) and the cost stays within the 2/day cap.
  *
- * `confirm: true` on the tool is advisory (the model controls it); these caps are the real control. A
- * human-approval gate for provision/release is a recommended follow-up. The repo already gates other paid or
- * irreversible actions (for example the CRM sequence activation gate, and the Meta-write digest manifests
- * halted inside agentModeService); none of them covers these tools.
+ * `confirm: true` on the tool is ignored (the model controls it). The control is the human approval card
+ * (hotLeadCallApprovalGate.ts: one user click per purchase or release, single use); these per-org caps are
+ * a second limit behind it.
  */
 
 const MAX_PURCHASES_PER_DAY = 2;
