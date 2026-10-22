@@ -80,17 +80,19 @@ export function consumedKeyOf(kind: string): string {
   return `${CONSUMED_KEY_PREFIX}${kind}`;
 }
 
-export interface AttendedFacts {
+export interface AttendedFacts<S extends { sessionType?: string }> {
   unattended?: boolean;
   /** Support or an admin acting as the customer. */
   delegated?: boolean;
   sessionId?: unknown;
   /** The session record read fresh from storage; null/undefined = unknown. */
-  session?: { sessionType?: string } | null;
+  session?: S | null;
 }
 
 /** Who may be asked at all. Fails closed on anything it cannot establish. */
-export function checkAttendedForApproval(facts: AttendedFacts): GateOutcome {
+export function checkAttendedForApproval<S extends { sessionType?: string }>(
+  facts: AttendedFacts<S>,
+): Extract<GateOutcome, { allowed: false }> | { allowed: true; sessionId: string; session: S } {
   if (facts.unattended === true) {
     return { allowed: false, code: 'unattended', reason: 'This needs a person to confirm in an interactive chat' };
   }
@@ -110,7 +112,7 @@ export function checkAttendedForApproval(facts: AttendedFacts): GateOutcome {
   if (facts.session.sessionType === 'scheduled') {
     return { allowed: false, code: 'scheduled', reason: 'This needs a person to confirm in an interactive chat, not a scheduled run.' };
   }
-  return { allowed: true };
+  return { allowed: true, sessionId: facts.sessionId, session: facts.session };
 }
 
 export interface ApprovalQuestionInput {
@@ -163,9 +165,10 @@ export function findApproval(
   consumedKinds: ReadonlySet<string>,
 ): ApprovalLookup {
   let newest: string | undefined;
-  for (const message of messages ?? []) {
-    for (const item of message?.metadata?.approvalDeckItems ?? []) {
-      if (typeof item?.kind === 'string' && item.kind.startsWith(prefix)) newest = item.kind;
+  // Messages are in conversation order, so the last match is the newest card. (The CRM gate reverses first.)
+  for (const message of messages) {
+    for (const item of message.metadata?.approvalDeckItems ?? []) {
+      if (item.kind.startsWith(prefix)) newest = item.kind;
     }
   }
   if (!newest) return { status: 'none', reason: 'no_card' };

@@ -65,17 +65,17 @@ async function requireApproval(p: {
   target: string | null; areaCode?: string; number?: string;
 }): Promise<Record<string, unknown> | undefined> {
   const { context } = p;
-  const sessionId = typeof context?.sessionId === 'string' ? context.sessionId : undefined;
+  const requestedSessionId = typeof context?.sessionId === 'string' ? context.sessionId : undefined;
   const { chatbotDb } = await import('../services/chatbotService');
-  const session = sessionId ? await chatbotDb.getChatSession(sessionId, true).catch(() => null) : null;
+  const readSession = requestedSessionId ? await chatbotDb.getChatSession(requestedSessionId, true).catch(() => null) : null;
   const attended = approval.checkAttendedForApproval({
     unattended: context?.isUnattendedRun === true,
     delegated: context?.isDelegatedAccess === true || context?.isDelegatedAdmin === true,
-    sessionId,
-    session,
+    sessionId: requestedSessionId,
+    session: readSession,
   });
   if (!attended.allowed) throw new Error(attended.reason);
-  if (!sessionId || !session) throw new Error('This session could not be read, so it cannot be confirmed as attended. Nothing was done.');
+  const { sessionId, session } = attended;
 
   const rentText = monthlyRentText();
   const digest = approval.computeApprovalDigest({
@@ -83,7 +83,7 @@ async function requireApproval(p: {
     target: p.target, rentText, revision: hotLeadCallRevisionOf(p.org.hotLeadCall),
   });
   // The history comes from the consistent session read above, so a fresh decline cannot be missed.
-  const messages: ApprovalDeckHistoryMessage[] = (session.messages ?? []) as unknown as ApprovalDeckHistoryMessage[];
+  const messages: ApprovalDeckHistoryMessage[] = session.messages;
   const consumedKinds = new Set(Object.keys(session.consumedMetaWriteManifestDigests ?? {})
     .filter(k => k.startsWith(approval.CONSUMED_KEY_PREFIX)).map(k => k.slice(approval.CONSUMED_KEY_PREFIX.length)));
   const found = approval.findApproval(messages, approval.approvalKindPrefix(p.action, digest), Date.now(), consumedKinds);
