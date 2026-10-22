@@ -121,7 +121,7 @@ The two label sets agree with each other at kappa 0.73 (n=40). Dev is smaller an
 This is **not** a validation under the rule above: the labels are AI labels, so `validation` is not
 recorded and `mayGate` stays false. The judge may report `task_success` as advisory. Gating needs a
 human to adjudicate the cases where the labels disagree. Evidence: [ENG-2591](https://linear.app/emmabyaw/issue/ENG-2591/agent-task-success-grader-stop-trusting-step-checkmarks-kappa-020-in#comment-ea8be576).
-20 of the 80 work-plan golden cases are empty sessions (0 messages) and should be dropped from the set.
+20 of the 80 work-plan golden cases were empty sessions: predefined work plans opened and never used. ENG-2608 excludes them (`excluded.reason = empty_session`) and the seeder now skips sessions never updated after creation.
 
 ## Instruction adherence and escalation (ENG-2189)
 
