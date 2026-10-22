@@ -146,7 +146,15 @@ payment waiting or declined. The daily sweep then treats it as unpaid: the month
 (`paymentUnconfirmedAt`), PAYG is held (`{reason: payment_failed, unconfirmed: true}`), and the owner is
 sent one email with the invoice to confirm it. The `invoiced -> failed` write is the dedupe. Paying or
 confirming the invoice lifts the hold like any payment failure. A payment that went through or is
-processing is left for its `invoice.paid`. Every webhook ignores (logs) an invoice the record set aside
+processing is left for its `invoice.paid`. The sweep reads the invoice itself first, and only an `open`
+invoice is checked this way. If Stripe already settled it before its webhook arrived (the PaymentIntent
+is then canceled), the sweep does what that webhook would:
+- `paid`: recorded paid.
+- `void`: written off, like `invoice.voided`.
+- `uncollectible`: handled like `invoice.marked_uncollectible`.
+- deleted or unknown: left alone and logged.
+
+So the owner is never held, or asked to confirm, over an invoice that cannot be paid any more. Every webhook ignores (logs) an invoice the record set aside
 (`uncollectedInvoice`). A record that names no invoice yet (a `pending` re-created by `retry`) accepts an
 event only for the invoice its own run created: this record's key AND its `createdAt` in the invoice
 metadata (`recordCreatedAt`, stamped at creation; the key alone is the same for every record of the
@@ -155,7 +163,9 @@ month never touches the new record. An older live invoice that the run's search 
 record's as soon as the run records its id. A `held` record that carries the invoice's id is moved to paid/failed too. Dispute on
 an overage charge -> `suspended = dispute` (see Disputes below). Refund -> `refundedCents` (cumulative,
 only ever raised), PAYG not resumed. Overage recognition uses PaymentIntent -> `invoicePayments.list` ->
-invoice metadata (Basil). For refunds it runs only while the switch is on; for disputes it always runs. A failed lookup on a **dispute** errors the webhook (500) so Stripe redelivers — a chargeback must
+invoice metadata (Basil). It pages through the PaymentIntent's invoice payments while `has_more` (at most
+5 pages of 10), paid ones first. For refunds it runs only while the switch is on; for disputes it always
+runs. A failed lookup on a **dispute** errors the webhook (500) so Stripe redelivers — a chargeback must
 never be dropped; on a **refund** the refund is recorded as before and on-call is alerted
 (`payg-settlement-lookup`). `resyncAllSubscriptionAmounts` skips overage invoices. The webhook controller
 records overage invoices neither as subscription payments (`payment_succeeded` / `payment_failed`, which
@@ -192,7 +202,8 @@ under their own payment-history types, `payg_overage_payment_succeeded` / `payg_
   history row, no page. `charge.dispute.closed` records the closing once. If the dispute was won (or was a
   closed inquiry), the hold is lifted only when NO dispute on the account is still open, and only if the
   hold was set by a recorded dispute (its `disputeId` is one of them, so a hold set by hand stays). If
-  another month is still failed, the hold becomes that month's payment-failure hold. That write is also
+  another month is still failed, the hold becomes that month's payment-failure hold (carrying `unconfirmed`
+  when that month failed because its payment was never confirmed, so the 429 still says so). That write is also
   conditional on THAT month still being `failed` on that invoice: if it is paid or voided after the read,
   the write fails and the lift reads again, so the account is never held for a month that is settled.
   The lift's write is conditional on `suspended` being exactly what it read. A dispute opened after that read re-stamps the
