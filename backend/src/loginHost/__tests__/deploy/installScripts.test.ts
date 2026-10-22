@@ -19,6 +19,7 @@ const TLS = join(__dirname, "../fixtures/tls");
 const WORKER_CERT = join(__dirname, "fixtures/worker-server.pem");
 const SCRIPTS = {
   "prod/install.sh": join(PROD, "install.sh"),
+  "prod/deploy.sh": join(PROD, "deploy.sh"),
   "prod/lib.sh": join(PROD, "lib.sh"),
   "build-login-host.sh": join(BACKEND, "scripts/build-login-host.sh"),
   "aw-net.sh": join(DEPLOY, "aw-net.sh"),
@@ -53,7 +54,7 @@ describe("deploy scripts: static guards", () => {
   const shellcheckAvailable = spawnSync("shellcheck", ["--version"]).status === 0;
   if (shellcheckAvailable) {
     it("the production scripts are shellcheck-clean (errors and warnings)", () => {
-      const r = spawnSync("shellcheck", ["-S", "warning", "-x", "-e", "SC1091", "-e", "SC2154", SCRIPTS["prod/install.sh"], SCRIPTS["prod/lib.sh"], SCRIPTS["build-login-host.sh"]], { encoding: "utf8" });
+      const r = spawnSync("shellcheck", ["-S", "warning", "-x", "-e", "SC1091", "-e", "SC2154", SCRIPTS["prod/install.sh"], SCRIPTS["prod/deploy.sh"], SCRIPTS["prod/lib.sh"], SCRIPTS["build-login-host.sh"]], { encoding: "utf8" });
       expect(r.stdout).toBe("");
       expect(r.status).toBe(0);
     });
@@ -601,7 +602,7 @@ case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${
     expect(manifest).toMatch(/^package_lock_sha256=[a-f0-9]{64}$/m);
     expect(manifest).toMatch(/^lockfile_check=/m);
     expect(manifest).not.toContain("WORKER_PRIVATE_IP");
-    for (const f of ["install.sh", "lib.sh", "versions.env", "check-config.js", "dist/loginHost/host/start.js", "files/aw-login-host@.service", "files/aw-login-host-failed@.service", "files/aw-env.slice.template", "files/host-config.template.json", "files/claude-turn.sh", "files/aw-net.sh", "files/aw-write-file.sh", "files/system-prompt.txt"]) {
+    for (const f of ["install.sh", "deploy.sh", "deployctl.js", "lib.sh", "versions.env", "check-config.js", "dist/loginHost/host/start.js", "files/aw-login-host@.service", "files/aw-login-host-failed@.service", "files/aw-env.slice.template", "files/host-config.template.json", "files/claude-turn.sh", "files/aw-net.sh", "files/aw-write-file.sh", "files/system-prompt.txt"]) {
       expect(existsSync(join(pkg, f))).toBe(true);
     }
     expect(text(join(pkg, "files/host-config.template.json"))).toContain("@@WORKER_IP@@"); // filled at install time

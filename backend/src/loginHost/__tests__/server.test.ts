@@ -64,12 +64,27 @@ describe("login host server", () => {
     expect(status.json).toMatchObject({ state: "active", epoch: 1, runningTurns: 0 });
   });
 
-  it("host.info answers with the protocol version, the node version and uptime, and nothing else", async () => {
+  it("host.info answers with the protocol version, the node version, uptime and the drain/load counters, and nothing else", async () => {
     const r = await call(sock, "POST", "/v1/host.info", {});
     expect(r.status).toBe(200);
-    expect(Object.keys(r.json).sort()).toEqual(["node", "protocol", "uptimeSec"]);
+    expect(Object.keys(r.json).sort()).toEqual(["drain", "node", "protocol", "running", "signIns", "uptimeSec"]);
+    expect(r.json).toMatchObject({ drain: "off", running: 0, signIns: 0 });
     expect(r.json).toMatchObject({ protocol: PROTOCOL_VERSION, node: process.version });
     expect((await call(sock, "POST", "/v1/host.info", { x: 1 })).status).toBe(400); // closed like every route
+  });
+
+  it("host.drain over the unix socket: strict gates new work with a retryable 429, off lifts it, bad input is refused", async () => {
+    await signIn(rig);
+    expect((await call(sock, "POST", "/v1/host.drain", { mode: "strict", ttlSec: 60 })).json).toMatchObject({ ok: true, mode: "strict" });
+    expect((await call(sock, "POST", "/v1/host.info", {})).json).toMatchObject({ drain: "strict" });
+    const refused = await call(sock, "POST", "/v1/turn.run", turnReq("conn1", 1));
+    expect(refused.status).toBe(429);
+    expect(refused.json).toEqual({ error: "EBUSY", detail: "draining" });
+    expect((await call(sock, "POST", "/v1/host.drain", { mode: "off" })).json).toMatchObject({ mode: "off" });
+    expect((await call(sock, "POST", "/v1/turn.run", turnReq("conn1", 1))).status).toBe(200);
+    expect((await call(sock, "POST", "/v1/host.drain", { mode: "sideways" })).status).toBe(400);
+    expect((await call(sock, "POST", "/v1/host.drain", { mode: "soft", ttlSec: 5 })).status).toBe(400); // below the floor
+    expect((await call(sock, "POST", "/v1/host.drain", { mode: "soft", extra: 1 })).status).toBe(400); // closed like every route
   });
 
   it("maps host errors to their status codes with a code only", async () => {
@@ -124,6 +139,7 @@ describe("login host server", () => {
       "connection.revoke": { connectionId: "c1", epoch: 1 },
       "connection.status": { connectionId: "c1" },
       "host.info": {},
+      "host.drain": { mode: "soft" },
     };
 
     it("every route's base request is valid (so the fuzz below proves the extra field is what fails)", () => {

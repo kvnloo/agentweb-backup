@@ -127,6 +127,76 @@ describe("login host client", () => {
       await running;
     });
 
+    describe("a deploy never fails a customer's turn", () => {
+      const turnRecords = () => Object.keys(rig.store.get().idempotency).filter((k) => k.startsWith("turn:")).length;
+
+      it("a turn that starts while the host drains is held back, then runs exactly once under the same key when the drain lifts", async () => {
+        await boot();
+        await signIn();
+        rig.mgr.setDrain({ mode: "strict" });
+        let slept = 0;
+        const out = runHostTurn(client, turnReq("c1", 1), {
+          busyWaitMs: 60_000,
+          random: () => 1,
+          sleep: async () => {
+            if (++slept === 2) rig.mgr.setDrain({ mode: "off" }); // the deploy finished
+            await new Promise((r) => setTimeout(r, 10));
+          },
+        });
+        expect(await out).toMatchObject({ kind: "completed", result: { ok: true } });
+        expect(slept).toBeGreaterThanOrEqual(2);
+        expect(turnRecords()).toBe(1);
+      });
+
+      it("a turn that starts while the worker is restarting (nothing listening) waits for it and runs exactly once", async () => {
+        await boot();
+        await signIn();
+        await handle.close(); // the restart window: socket gone
+        let slept = 0;
+        const out = runHostTurn(client, turnReq("c1", 1), {
+          busyWaitMs: 60_000,
+          random: () => 1,
+          sleep: async () => {
+            if (++slept === 2) handle = await startHostServer(rig.mgr, { socketPath: sock, socketMode: 0o660, tickMs: 3_600_000, sweepMs: 3_600_000 }); // the new build is up
+            await new Promise((r) => setTimeout(r, 10));
+          },
+        });
+        expect(await out).toMatchObject({ kind: "completed", result: { ok: true } });
+        expect(slept).toBeGreaterThanOrEqual(2);
+        expect(turnRecords()).toBe(1);
+      });
+
+      it("still gives up (does not wait forever) when the worker never comes back", async () => {
+        await boot();
+        await signIn();
+        await handle.close();
+        await expect(runHostTurn(client, turnReq("c1", 1), { busyWaitMs: 300, sleep: (ms) => new Promise((r) => setTimeout(r, ms)) })).rejects.toMatchObject({ code: "UNREACHABLE" });
+      });
+
+      it("a turn that is already running is not touched by a soft drain and finishes normally", async () => {
+        await boot();
+        await signIn();
+        let release!: () => void;
+        rig.script.turnEvents = [{ wait: new Promise<void>((r) => (release = r)) }, { type: "result", ok: true, text: "finished" }];
+        const running = runHostTurn(client, turnReq("c1", 1), { sleep: noSleep });
+        await waitFor(() => rig.script.activeTurns === 1);
+        rig.mgr.setDrain({ mode: "soft" });
+        expect(rig.mgr.setDrain({ mode: "strict" }).ok).toBe(false); // busy: a deploy would have to wait
+        release();
+        expect(await running).toMatchObject({ kind: "completed", result: { text: "finished" } });
+        expect(rig.mgr.setDrain({ mode: "strict" }).ok).toBe(true); // idle now
+      });
+
+      it("only an unestablished connection counts as 'not sent': a reset or a bad certificate does not", () => {
+        for (const d of ["ECONNREFUSED", "EHOSTUNREACH", "ENETUNREACH", "ENOENT"]) expect(new LoginHostError("UNREACHABLE", d).notSent).toBe(true);
+        expect(new LoginHostError("TIMEOUT", "connect").notSent).toBe(true);
+        for (const d of ["ECONNRESET", "EPIPE", "CERT_HAS_EXPIRED", "ERR_TLS_CERT_ALTNAME_INVALID", undefined]) expect(new LoginHostError("UNREACHABLE", d).notSent).toBe(false);
+        expect(new LoginHostError("TIMEOUT", "request").notSent).toBe(false);
+        expect(new LoginHostError("TIMEOUT", "start").notSent).toBe(false);
+        expect(new LoginHostError("BAD_RESPONSE").notSent).toBe(false);
+      });
+    });
+
     it("renews the lease so a long turn outlives the 30 s lease, and stops renewing when it ends", async () => {
       await boot();
       await signIn();
