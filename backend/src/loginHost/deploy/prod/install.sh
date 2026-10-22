@@ -1,10 +1,12 @@
 #!/bin/bash
 # ENG-2110: PRODUCTION install of the login host on the worker (Amazon Linux 2023, x86_64). Run as root by the SSM document
-# AW-LoginHost-Deploy-Prod from the extracted build tarball (this script's own directory holds everything it installs).
+# AW-LoginHost-Deploy-Signed from the extracted build tarball (this script's own directory holds everything it installs).
 #
 #   install.sh                          install / update everything (idempotent; safe to re-run; a failure NEVER stops a healthy running host)
 #   install.sh --dry-run                run every CHECK, print what would change, change nothing
-#   install.sh --rollback               make the previous release the active one again (the caller restarts the service)
+#   install.sh --prepare                do ONLY the slow, harmless-to-a-running-host part (bridge URL check, data disk, packages, node, pinned claude) and stop.
+#                                       deploy.sh runs this BEFORE it waits for an idle host, so downloads never happen while the host refuses customers' work.
+#   install.sh --rollback               make the previous release the active one again, with its unit and slice (the caller restarts the service)
 #   install.sh --self-test-disk <file>  exercise ONLY the data-disk logic against a loop device made from <file> (blank, then mounted, then remounted)
 #
 # Steps: data disk -> packages -> node -> pinned claude -> STAGE a release (files, TLS set, config; everything validated) -> SWITCH to it (a few
@@ -34,10 +36,12 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 DRY=0
 SELF_TEST_FILE=""
 ROLLBACK=0
+PREPARE=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --dry-run) DRY=1 ;;
     --rollback) ROLLBACK=1 ;;
+    --prepare) PREPARE=1 ;;
     --self-test-disk)
       shift
       [ "$#" -gt 0 ] || { echo "install: --self-test-disk needs a file" >&2; exit 2; }
@@ -55,7 +59,7 @@ OPT=/opt/aw-login-host
 CONF=/etc/aw-login-host
 UNIT_DIR=/etc/systemd/system
 SYSTEMCTL=systemctl
-LOCK=/run/aw-login-host-install.lock
+LOCK=/run/aw-deploy/install.lock # in a root-only directory (see deploy.sh): a file directly in /run could be opened, and flock-ed, by any local user
 SKIP_PREREQS=0
 DRY_BASE=/run
 OWN=(-o root -g root)
@@ -71,6 +75,7 @@ if [ -e "$HERE/.aw-test-mode" ]; then
 fi
 
 if [ "$TEST" != 1 ] && [ "$(id -u)" != 0 ]; then die "must run as root"; fi
+if [ "$TEST" != 1 ]; then mkdir -p "$(dirname "$LOCK")"; chmod 0700 "$(dirname "$LOCK")"; fi
 exec 9>"$LOCK"
 flock -n 9 || die "another install is running (lock $LOCK)"
 
@@ -78,6 +83,21 @@ flock -n 9 || die "another install is running (lock $LOCK)"
 swap_symlink() { # swap_symlink <target-text> <link>
   ln -sfn "$1" "$2.new"
   mv -T "$2.new" "$2"
+}
+
+# Put the unit files and the slice that a release carries back as the installed ones (they travel with the release so that code and units always match).
+# Releases made by an older installer carry none: then what is installed stays. Returns 0 when something was (re)installed.
+restore_units_from() { # restore_units_from <release-dir>
+  local rel=$1 u changed=1
+  for u in aw-login-host@.service aw-login-host-failed@.service "aw-$ENV_NAME.slice"; do
+    [ -f "$rel/$u" ] || continue
+    if ! cmp -s "$rel/$u" "$UNIT_DIR/$u" 2>/dev/null; then
+      install -m 0644 "${OWN[@]}" "$rel/$u" "$UNIT_DIR/$u.new"
+      mv -f "$UNIT_DIR/$u.new" "$UNIT_DIR/$u"
+      changed=0
+    fi
+  done
+  return $changed
 }
 
 # ───────────────────────────── --self-test-disk ─────────────────────────────
@@ -146,6 +166,9 @@ if [ "$ROLLBACK" = 1 ]; then
     install -m 0600 "${OWN[@]}" "$prev/prod.json" "$CONF/$ENV_NAME.json.new"
     mv -f "$CONF/$ENV_NAME.json.new" "$CONF/$ENV_NAME.json"
     [ -z "$cur_target" ] || swap_symlink "$cur_target" "$OPT/previous"
+    # the unit files and the slice of THAT release (older releases that did not carry them keep what is installed)
+    restore_units_from "$prev" || true
+    "$SYSTEMCTL" daemon-reload
     ok "rolled back to $prev_target. Restart the service now: systemctl restart aw-login-host@$ENV_NAME (the deploy document does this)."
   fi
   exit 0
@@ -164,6 +187,9 @@ cleanup() {
   if [ "$rc" -ne 0 ] && [ "$DRY" != 1 ]; then
     if have_valid_install; then
       log "the install failed (exit $rc) but a valid previous install exists: it was NOT touched and keeps running" >&2
+    elif [ "$PREPARE" = 1 ] || "$SYSTEMCTL" is-active --quiet "aw-login-host@$ENV_NAME"; then
+      # --prepare only gets the machine ready, and a host that is RUNNING is never stopped by a failed install (it may be on a layout this check does not know).
+      log "the preparation failed (exit $rc, see the lines above); nothing was started or stopped" >&2
     else
       # Nothing valid is installed (a first install that failed): make sure no half-configured host crash-loops.
       "$SYSTEMCTL" disable --now "aw-login-host@$ENV_NAME" >/dev/null 2>&1 || true
@@ -173,6 +199,20 @@ cleanup() {
   exit "$rc"
 }
 trap cleanup EXIT
+
+# The bridge URL (decided with the B4 turn path). https only: the worker reaches the backend's tool bridge across the network, through the egress proxy.
+BRIDGE_FILE=$CONF/bridge-url
+[ "$TEST" != 1 ] || BRIDGE_FILE=${AW_BRIDGE_FILE:-$BRIDGE_FILE}
+BRIDGE_URL=""
+if [ -f "$BRIDGE_FILE" ]; then BRIDGE_URL=$(head -n1 "$BRIDGE_FILE" | tr -d '\r\n'); fi
+if ! [[ "$BRIDGE_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$ ]]; then
+  if have_valid_install; then
+    log "no valid https bridge URL in $BRIDGE_FILE: nothing was changed and the running host keeps running" >&2
+  else
+    log "NOT INSTALLED: create $BRIDGE_FILE with the backend tool bridge's https URL (one line), then run the deploy again." >&2
+  fi
+  exit 3
+fi
 
 # ───────────────────────────── a. the data disk ─────────────────────────────
 
@@ -209,7 +249,7 @@ else
     doing "download node $NODE_VERSION (sha256-pinned) to $NODE_DIR"
     if [ "$DRY" != 1 ]; then
       tmpd=$(mktemp -d /var/tmp/aw-node.XXXXXX)
-      curl -fsSL --proto '=https' --tlsv1.2 -o "$tmpd/node.tar.xz" "$NODE_TARBALL_URL"
+      curl -fsSL --proto '=https' --tlsv1.2 --connect-timeout 20 --max-time 900 -o "$tmpd/node.tar.xz" "$NODE_TARBALL_URL"
       [ "$(sha256sum "$tmpd/node.tar.xz" | cut -d' ' -f1)" = "$NODE_TARBALL_SHA256" ] || { rm -rf "$tmpd"; die "node tarball sha256 mismatch"; }
       tar -xJf "$tmpd/node.tar.xz" -C "$tmpd"
       [ "$(sha256sum "$tmpd/node-v$NODE_VERSION-linux-x64/bin/node" | cut -d' ' -f1)" = "$NODE_BIN_SHA256" ] || { rm -rf "$tmpd"; die "node binary sha256 mismatch"; }
@@ -223,7 +263,11 @@ else
       ok "node $NODE_VERSION installed to $NODE_DIR"
     fi
   fi
-  if [ "$(readlink /usr/bin/node 2>/dev/null || true)" = "$NODE_DIR/bin/node" ]; then
+  # The /usr/bin/node link is what the unit starts and what deploy tooling runs: flipping it is part of the SWITCH (below), never of --prepare, so a host
+  # that keeps running (a deploy that finds it busy gives up) is not left with a different node under its next restart.
+  if [ "$PREPARE" = 1 ]; then
+    skip "/usr/bin/node link: left for the switch phase"
+  elif [ "$(readlink /usr/bin/node 2>/dev/null || true)" = "$NODE_DIR/bin/node" ]; then
     skip "/usr/bin/node already points at node $NODE_VERSION"
   else
     doing "ln -sfn $NODE_DIR/bin/node /usr/bin/node"
@@ -239,7 +283,7 @@ else
     doing "download claude $CLAUDE_VERSION from the npm registry (integrity + sha256 pinned)"
     if [ "$DRY" != 1 ]; then
       tmpd=$(mktemp -d /var/tmp/aw-claude.XXXXXX)
-      curl -fsSL --proto '=https' --tlsv1.2 -o "$tmpd/claude.tgz" "$CLAUDE_TARBALL_URL"
+      curl -fsSL --proto '=https' --tlsv1.2 --connect-timeout 20 --max-time 900 -o "$tmpd/claude.tgz" "$CLAUDE_TARBALL_URL"
       got="sha512-$(openssl dgst -sha512 -binary "$tmpd/claude.tgz" | openssl base64 -A)"
       [ "$got" = "$CLAUDE_TARBALL_INTEGRITY" ] || { rm -rf "$tmpd"; die "claude tarball integrity mismatch"; }
       tar -xzf "$tmpd/claude.tgz" -C "$tmpd" package/claude
@@ -251,6 +295,11 @@ else
       ok "claude $CLAUDE_VERSION installed at $CLAUDE_BIN"
     fi
   fi
+fi
+
+if [ "$PREPARE" = 1 ]; then
+  ok "prepared: the bridge URL, data disk, packages, node and the pinned claude are in place (nothing else was touched)"
+  exit 0
 fi
 
 # ───────────────────────────── d. stage a release (nothing is switched yet) ─────────────────────────────
@@ -273,20 +322,6 @@ resolve_worker_ip() {
 }
 WORKER_IP=$(resolve_worker_ip)
 ok "this worker's address: $WORKER_IP"
-
-# The bridge URL (decided with the B4 turn path). https only: the worker reaches the backend's tool bridge across the network, through the egress proxy.
-BRIDGE_FILE=$CONF/bridge-url
-[ "$TEST" != 1 ] || BRIDGE_FILE=${AW_BRIDGE_FILE:-$BRIDGE_FILE}
-BRIDGE_URL=""
-if [ -f "$BRIDGE_FILE" ]; then BRIDGE_URL=$(head -n1 "$BRIDGE_FILE" | tr -d '\r\n'); fi
-if ! [[ "$BRIDGE_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$ ]]; then
-  if have_valid_install; then
-    log "no valid https bridge URL in $BRIDGE_FILE: nothing was changed and the running host keeps running" >&2
-  else
-    log "NOT INSTALLED: create $BRIDGE_FILE with the backend tool bridge's https URL (one line), then run the deploy again." >&2
-  fi
-  exit 3
-fi
 
 STAMP=$(date -u +%Y%m%d%H%M%S)
 BUILD_NAME=$(sed -n 's/^name=//p' "$HERE/MANIFEST" | head -n1)
@@ -342,9 +377,11 @@ ok "TLS set read and validated (SAN names $WORKER_IP, key matches, chains to the
 
 # Fingerprint of everything that decides what runs: if it equals the active release's, there is nothing to do.
 FP=$( {
-  cat "$HERE/MANIFEST" "$HERE/files/aw-login-host@.service" "$HERE/files/aw-env.slice.template"
+  # (the MANIFEST minus what differs on every build without changing what runs: name, commit, run number, times, test/lockfile status. Its per-file sha256 list stays.)
+  grep -v -E '^(name|git_sha|dirty|allow_dirty|tests|lockfile_check|build_node|commit_time|build_seq)=' "$HERE/MANIFEST"
+  cat "$HERE/files/aw-login-host@.service" "$HERE/files/aw-env.slice.template"
   sha256sum "$STAGE_TLS_DIR/server.crt" "$STAGE_TLS_DIR/ca.crt" | cut -d' ' -f1
-  printf '%s\n%s\n' "$BRIDGE_URL" "$WORKER_IP"
+  printf '%s\n%s\n%s\n' "$BRIDGE_URL" "$WORKER_IP" "$(nproc)"
 } | sha256sum | cut -d' ' -f1)
 if have_valid_install && [ "$(cat "$OPT/current/FINGERPRINT")" = "$FP" ]; then
   # Re-assert the modes of the active TLS set even though nothing changed (a key that drifted to 0644 would make the host refuse to start).
@@ -353,6 +390,11 @@ if have_valid_install && [ "$(cat "$OPT/current/FINGERPRINT")" = "$FP" ]; then
     chmod 0644 "$act_tls/server.crt" "$act_tls/ca.crt"
     chmod 0600 "$act_tls/server.key"
     chmod 0755 "$act_tls"
+  fi
+  # A previous deploy that was killed half-way can leave unit files that do not match the active release: put them right (a no-op when they match).
+  if [ "$DRY" != 1 ] && restore_units_from "$OPT/current"; then
+    "$SYSTEMCTL" daemon-reload
+    log "the installed unit files did not match the active release: restored them"
   fi
   ok "this exact build, TLS set, address and bridge are already active ($(readlink "$OPT/current")): nothing to do"
   exit 0
@@ -396,6 +438,9 @@ sed -e "s|@@MEMORY_MAX@@|$SLICE_MEMORY_MAX|" -e "s|@@MEMORY_HIGH@@|$SLICE_MEMORY
   "$HERE/files/aw-env.slice.template" >"$STAGE_REL_DIR/aw-$ENV_NAME.slice"
 grep -q '@@' "$STAGE_REL_DIR/aw-$ENV_NAME.slice" && die "an unfilled placeholder is left in the slice"
 chmod 0644 "$STAGE_REL_DIR/aw-$ENV_NAME.slice"
+# The unit files travel with the release, so a rollback puts back the unit the previous build was tested with, not only its code.
+ins -m 0644 "$HERE/files/aw-login-host@.service" "$STAGE_REL_DIR/aw-login-host@.service"
+ins -m 0644 "$HERE/files/aw-login-host-failed@.service" "$STAGE_REL_DIR/aw-login-host-failed@.service"
 
 # Last pre-switch checks on the staged files.
 for f in claude-turn.sh aw-net.sh aw-write-file.sh; do [ -x "$STAGE_REL_DIR/$f" ] || die "staged $f is not executable"; done
@@ -457,5 +502,12 @@ while read -r _t name; do
   rm -rf "${OPT:?}/releases/$name" "${CONF:?}/tls/$name"
   log "pruned old release $name"
 done < <(find "$OPT/releases" -mindepth 1 -maxdepth 1 -type d ! -name '.stage-*' -printf '%T@ %f\n' | sort -rn)
+# Leftovers of an install that was killed half-way (they can hold a TLS key): staging directories older than a day.
+for d in "$OPT/releases" "$CONF/tls"; do
+  [ -d "$d" ] || continue
+  while IFS= read -r stale; do
+    rm -rf "${stale:?}"
+  done < <(find "$d" -mindepth 1 -maxdepth 1 -type d -name '.stage-*' -mtime +0 2>/dev/null)
+done
 
 exit 0
