@@ -140,6 +140,7 @@ import { startWorkflow, advanceIndependentWorkflow, type AdvanceIndependentOutco
 // dependency back on this file (verified), so this is a one-directional
 // import, not a cycle.
 import { approvalInboxService, type ApprovalDecision, type ApprovalDecisionApprover } from './approvalInboxService';
+import { getDefaultApproverForGate } from './approverDirectory';
 // Review fix: the manifest executor below needs the same active-resume
 // primitive approvalInboxExecution.ts already built for the per-decision
 // path — resumeOriginSession is exported from there specifically so this
@@ -14189,24 +14190,44 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     sessionId: string,
     writeHalts: any[],
   ): Promise<{ manifestId: string; turnMessage: string } | null> {
-    const manifestId = uuidv4();
+    // One packet PER AD ACCOUNT: the Desk groups packets under an account and one Approve All
+    // dispatches a whole packet, so a single iteration that writes to two ad accounts must not
+    // become one packet shown under only the first account.
+    const manifestByAccount = new Map<string, string>();
+    const manifestFor = (r: any): string => {
+      const key = String(r?.metaWriteDispatch?.resolvedAccountId || r?.target?.account_id || r?.metaWriteDispatch?.account_id || 'unknown').replace(/^act_/, '');
+      if (!manifestByAccount.has(key)) manifestByAccount.set(key, uuidv4());
+      return manifestByAccount.get(key)!;
+    };
+    const manifestId = manifestFor(writeHalts[0]);
     // Same default window stage_pending_decision uses for a team decision —
     // one consistent "how long before this goes stale" answer across every
     // producer of this table.
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
 
+    // ENG-1853 follow-up: unlike the plan_choice producer (ask_user_question, which lets
+    // the model supply an explicit chat_url), this path never gave a reviewer any way
+    // back to the conversation that proposed a real Meta write — evidencePacket only
+    // ever carried researchSummary. sessionId is already a parameter here; the same
+    // ${CUSTOMER_FRONTEND_URL}/agent-mode/${sessionId} link agentModeController.ts
+    // already uses elsewhere for "go back to this session" is trivial to attach.
+    const chatUrl = `${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/agent-mode/${sessionId}`;
     const settled = await Promise.allSettled(
       writeHalts.map((r) =>
         approvalInboxService.createDecision({
           gateType: 'meta_write',
-          approver: 'matt',
+          approver: getDefaultApproverForGate('meta_write'),
           subjectLabel: `Meta Ads · Account ${r?.target?.account_id || r?.metaWriteDispatch?.account_id || 'unknown'}`,
           businessImpact: r?.confirmationDetail || r?.confirmationPrompt || r?.summary || 'A Meta Ads change is waiting for review.',
-          evidencePacket: { researchSummary: r?.summary },
+          // No separate researchSummary here: confirmationDetail (above) IS r.summary, so
+          // setting evidencePacket.researchSummary to r.summary as well rendered the exact
+          // same sentence twice on the card. There's no separate agent-authored rationale
+          // captured at this halt point to put here instead.
+          evidencePacket: { chatUrl },
           metaWriteManifestDigest: r.metaWriteManifestDigest,
           metaWriteDispatch: r.metaWriteDispatch,
           originSessionId: sessionId,
-          manifestId,
+          manifestId: manifestFor(r),
           expiresAt,
         }),
       ),
@@ -14244,7 +14265,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     // honestly rather than assuming uniformity.
     const manifestIds = [...new Set(staged.map((d) => d.manifestId))];
     const reportedManifestId = manifestIds.length === 1 ? manifestIds[0] : manifestId;
-    if (manifestIds.length > 1) {
+    // More than one manifest is EXPECTED when the batch spans several ad accounts (one packet per
+    // account); it is only suspicious when it exceeds that, i.e. pre-existing idempotent hits.
+    if (manifestIds.length > manifestByAccount.size) {
       // Second-review fix: this genuinely CAN'T be made fully correct
       // without a return-contract change (multiple real manifestIds, no
       // single one actually contains every staged decision) — nothing
@@ -14261,7 +14284,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     return {
       manifestId: reportedManifestId,
       turnMessage:
-        count === 1
+        manifestIds.length > 1
+          ? `These ${count} changes span ${manifestIds.length} ad accounts, so they were queued as ${manifestIds.length} separate packets (one per account) for the assigned approver in the Approval Desk. I'll resume automatically as each is resolved.`
+          : count === 1
           ? `This change needs review before it runs — queued for the assigned approver in the Approval Desk. I'll resume automatically once it's resolved.`
           : `This packet of ${count} change${count === 1 ? '' : 's'} needs review before ${count === 1 ? 'it runs' : 'they run'} — queued for the assigned approver in the Approval Desk. I'll resume automatically once it's resolved.`,
     };
@@ -14435,6 +14460,11 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
 
     const target: Record<string, any> = { entity_type, action, account_id: scopeAccountId };
     const lines: string[] = [];
+    // The entity being UPDATED (never set on a CREATE) — already fetched in full by
+    // resolveCampaign/resolveAdSet/resolveAd below for its .name, but every other field
+    // on it (current daily_budget, current status, ...) was being thrown away. Kept here
+    // so the Changes: line below can show what's actually changing, not just which keys.
+    let currentEntity: any;
 
     /*
      * Best-effort resolvers — each guarded so a Meta lookup failure never blocks the gate.
@@ -14504,6 +14534,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         lines.push(`Create a NEW campaign "${params.name}" (objective: ${params.objective || 'unspecified'}) in ad account ${scopeAccountId}.`);
       } else {
         const campaign = await resolveCampaign(campaign_id);
+        currentEntity = campaign;
         target.campaign = nameOf(campaign, campaign_id);
         target.campaign_id = campaign_id;
         lines.push(`${action} campaign ${target.campaign} in ad account ${scopeAccountId}.`);
@@ -14516,6 +14547,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         lines.push(`Create a NEW ad set "${params.name}" UNDER campaign ${target.campaign} (ad account ${scopeAccountId}).`);
       } else {
         const adSet = await resolveAdSet(ad_set_id);
+        currentEntity = adSet;
         const campaign = await resolveCampaign(adSet?.campaign_id);
         target.ad_set = nameOf(adSet, ad_set_id);
         target.campaign = campaign ? nameOf(campaign, adSet?.campaign_id) : undefined;
@@ -14549,6 +14581,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           + `which RESETS THE AD'S LEARNING PHASE and can hurt performance on a live client campaign.`);
       } else {
         const ad = await resolveAd(ad_id);
+        currentEntity = ad;
         const adSet = await resolveAdSet(ad?.adset_id);
         const campaign = await resolveCampaign(ad?.campaign_id);
         target.ad = nameOf(ad, ad_id);
@@ -14576,13 +14609,77 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     }
 
     // Surface content/destination changes so the user can catch a wrong-asset edit.
+    // Review fix (ENG-1853 follow-up): this used to list only the changed field NAMES
+    // ("Changes: daily_budget.") with neither the current nor the proposed value — a
+    // reviewer approving a real budget/status change had no way to tell $60→$110 from
+    // $6,000→$11,000 without leaving the page. currentEntity (already fetched above
+    // for its .name, previously discarded) supplies the "before" side; params supplies
+    // the "after" side — both were already right here.
+    // Every agent money input is in MAJOR units of the ad account's currency (ENG-2277:
+    // normalizeMetaMoneyParams) and Meta reports the current value in MINOR units as a numeric
+    // STRING ("3000"). Both sides go through the same normalizeMetaMoney the writers use, so the
+    // card shows exactly the amount that will be submitted — "daily_budget: 3000 (= $30.00) →
+    // 310000 (= $3,100.00)" — including for zero-decimal currencies. If the account currency
+    // can't be read, the raw value is shown and flagged rather than guessed.
+    const MONEY_KEYS = new Set(['daily_budget', 'lifetime_budget', 'bid_amount', 'budget_amount', 'spend_cap']);
+    let accountCurrency: string | undefined;
+    if (accessToken && [...MONEY_KEYS].some((k) => params?.[k] !== undefined)) {
+      // Bounded: this runs on the halt path, and a stalled Graph read must not hold the approval card up.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        accountCurrency = await Promise.race([
+          metaService.getAdAccountCurrency(scopeAccountId, accessToken),
+          new Promise<undefined>((resolve) => { timer = setTimeout(() => resolve(undefined), 5000); }),
+        ]);
+      } catch { /* shown as unverified below */ } finally { if (timer) clearTimeout(timer); }
+    }
+    let currencyUnverified = false;
+    const money = (value: any, unit: 'major' | 'minor'): string => {
+      try {
+        // Only Meta's own read-back ("3000") is a numeric string; the writers reject a string
+        // PROPOSAL, so the card must not quietly accept one.
+        const n = unit === 'minor' && typeof value === 'string' && /^\d+(\.\d+)?$/.test(value) ? Number(value) : value;
+        return normalizeMetaMoney(n, accountCurrency, unit).description;
+      } catch {
+        currencyUnverified = true;
+        return `${String(value)} (${unit} units, currency unverified)`;
+      }
+    };
+    const formatChange = (key: string, value: any, side: 'before' | 'after'): string => {
+      if (value === undefined || value === null) return 'unset';
+      const text = MONEY_KEYS.has(key) ? money(value, side === 'before' ? 'minor' : 'major')
+        : value !== null && typeof value === 'object' ? JSON.stringify(value) : String(value);
+      // Long copy and object-valued fields (placement_assets, adset_schedule) must not flood the card.
+      return text.length > 160 ? `${text.slice(0, 157)}...` : text;
+    };
     const contentChanges: Record<string, any> = {};
-    for (const key of ['link_url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'status', 'daily_budget', 'lifetime_budget', 'creative_id', 'placement_assets', 'adset_schedule', 'pacing_type']) {
-      if (params[key] !== undefined) contentChanges[key] = params[key];
+    const changeDescriptions: string[] = [];
+    // A rename is a real change a reviewer must see; on CREATE the name is already in the summary line.
+    const changeKeys = ['link_url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'status', 'daily_budget', 'lifetime_budget', 'budget_amount', 'bid_amount', 'spend_cap', 'creative_id', 'placement_assets', 'adset_schedule', 'pacing_type'];
+    if (action !== 'CREATE') changeKeys.unshift('name');
+    // Everything else the write will send must be visible too (targeting, start/end time, bid
+    // strategy, …) — a card that lists only a fixed allowlist lets a reviewer approve fields they
+    // never saw. Internal control params (override/confirmation tokens) are not Meta fields.
+    for (const key of Object.keys(params || {})) {
+      if (changeKeys.includes(key) || (action === 'CREATE' && (key === 'name' || key === 'objective'))) continue;
+      if (/token|override|confirm/i.test(key) || ['campaign_id', 'adset_id', 'ad_set_id', 'ad_id', 'account_id'].includes(key)) continue;
+      changeKeys.push(key);
+    }
+    for (const key of changeKeys) {
+      if (params[key] === undefined) continue;
+      contentChanges[key] = params[key];
+      const before = currentEntity?.[key === 'budget_amount' ? 'daily_budget' : key];
+      const after = formatChange(key, params[key], 'after');
+      changeDescriptions.push(
+        before !== undefined ? `${key}: ${formatChange(key, before, 'before')} → ${after}` : `${key} → ${after}`,
+      );
     }
     if (Object.keys(contentChanges).length > 0) {
       target.changes = contentChanges;
-      lines.push(`Changes: ${Object.keys(contentChanges).join(', ')}.`);
+      lines.push(`Changes: ${changeDescriptions.join(', ')}.`);
+    }
+    if (currencyUnverified) {
+      lines.push('WARNING: the ad account currency could not be verified, so the amounts above are NOT converted — confirm the real amounts before approving.');
     }
 
     /*
