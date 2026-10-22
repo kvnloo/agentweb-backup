@@ -264,6 +264,7 @@ export interface WorkPlanSessionRow {
   sessionId: string;
   userId?: string;
   createdAt?: string;
+  updatedAt?: string;
 }
 
 export const WORK_PLAN_SEED_SOURCE = 'work_plan_session';
@@ -282,8 +283,13 @@ export interface WorkPlanSeedResult {
  * adds work-plan sessions of every session type (the eval-v2 sampler grades scheduled and predefined
  * work-plan runs too), created within SAMPLE_WINDOW_DAYS, in hash order, never by any grader verdict.
  *
+ * A session never updated after it was created was opened and not used (ENG-2608: 20 of the first
+ * 80 were predefined work plans with no messages), so it is skipped.
+ *
  * `target` is the total number of work-plan cases the store should hold, so a re-run with the same
- * target creates nothing. Sessions already in the store under any agent source are skipped.
+ * target creates nothing. `existing` must include excluded cases: a session already in the store
+ * under any agent source is skipped, and an excluded one is not counted toward the target, so a
+ * re-run replaces it with a new session.
  */
 export function buildWorkPlanCases(input: {
   sessions: WorkPlanSessionRow[];
@@ -292,13 +298,17 @@ export function buildWorkPlanCases(input: {
   now: Date;
 }): WorkPlanSeedResult {
   const stored = new Set(input.existing.filter((c) => c.surface === 'agent').map((c) => c.sourceRef.id));
-  const alreadyStored = input.existing.filter((c) => c.surface === 'agent' && c.seedSource === WORK_PLAN_SEED_SOURCE).length;
+  const alreadyStored = input.existing.filter((c) => c.surface === 'agent' && c.seedSource === WORK_PLAN_SEED_SOURCE && !c.excluded).length;
   const windowStart = input.now.getTime() - SAMPLE_WINDOW_DAYS * 24 * 60 * 60 * 1000;
   const eligible = input.sessions
     .filter((s) => !isEvaluationUser(s.userId))
     .filter((s) => {
       const created = s.createdAt ? Date.parse(s.createdAt) : NaN;
       return !Number.isNaN(created) && created <= input.now.getTime() && created >= windowStart;
+    })
+    .filter((s) => {
+      const updated = s.updatedAt ? Date.parse(s.updatedAt) : NaN;
+      return !Number.isNaN(updated) && updated > Date.parse(s.createdAt!);
     })
     .map((s) => newGoldenCase({ surface: 'agent', taskType: WORK_PLAN_SEED_SOURCE, sourceId: s.sessionId, seedSource: WORK_PLAN_SEED_SOURCE, now: input.now }));
   const cases = eligible
