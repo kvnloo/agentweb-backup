@@ -472,6 +472,11 @@ describe('HubSpotService — batchUpdateContacts', () => {
     ])).resolves.toEqual(['c-1']);
   });
 
+  it('matches numeric ids in results against string ids, and ignores results without an id', async () => {
+    mockAxiosPost.mockResolvedValue({ status: 200, data: { results: [{ id: 123 }, { id: null }, {}] } });
+    await expect(svc.batchUpdateContacts([{ id: '123', properties: {} }])).resolves.toEqual(['123']);
+  });
+
   it('returns undefined (no information) when the response carries no results array', async () => {
     mockAxiosPost.mockResolvedValue({ status: 200, data: {} });
     await expect(svc.batchUpdateContacts([{ id: 'c-1', properties: {} }])).resolves.toBeUndefined();
