@@ -61,6 +61,9 @@ import {
   resetLivePaymentMethodChecksForTests,
 } from '../../services/paygOverageService';
 import { getCurrentUsageMonth } from '../../services/llmUsageCreditService';
+import { evaluateCondition, type UpdateUserOptions } from '../../__tests__/helpers/userRowFake';
+import { getEffectiveLlmUsagePolicy } from '../../services/llmUsagePolicyResolverService';
+import { computePaygSettlementAmount, paygMonthInputsFromRow } from '../../services/paygSettlement';
 
 const USD = 1_000_000;
 const OWNER = 'owner-1';
@@ -147,7 +150,38 @@ describe('GET /api/subscription/payg', () => {
       overagePercentUsed: 0,
       suspended: null,
       hasPaymentMethod: true,
+      openInvoiceUrl: null,
     });
+  });
+
+  it('points the owner of a suspended account at the unpaid invoice (no amount); a pooled member sees none (rvE2E MINOR 5)', async () => {
+    users[OWNER].paygOverage = {
+      enabled: true, capPercentOfPool: 50, updatedBy: OWNER, updatedAt: '2026-10-01T00:00:00.000Z', version: 1,
+      suspended: { reason: 'payment_failed', at: '2026-10-05T00:00:00.000Z', invoiceId: 'in_sep' },
+    };
+    users[OWNER].paygSettlements = {
+      '2026-08': { status: 'paid', invoiceId: 'in_aug', hostedInvoiceUrl: 'https://invoice.stripe.com/i/aug' },
+      '2026-09': { status: 'failed', invoiceId: 'in_sep', hostedInvoiceUrl: 'https://invoice.stripe.com/i/sep', amountCents: 4500 },
+    };
+    const owner = await get(OWNER).expect(200);
+    expect(owner.body).toMatchObject({ suspended: 'payment_failed', openInvoiceUrl: 'https://invoice.stripe.com/i/sep' });
+    expect(JSON.stringify(owner.body)).not.toMatch(/4500|amount/i);
+    const member = await get(MEMBER).expect(200);
+    expect(member.body.openInvoiceUrl).toBeNull();
+  });
+
+  it.each([
+    [{ reason: 'dispute', at: '2026-10-05T00:00:00.000Z', invoiceId: 'in_aug', disputeId: 'dp_1' }],
+    [{ reason: 'dispute', at: '2026-10-05T00:00:00.000Z', invoiceId: 'in_aug', disputeId: 'dp_1', lost: true }],
+  ])('under a dispute hold (%j) no invoice link, even with a month unpaid — the same rule as the 429 (rv6 MINOR 4c)', async (suspended) => {
+    users[OWNER].paygOverage = {
+      enabled: true, capPercentOfPool: 50, updatedBy: OWNER, updatedAt: '2026-10-01T00:00:00.000Z', version: 1, suspended,
+    };
+    users[OWNER].paygSettlements = {
+      '2026-09': { status: 'failed', invoiceId: 'in_sep', hostedInvoiceUrl: 'https://invoice.stripe.com/i/sep' },
+    };
+    const owner = await get(OWNER).expect(200);
+    expect(owner.body).toMatchObject({ suspended: 'dispute', openInvoiceUrl: null });
   });
 
   it('reports overage as a percentage of the cap, never in dollars', async () => {
@@ -307,9 +341,10 @@ describe('PUT /api/subscription/payg', () => {
   it('an opt-in never lowers a high-water mark the gate raised meanwhile (conflict, not a lower mark)', async () => {
     // Read: the month's pool was $100. Between that read and the write, a check raised the stored mark
     // to $300 (a top-up). The opt-in's write must not put $100 back: its guard fails and it is a 409.
+    // (A mark from THIS month: rolling a previous month's mark over has its own exact-match guard, below.)
     users[OWNER].paygOverage = {
       enabled: false, capPercentOfPool: 50, updatedBy: OWNER, updatedAt: '2026-10-01T00:00:00.000Z', version: 2,
-      poolHighWater: { month: '2000-01', thresholdMicroUsd: 50 * USD },
+      poolHighWater: { month: getCurrentUsageMonth(), thresholdMicroUsd: 50 * USD },
     };
     const storedThreshold = 300 * USD;
     const recordWrite = mockUpdateUser.getMockImplementation()!;
@@ -329,6 +364,159 @@ describe('PUT /api/subscription/payg', () => {
     expect(res.body.error).toBe('payg_conflict');
     const [, , options] = settingsWrite();
     expect(options.condition.values).toMatchObject({ ':hwMonth': getCurrentUsageMonth(), ':hwThreshold': 100 * USD });
+  });
+
+  it('the month\'s first opt-in keeps last month\'s opt-in and mark as the closed copies settlement reads (PR-2)', async () => {
+    const lastMonthOptIn = { month: '2000-01', overageBaselineMicroUsd: 7 * USD, poolAtOptInMicroUsd: 100 * USD };
+    const lastMonthMark = { month: '2000-01', thresholdMicroUsd: 120 * USD };
+    users[OWNER].paygOverage = {
+      enabled: false, capPercentOfPool: 50, updatedBy: OWNER, updatedAt: '2026-10-01T00:00:00.000Z', version: 2,
+      optIn: lastMonthOptIn, poolHighWater: lastMonthMark,
+    };
+    // Conditions are evaluated against the row here. The opt-in's own usage read is a read (no gate
+    // write, rv4), so the settings write is the one that rolls the mark over.
+    const apply = mockUpdateUser.getMockImplementation()!;
+    mockUpdateUser.mockImplementation(async (id: string, fields: Record<string, unknown>, options: UpdateUserOptions | undefined) => {
+      const condition = options?.condition;
+      if (condition && !evaluateCondition(condition.expression, users[id], condition.names, condition.values)) {
+        throw Object.assign(new Error('cond'), { code: 'ConditionalCheckFailedException' });
+      }
+      return apply(id, fields, options);
+    });
+    await put(OWNER, { enabled: true, capPercentOfPool: 50 }).expect(200);
+    expect(mockUpdateUser).toHaveBeenCalledTimes(1);
+    const written = users[OWNER].paygOverage;
+    expect(written.optIn).toMatchObject({ month: getCurrentUsageMonth() });
+    expect(written.optInClosed).toEqual(lastMonthOptIn);
+    expect(written.poolHighWater).toEqual({ month: getCurrentUsageMonth(), thresholdMicroUsd: 100 * USD });
+    expect(written.poolHighWaterClosed).toEqual(lastMonthMark);
+    const [, , options] = settingsWrite();
+    expect(options.condition.values).toMatchObject({ ':prevHwMonth': '2000-01', ':prevHwThreshold': 120 * USD });
+  });
+
+  it('...and still succeeds when a turn gate rolled the mark over between the read and the write', async () => {
+    const lastMonthMark = { month: '2000-01', thresholdMicroUsd: 120 * USD };
+    users[OWNER].paygOverage = {
+      enabled: false, capPercentOfPool: 50, updatedBy: OWNER, updatedAt: '2026-10-01T00:00:00.000Z', version: 2,
+      poolHighWater: lastMonthMark,
+    };
+    const apply = mockUpdateUser.getMockImplementation()!;
+    mockUpdateUser.mockImplementation(async (id: string, fields: Record<string, unknown>, options: UpdateUserOptions | undefined) => {
+      // A turn elsewhere rolls the mark over first, exactly as the gate does.
+      users[id].paygOverage = {
+        ...users[id].paygOverage,
+        poolHighWater: { month: getCurrentUsageMonth(), thresholdMicroUsd: 100 * USD },
+        poolHighWaterClosed: lastMonthMark,
+      };
+      const condition = options?.condition;
+      if (condition && !evaluateCondition(condition.expression, users[id], condition.names, condition.values)) {
+        throw Object.assign(new Error('cond'), { code: 'ConditionalCheckFailedException' });
+      }
+      return apply(id, fields, options);
+    });
+    await put(OWNER, { enabled: true, capPercentOfPool: 50 }).expect(200);
+    expect(users[OWNER].paygOverage).toMatchObject({
+      enabled: true,
+      poolHighWater: { month: getCurrentUsageMonth(), thresholdMicroUsd: 100 * USD },
+      poolHighWaterClosed: lastMonthMark,
+    });
+  });
+
+  it('rolling last month\'s mark over still never lowers a mark the gate raised this month', async () => {
+    users[OWNER].paygOverage = {
+      enabled: false, capPercentOfPool: 50, updatedBy: OWNER, updatedAt: '2026-10-01T00:00:00.000Z', version: 2,
+      poolHighWater: { month: '2000-01', thresholdMicroUsd: 120 * USD },
+    };
+    const apply = mockUpdateUser.getMockImplementation()!;
+    mockUpdateUser.mockImplementation(async (id: string, fields: Record<string, unknown>, options: UpdateUserOptions | undefined) => {
+      const condition = options?.condition;
+      if (/#payg\.#version/.test(condition?.expression ?? '')) {
+        // Between the read and this write, a check raised this month's mark to $300 (a top-up).
+        users[id].paygOverage.poolHighWater = { month: getCurrentUsageMonth(), thresholdMicroUsd: 300 * USD };
+      }
+      if (condition && !evaluateCondition(condition.expression, users[id], condition.names, condition.values)) {
+        throw Object.assign(new Error('cond'), { code: 'ConditionalCheckFailedException' });
+      }
+      return apply(id, fields, options);
+    });
+    const res = await put(OWNER, { enabled: true, capPercentOfPool: 50 }).expect(409);
+    expect(res.body.error).toBe('payg_conflict');
+    expect(users[OWNER].paygOverage.poolHighWater).toEqual({ month: getCurrentUsageMonth(), thresholdMicroUsd: 300 * USD });
+  });
+
+  it('off -> on after PAYG already admitted this month keeps the month\'s baseline: a toggle cannot reset the cap (review M3)', async () => {
+    const month = getCurrentUsageMonth();
+    const [y, m] = month.split('-').map(Number);
+    const previousMonth = getCurrentUsageMonth(new Date(Date.UTC(y, m - 2, 1)));
+    // Opted in last month (baseline 0 for this one) and PAYG has already admitted $45 of the $50 cap.
+    const carriedOptIn = { month: previousMonth, overageBaselineMicroUsd: 0, poolAtOptInMicroUsd: 100 * USD };
+    users[OWNER].paygOverage = {
+      enabled: true, capPercentOfPool: 50, updatedBy: OWNER, updatedAt: '2026-10-01T00:00:00.000Z', version: 3,
+      optIn: carriedOptIn,
+      poolHighWater: { month, thresholdMicroUsd: 100 * USD },
+      admittedMonths: [{ month, capHighWaterMicroUsd: 50 * USD, tierPoolHighWaterMicroUsd: 100 * USD, markupBps: 25_000, spendBasis: 'spend_ledger' }],
+    };
+    mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 145 * USD });
+    await put(OWNER, { enabled: false }).expect(200);
+    await put(OWNER, { enabled: true, capPercentOfPool: 50 }).expect(200);
+    // No re-measured baseline: the $45 already admitted is still counted against this month's cap.
+    expect(users[OWNER].paygOverage.optIn).toEqual(carriedOptIn);
+    expect(users[OWNER].paygOverage.optInClosed).toBeUndefined();
+
+    // Another $45: the gate refuses at the cap instead of admitting a second "fresh" cap's worth.
+    mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 190 * USD });
+    const usage = await getEffectiveLlmUsagePolicy(OWNER);
+    expect(usage.mode.admissionAllowed).toBe(false);
+    expect(usage.paygBlock).toEqual({ reason: 'payg_cap_reached' });
+    // And settlement bills at most the cap.
+    const amount = computePaygSettlementAmount({
+      month,
+      admitted: users[OWNER].paygOverage.admittedMonths[0],
+      inputs: paygMonthInputsFromRow(users[OWNER], month, month)!,
+      settledMicroUsd: 190 * USD,
+    })!;
+    expect(amount.overageCostMicroUsd).toBe(50 * USD);
+  });
+
+  it('the settings view is a read: past the pool with PAYG on, it writes nothing (rv4 MINOR 2)', async () => {
+    users[OWNER].paygOverage = {
+      enabled: true, capPercentOfPool: 50, updatedBy: OWNER, updatedAt: '2026-10-01T00:00:00.000Z', version: 3,
+      poolHighWater: { month: '2000-01', thresholdMicroUsd: 1 },
+    };
+    mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 130 * USD, basis: 'spend_ledger' });
+    const res = await get(OWNER).expect(200);
+    expect(res.body.overagePercentUsed).toBe(60);
+    expect(mockUpdateUser).not.toHaveBeenCalled();
+    expect(users[OWNER].paygOverage.admittedMonths).toBeUndefined();
+    expect(users[OWNER].paygOverage.poolHighWater).toEqual({ month: '2000-01', thresholdMicroUsd: 1 });
+  });
+
+  it('off -> on in a month PAYG has not admitted in still measures a fresh baseline', async () => {
+    const month = getCurrentUsageMonth();
+    users[OWNER].paygOverage = {
+      enabled: false, capPercentOfPool: 50, updatedBy: OWNER, updatedAt: '2026-10-01T00:00:00.000Z', version: 3,
+      optIn: { month: '2000-01', overageBaselineMicroUsd: 0 },
+      poolHighWater: { month, thresholdMicroUsd: 100 * USD },
+    };
+    mockSpend.mockResolvedValue({ rawCostUsedMicroUsd: 130 * USD });
+    await put(OWNER, { enabled: true, capPercentOfPool: 50 }).expect(200);
+    expect(users[OWNER].paygOverage.optIn).toMatchObject({ month, overageBaselineMicroUsd: 30 * USD });
+  });
+
+  it('a re-enable later in the same month leaves the closed copies alone', async () => {
+    const month = getCurrentUsageMonth();
+    users[OWNER].paygOverage = {
+      enabled: false, capPercentOfPool: 50, updatedBy: OWNER, updatedAt: '2026-10-01T00:00:00.000Z', version: 2,
+      optIn: { month, overageBaselineMicroUsd: 0, poolAtOptInMicroUsd: 100 * USD },
+      poolHighWater: { month, thresholdMicroUsd: 100 * USD },
+      optInClosed: { month: '2000-01', overageBaselineMicroUsd: 7 * USD },
+    };
+    await put(OWNER, { enabled: true, capPercentOfPool: 50 }).expect(200);
+    const [, , options] = settingsWrite();
+    const paths = options.pathSets.map((p: { path: Array<string | number> }) => p.path[1]);
+    expect(paths).not.toContain('optInClosed');
+    expect(paths).not.toContain('poolHighWaterClosed');
+    expect(users[OWNER].paygOverage.optInClosed).toEqual({ month: '2000-01', overageBaselineMicroUsd: 7 * USD });
   });
 
   it('opting in with a live top-up pins the high-water mark without it (a refund must be able to take it back)', async () => {

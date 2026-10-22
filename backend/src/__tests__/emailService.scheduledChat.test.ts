@@ -239,7 +239,8 @@ describe('emailService.sendScheduledChatTokenLimitEmail', () => {
   // is not what stopped it (and can read far above 100%). The email names the PAYG reason instead.
   it.each([
     [{ reason: 'payg_cap_reached' }, "You've reached your pay-as-you-go limit", 'Raise your pay-as-you-go limit or upgrade your plan'],
-    [{ reason: 'payg_suspended' }, 'Pay-as-you-go is on hold', 'Update your payment method to resume pay-as-you-go.'],
+    [{ reason: 'payg_suspended', paygSuspendedReason: 'payment_failed' }, 'Pay-as-you-go is on hold', 'Pay the open invoice to resume pay-as-you-go.'],
+    [{ reason: 'payg_suspended', paygSuspendedReason: 'dispute' }, 'Pay-as-you-go is on hold', 'Please contact us to resume pay-as-you-go.'],
     [{ reason: 'payg_inactive', paygInactiveReason: 'no_payment_method' }, 'Pay-as-you-go needs a payment method', 'Add a payment method to keep working with pay-as-you-go.'],
     [{ reason: 'payg_inactive', paygInactiveReason: 'subscription_inactive' }, 'Pay-as-you-go needs an active subscription', 'Reactivate your subscription to keep working with pay-as-you-go.'],
   ] as const)('names the PAYG reason (%j), its own action, and no plan percentage', async (paygBlock, headline, action) => {

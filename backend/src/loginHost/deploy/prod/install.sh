@@ -1,0 +1,461 @@
+#!/bin/bash
+# ENG-2110: PRODUCTION install of the login host on the worker (Amazon Linux 2023, x86_64). Run as root by the SSM document
+# AW-LoginHost-Deploy-Prod from the extracted build tarball (this script's own directory holds everything it installs).
+#
+#   install.sh                          install / update everything (idempotent; safe to re-run; a failure NEVER stops a healthy running host)
+#   install.sh --dry-run                run every CHECK, print what would change, change nothing
+#   install.sh --rollback               make the previous release the active one again (the caller restarts the service)
+#   install.sh --self-test-disk <file>  exercise ONLY the data-disk logic against a loop device made from <file> (blank, then mounted, then remounted)
+#
+# Steps: data disk -> packages -> node -> pinned claude -> STAGE a release (files, TLS set, config; everything validated) -> SWITCH to it (a few
+# atomic renames) -> prune old releases. The service itself is restarted by the SSM document afterwards. Nothing here prints a secret.
+#
+# Layout on the worker:
+#   /opt/aw-login-host/releases/<build>-<stamp>/   files of one release (host bundle, wrapper scripts, prod.json snapshot, MANIFEST, FINGERPRINT)
+#   /opt/aw-login-host/current  -> releases/<...>  the active release          /opt/aw-login-host/previous -> the one before (for --rollback)
+#   /opt/aw-login-host/dist     -> current/dist    (the systemd unit's ExecStart path)
+#   /etc/aw-login-host/tls/<build>-<stamp>/        the TLS set that release uses (server.crt, server.key 0600, ca.crt)
+#   /etc/aw-login-host/prod.json                   the active config: a REGULAR file whose paths point into the active release and TLS set
+# (The host refuses symlinks anywhere on the path of the files it trusts, so the config, not a symlink, selects the files it reads.)
+#
+# Exit codes: 0 ok; 1 a step failed (the running host, if any, is untouched); 3 NOT installed because /etc/aw-login-host/bridge-url is missing or invalid.
+#
+# TODO (egress): the template allows console.anthropic.com:443 and claude.ai:443 besides api.anthropic.com:443 and platform.claude.com:443.
+# Prune the two extra hosts once the proxy's logs show they are never used by a real sign-in and turn.
+set -euo pipefail
+umask 022
+
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=versions.env
+. "$HERE/versions.env"
+# shellcheck source=lib.sh
+. "$HERE/lib.sh"
+
+DRY=0
+SELF_TEST_FILE=""
+ROLLBACK=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY=1 ;;
+    --rollback) ROLLBACK=1 ;;
+    --self-test-disk)
+      shift
+      [ "$#" -gt 0 ] || { echo "install: --self-test-disk needs a file" >&2; exit 2; }
+      SELF_TEST_FILE=$1
+      ;;
+    *) echo "install: unknown argument $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+ENV_NAME=prod
+DATA_MOUNT=/var/lib/aw-login-host/prod/u
+DATA_LABEL=awdata
+OPT=/opt/aw-login-host
+CONF=/etc/aw-login-host
+UNIT_DIR=/etc/systemd/system
+SYSTEMCTL=systemctl
+LOCK=/run/aw-login-host-install.lock
+SKIP_PREREQS=0
+DRY_BASE=/run
+OWN=(-o root -g root)
+# Test seam: a copy of these scripts in a scratch directory with a `.aw-test-mode` file next to them may redirect every path and fake the tools.
+# The marker is never part of a build tarball, so on the worker none of the AW_* variables below has any effect.
+TEST=0
+if [ -e "$HERE/.aw-test-mode" ]; then
+  TEST=1
+  OPT=${AW_OPT:?AW_OPT}; CONF=${AW_CONF:?AW_CONF}; UNIT_DIR=${AW_UNIT_DIR:?AW_UNIT_DIR}; LOCK=${AW_LOCK:?AW_LOCK}
+  SYSTEMCTL=${AW_SYSTEMCTL:-systemctl}; SKIP_PREREQS=${AW_SKIP_PREREQS:-0}
+  DRY_BASE=${AW_TMP:-${TMPDIR:-/tmp}}
+  [ "$(id -u)" = 0 ] || OWN=()
+fi
+
+if [ "$TEST" != 1 ] && [ "$(id -u)" != 0 ]; then die "must run as root"; fi
+exec 9>"$LOCK"
+flock -n 9 || die "another install is running (lock $LOCK)"
+
+# Atomic replace of a file/symlink: ln/cp into a sibling temp name, then rename over the target.
+swap_symlink() { # swap_symlink <target-text> <link>
+  ln -sfn "$1" "$2.new"
+  mv -T "$2.new" "$2"
+}
+
+# ───────────────────────────── --self-test-disk ─────────────────────────────
+
+if [ -n "$SELF_TEST_FILE" ]; then
+  # Disk logic only, on a loop device, with its own mount point, label and fstab: nothing of the real system is touched.
+  # Three passes, because the real world runs it three ways: first install (blank), redeploy (mounted, ours), after a reboot (ours, not mounted).
+  [ -f "$SELF_TEST_FILE" ] || die "self-test file $SELF_TEST_FILE does not exist"
+  ST_DIR=$(mktemp -d /run/aw-selftest.XXXXXX)
+  ST_MP="$ST_DIR/mnt"
+  ST_FSTAB="$ST_DIR/fstab"
+  printf '# a comment that must survive\nUUID=0000-0000 /boot ext4 defaults 0 2\nUUID=1111-1111 %s ext4 defaults 0 2\n' "$ST_MP" >"$ST_FSTAB"
+  ST_DEV=$(losetup --find --show "$SELF_TEST_FILE")
+  cleanup_selftest() {
+    umount "$ST_MP" 2>/dev/null || true
+    losetup -d "$ST_DEV" 2>/dev/null || true
+    rm -rf "$ST_DIR"
+  }
+  trap cleanup_selftest EXIT
+  log "self-test pass 1: first install"
+  ensure_data_disk "$ST_DEV" "$ST_MP" "awtest" "$ST_FSTAB"
+  log "self-test pass 2: redeploy (disk mounted at the mount point)"
+  ensure_data_disk "$ST_DEV" "$ST_MP" "awtest" "$ST_FSTAB"
+  umount "$ST_MP"
+  log "self-test pass 3: after a reboot (ours, not mounted)"
+  ensure_data_disk "$ST_DEV" "$ST_MP" "awtest" "$ST_FSTAB"
+  grep -c '^LABEL=awtest ' "$ST_FSTAB" | sed 's/^/install: self-test fstab lines for the label: /'
+  grep -c "$ST_MP" "$ST_FSTAB" | sed 's/^/install: self-test fstab lines for the mount point: /'
+  grep -c '^# a comment that must survive$' "$ST_FSTAB" | sed 's/^/install: self-test unrelated comment kept: /'
+  grep -c '^UUID=0000-0000 /boot ' "$ST_FSTAB" | sed 's/^/install: self-test unrelated line kept: /'
+  exit 0
+fi
+
+# ───────────────────────────── helpers for the release machinery ─────────────────────────────
+
+NODE_BIN=/usr/bin/node
+[ "$TEST" != 1 ] || NODE_BIN=$(command -v node || echo /usr/bin/node)
+check_config() { # check_config <config.json> <check-config.js>
+  local nb=$NODE_BIN
+  [ -x "$nb" ] || nb=$(command -v node || true)
+  [ -n "$nb" ] && "$nb" "$2" "$1"
+}
+
+# A valid install = an active release whose files, config and TLS set are all there.
+have_valid_install() {
+  [ -L "$OPT/current" ] && [ -f "$OPT/current/dist/loginHost/host/start.js" ] && [ -f "$OPT/current/prod.json" ] \
+    && [ -f "$OPT/current/FINGERPRINT" ] && [ -f "$CONF/$ENV_NAME.json" ] && [ -d "$(cat "$OPT/current/TLS_DIR" 2>/dev/null || echo /nonexistent)" ]
+}
+
+# ───────────────────────────── --rollback ─────────────────────────────
+
+if [ "$ROLLBACK" = 1 ]; then
+  [ -L "$OPT/previous" ] || die "there is no previous release to roll back to"
+  prev_target=$(readlink "$OPT/previous")
+  prev="$OPT/$prev_target"
+  [ -d "$prev" ] && [ -f "$prev/prod.json" ] && [ -f "$prev/dist/loginHost/host/start.js" ] && [ -f "$prev/TLS_DIR" ] && [ -f "$prev/WORKER_IP" ] \
+    || die "the previous release $prev_target is incomplete: deploy a known-good build instead"
+  prev_tls=$(cat "$prev/TLS_DIR")
+  validate_tls_dir "$prev_tls" "$(cat "$prev/WORKER_IP")" || die "the previous release's TLS set is no longer valid (expired or removed): deploy that build again instead of rolling back"
+  check_config "$prev/prod.json" "$prev/check-config.js" >/dev/null || die "the previous release's config is no longer accepted"
+  cur_target=""
+  [ ! -L "$OPT/current" ] || cur_target=$(readlink "$OPT/current")
+  doing "roll back: current -> $prev_target"
+  if [ "$DRY" != 1 ]; then
+    swap_symlink "$prev_target" "$OPT/current"
+    install -m 0600 "${OWN[@]}" "$prev/prod.json" "$CONF/$ENV_NAME.json.new"
+    mv -f "$CONF/$ENV_NAME.json.new" "$CONF/$ENV_NAME.json"
+    [ -z "$cur_target" ] || swap_symlink "$cur_target" "$OPT/previous"
+    ok "rolled back to $prev_target. Restart the service now: systemctl restart aw-login-host@$ENV_NAME (the deploy document does this)."
+  fi
+  exit 0
+fi
+
+# ───────────────────────────── on any failure: never touch a healthy running host ─────────────────────────────
+
+STAGE_REL=""
+STAGE_TLS=""
+DRY_TMP=""
+cleanup() {
+  local rc=$?
+  [ -z "$STAGE_REL" ] || rm -rf "$STAGE_REL"
+  [ -z "$STAGE_TLS" ] || rm -rf "$STAGE_TLS"
+  [ -z "$DRY_TMP" ] || rm -rf "$DRY_TMP"
+  if [ "$rc" -ne 0 ] && [ "$DRY" != 1 ]; then
+    if have_valid_install; then
+      log "the install failed (exit $rc) but a valid previous install exists: it was NOT touched and keeps running" >&2
+    else
+      # Nothing valid is installed (a first install that failed): make sure no half-configured host crash-loops.
+      "$SYSTEMCTL" disable --now "aw-login-host@$ENV_NAME" >/dev/null 2>&1 || true
+      log "NOT STARTED: nothing valid is installed (exit $rc, see the lines above)" >&2
+    fi
+  fi
+  exit "$rc"
+}
+trap cleanup EXIT
+
+# ───────────────────────────── a. the data disk ─────────────────────────────
+
+if [ "$SKIP_PREREQS" = 1 ]; then
+  skip "prerequisites (disk, packages, node, claude): skipped in test mode"
+else
+  DATA_DEV=""
+  if DATA_DEV=$(find_data_disk); then
+    ok "data disk candidate: $DATA_DEV"
+    ensure_data_disk "$DATA_DEV" "$DATA_MOUNT" "$DATA_LABEL" /etc/fstab
+  else
+    if [ "$DRY" = 1 ]; then
+      fail "no single data disk found here (expected on the worker; a dry run elsewhere will show this)"
+    else
+      die "cannot identify the data disk"
+    fi
+  fi
+
+  # ───────────────────────────── b. packages and node ─────────────────────────────
+
+  NEEDED_PKGS=()
+  for p in socat quota xz openssl python3 e2fsprogs util-linux; do rpm -q "$p" >/dev/null 2>&1 || NEEDED_PKGS+=("$p"); done
+  if [ "${#NEEDED_PKGS[@]}" -eq 0 ]; then
+    skip "packages present (socat quota xz openssl python3 e2fsprogs util-linux)"
+  else
+    doing "dnf install ${NEEDED_PKGS[*]}"
+    mut dnf -y install "${NEEDED_PKGS[@]}"
+  fi
+
+  NODE_DIR=/opt/aw-node/v$NODE_VERSION
+  if [ -x "$NODE_DIR/bin/node" ] && [ "$(sha256sum "$NODE_DIR/bin/node" | cut -d' ' -f1)" = "$NODE_BIN_SHA256" ]; then
+    skip "node $NODE_VERSION already installed and verified"
+  else
+    doing "download node $NODE_VERSION (sha256-pinned) to $NODE_DIR"
+    if [ "$DRY" != 1 ]; then
+      tmpd=$(mktemp -d /var/tmp/aw-node.XXXXXX)
+      curl -fsSL --proto '=https' --tlsv1.2 -o "$tmpd/node.tar.xz" "$NODE_TARBALL_URL"
+      [ "$(sha256sum "$tmpd/node.tar.xz" | cut -d' ' -f1)" = "$NODE_TARBALL_SHA256" ] || { rm -rf "$tmpd"; die "node tarball sha256 mismatch"; }
+      tar -xJf "$tmpd/node.tar.xz" -C "$tmpd"
+      [ "$(sha256sum "$tmpd/node-v$NODE_VERSION-linux-x64/bin/node" | cut -d' ' -f1)" = "$NODE_BIN_SHA256" ] || { rm -rf "$tmpd"; die "node binary sha256 mismatch"; }
+      mkdir -p /opt/aw-node
+      rm -rf "${NODE_DIR}.new"
+      mv "$tmpd/node-v$NODE_VERSION-linux-x64" "${NODE_DIR}.new"
+      chown -R root:root "${NODE_DIR}.new"
+      rm -rf "$NODE_DIR"
+      mv "${NODE_DIR}.new" "$NODE_DIR"
+      rm -rf "$tmpd"
+      ok "node $NODE_VERSION installed to $NODE_DIR"
+    fi
+  fi
+  if [ "$(readlink /usr/bin/node 2>/dev/null || true)" = "$NODE_DIR/bin/node" ]; then
+    skip "/usr/bin/node already points at node $NODE_VERSION"
+  else
+    doing "ln -sfn $NODE_DIR/bin/node /usr/bin/node"
+    mut ln -sfn "$NODE_DIR/bin/node" /usr/bin/node
+  fi
+
+  # ───────────────────────────── c. the pinned claude binary ─────────────────────────────
+
+  CLAUDE_BIN=/opt/aw-claude/$CLAUDE_VERSION/claude
+  if [ -f "$CLAUDE_BIN" ] && [ ! -L "$CLAUDE_BIN" ] && [ "$(sha256sum "$CLAUDE_BIN" | cut -d' ' -f1)" = "$CLAUDE_BIN_SHA256" ]; then
+    skip "claude $CLAUDE_VERSION already installed and verified"
+  else
+    doing "download claude $CLAUDE_VERSION from the npm registry (integrity + sha256 pinned)"
+    if [ "$DRY" != 1 ]; then
+      tmpd=$(mktemp -d /var/tmp/aw-claude.XXXXXX)
+      curl -fsSL --proto '=https' --tlsv1.2 -o "$tmpd/claude.tgz" "$CLAUDE_TARBALL_URL"
+      got="sha512-$(openssl dgst -sha512 -binary "$tmpd/claude.tgz" | openssl base64 -A)"
+      [ "$got" = "$CLAUDE_TARBALL_INTEGRITY" ] || { rm -rf "$tmpd"; die "claude tarball integrity mismatch"; }
+      tar -xzf "$tmpd/claude.tgz" -C "$tmpd" package/claude
+      [ "$(sha256sum "$tmpd/package/claude" | cut -d' ' -f1)" = "$CLAUDE_BIN_SHA256" ] || { rm -rf "$tmpd"; die "claude binary sha256 mismatch"; }
+      install -d -m 0755 "${OWN[@]}" "/opt/aw-claude" "/opt/aw-claude/$CLAUDE_VERSION"
+      install -m 0755 "${OWN[@]}" "$tmpd/package/claude" "$CLAUDE_BIN.new"
+      mv -f "$CLAUDE_BIN.new" "$CLAUDE_BIN"
+      rm -rf "$tmpd"
+      ok "claude $CLAUDE_VERSION installed at $CLAUDE_BIN"
+    fi
+  fi
+fi
+
+# ───────────────────────────── d. stage a release (nothing is switched yet) ─────────────────────────────
+
+[ -f "$HERE/dist/loginHost/host/start.js" ] || die "build is missing dist/loginHost/host/start.js"
+[ -f "$HERE/MANIFEST" ] || die "build is missing MANIFEST"
+
+# The worker's own address: from /etc/aw-login-host/worker.env, else the instance metadata (IMDSv2). The TLS server certificate must name it.
+resolve_worker_ip() {
+  local v=""
+  if [ -f "$CONF/worker.env" ]; then v=$(sed -n 's/^WORKER_PRIVATE_IP=//p' "$CONF/worker.env" | head -n1 | tr -d '\r\n'); fi
+  if [ -z "$v" ] && [ "$TEST" = 1 ]; then v=${AW_WORKER_IP:-}; fi
+  if [ -z "$v" ] && [ "$TEST" != 1 ]; then
+    local tok
+    tok=$(curl -fsS -m 3 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token 2>/dev/null || true)
+    [ -z "$tok" ] || v=$(curl -fsS -m 3 -H "X-aws-ec2-metadata-token: $tok" http://169.254.169.254/latest/meta-data/local-ipv4 2>/dev/null || true)
+  fi
+  is_private_ipv4 "$v" || die "cannot determine this worker's private IPv4 (got '$v'): set WORKER_PRIVATE_IP=<address> in $CONF/worker.env"
+  printf '%s\n' "$v"
+}
+WORKER_IP=$(resolve_worker_ip)
+ok "this worker's address: $WORKER_IP"
+
+# The bridge URL (decided with the B4 turn path). https only: the worker reaches the backend's tool bridge across the network, through the egress proxy.
+BRIDGE_FILE=$CONF/bridge-url
+[ "$TEST" != 1 ] || BRIDGE_FILE=${AW_BRIDGE_FILE:-$BRIDGE_FILE}
+BRIDGE_URL=""
+if [ -f "$BRIDGE_FILE" ]; then BRIDGE_URL=$(head -n1 "$BRIDGE_FILE" | tr -d '\r\n'); fi
+if ! [[ "$BRIDGE_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$ ]]; then
+  if have_valid_install; then
+    log "no valid https bridge URL in $BRIDGE_FILE: nothing was changed and the running host keeps running" >&2
+  else
+    log "NOT INSTALLED: create $BRIDGE_FILE with the backend tool bridge's https URL (one line), then run the deploy again." >&2
+  fi
+  exit 3
+fi
+
+STAMP=$(date -u +%Y%m%d%H%M%S)
+BUILD_NAME=$(sed -n 's/^name=//p' "$HERE/MANIFEST" | head -n1)
+[[ "$BUILD_NAME" =~ ^login-host-[A-Za-z0-9-]+$ ]] || die "the MANIFEST has no valid build name"
+REL_ID="$BUILD_NAME-$STAMP"
+REL_DIR="$OPT/releases/$REL_ID"
+TLS_DIR="$CONF/tls/$REL_ID"
+
+if [ "$DRY" = 1 ]; then
+  DRY_TMP=$(mktemp -d "$DRY_BASE/aw-dry.XXXXXX")
+  STAGE_TLS_DIR="$DRY_TMP/tls"
+  STAGE_REL_DIR="$DRY_TMP/release"
+else
+  mkdir -p "$OPT/releases" "$CONF/tls"
+  chmod 0755 "$OPT" "$OPT/releases" "$CONF" "$CONF/tls" 2>/dev/null || true
+  STAGE_TLS="$CONF/tls/.stage-$REL_ID"
+  STAGE_REL="$OPT/releases/.stage-$REL_ID"
+  STAGE_TLS_DIR=$STAGE_TLS
+  STAGE_REL_DIR=$STAGE_REL
+fi
+mkdir -m 0700 "$STAGE_TLS_DIR"
+mkdir -m 0755 "$STAGE_REL_DIR"
+
+# TLS set from Secrets Manager (via the instance role), written ONLY into the private staging directory, then validated as a set.
+fetch_tls_set() { # fetch_tls_set <dir>   (every command is checked: no `set -e` inside functions called from `||`)
+  local d=$1
+  (
+    umask 077
+    aws secretsmanager get-secret-value --region "$AWS_REGION" --secret-id "$TLS_SECRET_SERVER" --query SecretString --output text >"$d/.server.json" 2>/dev/null
+  ) || { log "FAIL could not read secret $TLS_SECRET_SERVER (does this instance's role allow it?)" >&2; return 1; }
+  (
+    umask 077
+    aws secretsmanager get-secret-value --region "$AWS_REGION" --secret-id "$TLS_SECRET_CA" --query SecretString --output text >"$d/.ca.json" 2>/dev/null
+  ) || { log "FAIL could not read secret $TLS_SECRET_CA (does this instance's role allow it?)" >&2; return 1; }
+  (
+    umask 077
+    python3 - "$d" <<'PY'
+import json, sys
+w = sys.argv[1]
+s = json.load(open(f"{w}/.server.json"))
+c = json.load(open(f"{w}/.ca.json"))
+for name, val in (("server.crt", s["cert"]), ("server.key", s["key"]), ("ca.crt", c["cert"])):
+    with open(f"{w}/{name}", "w") as f:
+        f.write(val if val.endswith("\n") else val + "\n")
+PY
+  ) || { log "FAIL the TLS secrets do not have the expected JSON shape ({cert,key,ca} / {cert})" >&2; return 1; }
+  rm -f "$d/.server.json" "$d/.ca.json" || return 1
+  validate_tls_dir "$d" "$WORKER_IP" || return 1
+  return 0
+}
+fetch_tls_set "$STAGE_TLS_DIR" || die "the TLS set could not be staged: nothing was changed"
+ok "TLS set read and validated (SAN names $WORKER_IP, key matches, chains to the CA, not expired)"
+
+# Fingerprint of everything that decides what runs: if it equals the active release's, there is nothing to do.
+FP=$( {
+  cat "$HERE/MANIFEST" "$HERE/files/aw-login-host@.service" "$HERE/files/aw-env.slice.template"
+  sha256sum "$STAGE_TLS_DIR/server.crt" "$STAGE_TLS_DIR/ca.crt" | cut -d' ' -f1
+  printf '%s\n%s\n' "$BRIDGE_URL" "$WORKER_IP"
+} | sha256sum | cut -d' ' -f1)
+if have_valid_install && [ "$(cat "$OPT/current/FINGERPRINT")" = "$FP" ]; then
+  # Re-assert the modes of the active TLS set even though nothing changed (a key that drifted to 0644 would make the host refuse to start).
+  if [ "$DRY" != 1 ]; then
+    act_tls=$(cat "$OPT/current/TLS_DIR")
+    chmod 0644 "$act_tls/server.crt" "$act_tls/ca.crt"
+    chmod 0600 "$act_tls/server.key"
+    chmod 0755 "$act_tls"
+  fi
+  ok "this exact build, TLS set, address and bridge are already active ($(readlink "$OPT/current")): nothing to do"
+  exit 0
+fi
+
+# The release directory.
+ins() { install "${OWN[@]}" "$@"; }
+ins -d -m 0755 "$STAGE_REL_DIR/dist" "$STAGE_REL_DIR/dist/loginHost" "$STAGE_REL_DIR/dist/loginHost/host"
+ins -m 0644 "$HERE/dist/loginHost/host/start.js" "$STAGE_REL_DIR/dist/loginHost/host/start.js"
+ins -m 0755 "$HERE/files/claude-turn.sh" "$STAGE_REL_DIR/claude-turn.sh"
+ins -m 0755 "$HERE/files/aw-net.sh" "$STAGE_REL_DIR/aw-net.sh"
+ins -m 0755 "$HERE/files/aw-write-file.sh" "$STAGE_REL_DIR/aw-write-file.sh"
+ins -m 0644 "$HERE/files/system-prompt.txt" "$STAGE_REL_DIR/system-prompt.txt"
+ins -m 0644 "$HERE/check-config.js" "$STAGE_REL_DIR/check-config.js"
+ins -m 0644 "$HERE/MANIFEST" "$STAGE_REL_DIR/MANIFEST"
+printf '%s\n' "$FP" >"$STAGE_REL_DIR/FINGERPRINT"
+printf '%s\n' "$TLS_DIR" >"$STAGE_REL_DIR/TLS_DIR"
+printf '%s\n' "$WORKER_IP" >"$STAGE_REL_DIR/WORKER_IP"
+chmod 0644 "$STAGE_REL_DIR/FINGERPRINT" "$STAGE_REL_DIR/TLS_DIR" "$STAGE_REL_DIR/WORKER_IP"
+
+# The config, with every path pointing into THIS release and ITS TLS set; accepted by the host's own parser before it is used.
+cfg_tmp="$STAGE_REL_DIR/prod.json"
+python3 - "$HERE/files/host-config.template.json" "$cfg_tmp" "$CLAUDE_BIN_SHA256" "$BRIDGE_URL" "$WORKER_IP" "$REL_DIR" "$TLS_DIR" "$CLAUDE_VERSION" <<'PY' || die "could not render the config"
+import json, sys
+tpl, out, sha, bridge, ip, rel, tls, ver = sys.argv[1:9]
+text = open(tpl).read()
+for k, v in (("@@CLAUDE_BIN_SHA256@@", sha), ("@@BRIDGE_URL@@", bridge), ("@@WORKER_IP@@", ip), ("@@RELEASE_DIR@@", rel), ("@@TLS_DIR@@", tls), ("@@CLAUDE_VERSION@@", ver)):
+    text = text.replace(k, v)
+if "@@" in text:
+    raise SystemExit("an unfilled placeholder is left in the config")
+json.loads(text)  # must stay valid JSON
+open(out, "w").write(text)
+PY
+chmod 0600 "$cfg_tmp"
+check_config "$cfg_tmp" "$HERE/check-config.js" >/dev/null || die "the generated config is rejected by the host's own schema (or there is no node to check it with): nothing was changed"
+ok "generated config accepted by the host's parser"
+
+# The slice that caps ALL customer units (values pinned in versions.env; CPU quota leaves ~20% of one vCPU for the host).
+CPU_QUOTA="$(( $(nproc) * 100 - 20 ))%"
+sed -e "s|@@MEMORY_MAX@@|$SLICE_MEMORY_MAX|" -e "s|@@MEMORY_HIGH@@|$SLICE_MEMORY_HIGH|" -e "s|@@TASKS_MAX@@|$SLICE_TASKS_MAX|" -e "s|@@CPU_QUOTA@@|$CPU_QUOTA|" \
+  "$HERE/files/aw-env.slice.template" >"$STAGE_REL_DIR/aw-$ENV_NAME.slice"
+grep -q '@@' "$STAGE_REL_DIR/aw-$ENV_NAME.slice" && die "an unfilled placeholder is left in the slice"
+chmod 0644 "$STAGE_REL_DIR/aw-$ENV_NAME.slice"
+
+# Last pre-switch checks on the staged files.
+for f in claude-turn.sh aw-net.sh aw-write-file.sh; do [ -x "$STAGE_REL_DIR/$f" ] || die "staged $f is not executable"; done
+[ "$SKIP_PREREQS" = 1 ] || [ -x "/opt/aw-claude/$CLAUDE_VERSION/claude" ] || [ "$DRY" = 1 ] || die "the pinned claude binary is missing"
+
+if [ "$DRY" = 1 ]; then
+  if [ "$FAILED" -gt 0 ]; then
+    log "dry run finished: $FAILED check(s) would FAIL on this machine"
+    exit 1
+  fi
+  log "dry run finished: every check passes; a real run would install release $REL_ID"
+  exit 0
+fi
+
+# ───────────────────────────── e. SWITCH (everything above is validated; a few atomic renames) ─────────────────────────────
+
+# Make the staged directories final. Renames are atomic and nothing refers to the new names yet.
+chmod 0755 "$STAGE_TLS_DIR"
+chmod 0644 "$STAGE_TLS_DIR/server.crt" "$STAGE_TLS_DIR/ca.crt"
+chmod 0600 "$STAGE_TLS_DIR/server.key"
+[ "${#OWN[@]}" -eq 0 ] || chown -R root:root "$STAGE_TLS_DIR" "$STAGE_REL_DIR"
+mv -T "$STAGE_TLS_DIR" "$TLS_DIR"
+STAGE_TLS=""
+mv -T "$STAGE_REL_DIR" "$REL_DIR"
+STAGE_REL=""
+
+PREV_TARGET=""
+[ ! -L "$OPT/current" ] || PREV_TARGET=$(readlink "$OPT/current")
+
+# The unit and the slice (global, tiny, written atomically), then the active release, the dist path the unit uses, and the config.
+ins -m 0644 "$HERE/files/aw-login-host@.service" "$UNIT_DIR/aw-login-host@.service.new"
+mv -f "$UNIT_DIR/aw-login-host@.service.new" "$UNIT_DIR/aw-login-host@.service"
+ins -m 0644 "$HERE/files/aw-login-host-failed@.service" "$UNIT_DIR/aw-login-host-failed@.service.new"
+mv -f "$UNIT_DIR/aw-login-host-failed@.service.new" "$UNIT_DIR/aw-login-host-failed@.service"
+ins -m 0644 "$REL_DIR/aw-$ENV_NAME.slice" "$UNIT_DIR/aw-$ENV_NAME.slice.new"
+mv -f "$UNIT_DIR/aw-$ENV_NAME.slice.new" "$UNIT_DIR/aw-$ENV_NAME.slice"
+
+swap_symlink "releases/$REL_ID" "$OPT/current"
+ins -m 0600 "$REL_DIR/prod.json" "$CONF/$ENV_NAME.json.new"
+mv -f "$CONF/$ENV_NAME.json.new" "$CONF/$ENV_NAME.json"
+# (the two renames above are the whole switch: the host reads its files only when it starts, and the caller restarts it afterwards)
+if [ -d "$OPT/dist" ] && [ ! -L "$OPT/dist" ]; then mv "$OPT/dist" "$OPT/dist.legacy-$STAMP"; fi # an earlier layout kept the files here directly
+if [ "$(readlink "$OPT/dist" 2>/dev/null || true)" != "current/dist" ]; then swap_symlink "current/dist" "$OPT/dist"; fi
+[ -z "$PREV_TARGET" ] || [ "$PREV_TARGET" = "releases/$REL_ID" ] || swap_symlink "$PREV_TARGET" "$OPT/previous"
+
+"$SYSTEMCTL" daemon-reload
+"$SYSTEMCTL" enable "aw-login-host@$ENV_NAME" >/dev/null 2>&1 || true
+ok "release $REL_ID is active (previous: ${PREV_TARGET:-none}); aw-login-host@$ENV_NAME enabled (the deploy document restarts it)"
+
+# ───────────────────────────── f. prune old releases (never the active or the previous one) ─────────────────────────────
+
+keep_a=$(readlink "$OPT/current" 2>/dev/null | sed 's|^releases/||' || true)
+keep_b=$(readlink "$OPT/previous" 2>/dev/null | sed 's|^releases/||' || true)
+n=0
+while read -r _t name; do
+  n=$((n + 1))
+  [ "$n" -gt "$RELEASES_KEEP" ] || continue
+  [ "$name" != "$keep_a" ] && [ "$name" != "$keep_b" ] || continue
+  rm -rf "${OPT:?}/releases/$name" "${CONF:?}/tls/$name"
+  log "pruned old release $name"
+done < <(find "$OPT/releases" -mindepth 1 -maxdepth 1 -type d ! -name '.stage-*' -printf '%T@ %f\n' | sort -rn)
+
+exit 0

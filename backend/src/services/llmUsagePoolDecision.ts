@@ -28,7 +28,9 @@ import { resolveEnforcementCostBasisMicroUsd } from './spendEnforcementBasis';
 import {
   evaluatePaygAdmission,
   paygOverageThresholdMicroUsd,
+  withPaygAdmission,
   type PaygBlock,
+  type PaygAdmittedMonth,
   type PaygOverageSettings,
   type PaygOverageStatus,
   type SubscriptionPaygOverageConfig,
@@ -61,12 +63,20 @@ export async function resolveLlmUsagePoolDecision(input: {
   paygTier: () => Promise<SubscriptionPaygOverageConfig | null | undefined>;
   /** Lazy: read only if the basis falls back to legacy (rollback path), never on the live ledger path. */
   legacyRawCostUsedMicroUsd: () => Promise<number>;
+  /**
+   * True only for a turn gate — a check that admits a turn about to run. Only then may PAYG state be
+   * written (the pool high-water mark, and the month's admission record that makes it billable). Every
+   * other caller (settings view, runway, drivers, model lists, admin reads) gets the same decision with
+   * no write at all: reading usage must never make a month billable or raise its cap.
+   */
+  recordAdmission?: boolean;
 }): Promise<LlmUsagePoolDecision> {
   const { billingUserId, billingUser, month, basePolicy } = input;
+  const recordAdmission = input.recordAdmission === true;
   // ENG-1250 §9.6 enforcement cutover (dark by default): swap the raw spend basis
   // onto the vendor-inclusive spend ledger and leave the rest of this pipeline —
   // credit application, threshold, predicate — untouched. See spendEnforcementBasis.ts.
-  const { rawCostUsedMicroUsd } = await resolveEnforcementCostBasisMicroUsd({
+  const { rawCostUsedMicroUsd, basis: spendBasis } = await resolveEnforcementCostBasisMicroUsd({
     billingUserId,
     billingMonth: month,
     legacyRawCostUsedMicroUsd: input.legacyRawCostUsedMicroUsd,
@@ -125,7 +135,7 @@ export async function resolveLlmUsagePoolDecision(input: {
   // The mark leaves out top-up credit a refund or dispute can still revoke: a live top-up already
   // extends today's pool (the overage threshold is the larger of the two), and once revoked it must not
   // linger in the mark as capacity nobody paid for. Seat and admin credit stay in it.
-  const poolHighWater = await recordPoolHighWater({
+  const markInput = {
     billingUserId,
     account: ownerAccount,
     month: usageMonth,
@@ -133,7 +143,9 @@ export async function resolveLlmUsagePoolDecision(input: {
       0,
       policy.hardCostThresholdMicroUsd - getRevocablePurchasedCreditMicroUsd(billingUser?.llmUsageCredits, month),
     ),
-  });
+  };
+  // A read-only caller measures against the mark the write would store, without storing it.
+  const poolHighWater = recordAdmission ? await recordPoolHighWater(markInput) : higherPoolHighWater(markInput);
   // Only an opt-in that is ON is ever evaluated; an OFF one keeps today's decision exactly.
   if (ownerAccount.enabled !== true) return base;
   const payg = evaluatePaygAdmission({
@@ -151,6 +163,21 @@ export async function resolveLlmUsagePoolDecision(input: {
     }),
     month: usageMonth,
   });
+  // Settlement bills a month only if PAYG actually admitted something in it, and only against what was
+  // in force when it did (see `admittedMonths`).
+  if (recordAdmission && payg.decision.reason === 'payg_overage' && payg.overage) {
+    await recordPaygAdmission({
+      billingUserId,
+      account: ownerAccount,
+      seen: {
+        month: usageMonth,
+        capHighWaterMicroUsd: payg.overage.capMicroUsd,
+        tierPoolHighWaterMicroUsd: Math.round(basePolicy!.hardCostThresholdMicroUsd),
+        markupBps: Number.isInteger(paygTier.markupBps) ? paygTier.markupBps! : null,
+        spendBasis: spendBasis === 'spend_ledger' ? 'spend_ledger' : 'legacy',
+      },
+    });
+  }
   return { ...base, mode: payg.decision, overage: payg.overage, paygBlock: payg.block };
 }
 
@@ -166,6 +193,17 @@ async function readOwnerConsistently(billingUserId: string): Promise<PoolBilling
   }
 }
 
+/** The mark a check measures against without writing: the stored one, or today's when it is higher. */
+function higherPoolHighWater(input: {
+  account: PaygOverageSettings;
+  month: string;
+  thresholdMicroUsd: number;
+}): PaygOverageSettings['poolHighWater'] {
+  const stored = input.account.poolHighWater;
+  if (stored?.month === input.month && stored.thresholdMicroUsd >= input.thresholdMicroUsd) return stored;
+  return { month: input.month, thresholdMicroUsd: input.thresholdMicroUsd };
+}
+
 /**
  * Raise this month's pool high-water mark when today's effective threshold is above it, and return the
  * mark the check should measure against.
@@ -173,6 +211,11 @@ async function readOwnerConsistently(billingUserId: string): Promise<PoolBilling
  * Written only when it rises, and conditionally on the stored mark still being lower, so two gates
  * (or two instances) racing on the same check cannot lower it. It is NOT the settings version: the
  * settings route writes only its own fields, so the two never overwrite each other.
+ *
+ * The first write of a new month replaces the previous month's mark, which settlement of that month
+ * still needs (it runs after the month closes). That write moves the old mark to `poolHighWaterClosed`
+ * and is conditional on the stored mark being EXACTLY the one this check read, so the closed copy is
+ * never a stale, lower snapshot of a mark another instance raised meanwhile.
  *
  * Losing that condition means someone stored an equal-or-higher mark this read did not see. The check
  * then re-reads the row strongly consistent and uses that mark — measuring against the lower one it
@@ -188,16 +231,31 @@ async function recordPoolHighWater(input: {
   const stored = input.account.poolHighWater;
   if (stored?.month === input.month && stored.thresholdMicroUsd >= input.thresholdMicroUsd) return stored;
   const ours = { month: input.month, thresholdMicroUsd: input.thresholdMicroUsd };
+  const names = { '#payg': 'paygOverage', '#hw': 'poolHighWater', '#month': 'month', '#threshold': 'thresholdMicroUsd' };
+  const rollingOver = typeof stored?.month === 'string' && stored.month !== input.month
+    && Number.isFinite(stored.thresholdMicroUsd);
   try {
-    await userDb.updateUser(input.billingUserId, {}, {
-      pathSets: [{ path: ['paygOverage', 'poolHighWater'], value: ours }],
-      condition: {
-        expression:
-          'attribute_exists(#payg) AND (attribute_not_exists(#payg.#hw) OR #payg.#hw.#month <> :hwMonth OR #payg.#hw.#threshold < :hwThreshold)',
-        names: { '#payg': 'paygOverage', '#hw': 'poolHighWater', '#month': 'month', '#threshold': 'thresholdMicroUsd' },
-        values: { ':hwMonth': input.month, ':hwThreshold': input.thresholdMicroUsd },
-      },
-    });
+    await userDb.updateUser(input.billingUserId, {}, rollingOver
+      ? {
+          pathSets: [
+            { path: ['paygOverage', 'poolHighWaterClosed'], value: stored },
+            { path: ['paygOverage', 'poolHighWater'], value: ours },
+          ],
+          condition: {
+            expression: 'attribute_exists(#payg) AND #payg.#hw.#month = :prevMonth AND #payg.#hw.#threshold = :prevThreshold',
+            names,
+            values: { ':prevMonth': stored!.month, ':prevThreshold': stored!.thresholdMicroUsd },
+          },
+        }
+      : {
+          pathSets: [{ path: ['paygOverage', 'poolHighWater'], value: ours }],
+          condition: {
+            expression:
+              'attribute_exists(#payg) AND (attribute_not_exists(#payg.#hw) OR #payg.#hw.#month <> :hwMonth OR #payg.#hw.#threshold < :hwThreshold)',
+            names,
+            values: { ':hwMonth': input.month, ':hwThreshold': input.thresholdMicroUsd },
+          },
+        });
     return ours;
   } catch (error: any) {
     if (error?.code !== 'ConditionalCheckFailedException') {
@@ -210,5 +268,34 @@ async function recordPoolHighWater(input: {
       && current.thresholdMicroUsd > input.thresholdMicroUsd
       ? current
       : ours;
+  }
+}
+
+/**
+ * Record what an admission was measured against in the owner's `admittedMonths` — only when it raises the
+ * month's cap or plan pool, lowers its markup, or starts the month (otherwise no write). Conditional on
+ * the list being the one this check read, so concurrent writers cannot drop each other's update. Never
+ * fails the check: a lost race means another writer changed the list (the next admission re-reads and
+ * re-applies), and a failed write only ever leaves a month billed for less, or not at all.
+ */
+async function recordPaygAdmission(input: {
+  billingUserId: string;
+  account: PaygOverageSettings;
+  seen: PaygAdmittedMonth;
+}): Promise<void> {
+  const stored = input.account.admittedMonths;
+  const next = withPaygAdmission(stored, input.seen);
+  if (!next) return;
+  const names = { '#payg': 'paygOverage', '#admitted': 'admittedMonths' };
+  try {
+    await userDb.updateUser(input.billingUserId, {}, {
+      pathSets: [{ path: ['paygOverage', 'admittedMonths'], value: next }],
+      condition: Array.isArray(stored)
+        ? { expression: 'attribute_exists(#payg) AND #payg.#admitted = :expected', names, values: { ':expected': stored } }
+        : { expression: 'attribute_exists(#payg) AND attribute_not_exists(#payg.#admitted)', names },
+    });
+  } catch (error: unknown) {
+    if ((error as { code?: unknown } | null)?.code === 'ConditionalCheckFailedException') return;
+    console.error(`[paygOverage] Failed to record the PAYG admission for ${input.billingUserId}:`, error instanceof Error ? error.message : error);
   }
 }
