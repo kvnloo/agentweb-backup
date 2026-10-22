@@ -123,6 +123,10 @@ recorded and `mayGate` stays false. The judge may report `task_success` as advis
 human to adjudicate the cases where the labels disagree. Evidence: [ENG-2591](https://linear.app/emmabyaw/issue/ENG-2591/agent-task-success-grader-stop-trusting-step-checkmarks-kappa-020-in#comment-ea8be576).
 20 of the 80 work-plan golden cases were empty sessions: predefined work plans opened and never used. ENG-2608 excludes them (`excluded.reason = empty_session`) and the seeder now skips sessions never updated after creation.
 
+A provider can fail partway through a judge or labeller reply and still answer HTTP 200, with
+`finish_reason: "error"` and no content. Bedrock did this on a 2026-10-22 rerun. Such a reply, or an empty one, is retried up to
+twice; if every attempt fails, the case errors as a provider error, not as "no JSON" (ENG-2620).
+
 ## Instruction adherence and escalation (ENG-2189)
 
 Three more deterministic graders in `loops/eval/agentGraders.ts` read each user turn and the

@@ -165,6 +165,50 @@ describe('judgeTaskSuccess', () => {
     expect(await judgeTaskSuccess({ trace: emailRun() }, { llm })).toMatchObject({ status: 'error', reason: 'LLM call failed: timeout' });
   });
 
+  it('retries a reply the provider ended in an error or left empty, then judges the retry (ENG-2620)', async () => {
+    const replies = [
+      { text: '', finishReason: 'error', usage: { inputTokens: 100, outputTokens: 69 } },
+      { text: '   ', finishReason: 'stop', usage: { inputTokens: 100, outputTokens: 0 } },
+      { text: '{"reason":"The email never went out.","verdict":"fail"}', finishReason: 'stop', usage: { inputTokens: 100, outputTokens: 20 } },
+    ];
+    let calls = 0;
+    const llm: RubricJudgeLlm = { complete: async () => replies[calls++] };
+    expect(await judgeTaskSuccess({ trace: emailRun() }, { llm })).toMatchObject({ status: 'ok', verdict: 'fail' });
+    expect(calls).toBe(3);
+  });
+
+  it('names the provider error, not missing JSON, when every attempt ends in one (ENG-2620)', async () => {
+    let calls = 0;
+    const llm: RubricJudgeLlm = { complete: async () => (calls++, { text: '', finishReason: 'error', usage: { inputTokens: 100, outputTokens: 69 } }) };
+    const result = await judgeTaskSuccess({ trace: emailRun() }, { llm });
+    expect(result).toMatchObject({ status: 'error', reason: 'the provider ended the reply with an error on all 3 attempts' });
+    expect(calls).toBe(3);
+  });
+
+  it('counts each kind of provider failure when the attempts fail differently (ENG-2620)', async () => {
+    const replies = [
+      { text: '', finishReason: 'error' },
+      { text: '', finishReason: 'error' },
+      { text: '', finishReason: 'stop' },
+    ];
+    let calls = 0;
+    const llm: RubricJudgeLlm = { complete: async () => replies[calls++] };
+    expect(await judgeTaskSuccess({ trace: emailRun() }, { llm })).toMatchObject({
+      status: 'error',
+      reason: 'the provider failed on all 3 attempts: 2 ended the reply with an error, 1 returned an empty reply',
+    });
+  });
+
+  it('does not retry an unparseable reply that finished normally, or a call that throws (ENG-2620)', async () => {
+    let calls = 0;
+    const prose: RubricJudgeLlm = { complete: async () => (calls++, { text: 'I cannot decide.', finishReason: 'stop' }) };
+    expect(await judgeTaskSuccess({ trace: emailRun() }, { llm: prose })).toMatchObject({ status: 'error', reason: 'no JSON object with a verdict in the judge output' });
+    expect(calls).toBe(1);
+    const throwing: RubricJudgeLlm = { complete: async () => { calls++; throw new Error('400 Provider returned error'); } };
+    await judgeTaskSuccess({ trace: emailRun() }, { llm: throwing });
+    expect(calls).toBe(2);
+  });
+
   it('refuses any judge that is not a registered Claude model', async () => {
     const llm = fakeLlm('{"reason":"x","verdict":"pass"}');
     for (const model of ['gemini-3.8-flash', 'google/gemini-3.5-flash', 'openai/gpt-5.2', 'gpt-5-chat-2', 'deepseek/deepseek-v4', 'not-a-model']) {
