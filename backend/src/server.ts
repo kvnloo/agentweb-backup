@@ -1115,6 +1115,35 @@ createTestAccount().then(async () => {
         console.error('[orgSeatCreditGrantCron] Failed to initialize:', error);
       }
 
+      // Hot-lead call number rent (ENG-2614) — daily sweep that meters the current
+      // month's rent of every org's caller number. Anchored to a fixed UTC hour
+      // (a bare 24h setInterval never elapses with redeploys every 1-2 hours); the
+      // month-scoped idempotency key makes any extra fire a safe no-op. Switch off
+      // with HOT_LEAD_CALL_RENT_METERING=false.
+      try {
+        const { runNumberRentCron } = await import('./cron/numberRentCron');
+        const { msUntilNextUtcHour } = await import('./utils/dailySchedule');
+        const NUMBER_RENT_HOUR_UTC = 11;
+        const DAY_MS = 24 * 60 * 60 * 1000;
+        const msUntilFirstNumberRentRun = msUntilNextUtcHour(NUMBER_RENT_HOUR_UTC);
+        setTimeout(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('numberRentCron', runNumberRentCron())
+            .catch(e => console.error('[numberRentCron] Error:', e));
+          setInterval(() => {
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('numberRentCron', runNumberRentCron())
+              .catch(e => console.error('[numberRentCron] Error:', e));
+          }, DAY_MS);
+        }, msUntilFirstNumberRentRun);
+        console.log(
+          `[numberRentCron] Initialized — first run at ${NUMBER_RENT_HOUR_UTC}:00 UTC ` +
+          `(in ${Math.round(msUntilFirstNumberRentRun / 60000)} min)`,
+        );
+      } catch (error) {
+        console.error('[numberRentCron] Failed to initialize:', error);
+      }
+
       // Pre-Renewal Ad-Integration Health Check (ENG-1270) — runs daily.
       // Charging a customer while their ad platform connection is silently dead
       // is a trust break (ThinkingAI, TransAmerica — Aug 2026 audit, both caught
