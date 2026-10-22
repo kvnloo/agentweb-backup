@@ -1,4 +1,5 @@
 import { metaWriteRateShaper, META_BUDGET_THROTTLE_SUBCODE } from './agentMode/metaWriteRateShaper';
+import { normalizeSkillIdArg } from './agentMode/skillIdArg';
 import { applyProviderPolicy, CompareProviderPolicy } from './agentMode/compareProviderPolicy';
 import { classifyMetaBudgetChange } from './agentMode/metaBudgetAnomaly';
 import { deriveDominanceLegacyIds } from './agentMode/modelSupersession';
@@ -41,6 +42,7 @@ import {
   buildImageSwapNotReflected, judgeImageSwap, readCreativeImage, selectSwapImageHash,
   type CreativeImageReadback, type ImageSwapExpectation, type ImageSwapVerdict,
 } from './agentMode/metaImageSwapCheck';
+import { buildUnappliedFieldsMessage, findUnappliedCreativeFields } from './agentMode/metaCreativeFieldsCheck';
 import { readAdmittedAuthorization } from '../utils/scheduledPublishConsentGuard';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
 import { createCrmEvidenceCollector, crmEvidenceFromEarlierInvocations, crmNumbersFromSessionHistory, runCrmFreshnessShadow, serializeCrmEvidence } from '../utils/crmFreshnessGuard';
@@ -87,6 +89,7 @@ import { reconcileUnconsumedCursors, ROW_KEYS as LEDGER_ROW_KEYS } from './agent
 import { reconcileModelReassessAck, findLastAssistantModel } from '../utils/modelReassessRequest';
 import { reconcileModelMentionAck, buildModelMentionIndex, type ModelMentionIndex } from '../utils/modelMentionRequest';
 import { resolveTurnModelCorrection } from '../utils/modelCorrectionStamp';
+import type { MessageModelRouting } from './agentMode/agentWebModelRouter';
 import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
 // ENG-2103 (F2, Pattern A): resolveOrgProfileField's only 5 callers
 // (readBrandGuidelines/readMarketStrategy and friends) moved to
@@ -137,6 +140,7 @@ import { startWorkflow, advanceIndependentWorkflow, type AdvanceIndependentOutco
 // dependency back on this file (verified), so this is a one-directional
 // import, not a cycle.
 import { approvalInboxService, type ApprovalDecision, type ApprovalDecisionApprover } from './approvalInboxService';
+import { getDefaultApproverForGate } from './approverDirectory';
 // Review fix: the manifest executor below needs the same active-resume
 // primitive approvalInboxExecution.ts already built for the per-decision
 // path — resumeOriginSession is exported from there specifically so this
@@ -268,6 +272,7 @@ import * as twitterImpl from '../emma/impl/twitter';
 // ENG-2103 (F2): Meta/LinkedIn ads APIs tool cluster, same treatment as leadsImpl above.
 import * as adsApisImpl from '../emma/impl/adsApis';
 import { buildToolkitObjectiveGate, readBackMetaNode } from './agentMode/metaToolkitSeams';
+import { PAUSED_BUNDLE_ACTION, PausedMetaBundle, parsePausedMetaBundle, pausedBundleSummary, executePausedMetaBundle, assertPausedBundleUserCount, preflightPausedMetaCreatives } from './agentMode/metaPausedBundle';
 // ENG-2103 (F2): Google Ads + HubSpot/Attio CRM passthrough tool cluster,
 // same treatment as leadsImpl above.
 import * as adsCrmApisImpl from '../emma/impl/adsCrmApis';
@@ -335,6 +340,7 @@ const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
  * files, not decoration — change it in both or in neither.
  */
 export const SKILL_UNRESOLVED_MARKER = "Could not resolve these skill IDs to any known skill";
+
 /*
  * The skill exists and the account is entitled to it, but nothing is installable behind it
  * right now — in practice an `__other_skills__` bundle whose unassociated-tool pool is empty.
@@ -361,7 +367,7 @@ const SKILL_NO_SUBSTITUTION =
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
 // mutation tool remains manage_predefined_work_plan.
-export const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'get_session_transcript', 'get_user_by_id', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
+export const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_user_funnel_status', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'get_session_transcript', 'get_user_by_id', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -582,6 +588,7 @@ type ApprovalDeckExecutionSummary = {
     stepId: string;
     status: 'verified' | 'failed';
     appliedObjectId?: string;
+    bundle?: { requested_ad_count: number; verified_ad_count: number; ledger: unknown[] };
     error?: string;
     mismatches?: Array<{ parameter: string; requested: unknown; applied: unknown }>;
   }>;
@@ -1738,6 +1745,7 @@ export class AgentModeService {
         await import('../emma/testAccountTools');
         await import('../emma/navigateTools');
         await import('../emma/connectAccountTool');
+        await import('../emma/linkedInAccountRevokeTools');
         await import('../emma/solveRecaptchaTool');
         await import('../emma/siteSigninTools');
         await import('../emma/verificationCodeTool');
@@ -3030,6 +3038,9 @@ export class AgentModeService {
     // false/undefined otherwise); every other caller of generateMarketingResponse
     // is an attended interactive path and leaves this undefined.
     isUnattendedRun?: boolean,
+    // ENG-669 PR-C: set when `llmModel` was routed by the AgentWeb Model (the selection, the table rule and version).
+    // Stamped on this turn's assistant messages beside `llm`, like the ENG-1205 correction.
+    modelRouting?: MessageModelRouting,
   ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; truncatedByStepBudget?: boolean; truncatedByTimeBudget?: boolean; persistedResponseCount?: number; workPlanTurnDisposition?: WorkPlanTurnDisposition; pendingApprovalDeck?: PendingApprovalDeck }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
@@ -4213,6 +4224,8 @@ export class AgentModeService {
 
         // Add LLM model to the response message
         responseMessage.llm = llmModel;
+        // ENG-669 PR-C: and, when the AgentWeb Model chose it, the selection and why.
+        if (modelRouting) Object.assign(responseMessage, modelRouting);
         // ENG-1205: and, when the model that ran is not the one that was asked
         // for, what was asked for — `llm` alone cannot distinguish "you picked
         // this" from "you were given this".
@@ -4927,6 +4940,7 @@ export class AgentModeService {
               role: 'assistant',
               content: staged.turnMessage,
               llm: llmModel,
+              ...modelRouting,
               metadata: { timestamp: new Date().toISOString(), awaitingUserConfirmation: true, approvalInboxManifestId: staged.manifestId },
             });
             if (onProgress) {
@@ -4973,6 +4987,7 @@ export class AgentModeService {
               role: 'assistant',
               content: deckPrompt,
               llm: llmModel,
+              ...modelRouting,
               // ENG-1635/1644 Phase B: no tool-call result carries the deck's data (unlike
               // ask_user_question, this halt is pushed as plain content) — this is the only
               // correlator the frontend has to know THIS message should render the
@@ -5010,6 +5025,7 @@ export class AgentModeService {
             role: 'assistant',
             content: confirmationPrompt,
             llm: llmModel,
+            ...modelRouting,
             metadata: { timestamp: new Date().toISOString(), awaitingUserConfirmation: true }
           });
           if (onProgress) {
@@ -5393,6 +5409,7 @@ export class AgentModeService {
             role: 'assistant',
             content,
             llm: llmModel,
+            ...modelRouting,
             metadata: { timestamp: new Date().toISOString() },
           });
         }
@@ -6457,6 +6474,9 @@ export class AgentModeService {
     'get_lead_lists',         // Lead management teaser
     'list_connected_accounts', // Social/ads integration teaser
     'connect_account',        // Read-only UI handoff when a required account is absent
+    // LinkedIn Outreach self-service (ENG-1153): caller-scoped inspect + confirm-gated revoke.
+    'inspect_linkedin_account',
+    'revoke_linkedin_account',
 
     'get_user_profile',         // Account info teaser
     'get_account_status',       // Self account status (plan, usage, api-key count) — wraps /api/auth/me, no args
@@ -6472,6 +6492,12 @@ export class AgentModeService {
     // Org notification preferences use the same org-settings authorization.
     'get_lead_notification_settings',
     'update_lead_notification_settings',
+    'get_hot_lead_call_settings',
+    'update_hot_lead_call_settings',
+    'provision_hot_lead_call_number',
+    'release_hot_lead_call_number',
+    'start_hot_lead_call_verification',
+    'confirm_hot_lead_call_verification',
 
     // Scheduled Chat Management
     'list_scheduled_chats',
@@ -6548,6 +6574,10 @@ export class AgentModeService {
     // only asks the current page to open the existing OAuth dialog; it does not
     // grant consent or connect an account by itself.
     'connect_account',
+    // LinkedIn Outreach inspect/revoke (ENG-1153) must survive a stale DB
+    // foundation_tools override, otherwise chat cannot reach them at all.
+    'inspect_linkedin_account',
+    'revoke_linkedin_account',
     // S3 overflow retrieval is infrastructure, not a skill: whenever a tool result
     // is offloaded to S3 the model is handed a "[Full response stored at S3 key: ...]"
     // pointer and MUST be able to resolve it. A DB `foundation_tools` setting that
@@ -7152,6 +7182,8 @@ export class AgentModeService {
       if (!Array.isArray(skillIds) || skillIds.length === 0 || skillIds.some((id) => typeof id !== 'string')) {
         return { success: false, message: "skillIds must be a non-empty array of skill IDs." };
       }
+      // ENG-2612: models copy the catalog display line ("<uuid>- Skill Name") as the id.
+      skillIds = [...new Set(skillIds.map(normalizeSkillIdArg))];
 
       const availableSkills = await this.getSkillsForDisplay([], userId);
       const availableById = new Map(availableSkills.map(skill => [skill.skillId, skill]));
@@ -10492,7 +10524,7 @@ export class AgentModeService {
 
   public async attachKnowledgeBaseFiles(
     taskId: string,
-    files: Array<{ name: string; content: string }>,
+    files: unknown,
     userId: string,
     sessionId: string
   ): Promise<any> {
@@ -11676,6 +11708,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           link_url: newLinkUrl || vd.call_to_action?.value?.link || '',
           call_to_action_type: params.call_to_action_type || vd.call_to_action?.type,
           url_tags: carriedUrlTags,
+          ...AgentModeService.carriedCreativeFields(existingSpec, params),
         };
       } else if (existingSpec.link_data?.child_attachments) {
         const ld = existingSpec.link_data;
@@ -11705,6 +11738,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           carousel_cards: updatedCards,
           call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
           url_tags: carriedUrlTags,
+          ...AgentModeService.carriedCreativeFields(existingSpec, params),
         };
       } else if (existingSpec.link_data) {
         const ld = existingSpec.link_data;
@@ -11725,6 +11759,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           link_url: newLinkUrl || ld.link || '',
           call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
           url_tags: carriedUrlTags,
+          ...AgentModeService.carriedCreativeFields(existingSpec, params),
         };
       } else {
         return {
@@ -12669,6 +12704,28 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   }
 
   /**
+   * ENG-2609: link description + Instagram identity of an existing creative, for rebuilding it
+   * (COPY_AD / swap). Carousels are skipped for description: they have no creative-level slot.
+   * `assetFeedSpec` is passed only when rebuilding a placement_assets creative, whose description
+   * lives in asset_feed_spec.descriptions rather than link_data / video_data.
+   */
+  private static carriedCreativeFields(
+    spec: any,
+    params: { description?: string; instagram_user_id?: string },
+    assetFeedSpec?: any,
+  ): { description?: string; instagram_user_id?: string } {
+    const carousel = !!spec?.link_data?.child_attachments;
+    const description = params.description
+      ?? (assetFeedSpec ? assetFeedSpec.descriptions?.[0]?.text : undefined)
+      ?? (carousel ? undefined : (spec?.video_data ? spec.video_data.link_description : spec?.link_data?.description));
+    const instagramUserId = params.instagram_user_id ?? spec?.instagram_user_id;
+    return {
+      ...(description ? { description } : {}),
+      ...(instagramUserId ? { instagram_user_id: instagramUserId } : {}),
+    };
+  }
+
+  /**
    * When a placement_assets creative serves Instagram placements, Meta requires
    * object_story_spec.instagram_user_id (else attaching it to an ad fails with subcode 1772103).
    * Resolve it from the Page if the caller didn't supply one.
@@ -12716,15 +12773,44 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       resolvedParams = await this.resolvePlacementAssetHashes(userId, resolvedParams, params.account_id);
       // IG placements require an instagram_user_id in object_story_spec — auto-resolve from the Page.
       resolvedParams = await this.resolvePlacementInstagramActor(resolvedParams, accessToken);
-      const creative = await metaService.createAdCreative(accountId, accessToken, resolvedParams);
+      const created = await metaService.createAdCreative(accountId, accessToken, resolvedParams);
+      // Meta's create response carries only the id; keep the name we sent so messages don't say "undefined".
+      const creative = created ? { ...created, name: created.name ?? resolvedParams.name } : created;
       // ENG-2141: link the generated images this creative uses to it (inert unless enabled).
       if (creative?.id) {
         void stampMetaCreativeCreated({ userId, accountId, metaCreativeId: String(creative.id), params: resolvedParams });
       }
 
+      // ENG-2596: a 200 doesn't prove Meta stored the IG identity / link description — read back.
+      // Only a caller-supplied IG id is checked: one auto-resolved for placement creatives was not asked for.
+      const requestedFields = { ...resolvedParams, instagram_user_id: params.instagram_user_id };
+      let unappliedFields: string[] = [];
+      let readbackUnavailable = false;
+      if (creative?.id && (requestedFields.instagram_user_id || requestedFields.description)) {
+        try {
+          const live = await metaService.getAdCreative(accessToken, String(creative.id));
+          unappliedFields = findUnappliedCreativeFields(requestedFields, live);
+        } catch (err: unknown) {
+          readbackUnavailable = true;
+          console.warn(`AgentMode: creative field read-back failed for ${creative.id}:`,
+            err instanceof Error ? err.message : err);
+        }
+      }
+      if (unappliedFields.length > 0) {
+        return {
+          success: true,
+          verified: false,
+          unapplied_fields: unappliedFields,
+          message: buildUnappliedFieldsMessage(creative, requestedFields, unappliedFields),
+          creative: creative
+        };
+      }
+
       return {
         success: true,
-        message: `Ad creative "${creative.name}" created successfully`,
+        message: `Ad creative "${creative.name}" created successfully` +
+          (readbackUnavailable ? ' (could not read it back to confirm description / instagram_user_id were stored)' : ''),
+        ...(readbackUnavailable ? { readback_unavailable: true } : {}),
         creative: creative
       };
     } catch (error: any) {
@@ -12970,7 +13056,29 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   // silently drops it (see updateAd's params typing), so a UTM-only retag
   // (ENG-239 retrofit, agentModeService.retagMetaAdUtm) must also go through
   // the swap path. carriedUrlTags below already forwards it correctly.
-  private static CREATIVE_CONTENT_KEYS = ['link_url', 'destination', 'url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'call_to_action_type', 'placement_assets', 'url_tags'];
+  private static CREATIVE_CONTENT_KEYS = ['link_url', 'destination', 'url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'call_to_action_type', 'placement_assets', 'url_tags', 'description', 'instagram_user_id'];
+
+  /**
+   * A just-created placement-customized creative cannot be attached for ~20-30s: Meta answers
+   * 1772103 "Instagram Account Is Missing" until it has processed it (measured live, ENG-2623).
+   * Retry only that error; any other failure, or running out of attempts, is thrown as before.
+   * The backoff is 30s because Meta also allows only one update per ad per 30s (#613).
+   */
+  private async attachCreativeWhenReady(accessToken: string, adId: string, creativeId: string, accountId: string): Promise<void> {
+    const MAX_ATTEMPTS = 3;
+    const BACKOFF_MS = 30_000;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await metaService.updateAd(accessToken, adId, { creative: { creative_id: creativeId } }, accountId);
+        return;
+      } catch (err: any) {
+        const subcode = Number(err?.structuredError?.error_subcode ?? err?.response?.error?.error_subcode);
+        if (subcode !== 1772103 || attempt >= MAX_ATTEMPTS) throw err;
+        console.log(`AgentMode: creative ${creativeId} not yet attachable to ad ${adId} (1772103, attempt ${attempt}/${MAX_ATTEMPTS}). Retrying in ${BACKOFF_MS}ms.`);
+        await this.sleep(BACKOFF_MS);
+      }
+    }
+  }
 
   public async updateMetaAdsAd(userId: string, adId: string, params: any, account_id?: string): Promise<any> {
     try {
@@ -13112,15 +13220,18 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       // creative. Copy/link/CTA carry over from the existing creative unless overridden.
       const ld = existingSpec.link_data || {};
       const vd = existingSpec.video_data || {};
+      // A placement-customized source has no link_data / video_data: its copy lives in asset_feed_spec.
+      const afs = creativeData.asset_feed_spec || {};
       newCreativeParams = {
         name: params.name || `${creativeData.name || 'Creative'} (placement-customized)`,
         page_id: pageId,
         placement_assets: params.placement_assets,
-        body: params.body || ld.message || vd.message || creativeData.body || '',
-        title: params.title || ld.name || vd.title || creativeData.title || '',
-        link_url: newLinkUrl || ld.link || vd.call_to_action?.value?.link || '',
-        call_to_action_type: params.call_to_action_type || ld.call_to_action?.type || vd.call_to_action?.type,
+        body: params.body || ld.message || vd.message || afs.bodies?.[0]?.text || creativeData.body || '',
+        title: params.title || ld.name || vd.title || afs.titles?.[0]?.text || creativeData.title || '',
+        link_url: newLinkUrl || ld.link || vd.call_to_action?.value?.link || afs.link_urls?.[0]?.website_url || '',
+        call_to_action_type: params.call_to_action_type || ld.call_to_action?.type || vd.call_to_action?.type || afs.call_to_action_types?.[0],
         url_tags: carriedUrlTags,
+        ...AgentModeService.carriedCreativeFields(existingSpec, params, creativeData.asset_feed_spec),
       };
     } else if (existingSpec.video_data) {
       // Video creative
@@ -13137,6 +13248,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         link_url: newLinkUrl || vd.call_to_action?.value?.link || '',
         call_to_action_type: params.call_to_action_type || vd.call_to_action?.type,
         url_tags: carriedUrlTags,
+        ...AgentModeService.carriedCreativeFields(existingSpec, params),
       };
       if (params.image_hash || params.image_url) {
         imageSwap = { oldHash: vd.image_hash, oldUrl: vd.image_url, requestedHash: params.image_hash, requestedUrl: params.image_url };
@@ -13144,6 +13256,15 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     } else if (existingSpec.link_data?.child_attachments) {
       // Carousel creative – update the main link and optionally per-card links
       const ld = existingSpec.link_data;
+      // A carousel has no creative-level description slot, so a swap could not apply it: refuse
+      // before creating a replacement creative that would silently leave the cards unchanged.
+      if (params.description) {
+        return {
+          success: false,
+          message: 'Carousel creatives have no creative-level description, so it cannot be updated here. Put per-card text in carousel_cards[].description instead.',
+          error: 'CAROUSEL_DESCRIPTION_UNSUPPORTED'
+        };
+      }
       const updatedCards = ld.child_attachments.map((card: any) => ({
         image_hash: card.image_hash,
         image_url: card.picture || card.image_url,
@@ -13161,6 +13282,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         carousel_cards: updatedCards,
         call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
         url_tags: carriedUrlTags,
+        ...AgentModeService.carriedCreativeFields(existingSpec, params),
       };
     } else if (existingSpec.link_data) {
       // Single image creative
@@ -13176,6 +13298,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         link_url: newLinkUrl || ld.link || '',
         call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
         url_tags: carriedUrlTags,
+        ...AgentModeService.carriedCreativeFields(existingSpec, params),
       };
       if (params.image_hash || params.image_url) {
         imageSwap = {
@@ -13253,7 +13376,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     let verification: Awaited<ReturnType<AgentModeService['verifyCreativeSwap']>> | undefined;
 
     for (let attempt = 1; attempt <= SWAP_VERIFY_ATTEMPTS; attempt++) {
-      await metaService.updateAd(accessToken, adId, { creative: { creative_id: newCreativeId } }, accountId);
+      await this.attachCreativeWhenReady(accessToken, adId, newCreativeId, accountId);
       verification = await this.verifyCreativeSwap(accessToken, adId, newCreativeId, accountId, newLinkUrl);
 
       const destinationOk = !newLinkUrl || !verification.liveLinkUrl
@@ -13801,7 +13924,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
    * they don't publish to a campaign or destroy anything.
    */
   private static META_WRITE_ACTIONS: Record<string, string[]> = {
-    CAMPAIGN: ['CREATE', 'UPDATE', 'DELETE'],
+    CAMPAIGN: ['CREATE', 'UPDATE', 'DELETE', PAUSED_BUNDLE_ACTION],
     AD_SET: ['CREATE', 'UPDATE', 'DELETE'],
     AD: ['CREATE', 'UPDATE', 'DELETE', 'COPY_AD', 'RETAG_UTM'],
     // Account-level assets. CREATE publishes a creative; UPLOAD_USERS pushes PII
@@ -13911,6 +14034,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
     );
     const session = await chatbotDb.getChatSession(sessionId);
+    if (action === PAUSED_BUNDLE_ACTION && session?.userId !== userId) return { granted: false, digest, reason: 'not_approved' };
     // Session already recorded this exact digest consumed — a repeat of the
     // same call re-confirms rather than executing again (acceptance
     // criterion 3).
@@ -13933,6 +14057,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     // which IS the deck that was just answered.
     const outcome = findApprovalDeckAnswerForDigest(grantSourceDeck ?? session?.pendingApprovalDeck, digest);
     if (!outcome.granted) return { granted: false, digest, reason: 'not_approved' };
+    if (action === PAUSED_BUNDLE_ACTION && outcome.answer.answeredBy !== 'user') return { granted: false, digest, reason: 'not_approved' };
     const granted = await chatbotDb.claimMetaWriteManifestDigest(sessionId, digest);
     return granted ? { granted: true, digest } : { granted: false, digest, reason: 'already_consumed' };
   }
@@ -14065,24 +14190,44 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     sessionId: string,
     writeHalts: any[],
   ): Promise<{ manifestId: string; turnMessage: string } | null> {
-    const manifestId = uuidv4();
+    // One packet PER AD ACCOUNT: the Desk groups packets under an account and one Approve All
+    // dispatches a whole packet, so a single iteration that writes to two ad accounts must not
+    // become one packet shown under only the first account.
+    const manifestByAccount = new Map<string, string>();
+    const manifestFor = (r: any): string => {
+      const key = String(r?.metaWriteDispatch?.resolvedAccountId || r?.target?.account_id || r?.metaWriteDispatch?.account_id || 'unknown').replace(/^act_/, '');
+      if (!manifestByAccount.has(key)) manifestByAccount.set(key, uuidv4());
+      return manifestByAccount.get(key)!;
+    };
+    const manifestId = manifestFor(writeHalts[0]);
     // Same default window stage_pending_decision uses for a team decision —
     // one consistent "how long before this goes stale" answer across every
     // producer of this table.
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
 
+    // ENG-1853 follow-up: unlike the plan_choice producer (ask_user_question, which lets
+    // the model supply an explicit chat_url), this path never gave a reviewer any way
+    // back to the conversation that proposed a real Meta write — evidencePacket only
+    // ever carried researchSummary. sessionId is already a parameter here; the same
+    // ${CUSTOMER_FRONTEND_URL}/agent-mode/${sessionId} link agentModeController.ts
+    // already uses elsewhere for "go back to this session" is trivial to attach.
+    const chatUrl = `${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/agent-mode/${sessionId}`;
     const settled = await Promise.allSettled(
       writeHalts.map((r) =>
         approvalInboxService.createDecision({
           gateType: 'meta_write',
-          approver: 'matt',
+          approver: getDefaultApproverForGate('meta_write'),
           subjectLabel: `Meta Ads · Account ${r?.target?.account_id || r?.metaWriteDispatch?.account_id || 'unknown'}`,
           businessImpact: r?.confirmationDetail || r?.confirmationPrompt || r?.summary || 'A Meta Ads change is waiting for review.',
-          evidencePacket: { researchSummary: r?.summary },
+          // No separate researchSummary here: confirmationDetail (above) IS r.summary, so
+          // setting evidencePacket.researchSummary to r.summary as well rendered the exact
+          // same sentence twice on the card. There's no separate agent-authored rationale
+          // captured at this halt point to put here instead.
+          evidencePacket: { chatUrl },
           metaWriteManifestDigest: r.metaWriteManifestDigest,
           metaWriteDispatch: r.metaWriteDispatch,
           originSessionId: sessionId,
-          manifestId,
+          manifestId: manifestFor(r),
           expiresAt,
         }),
       ),
@@ -14120,7 +14265,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     // honestly rather than assuming uniformity.
     const manifestIds = [...new Set(staged.map((d) => d.manifestId))];
     const reportedManifestId = manifestIds.length === 1 ? manifestIds[0] : manifestId;
-    if (manifestIds.length > 1) {
+    // More than one manifest is EXPECTED when the batch spans several ad accounts (one packet per
+    // account); it is only suspicious when it exceeds that, i.e. pre-existing idempotent hits.
+    if (manifestIds.length > manifestByAccount.size) {
       // Second-review fix: this genuinely CAN'T be made fully correct
       // without a return-contract change (multiple real manifestIds, no
       // single one actually contains every staged decision) — nothing
@@ -14137,7 +14284,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     return {
       manifestId: reportedManifestId,
       turnMessage:
-        count === 1
+        manifestIds.length > 1
+          ? `These ${count} changes span ${manifestIds.length} ad accounts, so they were queued as ${manifestIds.length} separate packets (one per account) for the assigned approver in the Approval Desk. I'll resume automatically as each is resolved.`
+          : count === 1
           ? `This change needs review before it runs — queued for the assigned approver in the Approval Desk. I'll resume automatically once it's resolved.`
           : `This packet of ${count} change${count === 1 ? '' : 's'} needs review before ${count === 1 ? 'it runs' : 'they run'} — queued for the assigned approver in the Approval Desk. I'll resume automatically once it's resolved.`,
     };
@@ -14311,6 +14460,11 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
 
     const target: Record<string, any> = { entity_type, action, account_id: scopeAccountId };
     const lines: string[] = [];
+    // The entity being UPDATED (never set on a CREATE) — already fetched in full by
+    // resolveCampaign/resolveAdSet/resolveAd below for its .name, but every other field
+    // on it (current daily_budget, current status, ...) was being thrown away. Kept here
+    // so the Changes: line below can show what's actually changing, not just which keys.
+    let currentEntity: any;
 
     /*
      * Best-effort resolvers — each guarded so a Meta lookup failure never blocks the gate.
@@ -14380,6 +14534,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         lines.push(`Create a NEW campaign "${params.name}" (objective: ${params.objective || 'unspecified'}) in ad account ${scopeAccountId}.`);
       } else {
         const campaign = await resolveCampaign(campaign_id);
+        currentEntity = campaign;
         target.campaign = nameOf(campaign, campaign_id);
         target.campaign_id = campaign_id;
         lines.push(`${action} campaign ${target.campaign} in ad account ${scopeAccountId}.`);
@@ -14392,6 +14547,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         lines.push(`Create a NEW ad set "${params.name}" UNDER campaign ${target.campaign} (ad account ${scopeAccountId}).`);
       } else {
         const adSet = await resolveAdSet(ad_set_id);
+        currentEntity = adSet;
         const campaign = await resolveCampaign(adSet?.campaign_id);
         target.ad_set = nameOf(adSet, ad_set_id);
         target.campaign = campaign ? nameOf(campaign, adSet?.campaign_id) : undefined;
@@ -14425,6 +14581,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           + `which RESETS THE AD'S LEARNING PHASE and can hurt performance on a live client campaign.`);
       } else {
         const ad = await resolveAd(ad_id);
+        currentEntity = ad;
         const adSet = await resolveAdSet(ad?.adset_id);
         const campaign = await resolveCampaign(ad?.campaign_id);
         target.ad = nameOf(ad, ad_id);
@@ -14452,13 +14609,77 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     }
 
     // Surface content/destination changes so the user can catch a wrong-asset edit.
+    // Review fix (ENG-1853 follow-up): this used to list only the changed field NAMES
+    // ("Changes: daily_budget.") with neither the current nor the proposed value — a
+    // reviewer approving a real budget/status change had no way to tell $60→$110 from
+    // $6,000→$11,000 without leaving the page. currentEntity (already fetched above
+    // for its .name, previously discarded) supplies the "before" side; params supplies
+    // the "after" side — both were already right here.
+    // Every agent money input is in MAJOR units of the ad account's currency (ENG-2277:
+    // normalizeMetaMoneyParams) and Meta reports the current value in MINOR units as a numeric
+    // STRING ("3000"). Both sides go through the same normalizeMetaMoney the writers use, so the
+    // card shows exactly the amount that will be submitted — "daily_budget: 3000 (= $30.00) →
+    // 310000 (= $3,100.00)" — including for zero-decimal currencies. If the account currency
+    // can't be read, the raw value is shown and flagged rather than guessed.
+    const MONEY_KEYS = new Set(['daily_budget', 'lifetime_budget', 'bid_amount', 'budget_amount', 'spend_cap']);
+    let accountCurrency: string | undefined;
+    if (accessToken && [...MONEY_KEYS].some((k) => params?.[k] !== undefined)) {
+      // Bounded: this runs on the halt path, and a stalled Graph read must not hold the approval card up.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        accountCurrency = await Promise.race([
+          metaService.getAdAccountCurrency(scopeAccountId, accessToken),
+          new Promise<undefined>((resolve) => { timer = setTimeout(() => resolve(undefined), 5000); }),
+        ]);
+      } catch { /* shown as unverified below */ } finally { if (timer) clearTimeout(timer); }
+    }
+    let currencyUnverified = false;
+    const money = (value: any, unit: 'major' | 'minor'): string => {
+      try {
+        // Only Meta's own read-back ("3000") is a numeric string; the writers reject a string
+        // PROPOSAL, so the card must not quietly accept one.
+        const n = unit === 'minor' && typeof value === 'string' && /^\d+(\.\d+)?$/.test(value) ? Number(value) : value;
+        return normalizeMetaMoney(n, accountCurrency, unit).description;
+      } catch {
+        currencyUnverified = true;
+        return `${String(value)} (${unit} units, currency unverified)`;
+      }
+    };
+    const formatChange = (key: string, value: any, side: 'before' | 'after'): string => {
+      if (value === undefined || value === null) return 'unset';
+      const text = MONEY_KEYS.has(key) ? money(value, side === 'before' ? 'minor' : 'major')
+        : value !== null && typeof value === 'object' ? JSON.stringify(value) : String(value);
+      // Long copy and object-valued fields (placement_assets, adset_schedule) must not flood the card.
+      return text.length > 160 ? `${text.slice(0, 157)}...` : text;
+    };
     const contentChanges: Record<string, any> = {};
-    for (const key of ['link_url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'status', 'daily_budget', 'lifetime_budget', 'creative_id', 'placement_assets', 'adset_schedule', 'pacing_type']) {
-      if (params[key] !== undefined) contentChanges[key] = params[key];
+    const changeDescriptions: string[] = [];
+    // A rename is a real change a reviewer must see; on CREATE the name is already in the summary line.
+    const changeKeys = ['link_url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'status', 'daily_budget', 'lifetime_budget', 'budget_amount', 'bid_amount', 'spend_cap', 'creative_id', 'placement_assets', 'adset_schedule', 'pacing_type'];
+    if (action !== 'CREATE') changeKeys.unshift('name');
+    // Everything else the write will send must be visible too (targeting, start/end time, bid
+    // strategy, …) — a card that lists only a fixed allowlist lets a reviewer approve fields they
+    // never saw. Internal control params (override/confirmation tokens) are not Meta fields.
+    for (const key of Object.keys(params || {})) {
+      if (changeKeys.includes(key) || (action === 'CREATE' && (key === 'name' || key === 'objective'))) continue;
+      if (/token|override|confirm/i.test(key) || ['campaign_id', 'adset_id', 'ad_set_id', 'ad_id', 'account_id'].includes(key)) continue;
+      changeKeys.push(key);
+    }
+    for (const key of changeKeys) {
+      if (params[key] === undefined) continue;
+      contentChanges[key] = params[key];
+      const before = currentEntity?.[key === 'budget_amount' ? 'daily_budget' : key];
+      const after = formatChange(key, params[key], 'after');
+      changeDescriptions.push(
+        before !== undefined ? `${key}: ${formatChange(key, before, 'before')} → ${after}` : `${key} → ${after}`,
+      );
     }
     if (Object.keys(contentChanges).length > 0) {
       target.changes = contentChanges;
-      lines.push(`Changes: ${Object.keys(contentChanges).join(', ')}.`);
+      lines.push(`Changes: ${changeDescriptions.join(', ')}.`);
+    }
+    if (currencyUnverified) {
+      lines.push('WARNING: the ad account currency could not be verified, so the amounts above are NOT converted — confirm the real amounts before approving.');
     }
 
     /*
@@ -14863,6 +15084,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
 
   private metaMarketingApiDeps(): adsApisImpl.CallMetaMarketingApiDeps {
     return {
+      preparePausedMetaBundle: this.preparePausedMetaBundle.bind(this),
       resolveCampaignObjectiveGate: this.resolveCampaignObjectiveGate.bind(this),
       validateMetaActionParams: this.validateMetaActionParams.bind(this),
       claimMetaWriteManifestGrant: this.claimMetaWriteManifestGrant.bind(this),
@@ -14874,6 +15096,46 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       getMetaCredentials: this.getMetaCredentials.bind(this),
       checkMetaBudgetChange: this.checkMetaBudgetChange.bind(this),
     };
+  }
+
+  /** A brief is a write item, never a generic planning answer or an objective-only grant. */
+  private async preflightPausedMetaBundle(userId: string, sessionId: string | undefined, accountId: string, accessToken: string, bundle: PausedMetaBundle) {
+    const session = sessionId ? await chatbotDb.getChatSession(sessionId) : null;
+    if (!session || session.userId !== userId) throw new Error('A paused bundle needs an owned chat session and explicit review-card approval.');
+    assertPausedBundleUserCount(bundle, await chatbotDb.getMessagesFromMessagesTable(sessionId!));
+    return preflightPausedMetaCreatives(bundle, accountId, id => metaService.getAdCreative(accessToken, id));
+  }
+
+  private async preparePausedMetaBundle(userId: string, sessionId: string | undefined, accountId: string, input: unknown): Promise<any> {
+    try {
+      const bundle = parsePausedMetaBundle(input);
+      const session = sessionId ? await chatbotDb.getChatSession(sessionId) : null;
+      if (!session || session.userId !== userId) throw new Error('A paused bundle needs an owned chat session and explicit review-card approval.');
+      const creds = await this.getMetaCredentials(userId, accountId);
+      const { getMetaPagesAccessState, getMetaAdsNoPagesMessage } = await import('../utils/metaAdsScope');
+      if (getMetaPagesAccessState(creds.connection?.config) === 'missing') throw new Error(getMetaAdsNoPagesMessage(creds.connection?.config));
+      bundle.creative_preflight = await this.preflightPausedMetaBundle(userId, sessionId, creds.accountId, creds.accessToken, bundle);
+      const money = await this.normalizeMetaMoneyParams(creds.accountId, creds.accessToken,
+        bundle.campaign.advantage_campaign_budget ? bundle.campaign : bundle.ad_set);
+      // Frozen alongside the exact fields. A later currency/connection change invalidates the grant.
+      if (!money.currency) throw new Error('Account currency could not be verified.');
+      bundle.currency = money.currency;
+      const grant = await this.claimMetaWriteManifestGrant(userId, sessionId!, 'CAMPAIGN', PAUSED_BUNDLE_ACTION, creds.accountId, undefined, undefined, undefined, bundle);
+      if (grant.granted) return this.dispatchAuthorizedMetaWrite(userId, 'CAMPAIGN', PAUSED_BUNDLE_ACTION, creds.accountId, undefined, undefined, undefined, bundle, false, sessionId);
+      if (grant.reason === 'already_consumed') return { success: false, complete: false,
+        message: 'This exact paused bundle approval has already been claimed. No new writes or approval request were made. Use the persisted approval execution result; do not recreate it.' };
+      const summary = pausedBundleSummary(bundle, creds.accountId);
+      return {
+        success: true, awaitingUserConfirmation: true, requiresConfirmation: true,
+        summary, confirmationDetail: summary, confirmationPrompt: summary,
+        message: `${summary}\nSubmit the single review card. The server executes the stored brief; do not re-call individual creates or ask for the objective again.`,
+        target: { account_id: creds.accountId }, metaWriteManifestDigest: grant.digest,
+        metaWriteDispatch: { entity_type: 'CAMPAIGN', action: PAUSED_BUNDLE_ACTION, account_id: creds.accountId, resolvedAccountId: creds.accountId, params: bundle },
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Invalid paused bundle.';
+      return { success: false, message, error: `PAUSED_BUNDLE_REFUSED: ${message}` };
+    }
   }
 
   /**
@@ -14951,6 +15213,25 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     overrideApproved: boolean,
     sessionId: string | undefined,
   ): Promise<MetaApiResult> {
+    if (action === PAUSED_BUNDLE_ACTION) {
+      if (entity_type !== 'CAMPAIGN' || campaign_id || ad_set_id || ad_id || overrideApproved) throw new Error('Invalid paused-bundle scope.');
+      const creds = await this.getMetaCredentials(userId, account_id);
+      if (creds.accountId.replace(/^act_/, '') !== account_id.replace(/^act_/, '')) throw new Error('Approved bundle account changed.');
+      const { getMetaPagesAccessState, getMetaAdsNoPagesMessage } = await import('../utils/metaAdsScope');
+      if (getMetaPagesAccessState(creds.connection?.config) === 'missing') throw new Error(getMetaAdsNoPagesMessage(creds.connection?.config));
+      return executePausedMetaBundle(params, {
+        preflight: bundle => this.preflightPausedMetaBundle(userId, sessionId, creds.accountId, creds.accessToken, bundle),
+        normalize: p => this.normalizeMetaMoneyParams(creds.accountId, creds.accessToken, p),
+        write: (entity, p, campaign, adSet) => this.dispatchAuthorizedMetaWrite(userId, entity, 'CREATE', account_id, campaign, adSet, undefined, p, false, sessionId),
+        read: async (entity, id, fields) => {
+          if (entity === 'AD') return metaService.getAd(creds.accessToken, id, creds.accountId);
+          const rows = entity === 'CAMPAIGN'
+            ? (await metaService.listCampaigns(creds.accountId, creds.accessToken, { campaignId: id, fields })).campaigns
+            : (await metaService.listAdSets(creds.accountId, creds.accessToken, undefined, { adSetId: id, fields })).adSets;
+          return Array.isArray(rows) ? rows.find(row => row && typeof row === 'object' && !Array.isArray(row) && row.id === id) : null;
+        },
+      }) as Promise<MetaApiResult>;
+    }
     const budgetAnomaly = await this.checkMetaBudgetChange(
       userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params, sessionId,
     );
@@ -15184,7 +15465,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           // above correctly used the raw id (matching the digest's own input); this
           // is the one place that must use the resolved one.
           const dispatchResult = await this.dispatchAuthorizedMetaWrite(
-            userId, dispatch.entity_type, dispatch.action, dispatch.resolvedAccountId ?? dispatch.account_id,
+            userId, dispatch.entity_type, dispatch.action, dispatch.action === PAUSED_BUNDLE_ACTION ? dispatch.account_id : dispatch.resolvedAccountId ?? dispatch.account_id,
             dispatch.campaign_id, dispatch.ad_set_id, dispatch.ad_id, dispatch.params,
             false, sessionId,
           );
@@ -15215,6 +15496,11 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       // Emma never actually received anything more specific than "Invalid parameter."
       return { verified: false, error: result?.message || result?.error || 'Meta write failed' };
     }
+    // An accepted write whose verification failed is not a verified workflow checkpoint.
+    if (result.readBackVerified === false || result.budget_verification === 'UNCONFIRMED' ||
+        result.budget_verification === 'MISMATCH' || result.spend_cap_verified === false || result.verified === false) {
+      return { verified: false, error: result.message || 'Meta write could not be verified.' };
+    }
     // Reuses whatever read-back mismatch detection the underlying write
     // method already performs (Phase 1's existing resolver — today,
     // AD_SET CREATE's bid_strategy/budget/timing comparison; not yet a
@@ -15238,6 +15524,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       verified: true,
       verifiedFields: {
         appliedObjectId: AgentModeService.extractDispatchedObjectId(result),
+        ...((result as any).ledger ? { ledger: (result as any).ledger, requested_ad_count: (result as any).requested_ad_count, verified_ad_count: (result as any).verified_ad_count } : {}),
         ...(result.readBackVerified === true ? { readBack: result.readBack } : {}),
       },
     };
@@ -15273,6 +15560,11 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         outputs: [],
         requiredParameters: [],
         execute: async (): Promise<Record<string, unknown>> => {
+          if (dispatch.action === PAUSED_BUNDLE_ACTION) {
+            const digest = await this.resolveMetaWriteManifestDigest(userId, dispatch.entity_type, dispatch.action, dispatch.account_id,
+              dispatch.campaign_id, dispatch.ad_set_id, dispatch.ad_id, dispatch.params);
+            if (digest !== decision.metaWriteManifestDigest) throw new Error('Paused bundle scope changed after approval.');
+          }
           // Review fix: advanceIndependentWorkflow provides no mutual
           // exclusion between two concurrent drivers of the SAME run picking
           // the same un-checkpointed step (unlike buildMetaWriteWorkflowSteps
@@ -15315,7 +15607,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
             throw new StepContendedError('This write is already being dispatched by a concurrent request.');
           }
           const dispatchResult = await this.dispatchAuthorizedMetaWrite(
-            userId, dispatch.entity_type, dispatch.action, dispatch.resolvedAccountId ?? dispatch.account_id,
+            userId, dispatch.entity_type, dispatch.action, dispatch.action === PAUSED_BUNDLE_ACTION ? dispatch.account_id : dispatch.resolvedAccountId ?? dispatch.account_id,
             dispatch.campaign_id, dispatch.ad_set_id, dispatch.ad_id, dispatch.params,
             false, originSessionId,
           );
@@ -15912,7 +16204,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       stepId: c.stepId,
       status: c.status,
       ...(c.status === 'verified'
-        ? { appliedObjectId: (c.verifiedFields as any)?.appliedObjectId as string | undefined }
+        ? { appliedObjectId: (c.verifiedFields as any)?.appliedObjectId as string | undefined,
+          ...(c.verifiedFields?.ledger ? { bundle: { requested_ad_count: c.verifiedFields.requested_ad_count as number,
+            verified_ad_count: c.verifiedFields.verified_ad_count as number, ledger: c.verifiedFields.ledger as unknown[] } } : {}) }
         : {}),
       ...(c.status === 'failed'
         ? Array.isArray(c.discrepancy)

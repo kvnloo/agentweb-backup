@@ -1344,24 +1344,44 @@ export async function handleCallGoogleAdsReportingApi(userId: string, args: {
 // ─── HubSpot Campaigns ──────────────────────────────────────────────────────
 
 export async function resolveHubSpotService(userId: string, accountId?: string): Promise<HubSpotService> {
+  // Order matters (ENG-2605): the caller's OWN OAuth account, then a private-app token pasted on one
+  // of their own lead lists, and only then an account an org admin shared. A shared account must never
+  // pre-empt something the caller connected themselves, or a call lands in a teammate's portal.
+  let ownErr: any;
   try {
-    return await HubSpotService.create(userId, accountId);
+    return await HubSpotService.create(userId, accountId, 'own');
   } catch (err: any) {
+    ownErr = err;
     // An explicit account_id or a multi-account ambiguity is actionable by the
     // caller — surface it instead of silently falling back to token-paste.
-    if (accountId || /multiple hubspot accounts/i.test(err?.message ?? '')) throw err;
+    if (/multiple hubspot accounts/i.test(err?.message ?? '')) throw err;
     // Fall back to token-paste: scan lead lists for HubSpot apiKeyEncrypted
   }
-  const { crmDb } = await import('../../services/db');
-  const lists = await crmDb.getLeadListsByUserId(userId);
-  for (const list of lists as any[]) {
-    const hubspotConfig = list?.externalCrmSyncConfigs?.hubspot;
-    if (hubspotConfig?.apiKeyEncrypted) {
-      const { decryptPassword } = await import('../../utils/crypto');
-      const { password } = decryptPassword(hubspotConfig.apiKeyEncrypted);
-      return HubSpotService.fromToken(password);
+  if (!accountId) {
+    const { crmDb } = await import('../../services/db');
+    const lists = await crmDb.getLeadListsByUserId(userId);
+    for (const list of lists as any[]) {
+      const hubspotConfig = list?.externalCrmSyncConfigs?.hubspot;
+      if (hubspotConfig?.apiKeyEncrypted) {
+        const { decryptPassword } = await import('../../utils/crypto');
+        const { password } = decryptPassword(hubspotConfig.apiKeyEncrypted);
+        return HubSpotService.fromToken(password);
+      }
     }
   }
+  // A shared account only stands in when the caller has NONE of their own. An own account that exists
+  // but fails (a revoked grant, a refresh error) keeps its old outcome: quietly switching to a teammate's
+  // portal would send the call somewhere the caller never chose.
+  if (/not connected|not found/i.test(ownErr?.message ?? '')) {
+    try {
+      return await HubSpotService.create(userId, accountId, 'shared');
+    } catch (err: any) {
+      // Anything but "there is none" is actionable and surfaces (several shared accounts, or one whose
+      // owner's grant needs reconnecting); "there is none" falls through to the original messages.
+      if (!/not connected|not found/i.test(err?.message ?? '')) throw err;
+    }
+  }
+  if (accountId) throw ownErr;
   throw new Error('No HubSpot account connected. Please connect HubSpot in Settings → External CRM Sync or via OAuth in Connected Accounts.');
 }
 

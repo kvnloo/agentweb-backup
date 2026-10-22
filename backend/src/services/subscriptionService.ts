@@ -5,6 +5,7 @@ import { skillService } from "./skillService";
 import { hasOwnLiveSubscription } from "./orgAuthz";
 import type { LlmUsagePolicy } from "./llmUsagePolicyService";
 import type { LlmUsageTopUpConfig } from './llmUsageTopUpService';
+import type { SubscriptionPaygOverageConfig } from './paygOverage';
 import type { SeatPricingConfig } from './orgSeatService';
 
 export interface SubscriptionType {
@@ -13,7 +14,14 @@ export interface SubscriptionType {
   hiddenPages?: string[]; // Array of page paths to hide entirely (not shown as locked); subset of pages not in allowedPages
   allowedSkills: string[]; // Array of skill IDs (e.g., ["skill-uuid-1", "skill-uuid-2"]) or ["*"] for all
   allowedConnectedAccounts?: string[]; // Array of platform types (e.g., ["linkedin", "gmail"]) or ["*"] for all; undefined = all
-  allowedFeatures?: string[]; // Stable product feature IDs or ["*"]; undefined = legacy row (all current features)
+  allowedFeatures?: string[]; // Stable product feature IDs or ["*"]; undefined = legacy row (all current features except the opt-in-only ones)
+  /**
+   * ENG-669: chat models this tier may select (canonical registry ids), or ["*"] for every non-admin catalog model.
+   * The reserved id "agentweb-model" names the future AgentWeb router and matches nothing runnable until it exists.
+   * undefined = every model. Enforced only while AW-Settings `model_tier_allowlist_enabled` is 'true'
+   * (services/agentMode/modelAccess.ts); system-chosen models (configured defaults) are always allowed.
+   */
+  allowedModels?: string[];
   allowedFunctionCalls?: string[]; // Deprecated — kept for on-read migration from old configs
   /** ENG-1978, observation only, never persisted: true when the stored row carried NO
    *  `allowedSkills` and it was defaulted to ["*"] on read. Set by getSubscriptionTypeConfig so
@@ -35,6 +43,8 @@ export interface SubscriptionType {
    * used for enforcement today; this field is not yet wired to replace it.
    */
   seatPricing?: SeatPricingConfig;
+  /** ENG-668: whether this tier's billing owners may opt into pay-as-you-go overages. Absent = not offered. */
+  paygOverage?: SubscriptionPaygOverageConfig;
 }
 
 // Default pages that are always available regardless of subscription type
@@ -61,6 +71,7 @@ const FREE_TIER_FALLBACK: SubscriptionType = {
 export const SUBSCRIPTION_FEATURES = {
   SCHEDULED_CHATS: "scheduled_chats",
   MODEL_COMPARE: "model_compare",
+  HOT_LEAD_CALL: "hot_lead_call",
 } as const;
 
 /**
@@ -280,10 +291,33 @@ const AVAILABLE_SUBSCRIPTION_FEATURES: ReadonlyArray<{
   id: SUBSCRIPTION_FEATURES.MODEL_COMPARE,
   label: "Compare models",
   description: "Send one prompt to several models and compare their answers side by side.",
+}, {
+  id: SUBSCRIPTION_FEATURES.HOT_LEAD_CALL,
+  label: "Hot lead calls",
+  description: "Phone a team member when a hot lead arrives and connect them to the lead.",
 }];
 
+/**
+ * Features that cost AgentWeb money per use (paid vendors). Every "all features" expansion or default
+ * (legacy rows, new tiers, an omitted list) leaves these out, so only an explicit tick, or a saved
+ * "*", grants them. A new paid-vendor feature joins this list.
+ */
+const OPT_IN_ONLY_SUBSCRIPTION_FEATURES: ReadonlyArray<SubscriptionFeatureId> = [
+  SUBSCRIPTION_FEATURES.HOT_LEAD_CALL,
+];
+
 export function getAllAvailableSubscriptionFeatures() {
-  return AVAILABLE_SUBSCRIPTION_FEATURES.map((feature) => ({ ...feature }));
+  return AVAILABLE_SUBSCRIPTION_FEATURES.map((feature) => ({
+    ...feature,
+    optInOnly: OPT_IN_ONLY_SUBSCRIPTION_FEATURES.includes(feature.id),
+  }));
+}
+
+/** The feature ids an absent or legacy feature list stands for: everything except opt-in-only features. */
+export function getDefaultSubscriptionFeatureIds(): SubscriptionFeatureId[] {
+  return AVAILABLE_SUBSCRIPTION_FEATURES
+    .map((feature) => feature.id)
+    .filter((id) => !OPT_IN_ONLY_SUBSCRIPTION_FEATURES.includes(id));
 }
 
 /**
@@ -396,8 +430,9 @@ export async function getAllowedFeatures(userId: string): Promise<string[]> {
   if (!config) return [];
 
   // Existing subscription rows predate feature entitlements. Preserve their
-  // behavior until an admin explicitly saves this field.
-  if (!Array.isArray(config.allowedFeatures) || config.allowedFeatures.includes("*")) {
+  // behavior until an admin explicitly saves this field, except for opt-in-only features.
+  if (!Array.isArray(config.allowedFeatures)) return getDefaultSubscriptionFeatureIds();
+  if (config.allowedFeatures.includes("*")) {
     return AVAILABLE_SUBSCRIPTION_FEATURES.map((feature) => feature.id);
   }
 
@@ -418,9 +453,8 @@ export async function isSubscriptionFeatureEnabled(
   // Interactive entry points still fail closed on null, while background jobs
   // can retry later without permanently pausing a permitted schedule.
   if (!config) return null;
-  if (!Array.isArray(config.allowedFeatures) || config.allowedFeatures.includes("*")) {
-    return true;
-  }
+  if (!Array.isArray(config.allowedFeatures)) return !OPT_IN_ONLY_SUBSCRIPTION_FEATURES.includes(feature);
+  if (config.allowedFeatures.includes("*")) return true;
 
   return config.allowedFeatures.includes(feature);
 }
@@ -467,6 +501,22 @@ async function readSubscriptionTypesSetting(): Promise<SubscriptionTypesSetting>
     }
     return last.setting;
   }
+}
+
+/**
+ * ENG-669: the raw `allowedModels` of one tier, for the tier model allowlist. Unlike getSubscriptionTypeConfig this
+ * keeps "the tier has no row" (`configured: false`: nothing narrows it, every model) apart from "the setting could
+ * not be read": that THROWS (after the same bounded last-known fallback as every entitlement read), so the caller can
+ * serve its own last-known answer instead of mistaking an outage for a configuration.
+ */
+export async function readTierAllowedModels(tierName: string): Promise<{ configured: boolean; allowedModels?: unknown }> {
+  const setting = await readSubscriptionTypesSetting();
+  if (!setting?.settingValue) return { configured: false };
+  const tiers: unknown = JSON.parse(setting.settingValue);
+  const tier = Array.isArray(tiers)
+    ? tiers.find((t: any) => t && typeof t === 'object' && t.name === tierName)
+    : undefined;
+  return tier ? { configured: true, allowedModels: (tier as SubscriptionType).allowedModels } : { configured: false };
 }
 
 /**

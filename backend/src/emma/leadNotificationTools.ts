@@ -1,25 +1,10 @@
 import { emmaToolRegistry } from './registry';
-import { orgDb, userDb } from '../services/db';
-import { can } from '../services/orgAuthz';
+import { orgDb } from '../services/db';
+import { callerOrg } from './orgCaller';
 import {
   configOf, effectiveLeadTypes, isLeadTypes, LEAD_ORIGINS, LEAD_ORIGIN_DESCRIPTIONS,
   type LeadNotificationsConfig,
 } from '../services/leadNotificationConfig';
-
-async function callerOrg(context: any, write = false) {
-  const userId = context?.userId || context?.agentUserId;
-  if (typeof userId !== 'string' || !userId.trim()) throw new Error('Authentication required');
-  const user = await userDb.getUserById(userId);
-  if (user?.userId !== userId || typeof user.orgId !== 'string' || !user.orgId.trim()) {
-    throw new Error('Organization membership required');
-  }
-  const org = await orgDb.getOrgById(user.orgId);
-  if (!org || org.orgId !== user.orgId) throw new Error('Organization not found');
-  if (write && !can({ userId, orgId: user.orgId, orgRole: typeof user.orgRole === 'string' ? user.orgRole : undefined }, org, 'org:configure')) {
-    throw new Error('Only org owners and admins can update lead notification settings');
-  }
-  return org;
-}
 
 function settings(config?: LeadNotificationsConfig) {
   return {
@@ -48,7 +33,7 @@ emmaToolRegistry.register({
   },
   execute: async (args: unknown, context?: any) => {
     validateArgs(args, []);
-    const org = await callerOrg(context);
+    const org = await callerOrg(context, 'lead notification settings');
     const config = configOf(org.leadNotifications);
     if (org.leadNotifications !== undefined && !config) throw new Error('Stored lead notification settings are invalid');
     return { success: true, ...settings(config) };
@@ -82,7 +67,7 @@ emmaToolRegistry.register({
     if ((args.leadTypes !== undefined && !isLeadTypes(args.leadTypes)) || (args.enabled !== undefined && typeof args.enabled !== 'boolean')) {
       throw new Error('Invalid lead types or enabled flag');
     }
-    const org = await callerOrg(context, true);
+    const org = await callerOrg(context, 'lead notification settings', true);
     const previous = org.leadNotifications;
     const config = configOf(previous);
     if (!config) throw new Error('Configure a valid Slack lead notification channel for this organization first');

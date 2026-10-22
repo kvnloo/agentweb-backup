@@ -299,7 +299,7 @@ describe('createSession: only an explicit requestedLlmModel is a selection', () 
     const res = makeRes();
     await agentModeController.createSession(createReq({ portalType: 'agent' }), res);
     expect(res.statusCode).toBe(201);
-    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, DEFAULT_MODEL, expect.anything());
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, DEFAULT_MODEL, expect.anything(), 'system');
   });
 
   it('an explicit unserved requestedLlmModel still 422s', async () => {

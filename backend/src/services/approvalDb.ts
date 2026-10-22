@@ -10,7 +10,7 @@ const dynamodbConfig = {
 const dynamodb = new AWS.DynamoDB.DocumentClient(dynamodbConfig);
 
 // Determine environment prefix for table names
-const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+import { TABLE_PREFIX } from '../config/constants';
 const ASSET_APPROVALS_TABLE = `${TABLE_PREFIX}AW-AssetApprovals`;
 
 export type AssetType = 'image' | 'video' | 'html' | 'text' | 'pdf' | 'other';

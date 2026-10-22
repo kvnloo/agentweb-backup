@@ -298,7 +298,8 @@ describe('account_health pool (ENG-2135)', () => {
 
 describe('work-plan sessions (ENG-665)', () => {
   const recent = (i: number) => new Date(NOW.getTime() - (i % 80) * 24 * 60 * 60 * 1000).toISOString();
-  const rows = Array.from({ length: 120 }, (_, i) => ({ sessionId: sid(1000 + i), userId: `u${i}`, createdAt: recent(i) }));
+  const later = (iso: string) => new Date(Date.parse(iso) + 60_000).toISOString();
+  const rows = Array.from({ length: 120 }, (_, i) => ({ sessionId: sid(1000 + i), userId: `u${i}`, createdAt: recent(i), updatedAt: later(recent(i)) }));
   const stored = (sessionId: string, seedSource: string) =>
     newGoldenCase({ surface: 'agent', taskType: seedSource, sourceId: sessionId, seedSource, now: NOW });
 
@@ -330,14 +331,36 @@ describe('work-plan sessions (ENG-665)', () => {
   it('excludes evaluation users and sessions that are old, future-dated or undated', () => {
     const day = 24 * 60 * 60 * 1000;
     const sessions = [
-      { sessionId: sid(1), userId: 'eval_bot', createdAt: recent(1) },
-      { sessionId: sid(2), createdAt: new Date(NOW.getTime() - 91 * day).toISOString() },
-      { sessionId: sid(3), createdAt: new Date(NOW.getTime() + day).toISOString() },
+      { sessionId: sid(1), userId: 'eval_bot', createdAt: recent(1), updatedAt: later(recent(1)) },
+      { sessionId: sid(2), createdAt: new Date(NOW.getTime() - 91 * day).toISOString(), updatedAt: later(new Date(NOW.getTime() - 91 * day).toISOString()) },
+      { sessionId: sid(3), createdAt: new Date(NOW.getTime() + day).toISOString(), updatedAt: later(new Date(NOW.getTime() + day).toISOString()) },
       { sessionId: sid(4) },
-      { sessionId: sid(5), createdAt: recent(2) },
+      { sessionId: sid(5), createdAt: recent(2), updatedAt: later(recent(2)) },
     ];
     const result = buildWorkPlanCases({ sessions, existing: [], target: 10, now: NOW });
     expect(result.eligible).toBe(1);
     expect(result.cases.map((c) => c.sourceRef.id)).toEqual([sid(5)]);
+  });
+
+  it('skips a session that was opened and never used: not updated after it was created (ENG-2608)', () => {
+    const created = recent(3);
+    const sessions = [
+      { sessionId: sid(1), createdAt: created, updatedAt: created },
+      { sessionId: sid(2), createdAt: created },
+      { sessionId: sid(3), createdAt: created, updatedAt: later(created) },
+    ];
+    const result = buildWorkPlanCases({ sessions, existing: [], target: 10, now: NOW });
+    expect(result.eligible).toBe(1);
+    expect(result.cases.map((c) => c.sourceRef.id)).toEqual([sid(3)]);
+  });
+
+  it('never re-seeds an excluded case, and leaves it out of the target so a re-run can replace it (ENG-2608)', () => {
+    const first = buildWorkPlanCases({ sessions: rows, existing: [], target: 10, now: NOW });
+    const exclusion = { reason: 'empty_session', by: 'a@example.com', at: NOW.toISOString() };
+    const existing = first.cases.map((c, i) => (i < 3 ? { ...c, excluded: exclusion } : c));
+    const again = buildWorkPlanCases({ sessions: rows, existing, target: 10, now: NOW });
+    expect(again.alreadyStored).toBe(7);
+    expect(again.cases).toHaveLength(3);
+    expect(again.cases.map((c) => c.caseId)).not.toEqual(expect.arrayContaining(first.cases.slice(0, 3).map((c) => c.caseId)));
   });
 });

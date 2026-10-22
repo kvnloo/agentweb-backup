@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import AWS from 'aws-sdk';
 
-const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+import { TABLE_PREFIX } from '../config/constants';
 const TABLE_NAME = `${TABLE_PREFIX}AW-V0Usage`;
 
 const dynamodb = new AWS.DynamoDB.DocumentClient({

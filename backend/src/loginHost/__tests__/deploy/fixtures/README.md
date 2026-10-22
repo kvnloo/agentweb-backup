@@ -1,0 +1,3 @@
+Test-only. `worker-server.pem` is a server certificate for the PRIVATE address 172.31.30.50 (the production worker's address, which the installer insists the certificate names),
+signed by the test CA in `../../fixtures/tls/ca.pem` and made for the key `../../fixtures/tls/server.key.pem` (P-256, 100-year validity). It protects nothing and is never deployed.
+Recreate: `printf "subjectAltName=IP:172.31.30.50\nextendedKeyUsage=serverAuth\n" > w.cnf; openssl req -new -key server.key.pem -subj /CN=aw-login-worker-prod-test -out w.csr; openssl x509 -req -in w.csr -CA ca.pem -CAkey ca.key.pem -CAcreateserial -days 36500 -sha256 -extfile w.cnf -out worker-server.pem`.

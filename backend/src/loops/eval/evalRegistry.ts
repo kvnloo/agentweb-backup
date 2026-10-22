@@ -156,6 +156,19 @@ export const EVAL_REGISTRY: readonly GraderEntry[] = [
     notes: 'Deterministic; offline only. Completion is still the plan\'s own step status, cross-checked against successful required tool calls; not yet compared with human labels (ENG-2135/2136).',
   },
   {
+    id: 'agent-task-success-judge',
+    surface: 'agent',
+    graderType: 'llm_judge',
+    measures: 'task_success pass | fail | na per session with the human labelling rubric: every requested deliverable delivered with tool or content evidence, explicit constraints respected; checklist before verdict',
+    source: 'services/taskSuccessJudge.ts (prompt, trace rendering, model guard) over services/agentRunTrace.ts; golden-case adapter loops/eval/runValidation.ts (taskSuccessJudgeGrader); trial scripts/runTaskSuccessJudgeTrial.ts',
+    version: 'prompt-sha256:17fef09dc816',
+    model: 'anthropic.claude-sonnet-5 via OpenRouter (Google and OpenAI models refused: the agent runs on Gemini)',
+    modelFamily: 'claude',
+    consumers: ['scripts/runTaskSuccessJudgeTrial.ts (offline, read-only)', 'scripts/runGraderValidation.ts agent-task-success-judge'],
+    knownIssues: ['ENG-2591'],
+    notes: 'ENG-2591: replaces reading the plan\'s own step checkmarks (agent-task-success measured kappa 0.20 vs blind labels on the 40 test work-plan cases, 2026-10-20). Trial 2026-10-21 on the test split: kappa 0.88 vs blind GPT-5.4 labels (n=39), 0.93 where GPT and Claude labels agree (n=34), 0.77 vs Claude labels (n=38); evidence https://linear.app/emmabyaw/issue/ENG-2591/agent-task-success-grader-stop-trusting-step-checkmarks-kappa-020-in#comment-ea8be576. AI labels, not human, so no validation is recorded and it cannot gate: advisory only. Offline only.',
+  },
+  {
     id: 'agent-tool-correctness',
     surface: 'agent',
     graderType: 'code',
@@ -337,7 +350,7 @@ export const EVAL_REGISTRY: readonly GraderEntry[] = [
       'scripts/scoreCreativeRubric.ts (offline, read-only)',
     ],
     knownIssues: ['ENG-421'],
-    notes: 'Advisory (ENG-2140, ENG-2192): never blocks generation. Off unless CREATIVE_RUBRIC_JUDGE_ENABLED=true with CREATIVE_RUBRIC_JUDGE_SAMPLE_RATE > 0 (unset in prod). Images are judged only after the deterministic gates pass. Surfaces: ad_image (7 criteria), organic_image, ad_copy, landing_page (ENG-421 criteria that apply). Runtime pairwise vs the prior best for ad images. Not yet validated against human labels (ENG-2136 harness, per-criterion kappa).',
+    notes: 'Advisory (ENG-2140, ENG-2192): never blocks generation. Off unless CREATIVE_RUBRIC_JUDGE_ENABLED=true with CREATIVE_RUBRIC_JUDGE_SAMPLE_RATE > 0. Prod: on at sample rate 0.25 (Agentweb-backend-env-prod-3, checked 2026-10-19); verdicts are stored and reported in the eval-v2 creative snapshot (report-only); nothing gates or alerts on them. Images are judged only after the deterministic gates pass. Surfaces: ad_image (7 criteria), organic_image, ad_copy, landing_page (ENG-421 criteria that apply). Runtime pairwise vs the prior best for ad images. Not yet validated against human labels (ENG-2136 harness, per-criterion kappa).',
   },
   {
     id: 'creative-performance-correlation',

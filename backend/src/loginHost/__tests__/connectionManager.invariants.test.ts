@@ -8,6 +8,7 @@
  *  I2 an allocated uid has a directory or a pending wipe (nothing leaks forever)
  *  I3 a connection that was disabled by the user is never `active` until a successful enable (or revoke)
  *  I4 a `revoked` connection has nothing pending and nothing on disk
+ *  I6 provider sessions alive never exceed the per-home caps (single-use sessions included)
  *  I5 after faults stop and the sweeper runs, every connection that was revoked is `revoked` and the host holds nothing for it
  */
 import { HostError } from "../protocol";
@@ -31,7 +32,7 @@ const STEPS = Number(process.env.INVARIANT_STEPS ?? 45);
 async function run(seed: number): Promise<void> {
   const rand = rng(seed);
   const pick = <T,>(xs: readonly T[]): T => xs[Math.floor(rand() * xs.length)];
-  const rig: Rig = makeRig({ config: { uidMin: 400_000, uidMax: 400_000 + 40, portCallTimeoutMs: 15, adapterCallTimeoutMs: 15, abortGraceMs: 10 } });
+  const rig: Rig = makeRig({ adapter: { singleUse: seed % 2 === 0 }, config: { uidMin: 400_000, uidMax: 400_000 + 40, portCallTimeoutMs: 15, adapterCallTimeoutMs: 15, abortGraceMs: 10 } }); // even seeds: one process per turn
   let mgr = rig.mgr;
   const trace: string[] = [];
   const attempts = new Map<string, string>(); // connection -> loginRef of a ready attempt
@@ -72,6 +73,7 @@ async function run(seed: number): Promise<void> {
       const pending = new Set<number>();
       for (const c of Object.values(st.connections)) for (const w of c.wipePending ?? []) pending.add(w.uid);
       for (const u of Object.keys(st.uidOwners)) if (!dirUids.has(Number(u)) && !pending.has(Number(u))) fail(`I2 after ${when}: uid ${u} owned with no directory and no pending wipe`);
+      if (rig.script.opened - rig.script.closed > CONNS.length * rig.adapter.maxProcessesPerHome) fail(`I6 after ${when}: ${rig.script.opened - rig.script.closed} provider sessions alive, over the per-home caps`);
       for (const c of CONNS) {
         if (!st.connections[c]) userDisabled.delete(c); // the host forgot an abandoned first sign-in: a later sign-in is a brand-new connection
         if (userDisabled.has(c) && stateOf(c) === "active") fail(`I3 after ${when}: ${c} is active although the user disabled it`);

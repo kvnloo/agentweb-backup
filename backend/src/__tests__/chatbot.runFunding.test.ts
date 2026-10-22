@@ -147,3 +147,14 @@ describe('ENG-1816 F1 — sendMessageStream resolves and enters a RunFunding sco
     expect(currentRunFunding()).toBeUndefined();
   });
 });
+
+describe('ENG-669 PR-C: the sidebar chatbot refuses the AgentWeb Model visibly', () => {
+  it.each([['sendMessage', sendMessage], ['sendMessageStream', sendMessageStream]] as const)('%s: 422 before any session read or LLM call', async (_name, handler) => {
+    mockChatbotDb.getChatSession.mockResolvedValue(SESSION_OWNER as any);
+    const res = makeRes();
+    await handler(makeReq({ body: { message: 'Hello Emma', model: 'agentweb-model' } } as any), res);
+    expect(res.status).toHaveBeenCalledWith(422);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'model_unavailable', requestedModel: 'agentweb-model', reason: 'not_selectable' }));
+    expect(mockGenerateChatResponse).not.toHaveBeenCalled();
+  });
+});

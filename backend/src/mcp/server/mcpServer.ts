@@ -275,6 +275,7 @@ export function setupMcpServer(
       oauthClientName: sessionEntry?.oauthClientName || (req as any)?._mcpOAuthClientName,
       clientType: sessionEntry?.clientType || (req as any)?._mcpClientType,
       userAgent: sessionEntry?.userAgent || req?.get('user-agent'),
+      clientIp: req?.ip,
     });
   };
 

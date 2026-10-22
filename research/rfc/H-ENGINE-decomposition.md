@@ -26,6 +26,6 @@ lookup, and releases in `finally`; core tracking separately covers tool executio
 registry and cron registry with deferred lookup/execution gates, including
 success, lookup/ownership failures, tool rejection and continuation siblings.
 These bounded local diagnostics do not establish Atem execution, full application
-bootstrap/seed or hosted CI acceptance. The private canonical queue is
-[fork #107](https://github.com/kvnloo/agentweb/issues/107); updating the origin
-feature branch remains held until the required test plane is available.
+bootstrap/seed or hosted CI acceptance. The canonical evidence queue is
+[fork #107](https://github.com/kvnloo/agentweb/issues/107). Origin Build checks
+are separate from Atem real-agent acceptance; this change remains in review.

@@ -528,7 +528,7 @@ export class HubspotAdapter implements CrmAdapter {
             if (idOutcome.gone.has(p.storedId!)) {
                 console.warn(
                     `[HubspotAdapter] stored contact ${p.storedId} for lead ${p.lead.leadId} ` +
-                    `no longer exists — falling back to upsert-by-email.`,
+                    `was not updated by HubSpot (deleted or merged away) — falling back to upsert-by-email.`,
                 );
                 emailLeads.push(p);
             }
@@ -772,8 +772,14 @@ export class HubspotAdapter implements CrmAdapter {
             Array.from(byId.values()),
             async (batch) => {
                 try {
-                    await svc.batchUpdateContacts(batch);
-                    for (const i of batch) updated.add(i.id);
+                    const echoed = await svc.batchUpdateContacts(batch);
+                    // HubSpot answers a merged-away id with 200 and no result for it. An id it did not
+                    // echo was NOT updated, so it takes the gone path (upsert by email finds the survivor).
+                    const confirmed = echoed === undefined ? undefined : new Set(echoed);
+                    for (const i of batch) {
+                        if (confirmed === undefined || confirmed.has(i.id)) updated.add(i.id);
+                        else gone.add(i.id);
+                    }
                 } catch (err: any) {
                     if (!this.isTransientHubSpotError(err)) throw err; // bisect to isolate the bad record
                     const msg = this.formatError(err);
@@ -1101,7 +1107,7 @@ export class HubspotAdapter implements CrmAdapter {
             const setFailedIds = new Set<string>();
             const setOutcome = await splitAndRetry(
                 setTargets,
-                (ids) => svc.batchUpdateContacts(ids.map(id => ({ id, properties: { lifecyclestage: targetStage } }))),
+                async (ids) => { await svc.batchUpdateContacts(ids.map(id => ({ id, properties: { lifecyclestage: targetStage } }))); },
                 { maxBatchSize: 100, concurrency: PUSH_BATCH_CONCURRENCY },
             );
             for (const f of setOutcome.failed) setFailedIds.add(f.item);
@@ -1118,7 +1124,7 @@ export class HubspotAdapter implements CrmAdapter {
                 if (restoreInputs.length > 0) {
                     await splitAndRetry(
                         restoreInputs,
-                        (batch) => svc.batchUpdateContacts(batch),
+                        async (batch) => { await svc.batchUpdateContacts(batch); },
                         { maxBatchSize: 100, concurrency: PUSH_BATCH_CONCURRENCY },
                     ).catch(() => { /* best-effort; failure leaves contact blank, healed next push */ });
                 }

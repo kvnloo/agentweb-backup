@@ -3,6 +3,8 @@ import { sendApprovalRequestWithTracking, postSlackMessage } from './slackServic
 import { batchReviewDb } from './batchReviewDb';
 import { isSessionLimitError } from '../utils/agentModeErrors';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
+import { isModelUnavailableError } from './agentMode/modelUnavailable';
+import { modelRefusalReviewerNotice } from '../utils/modelRefusalReviewerNotice';
 
 /**
  * ENG-936: the Agent Mode revision prompt, shared by every entry point (this
@@ -329,6 +331,18 @@ async function runAgentModeRevision(
         ).catch((slackErr: any) =>
           console.warn('[revisionService] failed to post session-busy notice:', slackErr?.message || slackErr),
         );
+      }
+      return;
+    }
+    // ENG-669 PR-C: the chat's model was refused (runVerifiedChat saved the refusal to the chat). Only the owner can fix
+    // it, so tell the reviewer what to do instead of "didn't go through", and do not page on-call.
+    if (isModelUnavailableError(error)) {
+      console.warn(`Agent Mode revision for session ${agentSessionId} refused: model_unavailable (${error.reason}).`);
+      if (approval.slackChannel) {
+        await postSlackMessage(approval.slackChannel, await modelRefusalReviewerNotice(error), approval.slackMessageTs || undefined)
+          .catch((slackErr: any) =>
+            console.warn('[revisionService] failed to post model-refusal notice:', slackErr?.message || slackErr),
+          );
       }
       return;
     }

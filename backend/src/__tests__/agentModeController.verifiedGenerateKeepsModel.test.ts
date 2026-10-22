@@ -79,6 +79,7 @@ jest.mock('../services/llmUsagePolicyResolverService', () => ({
 }));
 
 jest.mock('../services/tokenUsageService', () => ({
+  TURN_ADMISSION: { recordAdmission: true },
   checkTokenUsage: jest.fn(),
   incrementUserTokenUsage: jest.fn(),
   deriveBlockedByCost: jest.fn(() => ({ blockedByCost: false })),
@@ -203,7 +204,7 @@ describe('verifiedGenerate keeps the selected model', () => {
   it('an explicit request model wins over the stored one and the task default, and is stored', async () => {
     mockChatbotDb.getChatSession.mockResolvedValue(session('gpt-5.5') as any);
     await agentModeController.verifiedGenerate(verifiedReq({ llmModel: 'gemini-3.5-flash' }), makeRes());
-    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, 'gemini-3.5-flash', expect.anything());
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, 'gemini-3.5-flash', expect.anything(), 'user');
     expect(modelWrites()).not.toContain('report-model');
     expect(workerModels()).toEqual(['gemini-3.5-flash']);
   });
@@ -238,7 +239,7 @@ describe('verifiedGenerate keeps the selected model', () => {
   it('no selection at all: the task-type default still applies', async () => {
     mockChatbotDb.getChatSession.mockResolvedValue(session() as any);
     await agentModeController.verifiedGenerate(verifiedReq(), makeRes());
-    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, 'report-model');
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, 'report-model', undefined, 'system');
     expect(workerModels()).toEqual(['report-model']);
   });
 
@@ -257,7 +258,7 @@ describe('system callers of runVerifiedChat are unchanged', () => {
       sessionId: SESSION_ID, userId: OWNER, startingMessage: 'go', keywords: [],
       requiredFunctions: [{ functionName: 'update_html_file', minCount: 1 }], maxAttempts: 1, attachments: [],
     });
-    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, 'report-model');
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, 'report-model', undefined, 'system');
     expect(workerModels()).toEqual(['report-model']);
   });
 
@@ -331,7 +332,7 @@ describe('verifiedGenerate persists the explicit model only once the turn is adm
     mockWorker.runInWorker.mockImplementation((async () => { order.push('run'); return reportTool as any; }) as any);
     await agentModeController.verifiedGenerate(verifiedReq({ llmModel: 'gemini-3.5-flash' }), makeRes());
     expect(order).toEqual(['persist', 'run']);
-    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, 'gemini-3.5-flash', expect.anything());
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, 'gemini-3.5-flash', expect.anything(), 'user');
   });
 });
 
@@ -388,7 +389,7 @@ describe('verifiedGenerate applies the same usage gate as /generate', () => {
   it('checks the allowance of the authenticated user', async () => {
     mockWorker.runInWorker.mockResolvedValue(reportTool as any);
     await agentModeController.verifiedGenerate(verifiedReq(), makeRes());
-    expect(checkTokenUsage).toHaveBeenCalledWith(OWNER);
+    expect(checkTokenUsage).toHaveBeenCalledWith(OWNER, { recordAdmission: true });
   });
 
   it('an allowed account is unchanged', async () => {

@@ -101,8 +101,10 @@ export function createLlmConnectionsRouter(service: () => LlmConnectionService =
 
   router.delete("/:id", async (req, res) => {
     try {
-      await service().revoke(actorOf(req), req.params.id);
-      res.status(204).end();
+      const outcome = await service().revoke(actorOf(req), req.params.id);
+      // A hosted login is wiped by the login host: 202 means fenced and unusable but the host has not yet confirmed the wipe.
+      if (outcome === "revoking") res.status(202).json({ status: "revoking" });
+      else res.status(204).end();
     } catch (err) {
       fail(res, err, "revoke");
     }

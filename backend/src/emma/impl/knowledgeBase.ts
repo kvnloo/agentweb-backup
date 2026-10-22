@@ -524,19 +524,66 @@ export async function updateKnowledgeBaseFile(
   }
 }
 
+const ATTACH_FILE_SHAPE = '{"name": "design.md", "content": "..."}';
+
+type AttachFile = { name: string; content: string };
+
+/**
+ * Validates the model-supplied `files` argument. Only top-level `required` is enforced by the tool
+ * schema, so per-file shape must be checked here. `error` (not `message`) is what the model sees on a
+ * failed result, so it must name the fix.
+ */
+function normalizeAttachFiles(
+  raw: unknown
+): { files: AttachFile[] } | { message: string; error: string } {
+  let files = raw;
+  // Models sometimes serialize the array as a JSON string.
+  if (typeof files === 'string') {
+    try { files = JSON.parse(files); } catch { /* reported by the array check below */ }
+  }
+  if (files != null && !Array.isArray(files)) {
+    return {
+      message: 'files must be an array',
+      error: `Invalid input: files must be an array of ${ATTACH_FILE_SHAPE} objects`
+    };
+  }
+  if (!files || files.length === 0) {
+    return { message: 'At least one file is required', error: 'Invalid input: empty files array' };
+  }
+
+  const result: AttachFile[] = [];
+  for (const [i, entry] of files.entries()) {
+    const f = (entry && typeof entry === 'object' ? entry : {}) as Record<string, unknown>;
+    // Models often reuse update_knowledge_base_file's `fileName` key; accept the aliases.
+    const name = f.name || f.fileName || f.file_name || f.filename;
+    if (typeof name !== 'string' || name.trim().length === 0) {
+      return {
+        message: `File #${i + 1} has no name`,
+        error: `Invalid input: file #${i + 1} is missing "name" - each file must be ${ATTACH_FILE_SHAPE}`
+      };
+    }
+    if (typeof f.content !== 'string' || f.content.trim().length === 0) {
+      return {
+        message: `File "${name}" has empty content`,
+        error: `Invalid input: empty file content for "${name}" - put the text in a non-empty string "content" field`
+      };
+    }
+    result.push({ name, content: f.content });
+  }
+  return { files: result };
+}
+
 /**
  * Attach multiple files to a task's knowledge base
  * Used by attach_knowledge_base_files tool
  */
 export async function attachKnowledgeBaseFiles(
   taskId: string,
-  files: Array<{ name: string; content: string }>,
+  files: unknown,
   userId: string,
   sessionId: string
 ): Promise<any> {
   try {
-    console.log(`[attachKnowledgeBaseFiles] taskId=${taskId}, filesCount=${files?.length}, userId=${userId}`);
-
     // 1. Input validation
     if (!taskId || taskId.trim().length === 0) {
       return {
@@ -546,24 +593,12 @@ export async function attachKnowledgeBaseFiles(
       };
     }
 
-    if (!files || files.length === 0) {
-      return {
-        success: false,
-        message: 'At least one file is required',
-        error: 'Invalid input: empty files array'
-      };
+    const normalized = normalizeAttachFiles(files);
+    if ('error' in normalized) {
+      return { success: false, message: normalized.message, error: normalized.error };
     }
-
-    // Validate each file has content
-    for (const f of files) {
-      if (!f.content || f.content.trim().length === 0) {
-        return {
-          success: false,
-          message: `File "${f.name}" has empty content`,
-          error: 'Invalid input: empty file content'
-        };
-      }
-    }
+    const attachFiles = normalized.files;
+    console.log(`[attachKnowledgeBaseFiles] taskId=${taskId}, filesCount=${attachFiles.length}, userId=${userId}`);
 
     // 2. Get task and check authorization
     const { taskDb } = await import('../../services/db');
@@ -605,7 +640,7 @@ export async function attachKnowledgeBaseFiles(
     const uploadedFiles: Array<{ name: string; size: number; url: string }> = [];
 
     // 4. Upload each file
-    for (const f of files) {
+    for (const f of attachFiles) {
       const sanitizedName = f.name.replace(/[^a-zA-Z0-9._-]/g, '_');
       const filePath = `tasks/${taskId}/knowledge-base-files/${Date.now()}_${sanitizedName}`;
       const file = bucket.file(filePath);

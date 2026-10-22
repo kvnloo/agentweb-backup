@@ -43,6 +43,7 @@ import { DynamoDB } from 'aws-sdk';
 import { agentModeService } from '../services/agentModeService';
 import { settingsService } from '../services/settingsService';
 import { paginatedScan } from '../utils/dynamoPagination';
+import { AGENTWEB_MODEL_ID } from '../services/agentMode/modelAccess';
 
 // ── Pure planning logic (unit-testable without AWS) ────────────────────────
 
@@ -112,6 +113,9 @@ export function planModelMigration(
   replacements: Record<string, string> = SAME_FAMILY_MODEL_REPLACEMENTS
 ): MigrationPlan {
   if (!modelId || !modelId.trim()) return { action: 'ok' };
+  // ENG-669 PR-C: the AgentWeb Model is a selection (a router), never a registry id: a session, schedule or plan pinned
+  // to it is not stale, whether or not its router is switched on right now.
+  if (modelId.trim() === AGENTWEB_MODEL_ID) return { action: 'ok' };
   const normalized = normalizeModelId(modelId);
   if (validModelIds.has(normalized)) return { action: 'ok' };
   const replacement = replacements[modelId] ?? replacements[normalized];

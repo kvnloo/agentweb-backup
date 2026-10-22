@@ -10,7 +10,7 @@ import { getJwtSecret } from '../config/jwt';
 import { userDb, orgDb } from '../services/db';
 import { canInOrg } from '../services/orgAuthz';
 import { getAccountByPlatform } from '../services/connectedAccountsDb';
-import { buildDriveAccessInventory, DriveListClient } from '../services/integrationAccessService';
+import { buildDriveAccessInventory, browseDrive, clampDrivePageSize, isValidDriveId, DriveListClient } from '../services/integrationAccessService';
 
 const router = express.Router();
 
@@ -253,8 +253,25 @@ router.get('/access-inventory', authenticateToken, async (req: any, res) => {
       const { google } = await import('googleapis');
       drive = google.drive({ version: 'v3', auth }) as unknown as DriveListClient;
     }
-    const inventory = await buildDriveAccessInventory(drive, cfg.email ?? null);
     res.set('Cache-Control', 'no-store');
+    // ENG-2118: ?browse=1 lists one folder level (?parent=<id> for a folder's
+    // children), paged. Without it, keep the original flat inventory for older
+    // portal builds.
+    const { browse, parent, pageSize, pageToken } = req.query;
+    if (browse === '1') {
+      if (parent !== undefined && !isValidDriveId(parent)) {
+        return res.status(400).json({ error: 'Invalid parent' });
+      }
+      if (pageToken !== undefined && (typeof pageToken !== 'string' || pageToken.length > 2048)) {
+        return res.status(400).json({ error: 'Invalid pageToken' });
+      }
+      return res.json(await browseDrive(drive, cfg.email ?? null, {
+        parent: parent as string | undefined,
+        pageSize: clampDrivePageSize(pageSize),
+        pageToken: pageToken as string | undefined,
+      }));
+    }
+    const inventory = await buildDriveAccessInventory(drive, cfg.email ?? null);
     res.json(inventory);
   } catch (error: any) {
     console.error('[GoogleDrive AccessInventory] Error:', error.message);

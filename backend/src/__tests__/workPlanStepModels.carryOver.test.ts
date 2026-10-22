@@ -290,6 +290,47 @@ describe('modify_work_plan binds a model to its step, not to the stepCount slot'
   });
 });
 
+describe('ENG-669: a step model and its provenance move together (review F3)', () => {
+  const callLLM = jest.fn(async () => ({ content: 'NO' })) as any;
+  const plan = () => ({
+    title: 'Plan', planAuthor: 'system', createdAt: 'x', updatedAt: 'x',
+    steps: [
+      { stepCount: 1, title: 'Intro', status: 'pending' },
+      // the user's adopted pick (recovery from a retired admin pin)
+      { stepCount: 2, title: 'Adopted', status: 'pending', model: 'claude-sonnet-x', modelSource: 'user' },
+      // an admin-authored pin, stamped at launch
+      { stepCount: 3, title: 'Admin pinned', status: 'pending', model: 'gpt-5-chat', modelSource: 'system' },
+    ],
+  });
+  const run = async (steps: any[], remove: number[] = []) => {
+    mockChatbot.getChatSession.mockResolvedValue({ sessionId: 's', userId: 'u', messages: [], calledFunctions: {}, workPlan: plan() });
+    mockChatbot.updateSessionWorkPlan.mockResolvedValue({});
+    const r = await modifyWorkPlan(steps, remove, 's', undefined, false, callLLM);
+    expect(r.success).toBe(true);
+    return (mockChatbot.updateSessionWorkPlan.mock.calls[0][1].steps as any[]).map((s) => `${s.title}:${s.model ?? '-'}:${s.modelSource ?? '-'}`);
+  };
+  beforeEach(() => { jest.clearAllMocks(); jest.spyOn(console, 'log').mockImplementation(() => {}); });
+
+  it('reorder: each model keeps its OWN source (the user pick stays the user\'s, the admin pin stays system)', async () => {
+    expect(await run([{ stepCount: 2, title: 'Admin pinned' }, { stepCount: 3, title: 'Adopted' }]))
+      .toEqual(['Intro:-:-', 'Admin pinned:gpt-5-chat:system', 'Adopted:claude-sonnet-x:user']);
+  });
+  it('insert: the pushed-down steps keep their pairs; the new step gets neither model nor source', async () => {
+    expect(await run([{ stepCount: 2, title: 'Inserted' }, { stepCount: 3, title: 'Adopted' }, { stepCount: 4, title: 'Admin pinned' }]))
+      .toEqual(['Intro:-:-', 'Inserted:-:-', 'Adopted:claude-sonnet-x:user', 'Admin pinned:gpt-5-chat:system']);
+  });
+  it('delete: a slot that loses its model loses the source too', async () => {
+    expect(await run([{ stepCount: 2, title: 'Admin pinned' }], [3]))
+      .toEqual(['Intro:-:-', 'Admin pinned:gpt-5-chat:system']);
+    expect(await (async () => { jest.clearAllMocks(); return run([{ stepCount: 2, title: 'Something else' }], [3]); })())
+      .toEqual(['Intro:-:-', 'Something else:-:-']);
+  });
+  it('a template write carries the model only (a template records no provenance; its author is stamped at launch)', () => {
+    const out = carryStoredStepModels([{ stepCount: 1, title: 'Admin pinned' }], plan().steps);
+    expect(out[0]).toEqual({ stepCount: 1, title: 'Admin pinned', model: 'gpt-5-chat' });
+  });
+});
+
 describe('save_work_plan carries the session step model', () => {
   it.each([['on', true], ['unknown', true], ['off', false]] as const)('switch %s => model carried: %s', async (state, carried) => {
     mockState = state;

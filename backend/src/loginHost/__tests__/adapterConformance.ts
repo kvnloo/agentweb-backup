@@ -20,7 +20,8 @@ export function ctxFor(connectionId = "conf1"): AdapterContext {
   };
 }
 
-export function describeAdapterConformance(name: string, make: () => SubscriptionProviderAdapter): void {
+/** `makeCtx` lets an adapter that really spawns processes supply its own context (the default context cannot spawn). */
+export function describeAdapterConformance(name: string, make: () => SubscriptionProviderAdapter, makeCtx: (connectionId?: string) => AdapterContext = ctxFor): void {
   describe(`provider adapter conformance: ${name}`, () => {
     let adapter: SubscriptionProviderAdapter;
     beforeEach(() => (adapter = make()));
@@ -56,26 +57,26 @@ export function describeAdapterConformance(name: string, make: () => Subscriptio
     });
 
     it("loginStart returns an https URL (and a user code for device-code ceremonies), and loginCancel is safe to call", async () => {
-      const proc = await adapter.loginStart(ctxFor());
+      const proc = await adapter.loginStart(makeCtx());
       expect(proc.data.url).toMatch(/^https:\/\//);
       if (adapter.ceremony === "device_code") expect(proc.data.userCode).toBeTruthy();
       await expect(adapter.loginCancel(proc)).resolves.toBeUndefined();
     });
 
     it("preflight (on the open session) and authStatus return their documented shapes", async () => {
-      const session = await adapter.openSession(ctxFor(), { connectionId: "conf1", epoch: 1 });
+      const session = await adapter.openSession(makeCtx(), { connectionId: "conf1", epoch: 1 });
       const pre = await session.preflight();
       expect(typeof pre.ok).toBe("boolean");
       if (!pre.ok) expect(ERROR_KINDS).toContain(pre.kind);
       await session.close();
-      const st = await adapter.authStatus(ctxFor());
+      const st = await adapter.authStatus(makeCtx());
       expect(typeof st.loggedIn).toBe("boolean");
-      const hz = await adapter.hazards(ctxFor());
+      const hz = await adapter.hazards(makeCtx());
       expect(Array.isArray(hz)).toBe(true);
     });
 
     it("a turn yields events ending in exactly one result, and close() is idempotent", async () => {
-      const session = await adapter.openSession(ctxFor(), { connectionId: "conf1", epoch: 1 });
+      const session = await adapter.openSession(makeCtx(), { connectionId: "conf1", epoch: 1 });
       const model = [...adapter.models][0];
       const events: ProviderEvent[] = [];
       for await (const ev of session.turn({ turnId: "t1", prompt: "hi", model, bridgeToken: "bridge-token-0123456789" })) events.push(ev);
@@ -87,7 +88,7 @@ export function describeAdapterConformance(name: string, make: () => Subscriptio
     });
 
     it("interrupt() stops a turn in flight", async () => {
-      const session = await adapter.openSession(ctxFor(), { connectionId: "conf1", epoch: 1 });
+      const session = await adapter.openSession(makeCtx(), { connectionId: "conf1", epoch: 1 });
       const model = [...adapter.models][0];
       const it = session.turn({ turnId: "t2", prompt: "hi", model, bridgeToken: "bridge-token-0123456789" })[Symbol.asyncIterator]();
       await it.next();

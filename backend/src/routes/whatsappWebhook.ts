@@ -159,10 +159,15 @@ router.get('/', async (req, res) => {
  */
 router.post('/', async (req, res) => {
   let raw: Buffer;
+  let ourPhoneNumberId: string;
   try {
     raw = Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body ?? {}));
 
-    const { appSecret } = await getWhatsAppCredentials();
+    const { appSecret, phoneNumberId } = await getWhatsAppCredentials();
+    // String(): the secret is plain JSON.parse output, so a phoneNumberId written as a
+    // JSON number would never strictly equal Meta's string id and every event would be
+    // dropped. Meta always sends it as a string.
+    ourPhoneNumberId = String(phoneNumberId).trim();
     if (!verifySignature(raw, req.header('X-Hub-Signature-256'), appSecret)) {
       return res.status(401).json({ error: 'invalid signature' });
     }
@@ -184,6 +189,24 @@ router.post('/', async (req, res) => {
   try {
     for (const entry of payload?.entry ?? []) {
       for (const change of entry?.changes ?? []) {
+        // One Meta app can serve several business numbers, and the app-level callback
+        // receives events for ALL of them, all signed with the same app secret. The
+        // signature therefore says "from Meta", not "for this environment": the sandbox
+        // test number's traffic arrives here too once the app points at production. Only
+        // the number this environment sends from is ours to act on. Anything else is
+        // acknowledged (a retry would only be dropped again) and ignored. A change with no
+        // phone_number_id cannot be attributed, so it is ignored too.
+        const target = change?.value?.metadata?.phone_number_id;
+        if (target == null || String(target) !== ourPhoneNumberId) {
+          if (change?.value?.messages?.length || change?.value?.statuses?.length) {
+            console.warn(
+              target == null
+                ? '[whatsapp-webhook] ignoring an event that does not say which number it is for'
+                : `[whatsapp-webhook] ignoring an event for another number (phone_number_id …${String(target).slice(-4)})`,
+            );
+          }
+          continue;
+        }
         // `statuses` are OUR outbound messages being delivered/read. They are never
         // treated as inbound — that would open a service window and let us send free-form
         // text to someone who never wrote to us. A FAILED one is only logged, loudly: the

@@ -55,6 +55,11 @@ import { goldenSetStoreFromEnv, GOLDEN_CASES_TABLE_ENV, type GoldenSetStore } fr
 
 const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
 
+// The SDK has no default region outside the app (whose startup sets it), so a bare ops run failed
+// with "Missing region in config" until AWS_REGION was exported (ENG-665). Set before any client,
+// including the golden-set store's, is built.
+AWS.config.update({ region: process.env.AWS_REGION || 'us-west-2' });
+
 const TARGET_FLAGS: Record<string, EvalSurface> = {
   '--target-agent': 'agent',
   '--target-creative': 'creative',
@@ -176,10 +181,15 @@ async function loadWorkPlanSessions(client: AWS.DynamoDB.DocumentClient): Promis
   const rows = await paginatedScan<WorkPlanSessionRow>(client, {
     TableName: `${TABLE_PREFIX}AW-ChatSessions`,
     FilterExpression: 'size(workPlan.steps) > :zero',
-    ProjectionExpression: 'sessionId, userId, createdAt',
+    ProjectionExpression: 'sessionId, userId, createdAt, updatedAt',
     ExpressionAttributeValues: { ':zero': 0 },
   });
-  return rows.map((s) => ({ sessionId: s.sessionId, ...(s.userId ? { userId: s.userId } : {}), ...(s.createdAt ? { createdAt: s.createdAt } : {}) }));
+  return rows.map((s) => ({
+    sessionId: s.sessionId,
+    ...(s.userId ? { userId: s.userId } : {}),
+    ...(s.createdAt ? { createdAt: s.createdAt } : {}),
+    ...(s.updatedAt ? { updatedAt: s.updatedAt } : {}),
+  }));
 }
 
 async function seedWorkPlanSessions(store: GoldenSetStore, target: number, write: boolean): Promise<void> {
@@ -189,7 +199,8 @@ async function seedWorkPlanSessions(store: GoldenSetStore, target: number, write
     process.exit(1);
   }
   const sessions = await loadWorkPlanSessions(new AWS.DynamoDB.DocumentClient());
-  const existing = await store.listCases('agent');
+  // Excluded cases too, so an excluded session is never seeded again.
+  const existing = await store.listCases('agent', { includeExcluded: true });
   const result = buildWorkPlanCases({ sessions, existing, target, now: new Date() });
   const test = result.cases.filter((c) => c.split === 'test').length;
   console.log(`Work-plan sessions: ${sessions.length} with a work plan, ${result.eligible} eligible (last ${SAMPLE_WINDOW_DAYS} days, no evaluation users)`);

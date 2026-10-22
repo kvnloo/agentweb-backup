@@ -48,14 +48,13 @@ const ANONYMOUS_METHODS: ReadonlySet<string> = new Set([
 /**
  * Tools a stranger may EXECUTE.
  *
- * Deliberately empty. Harsha's call (2026-08-08) is list + one free demo tool,
- * and the demo tool is not shipped here: it takes a caller-supplied URL, so it
- * needs SSRF protection (no private ranges, no redirects into them) plus a
- * per-IP rate limit and a global daily ceiling. That is its own change and its
- * own review — bolting it onto a transport-auth PR is how one of those gets
- * skimmed. Until it lands, anonymous callers can look but not run.
+ * Exactly one (ENG-1034): `emma_review_site`, which fetches a caller-supplied
+ * public URL through the SSRF guard (DNS-pinned, every redirect hop
+ * re-validated, http/https on standard ports, body/time capped), is per-IP and
+ * globally rate limited, and touches no user data. A test pins the size at one
+ * so this cannot become a general anonymous door by accretion.
  */
-export const ANONYMOUS_TOOLS: ReadonlySet<string> = new Set<string>();
+export const ANONYMOUS_TOOLS: ReadonlySet<string> = new Set<string>(['emma_review_site']);
 
 /**
  * May this request body proceed with no credentials?

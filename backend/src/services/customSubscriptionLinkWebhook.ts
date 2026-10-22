@@ -1,5 +1,6 @@
 import type Stripe from 'stripe';
 import { CUSTOM_SUBSCRIPTION_LINK_SOURCE } from './customSubscriptionLinkCheckout';
+import { stripeIdOf as idOf } from '../utils/stripeInvoiceFields';
 
 /**
  * ENG-2366 (slice B of ENG-2266): pure classifier for Stripe events produced by
@@ -42,14 +43,6 @@ export class CustomLinkWebhookError extends Error {
 }
 
 const ORG_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
-
-function idOf(ref: unknown): string | null {
-  if (typeof ref === 'string') return ref || null;
-  if (ref && typeof ref === 'object' && typeof (ref as { id?: unknown }).id === 'string') {
-    return (ref as { id: string }).id || null;
-  }
-  return null;
-}
 
 function str(value: unknown): string | null {
   return typeof value === 'string' && value.trim() ? value.trim() : null;

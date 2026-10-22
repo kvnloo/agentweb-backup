@@ -14,12 +14,14 @@ import { getJwtSecret } from '../config/jwt';
 import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
 import { settingsService } from '../services/settingsService';
-import { checkTokenUsage, resolveBillingUserId } from '../services/tokenUsageService';
+import { checkTokenUsage, resolveBillingUserId, TURN_ADMISSION } from '../services/tokenUsageService';
 import { buildUsageBlockCopy } from '../utils/usageBlockCopy';
 import { getModelPrice } from '../utils/llmPricing';
 import { resolveOpenRouterUpstreamModelId } from '../utils/openRouterGatewayContract';
 import { LLM_MODEL_REGISTRY } from '../services/agentMode/llmModelRegistry';
 import { modelCompareEntitlement } from '../services/agentMode/modelCompareEntitlement';
+import { getTierCompareBlock } from '../services/agentMode/modelAccessInstance';
+import { agentWebModelRouter } from '../services/agentMode/agentWebModelRouterInstance';
 import { isCronEnabled } from '../utils/instanceState';
 import { resolveRunFunding, withRunFunding, type RunFunding } from '../services/funding/runFunding';
 import {
@@ -112,9 +114,11 @@ function compareDeps(): CompareDeps {
     isAcceptingWork: isCronEnabled,
     isFeatureEnabled: isModelCompareEnabled,
     isEntitled: (user) => modelCompareEntitlement.isEntitled(user),
+    getTierCompareBlock,
+    isAgentWebModelRouterEnabled: () => agentWebModelRouter.isEnabled(),
     getSession,
-    checkUsage: (userId) => checkTokenUsage(userId),
-    buildUsageBlock: (month) => buildUsageBlockCopy({ month }),
+    checkUsage: (userId) => checkTokenUsage(userId, TURN_ADMISSION),
+    buildUsageBlock: (month, paygBlock) => buildUsageBlockCopy({ month, paygBlock }),
     normalizeModelId: (model) => agentModeService.normalizeModelId(model),
     resolveModel: (input) => resolveEffectiveModelForUser(input),
     getModelInfo: (model) => agentModeService.getModelCompareInfo(model),
@@ -157,7 +161,8 @@ function selectDeps(): SelectDeps {
     tryClaim: tryClaimSessionGeneration,
     release: releaseSessionGeneration,
     appendMessages: (sessionId, messages) => chatbotDb.addMessagesToSession(sessionId, messages),
-    updateSessionModel: (sessionId, model) => chatbotDb.updateSessionLlmModel(sessionId, model),
+    // ENG-669: continuing with a compared column is the user's pick.
+    updateSessionModel: (sessionId, model) => chatbotDb.updateSessionLlmModel(sessionId, model, undefined, 'user'),
     maxSessionMessages: MAX_MESSAGE_SIZE_PER_SESSION,
     getSecret: getJwtSecret,
     now: () => Date.now(),

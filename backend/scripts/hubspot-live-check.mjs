@@ -8,13 +8,13 @@
 //     node backend/scripts/hubspot-live-check.mjs [--out results.json]
 //
 // Use a HubSpot DEVELOPER TEST ACCOUNT (free; no customer data). The private app needs
-// crm.objects.contacts.read/write. Every probe uses @eng2171.example.invalid addresses and
+// crm.objects.contacts.read/write. Every probe uses @eng2171.example.com addresses and
 // firstname "ENG2171-probe"; nothing else in the portal is read, changed or deleted.
 // The output is the raw status and body of each call: paste it into ENG-2464.
 import { writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-const DOMAIN = 'eng2171.example.invalid';
+const DOMAIN = 'eng2171.example.com';
 const NEVER_EXISTS = '999999999999';
 
 // Mirrors HubspotAdapter.isContactGoneError. If experiment 3 or 4 is not classified "gone"

@@ -23,7 +23,7 @@ import { dynamodb } from '../config/aws';
 import { crmDb } from './db';
 import { buildLeadCrmUpdateFragments } from '../utils/leadSchema';
 
-const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+import { TABLE_PREFIX } from '../config/constants';
 const TABLE_NAME = `${TABLE_PREFIX}AW-Deals`;
 
 export const DEAL_STAGES = [
