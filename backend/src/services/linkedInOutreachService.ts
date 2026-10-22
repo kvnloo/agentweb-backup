@@ -1623,7 +1623,11 @@ export class LinkedInOutreachService {
         text: messageText,
         subject,
         options: {
+          // unipile-node-sdk only serialises linkedin[inmail] when api === 'classic'
+          // (types/input/input-messaging.js); without it the flag is silently
+          // dropped and this becomes a plain new chat (ENG-2630).
           linkedin: {
+            api: 'classic',
             inmail: true,
           },
         },
