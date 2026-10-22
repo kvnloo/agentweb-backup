@@ -108,7 +108,7 @@ function refusingProvider(err: unknown): string | undefined {
  * OpenRouter serves the model from another. Azure refuses one GPT-5.4 labeller case every time, while
  * OpenAI and Bedrock also serve the model (ENG-2625). Any other failure, or the retry's own, is passed on.
  */
-export async function createAvoidingRefusingProvider<T>(create: (body: Record<string, unknown>) => Promise<T>, body: Record<string, unknown>): Promise<T> {
+export async function createAvoidingRefusingProvider<B extends object, T>(create: (body: B) => Promise<T>, body: B): Promise<T> {
   try {
     return await create(body);
   } catch (err) {
