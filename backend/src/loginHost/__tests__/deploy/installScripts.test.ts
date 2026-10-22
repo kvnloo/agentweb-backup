@@ -19,6 +19,7 @@ const TLS = join(__dirname, "../fixtures/tls");
 const WORKER_CERT = join(__dirname, "fixtures/worker-server.pem");
 const SCRIPTS = {
   "prod/install.sh": join(PROD, "install.sh"),
+  "prod/deploy.sh": join(PROD, "deploy.sh"),
   "prod/lib.sh": join(PROD, "lib.sh"),
   "build-login-host.sh": join(BACKEND, "scripts/build-login-host.sh"),
   "aw-net.sh": join(DEPLOY, "aw-net.sh"),
@@ -53,7 +54,7 @@ describe("deploy scripts: static guards", () => {
   const shellcheckAvailable = spawnSync("shellcheck", ["--version"]).status === 0;
   if (shellcheckAvailable) {
     it("the production scripts are shellcheck-clean (errors and warnings)", () => {
-      const r = spawnSync("shellcheck", ["-S", "warning", "-x", "-e", "SC1091", "-e", "SC2154", SCRIPTS["prod/install.sh"], SCRIPTS["prod/lib.sh"], SCRIPTS["build-login-host.sh"]], { encoding: "utf8" });
+      const r = spawnSync("shellcheck", ["-S", "warning", "-x", "-e", "SC1091", "-e", "SC2154", SCRIPTS["prod/install.sh"], SCRIPTS["prod/deploy.sh"], SCRIPTS["prod/lib.sh"], SCRIPTS["build-login-host.sh"]], { encoding: "utf8" });
       expect(r.stdout).toBe("");
       expect(r.status).toBe(0);
     });
@@ -601,11 +602,184 @@ case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${
     expect(manifest).toMatch(/^package_lock_sha256=[a-f0-9]{64}$/m);
     expect(manifest).toMatch(/^lockfile_check=/m);
     expect(manifest).not.toContain("WORKER_PRIVATE_IP");
-    for (const f of ["install.sh", "lib.sh", "versions.env", "check-config.js", "dist/loginHost/host/start.js", "files/aw-login-host@.service", "files/aw-login-host-failed@.service", "files/aw-env.slice.template", "files/host-config.template.json", "files/claude-turn.sh", "files/aw-net.sh", "files/aw-write-file.sh", "files/system-prompt.txt"]) {
+    for (const f of ["install.sh", "deploy.sh", "deployctl.js", "lib.sh", "versions.env", "check-config.js", "dist/loginHost/host/start.js", "files/aw-login-host@.service", "files/aw-login-host-failed@.service", "files/aw-env.slice.template", "files/host-config.template.json", "files/claude-turn.sh", "files/aw-net.sh", "files/aw-write-file.sh", "files/system-prompt.txt"]) {
       expect(existsSync(join(pkg, f))).toBe(true);
     }
     expect(text(join(pkg, "files/host-config.template.json"))).toContain("@@WORKER_IP@@"); // filled at install time
     expect(text(join(pkg, "versions.env"))).not.toMatch(/172\.31\.30\.50/);
+  });
+
+  it("the real tarball passes the SSM document's own layout rule: one top directory named after the build, no absolute or parent paths, a deploy.sh that is a regular file", () => {
+    const tgz = readdirSync(tarDir).find((f) => f.endsWith(".tar.gz"))!;
+    const name = tgz.replace(/\.tar\.gz$/, "");
+    const entries = spawnSync("tar", ["-tzf", join(tarDir, tgz)], { encoding: "utf8" }).stdout.split("\n").filter(Boolean);
+    expect(entries.length).toBeGreaterThan(10);
+    for (const e of entries) {
+      expect({ e, unsafe: e.startsWith("/") || e.includes("..") }).toEqual({ e, unsafe: false });
+      expect({ e, inside: e === name || e.startsWith(`${name}/`) }).toEqual({ e, inside: true });
+    }
+    expect(lstatSync(join(pkg, "deploy.sh")).isFile()).toBe(true);
+    expect(text(join(pkg, "MANIFEST"))).toMatch(/^build_seq=/m); // deploy.sh's no-downgrade rule reads this (empty for a hand-made build, the run number in CI)
+  });
+
+  describe("install.sh pieces the zero-interruption deploy relies on", () => {
+    const nextSecond = () => void spawnSync("sleep", ["1.2"]);
+
+    it("--prepare stops after the harmless prerequisites: no release, no TLS set, nothing switched", () => {
+      const b = box();
+      const r = run(b, "--prepare");
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain("prepared");
+      expect(releases(b)).toEqual([]);
+      expect(existsSync(join(b.opt, "current"))).toBe(false);
+      expect(tlsDirs(b)).toEqual([]);
+      expect(systemctlCalls(b)).toEqual([]);
+    });
+
+    it("the bridge URL is checked FIRST: without it --prepare (and a normal install) exit 3 before any download, disk or package step", () => {
+      const b = box({ bridge: null });
+      for (const args of [["--prepare"], []]) {
+        const r = run(b, ...args);
+        expect(r.status).toBe(3);
+        expect(r.stderr + r.stdout).not.toMatch(/data disk|dnf|download/);
+      }
+      expect(releases(b)).toEqual([]);
+    });
+
+    it("a build that differs only in name, commit, run number and times is the SAME deployment (no new release, so no restart)", () => {
+      const b = box();
+      expect(run(b).status).toBe(0);
+      const first = current(b);
+      nextSecond();
+      const m = text(join(b.pkg, "MANIFEST"))
+        .replace(/^name=.*$/m, "name=login-host-abcdefabcdef")
+        .replace(/^git_sha=.*$/m, "git_sha=0000000000000000000000000000000000000000")
+        .replace(/^commit_time=.*$/m, "commit_time=2030-01-01T00:00:00Z")
+        .replace(/^build_seq=.*$/m, "build_seq=99999");
+      writeFileSync(join(b.pkg, "MANIFEST"), m);
+      expect(run(b).status).toBe(0);
+      expect(current(b)).toBe(first);
+      expect(releases(b)).toHaveLength(1);
+    });
+
+    it("but a build whose FILES differ (a sha256 line changed) is a new release", () => {
+      const b = box();
+      expect(run(b).status).toBe(0);
+      const first = current(b);
+      nextSecond();
+      writeFileSync(join(b.pkg, "MANIFEST"), text(join(b.pkg, "MANIFEST")).replace(/^[0-9a-f]{64}  \.\/dist\/loginHost\/host\/start\.js$/m, "f".repeat(64) + "  ./dist/loginHost/host/start.js"));
+      expect(run(b).status).toBe(0);
+      expect(current(b)).not.toBe(first);
+    });
+
+    it("rollback puts back the PREVIOUS release's unit files and slice, not only its code, and reloads systemd", () => {
+      const b = box();
+      expect(run(b).status).toBe(0);
+      const unit = join(b.units, "aw-login-host@.service");
+      const firstUnit = text(unit);
+      nextSecond();
+      // the second build ships a different unit (and a different file hash, so it is a new release)
+      writeFileSync(join(b.pkg, "files/aw-login-host@.service"), firstUnit + "\n# a unit change that turned out to be bad\n");
+      writeFileSync(join(b.pkg, "MANIFEST"), text(join(b.pkg, "MANIFEST")) + "unit_changed=1\n");
+      expect(run(b).status).toBe(0);
+      expect(text(unit)).toContain("a unit change that turned out to be bad");
+      writeFileSync(b.calls, "");
+      expect(run(b, "--rollback").status).toBe(0);
+      expect(text(unit)).toBe(firstUnit);
+      expect(systemctlCalls(b)).toContain("systemctl daemon-reload");
+    });
+  });
+
+  describe("deploy.sh driving the REAL install.sh from the REAL build (fake systemctl and a fake deployctl)", () => {
+    /** deploy.sh needs a few more seams than install.sh; `ctlnode` stands in for `node deployctl.js` and answers from files. */
+    function deployBox(opts: { active: boolean }) {
+      const b = box();
+      const S = join(b.dir, "scen");
+      mkdirSync(S);
+      writeFileSync(join(S, "acquire.rc"), "0");
+      writeFileSync(join(S, "health.rcs"), "0\n0\n0\n");
+      writeFileSync(
+        join(b.bin, "systemctl"),
+        `#!/bin/bash\necho "systemctl $*" >>"${b.calls}"\n[ "$1" = "is-active" ] && exit ${opts.active ? 0 : 3}\nexit 0\n`,
+      );
+      writeFileSync(
+        join(b.bin, "ctlnode"),
+        `#!/bin/bash\nshift 2; cmd=$1; shift\necho "ctl $cmd $*" >>"${b.calls}"\ncase "$cmd" in\n acquire) exit "$(cat "${S}/acquire.rc")" ;;\n health) rc=$(head -n1 "${S}/health.rcs"); tail -n +2 "${S}/health.rcs" >"${S}/h.tmp"; mv "${S}/h.tmp" "${S}/health.rcs"; exit "$rc" ;;\n info) echo '{"drain":"strict"}'; exit 0 ;;\nesac\n`,
+      );
+      for (const f of ["systemctl", "ctlnode"]) chmodSync(join(b.bin, f), 0o755);
+      mkdirSync(join(b.dir, "state"));
+      // (a CI build carries the pipeline's run number; this one was made by hand)
+      writeFileSync(join(b.pkg, "MANIFEST"), text(join(b.pkg, "MANIFEST")).replace(/^build_seq=.*$/m, "build_seq=7"));
+      const env = { ...b.env, AW_SOCK: join(b.dir, "host.sock"), AW_DEPLOY_LOCK: join(b.dir, "deploy.lock"), AW_NODE: join(b.bin, "ctlnode"), AW_STATE_DIR: join(b.dir, "state"), AW_HOLD: join(b.dir, "hold"), AW_HEALTH_TIMEOUT: "5" };
+      const deploy = (...args: string[]) => spawnSync("bash", [join(b.pkg, "deploy.sh"), ...args], { encoding: "utf8", env: { ...process.env, ...env }, timeout: 120_000 });
+      return { b, S, deploy };
+    }
+    const calls = (b: Box) => systemctlCalls(b);
+    const nextSecond = () => void spawnSync("sleep", ["1.2"]); // a release id is the build plus the second it was installed in
+
+    it("a fresh worker: installs, starts the service, checks health, exit 0", () => {
+      const { b, deploy } = deployBox({ active: false });
+      const r = deploy();
+      expect(r.status).toBe(0);
+      expect(releases(b)).toHaveLength(1);
+      expect(calls(b).some((c) => c === "systemctl restart aw-login-host@prod")).toBe(true);
+      expect(calls(b).some((c) => c.startsWith("ctl acquire"))).toBe(false); // nobody to protect yet
+    });
+
+    it("a running worker: install, wait for idle, restart, health; the new release is the active one", () => {
+      const { b, deploy } = deployBox({ active: true });
+      expect(run(b).status).toBe(0); // the first release is already there and "running"
+      const first = current(b);
+      nextSecond();
+      writeFileSync(join(b.pkg, "MANIFEST"), text(join(b.pkg, "MANIFEST")) + "next_build=1\n"); // a different build
+      writeFileSync(join(b.dir, "state/deployed-build-seq"), "0\n");
+      const r = deploy();
+      expect(r.status).toBe(0);
+      expect(current(b)).not.toBe(first);
+      expect(readlinkSync(join(b.opt, "previous"))).toBe(first);
+      const c = calls(b);
+      expect(c.findIndex((x) => x.startsWith("ctl acquire"))).toBeLessThan(c.findIndex((x) => x === "systemctl restart aw-login-host@prod"));
+      expect(c.filter((x) => x === "ctl release ")).toEqual([]); // the restart cleared the drain
+    });
+
+    it("redeploying the exact same build and configuration restarts NOTHING and lifts the drain it took", () => {
+      const { b, deploy } = deployBox({ active: true });
+      expect(run(b).status).toBe(0);
+      const first = current(b);
+      const r = deploy();
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain("nothing to restart");
+      expect(current(b)).toBe(first);
+      expect(calls(b).some((x) => x === "systemctl restart aw-login-host@prod")).toBe(false);
+      expect(calls(b)).toContain("ctl release ");
+    });
+
+    it("a busy worker (never idle): exit 75, nothing restarted, and the ACTIVE release is the one still running", () => {
+      const { b, S, deploy } = deployBox({ active: true });
+      expect(run(b).status).toBe(0);
+      const first = current(b);
+      nextSecond();
+      writeFileSync(join(b.pkg, "MANIFEST"), text(join(b.pkg, "MANIFEST")) + "next_build=1\n");
+      writeFileSync(join(S, "acquire.rc"), "75");
+      const r = deploy();
+      expect(r.status).toBe(75);
+      expect(current(b)).toBe(first); // files on disk still match the host that was never restarted
+      expect(calls(b).some((x) => x === "systemctl restart aw-login-host@prod")).toBe(false);
+      expect(text(join(b.conf, "prod.json"))).toBe(text(join(b.opt, first.replace(/^releases\//, "releases/"), "prod.json")));
+    });
+
+    it("an unhealthy new build is rolled back to the release that was running, and restarted on it", () => {
+      const { b, S, deploy } = deployBox({ active: true });
+      expect(run(b).status).toBe(0);
+      const first = current(b);
+      nextSecond();
+      writeFileSync(join(b.pkg, "MANIFEST"), text(join(b.pkg, "MANIFEST")) + "next_build=1\n");
+      writeFileSync(join(S, "health.rcs"), "1\n0\n");
+      const r = deploy();
+      expect(r.status).toBe(1);
+      expect(current(b)).toBe(first);
+      expect(calls(b).filter((x) => x === "systemctl restart aw-login-host@prod")).toHaveLength(2);
+    });
   });
 
   it("FIRST install: a complete, validated release is switched in atomically; the unit, slice and config are in place; nothing was disabled", () => {
