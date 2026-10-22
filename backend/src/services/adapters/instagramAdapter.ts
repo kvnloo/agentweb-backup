@@ -352,6 +352,7 @@ export class InstagramAdapter implements SocialPlatformAdapter {
                     for (const insight of insights) {
                         const val = insight.values?.[0]?.value || 0;
                         switch (insight.name) {
+                            case 'views':
                             case 'impressions':
                             case 'plays':
                             case 'carousel_album_impressions':
