@@ -11,7 +11,7 @@ merge to main (touches backend/src/loginHost/** or the build/sign scripts)
        1 build            scripts/build-login-host.sh   refuses unless the gate tests pass, the tree is clean, the lockfile matches
        2 sign             scripts/sign-login-host.sh    KMS key only this job's role can use
        3 upload           s3://agentweb-login-host-992382574572/prod/builds/<build>.tar.gz(+.sig)
-       4 run              SSM document AW-LoginHost-Deploy-Prod on i-033394e5467b48e94           (.github/scripts/login-host-run-deploy.sh)
+       4 run              SSM document AW-LoginHost-Deploy-Signed on i-033394e5467b48e94           (.github/scripts/login-host-run-deploy.sh)
   -> on the worker, as root (prod/ssm-run.sh, the document body):
        verify the signature BEFORE unpacking; check the layout; run the build's prod/deploy.sh:
          install (switch the active release; the running host is untouched)
@@ -49,21 +49,22 @@ bash backend/src/loginHost/deploy/aws/setup-once.sh --apply
 
 It first checks the GitHub environment (step 1). It creates, idempotently: the GitHub OIDC provider (if the account has none); the role `aw-login-host-ci`, assumable ONLY by this repo's `login-host-prod`
 environment; one KMS key (`alias/aw-login-host-signing`, ECC_NIST_P256, sign/verify) that ONLY that role can sign with; read access to
-`prod/builds/*` for the worker's instance role; and the SSM document `AW-LoginHost-Deploy-Prod`, rendered from `prod/ssm-run.sh` with the key's public half.
-The policies are the files in `policies/`; they are covered by tests that fail if they grow a wildcard.
+`prod/builds/*` for the worker's instance role; and the SSM document `AW-LoginHost-Deploy-Signed`, rendered from `prod/ssm-run.sh` with the key's public half.
+The policies are the files in `policies/`; tests pin their exact actions and resources.
 
-Not verified from here (no IAM read access): whether the account already has the GitHub OIDC provider, whether a document of that name exists (it will
-be updated to a new default version, the old one stays available), and whether `iam create-open-id-connect-provider` still wants an explicit
+Not verified from here (no IAM read access): whether the account already has the GitHub OIDC provider, whether a document of that name exists (a document with the new name is created or updated), and whether `iam create-open-id-connect-provider` still wants an explicit
 `--thumbprint-list` on the installed CLI (GitHub's providers are validated by AWS's trusted CAs now; if the CLI insists, add GitHub's published thumbprint).
 
 Then run the workflow once by hand (Actions -> Login host deploy -> Run workflow) and watch it. The first run formats the data disk, so do it when nobody
 is using the worker. Until `/etc/aw-login-host/bridge-url` exists on the worker (decided with the turn path) the install stops with exit 3 and the workflow fails with
 "bridge url missing": that is expected, and nothing is started.
 
-## Step 3: tidy (recommended)
+## Step 3: tidy (optional)
 
-- Remove `vendor-argusoft-access` from anything that grants S3 write, SSM send-command or KMS on this path: nobody needs it any more.
 - The temporary policy `AWLoginWorkerProvisionTemp` can go.
+- The earlier hand-run document `AW-LoginHost-Deploy-Prod` (it took a sha256 typed by a person, with no signature) is NOT used and NOT reachable by the pipeline: this setup creates a
+  NEW document, `AW-LoginHost-Deploy-Signed`, and the CI role may only send that one. Delete the old one when convenient; nothing depends on it.
+- `vendor-argusoft-access` does not need to change. The signing key's policy denies `kms:Sign` and `kms:CreateGrant` to everyone but the CI role, whatever IAM says elsewhere.
 
 ## Residual risk (read this before you rely on it)
 
@@ -78,12 +79,14 @@ is using the worker. Until `/etc/aw-login-host/bridge-url` exists on the worker 
    (item 1).
 4. The role can only be assumed by a job GitHub lets use the `login-host-prod` environment, and that environment only accepts runs from `main`. So only code
    already on `main` can sign a build. Item 1 is what decides who can put code there.
-5. The signing key, the CI role and the document are all in the one AWS account as the IAM administrators; they remain the root of trust.
+5. The signing key, the CI role and the document are all in the one AWS account; whoever can edit the key policy or the document (IAM/KMS/SSM administrators) remains the root of trust.
+6. `build_seq` (the pipeline's run number) is what orders builds. If the workflow file is ever renamed or recreated, GitHub restarts its run counter at 1 and the worker will refuse every build
+   until `/var/lib/aw-login-host/deployed-build-seq` is reset by a person. Losing that file instead allows an old signed build once.
 
 ## Operating it
 
 - **A deploy failed / rolled back:** the workflow turns red with the worker's output; the previous build is serving. Fix forward with a new merge.
-- **Not deployed because the host was busy:** exit 75, nothing changed; the workflow retried for about two hours. Re-run it later.
+- **Not deployed because the host was busy:** exit 75, nothing changed; the workflow retried for several hours. Re-run it later.
 - **A newer build is already on the worker:** the run is skipped (a signed old build is refused; this is what stops downgrades).
 - **Emergency (a security fix that cannot wait for an idle moment):** a person on a Session Manager shell runs `deploy.sh --force` from the extracted build.
   It cuts running turns off and says so loudly. The document and the pipeline never do this.

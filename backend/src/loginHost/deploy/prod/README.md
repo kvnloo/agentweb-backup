@@ -14,20 +14,22 @@ pins, sha256 of every file), `check-config.js` (the host's own config parser), t
 the worker's own private address is read at install time.
 
 ## Deploy
-**Automatic.** A merge to `main` that touches the host runs `.github/workflows/login-host-deploy.yml`: build (the gate), sign with KMS, upload, and run the SSM document
-`AW-LoginHost-Deploy-Prod`, whose body is `ssm-run.sh` in this folder. The document verifies the signature before it unpacks anything, then runs the build's `deploy.sh`:
-install (switch the active release; the running host is untouched) -> **wait for an idle moment** (no turn running, nobody mid sign-in; never forced) -> refuse new work for the
-seconds of the restart -> restart -> health check -> **roll back by itself** if unhealthy. A signed build older than the one deployed is refused (no downgrades).
-No person approves a deploy and no vendor takes part. One-time setup and the residual risk: `../aws/README.md`.
+**Automatic.** A merge to `main` that touches the host runs `.github/workflows/login-host-deploy.yml`: build (the gate; no cloud credentials), then sign with KMS, upload, and run the SSM
+document `AW-LoginHost-Deploy-Signed`, whose body is `ssm-run.sh` in this folder. The document verifies the signature before it unpacks anything, then runs the build's `deploy.sh`:
+**wait for an idle moment first** (no turn running, nobody mid sign-in; never forced; nothing on disk has changed yet) -> install (switch the active release while the host
+refuses new work) -> restart -> health check -> **roll back by itself** if unhealthy. A build whose pipeline number is not higher than the last deployed one is refused (no downgrades).
+No person approves a deploy and nobody else takes part. One-time setup and the residual risk: `../aws/README.md`.
 
-`deploy.sh` exit codes: 0 deployed | 75 host stayed busy, nothing changed (the workflow retries, then asks you to re-run) | 1 bad build, rolled back | 2 bad build and the
-rollback failed: the host is DOWN | 3 bridge URL missing | 4 older than the deployed build, refused. `--force` (a person, on a shell, never the pipeline) skips the idle wait
-for an emergency fix and cuts running turns off.
+`deploy.sh` exit codes: 0 deployed (or already running) | 75 host stayed busy, nothing changed (the workflow retries, then asks you to re-run) | 1 bad build, rolled back | 2 bad build and the
+rollback failed: the host is DOWN | 3 bridge URL missing | 4 not newer than the deployed build, refused | 22 aborted before the restart | 76 the running host predates the drain protocol
+(one-time `--force` bootstrap by a person). The document adds 20 (refused: bad signature, name or layout: a security event) and 21 (could not prepare; nothing ran).
+`--force` (a person, on a shell, never the pipeline) skips the idle wait for an emergency fix and cuts running turns off.
 
 **By hand** (break glass, on a Session Manager shell as root): extract a build tarball into a fresh `mktemp -d` and run `./deploy.sh` from it.
 
 **What a customer sees during a deploy:** nothing, normally. If a chat message starts in the few seconds of the restart it waits (the backend retries "draining" and "worker not
-reachable" for up to 40 s) and then runs once; a sign-in started in that window asks the customer to try again. Running turns and sign-ins in progress are never interrupted.
+reachable" for up to 40 s) and then runs once; a sign-in started in that window asks the customer to try again. Running turns and sign-ins in progress are never interrupted. If the host is busy for 10 minutes straight the
+deploy also holds back NEW sign-ins and scheduled turns (not interactive chat) until it can find a quiet moment, for at most the rest of its 30-minute wait.
 
 ## Worker layout (what `install.sh` creates)
 ```

@@ -1,6 +1,6 @@
 #!/bin/bash
 # ENG-2110: PRODUCTION install of the login host on the worker (Amazon Linux 2023, x86_64). Run as root by the SSM document
-# AW-LoginHost-Deploy-Prod from the extracted build tarball (this script's own directory holds everything it installs).
+# AW-LoginHost-Deploy-Signed from the extracted build tarball (this script's own directory holds everything it installs).
 #
 #   install.sh                          install / update everything (idempotent; safe to re-run; a failure NEVER stops a healthy running host)
 #   install.sh --dry-run                run every CHECK, print what would change, change nothing

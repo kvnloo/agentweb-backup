@@ -12,7 +12,7 @@ import { PROTOCOL_VERSION } from "../../protocol";
 import { startHostServer, type HostServerHandle } from "../../server";
 import { drain as drainEvents, makeRig, signIn, turnReq, type Rig } from "../helpers";
 
-const OPTS: GateOptions = { pollSec: 3, softAfterSec: 120, totalSec: 1800, strictTtlSec: 120 };
+const OPTS: GateOptions = { pollSec: 3, softAfterSec: 120, totalSec: 1800, strictTtlSec: 120 }; // (the CLI default for soft is later; these tests set their own)
 
 describe("acquireIdle", () => {
   let rig: Rig;
@@ -227,6 +227,27 @@ describe("deployctl (the bundled CLI against a real host socket)", () => {
     expect(r.rc).toBe(1);
     expect(r.out).toContain("deploy:");
     handle = await startHostServer(rig.mgr, { socketPath: join(dir, "host.sock"), socketMode: 0o660, tickMs: 3_600_000, sweepMs: 3_600_000 });
+  });
+
+  it("a host that predates host.drain (unknown route) is exit 76, not a failure and not a restart", async () => {
+    // an old host answers an unknown route exactly like this
+    await handle.close();
+    const { createServer } = await import("http");
+    const old = createServer((_req, res) => res.writeHead(404, { "content-type": "application/json" }).end(JSON.stringify({ error: "EINVALID", detail: "route" })));
+    await new Promise<void>((r) => old.listen(join(dir, "host.sock"), r));
+    const r = await ctl("acquire", "--total", "5");
+    await new Promise((res) => old.close(res));
+    expect(r.rc).toBe(76);
+    expect(r.out).toContain("predates");
+    handle = await startHostServer(rig.mgr, { socketPath: join(dir, "host.sock"), socketMode: 0o660, tickMs: 3_600_000, sweepMs: 3_600_000 });
+  });
+
+  it("--strict-ttl is honoured (the drain must outlive the install)", async () => {
+    expect((await ctl("acquire", "--total", "5", "--strict-ttl", "300")).rc).toBe(0);
+    rig.clock.advance(250_000);
+    expect(rig.mgr.hostStatus().drain).toBe("strict");
+    rig.clock.advance(60_000);
+    expect(rig.mgr.hostStatus().drain).toBe("off");
   });
 
   it("bad usage is exit 2", async () => {

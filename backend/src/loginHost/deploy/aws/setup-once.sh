@@ -13,7 +13,7 @@
 #
 # Creates: (1) the GitHub OIDC identity provider if the account has none, (2) the role `aw-login-host-ci` that ONLY the `login-host-prod` GitHub environment
 # of this repo can assume (that environment only accepts runs from main), (3) one KMS signing key (ECC_NIST_P256) that ONLY that role can sign with,
-# (4) read access to the builds prefix for the worker, (5) the SSM document AW-LoginHost-Deploy-Prod, rendered from the repo with the key's public half.
+# (4) read access to the builds prefix for the worker, (5) the SSM document AW-LoginHost-Deploy-Signed, rendered from the repo with the key's public half.
 # It does NOT touch the worker, run a deploy, or grant anything to any person. See README.md for the GitHub-side step and for what to remove afterwards.
 set -euo pipefail
 
@@ -37,7 +37,7 @@ REGION=${AWS_REGION:-us-west-2}
 REPO=AgentWebPro/agentweb
 ENVIRONMENT=login-host-prod
 BUCKET=agentweb-login-host-992382574572
-DOCUMENT=AW-LoginHost-Deploy-Prod
+DOCUMENT=AW-LoginHost-Deploy-Signed
 INSTANCE=i-033394e5467b48e94
 CI_ROLE=aw-login-host-ci
 KEY_ALIAS=alias/aw-login-host-signing
@@ -86,7 +86,7 @@ render "$HERE/policies/ci-role-trust.json.tpl" "$OUT/ci-trust.json"
 if "$AWS" iam get-role --role-name "$CI_ROLE" >/dev/null 2>&1; then
   run "update the CI role's trust policy" "$AWS" iam update-assume-role-policy --role-name "$CI_ROLE" --policy-document "file://$OUT/ci-trust.json"
 else
-  run "create the CI role" "$AWS" iam create-role --role-name "$CI_ROLE" --assume-role-policy-document "file://$OUT/ci-trust.json" --max-session-duration 3600 --description "ENG-2110: builds, signs and deploys the login worker from GitHub Actions (environment $ENVIRONMENT only)"
+  run "create the CI role" "$AWS" iam create-role --role-name "$CI_ROLE" --assume-role-policy-document "file://$OUT/ci-trust.json" --max-session-duration 14400 --description "ENG-2110: builds, signs and deploys the login worker from GitHub Actions (environment $ENVIRONMENT only)"
 fi
 
 # (3) the signing key: created with a policy that lets only the CI role sign (the role must exist first: a key policy cannot name a principal that does not)

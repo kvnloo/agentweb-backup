@@ -18,6 +18,7 @@ case "\$1 \$2" in
     n=\$(grep -c 'ssm send-command' "$WORK/calls")
     printf '%08d-0000-0000-0000-000000000000\n' "\$n"; exit 0 ;;
   "ssm get-command-invocation")
+    if [ -f "$WORK/inv-error" ]; then cat "$WORK/inv-error" >&2; exit 254; fi
     n=\$(echo "\$*" | sed -n 's/.*--command-id 0*\([0-9]*\)-.*/\1/p')
     rc=\$(sed -n "\${n}p" "$WORK/rcs")
     case "\$*" in
@@ -41,10 +42,27 @@ grep -q "BuildKey=prod/builds/login-host-0123456789ab.tar.gz,MaxWait=600" "$WORK
 grep -q "worker said hi" "$WORK/out" && ok "prints the worker output" || bad "output"
 [ "$(run 75 75 0)" = 0 ] && [ "$(sends)" = 3 ] && ok "busy twice, then deployed" || bad "busy then ok"
 [ "$(run 75 75 75)" = 75 ] && [ "$(sends)" = 3 ] && ok "always busy: gives up with 75 after the retries (nothing forced)" || bad "always busy"
-[ "$(run 4)" = 0 ] && [ "$(sends)" = 1 ] && grep -q "newer build is already deployed" "$WORK/out" && ok "an older build is a skip, not a failure" || bad "superseded"
+[ "$(run 4)" = 0 ] && [ "$(sends)" = 1 ] && grep -q "higher number is already deployed" "$WORK/out" && ok "an older build is a skip, not a failure" || bad "superseded"
 [ "$(run 1)" = 1 ] && [ "$(sends)" = 1 ] && grep -q "ROLLED BACK" "$WORK/out" && ok "bad build: fails, is NOT retried" || bad "bad build"
 [ "$(run 2)" = 2 ] && [ "$(sends)" = 1 ] && grep -q "DOWN" "$WORK/out" && ok "worker down: fails loudly, not retried" || bad "down"
 [ "$(run 3)" = 3 ] && [ "$(sends)" = 1 ] && ok "bridge url missing: fails" || bad "bridge"
+[ "$(run 20)" = 20 ] && [ "$(sends)" = 1 ] && grep -q "security event" "$WORK/out" && ok "a refused build is reported as a security event, not retried" || bad "refused"
+[ "$(run 21)" = 21 ] && ok "could not prepare" || bad "prepare"
+[ "$(run 22)" = 22 ] && grep -q "BEFORE restarting" "$WORK/out" && ok "aborted before restart" || bad "pre-restart"
+[ "$(run 76)" = 76 ] && ok "needs bootstrap" || bad "76"
+printf '1\n' >"$WORK/rcs"; : >"$WORK/calls"; echo "An error occurred (ExpiredTokenException) when calling the GetCommandInvocation operation" >"$WORK/inv-error"
+AW_AWS="$WORK/aws" INSTANCE_ID=i-123 POLL=0 RETRY_PAUSE=0 RETRIES=3 bash "$SCRIPT" prod/builds/login-host-0123456789ab.tar.gz 600 >"$WORK/out" 2>&1; rc=$?
+[ "$rc" = 1 ] && grep -q "cannot read the deploy's status" "$WORK/out" && ok "expired credentials surface as an error, not an endless wait" || bad "expired creds (rc=$rc)"
+echo "An error occurred (InvocationDoesNotExist) when calling the GetCommandInvocation operation" >"$WORK/inv-error"
+( sleep 1; rm -f "$WORK/inv-error" ) & 
+printf '0\n' >"$WORK/rcs"; : >"$WORK/calls"
+AW_AWS="$WORK/aws" INSTANCE_ID=i-123 POLL=0.3 RETRY_PAUSE=0 RETRIES=3 bash "$SCRIPT" prod/builds/login-host-0123456789ab.tar.gz 600 >"$WORK/out" 2>&1; rc=$?
+[ "$rc" = 0 ] && ok "a not-yet-existing invocation is treated as pending" || bad "pending (rc=$rc)"
+wait
+rm -f "$WORK/inv-error"
+AW_AWS="$WORK/aws" INSTANCE_ID=i-123 bash "$SCRIPT" prod/builds/login-host-0123456789ab.tar.gz "1800; reboot" >/dev/null 2>&1; [ $? = 1 ] && ok "refuses a bad max wait" || bad "max wait"
+AW_AWS="$WORK/aws" INSTANCE_ID=i-123 bash "$SCRIPT" prod/builds/login-host-0123456789ab.tar.gz 99999 >/dev/null 2>&1; [ $? = 1 ] && ok "refuses a max wait over an hour" || bad "max wait cap"
+AW_AWS="$WORK/aws" INSTANCE_ID=i-123 bash "$SCRIPT" "prod/builds/../x" 60 >/dev/null 2>&1; [ $? = 1 ] && ok "refuses a bad build key" || bad "key"
 [ "$(run 137)" = 1 ] && ok "an unknown exit code is a failure" || bad "unknown"
 bash -n "$SCRIPT" && ok "parses" || bad "parse"
 echo "$pass passed, $fail failed"

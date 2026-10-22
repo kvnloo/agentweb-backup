@@ -619,7 +619,7 @@ case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${
       expect({ e, inside: e === name || e.startsWith(`${name}/`) }).toEqual({ e, inside: true });
     }
     expect(lstatSync(join(pkg, "deploy.sh")).isFile()).toBe(true);
-    expect(text(join(pkg, "MANIFEST"))).toMatch(/^commit_time=\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/m); // deploy.sh's no-downgrade rule reads this
+    expect(text(join(pkg, "MANIFEST"))).toMatch(/^build_seq=/m); // deploy.sh's no-downgrade rule reads this (empty for a hand-made build, the run number in CI)
   });
 
   describe("deploy.sh driving the REAL install.sh from the REAL build (fake systemctl and a fake deployctl)", () => {
@@ -640,6 +640,8 @@ case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${
       );
       for (const f of ["systemctl", "ctlnode"]) chmodSync(join(b.bin, f), 0o755);
       mkdirSync(join(b.dir, "state"));
+      // (a CI build carries the pipeline's run number; this one was made by hand)
+      writeFileSync(join(b.pkg, "MANIFEST"), text(join(b.pkg, "MANIFEST")).replace(/^build_seq=.*$/m, "build_seq=7"));
       const env = { ...b.env, AW_SOCK: join(b.dir, "host.sock"), AW_DEPLOY_LOCK: join(b.dir, "deploy.lock"), AW_NODE: join(b.bin, "ctlnode"), AW_STATE_DIR: join(b.dir, "state"), AW_HEALTH_TIMEOUT: "5" };
       const deploy = (...args: string[]) => spawnSync("bash", [join(b.pkg, "deploy.sh"), ...args], { encoding: "utf8", env: { ...process.env, ...env }, timeout: 120_000 });
       return { b, S, deploy };
@@ -662,16 +664,17 @@ case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${
       const first = current(b);
       nextSecond();
       writeFileSync(join(b.pkg, "MANIFEST"), text(join(b.pkg, "MANIFEST")) + "next_build=1\n"); // a different build
-      writeFileSync(join(b.dir, "state/deployed-commit-time"), "0\n");
+      writeFileSync(join(b.dir, "state/deployed-build-seq"), "0\n");
       const r = deploy();
       expect(r.status).toBe(0);
       expect(current(b)).not.toBe(first);
       expect(readlinkSync(join(b.opt, "previous"))).toBe(first);
       const c = calls(b);
       expect(c.findIndex((x) => x.startsWith("ctl acquire"))).toBeLessThan(c.findIndex((x) => x === "systemctl restart aw-login-host@prod"));
+      expect(c.filter((x) => x === "ctl release ")).toEqual([]); // the restart cleared the drain
     });
 
-    it("redeploying the exact same build and configuration restarts NOTHING and never waits for idle", () => {
+    it("redeploying the exact same build and configuration restarts NOTHING and lifts the drain it took", () => {
       const { b, deploy } = deployBox({ active: true });
       expect(run(b).status).toBe(0);
       const first = current(b);
@@ -679,7 +682,8 @@ case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${
       expect(r.status).toBe(0);
       expect(r.stdout).toContain("nothing to restart");
       expect(current(b)).toBe(first);
-      expect(calls(b).some((x) => x === "systemctl restart aw-login-host@prod" || x.startsWith("ctl acquire"))).toBe(false);
+      expect(calls(b).some((x) => x === "systemctl restart aw-login-host@prod")).toBe(false);
+      expect(calls(b)).toContain("ctl release ");
     });
 
     it("a busy worker (never idle): exit 75, nothing restarted, and the ACTIVE release is the one still running", () => {

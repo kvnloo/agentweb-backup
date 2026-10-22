@@ -1,5 +1,5 @@
 #!/bin/bash
-# ENG-2110: the BODY of the SSM document AW-LoginHost-Deploy-Prod. It is the root of trust of every worker deploy: it runs as root on the machine that
+# ENG-2110: the BODY of the SSM document AW-LoginHost-Deploy-Signed. It is the root of trust of every worker deploy: it runs as root on the machine that
 # holds customers' Claude logins, and decides whether a build is allowed to run there. render-ssm-doc.mjs embeds this file in the document; a person with
 # IAM rights installs the document ONCE (deploy/aws/README.md). Changing this file changes nothing on the worker until that happens again.
 #
@@ -23,14 +23,25 @@ WORK_BASE='@@WORK_BASE@@'
 AWS=@@AWS@@
 OPENSSL=@@OPENSSL@@
 
-die() { echo "aw-deploy: REFUSED: $*" >&2; exit 1; }
+# Exit codes beyond deploy.sh's own: 20 = REFUSED (bad signature, name, layout: treat as a security event), 21 = could not prepare (download, unpack: nothing ran).
+# Anything unexpected before deploy.sh starts is mapped to 21 by the EXIT trap, so a failing tool (tar and aws also exit 2) is never mistaken for deploy.sh's "host DOWN".
+PHASE=prepare
+WORK=""
+on_exit() {
+  local rc=$?
+  if [ "$PHASE" = prepare ]; then
+    [ -z "$WORK" ] || rm -rf "$WORK"
+    if [ "$rc" != 0 ] && [ "$rc" != 20 ]; then echo "aw-deploy: could not prepare the build (exit $rc); nothing was run" >&2; exit 21; fi
+  fi
+}
+trap on_exit EXIT
+die() { echo "aw-deploy: REFUSED: $*" >&2; exit 20; }
 
 [[ "$BUILD_KEY" =~ ^prod/builds/(login-host-[0-9a-f]{12})\.tar\.gz$ ]] || die "BuildKey is not prod/builds/login-host-<12 hex>.tar.gz"
 NAME=${BASH_REMATCH[1]}
-[[ "$MAX_WAIT" =~ ^[0-9]{1,5}$ ]] || die "MaxWait is not a number of seconds"
+[[ "$MAX_WAIT" =~ ^[0-9]{1,4}$ ]] || die "MaxWait is not a number of seconds"
 
 WORK=$(mktemp -d "$WORK_BASE/aw-deploy.XXXXXX") # mode 0700, fresh, root-owned, never predictable or shared
-trap 'rm -rf "$WORK"' EXIT
 
 # The public half of the pipeline's signing key (KMS asymmetric ECC_NIST_P256, SIGN_VERIFY). Rotating the key means installing the document again.
 cat >"$WORK/signer.pub.pem" <<'PUBKEY'
@@ -72,7 +83,9 @@ chmod -R go-w "$PKG"
 
 # Not exec: deploy.sh must outlive nothing of ours, but its exit code is the document's result (and the lock inside it is released by it).
 cd "$PKG"
+PHASE=deploy
 exec_rc=0
 bash ./deploy.sh --max-wait "$MAX_WAIT" || exec_rc=$?
 echo "aw-deploy: deploy.sh finished with exit code $exec_rc"
+rm -rf "$WORK"
 exit "$exec_rc"

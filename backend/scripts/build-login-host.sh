@@ -4,7 +4,7 @@
 #   backend/scripts/build-login-host.sh [--out DIR] [--skip-tests] [--allow-dirty]       (default DIR: backend/dist/login-host-builds)
 #
 # Output: DIR/login-host-<gitsha>.tar.gz and DIR/login-host-<gitsha>.tar.gz.sha256. The tarball is what the SSM document
-# AW-LoginHost-Deploy-Prod downloads from s3://agentweb-login-host-992382574572/prod/builds/, verifies against the sha256 given to it,
+# AW-LoginHost-Deploy-Signed downloads from s3://agentweb-login-host-992382574572/prod/builds/, verifies against the sha256 given to it,
 # extracts into a fresh root-owned 0700 directory and runs (install.sh at its top level). Contents: install.sh, deploy.sh (install + idle gate + restart + health + rollback), lib.sh, versions.env, MANIFEST,
 # check-config.js, deployctl.js, the esbuild bundle of the host, and files/ (wrapper scripts, systemd units, config and slice templates, system prompt).
 # It never contains a secret and nothing machine-specific (the worker's address is read at install time); the build aborts if it sees private-key
@@ -146,6 +146,9 @@ fi
   echo "esbuild=$ESBUILD_VERSION"
   echo "build_node=$(node --version)"
   echo "commit_time=$(date -u -d "@$EPOCH" +%Y-%m-%dT%H:%M:%SZ)"
+  # The pipeline's run number: strictly increasing, and set by GitHub, not by whoever authored the commit. deploy.sh refuses a build whose number is lower
+  # than the last one deployed (a signed OLD build must not be a way to downgrade). Empty for a build made by hand, which deploy.sh refuses.
+  echo "build_seq=${GITHUB_RUN_NUMBER:-}"
   echo "--- pinned versions (versions.env) ---"
   grep -E '^[A-Z0-9_]+=' "$PROD/versions.env"
   echo "--- sha256 of every file ---"

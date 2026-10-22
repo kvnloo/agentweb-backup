@@ -6,7 +6,7 @@
  * installScripts.test.ts.
  */
 import { spawn, spawnSync } from "child_process";
-import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "fs";
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 
@@ -22,10 +22,14 @@ interface Scenario {
   health?: number[];
   rollbackRc?: number;
   hasPrevious?: boolean;
-  /** the build's commit_time in its MANIFEST (omit the file with null) */
-  buildTime?: string | null;
-  /** the commit time (epoch) of the build the worker last finished deploying */
-  lastDeployedEpoch?: number;
+  /** the active release symlink already exists, and the (fake) installer does not change it: an identical build */
+  activeBefore?: boolean;
+  /** the (fake) installer switches the active release and then fails */
+  installMovesCurrent?: boolean;
+  /** the build's build_seq in its MANIFEST (null = the line is absent, as in a hand-made build) */
+  buildSeq?: number | null;
+  /** the build_seq of the build the worker last finished deploying */
+  lastDeployedSeq?: number;
 }
 
 describe("deploy.sh", () => {
@@ -42,6 +46,8 @@ describe("deploy.sh", () => {
     mkdirSync(S, { recursive: true });
     mkdirSync(join(dir, "opt"), { recursive: true });
     rmSync(join(dir, "opt/previous"), { force: true });
+    rmSync(join(dir, "opt/current"), { force: true });
+    if (sc.activeBefore || sc.installMovesCurrent) symlinkSync("releases/old", join(dir, "opt/current"));
     if (sc.hasPrevious !== false) symlinkSync("releases/old", join(dir, "opt/previous"));
     writeFileSync(join(S, "active"), sc.active === false ? "1" : "0");
     writeFileSync(join(S, "install.rc"), String(sc.installRc ?? 0));
@@ -55,10 +61,10 @@ describe("deploy.sh", () => {
     copyFileSync(DEPLOY_SH, join(pkg, "deploy.sh"));
     chmodSync(join(pkg, "deploy.sh"), 0o755);
     writeFileSync(join(pkg, ".aw-test-mode"), "");
-    if (sc.buildTime !== null) writeFileSync(join(pkg, "MANIFEST"), `name=x\ncommit_time=${sc.buildTime ?? "2026-10-22T10:00:00Z"}\n`);
+    writeFileSync(join(pkg, "MANIFEST"), `name=x\ncommit_time=2026-10-22T10:00:00Z\n${sc.buildSeq === null ? "" : `build_seq=${sc.buildSeq ?? 100}\n`}`);
     mkdirSync(join(dir, "state"), { recursive: true });
-    rmSync(join(dir, "state/deployed-commit-time"), { force: true });
-    if (sc.lastDeployedEpoch !== undefined) writeFileSync(join(dir, "state/deployed-commit-time"), `${sc.lastDeployedEpoch}\n`);
+    rmSync(join(dir, "state/deployed-build-seq"), { force: true });
+    if (sc.lastDeployedSeq !== undefined) writeFileSync(join(dir, "state/deployed-build-seq"), `${sc.lastDeployedSeq}\n`);
     writeFileSync(join(pkg, "deployctl.js"), ""); // only the fake node reads its arguments
     // install.sh: logs, honours the scenario
     writeFileSync(
@@ -66,6 +72,7 @@ describe("deploy.sh", () => {
       `#!/bin/bash
 echo "install $*" >> "${dir}/calls.log"
 if [ "\${1:-}" = "--rollback" ]; then exit "$(cat "${S}/rollback.rc")"; fi
+${sc.installMovesCurrent ? `ln -sfn releases/new "${dir}/opt/current"` : ""}
 exit "$(cat "${S}/install.rc")"
 `,
     );
@@ -106,7 +113,7 @@ exit 0
         PATH: process.env.PATH ?? "",
         AW_SYSTEMCTL: join(bin, "systemctl"),
         AW_SOCK: join(dir, "host.sock"),
-        AW_DEPLOY_LOCK: join(dir, "deploy.lock"),
+        AW_DEPLOY_LOCK: join(dir, "lockdir/deploy.lock"),
         AW_NODE: join(bin, "node"),
         AW_OPT: join(dir, "opt"),
         AW_STATE_DIR: join(dir, "state"),
@@ -128,39 +135,45 @@ exit 0
   };
   const restarts = (calls: string[]) => calls.filter((c) => c.startsWith("systemctl restart")).length;
 
-  it("a busy-then-idle host: install, wait for idle, restart, health, in that order; exit 0", () => {
+  it("an idle host: wait for idle FIRST, then install, restart, health, in that order; exit 0", () => {
     const r = run({});
     expect(r.rc).toBe(0);
     const calls = log();
-    order(calls, "install ", "ctl acquire", "systemctl restart", "ctl health");
+    order(calls, "ctl acquire", "install ", "systemctl restart", "ctl health");
     expect(calls.filter((c) => c === "install ")).toHaveLength(1);
     expect(restarts(calls)).toBe(1);
     expect(r.out).toContain("OK   deployed");
   });
 
-  it("passes the wait limit to the gate", () => {
+  it("passes the wait limit and a strict-drain lifetime that covers the install to the gate", () => {
     run({}, ["--max-wait", "600"]);
-    expect(log()).toContain("ctl acquire --total 600");
+    expect(log()).toContain("ctl acquire --total 600 --strict-ttl 900");
   });
 
-  it("NOT idle within the limit: NOTHING is restarted, the active release is put back, exit 75 (try again later, not a failure)", () => {
+  it("NOT idle within the limit: NOTHING has changed (the installer never ran) and nothing is restarted; exit 75, not a failure", () => {
     const r = run({ acquireRc: 75 });
     expect(r.rc).toBe(75);
     const calls = log();
     expect(restarts(calls)).toBe(0); // the protected ACTION did not happen
+    expect(calls.some((c) => c.startsWith("install"))).toBe(false); // so nothing on disk moved under the running host
     expect(calls.some((c) => c.startsWith("ctl health"))).toBe(false);
-    order(calls, "install ", "ctl acquire", "install --rollback");
     expect(r.out).toContain("NOT DEPLOYED");
   });
 
-  it("an idle gate that FAILS (not just 'busy') also restarts nothing", () => {
-    const r = run({ acquireRc: 1 });
-    expect(r.rc).toBe(1);
-    expect(restarts(log())).toBe(0);
-    expect(log()).toContain("install --rollback");
+  it("a running host that predates the drain protocol is not gated, not touched, and reported (76) for a one-time forced bootstrap", () => {
+    const r = run({ acquireRc: 76 });
+    expect(r.rc).toBe(76);
+    expect(log().some((c) => c.startsWith("install") || c.startsWith("systemctl restart"))).toBe(false);
+    expect(r.out).toContain("one-time bootstrap");
   });
 
-  it("--force skips the gate (and says so), but still checks health", () => {
+  it("an idle gate that FAILS (not just 'busy') changes and restarts nothing; exit 22", () => {
+    const r = run({ acquireRc: 1 });
+    expect(r.rc).toBe(22);
+    expect(log().some((c) => c.startsWith("install") || c.startsWith("systemctl restart"))).toBe(false);
+  });
+
+  it("--force skips the gate (and says so), installs, restarts and still checks health", () => {
     const r = run({}, ["--force"]);
     expect(r.rc).toBe(0);
     expect(log().some((c) => c.startsWith("ctl acquire"))).toBe(false);
@@ -184,8 +197,7 @@ exit 0
   });
 
   it("a rollback that cannot even be installed is DOWN too", () => {
-    const r = run({ health: [1], rollbackRc: 1 });
-    expect(r.rc).toBe(2);
+    expect(run({ health: [1], rollbackRc: 1 }).rc).toBe(2);
   });
 
   it("no previous release: a bad build reports DOWN instead of pretending to roll back", () => {
@@ -194,23 +206,45 @@ exit 0
     expect(log()).not.toContain("install --rollback");
   });
 
-  it("a host that is not running has nobody to protect: no gate, start it, check it", () => {
+  it("a host that is not running has nobody to protect: no gate, install, start it, check it", () => {
     const r = run({ active: false });
     expect(r.rc).toBe(0);
     expect(log().some((c) => c.startsWith("ctl acquire"))).toBe(false);
     expect(restarts(log())).toBe(1);
   });
 
-  it("a failed install restarts nothing and touches nothing", () => {
+  it("a failed install restarts nothing, lifts the drain it took, and exits 22", () => {
     const r = run({ installRc: 1 });
-    expect(r.rc).toBe(1);
-    expect(log().filter((c) => !c.startsWith("systemctl is-active"))).toEqual(["install "]);
+    expect(r.rc).toBe(22);
+    const calls = log().filter((c) => !c.startsWith("systemctl is-active"));
+    expect(calls).toEqual(["ctl acquire --total 1800 --strict-ttl 900", "install ", "ctl release "]);
   });
 
-  it("an install that is refused for want of a bridge URL (exit 3) is passed through and nothing is restarted", () => {
+  it("an install that fails AFTER switching the active release puts the old one back (the old host is still running on it)", () => {
+    const r = run({ installRc: 1, installMovesCurrent: true });
+    expect(r.rc).toBe(22);
+    order(log(), "install ", "install --rollback", "ctl release");
+    expect(restarts(log())).toBe(0);
+  });
+
+  it("an install that is refused for want of a bridge URL (exit 3) is passed through, nothing is restarted, the drain is lifted", () => {
     const r = run({ installRc: 3 });
     expect(r.rc).toBe(3);
     expect(restarts(log())).toBe(0);
+    expect(log()).toContain("ctl release ");
+  });
+
+  it("an identical build (the installer changes nothing) restarts nothing and lifts the drain at once", () => {
+    const r = run({ activeBefore: true });
+    expect(r.rc).toBe(0);
+    expect(r.out).toContain("nothing to restart");
+    expect(restarts(log())).toBe(0);
+    expect(log()).toContain("ctl release ");
+  });
+
+  it("a successful restart does not leave a stale release call behind (the restart cleared the drain)", () => {
+    run({});
+    expect(log()).not.toContain("ctl release ");
   });
 
   it("clears a start-limit failure before restarting (a crash loop must not block the deploy that fixes it)", () => {
@@ -218,66 +252,70 @@ exit 0
     order(log(), "systemctl reset-failed", "systemctl restart");
   });
 
-  it("two deploys never run at once", async () => {
-    const lock = join(dir, "deploy.lock");
+  it("two deploys never run at once, and the lock lives in a root-only directory", async () => {
+    mkdirSync(join(dir, "lockdir"), { recursive: true });
+    const lock = join(dir, "lockdir/deploy.lock");
     const holder = spawn("bash", ["-c", `exec 8>"${lock}"; flock 8; sleep 5`]);
     await new Promise((r) => setTimeout(r, 300));
     const r = run({});
     holder.kill();
-    expect(r.rc).toBe(1);
+    expect(r.rc).toBe(22);
     expect(r.out).toContain("another deploy is running");
     expect(restarts(log())).toBe(0);
   });
 
+  it("creates the lock directory root-only when it does not exist", () => {
+    run({});
+    expect(statSync(join(dir, "lockdir")).mode & 0o777).toBe(0o700);
+  });
+
   describe("no downgrades (a validly signed OLD build is still a downgrade)", () => {
-    const T = "2026-10-22T10:00:00Z";
-    const epoch = Date.parse(T) / 1000;
     const recorded = () => {
       try {
-        return Number(readFileSync(join(dir, "state/deployed-commit-time"), "utf8"));
+        return Number(readFileSync(join(dir, "state/deployed-build-seq"), "utf8"));
       } catch {
         return undefined;
       }
     };
 
-    it("refuses a build older than the one deployed: exit 4, and NOTHING runs (not even the installer)", () => {
-      const r = run({ lastDeployedEpoch: epoch + 60 });
+    it("refuses a build with a LOWER number than the one deployed: exit 4, and NOTHING runs (not even the gate or installer)", () => {
+      const r = run({ buildSeq: 99, lastDeployedSeq: 100 });
       expect(r.rc).toBe(4);
       expect(log().filter((c) => !c.startsWith("systemctl is-active"))).toEqual([]);
       expect(r.out).toContain("REFUSED");
-      expect(recorded()).toBe(epoch + 60);
+      expect(recorded()).toBe(100);
     });
-    it("accepts the same commit again (a redeploy) and a newer one, and records the time only AFTER the host is healthy", () => {
-      expect(run({ lastDeployedEpoch: epoch }).rc).toBe(0);
-      expect(run({ lastDeployedEpoch: epoch - 3600 }).rc).toBe(0);
-      expect(recorded()).toBe(epoch);
+    it("accepts the same number again (a redeploy) and a higher one, and records it only AFTER the host is healthy", () => {
+      expect(run({ buildSeq: 100, lastDeployedSeq: 100 }).rc).toBe(0);
+      expect(run({ buildSeq: 100, lastDeployedSeq: 50 }).rc).toBe(0);
+      expect(recorded()).toBe(100);
     });
-    it("first ever deploy records its time", () => {
+    it("first ever deploy records its number", () => {
       expect(run({}).rc).toBe(0);
-      expect(recorded()).toBe(epoch);
+      expect(recorded()).toBe(100);
     });
-    it("a failed or rolled-back deploy does not move the mark forward", () => {
-      expect(run({ lastDeployedEpoch: epoch - 100, health: [1, 0] }).rc).toBe(1);
-      expect(recorded()).toBe(epoch - 100);
-      expect(run({ lastDeployedEpoch: epoch - 100, acquireRc: 75 }).rc).toBe(75);
-      expect(recorded()).toBe(epoch - 100);
+    it("a failed, rolled-back or not-idle deploy does not move the mark forward", () => {
+      expect(run({ lastDeployedSeq: 50, health: [1, 0] }).rc).toBe(1);
+      expect(recorded()).toBe(50);
+      expect(run({ lastDeployedSeq: 50, acquireRc: 75 }).rc).toBe(75);
+      expect(recorded()).toBe(50);
     });
     it("the mark never moves backwards, even with --allow-older", () => {
-      expect(run({ lastDeployedEpoch: epoch + 500 }, ["--allow-older"]).rc).toBe(0);
-      expect(recorded()).toBe(epoch + 500);
+      expect(run({ buildSeq: 100, lastDeployedSeq: 500 }, ["--allow-older"]).rc).toBe(0);
+      expect(recorded()).toBe(500);
     });
     it("--allow-older lets a person step back on purpose", () => {
-      expect(run({ lastDeployedEpoch: epoch + 60 }, ["--allow-older"]).rc).toBe(0);
+      expect(run({ buildSeq: 99, lastDeployedSeq: 100 }, ["--allow-older"]).rc).toBe(0);
     });
-    it("a build whose MANIFEST has no readable commit time is refused", () => {
-      expect(run({ buildTime: null }).rc).toBe(4);
-      expect(run({ buildTime: "not a date" }).rc).toBe(4);
+    it("a build with no pipeline number (hand-made) is refused, and a git committer date cannot stand in for it", () => {
+      expect(run({ buildSeq: null }).rc).toBe(4);
       expect(log().filter((c) => !c.startsWith("systemctl is-active"))).toEqual([]);
+      expect(run({ buildSeq: null }, ["--allow-older"]).rc).toBe(0);
     });
   });
 
   it("refuses a nonsense wait limit and unknown arguments before doing anything", () => {
-    expect(run({}, ["--max-wait", "soon"]).rc).toBe(1);
+    expect(run({}, ["--max-wait", "soon"]).rc).toBe(22);
     expect(log()).toEqual([]);
     expect(run({}, ["--yolo"]).rc).toBe(2);
   });

@@ -2,12 +2,12 @@
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "AccountAdministersTheKeyButCannotSignWithIt",
+      "Sid": "AccountAdministersTheKey",
       "Effect": "Allow",
       "Principal": { "AWS": "arn:aws:iam::@@ACCOUNT@@:root" },
       "Action": [
-        "kms:Create*", "kms:Describe*", "kms:Enable*", "kms:List*", "kms:Put*", "kms:Update*", "kms:Revoke*", "kms:Disable*", "kms:Get*", "kms:Delete*",
-        "kms:TagResource", "kms:UntagResource", "kms:ScheduleKeyDeletion", "kms:CancelKeyDeletion"
+        "kms:DescribeKey", "kms:GetKeyPolicy", "kms:GetKeyRotationStatus", "kms:GetPublicKey", "kms:ListAliases", "kms:ListKeyPolicies", "kms:ListResourceTags",
+        "kms:PutKeyPolicy", "kms:TagResource", "kms:UntagResource", "kms:EnableKey", "kms:DisableKey", "kms:ScheduleKeyDeletion", "kms:CancelKeyDeletion"
       ],
       "Resource": "*"
     },
@@ -17,6 +17,14 @@
       "Principal": { "AWS": "arn:aws:iam::@@ACCOUNT@@:role/@@CI_ROLE@@" },
       "Action": ["kms:Sign", "kms:GetPublicKey", "kms:DescribeKey"],
       "Resource": "*"
+    },
+    {
+      "Sid": "NobodyElseMaySignOrGrantSigning",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": ["kms:Sign", "kms:CreateGrant", "kms:RetireGrant", "kms:ReEncrypt*"],
+      "Resource": "*",
+      "Condition": { "StringNotEquals": { "aws:PrincipalArn": "arn:aws:iam::@@ACCOUNT@@:role/@@CI_ROLE@@" } }
     }
   ]
 }

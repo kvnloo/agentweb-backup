@@ -2,7 +2,8 @@
  * ENG-2110: the deploy's window into the running host, as a tiny stand-alone program (build-login-host.sh bundles it to deployctl.js, deploy.sh
  * runs it as root over the host's unix socket; the network listener refuses `host.drain`).
  *
- *   node deployctl.js <socket> acquire [--poll S] [--soft-after S] [--total S]   wait for idle, then refuse new work   0 acquired, 75 not idle
+ *   node deployctl.js <socket> acquire [--poll S] [--soft-after S] [--total S] [--strict-ttl S]   wait for idle, then refuse new work
+ *                                                                              0 acquired, 75 not idle, 76 the host predates drain (cannot be gated)
  *   node deployctl.js <socket> release                                          let the host take work again           0
  *   node deployctl.js <socket> health [--timeout S] [--any-protocol]             this build is up, same protocol (any, after a rollback), undrained   0 healthy, 1 not
  *   node deployctl.js <socket> info                                              prints host.info as JSON               0
@@ -21,8 +22,12 @@ function call<T>(socketPath: string, route: string, body: unknown): Promise<T> {
       res.on("end", () => {
         try {
           const json = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-          if ((res.statusCode ?? 0) >= 400) reject(new Error(`host answered ${res.statusCode} ${String(json?.error ?? "")}${json?.detail ? "/" + String(json.detail) : ""}`));
-          else resolve(json as T);
+          if ((res.statusCode ?? 0) >= 400) {
+            const err = new Error(`host answered ${res.statusCode} ${String(json?.error ?? "")}${json?.detail ? "/" + String(json.detail) : ""}`);
+            // A host built before host.drain existed answers an unknown route like this.
+            if (res.statusCode === 404 && json?.error === "EINVALID" && json?.detail === "route") (err as Error & { unknownRoute?: boolean }).unknownRoute = true;
+            reject(err);
+          } else resolve(json as T);
         } catch {
           reject(new Error(`host answered ${res.statusCode} with something that is not JSON`));
         }
@@ -52,11 +57,19 @@ async function main(argv: string[]): Promise<number> {
   const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
   switch (cmd) {
     case "acquire": {
-      const r = await acquireIdle(
-        { pollSec: num(rest, "--poll", DEFAULT_GATE.pollSec), softAfterSec: num(rest, "--soft-after", DEFAULT_GATE.softAfterSec), totalSec: num(rest, "--total", DEFAULT_GATE.totalSec), strictTtlSec: DEFAULT_GATE.strictTtlSec },
-        { drain: (mode, ttlSec) => call<DrainReply>(socket, "host.drain", { mode, ttlSec }), sleep, now: Date.now, log },
-      );
-      return r.result === "acquired" ? 0 : 75;
+      try {
+        const r = await acquireIdle(
+          { pollSec: num(rest, "--poll", DEFAULT_GATE.pollSec), softAfterSec: num(rest, "--soft-after", DEFAULT_GATE.softAfterSec), totalSec: num(rest, "--total", DEFAULT_GATE.totalSec), strictTtlSec: num(rest, "--strict-ttl", DEFAULT_GATE.strictTtlSec) },
+          { drain: (mode, ttlSec) => call<DrainReply>(socket, "host.drain", { mode, ttlSec }), sleep, now: Date.now, log },
+        );
+        return r.result === "acquired" ? 0 : 75;
+      } catch (e) {
+        if ((e as { unknownRoute?: boolean }).unknownRoute) {
+          console.error("deploy: the running host does not know host.drain (it predates it)");
+          return 76;
+        }
+        throw e;
+      }
     }
     case "release":
       await call(socket, "host.drain", { mode: "off" });

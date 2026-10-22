@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * ENG-2110: renders the SSM document AW-LoginHost-Deploy-Prod from ../prod/ssm-run.sh. Plain Node, no dependencies, so the person who installs the
+ * ENG-2110: renders the SSM document AW-LoginHost-Deploy-Signed from ../prod/ssm-run.sh. Plain Node, no dependencies, so the person who installs the
  * document once can run it from a checkout:
  *
  *   node render-ssm-doc.js --public-key signer.pub.pem --bucket agentweb-login-host-992382574572 > doc.json
@@ -35,15 +35,15 @@ function render({ publicKeyPem, bucket, script = readFileSync(SCRIPT, "utf8"), w
   if (/@@[A-Z_]+@@/.test(body)) throw new Error("an unfilled placeholder is left in the script");
   const params = body.match(/\{\{[^}]*\}\}/g) || [];
   if (!params.every((p) => p === "{{ BuildKey }}" || p === "{{ MaxWait }}")) throw new Error("the script contains a {{ }} that is not one of the two parameters");
-  body = body.replace(/^#!.*\n/, "");
+  // The shebang stays: SSM runs a script that starts with one by that interpreter, and the script needs bash (=~, pipefail), not whatever /bin/sh is.
   return {
     schemaVersion: "2.2",
     description: "ENG-2110: deploy a signed login-host build to the prod worker. Verifies the pipeline's signature, then runs the build's deploy.sh (idle gate, health check, rollback). Source: backend/src/loginHost/deploy/prod/ssm-run.sh in the repo.",
     parameters: {
       BuildKey: { type: "String", description: "S3 key of the signed build", allowedPattern: "^prod/builds/login-host-[0-9a-f]{12}\\.tar\\.gz$" },
-      MaxWait: { type: "String", description: "Seconds the deploy may wait for the host to be idle", default: "1800", allowedPattern: "^[0-9]{1,5}$" },
+      MaxWait: { type: "String", description: "Seconds the deploy may wait for the host to be idle", default: "1800", allowedPattern: "^[0-9]{1,4}$" },
     },
-    mainSteps: [{ action: "aws:runShellScript", name: "deploy", inputs: { timeoutSeconds: "5400", runCommand: body.split("\n") } }],
+    mainSteps: [{ action: "aws:runShellScript", name: "deploy", inputs: { timeoutSeconds: "14400", runCommand: body.split("\n") } }],
   };
 }
 

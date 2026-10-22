@@ -18,7 +18,7 @@ const sub = (s: string) =>
     .replace(/@@ENVIRONMENT@@/g, "login-host-prod")
     .replace(/@@BUCKET@@/g, "agentweb-login-host-992382574572")
     .replace(/@@REGION@@/g, "us-west-2")
-    .replace(/@@DOCUMENT@@/g, "AW-LoginHost-Deploy-Prod")
+    .replace(/@@DOCUMENT@@/g, "AW-LoginHost-Deploy-Signed")
     .replace(/@@INSTANCE@@/g, "i-033394e5467b48e94")
     .replace(/@@CI_ROLE@@/g, "aw-login-host-ci")
     .replace(/@@KEY_ARN@@/g, "arn:aws:kms:us-west-2:992382574572:key/1234abcd-12ab-34cd-56ef-1234567890ab");
@@ -49,7 +49,7 @@ describe("the policies", () => {
     expect(by.WriteBuildsOnly).toMatchObject({ Action: "s3:PutObject", Resource: "arn:aws:s3:::agentweb-login-host-992382574572/prod/builds/*" });
     expect(by.SignWithTheOneKey.Resource).toMatch(/^arn:aws:kms:us-west-2:992382574572:key\/[0-9a-f-]+$/);
     expect(by.SignWithTheOneKey.Action).toEqual(["kms:Sign", "kms:GetPublicKey"]);
-    expect(by.RunTheOneDocumentOnTheOneInstance.Resource).toEqual(["arn:aws:ssm:us-west-2:992382574572:document/AW-LoginHost-Deploy-Prod", "arn:aws:ec2:us-west-2:992382574572:instance/i-033394e5467b48e94"]);
+    expect(by.RunTheOneDocumentOnTheOneInstance.Resource).toEqual(["arn:aws:ssm:us-west-2:992382574572:document/AW-LoginHost-Deploy-Signed", "arn:aws:ec2:us-west-2:992382574572:instance/i-033394e5467b48e94"]);
     // the only statement with Resource "*" is reading a command's result; no action anywhere is a wildcard
     expect(st.filter((s) => s.Resource === "*").map((s) => s.Sid)).toEqual(["ReadTheResult"]);
     for (const s of st) for (const a of ([] as string[]).concat(s.Action)) expect(a).not.toMatch(/\*/);
@@ -58,15 +58,21 @@ describe("the policies", () => {
     expect(actions.sort()).toEqual(["kms:GetPublicKey", "kms:Sign", "s3:PutObject", "ssm:GetCommandInvocation", "ssm:SendCommand"]);
   });
 
-  it("only the CI role may sign with the key; the account administers it but its own grant does not include signing", () => {
-    const st = policy("kms-key-policy.json.tpl").Statement as Array<{ Sid: string; Principal: { AWS: string }; Action: string[]; Resource: string }>;
-    const admin = st.find((s) => s.Sid.startsWith("AccountAdministers"))!;
-    const signer = st.find((s) => s.Sid === "OnlyTheDeployPipelineSigns")!;
-    expect(signer.Principal.AWS).toBe("arn:aws:iam::992382574572:role/aw-login-host-ci");
+  it("only the CI role may sign with the key: the account administers it with explicit actions (no wildcards, no grants), and a DENY covers everyone else", () => {
+    const st = policy("kms-key-policy.json.tpl").Statement as Array<{ Sid: string; Effect: string; Principal: unknown; Action: string[]; Condition?: unknown }>;
+    expect(st.map((x) => x.Sid)).toEqual(["AccountAdministersTheKey", "OnlyTheDeployPipelineSigns", "NobodyElseMaySignOrGrantSigning"]);
+    const [admin, signer, deny] = st;
     expect(signer.Action).toEqual(["kms:Sign", "kms:GetPublicKey", "kms:DescribeKey"]);
-    expect(admin.Action.some((a) => a === "kms:*" || a === "kms:Sign" || a === "kms:Sign*")).toBe(false);
-    expect(admin.Action).not.toContain("kms:Encrypt");
-    expect(st).toHaveLength(2);
+    expect(signer.Principal).toEqual({ AWS: "arn:aws:iam::992382574572:role/aw-login-host-ci" });
+    // the administrator statement: no wildcard action, and nothing that can sign or hand out signing
+    for (const a of admin.Action) {
+      expect(a).not.toMatch(/\*/);
+      expect(a).not.toMatch(/^kms:(Sign|CreateGrant|RetireGrant|Encrypt|Decrypt|ReEncrypt|Verify)/);
+    }
+    expect(deny.Effect).toBe("Deny");
+    expect(deny.Principal).toBe("*");
+    expect(deny.Action).toEqual(expect.arrayContaining(["kms:Sign", "kms:CreateGrant"]));
+    expect(deny.Condition).toEqual({ StringNotEquals: { "aws:PrincipalArn": "arn:aws:iam::992382574572:role/aw-login-host-ci" } });
   });
 
   it("the worker may read the builds prefix and nothing else", () => {
@@ -144,7 +150,7 @@ exit 0
     expect(at("kms create-alias --alias-name alias/aw-login-host-signing")).toBeGreaterThan(at("kms create-key"));
     expect(at("iam put-role-policy --role-name aw-login-host-ci")).toBeGreaterThan(at("kms create-alias"));
     expect(at("iam put-role-policy --role-name eng1816-worker-role")).toBeGreaterThan(0);
-    expect(at("ssm create-document --name AW-LoginHost-Deploy-Prod")).toBeGreaterThan(at("iam put-role-policy --role-name aw-login-host-ci"));
+    expect(at("ssm create-document --name AW-LoginHost-Deploy-Signed")).toBeGreaterThan(at("iam put-role-policy --role-name aw-login-host-ci"));
     expect(c.some((x) => x.includes("kms create-key") && x.includes("--key-spec ECC_NIST_P256") && x.includes("--key-usage SIGN_VERIFY"))).toBe(true);
     // it asked for the document to be rendered from the repo's body with a real public key
     const doc = JSON.parse(readFileSync(join(out, "doc.json"), "utf8"));

@@ -4,7 +4,7 @@
  *
  *   phase 1  every `pollSec` ask for a STRICT drain: it only succeeds when no turn is running and nobody is mid sign-in, and then it refuses all
  *            new turns and sign-ins (the backend retries those, see runHostTurn) until the restart, which takes seconds.
- *   phase 2  after `softAfterSec` also ask for a SOFT drain (new sign-ins and scheduled turns wait, interactive turns continue), so a host that is
+ *   phase 2  after `softAfterSec` (10 minutes: new sign-ins wait only if the host STAYS busy that long) also ask for a SOFT drain (new sign-ins and scheduled turns wait, interactive turns continue), so a host that is
  *            never quite idle because of background work reaches idle by itself. Soft is dropped again with the strict attempt that succeeds.
  *   timeout  after `totalSec` give up: drain off, report "not idle". The deploy is then cancelled and can simply run again later. It NEVER
  *            falls back to restarting a host that is serving someone (`--force` is a separate, loud, human decision).
@@ -34,7 +34,7 @@ export interface GateOptions {
   strictTtlSec: number;
 }
 
-export const DEFAULT_GATE: GateOptions = { pollSec: 3, softAfterSec: 120, totalSec: 1800, strictTtlSec: 120 };
+export const DEFAULT_GATE: GateOptions = { pollSec: 3, softAfterSec: 600, totalSec: 1800, strictTtlSec: 120 };
 
 export type GateResult = { result: "acquired"; waitedSec: number } | { result: "not_idle"; running: number; signIns: number; waitedSec: number };
 

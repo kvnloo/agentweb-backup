@@ -89,6 +89,16 @@ describe("ssm-run.sh (the deploy document's body)", () => {
     expect(workLeft()).toEqual([]);
   });
 
+  it("a tool failing BEFORE deploy.sh starts (download, unpack) is 21 'could not prepare', never a code deploy.sh uses (tar and aws also exit 2 = 'host DOWN')", () => {
+    const { root, name } = makePackage();
+    signFile(tarUp(root, name));
+    writeFileSync(join(dir, "aws"), "#!/bin/bash\nexit 2\n");
+    const r = runDoc();
+    expect(r.rc).toBe(21);
+    expect(deployRan()).toBe(false);
+    expect(workLeft()).toEqual([]);
+  });
+
   it("deploy.sh's exit code is the document's result (75 'not idle' must reach the pipeline as 75)", () => {
     const { root, name } = makePackage({ rc: 75 });
     signFile(tarUp(root, name));
@@ -110,7 +120,7 @@ describe("ssm-run.sh (the deploy document's body)", () => {
 
   describe("refused: the build is never unpacked and deploy.sh never runs", () => {
     const refused = (r: { rc: number | null; out: string }, why: string) => {
-      expect(r.rc).toBe(1);
+      expect(r.rc).toBe(20); // distinct from every deploy.sh code: the pipeline reports it as a security event
       expect(r.out).toContain("REFUSED");
       expect(r.out).toContain(why);
       expect(deployRan()).toBe(false);
@@ -216,7 +226,7 @@ describe("ssm-run.sh (the deploy document's body)", () => {
       const { root, name } = makePackage();
       signFile(tarUp(root, name));
       const r = runDoc({ BuildKey: key });
-      expect(r.rc).toBe(1);
+      expect(r.rc).toBe(20);
       expect(r.out).toContain("BuildKey is not");
       expect(deployRan()).toBe(false);
     });
@@ -244,11 +254,11 @@ describe("ssm-run.sh (the deploy document's body)", () => {
       expect(new RegExp(doc.parameters.MaxWait.allowedPattern).test("1800")).toBe(true);
     });
 
-    it.each(["", "abc", "1800; reboot", "-1", "123456"])("MaxWait %j", (v) => {
+    it.each(["", "abc", "1800; reboot", "-1", "12345"])("MaxWait %j", (v) => {
       const { root, name } = makePackage();
       signFile(tarUp(root, name));
       const r = runDoc({ MaxWait: v });
-      expect(r.rc).toBe(1);
+      expect(r.rc).toBe(20);
       expect(r.out).toContain("MaxWait is not");
       expect(deployRan()).toBe(false);
     });
@@ -262,14 +272,15 @@ describe("render-ssm-doc.js", () => {
   it("renders a document that constrains both parameters and carries the public key, never a private one", () => {
     const doc = render(ok);
     expect(doc.parameters.BuildKey.allowedPattern).toBe("^prod/builds/login-host-[0-9a-f]{12}\\.tar\\.gz$");
-    expect(doc.parameters.MaxWait.allowedPattern).toBe("^[0-9]{1,5}$");
+    expect(doc.parameters.MaxWait.allowedPattern).toBe("^[0-9]{1,4}$");
     const script = doc.mainSteps[0].inputs.runCommand.join("\n");
     expect(script).toContain("BEGIN PUBLIC KEY");
     expect(script).not.toContain("PRIVATE KEY");
     expect(script).toContain("s3://$BUCKET/$BUILD_KEY");
     expect(script).toContain("agentweb-login-host-992382574572");
     expect(script).not.toMatch(/@@[A-Z_]+@@/);
-    expect(Number(doc.mainSteps[0].inputs.timeoutSeconds)).toBeGreaterThan(1800); // longer than the longest idle wait
+    expect(Number(doc.mainSteps[0].inputs.timeoutSeconds)).toBeGreaterThan(9999 + 3600); // longer than the longest allowed idle wait plus install and two health checks
+    expect(script.startsWith("#!/bin/bash")).toBe(true); // SSM honours the shebang; the script needs bash
   });
 
   it("refuses a key that is not EC P-256 (RSA, P-384, garbage, a private key)", () => {

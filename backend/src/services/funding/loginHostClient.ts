@@ -40,6 +40,7 @@ export class LoginHostError extends Error {
   get notSent(): boolean {
     if (this.code === "TIMEOUT") return this.detail === "connect";
     return this.code === "UNREACHABLE" && (this.detail === "ECONNREFUSED" || this.detail === "EHOSTUNREACH" || this.detail === "ENETUNREACH" || this.detail === "ENOENT");
+    // (ECONNRESET is deliberately not here: it can come after the request was sent.)
   }
   /** The call may or may not have reached the host (no usable answer). */
   get ambiguous(): boolean {
