@@ -12773,7 +12773,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       resolvedParams = await this.resolvePlacementAssetHashes(userId, resolvedParams, params.account_id);
       // IG placements require an instagram_user_id in object_story_spec — auto-resolve from the Page.
       resolvedParams = await this.resolvePlacementInstagramActor(resolvedParams, accessToken);
-      const creative = await metaService.createAdCreative(accountId, accessToken, resolvedParams);
+      const created = await metaService.createAdCreative(accountId, accessToken, resolvedParams);
+      // Meta's create response carries only the id; keep the name we sent so messages don't say "undefined".
+      const creative = created ? { ...created, name: created.name ?? resolvedParams.name } : created;
       // ENG-2141: link the generated images this creative uses to it (inert unless enabled).
       if (creative?.id) {
         void stampMetaCreativeCreated({ userId, accountId, metaCreativeId: String(creative.id), params: resolvedParams });
@@ -13056,6 +13058,28 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   // the swap path. carriedUrlTags below already forwards it correctly.
   private static CREATIVE_CONTENT_KEYS = ['link_url', 'destination', 'url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'call_to_action_type', 'placement_assets', 'url_tags', 'description', 'instagram_user_id'];
 
+  /**
+   * A just-created placement-customized creative cannot be attached for ~20-30s: Meta answers
+   * 1772103 "Instagram Account Is Missing" until it has processed it (measured live, ENG-2623).
+   * Retry only that error; any other failure, or running out of attempts, is thrown as before.
+   * The backoff is 30s because Meta also allows only one update per ad per 30s (#613).
+   */
+  private async attachCreativeWhenReady(accessToken: string, adId: string, creativeId: string, accountId: string): Promise<void> {
+    const MAX_ATTEMPTS = 3;
+    const BACKOFF_MS = 30_000;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await metaService.updateAd(accessToken, adId, { creative: { creative_id: creativeId } }, accountId);
+        return;
+      } catch (err: any) {
+        const subcode = Number(err?.structuredError?.error_subcode ?? err?.response?.error?.error_subcode);
+        if (subcode !== 1772103 || attempt >= MAX_ATTEMPTS) throw err;
+        console.log(`AgentMode: creative ${creativeId} not yet attachable to ad ${adId} (1772103, attempt ${attempt}/${MAX_ATTEMPTS}). Retrying in ${BACKOFF_MS}ms.`);
+        await this.sleep(BACKOFF_MS);
+      }
+    }
+  }
+
   public async updateMetaAdsAd(userId: string, adId: string, params: any, account_id?: string): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
@@ -13196,14 +13220,16 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       // creative. Copy/link/CTA carry over from the existing creative unless overridden.
       const ld = existingSpec.link_data || {};
       const vd = existingSpec.video_data || {};
+      // A placement-customized source has no link_data / video_data: its copy lives in asset_feed_spec.
+      const afs = creativeData.asset_feed_spec || {};
       newCreativeParams = {
         name: params.name || `${creativeData.name || 'Creative'} (placement-customized)`,
         page_id: pageId,
         placement_assets: params.placement_assets,
-        body: params.body || ld.message || vd.message || creativeData.body || '',
-        title: params.title || ld.name || vd.title || creativeData.title || '',
-        link_url: newLinkUrl || ld.link || vd.call_to_action?.value?.link || '',
-        call_to_action_type: params.call_to_action_type || ld.call_to_action?.type || vd.call_to_action?.type,
+        body: params.body || ld.message || vd.message || afs.bodies?.[0]?.text || creativeData.body || '',
+        title: params.title || ld.name || vd.title || afs.titles?.[0]?.text || creativeData.title || '',
+        link_url: newLinkUrl || ld.link || vd.call_to_action?.value?.link || afs.link_urls?.[0]?.website_url || '',
+        call_to_action_type: params.call_to_action_type || ld.call_to_action?.type || vd.call_to_action?.type || afs.call_to_action_types?.[0],
         url_tags: carriedUrlTags,
         ...AgentModeService.carriedCreativeFields(existingSpec, params, creativeData.asset_feed_spec),
       };
@@ -13350,7 +13376,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     let verification: Awaited<ReturnType<AgentModeService['verifyCreativeSwap']>> | undefined;
 
     for (let attempt = 1; attempt <= SWAP_VERIFY_ATTEMPTS; attempt++) {
-      await metaService.updateAd(accessToken, adId, { creative: { creative_id: newCreativeId } }, accountId);
+      await this.attachCreativeWhenReady(accessToken, adId, newCreativeId, accountId);
       verification = await this.verifyCreativeSwap(accessToken, adId, newCreativeId, accountId, newLinkUrl);
 
       const destinationOk = !newLinkUrl || !verification.liveLinkUrl
