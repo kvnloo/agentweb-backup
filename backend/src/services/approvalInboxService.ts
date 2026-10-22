@@ -12,7 +12,7 @@ const dynamodbConfig = {
 };
 const dynamodb = new AWS.DynamoDB.DocumentClient(dynamodbConfig);
 
-const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+import { TABLE_PREFIX } from '../config/constants';
 const APPROVAL_DECISIONS_TABLE = `${TABLE_PREFIX}AW-ApprovalDecisions`;
 
 export class ApprovalInboxError extends Error {

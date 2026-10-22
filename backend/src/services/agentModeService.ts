@@ -1,4 +1,5 @@
 import { metaWriteRateShaper, META_BUDGET_THROTTLE_SUBCODE } from './agentMode/metaWriteRateShaper';
+import { normalizeSkillIdArg } from './agentMode/skillIdArg';
 import { applyProviderPolicy, CompareProviderPolicy } from './agentMode/compareProviderPolicy';
 import { classifyMetaBudgetChange } from './agentMode/metaBudgetAnomaly';
 import { deriveDominanceLegacyIds } from './agentMode/modelSupersession';
@@ -41,6 +42,7 @@ import {
   buildImageSwapNotReflected, judgeImageSwap, readCreativeImage, selectSwapImageHash,
   type CreativeImageReadback, type ImageSwapExpectation, type ImageSwapVerdict,
 } from './agentMode/metaImageSwapCheck';
+import { buildUnappliedFieldsMessage, findUnappliedCreativeFields } from './agentMode/metaCreativeFieldsCheck';
 import { readAdmittedAuthorization } from '../utils/scheduledPublishConsentGuard';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
 import { createCrmEvidenceCollector, crmEvidenceFromEarlierInvocations, crmNumbersFromSessionHistory, runCrmFreshnessShadow, serializeCrmEvidence } from '../utils/crmFreshnessGuard';
@@ -337,6 +339,7 @@ const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
  * files, not decoration — change it in both or in neither.
  */
 export const SKILL_UNRESOLVED_MARKER = "Could not resolve these skill IDs to any known skill";
+
 /*
  * The skill exists and the account is entitled to it, but nothing is installable behind it
  * right now — in practice an `__other_skills__` bundle whose unassociated-tool pool is empty.
@@ -7178,6 +7181,8 @@ export class AgentModeService {
       if (!Array.isArray(skillIds) || skillIds.length === 0 || skillIds.some((id) => typeof id !== 'string')) {
         return { success: false, message: "skillIds must be a non-empty array of skill IDs." };
       }
+      // ENG-2612: models copy the catalog display line ("<uuid>- Skill Name") as the id.
+      skillIds = [...new Set(skillIds.map(normalizeSkillIdArg))];
 
       const availableSkills = await this.getSkillsForDisplay([], userId);
       const availableById = new Map(availableSkills.map(skill => [skill.skillId, skill]));
@@ -11702,6 +11707,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           link_url: newLinkUrl || vd.call_to_action?.value?.link || '',
           call_to_action_type: params.call_to_action_type || vd.call_to_action?.type,
           url_tags: carriedUrlTags,
+          ...AgentModeService.carriedCreativeFields(existingSpec, params),
         };
       } else if (existingSpec.link_data?.child_attachments) {
         const ld = existingSpec.link_data;
@@ -11731,6 +11737,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           carousel_cards: updatedCards,
           call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
           url_tags: carriedUrlTags,
+          ...AgentModeService.carriedCreativeFields(existingSpec, params),
         };
       } else if (existingSpec.link_data) {
         const ld = existingSpec.link_data;
@@ -11751,6 +11758,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           link_url: newLinkUrl || ld.link || '',
           call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
           url_tags: carriedUrlTags,
+          ...AgentModeService.carriedCreativeFields(existingSpec, params),
         };
       } else {
         return {
@@ -12695,6 +12703,28 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   }
 
   /**
+   * ENG-2609: link description + Instagram identity of an existing creative, for rebuilding it
+   * (COPY_AD / swap). Carousels are skipped for description: they have no creative-level slot.
+   * `assetFeedSpec` is passed only when rebuilding a placement_assets creative, whose description
+   * lives in asset_feed_spec.descriptions rather than link_data / video_data.
+   */
+  private static carriedCreativeFields(
+    spec: any,
+    params: { description?: string; instagram_user_id?: string },
+    assetFeedSpec?: any,
+  ): { description?: string; instagram_user_id?: string } {
+    const carousel = !!spec?.link_data?.child_attachments;
+    const description = params.description
+      ?? (assetFeedSpec ? assetFeedSpec.descriptions?.[0]?.text : undefined)
+      ?? (carousel ? undefined : (spec?.video_data ? spec.video_data.link_description : spec?.link_data?.description));
+    const instagramUserId = params.instagram_user_id ?? spec?.instagram_user_id;
+    return {
+      ...(description ? { description } : {}),
+      ...(instagramUserId ? { instagram_user_id: instagramUserId } : {}),
+    };
+  }
+
+  /**
    * When a placement_assets creative serves Instagram placements, Meta requires
    * object_story_spec.instagram_user_id (else attaching it to an ad fails with subcode 1772103).
    * Resolve it from the Page if the caller didn't supply one.
@@ -12748,9 +12778,36 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         void stampMetaCreativeCreated({ userId, accountId, metaCreativeId: String(creative.id), params: resolvedParams });
       }
 
+      // ENG-2596: a 200 doesn't prove Meta stored the IG identity / link description — read back.
+      // Only a caller-supplied IG id is checked: one auto-resolved for placement creatives was not asked for.
+      const requestedFields = { ...resolvedParams, instagram_user_id: params.instagram_user_id };
+      let unappliedFields: string[] = [];
+      let readbackUnavailable = false;
+      if (creative?.id && (requestedFields.instagram_user_id || requestedFields.description)) {
+        try {
+          const live = await metaService.getAdCreative(accessToken, String(creative.id));
+          unappliedFields = findUnappliedCreativeFields(requestedFields, live);
+        } catch (err: unknown) {
+          readbackUnavailable = true;
+          console.warn(`AgentMode: creative field read-back failed for ${creative.id}:`,
+            err instanceof Error ? err.message : err);
+        }
+      }
+      if (unappliedFields.length > 0) {
+        return {
+          success: true,
+          verified: false,
+          unapplied_fields: unappliedFields,
+          message: buildUnappliedFieldsMessage(creative, requestedFields, unappliedFields),
+          creative: creative
+        };
+      }
+
       return {
         success: true,
-        message: `Ad creative "${creative.name}" created successfully`,
+        message: `Ad creative "${creative.name}" created successfully` +
+          (readbackUnavailable ? ' (could not read it back to confirm description / instagram_user_id were stored)' : ''),
+        ...(readbackUnavailable ? { readback_unavailable: true } : {}),
         creative: creative
       };
     } catch (error: any) {
@@ -12996,7 +13053,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   // silently drops it (see updateAd's params typing), so a UTM-only retag
   // (ENG-239 retrofit, agentModeService.retagMetaAdUtm) must also go through
   // the swap path. carriedUrlTags below already forwards it correctly.
-  private static CREATIVE_CONTENT_KEYS = ['link_url', 'destination', 'url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'call_to_action_type', 'placement_assets', 'url_tags'];
+  private static CREATIVE_CONTENT_KEYS = ['link_url', 'destination', 'url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'call_to_action_type', 'placement_assets', 'url_tags', 'description', 'instagram_user_id'];
 
   public async updateMetaAdsAd(userId: string, adId: string, params: any, account_id?: string): Promise<any> {
     try {
@@ -13147,6 +13204,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         link_url: newLinkUrl || ld.link || vd.call_to_action?.value?.link || '',
         call_to_action_type: params.call_to_action_type || ld.call_to_action?.type || vd.call_to_action?.type,
         url_tags: carriedUrlTags,
+        ...AgentModeService.carriedCreativeFields(existingSpec, params, creativeData.asset_feed_spec),
       };
     } else if (existingSpec.video_data) {
       // Video creative
@@ -13163,6 +13221,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         link_url: newLinkUrl || vd.call_to_action?.value?.link || '',
         call_to_action_type: params.call_to_action_type || vd.call_to_action?.type,
         url_tags: carriedUrlTags,
+        ...AgentModeService.carriedCreativeFields(existingSpec, params),
       };
       if (params.image_hash || params.image_url) {
         imageSwap = { oldHash: vd.image_hash, oldUrl: vd.image_url, requestedHash: params.image_hash, requestedUrl: params.image_url };
@@ -13170,6 +13229,15 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     } else if (existingSpec.link_data?.child_attachments) {
       // Carousel creative – update the main link and optionally per-card links
       const ld = existingSpec.link_data;
+      // A carousel has no creative-level description slot, so a swap could not apply it: refuse
+      // before creating a replacement creative that would silently leave the cards unchanged.
+      if (params.description) {
+        return {
+          success: false,
+          message: 'Carousel creatives have no creative-level description, so it cannot be updated here. Put per-card text in carousel_cards[].description instead.',
+          error: 'CAROUSEL_DESCRIPTION_UNSUPPORTED'
+        };
+      }
       const updatedCards = ld.child_attachments.map((card: any) => ({
         image_hash: card.image_hash,
         image_url: card.picture || card.image_url,
@@ -13187,6 +13255,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         carousel_cards: updatedCards,
         call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
         url_tags: carriedUrlTags,
+        ...AgentModeService.carriedCreativeFields(existingSpec, params),
       };
     } else if (existingSpec.link_data) {
       // Single image creative
@@ -13202,6 +13271,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         link_url: newLinkUrl || ld.link || '',
         call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
         url_tags: carriedUrlTags,
+        ...AgentModeService.carriedCreativeFields(existingSpec, params),
       };
       if (params.image_hash || params.image_url) {
         imageSwap = {

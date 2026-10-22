@@ -380,6 +380,32 @@ export class AttioService {
     return records.length > 0 ? this.mapCompany(records[0]) : null;
   }
 
+  /**
+   * Read-only record search for call_attio_api RECORDS SEARCH (ENG-2580).
+   * People: an `@` query filters by email; otherwise name contains. Companies:
+   * name contains. One page of up to 25 records.
+   */
+  async searchRecords(
+    objectSlug: 'people' | 'companies',
+    query: string,
+    limit: number = 25,
+  ): Promise<Array<AttioPerson | AttioCompany>> {
+    const q = query.trim();
+    const filter =
+      objectSlug === 'people'
+        ? q.includes('@')
+          ? { email_addresses: { email_address: { $eq: q.toLowerCase() } } }
+          : { name: { full_name: { $contains: q } } }
+        : { name: { $contains: q } };
+    const res = await axiosInstance.post(
+      `${this.baseUrl}/objects/${objectSlug}/records/query`,
+      { filter, limit },
+      { headers: this.headers() }
+    );
+    const records = (res.data as any)?.data ?? [];
+    return records.map((r: any) => (objectSlug === 'people' ? this.mapPerson(r) : this.mapCompany(r)));
+  }
+
   async getCompanyById(recordId: string): Promise<AttioCompany | null> {
     try {
       const res = await axiosInstance.get(
