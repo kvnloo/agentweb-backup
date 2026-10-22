@@ -258,7 +258,7 @@ router.get('/access-inventory', authenticateToken, async (req: any, res) => {
     // children), paged. Without it, keep the original flat inventory for older
     // portal builds.
     const { browse, parent, pageSize, pageToken } = req.query;
-    if (browse !== undefined) {
+    if (browse === '1') {
       if (parent !== undefined && !isValidDriveId(parent)) {
         return res.status(400).json({ error: 'Invalid parent' });
       }

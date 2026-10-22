@@ -3,7 +3,7 @@ import { browseDrive, clampDrivePageSize, isValidDriveId, DriveListClient } from
 const now = () => new Date('2026-10-22T00:00:00Z');
 const FOLDER = 'application/vnd.google-apps.folder';
 
-function fakeDrive(opts: { files?: any[]; drives?: any[]; next?: string; failFiles?: boolean; failDrives?: boolean } = {}): DriveListClient & { calls: any[] } {
+function fakeDrive(opts: { files?: any[]; drives?: any[]; driveNext?: string[]; next?: string; failFiles?: boolean; failDrives?: boolean } = {}): DriveListClient & { calls: any[] } {
   const calls: any[] = [];
   return {
     calls,
@@ -11,7 +11,9 @@ function fakeDrive(opts: { files?: any[]; drives?: any[]; next?: string; failFil
       list: async (p: any) => {
         calls.push(['drives', p]);
         if (opts.failDrives) throw Object.assign(new Error('x'), { response: { status: 403 } });
-        return { data: { drives: opts.drives || [] } };
+        const idx = p.pageToken ? Number(p.pageToken) : 0;
+        const pages = opts.driveNext ? (opts.driveNext as unknown as any[][]) : [opts.drives || []];
+        return { data: { drives: pages[idx] || [], nextPageToken: idx + 1 < pages.length ? String(idx + 1) : undefined } };
       },
     },
     files: {
@@ -52,7 +54,18 @@ describe('ENG-2118 Drive browse', () => {
     const files = d.calls.find((c) => c[0] === 'files')![1];
     expect(files.q).toBe("('root' in parents or sharedWithMe=true) and trashed=false");
     expect(files.pageSize).toBe(100);
+    expect(files).toMatchObject({ orderBy: 'folder,name', corpora: 'allDrives', supportsAllDrives: true, includeItemsFromAllDrives: true });
     expect(files.fields).toBe('nextPageToken, files(id, name, mimeType, ownedByMe, shared)');
+  });
+
+  it('pages through every shared drive on the first page, up to the cap', async () => {
+    const mk = (n: number, off: number) => Array.from({ length: n }, (_, i) => ({ id: 'd' + (off + i), name: 'Drive ' + (off + i) }));
+    const r = await browseDrive(fakeDrive({ driveNext: [mk(100, 0), mk(30, 100)] as any, files: [] }), null, {}, now);
+    expect(r.items.filter((i) => i.kind === 'drive')).toHaveLength(130);
+    expect(r.errors).toEqual([]);
+    const many = await browseDrive(fakeDrive({ driveNext: Array.from({ length: 6 }, (_, i) => mk(100, i * 100)) as any, files: [] }), null, {}, now);
+    expect(many.items.filter((i) => i.kind === 'drive')).toHaveLength(500);
+    expect(many.errors).toEqual(['shared drives: showing the first 500']);
   });
 
   it('later top-level pages skip shared drives', async () => {

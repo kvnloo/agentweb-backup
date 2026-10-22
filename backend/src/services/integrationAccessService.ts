@@ -195,7 +195,7 @@ export const DRIVE_BROWSE_PAGE_SIZES = [50, 100, 200] as const;
 export const DEFAULT_DRIVE_PAGE_SIZE = 50;
 const DRIVE_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const FOLDER_MIME = 'application/vnd.google-apps.folder';
-const SHARED_DRIVES_CAP = 100;
+const SHARED_DRIVES_CAP = 500;
 
 export function isValidDriveId(value: unknown): value is string {
   return typeof value === 'string' && DRIVE_ID.test(value);
@@ -262,8 +262,15 @@ export async function browseDrive(
     // Top level. Shared drives are few, so they ride along on the first page only.
     if (!pageToken) {
       try {
-        const { data } = await drive.drives.list({ pageSize: SHARED_DRIVES_CAP, fields: 'drives(id, name)' });
-        result.items.push(...(data.drives || []).map((d: any) => ({ id: String(d.id), name: String(d.name), kind: 'drive' as const })));
+        let driveToken: string | undefined;
+        let fetched = 0;
+        do {
+          const { data } = await drive.drives.list({ pageSize: 100, pageToken: driveToken, fields: 'nextPageToken, drives(id, name)' });
+          result.items.push(...(data.drives || []).map((d: any) => ({ id: String(d.id), name: String(d.name), kind: 'drive' as const })));
+          fetched += (data.drives || []).length;
+          driveToken = data.nextPageToken;
+        } while (driveToken && fetched < SHARED_DRIVES_CAP);
+        if (driveToken) result.errors.push(`shared drives: showing the first ${fetched}`);
       } catch (e) {
         result.errors.push(`shared drives: ${describe(e)}`);
       }
