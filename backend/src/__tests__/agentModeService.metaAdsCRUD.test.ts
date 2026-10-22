@@ -569,6 +569,21 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
           expect(result.message).toContain('rather than creating another');
         });
 
+        it('names the creative from the request when Meta\'s create response carries only the id (ENG-2624)', async () => {
+          (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'c1' });
+          (metaService.getAdCreative as jest.Mock).mockResolvedValue({ object_story_spec: { link_data: {} } });
+          const flagged = await agentModeService.createMetaAdsAdCreative('user123', base);
+          expect(flagged.message).toContain('"RB Creative"');
+          expect(flagged.message).not.toContain('undefined');
+
+          (metaService.getAdCreative as jest.Mock).mockResolvedValue({
+            object_story_spec: { instagram_user_id: 'ig_1', link_data: { description: 'The marketing OS' } },
+          });
+          const ok = await agentModeService.createMetaAdsAdCreative('user123', base);
+          expect(ok.message).toBe('Ad creative "RB Creative" created successfully');
+          expect(ok.creative.name).toBe('RB Creative');
+        });
+
         it('is a plain success when Meta stored both', async () => {
           (metaService.getAdCreative as jest.Mock).mockResolvedValue({
             object_story_spec: { instagram_user_id: 'ig_1', link_data: { description: 'The marketing OS' } },
@@ -1243,6 +1258,23 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
           await agentModeService.updateMetaAdsAd('user123', 'ad_123', { placement_assets: [{ image_hash: 'a', is_default: true }, { image_hash: 'b', placements: ['story'] }] });
 
           expect(sentCreative().description).toBe('Feed desc');
+        });
+
+        it('carries link, body, title and CTA from asset_feed_spec when swapping a placement creative (ENG-2623)', async () => {
+          mockSwap(OLD_LINK_SPEC, OLD_LINK_SPEC);
+          jest.mocked(metaService.getAdCreative).mockReset().mockResolvedValue({
+            id: 'old_creative_123', name: 'Old', object_story_spec: { page_id: 'page_123' },
+            asset_feed_spec: {
+              bodies: [{ text: 'AFS body' }], titles: [{ text: 'AFS title' }],
+              link_urls: [{ website_url: 'https://afs.example/' }], call_to_action_types: ['LEARN_MORE'],
+            },
+          } as never);
+
+          await agentModeService.updateMetaAdsAd('user123', 'ad_123', { placement_assets: [{ image_hash: 'a', is_default: true }, { image_hash: 'b', placements: ['story'] }] });
+
+          expect(sentCreative()).toEqual(expect.objectContaining({
+            link_url: 'https://afs.example/', body: 'AFS body', title: 'AFS title', call_to_action_type: 'LEARN_MORE',
+          }));
         });
 
         it('fails with SWAP_NOT_REFLECTED and does not attach when the new creative still has the old image', async () => {
