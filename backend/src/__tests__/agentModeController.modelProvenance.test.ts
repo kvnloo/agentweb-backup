@@ -19,6 +19,7 @@ jest.mock('../services/chatbotService', () => ({
     getMessagesFromMessagesTable: jest.fn(),
     getChatSessionRecord: jest.fn(),
     updateSessionWorkPlan: jest.fn(),
+    getUserSessions: jest.fn(),
   },
   updateTaskExecutionStatus: jest.fn(),
 }));
@@ -581,6 +582,39 @@ describe('ENG-669 model provenance', () => {
       const res = await read({ userId: 'admin-1', isAdmin: true });
       expect(res.body.workPlan).toMatchObject({ planAuthor: 'system', launchModelSource: 'user', planDefaultModelSource: 'system' });
       expect(res.body.workPlan.steps[0].modelSource).toBe('system');
+    });
+
+    const expectNoProvenance = (plan: any) => {
+      expect(plan).toBeDefined();
+      expect(JSON.stringify(plan)).not.toMatch(/planAuthor|launchModelSource|planDefaultModelSource|"modelSource"/);
+      expect(plan.steps[0].model).toBe(DISALLOWED);
+      expect(plan.templatePlanId).toBe('t1');
+    };
+
+    it('the session LIST the portal polls drops them too (owner); an admin keeps them', async () => {
+      (mockChatbotDb as any).getUserSessions.mockResolvedValue({ sessions: [sessionWithPlan()], lastEvaluatedKey: undefined });
+      const list = async (user: Record<string, unknown>) => {
+        const res = makeRes();
+        await agentModeController.getSessions({ user, query: {} } as any, res);
+        return res;
+      };
+      const owner = await list({ userId: OWNER, isAdmin: false });
+      expect(owner.statusCode).toBe(200);
+      expectNoProvenance(owner.body.sessions[0].workPlan);
+      expect(owner.body.sessions[0].llmModelSource).toBe('system');
+      const admin = await list({ userId: 'admin-1', isAdmin: true });
+      expect(admin.body.sessions[0].workPlan).toMatchObject({ planAuthor: 'system', launchModelSource: 'user' });
+    });
+
+    it('an idempotent replay of session creation drops them too', async () => {
+      (isRunStoreEnabled as jest.Mock).mockReturnValueOnce(true);
+      (claimIdempotency as jest.Mock).mockResolvedValueOnce({ claimed: false, sessionId: SESSION_ID });
+      storeSession(sessionWithPlan());
+      const res = makeRes();
+      await agentModeController.createSession({ user: { userId: OWNER, isAdmin: false }, body: { idempotencyKey: 'k1' }, query: {} } as any, res);
+      expect(res.statusCode).toBe(200);
+      expect(res.body.idempotentReplay).toBe(true);
+      expectNoProvenance(res.body.workPlan);
     });
   });
 
