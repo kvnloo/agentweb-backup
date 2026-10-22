@@ -28,6 +28,10 @@
 # SSM document never passes it. --allow-older lets a person on a Session Manager shell install an older or hand-made build on purpose.
 # A hold file (/etc/aw-login-host/hold) makes every deploy stop with 22 before it does anything: the kill-switch for "do not touch the worker now".
 #
+# WHAT IS ACTUALLY RUNNING. `current` says which release is ACTIVE ON DISK; after a deploy that was killed half-way it can name a release the running host
+# never started. So after every healthy start deploy.sh records the release the host is running (STATE_DIR/running-release), and "this exact build is already
+# running: nothing to restart" is only believed when that record equals `current`; otherwise the host is restarted onto it, behind the same gate and health check.
+#
 # NO DOWNGRADES. The signature proves a build came from our pipeline, not that it is the latest: whoever can write to the build bucket could re-offer an
 # old, correctly signed build with a known hole. So the build's sequence number (MANIFEST build_seq = the pipeline's run id, supplied by GitHub and checked
 # by the signing job; a committer date would be attacker-chosen) must not be lower than that of the last build this worker finished deploying.
@@ -80,6 +84,8 @@ on_exit() {
   fi
 }
 trap on_exit EXIT
+# SIGTERM/SIGINT (an SSM cancel, a person's Ctrl-C): bash would otherwise leave on_exit seeing a clean status. Leave with a status that on_exit maps to 22 or 24.
+trap 'exit 143' TERM INT
 die() { say "FATAL $*"; finish "${2:-22}"; }
 
 while [ "$#" -gt 0 ]; do
@@ -123,24 +129,29 @@ record_deployed() { # only ever moves forward; failing to write it must not turn
   fi
 }
 
+record_running() { # the release the host was just seen healthy on
+  { mkdir -p "$STATE_DIR" && readlink "$OPT/current" >"$STATE_DIR/running-release.new" && mv -f "$STATE_DIR/running-release.new" "$STATE_DIR/running-release"; } \
+    || say "WARNING: could not record which release is running (the next deploy will restart rather than skip)"
+}
+
 # Restart the service and wait for this build to answer. Returns the health result.
 restart_and_check() { # restart_and_check [--any-protocol]
   PHASE=post
   "$SYSTEMCTL" reset-failed "$SERVICE" >/dev/null 2>&1 || true # a crash loop that hit its start limit must not block this restart
   "$SYSTEMCTL" restart "$SERVICE" || return 1
   DRAINED=0 # a restart clears the drain
-  ctl health --timeout "$HEALTH_TIMEOUT" "$@"
+  ctl health --timeout "$HEALTH_TIMEOUT" "$@" && record_running
 }
 
 # Put the previous release back (only if there is one) and bring it up.
 roll_back() {
   [ -L "$OPT/previous" ] || { say "there is no previous release to roll back to"; return 1; }
   "$HERE/install.sh" --rollback || return 1
+  # The restart that puts the old build back also ends whatever the failing new build accepted meanwhile. Try to wait for a quiet moment first, but only briefly:
+  # a build that is unhealthy must not stay up longer than it has to. (If the host does not answer, there is nobody to wait for.)
+  if ctl info >/dev/null 2>&1; then ctl acquire --total 20 --strict-ttl "$STRICT_TTL" >/dev/null 2>&1 && DRAINED=1 || true; fi
   restart_and_check --any-protocol # the old build speaks its own protocol version, not this tarball's
 }
-
-was_active=0
-"$SYSTEMCTL" is-active --quiet "$SERVICE" && was_active=1
 
 # ───────────────────────────── 1. prepare (slow, harmless to a running host) ─────────────────────────────
 
@@ -153,6 +164,13 @@ if [ "$rc" = 3 ]; then
   finish 3
 fi
 [ "$rc" = 0 ] || die "preparing the machine failed (exit $rc); the running host, if any, was not touched"
+
+# Is there a host that has customers on it? Decided AFTER the slow preparation (it can take half an hour, and a host may have been started, or be in the middle of
+# restarting itself, meanwhile), and by systemd's own state: only a unit that is stopped or failed has nobody to protect. `activating` (a start or an auto-restart in
+# progress) counts as running: the gate then waits until it listens and is idle.
+state=$("$SYSTEMCTL" show -p ActiveState --value "$SERVICE" 2>/dev/null || echo unknown)
+case "$state" in inactive | failed) was_active=0 ;; *) was_active=1 ;; esac
+[ "$state" != unknown ] || { [ "$("$SYSTEMCTL" cat "$SERVICE" >/dev/null 2>&1; echo $?)" = 0 ] || was_active=0; } # a unit systemd has never heard of (first install) is not running
 
 # ───────────────────────────── 2. idle gate (nothing on disk has changed yet) ─────────────────────────────
 
@@ -198,7 +216,8 @@ if [ "$rc" != 0 ]; then
 fi
 
 # Nothing changed (same build, certificates and settings): nothing a restart would change, so the least disruptive deploy is none.
-if [ "$was_active" = 1 ] && [ "$FORCE" != 1 ] && [ -n "$active_before" ] && [ "$(readlink "$OPT/current" 2>/dev/null || true)" = "$active_before" ]; then
+if [ "$was_active" = 1 ] && [ "$FORCE" != 1 ] && [ -n "$active_before" ] && [ "$(readlink "$OPT/current" 2>/dev/null || true)" = "$active_before" ] \
+  && [ "$(cat "$STATE_DIR/running-release" 2>/dev/null || true)" = "$active_before" ]; then
   record_deployed
   say "OK   this exact build and configuration is already running: nothing to restart"
   finish 0
@@ -221,12 +240,11 @@ fi
 
 # ───────────────────────────── 4 + 5. restart and check ─────────────────────────────
 
-# The drain must still be on right before the restart. If it lapsed (a very slow install, a lost reply), take it again; if the host is busy by now, undo
-# the switch and give up cleanly: a restart must never reach a host that has customers on it.
-if [ "$FORCE" != 1 ] && ! ctl info 2>/dev/null | grep -q '"drain":"strict"'; then
-  say "the drain lapsed before the restart: asking for it again"
+# The drain must still be on right before the restart, with a fresh lifetime. Asking again is cheap and idempotent (it renews the drain while the host is idle); if the
+# host has become busy since, undo the switch and give up cleanly: a restart must never reach a host that has customers on it.
+if [ "$FORCE" != 1 ]; then
   set +e
-  ctl acquire --total 300 --strict-ttl "$STRICT_TTL"
+  ctl acquire --total 300 --strict-ttl "$STRICT_TTL" >/dev/null
   rc=$?
   set -e
   if [ "$rc" != 0 ]; then
@@ -234,10 +252,14 @@ if [ "$FORCE" != 1 ] && ! ctl info 2>/dev/null | grep -q '"drain":"strict"'; the
     say "NOT DEPLOYED: the host became busy again before the restart. Nothing was restarted; run the deploy again later."
     finish 75
   fi
+  DRAINED=1
 fi
+drain_started=$SECONDS
 
 if restart_and_check; then
   record_deployed
+  window=$((SECONDS - drain_started))
+  [ "$window" -le 30 ] || say "WARNING: the host refused new work for ${window}s around the restart (the backend retries for 40 s): look at what was slow"
   say "OK   deployed; $(ctl info 2>/dev/null || echo 'host.info unavailable')"
   finish 0
 fi
