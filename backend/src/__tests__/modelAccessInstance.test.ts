@@ -138,12 +138,14 @@ describe("storedBindingSource: the session's OWN stamp", () => {
       .toBeUndefined();
   });
 
-  it('#3607 follow-up 1: a legacy stamp of the session kind\'s default stays AgentWeb\'s; a new pick of it, or a recorded user pick, does not', async () => {
+  it('#3607 follow-up 1: the session kind\'s default STORED on the session stays AgentWeb\'s whatever its record; a new pick of it does not', async () => {
     const legacy = { sessionType: 'scheduled', llmModel: 'sched-model' };
     const check = async (session: any, model: string) => isSystemChosen(model, await storedBindingSource(session, model, (id) => id), session);
     expect(await check(legacy, 'sched-model')).toBe(true);
     expect(await check({ ...legacy, llmModelSource: 'system' }, 'sched-model')).toBe(true);
-    expect(await check({ ...legacy, llmModelSource: 'user' }, 'sched-model')).toBe(false);
+    // Recorded 'user': since 2026-10-19 the portal's per-turn echo of a legacy stamp records exactly this, so the
+    // record cannot tell AgentWeb's stamp from a pick; the stored kind default keeps running.
+    expect(await check({ ...legacy, llmModelSource: 'user' }, 'sched-model')).toBe(true);
     // The picker PATCH to the kind's default from another model: a new pick.
     expect(await check({ sessionType: 'scheduled', llmModel: 'gpt-5.5', llmModelSource: 'system' }, 'sched-model')).toBe(false);
   });

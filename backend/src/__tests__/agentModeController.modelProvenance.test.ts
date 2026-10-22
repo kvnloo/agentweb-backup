@@ -455,7 +455,7 @@ describe('ENG-669 model provenance', () => {
     });
   });
 
-  describe('#3607 follow-up 1: a session kind\'s configured default is AgentWeb\'s only when AgentWeb set it', () => {
+  describe('#3607 follow-up 1: a session kind\'s configured default is AgentWeb\'s unless the user picks it now', () => {
     const SCHEDULED_DEFAULT = DISALLOWED; // getScheduledChatsDefaultModel, outside the Free plan
     const scheduled = (extra: Record<string, unknown>) => ({ ...baseSession(ALLOWED), sessionType: 'scheduled', ...extra });
 
@@ -480,11 +480,65 @@ describe('ENG-669 model provenance', () => {
       expect(mockWorker.runInWorker).toHaveBeenCalledWith(expect.objectContaining({ llmModel: SCHEDULED_DEFAULT }), expect.anything());
     });
 
-    it('a stamp RECORDED as the user\'s pick of it is checked on the next turn (the final gate)', async () => {
+    it('a LEGACY stamp of it (none recorded) keeps running turn after turn: the portal\'s echo does not turn it into a user pick', async () => {
+      // Every session written before llmModelSource existed (2026-10-19) is like this. The portal re-sends the picker
+      // value on every turn; that echo is not a new choice, so the second turn must run like the first.
+      const stored = storeSession(scheduled({ llmModel: SCHEDULED_DEFAULT }));
+      for (const turn of [1, 2]) {
+        const res = makeRes();
+        await agentModeController.generateResponse(generateReq({ llmModel: SCHEDULED_DEFAULT }), res);
+        expect({ turn, status: res.statusCode, body: res.statusCode === 200 ? undefined : res.body }).toEqual({ turn, status: 200, body: undefined });
+      }
+      expect(mockWorker.runInWorker).toHaveBeenCalledTimes(2);
+      expect(stored().llmModel).toBe(SCHEDULED_DEFAULT);
+    });
+
+    it('a stamp of it RECORDED as the user\'s (what that echo wrote on legacy stamps since 2026-10-19) still runs at the final gate', async () => {
       storeSession(scheduled({ llmModel: SCHEDULED_DEFAULT, llmModelSource: 'user' }));
-      const err = await generateSessionResponse(SESSION_ID, MESSAGE, OWNER, SCHEDULED_DEFAULT).catch((e) => e);
-      expect(err).toMatchObject({ reason: 'not_in_plan' });
+      await generateSessionResponse(SESSION_ID, MESSAGE, OWNER, SCHEDULED_DEFAULT);
+      expect(mockWorker.runInWorker).toHaveBeenCalledWith(expect.objectContaining({ llmModel: SCHEDULED_DEFAULT }), expect.anything());
+    });
+
+    it('...while a NEW /generate pick of it from another model is refused by the pre-flight, nothing written', async () => {
+      storeSession(scheduled({ llmModelSource: 'system' }));
+      const res = makeRes();
+      await agentModeController.generateResponse(generateReq({ llmModel: SCHEDULED_DEFAULT }), res);
+      expect(res.statusCode).toBe(422);
+      expect(res.body).toMatchObject({ reason: 'not_in_plan' });
+      expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
       expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+    });
+
+    // The model the session had when a plan was launched there is not a pick the user makes at the plan's end (restore)
+    // or on a model-less step (its fallback), even when the launch recorded it as the user's: still the kind's default.
+    const planOnScheduledDefault = (steps: any[], extra: Record<string, unknown> = {}) => scheduled({
+      llmModel: ALLOWED, llmModelSource: 'system',
+      workPlan: { title: 'P', createdAt: 'x', updatedAt: 'x', engineModel: ALLOWED, launchModel: SCHEDULED_DEFAULT, steps, ...extra },
+    });
+
+    it('the end-of-plan restore of the kind\'s default (launch recorded \'user\') puts it back, with no "not in your plan" note', async () => {
+      const honor = jest.spyOn(workPlanStepModels, 'shouldHonor').mockResolvedValue(true);
+      const stored = storeSession(planOnScheduledDefault(
+        [{ stepCount: 1, title: 'S1', status: 'completed', model: ALLOWED, modelSource: 'system' }],
+        { planAuthor: 'system', launchModelSource: 'user' },
+      ));
+      await generateSessionResponse(SESSION_ID, MESSAGE, OWNER, ALLOWED);
+      honor.mockRestore();
+      expect(mockWorker.runInWorker).toHaveBeenCalledWith(expect.objectContaining({ llmModel: SCHEDULED_DEFAULT }), expect.anything());
+      expect(stored().llmModel).toBe(SCHEDULED_DEFAULT);
+      expect(mockChatbotDb.addMessageToSession.mock.calls.map(([, m]) => (m as any)?.metadata?.kind)).not.toContain('work-plan-model-restore-failed');
+    });
+
+    it('a model-less step falls back to the kind\'s default it was launched on (legacy plan): it runs, the plan does not pause', async () => {
+      const honor = jest.spyOn(workPlanStepModels, 'shouldHonor').mockResolvedValue(true);
+      storeSession(planOnScheduledDefault([
+        { stepCount: 1, title: 'S1', status: 'completed', model: ALLOWED },
+        { stepCount: 2, title: 'S2', status: 'pending' },
+      ]));
+      const result = await generateSessionResponse(SESSION_ID, MESSAGE, OWNER, ALLOWED);
+      honor.mockRestore();
+      expect(String(result?.content)).not.toContain('included in');
+      expect(mockWorker.runInWorker).toHaveBeenCalledWith(expect.objectContaining({ llmModel: SCHEDULED_DEFAULT }), expect.anything());
     });
 
     it('the interactive configured default stays a free pick in any kind of session', async () => {
