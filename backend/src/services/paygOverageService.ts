@@ -213,10 +213,10 @@ export async function updatePaygOverage(input: {
   const existing = context.billingUser?.paygOverage;
   const disabling = input.enabled === false;
   if (!context.available && !(disabling && existing?.enabled === true)) {
-    throw new PaygOverageRequestError(404, 'payg_unavailable', 'Pay-as-you-go is not available on this plan');
+    throw new PaygOverageRequestError(404, 'payg_unavailable', 'Extra usage is not available on this plan');
   }
   if (!context.eligible) {
-    throw new PaygOverageRequestError(403, 'not_billing_owner', 'Only the account that pays for this plan can change pay-as-you-go');
+    throw new PaygOverageRequestError(403, 'not_billing_owner', 'Only the account that pays for this plan can change extra usage');
   }
   if (typeof input.enabled !== 'boolean') {
     throw new PaygOverageRequestError(400, 'invalid_request', '`enabled` must be a boolean');
@@ -233,7 +233,7 @@ export async function updatePaygOverage(input: {
     throw new PaygOverageRequestError(
       403,
       'delegate_cannot_consent',
-      'Only the account owner can turn on pay-as-you-go or raise its limit',
+      'Only the account owner can turn on extra usage or raise its limit',
     );
   }
 
@@ -360,7 +360,7 @@ export async function updatePaygOverage(input: {
     }
   } catch (error: any) {
     if (error?.code === 'ConditionalCheckFailedException') {
-      throw new PaygOverageRequestError(409, 'payg_conflict', 'Pay-as-you-go settings changed in the meantime; reload and try again');
+      throw new PaygOverageRequestError(409, 'payg_conflict', 'Extra usage settings changed in the meantime; reload and try again');
     }
     throw error;
   }
@@ -373,7 +373,7 @@ export async function updatePaygOverage(input: {
 async function requireLivePaymentMethod(billingUser: User | null, billingUserId: string): Promise<void> {
   const customerId = billingUser?.stripe_customer_id;
   if (!customerId) {
-    throw new PaygOverageRequestError(409, 'payment_method_required', 'Add a payment method before turning on pay-as-you-go');
+    throw new PaygOverageRequestError(409, 'payment_method_required', 'Add a payment method before turning on extra usage');
   }
   let hasPaymentMethod: boolean;
   try {
@@ -385,6 +385,6 @@ async function requireLivePaymentMethod(billingUser: User | null, billingUserId:
     throw new PaygOverageRequestError(503, 'payment_check_unavailable', 'Could not confirm your payment method right now; please try again');
   }
   if (!hasPaymentMethod) {
-    throw new PaygOverageRequestError(409, 'payment_method_required', 'Add a payment method before turning on pay-as-you-go');
+    throw new PaygOverageRequestError(409, 'payment_method_required', 'Add a payment method before turning on extra usage');
   }
 }

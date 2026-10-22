@@ -216,7 +216,7 @@ describe('ENG-668 PAYG — both gates agree', () => {
 
     const customer = toCustomerTokenUsage(status);
     expect(customer.usageBlock.reason).toBe('payg_cap_reached');
-    expect(customer.usageBlock.headline).toMatch(/pay-as-you-go limit/);
+    expect(customer.usageBlock.headline).toMatch(/extra usage limit/);
     expect(customer).not.toHaveProperty('paygBlock');
 
     const usage = await getEffectiveLlmUsagePolicy(OWNER);
