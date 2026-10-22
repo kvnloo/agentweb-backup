@@ -104,17 +104,28 @@ function refusingProvider(err: unknown): string | undefined {
 }
 
 /**
- * Sends `body`; if one provider refuses it with a 400, sends it once more with that provider ignored, so
- * OpenRouter serves the model from another. Azure refuses one GPT-5.4 labeller case every time, while
- * OpenAI and Bedrock also serve the model (ENG-2625). Any other failure, or the retry's own, is passed on.
+ * Sends `body`; if one provider refuses it with a 400, sends it once more with that provider added to
+ * `provider.ignore`, so OpenRouter serves the model from another. Azure refuses one GPT-5.4 labeller case
+ * every time, while OpenAI and Bedrock also serve the model (ENG-2625). Any other failure is passed on;
+ * a failed retry is passed on with the refusal as its `cause`.
  */
-export async function createAvoidingRefusingProvider<B extends object, T>(create: (body: B) => Promise<T>, body: B): Promise<T> {
+export async function createAvoidingRefusingProvider<B extends { provider?: { ignore?: string[] } }, T>(
+  create: (body: B) => Promise<T>,
+  body: B,
+): Promise<T> {
   try {
     return await create(body);
   } catch (err) {
     const provider = refusingProvider(err);
     if (!provider) throw err;
-    return create({ ...body, provider: { ignore: [provider] } });
+    const preferences = { ...body.provider, ignore: [...(body.provider?.ignore ?? []), provider] };
+    try {
+      return await create({ ...body, provider: preferences });
+    } catch (retryErr) {
+      const withCause = retryErr as { cause?: unknown };
+      if (retryErr instanceof Error && withCause.cause === undefined) withCause.cause = err;
+      throw retryErr;
+    }
   }
 }
 
@@ -126,19 +137,21 @@ async function unmeteredJudgeLlm(cost: { usd: number }): Promise<RubricJudgeLlm>
   return {
     async complete(request) {
       // Non-streaming request: the response is a single completion with usage.
+      const body = {
+        model: resolveOpenRouterUpstreamModelId(request.model),
+        messages: [
+          { role: 'system', content: request.system },
+          { role: 'user', content: request.content.map((part) => (part.type === 'text' ? part.text : '')).join('\n') },
+        ],
+        ...(LLM_MODEL_REGISTRY[request.model]?.supportsTemperature === false ? {} : { temperature: 0 }),
+        max_tokens: request.maxTokens,
+        // OpenRouter reports each call's cost only when asked; the cap depends on it.
+        usage: { include: true },
+      };
       const res = (await createAvoidingRefusingProvider(
-        (body) => client.chat.completions.create(body as Parameters<typeof client.chat.completions.create>[0], { timeout: request.timeoutMs }),
-        {
-          model: resolveOpenRouterUpstreamModelId(request.model),
-          messages: [
-            { role: 'system', content: request.system },
-            { role: 'user', content: request.content.map((part) => (part.type === 'text' ? part.text : '')).join('\n') },
-          ],
-          ...(LLM_MODEL_REGISTRY[request.model]?.supportsTemperature === false ? {} : { temperature: 0 }),
-          max_tokens: request.maxTokens,
-          // OpenRouter reports each call's cost only when asked; the cap depends on it.
-          usage: { include: true },
-        },
+        (sent: typeof body & { provider?: { ignore?: string[] } }) =>
+          client.chat.completions.create(sent as Parameters<typeof client.chat.completions.create>[0], { timeout: request.timeoutMs }),
+        body,
       )) as unknown as Parameters<typeof readChatCompletion>[0] & { usage?: Record<string, unknown>; openrouter_metadata?: { is_byok?: unknown } };
       cost.usd += requireReportedCostUsd(res);
       return readChatCompletion(res);
