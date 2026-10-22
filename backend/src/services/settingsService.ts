@@ -74,6 +74,11 @@ export class SettingsService {
     this.tableName = `${TABLE_PREFIX}AW-Settings`;
   }
 
+  /** The AW-Settings table this service reads and writes (Dev- prefixed only when NODE_ENV is 'development'). */
+  getTableName(): string {
+    return this.tableName;
+  }
+
   async getSetting(settingName: string): Promise<Setting | null> {
     try {
       const params = {
