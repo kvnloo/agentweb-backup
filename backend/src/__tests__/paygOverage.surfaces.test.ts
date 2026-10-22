@@ -160,6 +160,16 @@ describe('sanitizeUserForResponse strips PAYG money fields (/api/auth/me)', () =
   it('adds nothing for a user who never opted in', () => {
     expect(sanitizeUserForResponse({ userId: 'u' })).not.toHaveProperty('paygOverage');
   });
+
+  it('never sends settlement records or the closed-month ledger (PR-2: provider cost and markup)', () => {
+    const out = sanitizeUserForResponse({
+      userId: 'u',
+      paygSettlements: { '2026-09': { status: 'paid', overageCostMicroUsd: 30 * USD, billedMicroUsd: 45 * USD, markupBps: 15_000 } },
+      llmUsageCreditsClosed: { month: '2026-09', totalPurchasedMicroUsd: 20 * USD },
+    });
+    expect(out).not.toHaveProperty('paygSettlements');
+    expect(out).not.toHaveProperty('llmUsageCreditsClosed');
+  });
 });
 
 describe('scheduled-chat block text', () => {
@@ -175,7 +185,7 @@ describe('scheduled-chat block text', () => {
   });
 
   it.each([
-    [{ reason: 'payg_cap_reached' }, /pay-as-you-go limit/],
+    [{ reason: 'payg_cap_reached' }, /extra usage limit/],
     [{ reason: 'payg_suspended' }, /on hold/],
     [{ reason: 'payg_inactive', paygInactiveReason: 'no_payment_method' }, /payment method/],
     [{ reason: 'payg_inactive', paygInactiveReason: 'subscription_inactive' }, /subscription/],

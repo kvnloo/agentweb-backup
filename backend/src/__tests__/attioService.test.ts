@@ -26,6 +26,7 @@ const mockAxiosPost = axios.post as jest.Mock;
 const mockAxiosGet = axios.get as jest.Mock;
 const mockAxiosPatch = axios.patch as jest.Mock;
 const mockAxiosDelete = axios.delete as jest.Mock;
+const mockAxiosPut = (axios as any).put as jest.Mock;
 const mockGetAccountsByUserId = getAccountsByUserId as jest.MockedFunction<typeof getAccountsByUserId>;
 const mockGetAccountById = getAccountById as jest.MockedFunction<typeof getAccountById>;
 const mockUpdateAccountConfig = updateAccountConfig as jest.MockedFunction<typeof updateAccountConfig>;
@@ -253,6 +254,57 @@ describe('AttioService', () => {
     it('throws on API error', async () => {
       mockAxiosDelete.mockRejectedValue(new Error('Not found'));
       await expect(service.deletePerson('bad-id')).rejects.toThrow('Not found');
+    });
+  });
+
+  describe('getAllLists parent_object normalisation (ENG-2631)', () => {
+    it('treats the raw array shape ["companies"] as a company list', async () => {
+      mockAxiosGet.mockResolvedValue({ data: { data: [
+        { id: { list_id: 'l1' }, name: 'Accounts', parent_object: ['companies'] },
+        { id: { list_id: 'l2' }, name: 'Leads', parent_object: ['people'] },
+        { id: { list_id: 'l3' }, name: 'Legacy', parent_object: ['people', 'companies'] },
+      ] } });
+      const lists = await service.getAllLists();
+      expect(lists.map(l => l.parentObject)).toEqual(['companies', 'people', 'companies']);
+    });
+
+    it('maps object UUIDs to slugs via getObjectSlug', async () => {
+      const uuid = '11111111-2222-3333-4444-555555555555';
+      mockAxiosGet.mockImplementation(async (url: string) => url.endsWith('/objects')
+        ? { data: { data: [{ id: { object_id: uuid }, api_slug: 'companies' }] } }
+        : { data: { data: [{ id: { list_id: 'l1' }, name: 'Accounts', parent_object: [uuid] }] } });
+      const lists = await service.getAllLists();
+      expect(lists[0].parentObject).toBe('companies');
+    });
+  });
+
+  describe('list entry dedupe (ENG-2632)', () => {
+    it('upsertListEntry uses PUT, never POST', async () => {
+      mockAxiosPut.mockResolvedValue({ data: { data: { id: { entry_id: 'e1' } } } });
+      await expect(service.upsertListEntry('list-abc', 'rec-1', 'companies')).resolves.toBe('e1');
+      expect(mockAxiosPut).toHaveBeenCalledWith(
+        'https://api.attio.com/v2/lists/list-abc/entries',
+        { data: { parent_record_id: 'rec-1', parent_object: 'companies', entry_values: {} } },
+        expect.any(Object)
+      );
+      expect(mockAxiosPost).not.toHaveBeenCalled();
+    });
+
+    it('upsertListEntry falls back to an existing entry on MULTIPLE_MATCH_RESULTS', async () => {
+      mockAxiosPut.mockRejectedValue({ response: { data: { code: 'MULTIPLE_MATCH_RESULTS' } } });
+      mockAxiosGet.mockResolvedValue({ data: { data: [
+        { id: { list_id: 'list-abc', entry_id: 'e1' } }, { id: { list_id: 'list-abc', entry_id: 'e2' } },
+      ] } });
+      await expect(service.upsertListEntry('list-abc', 'rec-1', 'people')).resolves.toBe('e1');
+    });
+
+    it('findListEntries returns every entry in the list and pages', async () => {
+      const page1 = Array.from({ length: 500 }, (_, i) => ({ id: { list_id: i === 3 ? 'list-abc' : 'other', entry_id: `a${i}` } }));
+      mockAxiosGet
+        .mockResolvedValueOnce({ data: { data: page1 } })
+        .mockResolvedValueOnce({ data: { data: [{ id: { list_id: 'list-abc', entry_id: 'b1' } }] } });
+      await expect(service.findListEntries('list-abc', 'rec-1')).resolves.toEqual(['a3', 'b1']);
+      expect(mockAxiosGet).toHaveBeenCalledTimes(2);
     });
   });
 

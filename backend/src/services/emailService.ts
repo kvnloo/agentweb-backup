@@ -12,6 +12,13 @@ import { Citation, CitationRenderFormat, renderCitationMarkers, stripCitationMar
 import { LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON } from '../utils/scheduleRunBlockedReason';
 import { resetDateFromMonth, formatResetDateLong } from '../utils/usageCycle';
 import { buildUsageBlockCopy, paygBlockActionSentence, type UsageBlockPaygInput } from '../utils/usageBlockCopy';
+import {
+  paygInvoiceCreatedEmailCopy,
+  paygPaymentActionRequiredEmailCopy,
+  paygPaymentFailedEmailCopy,
+  paygPaymentUnconfirmedEmailCopy,
+  type PaygSettlementEmailCopy,
+} from '../utils/paygSettlementCopy';
 import { buildScheduleModelNotice, buildWorkPlanStepModelNotice, type ModelNoticeCopy } from '../utils/unattendedModelNoticeCopy';
 import type { ModelUnavailableReason } from './agentMode/modelUnavailable';
 
@@ -75,6 +82,8 @@ export type ScheduledRunFailureNotice =
       failureClass: 'model_unavailable'; modelLabel: string; reason: ModelUnavailableReason;
       /** ENG-669 PR-C: the saved model is the AgentWeb Model and the router is unavailable right now (not "gone"). */
       routerUnavailable?: boolean;
+      /** The plans that include the model (the refusal's `upgradeRequired`); empty = none, so no upgrade is offered. */
+      upgradeRequired?: string[];
     };
 
 const EMPTY_RUN_DIGEST_PLACEHOLDER = '(This run produced no report content.)';
@@ -1031,7 +1040,9 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
     if (opts.failureClass === 'model_unavailable') {
       await this.sendModelUnavailableNoticeEmail(
         toEmails,
-        buildScheduleModelNotice({ scheduleName, modelLabel: opts.modelLabel, reason: opts.reason, routerUnavailable: opts.routerUnavailable }),
+        buildScheduleModelNotice({
+          scheduleName, modelLabel: opts.modelLabel, reason: opts.reason, routerUnavailable: opts.routerUnavailable, upgradeRequired: opts.upgradeRequired,
+        }),
         `schedule ${scheduleId}`,
       );
       return;
@@ -1131,6 +1142,8 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
       routerUnavailable?: boolean;
       scheduleName?: string | null;
       sessionTitle?: string | null;
+      /** The plans that include the model (the refusal's `upgradeRequired`); empty = none, so no upgrade is offered. */
+      upgradeRequired?: string[];
     },
   ) {
     await this.sendModelUnavailableNoticeEmail(toEmails, buildWorkPlanStepModelNotice(opts), `session ${opts.sessionId}`);
@@ -2826,6 +2839,94 @@ View Session: ${sessionUrl}`;
       console.error('Error sending slack triggered session email:', error);
       // Non-blocking: email failure should not interrupt the session flow
     }
+  },
+
+  /**
+   * ENG-668 PR-2: the billing owner's email when the month's pay-as-you-go overage invoice is created.
+   * A percentage of the cap only — never dollars; the Stripe invoice it links to carries the amount.
+   * Best-effort (`sendEmail` never throws): settlement does not depend on it.
+   */
+  async sendPaygOverageInvoiceEmail(input: {
+    to: string;
+    month: string;
+    percentOfCap: number;
+    invoiceUrl?: string | null;
+    /** Stripe already collected the invoice when the email goes out (the paid wording). */
+    paid?: boolean;
+  }): Promise<EmailSendOutcome | void> {
+    return this.sendPaygSettlementEmail(input.to, paygInvoiceCreatedEmailCopy(input), input.invoiceUrl, '#1976d2');
+  },
+
+  /** ENG-668 PR-2: the billing owner's email when the month's overage charge fails and PAYG is put on hold. */
+  async sendPaygOveragePaymentFailedEmail(input: {
+    to: string;
+    month: string;
+    invoiceUrl?: string | null;
+  }): Promise<EmailSendOutcome | void> {
+    return this.sendPaygSettlementEmail(input.to, paygPaymentFailedEmailCopy(input), input.invoiceUrl, '#dc3545');
+  },
+
+  /** ENG-668 PR-2: the owner's email when their bank holds the overage charge for confirmation (3-D Secure). */
+  async sendPaygOveragePaymentActionRequiredEmail(input: {
+    to: string;
+    month: string;
+    invoiceUrl?: string | null;
+  }): Promise<EmailSendOutcome | void> {
+    return this.sendPaygSettlementEmail(input.to, paygPaymentActionRequiredEmailCopy(input), input.invoiceUrl, '#1976d2');
+  },
+
+  /**
+   * ENG-668 PR-2: the owner's email when a payment waiting for their confirmation (3-D Secure) was not
+   * confirmed within the grace period and pay-as-you-go is put on hold. Sent once per month.
+   */
+  async sendPaygOveragePaymentUnconfirmedEmail(input: {
+    to: string;
+    month: string;
+    invoiceUrl?: string | null;
+  }): Promise<EmailSendOutcome | void> {
+    return this.sendPaygSettlementEmail(input.to, paygPaymentUnconfirmedEmailCopy(input), input.invoiceUrl, '#dc3545');
+  },
+
+  /** Renders the copy from `utils/paygSettlementCopy.ts`; no wording lives here. */
+  async sendPaygSettlementEmail(
+    to: string,
+    copy: PaygSettlementEmailCopy,
+    invoiceUrl: string | null | undefined,
+    accent: string,
+  ): Promise<EmailSendOutcome | void> {
+    const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+    const settingsUrl = `${customerFrontendUrl}/settings`;
+    const invoiceLink = invoiceUrl && /^https:\/\//.test(invoiceUrl) ? invoiceUrl : null;
+    const paragraphsHtml = copy.paragraphs
+      .map((p) => `<p style="margin: 0 0 12px 0; line-height: 1.6;">${this.escapeHtml(p)}</p>`)
+      .join('');
+    const html = `
+      <html>
+      <body style="font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f8f9fa;">
+        <div style="max-width: 640px; margin: 0 auto; background-color: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+          <div style="background-color: ${accent}; color: white; padding: 20px; border-radius: 8px 8px 0 0;">
+            <h1 style="margin: 0; font-size: 22px;">${this.escapeHtml(copy.headline)}</h1>
+          </div>
+          <div style="padding: 20px;">
+            ${paragraphsHtml}
+            ${invoiceLink && copy.invoiceLinkLabel
+              ? `<p style="margin: 16px 0;"><a href="${this.escapeHtml(invoiceLink)}" style="display: inline-block; background-color: #1976d2; color: white; padding: 12px 24px; text-decoration: none; border-radius: 4px;">${this.escapeHtml(copy.invoiceLinkLabel)}</a></p>`
+              : ''}
+            <p style="margin: 16px 0 0 0;"><a href="${this.escapeHtml(settingsUrl)}" style="color: #1976d2;">${this.escapeHtml(copy.settingsLinkLabel)}</a></p>
+          </div>
+        </div>
+      </body>
+      </html>
+    `;
+    const text = [
+      copy.headline,
+      '',
+      ...copy.paragraphs,
+      '',
+      ...(invoiceLink && copy.invoiceLinkLabel ? [`${copy.invoiceLinkLabel}: ${invoiceLink}`] : []),
+      `${copy.settingsLinkLabel}: ${settingsUrl}`,
+    ].join('\n');
+    return this.sendEmail(to, copy.subject, text, html);
   },
 
   async sendOncallAlert(

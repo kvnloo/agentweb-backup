@@ -14,10 +14,15 @@ import {
   handleChargeDisputeCreated,
   handleChargeDisputeClosed,
   handleSubscriptionScheduleEnded,
+  handleInvoiceVoided,
+  handleInvoiceMarkedUncollectible,
+  handleInvoicePaymentActionRequired,
+  handleSetupIntentSucceeded,
   reconcileAllStripeUsers,
   findBasePlanItem,
   getSubscriptionPeriodEndIso,
   isSetupModeCheckoutSession,
+  PAYG_OVERAGE_PURCHASE_TYPE,
 } from '../services/stripeService';
 import { invoiceLinePriceId, invoiceSubscriptionId } from '../utils/stripeInvoiceFields';
 
@@ -131,11 +136,28 @@ export async function handleWebhook(req: Request, res: Response) {
       case 'invoice.paid':
       case 'invoice.payment_succeeded':
         await handleInvoicePaymentSucceeded(event.data.object);
-        await handleInvoicePayment(event.data.object, 'payment_succeeded');
+        // A pay-as-you-go overage invoice is recorded by settlement under its own payment types.
+        if (!isPaygOverageInvoiceEvent(event)) await handleInvoicePayment(event.data.object, 'payment_succeeded');
         break;
       case 'invoice.payment_failed':
         await handleInvoicePaymentFailed(event.data.object);
-        await handleInvoicePayment(event.data.object, 'payment_failed');
+        if (!isPaygOverageInvoiceEvent(event)) await handleInvoicePayment(event.data.object, 'payment_failed');
+        break;
+      // ENG-668: pay-as-you-go overage invoices only (subscription invoices are a no-op here). Like the
+      // dispute events, these must be enabled on the Stripe webhook endpoint.
+      case 'invoice.voided':
+        await handleInvoiceVoided(event.data.object);
+        break;
+      case 'invoice.marked_uncollectible':
+        await handleInvoiceMarkedUncollectible(event.data.object);
+        break;
+      case 'invoice.payment_action_required':
+        await handleInvoicePaymentActionRequired(event.data.object);
+        break;
+      // ENG-668: a newly saved card replaces the one settlement pinned on an open overage invoice, so
+      // Stripe's retries charge it. Must be enabled on the webhook endpoint like the events above.
+      case 'setup_intent.succeeded':
+        await handleSetupIntentSucceeded(event.data.object);
         break;
       case 'charge.refunded':
         await handleChargeRefunded(event.data.object);
@@ -169,7 +191,11 @@ export async function handleWebhook(req: Request, res: Response) {
     // and health scores reflect live billing state. Fire-and-forget — never
     // blocks the webhook ack. Errors are swallowed inside the hook.
     // A setup-mode checkout is not a subscription event (it would map to payment.subscribed).
-    if (!(event.type === 'checkout.session.completed' && isSetupModeCheckoutSession(event.data.object))) {
+    // Nor is a pay-as-you-go overage invoice (ENG-668): the CRM mirror models the subscription.
+    // Nor is a saved payment method (`setup_intent.succeeded`).
+    if (!(event.type === 'checkout.session.completed' && isSetupModeCheckoutSession(event.data.object))
+      && event.type !== 'setup_intent.succeeded'
+      && !isPaygOverageInvoiceEvent(event)) {
       void sendStripeEventToCrm(event);
     }
 
@@ -310,6 +336,12 @@ async function handleInvoicePayment(
   } catch (err: any) {
     console.error(`[PaymentHistory] Failed to record ${eventType}: ${err.message}`);
   }
+}
+
+/** ENG-668: an `invoice.*` event for a pay-as-you-go overage invoice (settlement's, not the subscription's). */
+function isPaygOverageInvoiceEvent(event: { type: string; data: { object: unknown } }): boolean {
+  const metadata = (event.data?.object as { metadata?: Record<string, string> | null } | undefined)?.metadata;
+  return event.type.startsWith('invoice.') && !!metadata?.purchaseType && metadata.purchaseType === PAYG_OVERAGE_PURCHASE_TYPE;
 }
 
 /**

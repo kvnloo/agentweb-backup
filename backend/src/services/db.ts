@@ -18,6 +18,7 @@ import type { AttributionTouch } from "../types/attribution";
 import type { OrgRole } from "./orgAuthz";
 import type { MonthlyLlmUsageCredits } from "./llmUsageCreditService";
 import type { PaygOverageSettings } from "./paygOverage";
+import type { PaygSettlements } from "./paygSettlement";
 import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
 import { isEvaluationUser } from "./evaluationPolicy";
@@ -245,6 +246,7 @@ export interface User {
   displayName?: string;
   emailNotificationsEnabled?: boolean; // Portal Settings > Preferences toggle (ENG-1316). Absent = enabled (default).
   emmaTipsEnabled?: boolean; // Portal Settings > Preferences toggle + tip-card "don't show again" (ENG-188). Absent = enabled (default).
+  showModelCompare?: boolean; // Portal Settings > Preferences "Compare models" toggle (ENG-113). Display choice only — shows/hides the chat Compare button; entitlement and /compare enforcement are unaffected. Absent = shown (default).
   stripe_customer_id?: string;
   adAccount?: string; // Meta ad account ID
   emailDomain?: string; // @deprecated legacy single sending domain — kept for the task/subscriber-notification fallback sender (emailService.ts, dripSequenceWorker.ts legacyDefaultSender); CRM sending domains live in emailDomains[] (ENG-265)
@@ -667,8 +669,15 @@ export interface User {
   tokenAllowanceBonus?: number; // One-time bonus tokens granted by admin (resets on monthly reset)
   /** Monthly purchase/migration credits. Raw provider spend remains in tokenUsage. */
   llmUsageCredits?: MonthlyLlmUsageCredits;
+  /**
+   * ENG-668: the previous month's credit ledger, kept when a new month's first write replaces
+   * `llmUsageCredits` — month-end PAYG settlement measures the closed month against it. One month only.
+   */
+  llmUsageCreditsClosed?: MonthlyLlmUsageCredits;
   /** ENG-668: pay-as-you-go overage opt-in. Billing owners only; absent = never opted in. */
   paygOverage?: PaygOverageSettings;
+  /** ENG-668 PR-2: month-end PAYG settlement records by UTC `YYYY-MM` (last 12 months). Never sent to customers. */
+  paygSettlements?: PaygSettlements;
   stripe_subscription_id?: string; // Stripe subscription ID
   subscription_status?: string; // Stripe subscription status: active, trialing, past_due, canceled, canceling
   current_period_end?: string; // ISO date of current billing period end

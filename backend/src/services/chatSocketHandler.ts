@@ -1,7 +1,7 @@
 import jwt from 'jsonwebtoken';
 import { getJwtSecret } from '../config/jwt';
 import { generateChatResponse, chatbotDb } from './chatbotService';
-import { checkTokenUsage, toCustomerTokenUsage } from './tokenUsageService';
+import { checkTokenUsage, TURN_ADMISSION, toCustomerTokenUsage } from './tokenUsageService';
 import { userDb } from './db';
 import { buildUsageBlockCopy } from '../utils/usageBlockCopy';
 import { resolveRunFunding, withRunFunding } from './funding/runFunding';
@@ -41,7 +41,7 @@ export async function handleSocketChatMessage(
     const isDelegatedAdmin = !!decoded.delegateAccess || decoded.isAdmin === true;
 
     // Check token usage limits
-    const usageStatus = await checkTokenUsage(userId);
+    const usageStatus = await checkTokenUsage(userId, TURN_ADMISSION);
     if (!usageStatus.allowed) {
       // Same two defects as the MCP middleware carried, and the same fix: the
       // raw status leaked `costUsed`/`costAllowance` past ENG-1212's projection,

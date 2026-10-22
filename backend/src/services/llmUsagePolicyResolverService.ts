@@ -5,7 +5,8 @@ import {
   type LlmUsageModeDecision,
   type LlmUsagePolicy,
 } from "./llmUsagePolicyService";
-import { userDb } from './db';
+import { userDb, type User } from './db';
+import { withOwnerOpenInvoice } from './paygSettlement';
 import { resolveLlmUsagePoolDecision } from './llmUsagePoolDecision';
 import type { PaygBlock, PaygOverageStatus } from './paygOverage';
 
@@ -82,6 +83,9 @@ export async function getEffectiveLlmUsagePolicy(userId: string): Promise<{
       adjustment.migrationOffsetMicroUsd > 0,
     // Present only for an account with PAYG live and past its pool (absent keeps every other result as it was).
     ...(pool.overage ? { overage: pool.overage } : {}),
-    ...(pool.paygBlock ? { paygBlock: pool.paygBlock } : {}),
+    // ENG-668: the owner of a suspended account is pointed at the unpaid invoice.
+    ...(pool.paygBlock
+      ? { paygBlock: withOwnerOpenInvoice(pool.paygBlock, userId === billingUserId, (billingUser as User | undefined)?.paygSettlements)! }
+      : {}),
   };
 }

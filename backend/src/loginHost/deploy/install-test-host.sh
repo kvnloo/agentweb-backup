@@ -26,6 +26,8 @@ if ! mountpoint -q /var/lib/aw-login-host/test1/u; then
   mount -o remount,nosuid,nodev /var/lib/aw-login-host/test1/u   # the first loop mount drops these flags on AL2023
   quotacheck -cu /var/lib/aw-login-host/test1/u 2>/dev/null || true
   quotaon /var/lib/aw-login-host/test1/u 2>/dev/null || true
+  # quotacheck remounts and drops nosuid/nodev on AL2023; the unit's ExecStartPre re-asserts them, do it here too so a manual start matches
+  mount -o remount,nosuid,nodev,usrquota /var/lib/aw-login-host/test1/u
 fi
 SHA=$(sha256sum /opt/aw-claude/2.1.294/claude | cut -d' ' -f1)
 cat > /etc/aw-login-host/test1.json <<CFG
