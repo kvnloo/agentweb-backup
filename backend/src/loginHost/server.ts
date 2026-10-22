@@ -18,7 +18,7 @@ import { connect } from "net";
 import { ZodError } from "zod";
 import type { ConnectionManager } from "./connectionManager";
 import type { Logger } from "./ports";
-import { HostError, HTTP_STATUS, PROTOCOL_VERSION, ROUTES, type RouteName } from "./protocol";
+import { HostError, HTTP_STATUS, LOCAL_ONLY_ROUTES, PROTOCOL_VERSION, ROUTES, type RouteName } from "./protocol";
 
 const MAX_BODY_BYTES = 5 * 1024 * 1024;
 /** A request body that stops arriving for this long is dropped (slowloris). */
@@ -88,12 +88,14 @@ export async function startHostServer(manager: ConnectionManager, opts: HostServ
   const bodyIdleMs = opts.bodyIdleMs ?? BODY_IDLE_MS;
   const streamStallMs = opts.streamStallMs ?? 30_000;
   /** The one request handler both listeners use. */
-  const onRequest = (req: IncomingMessage, res: ServerResponse): void => {
-    void handle(manager, req, res, bodyIdleMs, streamStallMs).catch(() => {
+  const makeOnRequest = (local: boolean) => (req: IncomingMessage, res: ServerResponse): void => {
+    void handle(manager, req, res, bodyIdleMs, streamStallMs, local).catch(() => {
       if (!res.headersSent) sendError(res, new HostError("EINTERNAL"));
       else res.end();
     });
   };
+  const onRequest = makeOnRequest(true);
+  const onSecureRequest = makeOnRequest(false);
   const server = createServer(onRequest);
   applyLimits(server, opts.maxConnections ?? 128);
   await new Promise<void>((resolve, reject) => {
@@ -121,7 +123,7 @@ export async function startHostServer(manager: ConnectionManager, opts: HostServ
           req.socket.destroy();
           return;
         }
-        onRequest(req, res);
+        onSecureRequest(req, res);
       },
     );
     // First line: dropped before the HTTP parser sees a byte. `prependListener` is essential: https.Server registers its own
@@ -196,7 +198,7 @@ function createRejectionLog(log: Pick<Logger, "warn"> | undefined, now: () => nu
   };
 }
 
-async function handle(manager: ConnectionManager, req: IncomingMessage, res: ServerResponse, bodyIdleMs: number, streamStallMs: number): Promise<void> {
+async function handle(manager: ConnectionManager, req: IncomingMessage, res: ServerResponse, bodyIdleMs: number, streamStallMs: number, local: boolean): Promise<void> {
   if (req.method !== "POST") return sendError(res, new HostError("EINVALID", "method"), 405);
   const match = /^\/v1\/([A-Za-z.]+)$/.exec(req.url ?? "");
   const route = match?.[1] as RouteName | undefined;
@@ -204,6 +206,8 @@ async function handle(manager: ConnectionManager, req: IncomingMessage, res: Ser
   // revoke and sweeper (a connection the host has never heard of is treated as already wiped). A newer backend talking to an older worker
   // must get something it can only read as an error (see PROTOCOL_VERSION).
   if (!route || !Object.prototype.hasOwnProperty.call(ROUTES, route)) return sendError(res, new HostError("EINVALID", "route"), 404);
+  // Operator routes answer exactly like an unknown route on the network listener: the backend can never starve or probe the host through them.
+  if (!local && LOCAL_ONLY_ROUTES.has(route)) return sendError(res, new HostError("EINVALID", "route"), 404);
   if (!/^application\/json(;|$)/i.test(String(req.headers["content-type"] ?? ""))) return sendError(res, new HostError("EINVALID", "content_type"), 415);
 
   let body: unknown;
@@ -227,7 +231,8 @@ async function handle(manager: ConnectionManager, req: IncomingMessage, res: Ser
   }
 
   try {
-    if (route === "host.info") return send(res, 200, { protocol: PROTOCOL_VERSION, node: process.version, uptimeSec: Math.floor(process.uptime()) });
+    if (route === "host.info") return send(res, 200, { protocol: PROTOCOL_VERSION, node: process.version, uptimeSec: Math.floor(process.uptime()), ...manager.hostStatus() });
+    if (route === "host.drain") return send(res, 200, manager.setDrain(input));
     if (route === "turn.run") return await streamTurn(manager, input, res, streamStallMs);
     const result = await dispatch(manager, route, input);
     send(res, 200, result);

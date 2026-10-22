@@ -4,14 +4,14 @@
 #   backend/scripts/build-login-host.sh [--out DIR] [--skip-tests] [--allow-dirty]       (default DIR: backend/dist/login-host-builds)
 #
 # Output: DIR/login-host-<gitsha>.tar.gz and DIR/login-host-<gitsha>.tar.gz.sha256. The tarball is what the SSM document
-# AW-LoginHost-Deploy-Prod downloads from s3://agentweb-login-host-992382574572/prod/builds/, verifies against the sha256 given to it,
-# extracts into a fresh root-owned 0700 directory and runs (install.sh at its top level). Contents: install.sh, lib.sh, versions.env, MANIFEST,
-# check-config.js, the esbuild bundle of the host, and files/ (wrapper scripts, systemd units, config and slice templates, system prompt).
+# AW-LoginHost-Deploy-Signed downloads from s3://agentweb-login-host-992382574572/prod/builds/, verifies against the sha256 given to it,
+# extracts into a fresh root-owned 0700 directory and runs (install.sh at its top level). Contents: install.sh, deploy.sh (install + idle gate + restart + health + rollback), lib.sh, versions.env, MANIFEST,
+# check-config.js, deployctl.js, the esbuild bundle of the host, and files/ (wrapper scripts, systemd units, config and slice templates, system prompt).
 # It never contains a secret and nothing machine-specific (the worker's address is read at install time); the build aborts if it sees private-key
 # material. Reproducible for a given commit (mtime = commit time, sorted names, no gzip timestamp).
 #
 # THE BUILD IS THE GATE. It refuses to package when
-#   - the repo's own gate tests fail (deploy scripts, host, mutual TLS)                      override: --skip-tests   (recorded in the MANIFEST)
+#   - the repo's own gate tests fail (deploy scripts, host, mutual TLS, drain)                      override: --skip-tests   (recorded in the MANIFEST)
 #   - anything under backend/ is uncommitted                                                    override: --allow-dirty (recorded in the MANIFEST)
 #   - a package that ends up in the bundle is not the version package-lock.json pins            override: --allow-dirty (recorded in the MANIFEST)
 set -euo pipefail
@@ -19,11 +19,15 @@ set -euo pipefail
 OUT=""
 SKIP_TESTS=0
 ALLOW_DIRTY=0
+TESTS_ELSEWHERE=0
+TESTS_ONLY=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --out) shift; OUT=${1:?--out needs a directory} ;;
     --skip-tests) SKIP_TESTS=1 ;;
     --allow-dirty) ALLOW_DIRTY=1 ;;
+    --tests-run-elsewhere) TESTS_ELSEWHERE=1 ;;
+    --tests-only) TESTS_ONLY=1 ;;
     *) echo "build-login-host: unknown argument $1" >&2; exit 2 ;;
   esac
   shift
@@ -56,14 +60,24 @@ NAME="login-host-$SHA$DIRTY"
 cd "$BACKEND"
 
 # (2) the gate tests.
+# In the pipeline the tests run in their OWN job (--tests-only) that produces nothing, and the job that makes the tarball runs with --tests-run-elsewhere: jest
+# loads every dev dependency, and code that runs in the same job as the packaging could rewrite the tarball afterwards. The signing job only runs once the test
+# job has succeeded, which is what makes the MANIFEST value below true.
 TESTS="passed"
-if [ "$SKIP_TESTS" = 1 ]; then
+if [ "$TESTS_ELSEWHERE" = 1 ]; then
+  TESTS="separate-job"
+elif [ "$SKIP_TESTS" = 1 ]; then
   TESTS="SKIPPED (--skip-tests)"
   echo "build-login-host: WARNING: the gate tests were SKIPPED (--skip-tests); this is recorded in the MANIFEST" >&2
 else
   echo "build-login-host: running the gate tests"
   npx --no-install jest src/loginHost/__tests__/deploy src/loginHost/__tests__/host src/services/funding/__tests__/loginHostMutualTls.test.ts --silent \
     || { echo "build-login-host: ABORT: the gate tests failed; nothing was packaged" >&2; exit 1; }
+fi
+
+if [ "$TESTS_ONLY" = 1 ]; then
+  echo "build-login-host: the gate tests passed (--tests-only: nothing was packaged)"
+  exit 0
 fi
 
 WORK=$(mktemp -d)
@@ -77,12 +91,14 @@ ESBUILD_VERSION=$(npx --no-install esbuild --version)
 "${ESBUILD[@]}" src/loginHost/host/start.ts --outfile="$STAGE/dist/loginHost/host/start.js" --metafile="$WORK/meta-start.json"
 # The host's own config parser as a tiny stand-alone checker, so install.sh can validate the generated config before the host ever reads it.
 "${ESBUILD[@]}" src/loginHost/deploy/prod/check-config.ts --outfile="$STAGE/check-config.js" --metafile="$WORK/meta-check.json"
+# The deploy's window into the running host (idle gate, health check), run by deploy.sh over the host's unix socket.
+"${ESBUILD[@]}" src/loginHost/deploy/prod/deployCtl.ts --outfile="$STAGE/deployctl.js" --metafile="$WORK/meta-ctl.json"
 
 # (3) every npm package that ended up in the bundle must be the version package-lock.json pins (the build must be reproducible from the lockfile, not from
 # whatever happens to be in node_modules).
 LOCK_SHA=$(sha256sum package-lock.json | cut -d' ' -f1)
 LOCK_CHECK="ok"
-if ! node - "$WORK/meta-start.json" "$WORK/meta-check.json" <<'JS'
+if ! node - "$WORK/meta-start.json" "$WORK/meta-check.json" "$WORK/meta-ctl.json" <<'JS'
 const fs = require("fs");
 const lock = JSON.parse(fs.readFileSync("package-lock.json", "utf8")).packages;
 const pkgs = new Set();
@@ -120,11 +136,11 @@ fi
 # The directory name may have changed above (dirty): rebuild the staging path.
 if [ "$STAGE" != "$WORK/$NAME" ]; then mv "$STAGE" "$WORK/$NAME"; STAGE="$WORK/$NAME"; fi
 
-cp "$PROD/install.sh" "$PROD/lib.sh" "$PROD/versions.env" "$STAGE/"
+cp "$PROD/install.sh" "$PROD/deploy.sh" "$PROD/lib.sh" "$PROD/versions.env" "$STAGE/"
 cp "$DEPLOY/claude-turn.sh" "$DEPLOY/aw-net.sh" "$DEPLOY/aw-write-file.sh" "$DEPLOY/aw-login-host@.service" "$DEPLOY/aw-login-host-failed@.service" \
   "$PROD/host-config.template.json" "$PROD/system-prompt.txt" "$STAGE/files/"
 cp "$DEPLOY/aw-env.slice.example" "$STAGE/files/aw-env.slice.template"
-chmod 0755 "$STAGE/install.sh" "$STAGE/files/claude-turn.sh" "$STAGE/files/aw-net.sh" "$STAGE/files/aw-write-file.sh"
+chmod 0755 "$STAGE/install.sh" "$STAGE/deploy.sh" "$STAGE/files/claude-turn.sh" "$STAGE/files/aw-net.sh" "$STAGE/files/aw-write-file.sh"
 chmod 0644 "$STAGE/lib.sh"
 
 # Never ship key material.
@@ -144,6 +160,11 @@ fi
   echo "esbuild=$ESBUILD_VERSION"
   echo "build_node=$(node --version)"
   echo "commit_time=$(date -u -d "@$EPOCH" +%Y-%m-%dT%H:%M:%SZ)"
+  # The pipeline's run id: set by GitHub (not by whoever authored the commit), repository-wide and not reset by renaming a workflow, increasing over time.
+  # deploy.sh refuses a build whose number is lower than the last one deployed (a signed OLD build must not be a way to downgrade). The SIGNING job checks this
+  # value against its own GITHUB_RUN_ID before it signs, because this script runs in the job that executes npm code. Empty for a build made by hand, which
+  # deploy.sh refuses (exit 5).
+  echo "build_seq=${GITHUB_RUN_ID:-}"
   echo "--- pinned versions (versions.env) ---"
   grep -E '^[A-Z0-9_]+=' "$PROD/versions.env"
   echo "--- sha256 of every file ---"
