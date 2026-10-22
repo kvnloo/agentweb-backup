@@ -4,6 +4,8 @@
  * ever dialled, a bad or missing configuration fails CLOSED (and a bad update keeps the last good one), the certificate material is
  * never logged or put in an error, and the client is rebuilt only when something it depends on changes.
  */
+// The test-only TLS keys and certificates are generated on first use (they are not committed): this import must come first.
+import "../../../loginHost/__tests__/fixtures/tls/ensureFixtures";
 import { mkdtempSync, readFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";

@@ -4,6 +4,8 @@
  * pieces fit together: the core's calls land on the port the way the design says, and the sandbox command the port builds
  * for every customer process is the hardened one.
  */
+// The test-only TLS keys and certificates are generated on first use (they are not committed): this import must come first.
+import "../fixtures/tls/ensureFixtures";
 import { request } from "http";
 import { LoginHostClient, MutualTlsTransport } from "../../../services/funding/loginHostClient";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "fs";
