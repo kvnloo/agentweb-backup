@@ -1,8 +1,10 @@
+import { X509Certificate } from "crypto";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { verifyBinary, assertTrustedPath } from "../../host/binary";
 import { assertNoSubuidOverlap, HostConfigError, parseHostConfig } from "../../host/hostConfig";
+import { assertKeyFileMode, reportTlsCertExpiry } from "../../host/main";
 import { registerRange } from "../../host/ranges";
 import { assertHomesMount, assertRoot, parseMounts } from "../../host/startupChecks";
 
@@ -59,6 +61,21 @@ describe("host config (a CLOSED schema)", () => {
     const { portConfigFor } = await import("../../host/main");
     const cfg = parseHostConfig(base());
     expect(portConfigFor(cfg).paths.net).toEqual({ dir: "/run/aw-egress-test1", launcher: "/opt/aw-login-host/aw-net.sh", socat: "/usr/bin/socat" });
+  });
+  describe("mutual TLS listener (PR 3)", () => {
+    const tls = { host: "172.31.30.50", port: 8443, certPath: "/etc/aw-login-host/tls/server.crt", keyPath: "/etc/aw-login-host/tls/server.key", caPath: "/etc/aw-login-host/tls/ca.crt", clientCommonNames: ["agentweb-backend-prod"] };
+    it("is optional and absent by default", () => expect(parseHostConfig(base()).tls).toBeUndefined());
+    it("accepts a private address with the files and the pinned client identity", () => expect(parseHostConfig({ ...base(), tls }).tls).toMatchObject({ host: "172.31.30.50", port: 8443, clientCommonNames: ["agentweb-backend-prod"] }));
+    it.each([
+      ["0.0.0.0", { host: "0.0.0.0" }],
+      ["loopback", { host: "127.0.0.1" }],
+      ["a hostname", { host: "worker.internal" }],
+      ["a privileged port", { port: 443 }],
+      ["no client identity", { clientCommonNames: [] }],
+      ["a client identity with odd characters", { clientCommonNames: ["a b"] }],
+      ["an unknown key", { extra: 1 }],
+      ["a relative cert path", { certPath: "server.crt" }],
+    ])("rejects %s", (_n, over) => expect(bad({ tls: { ...tls, ...over } })).toThrow(HostConfigError));
   });
   it("rejects unknown keys anywhere (nothing is silently ignored)", () => {
     expect(bad({ extra: 1 })).toThrow(HostConfigError);
@@ -241,5 +258,43 @@ describe("range registry lock left empty by a dying creator", () => {
     utimesSync(join(dir, ".lock"), old, old);
     registerRange(dir, { env: "test1", uidMin: 400_000, uidMax: 410_000 }, 150);
     expect(readFileSync(join(dir, "test1.json"), "utf8")).toContain("400000");
+  });
+});
+
+describe("TLS start-up checks (PR 3)", () => {
+  const DAY = 24 * 60 * 60 * 1000;
+
+  it.each([0o600, 0o400, 0o100600, 0o100400])("a key file with mode %o is accepted (owner only)", (mode) => expect(() => assertKeyFileMode("/k", mode)).not.toThrow());
+  it.each([0o640, 0o644, 0o604, 0o660, 0o666, 0o100644, 0o100640, 0o610])("a key file with mode %o is refused (group or others can read or write it)", (mode) => {
+    expect(() => assertKeyFileMode("/etc/aw-login-host/tls/server.key", mode)).toThrow(HostConfigError);
+    expect(() => assertKeyFileMode("/etc/aw-login-host/tls/server.key", mode)).toThrow(/must be mode 0600/);
+  });
+
+  describe("server certificate expiry at start-up", () => {
+    const cert = readFileSync(join(__dirname, "../fixtures/tls/server.pem"));
+    const notAfter = new Date(new X509Certificate(cert).validTo).getTime();
+    const rec = () => {
+      const lines: Array<{ level: string; event: string; fields?: Record<string, unknown> }> = [];
+      return { lines, log: { info: (event: string, fields?: Record<string, unknown>) => void lines.push({ level: "info", event, fields }), warn: (event: string, fields?: Record<string, unknown>) => void lines.push({ level: "warn", event, fields }) } };
+    };
+
+    it("far from expiry: one info line with the day count, no warning", () => {
+      const { lines, log } = rec();
+      expect(reportTlsCertExpiry(log as never, cert, notAfter - 400 * DAY)).toBe(400);
+      expect(lines).toEqual([{ level: "info", event: "host_tls_cert_expiry", fields: { daysLeft: 400 } }]);
+    });
+    it("under 30 days: also a warning; expired: a negative count and a warning", () => {
+      const soon = rec();
+      expect(reportTlsCertExpiry(soon.log as never, cert, notAfter - 11 * DAY - 1000)).toBe(11);
+      expect(soon.lines.map((l) => l.event)).toEqual(["host_tls_cert_expiry", "host_tls_cert_expires_soon"]);
+      const gone = rec();
+      expect(reportTlsCertExpiry(gone.log as never, cert, notAfter + 2 * DAY + 1000)).toBe(-3);
+      expect(gone.lines[1]).toEqual({ level: "warn", event: "host_tls_cert_expires_soon", fields: { daysLeft: -3 } });
+    });
+    it("an unparseable certificate is a warning, not a crash, and never echoes the content", () => {
+      const { lines, log } = rec();
+      expect(reportTlsCertExpiry(log as never, "-----BEGIN CERTIFICATE-----\nSECRETISH\n-----END CERTIFICATE-----", 0)).toBeUndefined();
+      expect(lines).toEqual([{ level: "warn", event: "host_tls_cert_unparseable", fields: undefined }]);
+    });
   });
 });

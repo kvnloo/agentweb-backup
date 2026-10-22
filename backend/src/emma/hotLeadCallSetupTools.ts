@@ -2,9 +2,12 @@ import { emmaToolRegistry } from './registry';
 import { callerIdentity, callerOrg, type ToolContext } from './orgCaller';
 import { MEMBER_ID, type HotLeadCallConfig } from '../services/hotLeadCallConfig';
 import { VERIFICATION_CODE_TTL_MS, VERIFICATION_MAX_ATTEMPTS, VERIFICATION_MAX_STARTS_PER_MEMBER_PER_DAY, VERIFICATION_MAX_STARTS_PER_ORG_PER_DAY } from '../services/voice/memberVerification';
-import { confirmMemberVerification, startMemberVerification, storedHotLeadCallConfig as storedConfig } from '../services/hotLeadCallSettingsService';
+import { confirmMemberVerification, hotLeadCallRevisionOf, startMemberVerification, storedHotLeadCallConfig as storedConfig } from '../services/hotLeadCallSettingsService';
 import { assertHotLeadCallEntitled } from '../services/voice/hotLeadCallEntitlement';
 import { provisionNumber, releaseNumber, monthlyRentText } from '../services/voice/numberProvisioning';
+import * as approval from '../services/voice/hotLeadCallApprovalGate';
+import type { Organization } from '../services/db';
+import type { ApprovalDeckHistoryMessage } from '../services/agentMode/core/approvalDeck';
 
 /**
  * Setup tools for the hot lead auto-call: caller number, then team-member phone verification. Unlike the
@@ -13,9 +16,10 @@ import { provisionNumber, releaseNumber, monthlyRentText } from '../services/voi
  *
  * Spending or irreversible tools (provision, release, start verification) refuse unattended runs, mirroring
  * A1 of services/crmSequenceActivationGate.ts (`=== true`: only an explicit unattended turn is refused).
- * `confirm` on provision is advisory, not authorization. A2 (a deck-of-one human approval per purchase, as
- * the CRM sequence activation gate does) is NOT built and is a precondition for general availability; until
- * then the per-org purchase/release caps in numberProvisioning.ts are the real cost control.
+ * Provision and release additionally need a human approval: the first call halts with a one-question card
+ * and the purchase or release happens only on a later call, after the person in the chat clicked approve on
+ * that card (services/voice/hotLeadCallApprovalGate.ts). `confirm` on provision is ignored. The per-org
+ * purchase/release caps in numberProvisioning.ts remain as a second, independent limit.
  */
 
 const UNATTENDED_MESSAGE = 'This needs a person to confirm in an interactive chat';
@@ -51,29 +55,84 @@ function configuredOrThrow(config: HotLeadCallConfig | undefined): HotLeadCallCo
   return config;
 }
 
+/**
+ * Runs after every other check. Returns a halt (the approval card) unless the user already approved this exact
+ * action in this chat; in that case the approval is claimed (single use) and the caller may act. A claim that
+ * is lost, or a crash after it, costs the approval and never allows a second action.
+ */
+async function requireApproval(p: {
+  action: approval.HotLeadCallApprovalAction; org: Organization; context: ToolContext;
+  target: string | null; areaCode?: string; number?: string;
+}): Promise<Record<string, unknown> | undefined> {
+  const { context } = p;
+  const requestedSessionId = typeof context?.sessionId === 'string' ? context.sessionId : undefined;
+  const { chatbotDb } = await import('../services/chatbotService');
+  const readSession = requestedSessionId ? await chatbotDb.getChatSession(requestedSessionId, true).catch(() => null) : null;
+  const attended = approval.checkAttendedForApproval({
+    unattended: context?.isUnattendedRun === true,
+    delegated: context?.isDelegatedAccess === true || context?.isDelegatedAdmin === true,
+    sessionId: requestedSessionId,
+    session: readSession,
+  });
+  if (!attended.allowed) throw new Error(attended.reason);
+  const { sessionId, session } = attended;
+
+  const rentText = monthlyRentText();
+  const digest = approval.computeApprovalDigest({
+    action: p.action, orgId: p.org.orgId, userId: userIdOf(context), sessionId,
+    target: p.target, rentText, revision: hotLeadCallRevisionOf(p.org.hotLeadCall),
+  });
+  // The history comes from the consistent session read above, so a fresh decline cannot be missed.
+  const messages: ApprovalDeckHistoryMessage[] = session.messages;
+  const consumedKinds = new Set(Object.keys(session.consumedMetaWriteManifestDigests ?? {})
+    .filter(k => k.startsWith(approval.CONSUMED_KEY_PREFIX)).map(k => k.slice(approval.CONSUMED_KEY_PREFIX.length)));
+  const found = approval.findApproval(messages, approval.approvalKindPrefix(p.action, digest), Date.now(), consumedKinds);
+
+  if (found.status === 'none') {
+    const question = approval.buildApprovalQuestion({
+      action: p.action, kind: approval.newApprovalKind(p.action, digest), rentText, areaCode: p.areaCode, number: p.number,
+    });
+    return {
+      success: true,
+      awaitingUserConfirmation: true,
+      type: 'ask_user_question',
+      sessionId,
+      questionDeckPayload: [question],
+      confirmationPrompt: question.question,
+      summary: question.question,
+      message: 'Nothing was done yet. The run stops here until the user answers the card. After they approve, call this tool again with the same arguments; do not ask them in text.',
+    };
+  }
+  if (!(await chatbotDb.claimMetaWriteManifestDigest(sessionId, approval.consumedKeyOf(found.kind)))) {
+    throw new Error('This approval was already used. Nothing was done; ask again to get a new approval card.');
+  }
+  return undefined;
+}
+
 emmaToolRegistry.register({
   name: 'provision_hot_lead_call_number',
   definition: {
     name: 'provision_hot_lead_call_number',
-    description: `Buy the phone number the hot lead auto-call is placed from (org owners/admins only; refused when the organization's plan does not include hot lead calls). This spends money: the number has a monthly fee on your Twilio account (the current price is stated when the user is asked to agree), charged now and every month until it is released. Set it up in this order: save settings, get a number with this tool, verify the team member's phone, then enable calling. Needs saved hot lead call settings, and each organization can hold one number. Pass confirm:true only after the user has explicitly agreed to the cost in this conversation; confirm is advisory and is not an authorization, so never set it on your own. Each organization can buy at most 2 numbers per day. areaCode (3 digits) is optional and picks a US area code. If the result says the purchase could not be confirmed, do not retry; tell the user to contact support. Works even while hot lead calling is switched off platform-wide.`,
+    description: `Buy the phone number the hot lead auto-call is placed from (org owners/admins only; refused when the organization's plan does not include hot lead calls). This spends money: the number has a monthly fee on your Twilio account (the current price is stated when the user is asked to agree), charged now and every month until it is released. Set it up in this order: save settings, get a number with this tool, verify the team member's phone, then enable calling. Needs saved hot lead call settings, and each organization can hold one number. The user must approve each purchase: the first call stops with an approval card that states the monthly price, and the number is bought only when you call this tool again with the same arguments after they clicked approve (approval lasts 15 minutes and works once). Do not ask for the approval in text. confirm is ignored and authorizes nothing. Each organization can buy at most 2 numbers per day. areaCode (3 digits) is optional and picks a US area code. If the result says the purchase could not be confirmed, do not retry; tell the user to contact support. Works even while hot lead calling is switched off platform-wide.`,
     inputSchema: {
       type: 'object',
       properties: {
-        confirm: { type: 'boolean', description: 'Must be true: the user agreed to the monthly cost.' },
+        confirm: { type: 'boolean', description: 'Ignored. The user approves on the approval card, not through this argument.' },
         areaCode: { type: 'string', pattern: '^\\d{3}$', description: 'Optional US area code, exactly 3 digits.' },
       },
-      required: ['confirm'],
       additionalProperties: false,
     },
   },
   execute: async (args: unknown, context?: ToolContext) => {
     requireAttended(context);
-    const { confirm, areaCode } = onlyKeys(args, ['confirm', 'areaCode']);
-    if (confirm !== true) throw new Error(`Buying a number costs money (${monthlyRentText()}). Ask the user to agree, then call again with confirm:true.`);
+    const { areaCode } = onlyKeys(args, ['confirm', 'areaCode']);
     if (areaCode !== undefined && (typeof areaCode !== 'string' || !/^\d{3}$/.test(areaCode))) throw new Error('areaCode must be exactly 3 digits, for example 415');
     const org = await callerOrg(context, 'the hot lead caller number', true);
     await assertHotLeadCallEntitled(org);
     const config = configuredOrThrow(storedConfig(org));
+    if (config.twilioNumber || config.twilioNumberSid) throw new Error('This organization already has a caller number. Release it first if you need a different one.');
+    const halt = await requireApproval({ action: 'provision', org, context, target: typeof areaCode === 'string' ? areaCode : null, areaCode: typeof areaCode === 'string' ? areaCode : undefined });
+    if (halt) return halt;
     const result = await provisionNumber({ org, config, userId: userIdOf(context), areaCode });
     return {
       success: true, ...result,
@@ -86,7 +145,7 @@ emmaToolRegistry.register({
   name: 'release_hot_lead_call_number',
   definition: {
     name: 'release_hot_lead_call_number',
-    description: 'Release the hot lead auto-call phone number (org owners/admins only). The number goes back to the phone provider and cannot be recovered; a new one may differ and costs money again. Hot lead calling is turned off first and stays off until a new number is provisioned and calling is enabled again; the monthly charge stops. A call that is already in progress when this runs may fail. Limited to a few releases per day. Only run it when the user has clearly asked. Works even while hot lead calling is switched off platform-wide.',
+    description: 'Release the hot lead auto-call phone number (org owners/admins only). The number goes back to the phone provider and cannot be recovered; a new one may differ and costs money again. Hot lead calling is turned off first and stays off until a new number is provisioned and calling is enabled again; the monthly charge stops. A call that is already in progress when this runs may fail. Limited to a few releases per day. Only run it when the user has clearly asked. The user must approve each release: the first call stops with an approval card, and the number is released only when you call this tool again after they clicked approve (approval lasts 15 minutes and works once). Works even while hot lead calling is switched off platform-wide.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
   execute: async (args: unknown, context?: ToolContext) => {
@@ -94,6 +153,9 @@ emmaToolRegistry.register({
     onlyKeys(args, []);
     const org = await callerOrg(context, 'the hot lead caller number', true);
     const config = configuredOrThrow(storedConfig(org));
+    if (!config.twilioNumber && !config.twilioNumberSid) throw new Error('This organization has no caller number to release.');
+    const halt = await requireApproval({ action: 'release', org, context, target: config.twilioNumberSid ?? config.twilioNumber ?? null, number: config.twilioNumber });
+    if (halt) return halt;
     return { success: true, ...(await releaseNumber({ org, config })) };
   },
 });

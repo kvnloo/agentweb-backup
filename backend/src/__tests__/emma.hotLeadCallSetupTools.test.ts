@@ -2,6 +2,9 @@ type Tool = { name: string; definition: { description: string; inputSchema: { pr
 const handlers = new Map<string, Tool>();
 jest.mock('../emma/registry', () => ({ emmaToolRegistry: { register: (tool: Tool) => handlers.set(tool.name, tool) } }));
 jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn() }, orgDb: { getOrgById: jest.fn(), updateOrg: jest.fn() } }));
+jest.mock('../services/chatbotService', () => ({
+  chatbotDb: { getChatSession: jest.fn(), getMessagesFromMessagesTable: jest.fn(), claimMetaWriteManifestDigest: jest.fn() },
+}));
 jest.mock('../services/usageRecorderService', () => ({ recordVendorUsage: jest.fn().mockResolvedValue(undefined) }));
 jest.mock('../services/voice/hotLeadCallMode', () => ({ isHotLeadCallEnabled: jest.fn().mockResolvedValue(false) }));
 import { spokenCode } from './helpers/spokenCode';
@@ -9,6 +12,8 @@ import crypto from 'crypto';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { orgDb, userDb } from '../services/db';
+import { chatbotDb } from '../services/chatbotService';
+import { deckHalt, deckReply, type DeckMessage } from './helpers/approvalDeckHistory';
 import { recordVendorUsage } from '../services/usageRecorderService';
 import { isHotLeadCallEnabled } from '../services/voice/hotLeadCallMode';
 import '../emma/hotLeadCallTools';
@@ -21,8 +26,52 @@ import { getRecordingUnit } from '../utils/vendorRateCard';
 import { SHARED_SESSION_BLOCKED_ORG_SETTINGS_TOOLS } from '../services/agentMode/core/toolDispatch';
 
 const run = (name: string, args: unknown = {}, context: unknown = { userId: 'owner' }) => handlers.get(name)!.execute(args, context);
-const provision = (args: unknown = { confirm: true }, ctx?: unknown) => run('provision_hot_lead_call_number', args, ctx);
-const release = (ctx?: unknown) => run('release_hot_lead_call_number', {}, ctx);
+const SESSION = 'sess-1';
+const attended = (extra: Record<string, unknown> = {}) => ({ userId: 'owner', sessionId: SESSION, ...extra });
+type Halt = { awaitingUserConfirmation?: boolean; questionDeckPayload?: Array<{ kind: string; question: string; options: Array<{ id: string }> }> };
+
+// In-memory chat sessions: the history the approval gate reads and the single-use map it claims in.
+type FakeSession = { sessionType?: string; consumedMetaWriteManifestDigests: Record<string, string>; messages: DeckMessage[] };
+let sessions: Map<string, FakeSession>;
+let deckCounter: number;
+const sessionOf = (id: string) => { if (!sessions.has(id)) sessions.set(id, { sessionType: 'chat', consumedMetaWriteManifestDigests: {}, messages: [] }); return sessions.get(id)!; };
+function installChatDb() {
+  sessions = new Map();
+  deckCounter = 0;
+  (chatbotDb.getChatSession as jest.Mock).mockImplementation(async (id: string) => clone(sessionOf(id)));
+  // The default read is eventually consistent: it can miss the newest message.
+  (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockImplementation(async (id: string) => clone(sessionOf(id).messages.slice(0, -1)));
+  (chatbotDb.claimMetaWriteManifestDigest as jest.Mock).mockImplementation(async (id: string, key: string) => {
+    const map = sessionOf(id).consumedMetaWriteManifestDigests;
+    if (key in map) return false;
+    map[key] = new Date().toISOString();
+    return true;
+  });
+}
+/** Records a halt the way the deck seam stores it, and returns the deck id. */
+function recordHalt(result: unknown, sessionId = SESSION): string {
+  const item = (result as Halt).questionDeckPayload![0];
+  const deckId = `deck-${++deckCounter}`;
+  sessionOf(sessionId).messages.push(deckHalt(item.kind, deckId, item.question));
+  return deckId;
+}
+function answerCard(deckId: string, verdict: string, sessionId = SESSION, extra: { answeredBy?: 'user' | 'delegation'; at?: string } = {}) {
+  sessionOf(sessionId).messages.push(deckReply(deckId, verdict, extra.answeredBy ?? 'user', extra.at ?? new Date().toISOString()));
+}
+/** Calls the tool, and when it halts with a card, has the user approve it and calls again. */
+async function withApproval(name: string, args: unknown, ctx: { sessionId?: string } = attended()) {
+  const first = await run(name, args, ctx);
+  if (!(first as Halt).awaitingUserConfirmation) return first;
+  answerCard(recordHalt(first, ctx.sessionId), 'approve', ctx.sessionId);
+  return run(name, args, ctx);
+}
+/** Gets a card and has the user approve it, without running the tool a second time. */
+async function approveFresh(name: string, args: unknown, sessionId = SESSION) {
+  const halt = await run(name, args, attended({ sessionId }));
+  answerCard(recordHalt(halt, sessionId), 'approve', sessionId);
+}
+const provision = (args: unknown = {}, ctx: { sessionId?: string } = attended()) => withApproval('provision_hot_lead_call_number', args, ctx);
+const release = (ctx: { sessionId?: string } = attended()) => withApproval('release_hot_lead_call_number', {}, ctx);
 const start = (args: unknown = {}, ctx?: unknown) => run('start_hot_lead_call_verification', args, ctx);
 const confirm = (code: unknown, ctx?: unknown, memberId?: string) => run('confirm_hot_lead_call_verification', { code, ...(memberId ? { memberId } : {}) }, ctx);
 const SETUP_TOOLS = ['provision_hot_lead_call_number', 'release_hot_lead_call_number', 'start_hot_lead_call_verification', 'confirm_hot_lead_call_verification'];
@@ -105,6 +154,7 @@ beforeEach(() => {
   setVoiceProviderForTests(fake);
   (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'owner', orgId: 'org-a', orgRole: 'owner' });
   installOrgDb();
+  installChatDb();
   logSpies.splice(0, logSpies.length, ...(['log', 'info', 'warn', 'error', 'debug'] as const).map(m => jest.spyOn(console, m).mockImplementation(() => undefined)));
 });
 afterEach(() => {
@@ -165,16 +215,17 @@ describe('permissions and registration', () => {
     await expect(start({}, { userId: 'owner', isUnattendedRun: flag })).resolves.toMatchObject({ success: true });
     org.hotLeadCall = configured();
     fake.queueBuyNumberResult({ numberSid: NEW_SID, phoneNumber: NEW_NUMBER });
-    await expect(provision({ confirm: true }, { userId: 'owner', isUnattendedRun: flag })).resolves.toMatchObject({ success: true });
+    await expect(provision({ confirm: true }, attended({ isUnattendedRun: flag }))).resolves.toMatchObject({ success: true });
   });
   it('works while the platform kill switch is off, without consulting it', async () => {
     org.hotLeadCall = withNumber();
     await expect(start()).resolves.toMatchObject({ success: true });
     expect(isHotLeadCallEnabled).not.toHaveBeenCalled();
   });
-  it('describes confirm as advisory, the cost without a hard-coded price, and the irreversible release', () => {
+  it('describes the approval card, that confirm authorizes nothing, the cost without a hard-coded price, and the irreversible release', () => {
     const buy = handlers.get('provision_hot_lead_call_number')!.definition.description;
-    expect(buy).toMatch(/confirm is advisory/);
+    expect(buy).toMatch(/approval card/);
+    expect(buy).toMatch(/confirm is ignored and authorizes nothing/);
     expect(buy).not.toMatch(/\$\d/);
     expect(handlers.get('release_hot_lead_call_number')!.definition.description).toMatch(/cannot be recovered/);
     expect(handlers.get('start_hot_lead_call_verification')!.definition.description).toMatch(/voicemail.*Twilio call log/);
@@ -194,12 +245,8 @@ describe('provision_hot_lead_call_number', () => {
     expect(fake.boughtNumbers).toEqual([]);
     expect(writes).toEqual([]);
   });
-  it.each([[{}], [{ confirm: false }], [{ confirm: 'true' }], [{ confirm: 1 }], [{ confirm: null }]])('does not spend without confirm:true (%j)', async args => {
-    await expect(provision(args)).rejects.toThrow('costs money');
-    expect(fake.boughtNumbers).toEqual([]);
-  });
   it.each(['41', '4155', 'abc', '41a', '', 415, ' 415'])('rejects area code %j before buying', async areaCode => {
-    await expect(provision({ confirm: true, areaCode })).rejects.toThrow('areaCode must be exactly 3 digits');
+    await expect(provision({ areaCode })).rejects.toThrow('areaCode must be exactly 3 digits');
     expect(fake.boughtNumbers).toEqual([]);
   });
   it('refuses when the org already has a number, or only a sid', async () => {
@@ -231,14 +278,14 @@ describe('provision_hot_lead_call_number', () => {
   it('charges the first month to the org owner even when an admin buys', async () => {
     (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'a', orgId: 'org-a', orgRole: 'admin' });
     fake.queueBuyNumberResult({ numberSid: NEW_SID, phoneNumber: NEW_NUMBER });
-    await run('provision_hot_lead_call_number', { confirm: true }, { userId: 'a' });
+    await withApproval('provision_hot_lead_call_number', { confirm: true }, attended({ userId: 'a' }));
     expect((recordVendorUsage as jest.Mock).mock.calls[0][0].userId).toBe('owner');
   });
   it('falls back to the acting user, loudly, when the org has no owner', async () => {
     delete org.ownerUserId;
     (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'a', orgId: 'org-a', orgRole: 'admin' });
     fake.queueBuyNumberResult({ numberSid: NEW_SID, phoneNumber: NEW_NUMBER });
-    await run('provision_hot_lead_call_number', { confirm: true }, { userId: 'a' });
+    await withApproval('provision_hot_lead_call_number', { confirm: true }, attended({ userId: 'a' }));
     expect((recordVendorUsage as jest.Mock).mock.calls[0][0].userId).toBe('a');
     expect(allLogs()).toContain('has no owner');
   });
@@ -257,7 +304,7 @@ describe('provision_hot_lead_call_number', () => {
   it('two racing provisions reach Twilio once: the reservation is conditional, so the loser never buys', async () => {
     fake.queueBuyNumberResult({ numberSid: NEW_SID, phoneNumber: NEW_NUMBER });
     fake.queueBuyNumberResult({ numberSid: NEW_SID_2, phoneNumber: NEW_NUMBER_2 });
-    const results = await Promise.allSettled([provision(), provision()]);
+    const results = await Promise.allSettled([provision({}, attended()), provision({}, attended({ sessionId: 'sess-2' }))]);
     expect(results.filter(r => r.status === 'fulfilled')).toHaveLength(1);
     expect((results.find(r => r.status === 'rejected') as PromiseRejectedResult).reason.message).toContain('in progress');
     expect(fake.boughtNumbers).toHaveLength(1);
@@ -301,7 +348,8 @@ describe('provision_hot_lead_call_number', () => {
   });
   it('takes the unit and the price text from the rate card', async () => {
     fake.queueBuyNumberResult({ numberSid: NEW_SID, phoneNumber: NEW_NUMBER });
-    await expect(provision({})).rejects.toThrow(/\$1\.15 per month/);
+    const halt = await run('provision_hot_lead_call_number', {}, attended());
+    expect((halt as Halt).questionDeckPayload![0].question).toMatch(/\$1\.15 per month/);
     await provision();
     expect((recordVendorUsage as jest.Mock).mock.calls[0][0].unit).toBe(getRecordingUnit('twilio', 'number_monthly_rent'));
   });
@@ -343,8 +391,9 @@ describe('provision_hot_lead_call_number', () => {
   it('does NOT release when it cannot tell whether the write landed, and logs the orphan risk', async () => {
     fake.queueBuyNumberResult({ numberSid: NEW_SID, phoneNumber: NEW_NUMBER });
     beforeWrite = i => { if (i === 1) throw new Error('socket hang up'); };
+    await approveFresh('provision_hot_lead_call_number', {});
     (orgDb.getOrgById as jest.Mock).mockResolvedValueOnce(clone(org)).mockRejectedValueOnce(new Error('db down'));
-    await expect(provision()).rejects.toThrow('could not be confirmed');
+    await expect(run('provision_hot_lead_call_number', {}, attended())).rejects.toThrow('could not be confirmed');
     expect(fake.releasedNumbers).toEqual([]);
     expect(allLogs()).toContain(`ORPHAN number: org org-a sid ${NEW_SID}`);
   });
@@ -438,6 +487,171 @@ describe('release_hot_lead_call_number', () => {
     beforeWrite = i => { if (i >= 2) (org.hotLeadCall as Record<string, unknown>).maxCallsPerHour = bump++; };
     await expect(release()).rejects.toThrow('Try again');
     expect(org.hotLeadCall).toHaveProperty('twilioNumberSid');
+  });
+});
+
+describe('human approval for provision and release', () => {
+  const PROVISION = 'provision_hot_lead_call_number';
+  const RELEASE = 'release_hot_lead_call_number';
+  const ARGS: Record<string, unknown> = { [PROVISION]: { areaCode: '415' }, [RELEASE]: {} };
+  const spent = () => fake.boughtNumbers.length + fake.releasedNumbers.length;
+  const call = (name: string, ctx: Record<string, unknown> = attended()) => run(name, ARGS[name], ctx) as Promise<Halt & Record<string, unknown>>;
+  // Provision needs an org without a number; release needs one with a number.
+  const prepare = (name: string) => { org.hotLeadCall = name === PROVISION ? configured() : withNumber(); };
+
+  describe.each([PROVISION, RELEASE])('%s', name => {
+    beforeEach(() => { prepare(name); fake.queueBuyNumberResult({ numberSid: NEW_SID, phoneNumber: NEW_NUMBER }); });
+
+    it('halts with an approval card on the first call and does not act', async () => {
+      const result = await call(name);
+      expect(result).toMatchObject({ success: true, awaitingUserConfirmation: true, type: 'ask_user_question', sessionId: SESSION });
+      const [card] = result.questionDeckPayload as Array<Record<string, unknown>>;
+      expect(card).toMatchObject({ allowEmmaDecide: false, immutable: true });
+      expect(String(card.kind)).toMatch(new RegExp(`^hot_lead_call_approval:${name === PROVISION ? 'provision' : 'release'}:[0-9a-f]{64}:[0-9a-f]+$`));
+      expect(spent()).toBe(0);
+      expect(writes).toEqual([]);
+      expect(chatbotDb.claimMetaWriteManifestDigest).not.toHaveBeenCalled();
+    });
+    it('states the monthly rent from the rate card on the card', async () => {
+      expect(((await call(name)).questionDeckPayload![0]).question).toContain('$1.15 per month');
+    });
+    it('acts exactly once after the user approves, and a second call needs a new approval', async () => {
+      answerCard(recordHalt(await call(name)), 'approve');
+      const done = await call(name);
+      expect(done).toMatchObject({ success: true });
+      expect(done.awaitingUserConfirmation).toBeUndefined();
+      expect(spent()).toBe(1);
+      prepare(name);
+      const again = await call(name);
+      expect(again.awaitingUserConfirmation).toBe(true);
+      expect(spent()).toBe(1);
+    });
+    it('refuses and does not act when the claim is lost', async () => {
+      answerCard(recordHalt(await call(name)), 'approve');
+      (chatbotDb.claimMetaWriteManifestDigest as jest.Mock).mockResolvedValueOnce(false);
+      await expect(call(name)).rejects.toThrow('already used');
+      expect(spent()).toBe(0);
+    });
+    it('claims the approval before acting and under the namespaced key', async () => {
+      const halt = await call(name);
+      answerCard(recordHalt(halt), 'approve');
+      const order: string[] = [];
+      (chatbotDb.claimMetaWriteManifestDigest as jest.Mock).mockImplementationOnce(async () => { order.push('claim'); return true; });
+      jest.spyOn(fake, 'buyNumber').mockImplementation(async () => { order.push('act'); return { numberSid: NEW_SID, phoneNumber: NEW_NUMBER }; });
+      jest.spyOn(fake, 'releaseNumber').mockImplementation(async () => { order.push('act'); });
+      await call(name);
+      expect(order).toEqual(['claim', 'act']);
+      expect((chatbotDb.claimMetaWriteManifestDigest as jest.Mock).mock.calls[0]).toEqual([SESSION, `hotlead:${halt.questionDeckPayload![0].kind}`]);
+    });
+    it('does not act on a decline, a delegated answer, an unanswered card or an expired approval', async () => {
+      const decline = recordHalt(await call(name)); answerCard(decline, 'decline');
+      expect((await call(name)).awaitingUserConfirmation).toBe(true);
+      sessions.clear();
+      answerCard(recordHalt(await call(name)), 'approve', SESSION, { answeredBy: 'delegation' });
+      expect((await call(name)).awaitingUserConfirmation).toBe(true);
+      sessions.clear();
+      recordHalt(await call(name));
+      expect((await call(name)).awaitingUserConfirmation).toBe(true);
+      sessions.clear();
+      answerCard(recordHalt(await call(name)), 'approve', SESSION, { at: new Date(T0 - 16 * MIN).toISOString() });
+      expect((await call(name)).awaitingUserConfirmation).toBe(true);
+      expect(spent()).toBe(0);
+    });
+    it('does not accept an approval given in another chat session (a branched session starts without one)', async () => {
+      answerCard(recordHalt(await call(name), 'sess-old'), 'approve', 'sess-old');
+      expect((await call(name, attended({ sessionId: 'sess-new' }))).awaitingUserConfirmation).toBe(true);
+      expect(spent()).toBe(0);
+    });
+    it('does not accept an approval that was given for a different user', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'admin2', orgId: 'org-a', orgRole: 'admin' });
+      answerCard(recordHalt(await call(name, attended({ userId: 'admin2' }))), 'approve');
+      (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'owner', orgId: 'org-a', orgRole: 'owner' });
+      expect((await call(name)).awaitingUserConfirmation).toBe(true);
+    });
+    it('ignores confirm:true: it never acts without an approved card', async () => {
+      const args = name === PROVISION ? { confirm: true } : {};
+      const result = await run(name, args, attended());
+      expect((result as Halt).awaitingUserConfirmation).toBe(true);
+      expect(spent()).toBe(0);
+    });
+    it.each([
+      ['an unattended run', { isUnattendedRun: true }, 'This needs a person to confirm'],
+      ['a delegated (support) session', { isDelegatedAccess: true }, 'customer in their own chat'],
+      ['a delegated admin session', { isDelegatedAdmin: true }, 'customer in their own chat'],
+      ['a call without a chat session', { sessionId: undefined }, 'attended chat session'],
+    ])('refuses %s without showing a card', async (_label, extra, message) => {
+      await expect(call(name, attended(extra))).rejects.toThrow(message);
+      expect(spent()).toBe(0);
+    });
+    it('refuses a scheduled session without showing a card', async () => {
+      sessionOf(SESSION).sessionType = 'scheduled';
+      await expect(call(name)).rejects.toThrow('not a scheduled run');
+      expect(spent()).toBe(0);
+    });
+    it('refuses when the session cannot be read', async () => {
+      (chatbotDb.getChatSession as jest.Mock).mockRejectedValueOnce(new Error('db down'));
+      await expect(call(name)).rejects.toThrow('could not be read');
+    });
+    it('refuses a non-admin caller before any card is shown', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'm', orgId: 'org-a', orgRole: 'member' });
+      await expect(call(name, attended({ userId: 'm' }))).rejects.toThrow('owners and admins');
+      expect(chatbotDb.getChatSession).not.toHaveBeenCalled();
+    });
+    it('refuses missing settings before any card is shown', async () => {
+      delete org.hotLeadCall;
+      await expect(call(name)).rejects.toThrow('Save the hot lead call settings first');
+      expect(chatbotDb.getChatSession).not.toHaveBeenCalled();
+    });
+  });
+
+  it('refuses an org without the entitlement before any card is shown', async () => {
+    prepare(PROVISION);
+    setHotLeadCallEntitledOverride(false);
+    await expect(call(PROVISION)).rejects.toThrow('not included');
+    expect(chatbotDb.getChatSession).not.toHaveBeenCalled();
+  });
+  it('reads the history consistently: a newer card the default read has not seen yet still stops the purchase', async () => {
+    prepare(PROVISION);
+    const first = await call(PROVISION);
+    answerCard(recordHalt(first), 'approve');
+    // Only the newer halt is added, with no reply. The stale default read drops this newest message and would
+    // show the older, unused approval; the consistent read sees an unanswered newer card.
+    const newerKind = String(first.questionDeckPayload![0].kind).replace(/:[0-9a-f]+$/, ':newer');
+    sessionOf(SESSION).messages.push(deckHalt(newerKind, 'deck-newer'));
+    expect((await call(PROVISION)).awaitingUserConfirmation).toBe(true);
+    expect(fake.boughtNumbers).toEqual([]);
+    expect(chatbotDb.getChatSession).toHaveBeenCalledWith(SESSION, true);
+  });
+  it('an approval for one area code does not buy another', async () => {
+    prepare(PROVISION);
+    answerCard(recordHalt(await call(PROVISION)), 'approve');
+    const other = await run(PROVISION, { areaCode: '212' }, attended());
+    expect((other as Halt).awaitingUserConfirmation).toBe(true);
+    expect(fake.boughtNumbers).toEqual([]);
+  });
+  it('an approval does not survive a change of the stored settings', async () => {
+    prepare(PROVISION);
+    answerCard(recordHalt(await call(PROVISION)), 'approve');
+    org.hotLeadCall = configured({ maxCallsPerHour: 3 });
+    expect((await call(PROVISION)).awaitingUserConfirmation).toBe(true);
+    expect(fake.boughtNumbers).toEqual([]);
+  });
+  it('does not show a card when the org already has a number (provision) or has none (release)', async () => {
+    org.hotLeadCall = withNumber();
+    await expect(call(PROVISION)).rejects.toThrow('already has a caller number');
+    org.hotLeadCall = configured();
+    await expect(call(RELEASE)).rejects.toThrow('no caller number');
+    expect(chatbotDb.getChatSession).not.toHaveBeenCalled();
+  });
+  it('does not gate verification or confirm: they still run without a card', async () => {
+    org.hotLeadCall = withNumber();
+    await expect(start({}, attended())).resolves.toMatchObject({ success: true });
+  });
+  it('a release approval cannot be used to buy', async () => {
+    prepare(RELEASE);
+    answerCard(recordHalt(await call(RELEASE)), 'approve');
+    prepare(PROVISION);
+    expect((await call(PROVISION)).awaitingUserConfirmation).toBe(true);
   });
 });
 

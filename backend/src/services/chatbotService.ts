@@ -34,7 +34,7 @@ import { computeCostMicroUsd } from './usageRecorderService';
 import type { CacheWriteByTtl } from '../utils/llmPricing';
 import { approvalDb } from './approvalDb';
 import { PendingUserQuestion } from './agentMode/core/askUserQuestion';
-import { PendingApprovalDeck } from './agentMode/core/approvalDeck';
+import { PendingApprovalDeck, type ApprovalDeckAnswer, type ApprovalDeckItem } from './agentMode/core/approvalDeck';
 import { WorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
 import { WorkflowRunState } from './agentMode/core/workflow';
 import { assertSequentialStepCounts } from './workPlanSteps';
@@ -161,6 +161,10 @@ export interface ChatMessage {
     compareAlternativesOmitted?: 'size';
     /** ENG-113: set on the copied row of a branch created with "Branch with this answer". */
     branchedFromAlternative?: { model: string };
+    /** Approval deck halt: the deck id and its items; the reply message carries approvalDeckAnswer. */
+    pendingApprovalDeckId?: string;
+    approvalDeckItems?: ApprovalDeckItem[];
+    approvalDeckAnswer?: { deckId: string; answers: ApprovalDeckAnswer[] };
     mediaBudgetDeferred?: boolean;      // ENG-1239: set on the tool-role deferral marker AND on the whole-turn-timeout partial-delivery message that reports it, so an unresolved media-batch pause is detectable from the tail of session history alone
   };
 }

@@ -176,6 +176,19 @@ describe("login host client", () => {
       expect(out.kind === "completed" ? out.result.aborted : "dropped").toBeDefined();
     });
 
+    it("on two failed renewals the stream is cut IMMEDIATELY; a hung interrupt does not hold the caller", async () => {
+      await boot();
+      await signIn();
+      rig.script.turnEvents = [{ wait: new Promise<void>(() => undefined) }];
+      jest.spyOn(client, "turnRenew").mockRejectedValue(new LoginHostError("UNREACHABLE"));
+      const interrupt = jest.spyOn(client, "turnInterrupt").mockImplementation(() => new Promise(() => undefined)); // the dead link never answers
+      const started = Date.now();
+      const out = await runHostTurn(client, turnReq("c1", 1), { renewEveryMs: 1_000, sleep: (ms) => new Promise((r) => setTimeout(r, Math.min(ms, 10))) });
+      expect(Date.now() - started).toBeLessThan(2_000);
+      expect(out).toMatchObject({ kind: "unknown_outcome", reason: "stream_dropped" });
+      expect(interrupt).toHaveBeenCalledTimes(1); // still sent, alongside
+    });
+
     it("does not interrupt when a renew says the turn is already over", async () => {
       await boot();
       await signIn();
