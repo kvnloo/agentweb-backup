@@ -57,7 +57,15 @@ export async function seedRoutingTable(argv: readonly string[], deps: RoutingTab
     deps.err(`Could not read ${files[0]} as JSON: ${(error as Error).message}`);
     return 1;
   }
-  const report = describeRoutingTable(raw, await deps.listTiers(), deps.catalog, deps.normalizeModelId);
+  const tiers = await deps.listTiers();
+  if (tiers.length === 0) {
+    // In every real environment subscription_types lists the tiers; none read means no tier allowlist can be checked
+    // (or the wrong table), so nothing is written on that basis.
+    deps.err(`No subscription tiers were read from subscription_types in ${deps.tableName}: no tier can be checked`
+      + `${apply ? '; refusing --apply.' : '.'}`);
+    if (apply) return 1;
+  }
+  const report = describeRoutingTable(raw, tiers, deps.catalog, deps.normalizeModelId);
   deps.out(formatRoutingTableReport(report));
   if (!report.usable || !report.ok) {
     deps.err(`\nNot written: fix the table${apply ? '' : ' before running with --apply'}.`);

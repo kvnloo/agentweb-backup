@@ -9962,7 +9962,8 @@ export async function generateSessionResponse(
     }
     // #3607 follow-up 4: never silently: the chat says which model could not come back and that it stays on this one.
     // Once per plan (the marker cleared above is what makes the restore run at all).
-    await recordPlanModelRestoreFailed(sessionId, userId, stepModelTurn, modelDisplayLabel(llmModel));
+    // Named by the SELECTION the chat keeps (the stored model, e.g. the AgentWeb Model), not this turn's routed model.
+    await recordPlanModelRestoreFailed(sessionId, userId, stepModelTurn, modelDisplayLabel(updatedSession.llmModel || llmModel));
   }
   let ranModelDecision: EffectiveModelPolicyDecision | undefined;
   if (stepModelTurn.kind === 'resolved' || stepModelTurn.kind === 'restored') {
