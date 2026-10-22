@@ -51,7 +51,7 @@ PKG="$WORK/$NAME"
 M="$PKG/MANIFEST"
 [ -f "$M" ] || fail "no MANIFEST"
 grep -q $'\r' "$M" && fail "the MANIFEST has carriage returns"
-val() { sed -n "s/^$1=//p" "$M" | head -n1; }
+val() { awk -v k="$1" 'index($0, k "=") == 1 { print substr($0, length(k) + 2); exit }' "$M"; } # first value of key=value, no pipe (an early-exiting reader under pipefail inverts matches)
 [ "$(val name)" = "$NAME" ] || fail "MANIFEST name is '$(val name)'"
 [ "$(val git_sha)" = "$GITHUB_SHA" ] || fail "MANIFEST git_sha is '$(val git_sha)', this run is $GITHUB_SHA"
 [ "$(val build_seq)" = "$GITHUB_RUN_ID" ] || fail "MANIFEST build_seq is '$(val build_seq)', this run id is $GITHUB_RUN_ID"
