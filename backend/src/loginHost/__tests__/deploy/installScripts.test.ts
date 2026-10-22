@@ -622,6 +622,94 @@ case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${
     expect(text(join(pkg, "MANIFEST"))).toMatch(/^commit_time=\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/m); // deploy.sh's no-downgrade rule reads this
   });
 
+  describe("deploy.sh driving the REAL install.sh from the REAL build (fake systemctl and a fake deployctl)", () => {
+    /** deploy.sh needs a few more seams than install.sh; `ctlnode` stands in for `node deployctl.js` and answers from files. */
+    function deployBox(opts: { active: boolean }) {
+      const b = box();
+      const S = join(b.dir, "scen");
+      mkdirSync(S);
+      writeFileSync(join(S, "acquire.rc"), "0");
+      writeFileSync(join(S, "health.rcs"), "0\n0\n0\n");
+      writeFileSync(
+        join(b.bin, "systemctl"),
+        `#!/bin/bash\necho "systemctl $*" >>"${b.calls}"\n[ "$1" = "is-active" ] && exit ${opts.active ? 0 : 3}\nexit 0\n`,
+      );
+      writeFileSync(
+        join(b.bin, "ctlnode"),
+        `#!/bin/bash\nshift 2; cmd=$1; shift\necho "ctl $cmd $*" >>"${b.calls}"\ncase "$cmd" in\n acquire) exit "$(cat "${S}/acquire.rc")" ;;\n health) rc=$(head -n1 "${S}/health.rcs"); tail -n +2 "${S}/health.rcs" >"${S}/h.tmp"; mv "${S}/h.tmp" "${S}/health.rcs"; exit "$rc" ;;\n info) echo '{}'; exit 0 ;;\nesac\n`,
+      );
+      for (const f of ["systemctl", "ctlnode"]) chmodSync(join(b.bin, f), 0o755);
+      mkdirSync(join(b.dir, "state"));
+      const env = { ...b.env, AW_SOCK: join(b.dir, "host.sock"), AW_DEPLOY_LOCK: join(b.dir, "deploy.lock"), AW_NODE: join(b.bin, "ctlnode"), AW_STATE_DIR: join(b.dir, "state"), AW_HEALTH_TIMEOUT: "5" };
+      const deploy = (...args: string[]) => spawnSync("bash", [join(b.pkg, "deploy.sh"), ...args], { encoding: "utf8", env: { ...process.env, ...env }, timeout: 120_000 });
+      return { b, S, deploy };
+    }
+    const calls = (b: Box) => systemctlCalls(b);
+    const nextSecond = () => void spawnSync("sleep", ["1.2"]); // a release id is the build plus the second it was installed in
+
+    it("a fresh worker: installs, starts the service, checks health, exit 0", () => {
+      const { b, deploy } = deployBox({ active: false });
+      const r = deploy();
+      expect(r.status).toBe(0);
+      expect(releases(b)).toHaveLength(1);
+      expect(calls(b).some((c) => c === "systemctl restart aw-login-host@prod")).toBe(true);
+      expect(calls(b).some((c) => c.startsWith("ctl acquire"))).toBe(false); // nobody to protect yet
+    });
+
+    it("a running worker: install, wait for idle, restart, health; the new release is the active one", () => {
+      const { b, deploy } = deployBox({ active: true });
+      expect(run(b).status).toBe(0); // the first release is already there and "running"
+      const first = current(b);
+      nextSecond();
+      writeFileSync(join(b.pkg, "MANIFEST"), text(join(b.pkg, "MANIFEST")) + "next_build=1\n"); // a different build
+      writeFileSync(join(b.dir, "state/deployed-commit-time"), "0\n");
+      const r = deploy();
+      expect(r.status).toBe(0);
+      expect(current(b)).not.toBe(first);
+      expect(readlinkSync(join(b.opt, "previous"))).toBe(first);
+      const c = calls(b);
+      expect(c.findIndex((x) => x.startsWith("ctl acquire"))).toBeLessThan(c.findIndex((x) => x === "systemctl restart aw-login-host@prod"));
+    });
+
+    it("redeploying the exact same build and configuration restarts NOTHING and never waits for idle", () => {
+      const { b, deploy } = deployBox({ active: true });
+      expect(run(b).status).toBe(0);
+      const first = current(b);
+      const r = deploy();
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain("nothing to restart");
+      expect(current(b)).toBe(first);
+      expect(calls(b).some((x) => x === "systemctl restart aw-login-host@prod" || x.startsWith("ctl acquire"))).toBe(false);
+    });
+
+    it("a busy worker (never idle): exit 75, nothing restarted, and the ACTIVE release is the one still running", () => {
+      const { b, S, deploy } = deployBox({ active: true });
+      expect(run(b).status).toBe(0);
+      const first = current(b);
+      nextSecond();
+      writeFileSync(join(b.pkg, "MANIFEST"), text(join(b.pkg, "MANIFEST")) + "next_build=1\n");
+      writeFileSync(join(S, "acquire.rc"), "75");
+      const r = deploy();
+      expect(r.status).toBe(75);
+      expect(current(b)).toBe(first); // files on disk still match the host that was never restarted
+      expect(calls(b).some((x) => x === "systemctl restart aw-login-host@prod")).toBe(false);
+      expect(text(join(b.conf, "prod.json"))).toBe(text(join(b.opt, first.replace(/^releases\//, "releases/"), "prod.json")));
+    });
+
+    it("an unhealthy new build is rolled back to the release that was running, and restarted on it", () => {
+      const { b, S, deploy } = deployBox({ active: true });
+      expect(run(b).status).toBe(0);
+      const first = current(b);
+      nextSecond();
+      writeFileSync(join(b.pkg, "MANIFEST"), text(join(b.pkg, "MANIFEST")) + "next_build=1\n");
+      writeFileSync(join(S, "health.rcs"), "1\n0\n");
+      const r = deploy();
+      expect(r.status).toBe(1);
+      expect(current(b)).toBe(first);
+      expect(calls(b).filter((x) => x === "systemctl restart aw-login-host@prod")).toHaveLength(2);
+    });
+  });
+
   it("FIRST install: a complete, validated release is switched in atomically; the unit, slice and config are in place; nothing was disabled", () => {
     const b = box();
     const r = run(b);

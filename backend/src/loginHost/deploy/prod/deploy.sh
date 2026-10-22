@@ -102,6 +102,7 @@ roll_back() {
 
 was_active=0
 "$SYSTEMCTL" is-active --quiet "$SERVICE" && was_active=1
+active_before=$(readlink "$OPT/current" 2>/dev/null || true)
 
 set +e
 "$HERE/install.sh"
@@ -112,6 +113,16 @@ if [ "$rc" = 3 ]; then
   exit 3
 fi
 [ "$rc" = 0 ] || die "install failed (exit $rc); the running host, if any, was not touched"
+
+# ───────────────────────────── nothing changed: nothing to restart ─────────────────────────────
+
+# install.sh keeps the active release when the build, the certificates and the settings are all identical to it (same fingerprint). Then there is
+# nothing a restart would change, and the least disruptive deploy is none.
+if [ "$was_active" = 1 ] && [ "$FORCE" != 1 ] && [ -n "$active_before" ] && [ "$(readlink "$OPT/current" 2>/dev/null || true)" = "$active_before" ]; then
+  record_deployed
+  say "OK   this exact build and configuration is already running: nothing to restart"
+  exit 0
+fi
 
 # ───────────────────────────── a host that is not running has nobody to protect ─────────────────────────────
 
