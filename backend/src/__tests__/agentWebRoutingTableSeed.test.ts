@@ -77,6 +77,15 @@ describe('seedRoutingTable', () => {
     }
   });
 
+  it('no subscription tiers read (absent or empty subscription_types): dry run warns, --apply refuses', async () => {
+    const h = harness({ 't.json': NEXT });
+    h.deps.listTiers.mockResolvedValue([]);
+    expect(await seedRoutingTable(['t.json'], h.deps)).toBe(0);
+    expect(h.err.join('\n')).toContain('No subscription tiers were read');
+    expect(await seedRoutingTable(['t.json', '--apply'], h.deps)).toBe(1);
+    expect(h.writes()).toHaveLength(0);
+  });
+
   it('a table not valid for every tier is never written, even with --apply', async () => {
     const { tiers: _omit, ...withoutFreeOverride } = TABLE;
     const h = harness({ 't.json': JSON.stringify(withoutFreeOverride) });

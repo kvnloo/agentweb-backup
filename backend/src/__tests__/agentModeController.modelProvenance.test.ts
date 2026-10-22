@@ -454,6 +454,16 @@ describe('ENG-669 model provenance', () => {
       expect(mockChatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(SESSION_ID, expect.not.objectContaining({ engineModel: expect.anything() }));
       expect(stored().llmModel).toBe(ALLOWED);
     });
+
+    it('the note names the selection the chat keeps (the stored model), not the model this turn happened to run', async () => {
+      // e.g. a stored AgentWeb Model selection: the caller hands over the concrete routed model for this turn.
+      const honor = jest.spyOn(workPlanStepModels, 'shouldHonor').mockResolvedValue(true);
+      storeSession({ ...baseSession(ALLOWED), llmModelSource: 'system', workPlan: finishedPlan({ planAuthor: 'system', launchModelSource: 'user' }) });
+      await generateSessionResponse(SESSION_ID, MESSAGE, OWNER, DEFAULT_MODEL);
+      honor.mockRestore();
+      expect(restoreNotices()).toHaveLength(1);
+      expect(restoreNotices()[0].content).toContain('so the chat stays on gemini-3.5-flash.');
+    });
   });
 
   describe('#3607 follow-up 1: a session kind\'s configured default is AgentWeb\'s unless the user picks it now', () => {
