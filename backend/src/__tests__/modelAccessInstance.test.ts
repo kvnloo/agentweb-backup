@@ -84,9 +84,27 @@ describe('isSystemChosen', () => {
     [{ sessionType: 'image-generation' }, 'image-model'],
     [{ sessionType: 'video-generation' }, 'video-model'],
     [{ sessionType: 'regular', portalType: 'emma-sidebar' }, 'cs-model'],
-  ])('%p: its configured default %s is exempt there, and only there', async (session, model) => {
-    expect(await isSystemChosen(model, 'user', session)).toBe(true);
-    expect(await isSystemChosen(model, 'user', { sessionType: 'regular', portalType: 'agent' })).toBe(false);
+  ])('%p: its configured default %s is exempt there (AgentWeb\'s stamp, or a legacy one), and only there', async (session, model) => {
+    expect(await isSystemChosen(model, 'system', session)).toBe(true);
+    expect(await isSystemChosen(model, undefined, session)).toBe(true);
+    expect(await isSystemChosen(model, undefined, { sessionType: 'regular', portalType: 'agent' })).toBe(false);
+  });
+
+  it.each([
+    [{ sessionType: 'scheduled' }, 'sched-model'],
+    [{ sessionType: 'report_generation' }, 'report-model'],
+    [{ sessionType: 'report_generation' }, 'report-gen-model'],
+    [{ sessionType: 'image-generation' }, 'image-model'],
+    [{ sessionType: 'video-generation' }, 'video-model'],
+    [{ sessionType: 'regular', portalType: 'emma-sidebar' }, 'cs-model'],
+  ])('#3607 follow-up 1, %p: a USER\'s pick of its configured default %s is checked like any pick', async (session, model) => {
+    expect(await isSystemChosen(model, 'user', session)).toBe(false);
+  });
+
+  it('the interactive configured default stays exempt for a user pick in every kind of session', async () => {
+    for (const session of [{ sessionType: 'scheduled' }, { sessionType: 'image-generation' }, { sessionType: 'regular', portalType: 'emma-sidebar' }]) {
+      expect(await isSystemChosen('default-model', 'user', session)).toBe(true);
+    }
   });
 
   it("no check-time inference: a session's plan pins or template exempt nothing on their own", async () => {
@@ -114,7 +132,20 @@ describe("storedBindingSource: the session's OWN stamp", () => {
   it('legacy stamps (no source) follow the one session rule: a defaulted/corrected decision or a side channel is system', async () => {
     expect(await storedBindingSource({ llmModel: 'gpt-5.5', llmUsagePolicyDecision: { effectiveModel: 'gpt-5.5', modelSelection: 'corrected' } }, 'gpt-5.5', canonical)).toBe('system');
     expect(await storedBindingSource({ llmModel: 'gpt-5.5', slackThread: { channel: 'C' } }, 'gpt-5.5', canonical)).toBe('system');
-    expect(await storedBindingSource({ llmModel: 'gpt-5.5' }, 'gpt-5.5', canonical)).toBe('user');
+    // Nothing says who chose it: none recorded (checked like a pick, except as the session kind's default).
+    expect(await storedBindingSource({ llmModel: 'gpt-5.5' }, 'gpt-5.5', canonical)).toBeUndefined();
+    expect(await storedBindingSource({ llmModel: 'gpt-5.5', llmUsagePolicyDecision: { effectiveModel: 'gpt-5.5', modelSelection: 'honored' } }, 'gpt-5.5', canonical))
+      .toBeUndefined();
+  });
+
+  it('#3607 follow-up 1: a legacy stamp of the session kind\'s default stays AgentWeb\'s; a new pick of it, or a recorded user pick, does not', async () => {
+    const legacy = { sessionType: 'scheduled', llmModel: 'sched-model' };
+    const check = async (session: any, model: string) => isSystemChosen(model, await storedBindingSource(session, model, (id) => id), session);
+    expect(await check(legacy, 'sched-model')).toBe(true);
+    expect(await check({ ...legacy, llmModelSource: 'system' }, 'sched-model')).toBe(true);
+    expect(await check({ ...legacy, llmModelSource: 'user' }, 'sched-model')).toBe(false);
+    // The picker PATCH to the kind's default from another model: a new pick.
+    expect(await check({ sessionType: 'scheduled', llmModel: 'gpt-5.5', llmModelSource: 'system' }, 'sched-model')).toBe(false);
   });
 
   it("legacy plan session: the engine's unsourced stamp of the plan's OWN pin follows the plan-pin legacy rule; another model does not", async () => {
@@ -123,10 +154,10 @@ describe("storedBindingSource: the session's OWN stamp", () => {
     const legacy = { llmModel: 'step-pin', llmUsagePolicyDecision: honored, workPlan: { templatePlanId: 't1', planDefaultModel: 'plan-pin', steps: [{ model: 'step-pin' }] } };
     expect(await storedBindingSource(legacy, 'step-pin', canonical)).toBe('system');
     expect(await storedBindingSource({ ...legacy, llmModel: 'plan-pin', llmUsagePolicyDecision: undefined }, 'plan-pin', canonical)).toBe('system');
-    expect(await storedBindingSource({ ...legacy, llmModel: 'gpt-5.5', llmUsagePolicyDecision: undefined }, 'gpt-5.5', canonical)).toBe('user');
+    expect(await storedBindingSource({ ...legacy, llmModel: 'gpt-5.5', llmUsagePolicyDecision: undefined }, 'gpt-5.5', canonical)).toBeUndefined();
     // A recorded source, or a plan launched after the record existed, is never re-inferred.
     expect(await storedBindingSource({ ...legacy, llmModelSource: 'user' }, 'step-pin', canonical)).toBe('user');
-    expect(await storedBindingSource({ ...legacy, workPlan: { ...legacy.workPlan, planAuthor: 'system' } }, 'step-pin', canonical)).toBe('user');
+    expect(await storedBindingSource({ ...legacy, workPlan: { ...legacy.workPlan, planAuthor: 'system' } }, 'step-pin', canonical)).toBeUndefined();
     mockGetWorkPlan.mockResolvedValue({ visibility: 'private', isBuiltIn: false });
     expect(await storedBindingSource(legacy, 'step-pin', canonical)).toBe('user');
   });
