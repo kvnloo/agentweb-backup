@@ -192,10 +192,12 @@ export async function handleAttioApi(userId: string, args: any): Promise<any> {
           // type-checked against the schema — a string here (e.g. a single id
           // passed without brackets) has a truthy .length and would otherwise
           // be iterated character-by-character.
-          const recordIds: string[] = Array.isArray(args?.record_ids) ? args.record_ids : [];
-          if (!recordIds.length || recordIds.some(id => typeof id !== 'string' || !id.trim())) {
+          const rawAddIds: unknown[] = Array.isArray(args?.record_ids) ? args.record_ids : [];
+          if (!rawAddIds.length || rawAddIds.some(id => typeof id !== 'string' || !id.trim())) {
             return { success: false, error: 'record_ids must be a non-empty array of record id strings for LIST_ENTRIES ADD_ENTRIES.' };
           }
+          // Dedupe within the call — each add is otherwise its own entry (ENG-2632).
+          const recordIds: string[] = [...new Set((rawAddIds as string[]).map(id => id.trim()))];
           if (recordIds.length > MAX_LIST_ENTRY_RECORD_IDS) {
             return { success: false, error: `record_ids exceeds the maximum of ${MAX_LIST_ENTRY_RECORD_IDS} per call.` };
           }
@@ -206,9 +208,9 @@ export async function handleAttioApi(userId: string, args: any): Promise<any> {
           const isCompanyList = await isAttioCompanyList(svc, attioListId);
           const results = await runWithConcurrency(recordIds, LIST_ENTRY_CONCURRENCY, async recordId => {
             try {
-              const entryId = isCompanyList
-                ? await svc.addCompanyToList(attioListId, recordId)
-                : await svc.addPersonToList(attioListId, recordId);
+              // Upsert (PUT) so re-adding a record already on the list is a
+              // no-op rather than a second entry (ENG-2632).
+              const entryId = await svc.upsertListEntry(attioListId, recordId, isCompanyList ? 'companies' : 'people');
               return { recordId, success: true, entryId };
             } catch (err: any) {
               return { recordId, success: false, error: err?.response?.data?.message ?? err?.message };
@@ -220,10 +222,11 @@ export async function handleAttioApi(userId: string, args: any): Promise<any> {
         }
         case 'REMOVE_ENTRIES': {
           if (!args?.list_id) return { success: false, error: 'list_id is required for LIST_ENTRIES REMOVE_ENTRIES.' };
-          const recordIds: string[] = Array.isArray(args?.record_ids) ? args.record_ids : [];
-          if (!recordIds.length || recordIds.some(id => typeof id !== 'string' || !id.trim())) {
+          const rawRemoveIds: unknown[] = Array.isArray(args?.record_ids) ? args.record_ids : [];
+          if (!rawRemoveIds.length || rawRemoveIds.some(id => typeof id !== 'string' || !id.trim())) {
             return { success: false, error: 'record_ids must be a non-empty array of record id strings for LIST_ENTRIES REMOVE_ENTRIES.' };
           }
+          const recordIds: string[] = [...new Set((rawRemoveIds as string[]).map(id => id.trim()))];
           if (recordIds.length > MAX_LIST_ENTRY_RECORD_IDS) {
             return { success: false, error: `record_ids exceeds the maximum of ${MAX_LIST_ENTRY_RECORD_IDS} per call.` };
           }
@@ -232,10 +235,12 @@ export async function handleAttioApi(userId: string, args: any): Promise<any> {
           const objectSlug: 'people' | 'companies' = isCompanyList ? 'companies' : 'people';
           const results = await runWithConcurrency(recordIds, LIST_ENTRY_CONCURRENCY, async recordId => {
             try {
-              const entryId = await svc.findListEntry(attioListId, recordId, objectSlug);
-              if (!entryId) return { recordId, success: false, error: 'No list entry found for this record.' };
-              await svc.deleteListEntry(attioListId, entryId);
-              return { recordId, success: true };
+              // A record can hold several entries in one list; remove them all
+              // or the record stays on the list after a "remove" (ENG-2632).
+              const entryIds = await svc.findListEntries(attioListId, recordId, objectSlug);
+              if (!entryIds.length) return { recordId, success: false, error: 'No list entry found for this record.' };
+              for (const entryId of entryIds) await svc.deleteListEntry(attioListId, entryId);
+              return { recordId, success: true, removedEntries: entryIds.length };
             } catch (err: any) {
               return { recordId, success: false, error: err?.response?.data?.message ?? err?.message };
             }

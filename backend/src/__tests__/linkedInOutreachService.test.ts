@@ -830,6 +830,16 @@ describe('LinkedInOutreachService', () => {
     });
   });
 
+  describe('sendInMail (ENG-2630)', () => {
+    it("passes api: 'classic' so the SDK actually serialises the inmail flag", async () => {
+      await linkedInOutreachService.sendInMail('account-id', 'provider-id', false, 'Subj', 'Body');
+      const call = (mockUnipileClient.messaging.startNewChat as jest.Mock).mock.calls[0][0];
+      expect(call.options).toEqual({ linkedin: { api: 'classic', inmail: true } });
+      // unipile-node-sdk 1.9.3 isLinkedinClassicPostNewChatInputOptions requires
+      // api === 'classic' && inmail !== undefined, else linkedin[inmail] is dropped.
+    });
+  });
+
   describe('searchPeople', () => {
     it('should call POST /linkedin/search with classic api and keyword params', async () => {
       const mockResults = {
