@@ -97,7 +97,7 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
-[[ "$MAX_WAIT" =~ ^[0-9]{1,4}$ ]] && [ "$MAX_WAIT" -le 3000 ] || die "--max-wait must be a whole number of seconds, at most 3000"
+[[ "$MAX_WAIT" =~ ^(0|[1-9][0-9]{0,3})$ ]] && [ "$MAX_WAIT" -le 3000 ] || die "--max-wait must be a whole number of seconds, at most 3000"
 
 LOCK_DIR=$(dirname "$LOCK")
 mkdir -p "$LOCK_DIR"

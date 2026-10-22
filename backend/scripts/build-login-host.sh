@@ -19,11 +19,15 @@ set -euo pipefail
 OUT=""
 SKIP_TESTS=0
 ALLOW_DIRTY=0
+TESTS_ELSEWHERE=0
+TESTS_ONLY=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --out) shift; OUT=${1:?--out needs a directory} ;;
     --skip-tests) SKIP_TESTS=1 ;;
     --allow-dirty) ALLOW_DIRTY=1 ;;
+    --tests-run-elsewhere) TESTS_ELSEWHERE=1 ;;
+    --tests-only) TESTS_ONLY=1 ;;
     *) echo "build-login-host: unknown argument $1" >&2; exit 2 ;;
   esac
   shift
@@ -56,14 +60,24 @@ NAME="login-host-$SHA$DIRTY"
 cd "$BACKEND"
 
 # (2) the gate tests.
+# In the pipeline the tests run in their OWN job (--tests-only) that produces nothing, and the job that makes the tarball runs with --tests-run-elsewhere: jest
+# loads every dev dependency, and code that runs in the same job as the packaging could rewrite the tarball afterwards. The signing job only runs once the test
+# job has succeeded, which is what makes the MANIFEST value below true.
 TESTS="passed"
-if [ "$SKIP_TESTS" = 1 ]; then
+if [ "$TESTS_ELSEWHERE" = 1 ]; then
+  TESTS="separate-job"
+elif [ "$SKIP_TESTS" = 1 ]; then
   TESTS="SKIPPED (--skip-tests)"
   echo "build-login-host: WARNING: the gate tests were SKIPPED (--skip-tests); this is recorded in the MANIFEST" >&2
 else
   echo "build-login-host: running the gate tests"
   npx --no-install jest src/loginHost/__tests__/deploy src/loginHost/__tests__/host src/services/funding/__tests__/loginHostMutualTls.test.ts --silent \
     || { echo "build-login-host: ABORT: the gate tests failed; nothing was packaged" >&2; exit 1; }
+fi
+
+if [ "$TESTS_ONLY" = 1 ]; then
+  echo "build-login-host: the gate tests passed (--tests-only: nothing was packaged)"
+  exit 0
 fi
 
 WORK=$(mktemp -d)
