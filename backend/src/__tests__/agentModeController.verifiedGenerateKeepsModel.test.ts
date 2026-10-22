@@ -79,6 +79,7 @@ jest.mock('../services/llmUsagePolicyResolverService', () => ({
 }));
 
 jest.mock('../services/tokenUsageService', () => ({
+  TURN_ADMISSION: { recordAdmission: true },
   checkTokenUsage: jest.fn(),
   incrementUserTokenUsage: jest.fn(),
   deriveBlockedByCost: jest.fn(() => ({ blockedByCost: false })),
@@ -388,7 +389,7 @@ describe('verifiedGenerate applies the same usage gate as /generate', () => {
   it('checks the allowance of the authenticated user', async () => {
     mockWorker.runInWorker.mockResolvedValue(reportTool as any);
     await agentModeController.verifiedGenerate(verifiedReq(), makeRes());
-    expect(checkTokenUsage).toHaveBeenCalledWith(OWNER);
+    expect(checkTokenUsage).toHaveBeenCalledWith(OWNER, { recordAdmission: true });
   });
 
   it('an allowed account is unchanged', async () => {

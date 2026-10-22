@@ -7,6 +7,7 @@ import { type LlmUsageMode, type LlmUsagePolicy,
 } from "./llmUsagePolicyService";
 import { resolveLlmUsagePoolDecision } from './llmUsagePoolDecision';
 import type { PaygBlock } from './paygOverage';
+import { withOwnerOpenInvoice } from './paygSettlement';
 import { randomUUID } from 'crypto';
 import { recordLlmChargeEvent, LLM_CHARGE_EVENTS_TABLE } from './llmChargeAuditDb';
 import { buildUsageBlockCopy, type UsageBlockCopy } from '../utils/usageBlockCopy';
@@ -296,10 +297,20 @@ export async function getUserTokenAllowance(
 }
 
 /**
+ * ENG-668: pass this from a TURN gate — a check that admits a turn about to run — so a PAYG admission
+ * is recorded (the month becomes billable, its cap high-water may rise). Any caller that only reads
+ * usage passes nothing and writes nothing.
+ */
+export const TURN_ADMISSION = { recordAdmission: true } as const;
+
+/**
  * Check if a user can send messages. Returns usage status with warning/blocked flags.
  * For org members, quota is checked against the org owner's subscription and usage.
  */
-export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus> {
+export async function checkTokenUsage(
+  userId: string,
+  options: { recordAdmission?: boolean } = {},
+): Promise<TokenUsageStatus> {
   // ENG-1163: an anonymous predefined-work-plan session (createSessionWithPlan)
   // is owned by a synthetic `anon_<uuid>` id that has no AW-Users row and never
   // will — resolveBillingUserId returns it unchanged (no org to pool onto), and
@@ -391,6 +402,7 @@ export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus>
     // Lazy: read only if the basis falls back to legacy (rollback path), never on the live ledger path.
     legacyRawCostUsedMicroUsd: async (): Promise<number> =>
       Math.max(0, Math.round(((await getUserTokenUsage(billingUserId)).totalCost || 0) * 1_000_000)),
+    recordAdmission: options.recordAdmission === true,
   });
   const effectiveLlmUsagePolicy = pool.policy;
   const costUsedMicroUsd = pool.costUsedMicroUsd;
@@ -457,7 +469,10 @@ export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus>
           },
         }
       : {}),
-    ...(pool.paygBlock ? { paygBlock: pool.paygBlock } : {}),
+    // ENG-668: the owner of a suspended account is pointed at the unpaid invoice (the 429's usageBlock).
+    ...(pool.paygBlock
+      ? { paygBlock: withOwnerOpenInvoice(pool.paygBlock, userId === billingUserId, (billingUser as User | undefined)?.paygSettlements)! }
+      : {}),
   };
 }
 

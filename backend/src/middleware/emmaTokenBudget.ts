@@ -19,7 +19,7 @@
  */
 import { Request, Response, NextFunction } from 'express';
 import { AuthenticatedRequest } from './auth';
-import { checkTokenUsage, toCustomerTokenUsage } from '../services/tokenUsageService';
+import { checkTokenUsage, TURN_ADMISSION, toCustomerTokenUsage } from '../services/tokenUsageService';
 import { buildUsageBlockCopy } from '../utils/usageBlockCopy';
 
 export type EmmaRouteBudget = 'metered' | 'exempt';
@@ -171,7 +171,7 @@ export async function requireEmmaTokenBudget(
   }
 
   try {
-    const usageStatus = await checkTokenUsage(user.userId);
+    const usageStatus = await checkTokenUsage(user.userId, TURN_ADMISSION);
     if (!usageStatus.allowed) {
       // Same contract as controllers/chatbot.ts, so an MCP caller that runs out
       // of quota is indistinguishable from a web caller that does — now enforced
