@@ -1,3 +1,4 @@
+import { APIError } from 'openai';
 import { buildAgentRunTrace, type TraceMessageRow } from '../services/agentRunTrace';
 import {
   judgeTaskSuccess,
@@ -255,29 +256,47 @@ describe('labelTaskSuccess', () => {
 });
 
 describe('createAvoidingRefusingProvider', () => {
-  const refusal = (provider?: string) =>
-    Object.assign(new Error('400 Provider returned error'), { status: 400, error: { message: 'Provider returned error', ...(provider ? { metadata: { provider_name: provider } } : {}) } });
+  // Built by the SDK itself, so the tests hold the code to the error shape OpenRouter really produces.
+  const sdkError = (status: number, provider?: string) =>
+    APIError.generate(status, { error: { message: 'Provider returned error', ...(provider !== undefined ? { metadata: { provider_name: provider } } : {}) } }, undefined, {});
 
   it('retries a call one provider refuses with a 400 on the others, once (ENG-2625)', async () => {
     const bodies: Record<string, unknown>[] = [];
     const create = async (body: Record<string, unknown>) => {
       bodies.push(body);
-      if (bodies.length === 1) throw refusal('Azure');
+      if (bodies.length === 1) throw sdkError(400, 'Azure');
       return { choices: [] };
     };
     expect(await createAvoidingRefusingProvider(create, { model: 'openai/gpt-5.4' })).toEqual({ choices: [] });
     expect(bodies).toEqual([{ model: 'openai/gpt-5.4' }, { model: 'openai/gpt-5.4', provider: { ignore: ['Azure'] } }]);
   });
 
-  it("passes on any other failure, and the retry's own failure, without another call (ENG-2625)", async () => {
-    for (const err of [refusal(), Object.assign(new Error('500'), { status: 500, error: { metadata: { provider_name: 'Azure' } } }), new Error('timeout')]) {
+  it('keeps the provider preferences already in the body when it retries (ENG-2625)', async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const create = async (body: Record<string, unknown>) => {
+      bodies.push(body);
+      if (bodies.length === 1) throw sdkError(400, 'Azure');
+      return 'ok';
+    };
+    await createAvoidingRefusingProvider(create, { provider: { ignore: ['Google'], require_parameters: true } });
+    expect(bodies[1]).toEqual({ provider: { ignore: ['Google', 'Azure'], require_parameters: true } });
+  });
+
+  it('passes on any other failure without another call (ENG-2625)', async () => {
+    for (const err of [sdkError(400), sdkError(400, ''), sdkError(500, 'Azure'), new Error('timeout')]) {
       let calls = 0;
       await expect(createAvoidingRefusingProvider(async () => { calls++; throw err; }, {})).rejects.toBe(err);
       expect(calls).toBe(1);
     }
+  });
+
+  it("passes on the retry's own failure, keeping the refusal that caused the retry (ENG-2625)", async () => {
+    const refusal = sdkError(400, 'Azure');
+    const second = sdkError(400, 'OpenAI');
     let calls = 0;
-    const second = refusal('OpenAI');
-    await expect(createAvoidingRefusingProvider(async () => { calls++; throw calls === 1 ? refusal('Azure') : second; }, {})).rejects.toBe(second);
+    const thrown = await createAvoidingRefusingProvider(async () => { calls++; throw calls === 1 ? refusal : second; }, {}).catch((err: unknown) => err);
+    expect(thrown).toBe(second);
+    expect((thrown as { cause?: unknown }).cause).toBe(refusal);
     expect(calls).toBe(2);
   });
 });
