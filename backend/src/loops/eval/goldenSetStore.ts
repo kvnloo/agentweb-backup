@@ -19,6 +19,7 @@ import {
   parseGoldenCase,
   type GoldenCase,
   type GoldenCaseDraft,
+  type GoldenCaseExclusion,
   type GoldenSplit,
   type LabelUpdate,
 } from './goldenSet';
@@ -73,6 +74,8 @@ export function documentClientDb(client: DocClient): GoldenSetDb {
 
 export interface ListCasesOptions {
   split?: GoldenSplit;
+  /** Include cases an admin excluded (ENG-2608). Off by default: only the seeder needs them, to never re-add one. */
+  includeExcluded?: boolean;
 }
 
 export interface GoldenSetStore {
@@ -92,6 +95,11 @@ export interface GoldenSetStore {
    * with a human labeller saving real labels on the same case.
    */
   saveDraft(caseId: string, draft: GoldenCaseDraft): Promise<GoldenCase>;
+  /**
+   * Exclude the case from the set, or restore it with `null` (ENG-2608). Like a draft, this leaves
+   * `version` and the labels untouched.
+   */
+  setExclusion(caseId: string, exclusion: GoldenCaseExclusion | null): Promise<GoldenCase>;
 }
 
 function errorCode(error: unknown): string | undefined {
@@ -154,7 +162,9 @@ export function createGoldenSetStore(opts: { tableName: string | null; db?: Gold
         });
         for (const item of out.Items ?? []) {
           const parsed = parseOrSkip(item);
-          if (parsed && (!listOpts.split || parsed.split === listOpts.split)) cases.push(parsed);
+          if (!parsed || (listOpts.split && parsed.split !== listOpts.split)) continue;
+          if (parsed.excluded && !listOpts.includeExcluded) continue;
+          cases.push(parsed);
         }
         startKey = out.LastEvaluatedKey;
       } while (startKey);
@@ -223,6 +233,25 @@ export function createGoldenSetStore(opts: { tableName: string | null; db?: Gold
           ConditionExpression: 'attribute_exists(caseId)',
           ExpressionAttributeNames: { '#draft': 'draft' },
           ExpressionAttributeValues: { ':draft': draft },
+          ReturnValues: 'ALL_NEW',
+        });
+        return parseGoldenCase(out.Attributes);
+      } catch (error) {
+        if (errorCode(error) === 'ConditionalCheckFailedException') throw new GoldenCaseNotFoundError(caseId);
+        throw error;
+      }
+    },
+
+    async setExclusion(caseId, exclusion) {
+      const { table, client } = requireTable();
+      try {
+        const out = await client.update({
+          TableName: table,
+          Key: { caseId },
+          UpdateExpression: exclusion ? 'SET #excluded = :excluded' : 'REMOVE #excluded',
+          ConditionExpression: 'attribute_exists(caseId)',
+          ExpressionAttributeNames: { '#excluded': 'excluded' },
+          ...(exclusion ? { ExpressionAttributeValues: { ':excluded': exclusion } } : {}),
           ReturnValues: 'ALL_NEW',
         });
         return parseGoldenCase(out.Attributes);
