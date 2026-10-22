@@ -35,7 +35,8 @@ const PRE_MODEL_GATE_SKIP_STATUSES = new Set<string>([ACCOUNT_DISCONNECTED_STATU
 
 /**
  * Set (true) on a run result that FAILED before the model was resolved (the usage limit, a required function the plan
- * does not allow, missing variables, unresolved entitlements, a deleted owner): like the skips above, it says nothing
+ * does not allow or could not be checked, unresolved entitlements, a withheld report, a deleted owner; a run missing its
+ * variables saves no result at all): like the skips above, it says nothing
  * about the model, so it neither continues nor ends a model block (#3676 follow-up 1: blocked, then a limit, then
  * blocked again is one episode, one email).
  */
