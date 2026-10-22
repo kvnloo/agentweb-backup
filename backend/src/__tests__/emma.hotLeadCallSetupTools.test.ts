@@ -55,7 +55,7 @@ function recordHalt(result: unknown, sessionId = SESSION): string {
   sessionOf(sessionId).messages.push(deckHalt(item.kind, deckId, item.question));
   return deckId;
 }
-function answerCard(deckId: string, verdict: string, sessionId = SESSION, extra: { answeredBy?: string; at?: string } = {}) {
+function answerCard(deckId: string, verdict: string, sessionId = SESSION, extra: { answeredBy?: 'user' | 'delegation'; at?: string } = {}) {
   sessionOf(sessionId).messages.push(deckReply(deckId, verdict, extra.answeredBy ?? 'user', extra.at ?? new Date().toISOString()));
 }
 /** Calls the tool, and when it halts with a card, has the user approve it and calls again. */
@@ -596,15 +596,17 @@ describe('human approval for provision and release', () => {
     await expect(call(PROVISION)).rejects.toThrow('not included');
     expect(chatbotDb.getChatSession).not.toHaveBeenCalled();
   });
-  it('reads the history consistently: a decline the default read has not seen yet still stops the purchase', async () => {
+  it('reads the history consistently: a newer card the default read has not seen yet still stops the purchase', async () => {
     prepare(PROVISION);
     const first = await call(PROVISION);
     answerCard(recordHalt(first), 'approve');
+    // Only the newer halt is added, with no reply. The stale default read drops this newest message and would
+    // show the older, unused approval; the consistent read sees an unanswered newer card.
     const newerKind = String(first.questionDeckPayload![0].kind).replace(/:[0-9a-f]+$/, ':newer');
     sessionOf(SESSION).messages.push(deckHalt(newerKind, 'deck-newer'));
-    answerCard('deck-newer', 'decline');
     expect((await call(PROVISION)).awaitingUserConfirmation).toBe(true);
     expect(fake.boughtNumbers).toEqual([]);
+    expect(chatbotDb.getChatSession).toHaveBeenCalledWith(SESSION, true);
   });
   it('an approval for one area code does not buy another', async () => {
     prepare(PROVISION);

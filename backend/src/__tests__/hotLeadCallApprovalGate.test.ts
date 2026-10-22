@@ -19,7 +19,7 @@ function card(kind: string, deckId: string, answer?: { verdict: string; answered
   if (!answer) return [halt];
   return [halt, deckReply(deckId, answer.verdict, answer.answeredBy ?? 'user', answer.at ?? new Date(NOW - 60_000).toISOString())];
 }
-const find = (messages: Msg[], consumed: string[] = [], pre = prefix) => findApproval(messages as never, pre, NOW, new Set(consumed));
+const find = (messages: Msg[], consumed: string[] = [], pre = prefix) => findApproval(messages, pre, NOW, new Set(consumed));
 
 describe('computeApprovalDigest', () => {
   it('is stable for equal input', () => expect(computeApprovalDigest({ ...base })).toBe(digest));
@@ -97,7 +97,7 @@ describe('findApproval', () => {
 
 describe('checkAttendedForApproval', () => {
   const ok = { sessionId: 's1', session: { sessionType: 'chat' } };
-  it('allows an attended chat', () => expect(checkAttendedForApproval(ok)).toEqual({ allowed: true }));
+  it('allows an attended chat and returns the session', () => expect(checkAttendedForApproval(ok)).toEqual({ allowed: true, sessionId: 's1', session: ok.session }));
   it.each<[string, Parameters<typeof checkAttendedForApproval>[0]]>([
     ['unattended', { ...ok, unattended: true }],
     ['delegated', { ...ok, delegated: true }],
