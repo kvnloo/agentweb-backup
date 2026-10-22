@@ -35,8 +35,8 @@ note="$(jq -r --arg cut "${last_deploy}" '
     or (.title | test("^(chore|docs)(\\(|:|!)"; "i"))
     or docs_only;
   def summary: ((.body // "") | split("\n")
-    | map(gsub("^[#>*\\- ]+"; "") | gsub("\\s+$"; ""))
-    | map(select(length > 0 and (test("^(Summary|Closes|Fixes|Refs)\\b"; "i") | not)))
+    | map(gsub("^[#>*\\- ]+"; "") | gsub("\\*\\*|`"; "") | gsub("\\s+$"; ""))
+    | map(select(length > 0 and (test("^(Summary|What|Why|How|Closes|Fixes|Refs)\\b:?$|^(Closes|Fixes|Refs)\\b"; "i") | not)))
     | .[0] // "") | .[0:200];
   [ .[] | select(.mergedAt <= $cut) | select(skip | not) ]
   | sort_by(.mergedAt)
