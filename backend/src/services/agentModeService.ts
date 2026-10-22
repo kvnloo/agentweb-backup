@@ -14452,8 +14452,6 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     // on it (current daily_budget, current status, ...) was being thrown away. Kept here
     // so the Changes: line below can show what's actually changing, not just which keys.
     let currentEntity: any;
-    // AD_SET CREATE only: the parent campaign, to tell whether the write path will drop the ad set's own budget.
-    let parentCampaignForCreate: any;
 
     /*
      * Best-effort resolvers — each guarded so a Meta lookup failure never blocks the gate.
@@ -14531,7 +14529,6 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     } else if (entity_type === 'AD_SET') {
       if (action === 'CREATE') {
         const campaign = await resolveCampaign(campaign_id);
-        parentCampaignForCreate = campaign;
         target.campaign = nameOf(campaign, campaign_id);
         target.ad_set_name = params.name;
         lines.push(`Create a NEW ad set "${params.name}" UNDER campaign ${target.campaign} (ad account ${scopeAccountId}).`);
@@ -14605,67 +14602,49 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     // $6,000→$11,000 without leaving the page. currentEntity (already fetched above
     // for its .name, previously discarded) supplies the "before" side; params supplies
     // the "after" side — both were already right here.
-    // Units differ by field AND entity, and a reviewer approving real spend must see the amount
-    // Meta will actually receive: Meta itself (the "before" side) always reports minor units, as
-    // numeric STRINGS ("3000"); CAMPAIGN daily/lifetime_budget and spend_cap are forwarded raw in
-    // minor units, but `budget_amount` and every AD_SET budget/bid are DOLLARS (the write path
-    // multiplies by 100). Treating them all as cents showed an ad-set "$60" proposal as "$0.60".
+    // Every agent money input is in MAJOR units of the ad account's currency (ENG-2277:
+    // normalizeMetaMoneyParams) and Meta reports the current value in MINOR units as a numeric
+    // STRING ("3000"). Both sides go through the same normalizeMetaMoney the writers use, so the
+    // card shows exactly the amount that will be submitted — "daily_budget: 3000 (= $30.00) →
+    // 310000 (= $3,100.00)" — including for zero-decimal currencies. If the account currency
+    // can't be read, the raw value is shown and flagged rather than guessed.
     const MONEY_KEYS = new Set(['daily_budget', 'lifetime_budget', 'bid_amount', 'budget_amount', 'spend_cap']);
-    const proposedIsDollars = (key: string) =>
-      key === 'budget_amount' || (entity_type === 'AD_SET' && ['daily_budget', 'lifetime_budget', 'bid_amount'].includes(key));
-    const asWholeNumber = (v: any): number | undefined =>
-      typeof v === 'number' ? v : (typeof v === 'string' && /^\d+(\.\d+)?$/.test(v) ? Number(v) : undefined);
-    const usd = (cents: number) => `$${(cents / 100).toFixed(2)}`;
-    const formatBefore = (key: string, value: any): string => {
-      if (value === undefined || value === null) return 'unset';
-      const n = MONEY_KEYS.has(key) ? asWholeNumber(value) : undefined;
-      return n !== undefined ? usd(n) : String(value);
+    let accountCurrency: string | undefined;
+    if (accessToken && [...MONEY_KEYS].some((k) => params?.[k] !== undefined)) {
+      try { accountCurrency = await metaService.getAdAccountCurrency(scopeAccountId, accessToken); } catch { /* shown as unverified below */ }
+    }
+    const money = (value: any, unit: 'major' | 'minor'): string => {
+      try {
+        const n = typeof value === 'string' && /^\d+(\.\d+)?$/.test(value) ? Number(value) : value;
+        return normalizeMetaMoney(n, accountCurrency, unit).description;
+      } catch {
+        return `${String(value)} (${unit} units, currency unverified)`;
+      }
     };
-    const formatAfter = (key: string, value: any): string => {
+    const formatChange = (key: string, value: any, side: 'before' | 'after'): string => {
       if (value === undefined || value === null) return 'unset';
-      const n = MONEY_KEYS.has(key) ? asWholeNumber(value) : undefined;
-      return n !== undefined ? usd(proposedIsDollars(key) ? Math.round(n * 100) : n) : String(value);
-    };
-    // Non-money values: objects (placement_assets, adset_schedule) must not render as
-    // "[object Object]", and long copy must not flood the card.
-    const plain = (key: string, value: any, format: (k: string, v: any) => string): string => {
-      const text = value !== null && typeof value === 'object' ? JSON.stringify(value) : format(key, value);
+      const text = MONEY_KEYS.has(key) ? money(value, side === 'before' ? 'minor' : 'major')
+        : value !== null && typeof value === 'object' ? JSON.stringify(value) : String(value);
+      // Long copy and object-valued fields (placement_assets, adset_schedule) must not flood the card.
       return text.length > 160 ? `${text.slice(0, 157)}...` : text;
     };
-    // The write path silently DROPS some budget params; showing them as changes would
-    // tell a reviewer about an amount Meta never receives.
-    const notApplied: Record<string, string> = {};
-    if (action === 'CREATE' && entity_type === 'AD_SET' && (parentCampaignForCreate?.daily_budget || parentCampaignForCreate?.lifetime_budget)) {
-      notApplied.daily_budget = 'the campaign already carries the budget';
-      notApplied.lifetime_budget = 'the campaign already carries the budget';
-    }
-    if (action === 'CREATE' && entity_type === 'CAMPAIGN' && params.budget_amount !== undefined && !params.advantage_campaign_budget) {
-      notApplied.budget_amount = 'campaign budget only applies with advantage_campaign_budget';
-    }
-    if (action !== 'CREATE' && entity_type === 'CAMPAIGN' && params.budget_amount !== undefined) {
-      notApplied.daily_budget = 'budget_amount takes precedence';
-    }
     const contentChanges: Record<string, any> = {};
     const changeDescriptions: string[] = [];
     // A rename is a real change a reviewer must see; on CREATE the name is already in the summary line.
     const changeKeys = ['link_url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'status', 'daily_budget', 'lifetime_budget', 'budget_amount', 'bid_amount', 'spend_cap', 'creative_id', 'placement_assets', 'adset_schedule', 'pacing_type'];
     if (action !== 'CREATE') changeKeys.unshift('name');
     for (const key of changeKeys) {
-      if (params[key] === undefined || notApplied[key]) continue;
+      if (params[key] === undefined) continue;
       contentChanges[key] = params[key];
       const before = currentEntity?.[key === 'budget_amount' ? 'daily_budget' : key];
-      const after = plain(key, params[key], formatAfter);
+      const after = formatChange(key, params[key], 'after');
       changeDescriptions.push(
-        before !== undefined ? `${key}: ${plain(key, before, formatBefore)} → ${after}` : `${key} → ${after}`,
+        before !== undefined ? `${key}: ${formatChange(key, before, 'before')} → ${after}` : `${key} → ${after}`,
       );
     }
     if (Object.keys(contentChanges).length > 0) {
       target.changes = contentChanges;
       lines.push(`Changes: ${changeDescriptions.join(', ')}.`);
-    }
-    const ignored = Object.keys(notApplied).filter((k) => params[k] !== undefined);
-    if (ignored.length > 0) {
-      lines.push(`Not applied: ${ignored.map((k) => `${k} (${notApplied[k]})`).join(', ')}.`);
     }
 
     /*

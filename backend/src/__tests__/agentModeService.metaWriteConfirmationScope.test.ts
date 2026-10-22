@@ -220,92 +220,123 @@ describe('buildMetaWriteConfirmation scopes to the resolved ad account', () => {
    * .name. This pins that the confirmation text now shows the actual before/after values,
    * not just which keys are changing.
    */
-  describe('Changes: line shows actual before/after values, not just field names', () => {
-    it('shows a budget change in dollars, not raw cents', async () => {
-      getCampaignSpy.mockRestore();
-      const campaignSpy = jest.spyOn(metaService, 'getCampaign').mockResolvedValue({
-        id: 'camp_1', name: 'Summer Sale', daily_budget: 6000,
-      } as never);
-      try {
-        const result: any = await (agentModeService as any).buildMetaWriteConfirmation(
-          USER, 'CAMPAIGN', 'UPDATE', RESOLVED_ACCOUNT, 'camp_1', undefined, undefined,
-          { daily_budget: 11000 },
-        );
-        expect(result.summary).toContain('daily_budget: $60.00 → $110.00');
-        expect(result.summary).not.toContain('6000');
-        expect(result.summary).not.toContain('11000');
-      } finally {
-        campaignSpy.mockRestore();
-      }
+  describe('Changes: line shows what will actually be submitted (same units as the writers)', () => {
+    // ENG-2277: every agent money input is MAJOR units of the ad account currency; Meta reports the
+    // current value in MINOR units as a numeric string. Both sides are rendered with the writers'
+    // own normalizeMetaMoney so a $30 -> $3,100 slip is visible on the card.
+    let currencySpy: jest.SpyInstance;
+    beforeEach(() => {
+      currencySpy = jest.spyOn(metaService, 'getAdAccountCurrency').mockResolvedValue('USD' as never);
+    });
+    afterEach(() => {
+      currencySpy.mockRestore();
     });
 
-    it('shows a status change before/after without dollar-formatting a non-budget field', async () => {
-      getCampaignSpy.mockRestore();
-      const campaignSpy = jest.spyOn(metaService, 'getCampaign').mockResolvedValue({
-        id: 'camp_1', name: 'Summer Sale', status: 'ACTIVE',
-      } as never);
-      try {
-        const result: any = await (agentModeService as any).buildMetaWriteConfirmation(
-          USER, 'CAMPAIGN', 'UPDATE', RESOLVED_ACCOUNT, 'camp_1', undefined, undefined,
-          { status: 'PAUSED' },
-        );
-        expect(result.summary).toContain('status: ACTIVE → PAUSED');
-      } finally {
-        campaignSpy.mockRestore();
-      }
-    });
+    const build = (entity: string, action: string, ids: [string | undefined, string | undefined, string | undefined], params: any) =>
+      (agentModeService as any).buildMetaWriteConfirmation(USER, entity, action, RESOLVED_ACCOUNT, ids[0], ids[1], ids[2], params);
 
-    it('formats a before-budget that Meta returned as a numeric STRING the same as the proposed number', async () => {
-      // Found live against a real ad account: Graph returns daily_budget as "3000", and only
-      // coercing numbers rendered "3000 → $31.00" (raw cents before, dollars after).
+    it('shows a campaign budget as before (minor units) and after (major units converted), side by side', async () => {
       getCampaignSpy.mockRestore();
       const campaignSpy = jest.spyOn(metaService, 'getCampaign').mockResolvedValue({
         id: 'camp_1', name: 'Summer Sale', daily_budget: '3000',
       } as never);
       try {
-        const result: any = await (agentModeService as any).buildMetaWriteConfirmation(
-          USER, 'CAMPAIGN', 'UPDATE', RESOLVED_ACCOUNT, 'camp_1', undefined, undefined,
-          { daily_budget: 3100 },
-        );
-        expect(result.summary).toContain('daily_budget: $30.00 → $31.00');
-        expect(result.summary).not.toContain('3000');
+        const result: any = await build('CAMPAIGN', 'UPDATE', ['camp_1', undefined, undefined], { daily_budget: 31 });
+        expect(result.summary).toContain('daily_budget: 3000 (= $30.00) → 3100 (= $31.00)');
       } finally {
         campaignSpy.mockRestore();
       }
     });
 
-    it('shows an AD_SET budget proposal (dollars) against a Meta before-value (cents) without a 100x slip', async () => {
-      // AD_SET budgets are DOLLARS in the tool contract (updateMetaAdsAdSet multiplies by 100),
-      // while Meta reports the current value in cents. Treating both as cents showed a $60
-      // proposal as "$0.60".
+    it('makes a 100x slip visible: 3100 submitted as major units is $3,100.00', async () => {
+      getCampaignSpy.mockRestore();
+      const campaignSpy = jest.spyOn(metaService, 'getCampaign').mockResolvedValue({
+        id: 'camp_1', name: 'Summer Sale', daily_budget: '3000',
+      } as never);
+      try {
+        const result: any = await build('CAMPAIGN', 'UPDATE', ['camp_1', undefined, undefined], { daily_budget: 3100 });
+        expect(result.summary).toContain('daily_budget: 3000 (= $30.00) → 310000 (= $3,100.00)');
+      } finally {
+        campaignSpy.mockRestore();
+      }
+    });
+
+    it('shows an AD_SET budget in the same units (major in, minor out)', async () => {
       getCampaignSpy.mockRestore();
       const adSetSpy = jest.spyOn(metaService, 'getAdSet').mockResolvedValue({
         id: 'set_1', name: 'Evening Push', campaign_id: 'camp_1', daily_budget: '6000',
       } as never);
       const campaignSpy = jest.spyOn(metaService, 'getCampaign').mockResolvedValue({ id: 'camp_1', name: 'Summer Sale' } as never);
       try {
-        const result: any = await (agentModeService as any).buildMetaWriteConfirmation(
-          USER, 'AD_SET', 'UPDATE', RESOLVED_ACCOUNT, undefined, 'set_1', undefined,
-          { daily_budget: 75 },
-        );
-        expect(result.summary).toContain('daily_budget: $60.00 → $75.00');
+        const result: any = await build('AD_SET', 'UPDATE', [undefined, 'set_1', undefined], { daily_budget: 75 });
+        expect(result.summary).toContain('daily_budget: 6000 (= $60.00) → 7500 (= $75.00)');
       } finally {
         adSetSpy.mockRestore();
         campaignSpy.mockRestore();
       }
     });
 
-    it('shows a campaign budget_amount (dollars) against the campaign daily_budget (cents)', async () => {
+    it('compares a campaign budget_amount against the campaign daily_budget', async () => {
       getCampaignSpy.mockRestore();
       const campaignSpy = jest.spyOn(metaService, 'getCampaign').mockResolvedValue({
         id: 'camp_1', name: 'Summer Sale', daily_budget: '3000',
       } as never);
       try {
-        const result: any = await (agentModeService as any).buildMetaWriteConfirmation(
-          USER, 'CAMPAIGN', 'UPDATE', RESOLVED_ACCOUNT, 'camp_1', undefined, undefined,
-          { budget_amount: 45 },
-        );
-        expect(result.summary).toContain('budget_amount: $30.00 → $45.00');
+        const result: any = await build('CAMPAIGN', 'UPDATE', ['camp_1', undefined, undefined], { budget_amount: 45 });
+        expect(result.summary).toContain('budget_amount: 3000 (= $30.00) → 4500 (= $45.00)');
+      } finally {
+        campaignSpy.mockRestore();
+      }
+    });
+
+    it('uses the account currency\'s own minor-unit scale (zero-decimal JPY)', async () => {
+      currencySpy.mockResolvedValue('JPY' as never);
+      getCampaignSpy.mockRestore();
+      const campaignSpy = jest.spyOn(metaService, 'getCampaign').mockResolvedValue({
+        id: 'camp_1', name: 'Summer Sale', daily_budget: '3000',
+      } as never);
+      try {
+        const result: any = await build('CAMPAIGN', 'UPDATE', ['camp_1', undefined, undefined], { daily_budget: 3500 });
+        expect(result.summary).toContain('daily_budget: 3000 (= ¥3,000.00) → 3500 (= ¥3,500.00)');
+      } finally {
+        campaignSpy.mockRestore();
+      }
+    });
+
+    it('shows a CREATE budget with its converted amount and flags the raw value when the currency cannot be read', async () => {
+      currencySpy.mockRejectedValue(new Error('graph down') as never);
+      getCampaignSpy.mockRestore();
+      const campaignSpy = jest.spyOn(metaService, 'getCampaign').mockResolvedValue({ id: 'camp_1', name: 'Summer Sale' } as never);
+      try {
+        const result: any = await build('AD_SET', 'CREATE', ['camp_1', undefined, undefined], { name: 'New Set', daily_budget: 50 });
+        expect(result.summary).toContain('daily_budget → 50 (major units, currency unverified)');
+        expect(result.summary).not.toContain('$');
+      } finally {
+        campaignSpy.mockRestore();
+      }
+    });
+
+    it('shows a status change before/after without money-formatting a non-budget field', async () => {
+      getCampaignSpy.mockRestore();
+      const campaignSpy = jest.spyOn(metaService, 'getCampaign').mockResolvedValue({
+        id: 'camp_1', name: 'Summer Sale', status: 'ACTIVE',
+      } as never);
+      try {
+        const result: any = await build('CAMPAIGN', 'UPDATE', ['camp_1', undefined, undefined], { status: 'PAUSED' });
+        expect(result.summary).toContain('status: ACTIVE → PAUSED');
+        expect(currencySpy).not.toHaveBeenCalled();
+      } finally {
+        campaignSpy.mockRestore();
+      }
+    });
+
+    it('falls back to "key → value" (no "undefined →") when the current value could not be read', async () => {
+      getCampaignSpy.mockRestore();
+      const campaignSpy = jest.spyOn(metaService, 'getCampaign').mockResolvedValue(undefined as never);
+      try {
+        const result: any = await build('CAMPAIGN', 'UPDATE', ['camp_1', undefined, undefined], { daily_budget: 110 });
+        expect(result.summary).toContain('daily_budget → 11000 (= $110.00)');
+        expect(result.summary).not.toContain('undefined');
       } finally {
         campaignSpy.mockRestore();
       }
@@ -313,10 +344,7 @@ describe('buildMetaWriteConfirmation scopes to the resolved ad account', () => {
 
     it('does not repeat the name as a "change" on CREATE', async () => {
       getCampaignSpy.mockRestore();
-      const result: any = await (agentModeService as any).buildMetaWriteConfirmation(
-        USER, 'CAMPAIGN', 'CREATE', RESOLVED_ACCOUNT, undefined, undefined, undefined,
-        { name: 'Fall Sale', objective: 'OUTCOME_LEADS' },
-      );
+      const result: any = await build('CAMPAIGN', 'CREATE', [undefined, undefined, undefined], { name: 'Fall Sale', objective: 'OUTCOME_LEADS' });
       expect(result.summary).not.toContain('name →');
       expect(result.summary).not.toContain('Changes:');
     });
@@ -326,74 +354,13 @@ describe('buildMetaWriteConfirmation scopes to the resolved ad account', () => {
       const adSetSpy = jest.spyOn(metaService, 'getAdSet').mockResolvedValue({ id: 'set_1', name: 'Evening Push', campaign_id: 'camp_1' } as never);
       const campaignSpy = jest.spyOn(metaService, 'getCampaign').mockResolvedValue({ id: 'camp_1', name: 'Summer Sale' } as never);
       try {
-        const result: any = await (agentModeService as any).buildMetaWriteConfirmation(
-          USER, 'AD_SET', 'UPDATE', RESOLVED_ACCOUNT, undefined, 'set_1', undefined,
-          { adset_schedule: [{ days: [1], start_minute: 540, end_minute: 1020 }] },
-        );
+        const result: any = await build('AD_SET', 'UPDATE', [undefined, 'set_1', undefined], {
+          adset_schedule: [{ days: [1], start_minute: 540, end_minute: 1020 }],
+        });
         expect(result.summary).not.toContain('[object Object]');
         expect(result.summary).toContain('"start_minute":540');
       } finally {
         adSetSpy.mockRestore();
-        campaignSpy.mockRestore();
-      }
-    });
-
-    it('does not show an AD_SET CREATE budget the write path will drop when the campaign carries the budget', async () => {
-      getCampaignSpy.mockRestore();
-      const campaignSpy = jest.spyOn(metaService, 'getCampaign').mockResolvedValue({
-        id: 'camp_1', name: 'Summer Sale', daily_budget: '5000',
-      } as never);
-      try {
-        const result: any = await (agentModeService as any).buildMetaWriteConfirmation(
-          USER, 'AD_SET', 'CREATE', RESOLVED_ACCOUNT, 'camp_1', undefined, undefined,
-          { name: 'New Set', daily_budget: 50 },
-        );
-        expect(result.summary).not.toContain('daily_budget →');
-        expect(result.summary).toContain('Not applied: daily_budget (the campaign already carries the budget)');
-      } finally {
-        campaignSpy.mockRestore();
-      }
-    });
-
-    it('shows an AD_SET CREATE budget (dollars) when the campaign does not carry one', async () => {
-      getCampaignSpy.mockRestore();
-      const campaignSpy = jest.spyOn(metaService, 'getCampaign').mockResolvedValue({ id: 'camp_1', name: 'Summer Sale' } as never);
-      try {
-        const result: any = await (agentModeService as any).buildMetaWriteConfirmation(
-          USER, 'AD_SET', 'CREATE', RESOLVED_ACCOUNT, 'camp_1', undefined, undefined,
-          { name: 'New Set', daily_budget: 50 },
-        );
-        expect(result.summary).toContain('daily_budget → $50.00');
-        expect(result.summary).not.toContain('Not applied');
-      } finally {
-        campaignSpy.mockRestore();
-      }
-    });
-
-    it('flags a CAMPAIGN CREATE budget_amount that is ignored without advantage_campaign_budget', async () => {
-      getCampaignSpy.mockRestore();
-      const result: any = await (agentModeService as any).buildMetaWriteConfirmation(
-        USER, 'CAMPAIGN', 'CREATE', RESOLVED_ACCOUNT, undefined, undefined, undefined,
-        { name: 'Fall Sale', objective: 'OUTCOME_LEADS', budget_amount: 40 },
-      );
-      expect(result.summary).not.toContain('budget_amount →');
-      expect(result.summary).toContain('Not applied: budget_amount');
-    });
-
-    it('shows only budget_amount when a CAMPAIGN UPDATE sends both budget_amount and daily_budget (budget_amount wins)', async () => {
-      getCampaignSpy.mockRestore();
-      const campaignSpy = jest.spyOn(metaService, 'getCampaign').mockResolvedValue({
-        id: 'camp_1', name: 'Summer Sale', daily_budget: '3000',
-      } as never);
-      try {
-        const result: any = await (agentModeService as any).buildMetaWriteConfirmation(
-          USER, 'CAMPAIGN', 'UPDATE', RESOLVED_ACCOUNT, 'camp_1', undefined, undefined,
-          { budget_amount: 45, daily_budget: 9999 },
-        );
-        expect(result.summary).toContain('budget_amount: $30.00 → $45.00');
-        expect(result.summary).not.toContain('99.99');
-        expect(result.summary).toContain('Not applied: daily_budget (budget_amount takes precedence)');
-      } finally {
         campaignSpy.mockRestore();
       }
     });
@@ -409,24 +376,6 @@ describe('buildMetaWriteConfirmation scopes to the resolved ad account', () => {
           { name: 'Fall Sale' },
         );
         expect(result.summary).toContain('name: Summer Sale → Fall Sale');
-      } finally {
-        campaignSpy.mockRestore();
-      }
-    });
-
-    it('falls back to "key → value" (no "undefined →") when the current value could not be read', async () => {
-      // CREATE-branch entities and best-effort-degraded lookups never populate
-      // currentEntity — the change description must not surface the JS absence
-      // of a value as if it were a real "undefined" budget.
-      getCampaignSpy.mockRestore();
-      const campaignSpy = jest.spyOn(metaService, 'getCampaign').mockResolvedValue(undefined as never);
-      try {
-        const result: any = await (agentModeService as any).buildMetaWriteConfirmation(
-          USER, 'CAMPAIGN', 'UPDATE', RESOLVED_ACCOUNT, 'camp_1', undefined, undefined,
-          { daily_budget: 11000 },
-        );
-        expect(result.summary).toContain('daily_budget → $110.00');
-        expect(result.summary).not.toContain('undefined');
       } finally {
         campaignSpy.mockRestore();
       }
