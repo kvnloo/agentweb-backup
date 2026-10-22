@@ -1,4 +1,5 @@
-import { AgentModeService, normalizeSkillIdArg } from '../services/agentModeService';
+import { AgentModeService } from '../services/agentModeService';
+import { normalizeSkillIdArg } from '../services/agentMode/skillIdArg';
 
 // Mock all dependencies
 jest.mock('openai');

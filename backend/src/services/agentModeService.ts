@@ -1,4 +1,5 @@
 import { metaWriteRateShaper, META_BUDGET_THROTTLE_SUBCODE } from './agentMode/metaWriteRateShaper';
+import { normalizeSkillIdArg } from './agentMode/skillIdArg';
 import { applyProviderPolicy, CompareProviderPolicy } from './agentMode/compareProviderPolicy';
 import { classifyMetaBudgetChange } from './agentMode/metaBudgetAnomaly';
 import { deriveDominanceLegacyIds } from './agentMode/modelSupersession';
@@ -339,17 +340,6 @@ const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
  */
 export const SKILL_UNRESOLVED_MARKER = "Could not resolve these skill IDs to any known skill";
 
-const SKILL_ID_WITH_NAME_SUFFIX = /^\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\s*-\s+\S.*$/is;
-
-/**
- * ENG-2612: strip a trailing "- <Skill Name>" the model copied from the catalog listing.
- * Only a full UUID followed by "- <text>" is rewritten, so the result is exactly the id the
- * model meant; entitlement is still decided by the normal lookup on that bare UUID.
- */
-export function normalizeSkillIdArg(id: string): string {
-  const m = SKILL_ID_WITH_NAME_SUFFIX.exec(id);
-  return m ? m[1] : id;
-}
 /*
  * The skill exists and the account is entitled to it, but nothing is installable behind it
  * right now — in practice an `__other_skills__` bundle whose unassociated-tool pool is empty.
