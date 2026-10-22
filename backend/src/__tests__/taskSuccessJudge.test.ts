@@ -185,6 +185,20 @@ describe('judgeTaskSuccess', () => {
     expect(calls).toBe(3);
   });
 
+  it('counts each kind of provider failure when the attempts fail differently (ENG-2620)', async () => {
+    const replies = [
+      { text: '', finishReason: 'error' },
+      { text: '', finishReason: 'error' },
+      { text: '', finishReason: 'stop' },
+    ];
+    let calls = 0;
+    const llm: RubricJudgeLlm = { complete: async () => replies[calls++] };
+    expect(await judgeTaskSuccess({ trace: emailRun() }, { llm })).toMatchObject({
+      status: 'error',
+      reason: 'the provider failed on all 3 attempts: 2 ended the reply with an error, 1 returned an empty reply',
+    });
+  });
+
   it('does not retry an unparseable reply that finished normally, or a call that throws (ENG-2620)', async () => {
     let calls = 0;
     const prose: RubricJudgeLlm = { complete: async () => (calls++, { text: 'I cannot decide.', finishReason: 'stop' }) };
