@@ -6,6 +6,8 @@
  *     directory in TEST MODE against a REAL build tarball (a `.aw-test-mode` marker file redirects the paths and fakes the tools; it is never in a tarball).
  * Anything that needs root (the loop-device disk self-test) is run by hand on the test instance and reported in the PR.
  */
+// The test-only TLS keys and certificates are generated on first use (they are not committed): this import must come first.
+import "../fixtures/tls/ensureFixtures";
 import { spawn, spawnSync, type SpawnSyncReturns } from "child_process";
 import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, statSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
@@ -19,6 +21,7 @@ const TLS = join(__dirname, "../fixtures/tls");
 const WORKER_CERT = join(__dirname, "fixtures/worker-server.pem");
 const SCRIPTS = {
   "prod/install.sh": join(PROD, "install.sh"),
+  "prod/deploy.sh": join(PROD, "deploy.sh"),
   "prod/lib.sh": join(PROD, "lib.sh"),
   "build-login-host.sh": join(BACKEND, "scripts/build-login-host.sh"),
   "aw-net.sh": join(DEPLOY, "aw-net.sh"),
@@ -53,7 +56,7 @@ describe("deploy scripts: static guards", () => {
   const shellcheckAvailable = spawnSync("shellcheck", ["--version"]).status === 0;
   if (shellcheckAvailable) {
     it("the production scripts are shellcheck-clean (errors and warnings)", () => {
-      const r = spawnSync("shellcheck", ["-S", "warning", "-x", "-e", "SC1091", "-e", "SC2154", SCRIPTS["prod/install.sh"], SCRIPTS["prod/lib.sh"], SCRIPTS["build-login-host.sh"]], { encoding: "utf8" });
+      const r = spawnSync("shellcheck", ["-S", "warning", "-x", "-e", "SC1091", "-e", "SC2154", SCRIPTS["prod/install.sh"], SCRIPTS["prod/deploy.sh"], SCRIPTS["prod/lib.sh"], SCRIPTS["build-login-host.sh"]], { encoding: "utf8" });
       expect(r.stdout).toBe("");
       expect(r.status).toBe(0);
     });
@@ -117,7 +120,7 @@ describe("deploy scripts: static guards", () => {
 
   it("a failed redeploy never stops a healthy host: `disable --now` exists only in the trap and only when NO valid install exists", () => {
     expect(install.match(/disable --now/g)?.length).toBe(1);
-    expect(install).toMatch(/have_valid_install; then[\s\S]{0,300}else[\s\S]{0,300}disable --now/);
+    expect(install).toMatch(/have_valid_install; then[\s\S]{0,800}else[\s\S]{0,300}disable --now/);
     expect(install).toContain("exit 3");
     expect(install).toContain("flock -n 9");
   });
@@ -558,7 +561,7 @@ describe("install.sh: stage -> validate -> switch, rollback, and 'a failure neve
     writeFileSync(join(dir, "ca.json"), caJson);
     fake("aws", `[ -e "${dir}/aws-fails" ] && { echo "AccessDenied" >&2; exit 254; }
 case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${versions.TLS_SECRET_CA}"*) cat "${dir}/ca.json" ;; *) exit 2 ;; esac`);
-    fake("systemctl", `echo "systemctl $*" >>"${calls}"`);
+    fake("systemctl", `echo "systemctl $*" >>"${calls}"\n[ "$1" = "is-active" ] && exit 3 # not running, unless a test says otherwise\nexit 0`);
     const opt = join(dir, "opt");
     const conf = join(dir, "etc");
     const units = join(dir, "units");
@@ -601,11 +604,262 @@ case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${
     expect(manifest).toMatch(/^package_lock_sha256=[a-f0-9]{64}$/m);
     expect(manifest).toMatch(/^lockfile_check=/m);
     expect(manifest).not.toContain("WORKER_PRIVATE_IP");
-    for (const f of ["install.sh", "lib.sh", "versions.env", "check-config.js", "dist/loginHost/host/start.js", "files/aw-login-host@.service", "files/aw-login-host-failed@.service", "files/aw-env.slice.template", "files/host-config.template.json", "files/claude-turn.sh", "files/aw-net.sh", "files/aw-write-file.sh", "files/system-prompt.txt"]) {
+    for (const f of ["install.sh", "deploy.sh", "deployctl.js", "lib.sh", "versions.env", "check-config.js", "dist/loginHost/host/start.js", "files/aw-login-host@.service", "files/aw-login-host-failed@.service", "files/aw-env.slice.template", "files/host-config.template.json", "files/claude-turn.sh", "files/aw-net.sh", "files/aw-write-file.sh", "files/system-prompt.txt"]) {
       expect(existsSync(join(pkg, f))).toBe(true);
     }
     expect(text(join(pkg, "files/host-config.template.json"))).toContain("@@WORKER_IP@@"); // filled at install time
     expect(text(join(pkg, "versions.env"))).not.toMatch(/172\.31\.30\.50/);
+  });
+
+  it("the real tarball passes the SSM document's own layout rule: one top directory named after the build, no absolute or parent paths, a deploy.sh that is a regular file", () => {
+    const tgz = readdirSync(tarDir).find((f) => f.endsWith(".tar.gz"))!;
+    const name = tgz.replace(/\.tar\.gz$/, "");
+    const entries = spawnSync("tar", ["-tzf", join(tarDir, tgz)], { encoding: "utf8" }).stdout.split("\n").filter(Boolean);
+    expect(entries.length).toBeGreaterThan(10);
+    for (const e of entries) {
+      expect({ e, unsafe: e.startsWith("/") || e.includes("..") }).toEqual({ e, unsafe: false });
+      expect({ e, inside: e === name || e.startsWith(`${name}/`) }).toEqual({ e, inside: true });
+    }
+    expect(lstatSync(join(pkg, "deploy.sh")).isFile()).toBe(true);
+    expect(text(join(pkg, "MANIFEST"))).toMatch(/^build_seq=/m); // deploy.sh's no-downgrade rule reads this (empty for a hand-made build, the run number in CI)
+  });
+
+  describe("the build script's two pipeline modes", () => {
+    it("--tests-run-elsewhere packages WITHOUT running jest and says so in the MANIFEST (the signing job insists on exactly this value); the pipeline's run id becomes the build number", () => {
+      const out = join(root, "out-elsewhere");
+      const t0 = Date.now();
+      const b = spawnSync("bash", [SCRIPTS["build-login-host.sh"], "--out", out, "--tests-run-elsewhere", "--allow-dirty"], { cwd: BACKEND, encoding: "utf8", timeout: 200_000, env: { ...process.env, GITHUB_RUN_ID: "4242" } });
+      expect(b.status).toBe(0);
+      expect(b.stdout + b.stderr).not.toContain("running the gate tests");
+      const tgz = readdirSync(out).find((f) => f.endsWith(".tar.gz"))!;
+      const manifest = spawnSync("tar", ["-xzOf", join(out, tgz), "--wildcards", "*/MANIFEST"], { encoding: "utf8" }).stdout;
+      expect(manifest).toMatch(/^tests=separate-job$/m);
+      expect(manifest).toMatch(/^build_seq=4242$/m);
+      expect(Date.now() - t0).toBeLessThan(150_000);
+    });
+  });
+
+  describe("install.sh pieces the zero-interruption deploy relies on", () => {
+    const nextSecond = () => void spawnSync("sleep", ["1.2"]);
+
+    it("--prepare stops after the harmless prerequisites: no release, no TLS set, nothing switched", () => {
+      const b = box();
+      const r = run(b, "--prepare");
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain("prepared");
+      expect(releases(b)).toEqual([]);
+      expect(existsSync(join(b.opt, "current"))).toBe(false);
+      expect(tlsDirs(b)).toEqual([]);
+      expect(systemctlCalls(b)).toEqual([]);
+    });
+
+    it("the bridge URL is checked FIRST: without it --prepare (and a normal install) exit 3 before any download, disk or package step", () => {
+      const b = box({ bridge: null });
+      for (const args of [["--prepare"], []]) {
+        const r = run(b, ...args);
+        expect(r.status).toBe(3);
+        // in test mode the prerequisites step prints a "skipped" line when (and only when) it is reached: it must not be
+        expect(r.stderr + r.stdout).not.toContain("prerequisites (disk, packages");
+      }
+      expect(releases(b)).toEqual([]);
+    });
+
+    it("a build that differs only in name, commit, run number and times is the SAME deployment (no new release, so no restart)", () => {
+      const b = box();
+      expect(run(b).status).toBe(0);
+      const first = current(b);
+      nextSecond();
+      const m = text(join(b.pkg, "MANIFEST"))
+        .replace(/^name=.*$/m, "name=login-host-abcdefabcdef")
+        .replace(/^git_sha=.*$/m, "git_sha=0000000000000000000000000000000000000000")
+        .replace(/^commit_time=.*$/m, "commit_time=2030-01-01T00:00:00Z")
+        .replace(/^build_seq=.*$/m, "build_seq=99999");
+      writeFileSync(join(b.pkg, "MANIFEST"), m);
+      expect(run(b).status).toBe(0);
+      expect(current(b)).toBe(first);
+      expect(releases(b)).toHaveLength(1);
+    });
+
+    it("but a build whose FILES differ (a sha256 line changed) is a new release", () => {
+      const b = box();
+      expect(run(b).status).toBe(0);
+      const first = current(b);
+      nextSecond();
+      writeFileSync(join(b.pkg, "MANIFEST"), text(join(b.pkg, "MANIFEST")).replace(/^[0-9a-f]{64} {2}\.\/dist\/loginHost\/host\/start\.js$/m, "f".repeat(64) + "  ./dist/loginHost/host/start.js"));
+      expect(run(b).status).toBe(0);
+      expect(current(b)).not.toBe(first);
+    });
+
+    it("rollback puts back the PREVIOUS release's unit files and slice, not only its code, and reloads systemd", () => {
+      const b = box();
+      expect(run(b).status).toBe(0);
+      const unit = join(b.units, "aw-login-host@.service");
+      const firstUnit = text(unit);
+      nextSecond();
+      // the second build ships a different unit (and a different file hash, so it is a new release)
+      const failedUnit = join(b.units, "aw-login-host-failed@.service");
+      const slice = join(b.units, "aw-prod.slice");
+      const first3 = [firstUnit, text(failedUnit), text(slice)];
+      writeFileSync(join(b.pkg, "files/aw-login-host@.service"), firstUnit + "\n# a unit change that turned out to be bad\n");
+      writeFileSync(join(b.pkg, "files/aw-login-host-failed@.service"), first3[1] + "\n# bad failed-unit change\n");
+      writeFileSync(join(b.pkg, "files/aw-env.slice.template"), text(join(b.pkg, "files/aw-env.slice.template")) + "\n# bad slice change\n");
+      writeFileSync(join(b.pkg, "MANIFEST"), text(join(b.pkg, "MANIFEST")) + "unit_changed=1\n");
+      expect(run(b).status).toBe(0);
+      expect(text(unit)).toContain("a unit change that turned out to be bad");
+      expect(text(slice)).toContain("bad slice change");
+      writeFileSync(b.calls, "");
+      expect(run(b, "--rollback").status).toBe(0);
+      expect([text(unit), text(failedUnit), text(slice)]).toEqual(first3); // all three, not only the main unit
+      expect(systemctlCalls(b)).toContain("systemctl daemon-reload");
+    });
+  });
+
+  describe("install.sh safety rules from the reliability review", () => {
+    const nextSecond = () => void spawnSync("sleep", ["1.2"]);
+
+    it("a no-op install repairs unit files that do not match the active release (a deploy killed between 'write units' and 'switch' left them wrong)", () => {
+      const b = box();
+      expect(run(b).status).toBe(0);
+      const unit = join(b.units, "aw-login-host@.service");
+      const good = text(unit);
+      writeFileSync(unit, good + "\n# damaged by an interrupted deploy\n");
+      writeFileSync(b.calls, "");
+      expect(run(b).status).toBe(0);
+      expect(text(unit)).toBe(good);
+      expect(systemctlCalls(b)).toContain("systemctl daemon-reload");
+    });
+
+    it("a failed --prepare never stops or disables anything (it only gets the machine ready)", () => {
+      const b = box({ bridge: null });
+      expect(run(b, "--prepare").status).toBe(3);
+      expect(systemctlCalls(b).filter((c) => c.includes("disable") || c.includes("stop"))).toEqual([]);
+    });
+
+    it("a failed first install DOES disable the unit (no half-configured host may crash-loop), but never when the unit is running", () => {
+      const b = box({ bridge: null });
+      run(b);
+      expect(systemctlCalls(b).some((c) => c.includes("disable --now"))).toBe(true);
+      // now with a running unit: the fake systemctl says is-active
+      const b2 = box({ bridge: null });
+      writeFileSync(join(b2.bin, "systemctl"), `#!/bin/bash\necho "systemctl $*" >>"${b2.calls}"\n[ "$1" = "is-active" ] && exit 0\nexit 0\n`);
+      run(b2);
+      expect(systemctlCalls(b2).some((c) => c.includes("disable"))).toBe(false);
+    });
+
+    it("the /usr/bin/node link is flipped only in the switch phase, never by --prepare, and the install lock is in a root-only directory", () => {
+      const src = text(join(PROD, "install.sh"));
+      expect(src).toMatch(/if \[ "\$PREPARE" = 1 \]; then\n\s+skip "\/usr\/bin\/node link: left for the switch phase"\n\s+elif/);
+      expect(src).toContain("LOCK=/run/aw-deploy/install.lock");
+      expect(src).toMatch(/chmod 0700 "\$\(dirname "\$LOCK"\)"/);
+    });
+
+    it("staging directories left behind by a killed install are cleaned up once they are a day old, and only then", () => {
+      const b = box();
+      expect(run(b).status).toBe(0);
+      const fresh = join(b.opt, "releases/.stage-fresh");
+      const stale = join(b.opt, "releases/.stage-stale");
+      mkdirSync(fresh);
+      mkdirSync(stale);
+      spawnSync("touch", ["-d", "3 days ago", stale]);
+      nextSecond();
+      writeFileSync(join(b.pkg, "MANIFEST"), text(join(b.pkg, "MANIFEST")) + "another=1\n");
+      expect(run(b).status).toBe(0);
+      expect(existsSync(stale)).toBe(false);
+      expect(existsSync(fresh)).toBe(true);
+    });
+  });
+
+  describe("deploy.sh driving the REAL install.sh from the REAL build (fake systemctl and a fake deployctl)", () => {
+    /** deploy.sh needs a few more seams than install.sh; `ctlnode` stands in for `node deployctl.js` and answers from files. */
+    function deployBox(opts: { active: boolean }) {
+      const b = box();
+      const S = join(b.dir, "scen");
+      mkdirSync(S);
+      writeFileSync(join(S, "acquire.rc"), "0");
+      writeFileSync(join(S, "health.rcs"), "0\n0\n0\n");
+      writeFileSync(
+        join(b.bin, "systemctl"),
+        `#!/bin/bash\necho "systemctl $*" >>"${b.calls}"\n[ "$1" = "is-active" ] && exit ${opts.active ? 0 : 3}\n[ "$1" = "show" ] && { echo ${opts.active ? "active" : "inactive"}; exit 0; }\nexit 0\n`,
+      );
+      writeFileSync(
+        join(b.bin, "ctlnode"),
+        `#!/bin/bash\nshift 2; cmd=$1; shift\necho "ctl $cmd $*" >>"${b.calls}"\ncase "$cmd" in\n acquire) exit "$(cat "${S}/acquire.rc")" ;;\n health) rc=$(head -n1 "${S}/health.rcs"); tail -n +2 "${S}/health.rcs" >"${S}/h.tmp"; mv "${S}/h.tmp" "${S}/health.rcs"; exit "$rc" ;;\n info) echo '{"drain":"strict"}'; exit 0 ;;\nesac\n`,
+      );
+      for (const f of ["systemctl", "ctlnode"]) chmodSync(join(b.bin, f), 0o755);
+      mkdirSync(join(b.dir, "state"));
+      // (a CI build carries the pipeline's run number; this one was made by hand)
+      writeFileSync(join(b.pkg, "MANIFEST"), text(join(b.pkg, "MANIFEST")).replace(/^build_seq=.*$/m, "build_seq=7"));
+      const env = { ...b.env, AW_SOCK: join(b.dir, "host.sock"), AW_DEPLOY_LOCK: join(b.dir, "deploy.lock"), AW_NODE: join(b.bin, "ctlnode"), AW_STATE_DIR: join(b.dir, "state"), AW_HOLD: join(b.dir, "hold"), AW_HEALTH_TIMEOUT: "5" };
+      const deploy = (...args: string[]) => spawnSync("bash", [join(b.pkg, "deploy.sh"), ...args], { encoding: "utf8", env: { ...process.env, ...env }, timeout: 120_000 });
+      return { b, S, deploy };
+    }
+    const calls = (b: Box) => systemctlCalls(b);
+    const nextSecond = () => void spawnSync("sleep", ["1.2"]); // a release id is the build plus the second it was installed in
+
+    it("a fresh worker: installs, starts the service, checks health, exit 0", () => {
+      const { b, deploy } = deployBox({ active: false });
+      const r = deploy();
+      expect(r.status).toBe(0);
+      expect(releases(b)).toHaveLength(1);
+      expect(calls(b).some((c) => c === "systemctl restart aw-login-host@prod")).toBe(true);
+      expect(calls(b).some((c) => c.startsWith("ctl acquire"))).toBe(false); // nobody to protect yet
+    });
+
+    it("a running worker: install, wait for idle, restart, health; the new release is the active one", () => {
+      const { b, deploy } = deployBox({ active: true });
+      expect(run(b).status).toBe(0); // the first release is already there and "running"
+      const first = current(b);
+      nextSecond();
+      writeFileSync(join(b.pkg, "MANIFEST"), text(join(b.pkg, "MANIFEST")) + "next_build=1\n"); // a different build
+      writeFileSync(join(b.dir, "state/deployed-build-seq"), "0\n");
+      const r = deploy();
+      expect(r.status).toBe(0);
+      expect(current(b)).not.toBe(first);
+      expect(readlinkSync(join(b.opt, "previous"))).toBe(first);
+      const c = calls(b);
+      expect(c.findIndex((x) => x.startsWith("ctl acquire"))).toBeLessThan(c.findIndex((x) => x === "systemctl restart aw-login-host@prod"));
+      expect(c.filter((x) => x === "ctl release ")).toEqual([]); // the restart cleared the drain
+    });
+
+    it("redeploying the exact same build and configuration restarts NOTHING and lifts the drain it took", () => {
+      const { b, deploy } = deployBox({ active: true });
+      expect(run(b).status).toBe(0);
+      const first = current(b);
+      writeFileSync(join(b.dir, "state/running-release"), `${first}\n`); // the host was seen healthy on this release
+      const r = deploy();
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain("nothing to restart");
+      expect(current(b)).toBe(first);
+      expect(calls(b).some((x) => x === "systemctl restart aw-login-host@prod")).toBe(false);
+      expect(calls(b)).toContain("ctl release ");
+    });
+
+    it("a busy worker (never idle): exit 75, nothing restarted, and the ACTIVE release is the one still running", () => {
+      const { b, S, deploy } = deployBox({ active: true });
+      expect(run(b).status).toBe(0);
+      const first = current(b);
+      nextSecond();
+      writeFileSync(join(b.pkg, "MANIFEST"), text(join(b.pkg, "MANIFEST")) + "next_build=1\n");
+      writeFileSync(join(S, "acquire.rc"), "75");
+      const r = deploy();
+      expect(r.status).toBe(75);
+      expect(current(b)).toBe(first); // files on disk still match the host that was never restarted
+      expect(calls(b).some((x) => x === "systemctl restart aw-login-host@prod")).toBe(false);
+      expect(text(join(b.conf, "prod.json"))).toBe(text(join(b.opt, first.replace(/^releases\//, "releases/"), "prod.json")));
+    });
+
+    it("an unhealthy new build is rolled back to the release that was running, and restarted on it", () => {
+      const { b, S, deploy } = deployBox({ active: true });
+      expect(run(b).status).toBe(0);
+      const first = current(b);
+      nextSecond();
+      writeFileSync(join(b.pkg, "MANIFEST"), text(join(b.pkg, "MANIFEST")) + "next_build=1\n");
+      writeFileSync(join(S, "health.rcs"), "1\n0\n");
+      const r = deploy();
+      expect(r.status).toBe(1);
+      expect(current(b)).toBe(first);
+      expect(calls(b).filter((x) => x === "systemctl restart aw-login-host@prod")).toHaveLength(2);
+    });
   });
 
   it("FIRST install: a complete, validated release is switched in atomically; the unit, slice and config are in place; nothing was disabled", () => {

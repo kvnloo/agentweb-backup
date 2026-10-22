@@ -221,7 +221,7 @@ describe('unattended session, switch on', () => {
     expect(pauseWrites()[0].metadata).toMatchObject({ stepCount: 2, model: RETIRED, ownerNotified: true });
     expect(mockStepEmail).toHaveBeenCalledTimes(1);
     expect(mockStepEmail).toHaveBeenCalledWith(['owner@example.com'], {
-      sessionId: SESSION_ID, stepCount: 2, modelLabel: RETIRED, reason: 'not_served', scheduleName: undefined, sessionTitle: 'Chat',
+      sessionId: SESSION_ID, stepCount: 2, modelLabel: RETIRED, reason: 'not_served', scheduleName: undefined, sessionTitle: 'Chat', upgradeRequired: [],
     });
     expect(mockAlert).toHaveBeenCalledTimes(1);
   });
@@ -307,8 +307,15 @@ describe('unattended session, switch on', () => {
     db.getChatSession.mockResolvedValue(makeSession(plan('gpt-5.5')) as any);
     await turn(true);
     expect(worker.runInWorker).not.toHaveBeenCalled();
-    expect(mockStepEmail).toHaveBeenCalledWith(['owner@example.com'], expect.objectContaining({ stepCount: 2, reason: 'not_in_plan' }));
+    expect(mockStepEmail).toHaveBeenCalledWith(['owner@example.com'], expect.objectContaining({ stepCount: 2, reason: 'not_in_plan', upgradeRequired: ['Pro'] }));
     expect(mockAlert).not.toHaveBeenCalled();
+  });
+
+  it('#3676 follow-up 5: a step model no tier includes is emailed with an EMPTY upgradeRequired (no upgrade offered)', async () => {
+    mockSettings.subscription_types = JSON.stringify([{ name: 'Free', allowedModels: ['gemini-3.5-flash'] }, { name: 'Pro', allowedModels: ['gemini-3.5-flash'] }]);
+    db.getChatSession.mockResolvedValue(makeSession(plan('gpt-5.5')) as any);
+    await turn(true);
+    expect(mockStepEmail).toHaveBeenCalledWith(['owner@example.com'], expect.objectContaining({ reason: 'not_in_plan', upgradeRequired: [] }));
   });
 
   it('a failing email never breaks the turn', async () => {
@@ -317,7 +324,7 @@ describe('unattended session, switch on', () => {
     await expect(turn(true)).resolves.toMatchObject({ content: expect.stringContaining('Step 2 uses') });
   });
 
-  it('the automatic continuation chain of a scheduled session also notifies (no per-turn signal: the session kind decides)', async () => {
+  it('#3676 follow-up 2: a continuation chain started by an attended /generate turn on a scheduled session keeps the in-chat message only', async () => {
     const autoPlan = (steps: any[]) => ({ planId: 'p', autocomplete: true, steps });
     const stall = (workPlan: any) => {
       const session = { ...makeSession(workPlan), sessionType: 'scheduled', pageIdentifier: `Scheduled: Weekly report|scheduleId:${SCHEDULE_ID}` };
@@ -332,8 +339,33 @@ describe('unattended session, switch on', () => {
     });
     await agentModeController.generateResponse(generateReq(), makeRes());
     await flush();
+    // The owner who reopened the scheduled chat started this chain: it is attended, whatever the session's kind.
     expect(pauseWrites()).toHaveLength(1);
-    expect(mockStepEmail).toHaveBeenCalledTimes(1);
+    expect(pauseWrites()[0].metadata).not.toHaveProperty('ownerNotified');
+    expect(mockStepEmail).not.toHaveBeenCalled();
+  });
+
+  it('#3676 follow-up 2: each round of the chain runs with the starting turn\'s attendance (never re-derived from the session kind)', async () => {
+    const autoPlan = (steps: any[]) => ({ planId: 'p', autocomplete: true, steps });
+    const stall = (workPlan: any) => {
+      const session = { ...makeSession(workPlan), sessionType: 'scheduled', pageIdentifier: `Scheduled: Weekly report|scheduleId:${SCHEDULE_ID}` };
+      db.getChatSession.mockResolvedValue(session as any);
+      db.getChatSessionRecord.mockResolvedValue(session as any);
+    };
+    stall(autoPlan([step(1, 'pending', 'gemini-3.5-flash')]));
+    worker.runInWorker.mockImplementationOnce(async () => {
+      stall(autoPlan([step(1, 'completed', 'gemini-3.5-flash'), step(2, 'pending', 'gemini-3.5-flash')]));
+      return workerResult('step 1 done', []) as any;
+    });
+    worker.runInWorker.mockImplementationOnce(async () => {
+      stall(autoPlan([step(1, 'completed', 'gemini-3.5-flash'), step(2, 'completed', 'gemini-3.5-flash')]));
+      return workerResult('step 2 done', []) as any;
+    });
+    await agentModeController.generateResponse(generateReq(), makeRes());
+    await flush(40);
+    expect(worker.runInWorker).toHaveBeenCalledTimes(2);
+    expect(worker.runInWorker.mock.calls[0][0]).toMatchObject({ isUnattendedRun: false });
+    expect(worker.runInWorker.mock.calls[1][0]).toMatchObject({ isUnattendedRun: false });
   });
 });
 

@@ -367,6 +367,11 @@ async function findOrgSharedHubSpotAccounts(userId: string) {
   }
 }
 
+/** The org-shared HubSpot account with this id that `userId` may use, or null. */
+export async function findOrgSharedHubSpotAccountById(userId: string, accountId: string) {
+  return (await findOrgSharedHubSpotAccounts(userId)).find(acc => acc.account_id === accountId) ?? null;
+}
+
 /**
  * Which accounts may serve a call. 'any' (the default): the caller's own, then org-shared ones. 'own':
  * the caller's own only (exactly the pre-ENG-2605 behaviour). 'shared': only accounts an org admin
@@ -2408,7 +2413,7 @@ export class HubSpotService {
    */
   async batchUpdateContacts(
     inputs: Array<{ id: string; properties: Record<string, string> }>
-  ): Promise<void> {
+  ): Promise<string[] | undefined> {
     if (inputs.length > 100) {
       throw new Error(`batchUpdateContacts accepts at most 100 inputs per batch, got ${inputs.length}`);
     }
@@ -2420,6 +2425,12 @@ export class HubSpotService {
     );
 
     throwIfBatchPartialFailure(res);
+
+    // A merged-away id comes back as 200 with `results: []` and no error: nothing was updated. The ids
+    // HubSpot echoed are the only proof an input took effect. undefined = the body had no results array.
+    const results = res?.data?.results;
+    if (!Array.isArray(results)) return undefined;
+    return results.filter((r: any) => r?.id != null).map((r: any) => String(r.id));
   }
 
   /**

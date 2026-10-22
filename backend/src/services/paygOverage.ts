@@ -3,7 +3,8 @@
  *
  * Today an account that reaches its plan's hard cost threshold is paused (429 `usage_paused`) until the
  * month resets or it buys a top-up. With PAYG enabled, the billing owner instead keeps working past the
- * pool up to a cap they chose, and the overage is settled later (PR-2; this module charges nothing).
+ * pool up to a cap they chose, and the overage is settled after the month closes (`paygSettlement.ts`;
+ * this module charges nothing).
  *
  * The decision lives here, as ONE pure function, because there are two admission gates —
  * `checkTokenUsage` and `getEffectiveLlmUsagePolicy` — and both must reach the same answer. If PAYG
@@ -16,7 +17,7 @@
  * Same pattern as workPlanStepModels.ts. The process-wide instance lives in paygOverageService.ts.
  *
  * Data (all additive and optional — no table, no index):
- *   - `SubscriptionType.paygOverage` — whether the tier may opt in, and the markup PR-2 will bill at.
+ *   - `SubscriptionType.paygOverage` — whether the tier may opt in, and the markup settlement bills at.
  *   - `User.paygOverage` on the BILLING OWNER's row — the opt-in and its cap (a percentage only), the
  *     month's pool high-water mark, the overage already standing when the owner opted in, and a
  *     suspension set by settlement when a charge fails.
@@ -26,9 +27,14 @@
  */
 import type { LlmUsageModeDecision } from './llmUsagePolicyService';
 import { hasOwnLiveSubscription } from './orgAuthz';
-import type { PaygInactiveReason, UsageBlockReason } from '../utils/usageBlockCopy';
+import type { PaygInactiveReason, PaygSuspendedReason, UsageBlockReason } from '../utils/usageBlockCopy';
 
 export const PAYG_OVERAGE_SETTING = 'payg_overage_enabled';
+/**
+ * Separate AW-Settings row for month-end settlement (PR-2, `paygSettlementService.ts`): turning the gate
+ * on must never start charging cards by itself. Same exact-'true' rule and cache as the gate's switch.
+ */
+export const PAYG_SETTLEMENT_SETTING = 'payg_settlement_enabled';
 
 /** The only caps a customer can pick, as a percentage of their plan's pool. */
 export const PAYG_CAP_PERCENTS = [25, 50, 100, 200] as const;
@@ -81,20 +87,89 @@ export interface PaygOverageSettings {
    * against that month's pool high-water mark.
    */
   optIn?: { month: string; overageBaselineMicroUsd: number; poolAtOptInMicroUsd?: number };
+  /**
+   * The previous month's `poolHighWater` / `optIn`, kept when a new month's value replaces it (the gate
+   * rolls the mark over on the first check of a month; the settings route rolls the opt-in on the first
+   * opt-in of a month). Settlement runs after the month closes, by which time both may already belong to
+   * the new month — without these it would measure the closed month against the wrong pool and baseline.
+   * One month only; written in the same conditional update that replaces the live value.
+   */
+  poolHighWaterClosed?: { month: string; thresholdMicroUsd: number };
+  optInClosed?: { month: string; overageBaselineMicroUsd: number; poolAtOptInMicroUsd?: number };
+  /**
+   * The months (newest first, at most `PAYG_ADMITTED_MONTHS_KEPT`) in which a gate admitted at least one turn on PAYG
+   * (`reason: 'payg_overage'`), each with what was in force while it did. Settlement bills a month only
+   * when it is listed — spend past the pool in a month PAYG never admitted anything is the ordinary
+   * in-flight overrun every plan has, not overage the owner agreed to pay for — and bills it against
+   * THIS record, never against settings or a tier read after the month ended. Written by the gate,
+   * conditionally, only when an admission changes it (see `PaygAdmittedMonth`).
+   */
+  admittedMonths?: PaygAdmittedMonth[];
   /** Who last changed the settings (a delegated admin's id when acting as the customer). */
   updatedBy: string;
   updatedAt: string;
   /** Optimistic-concurrency token; every settings write is conditional on the version it read. */
   version: number;
-  /** Set by settlement when an overage charge fails. Blocks PAYG admission until cleared. */
-  suspended?: { reason: PaygSuspensionReason; at: string; invoiceId?: string };
+  /**
+   * Set by settlement when an overage charge fails (`payment_failed`, lifted once no month's overage
+   * invoice is still `failed`) or is disputed (`dispute`, lifted once every dispute on the account is
+   * closed and none was lost). Blocks PAYG admission while present.
+   */
+  suspended?: PaygSuspension;
+}
+
+export interface PaygSuspension {
+  reason: PaygSuspensionReason;
+  at: string;
+  invoiceId?: string;
+  /** `dispute` only: the dispute that last (re)stamped the hold. */
+  disputeId?: string;
+  /** `dispute` only: a dispute was lost — never lifted automatically (a person removes the hold). */
+  lost?: boolean;
+  /**
+   * `payment_failed` only: the payment was never confirmed by the owner (3-D Secure) within
+   * `PAYG_PAYMENT_CONFIRMATION_GRACE_DAYS`. Lifted like any payment-failure hold: paying the invoice.
+   */
+  unconfirmed?: boolean;
+  /**
+   * `dispute` only: when a month last FAILED while the dispute hold covered it. Written so a dispute lift
+   * that read the row before that failure cannot remove the hold (its `= :seen` condition fails and it
+   * re-reads, then hands the hold to the failed month).
+   */
+  paymentFailedAt?: string;
+}
+
+/** What the 429 says about a hold: the stored reason, refined (an unconfirmed payment, a lost dispute). */
+export function paygSuspendedReasonOf(suspended: PaygSuspension | undefined): PaygSuspendedReason | undefined {
+  if (suspended?.reason === 'payment_failed') return suspended.unconfirmed ? 'payment_unconfirmed' : 'payment_failed';
+  if (suspended?.reason === 'dispute') return suspended.lost ? 'dispute_lost' : 'dispute';
+  return undefined;
 }
 
 /** Why a PAYG-enabled account is still blocked, when the reason is PAYG's own: drives the 429 copy. */
 export interface PaygBlock {
   reason: UsageBlockReason;
+  /** Only with `payg_suspended`: why, which decides what lifts it (see `PaygSuspendedReason`). */
+  paygSuspendedReason?: PaygSuspendedReason;
+  /** Only with `payg_suspended`, for a pooled member: the billing owner is the one who can resolve it. */
+  paygOwnerResolves?: boolean;
   /** Only with `payg_inactive`: which admission prerequisite is missing. */
   paygInactiveReason?: PaygInactiveReason;
+  /**
+   * Only with `payg_suspended`, and only for the billing owner themselves: the Stripe-hosted page of the
+   * unpaid overage invoice, where it can be paid with any card. Never sent to a pooled member.
+   */
+  openInvoiceUrl?: string;
+}
+
+/**
+ * Whether the owner's subscription lets PAYG cover more usage: active or trialing, or `canceling` — a
+ * cancellation scheduled for the period end, during which the plan itself stays fully usable — so PAYG
+ * follows plan access and does not tell a paid-up customer to "reactivate".
+ */
+export function paygSubscriptionCovers(subscriptionStatus: unknown): boolean {
+  return subscriptionStatus === 'canceling'
+    || hasOwnLiveSubscription({ subscription_status: subscriptionStatus as string | null | undefined });
 }
 
 export interface PaygOverageStatus {
@@ -106,6 +181,96 @@ export interface PaygOverageStatus {
   poolMicroUsd: number;
   /** Floor, so 100 is only ever reported once the cap is actually reached. */
   percentOfCap: number;
+}
+
+/**
+ * What was in force during one month's PAYG admissions. Each figure only ever moves in the customer's
+ * favour within the month, so a write is needed only when an admission sees a higher cap or plan pool,
+ * or a lower markup:
+ *   - `capHighWaterMicroUsd`: the highest cap (`capPercentOfPool` x that moment's pool) any admission
+ *     was measured against — the most the owner agreed to be billed for that month. **The cap is a
+ *     monthly total:** raising it during the month applies to the whole month, including overrun already
+ *     admitted earlier in it (the consent copy says "Your limit applies to the whole month"); lowering it
+ *     later does not un-agree to overage already admitted; and no change after the month reaches back.
+ *   - `tierPoolHighWaterMicroUsd`: the highest plan pool (the tier's hard threshold, before credits) —
+ *     settlement's pool for the month, so a plan change after the month cannot move its bill.
+ *   - `markupBps`: the lowest tier markup seen; null when the tier had none (settlement holds the month).
+ *   - `spendBasis`: which spend figure the gate measured the month's admissions on — the spend ledger
+ *     (what settlement bills) or the legacy LLM-only counter; `mixed` once both were seen. Settlement
+ *     bills only a month measured on the ledger throughout, whatever the cutover setting is by then.
+ */
+export interface PaygAdmittedMonth {
+  month: string;
+  capHighWaterMicroUsd: number;
+  tierPoolHighWaterMicroUsd: number;
+  markupBps: number | null;
+  spendBasis: PaygSpendBasis;
+}
+
+export type PaygSpendBasis = 'spend_ledger' | 'legacy' | 'mixed';
+
+/**
+ * Months of `admittedMonths` kept: the current month plus the 12 before it, so every month settlement
+ * can still act on (its 12-month window, including a held month set to `retry`) keeps its terms.
+ */
+export const PAYG_ADMITTED_MONTHS_KEPT = 13;
+
+/** The stored record for `month`, or undefined. Tolerates a malformed list (it bills nothing). */
+export function paygAdmittedMonth(
+  account: Pick<PaygOverageSettings, 'admittedMonths'> | null | undefined,
+  month: string,
+): PaygAdmittedMonth | undefined {
+  const months = account?.admittedMonths;
+  if (!Array.isArray(months)) return undefined;
+  return months.find((entry) => entry && typeof entry === 'object' && entry.month === month);
+}
+
+/**
+ * `admittedMonths` after an admission measured against `seen`, or null when that admission changes
+ * nothing (the common case: no write). Newest month first, bounded.
+ */
+export function withPaygAdmission(
+  months: readonly PaygAdmittedMonth[] | null | undefined,
+  seen: PaygAdmittedMonth,
+): PaygAdmittedMonth[] | null {
+  const current = Array.isArray(months) ? months.filter((entry) => entry && typeof entry === 'object') : [];
+  const stored = current.find((entry) => entry.month === seen.month);
+  const lowerMarkup = (a: number | null, b: number | null) => (a === null ? b : b === null ? a : Math.min(a, b));
+  const merged: PaygAdmittedMonth = stored
+    ? {
+        month: seen.month,
+        capHighWaterMicroUsd: Math.max(stored.capHighWaterMicroUsd, seen.capHighWaterMicroUsd),
+        tierPoolHighWaterMicroUsd: Math.max(stored.tierPoolHighWaterMicroUsd, seen.tierPoolHighWaterMicroUsd),
+        markupBps: lowerMarkup(stored.markupBps, seen.markupBps),
+        spendBasis: stored.spendBasis === seen.spendBasis ? stored.spendBasis : 'mixed',
+      }
+    : seen;
+  if (
+    stored
+    && merged.capHighWaterMicroUsd === stored.capHighWaterMicroUsd
+    && merged.tierPoolHighWaterMicroUsd === stored.tierPoolHighWaterMicroUsd
+    && merged.markupBps === stored.markupBps
+    && merged.spendBasis === stored.spendBasis
+  ) {
+    return null;
+  }
+  return [merged, ...current.filter((entry) => entry.month !== seen.month)].slice(0, PAYG_ADMITTED_MONTHS_KEPT);
+}
+
+/**
+ * The month-scoped PAYG state for `month`: its pool high-water mark and opt-in, from the live fields or
+ * the closed-month copies, whichever belongs to that month. Missing for that month = undefined.
+ */
+export function paygMonthState(
+  account: Pick<PaygOverageSettings, 'poolHighWater' | 'poolHighWaterClosed' | 'optIn' | 'optInClosed'> | null | undefined,
+  month: string,
+): { poolHighWater: PaygOverageSettings['poolHighWater']; optIn: PaygOverageSettings['optIn'] } {
+  const pick = <T extends { month: string }>(...candidates: Array<T | undefined>) =>
+    candidates.find((candidate) => candidate?.month === month);
+  return {
+    poolHighWater: pick(account?.poolHighWater, account?.poolHighWaterClosed),
+    optIn: pick(account?.optIn, account?.optInClosed),
+  };
 }
 
 export interface PaygAdmission {
@@ -171,6 +336,61 @@ export function paygEffectiveBaselineMicroUsd(input: {
 }
 
 /**
+ * Overage since opting in (gross overage above the month's pool, less the opt-in baseline that still
+ * applies), or NaN when an input is unreadable. The one definition the gates admit against and
+ * settlement bills from (`paygSettlement.ts`), so the two cannot disagree for the same inputs.
+ */
+export function paygNetOverageMicroUsd(input: {
+  optIn: PaygOverageSettings['optIn'] | null | undefined;
+  poolHighWater: PaygOverageSettings['poolHighWater'] | null | undefined;
+  costUsedMicroUsd: number;
+  /** From `paygOverageThresholdMicroUsd`: the month's pool. */
+  overageThresholdMicroUsd: number;
+  /** UTC `YYYY-MM`; the opt-in baseline applies only in its own month. */
+  month: string;
+}): number {
+  if (!Number.isFinite(input.costUsedMicroUsd) || !Number.isFinite(input.overageThresholdMicroUsd)) return Number.NaN;
+  const baseline = paygEffectiveBaselineMicroUsd({
+    optIn: input.optIn,
+    poolHighWater: input.poolHighWater,
+    month: input.month,
+    poolMicroUsd: input.overageThresholdMicroUsd,
+  });
+  if (!Number.isFinite(baseline)) return Number.NaN;
+  return Math.max(0, paygGrossOverageMicroUsd(input.costUsedMicroUsd, input.overageThresholdMicroUsd) - baseline);
+}
+
+/**
+ * The gate's measurement: overage since opting in, the cap, and the pool both are measured on. Null
+ * when it cannot be measured (unreadable spend, pool or stored baseline, no cap) — the gate then keeps
+ * the 429.
+ */
+export function measurePaygOverage(input: {
+  capPercentOfPool: unknown;
+  optIn: PaygOverageSettings['optIn'] | null | undefined;
+  poolHighWater: PaygOverageSettings['poolHighWater'] | null | undefined;
+  costUsedMicroUsd: number;
+  /** From `paygOverageThresholdMicroUsd`: the month's pool, which overage AND the cap are measured on. */
+  overageThresholdMicroUsd: number;
+  /** UTC `YYYY-MM`; the opt-in baseline applies only in its own month. */
+  month: string;
+}): PaygOverageStatus | null {
+  if (!isPaygCapPercent(input.capPercentOfPool)) return null;
+  if (!Number.isFinite(input.costUsedMicroUsd) || !Number.isFinite(input.overageThresholdMicroUsd)) return null;
+
+  const capMicroUsd = paygCapMicroUsd(input.capPercentOfPool, input.overageThresholdMicroUsd);
+  if (capMicroUsd <= 0) return null;
+  const overageMicroUsd = paygNetOverageMicroUsd(input);
+  if (!Number.isFinite(overageMicroUsd)) return null;
+  return {
+    overageMicroUsd,
+    capMicroUsd,
+    poolMicroUsd: Math.round(input.overageThresholdMicroUsd),
+    percentOfCap: Math.floor((overageMicroUsd / capMicroUsd) * 100),
+  };
+}
+
+/**
  * Admit a turn past the plan pool, or keep the 429.
  *
  * Acts ONLY on `hard_threshold_reached`; every other decision is returned as-is, so with the switch
@@ -180,7 +400,7 @@ export function paygEffectiveBaselineMicroUsd(input: {
  *   - the tier allows PAYG (`allowed === true`);
  *   - the billing owner opted in (`enabled === true`) and is not suspended;
  *   - a payment method is on file (cached flag, `=== true`);
- *   - the subscription is active or trialing;
+ *   - the subscription is active, trialing, or canceling at the period end (`paygSubscriptionCovers`);
  *   - overage since opting in is still below `capPercentOfPool` of the month's pool.
  */
 export function evaluatePaygAdmission(input: {
@@ -202,38 +422,28 @@ export function evaluatePaygAdmission(input: {
   if (input.tier?.allowed !== true) return keep;
   const account = input.account;
   if (account?.enabled !== true) return keep;
-  if (!isPaygCapPercent(account.capPercentOfPool)) return keep;
-  if (!Number.isFinite(input.costUsedMicroUsd) || !Number.isFinite(input.overageThresholdMicroUsd)) return keep;
 
-  const capMicroUsd = paygCapMicroUsd(account.capPercentOfPool, input.overageThresholdMicroUsd);
-  if (capMicroUsd <= 0) return keep;
-  const baseline = paygEffectiveBaselineMicroUsd({
+  const overage = measurePaygOverage({
+    capPercentOfPool: account.capPercentOfPool,
     optIn: account.optIn,
     poolHighWater: account.poolHighWater,
+    costUsedMicroUsd: input.costUsedMicroUsd,
+    overageThresholdMicroUsd: input.overageThresholdMicroUsd,
     month: input.month,
-    poolMicroUsd: input.overageThresholdMicroUsd,
   });
-  if (!Number.isFinite(baseline)) return keep;
+  if (!overage) return keep;
 
-  const overageMicroUsd = Math.max(
-    0,
-    paygGrossOverageMicroUsd(input.costUsedMicroUsd, input.overageThresholdMicroUsd) - baseline,
-  );
-  const overage: PaygOverageStatus = {
-    overageMicroUsd,
-    capMicroUsd,
-    poolMicroUsd: Math.round(input.overageThresholdMicroUsd),
-    percentOfCap: Math.floor((overageMicroUsd / capMicroUsd) * 100),
-  };
-
-  if (account.suspended) return { ...keep, overage, block: { reason: 'payg_suspended' } };
+  if (account.suspended) {
+    const paygSuspendedReason = paygSuspendedReasonOf(account.suspended);
+    return { ...keep, overage, block: { reason: 'payg_suspended', ...(paygSuspendedReason ? { paygSuspendedReason } : {}) } };
+  }
   if (input.hasPaymentMethod !== true) {
     return { ...keep, overage, block: { reason: 'payg_inactive', paygInactiveReason: 'no_payment_method' } };
   }
-  if (!hasOwnLiveSubscription({ subscription_status: input.subscriptionStatus as string | null | undefined })) {
+  if (!paygSubscriptionCovers(input.subscriptionStatus)) {
     return { ...keep, overage, block: { reason: 'payg_inactive', paygInactiveReason: 'subscription_inactive' } };
   }
-  if (overageMicroUsd >= capMicroUsd) return { ...keep, overage, block: { reason: 'payg_cap_reached' } };
+  if (overage.overageMicroUsd >= overage.capMicroUsd) return { ...keep, overage, block: { reason: 'payg_cap_reached' } };
 
   return {
     decision: { usageMode: 'full_choice', admissionAllowed: true, reason: 'payg_overage' },
@@ -270,7 +480,7 @@ export function validatePaygOverageTierConfig(config: SubscriptionPaygOverageCon
   return errors;
 }
 
-export interface PaygOverageSwitchDeps {
+export interface ExactTrueSwitchDeps {
   getSetting(name: string): Promise<{ settingValue?: unknown } | null>;
   now(): number;
   log(message: string, fields?: Record<string, unknown>): void;
@@ -280,18 +490,24 @@ const CACHE_TTL_MS = 60_000;
 /** After a failed refresh, retry sooner than a full window but not on every request. */
 const ERROR_RETRY_MS = 5_000;
 
-export function createPaygOverageSwitch(deps: PaygOverageSwitchDeps) {
+/**
+ * A cached reader for one exact-'true' AW-Settings switch (the gate's `PAYG_OVERAGE_SETTING`, settlement's
+ * `PAYG_SETTLEMENT_SETTING`): only the exact string 'true' turns it on; absent, anything else, or a
+ * cold-start read failure is off; a read is cached ~60s and a failed refresh keeps the last-known value.
+ */
+export function createExactTrueSwitch(deps: ExactTrueSwitchDeps, settingName: string) {
   let known = false; // last successfully read value; cold start => off
   let validUntil = 0;
   let inFlight: Promise<void> | null = null; // one refresh at a time
 
   async function refresh(now: number): Promise<void> {
     try {
-      const row = await deps.getSetting(PAYG_OVERAGE_SETTING);
+      const row = await deps.getSetting(settingName);
       known = row?.settingValue === 'true';
       validUntil = now + CACHE_TTL_MS;
     } catch (error) {
-      deps.log('PaygOverage: failed to read the PAYG switch; keeping last-known value (off if none)', {
+      deps.log('PaygOverage: failed to read a PAYG switch; keeping last-known value (off if none)', {
+        setting: settingName,
         errorClass: (error as Error)?.name ?? 'Error',
         known,
       });

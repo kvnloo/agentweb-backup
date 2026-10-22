@@ -66,6 +66,9 @@ jest.mock('../services/agentMode/runStore', () => ({
   releaseIdempotency: jest.fn(),
 }));
 jest.mock('../utils/secretsManager', () => ({ getGCSPPrivateKey: jest.fn().mockResolvedValue('k') }));
+// ENG-669: the legacy plan-pin rule reads the source plan's template (storedBindingSource -> legacyPlanPinSource).
+const mockGetWorkPlan = jest.fn();
+jest.mock('../services/workPlanService', () => ({ workPlanService: { getWorkPlan: (...a: unknown[]) => mockGetWorkPlan(...a) } }));
 jest.mock('../controllers/guide', () => ({ getGuide: jest.fn() }));
 jest.mock('../controllers/release', () => ({ getReleases: jest.fn() }));
 jest.mock('../controllers/docsController', () => ({ getUserReleaseNotes: jest.fn() }));
@@ -223,6 +226,45 @@ describe('POST /session/:id/branch', () => {
     const out = await request(app).post(URL).set('Authorization', bearer('owner')).send({ messageIndex: 2, llmModel: 'agentweb-model' });
     expect(out.status).toBe(201);
     expect(mockFake.session(out.body.sessionId)!.llmModel).toBe('agentweb-model');
+  });
+
+  describe('#3607 follow-up 2: a branch inherits who chose the source\'s model', () => {
+    const LEGACY_URL = '/api/agent-mode/session/s-legacy/branch';
+    const seedLegacyPlanSession = (extra: Record<string, unknown> = {}) => {
+      // A plan launched before planAuthor existed; the engine stamped its step pin with no llmModelSource.
+      mockFake.seedSession({
+        sessionId: 's-legacy', userId: 'owner', title: 'Plan', portalType: 'agent', sessionType: 'regular', llmModel: 'claude-step-pin',
+        llmUsagePolicyDecision: { requestedModel: 'claude-step-pin', effectiveModel: 'claude-step-pin', modelSelection: 'honored' },
+        workPlan: { title: 'P', templatePlanId: 't1', createdAt: 'x', updatedAt: 'x', steps: [{ stepCount: 1, title: 'S1', status: 'completed', model: 'claude-step-pin' }] },
+        messageCount: ROWS.length, messages: [], ...extra,
+      });
+      mockFake.seedMessages('s-legacy', ROWS);
+    };
+
+    it('the inherited pin of a LEGACY admin-authored plan stays AgentWeb\'s choice on the branch (system), so it is not refused later', async () => {
+      mockGetWorkPlan.mockResolvedValue({ planId: 't1', visibility: 'system', isBuiltIn: true });
+      seedLegacyPlanSession();
+      const out = await request(app).post(LEGACY_URL).set('Authorization', bearer('owner')).send({ messageIndex: 2 });
+      expect(out.status).toBe(201);
+      expect(mockGetWorkPlan).toHaveBeenCalledWith('t1');
+      expect(mockFake.session(out.body.sessionId)).toMatchObject({ llmModel: 'claude-step-pin', llmModelSource: 'system' });
+    });
+
+    it('a legacy USER plan\'s pin, a recorded source, and an explicit pick keep their own provenance', async () => {
+      mockGetWorkPlan.mockResolvedValue({ planId: 't1', visibility: 'private', isBuiltIn: false });
+      seedLegacyPlanSession();
+      const userPlan = await request(app).post(LEGACY_URL).set('Authorization', bearer('owner')).send({ messageIndex: 2, idempotencyKey: 'a' });
+      expect(mockFake.session(userPlan.body.sessionId)!.llmModelSource).toBe('user');
+
+      mockGetWorkPlan.mockReset();
+      seedLegacyPlanSession({ sessionId: 's-legacy', llmModelSource: 'system' });
+      const recorded = await request(app).post(LEGACY_URL).set('Authorization', bearer('owner')).send({ messageIndex: 2, idempotencyKey: 'b' });
+      expect(mockFake.session(recorded.body.sessionId)!.llmModelSource).toBe('system');
+      expect(mockGetWorkPlan).not.toHaveBeenCalled();
+
+      const picked = await request(app).post(LEGACY_URL).set('Authorization', bearer('owner')).send({ messageIndex: 2, llmModel: 'gpt-5.5', idempotencyKey: 'c' });
+      expect(mockFake.session(picked.body.sessionId)!.llmModelSource).toBe('user');
+    });
   });
 
   it('409 SESSION_BUSY while the source is generating, and that lock is not released by the refused branch', async () => {

@@ -65,7 +65,7 @@ router.get('/payg', authenticateToken, async (req, res) => {
     return res.json(await getPaygOverageView(userId));
   } catch (error) {
     console.error('Error getting pay-as-you-go settings:', error);
-    return res.status(500).json({ error: 'Failed to get pay-as-you-go settings' });
+    return res.status(500).json({ error: 'Failed to get extra usage settings' });
   }
 });
 
@@ -88,7 +88,7 @@ router.put('/payg', authenticateToken, async (req, res) => {
       return res.status(error.status).json({ error: error.code, message: error.message });
     }
     console.error('Error updating pay-as-you-go settings:', error);
-    return res.status(500).json({ error: 'Failed to update pay-as-you-go settings' });
+    return res.status(500).json({ error: 'Failed to update extra usage settings' });
   }
 });
 

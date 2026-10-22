@@ -1,3 +1,4 @@
+import { APIError } from 'openai';
 import { buildAgentRunTrace, type TraceMessageRow } from '../services/agentRunTrace';
 import {
   judgeTaskSuccess,
@@ -10,7 +11,7 @@ import {
 } from '../services/taskSuccessJudge';
 import type { RubricJudgeLlm, RubricJudgeLlmRequest } from '../services/creativeRubricJudge';
 import { defaultGoldenCaseGraders, taskSuccessJudgeGrader } from '../loops/eval/runValidation';
-import { openRouterCallCostUsd, parseTrialArgs, requireReportedCostUsd } from '../scripts/runTaskSuccessJudgeTrial';
+import { createAvoidingRefusingProvider, openRouterCallCostUsd, parseTrialArgs, requireReportedCostUsd } from '../scripts/runTaskSuccessJudgeTrial';
 import type { GoldenCase } from '../loops/eval/goldenSet';
 
 let index = 0;
@@ -165,6 +166,50 @@ describe('judgeTaskSuccess', () => {
     expect(await judgeTaskSuccess({ trace: emailRun() }, { llm })).toMatchObject({ status: 'error', reason: 'LLM call failed: timeout' });
   });
 
+  it('retries a reply the provider ended in an error or left empty, then judges the retry (ENG-2620)', async () => {
+    const replies = [
+      { text: '', finishReason: 'error', usage: { inputTokens: 100, outputTokens: 69 } },
+      { text: '   ', finishReason: 'stop', usage: { inputTokens: 100, outputTokens: 0 } },
+      { text: '{"reason":"The email never went out.","verdict":"fail"}', finishReason: 'stop', usage: { inputTokens: 100, outputTokens: 20 } },
+    ];
+    let calls = 0;
+    const llm: RubricJudgeLlm = { complete: async () => replies[calls++] };
+    expect(await judgeTaskSuccess({ trace: emailRun() }, { llm })).toMatchObject({ status: 'ok', verdict: 'fail' });
+    expect(calls).toBe(3);
+  });
+
+  it('names the provider error, not missing JSON, when every attempt ends in one (ENG-2620)', async () => {
+    let calls = 0;
+    const llm: RubricJudgeLlm = { complete: async () => (calls++, { text: '', finishReason: 'error', usage: { inputTokens: 100, outputTokens: 69 } }) };
+    const result = await judgeTaskSuccess({ trace: emailRun() }, { llm });
+    expect(result).toMatchObject({ status: 'error', reason: 'the provider ended the reply with an error on all 3 attempts' });
+    expect(calls).toBe(3);
+  });
+
+  it('counts each kind of provider failure when the attempts fail differently (ENG-2620)', async () => {
+    const replies = [
+      { text: '', finishReason: 'error' },
+      { text: '', finishReason: 'error' },
+      { text: '', finishReason: 'stop' },
+    ];
+    let calls = 0;
+    const llm: RubricJudgeLlm = { complete: async () => replies[calls++] };
+    expect(await judgeTaskSuccess({ trace: emailRun() }, { llm })).toMatchObject({
+      status: 'error',
+      reason: 'the provider failed on all 3 attempts: 2 ended the reply with an error, 1 returned an empty reply',
+    });
+  });
+
+  it('does not retry an unparseable reply that finished normally, or a call that throws (ENG-2620)', async () => {
+    let calls = 0;
+    const prose: RubricJudgeLlm = { complete: async () => (calls++, { text: 'I cannot decide.', finishReason: 'stop' }) };
+    expect(await judgeTaskSuccess({ trace: emailRun() }, { llm: prose })).toMatchObject({ status: 'error', reason: 'no JSON object with a verdict in the judge output' });
+    expect(calls).toBe(1);
+    const throwing: RubricJudgeLlm = { complete: async () => { calls++; throw new Error('400 Provider returned error'); } };
+    await judgeTaskSuccess({ trace: emailRun() }, { llm: throwing });
+    expect(calls).toBe(2);
+  });
+
   it('refuses any judge that is not a registered Claude model', async () => {
     const llm = fakeLlm('{"reason":"x","verdict":"pass"}');
     for (const model of ['gemini-3.8-flash', 'google/gemini-3.5-flash', 'openai/gpt-5.2', 'gpt-5-chat-2', 'deepseek/deepseek-v4', 'not-a-model']) {
@@ -207,6 +252,52 @@ describe('labelTaskSuccess', () => {
     expect(taskSuccessModelProblem('gpt-5.4', 'judge')).toMatch(/not a registered Claude model/);
     expect(taskSuccessModelProblem('gpt-5.4', 'labeller')).toBeUndefined();
     expect(taskSuccessModelProblem('openai/gpt-5.2', 'labeller')).toMatch(/registered model outside/);
+  });
+});
+
+describe('createAvoidingRefusingProvider', () => {
+  // Built by the SDK itself, so the tests hold the code to the error shape OpenRouter really produces.
+  const sdkError = (status: number, provider?: string) =>
+    APIError.generate(status, { error: { message: 'Provider returned error', ...(provider !== undefined ? { metadata: { provider_name: provider } } : {}) } }, undefined, {});
+
+  it('retries a call one provider refuses with a 400 on the others, once (ENG-2625)', async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const create = async (body: Record<string, unknown>) => {
+      bodies.push(body);
+      if (bodies.length === 1) throw sdkError(400, 'Azure');
+      return { choices: [] };
+    };
+    expect(await createAvoidingRefusingProvider(create, { model: 'openai/gpt-5.4' })).toEqual({ choices: [] });
+    expect(bodies).toEqual([{ model: 'openai/gpt-5.4' }, { model: 'openai/gpt-5.4', provider: { ignore: ['Azure'] } }]);
+  });
+
+  it('keeps the provider preferences already in the body when it retries (ENG-2625)', async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const create = async (body: Record<string, unknown>) => {
+      bodies.push(body);
+      if (bodies.length === 1) throw sdkError(400, 'Azure');
+      return 'ok';
+    };
+    await createAvoidingRefusingProvider(create, { provider: { ignore: ['Google'], require_parameters: true } });
+    expect(bodies[1]).toEqual({ provider: { ignore: ['Google', 'Azure'], require_parameters: true } });
+  });
+
+  it('passes on any other failure without another call (ENG-2625)', async () => {
+    for (const err of [sdkError(400), sdkError(400, ''), sdkError(500, 'Azure'), new Error('timeout')]) {
+      let calls = 0;
+      await expect(createAvoidingRefusingProvider(async () => { calls++; throw err; }, {})).rejects.toBe(err);
+      expect(calls).toBe(1);
+    }
+  });
+
+  it("passes on the retry's own failure, keeping the refusal that caused the retry (ENG-2625)", async () => {
+    const refusal = sdkError(400, 'Azure');
+    const second = sdkError(400, 'OpenAI');
+    let calls = 0;
+    const thrown = await createAvoidingRefusingProvider(async () => { calls++; throw calls === 1 ? refusal : second; }, {}).catch((err: unknown) => err);
+    expect(thrown).toBe(second);
+    expect((thrown as { cause?: unknown }).cause).toBe(refusal);
+    expect(calls).toBe(2);
   });
 });
 
