@@ -402,7 +402,8 @@ Order of setup, which the tool text also teaches Emma:
 
 Cost bound through these tools: 2 purchases at the card's $1.15 plus 5
 verification calls at $0.014 is about $2.37 per org per day at the provisional
-rates. The first month's rent is metered at purchase; later months by the daily rent sweep.
+rates. The first month's rent is metered at purchase; later months by the daily
+rent sweep.
 
 General availability precondition: a human-approval gate (a deck-of-one approval
 per purchase or release, like `services/crmSequenceActivationGate.ts`) is NOT
@@ -683,7 +684,7 @@ Rules the code enforces:
   There is no backfill: months before the sweep was enabled are not recorded.
   The recorder returns nothing, so the sweep cannot see a lost write; the next
   daily run retries it, and the recorder's dropped-write alert reports it. The
-  sweep logs one line with counts (`[hotLeadCall] number rent sweep completed`:
+  sweep logs one line with counts (`[hotLeadCall] number rent sweep completed` at info, or `... completed with skipped or failed orgs` at error level when anything was skipped or failed:
   orgs scanned, numbers found, metered, skipped without an owner, with an invalid
   sid or without a rate-card unit, failed), never a phone number.
   **Kill switch:** set the environment variable `HOT_LEAD_CALL_RENT_METERING` to

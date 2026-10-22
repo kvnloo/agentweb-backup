@@ -150,11 +150,12 @@ describe('runNumberRentSweep', () => {
     expect(lines.filter(l => l.includes('org ok'))).toEqual([]);
     expect(lines.join('\n')).not.toMatch(/\+1415/);
   });
-  it('logs an org skipped for a missing rate-card unit', async () => {
+  it('logs an org skipped for a missing rate-card unit exactly once', async () => {
     jest.spyOn(rateCard, 'getRecordingUnit').mockReturnValue(null as never);
     listAll.mockResolvedValue([org('o1', SID_A)]);
     await runNumberRentSweep(NOW);
-    expect((console.error as unknown as jest.Mock).mock.calls.map(c => c.join(' '))).toContainEqual(expect.stringMatching(/org o1.*rate card/));
+    const lines = (console.error as unknown as jest.Mock).mock.calls.map(c => c.join(' '));
+    expect(lines.filter(l => l.includes('rate card'))).toHaveLength(1);
   });
   it('keeps going when one org fails', async () => {
     listAll.mockResolvedValue([org('o1', SID_A), org('o2', SID_B), org('o3', SID_C)]);
@@ -192,21 +193,26 @@ describe('runNumberRentSweep', () => {
   });
 });
 
-describe('runNumberRentSweep over the real recorder', () => {
-  /** The spend-event table as DynamoDB keeps it: one row per (billingUserId, eventId). */
+/** Installs the spend-event table as DynamoDB keeps it, one row per (billingUserId, eventId), and resets shared state. */
+function useFakeSpendStore(): Map<string, Record<string, unknown>> {
   const events = new Map<string, Record<string, unknown>>();
+  jest.restoreAllMocks();
+  delete process.env[ENV];
+  resetDroppedWriteState();
+  setDroppedWriteAlertSink(() => {});
+  mockTxn.mockImplementation(async (_inc: unknown, ev: { billingUserId: string; eventId: string }) => {
+    const k = `${ev.billingUserId}|${ev.eventId}`;
+    if (events.has(k)) return 'duplicate';
+    events.set(k, ev as unknown as Record<string, unknown>);
+    return 'applied';
+  });
+  return events;
+}
+
+describe('runNumberRentSweep over the real recorder', () => {
+  let events: Map<string, Record<string, unknown>>;
   beforeEach(() => {
-    jest.restoreAllMocks();
-    delete process.env[ENV];
-    events.clear();
-    resetDroppedWriteState();
-    setDroppedWriteAlertSink(() => {});
-    mockTxn.mockImplementation(async (_inc: unknown, ev: { billingUserId: string; eventId: string }) => {
-      const k = `${ev.billingUserId}|${ev.eventId}`;
-      if (events.has(k)) return 'duplicate';
-      events.set(k, ev as unknown as Record<string, unknown>);
-      return 'applied';
-    });
+    events = useFakeSpendStore();
     jest.spyOn(orgDb, 'listAll').mockResolvedValue([org('o1', SID_A)]);
   });
   afterEach(() => { jest.useRealTimers(); jest.restoreAllMocks(); });
@@ -271,7 +277,7 @@ describe('runNumberRentCron summary level', () => {
 });
 
 describe('rent of a purchase and of the sweep land on the owner, whoever bought', () => {
-  const events = new Map<string, Record<string, unknown>>();
+  let events: Map<string, Record<string, unknown>>;
   const buy = (owner: string | undefined, buyer: string) => {
     const fake = new FakeVoiceProvider();
     fake.queueBuyNumberResult({ numberSid: SID_A, phoneNumber: '+14155550123' });
@@ -280,17 +286,7 @@ describe('rent of a purchase and of the sweep land on the owner, whoever bought'
     return provisionNumber({ org: { orgId: 'o1', ownerUserId: owner, hotLeadCall: config } as unknown as Organization, config: config as never, userId: buyer });
   };
   beforeEach(() => {
-    jest.restoreAllMocks();
-    delete process.env[ENV];
-    events.clear();
-    resetDroppedWriteState();
-    setDroppedWriteAlertSink(() => {});
-    mockTxn.mockImplementation(async (_inc: unknown, ev: { billingUserId: string; eventId: string }) => {
-      const k = `${ev.billingUserId}|${ev.eventId}`;
-      if (events.has(k)) return 'duplicate';
-      events.set(k, ev as unknown as Record<string, unknown>);
-      return 'applied';
-    });
+    events = useFakeSpendStore();
     jest.spyOn(orgDb, 'updateOrg').mockResolvedValue(undefined as never);
     jest.spyOn(console, 'error').mockImplementation(() => {});
     setNow('2026-10-22T09:00:00Z');
