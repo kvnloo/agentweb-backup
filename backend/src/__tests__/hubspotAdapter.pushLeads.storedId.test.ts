@@ -210,6 +210,63 @@ describe('HubspotAdapter batched push — stored contact id wins over email (ENG
     });
   });
 
+  // ENG-2635. A real HubSpot answers a batch update for a MERGED-AWAY contact id with HTTP 200 and an
+  // empty `results` array — no error, nothing updated. That must not read as "updated".
+  describe('a stored contact id HubSpot silently ignores (merged away: 200, id missing from results)', () => {
+    /** batchUpdateContacts that only echoes the ids in `live`, like the real endpoint. */
+    const echoOnly = (live: string[]) =>
+      mockBatchUpdateContacts.mockImplementation(async (batch: any[]) => batch.map((b) => b.id).filter((id) => live.includes(id)));
+
+    it('REPRODUCTION: falls back to upsert-by-email and stores the id HubSpot returns, instead of reporting synced', async () => {
+      echoOnly([]);
+      const result = await adapter.pushLeads(auth, [lead('l1', 'merged@example.com', 'MERGED')], makeConfig());
+
+      expect(mockBatchUpsertContacts.mock.calls[0][0].map((i: any) => i.email)).toEqual(['merged@example.com']);
+      expect(persistedMeta('l1').hubspot_contact_id).toBe('new_merged@example.com');
+      expect(result).toMatchObject({ successCount: 1, newCount: 1, updatedCount: 0, errorCount: 0 });
+    });
+
+    it('in a mixed batch only the ignored id falls back; the confirmed ones stay updated in place', async () => {
+      echoOnly(['OK1', 'OK3']);
+      const leads = [lead('l1', 'ok1@example.com', 'OK1'), lead('l2', 'merged@example.com', 'MERGED'), lead('l3', 'ok3@example.com', 'OK3')];
+      const result = await adapter.pushLeads(auth, leads, makeConfig());
+
+      expect(persistedMeta('l1').hubspot_contact_id).toBe('OK1');
+      expect(persistedMeta('l3').hubspot_contact_id).toBe('OK3');
+      expect(mockBatchUpsertContacts.mock.calls[0][0].map((i: any) => i.email)).toEqual(['merged@example.com']);
+      expect(persistedMeta('l2').hubspot_contact_id).toBe('new_merged@example.com');
+      expect(result).toMatchObject({ successCount: 3, updatedCount: 2, newCount: 1, errorCount: 0 });
+    });
+
+    it('control: every id echoed => no upsert, all updated in place', async () => {
+      echoOnly(['A', 'B']);
+      const result = await adapter.pushLeads(auth, [lead('l1', 'a@example.com', 'A'), lead('l2', 'b@example.com', 'B')], makeConfig());
+
+      expect(mockBatchUpsertContacts).not.toHaveBeenCalled();
+      expect(result).toMatchObject({ successCount: 2, updatedCount: 2, newCount: 0, errorCount: 0 });
+    });
+
+    it('a response that carries no results array (undefined) is not treated as ignored', async () => {
+      mockBatchUpdateContacts.mockResolvedValue(undefined);
+      const result = await adapter.pushLeads(auth, [lead('l1', 'a@example.com', 'A')], makeConfig());
+
+      expect(mockBatchUpsertContacts).not.toHaveBeenCalled();
+      expect(persistedMeta('l1').hubspot_contact_id).toBe('A');
+      expect(result).toMatchObject({ successCount: 1, updatedCount: 1, errorCount: 0 });
+    });
+
+    it('two leads sharing one ignored id and one email collapse to ONE upsert input', async () => {
+      echoOnly([]);
+      const result = await adapter.pushLeads(
+        auth, [lead('l1', 'same@example.com', 'MERGED'), lead('l2', 'same@example.com', 'MERGED')], makeConfig());
+
+      expect(mockBatchUpsertContacts.mock.calls[0][0]).toHaveLength(1);
+      expect(persistedMeta('l1').hubspot_contact_id).toBe('new_same@example.com');
+      expect(persistedMeta('l2').hubspot_contact_id).toBe('new_same@example.com');
+      expect(result).toMatchObject({ successCount: 2, errorCount: 0 });
+    });
+  });
+
   describe('failures that are NOT "gone" fail closed — error, stored id kept, nothing created', () => {
     it.each([
       ['409 email collision', httpErr(409, { category: 'CONFLICT' })],
