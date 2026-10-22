@@ -114,6 +114,7 @@ jest.mock('../services/tokenUsageService', () => ({
     allowed: true, warning: false, used: 0, allowance: 1000000,
     bonus: 0, effectiveAllowance: 1000000, percentUsed: 0, month: '2026-07',
   })),
+  deriveBlockedByCost: jest.fn(() => ({ blockedByCost: false })),
 }));
 
 jest.mock('../utils/agentModeAlerts', () => ({
@@ -158,6 +159,7 @@ import { getEffectiveLlmUsagePolicy } from '../services/llmUsagePolicyResolverSe
 import { computeScheduleRunHealth, didSourcingBlockStateChange, runScheduledChat } from '../controllers/agentModeController';
 import { emailService } from '../services/emailService';
 import { modelAccess } from '../services/agentMode/modelAccessInstance';
+import { checkTokenUsage } from '../services/tokenUsageService';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
@@ -265,7 +267,7 @@ describe('switch on: the block is recorded and the owner is told once', () => {
 
     expect(mockFailedEmail).toHaveBeenCalledTimes(1);
     expect(mockFailedEmail).toHaveBeenCalledWith(['o@example.com'], 'FL Schedule', 'sched-fl', {
-      failureClass: 'model_unavailable', modelLabel: 'GPT-5.5', reason: 'not_in_plan',
+      failureClass: 'model_unavailable', modelLabel: 'GPT-5.5', reason: 'not_in_plan', upgradeRequired: ['Pro'],
     });
     expect(mockAlert).not.toHaveBeenCalled();
     expectNothingRan();
@@ -302,7 +304,7 @@ describe('switch on: the block is recorded and the owner is told once', () => {
     await fire('run-p-2', { llmModel: 'internal-judge-1' });
     await fire('run-p-3');
     expect(mockFailedEmail).toHaveBeenCalledTimes(2);
-    expect(mockFailedEmail.mock.calls[1][3]).toEqual({ failureClass: 'model_unavailable', modelLabel: 'internal-judge-1', reason: 'not_selectable' });
+    expect(mockFailedEmail.mock.calls[1][3]).toEqual({ failureClass: 'model_unavailable', modelLabel: 'internal-judge-1', reason: 'not_selectable', upgradeRequired: [] });
     expect(history[1]).toMatchObject({ blockedReason: 'not_selectable', blockedModel: 'internal-judge-1' });
   });
 
@@ -311,7 +313,7 @@ describe('switch on: the block is recorded and the owner is told once', () => {
     const result = await fire('run-ns-1');
     expect(result).toMatchObject({ blockedBy: 'model_unavailable', blockedReason: 'not_served', blockedModel: 'retired-model-9' });
     expect(mockFailedEmail).toHaveBeenCalledWith(['o@example.com'], 'FL Schedule', 'sched-fl', {
-      failureClass: 'model_unavailable', modelLabel: 'retired-model-9', reason: 'not_served',
+      failureClass: 'model_unavailable', modelLabel: 'retired-model-9', reason: 'not_served', upgradeRequired: [],
     });
     expect(mockAlert).toHaveBeenCalledTimes(1);
     expect(mockAlert.mock.calls[0][0].subject).toBe('AgentMode: unsupported model pinned on a scheduled chat');
@@ -322,6 +324,55 @@ describe('switch on: the block is recorded and the owner is told once', () => {
     const result = await fire('run-t-1', {}, true);
     expect(result.blockedBy).toBe('model_unavailable');
     expect(mockFailedEmail).not.toHaveBeenCalled();
+  });
+
+  it('#3676 follow-up 3: a TEST run as the first blocked run does not silence the next cron run\'s email', async () => {
+    useStoredSchedule({ ...baseSchedule, llmModel: 'gpt-5.5' });
+    await fire('run-tc-1', {}, true);
+    expect(history[0]).toMatchObject({ blockedBy: 'model_unavailable', testRun: true });
+    expect(mockFailedEmail).not.toHaveBeenCalled();
+    await fire('run-tc-2');
+    expect(mockFailedEmail).toHaveBeenCalledTimes(1);
+    // ...and only that once: the cron block is the episode now, a later Test click does not restart it.
+    await fire('run-tc-3', {}, true);
+    await fire('run-tc-4');
+    expect(mockFailedEmail).toHaveBeenCalledTimes(1);
+    expect(history[1]).not.toHaveProperty('testRun');
+  });
+
+  it('#3676 follow-up 1: blocked, then the usage limit, then blocked again is ONE email', async () => {
+    useStoredSchedule({ ...baseSchedule, llmModel: 'gpt-5.5' });
+    await fire('run-u-1');
+    (checkTokenUsage as jest.Mock).mockResolvedValueOnce({
+      allowed: false, warning: true, used: 100, allowance: 100, bonus: 0, effectiveAllowance: 100, percentUsed: 100, month: '2026-07',
+    });
+    const limited = await fire('run-u-2');
+    expect(limited).toMatchObject({ status: 'failure', endedBeforeModelCheck: true });
+    expect(limited.blockedBy).toBeUndefined();
+    await fire('run-u-3');
+    expect(history).toHaveLength(3);
+    expect(mockFailedEmail).toHaveBeenCalledTimes(1);
+  });
+
+  it('#3676 follow-up 4: the email goes out only once the blocked run is saved, so a failing save never re-emails', async () => {
+    useStoredSchedule({ ...baseSchedule, llmModel: 'gpt-5.5' });
+    mockScheduleDb.addRunResult.mockRejectedValue(new Error('dynamo down'));
+    for (let i = 0; i < 3; i++) await fire(`run-s-${i}`);
+    expect(mockFailedEmail).not.toHaveBeenCalled();
+    // The save recovers: this run is the first block on record, so it (and only it) emails.
+    mockScheduleDb.addRunResult.mockImplementation(async (_id: string, result: any) => { history.push(result); return undefined as any; });
+    await fire('run-s-3');
+    await fire('run-s-4');
+    expect(mockFailedEmail).toHaveBeenCalledTimes(1);
+  });
+
+  it('#3676 follow-up 5: no tier includes the model: upgradeRequired is empty and the run result does not suggest upgrading', async () => {
+    mockSettings.subscription_types = JSON.stringify([{ name: 'Free', allowedModels: ['legacy-target'] }, { name: 'Pro', allowedModels: ['legacy-target'] }]);
+    useStoredSchedule({ ...baseSchedule, llmModel: 'gpt-5.5' });
+    const result = await fire('run-ur-1');
+    expect(result.blockedReason).toBe('not_in_plan');
+    expect(result.actualResponse).not.toMatch(/upgrade/i);
+    expect(mockFailedEmail.mock.calls[0][3]).toMatchObject({ reason: 'not_in_plan', upgradeRequired: [] });
   });
 
   it("follows the schedule's recipients: its notification list, and nobody when the owner opted out", async () => {

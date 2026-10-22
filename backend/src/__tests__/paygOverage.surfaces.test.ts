@@ -185,7 +185,7 @@ describe('scheduled-chat block text', () => {
   });
 
   it.each([
-    [{ reason: 'payg_cap_reached' }, /pay-as-you-go limit/],
+    [{ reason: 'payg_cap_reached' }, /extra usage limit/],
     [{ reason: 'payg_suspended' }, /on hold/],
     [{ reason: 'payg_inactive', paygInactiveReason: 'no_payment_method' }, /payment method/],
     [{ reason: 'payg_inactive', paygInactiveReason: 'subscription_inactive' }, /subscription/],

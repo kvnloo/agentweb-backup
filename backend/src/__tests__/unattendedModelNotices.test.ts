@@ -9,8 +9,10 @@ import { emailService } from '../services/emailService';
 import { ModelUnavailableError } from '../services/agentMode/modelUnavailable';
 import { buildScheduleModelNotice, buildWorkPlanStepModelNotice, PRICING_PATH, SCHEDULES_PATH } from '../utils/unattendedModelNoticeCopy';
 import {
+  ENDED_BEFORE_MODEL_CHECK_FLAG,
   isNewScheduleModelBlock,
   isUnattendedPause,
+  SCHEDULE_TEST_RUN_FLAG,
   scheduleModelBlockFields,
   wasStepModelNoticeSent,
 } from '../utils/unattendedModelNotices';
@@ -53,6 +55,27 @@ describe('isNewScheduleModelBlock: email once per change into the state', () => 
     const history = [blockedRun('a'), { status: 'skipped_account_disconnected' }, { status: 'skipped_send_capacity_exhausted' }];
     expect(isNewScheduleModelBlock(history, block('a'))).toBe(false);
     expect(isNewScheduleModelBlock([{ status: 'skipped_account_disconnected' }], block('a'))).toBe(true);
+  });
+
+  it('#3676 follow-up 1: a failure written BEFORE the model check (usage limit, disallowed function, ...) neither continues nor ends the state', () => {
+    const limit = { status: 'failure', actualResponse: 'Monthly usage limit reached', [ENDED_BEFORE_MODEL_CHECK_FLAG]: true };
+    // blocked -> limit -> blocked is ONE episode: no second email.
+    expect(isNewScheduleModelBlock([blockedRun('a'), limit], block('a'))).toBe(false);
+    expect(isNewScheduleModelBlock([blockedRun('a'), limit, limit], block('a'))).toBe(false);
+    // ...and it does not start one either.
+    expect(isNewScheduleModelBlock([limit], block('a'))).toBe(true);
+    // An ordinary failure that got past the model still ends it.
+    expect(isNewScheduleModelBlock([blockedRun('a'), { status: 'failure' }], block('a'))).toBe(true);
+  });
+
+  it('#3676 follow-up 3: a Test run\'s block (never emailed) does not count as the block the owner was told about', () => {
+    const testBlock = { ...blockedRun('a'), [SCHEDULE_TEST_RUN_FLAG]: true };
+    expect(isNewScheduleModelBlock([testBlock], block('a'))).toBe(true);
+    expect(isNewScheduleModelBlock([{ status: 'success' }, testBlock], block('a'))).toBe(true);
+    // A cron block already emailed stays the episode through a later Test click.
+    expect(isNewScheduleModelBlock([blockedRun('a'), testBlock], block('a'))).toBe(false);
+    // A Test run that got past the model is an ordinary run.
+    expect(isNewScheduleModelBlock([blockedRun('a'), { status: 'success', [SCHEDULE_TEST_RUN_FLAG]: true }], block('a'))).toBe(true);
   });
 
   it('a LinkedIn sourcing block is not a model block', () => {
@@ -105,8 +128,8 @@ describe('notice copy', () => {
 
   it.each(['not_in_plan', 'not_served', 'not_selectable'] as const)('names no price or amount (%s)', (reason) => {
     for (const notice of [
-      buildScheduleModelNotice({ scheduleName: 'Weekly report', modelLabel: 'GPT-5.5', reason }),
-      buildWorkPlanStepModelNotice({ stepCount: 2, modelLabel: 'GPT-5.5', reason, sessionId: 's-1', scheduleName: 'Weekly report' }),
+      buildScheduleModelNotice({ scheduleName: 'Weekly report', modelLabel: 'GPT-5.5', reason, upgradeRequired: ['Pro'] }),
+      buildWorkPlanStepModelNotice({ stepCount: 2, modelLabel: 'GPT-5.5', reason, sessionId: 's-1', scheduleName: 'Weekly report', upgradeRequired: ['Pro'] }),
     ]) {
       const text = allText(notice);
       expect(text).not.toMatch(/[$€£]|\bUSD\b|\bper month\b|\/mo\b/i);
@@ -114,7 +137,7 @@ describe('notice copy', () => {
   });
 
   it('schedule, not in plan: names the schedule and model, says it is not in the plan, links the schedule and pricing', () => {
-    const notice = buildScheduleModelNotice({ scheduleName: 'Weekly report', modelLabel: 'GPT-5.5', reason: 'not_in_plan' });
+    const notice = buildScheduleModelNotice({ scheduleName: 'Weekly report', modelLabel: 'GPT-5.5', reason: 'not_in_plan', upgradeRequired: ['Pro'] });
     const text = allText(notice);
     expect(notice.subject).toContain('Weekly report');
     expect(text).toContain('Your scheduled chat "Weekly report" is set to run on GPT-5.5, which isn\'t included in your current plan.');
@@ -133,9 +156,37 @@ describe('notice copy', () => {
     expect(notice.subject).toBe('⚠️ Your scheduled chat "Weekly report" didn\'t run: its model is no longer available');
   });
 
+  it('#3676 follow-up 5: not in plan, but NO plan includes the model (upgradeRequired empty or absent): no upgrade advice, no "Compare plans"', () => {
+    for (const upgradeRequired of [[], undefined]) {
+      const schedule = buildScheduleModelNotice({ scheduleName: 'Weekly report', modelLabel: 'GPT-5.5', reason: 'not_in_plan', upgradeRequired });
+      const step = buildWorkPlanStepModelNotice({ stepCount: 2, modelLabel: 'GPT-5.5', reason: 'not_in_plan', sessionId: 's-1', sessionTitle: 'Research', upgradeRequired });
+      for (const notice of [schedule, step]) {
+        expect(allText(notice)).toContain("isn't included in your current plan");
+        expect(allText(notice)).toContain('choose a model your plan includes');
+        expect(allText(notice).toLowerCase()).not.toContain('upgrade');
+        expect(notice.actions.map((a) => a.path)).not.toContain(PRICING_PATH);
+      }
+    }
+  });
+
+  it('#3676 follow-up 6: with no schedule to name, a scheduled run\'s "Scheduled: " / "Test: " title prefix is not the chat\'s name', () => {
+    const scheduled = buildWorkPlanStepModelNotice({ stepCount: 2, modelLabel: 'M', reason: 'not_served', sessionId: 's-1', sessionTitle: 'Scheduled: Weekly report' });
+    expect(scheduled.subject).toBe('⚠️ Your work plan "Weekly report" paused: a step\'s model is no longer available');
+    expect(scheduled.subheading).toBe('Weekly report');
+    expect(scheduled.paragraphs[0]).toContain('in your chat "Weekly report"');
+    expect(buildWorkPlanStepModelNotice({ stepCount: 2, modelLabel: 'M', reason: 'not_served', sessionId: 's-1', sessionTitle: 'Test: Weekly report' }).subject)
+      .toBe('⚠️ Your work plan "Weekly report" paused: a step\'s model is no longer available');
+    // Nothing left after the prefix: the plain fallback, never `""`.
+    expect(buildWorkPlanStepModelNotice({ stepCount: 2, modelLabel: 'M', reason: 'not_served', sessionId: 's-1', sessionTitle: 'Scheduled: ' }).subject)
+      .toBe('⚠️ Your work plan paused: a step\'s model is no longer available');
+    // A title that merely contains the word keeps it.
+    expect(buildWorkPlanStepModelNotice({ stepCount: 2, modelLabel: 'M', reason: 'not_served', sessionId: 's-1', sessionTitle: 'Scheduled posts review' }).subheading)
+      .toBe('Scheduled posts review');
+  });
+
   it('work plan step: names the step, model and schedule (or the chat), links the chat', () => {
     const forSchedule = buildWorkPlanStepModelNotice({
-      stepCount: 3, modelLabel: 'GPT-5.5', reason: 'not_in_plan', sessionId: 's/1', scheduleName: 'Weekly report', sessionTitle: 'Scheduled: Weekly report',
+      stepCount: 3, modelLabel: 'GPT-5.5', reason: 'not_in_plan', sessionId: 's/1', scheduleName: 'Weekly report', sessionTitle: 'Scheduled: Weekly report', upgradeRequired: ['Pro'],
     });
     expect(forSchedule.paragraphs[0]).toBe(
       'Step 3 of the work plan in a run of your scheduled chat "Weekly report" uses GPT-5.5, which isn\'t included in your current plan. The plan paused at that step, and nothing was sent to a different model.',
@@ -177,7 +228,7 @@ describe('emailService: the model_unavailable failure class', () => {
   it('sends the model notice, not the keeps-failing / contact-support email', async () => {
     const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
     await emailService.sendScheduledRunFailedEmail(['owner@example.com'], 'Weekly report', 'sched-1', {
-      failureClass: 'model_unavailable', modelLabel: 'GPT-5.5', reason: 'not_in_plan',
+      failureClass: 'model_unavailable', modelLabel: 'GPT-5.5', reason: 'not_in_plan', upgradeRequired: ['Pro'],
     });
     expect(spy).toHaveBeenCalledTimes(1);
     const [recipients, subject, text, html] = spy.mock.calls[0];
@@ -215,6 +266,20 @@ describe('emailService: the model_unavailable failure class', () => {
     await expect(emailService.sendWorkPlanStepModelUnavailableEmail('owner@example.com', {
       sessionId: 'session-1', stepCount: 2, modelLabel: 'GPT-5.5', reason: 'not_in_plan',
     })).resolves.toBeUndefined();
+  });
+
+  it('#3676 follow-up 5: both notices pass upgradeRequired through: empty = no pricing link', async () => {
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+    await emailService.sendScheduledRunFailedEmail(['owner@example.com'], 'Weekly report', 'sched-1', {
+      failureClass: 'model_unavailable', modelLabel: 'GPT-5.5', reason: 'not_in_plan', upgradeRequired: [],
+    });
+    await emailService.sendWorkPlanStepModelUnavailableEmail(['owner@example.com'], {
+      sessionId: 'session-1', stepCount: 2, modelLabel: 'GPT-5.5', reason: 'not_in_plan', sessionTitle: 'Research', upgradeRequired: [],
+    });
+    for (const [, , text, html] of spy.mock.calls) {
+      expect(`${text}\n${html}`).not.toContain('/pricing');
+      expect(`${text}`.toLowerCase()).not.toContain('upgrade');
+    }
   });
 
   it('the existing classes are unchanged', async () => {
