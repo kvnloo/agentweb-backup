@@ -272,6 +272,9 @@ export interface PaygChargeRef {
   payment_intent?: string | { id?: string } | null;
 }
 
+/** Pages of invoice payments read for one PaymentIntent (10 each) before giving up on finding its invoice. */
+const PAYG_INVOICE_PAYMENT_PAGES = 5;
+
 /** An empty overage draft at least this old has no run in flight behind it (runs take seconds). */
 const PAYG_ORPHAN_DRAFT_AGE_SECONDS = 60 * 60;
 
@@ -675,14 +678,21 @@ export const stripeService = {
     const paymentIntent = typeof charge?.payment_intent === 'string' ? charge.payment_intent : charge?.payment_intent?.id;
     if (!paymentIntent) return null;
     const s = getStripeOrThrow();
-    // Every invoice payment of this PaymentIntent, not just the first one listed: the one that was paid
+    // Every invoice payment of this PaymentIntent, not just the first one listed — paged while Stripe
+    // says there are more (bounded: a PaymentIntent pays one invoice in practice): the one that was paid
     // (a refunded or disputed charge was collected) is preferred, then any other.
-    const payments = await s.invoicePayments.list({
-      payment: { type: 'payment_intent', payment_intent: paymentIntent },
-      limit: 10,
-      expand: ['data.invoice'],
-    });
-    const ordered = [...payments.data.filter((p) => p.status === 'paid'), ...payments.data.filter((p) => p.status !== 'paid')];
+    const all: Stripe.InvoicePayment[] = [];
+    for (let page = 0; page < PAYG_INVOICE_PAYMENT_PAGES; page++) {
+      const payments = await s.invoicePayments.list({
+        payment: { type: 'payment_intent', payment_intent: paymentIntent },
+        limit: 10,
+        expand: ['data.invoice'],
+        ...(all.length ? { starting_after: all[all.length - 1].id } : {}),
+      });
+      all.push(...payments.data);
+      if (!payments.has_more || !payments.data.length) break;
+    }
+    const ordered = [...all.filter((p) => p.status === 'paid'), ...all.filter((p) => p.status !== 'paid')];
     for (const payment of ordered) {
       const linked = payment.invoice;
       if (!linked) continue;
@@ -716,6 +726,11 @@ export const stripeService = {
     if (paymentIntent.status === 'requires_action') return 'action_required';
     if (paymentIntent.status === 'succeeded' || paymentIntent.status === 'processing' || paymentIntent.status === 'requires_capture') return 'in_progress';
     return 'declined';
+  },
+
+  /** ENG-668 PR-2: an overage invoice by id, or null when Stripe reports it deleted or unknown. */
+  async retrievePaygOverageInvoice(invoiceId: string): Promise<Stripe.Invoice | null> {
+    return retrieveInvoiceIfExists(getStripeOrThrow(), invoiceId);
   },
 
   /**

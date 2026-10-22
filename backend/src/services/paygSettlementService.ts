@@ -1083,7 +1083,14 @@ async function liftDisputeSuspension(billingUserId: string): Promise<void> {
     try {
       await userDb.updateUser(billingUserId, {}, failed
         ? {
-            pathSets: [{ path: ['paygOverage', 'suspended'], value: { reason: 'payment_failed', at: new Date().toISOString(), invoiceId: failed[1].invoiceId } }],
+            // A month failed because its payment was never confirmed keeps saying so (`unconfirmed`).
+            pathSets: [{
+              path: ['paygOverage', 'suspended'],
+              value: {
+                reason: 'payment_failed', at: new Date().toISOString(), invoiceId: failed[1].invoiceId,
+                ...(failed[1].paymentUnconfirmedAt ? { unconfirmed: true } : {}),
+              },
+            }],
             // ...and only while THAT month is still failed on that invoice: paid or voided after this read,
             // it must not be handed a hold nothing would ever lift (the loop reads again).
             condition: {
@@ -1203,6 +1210,27 @@ async function expireUnconfirmedPayment(billingUserId: string, month: string, no
   if (!user || !record || record.status !== 'invoiced' || !record.invoiceId) return null;
   if (!paygPaymentConfirmationOverdue(record.actionRequiredAt, now)) return null;
   const invoiceId = record.invoiceId;
+  // The invoice first: one voided, paid or marked uncollectible in Stripe (its PaymentIntent then
+  // canceled) before its webhook arrived is settled the way that webhook settles it — never held and
+  // emailed "confirm your payment" for an invoice that cannot be paid any more.
+  const invoice = await stripeService.retrievePaygOverageInvoice(invoiceId);
+  if (!invoice) {
+    console.warn(`${TAG} unconfirmed ${billingUserId} ${month}: invoice ${invoiceId} is deleted or unknown to Stripe; left for on-call`);
+    return null;
+  }
+  if (invoice.status === 'paid') {
+    await handlePaygOverageInvoicePaid(invoice);
+    return null;
+  }
+  if (invoice.status === 'void') {
+    await handlePaygOverageInvoiceVoided(invoice);
+    return null;
+  }
+  if (invoice.status === 'uncollectible') {
+    await handlePaygOverageInvoiceMarkedUncollectible(invoice);
+    return null;
+  }
+  if (invoice.status !== 'open') return null;
   if ((await stripeService.paygOverageInvoicePaymentState(invoiceId)) === 'in_progress') return null;
   const at = now.toISOString();
   const moved = await transitionSettlement(billingUserId, month, ['invoiced'], { status: 'failed', failedAt: at, paymentUnconfirmedAt: at });
