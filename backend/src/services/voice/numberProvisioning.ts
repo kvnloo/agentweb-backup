@@ -1,8 +1,8 @@
 import { orgDb, type Organization } from '../db';
 import { hotLeadCallConfigOf, maskPhone, type HotLeadCallConfig } from '../hotLeadCallConfig';
-import { recordVendorUsage } from '../usageRecorderService';
-import { getAllocatedRate, getRecordingUnit } from '../../utils/vendorRateCard';
+import { getAllocatedRate } from '../../utils/vendorRateCard';
 import { isRecord } from '../leadNotificationAttribution';
+import { meterNumberRent } from './numberRent';
 import { getVoiceProvider, VoiceCallError } from './voiceProvider';
 import { isConditionalFailure, unchangedSince } from './setupWrites';
 import { omit } from '../../utils/omit';
@@ -14,9 +14,8 @@ import { DAY_MS } from '../hotLeadCallText';
  * Buying and releasing are non-idempotent account changes, so every path that can leave a number billed
  * but unrecorded ("orphan") is either compensated (released again) or logged for ops with the number SID.
  * Rent is metered for EVERY successful purchase, including one that is released again straight away (Twilio
- * has already billed it); the key is idempotent per sid and month. RECURRING rent is not metered: that needs
- * a scheduled job that meters `twilio:number:<sid>:<YYYY-MM>` each month for every stored twilioNumberSid
- * (follow-up, not built here).
+ * has already billed it); the key is idempotent per sid and month. Later months are metered by the daily
+ * sweep in numberRent.ts (cron/numberRentCron.ts), which uses the same key for the current month.
  *
  * Cost control: before any purchase, a reservation is written to the org attribute `hotLeadCallProvisioning`
  * (same system-managed family as hotLeadCallVerification), conditional on that attribute AND hotLeadCall being
@@ -30,8 +29,9 @@ import { DAY_MS } from '../hotLeadCallText';
  * metered) and the cost stays within the 2/day cap.
  *
  * `confirm: true` on the tool is advisory (the model controls it); these caps are the real control. A
- * human-approval gate (approval deck) for provision/release is a recommended follow-up: the existing
- * mechanism is Meta-write specific (digest manifests halted inside agentModeService).
+ * human-approval gate for provision/release is a recommended follow-up. The repo already gates other paid or
+ * irreversible actions (for example the CRM sequence activation gate, and the Meta-write digest manifests
+ * halted inside agentModeService); none of them covers these tools.
  */
 
 const MAX_PURCHASES_PER_DAY = 2;
@@ -101,22 +101,7 @@ async function persisted(orgId: string, sid: string): Promise<boolean | 'unreada
 }
 
 /** Billed the moment the number was bought, so metered before anything that can fail or discard it. */
-async function meterRent(userId: string, sid: string): Promise<void> {
-  const unit = getRecordingUnit('twilio', 'number_monthly_rent');
-  if (!unit) {
-    console.error('[hotLeadCall] number rent not metered: twilio number_monthly_rent is missing from the rate card');
-    return;
-  }
-  // recordVendorUsage should never throw, but nothing here may skip the save/discard/orphan handling after a purchase.
-  try {
-    await recordVendorUsage({
-      userId, provider: 'twilio', operation: 'number_monthly_rent', feature: 'hot_lead_call', unit, quantity: 1,
-      rateKey: 'number_monthly_rent', idempotencyKey: `twilio:number:${sid}:${new Date().toISOString().slice(0, 7)}`,
-    });
-  } catch {
-    console.error(`[hotLeadCall] number rent metering failed for sid ${sid}; meter it manually`);
-  }
-}
+const meterRent = (userId: string, sid: string) => meterNumberRent(userId, sid);
 
 export async function provisionNumber(p: { org: Organization; config: HotLeadCallConfig; userId: string; areaCode?: string }) {
   const { org, config } = p;
