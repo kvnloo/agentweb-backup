@@ -6,6 +6,8 @@
  *     directory in TEST MODE against a REAL build tarball (a `.aw-test-mode` marker file redirects the paths and fakes the tools; it is never in a tarball).
  * Anything that needs root (the loop-device disk self-test) is run by hand on the test instance and reported in the PR.
  */
+// The test-only TLS keys and certificates are generated on first use (they are not committed): this import must come first.
+import "../fixtures/tls/ensureFixtures";
 import { spawn, spawnSync, type SpawnSyncReturns } from "child_process";
 import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, statSync, writeFileSync } from "fs";
 import { tmpdir } from "os";

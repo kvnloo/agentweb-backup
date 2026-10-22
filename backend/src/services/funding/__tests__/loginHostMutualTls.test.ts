@@ -4,6 +4,8 @@
  * both ways: the worker only serves a client certificate its CA signed with the backend's identity, and the backend only talks to a
  * worker whose certificate chains to its CA AND names the address it dialled.
  */
+// The test-only TLS keys and certificates are generated on first use (they are not committed): this import must come first.
+import "../../../loginHost/__tests__/fixtures/tls/ensureFixtures";
 import { readFileSync, mkdtempSync, rmSync } from "fs";
 import { createServer as createHttpsServer, request as httpsRequest } from "https";
 import { createServer as createNetServer } from "net";
