@@ -15,7 +15,10 @@ set -euo pipefail
 
 KEY=${1:?usage: login-host-run-deploy.sh <BuildKey> [max-wait-seconds]}
 MAX_WAIT=${2:-1800}
-[[ "$MAX_WAIT" =~ ^[0-9]{1,4}$ ]] && [ "$MAX_WAIT" -le 3600 ] || { echo "::error::max wait must be digits only, at most 3600 seconds"; exit 1; }
+if ! [[ "$MAX_WAIT" =~ ^[0-9]{1,4}$ ]] || [ "$MAX_WAIT" -gt 3600 ]; then
+  echo "::error::max wait must be digits only, at most 3600 seconds"
+  exit 1
+fi
 [[ "$KEY" =~ ^prod/builds/login-host-[0-9a-f]{12}\.tar\.gz$ ]] || { echo "::error::unexpected build key"; exit 1; }
 INSTANCE_ID=${INSTANCE_ID:?INSTANCE_ID}
 DOC=${DOC_NAME:-AW-LoginHost-Deploy-Signed}
