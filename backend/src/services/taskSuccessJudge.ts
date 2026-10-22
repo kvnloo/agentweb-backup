@@ -274,6 +274,7 @@ async function runTaskSuccessPrompt(
     timeoutMs,
   };
   let response;
+  const failures = { 'ended the reply with an error': 0, 'returned an empty reply': 0 };
   // A provider can fail partway through and still answer 200, with finish_reason "error" and no content
   // (seen on Bedrock, ENG-2620). That is transient, so retry it; a call that throws is not retried.
   for (let attempt = 1; ; attempt++) {
@@ -282,11 +283,15 @@ async function runTaskSuccessPrompt(
     } catch (err) {
       return { status: 'error', reason: `LLM call failed: ${err instanceof Error ? err.message : String(err)}`, model };
     }
-    const providerFailed = response.finishReason === 'error' || !response.text.trim();
-    if (!providerFailed) break;
+    if (response.finishReason === 'error') failures['ended the reply with an error']++;
+    else if (!response.text.trim()) failures['returned an empty reply']++;
+    else break;
     if (attempt === PROVIDER_ERROR_ATTEMPTS) {
-      const what = response.finishReason === 'error' ? 'ended the reply with an error' : 'returned an empty reply';
-      return { status: 'error', reason: `the provider ${what} on all ${attempt} attempts`, model, ...(response.usage ? { usage: response.usage } : {}) };
+      const kinds = Object.entries(failures).filter(([, n]) => n > 0);
+      const reason = kinds.length === 1
+        ? `the provider ${kinds[0][0]} on all ${attempt} attempts`
+        : `the provider failed on all ${attempt} attempts: ${kinds.map(([what, n]) => `${n} ${what}`).join(', ')}`;
+      return { status: 'error', reason, model, ...(response.usage ? { usage: response.usage } : {}) };
     }
   }
   const parsed = parseVerdict(response.text);
