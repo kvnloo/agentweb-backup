@@ -257,6 +257,9 @@ describe('createSessionWithPlan with per-step models', () => {
       const wp = body(r).workPlan;
       expect(wp.steps[0].model).toBe('gpt-5-chat');
       expect(JSON.stringify(wp)).not.toMatch(/launchModel|planDefaultModel|engineModel/);
+      // ENG-669 (#3607 follow-up 6): nor the model provenance bookkeeping (the stored plan keeps it).
+      expect(JSON.stringify(wp)).not.toMatch(/planAuthor|"modelSource"/);
+      expect((db.updateSessionWorkPlan.mock.calls[0][1].steps as any[])[0].modelSource).toBe('system');
     });
   });
 });

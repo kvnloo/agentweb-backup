@@ -555,6 +555,12 @@ const SubscriptionTypesTab: React.FC = () => {
       // A stored empty list (only possible out of band) is sent back as-is, so the server refuses it and the admin
       // decides, rather than this editor silently turning "no models" into "every model".
       const typedModels = allowedModelsInput.split(/[,\n]/).map((model) => model.trim()).filter(Boolean);
+      // Something was typed but it names no model (only commas, line breaks or spaces): refuse it rather than save it as
+      // "every model", which is the opposite of what a narrowing edit meant.
+      if (allowedModelsInput.trim() && typedModels.length === 0) {
+        setError('Allowed models names no model: list model ids separated by commas, use * for every model, or leave it blank');
+        return;
+      }
       const storedEmptyList = Array.isArray(editingType?.allowedModels) && editingType.allowedModels.length === 0;
       const allowedModels: string[] | undefined = typedModels.length > 0 ? typedModels : (storedEmptyList ? [] : undefined);
 

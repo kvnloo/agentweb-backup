@@ -19,6 +19,7 @@ jest.mock('../services/chatbotService', () => ({
     getMessagesFromMessagesTable: jest.fn(),
     getChatSessionRecord: jest.fn(),
     updateSessionWorkPlan: jest.fn(),
+    getUserSessions: jest.fn(),
   },
   updateTaskExecutionStatus: jest.fn(),
 }));
@@ -55,6 +56,8 @@ jest.mock('../services/agentModeService', () => ({
     getDefaultModel: jest.fn().mockResolvedValue('gpt-5-chat-2'),
     getReportsModel: jest.fn().mockResolvedValue('gpt-5-chat-2'),
     getCustomerSupportDefaultModel: jest.fn().mockResolvedValue('gpt-5-chat-2'),
+    // A scheduled session's configured default: outside the Free plan below.
+    getScheduledChatsDefaultModel: jest.fn().mockResolvedValue('gpt-5.5'),
     // internalOnly ids are registry keys but excluded from the supported set.
     // Like the real getSupportedModels(false): the live-voice id IS in the supported set.
     getSupportedModels: jest.fn(async () => ['gpt-5-chat-2', 'gemini-3.5-flash', 'gpt-5.5', 'live-voice-1']),
@@ -373,16 +376,18 @@ describe('ENG-669 model provenance', () => {
     }
   });
 
-  it('approval resume refused by the step resolver: exactly ONE saved refusal and ONE live update carrying its messageIndex', async () => {
+  /** A plan whose step 1 pin is retired while AgentWeb's own stamp (outside the Free plan) stands on the session. */
+  const retiredStepWithSystemStamp = () => ({ ...baseSession(DISALLOWED), llmModelSource: 'system',
+    workPlan: PLAN_SYSTEM([
+      { stepCount: 1, title: 'S1', status: 'pending', model: 'retired-model-9', modelSource: 'system' },
+      { stepCount: 2, title: 'S2', status: 'pending', model: DISALLOWED, modelSource: 'system' },
+    ], { launchModel: ALLOWED }) });
+
+  it('#3607 follow-up 5: approval resume on a RETIRED step pin with AgentWeb\'s stamp standing gets the retired-model pause, not "not in your plan"', async () => {
     const honor = jest.spyOn(workPlanStepModels, 'shouldHonor').mockResolvedValue(true);
-    // The stored stamp is AgentWeb's (passes the final gate); the step's own model is retired, so the stored model
-    // becomes a pick for the step, which is checked as the user's and refused INSIDE generateSessionResponse (which
-    // saves the refusal); the resume must reuse that record, not save a second one.
-    const s = { ...baseSession(DISALLOWED), llmModelSource: 'system',
-      workPlan: PLAN_SYSTEM([
-        { stepCount: 1, title: 'S1', status: 'pending', model: 'retired-model-9', modelSource: 'system' },
-        { stepCount: 2, title: 'S2', status: 'pending', model: DISALLOWED, modelSource: 'system' },
-      ], { launchModel: ALLOWED }) };
+    // The stored stamp is AgentWeb's (passes the final gate); the step's own model is retired. The stamp is not a pick the
+    // user made, so its refusal is not what this turn reports: the step's own model is.
+    const s = retiredStepWithSystemStamp();
     storeSession(s);
     (mockChatbotDb as any).getChatSessionRecord.mockResolvedValue(s);
     mockChatbotDb.addMessageToSession.mockImplementation(async (_id: string, m: any) => ({ messages: [{ ...m, messageIndex: 7 }] }) as any);
@@ -390,15 +395,236 @@ describe('ENG-669 model provenance', () => {
     jest.spyOn(console, 'warn').mockImplementation(() => {});
     await resumeOriginSession(SESSION_ID, 'Approved: send it');
     honor.mockRestore();
-    const refusals = mockChatbotDb.addMessageToSession.mock.calls.map(([, m]) => m as any)
-      .filter((m) => m.role === 'assistant' && m.metadata?.isErrorMessage);
+    const saved = mockChatbotDb.addMessageToSession.mock.calls.map(([, m]) => m as any).filter((m) => m.role === 'assistant');
     expect(mockWorker.runInWorker).not.toHaveBeenCalled();
-    expect(refusals).toHaveLength(1);
-    expect(refusals[0].content).toContain("isn't included in your plan");
-    expect(mockEmit).toHaveBeenCalledTimes(1);
-    expect(mockEmit).toHaveBeenCalledWith('session-message-appended', {
-      sessionId: SESSION_ID,
-      message: { role: 'assistant', content: refusals[0].content, messageIndex: 7, metadata: { isErrorMessage: true } },
+    expect(saved.filter((m) => m.metadata?.isErrorMessage)).toHaveLength(0);
+    const pause = saved.filter((m) => m.metadata?.kind === 'work-plan-step-model-unavailable');
+    expect(pause).toHaveLength(1);
+    expect(pause[0].metadata).toMatchObject({ stepCount: 1, model: 'retired-model-9' });
+    expect(pause[0].content).toContain('which is no longer available');
+    expect(pause[0].content).not.toContain('included in');
+    expect(mockEmit).toHaveBeenCalledWith('session-message-appended', { sessionId: SESSION_ID, message: { role: 'assistant', content: pause[0].content } });
+  });
+
+  it('...while a pick the user makes IN this request for that step is still answered as theirs (not in the plan)', async () => {
+    const honor = jest.spyOn(workPlanStepModels, 'shouldHonor').mockResolvedValue(true);
+    storeSession({ ...retiredStepWithSystemStamp(), llmModel: ALLOWED });
+    const err = await generateSessionResponse(
+      SESSION_ID, MESSAGE, OWNER, ALLOWED,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      false, DISALLOWED, // isUnattendedRun, explicitModelPick
+    ).catch((e) => e);
+    honor.mockRestore();
+    expect(err).toMatchObject({ reason: 'not_in_plan', requestedModel: DISALLOWED });
+    expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+  });
+
+  describe('#3607 follow-up 4: the end-of-plan restore of the pre-plan model', () => {
+    const finishedPlan = (extra: Record<string, unknown>) => ({
+      title: 'P', templatePlanId: 't1', createdAt: 'x', updatedAt: 'x', engineModel: ALLOWED, launchModel: DISALLOWED,
+      steps: [{ stepCount: 1, title: 'S1', status: 'completed', model: ALLOWED }], ...extra,
+    });
+    const restoreNotices = () => mockChatbotDb.addMessageToSession.mock.calls.map(([, m]) => m as any)
+      .filter((m) => m?.metadata?.kind === 'work-plan-model-restore-failed');
+
+    it('a LEGACY plan (no launchModelSource, no planAuthor): the restore is AgentWeb\'s action and puts the pre-plan model back', async () => {
+      const honor = jest.spyOn(workPlanStepModels, 'shouldHonor').mockResolvedValue(true);
+      const stored = storeSession({ ...baseSession(ALLOWED), llmModelSource: 'system', workPlan: finishedPlan({}) });
+      await generateSessionResponse(SESSION_ID, MESSAGE, OWNER, ALLOWED);
+      honor.mockRestore();
+      expect(mockWorker.runInWorker).toHaveBeenCalledWith(expect.objectContaining({ llmModel: DISALLOWED }), expect.anything());
+      expect(stored()).toMatchObject({ llmModel: DISALLOWED, llmModelSource: 'system' });
+      expect(restoreNotices()).toHaveLength(0);
+    });
+
+    it('a restore that is refused (the launch recorded the user\'s own pick, now outside the plan) is said in the chat, never silent', async () => {
+      const honor = jest.spyOn(workPlanStepModels, 'shouldHonor').mockResolvedValue(true);
+      const stored = storeSession({ ...baseSession(ALLOWED), llmModelSource: 'system',
+        workPlan: finishedPlan({ planAuthor: 'system', launchModelSource: 'user' }) });
+      await generateSessionResponse(SESSION_ID, MESSAGE, OWNER, ALLOWED);
+      honor.mockRestore();
+      // The turn runs on the current model, and the chat says why the old one did not come back (once: marker cleared).
+      expect(mockWorker.runInWorker).toHaveBeenCalledWith(expect.objectContaining({ llmModel: ALLOWED }), expect.anything());
+      expect(restoreNotices()).toHaveLength(1);
+      expect(restoreNotices()[0].content).toBe(
+        "The work plan is finished. This chat used GPT-5.5 before the plan, but that model isn't included in this account's plan, so the chat stays on gemini-3.5-flash. To switch, choose another model in the model picker.",
+      );
+      expect(mockEmit).toHaveBeenCalledWith('session-message-appended', { sessionId: SESSION_ID, message: { role: 'assistant', content: restoreNotices()[0].content } });
+      expect(mockChatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(SESSION_ID, expect.not.objectContaining({ engineModel: expect.anything() }));
+      expect(stored().llmModel).toBe(ALLOWED);
+    });
+
+    it('the note names the selection the chat keeps (the stored model), not the model this turn happened to run', async () => {
+      // e.g. a stored AgentWeb Model selection: the caller hands over the concrete routed model for this turn.
+      const honor = jest.spyOn(workPlanStepModels, 'shouldHonor').mockResolvedValue(true);
+      storeSession({ ...baseSession(ALLOWED), llmModelSource: 'system', workPlan: finishedPlan({ planAuthor: 'system', launchModelSource: 'user' }) });
+      await generateSessionResponse(SESSION_ID, MESSAGE, OWNER, DEFAULT_MODEL);
+      honor.mockRestore();
+      expect(restoreNotices()).toHaveLength(1);
+      expect(restoreNotices()[0].content).toContain('so the chat stays on gemini-3.5-flash.');
+    });
+  });
+
+  describe('#3607 follow-up 1: a session kind\'s configured default is AgentWeb\'s unless the user picks it now', () => {
+    const SCHEDULED_DEFAULT = DISALLOWED; // getScheduledChatsDefaultModel, outside the Free plan
+    const scheduled = (extra: Record<string, unknown>) => ({ ...baseSession(ALLOWED), sessionType: 'scheduled', ...extra });
+
+    it('the picker PATCH to the kind\'s default is a user pick: refused when outside the plan, nothing written', async () => {
+      storeSession(scheduled({ llmModelSource: 'system' }));
+      const p = makeRes();
+      await agentModeController.updateSessionLlmModel(patch(SCHEDULED_DEFAULT), p);
+      expect(p.statusCode).toBe(422);
+      expect(p.body).toMatchObject({ code: 'model_unavailable', reason: 'not_in_plan' });
+      expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
+    });
+
+    it('AgentWeb\'s own stamp of it (recorded system, or a legacy stamp with none recorded) still runs and can be re-selected', async () => {
+      const stored = storeSession(scheduled({ llmModel: SCHEDULED_DEFAULT, llmModelSource: 'system' }));
+      const p = makeRes();
+      await agentModeController.updateSessionLlmModel(patch(SCHEDULED_DEFAULT), p);
+      expect(p.statusCode).toBe(200);
+      expect(stored().llmModelSource).toBe('system');
+
+      storeSession(scheduled({ llmModel: SCHEDULED_DEFAULT }));
+      await generateSessionResponse(SESSION_ID, MESSAGE, OWNER, SCHEDULED_DEFAULT);
+      expect(mockWorker.runInWorker).toHaveBeenCalledWith(expect.objectContaining({ llmModel: SCHEDULED_DEFAULT }), expect.anything());
+    });
+
+    it('a LEGACY stamp of it (none recorded) keeps running turn after turn: the portal\'s echo does not turn it into a user pick', async () => {
+      // Every session written before llmModelSource existed (2026-10-19) is like this. The portal re-sends the picker
+      // value on every turn; that echo is not a new choice, so the second turn must run like the first.
+      const stored = storeSession(scheduled({ llmModel: SCHEDULED_DEFAULT }));
+      for (const turn of [1, 2]) {
+        const res = makeRes();
+        await agentModeController.generateResponse(generateReq({ llmModel: SCHEDULED_DEFAULT }), res);
+        expect({ turn, status: res.statusCode, body: res.statusCode === 200 ? undefined : res.body }).toEqual({ turn, status: 200, body: undefined });
+      }
+      expect(mockWorker.runInWorker).toHaveBeenCalledTimes(2);
+      expect(stored().llmModel).toBe(SCHEDULED_DEFAULT);
+    });
+
+    it('a stamp of it RECORDED as the user\'s (what that echo wrote on legacy stamps since 2026-10-19) still runs at the final gate', async () => {
+      storeSession(scheduled({ llmModel: SCHEDULED_DEFAULT, llmModelSource: 'user' }));
+      await generateSessionResponse(SESSION_ID, MESSAGE, OWNER, SCHEDULED_DEFAULT);
+      expect(mockWorker.runInWorker).toHaveBeenCalledWith(expect.objectContaining({ llmModel: SCHEDULED_DEFAULT }), expect.anything());
+    });
+
+    it('...while a NEW /generate pick of it from another model is refused by the pre-flight, nothing written', async () => {
+      storeSession(scheduled({ llmModelSource: 'system' }));
+      const res = makeRes();
+      await agentModeController.generateResponse(generateReq({ llmModel: SCHEDULED_DEFAULT }), res);
+      expect(res.statusCode).toBe(422);
+      expect(res.body).toMatchObject({ reason: 'not_in_plan' });
+      expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
+      expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+    });
+
+    // The model the session had when a plan was launched there is not a pick the user makes at the plan's end (restore)
+    // or on a model-less step (its fallback), even when the launch recorded it as the user's: still the kind's default.
+    const planOnScheduledDefault = (steps: any[], extra: Record<string, unknown> = {}) => scheduled({
+      llmModel: ALLOWED, llmModelSource: 'system',
+      workPlan: { title: 'P', createdAt: 'x', updatedAt: 'x', engineModel: ALLOWED, launchModel: SCHEDULED_DEFAULT, steps, ...extra },
+    });
+
+    it('the end-of-plan restore of the kind\'s default (launch recorded \'user\') puts it back, with no "not in your plan" note', async () => {
+      const honor = jest.spyOn(workPlanStepModels, 'shouldHonor').mockResolvedValue(true);
+      const stored = storeSession(planOnScheduledDefault(
+        [{ stepCount: 1, title: 'S1', status: 'completed', model: ALLOWED, modelSource: 'system' }],
+        { planAuthor: 'system', launchModelSource: 'user' },
+      ));
+      await generateSessionResponse(SESSION_ID, MESSAGE, OWNER, ALLOWED);
+      honor.mockRestore();
+      expect(mockWorker.runInWorker).toHaveBeenCalledWith(expect.objectContaining({ llmModel: SCHEDULED_DEFAULT }), expect.anything());
+      expect(stored().llmModel).toBe(SCHEDULED_DEFAULT);
+      expect(mockChatbotDb.addMessageToSession.mock.calls.map(([, m]) => (m as any)?.metadata?.kind)).not.toContain('work-plan-model-restore-failed');
+    });
+
+    it('a model-less step falls back to the kind\'s default it was launched on (legacy plan): it runs, the plan does not pause', async () => {
+      const honor = jest.spyOn(workPlanStepModels, 'shouldHonor').mockResolvedValue(true);
+      storeSession(planOnScheduledDefault([
+        { stepCount: 1, title: 'S1', status: 'completed', model: ALLOWED },
+        { stepCount: 2, title: 'S2', status: 'pending' },
+      ]));
+      const result = await generateSessionResponse(SESSION_ID, MESSAGE, OWNER, ALLOWED);
+      honor.mockRestore();
+      expect(String(result?.content)).not.toContain('included in');
+      expect(mockWorker.runInWorker).toHaveBeenCalledWith(expect.objectContaining({ llmModel: SCHEDULED_DEFAULT }), expect.anything());
+    });
+
+    it('the interactive configured default stays a free pick in any kind of session', async () => {
+      storeSession(scheduled({ llmModel: ALLOWED, llmModelSource: 'user' }));
+      const p = makeRes();
+      await agentModeController.updateSessionLlmModel(patch(DEFAULT_MODEL), p);
+      expect(p.statusCode).toBe(200);
+    });
+  });
+
+  describe('#3607 follow-up 6: owner session reads carry no model provenance bookkeeping', () => {
+    const sessionWithPlan = () => ({ ...baseSession(ALLOWED), llmModelSource: 'system',
+      workPlan: { title: 'P', templatePlanId: 't1', planAuthor: 'system', launchModel: ALLOWED, launchModelSource: 'user',
+        planDefaultModel: ALLOWED, planDefaultModelSource: 'system', createdAt: 'x', updatedAt: 'x',
+        steps: [{ stepCount: 1, title: 'S1', status: 'pending', model: DISALLOWED, modelSource: 'system' }, { stepCount: 2, title: 'S2', status: 'pending' }] } });
+    const read = async (user: Record<string, unknown>) => {
+      const res = makeRes();
+      await agentModeController.getSession({ params: { sessionId: SESSION_ID }, user, query: {} } as any, res);
+      return res;
+    };
+
+    it('the owner\'s read drops planAuthor, launchModelSource, planDefaultModelSource and step modelSource; keeps what the portal reads', async () => {
+      storeSession(sessionWithPlan());
+      const res = await read({ userId: OWNER, isAdmin: false });
+      expect(res.statusCode).toBe(200);
+      const plan = res.body.workPlan;
+      expect(plan).not.toHaveProperty('planAuthor');
+      expect(plan).not.toHaveProperty('launchModelSource');
+      expect(plan).not.toHaveProperty('planDefaultModelSource');
+      expect(plan.steps[0]).not.toHaveProperty('modelSource');
+      expect(plan.steps[0].model).toBe(DISALLOWED);
+      expect(plan.templatePlanId).toBe('t1');
+      expect(res.body.llmModelSource).toBe('system'); // the portal's llmModelIsSystemChoice reads it
+      // The stored plan is untouched.
+      expect(mockChatbotDb.updateSessionWorkPlan).not.toHaveBeenCalled();
+    });
+
+    it('an admin read keeps them (support)', async () => {
+      storeSession(sessionWithPlan());
+      const res = await read({ userId: 'admin-1', isAdmin: true });
+      expect(res.body.workPlan).toMatchObject({ planAuthor: 'system', launchModelSource: 'user', planDefaultModelSource: 'system' });
+      expect(res.body.workPlan.steps[0].modelSource).toBe('system');
+    });
+
+    const expectNoProvenance = (plan: any) => {
+      expect(plan).toBeDefined();
+      expect(JSON.stringify(plan)).not.toMatch(/planAuthor|launchModelSource|planDefaultModelSource|"modelSource"/);
+      expect(plan.steps[0].model).toBe(DISALLOWED);
+      expect(plan.templatePlanId).toBe('t1');
+    };
+
+    it('the session LIST the portal polls drops them too (owner); an admin keeps them', async () => {
+      (mockChatbotDb as any).getUserSessions.mockResolvedValue({ sessions: [sessionWithPlan()], lastEvaluatedKey: undefined });
+      const list = async (user: Record<string, unknown>) => {
+        const res = makeRes();
+        await agentModeController.getSessions({ user, query: {} } as any, res);
+        return res;
+      };
+      const owner = await list({ userId: OWNER, isAdmin: false });
+      expect(owner.statusCode).toBe(200);
+      expectNoProvenance(owner.body.sessions[0].workPlan);
+      expect(owner.body.sessions[0].llmModelSource).toBe('system');
+      const admin = await list({ userId: 'admin-1', isAdmin: true });
+      expect(admin.body.sessions[0].workPlan).toMatchObject({ planAuthor: 'system', launchModelSource: 'user' });
+    });
+
+    it('an idempotent replay of session creation drops them too', async () => {
+      (isRunStoreEnabled as jest.Mock).mockReturnValueOnce(true);
+      (claimIdempotency as jest.Mock).mockResolvedValueOnce({ claimed: false, sessionId: SESSION_ID });
+      storeSession(sessionWithPlan());
+      const res = makeRes();
+      await agentModeController.createSession({ user: { userId: OWNER, isAdmin: false }, body: { idempotencyKey: 'k1' }, query: {} } as any, res);
+      expect(res.statusCode).toBe(200);
+      expect(res.body.idempotentReplay).toBe(true);
+      expectNoProvenance(res.body.workPlan);
     });
   });
 
