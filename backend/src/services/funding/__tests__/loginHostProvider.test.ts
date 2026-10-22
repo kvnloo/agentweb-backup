@@ -9,9 +9,11 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { startHostServer, type HostServerHandle } from "../../../loginHost/server";
 import { makeRig, type Rig } from "../../../loginHost/__tests__/helpers";
-import { LoginHostClient } from "../loginHostClient";
+import { PROTOCOL_VERSION } from "../../../loginHost/protocol";
+import { LoginHostClient, LoginHostError } from "../loginHostClient";
 import {
-  isPrivateIPv4, LoginHostProvider, LOGIN_HOST_SETTING_NAME, parseClientMaterial, parseLoginHostSetting, REFRESH_INTERVAL_MS, RETRY_AFTER_FAILURE_MS, SECRET_TTL_MS,
+  CERT_WARN_DAYS, CERT_WARN_EVERY_MS, clientCertNotAfterMs, daysUntil, defaultBuild, defaultSecretName, isPrivateIPv4, LoginHostProvider, LOGIN_HOST_SETTING_NAME, parseClientMaterial, parseLoginHostSetting,
+  parseLoginHostSettingDetailed, PROTOCOL_RECHECK_MS, REFRESH_INTERVAL_MS, RETRY_AFTER_FAILURE_MS, SECRET_TTL_MS,
   type LoginHostProviderDeps,
 } from "../loginHostProvider";
 
@@ -45,16 +47,29 @@ describe("setting validation", () => {
     expect(parseLoginHostSetting(JSON.stringify(v))).toBeNull();
   });
 
-  it("rejects unknown keys at both levels, a missing default worker, 0 or 9 workers, duplicate ids, junk", () => {
-    expect(parseLoginHostSetting(JSON.stringify({ ...SETTING, extra: 1 }))).toBeNull();
-    expect(parseLoginHostSetting(JSON.stringify({ workers: [{ ...SETTING.workers[0], tls: false }], defaultWorker: "w1" }))).toBeNull();
+  it("ignores unknown keys (a newer row must not darken older instances), but still refuses a bad shape", () => {
+    expect(parseLoginHostSetting(JSON.stringify({ ...SETTING, extra: 1 }))).toEqual(SETTING);
+    expect(parseLoginHostSetting(JSON.stringify({ workers: [{ ...SETTING.workers[0], tls: false }], defaultWorker: "w1" }))).toEqual(SETTING);
     expect(parseLoginHostSetting(JSON.stringify({ ...SETTING, defaultWorker: "w2" }))).toBeNull();
     expect(parseLoginHostSetting(JSON.stringify({ workers: [], defaultWorker: "w1" }))).toBeNull();
-    const nine = Array.from({ length: 9 }, (_, i) => ({ id: `w${i + 1}`, host: `10.0.0.${i + 1}`, port: 8443 }));
-    expect(parseLoginHostSetting(JSON.stringify({ workers: nine, defaultWorker: "w1" }))).toBeNull();
-    expect(parseLoginHostSetting(JSON.stringify({ workers: nine.slice(0, 8), defaultWorker: "w1" }))).not.toBeNull();
-    expect(parseLoginHostSetting(JSON.stringify({ workers: [SETTING.workers[0], SETTING.workers[0]], defaultWorker: "w1" }))).toBeNull();
     for (const junk of ["", "null", "[]", "42", "{", '"w1"']) expect(parseLoginHostSetting(junk)).toBeNull();
+  });
+
+  it("exactly ONE worker: connection records do not say which worker holds a login, so a second entry (or a changed one) would orphan logins", () => {
+    const two = [SETTING.workers[0], { id: "w2", host: "172.31.30.51", port: 8443 }];
+    expect(parseLoginHostSetting(JSON.stringify({ workers: two, defaultWorker: "w1" }))).toBeNull();
+    expect(parseLoginHostSetting(JSON.stringify({ workers: [SETTING.workers[0], SETTING.workers[0]], defaultWorker: "w1" }))).toBeNull();
+    expect(parseLoginHostSetting(JSON.stringify({ workers: Array.from({ length: 9 }, (_, i) => ({ id: `w${i + 1}`, host: `10.0.0.${i + 1}`, port: 8443 })), defaultWorker: "w1" }))).toBeNull();
+  });
+
+  it("a row version this build does not understand fails closed with its own reason; v:1 is fine", () => {
+    expect(parseLoginHostSetting(JSON.stringify({ ...SETTING, v: 1 }))).toEqual({ ...SETTING, v: 1 });
+    for (const bad of [2, 0, "1", null, 1.5]) {
+      const r = parseLoginHostSettingDetailed(JSON.stringify({ ...SETTING, v: bad }));
+      expect(r).toEqual({ ok: false, reason: "version" });
+    }
+    expect(parseLoginHostSettingDetailed("{")).toEqual({ ok: false, reason: "json" });
+    expect(parseLoginHostSettingDetailed(JSON.stringify({ workers: [] }))).toEqual({ ok: false, reason: "shape" });
   });
 
   it("private ranges: 10/8, 172.16/12, 192.168/16 only", () => {
@@ -253,21 +268,167 @@ describe("LoginHostProvider", () => {
     expect(clear).toHaveBeenCalledTimes(1);
   });
 
-  it("uses the dev/ secret outside production and prod/ in production", () => {
+  it("uses the dev/ secret outside production and the prod/ secret in production (each exactly, asserted separately)", async () => {
     const env = process.env.NODE_ENV;
-    try {
-      process.env.NODE_ENV = "production";
-      const pr = make({ secretName: undefined });
-      void pr.refresh();
-      process.env.NODE_ENV = "development";
-      const dv = make({ secretName: undefined });
-      void dv.refresh();
-    } finally {
-      process.env.NODE_ENV = env;
-    }
-    return flush().then(() => {
-      expect(sec.mock.calls.map((c) => c[0])).toEqual(expect.arrayContaining(["prod/AgentWeb/LoginHost/client", "dev/AgentWeb/LoginHost/client"]));
+    const read = async (nodeEnv: string) => {
+      const calls = jest.fn(async () => secret());
+      try {
+        process.env.NODE_ENV = nodeEnv;
+        const p = new LoginHostProvider({ getSetting: setting, getSecret: calls, now: () => now, buildClient: () => new LoginHostClient({ json: async () => ({ status: 200, json: {} }), stream: async () => { throw new Error("n/a"); } }) });
+        await p.refresh();
+      } finally {
+        process.env.NODE_ENV = env;
+      }
+      return calls.mock.calls.map((c) => (c as unknown as [string])[0]);
+    };
+    expect(await read("production")).toEqual(["prod/AgentWeb/LoginHost/client"]);
+    expect(await read("development")).toEqual(["dev/AgentWeb/LoginHost/client"]);
+    expect(await read("test")).toEqual(["dev/AgentWeb/LoginHost/client"]);
+    expect(defaultSecretName()).toMatch(/^(dev|prod)\/AgentWeb\/LoginHost\/client$/);
+  });
+});
+
+describe("worker protocol check (host.info)", () => {
+  let now: number;
+  let logged: string[];
+  const mk = (hostInfo: () => Promise<{ protocol: number; node: string; uptimeSec: number }>) => {
+    const client = Object.assign(new LoginHostClient({ json: async () => ({ status: 200, json: {} }), stream: async () => { throw new Error("n/a"); } }), { hostInfo });
+    return new LoginHostProvider({ getSetting: async () => row(SETTING), getSecret: async () => secret(), now: () => now, buildClient: () => client });
+  };
+  beforeEach(() => {
+    now = 1_000_000;
+    logged = [];
+    for (const level of ["log", "info", "warn", "error"] as const) jest.spyOn(console, level).mockImplementation((...a: unknown[]) => void logged.push(a.map(String).join(" ")));
+  });
+  afterEach(() => jest.restoreAllMocks());
+  const settle = async (p: LoginHostProvider) => {
+    await p.refresh();
+    await new Promise((r) => setImmediate(r));
+  };
+
+  it("is unknown until the worker answers, then 'match' when the versions agree", async () => {
+    const p = mk(async () => ({ protocol: PROTOCOL_VERSION, node: "v22", uptimeSec: 1 }));
+    expect(p.protocolStatus()).toBe("unknown");
+    await settle(p);
+    expect(p.protocolStatus()).toBe("match");
+    expect(p.workerProtocol()).toBe(PROTOCOL_VERSION);
+  });
+
+  it("a different version is a logged 'mismatch' (never fatal: the client is still returned)", async () => {
+    const p = mk(async () => ({ protocol: PROTOCOL_VERSION + 1, node: "v22", uptimeSec: 1 }));
+    await settle(p);
+    expect(p.protocolStatus()).toBe("mismatch");
+    expect(p.workerProtocol()).toBe(PROTOCOL_VERSION + 1);
+    expect(p.client()).toBeInstanceOf(LoginHostClient);
+    expect(logged.filter((l) => l.includes("login_host_protocol_mismatch"))).toHaveLength(1);
+    await settle(p);
+    await settle(p);
+    expect(logged.filter((l) => l.includes("login_host_protocol_mismatch"))).toHaveLength(1); // once, not every minute
+  });
+
+  it("an older worker (unknown route) stays 'unknown' with a logged cause, retried on each refresh until it answers, then flips to match without a restart", async () => {
+    let answer: "old" | "new" = "old";
+    const hostInfo = jest.fn(async () => {
+      if (answer === "old") throw new LoginHostError("EINVALID", "route");
+      return { protocol: PROTOCOL_VERSION, node: "v22", uptimeSec: 1 };
     });
+    const p = mk(hostInfo);
+    await settle(p);
+    await settle(p);
+    expect(p.protocolStatus()).toBe("unknown");
+    expect(hostInfo.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(logged.filter((l) => l.includes("login_host_protocol_unknown cause=EINVALID/route"))).toHaveLength(1);
+    answer = "new";
+    await settle(p);
+    expect(p.protocolStatus()).toBe("match");
+  });
+
+  it("re-verifies a matching worker after PROTOCOL_RECHECK_MS (a redeployed worker is noticed)", async () => {
+    let protocol = PROTOCOL_VERSION;
+    const p = mk(async () => ({ protocol, node: "v22", uptimeSec: 1 }));
+    await settle(p);
+    expect(p.protocolStatus()).toBe("match");
+    protocol = PROTOCOL_VERSION + 1;
+    now += PROTOCOL_RECHECK_MS - 1;
+    await settle(p);
+    expect(p.protocolStatus()).toBe("match"); // not yet
+    now += 2;
+    await settle(p);
+    expect(p.protocolStatus()).toBe("mismatch");
+  });
+});
+
+describe("client certificate expiry visibility", () => {
+  const F = join(__dirname, "../../../loginHost/__tests__/fixtures/tls");
+  const realMaterial = { cert: readFileSync(join(F, "client.pem"), "utf8"), key: readFileSync(join(F, "client.key.pem"), "utf8"), ca: readFileSync(join(F, "ca.pem"), "utf8") };
+  const DAY = 24 * 60 * 60 * 1000;
+  let logged: string[];
+  beforeEach(() => {
+    logged = [];
+    for (const level of ["log", "info", "warn", "error"] as const) jest.spyOn(console, level).mockImplementation((...a: unknown[]) => void logged.push(a.map(String).join(" ")));
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  const providerAt = (nowFn: () => number) =>
+    new LoginHostProvider({
+      getSetting: async () => row(SETTING),
+      getSecret: async () => JSON.stringify(realMaterial),
+      now: nowFn,
+      buildClient: () => new LoginHostClient({ json: async () => ({ status: 200, json: {} }), stream: async () => { throw new Error("n/a"); } }),
+    });
+
+  it("the pure date math: whole days left, negative once expired", () => {
+    expect(daysUntil(10 * DAY, 0)).toBe(10);
+    expect(daysUntil(10 * DAY, 0.5 * DAY)).toBe(9);
+    expect(daysUntil(10 * DAY, 10 * DAY)).toBe(0);
+    expect(daysUntil(10 * DAY, 11 * DAY)).toBe(-1);
+    expect(clientCertNotAfterMs("not a certificate")).toBeUndefined();
+    expect(clientCertNotAfterMs(realMaterial.cert)).toBeGreaterThan(Date.parse("2100-01-01"));
+  });
+
+  it("a far-off expiry logs nothing; fewer than 30 days logs a warning with a day count; expired logs an error", async () => {
+    const notAfter = clientCertNotAfterMs(realMaterial.cert)!;
+    let now = notAfter - 400 * DAY;
+    const p = providerAt(() => now);
+    await p.refresh();
+    expect(p.clientCertDaysLeft()).toBe(400);
+    expect(logged.filter((l) => l.includes("login_host_client_cert"))).toEqual([]);
+    now = notAfter - (CERT_WARN_DAYS - 1) * DAY - 1000;
+    await p.refresh();
+    expect(logged.filter((l) => l.includes("login_host_client_cert_expires_soon daysLeft=29"))).toHaveLength(1);
+    now = notAfter + 2 * DAY + 1000;
+    await p.refresh();
+    expect(p.clientCertDaysLeft()).toBe(-3);
+    expect(logged.filter((l) => l.includes("login_host_client_cert_expired daysAgo=3"))).toHaveLength(1);
+  });
+
+  it("the warning is rate limited to once per CERT_WARN_EVERY_MS however often the provider refreshes", async () => {
+    const notAfter = clientCertNotAfterMs(realMaterial.cert)!;
+    let now = notAfter - 5 * DAY;
+    const p = providerAt(() => now);
+    for (let i = 0; i < 10; i++) {
+      await p.refresh();
+      now += 60_000;
+    }
+    expect(logged.filter((l) => l.includes("login_host_client_cert_expires_soon"))).toHaveLength(1);
+    now += CERT_WARN_EVERY_MS;
+    await p.refresh();
+    expect(logged.filter((l) => l.includes("login_host_client_cert_expires_soon"))).toHaveLength(2);
+  });
+
+  it("logs only a day count: never the certificate, the key or the secret", async () => {
+    const notAfter = clientCertNotAfterMs(realMaterial.cert)!;
+    const p = providerAt(() => notAfter - 3 * DAY);
+    await p.refresh();
+    const all = logged.join("\n");
+    expect(all).toContain("login_host_client_cert_expires_soon daysLeft=3");
+    expect(all).not.toMatch(/BEGIN|PRIVATE|MII[A-Za-z0-9]/);
+  });
+
+  it("an unparseable certificate gives no day count and no crash", async () => {
+    const p = new LoginHostProvider({ getSetting: async () => row(SETTING), getSecret: async () => secret(), now: () => 1_000_000, buildClient: () => new LoginHostClient({ json: async () => ({ status: 200, json: {} }), stream: async () => { throw new Error("n/a"); } }) });
+    await p.refresh();
+    expect(p.clientCertDaysLeft()).toBeUndefined();
   });
 });
 
@@ -303,5 +464,22 @@ describe("provider + REAL mutual TLS", () => {
     const c = provider.client();
     expect(c).toBeDefined();
     await expect(c!.connectionStatus({ connectionId: "nope" })).rejects.toMatchObject({ code: "ENOTFOUND" }); // answered by the host's handler, over mutual TLS
+  });
+
+  it("the PRODUCTION build function (defaultBuild) dials with the right identity and trust anchor: swapping cert and ca would fail this", async () => {
+    rig = makeRig();
+    dir = mkdtempSync(join(tmpdir(), "lh-prov-"));
+    handle = await startHostServer(rig.mgr, {
+      socketPath: join(dir, "host.sock"), tickMs: 3_600_000, sweepMs: 3_600_000,
+      tls: { host: "127.0.0.1", port: 0, cert: pem("server.pem"), key: pem("server.key.pem"), ca: pem("ca.pem"), clientCommonNames: ["agentweb-backend-test"] },
+    });
+    const m = { cert: pem("client.pem"), key: pem("client.key.pem"), ca: pem("ca.pem") };
+    const good = defaultBuild({ host: "127.0.0.1", port: handle.tlsPort! }, m);
+    await expect(good.connectionStatus({ connectionId: "nope" })).rejects.toMatchObject({ code: "ENOTFOUND" });
+    // the wrong trust anchor, or the wrong identity, must not get an answer
+    const wrongCa = defaultBuild({ host: "127.0.0.1", port: handle.tlsPort! }, { ...m, ca: pem("rogue-ca.pem") });
+    await expect(wrongCa.connectionStatus({ connectionId: "nope" })).rejects.toMatchObject({ code: "UNREACHABLE" });
+    const swapped = defaultBuild({ host: "127.0.0.1", port: handle.tlsPort! }, { cert: m.ca, key: m.key, ca: m.cert });
+    await expect(swapped.connectionStatus({ connectionId: "nope" })).rejects.toMatchObject({ code: "UNREACHABLE" });
   });
 });

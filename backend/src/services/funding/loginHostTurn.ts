@@ -111,7 +111,10 @@ export async function runHostTurn(client: LoginHostClient, req: RouteInput<"turn
       } catch (err) {
         if (err instanceof LoginHostError && (err.code === "ENOTFOUND" || err.code === "ESTALE")) return; // the turn is over or fenced
         if (++failures >= 2) {
-          void interrupt().then(() => stream.close());
+          // Cut the stream NOW and send the interrupt alongside. Waiting for the interrupt first would hold the caller for as long as the
+          // dead link takes to fail it, while the worker has already ended the turn (the lease lapses after ~30 s).
+          void interrupt();
+          stream.close();
           return;
         }
       }

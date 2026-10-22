@@ -12,16 +12,19 @@
  */
 import { chmodSync, existsSync, rmSync } from "fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "http";
-import { createServer as createHttpsServer } from "https";
+import { createServer as createHttpsServer, type Server as HttpsServer } from "https";
 import type { TLSSocket } from "tls";
 import { connect } from "net";
 import { ZodError } from "zod";
 import type { ConnectionManager } from "./connectionManager";
-import { HostError, HTTP_STATUS, ROUTES, type RouteName } from "./protocol";
+import type { Logger } from "./ports";
+import { HostError, HTTP_STATUS, PROTOCOL_VERSION, ROUTES, type RouteName } from "./protocol";
 
 const MAX_BODY_BYTES = 5 * 1024 * 1024;
 /** A request body that stops arriving for this long is dropped (slowloris). */
 const BODY_IDLE_MS = 15_000;
+/** A rejected TLS client is logged at most once per this window per reason (a scanner or a misconfigured peer must not flood the journal). */
+const TLS_REJECT_LOG_WINDOW_MS = 10_000;
 
 export interface HostServerOptions {
   socketPath: string;
@@ -41,6 +44,10 @@ export interface HostServerOptions {
    * subject CN must be one of `clientCommonNames`). Same closed API, same handler; the unix socket stays as it is.
    */
   tls?: { host: string; port: number; cert: string | Buffer; key: string | Buffer; ca: string | Buffer; clientCommonNames: string[]; maxConnections?: number; handshakeMs?: number };
+  /** Secret-free structured logging (codes and a certificate common name only). Without it nothing is logged. */
+  log?: Pick<Logger, "warn">;
+  /** Test seam for the rejection log's rate limit. */
+  now?: () => number;
 }
 
 export class SocketInUseError extends Error {
@@ -65,7 +72,7 @@ function socketIsLive(path: string): Promise<boolean> {
 export interface HostServerHandle {
   server: Server;
   /** The mutual-TLS listener, when configured. */
-  tlsServer?: Server;
+  tlsServer?: HttpsServer;
   /** The port the TLS listener actually bound (differs from the configured one only when that was 0, in tests). */
   tlsPort?: number;
   close(): Promise<void>;
@@ -78,25 +85,28 @@ export async function startHostServer(manager: ConnectionManager, opts: HostServ
   }
   // Processes started by a previous run may still be alive: kill them before serving anything.
   await manager.recover();
-  const server = createServer((req, res) => {
-    void handle(manager, req, res, opts.bodyIdleMs ?? BODY_IDLE_MS, opts.streamStallMs ?? 30_000).catch(() => {
+  const bodyIdleMs = opts.bodyIdleMs ?? BODY_IDLE_MS;
+  const streamStallMs = opts.streamStallMs ?? 30_000;
+  /** The one request handler both listeners use. */
+  const onRequest = (req: IncomingMessage, res: ServerResponse): void => {
+    void handle(manager, req, res, bodyIdleMs, streamStallMs).catch(() => {
       if (!res.headersSent) sendError(res, new HostError("EINTERNAL"));
       else res.end();
     });
-  });
-  server.requestTimeout = 0; // turn.run streams for a long time; the BODY is bounded separately (BODY_IDLE_MS)
-  server.headersTimeout = 10_000;
-  server.maxConnections = opts.maxConnections ?? 128;
+  };
+  const server = createServer(onRequest);
+  applyLimits(server, opts.maxConnections ?? 128);
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(opts.socketPath, () => resolve());
   });
   chmodSync(opts.socketPath, opts.socketMode ?? 0o660);
-  let tlsServer: Server | undefined;
+  let tlsServer: HttpsServer | undefined;
   let tlsPort: number | undefined;
   if (opts.tls) {
     const t = opts.tls;
     const allowed = new Set(t.clientCommonNames);
+    const rejected = createRejectionLog(opts.log, opts.now ?? Date.now);
     // The caller must be the backend's IDENTITY: a certificate the CA signed is necessary, not sufficient.
     const identityOk = (socket: TLSSocket): boolean => {
       const cn = socket.getPeerCertificate().subject?.CN;
@@ -107,26 +117,26 @@ export async function startHostServer(manager: ConnectionManager, opts: HostServ
       (req, res) => {
         // Second line of defence, checked per REQUEST: nothing reaches the manager unless this very socket carries the allowed identity.
         if (!identityOk(req.socket as TLSSocket)) {
+          rejected("identity", req.socket as TLSSocket);
           req.socket.destroy();
           return;
         }
-        void handle(manager, req, res, opts.bodyIdleMs ?? BODY_IDLE_MS, opts.streamStallMs ?? 30_000).catch(() => {
-          if (!res.headersSent) sendError(res, new HostError("EINTERNAL"));
-          else res.end();
-        });
+        onRequest(req, res);
       },
     );
     // First line: dropped before the HTTP parser sees a byte. `prependListener` is essential: https.Server registers its own
     // `secureConnection` listener when it is created, and a listener added with `on` would run AFTER it, i.e. after the request
     // had already been handed to the handler.
     secure.prependListener("secureConnection", (socket: TLSSocket) => {
-      if (!identityOk(socket)) socket.destroy();
+      if (!identityOk(socket)) {
+        rejected("identity", socket);
+        socket.destroy();
+      }
     });
-    secure.on("tlsClientError", () => undefined); // a failed handshake is the client's problem; never an unhandled event
+    // A failed handshake (no certificate, another CA, TLS < 1.3, a scanner) is the client's problem; logged (rate limited), never an unhandled event.
+    secure.on("tlsClientError", (err: Error) => rejected("handshake", undefined, (err as { code?: string }).code));
     secure.on("clientError", (_err, socket) => socket.destroy());
-    secure.requestTimeout = 0;
-    secure.headersTimeout = 10_000;
-    secure.maxConnections = t.maxConnections ?? 64;
+    applyLimits(secure, t.maxConnections ?? 64);
     await new Promise<void>((resolve, reject) => {
       secure.once("error", reject);
       secure.listen(t.port, t.host, () => resolve());
@@ -138,24 +148,51 @@ export async function startHostServer(manager: ConnectionManager, opts: HostServ
   const sweep = setInterval(() => void manager.sweep().catch(() => undefined), opts.sweepMs ?? 60_000);
   tick.unref();
   sweep.unref();
+  const servers: Server[] = tlsServer ? [server, tlsServer] : [server];
   return {
     server,
     ...(tlsServer ? { tlsServer, tlsPort } : {}),
-    close: () =>
-      new Promise<void>((resolve) => {
-        clearInterval(tick);
-        clearInterval(sweep);
-        let open = tlsServer ? 2 : 1;
-        const done = () => {
-          if (--open === 0) resolve();
-        };
-        server.close(done);
-        server.closeAllConnections?.();
-        if (tlsServer) {
-          tlsServer.close(done);
-          (tlsServer as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();
-        }
-      }),
+    close: async () => {
+      clearInterval(tick);
+      clearInterval(sweep);
+      await Promise.all(
+        servers.map(
+          (s) =>
+            new Promise<void>((resolve) => {
+              s.close(() => resolve());
+              s.closeAllConnections?.();
+            }),
+        ),
+      );
+    },
+  };
+}
+
+/** Limits both listeners share: turn.run streams for a long time, so only the BODY is bounded (BODY_IDLE_MS), never the request. */
+function applyLimits(server: Server, maxConnections: number): void {
+  server.requestTimeout = 0;
+  server.headersTimeout = 10_000;
+  server.maxConnections = maxConnections;
+}
+
+/**
+ * `tls_client_rejected {reason, cn?, code?}` at most once per window per reason. A client-certificate name that is wrong after a rotation
+ * otherwise looks like "the network is down" on both sides. The common name is not secret; nothing else from the certificate is logged,
+ * and `code` is an OpenSSL/Node error code, checked against a strict shape.
+ */
+function createRejectionLog(log: Pick<Logger, "warn"> | undefined, now: () => number): (reason: "identity" | "handshake", socket?: TLSSocket, errCode?: string) => void {
+  const lastAt = new Map<string, number>();
+  return (reason, socket, errCode) => {
+    if (!log) return;
+    const t = now();
+    const prev = lastAt.get(reason);
+    if (prev !== undefined && t - prev < TLS_REJECT_LOG_WINDOW_MS) return;
+    lastAt.set(reason, t);
+    const fields: Record<string, string> = { reason };
+    const cn = socket?.getPeerCertificate().subject?.CN;
+    if (typeof cn === "string") fields.cn = /^[A-Za-z0-9._ -]{1,64}$/.test(cn) ? cn : "(unprintable)";
+    if (typeof errCode === "string" && /^[A-Z0-9_]{1,64}$/.test(errCode)) fields.code = errCode;
+    log.warn("tls_client_rejected", fields);
   };
 }
 
@@ -163,7 +200,10 @@ async function handle(manager: ConnectionManager, req: IncomingMessage, res: Ser
   if (req.method !== "POST") return sendError(res, new HostError("EINVALID", "method"), 405);
   const match = /^\/v1\/([A-Za-z.]+)$/.exec(req.url ?? "");
   const route = match?.[1] as RouteName | undefined;
-  if (!route || !Object.prototype.hasOwnProperty.call(ROUTES, route)) return sendError(res, new HostError("ENOTFOUND"), 404);
+  // An unknown route is NOT "not found": ENOTFOUND means "no such connection/login/turn" and has a destructive meaning for the backend's
+  // revoke and sweeper (a connection the host has never heard of is treated as already wiped). A newer backend talking to an older worker
+  // must get something it can only read as an error (see PROTOCOL_VERSION).
+  if (!route || !Object.prototype.hasOwnProperty.call(ROUTES, route)) return sendError(res, new HostError("EINVALID", "route"), 404);
   if (!/^application\/json(;|$)/i.test(String(req.headers["content-type"] ?? ""))) return sendError(res, new HostError("EINVALID", "content_type"), 415);
 
   let body: unknown;
@@ -187,6 +227,7 @@ async function handle(manager: ConnectionManager, req: IncomingMessage, res: Ser
   }
 
   try {
+    if (route === "host.info") return send(res, 200, { protocol: PROTOCOL_VERSION, node: process.version, uptimeSec: Math.floor(process.uptime()) });
     if (route === "turn.run") return await streamTurn(manager, input, res, streamStallMs);
     const result = await dispatch(manager, route, input);
     send(res, 200, result);

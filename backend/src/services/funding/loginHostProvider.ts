@@ -8,6 +8,17 @@
  *   - the backend's CLIENT certificate material in Secrets Manager (`<prod|dev>/AgentWeb/LoginHost/client`: {cert,key,ca}), read as
  *     the EC2 instance role EXPLICITLY (its resource policy names only that role; the SDK default chain may pick static keys).
  *
+ * ONE WORKER. The setting's `workers` array holds exactly one entry (the array shape is kept for the future). Connection records do not
+ * say which worker holds their login, so changing the address or `defaultWorker` while hosted connections exist ORPHANS their logins
+ * (they live on the worker's disk): the sweeper would find "no such connection" on the new worker for every customer. The address is
+ * only for replacing a worker that has the SAME disk (e.g. a new instance with the data volume re-attached). A second worker needs a
+ * `subHostWorkerId` on the record (a DynamoDB model change, tracked in ENG-2114) and routing by it.
+ *
+ * Versions. The row may carry `v` (currently 1). Unknown extra keys are IGNORED (so a newer backend can add a field without darkening
+ * older instances during a rolling deploy), but a `v` this build does not understand fails closed with a logged code. Backend and worker
+ * speak the protocol in loginHost/protocol.ts: after (re)building its client the provider asks `host.info` and records whether the
+ * worker's PROTOCOL_VERSION matches (`protocolStatus()`); a mismatch is logged, never fatal. Deploy order: see PROTOCOL_VERSION.
+ *
  * The material lives only in this module's memory: never logged, never in an error message. `client()` is synchronous (the hosted
  * service's dependency is): until the first refresh completes it returns undefined and the callers answer `host_unavailable`.
  */
@@ -15,7 +26,10 @@ import AWS from "aws-sdk";
 import { createHash } from "crypto";
 import { z } from "zod";
 import { settingsService } from "../settingsService";
-import { LoginHostClient, MutualTlsTransport } from "./loginHostClient";
+import { CERT_WARN_DAYS, certNotAfterMs, daysUntil } from "../../loginHost/certExpiry";
+import { isRfc1918 } from "../../loginHost/ipv4";
+import { PROTOCOL_VERSION } from "../../loginHost/protocol";
+import { LoginHostClient, LoginHostError, MutualTlsTransport } from "./loginHostClient";
 
 export const LOGIN_HOST_SETTING_NAME = "eng1816_login_host";
 
@@ -25,32 +39,26 @@ export const REFRESH_INTERVAL_MS = 60 * 1000;
 /** After a failed refresh triggered by a caller, the next caller-triggered attempt waits this long (no hammering). */
 export const RETRY_AFTER_FAILURE_MS = 5_000;
 
-const OCTET = "(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)";
-const IPV4 = new RegExp(`^${OCTET}\\.${OCTET}\\.${OCTET}\\.${OCTET}$`);
+/** RFC 1918 only (shared with the host's config check via loginHost/ipv4.ts): the worker is reached over the VPC, never a public, loopback or link-local address. */
+export const isPrivateIPv4 = isRfc1918;
 
-/** RFC 1918 only: 10/8, 172.16/12, 192.168/16. The worker is reached over the VPC; never a public, loopback or link-local address. */
-export function isPrivateIPv4(host: string): boolean {
-  if (!IPV4.test(host)) return false;
-  const [a, b] = host.split(".").map(Number);
-  return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
-}
+/** The row's schema version this build understands. */
+export const SETTING_VERSION = 1;
 
-const workerSchema = z
-  .object({
-    id: z.string().regex(/^[a-z][a-z0-9]{0,15}$/),
-    host: z.string().refine(isPrivateIPv4, "private IPv4 literal"),
-    port: z.number().int().min(1024).max(65535),
-  })
-  .strict();
+// Unknown keys are stripped, not rejected (see "Versions" above).
+const workerSchema = z.object({
+  id: z.string().regex(/^[a-z][a-z0-9]{0,15}$/),
+  host: z.string().refine(isPrivateIPv4, "private IPv4 literal"),
+  port: z.number().int().min(1024).max(65535),
+});
 
 const settingSchema = z
   .object({
-    workers: z.array(workerSchema).min(1).max(8),
+    v: z.literal(SETTING_VERSION).optional(),
+    workers: z.array(workerSchema).min(1).max(1),
     defaultWorker: z.string(),
   })
-  .strict()
-  .refine((s) => s.workers.some((w) => w.id === s.defaultWorker), "defaultWorker must be one of the workers")
-  .refine((s) => new Set(s.workers.map((w) => w.id)).size === s.workers.length, "worker ids must be unique");
+  .refine((s) => s.workers.some((w) => w.id === s.defaultWorker), "defaultWorker must be the worker");
 
 export type LoginHostSetting = z.infer<typeof settingSchema>;
 
@@ -65,14 +73,26 @@ const materialSchema = z
 
 export type ClientMaterial = z.infer<typeof materialSchema>;
 
-/** Returns the parsed setting, or null if the JSON is not exactly the documented shape. Never throws, never echoes the value. */
-export function parseLoginHostSetting(text: string): LoginHostSetting | null {
+export type SettingParse = { ok: true; value: LoginHostSetting } | { ok: false; reason: "json" | "version" | "shape" };
+
+/** Parses the row. Never throws, never echoes the value; the reason is a code a log line can carry. */
+export function parseLoginHostSettingDetailed(text: string): SettingParse {
+  let raw: unknown;
   try {
-    const r = settingSchema.safeParse(JSON.parse(text));
-    return r.success ? r.data : null;
+    raw = JSON.parse(text);
   } catch {
-    return null;
+    return { ok: false, reason: "json" };
   }
+  const v = (raw as { v?: unknown } | null)?.v;
+  if (raw && typeof raw === "object" && v !== undefined && v !== SETTING_VERSION) return { ok: false, reason: "version" };
+  const r = settingSchema.safeParse(raw);
+  return r.success ? { ok: true, value: r.data } : { ok: false, reason: "shape" };
+}
+
+/** Returns the parsed setting, or null if the JSON is not the documented shape (or a version this build does not understand). */
+export function parseLoginHostSetting(text: string): LoginHostSetting | null {
+  const r = parseLoginHostSettingDetailed(text);
+  return r.ok ? r.value : null;
 }
 
 export function parseClientMaterial(text: string): ClientMaterial | null {
@@ -103,7 +123,22 @@ interface State {
   fingerprint: string;
 }
 
-const defaultBuild = (worker: { host: string; port: number }, m: ClientMaterial) => new LoginHostClient(new MutualTlsTransport({ host: worker.host, port: worker.port, cert: m.cert, key: m.key, ca: m.ca }));
+/** Builds the mutual-TLS client for a worker: the backend's certificate and key as ITS identity, the CA as the only trust anchor for the worker. */
+export const defaultBuild = (worker: { host: string; port: number }, m: ClientMaterial) => new LoginHostClient(new MutualTlsTransport({ host: worker.host, port: worker.port, cert: m.cert, key: m.key, ca: m.ca }));
+
+export { CERT_WARN_DAYS };
+/** The expiry warning is logged at most this often (the provider refreshes every minute). */
+export const CERT_WARN_EVERY_MS = 60 * 60 * 1000;
+/** The worker's protocol version is re-verified this often (a redeployed worker flips to "match" without a backend restart). */
+export const PROTOCOL_RECHECK_MS = 10 * 60 * 1000;
+
+/** Whole days until a certificate's notAfter (negative once expired). Pure; shared with the host. */
+export { daysUntil };
+
+/** The client certificate's notAfter (ms), or undefined if it cannot be parsed. */
+export const clientCertNotAfterMs = (certPem: string): number | undefined => certNotAfterMs(certPem);
+
+export type ProtocolStatus = "match" | "mismatch" | "unknown";
 
 const code = (e: unknown) => (e as { code?: string })?.code || (e as Error)?.name || "error";
 
@@ -117,6 +152,11 @@ export class LoginHostProvider {
   private inflight: Promise<void> | undefined;
   private lastFailureAt = 0;
   private timer: unknown;
+  private protocol: { status: ProtocolStatus; worker?: number; checkedAt: number } = { status: "unknown", checkedAt: 0 };
+  private protocolChecking = false;
+  private protocolUnknownLogged = false;
+  private certNotAfterMs: number | undefined;
+  private lastCertWarnAt = 0;
   private readonly now: () => number;
   private readonly secretName: string;
 
@@ -158,12 +198,13 @@ export class LoginHostProvider {
         this.state = undefined;
         return;
       }
-      setting = parseLoginHostSetting(row.settingValue);
-      if (!setting) {
-        console.error("[loginHostProvider] setting is malformed: keeping the last good value");
+      const parsed = parseLoginHostSettingDetailed(row.settingValue);
+      if (!parsed.ok) {
+        console.error(`[loginHostProvider] setting rejected (${parsed.reason === "version" ? "login_host_setting_version_unsupported" : "login_host_setting_malformed"}): keeping the last good value`);
         this.lastFailureAt = this.now();
         return;
       }
+      setting = parsed.value;
     } catch (e) {
       console.error(`[loginHostProvider] setting read failed: ${code(e)}`);
       this.lastFailureAt = this.now();
@@ -174,7 +215,10 @@ export class LoginHostProvider {
     if (!this.material || this.now() - this.material.at >= SECRET_TTL_MS) {
       try {
         const parsed = parseClientMaterial(await this.deps.getSecret(this.secretName));
-        if (parsed) this.material = { value: parsed, at: this.now() };
+        if (parsed) {
+          this.material = { value: parsed, at: this.now() };
+          this.certNotAfterMs = clientCertNotAfterMs(parsed.cert);
+        }
         else {
           console.error("[loginHostProvider] client certificate secret is malformed: keeping the last good value");
           this.lastFailureAt = this.now();
@@ -185,13 +229,67 @@ export class LoginHostProvider {
       }
     }
     if (!this.material) return; // never loaded: fail closed
+    this.warnAboutCertExpiry();
 
     // 3. swap, rebuilding the client only if the address or the material changed.
     const worker = setting.workers.find((w) => w.id === setting.defaultWorker)!;
     const m = this.material.value;
     const fingerprint = createHash("sha256").update(JSON.stringify([worker.host, worker.port, m.cert, m.key, m.ca])).digest("hex");
-    if (this.state?.fingerprint === fingerprint) return;
+    if (this.state?.fingerprint === fingerprint) {
+      this.maybeCheckProtocol();
+      return;
+    }
     this.state = { client: (this.deps.buildClient ?? defaultBuild)({ host: worker.host, port: worker.port }, m), fingerprint };
+    this.protocol = { status: "unknown", checkedAt: 0 }; // a new client may talk to a new worker
+    this.protocolUnknownLogged = false;
+    this.maybeCheckProtocol();
+  }
+
+  /** Whole days left on the backend's client certificate (negative once expired), or undefined if not loaded / unparseable. For an alarm. */
+  clientCertDaysLeft(): number | undefined {
+    return this.certNotAfterMs === undefined ? undefined : daysUntil(this.certNotAfterMs, this.now());
+  }
+
+  /** Logs (codes and a day count only) when the client certificate is about to expire or has: every call fails as UNREACHABLE the day it does. */
+  private warnAboutCertExpiry(): void {
+    const days = this.clientCertDaysLeft();
+    if (days === undefined || days >= CERT_WARN_DAYS) return;
+    if (this.now() - this.lastCertWarnAt < CERT_WARN_EVERY_MS) return;
+    this.lastCertWarnAt = this.now();
+    if (days < 0) console.error(`[loginHostProvider] login_host_client_cert_expired daysAgo=${-days}`);
+    else console.warn(`[loginHostProvider] login_host_client_cert_expires_soon daysLeft=${days}`);
+  }
+
+  /** Whether the worker speaks the protocol version this build was written for (see PROTOCOL_VERSION). Unknown until `host.info` answered. */
+  protocolStatus(): ProtocolStatus {
+    return this.protocol.status;
+  }
+  workerProtocol(): number | undefined {
+    return this.protocol.worker;
+  }
+
+  private maybeCheckProtocol(): void {
+    if (!this.state || this.protocolChecking) return;
+    if (this.protocol.status === "match" && this.now() - this.protocol.checkedAt < PROTOCOL_RECHECK_MS) return;
+    this.protocolChecking = true;
+    const client = this.state.client;
+    void (async () => {
+      try {
+        const info = await client.hostInfo();
+        const status: ProtocolStatus = info.protocol === PROTOCOL_VERSION ? "match" : "mismatch";
+        if (status === "mismatch" && this.protocol.status !== "mismatch") console.error(`[loginHostProvider] login_host_protocol_mismatch worker=${info.protocol} backend=${PROTOCOL_VERSION}`);
+        this.protocol = { status, worker: info.protocol, checkedAt: this.now() };
+      } catch (e) {
+        // An older worker answers EINVALID/route (or, before that change, ENOTFOUND) to a route it does not have; anything else is just "cannot tell yet".
+        const detail = e instanceof LoginHostError ? `${e.code}${e.detail ? `/${e.detail}` : ""}` : code(e);
+        const changed = this.protocol.status !== "unknown";
+        if (changed) this.protocol = { status: "unknown", checkedAt: this.now() };
+        if (changed || !this.protocolUnknownLogged) console.error(`[loginHostProvider] login_host_protocol_unknown cause=${detail}`); // once per client, not once a minute
+        this.protocolUnknownLogged = true;
+      } finally {
+        this.protocolChecking = false;
+      }
+    })();
   }
 
   start(): void {

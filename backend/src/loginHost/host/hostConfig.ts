@@ -4,6 +4,7 @@
  * and read once at start-up; nothing in it is ever taken from a request.
  */
 import { z } from "zod";
+import { isCanonicalIPv4, unusableAddressReason } from "../ipv4";
 import { assertAbsPath, LayoutError } from "../ports/layout";
 
 const absPath = z.string().refine((p) => {
@@ -80,7 +81,7 @@ const schema = z
     tls: z
       .object({
         /** The private address to bind (never 0.0.0.0 by accident): an IPv4 literal. */
-        host: z.string().regex(/^(?:\d{1,3}\.){3}\d{1,3}$/, "an IPv4 address"),
+        host: z.string().refine(isCanonicalIPv4, "a canonical IPv4 address (four decimal octets, no leading zeros)"),
         port: z.number().int().min(1024).max(65535).default(8443),
         certPath: absPath,
         keyPath: absPath,
@@ -145,7 +146,10 @@ export function parseHostConfig(raw: unknown): HostConfig {
     if (!Number.isInteger(port) || port < 1 || port > 65535) throw new HostConfigError(`egress.allow: bad port in ${t}`);
     if (/^[0-9.]+:/.test(t) || t.startsWith("[")) throw new HostConfigError(`egress.allow: literal IP targets are not allowed (${t})`);
   }
-  if (c.tls && (c.tls.host === "0.0.0.0" || c.tls.host.startsWith("127."))) throw new HostConfigError("tls.host must be the machine's private address (not 0.0.0.0 or loopback)");
+  // The worker's own address may be any of its interface addresses (so no private-range requirement here, unlike the backend's side), but
+  // never one that cannot be a machine's address on the network: every-interface, loopback, link-local, multicast or reserved.
+  const unusable = c.tls ? unusableAddressReason(c.tls.host) : null;
+  if (unusable) throw new HostConfigError(`tls.host must be the machine's own network address (${unusable} addresses are refused)`);
   const egressDir = `/run/aw-egress-${c.env}`;
   return { ...c, stateRoot, socketPath: `${c.socket.dir}/host.sock`, egressDir, egressSocketPath: `${egressDir}/proxy.sock` };
 }

@@ -20,6 +20,7 @@ import { SystemdUserFs, type SystemdPortConfig } from "../ports/systemdUserFs";
 import { startEgressProxy, type EgressProxyHandle } from "../egress/egressProxy";
 import { startHostServer, type HostServerHandle } from "../server";
 import { StateStore } from "../stateStore";
+import { CERT_WARN_DAYS, certNotAfterMs, daysUntil } from "../certExpiry";
 import { assertTrustedPath, verifyBinary, type VerifiedBinary } from "./binary";
 import { assertNoSubuidOverlap, HostConfigError, parseHostConfig, type HostConfig } from "./hostConfig";
 import { registerRange } from "./ranges";
@@ -46,6 +47,27 @@ export interface HostDeps {
   /** Tests: the egress proxy's name resolution and upstream connect (no real network). */
   egressResolve?: (host: string) => Promise<string[]>;
   managerOverrides?: Partial<ManagerConfig>;
+}
+
+/**
+ * The TLS private key must not be readable by anyone but root. `assertTrustedPath` only rules out WRITE access by group/others, so this
+ * is checked separately; `mode` is the file's st_mode.
+ */
+export function assertKeyFileMode(path: string, mode: number): void {
+  if (mode & 0o077) throw new HostConfigError(`${path} must be mode 0600 (it is ${(mode & 0o777).toString(8)})`);
+}
+
+/** Logs the server certificate's remaining life at start-up (day count only), warning under CERT_WARN_DAYS. Returns the days, or undefined if unparseable. */
+export function reportTlsCertExpiry(log: Logger, certPem: string | Buffer, now: number = Date.now()): number | undefined {
+  const notAfter = certNotAfterMs(certPem);
+  if (notAfter === undefined) {
+    log.warn("host_tls_cert_unparseable");
+    return undefined;
+  }
+  const daysLeft = daysUntil(notAfter, now);
+  log.info("host_tls_cert_expiry", { daysLeft });
+  if (daysLeft < CERT_WARN_DAYS) log.warn("host_tls_cert_expires_soon", { daysLeft });
+  return daysLeft;
 }
 
 export const realIds: IdGen = { next: (prefix) => `${prefix}-${randomBytes(12).toString("hex")}` };
@@ -79,6 +101,13 @@ export function portConfigFor(cfg: HostConfig, egressRef?: EgressRef): SystemdPo
     commandTimeoutMs: 30_000,
     ...(cfg.quota ? { quota: cfg.quota } : {}),
   };
+}
+
+/** The mutual-TLS listener's options from the config: the files are read here, once, at start-up (a renewed certificate needs a restart). */
+function tlsListenerOptions(tls: NonNullable<HostConfig["tls"]>, deps: Pick<HostDeps, "tlsHost" | "tlsPort">, log: Logger) {
+  const cert = readFileSync(tls.certPath);
+  reportTlsCertExpiry(log, cert);
+  return { host: deps.tlsHost ?? tls.host, port: deps.tlsPort ?? tls.port, cert, key: readFileSync(tls.keyPath), ca: readFileSync(tls.caPath), clientCommonNames: tls.clientCommonNames };
 }
 
 export interface BuiltHost {
@@ -200,10 +229,12 @@ export async function startHost(cfg: HostConfig, binary: VerifiedBinary, deps: H
       chownSync(sockDir, 0, cfg.socket.gid);
       chmodSync(sockDir, 0o750);
     }
+    const tlsOptions = cfg.tls ? tlsListenerOptions(cfg.tls, deps, deps.log) : undefined;
     const handle = await startHostServer(built.manager, {
       socketPath: sockPath,
       socketMode: cfg.socket.mode,
-      ...(cfg.tls ? { tls: { host: deps.tlsHost ?? cfg.tls.host, port: deps.tlsPort ?? cfg.tls.port, cert: readFileSync(cfg.tls.certPath), key: readFileSync(cfg.tls.keyPath), ca: readFileSync(cfg.tls.caPath), clientCommonNames: cfg.tls.clientCommonNames } } : {}),
+      log: deps.log,
+      ...(tlsOptions ? { tls: tlsOptions } : {}),
     });
     if (deps.chownSocket !== false) {
       chownSync(sockPath, 0, cfg.socket.gid);
@@ -247,10 +278,7 @@ export async function runMain(argv: string[] = process.argv): Promise<void> {
     const cfg = parseHostConfig(JSON.parse(readFileSync(configPath, "utf8")));
     // Everything the host or a customer unit executes or reads as policy must be root-controlled too.
     for (const p of [...(cfg.tls ? [cfg.tls.certPath, cfg.tls.keyPath, cfg.tls.caPath] : []), cfg.claude.turnWrapperPath, cfg.egress.launcherPath, cfg.egress.socat, cfg.claude.systemPromptFile, cfg.tools.writeFileHelper, cfg.tools.systemRun, cfg.tools.systemctl, cfg.tools.setpriv, cfg.tools.env, cfg.tools.rm, cfg.tools.find, ...(cfg.quota ? [cfg.tools.setquota] : [])]) assertTrustedPath(p);
-    if (cfg.tls) {
-      // The private key must not be readable by anyone but root (assertTrustedPath only rules out WRITE access).
-      if (statSync(cfg.tls.keyPath).mode & 0o077) throw new HostConfigError(`${cfg.tls.keyPath} must be mode 0600`);
-    }
+    if (cfg.tls) assertKeyFileMode(cfg.tls.keyPath, statSync(cfg.tls.keyPath).mode);
     if (existsSync("/etc/subuid")) assertNoSubuidOverlap(readFileSync("/etc/subuid", "utf8"), cfg.uidMin, cfg.uidMax);
     registerRange(`${cfg.sharedParent}/ranges`, { env: cfg.env, uidMin: cfg.uidMin, uidMax: cfg.uidMax });
     assertHomesMount(parseMounts(readFileSync("/proc/mounts", "utf8")), `${cfg.stateRoot}/u`, !!cfg.quota);

@@ -1,11 +1,15 @@
 /**
- * ENG-2110 PR 1c-i: the backend's client for the login host (src/loginHost).
+ * ENG-2110: the backend's client for the login host (src/loginHost).
  *
- * The host owns every customer login; this client only speaks its closed protocol. Nothing here ever
- * reads, stores or logs a token, a sign-in code, a prompt or a response body: errors carry a code and
- * (for host errors) the short detail the host chose. The transport is injectable because the production
- * path between the backend (Elastic Beanstalk) and the shared worker is not decided yet; the unix-socket
- * transport below is what the test environment uses (socket directory bind-mounted into the backend).
+ * The host owns every customer login; this client only speaks its closed protocol. Nothing here ever reads, stores or logs a token,
+ * a sign-in code, a prompt or a response body: errors carry a code and (for host errors) the short detail the host chose.
+ *
+ * Two transports reach the same closed API:
+ *   - `MutualTlsTransport`: PRODUCTION. The worker is a separate machine; TLS 1.3 with a client certificate on both ends (see the class).
+ *   - `UnixSocketTransport`: the test environment, where the host's socket directory is bind-mounted into the backend container.
+ *
+ * Protocol compatibility: the backend deploys on every merge, the worker by hand. See PROTOCOL_VERSION in loginHost/protocol.ts for the
+ * deploy-order rule; `hostInfo()` lets the provider compare versions.
  */
 import { request as httpRequest, type ClientRequest, type IncomingMessage, type RequestOptions } from "http";
 import { request as httpsRequest } from "https";
@@ -52,21 +56,60 @@ export interface HostTransport {
   stream(route: RouteName, body: unknown): Promise<StreamReply>;
 }
 
-export interface UnixSocketOptions {
+export interface TransportOptions {
+  /**
+   * The connection (TCP, and for TLS the handshake) must be established within this. Default 5 s. Node's own request timeouts only start
+   * counting AFTER the connect, so a stopped instance or a security group that drops packets would otherwise take the kernel's ~130 s of
+   * SYN retries to fail, longer than the load balancer waits for a user's request.
+   */
+  connectTimeoutMs?: number;
   /** A one-shot call (everything except `turn.run`) must answer within this. Default 60 s (host adapter calls are bounded at 60 s). */
   requestTimeoutMs?: number;
   /** `turn.run` must start answering (`accepted`) within this. Default 30 s. */
   streamStartTimeoutMs?: number;
   maxReplyBytes?: number;
 }
+/** @deprecated renamed: the options are shared by every transport. */
+export type UnixSocketOptions = TransportOptions;
 
 const DEFAULT_REPLY_BYTES = 8 * 1024 * 1024;
+
+/**
+ * The causes an operator needs to tell apart (an expired or mismatched certificate, a refused or reset connection, a TLS alert, a
+ * timeout) all arrive as `err.code`. Only codes of these exact shapes are kept, never message text, so a cause can be logged safely.
+ */
+const CAUSE_CODE = /^(?:E[A-Z]{3,12}|CERT_[A-Z_]{2,40}|ERR_TLS_[A-Z_]{1,60}|ERR_SSL_[A-Z0-9_]{1,60}|ERR_OSSL_[A-Z0-9_]{1,60}|DEPTH_ZERO_SELF_SIGNED_CERT|SELF_SIGNED_CERT_IN_CHAIN|UNABLE_TO_VERIFY_LEAF_SIGNATURE|UNABLE_TO_GET_ISSUER_CERT(?:_LOCALLY)?|HOSTNAME_MISMATCH)$/;
+
+type Phase = "connect" | "request" | "start";
+/** An ETIMEDOUT we raised ourselves, tagged with the phase that timed out. */
+function timeoutError(phase: Phase): Error {
+  return Object.assign(new Error("timeout"), { code: "ETIMEDOUT", awPhase: phase });
+}
 
 function mapSocketError(err: unknown): LoginHostError {
   if (err instanceof LoginHostError) return err;
   const code = (err as { code?: string })?.code;
-  if (code === "ETIMEDOUT" || code === "ESOCKETTIMEDOUT") return new LoginHostError("TIMEOUT");
-  return new LoginHostError("UNREACHABLE", typeof code === "string" && /^E[A-Z]{3,12}$/.test(code) ? code : undefined);
+  if (code === "ETIMEDOUT" || code === "ESOCKETTIMEDOUT") {
+    const phase = (err as { awPhase?: string }).awPhase;
+    return new LoginHostError("TIMEOUT", phase === "connect" || phase === "request" || phase === "start" ? phase : undefined);
+  }
+  return new LoginHostError("UNREACHABLE", typeof code === "string" && CAUSE_CODE.test(code) ? code : undefined);
+}
+
+/**
+ * Fails the request fast if the connection is not established in `ms` (see TransportOptions.connectTimeoutMs). Armed at once, cleared
+ * when the socket is connected (`secureConnect` for TLS: the handshake is part of connecting). Deliberately NOT the `timeout` option:
+ * that would also cut a long, legitimately silent streaming turn.
+ */
+function failFastConnect(req: ClientRequest, ms: number, secure: boolean): void {
+  const timer = setTimeout(() => req.destroy(timeoutError("connect")), ms);
+  timer.unref?.();
+  const clear = () => clearTimeout(timer);
+  req.once("socket", (socket) => {
+    if (!secure && !socket.connecting) return clear(); // a plain socket that is already connected (never the case with agent:false, kept for safety)
+    socket.once(secure ? "secureConnect" : "connect", clear);
+  });
+  req.once("close", clear);
 }
 
 /** A host error body is `{error: CODE, detail?}`; anything else is a bad answer, never echoed. */
@@ -84,12 +127,31 @@ function hostErrorFrom(status: number, json: unknown): LoginHostError {
 interface Connector {
   request: (options: RequestOptions, cb: (res: IncomingMessage) => void) => ClientRequest;
   base: RequestOptions & Record<string, unknown>;
+  /** TLS: the connection is only up after the handshake. */
+  secure?: boolean;
 }
 
 class NodeTransport implements HostTransport {
-  constructor(private readonly conn: Connector, private readonly opts: UnixSocketOptions = {}) {}
+  constructor(private readonly conn: Connector, private readonly opts: TransportOptions = {}) {}
 
+  /**
+   * Every failure leaves as a LoginHostError. `https.request` can THROW synchronously (a client certificate and key that do not match, a
+   * malformed PEM after a bad rotation): inside the promise that would surface as a raw Error with OpenSSL text, which the callers' error
+   * handling does not recognise. The cause code is kept, never the message.
+   */
   json(route: RouteName, body: unknown): Promise<JsonReply> {
+    return this.jsonInner(route, body).catch((e) => {
+      throw mapSocketError(e);
+    });
+  }
+
+  stream(route: RouteName, body: unknown): Promise<StreamReply> {
+    return this.streamInner(route, body).catch((e) => {
+      throw mapSocketError(e);
+    });
+  }
+
+  private jsonInner(route: RouteName, body: unknown): Promise<JsonReply> {
     const maxBytes = this.opts.maxReplyBytes ?? DEFAULT_REPLY_BYTES;
     return new Promise((resolve, reject) => {
       const payload = JSON.stringify(body);
@@ -117,13 +179,14 @@ class NodeTransport implements HostTransport {
           });
         },
       );
-      req.setTimeout(this.opts.requestTimeoutMs ?? 60_000, () => req.destroy(Object.assign(new Error("timeout"), { code: "ETIMEDOUT" })));
+      failFastConnect(req, this.opts.connectTimeoutMs ?? 5_000, this.conn.secure === true);
+      req.setTimeout(this.opts.requestTimeoutMs ?? 60_000, () => req.destroy(timeoutError("request")));
       req.on("error", (e) => reject(mapSocketError(e)));
       req.end(payload);
     });
   }
 
-  stream(route: RouteName, body: unknown): Promise<StreamReply> {
+  private streamInner(route: RouteName, body: unknown): Promise<StreamReply> {
     const maxLine = this.opts.maxReplyBytes ?? DEFAULT_REPLY_BYTES;
     return new Promise((resolve, reject) => {
       const payload = JSON.stringify(body);
@@ -173,7 +236,8 @@ class NodeTransport implements HostTransport {
           resolve({ lines, close: () => req.destroy() });
         },
       );
-      const startTimer = setTimeout(() => req.destroy(Object.assign(new Error("timeout"), { code: "ETIMEDOUT" })), this.opts.streamStartTimeoutMs ?? 30_000);
+      failFastConnect(req, this.opts.connectTimeoutMs ?? 5_000, this.conn.secure === true);
+      const startTimer = setTimeout(() => req.destroy(timeoutError("start")), this.opts.streamStartTimeoutMs ?? 30_000);
       startTimer.unref?.();
       req.on("error", (e) => {
         clearTimeout(startTimer);
@@ -186,7 +250,7 @@ class NodeTransport implements HostTransport {
 
 /** The host on the same machine, over its unix socket (the test environment; the socket directory is the access gate). */
 export class UnixSocketTransport extends NodeTransport {
-  constructor(socketPath: string, opts: UnixSocketOptions = {}) {
+  constructor(socketPath: string, opts: TransportOptions = {}) {
     super({ request: httpRequest, base: { socketPath, agent: false } }, opts);
   }
 }
@@ -206,8 +270,8 @@ export interface MutualTlsTarget {
  * only talks to a client certificate its CA signed with the backend's identity. No keep-alive pool (a restarted host would leave stale sockets).
  */
 export class MutualTlsTransport extends NodeTransport {
-  constructor(target: MutualTlsTarget, opts: UnixSocketOptions = {}) {
-    super({ request: httpsRequest as Connector["request"], base: { host: target.host, port: target.port, cert: target.cert, key: target.key, ca: target.ca, minVersion: "TLSv1.3", rejectUnauthorized: true, agent: false } }, opts);
+  constructor(target: MutualTlsTarget, opts: TransportOptions = {}) {
+    super({ request: httpsRequest as Connector["request"], secure: true, base: { host: target.host, port: target.port, cert: target.cert, key: target.key, ca: target.ca, minVersion: "TLSv1.3", rejectUnauthorized: true, agent: false } }, opts);
   }
 }
 
@@ -225,6 +289,7 @@ const loginStartReply = z.object({
 const loginReadyReply = z.object({ status: z.literal("ready"), planLabel: z.string().optional(), accountFingerprint: z.string().optional(), refreshExpiresAtMs: z.number().optional() });
 const loginStatusReply = z.union([loginReadyReply, z.object({ status: z.enum(["pending", "failed"]) })]);
 const renewReply = z.object({ leaseMs: z.number().int().positive() });
+const hostInfoReply = z.object({ protocol: z.number().int().min(0), node: z.string().max(40), uptimeSec: z.number().int().min(0) });
 const acceptedLine = z.object({ type: z.literal("accepted"), turnId: z.string(), duplicate: z.boolean(), status: z.enum(["running", "finished", "failed", "aborted"]).optional() });
 
 const count = z.number().finite().nonnegative().optional();
@@ -288,6 +353,10 @@ export class LoginHostClient {
   }
   connectionStatus(input: RouteInput<"connection.status">): Promise<{ state: string; epoch: number; runningTurns: number; planLabel?: string; reason?: string }> {
     return this.call("connection.status", input, statusReply);
+  }
+  /** The worker's protocol version (see PROTOCOL_VERSION in loginHost/protocol.ts). An older worker answers EINVALID/route. */
+  hostInfo(): Promise<{ protocol: number; node: string; uptimeSec: number }> {
+    return this.call("host.info", {}, hostInfoReply);
   }
   turnRenew(input: RouteInput<"turn.renew">): Promise<{ leaseMs: number }> {
     return this.call("turn.renew", input, renewReply);

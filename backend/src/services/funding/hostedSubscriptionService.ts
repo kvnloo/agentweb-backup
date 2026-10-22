@@ -73,6 +73,12 @@ export interface HostedSubscriptionDeps {
   now: () => number;
   newId: () => string;
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Whether the worker has been verified to speak this build's protocol (the provider's `host.info` check). "No such connection" (ENOTFOUND)
+   * is taken to mean "nothing to wipe / the host lost it" ONLY then: an older worker that lacks a route used to answer ENOTFOUND for it, which
+   * must never be read as "already wiped". Default: trusted (single-box test environments, unit tests).
+   */
+  workerSpeaksOurProtocol?: () => boolean;
 }
 
 interface Pending {
@@ -386,6 +392,10 @@ export class HostedSubscriptionService {
     return (await this.finishRevoke(connectionId, began.epoch)) === "revoked" ? "revoked" : "revoking";
   }
 
+  private protocolOk(): boolean {
+    return this.deps.workerSpeaksOurProtocol ? this.deps.workerSpeaksOurProtocol() : true;
+  }
+
   /** Asks the host to revoke (idempotent) and records `revoked` only on its confirmation. Never throws for a host problem. */
   private async finishRevoke(connectionId: string, epoch: number): Promise<"revoked" | "revoking" | "host_down"> {
     const client = this.deps.client();
@@ -395,8 +405,8 @@ export class HostedSubscriptionService {
       try {
         confirmed = (await this.revokeOnHost(client, connectionId, epoch)).state === "revoked";
       } catch (err) {
-        // A host that has never heard of the connection has nothing to wipe.
-        confirmed = err instanceof LoginHostError && err.code === "ENOTFOUND";
+        // A host that has never heard of the connection has nothing to wipe (provided it is a worker we know speaks our protocol).
+        confirmed = err instanceof LoginHostError && err.code === "ENOTFOUND" && this.protocolOk();
         down = err instanceof LoginHostError && err.ambiguous;
         if (!confirmed) console.error(`[hosted-subscription] revoke not confirmed connection=${connectionId} code=${err instanceof LoginHostError ? err.code : "error"}`);
       }
@@ -471,7 +481,7 @@ export class HostedSubscriptionService {
     try {
       st = await client.connectionStatus({ connectionId: r.connectionId });
     } catch (err) {
-      if (err instanceof LoginHostError && err.code === "ENOTFOUND") return this.markLost(r, epoch, "host_lost");
+      if (err instanceof LoginHostError && err.code === "ENOTFOUND") return this.protocolOk() ? this.markLost(r, epoch, "host_lost") : false;
       throw err;
     }
     if (st.state === "revoking" || st.state === "revoked") {
@@ -502,7 +512,7 @@ export class HostedSubscriptionService {
  * AW_LOGIN_HOST_SOCKET is set; otherwise the production worker over mutual TLS (address from AW-Settings, certificate from Secrets
  * Manager), which is undefined until configured and loaded (every call then answers `host_unavailable`).
  */
-function defaultClient(): LoginHostClient | undefined {
+export function defaultClient(): LoginHostClient | undefined {
   const socket = process.env.AW_LOGIN_HOST_SOCKET;
   if (socket) return new LoginHostClient(new UnixSocketTransport(socket));
   return getLoginHostProvider().client();
@@ -511,7 +521,14 @@ function defaultClient(): LoginHostClient | undefined {
 let defaultService: HostedSubscriptionService | null = null;
 export function getHostedSubscriptionService(): HostedSubscriptionService {
   if (!defaultService) {
-    defaultService = new HostedSubscriptionService({ db: new LlmConnectionDb(), client: defaultClient, now: () => Date.now(), newId: () => randomUUID() });
+    defaultService = new HostedSubscriptionService({
+      db: new LlmConnectionDb(),
+      client: defaultClient,
+      now: () => Date.now(),
+      newId: () => randomUUID(),
+      // The test environment's unix-socket host is built from the same checkout; the production worker must have been VERIFIED.
+      workerSpeaksOurProtocol: () => !!process.env.AW_LOGIN_HOST_SOCKET || getLoginHostProvider().protocolStatus() === "match",
+    });
   }
   return defaultService;
 }
