@@ -118,6 +118,29 @@ Trial (2026-10-21, `scripts/runTaskSuccessJudgeTrial.ts`; read-only, no spend ro
 
 The two label sets agree with each other at kappa 0.73 (n=40). Dev is smaller and noisier: 0.52 vs GPT, 0.66 on consensus (n=15–19).
 
+Rerun (2026-10-22) on the refreshed set: 80 active work-plan cases, 51 test and 29 dev. The 20 empty cases were
+excluded, and 20 cases from used sessions were seeded in their place (ENG-2608). The judge ran with the retry for
+replies that end in an error or come back empty (ENG-2620). Labels are fresh GPT-5.4 labels. Each row counts only cases
+with both a judge verdict and a label, so n is 78, not 80. Two test cases drop out:
+- `fb513a4b`, one of the seeded cases, has no label because Azure refused it (see below).
+- `f8acef31` has no verdict because the judge got an empty reply on all 3 attempts.
+
+| Judge vs GPT-5.4 labels | n | Agreement | Kappa |
+| --- | --- | --- | --- |
+| Test | 49 | 92% | 0.83 |
+| Dev | 29 | 79% | 0.58 |
+| All | 78 | 87% | 0.73 |
+| The 19 newly seeded cases | 19 | 89% | 0.78 |
+| Test cases where both GPT label runs agree | 38 | 95% | 0.88 |
+
+Reruns are stable:
+- GPT-5.4 gave the same label on 58 of its previous 60 (kappa 0.92).
+- The judge gave the same verdict on 55 of 58 (kappa 0.88).
+
+In 8 of the 10 disagreements the judge says fail where GPT says pass, so the judge is the stricter of the two.
+Azure refused one case (`fb513a4b`) for the labeller every time. The trial now retries a call a provider refuses with
+a 400 on the other providers serving the model (ENG-2625). Evidence: [ENG-2591](https://linear.app/emmabyaw/issue/ENG-2591/agent-task-success-grader-stop-trusting-step-checkmarks-kappa-020-in#comment-055876c6).
+
 This is **not** a validation under the rule above: the labels are AI labels, so `validation` is not
 recorded and `mayGate` stays false. The judge may report `task_success` as advisory. Gating needs a
 human to adjudicate the cases where the labels disagree. Evidence: [ENG-2591](https://linear.app/emmabyaw/issue/ENG-2591/agent-task-success-grader-stop-trusting-step-checkmarks-kappa-020-in#comment-ea8be576).
