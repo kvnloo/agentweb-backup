@@ -166,7 +166,7 @@ import {
   isSubscriptionFeatureEnabled,
   type SubscriptionFeatureId,
 } from '../services/subscriptionService';
-import { checkTokenUsage, deriveBlockedByCost } from '../services/tokenUsageService';
+import { checkTokenUsage, TURN_ADMISSION, deriveBlockedByCost } from '../services/tokenUsageService';
 import { fileProductFeedback, EMMA_FEEDBACK_INTENTS } from '../services/productFeedbackFiling';
 import { ReportReplayCapacityError } from '../utils/reportIntake';
 import { buildUsageBlockCopy, buildScheduledChatBlockMessage } from "../utils/usageBlockCopy";
@@ -1932,7 +1932,7 @@ async function scheduleAutoMediaContinuation(
   // too, since this call is unawaited fire-and-forget and must never reject.
   let usageStatus;
   try {
-    usageStatus = await checkTokenUsage(userId);
+    usageStatus = await checkTokenUsage(userId, TURN_ADMISSION);
   } catch (usageErr) {
     console.error(`AgentMode: media auto-continuation usage check failed for session ${sessionId}:`, usageErr);
     return;
@@ -2556,7 +2556,7 @@ async function scheduleAutoWorkPlanContinuation(
   // customer's usage on their behalf, unattended, after their allowance is exhausted.
   let usageStatus;
   try {
-    usageStatus = await checkTokenUsage(userId);
+    usageStatus = await checkTokenUsage(userId, TURN_ADMISSION);
   } catch (usageErr) {
     console.error(`AgentMode: work-plan auto-continuation usage check failed for session ${sessionId}:`, usageErr);
     return;
@@ -6966,7 +6966,7 @@ export async function runScheduledChat(
     }
 
     // Check token usage limits before creating the session
-    const usageStatus = await checkTokenUsage(userId);
+    const usageStatus = await checkTokenUsage(userId, TURN_ADMISSION);
     if (!usageStatus.allowed) {
       const notifyEmails = await resolveScheduleAlertRecipients(schedule, async () => {
         const { userDb: tokenUserDb } = await import('../services/db');
@@ -11145,7 +11145,7 @@ export const agentModeController = {
       generationSlot = slot;
 
       // Check token usage limits
-      const usageStatus = await checkTokenUsage(user.userId);
+      const usageStatus = await checkTokenUsage(user.userId, TURN_ADMISSION);
       if (!usageStatus.allowed) {
         // ENG-527: product-feedback filing is never token-limited. An over-quota user who
         // explicitly asks Emma to file a bug/feature request (portal `feedbackIntent`) gets it
@@ -12751,7 +12751,7 @@ export const agentModeController = {
       // via incrementUserTokenUsage) so an unauthenticated visitor can never
       // cause more vendor spend than the owner could cause themselves. This runs
       // before any LLM call: refuse loudly, never a degraded-but-billed path.
-      const usageStatus = await checkTokenUsage(session.userId);
+      const usageStatus = await checkTokenUsage(session.userId, TURN_ADMISSION);
       if (!usageStatus.allowed) {
         // The caller is anonymous, so the denial carries the message ONLY.
         // `usageStatus` is the owner's billing record (allowance, bonus, dollar
@@ -17252,7 +17252,7 @@ export const agentModeController = {
       // Same allowance gate (and 429 body) as /generate, checked before the model so an
       // exhausted account gets the 429 first, exactly as there. Interactive only: the
       // scheduled / Slack / email / result-endpoint callers of runVerifiedChat have their own.
-      const usageStatus = await checkTokenUsage(user.userId);
+      const usageStatus = await checkTokenUsage(user.userId, TURN_ADMISSION);
       if (!usageStatus.allowed) {
         return res.status(429).json(await buildUsagePausedBody({
           usageStatus,

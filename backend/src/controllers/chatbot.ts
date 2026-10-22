@@ -20,7 +20,7 @@ function redactSessionForViewer<T extends { messages?: any[] } | null | undefine
   return session;
 }
 import { chatbotDb, generateChatResponse } from '../services/chatbotService';
-import { checkTokenUsage, toCustomerTokenUsage } from '../services/tokenUsageService';
+import { checkTokenUsage, TURN_ADMISSION, toCustomerTokenUsage } from '../services/tokenUsageService';
 import { buildUsageBlockCopy } from '../utils/usageBlockCopy';
 import { userDb } from '../services/db';
 import { resolveRunFunding, withRunFunding } from '../services/funding/runFunding';
@@ -192,7 +192,7 @@ export const sendMessage = async (req: AuthenticatedRequest, res: Response) => {
 
     // Check token usage limits
     if (userId) {
-      const usageStatus = await checkTokenUsage(userId);
+      const usageStatus = await checkTokenUsage(userId, TURN_ADMISSION);
       if (!usageStatus.allowed) {
         // ENG-1344 AC6: one producer for the refusal, shared with the portal
         // modal, the MCP 429 and the socket error. Composed once so the flat
@@ -282,7 +282,7 @@ export const sendMessageStream = async (req: AuthenticatedRequest, res: Response
   }
 
   // Check token usage limits
-  const usageStatus = await checkTokenUsage(userId);
+  const usageStatus = await checkTokenUsage(userId, TURN_ADMISSION);
   if (!usageStatus.allowed) {
     const blockCopy = buildUsageBlockCopy({ month: usageStatus.month, paygBlock: usageStatus.paygBlock });
     res.status(429).json({

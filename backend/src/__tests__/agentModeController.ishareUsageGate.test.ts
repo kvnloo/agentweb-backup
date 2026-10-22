@@ -61,6 +61,7 @@ jest.mock('../utils/sseProgress', () => ({
 }));
 
 jest.mock('../services/tokenUsageService', () => ({
+  TURN_ADMISSION: { recordAdmission: true },
   checkTokenUsage: jest.fn(),
   incrementUserTokenUsage: jest.fn(),
 }));
@@ -227,7 +228,7 @@ describe('ENG-705 — share-token generate routes are usage-gated before any spe
     const res = makeRes();
     await agentModeController.generateSharedResponse(makeReq(), res);
 
-    expect(mockCheckTokenUsage).toHaveBeenCalledWith(OWNER_USER_ID);
+    expect(mockCheckTokenUsage).toHaveBeenCalledWith(OWNER_USER_ID, { recordAdmission: true });
   });
 
   it('AC2: spend from a share-token request is booked to the owner — the worker runs under the owner userId', async () => {
