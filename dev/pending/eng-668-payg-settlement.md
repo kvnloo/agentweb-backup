@@ -102,8 +102,18 @@ the owner updates theirs. A customer who saved their card through the setup-mode
 no invoice default, so their invoice IS pinned. `setup_intent.succeeded` therefore points every OPEN
 overage invoice of that customer that is pinned to another method at the newly saved one
 (`invoices.update default_payment_method`; key `payg-repoint:{invoice}:{pm}`), and Stripe's next retry
-charges it. If the account has no open overage invoice, this costs one row read and no Stripe call, and a
-failed row read is acknowledged as before. No checkout, customer or subscription field is touched. An
+charges it. It re-points only to the customer's NEWEST attached card (`paymentMethods.list({customer,
+type: card})`), because events are not ordered: an older card's late event never moves the invoice back,
+and a detached or non-card method is never used. Finding the invoices depends on the SetupIntent:
+- Tagged with the user (Zoma's Checkout): one indexed row read.
+- Untagged: one Stripe call, `invoices.list({customer, status: open})`. AW-Users has no
+  `stripe_customer_id` index, so the account is not looked up by scanning the table.
+
+Either way an invoice is moved only while its owner's settlement record still names it as unpaid. If
+that lookup fails, the error is logged and the event acknowledged. If Stripe refuses one update (the card
+was detached meanwhile), the refusal is logged, the other invoices are still re-pointed, on-call is
+alerted once (`payg-settlement-repoint`) and the webhook is acknowledged. No checkout, customer or
+subscription field is touched. An
 invoice Stripe already collected when settlement adopts it is recorded `paid`. Records older than 12 months are pruned in the same write.
 
 **Webhooks.** `handleInvoicePaymentSucceeded/Failed` hand any `metadata.purchaseType === 'payg_overage'`
@@ -124,12 +134,25 @@ the suspension. Paying never lifts a dispute suspension.
 the failure handler reads the invoice's default invoice payment
 (`invoicePayments.list({invoice, expand: data.payment.payment_intent})`; Basil has no
 `invoice.payment_intent`). `requires_action` is not a failure: nothing is suspended, no failure email is
-sent, the month stays `invoiced`, and the owner gets the once-only "confirm your payment" email. A decline,
-or an authentication the owner failed (`requires_payment_method`), still fails the month. If the lookup
-fails, the webhook answers 500 and Stripe redelivers; the handler never guesses. Every webhook ignores (logs) an invoice the record set aside
+sent, the month stays `invoiced`, and the owner gets the once-only "confirm your payment" email. The
+first such report stamps `actionRequiredAt` (once; a later report never moves it). If the PaymentIntent is
+`succeeded`, `processing` or `requires_capture` (the owner confirmed late, or a bank debit is in flight),
+it is not a failure either, and `invoice.paid` follows. A decline or a failed authentication
+(`requires_payment_method`), `canceled`, `requires_confirmation`, or no PaymentIntent at all still fails
+the month. If the lookup fails, the webhook answers 500 and Stripe redelivers; the handler never guesses.
+**A payment never confirmed.** Suppose a month is still `invoiced`
+`PAYG_PAYMENT_CONFIRMATION_GRACE_DAYS` (7) days after `actionRequiredAt`, and Stripe still has its
+payment waiting or declined. The daily sweep then treats it as unpaid: the month becomes `failed`
+(`paymentUnconfirmedAt`), PAYG is held (`{reason: payment_failed, unconfirmed: true}`), and the owner is
+sent one email with the invoice to confirm it. The `invoiced -> failed` write is the dedupe. Paying or
+confirming the invoice lifts the hold like any payment failure. A payment that went through or is
+processing is left for its `invoice.paid`. Every webhook ignores (logs) an invoice the record set aside
 (`uncollectedInvoice`). A record that names no invoice yet (a `pending` re-created by `retry`) accepts an
-event only for an invoice its own search would adopt: this record's key in the metadata, and not void. So
-a late `invoice.voided` for an older invoice of the month never writes off the new record. A `held` record that carries the invoice's id is moved to paid/failed too. Dispute on
+event only for the invoice its own run created: this record's key AND its `createdAt` in the invoice
+metadata (`recordCreatedAt`, stamped at creation; the key alone is the same for every record of the
+month), and not void. So a late `invoice.voided`, or a redelivered failure, for an older invoice of the
+month never touches the new record. An older live invoice that the run's search adopts becomes the
+record's as soon as the run records its id. A `held` record that carries the invoice's id is moved to paid/failed too. Dispute on
 an overage charge -> `suspended = dispute` (see Disputes below). Refund -> `refundedCents` (cumulative,
 only ever raised), PAYG not resumed. Overage recognition uses PaymentIntent -> `invoicePayments.list` ->
 invoice metadata (Basil). For refunds it runs only while the switch is on; for disputes it always runs. A failed lookup on a **dispute** errors the webhook (500) so Stripe redelivers — a chargeback must
@@ -169,8 +192,10 @@ under their own payment-history types, `payg_overage_payment_succeeded` / `payg_
   history row, no page. `charge.dispute.closed` records the closing once. If the dispute was won (or was a
   closed inquiry), the hold is lifted only when NO dispute on the account is still open, and only if the
   hold was set by a recorded dispute (its `disputeId` is one of them, so a hold set by hand stays). If
-  another month is still failed, the hold becomes that month's payment-failure hold. The lift's write is
-  conditional on `suspended` being exactly what it read. A dispute opened after that read re-stamps the
+  another month is still failed, the hold becomes that month's payment-failure hold. That write is also
+  conditional on THAT month still being `failed` on that invoice: if it is paid or voided after the read,
+  the write fails and the lift reads again, so the account is never held for a month that is settled.
+  The lift's write is conditional on `suspended` being exactly what it read. A dispute opened after that read re-stamps the
   hold. A month that fails under a dispute hold stamps `suspended.paymentFailedAt`. Either one makes the
   lift's write fail; the lift then reads again (up to 5 times, then 500 and Stripe redelivers). If the
   dispute was lost, the month is written off (`dispute_lost`) and PAYG is held as `{..., lost: true}` in
@@ -182,13 +207,19 @@ under their own payment-history types, `payg_overage_payment_succeeded` / `payg_
   still records the charge's cumulative `amount_refunded`, without a dedupe key. Unchanged, a follow-up.)
 - A cancellation scheduled for the period end (`subscription_status: canceling`) keeps PAYG covering, like
   the plan itself; only `canceled` (or past_due etc.) is `subscription_inactive`.
-- The owner of a suspended account is pointed at the unpaid invoice: `GET /api/subscription/payg` returns
-  `openInvoiceUrl` (newest month still `failed`; owner only, null otherwise; no amount). The 429
-  `usageBlock` carries `openInvoiceUrl` with `reason: payg_suspended` (owner only, never on a dispute hold).
-  Both are read from settlement records, with no Stripe call. The block names why
-  (`paygSuspendedReason`) and the copy says what lifts it. For a payment failure: "Pay the open invoice to
-  resume pay-as-you-go." For a dispute: "Please contact us to resume pay-as-you-go." It no longer says
-  "update your payment method", because updating a card does not pay an open invoice.
+- The owner of a suspended account is pointed at the unpaid invoice. `GET /api/subscription/payg` returns
+  `openInvoiceUrl` (newest month still `failed`; no amount), and the 429 `usageBlock` carries
+  `openInvoiceUrl` with `reason: payg_suspended`. Both are owner only and never under a dispute hold
+  (open or lost), because paying an invoice does not lift that. Both are read from settlement records,
+  with no Stripe call. The block names why (`paygSuspendedReason`: `payment_failed` |
+  `payment_unconfirmed` | `dispute` | `dispute_lost`), and the copy says what lifts it:
+  - payment failure: "Pay the open invoice to resume pay-as-you-go."
+  - unconfirmed payment: "Open the invoice to confirm the payment and resume pay-as-you-go."
+  - dispute: "…while a recent payment is under review with your bank. Please contact us…"
+  - lost dispute: "…following a dispute about a recent payment. Please contact us…"
+
+  A pooled member (`paygOwnerResolves`) is told "Your organization owner can resolve this." instead. The
+  copy no longer says "update your payment method", because updating a card does not pay an open invoice.
 
 **Emails.** Copy in one place: `utils/paygSettlementCopy.ts` (needs copy review). Invoice created: sent
 exactly once per month (`emailedAt`, claimed conditionally on the invoice AND the state it describes). It is
@@ -199,7 +230,8 @@ or void that landed first means no invoice email, so the owner never reads "will
 "didn't go through". The email states the month and the percentage of the **highest** limit the owner had set that month (the bill follows
 that limit, so the percentage matches the amount), plus the Stripe invoice link — no dollars. Payment
 failed: PAYG on hold, update the card and pay the invoice. Payment needs confirming (new): the bank asked
-for confirmation; open the invoice to confirm; PAYG stays on.
+for confirmation; open the invoice to confirm; PAYG stays on. Payment still unconfirmed after 7 days (new, rv6): PAYG on hold until it
+is confirmed; open the invoice to confirm it.
 
 **Rollback.** Set `payg_settlement_enabled` to anything but `true`: the sweep stops within ~60s and the
 refund/dispute webhooks return to exactly today's handling. A month left `pending` stays pending (no new
@@ -242,6 +274,5 @@ refund of a closed month's top-up after the month ends is not reflected in `llmU
 (billed less, never more); `capHighWaterMicroUsd` includes revocable top-up credit in the pool it is a
 percentage of (the pool mark excludes it — within the consent given at the time); the gate records the
 admission month with `getCurrentUsageMonth()` while its caller's billing month comes from
-`getCurrentMonth()` (identical on the UTC fleet; pre-existing). An overage invoice the owner never authenticates (3-D Secure)
-stays open, and PAYG stays on, until Stripe marks it uncollectible under the account's failed-payment
-settings. Set Billing → "Manage failed payments" to mark invoices uncollectible after the last retry.
+`getCurrentMonth()` (identical on the UTC fleet; pre-existing). With settlement switched off, the
+7-day unconfirmed-payment check does not run (it is part of the sweep).
