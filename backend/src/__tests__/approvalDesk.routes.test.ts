@@ -166,6 +166,27 @@ describe('GET /queue', () => {
     expect(res.body.manifests[0]).toMatchObject({ itemCount: 2, pendingCount: 1, readyToDispatchCount: 1 });
   });
 
+  it('files act_333 and 333 under ONE account group', async () => {
+    mockListPendingForApprover.mockResolvedValue([
+      decisionFor('d1', 'matt', { manifestId: 'm1', metaWriteDispatch: { resolvedAccountId: 'act_333' } }),
+      decisionFor('d2', 'matt', { manifestId: 'm2', metaWriteDispatch: { resolvedAccountId: '333' } }),
+    ]);
+    const res = await request(app).get('/api/approval-desk/queue').set('Authorization', `Bearer ${mattToken}`);
+    expect(res.body.manifests.map((m: any) => m.accountId)).toEqual(['333', '333']);
+  });
+
+  it('does not file a packet that spans two ad accounts under the first one', async () => {
+    mockListPendingForApprover.mockResolvedValue([
+      decisionFor('d1', 'matt', { manifestId: 'm1', metaWriteDispatch: { resolvedAccountId: 'act_ALPHA' } }),
+      decisionFor('d2', 'matt', { manifestId: 'm1', metaWriteDispatch: { resolvedAccountId: 'act_BETA' } }),
+    ]);
+    const res = await request(app).get('/api/approval-desk/queue').set('Authorization', `Bearer ${mattToken}`);
+    const m = res.body.manifests[0];
+    expect(m.accountId).toBeNull();
+    expect(m.accountLabel).toBeNull();
+    expect(m.accountIds.sort()).toEqual(['ALPHA', 'BETA']);
+  });
+
   it('excludes pre-existing decisions with no manifestId instead of surfacing a dead-end entry (found live on env1)', async () => {
     mockListPendingForApprover.mockResolvedValue([
       decisionFor('legacy-1', 'matt', { manifestId: undefined as any }),

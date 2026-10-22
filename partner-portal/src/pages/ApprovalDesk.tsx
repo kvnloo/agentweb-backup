@@ -90,6 +90,8 @@ interface ManifestSummary {
   // null for a manifest with no meta_write items (e.g. a pure plan_choice
   // packet) — there's no account to group it under.
   accountId: string | null;
+  // Optional: an older backend does not send it. More than one = a packet that spans ad accounts.
+  accountIds?: string[];
   accountLabel: string | null;
 }
 
@@ -121,6 +123,9 @@ function ManifestRow({ m, showSubject }: { m: ManifestSummary; showSubject: bool
       <CardContent>
         <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" alignItems={{ sm: 'center' }} spacing={1}>
           <Box sx={{ minWidth: 0 }}>
+            {(m.accountIds?.length ?? 0) > 1 && (
+              <Chip size="small" color="error" label={`Spans ${m.accountIds!.length} ad accounts: ${m.accountIds!.join(', ')}`} sx={{ mb: 0.5, mr: 0.5 }} />
+            )}
             {readyToDispatch && <Chip size="small" color="warning" label="Ready to dispatch — not sent yet" sx={{ mb: 0.5 }} />}
             {showSubject && <Typography variant="subtitle1">{m.subjectLabel || m.manifestId}</Typography>}
             {m.itemPreviews?.map((line, i) => (

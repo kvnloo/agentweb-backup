@@ -678,6 +678,9 @@ export class ApprovalInboxService {
     keyValue: string,
     pendingStatus: ApprovalDecisionStatus | ApprovalDecisionStatus[],
     limit: number,
+    // Applied server-side BEFORE the page limit counts a match, so rows the caller would only drop
+    // afterwards (e.g. other gate types) can't fill the page and hide the rows it wants.
+    extra?: { expression: string; names: Record<string, string>; values: Record<string, unknown> },
   ): Promise<ApprovalDecision[]> {
     const statuses = Array.isArray(pendingStatus) ? pendingStatus : [pendingStatus];
     const statusValues = Object.fromEntries(statuses.map((st, i) => [`:s${i}`, st]));
@@ -690,9 +693,9 @@ export class ApprovalInboxService {
           TableName: APPROVAL_DECISIONS_TABLE,
           IndexName: indexName,
           KeyConditionExpression: `${keyName} = :keyValue`,
-          FilterExpression: `#status IN (${Object.keys(statusValues).join(', ')})`,
-          ExpressionAttributeNames: { '#status': 'status' },
-          ExpressionAttributeValues: { ':keyValue': keyValue, ...statusValues },
+          FilterExpression: `#status IN (${Object.keys(statusValues).join(', ')})${extra ? ` AND ${extra.expression}` : ''}`,
+          ExpressionAttributeNames: { '#status': 'status', ...(extra?.names ?? {}) },
+          ExpressionAttributeValues: { ':keyValue': keyValue, ...statusValues, ...(extra?.values ?? {}) },
           ScanIndexForward: true,
           Limit: limit,
           ExclusiveStartKey: lastEvaluatedKey,
@@ -723,8 +726,11 @@ export class ApprovalInboxService {
    * find the packet again from the queue even though nothing had been dispatched yet.
    */
   async listAwaitingDispatchForApprover(approver: ApprovalDecisionApprover, limit = 50): Promise<ApprovalDecision[]> {
-    const found = await this.listPendingByIndex('ApproverIndex', 'approver', approver, ['approved', 'dispatching'], limit);
-    return found.filter((d) => d.gateType === 'meta_write' && d.verdict === 'approve');
+    return this.listPendingByIndex('ApproverIndex', 'approver', approver, ['approved', 'dispatching'], limit, {
+      expression: '#gateType = :metaWrite AND #verdict = :approve',
+      names: { '#gateType': 'gateType', '#verdict': 'verdict' },
+      values: { ':metaWrite': 'meta_write', ':approve': 'approve' },
+    });
   }
 
   async listPendingForCustomer(customerId: string, limit = 50): Promise<ApprovalDecision[]> {

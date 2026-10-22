@@ -35,9 +35,21 @@ async function resolveApprover(req: AuthenticatedRequest) {
 // payload (resolvedAccountId is the frozen, already-tenancy-checked value —
 // never account_id, the raw/unverified one); this just surfaces it instead
 // of leaving callers to regex it out of a free-text subjectLabel.
-function accountIdForManifest(decisions: ApprovalDecision[]): string | null {
-  const withAccount = decisions.find((d) => d.metaWriteDispatch?.resolvedAccountId);
-  return withAccount?.metaWriteDispatch?.resolvedAccountId || null;
+function normalizeAccountId(id: unknown): string | null {
+  const v = typeof id === 'string' ? id.replace(/^act_/, '').trim() : '';
+  return v || null;
+}
+
+// Producers have stored resolvedAccountId both as "act_333" and "333", so groups key on the bare id.
+// A packet written by an older build can span several accounts: report every account it touches
+// instead of silently filing the whole packet under the first one.
+function accountIdsForManifest(decisions: ApprovalDecision[]): string[] {
+  const ids = new Set<string>();
+  for (const d of decisions) {
+    const id = normalizeAccountId(d.metaWriteDispatch?.resolvedAccountId);
+    if (id) ids.add(id);
+  }
+  return [...ids];
 }
 
 // subjectLabel is producer-authored free text (see agentModeService.ts's
@@ -47,7 +59,7 @@ function accountIdForManifest(decisions: ApprovalDecision[]): string | null {
 // it. Falls back to the raw account id if the label doesn't match that
 // shape (never blocks grouping on a label-parsing miss).
 function accountLabelForManifest(decisions: ApprovalDecision[], accountId: string | null): string {
-  const label = decisions.find((d) => d.metaWriteDispatch?.resolvedAccountId === accountId)?.subjectLabel;
+  const label = decisions.find((d) => normalizeAccountId(d.metaWriteDispatch?.resolvedAccountId) === accountId)?.subjectLabel;
   // The meta_write producer labels decisions "Meta Ads · Account <id>" (no company name available there).
   const producerLabel = label?.match(/^Meta Ads\s*·\s*Account\s+(\S+)/i);
   if (producerLabel) return `Ad account ${producerLabel[1]}`;
@@ -128,7 +140,9 @@ router.get('/queue', authenticateToken, isAdmin, async (req, res) => {
       byManifest.set(decision.manifestId, list);
     }
     const manifests = [...byManifest.entries()].map(([manifestId, decisions]) => {
-      const accountId = accountIdForManifest(decisions);
+      const accountIds = accountIdsForManifest(decisions);
+      // Exactly one account -> group under it; several (legacy mixed packet) -> no single account.
+      const accountId = accountIds.length === 1 ? accountIds[0] : null;
       return {
         manifestId,
         // Display-only summary fields — the manifest detail route below is the
@@ -146,6 +160,9 @@ router.get('/queue', authenticateToken, isAdmin, async (req, res) => {
         // plan_choice packet) — those have no account to group under and
         // the frontend buckets them separately rather than forcing a fake one.
         accountId,
+        // Every account the packet touches; more than one means an older mixed packet that is shown
+        // on its own rather than filed under a single account.
+        accountIds,
         accountLabel: accountId ? accountLabelForManifest(decisions, accountId) : null,
       };
     });
