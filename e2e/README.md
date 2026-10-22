@@ -15,7 +15,10 @@ already-running AgentWeb test environment (for example on Atem) instead.
 
 ## Run locally
 
+From the repository root, install Partner Portal dependencies before starting the runner; otherwise a fresh clone cannot launch Vite.
+
 ```bash
+npm ci --prefix partner-portal
 cd e2e
 npm install
 npm exec -- e2e-web install chromium
