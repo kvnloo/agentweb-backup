@@ -96,6 +96,28 @@ export function requireReportedCostUsd(res: Parameters<typeof openRouterCallCost
   return reported;
 }
 
+/** The provider that refused a call outright (HTTP 400 naming it), if that is what `err` is. */
+function refusingProvider(err: unknown): string | undefined {
+  const e = err as { status?: unknown; error?: { metadata?: { provider_name?: unknown } } } | undefined;
+  const provider = e?.error?.metadata?.provider_name;
+  return e?.status === 400 && typeof provider === 'string' && provider ? provider : undefined;
+}
+
+/**
+ * Sends `body`; if one provider refuses it with a 400, sends it once more with that provider ignored, so
+ * OpenRouter serves the model from another. Azure refuses one GPT-5.4 labeller case every time, while
+ * OpenAI and Bedrock also serve the model (ENG-2625). Any other failure, or the retry's own, is passed on.
+ */
+export async function createAvoidingRefusingProvider<T>(create: (body: Record<string, unknown>) => Promise<T>, body: Record<string, unknown>): Promise<T> {
+  try {
+    return await create(body);
+  } catch (err) {
+    const provider = refusingProvider(err);
+    if (!provider) throw err;
+    return create({ ...body, provider: { ignore: [provider] } });
+  }
+}
+
 /** OpenRouter without the usage ledger; adds each call's reported cost to `cost.usd`. */
 async function unmeteredJudgeLlm(cost: { usd: number }): Promise<RubricJudgeLlm> {
   const { agentModeService } = await import('../services/agentModeService');
@@ -104,7 +126,8 @@ async function unmeteredJudgeLlm(cost: { usd: number }): Promise<RubricJudgeLlm>
   return {
     async complete(request) {
       // Non-streaming request: the response is a single completion with usage.
-      const res = (await client.chat.completions.create(
+      const res = (await createAvoidingRefusingProvider(
+        (body) => client.chat.completions.create(body as Parameters<typeof client.chat.completions.create>[0], { timeout: request.timeoutMs }),
         {
           model: resolveOpenRouterUpstreamModelId(request.model),
           messages: [
@@ -115,8 +138,7 @@ async function unmeteredJudgeLlm(cost: { usd: number }): Promise<RubricJudgeLlm>
           max_tokens: request.maxTokens,
           // OpenRouter reports each call's cost only when asked; the cap depends on it.
           usage: { include: true },
-        } as Parameters<typeof client.chat.completions.create>[0],
-        { timeout: request.timeoutMs },
+        },
       )) as unknown as Parameters<typeof readChatCompletion>[0] & { usage?: Record<string, unknown>; openrouter_metadata?: { is_byok?: unknown } };
       cost.usd += requireReportedCostUsd(res);
       return readChatCompletion(res);
