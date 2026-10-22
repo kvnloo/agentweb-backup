@@ -212,7 +212,7 @@ const OWNER = 'owner-1';
 const M = '2026-09';
 const KEY = `payg:${OWNER}:${M}`;
 const AMOUNT = 2345;
-const META = { purchaseType: PAYG_OVERAGE_PURCHASE_TYPE, billingUserId: OWNER, month: M, idempotencyKey: KEY } as const;
+const META = { purchaseType: PAYG_OVERAGE_PURCHASE_TYPE, billingUserId: OWNER, month: M, idempotencyKey: KEY, recordCreatedAt: '2026-10-02T12:00:00.000Z' } as const;
 const QUERY = `metadata['purchaseType']:'payg_overage' AND metadata['billingUserId']:'${OWNER}' AND metadata['month']:'${M}'`;
 
 const issueInput = (over: Record<string, unknown> = {}) => ({
@@ -345,6 +345,7 @@ suite('PAYG settlement Stripe calls against stripe-mock (API ' + STRIPE_API_VERS
         'metadata[billingUserId]': OWNER,
         'metadata[month]': M,
         'metadata[idempotencyKey]': KEY,
+        'metadata[recordCreatedAt]': META.recordCreatedAt,
         default_payment_method: 'pm_card',
       });
       expect(create.idempotencyKey).toBe(`${input.idempotencyKey}:invoice`);
@@ -370,6 +371,7 @@ suite('PAYG settlement Stripe calls against stripe-mock (API ' + STRIPE_API_VERS
         'metadata[billingUserId]': OWNER,
         'metadata[month]': M,
         'metadata[idempotencyKey]': KEY,
+        'metadata[recordCreatedAt]': META.recordCreatedAt,
       });
       expect(item.idempotencyKey).toBe(`${input.idempotencyKey}:item`);
       expect(item.raw).toMatchObject({ object: 'invoiceitem', invoice: created.id, amount: AMOUNT, currency: 'usd' });
@@ -536,7 +538,7 @@ suite('PAYG settlement Stripe calls against stripe-mock (API ' + STRIPE_API_VERS
       expect(params(list.query)).toEqual({
         'payment[type]': 'payment_intent',
         'payment[payment_intent]': 'pi_123',
-        limit: '1',
+        limit: '10',
         'expand[0]': 'data.invoice',
       });
       expect(list.raw.object).toBe('list');
@@ -1047,7 +1049,7 @@ suite('PAYG settlement Stripe calls against stripe-mock (API ' + STRIPE_API_VERS
 
     it('a PaymentIntent the list did not expand is retrieved (GET /v1/payment_intents/:id; `status` exists)', async () => {
       steers = [onPath('GET', /^\/v1\/invoice_payments$/, (json) => { json.data[0].payment.payment_intent = 'pi_overage'; })];
-      await expect(stripeService.paygOverageInvoicePaymentNeedsAction('in_overage')).resolves.toBe(false);
+      await expect(stripeService.paygOverageInvoicePaymentState('in_overage')).resolves.toBe('declined');
       const retrieved = one('GET', /^\/v1\/payment_intents\/pi_overage$/);
       expectField(retrieved.raw, 'status', 'string');
     });
@@ -1071,17 +1073,44 @@ suite('PAYG settlement Stripe calls against stripe-mock (API ' + STRIPE_API_VERS
       expectField(invoice, 'default_payment_method', 'string', 'object', 'null');
       expectField(invoice, 'customer', 'string', 'object', 'null');
       Object.assign(setupIntent, { status: 'succeeded', customer: 'cus_card', payment_method: 'pm_new', metadata: { userId: OWNER } });
-      steers = [onPath('GET', /^\/v1\/invoices\/in_overage$/, (json) => {
-        Object.assign(json, { status: 'open', customer: 'cus_card', default_payment_method: 'pm_card', metadata: { ...META } });
-      })];
+      steers = [
+        onPath('GET', /^\/v1\/invoices\/in_overage$/, (json) => {
+          Object.assign(json, { status: 'open', customer: 'cus_card', default_payment_method: 'pm_card', metadata: { ...META } });
+        }),
+        // The customer's newest attached card is the one just saved.
+        onPath('GET', /^\/v1\/payment_methods$/, (json) => { Object.assign(json.data[0], { id: 'pm_new', created: nowSeconds() }); }),
+      ];
       recs = [];
       useRow(ownerRow(settlementRecord({ status: 'failed', invoiceId: 'in_overage' })));
       const res = await deliverSigned('setup_intent.succeeded', setupIntent);
       expect(res.statusCode).toBe(200);
+      const methods = one('GET', /^\/v1\/payment_methods$/);
+      expect(params(methods.query)).toEqual({ customer: 'cus_card', type: 'card', limit: '100' });
+      for (const pm of methods.raw.data) { expectField(pm, 'id', 'string'); expectField(pm, 'created', 'number'); expectField(pm, 'type', 'string'); }
       const updated = one('POST', /^\/v1\/invoices\/in_overage$/);
       expect(params(updated.body)).toEqual({ default_payment_method: 'pm_new' });
       expect(updated.idempotencyKey).toBe('payg-repoint:in_overage:pm_new');
       expect(onStripeSubscriptionEvent).not.toHaveBeenCalled(); // not mirrored to the CRM
+    });
+
+    it('setup_intent.succeeded with no user tag: GET /v1/invoices (customer, open) accepted; an overage one is confirmed against its owner\'s record (rv6 MINOR 4a)', async () => {
+      const setupIntent: Json = await client().setupIntents.retrieve('seti_new');
+      Object.assign(setupIntent, { status: 'succeeded', customer: 'cus_card', payment_method: 'pm_new', metadata: {} });
+      steers = [
+        onPath('GET', /^\/v1\/invoices$/, (json) => {
+          expect(json.data.length).toBeGreaterThan(0);
+          Object.assign(json.data[0], { id: 'in_overage', status: 'open', customer: 'cus_card', default_payment_method: 'pm_card', metadata: { ...META } });
+        }),
+        onPath('GET', /^\/v1\/payment_methods$/, (json) => { Object.assign(json.data[0], { id: 'pm_new', created: nowSeconds() }); }),
+      ];
+      recs = [];
+      useRow(ownerRow(settlementRecord({ status: 'failed', invoiceId: 'in_overage' })));
+      expect((await deliverSigned('setup_intent.succeeded', setupIntent)).statusCode).toBe(200);
+      const listed = one('GET', /^\/v1\/invoices$/);
+      expect(params(listed.query)).toEqual({ customer: 'cus_card', status: 'open', limit: '100' });
+      for (const invoice of listed.raw.data) { expectField(invoice, 'metadata', 'object', 'null'); expectField(invoice, 'default_payment_method', 'string', 'object', 'null'); }
+      expect(params(one('POST', /^\/v1\/invoices\/in_overage$/).body)).toEqual({ default_payment_method: 'pm_new' });
+      expect(userDb.scanWithFilter).not.toHaveBeenCalled();
     });
 
     it('setup_intent.succeeded for an account with no open overage invoice: no Stripe call at all', async () => {

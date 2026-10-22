@@ -170,6 +170,20 @@ describe('GET /api/subscription/payg', () => {
     expect(member.body.openInvoiceUrl).toBeNull();
   });
 
+  it.each([
+    [{ reason: 'dispute', at: '2026-10-05T00:00:00.000Z', invoiceId: 'in_aug', disputeId: 'dp_1' }],
+    [{ reason: 'dispute', at: '2026-10-05T00:00:00.000Z', invoiceId: 'in_aug', disputeId: 'dp_1', lost: true }],
+  ])('under a dispute hold (%j) no invoice link, even with a month unpaid — the same rule as the 429 (rv6 MINOR 4c)', async (suspended) => {
+    users[OWNER].paygOverage = {
+      enabled: true, capPercentOfPool: 50, updatedBy: OWNER, updatedAt: '2026-10-01T00:00:00.000Z', version: 1, suspended,
+    };
+    users[OWNER].paygSettlements = {
+      '2026-09': { status: 'failed', invoiceId: 'in_sep', hostedInvoiceUrl: 'https://invoice.stripe.com/i/sep' },
+    };
+    const owner = await get(OWNER).expect(200);
+    expect(owner.body).toMatchObject({ suspended: 'dispute', openInvoiceUrl: null });
+  });
+
   it('reports overage as a percentage of the cap, never in dollars', async () => {
     users[OWNER].paygOverage = {
       enabled: true, capPercentOfPool: 50, updatedBy: OWNER,

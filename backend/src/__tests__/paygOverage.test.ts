@@ -98,6 +98,19 @@ describe('evaluatePaygAdmission', () => {
     expect(result.block).toEqual({ reason: 'payg_suspended', paygSuspendedReason: 'dispute' });
   });
 
+  it('names a lost dispute and an unconfirmed payment (rv6 MINOR 4b / 5)', () => {
+    const lost = evaluatePaygAdmission({
+      ...admitting(), costUsedMicroUsd: 400 * USD,
+      account: account({ suspended: { reason: 'dispute', at: '2026-10-02T00:00:00.000Z', lost: true } }),
+    });
+    expect(lost.block).toEqual({ reason: 'payg_suspended', paygSuspendedReason: 'dispute_lost' });
+    const unconfirmed = evaluatePaygAdmission({
+      ...admitting(), costUsedMicroUsd: 400 * USD,
+      account: account({ suspended: { reason: 'payment_failed', at: '2026-10-02T00:00:00.000Z', unconfirmed: true } }),
+    });
+    expect(unconfirmed.block).toEqual({ reason: 'payg_suspended', paygSuspendedReason: 'payment_unconfirmed' });
+  });
+
   it('says PAYG is on but not covering when no payment method is on file', () => {
     expect(evaluatePaygAdmission({ ...admitting(), hasPaymentMethod: false }).block)
       .toEqual({ reason: 'payg_inactive', paygInactiveReason: 'no_payment_method' });
@@ -380,7 +393,30 @@ describe('buildUsageBlockCopy — PAYG variants', () => {
     expect(copy.message).not.toMatch(/invoice/);
   });
 
-  it.each([undefined, 'payment_failed', 'dispute'] as const)('never says "update your payment method" for a hold (%p)', (paygSuspendedReason) => {
+  it('unconfirmed payment hold: confirm it on the invoice (rv6 MINOR 5)', () => {
+    const copy = buildUsageBlockCopy({ month: MONTH, paygBlock: { reason: 'payg_suspended', paygSuspendedReason: 'payment_unconfirmed' } });
+    expect(copy.body).toMatch(/still waiting to be confirmed/);
+    expect(copy.message).toContain('Open the invoice to confirm the payment and resume pay-as-you-go.');
+  });
+
+  it('lost dispute hold: never "under review" — it was decided; contact us (rv6 MINOR 4b)', () => {
+    const copy = buildUsageBlockCopy({ month: MONTH, paygBlock: { reason: 'payg_suspended', paygSuspendedReason: 'dispute_lost' } });
+    expect(copy.body).toMatch(/following a dispute about a recent payment/);
+    expect(`${copy.body} ${copy.message}`).not.toMatch(/under review/);
+    expect(copy.message).toContain('Please contact us to resume pay-as-you-go.');
+  });
+
+  it.each(['payment_failed', 'payment_unconfirmed', 'dispute', 'dispute_lost', undefined] as const)(
+    'a pooled member is told the organization owner can resolve it, never to pay or contact us (%p) (rv6 MINOR 4d)', (paygSuspendedReason) => {
+      for (const month of [MONTH, null]) {
+        const copy = buildUsageBlockCopy({ month, paygBlock: { reason: 'payg_suspended', paygOwnerResolves: true, ...(paygSuspendedReason ? { paygSuspendedReason } : {}) } });
+        expect(copy.message).toContain('Your organization owner can resolve this.');
+        expect(copy.message).not.toMatch(/Pay the open invoice|contact us|Open the invoice/);
+      }
+    });
+
+
+  it.each([undefined, 'payment_failed', 'payment_unconfirmed', 'dispute', 'dispute_lost'] as const)('never says "update your payment method" for a hold (%p)', (paygSuspendedReason) => {
     for (const month of [MONTH, null]) {
       const copy = buildUsageBlockCopy({ month, paygBlock: { reason: 'payg_suspended', ...(paygSuspendedReason ? { paygSuspendedReason } : {}) } });
       expect(`${copy.body} ${copy.message}`).not.toMatch(/update your payment method/i);

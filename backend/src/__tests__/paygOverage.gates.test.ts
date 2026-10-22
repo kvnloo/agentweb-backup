@@ -863,7 +863,8 @@ describe('ENG-668 PR-2 — what a blocked or cancelling owner is told (rvE2E MIN
 
   it('a pooled member never gets the owner\'s invoice; a dispute hold carries none', () => {
     const settlements = { '2026-09': { status: 'failed', invoiceId: 'in_sep', hostedInvoiceUrl: 'https://invoice.stripe.com/i/sep' } } as never;
-    expect(withOwnerOpenInvoice({ reason: 'payg_suspended' }, false, settlements)).toEqual({ reason: 'payg_suspended' });
+    // rv6 MINOR 4d: a pooled member is told the organization owner can resolve it, and gets no invoice.
+    expect(withOwnerOpenInvoice({ reason: 'payg_suspended' }, false, settlements)).toEqual({ reason: 'payg_suspended', paygOwnerResolves: true });
     expect(withOwnerOpenInvoice({ reason: 'payg_suspended' }, true, {} as never)).toEqual({ reason: 'payg_suspended' });
     expect(withOwnerOpenInvoice({ reason: 'payg_cap_reached' }, true, settlements)).toEqual({ reason: 'payg_cap_reached' });
     // A dispute hold is not lifted by paying, so it never points the owner at an invoice (even one unpaid).

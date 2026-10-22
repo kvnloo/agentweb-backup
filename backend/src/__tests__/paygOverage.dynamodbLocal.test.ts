@@ -62,7 +62,7 @@ jest.mock('../services/stripeService', () => ({
     resolveUserPaymentMethod: jest.fn(),
     findLiveCustomerIdForUser: jest.fn(),
     issuePaygOverageInvoice: jest.fn(),
-    paygOverageInvoicePaymentNeedsAction: jest.fn(),
+    paygOverageInvoicePaymentState: jest.fn(),
     listChargeRefunds: jest.fn(),
   },
 }));
@@ -78,6 +78,7 @@ jest.mock('../services/emailService', () => ({
     sendPaygOverageInvoiceEmail: jest.fn(),
     sendPaygOveragePaymentFailedEmail: jest.fn(),
     sendPaygOveragePaymentActionRequiredEmail: jest.fn(),
+    sendPaygOveragePaymentUnconfirmedEmail: jest.fn(),
   },
 }));
 
@@ -102,12 +103,12 @@ suite('PAYG conditional writes against DynamoDB Local', () => {
     tierName: jest.Mock; tierConfig: jest.Mock; getSetting: jest.Mock; spendBasis: jest.Mock;
     stripe: {
       resolveUserPaymentMethod: jest.Mock; findLiveCustomerIdForUser: jest.Mock; issuePaygOverageInvoice: jest.Mock;
-      paygOverageInvoicePaymentNeedsAction: jest.Mock; listChargeRefunds: jest.Mock;
+      paygOverageInvoicePaymentState: jest.Mock; listChargeRefunds: jest.Mock;
     };
     listSpendEvents: jest.Mock; getProjection: jest.Mock; paymentHistory: jest.Mock;
     email: {
       sendOncallAlert: jest.Mock; sendPaygOverageInvoiceEmail: jest.Mock; sendPaygOveragePaymentFailedEmail: jest.Mock;
-      sendPaygOveragePaymentActionRequiredEmail: jest.Mock;
+      sendPaygOveragePaymentActionRequiredEmail: jest.Mock; sendPaygOveragePaymentUnconfirmedEmail: jest.Mock;
     };
   };
 
@@ -254,7 +255,7 @@ suite('PAYG conditional writes against DynamoDB Local', () => {
     mocks.stripe.findLiveCustomerIdForUser.mockResolvedValue('cus_row');
     mocks.stripe.issuePaygOverageInvoice.mockReset();
     // A failed attempt is a decline unless a test says the bank awaits the owner's confirmation.
-    mocks.stripe.paygOverageInvoicePaymentNeedsAction.mockReset().mockResolvedValue(false);
+    mocks.stripe.paygOverageInvoicePaymentState.mockReset().mockResolvedValue('declined');
     mocks.stripe.listChargeRefunds.mockReset().mockResolvedValue([]);
     mocks.paymentHistory.mockResolvedValue({ written: true });
     mocks.email.sendOncallAlert.mockResolvedValue(undefined);
@@ -836,7 +837,9 @@ suite('PAYG conditional writes against DynamoDB Local', () => {
     it('conflict: a paid webhook moves the month while settlement is holding it — the hold is refused (`raced`), no alert', async () => {
       const o = await owner();
       mocks.stripe.issuePaygOverageInvoice.mockImplementation(async () => {
-        await settlement.handlePaygOverageInvoicePaid(invoiceEvent(o, 'in_paid_meanwhile'));
+        // The invoice this record's own run created (rv6 MINOR 1: its metadata names the record's createdAt).
+        const ev = invoiceEvent(o, 'in_paid_meanwhile');
+        await settlement.handlePaygOverageInvoicePaid({ ...ev, metadata: { ...ev.metadata, recordCreatedAt: DAY2.toISOString() } });
         return { outcome: 'no_customer' };
       });
       expect(await settlement.settlePaygOverageMonth(o.userId, M, DAY2)).toBe('raced');
@@ -1200,18 +1203,18 @@ suite('PAYG conditional writes against DynamoDB Local', () => {
     // MAJOR 1
     it('3-D Secure: the pair Stripe sends (action_required, then payment_failed with the PaymentIntent requires_action) keeps PAYG on, as the email promises', async () => {
       const o = await withMonths({ [M]: settle('invoiced', { invoiceId: 'in_3ds' }) });
-      mocks.stripe.paygOverageInvoicePaymentNeedsAction.mockResolvedValue(true);
+      mocks.stripe.paygOverageInvoicePaymentState.mockResolvedValue('action_required');
       const ev = { ...invoiceEvent(o, 'in_3ds'), status: 'open', attempt_count: 1 };
       await settlement.handlePaygOverageInvoicePaymentActionRequired(ev);
       await settlement.handlePaygOverageInvoicePaymentFailed(ev);
-      expect(mocks.stripe.paygOverageInvoicePaymentNeedsAction).toHaveBeenCalledWith('in_3ds');
+      expect(mocks.stripe.paygOverageInvoicePaymentState).toHaveBeenCalledWith('in_3ds');
       expect(mocks.email.sendPaygOveragePaymentActionRequiredEmail).toHaveBeenCalledTimes(1);
       expect(mocks.email.sendPaygOveragePaymentFailedEmail).not.toHaveBeenCalled();
       const after = await row(o.email);
       expect(after.paygOverage).not.toHaveProperty('suspended');
       expect(after.paygSettlements[M].status).toBe('invoiced');
       // ...and a genuine decline afterwards still fails it.
-      mocks.stripe.paygOverageInvoicePaymentNeedsAction.mockResolvedValue(false);
+      mocks.stripe.paygOverageInvoicePaymentState.mockResolvedValue('declined');
       await settlement.handlePaygOverageInvoicePaymentFailed(ev);
       expect((await row(o.email)).paygOverage.suspended).toMatchObject({ reason: 'payment_failed', invoiceId: 'in_3ds' });
     });
@@ -1372,6 +1375,68 @@ suite('PAYG conditional writes against DynamoDB Local', () => {
       mocks.email.sendOncallAlert.mockClear();
       await settlement.runPaygSettlement(now);
       expect(mocks.email.sendOncallAlert.mock.calls.filter(([, body]: [string, string]) => String(body).includes(o.userId))).toHaveLength(0);
+    });
+
+    // ── rv6 review round ────────────────────────────────────────────────────────────────────────────
+    // MAJOR 1: the won-dispute lift hands the hold to a failed month only while THAT month is still failed.
+    it.each([
+      ['paid', (o: { userId: string }) => settlement.handlePaygOverageInvoicePaid(invoiceEvent(o, 'in_f', AUG)), 'paid'],
+      ['voided', (o: { userId: string }) => settlement.handlePaygOverageInvoiceVoided(invoiceEvent(o, 'in_f', AUG)), 'written_off'],
+    ] as const)('rv6 MAJOR 1: the won-lift read a failed month that is %s before the lift writes — PAYG ends unsuspended, never held for a settled month', async (_what, settleIt, statusAfter) => {
+      const o = await withMonths({ [M]: settle('paid', { invoiceId: 'in_w' }), [AUG]: settle('invoiced', { invoiceId: 'in_f' }) });
+      await settlement.handlePaygOverageInvoicePaymentFailed(invoiceEvent(o, 'in_f', AUG));
+      await settlement.handlePaygOverageChargeDisputed({ id: 'dp_w' }, { id: 'ch_w' }, invoiceEvent(o, 'in_w'));
+      expect((await row(o.email)).paygOverage.suspended).toMatchObject({ reason: 'dispute', disputeId: 'dp_w' });
+      // closed: read 1 = loadSettlementFor, 2 = recording it closed, 3 = the lift's read; AUG settles right after 3.
+      afterNthConsistentRead(3, () => settleIt(o));
+      await settlement.handlePaygOverageChargeDisputeClosed({ id: 'dp_w', status: 'won' }, { id: 'ch_w' }, invoiceEvent(o, 'in_w'));
+      const after = await row(o.email);
+      expect(after.paygSettlements[AUG].status).toBe(statusAfter);
+      expect(after.paygOverage).not.toHaveProperty('suspended');
+    });
+
+    // MINOR 1: the key is the same for every record of the month; the record's createdAt is not.
+    it('rv6 MINOR 1: retry re-created the month (pending, no invoice yet): a late payment_failed for the OLD invoice (payload `open`, same key) does not fail the new record', async () => {
+      const o = await owner();
+      const realKey = `payg:${o.userId}:${M}`;
+      await patch(o.email, 'SET #s = :s', { '#s': 'paygSettlements' }, { ':s': { [M]: settle('pending', { idempotencyKey: realKey, createdAt: '2026-10-05T00:00:00.000Z' }) } });
+      const old = invoiceEvent(o, 'in_old');
+      await settlement.handlePaygOverageInvoicePaymentFailed({ ...old, status: 'open', metadata: { ...old.metadata, recordCreatedAt: DAY2.toISOString() } });
+      await settlement.handlePaygOverageInvoicePaymentFailed({ ...old, status: 'open' });
+      const rec = await record(o.email);
+      expect(rec.status).toBe('pending');
+      expect(rec.invoiceId).toBeUndefined();
+      expect((await row(o.email)).paygOverage.suspended).toBeUndefined();
+      // The record's own invoice is still recognised.
+      await settlement.handlePaygOverageInvoicePaymentFailed({ ...invoiceEvent(o, 'in_new'), status: 'open', metadata: { ...old.metadata, recordCreatedAt: '2026-10-05T00:00:00.000Z' } });
+      expect(await record(o.email)).toMatchObject({ status: 'failed', invoiceId: 'in_new' });
+    });
+
+    // MINOR 5: the grace-period stamp (nested `IN` + `attribute_not_exists`) and the expiry's writes.
+    it('rv6 MINOR 5: action required stamps `actionRequiredAt` once; 7 days on, the sweep fails the month, holds PAYG (unconfirmed) and emails once', async () => {
+      const FM = '2031-07';
+      const o = await owner({
+        paygSettlements: { [FM]: settle('invoiced', { invoiceId: 'in_unc', hostedInvoiceUrl: 'https://invoice.example/in_unc' }) },
+      }, { admittedMonths: [] });
+      mocks.stripe.paygOverageInvoicePaymentState.mockResolvedValue('action_required');
+      await settlement.handlePaygOverageInvoicePaymentActionRequired(invoiceEvent(o, 'in_unc', FM));
+      const first = (await record(o.email, FM)).actionRequiredAt;
+      expect(first).toEqual(expect.any(String));
+      await settlement.handlePaygOverageInvoicePaymentFailed({ ...invoiceEvent(o, 'in_unc', FM), status: 'open' });
+      expect((await record(o.email, FM)).actionRequiredAt).toBe(first);
+      const since = Date.parse(first);
+      await settlement.runPaygSettlement(new Date(since + 6 * 24 * 60 * 60 * 1000));
+      expect((await record(o.email, FM)).status).toBe('invoiced');
+      const due = new Date(since + 7 * 24 * 60 * 60 * 1000);
+      await settlement.runPaygSettlement(due);
+      await settlement.runPaygSettlement(due); // a second sweep the same day changes nothing
+      const after = await row(o.email);
+      expect(after.paygSettlements[FM]).toMatchObject({ status: 'failed', paymentUnconfirmedAt: due.toISOString() });
+      expect(after.paygOverage.suspended).toMatchObject({ reason: 'payment_failed', invoiceId: 'in_unc', unconfirmed: true });
+      // (The sweep scans the whole table: count only this owner's email.)
+      expect(mocks.email.sendPaygOveragePaymentUnconfirmedEmail.mock.calls.filter(([input]: [Json]) => input.to === o.email)).toHaveLength(1);
+      await settlement.handlePaygOverageInvoicePaid(invoiceEvent(o, 'in_unc', FM));
+      expect((await row(o.email)).paygOverage).not.toHaveProperty('suspended');
     });
   });
 
