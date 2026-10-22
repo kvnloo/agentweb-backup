@@ -88,7 +88,8 @@ async function sessionAccessAllowed(req: Request, res: Response, sessionId: unkn
     return false;
   }
   const user = (req as AuthenticatedRequest).user;
-  const session = await chatbotDb.getChatSessionRecord(sessionId);
+  // Strongly consistent: a session created just before this call must not read as missing (false 404).
+  const session = await chatbotDb.getChatSessionRecord(sessionId, true);
   if (!session || (session.userId !== user.userId && !user.isAdmin)) {
     res.status(404).json({ message: 'Session not found' });
     return false;
