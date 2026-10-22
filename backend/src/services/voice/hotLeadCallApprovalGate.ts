@@ -26,6 +26,7 @@ import {
   type ApprovalDeckHistoryMessage,
   type QuestionDeckQuestionInput,
 } from '../agentMode/core/approvalDeck';
+import type { GateOutcome } from '../crmSequenceActivationGate';
 import type { AskUserQuestionOption } from '../agentMode/core/askUserQuestion';
 
 export type HotLeadCallApprovalAction = 'provision' | 'release';
@@ -60,7 +61,7 @@ export function computeApprovalDigest(input: ApprovalDigestInput): string {
     orgId: input.orgId,
     userId: input.userId,
     sessionId: input.sessionId,
-    target: input.target ?? null,
+    target: input.target,
     rentText: input.rentText,
     revision: input.revision,
   };
@@ -78,8 +79,6 @@ export function newApprovalKind(action: HotLeadCallApprovalAction, digest: strin
 export function consumedKeyOf(kind: string): string {
   return `${CONSUMED_KEY_PREFIX}${kind}`;
 }
-
-export type GateOutcome = { allowed: true } | { allowed: false; code: string; reason: string };
 
 export interface AttendedFacts {
   unattended?: boolean;
@@ -119,7 +118,7 @@ export interface ApprovalQuestionInput {
   kind: string;
   rentText: string;
   areaCode?: string;
-  /** Masked number being released, for the card text. */
+  /** Number being released, for the card text. */
   number?: string;
 }
 
@@ -162,7 +161,6 @@ export function findApproval(
   prefix: string,
   now: number,
   consumedKinds: ReadonlySet<string>,
-  ttlMs: number = APPROVAL_TTL_MS,
 ): ApprovalLookup {
   let newest: string | undefined;
   for (const message of messages ?? []) {
@@ -176,7 +174,7 @@ export function findApproval(
   if (outcome.answer.answeredBy !== 'user') return { status: 'none', reason: 'not_human' };
   if (outcome.answer.verdict !== APPROVE_OPTION_ID) return { status: 'none', reason: 'declined' };
   const age = now - Date.parse(outcome.answer.at);
-  if (!Number.isFinite(age) || age > ttlMs || age < -CLOCK_SKEW_MS) return { status: 'none', reason: 'expired' };
+  if (!Number.isFinite(age) || age > APPROVAL_TTL_MS || age < -CLOCK_SKEW_MS) return { status: 'none', reason: 'expired' };
   if (consumedKinds.has(newest)) return { status: 'none', reason: 'consumed' };
   return { status: 'approved', kind: newest };
 }

@@ -2,12 +2,12 @@ import { emmaToolRegistry } from './registry';
 import { callerIdentity, callerOrg, type ToolContext } from './orgCaller';
 import { MEMBER_ID, type HotLeadCallConfig } from '../services/hotLeadCallConfig';
 import { VERIFICATION_CODE_TTL_MS, VERIFICATION_MAX_ATTEMPTS, VERIFICATION_MAX_STARTS_PER_MEMBER_PER_DAY, VERIFICATION_MAX_STARTS_PER_ORG_PER_DAY } from '../services/voice/memberVerification';
-import { confirmMemberVerification, startMemberVerification, storedHotLeadCallConfig as storedConfig } from '../services/hotLeadCallSettingsService';
+import { confirmMemberVerification, hotLeadCallRevisionOf, startMemberVerification, storedHotLeadCallConfig as storedConfig } from '../services/hotLeadCallSettingsService';
 import { assertHotLeadCallEntitled } from '../services/voice/hotLeadCallEntitlement';
 import { provisionNumber, releaseNumber, monthlyRentText } from '../services/voice/numberProvisioning';
-import { hotLeadCallRevisionOf } from '../services/hotLeadCallSettingsService';
 import * as approval from '../services/voice/hotLeadCallApprovalGate';
 import type { Organization } from '../services/db';
+import type { ApprovalDeckHistoryMessage } from '../services/agentMode/core/approvalDeck';
 
 /**
  * Setup tools for the hot lead auto-call: caller number, then team-member phone verification. Unlike the
@@ -55,8 +55,6 @@ function configuredOrThrow(config: HotLeadCallConfig | undefined): HotLeadCallCo
   return config;
 }
 
-type Approved = { halt: Record<string, unknown> } | { halt?: undefined };
-
 /**
  * Runs after every other check. Returns a halt (the approval card) unless the user already approved this exact
  * action in this chat; in that case the approval is claimed (single use) and the caller may act. A claim that
@@ -65,7 +63,7 @@ type Approved = { halt: Record<string, unknown> } | { halt?: undefined };
 async function requireApproval(p: {
   action: approval.HotLeadCallApprovalAction; org: Organization; context: ToolContext;
   target: string | null; areaCode?: string; number?: string;
-}): Promise<Approved> {
+}): Promise<Record<string, unknown> | undefined> {
   const { context } = p;
   const sessionId = typeof context?.sessionId === 'string' ? context.sessionId : undefined;
   const { chatbotDb } = await import('../services/chatbotService');
@@ -77,38 +75,38 @@ async function requireApproval(p: {
     session,
   });
   if (!attended.allowed) throw new Error(attended.reason);
+  if (!sessionId || !session) throw new Error('This session could not be read, so it cannot be confirmed as attended. Nothing was done.');
 
   const rentText = monthlyRentText();
   const digest = approval.computeApprovalDigest({
-    action: p.action, orgId: p.org.orgId, userId: userIdOf(context), sessionId: sessionId!,
+    action: p.action, orgId: p.org.orgId, userId: userIdOf(context), sessionId,
     target: p.target, rentText, revision: hotLeadCallRevisionOf(p.org.hotLeadCall),
   });
-  const messages = await chatbotDb.getMessagesFromMessagesTable(sessionId!);
-  const consumedKinds = new Set(Object.keys(session?.consumedMetaWriteManifestDigests ?? {})
+  // The history comes from the consistent session read above, so a fresh decline cannot be missed.
+  const messages: ApprovalDeckHistoryMessage[] = (session.messages ?? []) as unknown as ApprovalDeckHistoryMessage[];
+  const consumedKinds = new Set(Object.keys(session.consumedMetaWriteManifestDigests ?? {})
     .filter(k => k.startsWith(approval.CONSUMED_KEY_PREFIX)).map(k => k.slice(approval.CONSUMED_KEY_PREFIX.length)));
-  const found = approval.findApproval(messages as never, approval.approvalKindPrefix(p.action, digest), Date.now(), consumedKinds);
+  const found = approval.findApproval(messages, approval.approvalKindPrefix(p.action, digest), Date.now(), consumedKinds);
 
   if (found.status === 'none') {
     const question = approval.buildApprovalQuestion({
       action: p.action, kind: approval.newApprovalKind(p.action, digest), rentText, areaCode: p.areaCode, number: p.number,
     });
     return {
-      halt: {
-        success: true,
-        awaitingUserConfirmation: true,
-        type: 'ask_user_question',
-        sessionId,
-        questionDeckPayload: [question],
-        confirmationPrompt: question.question,
-        summary: question.question,
-        message: 'Nothing was done yet. The run stops here until the user answers the card. After they approve, call this tool again with the same arguments; do not ask them in text.',
-      },
+      success: true,
+      awaitingUserConfirmation: true,
+      type: 'ask_user_question',
+      sessionId,
+      questionDeckPayload: [question],
+      confirmationPrompt: question.question,
+      summary: question.question,
+      message: 'Nothing was done yet. The run stops here until the user answers the card. After they approve, call this tool again with the same arguments; do not ask them in text.',
     };
   }
-  if (!(await chatbotDb.claimMetaWriteManifestDigest(sessionId!, approval.consumedKeyOf(found.kind)))) {
+  if (!(await chatbotDb.claimMetaWriteManifestDigest(sessionId, approval.consumedKeyOf(found.kind)))) {
     throw new Error('This approval was already used. Nothing was done; ask again to get a new approval card.');
   }
-  return {};
+  return undefined;
 }
 
 emmaToolRegistry.register({
@@ -133,8 +131,8 @@ emmaToolRegistry.register({
     await assertHotLeadCallEntitled(org);
     const config = configuredOrThrow(storedConfig(org));
     if (config.twilioNumber || config.twilioNumberSid) throw new Error('This organization already has a caller number. Release it first if you need a different one.');
-    const gate = await requireApproval({ action: 'provision', org, context, target: typeof areaCode === 'string' ? areaCode : null, areaCode: typeof areaCode === 'string' ? areaCode : undefined });
-    if (gate.halt) return gate.halt;
+    const halt = await requireApproval({ action: 'provision', org, context, target: typeof areaCode === 'string' ? areaCode : null, areaCode: typeof areaCode === 'string' ? areaCode : undefined });
+    if (halt) return halt;
     const result = await provisionNumber({ org, config, userId: userIdOf(context), areaCode });
     return {
       success: true, ...result,
@@ -156,8 +154,8 @@ emmaToolRegistry.register({
     const org = await callerOrg(context, 'the hot lead caller number', true);
     const config = configuredOrThrow(storedConfig(org));
     if (!config.twilioNumber && !config.twilioNumberSid) throw new Error('This organization has no caller number to release.');
-    const gate = await requireApproval({ action: 'release', org, context, target: config.twilioNumberSid ?? config.twilioNumber ?? null, number: config.twilioNumber });
-    if (gate.halt) return gate.halt;
+    const halt = await requireApproval({ action: 'release', org, context, target: config.twilioNumberSid ?? config.twilioNumber ?? null, number: config.twilioNumber });
+    if (halt) return halt;
     return { success: true, ...(await releaseNumber({ org, config })) };
   },
 });
