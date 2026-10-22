@@ -144,6 +144,8 @@ jobs:
           bash .github/scripts/dependabot-config.test.sh
           bash .github/scripts/merge-evidence.test.sh
           bash .github/scripts/trunk-deploy-state.test.sh
+          bash .github/scripts/login-host-run-deploy.test.sh
+          bash .github/scripts/login-host-verify-build.test.sh
           bash .github/scripts/deploy-base-sha.test.sh
           bash .github/scripts/deploy-failure-alert.test.sh
           bash .github/scripts/eb-config-conflict.test.sh
