@@ -18,7 +18,7 @@
 import { createHash } from 'crypto';
 import type { AgentRunTrace, AgentRunTraceCall } from './agentRunTrace';
 import { LLM_MODEL_REGISTRY } from './agentMode/llmModelRegistry';
-import { readChatCompletion, type RubricJudgeLlm, type RubricJudgeUsage } from './creativeRubricJudge';
+import { readChatCompletion, type RubricJudgeLlm, type RubricJudgeLlmRequest, type RubricJudgeUsage } from './creativeRubricJudge';
 
 export const TASK_SUCCESS_JUDGE_GRADER_ID = 'agent-task-success-judge';
 export const DEFAULT_TASK_SUCCESS_JUDGE_MODEL = 'anthropic.claude-sonnet-5';
@@ -29,6 +29,8 @@ const MAX_OUTPUT_TOKENS = 6_000;
 const LABELLER_MAX_OUTPUT_TOKENS = 16_000;
 const LABELLER_TIMEOUT_MS = 300_000;
 const TIMEOUT_MS = 90_000;
+/** Calls per case when the provider fails mid-reply or returns nothing (one try plus two retries). */
+const PROVIDER_ERROR_ATTEMPTS = 3;
 
 export const TASK_SUCCESS_JUDGE_PROMPT = `You label whether an AI marketing agent's session accomplished what the user asked. The criterion is task_success, with this rubric:
 
@@ -264,17 +266,28 @@ async function runTaskSuccessPrompt(
 ): Promise<TaskSuccessJudgeResult> {
   if (!input.trace.ask && !input.trace.calls.length) return { status: 'error', reason: 'the session has no ask and no tool calls', model };
   const llm = injected ?? gatewayTaskSuccessJudgeLlm;
+  const request: RubricJudgeLlmRequest = {
+    model,
+    system: prompt,
+    content: [{ type: 'text', text: renderTraceForJudge(input.trace, input.title) }],
+    maxTokens,
+    timeoutMs,
+  };
   let response;
-  try {
-    response = await llm.complete({
-      model,
-      system: prompt,
-      content: [{ type: 'text', text: renderTraceForJudge(input.trace, input.title) }],
-      maxTokens,
-      timeoutMs,
-    });
-  } catch (err) {
-    return { status: 'error', reason: `LLM call failed: ${err instanceof Error ? err.message : String(err)}`, model };
+  // A provider can fail partway through and still answer 200, with finish_reason "error" and no content
+  // (seen on Bedrock, ENG-2620). That is transient, so retry it; a call that throws is not retried.
+  for (let attempt = 1; ; attempt++) {
+    try {
+      response = await llm.complete(request);
+    } catch (err) {
+      return { status: 'error', reason: `LLM call failed: ${err instanceof Error ? err.message : String(err)}`, model };
+    }
+    const providerFailed = response.finishReason === 'error' || !response.text.trim();
+    if (!providerFailed) break;
+    if (attempt === PROVIDER_ERROR_ATTEMPTS) {
+      const what = response.finishReason === 'error' ? 'ended the reply with an error' : 'returned an empty reply';
+      return { status: 'error', reason: `the provider ${what} on all ${attempt} attempts`, model, ...(response.usage ? { usage: response.usage } : {}) };
+    }
   }
   const parsed = parseVerdict(response.text);
   if (typeof parsed === 'string') {
