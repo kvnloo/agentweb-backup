@@ -22,6 +22,9 @@ function startFake({ missing = '404', accountType = 'DEVELOPER_TEST' } = {}) {
       if (req.headers.authorization !== 'Bearer tok') return send(401, {});
       if (path === '/account-info/v3/details') return send(200, { portalId: 1, accountType });
       if (req.method === 'POST' && path === '/crm/v3/objects/contacts') {
+        // ENG-2635: the real HubSpot rejects reserved-TLD addresses such as *.invalid (INVALID_EMAIL), which
+        // made the first probe impossible on a real portal while this fake accepted anything.
+        if (/\.invalid$/i.test(String(body.properties.email || ''))) return send(400, { category: 'VALIDATION_ERROR', message: `Email address ${body.properties.email} is invalid` });
         const id = String(next++); contacts.set(id, { id, properties: { ...body.properties } }); return send(201, { id, properties: body.properties });
       }
       const one = path.match(/^\/crm\/v3\/objects\/contacts\/(\d+)$/);
