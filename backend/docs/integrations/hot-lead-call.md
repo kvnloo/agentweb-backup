@@ -370,20 +370,22 @@ unattended runs (`context.isUnattendedRun === true`: scheduled or autonomous
 turns) with "This needs a person to confirm in an interactive chat".
 `confirm_hot_lead_call_verification` has no such refusal (the settings update has its own, listed above):
 
-- `provision_hot_lead_call_number({confirm: true, areaCode?})` buys one US local
+- `provision_hot_lead_call_number({areaCode?})` buys one US local
   voice-enabled number (the cost is stated in the tool text, read from the live
   rate card). Needs saved settings, one number per org, at most 2 purchases per
   org per rolling 24h and 6 releases per day (reservations are written to the org
   attribute `hotLeadCallProvisioning`, conditional on it and `hotLeadCall` being
   unchanged, BEFORE Twilio is called; a reservation whose purchase then fails
   still counts). A stored `hotLeadCallProvisioning` that is malformed makes both
-  tools refuse ("Contact support"). `confirm` is advisory only: the model
-  controls it, so it is not an authorization. An ambiguous buy failure is
+  tools refuse ("Contact support"). A person must approve each purchase
+  ([Human approval](#human-approval-for-provision-and-release)); `confirm` is
+  still accepted but ignored, because the model controls it. An ambiguous buy failure is
   logged as `ORPHAN RISK` and is not retried. Only the first month's rent is
   metered.
 - `release_hot_lead_call_number({})` turns calling off first, releases the
   number (a 404 from Twilio counts as already gone; any other failure keeps the
-  number assigned), then clears `twilioNumber`/`twilioNumberSid`.
+  number assigned), then clears `twilioNumber`/`twilioNumberSid`. Needs the
+  same human approval as a purchase.
 - `start_hot_lead_call_verification({memberId?})` rings the SAVED phone of a member (the only member, or the one named by `memberId`, required on a larger team) from the
   org number and reads a 6-digit code (inline TwiML, no webhook). Refused when the plan lacks the feature or no caller number exists. See [Verification](#verification-per-member) for storage and limits. Metered as one estimated
   minute (leg `verify`).
@@ -394,7 +396,7 @@ Order of setup, which the tool text also teaches Emma:
 
 1. `update_hot_lead_call_settings`: member phone, announced name, calling
    hours (with timezone), optionally lead types and limits. Saved disabled.
-2. `provision_hot_lead_call_number` (spends money, needs explicit user consent).
+2. `provision_hot_lead_call_number` (spends money; the user approves on a card).
 3. `start_hot_lead_call_verification`, then `confirm_hot_lead_call_verification`
    with the code the member heard.
 4. `update_hot_lead_call_settings({enabled: true})`. Refused unless a member's
@@ -404,10 +406,42 @@ Cost bound through these tools: 2 purchases at the card's $1.15 plus 5
 verification calls at $0.014 is about $2.37 per org per day at the provisional
 rates. First-month rent only; recurring rent is not metered.
 
-General availability precondition: a human-approval gate (a deck-of-one approval
-per purchase or release, like `services/crmSequenceActivationGate.ts`) is NOT
-built. Until it exists the unattended-run refusal and the per-org caps are the
-only controls, so enabling for more than hand-picked orgs needs that gate first.
+### Human approval for provision and release
+
+`provision_hot_lead_call_number` and `release_hot_lead_call_number` never act on the
+model's say-so. The first call halts the run with a one-question approval card
+(the same deck-of-one mechanism as `services/crmSequenceActivationGate.ts`; the
+logic is in `services/voice/hotLeadCallApprovalGate.ts`). The card states the
+monthly rent from the live rate card. After the person clicks approve, Emma
+calls the tool again with the same arguments and it acts.
+
+- Order: the existing checks run first (unattended, arguments, owner/admin,
+  plan entitlement, saved settings, already has / has no number), so a caller who
+  is refused never sees a card. Then: a chat session must exist and be readable,
+  must not be a scheduled session, and must not be a support/admin session acting
+  as the customer (`isDelegatedAccess` / `isDelegatedAdmin`).
+- Binding: the approval is tied to a digest of the action, org, user, chat
+  session, the area code (or the number being released), the rent as quoted now
+  and the revision of the stored settings. A different area code, a rent change, a
+  settings change or another chat session (for example a branched one) needs a new
+  card. The card kind is `hot_lead_call_approval:<action>:<digest>:<nonce>`.
+- Validity: the newest card for that digest must be answered "approve" by the
+  user (never by "Let Emma decide", which the card does not offer), at most 15
+  minutes ago, and not used yet. Declining, ignoring or letting it expire makes the
+  next call show a fresh card.
+- Single use: immediately before buying or releasing, the approval is claimed
+  with `chatbotDb.claimMetaWriteManifestDigest(sessionId, "hotlead:" + kind)`
+  (an entry in the session's existing `consumedMetaWriteManifestDigests` map; the
+  name says Meta but the function is generic). A lost claim refuses; a crash after
+  the claim loses the approval, so the person approves again. Nothing is bought
+  twice.
+- "Decline" is listed first and is the recommended option, so an answer taken
+  without a person choosing resolves to "do not spend".
+- `ask_user_question` rejects a model-supplied `kind` that starts with
+  `hot_lead_call_approval:`, so the model cannot author a card that passes for an
+  approval.
+- Not gated: `start_hot_lead_call_verification` (one capped call to a number the
+  admin saved) and turning calling on in `update_hot_lead_call_settings`.
 
 Verification limits: it proves a phone answered and the code was heard. A
 voicemail that plays the message back can also pass it. The spoken code is
@@ -735,15 +769,16 @@ Known limits, accepted:
 - A lead gets one call record ever. A member call Twilio rejected is not retried
   for the same member; the next member is tried instead, and a lead whose every
   placement was rejected is not called again.
-- `confirm: true` on the provisioning tool is advisory. The real controls are
-  the per-org purchase and release caps.
+- `confirm` on the provisioning tool is ignored. Purchases and releases need a
+  person's approval click; the per-org purchase and release caps remain as a second limit.
 - Two orgs configured with the same member phone can ring that person
   simultaneously: caps are per org and the cooldown is per member per org.
 - Prompt injection: the team phones and settings are changed through Emma
   tools, so text the model reads (a lead's form field, a web page) could try to
   steer `update_hot_lead_call_settings` or `confirm_hot_lead_call_verification`.
-  The human-approval gate (see Known follow-ups) is a general-availability
-  precondition; until then use hand-picked orgs.
+  Purchases and releases need a person's approval click, but those two tools are
+  the only gated ones: enabling calling and starting a verification are not, so use
+  hand-picked orgs until the remaining go-live checks are done.
 - Verification brute force: a code is 6 digits with 5 attempts per code, 5 codes per
   person per day and 20 per organization per day, so a guesser has roughly a 5-in-a-million
   chance per code and about 25-in-a-million per person per day.
@@ -1010,10 +1045,9 @@ on anywhere.
     carry the new version string for ALL vendors. Amounts are identical (checked
     byte for byte for v0, Apollo, Placid and Remotion); a reconciliation that
     groups by rate-card version will see a new bucket.
-14. Known gaps accepted at launch, to be closed before general availability: the
-    human-approval gate for provision/release (the tools refuse unattended runs
-    and are capped per org, nothing more); recurring number-rent metering is not
-    built (only the first month is recorded).
+14. Known gap accepted at launch, to be closed before general availability:
+    recurring number-rent metering is not built (only the first month is
+    recorded). Provision and release already need a person's approval click.
 
 ## Not verified without a real Twilio account
 
@@ -1095,10 +1129,8 @@ Twilio's documentation and encoded in tests with synthetic payloads:
   `twilio:number:<sid>:<YYYY-MM>`). Only the first month is metered today.
 - **Stuck-record cleanup.** A documented sweep for records live longer than a
   call can last (and reconciliation of their Twilio legs). No cron exists.
-- **Human-approval gate for paid tools (GA precondition).** None exists yet:
-  buying and releasing a number refuse unattended runs and are capped per org,
-  and `confirm` is advisory. A deck-of-one approval per purchase or release, like
-  `services/crmSequenceActivationGate.ts`, is needed before general availability.
+- **Approval for enabling calling.** Provision and release need a person's approval
+  click; turning calling on in `update_hot_lead_call_settings` does not yet.
 - **Missed-call Slack line.** The Slack alert does not say whether the call was
   placed, answered or declined; deliberately deferred so the Slack path stays
   untouched.
