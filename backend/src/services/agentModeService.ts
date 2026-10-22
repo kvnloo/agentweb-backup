@@ -12772,7 +12772,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       resolvedParams = await this.resolvePlacementAssetHashes(userId, resolvedParams, params.account_id);
       // IG placements require an instagram_user_id in object_story_spec — auto-resolve from the Page.
       resolvedParams = await this.resolvePlacementInstagramActor(resolvedParams, accessToken);
-      const creative = await metaService.createAdCreative(accountId, accessToken, resolvedParams);
+      const created = await metaService.createAdCreative(accountId, accessToken, resolvedParams);
+      // Meta's create response carries only the id; keep the name we sent so messages don't say "undefined".
+      const creative = created ? { ...created, name: created.name ?? resolvedParams.name } : created;
       // ENG-2141: link the generated images this creative uses to it (inert unless enabled).
       if (creative?.id) {
         void stampMetaCreativeCreated({ userId, accountId, metaCreativeId: String(creative.id), params: resolvedParams });
@@ -13195,14 +13197,16 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       // creative. Copy/link/CTA carry over from the existing creative unless overridden.
       const ld = existingSpec.link_data || {};
       const vd = existingSpec.video_data || {};
+      // A placement-customized source has no link_data / video_data: its copy lives in asset_feed_spec.
+      const afs = creativeData.asset_feed_spec || {};
       newCreativeParams = {
         name: params.name || `${creativeData.name || 'Creative'} (placement-customized)`,
         page_id: pageId,
         placement_assets: params.placement_assets,
-        body: params.body || ld.message || vd.message || creativeData.body || '',
-        title: params.title || ld.name || vd.title || creativeData.title || '',
-        link_url: newLinkUrl || ld.link || vd.call_to_action?.value?.link || '',
-        call_to_action_type: params.call_to_action_type || ld.call_to_action?.type || vd.call_to_action?.type,
+        body: params.body || ld.message || vd.message || afs.bodies?.[0]?.text || creativeData.body || '',
+        title: params.title || ld.name || vd.title || afs.titles?.[0]?.text || creativeData.title || '',
+        link_url: newLinkUrl || ld.link || vd.call_to_action?.value?.link || afs.link_urls?.[0]?.website_url || '',
+        call_to_action_type: params.call_to_action_type || ld.call_to_action?.type || vd.call_to_action?.type || afs.call_to_action_types?.[0],
         url_tags: carriedUrlTags,
         ...AgentModeService.carriedCreativeFields(existingSpec, params, creativeData.asset_feed_spec),
       };
