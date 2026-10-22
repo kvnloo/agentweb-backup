@@ -13,15 +13,19 @@ import { join } from "path";
 const DEPLOY_SH = join(__dirname, "../../deploy/prod/deploy.sh");
 
 interface Scenario {
-  /** `systemctl is-active` result for the service before the deploy. */
+  /** whether the service is running before the deploy (systemd ActiveState active / inactive) */
   active?: boolean;
+  /** systemd's ActiveState when it is neither (e.g. "activating", "failed") */
+  activeState?: string;
+  /** what STATE_DIR/running-release holds (the release the host was last seen healthy on) */
+  runningRelease?: string;
+  /** the fake `acquire` blocks for this many seconds (for the signal test) */
+  acquireSleep?: number;
   installRc?: number;
   /** exit code of `deployctl acquire` */
   acquireRc?: number;
   /** exit code of a SECOND `acquire` (the re-check right before the restart); default 0 */
   reacquireRc?: number;
-  /** what `deployctl info` reports as the drain state before the restart (default strict) */
-  infoDrain?: "strict" | "off";
   /** exit code of `install.sh --prepare` */
   prepareRc?: number;
   /** a hold file exists */
@@ -58,10 +62,13 @@ describe("deploy.sh", () => {
     if (sc.activeBefore || sc.installMovesCurrent) symlinkSync("releases/old", join(dir, "opt/current"));
     if (sc.hasPrevious !== false) symlinkSync("releases/old", join(dir, "opt/previous"));
     writeFileSync(join(S, "active"), sc.active === false ? "1" : "0");
+    writeFileSync(join(S, "state"), (sc.activeState ?? (sc.active === false ? "inactive" : "active")) + "\n");
+    rmSync(join(dir, "state/running-release"), { force: true });
+    writeFileSync(join(S, "acquire.sleep"), String(sc.acquireSleep ?? 0));
     writeFileSync(join(S, "install.rc"), String(sc.installRc ?? 0));
     writeFileSync(join(S, "prepare.rc"), String(sc.prepareRc ?? 0));
     writeFileSync(join(S, "reacquire.rc"), String(sc.reacquireRc ?? 0));
-    writeFileSync(join(S, "info.drain"), sc.infoDrain ?? "strict");
+    writeFileSync(join(S, "info.drain"), "strict");
     rmSync(join(dir, "hold"), { force: true });
     rmSync(join(S, "acquired.flag"), { force: true });
     if (sc.hold) writeFileSync(join(dir, "hold"), "");
@@ -79,6 +86,7 @@ describe("deploy.sh", () => {
     mkdirSync(join(dir, "state"), { recursive: true });
     rmSync(join(dir, "state/deployed-build-seq"), { force: true });
     if (sc.lastDeployedSeq !== undefined) writeFileSync(join(dir, "state/deployed-build-seq"), `${sc.lastDeployedSeq}\n`);
+    if (sc.runningRelease !== undefined) writeFileSync(join(dir, "state/running-release"), `${sc.runningRelease}\n`);
     writeFileSync(join(pkg, "deployctl.js"), ""); // only the fake node reads its arguments
     // install.sh: logs, honours the scenario
     writeFileSync(
@@ -100,6 +108,7 @@ exit "$(cat "${S}/install.rc")"
       `#!/bin/bash
 echo "systemctl $*" >> "${dir}/calls.log"
 if [ "$1" = "is-active" ]; then exit "$(cat "${S}/active")"; fi
+if [ "$1" = "show" ]; then cat "${S}/state"; exit 0; fi
 exit 0
 `,
     );
@@ -112,6 +121,7 @@ cmd=$1; shift
 echo "ctl $cmd $*" >> "${dir}/calls.log"
 case "$cmd" in
   acquire)
+    sleep "$(cat "${S}/acquire.sleep")"
     if [ -f "${S}/acquired.flag" ]; then exit "$(cat "${S}/reacquire.rc")"; fi
     touch "${S}/acquired.flag"; exit "$(cat "${S}/acquire.rc")" ;;
   health)
@@ -185,15 +195,15 @@ exit 0
   });
 
   it("the drain lapsed before the restart and the host is busy again: undo the switch, restart NOTHING, exit 75", () => {
-    const r = run({ infoDrain: "off", reacquireRc: 75 });
+    const r = run({ reacquireRc: 75 });
     expect(r.rc).toBe(75);
     expect(restarts(log())).toBe(0);
-    order(log(), "install ", "ctl info", "ctl acquire --total 300", "install --rollback");
+    order(log(), "install ", "ctl acquire --total 300", "install --rollback");
     expect(r.out).toContain("became busy again");
   });
 
   it("the drain lapsed but the host is idle again: it is taken again and the deploy goes on", () => {
-    const r = run({ infoDrain: "off", reacquireRc: 0 });
+    const r = run({ reacquireRc: 0 });
     expect(r.rc).toBe(0);
     expect(restarts(log())).toBe(1);
     expect(log().filter((c) => c.startsWith("ctl acquire"))).toHaveLength(2);
@@ -256,19 +266,19 @@ exit 0
   it("a failed prepare changes nothing, restarts nothing and takes no drain; exit 22", () => {
     const r = run({ prepareRc: 1 });
     expect(r.rc).toBe(22);
-    expect(log().filter((c) => !c.startsWith("systemctl is-active"))).toEqual(["install --prepare"]);
+    expect(log().filter((c) => !/^systemctl (is-active|show)/.test(c))).toEqual(["install --prepare"]);
   });
 
   it("a prepare refused for want of a bridge URL (exit 3) is passed through before anything else", () => {
     const r = run({ prepareRc: 3 });
     expect(r.rc).toBe(3);
-    expect(log().filter((c) => !c.startsWith("systemctl is-active"))).toEqual(["install --prepare"]);
+    expect(log().filter((c) => !/^systemctl (is-active|show)/.test(c))).toEqual(["install --prepare"]);
   });
 
   it("a failed install restarts nothing, lifts the drain it took, and exits 22", () => {
     const r = run({ installRc: 1 });
     expect(r.rc).toBe(22);
-    const calls = log().filter((c) => !c.startsWith("systemctl is-active"));
+    const calls = log().filter((c) => !/^systemctl (is-active|show)/.test(c));
     expect(calls).toEqual(["install --prepare", "ctl acquire --total 1800 --strict-ttl 300", "install ", "ctl release "]);
   });
 
@@ -280,12 +290,64 @@ exit 0
   });
 
   it("an identical build (the installer changes nothing) restarts nothing and lifts the drain at once", () => {
-    const r = run({ activeBefore: true });
+    const r = run({ activeBefore: true, runningRelease: "releases/old" });
     expect(r.rc).toBe(0);
     expect(r.out).toContain("nothing to restart");
     expect(restarts(log())).toBe(0);
     expect(log()).toContain("ctl release ");
   });
+
+  it("an identical build is NOT skipped when the host was never seen healthy on that release (a deploy killed half-way left `current` ahead of what runs): it is restarted behind the gate", () => {
+    for (const runningRelease of [undefined, "releases/some-older-one"]) {
+      const r = run({ activeBefore: true, runningRelease });
+      expect(r.rc).toBe(0);
+      expect(r.out).not.toContain("nothing to restart");
+      expect(restarts(log())).toBe(1);
+      order(log(), "ctl acquire", "systemctl restart", "ctl health");
+    }
+  });
+
+  it("after a healthy start the release the host runs is recorded (so the next identical deploy can be believed)", () => {
+    run({ activeBefore: true });
+    expect(readFileSync(join(dir, "state/running-release"), "utf8").trim()).toBe("releases/old");
+  });
+
+  it("systemd's own state decides whether anyone needs protecting: a unit that is `activating` (starting or auto-restarting) goes through the gate; only inactive/failed skips it", () => {
+    expect(run({ activeState: "activating" }).rc).toBe(0);
+    expect(log().some((c) => c.startsWith("ctl acquire"))).toBe(true);
+    for (const st of ["inactive", "failed"]) {
+      run({ activeState: st });
+      expect({ st, gated: log().some((c) => c.startsWith("ctl acquire")) }).toEqual({ st, gated: false });
+    }
+  });
+
+  it("the rollback restart is also asked to wait briefly for a quiet moment (a failing new build may have admitted turns in its minute)", () => {
+    run({ health: [1, 0] });
+    order(log(), "systemctl restart", "install --rollback", "ctl info", "ctl acquire --total 20", "systemctl restart");
+  });
+
+  it("a SIGTERM (an SSM cancel) is mapped to 22 'not restarted' and lifts the drain, instead of leaving the script with an unreadable status", async () => {
+    const child = (() => {
+      // run() is synchronous; build the same scenario by hand and send the signal while the (slow) fake gate is running
+      run({ acquireSleep: 0 }); // lays out the scratch files; discarded below
+      writeFileSync(join(dir, "scen/acquire.sleep"), "2");
+      writeFileSync(join(dir, "calls.log"), "");
+      rmSync(join(dir, "scen/acquired.flag"), { force: true });
+      rmSync(join(dir, "state/deployed-build-seq"), { force: true });
+      return spawn("bash", [join(dir, "pkg/deploy.sh")], {
+        env: { PATH: process.env.PATH ?? "", AW_SYSTEMCTL: join(dir, "bin/systemctl"), AW_SOCK: join(dir, "host.sock"), AW_DEPLOY_LOCK: join(dir, "lockdir/deploy.lock"), AW_NODE: join(dir, "bin/node"), AW_OPT: join(dir, "opt"), AW_STATE_DIR: join(dir, "state"), AW_HOLD: join(dir, "hold"), AW_HEALTH_TIMEOUT: "5" },
+      });
+    })();
+    let out = "";
+    child.stdout.on("data", (d) => (out += d));
+    await new Promise((r) => setTimeout(r, 700));
+    child.kill("SIGTERM");
+    const rc = await new Promise<number | null>((r) => child.on("close", r));
+    expect(rc).toBe(22);
+    expect(out).toContain("UNEXPECTED FAILURE");
+    expect(restarts(log())).toBe(0);
+    expect(log()).toContain("ctl release ");
+  }, 20_000);
 
   it("a successful restart does not leave a stale release call behind (the restart cleared the drain)", () => {
     run({});
@@ -301,7 +363,7 @@ exit 0
     const r = run({ hold: true });
     expect(r.rc).toBe(22);
     expect(r.out).toContain("HELD");
-    expect(log().filter((c) => !c.startsWith("systemctl is-active"))).toEqual([]);
+    expect(log().filter((c) => !/^systemctl (is-active|show)/.test(c))).toEqual([]);
   });
 
   it("an UNEXPECTED failure before the restart (here: the lock directory cannot be created) is 22 'host not restarted', never a build outcome like 1 or 2", () => {
@@ -341,7 +403,7 @@ exit 0
     it("refuses a build with a LOWER number than the one deployed: exit 4, and NOTHING runs (not even prepare or the gate)", () => {
       const r = run({ buildSeq: 99, lastDeployedSeq: 100 });
       expect(r.rc).toBe(4);
-      expect(log().filter((c) => !c.startsWith("systemctl is-active"))).toEqual([]);
+      expect(log().filter((c) => !/^systemctl (is-active|show)/.test(c))).toEqual([]);
       expect(r.out).toContain("REFUSED");
       expect(recorded()).toBe(100);
     });
@@ -370,7 +432,7 @@ exit 0
     it("a build with no pipeline number is exit 5 (a different outcome from 'older'), and a committer date cannot stand in for it", () => {
       const r = run({ buildSeq: null });
       expect(r.rc).toBe(5);
-      expect(log().filter((c) => !c.startsWith("systemctl is-active"))).toEqual([]);
+      expect(log().filter((c) => !/^systemctl (is-active|show)/.test(c))).toEqual([]);
       expect(run({ buildSeq: null }, ["--allow-older"]).rc).toBe(0);
     });
     it("a number that is not plain digits, or too long to compare safely, is exit 5, not a silently skipped check", () => {

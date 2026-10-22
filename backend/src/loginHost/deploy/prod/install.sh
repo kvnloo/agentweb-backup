@@ -59,7 +59,7 @@ OPT=/opt/aw-login-host
 CONF=/etc/aw-login-host
 UNIT_DIR=/etc/systemd/system
 SYSTEMCTL=systemctl
-LOCK=/run/aw-login-host-install.lock
+LOCK=/run/aw-deploy/install.lock # in a root-only directory (see deploy.sh): a file directly in /run could be opened, and flock-ed, by any local user
 SKIP_PREREQS=0
 DRY_BASE=/run
 OWN=(-o root -g root)
@@ -75,6 +75,7 @@ if [ -e "$HERE/.aw-test-mode" ]; then
 fi
 
 if [ "$TEST" != 1 ] && [ "$(id -u)" != 0 ]; then die "must run as root"; fi
+if [ "$TEST" != 1 ]; then mkdir -p "$(dirname "$LOCK")"; chmod 0700 "$(dirname "$LOCK")"; fi
 exec 9>"$LOCK"
 flock -n 9 || die "another install is running (lock $LOCK)"
 
@@ -82,6 +83,21 @@ flock -n 9 || die "another install is running (lock $LOCK)"
 swap_symlink() { # swap_symlink <target-text> <link>
   ln -sfn "$1" "$2.new"
   mv -T "$2.new" "$2"
+}
+
+# Put the unit files and the slice that a release carries back as the installed ones (they travel with the release so that code and units always match).
+# Releases made by an older installer carry none: then what is installed stays. Returns 0 when something was (re)installed.
+restore_units_from() { # restore_units_from <release-dir>
+  local rel=$1 u changed=1
+  for u in aw-login-host@.service aw-login-host-failed@.service "aw-$ENV_NAME.slice"; do
+    [ -f "$rel/$u" ] || continue
+    if ! cmp -s "$rel/$u" "$UNIT_DIR/$u" 2>/dev/null; then
+      install -m 0644 "${OWN[@]}" "$rel/$u" "$UNIT_DIR/$u.new"
+      mv -f "$UNIT_DIR/$u.new" "$UNIT_DIR/$u"
+      changed=0
+    fi
+  done
+  return $changed
 }
 
 # ───────────────────────────── --self-test-disk ─────────────────────────────
@@ -151,12 +167,7 @@ if [ "$ROLLBACK" = 1 ]; then
     mv -f "$CONF/$ENV_NAME.json.new" "$CONF/$ENV_NAME.json"
     [ -z "$cur_target" ] || swap_symlink "$cur_target" "$OPT/previous"
     # the unit files and the slice of THAT release (older releases that did not carry them keep what is installed)
-    for u in aw-login-host@.service aw-login-host-failed@.service "aw-$ENV_NAME.slice"; do
-      if [ -f "$prev/$u" ]; then
-        install -m 0644 "${OWN[@]}" "$prev/$u" "$UNIT_DIR/$u.new"
-        mv -f "$UNIT_DIR/$u.new" "$UNIT_DIR/$u"
-      fi
-    done
+    restore_units_from "$prev" || true
     "$SYSTEMCTL" daemon-reload
     ok "rolled back to $prev_target. Restart the service now: systemctl restart aw-login-host@$ENV_NAME (the deploy document does this)."
   fi
@@ -176,6 +187,9 @@ cleanup() {
   if [ "$rc" -ne 0 ] && [ "$DRY" != 1 ]; then
     if have_valid_install; then
       log "the install failed (exit $rc) but a valid previous install exists: it was NOT touched and keeps running" >&2
+    elif [ "$PREPARE" = 1 ] || "$SYSTEMCTL" is-active --quiet "aw-login-host@$ENV_NAME"; then
+      # --prepare only gets the machine ready, and a host that is RUNNING is never stopped by a failed install (it may be on a layout this check does not know).
+      log "the preparation failed (exit $rc, see the lines above); nothing was started or stopped" >&2
     else
       # Nothing valid is installed (a first install that failed): make sure no half-configured host crash-loops.
       "$SYSTEMCTL" disable --now "aw-login-host@$ENV_NAME" >/dev/null 2>&1 || true
@@ -249,7 +263,11 @@ else
       ok "node $NODE_VERSION installed to $NODE_DIR"
     fi
   fi
-  if [ "$(readlink /usr/bin/node 2>/dev/null || true)" = "$NODE_DIR/bin/node" ]; then
+  # The /usr/bin/node link is what the unit starts and what deploy tooling runs: flipping it is part of the SWITCH (below), never of --prepare, so a host
+  # that keeps running (a deploy that finds it busy gives up) is not left with a different node under its next restart.
+  if [ "$PREPARE" = 1 ]; then
+    skip "/usr/bin/node link: left for the switch phase"
+  elif [ "$(readlink /usr/bin/node 2>/dev/null || true)" = "$NODE_DIR/bin/node" ]; then
     skip "/usr/bin/node already points at node $NODE_VERSION"
   else
     doing "ln -sfn $NODE_DIR/bin/node /usr/bin/node"
@@ -363,7 +381,7 @@ FP=$( {
   grep -v -E '^(name|git_sha|dirty|allow_dirty|tests|lockfile_check|build_node|commit_time|build_seq)=' "$HERE/MANIFEST"
   cat "$HERE/files/aw-login-host@.service" "$HERE/files/aw-env.slice.template"
   sha256sum "$STAGE_TLS_DIR/server.crt" "$STAGE_TLS_DIR/ca.crt" | cut -d' ' -f1
-  printf '%s\n%s\n' "$BRIDGE_URL" "$WORKER_IP"
+  printf '%s\n%s\n%s\n' "$BRIDGE_URL" "$WORKER_IP" "$(nproc)"
 } | sha256sum | cut -d' ' -f1)
 if have_valid_install && [ "$(cat "$OPT/current/FINGERPRINT")" = "$FP" ]; then
   # Re-assert the modes of the active TLS set even though nothing changed (a key that drifted to 0644 would make the host refuse to start).
@@ -372,6 +390,11 @@ if have_valid_install && [ "$(cat "$OPT/current/FINGERPRINT")" = "$FP" ]; then
     chmod 0644 "$act_tls/server.crt" "$act_tls/ca.crt"
     chmod 0600 "$act_tls/server.key"
     chmod 0755 "$act_tls"
+  fi
+  # A previous deploy that was killed half-way can leave unit files that do not match the active release: put them right (a no-op when they match).
+  if [ "$DRY" != 1 ] && restore_units_from "$OPT/current"; then
+    "$SYSTEMCTL" daemon-reload
+    log "the installed unit files did not match the active release: restored them"
   fi
   ok "this exact build, TLS set, address and bridge are already active ($(readlink "$OPT/current")): nothing to do"
   exit 0
@@ -479,5 +502,12 @@ while read -r _t name; do
   rm -rf "${OPT:?}/releases/$name" "${CONF:?}/tls/$name"
   log "pruned old release $name"
 done < <(find "$OPT/releases" -mindepth 1 -maxdepth 1 -type d ! -name '.stage-*' -printf '%T@ %f\n' | sort -rn)
+# Leftovers of an install that was killed half-way (they can hold a TLS key): staging directories older than a day.
+for d in "$OPT/releases" "$CONF/tls"; do
+  [ -d "$d" ] || continue
+  while IFS= read -r stale; do
+    rm -rf "${stale:?}"
+  done < <(find "$d" -mindepth 1 -maxdepth 1 -type d -name '.stage-*' -mtime +0 2>/dev/null)
+done
 
 exit 0

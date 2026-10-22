@@ -118,7 +118,7 @@ describe("deploy scripts: static guards", () => {
 
   it("a failed redeploy never stops a healthy host: `disable --now` exists only in the trap and only when NO valid install exists", () => {
     expect(install.match(/disable --now/g)?.length).toBe(1);
-    expect(install).toMatch(/have_valid_install; then[\s\S]{0,300}else[\s\S]{0,300}disable --now/);
+    expect(install).toMatch(/have_valid_install; then[\s\S]{0,800}else[\s\S]{0,300}disable --now/);
     expect(install).toContain("exit 3");
     expect(install).toContain("flock -n 9");
   });
@@ -559,7 +559,7 @@ describe("install.sh: stage -> validate -> switch, rollback, and 'a failure neve
     writeFileSync(join(dir, "ca.json"), caJson);
     fake("aws", `[ -e "${dir}/aws-fails" ] && { echo "AccessDenied" >&2; exit 254; }
 case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${versions.TLS_SECRET_CA}"*) cat "${dir}/ca.json" ;; *) exit 2 ;; esac`);
-    fake("systemctl", `echo "systemctl $*" >>"${calls}"`);
+    fake("systemctl", `echo "systemctl $*" >>"${calls}"\n[ "$1" = "is-active" ] && exit 3 # not running, unless a test says otherwise\nexit 0`);
     const opt = join(dir, "opt");
     const conf = join(dir, "etc");
     const units = join(dir, "units");
@@ -641,7 +641,8 @@ case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${
       for (const args of [["--prepare"], []]) {
         const r = run(b, ...args);
         expect(r.status).toBe(3);
-        expect(r.stderr + r.stdout).not.toMatch(/data disk|dnf|download/);
+        // in test mode the prerequisites step prints a "skipped" line when (and only when) it is reached: it must not be
+        expect(r.stderr + r.stdout).not.toContain("prerequisites (disk, packages");
       }
       expect(releases(b)).toEqual([]);
     });
@@ -679,14 +680,75 @@ case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${
       const firstUnit = text(unit);
       nextSecond();
       // the second build ships a different unit (and a different file hash, so it is a new release)
+      const failedUnit = join(b.units, "aw-login-host-failed@.service");
+      const slice = join(b.units, "aw-prod.slice");
+      const first3 = [firstUnit, text(failedUnit), text(slice)];
       writeFileSync(join(b.pkg, "files/aw-login-host@.service"), firstUnit + "\n# a unit change that turned out to be bad\n");
+      writeFileSync(join(b.pkg, "files/aw-login-host-failed@.service"), first3[1] + "\n# bad failed-unit change\n");
+      writeFileSync(join(b.pkg, "files/aw-env.slice.template"), text(join(b.pkg, "files/aw-env.slice.template")) + "\n# bad slice change\n");
       writeFileSync(join(b.pkg, "MANIFEST"), text(join(b.pkg, "MANIFEST")) + "unit_changed=1\n");
       expect(run(b).status).toBe(0);
       expect(text(unit)).toContain("a unit change that turned out to be bad");
+      expect(text(slice)).toContain("bad slice change");
       writeFileSync(b.calls, "");
       expect(run(b, "--rollback").status).toBe(0);
-      expect(text(unit)).toBe(firstUnit);
+      expect([text(unit), text(failedUnit), text(slice)]).toEqual(first3); // all three, not only the main unit
       expect(systemctlCalls(b)).toContain("systemctl daemon-reload");
+    });
+  });
+
+  describe("install.sh safety rules from the reliability review", () => {
+    const nextSecond = () => void spawnSync("sleep", ["1.2"]);
+
+    it("a no-op install repairs unit files that do not match the active release (a deploy killed between 'write units' and 'switch' left them wrong)", () => {
+      const b = box();
+      expect(run(b).status).toBe(0);
+      const unit = join(b.units, "aw-login-host@.service");
+      const good = text(unit);
+      writeFileSync(unit, good + "\n# damaged by an interrupted deploy\n");
+      writeFileSync(b.calls, "");
+      expect(run(b).status).toBe(0);
+      expect(text(unit)).toBe(good);
+      expect(systemctlCalls(b)).toContain("systemctl daemon-reload");
+    });
+
+    it("a failed --prepare never stops or disables anything (it only gets the machine ready)", () => {
+      const b = box({ bridge: null });
+      expect(run(b, "--prepare").status).toBe(3);
+      expect(systemctlCalls(b).filter((c) => c.includes("disable") || c.includes("stop"))).toEqual([]);
+    });
+
+    it("a failed first install DOES disable the unit (no half-configured host may crash-loop), but never when the unit is running", () => {
+      const b = box({ bridge: null });
+      run(b);
+      expect(systemctlCalls(b).some((c) => c.includes("disable --now"))).toBe(true);
+      // now with a running unit: the fake systemctl says is-active
+      const b2 = box({ bridge: null });
+      writeFileSync(join(b2.bin, "systemctl"), `#!/bin/bash\necho "systemctl $*" >>"${b2.calls}"\n[ "$1" = "is-active" ] && exit 0\nexit 0\n`);
+      run(b2);
+      expect(systemctlCalls(b2).some((c) => c.includes("disable"))).toBe(false);
+    });
+
+    it("the /usr/bin/node link is flipped only in the switch phase, never by --prepare, and the install lock is in a root-only directory", () => {
+      const src = text(join(PROD, "install.sh"));
+      expect(src).toMatch(/if \[ "\$PREPARE" = 1 \]; then\n\s+skip "\/usr\/bin\/node link: left for the switch phase"\n\s+elif/);
+      expect(src).toContain("LOCK=/run/aw-deploy/install.lock");
+      expect(src).toMatch(/chmod 0700 "\$\(dirname "\$LOCK"\)"/);
+    });
+
+    it("staging directories left behind by a killed install are cleaned up once they are a day old, and only then", () => {
+      const b = box();
+      expect(run(b).status).toBe(0);
+      const fresh = join(b.opt, "releases/.stage-fresh");
+      const stale = join(b.opt, "releases/.stage-stale");
+      mkdirSync(fresh);
+      mkdirSync(stale);
+      spawnSync("touch", ["-d", "3 days ago", stale]);
+      nextSecond();
+      writeFileSync(join(b.pkg, "MANIFEST"), text(join(b.pkg, "MANIFEST")) + "another=1\n");
+      expect(run(b).status).toBe(0);
+      expect(existsSync(stale)).toBe(false);
+      expect(existsSync(fresh)).toBe(true);
     });
   });
 
@@ -700,7 +762,7 @@ case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${
       writeFileSync(join(S, "health.rcs"), "0\n0\n0\n");
       writeFileSync(
         join(b.bin, "systemctl"),
-        `#!/bin/bash\necho "systemctl $*" >>"${b.calls}"\n[ "$1" = "is-active" ] && exit ${opts.active ? 0 : 3}\nexit 0\n`,
+        `#!/bin/bash\necho "systemctl $*" >>"${b.calls}"\n[ "$1" = "is-active" ] && exit ${opts.active ? 0 : 3}\n[ "$1" = "show" ] && { echo ${opts.active ? "active" : "inactive"}; exit 0; }\nexit 0\n`,
       );
       writeFileSync(
         join(b.bin, "ctlnode"),
@@ -746,6 +808,7 @@ case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${
       const { b, deploy } = deployBox({ active: true });
       expect(run(b).status).toBe(0);
       const first = current(b);
+      writeFileSync(join(b.dir, "state/running-release"), `${first}\n`); // the host was seen healthy on this release
       const r = deploy();
       expect(r.status).toBe(0);
       expect(r.stdout).toContain("nothing to restart");
