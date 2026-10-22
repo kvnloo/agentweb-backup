@@ -89,10 +89,11 @@ export type BindingSource = ModelSource | undefined;
  * admin owner. True when the binding's provenance, recorded when it was written, says 'system', or the model is a
  * configured default that AgentWeb (not the user) put there:
  *  - the interactive default, everywhere and whatever the source: a turn with no model runs it anyway;
- *  - the scheduled / report / image / video / customer-support default in a session of that kind, only when the
- *    binding is NOT the user's pick ('user' = a pick recorded as the user's, or a new pick such as a picker PATCH to
- *    it). AgentWeb's own stamp of it is recorded 'system'; a legacy stamp with no record (undefined) is still taken as
- *    AgentWeb's, as before provenance existed.
+ *  - the scheduled / report / image / video / customer-support default in a session of that kind, unless it is a NEW
+ *    pick of it (source 'user' for a model the session does not already hold: a picker PATCH or /generate pick of it,
+ *    #3607 follow-up 1). The session's STORED model is exempt as that default whatever its record says: the portal
+ *    echoes the picker value on every turn, and that echo has recorded 'user' on legacy stamps (written before
+ *    provenance existed) since 2026-10-19, so a recorded 'user' cannot tell AgentWeb's stamp from a pick.
  * Nothing else is inferred at check time. An unreadable default contributes nothing.
  */
 export async function isSystemChosen(
@@ -105,15 +106,24 @@ export async function isSystemChosen(
   // Each read is isolated: one that throws (even synchronously) contributes nothing and blocks nothing.
   const read = (get: () => Promise<string | undefined | null>) => Promise.resolve().then(get);
   const reads = [read(() => agentModeService.getDefaultModel())];
-  // A user's pick of a session kind's default is checked like any other pick (follow-up 1 of #3607).
-  const sessionType = source === 'user' ? undefined : session?.sessionType;
+  // A NEW pick of a session kind's default is checked like any other pick (#3607 follow-up 1); the stored model is not.
+  const stored = typeof session?.llmModel === 'string' ? session.llmModel.trim() : '';
+  let isStoredModel = false;
+  try {
+    const resolution = stored ? agentModeService.resolveGenerationModel(stored) : undefined;
+    isStoredModel = !!resolution && !resolution.fellBack && resolution.model === canonicalModel;
+  } catch {
+    // An unresolvable stored id is not this model.
+  }
+  const kindDefaultApplies = source !== 'user' || isStoredModel;
+  const sessionType = kindDefaultApplies ? session?.sessionType : undefined;
   if (sessionType === 'scheduled') reads.push(read(() => agentModeService.getScheduledChatsDefaultModel()));
   if (sessionType === 'report_generation') {
     reads.push(read(() => agentModeService.getReportsModel()), read(() => agentModeService.getReportGenerationDefaultModel()));
   }
   if (sessionType === 'image-generation') reads.push(read(() => agentModeService.getImageGenerationDefaultModel()));
   if (sessionType === 'video-generation') reads.push(read(() => agentModeService.getVideoGenerationDefaultModel()));
-  if (source !== 'user' && session?.portalType === 'emma-sidebar') reads.push(read(() => agentModeService.getCustomerSupportDefaultModel()));
+  if (kindDefaultApplies && session?.portalType === 'emma-sidebar') reads.push(read(() => agentModeService.getCustomerSupportDefaultModel()));
   for (const settled of await Promise.allSettled(reads)) {
     if (settled.status !== 'fulfilled' || typeof settled.value !== 'string' || !settled.value.trim()) continue;
     const resolution = agentModeService.resolveGenerationModel(settled.value.trim());

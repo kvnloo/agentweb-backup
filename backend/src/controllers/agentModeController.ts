@@ -2289,8 +2289,15 @@ async function resolveWorkPlanStepModelForTurn(
   // user's only when the launch recorded that model as the user's own pick. A plan launched before launchModelSource
   // existed (legacy) cannot say, and its restore is not a pick the user is making now (#3607 follow-up 4).
   const restoreSource: ModelSource = plan.launchModelSource === 'user' ? 'user' : 'system';
+  // How the PRE-PLAN model (the restore, and a model-less step's fallback to it) is checked: as recorded, except that a
+  // 'user' record is the model the session already had at launch, not a pick made now, so (like an unrecorded stamp,
+  // see isSystemChosen) it is still exempt as the session kind's configured default. A 'user' launch record also comes
+  // from the portal's echo of a legacy stamp, which is AgentWeb's choice more often than not.
+  const prePlanCheck = (source: ModelSource): ModelSource | (() => Promise<BindingSource>) => (
+    source === 'system' ? 'system' : async () => undefined
+  );
   const resolveHonored = async (
-    model: string, stepCount: number, source: ModelSource | (() => Promise<ModelSource>),
+    model: string, stepCount: number, source: ModelSource | (() => Promise<BindingSource>),
   ): Promise<ResolvedStepDecision> => {
     // An explicit selection by a human: fail loud, never substitute.
     const decision = await resolveEffectiveModelForUser({
@@ -2310,7 +2317,7 @@ async function resolveWorkPlanStepModelForTurn(
     // ...nor when the stamp is a model the user picked during the plan (even if a resumed step adopted it as its own).
     if (plan.engineModel && plan.launchModel && session.llmModel === plan.engineModel && session.llmModel !== plan.pickedModel && !options.explicitPick) {
       try {
-        return { kind: 'restored', decision: await resolveHonored(plan.launchModel, 0, restoreSource), source: restoreSource };
+        return { kind: 'restored', decision: await resolveHonored(plan.launchModel, 0, prePlanCheck(restoreSource)), source: restoreSource };
       } catch (restoreError) {
         if (!isModelUnavailableError(restoreError)) throw restoreError;
         // The pre-plan model is gone (or outside the plan): do not retry every turn. The caller clears the marker and
@@ -2338,13 +2345,16 @@ async function resolveWorkPlanStepModelForTurn(
   const userPick = ownModel ? undefined : pick;
   const candidate = ownModel ?? (userPick || fallbackModel);
   if (!candidate) return { kind: 'none' };
+  const onLaunchModel = !userPick && !ownModel && !(typeof plan.planDefaultModel === 'string' && plan.planDefaultModel.trim());
   const candidateBinding = userPick
     ? 'user'
     : ownModel
       ? pinSource(step.modelSource)
-      : (typeof plan.planDefaultModel === 'string' && plan.planDefaultModel.trim()) ? pinSource(plan.planDefaultModelSource) : launchSource;
+      : onLaunchModel ? launchSource : pinSource(plan.planDefaultModelSource);
   try {
-    const decision = await resolveHonored(candidate, stepCount, candidateBinding);
+    const decision = await resolveHonored(
+      candidate, stepCount, onLaunchModel && typeof candidateBinding === 'string' ? prePlanCheck(candidateBinding) : candidateBinding,
+    );
     // The session stamp records the binding's provenance; a legacy plan's pin is stamped with none, so it stays under
     // the legacy rule (storedBindingSource) without reading the template here.
     return {
