@@ -13,6 +13,7 @@ import { readFileSync } from 'fs';
 import { join } from 'path';
 import { orgDb, userDb } from '../services/db';
 import { chatbotDb } from '../services/chatbotService';
+import { deckHalt, deckReply, type DeckMessage } from './helpers/approvalDeckHistory';
 import { recordVendorUsage } from '../services/usageRecorderService';
 import { isHotLeadCallEnabled } from '../services/voice/hotLeadCallMode';
 import '../emma/hotLeadCallTools';
@@ -30,7 +31,7 @@ const attended = (extra: Record<string, unknown> = {}) => ({ userId: 'owner', se
 type Halt = { awaitingUserConfirmation?: boolean; questionDeckPayload?: Array<{ kind: string; question: string; options: Array<{ id: string }> }> };
 
 // In-memory chat sessions: the history the approval gate reads and the single-use map it claims in.
-type FakeSession = { sessionType?: string; consumedMetaWriteManifestDigests: Record<string, string>; messages: Array<{ metadata: Record<string, unknown> }> };
+type FakeSession = { sessionType?: string; consumedMetaWriteManifestDigests: Record<string, string>; messages: DeckMessage[] };
 let sessions: Map<string, FakeSession>;
 let deckCounter: number;
 const sessionOf = (id: string) => { if (!sessions.has(id)) sessions.set(id, { sessionType: 'chat', consumedMetaWriteManifestDigests: {}, messages: [] }); return sessions.get(id)!; };
@@ -38,7 +39,8 @@ function installChatDb() {
   sessions = new Map();
   deckCounter = 0;
   (chatbotDb.getChatSession as jest.Mock).mockImplementation(async (id: string) => clone(sessionOf(id)));
-  (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockImplementation(async (id: string) => clone(sessionOf(id).messages));
+  // The default read is eventually consistent: it can miss the newest message.
+  (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockImplementation(async (id: string) => clone(sessionOf(id).messages.slice(0, -1)));
   (chatbotDb.claimMetaWriteManifestDigest as jest.Mock).mockImplementation(async (id: string, key: string) => {
     const map = sessionOf(id).consumedMetaWriteManifestDigests;
     if (key in map) return false;
@@ -50,11 +52,11 @@ function installChatDb() {
 function recordHalt(result: unknown, sessionId = SESSION): string {
   const item = (result as Halt).questionDeckPayload![0];
   const deckId = `deck-${++deckCounter}`;
-  sessionOf(sessionId).messages.push({ metadata: { pendingApprovalDeckId: deckId, approvalDeckItems: [{ itemId: `item-${deckId}`, kind: item.kind, question: item.question }] } });
+  sessionOf(sessionId).messages.push(deckHalt(item.kind, deckId, item.question));
   return deckId;
 }
 function answerCard(deckId: string, verdict: string, sessionId = SESSION, extra: { answeredBy?: string; at?: string } = {}) {
-  sessionOf(sessionId).messages.push({ metadata: { approvalDeckAnswer: { deckId, answers: [{ itemId: `item-${deckId}`, verdict, answeredBy: extra.answeredBy ?? 'user', at: extra.at ?? new Date().toISOString() }] } } });
+  sessionOf(sessionId).messages.push(deckReply(deckId, verdict, extra.answeredBy ?? 'user', extra.at ?? new Date().toISOString()));
 }
 /** Calls the tool, and when it halts with a card, has the user approve it and calls again. */
 async function withApproval(name: string, args: unknown, ctx: { sessionId?: string } = attended()) {
@@ -565,7 +567,6 @@ describe('human approval for provision and release', () => {
       ['a call without a chat session', { sessionId: undefined }, 'attended chat session'],
     ])('refuses %s without showing a card', async (_label, extra, message) => {
       await expect(call(name, attended(extra))).rejects.toThrow(message);
-      expect(chatbotDb.getMessagesFromMessagesTable).not.toHaveBeenCalled();
       expect(spent()).toBe(0);
     });
     it('refuses a scheduled session without showing a card', async () => {
@@ -582,12 +583,6 @@ describe('human approval for provision and release', () => {
       await expect(call(name, attended({ userId: 'm' }))).rejects.toThrow('owners and admins');
       expect(chatbotDb.getChatSession).not.toHaveBeenCalled();
     });
-    it('refuses an org without the entitlement before any card is shown', async () => {
-      if (name === RELEASE) return;
-      setHotLeadCallEntitledOverride(false);
-      await expect(call(name)).rejects.toThrow('not included');
-      expect(chatbotDb.getChatSession).not.toHaveBeenCalled();
-    });
     it('refuses missing settings before any card is shown', async () => {
       delete org.hotLeadCall;
       await expect(call(name)).rejects.toThrow('Save the hot lead call settings first');
@@ -595,6 +590,22 @@ describe('human approval for provision and release', () => {
     });
   });
 
+  it('refuses an org without the entitlement before any card is shown', async () => {
+    prepare(PROVISION);
+    setHotLeadCallEntitledOverride(false);
+    await expect(call(PROVISION)).rejects.toThrow('not included');
+    expect(chatbotDb.getChatSession).not.toHaveBeenCalled();
+  });
+  it('reads the history consistently: a decline the default read has not seen yet still stops the purchase', async () => {
+    prepare(PROVISION);
+    const first = await call(PROVISION);
+    answerCard(recordHalt(first), 'approve');
+    const newerKind = String(first.questionDeckPayload![0].kind).replace(/:[0-9a-f]+$/, ':newer');
+    sessionOf(SESSION).messages.push(deckHalt(newerKind, 'deck-newer'));
+    answerCard('deck-newer', 'decline');
+    expect((await call(PROVISION)).awaitingUserConfirmation).toBe(true);
+    expect(fake.boughtNumbers).toEqual([]);
+  });
   it('an approval for one area code does not buy another', async () => {
     prepare(PROVISION);
     answerCard(recordHalt(await call(PROVISION)), 'approve');

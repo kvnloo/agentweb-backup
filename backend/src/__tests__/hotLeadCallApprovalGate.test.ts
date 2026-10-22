@@ -3,6 +3,7 @@ import {
   approvalKindPrefix, buildApprovalQuestion, checkAttendedForApproval, computeApprovalDigest, consumedKeyOf,
   findApproval, newApprovalKind, type ApprovalDigestInput,
 } from '../services/voice/hotLeadCallApprovalGate';
+import { deckHalt, deckReply, type DeckMessage } from './helpers/approvalDeckHistory';
 
 const NOW = Date.parse('2026-10-22T12:00:00.000Z');
 const base: ApprovalDigestInput = {
@@ -11,13 +12,12 @@ const base: ApprovalDigestInput = {
 const digest = computeApprovalDigest(base);
 const prefix = approvalKindPrefix('provision', digest);
 
-type Msg = { metadata: Record<string, unknown> };
+type Msg = DeckMessage;
 /** A halt message carrying one card, optionally followed by the reply message that answers it. */
 function card(kind: string, deckId: string, answer?: { verdict: string; answeredBy?: 'user' | 'delegation'; at?: string }): Msg[] {
-  const halt: Msg = { metadata: { pendingApprovalDeckId: deckId, approvalDeckItems: [{ itemId: `i-${deckId}`, kind, question: 'q' }] } };
+  const halt = deckHalt(kind, deckId);
   if (!answer) return [halt];
-  const at = answer.at ?? new Date(NOW - 60_000).toISOString();
-  return [halt, { metadata: { approvalDeckAnswer: { deckId, answers: [{ itemId: `i-${deckId}`, verdict: answer.verdict, answeredBy: answer.answeredBy ?? 'user', at }] } } }];
+  return [halt, deckReply(deckId, answer.verdict, answer.answeredBy ?? 'user', answer.at ?? new Date(NOW - 60_000).toISOString())];
 }
 const find = (messages: Msg[], consumed: string[] = [], pre = prefix) => findApproval(messages as never, pre, NOW, new Set(consumed));
 
