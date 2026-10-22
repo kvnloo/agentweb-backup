@@ -30,6 +30,14 @@ export interface AdminRedactionOptions {
   viewerIsAdmin?: boolean;
   /** The set/list of admin-only tool names. Passed in so this stays a pure, dependency-free util. */
   adminToolNames?: Iterable<string>;
+  /**
+   * ENG-112: drop `metadata.branchOrigin` (chat-branching provenance: the source session id/title) from the
+   * returned rows. Set for viewers who are not the session owner (share / conversable links). Default false.
+   * ENG-113: the same flag also drops `metadata.compareAlternatives` (the saved unchosen Compare answers are
+   * owner-only) via the same mechanism. `compareAlternativesOmitted`/`compareId` carry no answer text and stay.
+   * ENG-669 PR-C: and the AgentWeb Model routing fields (`llmSelected`, `llmRoutingReason`, `llmRoutingTableVersion`).
+   */
+  omitBranchOrigin?: boolean;
 }
 
 // Back-compat alias for the original name.
@@ -39,7 +47,7 @@ export type FilterForClientOptions = AdminRedactionOptions;
  * Mark every message index that falls inside an admin-tainted turn. Returns an all-false array
  * when the viewer is an admin or no admin tool names are supplied (nothing to redact).
  */
-function computeAdminTaintedTurns(messages: any[], viewerIsAdmin: boolean, adminToolNameSet: Set<string>): boolean[] {
+export function computeAdminTaintedTurns(messages: any[], viewerIsAdmin: boolean, adminToolNameSet: Set<string>): boolean[] {
   const adminTainted = new Array(messages.length).fill(false);
   if (viewerIsAdmin || adminToolNameSet.size === 0) return adminTainted;
 
@@ -85,6 +93,25 @@ export function filterMessagesForClient(messages: any[], opts: AdminRedactionOpt
   const adminToolNameSet = new Set<string>(opts.adminToolNames ?? []);
   const adminTainted = computeAdminTaintedTurns(messages, viewerIsAdmin, adminToolNameSet);
 
+  // `omitBranchOrigin` is the legacy flag name for "this viewer is not the session owner": it strips BOTH owner-only
+  // metadata keys (ENG-112 branchOrigin and ENG-113 compareAlternatives). Both share the one call-site rule on purpose
+  // (every non-owner view must hide both); the adminOnlyMessageFilter tripwire tests pin each key.
+  // ENG-669 PR-C: the same viewers never get the AgentWeb Model's routing provenance either (`llmSelected`,
+  // `llmRoutingReason`, `llmRoutingTableVersion` beside `llm`): how the owner's turns were routed is the owner's.
+  const stripOwnerOnlyMetadata = (message: any) => {
+    if (!opts.omitBranchOrigin || !message || typeof message !== 'object') return message;
+    let out = message;
+    if ('llmSelected' in out || 'llmRoutingReason' in out || 'llmRoutingTableVersion' in out) {
+      const { llmSelected: _selected, llmRoutingReason: _reason, llmRoutingTableVersion: _version, ...rest } = out;
+      out = rest;
+    }
+    if (out.metadata && ('branchOrigin' in out.metadata || 'compareAlternatives' in out.metadata)) {
+      const { branchOrigin: _origin, compareAlternatives: _alternatives, ...metadata } = out.metadata;
+      out = { ...out, metadata };
+    }
+    return out;
+  };
+
   return messages.filter((message, i) => {
     // Remove tool messages (all viewers).
     if (message.role === 'tool') return false;
@@ -110,7 +137,7 @@ export function filterMessagesForClient(messages: any[], opts: AdminRedactionOpt
     }
 
     return true;
-  });
+  }).map(stripOwnerOnlyMetadata);
 }
 
 /**
@@ -146,4 +173,20 @@ export function redactAdminActivity(messages: any[], opts: AdminRedactionOptions
     }
     return true;
   });
+}
+
+/**
+ * Owner-only attribute: remove `branchedFrom` from a session-level object before it is shown to anyone but
+ * the owner's own portal (MCP tools and any other external view). Works on one session or `{sessions: []}`.
+ */
+export function omitBranchedFrom<T>(value: T): T {
+  if (!value || typeof value !== 'object') return value;
+  const strip = (s: any) => {
+    if (!s || typeof s !== 'object' || !('branchedFrom' in s)) return s;
+    const { branchedFrom: _b, ...rest } = s;
+    return rest;
+  };
+  const v: any = value;
+  if (Array.isArray(v.sessions)) return { ...strip(v), sessions: v.sessions.map(strip) } as T;
+  return strip(v) as T;
 }

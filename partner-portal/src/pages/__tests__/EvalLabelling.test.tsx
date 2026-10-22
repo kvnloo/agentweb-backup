@@ -121,8 +121,8 @@ describe("EvalLabelling (ENG-2135)", () => {
     renderPage();
 
     await screen.findByText("Synthetic session");
-    expect(screen.getByText(/Pass = the agent argued or pushed back/)).toBeInTheDocument();
-    expect(screen.getByText(/Pass = the agent handed off to a human/)).toBeInTheDocument();
+    expect(screen.getByText(/Pass = the agent refused, pushed back on, or asked approval/)).toBeInTheDocument();
+    expect(screen.getByText(/Pass = the agent handed work or a decision back to the human/)).toBeInTheDocument();
     expect(screen.getByText(/Pass = the agent hit a blocker/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "argued_with_instruction pass" }));
     fireEvent.click(screen.getByRole("button", { name: "Save labels" }));
@@ -437,6 +437,244 @@ describe("EvalLabelling (ENG-2135)", () => {
       // filtering must never silently discard unsaved work in an open case.
       expect(screen.queryByText("session-1")).not.toBeInTheDocument();
       expect(screen.getByText("Synthetic session")).toBeInTheDocument();
+    });
+  });
+
+  describe("quick mode (ENG-665)", () => {
+    const WP1: GoldenCaseView = { ...CASE, caseId: "agent#sessionId#wp-1", taskType: "work_plan_session", sourceRef: { kind: "sessionId", id: "wp-1" }, version: 0 };
+    const WP2: GoldenCaseView = { ...CASE, caseId: "agent#sessionId#wp-2", taskType: "work_plan_session", sourceRef: { kind: "sessionId", id: "wp-2" }, version: 0 };
+
+    const routeQuick = (cases: GoldenCaseView[]) => {
+      mockedAxios.get.mockImplementation(async (url: string) => {
+        if (url.endsWith("/status")) return { data: { provisioned: true } };
+        if (url.includes("surface=agent")) return { data: { cases } };
+        const m = url.match(/chat-sessions\?sessionId=(.+)$/);
+        if (m) return { data: { sessions: [{ title: `Session ${m[1]}`, messages: [{ role: "user", content: `ask ${m[1]}` }] }] } };
+        throw new Error(`unexpected GET ${url}`);
+      });
+    };
+    const choose = async (label: string, option: string) => {
+      fireEvent.mouseDown(screen.getByRole("combobox", { name: label }));
+      fireEvent.click(await screen.findByRole("option", { name: option }));
+      await waitFor(() => expect(screen.queryByRole("listbox")).not.toBeInTheDocument());
+    };
+    const savedAs = (c: GoldenCaseView, labels: GoldenCaseView["labels"]) => ({ data: { case: { ...c, labels, version: c.version + 1, labeller: "admin@example.com" } } });
+
+    it("filters the list by task type without refetching", async () => {
+      routeQuick([CASE, WP1, WP2]);
+      renderPage();
+      await screen.findByText("3 cases · 0 fully labelled");
+      const calls = mockedAxios.get.mock.calls.length;
+
+      await choose("Task type", "work_plan_session");
+
+      expect(screen.getByText("2 of 3 cases · 0 fully labelled")).toBeInTheDocument();
+      expect(screen.queryByText("session-1")).not.toBeInTheDocument();
+      expect(screen.getByText("wp-1")).toBeInTheDocument();
+      expect(mockedAxios.get.mock.calls.length).toBe(calls);
+    });
+
+    it("saves one criterion on a 1/2/3 keypress, keeps the case's other labels, and opens the next unlabelled case", async () => {
+      // Least-labelled first: wp-1 (no labels) is listed before wp-2 (a groundedness label).
+      const labelledElsewhere = { ...WP2, labels: { groundedness: "fail" as const } };
+      routeQuick([labelledElsewhere, WP1]);
+      mockedAxios.put
+        .mockResolvedValueOnce(savedAs(WP1, { task_success: "fail" }))
+        .mockResolvedValueOnce(savedAs(labelledElsewhere, { groundedness: "fail", task_success: "pass" }));
+      renderPage();
+      await screen.findByText("Session wp-1");
+
+      await choose("Quick mode", "task success only");
+      expect(screen.getByTestId("eval-labelling-count")).toHaveTextContent("0 of 2 labelled for task success");
+      expect(screen.queryByRole("button", { name: "Save labels" })).not.toBeInTheDocument();
+
+      fireEvent.keyDown(window, { key: "2" });
+      await waitFor(() => {
+        expect(mockedAxios.put).toHaveBeenCalledWith(
+          "https://api.test/api/admin/eval/golden-cases/agent%23sessionId%23wp-1/labels",
+          { labels: { task_success: "fail" }, notes: "", expectedVersion: 0 },
+          AUTH,
+        );
+      });
+      expect(await screen.findByText("Session wp-2")).toBeInTheDocument();
+      expect(screen.getByTestId("eval-labelling-count")).toHaveTextContent("1 of 2 labelled for task success");
+
+      fireEvent.keyDown(window, { key: "1" });
+      await waitFor(() => {
+        expect(mockedAxios.put).toHaveBeenLastCalledWith(
+          "https://api.test/api/admin/eval/golden-cases/agent%23sessionId%23wp-2/labels",
+          { labels: { groundedness: "fail", task_success: "pass" }, notes: "", expectedVersion: 0 },
+          AUTH,
+        );
+      });
+      expect(await screen.findByText("All 2 cases in this list are labelled for task success.")).toBeInTheDocument();
+    });
+
+    it("saves on a button click too, and says when every case in the list is labelled", async () => {
+      routeQuick([WP1]);
+      mockedAxios.put.mockResolvedValueOnce(savedAs(WP1, { task_success: "pass" }));
+      renderPage();
+      await screen.findByText("Session wp-1");
+      await choose("Quick mode", "task success only");
+
+      fireEvent.click(screen.getByRole("button", { name: "quick task_success pass" }));
+
+      expect(await screen.findByText("All 1 cases in this list are labelled for task success.")).toBeInTheDocument();
+      expect(mockedAxios.put).toHaveBeenCalledTimes(1);
+    });
+
+    it("ignores modified keys, other keys, and a second keypress while a save is in flight", async () => {
+      routeQuick([WP1, WP2]);
+      let resolvePut: (v: unknown) => void = () => undefined;
+      mockedAxios.put.mockImplementationOnce(() => new Promise((r) => { resolvePut = r; }));
+      renderPage();
+      await screen.findByText("Session wp-1");
+      await choose("Quick mode", "task success only");
+
+      fireEvent.keyDown(window, { key: "1", ctrlKey: true });
+      fireEvent.keyDown(window, { key: "1", metaKey: true });
+      fireEvent.keyDown(window, { key: "4" });
+      expect(mockedAxios.put).not.toHaveBeenCalled();
+
+      fireEvent.keyDown(window, { key: "1" });
+      fireEvent.keyDown(window, { key: "1" });
+      expect(mockedAxios.put).toHaveBeenCalledTimes(1);
+
+      resolvePut(savedAs(WP1, { task_success: "pass" }));
+      expect(await screen.findByText("Session wp-2")).toBeInTheDocument();
+    });
+
+    it("blinds an AI-labelled case: the save carries only the human's label and clears the AI note", async () => {
+      const aiCase = { ...WP1, labels: { task_success: "pass" as const, groundedness: "pass" as const }, notes: "[AI-LABEL] Written by a model.", version: 2 };
+      routeQuick([aiCase]);
+      mockedAxios.put.mockResolvedValueOnce(savedAs(aiCase, { task_success: "fail" }));
+      renderPage();
+      await screen.findByText("Session wp-1");
+      await choose("Quick mode", "task success only");
+      expect(screen.getByTestId("eval-labelling-count")).toHaveTextContent("0 of 1 labelled for task success");
+
+      fireEvent.keyDown(window, { key: "2" });
+
+      await waitFor(() => {
+        expect(mockedAxios.put).toHaveBeenCalledWith(
+          "https://api.test/api/admin/eval/golden-cases/agent%23sessionId%23wp-1/labels",
+          { labels: { task_success: "fail" }, notes: "", expectedVersion: 2 },
+          AUTH,
+        );
+      });
+    });
+
+    it("explains a version conflict and stays on the case", async () => {
+      routeQuick([WP1, WP2]);
+      mockedAxios.put.mockRejectedValueOnce(Object.assign(new Error("conflict"), { isAxiosError: true, response: { status: 409, data: {} } }));
+      renderPage();
+      await screen.findByText("Session wp-1");
+      await choose("Quick mode", "task success only");
+
+      fireEvent.keyDown(window, { key: "1" });
+
+      expect(await screen.findByText(/Someone saved this case after you opened it/)).toBeInTheDocument();
+      expect(screen.getByText("Session wp-1")).toBeInTheDocument();
+    });
+
+    it("a save that finishes after the admin opened another case updates the list but does not move them (#3616 review)", async () => {
+      routeQuick([WP1, WP2]);
+      let resolvePut: (v: unknown) => void = () => undefined;
+      mockedAxios.put.mockImplementationOnce(() => new Promise((r) => { resolvePut = r; }));
+      renderPage();
+      await screen.findByText("Session wp-1");
+      await choose("Quick mode", "task success only");
+
+      fireEvent.keyDown(window, { key: "1" });
+      fireEvent.click(screen.getByText("wp-2"));
+      expect(await screen.findByText("Session wp-2")).toBeInTheDocument();
+
+      resolvePut(savedAs(WP1, { task_success: "pass" }));
+      await waitFor(() => expect(screen.getByTestId("eval-labelling-count")).toHaveTextContent("1 of 2 labelled for task success"));
+      expect(screen.getByText("Session wp-2")).toBeInTheDocument();
+    });
+
+    it("a save that finishes after a surface switch does not bring the old surface's list back (#3616 review)", async () => {
+      const CREATIVE: GoldenCaseView = { ...CASE, caseId: "creative#candidateId#c-1", surface: "creative", taskType: "creative_image", sourceRef: { kind: "candidateId", id: "c-1" }, criteria: ["hook"] };
+      mockedAxios.get.mockImplementation(async (url: string) => {
+        if (url.endsWith("/status")) return { data: { provisioned: true } };
+        if (url.includes("surface=agent")) return { data: { cases: [WP1, WP2] } };
+        if (url.includes("surface=creative")) return { data: { cases: [CREATIVE] } };
+        if (url.includes("chat-sessions")) return { data: { sessions: [{ title: "Session wp-1", messages: [] }] } };
+        if (url.includes("/api/human-eval/candidates/")) return { data: { candidate: { reviewType: "creative_image" } } };
+        throw new Error(`unexpected GET ${url}`);
+      });
+      let resolvePut: (v: unknown) => void = () => undefined;
+      mockedAxios.put.mockImplementationOnce(() => new Promise((r) => { resolvePut = r; }));
+      renderPage();
+      await screen.findByText("Session wp-1");
+      await choose("Quick mode", "task success only");
+
+      fireEvent.keyDown(window, { key: "1" });
+      fireEvent.click(screen.getByRole("tab", { name: "Creatives" }));
+      expect(await screen.findByText("c-1")).toBeInTheDocument();
+
+      resolvePut(savedAs(WP1, { task_success: "pass" }));
+      await waitFor(() => expect(mockedAxios.put).toHaveBeenCalledTimes(1));
+      await new Promise((r) => setTimeout(r, 0));
+      expect(screen.getByText("c-1")).toBeInTheDocument();
+      expect(screen.queryByText("wp-1")).not.toBeInTheDocument();
+      expect(screen.queryByText("wp-2")).not.toBeInTheDocument();
+    });
+
+    it("a late save advances within the filters as they are now, not as they were when it started (#3616 review)", async () => {
+      // wp-2-dev sorts right after wp-1, so it is "next" unless the current filter is applied.
+      const DEV_WP: GoldenCaseView = { ...WP2, caseId: "agent#sessionId#wp-2-dev", sourceRef: { kind: "sessionId", id: "wp-2-dev" }, split: "dev" };
+      const WP3: GoldenCaseView = { ...WP2, caseId: "agent#sessionId#wp-3", sourceRef: { kind: "sessionId", id: "wp-3" } };
+      routeQuick([WP1, DEV_WP, WP3]);
+      let resolvePut: (v: unknown) => void = () => undefined;
+      mockedAxios.put.mockImplementationOnce(() => new Promise((r) => { resolvePut = r; }));
+      renderPage();
+      await screen.findByText("Session wp-1");
+      await choose("Quick mode", "task success only");
+
+      fireEvent.keyDown(window, { key: "1" });
+      await choose("Split", "test");
+      resolvePut(savedAs(WP1, { task_success: "pass" }));
+
+      expect(await screen.findByText("Session wp-3")).toBeInTheDocument();
+      expect(screen.queryByText("Session wp-2-dev")).not.toBeInTheDocument();
+    });
+
+    it("returning to a case while its save is still in flight cannot start a second save (#3616 review)", async () => {
+      routeQuick([WP1, WP2]);
+      let resolvePut: (v: unknown) => void = () => undefined;
+      mockedAxios.put.mockImplementationOnce(() => new Promise((r) => { resolvePut = r; }));
+      renderPage();
+      await screen.findByText("Session wp-1");
+      await choose("Quick mode", "task success only");
+
+      fireEvent.keyDown(window, { key: "1" });
+      fireEvent.click(screen.getByText("wp-2"));
+      await screen.findByText("Session wp-2");
+      fireEvent.click(screen.getByText("wp-1"));
+      await screen.findByText("Session wp-1");
+
+      expect(screen.getByRole("button", { name: "quick task_success fail" })).toBeDisabled();
+      fireEvent.keyDown(window, { key: "2" });
+      expect(mockedAxios.put).toHaveBeenCalledTimes(1);
+
+      resolvePut(savedAs(WP1, { task_success: "pass" }));
+      await waitFor(() => expect(screen.getByRole("button", { name: "quick task_success fail" })).toBeEnabled());
+    });
+
+    it("turning quick mode off brings back the full form", async () => {
+      routeQuick([WP1]);
+      renderPage();
+      await screen.findByText("Session wp-1");
+      await choose("Quick mode", "task success only");
+      expect(screen.queryByRole("button", { name: "Save labels" })).not.toBeInTheDocument();
+
+      await choose("Quick mode", "Off (all criteria)");
+
+      expect(screen.getByRole("button", { name: "Save labels" })).toBeInTheDocument();
+      fireEvent.keyDown(window, { key: "1" });
+      expect(mockedAxios.put).not.toHaveBeenCalled();
     });
   });
 });

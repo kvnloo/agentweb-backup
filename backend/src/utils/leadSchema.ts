@@ -649,3 +649,19 @@ export function projectLeadAttribution(lead: any): Partial<LeadAttributionFields
 
   return out;
 }
+
+/**
+ * Status a pending_review lead moves to once its draft has been sent: 'contacted'
+ * when the list has it, else the first active working status. Returns null (leave
+ * the status alone) for leads that aren't in review.
+ */
+export function statusAfterReviewedSend(
+  currentStatus: string | undefined | null,
+  statusConfig?: Array<{ value: string; type?: string }>,
+  listType?: string | null,
+): string | null {
+  if (currentStatus !== 'pending_review') return null;
+  const config = statusConfig?.length ? statusConfig : (defaultStatusConfigFor(listType) as Array<{ value: string; type?: string }>);
+  const working = config.filter(st => st.value !== 'pending_review' && (!st.type || st.type === 'active'));
+  return (working.find(st => st.value === 'contacted') ?? working[0])?.value ?? null;
+}

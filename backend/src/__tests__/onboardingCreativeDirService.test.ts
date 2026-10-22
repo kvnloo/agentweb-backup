@@ -8,16 +8,19 @@
 jest.mock("../services/db", () => ({
   userDb: {
     getUserById: jest.fn(),
+    getUserByIdConsistent: jest.fn(),
     updateUser: jest.fn(),
   },
 }));
 
 import {
+  claimCreativeDirRun,
   CREATIVE_DIR_SYSTEM_PROMPT,
   generateCreativeDirectionForUser,
   startCreativeDirForUser,
   triggerCreativeDirForUser,
 } from "../services/onboardingCreativeDirService";
+import { CREATIVE_DIR_TIMEOUT_MS } from "../services/creativeDirStatusService";
 const { userDb } = require("../services/db");
 
 class FakeLlm {
@@ -296,6 +299,92 @@ describe("onboardingCreativeDirService", () => {
       expect(writtenPatch.creativeDirResult.concepts).toHaveLength(6);
     });
 
+    // It runs moments after the upstream steps wrote their results, when the
+    // UserIdIndex can still serve the row from before them. Generating on that row
+    // would run on an empty persona/competitor set and record the step ready.
+    it("generates from the base-table row when the index still lacks the upstream results (ENG-2308)", async () => {
+      userDb.getUserByIdConsistent.mockResolvedValueOnce({
+        userId: "user-1",
+        brandGuidelines: { brandData: { brandName: "Linear" } },
+        icpResult: [onePersona],
+        competitorResult,
+      });
+      // The index row has no upstream results yet. The first index read this
+      // function makes (if it made the start read through the index) would get it.
+      userDb.getUserById.mockResolvedValueOnce({
+        userId: "user-1",
+        creativeDirStatus: "running",
+        creativeDirStartedAt: "2026-04-24T11:59:00.000Z",
+      });
+      userDb.updateUser.mockResolvedValue({});
+
+      const llm = new FakeLlm(fullResponse);
+      await triggerCreativeDirForUser("user-1", { llm: llm as any });
+
+      expect(llm.lastUserPrompt).toContain(onePersona.name);
+      expect(userDb.getUserById).toHaveBeenCalledTimes(1); // the completion read only
+    });
+
+    // ENG-2308 review follow-up, confirmed by direct reproduction (same
+    // reasoning as onboardingIcpService's icpOwnershipCondition tests).
+    it("conditions the completion write on this run's own creativeDirStartedAt when expectedStartedAt is provided", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          icpResult: [onePersona],
+          competitorResult,
+        })
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          creativeDirStatus: "running",
+          creativeDirStartedAt: "2026-04-24T11:59:00.000Z",
+        });
+      userDb.updateUser.mockResolvedValue({});
+
+      const llm = new FakeLlm(fullResponse);
+      await triggerCreativeDirForUser("user-1", {
+        llm: llm as any,
+        expectedStartedAt: "2026-04-24T11:59:00.000Z",
+      });
+
+      const options = userDb.updateUser.mock.calls[0][2];
+      expect(options?.condition?.expression).toBe(
+        "#creativeDirStartedAt = :creativeDirOwnerStartedAt",
+      );
+      expect(options?.condition?.values?.[":creativeDirOwnerStartedAt"]).toBe(
+        "2026-04-24T11:59:00.000Z",
+      );
+    });
+
+    it("drops the completion silently when a reclaim has superseded this run (ConditionalCheckFailedException)", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          icpResult: [onePersona],
+          competitorResult,
+        })
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          creativeDirStatus: "running",
+          creativeDirStartedAt: "2026-04-24T12:05:00.000Z",
+        });
+      const conditionalFailure = Object.assign(
+        new Error("The conditional request failed"),
+        { code: "ConditionalCheckFailedException" },
+      );
+      userDb.updateUser.mockRejectedValueOnce(conditionalFailure);
+      const llm = new FakeLlm(fullResponse);
+
+      await expect(
+        triggerCreativeDirForUser("user-1", {
+          llm: llm as any,
+          expectedStartedAt: "2026-04-24T11:59:00.000Z",
+        }),
+      ).resolves.toBeUndefined();
+
+      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+    });
+
     it("drops the ready patch silently when user is no longer running", async () => {
       userDb.getUserById
         .mockResolvedValueOnce({
@@ -408,6 +497,35 @@ describe("onboardingCreativeDirService", () => {
     });
   });
 
+  // ENG-2308 follow-up, caught live: the orchestrator's runCreativeDir used
+  // to call triggerCreativeDirForUser directly with nothing ever flipping
+  // creativeDirStatus to running first — the trigger silently dropped its
+  // result, which then starved adImage downstream. claimCreativeDirRun is
+  // the extracted, reusable claim both startCreativeDirForUser and
+  // runCreativeDir go through.
+  describe("claimCreativeDirRun", () => {
+    beforeEach(() => {
+      jest.clearAllMocks();
+    });
+
+    it("claims the axis and returns the persisted patch", async () => {
+      userDb.updateUser.mockResolvedValue({});
+      const patch = await claimCreativeDirRun("user-1");
+      expect(patch).not.toBeNull();
+      expect(patch?.creativeDirStatus).toBe("running");
+    });
+
+    it("returns null without throwing when it loses the claim", async () => {
+      const conditionalFailure = Object.assign(
+        new Error("The conditional request failed"),
+        { code: "ConditionalCheckFailedException" },
+      );
+      userDb.updateUser.mockRejectedValueOnce(conditionalFailure);
+      const patch = await claimCreativeDirRun("user-1");
+      expect(patch).toBeNull();
+    });
+  });
+
   describe("startCreativeDirForUser", () => {
     beforeEach(() => {
       jest.clearAllMocks();
@@ -417,12 +535,97 @@ describe("onboardingCreativeDirService", () => {
       userDb.updateUser.mockResolvedValue({});
       userDb.getUserById.mockResolvedValue(null);
 
-      await startCreativeDirForUser("user-1");
+      const result = await startCreativeDirForUser("user-1");
 
       expect(userDb.updateUser).toHaveBeenCalledTimes(1);
       const startPatch = userDb.updateUser.mock.calls[0][1];
       expect(startPatch.creativeDirStatus).toBe("running");
       expect(startPatch.creativeDirStartedAt).toBeTruthy();
+      // The claim also clears the previous attempt's error (REMOVE, via null);
+      // the returned patch is the same run without that storage-only marker.
+      expect(startPatch.creativeDirError).toBeNull();
+      expect(result).toEqual({ ...startPatch, creativeDirError: undefined });
+    });
+
+    // ENG-2308: same unconditional-write race as icp/competitor — two
+    // concurrent callers could each observe a non-running status and both
+    // launch a real LLM call. Guard the claim with a ConditionExpression.
+    it("claims the running transition with a ConditionExpression guarding against a concurrent in-flight run", async () => {
+      userDb.updateUser.mockResolvedValue({});
+      userDb.getUserById.mockResolvedValue(null);
+
+      const before = Date.now();
+      await startCreativeDirForUser("user-1");
+
+      const options = userDb.updateUser.mock.calls[0][2];
+      expect(options?.condition?.expression).toBe(
+        "attribute_not_exists(#creativeDirStatus) OR #creativeDirStatus <> :creativeDirRunning OR #creativeDirStartedAt <= :creativeDirStaleBefore",
+      );
+      expect(options?.condition?.names).toEqual({
+        "#creativeDirStatus": "creativeDirStatus",
+        "#creativeDirStartedAt": "creativeDirStartedAt",
+      });
+      expect(options?.condition?.values?.[":creativeDirRunning"]).toBe("running");
+      // ENG-2308 fix-of-a-fix: stale-claim escape hatch (see icpStartClaimCondition).
+      const staleBefore = Date.parse(
+        options?.condition?.values?.[":creativeDirStaleBefore"],
+      );
+      expect(staleBefore).toBeGreaterThanOrEqual(before - CREATIVE_DIR_TIMEOUT_MS - 1000);
+      expect(staleBefore).toBeLessThanOrEqual(Date.now() - CREATIVE_DIR_TIMEOUT_MS + 1000);
+    });
+
+    it("returns null and launches no background work when it loses the race to a concurrent caller", async () => {
+      userDb.getUserById.mockResolvedValue({ userId: "user-1" });
+      const conditionalFailure = Object.assign(
+        new Error("The conditional request failed"),
+        { code: "ConditionalCheckFailedException" },
+      );
+      userDb.updateUser.mockRejectedValue(conditionalFailure);
+
+      const result = await startCreativeDirForUser("user-1");
+
+      expect(result).toBeNull();
+      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+      // getUserById IS called once (to check eager status before claiming
+      // — ENG-2308 fix-of-a-fix).
+      expect(userDb.getUserById).toHaveBeenCalledTimes(1);
+    });
+
+    // ENG-2308 fix-of-a-fix, caught live: runCreativeDir claims this SAME
+    // axis itself when the orchestrator fires the step, inside the SAME
+    // reconcile pass this function delegates to. Must check eager status
+    // and skip claiming entirely in that case.
+    it("does not claim the axis itself on the eager pipeline — leaves the claim to runCreativeDir", async () => {
+      userDb.getUserById.mockResolvedValue({ userId: "user-1", useEagerPipeline: true });
+      const orchestratorWiring = require("../services/onboardingOrchestratorWiring");
+      const reconcileSpy = jest
+        .spyOn(orchestratorWiring, "reconcileForUser")
+        .mockImplementation(async () => {});
+      try {
+        const result = await startCreativeDirForUser("user-1");
+
+        expect(result).toBeNull();
+        expect(userDb.updateUser).not.toHaveBeenCalled();
+        expect(reconcileSpy).toHaveBeenCalledWith("user-1");
+      } finally {
+        reconcileSpy.mockRestore();
+      }
+    });
+
+    it("re-throws a non-conditional DynamoDB error", async () => {
+      // jest.clearAllMocks() (beforeEach) does not reset the previous test's
+      // mockResolvedValue — without this, a prior eager-pipeline test's
+      // `useEagerPipeline: true` leaks in, and since the eager check now
+      // runs BEFORE the claim write, this test would short-circuit to the
+      // reconcile branch and never reach updateUser at all.
+      userDb.getUserById.mockResolvedValue({ userId: "user-1" });
+      userDb.updateUser.mockRejectedValue(
+        Object.assign(new Error("boom"), {
+          code: "ProvisionedThroughputExceededException",
+        }),
+      );
+
+      await expect(startCreativeDirForUser("user-1")).rejects.toThrow("boom");
     });
   });
 });

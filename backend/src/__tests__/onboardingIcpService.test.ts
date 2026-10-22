@@ -28,6 +28,7 @@ jest.mock("../services/onboardingCompetitorService", () => ({
 }));
 
 import {
+  claimIcpRun,
   extractIcpBrandContext,
   generateIcpsForUser,
   ICP_DISCOVERY_SYSTEM_PROMPT,
@@ -36,6 +37,7 @@ import {
   startIcpDiscoveryForUser,
   triggerIcpDiscoveryForUser,
 } from "../services/onboardingIcpService";
+import { ICP_TIMEOUT_MS } from "../services/icpStatusService";
 const { taskDb, userDb } = require("../services/db");
 
 class FakeLlm {
@@ -395,6 +397,153 @@ describe("onboardingIcpService", () => {
       expect(writtenPatch.icpResult).toHaveLength(5);
     });
 
+    // ENG-2308 review follow-up, confirmed by direct reproduction against
+    // the real icpStartPatch/icpReadyPatch functions: the stale-claim
+    // escape hatch lets a reclaim supersede a merely-slow (not crashed)
+    // run. icpReadyPatch's own guard only checks icpStatus === "running",
+    // not WHICH run's "running" it is — without an ownership check on the
+    // WRITE itself, this run's zombie completion can land after a
+    // reclaim's own completion and silently clobber it.
+    it("conditions the completion write on this run's own icpStartedAt when expectedStartedAt is provided", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({ userId: "user-1" })
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          icpStatus: "running",
+          icpStartedAt: "2026-04-24T11:59:00.000Z",
+        });
+      userDb.updateUser.mockResolvedValue({});
+
+      const llm = new FakeLlm({ icps: fivePersonas });
+      await triggerIcpDiscoveryForUser("user-1", {
+        llm: llm as any,
+        expectedStartedAt: "2026-04-24T11:59:00.000Z",
+      });
+
+      const options = userDb.updateUser.mock.calls[0][2];
+      expect(options?.condition?.expression).toBe(
+        "#icpStartedAt = :icpOwnerStartedAt",
+      );
+      expect(options?.condition?.values?.[":icpOwnerStartedAt"]).toBe(
+        "2026-04-24T11:59:00.000Z",
+      );
+    });
+
+    // ENG-2308 live finding: a /icp/regenerate-one that overlapped this run
+    // keeps our icpStartedAt but sets `ready` (~6s) before we finish (~12-22s).
+    // That used to make icpReadyPatch return null and silently drop the
+    // whole-set result. The write is conditioned on our own claim, so it is safe.
+    it.each(["ready", "failed"])(
+      "still lands the whole-set result when a regenerate-one left status %s but the claim is still ours",
+      async (status) => {
+        const claim = "2026-04-24T11:59:00.000Z";
+        userDb.getUserById
+          .mockResolvedValueOnce({ userId: "user-1" })
+          .mockResolvedValueOnce({
+            userId: "user-1",
+            icpStatus: status,
+            icpStartedAt: claim,
+          });
+        userDb.updateUser.mockResolvedValue({});
+
+        await triggerIcpDiscoveryForUser("user-1", {
+          llm: new FakeLlm({ icps: fivePersonas }) as any,
+          expectedStartedAt: claim,
+        });
+
+        const [, patch, options] = userDb.updateUser.mock.calls[0];
+        expect(patch.icpStatus).toBe("ready");
+        expect(patch.icpResult).toHaveLength(5);
+        expect(options.condition.values[":icpOwnerStartedAt"]).toBe(claim);
+      },
+    );
+
+    it("clears the failed attempt's error when it lands over a failed status", async () => {
+      const claim = "2026-04-24T11:59:00.000Z";
+      userDb.getUserById
+        .mockResolvedValueOnce({ userId: "user-1" })
+        .mockResolvedValueOnce({ userId: "user-1", icpStatus: "failed", icpStartedAt: claim, icpError: "icp generation timed out" });
+      userDb.updateUser.mockResolvedValue({});
+      await triggerIcpDiscoveryForUser("user-1", { llm: new FakeLlm({ icps: fivePersonas }) as any, expectedStartedAt: claim });
+      expect(userDb.updateUser.mock.calls[0][1].icpError).toBeNull();
+    });
+
+    it("does NOT land the result when the non-running record belongs to a different claim", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({ userId: "user-1" })
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          icpStatus: "ready",
+          icpStartedAt: "2026-04-24T12:05:00.000Z",
+        });
+      userDb.updateUser.mockResolvedValue({});
+
+      await triggerIcpDiscoveryForUser("user-1", {
+        llm: new FakeLlm({ icps: fivePersonas }) as any,
+        expectedStartedAt: "2026-04-24T11:59:00.000Z",
+      });
+
+      expect(userDb.updateUser).not.toHaveBeenCalled();
+    });
+
+    it("drops the completion silently when a reclaim has superseded this run (ConditionalCheckFailedException), without mirroring or cascading", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({ userId: "user-1" })
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          icpStatus: "running",
+          // A reclaim's fresh startedAt — different from the stale
+          // expectedStartedAt this (zombie) run was given below.
+          icpStartedAt: "2026-04-24T12:05:00.000Z",
+        });
+      const conditionalFailure = Object.assign(
+        new Error("The conditional request failed"),
+        { code: "ConditionalCheckFailedException" },
+      );
+      userDb.updateUser.mockRejectedValueOnce(conditionalFailure);
+
+      const llm = new FakeLlm({ icps: fivePersonas });
+      await expect(
+        triggerIcpDiscoveryForUser("user-1", {
+          llm: llm as any,
+          expectedStartedAt: "2026-04-24T11:59:00.000Z",
+        }),
+      ).resolves.toBeUndefined();
+
+      // Exactly one write attempt (the one that lost ownership) — no
+      // second write, no mirror-to-marketStrategy call.
+      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+    });
+
+    it("conditions the failure-path write on this run's own icpStartedAt and drops it silently when superseded", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({ userId: "user-1" })
+        // Re-read inside the catch block, after the LLM throws.
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          icpStatus: "running",
+          icpStartedAt: "2026-04-24T12:05:00.000Z",
+        });
+      const conditionalFailure = Object.assign(
+        new Error("The conditional request failed"),
+        { code: "ConditionalCheckFailedException" },
+      );
+      userDb.updateUser.mockRejectedValueOnce(conditionalFailure);
+
+      const llm = new FakeLlm(null, new Error("bedrock exploded"));
+      await expect(
+        triggerIcpDiscoveryForUser("user-1", {
+          llm: llm as any,
+          expectedStartedAt: "2026-04-24T11:59:00.000Z",
+        }),
+      ).resolves.toBeUndefined();
+
+      const options = userDb.updateUser.mock.calls[0][2];
+      expect(options?.condition?.values?.[":icpOwnerStartedAt"]).toBe(
+        "2026-04-24T11:59:00.000Z",
+      );
+    });
+
     it("adds uploaded strategic context to ICP generation when user brand fields are sparse", async () => {
       userDb.getUserById
         .mockResolvedValueOnce({
@@ -633,6 +782,40 @@ describe("onboardingIcpService", () => {
     });
   });
 
+  // ENG-2308 follow-up, caught live: the eager-pipeline orchestrator's
+  // runIcp used to call triggerIcpDiscoveryForUser directly, with nothing
+  // ever flipping icpStatus to running first on a pure orchestrator-driven
+  // cascade — icpReadyPatch requires icpStatus === 'running' to persist a
+  // result, so the trigger ran for real then silently dropped it, and the
+  // orchestrator recorded the step "ready" with a null output anyway.
+  // claimIcpRun is the extracted, reusable claim both startIcpDiscoveryForUser
+  // and the orchestrator's runIcp now go through.
+  describe("claimIcpRun", () => {
+    beforeEach(() => {
+      jest.clearAllMocks();
+    });
+
+    it("claims the axis and returns the persisted patch", async () => {
+      userDb.updateUser.mockResolvedValue({});
+      const patch = await claimIcpRun("user-1");
+      expect(patch).not.toBeNull();
+      expect(patch?.icpStatus).toBe("running");
+      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+      const options = userDb.updateUser.mock.calls[0][2];
+      expect(options?.condition?.expression).toContain("icpStatus");
+    });
+
+    it("returns null without throwing when it loses the claim", async () => {
+      const conditionalFailure = Object.assign(
+        new Error("The conditional request failed"),
+        { code: "ConditionalCheckFailedException" },
+      );
+      userDb.updateUser.mockRejectedValueOnce(conditionalFailure);
+      const patch = await claimIcpRun("user-1");
+      expect(patch).toBeNull();
+    });
+  });
+
   describe("startIcpDiscoveryForUser", () => {
     beforeEach(() => {
       jest.clearAllMocks();
@@ -643,12 +826,111 @@ describe("onboardingIcpService", () => {
       // Make the background trigger find no user so it terminates fast.
       userDb.getUserById.mockResolvedValue(null);
 
-      await startIcpDiscoveryForUser("user-1");
+      const result = await startIcpDiscoveryForUser("user-1");
 
       expect(userDb.updateUser).toHaveBeenCalledTimes(1);
       const startPatch = userDb.updateUser.mock.calls[0][1];
       expect(startPatch.icpStatus).toBe("running");
       expect(startPatch.icpStartedAt).toBeTruthy();
+      // The claim also clears the previous attempt's error (REMOVE, via null);
+      // the returned patch is the same run without that storage-only marker.
+      expect(startPatch.icpError).toBeNull();
+      expect(result).toEqual({ ...startPatch, icpError: undefined });
+    });
+
+    // ENG-2308: OutreachIcpPick's 8s watchdog re-fires /icp/start whenever
+    // generation is still running past that window — which real generation
+    // routinely is. Without an atomic claim, a concurrent call that reads a
+    // stale non-running status launches a second, fully parallel LLM
+    // generation that races the first to decide which personas persist.
+    it("claims the running transition with a ConditionExpression guarding against a concurrent in-flight run", async () => {
+      userDb.updateUser.mockResolvedValue({});
+      userDb.getUserById.mockResolvedValue(null);
+
+      const before = Date.now();
+      await startIcpDiscoveryForUser("user-1");
+
+      const options = userDb.updateUser.mock.calls[0][2];
+      expect(options?.condition?.expression).toBe(
+        "attribute_not_exists(#icpStatus) OR #icpStatus <> :icpRunning OR #icpStartedAt <= :icpStaleBefore",
+      );
+      expect(options?.condition?.names).toEqual({
+        "#icpStatus": "icpStatus",
+        "#icpStartedAt": "icpStartedAt",
+      });
+      expect(options?.condition?.values?.[":icpRunning"]).toBe("running");
+      // ENG-2308 fix-of-a-fix: the stale-claim escape hatch — without it, a
+      // run genuinely stuck in `running` (lost to a deploy/crash) could
+      // never be retried again, since the exclusive claim would block every
+      // future /icp/start forever. The threshold is "now minus the same
+      // ICP_TIMEOUT_MS the FE's `timedOut` flag already uses", computed
+      // fresh on every call (not a fixed constant).
+      const staleBefore = Date.parse(options?.condition?.values?.[":icpStaleBefore"]);
+      expect(staleBefore).toBeGreaterThanOrEqual(before - ICP_TIMEOUT_MS - 1000);
+      expect(staleBefore).toBeLessThanOrEqual(Date.now() - ICP_TIMEOUT_MS + 1000);
+    });
+
+    it("returns null and launches no background work when it loses the race to a concurrent caller", async () => {
+      // Not on the eager pipeline, so this exercises the claim path.
+      userDb.getUserById.mockResolvedValue({ userId: "user-1" });
+      const conditionalFailure = Object.assign(
+        new Error("The conditional request failed"),
+        { code: "ConditionalCheckFailedException" },
+      );
+      userDb.updateUser.mockRejectedValue(conditionalFailure);
+
+      const result = await startIcpDiscoveryForUser("user-1");
+
+      expect(result).toBeNull();
+      // Only the failed claim attempt — no background-trigger writes, and
+      // in particular no second generateJsonRobust call could have been
+      // reached from here. getUserById IS called once (to check eager
+      // status before claiming — ENG-2308 fix-of-a-fix), but that's the
+      // extent of it.
+      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+      expect(userDb.getUserById).toHaveBeenCalledTimes(1);
+    });
+
+    // ENG-2308 fix-of-a-fix, caught live against a real preview + real
+    // eager-pipeline account: runIcp claims this SAME axis itself (with
+    // its own call to claimIcpRun) when the orchestrator actually fires
+    // the step, inside the SAME reconcile pass this function delegates to.
+    // If this function ALSO claimed before checking eager status, its own
+    // claim would always win an instant before handing off, permanently
+    // starving runIcp's claim moments later. Must check eager status and
+    // skip claiming entirely in that case, leaving claimIcpRun as the sole
+    // claimant — exactly like ad-image's existing fix.
+    it("does not claim the axis itself on the eager pipeline — leaves the claim to runIcp", async () => {
+      userDb.getUserById.mockResolvedValue({ userId: "user-1", useEagerPipeline: true });
+      const orchestratorWiring = require("../services/onboardingOrchestratorWiring");
+      const reconcileSpy = jest
+        .spyOn(orchestratorWiring, "reconcileForUser")
+        .mockImplementation(async () => {});
+      try {
+        const result = await startIcpDiscoveryForUser("user-1");
+
+        expect(result).toBeNull();
+        expect(userDb.updateUser).not.toHaveBeenCalled();
+        expect(reconcileSpy).toHaveBeenCalledWith("user-1");
+      } finally {
+        reconcileSpy.mockRestore();
+      }
+    });
+
+    it("re-throws a non-conditional DynamoDB error", async () => {
+      // jest.clearAllMocks() (beforeEach) does not reset the previous test's
+      // mockResolvedValue — without this, a prior eager-pipeline test's
+      // `useEagerPipeline: true` leaks in, and since the eager check now
+      // runs BEFORE the claim write, this test would short-circuit to the
+      // reconcile branch and never reach updateUser at all.
+      userDb.getUserById.mockResolvedValue({ userId: "user-1" });
+      userDb.updateUser.mockRejectedValue(
+        Object.assign(new Error("boom"), {
+          code: "ProvisionedThroughputExceededException",
+        }),
+      );
+
+      await expect(startIcpDiscoveryForUser("user-1")).rejects.toThrow("boom");
     });
   });
 
@@ -678,7 +960,13 @@ describe("onboardingIcpService", () => {
           userId: "user-1",
           icpStatus: "running",
           icpStartedAt: "2026-04-24T11:59:00.000Z",
-        });
+        })
+        // mirrorIcpsToMarketStrategy's own re-read is a 3rd call. Pin it to
+        // null (no user found -> early return, no extra write) instead of
+        // relying on whatever default a previous test in this file left
+        // behind — jest.clearAllMocks() (beforeEach) does not reset a
+        // previous test's persistent mockResolvedValue default.
+        .mockResolvedValue(null);
       userDb.updateUser.mockResolvedValue({});
 
       const llm = new FakeLlm({ icps: fivePersonas });

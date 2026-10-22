@@ -40,10 +40,12 @@ import { getAccountsWithOwnerIncludingOrgShared, updateAccountConfig } from '../
 import {
   PACED_WRITE_ACTIONS,
   dailyInviteAbsoluteMax,
+  dailyVolumeClassFor,
   reserveDailyVolumeSlot,
   reserveWriteSlot,
   type DailyVolumeState,
 } from '../linkedInWritePacer';
+import { unipileIdsForAccount } from '../../utils/scheduledRunAccountGate';
 
 export interface ResolvedLinkedInAccount {
   /** The account's actual owner — may differ from the calling user for an org-shared account. */
@@ -56,6 +58,12 @@ export interface ResolvedLinkedInAccount {
    * an established account that reconnects does not restart its ramp.
    */
   connectedAt: string | null | undefined;
+  /**
+   * The stored row's `account_id`. A caller may name the account by its Unipile id
+   * (legacy rows differ), but `updateAccountConfig` keys on `account_id` only, so the
+   * durable reservation must be written under this id or it throws and refuses the send.
+   */
+  storedAccountId?: string;
 }
 
 /**
@@ -69,13 +77,18 @@ export function resolveLinkedInAccountFromList(
   accounts: any[],
   accountId: string,
 ): ResolvedLinkedInAccount | null {
-  const matched = accounts.find((a: any) => a.platform === 'unipile' && a.account_id === accountId);
+  // A stored row is named by EITHER its account_id or Unipile's config.unipile_account_id (they differ on legacy
+  // rows; the sync cron and the scheduled-run gate already treat both as the same account). Matching only
+  // account_id wrongly refused a user's own account. Both ids belong to a row already scoped to the caller's own
+  // or org-shared accounts, so this widens naming, not access.
+  const matched = accounts.find((a: any) => a.platform === 'unipile' && unipileIdsForAccount(a).includes(accountId));
   if (!matched) return null;
   return {
     ownerUserId: (matched as any).userId,
     configuredDailyInviteCap: (matched as any)?.config?.daily_invite_cap,
     dailyVolumeState: (matched as any)?.config?.daily_volume,
     connectedAt: (matched as any)?.created_at,
+    storedAccountId: (matched as any).account_id,
   };
 }
 
@@ -109,7 +122,8 @@ export type PaceRefusalGate =
   | 'reservation_persistence';
 
 export type PaceLinkedInWriteResult =
-  | { refusal: null }
+  /** `reservedWindowStartedAt`: identity of the daily window the slot was committed to (ENG-2529 refund guard). */
+  | { refusal: null; reservedWindowStartedAt?: number }
   | {
       refusal: {
         success: false;
@@ -161,7 +175,9 @@ export async function paceLinkedInWrite(
     };
   }
 
-  const hourlySlot = await reserveWriteSlot(accountId);
+  // ENG-2529: key the hourly pacer by the canonical stored id so a legacy row named by its
+  // Unipile id shares one hourly slot across drip and CRM callers. The send itself keeps accountId.
+  const hourlySlot = await reserveWriteSlot(account.storedAccountId || accountId);
   if (!hourlySlot.allowed) {
     console.log(`[linkedInDailyVolumeGate] ${action} on ${accountId} refused by write pacer — ${hourlySlot.reason}`);
     return {
@@ -182,13 +198,21 @@ export async function paceLinkedInWrite(
     };
   }
 
+  // ENG-1594: maintenance writes (cancel/accept-invitation) carry no daily
+  // volume class, so there is no reservation to commit. Skipping the durable
+  // write keeps them governed by the hourly/burst pacer only and means a
+  // connected_accounts persistence failure can never refuse them.
+  if (dailyVolumeClassFor(action) === null) return { refusal: null };
+
   // Both checks passed — NOW durably commit the daily reservation against the
   // account OWNER's record. The callback runs again from fresh config on every
   // CAS retry, so concurrent writers cannot lose a reservation. Failing closed
   // here matters: the actual Unipile call happens only after this returns.
   let durableRefusalReason: string | undefined;
+  let reservedWindowStartedAt: number | undefined;
+  const reservedClass = dailyVolumeClassFor(action);
   try {
-    await updateAccountConfig(account.ownerUserId, 'unipile', accountId, (freshConfig) => {
+    await updateAccountConfig(account.ownerUserId, 'unipile', account.storedAccountId || accountId, (freshConfig) => {
       const freshDailySlot = reserveDailyVolumeSlot(
         action,
         freshConfig.daily_invite_cap,
@@ -205,6 +229,7 @@ export async function paceLinkedInWrite(
         durableRefusalReason = freshDailySlot.reason;
         return { updates: {}, skip: true };
       }
+      reservedWindowStartedAt = reservedClass ? freshDailySlot.nextState[reservedClass]?.windowStartedAt : undefined;
       return { updates: { daily_volume: freshDailySlot.nextState } };
     });
   } catch (err) {
@@ -236,7 +261,44 @@ export async function paceLinkedInWrite(
     };
   }
 
-  return { refusal: null };
+  return { refusal: null, reservedWindowStartedAt };
+}
+
+/**
+ * ENG-2529: give back a daily slot reserved by `paceLinkedInWrite` when the write it
+ * guarded then failed (the Unipile call threw), so failing sends do not exhaust the
+ * account's daily budget. Decrements only the current window; best-effort — a refund
+ * failure is logged, never thrown, because the caller is already handling a send error.
+ */
+export async function releaseLinkedInDailySlot(
+  action: string,
+  account: ResolvedLinkedInAccount,
+  accountId: string,
+  reservedWindowStartedAt?: number,
+): Promise<void> {
+  const cls = dailyVolumeClassFor(action);
+  if (cls === null || !PACED_WRITE_ACTIONS.has(action)) return;
+  try {
+    await updateAccountConfig(account.ownerUserId, 'unipile', account.storedAccountId || accountId, (freshConfig) => {
+      const state: DailyVolumeState = freshConfig.daily_volume || {};
+      const win = state[cls];
+      if (!win || win.count <= 0) return { updates: {}, skip: true };
+      // Refund only the window that received the reservation: if a new window started since,
+      // decrementing it would let later sends exceed that day's cap.
+      if (reservedWindowStartedAt === undefined || win.windowStartedAt !== reservedWindowStartedAt) return { updates: {}, skip: true };
+      return { updates: { daily_volume: { ...state, [cls]: { ...win, count: win.count - 1 } } } };
+    });
+  } catch (err) {
+    console.error(`[linkedInDailyVolumeGate] failed to release daily slot for ${accountId}:`, err);
+  }
+}
+
+/** Thrown when a non-owner (e.g. an org-shared member) tries to change the cap. */
+export class DailyInviteCapNotOwnerError extends Error {
+  constructor(accountId: string) {
+    super(`Only the owner of LinkedIn account ${accountId} can change its daily invite cap. Ask the account owner to change it in Settings.`);
+    this.name = 'DailyInviteCapNotOwnerError';
+  }
 }
 
 /**
@@ -248,7 +310,13 @@ export async function setDailyInviteCap(
   account: ResolvedLinkedInAccount,
   accountId: string,
   cap: unknown,
+  callerUserId: string,
 ): Promise<number> {
+  // ENG-1594: org-shared USE of an account does not grant authority over its
+  // safety config. Only the account owner may change its daily invite cap.
+  if (!callerUserId || callerUserId !== account.ownerUserId) {
+    throw new DailyInviteCapNotOwnerError(accountId);
+  }
   const parsedCap = typeof cap === 'number' ? cap : Number(cap);
   if (!Number.isFinite(parsedCap) || !Number.isInteger(parsedCap) || parsedCap < 0) {
     throw new Error('daily_invite_cap must be a non-negative integer for set-daily-invite-cap');

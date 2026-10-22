@@ -31,7 +31,7 @@ import {
   type CapiKeyCoverageRow,
 } from './metaCapiKeyCoverage';
 
-const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+import { TABLE_PREFIX } from '../config/constants';
 export const CAPI_KEY_COVERAGE_TABLE = `${TABLE_PREFIX}AW-MetaCapiKeyCoverage`;
 
 const dynamodb = new AWS.DynamoDB.DocumentClient();

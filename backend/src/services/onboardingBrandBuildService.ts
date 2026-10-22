@@ -31,9 +31,17 @@ import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 import { userDb } from "./db";
 import {
   buildFailedPatch,
+  buildStartPatch,
   logCompletionMetric,
 } from "./brandBuildStatusService";
 import { logStepMetric } from "./onboardingMetricsService";
+import { withClearedError } from "../utils/clearErrorOnClaim";
+import {
+  BRAND_BUILD_PROMPT_SENTINEL,
+  brandBuildOwnershipCondition,
+  brandBuildSessionPageIdentifier,
+  isClaimSuperseded,
+} from "./brandBuildSessionMarker";
 
 const BRAND_BUILD_MODEL = "anthropic.claude-sonnet-4-6";
 
@@ -77,7 +85,10 @@ export interface BrandBuildDeps {
    * Override for Emma's chat-session creator. Defaults to the real
    * `chatbotService.createChatSession`. Tests inject a fake.
    */
-  createChatSession?: (userId: string) => Promise<{ sessionId: string }>;
+  createChatSession?: (
+    userId: string,
+    opts?: { pageIdentifier?: string },
+  ) => Promise<{ sessionId: string }>;
   /**
    * Override for Emma's response generator. Defaults to the real
    * `agentModeController.generateSessionResponse`. Tests inject a fake
@@ -101,6 +112,19 @@ export interface BrandBuildDeps {
     userId: string,
     companyUrl: string,
   ) => Promise<{ persisted: boolean; logoUrl: string | null; reason: string }>;
+  /**
+   * The `brandBuildStartedAt` THIS run's own `claimBrandBuildRun` minted
+   * (ENG-2308 review follow-up). Conditions `persistFailure`'s writes on
+   * it so a reclaimed, merely-slow run's zombie failure can't stomp a
+   * reclaiming run's own in-progress or already-completed state — same
+   * ownership-token pattern applied to icp/competitor/creativeDir/adCopy.
+   * Optional for backward compatibility with direct callers/tests that
+   * bypass the claim; only callers that hold a fresh claim should pass it.
+   * The Emma session is created with a `pageIdentifier` naming this claim, so
+   * the `update_brand_guidelines` hook can tell a superseded session from the
+   * current one (see `brandBuildSessionPageIdentifier`).
+   */
+  expectedStartedAt?: string;
 }
 
 function buildBrandPrompt(input: {
@@ -117,7 +141,7 @@ function buildBrandPrompt(input: {
   // marketStrategy.icp / .competitors before exiting, leaving the user
   // staring at a half-empty review screen.
   return [
-    `You are Emma, running an autonomous brand-build for an onboarding flow. Do NOT ask the user any questions — they will verify your output on a dedicated review screen after you finish.`,
+    `You are Emma, ${BRAND_BUILD_PROMPT_SENTINEL}. Do NOT ask the user any questions — they will verify your output on a dedicated review screen after you finish.`,
     "",
     `Company name: ${companyName}`,
     `Company website: ${companyUrl}`,
@@ -263,7 +287,10 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
  * never trigger this path.
  */
 function defaultDeps(): {
-  createChatSession: (userId: string) => Promise<{ sessionId: string }>;
+  createChatSession: (
+    userId: string,
+    opts?: { pageIdentifier?: string },
+  ) => Promise<{ sessionId: string }>;
   generateSessionResponse: (
     sessionId: string,
     userMessage: string,
@@ -278,12 +305,12 @@ function defaultDeps(): {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { cronJobRegistry } = require("../utils/cronJobRegistry");
   return {
-    createChatSession: async (userId: string) => {
+    createChatSession: async (userId: string, opts?: { pageIdentifier?: string }) => {
       const session = await chatbotDb.createChatSession(
         userId,
         undefined,
         "agent",
-        "agent-mode",
+        opts?.pageIdentifier ?? "agent-mode",
         undefined,
         undefined,
         undefined,
@@ -300,6 +327,67 @@ function defaultDeps(): {
     generateSessionResponse: (sessionId, userMessage, userId, llmModel) =>
       cronJobRegistry.track('onboardingBrandBuildAgentTurn', generateSessionResponse(sessionId, userMessage, userId, llmModel)),
   };
+}
+
+/**
+ * Guards the non-building -> `building` transition with a DynamoDB
+ * ConditionExpression (ENG-2308 follow-up), same shape as the per-step
+ * axes' `claim<Axis>Run` functions. Also allows a fresh claim once the
+ * in-flight run has exceeded `BRAND_BUILD_TIMEOUT_MS`, matching the
+ * snapshot's own `timedOut` flag.
+ */
+function brandBuildStartClaimCondition(now: Date = new Date()) {
+  const staleBefore = new Date(now.getTime() - BRAND_BUILD_TIMEOUT_MS).toISOString();
+  return {
+    expression:
+      "attribute_not_exists(#brandBuildStatus) OR #brandBuildStatus <> :building OR #brandBuildStartedAt <= :staleBefore",
+    names: {
+      "#brandBuildStatus": "brandBuildStatus",
+      "#brandBuildStartedAt": "brandBuildStartedAt",
+    },
+    values: { ":building": "building", ":staleBefore": staleBefore },
+  };
+}
+
+/**
+ * Claim the brand-dna axis for a new run: atomically flip `brandBuildStatus`
+ * to `building` (or no-op, returning `null`, if someone else already holds
+ * the claim). Every entry point that wants to run a brand build must go
+ * through here — both `/brand-build/start` and the eager-pipeline
+ * orchestrator's `runBrandDna` (`onboardingOrchestratorWiring.ts`).
+ *
+ * `runBrandDna` needed this (ENG-2308 follow-up, caught live): it used to
+ * call `triggerBrandBuildForUser` directly, with nothing ever flipping
+ * `brandBuildStatus` to `building` first on a pure orchestrator-driven
+ * cascade (the normal case for brandDna — it has no deps, so it's the
+ * very first thing an eager-pipeline user's reconcile pass ever fires,
+ * with no reason `/brand-build/start` would have been hit separately).
+ * The `update_brand_guidelines` tool-call hook
+ * (`emma/impl/brandMarketStrategy.ts`) only flips `brandBuildStatus` to
+ * `ready` "if we were building" — without a prior claim, Emma's session
+ * ran for real, called the tool for real, and the flip to `ready` was
+ * silently skipped, so `triggerBrandBuildForUser`'s own final check saw
+ * `brandBuildStatus` still unset and reported "Emma finished but did not
+ * call update_brand_guidelines" — a false negative, not a real Emma
+ * failure. Confirmed live: this is the exact failure observed before this
+ * fix, on every attempt that didn't happen to also call
+ * `/brand-build/start` manually first.
+ */
+export async function claimBrandBuildRun(
+  userId: string,
+): Promise<ReturnType<typeof buildStartPatch> | null> {
+  const patch = buildStartPatch();
+  try {
+    await userDb.updateUser(userId, withClearedError(patch, "brandBuildError") as any, {
+      condition: brandBuildStartClaimCondition(),
+    });
+  } catch (err: any) {
+    if (err?.code === "ConditionalCheckFailedException") {
+      return null;
+    }
+    throw err;
+  }
+  return patch;
 }
 
 /**
@@ -338,6 +426,7 @@ export async function triggerBrandBuildForUser(
       user,
       "no companyUrl on User record — cannot brand-build",
       now(),
+      deps.expectedStartedAt,
     );
     return;
   }
@@ -352,6 +441,11 @@ export async function triggerBrandBuildForUser(
     try {
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const { provisionOnboardingSlackConnect } = require("./slackConnectService");
+      // One platform per customer (ENG-273): an account that is on WhatsApp is not
+      // also given a Slack Connect channel.
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { hasWhatsApp } = require("./customerChannelPolicy");
+      if (hasWhatsApp(user)) return;
       await provisionOnboardingSlackConnect({
         userId,
         companyName,
@@ -375,7 +469,16 @@ export async function triggerBrandBuildForUser(
 
   let sessionId: string;
   try {
-    const session = await createChatSession(userId);
+    // The session names the claim it serves so the update_brand_guidelines
+    // hook can tell it from a later run's session (see
+    // brandBuildSessionPageIdentifier). Without a claim (direct callers) it
+    // keeps the default identifier.
+    const session = await createChatSession(
+      userId,
+      deps.expectedStartedAt
+        ? { pageIdentifier: brandBuildSessionPageIdentifier(deps.expectedStartedAt) }
+        : undefined,
+    );
     sessionId = session.sessionId;
   } catch (e: any) {
     await persistFailure(
@@ -383,6 +486,7 @@ export async function triggerBrandBuildForUser(
       user,
       `failed to create Emma session: ${e?.message ?? String(e)}`,
       now(),
+      deps.expectedStartedAt,
     );
     return;
   }
@@ -402,6 +506,7 @@ export async function triggerBrandBuildForUser(
       (await userDb.getUserById(userId)) || user,
       `Emma session failed: ${e?.message ?? String(e)}`,
       now(),
+      deps.expectedStartedAt,
     );
     return;
   }
@@ -410,6 +515,23 @@ export async function triggerBrandBuildForUser(
   // ready-patch hook in agentModeService) and marketStrategy. Re-read the
   // user record and mirror marketStrategy → icpResult/competitorResult so
   // downstream UI + services hydrate.
+  //
+  // A run that was reclaimed while its session was still going (the client-side
+  // timeout calls /brand-build/fail then /start, which reclaims immediately)
+  // must not carry on and write for a build it no longer owns: its session was
+  // already refused by the update_brand_guidelines hook, and the writes below
+  // would otherwise mirror stale results over the newer run's.
+  if (deps.expectedStartedAt) {
+    const latest = (await userDb.getUserById(userId)) as any;
+    if (isClaimSuperseded(deps.expectedStartedAt, latest?.brandBuildStartedAt)) {
+      console.warn("[onboardingBrandBuildService] run superseded while its session ran; skipping post-session writes", {
+        userId,
+        ours: deps.expectedStartedAt,
+        current: latest?.brandBuildStartedAt,
+      });
+      return;
+    }
+  }
   await populateEmptyBrandGuidelines(userId);
   const updated = (await userDb.getUserById(userId)) as any;
   if (!updated) return;
@@ -430,7 +552,22 @@ export async function triggerBrandBuildForUser(
     mirrorPatch.competitorCompletedAt = now().toISOString();
   }
   if (Object.keys(mirrorPatch).length > 0) {
-    await userDb.updateUser(userId, mirrorPatch as any);
+    if (deps.expectedStartedAt) {
+      try {
+        await userDb.updateUser(userId, mirrorPatch as any, {
+          condition: brandBuildOwnershipCondition(deps.expectedStartedAt),
+        });
+      } catch (err: any) {
+        if (err?.code === "ConditionalCheckFailedException") {
+          // Reclaimed since the check above: the newer run owns these fields.
+          console.warn("[onboardingBrandBuildService] dropping stale mirror write: a newer claim owns the build", { userId });
+          return;
+        }
+        throw err;
+      }
+    } else {
+      await userDb.updateUser(userId, mirrorPatch as any);
+    }
   }
 
   // brandBuildStatus is flipped to ready by the agentModeService hook when
@@ -445,6 +582,7 @@ export async function triggerBrandBuildForUser(
       finalUser || updated,
       `Emma finished but did not call update_brand_guidelines (final brandBuildStatus=${finalStatus ?? "unset"})`,
       now(),
+      deps.expectedStartedAt,
     );
     return;
   }
@@ -514,9 +652,30 @@ async function persistFailure(
   current: any,
   message: string,
   now: Date,
+  expectedStartedAt?: string,
 ): Promise<void> {
   const patch = buildFailedPatch(current || {}, message, now);
-  await userDb.updateUser(userId, patch as any);
+  if (expectedStartedAt) {
+    try {
+      await userDb.updateUser(userId, patch as any, {
+        condition: brandBuildOwnershipCondition(expectedStartedAt),
+      });
+    } catch (err: any) {
+      if (err?.code === "ConditionalCheckFailedException") {
+        // A reclaim superseded THIS run while it was failing. Reporting
+        // our failure here would stomp whatever the reclaiming run has
+        // since done — drop it, the reclaiming run owns the axis's fate.
+        console.warn(
+          "[onboardingBrandBuildService] dropping stale failure — a newer claim owns the axis",
+          { userId },
+        );
+        return;
+      }
+      throw err;
+    }
+  } else {
+    await userDb.updateUser(userId, patch as any);
+  }
   // ENG-848: ONE durable row per outcome.
   //
   // This used to call logCompletionMetric AND write its own OnboardingMetrics

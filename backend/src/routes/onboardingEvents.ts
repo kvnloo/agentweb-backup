@@ -21,6 +21,7 @@ import {
   ALL_ONBOARDING_STAGES,
   deriveOnboardingStage,
   isOnboardingStage,
+  LIFECYCLE_NEUTRAL_ONBOARDING_EVENTS as LATERAL_ONBOARDING_EVENTS,
   OnboardingEvent,
 } from "../utils/onboardingStage";
 import { onOnboardingStageChanged } from "../services/contactCaptureHooks";
@@ -33,13 +34,20 @@ const MAX_EVENTS_PER_USER = 50;
 // Cap per-event payload to prevent abuse / runaway DynamoDB item size.
 const MAX_DATA_BYTES = 2048;
 
-// These beta funnel signals are analytics-only. They are persisted in the
-// event log, but must never create a lifecycle transition or timeline entry.
-const LATERAL_ONBOARDING_EVENTS = new Set([
-  "voice_onboarding_presented",
-  "voice_onboarding_started",
-  "voice_onboarding_text_fallback",
-]);
+// Analytics-only signals (voice beta funnel, review screens) are persisted in the
+// event log but never create a lifecycle transition or timeline entry; the set
+// lives in onboardingStage.ts next to the allow-list.
+
+export function capEventLog(events: OnboardingEvent[], max: number): OnboardingEvent[] {
+  let excess = events.length - max;
+  if (excess <= 0) return events;
+  const dropped = new Set<number>();
+  for (let i = 0; i < events.length - 1 && dropped.size < excess; i++) {
+    if (LATERAL_ONBOARDING_EVENTS.has(events[i]?.event)) dropped.add(i);
+  }
+  for (let i = 0; i < events.length - 1 && dropped.size < excess; i++) dropped.add(i);
+  return events.filter((_, i) => !dropped.has(i));
+}
 
 /**
  * POST /api/onboarding/events
@@ -105,8 +113,11 @@ router.post("/events", authenticateToken, async (req, res) => {
       ...(normalisedData !== undefined && { data: normalisedData }),
     };
 
-    // Append + cap to the last MAX_EVENTS_PER_USER events (FIFO drop).
-    const appended = [...existing, newEvent].slice(-MAX_EVENTS_PER_USER);
+    // Append + cap to MAX_EVENTS_PER_USER events. Click-level analytics events
+    // go first when trimming: dropping the oldest event outright could evict
+    // `goal_selected`/`brand_submitted` and make the next lifecycle event derive
+    // an earlier stage than the user has actually reached.
+    const appended = capEventLog([...existing, newEvent], MAX_EVENTS_PER_USER);
 
     const derivedStage = deriveOnboardingStage(appended, {
       lastActiveAt: (user as any).lastActiveAt,

@@ -5,9 +5,10 @@ import {
   type LlmUsageModeDecision,
   type LlmUsagePolicy,
 } from "./llmUsagePolicyService";
-import { userDb } from './db';
-import { applyLlmUsageCredits, getLlmUsageCreditAdjustment } from './llmUsageCreditService';
-import { resolveEnforcementCostBasisMicroUsd } from './spendEnforcementBasis';
+import { userDb, type User } from './db';
+import { withOwnerOpenInvoice } from './paygSettlement';
+import { resolveLlmUsagePoolDecision } from './llmUsagePoolDecision';
+import type { PaygBlock, PaygOverageStatus } from './paygOverage';
 
 export async function getEffectiveLlmUsagePolicy(userId: string): Promise<{
   billingUserId: string;
@@ -23,6 +24,9 @@ export async function getEffectiveLlmUsagePolicy(userId: string): Promise<{
    * and decline rather than compute against today's adjusted figures.
    */
   creditsApplied: boolean;
+  /** ENG-668: overage past the pool, for a PAYG-live account only. Internal: carries micro-USD. */
+  overage?: PaygOverageStatus;
+  paygBlock?: PaygBlock;
 }> {
   // A number of legacy controller unit tests replace the token/subscription
   // modules with deliberately partial Jest mocks. Keep those unrelated tests
@@ -54,39 +58,34 @@ export async function getEffectiveLlmUsagePolicy(userId: string): Promise<{
     userDb.getUserById(billingUserId),
   ]);
   const config = await getSubscriptionTypeConfig(subscriptionType);
-  const basePolicy = config?.llmUsagePolicy || null;
-  // Lazy: read only if the basis falls back to legacy (rollback path), never on the live ledger path.
-  const legacyRawCostUsedMicroUsd = async (): Promise<number> =>
-    Math.max(0, Math.round(((await getUserTokenUsage(billingUserId)).totalCost || 0) * 1_000_000));
-  // ENG-1250 §9.6 enforcement cutover (dark by default): swap the raw spend basis
-  // onto the vendor-inclusive spend ledger and leave the rest of this pipeline —
-  // credit application, threshold, predicate — untouched. See spendEnforcementBasis.ts.
-  const { rawCostUsedMicroUsd } = await resolveEnforcementCostBasisMicroUsd({
+  // ENG-668: the same pool decision checkTokenUsage reaches — spend basis, credits, the hard-threshold
+  // predicate and PAYG all live there once, so this gate cannot admit what that one refuses.
+  const pool = await resolveLlmUsagePoolDecision({
     billingUserId,
-    billingMonth: month,
-    legacyRawCostUsedMicroUsd,
-    tier: subscriptionType,
+    billingUser,
+    month,
+    subscriptionType,
+    basePolicy: config?.llmUsagePolicy || null,
+    paygTier: async () => config?.paygOverage,
+    // Lazy: read only if the basis falls back to legacy (rollback path), never on the live ledger path.
+    legacyRawCostUsedMicroUsd: async (): Promise<number> =>
+      Math.max(0, Math.round(((await getUserTokenUsage(billingUserId)).totalCost || 0) * 1_000_000)),
   });
-  const adjustment = getLlmUsageCreditAdjustment(billingUser?.llmUsageCredits, month);
-  const adjusted = basePolicy
-    ? applyLlmUsageCredits({
-        rawCostUsedMicroUsd,
-        hardThresholdMicroUsd: basePolicy.hardCostThresholdMicroUsd,
-        adjustment,
-      })
-    : { policyCostUsedMicroUsd: rawCostUsedMicroUsd, effectiveHardThresholdMicroUsd: 0 };
-  const policy = basePolicy
-    ? { ...basePolicy, hardCostThresholdMicroUsd: adjusted.effectiveHardThresholdMicroUsd }
-    : null;
-  const costUsedMicroUsd = adjusted.policyCostUsedMicroUsd;
+  const { adjustment } = pool;
   return {
     billingUserId,
-    policy,
-    costUsedMicroUsd,
-    mode: evaluateLlmUsageMode({ costUsedMicroUsd, policy }),
+    policy: pool.policy,
+    costUsedMicroUsd: pool.costUsedMicroUsd,
+    mode: pool.mode,
     creditsApplied:
       adjustment.purchasedMicroUsd > 0 ||
       adjustment.adminGrantedMicroUsd > 0 ||
       adjustment.migrationOffsetMicroUsd > 0,
+    // Present only for an account with PAYG live and past its pool (absent keeps every other result as it was).
+    ...(pool.overage ? { overage: pool.overage } : {}),
+    // ENG-668: the owner of a suspended account is pointed at the unpaid invoice.
+    ...(pool.paygBlock
+      ? { paygBlock: withOwnerOpenInvoice(pool.paygBlock, userId === billingUserId, (billingUser as User | undefined)?.paygSettlements)! }
+      : {}),
   };
 }

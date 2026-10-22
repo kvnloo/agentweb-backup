@@ -138,7 +138,24 @@ export interface GoldenCase {
   pair?: CreativePairRef;
   /** An AI-drafted suggestion for this case, pending human review. Absent until generated. */
   draft?: GoldenCaseDraft;
+  /** Set when an admin took the case out of the set; absent otherwise. */
+  excluded?: GoldenCaseExclusion;
 }
+
+/**
+ * Why a case was taken out of the set (ENG-2608), e.g. `empty_session` for a session nobody used.
+ * The row stays, so the exclusion can be undone and the seeder never adds the case again; reads
+ * leave it out unless they ask for excluded cases.
+ */
+export interface GoldenCaseExclusion {
+  reason: string;
+  /** The admin who excluded it. */
+  by: string;
+  /** ISO time it was excluded. */
+  at: string;
+}
+
+export const MAX_EXCLUSION_REASON_CHARS = 200;
 
 /** Share of cases in the test split. 0.6 so a 50-case surface can reach the registry's
  * MIN_VALIDATION_N (30) test cases; the rest are dev cases for tuning graders. */
@@ -336,6 +353,16 @@ export function parseGoldenCase(value: unknown): GoldenCase {
     replay = { fixtureId: nonEmptyString(value.replay.fixtureId, 'replay.fixtureId'), messageIndex: messageIndex as number };
   }
 
+  let excluded: GoldenCaseExclusion | undefined;
+  if (value.excluded !== undefined) {
+    if (!isRecord(value.excluded)) throw new GoldenCaseValidationError('excluded must be an object');
+    excluded = {
+      reason: nonEmptyString(value.excluded.reason, 'excluded.reason'),
+      by: nonEmptyString(value.excluded.by, 'excluded.by'),
+      at: nonEmptyString(value.excluded.at, 'excluded.at'),
+    };
+  }
+
   const notes = optionalString(value.notes, 'notes');
   const labeller = optionalString(value.labeller, 'labeller');
   const labelledAt = optionalString(value.labelledAt, 'labelledAt');
@@ -358,10 +385,30 @@ export function parseGoldenCase(value: unknown): GoldenCase {
     ...(replay ? { replay } : {}),
     ...(pair ? { pair } : {}),
     ...(draft ? { draft } : {}),
+    ...(excluded ? { excluded } : {}),
   };
 }
 
+/** The reason in an exclusion request body: a non-empty string of at most MAX_EXCLUSION_REASON_CHARS. */
+export function parseExclusionReason(body: unknown): string {
+  const reason = isRecord(body) && typeof body.reason === 'string' ? body.reason.trim() : '';
+  if (!reason) throw new GoldenCaseValidationError('reason must be a non-empty string');
+  if (reason.length > MAX_EXCLUSION_REASON_CHARS) throw new GoldenCaseValidationError(`reason must be at most ${MAX_EXCLUSION_REASON_CHARS} characters`);
+  return reason;
+}
+
 export const MAX_NOTE_CHARS = 2000;
+
+/**
+ * A label an AI wrote, with the owner's permission, starts its note with this (ENG-2135, 2026-10-14). The store
+ * records the saving admin as the labeller, so the note is the only marker. Agreement measured on such a label is
+ * not human agreement, so validation and the creative calibration report leave these cases out unless asked.
+ */
+export const AI_LABEL_NOTE_PREFIX = '[AI-LABEL]';
+
+export function isAiLabelled(c: Pick<GoldenCase, 'notes'>): boolean {
+  return typeof c.notes === 'string' && c.notes.startsWith(AI_LABEL_NOTE_PREFIX);
+}
 
 export interface LabelUpdate {
   labels: Partial<Record<GoldenCriterion, LabelValue>>;

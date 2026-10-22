@@ -9,7 +9,8 @@
  *   3. INVARIANTS  - taxonomy/alignment properties and "never throws".
  */
 import { buildUtmSpec, UTM_MEDIUM_PAID } from '../adUtm';
-import {
+import { matchRoutingRules } from '../trackingConfig';
+import { splitPaidChannel,
   CHANNELS,
   CHANNEL_GROUPS,
   ORGANIC_MEDIUMS,
@@ -47,7 +48,8 @@ describe('classifyTraffic: V1 parity (must not change)', () => {
     ['utm_source t.co', { landingUrl: lp('utm_source=t.co') }, { channel: 'X' }],
     ['unknown utm_source stays raw, group Referral', { landingUrl: lp('utm_source=creator_john') }, { channel: 'creator_john', channelGroup: 'Referral' }],
     ['unknown utm_source + known referrer -> referrer decides', { landingUrl: lp('utm_source=creator_john'), referrer: 'https://l.instagram.com/' }, { channel: 'Instagram' }],
-    ['utm_source beats referrer', { landingUrl: lp('utm_source=tiktok'), referrer: 'https://l.instagram.com/' }, { channel: 'TikTok' }],
+    // 2.2.0: observed referrer beats the link's tag; the tag is kept as linkChannel.
+    ['observed referrer beats utm_source (2.2.0)', { landingUrl: lp('utm_source=tiktok'), referrer: 'https://l.instagram.com/' }, { channel: 'Instagram', linkChannel: 'TikTok', detectedChannel: 'Instagram', matchedBy: 'referrer' }],
     ['utm_source is capped at 40 chars in the fallback channel', { landingUrl: lp(`utm_source=${'a'.repeat(80)}`) }, { channel: 'a'.repeat(40) }],
     ['referrer l.instagram.com', { landingUrl: lp(), referrer: 'https://l.instagram.com/' }, { channel: 'Instagram', referrerHost: 'l.instagram.com', sourceLink: '' }],
     ['referrer lm.facebook.com', { landingUrl: lp(), referrer: 'https://lm.facebook.com/' }, { channel: 'Facebook' }],
@@ -75,7 +77,8 @@ describe('classifyTraffic: V1 parity (must not change)', () => {
     ['in-app UA LinkedIn', { landingUrl: lp(), userAgent: UA.linkedin }, { channel: 'LinkedIn' }],
     ['plain desktop UA is direct', { landingUrl: lp(), userAgent: UA.desktop }, { channel: 'Direct', channelGroup: 'Direct' }],
     ['link-preview crawler UA is not Facebook in-app', { landingUrl: lp(), userAgent: UA.crawler }, { channel: 'Direct' }],
-    ['referrer beats UA', { landingUrl: lp(), referrer: 'https://www.reddit.com/', userAgent: UA.tiktok }, { channel: 'Reddit' }],
+    // 2.2.0: the in-app browser is where the visitor physically is; it beats the referrer.
+    ['in-app UA beats referrer (2.2.0)', { landingUrl: lp(), referrer: 'https://www.reddit.com/', userAgent: UA.tiktok }, { channel: 'TikTok', matchedBy: 'user_agent' }],
     ['unknown referrer + in-app UA -> UA decides', { landingUrl: lp(), referrer: 'https://example.org/', userAgent: UA.instagram }, { channel: 'Instagram', referrerHost: 'example.org' }],
     ['direct', { landingUrl: lp() }, { trafficType: 'organic', channel: 'Direct', channelGroup: 'Direct', referrerHost: '', sourceLink: '', sourceDetail: '' }],
     ['source_detail lists all keys in V1 order', { landingUrl: lp('post=p&utm_term=t&utm_content=tt-1&utm_campaign=c&utm_medium=bio&utm_source=tiktok&ref=r&src=s') }, { sourceDetail: 'utm_source=tiktok | utm_medium=bio | utm_campaign=c | utm_content=tt-1 | utm_term=t | ref=r | src=s | post=p' }],
@@ -171,7 +174,12 @@ describe('classifyTraffic: intentional differences from V1', () => {
 
     // click ids
     ['fbclid with no other signal names Meta (V1: Direct/Paid)', { landingUrl: lp('fbclid=IwAR1') }, { trafficType: 'paid', channel: 'Meta', channelGroup: 'Paid', matchedBy: 'click_id' }],
-    ['gclid with no other signal names Google Search', { landingUrl: lp('gclid=abc') }, { trafficType: 'paid', channel: 'Google Search', channelGroup: 'Paid' }],
+    ['gclid with no other signal names Google Ads', { landingUrl: lp('gclid=abc') }, { trafficType: 'paid', channel: 'Google Ads', channelKey: 'google_ads', channelGroup: 'Paid' }],
+    ['google referrer + gclid is Google Ads', { landingUrl: lp('gclid=abc'), referrer: 'https://www.google.com/' }, { channel: 'Google Ads', channelKey: 'google_ads' }],
+    ['utm_source=adwords&utm_medium=cpc is Google Ads', { landingUrl: lp('utm_source=adwords&utm_medium=cpc') }, { channel: 'Google Ads', channelGroup: 'Paid' }],
+    ['organic google referrer stays Google Search', { landingUrl: lp(), referrer: 'https://www.google.com/' }, { trafficType: 'organic', channel: 'Google Search', channelKey: 'google_search', channelGroup: 'Organic Search' }],
+    ['paid youtube is YouTube Ads', { landingUrl: lp('utm_source=youtube&utm_medium=cpv') }, { channel: 'YouTube Ads', channelKey: 'youtube_ads', channelGroup: 'Paid' }],
+    ['organic youtube stays YouTube', { landingUrl: lp('utm_source=youtube&utm_medium=description') }, { channel: 'YouTube', channelKey: 'youtube', trafficType: 'organic' }],
     ['ttclid names TikTok', { landingUrl: lp('ttclid=E.C.P') }, { channel: 'TikTok', channelGroup: 'Paid' }],
     ['ad_id alone cannot name a platform: still Direct/Paid', { landingUrl: lp('ad_id=123') }, { trafficType: 'paid', channel: 'Direct', channelGroup: 'Paid' }],
     ['click id never overrides an explicit utm_source', { landingUrl: lp('utm_source=creator_john&gclid=abc') }, { channel: 'creator_john', channelGroup: 'Paid' }],
@@ -266,13 +274,77 @@ describe('classifyTraffic: invariants', () => {
     }
   });
 
+  it('splitPaidChannel is idempotent and leaves organic/other channels alone (backfill-safe)', () => {
+    expect(splitPaidChannel('Google Search', 'google_search', true)).toEqual({ channel: 'Google Ads', channelKey: 'google_ads' });
+    expect(splitPaidChannel('Google Ads', 'google_ads', true)).toEqual({ channel: 'Google Ads', channelKey: 'google_ads' });
+    expect(splitPaidChannel('Google Search', 'google_search', false)).toEqual({ channel: 'Google Search', channelKey: 'google_search' });
+    expect(splitPaidChannel('Meta', 'meta', true)).toEqual({ channel: 'Meta', channelKey: 'meta' });
+  });
+
   it('aligns with adUtm.ts: ad links Emma builds classify as paid on their platform', () => {
-    for (const [platform, channel] of [['meta', 'Meta'], ['google', 'Google Search'], ['linkedin', 'LinkedIn']] as const) {
+    for (const [platform, channel] of [['meta', 'Meta'], ['google', 'Google Ads'], ['linkedin', 'LinkedIn']] as const) {
       const spec = buildUtmSpec(platform, { campaign: 'c1' });
       expect(spec.medium).toBe(UTM_MEDIUM_PAID);
       expect(run({ utm: { source: spec.source, medium: spec.medium, campaign: spec.campaign } })).toMatchObject({
         trafficType: 'paid', channel, channelGroup: 'Paid',
       });
     }
+  });
+});
+
+describe('paid channel split: routing compatibility', () => {
+  it('a pre-2.1.0 google_search rule still routes paid Google Ads sessions; google_ads rule routes only paid', () => {
+    const paid = classifyTraffic({ landingUrl: 'https://lp.example.com/?gclid=x' });
+    const organic = classifyTraffic({ landingUrl: 'https://lp.example.com/', referrer: 'https://www.google.com/' });
+    const rules = [
+      { id: 'a', match: { channel: 'google_search' }, childListId: 'any-google' },
+      { id: 'b', match: { channel: 'google_ads' }, childListId: 'ads-only' },
+    ];
+    expect(matchRoutingRules(rules, paid).sort()).toEqual(['ads-only', 'any-google']);
+    expect(matchRoutingRules(rules, organic)).toEqual(['any-google']);
+  });
+});
+
+describe('2.2.0 DramaBreak attribution decisions', () => {
+  it('Rise case: TikTok-tagged link opened from YouTube reports YouTube, keeps TikTok as linkChannel', () => {
+    expect(classifyTraffic({ landingUrl: lp('utm_source=tiktok&utm_medium=bio'), referrer: 'https://www.youtube.com/' }))
+      .toMatchObject({ channel: 'YouTube', linkChannel: 'TikTok', detectedChannel: 'YouTube', trafficType: 'organic' });
+  });
+  it('Facebook-tagged link inside the Instagram app reports Instagram', () => {
+    expect(classifyTraffic({ landingUrl: lp('utm_source=facebook'), userAgent: UA.instagram }))
+      .toMatchObject({ channel: 'Instagram', linkChannel: 'Facebook', matchedBy: 'user_agent' });
+  });
+  it('no referrer, no in-app UA: falls back to the link tag', () => {
+    expect(classifyTraffic({ landingUrl: lp('utm_source=tiktok') })).toMatchObject({ channel: 'TikTok', matchedBy: 'utm_source', detectedChannel: '' });
+  });
+  it('nothing at all: Direct', () => {
+    expect(classifyTraffic({ landingUrl: lp() })).toMatchObject({ channel: 'Direct', linkChannel: '', detectedChannel: '' });
+  });
+  it('paid link keeps its ad platform even when opened in another app', () => {
+    expect(classifyTraffic({ landingUrl: lp('utm_source=meta&utm_medium=paid_social'), userAgent: UA.instagram }))
+      .toMatchObject({ channel: 'Meta', channelGroup: 'Paid', trafficType: 'paid' });
+  });
+  it('Nova ads without utm_source=nova are still paid Nova via is_nova / nb_cid / nvss_ (2.3.0)', () => {
+    for (const q of ['is_nova=true', 'nb_cid=2049718437503352834', 'utm_content=nvss_ABC_123']) {
+      expect(classifyTraffic({ landingUrl: lp(q), referrer: 'https://www.newsbreak.com/' }))
+        .toMatchObject({ channelKey: 'nova', channelGroup: 'Paid', trafficType: 'paid', paidSignal: 'url:nova', matchedBy: 'url:nova', linkChannel: '' });
+      expect(classifyTraffic({ landingUrl: lp(q) })).toMatchObject({ channelKey: 'nova', trafficType: 'paid' });
+    }
+    expect(classifyTraffic({ landingUrl: lp(''), referrer: 'https://www.newsbreak.com/' }))
+      .toMatchObject({ channelKey: 'newsbreak', trafficType: 'organic' });
+    // An explicit, unrecognised utm_source still wins over the Nova URL fallback.
+    expect(classifyTraffic({ landingUrl: lp('utm_source=creator_john&is_nova=true') }).channelKey).not.toBe('nova');
+  });
+
+  it('Nova is paid by construction and its own channel', () => {
+    expect(classifyTraffic({ landingUrl: lp('utm_source=nova&utm_campaign=gbtm'), referrer: 'https://www.newsbreak.com/' }))
+      .toMatchObject({ channel: 'Nova (NewsBreak Ads)', channelKey: 'nova', channelGroup: 'Paid', trafficType: 'paid', paidSignal: 'utm_source:nova' });
+  });
+  it('organic newsbreak.com referrer is NewsBreak.com, not Direct', () => {
+    expect(classifyTraffic({ landingUrl: lp(), referrer: 'https://www.newsbreak.com/' })).toMatchObject({ channel: 'NewsBreak.com', trafficType: 'organic' });
+  });
+  it('Google: search vs ads stay split', () => {
+    expect(classifyTraffic({ landingUrl: lp(), referrer: 'https://www.google.com/' })).toMatchObject({ channel: 'Google Search' });
+    expect(classifyTraffic({ landingUrl: lp('gclid=x'), referrer: 'https://www.google.com/' })).toMatchObject({ channel: 'Google Ads', trafficType: 'paid' });
   });
 });

@@ -1,0 +1,3 @@
+## ENG-1034: emma_review_site — the one anonymous MCP tool (2026-10-20)
+
+`ANONYMOUS_TOOLS` now holds exactly `emma_review_site` (behind `MCP_ANONYMOUS_DISCOVERY`, still off in prod). It fetches a caller-supplied URL via `utils/ssrfGuard` (DNS-pinned, every redirect hop re-validated incl. scheme/port), http/https on default ports only, 2MB / 10s caps, deterministic HTML heuristics (no LLM). Per-IP (5/h) and global daily (200/instance) ceilings in `mcp/server/anonymousToolLimits.ts`, env-tunable, refused loudly with a Connect hint. Process-local by design: no new table. Also classifies the previously-unclassified `manage_crm_sequence` as `write`.

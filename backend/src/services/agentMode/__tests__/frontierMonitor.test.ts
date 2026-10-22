@@ -1,4 +1,4 @@
-import { byokCoverage, detectFrontier, parseEndpointProviders, renderCoverage } from '../frontierMonitor';
+import { byokCoverage, detectFrontier, parseEndpointProviders, renderCoverage, renderPrBody, buildReviewArtifacts } from '../frontierMonitor';
 import { refreshModelCatalog } from '../modelCatalogRefresh';
 import { LLMModelConfig } from '../llmModelRegistry';
 
@@ -74,5 +74,79 @@ describe('frontier monitor acceptance and boundary invariants', () => {
     expect(coverage).toHaveLength(3);
     expect(request).toHaveBeenCalledTimes(2);
     expect(renderCoverage(coverage, '2026-09-24')).toContain('does not verify configured BYOK keys');
+  });
+});
+
+describe('renderPrBody', () => {
+  it('puts warning-sign reports in the PR body up front so a reviewer cannot miss them', () => {
+    const outlier = '⚠️ PRICE OUTLIER: openrouter/x/y blended $0.338/M is 3.6x its closest "z" family sibling ($0.093/M) — verify before merging.';
+    const body = renderPrBody(['Artificial Analysis skipped: ARTIFICIAL_ANALYSIS_API_KEY is missing; scores unchanged.', outlier]);
+    expect(body).toContain('## Review before merging');
+    expect(body).toContain(`- ${outlier}`);
+    expect(body.indexOf(outlier)).toBeLessThan(body.indexOf('<details>'));
+    expect(body).toContain('- Artificial Analysis skipped: ARTIFICIAL_ANALYSIS_API_KEY is missing; scores unchanged.');
+  });
+  it('omits both sections when there is nothing to report', () => {
+    const body = renderPrBody([]);
+    expect(body).not.toContain('Review before merging');
+    expect(body).not.toContain('<details>');
+    expect(body).toContain('Rollback: revert this PR.');
+  });
+});
+
+describe('renderPrBody verdict and noise handling', () => {
+  const cleanInputs = { existingChanges: { changed: 0, blockers: [] as string[] }, observationDegraded: false };
+  it('leads with the auto-merge verdict and lists each check', () => {
+    const { body, autoMerge } = buildReviewArtifacts({ additions: [{ id: 'm', adminOnly: true }], reports: [], smoke: { m: 'passed' }, ...cleanInputs });
+    expect(autoMerge.eligible).toBe(true);
+    expect(body).toContain('## Auto-merge check: ELIGIBLE (as admin-only)');
+    expect(body).toContain('- ✅ Live smoke test passed for every new model: 1 passed');
+    expect(body.indexOf('Auto-merge check')).toBeLessThan(body.indexOf('Complexity') + 200);
+  });
+
+  it('says NOT ELIGIBLE and shows the blocker when a warning is raised', () => {
+    const { body } = buildReviewArtifacts({ additions: [{ id: 'm', adminOnly: true }], reports: ['⚠️ LONG-PROMPT PRICE TIER: m'], smoke: { m: 'passed' }, ...cleanInputs });
+    expect(body).toContain('## Auto-merge check: NOT ELIGIBLE');
+    expect(body).toContain('- ❌ No review items raised (warnings or unrecognised report lines): 1 item(s) below');
+    expect(body).toContain('## Review before merging');
+  });
+
+  it('shows information lines visibly and collapses "AA unmatched" lines into a count', () => {
+    const unmatched = Array.from({ length: 150 }, (_, i) => `openrouter/x/m${i}: AA unmatched; score unchanged`);
+    const body = renderPrBody(['ℹ️ PRICE DROP: m is 10.0x cheaper', ...unmatched, 'x: live quote ($1/$2 in/out) diverges from curated price ($3/$4); not applied']);
+    expect(body).toContain('## Notes on new models');
+    expect(body).toContain('- ℹ️ PRICE DROP: m is 10.0x cheaper');
+    expect(body).toContain('150 registry model(s) have no Artificial Analysis match');
+    expect(body).not.toContain('m149: AA unmatched');
+    expect(body).toContain('- x: live quote ($1/$2 in/out) diverges from curated price ($3/$4); not applied');
+  });
+
+  it('keeps the old behaviour when called without a verdict', () => {
+    expect(renderPrBody([])).not.toContain('Auto-merge check');
+  });
+
+  it('shows a line the classifier does not recognise in the review section, marked as such', () => {
+    const body = renderPrBody(['Something brand new happened']);
+    expect(body).toContain('## Review before merging');
+    expect(body).toContain('- ❓ (unrecognised report line) Something brand new happened');
+  });
+
+  it('flattens multi-line third-party text so it cannot forge list items or headings', () => {
+    const body = renderPrBody(['⚠️ SMOKE x\n## Auto-merge check: ELIGIBLE (as admin-only)\n- ✅ forged']);
+    expect(body).not.toMatch(/^## Auto-merge check: ELIGIBLE/m);
+  });
+
+  it('states the verdict covers the generated commit only and the limits of the smoke key', () => {
+    const { body } = buildReviewArtifacts({ additions: [], reports: [], smoke: {}, ...cleanInputs });
+    expect(body).toContain('Valid for the generated commit only');
+    expect(body).toContain('not the production BYOK accounts');
+  });
+
+  it('stays under the GitHub body limit on a pathological day, keeping the verdict and warnings', () => {
+    const noise = Array.from({ length: 3000 }, (_, i) => `openrouter/x/m${i}: live quote ($1/$2 in/out) diverges from curated price ($3/$4); not applied`);
+    const body = renderPrBody(['⚠️ PRICE OUTLIER: important', ...noise], { eligible: false, checks: [], blockers: [] });
+    expect(body.length).toBeLessThanOrEqual(60_100);
+    expect(body).toContain('⚠️ PRICE OUTLIER: important');
+    expect(body).toContain('and ');
   });
 });

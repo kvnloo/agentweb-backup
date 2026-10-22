@@ -62,6 +62,6 @@ describe('restyleContent — blog articles are citation-free (ENG-351 scope deci
   });
   it('uses the tenant content role for blog restyling', async () => {
     await restyleContent('A draft', 'topic', 'professional', 'default', false, 'blog-user');
-    expect(mockCallLLM.mock.calls[0][0]).toBe('openrouter/openai/gpt-5.6-luna');
+    expect(mockCallLLM.mock.calls[0][0]).toBe('openrouter/openai/gpt-6-luna'); // GPT-6 Luna: cheaper, newer tenant-content-role model
   });
 });

@@ -439,6 +439,52 @@ describe('AgentModeService - Social Media Tools', () => {
       expect(mockGetAccountById).not.toHaveBeenCalled();
     });
 
+    // ── ENG-976: reply to an existing X post via in_reply_to_post_id ──
+    it('ENG-976: passes in_reply_to_post_id to the X adapter as a reply', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockTwitterAccount] as any);
+      mockAdapter.createPost.mockResolvedValue({ success: true, message: 'Posted', postId: 'tw-2', postUrl: 'https://x.com/tw-2' });
+      const hook = jest.fn().mockResolvedValue(null);
+
+      const result = await service.postOnConnectedAccount('user-123', undefined, 'Great point!', [], 'twitter',
+        { assertPublishStillAuthorized: hook }, { inReplyToPostId: '1790000000000000001' });
+
+      expect(result.success).toBe(true);
+      expect(hook).toHaveBeenCalled();
+      expect(mockAdapter.createPost).toHaveBeenCalledWith(
+        mockTwitterAccount, 'Great point!', [], 'user-123', hook, { inReplyToPostId: '1790000000000000001' });
+    });
+
+    it('ENG-976: omitting in_reply_to_post_id keeps the original-post call unchanged', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockTwitterAccount] as any);
+      mockAdapter.createPost.mockResolvedValue({ success: true, message: 'Posted', postId: 'tw-1', postUrl: 'https://x.com/tw-1' });
+
+      await service.postOnConnectedAccount('user-123', undefined, 'Hello!', [], 'twitter');
+
+      expect(mockAdapter.createPost).toHaveBeenCalledWith(mockTwitterAccount, 'Hello!', [], 'user-123', undefined);
+    });
+
+    it('ENG-976: refuses in_reply_to_post_id on non-X platforms without posting', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockLinkedInAccount] as any);
+      mockGetAccountById.mockResolvedValue(mockLinkedInAccount as any);
+
+      const result = await service.postOnConnectedAccount('user-123', undefined, 'Hi', [], 'linkedin', undefined, { inReplyToPostId: '123' });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toMatch(/only supported for X/i);
+      expect(mockAdapter.createPost).not.toHaveBeenCalled();
+    });
+
+    it('ENG-976: a withdrawn publish consent stops a reply before the adapter', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockTwitterAccount] as any);
+      const hook = jest.fn().mockResolvedValue({ error: 'withdrawn' });
+
+      const result = await service.postOnConnectedAccount('user-123', undefined, 'x', [], 'twitter',
+        { assertPublishStillAuthorized: hook }, { inReplyToPostId: '1' });
+
+      expect(result).toEqual({ success: false, message: 'withdrawn' });
+      expect(mockAdapter.createPost).not.toHaveBeenCalled();
+    });
+
     // ── Platform hint (multiple accounts, platform narrows to one) ──
     it('resolves correct account when platform hint narrows multiple accounts to one', async () => {
       mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockTwitterAccount, mockLinkedInAccount] as any);

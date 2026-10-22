@@ -378,10 +378,17 @@ describe('UPDATE routes retirement through the confirmed REMOVE path (ENG-1329 e
 
 describe('removeConversionAction — the only working retire path (ENG-1329 e2e)', () => {
   it('issues a remove operation against conversionActions', async () => {
+    searchSpy.mockResolvedValue([storedRow({ status: 'REMOVED' })]);
     await googleAdsService.removeConversionAction('u', CUSTOMER, RESOURCE);
     expect(mutateSpy).toHaveBeenCalledTimes(1);
     expect(mutateSpy.mock.calls[0][2]).toBe('conversionActions');
     expect(mutateSpy.mock.calls[0][3]).toEqual([{ remove: RESOURCE }]);
+  });
+
+  it('ENG-2398: still ENABLED after remove is a loud failure', async () => {
+    searchSpy.mockResolvedValue([storedRow({ status: 'ENABLED' })]);
+    await expect(googleAdsService.removeConversionAction('u', CUSTOMER, RESOURCE))
+      .rejects.toMatchObject({ code: 'unsupported_field', fields: ['status'] });
   });
 
   it('refuses an empty resource name without calling Google', async () => {

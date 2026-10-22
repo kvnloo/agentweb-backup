@@ -85,6 +85,14 @@ export interface WorkPlanStep {
    */
   expectedAssetCountTools?: string[];
   inputRequest?: { title: string; prompt: string; fields: WorkPlanInputField[] };
+  /**
+   * ENG-2378: an explicit model for THIS step (canonical registry id). Additive optional key inside the existing
+   * JSON steps array (no migration, table, index or attribute). Absent = the plan's `defaultModel` pin, then the
+   * account default (today's behaviour). Only honoured while AW-Settings `work_plan_step_models_enabled` is 'true';
+   * when it is off, writes drop it and the engine ignores it. Never substituted: an unavailable step model stops
+   * the plan (see services/agentMode/workPlanStepModels.ts).
+   */
+  model?: string;
 }
 
 export interface WorkPlan {
@@ -159,6 +167,9 @@ export class WorkPlanService {
   private validateSteps(steps: WorkPlanStep[] | undefined): void {
     if (!steps) return;
     steps.forEach((step, idx) => {
+      if (step.model !== undefined && step.model !== null && typeof step.model !== 'string') {
+        throw new Error(`step ${idx + 1}: model must be a string`);
+      }
       if (step.userInstructions !== undefined && step.userInstructions !== null && typeof step.userInstructions !== 'string') {
         throw new Error(`step ${idx + 1}: userInstructions must be a string`);
       }

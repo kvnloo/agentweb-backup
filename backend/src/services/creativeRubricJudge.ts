@@ -222,6 +222,8 @@ export interface RubricJudgeLlmRequest {
 export interface RubricJudgeLlmResponse {
   text: string;
   usage?: RubricJudgeUsage;
+  /** The completion's finish_reason; "error" means the provider failed partway through the reply. */
+  finishReason?: string;
 }
 
 export interface RubricJudgeLlm {
@@ -229,7 +231,7 @@ export interface RubricJudgeLlm {
 }
 
 interface ChatCompletionLike {
-  choices?: Array<{ message?: { content?: unknown } }>;
+  choices?: Array<{ finish_reason?: unknown; message?: { content?: unknown } }>;
   usage?: { prompt_tokens?: unknown; completion_tokens?: unknown; cost?: unknown };
 }
 
@@ -239,8 +241,10 @@ function finiteOr(value: unknown, fallback: number): number {
 
 /** Reads text and token usage from an OpenAI-shaped chat completion. */
 export function readChatCompletion(res: ChatCompletionLike): RubricJudgeLlmResponse {
-  const content = res.choices?.[0]?.message?.content;
+  const choice = res.choices?.[0];
+  const content = choice?.message?.content;
   const text = typeof content === 'string' ? content : '';
+  const finishReason = typeof choice?.finish_reason === 'string' ? choice.finish_reason : undefined;
   const usage = res.usage
     ? {
         inputTokens: finiteOr(res.usage.prompt_tokens, 0),
@@ -248,7 +252,7 @@ export function readChatCompletion(res: ChatCompletionLike): RubricJudgeLlmRespo
         ...(typeof res.usage.cost === 'number' && Number.isFinite(res.usage.cost) ? { costUsd: res.usage.cost } : {}),
       }
     : undefined;
-  return usage ? { text, usage } : { text };
+  return { text, ...(usage ? { usage } : {}), ...(finishReason ? { finishReason } : {}) };
 }
 
 /** Production client: the OpenRouter gateway, metered as `creative_rubric_judge` system spend. */

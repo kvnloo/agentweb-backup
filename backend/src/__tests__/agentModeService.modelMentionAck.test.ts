@@ -86,8 +86,10 @@ describe('AgentModeService - ENG-1205 named-model acknowledgement', () => {
     expect(result.content).toContain(REPLY);
     expect(result.content).toContain('Claude Opus 5');
     expect(result.content).toContain('Gemini 3.1 Flash Lite');
-    // A non-admin cannot select Opus, so this is the entitlement branch.
-    expect(result.content).toMatch(/can't be selected on your account/i);
+    // ENG-2028: flipped. Opus is selectable by non-admins now (no name-based
+    // deny), so this is the picker-guidance branch, not the entitlement branch.
+    expect(result.content).toMatch(/can't change models from a chat message/i);
+    expect(result.content).not.toMatch(/can't be selected on your account|not available/i);
   });
 
   it('tells an entitled user how to actually switch, rather than that it is unavailable', async () => {

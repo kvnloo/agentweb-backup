@@ -4,7 +4,10 @@ import sharp from "sharp";
 import { workPlanService, type WorkPlanDisplayMetadataV1 } from "../services/workPlanService";
 import { normalizeWorkPlanSteps, findAmbiguousMergeTargets, findConflictingMergeTargets, findStepContentLoss, mergeWorkPlanSteps, summarizeStepChange } from "../services/workPlanSteps";
 import { normalizeWorkPlanDisplayMetadata } from "../services/workPlanDisplayMetadata";
+import { checkPlanDefaultModelWrite, isUserAdminSafe, planAdminStatusApplies } from "../services/agentMode/modelPin";
 import { workPlanThumbnailService } from "../services/workPlanThumbnailService";
+import { workPlanStepModels } from "../services/agentMode/workPlanStepModelsInstance";
+import { anyStepCarriesModel, checkPlanStepModelsWrite, checkStoredStepModelsForPublic, stepsWithModels } from "../services/agentMode/workPlanStepModels";
 
 const THUMBNAIL_MAX_BYTES = 2 * 1024 * 1024; // 2 MB
 const THUMBNAIL_ACCEPTED_TYPES = new Set(['image/jpeg', 'image/jpg', 'image/png', 'image/webp']);
@@ -71,7 +74,16 @@ router.post("/", async (req, res) => {
       return res.status(400).json({ message: "Title and at least one step are required" });
     }
 
-    const { steps: normalizedSteps, warnings } = normalizeWorkPlanSteps(steps);
+    // ENG-903: validate as the plan's LAUNCHERS will. A plan created here has no owner, so
+    // nobody launches it as an admin: adminOnly / internal / unserved models are refused now.
+    const modelCheck = await checkPlanDefaultModelWrite(async () => false, defaultModel);
+    if (!modelCheck.ok) return res.status(422).json(modelCheck.body);
+
+    // ENG-2378: a step `model` is stored (and validated like the plan default) only while the switch is on.
+    const stepModelsEnabled = anyStepCarriesModel(steps) && await workPlanStepModels.isEnabled();
+    const { steps: normalizedSteps, warnings } = normalizeWorkPlanSteps(steps, { stepModelsEnabled });
+    const stepModelCheck = await checkPlanStepModelsWrite(async () => false, normalizedSteps);
+    if (!stepModelCheck.ok) return res.status(422).json(stepModelCheck.body);
 
     // No plan id exists yet at create time, so a self-reference in
     // `nextPlanIds` cannot be checked (and cannot practically occur — the
@@ -92,7 +104,7 @@ router.post("/", async (req, res) => {
       requireLogin: requireLogin || false,
       showLoginSignup: showLoginSignup || 'after_plan_completed',
       showInAgentMode: showInAgentMode !== false,
-      defaultModel,
+      defaultModel: modelCheck.touched ? modelCheck.value : undefined,
       category,
       display: normalizedDisplay,
       visibility: visibility || 'system',
@@ -120,13 +132,33 @@ router.put("/:planId", async (req, res) => {
     if (steps !== undefined && !Array.isArray(steps)) {
       return res.status(400).json({ message: "steps must be an array" });
     }
+    // ENG-903: validate only a CHANGED model; re-sending the stored value never blocks an edit.
+    // Admin status applies only to a plan that is (and stays) private, owned by an admin and
+    // not org-scoped (its only launcher); any system/public/org-shared/other-owner plan is
+    // launched by non-admins too, so an adminOnly pin there would 422 every launch.
+    const effectiveVisibility = visibility !== undefined ? visibility : plan.visibility;
+    const adminClearsAfter = planAdminStatusApplies({ visibility: effectiveVisibility, ownerId: plan.ownerId, orgId: plan.orgId });
+    // The plan is leaving the "admin-only launcher" scope (e.g. private -> system/public): the
+    // STORED model must now be valid for a non-admin, even if it is not being edited.
+    const scopeWidened = planAdminStatusApplies(plan) && !adminClearsAfter;
+    const modelCheck = await checkPlanDefaultModelWrite(
+      () => adminClearsAfter ? isUserAdminSafe(plan.ownerId) : Promise.resolve(false),
+      defaultModel,
+      scopeWidened ? undefined : plan.defaultModel,
+    );
+    if (!modelCheck.ok) return res.status(422).json(modelCheck.body);
+    if (scopeWidened && (defaultModel === undefined || defaultModel === null) && plan.defaultModel) {
+      const storedCheck = await checkPlanDefaultModelWrite(() => Promise.resolve(false), plan.defaultModel);
+      if (!storedCheck.ok) return res.status(422).json(storedCheck.body);
+    }
     // A caller that decided this write was safe by reading the plan first can
     // stake the revision it saw. `null` is a real value here ("the plan had no
     // revision"), so presence of the key is what counts (ENG-890).
     const stake = "expectedStepsRev" in req.body
       ? { expectedStepsRev: req.body.expectedStepsRev }
       : {};
-    const normalized = steps !== undefined ? normalizeWorkPlanSteps(steps) : undefined;
+    const stepModelsEnabled = (anyStepCarriesModel(steps) || anyStepCarriesModel(plan.steps)) && await workPlanStepModels.isEnabled();
+    const normalized = steps !== undefined ? normalizeWorkPlanSteps(steps, { stepModelsEnabled, storedSteps: plan.steps }) : undefined;
     let normalizedSteps = normalized?.steps;
     const warnings = normalized?.warnings ?? [];
 
@@ -219,6 +251,9 @@ router.put("/:planId", async (req, res) => {
           // victim of it).
           if (has('expectedAssetCountTools')) out.expectedAssetCountTools = norm.expectedAssetCountTools;
           if (has('inputRequest')) out.inputRequest = norm.inputRequest;
+          // ENG-2378: same pass-through, gated on the switch (off: nothing is "supplied", the stored model stands).
+          // A blank string is the explicit clear (the normalizer drops it, so it is re-expressed as '').
+          if (stepModelsEnabled && typeof raw.model === 'string') out.model = norm.model ?? '';
           return out;
         });
 
@@ -321,6 +356,22 @@ router.put("/:planId", async (req, res) => {
       stepsChange = summarizeStepChange(existingSteps, normalizedSteps, mode);
     }
 
+    // ENG-2378: every step model that is NEW or CHANGED must be a served, selectable model (same rule as the
+    // plan's defaultModel: an unchanged stored value is tolerated so a since-retired model never blocks an
+    // unrelated edit). When the plan's launcher scope widens, its stored step models are re-checked as a
+    // non-admin launcher would, even if the steps were not part of this write.
+    if (stepModelsEnabled) {
+      const stepsToCheck = normalizedSteps ?? (scopeWidened ? stepsWithModels(plan.steps) : undefined);
+      if (stepsToCheck) {
+        const stepModelCheck = await checkPlanStepModelsWrite(
+          () => adminClearsAfter ? isUserAdminSafe(plan.ownerId) : Promise.resolve(false),
+          stepsToCheck,
+          scopeWidened || normalizedSteps === undefined ? undefined : plan.steps,
+        );
+        if (!stepModelCheck.ok) return res.status(422).json(stepModelCheck.body);
+      }
+    }
+
     // `display` is optional customer-facing browse metadata (ENG-1469). Presence
     // of the key is what counts, exactly like `expectedStepsRev` above: `null`
     // is a real instruction ("remove it"), so coalescing it away with `??` or
@@ -356,7 +407,7 @@ router.put("/:planId", async (req, res) => {
       ...(requireLogin !== undefined && { requireLogin }),
       ...(showLoginSignup !== undefined && { showLoginSignup }),
       ...(showInAgentMode !== undefined && { showInAgentMode }),
-      ...(defaultModel !== undefined && { defaultModel }),
+      ...(modelCheck.touched && { defaultModel: modelCheck.value }),
       ...(category !== undefined && { category }),
       ...(visibility !== undefined && { visibility }),
       // Absent key -> spread from `...plan` above is left standing (preserved).
@@ -408,6 +459,13 @@ router.delete("/:planId", async (req, res) => {
 // Approve a work plan
 router.post("/:planId/approve", async (req, res) => {
   try {
+    // ENG-2378: approval makes the plan public, launched by non-admins: refuse (state unchanged) when a step model is
+    // not selectable by them, same 422 body as a write.
+    const pending = await workPlanService.getWorkPlan(req.params.planId);
+    if (pending && pending.visibility === 'pending_review') {
+      const stepModelCheck = await checkStoredStepModelsForPublic(pending.steps, () => workPlanStepModels.shouldHonor());
+      if (!stepModelCheck.ok) return res.status(422).json(stepModelCheck.body);
+    }
     const plan = await workPlanService.approveWorkPlan(req.params.planId);
     res.json(plan);
   } catch (error: any) {

@@ -277,6 +277,11 @@ describe('readChatCompletion', () => {
     ).toEqual({ text: '{}', usage: { inputTokens: 10, outputTokens: 2, costUsd: 0.001 } });
     expect(readChatCompletion({ choices: [] })).toEqual({ text: '' });
   });
+
+  it('passes on the finish reason, so a provider error mid-reply is not mistaken for an empty answer (ENG-2620)', () => {
+    expect(readChatCompletion({ choices: [{ finish_reason: 'error', message: { content: null } }] })).toEqual({ text: '', finishReason: 'error' });
+    expect(readChatCompletion({ choices: [{ finish_reason: 'stop', message: { content: '{}' } }] })).toEqual({ text: '{}', finishReason: 'stop' });
+  });
 });
 
 describe('pairwise', () => {

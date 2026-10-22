@@ -433,6 +433,14 @@ const runDrain = async (reason: string): Promise<void> => {
     drainLiveVoiceToolExecutions(remainingDrainMs()),
   ]);
   await generateMarketingResponseWorkerService.shutdown(remainingDrainMs());
+  // ENG-2110: pending Claude sign-ins hold a child process and a private temp dir.
+  await import('./services/funding/claudeSubscriptionService')
+    .then((m) => m.shutdownClaudeSubscriptionService())
+    .catch(() => undefined);
+  // ENG-2110 1c: pending hosted sign-ins are cancelled on the login host (it also expires them itself).
+  await import('./services/funding/hostedSubscriptionService')
+    .then((m) => m.shutdownHostedSubscriptionService())
+    .catch(() => undefined);
   if (!cronDrain.drained) {
     console.warn(
       `[gracefulShutdown] Cron drain ceiling reached — ${cronDrain.stuckCount} job(s) still in-flight:`,
@@ -594,6 +602,16 @@ createTestAccount().then(async () => {
     console.warn('Failed to register enrichment specialists:', (err as Error).message);
   }
 
+  // ENG-2271: load the admin vendor-rate overrides BEFORE listening, so no usage recording
+  // (HTTP request or queue processor) prices a Twilio unit at the defaults while an override
+  // exists. Bounded by the read's own 1.5s timeout; a settings outage must not block boot.
+  // Skipped under Jest (shouldBootstrapBackgroundJobs), where no settings I/O may happen.
+  // (refresh never rejects and logs its own failure once.)
+  if (shouldBootstrapBackgroundJobs()) {
+    const { refreshVendorRateOverrides } = await import('./utils/vendorRateCard');
+    await refreshVendorRateOverrides();
+  }
+
   server.listen(port, async () => {
     console.log(`Server is running on port ${port}`);
     console.log(`WebSocket server is ready`);
@@ -643,6 +661,12 @@ createTestAccount().then(async () => {
     void import('./services/ensureCriticalTables')
       .then(({ ensureCriticalTables }) => ensureCriticalTables())
       .catch((err) => console.error('[startup] ensureCriticalTables failed (non-fatal):', err?.message || err));
+
+    // Register app-wide HubSpot webhook subscriptions once per build (one instance wins the claim).
+    import('./utils/hubspotWebhookSubscriptionsBoot')
+      .then(({ ensureWebhookSubscriptionsOncePerBuild }) => ensureWebhookSubscriptionsOncePerBuild())
+      .then((outcome) => console.log(`[startup] HubSpot webhook subscription sync: ${outcome}`))
+      .catch((err) => console.error('[startup] HubSpot webhook subscription sync failed (non-fatal):', err?.message || err));
 
     // Proactively refresh OAuth tokens for outbound MCP servers before they expire.
     import('./mcp/client/mcpOAuthRefreshService')
@@ -1091,6 +1115,64 @@ createTestAccount().then(async () => {
         console.error('[orgSeatCreditGrantCron] Failed to initialize:', error);
       }
 
+      // ENG-668 PR-2 — month-end pay-as-you-go settlement. Dark behind the AW-Settings switch
+      // `payg_settlement_enabled` (exact 'true'); off = the sweep returns without reading anything.
+      // Same fixed-UTC-hour anchoring as the seat-credit sweep above, and after it, so the closed
+      // month's credit ledger has already been kept as `llmUsageCreditsClosed` when it runs. Every
+      // month's settlement record makes an extra fire a no-op.
+      try {
+        const { runPaygSettlement } = await import('./cron/paygSettlementCron');
+        const { msUntilNextUtcHour } = await import('./utils/dailySchedule');
+        const PAYG_SETTLEMENT_HOUR_UTC = 12;
+        const DAY_MS = 24 * 60 * 60 * 1000;
+        const msUntilFirstPaygSettlementRun = msUntilNextUtcHour(PAYG_SETTLEMENT_HOUR_UTC);
+        setTimeout(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('paygSettlementCron', runPaygSettlement())
+            .catch(e => console.error('[paygSettlementCron] Error:', e));
+          setInterval(() => {
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('paygSettlementCron', runPaygSettlement())
+              .catch(e => console.error('[paygSettlementCron] Error:', e));
+          }, DAY_MS);
+        }, msUntilFirstPaygSettlementRun);
+        console.log(
+          `[paygSettlementCron] Initialized — first run at ${PAYG_SETTLEMENT_HOUR_UTC}:00 UTC ` +
+          `(in ${Math.round(msUntilFirstPaygSettlementRun / 60000)} min)`,
+        );
+      } catch (error) {
+        console.error('[paygSettlementCron] Failed to initialize:', error);
+      }
+
+      // Hot-lead call number rent (ENG-2614) — daily sweep that meters the current
+      // month's rent of every org's caller number. Anchored to a fixed UTC hour
+      // (a bare 24h setInterval never elapses with redeploys every 1-2 hours); the
+      // month-scoped idempotency key makes any extra fire a safe no-op. Switch off
+      // with HOT_LEAD_CALL_RENT_METERING=false.
+      try {
+        const { runNumberRentCron } = await import('./cron/numberRentCron');
+        const { msUntilNextUtcHour } = await import('./utils/dailySchedule');
+        const NUMBER_RENT_HOUR_UTC = 11;
+        const DAY_MS = 24 * 60 * 60 * 1000;
+        const msUntilFirstNumberRentRun = msUntilNextUtcHour(NUMBER_RENT_HOUR_UTC);
+        setTimeout(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('numberRentCron', runNumberRentCron())
+            .catch(e => console.error('[numberRentCron] Error:', e));
+          setInterval(() => {
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('numberRentCron', runNumberRentCron())
+              .catch(e => console.error('[numberRentCron] Error:', e));
+          }, DAY_MS);
+        }, msUntilFirstNumberRentRun);
+        console.log(
+          `[numberRentCron] Initialized — first run at ${NUMBER_RENT_HOUR_UTC}:00 UTC ` +
+          `(in ${Math.round(msUntilFirstNumberRentRun / 60000)} min)`,
+        );
+      } catch (error) {
+        console.error('[numberRentCron] Failed to initialize:', error);
+      }
+
       // Pre-Renewal Ad-Integration Health Check (ENG-1270) — runs daily.
       // Charging a customer while their ad platform connection is silently dead
       // is a trust break (ThinkingAI, TransAmerica — Aug 2026 audit, both caught
@@ -1520,6 +1602,41 @@ createTestAccount().then(async () => {
         }
       }
 
+      // Shadow-judge online sampler (ENG-2128, ENG-2189, ENG-2138, ENG-2146) — daily at 18:15
+      // UTC: a seeded uniform random sample of the previous day's sessions, scored by every
+      // shadow:true custom judge in AW-Settings scoring-judges via scoreSessionWithJudgeIfNeeded.
+      // Off unless SHADOW_JUDGE_SAMPLER_ENABLED=true (enabling it in prod is an OPS decision); the
+      // run itself refuses to write without the flag. No grader this writes is validated, so it
+      // raises no alert.
+      if (process.env.SHADOW_JUDGE_SAMPLER_ENABLED === 'true') {
+        try {
+          const SHADOW_JUDGE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+          const { runShadowJudgeSamplerCron } = await import('./cron/shadowJudgeSamplerCron');
+          const nowForShadowJudge = new Date();
+          const nextShadowJudgeRun = new Date(nowForShadowJudge);
+          nextShadowJudgeRun.setUTCHours(18, 15, 0, 0);
+          if (nextShadowJudgeRun <= nowForShadowJudge) {
+            nextShadowJudgeRun.setUTCDate(nextShadowJudgeRun.getUTCDate() + 1);
+          }
+          const msUntilShadowJudge = nextShadowJudgeRun.getTime() - nowForShadowJudge.getTime();
+          console.log(
+            `[ShadowJudgeSampler] Initialized — first run at 18:15 UTC (in ${Math.round(msUntilShadowJudge / 60000)} min)`,
+          );
+          setTimeout(() => {
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('ShadowJudgeSampler', runShadowJudgeSamplerCron())
+              .catch(e => console.error('[ShadowJudgeSampler] Error:', e));
+            setInterval(() => {
+              if (!isCronEnabled()) return;
+              cronJobRegistry.track('ShadowJudgeSampler', runShadowJudgeSamplerCron())
+                .catch(e => console.error('[ShadowJudgeSampler] Error:', e));
+            }, SHADOW_JUDGE_INTERVAL_MS);
+          }, msUntilShadowJudge);
+        } catch (error) {
+          console.error('[ShadowJudgeSampler] Failed to initialize:', error);
+        }
+      }
+
       // Nightly failure replay (ENG-591 AC2, ENG-2145) — 04:30 UTC: the registered replay cases
       // against current code; a regression is filed once through the ENG-240 intake. Off unless
       // FAILURE_REPLAY_NIGHTLY_ENABLED=true.
@@ -1544,6 +1661,35 @@ createTestAccount().then(async () => {
         });
       } catch (error) {
         console.error('[EvalMarkerSuite] Failed to initialize:', error);
+      }
+
+      // Claude subscription logins (ENG-2110): daily expiry pass (no-op unless the claudeSubscription
+      // funding flag is on), and recovery of any refreshed login a previous process died holding
+      // (runs whatever the flag says, and does nothing unless such a dir exists).
+      try {
+        const { scheduleClaudeSubscriptionExpiry } = await import('./cron/claudeSubscriptionExpiryCron');
+        scheduleClaudeSubscriptionExpiry({
+          isCronEnabled,
+          track: (jobName, promise) => cronJobRegistry.track(jobName, promise),
+        });
+        const { recoverClaudeSubscriptionOrphansAtBoot } = await import('./services/funding/claudeSubscriptionService');
+        // Not awaited: a slow store must never hold up the rest of boot.
+        void recoverClaudeSubscriptionOrphansAtBoot()
+          .then((recovered) => recovered && console.log('[ClaudeSubscription] boot recovery:', recovered))
+          .catch((error) => console.error('[ClaudeSubscription] boot recovery failed:', (error as { code?: string })?.code || 'error'));
+      } catch (error) {
+        console.error('[ClaudeSubscription] Failed to initialize:', (error as { code?: string })?.code || 'error');
+      }
+
+      // Hosted subscription logins (ENG-2110 1c/1d): finish unconfirmed disconnects. Not flag-gated on purpose.
+      try {
+        const { scheduleHostedSubscriptionSweep } = await import('./cron/hostedSubscriptionSweepCron');
+        scheduleHostedSubscriptionSweep({
+          isCronEnabled,
+          track: (jobName, promise) => cronJobRegistry.track(jobName, promise),
+        });
+      } catch (error) {
+        console.error('[HostedSubscription] Failed to initialize sweep:', (error as { code?: string })?.code || 'error');
       }
 
       // Weekly Engineering Scoreboard — read-only backend replacement for the

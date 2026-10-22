@@ -1,8 +1,9 @@
 import express, { Request, Response } from "express";
-import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
+import { authenticateToken, AuthenticatedRequest, isRealAdmin } from "../middleware/auth";
 import { batchReviewDb } from "../services/batchReviewDb";
 import { approvalDb, getAssetTypeFromFilename } from "../services/approvalDb";
-import { sendBatchApprovalRequest, updateBatchReviewMessage } from "../services/slackService";
+import { sendBatchApprovalRequest, updateBatchReviewMessage, getEffectiveAllowedChannels } from "../services/slackService";
+import { userDb } from "../services/db";
 import { triggerAutoRevision } from "../services/revisionService";
 
 const router = express.Router();
@@ -24,6 +25,27 @@ router.post("/create", authenticateToken, async (req: Request, res: Response) =>
 
   if (!channel || !assets || !Array.isArray(assets) || assets.length === 0) {
     return res.status(400).json({ error: "Missing required fields: channel, assets (non-empty array)" });
+  }
+
+  if (typeof channel !== "string") {
+    return res.status(400).json({ error: "channel must be a string" });
+  }
+
+  // ENG-2407: the bot posts with the workspace token, so the caller may only target a
+  // channel configured for their user/org (or be a real, non-delegated admin). Checked
+  // before any DB write or Slack call.
+  if (!isRealAdmin(req)) {
+    let allowed: string[] = [];
+    try {
+      const user = await userDb.getUserById(userId);
+      allowed = await getEffectiveAllowedChannels(user);
+    } catch (error: any) {
+      console.error("Error resolving allowed Slack channels:", error.message);
+      return res.status(500).json({ error: "Failed to create batch review" });
+    }
+    if (!allowed.includes(channel)) {
+      return res.status(403).json({ error: "Not allowed to post to this Slack channel" });
+    }
   }
 
   try {

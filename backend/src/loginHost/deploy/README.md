@@ -1,0 +1,19 @@
+# Login host deploy files (ENG-2110) — NOT installed by CI; DARK
+
+**Production worker: use `prod/install.sh` (built into a tarball by `backend/scripts/build-login-host.sh`); see `prod/README.md` for build, deploy, rollback, certificate rotation and the runbook.** The checklist below is the manual, test-instance view.
+
+Files: `aw-login-host@.service` (host, one instance per env), `aw-env.slice.example`, `host-config.example.json`,
+`claude-turn.sh` (per-turn wrapper), `aw-write-file.sh` (root helper that writes a file as a customer uid).
+
+Install checklist (test instance first; production needs the network-isolation PR before any external customer):
+1. node 22 at `/usr/bin/node`; host build under `/opt/aw-login-host/dist`; `claude-turn.sh`, `aw-write-file.sh` there, root-owned, mode 0755.
+2. Pinned Claude binary under `/opt/aw-claude/<version>/claude`, root-owned, not group/other-writable; put its sha256 in the config.
+3. Homes filesystem: a fixed-size loop image mounted at `/var/lib/aw-login-host/<env>/u` with `nosuid,nodev,usrquota` (the host refuses to start otherwise); run `quotacheck`/`quotaon`.
+4. `/etc/aw-login-host/<env>.json` root-owned 0600, uid range disjoint from every other env and `/etc/subuid` (the host enforces both).
+5. `systemctl enable --now aw-login-host@<env>`; the socket dir `/run/aw-login-host-<env>` is the access gate (group = the backend's gid).
+6. Network isolation (PR 2, mandatory): `socat` installed (`/usr/bin/socat`), `aw-net.sh` next to `claude-turn.sh` (root-owned 0755), and an `egress.allow` list in the config. Every customer unit then runs with `PrivateNetwork=yes` (loopback only) and reaches ONLY the host's allowlisting proxy (`/run/aw-egress-<env>/proxy.sock`, started and owned by the host process); the Emma tool bridge from `claude.bridgeUrl` is allowed automatically. The proxy refuses anything not on the list and any name that resolves to a private/loopback/metadata address.
+Config is a CLOSED schema: unknown keys fail start-up. See `host/hostConfig.ts`.
+
+## Test instance only
+`install-test-host.sh` installs env `test1` on the throwaway test instance (loop-mounted 500M homes fs, uid range 420000-430000, socket group 1000). It is NOT a production installer: production needs its own sized volume, a real group for the backend, and the network-isolation PR first.
+The manual live runner `__tests__/live/hostLiveAuth.ts` (bundle it with esbuild, run as root on the instance) does a REAL sign-in through the host with a hidden code entry; it prints only redacted PASS/FAIL lines.

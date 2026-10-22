@@ -113,3 +113,18 @@ describe('isWorkerShutdownError', () => {
     expect(isWorkerShutdownError(new Error('worker draining status unknown'))).toBe(false);
   });
 });
+
+describe('ENG-2381: isProviderUnavailableError', () => {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { isProviderUnavailableError, PROVIDER_UNAVAILABLE_USER_MESSAGE } = require('../utils/agentModeErrors');
+
+  it('matches the wrapped provider-unavailable message', () => {
+    expect(isProviderUnavailableError(new Error(PROVIDER_UNAVAILABLE_USER_MESSAGE))).toBe(true);
+  });
+
+  it('does not match a generic or raw upstream error (those still alert as unknown)', () => {
+    expect(isProviderUnavailableError(new Error('I apologize, but I encountered an error processing your request. Please try again.'))).toBe(false);
+    expect(isProviderUnavailableError(new Error('503 Provider returned error'))).toBe(false);
+    expect(isProviderUnavailableError(undefined)).toBe(false);
+  });
+});

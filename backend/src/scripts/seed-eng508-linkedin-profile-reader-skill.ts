@@ -91,25 +91,23 @@ export function buildProfileReaderSkill(skillId: string): Skill {
 /**
  * Enroll the skillId into every subscription tier that uses an explicit
  * allowedSkills list. Without this the skill is published but unreachable.
- * Idempotent: only appends where the ID is missing; wildcard tiers are left alone.
+ * Idempotent: only appends where the ID is missing; wildcard, empty and malformed tiers are left alone.
  */
 /**
  * Does this tier already grant every skill? Mirrors getAllowedSkills — the RUNTIME
- * authority — which returns ['*'] when allowedSkills is absent, EMPTY, or contains
- * '*'. Note findTiersAllowingSkill (used by the admin entitlement warning) differs:
- * it does `tier.allowedSkills || ['*']`, and since `[]` is truthy in JS an empty list
- * there reads as "allows nothing". Enrollment must follow the runtime rule, because
- * appending a skillId to an EMPTY list would flip that tier from "all skills allowed"
- * to "only this one skill allowed" — a severe entitlement regression.
+ * authority. Since ENG-1978 only an explicit '*' is a wildcard: an EMPTY list means
+ * NO skills, and an absent/non-array allowedSkills is a malformed row that the runtime
+ * refuses to resolve. Neither may be read as "all skills".
  */
 export function tierIsWildcard(tier: any): boolean {
-  const allowed: string[] | undefined = tier?.allowedSkills;
-  return !allowed || allowed.length === 0 || allowed.includes('*');
+  const allowed: unknown = tier?.allowedSkills;
+  return Array.isArray(allowed) && allowed.includes('*');
 }
 
 /** Runtime-accurate reachability for a single tier. */
 export function tierAllowsSkill(tier: any, skillId: string): boolean {
-  return tierIsWildcard(tier) || (tier.allowedSkills as string[]).includes(skillId);
+  const allowed: unknown = tier?.allowedSkills;
+  return tierIsWildcard(tier) || (Array.isArray(allowed) && allowed.includes(skillId));
 }
 
 export async function enrollSkillInTiers(
@@ -119,8 +117,8 @@ export async function enrollSkillInTiers(
   const { settingsService } = await import('../services/settingsService');
   const setting = await settingsService.getSetting('subscription_types');
   if (!setting) {
-    console.log('No subscription_types setting — every tier is implicitly wildcard, nothing to enroll.');
-    return { changed: [], alreadyAllowed: [], reachable: true };
+    console.log('No subscription_types setting — the runtime resolves no tier to this skill, nothing to enroll.');
+    return { changed: [], alreadyAllowed: [], reachable: false };
   }
 
   const tiers: any[] = JSON.parse(setting.settingValue);
@@ -132,7 +130,13 @@ export async function enrollSkillInTiers(
       alreadyAllowed.push(`${tier.name} (wildcard)`);
       continue;
     }
-    const allowed: string[] = tier.allowedSkills;
+    const allowed: string[] | undefined = Array.isArray(tier.allowedSkills) ? tier.allowedSkills : undefined;
+    // An empty list is a deliberate "no skills" tier and an absent one is malformed; widening
+    // either from a seed script would grant access nobody asked for, so both are left alone.
+    if (!allowed || allowed.length === 0) {
+      console.warn(`Skipping tier "${tier.name}": allowedSkills is ${allowed ? 'empty' : 'missing/malformed'}, not enrolling.`);
+      continue;
+    }
     if (allowed.includes(skillId)) {
       alreadyAllowed.push(tier.name);
       continue;
@@ -152,7 +156,9 @@ export async function enrollSkillInTiers(
 
   // Reachability judged by the SAME rule used to enroll, so the two can never
   // disagree. A dry run reports the post-apply state (nothing was written yet).
-  const reachable = tiers.length === 0 || tiers.some((t) => tierAllowsSkill(t, skillId));
+  // An empty tier list reaches nothing at runtime either (it falls back to the built-in Free tier,
+  // which has no skills, or to a flagged Basic grant that is denied), so it is not "reachable".
+  const reachable = tiers.some((t) => tierAllowsSkill(t, skillId));
   return { changed, alreadyAllowed, reachable };
 }
 
@@ -193,19 +199,19 @@ async function main() {
   console.log(`Reachable (runtime semantics): ${reachable}`);
   if (!reachable) throw new Error('Skill is still not reachable from any subscription tier');
 
-  // Cross-check against findTiersAllowingSkill — the helper behind the admin
-  // entitlement warning. It reads an EMPTY allowedSkills list as "allows nothing"
-  // while the runtime treats it as wildcard, so the two can legitimately disagree
-  // for empty-list tiers. Report that divergence instead of failing on it: the
-  // runtime result above is authoritative for whether the tool is discoverable.
+  // Cross-check against findTiersAllowingSkill — the helper behind the admin entitlement warning.
+  // Per tier it follows the same rule as the runtime, but it deliberately fails OPEN when the
+  // subscription_types setting is absent, empty or unparseable, so the two can still disagree in
+  // those degraded states. Report that divergence instead of failing on it: the runtime result
+  // above is authoritative for whether the tool is discoverable.
   if (!dryRun) {
     const { findTiersAllowingSkill } = await import('../services/subscriptionService');
     const { reachable: warnReachable, allowingTiers, totalTiers } = await findTiersAllowingSkill(skill.skillId);
     console.log(`Admin-warning view: reachable=${warnReachable} (${allowingTiers.length}/${totalTiers}: ${allowingTiers.join(', ') || 'none'})`);
     if (!warnReachable) {
       console.warn(
-        'NOTE: the admin entitlement warning will still flag this skill. That happens when every ' +
-          'tier stores an EMPTY allowedSkills list — allowed at runtime, but not counted by that helper.'
+        'NOTE: the admin entitlement warning will still flag this skill. Check that no tier is ' +
+          'missing its allowedSkills list or holding an empty one — neither reaches the skill at runtime.'
       );
     }
   }
