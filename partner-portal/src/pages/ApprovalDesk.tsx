@@ -110,14 +110,14 @@ function statusColor(decision: ApprovalDecisionView, answered: boolean): 'error'
 // row leads with what's IN the packet; a flat accountless row has no such
 // heading, so it keeps its own subject label as the title.
 function ManifestRow({ m, showSubject }: { m: ManifestSummary; showSubject: boolean }) {
-  const more = m.itemCount - m.itemPreviews.length;
+  const more = m.itemCount - (m.itemPreviews?.length ?? 0);
   return (
     <Card variant="outlined">
       <CardContent>
         <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" alignItems={{ sm: 'center' }} spacing={1}>
           <Box sx={{ minWidth: 0 }}>
             {showSubject && <Typography variant="subtitle1">{m.subjectLabel || m.manifestId}</Typography>}
-            {m.itemPreviews.map((line, i) => (
+            {m.itemPreviews?.map((line, i) => (
               <Typography
                 key={i}
                 variant={showSubject ? 'body2' : 'subtitle2'}

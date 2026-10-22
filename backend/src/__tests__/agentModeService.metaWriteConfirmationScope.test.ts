@@ -316,6 +316,19 @@ describe('buildMetaWriteConfirmation scopes to the resolved ad account', () => {
       }
     });
 
+    it('does not quietly accept a string PROPOSAL the writers would reject (only Meta\'s own read-back is coerced)', async () => {
+      getCampaignSpy.mockRestore();
+      const campaignSpy = jest.spyOn(metaService, 'getCampaign').mockResolvedValue({
+        id: 'camp_1', name: 'Summer Sale', daily_budget: '3000',
+      } as never);
+      try {
+        const result: any = await build('CAMPAIGN', 'UPDATE', ['camp_1', undefined, undefined], { daily_budget: '31' });
+        expect(result.summary).toContain('daily_budget: 3000 (= $30.00) → 31 (major units, currency unverified)');
+      } finally {
+        campaignSpy.mockRestore();
+      }
+    });
+
     it('shows a status change before/after without money-formatting a non-budget field', async () => {
       getCampaignSpy.mockRestore();
       const campaignSpy = jest.spyOn(metaService, 'getCampaign').mockResolvedValue({

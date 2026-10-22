@@ -48,6 +48,9 @@ function accountIdForManifest(decisions: ApprovalDecision[]): string | null {
 // shape (never blocks grouping on a label-parsing miss).
 function accountLabelForManifest(decisions: ApprovalDecision[], accountId: string | null): string {
   const label = decisions.find((d) => d.metaWriteDispatch?.resolvedAccountId === accountId)?.subjectLabel;
+  // The meta_write producer labels decisions "Meta Ads · Account <id>" (no company name available there).
+  const producerLabel = label?.match(/^Meta Ads\s*·\s*Account\s+(\S+)/i);
+  if (producerLabel) return `Ad account ${producerLabel[1]}`;
   const stripped = label?.split(/\s*·\s*Meta Ad Account\s/i)[0]?.trim();
   return stripped || `Account ${accountId}`;
 }

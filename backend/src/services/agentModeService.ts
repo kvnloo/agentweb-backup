@@ -14611,11 +14611,19 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     const MONEY_KEYS = new Set(['daily_budget', 'lifetime_budget', 'bid_amount', 'budget_amount', 'spend_cap']);
     let accountCurrency: string | undefined;
     if (accessToken && [...MONEY_KEYS].some((k) => params?.[k] !== undefined)) {
-      try { accountCurrency = await metaService.getAdAccountCurrency(scopeAccountId, accessToken); } catch { /* shown as unverified below */ }
+      // Bounded: this runs on the halt path, and a stalled Graph read must not hold the approval card up.
+      try {
+        accountCurrency = await Promise.race([
+          metaService.getAdAccountCurrency(scopeAccountId, accessToken),
+          new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 5000)),
+        ]);
+      } catch { /* shown as unverified below */ }
     }
     const money = (value: any, unit: 'major' | 'minor'): string => {
       try {
-        const n = typeof value === 'string' && /^\d+(\.\d+)?$/.test(value) ? Number(value) : value;
+        // Only Meta's own read-back ("3000") is a numeric string; the writers reject a string
+        // PROPOSAL, so the card must not quietly accept one.
+        const n = unit === 'minor' && typeof value === 'string' && /^\d+(\.\d+)?$/.test(value) ? Number(value) : value;
         return normalizeMetaMoney(n, accountCurrency, unit).description;
       } catch {
         return `${String(value)} (${unit} units, currency unverified)`;

@@ -131,6 +131,19 @@ describe('GET /queue', () => {
     expect(haven.itemCount).toBe(2);
   });
 
+  it('labels a Meta write group by its ad account when the producer label has no company name', async () => {
+    mockListPendingForApprover.mockResolvedValue([
+      decisionFor('d1', 'matt', {
+        manifestId: 'm1',
+        subjectLabel: 'Meta Ads · Account 1339414687604223',
+        metaWriteDispatch: { resolvedAccountId: 'act_1339414687604223' },
+      }),
+    ]);
+    const res = await request(app).get('/api/approval-desk/queue').set('Authorization', `Bearer ${mattToken}`);
+    expect(res.status).toBe(200);
+    expect(res.body.manifests[0].accountLabel).toBe('Ad account 1339414687604223');
+  });
+
   it('excludes pre-existing decisions with no manifestId instead of surfacing a dead-end entry (found live on env1)', async () => {
     mockListPendingForApprover.mockResolvedValue([
       decisionFor('legacy-1', 'matt', { manifestId: undefined as any }),
