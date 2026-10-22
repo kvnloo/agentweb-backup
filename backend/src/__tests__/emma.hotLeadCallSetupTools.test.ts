@@ -278,14 +278,14 @@ describe('provision_hot_lead_call_number', () => {
   it('charges the first month to the org owner even when an admin buys', async () => {
     (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'a', orgId: 'org-a', orgRole: 'admin' });
     fake.queueBuyNumberResult({ numberSid: NEW_SID, phoneNumber: NEW_NUMBER });
-    await run('provision_hot_lead_call_number', { confirm: true }, { userId: 'a' });
+    await withApproval('provision_hot_lead_call_number', { confirm: true }, attended({ userId: 'a' }));
     expect((recordVendorUsage as jest.Mock).mock.calls[0][0].userId).toBe('owner');
   });
   it('falls back to the acting user, loudly, when the org has no owner', async () => {
     delete org.ownerUserId;
     (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'a', orgId: 'org-a', orgRole: 'admin' });
     fake.queueBuyNumberResult({ numberSid: NEW_SID, phoneNumber: NEW_NUMBER });
-    await run('provision_hot_lead_call_number', { confirm: true }, { userId: 'a' });
+    await withApproval('provision_hot_lead_call_number', { confirm: true }, attended({ userId: 'a' }));
     expect((recordVendorUsage as jest.Mock).mock.calls[0][0].userId).toBe('a');
     expect(allLogs()).toContain('has no owner');
   });
