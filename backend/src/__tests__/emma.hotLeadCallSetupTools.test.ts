@@ -275,6 +275,20 @@ describe('provision_hot_lead_call_number', () => {
     });
     expect(allLogs()).not.toContain('4155550123');
   });
+  it('charges the first month to the org owner even when an admin buys', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'a', orgId: 'org-a', orgRole: 'admin' });
+    fake.queueBuyNumberResult({ numberSid: NEW_SID, phoneNumber: NEW_NUMBER });
+    await run('provision_hot_lead_call_number', { confirm: true }, { userId: 'a' });
+    expect((recordVendorUsage as jest.Mock).mock.calls[0][0].userId).toBe('owner');
+  });
+  it('falls back to the acting user, loudly, when the org has no owner', async () => {
+    delete org.ownerUserId;
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'a', orgId: 'org-a', orgRole: 'admin' });
+    fake.queueBuyNumberResult({ numberSid: NEW_SID, phoneNumber: NEW_NUMBER });
+    await run('provision_hot_lead_call_number', { confirm: true }, { userId: 'a' });
+    expect((recordVendorUsage as jest.Mock).mock.calls[0][0].userId).toBe('a');
+    expect(allLogs()).toContain('has no owner');
+  });
   it('omits areaCode when none is given and treats null as omitted', async () => {
     fake.queueBuyNumberResult({ numberSid: NEW_SID, phoneNumber: NEW_NUMBER });
     await provision({ confirm: true, areaCode: null });
