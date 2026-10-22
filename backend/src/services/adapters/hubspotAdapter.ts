@@ -528,7 +528,7 @@ export class HubspotAdapter implements CrmAdapter {
             if (idOutcome.gone.has(p.storedId!)) {
                 console.warn(
                     `[HubspotAdapter] stored contact ${p.storedId} for lead ${p.lead.leadId} ` +
-                    `no longer exists — falling back to upsert-by-email.`,
+                    `was not updated by HubSpot (deleted or merged away) — falling back to upsert-by-email.`,
                 );
                 emailLeads.push(p);
             }

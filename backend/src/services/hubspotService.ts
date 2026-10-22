@@ -2430,7 +2430,7 @@ export class HubSpotService {
     // HubSpot echoed are the only proof an input took effect. undefined = the body had no results array.
     const results = res?.data?.results;
     if (!Array.isArray(results)) return undefined;
-    return results.map((r: any) => String(r?.id)).filter((id: string) => id !== 'undefined');
+    return results.filter((r: any) => r?.id != null).map((r: any) => String(r.id));
   }
 
   /**
