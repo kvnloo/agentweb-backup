@@ -14190,7 +14190,16 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     sessionId: string,
     writeHalts: any[],
   ): Promise<{ manifestId: string; turnMessage: string } | null> {
-    const manifestId = uuidv4();
+    // One packet PER AD ACCOUNT: the Desk groups packets under an account and one Approve All
+    // dispatches a whole packet, so a single iteration that writes to two ad accounts must not
+    // become one packet shown under only the first account.
+    const manifestByAccount = new Map<string, string>();
+    const manifestFor = (r: any): string => {
+      const key = String(r?.metaWriteDispatch?.resolvedAccountId || r?.target?.account_id || r?.metaWriteDispatch?.account_id || 'unknown').replace(/^act_/, '');
+      if (!manifestByAccount.has(key)) manifestByAccount.set(key, uuidv4());
+      return manifestByAccount.get(key)!;
+    };
+    const manifestId = manifestFor(writeHalts[0]);
     // Same default window stage_pending_decision uses for a team decision —
     // one consistent "how long before this goes stale" answer across every
     // producer of this table.
@@ -14218,7 +14227,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           metaWriteManifestDigest: r.metaWriteManifestDigest,
           metaWriteDispatch: r.metaWriteDispatch,
           originSessionId: sessionId,
-          manifestId,
+          manifestId: manifestFor(r),
           expiresAt,
         }),
       ),
@@ -14256,7 +14265,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     // honestly rather than assuming uniformity.
     const manifestIds = [...new Set(staged.map((d) => d.manifestId))];
     const reportedManifestId = manifestIds.length === 1 ? manifestIds[0] : manifestId;
-    if (manifestIds.length > 1) {
+    // More than one manifest is EXPECTED when the batch spans several ad accounts (one packet per
+    // account); it is only suspicious when it exceeds that, i.e. pre-existing idempotent hits.
+    if (manifestIds.length > manifestByAccount.size) {
       // Second-review fix: this genuinely CAN'T be made fully correct
       // without a return-contract change (multiple real manifestIds, no
       // single one actually contains every staged decision) — nothing
@@ -14273,7 +14284,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     return {
       manifestId: reportedManifestId,
       turnMessage:
-        count === 1
+        manifestIds.length > 1
+          ? `These ${count} changes span ${manifestIds.length} ad accounts, so they were queued as ${manifestIds.length} separate packets (one per account) for the assigned approver in the Approval Desk. I'll resume automatically as each is resolved.`
+          : count === 1
           ? `This change needs review before it runs — queued for the assigned approver in the Approval Desk. I'll resume automatically once it's resolved.`
           : `This packet of ${count} change${count === 1 ? '' : 's'} needs review before ${count === 1 ? 'it runs' : 'they run'} — queued for the assigned approver in the Approval Desk. I'll resume automatically once it's resolved.`,
     };
@@ -14612,13 +14625,15 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     let accountCurrency: string | undefined;
     if (accessToken && [...MONEY_KEYS].some((k) => params?.[k] !== undefined)) {
       // Bounded: this runs on the halt path, and a stalled Graph read must not hold the approval card up.
+      let timer: ReturnType<typeof setTimeout> | undefined;
       try {
         accountCurrency = await Promise.race([
           metaService.getAdAccountCurrency(scopeAccountId, accessToken),
-          new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 5000)),
+          new Promise<undefined>((resolve) => { timer = setTimeout(() => resolve(undefined), 5000); }),
         ]);
-      } catch { /* shown as unverified below */ }
+      } catch { /* shown as unverified below */ } finally { if (timer) clearTimeout(timer); }
     }
+    let currencyUnverified = false;
     const money = (value: any, unit: 'major' | 'minor'): string => {
       try {
         // Only Meta's own read-back ("3000") is a numeric string; the writers reject a string
@@ -14626,6 +14641,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         const n = unit === 'minor' && typeof value === 'string' && /^\d+(\.\d+)?$/.test(value) ? Number(value) : value;
         return normalizeMetaMoney(n, accountCurrency, unit).description;
       } catch {
+        currencyUnverified = true;
         return `${String(value)} (${unit} units, currency unverified)`;
       }
     };
@@ -14641,6 +14657,14 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     // A rename is a real change a reviewer must see; on CREATE the name is already in the summary line.
     const changeKeys = ['link_url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'status', 'daily_budget', 'lifetime_budget', 'budget_amount', 'bid_amount', 'spend_cap', 'creative_id', 'placement_assets', 'adset_schedule', 'pacing_type'];
     if (action !== 'CREATE') changeKeys.unshift('name');
+    // Everything else the write will send must be visible too (targeting, start/end time, bid
+    // strategy, …) — a card that lists only a fixed allowlist lets a reviewer approve fields they
+    // never saw. Internal control params (override/confirmation tokens) are not Meta fields.
+    for (const key of Object.keys(params || {})) {
+      if (changeKeys.includes(key) || (action === 'CREATE' && (key === 'name' || key === 'objective'))) continue;
+      if (/token|override|confirm/i.test(key) || ['campaign_id', 'adset_id', 'ad_set_id', 'ad_id', 'account_id'].includes(key)) continue;
+      changeKeys.push(key);
+    }
     for (const key of changeKeys) {
       if (params[key] === undefined) continue;
       contentChanges[key] = params[key];
@@ -14653,6 +14677,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     if (Object.keys(contentChanges).length > 0) {
       target.changes = contentChanges;
       lines.push(`Changes: ${changeDescriptions.join(', ')}.`);
+    }
+    if (currencyUnverified) {
+      lines.push('WARNING: the ad account currency could not be verified, so the amounts above are NOT converted — confirm the real amounts before approving.');
     }
 
     /*

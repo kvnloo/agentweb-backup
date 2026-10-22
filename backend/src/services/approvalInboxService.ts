@@ -676,9 +676,11 @@ export class ApprovalInboxService {
     indexName: string,
     keyName: string,
     keyValue: string,
-    pendingStatus: ApprovalDecisionStatus,
+    pendingStatus: ApprovalDecisionStatus | ApprovalDecisionStatus[],
     limit: number,
   ): Promise<ApprovalDecision[]> {
+    const statuses = Array.isArray(pendingStatus) ? pendingStatus : [pendingStatus];
+    const statusValues = Object.fromEntries(statuses.map((st, i) => [`:s${i}`, st]));
     const matches: ApprovalDecision[] = [];
     let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
     let pages = 0;
@@ -688,9 +690,9 @@ export class ApprovalInboxService {
           TableName: APPROVAL_DECISIONS_TABLE,
           IndexName: indexName,
           KeyConditionExpression: `${keyName} = :keyValue`,
-          FilterExpression: '#status = :pending',
+          FilterExpression: `#status IN (${Object.keys(statusValues).join(', ')})`,
           ExpressionAttributeNames: { '#status': 'status' },
-          ExpressionAttributeValues: { ':keyValue': keyValue, ':pending': pendingStatus },
+          ExpressionAttributeValues: { ':keyValue': keyValue, ...statusValues },
           ScanIndexForward: true,
           Limit: limit,
           ExclusiveStartKey: lastEvaluatedKey,
@@ -713,6 +715,16 @@ export class ApprovalInboxService {
 
   async listPendingForApprover(approver: ApprovalDecisionApprover, limit = 50): Promise<ApprovalDecision[]> {
     return this.listPendingByIndex('ApproverIndex', 'approver', approver, 'pending_team_review', limit);
+  }
+
+  /**
+   * ENG-1853: approved meta_write items that are waiting for Approve All. They are no longer
+   * 'pending_team_review', so without this a reviewer who answered every card and left could not
+   * find the packet again from the queue even though nothing had been dispatched yet.
+   */
+  async listAwaitingDispatchForApprover(approver: ApprovalDecisionApprover, limit = 50): Promise<ApprovalDecision[]> {
+    const found = await this.listPendingByIndex('ApproverIndex', 'approver', approver, ['approved', 'dispatching'], limit);
+    return found.filter((d) => d.gateType === 'meta_write' && d.verdict === 'approve');
   }
 
   async listPendingForCustomer(customerId: string, limit = 50): Promise<ApprovalDecision[]> {

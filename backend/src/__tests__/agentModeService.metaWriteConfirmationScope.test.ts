@@ -378,6 +378,52 @@ describe('buildMetaWriteConfirmation scopes to the resolved ad account', () => {
       }
     });
 
+    it('lists every field the write will send (targeting, start_time, bid_strategy), not just a fixed allowlist', async () => {
+      getCampaignSpy.mockRestore();
+      const adSetSpy = jest.spyOn(metaService, 'getAdSet').mockResolvedValue({ id: 'set_1', name: 'Evening Push', campaign_id: 'camp_1' } as never);
+      const campaignSpy = jest.spyOn(metaService, 'getCampaign').mockResolvedValue({ id: 'camp_1', name: 'Summer Sale' } as never);
+      try {
+        const result: any = await build('AD_SET', 'UPDATE', [undefined, 'set_1', undefined], {
+          targeting: { geo_locations: { countries: ['US'] } },
+          start_time: '2026-11-01T00:00:00+0000',
+          bid_strategy: 'COST_CAP',
+          override_tracking_check: true,
+          budget_confirmation_token: 'secret-token',
+        });
+        expect(result.summary).toContain('targeting → {"geo_locations":{"countries":["US"]}}');
+        expect(result.summary).toContain('start_time → 2026-11-01T00:00:00+0000');
+        expect(result.summary).toContain('bid_strategy → COST_CAP');
+        expect(result.summary).not.toContain('secret-token');
+        expect(result.target.changes.targeting).toEqual({ geo_locations: { countries: ['US'] } });
+      } finally {
+        adSetSpy.mockRestore();
+        campaignSpy.mockRestore();
+      }
+    });
+
+    it('warns loudly when the account currency could not be verified', async () => {
+      currencySpy.mockRejectedValue(new Error('graph down') as never);
+      getCampaignSpy.mockRestore();
+      const campaignSpy = jest.spyOn(metaService, 'getCampaign').mockResolvedValue({ id: 'camp_1', name: 'Summer Sale', daily_budget: '3000' } as never);
+      try {
+        const result: any = await build('CAMPAIGN', 'UPDATE', ['camp_1', undefined, undefined], { daily_budget: 31 });
+        expect(result.summary).toContain('WARNING: the ad account currency could not be verified');
+      } finally {
+        campaignSpy.mockRestore();
+      }
+    });
+
+    it('does not warn when the currency was read', async () => {
+      getCampaignSpy.mockRestore();
+      const campaignSpy = jest.spyOn(metaService, 'getCampaign').mockResolvedValue({ id: 'camp_1', name: 'Summer Sale', daily_budget: '3000' } as never);
+      try {
+        const result: any = await build('CAMPAIGN', 'UPDATE', ['camp_1', undefined, undefined], { daily_budget: 31 });
+        expect(result.summary).not.toContain('WARNING');
+      } finally {
+        campaignSpy.mockRestore();
+      }
+    });
+
     it('shows a rename on UPDATE (name: before → after)', async () => {
       getCampaignSpy.mockRestore();
       const campaignSpy = jest.spyOn(metaService, 'getCampaign').mockResolvedValue({

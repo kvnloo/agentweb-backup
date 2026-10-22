@@ -97,4 +97,25 @@ describe('stageApprovalInboxMetaWriteManifest attaches a real chatUrl', () => {
     expect(req.evidencePacket.researchSummary).toBeUndefined();
     expect(req.businessImpact).toBe('UPDATE campaign "Summer Sale" in ad account act_1.');
   });
+
+  it('queues writes for different ad accounts as separate packets, and same-account writes together', async () => {
+    (approvalInboxService.createDecision as jest.Mock).mockImplementation(async (req: any) => ({
+      ...req, decisionId: req.metaWriteManifestDigest, status: 'pending_team_review',
+    }));
+    const forAccount = (digest: string, account: string) => writeHalt({
+      metaWriteManifestDigest: digest,
+      metaWriteDispatch: { entity_type: 'CAMPAIGN', action: 'UPDATE', account_id: `act_${account}`, resolvedAccountId: `act_${account}`, params: {} },
+      target: { account_id: account },
+    });
+
+    const result = await (service as any).stageApprovalInboxMetaWriteManifest(SESSION_ID, [
+      forAccount('d1', 'ALPHA'), forAccount('d2', 'BETA'), forAccount('d3', 'ALPHA'),
+    ]);
+
+    const calls = (approvalInboxService.createDecision as jest.Mock).mock.calls.map(([r]: any) => r);
+    const byDigest = Object.fromEntries(calls.map((r: any) => [r.metaWriteManifestDigest, r.manifestId]));
+    expect(byDigest.d1).toBe(byDigest.d3);
+    expect(byDigest.d1).not.toBe(byDigest.d2);
+    expect(result.turnMessage).toContain('2 separate packets');
+  });
 });

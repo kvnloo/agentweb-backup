@@ -383,6 +383,21 @@ describe('approvalInboxService.listPendingForApprover / listPendingForCustomer (
     expect(mockDynamoDB.query.mock.calls[1][0].ExclusiveStartKey).toEqual({ decisionId: 'old-2' });
   });
 
+  it('listAwaitingDispatchForApprover returns only approved/dispatching meta_write items and filters on both statuses', async () => {
+    mockDynamoDB.query.mockReturnValueOnce(ok({
+      Items: [
+        { decisionId: 'a', gateType: 'meta_write', verdict: 'approve', status: 'dispatching' },
+        { decisionId: 'b', gateType: 'plan_choice', verdict: 'approve', status: 'approved' },
+        { decisionId: 'c', gateType: 'meta_write', verdict: 'reject', status: 'approved' },
+      ],
+    }));
+    const result = await service.listAwaitingDispatchForApprover('matt');
+    expect(result.map((d: any) => d.decisionId)).toEqual(['a']);
+    const params = mockDynamoDB.query.mock.calls[0][0];
+    expect(params.FilterExpression).toBe('#status IN (:s0, :s1)');
+    expect(params.ExpressionAttributeValues).toMatchObject({ ':keyValue': 'matt', ':s0': 'approved', ':s1': 'dispatching' });
+  });
+
   it('listPendingForCustomer finds a real pending match that sorts past the first page of history', async () => {
     mockDynamoDB.query
       .mockReturnValueOnce(ok({

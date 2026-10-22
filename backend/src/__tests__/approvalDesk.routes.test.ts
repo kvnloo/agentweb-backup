@@ -39,6 +39,7 @@ jest.mock('../services/approverDirectory', () => ({
 jest.mock('../services/approvalInboxService', () => ({
   approvalInboxService: {
     listPendingForApprover: jest.fn(),
+    listAwaitingDispatchForApprover: jest.fn(),
     listByManifest: jest.fn(),
     getDecision: jest.fn(),
     claimDecision: jest.fn(),
@@ -62,6 +63,7 @@ import { agentModeService } from '../services/agentModeService';
 
 const mockGetApproverForEmail = getApproverForEmail as jest.Mock;
 const mockListPendingForApprover = approvalInboxService.listPendingForApprover as jest.Mock;
+const mockListAwaitingDispatch = approvalInboxService.listAwaitingDispatchForApprover as jest.Mock;
 const mockListByManifest = approvalInboxService.listByManifest as jest.Mock;
 const mockGetDecision = approvalInboxService.getDecision as jest.Mock;
 const mockClaimDecision = approvalInboxService.claimDecision as jest.Mock;
@@ -95,6 +97,7 @@ function decisionFor(id: string, approver: string, overrides: Partial<any> = {})
 
 beforeEach(() => {
   jest.clearAllMocks();
+  mockListAwaitingDispatch.mockResolvedValue([]);
   mockGetApproverForEmail.mockImplementation(async (email: string) => (email === 'matt@example.com' ? 'matt' : undefined));
 });
 
@@ -142,6 +145,25 @@ describe('GET /queue', () => {
     const res = await request(app).get('/api/approval-desk/queue').set('Authorization', `Bearer ${mattToken}`);
     expect(res.status).toBe(200);
     expect(res.body.manifests[0].accountLabel).toBe('Ad account 1339414687604223');
+  });
+
+  it('keeps a fully answered packet in the queue until Approve All has dispatched it, and says so', async () => {
+    mockListPendingForApprover.mockResolvedValue([]);
+    mockListAwaitingDispatch.mockResolvedValue([
+      decisionFor('d1', 'matt', { manifestId: 'm1', status: 'dispatching', verdict: 'approve' }),
+      decisionFor('d2', 'matt', { manifestId: 'm1', status: 'dispatching', verdict: 'approve' }),
+    ]);
+    const res = await request(app).get('/api/approval-desk/queue').set('Authorization', `Bearer ${mattToken}`);
+    expect(res.status).toBe(200);
+    expect(res.body.manifests).toHaveLength(1);
+    expect(res.body.manifests[0]).toMatchObject({ manifestId: 'm1', itemCount: 2, pendingCount: 0, readyToDispatchCount: 2 });
+  });
+
+  it('counts pending and ready-to-dispatch items separately within one packet', async () => {
+    mockListPendingForApprover.mockResolvedValue([decisionFor('d1', 'matt', { manifestId: 'm1' })]);
+    mockListAwaitingDispatch.mockResolvedValue([decisionFor('d2', 'matt', { manifestId: 'm1', status: 'dispatching', verdict: 'approve' })]);
+    const res = await request(app).get('/api/approval-desk/queue').set('Authorization', `Bearer ${mattToken}`);
+    expect(res.body.manifests[0]).toMatchObject({ itemCount: 2, pendingCount: 1, readyToDispatchCount: 1 });
   });
 
   it('excludes pre-existing decisions with no manifestId instead of surfacing a dead-end entry (found live on env1)', async () => {

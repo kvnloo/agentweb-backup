@@ -105,7 +105,13 @@ router.get('/queue', authenticateToken, isAdmin, async (req, res) => {
     if (!approver) {
       return res.status(403).json({ success: false, error: 'This login is not a named Approval Desk reviewer (matt/harsha/fangfang).' });
     }
-    const pending = await approvalInboxService.listPendingForApprover(approver);
+    // Pending items PLUS approved-but-undispatched meta_write items, so a packet whose every card
+    // was answered stays reachable until Approve All has run (or it expires).
+    const [pendingItems, awaitingDispatch] = await Promise.all([
+      approvalInboxService.listPendingForApprover(approver),
+      approvalInboxService.listAwaitingDispatchForApprover(approver),
+    ]);
+    const pending = [...pendingItems, ...awaitingDispatch];
     const byManifest = new Map<string, ApprovalDecision[]>();
     for (const decision of pending) {
       // Live-verified on env1 (2026-09-28): real decisions created before
@@ -129,6 +135,9 @@ router.get('/queue', authenticateToken, isAdmin, async (req, res) => {
         // source of truth for a reviewer actually acting on one.
         subjectLabel: decisions[0]?.subjectLabel,
         itemCount: decisions.length,
+        // How many still need an individual answer vs are answered and waiting on Approve All.
+        pendingCount: decisions.filter((d) => d.status === 'pending_team_review').length,
+        readyToDispatchCount: decisions.filter((d) => d.status === 'approved' || d.status === 'dispatching').length,
         // One line per item so a packet row can say WHAT is inside instead of
         // repeating the account name its accordion already shows.
         itemPreviews: decisions.slice(0, 3).map((d) => previewOf(d.businessImpact)),

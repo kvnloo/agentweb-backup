@@ -82,6 +82,9 @@ interface ManifestSummary {
   manifestId: string;
   subjectLabel?: string;
   itemCount: number;
+  // Optional: an older backend does not send these.
+  pendingCount?: number;
+  readyToDispatchCount?: number;
   itemPreviews: string[];
   earliestExpiresAt: string;
   // null for a manifest with no meta_write items (e.g. a pure plan_choice
@@ -111,11 +114,14 @@ function statusColor(decision: ApprovalDecisionView, answered: boolean): 'error'
 // heading, so it keeps its own subject label as the title.
 function ManifestRow({ m, showSubject }: { m: ManifestSummary; showSubject: boolean }) {
   const more = m.itemCount - (m.itemPreviews?.length ?? 0);
+  // Every card answered but Approve All not pressed yet — nothing has been dispatched.
+  const readyToDispatch = (m.pendingCount ?? 1) === 0 && (m.readyToDispatchCount ?? 0) > 0;
   return (
     <Card variant="outlined">
       <CardContent>
         <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" alignItems={{ sm: 'center' }} spacing={1}>
           <Box sx={{ minWidth: 0 }}>
+            {readyToDispatch && <Chip size="small" color="warning" label="Ready to dispatch — not sent yet" sx={{ mb: 0.5 }} />}
             {showSubject && <Typography variant="subtitle1">{m.subjectLabel || m.manifestId}</Typography>}
             {m.itemPreviews?.map((line, i) => (
               <Typography
@@ -132,7 +138,7 @@ function ManifestRow({ m, showSubject }: { m: ManifestSummary; showSubject: bool
             </Typography>
           </Box>
           <Button component={RouterLink} to={`/approval-desk/${encodeURIComponent(m.manifestId)}`} variant="contained">
-            Review
+            {readyToDispatch ? 'Review & dispatch' : 'Review'}
           </Button>
         </Stack>
       </CardContent>
