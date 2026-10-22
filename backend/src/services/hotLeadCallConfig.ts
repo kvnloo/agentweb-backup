@@ -111,6 +111,9 @@ export const HHMM = /^([01]\d|2[0-3]):[0-5]\d$/;
 export const isHhmm = (v: unknown): v is string => typeof v === 'string' && HHMM.test(v);
 const TWILIO_SID = /^PN[0-9a-f]{32}$/;
 
+/** Whether a stored value looks like a Twilio phone-number sid. */
+export const isTwilioNumberSid = (v: unknown): v is string => typeof v === 'string' && TWILIO_SID.test(v);
+
 // Area/Location only: UTC, abbreviations (EST), offsets and Etc/ zones are not a place whose local clock gates
 // calls. Intl folds case and resolves aliases, so we store the name it resolves to.
 export function normalizeTimezone(tz: unknown): string | null {
