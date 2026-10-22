@@ -383,6 +383,27 @@ describe('approvalInboxService.listPendingForApprover / listPendingForCustomer (
     expect(mockDynamoDB.query.mock.calls[1][0].ExclusiveStartKey).toEqual({ decisionId: 'old-2' });
   });
 
+  it('listAwaitingDispatchForApprover filters gate type and verdict server-side, so other approved rows cannot fill the page', async () => {
+    mockDynamoDB.query.mockReturnValueOnce(ok({
+      Items: [{ decisionId: 'a', gateType: 'meta_write', verdict: 'approve', status: 'dispatching' }],
+    }));
+    const result = await service.listAwaitingDispatchForApprover('matt');
+    expect(result.map((d: any) => d.decisionId)).toEqual(['a']);
+    const params = mockDynamoDB.query.mock.calls[0][0];
+    expect(params.FilterExpression).toBe('#status IN (:s0, :s1) AND #gateType = :metaWrite AND #verdict = :approve');
+    expect(params.ExpressionAttributeValues).toMatchObject({ ':keyValue': 'matt', ':s0': 'approved', ':s1': 'dispatching', ':metaWrite': 'meta_write', ':approve': 'approve' });
+    expect(params.ExpressionAttributeNames).toMatchObject({ '#status': 'status', '#gateType': 'gateType', '#verdict': 'verdict' });
+  });
+
+  it('listAwaitingDispatchForApprover keeps paging past pages whose rows the server-side filter removed', async () => {
+    mockDynamoDB.query
+      .mockReturnValueOnce(ok({ Items: [], LastEvaluatedKey: { decisionId: 'old-1' } }))
+      .mockReturnValueOnce(ok({ Items: [{ decisionId: 'new-1', gateType: 'meta_write', verdict: 'approve', status: 'dispatching' }] }));
+    const result = await service.listAwaitingDispatchForApprover('matt');
+    expect(result.map((d: any) => d.decisionId)).toEqual(['new-1']);
+    expect(mockDynamoDB.query).toHaveBeenCalledTimes(2);
+  });
+
   it('listPendingForCustomer finds a real pending match that sorts past the first page of history', async () => {
     mockDynamoDB.query
       .mockReturnValueOnce(ok({
