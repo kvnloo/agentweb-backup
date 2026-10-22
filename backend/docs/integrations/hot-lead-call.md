@@ -440,6 +440,19 @@ calls the tool again with the same arguments and it acts.
 - `ask_user_question` rejects a model-supplied `kind` that starts with
   `hot_lead_call_approval:`, so the model cannot author a card that passes for an
   approval.
+- Accepted decisions:
+  - The reserved-kind guard has one door, `ask_user_question`; no other tool can
+    emit a deck with a model-controlled `kind` today. The `crm_sequence_activation:`
+    prefix is still unreserved (follow-up).
+  - An internal admin can click approve on a customer's card (the deck answer route
+    allows `user.isAdmin`). It is a staff action recorded as `answeredBy: 'user'`
+    without an approver id.
+  - A purchase or release that is refused or fails after the claim (cap, Twilio
+    error, a settings change racing it) still uses up the approval; the user
+    approves again.
+  - When another deck is already awaiting an answer, the card is not persisted:
+    the model is told to stop and the user sees plain text. A typed "yes" then
+    produces another halt, never an action.
 - Not gated: `start_hot_lead_call_verification` (one capped call to a number the
   admin saved) and turning calling on in `update_hot_lead_call_settings`.
 
