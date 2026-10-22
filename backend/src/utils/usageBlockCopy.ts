@@ -75,11 +75,14 @@ const ACTION_TAIL = "Add usage or upgrade your plan to keep working before then.
 
 type PaygCopy = { headline: string; body: string; actionTail: string; undated: string };
 
+// ENG-668: customers see this feature as "Extra usage", never "pay-as-you-go" (matching the portal's
+// `paygCopy.ts`; ENG-2571 already uses "Pay as you go" for something else). Sentence case: "Extra usage"
+// starts a sentence, "extra usage" mid-sentence.
 const PAYG_CAP_REACHED_COPY: PaygCopy = {
-  headline: "You've reached your pay-as-you-go limit",
-  body: "You've used all of the AI usage included in your plan this month and your pay-as-you-go limit.",
-  actionTail: "Raise your pay-as-you-go limit or upgrade your plan to keep working before then.",
-  undated: "AI usage is paused: you've reached your pay-as-you-go limit. Raise the limit or upgrade your plan to keep working.",
+  headline: "You've reached your extra usage limit",
+  body: "You've used all of the AI usage included in your plan this month and your extra usage limit.",
+  actionTail: "Raise your extra usage limit or upgrade your plan to keep working before then.",
+  undated: "AI usage is paused: you've reached your extra usage limit. Raise the limit or upgrade your plan to keep working.",
 };
 
 /**
@@ -92,27 +95,27 @@ const PAYG_CAP_REACHED_COPY: PaygCopy = {
 const PAYG_SUSPENDED_CAUSE: Record<PaygSuspendedReason | "unknown", { cause: string; ownerAction: string; ownerUndatedAction: string }> = {
   payment_failed: {
     cause: "because a recent payment didn't go through",
-    ownerAction: "Pay the open invoice to resume pay-as-you-go.",
+    ownerAction: "Pay the open invoice to resume extra usage.",
     ownerUndatedAction: "Pay the open invoice to resume it.",
   },
   payment_unconfirmed: {
     cause: "because a recent payment is still waiting to be confirmed",
-    ownerAction: "Open the invoice to confirm the payment and resume pay-as-you-go.",
+    ownerAction: "Open the invoice to confirm the payment and resume extra usage.",
     ownerUndatedAction: "Open the invoice to confirm the payment and resume it.",
   },
   dispute: {
     cause: "while a recent payment is under review with your bank",
-    ownerAction: "Please contact us to resume pay-as-you-go.",
+    ownerAction: "Please contact us to resume extra usage.",
     ownerUndatedAction: "Please contact us to resume it.",
   },
   dispute_lost: {
     cause: "following a dispute about a recent payment",
-    ownerAction: "Please contact us to resume pay-as-you-go.",
+    ownerAction: "Please contact us to resume extra usage.",
     ownerUndatedAction: "Please contact us to resume it.",
   },
   unknown: {
     cause: "because of a problem with a recent payment",
-    ownerAction: "Please contact us to resume pay-as-you-go.",
+    ownerAction: "Please contact us to resume extra usage.",
     ownerUndatedAction: "Please contact us to resume it.",
   },
 };
@@ -123,25 +126,25 @@ function paygSuspendedCopy(block: UsageBlockPaygInput): PaygCopy {
   const copy = PAYG_SUSPENDED_CAUSE[why && why in PAYG_SUSPENDED_CAUSE ? why : "unknown"];
   const actionTail = block.paygOwnerResolves ? PAYG_OWNER_RESOLVES : copy.ownerAction;
   return {
-    headline: "Pay-as-you-go is on hold",
-    body: `You've used all of the AI usage included in your plan this month, and pay-as-you-go is on hold ${copy.cause}.`,
+    headline: "Extra usage is on hold",
+    body: `You've used all of the AI usage included in your plan this month, and extra usage is on hold ${copy.cause}.`,
     actionTail,
-    undated: `AI usage is paused: pay-as-you-go is on hold ${copy.cause}. ${block.paygOwnerResolves ? PAYG_OWNER_RESOLVES : copy.ownerUndatedAction}`,
+    undated: `AI usage is paused: extra usage is on hold ${copy.cause}. ${block.paygOwnerResolves ? PAYG_OWNER_RESOLVES : copy.ownerUndatedAction}`,
   };
 }
 
 const PAYG_INACTIVE_COPY: Record<PaygInactiveReason, PaygCopy> = {
   no_payment_method: {
-    headline: "Pay-as-you-go needs a payment method",
-    body: "You've used all of the AI usage included in your plan this month. Pay-as-you-go is on, but there is no payment method on file to cover more.",
-    actionTail: "Add a payment method to keep working with pay-as-you-go.",
-    undated: "AI usage is paused: pay-as-you-go is on, but there is no payment method on file. Add one to keep working.",
+    headline: "Extra usage needs a payment method",
+    body: "You've used all of the AI usage included in your plan this month. Extra usage is on, but there is no payment method on file to cover more.",
+    actionTail: "Add a payment method to keep working with extra usage.",
+    undated: "AI usage is paused: extra usage is on, but there is no payment method on file. Add one to keep working.",
   },
   subscription_inactive: {
-    headline: "Pay-as-you-go needs an active subscription",
-    body: "You've used all of the AI usage included in your plan this month. Pay-as-you-go is on, but it only covers more usage while your subscription is active.",
-    actionTail: "Reactivate your subscription to keep working with pay-as-you-go.",
-    undated: "AI usage is paused: pay-as-you-go only covers more usage while your subscription is active. Reactivate it to keep working.",
+    headline: "Extra usage needs an active subscription",
+    body: "You've used all of the AI usage included in your plan this month. Extra usage is on, but it only covers more usage while your subscription is active.",
+    actionTail: "Reactivate your subscription to keep working with extra usage.",
+    undated: "AI usage is paused: extra usage only covers more usage while your subscription is active. Reactivate it to keep working.",
   },
 };
 

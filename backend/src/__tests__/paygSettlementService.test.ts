@@ -2525,12 +2525,12 @@ describe('ENG-668 rv7 — review cases kept', () => {
       }
       const copy = (b: Record<string, unknown>) => (buildUsageBlock as unknown as (i: unknown) => Record<string, string>)({ month: null, paygBlock: b });
       const lost = copy({ reason: 'payg_suspended', paygSuspendedReason: 'dispute_lost' });
-      expect(lost.message).toBe('AI usage is paused: pay-as-you-go is on hold following a dispute about a recent payment. Please contact us to resume it.');
+      expect(lost.message).toBe('AI usage is paused: extra usage is on hold following a dispute about a recent payment. Please contact us to resume it.');
       const unc = copy({ reason: 'payg_suspended', paygSuspendedReason: 'payment_unconfirmed', openInvoiceUrl: 'https://x' });
       expect(unc.message).toContain('still waiting to be confirmed');
       expect(unc.openInvoiceUrl).toBe('https://x');
       const member = copy({ reason: 'payg_suspended', paygSuspendedReason: 'payment_failed', paygOwnerResolves: true });
-      expect(member.message).toBe("AI usage is paused: pay-as-you-go is on hold because a recent payment didn't go through. Your organization owner can resolve this.");
+      expect(member.message).toBe("AI usage is paused: extra usage is on hold because a recent payment didn't go through. Your organization owner can resolve this.");
       const dated = (buildUsageBlock as unknown as (i: unknown) => Record<string, string>)({ month: '2026-10', paygBlock: { reason: 'payg_suspended', paygSuspendedReason: 'dispute', paygOwnerResolves: true } });
       expect(dated.message).toMatch(/Your organization owner can resolve this\.$/);
       expect(dated.body).toContain('under review with your bank');
