@@ -218,6 +218,21 @@ describe("mutual TLS between the backend and the login host", () => {
     expect(Object.keys(logged[0].fields).sort()).toEqual(["cn", "reason"]);
   });
 
+  it("host.drain is a unix-socket-only operator route: over the network it answers exactly like an unknown route and changes nothing", async () => {
+    await boot();
+    const r = await new Promise<{ status: number; body: string }>((resolve) => {
+      const req = httpsRequest({ host: "127.0.0.1", port, method: "POST", path: "/v1/host.drain", ...backend, ca: server.ca, agent: false, headers: { "content-type": "application/json" } }, (res) => {
+        let body = "";
+        res.on("data", (d) => (body += d));
+        res.on("end", () => resolve({ status: res.statusCode ?? 0, body }));
+      });
+      req.end(JSON.stringify({ mode: "strict" }));
+    });
+    expect(r.status).toBe(404);
+    expect(JSON.parse(r.body)).toEqual({ error: "EINVALID", detail: "route" });
+    expect(rig.mgr.hostStatus().drain).toBe("off"); // the protected ACTION did not happen, not just the error
+  });
+
   it("only TLS 1.3 is spoken (a 1.2-only client cannot connect)", async () => {
     await boot();
     const res = await new Promise<string>((resolve) => {

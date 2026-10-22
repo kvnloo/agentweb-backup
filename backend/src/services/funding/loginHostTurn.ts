@@ -1,7 +1,8 @@
 /**
  * ENG-2110 PR 1c-i: runs ONE turn on the login host the way the host's contract requires.
  *
- *  - `EBUSY` (host or connection full) is retried with jittered backoff until `busyWaitMs` runs out.
+ *  - `EBUSY` (host or connection full, or draining for a deploy) and a connection that was never established (the worker is restarting) are
+ *    retried with jittered backoff until `busyWaitMs` runs out. Neither admitted anything, so a deploy never fails a turn that was only starting.
  *  - The turn lease (host default 30 s) is renewed on a timer. A renew the host cannot answer twice in a
  *    row ends the turn here; "turn not found" / "stale epoch" mean it is already over or fenced, so the
  *    timer just stops.
@@ -26,7 +27,7 @@ export interface HostTurnOptions {
   signal?: AbortSignal;
   /** Called for each event as it arrives (nothing is buffered). A throw interrupts the turn, drops the stream and propagates. */
   onEvent?: (event: ProviderEvent) => void | Promise<void>;
-  /** How long to keep retrying EBUSY. Default 20 s. */
+  /** How long to keep retrying EBUSY / a worker that is restarting. Default 40 s (a deploy's restart window is well inside it). */
   busyWaitMs?: number;
   /** Default 10 s; after the first renew it follows the host's `leaseMs / 3`. */
   renewEveryMs?: number;
@@ -47,7 +48,7 @@ const realSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(reso
 async function admit(client: LoginHostClient, req: RouteInput<"turn.run">, opts: HostTurnOptions): Promise<TurnStream> {
   const sleep = opts.sleep ?? realSleep;
   const random = opts.random ?? Math.random;
-  const deadline = Date.now() + (opts.busyWaitMs ?? 20_000);
+  const deadline = Date.now() + (opts.busyWaitMs ?? 40_000);
   let delay = BUSY_BASE_MS;
   let probed = false;
   for (;;) {
@@ -56,7 +57,8 @@ async function admit(client: LoginHostClient, req: RouteInput<"turn.run">, opts:
       return await client.turnRun(req);
     } catch (err) {
       if (!(err instanceof LoginHostError)) throw err;
-      if (err.busy) {
+      // `busy`: the host is full or draining for a deploy. `notSent`: it is restarting (a deploy swaps the build in seconds). Neither admitted anything.
+      if (err.busy || err.notSent) {
         if (Date.now() + delay > deadline) throw err;
         await sleep(delay * (0.5 + random() / 2));
         delay = Math.min(delay * 2, BUSY_MAX_MS);

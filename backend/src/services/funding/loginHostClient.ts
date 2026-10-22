@@ -32,6 +32,16 @@ export class LoginHostError extends Error {
   get busy(): boolean {
     return this.code === "EBUSY";
   }
+  /**
+   * The request provably never reached the host: the connection was refused or unroutable, or never got established in time. This is what a
+   * caller sees during a worker restart, and it is always safe to repeat (nothing was admitted), unlike a reset or a timeout AFTER connecting.
+   * Certificate failures are NOT in here: they will not fix themselves in a few seconds.
+   */
+  get notSent(): boolean {
+    if (this.code === "TIMEOUT") return this.detail === "connect";
+    return this.code === "UNREACHABLE" && (this.detail === "ECONNREFUSED" || this.detail === "EHOSTUNREACH" || this.detail === "ENETUNREACH" || this.detail === "ENOENT");
+    // (ECONNRESET is deliberately not here: it can come after the request was sent.)
+  }
   /** The call may or may not have reached the host (no usable answer). */
   get ambiguous(): boolean {
     return this.code === "UNREACHABLE" || this.code === "TIMEOUT" || this.code === "BAD_RESPONSE";
