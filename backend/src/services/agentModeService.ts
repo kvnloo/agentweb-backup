@@ -338,6 +338,18 @@ const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
  * files, not decoration — change it in both or in neither.
  */
 export const SKILL_UNRESOLVED_MARKER = "Could not resolve these skill IDs to any known skill";
+
+const SKILL_ID_WITH_NAME_SUFFIX = /^\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\s*-\s+\S.*$/is;
+
+/**
+ * ENG-2612: strip a trailing "- <Skill Name>" the model copied from the catalog listing.
+ * Only a full UUID followed by "- <text>" is rewritten, so the result is exactly the id the
+ * model meant; entitlement is still decided by the normal lookup on that bare UUID.
+ */
+export function normalizeSkillIdArg(id: string): string {
+  const m = SKILL_ID_WITH_NAME_SUFFIX.exec(id);
+  return m ? m[1] : id;
+}
 /*
  * The skill exists and the account is entitled to it, but nothing is installable behind it
  * right now — in practice an `__other_skills__` bundle whose unassociated-tool pool is empty.
@@ -7179,6 +7191,8 @@ export class AgentModeService {
       if (!Array.isArray(skillIds) || skillIds.length === 0 || skillIds.some((id) => typeof id !== 'string')) {
         return { success: false, message: "skillIds must be a non-empty array of skill IDs." };
       }
+      // ENG-2612: models copy the catalog display line ("<uuid>- Skill Name") as the id.
+      skillIds = [...new Set(skillIds.map(normalizeSkillIdArg))];
 
       const availableSkills = await this.getSkillsForDisplay([], userId);
       const availableById = new Map(availableSkills.map(skill => [skill.skillId, skill]));
