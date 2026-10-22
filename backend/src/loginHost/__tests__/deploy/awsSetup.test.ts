@@ -99,7 +99,7 @@ case "$1 $2" in
   "sts get-caller-identity") echo 992382574572 ;;
   "iam list-open-id-connect-providers") echo "" ;;
   "iam get-role") exit 254 ;;
-  "kms describe-key") if [ -f "${dir}/key-created" ]; then echo arn:aws:kms:us-west-2:992382574572:key/1234abcd-12ab-34cd-56ef-1234567890ab; else exit 254; fi ;;
+  "kms describe-key") if [ -f "${dir}/key-created" ]; then echo arn:aws:kms:us-west-2:992382574572:key/1234abcd-12ab-34cd-56ef-1234567890ab; else echo "An error occurred (NotFoundException) when calling the DescribeKey operation: Alias is not found" >&2; exit 254; fi ;;
   "kms create-key") touch "${dir}/key-created"; echo 1234abcd-12ab-34cd-56ef-1234567890ab ;;
   "kms get-public-key") cat "${dir}/pub.der.b64" ;;
   "ssm describe-document") exit 254 ;;
@@ -125,7 +125,7 @@ exit 0
   };
   const run = (...args: string[]) => {
     if (!args.some((a) => a === "--none")) fakeGhDefault();
-    return spawnSync("bash", [SETUP, ...args.filter((a) => a !== "--none")], { encoding: "utf8", env: { PATH: process.env.PATH ?? "", AW_AWS: join(dir, "aws"), AW_GH: join(dir, "gh"), AW_SETUP_OUT: out } });
+    return spawnSync("bash", [SETUP, ...args.filter((a) => a !== "--none")], { encoding: "utf8", env: { PATH: process.env.PATH ?? "", AW_AWS: join(dir, "aws"), AW_GH: join(dir, "gh"), AW_SETUP_OUT: out, ...(process.env.AW_SETUP_RETRY_SLEEP ? { AW_SETUP_RETRY_SLEEP: process.env.AW_SETUP_RETRY_SLEEP } : {}) } });
   };
   let fakeGhDefault = () => fakeGh("good");
   const calls = () => readFileSync(join(dir, "calls"), "utf8").split("\n").filter(Boolean);
@@ -218,6 +218,84 @@ exit 0
       "ssm delete-document --name AW-LoginHost-Deploy-Signed --document-version 2",
     ]);
     expect(c.some((x) => x.startsWith("kms create-key") || x.startsWith("iam create-role") || x.startsWith("ssm create-document"))).toBe(false); // nothing is created twice
+  });
+
+  const reRunAws = (extra: string) => `#!/bin/bash
+echo "$*" >> "${dir}/calls"
+case "$1 $2" in
+  "sts get-caller-identity") echo 992382574572 ;;
+  "iam list-open-id-connect-providers") echo "arn:aws:iam::992382574572:oidc-provider/token.actions.githubusercontent.com" ;;
+  "iam get-role") exit 0 ;;
+  "kms describe-key") echo arn:aws:kms:us-west-2:992382574572:key/1234abcd-12ab-34cd-56ef-1234567890ab ;;
+  "kms get-public-key") cat "${dir}/pub.der.b64" ;;
+  "ssm describe-document") exit 0 ;;
+  "ssm list-document-versions") echo "1	2" ;;
+${extra}
+esac
+exit 0
+`;
+
+  it("re-run with an IDENTICAL document already installed: no update (AWS would reject a duplicate), the matching version becomes the default, every other version is deleted", () => {
+    mkdirOut();
+    // first pass only to learn the document this script would render, then serve exactly that as version 2
+    run("--apply");
+    const rendered = readFileSync(join(out, "doc.json"), "utf8");
+    writeFileSync(join(dir, "doc.v2.json"), rendered);
+    writeFileSync(join(dir, "calls"), "");
+    writeFileSync(join(dir, "aws"), reRunAws(`  "ssm get-document") if echo "$*" | grep -q "document-version 2"; then cat "${dir}/doc.v2.json"; else echo '{"old":"body"}'; fi ;;`));
+    chmodSync(join(dir, "aws"), 0o755);
+    const r = run("--apply");
+    expect(r.status).toBe(0);
+    const c = calls();
+    expect(c.some((x) => x.startsWith("ssm update-document --name"))).toBe(false);
+    expect(c).toContain("ssm update-document-default-version --name AW-LoginHost-Deploy-Signed --document-version 2");
+    expect(c.filter((x) => x.startsWith("ssm delete-document"))).toEqual(["ssm delete-document --name AW-LoginHost-Deploy-Signed --document-version 1"]);
+  });
+
+  it("a failed key lookup (access denied, throttling) stops the script: it must never be read as 'no key' and create a second one", () => {
+    mkdirOut();
+    writeFileSync(join(dir, "aws"), `#!/bin/bash\necho "$*" >> "${dir}/calls"\ncase "$1 $2" in\n  "sts get-caller-identity") echo 992382574572 ;;\n  "iam list-open-id-connect-providers") echo x ;;\n  "iam get-role") exit 0 ;;\n  "kms describe-key") echo "An error occurred (AccessDeniedException) when calling DescribeKey" >&2; exit 254 ;;\nesac\nexit 0\n`);
+    chmodSync(join(dir, "aws"), 0o755);
+    const r = run("--apply");
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("could not look up the signing key");
+    expect(calls().some((x) => x.startsWith("kms create-key"))).toBe(false);
+  });
+
+  it("creating the key right after the role: IAM propagation errors are retried, other errors are not", () => {
+    mkdirOut();
+    writeFileSync(join(dir, "n"), "0");
+    const awsBody = (err: string) => `#!/bin/bash
+echo "$*" >> "${dir}/calls"
+case "$1 $2" in
+  "sts get-caller-identity") echo 992382574572 ;;
+  "iam list-open-id-connect-providers") echo "arn:aws:iam::992382574572:oidc-provider/token.actions.githubusercontent.com" ;;
+  "iam get-role") exit 254 ;;
+  "kms describe-key") if [ -f "${dir}/key-created" ]; then echo arn:aws:kms:us-west-2:992382574572:key/1234abcd; else echo "An error occurred (NotFoundException)" >&2; exit 254; fi ;;
+  "kms create-key") n=$(cat "${dir}/n"); echo $((n+1)) > "${dir}/n"; if [ "$n" -lt 2 ]; then echo "${err}" >&2; exit 254; fi; touch "${dir}/key-created"; echo 1234abcd ;;
+  "kms get-public-key") cat "${dir}/pub.der.b64" ;;
+  "ssm describe-document") exit 254 ;;
+esac
+exit 0
+`;
+    writeFileSync(join(dir, "aws"), awsBody("An error occurred (MalformedPolicyDocumentException): Invalid principal"));
+    chmodSync(join(dir, "aws"), 0o755);
+    process.env.AW_SETUP_RETRY_SLEEP = "0";
+    try {
+      const r = run("--apply");
+      expect(r.status).toBe(0);
+      expect(calls().filter((x) => x.startsWith("kms create-key"))).toHaveLength(3); // two propagation errors, then success
+      expect(calls().some((x) => x.startsWith("iam wait role-exists"))).toBe(true);
+      // any other error is not retried
+      writeFileSync(join(dir, "n"), "0");
+      writeFileSync(join(dir, "calls"), "");
+      rmSync(join(dir, "key-created"), { force: true });
+      writeFileSync(join(dir, "aws"), awsBody("An error occurred (LimitExceededException)"));
+      expect(run("--apply").status).toBe(1);
+      expect(calls().filter((x) => x.startsWith("kms create-key"))).toHaveLength(1);
+    } finally {
+      delete process.env.AW_SETUP_RETRY_SLEEP;
+    }
   });
 
   it("refuses to run when it cannot tell which account it is in, and rejects unknown arguments", () => {

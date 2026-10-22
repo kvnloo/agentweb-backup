@@ -41,7 +41,7 @@ function render({ publicKeyPem, bucket, script = readFileSync(SCRIPT, "utf8"), w
     description: "ENG-2110: deploy a signed login-host build to the prod worker. Verifies the pipeline's signature, then runs the build's deploy.sh (idle gate, health check, rollback). Source: backend/src/loginHost/deploy/prod/ssm-run.sh in the repo.",
     parameters: {
       BuildKey: { type: "String", description: "S3 key of the signed build", allowedPattern: "^prod/builds/login-host-[0-9a-f]{12}\\.tar\\.gz$" },
-      MaxWait: { type: "String", description: "Seconds the deploy may wait for the host to be idle", default: "1800", allowedPattern: "^[0-9]{1,4}$" },
+      MaxWait: { type: "String", description: "Seconds the deploy may wait for the host to be idle", default: "1800", allowedPattern: "^(0|[1-9][0-9]{0,3})$" },
     },
     mainSteps: [{ action: "aws:runShellScript", name: "deploy", inputs: { timeoutSeconds: "14400", runCommand: body.split("\n") } }],
   };

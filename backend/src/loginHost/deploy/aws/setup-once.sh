@@ -92,7 +92,16 @@ else
 fi
 
 # (3) the signing key: created with a policy that lets only the CI role sign (the role must exist first: a key policy cannot name a principal that does not)
-KEY_ARN=$("$AWS" kms describe-key --key-id "$KEY_ALIAS" --query KeyMetadata.Arn --output text 2>/dev/null || true)
+# Only "no such key" means create one. Any other failure (access denied, throttling) must stop the script: treating it as "no key" would create a SECOND key.
+KEY_ERR=$(mktemp)
+if KEY_ARN=$("$AWS" kms describe-key --key-id "$KEY_ALIAS" --query KeyMetadata.Arn --output text 2>"$KEY_ERR"); then :; else
+  if grep -q -E 'NotFoundException|not found|does not exist' "$KEY_ERR"; then KEY_ARN=""; else
+    echo "setup-once: could not look up the signing key ($(head -c 300 "$KEY_ERR")); nothing was created" >&2
+    rm -f "$KEY_ERR"
+    exit 1
+  fi
+fi
+rm -f "$KEY_ERR"
 render "$HERE/policies/kms-key-policy.json.tpl" "$OUT/kms-policy.json"
 if [ -n "$KEY_ARN" ] && [ "$KEY_ARN" != None ]; then
   say "the signing key exists: $KEY_ARN"
@@ -101,7 +110,16 @@ else
   say "create the signing key (ECC_NIST_P256, sign/verify only), with the policy that lets only the CI role sign"
   printf '    + %s\n' "$AWS kms create-key --key-spec ECC_NIST_P256 --key-usage SIGN_VERIFY --policy file://$OUT/kms-policy.json --description <...>" "$AWS kms create-alias --alias-name $KEY_ALIAS --target-key-id <the new key's id>"
   if [ "$APPLY" = 1 ]; then
-    KEY_ID=$("$AWS" kms create-key --key-spec ECC_NIST_P256 --key-usage SIGN_VERIFY --policy "file://$OUT/kms-policy.json" --description "ENG-2110: signs login-host builds; only the deploy pipeline may use it" --query KeyMetadata.KeyId --output text)
+    # The key policy names the role, which IAM may not have propagated yet: wait for it, and retry a few times.
+    "$AWS" iam wait role-exists --role-name "$CI_ROLE"
+    KEY_ID=""
+    for attempt in 1 2 3 4 5 6; do
+      if KEY_ID=$("$AWS" kms create-key --key-spec ECC_NIST_P256 --key-usage SIGN_VERIFY --policy "file://$OUT/kms-policy.json" --description "ENG-2110: signs login-host builds; only the deploy pipeline may use it" --query KeyMetadata.KeyId --output text 2>"$OUT/create-key.err"); then break; fi
+      grep -q MalformedPolicyDocument "$OUT/create-key.err" || { cat "$OUT/create-key.err" >&2; exit 1; }
+      say "IAM has not propagated the role yet (attempt $attempt); waiting"
+      sleep "${AW_SETUP_RETRY_SLEEP:-10}"
+    done
+    [ -n "$KEY_ID" ] || { echo "setup-once: the key could not be created (see above)" >&2; exit 1; }
     "$AWS" kms create-alias --alias-name "$KEY_ALIAS" --target-key-id "$KEY_ID"
     KEY_ARN=$("$AWS" kms describe-key --key-id "$KEY_ALIAS" --query KeyMetadata.Arn --output text)
   else
@@ -121,9 +139,21 @@ if [ "$APPLY" = 1 ]; then
   openssl pkey -pubin -inform DER -in "$OUT/signer.pub.der" -out "$OUT/signer.pub.pem"
   node "$HERE/render-ssm-doc.js" --public-key "$OUT/signer.pub.pem" --bucket "$BUCKET" >"$OUT/doc.json"
   if "$AWS" ssm describe-document --name "$DOCUMENT" >/dev/null 2>&1; then
-    ver=$("$AWS" ssm update-document --name "$DOCUMENT" --document-format JSON --document-version '$LATEST' --content "file://$OUT/doc.json" --query DocumentDescription.DocumentVersion --output text)
+    # Re-runnable: an identical document is not an error (AWS refuses a duplicate update), and the default version and the clean-up always end up right.
+    ver=""
+    for v in $("$AWS" ssm list-document-versions --name "$DOCUMENT" --query 'DocumentVersions[].DocumentVersion' --output text); do
+      have=$("$AWS" ssm get-document --name "$DOCUMENT" --document-version "$v" --query Content --output text | python3 -c 'import json,sys; print(json.dumps(json.loads(sys.stdin.read()), indent=2, sort_keys=False))' | sha256sum | cut -d' ' -f1 || true)
+      want_norm=$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), indent=2, sort_keys=False))' "$OUT/doc.json" | sha256sum | cut -d' ' -f1)
+      [ "$have" != "$want_norm" ] || ver=$v
+    done
+    if [ -z "$ver" ]; then
+      ver=$("$AWS" ssm update-document --name "$DOCUMENT" --document-format JSON --document-version '$LATEST' --content "file://$OUT/doc.json" --query DocumentDescription.DocumentVersion --output text)
+      say "updated the document $DOCUMENT to version $ver"
+    else
+      say "the document $DOCUMENT already has exactly this content (version $ver)"
+    fi
     "$AWS" ssm update-document-default-version --name "$DOCUMENT" --document-version "$ver" >/dev/null
-    say "updated the document $DOCUMENT to version $ver (default)"
+    say "version $ver is the default"
     # Older versions stay callable by number (`--document-version N`), so remove them: only the version rendered just now may ever run.
     for old in $("$AWS" ssm list-document-versions --name "$DOCUMENT" --query 'DocumentVersions[].DocumentVersion' --output text); do
       [ "$old" = "$ver" ] || "$AWS" ssm delete-document --name "$DOCUMENT" --document-version "$old" >/dev/null

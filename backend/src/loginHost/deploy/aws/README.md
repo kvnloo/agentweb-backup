@@ -8,10 +8,13 @@ involved, and no customer is cut off. This folder is everything the person with 
 ```
 merge to main (changes host CODE: backend/src/loginHost/** except tests and docs, the build/sign scripts, the lockfile, this workflow)
   -> .github/workflows/login-host-deploy.yml  (runs only if the repo variable LOGIN_HOST_DEPLOY_ENABLED is 'true'; environment `login-host-prod`, main only)
-       job 1 build        scripts/build-login-host.sh   gate tests, clean tree, lockfile check. Runs npm. NO cloud credentials.
-       job 2 deploy       checks the build against THIS commit (the scripts that will run as root must be the reviewed files; commit, run id, tests passed),
-                          then KMS-signs it, uploads to s3://agentweb-login-host-992382574572/prod/builds/<build>.tar.gz(+.sig), and runs the SSM document
-                          AW-LoginHost-Deploy-Signed on i-033394e5467b48e94 (.github/scripts/login-host-run-deploy.sh). Runs no npm.
+       job 1 test         the gate tests (runs every dev dependency's code). Produces nothing that is signed. NO cloud credentials.
+       job 2 build        npm ci --ignore-scripts, esbuild, lockfile check, packaging; no jest. NO cloud credentials. Uploads the tarball.
+       job 3 verify       parses the untrusted tarball and checks it against THIS commit (the scripts that will run as root must be the reviewed files;
+                          commit, run id, tests ran in the test job, clean tree). NO cloud credentials. Outputs the tarball's sha256.
+       job 4 deploy       has the credentials, parses nothing, runs no npm: re-fetches the artifact BY ID, checks the sha256, KMS-signs, uploads to
+                          s3://agentweb-login-host-992382574572/prod/builds/<build>.tar.gz(+.sig), runs the SSM document AW-LoginHost-Deploy-Signed on
+                          i-033394e5467b48e94 (.github/scripts/login-host-run-deploy.sh).
   -> on the worker, as root (prod/ssm-run.sh, the document body):
        verify the signature BEFORE unpacking; only plain files and directories; then the build's prod/deploy.sh:
          prepare (downloads, packages, node, claude: harmless to the running host)
@@ -52,14 +55,17 @@ environment; one KMS key (`alias/aw-login-host-signing`, ECC_NIST_P256, sign/ver
 `prod/builds/*` for the worker's instance role; and the SSM document `AW-LoginHost-Deploy-Signed`, rendered from `prod/ssm-run.sh` with the key's public half.
 The policies are the files in `policies/`; tests pin their exact actions and resources.
 
-Not verified from here (no IAM read access): whether the account already has the GitHub OIDC provider, whether a document of that name exists (a document with the new name is created or updated), and whether `iam create-open-id-connect-provider` still wants an explicit
+Not verified from here (no IAM read access; the next three are things the rehearsal on the worker will show): whether the bucket uses default SSE-S3 (then nothing more is needed) or SSE-KMS with a customer key (then the CI role also needs `kms:GenerateDataKey` and the worker `kms:Decrypt`); whether `ssm:GetCommandInvocation` can be scoped to a resource (it is `*` today, so the CI role can read any command output in the account: accepted); whether `can_admins_bypass` on the environment applies to deployment branch policies. Also not verified: whether the account already has the GitHub OIDC provider, whether a document of that name exists (a document with the new name is created or updated), and whether `iam create-open-id-connect-provider` still wants an explicit
 `--thumbprint-list` on the installed CLI (GitHub's providers are validated by AWS's trusted CAs now; if the CLI insists, add GitHub's published thumbprint).
 
 Then set the repository variable `LOGIN_HOST_DEPLOY_ENABLED` to `true` (Settings -> Secrets and variables -> Actions -> Variables; until it is `true` the workflow runs nothing at all) and run the workflow once by hand (Actions -> Login host deploy -> Run workflow) and watch it. The first run formats the data disk, so do it when nobody
 is using the worker. Until `/etc/aw-login-host/bridge-url` exists on the worker (decided with the turn path) the install stops with exit 3 and the workflow fails with
 "bridge url missing": that is expected, and nothing is started.
 
-## Step 3: tidy (optional)
+## Step 3: tidy (optional, recommended)
+
+- Add an S3 lifecycle rule that expires objects under `prod/builds/` after ~30 days: every signed build stays callable otherwise, and the worker's no-downgrade mark (a state file) is the only
+  thing that stops an old one being replayed by someone who can call SendCommand.
 
 - The temporary policy `AWLoginWorkerProvisionTemp` can go.
 - The earlier hand-run document `AW-LoginHost-Deploy-Prod` (it took a sha256 typed by a person, with no signature) is NOT used and NOT reachable by the pipeline: this setup creates a

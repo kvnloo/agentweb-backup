@@ -64,6 +64,15 @@ wait
 rm -f "$WORK/inv-error"
 AW_AWS="$WORK/aws" INSTANCE_ID=i-123 bash "$SCRIPT" prod/builds/login-host-0123456789ab.tar.gz "1800; reboot" >/dev/null 2>&1; [ $? = 1 ] && ok "refuses a bad max wait" || bad "max wait"
 AW_AWS="$WORK/aws" INSTANCE_ID=i-123 bash "$SCRIPT" prod/builds/login-host-0123456789ab.tar.gz 3001 >/dev/null 2>&1; [ $? = 1 ] && ok "refuses a max wait over 3000 s" || bad "max wait cap"
+for v in 0800 0900 0700 00 01; do
+  out=$(AW_AWS="$WORK/aws" INSTANCE_ID=i-123 bash "$SCRIPT" prod/builds/login-host-0123456789ab.tar.gz "$v" 2>&1); rc=$?
+  if [ "$rc" = 1 ] && grep -q "without leading zeros" <<<"$out"; then ok "refuses a max wait with a leading zero ($v): bash would read it as octal"; else bad "leading zero $v (rc=$rc)"; fi
+done
+printf '75\n75\n75\n' >"$WORK/rcs"; : >"$WORK/calls"
+AW_AWS="$WORK/aws" INSTANCE_ID=i-123 POLL=0 RETRY_PAUSE=0 RETRIES=3 AW_BUDGET_SEC=100 bash "$SCRIPT" prod/builds/login-host-0123456789ab.tar.gz 600 >"$WORK/out" 2>&1; rc=$?
+[ "$rc" = 75 ] && [ "$(sends)" = 1 ] && ok "no further attempt is started that could outlive the AWS credentials" || bad "budget (rc=$rc sends=$(sends))"
+printf '0\n' >"$WORK/rcs"; : >"$WORK/calls"
+if AW_AWS="$WORK/aws" INSTANCE_ID=i-123 POLL=0 RETRY_PAUSE=0 bash "$SCRIPT" prod/builds/login-host-0123456789ab.tar.gz 0 >/dev/null 2>&1; then ok "a max wait of 0 is allowed"; else bad "zero wait"; fi
 AW_AWS="$WORK/aws" INSTANCE_ID=i-123 bash "$SCRIPT" "prod/builds/../x" 60 >/dev/null 2>&1; [ $? = 1 ] && ok "refuses a bad build key" || bad "key"
 [ "$(run 137)" = 1 ] && ok "an unknown exit code is a failure" || bad "unknown"
 bash -n "$SCRIPT" && ok "parses" || bad "parse"

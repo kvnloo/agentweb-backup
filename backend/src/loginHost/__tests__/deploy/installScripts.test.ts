@@ -622,6 +622,21 @@ case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${
     expect(text(join(pkg, "MANIFEST"))).toMatch(/^build_seq=/m); // deploy.sh's no-downgrade rule reads this (empty for a hand-made build, the run number in CI)
   });
 
+  describe("the build script's two pipeline modes", () => {
+    it("--tests-run-elsewhere packages WITHOUT running jest and says so in the MANIFEST (the signing job insists on exactly this value); the pipeline's run id becomes the build number", () => {
+      const out = join(root, "out-elsewhere");
+      const t0 = Date.now();
+      const b = spawnSync("bash", [SCRIPTS["build-login-host.sh"], "--out", out, "--tests-run-elsewhere", "--allow-dirty"], { cwd: BACKEND, encoding: "utf8", timeout: 200_000, env: { ...process.env, GITHUB_RUN_ID: "4242" } });
+      expect(b.status).toBe(0);
+      expect(b.stdout + b.stderr).not.toContain("running the gate tests");
+      const tgz = readdirSync(out).find((f) => f.endsWith(".tar.gz"))!;
+      const manifest = spawnSync("tar", ["-xzOf", join(out, tgz), "--wildcards", "*/MANIFEST"], { encoding: "utf8" }).stdout;
+      expect(manifest).toMatch(/^tests=separate-job$/m);
+      expect(manifest).toMatch(/^build_seq=4242$/m);
+      expect(Date.now() - t0).toBeLessThan(150_000);
+    });
+  });
+
   describe("install.sh pieces the zero-interruption deploy relies on", () => {
     const nextSecond = () => void spawnSync("sleep", ["1.2"]);
 

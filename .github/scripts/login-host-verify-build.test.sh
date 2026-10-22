@@ -24,7 +24,7 @@ mkpkg() { # mkpkg <dir>: a good package laid out like the real build
   cp "$D/aw-env.slice.example" "$d/$NAME/files/aw-env.slice.template"
   cp "$P/host-config.template.json" "$P/system-prompt.txt" "$d/$NAME/files/"
   echo "// bundle" >"$d/$NAME/dist/loginHost/host/start.js"; echo "// c" >"$d/$NAME/check-config.js"; echo "// d" >"$d/$NAME/deployctl.js"
-  printf 'name=%s\ngit_sha=%s\ndirty=\nallow_dirty=0\ntests=passed\nlockfile_check=ok\nbuild_seq=%s\n' "$NAME" "$SHA" "$RUN" >"$d/$NAME/MANIFEST"
+  printf 'name=%s\ngit_sha=%s\ndirty=\nallow_dirty=0\ntests=separate-job\nlockfile_check=ok\nbuild_seq=%s\n' "$NAME" "$SHA" "$RUN" >"$d/$NAME/MANIFEST"
 }
 pack() { (cd "$1" && tar -czf "$2" "$NAME"); }
 verify() { GITHUB_SHA=$SHA GITHUB_RUN_ID=$RUN AW_REPO_ROOT="$ROOT" bash "$SCRIPT" "$1" >"$WORK/out" 2>&1; }
@@ -46,10 +46,17 @@ mkpkg "$WORK/p"; ln -s /etc/passwd "$WORK/p/$NAME/link"; pack "$WORK/p" "$WORK/$
 mkpkg "$WORK/p"; sed -i "s/^git_sha=.*/git_sha=ffffffffffffffffffffffffffffffffffffffff/" "$WORK/p/$NAME/MANIFEST"; pack "$WORK/p" "$WORK/$NAME.tar.gz"; expect_fail "a MANIFEST for another commit is refused" "git_sha"
 mkpkg "$WORK/p"; sed -i "s/^build_seq=.*/build_seq=99999999999999999999/" "$WORK/p/$NAME/MANIFEST"; pack "$WORK/p" "$WORK/$NAME.tar.gz"; expect_fail "a build number the build job chose is refused" "build_seq"
 mkpkg "$WORK/p"; sed -i "s/^build_seq=.*/build_seq=/" "$WORK/p/$NAME/MANIFEST"; pack "$WORK/p" "$WORK/$NAME.tar.gz"; expect_fail "an empty build number is refused" "build_seq"
-mkpkg "$WORK/p"; sed -i "s/^tests=.*/tests=SKIPPED (--skip-tests)/" "$WORK/p/$NAME/MANIFEST"; pack "$WORK/p" "$WORK/$NAME.tar.gz"; expect_fail "a build whose tests were skipped is refused" "tests did not pass"
+mkpkg "$WORK/p"; sed -i "s/^tests=.*/tests=passed/" "$WORK/p/$NAME/MANIFEST"; pack "$WORK/p" "$WORK/$NAME.tar.gz"; expect_fail "tests run inside the packaging job (not the separate job) are refused" "separate test job"
+mkpkg "$WORK/p"; sed -i "s/^tests=.*/tests=SKIPPED (--skip-tests)/" "$WORK/p/$NAME/MANIFEST"; pack "$WORK/p" "$WORK/$NAME.tar.gz"; expect_fail "a build whose tests were skipped is refused" "separate test job"
 mkpkg "$WORK/p"; sed -i "s/^allow_dirty=.*/allow_dirty=1/" "$WORK/p/$NAME/MANIFEST"; pack "$WORK/p" "$WORK/$NAME.tar.gz"; expect_fail "a --allow-dirty build is refused" "allow-dirty"
 mkpkg "$WORK/p"; sed -i "s/^dirty=.*/dirty=yes/" "$WORK/p/$NAME/MANIFEST"; pack "$WORK/p" "$WORK/$NAME.tar.gz"; expect_fail "a dirty-tree build is refused" "dirty"
 mkpkg "$WORK/p"; sed -i "s/^lockfile_check=.*/lockfile_check=MISMATCH/" "$WORK/p/$NAME/MANIFEST"; pack "$WORK/p" "$WORK/$NAME.tar.gz"; expect_fail "a lockfile mismatch is refused" "lockfile"
+mkpkg "$WORK/p"; ln "$WORK/p/$NAME/deploy.sh" "$WORK/p/$NAME/hard.sh"; pack "$WORK/p" "$WORK/$NAME.tar.gz"; expect_fail "a hard link is refused" "not a plain file"
+mkpkg "$WORK/p"; mkfifo "$WORK/p/$NAME/fifo"; pack "$WORK/p" "$WORK/$NAME.tar.gz"; expect_fail "a fifo is refused" "not a plain file"
+mkpkg "$WORK/p"; printf x >"$WORK/p/$NAME/$(printf 'deploy.sh\nMANIFEST')"; pack "$WORK/p" "$WORK/$NAME.tar.gz"; expect_fail "a file name containing a newline is refused" "unusual characters"
+mkpkg "$WORK/p"; printf x >"$WORK/p/$NAME/spa ce"; pack "$WORK/p" "$WORK/$NAME.tar.gz"; expect_fail "a file name with a space is refused" "unusual characters"
+mkpkg "$WORK/p"; sed -i 's/$/\r/' "$WORK/p/$NAME/MANIFEST"; pack "$WORK/p" "$WORK/$NAME.tar.gz"; expect_fail "a CRLF MANIFEST is refused" "carriage returns"
+mkpkg "$WORK/p"; (cd "$WORK/p" && tar -czf "$WORK/$NAME.tar.gz" --transform "s,^$NAME/install.sh,$NAME/../install.sh," "$NAME"); expect_fail "a parent-directory path in the archive is refused" "unsafe path"
 mkpkg "$WORK/p"; mv "$WORK/p/$NAME" "$WORK/p/login-host-aaaaaaaaaaaa"; (cd "$WORK/p" && tar -czf "$WORK/$NAME.tar.gz" login-host-aaaaaaaaaaaa); expect_fail "an archive with another top directory is refused" "outside"
 mkpkg "$WORK/p"; pack "$WORK/p" "$WORK/other-name.tar.gz"
 verify "$WORK/other-name.tar.gz" && bad "a wrongly named tarball was accepted" || { grep -q "expected" "$WORK/out" && ok "a wrongly named tarball is refused" || bad "wrong name: $(tail -1 "$WORK/out")"; }

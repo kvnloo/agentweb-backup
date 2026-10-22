@@ -18,8 +18,8 @@ set -euo pipefail
 
 KEY=${1:?usage: login-host-run-deploy.sh <BuildKey> [max-wait-seconds]}
 MAX_WAIT=${2:-1800}
-if ! [[ "$MAX_WAIT" =~ ^[0-9]{1,4}$ ]] || [ "$MAX_WAIT" -gt 3000 ]; then
-  echo "::error::max wait must be digits only, at most 3000 seconds"
+if ! [[ "$MAX_WAIT" =~ ^(0|[1-9][0-9]{0,3})$ ]] || [ "$MAX_WAIT" -gt 3000 ]; then
+  echo "::error::max wait must be a whole number of seconds without leading zeros, at most 3000"
   exit 1
 fi
 [[ "$KEY" =~ ^prod/builds/login-host-[0-9a-f]{12}\.tar\.gz$ ]] || { echo "::error::unexpected build key"; exit 1; }
@@ -35,6 +35,9 @@ if [[ "$POLL" =~ ^[1-9][0-9]*$ ]]; then LIMIT_POLLS=${LIMIT_POLLS:-$(((MAX_WAIT 
 summary() { [ -z "${GITHUB_STEP_SUMMARY:-}" ] || printf '%s\n' "$*" >>"$GITHUB_STEP_SUMMARY"; }
 annotate() { printf '::%s::%s\n' "$1" "$2"; }
 
+# The AWS session lasts 4 h: never START another attempt that could run past 3.5 h (an attempt is at most MAX_WAIT + 40 minutes of work, plus the pause).
+BUDGET=${AW_BUDGET_SEC:-12600}
+START=$SECONDS
 errfile=$(mktemp)
 trap 'rm -f "$errfile"' EXIT
 errors=0
@@ -89,7 +92,7 @@ while :; do
       exit 24
       ;;
     75)
-      if [ "$attempt" -ge "$RETRIES" ]; then
+      if [ "$attempt" -ge "$RETRIES" ] || [ $((SECONDS - START + PAUSE + MAX_WAIT + 2400)) -gt "$BUDGET" ]; then
         annotate error "NOT DEPLOYED: the worker stayed busy for $attempt attempts. Nothing was changed. Re-run this workflow later (it waits for an idle moment again)."
         summary "NOT deployed: the worker was busy for the whole window. Nothing changed. Re-run later."
         exit 75

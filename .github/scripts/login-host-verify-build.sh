@@ -6,7 +6,9 @@
 # The build job runs npm (every dependency, install scripts disabled but test code and esbuild still run) and has no cloud credentials. This job has the
 # credentials and runs no npm. Whatever the build job hands over is untrusted until proven otherwise, so before anything is signed:
 #   - the name, MANIFEST git sha and MANIFEST build number must be THIS run's commit and run id (the number deploy.sh orders builds by);
-#   - the MANIFEST must say the gate tests passed on a clean tree with a matching lockfile (a hand-made --skip-tests/--allow-dirty build is never signed);
+#   - the MANIFEST must say the gate tests ran in the pipeline's SEPARATE test job (tests=separate-job; the signing job only runs after that job succeeded) on a clean
+#     tree with a matching lockfile (a hand-made --skip-tests/--allow-dirty build is never signed). Running jest in the same job that packages the tarball would let
+#     any dev dependency rewrite the tarball afterwards, which is why the pipeline does not;
 #   - the scripts that run as root on the worker (install.sh, deploy.sh, lib.sh, versions.env, the wrapper scripts, units, config template) must be
 #     byte-for-byte the files in THIS checkout, which is what the reviewed merge contains;
 #   - nothing else may be in the archive except the two esbuild bundles, the dist/ directory and the MANIFEST. Only the bundle itself remains trusted to the
@@ -30,6 +32,8 @@ while IFS= read -r line; do
   case "${line:0:1}" in - | d) ;; *) fail "the archive has an entry that is not a plain file or directory" ;; esac
 done <<<"$LIST_V"
 while IFS= read -r entry; do
+  # (plain names only: tar escapes a newline or control character in a name, which shows up as a backslash and is refused here)
+  [[ "$entry" =~ ^[A-Za-z0-9._@/-]+$ ]] || fail "the archive has an entry with unusual characters in its name"
   case "$entry" in
     /* | *..*) fail "the archive has an unsafe path" ;;
     "$NAME" | "$NAME"/*) ;;
@@ -46,13 +50,14 @@ PKG="$WORK/$NAME"
 # The MANIFEST.
 M="$PKG/MANIFEST"
 [ -f "$M" ] || fail "no MANIFEST"
+grep -q $'\r' "$M" && fail "the MANIFEST has carriage returns"
 val() { sed -n "s/^$1=//p" "$M" | head -n1; }
 [ "$(val name)" = "$NAME" ] || fail "MANIFEST name is '$(val name)'"
 [ "$(val git_sha)" = "$GITHUB_SHA" ] || fail "MANIFEST git_sha is '$(val git_sha)', this run is $GITHUB_SHA"
 [ "$(val build_seq)" = "$GITHUB_RUN_ID" ] || fail "MANIFEST build_seq is '$(val build_seq)', this run id is $GITHUB_RUN_ID"
 [ -z "$(val dirty)" ] || fail "MANIFEST says the tree was dirty"
 [ "$(val allow_dirty)" = 0 ] || fail "MANIFEST says --allow-dirty was used"
-[ "$(val tests)" = passed ] || fail "MANIFEST says the gate tests did not pass ('$(val tests)')"
+[ "$(val tests)" = separate-job ] || fail "MANIFEST says the gate tests were not run by the pipeline's separate test job ('$(val tests)')"
 [ "$(val lockfile_check)" = ok ] || fail "MANIFEST says the lockfile check did not pass ('$(val lockfile_check)')"
 
 # The root-run scripts and templates, against this checkout.
@@ -68,13 +73,14 @@ for rel in "${!SRC[@]}"; do
 done
 
 # Nothing else.
-while IFS= read -r f; do
+while IFS= read -r -d '' f; do
   rel=${f#"$PKG"/}
+  [[ "$rel" =~ ^[A-Za-z0-9._@/-]+$ ]] || fail "a file in the build has unusual characters in its name"
   case "$rel" in
     MANIFEST | check-config.js | deployctl.js | dist/loginHost/host/start.js) ;;
     *) [ -n "${SRC[$rel]:-}" ] || fail "unexpected file in the build: $rel" ;;
   esac
-done < <(find "$PKG" -type f)
+done < <(find "$PKG" -type f -print0)
 [ -z "$(find "$PKG" ! -type f ! -type d)" ] || fail "the build contains something that is not a plain file or directory"
 
 echo "login-host-verify-build: $NAME matches commit $GITHUB_SHA, run $GITHUB_RUN_ID, and the reviewed scripts"

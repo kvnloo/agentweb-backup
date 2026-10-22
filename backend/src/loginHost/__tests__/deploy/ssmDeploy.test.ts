@@ -261,7 +261,7 @@ describe("ssm-run.sh (the deploy document's body)", () => {
       const re = new RegExp(render(ok).parameters.BuildKey.allowedPattern);
       expect(re.test(v)).toBe(false);
     });
-    it.each(["1800'; reboot; '", "1800\nreboot", "1800 ", "$(reboot)", "-1", ""])("the document's MaxWait pattern rejects %j", (v) => {
+    it.each(["1800'; reboot; '", "1800\nreboot", "1800 ", "$(reboot)", "-1", "", "0800", "00"])("the document's MaxWait pattern rejects %j", (v) => {
       expect(new RegExp(render(ok).parameters.MaxWait.allowedPattern).test(v)).toBe(false);
     });
     it("and accepts the real values", () => {
@@ -270,7 +270,7 @@ describe("ssm-run.sh (the deploy document's body)", () => {
       expect(new RegExp(doc.parameters.MaxWait.allowedPattern).test("1800")).toBe(true);
     });
 
-    it.each(["", "abc", "1800; reboot", "-1", "12345", "3001"])("MaxWait %j", (v) => {
+    it.each(["", "abc", "1800; reboot", "-1", "12345", "3001", "0800", "0900", "00"])("MaxWait %j", (v) => {
       const { root, name } = makePackage();
       signFile(tarUp(root, name));
       const r = runDoc({ MaxWait: v });
@@ -288,7 +288,7 @@ describe("render-ssm-doc.js", () => {
   it("renders a document that constrains both parameters and carries the public key, never a private one", () => {
     const doc = render(ok);
     expect(doc.parameters.BuildKey.allowedPattern).toBe("^prod/builds/login-host-[0-9a-f]{12}\\.tar\\.gz$");
-    expect(doc.parameters.MaxWait.allowedPattern).toBe("^[0-9]{1,4}$");
+    expect(doc.parameters.MaxWait.allowedPattern).toBe("^(0|[1-9][0-9]{0,3})$");
     const script = doc.mainSteps[0].inputs.runCommand.join("\n");
     expect(script).toContain("BEGIN PUBLIC KEY");
     expect(script).not.toContain("PRIVATE KEY");

@@ -50,22 +50,59 @@ describe("login-host-deploy.yml path filter", () => {
     for (const f of [".github/workflows/login-host-deploy.yml", ".github/scripts/login-host-run-deploy.sh", "backend/scripts/build-login-host.sh", "backend/scripts/sign-login-host.sh", "backend/package-lock.json"]) expect(p).toContain(f);
   });
 
-  it("the deploy job runs no npm and the build job holds no cloud credentials", () => {
-    const code = WORKFLOW.split("\n").filter((l) => !l.trim().startsWith("#")).join("\n"); // comments may mention npm
-    const [build, deploy] = code.split(/\n {2}deploy:\n/);
-    expect(build).not.toMatch(/id-token:\s*write/);
-    expect(build).not.toMatch(/configure-aws-credentials|role-to-assume/);
-    expect(build).toContain("npm ci --ignore-scripts");
-    expect(deploy).toMatch(/id-token:\s*write/);
-    expect(deploy).not.toMatch(/\bnpm\b|\bnpx\b/);
-    expect(deploy).toContain("environment: login-host-prod");
+  /** The jobs of the workflow, comments removed. */
+  const jobsOf = () => {
+    const code = WORKFLOW.split("\n").filter((l) => !l.trim().startsWith("#")).join("\n");
+    const body = code.slice(code.indexOf("\njobs:\n"));
+    const parts = body.split(/\n {2}([a-z]+):\n/); // ["", "test", text, "build", text, ...]
+    const out: Record<string, string> = {};
+    for (let i = 1; i < parts.length; i += 2) out[parts[i]] = parts[i + 1];
+    return out;
+  };
+
+  it("four jobs, each trusting less than the next: only the last holds cloud credentials, and it runs no npm and parses no archive", () => {
+    const j = jobsOf();
+    expect(Object.keys(j)).toEqual(["test", "build", "verify", "deploy"]);
+    for (const name of ["test", "build", "verify"]) {
+      expect({ name, idToken: /id-token:\s*write/.test(j[name]) }).toEqual({ name, idToken: false });
+      expect({ name, creds: /configure-aws-credentials|role-to-assume/.test(j[name]) }).toEqual({ name, creds: false });
+      expect({ name, env: /environment:/.test(j[name]) }).toEqual({ name, env: false });
+    }
+    // test and build install without lifecycle scripts; the tests run ONLY in the test job and packaging ONLY in the build job
+    expect(j.test).toContain("npm ci --ignore-scripts");
+    expect(j.build).toContain("npm ci --ignore-scripts");
+    expect(j.test).toContain("--tests-only");
+    expect(j.build).toContain("--tests-run-elsewhere");
+    expect(j.build).not.toMatch(/jest|--tests-only/);
+    expect(j.test).not.toMatch(/upload-artifact/); // the job that runs dev-dependency code produces nothing that gets signed
+    // verify has no npm either; deploy has the credentials, the environment, and no npm/tar parsing
+    expect(j.verify).not.toMatch(/\bnpm\b|\bnpx\b/);
+    expect(j.deploy).toMatch(/id-token:\s*write/);
+    expect(j.deploy).toContain("environment: login-host-prod");
+    expect(j.deploy).not.toMatch(/\bnpm\b|\bnpx\b|\btar\s+-|login-host-verify-build/); // (it never unpacks an archive)
     expect(WORKFLOW).not.toMatch(/pull_request/);
-    // both jobs: only from main AND only once someone has switched the pipeline on (so a merge before the one-time setup runs nothing at all)
-    expect(WORKFLOW.match(/if: github\.ref == 'refs\/heads\/main' && vars\.LOGIN_HOST_DEPLOY_ENABLED == 'true'/g)).toHaveLength(2);
-    // nothing is signed before the build is checked against this commit, and credentials come after the check
-    const iVerify = deploy.indexOf("login-host-verify-build.sh");
-    expect(iVerify).toBeGreaterThan(0);
-    expect(iVerify).toBeLessThan(deploy.indexOf("configure-aws-credentials"));
-    expect(deploy.indexOf("configure-aws-credentials")).toBeLessThan(deploy.indexOf("sign-login-host.sh \"$tar_file\""));
+  });
+
+  it("the chain: verify needs test and build; deploy needs all three; artifacts are fetched BY ID, never by name, and the signed file must be the verified one", () => {
+    const j = jobsOf();
+    expect(j.verify).toMatch(/needs: \[test, build\]/);
+    expect(j.deploy).toMatch(/needs: \[test, build, verify\]/);
+    for (const name of ["verify", "deploy"]) {
+      expect(j[name]).toContain("artifact-ids: ${{ needs.build.outputs.artifact_id }}");
+      expect(j[name]).not.toMatch(/download-artifact[\s\S]{0,120}\n\s+name:/);
+    }
+    expect(j.deploy).toContain("needs.verify.outputs.sha256");
+    // the comparison itself is there and fails the job on a mismatch (not just the variable's name)
+    expect(j.deploy).toMatch(/sha256sum "\$\{found\[0\]\}" \| cut -d' ' -f1\)" = "\$VERIFIED_SHA256" \] \|\| \{ echo "::error::[^"]*"; exit 1; \}/);
+    // nothing is signed before the sha256 check, and credentials come after it
+    const d = j.deploy;
+    expect(d.indexOf("VERIFIED_SHA256")).toBeGreaterThan(0);
+    expect(d.indexOf("VERIFIED_SHA256")).toBeLessThan(d.indexOf("configure-aws-credentials"));
+    expect(d.indexOf("configure-aws-credentials")).toBeLessThan(d.indexOf('sign-login-host.sh "$TAR"'));
+  });
+
+  it("every job runs only from main AND only once someone has switched the pipeline on (so a merge before the one-time setup runs nothing at all)", () => {
+    const j = jobsOf();
+    for (const name of Object.keys(j)) expect({ name, gated: j[name].includes("if: github.ref == 'refs/heads/main' && vars.LOGIN_HOST_DEPLOY_ENABLED == 'true'") }).toEqual({ name, gated: true });
   });
 });

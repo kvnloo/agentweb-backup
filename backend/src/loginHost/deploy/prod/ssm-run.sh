@@ -42,7 +42,7 @@ die() { echo "aw-deploy: REFUSED: $*" >&2; exit 20; }
 
 [[ "$BUILD_KEY" =~ ^prod/builds/(login-host-[0-9a-f]{12})\.tar\.gz$ ]] || die "BuildKey is not prod/builds/login-host-<12 hex>.tar.gz"
 NAME=${BASH_REMATCH[1]}
-[[ "$MAX_WAIT" =~ ^[0-9]{1,4}$ ]] && [ "$MAX_WAIT" -le 3000 ] || die "MaxWait is not a number of seconds between 0 and 3000"
+[[ "$MAX_WAIT" =~ ^(0|[1-9][0-9]{0,3})$ ]] && [ "$MAX_WAIT" -le 3000 ] || die "MaxWait is not a number of seconds between 0 and 3000"
 
 WORK=$(mktemp -d "$WORK_BASE/aw-deploy.XXXXXX") # mode 0700, fresh, root-owned, never predictable or shared
 
