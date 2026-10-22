@@ -62,7 +62,7 @@ const num = (args: string[], flag: string, dflt: number): number => {
 async function main(argv: string[]): Promise<number> {
   const [socket, cmd, ...rest] = argv;
   if (!socket || !cmd) {
-    console.error("usage: deployctl.js <socket> acquire|release|health|info [...]");
+    console.error("usage: deployctl.js <socket> acquire|release|health|info [...] (run by deploy.sh; see deploy/prod/README.md)");
     return 2;
   }
   const log = (line: string) => console.log(`deploy: ${line}`);
