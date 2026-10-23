@@ -675,9 +675,10 @@ export function modelUnavailableBody(err: ModelUnavailableError, audience: Model
 
 /**
  * ENG-2641: errors raised AFTER the turn's user message was stored in the chat. A send is refused before anything is
- * stored almost everywhere; these are the exceptions: generateSessionResponse's Work Plan step-model refusal (the
- * message is saved first, then the step's model is resolved) and a /verified-generate refusal on a later attempt (the
- * first attempt saved the starting message). Marked where they are raised, read where the refusal is answered.
+ * stored almost everywhere; the exceptions are generateSessionResponse's Work Plan step-model refusal (the message is
+ * saved first, then the step's model is resolved) and a /verified-generate refusal after an earlier attempt saved the
+ * starting message. generateSessionResponse marks every error it raises after its save; runVerifiedChatInner marks a
+ * refusal that follows a saved attempt. Read where the refusal is answered.
  */
 const errorsAfterUserMessageSaved = new WeakSet<object>();
 
@@ -5026,8 +5027,9 @@ async function runVerifiedChatInner(
   console.log('AgentMode runVerifiedChat: Received attachments:', attachmentsArray.length, attachmentsArray);
 
   let attempt = 0;
-  // ENG-2641: true once an attempt's generateSessionResponse returned, i.e. the starting message is in the chat. A model
-  // refusal after that (a later attempt) is answered as one whose message was already stored.
+  // ENG-2641: true once any attempt saved the starting message (its generateSessionResponse returned, or failed after
+  // the save, e.g. a transient worker error that is retried). A model refusal after that is answered as one whose
+  // message was already stored, even when the refusing attempt itself stopped before its own save.
   let startingMessageSaved = false;
   // ENG-947: attempts spent specifically on the publish requirement — the first
   // attempt that ended with a publish tool as the ONLY outstanding requirement,
@@ -6105,6 +6107,7 @@ async function runVerifiedChatInner(
 
     } catch (error) {
       console.error(`Run verified chat attempt ${attempt} failed:`, error);
+      if (wasRaisedAfterUserMessageSaved(error)) startingMessageSaved = true;
       // ENG-669 PR-C: a refused model (the stored AgentWeb Model selection with the switch off or unavailable for the
       // owner, or a selection outside the plan) is never retried; it is saved to the chat (once per error) so the owner
       // sees why, and every caller (Slack, revisions, human-eval) gets it to present as a refusal, not an outage.
@@ -9555,9 +9558,29 @@ function modelSourceAfter(
   return modelSourceAfterStamp(session, model, explicitPick, canonicalModelId);
 }
 
+/** ENG-2641: what one generateSessionResponse turn has done so far, for the errors it raises. */
+interface SessionTurnState {
+  /** The turn's user message is in the chat (saved by this turn, or an already-saved dangling directive reused). */
+  userMessageSaved: boolean;
+}
+type SessionTurnArgs = Parameters<typeof runSessionTurn> extends [SessionTurnState, ...infer Rest] ? Rest : never;
+
 // Common function to generate AI response for a session
 // Always uses worker process to prevent blocking the main event loop
-export async function generateSessionResponse(
+export async function generateSessionResponse(...args: SessionTurnArgs): ReturnType<typeof runSessionTurn> {
+  const turn: SessionTurnState = { userMessageSaved: false };
+  try {
+    return await runSessionTurn(turn, ...args);
+  } catch (error) {
+    // ENG-2641: any error raised once the user message is in the chat (e.g. the Work Plan step-model refusal, or a
+    // worker failure a /verified-generate retry follows) is marked, so a refusal answered for it says it was stored.
+    if (turn.userMessageSaved) markRaisedAfterUserMessageSaved(error);
+    throw error;
+  }
+}
+
+async function runSessionTurn(
+  turn: SessionTurnState,
   sessionId: string,
   userMessage: string,
   userId: string,
@@ -9943,6 +9966,7 @@ export async function generateSessionResponse(
   } else {
     console.log('AgentMode generateSessionResponse: reusing an already-dangling auto-continuation directive — skipped a redundant duplicate');
   }
+  turn.userMessageSaved = true;
 
   // Get updated session with the new user message
   const updatedSession = await chatbotDb.getChatSession(sessionId);
@@ -9963,8 +9987,6 @@ export async function generateSessionResponse(
     if (isModelUnavailableError(stepModelError) && stepModelError.reason === 'not_in_plan') {
       await recordModelRefusal(sessionId, stepModelError, isInteractiveShare ? 'share_viewer' : 'owner');
     }
-    // ENG-2641: the HTTP callers answer this refusal with userMessageSaved: true (the client must not resend it).
-    markRaisedAfterUserMessageSaved(stepModelError);
     throw stepModelError;
   }
   if (stepModelTurn.kind === 'unavailable') {
