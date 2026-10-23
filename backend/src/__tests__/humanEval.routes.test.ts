@@ -204,6 +204,14 @@ describe('POST /api/human-eval/candidates — session ownership (ENG-2651)', () 
     expect(mockCreateCandidate).not.toHaveBeenCalled();
   });
 
+  it('answers an oversized sessionId 404 without reading it (DynamoDB would reject the key with a 500)', async () => {
+    const res = await request(app).post('/api/human-eval/candidates').send({ ...body, sessionId: 'x'.repeat(4000) });
+
+    expect(res.status).toBe(404);
+    expect(mockGetChatSessionRecord).not.toHaveBeenCalled();
+    expect(mockCreateCandidate).not.toHaveBeenCalled();
+  });
+
   it('rejects a non-string sessionId with 400 instead of silently dropping it', async () => {
     const res = await request(app).post('/api/human-eval/candidates').send({ ...body, sessionId: { $ne: null } });
 

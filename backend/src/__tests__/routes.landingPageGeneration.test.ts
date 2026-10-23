@@ -310,6 +310,27 @@ describe("POST /api/landing-pages/v0/generate — originating_session_id ownersh
     expect(generateOpts().originatingSessionId).toBeUndefined();
   });
 
+  it("drops an oversized id without reading it (DynamoDB would reject the key with a 500)", async () => {
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", lead_list_id: "list-1", originating_session_id: "x".repeat(4000) });
+
+    expect(res.status).toBe(201);
+    expect(mockGetChatSessionRecord).not.toHaveBeenCalled();
+    expect(generateOpts().originatingSessionId).toBeUndefined();
+  });
+
+  it("drops the id instead of failing the generation when the session read fails", async () => {
+    mockGetChatSessionRecord.mockRejectedValue(new Error("ProvisionedThroughputExceededException"));
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", lead_list_id: "list-1", originating_session_id: "own-session" });
+
+    expect(res.status).toBe(201);
+    expect(generateOpts().originatingSessionId).toBeUndefined();
+  });
+
   it("keeps the caller's own session", async () => {
     mockGetChatSessionRecord.mockResolvedValue({ sessionId: "own-session", userId: "test-user-id" });
 
