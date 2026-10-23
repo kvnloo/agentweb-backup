@@ -124,36 +124,56 @@ describe('stageApprovalInboxMetaWriteManifest attaches a real chatUrl', () => {
     expect(result.turnMessage).toContain('2 separate packets');
   });
 
+  const flush = () => new Promise((r) => setImmediate(r));
+  const pending = (over: any = {}) => async (req: any) => ({ ...req, decisionId: req.metaWriteManifestDigest, status: 'pending_team_review', createdAt: new Date().toISOString(), ...over });
+  const forAccount = (digest: string, account: string) => writeHalt({
+    metaWriteManifestDigest: digest,
+    metaWriteDispatch: { entity_type: 'CAMPAIGN', action: 'UPDATE', account_id: `act_${account}`, resolvedAccountId: `act_${account}`, params: {} },
+    target: { account_id: account },
+  });
+
   it('pings the assigned reviewer once per packet (not per item) and per account', async () => {
-    (approvalInboxService.createDecision as jest.Mock).mockImplementation(async (req: any) => ({
-      ...req, decisionId: req.metaWriteManifestDigest, status: 'pending_team_review',
-    }));
-    const forAccount = (digest: string, account: string) => writeHalt({
-      metaWriteManifestDigest: digest,
-      metaWriteDispatch: { entity_type: 'CAMPAIGN', action: 'UPDATE', account_id: `act_${account}`, resolvedAccountId: `act_${account}`, params: {} },
-      target: { account_id: account },
-    });
-    await (service as any).stageApprovalInboxMetaWriteManifest(SESSION_ID, [forAccount('d1', 'ALPHA'), forAccount('d2', 'ALPHA'), forAccount('d3', 'BETA')]);
+    (approvalInboxService.createDecision as jest.Mock).mockImplementation(pending());
+    await (service as any).stageApprovalInboxMetaWriteManifest(SESSION_ID, [forAccount('d1', '111'), forAccount('d2', '111'), forAccount('d3', '222')]);
+    await flush();
     const calls = (postManifestReadyNotice as jest.Mock).mock.calls.map(([approver, packet]: any) => ({ approver, n: packet.itemCount, acct: packet.accountLabel }));
     expect(calls).toHaveLength(2);
     expect(calls).toEqual(expect.arrayContaining([
-      { approver: 'matt', n: 2, acct: 'ad account ALPHA' },
-      { approver: 'matt', n: 1, acct: 'ad account BETA' },
+      { approver: 'matt', n: 2, acct: 'ad account 111' },
+      { approver: 'matt', n: 1, acct: 'ad account 222' },
     ]));
   });
 
-  it('does not ping for decisions that are not pending, and a Slack failure never breaks staging', async () => {
-    (approvalInboxService.createDecision as jest.Mock).mockImplementation(async (req: any) => ({
-      ...req, decisionId: req.metaWriteManifestDigest, status: 'executed',
-    }));
+  it('does not ping for non-pending decisions, nor re-ping a retried iteration that hit an already-staged (old) row', async () => {
+    (approvalInboxService.createDecision as jest.Mock).mockImplementation(pending({ status: 'executed' }));
     await (service as any).stageApprovalInboxMetaWriteManifest(SESSION_ID, [writeHalt()]);
+    await flush();
     expect(postManifestReadyNotice).not.toHaveBeenCalled();
 
-    (approvalInboxService.createDecision as jest.Mock).mockImplementation(async (req: any) => ({
-      ...req, decisionId: req.metaWriteManifestDigest, status: 'pending_team_review',
-    }));
-    (postManifestReadyNotice as jest.Mock).mockRejectedValue(new Error('slack down'));
+    (approvalInboxService.createDecision as jest.Mock).mockImplementation(pending({ createdAt: new Date(Date.now() - 10 * 60_000).toISOString() }));
+    await (service as any).stageApprovalInboxMetaWriteManifest(SESSION_ID, [writeHalt()]);
+    await flush();
+    expect(postManifestReadyNotice).not.toHaveBeenCalled();
+  });
+
+  it('never puts a non-numeric account id (a possible mention/link injection) into the Slack text', async () => {
+    (approvalInboxService.createDecision as jest.Mock).mockImplementation(pending());
+    await (service as any).stageApprovalInboxMetaWriteManifest(SESSION_ID, [forAccount('d1', '<!channel>')]);
+    await flush();
+    expect((postManifestReadyNotice as jest.Mock).mock.calls[0][1].accountLabel).toBeUndefined();
+  });
+
+  it('does not wait for Slack: staging returns while the reminder is still in flight, and a Slack failure never breaks it', async () => {
+    (approvalInboxService.createDecision as jest.Mock).mockImplementation(pending());
+    let release: () => void = () => undefined;
+    (postManifestReadyNotice as jest.Mock).mockImplementation(() => new Promise<void>((resolve) => { release = resolve; }));
     const result = await (service as any).stageApprovalInboxMetaWriteManifest(SESSION_ID, [writeHalt()]);
     expect(result.manifestId).toBeTruthy();
+    release();
+
+    (postManifestReadyNotice as jest.Mock).mockRejectedValue(new Error('slack down'));
+    const again = await (service as any).stageApprovalInboxMetaWriteManifest(SESSION_ID, [writeHalt({ metaWriteManifestDigest: 'digest-9' })]);
+    await flush();
+    expect(again.manifestId).toBeTruthy();
   });
 });

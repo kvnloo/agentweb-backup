@@ -18,6 +18,7 @@ jest.mock('../services/settingsService', () => ({
 
 jest.mock('../services/approverDirectory', () => ({
   getApproverChannel: jest.fn(),
+  getApproverReminderChannel: jest.fn(),
   getApproverSlackUserId: jest.fn(),
   getFallbackApproverSlackUserIds: jest.fn(),
 }));
@@ -31,7 +32,7 @@ jest.mock('../services/approvalInboxExecution', () => ({
 }));
 
 import { settingsService } from '../services/settingsService';
-import { getApproverChannel, getApproverSlackUserId, getFallbackApproverSlackUserIds } from '../services/approverDirectory';
+import { getApproverChannel, getApproverReminderChannel, getApproverSlackUserId, getFallbackApproverSlackUserIds } from '../services/approverDirectory';
 import { approvalInboxService } from '../services/approvalInboxService';
 import { executeResolvedDecision } from '../services/approvalInboxExecution';
 
@@ -44,6 +45,7 @@ import * as approvalInboxSlack from '../services/approvalInboxSlack';
 const mockGetSetting = settingsService.getSetting as jest.Mock;
 const mockSetSetting = settingsService.setSetting as jest.Mock;
 const mockGetApproverChannel = getApproverChannel as jest.Mock;
+const mockGetReminderChannel = getApproverReminderChannel as jest.Mock;
 const mockGetApproverSlackUserId = getApproverSlackUserId as jest.Mock;
 const mockGetFallback = getFallbackApproverSlackUserIds as jest.Mock;
 const mockListPending = approvalInboxService.listPendingForApprover as jest.Mock;
@@ -56,6 +58,7 @@ describe('approvalInboxSlack', () => {
     process.env.SLACK_BOT_TOKEN = 'xoxb-test';
     mockGetSetting.mockResolvedValue(null);
     mockGetApproverChannel.mockResolvedValue('C-MATT');
+    mockGetReminderChannel.mockResolvedValue('C-REMIND');
     mockGetApproverSlackUserId.mockResolvedValue('U-MATT');
     mockGetFallback.mockResolvedValue([]);
     mockListPending.mockResolvedValue([]);
@@ -354,7 +357,7 @@ describe('approvalInboxSlack', () => {
       await approvalInboxSlack.postManifestReadyNotice('matt', { manifestId: 'm-1', itemCount: 3, accountLabel: 'ad account 123' });
       expect(mockPostMessage).toHaveBeenCalledTimes(1);
       const arg = mockPostMessage.mock.calls[0][0];
-      expect(arg.channel).toBe('C-MATT');
+      expect(arg.channel).toBe('C-REMIND');
       expect(arg.text).toBe('🔔 <@U-MATT> — 3 Meta Ads changes for ad account 123 waiting for your review in the Approval Desk: https://partner.agentweb.pro/approval-desk/m-1');
       expect(arg.blocks).toBeUndefined();
     });
@@ -367,8 +370,20 @@ describe('approvalInboxSlack', () => {
       expect(mockPostMessage.mock.calls[0][0].text).toBe('🔔 fangfang — 1 Meta Ads change waiting for your review in the Approval Desk: https://partner.agentweb.pro/approval-desk/a%20b');
     });
 
+    it('refuses to post a dead localhost link in production when FRONTEND_URL is unset', async () => {
+      const oldEnv = process.env.NODE_ENV;
+      delete process.env.FRONTEND_URL;
+      (process.env as any).NODE_ENV = 'production';
+      try {
+        await approvalInboxSlack.postManifestReadyNotice('matt', { manifestId: 'm-1', itemCount: 1 });
+        expect(mockPostMessage).not.toHaveBeenCalled();
+      } finally {
+        (process.env as any).NODE_ENV = oldEnv;
+      }
+    });
+
     it('never throws when Slack or the channel lookup fails (the packet is already staged)', async () => {
-      mockGetApproverChannel.mockRejectedValue(new Error('no channel'));
+      mockGetReminderChannel.mockRejectedValue(new Error('no channel'));
       await expect(approvalInboxSlack.postManifestReadyNotice('matt', { manifestId: 'm-1', itemCount: 1 })).resolves.toBeUndefined();
       expect(mockPostMessage).not.toHaveBeenCalled();
     });
