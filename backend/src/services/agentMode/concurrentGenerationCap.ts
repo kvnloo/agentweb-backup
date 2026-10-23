@@ -79,7 +79,7 @@ export async function acquireInteractiveGenerationSlot(
   let sessions = active.get(userId);
   if (limit > 0) {
     const max = options?.continuesPausedTurn ? limit * PAUSED_TURN_CEILING_MULTIPLIER : limit;
-    const others = sessions ? [...sessions.keys()].filter((s) => s !== sessionId).length : 0;
+    const others = sessions ? sessions.size - (sessions.has(sessionId) ? 1 : 0) : 0;
     if (others >= max) return { ok: false, limit: max, current: others };
   }
   if (!sessions) {
