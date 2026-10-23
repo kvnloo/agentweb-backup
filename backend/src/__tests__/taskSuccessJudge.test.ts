@@ -38,6 +38,26 @@ function fakeLlm(text: string): RubricJudgeLlm & { requests: RubricJudgeLlmReque
 }
 
 describe('renderTraceForJudge', () => {
+  it('never cuts an emoji in half where it clips a line, so the request stays valid JSON (ENG-2638)', () => {
+    index = 0;
+    const agentText = `${'y'.repeat(599)}😀${'z'.repeat(50)}`;
+    const trace = buildAgentRunTrace({ sessionId: 's2', messages: [row({ role: 'user', content: 'Write the post' }), row({ role: 'assistant', content: agentText })] });
+    const rendered = renderTraceForJudge(trace);
+
+    expect(rendered).toContain(`AGENT: ${'y'.repeat(599)}…`);
+    expect(rendered).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
+  });
+
+  it('replaces half an emoji already in the stored text, so no lone surrogate reaches the request (ENG-2638)', () => {
+    index = 0;
+    const trace = buildAgentRunTrace({ sessionId: 's2', messages: [row({ role: 'user', content: 'Write the post' }), row({ role: 'assistant', content: 'Done \uD83D and posted' })] });
+    const rendered = renderTraceForJudge(trace);
+
+    expect(rendered).toContain('AGENT: Done \uFFFD and posted');
+    expect(rendered).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
+  });
+
+
   it('shows the plan state, then every message and call in order, then the final reply as text', () => {
     const text = renderTraceForJudge(emailRun(), 'Audit session');
 
@@ -100,18 +120,6 @@ describe('renderTraceForJudge', () => {
     ];
     const text = renderTraceForJudge(buildAgentRunTrace({ sessionId: 's', messages }));
     expect(text).toContain('a later get_meta_insights call succeeded, with args: account=Acme US');
-  });
-});
-
-describe('renderTraceForJudge clipping', () => {
-  it('never cuts an emoji in half where it clips a line, so the request stays valid JSON (ENG-2638)', () => {
-    index = 0;
-    const agentText = `${'y'.repeat(599)}😀${'z'.repeat(50)}`;
-    const trace = buildAgentRunTrace({ sessionId: 's2', messages: [row({ role: 'user', content: 'Write the post' }), row({ role: 'assistant', content: agentText })] });
-    const rendered = renderTraceForJudge(trace);
-
-    expect(rendered).toContain(`AGENT: ${'y'.repeat(599)}…`);
-    expect(rendered).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
   });
 });
 

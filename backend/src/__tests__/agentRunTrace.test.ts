@@ -1,4 +1,4 @@
-import { buildAgentRunTrace, redactText, TRACE_LIMITS, type TraceMessageRow } from '../services/agentRunTrace';
+import { buildAgentRunTrace, cutWithoutSplittingPair, redactText, TRACE_LIMITS, type TraceMessageRow } from '../services/agentRunTrace';
 
 let index = 0;
 function row(message: Record<string, unknown>): TraceMessageRow {
@@ -442,6 +442,19 @@ describe('buildAgentRunTrace', () => {
     expect(trace.resultsDegraded).toBe(true);
     expect(trace.calls[0].result).toHaveLength(TRACE_LIMITS.degradedResultChars);
     expect(trace.calls[0]).toMatchObject({ resultTruncated: true, resultChars: big.length });
+  });
+});
+
+describe('cutWithoutSplittingPair', () => {
+  it.each([
+    ['', 3, ''],
+    ['abc', 0, ''],
+    ['abc', 5, 'abc'],
+    ['a😀', 3, 'a😀'],
+    ['a😀', 2, 'a'],
+    ['a\uDE00b', 2, 'a\uDE00'],
+  ])('cuts %j at %i to %j, never leaving the first half of a pair (ENG-2638)', (text, max, expected) => {
+    expect(cutWithoutSplittingPair(text, max)).toBe(expected);
   });
 });
 
