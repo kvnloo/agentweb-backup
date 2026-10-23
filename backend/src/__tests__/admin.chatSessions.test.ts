@@ -172,7 +172,7 @@ describe("Admin chat sessions endpoint", () => {
   });
 
   // ENG-2648: a branch nobody continued (and the archived leftover of a failed branch copy) holds only a copy of
-  // its source's turns, so neither list shows it or creates a review link for it; a continued branch stays.
+  // its source's turns: the recent list leaves it out, the owner's list keeps it, and no review link is created.
   describe("branch copies (ENG-2648)", () => {
     const origin = { sourceSessionId: "src", sourceMessageIndex: 2, branchedAt: "2026-10-01T10:30:00.000Z" };
     const copied = [
@@ -197,16 +197,17 @@ describe("Admin chat sessions endpoint", () => {
       expect(mockChatbotDb.createOrReuseInteractiveShare.mock.calls.map((c) => c[0])).toEqual(["continued"]);
     });
 
-    it("the owner-filtered list applies the same rule", async () => {
+    it("the owner-filtered list keeps the owner's never-continued branch but creates no review link for it", async () => {
       (mockChatbotDb as any).getSessionsWithoutMessages.mockResolvedValue([meta("pure-copy"), meta("continued")]);
       const res = await request(app).get("/api/admin/chat-sessions?userId=owner-1").expect(200);
-      expect(res.body.sessions.map((s: any) => s.sessionId)).toEqual(["continued"]);
+      expect(res.body.sessions.map((s: any) => s.sessionId).sort()).toEqual(["continued", "pure-copy"]);
       expect(mockChatbotDb.createOrReuseInteractiveShare.mock.calls.map((c) => c[0])).toEqual(["continued"]);
     });
 
-    it("a lookup by id still finds an orphan (operators inspect the id a failed branch logged)", async () => {
+    it("a lookup by id still finds an orphan (operators inspect the id a failed branch logged), with no review link", async () => {
       const res = await request(app).get("/api/admin/chat-sessions?sessionId=orphan").expect(200);
       expect(res.body.sessions.map((s: any) => s.sessionId)).toEqual(["orphan"]);
+      expect(mockChatbotDb.createOrReuseInteractiveShare).not.toHaveBeenCalled();
     });
   });
 

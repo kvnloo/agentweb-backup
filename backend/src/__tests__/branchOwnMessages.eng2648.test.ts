@@ -4,7 +4,13 @@
  * is not a second scored/graded/listed session and a continued branch is not credited with its source's work.
  */
 import { branchOwnMessages, buildBranchRows, type BranchOrigin } from '../services/agentMode/chatBranching';
-import { judgeCohortExclusion, scoreSessionIfNeeded } from '../services/sessionScoringService';
+import {
+  BRANCH_CONTEXT_CLOSE_MARKER,
+  BRANCH_CONTEXT_OPEN_MARKER,
+  judgeCohortExclusion,
+  judgeScoringPath,
+  scoreSessionIfNeeded,
+} from '../services/sessionScoringService';
 import { buildLoadedSession, type DocItem } from '../loops/eval/agentGraderLoader';
 import { agentModeService } from '../services/agentModeService';
 import type { ChatMessage } from '../services/chatbotService';
@@ -106,24 +112,61 @@ describe('satisfaction scoring counts a branch by its own turns', () => {
     await expect(scoreSessionIfNeeded(session([...COPY, ...OWN]))).resolves.toMatchObject({ score: 4 });
     expect(mockCallLLM).toHaveBeenCalledTimes(1);
   });
+
+  it('the judge scores only the own turns; the copied prefix is a marked context block before them', async () => {
+    mockCallLLM.mockResolvedValue({
+      choices: [{ message: { content: JSON.stringify({ reason: 'ok', score: 4, dimensions: { goalCompletion: 4, dataAccuracy: 4, outputQuality: 4 } }) } }],
+    } as any);
+    await scoreSessionIfNeeded(session([...COPY, ...OWN]));
+    const prompt = String((mockCallLLM.mock.calls[0][1] as any[])[1].content);
+    const open = prompt.indexOf(BRANCH_CONTEXT_OPEN_MARKER);
+    const close = prompt.indexOf(BRANCH_CONTEXT_CLOSE_MARKER);
+    expect(open).toBeGreaterThanOrEqual(0);
+    expect(close).toBeGreaterThan(open);
+    for (const copied of ['user: find leads', 'user: now draft the email', 'assistant: Here is the draft.']) {
+      const at = prompt.indexOf(copied);
+      expect(at).toBeGreaterThan(open);
+      expect(at).toBeLessThan(close);
+      expect(prompt.indexOf(copied, close)).toBe(-1);
+    }
+    expect(prompt.indexOf('user: make it shorter')).toBeGreaterThan(close);
+    expect(prompt.indexOf('assistant: Sent.')).toBeGreaterThan(close);
+  });
+
+  it('a non-branch transcript carries no copied-context block', async () => {
+    mockCallLLM.mockResolvedValue({
+      choices: [{ message: { content: JSON.stringify({ reason: 'ok', score: 4, dimensions: { goalCompletion: 4, dataAccuracy: 4, outputQuality: 4 } }) } }],
+    } as any);
+    await scoreSessionIfNeeded(session(SOURCE));
+    expect(String((mockCallLLM.mock.calls[0][1] as any[])[1].content)).not.toContain(BRANCH_CONTEXT_OPEN_MARKER);
+  });
+
+  it('turn state is the own turns\': an own question with no reply yet is in flight, not judged on the copied reply', async () => {
+    const waiting = session([...COPY, OWN[0]]);
+    expect(judgeScoringPath(waiting)).toBe('in-flight');
+    await expect(scoreSessionIfNeeded(waiting)).resolves.toBeNull();
+    expect(mockCallLLM).not.toHaveBeenCalled();
+  });
 });
 
-describe('eval graders see only a branch\'s own turns', () => {
+describe('eval graders grade a branch by its own turns', () => {
   const rows = (messages: ChatMessage[]): DocItem[] =>
     messages.map((message, messageIndex) => ({ sessionId: 'branch-1', messageIndex, message: message as unknown as DocItem }));
 
-  it('copied tool calls and user turns are not graded again', () => {
-    const { session: graded } = buildLoadedSession({ sessionId: 'branch-1' }, rows([...COPY, ...OWN]), [], undefined);
-    expect(graded.ledger.map((c) => c.id)).toEqual(['own-1']);
-    expect(graded.userTurns).toBe(1);
-    expect((graded.turns ?? []).map((t) => t.userText)).toEqual(['make it shorter']);
-    expect(graded.finalReply).toBe('Sent.');
+  it('copied user turns are not graded again; the ledger stays the whole history (groundedness)', () => {
+    const loaded = buildLoadedSession({ sessionId: 'branch-1' }, rows([...COPY, ...OWN]), [], undefined);
+    expect(loaded.branchCopyOnly).toBeUndefined();
+    expect(loaded.session.ledger.map((c) => c.id)).toEqual(['src-1', 'own-1']);
+    expect(loaded.session.userTurns).toBe(1);
+    expect((loaded.session.turns ?? []).map((t) => t.userText)).toEqual(['make it shorter']);
+    expect(loaded.session.finalReply).toBe('Sent.');
   });
 
-  it('a never-continued branch grades as empty, not as a copy of its source', () => {
-    const { session: graded } = buildLoadedSession({ sessionId: 'branch-1' }, rows(COPY), [], undefined);
-    expect(graded.ledger).toEqual([]);
-    expect(graded.userTurns).toBe(0);
-    expect(graded.finalReply).toBeUndefined();
+  it('a never-continued branch is flagged copy-only and has no own turns or reply', () => {
+    const loaded = buildLoadedSession({ sessionId: 'branch-1' }, rows(COPY), [], undefined);
+    expect(loaded.branchCopyOnly).toBe(true);
+    expect(loaded.session.userTurns).toBe(0);
+    expect(loaded.session.finalReply).toBeUndefined();
+    expect(buildLoadedSession({ sessionId: 'src' }, rows(SOURCE), [], undefined).branchCopyOnly).toBeUndefined();
   });
 });
