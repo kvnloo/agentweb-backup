@@ -260,6 +260,7 @@ import type { GatewayTaskClass } from '../../utils/openRouterGatewayContract';
 import type { LLMUsageContext } from '../../utils/llmService';
 import { isAgentWebModelId } from '../../services/agentMode/agentWebModelRouter';
 import { buildResultDeliveryEmailHtml, buildReviewUrl } from '../../services/resultEndpointReview';
+import { escapeHtml } from './shared/htmlEscaping';
 
 /**
  * ENG-1816 F2 follow-up: a production session reported "No work plan found in
@@ -1667,32 +1668,35 @@ export async function sendForReview(
     const { emailService: emailSvc } = await import('../../services/emailService');
     let contentSection = '';
     if (contentUrl) {
-      contentSection = `<p><a href="${contentUrl}" style="color: #1976d2;">View Generated Content</a></p>`;
+      contentSection = `<p><a href="${escapeHtml(String(contentUrl))}" style="color: #1976d2;">View Generated Content</a></p>`;
     }
     if (contentHtml) {
       contentSection += `<div style="margin: 16px 0; padding: 16px; border: 1px solid #e0e0e0; border-radius: 8px; background: #fafafa;">${contentHtml}</div>`;
     }
 
+    // ENG-2650: trigger args are public input and subject/content_url come from
+    // the model, so every value below is escaped. contentHtml is the generated
+    // content under review and is shown as-is.
     const argsEntries = Object.entries(metadata.args || {});
     const paramsSummary = argsEntries.length > 0
       ? `<table style="width: 100%; border-collapse: collapse; margin: 12px 0;">
           <tr style="background: #f5f5f5;"><th style="text-align: left; padding: 8px; border: 1px solid #e0e0e0;">Parameter</th><th style="text-align: left; padding: 8px; border: 1px solid #e0e0e0;">Value</th></tr>
-          ${argsEntries.map(([k, v]) => `<tr><td style="padding: 8px; border: 1px solid #e0e0e0;">${k}</td><td style="padding: 8px; border: 1px solid #e0e0e0;">${v}</td></tr>`).join('')}
+          ${argsEntries.map(([k, v]) => `<tr><td style="padding: 8px; border: 1px solid #e0e0e0;">${escapeHtml(k)}</td><td style="padding: 8px; border: 1px solid #e0e0e0;">${escapeHtml(String(v))}</td></tr>`).join('')}
         </table>`
       : '';
 
     const reviewHtml = `
       <div style="font-family: Arial, sans-serif; max-width: 700px; margin: 0 auto;">
         <div style="background: #1976d2; color: white; padding: 12px 20px; border-radius: 8px 8px 0 0; font-weight: bold;">
-          Review: ${subject}
+          Review: ${escapeHtml(String(subject))}
         </div>
         <div style="padding: 20px; border: 1px solid #e0e0e0; border-top: none;">
-          <p style="color: #666;">A new result has been generated for "<strong>${metadata.resultTitle || metadata.resultName}</strong>". Please review the content below.</p>
+          <p style="color: #666;">A new result has been generated for "<strong>${escapeHtml(String(metadata.resultTitle || metadata.resultName))}</strong>". Please review the content below.</p>
           ${contentSection}
           ${paramsSummary ? `<h3 style="margin-top: 20px; color: #333;">Parameters</h3>${paramsSummary}` : ''}
-          ${metadata.leadEmail ? `<p><strong>Lead email:</strong> ${metadata.leadEmail}</p>` : ''}
+          ${metadata.leadEmail ? `<p><strong>Lead email:</strong> ${escapeHtml(String(metadata.leadEmail))}</p>` : ''}
           <div style="margin-top: 24px; text-align: center;">
-            <a href="${reviewUrl}" style="display: inline-block; background: #1976d2; color: white; padding: 12px 32px; border-radius: 6px; text-decoration: none; font-weight: bold; font-size: 16px;">Review & Send Result</a>
+            <a href="${escapeHtml(reviewUrl)}" style="display: inline-block; background: #1976d2; color: white; padding: 12px 32px; border-radius: 6px; text-decoration: none; font-weight: bold; font-size: 16px;">Review & Send Result</a>
           </div>
         </div>
       </div>`;
