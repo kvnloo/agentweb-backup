@@ -311,6 +311,12 @@ async function main(): Promise<void> {
       session,
       error: errorText,
     });
+    // External native send must respect the same modal guard as raw Enter.
+    // Keep the overlaid composer visible but not advertised as sendable.
+    if (pickerState || approvalState || runState) {
+      const editor = dock.c?.find(node => node.id === 'composer');
+      if (editor) editor.p = { ...editor.p, sendable: false };
+    }
     const layer = pickerState
       ? renderSessionPicker(pickerState, session.sessionId)
       : approvalState && approvalDeckIsAwaiting(session.pendingApprovalDeck)
