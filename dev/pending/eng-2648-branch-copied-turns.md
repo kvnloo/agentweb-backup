@@ -17,8 +17,18 @@ session. What did double-count: every reader that treats the branch's rows as it
 Fix: `branchOwnMessages(messages)` returns the rows from the branch's first OWN user message on: a user row
 positioned after the branched-from assistant row (`branchOrigin.sourceMessageIndex`). Position only — a copied
 row keeps its source timestamp, so timestamps cannot tell a copy from an own turn. A non-branch is returned
-unchanged. Those readers use it (both admin lists: recent and owner-filtered). The `?sessionId=` admin lookup still finds any session by id, so an
-orphan named in a `ChatBranching: unexpected failure` log line can still be inspected.
+unchanged. Where it is used:
+- Scoring: every turn-state check (user/assistant turns, no-task, blocked-external, mid-tool-loop, failed run,
+  `judgeScoringPath`) reads the own turns. The judge scores only the own turns; the copied prefix is sent first
+  as a marked, bounded "COPIED CONTEXT" block. The tool-call manifest still covers the whole history.
+- Eval-v2: turns, user-turn count, final reply and crash check are the own turns; the tool ledger stays the
+  whole history's (groundedness and repeated-write checks). A copy-only branch is flagged
+  (`LoadedSession.branchCopyOnly`) and the daily sampler skips it.
+- Admin: the recent list (and `get_chat_history`) leaves out copy-only branches and failed-copy leftovers; the
+  owner-filtered list keeps a revealed never-continued branch (archived leftovers are already excluded there);
+  no review iShare link is created for a copy-only branch on any path. `get_chat_history` stats count own rows.
+  The `?sessionId=` lookup still finds any session by id, so an orphan named in a
+  `ChatBranching: unexpected failure` log line can still be inspected.
 
 Orphan sweep: not built. Leftovers are hidden (archived) and are now excluded from every reader above.
 If they ever need removing, that is a data-plane delete (Harsha): candidates are sessions with
