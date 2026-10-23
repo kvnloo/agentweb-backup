@@ -52,6 +52,7 @@ export interface OperatorView {
   executionId?: string;
   detail?: OperatorExecution;
   confirm?: OperatorConfirm;
+  confirmSelected?: 'cancel' | 'confirm';
   busy?: boolean;
   notice?: string;
   lastUpdated?: string;
