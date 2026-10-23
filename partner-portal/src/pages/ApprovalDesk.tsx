@@ -540,7 +540,11 @@ function ManifestDetail({ manifestId }: { manifestId: string }) {
   const allAnswered = decisions.length > 0 && answeredCount === decisions.length;
   const hasMetaWrite = decisions.some((d) => d.gateType === 'meta_write');
   // Once every item has been dispatched there is nothing left to run; the server would 409 a repeat anyway.
-  const alreadyDispatched = decisions.length > 0 && decisions.every((d) => d.status === 'executed' || d.status === 'execution_failed');
+  // A packet with a rejected item is finished once every OTHER item has been dispatched, so rejected
+  // counts as done here — found on prod, where a reject + two approves left the button enabled.
+  const alreadyDispatched =
+    decisions.some((d) => d.status === 'executed' || d.status === 'execution_failed') &&
+    decisions.every((d) => d.status === 'executed' || d.status === 'execution_failed' || d.status === 'rejected');
 
   const approveAll = async () => {
     setApprovingAll(true);
