@@ -139,13 +139,13 @@ describe('Read-only authorized execution activity API contract', () => {
 
   it('marks 401/403/502 or malformed activity as unavailable instead of fabricating events', async () => {
     for (const outcome of [
-      Promise.reject({ response: { status: 401, data: { Authorization: 'Bearer private' } } }),
-      Promise.reject({ response: { status: 403 } }),
-      Promise.reject({ response: { status: 502 } }),
-      Promise.resolve({ data: { events: [event] } }),
+      () => Promise.reject({ response: { status: 401, data: { Authorization: 'Bearer private' } } }),
+      () => Promise.reject({ response: { status: 403 } }),
+      () => Promise.reject({ response: { status: 502 } }),
+      () => Promise.resolve({ data: { events: [event] } }),
     ]) {
       const client = make();
-      get.mockResolvedValueOnce({ data: detail }).mockImplementationOnce(() => outcome);
+      get.mockResolvedValueOnce({ data: detail }).mockImplementationOnce(outcome);
       const read = await client.getExecutionWithActivity('task 1', 'execution/1');
       expect(read.activity).toEqual([]);
       expect(read.activityUnavailable).toBe(true);

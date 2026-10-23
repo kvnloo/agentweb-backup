@@ -926,7 +926,7 @@ export const getOperatorExecutionActivity = async (req: AuthRequest, res: Respon
       || !/^[a-zA-Z0-9_-]{1,120}$/.test(executionId)
       || !/^[a-zA-Z0-9_-]{1,120}$/.test(execution.userId || '')
       || !key.startsWith(prefix)
-      || !/^[a-z0-9]{20}\\.log$/.test(key.slice(prefix.length))) {
+      || !/^[a-z0-9]{20}\.log$/.test(key.slice(prefix.length))) {
       return res.json(empty);
     }
     const result = await s3.getObject({

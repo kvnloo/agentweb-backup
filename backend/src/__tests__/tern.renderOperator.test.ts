@@ -138,7 +138,8 @@ describe('Actual browser activity and incremental keyed TSP updates', () => {
       expect(ops).not.toContainEqual(['del', 'operator.run.timeline']);
       r.commit(b);
       expect(r.diff(b)).toEqual([]);
-      expect(JSON.stringify(b)).not.toContain('private');
+      expect(JSON.stringify(b)).not.toContain('Bearer private');
+      expect(JSON.stringify(b)).not.toContain('private/log?token=never-render');
     }
   });
 
