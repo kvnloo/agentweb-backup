@@ -9,6 +9,7 @@
  */
 
 import { isRunFailurePlaceholder, type ResumeMessage } from '../../services/agentMode/core/resumePlan';
+import { branchOwnMessages } from '../../services/agentMode/chatBranching';
 import type { AgentLoopEvent, GraderTurn, GraderWorkPlan, LedgerCall, SessionForGrading, SessionSpend } from './agentGraders';
 
 export type DocItem = Record<string, unknown>;
@@ -314,7 +315,8 @@ export function buildLoadedSession(
   events: readonly AgentLoopEvent[],
   spend: SpendRollup | undefined,
 ): LoadedSession {
-  const messages = orderedMessages(messageRows);
+  // ENG-2648: a branch is graded on its own turns only; the rows it copied ran (and are graded) in its source.
+  const messages = branchOwnMessages(orderedMessages(messageRows));
   const workPlan = toGraderWorkPlan(sessionItem.workPlan);
   const finalReply = finalReplyOf(messages);
   return {

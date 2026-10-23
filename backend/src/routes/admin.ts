@@ -18,6 +18,7 @@ import { resendService } from "../services/resendService";
 import { sendGTMPlanUpdateNotifications, sendPhaseStatusReport, sendPlanStatusReport } from "../services/gtmPlanNotificationService";
 import { notifySlackWorkItemCompleted } from "../services/gtmPlanService";
 import { chatbotDb, ChatSession } from "../services/chatbotService";
+import { branchOwnMessages } from "../services/agentMode/chatBranching";
 import { scoreSessionIfNeeded, scoreSessionWithJudgeIfNeeded, ScoringJudge } from "../services/sessionScoringService";
 import { backfillSessionScores } from "../services/scoreBackfill";
 import { DynamoDB } from "aws-sdk";
@@ -3614,10 +3615,13 @@ router.get("/chat-sessions", async (req, res) => {
       ? Buffer.from(JSON.stringify(nextKey)).toString("base64")
       : null;
 
-    // Filter out sessions that have no user messages (not real sessions)
+    // Filter out sessions that have no user messages (not real sessions). ENG-2648: for a branch only its
+    // OWN user messages count, so a branch nobody continued and the hidden (archived) leftover of a failed
+    // branch copy — both nothing but a copy of turns already listed under their source — are left out too.
+    // (The ?sessionId= lookup above still finds any session by id, orphans included.)
     const nonEmptySessions = sessionsWithMessages.filter((session: any) =>
       Array.isArray(session.messages) &&
-      session.messages.some((msg: any) => msg.role === "user")
+      branchOwnMessages(session.messages).some((msg: any) => msg.role === "user")
     );
 
     await ensureIshareLinkForReview(nonEmptySessions);

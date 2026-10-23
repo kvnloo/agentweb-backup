@@ -3,6 +3,7 @@ import { resolveModelForUser } from './modelRoles';
 import { OUTCOME_JUDGE_SHADOW_FEATURE, assertOutcomeJudgeModelAllowed, DEFAULT_OUTCOME_JUDGE_MODEL, isInShadowSample } from './outcomeJudge';
 import { chatbotDb, ChatSession, ChatMessage } from "./chatbotService";
 import { isTestScheduledSession } from "../utils/scheduledTestRunSession";
+import { branchOwnMessages } from "./agentMode/chatBranching";
 import { summarizeAiStyleTells } from "./aiStyleGuard";
 import {
   appendConfirmedPublishNotice,
@@ -2032,7 +2033,8 @@ export interface JudgeCohortExclusion {
  * Null means the session is in the cohort. Order matters and matches the original checks.
  */
 export function judgeCohortExclusion(session: ChatSession): JudgeCohortExclusion | null {
-  const userMessages = (session.messages || []).filter((m: any) => m.role === "user");
+  // ENG-2648: a branch's copied rows were judged in its source; only its own turns make it a scorable chat.
+  const userMessages = branchOwnMessages(session.messages || []).filter((m: any) => m.role === "user");
   if (userMessages.length < MIN_USER_MESSAGES) {
     return { reason: "no-user-message", retract: false };
   }
@@ -2262,8 +2264,9 @@ export async function attemptSessionScore(
 
   const messageCount = session.messageCount ?? session.messages?.length ?? 0;
 
-  // Count user messages
-  const userMessages = (session.messages || []).filter(
+  // Count user messages. ENG-2648: a branch counts only its own (its copied turns are scored in the
+  // source), so a never-continued branch or the hidden leftover of a failed copy is not scored again.
+  const userMessages = branchOwnMessages(session.messages || []).filter(
     (m: any) => m.role === "user"
   );
   if (userMessages.length < MIN_USER_MESSAGES) {
