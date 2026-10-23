@@ -11388,7 +11388,7 @@
   },
   "src/services/smartleadService.ts": {
     "@typescript-eslint/no-explicit-any": {
-      "count": 4
+      "count": 2
     }
   },
   "src/services/socialPostsService.ts": {
