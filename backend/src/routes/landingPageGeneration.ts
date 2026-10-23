@@ -440,6 +440,9 @@ router.get("/site", async (req: Request, res: Response) => {
   }
 });
 
+/** Real session ids are uuids (36 chars); DynamoDB rejects a key over 2048 bytes with a ValidationException. */
+const MAX_ORIGINATING_SESSION_ID_LENGTH = 200;
+
 /**
  * ENG-2651: the chat a generated page reports back to. The page record carries it as
  * `originatingSessionId`, which (a) durableLandingService.postToSession appends the completion /
@@ -454,9 +457,17 @@ async function resolveOriginatingSessionId(
   originatingSessionId: unknown,
   caller: { userId?: string; isAdmin?: boolean } | undefined,
 ): Promise<string | undefined> {
-  if (typeof originatingSessionId !== "string" || !originatingSessionId) return undefined;
-  const { chatbotDb } = await import("../services/chatbotService");
-  const session = await chatbotDb.getChatSessionRecord(originatingSessionId, true);
+  if (typeof originatingSessionId !== "string" || !originatingSessionId.trim()) return undefined;
+  if (originatingSessionId.length > MAX_ORIGINATING_SESSION_ID_LENGTH) return undefined;
+  let session;
+  try {
+    const { chatbotDb } = await import("../services/chatbotService");
+    session = await chatbotDb.getChatSessionRecord(originatingSessionId, true);
+  } catch (err: any) {
+    // Never fail a generation over its optional report-back chat: drop it, like any unusable id.
+    console.warn(`[LP GENERATION] could not read originating session, generating without it: ${err?.message}`);
+    return undefined;
+  }
   if (!session) return undefined;
   const isOwner = !!caller?.userId && session.userId === caller.userId;
   if (isOwner || caller?.isAdmin === true) return originatingSessionId;

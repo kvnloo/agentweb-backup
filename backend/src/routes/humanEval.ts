@@ -13,6 +13,8 @@ import { chatbotDb } from '../services/chatbotService';
 const HUMAN_EVAL_STATUSES: readonly HumanEvalStatus[] = ['pending', 'reviewed'];
 const HUMAN_EVAL_REVIEW_TYPES: readonly HumanEvalReviewType[] = ['creative_image', 'landing_page', 'lead_enrichment'];
 
+const MAX_SESSION_ID_LENGTH = 200;
+
 const router = express.Router();
 
 router.use(authenticateToken);
@@ -51,7 +53,11 @@ router.post('/candidates', async (req: Request, res: Response): Promise<void> =>
         return;
       }
       const caller = authReq.user;
-      const session = await chatbotDb.getChatSessionRecord(sessionId, true);
+      // Real ids are uuids (36 chars); an oversized key would make DynamoDB throw (a 500), so it is
+      // simply not a session.
+      const session = sessionId.length <= MAX_SESSION_ID_LENGTH
+        ? await chatbotDb.getChatSessionRecord(sessionId, true)
+        : null;
       const isOwner = !!caller?.userId && session?.userId === caller.userId;
       if (!session || !(isOwner || caller?.isAdmin === true)) {
         res.status(404).json({ error: 'Session not found' });
