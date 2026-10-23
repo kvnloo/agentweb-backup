@@ -7,10 +7,11 @@
  *     the portal `AgentMode` page and are authorized only by the token in the URL.
  *
  * Both used to receive the session record nearly as stored: the stored system prompt (row 0, ~100 KB),
- * every assistant row's provider fields (`reasoning`, `reasoning_details`, `usage`, `refusal`), and on
- * the read-only link also the owner's whole authorized skills catalog, the owner's `supportNote`, the
- * Slack thread and `interactiveShareMetadata` — whose `token` is the conversable credential, so a
- * read-only viewer could upgrade themselves to driving Emma on the owner's account.
+ * every assistant row's provider fields (`reasoning`, `reasoning_details`, `usage`, `refusal`), the owner's
+ * whole authorized skills catalog, the owner's `supportNote` (the admin's internal note about the account,
+ * set via PUT /admin/users/:userId/support-note), the Slack thread, and `interactiveShareMetadata` — whose
+ * `token` is the conversable credential, so a read-only viewer could upgrade themselves to driving Emma on
+ * the owner's account.
  *
  * The rule here: a viewer gets exactly the fields its page reads, nothing else. Everything is an
  * allowlist, so a field added to the stored record later stays private until someone adds it here on
@@ -50,14 +51,25 @@ export const READ_ONLY_SHARE_MESSAGE_METADATA_KEYS = [
 ] as const;
 
 /**
+ * `role:'user'` rows the SERVER wrote as the next turn's instruction (generateSessionResponse's
+ * `userMessageKind`): the media auto-continuation directive and the approval-inbox resume. Nobody typed
+ * them; ShareConversation has no notion of `kind` and would render their internal instruction text as a
+ * customer bubble, so the read-only view leaves them out.
+ */
+export const SERVER_AUTHORED_USER_KINDS: readonly string[] = ['auto-continuation', 'approval-inbox-resolution'];
+
+const isServerAuthoredUserRow = (m: Row): boolean =>
+  m.role === 'user' && isObject(m.metadata) && typeof m.metadata.kind === 'string' && SERVER_AUTHORED_USER_KINDS.includes(m.metadata.kind);
+
+/**
  * Rows for the read-only share page. The page renders nothing for a `system` row, so system rows (the
- * stored system prompt, internal markers, telemetry records) are dropped outright; user and assistant
- * rows keep `role`, `content` and the metadata above.
+ * stored system prompt, internal markers, telemetry records) are dropped outright, as are server-authored
+ * user rows (above); the rest keep `role`, `content` and the metadata above.
  */
 export function toReadOnlyShareMessages(messages: unknown): Row[] {
   if (!Array.isArray(messages)) return [];
   return messages
-    .filter((m): m is Row => isObject(m) && (m.role === 'user' || m.role === 'assistant'))
+    .filter((m): m is Row => isObject(m) && (m.role === 'user' || m.role === 'assistant') && !isServerAuthoredUserRow(m))
     .map((m) => {
       const row: Row = { role: m.role, content: m.content };
       if (isObject(m.metadata)) row.metadata = pickPresent(m.metadata, READ_ONLY_SHARE_MESSAGE_METADATA_KEYS);
@@ -139,9 +151,34 @@ function isRenderedSystemRow(m: Row): boolean {
  */
 const SYSTEM_PLACEHOLDER_METADATA_KEYS = ['timestamp', 'kind', 'isErrorMessage'] as const;
 
+/**
+ * Content prefix of the "first attempt failed, a retry follows" telemetry row (agentModeController's
+ * fire-and-forget retry path writes it as role:'system' with `isErrorMessage: true` for the server-side loop
+ * sensor). It is NOT a failure of the run: the landing-page status poll marks a session failed on any row
+ * with `isErrorMessage`, so a viewer's placeholder for this row must not carry the flag while the retry runs.
+ */
+export const FIRST_ATTEMPT_TELEMETRY_PREFIX = '[telemetry] First-attempt agent failure';
+
+const isFirstAttemptTelemetryRow = (m: Row): boolean =>
+  typeof m.content === 'string' && m.content.startsWith(FIRST_ATTEMPT_TELEMETRY_PREFIX);
+
+/** MessageFeedbackButtons reads `type` (and the comment/timestamp it shows); `userId` is the rater's id. */
+const FEEDBACK_KEYS = ['type', 'comment', 'timestamp'] as const;
+
+function narrowFeedback(feedback: unknown): Row | undefined {
+  return isObject(feedback) ? pickPresent(feedback, FEEDBACK_KEYS) : undefined;
+}
+
 function toConversableRow(m: Row): Row {
   const row: Row = { role: m.role, content: m.content, ...pickPresent(m, CONVERSABLE_SHARE_MESSAGE_FIELDS) };
-  if (isObject(m.metadata)) row.metadata = pickPresent(m.metadata, CONVERSABLE_SHARE_MESSAGE_METADATA_KEYS);
+  if (isObject(m.metadata)) {
+    const metadata = pickPresent(m.metadata, CONVERSABLE_SHARE_MESSAGE_METADATA_KEYS);
+    if ('feedback' in metadata) {
+      const feedback = narrowFeedback(metadata.feedback);
+      if (feedback) metadata.feedback = feedback; else delete metadata.feedback;
+    }
+    row.metadata = metadata;
+  }
   return row;
 }
 
@@ -150,7 +187,11 @@ export function toConversableShareMessages(messages: unknown): Row[] {
   return messages.filter(isObject).map((m) => {
     if (m.role !== 'system' || isRenderedSystemRow(m)) return toConversableRow(m);
     const placeholder: Row = { role: 'system', content: '', ...pickPresent(m, ['messageIndex', 'clientId']) };
-    if (isObject(m.metadata)) placeholder.metadata = pickPresent(m.metadata, SYSTEM_PLACEHOLDER_METADATA_KEYS);
+    if (isObject(m.metadata)) {
+      const metadata = pickPresent(m.metadata, SYSTEM_PLACEHOLDER_METADATA_KEYS);
+      if (isFirstAttemptTelemetryRow(m)) delete metadata.isErrorMessage;
+      placeholder.metadata = metadata;
+    }
     return placeholder;
   });
 }
@@ -184,8 +225,10 @@ export function narrowSkillsForShareViewer(skills: unknown, adminSkillId: string
 
 /**
  * Session fields the conversable AgentMode page (useAgentModeSessions' conversable loaders) and the
- * landing-page status poll read. Not sent: `shareMetadata` / `interactiveShareMetadata` (only the
- * owner's Share dialog reads them, unreachable on these routes) and `isConversable` (never read).
+ * landing-page status poll read. Not sent: `supportNote` (the admin's internal note about the account; the
+ * ishare header falls back to "You're chatting with Emma in a shared conversation" without it),
+ * `shareMetadata` / `interactiveShareMetadata` (only the owner's Share dialog reads them, unreachable on
+ * these routes) and `isConversable` (never read).
  */
 export function buildConversableShareSession(input: {
   sessionId: string;
@@ -196,7 +239,6 @@ export function buildConversableShareSession(input: {
   workPlan?: unknown;
   llmModel?: string;
   hasActiveProgress?: boolean;
-  supportNote?: string;
   slackThread?: unknown;
   skills?: DisplaySkill[];
   pendingWorkPlanInput?: unknown;
@@ -211,8 +253,7 @@ export function buildConversableShareSession(input: {
     workPlan: input.workPlan,
     llmModel: input.llmModel,
     hasActiveProgress: input.hasActiveProgress,
-    // The ishare header: "You're chatting with Emma in a shared conversation for <supportNote>" + "View in Slack".
-    supportNote: input.supportNote,
+    // The ishare header's "View in Slack" link.
     slackThread: input.slackThread,
     skills: input.skills ?? [],
     pendingWorkPlanInput: input.pendingWorkPlanInput,
@@ -226,6 +267,6 @@ export function buildConversableShareSession(input: {
  * and usage — and the endpoint takes a raw row index, so it could return rows the viewer's chat hides.
  */
 export function toIShareFeedbackResponse(updatedMessage: unknown): Row {
-  const feedback = isObject(updatedMessage) && isObject(updatedMessage.metadata) ? updatedMessage.metadata.feedback : undefined;
+  const feedback = isObject(updatedMessage) && isObject(updatedMessage.metadata) ? narrowFeedback(updatedMessage.metadata.feedback) : undefined;
   return { success: true, message: { metadata: feedback === undefined ? {} : { feedback } } };
 }

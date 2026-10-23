@@ -14,6 +14,7 @@ import { filterMessagesForClient as filterMessagesForClientPure } from '../utils
 import {
   buildConversableShareSession,
   buildReadOnlyShareSession,
+  FIRST_ATTEMPT_TELEMETRY_PREFIX,
   narrowSkillsForShareViewer,
   toConversableShareMessages,
   toIShareFeedbackResponse,
@@ -12497,16 +12498,8 @@ export const agentModeController = {
         const defaultModel = await agentModeService.getDefaultModel();
         const modelToUse = session.llmModel || defaultModel;
 
-        // The ishare header names the owner's company: "...a shared conversation for <supportNote>".
-        let supportNote: string | undefined;
-        try {
-          const user = await userDb.getUserById(session.userId);
-          supportNote = user?.supportNote;
-        } catch (error) {
-          console.error('Failed to fetch user supportNote:', error);
-          // Continue without supportNote if fetch fails
-        }
-
+        // No supportNote: it is the admin's internal note about the account, not something to show a viewer
+        // (the ishare header falls back to "You're chatting with Emma in a shared conversation").
         // Skills popover: only this session's installed skills (never the owner's catalog or the admin bundle).
         let sharedSkills: ReturnType<typeof narrowSkillsForShareViewer> = [];
         try {
@@ -12528,7 +12521,6 @@ export const agentModeController = {
             workPlan,
             llmModel: modelToUse,
             hasActiveProgress: hasActiveProgress(session.sessionId),
-            supportNote,
             slackThread: session.slackThread,
             skills: sharedSkills,
             pendingWorkPlanInput: session.pendingWorkPlanInput,
@@ -17003,7 +16995,7 @@ export const agentModeController = {
               });
               const firstAttemptErrorMessage: ChatMessage = {
                 role: 'system',
-                content: `[telemetry] First-attempt agent failure (retry will follow): ${(firstErr?.message ?? String(firstErr)).slice(0, 500)} | ctx: ${debugCtx}`,
+                content: `${FIRST_ATTEMPT_TELEMETRY_PREFIX} (retry will follow): ${(firstErr?.message ?? String(firstErr)).slice(0, 500)} | ctx: ${debugCtx}`,
                 timestamp: new Date().toISOString(),
                 metadata: {
                   timestamp: new Date().toISOString(),
