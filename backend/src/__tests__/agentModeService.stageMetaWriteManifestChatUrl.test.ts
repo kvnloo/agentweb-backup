@@ -177,4 +177,29 @@ describe('stageApprovalInboxMetaWriteManifest attaches a real chatUrl', () => {
     await flush();
     expect(again.manifestId).toBeTruthy();
   });
+
+  it('counts a digest staged twice in one call once, so the reminder never overstates the packet', async () => {
+    const rows = new Map<string, any>();
+    (approvalInboxService.createDecision as jest.Mock).mockImplementation(async (req: any) => {
+      if (!rows.has(req.metaWriteManifestDigest)) rows.set(req.metaWriteManifestDigest, { ...req, decisionId: req.metaWriteManifestDigest, status: 'pending_team_review', createdAt: new Date().toISOString() });
+      return rows.get(req.metaWriteManifestDigest);
+    });
+    await (service as any).stageApprovalInboxMetaWriteManifest(SESSION_ID, [forAccount('dup', '111'), forAccount('dup', '111'), forAccount('other', '111')]);
+    await flush();
+    expect((postManifestReadyNotice as jest.Mock).mock.calls).toHaveLength(1);
+    expect((postManifestReadyNotice as jest.Mock).mock.calls[0][1].itemCount).toBe(2);
+  });
+
+  it('logs (does not throw) when the reminder fails', async () => {
+    (approvalInboxService.createDecision as jest.Mock).mockImplementation(pending());
+    (postManifestReadyNotice as jest.Mock).mockRejectedValue(new Error('slack down'));
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      await (service as any).stageApprovalInboxMetaWriteManifest(SESSION_ID, [writeHalt({ metaWriteManifestDigest: 'digest-warn' })]);
+      await flush();
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('failed to post the Approval Desk reminder'), 'slack down');
+    } finally {
+      warn.mockRestore();
+    }
+  });
 });
