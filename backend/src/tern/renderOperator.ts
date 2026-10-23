@@ -132,24 +132,41 @@ function detailNode(execution: OperatorExecution, asOf?: string, portalBaseUrl?:
         ],
       },
     });
+    // Tern tables hide/truncate columns in narrow picker previews. Each source
+    // event instead owns a keyed, vertically wrapped timestamp/level + summary.
     children.push({
       id: 'operator.run.timeline',
-      k: 'table',
-      p: {
-        cols: [
-          { id: 'when', head: 'Log time' },
-          { id: 'level', head: 'Level' },
-          { id: 'activity', head: 'Browser execution activity', grow: 2 },
-        ],
-        rows: events.map(item => ({
-          id: safeText(item.id, 80),
-          cells: {
-            when: safeText(item.when, 50),
-            level: safeText(item.level, 10),
-            activity: safeText(item.summary, 120),
-          },
-        })),
-      },
+      k: 'section',
+      p: { head: 'Browser execution activity' },
+      c: events.map((item): TspNode => {
+        const id = 'operator.run.event.' + safeText(item.id, 80);
+        const levelTone = item.level === 'ERROR' ? 'error'
+          : item.level === 'WARNING' ? 'warning' : 'info';
+        return {
+          id,
+          k: 'col',
+          p: { gap: 'none' },
+          c: [
+            {
+              id: id + '.meta',
+              k: 'text',
+              p: {
+                wrap: 'char',
+                spans: [
+                  { t: safeText(item.when, 50), s: 'muted mono' },
+                  { t: ' · ', s: 'muted' },
+                  { t: safeText(item.level, 10), s: levelTone },
+                ],
+              },
+            },
+            {
+              id: id + '.summary',
+              k: 'text',
+              p: { text: safeText(item.summary, 120), wrap: 'char' },
+            },
+          ],
+        };
+      }),
     });
   } else if (execution.activityUnavailable) {
     children.push({

@@ -145,10 +145,42 @@ describe('Actual browser activity and incremental keyed TSP updates', () => {
     const latest = nodes.find(node => node.id === 'operator.run.latest');
     expect(JSON.stringify(latest)).toContain('Browser action: click');
     const timeline = nodes.find(node => node.id === 'operator.run.timeline');
-    expect(timeline?.k).toBe('table');
-    expect((timeline?.p?.rows as unknown[])).toHaveLength(2);
+    expect(timeline).toMatchObject({
+      k: 'section', p: { head: 'Browser execution activity' },
+    });
+    expect(timeline?.c).toHaveLength(2);
+    // Tern table cells never wrap, and narrow previews can hide the last
+    // column. The activity must be its own wrapping text node for every event.
+    for (const event of view.detail!.activity!) {
+      const id = 'operator.run.event.' + event.id;
+      const entry = timeline?.c?.find(child => child.id === id);
+      expect(entry).toMatchObject({ k: 'col', p: { gap: 'none' } });
+      expect(entry?.c?.find(child => child.id === id + '.meta')).toMatchObject({
+        k: 'text',
+        p: {
+          wrap: 'char',
+          spans: [
+            { t: event.when, s: 'muted mono' },
+            { t: ' · ', s: 'muted' },
+            { t: event.level, s: event.level === 'ERROR' ? 'error'
+              : event.level === 'WARNING' ? 'warning' : 'info' },
+          ],
+        },
+      });
+      expect(entry?.c?.find(child => child.id === id + '.summary')).toMatchObject({
+        k: 'text', p: { wrap: 'char', text: event.summary },
+      });
+    }
+    expect(timeline?.p?.cols).toBeUndefined();
+    expect(timeline?.p?.rows).toBeUndefined();
     expect(nodes.find(node => node.id === 'operator.run.user-requests')).toBeUndefined();
-    const wire = JSON.stringify(nodes);
+    const wire = encodeTspJson('f', {
+      sf: 'agentweb-operator', s: 1,
+      ops: new TspSurfaceReconciler('agentweb-operator').diff(renderOperator(view)),
+    });
+    for (const event of view.detail!.activity!) {
+      expect(wire).toContain(event.summary);
+    }
     for (const secret of ['token=never-render', '"secret"', 'private/log', 'Bearer private']) {
       expect(wire).not.toContain(secret);
     }
@@ -163,15 +195,20 @@ describe('Actual browser activity and incremental keyed TSP updates', () => {
       const r = new TspSurfaceReconciler('agentweb-operator');
       const a = renderOperator(running);
       const b = renderOperator(terminal);
-      const firstRows = all(a[0]).find(node => node.id === 'operator.run.timeline')?.p?.rows as any[];
-      const lastRows = all(b[0]).find(node => node.id === 'operator.run.timeline')?.p?.rows as any[];
-      expect(lastRows.slice(0, 2)).toEqual(firstRows);
-      expect(lastRows).toHaveLength(3);
+      const firstEvents = all(a[0]).find(node => node.id === 'operator.run.timeline')!.c!;
+      const lastEvents = all(b[0]).find(node => node.id === 'operator.run.timeline')!.c!;
+      expect(lastEvents.slice(0, 2)).toEqual(firstEvents);
+      expect(lastEvents).toHaveLength(3);
+      const appended = lastEvents[2]!;
+      expect(appended.id).toBe('operator.run.event.' + terminal.detail!.activity![2]!.id);
       r.commit(a);
       const ops = r.diff(b);
-      expect(ops).toContainEqual(['set', 'operator.run.timeline', expect.objectContaining({
-        rows: lastRows,
-      })]);
+      expect(ops).toContainEqual(['add', appended.id, 'operator.run.timeline', null, appended]);
+      for (const existing of firstEvents) {
+        expect(ops).not.toContainEqual(['del', existing.id]);
+        expect(ops.some(op => op[0] === 'add' && op[1] === existing.id)).toBe(false);
+      }
+      expect(ops.some(op => op[0] === 'set' && op[1] === 'operator.run.timeline')).toBe(false);
       expect(ops).not.toContainEqual(['del', 'main']);
       expect(ops).not.toContainEqual(['del', 'operator.runs']);
       expect(ops).not.toContainEqual(['del', 'operator.run.preview']);
@@ -181,6 +218,54 @@ describe('Actual browser activity and incremental keyed TSP updates', () => {
       expect(JSON.stringify(b)).not.toContain('Bearer private');
       expect(JSON.stringify(b)).not.toContain('private/log?token=never-render');
     }
+  });
+
+  it('patches changed safe activity text and severity on the same event identity', () => {
+    const running = withLog('running', [step, click]);
+    const refreshed = withLog('running', [step, click]);
+    const original = refreshed.detail!.activity!;
+    const changed = {
+      ...original[1]!, summary: 'Browser execution log',
+      level: 'WARNING' as const,
+    };
+    refreshed.detail = { ...refreshed.detail!, activity: [original[0]!, changed] };
+    const id = 'operator.run.event.' + changed.id;
+    const r = new TspSurfaceReconciler('agentweb-operator');
+    r.commit(renderOperator(running));
+    const next = renderOperator(refreshed);
+    const ops = r.diff(next);
+    expect(ops).toContainEqual(['text', id + '.summary', 'replace', 'Browser execution log']);
+    expect(ops).toContainEqual(['set', id + '.meta', expect.objectContaining({
+      spans: expect.arrayContaining([{ t: 'WARNING', s: 'warning' }]),
+    })]);
+    expect(ops.some(op => op[0] === 'del' && op[1].startsWith('operator.run.')))
+      .toBe(false);
+    expect(ops.some(op => op[0] === 'add' && op[1].startsWith('operator.run.event.')))
+      .toBe(false);
+    r.commit(next);
+    expect(r.diff(next)).toEqual([]);
+  });
+
+  it('preserves all 40 source-backed entries in native narrow-preview-safe order', () => {
+    const lines = Array.from({ length: 48 }, (_, index) =>
+      '2026-10-22 21:00:' + String(index % 60).padStart(2, '0')
+      + ',000 - browser_use.agent - INFO - Step ' + (index + 1));
+    const view = withLog('running', lines);
+    const source = view.detail!.activity!;
+    const timeline = all(renderOperator(view)[0]).find(
+      node => node.id === 'operator.run.timeline',
+    );
+    expect(source).toHaveLength(40);
+    expect(timeline?.c?.map(node => node.id))
+      .toEqual(source.map(event => 'operator.run.event.' + event.id));
+    expect(timeline?.c?.map(entry =>
+      entry.c?.find(node => node.id === entry.id + '.summary')?.p?.text,
+    )).toEqual(source.map(event => event.summary));
+    expect(source[0]?.summary).toBe('Browser step 9');
+    expect(source[39]?.summary).toBe('Browser step 48');
+    expect(timeline?.c?.every(entry =>
+      entry.c?.find(node => node.id === entry.id + '.summary')?.p?.wrap === 'char',
+    )).toBe(true);
   });
 
   it('treats activity-read failures as unavailable, never as fake browser steps', () => {

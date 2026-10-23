@@ -40,6 +40,16 @@ endpoints, whose authorization checks stay authoritative.
   30 seconds. No event feed exists for this execution path: Tern therefore
   applies incremental keyed patches from these polls, without generating
   synthetic "activity" events on every refresh.
+- The native Run Inspector side preview renders activity as a Tern `section`
+  with individually keyed vertical `col` entries: a timestamp/severity
+  header and a separate bounded summary `text` with `wrap: 'char'`. The old
+  three-column table hid/truncated the activity column on narrow picker
+  previews; native text wrapping keeps the complete safe summary readable
+  without measuring pixels or suppressing earlier events. Source browser-log
+  IDs remain stable across polls, so TSP reconciles new events as child adds
+  and changed summaries as text patches (up to the last 40 events). This uses
+  Stencil's documented [layout](https://docs.stencil.so/tern/elements/layout.html)
+  and [text](https://docs.stencil.so/tern/elements/text.html) element semantics.
 - The backend checks task ownership/admin and execution-task binding before
   using its own configured S3 bucket and IAM to read only the expected log
   object (last 256 KiB). The original log URL, token, HTML, command arguments,
@@ -181,7 +191,7 @@ backend: resume regular/scheduled Emma sessions, stream tools, answer a deck,
 inspect plans and AgentRuns; run the operator with a task whose execution
 transitions running → completed and another running → failed, including
 runs with no userInteractions; confirm S3-backed browser events and stable keyed
-row patches, elapsed times, status,
+event-node patches, elapsed times, status,
 artifacts, no sensitive URLs or headers in captured frames; verify an engine
 `task_results/<execution>/<token>/<filename>` fixture does not expose the
 matching `result_files[].token` in JSON, native nodes or wire frames; follow
@@ -190,7 +200,11 @@ then deliver A's delayed select/activate/confirm actions and verify B remains
 Cancel with zero mutations. Confirm current-generation B once and verify
 exactly one POST/PUT; disconnect/reopen the Tern window. Test
 permission denial, stale/completed stop, and failed HTTP calls. Do not merge
-without real host/backend evidence.
+without real host/backend evidence. At native 1280x800 and narrower Tern
+viewports, inspect the actual Run Inspector picker side preview, not just its
+serialized model: verify both `Browser step 1` and `Browser action: click`
+are visibly readable beneath their timestamps/severity; scroll a 40-event
+timeline, then verify incremental add/update frames preserve existing entries.
 
 ## Provenance
 
