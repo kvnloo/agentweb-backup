@@ -80,10 +80,12 @@ describe('branchOwnMessages', () => {
     expect(branchOwnMessages([...COPY, untimed])).toEqual([untimed]);
   });
 
-  it('an own user row written after branchedAt counts even if a legacy source index gap shifted positions', () => {
-    // sourceMessageIndex 9 > the real position (5): only the timestamp identifies the own turn.
-    const gapped = buildBranchRows(SOURCE, 5, { ...ORIGIN, sourceMessageIndex: 9 }, BRANCHED_AT);
-    expect(branchOwnMessages([...gapped, ...OWN])).toEqual(OWN);
+  it('a copied user row stamped after branchedAt (skewed source clock) is still a copy', () => {
+    const skewed = COPY.map((m) => (m.role === 'user'
+      ? { ...m, timestamp: at(35), metadata: { ...(m.metadata ?? {}), timestamp: at(35) } }
+      : m)) as ChatMessage[];
+    expect(branchOwnMessages(skewed)).toEqual([]);
+    expect(branchOwnMessages([...skewed, ...OWN])).toEqual(OWN);
   });
 });
 
