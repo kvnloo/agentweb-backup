@@ -116,6 +116,8 @@ function detailNode(execution: OperatorExecution): TspNode {
           id: safeText(item.id, 80) || 'interaction-' + index,
           cells: {
             when: typeof item.timestamp === 'number'
+              && Number.isFinite(item.timestamp)
+              && Math.abs(item.timestamp) <= 8640000000000000
               ? new Date(item.timestamp).toISOString()
               : '—',
             status: safeText(item.status, 40),
