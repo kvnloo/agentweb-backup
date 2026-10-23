@@ -376,6 +376,11 @@ export class InstagramAdapter implements SocialPlatformAdapter {
                         }
                     }
 
+                    // An unsupported metric is dropped from the request rather than failing it, so say so
+                    // instead of presenting the resulting 0 as a measured value (ENG-2636).
+                    const hasViews = insights.some((i: any) => ['views', 'impressions', 'plays', 'carousel_album_impressions'].includes(i.name));
+                    const metricErrors = hasViews ? undefined : [{ metric: 'views', error: 'Instagram did not return views for this media type; impressions is 0 because it is unavailable, not because there were none.' }];
+
                     // Fall back to media object counts if insights don't include likes/comments
                     let likes = insightLikes || postData?.like_count || 0;
                     let comments = insightComments || postData?.comments_count || 0;
@@ -388,6 +393,7 @@ export class InstagramAdapter implements SocialPlatformAdapter {
                         impressions,
                         engagement: totalInteractions || (likes + comments + saved),
                         fetchedAt,
+                        ...(metricErrors ? { metricErrors } : {}),
                         extendedMetrics: {
                             saved,
                             totalInteractions,
