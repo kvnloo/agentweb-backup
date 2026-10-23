@@ -3324,11 +3324,20 @@ const REVIEW_ISHARE_EXPIRATION_DAYS = 45;
 // until it expires, then regenerated. These links are shared out to reviewers,
 // so the window must outlast the review cycle — but stays bounded because the
 // session may be internal, not customer-shared (see REVIEW_ISHARE_EXPIRATION_DAYS).
+/** ENG-2648: a branch whose every row is a copy of its source (no user turn of its own). */
+function isBranchCopyOnly(session: any): boolean {
+  const messages = Array.isArray(session?.messages) ? session.messages : [];
+  return messages.length > 0 && branchOwnMessages(messages).length === 0;
+}
+
 async function ensureIshareLinkForReview(sessions: any[]): Promise<void> {
   await Promise.all(
     sessions.map(async (session) => {
       const meta = session.interactiveShareMetadata;
       if (meta?.isActive && meta?.token) return;
+      // ENG-2648: never mint a review link for a branch with no turns of its own (a never-continued branch or
+      // the hidden leftover of a failed copy): its content is reviewed under its source.
+      if (isBranchCopyOnly(session)) return;
       try {
         const ishareUrl = await chatbotDb.createOrReuseInteractiveShare(
           session.sessionId,
@@ -3423,11 +3432,12 @@ router.get("/chat-sessions", async (req, res) => {
         })
       );
 
-      // ENG-2648: same own-turn rule as the recent list below — a branch nobody continued is a copy of turns
-      // already listed under its source, so it is left out here too (and gets no review link).
+      // ENG-2648: an owner's own list keeps a revealed branch they never continued (it is one of their chats;
+      // archived leftovers of a failed copy are already excluded by getSessionsWithoutMessages), but
+      // ensureIshareLinkForReview creates no review link for it.
       const nonEmptySessions = sessionsWithMessages.filter((session: any) =>
         Array.isArray(session.messages) &&
-        branchOwnMessages(session.messages).some((msg: any) => msg.role === "user")
+        session.messages.some((msg: any) => msg.role === "user")
       );
 
       const nextOffset = offset + limit;
