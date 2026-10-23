@@ -3,7 +3,6 @@
  * turns into an AgentWeb-paid run), so each deny path has its own case.
  */
 import {
-  admissionPlanFor,
   DEFAULT_SERVED_ALIASES,
   PLAN_MODEL_ALIASES,
   pickHostedClaudeConnection,
@@ -15,6 +14,7 @@ import {
   type SubscriptionRouteDeps,
 } from "../subscriptionRoute";
 import type { LlmConnectionRecord } from "../llmConnectionDb";
+import { LLM_MODEL_REGISTRY } from "../../agentMode/llmModelRegistry";
 
 const NOW = 1_800_000_000_000;
 const SONNET = "openrouter/anthropic/claude-sonnet-5.5";
@@ -101,6 +101,7 @@ describe("resolveSubscriptionRoute: the allow-list is default deny", () => {
     ["a delegated session", { isDelegated: true }],
     ["an interactive share", { isInteractiveShare: true }],
     ["a conversable visitor", { entry: "conversable" }],
+    ["the share entry", { entry: "share" }],
     ["slack", { entry: "slack" }],
     ["email", { entry: "email" }],
     ["teams/other transports", { entry: "teams_or_other_transport" }],
@@ -151,7 +152,7 @@ describe("resolveSubscriptionRoute: flag, model, connection", () => {
 
 describe("pickHostedClaudeConnection", () => {
   const reason = (records: LlmConnectionRecord[]) => {
-    const r = pickHostedClaudeConnection(records, NOW);
+    const r = pickHostedClaudeConnection(records, NOW, "u1");
     return r.ok ? "ok" : r.reason;
   };
   it("no_connection: none, a revoked one, an api-key one, a legacy (not hosted) login", () => {
@@ -185,6 +186,7 @@ describe("pickHostedClaudeConnection", () => {
     const picked = pickHostedClaudeConnection(
       [conn({ connectionId: "old", updatedAt: "2026-09-01T00:00:00Z" }), conn({ connectionId: "dead", status: "invalid", updatedAt: "2026-10-09T00:00:00Z" }), conn({ connectionId: "new", updatedAt: "2026-10-05T00:00:00Z" })],
       NOW,
+      "u1",
     );
     expect(picked.ok && picked.record.connectionId).toBe("new");
   });
@@ -225,39 +227,117 @@ describe("toRunFunding", () => {
   });
 });
 
-describe("admissionPlanFor", () => {
-  const agentweb: RouteDecision = { route: "agentweb" };
-  const plan: RouteDecision = { route: "claude_subscription", connectionId: "c", epoch: 1, alias: "sonnet", modelId: SONNET, ownerUserId: "u1" };
-  const stop: RouteDecision = { route: "stop", reason: "no_connection" };
+describe("strict inputs: anything that is not a real false is treated as true and denied", () => {
+  it.each([undefined, null, 0, "false", "", NaN])("isDelegated = %p is denied", async (v) => {
+    const d = deps();
+    expect(await resolveSubscriptionRoute(input({ isDelegated: v as never }), d)).toEqual({ route: "stop", reason: "not_allowed_here" });
+    expect(d.calls).toEqual({ flag: 0, list: 0 });
+  });
+  it.each([undefined, null, 0, "false", "", NaN])("isInteractiveShare = %p is denied", async (v) => {
+    expect(await resolveSubscriptionRoute(input({ isInteractiveShare: v as never }), deps())).toEqual({ route: "stop", reason: "not_allowed_here" });
+  });
+  it("ids are compared exactly: case, whitespace and unicode normalization differences are denied", async () => {
+    for (const initiatorUserId of ["U1", "u1 ", " u1", "u1\u0000", "\u0075\u0031\u200b"]) {
+      expect(await resolveSubscriptionRoute(input({ initiatorUserId }), deps())).toEqual({ route: "stop", reason: "not_allowed_here" });
+    }
+    expect(await resolveSubscriptionRoute(input({ sessionOwnerUserId: "caf\u00e9", initiatorUserId: "cafe\u0301" }), deps())).toEqual({ route: "stop", reason: "not_allowed_here" });
+  });
+});
 
-  it("an AgentWeb turn keeps every allowance gate exactly as today", () => {
-    for (const allowed of [true, false]) {
-      expect(admissionPlanFor(agentweb, { agentwebAllowanceAllowed: allowed })).toEqual({
-        runTurn: true,
-        checkAgentWebAllowanceForModel: true,
-        recordPaygAdmission: true,
-        applyModelPolicySwap: true,
-        requirePlanEntitlement: false,
-        auxiliaryAgentWebSpend: "allowed",
-      });
+describe("the connection must belong to the session owner, whatever the list contains", () => {
+  it("ignores a record owned by someone else even if the lookup returned it", async () => {
+    const d = await resolveSubscriptionRoute(input(), deps({ records: [conn({ ownerUserId: "u2", connectionId: "theirs" })] }));
+    expect(d).toEqual({ route: "stop", reason: "no_connection" });
+  });
+  it("takes the funding owner from the session owner, never from the record", async () => {
+    const d = await resolveSubscriptionRoute(input(), deps({ records: [conn({ connectionId: "mine" }), conn({ ownerUserId: "u2", connectionId: "theirs", updatedAt: "2030-01-01T00:00:00Z" })] }));
+    expect(d).toMatchObject({ route: "claude_subscription", connectionId: "mine", ownerUserId: "u1" });
+  });
+  it("a lookup that returns something that is not a list is a lookup failure, not a crash and not agentweb", async () => {
+    for (const bad of [undefined, null, {}, "x"]) {
+      expect(await resolveSubscriptionRoute(input(), deps({ listConnections: async () => bad as never }))).toEqual({ route: "stop", reason: "lookup_failed" });
+    }
+    expect(await resolveSubscriptionRoute(input(), deps({ listConnections: async () => [null as never] }))).toEqual({ route: "stop", reason: "lookup_failed" });
+  });
+  it("a dependency that throws synchronously fails closed", async () => {
+    const boom = () => {
+      throw new Error("sync");
+    };
+    expect(await resolveSubscriptionRoute(input(), deps({ isEnabledFor: boom as never }))).toEqual({ route: "stop", reason: "lookup_failed" });
+    expect(await resolveSubscriptionRoute(input(), deps({ listConnections: boom as never }))).toEqual({ route: "stop", reason: "lookup_failed" });
+  });
+});
+
+describe("pickHostedClaudeConnection: more shapes", () => {
+  const pick = (records: LlmConnectionRecord[]) => pickHostedClaudeConnection(records, NOW, "u1");
+  it("an unusable expiry value counts as expired, an absent one does not", () => {
+    for (const bad of [Number.NaN, "999999999999999" as unknown as number, Infinity * 0, -5]) {
+      const r = pick([conn({ subRefreshExpiresAtMs: bad })]);
+      expect(r.ok).toBe(false);
+      expect(!r.ok && r.reason).toBe("expired");
+    }
+    expect(pick([conn({ subRefreshExpiresAtMs: undefined })]).ok).toBe(true);
+  });
+  it("an unknown status string never routes", () => {
+    const r = pick([conn({ status: "weird" as never })]);
+    expect(!r.ok && r.reason).toBe("revoked_or_disabled");
+  });
+  it("status revoked without a revokedAt still never routes", () => {
+    const r = pick([conn({ status: "revoked" })]);
+    expect(!r.ok && r.reason).toBe("revoked_or_disabled");
+  });
+  it("expired is reported before needs_reconnect when both are present", () => {
+    const r = pick([conn({ connectionId: "a", status: "expired" }), conn({ connectionId: "b", status: "invalid", subNeedsReconnect: true })]);
+    expect(!r.ok && r.reason).toBe("expired");
+  });
+  it("ties are broken deterministically: newest, then higher epoch, then lowest id; a missing updatedAt falls back to createdAt", () => {
+    const same = "2026-10-05T00:00:00Z";
+    const a = pick([conn({ connectionId: "b", updatedAt: same, subHostEpoch: 2 }), conn({ connectionId: "a", updatedAt: same, subHostEpoch: 2 }), conn({ connectionId: "c", updatedAt: same, subHostEpoch: 7 })]);
+    expect(a.ok && a.record.connectionId).toBe("c");
+    const b = pick([conn({ connectionId: "b", updatedAt: same, subHostEpoch: 2 }), conn({ connectionId: "a", updatedAt: same, subHostEpoch: 2 })]);
+    expect(b.ok && b.record.connectionId).toBe("a");
+    // ids deliberately sort the OTHER way round from the dates, so only the createdAt fallback can pick the newer one
+    const c = pick([conn({ connectionId: "a-older", updatedAt: undefined, createdAt: "2026-01-01T00:00:00Z" }), conn({ connectionId: "z-newer", updatedAt: undefined, createdAt: "2026-06-01T00:00:00Z" })]);
+    expect(c.ok && c.record.connectionId).toBe("z-newer");
+  });
+});
+
+describe("check order and timers", () => {
+  it("the flag is checked before the model: an unlisted user with an unservable model sees not_enabled, not model_not_on_plan", async () => {
+    expect(await resolveSubscriptionRoute(input({ model: "gpt-5" }), deps({ isEnabledFor: async () => false }))).toEqual({ route: "stop", reason: "not_enabled" });
+  });
+  it("leaves no timer behind after a normal answer, a failure or a timeout", async () => {
+    jest.useFakeTimers();
+    try {
+      await resolveSubscriptionRoute(input(), deps());
+      await resolveSubscriptionRoute(input(), deps({ isEnabledFor: async () => Promise.reject(new Error("x")) }));
+      const slow = resolveSubscriptionRoute(input(), deps({ isEnabledFor: () => new Promise<boolean>(() => undefined), lookupTimeoutMs: 50 }));
+      jest.advanceTimersByTime(60);
+      expect(await slow).toEqual({ route: "stop", reason: "lookup_failed" });
+      expect(jest.getTimerCount()).toBe(0);
+    } finally {
+      jest.useRealTimers();
     }
   });
-  it("a plan turn is not blocked, billed or model-swapped by the AgentWeb allowance", () => {
-    const p = admissionPlanFor(plan, { agentwebAllowanceAllowed: false });
-    expect(p).toMatchObject({ runTurn: true, checkAgentWebAllowanceForModel: false, recordPaygAdmission: false, applyModelPolicySwap: false, requirePlanEntitlement: true });
+});
+
+describe("alias table vs the real model registry", () => {
+  it("every key is a real registry id, so a rename fails CI instead of silently disabling the plan route", () => {
+    for (const id of Object.keys(PLAN_MODEL_ALIASES)) expect((LLM_MODEL_REGISTRY as Record<string, unknown>)[id]).toBeDefined();
   });
-  it("auxiliary AgentWeb spend on a plan turn is refused while the allowance is paused, allowed otherwise", () => {
-    expect(admissionPlanFor(plan, { agentwebAllowanceAllowed: false }).auxiliaryAgentWebSpend).toBe("refused");
-    expect(admissionPlanFor(plan, { agentwebAllowanceAllowed: true }).auxiliaryAgentWebSpend).toBe("allowed");
+  it("pins today's visibility: haiku-5.5 and sonnet-5.5 are admin-only in the registry, opus-5.5 and fable-5.1 are not (picker visibility is an L5 decision)", () => {
+    const adminOnly = (id: string) => (LLM_MODEL_REGISTRY as Record<string, { adminOnly?: boolean } | undefined>)[id]?.adminOnly === true;
+    expect(adminOnly("openrouter/anthropic/claude-haiku-5.5")).toBe(true);
+    expect(adminOnly("openrouter/anthropic/claude-sonnet-5.5")).toBe(true);
+    expect(adminOnly("openrouter/anthropic/claude-opus-5.5")).toBe(false);
+    expect(adminOnly("openrouter/anthropic/claude-fable-5.1")).toBe(false);
   });
-  it("a stopped decision runs nothing and spends nothing", () => {
-    expect(admissionPlanFor(stop, { agentwebAllowanceAllowed: true })).toEqual({
-      runTurn: false,
-      checkAgentWebAllowanceForModel: false,
-      recordPaygAdmission: false,
-      applyModelPolicySwap: false,
-      requirePlanEntitlement: false,
-      auxiliaryAgentWebSpend: "refused",
-    });
+});
+
+describe("toRunFunding billing subject", () => {
+  const decision = { route: "claude_subscription", connectionId: "c9", epoch: 4, alias: "opus", modelId: "m", ownerUserId: "member-1" } as const;
+  it("defaults to the owner, and takes the controller's resolved billing subject (the org root) when given", () => {
+    expect(toRunFunding(decision, "t").billingUserId).toBe("member-1");
+    expect(toRunFunding(decision, "t", "org-root-9")).toMatchObject({ billingUserId: "org-root-9", ownerUserId: "member-1", fundingPrincipalId: "member-1", fallback: "stop" });
   });
 });

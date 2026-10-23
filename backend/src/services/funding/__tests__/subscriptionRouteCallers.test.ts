@@ -1,33 +1,50 @@
 /**
- * ENG-2113 PR A: every way a chat turn can start (`generateSessionResponse`) is listed here with who starts it. This test FAILS when a new call
- * site appears or one disappears, so nobody can add an entry point that silently inherits (or silently lacks) the subscription-route rules in
- * subscriptionRoute.ts. Only the authenticated owner's plain /generate chat may ever use a customer's plan; every other row must resolve as
- * `RouteEntry` other than "owner_chat" when the route resolution is wired in (PR C), which default-denies them.
+ * ENG-2113 PR A: every way a chat turn can start (`generateSessionResponse`) is listed here with who starts it. This test FAILS when a call site
+ * is added, removed, MOVED to another function, or hidden behind an alias, so nobody can add an entry point that silently inherits (or silently
+ * lacks) the subscription-route rules in subscriptionRoute.ts. Only the authenticated owner's plain /generate chat may ever use a customer's plan;
+ * every other row must resolve to a `RouteEntry` other than "owner_chat" when route resolution is wired in (PR C), which default-denies them.
  *
- * To add or remove a call site: update the table below in the same change, and classify the new entry in subscriptionRoute.ts (RouteEntry).
+ * This is a tripwire, not the guard: the guard is that the resolver is default-deny and that PR C derives `entry` from the call site. When
+ * PR C makes `entry`/`fundingChoice` a REQUIRED parameter of generateSessionResponse the compiler enforces the classification and this test can go.
+ *
+ * To add, move or remove a call site: update EXPECTED in the same change, and classify the new entry in subscriptionRoute.ts (RouteEntry).
  */
 import { readdirSync, readFileSync, statSync } from "fs";
 import { join, relative } from "path";
 
 const SRC = join(__dirname, "..", "..", "..");
 
-/** file (relative to src) -> number of call sites and who starts those turns */
-const EXPECTED: Record<string, { calls: number; who: string }> = {
+/** file -> the enclosing function of each call site (sorted), and who starts those turns. */
+const EXPECTED: Record<string, { sites: string[]; who: string }> = {
   "controllers/agentModeController.ts": {
-    calls: 10,
-    who:
-      "1 owner_chat (/generate by the authenticated owner: the ONLY plan-eligible site) + 9 not eligible: media continuation, work-plan continuation, " +
-      "verified-chat retry loop (scheduled/verified), verified-chat continuation, reflection turn, interactive share, conversable visitor, " +
-      "plan launch (x2 call sites)",
+    sites: [
+      "function runScheduleSelfImprovement", // scheduled self-improvement turn
+      "function runVerifiedChatInner", // scheduled / verified chat: its retry loop call ...
+      "function runVerifiedChatInner", // ... and its continuation call
+      "function scheduleAutoMediaContinuation", // automatic follow-up turn
+      "function scheduleAutoWorkPlanContinuation", // automatic follow-up turn
+      "method createSessionWithPlan", // plan launch (two call sites)
+      "method createSessionWithPlan",
+      "method generateConversableResponse", // anonymous visitor through a conversable link
+      "method generateResponse", // OWNER_CHAT_SITE: /generate by the authenticated session owner, the ONLY plan-eligible site
+      "method generateSharedResponse", // interactive share
+    ],
+    who: "only generateResponse may ever be plan-eligible",
   },
-  "routes/gtmPlan.ts": { calls: 1, who: "gtm plan first turn" },
-  "routes/admin.ts": { calls: 1, who: "admin launches a plan turn as the plan owner (admin_launch)" },
-  "routes/slack.ts": { calls: 1, who: "Slack thread turn (third-party text possible)" },
-  "services/emmaEmailService.ts": { calls: 1, who: "email turn (external sender text)" },
-  "services/onboardingBrandBuildService.ts": { calls: 2, who: "onboarding brand build (background)" },
-  "services/approvalInboxExecution.ts": { calls: 1, who: "approval inbox resume (server-authored)" },
-  "services/conversation/sessionResponder.ts": { calls: 1, who: "Teams / other transports" },
+  "routes/admin.ts": { sites: ["route /gtm-plans/:planId/phases/:phaseId/work-items/:workItemId/start-session"], who: "admin launches a plan work item as the plan owner (admin_launch)" },
+  "routes/gtmPlan.ts": { sites: ["route /:planId/phases/:phaseId/work-items/:workItemId/start-session"], who: "gtm plan work item first turn" },
+  "routes/slack.ts": { sites: ["function handleMappedSlackThreadResponse"], who: "Slack thread (third-party text possible)" },
+  "services/approvalInboxExecution.ts": { sites: ["function resumeOriginSession"], who: "approval inbox resume (server-authored)" },
+  "services/conversation/sessionResponder.ts": { sites: ["function handleSessionResponse"], who: "Teams / other transports" },
+  "services/emmaEmailService.ts": { sites: ["method processInboundEmail"], who: "email turn (external sender text)" },
+  "services/onboardingBrandBuildService.ts": { sites: ["function defaultDeps", "function triggerBrandBuildForUser"], who: "onboarding brand build (background; calls go through an injected dependency)" },
 };
+
+/** The one place a turn may use a customer's plan. Every other site must be classified as a different RouteEntry when wiring lands. */
+const OWNER_CHAT_SITE = { file: "controllers/agentModeController.ts", site: "method generateResponse" };
+
+/** Known, reviewed aliasing: onboarding injects the function as a dependency (a background caller, never plan-eligible). */
+const ALLOWED_ALIASING = ["services/onboardingBrandBuildService.ts: renamed on destructuring or in an object: { generateSessionResponse: d"];
 
 function listTs(dir: string, out: string[] = []): string[] {
   for (const name of readdirSync(dir)) {
@@ -43,35 +60,68 @@ function listTs(dir: string, out: string[] = []): string[] {
   return out;
 }
 
-function scan(): { calls: Record<string, number>; aliasing: string[] } {
-  const calls: Record<string, number> = {};
+/** The nearest named function / top-level arrow handler / route above `index`, as a stable label. */
+function enclosing(text: string, index: number): string {
+  const before = text.slice(0, index);
+  const markers = [
+    ...before.matchAll(
+      /(?:^|\n)[ \t]*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z0-9_$]+)|(?:^|\n)(?:export\s+)?const\s+([A-Za-z0-9_$]+)\s*(?::[^=\n]+)?=\s*(?:async\s*)?(?:\(|[A-Za-z_$][\w$]*\s*=>)|(?:^|\n) {2}(?:async\s+)?(?!(?:if|while|for|switch|catch|return|await|void)\b)([A-Za-z0-9_$]+)\s*\([^)\n]*\)\s*(?::[^{\n]+)?\{|\brouter\.(?:get|post|put|patch|delete)\(\s*['"`]([^'"`]+)['"`]/g,
+    ),
+  ];
+  const last = markers[markers.length - 1];
+  if (!last) return "(module level)";
+  return last[1] ? `function ${last[1]}` : last[2] ? `const ${last[2]}` : last[3] ? `method ${last[3]}` : `route ${last[4]}`;
+}
+
+function isInComment(text: string, index: number): boolean {
+  const lineStart = text.lastIndexOf("\n", index) + 1;
+  const prefix = text.slice(lineStart, index).trim();
+  return prefix.startsWith("//") || prefix.startsWith("*") || prefix.startsWith("/*");
+}
+
+export function scan(): { sites: Record<string, string[]>; aliasing: string[] } {
+  const sites: Record<string, string[]> = {};
   const aliasing: string[] = [];
   for (const file of listTs(SRC)) {
     const rel = relative(SRC, file);
-    const lines = readFileSync(file, "utf8").split("\n");
-    lines.forEach((line, i) => {
-      const t = line.trim();
-      if (t.startsWith("//") || t.startsWith("*") || t.startsWith("/*")) return;
-      if (!/\bgenerateSessionResponse\b/.test(line)) return;
-      if (/\bfunction\s+generateSessionResponse\b/.test(line)) return; // the definition
-      const n = (line.match(/\bgenerateSessionResponse\s*\(/g) ?? []).length;
-      if (n > 0) calls[rel] = (calls[rel] ?? 0) + n;
-      // Ways to call it that this count would miss: bind/call/apply, or assigning the function to another name.
-      if (/\bgenerateSessionResponse\s*\.\s*(bind|call|apply)\b/.test(line)) aliasing.push(`${rel}:${i + 1}: ${t.slice(0, 100)}`);
-      if (/(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*generateSessionResponse\s*(?:;|$)/.test(line)) aliasing.push(`${rel}:${i + 1}: ${t.slice(0, 100)}`);
-    });
+    const text = readFileSync(file, "utf8");
+    if (!/generateSessionResponse/.test(text)) continue;
+    for (const m of text.matchAll(/\bgenerateSessionResponse\s*\(/g)) {
+      const i = m.index as number;
+      if (isInComment(text, i)) continue;
+      if (/function\s+$/.test(text.slice(Math.max(0, i - 12), i))) continue; // the definition itself
+      (sites[rel] ??= []).push(enclosing(text, i));
+    }
+    // Ways to reach it that a call-site scan would miss: bind/call/apply, renaming, assigning, passing it as a value.
+    const hiding: Array<[string, RegExp]> = [
+      ["bind/call/apply", /\bgenerateSessionResponse\s*\.\s*(?:bind|call|apply)\b/g],
+      ["renamed on destructuring or in an object", /[{,]\s*generateSessionResponse\s*:\s*[A-Za-z_$]/g],
+      ["assigned to another name", /(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*generateSessionResponse\s*(?:;|$)/gm],
+      ["passed as a value", /[(,]\s*generateSessionResponse\s*[,)]/g],
+    ];
+    for (const [what, re] of hiding) {
+      for (const m of text.matchAll(re)) {
+        if (isInComment(text, m.index as number)) continue;
+        aliasing.push(`${rel}: ${what}: ${m[0].trim().slice(0, 80)}`);
+      }
+    }
   }
-  return { calls, aliasing };
+  for (const k of Object.keys(sites)) sites[k].sort();
+  return { sites, aliasing };
 }
 
 describe("generateSessionResponse call sites are all classified", () => {
   const found = scan();
-  it("has exactly the call sites listed in EXPECTED (a new or removed site must be classified here)", () => {
-    const actual = Object.fromEntries(Object.entries(found.calls).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => [k, v]));
-    const expected = Object.fromEntries(Object.entries(EXPECTED).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => [k, v.calls]));
-    expect(actual).toEqual(expected);
+  it("has exactly the call sites listed in EXPECTED, in the functions listed (a new, moved or removed site must be classified here)", () => {
+    const expected = Object.fromEntries(Object.entries(EXPECTED).map(([k, v]) => [k, [...v.sites].sort()]));
+    expect(found.sites).toEqual(expected);
   });
-  it("is never aliased, bound or applied under another name (which would hide a call site from this test)", () => {
-    expect(found.aliasing).toEqual([]);
+  it("has exactly one plan-eligible site, and it is the owner's /generate handler", () => {
+    expect(EXPECTED[OWNER_CHAT_SITE.file].sites.filter((x) => x === OWNER_CHAT_SITE.site)).toHaveLength(1);
+    const others = Object.entries(found.sites).flatMap(([file, sites]) => sites.map((x) => `${file}#${x}`)).filter((x) => x !== `${OWNER_CHAT_SITE.file}#${OWNER_CHAT_SITE.site}`);
+    expect(others.length).toBe(Object.values(found.sites).flat().length - 1);
+  });
+  it("is never bound, renamed, assigned to another name or passed as a value (which would hide a call site)", () => {
+    expect(found.aliasing).toEqual(ALLOWED_ALIASING);
   });
 });

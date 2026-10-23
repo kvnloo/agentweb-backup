@@ -11,6 +11,15 @@
  *  - A pick that cannot be honoured (flag off, connection dead, model not served by the plan, lookup failed) is a typed STOP. It is never
  *    converted into an AgentWeb-paid run: the user asked for their plan.
  *  - The credential never appears here: a connection is a reference (id + epoch); the login lives in the host's per-connection home.
+ *
+ * CONTRACT FOR THE CALLER (the controller, when this is wired in; none of it can be checked here):
+ *  - `sessionOwnerUserId` is `session.userId`, NEVER `req.user.userId`: in a delegated request `req.user` is the TARGET user, so id equality alone
+ *    cannot reveal delegation. `isDelegated` must therefore combine BOTH `req.delegateInfo?.isDelegated` and the session's persisted delegate flag.
+ *  - `isDelegated` and `isInteractiveShare` must be real booleans; anything else (undefined, null, "false") is treated as "yes" and denied.
+ *  - `model` is the canonical registry id of the user's EXPLICIT pick (resolve legacy ids with the registry's canonicalPinId first), re-read on every
+ *    message. It is never the "effective" model after resolveEffectiveModelForUser or the agentweb-model router: a silent swap must not change which
+ *    model the plan runs.
+ *  - The funding choice is re-resolved on every message; this module holds no state.
  */
 import type { LlmConnectionRecord } from "./llmConnectionDb";
 import type { RunFunding } from "./runFunding";
@@ -22,6 +31,9 @@ export type PlanAlias = "haiku" | "sonnet" | "opus" | "fable";
  * Registry model id -> the CLI alias that runs that exact model. Verified against the pinned CLI (2.1.294) with the `init` event on 2026-10-23:
  * haiku -> claude-haiku-5-5, sonnet -> claude-sonnet-5-5, opus -> claude-opus-5-5, fable -> claude-fable-5-1. An id that is not listed here
  * (an older version such as Opus 4.8, any non-Claude model) has NO plan route: the alias would silently run a different model than the one picked.
+ * Note (2026-10-23): in the registry `haiku-5.5` and `sonnet-5.5` are adminOnly today, and the customer-visible Claude entries are other ids
+ * (e.g. Bedrock "Claude Sonnet 5"), which are different models and deliberately NOT mapped. Which of these the picker offers is an L5 decision;
+ * this table only says which picks CAN run on a plan. `DEFAULT_SERVED_ALIASES` mirrors the host config's `claude.models`; keep them in step.
  */
 export const PLAN_MODEL_ALIASES: Readonly<Record<string, PlanAlias>> = Object.freeze({
   "openrouter/anthropic/claude-haiku-5.5": "haiku",
@@ -133,14 +145,19 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
 
 type Picked = { ok: true; record: LlmConnectionRecord; epoch: number } | { ok: false; reason: StopReason };
 
-/** Picks the connection a plan turn would use, or the most informative reason there is none. Pure. */
-export function pickHostedClaudeConnection(records: LlmConnectionRecord[], nowMs: number): Picked {
-  const candidates = records.filter((r) => r.kind === "claude_subscription" && r.subHosted === true && !r.revokedAt);
+/**
+ * Picks the connection a plan turn would use, or the most informative reason there is none. Pure. Only records OWNED by `ownerUserId` count: the
+ * list comes from an owner-indexed query today, but this must not depend on that.
+ */
+export function pickHostedClaudeConnection(records: LlmConnectionRecord[], nowMs: number, ownerUserId: string): Picked {
+  const candidates = records.filter((r) => r.ownerUserId === ownerUserId && r.kind === "claude_subscription" && r.subHosted === true && !r.revokedAt);
   if (candidates.length === 0) return { ok: false, reason: "no_connection" };
-  const refreshExpired = (r: LlmConnectionRecord) => typeof r.subRefreshExpiresAtMs === "number" && r.subRefreshExpiresAtMs <= nowMs;
+  // A present-but-unusable expiry (NaN, a string) counts as expired; only an ABSENT expiry (older rows) means "no known expiry".
+  const refreshExpired = (r: LlmConnectionRecord) => r.subRefreshExpiresAtMs !== undefined && !(Number.isFinite(r.subRefreshExpiresAtMs) && r.subRefreshExpiresAtMs > nowMs);
+  const when = (r: LlmConnectionRecord) => r.updatedAt ?? r.createdAt ?? "";
   const usable = candidates
     .filter((r) => r.status === "active" && r.subNeedsReconnect !== true && !refreshExpired(r) && Number.isInteger(r.subHostEpoch) && (r.subHostEpoch as number) >= 1)
-    .sort((a, b) => (b.updatedAt ?? b.createdAt ?? "").localeCompare(a.updatedAt ?? a.createdAt ?? ""));
+    .sort((a, b) => (when(a) < when(b) ? 1 : when(a) > when(b) ? -1 : 0) || (b.subHostEpoch as number) - (a.subHostEpoch as number) || (a.connectionId < b.connectionId ? -1 : a.connectionId > b.connectionId ? 1 : 0));
   if (usable.length > 0) return { ok: true, record: usable[0], epoch: usable[0].subHostEpoch as number };
   if (candidates.some((r) => r.status === "expired" || refreshExpired(r))) return { ok: false, reason: "expired" };
   if (candidates.some((r) => r.status === "invalid" || r.subNeedsReconnect === true)) return { ok: false, reason: "needs_reconnect" };
@@ -160,8 +177,8 @@ export async function resolveSubscriptionRoute(input: RouteInput, deps: Subscrip
     typeof input.initiatorUserId !== "string" ||
     input.initiatorUserId.length === 0 ||
     input.initiatorUserId !== input.sessionOwnerUserId ||
-    input.isDelegated ||
-    input.isInteractiveShare
+    input.isDelegated !== false ||
+    input.isInteractiveShare !== false
   ) {
     return { route: "stop", reason: "not_allowed_here" };
   }
@@ -184,7 +201,13 @@ export async function resolveSubscriptionRoute(input: RouteInput, deps: Subscrip
   } catch {
     return { route: "stop", reason: "lookup_failed" };
   }
-  const picked = pickHostedClaudeConnection(records, deps.now());
+  let picked: Picked;
+  try {
+    if (!Array.isArray(records)) throw new Error("not a list");
+    picked = pickHostedClaudeConnection(records, deps.now(), input.sessionOwnerUserId);
+  } catch {
+    return { route: "stop", reason: "lookup_failed" };
+  }
   if (!picked.ok) return { route: "stop", reason: picked.reason };
   return {
     route: "claude_subscription",
@@ -192,55 +215,26 @@ export async function resolveSubscriptionRoute(input: RouteInput, deps: Subscrip
     epoch: picked.epoch,
     alias,
     modelId: input.model,
-    ownerUserId: picked.record.ownerUserId,
+    ownerUserId: input.sessionOwnerUserId,
   };
 }
 
-/** The ambient RunFunding for a plan turn. `fallback: "stop"` is fixed: a plan run is never converted into an AgentWeb-paid one. */
-export function toRunFunding(decision: Extract<RouteDecision, { route: "claude_subscription" }>, nowIso: string): RunFunding {
+/**
+ * The ambient RunFunding for a plan turn. `fallback: "stop"` is fixed: a plan run is never converted into an AgentWeb-paid one.
+ * `billingUserId` is the run's billing SUBJECT (the org root for an org member, as the live path resolves it): pass the controller's resolved
+ * value so ledger and audit attribution agree with the rest of the turn. It defaults to the owner only for a user with no org.
+ */
+export function toRunFunding(decision: Extract<RouteDecision, { route: "claude_subscription" }>, nowIso: string, billingUserId: string = decision.ownerUserId): RunFunding {
   return {
     route: "claude_subscription",
     connectionId: decision.connectionId,
     provider: "anthropic",
     fallback: "stop",
     ownerUserId: decision.ownerUserId,
-    billingUserId: decision.ownerUserId,
+    billingUserId,
     fundingPrincipalId: decision.ownerUserId,
     hostEpoch: decision.epoch,
     planModel: decision.alias,
     resolvedAt: nowIso,
   };
-}
-
-/**
- * Which AgentWeb-allowance gates apply to a turn, given the route. Pure policy table; the controller uses it once funding is resolved,
- * BEFORE the allowance gates (see design v3 section 3.3). For an AgentWeb turn nothing changes. For a plan turn the model tokens are not
- * paid from the allowance, so the allowance gates (and the pay-as-you-go admission they record) do not apply to them; AgentWeb-paid
- * auxiliary spend (embeddings, media/research tools, helpers) is allowed only while the allowance is not paused.
- */
-export interface AdmissionPlan {
-  runTurn: boolean;
-  checkAgentWebAllowanceForModel: boolean;
-  recordPaygAdmission: boolean;
-  applyModelPolicySwap: boolean;
-  requirePlanEntitlement: boolean;
-  auxiliaryAgentWebSpend: "allowed" | "refused";
-}
-
-export function admissionPlanFor(decision: RouteDecision, ctx: { agentwebAllowanceAllowed: boolean }): AdmissionPlan {
-  switch (decision.route) {
-    case "agentweb":
-      return { runTurn: true, checkAgentWebAllowanceForModel: true, recordPaygAdmission: true, applyModelPolicySwap: true, requirePlanEntitlement: false, auxiliaryAgentWebSpend: "allowed" };
-    case "claude_subscription":
-      return {
-        runTurn: true,
-        checkAgentWebAllowanceForModel: false,
-        recordPaygAdmission: false,
-        applyModelPolicySwap: false,
-        requirePlanEntitlement: true,
-        auxiliaryAgentWebSpend: ctx.agentwebAllowanceAllowed ? "allowed" : "refused",
-      };
-    case "stop":
-      return { runTurn: false, checkAgentWebAllowanceForModel: false, recordPaygAdmission: false, applyModelPolicySwap: false, requirePlanEntitlement: false, auxiliaryAgentWebSpend: "refused" };
-  }
 }
