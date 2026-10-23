@@ -14,9 +14,10 @@ session. What did double-count: every reader that treats the branch's rows as it
   never-continued branches, and created iShare review links on them; `get_chat_history` attributed the
   copied turns' models, waits and heap to the branch.
 
-Fix: `branchOwnMessages(messages)` returns the rows from the branch's first OWN user message on (a user row
-after the branched-from assistant row, or written after `branchOrigin.branchedAt`); a non-branch is returned
-unchanged. Those four readers use it. The `?sessionId=` admin lookup still finds any session by id, so an
+Fix: `branchOwnMessages(messages)` returns the rows from the branch's first OWN user message on: a user row
+positioned after the branched-from assistant row (`branchOrigin.sourceMessageIndex`). Position only — a copied
+row keeps its source timestamp, so timestamps cannot tell a copy from an own turn. A non-branch is returned
+unchanged. Those readers use it (both admin lists: recent and owner-filtered). The `?sessionId=` admin lookup still finds any session by id, so an
 orphan named in a `ChatBranching: unexpected failure` log line can still be inspected.
 
 Orphan sweep: not built. Leftovers are hidden (archived) and are now excluded from every reader above.
