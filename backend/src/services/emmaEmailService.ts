@@ -1,6 +1,6 @@
 import axios from 'axios';
 import { EMMA_EMAIL_ADDRESS, EMMA_EMAIL_FROM, TEMP_EMAIL_PREFIX, TEMP_EMAIL_DOMAIN } from '../config';
-import { resendService } from './resendService';
+import { resendService, ReceivedEmailAuthentication } from './resendService';
 import { chatbotDb } from './chatbotService';
 import { generateSessionResponse, modelUnavailableBody } from '../controllers/agentModeController';
 import { isModelUnavailableError } from './agentMode/modelUnavailable';
@@ -96,7 +96,20 @@ export class EmmaEmailService {
   }
 
   /**
-   * Look up a registered user by email. Returns null if not found.
+   * ENG-2652: whether Resend's receiving server proved the From address genuine. The From header
+   * is whatever the sender typed, and resolveUserId turns it into the account Emma acts for, so
+   * an unproven From must never pick an account. Accepted: DMARC `pass` (SPF or DKIM aligned with
+   * the From domain), or DKIM `pass` (Resend reports a signature from any domain other than the
+   * From domain as `gray`, so `pass` is a From-aligned signature). SPF `pass` alone is not enough:
+   * it covers the envelope sender, which need not be the From domain. Missing verdicts fail closed.
+   */
+  isSenderAuthenticated(authentication: ReceivedEmailAuthentication | null | undefined): boolean {
+    return authentication?.dmarc === 'pass' || authentication?.dkim === 'pass';
+  }
+
+  /**
+   * Look up a registered user by email. Returns null if not found. Callers must first establish
+   * that the address is authenticated (isSenderAuthenticated): this trusts it as given.
    */
   async resolveUserId(senderEmail: string): Promise<string | null> {
     const user = await userDb.getUserByEmail(senderEmail);
@@ -202,17 +215,28 @@ export class EmmaEmailService {
     // 2. Extract message body
     const messageBody = this.extractMessageBody(emailContent);
 
-    // 3. Extract session ID from subject
+    // 3. Refuse a sender whose From address is not authenticated (ENG-2652). It decides which
+    // account Emma acts for, so a forged From would otherwise run a turn inside — and email back —
+    // another person's account. No reply: replying would mail the forged address.
+    if (!this.isSenderAuthenticated(emailContent.authentication)) {
+      console.warn(
+        `[EmmaEmail] Ignoring inbound email ${event.emailId}: sender not authenticated ` +
+        `(authentication=${JSON.stringify(emailContent.authentication ?? null)})`
+      );
+      return;
+    }
+
+    // 4. Extract session ID from subject
     const existingSessionId = this.extractSessionId(event.subject);
 
-    // 4. Resolve user — reject unregistered senders
+    // 5. Resolve user — reject unregistered senders
     const userId = await this.resolveUserId(event.from);
     if (!userId) {
       await this.sendUnregisteredUserReply(event);
       return;
     }
 
-    // 5. Determine session: continue the referenced session only when the sender owns it,
+    // 6. Determine session: continue the referenced session only when the sender owns it,
     // otherwise start a new one. ENG-2652: a [ref:<id>] tag is just subject text, so it must not
     // let a sender run a turn in (and receive the iShare link of) another account's chat. Owner
     // only, admins included: email carries no delegate ("access account") context, and its sender
@@ -244,13 +268,13 @@ export class EmmaEmailService {
       console.log(`[EmmaEmail] Created new Agent Mode session ${sessionId}`);
     }
 
-    // 6. Update email metadata on session
+    // 7. Update email metadata on session
     await chatbotDb.updateSessionEmailMetadata(sessionId, {
       senderEmail: event.from,
       lastInboundEmailId: event.emailId,
     });
 
-    // 7. Upload email attachments to S3 for Agent Mode access
+    // 8. Upload email attachments to S3 for Agent Mode access
     let attachments: { url: string; filename: string; size: number; mimetype: string; uploadedAt: string }[] | undefined;
     if (emailContent.attachments && emailContent.attachments.length > 0) {
       console.log(`[EmmaEmail] Processing ${emailContent.attachments.length} attachment(s)`);
@@ -280,7 +304,7 @@ export class EmmaEmailService {
       if (attachments.length === 0) attachments = undefined;
     }
 
-    // 8. Generate response using Agent Mode (same logic as in-app Agent Mode chat)
+    // 9. Generate response using Agent Mode (same logic as in-app Agent Mode chat)
     const fullMessage = isNewConversation && event.subject && messageBody
       ? `${event.subject}\n\n${messageBody}`
       : messageBody || event.subject || '';
@@ -320,10 +344,10 @@ export class EmmaEmailService {
       }
     }
 
-    // 9. Create ishare URL (always the sender's own session — see step 5)
+    // 10. Create ishare URL (always the sender's own session — see step 6)
     const ishareUrl = await chatbotDb.createOrReuseInteractiveShare(sessionId);
 
-    // 10. Build and send response email
+    // 11. Build and send response email
     const responseSubject = this.buildResponseSubject(event.subject, sessionId);
     const { html, text } = this.buildResponseEmail(emmaResponse, ishareUrl);
 
@@ -341,7 +365,7 @@ export class EmmaEmailService {
       inReplyTo: inboundMessageId || event.emailId,
     });
 
-    // 11. Update outbound email ID on session
+    // 12. Update outbound email ID on session
     if (sendResult?.id) {
       await chatbotDb.updateSessionEmailMetadata(sessionId, {
         senderEmail: event.from,
