@@ -73,6 +73,49 @@ endpoints, whose authorization checks stay authoritative.
   the terminal surface as a secrets vault. Emma's independent native URL
   guard also rejects the same engine path-capability shape.
 
+## Emma composer keyboard and TSP input
+
+In the opt-in tern:emma CLI, the program owns the composer text, UTF-16
+caret and undo history in src/scripts/tern-emma-input.ts. The terminal
+renders it, but does not own the text. Per Stencil's TSP input contract,
+ordinary keyboard characters, navigation and bracketed paste arrive on
+the PTY; a native edit event is for selection/caret changes and a native
+send event is an externally submitted atomic prompt, not keyboard Enter.
+All paths use the existing sendPrompt and backend routes.
+
+- **Enter** sends one nonblank prompt when idle. While busy, typed draft
+  text remains editable but pressing Enter cannot start a second turn.
+- **Shift+Enter** inserts a literal newline; **Ctrl+J** is the raw
+  terminal newline fallback. **Ctrl+Enter** submits a multiline draft.
+  Bracketed paste preserves embedded newline characters and never sends.
+- **Arrow keys, Home/End, word navigation, Backspace and Delete** update
+  the client caret without splitting surrogate pairs. Native selection
+  replacement uses the existing strict length-checked TSP edit resolver.
+- **Ctrl+Z** (raw) and native undo share the same local history.
+  **Ctrl+C** (including kitty CSI-u modifiers) restores terminal modes
+  and exits cleanly. The existing session picker, approval deck and run
+  inspector keep their distinct modal key handlers.
+- **/resume**, **/sessions**, **/new** and **/runs** still go through the
+  original client command dispatch. Native external send is ignored
+  while another modal or a running turn prevents submission.
+
+The regression suite at src/__tests__/tern.emmaInput.test.ts sends
+actual raw terminal character/CSI/paste sequences to the same
+EmmaInputController.handleRaw method used by the CLI, including mixed
+TSP frames. This is not a substitute for native end-to-end proof.
+
+For native acceptance, OMP must use its **owned** ungated Tern serve
+window, real PTY/script wrapper and isolated loopback HTTP fixture:
+launch npm run tern:emma -- --new with AGENTWEB_API_URL pointing to that
+fixture and only a synthetic fixture token; type the ordinary keyboard
+text "Run two native fixture tools", then Enter. Capture exactly one
+message POST at the real loopback endpoint and its rendered reply.
+Repeat with Unicode, bracketed paste, Shift+Enter, native selection
+replacement followed by raw typing, busy-state Enter, /resume, Ctrl+C
+and detach/re-attach. Record hello/ACK, frame trace and HTTP request
+count. No personal host input, provider request or production login.
+This connector-only worker has **not** executed that native proof.
+
 ## Launch
 
 Use an AgentWeb customer token that already has access to the target tasks.
@@ -124,6 +167,7 @@ npm run typecheck
 node --max-old-space-size=4096 node_modules/.bin/jest --runInBand --forceExit \
   src/__tests__/tern.protocol.test.ts \
   src/__tests__/tern.textEdit.test.ts \
+  src/__tests__/tern.emmaInput.test.ts \
   src/__tests__/tern.reconcile.test.ts \
   src/__tests__/tern.renderEmma.test.ts \
   src/__tests__/tern.agentWebClient.test.ts \
