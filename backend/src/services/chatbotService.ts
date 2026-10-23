@@ -2803,6 +2803,8 @@ export class ChatbotDB {
         sessionId,
       },
       UpdateExpression: "SET archived = :archived, adminListPartition = :adminListPartition",
+      // ENG-2644: never upsert a ghost row for an unknown id.
+      ConditionExpression: "attribute_exists(sessionId)",
       ExpressionAttributeValues: {
         ":archived": true,
         ":adminListPartition": "all",
