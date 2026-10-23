@@ -14288,9 +14288,13 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     // never hold up the agent turn. Only rows created by this call are announced — createDecision returns the
     // EXISTING row on an idempotent hit, and a retried iteration must not re-ping the reviewer.
     const packets = new Map<string, { approver: NonNullable<ApprovalDecision['approver']>; manifestId: string; items: ApprovalDecision[] }>();
+    const announced = new Set<string>();
     for (const d of staged) {
       if (d.status !== 'pending_team_review' || !d.manifestId || !d.approver) continue;
       if (d.createdAt < stagingStartedAt) continue;
+      // Two halts with the same digest in one call resolve to the same row: count it once.
+      if (announced.has(d.decisionId)) continue;
+      announced.add(d.decisionId);
       const key = `${d.manifestId}|${d.approver}`;
       const entry = packets.get(key) || { approver: d.approver, manifestId: d.manifestId, items: [] };
       entry.items.push(d);
