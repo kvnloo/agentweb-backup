@@ -259,6 +259,7 @@ import { buildAnonymousModelUnavailableBody, buildAnonymousPlanModelToolMessage,
 import type { GatewayTaskClass } from '../../utils/openRouterGatewayContract';
 import type { LLMUsageContext } from '../../utils/llmService';
 import { isAgentWebModelId } from '../../services/agentMode/agentWebModelRouter';
+import { buildReviewUrl } from '../../services/resultEndpointReview';
 
 /**
  * ENG-1816 F2 follow-up: a production session reported "No work plan found in
@@ -1608,8 +1609,6 @@ export async function sendForReview(
     };
     await chatbotDb.updateSessionResultEndpointMetadata(sessionId, updatedMetadata);
 
-    const reviewUrl = `${customerFrontendUrl}/review/${sessionId}`;
-
     // --- skipReview mode: auto-send to lead, CC reviewer ---
     if (metadata.skipReview && metadata.leadEmail) {
       const { resendService: resendSvc } = await import('../../services/resendService');
@@ -1693,6 +1692,9 @@ export async function sendForReview(
     }
 
     // --- Standard review mode: send review email to reviewer ---
+    // ENG-2650: the link carries the per-session reviewer capability token;
+    // the /review API routes reject the bare session id.
+    const reviewUrl = buildReviewUrl(customerFrontendUrl, sessionId);
     const { emailService: emailSvc } = await import('../../services/emailService');
     let contentSection = '';
     if (contentUrl) {

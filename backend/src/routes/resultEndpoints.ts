@@ -3,6 +3,8 @@ import { handleResult, getResultEndpointConfigs } from '../controllers/resultEnd
 import { chatbotDb } from '../services/chatbotService';
 import { resendService } from '../services/resendService';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
+import { getUserFromToken } from '../middleware/auth';
+import { REVIEW_TOKEN_HEADER, verifyReviewToken } from '../services/resultEndpointReview';
 
 const router = express.Router();
 
@@ -80,8 +82,37 @@ export default router;
 
 export const reviewRouter = express.Router();
 
+/**
+ * ENG-2650: every review route must be opened by the configured reviewer (the
+ * per-session capability token from the `send_for_review` link, sent in the
+ * X-Review-Token header) or by a real, non-delegated admin. The session id
+ * alone is not a credential: it is also handed to the lead. Checked before any
+ * session read, so an unauthorized caller cannot probe which sessions exist.
+ */
+export async function requireReviewAccess(req: express.Request, res: express.Response, next: express.NextFunction) {
+  try {
+    if (verifyReviewToken(req.params.sessionId, req.get(REVIEW_TOKEN_HEADER))) {
+      return next();
+    }
+    if (req.headers.authorization) {
+      const { user, decoded } = await getUserFromToken(req);
+      // Same rule as isRealAdmin: a delegate token acts as the target account.
+      if (user?.isAdmin && !decoded?.delegateAccess) {
+        return next();
+      }
+    }
+    return res.status(401).json({
+      error: 'This review link is invalid. Open the link from the latest review email, or sign in as an admin.',
+      code: 'review_access_denied',
+    });
+  } catch (error) {
+    console.error('Error authorizing review access:', error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
 // GET review data: collects ALL assets from session messages + metadata
-reviewRouter.get('/:sessionId', async (req, res) => {
+reviewRouter.get('/:sessionId', requireReviewAccess, async (req, res) => {
   try {
     const { sessionId } = req.params;
     const session = await chatbotDb.getChatSession(sessionId);
@@ -194,7 +225,7 @@ reviewRouter.get('/:sessionId', async (req, res) => {
 });
 
 // POST send a specific asset via email
-reviewRouter.post('/:sessionId/send', async (req, res) => {
+reviewRouter.post('/:sessionId/send', requireReviewAccess, async (req, res) => {
   try {
     const { sessionId } = req.params;
     const { recipientEmail, customMessage, assetUrl } = req.body;
