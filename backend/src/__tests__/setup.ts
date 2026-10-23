@@ -1,6 +1,15 @@
 // Test setup file
 // This file runs before all tests
 
+// Node 18 has no global `crypto` (Node 19+ does). pkce-challenge, a dependency of the MCP SDK client, then falls back to a dynamic
+// `import("node:crypto")` that Jest cannot run without --experimental-vm-modules, so every suite that loads the MCP client (agentModeService,
+// the tool bridge tests, ...) failed on Node 18 with "You need to run with a version of node that supports ES Modules in the VM API". The
+// project pins no Node version, so this keeps the suite runnable on 18. Test-only; the same object Node 19+ exposes as globalThis.crypto.
+if (!(globalThis as { crypto?: unknown }).crypto) {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  (globalThis as { crypto?: unknown }).crypto = require('crypto').webcrypto;
+}
+
 // Set NODE_ENV to test
 process.env.NODE_ENV = 'test';
 
