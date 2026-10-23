@@ -13348,6 +13348,17 @@ export const agentModeController = {
         return res.status(404).json({ error: 'Session not found' });
       }
 
+      // ENG-2644: the token used to be required but never compared, so anyone who knew the id of an
+      // interactively shared chat could cancel its owner's run. Same check as the other /ishare routes.
+      const interactiveShare = session.interactiveShareMetadata;
+      if (new Date() > getInteractiveShareExpiresAt(interactiveShare)) {
+        await chatbotDb.updateSessionInteractiveShareMetadata(shareId, { ...interactiveShare, isActive: false });
+        return res.status(410).json({ error: 'Interactive share link has expired' });
+      }
+      if (interactiveShare.token !== conversable) {
+        return res.status(401).json({ error: 'Invalid or expired conversable token' });
+      }
+
       // Signal cancellation
       requestCancel(shareId);
       generateMarketingResponseWorkerService.cancelSession(shareId);
