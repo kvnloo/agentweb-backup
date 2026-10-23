@@ -7,6 +7,9 @@ jest.mock('../middleware/auth', () => ({
     req.user = { userId: 'admin-user-1', email: 'admin@example.com', isAdmin: true };
     next();
   },
+  // ENG-2650: the review routes accept the reviewer link token (set per request
+  // below) or a real admin login; no login is presented in these tests.
+  getUserFromToken: jest.fn(async () => ({ user: null })),
 }));
 
 jest.mock('../middleware/admin', () => ({
@@ -84,6 +87,7 @@ import { runVerifiedChat } from '../controllers/agentModeController';
 import { applyVariableValues } from '../controllers/resultEndpointController';
 import resultEndpointsRoutes, { reviewRouter } from '../routes/resultEndpoints';
 import adminRoutes from '../routes/admin';
+import { REVIEW_TOKEN_HEADER, signReviewToken } from '../services/resultEndpointReview';
 
 const mockedSettings = settingsService as jest.Mocked<typeof settingsService>;
 const mockedChatbot = chatbotDb as jest.Mocked<typeof chatbotDb>;
@@ -262,6 +266,7 @@ describe('Result Endpoints', () => {
 
       await request(app)
         .get('/review/nonexistent')
+        .set(REVIEW_TOKEN_HEADER, signReviewToken('nonexistent'))
         .expect(404);
     });
 
@@ -312,6 +317,7 @@ describe('Result Endpoints', () => {
 
       const res = await request(app)
         .get('/review/sess-123')
+        .set(REVIEW_TOKEN_HEADER, signReviewToken('sess-123'))
         .expect(200);
 
       expect(res.body.success).toBe(true);
@@ -355,6 +361,7 @@ describe('Result Endpoints', () => {
 
       const res = await request(app)
         .get('/review/sess-fallback')
+        .set(REVIEW_TOKEN_HEADER, signReviewToken('sess-fallback'))
         .expect(200);
 
       expect(res.body.success).toBe(true);
@@ -382,9 +389,18 @@ describe('Result Endpoints', () => {
         resultEndpointMetadata: metadata,
       } as any);
       mockedChatbot.updateSessionResultEndpointMetadata.mockResolvedValue({} as any);
+      // ENG-2650: only one of the session's own generated assets can be sent.
+      (mockedChatbot as any).getMessagesFromMessagesTable.mockResolvedValue([
+        {
+          role: 'tool',
+          name: 'create_html_file',
+          content: JSON.stringify({ success: true, s3_url: 'https://s3.example.com/result.html' }),
+        },
+      ]);
 
       const res = await request(app)
         .post('/review/sess-123/send')
+        .set(REVIEW_TOKEN_HEADER, signReviewToken('sess-123'))
         .send({
           recipientEmail: 'lead@example.com',
           customMessage: 'Here is your report',
@@ -414,6 +430,7 @@ describe('Result Endpoints', () => {
     it('should return 400 when assetUrl is missing', async () => {
       await request(app)
         .post('/review/sess-123/send')
+        .set(REVIEW_TOKEN_HEADER, signReviewToken('sess-123'))
         .send({ recipientEmail: 'test@example.com' })
         .expect(400);
     });
@@ -421,6 +438,7 @@ describe('Result Endpoints', () => {
     it('should return 400 when recipientEmail is missing', async () => {
       await request(app)
         .post('/review/sess-123/send')
+        .set(REVIEW_TOKEN_HEADER, signReviewToken('sess-123'))
         .send({ assetUrl: 'https://example.com/file.png' })
         .expect(400);
     });
