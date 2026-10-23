@@ -10348,6 +10348,13 @@ export function redactMessagesForShareViewer<T>(messages: T[] | undefined): T[] 
     });
 }
 
+/** ENG-2644: owner-or-admin check for session-scoped mutations (same rule as emmaApi sessionAccessAllowed). */
+async function callerOwnsSession(sessionId: string, user: User | undefined): Promise<boolean> {
+  if (!user || !sessionId) return false;
+  const session = await chatbotDb.getChatSessionRecord(sessionId, true);
+  return !!session && (session.userId === user.userId || !!user.isAdmin);
+}
+
 export const agentModeController = {
   // Get user's agent chat sessions with infinite scroll support
   async getSessions(req: Request, res: Response) {
@@ -13359,11 +13366,17 @@ export const agentModeController = {
     try {
       const { sessionId } = req.params;
       const user = req.user as User;
-
-
+      // ENG-2644: only the owner (delegate tokens resolve to the target account) or an admin may
+      // archive. Missing and foreign sessions answer the same 404 so ids cannot be probed.
+      if (!(await callerOwnsSession(sessionId, user))) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
       await chatbotDb.archiveSession(sessionId);
       res.json({ message: 'Session archived successfully' });
     } catch (error) {
+      if ((error as { code?: string })?.code === 'ConditionalCheckFailedException') {
+        return res.status(404).json({ error: 'Session not found' });
+      }
       console.error('AgentMode: Archive session error:', error);
       res.status(500).json({ error: 'Failed to archive session' });
     }
@@ -13375,8 +13388,9 @@ export const agentModeController = {
       const { sessionId, taskId, executionId } = req.params;
       const { status } = req.body;
       const user = req.user as User;
-
-
+      if (!(await callerOwnsSession(sessionId, user))) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
       await updateTaskExecutionStatus(sessionId, taskId, executionId, status);
       res.json({ message: 'Task status updated successfully' });
     } catch (error) {
