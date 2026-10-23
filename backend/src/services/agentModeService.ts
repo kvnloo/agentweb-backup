@@ -332,7 +332,7 @@ import {
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
-const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
+export const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
 /*
  * ENG-1795: the sentence that marks an install refusal as an ID failure rather than a
  * billing one. `toolErrorClassifier` keys on this exact phrase to route the refusal to
