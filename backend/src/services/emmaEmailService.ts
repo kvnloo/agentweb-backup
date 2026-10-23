@@ -148,8 +148,12 @@ export class EmmaEmailService {
       subject = `Re: ${subject}`;
     }
 
-    // Add [ref:sessionId] tag if not already present
-    if (!SESSION_ID_REGEX.test(subject)) {
+    // The tag names the session that answered, so the next reply continues it. An inbound tag
+    // naming any other session (one that was not found, or belongs to another account — ENG-2652)
+    // is replaced rather than echoed back into the thread.
+    if (SESSION_ID_REGEX.test(subject)) {
+      subject = subject.replace(SESSION_ID_REGEX, `[ref:${sessionId}]`);
+    } else {
       subject = `${subject} [ref:${sessionId}]`;
     }
 
@@ -208,30 +212,26 @@ export class EmmaEmailService {
       return;
     }
 
-    // 5. Determine session: continue existing or create new
-    let sessionId: string;
-
+    // 5. Determine session: continue the referenced session only when the sender owns it,
+    // otherwise start a new one. ENG-2652: a [ref:<id>] tag is just subject text, so it must not
+    // let a sender run a turn in (and receive the iShare link of) another account's chat. Owner
+    // only, admins included: email carries no delegate ("access account") context, and its sender
+    // proof is weaker than a portal token, so it never unlocks a chat its sender does not own.
+    // A foreign session is treated exactly like a missing one. Record-only read: a refused id
+    // never loads the other account's transcript.
+    let sessionId: string | undefined;
     if (existingSessionId) {
-      // Validate the session exists
-      const existingSession = await chatbotDb.getChatSession(existingSessionId);
-      if (existingSession) {
+      const existingSession = await chatbotDb.getChatSessionRecord(existingSessionId, true);
+      if (existingSession && existingSession.userId === userId) {
         sessionId = existingSessionId;
         console.log(`[EmmaEmail] Continuing existing session ${sessionId}`);
       } else {
-        // Session not found — fall back to new session
-        console.log(`[EmmaEmail] Session ${existingSessionId} not found, creating new session`);
-        const newSession = await chatbotDb.createChatSession(
-          userId, undefined, 'agent', 'agent-mode', undefined, undefined, undefined, undefined, 'emma-email', undefined
-        );
-        sessionId = newSession.sessionId;
-        const defaultModel = await agentModeService.getDefaultModel();
-        await chatbotDb.updateSessionLlmModel(sessionId, defaultModel, undefined, 'system');
-        if (event.subject) {
-          await chatbotDb.updateSessionTitle(sessionId, event.subject);
-        }
+        console.log(`[EmmaEmail] Session ${existingSessionId} not found for sender, creating new session`);
       }
-    } else {
-      // New conversation — create Agent Mode session
+    }
+
+    const isNewConversation = !sessionId;
+    if (!sessionId) {
       const newSession = await chatbotDb.createChatSession(
         userId, undefined, 'agent', 'agent-mode', undefined, undefined, undefined, undefined, 'emma-email', undefined
       );
@@ -281,7 +281,6 @@ export class EmmaEmailService {
     }
 
     // 8. Generate response using Agent Mode (same logic as in-app Agent Mode chat)
-    const isNewConversation = !existingSessionId;
     const fullMessage = isNewConversation && event.subject && messageBody
       ? `${event.subject}\n\n${messageBody}`
       : messageBody || event.subject || '';
@@ -321,7 +320,7 @@ export class EmmaEmailService {
       }
     }
 
-    // 9. Create ishare URL
+    // 9. Create ishare URL (always the sender's own session — see step 5)
     const ishareUrl = await chatbotDb.createOrReuseInteractiveShare(sessionId);
 
     // 10. Build and send response email
