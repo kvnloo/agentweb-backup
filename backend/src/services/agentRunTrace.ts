@@ -529,8 +529,8 @@ export function redactText(text: string): string {
 }
 
 /**
- * The first `max` UTF-16 units of `text`, one fewer if the cut would split a surrogate pair (an emoji): a lone
- * half is invalid JSON, and every LLM provider rejects the request (ENG-2638).
+ * The first `max` UTF-16 units of `text`, one fewer if the cut would split a surrogate pair (an emoji): LLM
+ * providers' strict JSON parsers reject a request holding a lone half (ENG-2638).
  */
 export function cutWithoutSplittingPair(text: string, max: number): string {
   const cut = text.slice(0, max);
@@ -563,7 +563,10 @@ function textOf(content: unknown, trim = true): string | undefined {
   if (typeof content === 'string') text = content;
   else if (Array.isArray(content)) {
     text = content
-      .map((block) => (typeof block === 'string' ? block : typeof (block as { text?: unknown } | null)?.text === 'string' ? (block as { text: string }).text : ''))
+      .map((block) => {
+        const blockText = asRecord(block).text;
+        return typeof block === 'string' ? block : typeof blockText === 'string' ? blockText : '';
+      })
       .filter(Boolean)
       .join('\n');
   }
