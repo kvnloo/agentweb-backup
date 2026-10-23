@@ -46,9 +46,16 @@ async function getIdentity(accessToken: string): Promise<{ username: string | nu
   }
 }
 
+/**
+ * What goes into a response's `errors[]`. Only the HTTP status or a bare network code ever does: a provider's
+ * own message (token-refresh failures, `invalid_grant`, request bodies echoed back) stays in the server log.
+ */
 function describe(err: any): string {
   const status = err?.response?.status;
-  return status ? `HTTP ${status}` : (err?.message || 'unknown error');
+  if (status) return `HTTP ${status}`;
+  console.warn('[IntegrationAccess] provider call failed:', err?.message || err);
+  const code = typeof err?.code === 'string' && /^[A-Z][A-Z0-9_]{2,40}$/.test(err.code) ? err.code : null;
+  return code ?? 'request failed';
 }
 
 export async function buildClickUpAccessInventory(
