@@ -591,7 +591,7 @@ export function renderSessionPicker(
     if (session.sessionId === currentSessionId) badges.push({ text: 'current', tone: 'accent' });
     if (session.sessionType === 'scheduled') badges.push({ text: 'scheduled' });
 
-    return safeEmmaNode({
+    return {
       id: session.sessionId,
       label: sessionLabel(session),
       ...(firstUserMessage(session) && session.title
@@ -646,7 +646,7 @@ export function renderSessionPicker(
     }
   }
 
-  return {
+  return safeEmmaNode({
     id: 'layer',
     k: 'col',
     c: [{
