@@ -1,6 +1,6 @@
 jest.mock('../services/agentModeService', () => ({ agentModeService: { callLLM: jest.fn() } }));
 import { agentModeService } from '../services/agentModeService';
-import { FIT_TIMEOUT_MS, fitSubmission, judgeLeadFit } from '../services/leadNotificationFitJudge';
+import { FIT_TIMEOUT_MS, fitSubmission, judgeLeadFit, WITHHELD_REASON } from '../services/leadNotificationFitJudge';
 const call = agentModeService.callLLM as jest.Mock;
 beforeEach(() => jest.resetAllMocks());
 it('returns bad verdict from full submission judgement', async () => {
@@ -25,7 +25,7 @@ it('fails open on timeout without waiting for provider completion', async () => 
   } finally { jest.useRealTimers(); }
 });
 it.each(['not json', '{"verdict":"bad","reasons":[]}', '{"verdict":"unknown","reasons":["why"]}',
-  '{"verdict":"good","reasons":["Call back at (555) 123-4567"]}', '{"verdict":"good","reasons":["Contact jane@acme.com"]}'])('fails open on malformed response %s', async content => {
+])('fails open on malformed response %s', async content => {
   call.mockResolvedValue({ choices: [{ message: { content } }] });
   expect(await judgeLeadFit({}, { enabled: true }, 'owner')).toEqual({ verdict: 'unscored', reasons: [] });
 });
@@ -44,7 +44,7 @@ it.each(['Manages 100-1000 units but message is unrelated to leasing', 'Founded 
   call.mockResolvedValue({ choices: [{ message: { content: JSON.stringify({ verdict: 'bad', reasons: [reason] }) } }] });
   expect(await judgeLeadFit({}, { enabled: true }, 'owner')).toEqual({ verdict: 'bad', reasons: [reason] });
 });
-it.each(['Call +1 5551234567', 'Reach 555.123.4567', 'Phone 5551234567'])('rejects phone-shaped reason %s', async reason => {
-  call.mockResolvedValue({ choices: [{ message: { content: JSON.stringify({ verdict: 'good', reasons: [reason] }) } }] });
-  expect(await judgeLeadFit({}, { enabled: true }, 'owner')).toEqual({ verdict: 'unscored', reasons: [] });
+it.each(['Call +1 5551234567', 'Reach 555.123.4567', 'Phone 5551234567', 'Call back at (555) 123-4567', 'Contact jane@acme.com', 'Manages 120 450 900 units'])('withholds contact-shaped reason but keeps verdict %s', async reason => {
+  call.mockResolvedValue({ choices: [{ message: { content: JSON.stringify({ verdict: 'bad', reasons: [reason, 'Unrelated to leasing'] }) } }] });
+  expect(await judgeLeadFit({}, { enabled: true }, 'owner')).toEqual({ verdict: 'bad', reasons: [WITHHELD_REASON, 'Unrelated to leasing'] });
 });

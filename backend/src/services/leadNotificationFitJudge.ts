@@ -13,6 +13,7 @@ const phoneLike = (run: string): boolean => {
   const groups = run.split(/\D+/).filter(Boolean).length;
   return (run.startsWith('+') && digits >= 7) || digits >= 10 || (digits >= 7 && groups >= 3);
 };
+export const WITHHELD_REASON = 'Reason withheld (contained contact-like details)';
 const leaksContact = (reason: string): boolean =>
   /\S+@\S+\.\S+/.test(reason) || (reason.match(/\+?\d(?:[\s().\-]*\d)*/g) ?? []).some(phoneLike);
 const scalar = (v: unknown): string => typeof v === 'string' ? v.slice(0, 1000) : typeof v === 'number' || typeof v === 'boolean' ? String(v) : '';
@@ -58,8 +59,10 @@ export async function judgeLeadFit(lead: Record<string, unknown>, config: LeadFi
     const parsed = JSON.parse(raw);
     if (!parsed || !['good', 'maybe', 'bad'].includes(parsed.verdict) || !Array.isArray(parsed.reasons) ||
         parsed.reasons.length < 1 || parsed.reasons.length > 3 ||
-        !parsed.reasons.every((reason: unknown) => typeof reason === 'string' && reason.trim() && reason.length <= 160 && !leaksContact(reason))) throw new Error('Invalid fit response');
-    return { verdict: parsed.verdict, reasons: parsed.reasons.map((reason: string) => reason.trim()) };
+        !parsed.reasons.every((reason: unknown) => typeof reason === 'string' && reason.trim() && reason.length <= 160)) throw new Error('Invalid fit response');
+    // A contact-shaped reason is withheld from Slack, but the verdict stands: digit-heavy business
+    // reasons ("120 450 900 units") must not silently turn a bad verdict into an unscored post.
+    return { verdict: parsed.verdict, reasons: parsed.reasons.map((reason: string) => (leaksContact(reason) ? WITHHELD_REASON : reason.trim())) };
   } catch {
     // Errors (including malformed output) never suppress notifications or log contact data.
     return { verdict: 'unscored', reasons: [] };
