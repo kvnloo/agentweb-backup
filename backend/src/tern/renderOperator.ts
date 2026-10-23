@@ -253,7 +253,7 @@ export function renderOperator(view: OperatorView): TspNode[] {
             detail: 'Send exactly one request to AgentWeb' },
         ],
         order: ['cancel', 'confirm'],
-        selected: 'cancel',
+        selected: view.confirmSelected ?? 'cancel',
         actions: [
           { id: 'cancel', label: 'Cancel', keys: ['esc'], end: true },
           { id: 'confirm', label: 'Confirm', keys: ['enter'], primary: true },
