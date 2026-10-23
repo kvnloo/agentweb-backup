@@ -369,9 +369,14 @@ async function main(): Promise<void> {
         view.detail = execution;
         view.notice = confirm.kind === 'run' ? 'Execution requested' : 'Stop requested';
       }
-      // The backend remains authoritative; re-read after the mutation settles.
-      const runs = await client.listExecutions(confirm.taskId);
-      if (view.taskId === confirm.taskId) view.executions = runs;
+      // Backend write acknowledged. A follow-up read failing must not relabel
+      // that acknowledged write as ambiguous or trigger a second mutation.
+      try {
+        const runs = await client.listExecutions(confirm.taskId);
+        if (view.taskId === confirm.taskId) view.executions = runs;
+      } catch {
+        view.notice = 'Action accepted; run refresh unavailable';
+      }
     } catch (error) {
       // Network failure after a mutation is ambiguous. Do not retry or infer success.
       view.notice = 'Action not confirmed (' + errorStatus(error)
@@ -535,7 +540,7 @@ async function main(): Promise<void> {
 }
 
 main().catch(error => {
-  process.stdout.write(KITTY_POP + PASTE_OFF);
+  if (process.stdout.isTTY) process.stdout.write(KITTY_POP + PASTE_OFF);
   process.stdin.setRawMode?.(false);
   process.stdin.pause();
   process.stderr.write('tern:operator: ' +
