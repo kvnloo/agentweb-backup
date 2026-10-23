@@ -1,4 +1,4 @@
-name: Tern Emma Experiment
+name: Tern Emma and Operator
 
 on:
   push:
@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - name: Checkout experiment
+      - name: Checkout Tern integration
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
@@ -37,5 +37,14 @@ jobs:
 
       - name: Tern focused regressions
         working-directory: backend
-        run: |
-          node --max-old-space-size=4096 node_modules/.bin/jest --runInBand --forceExit             src/__tests__/tern.protocol.test.ts             src/__tests__/tern.textEdit.test.ts             src/__tests__/tern.reconcile.test.ts             src/__tests__/tern.renderEmma.test.ts             src/__tests__/tern.agentWebClient.test.ts
+        run: >-
+          node --max-old-space-size=4096 node_modules/.bin/jest
+          --runInBand --forceExit
+          src/__tests__/tern.protocol.test.ts
+          src/__tests__/tern.textEdit.test.ts
+          src/__tests__/tern.reconcile.test.ts
+          src/__tests__/tern.renderEmma.test.ts
+          src/__tests__/tern.agentWebClient.test.ts
+          src/__tests__/tern.operatorModel.test.ts
+          src/__tests__/tern.operatorClient.test.ts
+          src/__tests__/tern.renderOperator.test.ts
