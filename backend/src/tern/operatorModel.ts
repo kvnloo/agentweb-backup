@@ -78,7 +78,8 @@ export function safeText(value: unknown, limit = 700): string {
     .replace(/[\x00-\x1f\x7f]/g, ' ')
     .replace(/\bBearer\s+[^\s"'<>]+/gi, 'Bearer [redacted]')
     .replace(/\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|password|secret)\b\s*[:=]\s*["']?[^\s,"'}]+/gi, '[redacted]')
-    .replace(/https?:\/\/[^\s<>"']+/gi, raw => safeArtifactUrl(raw) ?? '[private URL]')
+    .replace(/https?:\/\/[^\s<>"']+/gi, '[URL withheld]')
+    .replace(/\b(?:sk-[A-Za-z0-9_-]{12,}|ghp_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,}|xox[baprs]-[A-Za-z0-9_-]{12,})\b/g, '[credential withheld]')
     .trim();
   const bounded = Math.max(0, Math.min(limit, 4000));
   return text.length > bounded ? text.slice(0, bounded) + '…' : text;
@@ -94,7 +95,7 @@ export function displayExecution(execution: OperatorExecution): Record<string, u
     model: safeText(execution.llmName, 90),
     result: safeText(execution.result),
     error: safeText(execution.error),
-    artifacts: (execution.result_files ?? []).slice(0, 20).map(file => ({
+    artifacts: (Array.isArray(execution.result_files) ? execution.result_files : []).slice(0, 20).map(file => ({
       filename: safeText(file.filename, 120),
       url: safeArtifactUrl(file.url) ?? null,
     })),
