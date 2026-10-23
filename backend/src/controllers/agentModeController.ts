@@ -17239,8 +17239,11 @@ export const agentModeController = {
         return res.status(400).json({ error: 'conversableToken is required' });
       }
 
-      // Record only, strongly consistent: an unproven caller never triggers a transcript read.
-      const session = await chatbotDb.getChatSessionRecord(sessionId, true);
+      // Record only, strongly consistent: an unproven caller never triggers a transcript read. An id
+      // over 200 chars is not a session (real ids are uuids) and would make DynamoDB throw (a 500).
+      const session = typeof sessionId === 'string' && sessionId.length <= 200
+        ? await chatbotDb.getChatSessionRecord(sessionId, true)
+        : null;
       const share = session?.interactiveShareMetadata;
       const proven = !!session && !!share?.isActive && typeof share.token === 'string'
         && new Date() <= getInteractiveShareExpiresAt(share)
