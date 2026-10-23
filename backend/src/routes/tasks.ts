@@ -1,6 +1,6 @@
 import express, { Request, RequestHandler, Response } from 'express';
 import cors from 'cors';
-import { createTask, getTasks, getTask, updateTask, deleteTask, executeTask, getTaskExecutions, updateTaskExecution, respondToInteraction, getTaskExecution, getExecutionLog, generateShareToken, getExecutionWithToken, sendExecutionEmail, uploadFileToExecution, getPlacidEditorToken, generateFromTemplateToExecution, listPlacidTemplates, createRevisionExecution, updateReport, getTaskExecutionPublic } from '../controllers/tasks';
+import { createTask, getTasks, getTask, updateTask, deleteTask, executeTask, getTaskExecutions, updateTaskExecution, respondToInteraction, getTaskExecution, getExecutionLog, getOperatorExecutionActivity, generateShareToken, getExecutionWithToken, sendExecutionEmail, uploadFileToExecution, getPlacidEditorToken, generateFromTemplateToExecution, listPlacidTemplates, createRevisionExecution, updateReport, getTaskExecutionPublic } from '../controllers/tasks';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { taskDb, subscriberDb, orgDb } from '../services/db';
 import multer from 'multer';
@@ -320,6 +320,7 @@ router.get('/', getTasks);
 router.get('/:id', getTask);
 router.get('/:id/executions', getTaskExecutions);
 router.get('/:id/executions/:executionId', getTaskExecution);
+router.get('/:id/executions/:executionId/activity', getOperatorExecutionActivity);
 router.get('/:id/executions/:executionId/share', generateShareToken);
 router.post('/:id/executions/:executionId/email', sendExecutionEmail);
 router.put('/:id', updateTask);

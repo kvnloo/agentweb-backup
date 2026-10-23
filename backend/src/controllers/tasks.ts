@@ -17,6 +17,7 @@ import { retryTransientWrite } from '../services/usageWriteFailureMonitor';
 import { renderPlacidImage, describePlacidError } from '../services/placidRenderService';
 import { uploadFileToS3 } from '../utils/s3Utils';
 import { v4 as uuidv4 } from 'uuid';
+import { parseOperatorBrowserLogHtml } from '../tern/operatorModel';
 
 const s3 = new S3();
 
@@ -877,6 +878,66 @@ export const getTaskExecutionPublic = async (req: Request, res: Response) => {
   } catch (error) {
     console.error('Error in getTaskExecutionPublic:', error);
     res.status(500).json({ message: 'Error fetching task execution' });
+  }
+};
+
+/**
+ * Read-only operator projection over the EXISTING browser-use log. The
+ * agent-engine already overwrites this S3 object about every 30 seconds.
+ * No log token, HTML, prompt, tool arguments or S3 destination leaves here.
+ * Route is mounted after authenticateToken, unlike the legacy log iframe.
+ */
+export const getOperatorExecutionActivity = async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+    const taskId = req.params.id;
+    const executionId = req.params.executionId;
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) return res.status(404).json({ message: 'Task not found' });
+    const user = await userDb.getUserById(userId);
+    if (!user) return res.status(401).json({ message: 'User not found' });
+    // Same owner-or-admin read scope as getTaskExecutions/getTaskExecution.
+    if (!user.isAdmin && task.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+    const execution = await taskDb.getTaskExecutionById(executionId);
+    if (!execution || execution.taskId !== taskId) {
+      return res.status(404).json({ message: 'Execution not found for this task' });
+    }
+    res.setHeader('Cache-Control', 'private, no-store');
+    const empty = { source: 'browser-log' as const, events: [] };
+    if (!execution.browser_use_log) return res.json(empty);
+
+    const bucket = process.env.AWS_S3_BUCKET;
+    if (!bucket) return res.status(503).json({ message: 'Execution activity unavailable' });
+    let url: URL;
+    try {
+      url = new URL(execution.browser_use_log);
+    } catch {
+      return res.json(empty);
+    }
+    // Never fetch an arbitrary persisted URL. Only read this task engine's
+    // exact existing S3 object from the configured bucket with server IAM.
+    const key = url.pathname.slice(1);
+    const prefix = `execution_logs/${execution.userId}/activities_${executionId}_`;
+    if (url.protocol !== 'https:' || url.host !== `${bucket}.s3.amazonaws.com`
+      || url.username || url.password || url.search || url.hash
+      || !/^[a-zA-Z0-9_-]{1,120}$/.test(executionId)
+      || !/^[a-zA-Z0-9_-]{1,120}$/.test(execution.userId || '')
+      || !key.startsWith(prefix)
+      || !/^[a-z0-9]{20}\\.log$/.test(key.slice(prefix.length))) {
+      return res.json(empty);
+    }
+    const result = await s3.getObject({
+      Bucket: bucket, Key: key, Range: 'bytes=-262144',
+    }).promise();
+    const body = Buffer.isBuffer(result.Body) ? result.Body.toString('utf8')
+      : typeof result.Body === 'string' ? result.Body : '';
+    return res.json({ source: 'browser-log', events: parseOperatorBrowserLogHtml(body) });
+  } catch (error) {
+    console.error('Error loading authorized execution activity:', error);
+    return res.status(502).json({ message: 'Execution activity unavailable' });
   }
 };
 
