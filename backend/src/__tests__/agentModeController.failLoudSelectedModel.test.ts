@@ -154,6 +154,7 @@ import { isRunStoreEnabled, claimIdempotency } from '../services/agentMode/runSt
 import { modelAccess } from '../services/agentMode/modelAccessInstance';
 import { workPlanStepModels } from '../services/agentMode/workPlanStepModelsInstance';
 import { readTierAllowedModels, getUserSubscriptionResolution } from '../services/subscriptionService';
+import { isTransientLLMError } from '../utils/agentModeErrors';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockWorker = generateMarketingResponseWorkerService as jest.Mocked<typeof generateMarketingResponseWorkerService>;
@@ -1529,6 +1530,25 @@ describe('ENG-2641: every refused send says whether the user message was stored 
       expect(res.statusCode).toBe(422);
       expect(res.body).toMatchObject({ code: 'model_unavailable', userMessageSaved: true });
       expect(savedUserMessages()[0]).toMatchObject({ content: MESSAGE });
+    });
+
+    it('attempt 1 saves the message then fails transiently; attempt 2 is refused BEFORE its own save: still true', async () => {
+      assertSpy = jest.spyOn(modelAccess, 'assertModelAllowed');
+      assertSpy.mockResolvedValueOnce(undefined).mockResolvedValueOnce(undefined).mockRejectedValueOnce(notInPlan());
+      const transient = new Error('upstream overloaded');
+      (isTransientLLMError as jest.Mock).mockImplementation((e: unknown) => e === transient);
+      mockWorker.runInWorker.mockRejectedValueOnce(transient);
+      try {
+        const res = makeRes();
+        await agentModeController.verifiedGenerate(verifiedReq(), res);
+        expect(assertSpy).toHaveBeenCalledTimes(3);
+        expect(mockWorker.runInWorker).toHaveBeenCalledTimes(1);
+        expect(res.statusCode).toBe(422);
+        expect(res.body).toMatchObject({ code: 'model_unavailable', userMessageSaved: true });
+        expect(savedUserMessages()).toEqual([expect.objectContaining({ content: MESSAGE })]);
+      } finally {
+        (isTransientLLMError as jest.Mock).mockReset().mockReturnValue(false);
+      }
     });
 
     it('429 usage paused: false', async () => {
