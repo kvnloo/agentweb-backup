@@ -164,3 +164,158 @@ describe('Read-only authorized execution activity API contract', () => {
     expect(putOnly).toHaveBeenCalledTimes(1);
   });
 });
+
+/**
+ * Direct controller boundary checks. This endpoint is registered under the
+ * routes/tasks.ts authenticateToken middleware, and ALSO requires req.user,
+ * owner/admin access, and execution-task binding before any S3 read.
+ */
+describe('Backend execution activity authorization', () => {
+  const getTaskById = jest.fn();
+  const getTaskExecutionById = jest.fn();
+  const getUserById = jest.fn();
+  const getObject = jest.fn();
+  let read: (req: any, res: any) => Promise<any>;
+  let previousBucket: string | undefined;
+
+  beforeAll(() => {
+    previousBucket = process.env.AWS_S3_BUCKET;
+    process.env.AWS_S3_BUCKET = 'agentweb-test-bucket';
+
+    // Keep the controller unit scoped to its genuine taskDb/userDb/S3 API
+    // without bootstrapping unrelated billing, email or provider clients.
+    jest.isolateModules(() => {
+      jest.doMock('../services/db', () => ({
+        taskDb: { getTaskById, getTaskExecutionById },
+        userDb: { getUserById },
+        orgDb: {}, scheduleDb: {}, taskTemplateDb: {},
+      }));
+      jest.doMock('aws-sdk', () => {
+        const S3 = jest.fn(() => ({ getObject }));
+        return { __esModule: true, default: { S3 }, S3 };
+      });
+      jest.doMock('../services/chatbotService', () => ({ chatbotDb: {} }));
+      jest.doMock('../services/approvalDb', () => ({ getAssetTypeFromFilename: jest.fn() }));
+      jest.doMock('../services/orgShareService', () => ({
+        canViewItem: jest.fn(), canEditItem: jest.fn(),
+      }));
+      jest.doMock('../utils/secretsManager', () => ({ getPlacidPrivateToken: jest.fn() }));
+      jest.doMock('../utils/agentModeAssetIds', () => ({ parseAgentModeImageIds: jest.fn() }));
+      jest.doMock('../services/usageWriteFailureMonitor', () => ({ retryTransientWrite: jest.fn() }));
+      jest.doMock('../services/placidRenderService', () => ({
+        renderPlacidImage: jest.fn(), describePlacidError: jest.fn(),
+      }));
+      jest.doMock('../utils/s3Utils', () => ({ uploadFileToS3: jest.fn() }));
+      read = require('../controllers/tasks').getOperatorExecutionActivity;
+    });
+  });
+
+  afterAll(() => {
+    if (previousBucket === undefined) delete process.env.AWS_S3_BUCKET;
+    else process.env.AWS_S3_BUCKET = previousBucket;
+  });
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    getTaskById.mockResolvedValue({ taskId: 'task-1', userId: 'owner' });
+    getUserById.mockResolvedValue({ userId: 'owner', isAdmin: false });
+    getTaskExecutionById.mockResolvedValue({
+      taskId: 'task-1', executionId: 'execution-1', userId: 'owner',
+      status: 'running',
+      browser_use_log: 'https://agentweb-test-bucket.s3.amazonaws.com/'
+        + 'execution_logs/owner/activities_execution-1_abcdefghijklmnopqrst.log',
+    });
+    const content = '<html><body><pre>'
+      + '2026-10-22 21:15:01,456 - browser_use.agent - INFO - Action 1: click('
+      + '{Authorization: Bearer private-token})</pre></body></html>';
+    getObject.mockImplementation(() => ({
+      promise: async () => ({ Body: Buffer.from(content) }),
+    }));
+  });
+
+  async function invoke(userId: string | undefined = 'owner') {
+    const req = {
+      params: { id: 'task-1', executionId: 'execution-1' },
+      ...(userId ? { user: { userId } } : {}),
+    };
+    const res = {
+      status: jest.fn().mockReturnThis(),
+      json: jest.fn().mockReturnThis(),
+      setHeader: jest.fn(),
+    };
+    await read(req, res);
+    return res;
+  }
+
+  it('refuses unauthenticated, non-owner, and task-mismatched reads before S3', async () => {
+    const noAuth = await invoke(undefined);
+    expect(noAuth.status).toHaveBeenCalledWith(401);
+    expect(getObject).not.toHaveBeenCalled();
+
+    const forbidden = await invoke('attacker');
+    expect(forbidden.status).toHaveBeenCalledWith(403);
+    expect(getObject).not.toHaveBeenCalled();
+
+    getTaskExecutionById.mockResolvedValueOnce({
+      executionId: 'execution-1', taskId: 'another-task', userId: 'owner',
+    });
+    const differentTask = await invoke();
+    expect(differentTask.status).toHaveBeenCalledWith(404);
+    expect(getObject).not.toHaveBeenCalled();
+  });
+
+  it('uses backend S3 IAM and returns only fixed summaries, never raw log or signed URLs', async () => {
+    const res = await invoke();
+    expect(res.status).not.toHaveBeenCalled();
+    expect(getObject).toHaveBeenCalledWith({
+      Bucket: 'agentweb-test-bucket',
+      Key: 'execution_logs/owner/activities_execution-1_abcdefghijklmnopqrst.log',
+      Range: 'bytes=-262144',
+    });
+    expect(res.setHeader).toHaveBeenCalledWith('Cache-Control', 'private, no-store');
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
+      source: 'browser-log',
+      events: [expect.objectContaining({
+        kind: 'action', level: 'INFO', summary: 'Browser action: click',
+      })],
+    }));
+    const wire = JSON.stringify(res.json.mock.calls);
+    for (const secret of ['Bearer private-token', 'Authorization',
+      'abcdefghijklmnopqrst', 'browser_use_log', 's3.amazonaws.com', '<pre>']) {
+      expect(wire).not.toContain(secret);
+    }
+  });
+
+  it('returns an empty actual timeline for no log or a forged external destination', async () => {
+    getTaskExecutionById.mockResolvedValueOnce({
+      taskId: 'task-1', executionId: 'execution-1', userId: 'owner',
+      status: 'running',
+    });
+    const absent = await invoke();
+    expect(absent.json).toHaveBeenCalledWith({ source: 'browser-log', events: [] });
+    expect(getObject).not.toHaveBeenCalled();
+
+    getTaskExecutionById.mockResolvedValueOnce({
+      taskId: 'task-1', executionId: 'execution-1', userId: 'owner',
+      browser_use_log: 'https://evil.example/execution_logs/owner/activities_execution-1_abcdefghijklmnopqrst.log',
+    });
+    const forged = await invoke();
+    expect(forged.json).toHaveBeenCalledWith({ source: 'browser-log', events: [] });
+    expect(getObject).not.toHaveBeenCalled();
+  });
+
+  it('keeps S3 errors out of the response and never falls back to the token-log route', async () => {
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      getObject.mockImplementationOnce(() => ({
+        promise: async () => { throw new Error('s3 token=private'); },
+      }));
+      const res = await invoke();
+      expect(res.status).toHaveBeenCalledWith(502);
+      expect(res.json).toHaveBeenCalledWith({ message: 'Execution activity unavailable' });
+      expect(JSON.stringify(res.json.mock.calls)).not.toContain('private');
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+});
