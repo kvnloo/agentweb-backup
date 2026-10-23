@@ -539,9 +539,7 @@ function ManifestDetail({ manifestId }: { manifestId: string }) {
   const answeredCount = decisions.filter((d) => RESOLVED_STATUSES.has(d.status)).length;
   const allAnswered = decisions.length > 0 && answeredCount === decisions.length;
   const hasMetaWrite = decisions.some((d) => d.gateType === 'meta_write');
-  // Once every item has been dispatched there is nothing left to run; the server would 409 a repeat anyway.
-  // A packet with a rejected item is finished once every OTHER item has been dispatched, so rejected
-  // counts as done here — found on prod, where a reject + two approves left the button enabled.
+  // Dispatched = at least one item ran and every other item is only rejected (the server 409s a repeat anyway).
   const alreadyDispatched =
     decisions.some((d) => d.status === 'executed' || d.status === 'execution_failed') &&
     decisions.every((d) => d.status === 'executed' || d.status === 'execution_failed' || d.status === 'rejected');
