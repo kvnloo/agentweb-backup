@@ -1,0 +1,1311 @@
+#!/usr/bin/env node
+import { AgentWebClient, EmmaStreamEvent } from '../tern/agentWebClient';
+import {
+  encodeHelloQuery,
+  encodeTspJson,
+  parseTspJson,
+  TSP_DEFAULT_APC_LIMIT,
+  TspStreamReader,
+} from '../tern/protocol';
+import { TspSurfaceReconciler } from '../tern/reconcile';
+import { resolveNativeTextEdit } from '../tern/textEdit';
+import {
+  AgentRunSummaryLike,
+  ApprovalDeckInboundAnswer,
+  ApprovalDeckUiState,
+  EmmaMessage,
+  EmmaSessionLike,
+  approvalDeckAllAnswered,
+  approvalDeckIsAwaiting,
+  filterSessions,
+  renderAgentRunsScreen,
+  renderApprovalDeck,
+  renderEmmaDock,
+  renderEmmaMain,
+  renderEmptyLayer,
+  renderSessionPicker,
+  RunningTool,
+  SessionPickerState,
+  TspNode,
+} from '../tern/renderEmma';
+
+const SURFACE_ID = 'agentweb-emma';
+const RUNS_SURFACE_ID = 'agentweb-runs';
+const DA1 = '\x1b[c';
+const PASTE_ON = '\x1b[?2004h';
+const PASTE_OFF = '\x1b[?2004l';
+const KITTY_PUSH = '\x1b[>1u';
+const KITTY_POP = '\x1b[<u';
+
+let terminalModesArmed = false;
+
+function armTerminalModes(): void {
+  if (terminalModesArmed) return;
+  process.stdout.write(PASTE_ON + KITTY_PUSH);
+  terminalModesArmed = true;
+}
+
+function restoreTerminalModes(): void {
+  if (!terminalModesArmed) return;
+  process.stdout.write(KITTY_POP + PASTE_OFF);
+  terminalModesArmed = false;
+}
+
+interface HelloReply {
+  r: 'hello';
+  v: number;
+  term: string;
+  kinds: string[];
+  features?: string[];
+  apc?: number;
+  credits?: number;
+}
+
+interface PickerKey {
+  name: string;
+  text?: string;
+  ctrl?: boolean;
+}
+
+function argValue(name: string): string | undefined {
+  const index = process.argv.indexOf(name);
+  if (index < 0 || index + 1 >= process.argv.length) return undefined;
+  return process.argv[index + 1];
+}
+
+function usage(message?: string): never {
+  if (message) process.stderr.write(`${message}\n\n`);
+  process.stderr.write(
+    'Usage: AGENTWEB_TOKEN=<token> npm run tern:emma -- [--session <id> | --new]\n' +
+    '       Optional: AGENTWEB_API_URL=http://localhost:3001\n' +
+    '                 AGENTWEB_RUNS_SECRET=<read-only secret> or AGENTWEB_ADMIN_TOKEN=<admin JWT> for /runs\n',
+  );
+  process.exit(1);
+}
+
+function isHello(value: Record<string, unknown>): value is Record<string, unknown> & HelloReply {
+  return value.r === 'hello'
+    && typeof value.v === 'number'
+    && typeof value.term === 'string'
+    && Array.isArray(value.kinds)
+    && value.kinds.every(item => typeof item === 'string');
+}
+
+class FrameSender {
+  private sequence = 0;
+  private acked = 0;
+  private pending: { ops: unknown[][]; onSent?: () => void } | null = null;
+
+  constructor(
+    private readonly surfaceId: string,
+    private readonly apcLimit: number,
+    private readonly credits: number,
+  ) {}
+
+  request(ops: unknown[][], onSent?: () => void): void {
+    // While blocked, keep only the newest state transition. The reconciler
+    // computes each pending batch from the last state actually sent.
+    this.pending = { ops, onSent };
+    if (ops.length === 0) {
+      const pending = this.pending;
+      this.pending = null;
+      pending.onSent?.();
+      return;
+    }
+    this.pump();
+  }
+
+  ack(sequence: number): void {
+    if (sequence <= this.acked) return;
+    this.acked = Math.min(sequence, this.sequence);
+    this.pump();
+  }
+
+  private get blocked(): boolean {
+    return this.sequence - this.acked >= this.credits;
+  }
+
+  private pump(): void {
+    if (this.blocked || !this.pending) return;
+    const pending = this.pending;
+    this.pending = null;
+    const s = ++this.sequence;
+    process.stdout.write(
+      encodeTspJson('f', { sf: this.surfaceId, s, ops: pending.ops }, undefined, this.apcLimit),
+    );
+    pending.onSent?.();
+  }
+}
+
+function decodePickerKey(buffer: string): { key?: PickerKey; used: number; needMore?: boolean } {
+  if (!buffer) return { used: 0, needMore: true };
+
+  if (buffer.startsWith('\x1b[200~')) {
+    const end = buffer.indexOf('\x1b[201~', 6);
+    if (end < 0) return { used: 0, needMore: true };
+    return {
+      key: { name: 'paste', text: buffer.slice(6, end) },
+      used: end + 6,
+    };
+  }
+
+  const first = buffer[0];
+  if (first !== '\x1b') {
+    const code = buffer.codePointAt(0);
+    if (code === undefined) return { used: 1 };
+    const char = String.fromCodePoint(code);
+    const used = char.length;
+
+    if (char === '\r' || char === '\n') return { key: { name: 'enter' }, used };
+    if (char === '\t') return { key: { name: 'tab' }, used };
+    if (char === '\x7f' || char === '\b') return { key: { name: 'backspace' }, used };
+    if (char === '\x03') return { key: { name: 'c', ctrl: true }, used };
+    if (code >= 1 && code <= 26) {
+      return { key: { name: String.fromCharCode(code + 96), ctrl: true }, used };
+    }
+    if (code < 32) return { used };
+    return { key: { name: char.toLowerCase(), text: char }, used };
+  }
+
+  if (buffer.length === 1) return { used: 0, needMore: true };
+
+  const simple: Record<string, string> = {
+    '\x1b[A': 'up',
+    '\x1b[B': 'down',
+    '\x1b[C': 'right',
+    '\x1b[D': 'left',
+    '\x1b[H': 'home',
+    '\x1b[F': 'end',
+    '\x1b[3~': 'delete',
+    '\x1b[5~': 'page_up',
+    '\x1b[6~': 'page_down',
+  };
+  for (const [sequence, name] of Object.entries(simple)) {
+    if (buffer.startsWith(sequence)) return { key: { name }, used: sequence.length };
+    if (sequence.startsWith(buffer)) return { used: 0, needMore: true };
+  }
+
+  const csi = /^\x1b\[([0-9:;]*)([A-Za-z~])/.exec(buffer);
+  if (!csi && buffer.startsWith('\x1b[') && buffer.length < 64) {
+    return { used: 0, needMore: true };
+  }
+  if (csi) {
+    const [sequence, params, final] = csi;
+    if (final === 'u') {
+      const pieces = params.split(';');
+      const code = Number((pieces[0] || '').split(':')[0]);
+      const modifier = Number((pieces[1] || '1').split(':')[0]);
+      const bits = Math.max(0, modifier - 1);
+      const ctrl = (bits & 4) !== 0;
+      const named: Record<number, string> = {
+        13: 'enter',
+        9: 'tab',
+        27: 'escape',
+        127: 'backspace',
+        57417: 'left',
+        57418: 'right',
+        57419: 'up',
+        57420: 'down',
+        57421: 'page_up',
+        57422: 'page_down',
+        57423: 'home',
+        57424: 'end',
+        57426: 'delete',
+      };
+      const name = named[code];
+      if (name) return { key: { name, ctrl }, used: sequence.length };
+      if (Number.isInteger(code) && code >= 32 && code <= 0x10ffff) {
+        const text = String.fromCodePoint(code);
+        return { key: { name: text.toLowerCase(), text: ctrl ? undefined : text, ctrl }, used: sequence.length };
+      }
+      return { used: sequence.length };
+    }
+
+    const arrowName: Record<string, string> = {
+      A: 'up',
+      B: 'down',
+      C: 'right',
+      D: 'left',
+      H: 'home',
+      F: 'end',
+    };
+    if (arrowName[final]) return { key: { name: arrowName[final] }, used: sequence.length };
+    if (final === '~') {
+      const n = Number(params.split(';')[0]);
+      const name = n === 3 ? 'delete' : n === 5 ? 'page_up' : n === 6 ? 'page_down' : undefined;
+      return { ...(name ? { key: { name } } : {}), used: sequence.length };
+    }
+    return { used: sequence.length };
+  }
+
+  // A lone ESC is ambiguous with an escape-sequence prefix; the caller flushes it
+  // after a short deadline. Unknown completed ESC sequences are consumed.
+  if (buffer.startsWith('\x1b')) return { used: 1, key: { name: 'escape' } };
+  return { used: 1 };
+}
+
+async function main(): Promise<void> {
+  const token = process.env.AGENTWEB_TOKEN;
+  if (!token) usage('AGENTWEB_TOKEN is required.');
+
+  const baseUrl = process.env.AGENTWEB_API_URL || 'http://localhost:3001';
+  const client = new AgentWebClient({
+    baseUrl,
+    token,
+    runsToken: process.env.AGENTWEB_ADMIN_TOKEN,
+    runsSecret: process.env.AGENTWEB_RUNS_SECRET,
+  });
+  const requestedSession = argValue('--session');
+  const forceNew = process.argv.includes('--new');
+
+  let session: EmmaSessionLike;
+  if (requestedSession) {
+    session = await client.getSession(requestedSession);
+  } else if (forceNew) {
+    session = await client.createSession();
+  } else {
+    const sessions = await client.listEmmaSessions(1);
+    session = sessions[0] ?? await client.createSession();
+  }
+
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    usage('tern:emma must run in an interactive Tern pane.');
+  }
+
+  process.stdin.setEncoding('utf8');
+  process.stdin.setRawMode?.(true);
+  process.stdin.resume();
+
+  const reader = new TspStreamReader();
+  let helloResolve: ((hello: HelloReply) => void) | undefined;
+  let eventHandler: ((event: Record<string, unknown>) => void) | undefined;
+  let rawHandler: ((raw: string) => void) | undefined;
+  let shuttingDown = false;
+  let surfaceOpened = false;
+  let runsSurfaceOpened = false;
+
+  const closeAndExit = (code: number) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    if (runsSurfaceOpened) {
+      process.stdout.write(
+        encodeTspJson('x', { id: RUNS_SURFACE_ID, keep: false }),
+      );
+      runsSurfaceOpened = false;
+    }
+    if (surfaceOpened) {
+      process.stdout.write(
+        encodeTspJson('x', { id: SURFACE_ID, keep: false }),
+      );
+    }
+    restoreTerminalModes();
+    process.stdin.setRawMode?.(false);
+    process.stdin.pause();
+    process.exit(code);
+  };
+
+  process.on('SIGINT', () => closeAndExit(130));
+  process.on('SIGTERM', () => closeAndExit(143));
+  process.on('SIGHUP', () => closeAndExit(129));
+
+  process.stdin.on('data', (chunk: string) => {
+    for (const part of reader.pushParts(chunk)) {
+      if (part.type === 'raw') {
+        rawHandler?.(part.data);
+        continue;
+      }
+
+      const raw = part.message;
+      const value = parseTspJson(raw);
+      if (!value) continue;
+      if (raw.verb === 'r' && isHello(value)) {
+        helloResolve?.(value);
+        continue;
+      }
+      if (raw.verb === 'e') eventHandler?.(value);
+    }
+  });
+
+  const hello = await new Promise<HelloReply>((resolve, reject) => {
+    helloResolve = resolve;
+    const timer = setTimeout(
+      () => reject(new Error('Tern Surface Protocol hello timed out')),
+      800,
+    );
+    const wrapped = (reply: HelloReply) => {
+      clearTimeout(timer);
+      resolve(reply);
+    };
+    helloResolve = wrapped;
+
+    process.stdout.write(encodeHelloQuery('agentweb-emma'));
+    // DA1 is the standard capability-probe sentinel used by Tern clients.
+    process.stdout.write(DA1);
+  }).catch(error => {
+    process.stdin.setRawMode?.(false);
+    process.stdin.pause();
+    throw error;
+  });
+
+  const requiredKinds = ['col', 'card', 'md', 'editor', 'status', 'seg', 'tool', 'picker', 'kv', 'section', 'checklist', 'progress', 'table'];
+  const missingKinds = requiredKinds.filter(kind => !hello.kinds.includes(kind));
+  if (missingKinds.length > 0) {
+    process.stdin.setRawMode?.(false);
+    process.stdin.pause();
+    throw new Error(`Tern is missing required TSP kinds: ${missingKinds.join(', ')}`);
+  }
+
+  armTerminalModes();
+
+  const apcLimit = typeof hello.apc === 'number'
+    ? hello.apc
+    : TSP_DEFAULT_APC_LIMIT;
+  const credits = typeof hello.credits === 'number' && hello.credits > 0
+    ? Math.floor(hello.credits)
+    : 2;
+  let frames = new FrameSender(SURFACE_ID, apcLimit, credits);
+  let reconciler = new TspSurfaceReconciler(SURFACE_ID);
+  let surfaceFocus: string | null | undefined;
+
+  process.stdout.write(
+    encodeTspJson(
+      'o',
+      {
+        id: SURFACE_ID,
+        mode: 'inline',
+        title: session.title || 'Emma',
+        role: 'agentweb.emma',
+      },
+      undefined,
+      apcLimit,
+    ),
+  );
+  surfaceOpened = true;
+
+  let composer = '';
+  let cursor = 0;
+  let running = false;
+  let runningTools: RunningTool[] = [];
+  let toolCounter = 0;
+  let errorText: string | undefined;
+  let pickerState: SessionPickerState | undefined;
+  let approvalState: ApprovalDeckUiState | undefined;
+  let runState: { runs: AgentRunSummaryLike[]; selected: number } | undefined;
+  let runFrames: FrameSender | undefined;
+  let runReconciler: TspSurfaceReconciler | undefined;
+  const dismissedDecks = new Set<string>();
+  let pickerKeyBuffer = '';
+  let escapeFlush: NodeJS.Timeout | undefined;
+  const undoStack: Array<{ text: string; cursor: number }> = [];
+  const pickerUndoStack: Array<{ text: string; cursor: number }> = [];
+  const approvalUndoStack: Array<{ text: string; cursor: number }> = [];
+
+  const render = (_dockOnly = false) => {
+    const mainNode = renderEmmaMain(session, runningTools);
+    const dock = renderEmmaDock({
+      text: composer,
+      cursor,
+      running,
+      session,
+      error: errorText,
+    });
+    const layer = pickerState
+      ? renderSessionPicker(pickerState, session.sessionId)
+      : approvalState && approvalDeckIsAwaiting(session.pendingApprovalDeck)
+        ? renderApprovalDeck(session.pendingApprovalDeck, approvalState)
+        : renderEmptyLayer();
+
+    const roots = [mainNode, dock, layer];
+    const ops = reconciler.diff(roots) as unknown[][];
+
+    let desiredFocus: string | null = null;
+    if (!pickerState && !approvalState) {
+      desiredFocus = 'composer';
+    } else if (approvalState && approvalDeckIsAwaiting(session.pendingApprovalDeck)) {
+      const item = session.pendingApprovalDeck.items[approvalState.itemIndex];
+      const needsText = approvalState.selectedVerdict === 'comment'
+        || (approvalState.selectedVerdict === 'reject' && item?.allowFreeText === true);
+      if (needsText) desiredFocus = 'approval-note';
+    }
+
+    if (desiredFocus !== surfaceFocus) {
+      ops.push(['focus', desiredFocus]);
+    }
+
+    frames.request(ops, () => {
+      reconciler.commit(roots);
+      surfaceFocus = desiredFocus;
+    });
+  };
+
+  const renderRuns = () => {
+    if (!runState || !runFrames || !runReconciler) return;
+    const roots = [renderAgentRunsScreen(runState.runs, runState.selected)];
+    const ops = runReconciler.diff(roots) as unknown[][];
+    runFrames.request(ops, () => runReconciler?.commit(roots));
+  };
+
+  const closeAgentRuns = () => {
+    runState = undefined;
+    runFrames = undefined;
+    runReconciler = undefined;
+    pickerKeyBuffer = '';
+    clearTimeout(escapeFlush);
+    escapeFlush = undefined;
+    if (runsSurfaceOpened) {
+      process.stdout.write(
+        encodeTspJson('x', { id: RUNS_SURFACE_ID, keep: false }, undefined, apcLimit),
+      );
+      runsSurfaceOpened = false;
+    }
+  };
+
+  const refreshAgentRuns = async () => {
+    if (!runState) return;
+    try {
+      const runs = await client.getAgentRuns(session.sessionId, 3);
+      runState.runs = runs;
+      runState.selected = Math.max(0, Math.min(runState.selected, Math.max(0, runs.length - 1)));
+      renderRuns();
+    } catch (error: any) {
+      const status = error?.response?.status;
+      closeAgentRuns();
+      errorText = status === 401 || status === 403
+        ? 'AgentRun Inspector requires admin access'
+        : error instanceof Error
+          ? error.message
+          : String(error);
+      render(true);
+    }
+  };
+
+  const openAgentRuns = async () => {
+    if (running) return;
+    try {
+      const runs = await client.getAgentRuns(session.sessionId, 3);
+      runState = { runs, selected: 0 };
+      pickerKeyBuffer = '';
+      runFrames = new FrameSender(RUNS_SURFACE_ID, apcLimit, credits);
+      runReconciler = new TspSurfaceReconciler(RUNS_SURFACE_ID);
+      process.stdout.write(
+        encodeTspJson(
+          'o',
+          {
+            id: RUNS_SURFACE_ID,
+            mode: 'screen',
+            title: 'AgentRun Inspector',
+            role: 'agentweb.runs',
+          },
+          undefined,
+          apcLimit,
+        ),
+      );
+      runsSurfaceOpened = true;
+      renderRuns();
+    } catch (error: any) {
+      const status = error?.response?.status;
+      errorText = status === 401 || status === 403
+        ? 'AgentRun Inspector requires admin access'
+        : error instanceof Error
+          ? error.message
+          : String(error);
+      render(true);
+    }
+  };
+
+  const closePicker = () => {
+    pickerState = undefined;
+    pickerUndoStack.length = 0;
+    approvalUndoStack.length = 0;
+    pickerKeyBuffer = '';
+    clearTimeout(escapeFlush);
+    escapeFlush = undefined;
+    render();
+  };
+
+  const maybeOpenApprovalDeck = () => {
+    const deck = session.pendingApprovalDeck;
+    if (!approvalDeckIsAwaiting(deck) || dismissedDecks.has(deck.deckId)) {
+      approvalState = undefined;
+      return;
+    }
+    if (approvalState && session.pendingApprovalDeck?.deckId === deck.deckId) return;
+    const firstItem = deck.items[0];
+    const firstChoices = firstItem?.metaWriteManifestDigest
+      ? [{ id: 'approve' }, { id: 'reject' }]
+      : firstItem?.options ?? [];
+    approvalState = {
+      itemIndex: 0,
+      answers: [],
+      selectedVerdict:
+        firstChoices.find((choice: any) => choice.recommended)?.id
+        || firstChoices[0]?.id,
+      freeText: '',
+      freeTextCursor: 0,
+    };
+    pickerState = undefined;
+    pickerKeyBuffer = '';
+  };
+
+  const closeApprovalDeck = () => {
+    const deck = session.pendingApprovalDeck;
+    if (approvalDeckIsAwaiting(deck)) dismissedDecks.add(deck.deckId);
+    approvalState = undefined;
+    approvalUndoStack.length = 0;
+    pickerKeyBuffer = '';
+    clearTimeout(escapeFlush);
+    escapeFlush = undefined;
+    render();
+  };
+
+  const visiblePickerSessions = (): EmmaSessionLike[] =>
+    pickerState ? filterSessions(pickerState.sessions, pickerState.query) : [];
+
+  const clampPickerSelection = () => {
+    if (!pickerState) return;
+    const visible = visiblePickerSessions();
+    pickerState.selected = Math.max(0, Math.min(pickerState.selected, Math.max(0, visible.length - 1)));
+  };
+
+  const switchSession = async (sessionId: string) => {
+    if (running) return;
+    try {
+      closeAgentRuns();
+      const next = await client.getSession(sessionId);
+      session = next;
+      composer = '';
+      cursor = 0;
+      errorText = undefined;
+      undoStack.length = 0;
+      pickerState = undefined;
+      approvalState = undefined;
+      maybeOpenApprovalDeck();
+      render();
+    } catch (error) {
+      errorText = error instanceof Error ? error.message : String(error);
+      render();
+    }
+  };
+
+  const createNewSession = async () => {
+    if (running) return;
+    try {
+      closeAgentRuns();
+      session = await client.createSession();
+      composer = '';
+      cursor = 0;
+      errorText = undefined;
+      undoStack.length = 0;
+      pickerState = undefined;
+      approvalState = undefined;
+      render();
+    } catch (error) {
+      errorText = error instanceof Error ? error.message : String(error);
+      render();
+    }
+  };
+
+  const resumeSelectedSession = () => {
+    const selected = visiblePickerSessions()[pickerState?.selected ?? -1];
+    if (selected) void switchSession(selected.sessionId);
+  };
+
+  const openSessionPicker = async () => {
+    if (running) return;
+    approvalState = undefined;
+    try {
+      const [emmaSessions, scheduledSessions] = await Promise.all([
+        client.listEmmaSessions(50),
+        client.listScheduledSessions(50),
+      ]);
+      const byId = new Map<string, EmmaSessionLike>();
+      for (const item of [...emmaSessions, ...scheduledSessions]) {
+        if (!byId.has(item.sessionId)) byId.set(item.sessionId, item);
+      }
+      if (!byId.has(session.sessionId)) byId.set(session.sessionId, session);
+      const sessions = [...byId.values()];
+      const sorted = filterSessions(sessions, '');
+      const selected = Math.max(0, sorted.findIndex(item => item.sessionId === session.sessionId));
+      pickerState = { sessions, query: '', cursor: 0, selected };
+      pickerUndoStack.length = 0;
+      pickerKeyBuffer = '';
+      errorText = undefined;
+      render();
+    } catch (error) {
+      errorText = error instanceof Error ? error.message : String(error);
+      render(true);
+    }
+  };
+
+  const updatePickerQuery = (next: string, nextCursor: number, recordUndo = true) => {
+    if (!pickerState) return;
+    if (recordUndo && next !== pickerState.query) {
+      pickerUndoStack.push({ text: pickerState.query, cursor: pickerState.cursor });
+      if (pickerUndoStack.length > 100) pickerUndoStack.shift();
+    }
+    pickerState.query = next;
+    pickerState.cursor = Math.max(0, Math.min(nextCursor, next.length));
+    pickerState.selected = 0;
+    clampPickerSelection();
+    render();
+  };
+
+  const currentApprovalDeck = () =>
+    approvalDeckIsAwaiting(session.pendingApprovalDeck) ? session.pendingApprovalDeck : undefined;
+
+  const approvalChoices = () => {
+    const deck = currentApprovalDeck();
+    const item = deck?.items[approvalState?.itemIndex ?? -1];
+    if (!item) return [];
+    if (item.metaWriteManifestDigest) {
+      return [
+        { id: 'approve', label: 'Approve' },
+        { id: 'reject', label: 'Reject' },
+      ];
+    }
+    return item.options ?? [];
+  };
+
+  const syncApprovalSelection = () => {
+    const deck = currentApprovalDeck();
+    if (!deck || !approvalState) return;
+    const item = deck.items[approvalState.itemIndex];
+    if (!item) return;
+    const existing = approvalState.answers.find(answer => answer.itemId === item.itemId);
+    const choices = approvalChoices();
+    approvalState.selectedVerdict =
+      existing?.verdict
+      || choices.find((choice: any) => choice.recommended)?.id
+      || choices[0]?.id;
+    approvalState.freeText = existing?.freeText ?? '';
+    approvalState.freeTextCursor = approvalState.freeText.length;
+  };
+
+  const recordApprovalChoice = (delegated = false): boolean => {
+    const deck = currentApprovalDeck();
+    if (!deck || !approvalState) return false;
+    const item = deck.items[approvalState.itemIndex];
+    if (!item) return false;
+
+    let answer: ApprovalDeckInboundAnswer;
+    if (delegated) {
+      if (!item.allowEmmaDecide || item.metaWriteManifestDigest) return false;
+      answer = { itemId: item.itemId, verdict: '', delegated: true };
+    } else {
+      const verdict = approvalState.selectedVerdict;
+      if (!verdict) return false;
+      const freeText = approvalState.freeText.trim();
+
+      if (verdict === 'comment') {
+        if (!freeText) return false;
+        answer = { itemId: item.itemId, verdict, freeText };
+      } else if (verdict === 'reject' && item.allowFreeText === true && freeText) {
+        answer = { itemId: item.itemId, verdict, freeText };
+      } else {
+        answer = { itemId: item.itemId, verdict };
+      }
+    }
+
+    approvalState.answers = [
+      ...approvalState.answers.filter(existing => existing.itemId !== item.itemId),
+      answer,
+    ];
+    return true;
+  };
+
+  const moveApproval = (delta: number) => {
+    const deck = currentApprovalDeck();
+    if (!deck || !approvalState) return;
+    approvalState.itemIndex = Math.max(0, Math.min(deck.items.length - 1, approvalState.itemIndex + delta));
+    approvalState.selectedVerdict = undefined;
+    approvalUndoStack.length = 0;
+    syncApprovalSelection();
+    render();
+  };
+
+  const submitApprovalDeck = async () => {
+    const deck = currentApprovalDeck();
+    if (!deck || !approvalState || running || !approvalDeckAllAnswered(deck, approvalState)) return;
+    running = true;
+    errorText = undefined;
+    const answers = [...approvalState.answers];
+    approvalState = undefined;
+    render();
+
+    try {
+      session = await client.submitApprovalDeck(session, deck.deckId, answers);
+      dismissedDecks.delete(deck.deckId);
+      maybeOpenApprovalDeck();
+    } catch (error) {
+      errorText = error instanceof Error ? error.message : String(error);
+      try {
+        session = await client.getSession(session.sessionId);
+      } catch {
+        // Keep the existing session and surface the error in the status line.
+      }
+      if (approvalDeckIsAwaiting(session.pendingApprovalDeck)) {
+        approvalState = {
+          itemIndex: 0,
+          answers,
+          freeText: '',
+          freeTextCursor: 0,
+        };
+        syncApprovalSelection();
+      }
+    } finally {
+      running = false;
+      render();
+    }
+  };
+
+  const chooseApprovalAndAdvance = (delegated = false) => {
+    const deck = currentApprovalDeck();
+    if (!deck || !approvalState || !recordApprovalChoice(delegated)) return;
+    if (approvalState.itemIndex < deck.items.length - 1) {
+      moveApproval(1);
+    } else {
+      render();
+    }
+  };
+
+  const handleRunKey = (key: PickerKey): boolean => {
+    if (!runState) return false;
+
+    if (key.ctrl && key.name === 'c') {
+      closeAndExit(130);
+      return true;
+    }
+    if (key.name === 'escape') {
+      closeAgentRuns();
+      return true;
+    }
+    if (!key.ctrl && key.name === 'r') {
+      void refreshAgentRuns();
+      return true;
+    }
+    if (key.name === 'up') {
+      runState.selected = Math.max(0, runState.selected - 1);
+      renderRuns();
+      return true;
+    }
+    if (key.name === 'down') {
+      runState.selected = Math.min(Math.max(0, runState.runs.length - 1), runState.selected + 1);
+      renderRuns();
+      return true;
+    }
+    if (key.name === 'home') {
+      runState.selected = 0;
+      renderRuns();
+      return true;
+    }
+    if (key.name === 'end') {
+      runState.selected = Math.max(0, runState.runs.length - 1);
+      renderRuns();
+      return true;
+    }
+    return true;
+  };
+
+  const handlePickerKey = (key: PickerKey) => {
+    if (runState && handleRunKey(key)) return;
+
+    if (approvalState) {
+      const choices = approvalChoices();
+      const current = approvalState.selectedVerdict;
+      let selectedIndex = Math.max(0, choices.findIndex((choice: any) => choice.id === current));
+
+      if (key.ctrl && key.name === 'c') {
+        closeAndExit(130);
+        return;
+      }
+      if (key.ctrl && key.name === 'enter') {
+        void submitApprovalDeck();
+        return;
+      }
+      if (key.name === 'escape') {
+        closeApprovalDeck();
+        return;
+      }
+      if (key.name === 'left') {
+        moveApproval(-1);
+        return;
+      }
+      if (key.name === 'right') {
+        const deck = currentApprovalDeck();
+        if (deck && approvalState.itemIndex < deck.items.length - 1) moveApproval(1);
+        return;
+      }
+      if (key.name === 'up' || key.name === 'down') {
+        selectedIndex += key.name === 'up' ? -1 : 1;
+        selectedIndex = Math.max(0, Math.min(choices.length - 1, selectedIndex));
+        approvalState.selectedVerdict = choices[selectedIndex]?.id;
+        render();
+        return;
+      }
+      if (key.name === 'enter') {
+        chooseApprovalAndAdvance(false);
+        return;
+      }
+      if (!key.ctrl && key.name === 'd') {
+        chooseApprovalAndAdvance(true);
+        return;
+      }
+      return;
+    }
+
+    if (!pickerState) {
+      if (key.ctrl && key.name === 'c') closeAndExit(130);
+      return;
+    }
+
+    if (key.ctrl && key.name === 'c') {
+      closeAndExit(130);
+      return;
+    }
+    if (key.ctrl && key.name === 'n') {
+      void createNewSession();
+      return;
+    }
+    if (key.ctrl && key.name === 'z') {
+      const previous = pickerUndoStack.pop();
+      if (previous && pickerState) {
+        updatePickerQuery(previous.text, previous.cursor, false);
+      }
+      return;
+    }
+
+    switch (key.name) {
+      case 'escape':
+        closePicker();
+        return;
+      case 'enter':
+        resumeSelectedSession();
+        return;
+      case 'up':
+        pickerState.selected--;
+        clampPickerSelection();
+        render();
+        return;
+      case 'down':
+        pickerState.selected++;
+        clampPickerSelection();
+        render();
+        return;
+      case 'page_up':
+        pickerState.selected -= 8;
+        clampPickerSelection();
+        render();
+        return;
+      case 'page_down':
+        pickerState.selected += 8;
+        clampPickerSelection();
+        render();
+        return;
+      case 'left':
+        pickerState.cursor = Math.max(0, pickerState.cursor - 1);
+        render();
+        return;
+      case 'right':
+        pickerState.cursor = Math.min(pickerState.query.length, pickerState.cursor + 1);
+        render();
+        return;
+      case 'home':
+        pickerState.cursor = 0;
+        render();
+        return;
+      case 'end':
+        pickerState.cursor = pickerState.query.length;
+        render();
+        return;
+      case 'backspace':
+        if (pickerState.cursor > 0) {
+          const at = pickerState.cursor;
+          updatePickerQuery(
+            pickerState.query.slice(0, at - 1) + pickerState.query.slice(at),
+            at - 1,
+          );
+        }
+        return;
+      case 'delete':
+        if (pickerState.cursor < pickerState.query.length) {
+          const at = pickerState.cursor;
+          updatePickerQuery(
+            pickerState.query.slice(0, at) + pickerState.query.slice(at + 1),
+            at,
+          );
+        }
+        return;
+      case 'paste':
+        if (key.text) {
+          const at = pickerState.cursor;
+          updatePickerQuery(
+            pickerState.query.slice(0, at) + key.text + pickerState.query.slice(at),
+            at + key.text.length,
+          );
+        }
+        return;
+      default:
+        if (key.text) {
+          const at = pickerState.cursor;
+          updatePickerQuery(
+            pickerState.query.slice(0, at) + key.text + pickerState.query.slice(at),
+            at + key.text.length,
+          );
+        }
+    }
+  };
+
+  const drainPickerKeys = (finalEscape = false) => {
+    for (;;) {
+      if (!pickerKeyBuffer) return;
+      if (finalEscape && pickerKeyBuffer === '\x1b') {
+        pickerKeyBuffer = '';
+        handlePickerKey({ name: 'escape' });
+        return;
+      }
+
+      const decoded = decodePickerKey(pickerKeyBuffer);
+      if (decoded.needMore && decoded.used === 0) return;
+      if (decoded.used <= 0) return;
+      pickerKeyBuffer = pickerKeyBuffer.slice(decoded.used);
+      if (decoded.key) handlePickerKey(decoded.key);
+    }
+  };
+
+  rawHandler = raw => {
+    if (!pickerState && !approvalState && !runState) {
+      if (raw.includes('\x03')) closeAndExit(130);
+      return;
+    }
+
+    pickerKeyBuffer += raw;
+    clearTimeout(escapeFlush);
+    escapeFlush = undefined;
+    drainPickerKeys();
+
+    if (pickerKeyBuffer === '\x1b') {
+      escapeFlush = setTimeout(() => {
+        escapeFlush = undefined;
+        drainPickerKeys(true);
+      }, 30);
+    }
+  };
+
+  const parseTextEdit = (event: Record<string, unknown>) => {
+    const { from, to, text, cursor: nextCursor, len } = event;
+    if (
+      typeof from !== 'number'
+      || typeof to !== 'number'
+      || typeof text !== 'string'
+      || typeof nextCursor !== 'number'
+      || typeof len !== 'number'
+    ) return null;
+    return { from, to, text, cursor: nextCursor, len };
+  };
+
+  const applyEdit = (event: Record<string, unknown>) => {
+    const edit = parseTextEdit(event);
+    if (!edit) return;
+
+    if (event.id === 'approval-note' && approvalState) {
+      const resolved = resolveNativeTextEdit(approvalState.freeText, edit);
+      if (!resolved) return;
+      approvalUndoStack.push({
+        text: approvalState.freeText,
+        cursor: approvalState.freeTextCursor,
+      });
+      if (approvalUndoStack.length > 100) approvalUndoStack.shift();
+      approvalState.freeText = resolved.text;
+      approvalState.freeTextCursor = resolved.cursor;
+      render();
+      return;
+    }
+
+    if (event.id === 'session-picker' && pickerState) {
+      const resolved = resolveNativeTextEdit(pickerState.query, edit);
+      if (!resolved) return;
+      updatePickerQuery(resolved.text, resolved.cursor);
+      return;
+    }
+
+    if (event.id !== 'composer') return;
+    const resolved = resolveNativeTextEdit(composer, edit);
+    if (!resolved) return;
+
+    undoStack.push({ text: composer, cursor });
+    if (undoStack.length > 100) undoStack.shift();
+    composer = resolved.text;
+    cursor = resolved.cursor;
+    errorText = undefined;
+    render(true);
+  };
+
+  const sendPrompt = async (prompt: string) => {
+    const text = prompt.trim();
+    if (!text || running) return;
+
+    if (text === '/runs') {
+      composer = '';
+      cursor = 0;
+      void openAgentRuns();
+      return;
+    }
+    if (text === '/resume' || text === '/sessions') {
+      composer = '';
+      cursor = 0;
+      void openSessionPicker();
+      return;
+    }
+    if (text === '/new') {
+      composer = '';
+      cursor = 0;
+      void createNewSession();
+      return;
+    }
+
+    running = true;
+    errorText = undefined;
+    composer = '';
+    cursor = 0;
+    undoStack.length = 0;
+    runningTools = [];
+
+    const optimistic: EmmaMessage = {
+      role: 'user',
+      content: text,
+      timestamp: new Date().toISOString(),
+    };
+    session = {
+      ...session,
+      messages: [...(session.messages ?? []), optimistic],
+    };
+    render();
+
+    try {
+      const usesAgentMode = session.sessionType === 'scheduled' || session.portalType === 'agent';
+      if (usesAgentMode) {
+        // Scheduled-tab sessions are attended Agent Mode turns in the real
+        // customer portal (ENG-2072). Preserve that route instead of sending
+        // them through the customer-chat SSE controller.
+        session = await client.sendAgentModeMessage(session, text);
+        errorText = undefined;
+      } else {
+        const complete = await client.streamMessage(
+          session.sessionId,
+          text,
+          (event: EmmaStreamEvent) => {
+            if (event.type !== 'tool_start' || typeof event.name !== 'string') return;
+            runningTools = [
+              ...runningTools,
+              {
+                id: String(++toolCounter),
+                name: event.name,
+                startedAt: Date.now(),
+              },
+            ];
+            render();
+          },
+        );
+
+        if (complete.session) {
+          session = complete.session;
+        } else {
+          session = await client.getSession(session.sessionId);
+        }
+        errorText = complete.error ? 'Last turn failed' : undefined;
+      }
+      maybeOpenApprovalDeck();
+    } catch (error) {
+      errorText = error instanceof Error ? error.message : String(error);
+      try {
+        session = await client.getSession(session.sessionId);
+      } catch {
+        // Keep the optimistic local transcript; the status line already shows the failure.
+      }
+    } finally {
+      running = false;
+      runningTools = [];
+      render();
+    }
+  };
+
+  eventHandler = event => {
+    switch (event.ev) {
+      case 'ack':
+        if (typeof event.s === 'number') {
+          if (event.sf === RUNS_SURFACE_ID) runFrames?.ack(event.s);
+          else frames.ack(event.s);
+        }
+        break;
+      case 'edit':
+        applyEdit(event);
+        break;
+      case 'undo': {
+        if (event.id === 'session-picker' && pickerState) {
+          const previous = pickerUndoStack.pop();
+          if (!previous) break;
+          updatePickerQuery(previous.text, previous.cursor, false);
+          break;
+        }
+        if (event.id === 'approval-note' && approvalState) {
+          const previous = approvalUndoStack.pop();
+          if (!previous) break;
+          approvalState.freeText = previous.text;
+          approvalState.freeTextCursor = previous.cursor;
+          render();
+          break;
+        }
+        if (event.id !== 'composer') break;
+        const previous = undoStack.pop();
+        if (!previous) break;
+        composer = previous.text;
+        cursor = previous.cursor;
+        render(true);
+        break;
+      }
+      case 'send':
+        if (event.id === 'approval-note' && approvalState && typeof event.text === 'string') {
+          approvalState.freeText = event.text;
+          approvalState.freeTextCursor = event.text.length;
+          chooseApprovalAndAdvance(false);
+          break;
+        }
+        if (event.id === 'composer' && typeof event.text === 'string') {
+          void sendPrompt(event.text);
+        }
+        break;
+      case 'select':
+      case 'activate': {
+        if (event.id === 'run-picker' && typeof event.item === 'string' && runState) {
+          const index = runState.runs.findIndex(run => run.runId === event.item);
+          if (index >= 0) {
+            runState.selected = index;
+            renderRuns();
+          }
+          break;
+        }
+        if (event.id === 'approval-picker' && typeof event.item === 'string' && approvalState) {
+          approvalState.selectedVerdict = event.item;
+          if (event.ev === 'activate') chooseApprovalAndAdvance(false);
+          else render();
+          break;
+        }
+        if (event.id !== 'session-picker' || typeof event.item !== 'string' || !pickerState) break;
+        const visible = visiblePickerSessions();
+        const index = visible.findIndex(item => item.sessionId === event.item);
+        if (index < 0) break;
+        pickerState.selected = index;
+        if (event.ev === 'activate') resumeSelectedSession();
+        else render();
+        break;
+      }
+      case 'action': {
+        if (event.act === 'runs' && event.id === 'status.runs') {
+          void openAgentRuns();
+          break;
+        }
+        if (event.id === 'run-picker' && runState) {
+          if (event.act === 'refresh') void refreshAgentRuns();
+          else if (event.act === 'close' || event.act === 'cancel') closeAgentRuns();
+          break;
+        }
+        if (event.act === 'sessions' && event.id === 'status.sessions') {
+          void openSessionPicker();
+          break;
+        }
+        if (event.id === 'approval-picker' && approvalState) {
+          if (event.act === 'choose') chooseApprovalAndAdvance(false);
+          else if (event.act === 'delegate') chooseApprovalAndAdvance(true);
+          else if (event.act === 'prev') moveApproval(-1);
+          else if (event.act === 'next') moveApproval(1);
+          else if (event.act === 'submit') void submitApprovalDeck();
+          else if (event.act === 'close' || event.act === 'cancel') closeApprovalDeck();
+          break;
+        }
+        if (event.id !== 'session-picker') break;
+        if (event.act === 'resume') resumeSelectedSession();
+        else if (event.act === 'new') void createNewSession();
+        else if (event.act === 'close' || event.act === 'cancel') closePicker();
+        break;
+      }
+      case 'gone': {
+        const ids = Array.isArray(event.ids)
+          ? event.ids.filter((id): id is string => typeof id === 'string')
+          : [];
+
+        if (ids.includes(RUNS_SURFACE_ID)) {
+          // Tern dropped the screen surface itself (for example after the user
+          // dismissed it externally). Do not send an x for something already gone.
+          runState = undefined;
+          runFrames = undefined;
+          runReconciler = undefined;
+          runsSurfaceOpened = false;
+          pickerKeyBuffer = '';
+          break;
+        }
+
+        if (ids.includes(SURFACE_ID)) {
+          // Tern no longer has the inline surface. Re-open from canonical AgentWeb
+          // state with a fresh frame sequence, matching the SDK's gone recovery.
+          frames = new FrameSender(SURFACE_ID, apcLimit, credits);
+          reconciler = new TspSurfaceReconciler(SURFACE_ID);
+          surfaceFocus = undefined;
+          process.stdout.write(
+            encodeTspJson(
+              'o',
+              {
+                id: SURFACE_ID,
+                mode: 'inline',
+                title: session.title || 'Emma',
+                role: 'agentweb.emma',
+              },
+              undefined,
+              apcLimit,
+            ),
+          );
+          render();
+          break;
+        }
+
+        // Node-level eviction: replay only the affected surface from canonical
+        // application state. Our renderer sends complete region replacements.
+        if (event.sf === RUNS_SURFACE_ID) {
+          runReconciler?.forget(ids);
+          renderRuns();
+        } else {
+          reconciler.forget(ids);
+          render();
+        }
+        break;
+      }
+      case 'error':
+        if (typeof event.msg === 'string') {
+          errorText = event.msg;
+          if (event.sf === RUNS_SURFACE_ID) {
+            closeAgentRuns();
+          } else {
+            render(pickerState === undefined && approvalState === undefined);
+          }
+        }
+        break;
+      default:
+        break;
+    }
+  };
+
+  maybeOpenApprovalDeck();
+  if (approvalState) syncApprovalSelection();
+  render();
+}
+
+main().catch(error => {
+  try {
+    restoreTerminalModes();
+    process.stdin.setRawMode?.(false);
+    process.stdin.pause();
+  } catch {
+    // no-op
+  }
+  process.stderr.write(`tern:emma: ${error instanceof Error ? error.message : String(error)}\n`);
+  process.exit(1);
+});
