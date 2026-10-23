@@ -1,6 +1,6 @@
 import { Request, Response } from 'express';
 import { settingsService } from '../services/settingsService';
-import { __resetConcurrentGenerationCapForTests, __activeGenerationCountForTests } from '../services/agentMode/concurrentGenerationCap';
+import { acquireInteractiveGenerationSlot, __resetConcurrentGenerationCapForTests, __activeGenerationCountForTests } from '../services/agentMode/concurrentGenerationCap';
 import { agentModeController, activeSessionGenerations, drainActiveSessionGenerations } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
@@ -286,6 +286,37 @@ describe('AgentModeController - per-user concurrent generation cap (ENG-110)', (
       await done;
       other.finish();
       await other.done;
+      expect(__activeGenerationCountForTests(userId)).toBe(0);
+    });
+
+    // ENG-2648: the bypass is bounded. At the hard ceiling (limit x2 other chats generating) an
+    // answer/cancel turn is refused BEFORE its pending state is consumed, so a retry still works.
+    it.each(cases)('%s at the hard ceiling (limit x2): 429 before the side effect, nothing held', async (_n, body, pending, arm, sideEffect) => {
+      getSetting.mockResolvedValue({ settingValue: '1' });
+      // Two other chats already generating: one admitted normally, one an answer turn above the limit.
+      const others = [
+        await acquireInteractiveGenerationSlot(userId, 'other-1'),
+        await acquireInteractiveGenerationSlot(userId, 'other-2', { continuesPausedTurn: true }),
+      ];
+      expect(others.every((o) => o.ok)).toBe(true);
+      withPending(pending);
+      arm();
+      const res = makeRes();
+      await agentModeController.generateResponse(reqWith(body), res);
+      expect(res.status).toHaveBeenCalledWith(429);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'TOO_MANY_CONCURRENT_RUNS', limit: 2 }));
+      expect(sideEffect()).not.toHaveBeenCalled();
+      expect(activeSessionGenerations.has('paused')).toBe(false);
+      expect(__activeGenerationCountForTests(userId)).toBe(2);
+      others.forEach((o) => { if (o.ok) o.release(); });
+      expect(__activeGenerationCountForTests(userId)).toBe(0);
+    });
+
+    it('an answer turn that is rejected (409) before the run releases its early-taken slot', async () => {
+      withPending({ pendingApprovalDeck: null });
+      const res = makeRes();
+      await agentModeController.generateResponse(reqWith({ deckAnswer: { deckId: 'd1', answers: [] } }), res);
+      expect(res.status).toHaveBeenCalledWith(409);
       expect(__activeGenerationCountForTests(userId)).toBe(0);
     });
 

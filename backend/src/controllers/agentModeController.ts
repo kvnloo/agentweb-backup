@@ -10849,6 +10849,10 @@ export const agentModeController = {
     // just the generic "Superseded — not answered" a deck that was silently
     // replaced/abandoned some other way would show. Mirrors approvalDeckAnswerMeta.
     let approvalDeckCancelledMeta: { deckId: string } | undefined;
+    // ENG-2648: the concurrency slot of an answer/cancel turn, taken BEFORE its pending
+    // state is consumed. Hoisted so the outer `finally` releases it on the early returns
+    // that precede the inner try (release() is idempotent; the inner finally also runs it).
+    let pausedTurnSlot: { release: () => void } | undefined;
     try {
       // A-019: do not admit a fresh interactive turn after shutdown drain starts.
       // This is intentionally before STT, idempotency/session claims, deck writes,
@@ -10946,6 +10950,18 @@ export const agentModeController = {
       // deckCancel still populate them.
       let answerAck: string | undefined;
       let answeredQuestionMeta: { questionId: string; optionId: string; delegated: boolean } | undefined;
+
+      // ENG-110/ENG-2648: an answer/cancel turn is admitted above the per-user cap (refusing it
+      // after the deck / work-plan request below is consumed would lose the outcome), but only up
+      // to the hard ceiling (limit x2). Its slot is taken HERE, before anything is consumed, so a
+      // 429 at the ceiling leaves the pending deck / request intact for a retry.
+      if (deckAnswer || deckCancel || workPlanInputAnswer) {
+        const reserved = await acquireInteractiveGenerationSlot(session.userId, sessionId, { continuesPausedTurn: true });
+        if (!reserved.ok) {
+          return res.status(429).json(buildTooManyRunsBody(reserved.current, reserved.limit));
+        }
+        pausedTurnSlot = reserved;
+      }
 
       // Work-plan details are validated and persisted as structured values before
       // Emma receives the continuation. This keeps chat and MCP answers identical
@@ -11159,17 +11175,17 @@ export const agentModeController = {
 
       // ENG-110: per-user soft cap on concurrently generating interactive chats.
       // Taken AFTER the session claim, released in the finally below on every exit.
-      let generationSlot: { release: () => void } | undefined;
+      // An answer/cancel turn already holds its slot (taken before its pending state was
+      // consumed, see pausedTurnSlot above), so it is never refused here.
+      let generationSlot: { release: () => void } | undefined = pausedTurnSlot;
       try {
-      // Answer/cancel turns already consumed a paused deck / work-plan request above
-      // (writes dispatched, state cleared), so refusing them now would lose the
-      // outcome and make a retry 409. They are never refused, only counted.
-      const continuesPausedTurn = Boolean(deckAnswer || deckCancel || workPlanInputAnswer);
-      const slot = await acquireInteractiveGenerationSlot(session.userId, sessionId, { bypassLimit: continuesPausedTurn });
-      if (!slot.ok) {
-        return res.status(429).json(buildTooManyRunsBody(slot.current, slot.limit));
+      if (!generationSlot) {
+        const slot = await acquireInteractiveGenerationSlot(session.userId, sessionId);
+        if (!slot.ok) {
+          return res.status(429).json(buildTooManyRunsBody(slot.current, slot.limit));
+        }
+        generationSlot = slot;
       }
-      generationSlot = slot;
 
       // Check token usage limits
       const usageStatus = await checkTokenUsage(user.userId, TURN_ADMISSION);
@@ -12050,6 +12066,8 @@ export const agentModeController = {
         error: 'Failed to generate response',
         ...(diagnosticContent ? { diagnosticMessage: diagnosticContent } : {}),
       });
+    } finally {
+      pausedTurnSlot?.release();
     }
   },
 
