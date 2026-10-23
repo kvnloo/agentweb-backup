@@ -9,7 +9,12 @@
 
 export type LlmConnectionKind = "api_key" | "claude_subscription" | "codex_subscription";
 
-export type LlmConnectionStatus = "active" | "invalid" | "revoked" | "expired";
+/**
+ * `revoking` and `disabled` exist only for hosted subscription logins (ENG-2110 1c): `revoking` = the owner disconnected and the
+ * login host has not yet confirmed the wipe (the slot is already released); `disabled` = fenced but kept. Everything that routes
+ * funding requires `=== "active"`, so both fail closed. "Needs reconnect" is `invalid` plus `subNeedsReconnect`.
+ */
+export type LlmConnectionStatus = "active" | "invalid" | "revoked" | "expired" | "revoking" | "disabled";
 
 export interface LlmConnectionHealth {
   lastOkAt?: string;

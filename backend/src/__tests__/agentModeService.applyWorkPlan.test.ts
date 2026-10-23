@@ -288,7 +288,7 @@ describe('AgentModeService - predefined work plan templates', () => {
 
       await service.applyPredefinedWorkPlan('Client Onboarding', sessionId, 'user-1');
 
-      expect(chatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(sessionId, 'anthropic.claude-sonnet-4-6');
+      expect(chatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(sessionId, 'anthropic.claude-sonnet-4-6', undefined, 'system');
     });
 
     it('ENG-1698: resets calledFunctions so a predefined-plan launch does not inherit stale tool-call credit', async () => {

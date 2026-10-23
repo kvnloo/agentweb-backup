@@ -37,6 +37,8 @@ export function listedToolNames(): string[] {
     ...(LANDING_WORKFLOW_TOOL_NAMES ?? []),
     ...(PUBLISH_WORKFLOW_TOOL_NAMES ?? []),
     ...SESSION_TOOL_NAMES,
+    // ENG-1034: the anonymous demo tool must be visible to be tried.
+    'emma_review_site',
     SEARCH_TOOL_NAME,
   ];
 }

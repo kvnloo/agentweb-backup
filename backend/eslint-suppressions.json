@@ -11446,36 +11446,6 @@
       "count": 10
     }
   },
-  "src/services/swarm/__tests__/helpers.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 4
-    }
-  },
-  "src/services/swarm/__tests__/pipeline.integration.test.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 5
-    }
-  },
-  "src/services/swarm/__tests__/prioritySorter.test.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
-  "src/services/swarm/__tests__/sprintCurator.test.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
-  "src/services/swarm/__tests__/taskFilter.test.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
-  "src/services/swarm/__tests__/workerCoordinator.test.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
   "src/services/taskSubscriberMetricsService.ts": {
     "@typescript-eslint/no-explicit-any": {
       "count": 8

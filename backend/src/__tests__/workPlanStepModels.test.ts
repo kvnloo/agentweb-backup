@@ -100,6 +100,7 @@ import {
   checkPlanStepModelsWrite,
   resolvePlanStepModelsForLaunch,
   isStepModelUnavailableError,
+  buildStepModelPausedMessage,
 } from '../services/agentMode/workPlanStepModels';
 
 const db = chatbotDb as jest.Mocked<typeof chatbotDb>;
@@ -678,6 +679,21 @@ describe('applyPredefinedWorkPlan (launch / accept / scheduled launch core)', ()
     expect(db.updateSessionWorkPlan.mock.calls[0][1]).toMatchObject({ planDefaultModel: 'gpt-5-chat', launchModel: 'claude-sonnet-x' });
   });
 
+  it("ENG-669: each pin is stamped at launch WITH its provenance (the plan's author): admin plan system, user plan user", async () => {
+    db.getChatSession.mockResolvedValue({ sessionId: 's1', messages: [], llmModel: 'claude-sonnet-x' } as any);
+    await launch(plan([S(1, 'gpt-5-chat'), S(2)], { defaultModel: 'gpt-5-chat' }));
+    let wp = db.updateSessionWorkPlan.mock.calls[0][1] as any;
+    expect(wp).toMatchObject({ planAuthor: 'system', planDefaultModel: 'gpt-5-chat', planDefaultModelSource: 'system' });
+    expect(wp.steps.map((s: any) => `${s.model ?? '-'}:${s.modelSource ?? '-'}`)).toEqual(['gpt-5-chat:system', '-:-']);
+    jest.clearAllMocks();
+    db.getChatSession.mockResolvedValue({ sessionId: 's1', messages: [], llmModel: 'claude-sonnet-x' } as any);
+    db.updateSessionWorkPlan.mockResolvedValue({} as any);
+    await launch(plan([S(1, 'gpt-5-chat'), S(2)], { defaultModel: 'gpt-5-chat', visibility: 'private', ownerId: 'user-1' }));
+    wp = db.updateSessionWorkPlan.mock.calls[0][1] as any;
+    expect(wp).toMatchObject({ planAuthor: 'user', planDefaultModelSource: 'user' });
+    expect(wp.steps[0]).toMatchObject({ model: 'gpt-5-chat', modelSource: 'user' });
+  });
+
   it('a plan without step models records neither (unchanged session shape)', async () => {
     db.getChatSession.mockResolvedValue({ sessionId: 's1', messages: [], llmModel: 'claude-sonnet-x' } as any);
     await launch(plan([S(1), S(2)], { defaultModel: 'gpt-5-chat' }));
@@ -768,5 +784,16 @@ describe('private -> public transitions revalidate step models for NON-admin lau
     svc.submitForReview = jest.fn(async () => { throw new Error('Not authorized'); });
     const res = await request(app).post('/api/user-work-plans/p1/submit-for-review').send({});
     expect(res.status).toBe(403);
+  });
+});
+
+describe('buildStepModelPausedMessage (ENG-669)', () => {
+  it("a step model outside the plan is worded for whoever reads the chat (owner or share viewer): never 'your plan'", () => {
+    const text = buildStepModelPausedMessage(2, 'GPT-5.5', 'not_in_plan');
+    expect(text).toContain("Step 2 uses GPT-5.5, which isn't included in this account's plan.");
+    expect(text).not.toContain('your plan');
+  });
+  it('an unavailable model keeps its wording', () => {
+    expect(buildStepModelPausedMessage(1, 'X', 'not_served')).toContain('Step 1 uses X, which is no longer available.');
   });
 });

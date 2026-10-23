@@ -26,6 +26,7 @@ const FULL_PARAMS: GenerateMarketingResponseParams = {
   approvedRevisionImageSources: ['https://example.com/img.png'],
   requireWorkPlanDisposition: true,
   isUnattendedRun: false,
+  modelRouting: { llmSelected: 'agentweb-model', llmRoutingReason: 'chat task: table default', llmRoutingTableVersion: 't1' },
 };
 
 describe('EmmaLoopBackend (ENG-1816 F1)', () => {
@@ -62,6 +63,7 @@ describe('EmmaLoopBackend (ENG-1816 F1)', () => {
       FULL_PARAMS.approvedRevisionImageSources,
       FULL_PARAMS.requireWorkPlanDisposition,
       FULL_PARAMS.isUnattendedRun,
+      FULL_PARAMS.modelRouting,
     );
   });
 

@@ -13,6 +13,18 @@
  */
 import { z } from "zod";
 
+/**
+ * The version of THIS protocol (routes, request and reply shapes). The backend and the worker both deploy automatically on a merge to main, but
+ * as separate pipelines that finish at different times (the worker also waits for an idle moment), so they routinely run different commits. Bump it whenever a route or a field is added, removed or
+ * changes meaning, and keep the deploy order in mind:
+ *   - a change to what the backend SENDS (a new route or request field): deploy the WORKER first (an old worker refuses unknown fields);
+ *   - a change to what the worker REPLIES (a new reply field the backend starts relying on): deploy the BACKEND first (its reply shapes
+ *     ignore extra fields, so a newer worker is harmless to an older backend).
+ * The backend asks `host.info` once after it builds its client and logs a mismatch; an unknown route answers EINVALID/route (never
+ * ENOTFOUND, which means "no such connection" and has a destructive meaning for revoke and the sweeper).
+ */
+export const PROTOCOL_VERSION = 2;
+
 const ID = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/, "id: letters, digits, _ and - only, 1-64 chars");
 const PROVIDER = z.string().regex(/^[a-z][a-z0-9_]{0,31}$/);
 const EPOCH = z.number().int().min(1).max(2_147_483_647);
@@ -51,6 +63,15 @@ export const turnToolResultReq = z
   .object({ connectionId: ID, turnId: ID, epoch: EPOCH, operationId: ID, ok: z.boolean(), content: z.string().max(4_000_000) })
   .strict();
 
+export const hostInfoReq = z.object({}).strict();
+/**
+ * Deploy support (UNIX SOCKET ONLY: the mutual-TLS listener refuses it, so a compromised backend cannot starve the host).
+ *   off     admit everything again
+ *   strict  only if nothing is running, signing in or being promoted/revoked at this instant: refuse ALL new turns and sign-ins from now on
+ * The state expires by itself after `ttlSec`: a deploy that dies half-way cannot leave the host refusing work. A restart clears it.
+ */
+export const hostDrainReq = z.object({ mode: z.enum(["off", "strict"]), ttlSec: z.number().int().min(10).max(3600).optional() }).strict();
+
 export const connectionActionReq = z.object({ connectionId: ID, epoch: EPOCH }).strict();
 export const connectionStatusReq = z.object({ connectionId: ID }).strict();
 
@@ -68,7 +89,11 @@ export const ROUTES = {
   "connection.enable": connectionActionReq,
   "connection.revoke": connectionActionReq,
   "connection.status": connectionStatusReq,
+  "host.info": hostInfoReq,
+  "host.drain": hostDrainReq,
 } as const;
+/** Routes only the local unix socket serves. */
+export const LOCAL_ONLY_ROUTES: ReadonlySet<RouteName> = new Set<RouteName>(["host.drain"]);
 export type RouteName = keyof typeof ROUTES;
 export type RouteInput<R extends RouteName> = z.infer<(typeof ROUTES)[R]>;
 

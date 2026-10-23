@@ -42,6 +42,17 @@ jest.mock('../middleware/auth', () => ({
   isAdmin: (_req: any, _res: any, next: any) => next(),
 }));
 jest.mock('../services/orgAuthz', () => ({ can: jest.fn(() => true), canEditItem: jest.fn(() => true) }));
+// ENG-669: AW-Settings rows by name (tier-allowlist switch off unless a test sets it) and the owner's tier.
+const mockSettings: Record<string, string | undefined> = {};
+jest.mock('../services/settingsService', () => ({
+  settingsService: {
+    getSetting: jest.fn(async (name: string) => (mockSettings[name] === undefined ? null : { settingName: name, settingValue: mockSettings[name] })),
+  },
+}));
+jest.mock('../services/subscriptionService', () => ({
+  getUserSubscriptionResolution: jest.fn(async () => ({ subscriptionType: 'Free', resolved: true })),
+  readTierAllowedModels: jest.fn(async (tier: string) => (tier === 'Free' ? { configured: true, allowedModels: ['gpt-5-chat'] } : { configured: false })),
+}));
 
 // Registry double: same shape as AgentModeService's resolveGenerationModel / isModelSelectableBy.
 const REG = new Set(['gpt-5-chat', 'claude-sonnet-x', 'admin-only-model', 'internal-judge', 'live-voice']);
@@ -72,6 +83,7 @@ import adminWorkPlanRoutes from '../routes/adminWorkPlanRoutes';
 import userWorkPlanRoutes from '../routes/userWorkPlanRoutes';
 import * as orgShareService from '../services/orgShareService';
 import { authenticateToken, isAdmin } from '../middleware/auth';
+import { modelAccess } from '../services/agentMode/modelAccessInstance';
 
 const db = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const candidates = getAccessiblePredefinedWorkPlanCandidates as jest.Mock;
@@ -173,14 +185,14 @@ describe('applyPredefinedWorkPlan (Emma tool / launch / accept core)', () => {
     getUser.mockResolvedValue({ userId: 'user-1', isAdmin: true });
     const r: any = await launch('admin-only-model');
     expect(r.success).toBe(true);
-    expect(db.updateSessionLlmModel).toHaveBeenCalledWith('s1', 'admin-only-model');
+    expect(db.updateSessionLlmModel).toHaveBeenCalledWith('s1', 'admin-only-model', undefined, 'system');
   });
 
   it('valid, alias and live-served ids launch and store the canonical id; empty leaves the model untouched', async () => {
     expect(((await launch('gpt-5-chat')) as any).success).toBe(true);
-    expect(db.updateSessionLlmModel).toHaveBeenLastCalledWith('s1', 'gpt-5-chat');
+    expect(db.updateSessionLlmModel).toHaveBeenLastCalledWith('s1', 'gpt-5-chat', undefined, 'system');
     expect(((await launch('legacy-alias')) as any).success).toBe(true);
-    expect(db.updateSessionLlmModel).toHaveBeenLastCalledWith('s1', 'claude-sonnet-x');
+    expect(db.updateSessionLlmModel).toHaveBeenLastCalledWith('s1', 'claude-sonnet-x', undefined, 'system');
     db.updateSessionLlmModel.mockClear();
     expect(((await launch('')) as any).success).toBe(true);
     expect(((await launch(undefined)) as any).success).toBe(true);
@@ -193,6 +205,25 @@ describe('applyPredefinedWorkPlan (Emma tool / launch / accept core)', () => {
     expectNoSideEffects();
     await new Promise((res) => setImmediate(res));
     expect(mockAlert).toHaveBeenCalledWith(expect.objectContaining({ dedupeKey: 'workplan_model_invalid:plan-1:retired-9' }));
+  });
+
+  it('ENG-669 PR-C: an unattended launch pinned to an unavailable AgentWeb Model is refused without paging (the router alert covers it)', async () => {
+    const { agentWebModelRouter } = await import('../services/agentMode/agentWebModelRouterInstance');
+    for (const table of [undefined, '{not json']) {
+      agentWebModelRouter.reset();
+      mockAlert.mockClear();
+      mockSettings.agentweb_model_router_enabled = table ? 'true' : undefined;
+      mockSettings.agentweb_model_routing_table = table;
+      const r: any = await launch('agentweb-model', { isUnattendedRun: true });
+      expect(r.errorType).toBe('model_unavailable');
+      expect(r.message).toContain('(AgentWeb Model)');
+      expectNoSideEffects();
+      await new Promise((res) => setImmediate(res));
+      expect(mockAlert.mock.calls.map(([a]) => a.dedupeKey).filter((k) => String(k).startsWith('workplan_model_invalid'))).toEqual([]);
+    }
+    delete mockSettings.agentweb_model_router_enabled;
+    delete mockSettings.agentweb_model_routing_table;
+    agentWebModelRouter.reset();
   });
 
   it('a FAILED model write refuses the launch and writes nothing else (model is written first)', async () => {
@@ -241,7 +272,7 @@ describe('applyPredefinedWorkPlan (Emma tool / launch / accept core)', () => {
       const r: any = await launch('gpt-5-chat', { force: true });
       expect(r.success).toBe(false);
       expect(db.updateSessionLlmModel).toHaveBeenCalledTimes(1);
-      expect(db.updateSessionLlmModel).toHaveBeenCalledWith('s1', 'gpt-5-chat');
+      expect(db.updateSessionLlmModel).toHaveBeenCalledWith('s1', 'gpt-5-chat', undefined, 'system');
       expect(db.restoreSessionLlmModelIfUnchanged).toHaveBeenCalledWith('s1', 'gpt-5-chat', { llmModel: 'old-model', llmUsagePolicyDecision: PRIOR_DECISION });
     });
 
@@ -563,5 +594,106 @@ describe('admin status scope: private + owner-admin + NO org only', () => {
     wps.getWorkPlan.mockResolvedValue(stored() as any);
     const ok = await request(app).put('/api/user-work-plans/p1').send({ defaultModel: 'admin-only-model' });
     expect(ok.status).toBe(200);
+  });
+});
+
+/**
+ * ENG-669 PR-A: a USER-authored plan pin must be in the owner's plan at write time and in the LAUNCHING user's plan
+ * at launch (422 / tool refusal `not_in_plan`); an admin-authored (system) plan's pin is AgentWeb's choice and is
+ * exempt. An unchanged stored pin stays editable. Switch off: unchanged.
+ */
+describe('ENG-669 tier model allowlist on plan pins', () => {
+  const NOT_IN_PLAN = 'claude-sonnet-x';
+  const notAdmin = async () => false;
+  beforeEach(() => {
+    jest.clearAllMocks();
+    for (const key of Object.keys(mockSettings)) delete mockSettings[key];
+    mockSettings.model_tier_allowlist_enabled = 'true';
+    mockSettings.subscription_types = JSON.stringify([{ name: 'Free', allowedModels: ['gpt-5-chat'] }, { name: 'Pro' }]);
+    modelAccess.reset();
+    getUser.mockResolvedValue({ userId: 'user-1', isAdmin: false });
+    db.getChatSession.mockResolvedValue({ sessionId: 's1', messages: [] } as any);
+  });
+
+  it('modelPin: checked only with a tier owner, on the canonical id', async () => {
+    await expect(resolvePlanLaunchModel(registry, notAdmin, 'legacy-alias', 'user-1'))
+      .rejects.toMatchObject({ reason: 'not_in_plan', plan: { model: NOT_IN_PLAN, tier: 'Free', upgradeRequired: ['Pro'] } });
+    await expect(resolvePlanLaunchModel(registry, notAdmin, NOT_IN_PLAN)).resolves.toBe(NOT_IN_PLAN);
+    await expect(resolvePlanLaunchModel(registry, notAdmin, 'gpt-5-chat', 'user-1')).resolves.toBe('gpt-5-chat');
+  });
+
+  it('modelPin: an UNCHANGED stored pin outside the plan stays editable; a changed one is refused', async () => {
+    expect(await validatePlanDefaultModelWrite(registry, notAdmin, NOT_IN_PLAN, NOT_IN_PLAN, 'user-1')).toEqual({ touched: true, value: NOT_IN_PLAN });
+    // The stored alias resent as its canonical id is the same model: unchanged, stored canonically.
+    expect(await validatePlanDefaultModelWrite(registry, notAdmin, NOT_IN_PLAN, 'legacy-alias', 'user-1')).toEqual({ touched: true, value: NOT_IN_PLAN });
+    await expect(validatePlanDefaultModelWrite(registry, notAdmin, NOT_IN_PLAN, 'gpt-5-chat', 'user-1')).rejects.toMatchObject({ reason: 'not_in_plan' });
+  });
+
+  describe('launch (Emma tool / applyPredefinedWorkPlan)', () => {
+    const launchPlan = (p: Record<string, unknown>) => {
+      candidates.mockResolvedValue([p]);
+      return workPlansImpl.applyPredefinedWorkPlan('Client Onboarding', 's1', 'user-1', {}, registry as any) as Promise<any>;
+    };
+
+    it("a user plan's pin outside the launcher's plan is refused with the plan details; nothing changes", async () => {
+      const r = await launchPlan({ ...plan(NOT_IN_PLAN), visibility: 'private', isBuiltIn: false, ownerId: 'user-1' });
+      expect(r).toMatchObject({ success: false, errorType: 'model_unavailable' });
+      expect(r.modelUnavailable).toMatchObject({ reason: 'not_in_plan', model: NOT_IN_PLAN, tier: 'Free', upgradeRequired: ['Pro'] });
+      expect(r.message).toContain("isn't included in your plan");
+      expect(db.updateSessionLlmModel).not.toHaveBeenCalled();
+      expect(db.updateSessionWorkPlan).not.toHaveBeenCalled();
+    });
+
+    it("an admin-authored (system) plan's pin is exempt and launches on exactly that model", async () => {
+      const r = await launchPlan({ ...plan(NOT_IN_PLAN), visibility: 'system', isBuiltIn: true });
+      expect(r.success).toBe(true);
+      expect(db.updateSessionLlmModel).toHaveBeenCalledWith('s1', NOT_IN_PLAN, undefined, 'system');
+    });
+
+    it('switch off: the user plan launches as before', async () => {
+      delete mockSettings.model_tier_allowlist_enabled;
+      modelAccess.reset();
+      const r = await launchPlan({ ...plan(NOT_IN_PLAN), visibility: 'private', isBuiltIn: false, ownerId: 'user-1' });
+      expect(r.success).toBe(true);
+    });
+  });
+
+  describe('write routes', () => {
+    const app = express();
+    app.use(express.json());
+    app.use('/api/admin/work-plans', authenticateToken, isAdmin, adminWorkPlanRoutes);
+    app.use('/api/user-work-plans', authenticateToken, userWorkPlanRoutes);
+    const step = { stepCount: 1, title: 'S', description: 'd' };
+    const stored = (defaultModel?: string) => ({
+      planId: 'p1', title: 'T', steps: [step], visibility: 'private', ownerId: 'user-1', defaultModel, createdAt: 'x', updatedAt: 'x',
+    });
+    beforeEach(() => {
+      mockIsAdminCaller = false;
+      wps.createWorkPlan.mockImplementation(async (p: any) => ({ ...p, planId: 'new' }));
+      wps.updateWorkPlan.mockResolvedValue('rev');
+    });
+
+    it("user POST: a pin outside the owner's plan is a 422 not_in_plan; nothing written", async () => {
+      const res = await request(app).post('/api/user-work-plans').send({ title: 'T', steps: [step], defaultModel: NOT_IN_PLAN });
+      expect(res.status).toBe(422);
+      expect(res.body).toMatchObject({ code: 'model_unavailable', reason: 'not_in_plan', tier: 'Free' });
+      expect(wps.createWorkPlan).not.toHaveBeenCalled();
+    });
+
+    it('user PUT: an unchanged stored pin outside the plan stays editable; changing to one is a 422', async () => {
+      wps.getWorkPlan.mockResolvedValue(stored(NOT_IN_PLAN) as any);
+      expect((await request(app).put('/api/user-work-plans/p1').send({ title: 'Renamed', defaultModel: NOT_IN_PLAN })).status).toBe(200);
+      wps.getWorkPlan.mockResolvedValue(stored('gpt-5-chat') as any);
+      const changed = await request(app).put('/api/user-work-plans/p1').send({ defaultModel: NOT_IN_PLAN });
+      expect(changed.status).toBe(422);
+      expect(changed.body).toMatchObject({ reason: 'not_in_plan' });
+    });
+
+    it('admin POST (admin-authored system plan): the same pin is accepted', async () => {
+      mockIsAdminCaller = true;
+      const res = await request(app).post('/api/admin/work-plans').send({ title: 'T', steps: [step], defaultModel: NOT_IN_PLAN });
+      expect(res.status).toBe(201);
+      expect(wps.createWorkPlan).toHaveBeenCalledWith(expect.objectContaining({ defaultModel: NOT_IN_PLAN }));
+    });
   });
 });

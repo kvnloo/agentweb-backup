@@ -76,6 +76,7 @@ export class EmmaLoopBackend implements RunBackend {
         params.approvedRevisionImageSources,
         params.requireWorkPlanDisposition,
         params.isUnattendedRun,
+        params.modelRouting, // ENG-669 PR-C: the AgentWeb Model stamp, last like the worker script's list
       );
     } catch (error) {
       emitTerminal(emitter, "failed");

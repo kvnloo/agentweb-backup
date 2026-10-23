@@ -78,6 +78,10 @@ provider-failure cases; confirm bad leads remain in CRM, only bad skips Slack,
 error posts unscored, and other orgs are unchanged. Roll back by disabling
 `fitFilter.enabled` (with approval) or reverting this PR. No backfill is introduced.
 
+The same lead-created moment also feeds the optional hot-lead auto-call (a phone
+call to a team member, press 1 to connect the lead). It is independent of
+Slack and never changes this alert; see [hot-lead-call.md](./hot-lead-call.md).
+
 ## Lead-type filter and Emma tools
 
 `leadTypes` is optional on the existing org JSON config. Absent means

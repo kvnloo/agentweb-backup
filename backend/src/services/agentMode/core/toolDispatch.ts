@@ -33,7 +33,7 @@ import { Citation, CitationRegistry, WEB_SEARCH_TOOL_NAMES, buildCitationIndexBl
 import { appendRetryabilityGuidance } from './errorRetryability';
 import { LLM_MODEL_REGISTRY } from '../llmModelRegistry';
 import { sealTruncatedPayload, sealTruncatedPayloadWithNotice } from './truncatedPayload';
-import { parseToolCallArguments, TruncatedToolCallArgumentsError } from './repairToolCallArguments';
+import { normalizeRepairedToolCallArguments, parseToolCallArguments, TruncatedToolCallArgumentsError } from './repairToolCallArguments';
 import {
   buildToolResponseS3Header,
   buildToolResponseUnavailableHeader,
@@ -262,6 +262,12 @@ export function seedSearchCallCountFromHistory(
 export const SHARED_SESSION_BLOCKED_ORG_SETTINGS_TOOLS: ReadonlySet<string> = new Set([
   'get_lead_notification_settings',
   'update_lead_notification_settings',
+  'get_hot_lead_call_settings',
+  'update_hot_lead_call_settings',
+  'provision_hot_lead_call_number',
+  'release_hot_lead_call_number',
+  'start_hot_lead_call_verification',
+  'confirm_hot_lead_call_verification',
   'save_org_memory',
   'delete_org_memory',
   'save_memory',
@@ -785,6 +791,10 @@ export async function executePreparedTools(
       // early string terminator. Retry through a repair pass before failing —
       // see repairToolCallArguments.ts for the observed failure signature.
       const functionArgs = parseToolCallArguments(toolCall.function.arguments);
+      // ENG-2597: when the raw arguments needed repair (duplicated object,
+      // unescaped quote), store the repaired form on the tool call so the
+      // assistant turn persisted to history replays valid JSON next turn.
+      normalizeRepairedToolCallArguments(toolCall, functionArgs);
 
       // Enforce skill-based tool access; block admin-only tools without admin access,
       // block context-restricted/shared-session tools even if the LLM hallucinates them.

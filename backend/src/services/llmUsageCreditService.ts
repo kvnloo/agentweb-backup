@@ -2,7 +2,7 @@ import AWS from 'aws-sdk';
 import { userDb, type User } from './db';
 import { paymentHistoryDb } from './paymentHistoryDb';
 
-const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+import { TABLE_PREFIX } from '../config/constants';
 const USERS_TABLE = `${TABLE_PREFIX}AW-Users`;
 const PAYMENT_HISTORY_TABLE = `${TABLE_PREFIX}AW-PaymentHistory`;
 const docClient = new AWS.DynamoDB.DocumentClient();
@@ -110,6 +110,42 @@ export function getLlmUsageCreditAdjustment(
   };
 }
 
+/**
+ * Grant-id prefix of the monthly seat credit (`orgSeatCreditGrantService.seatCreditGrantId`). Seat credit
+ * is ledgered as `source: 'purchase'` like a top-up, so the id is what tells the two apart.
+ */
+export const SEAT_CREDIT_GRANT_ID_PREFIX = 'seat-credit:';
+
+/**
+ * ENG-668: purchased credit in this month's ledger that a refund or dispute can still take back — the
+ * additional-usage top-ups (`source: 'purchase'`, every id except the seat credit's), net of their
+ * reversals. Seat credit, admin grants and migration offsets are not counted: nothing revokes them
+ * mid-month.
+ *
+ * The PAYG pool high-water mark is recorded WITHOUT this amount, so a top-up counts toward the pool only
+ * while it is live: refunded or disputed, it stops extending the pool instead of staying behind in the
+ * mark as unbilled capacity. A ledger whose purchase total is not itemised by grant counts all of its net
+ * purchase as revocable, which only ever keeps the mark lower.
+ */
+export function getRevocablePurchasedCreditMicroUsd(
+  ledger: MonthlyLlmUsageCredits | null | undefined,
+  month = getCurrentUsageMonth(),
+): number {
+  if (!ledger || ledger.month !== month) return 0;
+  const purchasedNet = getLlmUsageCreditAdjustment(ledger, month).purchasedMicroUsd;
+  const purchaseGrants = (ledger.grants || []).filter((grant) => grant.source === 'purchase');
+  const itemisedTotal = purchaseGrants.reduce((sum, grant) => sum + Math.max(0, Math.round(grant.amountMicroUsd || 0)), 0);
+  if (itemisedTotal !== Math.round(ledger.totalPurchasedMicroUsd || 0)) return purchasedNet;
+  const reversedByGrant = new Map<string, number>();
+  for (const reversal of ledger.reversals || []) {
+    reversedByGrant.set(reversal.grantId, (reversedByGrant.get(reversal.grantId) || 0) + Math.max(0, Math.round(reversal.amountMicroUsd || 0)));
+  }
+  const revocable = purchaseGrants
+    .filter((grant) => !grant.id.startsWith(SEAT_CREDIT_GRANT_ID_PREFIX))
+    .reduce((sum, grant) => sum + Math.max(0, Math.round(grant.amountMicroUsd || 0) - (reversedByGrant.get(grant.id) || 0)), 0);
+  return Math.min(purchasedNet, revocable);
+}
+
 export function applyLlmUsageCredits(input: {
   rawCostUsedMicroUsd: number;
   hardThresholdMicroUsd: number;
@@ -152,6 +188,37 @@ export function planRolloutMigrationCredit(input: {
  * the migration safe to rerun.
  */
 export const planRolloutUsageReset = planRolloutMigrationCredit;
+
+/**
+ * ENG-668: the ledger a new month's first write is about to replace, to keep as
+ * `llmUsageCreditsClosed`; undefined when the write stays in the same month.
+ *
+ * The ledger holds one month only, and its first write of a new month (the seat-credit sweep at
+ * 10:00 UTC on day 1, a top-up, a debit) replaces the closed month wholesale. Month-end PAYG
+ * settlement runs after that, and measures the closed month against that month's credits — without
+ * this copy it would see none and bill top-up and seat-credit usage as overage. One month only; the
+ * per-debit list is left out (settlement reads totals and grants only), which keeps the copy far below
+ * the debit ledger's share of the item. Only an account with a PAYG record (on or off) gets one: no other
+ * account is ever settled, so for them nothing changes.
+ */
+function ledgerToClose(user: Pick<User, 'llmUsageCredits' | 'paygOverage'>, month: string): MonthlyLlmUsageCredits | undefined {
+  const existing = user.llmUsageCredits;
+  if (!user.paygOverage || !existing || existing.month === month) return undefined;
+  const closed: MonthlyLlmUsageCredits = { ...existing };
+  delete closed.debits;
+  delete closed.debitIds;
+  return closed;
+}
+
+/** The credit ledger for `month`: the live one, or the closed month kept at rollover. */
+export function getLlmUsageCreditLedgerForMonth(
+  user: Pick<User, 'llmUsageCredits' | 'llmUsageCreditsClosed'> | null | undefined,
+  month: string,
+): MonthlyLlmUsageCredits | undefined {
+  if (user?.llmUsageCredits?.month === month) return user.llmUsageCredits;
+  if (user?.llmUsageCreditsClosed?.month === month) return user.llmUsageCreditsClosed;
+  return undefined;
+}
 
 function isConditionalFailure(error: any): boolean {
   return error?.code === 'ConditionalCheckFailedException';
@@ -236,6 +303,7 @@ export async function grantMonthlyLlmUsageCredit(input: {
       grantIds: [...(current.grantIds || []), input.grantId],
       grants: [...(current.grants || []), grant],
     };
+    const closed = ledgerToClose(user, month);
 
     const condition: {
       expression: string;
@@ -286,14 +354,18 @@ export async function grantMonthlyLlmUsageCredit(input: {
               Update: {
                 TableName: USERS_TABLE,
                 Key: { email: user.email },
-                UpdateExpression: 'SET #creditLedger = :next',
+                UpdateExpression: closed
+                  ? 'SET #creditLedger = :next, #closedLedger = :closed'
+                  : 'SET #creditLedger = :next',
                 ConditionExpression: condition.expression,
                 ExpressionAttributeNames: {
                   '#creditLedger': 'llmUsageCredits',
+                  ...(closed ? { '#closedLedger': 'llmUsageCreditsClosed' } : {}),
                   ...(condition.names || {}),
                 },
                 ExpressionAttributeValues: {
                   ':next': next,
+                  ...(closed ? { ':closed': closed } : {}),
                   ...(condition.values || {}),
                 },
               },
@@ -326,7 +398,11 @@ export async function grantMonthlyLlmUsageCredit(input: {
           ],
         }).promise();
       } else {
-        await userDb.updateUser(billingUserId, { llmUsageCredits: next }, { condition });
+        await userDb.updateUser(
+          billingUserId,
+          { llmUsageCredits: next, ...(closed ? { llmUsageCreditsClosed: closed } : {}) },
+          { condition },
+        );
       }
       return { granted: true, billingUserId, ledger: next };
     } catch (error) {
@@ -552,6 +628,7 @@ export async function recordLlmUsageDebit(input: {
       debitIds: [...(current.debitIds || []), debitId],
       totalDebitedMicroUsd: (current.totalDebitedMicroUsd || 0) + amountMicroUsd,
     };
+    const closed = ledgerToClose(user, month);
 
     const condition: {
       expression: string;
@@ -583,7 +660,11 @@ export async function recordLlmUsageDebit(input: {
         };
 
     try {
-      await userDb.updateUser(billingUserId, { llmUsageCredits: next }, { condition });
+      await userDb.updateUser(
+        billingUserId,
+        { llmUsageCredits: next, ...(closed ? { llmUsageCreditsClosed: closed } : {}) },
+        { condition },
+      );
       return { debited: true, billingUserId, ledger: next };
     } catch (error) {
       if (isConditionalFailure(error)) continue;

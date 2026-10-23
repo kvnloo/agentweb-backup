@@ -19,6 +19,17 @@ jest.mock('../services/subscriptionService', () => ({
   getAllowedFunctionCalls: jest.fn(async () => ['get_marketing_tips', 'linkedin_outreach']),
   getAllowedSkills: jest.fn(async () => ['*']),
   isSubscriptionFeatureEnabled: jest.fn(async () => true),
+  // ENG-669: the owner's tier for the model allowlist (Free lists only the default here).
+  getUserSubscriptionResolution: jest.fn(async () => ({ subscriptionType: 'Free', resolved: true })),
+  // 'legacy-target' only: 'gpt-5-chat-2' is a real legacy alias of 'gpt-5.5', so listing it would allow gpt-5.5.
+  readTierAllowedModels: jest.fn(async () => ({ configured: true, allowedModels: ['legacy-target'] })),
+}));
+// ENG-669: AW-Settings rows by name; the tier-allowlist switch is off unless a test sets it.
+const mockSettings: Record<string, string | undefined> = {};
+jest.mock('../services/settingsService', () => ({
+  settingsService: {
+    getSetting: jest.fn(async (name: string) => (mockSettings[name] === undefined ? null : { settingName: name, settingValue: mockSettings[name] })),
+  },
 }));
 
 jest.mock('../services/chatbotService', () => ({
@@ -143,6 +154,8 @@ import { generateMarketingResponseWorkerService } from '../services/generateMark
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { getEffectiveLlmUsagePolicy } from '../services/llmUsagePolicyResolverService';
 import { runScheduledChat } from '../controllers/agentModeController';
+import { modelAccess } from '../services/agentMode/modelAccessInstance';
+import { agentWebModelRouter } from '../services/agentMode/agentWebModelRouterInstance';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
@@ -171,6 +184,8 @@ const flushAsync = async (rounds = 20) => { for (let i = 0; i < rounds; i++) awa
 
 beforeEach(() => {
   jest.clearAllMocks();
+  for (const key of Object.keys(mockSettings)) delete mockSettings[key];
+  modelAccess.reset();
   mockPolicy.mockResolvedValue({ billingUserId: USER, policy: null, costUsedMicroUsd: 0, tokenUsed: 0, mode: FULL_CHOICE });
   mockAgentModeService.getDefaultModel.mockResolvedValue('gpt-5-chat-2');
   (mockAgentModeService as any).getScheduledChatsDefaultModel.mockResolvedValue('gpt-5-chat-2');
@@ -276,7 +291,7 @@ describe('runScheduledChat: unchanged cases (WP-G)', () => {
     await flushAsync();
     expect(result.status).not.toBe('failure');
     expect(mockWorker.runInWorker).toHaveBeenCalledWith(expect.objectContaining({ llmModel: 'gpt-5.5' }), expect.anything());
-    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith('session-fl', 'gpt-5.5', expect.anything());
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith('session-fl', 'gpt-5.5', expect.anything(), 'user');
     expect(mockAlert).not.toHaveBeenCalledWith(expect.objectContaining({ subject: 'AgentMode: unsupported model pinned on a scheduled chat' }));
   });
 
@@ -318,5 +333,80 @@ describe('runScheduledChat: unchanged cases (WP-G)', () => {
     expect(result.actualResponse ?? '').not.toContain('model_unavailable');
     expect(mockWorker.runInWorker).not.toHaveBeenCalled();
     expect(mockAlert).not.toHaveBeenCalledWith(expect.objectContaining({ subject: 'AgentMode: unsupported model pinned on a scheduled chat' }));
+  });
+});
+
+/**
+ * ENG-669 (review MAJOR 2): with the tier allowlist on, the owner's own pin must be in the owner's plan (a visible
+ * failed run, no page), while a pin inherited from an admin-authored schedule template (llmModelSource 'system') is
+ * AgentWeb's choice and runs.
+ */
+describe('runScheduledChat: tier model allowlist (ENG-669)', () => {
+  beforeEach(() => {
+    mockSettings.model_tier_allowlist_enabled = 'true';
+    mockSettings.subscription_types = JSON.stringify([{ name: 'Free', allowedModels: ['legacy-target'] }, { name: 'Pro' }]);
+  });
+
+  it("the owner's pin outside the plan fails the run visibly, runs nothing, and does not page on-call", async () => {
+    const result: any = await runScheduledChat({ ...baseSchedule, llmModel: 'gpt-5.5' }, USER, false, 'run-tier-1');
+    await flushAsync();
+    expect(result).toMatchObject({ status: 'failure', passed: false });
+    expect(result.actualResponse).toBe(
+      'model_unavailable: pinned model "gpt-5.5" is not included in the account\'s plan — choose a model your plan includes for this schedule, or upgrade the plan',
+    );
+    expectNothingRan();
+    expect(mockAlert).not.toHaveBeenCalledWith(expect.objectContaining({ subject: 'AgentMode: unsupported model pinned on a scheduled chat' }));
+  });
+
+  it('a pin inherited from an admin-authored template (llmModelSource system) runs, stamped as a system model', async () => {
+    const result: any = await runScheduledChat({ ...baseSchedule, llmModel: 'gpt-5.5', llmModelSource: 'system' } as any, USER, false, 'run-tier-2');
+    await flushAsync();
+    expect(result.status).not.toBe('failure');
+    expect(mockWorker.runInWorker).toHaveBeenCalledWith(expect.objectContaining({ llmModel: 'gpt-5.5' }), expect.anything());
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith('session-fl', 'gpt-5.5', expect.anything(), 'system');
+  });
+});
+
+/**
+ * ENG-669 PR-C: a schedule pinned to the AgentWeb Model routes as a SCHEDULED task, runs the routed model, and the
+ * run's session keeps the selection (with the routed decision). Switch off: the pin is an unknown model, as before.
+ */
+describe('runScheduledChat: AgentWeb Model pin (ENG-669 PR-C)', () => {
+  beforeEach(() => agentWebModelRouter.reset());
+
+  it('switch on: runs the scheduled route and stores the selection, not the routed model', async () => {
+    mockSettings.agentweb_model_router_enabled = 'true';
+    mockSettings.agentweb_model_routing_table = JSON.stringify({ version: 't1', default: 'gpt-5.5', routes: { scheduled: 'gpt-5.5' } });
+    const result: any = await runScheduledChat({ ...baseSchedule, llmModel: 'agentweb-model' }, USER, false, 'run-aw-1');
+    await flushAsync();
+    expect(result.status).not.toBe('failure');
+    expect(mockWorker.runInWorker).toHaveBeenCalledWith(expect.objectContaining({ llmModel: 'gpt-5.5' }), expect.anything());
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith('session-fl', 'agentweb-model', expect.objectContaining({
+      requestedModel: 'agentweb-model', effectiveModel: 'gpt-5.5', routedVia: 'agentweb-model', routingReason: 'scheduled task: table route', tableVersion: 't1',
+    }), 'user');
+    expect(mockChatbotDb.updateSessionLlmModel.mock.calls.map((c) => c[1])).not.toContain('gpt-5.5');
+  });
+
+  it('switch off: the pin fails the run visibly, naming the AgentWeb Model; nothing runs, nobody is paged', async () => {
+    const result: any = await runScheduledChat({ ...baseSchedule, llmModel: 'agentweb-model' }, USER, false, 'run-aw-2');
+    await flushAsync();
+    expect(result).toMatchObject({ status: 'failure', passed: false });
+    expect(result.actualResponse).toBe(
+      'model_unavailable: AgentWeb Model is unavailable right now — choose another model for this schedule, or try again later',
+    );
+    expectNothingRan();
+    expect(mockAlert).not.toHaveBeenCalled();
+  });
+
+  it('one broken routing table and three pinned schedules: exactly ONE on-call alert (the router\'s), no per-schedule pages', async () => {
+    mockSettings.agentweb_model_router_enabled = 'true';
+    mockSettings.agentweb_model_routing_table = '{not json';
+    for (const id of ['s1', 's2', 's3']) {
+      const result: any = await runScheduledChat({ ...baseSchedule, scheduleId: id, llmModel: 'agentweb-model' }, USER, false, `run-${id}`);
+      expect(result.status).toBe('failure');
+      expect(result.actualResponse).toContain('AgentWeb Model is unavailable right now');
+    }
+    await flushAsync();
+    expect(mockAlert.mock.calls.map(([a]) => a.dedupeKey)).toEqual(['agentweb_model_router:unavailable']);
   });
 });

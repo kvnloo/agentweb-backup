@@ -45,6 +45,10 @@ jest.mock('../services/agentModeService', () => ({
     normalizeModelId: (m: string) => m,
     getModelCompareInfo: (m: string) => ({ name: m, provider: 'other', isLive: false, internalOnly: false }),
     callLLM: (...a: unknown[]) => mockCallLLM(...a),
+    // ENG-669 D3: the chat catalog and default the tier rule counts against.
+    getSupportedModels: async () => ['default-model', 'gpt-5.5', 'gemini-3.5-flash'],
+    getDefaultModel: async () => 'default-model',
+    isLiveModel: () => false,
   },
 }));
 jest.mock('../services/settingsService', () => ({
@@ -72,6 +76,7 @@ jest.mock('../services/agentMode/runStore', () => ({ getOwnedRunStatus: jest.fn(
 
 import agentModeRoutes from '../routes/agentMode';
 import { currentRunFunding } from '../services/funding/runFunding';
+import { modelAccess } from '../services/agentMode/modelAccessInstance';
 
 const GOOD_SECRET = 'route-test-secret';
 const bearer = (userId: string) => `Bearer ${jwt.sign({ userId, email: `${userId}@x.test`, isAdmin: false }, GOOD_SECRET)}`;
@@ -295,7 +300,7 @@ describe('compare -> select round trip over HTTP', () => {
     expect(select.body.llmModel).toBe('gemini-3.5-flash');
     expect(select.body.messages.map((m: any) => m.role)).toEqual(['user', 'assistant']);
     expect(mockAddMessages).toHaveBeenCalledTimes(1);
-    expect(mockUpdateModel).toHaveBeenCalledWith('s-1', 'gemini-3.5-flash');
+    expect(mockUpdateModel).toHaveBeenCalledWith('s-1', 'gemini-3.5-flash', undefined, 'user');
 
     // the same token cannot be replayed against a forged answer
     const forged = await request(app).post('/api/agent-mode/compare/select').set('Authorization', bearer('owner')).send({
@@ -354,5 +359,41 @@ describe('ENG-113 real controller wiring: saved alternatives round trip over HTT
     const { out } = await select('true', (b) => ({ ...b, alternatives: [{ ...b.alternatives[0], content: 'forged' }] }));
     expect(out.status).toBe(200);
     expect(JSON.stringify(mockAddMessages.mock.calls[0][1])).not.toContain('forged');
+  });
+});
+
+/**
+ * ENG-669 D3 through the real wiring: switch + owner tier (REAL subscriptionService over the faked settings/user
+ * reads). A plan that runs fewer than two models gets 403 compare_not_available_for_tier before any spend.
+ */
+describe('POST /compare: tier model allowlist (ENG-669 D3)', () => {
+  const settingsWith = (tiers: unknown[], switchValue: string | null = 'true') => async (name: string) => {
+    if (name === 'model_tier_allowlist_enabled') return switchValue === null ? null : { settingName: name, settingValue: switchValue };
+    if (name === 'subscription_types') {
+      return { settingName: name, settingValue: JSON.stringify((tiers as object[]).map((t) => ({ allowedPages: [], allowedSkills: [], ...t }))) };
+    }
+    return null;
+  };
+  beforeEach(() => modelAccess.reset());
+
+  it('403 compare_not_available_for_tier with upgradeRequired, no usage read and no model call', async () => {
+    mockGetSetting.mockImplementation(settingsWith([{ name: 'Free', allowedModels: ['agentweb-model'] }, { name: 'Pro' }]));
+    const out = await request(app).post('/api/agent-mode/compare').set('Authorization', bearer('owner')).send(validBody);
+    expect(out.status).toBe(403);
+    expect(out.body).toMatchObject({ code: 'compare_not_available_for_tier', tier: 'Free', upgradeRequired: ['Pro'] });
+    expect(mockCheckUsage).not.toHaveBeenCalled();
+    expect(mockCallLLM).not.toHaveBeenCalled();
+  });
+
+  it('two runnable models (one allowed + the default) compare as before', async () => {
+    mockGetSetting.mockImplementation(settingsWith([{ name: 'Free', allowedModels: ['gpt-5.5'] }]));
+    const out = await request(app).post('/api/agent-mode/compare').set('Authorization', bearer('owner')).send(validBody);
+    expect(out.status).toBe(200);
+  });
+
+  it('switch off: the same Free tier compares as before', async () => {
+    mockGetSetting.mockImplementation(settingsWith([{ name: 'Free', allowedModels: ['agentweb-model'] }], null));
+    const out = await request(app).post('/api/agent-mode/compare').set('Authorization', bearer('owner')).send(validBody);
+    expect(out.status).toBe(200);
   });
 });

@@ -7,6 +7,7 @@ import { isSmokeTestLead } from '../utils/smokeTestLead';
 import { suppressLeadSideEffects } from '../utils/sessionList';
 import { WebClient, ChatPostMessageArguments } from '@slack/web-api';
 import { crmDb, orgDb, userDb } from './db';
+import { dispatchHotLeadCall } from './hotLeadCallService';
 import { enqueueJob, markJobComplete, markJobFailed, registerProcessor, startHeartbeat } from './asyncJobQueue';
 
 interface LeadNotificationJob { origin?: LeadOrigin; orgId: string; listId: string; leadId: string; submissionId?: string; submittedAt?: string }
@@ -252,6 +253,8 @@ async function deliverLeadNotification(job: LeadNotificationJob, ctx: NonNullabl
 
 /** Never rejects to a lead saver. Call fire-and-forget immediately after a successful write. */
 export async function dispatchLeadCreated(listId: string, leadId: string, origin?: LeadOrigin, submission?: { submissionId: string; submittedAt: string }): Promise<void> {
+  // First, so orgs without Slack (dispatchLead returns early) still reach it. Never rejects, never awaited.
+  void dispatchHotLeadCall(listId, leadId, origin, submission);
   await dispatchLead(listId, leadId, origin, submission);
 }
 

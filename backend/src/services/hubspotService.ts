@@ -1,6 +1,6 @@
 import axios from 'axios';
 import { getHubSpotConfig } from '../config/integrations';
-import { getAccountsByUserId, getAccountById, updateAccountTokens, updateAccountConfig } from './connectedAccountsDb';
+import { getAccountsByUserId, getAccountById, getAccountsWithOwnerIncludingOrgShared, updateAccountTokens, updateAccountConfig } from './connectedAccountsDb';
 
 // Module-level axios instance with a 15-second timeout for all HubSpot API calls.
 // Falls back to the base axios object when axios.create returns falsy (e.g., in jest auto-mock).
@@ -349,25 +349,69 @@ const RECONNECT_MESSAGE =
 // ─── Module-level account resolver ───────────────────────────────────────────
 // Used by both the static factory and the mid-operation refresh path.
 
-async function resolveHubSpotAccount(userId: string, accountId?: string) {
+/**
+ * ENG-2605. The account that serves a call and the user whose record OWNS it. They differ when a
+ * teammate uses a HubSpot account an org admin shared (`sharedWithOrg`): the token must then be
+ * refreshed and written back to the OWNER's record, never the caller's, or the caller would grow a
+ * copy of a teammate's account while the owner's stale token never updates.
+ */
+async function findOrgSharedHubSpotAccounts(userId: string) {
+  try {
+    const all = await getAccountsWithOwnerIncludingOrgShared(userId);
+    return all.filter(acc => acc.platform === 'hubspot' && acc.userId !== userId);
+  } catch (err: any) {
+    // The org lookup is a fallback: its failure must read as "no shared account", exactly what
+    // callers saw before sharing was honoured, not as a new class of error.
+    console.warn(`[HubSpotService] org-shared account lookup failed for ${userId}: ${err?.message || err}`);
+    return [];
+  }
+}
+
+/** The org-shared HubSpot account with this id that `userId` may use, or null. */
+export async function findOrgSharedHubSpotAccountById(userId: string, accountId: string) {
+  return (await findOrgSharedHubSpotAccounts(userId)).find(acc => acc.account_id === accountId) ?? null;
+}
+
+/**
+ * Which accounts may serve a call. 'any' (the default): the caller's own, then org-shared ones. 'own':
+ * the caller's own only (exactly the pre-ENG-2605 behaviour). 'shared': only accounts an org admin
+ * shared. Emma's tool needs the split so a pasted private-app token on the caller's OWN lead list is
+ * tried before a teammate's shared account, never after it.
+ */
+export type HubSpotAccountSource = 'any' | 'own' | 'shared';
+
+async function resolveHubSpotAccount(userId: string, accountId?: string, source: HubSpotAccountSource = 'any') {
   if (accountId) {
-    const account = await getAccountById(accountId, userId);
-    if (!account || account.platform !== 'hubspot') {
-      throw new Error(`HubSpot account "${accountId}" not found. Please reconnect your account.`);
+    if (source !== 'shared') {
+      const account = await getAccountById(accountId, userId);
+      if (account && account.platform === 'hubspot') return { account, ownerUserId: userId };
     }
-    return account;
+    if (source !== 'own') {
+      const sharedMatch = (await findOrgSharedHubSpotAccounts(userId)).find(acc => acc.account_id === accountId);
+      if (sharedMatch) return { account: sharedMatch, ownerUserId: sharedMatch.userId };
+    }
+    throw new Error(`HubSpot account "${accountId}" not found. Please reconnect your account.`);
   }
 
-  const accounts = await getAccountsByUserId(userId);
-  const hubspotAccounts = accounts.filter(acc => acc.platform === 'hubspot');
-  if (hubspotAccounts.length === 0) {
-    throw new Error('HubSpot account not connected. Please connect your HubSpot account in Settings.');
+  if (source !== 'shared') {
+    const accounts = await getAccountsByUserId(userId);
+    const hubspotAccounts = accounts.filter(acc => acc.platform === 'hubspot');
+    // The caller's own account always wins; shared accounts are only considered when they have none.
+    if (hubspotAccounts.length === 1) return { account: hubspotAccounts[0], ownerUserId: userId };
+    if (hubspotAccounts.length > 1) {
+      const list = hubspotAccounts.map(a => `${a.account_name} (ID: ${a.account_id})`).join(', ');
+      throw new Error(`Multiple HubSpot accounts found: [${list}]. Specify account_id.`);
+    }
+    if (source === 'own') throw new Error('HubSpot account not connected. Please connect your HubSpot account in Settings.');
   }
-  if (hubspotAccounts.length > 1) {
-    const list = hubspotAccounts.map(a => `${a.account_name} (ID: ${a.account_id})`).join(', ');
+
+  const shared = await findOrgSharedHubSpotAccounts(userId);
+  if (shared.length === 1) return { account: shared[0], ownerUserId: shared[0].userId };
+  if (shared.length > 1) {
+    const list = shared.map(a => `${a.account_name} (ID: ${a.account_id})`).join(', ');
     throw new Error(`Multiple HubSpot accounts found: [${list}]. Specify account_id.`);
   }
-  return hubspotAccounts[0];
+  throw new Error('HubSpot account not connected. Please connect your HubSpot account in Settings.');
 }
 
 export class HubSpotService {
@@ -423,8 +467,8 @@ export class HubSpotService {
    * OAuth path — resolves and (if needed) refreshes the token from the DB,
    * then returns a fully-initialised instance. One DB read per operation.
    */
-  static async create(userId: string, accountId?: string): Promise<HubSpotService> {
-    const account = await resolveHubSpotAccount(userId, accountId);
+  static async create(userId: string, accountId?: string, source: HubSpotAccountSource = 'any'): Promise<HubSpotService> {
+    const { account, ownerUserId } = await resolveHubSpotAccount(userId, accountId, source);
     const config = account.config as any;
     const expiresAt: number = config.token_expires_at || 0;
     const portalId: string | undefined = config.hub_id !== undefined ? String(config.hub_id) : account.account_id;
@@ -440,7 +484,7 @@ export class HubSpotService {
     // itself on the next use.
 
     if (expiresAt - Date.now() > TOKEN_REFRESH_BUFFER_MS) {
-      return new HubSpotService(config.access_token, userId, account.account_id, expiresAt, portalId);
+      return new HubSpotService(config.access_token, ownerUserId, account.account_id, expiresAt, portalId);
     }
 
     if (!config.refresh_token) {
@@ -448,8 +492,8 @@ export class HubSpotService {
     }
 
     // Token is expiring — create provisional instance, refresh, then return it.
-    const instance = new HubSpotService(config.access_token, userId, account.account_id, expiresAt, portalId);
-    await instance.doRefresh(userId, account.account_id, config.refresh_token, !!config.needs_reconnect);
+    const instance = new HubSpotService(config.access_token, ownerUserId, account.account_id, expiresAt, portalId);
+    await instance.doRefresh(ownerUserId, account.account_id, config.refresh_token, !!config.needs_reconnect);
     return instance;
   }
 
@@ -478,7 +522,10 @@ export class HubSpotService {
     if (!this._userId || !this._accountId) {
       throw new Error('Cannot refresh: OAuth context missing on this instance.');
     }
-    const account = await resolveHubSpotAccount(this._userId, this._accountId);
+    // This instance is bound to its account's OWNER (see create). Re-resolve against that owner's own
+    // record only: if the owner has since removed the account, a teammate's shared copy of the same
+    // portal must not be picked up, because the refreshed tokens are written back to this._userId.
+    const { account } = await resolveHubSpotAccount(this._userId, this._accountId, 'own');
     const config = account.config as any;
     if (!config.refresh_token) {
       throw new Error('HubSpot access token expired and no refresh token is available. Please reconnect your HubSpot account.');
@@ -2366,7 +2413,7 @@ export class HubSpotService {
    */
   async batchUpdateContacts(
     inputs: Array<{ id: string; properties: Record<string, string> }>
-  ): Promise<void> {
+  ): Promise<string[] | undefined> {
     if (inputs.length > 100) {
       throw new Error(`batchUpdateContacts accepts at most 100 inputs per batch, got ${inputs.length}`);
     }
@@ -2378,6 +2425,12 @@ export class HubSpotService {
     );
 
     throwIfBatchPartialFailure(res);
+
+    // A merged-away id comes back as 200 with `results: []` and no error: nothing was updated. The ids
+    // HubSpot echoed are the only proof an input took effect. undefined = the body had no results array.
+    const results = res?.data?.results;
+    if (!Array.isArray(results)) return undefined;
+    return results.filter((r: any) => r?.id != null).map((r: any) => String(r.id));
   }
 
   /**

@@ -68,6 +68,7 @@ jest.mock('../services/agentModeService', () => ({
 }));
 
 jest.mock('../services/tokenUsageService', () => ({
+  TURN_ADMISSION: { recordAdmission: true },
   checkTokenUsage: jest.fn().mockResolvedValue({
     allowed: true, warning: false, used: 0, allowance: null,
     bonus: 0, effectiveAllowance: null, percentUsed: 0, month: '2026-08',
@@ -568,7 +569,8 @@ describe('AgentModeController - automatic media-batch continuation (ENG-1239)', 
 
       // The usage check ran before any continuation work, and no second worker turn
       // (the auto-continuation itself) was ever attempted — no image generated, no charge.
-      expect(mockCheckTokenUsage).toHaveBeenCalledWith(mockUserId);
+      // A turn gate (ENG-668): it may record a pay-as-you-go admission.
+      expect(mockCheckTokenUsage).toHaveBeenCalledWith(mockUserId, { recordAdmission: true });
       expect(mockCheckTokenUsage).toHaveBeenCalledTimes(2);
       expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
       expect(consoleErrorSpy).toHaveBeenCalledWith(

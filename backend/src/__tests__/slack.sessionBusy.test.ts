@@ -344,3 +344,53 @@ describe('Slack Agent Mode revision — session-busy contention (ENG-1719)', () 
     });
   });
 });
+
+// ENG-669 PR-C (rv-3681): runVerifiedChat refuses a stored AgentWeb Model selection it cannot serve. Both revision
+// branches tell the reviewer what is wrong and what to do, and do not page on-call (not an outage). Non-model failures
+// keep the generic notice and the page (the ENG-1741 tests above).
+import { ModelUnavailableError } from '../services/agentMode/modelUnavailable';
+
+describe('Slack Agent Mode revision — the chat\'s model refused (model_unavailable)', () => {
+  let app: express.Application;
+  const base = {
+    assetUrl: 'https://example.com/original.png', filename: 'original.png', assetType: 'image', userId: 'user-1',
+    slackChannel: 'C1', slackChannelName: 'approvals', slackMessageTs: '100.0',
+  };
+  const branches: Array<[string, Record<string, unknown>, () => void]> = [
+    ['direct asset (agentSessionId)', { ...base, executionId: 'sess-a-images' }, () => undefined],
+    ['task-based (task.sessionId)', { ...base, executionId: 'exec-browser-task-1' }, () => {
+      mockGetTaskExecutionById.mockResolvedValue({ taskId: 'task-1', executionId: 'exec-browser-task-1' });
+      mockGetTaskById.mockResolvedValue({ taskId: 'task-1', sessionId: 'sess-b' });
+    }],
+  ];
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockIsSessionBusyError.mockImplementation((error: unknown) =>
+      typeof error === 'object' && error !== null && (error as any).code === 'SESSION_BUSY');
+    mockPostSlackMessage.mockResolvedValue({ ts: '1', channel: 'C1' });
+    mockUpdateApprovalStatus.mockResolvedValue(undefined);
+    mockGetChatSession.mockResolvedValue({ userId: 'user-1', llmModel: 'agentweb-model' });
+    app = buildApp();
+  });
+  afterEach(() => { delete process.env.SLACK_VERIFICATION_TOKEN; });
+
+  it.each(branches)('%s: posts the refusal and what to do; no page, no generic notice', async (_label, approval, setUp) => {
+    setUp();
+    mockGetApproval.mockResolvedValue(approval);
+    mockRunVerifiedChat.mockRejectedValueOnce(new ModelUnavailableError('agentweb-model', 'not_served'));
+
+    const res = await request(app).post('/api/slack/interactions').type('form')
+      .send({ payload: JSON.stringify(feedbackModalPayload(approval, 'make it pop')) });
+    expect(res.status).toBe(200);
+    await flushMicrotasks();
+
+    expect(mockSendAgentModeOncallAlert).not.toHaveBeenCalled();
+    const posts = mockPostSlackMessage.mock.calls.filter(([channel]) => channel === 'C1');
+    expect(posts).toHaveLength(1);
+    expect(posts[0][1]).toContain("AgentWeb Model isn't available right now");
+    expect(posts[0][1]).toContain('choose another model for this chat in AgentWeb, then retry the feedback');
+    expect(posts[0][1]).not.toContain("didn't go through");
+    expect(posts[0][2]).toBe('100.0');
+  });
+});

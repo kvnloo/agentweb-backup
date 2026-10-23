@@ -1331,6 +1331,22 @@ export async function removeC2PAFromImage(
 
     } catch (error: any) {
       console.error('AgentMode: Error removing C2PA metadata:', error);
+      // ENG-2584: a 4xx on the source download means the URL itself is
+      // unusable for a server-side fetch (expired signed CDN link, auth-gated
+      // asset). Retrying the same URL can never succeed, so say so explicitly.
+      const status = error?.response?.status;
+      if ([401, 403, 404, 410].includes(status)) {
+        return {
+          success: false,
+          message:
+            `Could not download the source image (HTTP ${status}). The URL is expired, private, or ` +
+            `forbidden for server-side download (signed CDN links such as fbcdn.net expire). Do not retry ` +
+            `this same URL. Fetch a fresh image URL from the source (e.g. re-query the ads API), use an ` +
+            `uploaded S3 copy, or ask the user to upload the image.`,
+          error: 'source_download_refused',
+          status,
+        };
+      }
       return {
         success: false,
         message: 'Failed to remove C2PA metadata from image',

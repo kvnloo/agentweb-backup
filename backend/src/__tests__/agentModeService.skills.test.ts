@@ -1,4 +1,5 @@
 import { AgentModeService } from '../services/agentModeService';
+import { normalizeSkillIdArg } from '../services/agentMode/skillIdArg';
 
 // Mock all dependencies
 jest.mock('openai');
@@ -109,6 +110,48 @@ describe('AgentModeService - Skills', () => {
      * failure; reporting it as a plan limitation sends a paying customer to sales for
      * something sales cannot fix.
      */
+    /*
+     * ENG-2612: production rows show the model passing the catalog display line
+     * ("<uuid>- Skill Name") as the id. The UUID is recovered; nothing else changes.
+     */
+    describe('skill id with copied name suffix (ENG-2612)', () => {
+      const uuid = '7f3464da-faab-487c-9690-5fc87c609752';
+
+      it('installs the UUID when the model appends "- <Skill Name>"', async () => {
+        (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([
+          { skillId: uuid, name: 'Meta B2B Ad Generation', description: 'Desc', toolNames: ['t'], isPublished: true },
+        ]);
+        (chatbotDb.addAssociatedSkills as jest.Mock).mockResolvedValue(undefined);
+
+        const result = await agentModeService.installSkills(
+          [`${uuid}- Meta B2B Ad Generation - Image and Copy`, uuid],
+          'user-123',
+          'session-123'
+        );
+
+        expect(result.success).toBe(true);
+        expect(chatbotDb.addAssociatedSkills).toHaveBeenCalledWith('session-123', [uuid]);
+      });
+
+      it('normalizeSkillIdArg leaves exact, virtual and non-UUID ids untouched', () => {
+        expect(normalizeSkillIdArg(uuid)).toBe(uuid);
+        expect(normalizeSkillIdArg(`${uuid}- X (Twitter) Management`)).toBe(uuid);
+        expect(normalizeSkillIdArg(`${uuid} - Luma: pull guests`)).toBe(uuid);
+        expect(normalizeSkillIdArg('__other_skills__')).toBe('__other_skills__');
+        expect(normalizeSkillIdArg('no-such-skill-xyz')).toBe('no-such-skill-xyz');
+        expect(normalizeSkillIdArg('7e7b65a0eb-50c6-489b-959c-e4d3a1a23091- Luma')).toBe(
+          '7e7b65a0eb-50c6-489b-959c-e4d3a1a23091- Luma'
+        );
+      });
+
+      it('a suffixed UUID the user cannot see is still refused as unresolved', async () => {
+        (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
+        const result = await agentModeService.installSkills([`${uuid}- Hidden`], 'user-123', 'session-123');
+        expect(result.message).toContain('Could not resolve these skill IDs to any known skill');
+        expect(chatbotDb.addAssociatedSkills).not.toHaveBeenCalled();
+      });
+    });
+
     it('should return error for invalid skill IDs', async () => {
       (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
 
