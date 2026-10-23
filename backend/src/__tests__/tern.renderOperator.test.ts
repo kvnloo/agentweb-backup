@@ -48,7 +48,8 @@ describe('Native Tern task/run surface', () => {
   it('starts every confirmation at Cancel', () => {
     const view = sample('running');
     view.confirm = { kind: 'stop', taskId: 'task-one', executionId: 'run-one' };
-    expect(renderOperator(view).flatMap(all).find(node => node.id === 'operator.confirm')?.p?.selected)
+    expect(renderOperator(view).reduce((out: TspNode[], root) => out.concat(all(root)), [])
+      .find(node => node.id === 'operator.confirm')?.p?.selected)
       .toBe('cancel');
   });
 
