@@ -144,6 +144,14 @@ describe('Emma production raw PTY input handler', () => {
     expect(f.posts).toEqual(['hello']);
   });
 
+  it('preserves shifted Kitty printable characters from unshifted keycodes', () => {
+    const f = fixture();
+    f.input.handleRaw('\x1b[114;2u\x1b[49;2u\x1b[49:33;2u');
+    expect(f.input.text).toBe('R!!');
+    f.input.handleRaw('\r');
+    expect(f.posts).toEqual(['R!!']);
+  });
+
   it('ignores kitty key-release events and never inserts unrelated CSI replies', () => {
     const f = fixture();
     f.input.handleRaw('\x1b[97;1:3u\x1b[?1;2c');
