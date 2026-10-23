@@ -18,11 +18,24 @@ endpoints, whose authorization checks stay authoritative.
 - **Emma**: transcript, native editor/send, tool cards, session picker,
   plan/approval deck, coding preview, and AgentRun trace (tern:emma).
 - **Operator**: tasks → executions → selected run; status, model, timestamps,
-  result/error, allowlisted artifact links, recent user-interaction activity,
-  explicit gated Run/Stop, and a status/refresh action (tern:operator).
-- The operator reads state every 10 seconds, using keyed TSP updates instead
-  of recreating its surface. The portal also polls; a real backend event feed
-  is a separate planned slice.
+  result/error, elapsed duration, safe artifact links, actual browser execution
+  activity and user requests, explicit gated Run/Stop, and a refresh action.
+- The operator reads execution status every 10 seconds. An additive
+  authenticated `GET /api/tasks/:id/executions/:executionId/activity` endpoint
+  projects the existing browser-use log stored in S3 into at most 40 keyed
+  event records. The agent engine currently uploads log changes about every
+  30 seconds. No event feed exists for this execution path: Tern therefore
+  applies incremental keyed patches from these polls, without generating
+  synthetic "activity" events on every refresh.
+- The backend checks task ownership/admin and execution-task binding before
+  using its own configured S3 bucket and IAM to read only the expected log
+  object (last 256 KiB). The original log URL, token, HTML, command arguments,
+  message payloads and credential-bearing text never cross the activity API,
+  TSP or JSON boundary. Only event kind, timestamp, severity and safe fixed
+  summaries derived from persisted browser-use log lines are exposed.
+- No extra browser logging, persisted operator state or execution policy is
+  introduced. When the engine has not published a log yet, the timeline is
+  empty rather than invented; failures to read activity are shown explicitly.
 - Artifact URLs with query strings/fragments/embedded credentials are not
   sent across TSP. Browser log signed URLs and file access tokens remain
   withheld. Free-form result/error text is bounded and redacted on a best-effort
@@ -86,7 +99,9 @@ node --max-old-space-size=4096 node_modules/.bin/jest --runInBand --forceExit \
 Then dogfood in an authenticated isolated **real Tern host** with an AgentWeb
 backend: resume regular/scheduled Emma sessions, stream tools, answer a deck,
 inspect plans and AgentRuns; run the operator with a task whose execution
-transitions running → completed and another running → failed; validate status,
+transitions running → completed and another running → failed, including
+runs with no userInteractions; confirm S3-backed browser events and stable keyed
+row patches, elapsed times, status,
 artifacts, no sensitive URLs or headers in captured frames; disconnect/reopen
 the Tern window; verify confirmations and that only one POST/PUT occurs. Test
 permission denial, stale/completed stop, and failed HTTP calls. Do not merge

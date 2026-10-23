@@ -1,5 +1,5 @@
 import axios, { AxiosInstance } from 'axios';
-import type { OperatorExecution, OperatorTask } from './operatorModel';
+import type { OperatorActivity, OperatorExecution, OperatorTask } from './operatorModel';
 
 /** Uses the existing authenticated task endpoints and authorization gates. */
 export class AgentWebOperatorClient {
@@ -45,6 +45,41 @@ export class AgentWebOperatorClient {
       throw new Error('Unexpected execution response');
     }
     return data as OperatorExecution;
+  }
+
+  /**
+   * The existing detail read retains the server's task authorization boundary.
+   * The additive /activity route separately authorizes each bounded S3 read.
+   * No raw log, log URL or access token is returned by that activity route.
+   */
+  async getExecutionWithActivity(taskId: string, executionId: string): Promise<OperatorExecution> {
+    const execution = await this.getExecution(taskId, executionId);
+    if (!execution.browser_use_log) return { ...execution, activity: [] };
+    try {
+      const { data } = await this.http.get(
+        '/api/tasks/' + encodeURIComponent(taskId) + '/executions/'
+          + encodeURIComponent(executionId) + '/activity',
+      );
+      if (!data || data.source !== 'browser-log' || !Array.isArray(data.events)) {
+        throw new Error('Unexpected activity response');
+      }
+      const events: OperatorActivity[] = data.events.slice(-40).filter(
+        (item: any): item is OperatorActivity =>
+          item && typeof item.id === 'string' && /^browser\.[0-9a-f]{20}\.[0-9]+$/.test(item.id)
+          && typeof item.when === 'string' && item.when.length <= 50
+          && ['step', 'action', 'log'].includes(item.kind)
+          && ['INFO', 'WARNING', 'ERROR'].includes(item.level)
+          && typeof item.summary === 'string' && item.summary.length <= 120,
+      ).map((item: OperatorActivity) => ({
+        id: item.id, when: item.when, kind: item.kind,
+        level: item.level, summary: item.summary,
+      }));
+      return { ...execution, activity: events };
+    } catch {
+      // Never replace a valid execution with a guessed activity event or with
+      // an error body's potentially sensitive text. The next poll can recover.
+      return { ...execution, activity: [], activityUnavailable: true };
+    }
   }
 
   async startTask(taskId: string): Promise<OperatorExecution> {

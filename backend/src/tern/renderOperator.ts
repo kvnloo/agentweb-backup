@@ -1,7 +1,7 @@
 import type { TspNode } from './renderEmma';
 import {
   OperatorExecution, OperatorTask, OperatorView,
-  safeArtifactUrl, safeText,
+  elapsedExecution, safeArtifactUrl, safeText,
 } from './operatorModel';
 
 function runTone(status: string): string {
@@ -41,7 +41,7 @@ function executionItem(run: OperatorExecution): Record<string, unknown> {
   };
 }
 
-function detailNode(execution: OperatorExecution): TspNode {
+function detailNode(execution: OperatorExecution, asOf?: string): TspNode {
   const result = safeText(execution.result, 1800);
   const error = safeText(execution.error, 1000);
   const children: TspNode[] = [{
@@ -53,7 +53,8 @@ function detailNode(execution: OperatorExecution): TspNode {
         { k: 'Status', v: safeText(execution.status, 40) },
         { k: 'Model', v: safeText(execution.llmName, 80) || '—' },
         { k: 'Started', v: safeText(execution.startTime, 60) || '—' },
-        { k: 'Completed', v: safeText(execution.completedAt, 60) || '—' },
+        { k: 'Finished', v: safeText(execution.endTime || execution.completedAt, 60) || '—' },
+        { k: 'Elapsed', v: elapsedExecution(execution, asOf) || '—' },
       ],
     },
   }];
@@ -99,18 +100,63 @@ function detailNode(execution: OperatorExecution): TspNode {
     });
   }
 
+  const events = Array.isArray(execution.activity) ? execution.activity.slice(-40) : [];
+  const latest = events[events.length - 1];
+  if (latest) {
+    children.push({
+      id: 'operator.run.latest',
+      k: 'kv',
+      p: {
+        items: [
+          { k: 'Latest activity', v: safeText(latest.summary, 120) },
+          { k: 'Observed', v: safeText(latest.when, 50) },
+        ],
+      },
+    });
+    children.push({
+      id: 'operator.run.timeline',
+      k: 'table',
+      p: {
+        cols: [
+          { id: 'when', head: 'Log time' },
+          { id: 'level', head: 'Level' },
+          { id: 'activity', head: 'Browser execution activity', grow: 2 },
+        ],
+        rows: events.map(item => ({
+          id: safeText(item.id, 80),
+          cells: {
+            when: safeText(item.when, 50),
+            level: safeText(item.level, 10),
+            activity: safeText(item.summary, 120),
+          },
+        })),
+      },
+    });
+  } else if (execution.activityUnavailable) {
+    children.push({
+      id: 'operator.run.activity-state', k: 'text',
+      p: { text: 'Execution activity temporarily unavailable.', tone: 'warning' },
+    });
+  } else if (execution.browser_use_log) {
+    children.push({
+      id: 'operator.run.activity-state', k: 'text',
+      p: { text: 'No browser execution events in the available log tail yet.', tone: 'muted' },
+    });
+  }
+
+  // Questions are real human-interaction records, not browser/tool events.
   const interactions = Array.isArray(execution.userInteractions)
     ? execution.userInteractions.slice(-12)
     : [];
   if (interactions.length) {
     children.push({
-      id: 'operator.run.activity',
+      id: 'operator.run.user-requests',
       k: 'table',
       p: {
         cols: [
           { id: 'when', head: 'Time' },
           { id: 'status', head: 'State' },
-          { id: 'activity', head: 'Activity', grow: 2 },
+          { id: 'activity', head: 'User request', grow: 2 },
         ],
         rows: interactions.map((item, index) => ({
           id: safeText(item.id, 80) || 'interaction-' + index,
@@ -125,15 +171,6 @@ function detailNode(execution: OperatorExecution): TspNode {
           },
         })),
       },
-    });
-  }
-
-  // browser_use_log is often a signed URL. Do not expose it through the wire.
-  if (execution.browser_use_log) {
-    children.push({
-      id: 'operator.run.browser-log',
-      k: 'text',
-      p: { text: 'Browser log available in the authenticated web portal.', tone: 'muted' },
     });
   }
 
@@ -188,7 +225,7 @@ export function renderOperator(view: OperatorView): TspNode[] {
       state: view.busy ? 'loading' : 'ready',
     },
     c: isRuns
-      ? current ? [detailNode(current)] : []
+      ? current ? [detailNode(current, view.lastUpdated)] : []
       : currentTask ? [{
           id: 'operator.task.preview',
           k: 'kv',

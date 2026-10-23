@@ -108,7 +108,7 @@ async function main(): Promise<void> {
       throw new Error('Requested execution is not visible for this task');
     }
     if (view.executionId) {
-      view.detail = await client.getExecution(view.taskId, view.executionId);
+      view.detail = await client.getExecutionWithActivity(view.taskId, view.executionId);
     }
   }
   view.lastUpdated = new Date().toISOString();
@@ -223,7 +223,7 @@ async function main(): Promise<void> {
   async function loadDetail(taskId: string, executionId: string): Promise<void> {
     const epoch = ++detailEpoch;
     try {
-      const detail = await client.getExecution(taskId, executionId);
+      const detail = await client.getExecutionWithActivity(taskId, executionId);
       if (epoch === detailEpoch && taskId === view.taskId && executionId === view.executionId) {
         view.detail = detail;
         render();
