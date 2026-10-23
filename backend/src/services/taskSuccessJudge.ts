@@ -16,7 +16,7 @@
  * which carries no verdict and so can never be read as a pass. The public function never throws.
  */
 import { createHash } from 'crypto';
-import type { AgentRunTrace, AgentRunTraceCall } from './agentRunTrace';
+import { cutWithoutSplittingPair, type AgentRunTrace, type AgentRunTraceCall } from './agentRunTrace';
 import { LLM_MODEL_REGISTRY } from './agentMode/llmModelRegistry';
 import { readChatCompletion, type RubricJudgeLlm, type RubricJudgeLlmRequest, type RubricJudgeUsage } from './creativeRubricJudge';
 
@@ -103,7 +103,7 @@ export const gatewayTaskSuccessJudgeLlm: RubricJudgeLlm = {
 const clip = (text: string | undefined, max: number): string => {
   if (!text) return '';
   const flat = text.replace(/\s+/g, ' ').trim();
-  return flat.length > max ? `${flat.slice(0, max)}…` : flat;
+  return flat.length > max ? `${cutWithoutSplittingPair(flat, max)}…` : flat;
 };
 
 const plain = (html: string): string => html.replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&');

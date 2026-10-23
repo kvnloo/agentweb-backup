@@ -519,10 +519,20 @@ export function redactText(text: string): string {
   return shielded.replace(OPAQUE_TOKEN, '[REDACTED]').replace(/\u0000(\d+)\u0000/g, (_, i) => kept[Number(i)] ?? '');
 }
 
+/**
+ * The first `max` UTF-16 units of `text`, one fewer if the cut would split a surrogate pair (an emoji): a lone
+ * half is invalid JSON, and every LLM provider rejects the request (ENG-2638).
+ */
+export function cutWithoutSplittingPair(text: string, max: number): string {
+  const cut = text.slice(0, max);
+  const last = cut.charCodeAt(cut.length - 1);
+  return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
+}
+
 /** Cap, redact, cap again: regexes never run over a multi-megabyte result, and a mask never grows the text past the cap. */
 function capRedacted(text: string, max: number): { text: string; truncated: boolean } {
-  const redacted = redactText(text.length > max + 512 ? text.slice(0, max + 512) : text);
-  return { text: redacted.slice(0, max), truncated: text.length > max || redacted.length > max };
+  const redacted = redactText(text.length > max + 512 ? cutWithoutSplittingPair(text, max + 512) : text);
+  return { text: cutWithoutSplittingPair(redacted, max), truncated: text.length > max || redacted.length > max };
 }
 
 function reasonOf(content: string): string {
