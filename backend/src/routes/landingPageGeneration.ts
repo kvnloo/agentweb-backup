@@ -441,6 +441,30 @@ router.get("/site", async (req: Request, res: Response) => {
 });
 
 /**
+ * ENG-2651: the chat a generated page reports back to. The page record carries it as
+ * `originatingSessionId`, which (a) durableLandingService.postToSession appends the completion /
+ * failure message to, and (b) the auto human-eval candidate (v0Service.enqueueLandingPageHumanEval)
+ * mints an iShare link for. Only a chat the caller may open qualifies: its owner, or an admin (the
+ * agentModeController.getSession / routes/emmaApi.ts rule; a delegate token resolves `req.user` to the
+ * target account). Anything else is dropped, never refused: the MCP tool sends `context.sessionId`,
+ * which for an external MCP client is the MCP transport session id rather than a chat, and generation
+ * without a chat to report to is the existing behaviour for that case.
+ */
+async function resolveOriginatingSessionId(
+  originatingSessionId: unknown,
+  caller: { userId?: string; isAdmin?: boolean } | undefined,
+): Promise<string | undefined> {
+  if (typeof originatingSessionId !== "string" || !originatingSessionId) return undefined;
+  const { chatbotDb } = await import("../services/chatbotService");
+  const session = await chatbotDb.getChatSessionRecord(originatingSessionId, true);
+  if (!session) return undefined;
+  const isOwner = !!caller?.userId && session.userId === caller.userId;
+  if (isOwner || caller?.isAdmin === true) return originatingSessionId;
+  console.warn(`[LP GENERATION] ignoring originating_session_id owned by another account (caller ${caller?.userId})`);
+  return undefined;
+}
+
+/**
  * POST /api/landing-pages/v0/generate
  * Generate a new landing page using v0 Platform API + brand guidelines
  */
@@ -686,9 +710,14 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
         .catch((e) => console.warn(`[LP GENERATION] could not lock site mode: ${e?.message}`));
     }
 
+    const originatingSessionId = await resolveOriginatingSessionId(
+      originating_session_id,
+      (req as unknown as AuthenticatedRequest).user,
+    );
+
     const result = await generateLandingPage(userId, prompt, pageName, brandContext, effectiveLeadListId, template_html, {
       siteId: typeof site_id === "string" ? site_id : undefined,
-      originatingSessionId: typeof originating_session_id === "string" ? originating_session_id : undefined,
+      originatingSessionId,
       mode: effectiveMode,
       bridgeOutUrl: typeof bridge_out_url === "string" ? bridge_out_url : undefined,
       metaPixelOverride,
