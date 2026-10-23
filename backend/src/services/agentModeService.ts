@@ -14193,6 +14193,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     // One packet PER AD ACCOUNT: the Desk groups packets under an account and one Approve All
     // dispatches a whole packet, so a single iteration that writes to two ad accounts must not
     // become one packet shown under only the first account.
+    // Taken before any createDecision call: a row whose createdAt is >= this was created by THIS call,
+    // an older one is an idempotent hit on an already-staged digest (a retried iteration).
+    const stagingStartedAt = new Date().toISOString();
     const manifestByAccount = new Map<string, string>();
     const manifestFor = (r: any): string => {
       const key = String(r?.metaWriteDispatch?.resolvedAccountId || r?.target?.account_id || r?.metaWriteDispatch?.account_id || 'unknown').replace(/^act_/, '');
@@ -14282,13 +14285,12 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
 
     // One short Slack reminder per packet to the assigned reviewer (same style as the eval queue).
     // Fire-and-forget: the decisions are already durably staged, and a slow or rate-limited Slack must
-    // never hold up the agent turn. Only rows created just now are announced — createDecision returns the
+    // never hold up the agent turn. Only rows created by this call are announced — createDecision returns the
     // EXISTING row on an idempotent hit, and a retried iteration must not re-ping the reviewer.
-    const freshWindowMs = 60_000;
     const packets = new Map<string, { approver: NonNullable<ApprovalDecision['approver']>; manifestId: string; items: ApprovalDecision[] }>();
     for (const d of staged) {
       if (d.status !== 'pending_team_review' || !d.manifestId || !d.approver) continue;
-      if (Date.now() - Date.parse(d.createdAt) > freshWindowMs) continue;
+      if (d.createdAt < stagingStartedAt) continue;
       const key = `${d.manifestId}|${d.approver}`;
       const entry = packets.get(key) || { approver: d.approver, manifestId: d.manifestId, items: [] };
       entry.items.push(d);
