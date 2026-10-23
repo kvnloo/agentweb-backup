@@ -1,4 +1,4 @@
-import { buildAgentRunTrace, redactText, TRACE_LIMITS, type TraceMessageRow } from '../services/agentRunTrace';
+import { buildAgentRunTrace, cutWithoutSplittingPair, redactText, TRACE_LIMITS, type TraceMessageRow } from '../services/agentRunTrace';
 
 let index = 0;
 function row(message: Record<string, unknown>): TraceMessageRow {
@@ -424,6 +424,15 @@ describe('buildAgentRunTrace', () => {
     expect(trace.timelineOmitted).toBe(0);
   });
 
+  it('never cuts an emoji in half when it caps text, so the trace stays valid UTF-16 (ENG-2638)', () => {
+    index = 0;
+    const content = `${'x'.repeat(TRACE_LIMITS.resultChars - 1)}😀 and more`;
+    const trace = buildAgentRunTrace({ sessionId: 's4', messages: [assistantCalls(call('e1', 'perform_data_analysis', {})), toolResult('e1', 'perform_data_analysis', content, '2026-10-14T10:00:00Z')] });
+
+    expect(trace.calls[0].result).toBe('x'.repeat(TRACE_LIMITS.resultChars - 1));
+    expect(trace.calls[0].resultTruncated).toBe(true);
+  });
+
   it('caps large results and degrades every result when the run is over budget', () => {
     index = 0;
     const big = 'row of data '.repeat(Math.ceil((TRACE_LIMITS.resultChars + 100) / 12));
@@ -433,6 +442,19 @@ describe('buildAgentRunTrace', () => {
     expect(trace.resultsDegraded).toBe(true);
     expect(trace.calls[0].result).toHaveLength(TRACE_LIMITS.degradedResultChars);
     expect(trace.calls[0]).toMatchObject({ resultTruncated: true, resultChars: big.length });
+  });
+});
+
+describe('cutWithoutSplittingPair', () => {
+  it.each([
+    ['', 3, ''],
+    ['abc', 0, ''],
+    ['abc', 5, 'abc'],
+    ['a😀', 3, 'a😀'],
+    ['a😀', 2, 'a'],
+    ['a\uDE00b', 2, 'a\uDE00'],
+  ])('cuts %j at %i to %j, never leaving the first half of a pair (ENG-2638)', (text, max, expected) => {
+    expect(cutWithoutSplittingPair(text, max)).toBe(expected);
   });
 });
 
