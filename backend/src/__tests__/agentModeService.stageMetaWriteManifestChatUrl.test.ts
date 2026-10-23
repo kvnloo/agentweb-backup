@@ -144,13 +144,14 @@ describe('stageApprovalInboxMetaWriteManifest attaches a real chatUrl', () => {
     ]));
   });
 
-  it('does not ping for non-pending decisions, nor re-ping a retried iteration that hit an already-staged (old) row', async () => {
+  it('does not ping for non-pending decisions, nor re-ping a retried iteration that hit an already-staged row', async () => {
     (approvalInboxService.createDecision as jest.Mock).mockImplementation(pending({ status: 'executed' }));
     await (service as any).stageApprovalInboxMetaWriteManifest(SESSION_ID, [writeHalt()]);
     await flush();
     expect(postManifestReadyNotice).not.toHaveBeenCalled();
 
-    (approvalInboxService.createDecision as jest.Mock).mockImplementation(pending({ createdAt: new Date(Date.now() - 10 * 60_000).toISOString() }));
+    // A retry within seconds: the row already existed before this call, so its createdAt is older than the call.
+    (approvalInboxService.createDecision as jest.Mock).mockImplementation(pending({ createdAt: new Date(Date.now() - 5_000).toISOString() }));
     await (service as any).stageApprovalInboxMetaWriteManifest(SESSION_ID, [writeHalt()]);
     await flush();
     expect(postManifestReadyNotice).not.toHaveBeenCalled();
