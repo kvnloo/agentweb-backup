@@ -267,7 +267,11 @@ async function main(): Promise<void> {
     session = await client.createSession();
   } else {
     const sessions = await client.listEmmaSessions(1);
-    session = sessions[0] ?? await client.createSession();
+    // The history endpoint is for discovery; render/correlate against the
+    // canonical complete session ledger, just like explicit resume does.
+    session = sessions[0]
+      ? await client.getSession(sessions[0].sessionId)
+      : await client.createSession();
   }
 
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
