@@ -51,7 +51,7 @@ class CreditFrames {
   private acked = 0;
   private pending?: { ops: unknown[][]; after: () => void };
 
-  constructor(private readonly limit: number, private readonly credits: number) {}
+  constructor(private readonly surfaceId: string, private readonly limit: number, private readonly credits: number) {}
 
   send(ops: unknown[][], after: () => void): void {
     this.pending = { ops, after };
@@ -70,7 +70,7 @@ class CreditFrames {
     this.pending = undefined;
     if (ops.length) {
       process.stdout.write(encodeTspJson('f',
-        { sf: SURFACE_ID, s: ++this.sequence, ops }, undefined, this.limit));
+        { sf: this.surfaceId, s: ++this.sequence, ops }, undefined, this.limit));
     }
     after();
   }
@@ -133,6 +133,8 @@ async function main(): Promise<void> {
   let shuttingDown = false;
   let visible = true;
   let recoveries = 0;
+  let activeSurfaceId = SURFACE_ID;
+  let protocolFailed = false;
   let sender: CreditFrames;
   let reconciler: TspSurfaceReconciler;
   let apcLimit = TSP_DEFAULT_APC_LIMIT;
@@ -150,7 +152,7 @@ async function main(): Promise<void> {
     if (polling) clearInterval(polling);
     if (escapeFlush) clearTimeout(escapeFlush);
     if (open) {
-      process.stdout.write(encodeTspJson('x', { id: SURFACE_ID, keep: false }, undefined, apcLimit));
+      process.stdout.write(encodeTspJson('x', { id: activeSurfaceId, keep: false }, undefined, apcLimit));
       open = false;
     }
     if (modesArmed) process.stdout.write(KITTY_POP + PASTE_OFF);
@@ -198,7 +200,7 @@ async function main(): Promise<void> {
   modesArmed = true;
 
   function render(): void {
-    if (shuttingDown || !open) return;
+    if (shuttingDown || !open || protocolFailed) return;
     const roots = renderOperator(view);
     const rec = reconciler;
     const ops = rec.diff(roots) as unknown[][];
@@ -206,10 +208,12 @@ async function main(): Promise<void> {
   }
 
   function openSurface(): void {
-    sender = new CreditFrames(apcLimit, credits);
-    reconciler = new TspSurfaceReconciler(SURFACE_ID);
+    activeSurfaceId = SURFACE_ID + (recoveries ? '-' + recoveries : '');
+    protocolFailed = false;
+    sender = new CreditFrames(activeSurfaceId, apcLimit, credits);
+    reconciler = new TspSurfaceReconciler(activeSurfaceId);
     process.stdout.write(encodeTspJson('o', {
-      id: SURFACE_ID, mode: 'screen', title: 'AgentWeb Operator',
+      id: activeSurfaceId, mode: 'screen', title: 'AgentWeb Operator',
       role: 'agentweb.operator',
     }, undefined, apcLimit));
     open = true;
@@ -241,9 +245,10 @@ async function main(): Promise<void> {
       const sorted = [...runs].sort((a, b) =>
         (b.startTime || '').localeCompare(a.startTime || ''));
       const target = preferred || view.executionId;
+      const previous = view.executionId;
       view.executionId = (target && runs.some(run => run.executionId === target))
         ? target : sorted[0]?.executionId;
-      view.detail = undefined;
+      if (view.executionId !== previous) view.detail = undefined;
       if (view.executionId) await loadDetail(taskId, view.executionId);
       else render();
     } catch (error) {
@@ -465,7 +470,7 @@ async function main(): Promise<void> {
   };
 
   eventHandler = event => {
-    if (event.sf && event.sf !== SURFACE_ID) return;
+    if (event.sf && event.sf !== activeSurfaceId) return;
     if (event.ev === 'ack' && typeof event.s === 'number') {
       sender.ack(event.s);
       return;
@@ -478,7 +483,7 @@ async function main(): Promise<void> {
     if (event.ev === 'gone') {
       const ids = Array.isArray(event.ids)
         ? event.ids.filter((id): id is string => typeof id === 'string') : [];
-      if (ids.includes(SURFACE_ID)) {
+      if (ids.includes(activeSurfaceId)) {
         open = false;
         if (++recoveries > 3) return close(1);
         openSurface();
@@ -489,8 +494,8 @@ async function main(): Promise<void> {
       return;
     }
     if (event.ev === 'error') {
-      view.notice = 'TSP operation rejected; reconnect the pane';
-      render();
+      protocolFailed = true;
+      process.stderr.write('tern:operator: TSP operation rejected; reconnect the pane\n');
       return;
     }
     if (event.ev === 'select' || event.ev === 'activate') {
@@ -508,7 +513,7 @@ async function main(): Promise<void> {
     if (event.ev !== 'action' || typeof event.act !== 'string') return;
     if (event.id === 'operator.confirm') {
       if (event.act === 'cancel' || event.act === 'close') selectConfirmation('cancel', true);
-      else if (event.act === 'confirm') void submitConfirmation();
+      else if (event.act === 'confirm') selectConfirmation('confirm', true);
       return;
     }
     if (view.confirm) return;
