@@ -233,7 +233,7 @@ describe('Backend execution activity authorization', () => {
     }));
   });
 
-  async function invoke(userId: string | undefined = 'owner') {
+  async function invoke(userId: string | null = 'owner') {
     const req = {
       params: { id: 'task-1', executionId: 'execution-1' },
       ...(userId ? { user: { userId } } : {}),
@@ -248,7 +248,7 @@ describe('Backend execution activity authorization', () => {
   }
 
   it('refuses unauthenticated, non-owner, and task-mismatched reads before S3', async () => {
-    const noAuth = await invoke(undefined);
+    const noAuth = await invoke(null);
     expect(noAuth.status).toHaveBeenCalledWith(401);
     expect(getObject).not.toHaveBeenCalled();
 
