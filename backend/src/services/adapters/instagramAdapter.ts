@@ -352,6 +352,8 @@ export class InstagramAdapter implements SocialPlatformAdapter {
                     for (const insight of insights) {
                         const val = insight.values?.[0]?.value || 0;
                         switch (insight.name) {
+                            // `views` replaces the retired impressions/plays; it also counts replays, so it will not
+                            // match historical impressions exactly (ENG-2636).
                             case 'views':
                             case 'impressions':
                             case 'plays':
