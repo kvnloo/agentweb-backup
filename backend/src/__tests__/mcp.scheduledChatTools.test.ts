@@ -212,14 +212,20 @@ describe('Scheduled Chat MCP Tools', () => {
   // ─── SUCCESS tests ─────────────────────────────────────────────────────
 
   describe('list_scheduled_chats', () => {
+    // ENG-1611 made this tool always request a bounded page (default limit 50),
+    // so the controller answers with the paged `{ items, nextCursor }` shape.
     it('should call GET /api/agent-mode/scheduled-chats', async () => {
-      mockMcpFetch.mockResolvedValue([{ scheduleId: 'sc-1', scheduleName: 'Daily Report' }]);
+      mockMcpFetch.mockResolvedValue({
+        items: [{ scheduleId: 'sc-1', scheduleName: 'Daily Report' }],
+        nextCursor: null,
+      });
 
       const result = await mcpToolRegistry.execute('list_scheduled_chats', {}, context);
 
       expect(mockMcpFetch).toHaveBeenCalledWith({
         method: 'GET',
         path: '/api/agent-mode/scheduled-chats',
+        queryParams: { limit: '50' },
         context: { userId: 'user-123', agentUserId: 'user-123' },
       });
       expect(result.content[0].text).toContain('sc-1');
