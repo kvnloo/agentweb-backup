@@ -15706,6 +15706,7 @@ export const agentModeController = {
         updatedAt: new Date().toISOString()
       });
 
+      console.log(`[schedule-toggle] schedule=${scheduleId} ${schedule.status ?? 'none'} -> ${status} owner=${user.userId} ua=${JSON.stringify(String(req.get('user-agent') ?? '').slice(0, 60))}`);
       res.json({ message: `Scheduled chat ${status === 'active' ? 'enabled' : 'paused'} successfully` });
 
     } catch (error) {
