@@ -377,6 +377,25 @@ describe('InstagramAdapter', () => {
             await expect(adapter.getPostAnalytics(mockInvalidAccount, ['123'])).rejects.toThrow('This account must be connected via Instagram Direct Login to get post analytics.');
         });
 
+        it('reports Meta\'s `views` metric as impressions (ENG-2636)', async () => {
+            mockInstagramService.getInstagramMediaObject.mockResolvedValueOnce({ media_type: 'VIDEO', media_product_type: 'REELS', like_count: 1, comments_count: 0 } as any);
+            mockInstagramService.getInstagramMediaInsights.mockResolvedValueOnce([{ name: 'views', values: [{ value: 4321 }] }] as any);
+
+            const result = await adapter.getPostAnalytics(mockValidAccount, ['media_reel'], 'user_123');
+
+            expect(result[0]).toEqual(expect.objectContaining({ postId: 'media_reel', impressions: 4321 }));
+        });
+
+        it('flags impressions as unavailable when Instagram returned no views row, instead of a silent 0 (ENG-2636)', async () => {
+            mockInstagramService.getInstagramMediaObject.mockResolvedValueOnce({ media_type: 'IMAGE', media_product_type: 'STORY', like_count: 0, comments_count: 0 } as any);
+            mockInstagramService.getInstagramMediaInsights.mockResolvedValueOnce([{ name: 'reach', values: [{ value: 9 }] }] as any);
+
+            const result = await adapter.getPostAnalytics(mockValidAccount, ['media_story'], 'user_123');
+
+            expect(result[0].impressions).toBe(0);
+            expect(result[0].metricErrors).toEqual([expect.objectContaining({ metric: 'views', error: expect.stringContaining('unavailable') })]);
+        });
+
         it('should fetch post analytics including extended metrics and fallback on missing likes/comments', async () => {
             mockInstagramService.getInstagramMediaObject.mockResolvedValueOnce({
                 media_type: 'IMAGE',

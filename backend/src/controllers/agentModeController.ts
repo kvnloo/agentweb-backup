@@ -10329,6 +10329,32 @@ export const calculateNextRunTime = (
   return nextRun;
 };
 
+
+/** ENG-2645: model-private message keys that no share viewer (anonymous or interactive) may receive. */
+const SHARE_PRIVATE_MESSAGE_KEYS = ['reasoning', 'reasoning_details', 'usage', 'refusal', 'llm'] as const;
+
+/**
+ * ENG-2645: share viewers never get the system prompt row or the model's private reasoning/usage fields.
+ * Pure; display fields (content, metadata, tool_calls, timestamps) pass through unchanged.
+ */
+export function redactMessagesForShareViewer<T>(messages: T[] | undefined): T[] {
+  return (messages || [])
+    .filter((m) => (m as { role?: string })?.role !== 'system')
+    .map((m) => {
+      if (!m || typeof m !== 'object') return m;
+      const copy: Record<string, unknown> = { ...(m as Record<string, unknown>) };
+      for (const k of SHARE_PRIVATE_MESSAGE_KEYS) delete copy[k];
+      return copy as T;
+    });
+}
+
+/** ENG-2644: owner-or-admin check for session-scoped mutations (same rule as emmaApi sessionAccessAllowed). */
+async function callerOwnsSession(sessionId: string, user: User | undefined): Promise<boolean> {
+  if (!user || !sessionId) return false;
+  const session = await chatbotDb.getChatSessionRecord(sessionId, true);
+  return !!session && (session.userId === user.userId || !!user.isAdmin);
+}
+
 export const agentModeController = {
   // Get user's agent chat sessions with infinite scroll support
   async getSessions(req: Request, res: Response) {
@@ -12484,7 +12510,7 @@ export const agentModeController = {
           sessionId: session.sessionId,
           title: session.title,
           // ENG-112: a share viewer is not the owner: no branch provenance (source session id/title).
-          messages: filterMessagesForClient(session.messages, { omitBranchOrigin: true }),
+          messages: redactMessagesForShareViewer(filterMessagesForClient(session.messages, { omitBranchOrigin: true })),
           createdAt: session.createdAt,
           updatedAt: session.updatedAt,
           shareMetadata: session.shareMetadata,
@@ -12493,10 +12519,14 @@ export const agentModeController = {
           llmModel: modelToUse,
           isConversable: !!conversable,
           hasActiveProgress: hasActiveProgress(session.sessionId),
-          supportNote: supportNote,
-          skills: sharedSkills,
-          slackThread: session.slackThread,
-          pendingWorkPlanInput: session.pendingWorkPlanInput,
+          // ENG-2645: the anonymous view-only page (ShareConversation.tsx) renders none of these; only the
+          // token-holding interactive share (/ishare, full agent-mode UI) receives them.
+          ...(conversable ? {
+            supportNote: supportNote,
+            skills: sharedSkills,
+            slackThread: session.slackThread,
+            pendingWorkPlanInput: session.pendingWorkPlanInput,
+          } : {}),
           // ENG-1635/1644: expose the live deck slot so a shared/read-only card can
           // reflect the real answered option (highlight + "Answered") instead of a bare
           // "View only" — used to distinguish "still the current awaiting deck" vs
@@ -13336,11 +13366,17 @@ export const agentModeController = {
     try {
       const { sessionId } = req.params;
       const user = req.user as User;
-
-
+      // ENG-2644: only the owner (delegate tokens resolve to the target account) or an admin may
+      // archive. Missing and foreign sessions answer the same 404 so ids cannot be probed.
+      if (!(await callerOwnsSession(sessionId, user))) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
       await chatbotDb.archiveSession(sessionId);
       res.json({ message: 'Session archived successfully' });
     } catch (error) {
+      if ((error as { code?: string })?.code === 'ConditionalCheckFailedException') {
+        return res.status(404).json({ error: 'Session not found' });
+      }
       console.error('AgentMode: Archive session error:', error);
       res.status(500).json({ error: 'Failed to archive session' });
     }
@@ -13352,8 +13388,9 @@ export const agentModeController = {
       const { sessionId, taskId, executionId } = req.params;
       const { status } = req.body;
       const user = req.user as User;
-
-
+      if (!(await callerOwnsSession(sessionId, user))) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
       await updateTaskExecutionStatus(sessionId, taskId, executionId, status);
       res.json({ message: 'Task status updated successfully' });
     } catch (error) {
@@ -15669,6 +15706,7 @@ export const agentModeController = {
         updatedAt: new Date().toISOString()
       });
 
+      console.log(`[schedule-toggle] schedule=${scheduleId} ${schedule.status ?? 'none'} -> ${status} owner=${user.userId} ua=${JSON.stringify(String(req.get('user-agent') ?? '').slice(0, 60))}`);
       res.json({ message: `Scheduled chat ${status === 'active' ? 'enabled' : 'paused'} successfully` });
 
     } catch (error) {
@@ -16333,7 +16371,7 @@ export const agentModeController = {
       res.json({
         sessionId: session.sessionId,
         title: session.title,
-        messages: filterMessagesForClient(session.messages, { omitBranchOrigin: true }),
+        messages: redactMessagesForShareViewer(filterMessagesForClient(session.messages, { omitBranchOrigin: true })),
         createdAt: session.createdAt,
         updatedAt: session.updatedAt,
         workPlan: redactWorkPlanForViewer(session.workPlan),

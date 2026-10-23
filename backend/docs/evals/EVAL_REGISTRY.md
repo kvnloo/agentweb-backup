@@ -122,7 +122,7 @@ Rerun (2026-10-22) on the refreshed set: 80 active work-plan cases, 51 test and 
 excluded, and 20 cases from used sessions were seeded in their place (ENG-2608). The judge ran with the retry for
 replies that end in an error or come back empty (ENG-2620). Labels are fresh GPT-5.4 labels. Each row counts only cases
 with both a judge verdict and a label, so n is 78, not 80. Two test cases drop out:
-- `fb513a4b`, one of the seeded cases, has no label because Azure refused it (see below).
+- `fb513a4b`, one of the seeded cases, has no label because every provider rejected its request (see below).
 - `f8acef31` has no verdict because the judge got an empty reply on all 3 attempts.
 
 | Judge vs GPT-5.4 labels | n | Agreement | Kappa |
@@ -138,8 +138,10 @@ Reruns are stable:
 - The judge gave the same verdict on 55 of 58 (kappa 0.88).
 
 In 8 of the 10 disagreements the judge says fail where GPT says pass, so the judge is the stricter of the two.
-Azure refused one case (`fb513a4b`) for the labeller every time. The trial now retries a call a provider refuses with
-a 400 on the other providers serving the model (ENG-2625). Evidence: [ENG-2591](https://linear.app/emmabyaw/issue/ENG-2591/agent-task-success-grader-stop-trusting-step-checkmarks-kappa-020-in#comment-055876c6).
+Every provider rejected the labeller request for `fb513a4b`: Azure and OpenAI as invalid JSON, Bedrock as a validation
+error. The trace had cut a reply at its length cap in the middle of an emoji, which left half a UTF-16 surrogate pair.
+Text caps in `agentRunTrace.ts` and the judge prompt no longer split a pair. A half already in stored text is replaced
+in the rendered prompt (ENG-2638). Evidence: [ENG-2591](https://linear.app/emmabyaw/issue/ENG-2591/agent-task-success-grader-stop-trusting-step-checkmarks-kappa-020-in#comment-055876c6).
 
 This is **not** a validation under the rule above: the labels are AI labels, so `validation` is not
 recorded and `mayGate` stays false. The judge may report `task_success` as advisory. Gating needs a

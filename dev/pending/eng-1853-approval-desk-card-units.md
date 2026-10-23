@@ -1,5 +1,0 @@
-## ENG-1853: Approval Desk card amounts and approver mapping (2026-10-22)
-
-- Every agent money input (`daily_budget`, `lifetime_budget`, `bid_amount`, `budget_amount`, `spend_cap`) is MAJOR units of the account currency (ENG-2277, `normalizeMetaMoneyParams`); Meta returns the current value in MINOR units as a numeric STRING ("3000"). `buildMetaWriteConfirmation` renders both sides with the writers' own `normalizeMetaMoney` ("daily_budget: 3000 (= $30.00) → 3100 (= $31.00)"). If the account currency can't be read it shows the raw value flagged "currency unverified" rather than guessing. Keep it in step with `normalizeMetaMoneyParams`.
-- The Desk only knows who is logged in via `approval_inbox_reviewer_{matt,fangfang,harsha}_email` (AW-Settings, env fallback `APPROVAL_INBOX_*_EMAIL`). Unset => that person gets a 403 and no queue. All Meta writes route to Matt (`getDefaultApproverForGate`).
-- A tracking-check override on a card shows the WARNING line, but the dispatch strips `override_tracking_check`, so the launch gate still blocks. Safe direction, misleading wording.
