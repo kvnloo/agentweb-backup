@@ -351,6 +351,29 @@ async function postApproverNotice(
   }
 }
 
+/**
+ * ENG-1853: the Approval Desk's one concise reminder per packet — an @-mention of the assigned
+ * reviewer plus the portal link, in the same channel and style as the eval queue's "one concise
+ * reviewer assignment/link" message. Deliberately no per-item text or buttons: the Desk is where the
+ * context and the decision live, Slack only says "something is waiting for you".
+ */
+export async function postManifestReadyNotice(
+  approver: ApprovalDecisionApprover,
+  packet: { manifestId: string; itemCount: number; accountLabel?: string },
+): Promise<void> {
+  await postApproverNotice(
+    approver,
+    async () => {
+      const slackUserId = await getApproverSlackUserId(approver);
+      const mention = slackUserId ? `<@${slackUserId}>` : approver;
+      const base = (process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/+$/, '');
+      const what = `${packet.itemCount} Meta Ads change${packet.itemCount === 1 ? '' : 's'}${packet.accountLabel ? ` for ${packet.accountLabel}` : ''}`;
+      return `🔔 ${mention} — ${what} waiting for your review in the Approval Desk: ${base}/approval-desk/${encodeURIComponent(packet.manifestId)}`;
+    },
+    'packet-ready notice',
+  );
+}
+
 export async function postDecisionResolvedNotice(approver: ApprovalDecisionApprover, decision: ApprovalDecision): Promise<void> {
   // The re-rendered queue message already reflects the resolution (the item
   // simply disappears from the pending list) — this is an additional,

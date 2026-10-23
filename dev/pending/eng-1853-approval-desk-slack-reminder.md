@@ -1,0 +1,6 @@
+## ENG-1853: Approval Desk Slack reminder for staged Meta-write packets (2026-10-23)
+
+- Staging a Meta-write packet (`stageApprovalInboxMetaWriteManifest`) now posts ONE concise Slack reminder per packet (per ad account) to the assigned reviewer: an @-mention plus the Desk link (`FRONTEND_URL/approval-desk/<manifestId>`), no per-item text or buttons. Best-effort: a Slack failure is only logged and never affects staging.
+- Before this, only the plan_choice tool (`stage_pending_decision`) pinged anyone, so a staged Meta write sat unseen. Reviewers are Matt and Fangfang (Harsha is not a Desk reviewer); meta_write routes to Matt (`getDefaultApproverForGate`), matching the eval queue's type-based routing.
+- Channel: `getApproverChannel` now falls back to the eval-queue channel (`human_eval_slack_channel`, env `HUMAN_EVAL_SLACK_CHANNEL`/`EVAL_QUEUE_SLACK_CHANNEL`/`SLACK_EVAL_CHANNEL`) when no `approval_inbox_channel_<approver>` / `approval_inbox_channel_default` is set, so reminders land where the eval queue already pings them. The @-mention uses `human_eval_reviewer_<approver>_slack_user_id`.
+- env1 has `human_eval_slack_channel` set to the REAL eval-queue channel: set `approval_inbox_channel_matt` to a private target before testing there, or reminders would ping real reviewers.

@@ -66,9 +66,17 @@ export async function getApproverSlackUserId(approver: ApprovalDecisionApprover)
 export async function getApproverChannel(approver: ApprovalDecisionApprover): Promise<string> {
   const perApprover = await settingsService.getSetting(`${APPROVER_CHANNEL_SETTING_PREFIX}${approver}`);
   const fallback = await settingsService.getSetting(APPROVER_CHANNEL_DEFAULT_SETTING);
+  // Last resort: the same channel the human eval queue already posts to (humanEvalService's
+  // getEvalChannel keys), so Desk reminders land where Matt and Fangfang already look for review
+  // pings even when no approval-inbox channel was ever configured.
+  const evalQueue = await settingsService.getSetting('human_eval_slack_channel');
   const channel = perApprover?.settingValue
     || fallback?.settingValue
-    || process.env[APPROVER_CHANNEL_DEFAULT_ENV];
+    || process.env[APPROVER_CHANNEL_DEFAULT_ENV]
+    || evalQueue?.settingValue
+    || process.env.HUMAN_EVAL_SLACK_CHANNEL
+    || process.env.EVAL_QUEUE_SLACK_CHANNEL
+    || process.env.SLACK_EVAL_CHANNEL;
 
   if (!channel?.trim()) {
     throw new ApproverDirectoryError(`No Slack channel configured for approver '${approver}' (and no default configured)`);

@@ -341,4 +341,36 @@ describe('approvalInboxSlack', () => {
       await expect(approvalInboxSlack.postDecisionExpiredNotice('harsha', decision)).resolves.toBeUndefined();
     });
   });
+
+  describe('postManifestReadyNotice (the concise Approval Desk reminder)', () => {
+    const OLD_FRONTEND = process.env.FRONTEND_URL;
+    afterEach(() => {
+      if (OLD_FRONTEND === undefined) delete process.env.FRONTEND_URL; else process.env.FRONTEND_URL = OLD_FRONTEND;
+    });
+
+    it('@-mentions the reviewer and links straight to the packet, in the reviewer channel', async () => {
+      process.env.FRONTEND_URL = 'https://partner.agentweb.pro/';
+      mockPostMessage.mockResolvedValue({ ok: true, ts: '1.1' });
+      await approvalInboxSlack.postManifestReadyNotice('matt', { manifestId: 'm-1', itemCount: 3, accountLabel: 'ad account 123' });
+      expect(mockPostMessage).toHaveBeenCalledTimes(1);
+      const arg = mockPostMessage.mock.calls[0][0];
+      expect(arg.channel).toBe('C-MATT');
+      expect(arg.text).toBe('🔔 <@U-MATT> — 3 Meta Ads changes for ad account 123 waiting for your review in the Approval Desk: https://partner.agentweb.pro/approval-desk/m-1');
+      expect(arg.blocks).toBeUndefined();
+    });
+
+    it('uses singular wording, omits the account when unknown, and falls back to the name without a Slack id', async () => {
+      process.env.FRONTEND_URL = 'https://partner.agentweb.pro';
+      mockGetApproverSlackUserId.mockResolvedValue(undefined);
+      mockPostMessage.mockResolvedValue({ ok: true, ts: '1.1' });
+      await approvalInboxSlack.postManifestReadyNotice('fangfang', { manifestId: 'a b', itemCount: 1 });
+      expect(mockPostMessage.mock.calls[0][0].text).toBe('🔔 fangfang — 1 Meta Ads change waiting for your review in the Approval Desk: https://partner.agentweb.pro/approval-desk/a%20b');
+    });
+
+    it('never throws when Slack or the channel lookup fails (the packet is already staged)', async () => {
+      mockGetApproverChannel.mockRejectedValue(new Error('no channel'));
+      await expect(approvalInboxSlack.postManifestReadyNotice('matt', { manifestId: 'm-1', itemCount: 1 })).resolves.toBeUndefined();
+      expect(mockPostMessage).not.toHaveBeenCalled();
+    });
+  });
 });

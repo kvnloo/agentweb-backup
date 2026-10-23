@@ -14280,6 +14280,28 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       );
     }
 
+    // One short Slack reminder per packet to the assigned reviewer (same channel/style as the eval
+    // queue). Best-effort and never awaited into the turn: the decisions are already durably staged.
+    try {
+      const { postManifestReadyNotice } = await import('./approvalInboxSlack');
+      const byManifest = new Map<string, ApprovalDecision[]>();
+      for (const d of staged) {
+        if (d.status !== 'pending_team_review' || !d.manifestId) continue;
+        byManifest.set(d.manifestId, [...(byManifest.get(d.manifestId) || []), d]);
+      }
+      for (const [mid, items] of byManifest) {
+        const acct = String(items[0]?.metaWriteDispatch?.resolvedAccountId || '').replace(/^act_/, '');
+        if (!items[0].approver) continue;
+        await postManifestReadyNotice(items[0].approver, {
+          manifestId: mid,
+          itemCount: items.length,
+          accountLabel: acct ? `ad account ${acct}` : undefined,
+        });
+      }
+    } catch (err: any) {
+      console.warn('[agent-mode-service] failed to post the Approval Desk reminder to Slack:', err?.message || err);
+    }
+
     const count = staged.length;
     return {
       manifestId: reportedManifestId,

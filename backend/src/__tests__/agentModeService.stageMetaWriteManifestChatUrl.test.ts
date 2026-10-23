@@ -10,6 +10,10 @@
  * session", and attached to every decision staged from one halt batch.
  */
 
+jest.mock('../services/approvalInboxSlack', () => ({
+  postManifestReadyNotice: jest.fn(),
+}));
+
 jest.mock('../services/approvalInboxService', () => ({
   approvalInboxService: {
     createDecision: jest.fn(),
@@ -18,6 +22,7 @@ jest.mock('../services/approvalInboxService', () => ({
 
 import { AgentModeService } from '../services/agentModeService';
 import { approvalInboxService } from '../services/approvalInboxService';
+import { postManifestReadyNotice } from '../services/approvalInboxSlack';
 
 const SESSION_ID = 'sess-chaturl-1';
 
@@ -117,5 +122,38 @@ describe('stageApprovalInboxMetaWriteManifest attaches a real chatUrl', () => {
     expect(byDigest.d1).toBe(byDigest.d3);
     expect(byDigest.d1).not.toBe(byDigest.d2);
     expect(result.turnMessage).toContain('2 separate packets');
+  });
+
+  it('pings the assigned reviewer once per packet (not per item) and per account', async () => {
+    (approvalInboxService.createDecision as jest.Mock).mockImplementation(async (req: any) => ({
+      ...req, decisionId: req.metaWriteManifestDigest, status: 'pending_team_review',
+    }));
+    const forAccount = (digest: string, account: string) => writeHalt({
+      metaWriteManifestDigest: digest,
+      metaWriteDispatch: { entity_type: 'CAMPAIGN', action: 'UPDATE', account_id: `act_${account}`, resolvedAccountId: `act_${account}`, params: {} },
+      target: { account_id: account },
+    });
+    await (service as any).stageApprovalInboxMetaWriteManifest(SESSION_ID, [forAccount('d1', 'ALPHA'), forAccount('d2', 'ALPHA'), forAccount('d3', 'BETA')]);
+    const calls = (postManifestReadyNotice as jest.Mock).mock.calls.map(([approver, packet]: any) => ({ approver, n: packet.itemCount, acct: packet.accountLabel }));
+    expect(calls).toHaveLength(2);
+    expect(calls).toEqual(expect.arrayContaining([
+      { approver: 'matt', n: 2, acct: 'ad account ALPHA' },
+      { approver: 'matt', n: 1, acct: 'ad account BETA' },
+    ]));
+  });
+
+  it('does not ping for decisions that are not pending, and a Slack failure never breaks staging', async () => {
+    (approvalInboxService.createDecision as jest.Mock).mockImplementation(async (req: any) => ({
+      ...req, decisionId: req.metaWriteManifestDigest, status: 'executed',
+    }));
+    await (service as any).stageApprovalInboxMetaWriteManifest(SESSION_ID, [writeHalt()]);
+    expect(postManifestReadyNotice).not.toHaveBeenCalled();
+
+    (approvalInboxService.createDecision as jest.Mock).mockImplementation(async (req: any) => ({
+      ...req, decisionId: req.metaWriteManifestDigest, status: 'pending_team_review',
+    }));
+    (postManifestReadyNotice as jest.Mock).mockRejectedValue(new Error('slack down'));
+    const result = await (service as any).stageApprovalInboxMetaWriteManifest(SESSION_ID, [writeHalt()]);
+    expect(result.manifestId).toBeTruthy();
   });
 });
