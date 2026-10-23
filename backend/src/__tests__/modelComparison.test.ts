@@ -545,10 +545,10 @@ describe('POST /compare truncation, preflight, parallel policy, slot release', (
     }
   });
 
-  it('keeps empty_response for a non-length empty, and the output cap is 8192', async () => {
+  it('keeps empty_response for a non-length empty, and the output cap is 32000 (= /generate AGENT_MODE_MAX_OUTPUT_TOKENS, ENG-2648)', async () => {
     const { deps, callLLM } = makeDeps({ callLLM: jest.fn(async () => ({ choices: [{ message: { content: '' }, finish_reason: 'stop' }] })) as any });
     expect(res(await run(deps, body())).results[0].errorCode).toBe('empty_response');
-    expect(COMPARE_MAX_OUTPUT_TOKENS).toBe(8192);
+    expect(COMPARE_MAX_OUTPUT_TOKENS).toBe(32000);
     void callLLM;
   });
 
