@@ -10,6 +10,7 @@ import {
 } from '../tern/protocol';
 import { TspSurfaceReconciler } from '../tern/reconcile';
 import { resolveNativeTextEdit } from '../tern/textEdit';
+import { EmmaInputController, EmmaKey } from './tern-emma-input';
 import {
   AgentRunSummaryLike,
   ApprovalDeckInboundAnswer,
@@ -63,11 +64,7 @@ interface HelloReply {
   credits?: number;
 }
 
-interface PickerKey {
-  name: string;
-  text?: string;
-  ctrl?: boolean;
-}
+type PickerKey = EmmaKey;
 
 function argValue(name: string): string | undefined {
   const index = process.argv.indexOf(name);
@@ -137,113 +134,6 @@ class FrameSender {
     );
     pending.onSent?.();
   }
-}
-
-function decodePickerKey(buffer: string): { key?: PickerKey; used: number; needMore?: boolean } {
-  if (!buffer) return { used: 0, needMore: true };
-
-  if (buffer.startsWith('\x1b[200~')) {
-    const end = buffer.indexOf('\x1b[201~', 6);
-    if (end < 0) return { used: 0, needMore: true };
-    return {
-      key: { name: 'paste', text: buffer.slice(6, end) },
-      used: end + 6,
-    };
-  }
-
-  const first = buffer[0];
-  if (first !== '\x1b') {
-    const code = buffer.codePointAt(0);
-    if (code === undefined) return { used: 1 };
-    const char = String.fromCodePoint(code);
-    const used = char.length;
-
-    if (char === '\r' || char === '\n') return { key: { name: 'enter' }, used };
-    if (char === '\t') return { key: { name: 'tab' }, used };
-    if (char === '\x7f' || char === '\b') return { key: { name: 'backspace' }, used };
-    if (char === '\x03') return { key: { name: 'c', ctrl: true }, used };
-    if (code >= 1 && code <= 26) {
-      return { key: { name: String.fromCharCode(code + 96), ctrl: true }, used };
-    }
-    if (code < 32) return { used };
-    return { key: { name: char.toLowerCase(), text: char }, used };
-  }
-
-  if (buffer.length === 1) return { used: 0, needMore: true };
-
-  const simple: Record<string, string> = {
-    '\x1b[A': 'up',
-    '\x1b[B': 'down',
-    '\x1b[C': 'right',
-    '\x1b[D': 'left',
-    '\x1b[H': 'home',
-    '\x1b[F': 'end',
-    '\x1b[3~': 'delete',
-    '\x1b[5~': 'page_up',
-    '\x1b[6~': 'page_down',
-  };
-  for (const [sequence, name] of Object.entries(simple)) {
-    if (buffer.startsWith(sequence)) return { key: { name }, used: sequence.length };
-    if (sequence.startsWith(buffer)) return { used: 0, needMore: true };
-  }
-
-  const csi = /^\x1b\[([0-9:;]*)([A-Za-z~])/.exec(buffer);
-  if (!csi && buffer.startsWith('\x1b[') && buffer.length < 64) {
-    return { used: 0, needMore: true };
-  }
-  if (csi) {
-    const [sequence, params, final] = csi;
-    if (final === 'u') {
-      const pieces = params.split(';');
-      const code = Number((pieces[0] || '').split(':')[0]);
-      const modifier = Number((pieces[1] || '1').split(':')[0]);
-      const bits = Math.max(0, modifier - 1);
-      const ctrl = (bits & 4) !== 0;
-      const named: Record<number, string> = {
-        13: 'enter',
-        9: 'tab',
-        27: 'escape',
-        127: 'backspace',
-        57417: 'left',
-        57418: 'right',
-        57419: 'up',
-        57420: 'down',
-        57421: 'page_up',
-        57422: 'page_down',
-        57423: 'home',
-        57424: 'end',
-        57426: 'delete',
-      };
-      const name = named[code];
-      if (name) return { key: { name, ctrl }, used: sequence.length };
-      if (Number.isInteger(code) && code >= 32 && code <= 0x10ffff) {
-        const text = String.fromCodePoint(code);
-        return { key: { name: text.toLowerCase(), text: ctrl ? undefined : text, ctrl }, used: sequence.length };
-      }
-      return { used: sequence.length };
-    }
-
-    const arrowName: Record<string, string> = {
-      A: 'up',
-      B: 'down',
-      C: 'right',
-      D: 'left',
-      H: 'home',
-      F: 'end',
-    };
-    if (arrowName[final]) return { key: { name: arrowName[final] }, used: sequence.length };
-    if (final === '~') {
-      const n = Number(params.split(';')[0]);
-      const name = n === 3 ? 'delete' : n === 5 ? 'page_up' : n === 6 ? 'page_down' : undefined;
-      return { ...(name ? { key: { name } } : {}), used: sequence.length };
-    }
-    return { used: sequence.length };
-  }
-
-  // A lone ESC is ambiguous with an escape-sequence prefix; the caller flushes it
-  // after a short deadline. Unknown completed ESC sequences are consumed.
-  if (buffer.startsWith('\x1b')) return { used: 1, key: { name: 'escape' } };
-  return { used: 1 };
 }
 
 async function main(): Promise<void> {
@@ -388,8 +278,6 @@ async function main(): Promise<void> {
   );
   surfaceOpened = true;
 
-  let composer = '';
-  let cursor = 0;
   let running = false;
   let runningTools: RunningTool[] = [];
   let errorText: string | undefined;
@@ -399,17 +287,26 @@ async function main(): Promise<void> {
   let runFrames: FrameSender | undefined;
   let runReconciler: TspSurfaceReconciler | undefined;
   const dismissedDecks = new Set<string>();
-  let pickerKeyBuffer = '';
-  let escapeFlush: NodeJS.Timeout | undefined;
-  const undoStack: Array<{ text: string; cursor: number }> = [];
+  // Raw PTY keys and native edit/undo events share one composer model.
+  const input = new EmmaInputController({
+    mode: () => runState ? 'runs' : approvalState ? 'approval' : pickerState ? 'picker' : 'composer',
+    canSubmit: () => !running && !pickerState && !approvalState && !runState,
+    onSubmit: text => { void sendPrompt(text); },
+    onModalKey: key => handlePickerKey(key),
+    onInterrupt: () => closeAndExit(130),
+    onChange: () => {
+      errorText = undefined;
+      render(true);
+    },
+  });
   const pickerUndoStack: Array<{ text: string; cursor: number }> = [];
   const approvalUndoStack: Array<{ text: string; cursor: number }> = [];
 
   const render = (_dockOnly = false) => {
     const mainNode = renderEmmaMain(session, runningTools);
     const dock = renderEmmaDock({
-      text: composer,
-      cursor,
+      text: input.text,
+      cursor: input.cursor,
       running,
       session,
       error: errorText,
@@ -454,9 +351,7 @@ async function main(): Promise<void> {
     runState = undefined;
     runFrames = undefined;
     runReconciler = undefined;
-    pickerKeyBuffer = '';
-    clearTimeout(escapeFlush);
-    escapeFlush = undefined;
+    input.resetRaw();
     if (runsSurfaceOpened) {
       process.stdout.write(
         encodeTspJson('x', { id: RUNS_SURFACE_ID, keep: false }, undefined, apcLimit),
@@ -489,7 +384,7 @@ async function main(): Promise<void> {
     try {
       const runs = await client.getAgentRuns(session.sessionId, 3);
       runState = { runs, selected: 0 };
-      pickerKeyBuffer = '';
+      input.resetRaw();
       runFrames = new FrameSender(RUNS_SURFACE_ID, apcLimit, credits);
       runReconciler = new TspSurfaceReconciler(RUNS_SURFACE_ID);
       process.stdout.write(
@@ -522,9 +417,7 @@ async function main(): Promise<void> {
     pickerState = undefined;
     pickerUndoStack.length = 0;
     approvalUndoStack.length = 0;
-    pickerKeyBuffer = '';
-    clearTimeout(escapeFlush);
-    escapeFlush = undefined;
+    input.resetRaw();
     render();
   };
 
@@ -549,7 +442,7 @@ async function main(): Promise<void> {
       freeTextCursor: 0,
     };
     pickerState = undefined;
-    pickerKeyBuffer = '';
+    input.resetRaw();
   };
 
   const closeApprovalDeck = () => {
@@ -557,9 +450,7 @@ async function main(): Promise<void> {
     if (approvalDeckIsAwaiting(deck)) dismissedDecks.add(deck.deckId);
     approvalState = undefined;
     approvalUndoStack.length = 0;
-    pickerKeyBuffer = '';
-    clearTimeout(escapeFlush);
-    escapeFlush = undefined;
+    input.resetRaw();
     render();
   };
 
@@ -578,10 +469,8 @@ async function main(): Promise<void> {
       closeAgentRuns();
       const next = await client.getSession(sessionId);
       session = next;
-      composer = '';
-      cursor = 0;
+      input.clear();
       errorText = undefined;
-      undoStack.length = 0;
       pickerState = undefined;
       approvalState = undefined;
       maybeOpenApprovalDeck();
@@ -597,10 +486,8 @@ async function main(): Promise<void> {
     try {
       closeAgentRuns();
       session = await client.createSession();
-      composer = '';
-      cursor = 0;
+      input.clear();
       errorText = undefined;
-      undoStack.length = 0;
       pickerState = undefined;
       approvalState = undefined;
       render();
@@ -633,7 +520,7 @@ async function main(): Promise<void> {
       const selected = Math.max(0, sorted.findIndex(item => item.sessionId === session.sessionId));
       pickerState = { sessions, query: '', cursor: 0, selected };
       pickerUndoStack.length = 0;
-      pickerKeyBuffer = '';
+      input.resetRaw();
       errorText = undefined;
       render();
     } catch (error) {
@@ -960,41 +847,7 @@ async function main(): Promise<void> {
     }
   };
 
-  const drainPickerKeys = (finalEscape = false) => {
-    for (;;) {
-      if (!pickerKeyBuffer) return;
-      if (finalEscape && pickerKeyBuffer === '\x1b') {
-        pickerKeyBuffer = '';
-        handlePickerKey({ name: 'escape' });
-        return;
-      }
-
-      const decoded = decodePickerKey(pickerKeyBuffer);
-      if (decoded.needMore && decoded.used === 0) return;
-      if (decoded.used <= 0) return;
-      pickerKeyBuffer = pickerKeyBuffer.slice(decoded.used);
-      if (decoded.key) handlePickerKey(decoded.key);
-    }
-  };
-
-  rawHandler = raw => {
-    if (!pickerState && !approvalState && !runState) {
-      if (raw.includes('\x03')) closeAndExit(130);
-      return;
-    }
-
-    pickerKeyBuffer += raw;
-    clearTimeout(escapeFlush);
-    escapeFlush = undefined;
-    drainPickerKeys();
-
-    if (pickerKeyBuffer === '\x1b') {
-      escapeFlush = setTimeout(() => {
-        escapeFlush = undefined;
-        drainPickerKeys(true);
-      }, 30);
-    }
-  };
+  rawHandler = raw => input.handleRaw(raw);
 
   const parseTextEdit = (event: Record<string, unknown>) => {
     const { from, to, text, cursor: nextCursor, len } = event;
@@ -1033,16 +886,8 @@ async function main(): Promise<void> {
       return;
     }
 
-    if (event.id !== 'composer') return;
-    const resolved = resolveNativeTextEdit(composer, edit);
-    if (!resolved) return;
-
-    undoStack.push({ text: composer, cursor });
-    if (undoStack.length > 100) undoStack.shift();
-    composer = resolved.text;
-    cursor = resolved.cursor;
-    errorText = undefined;
-    render(true);
+    if (event.id !== 'composer' || pickerState || approvalState || runState) return;
+    input.applyNativeEdit(edit);
   };
 
   const sendPrompt = async (prompt: string) => {
@@ -1050,29 +895,24 @@ async function main(): Promise<void> {
     if (!text || running) return;
 
     if (text === '/runs') {
-      composer = '';
-      cursor = 0;
+      input.clear();
       void openAgentRuns();
       return;
     }
     if (text === '/resume' || text === '/sessions') {
-      composer = '';
-      cursor = 0;
+      input.clear();
       void openSessionPicker();
       return;
     }
     if (text === '/new') {
-      composer = '';
-      cursor = 0;
+      input.clear();
       void createNewSession();
       return;
     }
 
     running = true;
     errorText = undefined;
-    composer = '';
-    cursor = 0;
-    undoStack.length = 0;
+    input.clear();
     runningTools = [];
 
     const optimistic: EmmaMessage = {
@@ -1158,12 +998,8 @@ async function main(): Promise<void> {
           render();
           break;
         }
-        if (event.id !== 'composer') break;
-        const previous = undoStack.pop();
-        if (!previous) break;
-        composer = previous.text;
-        cursor = previous.cursor;
-        render(true);
+        if (event.id !== 'composer' || pickerState || approvalState || runState) break;
+        input.undo();
         break;
       }
       case 'send':
@@ -1173,7 +1009,8 @@ async function main(): Promise<void> {
           chooseApprovalAndAdvance(false);
           break;
         }
-        if (event.id === 'composer' && typeof event.text === 'string') {
+        if (event.id === 'composer' && typeof event.text === 'string'
+          && !running && !pickerState && !approvalState && !runState) {
           void sendPrompt(event.text);
         }
         break;
@@ -1243,7 +1080,7 @@ async function main(): Promise<void> {
           runFrames = undefined;
           runReconciler = undefined;
           runsSurfaceOpened = false;
-          pickerKeyBuffer = '';
+          input.resetRaw();
           break;
         }
 
