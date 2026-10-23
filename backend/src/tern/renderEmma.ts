@@ -1,3 +1,5 @@
+import { safeEmmaNode, safeEmmaToolDetail, safeEmmaUrl } from './emmaSurfaceSafety';
+
 export interface TspNode {
   id: string;
   k: string;
@@ -169,12 +171,9 @@ function codingPreviewBody(tool: EmmaToolCall): TspNode[] {
   const result = asRecord(tool.result);
   if (!result) return [];
 
-  const previewUrl =
-    typeof result.previewUrl === 'string'
-      ? result.previewUrl
-      : typeof result.url === 'string'
-        ? result.url
-        : undefined;
+  const previewUrl = safeEmmaUrl(
+    typeof result.previewUrl === 'string' ? result.previewUrl : result.url,
+  );
   const branch = typeof result.branch === 'string' ? result.branch : undefined;
   const buildStatus = typeof result.buildStatus === 'string' ? result.buildStatus : undefined;
   const acceptanceStatus = typeof result.acceptanceStatus === 'string' ? result.acceptanceStatus : undefined;
@@ -261,26 +260,47 @@ function toolLabel(name: string): string {
     .replace(/\b\w/g, c => c.toUpperCase());
 }
 
-function compact(value: unknown, max = 1200): string | undefined {
-  if (value === undefined || value === null) return undefined;
-  let text: string;
-  if (typeof value === 'string') text = value;
-  else {
-    try {
-      text = JSON.stringify(value, null, 2);
-    } catch {
-      text = String(value);
+/**
+ * SSE supplies only a tool name. Correlate starts to persisted ledger entries
+ * by session + name + occurrence (FIFO for repeated names), never an invented
+ * backend event ID. Historical occurrences anchor session rehydration.
+ */
+export function nativeToolId(sessionId: string, name: string, occurrence: number): string {
+  return `tool.${encodeURIComponent(sessionId)}.${encodeURIComponent(name)}.${occurrence}`;
+}
+
+function ledgerCounts(session: EmmaSessionLike): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const message of session.messages ?? []) {
+    if (message.role !== 'assistant' || !Array.isArray(message.metadata?.toolCalls)) continue;
+    for (const call of message.metadata.toolCalls) {
+      if (typeof call?.name !== 'string') continue;
+      counts.set(call.name, (counts.get(call.name) ?? 0) + 1);
     }
   }
-  if (!text) return undefined;
-  return text.length <= max ? text : `${text.slice(0, max)}\n…`;
+  return counts;
+}
+
+export function runningToolForStart(
+  session: EmmaSessionLike,
+  runningTools: readonly RunningTool[],
+  name: string,
+  startedAt = Date.now(),
+): RunningTool {
+  const past = ledgerCounts(session).get(name) ?? 0;
+  const inFlight = runningTools.filter(tool => tool.name === name).length;
+  return {
+    id: nativeToolId(session.sessionId, name, past + inFlight),
+    name,
+    startedAt,
+  };
 }
 
 function persistedToolNode(tool: EmmaToolCall, id: string): TspNode {
   const result = asRecord(tool.result);
   const failed = tool.error !== undefined || result?.success === false;
   const codingBody = codingPreviewBody(tool);
-  const errorBody = compact(failed ? tool.error ?? tool.result : undefined);
+  const errorBody = safeEmmaToolDetail(failed ? tool.error ?? tool.result : undefined);
   const children: TspNode[] = codingBody.map((child, index) => ({
     ...child,
     id: `${id}.rich.${index}`,
@@ -309,7 +329,7 @@ function persistedToolNode(tool: EmmaToolCall, id: string): TspNode {
 
 function runningToolNode(tool: RunningTool, now: number): TspNode {
   return {
-    id: `running.${tool.id}`,
+    id: tool.id,
     k: 'tool',
     p: {
       name: tool.name,
@@ -335,12 +355,6 @@ function messageNode(message: EmmaMessage, index: number): TspNode | null {
     });
   }
 
-  if (message.role === 'assistant') {
-    for (const [toolIndex, tool] of (message.metadata?.toolCalls ?? []).entries()) {
-      children.push(persistedToolNode(tool, `${id}.tool.${tool.id ?? toolIndex}`));
-    }
-  }
-
   if (children.length === 0) return null;
 
   return {
@@ -362,12 +376,27 @@ export function renderEmmaMain(
 ): TspNode {
   const children: TspNode[] = [];
 
+  const occurrences = new Map<string, number>();
+  const persistedIds = new Set<string>();
   for (const [index, message] of (session.messages ?? []).entries()) {
     const node = messageNode(message, index);
     if (node) children.push(node);
+    if (message.role !== 'assistant' || !Array.isArray(message.metadata?.toolCalls)) continue;
+    for (const tool of message.metadata.toolCalls) {
+      if (typeof tool?.name !== 'string') continue;
+      const occurrence = occurrences.get(tool.name) ?? 0;
+      occurrences.set(tool.name, occurrence + 1);
+      const id = nativeToolId(session.sessionId, tool.name, occurrence);
+      // Sibling position is stable in both phases: the keyed reconciler
+      // updates status in place instead of deleting/recreating a reparented card.
+      children.push(persistedToolNode(tool, id));
+      persistedIds.add(id);
+    }
   }
 
-  for (const tool of runningTools) children.push(runningToolNode(tool, now));
+  for (const tool of runningTools) {
+    if (!persistedIds.has(tool.id)) children.push(runningToolNode(tool, now));
+  }
 
   if (children.length === 0) {
     children.push({
@@ -377,12 +406,12 @@ export function renderEmmaMain(
     });
   }
 
-  return {
+  return safeEmmaNode({
     id: 'main',
     k: 'col',
     p: { gap: 'sm' },
     c: children,
-  };
+  });
 }
 
 export function renderWorkPlanChecklist(session: EmmaSessionLike): TspNode | null {
@@ -392,7 +421,7 @@ export function renderWorkPlanChecklist(session: EmmaSessionLike): TspNode | nul
   const firstPending = plan.steps.findIndex(step => step.status === 'pending');
   const done = plan.steps.filter(step => step.status === 'completed' || step.status === 'skipped').length;
 
-  return {
+  return safeEmmaNode({
     id: 'work-plan',
     k: 'checklist',
     p: {
@@ -417,7 +446,7 @@ export function renderWorkPlanChecklist(session: EmmaSessionLike): TspNode | nul
         collapsed: done === plan.steps.length,
       }],
     },
-  };
+  });
 }
 
 export function renderEmmaDock(options: {
@@ -444,7 +473,7 @@ export function renderEmmaDock(options: {
 
   const workPlan = renderWorkPlanChecklist(session);
 
-  return {
+  return safeEmmaNode({
     id: 'dock',
     k: 'col',
     p: { gap: 'xs' },
@@ -497,7 +526,7 @@ export function renderEmmaDock(options: {
         ],
       },
     ],
-  };
+  });
 }
 
 function firstUserMessage(session: EmmaSessionLike): string {
@@ -562,7 +591,7 @@ export function renderSessionPicker(
     if (session.sessionId === currentSessionId) badges.push({ text: 'current', tone: 'accent' });
     if (session.sessionType === 'scheduled') badges.push({ text: 'scheduled' });
 
-    return {
+    return safeEmmaNode({
       id: session.sessionId,
       label: sessionLabel(session),
       ...(firstUserMessage(session) && session.title
@@ -652,7 +681,7 @@ export function renderSessionPicker(
       },
       ...(previewChildren.length ? { c: previewChildren } : {}),
     }],
-  };
+  });
 }
 
 export function renderEmptyLayer(): TspNode {
@@ -816,7 +845,7 @@ export function renderApprovalDeck(
   }
   actions.push({ id: 'close', label: 'Close', keys: ['esc'], end: true });
 
-  return {
+  return safeEmmaNode({
     id: 'layer',
     k: 'col',
     c: [{
@@ -843,7 +872,7 @@ export function renderApprovalDeck(
       },
       c: preview,
     }],
-  };
+  });
 }
 
 
@@ -908,13 +937,14 @@ export function renderAgentRunsScreen(
       },
     });
 
-    if (selected.chat?.customerPortalUrl) {
+    const chatUrl = safeEmmaUrl(selected.chat?.customerPortalUrl);
+    if (chatUrl) {
       preview.push({
         id: 'run-preview.chat',
         k: 'text',
         p: {
-          spans: [{ t: 'Open chat', s: 'link', href: selected.chat.customerPortalUrl }],
-          href: selected.chat.customerPortalUrl,
+          spans: [{ t: 'Open chat', s: 'link', href: chatUrl }],
+          href: chatUrl,
           actions: { click: 'open', menu: ['open', 'copy'] },
         },
       });
@@ -1014,9 +1044,9 @@ export function renderAgentRunsScreen(
     c: preview,
   };
 
-  return {
+  return safeEmmaNode({
     id: 'main',
     k: 'col',
     c: [picker],
-  };
+  });
 }

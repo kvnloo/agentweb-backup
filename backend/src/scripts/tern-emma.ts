@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { AgentWebClient, EmmaStreamEvent } from '../tern/agentWebClient';
+import { safeEmmaText } from '../tern/emmaSurfaceSafety';
 import {
   encodeHelloQuery,
   encodeTspJson,
@@ -22,6 +23,7 @@ import {
   renderApprovalDeck,
   renderEmmaDock,
   renderEmmaMain,
+  runningToolForStart,
   renderEmptyLayer,
   renderSessionPicker,
   RunningTool,
@@ -373,7 +375,7 @@ async function main(): Promise<void> {
       {
         id: SURFACE_ID,
         mode: 'inline',
-        title: session.title || 'Emma',
+        title: safeEmmaText(session.title || 'Emma', 120),
         role: 'agentweb.emma',
       },
       undefined,
@@ -386,7 +388,6 @@ async function main(): Promise<void> {
   let cursor = 0;
   let running = false;
   let runningTools: RunningTool[] = [];
-  let toolCounter = 0;
   let errorText: string | undefined;
   let pickerState: SessionPickerState | undefined;
   let approvalState: ApprovalDeckUiState | undefined;
@@ -1095,13 +1096,11 @@ async function main(): Promise<void> {
           text,
           (event: EmmaStreamEvent) => {
             if (event.type !== 'tool_start' || typeof event.name !== 'string') return;
+            // SSE supplies names, not IDs. Match this card to the existing
+            // persisted ledger by per-name FIFO occurrence within the session.
             runningTools = [
               ...runningTools,
-              {
-                id: String(++toolCounter),
-                name: event.name,
-                startedAt: Date.now(),
-              },
+              runningToolForStart(session, runningTools, event.name),
             ];
             render();
           },
@@ -1256,7 +1255,7 @@ async function main(): Promise<void> {
               {
                 id: SURFACE_ID,
                 mode: 'inline',
-                title: session.title || 'Emma',
+                title: safeEmmaText(session.title || 'Emma', 120),
                 role: 'agentweb.emma',
               },
               undefined,

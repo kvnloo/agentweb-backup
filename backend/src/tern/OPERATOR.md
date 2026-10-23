@@ -17,6 +17,19 @@ endpoints, whose authorization checks stay authoritative.
 
 - **Emma**: transcript, native editor/send, tool cards, session picker,
   plan/approval deck, coding preview, and AgentRun trace (tern:emma).
+- **Emma tool identity**: chatbot SSE emits a tool name, not a call ID. The
+  adapter keys each live start by session + tool name + ordinal occurrence in
+  the existing persisted `metadata.toolCalls` ledger. Repeated same-name calls
+  correlate FIFO; completed/failed cards remain siblings under the native
+  transcript root and patch in place on reconciliation and session rehydration.
+  This is presentation identity, not a new backend/persistence ID. A start
+  absent from the persisted ledger cannot be recovered after a restart.
+- **Emma credential boundary**: every projected Emma surface (chat, tool
+  detail, coding preview, session picker, plan, approval deck and AgentRuns)
+  suppresses nested auth/token fields, bearer credentials and signed/userinfo
+  URLs. Failed-tool details remain bounded and useful; normal HTTP(S) previews
+  and links without credential-bearing parameters keep open/copy actions.
+  The editable composer remains user-authored local input.
 - **Operator**: tasks → executions → selected run; status, model, timestamps,
   result/error, elapsed duration, safe artifact links, actual browser execution
   activity and user requests, explicit gated Run/Stop, and a refresh action.
