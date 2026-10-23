@@ -2798,6 +2798,13 @@ async function scheduleAutoWorkPlanContinuation(
     });
 }
 
+/** Constant-time comparison of a presented conversable token with the stored one (ENG-2653). */
+function conversableTokenMatches(stored: string, presented: string): boolean {
+  const a = Buffer.from(stored, 'utf8');
+  const b = Buffer.from(presented, 'utf8');
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
 /**
  * Auto-files a Linear "Customer Reported" issue for context-limit errors.
  * Skips if the session already has contextLimitReported set (dedup).
@@ -17206,24 +17213,55 @@ export const agentModeController = {
 
 
   // Transfer session from anonymous user to authenticated user
+  /**
+   * Hand an anonymous plan session to the account that just signed in (the portal calls this after
+   * sign-up for each anon session in its `agentweb_plan_sessions` localStorage).
+   *
+   * ENG-2653: the caller must PROVE they are that anonymous visitor. The only secret the visitor's
+   * browser holds is the conversable token createSessionWithPlan issued with the session (returned
+   * as `conversableToken`, stored next to the session id in localStorage, and in the visitor's
+   * `?conversable=` URL). A session id alone is not proof: it appears in URLs, logs and shared links.
+   * Without a token that matches the session's active interactive share, the answer is the same 404
+   * as a missing session, so the endpoint confirms nothing about ids it is probed with.
+   *
+   * Only `predefined-work-plan` sessions transfer. The other anonymous kind, result-endpoint sessions
+   * (resultEndpointController), is never stored by the portal, and its conversable token is served by
+   * the unauthenticated GET /review/:sessionId to anyone holding the session id, so for those the
+   * token proves nothing.
+   */
   async transferSession(req: AuthenticatedRequest, res: Response) {
     try {
       const { sessionId } = req.params;
       const user = req.user;
+      const conversableToken = (req.body as { conversableToken?: unknown } | undefined)?.conversableToken;
 
-      // Get the session to verify it exists and check if it's anonymous
-      const session = await chatbotDb.getChatSession(sessionId);
-      if (!session) {
+      if (typeof conversableToken !== 'string' || conversableToken.length === 0) {
+        return res.status(400).json({ error: 'conversableToken is required' });
+      }
+
+      // Record only, strongly consistent: an unproven caller never triggers a transcript read.
+      const session = await chatbotDb.getChatSessionRecord(sessionId, true);
+      const share = session?.interactiveShareMetadata;
+      const proven = !!session && !!share?.isActive && typeof share.token === 'string'
+        && new Date() <= getInteractiveShareExpiresAt(share)
+        && conversableTokenMatches(share.token, conversableToken);
+      if (!session || !proven) {
         return res.status(404).json({ error: 'Session not found' });
       }
 
       // Check if the session belongs to an anonymous user
-      if (!session.userId.startsWith('anon_')) {
+      if (typeof session.userId !== 'string' || !session.userId.startsWith('anon_')) {
         return res.status(400).json({ error: 'Session is not anonymous' });
       }
+      if (session.sessionType !== 'predefined-work-plan') {
+        return res.status(400).json({ error: 'Session cannot be transferred' });
+      }
 
-      // Update the session userId to the authenticated user's ID
-      await chatbotDb.updateSessionUserId(sessionId, user.userId);
+      // Conditional on the anonymous owner we just checked: a concurrent transfer cannot overwrite it.
+      const transferred = await chatbotDb.updateSessionUserId(sessionId, user.userId, session.userId);
+      if (!transferred) {
+        return res.status(400).json({ error: 'Session is not anonymous' });
+      }
 
       res.json({
         message: 'Session transferred successfully',
