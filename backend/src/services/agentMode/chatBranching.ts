@@ -95,13 +95,7 @@ export function readBranchOrigin(messages: readonly BranchHistoryRow[] | undefin
 /** The fields of a stored row the branch readers look at (ChatMessage, the eval loader's ResumeMessage, ...). */
 export interface BranchHistoryRow {
   role?: unknown;
-  timestamp?: unknown;
   metadata?: unknown;
-}
-
-function rowTimeMs(row: BranchHistoryRow): number {
-  const raw = (row.metadata as { timestamp?: unknown } | null | undefined)?.timestamp ?? row.timestamp;
-  return typeof raw === 'string' ? Date.parse(raw) : Number.NaN;
 }
 
 /**
@@ -112,18 +106,15 @@ function rowTimeMs(row: BranchHistoryRow): number {
  * Not a branch (row 0 carries no branchOrigin) => `messages` unchanged. A branch nobody continued — including
  * the hidden (archived) leftover of a failed copy — has no own rows => [].
  *
- * A user row is the branch's own when it sits after the branched-from assistant row (copied user rows always
- * precede it: rows are copied densely in order and the branch point is an assistant row), or when it was
- * written after `branchedAt` (every interactive user row is time-stamped; copied rows keep their source
- * timestamps, which predate the branch). Either signal alone suffices, so neither an index gap in a legacy
- * source nor a missing timestamp hides a real turn.
+ * A user row is the branch's own when it sits after the branched-from assistant row: rows are copied densely and
+ * in order, the branch point is an assistant row, and the copy only extends past it over non-user rows, so every
+ * copied user row precedes it and every own user row follows it. Position only: timestamps are NOT used, since
+ * a copied row keeps whatever timestamp its source row carried and so cannot prove it is not a copy.
  */
 export function branchOwnMessages<T extends BranchHistoryRow>(messages: readonly T[]): T[] {
   const origin = readBranchOrigin(messages);
   if (!origin) return [...messages];
-  const branchedAtMs = typeof origin.branchedAt === 'string' ? Date.parse(origin.branchedAt) : Number.NaN;
-  const firstOwn = messages.findIndex((row, i) =>
-    row.role === 'user' && (i > origin.sourceMessageIndex || rowTimeMs(row) > branchedAtMs));
+  const firstOwn = messages.findIndex((row, i) => row.role === 'user' && i > origin.sourceMessageIndex);
   return firstOwn < 0 ? [] : messages.slice(firstOwn);
 }
 

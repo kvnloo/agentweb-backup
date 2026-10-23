@@ -3423,9 +3423,11 @@ router.get("/chat-sessions", async (req, res) => {
         })
       );
 
+      // ENG-2648: same own-turn rule as the recent list below — a branch nobody continued is a copy of turns
+      // already listed under its source, so it is left out here too (and gets no review link).
       const nonEmptySessions = sessionsWithMessages.filter((session: any) =>
         Array.isArray(session.messages) &&
-        session.messages.some((msg: any) => msg.role === "user")
+        branchOwnMessages(session.messages).some((msg: any) => msg.role === "user")
       );
 
       const nextOffset = offset + limit;
