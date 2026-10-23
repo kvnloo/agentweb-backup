@@ -148,6 +148,7 @@ jobs:
           bash .github/scripts/login-host-verify-build.test.sh
           bash .github/scripts/deploy-base-sha.test.sh
           bash .github/scripts/deploy-failure-alert.test.sh
+          bash .github/scripts/rollout-note.test.sh
           bash .github/scripts/eb-config-conflict.test.sh
           bash .github/scripts/staging-env-override.test.sh
           bash .github/scripts/sha-jest.test.sh
