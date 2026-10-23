@@ -96,39 +96,6 @@ export function requireReportedCostUsd(res: Parameters<typeof openRouterCallCost
   return reported;
 }
 
-/** The provider that refused a call outright (HTTP 400 naming it), if that is what `err` is. */
-function refusingProvider(err: unknown): string | undefined {
-  const e = err as { status?: unknown; error?: { metadata?: { provider_name?: unknown } } } | undefined;
-  const provider = e?.error?.metadata?.provider_name;
-  return e?.status === 400 && typeof provider === 'string' && provider ? provider : undefined;
-}
-
-/**
- * Sends `body`; if one provider refuses it with a 400, sends it once more with that provider added to
- * `provider.ignore`, so OpenRouter serves the model from another. Azure refuses one GPT-5.4 labeller case
- * every time, while OpenAI and Bedrock also serve the model (ENG-2625). Any other failure is passed on;
- * a failed retry is passed on with the refusal as its `cause`.
- */
-export async function createAvoidingRefusingProvider<B extends { provider?: { ignore?: string[] } }, T>(
-  create: (body: B) => Promise<T>,
-  body: B,
-): Promise<T> {
-  try {
-    return await create(body);
-  } catch (err) {
-    const provider = refusingProvider(err);
-    if (!provider) throw err;
-    const preferences = { ...body.provider, ignore: [...(body.provider?.ignore ?? []), provider] };
-    try {
-      return await create({ ...body, provider: preferences });
-    } catch (retryErr) {
-      const withCause = retryErr as { cause?: unknown };
-      if (retryErr instanceof Error && withCause.cause === undefined) withCause.cause = err;
-      throw retryErr;
-    }
-  }
-}
-
 /** OpenRouter without the usage ledger; adds each call's reported cost to `cost.usd`. */
 async function unmeteredJudgeLlm(cost: { usd: number }): Promise<RubricJudgeLlm> {
   const { agentModeService } = await import('../services/agentModeService');
@@ -137,21 +104,19 @@ async function unmeteredJudgeLlm(cost: { usd: number }): Promise<RubricJudgeLlm>
   return {
     async complete(request) {
       // Non-streaming request: the response is a single completion with usage.
-      const body = {
-        model: resolveOpenRouterUpstreamModelId(request.model),
-        messages: [
-          { role: 'system', content: request.system },
-          { role: 'user', content: request.content.map((part) => (part.type === 'text' ? part.text : '')).join('\n') },
-        ],
-        ...(LLM_MODEL_REGISTRY[request.model]?.supportsTemperature === false ? {} : { temperature: 0 }),
-        max_tokens: request.maxTokens,
-        // OpenRouter reports each call's cost only when asked; the cap depends on it.
-        usage: { include: true },
-      };
-      const res = (await createAvoidingRefusingProvider(
-        (sent: typeof body & { provider?: { ignore?: string[] } }) =>
-          client.chat.completions.create(sent as Parameters<typeof client.chat.completions.create>[0], { timeout: request.timeoutMs }),
-        body,
+      const res = (await client.chat.completions.create(
+        {
+          model: resolveOpenRouterUpstreamModelId(request.model),
+          messages: [
+            { role: 'system', content: request.system },
+            { role: 'user', content: request.content.map((part) => (part.type === 'text' ? part.text : '')).join('\n') },
+          ],
+          ...(LLM_MODEL_REGISTRY[request.model]?.supportsTemperature === false ? {} : { temperature: 0 }),
+          max_tokens: request.maxTokens,
+          // OpenRouter reports each call's cost only when asked; the cap depends on it.
+          usage: { include: true },
+        } as Parameters<typeof client.chat.completions.create>[0],
+        { timeout: request.timeoutMs },
       )) as unknown as Parameters<typeof readChatCompletion>[0] & { usage?: Record<string, unknown>; openrouter_metadata?: { is_byok?: unknown } };
       cost.usd += requireReportedCostUsd(res);
       return readChatCompletion(res);
