@@ -6028,7 +6028,7 @@ emmaToolRegistry.register({
   name: "read_file_content",
   definition: {
     name: "read_file_content",
-    description: 'Read and extract text content from a file URL. Supports text files, PDFs, HTML, Markdown, CSV, Excel/XLSX spreadsheets, Word documents (docx, doc), and other common formats. Do NOT use this for image files (jpg, jpeg, png, gif, webp) — use describe_image instead. For SVG source markup, text labels, or dimensions, use this tool; use describe_image for visual analysis of SVGs. Do NOT use this for video files (mp4, mov, avi, webm, mkv) — use describe_video instead.',
+    description: 'Read and extract text content from a file URL. Supports text files, PDFs, HTML, Markdown, CSV, Excel/XLSX spreadsheets, Word documents (docx, doc), and other common formats. Do NOT use this for image files (jpg, jpeg, png, gif, webp) — use describe_image instead. For SVG source markup, text labels, or dimensions, use this tool; use describe_image for visual analysis of SVGs. Do NOT use this for video files (mp4, mov, avi, webm, mkv) — use describe_video instead. Only pass a URL that appears verbatim in the conversation (an Attached Files link or a link the user pasted). NEVER guess or construct a file URL: if the user says a file is attached but the message has no Attached Files link, do not call this tool — reply "I do not see an attachment on that message — please re-attach the file."',
     inputSchema: {
       type: "object",
       properties: {
