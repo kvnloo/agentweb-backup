@@ -183,18 +183,25 @@ export function buildAgentRunTrace(input: {
   };
 }
 
+/** A stored row's untyped JSON field as a record; anything else reads as empty. */
+const asRecord = (value: unknown): Record<string, unknown> => (value && typeof value === 'object' ? (value as Record<string, unknown>) : {});
+
 function normalizeMessage(row: TraceMessageRow): NormalizedMessage {
   // Older rows store the message fields on the row itself, with no `message` wrapper.
-  const m = (row.message ?? row) as Record<string, any>;
-  const metadata = (m.metadata ?? {}) as Record<string, any>;
+  const m = asRecord(row.message ?? row);
+  const metadata = asRecord(m.metadata);
   const toolCalls = Array.isArray(m.tool_calls)
     ? m.tool_calls
-        .map((tc: any) => ({
-          id: String(tc?.id ?? ''),
-          name: String(tc?.function?.name ?? tc?.name ?? ''),
-          arguments: typeof tc?.function?.arguments === 'string' ? tc.function.arguments : JSON.stringify(tc?.function?.arguments ?? {}),
-        }))
-        .filter((tc: { id: string; name: string }) => tc.id && tc.name)
+        .map((raw) => {
+          const tc = asRecord(raw);
+          const fn = asRecord(tc.function);
+          return {
+            id: String(tc.id ?? ''),
+            name: String(fn.name ?? tc.name ?? ''),
+            arguments: typeof fn.arguments === 'string' ? fn.arguments : JSON.stringify(fn.arguments ?? {}),
+          };
+        })
+        .filter((tc) => tc.id && tc.name)
     : [];
   return {
     index: row.messageIndex ?? 0,
@@ -202,8 +209,8 @@ function normalizeMessage(row: TraceMessageRow): NormalizedMessage {
     content: m.content,
     toolCalls,
     toolCallId: typeof m.tool_call_id === 'string' ? m.tool_call_id : undefined,
-    metaToolCalls: Array.isArray(metadata.toolCalls) ? metadata.toolCalls : [],
-    usage: m.usage && typeof m.usage === 'object' ? m.usage : undefined,
+    metaToolCalls: Array.isArray(metadata.toolCalls) ? (metadata.toolCalls as NormalizedMessage['metaToolCalls']) : [],
+    usage: m.usage && typeof m.usage === 'object' ? (m.usage as NormalizedMessage['usage']) : undefined,
     ts: firstString(metadata.timestamp, m.timestamp),
   };
 }
@@ -516,6 +523,8 @@ export function redactText(text: string): string {
     .replace(AUTH_SCHEME, '$1 [REDACTED]');
   const kept: string[] = [];
   const shielded = explicit.replace(READABLE_IDS, (match) => `\u0000${kept.push(match) - 1}\u0000`);
+  // NUL brackets the placeholder because it never occurs in the text being redacted.
+  // eslint-disable-next-line no-control-regex
   return shielded.replace(OPAQUE_TOKEN, '[REDACTED]').replace(/\u0000(\d+)\u0000/g, (_, i) => kept[Number(i)] ?? '');
 }
 
@@ -554,7 +563,7 @@ function textOf(content: unknown, trim = true): string | undefined {
   if (typeof content === 'string') text = content;
   else if (Array.isArray(content)) {
     text = content
-      .map((block) => (typeof block === 'string' ? block : typeof (block as any)?.text === 'string' ? (block as any).text : ''))
+      .map((block) => (typeof block === 'string' ? block : typeof (block as { text?: unknown } | null)?.text === 'string' ? (block as { text: string }).text : ''))
       .filter(Boolean)
       .join('\n');
   }
