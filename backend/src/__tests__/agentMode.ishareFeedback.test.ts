@@ -71,13 +71,13 @@ describe('Agent Mode iShare Feedback', () => {
       expect(response.body.success).toBe(true);
       // ENG-2645: only the feedback MessageFeedbackButtons reads back — never the stored row (its content can
       // belong to a row the viewer's chat hides, and it carries the assistant's reasoning and usage).
+      // (and without the rater's userId).
       expect(response.body.message).toEqual({
         metadata: {
           feedback: {
             type: 'like',
             comment: 'Very helpful!',
             timestamp: '2026-01-25T00:00:00Z',
-            userId: 'anonymous-ishare',
           },
         },
       });

@@ -3,7 +3,8 @@
  *
  * Production, 2026-10-23: an unauthenticated GET /api/agent-mode/share/:id returned ~148 KB — the stored system prompt
  * (row 0), every assistant row's reasoning / reasoning_details / usage / refusal, the owner's whole authorized skills
- * catalog (incl. private skills and the admin bundle), the owner's supportNote and Slack thread, and
+ * catalog (incl. private skills and the admin bundle), the owner's supportNote (the admin's internal note about
+ * the account) and Slack thread, and
  * interactiveShareMetadata, whose token is the conversable credential.
  *
  * Pinned here, for both public views:
@@ -13,6 +14,10 @@
  *     text, no provider fields, no catalog/admin skills, no share metadata — and every field the chat renders is kept,
  *     with system rows kept as empty placeholders so the page's row counting/keys are unchanged.
  *   - the conversable generate and feedback responses do not reopen either leak.
+ * Review round (PR #3735): no supportNote on either view; feedback without the rater's userId; the first-attempt
+ * telemetry placeholder carries no isErrorMessage (the landing-page poll would mark a retrying run failed) while
+ * real failure rows keep it; server-authored user rows (auto-continuation / approval-inbox resume) are not shown
+ * as customer bubbles on the read-only page.
  */
 import { Request, Response } from 'express';
 
@@ -67,6 +72,8 @@ const SESSION_ID = 'share-session-2645';
 const TOKEN = 'conversable-token-2645';
 const SYSTEM_PROMPT = 'You are Emma. INTERNAL SYSTEM PROMPT — never shown to a share viewer.';
 const TELEMETRY = '[telemetry] First-attempt agent failure (retry will follow): boom | ctx: {"errorName":"Err"}';
+const CONTINUATION = 'INTERNAL DIRECTIVE: continue generating the remaining media';
+const INBOX_RESUME = 'INTERNAL DIRECTIVE: approval inbox decision resolved';
 
 const deck = {
   deckId: 'deck-1',
@@ -131,6 +138,9 @@ function storedSession() {
       },
       { role: 'tool', name: 'you_search_web', tool_call_id: 'tc1', content: '{"raw":"tool output"}', messageIndex: 4 },
       { role: 'system', content: TELEMETRY, messageIndex: 5, metadata: { timestamp: 't5', isErrorMessage: true } },
+      { role: 'user', content: CONTINUATION, messageIndex: 6, metadata: { timestamp: 't6', kind: 'auto-continuation' } },
+      { role: 'assistant', content: 'I encountered an error.', messageIndex: 7, metadata: { timestamp: 't7', isErrorMessage: true } },
+      { role: 'user', content: INBOX_RESUME, messageIndex: 8, metadata: { timestamp: 't8', kind: 'approval-inbox-resolution' } },
     ],
   };
 }
@@ -177,7 +187,7 @@ describe('ENG-2645 read-only share (/share/:id)', () => {
     expect(Object.keys(session).sort()).toEqual(['messages', 'pendingApprovalDeck', 'sessionId', 'title', 'workPlan']);
     const json = JSON.stringify(session);
     for (const secret of [SYSTEM_PROMPT, TELEMETRY, 'SECRET CHAIN OF THOUGHT', 'SECRET DETAIL', TOKEN, 'Acme Corp', 'C123',
-      'Owner Private Skill', 'get_pr_digest', '203.0.113.9', 'internal-doc.pdf', 'tool output']) {
+      'Owner Private Skill', 'get_pr_digest', '203.0.113.9', 'internal-doc.pdf', 'tool output', CONTINUATION, INBOX_RESUME]) {
       expect(json).not.toContain(secret);
     }
     for (const field of ['"reasoning"', '"reasoning_details"', '"usage"', '"refusal"', '"tool_calls"', '"skills"',
@@ -207,6 +217,8 @@ describe('ENG-2645 read-only share (/share/:id)', () => {
           pendingApprovalDeckId: 'deck-1',
         },
       },
+      // A real failure row is a real assistant bubble on the page.
+      { role: 'assistant', content: 'I encountered an error.', metadata: { timestamp: 't7' } },
     ]);
   });
 
@@ -223,17 +235,19 @@ describe('ENG-2645 conversable share (/ishare/:id?conversable=…)', () => {
 
     expect(Object.keys(session).sort()).toEqual([
       'createdAt', 'hasActiveProgress', 'llmModel', 'messages', 'pendingApprovalDeck', 'pendingWorkPlanInput', 'sessionId',
-      'skills', 'slackThread', 'supportNote', 'title', 'updatedAt', 'workPlan',
+      'skills', 'slackThread', 'title', 'updatedAt', 'workPlan',
     ]);
     const json = JSON.stringify(session);
-    for (const secret of [SYSTEM_PROMPT, TELEMETRY, 'SECRET CHAIN OF THOUGHT', 'SECRET DETAIL', 'Owner Private Skill',
+    for (const secret of [SYSTEM_PROMPT, TELEMETRY, 'SECRET CHAIN OF THOUGHT', 'SECRET DETAIL', 'Owner Private Skill', 'Acme Corp',
       'Admin Tools', 'get_pr_digest', 'loose_tool', '203.0.113.9', 'Visitor UA', 'internal-doc.pdf', 'tool output', 'systemPromptVersion']) {
       expect(json).not.toContain(secret);
     }
     for (const field of ['"reasoning"', '"reasoning_details"', '"usage"', '"refusal"', '"tool_calls"', '"ishareSender"',
-      '"crmEvidence"', '"shareMetadata"', '"interactiveShareMetadata"', '"visibility"']) {
+      '"crmEvidence"', '"shareMetadata"', '"interactiveShareMetadata"', '"visibility"', '"supportNote"', '"userId"']) {
       expect(json).not.toContain(field);
     }
+    // supportNote is the admin's internal note: the owner record is not even read for a viewer.
+    expect(getUserById).not.toHaveBeenCalled();
   });
 
   it('keeps every field the chat renders, and system rows as empty placeholders in place', async () => {
@@ -241,7 +255,7 @@ describe('ENG-2645 conversable share (/ishare/:id?conversable=…)', () => {
 
     expect(session).toMatchObject({
       sessionId: SESSION_ID, title: 'Shared chat', createdAt: '2026-10-23T00:00:00Z', updatedAt: '2026-10-23T01:00:00Z',
-      llmModel: 'gpt-5-chat-2', hasActiveProgress: false, supportNote: 'Acme Corp',
+      llmModel: 'gpt-5-chat-2', hasActiveProgress: false,
       slackThread: { channel: 'C123', threadTs: '1700000000.000100' },
       pendingWorkPlanInput: { requestId: 'r1', fields: [] }, pendingApprovalDeck: deck,
     });
@@ -251,12 +265,19 @@ describe('ENG-2645 conversable share (/ishare/:id?conversable=…)', () => {
 
     // Same rows the non-owner filter keeps (only the tool row is gone), same order and messageIndex.
     expect(session.messages.map((m: { role: string; messageIndex: number }) => [m.role, m.messageIndex])).toEqual([
-      ['system', 0], ['user', 1], ['system', 2], ['assistant', 3], ['system', 5],
+      ['system', 0], ['user', 1], ['system', 2], ['assistant', 3], ['system', 5], ['user', 6], ['assistant', 7], ['user', 8],
     ]);
-    const [prompt, user, upload, assistant, telemetry] = session.messages;
+    const [prompt, user, upload, assistant, telemetry, continuation, failure] = session.messages;
     expect(prompt).toEqual({ role: 'system', content: '', messageIndex: 0, metadata: { timestamp: 't0' } });
-    // The landing-page status poll reads isErrorMessage on any row.
-    expect(telemetry).toEqual({ role: 'system', content: '', messageIndex: 5, metadata: { timestamp: 't5', isErrorMessage: true } });
+    // The landing-page status poll marks the run failed on any row with isErrorMessage: the first-attempt
+    // telemetry row only means "a retry follows", so its placeholder does not carry the flag …
+    expect(telemetry).toEqual({ role: 'system', content: '', messageIndex: 5, metadata: { timestamp: 't5' } });
+    // … while a real failure row keeps it.
+    expect(failure).toEqual({
+      role: 'assistant', content: 'I encountered an error.', messageIndex: 7, metadata: { timestamp: 't7', isErrorMessage: true },
+    });
+    // The chat renders an auto-continuation row as a divider from its kind, so the conversable view keeps it.
+    expect(continuation).toEqual({ role: 'user', content: CONTINUATION, messageIndex: 6, metadata: { timestamp: 't6', kind: 'auto-continuation' } });
     // A successful upload row is rendered by ChatMessageItem, so it is kept whole.
     expect(upload).toEqual({
       role: 'system', content: 'Image uploaded: a.png', messageIndex: 2,
@@ -267,12 +288,14 @@ describe('ENG-2645 conversable share (/ishare/:id?conversable=…)', () => {
       metadata: { timestamp: 't1', attachments: stored.messages[1].metadata!.attachments },
     });
     const am = stored.messages[3].metadata!;
+    expect(am.feedback).toEqual({ type: 'like', timestamp: 't4', userId: 'owner-user' });
     expect(assistant).toEqual({
       role: 'assistant', content: 'Here is what I found {{cite:1}}', messageIndex: 3, llm: 'gpt-5-chat-2',
       modelCorrection: { requestedModel: 'opus', effectiveModel: 'gpt-5-chat-2' },
       metadata: {
         timestamp: 't3', toolCalls: assistantToolCalls, citations: am.citations, suggestedReplies: ['Tell me more'],
-        feedback: am.feedback, pendingApprovalDeckId: 'deck-1', approvalDeckItems: deck.items, awaitingUserConfirmation: true,
+        // The rater's userId is not sent; MessageFeedbackButtons reads the type.
+        feedback: { type: 'like', timestamp: 't4' }, pendingApprovalDeckId: 'deck-1', approvalDeckItems: deck.items, awaitingUserConfirmation: true,
       },
     });
   });
