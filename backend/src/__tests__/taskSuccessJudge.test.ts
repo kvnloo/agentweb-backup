@@ -104,6 +104,18 @@ describe('renderTraceForJudge', () => {
   });
 });
 
+describe('renderTraceForJudge clipping', () => {
+  it('never cuts an emoji in half where it clips a line, so the request stays valid JSON (ENG-2638)', () => {
+    index = 0;
+    const agentText = `${'y'.repeat(599)}😀${'z'.repeat(50)}`;
+    const trace = buildAgentRunTrace({ sessionId: 's2', messages: [row({ role: 'user', content: 'Write the post' }), row({ role: 'assistant', content: agentText })] });
+    const rendered = renderTraceForJudge(trace);
+
+    expect(rendered).toContain(`AGENT: ${'y'.repeat(599)}…`);
+    expect(rendered).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
+  });
+});
+
 describe('judgeTaskSuccess', () => {
   it('returns the verdict, reason and checklist, sending the rubric and the rendered trace', async () => {
     const llm = fakeLlm('```json\n{"checklist":["audit: DELIVERED","email: NOT DELIVERED — send failed"],"reason":"The email never went out.","verdict":"fail"}\n```');

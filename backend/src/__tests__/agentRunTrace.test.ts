@@ -424,6 +424,15 @@ describe('buildAgentRunTrace', () => {
     expect(trace.timelineOmitted).toBe(0);
   });
 
+  it('never cuts an emoji in half when it caps text, so the trace stays valid UTF-16 (ENG-2638)', () => {
+    index = 0;
+    const content = `${'x'.repeat(TRACE_LIMITS.resultChars - 1)}😀 and more`;
+    const trace = buildAgentRunTrace({ sessionId: 's4', messages: [assistantCalls(call('e1', 'perform_data_analysis', {})), toolResult('e1', 'perform_data_analysis', content, '2026-10-14T10:00:00Z')] });
+
+    expect(trace.calls[0].result).toBe('x'.repeat(TRACE_LIMITS.resultChars - 1));
+    expect(trace.calls[0].resultTruncated).toBe(true);
+  });
+
   it('caps large results and degrades every result when the run is over budget', () => {
     index = 0;
     const big = 'row of data '.repeat(Math.ceil((TRACE_LIMITS.resultChars + 100) / 12));
