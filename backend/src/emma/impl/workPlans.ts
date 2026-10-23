@@ -259,7 +259,7 @@ import { buildAnonymousModelUnavailableBody, buildAnonymousPlanModelToolMessage,
 import type { GatewayTaskClass } from '../../utils/openRouterGatewayContract';
 import type { LLMUsageContext } from '../../utils/llmService';
 import { isAgentWebModelId } from '../../services/agentMode/agentWebModelRouter';
-import { buildReviewUrl } from '../../services/resultEndpointReview';
+import { buildResultDeliveryEmailHtml, buildReviewUrl } from '../../services/resultEndpointReview';
 
 /**
  * ENG-1816 F2 follow-up: a production session reported "No work plan found in
@@ -1632,39 +1632,8 @@ export async function sendForReview(
       const resultLabel = metadata.resultTitle || metadata.resultName || 'your report';
       const replyToAddr = reviewerEmail || RESEND_SYSTEM_EMAIL;
 
-      // Build asset block
-      let assetBlock = '';
-      if (assetUrl) {
-        if (assetUrl.match(/\.(png|jpg|jpeg|gif|webp)$/i) || assetUrl.includes('image')) {
-          assetBlock = `<p style="text-align: center;"><img src="${assetUrl}" alt="${resultLabel}" style="max-width: 100%; border-radius: 8px;" /></p>`;
-        } else if (assetUrl.match(/\.(mp4|webm|mov)$/i) || assetUrl.includes('video')) {
-          assetBlock = `<div style="text-align: center; margin: 20px 0;"><a href="${assetUrl}" style="background: linear-gradient(90deg, #643B7E 0%, #6F3DFD 100%); color: white; padding: 12px 30px; text-decoration: none; border-radius: 6px; display: inline-block; font-weight: bold;">Watch Video</a></div>`;
-        } else {
-          assetBlock = `<div style="text-align: center; margin: 20px 0;"><a href="${assetUrl}" style="background: linear-gradient(90deg, #643B7E 0%, #6F3DFD 100%); color: white; padding: 12px 30px; text-decoration: none; border-radius: 6px; display: inline-block; font-weight: bold;">View Your Result</a></div>`;
-        }
-      }
-
-      // Formal email to lead, CC reviewer
-      const leadEmailHtml = `
-        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
-          <div style="text-align: center; margin-bottom: 30px;">
-            <h1 style="color: #1B2549; margin: 0;">AgentWeb</h1>
-            <p style="color: #666; margin: 5px 0;">${resultLabel}</p>
-          </div>
-          <div style="background: #f8f9fa; padding: 30px; border-radius: 8px; margin-bottom: 20px;">
-            <h2 style="color: #1B2549; margin-top: 0;">Your ${resultLabel} is Ready!</h2>
-            <p style="color: #333; line-height: 1.6;">We're excited to send you the requested ${resultLabel}. Our team has prepared this content specifically for you.</p>
-            ${assetBlock}
-            <p style="color: #333; line-height: 1.6; margin-top: 20px;">
-              If you have any questions or would like to request changes, simply reply to this email or reach out to us at
-              <a href="mailto:${replyToAddr}" style="color: #643B7E; text-decoration: none;">${replyToAddr}</a>
-              and we'll be happy to assist.
-            </p>
-          </div>
-          <div style="text-align: center; color: #666; font-size: 12px;">
-            <p>Powered by <a href="https://agentweb.pro" style="color: #643B7E; text-decoration: none;">AgentWeb</a></p>
-          </div>
-        </div>`;
+      // ENG-2650: same escaped template as POST /review/:sessionId/send.
+      const leadEmailHtml = buildResultDeliveryEmailHtml({ resultLabel, replyTo: replyToAddr, assetUrl });
 
       const leadSubject = metadata.contentSubject || `Your ${resultLabel} is ready`;
       await resendSvc.sendEmail({
