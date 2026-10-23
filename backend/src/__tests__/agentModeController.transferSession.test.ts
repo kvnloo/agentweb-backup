@@ -131,6 +131,13 @@ describe('Agent Mode Controller - Transfer Session', () => {
       }
     });
 
+    it('answers an oversized session id 404 without reading it', async () => {
+      const res = await transfer({ conversableToken: VISITOR_TOKEN }, 'x'.repeat(4000));
+
+      expect(chatbotDb.getChatSessionRecord).not.toHaveBeenCalled();
+      expect(res.status).toHaveBeenCalledWith(404);
+    });
+
     it('rejects a token of a different length (no prefix match)', async () => {
       const res = await transfer({ conversableToken: VISITOR_TOKEN.slice(0, 10) });
 
