@@ -219,7 +219,7 @@ export function renderOperator(view: OperatorView): TspNode[] {
   const runs = [...view.executions].sort((a, b) =>
     (b.startTime || '').localeCompare(a.startTime || ''));
   const selected = runs.find(run => run.executionId === view.executionId);
-  const current = view.detail?.executionId === view.executionId
+  const current = view.detail && view.detail.executionId === view.executionId
     && view.detail.taskId === view.taskId ? view.detail : selected;
   const isRuns = view.scope === 'executions';
   const items = isRuns ? runs.map(executionItem) : view.tasks.map(taskItem);

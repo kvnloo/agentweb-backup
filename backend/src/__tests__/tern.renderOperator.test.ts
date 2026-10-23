@@ -278,4 +278,9 @@ describe('Actual browser activity and incremental keyed TSP updates', () => {
     expect(nodes.find(node => node.id === 'operator.run.activity-state')?.p?.text)
       .toBe('Execution activity temporarily unavailable.');
   });
+  it('renders empty task and execution views without a detail record', () => {
+    for (const scope of ['tasks', 'executions'] as const) {
+      expect(() => renderOperator({ scope, tasks: [], executions: [] })).not.toThrow();
+    }
+  });
 });
