@@ -417,6 +417,17 @@ describe('surfaces (ENG-2192)', () => {
     expect(textOf(calls[0]).length).toBeLessThan(MAX_LANDING_PAGE_SOURCE_CHARS + 5_000);
   });
 
+  it('ENG-2643: cuts the landing-page source and brief fields without splitting an emoji', async () => {
+    const { llm, calls } = stubLlm(surfaceVerdict('landing_page'));
+    const source = 'x'.repeat(MAX_LANDING_PAGE_SOURCE_CHARS - 1) + '\u{1F600}' + 'tail';
+    const goal = 'g'.repeat(1_999) + '\u{1F680}' + 'more';
+    await judgeLandingPage({ source }, { goal }, { llm });
+
+    const sent = textOf(calls[0]);
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(sent)).toBe(false);
+    expect(sent).not.toContain('tail');
+  });
+
   it('rejects a surface verdict that is missing one of its criteria', async () => {
     const partial = JSON.parse(surfaceVerdict('landing_page')) as Record<string, unknown>;
     delete partial.hook_clarity;
