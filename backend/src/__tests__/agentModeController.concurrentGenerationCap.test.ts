@@ -154,6 +154,7 @@ describe('AgentModeController - per-user concurrent generation cap (ENG-110)', (
       code: 'TOO_MANY_CONCURRENT_RUNS',
       message: 'You have 3 chats generating at once. Wait for one to finish, then try again.',
       limit: 3,
+      userMessageSaved: false,
     });
     expect(activeSessionGenerations.has('d')).toBe(false);
     expect(__activeGenerationCountForTests(userId)).toBe(3);

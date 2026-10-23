@@ -256,8 +256,8 @@ describe('switch OFF: as before the router (the id is an unknown model), with th
 
     expect(res.statusCode).toBe(422);
     expect(unknown.statusCode).toBe(422);
-    expect(res.body).toEqual({ error: AW_UNAVAILABLE, code: 'model_unavailable', requestedModel: AW, reason: 'not_served' });
-    expect(unknown.body).toEqual(buildModelUnavailableBody(new ModelUnavailableError('retired-model-9', 'not_served')));
+    expect(res.body).toEqual({ error: AW_UNAVAILABLE, code: 'model_unavailable', requestedModel: AW, reason: 'not_served', userMessageSaved: false });
+    expect(unknown.body).toEqual({ ...buildModelUnavailableBody(new ModelUnavailableError('retired-model-9', 'not_served')), userMessageSaved: false });
     expect(Object.keys(res.body).sort()).toEqual(Object.keys(unknown.body).sort());
     expect(mockWorker.runInWorker).not.toHaveBeenCalled();
     expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
@@ -359,7 +359,7 @@ describe('switch ON', () => {
     for (let i = 0; i < 2; i++) {
       const refused = await turn();
       expect(refused.statusCode).toBe(422);
-      expect(refused.body).toEqual(buildModelUnavailableBody(new ModelUnavailableError(AW, 'not_served')));
+      expect(refused.body).toEqual({ ...buildModelUnavailableBody(new ModelUnavailableError(AW, 'not_served')), userMessageSaved: false });
     }
     expect(mockWorker.runInWorker).not.toHaveBeenCalled();
 
@@ -705,7 +705,7 @@ describe('MAJOR 1: the owner\'s plan never reaches a share viewer through the ro
 describe('MAJOR 2: a STORED AgentWeb Model selection the router cannot serve is refused visibly on every path', () => {
   const expectRefused = (res: any) => {
     expect(res.statusCode).toBe(422);
-    expect(res.body).toEqual({ error: AW_UNAVAILABLE, code: 'model_unavailable', requestedModel: AW, reason: 'not_served' });
+    expect(res.body).toEqual({ error: AW_UNAVAILABLE, code: 'model_unavailable', requestedModel: AW, reason: 'not_served', userMessageSaved: false });
   };
   const expectUntouched = (store: { get: () => any }) => {
     expect(mockWorker.runInWorker).not.toHaveBeenCalled();

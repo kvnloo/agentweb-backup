@@ -438,6 +438,8 @@ describe('POST /verified-generate returns 409 SESSION_BUSY on lock timeout (ENG-
       expect.objectContaining({
         error: 'Session is busy',
         code: 'SESSION_BUSY',
+        // ENG-2641: refused before the starting message was stored.
+        userMessageSaved: false,
       }),
     );
     expect(mockWorkerService.runInWorker).not.toHaveBeenCalled();
