@@ -66,22 +66,35 @@ export async function getApproverSlackUserId(approver: ApprovalDecisionApprover)
 export async function getApproverChannel(approver: ApprovalDecisionApprover): Promise<string> {
   const perApprover = await settingsService.getSetting(`${APPROVER_CHANNEL_SETTING_PREFIX}${approver}`);
   const fallback = await settingsService.getSetting(APPROVER_CHANNEL_DEFAULT_SETTING);
-  // Last resort: the same channel the human eval queue already posts to (humanEvalService's
-  // getEvalChannel keys), so Desk reminders land where Matt and Fangfang already look for review
-  // pings even when no approval-inbox channel was ever configured.
-  const evalQueue = await settingsService.getSetting('human_eval_slack_channel');
   const channel = perApprover?.settingValue
     || fallback?.settingValue
-    || process.env[APPROVER_CHANNEL_DEFAULT_ENV]
-    || evalQueue?.settingValue
-    || process.env.HUMAN_EVAL_SLACK_CHANNEL
-    || process.env.EVAL_QUEUE_SLACK_CHANNEL
-    || process.env.SLACK_EVAL_CHANNEL;
+    || process.env[APPROVER_CHANNEL_DEFAULT_ENV];
 
   if (!channel?.trim()) {
     throw new ApproverDirectoryError(`No Slack channel configured for approver '${approver}' (and no default configured)`);
   }
   return channel.trim();
+}
+
+/** Channel for the Approval Desk's one-line packet reminder only. Same as getApproverChannel, plus a
+ *  last-resort fallback to the eval-queue channel (humanEvalService's getEvalChannel keys) so the reminder
+ *  lands where Matt and Fangfang already look for review pings even when no approval-inbox channel was
+ *  ever configured. Deliberately NOT folded into getApproverChannel: that one also feeds the interactive
+ *  queue message (Approve/Reject buttons), resolution/expiry notices and plan_choice staging, which must
+ *  stay dormant until someone configures a channel for them on purpose. */
+export async function getApproverReminderChannel(approver: ApprovalDecisionApprover): Promise<string> {
+  try {
+    return await getApproverChannel(approver);
+  } catch (err) {
+    if (!(err instanceof ApproverDirectoryError)) throw err;
+    const evalQueue = await settingsService.getSetting('human_eval_slack_channel');
+    const channel = evalQueue?.settingValue
+      || process.env.HUMAN_EVAL_SLACK_CHANNEL
+      || process.env.EVAL_QUEUE_SLACK_CHANNEL
+      || process.env.SLACK_EVAL_CHANNEL;
+    if (!channel?.trim()) throw err;
+    return channel.trim();
+  }
 }
 
 /** Optional configured fallback approver(s) who may act on ANY decision, so

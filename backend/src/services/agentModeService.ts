@@ -14280,26 +14280,35 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       );
     }
 
-    // One short Slack reminder per packet to the assigned reviewer (same channel/style as the eval
-    // queue). Best-effort and never awaited into the turn: the decisions are already durably staged.
-    try {
-      const { postManifestReadyNotice } = await import('./approvalInboxSlack');
-      const byManifest = new Map<string, ApprovalDecision[]>();
-      for (const d of staged) {
-        if (d.status !== 'pending_team_review' || !d.manifestId) continue;
-        byManifest.set(d.manifestId, [...(byManifest.get(d.manifestId) || []), d]);
-      }
-      for (const [mid, items] of byManifest) {
-        const acct = String(items[0]?.metaWriteDispatch?.resolvedAccountId || '').replace(/^act_/, '');
-        if (!items[0].approver) continue;
-        await postManifestReadyNotice(items[0].approver, {
-          manifestId: mid,
-          itemCount: items.length,
-          accountLabel: acct ? `ad account ${acct}` : undefined,
-        });
-      }
-    } catch (err: any) {
-      console.warn('[agent-mode-service] failed to post the Approval Desk reminder to Slack:', err?.message || err);
+    // One short Slack reminder per packet to the assigned reviewer (same style as the eval queue).
+    // Fire-and-forget: the decisions are already durably staged, and a slow or rate-limited Slack must
+    // never hold up the agent turn. Only rows created just now are announced — createDecision returns the
+    // EXISTING row on an idempotent hit, and a retried iteration must not re-ping the reviewer.
+    const freshWindowMs = 60_000;
+    const packets = new Map<string, { approver: NonNullable<ApprovalDecision['approver']>; manifestId: string; items: ApprovalDecision[] }>();
+    for (const d of staged) {
+      if (d.status !== 'pending_team_review' || !d.manifestId || !d.approver) continue;
+      if (Date.now() - Date.parse(d.createdAt) > freshWindowMs) continue;
+      const key = `${d.manifestId}|${d.approver}`;
+      const entry = packets.get(key) || { approver: d.approver, manifestId: d.manifestId, items: [] };
+      entry.items.push(d);
+      packets.set(key, entry);
+    }
+    if (packets.size > 0) {
+      void (async () => {
+        const { postManifestReadyNotice } = await import('./approvalInboxSlack');
+        for (const { approver, manifestId: mid, items } of packets.values()) {
+          // Only a bare numeric ad account id is ever interpolated into Slack text (no mentions/links).
+          const acct = String(items[0]?.metaWriteDispatch?.resolvedAccountId || '').replace(/^act_/, '');
+          await postManifestReadyNotice(approver, {
+            manifestId: mid,
+            itemCount: items.length,
+            accountLabel: /^\d+$/.test(acct) ? `ad account ${acct}` : undefined,
+          });
+        }
+      })().catch((err: any) => {
+        console.warn('[agent-mode-service] failed to post the Approval Desk reminder to Slack:', err?.message || err);
+      });
     }
 
     const count = staged.length;
