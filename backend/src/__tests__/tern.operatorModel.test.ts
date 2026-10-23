@@ -1,6 +1,7 @@
 import {
-  confirmationMatches, displayOperatorJson, elapsedExecution,
-  parseOperatorBrowserLogHtml, safeArtifactUrl, safeText, OperatorView,
+  applyNativeConfirmationEvent, confirmationMatches, displayOperatorJson, elapsedExecution,
+  operatorConfirmNodeId, operatorPortalPath, parseOperatorBrowserLogHtml,
+  safeArtifactUrl, safeOperatorPortalUrl, safeText, OperatorView,
 } from '../tern/operatorModel';
 
 describe('Tern operator redaction and explicit confirmation', () => {
@@ -18,6 +19,11 @@ describe('Tern operator redaction and explicit confirmation', () => {
     expect(safeArtifactUrl('https://user:password@cdn.example/file')).toBeUndefined();
     expect(safeArtifactUrl('javascript:alert(1)')).toBeUndefined();
     expect(safeArtifactUrl('https://cdn.example/file')).toBe('https://cdn.example/file');
+    const token = 'm0n1p2q3r4s5t6u7v8w9';
+    const capability = 'https://bucket.s3.amazonaws.com/task_results/e-1/' + token + '/result.html';
+    expect(safeArtifactUrl(capability)).toBeUndefined();
+    expect(safeArtifactUrl(capability.replace('task_results', 'task%5Fresults'))).toBeUndefined();
+    expect(safeArtifactUrl('https://cdn.example/file', token)).toBeUndefined();
     const view: OperatorView = {
       ...running,
       detail: {
@@ -25,7 +31,9 @@ describe('Tern operator redaction and explicit confirmation', () => {
         result: 'Authorization: Bearer abc123',
         error: 'secret=abc123',
         result_files: [
-          { filename: 'result.html', url: 'https://cdn.example/file?token=abc', token: 'abc' },
+          { filename: 'result.html', url: capability, token },
+          { filename: 'private.html', url: 'https://cdn.example/file?token=abc', token: 'abc' },
+          { filename: 'public.html', url: 'https://cdn.example/file' },
         ],
       },
     };
@@ -33,6 +41,10 @@ describe('Tern operator redaction and explicit confirmation', () => {
     expect(output).toContain('result.html');
     expect(output).not.toContain('abc123');
     expect(output).not.toContain('token=abc');
+    expect(output).not.toContain(token);
+    expect(output).not.toContain('task_results/e-1');
+    expect(output).toContain('https://cdn.example/file');
+    expect(output).toContain('/tasks/task-1/executions/e-1');
     expect(output).not.toContain('"token"');
   });
 
@@ -43,7 +55,8 @@ describe('Tern operator redaction and explicit confirmation', () => {
   });
 
   it('blocks stale, retargeted and already-completed stop requests', () => {
-    const stop = { kind: 'stop' as const, taskId: 'task-1', executionId: 'e-1' };
+    const stop = { kind: 'stop' as const, taskId: 'task-1', executionId: 'e-1',
+      taskName: 'Report', generation: 1, surfaceId: 'agentweb-operator' };
     expect(confirmationMatches(running, stop)).toBe(true);
     expect(confirmationMatches({ ...running, busy: true }, stop)).toBe(false);
     expect(confirmationMatches({ ...running, executionId: 'e-2' }, stop)).toBe(false);
@@ -53,8 +66,78 @@ describe('Tern operator redaction and explicit confirmation', () => {
     expect(confirmationMatches(running, { ...stop, taskId: 'another-task' })).toBe(false);
   });
 
+  it('builds only credential-free references to the existing authenticated portal route', () => {
+    expect(operatorPortalPath('task/a', 'run:b')).toBe('/tasks/task%2Fa/executions/run%3Ab');
+    expect(safeOperatorPortalUrl('https://portal.example/', 'task-1', 'e-1'))
+      .toBe('https://portal.example/tasks/task-1/executions/e-1');
+    for (const base of [
+      'https://user:secret@portal.example/',
+      'https://portal.example/?token=credential',
+      'https://portal.example/private/capability',
+      'javascript:alert(1)',
+    ]) expect(safeOperatorPortalUrl(base, 'task-1', 'e-1')).toBeUndefined();
+  });
+
+  it('rejects stale A native events after closing A and opening B, mutating B once only', () => {
+    const view: OperatorView = {
+      scope: 'executions',
+      tasks: [
+        { taskId: 'task-A', name: 'Alpha', status: 'active' },
+        { taskId: 'task-B', name: 'Beta', status: 'active' },
+      ],
+      taskId: 'task-A',
+      executions: [{ taskId: 'task-A', executionId: 'run-A', status: 'running' }],
+      executionId: 'run-A',
+      detail: { taskId: 'task-A', executionId: 'run-A', status: 'running' },
+    };
+    const a = { kind: 'stop' as const, taskId: 'task-A', taskName: 'Alpha',
+      executionId: 'run-A', generation: 41, surfaceId: 'agentweb-operator' };
+    const b = { kind: 'stop' as const, taskId: 'task-B', taskName: 'Beta',
+      executionId: 'run-B', generation: 42, surfaceId: 'agentweb-operator' };
+    const mutations: Array<{ taskId: string; executionId?: string }> = [];
+    const feed = (event: { id: string; ev: string; item?: string; act?: string; sf?: string }) => {
+      const decision = applyNativeConfirmationEvent(view, event, 'agentweb-operator');
+      if (decision === 'cancel') {
+        view.confirm = undefined;
+        view.confirmSelected = undefined;
+      } else if (decision === 'submit' && view.confirm) {
+        mutations.push({ taskId: view.confirm.taskId, executionId: view.confirm.executionId });
+        view.busy = true;
+        view.confirm = undefined; // mirrors the CLI's synchronous submission guard
+      }
+      return decision;
+    };
+    view.confirm = a;
+    view.confirmSelected = 'cancel';
+    expect(feed({ id: operatorConfirmNodeId(a), ev: 'action', act: 'cancel' })).toBe('cancel');
+    view.taskId = 'task-B';
+    view.executionId = 'run-B';
+    view.executions = [{ taskId: 'task-B', executionId: 'run-B', status: 'running' }];
+    view.detail = { taskId: 'task-B', executionId: 'run-B', status: 'running' };
+    view.confirm = b;
+    view.confirmSelected = 'cancel';
+    for (const event of [
+      { id: operatorConfirmNodeId(a), ev: 'select', item: 'confirm' },
+      { id: operatorConfirmNodeId(a), ev: 'activate', item: 'confirm' },
+      { id: operatorConfirmNodeId(a), ev: 'action', act: 'confirm' },
+    ]) expect(feed(event)).toBe('ignored');
+    expect(feed({ id: operatorConfirmNodeId(b), sf: 'prior-surface', ev: 'action', act: 'confirm' }))
+      .toBe('ignored');
+    expect(view.confirmSelected).toBe('cancel');
+    expect(mutations).toHaveLength(0);
+    expect(feed({ id: operatorConfirmNodeId(b), ev: 'select', item: 'confirm' }))
+      .toBe('selected');
+    expect(mutations).toHaveLength(0);
+    expect(feed({ id: operatorConfirmNodeId(b), ev: 'activate', item: 'confirm' }))
+      .toBe('submit');
+    expect(feed({ id: operatorConfirmNodeId(b), ev: 'action', act: 'confirm' }))
+      .toBe('ignored');
+    expect(mutations).toEqual([{ taskId: 'task-B', executionId: 'run-B' }]);
+  });
+
   it('permits a run only against the selected known task, never a foreign id', () => {
-    const run = { kind: 'run' as const, taskId: 'task-1' };
+    const run = { kind: 'run' as const, taskId: 'task-1',
+      taskName: 'Report', generation: 1, surfaceId: 'agentweb-operator' };
     expect(confirmationMatches(running, run)).toBe(true);
     expect(confirmationMatches(running, { ...run, taskId: 'task-2' })).toBe(false);
   });

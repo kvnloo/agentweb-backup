@@ -8,8 +8,8 @@
  */
 import { AgentWebOperatorClient } from '../tern/operatorClient';
 import {
-  confirmationMatches, displayOperatorJson,
-  OperatorConfirm, OperatorExecution, OperatorView,
+  applyNativeConfirmationEvent, confirmationMatches, displayOperatorJson,
+  operatorConfirmNodeId, OperatorConfirm, OperatorExecution, OperatorView,
 } from '../tern/operatorModel';
 import {
   encodeHelloQuery, encodeTspJson, parseTspJson,
@@ -92,6 +92,7 @@ async function main(): Promise<void> {
 
   const view: OperatorView = {
     scope: 'tasks', tasks: [], executions: [],
+    portalBaseUrl: process.env.AGENTWEB_PORTAL_URL,
   };
   view.tasks = await client.listTasks();
   if (requestedTask && !view.tasks.some(task => task.taskId === requestedTask)) {
@@ -145,6 +146,7 @@ async function main(): Promise<void> {
   let refreshInFlight = false;
   let runsEpoch = 0;
   let detailEpoch = 0;
+  let confirmationGeneration = 0;
 
   function close(code: number): void {
     if (shuttingDown) return;
@@ -208,6 +210,9 @@ async function main(): Promise<void> {
   }
 
   function openSurface(): void {
+    // Native recovery invalidates a prior surface's pending confirmation.
+    view.confirm = undefined;
+    view.confirmSelected = undefined;
     activeSurfaceId = SURFACE_ID + (recoveries ? '-' + recoveries : '');
     protocolFailed = false;
     sender = new CreditFrames(activeSurfaceId, apcLimit, credits);
@@ -329,6 +334,9 @@ async function main(): Promise<void> {
     if (view.busy || !view.taskId) return;
     const confirm: OperatorConfirm = {
       kind, taskId: view.taskId,
+      taskName: view.tasks.find(task => task.taskId === view.taskId)?.name || view.taskId,
+      generation: ++confirmationGeneration,
+      surfaceId: activeSurfaceId,
       ...(kind === 'stop' ? { executionId: view.executionId } : {}),
     };
     if (!confirmationMatches(view, confirm)) {
@@ -398,11 +406,25 @@ async function main(): Promise<void> {
     if (activate) {
       if (item === 'cancel') {
         view.confirm = undefined;
+        view.confirmSelected = undefined;
         render();
       } else {
         void submitConfirmation();
       }
     } else render();
+  }
+
+  /** The native peer's event must target this exact picker + surface generation. */
+  function receiveNativeConfirmation(event: Record<string, unknown>): boolean {
+    const decision = applyNativeConfirmationEvent(view, event, activeSurfaceId);
+    if (decision === 'ignored') return false;
+    if (decision === 'selected') render();
+    else if (decision === 'cancel') {
+      view.confirm = undefined;
+      view.confirmSelected = undefined;
+      render();
+    } else void submitConfirmation();
+    return true;
   }
 
   function moveSelection(delta: number): void {
@@ -488,6 +510,11 @@ async function main(): Promise<void> {
     if (event.ev === 'gone') {
       const ids = Array.isArray(event.ids)
         ? event.ids.filter((id): id is string => typeof id === 'string') : [];
+      if (view.confirm && (ids.includes(activeSurfaceId)
+          || ids.includes(operatorConfirmNodeId(view.confirm)))) {
+        view.confirm = undefined;
+        view.confirmSelected = undefined;
+      }
       if (ids.includes(activeSurfaceId)) {
         open = false;
         if (++recoveries > 3) return close(1);
@@ -505,24 +532,21 @@ async function main(): Promise<void> {
     }
     if (event.ev === 'select' || event.ev === 'activate') {
       if (typeof event.item !== 'string') return;
+      if (receiveNativeConfirmation(event) || view.confirm) return;
       const activate = event.ev === 'activate';
-      if (event.id === 'operator.confirm') selectConfirmation(event.item, activate);
-      else if (!view.confirm && event.id === 'operator.tasks') {
+      if (event.id === 'operator.tasks') {
         selectTask(event.item);
         if (activate) openRuns();
-      } else if (!view.confirm && event.id === 'operator.runs') {
+      } else if (event.id === 'operator.runs') {
         selectExecution(event.item);
       }
       return;
     }
     if (event.ev !== 'action' || typeof event.act !== 'string') return;
-    if (event.id === 'operator.confirm') {
-      if (event.act === 'cancel' || event.act === 'close') selectConfirmation('cancel', true);
-      else if (event.act === 'confirm') selectConfirmation('confirm', true);
-      return;
-    }
-    if (view.confirm) return;
-    if (event.act === 'refresh') void refresh();
+    if (receiveNativeConfirmation(event) || view.confirm) return;
+    if (event.act === 'refresh'
+        && (event.id === 'operator.status.refresh'
+          || event.id === 'operator.tasks' || event.id === 'operator.runs')) void refresh();
     else if (event.id === 'operator.tasks') {
       if (event.act === 'open') openRuns();
       else if (event.act === 'start') requestConfirmation('run');

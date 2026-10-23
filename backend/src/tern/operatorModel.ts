@@ -60,7 +60,12 @@ export interface OperatorExecution {
 export interface OperatorConfirm {
   kind: 'run' | 'stop';
   taskId: string;
+  taskName: string;
   executionId?: string;
+  /** Monotonic, process-local native picker generation. Never reuse on reopen. */
+  generation: number;
+  /** Native surface epoch on which the confirmation was opened. */
+  surfaceId: string;
 }
 
 export interface OperatorView {
@@ -75,6 +80,8 @@ export interface OperatorView {
   busy?: boolean;
   notice?: string;
   lastUpdated?: string;
+  /** Optional trusted portal origin; never an API JWT or artifact URL. */
+  portalBaseUrl?: string;
 }
 
 /**
@@ -130,14 +137,60 @@ export function elapsedExecution(execution: OperatorExecution, asOf?: string): s
     : remainder + 's';
 }
 
-/** Never propagate query-string credentials or a URL with user info to TSP. */
-export function safeArtifactUrl(value: unknown): string | undefined {
-  if (typeof value !== 'string' || value.length > 2048) return undefined;
+/**
+ * agent-engine/task_utils.py uploads files to
+ * task_results/<executionId>/<20-character random_token>/<filename> and
+ * persists the same random_token as result_files[].token. That path grants
+ * possession-based access even without query parameters.
+ */
+export function isTaskResultCapabilityPath(pathname: string): boolean {
+  let path = pathname;
+  for (let depth = 0; depth < 3; depth++) {
+    if (/(?:^|\/)task_results\/[^/]+\/[^/]+(?:\/|$)/i.test(path)) return true;
+    try {
+      const decoded = decodeURIComponent(path);
+      if (decoded === path) return false;
+      path = decoded;
+    } catch {
+      return true; // Ambiguous percent encoding: fail closed.
+    }
+  }
+  return /(?:^|\/)task_results\/[^/]+\/[^/]+(?:\/|$)/i.test(path);
+}
+
+/** Never expose file bearer tokens, including path-embedded S3 capabilities. */
+export function safeArtifactUrl(value: unknown, fileToken?: unknown): string | undefined {
+  if (typeof fileToken === 'string' && fileToken.length > 0) return undefined;
+  if (typeof value !== 'string' || !value || value.length > 2048 || /\s/.test(value)) return undefined;
   try {
     const url = new URL(value);
-    if (!['https:', 'http:'].includes(url.protocol)) return undefined;
-    if (url.username || url.password || url.search || url.hash) return undefined;
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') return undefined;
+    if (url.username || url.password || url.search || url.hash
+        || isTaskResultCapabilityPath(url.pathname)) return undefined;
     return url.toString();
+  } catch {
+    return undefined;
+  }
+}
+
+/** Existing authenticated Partner Portal execution route (App.tsx). No bearer data. */
+export function operatorPortalPath(taskId: string, executionId: string): string | undefined {
+  if (![taskId, executionId].every(id =>
+      typeof id === 'string' && id.length > 0 && id.length <= 256
+      && !/[\x00-\x1f\x7f]/.test(id))) return undefined;
+  return '/tasks/' + encodeURIComponent(taskId) + '/executions/' + encodeURIComponent(executionId);
+}
+
+/** Only a user-configured, credential-free portal origin may become a native open action. */
+export function safeOperatorPortalUrl(base: unknown, taskId: string, executionId: string): string | undefined {
+  const path = operatorPortalPath(taskId, executionId);
+  if (typeof base !== 'string' || !path || base.length > 2048 || /\s/.test(base)) return undefined;
+  try {
+    const origin = new URL(base);
+    if ((origin.protocol !== 'http:' && origin.protocol !== 'https:')
+      || origin.username || origin.password || origin.search || origin.hash
+      || origin.pathname !== '/') return undefined;
+    return new URL(path, origin.origin).toString();
   } catch {
     return undefined;
   }
@@ -184,8 +237,12 @@ export function displayExecution(execution: OperatorExecution, asOf?: string): R
     activityUnavailable: execution.activityUnavailable === true,
     artifacts: (Array.isArray(execution.result_files) ? execution.result_files : []).slice(0, 20).map(file => ({
       filename: safeText(file.filename, 120),
-      url: safeArtifactUrl(file.url) ?? null,
+      url: safeArtifactUrl(file.url, file.token) ?? null,
     })),
+    ...((Array.isArray(execution.result_files) ? execution.result_files : []).slice(0, 20)
+      .some(file => !safeArtifactUrl(file.url, file.token))
+      ? { privateArtifactPortal: operatorPortalPath(execution.taskId, execution.executionId) ?? null }
+      : {}),
   };
 }
 
@@ -218,4 +275,44 @@ export function confirmationMatches(view: OperatorView, confirm: OperatorConfirm
     && view.detail?.executionId === confirm.executionId
     && view.detail?.taskId === confirm.taskId
     && view.detail.status.toLowerCase() === 'running';
+}
+
+
+/** Picker identity is scoped to an open, not merely to the selected task. */
+export function operatorConfirmNodeId(confirm: OperatorConfirm): string {
+  return 'operator.confirm.' + confirm.generation;
+}
+
+export type NativeConfirmationDecision = 'ignored' | 'selected' | 'cancel' | 'submit';
+
+/**
+ * Pure native-event gate shared by the CLI and regression harness.
+ * A delayed select/activate/action for a deleted picker cannot act on the
+ * next picker, even if the newer picker selects the same task or run.
+ */
+export function applyNativeConfirmationEvent(
+  view: OperatorView,
+  event: { id?: unknown; sf?: unknown; ev?: unknown; item?: unknown; act?: unknown },
+  activeSurfaceId: string,
+): NativeConfirmationDecision {
+  const confirm = view.confirm;
+  if (!confirm || view.busy || confirm.surfaceId !== activeSurfaceId
+    || event.id !== operatorConfirmNodeId(confirm)
+    || (event.sf !== undefined && event.sf !== activeSurfaceId)
+    || !confirmationMatches(view, confirm)) return 'ignored';
+
+  if (event.ev === 'select' || event.ev === 'activate') {
+    if (event.item !== 'cancel' && event.item !== 'confirm') return 'ignored';
+    view.confirmSelected = event.item;
+    if (event.ev === 'select') return 'selected';
+    return event.item === 'confirm' ? 'submit' : 'cancel';
+  }
+  if (event.ev === 'action') {
+    if (event.act === 'cancel' || event.act === 'close') return 'cancel';
+    if (event.act === 'confirm') {
+      view.confirmSelected = 'confirm';
+      return 'submit';
+    }
+  }
+  return 'ignored';
 }

@@ -5,6 +5,7 @@
  * credential-bearing data does not belong in a native surface.
  */
 import type { TspNode } from './renderEmma';
+import { isTaskResultCapabilityPath } from './operatorModel';
 
 const URL_KEY = /^(href|url|uri|src|imageurl|previewurl|customerportalurl)$/i;
 const URL_TEXT = /https?:\/\/[^\s<>"'\])]+/gi;
@@ -23,7 +24,8 @@ export function safeEmmaUrl(value: unknown): string | undefined {
   try {
     const parsed = new URL(value);
     if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return undefined;
-    if (parsed.username || parsed.password || parsed.hash) return undefined;
+    if (parsed.username || parsed.password || parsed.hash
+      || isTaskResultCapabilityPath(parsed.pathname)) return undefined;
     let credentialParameter = false;
     parsed.searchParams.forEach((_value, key) => {
       const normalized = key.replace(/[^a-z0-9]/gi, '').toLowerCase();

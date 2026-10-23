@@ -49,10 +49,29 @@ endpoints, whose authorization checks stay authoritative.
 - No extra browser logging, persisted operator state or execution policy is
   introduced. When the engine has not published a log yet, the timeline is
   empty rather than invented; failures to read activity are shown explicitly.
-- Artifact URLs with query strings/fragments/embedded credentials are not
-  sent across TSP. Browser log signed URLs and file access tokens remain
-  withheld. Free-form result/error text is bounded and redacted on a best-effort
-  basis; do not treat the terminal surface as a secrets vault.
+- Engine-uploaded artifacts use a path bearer: `agent-engine/task_utils.py`
+  creates `task_results/<execution>/<random_token>/<filename>` and stores the
+  identical bearer in `result_files[].token`. Both TSP and read-only JSON
+  withhold these full URLs, even when they have no query string or when the
+  token field was omitted; ordinary credential-free public HTTP(S) URLs remain
+  clickable.
+- Private artifacts retain a credential-free authenticated Partner Portal
+  reference to the existing `/tasks/:taskId/executions/:executionId` route
+  (`partner-portal/src/App.tsx`). Setting `AGENTWEB_PORTAL_URL` to the
+  trusted portal **origin** enables native open/copy on that route. When unset,
+  Tern shows the relative portal path for manual navigation. This does not
+  create a new authorization policy or a TSP bearer proxy; the portal enforces
+  its existing login/access gates.
+- Each native Run/Stop confirmation has a new monotonic picker ID and captures
+  task ID/name, execution ID (for Stop), action and surface epoch. Delayed
+  select/activate/action events from an earlier picker or recovered surface are
+  ignored, and native cancellation/eviction clears the pending intent. The
+  current picker begins at Cancel; one confirmed current-generation intent
+  yields at most one backend mutation.
+- Browser log signed URLs and file access tokens remain withheld. Free-form
+  result/error text is bounded and redacted on a best-effort basis; do not treat
+  the terminal surface as a secrets vault. Emma's independent native URL
+  guard also rejects the same engine path-capability shape.
 
 ## Launch
 
@@ -64,6 +83,8 @@ From backend/ **inside a Tern pane**:
 ~~~sh
 export AGENTWEB_TOKEN="<customer JWT>"
 export AGENTWEB_API_URL="http://localhost:3001"
+# Optional, for native Open on private artifact portal references:
+export AGENTWEB_PORTAL_URL="http://localhost:3000"
 
 npm run tern:emma
 npm run tern:operator
@@ -74,8 +95,10 @@ npm run tern:operator -- --task "<task id>" --execution "<execution id>"
 Native operator controls: task selection + **Enter** to inspect; **s** requests
 a task run; **x** requests stop for the selected currently running execution;
 **r** refreshes; **Esc** returns to tasks/exits; **q** exits. Every Run/Stop opens
-a modal whose initial selection is **Cancel**. Move to Confirm, then explicitly
-activate it; no action is retried after ambiguous network failures. Any server
+a modal whose initial selection is **Cancel** and whose title/subtitle name
+the exact captured task/execution. Move to Confirm, then explicitly activate
+it; delayed events from a closed or older native picker cannot confirm a newer
+one. No action is retried after ambiguous network failures. Any server
 refusal is surfaced as a generic HTTP status rather than reflecting private
 response bodies into Tern.
 
@@ -115,8 +138,13 @@ inspect plans and AgentRuns; run the operator with a task whose execution
 transitions running → completed and another running → failed, including
 runs with no userInteractions; confirm S3-backed browser events and stable keyed
 row patches, elapsed times, status,
-artifacts, no sensitive URLs or headers in captured frames; disconnect/reopen
-the Tern window; verify confirmations and that only one POST/PUT occurs. Test
+artifacts, no sensitive URLs or headers in captured frames; verify an engine
+`task_results/<execution>/<token>/<filename>` fixture does not expose the
+matching `result_files[].token` in JSON, native nodes or wire frames; follow
+the authenticated portal reference. Open A confirmation, close it, open B,
+then deliver A's delayed select/activate/confirm actions and verify B remains
+Cancel with zero mutations. Confirm current-generation B once and verify
+exactly one POST/PUT; disconnect/reopen the Tern window. Test
 permission denial, stale/completed stop, and failed HTTP calls. Do not merge
 without real host/backend evidence.
 

@@ -472,13 +472,16 @@ describe('Tern Emma renderer', () => {
     const signedUrl = 'https://preview.example/app?X-Amz-Signature=' + signedToken;
     const userinfoUrl = 'https://test:' + userPassword + '@preview.example/app';
     const safeUrl = 'https://preview.example/app?page=2';
+    const capabilityToken = 'm0n1p2q3r4s5t6u7v8w9';
+    const capabilityUrl = 'https://bucket.s3.amazonaws.com/task_results/run-1/'
+      + capabilityToken + '/report.html';
 
     const session = {
       sessionId: 'secure',
       title: 'Normal conversation',
       messages: [{
         role: 'assistant',
-        content: 'The request failed; retry is possible.',
+        content: 'The request failed; retry is possible. Artifact: ' + capabilityUrl,
         metadata: {
           toolCalls: [
             {
@@ -529,6 +532,19 @@ describe('Tern Emma renderer', () => {
               id: 'safe-preview',
               name: 'coding_agent',
               result: { success: true, previewUrl: safeUrl, branch: 'main' },
+            },
+            {
+              id: 'engine-result',
+              name: 'fetch_resource',
+              result: {
+                success: false, error: 'Artifact unavailable; use the portal',
+                result_files: [{ url: capabilityUrl, filename: 'report.html', token: capabilityToken }],
+              },
+            },
+            {
+              id: 'path-capability-preview',
+              name: 'coding_agent',
+              result: { success: true, previewUrl: capabilityUrl },
             },
           ],
         },
@@ -610,7 +626,7 @@ describe('Tern Emma renderer', () => {
         ops: reconciler.diff(roots),
       });
     }).join('');
-    for (const secret of [authorization, accessToken, signedToken, userPassword]) {
+    for (const secret of [authorization, accessToken, signedToken, userPassword, capabilityToken]) {
       expect(serialized).not.toContain(secret);
     }
     expect(serialized).toContain('Request failed after two retries');
@@ -618,6 +634,8 @@ describe('Tern Emma renderer', () => {
     expect(serialized).toContain(safeUrl);
     expect(serialized).not.toContain(userinfoUrl);
     expect(serialized).not.toContain(signedUrl);
+    expect(serialized).not.toContain(capabilityUrl);
+    expect(serialized).not.toContain('bucket.s3.amazonaws.com/task_results');
   });
 
 });

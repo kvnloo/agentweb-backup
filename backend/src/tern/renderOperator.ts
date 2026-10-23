@@ -1,7 +1,8 @@
 import type { TspNode } from './renderEmma';
 import {
   OperatorExecution, OperatorTask, OperatorView,
-  elapsedExecution, safeArtifactUrl, safeText,
+  elapsedExecution, operatorConfirmNodeId, operatorPortalPath,
+  safeArtifactUrl, safeOperatorPortalUrl, safeText,
 } from './operatorModel';
 
 function runTone(status: string): string {
@@ -41,7 +42,7 @@ function executionItem(run: OperatorExecution): Record<string, unknown> {
   };
 }
 
-function detailNode(execution: OperatorExecution, asOf?: string): TspNode {
+function detailNode(execution: OperatorExecution, asOf?: string, portalBaseUrl?: string): TspNode {
   const result = safeText(execution.result, 1800);
   const error = safeText(execution.error, 1000);
   const children: TspNode[] = [{
@@ -83,12 +84,12 @@ function detailNode(execution: OperatorExecution, asOf?: string): TspNode {
       k: 'section',
       p: { head: 'Artifacts' },
       c: files.map((file, index): TspNode => {
-        const href = safeArtifactUrl(file.url);
+        const href = safeArtifactUrl(file.url, file.token);
         return {
           id: 'operator.run.artifact.' + index,
           k: 'text',
           p: {
-            text: safeText(file.filename, 120) + (href ? '' : ' (private link withheld)'),
+            text: safeText(file.filename, 120) + (href ? '' : ' (open in authenticated AgentWeb portal)'),
             ...(href ? {
               href,
               spans: [{ t: safeText(file.filename, 120), s: 'link', href }],
@@ -98,6 +99,24 @@ function detailNode(execution: OperatorExecution, asOf?: string): TspNode {
         };
       }),
     });
+    if (files.some(file => !safeArtifactUrl(file.url, file.token))) {
+      const portalPath = operatorPortalPath(execution.taskId, execution.executionId);
+      const portalHref = safeOperatorPortalUrl(portalBaseUrl, execution.taskId, execution.executionId);
+      if (portalPath) {
+        children.push({
+          id: 'operator.run.private-artifact-portal',
+          k: 'text',
+          p: {
+            text: 'Private artifacts: open authenticated AgentWeb Execution Details at ' + portalPath,
+            ...(portalHref ? {
+              href: portalHref,
+              spans: [{ t: 'Open in AgentWeb', s: 'link', href: portalHref }],
+              actions: { click: 'open', menu: ['open', 'copy'] },
+            } : {}),
+          },
+        });
+      }
+    }
   }
 
   const events = Array.isArray(execution.activity) ? execution.activity.slice(-40) : [];
@@ -225,7 +244,7 @@ export function renderOperator(view: OperatorView): TspNode[] {
       state: view.busy ? 'loading' : 'ready',
     },
     c: isRuns
-      ? current ? [detailNode(current, view.lastUpdated)] : []
+      ? current ? [detailNode(current, view.lastUpdated, view.portalBaseUrl)] : []
       : currentTask ? [{
           id: 'operator.task.preview',
           k: 'kv',
@@ -278,11 +297,16 @@ export function renderOperator(view: OperatorView): TspNode[] {
     id: 'layer',
     k: 'col',
     c: confirm ? [{
-      id: 'operator.confirm',
+      id: operatorConfirmNodeId(confirm),
       k: 'picker',
       p: {
-        title: confirm.kind === 'stop' ? 'Stop this running execution?' : 'Start a new execution?',
-        subtitle: 'AgentWeb will enforce current ownership and execution policy.',
+        title: confirm.kind === 'stop'
+          ? 'Stop execution ' + safeText(confirm.executionId, 65) + '?'
+          : 'Run task ' + (safeText(confirm.taskName, 80) || safeText(confirm.taskId, 65)) + '?',
+        subtitle: 'Task: ' + (safeText(confirm.taskName, 80) || safeText(confirm.taskId, 65))
+          + ' (' + safeText(confirm.taskId, 65) + ')'
+          + (confirm.executionId ? ' · Execution: ' + safeText(confirm.executionId, 65) : '')
+          + ' · AgentWeb enforces ownership and execution policy.',
         noun: 'choices',
         size: 'md',
         layout: 'list',
