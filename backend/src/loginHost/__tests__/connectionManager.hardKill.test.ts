@@ -32,6 +32,16 @@ describe("K: hard vs graceful per reason", () => {
     expect(rig.fs.killedHard).toEqual([]);
   });
 
+  it("an alarm whose kills FAIL still reaches the consumer as an alarm event (then the failure)", async () => {
+    rig = makeRig();
+    await signIn(rig, "conn1", 1);
+    rig.script.turnEvents = [{ type: "alarm", hazard: { kind: "hook_event" } }, { type: "result", ok: true, text: "x" }];
+    rig.fs.failKills = 2; // the hard kill and the final kill both fail
+    const events = await drain((await rig.mgr.runTurn(turnReq("conn1", 1))).events!);
+    expect(events.some((e) => e.type === "alarm")).toBe(true);
+    expect(rig.mgr.status({ connectionId: "conn1" })).toMatchObject({ state: "needs_attention" });
+  });
+
   it("revoke: the hard kill happens BEFORE the sessions are closed", async () => {
     rig = makeRig();
     await signIn(rig, "c1", 1);

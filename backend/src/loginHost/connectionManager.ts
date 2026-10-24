@@ -557,9 +557,16 @@ export class ConnectionManager {
         if (running.aborted) break;
         if (ev.type === "alarm") {
           // Defense in depth: an epoch change always aborts the turn first (checked above), so a stale alarm should not get here.
-          await this.locked(c.connectionId, async () => (c.epoch === running.epoch ? this.raiseAlarm(c, ev.hazard) : undefined));
+          // The alarm event must reach the consumer even when the kills inside raiseAlarm fail: it is reported first, the failure after.
+          let alarmFailure: unknown;
+          try {
+            await this.locked(c.connectionId, async () => (c.epoch === running.epoch ? this.raiseAlarm(c, ev.hazard) : undefined));
+          } catch (err) {
+            alarmFailure = err;
+          }
           running.aborted ??= "alarm";
           yield ev;
+          if (alarmFailure !== undefined) throw alarmFailure;
           break;
         }
         // A finished-with-auth_dead turn means the login is dead (the adapter confirms with the CLI's own status first). Fenced like preflight.
