@@ -321,6 +321,85 @@ describe('generateMarketingResponse turn preamble — golden (ENG-2113 PR C0)', 
     writeFileSync(GOLDEN_PATH, JSON.stringify(recorded, null, 2) + '\n');
   });
 
+  // The values the loop reads AFTER the first model call (admin gate for the model picker, the correction stamp on the reply,
+  // the work-plan snapshot, the entitlement list) never show in the first call, so pin what prepareTurnContext hands back.
+  describe('returned context', () => {
+    const prepare = async (f: Fixture, over: Record<string, any> = {}) => {
+      setup(f);
+      const svc = new AgentModeService();
+      return (svc as any).prepareTurnContext({
+        messageContent: f.message,
+        sessionHistory: f.history,
+        userId: 'golden-user',
+        llmModel: svc.default_model,
+        sessionId: 'golden',
+        isInteractiveShare: false,
+        isDelegatedAccess: false,
+        ...over,
+      });
+    };
+    const admin = FIXTURES.find((f) => f.name.startsWith('admin user'))!;
+
+    it('admin owner: admin flags, entitlement, skills and a fresh work-plan snapshot', async () => {
+      const ctx = await prepare(admin);
+      expect(ctx.isAdmin).toBe(true);
+      expect(ctx.hasAdminAccess).toBe(true);
+      expect(ctx.billingUserId).toBe('golden-user');
+      expect(ctx.userAllowedSkillIds).toEqual(['s1', 's2']);
+      expect(ctx.userAllowedSkillIdsForDisplay).toEqual(['s1', 's2']);
+      expect(ctx.publishedSkills).toHaveLength(2);
+      expect(ctx.sessionAssociatedSkillIds).toEqual(['s1']);
+      expect(ctx.liveInstalledSkillIds).toEqual(['s1']);
+      expect(ctx.isLegacySession).toBe(false);
+      expect(ctx.isScheduledSession).toBe(false);
+      expect(ctx.loopBreakerActive).toBe(false);
+      expect(ctx.humanPacedTurn).toBe(false);
+      expect(ctx.currentSession.sessionId).toBe('golden');
+      expect(ctx.allowedToolNames).toBeInstanceOf(Set);
+      expect(ctx.workPlanTurnBefore).toBeDefined();
+      expect(ctx.messages[0].role).toBe('system');
+      expect(ctx.messages[0].content).toContain('Current date: 2026-10-25');
+    });
+
+    it('non-admin owner, legacy session, unresolved entitlement fails closed', async () => {
+      const ctx = await prepare({ ...FIXTURES[0], allowedSkills: null });
+      expect(ctx.isAdmin).toBe(false);
+      expect(ctx.hasAdminAccess).toBe(false);
+      expect(ctx.isLegacySession).toBe(true);
+      expect(ctx.userAllowedSkillIds).toBeNull();
+      expect(ctx.userAllowedSkillIdsForDisplay).toEqual([]);
+    });
+
+    it('delegated access grants admin tools without making the owner an admin; a share never does', async () => {
+      const delegated = await prepare(FIXTURES[0], { isDelegatedAccess: true });
+      expect(delegated.isAdmin).toBe(false);
+      expect(delegated.hasAdminAccess).toBe(true);
+      const share = await prepare(admin, { isInteractiveShare: true });
+      expect(share.isAdmin).toBe(true);
+      expect(share.hasAdminAccess).toBe(false);
+    });
+
+    it('the correction stamp is read from the session decision for THIS turn only', async () => {
+      const svc = new AgentModeService();
+      const decision = { requestedModel: 'x', effectiveModel: svc.default_model, reason: 'r' };
+      const ctx = await prepare({ ...FIXTURES[0], session: { ...(FIXTURES[0].session as any), llmUsagePolicyDecision: decision } });
+      const { resolveTurnModelCorrection } = require('../utils/modelCorrectionStamp');
+      expect(ctx.turnModelCorrection).toEqual(resolveTurnModelCorrection(decision, svc.default_model));
+    });
+
+    it('scheduled session: flag set, anti-loop never fires', async () => {
+      const sched = FIXTURES.find((f) => f.name === 'scheduled session reopened attended')!;
+      const ctx = await prepare(sched);
+      expect(ctx.isScheduledSession).toBe(true);
+      expect(ctx.loopBreakerActive).toBe(false);
+    });
+
+    it('long pause in history marks the turn human-paced', async () => {
+      const ctx = await prepare(FIXTURES.find((f) => f.name.startsWith('slow human pace'))!);
+      expect(ctx.humanPacedTurn).toBe(true);
+    });
+  });
+
   it('every fixture is recorded and nothing stale is left in the golden file', () => {
     if (process.env.UPDATE_GOLDEN) return;
     expect(Object.keys(golden).sort()).toEqual(FIXTURES.map((f) => f.name).sort());
