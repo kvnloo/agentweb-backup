@@ -26,6 +26,20 @@ describe('selectEngagementExitTrigger (ENG-2548)', () => {
     expect(selectEngagementExitTrigger([e], ENROLLED, ['clicked']).trigger).toBeNull();
   });
 
+  it('Gmail GoogleImageProxy click is a scanner and does not exit (ENG-325)', () => {
+    const e = ev('email.clicked', '2026-10-02T10:01:30Z', { click: { userAgent: 'GoogleImageProxy', link: 'https://a' } });
+    const r = selectEngagementExitTrigger([e], ENROLLED, ['clicked']);
+    expect(r.trigger).toBeNull();
+    expect(r.suppressed).toEqual([{ event: e, reason: 'scanner_user_agent' }]);
+  });
+
+  it('parses Resend "+00" send times so machine opens are still classified (ENG-325)', () => {
+    const apple = { eventType: 'email.opened', createdAt: '2026-10-24T08:00:00.123Z', data: { created_at: '2026-10-24 07:59:00.123456+00', open: { userAgent: 'AppleMailProxy/1.0' } } };
+    const gmailFast = { eventType: 'email.opened', createdAt: '2026-10-24T08:22:00.000Z', data: { created_at: '2026-10-24 08:21:58.000456+00', open: { userAgent: 'GoogleImageProxy' } } };
+    expect(selectEngagementExitTrigger([apple], ENROLLED, ['opened']).suppressed[0]?.reason).toBe('proxy_open');
+    expect(selectEngagementExitTrigger([gmailFast], ENROLLED, ['opened']).suppressed[0]?.reason).toBe('too_fast');
+  });
+
   it('Gmail GoogleImageProxy open is a human open and exits (ENG-325)', () => {
     const e = ev('email.opened', '2026-10-02T11:00:00Z', { open: { userAgent: 'Mozilla/5.0 via ggpht.com GoogleImageProxy' } });
     const r = selectEngagementExitTrigger([e], ENROLLED, ['opened']);

@@ -59,6 +59,12 @@ export const IMAGE_PROXY_USER_AGENT_PATTERNS: readonly RegExp[] = [
 ];
 
 /** Link scanners / security gateways / preview fetchers. */
+/**
+ * ENG-325: Gmail's image proxy is human for opens, but a *click* carrying the
+ * image-proxy UA is an automated fetch, never a recipient's click.
+ */
+export const CLICK_ONLY_SCANNER_USER_AGENT_PATTERNS: readonly RegExp[] = [/GoogleImageProxy/i, /ggpht\.com/i];
+
 export const SCANNER_USER_AGENT_PATTERNS: readonly RegExp[] = [
   ...IMAGE_PROXY_USER_AGENT_PATTERNS,
   /SafeLinks/i,
@@ -101,7 +107,10 @@ export function classifyEngagementEvent(
   if (input.type === 'open' && matchesAny(input.userAgent, IMAGE_PROXY_USER_AGENT_PATTERNS)) {
     return { human: false, reason: 'proxy_open' };
   }
-  if (matchesAny(input.userAgent, SCANNER_USER_AGENT_PATTERNS)) {
+  if (
+    matchesAny(input.userAgent, SCANNER_USER_AGENT_PATTERNS) ||
+    (input.type === 'click' && matchesAny(input.userAgent, CLICK_ONLY_SCANNER_USER_AGENT_PATTERNS))
+  ) {
     return { human: false, reason: 'scanner_user_agent' };
   }
   if (at - sent < opts.tooFastWindowMs) {

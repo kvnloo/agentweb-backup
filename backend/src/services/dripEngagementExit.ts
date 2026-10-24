@@ -24,7 +24,11 @@ export interface EngagementExitDecision {
 
 function parseSentAt(e: any): number {
   const raw = e?.data?.created_at;
-  return raw ? new Date(String(raw).replace(' ', 'T')).getTime() : NaN;
+  if (!raw) return NaN;
+  // Resend stores e.g. "2026-10-24 07:59:00.123456+00": swap the space for
+  // "T" and widen a bare "+HH"/"-HH" offset to "+HH:00" so Date can parse it.
+  const iso = String(raw).trim().replace(' ', 'T').replace(/([+-]\d{2})$/, '$1:00');
+  return new Date(iso).getTime();
 }
 
 function toEngagement(e: any): EngagementEvent | null {
