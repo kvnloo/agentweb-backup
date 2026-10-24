@@ -26,6 +26,19 @@ describe("cleanup targets the right uid", () => {
   let rig: Rig;
   afterEach(() => rig?.cleanup());
 
+  it("revoke kills HARD (the home is wiped right after; nothing may run on), disable keeps the login and so stops gracefully", async () => {
+    rig = makeRig({});
+    await signIn(rig, "c1", 1);
+    await signIn(rig, "c2", 1);
+    const u1 = rig.store.get().connections.c1.uid;
+    const u2 = rig.store.get().connections.c2.uid;
+    await rig.mgr.disable({ connectionId: "c2", epoch: 2 });
+    expect(rig.fs.killed).toContain(u2);
+    expect(rig.fs.killedHard).not.toContain(u2); // a disabled connection can be enabled again: its login must survive the stop
+    await rig.mgr.revoke({ connectionId: "c1", epoch: 2 });
+    expect(rig.fs.killedHard).toContain(u1);
+  });
+
   it("a hung turn after a revoke never calls killAll with an out-of-range uid (-1 would mean every process)", async () => {
     rig = makeRig({ config: { abortGraceMs: 30 } });
     await signIn(rig, "c1", 1);

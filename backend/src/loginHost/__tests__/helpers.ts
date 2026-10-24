@@ -29,6 +29,8 @@ export class CounterIds implements IdGen {
 export class FakeFs implements UserFsPort {
   dirs = new Set<string>();
   killed: number[] = [];
+  /** The uids killAll was asked to kill HARD (no grace). */
+  killedHard: number[] = [];
   wipes: string[] = [];
   residue = new Map<number, number>();
   failWipes = false;
@@ -97,7 +99,8 @@ export class FakeFs implements UserFsPort {
     this.log.push(`wipe:home:${uid}`);
     this.onWipe?.();
   }
-  async killAll(uid: number): Promise<void> {
+  async killAll(uid: number, opts?: { hard?: boolean }): Promise<void> {
+    if (opts?.hard) this.killedHard.push(uid);
     if (this.killGate) await this.killGate;
     if (this.failKillOnce) {
       this.failKillOnce = false;

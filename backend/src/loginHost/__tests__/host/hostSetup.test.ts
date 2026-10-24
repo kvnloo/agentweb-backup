@@ -6,7 +6,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { verifyBinary, assertTrustedPath } from "../../host/binary";
 import { assertNoSubuidOverlap, HostConfigError, parseHostConfig } from "../../host/hostConfig";
-import { assertKeyFileMode, reportTlsCertExpiry } from "../../host/main";
+import { assertKeyFileMode, portConfigFor, reportTlsCertExpiry } from "../../host/main";
 import { registerRange } from "../../host/ranges";
 import { assertHomesMount, assertRoot, parseMounts } from "../../host/startupChecks";
 
@@ -27,6 +27,19 @@ const base = () => ({
   claude: { binaryPath: "/opt/aw-claude/2.1.294/claude", expectedSha256: "a".repeat(64), version: "2.1.294", systemPromptFile: "/opt/aw-login-host/system-prompt.txt", bridgeUrl: "http://127.0.0.1:3001/internal/tool-bridge/run/mcp" },
 });
 const bad = (over: Record<string, unknown>) => () => parseHostConfig({ ...base(), ...over });
+
+describe("stopGraceSec (graceful customer-unit stop)", () => {
+  it("accepts 2..12 and rejects everything else at LOAD time (not only when the first unit starts)", () => {
+    for (const stopGraceSec of [2, 10, 12]) expect(parseHostConfig({ ...base(), limits: { stopGraceSec } }).limits.stopGraceSec).toBe(stopGraceSec);
+    for (const stopGraceSec of [0, 1, 13, 121, 1.5, "10", -1]) expect(bad({ limits: { stopGraceSec } })).toThrow(HostConfigError);
+  });
+  it("the kill budget covers the grace (a normal graceful stop must not read as a stuck unit)", () => {
+    const cfg = parseHostConfig({ ...base(), limits: { stopGraceSec: 12 } });
+    expect(portConfigFor(cfg).killTimeoutMs).toBe(15_000 + 12_000);
+    expect(portConfigFor(parseHostConfig(base())).killTimeoutMs).toBe(25_000);
+    expect(portConfigFor(cfg).commandTimeoutMs).toBeGreaterThanOrEqual(2 * 12_000); // one `systemctl stop` may block for the SIGTERM phase and again for the final SIGKILL phase
+  });
+});
 
 describe("host config (a CLOSED schema)", () => {
   it("accepts a minimal config and fills the documented defaults", () => {

@@ -232,10 +232,10 @@ export class ConnectionManager {
 
   /** Kill every process of a uid, but never with a value outside the reserved range (-1 would mean "everything" to kill(2)). */
   /** `onRaw` receives the port's own promise, so a caller can keep a guard until the REAL kill settles (the bounded wait may give up first). */
-  private async safeKill(uid: number, onRaw?: (raw: Promise<void>) => void): Promise<boolean> {
+  private async safeKill(uid: number, onRaw?: (raw: Promise<void>) => void, hard = false): Promise<boolean> {
     if (!Number.isInteger(uid) || uid < this.cfg.uidMin || uid > this.cfg.uidMax) return false;
     await this.f("killAll", () => {
-      const raw = (async () => this.deps.fs.killAll(uid))(); // starts synchronously (as before), and a synchronous throw becomes a rejection
+      const raw = (async () => this.deps.fs.killAll(uid, hard ? { hard: true } : undefined))(); // starts synchronously (as before), and a synchronous throw becomes a rejection
       onRaw?.(raw);
       return raw;
     });
@@ -1018,6 +1018,10 @@ export class ConnectionManager {
 
   /** Stops every turn and process of a connection (epoch changed, disabled, revoked, alarm). */
   private async terminateConnection(c: ConnRecord, reason: string): Promise<void> {
+    // Revoke and the hazard alarm kill HARD, first: the home is wiped right after (a graceful stop would protect nothing) and a process
+    // under an alarm must not get a grace period to run on (e.g. exit-time hooks). Disable and a reconnect keep the login, so they stop gracefully.
+    const hard = reason === "revoked" || reason === "alarm";
+    if (hard && c.uid >= 0) await this.safeKill(c.uid, undefined, true);
     for (const t of [...this.turns.values()]) if (t.connectionId === c.connectionId) t.abort(reason);
     const list = this.sessions.get(c.connectionId) ?? [];
     this.sessions.delete(c.connectionId);

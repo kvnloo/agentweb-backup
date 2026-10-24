@@ -74,6 +74,10 @@ export class FakeSystem implements CommandPort, RootFs {
   immortal = new Set<string>();
   /** `systemctl stop <unit>` exits non-zero and does nothing (a stuck unit / bus error): the port must fall back to SIGKILL. */
   stopFails = false;
+  /** `systemctl stop <unit>` exits with this code and does nothing (5 = "unit not loaded": already gone). */
+  stopExitCode?: number;
+  /** `systemctl stop <unit>` takes this long (a graceful stop in progress); the client gives up after its own timeout and the unit stays running. */
+  stopLatencyMs = 0;
   /** A gate the `systemctl stop <slice>` waits for (a slow kill). */
   stopGate?: Promise<void>;
   /** systemd-run client dies at once (as if killed) while the unit keeps running. */
@@ -158,18 +162,18 @@ export class FakeSystem implements CommandPort, RootFs {
   }
 
   // ───────────────────────────── CommandPort ─────────────────────────────
-  async run(file: string, args: string[]): Promise<CommandResult> {
+  async run(file: string, args: string[], opts?: { timeoutMs?: number }): Promise<CommandResult> {
     this.calls.push({ file, args });
     const ok = (stdout = "", code = 0): CommandResult => ({ code, signal: null, stdout, stderr: "", timedOut: false });
     const name = file.split("/").pop();
-    if (name === "systemctl") return this.systemctl(args, ok);
+    if (name === "systemctl") return this.systemctl(args, ok, opts?.timeoutMs);
     if (name === "setquota") return this.failSetquota ? ok("", 1) : ok();
     if (name === "rm") return this.rm(args, ok);
     if (name === "find") return this.find(args, ok);
     return ok("", 127);
   }
 
-  private async systemctl(args: string[], ok: (o?: string, c?: number) => CommandResult): Promise<CommandResult> {
+  private async systemctl(args: string[], ok: (o?: string, c?: number) => CommandResult, timeoutMs?: number): Promise<CommandResult> {
     const [sub, ...rest] = args;
     if (sub === "list-units") {
       if (this.failList) return ok("", 1);
@@ -196,6 +200,14 @@ export class FakeSystem implements CommandPort, RootFs {
       return ok();
     }
     if (sub === "stop" && this.stopFails && !rest[0].endsWith(".slice")) return ok("", 1);
+    if (sub === "stop" && this.stopExitCode !== undefined && !rest[0].endsWith(".slice")) return ok("", this.stopExitCode);
+    if (sub === "stop" && this.stopLatencyMs > 0 && !rest[0].endsWith(".slice")) {
+      if (timeoutMs !== undefined && this.stopLatencyMs > timeoutMs) {
+        await new Promise((r) => setTimeout(r, timeoutMs));
+        return { code: null, signal: null, stdout: "", stderr: "", timedOut: true }; // the client gave up; the unit is still stopping
+      }
+      await new Promise((r) => setTimeout(r, this.stopLatencyMs));
+    }
     if ((sub === "stop" || sub === "kill") && rest.length) {
       const unit = rest[rest.length - 1];
       const u = this.units.get(unit);

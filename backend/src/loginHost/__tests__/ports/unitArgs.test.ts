@@ -139,8 +139,10 @@ describe("unit properties: the sandbox", () => {
     expect(p).not.toContain("KillSignal=SIGKILL");
   });
   it("the grace period is configurable and bounded", () => {
-    expect(unitProperties(layout, spec(), { ...limits, stopGraceSec: 25 }, paths)).toContain("TimeoutStopSec=25s");
-    for (const stopGraceSec of [0, 1, 121, 1.5, NaN, -3]) expect(() => unitProperties(layout, spec(), { ...limits, stopGraceSec }, paths)).toThrow();
+    expect(unitProperties(layout, spec(), { ...limits, stopGraceSec: 12 }, paths)).toContain("TimeoutStopSec=12s");
+    expect(unitProperties(layout, spec(), { ...limits, stopGraceSec: 2 }, paths)).toContain("TimeoutStopSec=2s");
+    // above 12 s a graceful stop no longer fits the host's own stop budget (60 s service stop, 30 s per systemctl call)
+    for (const stopGraceSec of [0, 1, 13, 120, 121, 1.5, NaN, -3]) expect(() => unitProperties(layout, spec(), { ...limits, stopGraceSec }, paths)).toThrow();
   });
   it("rejects a task limit that is not a sane integer", () => {
     for (const tasksMax of [0, -1, 1.5, 1_000_000, NaN]) expect(() => unitProperties(layout, spec(), { ...limits, tasksMax }, paths)).toThrow();
