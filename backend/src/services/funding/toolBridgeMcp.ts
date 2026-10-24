@@ -107,8 +107,8 @@ export class ToolBridgeMcpAdapter {
     return runIds;
   }
 
-  takeLedger(runId: string): { records: BridgeCallRecord[]; truncated: number } {
-    return this.bridge.takeLedger(runId);
+  takeLedger(runId: string, opts?: { clear?: boolean }): { records: BridgeCallRecord[]; truncated: number } {
+    return this.bridge.takeLedger(runId, opts);
   }
 
   takeLedgerByGeneration(generation: string): { records: BridgeCallRecord[]; truncated: number } {

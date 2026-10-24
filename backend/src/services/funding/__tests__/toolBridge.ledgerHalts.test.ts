@@ -730,6 +730,8 @@ describe('ToolBridge ledger, halts, stop and repeat guard', () => {
       void bridge.callTool(t1, { name: 'save_note', args: { id: 'one' } });
       await flush();
       const t2 = bridge.openRun(RUN); // reconnect: same run id, new token
+      // the replaced run left a write with an unknown outcome; a new user turn starts clean, but the old write still holds the slot
+      bridge.beginTurn(RUN.userId, RUN.sessionId);
       const second = bridge.callTool(t2, { name: 'save_note', args: { id: 'two' } });
       await flush();
       expect(order).toEqual(['one']); // the second write waits for the first
