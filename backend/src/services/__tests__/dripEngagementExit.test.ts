@@ -26,15 +26,22 @@ describe('selectEngagementExitTrigger (ENG-2548)', () => {
     expect(selectEngagementExitTrigger([e], ENROLLED, ['clicked']).trigger).toBeNull();
   });
 
-  it('image-proxy open does not exit', () => {
+  it('Gmail GoogleImageProxy open is a human open and exits (ENG-325)', () => {
     const e = ev('email.opened', '2026-10-02T11:00:00Z', { open: { userAgent: 'Mozilla/5.0 via ggpht.com GoogleImageProxy' } });
+    const r = selectEngagementExitTrigger([e], ENROLLED, ['opened']);
+    expect(r.trigger).toBe(e);
+    expect(r.suppressed).toEqual([]);
+  });
+
+  it('Apple MPP proxy open does not exit', () => {
+    const e = ev('email.opened', '2026-10-02T11:00:00Z', { open: { userAgent: 'AppleMailProxy/1.0' } });
     const r = selectEngagementExitTrigger([e], ENROLLED, ['opened']);
     expect(r.trigger).toBeNull();
     expect(r.suppressed[0].reason).toBe('proxy_open');
   });
 
   it('human open after a suppressed proxy open still exits', () => {
-    const proxy = ev('email.opened', '2026-10-02T11:00:00Z', { open: { userAgent: 'GoogleImageProxy' } });
+    const proxy = ev('email.opened', '2026-10-02T11:00:00Z', { open: { userAgent: 'AppleMailProxy/1.0' } });
     const human = ev('email.opened', '2026-10-02T12:00:00Z', { open: { userAgent: HUMAN_UA } });
     const r = selectEngagementExitTrigger([proxy, human], ENROLLED, ['opened']);
     expect(r.trigger).toBe(human);

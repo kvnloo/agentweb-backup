@@ -44,10 +44,16 @@ export interface ClassifyOptions {
   burstWindowMs?: number;
 }
 
-/** Image proxies that prefetch opens (Apple MPP, Gmail). Opens from these never count as human. */
+/**
+ * Image proxies that prefetch opens regardless of a human (Apple MPP). Opens
+ * from these never count as human.
+ *
+ * ENG-325: Gmail's GoogleImageProxy (ggpht.com) is deliberately NOT listed.
+ * Gmail fetches images through its proxy only when the recipient opens the
+ * message, so it is the dominant UA for real human opens. Machine opens via
+ * Gmail are still caught by the too-fast gap rule.
+ */
 export const IMAGE_PROXY_USER_AGENT_PATTERNS: readonly RegExp[] = [
-  /GoogleImageProxy/i,
-  /ggpht\.com/i,
   /Apple\s?Mail\s?Privacy/i,
   /AppleMailProxy/i,
 ];
