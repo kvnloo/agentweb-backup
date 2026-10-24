@@ -96,6 +96,10 @@ describe("unit properties: the sandbox", () => {
       "SystemCallFilter=~io_uring_setup io_uring_enter io_uring_register userfaultfd perf_event_open bpf keyctl add_key request_key",
       "SystemCallErrorNumber=EPERM",
       "RuntimeMaxSec=7200",
+      "KillMode=mixed",
+      "KillSignal=SIGTERM",
+      "TimeoutStopSec=10s",
+      "SendSIGKILL=yes",
       "OOMScoreAdjust=500",
       "InaccessiblePaths=-/run/dbus",
       "InaccessiblePaths=-/run/containerd",
@@ -125,6 +129,20 @@ describe("unit properties: the sandbox", () => {
   it.each([["1"], ["1g"], ["0M"], ["1GB"], ["-1G"], ["abc"], [""]])("rejects limit %j", (memoryMax) => expect(() => unitProperties(layout, spec(), { ...limits, memoryMax }, paths)).toThrow());
   it("rejects a runtime ceiling that is missing, too small, or absurd (a unit must always have an end)", () => {
     for (const runtimeMaxSec of [0, 5, -1, 1.5, 10 * 24 * 3600, NaN, undefined as unknown as number]) expect(() => unitProperties(layout, spec(), { ...limits, runtimeMaxSec }, paths)).toThrow();
+  });
+  it("every customer unit stops GRACEFULLY: SIGTERM to the main process only, SIGKILL after the grace period (a hard kill mid-refresh destroys the login)", () => {
+    const p = props();
+    expect(p).toEqual(expect.arrayContaining(["KillMode=mixed", "KillSignal=SIGTERM", "TimeoutStopSec=10s", "SendSIGKILL=yes"]));
+    expect(p.filter((x) => x.startsWith("KillMode=") || x.startsWith("KillSignal=") || x.startsWith("TimeoutStopSec=") || x.startsWith("SendSIGKILL="))).toHaveLength(4);
+    // mixed, never control-group: SIGTERM must not also stop the egress helper the CLI needs while it finishes writing its login
+    expect(p).not.toContain("KillMode=control-group");
+    expect(p).not.toContain("KillSignal=SIGKILL");
+  });
+  it("the grace period is configurable and bounded", () => {
+    expect(unitProperties(layout, spec(), { ...limits, stopGraceSec: 12 }, paths)).toContain("TimeoutStopSec=12s");
+    expect(unitProperties(layout, spec(), { ...limits, stopGraceSec: 2 }, paths)).toContain("TimeoutStopSec=2s");
+    // above 12 s a graceful stop no longer fits the host's own stop budget (60 s service stop, 30 s per systemctl call)
+    for (const stopGraceSec of [0, 1, 13, 120, 121, 1.5, NaN, -3]) expect(() => unitProperties(layout, spec(), { ...limits, stopGraceSec }, paths)).toThrow();
   });
   it("rejects a task limit that is not a sane integer", () => {
     for (const tasksMax of [0, -1, 1.5, 1_000_000, NaN]) expect(() => unitProperties(layout, spec(), { ...limits, tasksMax }, paths)).toThrow();

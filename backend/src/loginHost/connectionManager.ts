@@ -232,10 +232,10 @@ export class ConnectionManager {
 
   /** Kill every process of a uid, but never with a value outside the reserved range (-1 would mean "everything" to kill(2)). */
   /** `onRaw` receives the port's own promise, so a caller can keep a guard until the REAL kill settles (the bounded wait may give up first). */
-  private async safeKill(uid: number, onRaw?: (raw: Promise<void>) => void): Promise<boolean> {
+  private async safeKill(uid: number, onRaw?: (raw: Promise<void>) => void, hard = false): Promise<boolean> {
     if (!Number.isInteger(uid) || uid < this.cfg.uidMin || uid > this.cfg.uidMax) return false;
     await this.f("killAll", () => {
-      const raw = (async () => this.deps.fs.killAll(uid))(); // starts synchronously (as before), and a synchronous throw becomes a rejection
+      const raw = (async () => this.deps.fs.killAll(uid, hard ? { hard: true } : undefined))(); // starts synchronously (as before), and a synchronous throw becomes a rejection
       onRaw?.(raw);
       return raw;
     });
@@ -557,9 +557,16 @@ export class ConnectionManager {
         if (running.aborted) break;
         if (ev.type === "alarm") {
           // Defense in depth: an epoch change always aborts the turn first (checked above), so a stale alarm should not get here.
-          await this.locked(c.connectionId, async () => (c.epoch === running.epoch ? this.raiseAlarm(c, ev.hazard) : undefined));
+          // The alarm event must reach the consumer even when the kills inside raiseAlarm fail: it is reported first, the failure after.
+          let alarmFailure: unknown;
+          try {
+            await this.locked(c.connectionId, async () => (c.epoch === running.epoch ? this.raiseAlarm(c, ev.hazard) : undefined));
+          } catch (err) {
+            alarmFailure = err;
+          }
           running.aborted ??= "alarm";
           yield ev;
+          if (alarmFailure !== undefined) throw alarmFailure;
           break;
         }
         // A finished-with-auth_dead turn means the login is dead (the adapter confirms with the CLI's own status first). Fenced like preflight.
@@ -1018,12 +1025,25 @@ export class ConnectionManager {
 
   /** Stops every turn and process of a connection (epoch changed, disabled, revoked, alarm). */
   private async terminateConnection(c: ConnRecord, reason: string): Promise<void> {
+    // Everything synchronous first, so nothing below can leave a turn running if a kill fails: turns are aborted (they report "aborted:
+    // <reason>", not a transient failure caused by the kill) and every session is marked dead (no new work, no auth check).
     for (const t of [...this.turns.values()]) if (t.connectionId === c.connectionId) t.abort(reason);
     const list = this.sessions.get(c.connectionId) ?? [];
     this.sessions.delete(c.connectionId);
+    for (const hs of list) hs.dead = true;
+    // Revoke and the hazard alarm kill HARD: a revoked home is wiped right after, and a process under an alarm (the connection is retired
+    // to needs_attention and its login never reused) must not get a grace period to run on (e.g. exit-time hooks). Disable and a
+    // reconnect keep the login, so they stop gracefully. Best effort: the final kill below is the one that reports a failure.
+    const hard = reason === "revoked" || reason === "alarm";
+    if (hard && c.uid >= 0) {
+      try {
+        await this.safeKill(c.uid, undefined, true);
+      } catch (err) {
+        this.log.warn("hard_kill_failed", { connectionId: c.connectionId, reason, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
     await Promise.all(
       list.map(async (hs) => {
-        hs.dead = true;
         try {
           await this.a("closeSession", async () => (await hs.ready).close());
         } catch {

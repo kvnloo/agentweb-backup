@@ -20,6 +20,13 @@ export interface UnitLimits {
   shmSize: string;
   /** Hard ceiling on a unit's lifetime: a unit that outlives its turn (a lost client, a hung CLI) is ended by systemd itself. */
   runtimeMaxSec: number;
+  /**
+   * How long a stopping unit gets to exit on SIGTERM before systemd sends SIGKILL (default 10, 2..12). The CLI refreshes an expired login
+   * in its first seconds: the server rotates BOTH tokens and the new pair is written afterwards, so a SIGKILL in between destroys the
+   * login (verified live 2026-10-24; SIGTERM with a grace period kept it 5/5). Every stop of a customer unit that keeps its login must
+   * therefore be graceful first. (Revoke and the hazard alarm still kill hard: the home is wiped right after, and nothing may run on.)
+   */
+  stopGraceSec?: number;
 }
 
 export interface UnitSpec {
@@ -50,12 +57,18 @@ export interface UnitPaths {
 }
 
 const SIZE = /^[1-9][0-9]{0,6}[KMG]$/;
+export const DEFAULT_STOP_GRACE_SEC = 10;
+export const MIN_STOP_GRACE_SEC = 2;
+/** Above this a graceful stop no longer fits the host's own stop budget (TimeoutStopSec=60 for the service, 30 s per systemctl call, twice the grace for stop + final kill). */
+export const MAX_STOP_GRACE_SEC = 12;
 
 /** The sandbox properties, in a fixed order (one `-p` each). */
 export function unitProperties(layout: Layout, spec: UnitSpec, limits: UnitLimits, paths: UnitPaths): string[] {
   if (!SIZE.test(limits.memoryMax) || !SIZE.test(limits.tmpSize) || !SIZE.test(limits.shmSize)) throw new Error("unit limits invalid");
   if (!Number.isInteger(limits.tasksMax) || limits.tasksMax < 1 || limits.tasksMax > 100_000) throw new Error("unit limits invalid");
   if (!Number.isInteger(limits.runtimeMaxSec) || limits.runtimeMaxSec < 10 || limits.runtimeMaxSec > 7 * 24 * 3600) throw new Error("unit limits invalid");
+  const grace = limits.stopGraceSec ?? DEFAULT_STOP_GRACE_SEC;
+  if (!Number.isInteger(grace) || grace < MIN_STOP_GRACE_SEC || grace > MAX_STOP_GRACE_SEC) throw new Error("unit limits invalid");
   const ref = assertAbsPath(spec.refDir);
   return [
     "ProtectSystem=strict",
@@ -108,6 +121,13 @@ export function unitProperties(layout: Layout, spec: UnitSpec, limits: UnitLimit
     `MemoryMax=${limits.memoryMax}`,
     `TasksMax=${limits.tasksMax}`,
     `RuntimeMaxSec=${limits.runtimeMaxSec}`,
+    // Graceful stop. The CLI is the unit's main process (the launcher chain `exec`s into it), so under `mixed` only IT gets SIGTERM and
+    // has the grace period to finish writing a refreshed login. The rest of the unit (the egress helper, any child of the CLI) is
+    // SIGKILLed by systemd as soon as the main process has exited, or at the end of the grace period if it has not.
+    "KillMode=mixed",
+    "KillSignal=SIGTERM",
+    `TimeoutStopSec=${grace}s`,
+    "SendSIGKILL=yes",
     "OOMScoreAdjust=500", // under memory pressure the kernel picks customers, never the host service
   ];
 }

@@ -242,6 +242,41 @@ describe("the whole host over a real socket", () => {
       rig = again;
     });
 
+    it("on shutdown the units are stopped (gracefully) BEFORE the egress proxy closes: a CLI finishing a refreshed login still needs the network", async () => {
+      rig = await boot();
+      const att = await signInAttempt(rig);
+      const ctx = rig.host.built.port.contextFor("c1", att.uid, att.attemptRef, "attempt");
+      ctx.spawnAs({ file: "/bin/sleep", args: ["60"], env: { PATH: "/usr/bin" }, cwd: ctx.workDir });
+      const sock = join(egressDirOf(rig), String(att.uid), "proxy.sock");
+      const proxyUpWhenSliceStopped: boolean[] = [];
+      const realRun = rig.sys.run.bind(rig.sys);
+      rig.sys.run = async (file: string, args: string[], opts?: { timeoutMs?: number }) => {
+        if (args[0] === "stop" && args[1]?.endsWith(".slice")) proxyUpWhenSliceStopped.push(existsSync(sock));
+        return realRun(file, args, opts);
+      };
+      await rig.host.shutdown();
+      expect(proxyUpWhenSliceStopped.length).toBeGreaterThan(0);
+      expect(proxyUpWhenSliceStopped.every(Boolean)).toBe(true); // the customer's proxy socket still existed while the units were stopping
+      expect(existsSync(join(egressDirOf(rig), String(att.uid)))).toBe(false); // and is gone afterwards
+      rig = await boot({ sys: rig.sys, dir: dirname(dirname(rig.sock)) });
+    });
+
+    it("the egress proxy is closed even when stopping the units fails (nothing is left listening)", async () => {
+      rig = await boot();
+      const egress = rig.host.egress!;
+      let closed = 0;
+      const realClose = egress.close.bind(egress);
+      egress.close = async () => {
+        closed++;
+        return realClose();
+      };
+      rig.sys.failList = true; // the units cannot be listed, so stopping the environment throws
+      await expect(rig.host.shutdown()).rejects.toThrow();
+      expect(closed).toBe(1);
+      rig.sys.failList = false;
+      rig = await boot({ sys: rig.sys, dir: dirname(dirname(rig.sock)) });
+    });
+
     it("every customer unit the real port starts has its own network namespace, ITS OWN proxy directory and the launcher", async () => {
       rig = await boot();
       const att = await signInAttempt(rig);

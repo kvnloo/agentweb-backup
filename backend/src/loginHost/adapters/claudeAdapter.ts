@@ -550,8 +550,10 @@ class ClaudeSession implements ProviderSession {
         const confirmation: Promise<ErrorKind> = this.closing
           ? Promise.resolve("transient")
           : (async () => {
-              await this.stopProcess(); // the turn's process is gone first: the check must not run beside it (one process per cap slot)
-              return this.closing ? "transient" : await this.adapter.confirmLoggedOut(this.ctx);
+              // The turn's process is gone first: the check must not run beside it (one process per cap slot, and a CLI still inside its
+              // stop grace may be writing a refreshed login the check would read half-written). Not gone in time => no check.
+              const gone = await this.stopProcess();
+              return this.closing || !gone ? "transient" : await this.adapter.confirmLoggedOut(this.ctx);
             })();
         this.confirming = confirmation;
         errorKind = await confirmation;
@@ -576,7 +578,7 @@ class ClaudeSession implements ProviderSession {
   }
 
   /** Asks the runner to end the turn's process and waits for it to be gone, bounded: a kill that keeps failing must not hang the turn (`close()` keeps waiting for the real exit). */
-  private async stopProcess(): Promise<void> {
+  private async stopProcess(): Promise<boolean> {
     try {
       if (this.key) this.runner.close({ conversationId: this.key });
       else this.runner.closeAll();
@@ -585,11 +587,18 @@ class ClaudeSession implements ProviderSession {
     }
     await this.spawning?.catch(() => undefined);
     let timer: NodeJS.Timeout | undefined;
+    let gone = false;
     try {
-      await Promise.race([Promise.all(this.exits), new Promise<void>((r) => (timer = setTimeout(r, this.cfg.killWaitMs)))]);
+      await Promise.race([
+        Promise.all(this.exits).then(() => {
+          gone = true;
+        }),
+        new Promise<void>((r) => (timer = setTimeout(r, this.cfg.killWaitMs))),
+      ]);
     } finally {
       if (timer) clearTimeout(timer);
     }
+    return gone;
   }
 
   private async doClose(): Promise<void> {
