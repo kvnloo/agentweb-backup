@@ -48,6 +48,7 @@ export function selectEngagementExitTrigger(
   events: any[],
   enrolledAtMs: number,
   wanted: readonly EngagementExitCondition[],
+  opts: { emailEverSent?: boolean } = {},
 ): EngagementExitDecision {
   const suppressed: SuppressedEngagement[] = [];
   const inWindow = events.filter((e) => {
@@ -63,7 +64,13 @@ export function selectEngagementExitTrigger(
     const isClick = wanted.includes('clicked') && e.eventType === 'email.clicked';
     if (!isOpen && !isClick) continue;
 
+    // Opens/clicks are only attributable to this sequence if it has sent this lead an
+    // email, and the engaged email was sent after enrollment. The events lookup is keyed
+    // on domain + lead only, so without this an open of an unrelated email exits the lead.
+    if (opts.emailEverSent === false) continue;
     const sentAt = parseSentAt(e);
+    if (Number.isFinite(sentAt) && sentAt < enrolledAtMs) continue;
+
     if (!Number.isFinite(sentAt)) return { trigger: e, suppressed }; // cannot classify: legacy behaviour
 
     const priorEvents = engagements.filter((x, j): x is EngagementEvent => j !== i && x !== null);

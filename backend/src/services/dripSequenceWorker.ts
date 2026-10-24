@@ -518,7 +518,9 @@ async function checkExitConditions(
       const wanted = exitConditions.onEmailEngagement;
       // ENG-2548: opens/clicks go through dripEngagementClassifier — link scanners and
       // image proxies no longer exit a lead. Replies always count.
-      const { trigger, suppressed } = selectEngagementExitTrigger(events, enrolledAt, wanted);
+      const { trigger, suppressed } = selectEngagementExitTrigger(events, enrolledAt, wanted, {
+        emailEverSent: !!(enrollment as any).lastEmailSentAt,
+      });
       for (const s of suppressed) {
         const detail = s.event?.data?.click || s.event?.data?.open || {};
         console.warn('[dripWorker] suspected_machine_engagement', JSON.stringify({

@@ -77,4 +77,24 @@ describe('selectEngagementExitTrigger (ENG-2548)', () => {
     const open = ev('email.opened', '2026-10-02T12:00:00Z', { open: { userAgent: HUMAN_UA } });
     expect(selectEngagementExitTrigger([old, open], ENROLLED, ['clicked']).trigger).toBeNull();
   });
+
+  it('open does not exit when the sequence has sent this lead no email (unrelated email)', () => {
+    const gmail = ev('email.opened', '2026-10-02T10:02:00Z', { open: { userAgent: 'Mozilla/5.0 (via ggpht.com GoogleImageProxy)' } });
+    expect(selectEngagementExitTrigger([gmail], ENROLLED, ['opened'], { emailEverSent: false }).trigger).toBeNull();
+  });
+
+  it('open of an email sent before enrollment does not exit', () => {
+    const e = { eventType: 'email.opened', createdAt: '2026-10-02T12:00:00Z', data: { created_at: '2026-09-30 10:00:00+00', open: { userAgent: HUMAN_UA } } };
+    expect(selectEngagementExitTrigger([e], ENROLLED, ['opened'], { emailEverSent: true }).trigger).toBeNull();
+  });
+
+  it('reply still exits even if no email was sent', () => {
+    const r = ev('email.received', '2026-10-02T12:00:00Z');
+    expect(selectEngagementExitTrigger([r], ENROLLED, ['replied'], { emailEverSent: false }).trigger).toBe(r);
+  });
+
+  it('human open of a sequence email still exits when emailEverSent', () => {
+    const e = ev('email.opened', '2026-10-02T12:00:00Z', { open: { userAgent: HUMAN_UA } });
+    expect(selectEngagementExitTrigger([e], ENROLLED, ['opened'], { emailEverSent: true }).trigger).toBe(e);
+  });
 });
