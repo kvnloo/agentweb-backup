@@ -9559,6 +9559,7 @@ emmaToolRegistry.register({
     name: 'call_hubspot_api',
     description: `Manage HubSpot marketing assets and data via a single unified tool.
 Use entity_type to select the resource, action to select the operation.
+For CONTACT_LIST GET pass list_id as a top-level string (listId/id/guid and id-bearing query objects are accepted aliases). LIST with a list id reads that list; omit ids to enumerate lists. For CAMPAIGN GET/GET_METRICS pass top-level guid (id is accepted). Use CONTACTS + LIST to list contacts.
 
 ENTITY_TYPE + ACTION MATRIX:
 
@@ -9714,8 +9715,11 @@ emmaToolRegistry.register({
 reporting and list-membership workflows.
 
 Attio has no equivalent of HubSpot's marketing-asset concepts (campaigns,
-emails, landing pages, workflows, social broadcasts) — this tool covers only
-lists and list entries, mirroring call_hubspot_api's CONTACT_LIST actions.
+emails, landing pages, workflows, social broadcasts). Supported entity_type values
+are RECORDS, LISTS, LIST_ENTRIES (case-insensitive). Workspace lookup/get_workspace
+is not supported. Use {entity_type:"RECORDS",action:"SEARCH",query:"name or email"}
+or {entity_type:"RECORDS",action:"LIST",object_type:"people"}; PERSON/PEOPLE are
+aliases for RECORDS with object_type people. Pass fields at the top level.
 
 ENTITY_TYPE + ACTION MATRIX:
 
