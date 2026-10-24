@@ -177,13 +177,15 @@ export class SystemdUserFs implements UserFsPort {
 
   // ───────────────────────────── processes ─────────────────────────────
 
-  async killAll(uid: number): Promise<void> {
+  async killAll(uid: number, opts: { hard?: boolean } = {}): Promise<void> {
     this.layout.assertUid(uid);
     await this.withGate(uid, async () => {
       const deadline = Date.now() + this.cfg.killTimeoutMs;
       for (;;) {
-        await this.cmd.run(this.cfg.paths.systemctl, ["stop", this.layout.sliceName(uid)], { timeoutMs: this.cfg.commandTimeoutMs });
+        // Graceful by default (the slice's units stop with SIGTERM + their grace); a hard kill skips straight to SIGKILL below.
+        if (!opts.hard) await this.cmd.run(this.cfg.paths.systemctl, ["stop", this.layout.sliceName(uid)], { timeoutMs: this.cfg.commandTimeoutMs });
         const units = await this.listUnits(uid);
+        // After a graceful `stop <slice>` (which waits) what is still listed here survived it; after a hard kill everything listed is killed now.
         for (const u of units) {
           await this.cmd.run(this.cfg.paths.systemctl, ["kill", "-s", "SIGKILL", u], { timeoutMs: this.cfg.commandTimeoutMs });
           await this.cmd.run(this.cfg.paths.systemctl, ["stop", u], { timeoutMs: this.cfg.commandTimeoutMs });
@@ -333,6 +335,11 @@ export class SystemdUserFs implements UserFsPort {
     return new UnitChild(client, unitName, {
       isActive: (u) => this.unitActive(u),
       killUnit: async (u) => {
+        // GRACEFUL first: the unit's own stop (KillSignal=SIGTERM to the CLI, SIGKILL only after TimeoutStopSec). A hard kill
+        // while the CLI refreshes an expired login destroys that login (the server rotated the tokens, the new pair is never written).
+        const stopped = await this.cmd.run(this.cfg.paths.systemctl, ["stop", u], { timeoutMs: this.cfg.commandTimeoutMs });
+        if (!stopped.timedOut && (stopped.code === 0 || stopped.code === 5)) return; // 5 = the unit is not loaded: already gone, nothing to kill
+        // The stop itself failed or hung (a stuck unit, a bus error): the hard kill is the fallback so a unit can never outlive its turn.
         await this.cmd.run(this.cfg.paths.systemctl, ["kill", "-s", "SIGKILL", u], { timeoutMs: this.cfg.commandTimeoutMs });
         await this.cmd.run(this.cfg.paths.systemctl, ["stop", u], { timeoutMs: this.cfg.commandTimeoutMs });
       },
