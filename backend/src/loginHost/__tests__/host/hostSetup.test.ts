@@ -6,7 +6,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { verifyBinary, assertTrustedPath } from "../../host/binary";
 import { assertNoSubuidOverlap, HostConfigError, parseHostConfig } from "../../host/hostConfig";
-import { assertKeyFileMode, managerConfigFor, portConfigFor, reportTlsCertExpiry } from "../../host/main";
+import { adapterKillWaitMs, assertKeyFileMode, managerConfigFor, portConfigFor, reportTlsCertExpiry } from "../../host/main";
 import { DEFAULT_CONFIG } from "../../connectionManager";
 import { registerRange } from "../../host/ranges";
 import { assertHomesMount, assertRoot, parseMounts } from "../../host/startupChecks";
@@ -43,6 +43,11 @@ describe("stopGraceSec (graceful customer-unit stop)", () => {
 });
 
 describe("manager timers derived from the stop grace", () => {
+  it("the claude adapter waits the stop grace plus 5 s for a stopping turn process", () => {
+    expect(adapterKillWaitMs(parseHostConfig(base()))).toBe(15_000);
+    expect(adapterKillWaitMs(parseHostConfig({ ...base(), limits: { stopGraceSec: 12 } }))).toBe(17_000);
+    expect(adapterKillWaitMs(parseHostConfig({ ...base(), limits: { stopGraceSec: 2 } }))).toBe(7_000);
+  });
   it("a stopping provider gets the default abort grace PLUS the unit's stop grace", () => {
     expect(managerConfigFor(parseHostConfig(base())).abortGraceMs).toBe(DEFAULT_CONFIG.abortGraceMs + 10_000);
     expect(managerConfigFor(parseHostConfig({ ...base(), limits: { stopGraceSec: 2 } })).abortGraceMs).toBe(DEFAULT_CONFIG.abortGraceMs + 2_000);

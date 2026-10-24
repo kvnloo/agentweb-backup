@@ -295,6 +295,15 @@ describe("UnitChild: kill by unit name, 'gone' only when the unit is inactive", 
     await tick();
     expect(sys.callsOf("/usr/bin/systemctl").some((c) => c.args[0] === "kill" && c.args.includes(unit.name))).toBe(false);
   });
+  it("a stop failing with any OTHER non-zero code (3, 4) falls back to SIGKILL; only 0 and 5 count as done", async () => {
+    for (const code of [3, 4]) {
+      const { child, sys, unit } = await started();
+      sys.stopExitCode = code;
+      child.kill();
+      await tick();
+      expect(sys.callsOf("/usr/bin/systemctl").some((c) => c.args.join(" ") === `kill -s SIGKILL ${unit.name}`)).toBe(true);
+    }
+  });
   it("a program that exits by itself is reported with its own exit code once the unit is inactive", async () => {
     const { exits, sys, unit } = await started();
     sys.endUnit(unit, 0);

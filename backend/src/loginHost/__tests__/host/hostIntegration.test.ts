@@ -261,6 +261,22 @@ describe("the whole host over a real socket", () => {
       rig = await boot({ sys: rig.sys, dir: dirname(dirname(rig.sock)) });
     });
 
+    it("the egress proxy is closed even when stopping the units fails (nothing is left listening)", async () => {
+      rig = await boot();
+      const egress = rig.host.egress!;
+      let closed = 0;
+      const realClose = egress.close.bind(egress);
+      egress.close = async () => {
+        closed++;
+        return realClose();
+      };
+      rig.sys.failList = true; // the units cannot be listed, so stopping the environment throws
+      await expect(rig.host.shutdown()).rejects.toThrow();
+      expect(closed).toBe(1);
+      rig.sys.failList = false;
+      rig = await boot({ sys: rig.sys, dir: dirname(dirname(rig.sock)) });
+    });
+
     it("every customer unit the real port starts has its own network namespace, ITS OWN proxy directory and the launcher", async () => {
       rig = await boot();
       const att = await signInAttempt(rig);

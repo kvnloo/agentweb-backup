@@ -121,6 +121,11 @@ export interface BuiltHost {
   egressRef: EgressRef;
 }
 
+/** How long the Claude adapter waits for a stopping turn process: the unit's stop grace plus a margin. */
+export function adapterKillWaitMs(cfg: HostConfig): number {
+  return cfg.limits.stopGraceSec * 1000 + 5_000;
+}
+
 /** The connection manager's config: defaults, then the host config's overrides, then the values derived from the unit stop grace. */
 export function managerConfigFor(cfg: HostConfig, overrides: Partial<ManagerConfig> = {}): ManagerConfig {
   return {
@@ -152,7 +157,7 @@ export function buildHost(cfg: HostConfig, binary: VerifiedBinary, deps: HostDep
           ...(cfg.claude.models ? { models: cfg.claude.models } : {}),
           ...(cfg.claude.basePath ? { basePath: cfg.claude.basePath } : {}),
           // A stopping turn process gets the unit's grace period: waits for it (and the auth check that follows) must outlast it.
-          killWaitMs: cfg.limits.stopGraceSec * 1000 + 5_000,
+          killWaitMs: adapterKillWaitMs(cfg),
         }),
       ],
     ]);
