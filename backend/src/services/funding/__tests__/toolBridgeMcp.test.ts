@@ -375,6 +375,7 @@ describe('tool bridge MCP endpoint', () => {
   });
 
   it('revoking the connection closes the funded run and its MCP session', async () => {
+    (deps as any).isLive = jest.fn(async () => true);
     const token = adapter.openRun({ ...RUN, connectionId: 'conn-1', epoch: 2 });
     const client = await connect(token);
     expect(adapter.revokeConnection('conn-1')).toEqual([RUN.runId]);

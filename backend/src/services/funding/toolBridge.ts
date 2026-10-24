@@ -275,6 +275,10 @@ interface Ledger {
   bytes: number;
   truncated: number;
   closedAtMs?: number;
+  /** When the last record landed (a late one extends the retention). */
+  lastRecordAtMs?: number;
+  /** Calls of this run generation still in the bridge. */
+  pending: number;
 }
 
 interface CallCtx {
@@ -286,6 +290,12 @@ interface CallCtx {
   arrivalSeq: number;
   startedAt: number;
   executing: boolean;
+  /** The executor was invoked (so an effect may exist). */
+  started: boolean;
+  /** The hold limit passed before the executor was invoked: the call must be refused, not run late. */
+  abandoned: boolean;
+  /** Frees the session's write slot early (the run closed under the call). */
+  releaseSlot?: () => void;
   abort: AbortController;
   abortedByClient: boolean;
   revokedDuringCall: boolean;
@@ -337,6 +347,8 @@ interface SessionState {
   completed: Map<string, Completed>;
   completedBytes: number;
   unknownOutcome: boolean;
+  /** Set by a late event from an earlier turn; reported by the next `beginTurn`, never blocks the current turn. */
+  carriedUnknown: boolean;
   runIds: Set<string>;
   touchedAtMs: number;
 }
@@ -370,8 +382,6 @@ interface RunState {
   /** Per model message: dedupe key -> the call id that is handling it. */
   seenByGroup: Map<string, Map<string, string>>;
   liveOkUntilMs: number;
-  /** Release the executor's state when the last executing call finishes. */
-  releasePending: boolean;
   /** Call ids already answered, for `pendingInGroup`. */
   answered: Set<string>;
 }
@@ -414,6 +424,8 @@ const MAX_COMPLETED_ENTRIES = 32;
 const MAX_COMPLETED_BYTES = 512 * 1024;
 const MAX_SESSIONS_TRACKED = 2048;
 const LATE_RETENTION_MS = 5 * 60 * 1000;
+/** A closed run's ledger is kept at most this long while calls are still pending in it (the hold limit is 15 minutes). */
+const MAX_LATE_HOLD_MS = 2 * 60 * 60 * 1000;
 const ABANDONED_SESSION_MS = 24 * 60 * 60 * 1000;
 
 export class ToolBridge {
@@ -421,6 +433,10 @@ export class ToolBridge {
   private readonly sessions = new Map<string, SessionState>();
   private readonly ledgers = new Map<string, Ledger>();
   private readonly lastGenerationByRun = new Map<string, string>();
+  /** Executor calls in progress per run id, across run generations. */
+  private readonly execCount = new Map<string, number>();
+  /** Run ids whose executor state is released when their last executing call finishes. */
+  private readonly releaseAfter = new Set<string>();
   private readonly holdLimitMs: number;
   private readonly persistTimeoutMs: number;
   private readonly admissionWindowMs: number;
@@ -448,6 +464,10 @@ export class ToolBridge {
    * Throws if the id is open for a different user.
    */
   openRun(claims: RunToolTokenClaims, opts: OpenRunOptions = {}): string {
+    if (claims.connectionId && !this.deps.isLive) {
+      // Fail closed: a connection-funded run without a liveness check would keep writing after a revoke or the kill switch.
+      throw new Error("tool bridge: a connection-funded run needs a liveness check");
+    }
     const existing = this.runs.get(claims.runId);
     if (existing && (existing.claims.userId !== claims.userId || existing.claims.sessionId !== claims.sessionId)) {
       throw new Error("tool bridge: run id is already open for another session");
@@ -460,7 +480,7 @@ export class ToolBridge {
       session.halt = { epoch: session.epoch, firstHaltAtMs: Date.now(), consumed: new Set(), refused: 0 };
     }
     const generation = randomUUID();
-    const ledger: Ledger = { generation, runId: claims.runId, records: [], bytes: 0, truncated: 0 };
+    const ledger: Ledger = { generation, runId: claims.runId, records: [], bytes: 0, truncated: 0, pending: 0 };
     this.ledgers.set(generation, ledger);
     this.lastGenerationByRun.set(claims.runId, generation);
     session.runIds.add(claims.runId);
@@ -486,7 +506,6 @@ export class ToolBridge {
       groupOrderSeq: 0,
       seenByGroup: new Map(),
       liveOkUntilMs: 0,
-      releasePending: false,
       answered: new Set(),
     });
     return this.tokens.mint(claims);
@@ -539,6 +558,21 @@ export class ToolBridge {
     return { settled: state.pending.size === 0, stillRunning: state.pending.size };
   }
 
+  private safeRelease(runId: string): void {
+    this.releaseAfter.delete(runId);
+    try {
+      this.deps.releaseRun?.(runId);
+    } catch (err) {
+      console.error("[tool-bridge] releaseRun failed (swallowed):", err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  /** An outcome we cannot know belongs to the turn the call started in; a late event never poisons a newer turn. */
+  private markUnknown(ctx: CallCtx): void {
+    if (ctx.epoch === ctx.session.epoch) ctx.session.unknownOutcome = true;
+    else ctx.session.carriedUnknown = true;
+  }
+
   /** `expected`: close only if this exact run is still the one open under the id (a replacement must survive a stale close). */
   private endRun(runId: string, releaseExecutor: boolean, expected?: RunState): void {
     const state = this.runs.get(runId);
@@ -550,18 +584,19 @@ export class ToolBridge {
     state.session.runIds.delete(runId);
     state.ledger.closedAtMs = Date.now();
     // A write still executing under a closing run: its outcome may never reach the model.
-    if ([...state.running].some((c) => c.write)) state.session.unknownOutcome = true;
     for (const ctx of state.running) {
+      if (ctx.write) this.markUnknown(ctx);
       ctx.revokedDuringCall = true;
       ctx.abort.abort();
+      ctx.releaseSlot?.(); // the call keeps running, but it no longer holds up the session's next writes
     }
     for (const release of [...state.waiters]) release();
     state.waiters.clear();
     for (const waiters of state.callGroupWaiters.values()) for (const wake of [...waiters]) wake();
     if (releaseExecutor) {
-      // The executor's per-run state is needed until the calls still executing have finished.
-      if (state.running.size > 0) state.releasePending = true;
-      else this.deps.releaseRun?.(runId);
+      // The executor's per-run state is needed until the calls still executing (of any generation) have finished.
+      if ((this.execCount.get(runId) ?? 0) > 0) this.releaseAfter.add(runId);
+      else this.safeRelease(runId);
     }
     if (state.session.runIds.size === 0) this.clearCompleted(state.session);
     this.pruneLedgers();
@@ -593,7 +628,7 @@ export class ToolBridge {
    */
   beginTurn(userId: string, sessionId: string): { previousUnknownOutcome: boolean } {
     const session = this.sessionFor(userId, sessionId);
-    const previousUnknownOutcome = session.unknownOutcome;
+    const previousUnknownOutcome = session.unknownOutcome || session.carriedUnknown;
     session.epoch++;
     session.halt = null;
     session.halts = [];
@@ -601,6 +636,7 @@ export class ToolBridge {
     session.cancelled = false;
     session.turnActive = true;
     session.unknownOutcome = false;
+    session.carriedUnknown = false;
     this.clearCompleted(session);
     return { previousUnknownOutcome };
   }
@@ -653,7 +689,7 @@ export class ToolBridge {
       cancelled: session.cancelled,
       epoch: session.epoch,
       turnActive: session.turnActive,
-      unknownOutcome: session.unknownOutcome,
+      unknownOutcome: session.unknownOutcome || session.carriedUnknown,
       refusedWhileHalted: session.halt?.refused ?? 0,
     };
   }
@@ -692,10 +728,19 @@ export class ToolBridge {
 
   /** Records of a closed run, including calls that finished after it closed. Removes the ledger. */
   takeLedgerByGeneration(generation: string): { records: BridgeCallRecord[]; truncated: number } {
+    this.pruneLedgers();
     const ledger = this.ledgers.get(generation);
     if (!ledger || ledger.closedAtMs === undefined) return { records: [], truncated: 0 }; // an open run's ledger is taken with takeLedger
-    this.ledgers.delete(generation);
-    return this.snapshotLedger(ledger);
+    const snapshot = this.snapshotLedger(ledger);
+    if (ledger.pending > 0) {
+      // Calls are still running: keep the ledger so their records can be taken when they land.
+      ledger.records = [];
+      ledger.bytes = 0;
+      ledger.truncated = 0;
+    } else {
+      this.ledgers.delete(generation);
+    }
+    return snapshot;
   }
 
   generationOf(runId: string): string | undefined {
@@ -798,6 +843,8 @@ export class ToolBridge {
       arrivalSeq: ++state.callSeq,
       startedAt: Date.now(),
       executing: false,
+      started: false,
+      abandoned: false,
       abort: new AbortController(),
       abortedByClient: false,
       revokedDuringCall: false,
@@ -816,8 +863,10 @@ export class ToolBridge {
     // The whole call, from here on, is tracked so a drain can wait for it.
     const work = this.admitAndRun(ctx);
     state.pending.add(work);
+    state.ledger.pending++;
     const answered = () => {
       state.pending.delete(work);
+      state.ledger.pending--;
       state.answered.add(ctx.toolCallId);
       while (state.answered.size > MAX_TRACKED_CALL_IDS * 2) state.answered.delete(state.answered.values().next().value as string);
     };
@@ -893,14 +942,22 @@ export class ToolBridge {
         let holdTimer: ReturnType<typeof setTimeout> | undefined;
         const held = new Promise<void>((resolve) => {
           holdTimer = setTimeout(() => {
-            if (ctx.executing) {
+            if (ctx.started) {
+              // The executor was invoked (it may still be running or saving a halt): an effect may exist.
               ctx.heldPastLimit = true;
-              session.unknownOutcome = true;
+              this.markUnknown(ctx);
+            } else {
+              // Stuck before the executor (tool list, liveness): it must not run late, alongside the next write.
+              ctx.abandoned = true;
             }
             heldResolve({ done: false });
             resolve();
           }, this.holdLimitMs);
           holdTimer.unref?.();
+          ctx.releaseSlot = () => {
+            heldResolve({ done: false });
+            resolve();
+          };
         });
         try {
           await Promise.race([execPromise.then(() => undefined, () => undefined), held]);
@@ -997,8 +1054,16 @@ export class ToolBridge {
     const latch = session.halt;
     if (!latch || !call.callId || !latch.groupId) return false;
     await this.callGroupOf(state, call.callId);
-    // Everything below is synchronous: nothing can change between the checks and the admission.
-    if (session.halt !== latch || state.closed || session.cancelled) return false;
+    if (session.halt !== latch) return false;
+    return this.admitSync(ctx);
+  }
+
+  /** The synchronous half of admission: nothing can change between the checks and the admission. */
+  private admitSync(ctx: CallCtx): boolean {
+    const { state, session, call } = ctx;
+    const latch = session.halt;
+    if (!latch || !call.callId || !latch.groupId) return false;
+    if (state.closed || session.cancelled || session.epoch !== ctx.epoch) return false;
     const announced = state.announced.get(call.callId);
     if (!announced || announced.groupId !== latch.groupId || announced.name === undefined) return false;
     if (announced.name !== call.name || announced.inputKey !== stableStringify(call.args)) return false;
@@ -1118,7 +1183,11 @@ export class ToolBridge {
     if (session.cancelled) return this.exec(ctx, "refused", refusal(CANCELLED_MESSAGE));
     if (state.closed) return this.exec(ctx, "refused", refusal(RUN_ENDED_MESSAGE));
     if (session.epoch !== ctx.epoch) return this.exec(ctx, "refused", refusal(TURN_ENDED_MESSAGE));
-    if (session.halt && !admitted) return this.exec(ctx, "refused", refusal(HALTED_MESSAGE));
+    if (ctx.abandoned) return this.exec(ctx, "refused", refusal(LIST_UNAVAILABLE_MESSAGE));
+    // A write that was already queued when an outcome became unknown must not run past the block.
+    if (write && session.unknownOutcome) return this.exec(ctx, "refused", refusal(UNKNOWN_BLOCK_MESSAGE));
+    // A sibling that was queued before the halt landed gets the same admission as one that arrives after it.
+    if (session.halt && !admitted && !this.admitSync(ctx)) return this.exec(ctx, "refused", refusal(HALTED_MESSAGE));
     if (!tools.has(call.name)) return this.exec(ctx, "refused", refusal(`${call.name} is not available in this run.`));
 
     if (group && call.callId && this.isDedupable(call.name)) {
@@ -1144,7 +1213,9 @@ export class ToolBridge {
 
     let outcome: BridgeExecuteOutcome;
     ctx.executing = true;
+    ctx.started = true;
     state.running.add(ctx);
+    this.execCount.set(state.claims.runId, (this.execCount.get(state.claims.runId) ?? 0) + 1);
     try {
       outcome = await this.deps.execute(state.claims, call, { signal: ctx.abort.signal });
       if (!outcome || typeof outcome.content !== "string") throw new Error("executor returned no result");
@@ -1157,11 +1228,12 @@ export class ToolBridge {
     } finally {
       ctx.executing = false;
       state.running.delete(ctx);
-      if (state.releasePending && state.running.size === 0) {
-        state.releasePending = false;
-        // Not if the id was reopened meanwhile: the executor's state now belongs to the new run.
-        if (!this.runs.has(state.claims.runId)) this.deps.releaseRun?.(state.claims.runId);
-      }
+      const runId = state.claims.runId;
+      const left = (this.execCount.get(runId) ?? 1) - 1;
+      if (left > 0) this.execCount.set(runId, left);
+      else this.execCount.delete(runId);
+      // Not if the id was reopened meanwhile: the executor's state now belongs to the new run (released when that one closes).
+      if (left <= 0 && this.releaseAfter.has(runId) && !this.runs.has(runId)) this.safeRelease(runId);
     }
 
     let result: BridgeCallResult = {
@@ -1197,6 +1269,13 @@ export class ToolBridge {
           console.error("[tool-bridge] onToolsChanged failed (swallowed):", err instanceof Error ? err.message : String(err));
         }
       }
+    }
+    // A new turn may have begun while the halt was being saved or the tool list refreshed: the text (it can carry the
+    // approval token) must not reach the model of a turn that no longer has a halt to answer to.
+    if (outcome.requiresConfirmation && !staleHalt && session.epoch !== ctx.epoch) {
+      staleHalt = true;
+      result = refusal(TURN_ENDED_MESSAGE);
+      shareable = false;
     }
     return this.exec(ctx, "executed", result, { outcome, staleHalt, shareable, recordAs: actual });
   }
@@ -1285,6 +1364,7 @@ export class ToolBridge {
     const ledger = state.ledger;
     const announced = call.callId ? state.announced.get(call.callId) : undefined;
     const endedAt = Date.now();
+    ledger.lastRecordAtMs = endedAt;
     const content = capText(result.content, MAX_RECORD_CONTENT_BYTES);
     const entry: BridgeCallRecord = {
       toolCallId: ctx.toolCallId,
@@ -1342,7 +1422,11 @@ export class ToolBridge {
   private pruneLedgers(): void {
     const now = Date.now();
     for (const [generation, ledger] of this.ledgers) {
-      if (ledger.closedAtMs !== undefined && now - ledger.closedAtMs > LATE_RETENTION_MS) {
+      if (ledger.closedAtMs === undefined) continue;
+      const age = now - ledger.closedAtMs;
+      const idle = now - Math.max(ledger.closedAtMs, ledger.lastRecordAtMs ?? 0);
+      // Kept while calls are still pending in it: a write finishing late must never be invisible.
+      if ((ledger.pending <= 0 && idle > LATE_RETENTION_MS) || age > MAX_LATE_HOLD_MS) {
         this.ledgers.delete(generation);
         if (this.lastGenerationByRun.get(ledger.runId) === generation) this.lastGenerationByRun.delete(ledger.runId);
       }
@@ -1369,6 +1453,7 @@ export class ToolBridge {
         completed: new Map(),
         completedBytes: 0,
         unknownOutcome: false,
+        carriedUnknown: false,
         runIds: new Set(),
         touchedAtMs: Date.now(),
       };

@@ -77,6 +77,12 @@ interface EmmaRunState {
 
 export class EmmaToolBridgeExecutor implements ToolBridgeDeps {
   private readonly runs = new Map<string, EmmaRunState>();
+  /** Per-call liveness of a connection-funded run (see bridgeLiveness.ts). A run funded by a connection cannot open without one. */
+  readonly isLive?: ToolBridgeDeps["isLive"];
+
+  constructor(opts: { isLive?: ToolBridgeDeps["isLive"] } = {}) {
+    this.isLive = opts.isLive;
+  }
 
   /** Must be called before the bridge opens the run. */
   registerRun(runId: string, context: EmmaBridgeRunContext): void {

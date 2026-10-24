@@ -179,7 +179,7 @@ describe('ToolBridge review fixes', () => {
     });
   });
 
-  it('releases a joined caller even when recording the original throws (and never loses the answer)', async () => {
+  it('recording never throws, so a joined caller still gets the answer even when the result cannot be serialized', async () => {
     const gate = deferred<BridgeExecuteOutcome>();
     const { bridge } = make({ execute: jest.fn(async () => gate.promise) as any });
     const token = bridge.openRun(RUN);

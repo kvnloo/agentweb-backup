@@ -2,7 +2,7 @@ import { createSubscriptionIsLive } from '../bridgeLiveness';
 import { __resetFundingFlagsCacheForTests, FUNDING_FLAGS_SETTING_NAME } from '../fundingFlags';
 import { settingsService } from '../../settingsService';
 
-jest.mock('../../settingsService', () => ({ settingsService: { getSetting: jest.fn() } }));
+jest.mock('../../settingsService', () => ({ settingsService: { getSetting: jest.fn(), getSettingConsistent: jest.fn() } }));
 
 const NOW = Date.parse('2026-10-24T12:00:00Z');
 const RUN = { runId: 'r', userId: 'u1', sessionId: 's', connectionId: 'c1', epoch: 3 };
@@ -11,7 +11,12 @@ const record = (over: Record<string, unknown> = {}) =>
 const flags = (over: Record<string, unknown> = {}) =>
   JSON.stringify({ byok: { enabled: false, allowUserIds: [] }, claudeSubscription: { enabled: true, allowUserIds: ['u1'] }, killSwitch: false, ...over });
 
-const getSetting = settingsService.getSetting as jest.Mock;
+const getSettingCached = settingsService.getSetting as jest.Mock; // reads (cached path)
+const getSettingFresh = settingsService.getSettingConsistent as jest.Mock; // writes (fresh path)
+const getSetting = { // both paths answer the same row unless a test splits them
+  mockReset: () => { getSettingCached.mockReset(); getSettingFresh.mockReset(); },
+  mockResolvedValue: (v: unknown) => { getSettingCached.mockResolvedValue(v); getSettingFresh.mockResolvedValue(v); },
+};
 
 function make(rec: any) {
   return createSubscriptionIsLive({ getConnection: jest.fn(async () => rec), now: () => NOW });
@@ -58,7 +63,8 @@ describe('subscription liveness check', () => {
 
   it('a write throws when the flags cannot be read fresh, even though a good value is cached', async () => {
     expect(await make(record())(RUN, { write: false })).toBe(true); // caches the good flags
-    getSetting.mockRejectedValue(new Error('dynamo down'));
+    getSettingFresh.mockRejectedValue(new Error('dynamo down')); // the cached path is not even consulted for a write
+    getSettingCached.mockRejectedValue(new Error('dynamo down'));
     await expect(make(record())(RUN, { write: true })).rejects.toThrow();
     expect(await make(record())(RUN, { write: false })).toBe(true); // reads may use the cache
   });

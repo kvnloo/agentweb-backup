@@ -39,6 +39,8 @@ export function isStrictRepeatEffect(toolName: string, args: Record<string, unkn
   if (rule === "strict") return true;
   if (rule === "read") return false;
   if (toolName.startsWith("call_") && rule === undefined) return true; // an unlisted call_* tool: fail toward not repeating
+  // An argument shape that hides the action (a wrapped or renamed field) cannot be classified: fail toward not repeating.
+  if (rule === "by_args" && typeof args.action !== "string") return true;
   const effect = evaluateAgentToolPolicy({ toolName, args }).effect;
   return STRICT_EFFECTS.has(effect);
 }

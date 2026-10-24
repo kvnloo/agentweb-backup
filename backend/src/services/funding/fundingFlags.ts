@@ -131,7 +131,7 @@ export async function getFundingFlags(): Promise<FundingFlags> {
  * row is a definite "all off".
  */
 export async function readFundingFlagsFresh(): Promise<FundingFlags> {
-  const setting = await settingsService.getSetting(FUNDING_FLAGS_SETTING_NAME);
+  const setting = await settingsService.getSettingConsistent(FUNDING_FLAGS_SETTING_NAME);
   if (!setting) return ALL_OFF;
   const parsed = parseFundingFlags(JSON.parse(setting.settingValue));
   if (!parsed) throw new Error(`${FUNDING_FLAGS_SETTING_NAME} is malformed`);

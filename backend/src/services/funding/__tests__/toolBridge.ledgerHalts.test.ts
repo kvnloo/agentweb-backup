@@ -481,7 +481,7 @@ describe('ToolBridge ledger, halts, stop and repeat guard', () => {
       expect(deps.execute).toHaveBeenCalledTimes(2);
     });
 
-    it('releases the write slot when a call outlives its hold limit and marks the outcome unknown', async () => {
+    it('releases the write slot when a call outlives its hold limit, marks the outcome unknown and blocks writes until the next turn', async () => {
       const hung = deferred<BridgeExecuteOutcome>();
       let n = 0;
       const deps = makeDeps({ execute: jest.fn(async () => (n++ === 0 ? hung.promise : ok('next'))) as any });
@@ -490,17 +490,19 @@ describe('ToolBridge ledger, halts, stop and repeat guard', () => {
       bridge.beginTurn(RUN.userId, RUN.sessionId);
       const stuck = bridge.callTool(token, { name: 'send_email', args: { n: 1 }, callId: 't1' });
       const retry = bridge.callTool(token, { name: 'send_email', args: { n: 1 }, callId: 't2' });
-      const other = bridge.callTool(token, { name: 'save_note', args: {} });
-      expect((await other).content).toBe('next');
+      const queued = bridge.callTool(token, { name: 'save_note', args: {} }); // already queued behind the hung write
       const joined = await retry;
       expect(joined.isError).toBe(true);
       expect(joined.content).toContain('outcome is not known');
+      // the slot is free, but the queued write may not run past the unknown outcome
+      expect((await queued).content).toContain('outcome is not known');
       expect(bridge.sessionStatus(RUN.userId, RUN.sessionId)?.unknownOutcome).toBe(true);
       hung.resolve(ok('finally'));
       await stuck;
       const rec = bridge.takeLedger(RUN.runId).records.find((r) => r.toolCallId === 't1');
       expect(rec?.heldPastLimit).toBe(true);
       expect(bridge.beginTurn(RUN.userId, RUN.sessionId).previousUnknownOutcome).toBe(true);
+      expect((await bridge.callTool(token, { name: 'save_note', args: {} })).content).toBe('next');
     });
   });
 
@@ -715,7 +717,7 @@ describe('ToolBridge ledger, halts, stop and repeat guard', () => {
   // ─── Runs ───────────────────────────────────────────────────────────────────
 
   describe('runs and sessions', () => {
-    it('replacing a run does not reset the session write queue', async () => {
+    it('replacing a run frees the slot of the write it abandons, and that write blocks further writes in the same turn', async () => {
       const first = deferred<BridgeExecuteOutcome>();
       const order: string[] = [];
       let n = 0;
@@ -726,18 +728,18 @@ describe('ToolBridge ledger, halts, stop and repeat guard', () => {
         }) as any,
       });
       const { bridge } = make(deps);
+      bridge.beginTurn(RUN.userId, RUN.sessionId);
       const t1 = bridge.openRun(RUN);
       void bridge.callTool(t1, { name: 'save_note', args: { id: 'one' } });
       await flush();
-      const t2 = bridge.openRun(RUN); // reconnect: same run id, new token
-      // the replaced run left a write with an unknown outcome; a new user turn starts clean, but the old write still holds the slot
-      bridge.beginTurn(RUN.userId, RUN.sessionId);
-      const second = bridge.callTool(t2, { name: 'save_note', args: { id: 'two' } });
-      await flush();
-      expect(order).toEqual(['one']); // the second write waits for the first
+      const t2 = bridge.openRun(RUN); // reconnect: same run id, new token; the first write's answer can no longer reach the model
+      const sameTurn = await bridge.callTool(t2, { name: 'save_note', args: { id: 'two' } });
+      expect(sameTurn.content).toContain('outcome is not known');
+      expect(order).toEqual(['one']);
+      bridge.beginTurn(RUN.userId, RUN.sessionId); // the user answers: a new turn runs without waiting for the abandoned write
+      expect((await bridge.callTool(t2, { name: 'save_note', args: { id: 'three' } })).content).toBe('second');
+      expect(order).toEqual(['one', 'three']);
       first.resolve(ok('first'));
-      await second;
-      expect(order).toEqual(['one', 'two']);
     });
 
     it('refuses to open a run id that is open for another user or session', () => {
@@ -829,7 +831,7 @@ describe('ToolBridge ledger, halts, stop and repeat guard', () => {
     });
 
     it('revokeConnection closes every run funded by that connection and returns their ids', async () => {
-      const { bridge } = make();
+      const { bridge } = make(makeDeps({ isLive: jest.fn(async () => true) }));
       const t1 = bridge.openRun(claims);
       const t2 = bridge.openRun({ runId: 'run-2', userId: 'user-2', sessionId: 's2' });
       const t3 = bridge.openRun({ runId: 'run-3', userId: 'user-1', sessionId: 's3', connectionId: 'conn-other', epoch: 1 });
@@ -841,7 +843,7 @@ describe('ToolBridge ledger, halts, stop and repeat guard', () => {
 
     it('a write that was revoked while it executed is flagged', async () => {
       const gate = deferred<BridgeExecuteOutcome>();
-      const deps = makeDeps({ execute: jest.fn(async () => gate.promise) as any });
+      const deps = makeDeps({ execute: jest.fn(async () => gate.promise) as any, isLive: jest.fn(async () => true) });
       const { bridge } = make(deps);
       const token = bridge.openRun(claims);
       const p = bridge.callTool(token, { name: 'send_email', args: {}, callId: 'a' });
