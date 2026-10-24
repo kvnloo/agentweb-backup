@@ -6,7 +6,8 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { verifyBinary, assertTrustedPath } from "../../host/binary";
 import { assertNoSubuidOverlap, HostConfigError, parseHostConfig } from "../../host/hostConfig";
-import { assertKeyFileMode, portConfigFor, reportTlsCertExpiry } from "../../host/main";
+import { assertKeyFileMode, managerConfigFor, portConfigFor, reportTlsCertExpiry } from "../../host/main";
+import { DEFAULT_CONFIG } from "../../connectionManager";
 import { registerRange } from "../../host/ranges";
 import { assertHomesMount, assertRoot, parseMounts } from "../../host/startupChecks";
 
@@ -38,6 +39,23 @@ describe("stopGraceSec (graceful customer-unit stop)", () => {
     expect(portConfigFor(cfg).killTimeoutMs).toBe(15_000 + 12_000);
     expect(portConfigFor(parseHostConfig(base())).killTimeoutMs).toBe(25_000);
     expect(portConfigFor(cfg).commandTimeoutMs).toBeGreaterThanOrEqual(2 * 12_000); // one `systemctl stop` may block for the SIGTERM phase and again for the final SIGKILL phase
+  });
+});
+
+describe("manager timers derived from the stop grace", () => {
+  it("a stopping provider gets the default abort grace PLUS the unit's stop grace", () => {
+    expect(managerConfigFor(parseHostConfig(base())).abortGraceMs).toBe(DEFAULT_CONFIG.abortGraceMs + 10_000);
+    expect(managerConfigFor(parseHostConfig({ ...base(), limits: { stopGraceSec: 2 } })).abortGraceMs).toBe(DEFAULT_CONFIG.abortGraceMs + 2_000);
+  });
+  it("a configured abortGraceMs does NOT drop the stop grace (it is the base the grace is added to)", () => {
+    const cfg = parseHostConfig({ ...base(), limits: { stopGraceSec: 12 }, manager: { abortGraceMs: 5_000 } });
+    expect(managerConfigFor(cfg).abortGraceMs).toBe(5_000 + 12_000);
+  });
+  it("test overrides still win, and the uid range comes from the host config", () => {
+    const m = managerConfigFor(parseHostConfig(base()), { abortGraceMs: 30 });
+    expect(m.abortGraceMs).toBe(30);
+    expect(m.uidMin).toBe(400_000);
+    expect(m.uidMax).toBe(410_000);
   });
 });
 

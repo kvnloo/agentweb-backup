@@ -1018,16 +1018,25 @@ export class ConnectionManager {
 
   /** Stops every turn and process of a connection (epoch changed, disabled, revoked, alarm). */
   private async terminateConnection(c: ConnRecord, reason: string): Promise<void> {
-    // Revoke and the hazard alarm kill HARD, first: the home is wiped right after (a graceful stop would protect nothing) and a process
-    // under an alarm must not get a grace period to run on (e.g. exit-time hooks). Disable and a reconnect keep the login, so they stop gracefully.
-    const hard = reason === "revoked" || reason === "alarm";
-    if (hard && c.uid >= 0) await this.safeKill(c.uid, undefined, true);
+    // Everything synchronous first, so nothing below can leave a turn running if a kill fails: turns are aborted (they report "aborted:
+    // <reason>", not a transient failure caused by the kill) and every session is marked dead (no new work, no auth check).
     for (const t of [...this.turns.values()]) if (t.connectionId === c.connectionId) t.abort(reason);
     const list = this.sessions.get(c.connectionId) ?? [];
     this.sessions.delete(c.connectionId);
+    for (const hs of list) hs.dead = true;
+    // Revoke and the hazard alarm kill HARD: a revoked home is wiped right after, and a process under an alarm (the connection is retired
+    // to needs_attention and its login never reused) must not get a grace period to run on (e.g. exit-time hooks). Disable and a
+    // reconnect keep the login, so they stop gracefully. Best effort: the final kill below is the one that reports a failure.
+    const hard = reason === "revoked" || reason === "alarm";
+    if (hard && c.uid >= 0) {
+      try {
+        await this.safeKill(c.uid, undefined, true);
+      } catch (err) {
+        this.log.warn("hard_kill_failed", { connectionId: c.connectionId, reason, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
     await Promise.all(
       list.map(async (hs) => {
-        hs.dead = true;
         try {
           await this.a("closeSession", async () => (await hs.ready).close());
         } catch {

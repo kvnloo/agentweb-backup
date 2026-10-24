@@ -39,6 +39,19 @@ describe("cleanup targets the right uid", () => {
     expect(rig.fs.killedHard).toContain(u1);
   });
 
+  it("a hard kill that FAILS cannot strand the connection's turns: they are aborted and the sessions closed regardless, and the final kill still completes the revoke", async () => {
+    rig = makeRig({ config: { abortGraceMs: 30 } });
+    await signIn(rig, "c1", 1);
+    rig.script.hangTurn = true;
+    const out = drain((await rig.mgr.runTurn(turnReq("c1", 1))).events!);
+    await flush();
+    rig.fs.failKillOnce = true; // the FIRST killAll (the hard one) throws
+    await expect(rig.mgr.revoke({ connectionId: "c1", epoch: 2 })).resolves.toMatchObject({ cleanupConfirmed: true });
+    const events = await out;
+    expect(events[events.length - 1]).toMatchObject({ type: "result", ok: false, aborted: "revoked" }); // aborted by the revoke, not a failure caused by the kill
+    expect(rig.fs.killed.length).toBeGreaterThan(0); // the final (graceful) kill still ran after the failed hard one
+  });
+
   it("a hung turn after a revoke never calls killAll with an out-of-range uid (-1 would mean every process)", async () => {
     rig = makeRig({ config: { abortGraceMs: 30 } });
     await signIn(rig, "c1", 1);
@@ -243,7 +256,7 @@ describe("a hung adapter or port cannot wedge a connection", () => {
   it("a revoke whose cleanup throws reports cleanup pending instead of failing, and the sweeper finishes it", async () => {
     rig = makeRig();
     await signIn(rig, "c1", 1);
-    rig.fs.failKillOnce = true;
+    rig.fs.failKills = 2; // the hard kill (best effort) AND the final kill fail: the cleanup is really pending
     await expect(rig.mgr.revoke({ connectionId: "c1", epoch: 2 })).resolves.toMatchObject({ state: "revoking", cleanupConfirmed: false });
     await rig.mgr.sweep();
     expect(rig.mgr.status({ connectionId: "c1" }).state).toBe("revoked");

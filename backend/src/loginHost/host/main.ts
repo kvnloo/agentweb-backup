@@ -121,6 +121,19 @@ export interface BuiltHost {
   egressRef: EgressRef;
 }
 
+/** The connection manager's config: defaults, then the host config's overrides, then the values derived from the unit stop grace. */
+export function managerConfigFor(cfg: HostConfig, overrides: Partial<ManagerConfig> = {}): ManagerConfig {
+  return {
+    ...DEFAULT_CONFIG,
+    ...cfg.manager,
+    // Whatever base is in effect (the default or a configured value), a stopping provider also gets the unit's stop grace.
+    abortGraceMs: (cfg.manager?.abortGraceMs ?? DEFAULT_CONFIG.abortGraceMs) + cfg.limits.stopGraceSec * 1000,
+    uidMin: cfg.uidMin,
+    uidMax: cfg.uidMax,
+    ...overrides,
+  };
+}
+
 export function buildHost(cfg: HostConfig, binary: VerifiedBinary, deps: HostDeps): BuiltHost {
   const layout = layoutFor(cfg);
   const egressRef: EgressRef = {};
@@ -150,15 +163,7 @@ export function buildHost(cfg: HostConfig, binary: VerifiedBinary, deps: HostDep
     ids: deps.ids ?? realIds,
     adapters,
     log: deps.log,
-    config: {
-      ...DEFAULT_CONFIG,
-      // After an abort the provider gets its stop grace (plus the usual margin) before the turn is called hung.
-      abortGraceMs: DEFAULT_CONFIG.abortGraceMs + cfg.limits.stopGraceSec * 1000,
-      ...cfg.manager,
-      uidMin: cfg.uidMin,
-      uidMax: cfg.uidMax,
-      ...(deps.managerOverrides ?? {}),
-    },
+    config: managerConfigFor(cfg, deps.managerOverrides),
   });
   return { layout, port, store, manager, egressRef };
 }

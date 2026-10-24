@@ -38,6 +38,8 @@ export class FakeFs implements UserFsPort {
   killGate?: Promise<void>;
   /** killAll throws once. */
   failKillOnce = false;
+  /** killAll throws this many more times (each call counts). */
+  failKills = 0;
   /** promoteAttempt throws before doing anything. */
   failPromote = false;
   /** promoteAttempt moves the directory and THEN throws: the shape of a crash between the rename and the save. */
@@ -104,6 +106,10 @@ export class FakeFs implements UserFsPort {
     if (this.killGate) await this.killGate;
     if (this.failKillOnce) {
       this.failKillOnce = false;
+      throw new Error("kill failed");
+    }
+    if (this.failKills > 0) {
+      this.failKills--;
       throw new Error("kill failed");
     }
     this.killed.push(uid);
