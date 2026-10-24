@@ -72,6 +72,8 @@ export class FakeSystem implements CommandPort, RootFs {
   clientKills = 0;
   /** Units refuse to die (`systemctl kill/stop` is a no-op): an immortal process. */
   immortal = new Set<string>();
+  /** `systemctl stop <unit>` exits non-zero and does nothing (a stuck unit / bus error): the port must fall back to SIGKILL. */
+  stopFails = false;
   /** A gate the `systemctl stop <slice>` waits for (a slow kill). */
   stopGate?: Promise<void>;
   /** systemd-run client dies at once (as if killed) while the unit keeps running. */
@@ -193,6 +195,7 @@ export class FakeSystem implements CommandPort, RootFs {
       if (m) for (const u of this.units.values()) if (u.uid === Number(m[2]) && !this.immortal.has(u.name)) this.endUnit(u, 255);
       return ok();
     }
+    if (sub === "stop" && this.stopFails && !rest[0].endsWith(".slice")) return ok("", 1);
     if ((sub === "stop" || sub === "kill") && rest.length) {
       const unit = rest[rest.length - 1];
       const u = this.units.get(unit);

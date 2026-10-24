@@ -96,7 +96,8 @@ export function portConfigFor(cfg: HostConfig, egressRef?: EgressRef): SystemdPo
     },
     limits: cfg.limits,
     paths: { ...cfg.tools, inaccessible: [cfg.socket.dir], net: { dir: cfg.egressDir, launcher: cfg.egress.launcherPath, socat: cfg.egress.socat } },
-    killTimeoutMs: 15_000,
+    // A graceful stop (stopGraceSec) happens inside every kill: the budget must cover it, or a normal stop would read as a stuck unit.
+    killTimeoutMs: 15_000 + cfg.limits.stopGraceSec * 1000,
     killPollMs: 100,
     commandTimeoutMs: 30_000,
     ...(cfg.quota ? { quota: cfg.quota } : {}),

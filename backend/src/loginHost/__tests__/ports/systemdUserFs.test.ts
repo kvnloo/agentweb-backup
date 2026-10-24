@@ -235,13 +235,27 @@ describe("UnitChild: kill by unit name, 'gone' only when the unit is inactive", 
   it("kill() acts on the UNIT at once, synchronously (it does not wait for the client to die, which would leave the unit running)", async () => {
     const { child, sys, unit } = await started();
     child.kill();
-    expect(sys.callsOf("/usr/bin/systemctl").some((c) => c.args.join(" ") === `kill -s SIGKILL ${unit.name}`)).toBe(true); // recorded before any await
+    expect(sys.callsOf("/usr/bin/systemctl").some((c) => c.args.join(" ") === `stop ${unit.name}`)).toBe(true); // recorded before any await
   });
-  it("kill() runs systemctl kill on the UNIT (not a signal to the client) and the exit is reported after it is inactive", async () => {
+  it("kill() is GRACEFUL: a plain `systemctl stop` of the UNIT (SIGTERM, then SIGKILL after TimeoutStopSec), never a SIGKILL while the stop works (a hard kill mid-refresh destroys the login)", async () => {
     const { child, exits, sys, unit } = await started();
     child.kill();
     await tick();
-    expect(sys.callsOf("/usr/bin/systemctl").some((c) => c.args.join(" ") === `kill -s SIGKILL ${unit.name}`)).toBe(true);
+    const calls = sys.callsOf("/usr/bin/systemctl").map((c) => c.args.join(" "));
+    expect(calls).toContain(`stop ${unit.name}`);
+    expect(calls.some((c) => c.startsWith("kill "))).toBe(false);
+    expect(unit.state).toBe("inactive");
+    expect(exits).toEqual([[255, null]]);
+  });
+  it("falls back to SIGKILL only when the graceful stop itself fails, so a unit can never outlive its turn", async () => {
+    const { child, exits, sys, unit } = await started();
+    sys.stopFails = true;
+    child.kill();
+    await tick();
+    const calls = sys.callsOf("/usr/bin/systemctl").map((c) => c.args.join(" "));
+    expect(calls).toContain(`stop ${unit.name}`);
+    expect(calls).toContain(`kill -s SIGKILL ${unit.name}`);
+    expect(calls.indexOf(`stop ${unit.name}`)).toBeLessThan(calls.indexOf(`kill -s SIGKILL ${unit.name}`));
     expect(unit.state).toBe("inactive");
     expect(exits).toEqual([[255, null]]);
   });

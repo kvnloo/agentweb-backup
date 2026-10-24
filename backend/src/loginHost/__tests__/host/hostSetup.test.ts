@@ -33,7 +33,7 @@ describe("host config (a CLOSED schema)", () => {
     const c = parseHostConfig(base());
     expect(c.stateRoot).toBe("/var/lib/aw-login-host/test1");
     expect(c.socketPath).toBe("/run/aw-login-host-test1/host.sock");
-    expect(c.limits).toEqual({ memoryMax: "1G", tasksMax: 256, tmpSize: "128M", shmSize: "64M", runtimeMaxSec: 7200 });
+    expect(c.limits).toEqual({ memoryMax: "1G", tasksMax: 256, tmpSize: "128M", shmSize: "64M", runtimeMaxSec: 7200, stopGraceSec: 10 });
     expect(c.tools.systemRun).toBe("/usr/bin/systemd-run");
     expect(c.claude.turnWrapperPath).toBe("/opt/aw-login-host/claude-turn.sh");
     expect(c.socket.mode).toBe(0o660);

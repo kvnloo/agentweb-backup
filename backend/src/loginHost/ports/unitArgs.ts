@@ -20,6 +20,12 @@ export interface UnitLimits {
   shmSize: string;
   /** Hard ceiling on a unit's lifetime: a unit that outlives its turn (a lost client, a hung CLI) is ended by systemd itself. */
   runtimeMaxSec: number;
+  /**
+   * How long a stopping unit gets to exit on SIGTERM before systemd sends SIGKILL (default 10). The CLI refreshes an expired login in
+   * its first seconds: the server rotates BOTH tokens and the new pair is written afterwards, so a SIGKILL in between destroys the login
+   * (verified live 2026-10-24; SIGTERM with a grace period kept it 5/5). Every stop of a customer unit must therefore be graceful first.
+   */
+  stopGraceSec?: number;
 }
 
 export interface UnitSpec {
@@ -50,12 +56,15 @@ export interface UnitPaths {
 }
 
 const SIZE = /^[1-9][0-9]{0,6}[KMG]$/;
+export const DEFAULT_STOP_GRACE_SEC = 10;
 
 /** The sandbox properties, in a fixed order (one `-p` each). */
 export function unitProperties(layout: Layout, spec: UnitSpec, limits: UnitLimits, paths: UnitPaths): string[] {
   if (!SIZE.test(limits.memoryMax) || !SIZE.test(limits.tmpSize) || !SIZE.test(limits.shmSize)) throw new Error("unit limits invalid");
   if (!Number.isInteger(limits.tasksMax) || limits.tasksMax < 1 || limits.tasksMax > 100_000) throw new Error("unit limits invalid");
   if (!Number.isInteger(limits.runtimeMaxSec) || limits.runtimeMaxSec < 10 || limits.runtimeMaxSec > 7 * 24 * 3600) throw new Error("unit limits invalid");
+  const grace = limits.stopGraceSec ?? DEFAULT_STOP_GRACE_SEC;
+  if (!Number.isInteger(grace) || grace < 2 || grace > 120) throw new Error("unit limits invalid");
   const ref = assertAbsPath(spec.refDir);
   return [
     "ProtectSystem=strict",
@@ -108,6 +117,12 @@ export function unitProperties(layout: Layout, spec: UnitSpec, limits: UnitLimit
     `MemoryMax=${limits.memoryMax}`,
     `TasksMax=${limits.tasksMax}`,
     `RuntimeMaxSec=${limits.runtimeMaxSec}`,
+    // Graceful stop: SIGTERM to the main process only (the egress helper beside it keeps the network up while the CLI finishes
+    // writing a refreshed login), then SIGKILL to whatever is left after the grace period.
+    "KillMode=mixed",
+    "KillSignal=SIGTERM",
+    `TimeoutStopSec=${grace}s`,
+    "SendSIGKILL=yes",
     "OOMScoreAdjust=500", // under memory pressure the kernel picks customers, never the host service
   ];
 }
