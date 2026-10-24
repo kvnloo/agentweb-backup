@@ -75,7 +75,7 @@ describe('tool bridge MCP endpoint', () => {
     bridge = new ToolBridge(deps);
     adapter = new ToolBridgeMcpAdapter(bridge);
     const app = express();
-    app.use(express.json());
+    app.use(express.json({ limit: '50mb' })); // the app's own limit (app.ts)
     app.use('/internal/tool-bridge', createToolBridgeRouter(adapter));
     http = app.listen(0, '127.0.0.1');
     await new Promise<void>((resolve) => http.once('listening', () => resolve()));
@@ -116,7 +116,7 @@ describe('tool bridge MCP endpoint', () => {
       _meta: { [HARNESS_TOOL_USE_ID_META_KEY]: 'toolu_abc123' },
     });
     expect(result).toMatchObject({ content: [{ type: 'text', text: 'get_leads done' }], isError: false });
-    expect(deps.execute).toHaveBeenCalledWith(RUN, { name: 'get_leads', args: { q: 'acme' }, callId: 'toolu_abc123' });
+    expect(deps.execute).toHaveBeenCalledWith(RUN, { name: 'get_leads', args: { q: 'acme' }, callId: 'toolu_abc123' }, expect.anything());
   });
 
   it('answers a forged token exactly as it answers a path that does not exist, and never reaches the bridge', async () => {
@@ -340,6 +340,83 @@ describe('tool bridge MCP endpoint', () => {
     const noSession = await fetch(`${baseUrl}/internal/tool-bridge/${RUN.runId}/mcp`, { method: 'POST', headers, body });
     expect(noSession.status).toBe(400);
   });
+  // ─── ENG-2113 PR B ──────────────────────────────────────────────────────────
+
+  it('answers the initialize request as plain JSON, not an event stream (the CLI handshake fails on SSE)', async () => {
+    const token = adapter.openRun(RUN);
+    const res = await fetch(`${baseUrl}/internal/tool-bridge/${RUN.runId}/mcp`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/event-stream',
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'probe', version: '1' } },
+      }),
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('application/json');
+    expect(res.headers.get('content-type')).not.toContain('text/event-stream');
+    const body = await res.json();
+    expect(body.result.serverInfo.name).toBe('emma');
+  });
+
+  it('a stop closes the run and its MCP session, so the harness cannot call again', async () => {
+    const token = adapter.openRun(RUN);
+    const client = await connect(token);
+    adapter.beginTurn(RUN.userId, RUN.sessionId);
+    expect(adapter.cancelSession(RUN.userId, RUN.sessionId)).toEqual({ cancelled: true, runIds: [RUN.runId] });
+    await expect(client.callTool({ name: 'launch_campaign', arguments: {} })).rejects.toBeDefined();
+    expect(deps.execute).not.toHaveBeenCalled();
+  });
+
+  it('revoking the connection closes the funded run and its MCP session', async () => {
+    (deps as any).isLive = jest.fn(async () => true);
+    const token = adapter.openRun({ ...RUN, connectionId: 'conn-1', epoch: 2 });
+    const client = await connect(token);
+    expect(adapter.revokeConnection('conn-1')).toEqual([RUN.runId]);
+    await expect(client.callTool({ name: 'get_leads', arguments: {} })).rejects.toBeDefined();
+  });
+
+  it('feeds the stream events to the bridge so a repeated call in one message collapses', async () => {
+    const token = adapter.openRun(RUN, { callGroupWaitMs: 100 });
+    adapter.noteToolUse(RUN.runId, 'toolu_1', 'get_leads', { q: 'a' }, 'msg_1');
+    adapter.noteToolUse(RUN.runId, 'toolu_2', 'get_leads', { q: 'a' }, 'msg_1');
+    const client = await connect(token);
+    const call = (id: string) =>
+      client.callTool({ name: 'get_leads', arguments: { q: 'a' }, _meta: { [HARNESS_TOOL_USE_ID_META_KEY]: id } });
+    const first = await call('toolu_1');
+    const second = await call('toolu_2');
+    expect((first.content as any)[0].text).toBe('get_leads done');
+    expect((second.content as any)[0].text).toContain('was collapsed');
+    expect(deps.execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('carries unicode and a 300 KB argument to the tool byte-identical over real HTTP', async () => {
+    const token = adapter.openRun(RUN);
+    const client = await connect(token);
+    const unicode = 'héllo wörld 你好, 世界 🚀 — “quotes” \\ backslash \t tab \u0000 nul';
+    const big = 'x'.repeat(300_000) + '🚀';
+    await client.callTool({ name: 'get_leads', arguments: { q: unicode } });
+    await client.callTool({ name: 'get_leads', arguments: { q: big } });
+    const received = deps.execute.mock.calls.map((c: any[]) => c[1].args.q);
+    expect(received).toEqual([unicode, big]);
+  });
+
+  it('drains and closes through the adapter, returning the ledger', async () => {
+    const token = adapter.openRun(RUN);
+    const client = await connect(token);
+    await client.callTool({ name: 'get_leads', arguments: { q: 'a' } });
+    const drained = await adapter.closeRunAndDrain(RUN.runId, 500);
+    expect(drained?.settled).toBe(true);
+    expect(drained?.ledger.map((r) => r.name)).toEqual(['get_leads']);
+    await expect(client.callTool({ name: 'get_leads', arguments: {} })).rejects.toBeDefined();
+  });
+
 });
 
 describe('isLocalOnlyRequest', () => {
