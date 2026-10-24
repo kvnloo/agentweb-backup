@@ -19,6 +19,10 @@ export interface RunToolTokenClaims {
   runId: string;
   userId: string;
   sessionId: string;
+  /** The subscription connection this run is funded by, when it is. Lets a revoke find the runs it affects. */
+  connectionId?: string;
+  /** The connection's host epoch at open time. */
+  epoch?: number;
 }
 
 export type RunToolTokenRejection = "missing" | "unknown" | "expired" | "wrong_run";
