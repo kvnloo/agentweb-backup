@@ -396,7 +396,7 @@ app.use(express.urlencoded({ limit: "50mb", extended: true }));
 // Alias it onto /api/webhooks/forward-lead (same per-list publicAccessEnabled gate) by
 // moving the path param into body.listId; the path param wins over any body value.
 app.post(/^\/api\/leads\/public\/([^\/]+)\/?$/, (req, _res, next) => {
-  const listId = decodeURIComponent((req.params as Record<string, string>)[0]);
+  const listId = (req.params as Record<string, string>)[0];
   const body = req.body && typeof req.body === "object" ? req.body : {};
   req.body = { ...body, listId };
   req.url = "/api/webhooks/forward-lead";
