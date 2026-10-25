@@ -359,3 +359,27 @@ describe('ENG-2593 public CORS for /api/webhooks/forward-lead', () => {
     expect(res.headers['access-control-allow-origin']).toBeUndefined();
   });
 });
+
+describe('ENG-2657 /api/leads/public/:listId alias of forward-lead', () => {
+  const customerOrigin = 'https://nuerraa.com';
+
+  it('answers the preflight from a customer origin with open CORS', async () => {
+    const res = await request(app)
+      .options('/api/leads/public/some-list-id')
+      .set('Origin', customerOrigin)
+      .set('Access-Control-Request-Method', 'POST')
+      .set('Access-Control-Request-Headers', 'Content-Type');
+    expect(res.status).toBe(200);
+    expect(res.headers['access-control-allow-origin']).toBe('*');
+  });
+
+  it('routes the POST into forward-lead with listId from the path', async () => {
+    const res = await request(app)
+      .post('/api/leads/public/some-list-id')
+      .set('Origin', customerOrigin)
+      .send({ email: 'a@b.co' });
+    expect(res.status).not.toBe(400); // listId came from the path, so forward-lead did not reject it as missing
+    expect(res.text).not.toContain('Not allowed by CORS');
+    expect(res.headers['access-control-allow-origin']).toBe('*');
+  });
+});
