@@ -155,8 +155,10 @@ export async function handleResult(req: Request, res: Response): Promise<void> {
       args,
     });
 
-    // 5. Enable interactive sharing
-    const ishareUrl = await chatbotDb.createOrReuseInteractiveShare(session.sessionId);
+    // 5. Enable interactive sharing. The link is a conversable (chat-as-owner) credential for
+    // the reviewer, so it is NOT returned to the anonymous caller (ENG-2669); the reviewer gets
+    // it from the token-gated GET /review/:sessionId.
+    await chatbotDb.createOrReuseInteractiveShare(session.sessionId);
 
     // 6. Set LLM model (use default)
     const llmModel = await agentModeService.getDefaultModel();
@@ -207,7 +209,6 @@ export async function handleResult(req: Request, res: Response): Promise<void> {
     res.status(200).json({
       success: true,
       sessionId: session.sessionId,
-      ishareUrl,
       configName: config.name,
       resultTitle: config.resultTitle || config.name,
     });

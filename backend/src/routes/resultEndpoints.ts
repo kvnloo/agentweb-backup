@@ -39,7 +39,13 @@ router.get('/:resultName/info', async (req, res) => {
   }
 });
 
-// GET status for polling from the waiting page
+// GET status for polling from the waiting page.
+// ENG-2669: the session id is the only credential here and it sits in the lead's page URL
+// (and so in history, referrers and shared links). The route therefore answers only for a
+// session that belongs to :resultName, returns the same 404 for "no such session" and
+// "not this endpoint's session" (no existence oracle), and exposes just what the lead's
+// own waiting page renders: completion + the report link. The lead's email, the generated
+// HTML and the iShare chat link stay behind the reviewer token (`/review/*`).
 router.get('/:resultName/status/:sessionId', async (req, res) => {
   try {
     const { resultName, sessionId } = req.params;
@@ -51,14 +57,14 @@ router.get('/:resultName/status/:sessionId', async (req, res) => {
       return res.status(404).json({ error: `Result endpoint "${resultName}" not found` });
     }
 
-    // Load session
+    // Load session; it must be a session this very endpoint created
     const session = await chatbotDb.getChatSession(sessionId);
-    if (!session) {
+    const metadata = session?.resultEndpointMetadata;
+    if (!session || metadata?.resultName !== resultName) {
       return res.status(404).json({ error: 'Session not found' });
     }
 
-    const metadata = session.resultEndpointMetadata;
-    const isCompleted = !!(metadata?.contentUrl || metadata?.contentHtml);
+    const isCompleted = !!(metadata.contentUrl || metadata.contentHtml);
 
     const response: Record<string, any> = {
       status: isCompleted ? 'completed' : 'pending',
@@ -66,12 +72,8 @@ router.get('/:resultName/status/:sessionId', async (req, res) => {
       waitingContent: config.waitingContent || null,
     };
 
-    if (isCompleted) {
-      if (metadata?.contentUrl) {
-        response.reportUrl = metadata.contentUrl;
-      }
-      response.contentHtml = metadata?.contentHtml || null;
-      response.leadEmail = metadata?.leadEmail || null;
+    if (isCompleted && metadata.contentUrl) {
+      response.reportUrl = metadata.contentUrl;
     }
 
     return res.json(response);
