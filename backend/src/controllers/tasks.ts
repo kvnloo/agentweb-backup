@@ -16,6 +16,7 @@ import { parseAgentModeImageIds } from '../utils/agentModeAssetIds';
 import { retryTransientWrite } from '../services/usageWriteFailureMonitor';
 import { renderPlacidImage, describePlacidError } from '../services/placidRenderService';
 import { uploadFileToS3 } from '../utils/s3Utils';
+import { getInteractiveShareExpiresAt } from '../utils/interactiveShare';
 import { v4 as uuidv4 } from 'uuid';
 
 const s3 = new S3();
@@ -818,20 +819,31 @@ export const getTaskExecutionPublic = async (req: Request, res: Response) => {
     // Check if the session is shared (either view-only or interactive)
     const hasViewOnlyShare = session.shareMetadata?.isShared;
     const hasInteractiveShare = session.interactiveShareMetadata?.isActive;
-    
+
     if (!hasViewOnlyShare && !hasInteractiveShare) {
       return res.status(404).json({ message: 'Session is not shared' });
     }
 
-    // Check if the session has expired (for view-only shares)
-    if (hasViewOnlyShare && session.shareMetadata?.expiresAt && new Date() > new Date(session.shareMetadata.expiresAt)) {
-      return res.status(410).json({ message: 'Share link has expired' });
+    const viewOnlyExpired = !!(hasViewOnlyShare && session.shareMetadata?.expiresAt
+      && new Date() > new Date(session.shareMetadata.expiresAt));
+
+    // A live read-only share is public by design (portal ShareConversation page, no credential).
+    if (!hasViewOnlyShare || viewOnlyExpired) {
+      if (!hasInteractiveShare || !session.interactiveShareMetadata) {
+        return res.status(410).json({ message: 'Share link has expired' });
+      }
+      // ENG-2644: an interactive share is opened with its conversable token, never by the session id alone.
+      // Same expiry + token checks as the /ishare routes in agentModeController.
+      const interactiveShare = session.interactiveShareMetadata;
+      if (new Date() > getInteractiveShareExpiresAt(interactiveShare)) {
+        await chatbotDb.updateSessionInteractiveShareMetadata(sessionId, { ...interactiveShare, isActive: false });
+        return res.status(410).json({ message: 'Interactive share link has expired' });
+      }
+      const conversable = req.query.conversable;
+      if (!interactiveShare.token || interactiveShare.token !== conversable) {
+        return res.status(401).json({ message: 'Invalid or expired conversable token' });
+      }
     }
-    
-    // Check if the interactive share has expired (interactive shares don't have expiration for now)
-    // if (hasInteractiveShare && session.interactiveShareMetadata?.expiresAt && new Date() > new Date(session.interactiveShareMetadata.expiresAt)) {
-    //   return res.status(410).json({ message: 'Interactive share link has expired' });
-    // }
 
     // Verify that the task execution exists in this session's messages
     let taskExecutionFound = false;
