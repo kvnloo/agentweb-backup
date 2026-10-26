@@ -1364,6 +1364,29 @@ describe('LinkedInAdapter', () => {
       }
     });
 
+    it('throws the retryable FreshTokenRejectedError, not the reconnect error, when a refreshed token keeps getting 401 (ENG-2663)', async () => {
+      jest.useFakeTimers();
+      try {
+        const expiredAccount = {
+          ...mockPersonalAccount,
+          config: { ...mockPersonalAccount.config, token_expires_at: Date.now() - 1000, refresh_token: 'rt' },
+        };
+        mockLinkedInService.refreshAccessToken.mockResolvedValue({ access_token: 'fresh-token', expires_in: 5184000 });
+        mockLinkedInService.createComment.mockRejectedValue(new Error('LinkedIn access token expired or invalid'));
+
+        const pending = adapter.createComment(expiredAccount as any, 'urn:li:share:123', 'Great post!').catch((e) => e);
+        await jest.advanceTimersByTimeAsync(11000);
+        const err: any = await pending;
+
+        expect(err.name).toBe('FreshTokenRejectedError');
+        expect(err.freshTokenRejected).toBe(true);
+        expect(err.message).not.toMatch(/access token expired/);
+        expect(mockLinkedInService.createComment).toHaveBeenCalledTimes(2);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
     it('does not retry a 401 when the stored token was not refreshed', async () => {
       mockLinkedInService.createComment.mockRejectedValue(new Error('LinkedIn access token expired or invalid'));
 
