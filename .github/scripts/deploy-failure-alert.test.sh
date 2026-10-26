@@ -383,6 +383,24 @@ check_workflow() {
   fi
 }
 
+# check_alert_job: like check_workflow, but scoped to the notify-deploy-failure
+# job block. ENG-2677 added a separate success-only notify-feature-launch job;
+# AC2/AC4 are claims about the FAILURE alert, not the whole file.
+check_alert_job() {
+  local desc="$1" pattern="$2" expectation="$3" block
+  TESTS_RUN=$(( TESTS_RUN + 1 ))
+  block="$(awk '/^  notify-deploy-failure:$/{f=1;print;next} f&&/^  [a-z0-9-]+:$/{f=0} f' "${DEPLOY_WORKFLOW}" | sed -e 's/^[[:space:]]*#.*$//')"
+  if [ -z "${block}" ]; then
+    record_fail "${desc}" "notify-deploy-failure job block not found"
+    return
+  fi
+  if printf '%s\n' "${block}" | grep -E "${pattern}" >/dev/null; then
+    [ "${expectation}" = 'present' ] && pass "${desc}" || record_fail "${desc}" "notify-deploy-failure unexpectedly matches: ${pattern}"
+  else
+    [ "${expectation}" = 'absent' ] && pass "${desc}" || record_fail "${desc}" "notify-deploy-failure does not match: ${pattern}"
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # Cases
 # ---------------------------------------------------------------------------
@@ -853,9 +871,9 @@ if grep -q 'detect-changes' <<<"${NOTIFY_IF}"; then
 else
   pass 'it does NOT fire on detect-changes, which deploys nothing'
 fi
-check_workflow 'AC2: it never fires on a skipped job' \
+check_alert_job 'AC2: it never fires on a skipped job' \
   "result == 'skipped'" 'absent'
-check_workflow 'AC2: it never fires on a successful job' \
+check_alert_job 'AC2: it never fires on a successful job' \
   "result == 'success'" 'absent'
 check_workflow 'it runs in the prod environment, where the AWS secrets live' \
   '^    environment: prod$' 'present'
@@ -863,7 +881,7 @@ check_workflow 'it can list the run jobs and read their annotations' \
   '^      actions: read$' 'present'
 check_workflow 'the Slack secret id is passed in, not guessed' \
   'SLACK_SECRET_ID: prod/AgentWeb/Slack' 'present'
-check_workflow 'AC4: the notify step is not allowed to fail quietly' \
+check_alert_job 'AC4: the notify step is not allowed to fail quietly' \
   'continue-on-error *:' 'absent'
 
 # The bot can only post where it is already a member, so the channel has to be
