@@ -133,6 +133,7 @@ export function buildSyntheticTaskSet(): AbTask[] {
           taskType: taskType as AgentWebTaskType,
           synthetic: true,
           brand: brand.name,
+          template: `${taskType}-t${t + 1}`,
           ...template(brand, i),
         });
       });

@@ -37,6 +37,8 @@ export interface AbTask {
   requiredTools: string[];
   /** Facts the judge needs that are not in the prompt (e.g. "every number must come from the table"). */
   judgeNotes?: string;
+  /** Which template produced the task (pilot sampling spreads across templates). */
+  template?: string;
 }
 
 /** How the product creates a session for each task type (inverse of agentWebModelRouter.taskTypeForSession). */
@@ -51,8 +53,20 @@ export const SESSION_SHAPE: Record<AgentWebTaskType, { sessionType: string; port
   scheduled: null,
 };
 
-/** Domains a synthetic task may name: RFC 2606 reserved names only. */
-const RESERVED_DOMAIN = /^(?:[a-z0-9-]+\.)*(?:example|invalid|test)(?:\.(?:com|org|net))?$/i;
+const RESERVED_TLDS = new Set(['test', 'example', 'invalid', 'localhost']);
+const RESERVED_SECOND_LEVEL = new Set(['example.com', 'example.net', 'example.org']);
+
+/**
+ * True only for names reserved by RFC 2606 / RFC 6761: the TLDs .test, .example, .invalid and .localhost, and
+ * example.com / example.net / example.org (with any subdomain). "test.com" or "invalid.org" are real domains.
+ */
+export function isReservedDomain(host: string): boolean {
+  const labels = host.toLowerCase().replace(/\.+$/, '').split('.');
+  if (labels.some((l) => !/^[a-z0-9-]+$/.test(l))) return false;
+  if (RESERVED_TLDS.has(labels[labels.length - 1])) return true;
+  return labels.length >= 2 && RESERVED_SECOND_LEVEL.has(labels.slice(-2).join('.'));
+}
+
 const EMAIL = /[A-Z0-9._%+-]+@([A-Z0-9.-]+\.[A-Z]{2,})/gi;
 const URL_HOST = /\bhttps?:\/\/([^/\s"'):,;?#]+)/gi;
 
@@ -77,11 +91,34 @@ export function taskSetProblems(tasks: readonly AbTask[]): string[] {
     for (const re of [EMAIL, URL_HOST]) {
       for (const match of text.matchAll(re)) {
         const host = match[1].replace(/\.+$/, '');
-        if (!RESERVED_DOMAIN.test(host)) problems.push(`${id}: names a non-reserved domain (${host}); synthetic tasks use .example/.invalid/.test only`);
+        if (!isReservedDomain(host)) problems.push(`${id}: names a non-reserved domain (${host}); synthetic tasks use RFC 2606/6761 reserved names only`);
       }
     }
   }
   return problems;
+}
+
+/**
+ * The first `limit` tasks of one cell, spread across templates and brands (round-robin over templates, shifting the
+ * brand each round), so a 2-task pilot never measures two brands of the same template. With no limit, every task.
+ */
+export function sampleAcrossTemplates(tasks: readonly AbTask[], limit = Infinity): AbTask[] {
+  const byTemplate = new Map<string, AbTask[]>();
+  for (const t of tasks) {
+    const key = t.template ?? t.taskId;
+    byTemplate.set(key, [...(byTemplate.get(key) ?? []), t]);
+  }
+  const groups = [...byTemplate.values()];
+  const out: AbTask[] = [];
+  for (let round = 0; out.length < Math.min(limit, tasks.length); round++) {
+    for (let g = 0; g < groups.length && out.length < Math.min(limit, tasks.length); g++) {
+      const group = groups[g];
+      if (round >= group.length) continue;
+      out.push(group[(round + g) % group.length]);
+    }
+    if (round > tasks.length) break;
+  }
+  return out;
 }
 
 /** Stable fingerprint of a task set, recorded with every run so results from different sets never mix. */
@@ -188,6 +225,15 @@ export const GENERATION_PROFILE: Record<AgentWebTaskType, { inputTokens: number;
   report: { inputTokens: 300_000, outputTokens: 8_000 },
 };
 
+/**
+ * Upper bound for ONE LLM call before it is sent, for the budget reservation: every input character counted as a third
+ * of a token (real text and JSON run ~3.5-4 chars per token), no cache discount, and the full output allowance.
+ */
+export function callUpperBoundUsd(model: string, inputChars: number, maxOutputTokens: number): number {
+  const p = priceOrThrow(model);
+  return (Math.ceil(inputChars / 3) * p.inPerM + maxOutputTokens * p.outPerM) / 1_000_000;
+}
+
 /** One judge call (two transcripts + rubric in; checklist, scores and any hidden reasoning out). */
 export const JUDGE_PROFILE: Record<'default' | 'report', { inputTokens: number; outputTokens: number }> = {
   default: { inputTokens: 12_000, outputTokens: 4_000 },
@@ -236,11 +282,22 @@ export interface RunRecord {
   model: string;
   /** Every `llm` stamped on this run's assistant messages: anything but `model` means the run was substituted. */
   ranModels: string[];
-  status: 'ok' | 'error';
+  /**
+   * ok: the run finished (it may still have failed the task, see runFailure). error: it failed after the product's
+   * own retries (a real failure, counted). aborted: the harness stopped it (budget cap, a call with no reported cost);
+   * it is not a measurement, is left out of every metric and is rerun on resume.
+   */
+  status: 'ok' | 'error' | 'aborted';
   error?: string;
+  /** Turns taken, including the verified-chat re-prompts for a skipped required tool. */
+  attempts: number;
   finalText: string;
   toolCalls: Array<{ name: string; args: string }>;
+  /** Token usage of the arm model's assistant messages (for re-pricing). */
   usage: TurnUsage[];
+  /** Every LLM call the run made, with OpenRouter's reported cost (prompt caching included). */
+  calls: Array<{ model: string; costUsd: number; feature?: string }>;
+  /** Sum of `calls`: what the task cost, side calls (e.g. suggested replies) included. */
   costUsd: number;
   latencyMs: number;
   startedAt: string;
@@ -259,11 +316,29 @@ export function runFailure(run: RunRecord, task: AbTask): string | undefined {
   return undefined;
 }
 
+/** Required tools a run has not called yet (each counts once, like a verified-generate `minCount: 1`). */
+export function missingRequiredTools(requiredTools: readonly string[], toolCalls: ReadonlyArray<{ name: string }>): string[] {
+  const called = new Set(toolCalls.map((c) => c.name));
+  return requiredTools.filter((t) => !called.has(t));
+}
+
+/** The re-prompt runVerifiedChatInner sends when a required function is still missing (agentModeController.ts). */
+export function verifiedChatRetryMessage(missing: readonly string[]): string {
+  return `Please try again. Make sure to ${missing.map((fn) => `${fn} (1 more time needed)`).join(', ')}.`;
+}
+
+/** Turns the product's interactive /verified-generate allows by default (Images, Videos, Reports pages, one audience). */
+export const VERIFIED_CHAT_MAX_ATTEMPTS = 5;
+
 // ── Blinding ─────────────────────────────────────────────────────────────────
 
-// A model or vendor name plus any version/variant suffix ("gemini-3.8-flash", "Claude Sonnet 5", "GPT-5.4").
+// A model, model family, lab or model host, plus any version/variant suffix ("gemini-3.8-flash", "Claude Sonnet 5",
+// "GPT-5.4"). Bare "Google" is NOT redacted: it is ordinary marketing vocabulary here (Google Search, Google Ads, a
+// channel in the report data), so only Google-as-model-maker phrases are.
 const MODEL_NAME_PATTERN = new RegExp(
-  '\\b(?:claude|anthropic|sonnet|opus|haiku|gemini|google\\s+deepmind|deepmind|gpt|openai|chatgpt|llama|mistral|deepseek|glm|qwen)'
+  '\\b(?:claude|anthropic|sonnet|opus|haiku|gemini|gemma|bard|palm|google\\s+(?:deepmind|ai|gemini|vertex|bard|llm|model)|'
+    + '(?:trained|built|made|developed|created)\\s+by\\s+google|deepmind|vertex(?:\\s+ai)?|bedrock|openrouter|'
+    + 'azure\\s+openai|gpt|openai|chatgpt|codex|llama|mistral|mixtral|deepseek|glm|zhipu|qwen|grok|xai|cohere|kimi|moonshot|nova)'
     // Each piece has one parse (separators are never digits or dots), so a long run of digits cannot backtrack.
     + '(?:[-\\s]?\\d+(?:\\.\\d+)*)?(?:[-\\s](?:\\d+(?:\\.\\d+)*|flash|pro|lite|preview|sonnet|opus|haiku|sol|luna|mini|nano))*\\b',
   'gi',
@@ -274,19 +349,41 @@ export function redactModelNames(text: string): string {
   return text.replace(MODEL_NAME_PATTERN, '[model]');
 }
 
-const MAX_ARGS_CHARS = 6_000;
-const MAX_FINAL_CHARS = 20_000;
+/** Arguments of a tool call other than the deliverable are clipped; they are context, not the work being judged. */
+const MAX_CONTEXT_ARGS_CHARS = 6_000;
 
 function clip(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max)}\n…[truncated ${text.length - max} chars]`;
 }
 
-/** What the judge (and a human rater) sees of one run: the tool calls it made, with arguments, then its final reply. */
-export function transcriptOf(run: RunRecord): string {
+/** Tool arguments as readable text: a JSON object becomes `key: value` lines with strings unescaped. */
+export function renderArgs(args: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(args);
+  } catch {
+    return args;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return args;
+  return Object.entries(parsed as Record<string, unknown>)
+    .map(([k, v]) => `${k}: ${typeof v === 'string' ? v : JSON.stringify(v)}`)
+    .join('\n');
+}
+
+/**
+ * What the judge (and a human rater) sees of one run: the tool calls it made, then its final reply. The deliverable
+ * is never truncated: a required tool's arguments (e.g. create_blog_article's content_draft, generate_image's prompt)
+ * and the final reply are shown in full. Other tools' arguments are clipped.
+ */
+export function transcriptOf(run: RunRecord, requiredTools: readonly string[] = []): string {
+  const required = new Set(requiredTools);
   const calls = run.toolCalls.length === 0
     ? '(no tool calls)'
-    : run.toolCalls.map((c, i) => `${i + 1}. ${c.name}(${clip(c.args, MAX_ARGS_CHARS)})`).join('\n');
-  return redactModelNames(`Tool calls:\n${calls}\n\nFinal reply:\n${clip(run.finalText || '(empty)', MAX_FINAL_CHARS)}`);
+    : run.toolCalls.map((c, i) => {
+      const args = renderArgs(c.args);
+      return `${i + 1}. ${c.name}${required.has(c.name) ? ' [deliverable]' : ''}:\n${required.has(c.name) ? args : clip(args, MAX_CONTEXT_ARGS_CHARS)}`;
+    }).join('\n\n');
+  return redactModelNames(`Tool calls:\n${calls}\n\nFinal reply:\n${run.finalText || '(empty)'}`);
 }
 
 /** Opaque, seed-dependent id for a pair, so a human sheet reveals nothing about the task order or arms. */
@@ -356,7 +453,7 @@ Respond with ONLY valid JSON:
 
 export function judgeUserContent(task: AbTask, first: RunRecord, second: RunRecord): string {
   const notes = task.judgeNotes ? `\n\nNotes for the judge:\n${task.judgeNotes}` : '';
-  return `The user's request:\n<<<\n${task.prompt}\n>>>${notes}\n\nResponse 1:\n<<<\n${transcriptOf(first)}\n>>>\n\nResponse 2:\n<<<\n${transcriptOf(second)}\n>>>\n\nReturn your JSON now.`;
+  return `The user's request:\n<<<\n${task.prompt}\n>>>${notes}\n\nResponse 1:\n<<<\n${transcriptOf(first, task.requiredTools)}\n>>>\n\nResponse 2:\n<<<\n${transcriptOf(second, task.requiredTools)}\n>>>\n\nReturn your JSON now.`;
 }
 
 export interface JudgeVerdict {
@@ -503,6 +600,14 @@ function mean(xs: readonly number[]): number {
   return xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : NaN;
 }
 
+/** Mean over the finite values only (an errored run's cost is NaN: it is a failure, not a price). */
+function meanFinite(xs: readonly number[]): number {
+  return mean(xs.filter((x) => Number.isFinite(x)));
+}
+
+/** A run's cost for the cost metrics: errored runs are excluded (they stay in the failure rate). */
+const metricCost = (r: RunRecord): number => (r.status === 'ok' ? r.costUsd : NaN);
+
 function quantile(xs: readonly number[], q: number): number {
   if (!xs.length) return NaN;
   const s = [...xs].sort((a, b) => a - b);
@@ -548,13 +653,13 @@ export function summarizeCell(cell: Cell, judge: string, pairs: readonly PairDat
   const diffs = judged.map((p) => p.judgement.routerScore - p.judgement.incumbentScore);
   const rScores = judged.map((p) => p.judgement.routerScore);
   const iScores = judged.map((p) => p.judgement.incumbentScore);
-  const rCost = judged.map((p) => p.router.costUsd);
-  const iCost = judged.map((p) => p.incumbent.costUsd);
+  const rCost = judged.map((p) => metricCost(p.router));
+  const iCost = judged.map((p) => metricCost(p.incumbent));
   const wins = judged.filter((p) => p.judgement.preference === 'router').length;
   const losses = judged.filter((p) => p.judgement.preference === 'incumbent').length;
   const ties = n - wins - losses;
   const qpdRatio = (idx: number[]) => {
-    const pick = (xs: number[]) => mean(idx.map((i) => xs[i]));
+    const pick = (xs: number[]) => meanFinite(idx.map((i) => xs[i]));
     return (pick(rScores) / pick(rCost)) / (pick(iScores) / pick(iCost));
   };
   const failDiff = (idx: number[]) => {
@@ -579,11 +684,11 @@ export function summarizeCell(cell: Cell, judge: string, pairs: readonly PairDat
     meanScore: { router: mean(rScores), incumbent: mean(iScores) },
     scoreDiff: { mean: mean(diffs), ci: bootstrapCi(n, (idx) => mean(idx.map((i) => diffs[i])), 10_000, seed) },
     winRate: { value: n ? (wins + ties / 2) / n : NaN, wins, losses, ties, ci: wilson(wins, wins + losses) },
-    meanCostUsd: { router: mean(pairs.map((p) => p.router.costUsd)), incumbent: mean(pairs.map((p) => p.incumbent.costUsd)) },
+    meanCostUsd: { router: meanFinite(pairs.map((p) => metricCost(p.router))), incumbent: meanFinite(pairs.map((p) => metricCost(p.incumbent))) },
     latencyMs: { router: lat(pairs.map((p) => p.router)), incumbent: lat(pairs.map((p) => p.incumbent)) },
     qpd: {
-      router: mean(rScores) / mean(rCost),
-      incumbent: mean(iScores) / mean(iCost),
+      router: mean(rScores) / meanFinite(rCost),
+      incumbent: mean(iScores) / meanFinite(iCost),
       ratio: n ? qpdRatio(judged.map((_, i) => i)) : NaN,
       ci: bootstrapCi(n, qpdRatio, 10_000, seed),
     },
@@ -595,7 +700,10 @@ export function summarizeCell(cell: Cell, judge: string, pairs: readonly PairDat
 // ── Decision rule (pre-registered: change it only before a run, never after seeing results) ──
 
 export interface DecisionRule {
-  /** Judged pairs a cell needs before it can pass or fail. */
+  /**
+   * Judged pairs a cell needs before it can pass or fail. 36 of the 40 planned, so up to `maxJudgeErrorRate` (10%)
+   * of pairs can fail judging without making the cell inconclusive by count alone.
+   */
   minPairs: number;
   /** Largest allowed increase of the router's failure rate over the incumbent's (point estimate). */
   maxFailureRateIncrease: number;
@@ -612,7 +720,7 @@ export interface DecisionRule {
 }
 
 export const DEFAULT_DECISION_RULE: DecisionRule = {
-  minPairs: 40,
+  minPairs: 36,
   maxFailureRateIncrease: 0.05,
   scoreMargin: 0.5,
   minWinRate: 0.4,

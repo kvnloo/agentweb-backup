@@ -11,22 +11,26 @@ blinded sheet, sealed key, ratings template). Every command resumes from `--out-
 
 **How a run works.** In-process `agentModeService.generateMarketingResponse(..., mockMode=true)` on the Dev tables, in a
 session shaped like the product's (report_generation / image-generation / video-generation / emma-sidebar), with the
-skills carrying the flow's required tool installed as `runVerifiedChat` does. Mock mode means no tool leaves the
-sandbox and both arms see identical tool results. Cost is the turn's assistant-message usage priced by
-`MODEL_PRICING` (an unpriced model is refused, never $0). A run fails if it errored, if any assistant message ran a
-model other than the arm's, if a required tool was not called, or if it returned nothing; a failed arm scores the
-floor without a judge call. Each pair is judged twice (router first, incumbent first) with model names redacted; a
-judge must be from a provider that wrote neither arm (`gpt-6-sol` judges every cell; Sonnet 5 adds a second opinion on
-Gemini-vs-Gemini cells).
+skills carrying the flow's required tool installed as `runVerifiedChat` does. The task is re-prompted ("Please try
+again. Make sure to <tool> (1 more time needed).") up to 5 turns while the required tool is skipped, as the product's
+`/verified-generate` does. Mock mode means no tool leaves the sandbox and both arms see identical tool results. Cost is
+what OpenRouter reported (`usage.cost`, via `openRouterCallCostUsd`) for EVERY LLM call of the run, wrapped at
+`agentModeService.callLLM` (suggested replies and side calls included). A call with no reported cost stops the run.
+A run fails if it errored, if any assistant message ran a model other than the arm's, if a required tool was not
+called, or if it returned nothing; a failed arm scores the floor without a judge call. Each pair is judged twice
+(router first, incumbent first) with model names redacted and the required tool's arguments (the report body in
+`create_blog_article`) shown in full; a judge must be from a provider that wrote neither arm.
 
-**Safety.** `generate`/`judge` refuse anything but `NODE_ENV=development`, refuse a `--user-id` whose email is not on a
-reserved test domain, refuse a task set not marked synthetic or naming a non-reserved domain, and stop before the call
-that would pass `--max-usd` (spend already in `--out-dir` counts). Judge calls are unmetered (eval spend is no
-customer's usage) and capped by OpenRouter's reported cost.
+**Safety and spend.** `generate`/`judge` refuse anything but `NODE_ENV=development`, an unset or production
+`AWS_S3_BUCKET`, an exported `OPENROUTER_API_KEY` (unless `--allow-env-key`), a `--user-id` that is an admin, a shared
+QA account or not on an RFC 2606/6761 reserved domain, and a task set not marked synthetic. Create one budget file
+with `budget --generation-cap 150 --judge-cap 50`; every run (no-tier, Free, pilot, resume) passes it as
+`--budget-file`, so the caps are global. Each call is reserved at an upper bound (max of its estimate and the largest
+cost seen for that model) before it is sent and settled after; a crash leaves the reservation charged. Exit codes:
+0 done, 1 error/refused, 3 stopped at the cap, 4 a call reported no cost.
 
 **Not covered.** `scheduled` is refused (an in-process turn is not a faithful unattended run); v0 routes it to the same
-model as today, so it needs no A/B. Tool-internal LLM calls (e.g. `create_blog_article`'s rewrite, which uses the
-`content_generation` role model) and suggested replies are the same on both arms and are excluded from cost.
+model as today, so it needs no A/B. Mock mode skips the work-plan reminder and the retry backoff sleep (latency only).
 
 **Finding while building it.** The Research Reports flow (`/verified-generate` with `create_blog_article`) runs
 `agent_mode_report_generation_default_model` (falling back to `agent_mode_default_model`), not

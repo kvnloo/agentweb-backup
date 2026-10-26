@@ -14,6 +14,12 @@ import { MODEL_PRICING } from '../utils/llmPricing';
 import {
   DEFAULT_DECISION_RULE,
   SESSION_SHAPE,
+  VERIFIED_CHAT_MAX_ATTEMPTS,
+  callUpperBoundUsd,
+  isReservedDomain,
+  missingRequiredTools,
+  sampleAcrossTemplates,
+  verifiedChatRetryMessage,
   combineOrders,
   decideCell,
   estimateCost,
@@ -38,7 +44,22 @@ import {
   type RunRecord,
 } from '../loops/eval/routerAb';
 import { buildSyntheticTaskSet, syntheticPerformanceTable } from '../loops/eval/routerAbTasks';
-import { evalUserProblem, harvestResponse, parseFlags, parseHumanCsv, parseReprice, requireDevelopment } from '../scripts/routerAbEval';
+import {
+  evalUserProblem,
+  harvestResponse,
+  openRouterKeySource,
+  parseFlags,
+  parseHumanCsv,
+  parseReprice,
+  repricedCostUsd,
+  requireDevelopment,
+  runVerified,
+  s3BucketProblem,
+  skillEntitlementProblems,
+} from '../scripts/routerAbEval';
+import { BudgetExceededError, BudgetLedger, CostMeter, readJsonlRepairing, reportedCostUsd } from '../loops/eval/routerAbBudget';
+import { appendFileSync, existsSync, mkdtempSync, readFileSync as readFile, rmSync, writeFileSync } from 'fs';
+import os from 'os';
 import { readFileSync } from 'fs';
 import path from 'path';
 
@@ -55,7 +76,7 @@ function task(overrides: Partial<AbTask> = {}): AbTask {
 function run(overrides: Partial<RunRecord> = {}): RunRecord {
   return {
     taskId: 't1', taskType: 'image', arm: 'router', model: 'gemini-3.8-flash', ranModels: ['gemini-3.8-flash'], status: 'ok',
-    finalText: 'Here is your ad.', toolCalls: [{ name: 'generate_image', args: '{"prompt":"x"}' }], usage: [], costUsd: 0.1,
+    finalText: 'Here is your ad.', toolCalls: [{ name: 'generate_image', args: '{"prompt":"x"}' }], attempts: 1, usage: [], calls: [], costUsd: 0.1,
     latencyMs: 1000, startedAt: '2026-10-23T00:00:00.000Z', ...overrides,
   };
 }
@@ -100,7 +121,7 @@ describe('arms', () => {
     const byType = Object.fromEntries(cells.map((c) => [c.taskType, c]));
     expect(byType.chat.identical).toBe(true);
     expect(byType.scheduled.identical).toBe(true);
-    expect(byType.report).toMatchObject({ identical: false, router: { model: 'anthropic.claude-sonnet-5', reason: 'report task: table route' }, incumbent: { model: 'anthropic.claude-sonnet-4-6' } });
+    expect(byType.report).toMatchObject({ identical: false, router: { model: 'anthropic.claude-sonnet-5', reason: 'report task: table route' }, incumbent: { model: 'gemini-3.1-pro-preview' } });
     for (const t of ['support', 'image', 'video']) {
       expect(byType[t]).toMatchObject({ identical: false, router: { model: 'gemini-3.8-flash' }, incumbent: { model: 'gemini-3.1-pro-preview' } });
     }
@@ -159,9 +180,9 @@ describe('judge eligibility and blinding', () => {
 
   it('strips model self-identification from what the judge and raters see', () => {
     expect(redactModelNames('As Gemini (by Google DeepMind), not Claude Sonnet 5 or GPT-5.4, I wrote this.')).toBe('As [model] (by [model]), not [model] or [model], I wrote this.');
-    const shown = transcriptOf(run({ finalText: 'Generated with gemini-3.8-flash.' }));
+    const shown = transcriptOf(run({ finalText: 'Generated with gemini-3.8-flash.' }), ['generate_image']);
     expect(shown).toContain('Generated with [model].');
-    expect(shown).toContain('generate_image({"prompt":"x"})');
+    expect(shown).toContain('generate_image [deliverable]:\nprompt: x');
   });
 
   it('pair ids are opaque and the human-sheet order is seed-dependent and balanced', () => {
@@ -268,7 +289,7 @@ describe('decision rule', () => {
 
   it('is inconclusive below the pre-registered sample size', () => {
     const s = summarizeCell(cell, 'j', pairs(20, () => ({ r: 7, i: 7, rCost: 0.1, iCost: 0.3 })));
-    expect(decideCell(s, DEFAULT_DECISION_RULE)).toEqual({ verdict: 'inconclusive', reasons: ['20 judged pairs < 40 required'] });
+    expect(decideCell(s, DEFAULT_DECISION_RULE)).toEqual({ verdict: 'inconclusive', reasons: ['20 judged pairs < 36 required'] });
   });
 });
 
@@ -293,14 +314,191 @@ describe('CLI safety', () => {
 
   it('refuses a missing user or one that is not on a reserved test domain', () => {
     expect(evalUserProblem({ email: 'router-ab-eval@agentweb.invalid' })).toBeUndefined();
-    expect(evalUserProblem({ email: 'test@example.com' })).toBeUndefined();
+    expect(evalUserProblem({ email: 'router-ab@eval.example' })).toBeUndefined();
+    expect(evalUserProblem({ email: 'test@example.com' })).toMatch(/shared QA account/);
+    expect(evalUserProblem({ email: 'qa@test.com' })).toMatch(/never a real user/);
+    expect(evalUserProblem({ email: 'router-ab@agentweb.invalid', isAdmin: true })).toMatch(/admin/);
     expect(evalUserProblem({ email: 'owner@realcustomer.com' })).toMatch(/never a real user/);
     expect(evalUserProblem({ email: 'x@example.com.attacker.io' })).toMatch(/never a real user/);
     expect(evalUserProblem(null)).toMatch(/does not exist/);
   });
 
   it('parses commands and flags', () => {
-    expect(parseFlags(['generate', '--max-usd', '150', '--tier', 'Free', '--dry'])).toEqual({ command: 'generate', flags: { 'max-usd': '150', tier: 'Free', dry: true } });
+    expect(parseFlags(['generate', '--budget-file', 'b.jsonl', '--tier', 'Free', '--dry'])).toEqual({ command: 'generate', flags: { 'budget-file': 'b.jsonl', tier: 'Free', dry: true } });
     expect(() => parseFlags(['plan', 'stray'])).toThrow(/unexpected argument/);
+  });
+});
+
+describe('reserved domains', () => {
+  it('accepts only RFC 2606/6761 names', () => {
+    for (const h of ['a.example', 'x.test', 'y.invalid', 'localhost', 'example.com', 'shop.example.org', 'a.b.example.net']) expect(isReservedDomain(h)).toBe(true);
+    for (const h of ['test.com', 'invalid.org', 'example.com.attacker.io', 'notexample.com', 'test.co.uk', 'a_b.example']) expect(isReservedDomain(h)).toBe(false);
+  });
+});
+
+describe('environment refusals', () => {
+  it('refuses an unset or production S3 bucket', () => {
+    expect(s3BucketProblem(undefined)).toMatch(/not set/);
+    expect(s3BucketProblem('agentweb-user-files')).toMatch(/production/);
+    expect(s3BucketProblem('agentweb-user-files-dev')).toBeUndefined();
+  });
+
+  it('refuses an exported OPENROUTER_API_KEY unless explicitly allowed', () => {
+    expect(openRouterKeySource({ OPENROUTER_API_KEY: 'k' }, false)).toHaveProperty('problem');
+    expect(openRouterKeySource({ OPENROUTER_API_KEY: 'k' }, true)).toHaveProperty('source');
+    expect(openRouterKeySource({}, false)).toHaveProperty('source');
+  });
+
+  it('refuses a tier that cannot run the required skills', () => {
+    const skills = [{ skillId: 's1', toolNames: ['create_blog_article'] }];
+    expect(skillEntitlementProblems(['create_blog_article'], skills, ['other'])).toHaveLength(1);
+    expect(skillEntitlementProblems(['create_blog_article'], skills, ['s1'])).toEqual([]);
+    expect(skillEntitlementProblems(['create_blog_article'], skills, ['*'])).toEqual([]);
+    expect(skillEntitlementProblems([], skills, null)).toHaveLength(1);
+  });
+});
+
+describe('transcripts and sampling', () => {
+  it('never truncates the required tool\'s arguments (the report is in content_draft); other tools are clipped', () => {
+    const draft = 'word '.repeat(10_000);
+    const r = run({ toolCalls: [{ name: 'create_blog_article', args: JSON.stringify({ content_draft: draft }) }, { name: 'other', args: JSON.stringify({ x: 'y'.repeat(20_000) }) }], finalText: 'z'.repeat(30_000) });
+    const text = transcriptOf(r, ['create_blog_article']);
+    expect(text).toContain(draft);
+    expect(text).toContain('[deliverable]');
+    expect(text).toMatch(/\[truncated \d+ chars\]/);
+    expect(text).toContain('z'.repeat(30_000));
+  });
+
+  it('redacts more model makers and hosts', () => {
+    const out = redactModelNames('Gemma 3, Bard, Google Vertex AI, AWS Bedrock, Grok 4 and Google Search Ads');
+    expect(out).not.toMatch(/gemma|bard|vertex|bedrock|grok/i);
+    expect(out).toContain('Google Search Ads');
+  });
+
+  it('a limit samples across templates', () => {
+    const tasks = buildSyntheticTaskSet().filter((t) => t.taskType === 'report');
+    const picked = sampleAcrossTemplates(tasks, 2);
+    expect(picked).toHaveLength(2);
+    expect(new Set(picked.map((t) => t.template)).size).toBe(2);
+    expect(sampleAcrossTemplates(tasks)).toHaveLength(tasks.length);
+  });
+});
+
+describe('verified-chat retries', () => {
+  const t = task({ taskType: 'report', requiredTools: ['create_blog_article'] });
+  const call = { role: 'assistant', llm: 'm', content: 'done', tool_calls: [{ function: { name: 'create_blog_article', arguments: '{}' } }] };
+  const skip = { role: 'assistant', llm: 'm', content: 'Here is a plan' };
+
+  it('re-prompts like the product when the required tool is skipped, up to 5 turns', async () => {
+    const messages: string[] = [];
+    const out = await runVerified(t, 'm', { stopped: () => false, generate: async (msg) => { messages.push(msg); return messages.length === 3 ? { content: 'ok', responseMessages: [call] } : { content: 'x', responseMessages: [skip] }; } });
+    expect(out.status).toBe('ok');
+    expect(out.attempts).toBe(3);
+    expect(messages[1]).toBe(verifiedChatRetryMessage(['create_blog_article']));
+    expect(missingRequiredTools(['a', 'b'], [{ name: 'a' }])).toEqual(['b']);
+  });
+
+  it('stops after the maximum attempts and leaves the failure to runFailure', async () => {
+    let n = 0;
+    const out = await runVerified(t, 'm', { stopped: () => false, generate: async () => { n++; return { content: 'x', responseMessages: [skip] }; } });
+    expect(n).toBe(VERIFIED_CHAT_MAX_ATTEMPTS);
+    expect(runFailure({ ...run({ taskType: 'report', model: 'm' }), ...out }, t)).toMatch(/required tool not called/);
+  });
+
+  it('a task with no required tool is one turn; a non-transient error ends the run', async () => {
+    let n = 0;
+    await runVerified(task({ requiredTools: [] }), 'm', { stopped: () => false, generate: async () => { n++; return { content: 'x', responseMessages: [skip] }; } });
+    expect(n).toBe(1);
+    const failed = await runVerified(t, 'm', { stopped: () => false, generate: async () => { throw new Error('bad request'); } });
+    expect(failed).toMatchObject({ status: 'error', error: 'bad request' });
+  });
+});
+
+describe('budget', () => {
+  let dir: string;
+  let file: string;
+  beforeEach(() => {
+    dir = mkdtempSync(path.join(os.tmpdir(), 'router-ab-budget-'));
+    file = path.join(dir, 'budget.jsonl');
+    BudgetLedger.init(file, { generationUsd: 1, judgeUsd: 1 });
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  const costOf = (res: { cost?: number }) => res.cost;
+
+  it('is shared: a second ledger on the same file sees the first one\'s spend, and only one holds it at a time', () => {
+    const a = BudgetLedger.open(file);
+    a.settle(a.reserve('generation', 0.6, 'x', 'run1'), 0.6, 'reported');
+    expect(() => BudgetLedger.open(file)).toThrow(/another run holds/);
+    a.close();
+    const b = BudgetLedger.open(file);
+    expect(b.spent('generation')).toBeCloseTo(0.6);
+    expect(() => b.reserve('generation', 0.5, 'y', 'run2')).toThrow(BudgetExceededError);
+    b.close();
+  });
+
+  it('charges an unsettled reservation in full (a crash only over-counts) and refuses a second init', () => {
+    const a = BudgetLedger.open(file);
+    a.reserve('judge', 0.7, 'x', 'o');
+    a.close();
+    const b = BudgetLedger.open(file);
+    expect(b.spent('judge')).toBeCloseTo(0.7);
+    b.close();
+    expect(() => BudgetLedger.init(file, { generationUsd: 5, judgeUsd: 5 })).toThrow();
+  });
+
+  it('reserves max(upper bound, largest seen), settles at the reported cost and counts every call in scope', async () => {
+    const ledger = BudgetLedger.open(file);
+    const meter = new CostMeter(ledger, 'generation', 'o', costOf);
+    const { calls } = await meter.scoped('t', async () => {
+      await meter.meter('m', 0.1, async () => ({ cost: 0.3 }));
+      await meter.meter('m', 0.1, async () => ({ cost: 0.05 }), 'suggested_replies');
+    });
+    expect(reportedCostUsd(calls)).toBeCloseTo(0.35);
+    expect(calls[1].feature).toBe('suggested_replies');
+    expect(ledger.spent('generation')).toBeCloseTo(0.35);
+    // the next call reserves the largest seen (0.3), not the 0.1 estimate
+    await expect(meter.meter('m', 0.1, async () => ({ cost: 0.01 }))).resolves.toBeDefined();
+    await expect(meter.meter('m', 0.1, async () => ({ cost: 0.01 }))).resolves.toBeDefined();
+    expect(ledger.spent('generation')).toBeCloseTo(0.37);
+    await expect(meter.meter('m', 0.7, async () => { throw new Error('never sent'); })).rejects.toBeInstanceOf(BudgetExceededError);
+    expect(meter.fatal).toBeInstanceOf(BudgetExceededError);
+    ledger.close();
+  });
+
+  it('stops the run when a call reports no cost, charging its reservation', async () => {
+    const ledger = BudgetLedger.open(file);
+    const meter = new CostMeter(ledger, 'generation', 'o', costOf);
+    const { error, calls } = await meter.scoped('t', () => meter.meter('m', 0.2, async () => ({})));
+    expect(error).toMatchObject({ code: 'ROUTER_AB_COST_UNREPORTED' });
+    expect(calls[0]).toMatchObject({ outcome: 'unreported', costUsd: 0.2 });
+    expect(reportedCostUsd(calls)).toBe(0);
+    expect(ledger.spent('generation')).toBeCloseTo(0.2);
+    await expect(meter.meter('m', 0.01, async () => ({ cost: 0 }))).rejects.toBe(meter.fatal);
+    ledger.close();
+  });
+
+  it('upper bound counts every character as a third of a token with the full output allowance', () => {
+    const m = Object.keys(MODEL_PRICING)[0];
+    expect(callUpperBoundUsd(m, 3_000_000, 0)).toBeCloseTo(MODEL_PRICING[m].inPerM);
+  });
+
+  it('tolerates a truncated last JSONL line (and trims it), but not corruption elsewhere', () => {
+    const f = path.join(dir, 'runs.jsonl');
+    writeFileSync(f, '{"a":1}\n{"a":2');
+    expect(readJsonlRepairing(f, () => undefined)).toEqual([{ a: 1 }]);
+    expect(readFile(f, 'utf8')).toBe('{"a":1}\n');
+    appendFileSync(f, '{"a":3}\n');
+    expect(readJsonlRepairing(f)).toEqual([{ a: 1 }, { a: 3 }]);
+    writeFileSync(f, '{"a":1}\nnot json\n{"a":3}\n');
+    expect(() => readJsonlRepairing(f)).toThrow(/line 2/);
+    expect(existsSync(f)).toBe(true);
+  });
+
+  it('re-pricing keeps the observed side-call cost and moves only the arm model\'s token price', () => {
+    const m = 'gemini-3.8-flash';
+    const r = run({ model: m, usage: [{ promptTokens: 1_000_000, completionTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }], costUsd: 1 });
+    const base = MODEL_PRICING[m].inPerM;
+    expect(repricedCostUsd(r, { ...MODEL_PRICING[m], inPerM: base + 1 })).toBeCloseTo(2);
   });
 });
