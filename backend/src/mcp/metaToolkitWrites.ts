@@ -3,7 +3,8 @@
  * narrow surface, per Harsha 2026-10-12).
  *
  * Allowed: CAMPAIGN / AD_SET / AD  CREATE, and UPDATE of status (ACTIVE|PAUSED) or budget.
- * Still excluded: DELETE, COPY_AD, RETAG_UTM, creatives, custom audiences/uploads, launch_*.
+ * Still excluded: DELETE, COPY_AD, RETAG_UTM, custom audiences/uploads, launch_*.
+ * Creative assets (AD_CREATIVE UPLOAD_IMAGE / UPLOAD_VIDEO / CREATE) are metaToolkitCreatives.ts.
  *
  * Flow (preview → confirm, bound):
  *   1. Call without `confirm` → full guard run, nothing sent to Meta, returns a PREVIEW and a
@@ -167,7 +168,7 @@ function validateWriteShape(entity: string, action: string, args: any): any {
   return params;
 }
 
-function assertAdsManagementGranted(accounts: ConnectedAccount[], accountId: string) {
+export function assertAdsManagementGranted(accounts: ConnectedAccount[], accountId: string) {
   const norm = (v: unknown) => String(v ?? '').trim().replace(/^act_/, '');
   const account = accounts.filter(isMetaAdAccount).find(
     (a) => norm((a.config as any)?.ad_account_id) === norm(accountId) || norm(a.account_id) === norm(accountId),
