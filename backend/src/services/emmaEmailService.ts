@@ -284,7 +284,11 @@ export class EmmaEmailService {
     const fullMessage = isNewConversation && event.subject && messageBody
       ? `${event.subject}\n\n${messageBody}`
       : messageBody || event.subject || '';
-    const llmModel = await agentModeService.getDefaultModel();
+    // ENG-2648: a continued chat keeps the model it already runs on (the user may have picked one in the
+    // app), exactly like a Slack thread reply; only a new session uses the default (stamped above).
+    // Read here, after the session is decided, so the ownership rules above stay the only gate.
+    const continuedSession = sessionId === existingSessionId ? await chatbotDb.getChatSessionRecord(sessionId) : null;
+    const llmModel = continuedSession?.llmModel || await agentModeService.getDefaultModel();
     // ENG-1189: this turn's tool calls self-call back into this process via
     // mcpFetch — tracked so a deploy mid-run waits for it instead of
     // abandoning it against a closed listener.

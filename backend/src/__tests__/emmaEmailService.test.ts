@@ -13,6 +13,7 @@ jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     createChatSession: jest.fn(),
     getChatSession: jest.fn(),
+    getChatSessionRecord: jest.fn(),
     createOrReuseInteractiveShare: jest.fn(),
     updateSessionEmailMetadata: jest.fn(),
     updateSessionTitle: jest.fn(),
@@ -364,6 +365,24 @@ describe('EmmaEmailService', () => {
         'claude-sonnet-4-20250514',
         undefined
       );
+    });
+
+    // ENG-2648: like a Slack thread reply, an email continuing a chat runs on that chat's stored model.
+    it("continues an existing session on that session's stored model, not the default", async () => {
+      const sessionId = '12345678-1234-1234-1234-123456789012';
+      (resendService.getReceivedEmailContent as jest.Mock).mockResolvedValue({ text: 'Follow-up question' });
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ sessionId, userId: 'user-123', llmModel: 'openrouter/openai/gpt-6-sol' });
+      (chatbotDb.getChatSessionRecord as jest.Mock).mockResolvedValue({ sessionId, userId: 'user-123', llmModel: 'openrouter/openai/gpt-6-sol' });
+      (userDb.getUserByEmail as jest.Mock).mockResolvedValue({ userId: 'user-123', email: 'user@example.com' });
+      (generateSessionResponse as jest.Mock).mockResolvedValue({ content: 'Answer', toolCalls: [], knowledgeBaseQueries: [], sources: [], responseMessages: [] });
+      (chatbotDb.createOrReuseInteractiveShare as jest.Mock).mockResolvedValue(`https://app.agentweb.pro/ishare/${sessionId}?conversable=token`);
+      (chatbotDb.updateSessionEmailMetadata as jest.Mock).mockResolvedValue({});
+      (resendService.sendEmail as jest.Mock).mockResolvedValue({ id: 'sent-005' });
+
+      await service.processInboundEmail({ ...baseEvent, subject: `Re: Help [ref:${sessionId}]` });
+
+      expect(generateSessionResponse).toHaveBeenCalledWith(sessionId, 'Follow-up question', 'user-123', 'openrouter/openai/gpt-6-sol', undefined);
+      expect(chatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
     });
 
     it('falls back to new session when ref tag session not found', async () => {
