@@ -44,6 +44,8 @@ type InvokeResponse = {
   };
   /** callLLM already recorded this response, so the compatibility wrapper must not double-charge it. */
   __agentwebGatewayMetered?: boolean;
+  /** Provider finish reason (ENG-2679); undefined when the transport omits it. */
+  finishReason?: string;
 };
 
 /**
@@ -120,6 +122,7 @@ export class LLMService {
         },
       } : undefined,
       __agentwebGatewayMetered: hasUsage ? true : undefined,
+      finishReason: response?.choices?.[0]?.finish_reason || undefined,
     };
   }
 
@@ -180,6 +183,16 @@ export class LLMService {
     onUsage?: OnUsageCallback,
     requestOptions: { webSearch?: boolean; timeoutMs?: number } = {},
   ): Promise<string> {
+    return (await this.invokeWithMeta(systemPrompt, userPrompt, usageContext, onUsage, requestOptions)).content;
+  }
+
+  private async invokeWithMeta(
+    systemPrompt: string,
+    userPrompt: string,
+    usageContext?: LLMUsageContext,
+    onUsage?: OnUsageCallback,
+    requestOptions: { webSearch?: boolean; timeoutMs?: number } = {},
+  ): Promise<{ content: string; finishReason?: string }> {
     const messages = [
       new SystemMessage(systemPrompt),
       new HumanMessage(userPrompt),
@@ -188,7 +201,8 @@ export class LLMService {
       ? await this.invokeGateway(messages, usageContext, requestOptions)
       : await this.requireChatModel().invoke(messages);
     this.observeUsage(response, usageContext, onUsage);
-    return typeof response.content === 'string' ? response.content : String(response.content || '');
+    const content = typeof response.content === 'string' ? response.content : String(response.content || '');
+    return { content, finishReason: response.finishReason };
   }
 
   async generateContent(
@@ -277,7 +291,13 @@ export class LLMService {
     onUsage?: OnUsageCallback,
     usageContext?: LLMUsageContext,
   ): Promise<string> {
-    const raw = await this.invoke(`${systemPrompt}\n\nCRITICAL: You MUST wrap your HTML output in the following XML tags:\n<actual_html_content>\n[Your complete HTML code here]\n</actual_html_content>\n\nThe HTML must be a complete, well-formed HTML document with proper DOCTYPE, head, and body sections.`, userPrompt, usageContext, onUsage);
+    const { content: raw, finishReason } = await this.invokeWithMeta(`${systemPrompt}\n\nCRITICAL: You MUST wrap your HTML output in the following XML tags:\n<actual_html_content>\n[Your complete HTML code here]\n</actual_html_content>\n\nThe HTML must be a complete, well-formed HTML document with proper DOCTYPE, head, and body sections.`, userPrompt, usageContext, onUsage);
+    // ENG-2679: a max-token cutoff is never a usable document or fragment.
+    if (finishReason === 'length') {
+      const err = new Error(`HTML generation truncated (finish_reason=length, model=${this.modelName})`);
+      err.name = 'IncompleteHtmlRenderError';
+      throw err;
+    }
     const tagged = raw.match(/<actual_html_content>([\s\S]*?)<\/actual_html_content>/i)?.[1];
     if (tagged) return tagged.trim();
     const htmlStart = raw.search(/<!DOCTYPE|<html/i);
