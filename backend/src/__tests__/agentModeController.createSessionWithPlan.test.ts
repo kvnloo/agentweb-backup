@@ -1392,4 +1392,60 @@ describe('AgentModeController - createSessionWithPlan', () => {
       expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
     });
   });
+
+  // ENG-2655: private plans resolve only for their owner / org members (defence in depth on top of the candidate sets).
+  describe('private plan access (ENG-2655)', () => {
+    const privatePlan = (over: Record<string, unknown>) => ({
+      ...mockWorkPlans[0], planId: 'priv-1', title: 'Secret Plan', visibility: 'private' as const, isBuiltIn: false, ...over,
+    }) as any;
+    const signedIn = () => mockGetUserFromToken.mockResolvedValue({
+      user: { userId: 'viewer', email: 'v@example.com', isAdmin: false, roles: ['customer'] as ('partner' | 'customer' | 'free')[] },
+    });
+    beforeEach(() => {
+      signedIn();
+      mockChatbotDb.createChatSession.mockResolvedValue({ ...mockSession, userId: 'viewer' } as any);
+    });
+
+    it("404s another account's private plan for a signed-in non-owner and creates no session", async () => {
+      const res = mockResponse();
+      await agentModeController.createSessionWithPlan(mockRequest('Secret Plan'), res);
+      expect(res.status).toHaveBeenCalledWith(404);
+      expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+    });
+
+    it('defence in depth: 403s a private plan found in the system/public lists, no session created', async () => {
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: string) =>
+        v === 'public' ? [privatePlan({ ownerId: undefined })] : []);
+      const res = mockResponse();
+      await agentModeController.createSessionWithPlan(mockRequest('Secret Plan'), res);
+      expect(res.status).toHaveBeenCalledWith(403);
+      expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+    });
+
+    it('launches the caller\'s own private plan', async () => {
+      mockWorkPlanService.getWorkPlansByOwner.mockResolvedValue([privatePlan({ ownerId: 'viewer' })]);
+      const res = mockResponse();
+      await agentModeController.createSessionWithPlan(mockRequest('Secret Plan'), res);
+      expect(res.status).not.toHaveBeenCalled();
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ sessionId: expect.any(String) }));
+    });
+
+    it("launches an org member's private plan for a member of that org", async () => {
+      mockUserDb.getUserById.mockResolvedValue({ userId: 'viewer', orgId: 'org-1' } as any);
+      mockWorkPlanService.getWorkPlansByOrg.mockResolvedValue([privatePlan({ ownerId: 'mate' })]);
+      const res = mockResponse();
+      await agentModeController.createSessionWithPlan(mockRequest('Secret Plan'), res);
+      expect(res.status).not.toHaveBeenCalled();
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ sessionId: expect.any(String) }));
+    });
+
+    it('launches a system plan for an anonymous caller', async () => {
+      mockGetUserFromToken.mockResolvedValue({ user: null });
+      mockChatbotDb.createChatSession.mockResolvedValue({ ...mockSession, userId: 'anon_mock-uuid-123' } as any);
+      const res = mockResponse();
+      await agentModeController.createSessionWithPlan(mockRequest(mockPlanTitle), res);
+      expect(res.status).not.toHaveBeenCalled();
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ sessionId: expect.any(String) }));
+    });
+  });
 });
