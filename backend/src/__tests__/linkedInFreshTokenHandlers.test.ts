@@ -90,6 +90,17 @@ describe('ENG-2663 FreshTokenRejectedError through the real LinkedIn handlers', 
     expectRetryableNotReconnect(await service.reactToLinkedInPost('user-1', ACCOUNT.account_id, 'urn:li:share:1', 'LIKE'));
   });
 
+  it('repost and comment report an adapter-side consent stop as a failure, not success', async () => {
+    adapter.createRepost.mockResolvedValue({ success: false, message: 'consent withdrawn' });
+    adapter.createComment.mockResolvedValue({ success: false, message: 'consent withdrawn' });
+
+    const repost: any = await service.linkedinRepost('user-1', ACCOUNT.account_id, 'urn:li:share:1');
+    const comment: any = await service.commentOnLinkedInPost('user-1', ACCOUNT.account_id, 'urn:li:share:1', 'nice');
+
+    expect(repost).toEqual({ success: false, message: 'consent withdrawn' });
+    expect(comment).toEqual({ success: false, message: 'consent withdrawn' });
+  });
+
   it('a genuine reconnect error still gets the auth treatment', async () => {
     adapter.createPost.mockRejectedValue(Object.assign(new Error('LinkedIn access token expired. Please reconnect your account.'), { code: 401 }));
     const result: any = await service.postOnConnectedAccount('user-1', ACCOUNT.account_id, 'hello');
