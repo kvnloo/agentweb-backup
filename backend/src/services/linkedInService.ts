@@ -13,8 +13,36 @@ import {
   LinkedInPaginatedResponse
 } from '../types/linkedIn';
 
+// LinkedIn can answer a 401 "revoked by the user" for an access token minted under a
+// second earlier, then accept the very same token moments later (ENG-2663: prod
+// 2026-10-13 and 2026-10-25, both recovered with no reconnect). A 401 means nothing was
+// written, so a call made with a just-refreshed token is retried before it is reported
+// as an expired credential.
+const FRESH_TOKEN_WINDOW_MS = 60_000;
+const freshlyMintedTokens = new Map<string, number>();
+
+function markTokenFresh(token: string): void {
+  const now = Date.now();
+  for (const [t, mintedAt] of freshlyMintedTokens) {
+    if (now - mintedAt > FRESH_TOKEN_WINDOW_MS) freshlyMintedTokens.delete(t);
+  }
+  freshlyMintedTokens.set(token, now);
+}
+
+function bearerTokenOf(error: any): string | undefined {
+  const headers = error?.config?.headers;
+  const auth = typeof headers?.get === 'function' ? headers.get('Authorization') : headers?.Authorization;
+  return typeof auth === 'string' && auth.startsWith('Bearer ') ? auth.slice('Bearer '.length) : undefined;
+}
+
+function isFreshlyMinted(token: string | undefined): boolean {
+  const mintedAt = token ? freshlyMintedTokens.get(token) : undefined;
+  return mintedAt !== undefined && Date.now() - mintedAt <= FRESH_TOKEN_WINDOW_MS;
+}
+
 export class LinkedInService {
   private client: ReturnType<typeof axios.create>;
+  private freshTokenRetryDelaysMs = [2000, 5000];
 
   constructor() {
     this.client = axios.create({
@@ -32,11 +60,19 @@ export class LinkedInService {
    * Safe request wrapper to handle errors
    */
   private async safeRequest<T>(request: () => Promise<T>): Promise<T> {
-    try {
-      return await request();
-    } catch (error: any) {
-      this.handleError(error);
-      throw error; // unreachable
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await request();
+      } catch (error: any) {
+        const delayMs = this.freshTokenRetryDelaysMs[attempt];
+        if (delayMs !== undefined && error?.response?.status === 401 && isFreshlyMinted(bearerTokenOf(error))) {
+          console.warn(`[LinkedIn] 401 on a token refreshed moments ago; retrying in ${delayMs}ms (attempt ${attempt + 1}/${this.freshTokenRetryDelaysMs.length})`);
+          await new Promise(resolve => setTimeout(resolve, delayMs));
+          continue;
+        }
+        this.handleError(error);
+        throw error; // unreachable
+      }
     }
   }
 
@@ -111,6 +147,7 @@ export class LinkedInService {
 
       console.log('[LinkedIn] Token refreshed successfully');
       const data = response.data as { access_token: string; expires_in: number; refresh_token?: string };
+      markTokenFresh(data.access_token);
       return {
         access_token: data.access_token,
         expires_in: data.expires_in,
