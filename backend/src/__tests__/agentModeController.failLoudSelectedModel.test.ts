@@ -154,7 +154,7 @@ import { isRunStoreEnabled, claimIdempotency } from '../services/agentMode/runSt
 import { modelAccess } from '../services/agentMode/modelAccessInstance';
 import { workPlanStepModels } from '../services/agentMode/workPlanStepModelsInstance';
 import { readTierAllowedModels, getUserSubscriptionResolution } from '../services/subscriptionService';
-import { isTransientLLMError } from '../utils/agentModeErrors';
+import { isTransientLLMError, isWorkerShutdownError, isContextLimitError, PROVIDER_UNAVAILABLE_USER_MESSAGE } from '../utils/agentModeErrors';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockWorker = generateMarketingResponseWorkerService as jest.Mocked<typeof generateMarketingResponseWorkerService>;
@@ -1557,6 +1557,182 @@ describe('ENG-2641: every refused send says whether the user message was stored 
       await agentModeController.verifiedGenerate(verifiedReq(), res);
       expect(res.statusCode).toBe(429);
       expect(res.body).toMatchObject({ code: 'usage_paused', userMessageSaved: false });
+    });
+  });
+});
+
+describe('ENG-2672: a generation that fails AFTER the user message was stored says so (userMessageSaved)', () => {
+  const MODEL = 'gpt-5.5';
+  const savedUserMessages = () => mockChatbotDb.addMessageToSession.mock.calls
+    .map(([, message]) => message as any)
+    .filter((m) => m.role === 'user');
+  const shareReq = () => ({
+    params: { shareId: SESSION_ID }, query: { conversable: 'tok' }, body: { userMessage: MESSAGE, attachments: [] }, on: jest.fn(),
+    method: 'POST', path: '/api/agent-mode/ishare/generate', ip: '127.0.0.1', socket: { remoteAddress: '127.0.0.1' },
+  } as unknown as Request);
+  const sharedSession = () => ({
+    ...baseSession(MODEL),
+    interactiveShareMetadata: { isActive: true, token: 'tok', sharedAt: '2026-07-01T00:00:00Z' },
+  });
+  const send = async (body: Record<string, unknown> = {}) => {
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq({ llmModel: MODEL, ...body }), res);
+    return res;
+  };
+  const sendShared = async () => {
+    mockChatbotDb.getChatSession.mockResolvedValue(sharedSession() as any);
+    const res = makeRes();
+    await agentModeController.generateSharedResponse(shareReq(), res);
+    return res;
+  };
+  const failures: Array<{ name: string; error: () => Error; prepare?: () => void; status: number; code: string }> = [
+    {
+      name: 'provider unavailable',
+      error: () => new Error(PROVIDER_UNAVAILABLE_USER_MESSAGE),
+      status: 503,
+      code: 'PROVIDER_UNAVAILABLE',
+    },
+    {
+      name: 'provider has no endpoints',
+      error: () => new Error('No endpoints found for this model'),
+      status: 503,
+      code: 'PROVIDER_UNAVAILABLE',
+    },
+    {
+      name: 'server restarting',
+      error: () => new Error('worker shut down'),
+      prepare: () => (isWorkerShutdownError as jest.Mock).mockReturnValue(true),
+      status: 503,
+      code: 'SERVER_RESTARTING',
+    },
+    {
+      name: 'context limit',
+      error: () => new Error('context length exceeded'),
+      prepare: () => (isContextLimitError as jest.Mock).mockReturnValue(true),
+      status: 413,
+      code: 'CONTEXT_LIMIT_EXCEEDED',
+    },
+  ];
+  afterEach(() => {
+    (isWorkerShutdownError as jest.Mock).mockReturnValue(false);
+    (isContextLimitError as jest.Mock).mockReturnValue(false);
+    jest.useRealTimers();
+  });
+
+  describe.each(failures)('$name ($status $code)', ({ error, prepare, status, code }) => {
+    it('/generate: true when the worker fails after the save, status and code unchanged', async () => {
+      prepare?.();
+      mockWorker.runInWorker.mockRejectedValueOnce(error());
+      const res = await send({ clientId: 'msg-1' });
+      expect(res.statusCode).toBe(status);
+      expect(res.body).toMatchObject({ code, userMessageSaved: true });
+      expect(savedUserMessages()).toEqual([expect.objectContaining({ content: MESSAGE, clientId: 'msg-1' })]);
+    });
+
+    it('/generate: false when the same failure is raised while saving the message (nothing stored)', async () => {
+      prepare?.();
+      const failure = error();
+      // The first write of a new chat is its system message; only the USER message's save fails.
+      mockChatbotDb.addMessageToSession.mockImplementation(async (_id: string, message: any) => {
+        if (message.role === 'user') throw failure;
+        return baseSession() as any;
+      });
+      const res = await send();
+      expect(res.statusCode).toBe(status);
+      expect(res.body).toMatchObject({ code, userMessageSaved: false });
+    });
+
+    it('/ishare/:id/generate: true when the worker fails after the save', async () => {
+      prepare?.();
+      mockWorker.runInWorker.mockRejectedValueOnce(error());
+      const res = await sendShared();
+      expect(res.statusCode).toBe(status);
+      expect(res.body).toMatchObject({ code, userMessageSaved: true });
+      expect(savedUserMessages()).toEqual([expect.objectContaining({ content: MESSAGE })]);
+    });
+  });
+
+  describe('504 GENERATION_TIMEOUT', () => {
+    it('/generate: true when the cap fires after the save', async () => {
+      jest.useFakeTimers();
+      mockWorker.runInWorker.mockReturnValueOnce(new Promise(() => undefined) as any);
+      const pending = send();
+      await jest.advanceTimersByTimeAsync(10 * 60 * 1000 + 1000);
+      const res = await pending;
+      expect(res.statusCode).toBe(504);
+      expect(res.body).toMatchObject({ code: 'GENERATION_TIMEOUT', userMessageSaved: true });
+      expect(savedUserMessages()).toHaveLength(1);
+    });
+
+    it('/generate: false when the cap fires before the save completed', async () => {
+      jest.useFakeTimers();
+      mockChatbotDb.addMessageToSession.mockImplementation((async (_id: string, message: any) => (
+        message.role === 'user' ? new Promise(() => undefined) : baseSession()
+      )) as any);
+      const pending = send();
+      await jest.advanceTimersByTimeAsync(10 * 60 * 1000 + 1000);
+      const res = await pending;
+      expect(res.statusCode).toBe(504);
+      expect(res.body).toMatchObject({ code: 'GENERATION_TIMEOUT', userMessageSaved: false });
+    });
+
+    it('/ishare/:id/generate: true when the cap fires after the save', async () => {
+      jest.useFakeTimers();
+      mockWorker.runInWorker.mockReturnValueOnce(new Promise(() => undefined) as any);
+      const pending = sendShared();
+      await jest.advanceTimersByTimeAsync(10 * 60 * 1000 + 1000);
+      const res = await pending;
+      expect(res.statusCode).toBe(504);
+      expect(res.body).toMatchObject({ code: 'GENERATION_TIMEOUT', userMessageSaved: true });
+    });
+  });
+
+  describe('409 SESSION_BUSY from the idempotency claim (a duplicate while the first copy runs)', () => {
+    beforeEach(() => {
+      (isRunStoreEnabled as jest.Mock).mockReturnValue(true);
+      (claimIdempotency as jest.Mock).mockResolvedValue({ claimed: false, inFlightRunId: 'run-1' });
+    });
+    afterEach(() => {
+      (isRunStoreEnabled as jest.Mock).mockImplementation(() => jest.requireActual('../services/agentMode/runStore').isRunStoreEnabled());
+      (claimIdempotency as jest.Mock).mockImplementation((...a: unknown[]) => jest.requireActual('../services/agentMode/runStore').claimIdempotency(...a));
+    });
+
+    it('true when the chat already holds a user message with this request\'s clientId', async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue({
+        ...baseSession(MODEL),
+        messages: [{ role: 'user', content: MESSAGE, clientId: 'msg-1', timestamp: 't' }],
+      } as any);
+      const res = await send({ clientId: 'msg-1' });
+      expect(res.statusCode).toBe(409);
+      expect(res.body).toMatchObject({ code: 'SESSION_BUSY', runId: 'run-1', userMessageSaved: true });
+      expect(savedUserMessages()).toEqual([]);
+    });
+
+    it('false when only a DIFFERENT clientId is in the chat (an identical earlier message is not this copy)', async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue({
+        ...baseSession(MODEL),
+        messages: [{ role: 'user', content: MESSAGE, clientId: 'msg-0', timestamp: 't' }],
+      } as any);
+      const res = await send({ clientId: 'msg-1' });
+      expect(res.body).toMatchObject({ code: 'SESSION_BUSY', userMessageSaved: false });
+    });
+
+    it('false when the request carries no clientId', async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue({
+        ...baseSession(MODEL),
+        messages: [{ role: 'user', content: MESSAGE, timestamp: 't' }],
+      } as any);
+      const res = await send();
+      expect(res.body).toMatchObject({ code: 'SESSION_BUSY', userMessageSaved: false });
+    });
+
+    it('false when the chat cannot be read', async () => {
+      mockChatbotDb.getChatSession
+        .mockResolvedValueOnce(baseSession(MODEL) as any)
+        .mockRejectedValue(new Error('dynamo down'));
+      const res = await send({ clientId: 'msg-1' });
+      expect(res.statusCode).toBe(409);
+      expect(res.body).toMatchObject({ code: 'SESSION_BUSY', userMessageSaved: false });
     });
   });
 });
