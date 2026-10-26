@@ -21,6 +21,30 @@ function rethrowWithCode(message: string, code?: number): never {
  * LinkedIn Adapter Implementation
  * Handles differences between Personal and Company pages
  */
+// ENG-2663: LinkedIn can reject an access token with 401 "revoked by the user"
+// when it is used within ~1s of being minted by a refresh; the same token is
+// accepted moments later (prod: 2026-10-13, 2026-10-25). A 401 creates nothing,
+// so one delayed retry is safe and avoids a false "reconnect" alarm.
+export const FRESH_TOKEN_RETRY_DELAY_MS = 5000;
+// A 401 surfaces either as an axios error or as linkedInService's rethrown plain Error.
+function isLinkedIn401(error: any): boolean {
+  return error?.response?.status === 401
+    || /LinkedIn access token expired or invalid/.test(error?.message || '');
+}
+
+export async function retryOnceIfFreshToken401<T>(wasRefreshed: boolean, call: () => Promise<T>, delayMs = FRESH_TOKEN_RETRY_DELAY_MS): Promise<T> {
+  try {
+    return await call();
+  } catch (error: any) {
+    // linkedInService's interceptor rethrows a 401 as a plain Error without `response`.
+    const is401 = isLinkedIn401(error);
+    if (!wasRefreshed || !is401) throw error;
+    console.warn(`[LinkedInAdapter] ENG-2663: 401 on a just-refreshed token; retrying once in ${delayMs}ms`);
+    await new Promise((r) => setTimeout(r, delayMs));
+    return await call();
+  }
+}
+
 export class LinkedInAdapter implements SocialPlatformAdapter {
 
   /**
@@ -105,7 +129,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
 
     try {
       // Get valid token (refreshes if expired)
-      const { token } = await this.getValidToken(account, userId);
+      const { token, wasRefreshed } = await this.getValidToken(account, userId);
 
       // Upload images if provided - track failures for transparency
       let imageUrns: string[] = [];
@@ -139,11 +163,11 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       // carries a URL and no image builds a link preview first — OG discovery, possibly
       // a headless browser, a thumbnail upload — so the check above is not the last
       // moment for that shape. linkedInService re-runs it at the request itself.
-      const postUrn = await linkedInService.createPost(
+      const postUrn = await retryOnceIfFreshToken401(wasRefreshed, () => linkedInService.createPost(
         token, authorUrn, content, imageUrns.length > 0 ? imageUrns : undefined,
         assertStillAuthorized,
         ...(draft ? [{ draft: true }] : [])
-      );
+      ));
 
       // ENG-428: a draft is not a published post — do not cache it as one (the
       // posts cache is served back as lifecycleState PUBLISHED) and do not claim a
@@ -195,7 +219,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       if (error.response?.status === 429) {
         rethrowWithCode('LinkedIn rate limit exceeded. Please try again later.', 429);
       }
-      if (error.response?.status === 401) {
+      if (isLinkedIn401(error)) {
         rethrowWithCode('LinkedIn access token expired. Please reconnect your account.', 401);
       }
       throw error;
@@ -301,7 +325,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
 
     try {
       // Get valid token (refreshes if expired)
-      const { token } = await this.getValidToken(account, userId);
+      const { token, wasRefreshed } = await this.getValidToken(account, userId);
 
       // Validate reaction type
       const validReactionTypes = ['LIKE', 'PRAISE', 'EMPATHY', 'INTEREST', 'APPRECIATION', 'ENTERTAINMENT'];
@@ -311,12 +335,12 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       }
 
       // Create reaction
-      const reactionUrn = await linkedInService.createReaction(
+      const reactionUrn = await retryOnceIfFreshToken401(wasRefreshed, () => linkedInService.createReaction(
         token,
         postUrn,
         actorUrn,
         upperReactionType as any
-      );
+      ));
 
       return {
         success: true,
@@ -329,7 +353,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       if (error.response?.status === 429) {
         rethrowWithCode('LinkedIn rate limit exceeded. Please try again later.', 429);
       }
-      if (error.response?.status === 401) {
+      if (isLinkedIn401(error)) {
         rethrowWithCode('LinkedIn access token expired. Please reconnect your account.', 401);
       }
       if (error.response?.status === 403) {

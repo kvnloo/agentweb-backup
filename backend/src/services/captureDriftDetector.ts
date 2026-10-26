@@ -14,7 +14,7 @@
  * four per-site constants (lead-list map, forward URL, pixel id, Meta account id); those
  * declarations are masked on both sides, and everything else must match exactly.
  */
-import { buildCaptureRoute, buildLandingPageMiddleware } from './v0Service';
+import { buildCaptureRoute, buildLandingPageMiddleware, type AttributionCookiesMode } from './v0Service';
 
 export type CaptureFileStatus = 'match' | 'missing' | 'drifted';
 
@@ -35,6 +35,8 @@ export interface CaptureDriftReport {
 export interface DeployedCaptureFiles {
   middleware: string | null;
   captureRoute: string | null;
+  /** ENG-2666: the site's configured attribution-cookie mode; default 'on'. */
+  attributionCookies?: AttributionCookiesMode;
 }
 
 // Static patterns for the exact literal shapes buildCaptureRoute() emits. Only a JSON
@@ -81,7 +83,7 @@ function compare(path: string, expected: string, actual: string | null): Capture
 
 export function detectCaptureDrift(deployed: DeployedCaptureFiles): CaptureDriftReport {
   const files = [
-    compare('middleware.ts', buildLandingPageMiddleware(), deployed.middleware),
+    compare('middleware.ts', buildLandingPageMiddleware({ attributionCookies: deployed.attributionCookies }), deployed.middleware),
     compare('app/api/capture/route.ts', buildCaptureRoute({}), deployed.captureRoute),
   ];
   return { drifted: files.some((f) => f.status !== 'match'), files };
