@@ -20,7 +20,11 @@ export type ClaudeStopCode =
   | "usage_limit" //      the plan's own usage limit
   | "policy_blocks" //    an organisation policy on the plan makes it unusable for AgentWeb
   | "turn_failed" //     anything else the plan run reported
-  | "invalid_funding_choice"; // the request named a funding choice that is not one we serve
+  | "invalid_funding_choice" // the request named a funding choice that is not one we serve
+  | "turn_timeout" //     the whole turn ran past its time limit and was stopped
+  | "server_restarting" // AgentWeb is restarting; no new plan turn is started
+  | "extra_usage_needs_ack" // Fable can bill the customer's extra usage credits; it runs only when the request acknowledges that
+  | "org_not_supported"; // organisation members cannot use the plan route yet (data governance not decided)
 
 interface StopInfo {
   httpStatus: number;
@@ -44,6 +48,10 @@ const STOPS: Record<ClaudeStopCode, StopInfo> = {
   usage_limit: { httpStatus: 429, retryable: false, message: "Your Claude plan has reached its usage limit. It will work again when the limit resets, or you can choose another model." },
   policy_blocks: { httpStatus: 409, retryable: false, message: "Your organisation's settings on this Claude plan do not allow it to be used here. Choose another model." },
   invalid_funding_choice: { httpStatus: 400, retryable: false, message: "That funding choice is not available." },
+  turn_timeout: { httpStatus: 504, retryable: false, message: "This message ran past the time limit for a single turn on your Claude plan and was stopped. Anything it finished is saved above. Send a shorter request, or choose another model." },
+  server_restarting: { httpStatus: 503, retryable: true, message: "AgentWeb is restarting. Please send your message again in a moment." },
+  extra_usage_needs_ack: { httpStatus: 409, retryable: false, message: "This model can use your Claude plan's extra usage credits, which are billed to you by Anthropic. Confirm that you want this, or choose another model." },
+  org_not_supported: { httpStatus: 403, retryable: false, message: "Using your own Claude plan is not available for organisation accounts yet. Choose another model." },
   turn_failed: { httpStatus: 502, retryable: true, message: "Your Claude plan could not complete this message. Please try again, or choose another model." },
 };
 
@@ -101,8 +109,9 @@ export function fromHostFailure(err: unknown): ClaudeRouteStopError | undefined 
   }
 }
 
-/** A turn that finished with `ok:false`. */
-export function fromResultErrorKind(kind: ErrorKind | undefined): ClaudeRouteStopError {
+/** A turn that finished with `ok:false`. `aborted` is the host's own reason when it ended the turn ("deadline" = the time limit). */
+export function fromResultErrorKind(kind: ErrorKind | undefined, aborted?: string): ClaudeRouteStopError {
+  if (aborted === "deadline") return new ClaudeRouteStopError("turn_timeout");
   switch (kind) {
     case "usage_limit":
       return new ClaudeRouteStopError("usage_limit");

@@ -85,6 +85,11 @@ function renderToolCalls(toolCalls: any[]): string {
     .join("\n");
 }
 
+/** Adds one DIRECTIVE block after everything rendered so far (the last block the model reads). The size reserve covers it. */
+export function appendDirective(prompt: string, text: string): string {
+  return `${prompt}${block("DIRECTIVE", text)}\n`;
+}
+
 export interface RenderedPrompt {
   prompt: string;
   chars: number;

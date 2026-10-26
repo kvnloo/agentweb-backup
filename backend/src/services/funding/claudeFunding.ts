@@ -7,6 +7,10 @@
  *
  *  - No `fundingChoice` (undefined / null): AgentWeb, with no I/O, exactly as today. Nobody who never asks for the plan is touched by any of this.
  *  - `fundingChoice === "claude_subscription"`: resolved; a stop throws `ClaudeRouteStopError`; success returns the decision.
+ *  - `fundingChoice === "agentweb"`: AgentWeb, the same as no choice, but said out loud (a picker that always attaches the field sends this for non-plan models).
+ *  - Fable (the alias that can bill the customer's extra usage credits without the CLI asking in non-interactive mode) runs only when the request carries
+ *    the user's acknowledgement. This is a code rule, so no host configuration change can turn it on by itself.
+ *  - Organisation members: stopped as `org_not_supported` until the data-governance question (org-root context going to a personal Anthropic account) is decided.
  *  - Anything else: a 400. It is not silently treated as "no choice": a client that tried to ask for something we do not serve must hear that.
  *  - The model is the explicit pick of THIS request, canonicalised by the caller. A stored session model is never enough (a system-stamped default
  *    must not turn into a plan run), so a missing or unresolvable pick reaches the resolver as "" and stops there as `model_not_on_plan`, after
@@ -29,12 +33,16 @@ export interface TurnFundingInput {
   requestIsDelegated: boolean;
   /** `session.delegateInfo?.isDelegated === true`. */
   sessionIsDelegated: boolean;
+  /** `req.body.acknowledgeExtraUsage === true`: the user was told the model can bill their extra usage credits (Fable). */
+  acknowledgedExtraUsage?: boolean;
+  /** `req.user.orgId`: set for organisation members. Truthy = stop (see above). */
+  initiatorOrgId?: string | null;
   /** The request's explicit model pick, already canonicalised to a registry id; undefined when there is none or it does not resolve. */
   explicitModelId: string | undefined;
 }
 
 export async function resolveTurnFunding(input: TurnFundingInput, deps?: SubscriptionRouteDeps): Promise<TurnFunding> {
-  if (input.rawFundingChoice === undefined || input.rawFundingChoice === null) return { route: "agentweb" };
+  if (input.rawFundingChoice === undefined || input.rawFundingChoice === null || input.rawFundingChoice === "agentweb") return { route: "agentweb" };
   if (input.rawFundingChoice !== "claude_subscription") throw new ClaudeRouteStopError("invalid_funding_choice");
 
   const decision = await resolveSubscriptionRoute(
@@ -52,5 +60,8 @@ export async function resolveTurnFunding(input: TurnFundingInput, deps?: Subscri
   if (decision.route === "stop") throw stopFromReason(decision.reason);
   // With the literal set the resolver answers stop or plan. Anything else is a resolver bug: stop, never fall through to AgentWeb.
   if (decision.route !== "claude_subscription") throw new ClaudeRouteStopError("turn_failed");
+  // After the resolver, so a user who is not allow-listed still hears `not_enabled` and learns nothing about their org.
+  if (decision.alias === "fable" && input.acknowledgedExtraUsage !== true) throw new ClaudeRouteStopError("extra_usage_needs_ack");
+  if (input.initiatorOrgId) throw new ClaudeRouteStopError("org_not_supported");
   return decision;
 }

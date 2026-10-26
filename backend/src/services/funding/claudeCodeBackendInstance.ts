@@ -33,6 +33,16 @@ export const claudeCodeBackend = new ClaudeCodeBackend({
   markNeedsReconnect: async (connectionId, epoch, reason) => {
     await connections.hostedMarkNeedsReconnect(connectionId, epoch, reason.slice(0, 60), new Date().toISOString());
   },
+  // The same forward the worker path uses: an event from a tool reaches the user's open tabs (CRM and coding-agent live refresh).
+  socketEmit: (room, event, payload) => {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { io } = require("../../server");
+      io.to(room).emit(event, payload);
+    } catch {
+      /* Socket.IO not available: the refresh is best-effort */
+    }
+  },
   writeJournal: (row) => getAttemptUsageJournal().record(row),
   emptyFallbackText: EMPTY_FINAL_RESPONSE_FALLBACK,
   now: () => Date.now(),

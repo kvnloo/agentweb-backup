@@ -10920,6 +10920,9 @@ export const agentModeController = {
     // state is consumed. Hoisted so the outer `finally` releases it on the early returns
     // that precede the inner try (release() is idempotent; the inner finally also runs it).
     let pausedTurnSlot: { release: () => void } | undefined;
+    // ENG-2113: true once this request is a plan-route turn, so ANY failure after that (not only a typed stop) is answered with fixed copy and
+    // never reaches the diagnosis agent, which would spend AgentWeb money to guess at a turn that ran on the user's plan.
+    let planTurn = false;
     try {
       // A-019: do not admit a fresh interactive turn after shutdown drain starts.
       // This is intentionally before STT, idempotency/session claims, deck writes,
@@ -10979,14 +10982,22 @@ export const agentModeController = {
           rawFundingChoice: req.body.fundingChoice,
           initiatorUserId: user.userId,
           sessionOwnerUserId: session.userId,
+          initiatorOrgId: (user as any).orgId,
+          acknowledgedExtraUsage: req.body.acknowledgeExtraUsage === true,
           requestIsDelegated: (req as any).delegateInfo?.isDelegated === true,
           sessionIsDelegated: session.delegateInfo?.isDelegated === true,
-          explicitModelId: llmModel ? canonicalPinId(agentModeService, llmModel) : undefined,
+          // Only a plan request needs the pick resolved; everyone else skips the lookup (and its log line).
+          explicitModelId: llmModel && req.body.fundingChoice === 'claude_subscription' ? canonicalPinId(agentModeService, llmModel) : undefined,
         });
-        if (funding.route === 'claude_subscription') planRoute = funding;
+        if (funding.route === 'claude_subscription') {
+          planRoute = funding;
+          planTurn = true;
+        }
       } catch (fundingError) {
-        if (fundingError instanceof ClaudeRouteStopError) return res.status(fundingError.httpStatus).json(sendRefusalBody(claudeStopBody(fundingError), false)); // nothing is saved yet
-        throw fundingError;
+        // Nothing is saved yet. A lookup that failed for any reason other than a typed stop is still a stop (never an AgentWeb run, never a 500).
+        const fundingStop = fundingError instanceof ClaudeRouteStopError ? fundingError : new ClaudeRouteStopError('lookup_failed');
+        if (!(fundingError instanceof ClaudeRouteStopError)) console.error('AgentMode: plan funding lookup failed:', fundingError instanceof Error ? fundingError.message : String(fundingError));
+        return res.status(fundingStop.httpStatus).json(sendRefusalBody(claudeStopBody(fundingStop), false));
       }
 
       // EXPLICIT = the REQUEST carries a model. A model merely STORED on the session is
@@ -11547,7 +11558,10 @@ export const agentModeController = {
         if (planRoute && genErr?.isGenerationTimeout) {
           requestCancel(sessionId);
           generateMarketingResponseWorkerService.cancelSession(sessionId);
-          throw genErr;
+          // A typed stop with fixed copy (not the generic error path / diagnosis agent). The user message was saved long before the cap.
+          const timeoutStop = new ClaudeRouteStopError('turn_timeout');
+          markRaisedAfterUserMessageSaved(timeoutStop);
+          throw timeoutStop;
         }
         // A long landing-page build outlived the run timeout but is still running.
         // Don't report a false failure — tell the user it's still building and post
@@ -11886,19 +11900,29 @@ export const agentModeController = {
       }
       // ENG-2113: the plan route stopped the turn after the user's message was saved (host busy, plan limit, login dead...). A fixed-copy
       // note keeps the chat honest on reload; no diagnosis agent (it would spend AgentWeb money to guess at something already known).
-      if (error instanceof ClaudeRouteStopError && !res.headersSent) {
-        if (runSurvivalRunId) void markRunTerminal(runSurvivalRunId, 'failed', { finishReason: `claude_plan_${error.code}` });
+      const planStop =
+        error instanceof ClaudeRouteStopError
+          ? error
+          : planTurn && !res.headersSent && !(error instanceof Error && isWorkerShutdownError(error))
+            ? new ClaudeRouteStopError('turn_failed')
+            : undefined;
+      if (planStop && !res.headersSent) {
+        if (planStop !== error) {
+          console.error('AgentMode: plan turn failed outside the Claude backend:', error instanceof Error ? error.message : String(error));
+          if (wasRaisedAfterUserMessageSaved(error)) markRaisedAfterUserMessageSaved(planStop);
+        }
+        if (runSurvivalRunId) void markRunTerminal(runSurvivalRunId, 'failed', { finishReason: `claude_plan_${planStop.code}` });
         const stoppedSessionId = req.body?.sessionId;
         if (stoppedSessionId) {
           markProgressComplete(stoppedSessionId);
           await chatbotDb.addMessageToSession(stoppedSessionId, {
             role: 'assistant',
-            content: error.userMessage,
+            content: planStop.userMessage,
             timestamp: new Date().toISOString(),
-            metadata: { timestamp: new Date().toISOString(), isErrorMessage: true, kind: 'claude-plan-stop', code: error.code },
+            metadata: { timestamp: new Date().toISOString(), isErrorMessage: true, kind: 'claude-plan-stop', code: planStop.code },
           } as ChatMessage).catch((persistErr) => console.error('AgentMode: failed to persist plan stop note:', persistErr));
         }
-        return res.status(error.httpStatus).json(sendRefusalBody(claudeStopBody(error), wasRaisedAfterUserMessageSaved(error)));
+        return res.status(planStop.httpStatus).json(sendRefusalBody(claudeStopBody(planStop), wasRaisedAfterUserMessageSaved(planStop)));
       }
       console.error('AgentMode: Generate response error:', error);
 
@@ -17452,6 +17476,11 @@ export const agentModeController = {
   // Verified generate - ensures required functions are called minimum number of times
   async verifiedGenerate(req: Request, res: Response) {
     try {
+      // ENG-2113: this endpoint always runs on AgentWeb's models. A client that asks for the user's own plan here must hear no, not be silently
+      // run on AgentWeb (the same rule as /generate: a plan request is never turned into an AgentWeb run).
+      if (req.body?.fundingChoice !== undefined && req.body?.fundingChoice !== null && req.body?.fundingChoice !== 'agentweb') {
+        return res.status(400).json(sendRefusalBody(claudeStopBody(new ClaudeRouteStopError('invalid_funding_choice')), false));
+      }
       const user = req.user as User;
       const { sessionId, startingMessage, requiredFunctions, keywords, attachments, maxAttempts: maxAttemptsParam } = req.body;
       

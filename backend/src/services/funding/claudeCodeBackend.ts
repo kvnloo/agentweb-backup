@@ -26,10 +26,11 @@ import type { RunToolTokenClaims } from "./runToolToken";
 import type { PlanRoute } from "./claudeFunding";
 import type { ClaudeRunRegistry } from "./claudeRunRegistry";
 import { ClaudeRunConflictError } from "./claudeRunRegistry";
-import { PromptTooLargeError, renderPromptForCli } from "./claudePromptRenderer";
+import { PromptTooLargeError, appendDirective, renderPromptForCli } from "./claudePromptRenderer";
 import { mapLedgerToResponseMessages, type ClaudeTurnUsage } from "./claudeTurnMessages";
 import { ClaudeRouteStopError, fromHostFailure, fromResultErrorKind } from "./claudeRouteErrors";
 import type { AttemptUsage } from "./attemptUsageJournal";
+import type { RunFunding } from "./runFunding";
 
 export interface ClaudeTurnParams {
   decision: PlanRoute;
@@ -80,7 +81,7 @@ export interface ClaudeBackendDeps {
   runHostTurn(client: LoginHostClient, req: RouteInput<"turn.run">, opts: HostTurnOptions): Promise<HostTurnOutcome>;
   bridge: {
     openRun(claims: RunToolTokenClaims, opts?: { callGroupWaitMs?: number; onHalted?: (info: { fallbackNeeded: boolean }) => void }): string;
-    beginTurn(userId: string, sessionId: string): unknown;
+    beginTurn(userId: string, sessionId: string): { previousUnknownOutcome: boolean } | undefined;
     noteToolUse(runId: string, callId: string, name: string, input: unknown, messageId?: string): void;
     noteToolResult(runId: string, callId?: string): void;
     closeRunAndDrain(runId: string, timeoutMs: number): Promise<CloseAndDrainResult | null>;
@@ -93,7 +94,7 @@ export interface ClaudeBackendDeps {
     takeLedgerByGeneration(generation: string): { records: BridgeCallRecord[]; truncated: number };
   };
   executor: {
-    registerRun(runId: string, ctx: { llmModel: string; isDelegatedAccess?: boolean; excludeTools?: string[]; screenshotUrl?: string }): void;
+    registerRun(runId: string, ctx: { llmModel: string; isDelegatedAccess?: boolean; excludeTools?: string[]; screenshotUrl?: string; socketEmit?: (room: string, event: string, payload: any) => void; fundingScope?: RunFunding }): void;
     beginTurn(runId: string, turn: { agentRuntimeRunId?: string; priorSearchCallCount?: number }): void;
     releaseRun(runId: string): void;
   };
@@ -106,22 +107,32 @@ export interface ClaudeBackendDeps {
   emptyFallbackText: string;
   now(): number;
   newRunId(): string;
+  /** Live-refresh events from tools (a CRM or coding-agent change): the same Socket.IO forward the worker path uses. */
+  socketEmit?: (room: string, event: string, payload: any) => void;
   /** Cap for the whole turn; the host deadline is what is left of it. Default 600 s (the controller's generation timeout). */
   turnHardCapMs?: number;
   drainTimeoutMs?: number;
   /** Web searches the session already used (the per-session cap): `seedSearchCallCountFromHistory`. Default 0. */
   seedSearchCount?(history: any[]): number;
-  /** How long, and how often, to look for a tool call that was still executing when the turn ended. Defaults: 5 min, 3 s. */
+  /** How long, and how often, to look for a tool call that was still executing when the turn ended. Defaults: the bridge hold limit (15 min), 3 s. */
   lateWatchMaxMs?: number;
   lateWatchPollMs?: number;
 }
 
 const GRACE_MS = 20_000;
 const MIN_DEADLINE_MS = 30_000;
+/** The host may hold a turn up to this long waiting for a free slot before it starts; the deadline is counted from the start of the turn. */
+const HOST_BUSY_WAIT_MS = 40_000;
+/** The host's own ceiling for a turn deadline. */
+const MAX_DEADLINE_MS = 3_600_000;
+/** The bridge gives up on a call it is still holding after this long (the longest a late record can still arrive). */
+const LATE_WATCH_DEFAULT_MS = 15 * 60_000;
 
 export const OUTCOME_UNKNOWN_NOTE =
   "I lost the connection to your Claude plan while working on this. It may or may not have finished. Please check the results before asking me to repeat anything.";
 export const LATE_RESULT_NOTE = "The action above finished after this turn was stopped. Please check the result before asking me to repeat it.";
+export const PREVIOUS_UNKNOWN_DIRECTIVE =
+  "An action in the previous turn may have run without its result reaching you. Before repeating any action that changes something, check its current state with a read-only tool, or ask the user.";
 export const CONFIRMATION_NOTE =
   "That action needs your confirmation before I can go on. Approval cards are not available on your Claude plan yet, so I have stopped here without doing it.";
 
@@ -129,10 +140,20 @@ export class ClaudeCodeBackend {
   constructor(private readonly deps: ClaudeBackendDeps) {}
 
   private readonly watchers = new Set<Promise<void>>();
+  private readonly wakers = new Set<() => void>();
+  private flushing = false;
 
-  /** Resolves when no late-result watcher is running (shutdown and tests). */
+  /** Resolves when no late-result watcher is running (tests). */
   async idle(): Promise<void> {
     while (this.watchers.size > 0) await Promise.allSettled([...this.watchers]);
+  }
+
+  /** Shutdown: every watcher looks one last time for late records, saves them, and ends. Resolves when all have. */
+  async flush(): Promise<void> {
+    this.flushing = true;
+    for (const wake of [...this.wakers]) wake();
+    await this.idle();
+    this.flushing = false;
   }
 
   /**
@@ -187,11 +208,13 @@ export class ClaudeCodeBackend {
     let rawError: unknown;
     let registered: { release(): void } | undefined;
     let opened = false;
+    let everOpened = false;
     let executorRegistered = false;
     let outcome: HostTurnOutcome | undefined;
     let cancelledByUser = false;
 
     const progress = (status: string, extra: Record<string, unknown> = {}) => {
+      if (seen.stopped || rawError !== undefined || pendingStop) return; // nothing is "executing" once the turn is stopped or failed
       try {
         p.onProgress?.({ iteration: uses.length, status, ...extra });
       } catch {
@@ -200,13 +223,17 @@ export class ClaudeCodeBackend {
     };
 
     try {
-      d.executor.registerRun(runId, { llmModel: p.llmModel, isDelegatedAccess: p.isDelegatedAccess, excludeTools: p.excludeTools, screenshotUrl: p.screenshotUrl });
+      d.executor.registerRun(runId, { llmModel: p.llmModel, isDelegatedAccess: p.isDelegatedAccess, excludeTools: p.excludeTools, screenshotUrl: p.screenshotUrl, socketEmit: d.socketEmit,
+        // The tools' own paid / LLM calls: AgentWeb-funded and attributed to this run, on purpose (decision 2026-10-23). Never the plan's scope.
+        fundingScope: { route: "agentweb", fallback: "agentweb", ownerUserId: p.userId, billingUserId: p.billingUserId ?? p.userId, runLabel: `claude_plan:${runId}`, resolvedAt: new Date(startedAt).toISOString() },
+      });
       executorRegistered = true;
       const token = d.bridge.openRun(
         { runId, userId: p.userId, sessionId: p.sessionId, connectionId, epoch },
         { callGroupWaitMs: 1_500, onHalted: (info) => void (seen.confirmationFallback ||= info.fallbackNeeded) },
       );
       opened = true;
+      everOpened = true;
 
       // 4. cancel handle FIRST: a refused second turn must not have touched the running turn's session state (`beginTurn` starts a new epoch and
       // lifts halts). Then the Stop re-check.
@@ -222,7 +249,8 @@ export class ClaudeCodeBackend {
         if (err instanceof ClaudeRunConflictError) throw new ClaudeRouteStopError("host_busy");
         throw err;
       }
-      d.bridge.beginTurn(p.userId, p.sessionId);
+      const began = d.bridge.beginTurn(p.userId, p.sessionId);
+      if (began?.previousUnknownOutcome === true) prompt = appendDirective(prompt, PREVIOUS_UNKNOWN_DIRECTIVE);
       d.executor.beginTurn(runId, { agentRuntimeRunId: runId, priorSearchCallCount: d.seedSearchCount?.(p.sessionHistory) ?? 0 });
 
       if (d.isCancelled(p.sessionId)) {
@@ -231,7 +259,7 @@ export class ClaudeCodeBackend {
         // 5. the turn
         const cap = d.turnHardCapMs ?? 600_000;
         const elapsed = p.turnStartMs ? Math.max(0, d.now() - p.turnStartMs) : 0;
-        const deadlineMs = Math.max(MIN_DEADLINE_MS, cap - elapsed - GRACE_MS);
+        const deadlineMs = Math.min(MAX_DEADLINE_MS, Math.max(MIN_DEADLINE_MS, cap - elapsed - GRACE_MS - HOST_BUSY_WAIT_MS));
         progress("thinking");
         try {
           outcome = await d.runHostTurn(
@@ -292,7 +320,7 @@ export class ClaudeCodeBackend {
       const drained = await d.bridge.closeRunAndDrain(runId, d.drainTimeoutMs ?? 10_000);
       opened = false;
       const ledger: BridgeCallRecord[] = drained ? drained.ledger : d.bridge.takeLedger(runId).records;
-      if (!drained || drained.stillRunning > 0) this.watchLate(p, generation, ledger);
+      if (!drained || drained.stillRunning > 0) this.watchLate(p, generation, ledger, drained ? drained.stillRunning : undefined);
 
       // 7. map
       if (seen.stopped || cancelledByUser || d.isCancelled(p.sessionId)) {
@@ -321,7 +349,7 @@ export class ClaudeCodeBackend {
         // Anything the turn did before failing is real: keep it visible, then stop with the typed reason.
         await this.persistSettled(p, ledger);
         await this.journal(p, runId, startedAt, result.aborted ? "aborted" : "failed", seen.usage);
-        const stop = fromResultErrorKind(result.errorKind);
+        const stop = fromResultErrorKind(result.errorKind, result.aborted);
         console.error("[claude-backend] turn ended not ok", { errorKind: result.errorKind, aborted: result.aborted, stop: stop.code, session: p.sessionId });
         if (stop.markNeedsReconnect) await d.markNeedsReconnect(connectionId, epoch, "turn_auth_dead").catch(() => undefined);
         throw stop;
@@ -356,7 +384,9 @@ export class ClaudeCodeBackend {
           /* already closed */
         }
       }
-      if (executorRegistered) {
+      // Once the bridge run was opened, the bridge releases the executor's state when the run closes AND its last call has finished. Releasing here
+      // would pull the state out from under a call that is still executing (a Stop mid-write).
+      if (executorRegistered && !everOpened) {
         try {
           d.executor.releaseRun(runId);
         } catch {
@@ -370,26 +400,42 @@ export class ClaudeCodeBackend {
    * A call that was still executing when the turn ended (a Stop mid-write) finishes later and is recorded by the bridge as a late record. Nothing
    * else would ever show it in the chat, so it is looked for, for a bounded time, and saved with a note. Each call is saved once.
    */
-  private watchLate(p: ClaudeTurnParams, generation: string | undefined, settled: BridgeCallRecord[]): void {
+  private watchLate(p: ClaudeTurnParams, generation: string | undefined, settled: BridgeCallRecord[], expectedLate: number | undefined): void {
     const d = this.deps;
     if (!generation) return;
     const pollMs = d.lateWatchPollMs ?? 3_000;
-    const polls = Math.max(1, Math.ceil((d.lateWatchMaxMs ?? 5 * 60_000) / pollMs));
+    const polls = Math.max(1, Math.ceil((d.lateWatchMaxMs ?? LATE_WATCH_DEFAULT_MS) / pollMs));
     const done = new Set(settled.map((r) => r.toolCallId));
+    let saved = 0;
+    const sleep = () =>
+      new Promise<void>((resolve) => {
+        const wake = () => {
+          clearTimeout(t);
+          this.wakers.delete(wake);
+          resolve();
+        };
+        const t = setTimeout(wake, pollMs);
+        t.unref?.();
+        this.wakers.add(wake);
+      });
     const task: Promise<void> = (async () => {
       for (let i = 0; i < polls; i++) {
-        await new Promise<void>((resolve) => {
-          const t = setTimeout(resolve, pollMs);
-          t.unref?.();
-        });
-        const late = d.bridge.takeLedgerByGeneration(generation).records.filter((r) => r.late === true && !done.has(r.toolCallId));
-        if (late.length === 0) continue;
-        for (const r of late) done.add(r.toolCallId);
-        const mapped = mapLedgerToResponseMessages({ ledger: late, finalText: LATE_RESULT_NOTE, llm: p.llmModel, stamps: p.stamps });
-        const note = mapped.responseMessages[mapped.responseMessages.length - 1];
-        note.metadata = { ...note.metadata, kind: "claude-late-result" };
-        delete note.metadata.toolCalls;
-        await d.persistMessages(p.sessionId, mapped.responseMessages);
+        await sleep();
+        // Only a call that really ran is worth showing. A refused / collapsed / joined late record executed nothing.
+        const late = d.bridge
+          .takeLedgerByGeneration(generation)
+          .records.filter((r) => r.late === true && (r.kind === "executed" || r.kind === "failed") && !done.has(r.toolCallId));
+        if (late.length > 0) {
+          for (const r of late) done.add(r.toolCallId);
+          saved += late.length;
+          const mapped = mapLedgerToResponseMessages({ ledger: late, finalText: LATE_RESULT_NOTE, llm: p.llmModel, stamps: p.stamps });
+          const note = mapped.responseMessages[mapped.responseMessages.length - 1];
+          note.metadata = { ...note.metadata, kind: "claude-late-result" };
+          delete note.metadata.toolCalls;
+          await d.persistMessages(p.sessionId, mapped.responseMessages);
+        }
+        if (this.flushing) break; // shutdown: that was the last look
+        if (expectedLate !== undefined && saved >= expectedLate) break; // everything that was still running has been shown
       }
     })()
       .catch((err) => console.error("[claude-backend] late result watch failed:", err instanceof Error ? err.message : String(err)))
