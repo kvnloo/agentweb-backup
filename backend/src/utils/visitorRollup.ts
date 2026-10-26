@@ -81,9 +81,12 @@ export function applyUserPropOps(
       const exists = Object.prototype.hasOwnProperty.call(props, name);
       if (!exists && Object.keys(props).length >= MAX_USER_PROPS) continue;
       if (type === 'add') {
-        const delta = typeof raw === 'number' ? raw : Number(raw);
+        const delta =
+          typeof raw === 'number' ? raw : typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : NaN;
         if (!Number.isFinite(delta)) continue;
-        const prevNum = exists ? Number(props[name]) : 0;
+        const previous = exists ? props[name] : undefined;
+        const prevNum =
+          typeof previous === 'number' || typeof previous === 'string' ? Number(previous) : 0;
         const prev = Number.isFinite(prevNum) ? prevNum : 0;
         const sum = prev + delta;
         if (!Number.isFinite(sum)) continue;

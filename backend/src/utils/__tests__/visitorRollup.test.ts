@@ -26,6 +26,14 @@ describe('rollupVisitors (ENG-2690)', () => {
     expect(v.userProperties).toEqual({ first_source: 'google', plan: 'pro', visits: 4 });
   });
 
+  it('add treats a non-numeric previous value (boolean) as 0 and ignores boolean deltas', () => {
+    const [v] = rollupVisitors([
+      row({ visitorId: 'vis-aaaa1111', sessionStartMs: 1000, user_set: { n: true } }),
+      row({ visitorId: 'vis-aaaa1111', sessionStartMs: 2000, user_add: { n: 2, m: true } }),
+    ]);
+    expect(v.userProperties).toEqual({ n: 2 });
+  });
+
   it('skips rows without visitorId and rejects unsafe/unbounded input', () => {
     const many: Record<string, number> = {};
     for (let i = 0; i < MAX_USER_PROPS + 10; i++) many[`p${i}`] = i;
