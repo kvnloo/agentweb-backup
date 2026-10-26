@@ -1,0 +1,8 @@
+{
+  "chat": "gemini-3.8-flash",
+  "scheduled": "gemini-3.8-flash",
+  "report": "gemini-3.1-pro-preview",
+  "support": "gemini-3.1-pro-preview",
+  "image": "gemini-3.1-pro-preview",
+  "video": "gemini-3.1-pro-preview"
+}

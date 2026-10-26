@@ -1,0 +1,13 @@
+{
+  "version": "2026-10-21.1",
+  "default": "gemini-3.8-flash",
+  "routes": {
+    "chat": "gemini-3.8-flash",
+    "scheduled": "gemini-3.8-flash",
+    "report": "anthropic.claude-sonnet-5",
+    "support": "gemini-3.8-flash",
+    "image": "gemini-3.8-flash",
+    "video": "gemini-3.8-flash"
+  },
+  "tiers": { "Free": { "routes": { "report": "gemini-3.8-flash" } } }
+}
