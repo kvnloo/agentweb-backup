@@ -1,4 +1,4 @@
-import { retryIfFreshToken401, FRESH_TOKEN_RETRY_DELAYS_MS, FreshTokenRejectedError } from '../services/adapters/linkedInAdapter';
+import { retryIfFreshToken401, isFreshlyMintedToken, FRESH_TOKEN_RETRY_DELAYS_MS, FreshTokenRejectedError } from '../services/adapters/linkedInAdapter';
 import { toolResultError } from '../utils/toolResultError';
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 import { retryabilityLine } from '../services/agentMode/core/errorRetryability';
@@ -45,6 +45,39 @@ describe('ENG-2663 retryIfFreshToken401', () => {
   });
   it('defaults to a single 10s wait so an interactive user is never blocked long', () => {
     expect(FRESH_TOKEN_RETRY_DELAYS_MS).toEqual([10_000]);
+  });
+});
+
+describe('ENG-2663 isFreshlyMintedToken (age derived from the stored expiry)', () => {
+  const DAY = 24 * 60 * 60 * 1000;
+  const now = 1_800_000_000_000;
+  it('is fresh right after a 60-day token is minted, and for the next few minutes', () => {
+    expect(isFreshlyMintedToken(now + 60 * DAY, now)).toBe(true);
+    expect(isFreshlyMintedToken(now + 60 * DAY - 4 * 60 * 1000, now)).toBe(true);
+  });
+  it('is no longer fresh after 5 minutes', () => {
+    expect(isFreshlyMintedToken(now + 60 * DAY - 6 * 60 * 1000, now)).toBe(false);
+  });
+  it('is not fresh for an old token, an expired token, or a far-future placeholder expiry', () => {
+    expect(isFreshlyMintedToken(now + 1 * 60 * 60 * 1000, now)).toBe(false);
+    expect(isFreshlyMintedToken(now - 1000, now)).toBe(false);
+    expect(isFreshlyMintedToken(9007199254740991, now)).toBe(false);
+    expect(isFreshlyMintedToken(NaN, now)).toBe(false);
+    expect(isFreshlyMintedToken(undefined as any, now)).toBe(false);
+  });
+  it('tolerates a little clock skew between hosts', () => {
+    expect(isFreshlyMintedToken(now + 60 * DAY + 30 * 1000, now)).toBe(true);
+    expect(isFreshlyMintedToken(now + 60 * DAY + 5 * 60 * 1000, now)).toBe(false);
+  });
+});
+
+describe('ENG-2663 retry hook', () => {
+  it('runs beforeRetry between attempts and aborts the retry if it throws', async () => {
+    const call = jest.fn().mockRejectedValue(err401());
+    const beforeRetry = jest.fn().mockRejectedValue(new Error('consent withdrawn'));
+    await expect(retryIfFreshToken401(true, call, [0], beforeRetry)).rejects.toThrow('consent withdrawn');
+    expect(call).toHaveBeenCalledTimes(1);
+    expect(beforeRetry).toHaveBeenCalledTimes(1);
   });
 });
 
