@@ -8,6 +8,8 @@
  *   --halt      B3  a tool that asks for confirmation ends the turn with the plain confirmation note (no deck yet)
  *   --stop      B4  the registry stops the running turn: cancelled result, settled tool work persisted, no follow-up write
  *   --unknown   B5  the host does not know the connection: typed `needs_reconnect`, connection flagged
+ *   --timeout   B6  the host ends the turn at its deadline: typed `turn_timeout` stop, settled tool work kept, the still-running call saved later
+ *   --revoke    B7  disconnecting the connection (registry.cancelConnection + bridge.revokeConnection, as the revoke hook does) stops the running turn
  *   --all       every case above
  * Serves the bridge adapter on 127.0.0.1:${AW_BRIDGE_PORT:-3991} (the host's configured bridge URL on the test instance).
  */
@@ -18,7 +20,7 @@ import { runHostTurn } from "../../../services/funding/loginHostTurn";
 import { ToolBridge, type BridgeExecuteOutcome, type BridgeTool, type ToolBridgeDeps } from "../../../services/funding/toolBridge";
 import { ToolBridgeMcpAdapter } from "../../../services/funding/toolBridgeMcp";
 import { ClaudeRunRegistry } from "../../../services/funding/claudeRunRegistry";
-import { ClaudeCodeBackend, CONFIRMATION_NOTE, type ClaudeTurnParams, type ClaudeTurnResult } from "../../../services/funding/claudeCodeBackend";
+import { ClaudeCodeBackend, CONFIRMATION_NOTE, type ClaudeBackendDeps, type ClaudeTurnParams, type ClaudeTurnResult } from "../../../services/funding/claudeCodeBackend";
 import { ClaudeRouteStopError } from "../../../services/funding/claudeRouteErrors";
 import { EMPTY_FINAL_RESPONSE_FALLBACK } from "../../../services/agentMode/core/termination";
 import type { AttemptUsage } from "../../../services/funding/attemptUsageJournal";
@@ -98,8 +100,7 @@ const data = { persisted: [] as any[][], journal: [] as AttemptUsage[], reconnec
 let n = 0;
 let lastBackend: ClaudeCodeBackend | undefined;
 
-function backend(connectionOverride?: string) {
-  void connectionOverride;
+function backend(over: Partial<ClaudeBackendDeps> = {}) {
   return new ClaudeCodeBackend({
     hostClient: () => client,
     prepareTurnContext: async () => ({ messages: data.messages }),
@@ -118,6 +119,7 @@ function backend(connectionOverride?: string) {
     drainTimeoutMs: 8_000,
     lateWatchPollMs: 2_000,
     lateWatchMaxMs: 90_000,
+    ...over,
   });
 }
 
@@ -140,11 +142,11 @@ const params = (cid: string, over: Partial<ClaudeTurnParams> = {}): ClaudeTurnPa
   ...over,
 });
 
-async function runCase(label: string, p: ClaudeTurnParams): Promise<{ r?: ClaudeTurnResult; stop?: ClaudeRouteStopError; err?: unknown; seconds: number; progress: string[] }> {
+async function runCase(label: string, p: ClaudeTurnParams, deps: Partial<ClaudeBackendDeps> = {}): Promise<{ r?: ClaudeTurnResult; stop?: ClaudeRouteStopError; err?: unknown; seconds: number; progress: string[] }> {
   const t0 = Date.now();
   const progress: string[] = [];
   try {
-    lastBackend = backend();
+    lastBackend = backend(deps);
     const r = await lastBackend.run({ ...p, onProgress: (x) => void progress.push(x.status) });
     const seconds = Math.round((Date.now() - t0) / 100) / 10;
     out(`${label}.result`, { seconds, content: r.content.slice(0, 160), roles: r.responseMessages.map((m) => m.role), cancelled: r.cancelled === true, progress: [...new Set(progress)] });
@@ -230,6 +232,38 @@ async function main() {
     check("B5 the host's answer for an unknown connection is a typed stop, not an AgentWeb run", c.stop?.code === "needs_reconnect" || c.stop?.code === "host_unavailable" || c.stop?.code === "turn_failed", c.stop?.code ?? c.err);
     check("B5 when the host denies the connection it is flagged for reconnect", c.stop?.code !== "needs_reconnect" || (data.reconnect.length === 1 && data.reconnect[0][0] === "zz-no-such-connection"), data.reconnect);
     check("B5 nothing is left registered", registry.size === 0);
+  }
+
+  if (want("--timeout")) {
+    reset([
+      { role: "system", content: "You are a concise assistant. Use the tools exactly as asked, in order." },
+      { role: "user", content: "Call mcp__emma__live_hold with label='a'. When it returns, call mcp__emma__live_hold with label='b'. Then reply DONE." },
+    ]);
+    // A 60 s turn cap makes the host deadline its 30 s floor: the first hold (25 s) settles, the second is still running when the host ends the turn.
+    const c = await runCase("B6.timeout", params(cid, { turnStartMs: Date.now() }), { turnHardCapMs: 60_000 });
+    await sleep(26_000); // the second hold runs 25 s from its start; the late-result watcher then saves it
+    await lastBackend!.idle();
+    check("B6 the host's deadline ended the turn as the typed timeout stop", c.stop?.code === "turn_timeout" && c.stop.httpStatus === 504, c.stop?.code ?? c.err);
+    check("B6 it ended at the deadline, not at the model's own pace", c.seconds >= 28 && c.seconds < 55, c.seconds);
+    check("B6 the call that finished before the deadline is kept in the chat", data.persisted.some((b) => b.some((m: any) => m.role === "tool" && m.content === "HOLD_RECEIPT")), data.persisted.map((b) => b.map((m: any) => m.role)));
+    check("B6 the call still running at the deadline ran once and is saved when it finishes, with a note", exec.calls.filter((x) => x === "live_hold").length === 2 && data.persisted.some((b) => b.some((m: any) => m.metadata?.kind === "claude-late-result")), { calls: exec.calls, batches: data.persisted.length });
+    check("B6 nothing is left registered", registry.size === 0);
+  }
+
+  if (want("--revoke")) {
+    reset([
+      { role: "system", content: "You are a concise assistant. Use the tools exactly as asked, in order." },
+      { role: "user", content: "Call mcp__emma__live_hold with label='h'. When it returns, call mcp__emma__live_write with note='after'. Then reply DONE." },
+    ]);
+    // What the disconnect path does (hostedSubscriptionService.onRevokeBegun): stop the turns of the connection, then close its bridge runs.
+    setTimeout(() => out("B7.revoke", { stopped: registry.cancelConnection(cid), runs: adapter.revokeConnection(cid).length }), 9_000);
+    const c = await runCase("B7.revoke", params(cid, { turnStartMs: Date.now() }));
+    await sleep(22_000);
+    await lastBackend!.idle();
+    check("B7 revoking the connection ended the running turn as cancelled, with no answer", c.r?.cancelled === true && c.r.responseMessages.length === 0, c.r && { cancelled: c.r.cancelled });
+    check("B7 it ended well before the model could finish both steps", c.seconds < 40, c.seconds);
+    check("B7 the follow-up write never started under the revoked connection", exec.calls.includes("live_hold") && !exec.calls.includes("live_write"), exec.calls);
+    check("B7 nothing is left registered", registry.size === 0);
   }
 
   const failed = checks.filter((c) => !c.ok);
