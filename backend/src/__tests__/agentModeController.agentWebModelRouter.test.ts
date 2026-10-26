@@ -683,7 +683,12 @@ describe('MAJOR 1: the owner\'s plan never reaches a share viewer through the ro
     const view = makeRes();
     await agentModeController.getSharedConversation({ params: { shareId: SESSION_ID }, query: {} } as any, view);
     expect(view.statusCode).toBe(200);
-    const served = view.body.session.messages.find((m: any) => m.role === 'assistant');
+    // ENG-2645: the read-only page shows no model footer, so its rows carry no model fields at all.
+    expect(view.body.session.messages.find((m: any) => m.role === 'assistant')).toEqual({ role: 'assistant', content: 'OK' });
+    const conversableView = makeRes();
+    await agentModeController.getSharedConversation({ params: { shareId: SESSION_ID }, query: { conversable: 'tok' } } as any, conversableView);
+    expect(conversableView.statusCode).toBe(200);
+    const served = conversableView.body.session.messages.find((m: any) => m.role === 'assistant');
     expect(served).toMatchObject({ llm: ROUTED_CHAT, content: 'OK' });
     expect(served).not.toHaveProperty('llmSelected');
     expect(served).not.toHaveProperty('llmRoutingReason');

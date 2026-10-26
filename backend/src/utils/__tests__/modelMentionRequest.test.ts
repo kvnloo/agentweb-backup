@@ -337,3 +337,27 @@ describe('findModelMention — a dot between two words is not a vendor abbreviat
     expect(findModelMention('What does it mean to use Z.ai: GLM 5.3?', idx)).toBeNull();
   });
 });
+
+describe('findModelMention — a key never matches part of a dotted version (ENG-2646)', () => {
+  // "5.5" tokenizes to "5" + "5", and the scan is position-first, so the shorter sibling's id key
+  // "anthropic claude sonnet 5" used to match at "Anthropic" and win before the scan reached
+  // "Claude Sonnet 5.5". Only the auto-added entry's "Anthropic: ..." name happened to hide this.
+  const index = buildModelMentionIndex([
+    ...CATALOG,
+    { id: 'openrouter/anthropic/claude-sonnet-5.5', name: 'Claude Sonnet 5.5', family: 'claude-sonnet' },
+  ]);
+  const SONNET_5 = 'anthropic.claude-sonnet-5';
+  const SONNET_5_5 = 'openrouter/anthropic/claude-sonnet-5.5';
+
+  it.each([
+    ['use Anthropic: Claude Sonnet 5.5 for this', SONNET_5_5],
+    ['use Anthropic Claude Sonnet 5.5', SONNET_5_5],
+    ['switch to Claude Sonnet 5.5', SONNET_5_5],
+    ['use Sonnet 5.5 for this', SONNET_5_5],
+    ['use Anthropic Claude Sonnet 5 for this', SONNET_5],
+    ['switch to Claude Sonnet 5. Then summarise.', SONNET_5],
+    ['use Sonnet 5', SONNET_5],
+  ])('reads %p as a request for the correct model', (text, expected) => {
+    expect(findModelMention(text, index)?.modelId).toBe(expected);
+  });
+});
