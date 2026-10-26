@@ -138,18 +138,27 @@ export const AW_SDK_SOURCE: string = String.raw`/* AgentWeb tracker v1. One sess
     var videoPrev = [];
     var videoPrevEls = [];
 
+    // UTF-8 byte size of a string: the ingest limit is in bytes, and non-ASCII registered values take 2-4
+    // bytes per character, so a character count under-measures them (Opslane run 1360).
+    function utf8Bytes(str) {
+      var n = 0;
+      for (var bi = 0; bi < str.length; bi++) {
+        var c = str.charCodeAt(bi);
+        n += c < 0x80 ? 1 : c < 0x800 ? 2 : (c >= 0xd800 && c < 0xe000) ? 2 : 3;
+      }
+      return n;
+    }
+
     function transmit(body) {
       var s = JSON.stringify(body);
-      // The ingest rejects > 16kb. Every field is ASCII (labels are folded above, URLs arrive percent-encoded)
-      // except props, so length is within 2x of bytes; the worst case (all-quote labels, which JSON doubles)
-      // is what this guards: shed the cumulative strings, keep the event.
-      if (s.length > 15000) {
+      // The ingest rejects > 16kb (bytes). Shed the cumulative strings first, keep the event.
+      if (utf8Bytes(s) > 15000) {
         body.journey = ''; body.clickLog = ''; body.showsClicked = '';
         s = JSON.stringify(body);
       }
       // Registered super values (site-owner awSuper/awRegister) can still push it over: drop them, keep
       // the automatic ones (#url, #title, ...) and the event.
-      if (s.length > 15000 && body['super']) {
+      if (utf8Bytes(s) > 15000 && body['super']) {
         body['super'] = superProps(false);
         s = JSON.stringify(body);
       }

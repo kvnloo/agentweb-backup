@@ -284,4 +284,13 @@ describe('aw.js: ENG-2689 super properties', () => {
     expect(sent[0].super.session_page_num).toBe(1);
     expect(second[0].super.session_page_num).toBe(2);
   });
+
+  it('non-ASCII registered values over the byte cap are shed by BYTES, keeping presets and the event', () => {
+    const { sizes, sent } = got('superNonAscii');
+    expect(sent).toHaveLength(1);
+    expect(sizes[0]).toBeLessThan(16 * 1024);
+    expect(sent[0].event).toBe('lp_view');
+    expect(sent[0].super).not.toHaveProperty('k0');
+    expect(sent[0].super).toMatchObject({ '#lib': 'js', '#url': URL_ });
+  });
 });
