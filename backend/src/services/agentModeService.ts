@@ -3007,7 +3007,7 @@ export class AgentModeService {
    * publish directive and the anti-loop directive, and returns the messages plus every value the loop derives from them.
    * Any change here changes what the model reads: agentModeService.prepareTurnContext.golden.test.ts pins it.
    */
-  private async prepareTurnContext(input: {
+  async prepareTurnContext(input: {
     messageContent: string;
     sessionHistory: ChatMessage[];
     userId: string;
