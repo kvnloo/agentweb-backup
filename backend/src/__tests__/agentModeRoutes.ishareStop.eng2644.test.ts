@@ -82,4 +82,30 @@ describe('POST /api/agent-mode/ishare/:shareId/stop (public, conversable token)'
     expect(res.status).toBe(410);
     expect(mockRequestCancel).not.toHaveBeenCalled();
   });
+
+  it('answers 410 on an expired share and writes NO share metadata (a stale read must not clobber a re-share)', async () => {
+    mockFake.seedSession({ ...SEEDED_SESSION, interactiveShareMetadata: { ...SEEDED_SESSION.interactiveShareMetadata, expiresAt: '2020-01-01T00:00:00.000Z' } });
+    mockFake.writeLog.length = 0;
+    const res = await stop(SESSION_ID, 'TOK');
+    expect(res.status).toBe(410);
+    expect(mockFake.writeLog).toHaveLength(0);
+  });
+
+  it('answers 410 (not 404) on a retry, and leaves a share the owner re-created untouched', async () => {
+    const expired = { ...SEEDED_SESSION, interactiveShareMetadata: { ...SEEDED_SESSION.interactiveShareMetadata, expiresAt: '2020-01-01T00:00:00.000Z' } };
+    mockFake.seedSession(expired);
+    expect((await stop(SESSION_ID, 'TOK')).status).toBe(410);
+    expect((await stop(SESSION_ID, 'TOK')).status).toBe(410);
+    // owner re-creates the share (new token, live expiry): the old token is refused, the new one stops the run
+    mockFake.seedSession({ ...SEEDED_SESSION, interactiveShareMetadata: { ...SEEDED_SESSION.interactiveShareMetadata, token: 'NEW' } });
+    expect((await stop(SESSION_ID, 'TOK')).status).toBe(401);
+    expect((await stop(SESSION_ID, 'NEW')).status).toBe(200);
+    expect(mockRequestCancel).toHaveBeenCalledTimes(1);
+  });
+
+  it('answers 410 for a switched-off share with the right token, 404 only for a missing session', async () => {
+    mockFake.seedSession({ ...SEEDED_SESSION, interactiveShareMetadata: { ...SEEDED_SESSION.interactiveShareMetadata, isActive: false } });
+    expect((await stop(SESSION_ID, 'TOK')).status).toBe(410);
+    expect((await stop('nope', 'TOK')).status).toBe(404);
+  });
 });
