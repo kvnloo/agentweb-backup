@@ -195,7 +195,7 @@ describe('AD_CREATIVE CREATE', () => {
     await expect(executeMetaToolkitCreative(USER, call('CREATE', base), deps())).rejects.toThrow(/needs the media/);
     const d = deps({ videoStatus: jest.fn().mockResolvedValue({ status: 'processing' }) });
     const r = await executeMetaToolkitCreative(USER, call('CREATE', { ...base, video_id: '1', image_url: 'https://cdn.x/t.jpg' }), d);
-    expect(r.status).toBe('VIDEO_NOT_READY');
+    expect((r as any).status).toBe('VIDEO_NOT_READY');
     expect(d.dispatch).not.toHaveBeenCalled();
   });
 
