@@ -360,7 +360,7 @@ describe('Interactive Share Expiration', () => {
         },
       });
 
-      const req = mockRequest({ params: { shareId: 'session-1' } });
+      const req = mockRequest({ params: { shareId: 'session-1' }, query: { conversable: 'valid-token' } });
       const res = mockResponse();
 
       await agentModeController.getShareOgMetadata(req, res);

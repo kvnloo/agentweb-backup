@@ -34,6 +34,7 @@ import { WEB_SEARCH_TOOL_NAMES } from "../../utils/citations";
 import { chatbotDb } from "../chatbotService";
 import type { RunToolTokenClaims } from "./runToolToken";
 import type { BridgeExecuteOutcome, BridgeImage, BridgeTool, BridgeToolCall, ToolBridgeDeps } from "./toolBridge";
+import { isStrictRepeatEffect } from "./bridgeToolClassification";
 
 export interface EmmaBridgeRunContext {
   llmModel: string;
@@ -76,6 +77,12 @@ interface EmmaRunState {
 
 export class EmmaToolBridgeExecutor implements ToolBridgeDeps {
   private readonly runs = new Map<string, EmmaRunState>();
+  /** Per-call liveness of a connection-funded run (see bridgeLiveness.ts). A run funded by a connection cannot open without one. */
+  readonly isLive?: ToolBridgeDeps["isLive"];
+
+  constructor(opts: { isLive?: ToolBridgeDeps["isLive"] } = {}) {
+    this.isLive = opts.isLive;
+  }
 
   /** Must be called before the bridge opens the run. */
   registerRun(runId: string, context: EmmaBridgeRunContext): void {
@@ -136,6 +143,11 @@ export class EmmaToolBridgeExecutor implements ToolBridgeDeps {
   /** Same exemptions Emma's dispatcher applies to its own same-message collapsing. */
   isDedupable(toolName: string): boolean {
     return !NON_DEDUPABLE_TOOLS.has(toolName);
+  }
+
+  /** Calls whose identical repeat in one turn must return the original outcome (see bridgeToolClassification.ts). */
+  isStrictEffect(toolName: string, args: Record<string, unknown>): boolean {
+    return isStrictRepeatEffect(toolName, args);
   }
 
   async execute(run: RunToolTokenClaims, call: BridgeToolCall): Promise<BridgeExecuteOutcome> {
@@ -224,6 +236,14 @@ export class EmmaToolBridgeExecutor implements ToolBridgeDeps {
       // awaitingUserConfirmation. `requiresConfirmation` alone does not stop the turn.
       requiresConfirmation: !isError && entry.result?.awaitingUserConfirmation === true,
       toolsChanged: dispatched.skillsUpdated === true,
+      // The minimal result Emma's loop keeps in its ledger; backend-only (it can carry approval tokens and Meta digests).
+      result: entry.result,
+      ...(isError ? { error: describeError(entry.error) } : {}),
+      context: {
+        isUnattendedRun: context.isUnattendedRun === true,
+        isDelegatedAccess: context.isDelegatedAccess === true,
+        isInteractiveShare: context.isInteractiveShare === true,
+      },
     };
   }
 
@@ -253,6 +273,15 @@ function toBridgeContent(content: unknown): { content: string; images?: BridgeIm
     }
   }
   return { content: text.join("\n"), ...(images.length ? { images } : {}) };
+}
+
+/** A short, non-sensitive label for a tool failure: the ledger keeps the tool's own text elsewhere. */
+function describeError(error: unknown): string {
+  if (typeof error === "string") return error.slice(0, 200);
+  if (error && typeof error === "object" && typeof (error as { message?: unknown }).message === "string") {
+    return String((error as { message: string }).message).slice(0, 200);
+  }
+  return "tool error";
 }
 
 function toBridgeTool(definition: any): BridgeTool | null {

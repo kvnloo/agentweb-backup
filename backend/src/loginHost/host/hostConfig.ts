@@ -4,6 +4,7 @@
  * and read once at start-up; nothing in it is ever taken from a request.
  */
 import { z } from "zod";
+import { isCanonicalIPv4, unusableAddressReason } from "../ipv4";
 import { assertAbsPath, LayoutError } from "../ports/layout";
 
 const absPath = z.string().refine((p) => {
@@ -35,6 +36,8 @@ const schema = z
         tmpSize: size.default("128M"),
         shmSize: size.default("64M"),
         runtimeMaxSec: z.number().int().min(10).max(7 * 24 * 3600).default(2 * 3600),
+        /** Grace period a stopping customer unit gets to exit on SIGTERM before SIGKILL (keeps a login that is mid-refresh intact). */
+        stopGraceSec: z.number().int().min(2).max(12).default(10),
       })
       .strict()
       .default({}),
@@ -63,9 +66,43 @@ const schema = z
         systemPromptFile: absPath,
         turnWrapperPath: absPath.default("/opt/aw-login-host/claude-turn.sh"),
         /** The Emma tool bridge's MCP endpoint as seen from a customer process. */
-        bridgeUrl: z.string().url().refine((u) => /^https?:\/\//.test(u) && !/[$%\s]/.test(u), "http(s) only, no $ % or whitespace"),
+        bridgeUrl: z
+          .string()
+          .url()
+          .refine((u) => /^https?:\/\//.test(u) && !/[$%\s]/.test(u), "http(s) only, no $ % or whitespace")
+          // The egress proxy matches the bridge by plain host and port: an IPv6 literal cannot be expressed there, so it is refused up front.
+          .refine((u) => !new URL(u).hostname.startsWith("["), "IPv6 literal hosts are not supported for the tool bridge (use a name or an IPv4 address)"),
         models: z.array(z.string().regex(/^[A-Za-z0-9._:-]{1,64}$/)).min(1).max(20).optional(),
         basePath: z.string().regex(/^[A-Za-z0-9._/:-]{1,200}$/).optional(),
+      })
+      .strict(),
+    /**
+     * Mutual-TLS listener for a backend on ANOTHER machine (PR 3). Optional: the unix socket alone is enough on a single box (the test
+     * environment). The files are root-owned (the key 0600), written at deploy time from Secrets Manager; they are read once at start-up.
+     */
+    tls: z
+      .object({
+        /** The private address to bind (never 0.0.0.0 by accident): an IPv4 literal. */
+        host: z.string().refine(isCanonicalIPv4, "a canonical IPv4 address (four decimal octets, no leading zeros)"),
+        port: z.number().int().min(1024).max(65535).default(8443),
+        certPath: absPath,
+        keyPath: absPath,
+        caPath: absPath,
+        /** The subject CN(s) the backend's client certificate must carry (the CA signing it is necessary, not sufficient). */
+        clientCommonNames: z.array(z.string().regex(/^[A-Za-z0-9._-]{1,64}$/)).min(1).max(5),
+      })
+      .strict()
+      .optional(),
+    /**
+     * Network isolation (PR 2): every customer unit runs with PrivateNetwork=yes (loopback only) and reaches the world ONLY through the
+     * host's allowlisting proxy over a unix socket. `allow` is the complete list of `host:port` targets a customer process may reach
+     * (the Emma tool bridge from `claude.bridgeUrl` is added automatically). There is no default: a host with no policy does not start.
+     */
+    egress: z
+      .object({
+        allow: z.array(z.string().regex(/^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?:[0-9]{1,5}$/, "lowercase host:port")).min(1).max(50),
+        launcherPath: absPath.default("/opt/aw-login-host/aw-net.sh"),
+        socat: absPath.default("/usr/bin/socat"),
       })
       .strict(),
     tools: z
@@ -84,7 +121,7 @@ const schema = z
   })
   .strict();
 
-export type HostConfig = z.infer<typeof schema> & { stateRoot: string; socketPath: string };
+export type HostConfig = z.infer<typeof schema> & { stateRoot: string; socketPath: string; egressDir: string; egressSocketPath: string };
 
 export class HostConfigError extends Error {
   constructor(readonly reason: string) {
@@ -106,7 +143,17 @@ export function parseHostConfig(raw: unknown): HostConfig {
   } catch (e) {
     throw new HostConfigError(e instanceof LayoutError ? e.reason : "path invalid");
   }
-  return { ...c, stateRoot, socketPath: `${c.socket.dir}/host.sock` };
+  for (const t of c.egress.allow) {
+    const port = Number(t.slice(t.lastIndexOf(":") + 1));
+    if (!Number.isInteger(port) || port < 1 || port > 65535) throw new HostConfigError(`egress.allow: bad port in ${t}`);
+    if (/^[0-9.]+:/.test(t) || t.startsWith("[")) throw new HostConfigError(`egress.allow: literal IP targets are not allowed (${t})`);
+  }
+  // The worker's own address may be any of its interface addresses (so no private-range requirement here, unlike the backend's side), but
+  // never one that cannot be a machine's address on the network: every-interface, loopback, link-local, multicast or reserved.
+  const unusable = c.tls ? unusableAddressReason(c.tls.host) : null;
+  if (unusable) throw new HostConfigError(`tls.host must be the machine's own network address (${unusable} addresses are refused)`);
+  const egressDir = `/run/aw-egress-${c.env}`;
+  return { ...c, stateRoot, socketPath: `${c.socket.dir}/host.sock`, egressDir, egressSocketPath: `${egressDir}/proxy.sock` };
 }
 
 /** Parses /etc/subuid ("name:start:count" lines): the host's uid range must not overlap any of them. */

@@ -12,22 +12,34 @@ import { getSubscriptionTypeConfig, getUserSubscriptionType } from './subscripti
 import { getCurrentMonth, resolveBillingUserId } from './tokenUsageService';
 import { getEffectiveLlmUsagePolicy } from './llmUsagePolicyResolverService';
 import { getCurrentUsageMonth, getRevocablePurchasedCreditMicroUsd } from './llmUsageCreditService';
+import { isPaygDisputeHold, paygOpenInvoiceUrl } from './paygSettlement';
 import {
-  createPaygOverageSwitch,
+  createExactTrueSwitch,
+  PAYG_OVERAGE_SETTING,
   isPaygCapPercent,
+  paygAdmittedMonth,
+  PAYG_SETTLEMENT_SETTING,
   paygGrossOverageMicroUsd,
   paygOverageThresholdMicroUsd,
+  paygSuspendedReasonOf,
   type PaygCapPercent,
   type PaygOverageSettings,
   type PaygSuspensionReason,
 } from './paygOverage';
 
 /** Process-wide switch reader: one cache, one answer for both gates and the settings routes. */
-export const paygOverageSwitch = createPaygOverageSwitch({
+export const paygOverageSwitch = createExactTrueSwitch({
   getSetting: (name) => settingsService.getSetting(name),
   now: () => Date.now(),
   log: (message, fields) => console.error(message, fields),
-});
+}, PAYG_OVERAGE_SETTING);
+
+/** Month-end settlement's own switch (`paygSettlementService.ts`): off = the settlement cron does nothing. */
+export const paygSettlementSwitch = createExactTrueSwitch({
+  getSetting: (name) => settingsService.getSetting(name),
+  now: () => Date.now(),
+  log: (message, fields) => console.error(message, fields),
+}, PAYG_SETTLEMENT_SETTING);
 
 /** A refusal the route maps straight to `status` + `{ error: code }`. */
 export class PaygOverageRequestError extends Error {
@@ -49,6 +61,12 @@ export interface PaygOverageView {
   suspended: PaygSuspensionReason | null;
   /** The billing owner has a payment method on file. Always false for a caller who is not the owner. */
   hasPaymentMethod: boolean;
+  /**
+   * The Stripe-hosted page of the newest unpaid overage invoice (a month whose charge failed), where it
+   * can be paid with any card — paying it lifts a payment-failure hold. Owner only; null otherwise.
+   * No amount: the page carries it.
+   */
+  openInvoiceUrl: string | null;
 }
 
 interface PaygContext {
@@ -88,6 +106,10 @@ function toView(
     suspended: account?.suspended?.reason ?? null,
     // The owner's billing state is the owner's: a pooled member sees false, never the owner's card status.
     hasPaymentMethod: context.eligible && context.billingUser?.has_payment_method === true,
+    // Never under a dispute hold (paying does not lift it), the same rule as the 429's `usageBlock`.
+    openInvoiceUrl: context.eligible && !isPaygDisputeHold(paygSuspendedReasonOf(account?.suspended))
+      ? paygOpenInvoiceUrl(context.billingUser?.paygSettlements) ?? null
+      : null,
   };
 }
 
@@ -191,10 +213,10 @@ export async function updatePaygOverage(input: {
   const existing = context.billingUser?.paygOverage;
   const disabling = input.enabled === false;
   if (!context.available && !(disabling && existing?.enabled === true)) {
-    throw new PaygOverageRequestError(404, 'payg_unavailable', 'Pay-as-you-go is not available on this plan');
+    throw new PaygOverageRequestError(404, 'payg_unavailable', 'Extra usage is not available on this plan');
   }
   if (!context.eligible) {
-    throw new PaygOverageRequestError(403, 'not_billing_owner', 'Only the account that pays for this plan can change pay-as-you-go');
+    throw new PaygOverageRequestError(403, 'not_billing_owner', 'Only the account that pays for this plan can change extra usage');
   }
   if (typeof input.enabled !== 'boolean') {
     throw new PaygOverageRequestError(400, 'invalid_request', '`enabled` must be a boolean');
@@ -211,7 +233,7 @@ export async function updatePaygOverage(input: {
     throw new PaygOverageRequestError(
       403,
       'delegate_cannot_consent',
-      'Only the account owner can turn on pay-as-you-go or raise its limit',
+      'Only the account owner can turn on extra usage or raise its limit',
     );
   }
 
@@ -220,6 +242,10 @@ export async function updatePaygOverage(input: {
 
   let optIn: PaygOverageSettings['optIn'] | undefined;
   let poolHighWater: PaygOverageSettings['poolHighWater'] | undefined;
+  // The previous month's opt-in / mark these replace: settlement of that month runs after it closes and
+  // still needs them (see `optInClosed`).
+  let optInClosed: PaygOverageSettings['optInClosed'] | undefined;
+  let poolHighWaterClosed: PaygOverageSettings['poolHighWaterClosed'] | undefined;
   if (turningOn) {
     // Overage already standing right now is not the customer's to pay for: it accrued before they
     // agreed. Measured exactly the way the gates measure it (same pool, same high-water mark).
@@ -228,10 +254,13 @@ export async function updatePaygOverage(input: {
       throw new PaygOverageRequestError(404, 'payg_unavailable', 'This plan has no usage pool to go past');
     }
     const month = getCurrentUsageMonth();
-    // The baseline is taken ONLY on the month's first opt-in. Re-enabling later in the same month keeps
-    // it: re-measuring would zero the overage already run up since the first opt-in, so toggling PAYG
-    // off and on would reset the cap. A new month starts with no baseline (the gates ignore a stale one).
-    if (existing?.optIn?.month !== month) {
+    // The baseline is taken ONLY on the month's first opt-in, and only if PAYG has not already admitted
+    // anything this month. Re-enabling later in the same month keeps the month's baseline: re-measuring
+    // would turn overage already admitted (and billable) into "standing before opt-in", so toggling PAYG
+    // off and on would reset the cap. That includes an opt-in carried over from an earlier month — its
+    // baseline for this month is 0, and an off -> on mid-month must not replace that with the overage
+    // the owner has already run up on PAYG. A new month starts with no baseline (the gates ignore a stale one).
+    if (existing?.optIn?.month !== month && !paygAdmittedMonth(existing, month)) {
       const poolMicroUsd = paygOverageThresholdMicroUsd({
         effectiveHardThresholdMicroUsd: usage.policy.hardCostThresholdMicroUsd,
         poolHighWater: existing?.poolHighWater,
@@ -242,6 +271,7 @@ export async function updatePaygOverage(input: {
         overageBaselineMicroUsd: paygGrossOverageMicroUsd(usage.costUsedMicroUsd, poolMicroUsd),
         poolAtOptInMicroUsd: poolMicroUsd,
       };
+      if (existing?.optIn) optInClosed = existing.optIn;
       // Pin the month's pool at least at the opt-in pool, so a downgrade before the next check cannot
       // drop the pool under the one the baseline was measured against. Like the gate's own mark, it
       // leaves out top-up credit a refund can still revoke (llmUsagePoolDecision.ts).
@@ -252,6 +282,7 @@ export async function updatePaygOverage(input: {
       );
       if (existing?.poolHighWater?.month !== month || existing.poolHighWater.thresholdMicroUsd < markMicroUsd) {
         poolHighWater = { month, thresholdMicroUsd: markMicroUsd };
+        if (existing?.poolHighWater && existing.poolHighWater.month !== month) poolHighWaterClosed = existing.poolHighWater;
       }
     }
     await requireLivePaymentMethod(context.billingUser, context.billingUserId);
@@ -283,6 +314,8 @@ export async function updatePaygOverage(input: {
         ...(capPercentOfPool !== null ? { capPercentOfPool } : {}),
         ...(optIn ? { optIn } : {}),
         ...(poolHighWater ? { poolHighWater } : {}),
+        ...(optInClosed ? { optInClosed } : {}),
+        ...(poolHighWaterClosed ? { poolHighWaterClosed } : {}),
         updatedBy: input.actorId,
         updatedAt: now,
         version: nextVersion,
@@ -293,7 +326,20 @@ export async function updatePaygOverage(input: {
           : 'attribute_exists(#payg) AND attribute_not_exists(#payg.#version)',
       ];
       const values: Record<string, unknown> = Number.isInteger(existing.version) ? { ':expectedVersion': existing.version } : {};
-      if (poolHighWater) {
+      if (poolHighWaterClosed) {
+        // Rolling last month's mark over. Nothing raises a month's mark once the month has ended, so the
+        // closed copy is right whether the stored mark is still that one or the gate rolled it over a
+        // moment ago (this request's own usage read above does exactly that) — but, as below, never
+        // over a mark the gate has since raised higher for this month.
+        conditions.push(
+          '((#payg.#hw.#hwMonth = :prevHwMonth AND #payg.#hw.#hwThreshold = :prevHwThreshold)'
+            + ' OR (#payg.#hw.#hwMonth = :hwMonth AND #payg.#hw.#hwThreshold <= :hwThreshold))',
+        );
+        values[':prevHwMonth'] = poolHighWaterClosed.month;
+        values[':prevHwThreshold'] = poolHighWaterClosed.thresholdMicroUsd;
+        values[':hwMonth'] = poolHighWater!.month;
+        values[':hwThreshold'] = poolHighWater!.thresholdMicroUsd;
+      } else if (poolHighWater) {
         // The gate raises the mark without bumping the version; never lower one it raised meanwhile.
         conditions.push('(attribute_not_exists(#payg.#hw) OR #payg.#hw.#hwMonth <> :hwMonth OR #payg.#hw.#hwThreshold <= :hwThreshold)');
         values[':hwMonth'] = poolHighWater.month;
@@ -314,7 +360,7 @@ export async function updatePaygOverage(input: {
     }
   } catch (error: any) {
     if (error?.code === 'ConditionalCheckFailedException') {
-      throw new PaygOverageRequestError(409, 'payg_conflict', 'Pay-as-you-go settings changed in the meantime; reload and try again');
+      throw new PaygOverageRequestError(409, 'payg_conflict', 'Extra usage settings changed in the meantime; reload and try again');
     }
     throw error;
   }
@@ -327,7 +373,7 @@ export async function updatePaygOverage(input: {
 async function requireLivePaymentMethod(billingUser: User | null, billingUserId: string): Promise<void> {
   const customerId = billingUser?.stripe_customer_id;
   if (!customerId) {
-    throw new PaygOverageRequestError(409, 'payment_method_required', 'Add a payment method before turning on pay-as-you-go');
+    throw new PaygOverageRequestError(409, 'payment_method_required', 'Add a payment method before turning on extra usage');
   }
   let hasPaymentMethod: boolean;
   try {
@@ -339,6 +385,6 @@ async function requireLivePaymentMethod(billingUser: User | null, billingUserId:
     throw new PaygOverageRequestError(503, 'payment_check_unavailable', 'Could not confirm your payment method right now; please try again');
   }
   if (!hasPaymentMethod) {
-    throw new PaygOverageRequestError(409, 'payment_method_required', 'Add a payment method before turning on pay-as-you-go');
+    throw new PaygOverageRequestError(409, 'payment_method_required', 'Add a payment method before turning on extra usage');
   }
 }

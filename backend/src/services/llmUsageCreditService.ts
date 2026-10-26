@@ -2,7 +2,7 @@ import AWS from 'aws-sdk';
 import { userDb, type User } from './db';
 import { paymentHistoryDb } from './paymentHistoryDb';
 
-const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+import { TABLE_PREFIX } from '../config/constants';
 const USERS_TABLE = `${TABLE_PREFIX}AW-Users`;
 const PAYMENT_HISTORY_TABLE = `${TABLE_PREFIX}AW-PaymentHistory`;
 const docClient = new AWS.DynamoDB.DocumentClient();
@@ -189,6 +189,37 @@ export function planRolloutMigrationCredit(input: {
  */
 export const planRolloutUsageReset = planRolloutMigrationCredit;
 
+/**
+ * ENG-668: the ledger a new month's first write is about to replace, to keep as
+ * `llmUsageCreditsClosed`; undefined when the write stays in the same month.
+ *
+ * The ledger holds one month only, and its first write of a new month (the seat-credit sweep at
+ * 10:00 UTC on day 1, a top-up, a debit) replaces the closed month wholesale. Month-end PAYG
+ * settlement runs after that, and measures the closed month against that month's credits — without
+ * this copy it would see none and bill top-up and seat-credit usage as overage. One month only; the
+ * per-debit list is left out (settlement reads totals and grants only), which keeps the copy far below
+ * the debit ledger's share of the item. Only an account with a PAYG record (on or off) gets one: no other
+ * account is ever settled, so for them nothing changes.
+ */
+function ledgerToClose(user: Pick<User, 'llmUsageCredits' | 'paygOverage'>, month: string): MonthlyLlmUsageCredits | undefined {
+  const existing = user.llmUsageCredits;
+  if (!user.paygOverage || !existing || existing.month === month) return undefined;
+  const closed: MonthlyLlmUsageCredits = { ...existing };
+  delete closed.debits;
+  delete closed.debitIds;
+  return closed;
+}
+
+/** The credit ledger for `month`: the live one, or the closed month kept at rollover. */
+export function getLlmUsageCreditLedgerForMonth(
+  user: Pick<User, 'llmUsageCredits' | 'llmUsageCreditsClosed'> | null | undefined,
+  month: string,
+): MonthlyLlmUsageCredits | undefined {
+  if (user?.llmUsageCredits?.month === month) return user.llmUsageCredits;
+  if (user?.llmUsageCreditsClosed?.month === month) return user.llmUsageCreditsClosed;
+  return undefined;
+}
+
 function isConditionalFailure(error: any): boolean {
   return error?.code === 'ConditionalCheckFailedException';
 }
@@ -272,6 +303,7 @@ export async function grantMonthlyLlmUsageCredit(input: {
       grantIds: [...(current.grantIds || []), input.grantId],
       grants: [...(current.grants || []), grant],
     };
+    const closed = ledgerToClose(user, month);
 
     const condition: {
       expression: string;
@@ -322,14 +354,18 @@ export async function grantMonthlyLlmUsageCredit(input: {
               Update: {
                 TableName: USERS_TABLE,
                 Key: { email: user.email },
-                UpdateExpression: 'SET #creditLedger = :next',
+                UpdateExpression: closed
+                  ? 'SET #creditLedger = :next, #closedLedger = :closed'
+                  : 'SET #creditLedger = :next',
                 ConditionExpression: condition.expression,
                 ExpressionAttributeNames: {
                   '#creditLedger': 'llmUsageCredits',
+                  ...(closed ? { '#closedLedger': 'llmUsageCreditsClosed' } : {}),
                   ...(condition.names || {}),
                 },
                 ExpressionAttributeValues: {
                   ':next': next,
+                  ...(closed ? { ':closed': closed } : {}),
                   ...(condition.values || {}),
                 },
               },
@@ -362,7 +398,11 @@ export async function grantMonthlyLlmUsageCredit(input: {
           ],
         }).promise();
       } else {
-        await userDb.updateUser(billingUserId, { llmUsageCredits: next }, { condition });
+        await userDb.updateUser(
+          billingUserId,
+          { llmUsageCredits: next, ...(closed ? { llmUsageCreditsClosed: closed } : {}) },
+          { condition },
+        );
       }
       return { granted: true, billingUserId, ledger: next };
     } catch (error) {
@@ -588,6 +628,7 @@ export async function recordLlmUsageDebit(input: {
       debitIds: [...(current.debitIds || []), debitId],
       totalDebitedMicroUsd: (current.totalDebitedMicroUsd || 0) + amountMicroUsd,
     };
+    const closed = ledgerToClose(user, month);
 
     const condition: {
       expression: string;
@@ -619,7 +660,11 @@ export async function recordLlmUsageDebit(input: {
         };
 
     try {
-      await userDb.updateUser(billingUserId, { llmUsageCredits: next }, { condition });
+      await userDb.updateUser(
+        billingUserId,
+        { llmUsageCredits: next, ...(closed ? { llmUsageCreditsClosed: closed } : {}) },
+        { condition },
+      );
       return { debited: true, billingUserId, ledger: next };
     } catch (error) {
       if (isConditionalFailure(error)) continue;

@@ -21,6 +21,7 @@ import {
 } from '../services/agentMode/runStore';
 import { isModelUnavailableError } from '../services/agentMode/modelUnavailable';
 import { modelSourceAfter } from '../services/agentMode/modelAccess';
+import { storedBindingSource } from '../services/agentMode/modelAccessInstance';
 import {
   releaseSessionGeneration,
   resolveEffectiveModelForUser,
@@ -42,6 +43,7 @@ import {
   parseBranchRateLimit,
 } from '../services/agentMode/chatBranching';
 import { v4 as uuidv4 } from 'uuid';
+import { storedModelFor } from '../services/agentMode/agentWebModelRouter';
 
 /**
  * Feature flag, AW-Settings (prod Elastic Beanstalk is at the env-var size limit, and a settings
@@ -131,13 +133,21 @@ function branchDeps(): BranchDeps {
           // ENG-669: an inherited model AgentWeb stamped on the source stays AgentWeb's choice.
           session,
         });
-        const model = decision.effectiveModel ?? (await agentModeService.getDefaultModel());
-        return {
-          ok: true,
-          model,
-          policy: toStoredModelPolicyDecision(decision),
-          source: modelSourceAfter(session, model, explicit ? requestedModel : null, (id) => agentModeService.normalizeModelId(id)),
-        };
+        // ENG-669 PR-C: the branch keeps the SELECTION (a routed AgentWeb Model stays `agentweb-model`).
+        const model = decision.effectiveModel
+          ? storedModelFor(decision, decision.effectiveModel)
+          : await agentModeService.getDefaultModel();
+        const canonical = (id: string) => agentModeService.normalizeModelId(id);
+        const explicitPick = explicit ? requestedModel : null;
+        let source = modelSourceAfter(session, model, explicitPick, canonical);
+        // ENG-669 (#3607 follow-up 2): a branch that INHERITS the source's stored model inherits who chose it, by the
+        // same rule the source's own turns use (storedBindingSource), including the legacy plan-pin rule: the branch
+        // carries no plan, so a legacy plan's pin left unrecorded would otherwise be read as the user's pick later.
+        if (session?.llmModel && (!explicitPick || canonical(explicitPick) === canonical(session.llmModel))
+          && canonical(model) === canonical(session.llmModel)) {
+          source = (await storedBindingSource(session, model, canonical)) ?? 'user';
+        }
+        return { ok: true, model, policy: toStoredModelPolicyDecision(decision), source };
       } catch (error) {
         if (!isModelUnavailableError(error)) throw error;
         return { ok: false, outcome: { status: 422, body: modelUnavailableBody(error) } };

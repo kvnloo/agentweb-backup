@@ -277,6 +277,11 @@ describe('readChatCompletion', () => {
     ).toEqual({ text: '{}', usage: { inputTokens: 10, outputTokens: 2, costUsd: 0.001 } });
     expect(readChatCompletion({ choices: [] })).toEqual({ text: '' });
   });
+
+  it('passes on the finish reason, so a provider error mid-reply is not mistaken for an empty answer (ENG-2620)', () => {
+    expect(readChatCompletion({ choices: [{ finish_reason: 'error', message: { content: null } }] })).toEqual({ text: '', finishReason: 'error' });
+    expect(readChatCompletion({ choices: [{ finish_reason: 'stop', message: { content: '{}' } }] })).toEqual({ text: '{}', finishReason: 'stop' });
+  });
 });
 
 describe('pairwise', () => {
@@ -410,6 +415,17 @@ describe('surfaces (ENG-2192)', () => {
     expect(result).toMatchObject({ status: 'ok', surface: 'landing_page', passed: true });
     expect(textOf(calls[0])).toContain(`source cut to its first ${MAX_LANDING_PAGE_SOURCE_CHARS} characters`);
     expect(textOf(calls[0]).length).toBeLessThan(MAX_LANDING_PAGE_SOURCE_CHARS + 5_000);
+  });
+
+  it('ENG-2643: cuts the landing-page source and brief fields without splitting an emoji', async () => {
+    const { llm, calls } = stubLlm(surfaceVerdict('landing_page'));
+    const source = 'x'.repeat(MAX_LANDING_PAGE_SOURCE_CHARS - 1) + '\u{1F600}' + 'tail';
+    const goal = 'g'.repeat(1_999) + '\u{1F680}' + 'more';
+    await judgeLandingPage({ source }, { goal }, { llm });
+
+    const sent = textOf(calls[0]);
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(sent)).toBe(false);
+    expect(sent).not.toContain('tail');
   });
 
   it('rejects a surface verdict that is missing one of its criteria', async () => {

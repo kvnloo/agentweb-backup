@@ -21,27 +21,39 @@ import {
 
 export { isSystemAuthoredPlan };
 
+/** Every configured subscription tier (admin order) with its raw `allowedModels`. Throws when the setting is unreadable. */
+export async function listSubscriptionTiers(): Promise<TierModelsConfig[]> {
+  const { settingsService } = await import('../settingsService');
+  const setting = await settingsService.getSetting('subscription_types');
+  const parsed: unknown = setting?.settingValue ? JSON.parse(setting.settingValue) : [];
+  return Array.isArray(parsed) ? (parsed as TierModelsConfig[]) : [];
+}
+
 export const modelAccess: ModelAccessService = createModelAccess({
   getSetting: async (name) => (await import('../settingsService')).settingsService.getSetting(name),
   getUser: async (userId) => (await import('../db')).userDb.getUserById(userId),
   resolveTier: async (userId) => (await import('../subscriptionService')).getUserSubscriptionResolution(userId),
   readTierModels: async (tierName) => (await import('../subscriptionService')).readTierAllowedModels(tierName),
-  listTiers: async () => {
-    const { settingsService } = await import('../settingsService');
-    const setting = await settingsService.getSetting('subscription_types');
-    const parsed: unknown = setting?.settingValue ? JSON.parse(setting.settingValue) : [];
-    return Array.isArray(parsed) ? (parsed as TierModelsConfig[]) : [];
-  },
+  listTiers: () => listSubscriptionTiers(),
   // The same alias table agentModeService.normalizeModelId applies (a pure module, no service graph).
   normalizeModelId: resolveLegacyModelAlias,
   alertTierUnreadable: async ({ ownerUserId, tier, dedupeKey, dedupeWindowMs }) => {
     const { sendAgentModeOncallAlert } = await import('../../utils/agentModeAlerts');
-    return sendAgentModeOncallAlert({
-      subject: 'AgentMode: tier model allowlist could not read a subscription tier',
-      message:
-        'The tier model allowlist (model_tier_allowlist_enabled) could not read the owner\'s subscription tier and ' +
+    // The tier is also read by the AgentWeb Model router (ENG-669 PR-C) for its per-tier routes, with the allowlist on
+    // or off: only name the allowlist when it is the one reading (a failed switch read counts as off).
+    const allowlistOn = await modelAccess.isEnabled().catch(() => false);
+    const consequence = allowlistOn
+      ? 'The tier model allowlist (model_tier_allowlist_enabled) could not read the owner\'s subscription tier and ' +
         'had no last-known answer, so the requested model was ALLOWED (the gate never blocks on an infrastructure ' +
-        'failure). Check the subscription_types setting and the user/org reads.\n\nNOTE: deduped; further ' +
+        'failure).'
+      : 'The AgentWeb Model router could not read the owner\'s subscription tier and had no last-known answer, so ' +
+        'the turn was routed without a confirmed tier (that tier\'s overrides in the routing table may not have applied).';
+    return sendAgentModeOncallAlert({
+      subject: allowlistOn
+        ? 'AgentMode: tier model allowlist could not read a subscription tier'
+        : 'AgentMode: AgentWeb Model router could not read a subscription tier',
+      message:
+        `${consequence} Check the subscription_types setting and the user/org reads.\n\nNOTE: deduped; further ` +
         'occurrences in the next hour are suppressed (grep "ModelAccess: tier unreadable" in the logs).',
       context: { Owner: ownerUserId, Tier: tier ?? 'unknown' },
       dedupeKey,
@@ -65,15 +77,24 @@ export interface SystemModelSession extends StoredModelRecord {
   } | null;
 }
 
-/** A model binding's provenance, as recorded when it was written (undefined = none recorded: a user's). */
+/**
+ * A model binding's provenance, as recorded when it was written. Undefined = none recorded (a legacy stamp written
+ * before provenance existed): checked like a user's pick, except that it may be the session kind's configured default
+ * (see isSystemChosen).
+ */
 export type BindingSource = ModelSource | undefined;
 
 /**
  * ENG-669: the ONE answer to "did AgentWeb choose this model?", the only exemption from the tier allowlist besides an
- * admin owner. True when the binding's provenance, recorded when it was written, says 'system', or the model is the
- * configured default for this session's kind (the interactive default everywhere; the scheduled / report / image /
- * video / customer-support default in such sessions). Nothing else is inferred at check time. An unreadable default
- * contributes nothing.
+ * admin owner. True when the binding's provenance, recorded when it was written, says 'system', or the model is a
+ * configured default that AgentWeb (not the user) put there:
+ *  - the interactive default, everywhere and whatever the source: a turn with no model runs it anyway;
+ *  - the scheduled / report / image / video / customer-support default in a session of that kind, unless it is a NEW
+ *    pick of it (source 'user' for a model the session does not already hold: a picker PATCH or /generate pick of it,
+ *    #3607 follow-up 1). The session's STORED model is exempt as that default whatever its record says: the portal
+ *    echoes the picker value on every turn, and that echo has recorded 'user' on legacy stamps (written before
+ *    provenance existed) since 2026-10-19, so a recorded 'user' cannot tell AgentWeb's stamp from a pick.
+ * Nothing else is inferred at check time. An unreadable default contributes nothing.
  */
 export async function isSystemChosen(
   canonicalModel: string,
@@ -85,14 +106,24 @@ export async function isSystemChosen(
   // Each read is isolated: one that throws (even synchronously) contributes nothing and blocks nothing.
   const read = (get: () => Promise<string | undefined | null>) => Promise.resolve().then(get);
   const reads = [read(() => agentModeService.getDefaultModel())];
-  const sessionType = session?.sessionType;
+  // A NEW pick of a session kind's default is checked like any other pick (#3607 follow-up 1); the stored model is not.
+  const stored = typeof session?.llmModel === 'string' ? session.llmModel.trim() : '';
+  let isStoredModel = false;
+  try {
+    const resolution = stored ? agentModeService.resolveGenerationModel(stored) : undefined;
+    isStoredModel = !!resolution && !resolution.fellBack && resolution.model === canonicalModel;
+  } catch {
+    // An unresolvable stored id is not this model.
+  }
+  const kindDefaultApplies = source !== 'user' || isStoredModel;
+  const sessionType = kindDefaultApplies ? session?.sessionType : undefined;
   if (sessionType === 'scheduled') reads.push(read(() => agentModeService.getScheduledChatsDefaultModel()));
   if (sessionType === 'report_generation') {
     reads.push(read(() => agentModeService.getReportsModel()), read(() => agentModeService.getReportGenerationDefaultModel()));
   }
   if (sessionType === 'image-generation') reads.push(read(() => agentModeService.getImageGenerationDefaultModel()));
   if (sessionType === 'video-generation') reads.push(read(() => agentModeService.getVideoGenerationDefaultModel()));
-  if (session?.portalType === 'emma-sidebar') reads.push(read(() => agentModeService.getCustomerSupportDefaultModel()));
+  if (kindDefaultApplies && session?.portalType === 'emma-sidebar') reads.push(read(() => agentModeService.getCustomerSupportDefaultModel()));
   for (const settled of await Promise.allSettled(reads)) {
     if (settled.status !== 'fulfilled' || typeof settled.value !== 'string' || !settled.value.trim()) continue;
     const resolution = agentModeService.resolveGenerationModel(settled.value.trim());
@@ -114,24 +145,28 @@ export function systemModelCheck(
 
 /**
  * The provenance of the session's STORED model when `model` is that model (re-sending or re-selecting it is not a new
- * pick), else 'user'. `canonical` maps an id to its registry id (legacy aliases resolved).
+ * pick), else 'user' (a new pick). `canonical` maps an id to its registry id (legacy aliases resolved).
+ * A stored model with no recorded source (legacy) follows storedModelSource's legacy rule, and the engine's stamp of a
+ * legacy plan's OWN pin the plan-pin legacy rule; when neither says 'system' it is undefined (none recorded, see
+ * BindingSource), never 'user', so a legacy stamp of the session kind's default stays AgentWeb's.
  */
 export async function storedBindingSource(
   session: SystemModelSession | null | undefined,
   model: string | null | undefined,
   canonical: (id: string) => string,
-): Promise<ModelSource> {
+): Promise<BindingSource> {
   const stored = session?.llmModel;
   const same = (a: unknown) => typeof a === 'string' && !!a.trim() && !!model && canonical(a.trim()) === canonical(model.trim());
   if (!stored || !same(stored)) return 'user';
-  const source = storedModelSource(session) ?? 'user';
+  if (session?.llmModelSource === 'user' || session?.llmModelSource === 'system') return session.llmModelSource;
+  if (storedModelSource(session) === 'system') return 'system';
   // Legacy (no source recorded): the engine's stamp of a legacy plan's OWN pin follows the plan-pin legacy rule.
   const plan = session?.workPlan;
-  if (source === 'user' && !session?.llmModelSource && plan && plan.planAuthor === undefined
+  if (plan && plan.planAuthor === undefined
     && (same(plan.planDefaultModel) || (Array.isArray(plan.steps) && plan.steps.some((step: any) => same(step?.model))))) {
     return legacyPlanPinSource(plan);
   }
-  return source;
+  return undefined;
 }
 
 /**

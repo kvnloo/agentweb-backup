@@ -96,6 +96,10 @@ describe("unit properties: the sandbox", () => {
       "SystemCallFilter=~io_uring_setup io_uring_enter io_uring_register userfaultfd perf_event_open bpf keyctl add_key request_key",
       "SystemCallErrorNumber=EPERM",
       "RuntimeMaxSec=7200",
+      "KillMode=mixed",
+      "KillSignal=SIGTERM",
+      "TimeoutStopSec=10s",
+      "SendSIGKILL=yes",
       "OOMScoreAdjust=500",
       "InaccessiblePaths=-/run/dbus",
       "InaccessiblePaths=-/run/containerd",
@@ -126,10 +130,59 @@ describe("unit properties: the sandbox", () => {
   it("rejects a runtime ceiling that is missing, too small, or absurd (a unit must always have an end)", () => {
     for (const runtimeMaxSec of [0, 5, -1, 1.5, 10 * 24 * 3600, NaN, undefined as unknown as number]) expect(() => unitProperties(layout, spec(), { ...limits, runtimeMaxSec }, paths)).toThrow();
   });
+  it("every customer unit stops GRACEFULLY: SIGTERM to the main process only, SIGKILL after the grace period (a hard kill mid-refresh destroys the login)", () => {
+    const p = props();
+    expect(p).toEqual(expect.arrayContaining(["KillMode=mixed", "KillSignal=SIGTERM", "TimeoutStopSec=10s", "SendSIGKILL=yes"]));
+    expect(p.filter((x) => x.startsWith("KillMode=") || x.startsWith("KillSignal=") || x.startsWith("TimeoutStopSec=") || x.startsWith("SendSIGKILL="))).toHaveLength(4);
+    // mixed, never control-group: SIGTERM must not also stop the egress helper the CLI needs while it finishes writing its login
+    expect(p).not.toContain("KillMode=control-group");
+    expect(p).not.toContain("KillSignal=SIGKILL");
+  });
+  it("the grace period is configurable and bounded", () => {
+    expect(unitProperties(layout, spec(), { ...limits, stopGraceSec: 12 }, paths)).toContain("TimeoutStopSec=12s");
+    expect(unitProperties(layout, spec(), { ...limits, stopGraceSec: 2 }, paths)).toContain("TimeoutStopSec=2s");
+    // above 12 s a graceful stop no longer fits the host's own stop budget (60 s service stop, 30 s per systemctl call)
+    for (const stopGraceSec of [0, 1, 13, 120, 121, 1.5, NaN, -3]) expect(() => unitProperties(layout, spec(), { ...limits, stopGraceSec }, paths)).toThrow();
+  });
   it("rejects a task limit that is not a sane integer", () => {
     for (const tasksMax of [0, -1, 1.5, 1_000_000, NaN]) expect(() => unitProperties(layout, spec(), { ...limits, tasksMax }, paths)).toThrow();
   });
   it("an extra inaccessible path is validated like every other path", () => expect(() => unitProperties(layout, spec(), limits, { ...paths, inaccessible: ["/run/x y"] })).toThrow(LayoutError));
+});
+
+describe("network isolation (PR 2)", () => {
+  const net = { dir: "/run/aw-egress-test1", launcher: "/opt/aw-login-host/aw-net.sh", socat: "/usr/bin/socat" };
+  const withNet = { ...paths, net };
+
+  it("gives the unit its own network namespace and only the egress proxy socket directory, read-only, on an empty /run", () => {
+    const props = unitProperties(layout, spec(), limits, withNet);
+    expect(props).toContain("PrivateNetwork=yes");
+    expect(props).toContain("TemporaryFileSystem=/run:ro");
+    expect(props).toContain("BindReadOnlyPaths=/run/aw-egress-test1:/run/aw-egress");
+    expect(props.filter((p) => p.startsWith("BindReadOnlyPaths="))).toHaveLength(1);
+    expect(props.filter((p) => p.startsWith("BindPaths="))).toHaveLength(1); // still ONE writable bind
+    expect(props).toContain("IPAddressDeny=169.254.169.254 fd00:ec2::254"); // defence in depth stays
+  });
+
+  it("without a net policy the shape is the old shared network (the host config makes the policy mandatory)", () => {
+    const props = unitProperties(layout, spec(), limits, paths);
+    expect(props.some((p) => p.startsWith("PrivateNetwork"))).toBe(false);
+  });
+
+  it("starts the process through the launcher: <launcher> <socat> <file> <args>, after the privilege drop and the chdir", () => {
+    const argv = systemRunArgs(layout, spec(), limits, withNet);
+    const at = argv.indexOf("/opt/aw-login-host/aw-net.sh");
+    expect(at).toBeGreaterThan(argv.indexOf("--chdir=" + `${refDir}/work`));
+    expect(argv.slice(at, at + 4)).toEqual(["/opt/aw-login-host/aw-net.sh", "/usr/bin/socat", "/opt/aw-login-host/claude-turn.sh", "/opt/aw-claude/2.1.294/claude"]);
+    expect(argv.indexOf("--reuid=400123")).toBeLessThan(at); // the launcher runs as the customer, never as root
+    expect(systemRunArgs(layout, spec(), limits, paths)).not.toContain("/opt/aw-login-host/aw-net.sh");
+  });
+
+  it("validates the proxy directory and the launcher/socat paths like every other path", () => {
+    expect(() => unitProperties(layout, spec(), limits, { ...paths, net: { ...net, dir: "/run/a b" } })).toThrow(LayoutError);
+    expect(() => systemRunArgs(layout, spec(), limits, { ...paths, net: { ...net, launcher: "rel/aw-net.sh" } })).toThrow(LayoutError);
+    expect(() => systemRunArgs(layout, spec(), limits, { ...paths, net: { ...net, socat: "/usr/bin/socat;x" } })).toThrow(LayoutError);
+  });
 });
 
 describe("systemd-run argv", () => {

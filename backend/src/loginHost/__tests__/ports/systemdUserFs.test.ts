@@ -235,15 +235,74 @@ describe("UnitChild: kill by unit name, 'gone' only when the unit is inactive", 
   it("kill() acts on the UNIT at once, synchronously (it does not wait for the client to die, which would leave the unit running)", async () => {
     const { child, sys, unit } = await started();
     child.kill();
-    expect(sys.callsOf("/usr/bin/systemctl").some((c) => c.args.join(" ") === `kill -s SIGKILL ${unit.name}`)).toBe(true); // recorded before any await
+    expect(sys.callsOf("/usr/bin/systemctl").some((c) => c.args.join(" ") === `stop ${unit.name}`)).toBe(true); // recorded before any await
   });
-  it("kill() runs systemctl kill on the UNIT (not a signal to the client) and the exit is reported after it is inactive", async () => {
+  it("kill() is GRACEFUL: a plain `systemctl stop` of the UNIT (SIGTERM, then SIGKILL after TimeoutStopSec), never a SIGKILL while the stop works (a hard kill mid-refresh destroys the login)", async () => {
     const { child, exits, sys, unit } = await started();
     child.kill();
     await tick();
-    expect(sys.callsOf("/usr/bin/systemctl").some((c) => c.args.join(" ") === `kill -s SIGKILL ${unit.name}`)).toBe(true);
+    const calls = sys.callsOf("/usr/bin/systemctl").map((c) => c.args.join(" "));
+    expect(calls).toContain(`stop ${unit.name}`);
+    expect(calls.some((c) => c.startsWith("kill "))).toBe(false);
     expect(unit.state).toBe("inactive");
     expect(exits).toEqual([[255, null]]);
+  });
+  it("falls back to SIGKILL only when the graceful stop itself fails, so a unit can never outlive its turn", async () => {
+    const { child, exits, sys, unit } = await started();
+    sys.stopFails = true;
+    child.kill();
+    await tick();
+    const calls = sys.callsOf("/usr/bin/systemctl").map((c) => c.args.join(" "));
+    expect(calls).toContain(`stop ${unit.name}`);
+    expect(calls).toContain(`kill -s SIGKILL ${unit.name}`);
+    expect(calls.indexOf(`stop ${unit.name}`)).toBeLessThan(calls.indexOf(`kill -s SIGKILL ${unit.name}`));
+    expect(unit.state).toBe("inactive");
+    expect(exits).toEqual([[255, null]]);
+  });
+  it("a stop that HANGS past the client timeout falls back to SIGKILL (a stuck unit can never outlive its turn)", async () => {
+    const { child, exits, sys, unit } = await started();
+    sys.stopLatencyMs = 5_000; // far longer than the rig's 1000 ms client timeout, shortened below
+    child.kill();
+    await new Promise((r) => setTimeout(r, 1_200));
+    const calls = sys.callsOf("/usr/bin/systemctl").map((c) => c.args.join(" "));
+    expect(calls).toContain(`kill -s SIGKILL ${unit.name}`);
+    expect(calls.indexOf(`stop ${unit.name}`)).toBeLessThan(calls.indexOf(`kill -s SIGKILL ${unit.name}`));
+    expect(unit.state).toBe("inactive");
+    expect(exits).toEqual([[255, null]]);
+  });
+  it("a stop that takes LONGER than a moment but finishes inside the client timeout is a graceful stop: no SIGKILL", async () => {
+    const { child, sys, unit } = await started();
+    sys.stopLatencyMs = 60; // the graceful stop in progress
+    child.kill();
+    await new Promise((r) => setTimeout(r, 200));
+    const calls = sys.callsOf("/usr/bin/systemctl").map((c) => c.args.join(" "));
+    expect(calls.filter((c) => c === `stop ${unit.name}`).length).toBeGreaterThanOrEqual(1);
+    expect(calls.some((c) => c.startsWith("kill "))).toBe(false);
+    expect(unit.state).toBe("inactive");
+  });
+  it("the exact fallback sequence is stop, SIGKILL, stop", async () => {
+    const { child, sys, unit } = await started();
+    sys.stopFails = true;
+    child.kill();
+    await tick();
+    const calls = sys.callsOf("/usr/bin/systemctl").map((c) => c.args.join(" ")).filter((c) => c.endsWith(unit.name) && !c.startsWith("is-active"));
+    expect(calls.slice(0, 3)).toEqual([`stop ${unit.name}`, `kill -s SIGKILL ${unit.name}`, `stop ${unit.name}`]);
+  });
+  it("a stop that reports 'not loaded' (exit 5: the unit is already gone) is success: no SIGKILL at a unit that no longer exists", async () => {
+    const { child, sys, unit } = await started();
+    sys.stopExitCode = 5;
+    child.kill();
+    await tick();
+    expect(sys.callsOf("/usr/bin/systemctl").some((c) => c.args[0] === "kill" && c.args.includes(unit.name))).toBe(false);
+  });
+  it("a stop failing with any OTHER non-zero code (3, 4) falls back to SIGKILL; only 0 and 5 count as done", async () => {
+    for (const code of [3, 4]) {
+      const { child, sys, unit } = await started();
+      sys.stopExitCode = code;
+      child.kill();
+      await tick();
+      expect(sys.callsOf("/usr/bin/systemctl").some((c) => c.args.join(" ") === `kill -s SIGKILL ${unit.name}`)).toBe(true);
+    }
   });
   it("a program that exits by itself is reported with its own exit code once the unit is inactive", async () => {
     const { exits, sys, unit } = await started();
@@ -287,6 +346,28 @@ describe("killAll", () => {
     await port.killAll(UID);
     expect(sys.activeUnits(UID)).toHaveLength(0);
     expect(sys.activeUnits(UID2)).toHaveLength(1);
+  });
+  it("killAll is graceful by default: the slice is stopped BEFORE any SIGKILL, and nothing is SIGKILLed when the stop worked", async () => {
+    const { port, sys } = rig();
+    await port.createAttemptDir(UID, "att-1");
+    const a = port.contextFor("c", UID, "att-1", "attempt");
+    a.spawnAs({ file: "/bin/sleep", args: ["1"], env: {}, cwd: a.workDir });
+    await port.killAll(UID);
+    const calls = sys.callsOf("/usr/bin/systemctl").map((c) => c.args.join(" "));
+    expect(calls[0]).toMatch(/^stop aw-test1-\d+\.slice$/);
+    expect(calls.some((c) => c.startsWith("kill "))).toBe(false);
+  });
+  it("killAll({hard:true}) SIGKILLs the units at once, without the graceful slice stop first", async () => {
+    const { port, sys } = rig();
+    await port.createAttemptDir(UID, "att-1");
+    const a = port.contextFor("c", UID, "att-1", "attempt");
+    a.spawnAs({ file: "/bin/sleep", args: ["1"], env: {}, cwd: a.workDir });
+    await port.killAll(UID, { hard: true });
+    const calls = sys.callsOf("/usr/bin/systemctl").map((c) => c.args.join(" "));
+    const firstKill = calls.findIndex((c) => c.startsWith("kill -s SIGKILL "));
+    expect(firstKill).toBe(calls.findIndex((c) => !c.startsWith("list-")));
+    expect(calls.some((c) => /^stop aw-test1-\d+\.slice$/.test(c) && calls.indexOf(c) < firstKill)).toBe(false);
+    expect(sys.activeUnits(UID)).toHaveLength(0);
   });
   it("kills processes of the uid that are outside every unit (strays)", async () => {
     const { port, sys } = rig();

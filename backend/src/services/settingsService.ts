@@ -74,6 +74,11 @@ export class SettingsService {
     this.tableName = `${TABLE_PREFIX}AW-Settings`;
   }
 
+  /** The AW-Settings table this service reads and writes (Dev- prefixed only when NODE_ENV is 'development'). */
+  getTableName(): string {
+    return this.tableName;
+  }
+
   async getSetting(settingName: string): Promise<Setting | null> {
     try {
       const params = {
@@ -89,6 +94,12 @@ export class SettingsService {
       console.error('Error getting setting:', error);
       throw error;
     }
+  }
+
+  /** Like `getSetting` but strongly consistent: for decisions that must see a change made a moment ago (a kill switch). */
+  async getSettingConsistent(settingName: string): Promise<Setting | null> {
+    const result = await dynamodb.get({ TableName: this.tableName, Key: { settingName }, ConsistentRead: true }).promise();
+    return (result.Item as Setting) || null;
   }
 
   async getSettings(settingNames: string[]): Promise<Setting[]> {

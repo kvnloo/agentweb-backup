@@ -4,9 +4,14 @@
  */
 
 import { EmmaToolBridgeExecutor } from "./emmaToolBridgeExecutor";
+import { createSubscriptionIsLive } from "./bridgeLiveness";
+import { LlmConnectionDb } from "./llmConnectionDb";
 import { ToolBridge } from "./toolBridge";
 import { ToolBridgeMcpAdapter } from "./toolBridgeMcp";
 
-export const emmaToolBridgeExecutor = new EmmaToolBridgeExecutor();
+const connections = new LlmConnectionDb();
+export const emmaToolBridgeExecutor = new EmmaToolBridgeExecutor({
+  isLive: createSubscriptionIsLive({ getConnection: (connectionId) => connections.get(connectionId) }),
+});
 // Reached only through the adapter, so closing a run always closes its MCP sessions too.
 export const toolBridgeMcp = new ToolBridgeMcpAdapter(new ToolBridge(emmaToolBridgeExecutor));

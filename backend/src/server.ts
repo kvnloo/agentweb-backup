@@ -437,6 +437,10 @@ const runDrain = async (reason: string): Promise<void> => {
   await import('./services/funding/claudeSubscriptionService')
     .then((m) => m.shutdownClaudeSubscriptionService())
     .catch(() => undefined);
+  // ENG-2110 1c: pending hosted sign-ins are cancelled on the login host (it also expires them itself).
+  await import('./services/funding/hostedSubscriptionService')
+    .then((m) => m.shutdownHostedSubscriptionService())
+    .catch(() => undefined);
   if (!cronDrain.drained) {
     console.warn(
       `[gracefulShutdown] Cron drain ceiling reached — ${cronDrain.stuckCount} job(s) still in-flight:`,
@@ -596,6 +600,16 @@ createTestAccount().then(async () => {
     console.log('Enrichment specialists registered');
   } catch (err) {
     console.warn('Failed to register enrichment specialists:', (err as Error).message);
+  }
+
+  // ENG-2271: load the admin vendor-rate overrides BEFORE listening, so no usage recording
+  // (HTTP request or queue processor) prices a Twilio unit at the defaults while an override
+  // exists. Bounded by the read's own 1.5s timeout; a settings outage must not block boot.
+  // Skipped under Jest (shouldBootstrapBackgroundJobs), where no settings I/O may happen.
+  // (refresh never rejects and logs its own failure once.)
+  if (shouldBootstrapBackgroundJobs()) {
+    const { refreshVendorRateOverrides } = await import('./utils/vendorRateCard');
+    await refreshVendorRateOverrides();
   }
 
   server.listen(port, async () => {
@@ -1099,6 +1113,64 @@ createTestAccount().then(async () => {
         );
       } catch (error) {
         console.error('[orgSeatCreditGrantCron] Failed to initialize:', error);
+      }
+
+      // ENG-668 PR-2 — month-end pay-as-you-go settlement. Dark behind the AW-Settings switch
+      // `payg_settlement_enabled` (exact 'true'); off = the sweep returns without reading anything.
+      // Same fixed-UTC-hour anchoring as the seat-credit sweep above, and after it, so the closed
+      // month's credit ledger has already been kept as `llmUsageCreditsClosed` when it runs. Every
+      // month's settlement record makes an extra fire a no-op.
+      try {
+        const { runPaygSettlement } = await import('./cron/paygSettlementCron');
+        const { msUntilNextUtcHour } = await import('./utils/dailySchedule');
+        const PAYG_SETTLEMENT_HOUR_UTC = 12;
+        const DAY_MS = 24 * 60 * 60 * 1000;
+        const msUntilFirstPaygSettlementRun = msUntilNextUtcHour(PAYG_SETTLEMENT_HOUR_UTC);
+        setTimeout(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('paygSettlementCron', runPaygSettlement())
+            .catch(e => console.error('[paygSettlementCron] Error:', e));
+          setInterval(() => {
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('paygSettlementCron', runPaygSettlement())
+              .catch(e => console.error('[paygSettlementCron] Error:', e));
+          }, DAY_MS);
+        }, msUntilFirstPaygSettlementRun);
+        console.log(
+          `[paygSettlementCron] Initialized — first run at ${PAYG_SETTLEMENT_HOUR_UTC}:00 UTC ` +
+          `(in ${Math.round(msUntilFirstPaygSettlementRun / 60000)} min)`,
+        );
+      } catch (error) {
+        console.error('[paygSettlementCron] Failed to initialize:', error);
+      }
+
+      // Hot-lead call number rent (ENG-2614) — daily sweep that meters the current
+      // month's rent of every org's caller number. Anchored to a fixed UTC hour
+      // (a bare 24h setInterval never elapses with redeploys every 1-2 hours); the
+      // month-scoped idempotency key makes any extra fire a safe no-op. Switch off
+      // with HOT_LEAD_CALL_RENT_METERING=false.
+      try {
+        const { runNumberRentCron } = await import('./cron/numberRentCron');
+        const { msUntilNextUtcHour } = await import('./utils/dailySchedule');
+        const NUMBER_RENT_HOUR_UTC = 11;
+        const DAY_MS = 24 * 60 * 60 * 1000;
+        const msUntilFirstNumberRentRun = msUntilNextUtcHour(NUMBER_RENT_HOUR_UTC);
+        setTimeout(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('numberRentCron', runNumberRentCron())
+            .catch(e => console.error('[numberRentCron] Error:', e));
+          setInterval(() => {
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('numberRentCron', runNumberRentCron())
+              .catch(e => console.error('[numberRentCron] Error:', e));
+          }, DAY_MS);
+        }, msUntilFirstNumberRentRun);
+        console.log(
+          `[numberRentCron] Initialized — first run at ${NUMBER_RENT_HOUR_UTC}:00 UTC ` +
+          `(in ${Math.round(msUntilFirstNumberRentRun / 60000)} min)`,
+        );
+      } catch (error) {
+        console.error('[numberRentCron] Failed to initialize:', error);
       }
 
       // Pre-Renewal Ad-Integration Health Check (ENG-1270) — runs daily.
@@ -1607,6 +1679,17 @@ createTestAccount().then(async () => {
           .catch((error) => console.error('[ClaudeSubscription] boot recovery failed:', (error as { code?: string })?.code || 'error'));
       } catch (error) {
         console.error('[ClaudeSubscription] Failed to initialize:', (error as { code?: string })?.code || 'error');
+      }
+
+      // Hosted subscription logins (ENG-2110 1c/1d): finish unconfirmed disconnects. Not flag-gated on purpose.
+      try {
+        const { scheduleHostedSubscriptionSweep } = await import('./cron/hostedSubscriptionSweepCron');
+        scheduleHostedSubscriptionSweep({
+          isCronEnabled,
+          track: (jobName, promise) => cronJobRegistry.track(jobName, promise),
+        });
+      } catch (error) {
+        console.error('[HostedSubscription] Failed to initialize sweep:', (error as { code?: string })?.code || 'error');
       }
 
       // Weekly Engineering Scoreboard — read-only backend replacement for the

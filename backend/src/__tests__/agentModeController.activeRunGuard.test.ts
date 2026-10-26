@@ -179,6 +179,7 @@ describe('POST /generate on instance B', () => {
       error: 'Session is busy',
       message: 'A response is already being generated for this session. Please wait.',
       code: 'SESSION_BUSY',
+      userMessageSaved: false,
     });
     expect(worker.runInWorker).not.toHaveBeenCalled();
     expect(activeSessionGenerations.size).toBe(0);

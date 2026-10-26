@@ -2,6 +2,8 @@ import { createHash } from 'node:crypto';
 import { resolveModelForUser } from './modelRoles';
 import { OUTCOME_JUDGE_SHADOW_FEATURE, assertOutcomeJudgeModelAllowed, DEFAULT_OUTCOME_JUDGE_MODEL, isInShadowSample } from './outcomeJudge';
 import { chatbotDb, ChatSession, ChatMessage } from "./chatbotService";
+import { isTestScheduledSession } from "../utils/scheduledTestRunSession";
+import { branchOwnMessages } from "./agentMode/chatBranching";
 import { summarizeAiStyleTells } from "./aiStyleGuard";
 import {
   appendConfirmedPublishNotice,
@@ -478,6 +480,45 @@ function capTranscriptForScoring(text: string): { text: string; truncated: boole
 }
 
 /**
+ * ENG-2648: a branch starts with a COPY of its source's turns, which were judged in the source. Every
+ * turn-state check (user/assistant turns, no-task, blocked, mid-tool-loop, failed run) reads this view, which
+ * holds only the turns the branch produced itself. A non-branch is returned as is.
+ */
+function ownTurnView(session: ChatSession): ChatSession {
+  const messages = session.messages || [];
+  const own = branchOwnMessages(messages);
+  return own.length === messages.length ? session : { ...session, messages: own };
+}
+
+/** ENG-2648: budget for the copied-context block of a branch (its tail is kept). */
+export const BRANCH_CONTEXT_MAX_CHARS = 8000;
+export const BRANCH_CONTEXT_OPEN_MARKER =
+  "[COPIED CONTEXT: this chat was branched from another chat. The lines up to the end marker were copied " +
+  "from that chat and were already evaluated there. They are background only. Do NOT score them; evaluate " +
+  "ONLY the turns after the end marker.]";
+export const BRANCH_CONTEXT_CLOSE_MARKER = "[END OF COPIED CONTEXT: evaluate only the turns below.]";
+
+/**
+ * The transcript handed to a judge. For a branch, only its own turns are the conversation to score (last
+ * MAX_MESSAGES_FOR_SCORING, capped as usual); the copied prefix comes first as a clearly marked, separately
+ * bounded context block, so a reply like "make it shorter" can be judged against what it refers to. The tool
+ * call manifest stays built from the whole history: copied tool results are real data the branch's own
+ * replies may cite, and dropping them would make applyFabricationGuard cap a grounded reply.
+ */
+function buildJudgedTranscript(messages: ChatMessage[]): { text: string; truncated: boolean } {
+  const own = branchOwnMessages(messages);
+  const capped = capTranscriptForScoring(serializeMessagesForScoring(own.slice(-MAX_MESSAGES_FOR_SCORING)));
+  if (own.length === messages.length) return capped;
+  let context = serializeMessagesForScoring(messages.slice(0, messages.length - own.length));
+  if (!context) return capped;
+  if (context.length > BRANCH_CONTEXT_MAX_CHARS) context = `…${context.slice(context.length - BRANCH_CONTEXT_MAX_CHARS)}`;
+  return {
+    text: `${BRANCH_CONTEXT_OPEN_MARKER}\n${context}\n${BRANCH_CONTEXT_CLOSE_MARKER}\n\n${capped.text}`,
+    truncated: capped.truncated,
+  };
+}
+
+/**
  * Backstop for zero-task sessions the static phrase lists below cannot
  * enumerate ("hey, just checking in", "sorry wrong window", …). The judge is
  * asked one extra, purely factual question — did the user ever ask for
@@ -934,27 +975,6 @@ function classifyTurnlessSession(session: ChatSession): "in-flight" | "failed" {
   if (Number.isNaN(updatedAtMs)) return "failed";
   const age = Date.now() - updatedAtMs;
   return age <= IN_FLIGHT_GRACE_MS ? "in-flight" : "failed";
-}
-
-/**
- * Whether this session is a manual "Test this schedule" run rather than a real
- * scheduled execution. Test runs are triggered interactively by the user, who
- * watches the outcome live, and are deliberately excluded from the durable
- * lease/reconciler recovery path (agentModeController.runScheduledChat) — a test
- * click must never requeue. They are QA actions, not production runs, so a test
- * that crashes must not be scored or surfaced as a satisfaction reliability
- * failure: doing so pollutes the cohort and files recurring product tickets for
- * what the user already saw fail in the UI (ENG-499).
- *
- * runScheduledChat prefixes the pageIdentifier (and title) with "Test: " for a
- * test run and "Scheduled: " for a real run, so the prefix is a reliable marker
- * fixed at session creation. A schedule literally named "Test: …" produces a real
- * run titled "Scheduled: Test: …", which correctly does NOT match.
- */
-function isTestScheduledSession(session: ChatSession): boolean {
-  if (session.sessionType !== "scheduled") return false;
-  const marker = session.pageIdentifier ?? session.title ?? "";
-  return marker.startsWith("Test: ");
 }
 
 // ENG-803/ENG-1245: the exact terminal sentence a scheduled run is instructed to end
@@ -1701,8 +1721,8 @@ export async function scoreSession(
   sessionType?: string,
   usageContext?: { userId?: string; feature?: string; sessionId?: string }
 ): Promise<ScoringResult> {
-  const recentMessages = messages.slice(-MAX_MESSAGES_FOR_SCORING);
-  const capped = capTranscriptForScoring(serializeMessagesForScoring(recentMessages));
+  // ENG-2648: a branch's own turns are what is judged; its copied prefix is marked context only.
+  const capped = buildJudgedTranscript(messages);
   const header = getSessionTypeHeader(pageIdentifier, sessionType);
   // ENG-1223: computed from the FULL session, not recentMessages — a session
   // with >MAX_MESSAGES_FOR_SCORING messages that made tool calls earlier would
@@ -1879,8 +1899,8 @@ export async function scoreSessionWithJudge(
   callLLM?: ScoringLlmCall,
   judgeOptions?: JudgePromptOptions
 ): Promise<ScoringResult> {
-  const recentMessages = messages.slice(-MAX_MESSAGES_FOR_SCORING);
-  const capped = capTranscriptForScoring(serializeMessagesForScoring(recentMessages));
+  // ENG-2648: a branch's own turns are what is judged; its copied prefix is marked context only.
+  const capped = buildJudgedTranscript(messages);
   const header = getSessionTypeHeader(undefined, sessionType);
   // ENG-1223: see scoreSession — computed from the full session, not
   // recentMessages, so the manifest's "anywhere in this session" claim is
@@ -1889,7 +1909,7 @@ export async function scoreSessionWithJudge(
   // ENG-2429: eval-only telemetry for AI-tell phrasing in Emma's output.
   // Logged, never persisted; never affects the score or throws.
   try {
-    const styleTells = summarizeAiStyleTells(messages);
+    const styleTells = summarizeAiStyleTells(branchOwnMessages(messages));
     if (styleTells.total > 0) {
       console.log(
         JSON.stringify({ event: "ai_style_tells", sessionId: usageContext?.sessionId, ...styleTells })
@@ -2051,7 +2071,9 @@ export interface JudgeCohortExclusion {
  * replays (scripts/evalOutcomeJudge.ts) judge exactly the population production does (ENG-2138).
  * Null means the session is in the cohort. Order matters and matches the original checks.
  */
-export function judgeCohortExclusion(session: ChatSession): JudgeCohortExclusion | null {
+export function judgeCohortExclusion(fullSession: ChatSession): JudgeCohortExclusion | null {
+  // ENG-2648: a branch's copied turns were judged in its source; every check below reads only its own turns.
+  const session = ownTurnView(fullSession);
   const userMessages = (session.messages || []).filter((m: any) => m.role === "user");
   if (userMessages.length < MIN_USER_MESSAGES) {
     return { reason: "no-user-message", retract: false };
@@ -2116,7 +2138,8 @@ export function judgeCohortExclusion(session: ChatSession): JudgeCohortExclusion
  * Still deferred within the grace window in case the reconciler's resume/retry is
  * racing to continue the same session (ENG-479).
  */
-export function judgeScoringPath(session: ChatSession): "in-flight" | "failed-run" | "judge" {
+export function judgeScoringPath(fullSession: ChatSession): "in-flight" | "failed-run" | "judge" {
+  const session = ownTurnView(fullSession); // ENG-2648: a branch's turn state is that of its own turns
   if (endsWithRunFailurePlaceholder(session.messages)) {
     return classifyTurnlessSession(session) === "in-flight" ? "in-flight" : "failed-run";
   }
@@ -2282,8 +2305,13 @@ export async function attemptSessionScore(
 
   const messageCount = session.messageCount ?? session.messages?.length ?? 0;
 
+  // ENG-2648: every turn-state check reads only a branch's OWN turns (its copied turns are scored in the
+  // source), so a never-continued branch or the hidden leftover of a failed copy is not scored again and
+  // a copied reply never stands in for an own one. Writes (retract, surfaceFailedRun) take the real session.
+  const view = ownTurnView(session);
+
   // Count user messages
-  const userMessages = (session.messages || []).filter(
+  const userMessages = (view.messages || []).filter(
     (m: any) => m.role === "user"
   );
   if (userMessages.length < MIN_USER_MESSAGES) {
@@ -2303,7 +2331,7 @@ export async function attemptSessionScore(
   // it was still in the cohort gets that stale score retracted rather than
   // keeping it forever (scoring skips it from now on, so nothing would ever
   // overwrite it).
-  if (isNoTaskSession(session.messages, session.pageIdentifier) && hasAssistantTurn(session.messages)) {
+  if (isNoTaskSession(view.messages, view.pageIdentifier) && hasAssistantTurn(view.messages)) {
     await retractSatisfactionScore(session);
     return skip("no-task-session");
   }
@@ -2313,7 +2341,7 @@ export async function attemptSessionScore(
   // isPublishGateWithheldSession. Placed BEFORE the already-scored early return,
   // same reasoning as isNoTaskSession above, so an existing divergent score is
   // retracted rather than kept forever.
-  if (isPublishGateWithheldSession(session)) {
+  if (isPublishGateWithheldSession(view)) {
     await retractSatisfactionScore(session);
     return skip("publish-gate-withheld");
   }
@@ -2327,7 +2355,7 @@ export async function attemptSessionScore(
   if (isTestScheduledSession(session)) {
     return skip("test-run");
   }
-  if (isBlockedExternalSessionForSession(session) && hasAssistantTurn(session.messages)) {
+  if (isBlockedExternalSessionForSession(view) && hasAssistantTurn(view.messages)) {
     await retractSatisfactionScore(session);
     return skip("blocked-external");
   }
@@ -2364,12 +2392,12 @@ export async function attemptSessionScore(
   // deferred within the grace window in case the reconciler's resume/retry is racing
   // to continue the same session (ENG-479).
   let result: ScoringResult;
-  if (endsWithRunFailurePlaceholder(session.messages)) {
+  if (endsWithRunFailurePlaceholder(view.messages)) {
     if (classifyTurnlessSession(session) === "in-flight") {
       return skip("in-flight");
     }
     result = buildFailedRunResult(messageCount);
-  } else if (!hasAssistantTurn(session.messages)) {
+  } else if (!hasAssistantTurn(view.messages)) {
     // No assistant turn yet: skip if still in-flight, flag as failed if stale.
     if (classifyTurnlessSession(session) === "in-flight") {
       return skip("in-flight");
@@ -2378,7 +2406,7 @@ export async function attemptSessionScore(
     // retry note + diagnostic error) before recording the deterministic score.
     await surfaceFailedRun(session);
     result = buildFailedRunResult(messageCount);
-  } else if (transcriptEndsMidToolLoop(session.messages)) {
+  } else if (transcriptEndsMidToolLoop(view.messages)) {
     // Partial tool-loop persisted (tool result or pure tool-call turn is last).
     // Defer if still within the grace window; score the partial transcript if stale.
     if (classifyTurnlessSession(session) === "in-flight") {

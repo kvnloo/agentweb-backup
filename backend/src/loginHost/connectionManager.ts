@@ -201,6 +201,10 @@ export class ConnectionManager {
   private readonly sessions = new Map<string, HostSession[]>();
   private readonly turns = new Map<string, RunningTurn>();
   private sweeping: Promise<void> | undefined;
+  /** Deploy drain (see `hostDrainReq`). In memory on purpose: a restart, which is what a drain prepares, clears it. */
+  private drain: { untilMs: number } | undefined;
+  /** Sign-ins between their drain check and the moment their attempt is recorded (an await sits in between). */
+  private admittingLogins = 0;
 
   constructor(private readonly deps: ManagerDeps) {
     this.cfg = { ...DEFAULT_CONFIG, ...(deps.config ?? {}) };
@@ -228,10 +232,10 @@ export class ConnectionManager {
 
   /** Kill every process of a uid, but never with a value outside the reserved range (-1 would mean "everything" to kill(2)). */
   /** `onRaw` receives the port's own promise, so a caller can keep a guard until the REAL kill settles (the bounded wait may give up first). */
-  private async safeKill(uid: number, onRaw?: (raw: Promise<void>) => void): Promise<boolean> {
+  private async safeKill(uid: number, onRaw?: (raw: Promise<void>) => void, hard = false): Promise<boolean> {
     if (!Number.isInteger(uid) || uid < this.cfg.uidMin || uid > this.cfg.uidMax) return false;
     await this.f("killAll", () => {
-      const raw = (async () => this.deps.fs.killAll(uid))(); // starts synchronously (as before), and a synchronous throw becomes a rejection
+      const raw = (async () => this.deps.fs.killAll(uid, hard ? { hard: true } : undefined))(); // starts synchronously (as before), and a synchronous throw becomes a rejection
       onRaw?.(raw);
       return raw;
     });
@@ -275,43 +279,53 @@ export class ConnectionManager {
 
   loginStart(req: RouteInput<"login.start">): Promise<LoginStartResult> {
     return this.locked(req.connectionId, async () => {
-      const adapter = this.adapter(req.provider);
-      const st = this.state();
-      let c = st.connections[req.connectionId];
-      if (c) {
-        if (c.provider !== req.provider) throw new HostError("EINVALID", "provider_mismatch");
-        if (c.state === "revoking" || c.state === "revoked") throw new HostError("ESTATE", "revoked");
-        if (c.state === "swapping") throw new HostError("ESTATE", "swapping");
-        if (!req.reconnect && c.state !== "attempting") throw new HostError("ESTATE", "exists_use_reconnect");
-        await this.expireStaleAttempt(c);
-        if (c.attempt) throw new HostError("ESTATE", "login_pending");
-      } else {
-        if (req.reconnect) throw new HostError("ENOTFOUND");
-        const now = this.deps.clock.nowMs();
-        c = { connectionId: req.connectionId, provider: req.provider, uid: -1, homeRef: "", epoch: 0, state: "attempting", createdAtMs: now, updatedAtMs: now };
-        st.connections[req.connectionId] = c;
-      }
-      const attemptRef = this.deps.ids.next("att");
-      const loginRef = this.deps.ids.next("login");
-      const owner = `attempt:${attemptRef}`;
-      const uid = this.uids.allocate(owner);
-      const now = this.deps.clock.nowMs();
-      c.attempt = { loginRef, uid, attemptRef, startedAtMs: now, expiresAtMs: now + adapter.loginTtlMs, state: "pending" };
-      this.save();
+      this.refuseIfDraining();
+      this.admittingLogins++; // counted until the attempt is recorded, so a strict drain cannot slip between the check and the record
       try {
-        await this.f("createAttemptDir", () => this.deps.fs.createAttemptDir(uid, attemptRef));
-        const ctx = this.deps.fs.contextFor(req.connectionId, uid, attemptRef, "attempt");
-        // The lockdown configuration must exist before the CLI runs for the first time (Codex: file credential store, no tools).
-        await this.a("prepareHome", () => adapter.prepareHome(this.deps.fs.asUser(uid, attemptRef, "attempt"), ctx));
-        const proc = await this.a("loginStart", () => adapter.loginStart(ctx));
-        this.logins.set(loginRef, { connectionId: req.connectionId, proc, provider: req.provider });
-        return { loginRef, ceremony: adapter.ceremony, url: proc.data.url, ...(proc.data.userCode ? { userCode: proc.data.userCode } : {}), expiresAtMs: c.attempt.expiresAtMs };
-      } catch (err) {
-        await this.discardAttempt(c, "start_failed");
-        this.log.warn("login_start_failed", { connectionId: req.connectionId, code: errCode(err) });
-        throw err instanceof HostError ? err : new HostError("EINTERNAL", "login_start_failed");
+        return await this.loginStartAdmitted(req);
+      } finally {
+        this.admittingLogins--;
       }
     });
+  }
+
+  private async loginStartAdmitted(req: RouteInput<"login.start">): Promise<LoginStartResult> {
+    const adapter = this.adapter(req.provider);
+    const st = this.state();
+    let c = st.connections[req.connectionId];
+    if (c) {
+      if (c.provider !== req.provider) throw new HostError("EINVALID", "provider_mismatch");
+      if (c.state === "revoking" || c.state === "revoked") throw new HostError("ESTATE", "revoked");
+      if (c.state === "swapping") throw new HostError("ESTATE", "swapping");
+      if (!req.reconnect && c.state !== "attempting") throw new HostError("ESTATE", "exists_use_reconnect");
+      await this.expireStaleAttempt(c);
+      if (c.attempt) throw new HostError("ESTATE", "login_pending");
+    } else {
+      if (req.reconnect) throw new HostError("ENOTFOUND");
+      const now = this.deps.clock.nowMs();
+      c = { connectionId: req.connectionId, provider: req.provider, uid: -1, homeRef: "", epoch: 0, state: "attempting", createdAtMs: now, updatedAtMs: now };
+      st.connections[req.connectionId] = c;
+    }
+    const attemptRef = this.deps.ids.next("att");
+    const loginRef = this.deps.ids.next("login");
+    const owner = `attempt:${attemptRef}`;
+    const uid = this.uids.allocate(owner);
+    const now = this.deps.clock.nowMs();
+    c.attempt = { loginRef, uid, attemptRef, startedAtMs: now, expiresAtMs: now + adapter.loginTtlMs, state: "pending" };
+    this.save();
+    try {
+      await this.f("createAttemptDir", () => this.deps.fs.createAttemptDir(uid, attemptRef));
+      const ctx = this.deps.fs.contextFor(req.connectionId, uid, attemptRef, "attempt");
+      // The lockdown configuration must exist before the CLI runs for the first time (Codex: file credential store, no tools).
+      await this.a("prepareHome", () => adapter.prepareHome(this.deps.fs.asUser(uid, attemptRef, "attempt"), ctx));
+      const proc = await this.a("loginStart", () => adapter.loginStart(ctx));
+      this.logins.set(loginRef, { connectionId: req.connectionId, proc, provider: req.provider });
+      return { loginRef, ceremony: adapter.ceremony, url: proc.data.url, ...(proc.data.userCode ? { userCode: proc.data.userCode } : {}), expiresAtMs: c.attempt.expiresAtMs };
+    } catch (err) {
+      await this.discardAttempt(c, "start_failed");
+      this.log.warn("login_start_failed", { connectionId: req.connectionId, code: errCode(err) });
+      throw err instanceof HostError ? err : new HostError("EINTERNAL", "login_start_failed");
+    }
   }
 
   loginComplete(req: RouteInput<"login.complete">): Promise<LoginReady> {
@@ -426,6 +440,7 @@ export class ConnectionManager {
     const c = this.requireConn(req.connectionId);
     this.requireEpoch(c, req.epoch);
     if (c.state !== "active") throw new HostError("ESTATE", c.state);
+    this.refuseIfDraining();
     if ((this.killsInFlight.get(c.connectionId) ?? 0) > 0) throw new HostError("EBUSY", "connection_busy");
     const adapter = this.adapter(c.provider);
     if (!adapter.models.has(req.model)) throw new HostError("EINVALID", "model_not_allowed");
@@ -542,9 +557,16 @@ export class ConnectionManager {
         if (running.aborted) break;
         if (ev.type === "alarm") {
           // Defense in depth: an epoch change always aborts the turn first (checked above), so a stale alarm should not get here.
-          await this.locked(c.connectionId, async () => (c.epoch === running.epoch ? this.raiseAlarm(c, ev.hazard) : undefined));
+          // The alarm event must reach the consumer even when the kills inside raiseAlarm fail: it is reported first, the failure after.
+          let alarmFailure: unknown;
+          try {
+            await this.locked(c.connectionId, async () => (c.epoch === running.epoch ? this.raiseAlarm(c, ev.hazard) : undefined));
+          } catch (err) {
+            alarmFailure = err;
+          }
           running.aborted ??= "alarm";
           yield ev;
+          if (alarmFailure !== undefined) throw alarmFailure;
           break;
         }
         // A finished-with-auth_dead turn means the login is dead (the adapter confirms with the CLI's own status first). Fenced like preflight.
@@ -705,6 +727,54 @@ export class ConnectionManager {
     const c = this.requireConn(req.connectionId);
     const running = [...this.turns.values()].filter((t) => t.connectionId === c.connectionId).length;
     return { state: c.state, epoch: c.epoch, runningTurns: running, ...(c.planLabel ? { planLabel: c.planLabel } : {}), ...(c.reason ? { reason: c.reason } : {}) };
+  }
+
+  // ───────────────────────────── deploy drain ─────────────────────────────
+
+  /**
+   * Work a restart would destroy: running turns and sign-ins a person is in the middle of (or that are being promoted). Expired attempts do not count: a
+   * restart discards them anyway. Revokes in progress deliberately do NOT count: a stuck wipe must not block deploys forever, and a restart simply resumes
+   * the wipe from the saved `revoking` state on the next sweep (so a revoke can finish up to a minute later, never be lost).
+   */
+  private busy(): { turns: number; signIns: number } {
+    const now = this.deps.clock.nowMs();
+    let signIns = this.admittingLogins;
+    for (const c of Object.values(this.state().connections)) {
+      if (c.state === "swapping" || (c.attempt && c.attempt.expiresAtMs > now)) signIns++;
+    }
+    return { turns: this.turns.size, signIns };
+  }
+
+  /** Whether the drain is on, forgetting an expired one. */
+  private draining(): boolean {
+    if (this.drain && this.drain.untilMs <= this.deps.clock.nowMs()) this.drain = undefined;
+    return this.drain !== undefined;
+  }
+
+  /** Admission gate for NEW work. Retryable (EBUSY): the backend already waits and retries on it, and a drain covers only the switch and restart. */
+  private refuseIfDraining(): void {
+    if (this.draining()) throw new HostError("EBUSY", "draining");
+  }
+
+  /** `host.drain` (unix socket only). `strict` is atomic: it checks and gates in the same synchronous step, so nothing can be admitted in between. */
+  setDrain(req: RouteInput<"host.drain">): { mode: "off" | "strict"; running: number; signIns: number; ok: boolean } {
+    const ttlMs = (req.ttlSec ?? 120) * 1000;
+    let ok = true;
+    if (req.mode === "off") this.drain = undefined;
+    else {
+      const b = this.busy();
+      if (b.turns === 0 && b.signIns === 0) this.drain = { untilMs: this.deps.clock.nowMs() + ttlMs };
+      else ok = false;
+    }
+    const b = this.busy();
+    this.log.info("host_drain", { mode: req.mode, ok, running: b.turns, signIns: b.signIns });
+    return { mode: this.draining() ? "strict" : "off", running: b.turns, signIns: b.signIns, ok };
+  }
+
+  /** For `host.info`. */
+  hostStatus(): { drain: "off" | "strict"; running: number; signIns: number } {
+    const b = this.busy();
+    return { drain: this.draining() ? "strict" : "off", running: b.turns, signIns: b.signIns };
   }
 
   // ───────────────────────────── sweeper ─────────────────────────────
@@ -955,12 +1025,25 @@ export class ConnectionManager {
 
   /** Stops every turn and process of a connection (epoch changed, disabled, revoked, alarm). */
   private async terminateConnection(c: ConnRecord, reason: string): Promise<void> {
+    // Everything synchronous first, so nothing below can leave a turn running if a kill fails: turns are aborted (they report "aborted:
+    // <reason>", not a transient failure caused by the kill) and every session is marked dead (no new work, no auth check).
     for (const t of [...this.turns.values()]) if (t.connectionId === c.connectionId) t.abort(reason);
     const list = this.sessions.get(c.connectionId) ?? [];
     this.sessions.delete(c.connectionId);
+    for (const hs of list) hs.dead = true;
+    // Revoke and the hazard alarm kill HARD: a revoked home is wiped right after, and a process under an alarm (the connection is retired
+    // to needs_attention and its login never reused) must not get a grace period to run on (e.g. exit-time hooks). Disable and a
+    // reconnect keep the login, so they stop gracefully. Best effort: the final kill below is the one that reports a failure.
+    const hard = reason === "revoked" || reason === "alarm";
+    if (hard && c.uid >= 0) {
+      try {
+        await this.safeKill(c.uid, undefined, true);
+      } catch (err) {
+        this.log.warn("hard_kill_failed", { connectionId: c.connectionId, reason, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
     await Promise.all(
       list.map(async (hs) => {
-        hs.dead = true;
         try {
           await this.a("closeSession", async () => (await hs.ready).close());
         } catch {

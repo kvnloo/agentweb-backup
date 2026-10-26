@@ -114,6 +114,9 @@ export interface MetaAdsAdCreativeParams {
   placement_assets?: MetaPlacementAsset[];
   body: string;
   title: string;
+  // Link description: the small line under the headline (link_data.description; video_data.link_description;
+  // asset_feed_spec.descriptions for placement_assets creatives).
+  description?: string;
   link_url: string;
   call_to_action_type?: string;
   // URL append rules (UTM parameters). Stored on the creative as `url_tags` and applied by Meta to
@@ -1972,6 +1975,9 @@ export class MetaService {
             value: { link: params.link_url }
           } : undefined
         };
+        if (params.description) {
+          videoData.link_description = params.description;
+        }
         // Prefer image_hash (uploaded asset) over image_url
         if (params.image_hash) {
           videoData.image_hash = params.image_hash;
@@ -2016,12 +2022,21 @@ export class MetaService {
             value: { link: params.link_url }
           } : undefined
         };
+        if (params.description) {
+          objectStorySpec.link_data.description = params.description;
+        }
 
         if (params.image_hash) {
           objectStorySpec.link_data.image_hash = params.image_hash;
         } else if (params.image_url) {
           objectStorySpec.link_data.picture = params.image_url;
         }
+      }
+
+      // Every non-placement creative type carries the Instagram identity too; without it the ad
+      // runs under the Page's linked/default Instagram account instead of the one requested.
+      if (params.instagram_user_id) {
+        objectStorySpec.instagram_user_id = params.instagram_user_id;
       }
 
       const creativeParams: any = {
@@ -2121,6 +2136,9 @@ export class MetaService {
     };
     if (params.call_to_action_type) {
       assetFeedSpec.call_to_action_types = [params.call_to_action_type];
+    }
+    if (params.description) {
+      assetFeedSpec.descriptions = [{ text: params.description }];
     }
 
     // For asset_feed_spec creatives, all copy/link/format live in asset_feed_spec; object_story_spec
@@ -2836,10 +2854,10 @@ export class MetaService {
       // fall back to re-uploading that low-res preview URL, which Meta's AdCreative create
       // endpoint rejects (error code 100, subcode 1487390).
       const objectStorySpecField =
-        'object_story_spec{page_id,' +
-        'link_data{link,message,caption,name,image_hash,picture,call_to_action,' +
+        'object_story_spec{page_id,instagram_user_id,' +
+        'link_data{link,message,caption,name,description,image_hash,picture,call_to_action,' +
         'child_attachments{link,image_hash,picture,name,description,video_id,call_to_action}},' +
-        'video_data{video_id,image_hash,image_url,title,message,call_to_action}}';
+        'video_data{video_id,image_hash,image_url,title,message,link_description,call_to_action}}';
       const fields = [
         // account_id is requested so callers can bind the returned node to the ad
         // account they intended to read (ENG-471). A Meta OAuth token can span
@@ -2849,7 +2867,7 @@ export class MetaService {
         'object_type', 'link_url', objectStorySpecField, 'asset_feed_spec', 'url_tags'
       ];
       this.log(`Fetching ad creative: ${creativeId}`);
-      const result = await creative.get(fields);
+      const result = await MetaService.withReadDeadline<any>(() => creative.get(fields), 'ad creative');
       return result._data;
     } catch (error) {
       return this.handleError(error, 'getAdCreative');

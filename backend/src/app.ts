@@ -1,4 +1,5 @@
 import { registerLeadNotificationProcessor } from './services/orgLeadNotificationService';
+import { registerHotLeadCallProcessor } from './services/hotLeadCallService';
 import { evaluationAdminRoutes } from './routes/evaluation';
 import { evaluationHttpBoundary } from './middleware/evaluation';
 import express from "express";
@@ -13,6 +14,7 @@ import adminRoutes from "./routes/admin";
 import adminUsageRoutes from "./routes/adminUsage";
 import mcpUsageAdminRoutes from "./routes/mcpUsageAdmin";
 import adminV0CreditsRoutes from "./routes/adminV0Credits";
+import adminVendorRatesRoutes from "./routes/adminVendorRates";
 import adminCustomSubscriptionLinksRoutes from "./routes/adminCustomSubscriptionLinks";
 import internalUsageRoutes from "./routes/internalUsage";
 import configRouter from "./routes/config";
@@ -36,6 +38,7 @@ import agentModeRoutes from "./routes/agentMode";
 import settingsRoutes from "./routes/settings";
 import imageModelsRoutes from "./routes/image-models";
 import webhookRoutes from "./routes/webhooks";
+import twilioVoiceWebhookRoutes, { twilioVoiceBodyParser } from "./routes/twilioVoiceWebhook";
 import benchmarkRoutes from "./routes/benchmark";
 import seoRoutes from "./routes/seo";
 import funnelRoutes from "./routes/funnel";
@@ -86,6 +89,7 @@ import zomaRoutes from "./routes/zoma";
 import { createToolBridgeRouter } from "./routes/toolBridge";
 import { createLlmConnectionsRouter } from "./routes/llmConnections";
 import { createClaudeSubscriptionRouter } from "./routes/claudeSubscription";
+import { createHostedSubscriptionsRouter } from "./routes/hostedSubscriptions";
 import { toolBridgeMcp } from "./services/funding/toolBridgeService";
 import skillRoutes from "./routes/skillRoutes";
 import userSkillRoutes from "./routes/userSkillRoutes";
@@ -94,6 +98,7 @@ import adminWorkPlanRoutes from "./routes/adminWorkPlanRoutes";
 import adminLandingPagesRoutes from "./routes/adminLandingPages";
 import adminSessionCleanupRoutes from "./routes/adminSessionCleanup";
 import adminOrgDiagnosticsRoutes from "./routes/adminOrgDiagnostics";
+import adminScheduledChatsRoutes from "./routes/adminScheduledChats";
 import adminTrackingMonitorRoutes from "./routes/adminTrackingMonitor";
 import adminRenewalIntegrationHealthRoutes from "./routes/adminRenewalIntegrationHealth";
 import adminPromptTemplatesRoutes from "./routes/adminPromptTemplates";
@@ -127,6 +132,7 @@ import sourceAccessRoutes from "./routes/sourceAccess";
 import orgMemoryRoutes from "./routes/orgMemory";
 import orgModelRolesRoutes from './routes/orgModelRoles';
 import orgShareSettingsRoutes from "./routes/orgShareSettings";
+import orgHotLeadCallRoutes from "./routes/orgHotLeadCall";
 import orgMemberRemovalRoutes from "./routes/orgMemberRemoval";
 import testAccountsRoutes from "./routes/testAccounts";
 import onboardingEventsRoutes from "./routes/onboardingEvents";
@@ -313,7 +319,9 @@ const corsOptions = {
   // useTokenUsage hook cache-busts /api/subscription/usage with those request
   // headers; cross-origin (app.agentweb.pro -> api.agentweb.pro) the browser
   // preflights them and, if absent here, blocks the fetch so the meter never loads.
-  allowedHeaders: ["Content-Type", "Authorization", "Cache-Control", "Pragma"],
+  // ENG-2650: X-Review-Token carries the result-endpoint reviewer capability
+  // from the portal's /review/:sessionId page to the /review API routes.
+  allowedHeaders: ["Content-Type", "Authorization", "Cache-Control", "Pragma", "X-Review-Token"],
   // ENG-2418: GET /api/tasks/executions/with-images returns paging metadata in
   // headers; cross-origin the portal can only read them if they are exposed.
   exposedHeaders: ["X-Total-Tasks", "X-Next-Cursor"],
@@ -328,6 +336,11 @@ app.use((req, res, next) => {
       // ENG-2315: the tracker SDK and its ingest are called from visitors' browsers on any customer
       // domain. Origins are enforced per list inside the route (trackingConfig.allowedOrigins), not here.
       req.path === '/api/track/event' ||
+      // ENG-2593: customer web forms on any domain POST leads here from the browser.
+      // Access is gated per list (publicAccessEnabled) inside routes/webhooks.ts.
+      req.path === '/api/webhooks/forward-lead' ||
+      // ENG-2657: emma-forms.js posts to /api/leads/public/:listId (alias of forward-lead below).
+      /^\/api\/leads\/public\/[^\/]+\/?$/.test(req.path) ||
       req.path.startsWith('/sdk/v1/') ||
       req.path.startsWith('/batch-review/')) {
     // Allow all origins for public endpoints
@@ -375,8 +388,22 @@ app.use("/api/webhooks/unipile", express.json({ type: () => true, limit: "1mb" }
 // ENG-2315: public tracker ingest. Its own 16kb parser must run before the global 50mb one below
 // (body-parser skips a request whose body is already parsed).
 app.use("/api/track/event", ...trackBodyParser);
+// ENG-2271: Twilio voice callbacks are small flat forms; parse them with a narrow limit first (body-parser
+// skips a body that is already parsed), so the global 50mb extended parser below never sees them.
+app.use("/api/webhooks/twilio-voice", twilioVoiceBodyParser);
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
+
+// ENG-2657: customer sites embedding /emma-forms.js POST to /api/leads/public/:listId.
+// Alias it onto /api/webhooks/forward-lead (same per-list publicAccessEnabled gate) by
+// moving the path param into body.listId; the path param wins over any body value.
+app.post(/^\/api\/leads\/public\/([^\/]+)\/?$/, (req, _res, next) => {
+  const listId = (req.params as Record<string, string>)[0];
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  req.body = { ...body, listId };
+  req.url = "/api/webhooks/forward-lead";
+  next();
+});
 app.use(passport.initialize());
 app.use(evaluationHttpBoundary);
 app.use("/api/admin/evaluations", evaluationAdminRoutes);
@@ -417,6 +444,7 @@ app.use("/api/admin", adminRoutes);
 app.use("/api/admin", adminUsageRoutes);
 app.use("/api/admin", mcpUsageAdminRoutes);
 app.use("/api/admin", adminV0CreditsRoutes);
+app.use("/api/admin", adminVendorRatesRoutes);
 app.use("/api/admin", adminCustomSubscriptionLinksRoutes);
 app.use("/api/internal", internalUsageRoutes);
 // ENG-2109: MCP endpoint for claude -p sessions this backend spawned. Local-only; see routes/toolBridge.ts.
@@ -424,6 +452,8 @@ app.use("/internal/tool-bridge", createToolBridgeRouter(toolBridgeMcp));
 // ENG-2110: connecting a Claude subscription (sign-in ceremony). Gated per user by the claudeSubscription flag.
 // Mounted before the generic router so its paths are never read as a connection id.
 app.use("/api/llm-connections/claude-subscription", createClaudeSubscriptionRouter());
+// ENG-2110 (1c): the same ceremony for a login that lives on the login host (dark: per-user flag, no host configured in prod).
+app.use("/api/llm-connections/subscriptions/:provider", createHostedSubscriptionsRouter());
 // ENG-2105: a customer's own LLM provider keys (BYOK). Adding or re-validating a key
 // is gated by the eng1816_funding_flags row; listing and revoking always work.
 app.use("/api/llm-connections", createLlmConnectionsRouter());
@@ -456,6 +486,9 @@ app.use("/api/blog", blogRoutes);
 app.use("/api/agent-mode", agentModeRoutes);
 app.use("/api/settings", settingsRoutes);
 app.use("/api/image-models", imageModelsRoutes);
+// ENG-2271: Twilio voice callbacks (form-encoded, parsed by the narrow 64kb parser mounted before the global
+// ones). Every route verifies X-Twilio-Signature itself, so there is deliberately no auth middleware here.
+app.use("/api/webhooks/twilio-voice", twilioVoiceWebhookRoutes);
 app.use("/api/webhooks", webhookRoutes);
 app.use("/api/webhooks/fathom", fathomWebhookRoutes);
 app.use("/api/webhooks/whatsapp", whatsappWebhookRoutes);
@@ -465,6 +498,7 @@ app.use("/api/webhooks/calendly", calendlyWebhookRoutes);
 app.use("/api/webhooks/unipile", unipileWebhookRoutes);
 registerConversionRelayProcessor();
 registerLeadNotificationProcessor();
+registerHotLeadCallProcessor();
 app.use("/api/benchmark", benchmarkRoutes);
 app.use("/api/seo", seoRoutes);
 app.use("/api/funnels", funnelRoutes);
@@ -538,6 +572,8 @@ app.use("/api/admin/landing-pages", authenticateToken, isAdmin, adminLandingPage
 // ENG-2314 — dry-run-first merge/delete of LP session rows. Same admin double-gate as above.
 app.use("/api/admin/session-cleanup", authenticateToken, isAdmin, adminSessionCleanupRoutes);
 app.use("/api/admin/org-diagnostics", authenticateToken, isAdmin, adminOrgDiagnosticsRoutes);
+// ENG-778 — audited cross-owner scheduled-chat inspect + pause/resume (no edit/delete).
+app.use("/api/admin/scheduled-chats", authenticateToken, isAdmin, adminScheduledChatsRoutes);
 app.use("/api/admin/tracking-monitor", authenticateToken, isAdmin, adminTrackingMonitorRoutes);
 app.use("/api/admin/renewal-integration-health", authenticateToken, isAdmin, adminRenewalIntegrationHealthRoutes);
 app.use("/api/admin/prompt-templates", authenticateToken, isAdmin, adminPromptTemplatesRoutes);
@@ -610,6 +646,7 @@ app.use("/api/source-access", sourceAccessRoutes);
 app.use("/api/org", orgMemoryRoutes);
 app.use("/api/orgs/me/model-roles", authenticateToken, orgModelRolesRoutes);
 app.use("/api/orgs/me/share-settings", authenticateToken, orgShareSettingsRoutes);
+app.use("/api/orgs/me/hot-lead-call", authenticateToken, orgHotLeadCallRoutes);
 app.use("/api/orgs/me/members", authenticateToken, orgMemberRemovalRoutes);
 app.use("/api/characters", charactersRoutes);
 app.use("/api/contractor", contractorRoutes);

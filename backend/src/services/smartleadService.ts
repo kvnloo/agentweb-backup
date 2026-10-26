@@ -68,12 +68,122 @@ interface SmartLeadLeadsResponse {
   data: SmartLeadLeadRaw[];
 }
 
+// ─── Shared request client (ENG-2658) ───────────────────────────────────
+//
+// Every Smartlead call goes through smartleadRequest so that:
+//  - 429s retry with exponential backoff + full jitter (honouring Retry-After),
+//  - we self-throttle below Smartlead's rate limit (default ~60 req/min),
+//  - the api_key query param never appears in thrown errors or logs.
+
+export interface SmartleadClientOptions {
+  maxRetries: number;
+  baseDelayMs: number;
+  maxDelayMs: number;
+  requestsPerMinute: number;
+  timeoutMs: number;
+}
+
+const DEFAULT_CLIENT_OPTIONS: SmartleadClientOptions = {
+  maxRetries: 4,
+  baseDelayMs: 1000,
+  maxDelayMs: 30000,
+  requestsPerMinute: 60,
+  timeoutMs: 15000,
+};
+
+let clientOptions: SmartleadClientOptions = { ...DEFAULT_CLIENT_OPTIONS };
+let sleepFn: (ms: number) => Promise<void> = ms => new Promise(r => setTimeout(r, ms));
+let randomFn: () => number = Math.random;
+let nowFn: () => number = Date.now;
+let nextSlotAt = 0;
+
+/** Test seam: override timing/randomness and client options. Resets throttle state. */
+export function __configureSmartleadClient(overrides: {
+  options?: Partial<SmartleadClientOptions>;
+  sleep?: (ms: number) => Promise<void>;
+  random?: () => number;
+  now?: () => number;
+} = {}): void {
+  clientOptions = { ...DEFAULT_CLIENT_OPTIONS, ...(overrides.options || {}) };
+  sleepFn = overrides.sleep || (ms => new Promise(r => setTimeout(r, ms)));
+  randomFn = overrides.random || Math.random;
+  nowFn = overrides.now || Date.now;
+  nextSlotAt = 0;
+}
+
+/** Remove api_key values from any string (URLs, error messages, serialized configs). */
+export function scrubSmartleadSecrets(text: string, apiKey?: string): string {
+  let out = String(text ?? "").replace(/(api_key=)[^&\s"']+/gi, "$1[REDACTED]");
+  if (apiKey) out = out.split(apiKey).join("[REDACTED]");
+  return out;
+}
+
+async function acquireThrottleSlot(): Promise<void> {
+  const rpm = clientOptions.requestsPerMinute;
+  if (!rpm || rpm <= 0) return;
+  const interval = 60000 / rpm;
+  const now = nowFn();
+  const slot = Math.max(now, nextSlotAt);
+  nextSlotAt = slot + interval;
+  const wait = slot - now;
+  if (wait > 0) await sleepFn(wait);
+}
+
+function retryDelayMs(attempt: number, retryAfterHeader: unknown): number {
+  const retryAfter = Number(retryAfterHeader);
+  if (Number.isFinite(retryAfter) && retryAfter > 0) {
+    return Math.min(retryAfter * 1000, clientOptions.maxDelayMs);
+  }
+  const cap = Math.min(clientOptions.baseDelayMs * 2 ** attempt, clientOptions.maxDelayMs);
+  return Math.floor(randomFn() * cap); // full jitter
+}
+
+export class SmartleadApiError extends Error {
+  constructor(message: string, public readonly status?: number) {
+    super(message);
+    this.name = "SmartleadApiError";
+  }
+}
+
+export async function smartleadRequest<T>(
+  apiKey: string,
+  method: "GET" | "POST" | "PATCH" | "DELETE",
+  path: string,
+  opts: { params?: Record<string, unknown>; data?: unknown } = {},
+): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    await acquireThrottleSlot();
+    try {
+      const response = await axios.request<T>({
+        method,
+        url: `${BASE_URL}${path}`,
+        params: { ...(opts.params || {}), api_key: apiKey },
+        data: opts.data,
+        timeout: clientOptions.timeoutMs,
+      });
+      return response.data;
+    } catch (caught: unknown) {
+      const error = caught as {
+        message?: string;
+        response?: { status?: number; headers?: Record<string, unknown> };
+      };
+      const status: number | undefined = error?.response?.status;
+      if (status === 429 && attempt < clientOptions.maxRetries) {
+        await sleepFn(retryDelayMs(attempt, error?.response?.headers?.["retry-after"]));
+        continue;
+      }
+      const raw = error?.message || "Smartlead request failed";
+      throw new SmartleadApiError(
+        scrubSmartleadSecrets(`Smartlead ${method} ${path} failed${status ? ` (${status})` : ""}: ${raw}`, apiKey),
+        status,
+      );
+    }
+  }
+}
+
 async function fetchCampaigns(apiKey: string): Promise<SmartLeadCampaignRaw[]> {
-  const response = await axios.get<SmartLeadCampaignRaw[]>(`${BASE_URL}/campaigns`, {
-    params: { api_key: apiKey },
-    timeout: 15000,
-  });
-  return response.data || [];
+  const data = await smartleadRequest<SmartLeadCampaignRaw[]>(apiKey, "GET", "/campaigns");
+  return data || [];
 }
 
 async function fetchCampaignLeads(
@@ -86,18 +196,16 @@ async function fetchCampaignLeads(
 
   // Paginate through all leads for this campaign
   while (true) {
-    const response = await axios.get<SmartLeadLeadsResponse>(
-      `${BASE_URL}/campaigns/${campaignId}/leads`,
-      {
-        params: { api_key: apiKey, offset, limit: LEADS_PAGE_LIMIT },
-        timeout: 15000,
-      },
+    const data = await smartleadRequest<SmartLeadLeadsResponse>(
+      apiKey,
+      "GET",
+      `/campaigns/${campaignId}/leads`,
+      { params: { offset, limit: LEADS_PAGE_LIMIT } },
     );
 
-    const data = response.data;
-    total = parseInt(data.total_leads || "0", 10);
+    total = parseInt(data?.total_leads || "0", 10);
 
-    if (!data.data || data.data.length === 0) break;
+    if (!data?.data || data.data.length === 0) break;
 
     allLeads.push(...data.data);
 
@@ -114,11 +222,8 @@ async function fetchCampaignLeads(
 }
 
 async function fetchEmailAccounts(apiKey: string): Promise<number> {
-  const response = await axios.get<any[]>(`${BASE_URL}/email-accounts`, {
-    params: { api_key: apiKey },
-    timeout: 15000,
-  });
-  return Array.isArray(response.data) ? response.data.length : 0;
+  const data = await smartleadRequest<unknown[]>(apiKey, "GET", "/email-accounts");
+  return Array.isArray(data) ? data.length : 0;
 }
 
 // ─── Main Function ──────────────────────────────────────────────────────
@@ -188,8 +293,9 @@ export async function getSmartLeadMetrics(): Promise<SmartLeadMetrics> {
       campaigns: campaignSummaries,
       status: "ok",
     };
-  } catch (error: any) {
-    console.error("[SmartLeadService] Error fetching SmartLead metrics:", error.message);
-    return emptyMetrics("error", error.message);
+  } catch (error: unknown) {
+    const message = scrubSmartleadSecrets((error as { message?: string })?.message || "Unknown error", apiKey);
+    console.error("[SmartLeadService] Error fetching SmartLead metrics:", message);
+    return emptyMetrics("error", message);
   }
 }

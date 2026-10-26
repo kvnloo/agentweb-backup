@@ -1,8 +1,13 @@
+// The test-only TLS keys and certificates are generated on first use (they are not committed): this import must come first.
+import "../fixtures/tls/ensureFixtures";
+import { X509Certificate } from "crypto";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { verifyBinary, assertTrustedPath } from "../../host/binary";
 import { assertNoSubuidOverlap, HostConfigError, parseHostConfig } from "../../host/hostConfig";
+import { adapterKillWaitMs, assertKeyFileMode, managerConfigFor, portConfigFor, reportTlsCertExpiry } from "../../host/main";
+import { DEFAULT_CONFIG } from "../../connectionManager";
 import { registerRange } from "../../host/ranges";
 import { assertHomesMount, assertRoot, parseMounts } from "../../host/startupChecks";
 
@@ -19,19 +24,96 @@ const base = () => ({
   uidMin: 400_000,
   uidMax: 410_000,
   socket: { dir: "/run/aw-login-host-test1", gid: 990 },
+  egress: { allow: ["api.anthropic.com:443", "platform.claude.com:443", "claude.ai:443"] },
   claude: { binaryPath: "/opt/aw-claude/2.1.294/claude", expectedSha256: "a".repeat(64), version: "2.1.294", systemPromptFile: "/opt/aw-login-host/system-prompt.txt", bridgeUrl: "http://127.0.0.1:3001/internal/tool-bridge/run/mcp" },
 });
 const bad = (over: Record<string, unknown>) => () => parseHostConfig({ ...base(), ...over });
+
+describe("stopGraceSec (graceful customer-unit stop)", () => {
+  it("accepts 2..12 and rejects everything else at LOAD time (not only when the first unit starts)", () => {
+    for (const stopGraceSec of [2, 10, 12]) expect(parseHostConfig({ ...base(), limits: { stopGraceSec } }).limits.stopGraceSec).toBe(stopGraceSec);
+    for (const stopGraceSec of [0, 1, 13, 121, 1.5, "10", -1]) expect(bad({ limits: { stopGraceSec } })).toThrow(HostConfigError);
+  });
+  it("the kill budget covers the grace (a normal graceful stop must not read as a stuck unit)", () => {
+    const cfg = parseHostConfig({ ...base(), limits: { stopGraceSec: 12 } });
+    expect(portConfigFor(cfg).killTimeoutMs).toBe(15_000 + 12_000);
+    expect(portConfigFor(parseHostConfig(base())).killTimeoutMs).toBe(25_000);
+    expect(portConfigFor(cfg).commandTimeoutMs).toBeGreaterThanOrEqual(2 * 12_000); // one `systemctl stop` may block for the SIGTERM phase and again for the final SIGKILL phase
+  });
+});
+
+describe("manager timers derived from the stop grace", () => {
+  it("the claude adapter waits the stop grace plus 5 s for a stopping turn process", () => {
+    expect(adapterKillWaitMs(parseHostConfig(base()))).toBe(15_000);
+    expect(adapterKillWaitMs(parseHostConfig({ ...base(), limits: { stopGraceSec: 12 } }))).toBe(17_000);
+    expect(adapterKillWaitMs(parseHostConfig({ ...base(), limits: { stopGraceSec: 2 } }))).toBe(7_000);
+  });
+  it("a stopping provider gets the default abort grace PLUS the unit's stop grace", () => {
+    expect(managerConfigFor(parseHostConfig(base())).abortGraceMs).toBe(DEFAULT_CONFIG.abortGraceMs + 10_000);
+    expect(managerConfigFor(parseHostConfig({ ...base(), limits: { stopGraceSec: 2 } })).abortGraceMs).toBe(DEFAULT_CONFIG.abortGraceMs + 2_000);
+  });
+  it("a configured abortGraceMs does NOT drop the stop grace (it is the base the grace is added to)", () => {
+    const cfg = parseHostConfig({ ...base(), limits: { stopGraceSec: 12 }, manager: { abortGraceMs: 5_000 } });
+    expect(managerConfigFor(cfg).abortGraceMs).toBe(5_000 + 12_000);
+  });
+  it("test overrides still win, and the uid range comes from the host config", () => {
+    const m = managerConfigFor(parseHostConfig(base()), { abortGraceMs: 30 });
+    expect(m.abortGraceMs).toBe(30);
+    expect(m.uidMin).toBe(400_000);
+    expect(m.uidMax).toBe(410_000);
+  });
+});
 
 describe("host config (a CLOSED schema)", () => {
   it("accepts a minimal config and fills the documented defaults", () => {
     const c = parseHostConfig(base());
     expect(c.stateRoot).toBe("/var/lib/aw-login-host/test1");
     expect(c.socketPath).toBe("/run/aw-login-host-test1/host.sock");
-    expect(c.limits).toEqual({ memoryMax: "1G", tasksMax: 256, tmpSize: "128M", shmSize: "64M", runtimeMaxSec: 7200 });
+    expect(c.limits).toEqual({ memoryMax: "1G", tasksMax: 256, tmpSize: "128M", shmSize: "64M", runtimeMaxSec: 7200, stopGraceSec: 10 });
     expect(c.tools.systemRun).toBe("/usr/bin/systemd-run");
     expect(c.claude.turnWrapperPath).toBe("/opt/aw-login-host/claude-turn.sh");
     expect(c.socket.mode).toBe(0o660);
+  });
+  it("requires an egress policy (a host with no allowlist does not start) and derives the proxy socket path", () => {
+    const noEgress: Record<string, unknown> = { ...base() };
+    delete noEgress.egress;
+    expect(() => parseHostConfig(noEgress)).toThrow(HostConfigError);
+    const c = parseHostConfig(base());
+    expect(c.egressDir).toBe("/run/aw-egress-test1");
+    expect(c.egressSocketPath).toBe("/run/aw-egress-test1/proxy.sock");
+    expect(c.egress.launcherPath).toBe("/opt/aw-login-host/aw-net.sh");
+    expect(c.egress.socat).toBe("/usr/bin/socat");
+  });
+  it.each([
+    ["an empty allowlist", { egress: { allow: [] } }],
+    ["a literal IP", { egress: { allow: ["169.254.169.254:80"] } }],
+    ["a bracketed IPv6", { egress: { allow: ["[::1]:443"] } }],
+    ["no port", { egress: { allow: ["api.anthropic.com"] } }],
+    ["a port out of range", { egress: { allow: ["api.anthropic.com:70000"] } }],
+    ["a wildcard", { egress: { allow: ["*.anthropic.com:443"] } }],
+    ["upper case", { egress: { allow: ["API.anthropic.com:443"] } }],
+    ["a path", { egress: { allow: ["api.anthropic.com:443/x"] } }],
+    ["unknown egress keys", { egress: { allow: ["api.anthropic.com:443"], open: true } }],
+  ])("rejects an egress policy with %s", (_n, over) => expect(bad(over)).toThrow(HostConfigError));
+  it("the production port config ALWAYS isolates the network (units get PrivateNetwork and the proxy directory)", async () => {
+    const { portConfigFor } = await import("../../host/main");
+    const cfg = parseHostConfig(base());
+    expect(portConfigFor(cfg).paths.net).toEqual({ dir: "/run/aw-egress-test1", launcher: "/opt/aw-login-host/aw-net.sh", socat: "/usr/bin/socat" });
+  });
+  describe("mutual TLS listener (PR 3)", () => {
+    const tls = { host: "172.31.30.50", port: 8443, certPath: "/etc/aw-login-host/tls/server.crt", keyPath: "/etc/aw-login-host/tls/server.key", caPath: "/etc/aw-login-host/tls/ca.crt", clientCommonNames: ["agentweb-backend-prod"] };
+    it("is optional and absent by default", () => expect(parseHostConfig(base()).tls).toBeUndefined());
+    it("accepts a private address with the files and the pinned client identity", () => expect(parseHostConfig({ ...base(), tls }).tls).toMatchObject({ host: "172.31.30.50", port: 8443, clientCommonNames: ["agentweb-backend-prod"] }));
+    it.each([
+      ["0.0.0.0", { host: "0.0.0.0" }],
+      ["loopback", { host: "127.0.0.1" }],
+      ["a hostname", { host: "worker.internal" }],
+      ["a privileged port", { port: 443 }],
+      ["no client identity", { clientCommonNames: [] }],
+      ["a client identity with odd characters", { clientCommonNames: ["a b"] }],
+      ["an unknown key", { extra: 1 }],
+      ["a relative cert path", { certPath: "server.crt" }],
+    ])("rejects %s", (_n, over) => expect(bad({ tls: { ...tls, ...over } })).toThrow(HostConfigError));
   });
   it("rejects unknown keys anywhere (nothing is silently ignored)", () => {
     expect(bad({ extra: 1 })).toThrow(HostConfigError);
@@ -60,6 +142,8 @@ describe("host config (a CLOSED schema)", () => {
     ["an uppercase sha256", { claude: { ...base().claude, expectedSha256: "A".repeat(64) } }],
     ["a relative binary path", { claude: { ...base().claude, binaryPath: "claude" } }],
     ["a binary path with a colon", { claude: { ...base().claude, binaryPath: "/opt/a:b/claude" } }],
+    ["a bridge url with an IPv6 literal host", { claude: { ...base().claude, bridgeUrl: "http://[::1]:3001/mcp" } }],
+    ["a bridge url with a bracketed public IPv6 host", { claude: { ...base().claude, bridgeUrl: "https://[2607:6bc0::10]/mcp" } }],
     ["a bridge url that is not http(s)", { claude: { ...base().claude, bridgeUrl: "file:///etc/passwd" } }],
     ["a model with a space", { claude: { ...base().claude, models: ["sonnet 4"] } }],
     ["a tool path with $", { tools: { rm: "/usr/bin/$rm" } }],
@@ -212,5 +296,43 @@ describe("range registry lock left empty by a dying creator", () => {
     utimesSync(join(dir, ".lock"), old, old);
     registerRange(dir, { env: "test1", uidMin: 400_000, uidMax: 410_000 }, 150);
     expect(readFileSync(join(dir, "test1.json"), "utf8")).toContain("400000");
+  });
+});
+
+describe("TLS start-up checks (PR 3)", () => {
+  const DAY = 24 * 60 * 60 * 1000;
+
+  it.each([0o600, 0o400, 0o100600, 0o100400])("a key file with mode %o is accepted (owner only)", (mode) => expect(() => assertKeyFileMode("/k", mode)).not.toThrow());
+  it.each([0o640, 0o644, 0o604, 0o660, 0o666, 0o100644, 0o100640, 0o610])("a key file with mode %o is refused (group or others can read or write it)", (mode) => {
+    expect(() => assertKeyFileMode("/etc/aw-login-host/tls/server.key", mode)).toThrow(HostConfigError);
+    expect(() => assertKeyFileMode("/etc/aw-login-host/tls/server.key", mode)).toThrow(/must be mode 0600/);
+  });
+
+  describe("server certificate expiry at start-up", () => {
+    const cert = readFileSync(join(__dirname, "../fixtures/tls/server.pem"));
+    const notAfter = new Date(new X509Certificate(cert).validTo).getTime();
+    const rec = () => {
+      const lines: Array<{ level: string; event: string; fields?: Record<string, unknown> }> = [];
+      return { lines, log: { info: (event: string, fields?: Record<string, unknown>) => void lines.push({ level: "info", event, fields }), warn: (event: string, fields?: Record<string, unknown>) => void lines.push({ level: "warn", event, fields }) } };
+    };
+
+    it("far from expiry: one info line with the day count, no warning", () => {
+      const { lines, log } = rec();
+      expect(reportTlsCertExpiry(log as never, cert, notAfter - 400 * DAY)).toBe(400);
+      expect(lines).toEqual([{ level: "info", event: "host_tls_cert_expiry", fields: { daysLeft: 400 } }]);
+    });
+    it("under 30 days: also a warning; expired: a negative count and a warning", () => {
+      const soon = rec();
+      expect(reportTlsCertExpiry(soon.log as never, cert, notAfter - 11 * DAY - 1000)).toBe(11);
+      expect(soon.lines.map((l) => l.event)).toEqual(["host_tls_cert_expiry", "host_tls_cert_expires_soon"]);
+      const gone = rec();
+      expect(reportTlsCertExpiry(gone.log as never, cert, notAfter + 2 * DAY + 1000)).toBe(-3);
+      expect(gone.lines[1]).toEqual({ level: "warn", event: "host_tls_cert_expires_soon", fields: { daysLeft: -3 } });
+    });
+    it("an unparseable certificate is a warning, not a crash, and never echoes the content", () => {
+      const { lines, log } = rec();
+      expect(reportTlsCertExpiry(log as never, "-----BEGIN CERTIFICATE-----\nSECRETISH\n-----END CERTIFICATE-----", 0)).toBeUndefined();
+      expect(lines).toEqual([{ level: "warn", event: "host_tls_cert_unparseable", fields: undefined }]);
+    });
   });
 });

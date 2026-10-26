@@ -747,6 +747,9 @@ const DEFAULT_ARG_ALIASES: Record<string, string[]> = {
   operations_json: ['replacement_json', 'operations', 'replacements', 'replacement_instructions'],
   // playwright_browser_evaluate requires `function`; models send `expression`/`script` (ENG-2473).
   function: ['expression', 'script', 'js', 'code'],
+  // monitor_lead_volume / assess_client_health etc. require `client_name_or_email`;
+  // scheduled report runs send `client_id: "<email>"` (ENG-2610).
+  client_name_or_email: ['client_id', 'client_email', 'client'],
 };
 
 export function evaluateAgentToolPolicy(input: AgentToolPolicyInput): AgentToolPolicyDecision {
@@ -798,6 +801,9 @@ export function evaluateAgentToolPolicy(input: AgentToolPolicyInput): AgentToolP
     flags,
   };
 }
+
+import { normalizeHubSpotArgs } from './agentMode/crmToolArgs';
+import { normalizeAttioArgs } from './agentMode/attioTools';
 
 // ENG-2570: call_hubspot_api CONTACT_LIST GET — models put the list id in
 // `query` ({listId:"17"}, "listId=17", 17) instead of `list_id`, then loop to
@@ -965,12 +971,25 @@ export function validateAndRepairToolArgs(
     ? schema.required.filter((name: unknown): name is string => typeof name === 'string')
     : [];
   const allowAdditional = schema.additionalProperties !== false;
-  const repairedArgs: Record<string, unknown> = { ...(input.args as Record<string, unknown>) };
+  let repairedArgs: Record<string, unknown> = { ...(input.args as Record<string, unknown>) };
+  if (input.toolName === 'call_hubspot_api') {
+    const normalized = normalizeHubSpotArgs(repairedArgs);
+    if (JSON.stringify(normalized) !== JSON.stringify(repairedArgs)) {
+      repairs.push(repairedArgs.query !== undefined && normalized.query === undefined ? 'query->list_id' : 'hubspot:aliases');
+      repairedArgs = normalized;
+    }
+  }
+  if (input.toolName === 'call_attio_api') {
+    const { args, entityType, action } = normalizeAttioArgs(repairedArgs);
+    const normalized = { ...args, ...(entityType ? { entity_type: entityType } : {}), action };
+    if (JSON.stringify(normalized) !== JSON.stringify(repairedArgs)) repairs.push('attio:aliases');
+    repairedArgs = normalized;
+  }
   const propertyNames = Object.keys(properties);
   const lowRiskRepairAllowed = (input.effect ?? classifyToolEffect(input.toolName, input.args)) === 'read';
 
   for (const key of Object.keys(repairedArgs)) {
-    if (properties[key]) continue;
+    if (Object.prototype.hasOwnProperty.call(properties, key)) continue;
 
     // ENG-1668: a common LLM mistake — inventing a wrapper object (e.g.
     // `params: { criterion_resource_name: ... }`) around fields that actually
@@ -1510,6 +1529,8 @@ function findKnownAliasSource(input: {
     ].map(normalizeArgName);
     for (const key of Object.keys(input.existingArgs)) {
       if (key === input.target) continue;
+      // A key that is a real schema property is the caller's own argument, not an alias (ENG-2610).
+      if (Object.prototype.hasOwnProperty.call(input.properties, key)) continue;
       if (targetAliases.includes(normalizeArgName(key))) return key;
     }
   }
@@ -1528,6 +1549,13 @@ function findKnownAliasSource(input: {
 }
 
 function validateJsonSchemaType(name: string, value: unknown, schema: any): AgentToolContractIssue | null {
+  if (schema === false) {
+    return {
+      code: 'invalid_args',
+      path: `$.${name}`,
+      message: `Argument "${name}" is not allowed by the tool schema.`,
+    };
+  }
   const expected = schema?.type;
   if (!expected) return null;
   const expectedTypes = Array.isArray(expected) ? expected : [expected];

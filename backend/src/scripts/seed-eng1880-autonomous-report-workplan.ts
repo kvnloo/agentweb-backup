@@ -126,9 +126,9 @@ export const AUTONOMOUS_REPORT_WORKPLAN_STEPS: WorkPlanStep[] = [
 // undefined ownerId makes orgShareService.canEditItem's ownership check unconditionally
 // false for every caller, permanently blocking the plan from the standard user-facing
 // edit route. This script has no authenticated "calling user" the way that route does,
-// so it accepts an explicit override and otherwise falls back to the same admin userId
-// the proven internal validation plan (e5763948-...) used.
-const DEFAULT_SEED_OWNER_USER_ID = '1d2547e7-b5b8-4f89-8dd1-740e0a07b8f5';
+// so it accepts an explicit override. The default must match the Phase B schedule
+// owner in seed-eng1880-phase-b-scheduled-reports.ts: this plan is private.
+const DEFAULT_SEED_OWNER_USER_ID = '1743956381327';
 
 export function buildAutonomousReportWorkPlan(
   ownerId: string = process.env.SEED_OWNER_USER_ID || DEFAULT_SEED_OWNER_USER_ID,

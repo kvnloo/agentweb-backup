@@ -27,12 +27,18 @@ router.get('/me/onboarding', authenticateToken, async (req, res) => {
 // ENG-1316: extended to also persist emailNotificationsEnabled — the portal
 // preferences save previously silently dropped this field (ENG-1085 gap).
 // ENG-188: extended again for emmaTipsEnabled (the Emma tips carousel opt-out).
+// ENG-113: and for showModelCompare (hides the chat Compare button). A display
+// preference only — the Compare entitlement, tier allowlist and kill switch are
+// enforced on /compare regardless of this value, so it is never consulted there.
+// ENG-2118: and for showIntegrationAccess (hides the Integration access card in
+// Connected Accounts). Also display-only: the access-inventory routes keep their
+// org:accounts:read check whatever this is set to.
 router.patch('/me/profile', authenticateToken, async (req, res) => {
   try {
     const userId = (req as AuthenticatedRequest).user?.userId;
     if (!userId) return res.status(401).json({ message: 'User not authenticated' });
 
-    const { displayName, emailNotificationsEnabled, emmaTipsEnabled } = req.body ?? {};
+    const { displayName, emailNotificationsEnabled, emmaTipsEnabled, showModelCompare, showIntegrationAccess } = req.body ?? {};
 
     const trimmedDisplayName = typeof displayName === 'string' ? displayName.trim() : displayName;
     if (displayName !== undefined && (typeof trimmedDisplayName !== 'string' || !trimmedDisplayName || trimmedDisplayName.length > 100)) {
@@ -44,11 +50,19 @@ router.patch('/me/profile', authenticateToken, async (req, res) => {
     if (emmaTipsEnabled !== undefined && typeof emmaTipsEnabled !== 'boolean') {
       return res.status(400).json({ message: 'emmaTipsEnabled must be a boolean' });
     }
+    if (showModelCompare !== undefined && typeof showModelCompare !== 'boolean') {
+      return res.status(400).json({ message: 'showModelCompare must be a boolean' });
+    }
+    if (showIntegrationAccess !== undefined && typeof showIntegrationAccess !== 'boolean') {
+      return res.status(400).json({ message: 'showIntegrationAccess must be a boolean' });
+    }
 
     const updates: Record<string, unknown> = {};
     if (displayName !== undefined) updates.displayName = trimmedDisplayName;
     if (emailNotificationsEnabled !== undefined) updates.emailNotificationsEnabled = emailNotificationsEnabled;
     if (emmaTipsEnabled !== undefined) updates.emmaTipsEnabled = emmaTipsEnabled;
+    if (showModelCompare !== undefined) updates.showModelCompare = showModelCompare;
+    if (showIntegrationAccess !== undefined) updates.showIntegrationAccess = showIntegrationAccess;
 
     if (Object.keys(updates).length === 0) {
       return res.status(400).json({ message: 'No valid fields to update' });

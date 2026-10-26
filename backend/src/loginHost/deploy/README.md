@@ -1,5 +1,7 @@
 # Login host deploy files (ENG-2110) — NOT installed by CI; DARK
 
+**Production worker: use `prod/install.sh` (built into a tarball by `backend/scripts/build-login-host.sh`); see `prod/README.md` for build, deploy, rollback, certificate rotation and the runbook.** The checklist below is the manual, test-instance view.
+
 Files: `aw-login-host@.service` (host, one instance per env), `aw-env.slice.example`, `host-config.example.json`,
 `claude-turn.sh` (per-turn wrapper), `aw-write-file.sh` (root helper that writes a file as a customer uid).
 
@@ -9,4 +11,10 @@ Install checklist (test instance first; production needs the network-isolation P
 3. Homes filesystem: a fixed-size loop image mounted at `/var/lib/aw-login-host/<env>/u` with `nosuid,nodev,usrquota` (the host refuses to start otherwise); run `quotacheck`/`quotaon`.
 4. `/etc/aw-login-host/<env>.json` root-owned 0600, uid range disjoint from every other env and `/etc/subuid` (the host enforces both).
 5. `systemctl enable --now aw-login-host@<env>`; the socket dir `/run/aw-login-host-<env>` is the access gate (group = the backend's gid).
+6. Network isolation (PR 2, mandatory): `socat` installed (`/usr/bin/socat`), `aw-net.sh` next to `claude-turn.sh` (root-owned 0755), and an `egress.allow` list in the config. Every customer unit then runs with `PrivateNetwork=yes` (loopback only) and reaches ONLY the host's allowlisting proxy (`/run/aw-egress-<env>/proxy.sock`, started and owned by the host process); the Emma tool bridge from `claude.bridgeUrl` is allowed automatically. The proxy refuses anything not on the list and any name that resolves to a private/loopback/metadata address.
+7. Stopping customer processes: every customer unit stops GRACEFULLY (`KillMode=mixed`, `KillSignal=SIGTERM`, `TimeoutStopSec=<limits.stopGraceSec>`, default 10, allowed 2..12), SIGKILL only after the grace period or if the stop itself fails; revoke and the hazard alarm kill hard (the home is wiped right after). Why: the CLI refreshes an expired login in its first seconds (the server rotates both tokens, the new pair is written afterwards), and a SIGKILL in between destroys the login. DEPLOY ORDER: `limits.stopGraceSec` is a new key of a CLOSED schema; an old host binary refuses a config that has it, so deploy the new host first and only then add the key (the default needs no config change).
 Config is a CLOSED schema: unknown keys fail start-up. See `host/hostConfig.ts`.
+
+## Test instance only
+`install-test-host.sh` installs env `test1` on the throwaway test instance (loop-mounted 500M homes fs, uid range 420000-430000, socket group 1000). It is NOT a production installer: production needs its own sized volume, a real group for the backend, and the network-isolation PR first.
+The manual live runner `__tests__/live/hostLiveAuth.ts` (bundle it with esbuild, run as root on the instance) does a REAL sign-in through the host with a hidden code entry; it prints only redacted PASS/FAIL lines.

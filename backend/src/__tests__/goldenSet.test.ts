@@ -55,6 +55,14 @@ describe('golden case schema (ENG-2135)', () => {
     expect(() => parseGoldenCase({ ...agentCase(), version: -1 })).toThrow(/version/);
   });
 
+  it('keeps an exclusion with its reason, admin and time, and rejects a malformed one (ENG-2608)', () => {
+    const excluded = { reason: 'empty_session', by: 'admin@example.com', at: NOW.toISOString() };
+    expect(parseGoldenCase({ ...agentCase(), excluded })).toMatchObject({ excluded });
+    expect(parseGoldenCase(agentCase())).not.toHaveProperty('excluded');
+    expect(() => parseGoldenCase({ ...agentCase(), excluded: { reason: '', by: 'a', at: 'b' } })).toThrow(/excluded.reason/);
+    expect(() => parseGoldenCase({ ...agentCase(), excluded: 'yes' })).toThrow(/excluded must be an object/);
+  });
+
   it('allows a replay link only on agent cases', () => {
     const creative = newGoldenCase({ surface: 'creative', taskType: 'creative_image', sourceId: 'cand-1', seedSource: 's', now: NOW });
     expect(() => parseGoldenCase({ ...creative, replay: { fixtureId: 'f', messageIndex: 1 } })).toThrow(/only valid on agent/);

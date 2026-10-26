@@ -548,7 +548,7 @@ describe('readFileContent', () => {
       const axios = require('axios');
       axios.get.mockResolvedValue(mockResponse);
 
-      const result = await (agentModeService as any).readFileContent('https://s3.amazonaws.com/bucket/PostAnalytics.xlsx');
+      const result = await (agentModeService as any).readFileContent('https://files.example.com/bucket/PostAnalytics.xlsx');
 
       expect(result.success).toBe(true);
       expect(result.file_type).toBe('spreadsheet');
@@ -901,5 +901,44 @@ describe('readFileContent', () => {
       expect(cb).toHaveBeenCalledWith(null, '93.184.216.34', 4);
     });
   });
-});
 
+  // ENG-2656: Emma guessed https://flatfee-campaigns.s3.us-west-2.amazonaws.com/...
+  // for an "attached" file that never uploaded. A non-AgentWeb S3 URL must be
+  // refused with re-attach guidance and must cause no network request.
+  describe('ENG-2656 foreign storage refusal', () => {
+    const ssrfGuardMock = require('../utils/ssrfGuard');
+    it.each([
+      'https://flatfee-campaigns.s3.us-west-2.amazonaws.com/campaigns/updated-document.docx',
+      'https://some-bucket.s3.amazonaws.com/doc.pdf',
+      'https://s3.amazonaws.com/other-bucket/doc.pdf',
+      'https://s3.us-west-2.amazonaws.com/other-bucket/doc.pdf',
+      'https://s3-us-west-2.amazonaws.com/other-bucket/doc.pdf',
+    ])('refuses %s without fetching', async (url) => {
+      const result = await (agentModeService as any).readFileContent(url, { userId: 'user-a' });
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('Not an AgentWeb storage URL');
+      expect(result.message).toContain('please re-attach the file');
+      expect(axios.get).not.toHaveBeenCalled();
+      expect(ssrfGuardMock.resolvePinnedPublicAddress).not.toHaveBeenCalled();
+    });
+
+    it("still reads the caller's own AgentWeb upload", async () => {
+      const result = await (agentModeService as any).readFileContent(
+        'https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/user-a/files/1/doc.txt',
+        { userId: 'user-a' },
+      );
+      expect(result.success).toBe(true);
+    });
+
+    it('does not treat look-alike non-S3 hosts as storage', async () => {
+      (axios.get as jest.Mock).mockResolvedValueOnce({ status: 200, headers: { 'content-type': 'text/plain' }, data: Buffer.from('ok') });
+      const result = await (agentModeService as any).readFileContent('https://s3.amazonaws.com.evil.example/x.txt', { userId: 'user-a' });
+      expect(result.success).toBe(true);
+    });
+
+    it('tells the model to ask for a re-attach instead of guessing a URL', () => {
+      const { AGENT_MODE_SYSTEM_PROMPT } = jest.requireActual('../docs/agentModeSystemPrompt');
+      expect(String(AGENT_MODE_SYSTEM_PROMPT)).toMatch(/NEVER guess, construct, or search for an attachment URL/);
+    });
+  });
+});

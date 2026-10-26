@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
 import { MODIFY_WORK_PLAN_INPUT_SCHEMA, validateModifyWorkPlanArgs } from './impl/modifyWorkPlanArgs';
 import { agentModeService } from '../services/agentModeService';
+import { APPROVAL_KIND_RESERVED_PREFIX } from '../services/voice/hotLeadCallApprovalGate';
 import { getAccessToken as getClickUpAccessToken, createTaskInList as createClickUpTaskInList, getListCustomFields as getClickUpListCustomFields, ClickUpTaskError } from '../services/clickupService';
 import { emmaToolRegistry } from './registry';
 import { auditCampaigns } from '../services/adUtmAuditService';
@@ -18,7 +19,7 @@ import { chatbotDb } from '../services/chatbotService';
 import { incrementUserTokenUsage } from '../services/tokenUsageService';
 import { getExecutionsWithAssets } from '../routes/tasks';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
-import { getUserFunnelStatusIssueTags, getUserFunnelStatusLabel } from '../utils/userFunnelStatus';
+import { getUserFunnelStatusIssueTags, getUserFunnelStatusLabel, USER_FUNNEL_STATUS_VALUES } from '../utils/userFunnelStatus';
 import { humanEvalService, HumanEvalReviewType } from '../services/humanEvalService';
 import { enqueueAutoHumanEval, claimArtifactForHumanEval, releaseArtifactClaim } from '../services/autoHumanEvalService';
 import { type AskUserQuestionOption } from '../services/agentMode/core/askUserQuestion';
@@ -124,6 +125,8 @@ import * as miscImpl from './impl/misc';
 // Register browser cookie persistence tools
 import './browserCookieTools';
 import './leadNotificationTools';
+import './hotLeadCallTools';
+import './hotLeadCallSetupTools';
 
 // Register email lookup / find tool (provider-agnostic)
 import './emailLookupTool';
@@ -248,6 +251,8 @@ emmaToolRegistry.register({
 // only widens Emma's OWN judgment-based use of the card within Meta; it does
 // not add a new hard-enforced gate for other Meta entities — that requires its
 // own dedicated gate, built the same way ENG-400 was, per irreversible action.
+const RESERVED_QUESTION_KIND_PREFIXES = [APPROVAL_KIND_RESERVED_PREFIX];
+
 emmaToolRegistry.register({
   name: 'ask_user_question',
   definition: {
@@ -308,6 +313,11 @@ If the user replies with a TYPED message instead of clicking an option, that ope
     const sessionId = context?.sessionId;
     if (!sessionId) {
       return { success: false, message: 'ask_user_question requires an active session.' };
+    }
+    // Cards with these kinds are written only by their own gate; a model-authored card could otherwise
+    // pass for the approval a gate waits for.
+    if (typeof args.kind === 'string' && RESERVED_QUESTION_KIND_PREFIXES.some(prefix => args.kind.startsWith(prefix))) {
+      return { success: false, message: `kind "${args.kind}" is reserved for a built-in approval card. Omit kind or use another value.` };
     }
     // Normalize incoming options: assign a stable id when the model omitted one —
     // same normalization present_question_deck's execute() applies.
@@ -6018,7 +6028,7 @@ emmaToolRegistry.register({
   name: "read_file_content",
   definition: {
     name: "read_file_content",
-    description: 'Read and extract text content from a file URL. Supports text files, PDFs, HTML, Markdown, CSV, Excel/XLSX spreadsheets, Word documents (docx, doc), and other common formats. Do NOT use this for image files (jpg, jpeg, png, gif, webp) — use describe_image instead. For SVG source markup, text labels, or dimensions, use this tool; use describe_image for visual analysis of SVGs. Do NOT use this for video files (mp4, mov, avi, webm, mkv) — use describe_video instead.',
+    description: 'Read and extract text content from a file URL. Supports text files, PDFs, HTML, Markdown, CSV, Excel/XLSX spreadsheets, Word documents (docx, doc), and other common formats. Do NOT use this for image files (jpg, jpeg, png, gif, webp) — use describe_image instead. For SVG source markup, text labels, or dimensions, use this tool; use describe_image for visual analysis of SVGs. Do NOT use this for video files (mp4, mov, avi, webm, mkv) — use describe_video instead. Only pass a URL that appears verbatim in the conversation (an Attached Files link or a link the user pasted). NEVER guess or construct a file URL: if the user says a file is attached but the message has no Attached Files link, do not call this tool — reply "I do not see an attachment on that message — please re-attach the file."',
     inputSchema: {
       type: "object",
       properties: {
@@ -7452,6 +7462,80 @@ mcpToolRegistry.register({
   },
 });
 
+mcpToolRegistry.register({
+  name: 'manage_user_funnel_status',
+  definition: {
+    name: 'manage_user_funnel_status',
+    description:
+      'Admin-only: resolve AgentWeb users by email and read, preview, or apply their funnelStatus ' +
+      '(same write as PUT /api/admin/users/:userId/funnel-status). Values are limited to the approved ' +
+      'stage vocabulary or null. Max 50 rows per call; preview first, apply is idempotent and audited ' +
+      '(actor, accountable owner, before, after, timestamp). Returns updated/skipped/unresolved rows.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        mode: { type: 'string', enum: ['read', 'preview', 'apply'], description: 'read current values, preview a change, or apply it.' },
+        rows: {
+          type: 'array',
+          maxItems: 50,
+          items: {
+            type: 'object',
+            properties: {
+              email: { type: 'string' },
+              funnel_status: { type: ['string', 'null'], enum: [...USER_FUNNEL_STATUS_VALUES, null], description: 'Target stage, or null to clear. Required for preview/apply.' },
+            },
+            required: ['email'],
+          },
+        },
+        accountable_owner: { type: 'string', description: 'Human accountable for an apply (defaults to the acting admin).' },
+      },
+      required: ['mode', 'rows'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+    if (context?.externalMcp === true) throw new Error('Admin access required to manage user funnel status');
+    const user = await userDb.getUserById(userId);
+    const delegatedAdmin = context?.isDelegatedAdmin === true;
+    if (user?.isAdmin !== true && !delegatedAdmin) {
+      throw new Error('Admin access required to manage user funnel status');
+    }
+    let actorEmail: string | undefined = delegatedAdmin ? context?.adminEmail : user?.email;
+    // Audit the delegating administrator, not the impersonated target user.
+    let actorUserId: string | undefined = delegatedAdmin ? undefined : userId;
+    if (delegatedAdmin && context?.sessionId) {
+      const session = await chatbotDb.getChatSession(context.sessionId);
+      if (session?.delegateInfo?.isDelegated) {
+        actorEmail ??= session.delegateInfo.adminEmail;
+        actorUserId = session.delegateInfo.adminUserId;
+      }
+    }
+    // The socket sidebar marks real admins isDelegatedAdmin without an adminEmail;
+    // a genuine admin row is its own actor.
+    if (user?.isAdmin === true) {
+      if (!actorEmail) actorEmail = user.email;
+      if (!actorUserId) actorUserId = userId;
+    }
+    if (!actorEmail || !actorUserId) throw new Error('Administrator identity unavailable');
+    const mode = args?.mode;
+    if (mode !== 'read' && mode !== 'preview' && mode !== 'apply') {
+      throw new Error('mode must be read, preview, or apply');
+    }
+    const { runFunnelStatusOperation } = await import('../services/adminFunnelStatusService');
+    const { recordAdminAudit } = await import('../services/adminAuditLog');
+    const owner = typeof args?.accountable_owner === 'string' && args.accountable_owner.trim() ? args.accountable_owner.trim() : actorEmail;
+    return runFunnelStatusOperation(mode, args?.rows, { actorUserId, actorEmail, accountableOwner: owner }, {
+      getUserByEmail: async (email) => {
+        const u: any = await userDb.getUserByEmail(email);
+        return u ? { userId: u.userId, email: u.email, funnelStatus: u.funnelStatus } : undefined;
+      },
+      updateFunnelStatus: (targetUserId, funnelStatus) => userDb.updateUser(targetUserId, { funnelStatus }),
+      audit: (event) => recordAdminAudit(event),
+    });
+  },
+});
+
 const bridgedToolNames = [
   // Scheduled Chat tools
   'list_scheduled_chats',
@@ -7493,6 +7577,7 @@ const bridgedToolNames = [
 const adminToolNames = [
   'manage_linear_governance_label',
   'read_linear_issues',
+  'manage_user_funnel_status',
   'list_predefined_work_plans',
   'manage_predefined_work_plan',
   'list_skills',
@@ -7622,10 +7707,13 @@ emmaToolRegistry.register({
   execute: async (args: any, context?: any) => {
     const { LANDING_PAGE_PREVIEW_BRANCH, runCodingAgent } = await import('../services/codingAgentService');
     const { classifyCodingAgentFailure } = await import('../services/codingAgentFailureClass');
+    // ENG-2648: the chat's model, else the configured system default (agent_mode_default_model) — never a
+    // hard-coded model id, which drifts from the registry and the plan allowlist.
+    const toolModel: string = context?.llmModel || await agentModeService.getDefaultModel();
     const executeMcpTool = context?.service
       ? async (toolName: string, toolArgs: any) => {
         return context.service.executeTool(
-          context.llmModel || 'anthropic.claude-sonnet-4-6',
+          toolModel,
           toolName,
           toolArgs,
           context.userId,
@@ -7645,7 +7733,7 @@ emmaToolRegistry.register({
         pageId: args.page_id,
         userId: context?.userId,
         sessionId,
-        llmModel: context?.llmModel || 'anthropic.claude-sonnet-4-6',
+        llmModel: toolModel,
         socketEmit: context?.socketEmit,
         executeMcpTool,
         draftBranch,
@@ -9474,6 +9562,7 @@ emmaToolRegistry.register({
     name: 'call_hubspot_api',
     description: `Manage HubSpot marketing assets and data via a single unified tool.
 Use entity_type to select the resource, action to select the operation.
+For CONTACT_LIST GET pass list_id as a top-level string (listId/id/guid and id-bearing query objects are accepted aliases). LIST with a list id reads that list; omit ids to enumerate lists. For CAMPAIGN GET/GET_METRICS pass top-level guid (id is accepted). Use CONTACTS + LIST to list contacts.
 
 ENTITY_TYPE + ACTION MATRIX:
 
@@ -9629,8 +9718,11 @@ emmaToolRegistry.register({
 reporting and list-membership workflows.
 
 Attio has no equivalent of HubSpot's marketing-asset concepts (campaigns,
-emails, landing pages, workflows, social broadcasts) — this tool covers only
-lists and list entries, mirroring call_hubspot_api's CONTACT_LIST actions.
+emails, landing pages, workflows, social broadcasts). Supported entity_type values
+are RECORDS, LISTS, LIST_ENTRIES (case-insensitive). Workspace lookup/get_workspace
+is not supported. Use {entity_type:"RECORDS",action:"SEARCH",query:"name or email"}
+or {entity_type:"RECORDS",action:"LIST",object_type:"people"}; PERSON/PEOPLE are
+aliases for RECORDS with object_type people. Pass fields at the top level.
 
 ENTITY_TYPE + ACTION MATRIX:
 
@@ -9643,6 +9735,12 @@ ENTITY_TYPE + ACTION MATRIX:
                REMOVE_ENTRIES removes Person record ids from the list (looks up
                each person's entry in the list and deletes it).
 
+  RECORDS → SEARCH (query, object_type?) | LIST (object_type?, offset?)
+               Read-only People/Company record lookup. SEARCH matches by name
+               (or by email when query contains @) and returns up to 25 records
+               with their recordId — use it to find record_ids for ADD_ENTRIES.
+               object_type: 'people' (default) or 'companies'.
+
   LISTS → LIST | GET (list_id) | CREATE (name, object_type?)
                Whole-list actions. LIST enumerates every list in the workspace.
                CREATE makes a new list (object_type: 'people' or 'companies',
@@ -9652,16 +9750,17 @@ ENTITY_TYPE + ACTION MATRIX:
     inputSchema: {
       type: 'object',
       properties: {
-        entity_type: { type: 'string', enum: ['LIST_ENTRIES', 'LISTS'], description: 'Attio resource to operate on.' },
-        action:      { type: 'string', enum: ['COUNT', 'ADD_ENTRIES', 'REMOVE_ENTRIES', 'LIST', 'GET', 'CREATE'], description: 'Action to perform. See ACTION MATRIX.' },
+        entity_type: { type: 'string', enum: ['RECORDS', 'LIST_ENTRIES', 'LISTS'], description: 'Attio resource to operate on.' },
+        action:      { type: 'string', enum: ['SEARCH', 'COUNT', 'ADD_ENTRIES', 'REMOVE_ENTRIES', 'LIST', 'GET', 'CREATE'], description: 'Action to perform. See ACTION MATRIX.' },
+        query:       { type: 'string', description: 'RECORDS SEARCH only: name, or email address, to look up.' },
         list_id:     { type: 'string', description: 'Required for LIST_ENTRIES COUNT/LIST/ADD_ENTRIES/REMOVE_ENTRIES and LISTS GET. For LIST_ENTRIES actions, pass the AgentWeb lead list\'s id (e.g. from get_lead_lists/get_lead_details) — it is automatically resolved to that list\'s connected Attio deal-list id; a raw Attio list id also works. For LISTS actions, always a raw Attio list id (e.g. from LISTS LIST) — never an AgentWeb list id.' },
         record_ids:  { type: 'array', items: { type: 'string' }, maxItems: 100, description: 'Attio record ids (Person or Company, matching the target list). Required for LIST_ENTRIES ADD_ENTRIES/REMOVE_ENTRIES. Max 100 per call.' },
         offset:      { type: 'integer', description: 'LIST_ENTRIES LIST only: page offset; pass next_offset from the previous page.' },
         name:        { type: 'string', description: 'List display name. Required for LISTS CREATE.' },
-        object_type: { type: 'string', enum: ['people', 'companies'], description: 'What kind of records the new list holds. LISTS CREATE only. Defaults to "people".' },
+        object_type: { type: 'string', enum: ['people', 'companies'], description: 'Record kind for LISTS CREATE and RECORDS SEARCH/LIST. Defaults to "people".' },
         account_id:  { type: 'string', description: 'Attio account ID. Required when the user has multiple Attio accounts connected — the error message will list them; ask the user which to use.' },
       },
-      required: ['entity_type', 'action'],
+      required: ['action'],
     },
   },
   execute: async (args: any, context?: any) => {

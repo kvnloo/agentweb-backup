@@ -453,7 +453,7 @@ describe("claude adapter: a turn", () => {
     expect(Date.now() - t0).toBeGreaterThanOrEqual(600); // 300 ms timeout + the 400 ms kill wait: it waited for the exit before giving up
   });
 
-  it("a kill that keeps failing cannot hang the turn: the result still arrives (bounded stop), and `closed` honestly stays pending", async () => {
+  it("a kill that keeps failing cannot hang the turn: the result still arrives (bounded stop) as TRANSIENT (no auth check runs beside a process that is not gone), and `closed` honestly stays pending", async () => {
     const e = makeEnv();
     e.scenario({ turn: [{ type: "result", subtype: "error", is_error: true, result: "Not logged in · Please run /login" }], status: { loggedIn: false } });
     let allowKill = false;
@@ -471,7 +471,9 @@ describe("claude adapter: a turn", () => {
     void session.closed.then(() => (closed = true));
     const t0 = Date.now();
     const events = await collect(session);
-    expect(events[events.length - 1]).toMatchObject({ type: "result", ok: false, errorKind: "auth_dead" });
+    // The process was not gone in time (it may still be inside its stop grace, writing a refreshed login): `auth status` must not run
+    // beside it, so the failure is reported as transient instead of risking a half-written read or a second refresher.
+    expect(events[events.length - 1]).toMatchObject({ type: "result", ok: false, errorKind: "transient" });
     expect(Date.now() - t0).toBeLessThan(4000);
     expect(closed).toBe(false); // the process could not be killed: not "gone"
     allowKill = true;

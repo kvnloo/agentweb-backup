@@ -17,6 +17,7 @@ import {
   tryClaimSessionGeneration,
   releaseSessionGeneration,
 } from '../controllers/agentModeController';
+import { isAgentWebModelId } from './agentMode/agentWebModelRouter';
 
 /**
  * ENG-1644 Phase D: what "executing" a resolved decision means, per gate
@@ -159,7 +160,9 @@ export async function resumeOriginSession(sessionId: string, messageContent: str
     // ENG-669: the resume was refused because the session's model is outside the owner's plan (only with the tier
     // allowlist on). The note above is model-only context, so tell the user why Emma did not pick the work back up:
     // exactly one saved refusal (reusing the one generateSessionResponse may already have saved) and one live update.
-    if (isModelUnavailableError(err) && err.reason === 'not_in_plan') {
+    // ENG-669 PR-C: likewise when the session's selection is the AgentWeb Model and its router is switched off or
+    // unavailable (any reason). Other models' refusals keep their previous handling (the passive note only).
+    if (isModelUnavailableError(err) && (err.reason === 'not_in_plan' || isAgentWebModelId(err.requestedModel))) {
       const refusal = await recordModelRefusal(sessionId, err);
       if (refusal) {
         try {

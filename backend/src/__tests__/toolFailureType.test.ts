@@ -106,6 +106,19 @@ describe('classifyToolFailureType', () => {
         classifyToolFailureType('Error', "API error (400): 'x@y.com' is not a member of the page owner's organization"),
       ).toBe('by_design');
     });
+    it('classifies a Google Ads serving_chain state report as by_design (ENG-2611)', () => {
+      expect(classifyToolFailureType('Error', '{"customerId":"4149815605","state":"UNVERIFIED","campaigns":[]}')).toBe('by_design');
+      expect(classifyToolFailureType('Error', '{"customerId":"1","state":"BLOCKED_BY_POLICY","blockers":[]}')).toBe('by_design');
+      expect(classifyToolFailureType('Error', '{"customerId":"1","state":"DELIVERY_FAILED"}')).toBe('bug');
+    });
+    it('classifies the LinkedIn identity-mismatch send refusal as by_design (ENG-2619)', () => {
+      const msg =
+        'Refused to send: the LinkedIn profile at https://www.linkedin.com/in/someone does not appear to belong to this lead (Jane Doe, Acme). Profile company differs. Verify or correct the lead\'s LinkedIn URL before contacting them.';
+      expect(classifyToolFailureType('Error', msg)).toBe('by_design');
+      expect(classifyToolFailureType('not_found', msg)).toBe('by_design');
+      expect(classifyToolFailureType('', msg)).toBe('by_design');
+      expect(classifyToolFailureType('not_found', 'Lead not found')).toBe('config');
+    });
     it('classifies a landing-page authorization gap', () => {
       expect(classifyToolFailureType('Error', 'Not authorized to edit this landing page.')).toBe('config');
     });

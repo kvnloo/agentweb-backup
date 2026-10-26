@@ -9,6 +9,7 @@ import { REPLY_LENGTH_FIXTURES_GRADER, REPLY_LENGTH_FIXTURES_VERSION } from '../
 import { CREATIVE_GATES_GRADER_ID, CREATIVE_GATES_VERSION } from '../services/creativeGates';
 import { CREATIVE_RUBRIC_GRADER_ID, CREATIVE_RUBRIC_VERSION } from '../services/creativeRubricJudge';
 import { OUTCOME_RUBRIC_B_VERSION } from '../services/outcomeJudge';
+import { TASK_SUCCESS_JUDGE_GRADER_ID, TASK_SUCCESS_JUDGE_VERSION } from '../services/taskSuccessJudge';
 
 const VERSION_FORMAT = /^(\d+|\d{4}-\d{2}-\d{2}\.[\w.-]+|v\d+|prompt-sha256:[0-9a-f]{12}|untracked@\d{4}-\d{2}-\d{2})$/;
 
@@ -26,6 +27,7 @@ describe('eval registry versions', () => {
       [CREATIVE_GATES_GRADER_ID]: CREATIVE_GATES_VERSION,
       [CREATIVE_RUBRIC_GRADER_ID]: CREATIVE_RUBRIC_VERSION,
       'session-judge-outcome-b-shadow': OUTCOME_RUBRIC_B_VERSION,
+      [TASK_SUCCESS_JUDGE_GRADER_ID]: TASK_SUCCESS_JUDGE_VERSION,
     };
     for (const [id, version] of Object.entries(expected)) {
       expect({ id, version: getGrader(id)?.version }).toEqual({ id, version });

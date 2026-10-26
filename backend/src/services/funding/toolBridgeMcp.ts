@@ -17,7 +17,15 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { CallToolRequestSchema, ListToolsRequestSchema, isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { RunToolTokenClaims } from "./runToolToken";
-import { ToolBridge, ToolBridgeAuthError, type OpenRunOptions } from "./toolBridge";
+import {
+  ToolBridge,
+  ToolBridgeAuthError,
+  type BridgeCallRecord,
+  type BridgeHalt,
+  type CloseAndDrainResult,
+  type OpenRunOptions,
+  type SessionStatus,
+} from "./toolBridge";
 
 /** Claude Code's own id for a tool call, sent in the MCP request's `_meta`. Undocumented; pinned with the binary. */
 export const HARNESS_TOOL_USE_ID_META_KEY = "claudecode/toolUseId";
@@ -58,18 +66,70 @@ export class ToolBridgeMcpAdapter {
     this.bridge.noteCallGroup(runId, callId, groupId);
   }
 
+  /** Pass each tool-use event from the harness's stream here (with the message id when it has one). */
+  noteToolUse(runId: string, callId: string, name: string, input: unknown, messageId?: string): void {
+    this.bridge.noteToolUse(runId, callId, name, input, messageId);
+  }
+
+  /** Pass each tool result that goes back to the model here. */
+  noteToolResult(runId: string, callId?: string): void {
+    this.bridge.noteToolResult(runId, callId);
+  }
+
   closeRun(runId: string): void {
     this.closeSessions(runId);
     this.bridge.closeRun(runId);
   }
 
-  /** Lifts the session's confirmation halt. Only a new turn from the user may trigger this. */
-  clearHalt(sessionId: string): void {
-    this.bridge.clearHalt(sessionId);
+  /** Refuses new calls, waits for those in flight, takes the ledger and halts, then closes the run and its MCP sessions. */
+  async closeRunAndDrain(runId: string, timeoutMs: number): Promise<CloseAndDrainResult | null> {
+    const result = await this.bridge.closeRunAndDrain(runId, timeoutMs);
+    this.closeSessions(runId);
+    return result;
   }
 
-  isHalted(sessionId: string): boolean {
-    return this.bridge.isHalted(sessionId);
+  /** Must be called on every user message. Lifts the halt and starts a new epoch. */
+  beginTurn(userId: string, sessionId: string): { previousUnknownOutcome: boolean } {
+    return this.bridge.beginTurn(userId, sessionId);
+  }
+
+  /** The user pressed Stop. Closes the session's runs and MCP sessions; the caller must also end the host turn gracefully. */
+  cancelSession(userId: string, sessionId: string): { cancelled: boolean; runIds: string[] } {
+    const result = this.bridge.cancelSession(userId, sessionId);
+    for (const runId of result.runIds) this.closeSessions(runId);
+    return result;
+  }
+
+  /** Closes every run funded by this connection, with its MCP sessions. Returns the run ids so host turns can be ended. */
+  revokeConnection(connectionId: string): string[] {
+    const runIds = this.bridge.revokeConnection(connectionId);
+    for (const runId of runIds) this.closeSessions(runId);
+    return runIds;
+  }
+
+  takeLedger(runId: string, opts?: { clear?: boolean }): { records: BridgeCallRecord[]; truncated: number } {
+    return this.bridge.takeLedger(runId, opts);
+  }
+
+  takeLedgerByGeneration(generation: string): { records: BridgeCallRecord[]; truncated: number } {
+    return this.bridge.takeLedgerByGeneration(generation);
+  }
+
+  takeHalts(userId: string, sessionId: string): BridgeHalt[] {
+    return this.bridge.takeHalts(userId, sessionId);
+  }
+
+  sessionStatus(userId: string, sessionId: string): SessionStatus | null {
+    return this.bridge.sessionStatus(userId, sessionId);
+  }
+
+  /** Lifts the session's confirmation halt. Only a new turn from the user may trigger this. Prefer `beginTurn`. */
+  clearHalt(sessionId: string, userId?: string): void {
+    this.bridge.clearHalt(sessionId, userId);
+  }
+
+  isHalted(sessionId: string, userId?: string): boolean {
+    return this.bridge.isHalted(sessionId, userId);
   }
 
   /**
@@ -135,7 +195,7 @@ export class ToolBridgeMcpAdapter {
       };
     });
 
-    server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       const params = request.params;
       const harnessCallId = (params._meta as Record<string, unknown> | undefined)?.[HARNESS_TOOL_USE_ID_META_KEY];
       try {
@@ -147,6 +207,9 @@ export class ToolBridgeMcpAdapter {
             ...(typeof harnessCallId === "string" ? { callId: harnessCallId } : {}),
           },
           runId,
+          // The signal only says the request was dropped (probe: it does not fire when the CLI cuts a
+          // slow call or is killed), so it informs the ledger and nothing else.
+          { signal: extra?.signal },
         );
         return {
           content: [
@@ -165,6 +228,10 @@ export class ToolBridgeMcpAdapter {
 
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
+      // Required: with the SDK's default (SSE-streamed responses) the CLI's initialize handshake
+      // fails and every turn dies in under a second (live probe, ENG-2113). Plain JSON responses
+      // work; they cannot stream progress, which long tools do not need over this route.
+      enableJsonResponse: true,
       onsessioninitialized: (newSessionId: string) => {
         try {
           this.bridge.verify(token, runId);

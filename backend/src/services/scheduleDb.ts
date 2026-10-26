@@ -3,7 +3,7 @@ import { DynamoDB } from 'aws-sdk';
 import { DocumentClient } from 'aws-sdk/clients/dynamodb';
 
 // Get table prefix based on NODE_ENV (defaults to empty string for production)
-const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+import { TABLE_PREFIX } from '../config/constants';
 
 const dynamodb = new DynamoDB.DocumentClient({
   region: 'us-west-2',

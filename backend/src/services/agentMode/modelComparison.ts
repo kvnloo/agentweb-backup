@@ -26,6 +26,7 @@ import {
 } from './compareProviderPolicy';
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'crypto';
 import type { ChatMessage } from '../chatbotService';
+import { AGENTWEB_MODEL_ID } from './modelAccess';
 import { classifyToolErrorClass } from '../../utils/toolErrorClassifier';
 import type { UsageBlockPaygInput } from '../../utils/usageBlockCopy';
 import {
@@ -48,13 +49,21 @@ export const MAX_CONTEXT_CHARS = 24000;
 /** A single replayed turn is cut to this many characters. */
 export const MAX_CONTEXT_MESSAGE_CHARS = 4000;
 /**
- * Per-model output cap. Includes reasoning tokens (reasoning models spend their budget
- * thinking before they answer), so it is deliberately well above a typical answer.
- * 8192 is a compromise (/generate allows far more); tune after a live smoke test with
- * reasoning models, which has NOT been done. A `length` stop is reported as
- * `output_limit`, never offered for selection.
+ * Per-model output cap. It INCLUDES reasoning tokens: OpenRouter counts them against
+ * `max_tokens`, and a model that spends the whole budget thinking returns
+ * `finish_reason: "length"` with empty content while the reasoning is still billed; OpenAI
+ * recommends reserving at least 25,000 tokens for reasoning plus output. The registry sets
+ * no reasoning effort, so each model runs at its provider default (e.g. medium for GPT,
+ * mandatory high for Claude Opus 5.5) — exactly as in chat.
+ *
+ * ENG-2648: 32000, the same ceiling /generate sends to every chat model
+ * (AGENT_MODE_MAX_OUTPUT_TOKENS), so Compare no longer fails with `output_limit` on an
+ * answer the same model gives in chat, and no model is sent a max_tokens that chat does not
+ * already send it. It is a ceiling, not a reservation: models emit only what they need and
+ * metering bills actual usage; COMPARE_TIMEOUT_MS still bounds each call. A `length` stop is
+ * still reported as `output_limit` and never offered for selection.
  */
-export const COMPARE_MAX_OUTPUT_TOKENS = 8192;
+export const COMPARE_MAX_OUTPUT_TOKENS = 32000;
 /** Per-model transport deadline handed to callLLM. */
 export const COMPARE_TIMEOUT_MS = 60_000;
 /** A select token is honored for this long after the compare was issued. */
@@ -82,7 +91,11 @@ export const COMPARE_SYSTEM_PROMPT =
   'You are Emma, AgentWeb\'s assistant, answering in a side-by-side model comparison. ' +
   'You have no tools in this mode: you cannot browse, search, run code, read files, send messages or ' +
   'change anything. Answer the user\'s latest message directly from the conversation and your own ' +
-  'knowledge. If the request needs a tool or live data, say so briefly and answer as far as you can without it.';
+  'knowledge. If the request needs a tool or live data, say so briefly and answer as far as you can without it. ' +
+  // ENG-2648: the answers are shown side by side and rendered as Markdown, so every model must use the same
+  // format (without this, Claude Sonnet 5 answered in HTML tags while the others used Markdown).
+  'Format your answer in Markdown (headings, lists, tables and fenced code blocks where they help); do not use HTML tags. ' +
+  'If the user asks for HTML or other code, put it in a fenced code block.';
 
 export type CompareErrorCode =
   | 'timeout'
@@ -167,6 +180,12 @@ export interface CompareDeps {
    * blocked (also while the tier allowlist is off). Omitted = not gated.
    */
   getTierCompareBlock?(ownerUserId: string): Promise<{ tier: string | null; upgradeRequired: string[] } | null>;
+  /**
+   * ENG-669 PR-C: whether the AgentWeb Model router is on. While it is, `agentweb-model` is refused as a Compare column
+   * (it is a router, not one model; v0 compares concrete models only). Read only when a column names it.
+   * Omitted = off (the id is an unknown model, rejected per column as before).
+   */
+  isAgentWebModelRouterEnabled?(): Promise<boolean>;
   getSession(sessionId: string): Promise<CompareSession | null>;
   checkUsage(userId: string): Promise<CompareUsageStatus>;
   /** Builds the 429 body fields shared with /generate (message + structured usageBlock). */
@@ -616,6 +635,13 @@ export async function compareModels(
   const parsed = validateCompareRequest(input.body);
   if (!parsed.ok) return parsed.outcome;
   const { sessionId, prompt, models } = parsed.value;
+  if (models.includes(AGENTWEB_MODEL_ID) && deps.isAgentWebModelRouterEnabled && await deps.isAgentWebModelRouterEnabled()) {
+    return fail(
+      400,
+      'The AgentWeb Model picks a different model per task, so it cannot be a comparison column. Compare specific models instead.',
+      'agentweb_model_not_comparable',
+    );
+  }
 
   const session = await deps.getSession(sessionId);
   if (!session) return fail(404, 'Session not found', 'session_not_found');

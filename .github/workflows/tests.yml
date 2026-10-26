@@ -144,8 +144,12 @@ jobs:
           bash .github/scripts/dependabot-config.test.sh
           bash .github/scripts/merge-evidence.test.sh
           bash .github/scripts/trunk-deploy-state.test.sh
+          bash .github/scripts/login-host-run-deploy.test.sh
+          bash .github/scripts/login-host-verify-build.test.sh
           bash .github/scripts/deploy-base-sha.test.sh
           bash .github/scripts/deploy-failure-alert.test.sh
+          bash .github/scripts/rollout-note.test.sh
+          bash .github/scripts/deploy-launch-notify.test.sh
           bash .github/scripts/eb-config-conflict.test.sh
           bash .github/scripts/staging-env-override.test.sh
           bash .github/scripts/sha-jest.test.sh
@@ -183,7 +187,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.11'
 

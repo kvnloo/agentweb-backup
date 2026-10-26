@@ -34,7 +34,7 @@ import { computeCostMicroUsd } from './usageRecorderService';
 import type { CacheWriteByTtl } from '../utils/llmPricing';
 import { approvalDb } from './approvalDb';
 import { PendingUserQuestion } from './agentMode/core/askUserQuestion';
-import { PendingApprovalDeck } from './agentMode/core/approvalDeck';
+import { PendingApprovalDeck, type ApprovalDeckAnswer, type ApprovalDeckItem } from './agentMode/core/approvalDeck';
 import { WorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
 import { WorkflowRunState } from './agentMode/core/workflow';
 import { assertSequentialStepCounts } from './workPlanSteps';
@@ -81,6 +81,11 @@ export interface ChatMessage {
   content: string;
   timestamp?: string; // Add direct timestamp field
   llm?: string; // LLM model used for this message (for assistant messages)
+  // ENG-669 PR-C: set when `llm` was chosen by the AgentWeb Model router: the user's selection ('agentweb-model'), the
+  // table rule that picked `llm`, and the table version ("AgentWeb Model · via <llm>").
+  llmSelected?: string;
+  llmRoutingReason?: string;
+  llmRoutingTableVersion?: string;
   name?: string; // For tool messages
   tool_call_id?: string; // For tool messages
   tool_calls?: any[]; // For assistant messages with tool calls
@@ -156,6 +161,10 @@ export interface ChatMessage {
     compareAlternativesOmitted?: 'size';
     /** ENG-113: set on the copied row of a branch created with "Branch with this answer". */
     branchedFromAlternative?: { model: string };
+    /** Approval deck halt: the deck id and its items; the reply message carries approvalDeckAnswer. */
+    pendingApprovalDeckId?: string;
+    approvalDeckItems?: ApprovalDeckItem[];
+    approvalDeckAnswer?: { deckId: string; answers: ApprovalDeckAnswer[] };
     mediaBudgetDeferred?: boolean;      // ENG-1239: set on the tool-role deferral marker AND on the whole-turn-timeout partial-delivery message that reports it, so an unresolved media-batch pause is detectable from the tail of session history alone
   };
 }
@@ -479,6 +488,11 @@ export interface ChatSession {
     modelSelectionReason: string;
     usageMode: 'full_choice' | 'optimized' | 'paused';
     usagePolicyVersion: string | null;
+    // ENG-669 PR-C: present when the selection was the AgentWeb Model (`requestedModel`): the router's provenance for
+    // the concrete `effectiveModel` that ran. The session's llmModel keeps the selection.
+    routedVia?: 'agentweb-model';
+    routingReason?: string;
+    tableVersion?: string;
     recordedAt: string;
   };
   delegateInfo?: {
@@ -2789,6 +2803,8 @@ export class ChatbotDB {
         sessionId,
       },
       UpdateExpression: "SET archived = :archived, adminListPartition = :adminListPartition",
+      // ENG-2644: never upsert a ghost row for an unknown id.
+      ConditionExpression: "attribute_exists(sessionId)",
       ExpressionAttributeValues: {
         ":archived": true,
         ":adminListPartition": "all",
@@ -3306,10 +3322,16 @@ export class ChatbotDB {
     }
   }
 
+  /**
+   * Reassign a session to `newUserId`. With `expectedUserId`, the write only lands while the session
+   * is still owned by that id (ENG-2653: an anonymous session moves to the account that proved it, and
+   * a concurrent transfer cannot overwrite the winner); null means that condition failed.
+   */
   async updateSessionUserId(
     sessionId: string,
-    newUserId: string
-  ): Promise<ChatSession> {
+    newUserId: string,
+    expectedUserId?: string
+  ): Promise<ChatSession | null> {
     // First, get the session to verify it exists
     const session = await this.getChatSession(sessionId);
     if (!session) {
@@ -3317,7 +3339,7 @@ export class ChatbotDB {
     }
 
     // Update the userId
-    const params = {
+    const params: AWS.DynamoDB.DocumentClient.UpdateItemInput = {
       TableName: this.tableName,
       Key: {
         sessionId,
@@ -3326,7 +3348,9 @@ export class ChatbotDB {
       ExpressionAttributeValues: {
         ":userId": newUserId,
         ":adminListPartition": "all",
+        ...(expectedUserId !== undefined ? { ":expectedUserId": expectedUserId } : {}),
       },
+      ...(expectedUserId !== undefined ? { ConditionExpression: "userId = :expectedUserId" } : {}),
       ReturnValues: "ALL_NEW",
     };
 
@@ -3334,6 +3358,7 @@ export class ChatbotDB {
       const result = await dynamodb.update(params).promise();
       return result.Attributes as ChatSession;
     } catch (error) {
+      if (expectedUserId !== undefined && this.isConditionalCheckFailure(error)) return null;
       console.error("Error updating session userId:", error);
       throw error;
     }

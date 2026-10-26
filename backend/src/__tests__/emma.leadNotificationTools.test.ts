@@ -56,7 +56,7 @@ it.each([{}, { userId: '' }, { userId: 123 }])('requires authentication %j', asy
 it('allows org members to read but refuses writes even for global admins', async () => {
   (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'member', orgId: 'org-a', orgRole: 'member', isAdmin: true });
   expect((await get({}, { userId: 'member' })).success).toBe(true);
-  await expect(update({ leadTypes: [] }, { userId: 'member' })).rejects.toThrow('owners and admins');
+  await expect(update({ leadTypes: [] }, { userId: 'member' })).rejects.toThrow('Only org owners and admins can update lead notification settings');
   expect(orgDb.updateOrg).not.toHaveBeenCalled();
 });
 it('allows an org admin to write', async () => {

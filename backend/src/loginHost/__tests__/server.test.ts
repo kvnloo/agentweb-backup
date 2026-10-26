@@ -3,7 +3,7 @@ import { connect } from "net";
 import { existsSync, mkdtempSync, rmSync, statSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { ROUTES, type RouteName } from "../protocol";
+import { PROTOCOL_VERSION, ROUTES, type RouteName } from "../protocol";
 import { SocketInUseError, startHostServer, type HostServerHandle } from "../server";
 import { makeRig, signIn, turnReq, type Rig } from "./helpers";
 
@@ -64,6 +64,30 @@ describe("login host server", () => {
     expect(status.json).toMatchObject({ state: "active", epoch: 1, runningTurns: 0 });
   });
 
+  it("host.info answers with the protocol version, the node version, uptime and the drain/load counters, and nothing else", async () => {
+    const r = await call(sock, "POST", "/v1/host.info", {});
+    expect(r.status).toBe(200);
+    expect(Object.keys(r.json).sort()).toEqual(["drain", "node", "protocol", "running", "signIns", "uptimeSec"]);
+    expect(r.json).toMatchObject({ drain: "off", running: 0, signIns: 0 });
+    expect(r.json).toMatchObject({ protocol: PROTOCOL_VERSION, node: process.version });
+    expect((await call(sock, "POST", "/v1/host.info", { x: 1 })).status).toBe(400); // closed like every route
+  });
+
+  it("host.drain over the unix socket: strict gates new work with a retryable 429, off lifts it, bad input is refused", async () => {
+    await signIn(rig);
+    expect((await call(sock, "POST", "/v1/host.drain", { mode: "strict", ttlSec: 60 })).json).toMatchObject({ ok: true, mode: "strict" });
+    expect((await call(sock, "POST", "/v1/host.info", {})).json).toMatchObject({ drain: "strict" });
+    const refused = await call(sock, "POST", "/v1/turn.run", turnReq("conn1", 1));
+    expect(refused.status).toBe(429);
+    expect(refused.json).toEqual({ error: "EBUSY", detail: "draining" });
+    expect((await call(sock, "POST", "/v1/host.drain", { mode: "off" })).json).toMatchObject({ mode: "off" });
+    expect((await call(sock, "POST", "/v1/turn.run", turnReq("conn1", 1))).status).toBe(200);
+    expect((await call(sock, "POST", "/v1/host.drain", { mode: "sideways" })).status).toBe(400);
+    expect((await call(sock, "POST", "/v1/host.drain", { mode: "soft" })).status).toBe(400); // there is no soft mode
+    expect((await call(sock, "POST", "/v1/host.drain", { mode: "strict", ttlSec: 5 })).status).toBe(400); // below the floor
+    expect((await call(sock, "POST", "/v1/host.drain", { mode: "strict", extra: 1 })).status).toBe(400); // closed like every route
+  });
+
   it("maps host errors to their status codes with a code only", async () => {
     const stale = await call(sock, "POST", "/v1/connection.status", { connectionId: "nope" });
     expect(stale).toMatchObject({ status: 404, json: { error: "ENOTFOUND" } });
@@ -78,6 +102,11 @@ describe("login host server", () => {
     expect((await call(sock, "GET", "/v1/connection.status")).status).toBe(405);
     expect((await call(sock, "POST", "/v1/does.not.exist", {})).status).toBe(404);
     expect((await call(sock, "POST", "/v1/__proto__", {})).status).toBe(404);
+    // An unknown route is NOT "not found": ENOTFOUND means "no such connection" and the backend reads it as "already wiped".
+    const unknown = await call(sock, "POST", "/v1/connection.teleport", {});
+    expect(unknown.json).toEqual({ error: "EINVALID", detail: "route" });
+    expect(unknown.text).not.toContain("ENOTFOUND");
+    expect((await call(sock, "POST", "/v1/__proto__", {})).json).toEqual({ error: "EINVALID", detail: "route" });
     expect((await call(sock, "POST", "/v1/connection.status", { connectionId: "c1" }, { "content-type": "text/plain" })).status).toBe(415);
     expect((await call(sock, "POST", "/v1/connection.status", "{not json")).json).toMatchObject({ error: "EINVALID", detail: "json" });
     const big = await call(sock, "POST", "/v1/turn.run", JSON.stringify({ prompt: "x".repeat(6 * 1024 * 1024) })).catch(() => ({ status: 0, text: "", json: undefined }));
@@ -110,6 +139,8 @@ describe("login host server", () => {
       "connection.enable": { connectionId: "c1", epoch: 1 },
       "connection.revoke": { connectionId: "c1", epoch: 1 },
       "connection.status": { connectionId: "c1" },
+      "host.info": {},
+      "host.drain": { mode: "strict" },
     };
 
     it("every route's base request is valid (so the fuzz below proves the extra field is what fails)", () => {
