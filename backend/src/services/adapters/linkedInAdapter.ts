@@ -21,12 +21,29 @@ function rethrowWithCode(message: string, code?: number): never {
  * LinkedIn Adapter Implementation
  * Handles differences between Personal and Company pages
  */
-// ENG-2663: LinkedIn can reject an access token with 401 "revoked by the user"
-// when it is used right after being minted by a refresh, then accept the same token
-// later (prod: 2026-10-13, 2026-10-25; a public report puts it at seconds to minutes).
-// A 401 creates nothing, so delayed retries are safe and avoid a false "reconnect" alarm.
-// The delays are a defensible guess, not a measured value.
-export const FRESH_TOKEN_RETRY_DELAYS_MS = [10_000, 30_000, 60_000];
+// ENG-2663: LinkedIn can reject an access token with 401 "revoked by the user" when it is
+// used right after being minted by a refresh, then accept the same token later (prod:
+// 2026-10-13, 2026-10-25; a public report puts it at seconds to minutes). A 401 creates
+// nothing, so a retry is safe. The wait is kept short because an interactive user may be
+// blocked on it; if LinkedIn still refuses, callers get FreshTokenRejectedError (retryable,
+// NOT "reconnect") and the agent / executor spread the next attempt over time.
+export const FRESH_TOKEN_RETRY_DELAYS_MS = [10_000];
+
+export class FreshTokenRejectedError extends Error {
+  readonly freshTokenRejected = true;
+  // Declared class (see KNOWN_TOOL_ERROR_CLASSES): yields "Retryable: yes" guidance, not the
+  // terminal "auth" verdict that tells the model to send the user to reconnect.
+  readonly toolErrorClass = 'upstream_5xx';
+  constructor() {
+    super(
+      'LinkedIn temporarily rejected the access that was just renewed for this account, so nothing was published. '
+      + 'This is a temporary LinkedIn-side issue, not a disconnected account - do not ask the user to reconnect. '
+      + 'Wait about a minute and try once more.'
+    );
+    this.name = 'FreshTokenRejectedError';
+  }
+}
+
 // A 401 surfaces either as an axios error or as linkedInService's rethrown plain Error.
 function isLinkedIn401(error: any): boolean {
   return error?.response?.status === 401
@@ -38,8 +55,9 @@ export async function retryIfFreshToken401<T>(wasRefreshed: boolean, call: () =>
     try {
       return await call();
     } catch (error: any) {
+      if (!wasRefreshed || !isLinkedIn401(error)) throw error;
       const delayMs = delaysMs[attempt];
-      if (!wasRefreshed || !isLinkedIn401(error) || delayMs === undefined) throw error;
+      if (delayMs === undefined) throw new FreshTokenRejectedError();
       console.warn(`[LinkedInAdapter] ENG-2663: 401 on a just-refreshed token; retry ${attempt + 1}/${delaysMs.length} in ${delayMs}ms`);
       await new Promise((r) => setTimeout(r, delayMs));
     }
