@@ -1,6 +1,7 @@
 import { classifyTraffic, type TrafficClassification } from './trafficSource';
 import { resolveIngestSessionIdentity, type SessionIdentity } from './sessionList';
 import { isPlausibleListId } from './trackingConfig';
+import { parseSuperProps } from './superProperties';
 
 /**
  * ENG-2315: parsing + row-building for the PUBLIC tracker ingest (POST /api/track/event).
@@ -173,6 +174,10 @@ export function parseIngestBody(body: unknown, nowMs: number, allowList?: EventA
       if (json !== '{}') put('lastCustomProps', json.slice(0, 500));
     }
   }
+
+  // ENG-2689: super properties ride every event, but only lists that opted in with an allow-list store
+  // them, and only under the fixed SUPER_PROPERTIES names.
+  if (allowList) for (const [k, v] of Object.entries(parseSuperProps(b.super))) put(k, v);
 
   const landingUrl = repairEscapedQuery(cleanUrl(b.landingUrl, 1000));
   const referrer = cleanUrl(b.referrer, 1000);

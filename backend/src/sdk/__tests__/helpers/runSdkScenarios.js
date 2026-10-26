@@ -246,6 +246,20 @@ const scenarios = {
     return { sent: bodies(e) };
   },
 
+  superProps() {
+    const e = setup();
+    e.win.awSuper = { funnel_type: 'free_trial', is_login: false, session_intent_score: 3, bad: { x: 1 } };
+    e.load();
+    e.win.awRegister({ funnel_type: 'funnel_review' });
+    e.win.awTrack('cta_click', { cta_name: 'x' });
+    setVisibility(e.win, 'hidden');
+    const stored = e.win.sessionStorage.getItem('aw_s_' + LIST);
+    const second = setup({ sessionSeed: { ['aw_s_' + LIST]: stored } });
+    second.load();
+    second.win.awTrack('next_page');
+    return { sent: bodies(e), second: bodies(second) };
+  },
+
   dntDefault() { const e = setup({ dnt: true }); e.load(); return { sent: bodies(e) }; },
   dntOptIn() {
     const e = setup({ dnt: true, scriptAttrs: 'data-aw-respect-dnt' }); e.load();

@@ -128,6 +128,8 @@ export const AW_SDK_SOURCE: string = String.raw`/* AgentWeb tracker v1. One sess
         Date.now() - st.startMs > SESSION_MAX_AGE_MS || st.startMs > Date.now() + 60000) {
       st = newSession();
     }
+    // ENG-2689: pages viewed this session including this one (super property session_page_num).
+    st.pages = (typeof st.pages === 'number' && st.pages >= 0 ? st.pages : 0) + 1;
     function save() { try { ssSet(sk, JSON.stringify(st)); } catch (e) {} }
     save();
 
@@ -167,6 +169,47 @@ export const AW_SDK_SOURCE: string = String.raw`/* AgentWeb tracker v1. One sess
       return false;
     }
 
+    // ENG-2689: super properties attached to every event. Presets the browser knows, plus whatever the
+    // host page registers with awRegister({...}) (registered values win). The ingest keeps only the names
+    // in its fixed super-property table, typed and bounded, so unknown keys here are harmless.
+    var superReg = {}, superN = 0;
+    function superProps() {
+      var o = {}, k;
+      try {
+        o['#event_time'] = Date.now();
+        o['#lib'] = 'js'; o['#lib_version'] = '1';
+        o['#device_id'] = vid;
+        o['#url'] = String(win.location.href).slice(0, 1000);
+        if (doc.referrer) o['#referrer'] = String(doc.referrer).slice(0, 1000);
+        if (doc.title) o['#title'] = String(doc.title).slice(0, 300);
+        if (nav.userAgent) o['#ua'] = String(nav.userAgent).slice(0, 300);
+        if (nav.language) o['#system_language'] = String(nav.language).slice(0, 2).toLowerCase();
+        if (win.screen && win.screen.width) { o['#screen_width'] = win.screen.width; o['#screen_height'] = win.screen.height; }
+        o['#zone_offset'] = -new Date().getTimezoneOffset() / 60;
+        o.site_domain = String(win.location.hostname).replace(/^www\./, '').slice(0, 120);
+        o.session_page_num = st.pages || 1;
+      } catch (e) {}
+      for (k in superReg) if (Object.prototype.hasOwnProperty.call(superReg, k)) o[k] = superReg[k];
+      return o;
+    }
+    function register(p) {
+      try {
+        if (!p || typeof p !== 'object') return false;
+        for (var k in p) {
+          if (!Object.prototype.hasOwnProperty.call(p, k) || typeof k !== 'string' || k.length > 40) continue;
+          var v = p[k];
+          if (!Object.prototype.hasOwnProperty.call(superReg, k)) { if (superN >= 60) continue; superN++; }
+          if (typeof v === 'string') superReg[k] = v.slice(0, 300);
+          else if (typeof v === 'number' && isFinite(v)) superReg[k] = v;
+          else if (typeof v === 'boolean') superReg[k] = v;
+        }
+        return true;
+      } catch (e) { return false; }
+    }
+    win.awRegister = register;
+    // Registered before the script loaded: window.awSuper = { funnel_type: 'free_trial', ... }
+    try { if (win.awSuper) register(win.awSuper); } catch (e) {}
+
     function baseBody(ev) {
       // clientNowMs: the device clock NOW, so the server can tell a clock that is ahead (its startMs is rejected as
       // future until the clock catches up, which would move the session to a new row mid-session) from a normal one.
@@ -184,6 +227,7 @@ export const AW_SDK_SOURCE: string = String.raw`/* AgentWeb tracker v1. One sess
       // Cumulative on EVERY event, like journey: the server guards them with eventCount, so a click that
       // is overtaken on the wire by a later event must not be the only carrier of the click log.
       if (st.nclicks) { b.clickCount = st.nclicks; b.clickLog = st.clicks.join(' > ').slice(-4000); }
+      b['super'] = superProps();
       return b;
     }
 
