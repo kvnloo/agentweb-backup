@@ -76,7 +76,7 @@ printf '%s' "${MOCK_SLACK_BODY}" >"$out"; printf '200'
 M
 chmod +x "${TDIR}/bin/"*
 run_full() {
-  PATH="${TDIR}/bin:${PATH}" MOCK_SLACK_BODY="$1" FEATURE_LAUNCHES_CHANNEL=C1 \
+  env -u GITHUB_ACTIONS PATH="${TDIR}/bin:${PATH}" MOCK_SLACK_BODY="$1" FEATURE_LAUNCHES_CHANNEL=C1 \
     BASE_SHA=a COMMIT_SHA=b REPO=o/r RUN_URL=u bash "${SCRIPT}" 2>&1
 }
 out="$(run_full '{"ok":false,"error":"not_in_channel"}')"; rc=$?
