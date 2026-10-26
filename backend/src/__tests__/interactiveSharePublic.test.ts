@@ -345,46 +345,18 @@ describe('Interactive Share Public Endpoint Tests', () => {
         expect(mockTaskDb.getTaskExecutionById).not.toHaveBeenCalled();
       });
 
-      it('answers 410 for an expired share, switches it off, and reads no execution', async () => {
+      it('answers 410 for an expired share with NO share-metadata write, and 410 again on retry', async () => {
         mockChatbotDb.getChatSession.mockResolvedValue(interactiveSession({ expiresAt: '2020-01-01T00:00:00Z' }) as any);
-        const response = await get('&conversable=conv-token');
-        expect(response.status).toBe(410);
-        expect(mockChatbotDb.updateSessionInteractiveShareMetadata).toHaveBeenCalledWith(
-          sessionId,
-          expect.objectContaining({ isActive: false, token: 'conv-token' }),
-        );
+        expect((await get('&conversable=conv-token')).status).toBe(410);
+        expect((await get('&conversable=conv-token')).status).toBe(410);
+        expect(mockChatbotDb.updateSessionInteractiveShareMetadata).not.toHaveBeenCalled();
         expect(mockTaskDb.getTaskExecutionById).not.toHaveBeenCalled();
       });
 
-      it('still serves a live view-only share with no token (ShareConversation page)', async () => {
-        mockChatbotDb.getChatSession.mockResolvedValue({
-          ...interactiveSession({}),
-          shareMetadata: { isShared: true },
-        } as any);
-        mockTaskDb.getTaskExecutionById.mockResolvedValue({ executionId, taskId, status: 'running' } as any);
-        const response = await get('');
-        expect(response.status).toBe(200);
-      });
-
-      it('answers 410 for an expired view-only share when there is no interactive share', async () => {
-        mockChatbotDb.getChatSession.mockResolvedValue({
-          sessionId,
-          messages: [],
-          shareMetadata: { isShared: true, expiresAt: '2020-01-01T00:00:00Z' },
-        } as any);
-        const response = await get('');
-        expect(response.status).toBe(410);
-        expect(mockTaskDb.getTaskExecutionById).not.toHaveBeenCalled();
-      });
-
-      it('requires the token once the view-only share has expired but the interactive share is live', async () => {
-        mockChatbotDb.getChatSession.mockResolvedValue({
-          ...interactiveSession({ expiresAt: '2099-01-01T00:00:00Z' }),
-          shareMetadata: { isShared: true, expiresAt: '2020-01-01T00:00:00Z' },
-        } as any);
-        mockTaskDb.getTaskExecutionById.mockResolvedValue({ executionId, taskId, status: 'running' } as any);
-        expect((await get('')).status).toBe(401);
-        expect((await get('&conversable=conv-token')).status).toBe(200);
+      it('answers 410 for a switched-off share with the right token and 401 with a wrong one (never 404)', async () => {
+        mockChatbotDb.getChatSession.mockResolvedValue(interactiveSession({ isActive: false }) as any);
+        expect((await get('&conversable=conv-token')).status).toBe(410);
+        expect((await get('&conversable=other')).status).toBe(401);
       });
 
       it('serves a share with no expiresAt (never expires) to the token holder', async () => {

@@ -818,9 +818,10 @@ export const getTaskExecutionPublic = async (req: Request, res: Response) => {
 
     // Check if the session is shared (either view-only or interactive)
     const hasViewOnlyShare = session.shareMetadata?.isShared;
-    const hasInteractiveShare = session.interactiveShareMetadata?.isActive;
+    // Metadata without a token was never an openable share (nothing to compare), so it counts as no share.
+    const interactiveShare = session.interactiveShareMetadata?.token ? session.interactiveShareMetadata : undefined;
 
-    if (!hasViewOnlyShare && !hasInteractiveShare) {
+    if (!hasViewOnlyShare && !interactiveShare) {
       return res.status(404).json({ message: 'Session is not shared' });
     }
 
@@ -829,19 +830,19 @@ export const getTaskExecutionPublic = async (req: Request, res: Response) => {
 
     // A live read-only share is public by design (portal ShareConversation page, no credential).
     if (!hasViewOnlyShare || viewOnlyExpired) {
-      if (!hasInteractiveShare || !session.interactiveShareMetadata) {
+      if (!interactiveShare) {
         return res.status(410).json({ message: 'Share link has expired' });
       }
       // ENG-2644: an interactive share is opened with its conversable token, never by the session id alone.
-      // Same expiry + token checks as the /ishare routes in agentModeController.
-      const interactiveShare = session.interactiveShareMetadata;
-      if (new Date() > getInteractiveShareExpiresAt(interactiveShare)) {
-        await chatbotDb.updateSessionInteractiveShareMetadata(sessionId, { ...interactiveShare, isActive: false });
-        return res.status(410).json({ message: 'Interactive share link has expired' });
-      }
+      // Token first, so a retry on an expired or switched-off share answers the same 401/410 every time.
+      // Intentionally NO write on expiry: this read-only route must not deactivate from a stale read (it
+      // could overwrite a share the owner just re-created); the /ishare routes do the switching off.
       const conversable = req.query.conversable;
-      if (!interactiveShare.token || interactiveShare.token !== conversable) {
+      if (interactiveShare.token !== conversable) {
         return res.status(401).json({ message: 'Invalid or expired conversable token' });
+      }
+      if (!interactiveShare.isActive || new Date() > getInteractiveShareExpiresAt(interactiveShare)) {
+        return res.status(410).json({ message: 'Interactive share link has expired' });
       }
     }
 
