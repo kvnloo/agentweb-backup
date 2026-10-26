@@ -227,6 +227,22 @@ describe('Agent Mode Controller - getShareOgMetadata', () => {
     expect(res.json).toHaveBeenCalledWith({ title: 'Both shares', description: 'Hello' });
   });
 
+  it('returns 410 for an expired read-only share even when the request carries a valid iShare token', async () => {
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+      sessionId: 'session-1',
+      title: 'Expired read-only',
+      messages: [{ role: 'user', content: 'Hello' }],
+      shareMetadata: { isShared: true, expiresAt: '2000-01-01T00:00:00Z' },
+      interactiveShareMetadata: { isActive: true, token: 'tok-1', expiresAt: '2099-01-01T00:00:00Z' },
+    });
+    const res = mockResponse();
+
+    await agentModeController.getShareOgMetadata(mockRequest('session-1', { conversable: 'tok-1' }), res);
+
+    expect(res.status).toHaveBeenCalledWith(410);
+    expect(res.json).toHaveBeenCalledWith({ error: 'Share link has expired' });
+  });
+
   // ENG-2654: the description comes from what the share page shows, not raw messages (ENG-2163 admin-turn filter).
   it('never uses an admin-tainted prompt as the description', async () => {
     (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({

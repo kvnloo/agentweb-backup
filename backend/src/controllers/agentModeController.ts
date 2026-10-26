@@ -18,6 +18,7 @@ import {
   narrowSkillsForShareViewer,
   toConversableShareMessages,
   toIShareFeedbackResponse,
+  toReadOnlyShareMessages,
 } from '../utils/shareViewerSerializers';
 import { ABOUT_AGENTWEB_TEAM, getUnattendedExecutionDirective } from '../docs/agentModeSystemPrompt';
 import { chatbotDb, updateTaskExecutionStatus, ChatMessage, getEmmaSystemContext } from '../services/chatbotService';
@@ -17707,10 +17708,12 @@ export const agentModeController = {
       // First user message the share viewer would see. ENG-2654: same filter as getSharedConversation, so a
       // delegated admin's prompt (ENG-2163 admin-tainted turn) never becomes the preview text.
       let description = 'View this conversation on AgentWeb';
-      const firstUserMessage = redactMessagesForShareViewer(filterMessagesForClient(session.messages, { omitBranchOrigin: true }))
+      // ENG-2645 serializers, picked by share type, so the preview is never richer than the share page.
+      const viewerMessages = filterMessagesForClient(session.messages, { omitBranchOrigin: true });
+      const firstUserMessage = (hasViewOnlyShare ? toReadOnlyShareMessages(viewerMessages) : toConversableShareMessages(viewerMessages))
         .find((m: any) => m && m.role === 'user' && typeof m.content === 'string');
       if (firstUserMessage) {
-        const content = firstUserMessage.content.trim();
+        const content = String(firstUserMessage.content).trim();
         description = content.length > 160 ? content.substring(0, 157) + '...' : content;
       }
 
