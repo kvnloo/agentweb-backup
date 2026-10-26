@@ -29,6 +29,8 @@ export class CounterIds implements IdGen {
 export class FakeFs implements UserFsPort {
   dirs = new Set<string>();
   killed: number[] = [];
+  /** The uids killAll was asked to kill HARD (no grace). */
+  killedHard: number[] = [];
   wipes: string[] = [];
   residue = new Map<number, number>();
   failWipes = false;
@@ -36,6 +38,8 @@ export class FakeFs implements UserFsPort {
   killGate?: Promise<void>;
   /** killAll throws once. */
   failKillOnce = false;
+  /** killAll throws this many more times (each call counts). */
+  failKills = 0;
   /** promoteAttempt throws before doing anything. */
   failPromote = false;
   /** promoteAttempt moves the directory and THEN throws: the shape of a crash between the rename and the save. */
@@ -97,10 +101,15 @@ export class FakeFs implements UserFsPort {
     this.log.push(`wipe:home:${uid}`);
     this.onWipe?.();
   }
-  async killAll(uid: number): Promise<void> {
+  async killAll(uid: number, opts?: { hard?: boolean }): Promise<void> {
+    if (opts?.hard) this.killedHard.push(uid);
     if (this.killGate) await this.killGate;
     if (this.failKillOnce) {
       this.failKillOnce = false;
+      throw new Error("kill failed");
+    }
+    if (this.failKills > 0) {
+      this.failKills--;
       throw new Error("kill failed");
     }
     this.killed.push(uid);

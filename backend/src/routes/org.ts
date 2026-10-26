@@ -1051,6 +1051,7 @@ router.patch("/:orgId/members/:memberId/role", async (req: Request, res: Respons
     }
 
     await userDb.updateUser(memberId, { orgRole: role });
+    console.log(`[org-role-change] org=${orgId} member=${memberId} ${member.orgRole ?? "none"} -> ${role} by=${userId}`);
     return res.json({ success: true, message: `Member role set to ${role}`, role });
   } catch (error) {
     console.error("Error changing member role:", error);
