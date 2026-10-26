@@ -58,7 +58,7 @@ export function paygInvoiceCreatedEmailCopy(input: { month: string; percentOfCap
       `In ${label} your team kept working past the AI usage included in your plan, using ${percent}% of the highest extra usage limit you had set that month.`,
       input.paid
         ? 'Stripe has issued an invoice for that usage, and it has already been paid. The invoice shows the amount.'
-        : 'Stripe has issued an invoice for that usage and will charge the payment method on file. The invoice shows the amount.',
+        : 'Stripe has issued an invoice for that usage and will charge the payment method on file. The invoice shows the amount. Stripe will also email you a receipt for the payment.',
     ],
     invoiceLinkLabel: 'View your invoice',
     settingsLinkLabel: 'Review your extra usage settings',
