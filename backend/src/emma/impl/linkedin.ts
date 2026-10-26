@@ -631,6 +631,8 @@ export async function linkedinRepost(userId: string, accountId: string, postUrn:
       toolContext?.assertPublishStillAuthorized
     );
 
+    if (result.success === false) return { success: false, message: result.message };
+
     return {
       success: true,
       message: result.message,
@@ -740,6 +742,8 @@ export async function commentOnLinkedInPost(userId: string, accountId: string, p
         currentAccount, postUrn, commentText, userId, parentCommentUrn,
         toolContext?.assertPublishStillAuthorized
       );
+
+      if (result.success === false) return { success: false, message: result.message };
 
       return {
         success: true,
