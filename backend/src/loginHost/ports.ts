@@ -36,7 +36,8 @@ export interface UserFsPort {
   wipeAttempt(uid: number, attemptRef: string): Promise<void>;
   wipeHome(uid: number, homeRef: string): Promise<void>;
   /** Kill every process running as `uid` and wait until none is left. */
-  killAll(uid: number): Promise<void>;
+  /** `hard`: SIGKILL at once, no grace (revoke and the hazard alarm: the home is wiped right after and nothing may keep running). */
+  killAll(uid: number, opts?: { hard?: boolean }): Promise<void>;
   /** Number of files owned by `uid` left in shared temp locations (/tmp, /dev/shm, /var/tmp). Must be 0 before a uid is freed. */
   residueCount(uid: number): Promise<number>;
 }

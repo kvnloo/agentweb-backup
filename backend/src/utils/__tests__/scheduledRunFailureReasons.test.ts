@@ -36,6 +36,23 @@ describe('describeScheduledRunFailureReasons (ENG-1735)', () => {
     expect(reasons.join('|')).toMatch(/LinkedIn/);
   });
 
+  // ENG-2662: "Harsha Daily X Post (Autonomous)" called twitter_outreach, then never
+  // called post_on_connected_account across all 3 presses. The alert must say the
+  // model withheld the named publish tool, not just that a budget ran out.
+  it('names the withheld publish tool and that the model held it, not a budget bug', () => {
+    const reasons = describeScheduledRunFailureReasons({
+      ...base,
+      publishHeldForApproval: true,
+      functionCallMisses: ['post_on_connected_account'],
+      attempts: 3,
+    });
+    const joined = reasons.join('|');
+    expect(joined).toMatch(/publish press budget exhausted with the publish tool uncalled/);
+    expect(joined).toMatch(/post_on_connected_account/);
+    expect(joined).toMatch(/withheld/);
+    expect(joined).toMatch(/after 3 attempt/);
+  });
+
   it('adds no generic reason when misses already explain the failure', () => {
     expect(describeScheduledRunFailureReasons({ ...base, functionCallMisses: ['google_ads_manage'] })).toEqual([]);
   });

@@ -267,6 +267,19 @@ function setup(row: Record<string, unknown> = ownerRow(), opts: { switchOn?: boo
 }
 
 beforeEach(() => {
+  // "Today" is pinned to the fixtures' day (3 Oct 2026, so the month being settled is September). The sweep
+  // is calendar-sensitive (it does nothing on day 1 of a month, and settles the PREVIOUS month) and the
+  // service stamps `new Date()` into its records, so the fixtures' fixed day offsets only mean what they say
+  // if today is fixed too. Unpinned, the suite failed on the last ~9 days of every month. Only Date is
+  // faked: timers, ticks and promises stay real.
+  jest.useFakeTimers({
+    now: new Date('2026-10-03T12:00:00.000Z'),
+    doNotFake: [
+      'hrtime', 'nextTick', 'performance', 'queueMicrotask', 'requestAnimationFrame', 'cancelAnimationFrame',
+      'requestIdleCallback', 'cancelIdleCallback', 'setImmediate', 'clearImmediate', 'setInterval', 'clearInterval',
+      'setTimeout', 'clearTimeout',
+    ],
+  });
   jest.clearAllMocks();
   jest.restoreAllMocks();
   mockStripeState.invoices.clear();
@@ -279,6 +292,10 @@ beforeEach(() => {
   mockStripe.invoicePayments.list.mockReset().mockResolvedValue({ data: [] });
   process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = 'true';
   spend(130);
+});
+
+afterEach(() => {
+  jest.useRealTimers();
 });
 
 afterAll(() => {
