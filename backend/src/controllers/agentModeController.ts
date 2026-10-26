@@ -13330,19 +13330,21 @@ export const agentModeController = {
 
       // Verify session exists and conversable token is valid
       const session = await chatbotDb.getChatSession(shareId);
-      if (!session || !session.interactiveShareMetadata?.isActive) {
+      if (!session || !session.interactiveShareMetadata) {
         return res.status(404).json({ error: 'Session not found' });
       }
 
       // ENG-2644: the token used to be required but never compared, so anyone who knew the id of an
-      // interactively shared chat could cancel its owner's run. Same check as the other /ishare routes.
+      // interactively shared chat could cancel its owner's run. The token is checked first so a retry on an
+      // expired or switched-off share answers the same 401/410 every time, never a 404.
       const interactiveShare = session.interactiveShareMetadata;
-      if (new Date() > getInteractiveShareExpiresAt(interactiveShare)) {
-        await chatbotDb.updateSessionInteractiveShareMetadata(shareId, { ...interactiveShare, isActive: false });
-        return res.status(410).json({ error: 'Interactive share link has expired' });
-      }
-      if (interactiveShare.token !== conversable) {
+      if (!interactiveShare.token || interactiveShare.token !== conversable) {
         return res.status(401).json({ error: 'Invalid or expired conversable token' });
+      }
+      // Intentionally NO write on expiry: stop only cancels a run. Deactivating from this stale read could
+      // overwrite a share the owner just re-created, and the other /ishare routes do the switching off.
+      if (!interactiveShare.isActive || new Date() > getInteractiveShareExpiresAt(interactiveShare)) {
+        return res.status(410).json({ error: 'Interactive share link has expired' });
       }
 
       // Signal cancellation
