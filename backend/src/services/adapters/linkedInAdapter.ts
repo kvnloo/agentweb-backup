@@ -720,13 +720,9 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
 
   async verifyToken(account: ConnectedAccount): Promise<boolean> {
     try {
-      // getValidToken only checks the expiry timestamp / refreshes; a token the
-      // member revoked in LinkedIn still looks unexpired (and even refreshes), so
-      // ask LinkedIn whether it is actually honored (ENG-2663).
-      const { token } = await this.getValidToken(account);
-      const { clientId, clientSecret } = await getLinkedInConfig();
-      const result = await linkedInService.introspectToken(token, clientId, clientSecret);
-      return result.active;
+      // getValidToken handles expiry checks, refreshing, and DB updates
+      await this.getValidToken(account);
+      return true;
     } catch (error) {
       console.warn('[LinkedInAdapter] specific token verification failed:', error);
       return false;

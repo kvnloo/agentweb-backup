@@ -1055,38 +1055,6 @@ export class LinkedInService {
   }
 
   /**
-   * Ask LinkedIn whether an access token is still honored (RFC 7662 introspection).
-   * Unlike the userinfo probe this needs no OpenID scope, so it works for every
-   * connected account. `active: false` is definitive (revoked/expired); anything
-   * inconclusive (network, throttling, endpoint refusing us) is `uncertain` and
-   * reported active so a LinkedIn blip never marks a healthy account dead.
-   */
-  async introspectToken(
-    accessToken: string,
-    clientId: string,
-    clientSecret: string
-  ): Promise<{ active: boolean; status?: string; uncertain?: boolean }> {
-    try {
-      const response = await axios.post(
-        'https://www.linkedin.com/oauth/v2/introspectToken',
-        new URLSearchParams({ token: accessToken, client_id: clientId, client_secret: clientSecret }).toString(),
-        {
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          timeout: 5000,
-        }
-      );
-      const data = response.data as { active?: unknown; status?: string };
-      if (typeof data?.active !== 'boolean') {
-        return { active: true, uncertain: true };
-      }
-      return { active: data.active, status: data.status };
-    } catch (error: any) {
-      console.warn('[LinkedIn introspectToken] Inconclusive:', error.response?.status || error.code || error.message);
-      return { active: true, uncertain: true };
-    }
-  }
-
-  /**
    * Verify if an access token is still valid by making an API call
    * Uses the lightweight userinfo endpoint for personal tokens
    * @returns Object with valid status, optional error message, and uncertain flag (Fix #6)
