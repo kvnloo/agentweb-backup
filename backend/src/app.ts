@@ -319,7 +319,9 @@ const corsOptions = {
   // useTokenUsage hook cache-busts /api/subscription/usage with those request
   // headers; cross-origin (app.agentweb.pro -> api.agentweb.pro) the browser
   // preflights them and, if absent here, blocks the fetch so the meter never loads.
-  allowedHeaders: ["Content-Type", "Authorization", "Cache-Control", "Pragma"],
+  // ENG-2650: X-Review-Token carries the result-endpoint reviewer capability
+  // from the portal's /review/:sessionId page to the /review API routes.
+  allowedHeaders: ["Content-Type", "Authorization", "Cache-Control", "Pragma", "X-Review-Token"],
   // ENG-2418: GET /api/tasks/executions/with-images returns paging metadata in
   // headers; cross-origin the portal can only read them if they are exposed.
   exposedHeaders: ["X-Total-Tasks", "X-Next-Cursor"],

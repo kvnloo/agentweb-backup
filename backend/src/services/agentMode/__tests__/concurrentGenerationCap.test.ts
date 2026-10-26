@@ -69,6 +69,24 @@ describe('concurrentGenerationCap (ENG-110)', () => {
     expect(__activeGenerationCountForTests('u1')).toBe(1);
   });
 
+  // ENG-2648: an answer/cancel turn may exceed the limit, but only up to limit x2.
+  it('a continuesPausedTurn slot is admitted above the limit up to the hard ceiling (limit x2), then refused holding nothing', async () => {
+    setLimit('2');
+    for (const s of ['s1', 's2']) expect((await acquireInteractiveGenerationSlot('u1', s)).ok).toBe(true);
+    expect((await acquireInteractiveGenerationSlot('u1', 's3')).ok).toBe(false);
+    for (const s of ['p1', 'p2']) expect((await acquireInteractiveGenerationSlot('u1', s, { continuesPausedTurn: true })).ok).toBe(true);
+    const refused = await acquireInteractiveGenerationSlot('u1', 'p3', { continuesPausedTurn: true });
+    expect(refused).toEqual({ ok: false, limit: 4, current: 4 });
+    expect(__activeGenerationCountForTests('u1')).toBe(4);
+    // Its own session is never counted against it.
+    expect((await acquireInteractiveGenerationSlot('u1', 'p1', { continuesPausedTurn: true })).ok).toBe(true);
+  });
+
+  it('a continuesPausedTurn slot is unlimited when the limit is 0', async () => {
+    setLimit('0');
+    for (let i = 0; i < 10; i++) expect((await acquireInteractiveGenerationSlot('u1', `p${i}`, { continuesPausedTurn: true })).ok).toBe(true);
+  });
+
   it('cleans up the user entry when the last slot is released', async () => {
     const a = await acquireInteractiveGenerationSlot('u1', 's1');
     (a as any).release();

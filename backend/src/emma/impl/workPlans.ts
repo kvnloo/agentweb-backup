@@ -259,6 +259,8 @@ import { buildAnonymousModelUnavailableBody, buildAnonymousPlanModelToolMessage,
 import type { GatewayTaskClass } from '../../utils/openRouterGatewayContract';
 import type { LLMUsageContext } from '../../utils/llmService';
 import { isAgentWebModelId } from '../../services/agentMode/agentWebModelRouter';
+import { buildResultDeliveryEmailHtml, buildReviewUrl, isValidRecipientEmail } from '../../services/resultEndpointReview';
+import { escapeHtml } from './shared/htmlEscaping';
 
 /**
  * ENG-1816 F2 follow-up: a production session reported "No work plan found in
@@ -1608,10 +1610,8 @@ export async function sendForReview(
     };
     await chatbotDb.updateSessionResultEndpointMetadata(sessionId, updatedMetadata);
 
-    const reviewUrl = `${customerFrontendUrl}/review/${sessionId}`;
-
     // --- skipReview mode: auto-send to lead, CC reviewer ---
-    if (metadata.skipReview && metadata.leadEmail) {
+    if (metadata.skipReview && metadata.leadEmail && isValidRecipientEmail(metadata.leadEmail)) {
       const { resendService: resendSvc } = await import('../../services/resendService');
       const { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } = await import('../../config');
 
@@ -1633,41 +1633,10 @@ export async function sendForReview(
       const resultLabel = metadata.resultTitle || metadata.resultName || 'your report';
       const replyToAddr = reviewerEmail || RESEND_SYSTEM_EMAIL;
 
-      // Build asset block
-      let assetBlock = '';
-      if (assetUrl) {
-        if (assetUrl.match(/\.(png|jpg|jpeg|gif|webp)$/i) || assetUrl.includes('image')) {
-          assetBlock = `<p style="text-align: center;"><img src="${assetUrl}" alt="${resultLabel}" style="max-width: 100%; border-radius: 8px;" /></p>`;
-        } else if (assetUrl.match(/\.(mp4|webm|mov)$/i) || assetUrl.includes('video')) {
-          assetBlock = `<div style="text-align: center; margin: 20px 0;"><a href="${assetUrl}" style="background: linear-gradient(90deg, #643B7E 0%, #6F3DFD 100%); color: white; padding: 12px 30px; text-decoration: none; border-radius: 6px; display: inline-block; font-weight: bold;">Watch Video</a></div>`;
-        } else {
-          assetBlock = `<div style="text-align: center; margin: 20px 0;"><a href="${assetUrl}" style="background: linear-gradient(90deg, #643B7E 0%, #6F3DFD 100%); color: white; padding: 12px 30px; text-decoration: none; border-radius: 6px; display: inline-block; font-weight: bold;">View Your Result</a></div>`;
-        }
-      }
+      // ENG-2650: same escaped template as POST /review/:sessionId/send.
+      const leadEmailHtml = buildResultDeliveryEmailHtml({ resultLabel, replyTo: replyToAddr, assetUrl });
 
-      // Formal email to lead, CC reviewer
-      const leadEmailHtml = `
-        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
-          <div style="text-align: center; margin-bottom: 30px;">
-            <h1 style="color: #1B2549; margin: 0;">AgentWeb</h1>
-            <p style="color: #666; margin: 5px 0;">${resultLabel}</p>
-          </div>
-          <div style="background: #f8f9fa; padding: 30px; border-radius: 8px; margin-bottom: 20px;">
-            <h2 style="color: #1B2549; margin-top: 0;">Your ${resultLabel} is Ready!</h2>
-            <p style="color: #333; line-height: 1.6;">We're excited to send you the requested ${resultLabel}. Our team has prepared this content specifically for you.</p>
-            ${assetBlock}
-            <p style="color: #333; line-height: 1.6; margin-top: 20px;">
-              If you have any questions or would like to request changes, simply reply to this email or reach out to us at
-              <a href="mailto:${replyToAddr}" style="color: #643B7E; text-decoration: none;">${replyToAddr}</a>
-              and we'll be happy to assist.
-            </p>
-          </div>
-          <div style="text-align: center; color: #666; font-size: 12px;">
-            <p>Powered by <a href="https://agentweb.pro" style="color: #643B7E; text-decoration: none;">AgentWeb</a></p>
-          </div>
-        </div>`;
-
-      const leadSubject = metadata.contentSubject || `Your ${resultLabel} is ready`;
+      const leadSubject = (metadata.contentSubject || `Your ${resultLabel} is ready`).replace(/[\r\n]+/g, ' ');
       await resendSvc.sendEmail({
         from: `${RESEND_SYSTEM_NAME} <${RESEND_SYSTEM_EMAIL}>`,
         to: metadata.leadEmail,
@@ -1693,40 +1662,46 @@ export async function sendForReview(
     }
 
     // --- Standard review mode: send review email to reviewer ---
+    // ENG-2650: the link carries the per-session reviewer capability token;
+    // the /review API routes reject the bare session id.
+    const reviewUrl = buildReviewUrl(customerFrontendUrl, sessionId);
     const { emailService: emailSvc } = await import('../../services/emailService');
     let contentSection = '';
     if (contentUrl) {
-      contentSection = `<p><a href="${contentUrl}" style="color: #1976d2;">View Generated Content</a></p>`;
+      contentSection = `<p><a href="${escapeHtml(String(contentUrl))}" style="color: #1976d2;">View Generated Content</a></p>`;
     }
     if (contentHtml) {
       contentSection += `<div style="margin: 16px 0; padding: 16px; border: 1px solid #e0e0e0; border-radius: 8px; background: #fafafa;">${contentHtml}</div>`;
     }
 
+    // ENG-2650: trigger args are public input and subject/content_url come from
+    // the model, so every value below is escaped. contentHtml is the generated
+    // content under review and is shown as-is.
     const argsEntries = Object.entries(metadata.args || {});
     const paramsSummary = argsEntries.length > 0
       ? `<table style="width: 100%; border-collapse: collapse; margin: 12px 0;">
           <tr style="background: #f5f5f5;"><th style="text-align: left; padding: 8px; border: 1px solid #e0e0e0;">Parameter</th><th style="text-align: left; padding: 8px; border: 1px solid #e0e0e0;">Value</th></tr>
-          ${argsEntries.map(([k, v]) => `<tr><td style="padding: 8px; border: 1px solid #e0e0e0;">${k}</td><td style="padding: 8px; border: 1px solid #e0e0e0;">${v}</td></tr>`).join('')}
+          ${argsEntries.map(([k, v]) => `<tr><td style="padding: 8px; border: 1px solid #e0e0e0;">${escapeHtml(k)}</td><td style="padding: 8px; border: 1px solid #e0e0e0;">${escapeHtml(String(v))}</td></tr>`).join('')}
         </table>`
       : '';
 
     const reviewHtml = `
       <div style="font-family: Arial, sans-serif; max-width: 700px; margin: 0 auto;">
         <div style="background: #1976d2; color: white; padding: 12px 20px; border-radius: 8px 8px 0 0; font-weight: bold;">
-          Review: ${subject}
+          Review: ${escapeHtml(String(subject))}
         </div>
         <div style="padding: 20px; border: 1px solid #e0e0e0; border-top: none;">
-          <p style="color: #666;">A new result has been generated for "<strong>${metadata.resultTitle || metadata.resultName}</strong>". Please review the content below.</p>
+          <p style="color: #666;">A new result has been generated for "<strong>${escapeHtml(String(metadata.resultTitle || metadata.resultName))}</strong>". Please review the content below.</p>
           ${contentSection}
           ${paramsSummary ? `<h3 style="margin-top: 20px; color: #333;">Parameters</h3>${paramsSummary}` : ''}
-          ${metadata.leadEmail ? `<p><strong>Lead email:</strong> ${metadata.leadEmail}</p>` : ''}
+          ${metadata.leadEmail ? `<p><strong>Lead email:</strong> ${escapeHtml(String(metadata.leadEmail))}</p>` : ''}
           <div style="margin-top: 24px; text-align: center;">
-            <a href="${reviewUrl}" style="display: inline-block; background: #1976d2; color: white; padding: 12px 32px; border-radius: 6px; text-decoration: none; font-weight: bold; font-size: 16px;">Review & Send Result</a>
+            <a href="${escapeHtml(reviewUrl)}" style="display: inline-block; background: #1976d2; color: white; padding: 12px 32px; border-radius: 6px; text-decoration: none; font-weight: bold; font-size: 16px;">Review & Send Result</a>
           </div>
         </div>
       </div>`;
 
-    await emailSvc.sendEmail(reviewerEmail, `Review: ${subject}`, `Review result for ${metadata.resultTitle || metadata.resultName}`, reviewHtml);
+    await emailSvc.sendEmail(reviewerEmail, `Review: ${String(subject).replace(/[\r\n]+/g, ' ')}`, `Review result for ${metadata.resultTitle || metadata.resultName}`, reviewHtml);
     return { success: true, message: `Review email sent to ${reviewerEmail}`, to: reviewerEmail };
 
   } catch (error) {

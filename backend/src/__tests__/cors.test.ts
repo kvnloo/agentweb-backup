@@ -184,6 +184,20 @@ describe('CORS Access-Control-Allow-Methods', () => {
   // request headers. Cross-origin (app.agentweb.pro -> api.agentweb.pro), the browser
   // preflights those headers; if they aren't in Access-Control-Allow-Headers the
   // fetch fails and the meter silently never loads. Guard the allow-list.
+  // ENG-2650: the portal's /review/:sessionId page sends the reviewer capability
+  // token cross-origin in X-Review-Token; without it in the allow-list the
+  // preflight fails and no reviewer can open a review.
+  it('should advertise X-Review-Token in Access-Control-Allow-Headers', async () => {
+    const res = await request(app)
+      .options('/review/sess-1')
+      .set('Origin', allowedOrigin)
+      .set('Access-Control-Request-Method', 'GET')
+      .set('Access-Control-Request-Headers', 'x-review-token');
+
+    const headers = (res.headers['access-control-allow-headers'] || '').toLowerCase();
+    expect(headers).toContain('x-review-token');
+  });
+
   it('should advertise Cache-Control and Pragma in Access-Control-Allow-Headers', async () => {
     const res = await request(app)
       .options('/api/subscription/usage')

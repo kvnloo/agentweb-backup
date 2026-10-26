@@ -261,6 +261,18 @@ function hasLeadingRequestVerb(tokens: Token[], index: number): boolean {
   return false;
 }
 
+/**
+ * Does a key match stop part-way through a dotted version? "5.5" tokenizes to "5" + "5", so for
+ * "use Anthropic: Claude Sonnet 5.5" the key "anthropic claude sonnet 5" (Sonnet 5's id) matched at
+ * "Anthropic" before the scan ever reached "Claude Sonnet 5.5" (ENG-2646). A version is only complete
+ * when the next token is not another number joined to it by a dot.
+ */
+function endsInsideVersion(tokens: Token[], lastIndex: number, text: string): boolean {
+  const last = tokens[lastIndex];
+  const next = tokens[lastIndex + 1];
+  return !!next && isVersionToken(last.text) && /^\d/.test(next.text) && text.slice(last.end, next.start) === '.';
+}
+
 function matchLengthAt(tokens: Token[], index: number, key: string): number {
   const keyTokens = key.split(' ');
   if (index + keyTokens.length > tokens.length) return 0;
@@ -334,6 +346,7 @@ export function findModelMention(
     for (const { key, modelId } of index.keys) {
       const length = matchLengthAt(tokens, i, key);
       if (!length) continue;
+      if (endsInsideVersion(tokens, i + length - 1, messageContent)) continue;
       if (!hasLeadingRequestVerb(tokens, i)) continue;
 
       const sentence = sentenceBoundsAt(tokens, i, messageContent);
