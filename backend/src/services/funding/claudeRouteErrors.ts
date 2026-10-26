@@ -19,7 +19,8 @@ export type ClaudeStopCode =
   | "context_too_large" // the conversation does not fit one request
   | "usage_limit" //      the plan's own usage limit
   | "policy_blocks" //    an organisation policy on the plan makes it unusable for AgentWeb
-  | "turn_failed"; //     anything else the plan run reported
+  | "turn_failed" //     anything else the plan run reported
+  | "invalid_funding_choice"; // the request named a funding choice that is not one we serve
 
 interface StopInfo {
   httpStatus: number;
@@ -42,6 +43,7 @@ const STOPS: Record<ClaudeStopCode, StopInfo> = {
   context_too_large: { httpStatus: 413, retryable: false, message: "This conversation is too long to send to your Claude plan. Start a new chat, or choose another model." },
   usage_limit: { httpStatus: 429, retryable: false, message: "Your Claude plan has reached its usage limit. It will work again when the limit resets, or you can choose another model." },
   policy_blocks: { httpStatus: 409, retryable: false, message: "Your organisation's settings on this Claude plan do not allow it to be used here. Choose another model." },
+  invalid_funding_choice: { httpStatus: 400, retryable: false, message: "That funding choice is not available." },
   turn_failed: { httpStatus: 502, retryable: true, message: "Your Claude plan could not complete this message. Please try again, or choose another model." },
 };
 
