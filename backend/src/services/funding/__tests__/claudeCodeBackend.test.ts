@@ -28,6 +28,7 @@ interface Harness {
   setHost(fn: (req: any, opts: any) => Promise<HostTurnOutcome>): void;
   setLedger(ledger: BridgeCallRecord[], halts?: BridgeHalt[]): void;
   state: { cancelled: boolean; client: boolean; messages: any[]; hostReq?: any };
+  late: BridgeCallRecord[];
 }
 
 function harness(): Harness {
@@ -40,6 +41,8 @@ function harness(): Harness {
   let host: (req: any, opts: any) => Promise<HostTurnOutcome> = async () => done('answer');
   let ledger: BridgeCallRecord[] = [];
   let halts: BridgeHalt[] = [];
+  let runClosedByCancel = false; // the real bridge ends the run on cancelSession: the drain of a closed run answers null
+  const lateRecords: BridgeCallRecord[] = [];
   let n = 0;
   const deps: ClaudeBackendDeps = {
     hostClient: () => (state.client ? ({} as any) : undefined),
@@ -55,10 +58,13 @@ function harness(): Harness {
       beginTurn: () => void calls.push('beginTurn'),
       noteToolUse: (_r, id, name) => void calls.push(`use:${id}:${name}`),
       noteToolResult: (_r, id) => void calls.push(`result:${id}`),
-      closeRunAndDrain: async () => (calls.push('drain'), { settled: true, stillRunning: 0, ledger, ledgerTruncated: 0, halts, generation: 'g' }),
+      closeRunAndDrain: async () => (calls.push('drain'), runClosedByCancel ? null : { settled: true, stillRunning: 0, ledger, ledgerTruncated: 0, halts, generation: 'g' }),
       closeRun: () => void calls.push('closeRun'),
-      cancelSession: () => void calls.push('bridgeCancel'),
+      cancelSession: () => ((runClosedByCancel = true), void calls.push('bridgeCancel')),
       takeHalts: () => halts,
+      takeLedger: () => ({ records: ledger, truncated: 0 }),
+      generationOf: () => 'g',
+      takeLedgerByGeneration: () => ({ records: [...ledger, ...lateRecords], truncated: 0 }),
     },
     executor: {
       registerRun: () => void calls.push('exec:register'),
@@ -73,8 +79,10 @@ function harness(): Harness {
     emptyFallbackText: FALLBACK,
     now: () => 1_000_000,
     newRunId: () => `claude-run-${++n}`,
+    lateWatchPollMs: 5,
+    lateWatchMaxMs: 60,
   };
-  return { deps, calls, persisted, journal, reconnect, registry, state, setHost: (f) => (host = f), setLedger: (l, h = []) => ((ledger = l), (halts = h)) };
+  return { deps, calls, persisted, journal, reconnect, registry, state, late: lateRecords, setHost: (f) => (host = f), setLedger: (l, h = []) => ((ledger = l), (halts = h)) };
 }
 
 const params = (over: Partial<ClaudeTurnParams> = {}): ClaudeTurnParams => ({
@@ -197,6 +205,70 @@ describe('ClaudeCodeBackend', () => {
     });
   });
 
+  describe('what the bridge ledger holds after a Stop closed the run', () => {
+    it('reads the ledger from where the bridge keeps it when the drain of the closed run answers null', async () => {
+      const h = harness();
+      h.setLedger([rec({ toolCallId: 'tc1', name: 'save_note', groupId: 'g', groupIndex: 0, groupOrder: 0 }), rec({ toolCallId: 'tc2', name: 'save_note', groupId: 'g2', groupIndex: 0, groupOrder: 1 })]);
+      h.setHost(async () => (h.registry.cancel('s1'), { kind: 'completed', result: { type: 'result', ok: false, text: '', aborted: 'interrupted' } as any }));
+      await new ClaudeCodeBackend(h.deps).run(params());
+      expect(h.persisted).toHaveLength(1);
+      expect(h.persisted[0].filter((m) => m.role === 'tool')).toHaveLength(2);
+    });
+
+    it('a call that was still executing is saved when it finishes, once, with a note', async () => {
+      const h = harness();
+      const backend = new ClaudeCodeBackend(h.deps);
+      h.setHost(async () => (h.registry.cancel('s1'), { kind: 'completed', result: { type: 'result', ok: false, text: '', aborted: 'interrupted' } as any }));
+      await backend.run(params());
+      expect(h.persisted).toEqual([]); // nothing had settled
+      h.late.push(rec({ toolCallId: 'late1', name: 'live_hold', late: true, cancelledDuringCall: true, groupId: 'g', groupIndex: 0, groupOrder: 0 }));
+      await backend.idle();
+      expect(h.persisted).toHaveLength(1);
+      expect(h.persisted[0].map((m) => m.role)).toEqual(['assistant', 'tool', 'assistant']);
+      expect(h.persisted[0][2]).toMatchObject({ content: expect.stringMatching(/finished after this turn was stopped/), metadata: { kind: 'claude-late-result' } });
+      expect(h.persisted[0][2].metadata.toolCalls).toBeUndefined();
+    });
+
+    it('a call that settled before the Stop is not saved a second time as a late result', async () => {
+      const h = harness();
+      const backend = new ClaudeCodeBackend(h.deps);
+      const settled = rec({ toolCallId: 'tc1', name: 'save_note', late: true });
+      h.setLedger([settled]);
+      h.setHost(async () => (h.registry.cancel('s1'), { kind: 'completed', result: { type: 'result', ok: false, text: '', aborted: 'interrupted' } as any }));
+      await backend.run(params());
+      await backend.idle();
+      expect(h.persisted).toHaveLength(1); // only the settled batch
+    });
+
+    it('does not look for late results when the drain finished cleanly', async () => {
+      const h = harness();
+      const backend = new ClaudeCodeBackend(h.deps);
+      await backend.run(params());
+      h.late.push(rec({ toolCallId: 'x', name: 'save_note', late: true }));
+      await backend.idle();
+      expect(h.persisted).toEqual([]);
+    });
+  });
+
+  describe('journal and tool budgets', () => {
+    it('attributes the journal row to the billing subject the context resolved (the org root for a member)', async () => {
+      const h = harness();
+      h.deps.prepareTurnContext = async () => ({ messages: h.state.messages, billingUserId: 'org-root' });
+      h.setHost(async (_r, opts) => (await opts.onEvent({ type: 'usage', inputTokens: 1, outputTokens: 1 }), done('ok')));
+      await new ClaudeCodeBackend(h.deps).run(params());
+      expect(h.journal[0]).toMatchObject({ userId: 'u1', billingUserId: 'org-root' });
+    });
+
+    it('seeds the per-session web-search count into the executor for this turn', async () => {
+      const h = harness();
+      const begin = jest.fn();
+      h.deps.executor.beginTurn = begin;
+      h.deps.seedSearchCount = () => 7;
+      await new ClaudeCodeBackend(h.deps).run(params({ sessionHistory: [{ role: 'user', content: 'x' }] }));
+      expect(begin).toHaveBeenCalledWith('claude-run-1', { agentRuntimeRunId: 'claude-run-1', priorSearchCallCount: 7 });
+    });
+  });
+
   describe('Stop', () => {
     it('a Stop that landed before the turn started runs nothing on the host', async () => {
       const h = harness();
@@ -273,14 +345,40 @@ describe('ClaudeCodeBackend', () => {
       expect(h.persisted).toHaveLength(1);
     });
 
-    it('an unexpected error still releases the run, the executor and the cancel handle', async () => {
+    it('an unexpected error becomes a typed stop (detail only in the log), after the settled work is kept and everything is released', async () => {
+      const h = harness();
+      h.setLedger([rec({ toolCallId: 'tc1', name: 'save_note' })]);
+      h.setHost(async () => {
+        throw new Error('boom with a secret-ish detail');
+      });
+      const err = await new ClaudeCodeBackend(h.deps).run(params()).catch((e) => e);
+      expect(err).toBeInstanceOf(ClaudeRouteStopError);
+      expect((err as ClaudeRouteStopError).code).toBe('turn_failed');
+      expect(JSON.stringify((err as ClaudeRouteStopError).userMessage)).not.toContain('secret-ish');
+      expect(h.persisted).toHaveLength(1); // the write that ran is not lost
+      expect(h.calls).toEqual(expect.arrayContaining(['drain', 'exec:release']));
+      expect(h.registry.size).toBe(0);
+      expect(h.journal).toEqual([]);
+    });
+
+    it('an error before anything is opened (the context cannot be built) is also a typed stop, and opens nothing', async () => {
+      const h = harness();
+      h.deps.prepareTurnContext = async () => {
+        throw new Error('dynamo down');
+      };
+      expect(await stopCode(new ClaudeCodeBackend(h.deps).run(params()))).toBe('turn_failed');
+      expect(h.calls).toEqual([]);
+    });
+
+    it('a refused second turn never starts a new bridge epoch (it must not stale the running turn\'s halts or calls)', async () => {
       const h = harness();
       h.setHost(async () => {
-        throw new Error('boom');
+        await stopCode(new ClaudeCodeBackend({ ...h.deps, newRunId: () => 'claude-run-2' }).run(params()));
+        return done('ok');
       });
-      await expect(new ClaudeCodeBackend(h.deps).run(params())).rejects.toThrow('boom');
-      expect(h.calls).toEqual(expect.arrayContaining(['closeRun', 'exec:release']));
-      expect(h.registry.size).toBe(0);
+      await new ClaudeCodeBackend(h.deps).run(params());
+      expect(h.calls.filter((c) => c === 'beginTurn')).toHaveLength(1);
+      expect(h.calls.filter((c) => c === 'exec:begin')).toHaveLength(1);
     });
 
     it('a second turn for the same session is refused without touching the first', async () => {

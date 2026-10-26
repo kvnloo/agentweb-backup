@@ -96,6 +96,16 @@ export class ClaudeRunRegistry {
     return n;
   }
 
+  /** Process shutdown: stops every running Claude turn (so the host turns are interrupted before this process exits). Returns how many. */
+  cancelAll(): number {
+    let n = 0;
+    for (const entry of [...this.bySession.values()]) {
+      this.stop(entry);
+      n++;
+    }
+    return n;
+  }
+
   private stop(entry: Entry): void {
     if (entry.cancelled) return; // idempotent: a Stop and a timeout landing together act once
     entry.cancelled = true;

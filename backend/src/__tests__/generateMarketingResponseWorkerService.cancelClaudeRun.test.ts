@@ -31,6 +31,35 @@ describe('cancelSession reaches a running Claude turn', () => {
     expect(abort).not.toHaveBeenCalled();
   });
 
+  describe('shutdown drain', () => {
+    it('waits for a running Claude turn before it finishes, like it waits for worker requests', async () => {
+      let released = false;
+      const handle = claudeRunRegistry.register('s-drain', 'u1', 'c1', { refuseNewCalls: jest.fn(), abort: jest.fn() });
+      registered.push(handle);
+      setTimeout(() => {
+        released = true;
+        handle.release();
+      }, 80);
+      await service.shutdown(3_000);
+      expect(released).toBe(true);
+    });
+
+    it('stops the Claude turns that outlast the ceiling, so the host turns are interrupted before the process exits', async () => {
+      const abort = jest.fn();
+      const refuse = jest.fn();
+      registered.push(claudeRunRegistry.register('s-stuck', 'u1', 'c1', { refuseNewCalls: refuse, abort }));
+      await service.shutdown(60);
+      expect(refuse).toHaveBeenCalledTimes(1);
+      expect(abort).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not wait when no Claude turn is running', async () => {
+      const t0 = Date.now();
+      await service.shutdown(5_000);
+      expect(Date.now() - t0).toBeLessThan(1_000);
+    });
+  });
+
   it('is a no-op for a session with no Claude turn (Emma, as today): nothing forked, nothing thrown', () => {
     expect(() => service.cancelSession('s-emma')).not.toThrow();
     expect(claudeRunRegistry).toBeInstanceOf(ClaudeRunRegistry);

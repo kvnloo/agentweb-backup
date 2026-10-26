@@ -214,6 +214,15 @@ describe('/generate on the Claude plan route', () => {
       expect(worker.runInWorker).not.toHaveBeenCalled();
     });
 
+    it('a plan request is never handed to the worker, even if the backend returns nothing', async () => {
+      backend.mockResolvedValueOnce(undefined);
+      const res = makeRes();
+      await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription' }), res);
+      expect(worker.runInWorker).not.toHaveBeenCalled();
+      expect(res.status).toHaveBeenCalledWith(502);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'turn_failed', funding: 'claude_subscription' }));
+    });
+
     it('a backend stop after the message was saved leaves a fixed-copy note, uses no diagnosis agent and releases the lock', async () => {
       backend.mockRejectedValueOnce(new ClaudeRouteStopError('usage_limit'));
       const res = makeRes();

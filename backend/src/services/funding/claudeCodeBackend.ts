@@ -75,7 +75,7 @@ export interface ClaudeBackendDeps {
     isDelegatedAccess: boolean;
     publishAuthorizationOverride?: undefined;
     isUnattendedRun: boolean;
-  }): Promise<{ messages: any[] }>;
+  }): Promise<{ messages: any[]; billingUserId?: string }>;
   trimToolMessages(messages: any[]): any[];
   runHostTurn(client: LoginHostClient, req: RouteInput<"turn.run">, opts: HostTurnOptions): Promise<HostTurnOutcome>;
   bridge: {
@@ -87,10 +87,14 @@ export interface ClaudeBackendDeps {
     closeRun(runId: string): void;
     cancelSession(userId: string, sessionId: string): unknown;
     takeHalts(userId: string, sessionId: string): BridgeHalt[];
+    /** The run's ledger, still readable after the run was closed (a Stop closes it before the drain). */
+    takeLedger(runId: string): { records: BridgeCallRecord[]; truncated: number };
+    generationOf(runId: string): string | undefined;
+    takeLedgerByGeneration(generation: string): { records: BridgeCallRecord[]; truncated: number };
   };
   executor: {
     registerRun(runId: string, ctx: { llmModel: string; isDelegatedAccess?: boolean; excludeTools?: string[]; screenshotUrl?: string }): void;
-    beginTurn(runId: string, turn: { agentRuntimeRunId?: string }): void;
+    beginTurn(runId: string, turn: { agentRuntimeRunId?: string; priorSearchCallCount?: number }): void;
     releaseRun(runId: string): void;
   };
   registry: ClaudeRunRegistry;
@@ -105,6 +109,11 @@ export interface ClaudeBackendDeps {
   /** Cap for the whole turn; the host deadline is what is left of it. Default 600 s (the controller's generation timeout). */
   turnHardCapMs?: number;
   drainTimeoutMs?: number;
+  /** Web searches the session already used (the per-session cap): `seedSearchCallCountFromHistory`. Default 0. */
+  seedSearchCount?(history: any[]): number;
+  /** How long, and how often, to look for a tool call that was still executing when the turn ended. Defaults: 5 min, 3 s. */
+  lateWatchMaxMs?: number;
+  lateWatchPollMs?: number;
 }
 
 const GRACE_MS = 20_000;
@@ -112,13 +121,35 @@ const MIN_DEADLINE_MS = 30_000;
 
 export const OUTCOME_UNKNOWN_NOTE =
   "I lost the connection to your Claude plan while working on this. It may or may not have finished. Please check the results before asking me to repeat anything.";
+export const LATE_RESULT_NOTE = "The action above finished after this turn was stopped. Please check the result before asking me to repeat it.";
 export const CONFIRMATION_NOTE =
   "That action needs your confirmation before I can go on. Approval cards are not available on your Claude plan yet, so I have stopped here without doing it.";
 
 export class ClaudeCodeBackend {
   constructor(private readonly deps: ClaudeBackendDeps) {}
 
+  private readonly watchers = new Set<Promise<void>>();
+
+  /** Resolves when no late-result watcher is running (shutdown and tests). */
+  async idle(): Promise<void> {
+    while (this.watchers.size > 0) await Promise.allSettled([...this.watchers]);
+  }
+
+  /**
+   * Every failure leaves here as a typed stop. A raw error (a database blip, a bug) is never shown as-is and never reaches the generic error path that
+   * would call the diagnosis agent; the detail goes to the log only.
+   */
   async run(p: ClaudeTurnParams): Promise<ClaudeTurnResult> {
+    try {
+      return await this.runInner(p);
+    } catch (err) {
+      if (err instanceof ClaudeRouteStopError) throw err;
+      console.error("[claude-backend] turn failed:", err instanceof Error ? err.message : String(err));
+      throw new ClaudeRouteStopError("turn_failed");
+    }
+  }
+
+  private async runInner(p: ClaudeTurnParams): Promise<ClaudeTurnResult> {
     const d = this.deps;
     const client = d.hostClient();
     if (!client) throw new ClaudeRouteStopError("host_unavailable");
@@ -136,6 +167,7 @@ export class ClaudeCodeBackend {
       publishAuthorizationOverride: undefined,
       isUnattendedRun: false,
     });
+    p = { ...p, billingUserId: ctx.billingUserId ?? p.billingUserId };
     let prompt: string;
     try {
       prompt = renderPromptForCli(d.trimToolMessages(ctx.messages)).prompt;
@@ -150,12 +182,12 @@ export class ClaudeCodeBackend {
     const startedAt = d.now();
     const ac = new AbortController();
     const uses: Array<{ id: string; name: string }> = [];
-    const seen: { usage?: ClaudeTurnUsage; confirmationFallback: boolean } = { confirmationFallback: false };
+    const seen: { usage?: ClaudeTurnUsage; confirmationFallback: boolean; stopped: boolean } = { confirmationFallback: false, stopped: false };
     let pendingStop: ClaudeRouteStopError | undefined;
+    let rawError: unknown;
     let registered: { release(): void } | undefined;
     let opened = false;
     let executorRegistered = false;
-    let drained: CloseAndDrainResult | null = null;
     let outcome: HostTurnOutcome | undefined;
     let cancelledByUser = false;
 
@@ -175,19 +207,24 @@ export class ClaudeCodeBackend {
         { callGroupWaitMs: 1_500, onHalted: (info) => void (seen.confirmationFallback ||= info.fallbackNeeded) },
       );
       opened = true;
-      d.bridge.beginTurn(p.userId, p.sessionId);
-      d.executor.beginTurn(runId, { agentRuntimeRunId: runId });
 
-      // 4. cancel handle, then the Stop re-check
+      // 4. cancel handle FIRST: a refused second turn must not have touched the running turn's session state (`beginTurn` starts a new epoch and
+      // lifts halts). Then the Stop re-check.
       try {
         registered = d.registry.register(p.sessionId, p.userId, connectionId, {
           refuseNewCalls: () => void d.bridge.cancelSession(p.userId, p.sessionId),
-          abort: () => ac.abort(),
+          abort: () => {
+            seen.stopped = true;
+            ac.abort();
+          },
         });
       } catch (err) {
         if (err instanceof ClaudeRunConflictError) throw new ClaudeRouteStopError("host_busy");
         throw err;
       }
+      d.bridge.beginTurn(p.userId, p.sessionId);
+      d.executor.beginTurn(runId, { agentRuntimeRunId: runId, priorSearchCallCount: d.seedSearchCount?.(p.sessionHistory) ?? 0 });
+
       if (d.isCancelled(p.sessionId)) {
         cancelledByUser = true;
       } else {
@@ -237,22 +274,34 @@ export class ClaudeCodeBackend {
           );
         } catch (err) {
           const stop = fromHostFailure(err);
-          if (!stop) throw err;
-          if (stop.markNeedsReconnect) await d.markNeedsReconnect(connectionId, epoch, "host_denied").catch(() => undefined);
-          pendingStop = stop; // tool work that already ran is real: it is drained and persisted below, then this is thrown
+          if (stop) {
+            if (stop.markNeedsReconnect) await d.markNeedsReconnect(connectionId, epoch, "host_denied").catch(() => undefined);
+            pendingStop = stop; // tool work that already ran is real: it is drained and persisted below, then this is thrown
+          } else {
+            rawError = err; // same: persist what ran, then fail (typed, by run())
+            ac.abort();
+          }
         }
       }
 
-      // 6. wait for in-flight calls, take the ledger
-      drained = await d.bridge.closeRunAndDrain(runId, d.drainTimeoutMs ?? 10_000);
+      // 6. wait for in-flight calls, take the ledger. A Stop (or a revoke) closes the bridge run BEFORE this point, and the drain of a closed run
+      // answers null: the ledger is then read from where the bridge keeps it, never treated as empty.
+      const generation = d.bridge.generationOf(runId);
+      const drained = await d.bridge.closeRunAndDrain(runId, d.drainTimeoutMs ?? 10_000);
       opened = false;
-      const ledger: BridgeCallRecord[] = drained?.ledger ?? [];
+      const ledger: BridgeCallRecord[] = drained ? drained.ledger : d.bridge.takeLedger(runId).records;
+      if (!drained || drained.stillRunning > 0) this.watchLate(p, generation, ledger);
 
       // 7. map
-      if (cancelledByUser || ac.signal.aborted || d.isCancelled(p.sessionId)) {
+      if (seen.stopped || cancelledByUser || d.isCancelled(p.sessionId)) {
         await this.persistSettled(p, ledger);
         await this.journal(p, runId, startedAt, "aborted", seen.usage);
         return { content: "Generation was stopped.", toolCalls: [], knowledgeBaseQueries: [], sources: [], responseMessages: [], persistedResponseCount: 0, cancelled: true };
+      }
+      if (rawError !== undefined) {
+        await this.persistSettled(p, ledger);
+        await this.journal(p, runId, startedAt, "failed", seen.usage);
+        throw rawError;
       }
       if (pendingStop) {
         await this.persistSettled(p, ledger);
@@ -312,6 +361,37 @@ export class ClaudeCodeBackend {
         }
       }
     }
+  }
+
+  /**
+   * A call that was still executing when the turn ended (a Stop mid-write) finishes later and is recorded by the bridge as a late record. Nothing
+   * else would ever show it in the chat, so it is looked for, for a bounded time, and saved with a note. Each call is saved once.
+   */
+  private watchLate(p: ClaudeTurnParams, generation: string | undefined, settled: BridgeCallRecord[]): void {
+    const d = this.deps;
+    if (!generation) return;
+    const pollMs = d.lateWatchPollMs ?? 3_000;
+    const polls = Math.max(1, Math.ceil((d.lateWatchMaxMs ?? 5 * 60_000) / pollMs));
+    const done = new Set(settled.map((r) => r.toolCallId));
+    const task: Promise<void> = (async () => {
+      for (let i = 0; i < polls; i++) {
+        await new Promise<void>((resolve) => {
+          const t = setTimeout(resolve, pollMs);
+          t.unref?.();
+        });
+        const late = d.bridge.takeLedgerByGeneration(generation).records.filter((r) => r.late === true && !done.has(r.toolCallId));
+        if (late.length === 0) continue;
+        for (const r of late) done.add(r.toolCallId);
+        const mapped = mapLedgerToResponseMessages({ ledger: late, finalText: LATE_RESULT_NOTE, llm: p.llmModel, stamps: p.stamps });
+        const note = mapped.responseMessages[mapped.responseMessages.length - 1];
+        note.metadata = { ...note.metadata, kind: "claude-late-result" };
+        delete note.metadata.toolCalls;
+        await d.persistMessages(p.sessionId, mapped.responseMessages);
+      }
+    })()
+      .catch((err) => console.error("[claude-backend] late result watch failed:", err instanceof Error ? err.message : String(err)))
+      .finally(() => void this.watchers.delete(task));
+    this.watchers.add(task);
   }
 
   /** The settled tool work of a turn that has no answer to persist: the pairs, without a final message. */

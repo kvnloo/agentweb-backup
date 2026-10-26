@@ -111,6 +111,11 @@ export class ToolBridgeMcpAdapter {
     return this.bridge.takeLedger(runId, opts);
   }
 
+  /** Id of the run's ledger, valid after the run has been closed (calls that finish late are added to it). */
+  generationOf(runId: string): string | undefined {
+    return this.bridge.generationOf(runId);
+  }
+
   takeLedgerByGeneration(generation: string): { records: BridgeCallRecord[]; truncated: number } {
     return this.bridge.takeLedgerByGeneration(generation);
   }

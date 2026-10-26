@@ -410,10 +410,15 @@ export class GenerateMarketingResponseWorkerService {
 
     const deadline = Date.now() + Math.max(0, ceilingMs);
 
-    while (this.pendingRequests.size > 0 && Date.now() < deadline) {
+    // ENG-2113: a turn on the user's own Claude plan runs in this process, not the worker, so it is not in pendingRequests. It is waited for
+    // the same way (and stopped, gracefully for the host, if the ceiling is reached) so a deploy does not cut it off mid-write.
+    while ((this.pendingRequests.size > 0 || claudeRunRegistry.size > 0) && Date.now() < deadline) {
       await new Promise(resolve => setTimeout(resolve, Math.min(DRAIN_POLL_INTERVAL_MS, Math.max(0, deadline - Date.now()))));
     }
 
+    if (claudeRunRegistry.size > 0) {
+      console.warn(`[Worker] Drain ceiling reached — stopping ${claudeRunRegistry.cancelAll()} Claude plan turn(s)`);
+    }
     if (this.pendingRequests.size > 0) {
       console.warn(`[Worker] Drain ceiling reached — ${this.pendingRequests.size} request(s) still in-flight; force-killing`);
       this.failAllPendingRequests(new Error('Worker shutdown — drain ceiling exceeded'));

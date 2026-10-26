@@ -5,6 +5,7 @@
 import { agentModeService } from "../agentModeService";
 import { chatbotDb } from "../chatbotService";
 import { stripImageDataForPersistence } from "../agentMode/incrementalPersist";
+import { seedSearchCallCountFromHistory } from "../agentMode/core/toolDispatch";
 import { EMPTY_FINAL_RESPONSE_FALLBACK } from "../agentMode/core/termination";
 import { isCancelled } from "../../utils/sseProgress";
 import { ClaudeCodeBackend, newClaudeRunId } from "./claudeCodeBackend";
@@ -36,5 +37,6 @@ export const claudeCodeBackend = new ClaudeCodeBackend({
   emptyFallbackText: EMPTY_FINAL_RESPONSE_FALLBACK,
   now: () => Date.now(),
   newRunId: newClaudeRunId,
+  seedSearchCount: (history) => seedSearchCallCountFromHistory(history as any),
   turnHardCapMs: parseInt(process.env.AGENT_MODE_GENERATION_TIMEOUT_MS || '600000', 10),
 });

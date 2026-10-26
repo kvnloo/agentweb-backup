@@ -10097,23 +10097,26 @@ export async function generateSessionResponse(
   // This allows health checks to continue working during long-running operations
   // ENG-2113: the plan route runs in THIS process through the Claude backend and never reaches the worker below, so it can never end up on AgentWeb's
   // models. Everything the backend cannot do yet is a typed stop or a documented limit, not a fallback.
-  const planResponse = planRoute
-    ? await claudeCodeBackend.run({
-        decision: planRoute,
-        sessionId,
-        userId,
-        messageContent,
-        sessionHistory: sessionHistoryForWorker,
-        llmModel,
-        isDelegatedAccess: effectiveIsDelegatedAccess,
-        screenshotUrl,
-        excludeTools,
-        turnStartMs,
-        stamps: turnRouting as Record<string, unknown> | undefined,
-        onProgress: (progress) => emitProgress(sessionId, progress),
-      })
-    : undefined;
-  const response = planResponse ?? await generateMarketingResponseWorkerService.runInWorker(
+  let planResponse: Awaited<ReturnType<typeof claudeCodeBackend.run>> | undefined;
+  if (planRoute) {
+    planResponse = await claudeCodeBackend.run({
+      decision: planRoute,
+      sessionId,
+      userId,
+      messageContent,
+      sessionHistory: sessionHistoryForWorker,
+      llmModel,
+      isDelegatedAccess: effectiveIsDelegatedAccess,
+      screenshotUrl,
+      excludeTools,
+      turnStartMs,
+      stamps: turnRouting as Record<string, unknown> | undefined,
+      onProgress: (progress) => emitProgress(sessionId, progress),
+    });
+    // Fail closed: a plan request is never handed to the worker, whatever the backend returned.
+    if (!planResponse) throw new ClaudeRouteStopError('turn_failed');
+  }
+  const response = planRoute ? planResponse! : await generateMarketingResponseWorkerService.runInWorker(
     {
       messageContent,
       sessionHistory: sessionHistoryForWorker,

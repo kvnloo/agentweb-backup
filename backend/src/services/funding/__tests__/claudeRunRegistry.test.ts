@@ -106,6 +106,18 @@ describe('ClaudeRunRegistry', () => {
     expect(c.abort).not.toHaveBeenCalled();
   });
 
+  it('cancelAll (process shutdown) stops every running turn once', () => {
+    const r = new ClaudeRunRegistry();
+    const a = hooks();
+    const b = hooks();
+    r.register('s1', 'u1', 'c1', a);
+    r.register('s2', 'u2', 'c2', b);
+    expect(r.cancelAll()).toBe(2);
+    expect(r.cancelAll()).toBe(2); // idempotent per entry: the hooks do not run twice
+    expect(a.abort).toHaveBeenCalledTimes(1);
+    expect(b.abort).toHaveBeenCalledTimes(1);
+  });
+
   it('the kill switch for an owner stops that owner only', () => {
     const r = new ClaudeRunRegistry();
     const a = hooks();
