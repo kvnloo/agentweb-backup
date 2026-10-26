@@ -31,6 +31,12 @@ jest.mock('../services/autoHumanEvalService', () => ({
   releaseArtifactClaim: jest.fn().mockResolvedValue(undefined),
 }));
 
+// ENG-2651: the route reads the named session's record to decide who may attach it.
+const mockGetChatSessionRecord = jest.fn();
+jest.mock('../services/chatbotService', () => ({
+  chatbotDb: { getChatSessionRecord: (...args: any[]) => mockGetChatSessionRecord(...args) },
+}));
+
 import humanEvalRoutes from '../routes/humanEval';
 import { humanEvalService } from '../services/humanEvalService';
 import { claimArtifactForHumanEval, releaseArtifactClaim } from '../services/autoHumanEvalService';
@@ -51,6 +57,7 @@ beforeEach(() => {
   mockListCandidates.mockResolvedValue([]);
   mockClaimArtifact.mockResolvedValue(true);
   mockReleaseArtifact.mockResolvedValue(undefined);
+  mockGetChatSessionRecord.mockResolvedValue(null);
 });
 
 describe('POST /api/human-eval/candidates', () => {
@@ -147,6 +154,103 @@ describe('POST /api/human-eval/candidates', () => {
     });
 
     expect(mockReleaseArtifact).not.toHaveBeenCalled();
+  });
+});
+
+// ENG-2651: createCandidate mints an iShare link (a token that opens and chats in the session) for
+// the candidate's sessionId and returns it as candidate.chatUrl, and reviewer feedback is later
+// written into that session. Only the session owner or an admin may name a session; anything else
+// must be refused before any candidate, claim, or link exists.
+describe('POST /api/human-eval/candidates — session ownership (ENG-2651)', () => {
+  const body = {
+    reviewType: 'creative_image',
+    outputSummary: 'Ad image generated.',
+    artifactUrl: 'https://example.com/ad.png',
+  };
+
+  it('refuses another account\'s session with 404 and mints nothing', async () => {
+    mockGetChatSessionRecord.mockResolvedValue({ sessionId: 'victim-session', userId: 'victim-user' });
+
+    const res = await request(app).post('/api/human-eval/candidates').send({ ...body, sessionId: 'victim-session' });
+
+    expect(res.status).toBe(404);
+    expect(res.body).toEqual({ error: 'Session not found' });
+    expect(res.body.candidate).toBeUndefined();
+    expect(mockGetChatSessionRecord).toHaveBeenCalledWith('victim-session', true);
+    expect(mockCreateCandidate).not.toHaveBeenCalled();
+    expect(mockClaimArtifact).not.toHaveBeenCalled();
+  });
+
+  it('answers a missing session exactly like a foreign one', async () => {
+    mockGetChatSessionRecord.mockResolvedValue(null);
+
+    const res = await request(app).post('/api/human-eval/candidates').send({ ...body, sessionId: 'no-such-session' });
+
+    expect(res.status).toBe(404);
+    expect(res.body).toEqual({ error: 'Session not found' });
+    expect(mockCreateCandidate).not.toHaveBeenCalled();
+    expect(mockClaimArtifact).not.toHaveBeenCalled();
+  });
+
+  it('refuses a session id when the caller has an empty userId even if the session has none', async () => {
+    mockGetChatSessionRecord.mockResolvedValue({ sessionId: 'orphan-session' });
+
+    const res = await request(app)
+      .post('/api/human-eval/candidates')
+      .set('x-no-user-id', '1')
+      .send({ ...body, sessionId: 'orphan-session' });
+
+    expect(res.status).toBe(404);
+    expect(mockCreateCandidate).not.toHaveBeenCalled();
+  });
+
+  it('answers an oversized sessionId 404 without reading it (DynamoDB would reject the key with a 500)', async () => {
+    const res = await request(app).post('/api/human-eval/candidates').send({ ...body, sessionId: 'x'.repeat(4000) });
+
+    expect(res.status).toBe(404);
+    expect(mockGetChatSessionRecord).not.toHaveBeenCalled();
+    expect(mockCreateCandidate).not.toHaveBeenCalled();
+  });
+
+  it('rejects a non-string sessionId with 400 instead of silently dropping it', async () => {
+    const res = await request(app).post('/api/human-eval/candidates').send({ ...body, sessionId: { $ne: null } });
+
+    expect(res.status).toBe(400);
+    expect(mockGetChatSessionRecord).not.toHaveBeenCalled();
+    expect(mockCreateCandidate).not.toHaveBeenCalled();
+  });
+
+  it('accepts the caller\'s own session and passes it to createCandidate', async () => {
+    mockGetChatSessionRecord.mockResolvedValue({ sessionId: 'own-session', userId: 'user-1' });
+
+    const res = await request(app).post('/api/human-eval/candidates').send({ ...body, sessionId: 'own-session' });
+
+    expect(res.status).toBe(200);
+    expect(mockClaimArtifact).toHaveBeenCalledWith('https://example.com/ad.png');
+    expect(mockCreateCandidate).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: 'own-session',
+      userId: 'user-1',
+    }));
+  });
+
+  it('lets an admin attach any account\'s session', async () => {
+    mockGetChatSessionRecord.mockResolvedValue({ sessionId: 'customer-session', userId: 'customer-user' });
+
+    const res = await request(app)
+      .post('/api/human-eval/candidates')
+      .set('x-admin', '1')
+      .send({ ...body, sessionId: 'customer-session' });
+
+    expect(res.status).toBe(200);
+    expect(mockCreateCandidate).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'customer-session' }));
+  });
+
+  it('does not read any session when none is named', async () => {
+    const res = await request(app).post('/api/human-eval/candidates').send({ ...body, sessionId: '' });
+
+    expect(res.status).toBe(200);
+    expect(mockGetChatSessionRecord).not.toHaveBeenCalled();
+    expect(mockCreateCandidate).toHaveBeenCalledWith(expect.objectContaining({ sessionId: undefined }));
   });
 });
 

@@ -23,6 +23,7 @@ import { SCHEDULED_CHATS_DEFAULT_LIMIT, SCHEDULED_CHATS_MAX_LIMIT } from '../../
 // ENG-982: `ctx` and `jsonResult` moved to ./toolHelpers so workflowTools.ts can
 // share them instead of keeping a second copy. Behaviour unchanged.
 import { omitBranchedFrom } from '../../utils/adminOnlyMessageFilter';
+import { branchOwnMessages } from '../../services/agentMode/chatBranching';
 import { omitActiveRun } from '../../services/agentMode/sessionActiveRunGuard';
 import { ctx, jsonResult, CLIENT_ID_SCHEMA_PROPERTY } from './toolHelpers';
 import { publishWithdrawnMidFlight } from '../../utils/scheduledPublishConsentGuard';
@@ -3405,7 +3406,9 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
       // spend from assistant turns timestamped inside [start_time, end_time).
       let inWindowCostMicro = 0;
       let timestampedAssistantTurns = 0;
-      for (const msg of messages) {
+      // ENG-2648: a branch's copied rows ran (with their models, waits and heap) in its SOURCE; attributing
+      // them to the branch would report models and turns that never ran here. Only its own rows count.
+      for (const msg of branchOwnMessages(messages)) {
         if (msg?.role !== 'assistant') continue;
         assistantTurnCount++;
         const turnCost = msg?.usage?.estimated_cost || 0;
@@ -3821,7 +3824,7 @@ mcpToolRegistry.register({
   name: 'monitor_lead_volume',
   definition: {
     name: 'monitor_lead_volume',
-    description: `Report spend and CRM-landed leads per Meta ad campaign per day for a specific client, and flag campaigns whose lead volume has collapsed relative to THAT CAMPAIGN'S OWN history. Admin-only tool.
+    description: `Report spend and CRM-landed leads per Meta ad campaign per day for a specific client, and flag campaigns whose lead volume has collapsed relative to THAT CAMPAIGN'S OWN history. Admin-only tool. Pass the client's name or email as client_name_or_email; client_id and client_email are accepted aliases.
 
 Trigger is distribution-aware, not a fixed day count: a campaign is flagged only when its trailing 7-day lead average falls below its OWN 5th-percentile historical floor. A campaign needs at least 14 days of baseline history (excluding the trailing window) before it can be flagged at all — with less, status is 'insufficient_history', not 'normal' or 'drought'.
 
