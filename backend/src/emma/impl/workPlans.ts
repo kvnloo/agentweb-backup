@@ -259,7 +259,7 @@ import { buildAnonymousModelUnavailableBody, buildAnonymousPlanModelToolMessage,
 import type { GatewayTaskClass } from '../../utils/openRouterGatewayContract';
 import type { LLMUsageContext } from '../../utils/llmService';
 import { isAgentWebModelId } from '../../services/agentMode/agentWebModelRouter';
-import { buildResultDeliveryEmailHtml, buildReviewUrl } from '../../services/resultEndpointReview';
+import { buildResultDeliveryEmailHtml, buildReviewUrl, isValidRecipientEmail } from '../../services/resultEndpointReview';
 import { escapeHtml } from './shared/htmlEscaping';
 
 /**
@@ -1611,7 +1611,7 @@ export async function sendForReview(
     await chatbotDb.updateSessionResultEndpointMetadata(sessionId, updatedMetadata);
 
     // --- skipReview mode: auto-send to lead, CC reviewer ---
-    if (metadata.skipReview && metadata.leadEmail) {
+    if (metadata.skipReview && metadata.leadEmail && isValidRecipientEmail(metadata.leadEmail)) {
       const { resendService: resendSvc } = await import('../../services/resendService');
       const { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } = await import('../../config');
 
@@ -1636,7 +1636,7 @@ export async function sendForReview(
       // ENG-2650: same escaped template as POST /review/:sessionId/send.
       const leadEmailHtml = buildResultDeliveryEmailHtml({ resultLabel, replyTo: replyToAddr, assetUrl });
 
-      const leadSubject = metadata.contentSubject || `Your ${resultLabel} is ready`;
+      const leadSubject = (metadata.contentSubject || `Your ${resultLabel} is ready`).replace(/[\r\n]+/g, ' ');
       await resendSvc.sendEmail({
         from: `${RESEND_SYSTEM_NAME} <${RESEND_SYSTEM_EMAIL}>`,
         to: metadata.leadEmail,
@@ -1701,7 +1701,7 @@ export async function sendForReview(
         </div>
       </div>`;
 
-    await emailSvc.sendEmail(reviewerEmail, `Review: ${subject}`, `Review result for ${metadata.resultTitle || metadata.resultName}`, reviewHtml);
+    await emailSvc.sendEmail(reviewerEmail, `Review: ${String(subject).replace(/[\r\n]+/g, ' ')}`, `Review result for ${metadata.resultTitle || metadata.resultName}`, reviewHtml);
     return { success: true, message: `Review email sent to ${reviewerEmail}`, to: reviewerEmail };
 
   } catch (error) {

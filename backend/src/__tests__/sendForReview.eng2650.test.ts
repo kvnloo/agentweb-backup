@@ -94,3 +94,23 @@ describe('send_for_review skipReview auto-send', () => {
     expect(html).toContain('src="https://s3.example.com/image&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;"');
   });
 });
+
+describe('send_for_review header and recipient hardening', () => {
+  it('strips CR/LF from the reviewer and lead subjects', async () => {
+    useSession({ leadEmail: 'lead@example.com' });
+    await sendForReview('Hi\r\nBcc: x@evil.com', 'sess-r1', 'anon_1');
+    expect(mockedEmail.mock.calls[0][1]).toBe('Review: Hi Bcc: x@evil.com');
+
+    mockedEmail.mockClear();
+    useSession({ skipReview: true, leadEmail: 'lead@example.com', contentSubject: 'Yo\r\nBcc: x@evil.com' });
+    await sendForReview('S', 'sess-r1', 'anon_1');
+    expect(mockedResend.mock.calls[0][0].subject).toBe('Yo Bcc: x@evil.com');
+  });
+
+  it('never auto-sends to a malformed lead address; falls back to the review email', async () => {
+    useSession({ skipReview: true, leadEmail: 'a@b.co, victim@x.com' });
+    await sendForReview('S', 'sess-r1', 'anon_1');
+    expect(mockedResend).not.toHaveBeenCalled();
+    expect(mockedEmail).toHaveBeenCalledTimes(1);
+  });
+});

@@ -140,6 +140,19 @@ describe('Result Endpoints', () => {
       expect(res.body.error).toContain('not found');
     });
 
+    it('rejects a malformed leadEmail before creating a session (ENG-2650)', async () => {
+      mockedSettings.getSetting.mockResolvedValue({
+        settingName: 'result-endpoints-config',
+        settingValue: JSON.stringify([sampleConfig]),
+        updatedAt: new Date().toISOString(),
+        updatedBy: 'admin',
+      });
+      for (const bad of ['a@b.co, victim@x.com', 'Bob <bob@x.com>', 'a@b.co\r\nBcc: v@x.com', 'nope']) {
+        await request(app).post('/r/gtm/trigger').send({ leadEmail: bad }).expect(400);
+      }
+      expect(mockedChatbot.createChatSession).not.toHaveBeenCalled();
+    });
+
     it('should return 200 JSON and fire runVerifiedChat for valid config', async () => {
       mockedSettings.getSetting.mockResolvedValue({
         settingName: 'result-endpoints-config',
