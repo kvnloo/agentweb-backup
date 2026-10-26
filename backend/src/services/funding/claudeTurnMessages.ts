@@ -15,6 +15,7 @@
  *
  * Pure: no I/O, no clock unless `now` is not supplied. Images are not persisted (the ledger omits them).
  */
+import { EMPTY_FINAL_RESPONSE_FALLBACK } from "../agentMode/core/termination";
 import type { BridgeCallRecord } from "./toolBridge";
 
 export interface ClaudeTurnUsage {
@@ -27,7 +28,7 @@ export interface ClaudeTurnUsage {
 
 export interface MapLedgerInput {
   ledger: BridgeCallRecord[];
-  /** The visible answer. The caller resolves an empty one first (Emma's EMPTY_FINAL_RESPONSE_FALLBACK); this does not invent text. */
+  /** The visible answer. A blank one becomes Emma's EMPTY_FINAL_RESPONSE_FALLBACK, so a reload never shows an empty assistant message. */
   finalText: string;
   /** The registry id, never the CLI alias (vision gating, acks and cost estimates read it). */
   llm: string;
@@ -112,7 +113,7 @@ export function mapLedgerToResponseMessages(input: MapLedgerInput): MappedTurn {
 
   responseMessages.push({
     role: "assistant",
-    content: input.finalText,
+    content: input.finalText && input.finalText.trim() ? input.finalText : EMPTY_FINAL_RESPONSE_FALLBACK,
     llm: input.llm,
     ...stamps,
     ...(input.usage

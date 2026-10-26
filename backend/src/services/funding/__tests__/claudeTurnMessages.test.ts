@@ -1,5 +1,6 @@
 import { mapLedgerToResponseMessages } from '../claudeTurnMessages';
 import type { BridgeCallRecord } from '../toolBridge';
+import { EMPTY_FINAL_RESPONSE_FALLBACK } from '../../agentMode/core/termination';
 
 const NOW = () => '2026-10-26T00:00:00.000Z';
 
@@ -19,14 +20,15 @@ function rec(over: Partial<BridgeCallRecord> & Pick<BridgeCallRecord, 'toolCallI
   };
 }
 
-const base = { llm: 'claude-opus-5-5', now: NOW };
+const LLM = 'openrouter/anthropic/claude-opus-5.5'; // the registry id, never the CLI alias
+const base = { llm: LLM, now: NOW };
 
 describe('mapLedgerToResponseMessages', () => {
   it('maps a turn with no tools to the single answer message', () => {
     const { responseMessages, toolCalls } = mapLedgerToResponseMessages({ ...base, ledger: [], finalText: 'Hello' });
     expect(toolCalls).toEqual([]);
     expect(responseMessages).toEqual([
-      { role: 'assistant', content: 'Hello', llm: 'claude-opus-5-5', metadata: { timestamp: NOW(), funding: 'subscription' } },
+      { role: 'assistant', content: 'Hello', llm: LLM, metadata: { timestamp: NOW(), funding: 'subscription' } },
     ]);
   });
 
@@ -114,6 +116,13 @@ describe('mapLedgerToResponseMessages', () => {
     // intermediate assistant messages carry no usage: the tokens are the turn's, counted once
     expect(responseMessages[0].usage).toBeUndefined();
   });
+});
+
+it('never persists a blank answer', () => {
+  for (const blank of ['', '   \n']) {
+    const { responseMessages } = mapLedgerToResponseMessages({ ...base, ledger: [], finalText: blank });
+    expect(responseMessages[responseMessages.length - 1].content).toBe(EMPTY_FINAL_RESPONSE_FALLBACK);
+  }
 });
 
 describe('persisted turn replayed through buildMarketingContext', () => {
