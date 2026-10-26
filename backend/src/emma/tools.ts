@@ -7707,10 +7707,13 @@ emmaToolRegistry.register({
   execute: async (args: any, context?: any) => {
     const { LANDING_PAGE_PREVIEW_BRANCH, runCodingAgent } = await import('../services/codingAgentService');
     const { classifyCodingAgentFailure } = await import('../services/codingAgentFailureClass');
+    // ENG-2648: the chat's model, else the configured system default (agent_mode_default_model) — never a
+    // hard-coded model id, which drifts from the registry and the plan allowlist.
+    const toolModel: string = context?.llmModel || await agentModeService.getDefaultModel();
     const executeMcpTool = context?.service
       ? async (toolName: string, toolArgs: any) => {
         return context.service.executeTool(
-          context.llmModel || 'anthropic.claude-sonnet-4-6',
+          toolModel,
           toolName,
           toolArgs,
           context.userId,
@@ -7730,7 +7733,7 @@ emmaToolRegistry.register({
         pageId: args.page_id,
         userId: context?.userId,
         sessionId,
-        llmModel: context?.llmModel || 'anthropic.claude-sonnet-4-6',
+        llmModel: toolModel,
         socketEmit: context?.socketEmit,
         executeMcpTool,
         draftBranch,
