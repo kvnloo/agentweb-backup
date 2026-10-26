@@ -110,8 +110,13 @@ export interface BridgeCallRecord {
   args: Record<string, unknown>;
   kind: BridgeRecordKind;
   isError: boolean;
-  /** The model-facing text, as Emma's loop would persist it (images omitted). */
+  /** What the tool really returned, as Emma's loop would persist it (images omitted). Backend-only: it can carry approval tokens. */
   toolMessageContent: string;
+  /**
+   * What the model was actually handed, present only when it differs from `toolMessageContent` (a halted preview answered with
+   * TURN_ENDED / PERSIST_FAILED). Anything that puts this call back into chat history must use `answeredContent ?? toolMessageContent`.
+   */
+  answeredContent?: string;
   /** The minimal tool result (executed calls only). */
   result?: unknown;
   error?: string;
@@ -1366,6 +1371,7 @@ export class ToolBridge {
     const endedAt = Date.now();
     ledger.lastRecordAtMs = endedAt;
     const content = capText(result.content, MAX_RECORD_CONTENT_BYTES);
+    const answered = returned === result ? content : capText(returned.content, MAX_RECORD_CONTENT_BYTES);
     const entry: BridgeCallRecord = {
       toolCallId: ctx.toolCallId,
       name: call.name,
@@ -1373,6 +1379,7 @@ export class ToolBridge {
       kind,
       isError: result.isError,
       toolMessageContent: content,
+      ...(answered !== content ? { answeredContent: answered } : {}),
       ...(extra.outcome?.result !== undefined ? { result: deepCopy(extra.outcome.result) } : {}),
       ...((extra.error ?? extra.outcome?.error) ? { error: extra.error ?? extra.outcome?.error } : {}),
       ...(announced ? { groupId: announced.groupId, groupIndex: announced.groupIndex, groupOrder: announced.groupOrder } : {}),
