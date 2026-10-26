@@ -150,7 +150,7 @@ export const AW_SDK_SOURCE: string = String.raw`/* AgentWeb tracker v1. One sess
       // Registered super values (site-owner awSuper/awRegister) can still push it over: drop them, keep
       // the automatic ones (#url, #title, ...) and the event.
       if (s.length > 15000 && body['super']) {
-        for (var rk in superReg) if (Object.prototype.hasOwnProperty.call(superReg, rk)) delete body['super'][rk];
+        body['super'] = superProps(false);
         s = JSON.stringify(body);
       }
       try {
@@ -179,7 +179,7 @@ export const AW_SDK_SOURCE: string = String.raw`/* AgentWeb tracker v1. One sess
     // host page registers with awRegister({...}) (registered values win). The ingest keeps only the names
     // in its fixed super-property table, typed and bounded, so unknown keys here are harmless.
     var superReg = {}, superN = 0;
-    function superProps() {
+    function superProps(includeRegistered) {
       var o = {}, k;
       try {
         o['#event_time'] = Date.now();
@@ -195,7 +195,9 @@ export const AW_SDK_SOURCE: string = String.raw`/* AgentWeb tracker v1. One sess
         o.site_domain = String(win.location.hostname).replace(/^www\./, '').slice(0, 120);
         o.session_page_num = st.pages || 1;
       } catch (e) {}
-      for (k in superReg) if (Object.prototype.hasOwnProperty.call(superReg, k)) o[k] = superReg[k];
+      if (includeRegistered !== false) {
+        for (k in superReg) if (Object.prototype.hasOwnProperty.call(superReg, k)) o[k] = superReg[k];
+      }
       return o;
     }
     function register(p) {
