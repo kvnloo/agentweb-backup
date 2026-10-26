@@ -9,8 +9,17 @@ import {
 import { isEvaluationUser, EvaluationDenied } from '../services/evaluationPolicy';
 import { Request, Response } from 'express';
 import { AuthenticatedRequest, getUserFromToken, isRealAdmin } from '../middleware/auth';
-import { agentModeService, AgentModeService, normalizeWorkPlanTitleForMatch, ADMIN_SKILL_TOOL_NAMES } from '../services/agentModeService';
+import { agentModeService, AgentModeService, normalizeWorkPlanTitleForMatch, ADMIN_SKILL_TOOL_NAMES, ADMIN_SKILL_VIRTUAL_ID } from '../services/agentModeService';
 import { filterMessagesForClient as filterMessagesForClientPure } from '../utils/adminOnlyMessageFilter';
+import {
+  buildConversableShareSession,
+  buildReadOnlyShareSession,
+  FIRST_ATTEMPT_TELEMETRY_PREFIX,
+  narrowSkillsForShareViewer,
+  toConversableShareMessages,
+  toIShareFeedbackResponse,
+  toReadOnlyShareMessages,
+} from '../utils/shareViewerSerializers';
 import { ABOUT_AGENTWEB_TEAM, getUnattendedExecutionDirective } from '../docs/agentModeSystemPrompt';
 import { chatbotDb, updateTaskExecutionStatus, ChatMessage, getEmmaSystemContext } from '../services/chatbotService';
 import { shouldSuppressScheduledNotification } from '../services/linkScanNotificationPolicy';
@@ -35,6 +44,7 @@ import {
 } from '../services/scheduledReportAccess';
 import { settingsService } from '../services/settingsService';
 import { sessionActiveRunGuard } from '../services/agentMode/sessionActiveRunGuardInstance';
+import { getInteractiveShareExpiresAt } from '../utils/interactiveShare';
 import { workPlanService } from '../services/workPlanService';
 import { projectWorkPlanForCustomer } from '../services/workPlanCustomerProjection';
 import { v4 as uuidv4 } from 'uuid';
@@ -2786,21 +2796,6 @@ async function scheduleAutoWorkPlanContinuation(
         );
       }
     });
-}
-
-/**
- * Returns the effective expiration date for an interactive share.
- *
- * Only an explicit `expiresAt` causes expiry. Shares created without one —
- * every public plan/ishare link (createSessionWithPlan sets `sharedAt` only)
- * and all legacy shares — never expire on a timer; their availability is
- * governed solely by the `isActive` flag. (Previously, a missing `expiresAt`
- * was treated as "sharedAt + 7 days", which silently 410'd every such link a
- * week after creation and broke all ishare links.)
- */
-function getInteractiveShareExpiresAt(share: { expiresAt?: string; sharedAt?: string }): Date {
-  if (share.expiresAt) return new Date(share.expiresAt);
-  return new Date(8640000000000000); // No expiresAt — never expires
 }
 
 /**
@@ -10330,24 +10325,6 @@ export const calculateNextRunTime = (
 };
 
 
-/** ENG-2645: model-private message keys that no share viewer (anonymous or interactive) may receive. */
-const SHARE_PRIVATE_MESSAGE_KEYS = ['reasoning', 'reasoning_details', 'usage', 'refusal', 'llm'] as const;
-
-/**
- * ENG-2645: share viewers never get the system prompt row or the model's private reasoning/usage fields.
- * Pure; display fields (content, metadata, tool_calls, timestamps) pass through unchanged.
- */
-export function redactMessagesForShareViewer<T>(messages: T[] | undefined): T[] {
-  return (messages || [])
-    .filter((m) => (m as { role?: string })?.role !== 'system')
-    .map((m) => {
-      if (!m || typeof m !== 'object') return m;
-      const copy: Record<string, unknown> = { ...(m as Record<string, unknown>) };
-      for (const k of SHARE_PRIVATE_MESSAGE_KEYS) delete copy[k];
-      return copy as T;
-    });
-}
-
 /** ENG-2644: owner-or-admin check for session-scoped mutations (same rule as emmaApi sessionAccessAllowed). */
 async function callerOwnsSession(sessionId: string, user: User | undefined): Promise<boolean> {
   if (!user || !sessionId) return false;
@@ -12501,60 +12478,61 @@ export const agentModeController = {
         }
       }
 
-      // Use session's llmModel if available, otherwise use default
-      const defaultModel = await agentModeService.getDefaultModel();
-      const modelToUse = session.llmModel || defaultModel;
+      // ENG-2645: a share viewer is not the owner, so the response is an allowlist of what the viewer's page
+      // reads (utils/shareViewerSerializers.ts), never the session record. Both views start from the same
+      // non-owner filter (ENG-112: no branch provenance, ENG-113/669 owner-only metadata, ENG-2163 admin turns).
+      const viewerMessages = filterMessagesForClient(session.messages, { omitBranchOrigin: true });
+      const workPlan = redactWorkPlanForViewer(session.workPlan);
+      // Both views also get the live approval-deck slot (ENG-1635/1644): it lets a shared card show the real
+      // answered option instead of a bare "View only"; everything in it is already in the transcript's card.
 
-      // Get user's supportNote if available
-      let supportNote: string | undefined;
-      try {
-        const user = await userDb.getUserById(session.userId);
-        supportNote = user?.supportNote;
-      } catch (error) {
-        console.error('Failed to fetch user supportNote:', error);
-        // Continue without supportNote if fetch fails
-      }
+      if (!conversable) {
+        // Read-only link: the portal's ShareConversation page. No skills, no supportNote/Slack thread, no model,
+        // and no share metadata — `interactiveShareMetadata.token` is the conversable credential.
+        res.status(200).json({
+          session: buildReadOnlyShareSession({
+            sessionId: session.sessionId,
+            title: session.title,
+            messages: viewerMessages,
+            workPlan,
+            pendingApprovalDeck: session.pendingApprovalDeck,
+          }),
+        });
+      } else {
+        // Conversable link: the portal's AgentMode chat (and the landing-page status poll).
+        const defaultModel = await agentModeService.getDefaultModel();
+        const modelToUse = session.llmModel || defaultModel;
 
-      // Build skills list with installed status (includes virtual other_skills), filtered by subscription
-      let sharedSkills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[] = [];
-      try {
-        sharedSkills = await agentModeService.getSkillsForDisplay(session.associatedSkills || [], session.userId);
-      } catch (error) {
-        console.error('AgentMode getSharedConversation: Failed to fetch skills:', error);
-      }
-
-      res.status(200).json({
-        session: {
-          sessionId: session.sessionId,
-          title: session.title,
-          // ENG-112: a share viewer is not the owner: no branch provenance (source session id/title).
-          messages: redactMessagesForShareViewer(filterMessagesForClient(session.messages, { omitBranchOrigin: true })),
-          createdAt: session.createdAt,
-          updatedAt: session.updatedAt,
-          shareMetadata: session.shareMetadata,
-          interactiveShareMetadata: session.interactiveShareMetadata,
-          workPlan: redactWorkPlanForViewer(session.workPlan),
-          llmModel: modelToUse,
-          isConversable: !!conversable,
-          hasActiveProgress: hasActiveProgress(session.sessionId),
-          // ENG-2645: the anonymous view-only page (ShareConversation.tsx) renders none of these; only the
-          // token-holding interactive share (/ishare, full agent-mode UI) receives them.
-          ...(conversable ? {
-            supportNote: supportNote,
-            skills: sharedSkills,
-            slackThread: session.slackThread,
-            pendingWorkPlanInput: session.pendingWorkPlanInput,
-          } : {}),
-          // ENG-1635/1644: expose the live deck slot so a shared/read-only card can
-          // reflect the real answered option (highlight + "Answered") instead of a bare
-          // "View only" — used to distinguish "still the current awaiting deck" vs
-          // "superseded". Everything here is already visible in the transcript's
-          // card, so it leaks nothing new; the share stays read-only via the card's
-          // readOnly path. (PR2: the pendingUserQuestion sibling of this field is
-          // gone — ask_user_question/the objective gate always build a deck-of-one now.)
-          pendingApprovalDeck: session.pendingApprovalDeck
+        // No supportNote: it is the admin's internal note about the account, not something to show a viewer
+        // (the ishare header falls back to "You're chatting with Emma in a shared conversation").
+        // Skills popover: only this session's installed skills (never the owner's catalog or the admin bundle).
+        let sharedSkills: ReturnType<typeof narrowSkillsForShareViewer> = [];
+        try {
+          sharedSkills = narrowSkillsForShareViewer(
+            await agentModeService.getSkillsForDisplay(session.associatedSkills || [], session.userId),
+            ADMIN_SKILL_VIRTUAL_ID,
+          );
+        } catch (error) {
+          console.error('AgentMode getSharedConversation: Failed to fetch skills:', error);
         }
-      });
+
+        res.status(200).json({
+          session: buildConversableShareSession({
+            sessionId: session.sessionId,
+            title: session.title,
+            messages: viewerMessages,
+            createdAt: session.createdAt,
+            updatedAt: session.updatedAt,
+            workPlan,
+            llmModel: modelToUse,
+            hasActiveProgress: hasActiveProgress(session.sessionId),
+            slackThread: session.slackThread,
+            skills: sharedSkills,
+            pendingWorkPlanInput: session.pendingWorkPlanInput,
+            pendingApprovalDeck: session.pendingApprovalDeck,
+          }),
+        });
+      }
 
       // ai-eval-funnel loop telemetry — fire-once eval_completed / eval_failed
       // events server-side so the lander's loop sensor can see them
@@ -12921,7 +12899,8 @@ export const agentModeController = {
         ...(typeof sharedAssistantMessageIndex === 'number' ? { messageIndex: sharedAssistantMessageIndex } : {}),
         ...(typeof response.userMessageIndex === 'number' ? { userMessageIndex: response.userMessageIndex } : {}),
         workPlan: redactWorkPlanForViewer(response.workPlan),
-        skills: response.skills,
+        // ENG-2645: the viewer's Skills popover gets this session's installed skills only, not the owner's catalog.
+        skills: narrowSkillsForShareViewer(response.skills, ADMIN_SKILL_VIRTUAL_ID),
         ...(response.workPlanTurnDisposition ? { workPlanTurnDisposition: response.workPlanTurnDisposition } : {}),
         // ENG-1635/1644: same immediate-sync fields as the authenticated path (see
         // generateResponse) — lets the optimistic ApprovalDeckCard on a shared link
@@ -13362,8 +13341,21 @@ export const agentModeController = {
 
       // Verify session exists and conversable token is valid
       const session = await chatbotDb.getChatSession(shareId);
-      if (!session || !session.interactiveShareMetadata?.isActive) {
+      if (!session || !session.interactiveShareMetadata) {
         return res.status(404).json({ error: 'Session not found' });
+      }
+
+      // ENG-2644: the token used to be required but never compared, so anyone who knew the id of an
+      // interactively shared chat could cancel its owner's run. The token is checked first so a retry on an
+      // expired or switched-off share answers the same 401/410 every time, never a 404.
+      const interactiveShare = session.interactiveShareMetadata;
+      if (!interactiveShare.token || interactiveShare.token !== conversable) {
+        return res.status(401).json({ error: 'Invalid or expired conversable token' });
+      }
+      // Intentionally NO write on expiry: stop only cancels a run. Deactivating from this stale read could
+      // overwrite a share the owner just re-created, and the other /ishare routes do the switching off.
+      if (!interactiveShare.isActive || new Date() > getInteractiveShareExpiresAt(interactiveShare)) {
+        return res.status(410).json({ error: 'Interactive share link has expired' });
       }
 
       // Signal cancellation
@@ -13968,10 +13960,8 @@ export const agentModeController = {
         console.warn('Failed to file feedback item (ishare):', err.message);
       });
 
-      res.json({
-        success: true,
-        message: updatedMessage,
-      });
+      // ENG-2645: only the feedback the portal reads back, not the raw stored row (reasoning, usage, …).
+      res.json(toIShareFeedbackResponse(updatedMessage));
     } catch (error) {
       console.error('AgentMode: Submit ishare message feedback error:', error);
       res.status(500).json({ error: 'Failed to submit feedback' });
@@ -16389,7 +16379,8 @@ export const agentModeController = {
       res.json({
         sessionId: session.sessionId,
         title: session.title,
-        messages: redactMessagesForShareViewer(filterMessagesForClient(session.messages, { omitBranchOrigin: true })),
+        // ENG-2645: same row shaping as the conversable share view (no system prompt, no reasoning/usage).
+        messages: toConversableShareMessages(filterMessagesForClient(session.messages, { omitBranchOrigin: true })),
         createdAt: session.createdAt,
         updatedAt: session.updatedAt,
         workPlan: redactWorkPlanForViewer(session.workPlan),
@@ -17008,7 +16999,7 @@ export const agentModeController = {
             // the first-attempt failure with a successful response.
             //
             // Uses role='system' so the user doesn't see this in their chat UI
-            // (filterMessagesForClient strips system messages on read). The sensor
+            // (the portal renders no bubble for a system row; share views blank or drop it, ENG-2645). The sensor
             // path queries the raw messages array, so it still sees the tag.
             try {
               // Pack debug info (errorName/code/httpStatus) into the content
@@ -17022,7 +17013,7 @@ export const agentModeController = {
               });
               const firstAttemptErrorMessage: ChatMessage = {
                 role: 'system',
-                content: `[telemetry] First-attempt agent failure (retry will follow): ${(firstErr?.message ?? String(firstErr)).slice(0, 500)} | ctx: ${debugCtx}`,
+                content: `${FIRST_ATTEMPT_TELEMETRY_PREFIX} (retry will follow): ${(firstErr?.message ?? String(firstErr)).slice(0, 500)} | ctx: ${debugCtx}`,
                 timestamp: new Date().toISOString(),
                 metadata: {
                   timestamp: new Date().toISOString(),
@@ -17697,6 +17688,8 @@ export const agentModeController = {
   async getShareOgMetadata(req: Request, res: Response) {
     try {
       const { shareId } = req.params;
+      // ENG-2654: an interactive (iShare) link is token-gated, so its preview is too.
+      const conversable = req.query?.conversable;
 
       const session = await chatbotDb.getChatSession(shareId);
       if (!session) {
@@ -17707,36 +17700,39 @@ export const agentModeController = {
         return res.status(403).json({ error: 'Sharing is not available in this sandbox workspace' });
       }
 
-      // Must have view-only or interactive sharing enabled
       const hasViewOnlyShare = session.shareMetadata?.isShared;
-      const hasInteractiveShare = session.interactiveShareMetadata?.isActive;
-      if (!hasViewOnlyShare && !hasInteractiveShare) {
-        return res.status(404).json({ error: 'This conversation is not shared' });
-      }
-
-      // Check if view-only share expired
-      if (hasViewOnlyShare && session.shareMetadata?.expiresAt && new Date() > new Date(session.shareMetadata.expiresAt)) {
-        return res.status(410).json({ error: 'Share link has expired' });
-      }
-
-      // Check if interactive share expired
-      if (!hasViewOnlyShare && hasInteractiveShare && session.interactiveShareMetadata &&
-          new Date() > getInteractiveShareExpiresAt(session.interactiveShareMetadata)) {
-        return res.status(410).json({ error: 'Interactive share link has expired' });
+      if (hasViewOnlyShare) {
+        if (session.shareMetadata?.expiresAt && new Date() > new Date(session.shareMetadata.expiresAt)) {
+          return res.status(410).json({ error: 'Share link has expired' });
+        }
+      } else {
+        // ENG-2654: no read-only share, so only the holder of the interactive token may see the title and
+        // first message — knowing the chat id is not enough. Same token + expiry rule as the /ishare routes,
+        // except this public reader never writes (no isActive flip on expiry).
+        const interactiveShare = session.interactiveShareMetadata;
+        if (!interactiveShare?.isActive || !conversable) {
+          return res.status(404).json({ error: 'This conversation is not shared' });
+        }
+        if (!interactiveShare.token || interactiveShare.token !== conversable) {
+          return res.status(401).json({ error: 'Invalid or expired conversable token' });
+        }
+        if (new Date() > getInteractiveShareExpiresAt(interactiveShare)) {
+          return res.status(410).json({ error: 'Interactive share link has expired' });
+        }
       }
 
       const title = session.title || 'AgentWeb Conversation';
 
-      // Extract first user message for description
+      // First user message the share viewer would see. ENG-2654: same filter as getSharedConversation, so a
+      // delegated admin's prompt (ENG-2163 admin-tainted turn) never becomes the preview text.
       let description = 'View this conversation on AgentWeb';
-      if (Array.isArray(session.messages)) {
-        const firstUserMessage = session.messages.find(
-          (m: any) => m && m.role === 'user' && typeof m.content === 'string'
-        );
-        if (firstUserMessage) {
-          const content = firstUserMessage.content.trim();
-          description = content.length > 160 ? content.substring(0, 157) + '...' : content;
-        }
+      // ENG-2645 serializers, picked by share type, so the preview is never richer than the share page.
+      const viewerMessages = filterMessagesForClient(session.messages, { omitBranchOrigin: true });
+      const firstUserMessage = (hasViewOnlyShare ? toReadOnlyShareMessages(viewerMessages) : toConversableShareMessages(viewerMessages))
+        .find((m: any) => m && m.role === 'user' && typeof m.content === 'string');
+      if (firstUserMessage) {
+        const content = String(firstUserMessage.content).trim();
+        description = content.length > 160 ? content.substring(0, 157) + '...' : content;
       }
 
       res.json({ title, description });
