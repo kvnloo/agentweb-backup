@@ -124,6 +124,20 @@ export async function getFundingFlags(): Promise<FundingFlags> {
   return resolved;
 }
 
+/**
+ * Reads the flags straight from AW-Settings: never cached, never the last good value.
+ * Throws when the read fails or the row is malformed, so a caller that must not act on
+ * a stale answer (a write on a subscription connection) can refuse instead. An absent
+ * row is a definite "all off".
+ */
+export async function readFundingFlagsFresh(): Promise<FundingFlags> {
+  const setting = await settingsService.getSettingConsistent(FUNDING_FLAGS_SETTING_NAME);
+  if (!setting) return ALL_OFF;
+  const parsed = parseFundingFlags(JSON.parse(setting.settingValue));
+  if (!parsed) throw new Error(`${FUNDING_FLAGS_SETTING_NAME} is malformed`);
+  return parsed;
+}
+
 /** Test hook: force the next getFundingFlags() call to re-read instead of using the cache. */
 /** In an allowlist, lets every user through. */
 export const FUNDING_ALLOW_ALL = "*";
@@ -145,6 +159,13 @@ export async function isByokEnabledFor(userId: string): Promise<boolean> {
  */
 export async function isClaudeSubscriptionEnabledFor(userId: string): Promise<boolean> {
   const flags = await getFundingFlags();
+  if (flags.killSwitch || !flags.claudeSubscription.enabled) return false;
+  return userId !== FUNDING_ALLOW_ALL && flags.claudeSubscription.allowUserIds.includes(userId);
+}
+
+/** `isClaudeSubscriptionEnabledFor` on a fresh read; throws when the flags cannot be read. */
+export async function isClaudeSubscriptionEnabledForFresh(userId: string): Promise<boolean> {
+  const flags = await readFundingFlagsFresh();
   if (flags.killSwitch || !flags.claudeSubscription.enabled) return false;
   return userId !== FUNDING_ALLOW_ALL && flags.claudeSubscription.allowUserIds.includes(userId);
 }

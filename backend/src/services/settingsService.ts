@@ -96,6 +96,12 @@ export class SettingsService {
     }
   }
 
+  /** Like `getSetting` but strongly consistent: for decisions that must see a change made a moment ago (a kill switch). */
+  async getSettingConsistent(settingName: string): Promise<Setting | null> {
+    const result = await dynamodb.get({ TableName: this.tableName, Key: { settingName }, ConsistentRead: true }).promise();
+    return (result.Item as Setting) || null;
+  }
+
   async getSettings(settingNames: string[]): Promise<Setting[]> {
     const settings: Setting[] = [];
     const uniqueNames = [...new Set(settingNames.filter(name => typeof name === 'string' && name.length > 0))];

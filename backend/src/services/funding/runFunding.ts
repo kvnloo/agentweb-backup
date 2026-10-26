@@ -33,6 +33,10 @@ export interface RunFunding {
    * (A2); until then usage falls back to `ownerUserId`.
    */
   fundingPrincipalId?: string;
+  /** `claude_subscription` only: the credential epoch of the connection this run was admitted under (the host fences on it). */
+  hostEpoch?: number;
+  /** `claude_subscription` only: the CLI model alias the plan runs (haiku|sonnet|opus|fable). */
+  planModel?: string;
   resolvedAt: string;
 }
 

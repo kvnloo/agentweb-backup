@@ -542,6 +542,27 @@ export function isS3KeyOwnedByUser(key: string, userId: string | null | undefine
 const READ_FILE_MAX_REDIRECTS = 5;
 
 /**
+ * ENG-2656: true for any AWS S3 endpoint host (virtual-hosted or path style).
+ * readFileContent only reaches this check after extractS3KeyFromUrl declined
+ * the URL, so a match here is a bucket that is NOT AgentWeb's upload bucket.
+ * Real chat attachments always live in our bucket; a foreign S3 URL is almost
+ * always a model-guessed "attachment" location (FlatFeeCorp, Oct 22), so we
+ * refuse it without making any network request.
+ */
+export function isForeignS3Host(host: string): boolean {
+  const h = (host || '').toLowerCase();
+  return h === 's3.amazonaws.com'
+    || /^s3[.-][a-z0-9-]+\.amazonaws\.com$/.test(h)
+    || /\.s3\.amazonaws\.com$/.test(h)
+    || /\.s3[.-][a-z0-9-]+\.amazonaws\.com$/.test(h);
+}
+
+export const FOREIGN_STORAGE_REFUSAL_MESSAGE =
+  'This URL points to an S3 bucket that is not AgentWeb file storage, so it is not a chat attachment and was not fetched. ' +
+  'Never guess or construct attachment URLs. If the user said they attached a file but the message has no Attached Files link, ' +
+  'reply: "I don\'t see an attachment on that message — please re-attach the file." Only read URLs that appear verbatim in the conversation.';
+
+/**
  * ENG-2420: SSRF-safe external GET. Every hop is DNS-resolved and refused if any
  * answer is private/loopback/link-local, then the connection is pinned to the
  * validated address (no rebinding window) and redirects are followed manually so
@@ -666,6 +687,14 @@ export async function readFileContent(fileUrl: string, caller?: ReadFileCallerCo
       // Google Drive / Docs links require the user's OAuth token — unauthenticated
       // fetches return 401 for Workspace-restricted orgs. Tell the user to upload instead.
       const urlHost = new URL(normalizedFileUrl).hostname.toLowerCase();
+      if (isForeignS3Host(urlHost)) {
+        console.warn('AgentMode: read_file_content refused non-AgentWeb S3 host (ENG-2656)');
+        return {
+          success: false,
+          message: FOREIGN_STORAGE_REFUSAL_MESSAGE,
+          error: 'Not an AgentWeb storage URL'
+        };
+      }
       if (urlHost === 'drive.google.com' || urlHost === 'docs.google.com') {
         return {
           success: false,
