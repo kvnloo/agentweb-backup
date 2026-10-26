@@ -1364,6 +1364,63 @@ describe("v0Service - multi-site routing (DURABLE_LANDING_GENERATION=on)", () =>
   });
 });
 
+// ENG-2673: the flag-off (legacy) branch used to pass a literal `undefined` where the originating
+// session belongs, so completion messages / review candidates were never tied to the chat. The
+// route has already verified the id belongs to the caller (resolveOriginatingSessionId); the
+// service only has to carry it through, exactly as the flag-on branch does.
+describe("v0Service - originatingSessionId (DURABLE_LANDING_GENERATION=off, ENG-2673)", () => {
+  const ORIG = process.env.DURABLE_LANDING_GENERATION;
+  beforeEach(() => {
+    delete process.env.DURABLE_LANDING_GENERATION;
+  });
+  afterEach(() => {
+    if (ORIG === undefined) delete process.env.DURABLE_LANDING_GENERATION;
+    else process.env.DURABLE_LANDING_GENERATION = ORIG;
+  });
+
+  it("stamps originatingSessionId on a first page", async () => {
+    mockQuery.mockReturnValue({ promise: () => Promise.resolve({ Items: [] }) });
+    mockChatsCreate.mockResolvedValueOnce({ id: "chat_legacy_first" });
+
+    await generateLandingPage("user-1", "p", "n", {}, undefined, undefined, {
+      originatingSessionId: "sess-legacy",
+    });
+
+    expect(mockPut.mock.calls[0][0].Item.originatingSessionId).toBe("sess-legacy");
+  });
+
+  it("stamps originatingSessionId on a sub-page added to the existing site", async () => {
+    const item = {
+      id: "site-1",
+      userId: "user-1",
+      githubRepoUrl: "https://github.com/o/r",
+      vercelProjectId: "vp1",
+      isRootPage: true,
+      siteId: "site-1",
+    };
+    mockGet.mockReturnValue({ promise: () => Promise.resolve({ Item: item }) });
+    mockQuery.mockReturnValue({ promise: () => Promise.resolve({ Items: [item] }) });
+    mockChatsCreate.mockResolvedValueOnce({ id: "chat_legacy_sub" });
+
+    await generateLandingPage("user-1", "Variant", "Pricing", {}, undefined, undefined, {
+      originatingSessionId: "sess-legacy",
+    });
+
+    const put = mockPut.mock.calls[0][0].Item;
+    expect(put.slug).toBeDefined();
+    expect(put.originatingSessionId).toBe("sess-legacy");
+  });
+
+  it("leaves originatingSessionId unset when none is supplied", async () => {
+    mockQuery.mockReturnValue({ promise: () => Promise.resolve({ Items: [] }) });
+    mockChatsCreate.mockResolvedValueOnce({ id: "chat_legacy_none" });
+
+    await generateLandingPage("user-1", "p", "n", {});
+
+    expect(mockPut.mock.calls[0][0].Item).not.toHaveProperty("originatingSessionId");
+  });
+});
+
 describe("v0Service - ENG-287 residual hardening", () => {
   const statusesWritten = () =>
     mockUpdate.mock.calls
