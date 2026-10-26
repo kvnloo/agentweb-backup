@@ -138,7 +138,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       if (mediaUrls && mediaUrls.length > 0) {
         for (const url of mediaUrls) {
           try {
-            const imageUrn = await linkedInService.uploadImageFromUrl(token, authorUrn, url);
+            const imageUrn = await retryOnceIfFreshToken401(wasRefreshed, () => linkedInService.uploadImageFromUrl(token, authorUrn, url));
             imageUrns.push(imageUrn);
           } catch (uploadError: any) {
             const errorMsg = uploadError?.message || 'Unknown upload error';
@@ -287,7 +287,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     const authorUrn = account.account_id;
 
     try {
-      const { token } = await this.getValidToken(account, userId);
+      const { token, wasRefreshed } = await this.getValidToken(account, userId);
 
       // ENG-827: the token refresh above is a network round-trip taken on a consent
       // decision read before it. This is the last moment before the repost is public.
@@ -297,7 +297,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
         return { success: false, message: withdrawn.error };
       }
 
-      const repostUrn = await linkedInService.createRepost(token, authorUrn, originalPostUrn, commentary);
+      const repostUrn = await retryOnceIfFreshToken401(wasRefreshed, () => linkedInService.createRepost(token, authorUrn, originalPostUrn, commentary));
 
       return {
         success: true,
