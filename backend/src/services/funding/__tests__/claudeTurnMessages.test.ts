@@ -85,6 +85,19 @@ describe('mapLedgerToResponseMessages', () => {
     expect(toolCalls[1].error).toBeUndefined();
   });
 
+  it('never stores a deferral marker in the ledger, so no backstop can continue a plan chat on AgentWeb', () => {
+    const ledger = [
+      rec({ toolCallId: 'a', name: 'generate_image', result: { deferred: true, reason: 'media_generation_time_budget' } }),
+      rec({ toolCallId: 'b', name: 'get_leads', result: { n: 1 } }),
+    ];
+    const { responseMessages, toolCalls } = mapLedgerToResponseMessages({ ...base, ledger, finalText: 'x' });
+    expect(toolCalls[0].result).toBeUndefined();
+    expect(toolCalls[1].result).toEqual({ n: 1 });
+    expect(JSON.stringify(responseMessages)).not.toContain('media_generation_time_budget');
+    const { hasUnresolvedMediaDeferral } = require('../../../utils/timeoutContinuation');
+    expect(hasUnresolvedMediaDeferral(responseMessages)).toBe(false);
+  });
+
   it('records refused and failed calls as errors without leaking detail', () => {
     const ledger = [
       rec({ toolCallId: 'r', name: 'send_email', kind: 'refused', isError: true, toolMessageContent: 'send_email is not available in this run.' }),

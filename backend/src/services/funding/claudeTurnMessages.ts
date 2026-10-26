@@ -54,6 +54,15 @@ export interface MappedTurn {
   toolCalls: LedgerToolCall[];
 }
 
+/**
+ * A "this call was deferred" result is the signal Emma's backstops use to start an AUTOMATIC follow-up turn (media budget deferral), and those turns run on
+ * AgentWeb's models. A plan turn must never leave that signal in its stored ledger, whatever a tool returned, or a later read of the chat could continue
+ * it on AgentWeb. The tool message text is kept; only the machine-readable marker is not.
+ */
+function isDeferral(result: unknown): boolean {
+  return !!result && typeof result === "object" && (result as { deferred?: unknown }).deferred === true;
+}
+
 /** Consecutive records of one model message. A call the stream never announced is its own group. */
 function groupRecords(ledger: BridgeCallRecord[]): BridgeCallRecord[][] {
   const groups: BridgeCallRecord[][] = [];
@@ -105,7 +114,7 @@ export function mapLedgerToResponseMessages(input: MapLedgerInput): MappedTurn {
         arguments: rec.args ?? {},
         duration: collapsed ? 0 : rec.durationMs,
         ...(collapsed ? { duplicateOf: rec.duplicateOfId } : {}),
-        ...(rec.result !== undefined && rec.answeredContent === undefined && !collapsed ? { result: rec.result } : {}),
+        ...(rec.result !== undefined && rec.answeredContent === undefined && !collapsed && !isDeferral(rec.result) ? { result: rec.result } : {}),
         ...(failed && !collapsed ? { error: rec.error ?? "Tool call did not complete" } : {}),
       });
     }

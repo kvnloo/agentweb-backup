@@ -72,7 +72,7 @@ export interface ClaudeBackendDeps {
     sessionId: string;
     isInteractiveShare: boolean;
     screenshotUrl?: string;
-    isDelegatedAccess?: boolean;
+    isDelegatedAccess: boolean;
     publishAuthorizationOverride?: undefined;
     isUnattendedRun: boolean;
   }): Promise<{ messages: any[] }>;
@@ -132,7 +132,7 @@ export class ClaudeCodeBackend {
       sessionId: p.sessionId,
       isInteractiveShare: false,
       screenshotUrl: p.screenshotUrl,
-      isDelegatedAccess: p.isDelegatedAccess,
+      isDelegatedAccess: p.isDelegatedAccess === true,
       publishAuthorizationOverride: undefined,
       isUnattendedRun: false,
     });
