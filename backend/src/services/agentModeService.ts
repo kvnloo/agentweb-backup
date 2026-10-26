@@ -15323,6 +15323,36 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     return { result, createdId: AgentModeService.extractDispatchedObjectId(result) };
   }
 
+  /**
+   * Zoma creative upload: Meta processing state of an uploaded video, ownership-scoped to the
+   * selected ad account (a video id addresses a node globally). Returns Meta's preferred
+   * thumbnail once ready, so the caller can build a video creative without a second upload.
+   */
+  public async readToolkitMetaVideoStatus(userId: string, account_id: string, videoId: string): Promise<{ status: string; thumbnail_url?: string; error?: string }> {
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    const base = `https://graph.facebook.com/${apiVersion}`;
+    const { data: node } = await axios.get(`${base}/${encodeURIComponent(videoId)}`, {
+      params: { fields: 'id,status,thumbnails{uri,is_preferred}', access_token: accessToken },
+    });
+    // AdVideo has no account_id field; confirm ownership through the account's own edge.
+    const { data: owned } = await axios.get(`${base}/act_${accountId.replace(/^act_/, '')}/advideos`, {
+      params: { fields: 'id', filtering: JSON.stringify([{ field: 'id', operator: 'IN', value: [videoId] }]), access_token: accessToken },
+    });
+    if (!Array.isArray(owned?.data) || !owned.data.some((v: any) => String(v?.id) === String(videoId))) {
+      throw new Error('That video is not in the selected ad account.');
+    }
+    const raw = String(node?.status?.video_status || 'processing').toLowerCase();
+    const status = raw === 'ready' ? 'ready' : raw === 'error' ? 'error' : 'processing';
+    const thumbs: any[] = node?.thumbnails?.data ?? [];
+    const thumb = thumbs.find((t) => t?.is_preferred) ?? thumbs[0];
+    return {
+      status,
+      ...(thumb?.uri ? { thumbnail_url: String(thumb.uri) } : {}),
+      ...(status === 'error' ? { error: String(node?.status?.processing_progress ?? 'processing failed') } : {}),
+    };
+  }
+
   /** Read-back after a toolkit write: status + effective status + budgets, ownership-scoped. */
   public async readBackMetaWriteTarget(userId: string, account_id: string, entity_type: string, id: string) {
     const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);

@@ -19,6 +19,8 @@ import { isZomaTool, ZOMA_TOOL_DEFINITIONS } from './zomaToolDefinitions';
 import { MetaToolkitRefusal } from './metaToolkitErrors';
 import { GUARDED_WRITE_ACTIONS } from './metaToolkitWriteSurface';
 
+const CREATIVE_UPLOAD_ACTIONS = ['UPLOAD_IMAGE', 'UPLOAD_VIDEO'] as const;
+
 const META_MARKETING_API_DESCRIPTION =
   'Meta Marketing API for external agents. Reads: LIST, GET, PREVIEW, SEARCH, GET_MATCH_QUALITY. ' +
   'Guarded writes (CAMPAIGN, AD_SET, AD only): CREATE, and UPDATE of status (ACTIVE/PAUSED) or budget. ' +
@@ -26,7 +28,12 @@ const META_MARKETING_API_DESCRIPTION =
   'then after their explicit approval repeat the exact same call with confirm=true and the preview_token. ' +
   'New campaigns, ad sets and ads are always created PAUSED; activating (status=ACTIVE) is its own separate preview and approval. ' +
   'Budgets are in MAJOR units of the ad account currency (e.g. 50 = $50.00); the preview echoes the converted amount. ' +
-  'A write is done only when the result says verification CONFIRMED. DELETE, creatives, audiences and uploads are not available.';
+  'A write is done only when the result says verification CONFIRMED. ' +
+  'CREATIVES (no preview needed, they cannot spend until an ad uses them): AD_CREATIVE UPLOAD_IMAGE (params.image_url) → image_hash; ' +
+  'AD_CREATIVE UPLOAD_VIDEO (params.video_url) → video_id + thumbnail_url, waits for Meta processing (re-check with params.video_id); ' +
+  'AD_CREATIVE CREATE (name, page_id, body, title, link_url, call_to_action_type + image_hash | image_url | video_id with image_url/image_hash thumbnail) → creative_id; ' +
+  'then AD CREATE with params.creative_id (guarded preview, created PAUSED). For a file on the user\'s computer call zoma_prepare_upload first. ' +
+  'Use PAGE LIST for page_id. DELETE and custom audiences are not available.';
 
 export const META_TOOLKIT_V1_TOOL_NAMES = [
   'list_meta_ads_campaigns',
@@ -56,7 +63,7 @@ function narrowDefinition(definition: any): any {
     delete props.client_id;
     if (def.name === 'call_meta_marketing_api') {
       def.description = META_MARKETING_API_DESCRIPTION;
-      if (props.action?.enum) props.action.enum = [...META_TOOLKIT_V1_ACTIONS, ...GUARDED_WRITE_ACTIONS];
+      if (props.action?.enum) props.action.enum = [...META_TOOLKIT_V1_ACTIONS, ...GUARDED_WRITE_ACTIONS, ...CREATIVE_UPLOAD_ACTIONS];
       props.confirm = {
         type: 'boolean',
         description: 'Writes only. Omit to get a PREVIEW (nothing changes). Set true only after the user explicitly approved that preview, together with its preview_token.',
