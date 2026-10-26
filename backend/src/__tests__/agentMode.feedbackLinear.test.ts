@@ -88,7 +88,7 @@ describe('Agent Mode feedback → Linear intake', () => {
       expect(res.json).toHaveBeenCalledWith({ success: true, message: expect.any(Object) });
     });
 
-    it('should file human-triage intake when user likes a message', async () => {
+    it('ENG-2676: does not file intake when user likes a message, but still persists and injects context', async () => {
       (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
       (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue(mockMessages);
 
@@ -99,12 +99,13 @@ describe('Agent Mode feedback → Linear intake', () => {
 
       await Promise.resolve();
 
-      expect(fileAutoIssue).toHaveBeenCalledWith(
-        expect.objectContaining({
-          title: expect.stringContaining('Like'),
-          description: expect.stringContaining('Excellent!'),
-        }),
+      expect(fileAutoIssue).not.toHaveBeenCalled();
+      expect(chatbotDb.updateMessageFeedback).toHaveBeenCalled();
+      expect(chatbotDb.addMessageToSession).toHaveBeenCalledWith(
+        'session-abc',
+        expect.objectContaining({ role: 'system', content: expect.stringContaining('liked') }),
       );
+      expect(res.json).toHaveBeenCalledWith({ success: true, message: expect.any(Object) });
     });
 
     it('should file intake without comment when no comment provided', async () => {
@@ -125,7 +126,7 @@ describe('Agent Mode feedback → Linear intake', () => {
       (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
       (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue(mockMessages);
 
-      const req = mockRequest(mockUser, 'session-abc', '1', { type: 'like' });
+      const req = mockRequest(mockUser, 'session-abc', '1', { type: 'dislike' });
       const res = mockResponse();
 
       await agentModeController.submitMessageFeedback(req, res);
@@ -174,6 +175,39 @@ describe('Agent Mode feedback → Linear intake', () => {
 
       expect(fileAutoIssue).not.toHaveBeenCalled();
       expect(res.status).toHaveBeenCalledWith(401);
+    });
+  });
+
+  describe('submitIShareMessageFeedback (ENG-2676)', () => {
+    const shareSession = {
+      ...mockSession,
+      interactiveShareMetadata: { isActive: true, token: 'tok', createdAt: new Date().toISOString() },
+    };
+    const ishareReq = (type: string) =>
+      ({ params: { shareId: 'session-abc', messageIndex: '1' }, query: { conversable: 'tok' }, body: { type, comment: 'c' } } as any);
+
+    beforeEach(() => {
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(shareSession);
+      (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue(mockMessages);
+    });
+
+    it('does not file intake for a like', async () => {
+      const res = mockResponse();
+      await agentModeController.submitIShareMessageFeedback(ishareReq('like'), res);
+      await Promise.resolve();
+      expect(res.status).not.toHaveBeenCalled();
+      expect(chatbotDb.updateMessageFeedback).toHaveBeenCalled();
+      expect(fileAutoIssue).not.toHaveBeenCalled();
+    });
+
+    it('files intake for a dislike', async () => {
+      const res = mockResponse();
+      await agentModeController.submitIShareMessageFeedback(ishareReq('dislike'), res);
+      await Promise.resolve();
+      expect(res.status).not.toHaveBeenCalled();
+      expect(fileAutoIssue).toHaveBeenCalledWith(
+        expect.objectContaining({ title: expect.stringContaining('Dislike Feedback (iShare)') }),
+      );
     });
   });
 });

@@ -13691,9 +13691,11 @@ export const agentModeController = {
         console.warn('Failed to propagate message feedback to images:', propagateError);
       }
 
-      // Fire-and-forget: file an item so the team can review positive/negative feedback
-      fileAutoIssue({
-        title: `Agent Mode ${type === 'like' ? 'Like' : 'Dislike'} Feedback – ${session.title || sessionId}`,
+      // Fire-and-forget: file an item so the team can review negative feedback.
+      // ENG-2676: a like is sentiment, not a defect — likes are persisted and
+      // injected as context above but never filed as a Linear Bug.
+      if (type === 'dislike') fileAutoIssue({
+        title: `Agent Mode Dislike Feedback – ${session.title || sessionId}`,
         description: [
           `User ${user.email} voted ${type} on a message in session "${session.title || sessionId}".`,
           comment ? `Comment: "${comment}"` : '',
@@ -14093,9 +14095,9 @@ export const agentModeController = {
         console.warn('Failed to propagate ishare message feedback to images:', propagateError);
       }
 
-      // Fire-and-forget: file an item for anonymous ishare votes
-      fileAutoIssue({
-        title: `Agent Mode ${type === 'like' ? 'Like' : 'Dislike'} Feedback (iShare) – ${session.title || shareId}`,
+      // Fire-and-forget: file an item for anonymous ishare dislikes (ENG-2676: likes are not defects)
+      if (type === 'dislike') fileAutoIssue({
+        title: `Agent Mode Dislike Feedback (iShare) – ${session.title || shareId}`,
         description: [
           `Anonymous visitor voted ${type} on a message in shared session "${session.title || shareId}".`,
           comment ? `Comment: "${comment}"` : '',
