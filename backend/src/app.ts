@@ -319,7 +319,9 @@ const corsOptions = {
   // useTokenUsage hook cache-busts /api/subscription/usage with those request
   // headers; cross-origin (app.agentweb.pro -> api.agentweb.pro) the browser
   // preflights them and, if absent here, blocks the fetch so the meter never loads.
-  allowedHeaders: ["Content-Type", "Authorization", "Cache-Control", "Pragma"],
+  // ENG-2650: X-Review-Token carries the result-endpoint reviewer capability
+  // from the portal's /review/:sessionId page to the /review API routes.
+  allowedHeaders: ["Content-Type", "Authorization", "Cache-Control", "Pragma", "X-Review-Token"],
   // ENG-2418: GET /api/tasks/executions/with-images returns paging metadata in
   // headers; cross-origin the portal can only read them if they are exposed.
   exposedHeaders: ["X-Total-Tasks", "X-Next-Cursor"],
@@ -337,6 +339,8 @@ app.use((req, res, next) => {
       // ENG-2593: customer web forms on any domain POST leads here from the browser.
       // Access is gated per list (publicAccessEnabled) inside routes/webhooks.ts.
       req.path === '/api/webhooks/forward-lead' ||
+      // ENG-2657: emma-forms.js posts to /api/leads/public/:listId (alias of forward-lead below).
+      /^\/api\/leads\/public\/[^\/]+\/?$/.test(req.path) ||
       req.path.startsWith('/sdk/v1/') ||
       req.path.startsWith('/batch-review/')) {
     // Allow all origins for public endpoints
@@ -389,6 +393,17 @@ app.use("/api/track/event", ...trackBodyParser);
 app.use("/api/webhooks/twilio-voice", twilioVoiceBodyParser);
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
+
+// ENG-2657: customer sites embedding /emma-forms.js POST to /api/leads/public/:listId.
+// Alias it onto /api/webhooks/forward-lead (same per-list publicAccessEnabled gate) by
+// moving the path param into body.listId; the path param wins over any body value.
+app.post(/^\/api\/leads\/public\/([^\/]+)\/?$/, (req, _res, next) => {
+  const listId = (req.params as Record<string, string>)[0];
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  req.body = { ...body, listId };
+  req.url = "/api/webhooks/forward-lead";
+  next();
+});
 app.use(passport.initialize());
 app.use(evaluationHttpBoundary);
 app.use("/api/admin/evaluations", evaluationAdminRoutes);

@@ -8,6 +8,7 @@
  * and the model's reasoning and memory telemetry are never included.
  */
 
+import { cutWithoutSplittingPair } from '../utils/surrogateSafeCut';
 import { SECRET_KEY_PATTERN } from '../loops/instances/agent-mode/runRecorder';
 
 export const TRACE_LIMITS = {
@@ -528,15 +529,7 @@ export function redactText(text: string): string {
   return shielded.replace(OPAQUE_TOKEN, '[REDACTED]').replace(/\u0000(\d+)\u0000/g, (_, i) => kept[Number(i)] ?? '');
 }
 
-/**
- * The first `max` UTF-16 units of `text`, one fewer if the cut would split a surrogate pair (an emoji): LLM
- * providers' strict JSON parsers reject a request holding a lone half (ENG-2638).
- */
-export function cutWithoutSplittingPair(text: string, max: number): string {
-  const cut = text.slice(0, max);
-  const last = cut.charCodeAt(cut.length - 1);
-  return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
-}
+export { cutWithoutSplittingPair } from '../utils/surrogateSafeCut';
 
 /** Cap, redact, cap again: regexes never run over a multi-megabyte result, and a mask never grows the text past the cap. */
 function capRedacted(text: string, max: number): { text: string; truncated: boolean } {

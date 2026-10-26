@@ -6028,7 +6028,7 @@ emmaToolRegistry.register({
   name: "read_file_content",
   definition: {
     name: "read_file_content",
-    description: 'Read and extract text content from a file URL. Supports text files, PDFs, HTML, Markdown, CSV, Excel/XLSX spreadsheets, Word documents (docx, doc), and other common formats. Do NOT use this for image files (jpg, jpeg, png, gif, webp) — use describe_image instead. For SVG source markup, text labels, or dimensions, use this tool; use describe_image for visual analysis of SVGs. Do NOT use this for video files (mp4, mov, avi, webm, mkv) — use describe_video instead.',
+    description: 'Read and extract text content from a file URL. Supports text files, PDFs, HTML, Markdown, CSV, Excel/XLSX spreadsheets, Word documents (docx, doc), and other common formats. Do NOT use this for image files (jpg, jpeg, png, gif, webp) — use describe_image instead. For SVG source markup, text labels, or dimensions, use this tool; use describe_image for visual analysis of SVGs. Do NOT use this for video files (mp4, mov, avi, webm, mkv) — use describe_video instead. Only pass a URL that appears verbatim in the conversation (an Attached Files link or a link the user pasted). NEVER guess or construct a file URL: if the user says a file is attached but the message has no Attached Files link, do not call this tool — reply "I do not see an attachment on that message — please re-attach the file."',
     inputSchema: {
       type: "object",
       properties: {
@@ -7707,10 +7707,13 @@ emmaToolRegistry.register({
   execute: async (args: any, context?: any) => {
     const { LANDING_PAGE_PREVIEW_BRANCH, runCodingAgent } = await import('../services/codingAgentService');
     const { classifyCodingAgentFailure } = await import('../services/codingAgentFailureClass');
+    // ENG-2648: the chat's model, else the configured system default (agent_mode_default_model) — never a
+    // hard-coded model id, which drifts from the registry and the plan allowlist.
+    const toolModel: string = context?.llmModel || await agentModeService.getDefaultModel();
     const executeMcpTool = context?.service
       ? async (toolName: string, toolArgs: any) => {
         return context.service.executeTool(
-          context.llmModel || 'anthropic.claude-sonnet-4-6',
+          toolModel,
           toolName,
           toolArgs,
           context.userId,
@@ -7730,7 +7733,7 @@ emmaToolRegistry.register({
         pageId: args.page_id,
         userId: context?.userId,
         sessionId,
-        llmModel: context?.llmModel || 'anthropic.claude-sonnet-4-6',
+        llmModel: toolModel,
         socketEmit: context?.socketEmit,
         executeMcpTool,
         draftBranch,
@@ -9559,6 +9562,7 @@ emmaToolRegistry.register({
     name: 'call_hubspot_api',
     description: `Manage HubSpot marketing assets and data via a single unified tool.
 Use entity_type to select the resource, action to select the operation.
+For CONTACT_LIST GET pass list_id as a top-level string (listId/id/guid and id-bearing query objects are accepted aliases). LIST with a list id reads that list; omit ids to enumerate lists. For CAMPAIGN GET/GET_METRICS pass top-level guid (id is accepted). Use CONTACTS + LIST to list contacts.
 
 ENTITY_TYPE + ACTION MATRIX:
 
@@ -9714,8 +9718,11 @@ emmaToolRegistry.register({
 reporting and list-membership workflows.
 
 Attio has no equivalent of HubSpot's marketing-asset concepts (campaigns,
-emails, landing pages, workflows, social broadcasts) — this tool covers only
-lists and list entries, mirroring call_hubspot_api's CONTACT_LIST actions.
+emails, landing pages, workflows, social broadcasts). Supported entity_type values
+are RECORDS, LISTS, LIST_ENTRIES (case-insensitive). Workspace lookup/get_workspace
+is not supported. Use {entity_type:"RECORDS",action:"SEARCH",query:"name or email"}
+or {entity_type:"RECORDS",action:"LIST",object_type:"people"}; PERSON/PEOPLE are
+aliases for RECORDS with object_type people. Pass fields at the top level.
 
 ENTITY_TYPE + ACTION MATRIX:
 

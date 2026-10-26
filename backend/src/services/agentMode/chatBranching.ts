@@ -84,12 +84,38 @@ export interface BranchOrigin {
 }
 
 /** The provenance of a branch, read from row 0 of its history. */
-export function readBranchOrigin(messages: readonly ChatMessage[] | undefined): BranchOrigin | null {
+export function readBranchOrigin(messages: readonly BranchHistoryRow[] | undefined): BranchOrigin | null {
   const origin = (messages?.[0]?.metadata as { branchOrigin?: unknown } | undefined)?.branchOrigin;
   if (!origin || typeof origin !== 'object') return null;
   const o = origin as Partial<BranchOrigin>;
   if (typeof o.sourceSessionId !== 'string' || typeof o.sourceMessageIndex !== 'number') return null;
   return o as BranchOrigin;
+}
+
+/** The fields of a stored row the branch readers look at (ChatMessage, the eval loader's ResumeMessage, ...). */
+export interface BranchHistoryRow {
+  role?: unknown;
+  metadata?: unknown;
+}
+
+/**
+ * ENG-2648: the rows a branch produced ITSELF — everything from its first own user message on.
+ *
+ * A branch is born with a copy of its source's rows [0..k] (buildBranchRows). Those turns ran, were billed and
+ * are graded/scored in the SOURCE, so a reader that scores, grades or lists sessions must not count them again.
+ * Not a branch (row 0 carries no branchOrigin) => `messages` unchanged. A branch nobody continued — including
+ * the hidden (archived) leftover of a failed copy — has no own rows => [].
+ *
+ * A user row is the branch's own when it sits after the branched-from assistant row: rows are copied densely and
+ * in order, the branch point is an assistant row, and the copy only extends past it over non-user rows, so every
+ * copied user row precedes it and every own user row follows it. Position only: timestamps are NOT used, since
+ * a copied row keeps whatever timestamp its source row carried and so cannot prove it is not a copy.
+ */
+export function branchOwnMessages<T extends BranchHistoryRow>(messages: readonly T[]): T[] {
+  const origin = readBranchOrigin(messages);
+  if (!origin) return [...messages];
+  const firstOwn = messages.findIndex((row, i) => row.role === 'user' && i > origin.sourceMessageIndex);
+  return firstOwn < 0 ? [] : messages.slice(firstOwn);
 }
 
 export interface ServiceOutcome<T = unknown> {

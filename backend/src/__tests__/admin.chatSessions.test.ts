@@ -8,6 +8,7 @@ import * as sessionScoringService from "../services/sessionScoringService";
 jest.mock("../services/chatbotService", () => ({
   chatbotDb: {
     getRecentSessionsPage: jest.fn(),
+    getSessionsWithoutMessages: jest.fn(),
     getChatSession: jest.fn(),
     updateSessionSatisfactionScore: jest.fn(),
     updateSessionJudgeScore: jest.fn(),
@@ -168,6 +169,46 @@ describe("Admin chat sessions endpoint", () => {
     // Only the session with a user message should be returned
     expect(res.body.sessions).toHaveLength(1);
     expect(res.body.sessions[0].sessionId).toBe("real-session");
+  });
+
+  // ENG-2648: a branch nobody continued (and the archived leftover of a failed branch copy) holds only a copy of
+  // its source's turns: the recent list leaves it out, the owner's list keeps it, and no review link is created.
+  describe("branch copies (ENG-2648)", () => {
+    const origin = { sourceSessionId: "src", sourceMessageIndex: 2, branchedAt: "2026-10-01T10:30:00.000Z" };
+    const copied = [
+      { role: "system", content: "sys", metadata: { branchOrigin: origin } },
+      { role: "user", content: "source question" },
+      { role: "assistant", content: "source answer" },
+    ];
+    const meta = (sessionId: string) => ({ sessionId, userId: "owner-1", createdAt: "2026-10-01T10:30:00Z", updatedAt: "2026-10-01T10:31:00Z", messages: [] });
+    const full: Record<string, any> = {
+      "pure-copy": { ...meta("pure-copy"), messages: copied },
+      "orphan": { ...meta("orphan"), archived: true, messages: copied.slice(0, 2) },
+      "continued": { ...meta("continued"), messages: [...copied, { role: "user", content: "own question" }, { role: "assistant", content: "own answer" }] },
+    };
+    beforeEach(() => {
+      mockChatbotDb.getChatSession.mockImplementation(async (id: string) => (full[id] ? { ...full[id] } : null));
+    });
+
+    it("the recent list leaves out pure copies and orphans, keeps a continued branch, and links only that one", async () => {
+      mockChatbotDb.getRecentSessionsPage.mockResolvedValue({ sessions: Object.keys(full).map(meta) as any, lastEvaluatedKey: undefined });
+      const res = await request(app).get("/api/admin/chat-sessions").expect(200);
+      expect(res.body.sessions.map((s: any) => s.sessionId)).toEqual(["continued"]);
+      expect(mockChatbotDb.createOrReuseInteractiveShare.mock.calls.map((c) => c[0])).toEqual(["continued"]);
+    });
+
+    it("the owner-filtered list keeps the owner's never-continued branch but creates no review link for it", async () => {
+      (mockChatbotDb as any).getSessionsWithoutMessages.mockResolvedValue([meta("pure-copy"), meta("continued")]);
+      const res = await request(app).get("/api/admin/chat-sessions?userId=owner-1").expect(200);
+      expect(res.body.sessions.map((s: any) => s.sessionId).sort()).toEqual(["continued", "pure-copy"]);
+      expect(mockChatbotDb.createOrReuseInteractiveShare.mock.calls.map((c) => c[0])).toEqual(["continued"]);
+    });
+
+    it("a lookup by id still finds an orphan (operators inspect the id a failed branch logged), with no review link", async () => {
+      const res = await request(app).get("/api/admin/chat-sessions?sessionId=orphan").expect(200);
+      expect(res.body.sessions.map((s: any) => s.sessionId)).toEqual(["orphan"]);
+      expect(mockChatbotDb.createOrReuseInteractiveShare).not.toHaveBeenCalled();
+    });
   });
 
   it("passes the decoded cursor to pagination queries", async () => {

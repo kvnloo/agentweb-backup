@@ -1509,7 +1509,10 @@ async function hubspotMarketingPreflight(
   }
 }
 
+import { normalizeHubSpotArgs } from '../../services/agentMode/crmToolArgs';
+
 export async function handleHubspotApi(userId: string, args: any): Promise<any> {
+  args = normalizeHubSpotArgs(args);
   const entityType: string = (args?.entity_type ?? '').toUpperCase();
   const action: string = (args?.action ?? '').toUpperCase();
   try {
@@ -1535,6 +1538,11 @@ export async function handleHubspotApi(userId: string, args: any): Promise<any> 
     // setups.
     const preflight = await hubspotMarketingPreflight(userId, svc, entityType, action);
     if (preflight) return preflight;
+
+    if (entityType === 'CONTACTS') {
+      if (action !== 'LIST') return { success: false, error: 'Valid CONTACTS action: LIST (cursor optional).' };
+      return { success: true, ...await svc.listContacts(args?.cursor) };
+    }
 
     // ─── CONTACT_LIST ──────────────────────────────────────────────────────
     if (entityType === 'CONTACT_LIST') {

@@ -131,6 +131,7 @@
  * billingUserId and found zero matches, confirming Manan's own pre-check
  * before this round started.
  */
+import { truncateToolContent } from '../../utils/surrogateSafeCut';
 import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
 import {
@@ -1191,7 +1192,7 @@ export async function searchKnowledgeBase(query: string, maxResults: number = 5,
       // never capped, so a single oversized entry could exceed Node's max
       // string length once merged/serialized downstream and crash the process.
       content: result.content && result.content.length > 5000
-        ? result.content.substring(0, 5000) + '\n\n[Content truncated]'
+        ? truncateToolContent(result.content)
         : result.content,
       source: result.metadata?.source || 'unknown',
       ...(result.metadata?.fileName && { fileName: result.metadata.fileName })
@@ -1238,7 +1239,7 @@ export async function searchKnowledgeBase(query: string, maxResults: number = 5,
                 if (content) {
                   const parentFolder = folders.find(f => file.parents?.includes(f.folderId));
                   results.push({
-                    content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
+                    content: truncateToolContent(content),
                     source: `google-drive/${parentFolder?.name || 'shared'}/${file.name}`
                   });
                 }
@@ -1286,7 +1287,7 @@ export async function searchKnowledgeBase(query: string, maxResults: number = 5,
                   const contentMatch = content.toLowerCase().includes(queryLower);
                   if (nameMatch || contentMatch) {
                     results.push({
-                      content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
+                      content: truncateToolContent(content),
                       source: `clickup/${workspace.name}/${doc.name}`
                     });
                     clickUpResultCount++;
@@ -1324,7 +1325,7 @@ export async function searchKnowledgeBase(query: string, maxResults: number = 5,
                 if (nameMatch || descMatch) {
                   const summary = `# ${task.name}\n\n**Status:** ${task.status}${task.priority ? `\n**Priority:** ${task.priority}` : ''}${task.assignees.length > 0 ? `\n**Assignees:** ${task.assignees.join(', ')}` : ''}${task.description ? `\n\n${task.description}` : ''}`;
                   results.push({
-                    content: summary.length > 5000 ? summary.substring(0, 5000) + '\n\n[Content truncated]' : summary,
+                    content: truncateToolContent(summary),
                     source: `clickup-tasks/${workspace.name}/${task.name}`
                   });
                   clickUpTaskResultCount++;
@@ -1448,7 +1449,7 @@ export async function searchForeplayAds(query: string, maxResults: number = 5, u
         if (nameMatch || descMatch || headlineMatch || brandMatch) {
           const content = formatForeplayAdAsMarkdown(ad);
           results.push({
-            content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
+            content: truncateToolContent(content),
             source: `foreplay-swipefile/${ad.brandName || 'Unknown'}/${ad.name || ad.headline || ad.id}`
           });
           foreplayResultCount++;
@@ -1475,7 +1476,7 @@ export async function searchForeplayAds(query: string, maxResults: number = 5, u
             if (nameMatch || descMatch || headlineMatch || brandMatch) {
               const content = formatForeplayAdAsMarkdown(ad);
               results.push({
-                content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
+                content: truncateToolContent(content),
                 source: `foreplay-board/${board.name}/${ad.brandName || 'Unknown'}/${ad.name || ad.headline || ad.id}`
               });
               foreplayResultCount++;
@@ -1588,7 +1589,7 @@ export async function searchForeplayDiscovery(
     const results = ads.map(ad => ({
       content: (() => {
         const c = formatForeplayAdAsMarkdown(ad);
-        return c.length > 5000 ? c.substring(0, 5000) + '\n\n[Content truncated]' : c;
+        return truncateToolContent(c);
       })(),
       source: `foreplay-discovery/${ad.brandName || 'Unknown'}/${ad.name || ad.headline || ad.id}`
     }));

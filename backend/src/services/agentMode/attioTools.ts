@@ -58,6 +58,10 @@ export function normalizeAttioArgs(raw: any): { args: any; entityType: string; a
     entityType = 'RECORDS';
   }
   if (!entityType && action === 'SEARCH' && args.query !== undefined) entityType = 'RECORDS';
+  // No workspace endpoint is exposed by this service. Reach the actionable
+  // handler diagnostic rather than failing required-field validation.
+  if (!entityType && action === 'GET_WORKSPACE') entityType = 'WORKSPACE';
+  delete args.params;
   return { args, entityType, action };
 }
 
@@ -150,6 +154,9 @@ export async function handleAttioApi(userId: string, args: any): Promise<any> {
   const action: string = normalized.action;
   if (!entityType) {
     return { success: false, error: 'entity_type is required. Valid: RECORDS (SEARCH/LIST people or companies), LIST_ENTRIES, LISTS.' };
+  }
+  if (!['RECORDS', 'LIST_ENTRIES', 'LISTS'].includes(entityType)) {
+    return { success: false, error: `Unknown entity_type "${entityType}". Valid: RECORDS (SEARCH/LIST people or companies), LIST_ENTRIES (LIST/COUNT/ADD_ENTRIES/REMOVE_ENTRIES), LISTS. Workspace lookup is not supported; use LISTS LIST to discover lists.` };
   }
   try {
     const svc = await resolveAttioService(userId, args?.account_id);

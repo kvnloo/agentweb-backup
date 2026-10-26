@@ -247,6 +247,7 @@ export interface User {
   emailNotificationsEnabled?: boolean; // Portal Settings > Preferences toggle (ENG-1316). Absent = enabled (default).
   emmaTipsEnabled?: boolean; // Portal Settings > Preferences toggle + tip-card "don't show again" (ENG-188). Absent = enabled (default).
   showModelCompare?: boolean; // Portal Settings > Preferences "Compare models" toggle (ENG-113). Display choice only — shows/hides the chat Compare button; entitlement and /compare enforcement are unaffected. Absent = shown (default).
+  showIntegrationAccess?: boolean; // Portal Settings > Preferences "Integration access panel" toggle (ENG-2118). Display choice only — shows/hides the Connected Accounts card; /api/oauth/*/access-inventory still enforces org:accounts:read. Absent = shown (default).
   stripe_customer_id?: string;
   adAccount?: string; // Meta ad account ID
   emailDomain?: string; // @deprecated legacy single sending domain — kept for the task/subscriber-notification fallback sender (emailService.ts, dripSequenceWorker.ts legacyDefaultSender); CRM sending domains live in emailDomains[] (ENG-265)

@@ -802,6 +802,9 @@ export function evaluateAgentToolPolicy(input: AgentToolPolicyInput): AgentToolP
   };
 }
 
+import { normalizeHubSpotArgs } from './agentMode/crmToolArgs';
+import { normalizeAttioArgs } from './agentMode/attioTools';
+
 // ENG-2570: call_hubspot_api CONTACT_LIST GET — models put the list id in
 // `query` ({listId:"17"}, "listId=17", 17) instead of `list_id`, then loop to
 // repeated_failure (prod session 6935593b, 2026-10-17). Move an unambiguous id
@@ -968,7 +971,20 @@ export function validateAndRepairToolArgs(
     ? schema.required.filter((name: unknown): name is string => typeof name === 'string')
     : [];
   const allowAdditional = schema.additionalProperties !== false;
-  const repairedArgs: Record<string, unknown> = { ...(input.args as Record<string, unknown>) };
+  let repairedArgs: Record<string, unknown> = { ...(input.args as Record<string, unknown>) };
+  if (input.toolName === 'call_hubspot_api') {
+    const normalized = normalizeHubSpotArgs(repairedArgs);
+    if (JSON.stringify(normalized) !== JSON.stringify(repairedArgs)) {
+      repairs.push(repairedArgs.query !== undefined && normalized.query === undefined ? 'query->list_id' : 'hubspot:aliases');
+      repairedArgs = normalized;
+    }
+  }
+  if (input.toolName === 'call_attio_api') {
+    const { args, entityType, action } = normalizeAttioArgs(repairedArgs);
+    const normalized = { ...args, ...(entityType ? { entity_type: entityType } : {}), action };
+    if (JSON.stringify(normalized) !== JSON.stringify(repairedArgs)) repairs.push('attio:aliases');
+    repairedArgs = normalized;
+  }
   const propertyNames = Object.keys(properties);
   const lowRiskRepairAllowed = (input.effect ?? classifyToolEffect(input.toolName, input.args)) === 'read';
 

@@ -103,4 +103,28 @@ describe('ENG-2118 Drive browse', () => {
     expect(isValidDriveId("x' or '1'='1")).toBe(false);
     expect(isValidDriveId('')).toBe(false);
   });
+
+  it('never puts a provider message into errors[] (it is logged, not returned)', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const d: DriveListClient = {
+      drives: { list: async () => ({ data: {} }) },
+      files: { list: async () => { throw new Error('invalid_grant: token has been revoked for aseth@argusoft.com'); } },
+    };
+    const r = await browseDrive(d, null, { parent: 'p1' }, now);
+    expect(r.errors).toEqual(['folder: request failed']);
+    expect(JSON.stringify(r)).not.toContain('invalid_grant');
+    expect(warn).toHaveBeenCalledWith('[IntegrationAccess] provider call failed:', expect.stringContaining('invalid_grant'));
+    warn.mockRestore();
+  });
+
+  it('keeps a bare network error code, which carries no provider text', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const d: DriveListClient = {
+      drives: { list: async () => ({ data: {} }) },
+      files: { list: async () => { throw Object.assign(new Error('getaddrinfo ENOTFOUND www.googleapis.com'), { code: 'ENOTFOUND' }); } },
+    };
+    const r = await browseDrive(d, null, {}, now);
+    expect(r.errors).toEqual(['top level: ENOTFOUND']);
+    warn.mockRestore();
+  });
 });
