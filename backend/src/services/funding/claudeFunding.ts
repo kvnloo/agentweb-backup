@@ -35,8 +35,12 @@ export interface TurnFundingInput {
   sessionIsDelegated: boolean;
   /** `req.body.acknowledgeExtraUsage === true`: the user was told the model can bill their extra usage credits (Fable). */
   acknowledgedExtraUsage?: boolean;
-  /** `req.user.orgId`: set for organisation members. Truthy = stop (see above). */
-  initiatorOrgId?: string | null;
+  /**
+   * The initiator's organisation id (organisation members have one), read from the stored user: the authenticated `req.user` is built from the
+   * token and never carries it. Called only after the allow-list and the connection have said yes, so a user who is not allow-listed costs no
+   * read. A truthy answer is a stop; a FAILED read is an error (not "no organisation"), so the caller can stop with a typed lookup failure.
+   */
+  lookupOrgId?: () => Promise<string | null | undefined>;
   /** The request's explicit model pick, already canonicalised to a registry id; undefined when there is none or it does not resolve. */
   explicitModelId: string | undefined;
 }
@@ -62,6 +66,6 @@ export async function resolveTurnFunding(input: TurnFundingInput, deps?: Subscri
   if (decision.route !== "claude_subscription") throw new ClaudeRouteStopError("turn_failed");
   // After the resolver, so a user who is not allow-listed still hears `not_enabled` and learns nothing about their org.
   if (decision.alias === "fable" && input.acknowledgedExtraUsage !== true) throw new ClaudeRouteStopError("extra_usage_needs_ack");
-  if (input.initiatorOrgId) throw new ClaudeRouteStopError("org_not_supported");
+  if (input.lookupOrgId && (await input.lookupOrgId())) throw new ClaudeRouteStopError("org_not_supported");
   return decision;
 }

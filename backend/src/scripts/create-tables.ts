@@ -2216,9 +2216,10 @@ export const createZomaDeviceAuthTable = async () => {
   };
   try { await dynamodb.createTable(params).promise(); console.log(`Created ${params.TableName} table`); }
   catch (error: any) { if (error.code !== 'ResourceInUseException') throw error; }
-  // TTL can only be set on an ACTIVE table. Never fatal: the role running setup may not be allowed to set it.
-  await dynamodb.waitFor('tableExists', { TableName: params.TableName }).promise();
+  // TTL can only be set on an ACTIVE table. Never fatal (nothing after this table may be skipped): the role running setup may not be allowed
+  // to describe the table or to set TTL.
   try {
+    await dynamodb.waitFor('tableExists', { TableName: params.TableName }).promise();
     await dynamodb.updateTimeToLive({
       TableName: params.TableName,
       TimeToLiveSpecification: { Enabled: true, AttributeName: 'ttl' },

@@ -539,11 +539,15 @@ export function getHostedSubscriptionService(): HostedSubscriptionService {
       newId: () => randomUUID(),
       // The test environment's unix-socket host is built from the same checkout; the production worker must have been VERIFIED.
       workerSpeaksOurProtocol: () => !!process.env.AW_LOGIN_HOST_SOCKET || getLoginHostProvider().protocolStatus() === "match",
-      // Loaded on first use: the bridge singletons pull in Emma's whole service, which the sweeper and the routes must not load just to exist.
+      // Required on first use, not at load: the bridge singletons pull in Emma's whole service, which the sweeper and the routes must not load
+      // just to exist. Synchronous on purpose: the turns are stopped before this call returns, i.e. before the host is asked to wipe the login.
       onRevokeBegun: (connectionId) => {
-        const logFailure = (err: unknown) => console.error("[hosted-subscription] could not stop running turns:", err instanceof Error ? err.message : String(err));
-        void import("./claudeRunRegistry").then(({ claudeRunRegistry }) => claudeRunRegistry.cancelConnection(connectionId)).catch(logFailure);
-        void import("./toolBridgeService").then(({ toolBridgeMcp }) => toolBridgeMcp.revokeConnection(connectionId)).catch(logFailure);
+        /* eslint-disable @typescript-eslint/no-var-requires */
+        const { claudeRunRegistry } = require("./claudeRunRegistry") as typeof import("./claudeRunRegistry");
+        claudeRunRegistry.cancelConnection(connectionId);
+        const { toolBridgeMcp } = require("./toolBridgeService") as typeof import("./toolBridgeService");
+        toolBridgeMcp.revokeConnection(connectionId);
+        /* eslint-enable @typescript-eslint/no-var-requires */
       },
     });
   }

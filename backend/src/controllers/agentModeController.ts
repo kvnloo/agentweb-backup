@@ -10982,7 +10982,12 @@ export const agentModeController = {
           rawFundingChoice: req.body.fundingChoice,
           initiatorUserId: user.userId,
           sessionOwnerUserId: session.userId,
-          initiatorOrgId: (user as any).orgId,
+          // Read from the stored user (strongly consistent: this is a gate), only after the allow-list has said yes. req.user never carries it.
+          lookupOrgId: async () => {
+            const stored = await userDb.getUserByIdConsistent(user.userId);
+            if (!stored) throw new Error('user record not found'); // a failed read is a typed lookup failure, never "no organisation"
+            return stored.orgId;
+          },
           acknowledgedExtraUsage: req.body.acknowledgeExtraUsage === true,
           requestIsDelegated: (req as any).delegateInfo?.isDelegated === true,
           sessionIsDelegated: session.delegateInfo?.isDelegated === true,
@@ -11903,8 +11908,9 @@ export const agentModeController = {
       const planStop =
         error instanceof ClaudeRouteStopError
           ? error
-          : planTurn && !res.headersSent && !(error instanceof Error && isWorkerShutdownError(error))
-            ? new ClaudeRouteStopError('turn_failed')
+          // A full session keeps its own answer (413, start a new chat): "try again" would never work. Everything else on a plan turn is a typed stop.
+          : planTurn && !res.headersSent && !(error instanceof Error && isSessionLimitError(error))
+            ? new ClaudeRouteStopError(error instanceof Error && isWorkerShutdownError(error) ? 'server_restarting' : 'turn_failed')
             : undefined;
       if (planStop && !res.headersSent) {
         if (planStop !== error) {
@@ -11915,12 +11921,15 @@ export const agentModeController = {
         const stoppedSessionId = req.body?.sessionId;
         if (stoppedSessionId) {
           markProgressComplete(stoppedSessionId);
-          await chatbotDb.addMessageToSession(stoppedSessionId, {
-            role: 'assistant',
-            content: planStop.userMessage,
-            timestamp: new Date().toISOString(),
-            metadata: { timestamp: new Date().toISOString(), isErrorMessage: true, kind: 'claude-plan-stop', code: planStop.code },
-          } as ChatMessage).catch((persistErr) => console.error('AgentMode: failed to persist plan stop note:', persistErr));
+          // A note under a message that was never saved would be an answer to nothing.
+          if (wasRaisedAfterUserMessageSaved(planStop)) {
+            await chatbotDb.addMessageToSession(stoppedSessionId, {
+              role: 'assistant',
+              content: planStop.userMessage,
+              timestamp: new Date().toISOString(),
+              metadata: { timestamp: new Date().toISOString(), isErrorMessage: true, kind: 'claude-plan-stop', code: planStop.code },
+            } as ChatMessage).catch((persistErr) => console.error('AgentMode: failed to persist plan stop note:', persistErr));
+          }
         }
         return res.status(planStop.httpStatus).json(sendRefusalBody(claudeStopBody(planStop), wasRaisedAfterUserMessageSaved(planStop)));
       }

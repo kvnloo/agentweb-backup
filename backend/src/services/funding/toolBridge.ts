@@ -649,6 +649,14 @@ export class ToolBridge {
   }
 
   /**
+   * A turn that never reached the model (stopped, or refused by the host before it ran) must not use up the warning `beginTurn` reported: the
+   * action it warns about is still unaccounted for, and the next turn has to hear it. Safe to call for any session.
+   */
+  rearmUnknownOutcome(userId: string, sessionId: string): void {
+    this.sessionFor(userId, sessionId).carriedUnknown = true;
+  }
+
+  /**
    * The user pressed Stop. A no-op unless a turn is active (a stale Stop cannot poison
    * the next turn). Refuses every call not yet started, flags the one executing, closes
    * the session's runs and revokes their tokens. Never touches the halt latch or the

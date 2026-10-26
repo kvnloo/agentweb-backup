@@ -19,6 +19,8 @@ export const HOST_PROMPT_MAX_CHARS = 2_000_000;
 /** The host rejects a request body over 5 MiB; the rest of the request (ids, token, model) and a safety margin are reserved. */
 export const HOST_BODY_MAX_BYTES = 5 * 1024 * 1024;
 const BODY_RESERVE_BYTES = 32 * 1024;
+/** Room under the character cap for what is added after rendering (one directive). */
+const CHAR_RESERVE = 4 * 1024;
 
 export class PromptTooLargeError extends Error {
   constructor(public readonly chars: number, public readonly bytes: number) {
@@ -127,7 +129,7 @@ export function renderPromptForCli(messages: any[]): RenderedPrompt {
   }
   const prompt = `${PROMPT_PREAMBLE}\n\n${blocks.join("\n")}\n`;
   const bodyBytes = Buffer.byteLength(JSON.stringify(prompt));
-  if (prompt.length > HOST_PROMPT_MAX_CHARS || bodyBytes > HOST_BODY_MAX_BYTES - BODY_RESERVE_BYTES) {
+  if (prompt.length > HOST_PROMPT_MAX_CHARS - CHAR_RESERVE || bodyBytes > HOST_BODY_MAX_BYTES - BODY_RESERVE_BYTES) {
     throw new PromptTooLargeError(prompt.length, bodyBytes);
   }
   return { prompt, chars: prompt.length, bodyBytes };

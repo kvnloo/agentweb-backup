@@ -22,7 +22,9 @@ import { resolveTurnFunding } from '../services/funding/claudeFunding';
 import { claudeCodeBackend } from '../services/funding/claudeCodeBackendInstance';
 import { ClaudeRouteStopError } from '../services/funding/claudeRouteErrors';
 import { assertModelInOwnerPlan, modelAccess } from '../services/agentMode/modelAccessInstance';
+import { userDb } from '../services/db';
 import { resolveRunFunding } from '../services/funding/runFunding';
+import { isSessionLimitError, isWorkerShutdownError } from '../utils/agentModeErrors';
 import { emitProgress, requestCancel } from '../utils/sseProgress';
 import { WORK_PLAN_NEEDS_YOU_MESSAGE } from '../controllers/agentModeController';
 
@@ -207,13 +209,24 @@ describe('/generate on the Claude plan route', () => {
       expect(funding).toHaveBeenCalledWith(expect.objectContaining({ explicitModelId: undefined }));
     });
 
-    it('hands the resolver the organisation, the Fable acknowledgement, the initiator and a delegated session', async () => {
+    it('hands the resolver an organisation lookup that reads the STORED user (req.user never carries orgId), the Fable acknowledgement, the initiator and a delegated session', async () => {
       funding.mockRejectedValue(new ClaudeRouteStopError('not_enabled'));
       db.getChatSession.mockResolvedValue({ ...SESSION, delegateInfo: { isDelegated: true } } as any);
       const req = makeReq({ fundingChoice: 'claude_subscription', acknowledgeExtraUsage: true }) as any;
-      req.user = { userId: 'u1', email: 'u1@example.com', orgId: 'org-1' };
       await agentModeController.generateResponse(req, makeRes());
-      expect(funding).toHaveBeenLastCalledWith(expect.objectContaining({ initiatorOrgId: 'org-1', acknowledgedExtraUsage: true, sessionIsDelegated: true, initiatorUserId: 'u1' }));
+      expect(funding).toHaveBeenLastCalledWith(expect.objectContaining({ acknowledgedExtraUsage: true, sessionIsDelegated: true, initiatorUserId: 'u1' }));
+      expect(funding.mock.calls[funding.mock.calls.length - 1][0]).not.toHaveProperty('initiatorOrgId');
+      const lookup = funding.mock.calls[funding.mock.calls.length - 1][0].lookupOrgId as () => Promise<unknown>;
+      const read = jest.spyOn(userDb, 'getUserByIdConsistent');
+      read.mockResolvedValueOnce({ userId: 'u1', orgId: 'org-1' } as any);
+      expect(await lookup()).toBe('org-1');
+      expect(read).toHaveBeenCalledWith('u1');
+      read.mockResolvedValueOnce({ userId: 'u1' } as any);
+      expect(await lookup()).toBeUndefined();
+      read.mockResolvedValueOnce(undefined as any);
+      await expect(lookup()).rejects.toThrow(); // a missing record is a failed lookup, never "no organisation"
+      read.mockRejectedValueOnce(new Error('dynamo blip'));
+      await expect(lookup()).rejects.toThrow('dynamo blip');
       await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription', acknowledgeExtraUsage: 'yes' }), makeRes());
       expect(funding).toHaveBeenLastCalledWith(expect.objectContaining({ acknowledgedExtraUsage: false })); // only the literal true counts
       const admin = makeReq({ fundingChoice: 'claude_subscription' }) as any;
@@ -344,6 +357,40 @@ describe('/generate on the Claude plan route', () => {
       expect(agentModeService.generateDiagnosticMessage).not.toHaveBeenCalled();
       expect(worker.runInWorker).not.toHaveBeenCalled();
       expect(activeSessionGenerations.has('s1')).toBe(false);
+    });
+
+    it('a worker-shutdown error on a plan turn is the restarting stop, in the plan shape', async () => {
+      backend.mockRejectedValueOnce(new Error('worker exited'));
+      (isWorkerShutdownError as unknown as jest.Mock).mockReturnValueOnce(true);
+      const res = makeRes();
+      await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription' }), res);
+      expect(res.status).toHaveBeenCalledWith(503);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'server_restarting', funding: 'claude_subscription', retryable: true }));
+      expect(agentModeService.generateDiagnosticMessage).not.toHaveBeenCalled();
+    });
+
+    it('an error before the user message is saved is a typed stop that says so, with no note under a message that does not exist', async () => {
+      db.getMessagesFromMessagesTable.mockRejectedValueOnce(new Error('messages table down')); // read before the user message is stored
+      const res = makeRes();
+      await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription' }), res);
+      expect(res.status).toHaveBeenCalledWith(502);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'turn_failed', funding: 'claude_subscription', userMessageSaved: false }));
+      expect(db.addMessageToSession.mock.calls.some((c) => (c[1] as any)?.metadata?.kind === 'claude-plan-stop')).toBe(false);
+      expect(backend).not.toHaveBeenCalled();
+      expect(agentModeService.generateDiagnosticMessage).not.toHaveBeenCalled();
+    });
+
+    it('a full session keeps its own answer on a plan turn: never a retryable "try again", never a note under a message that was not saved', async () => {
+      backend.mockRejectedValueOnce(new Error('SESSION_MESSAGE_LIMIT_EXCEEDED'));
+      (isSessionLimitError as unknown as jest.Mock).mockReturnValue(true);
+      try {
+        const res = makeRes();
+        await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription' }), res);
+        expect(res.json).not.toHaveBeenCalledWith(expect.objectContaining({ code: 'turn_failed' }));
+        expect(db.addMessageToSession.mock.calls.some((c) => (c[1] as any)?.metadata?.kind === 'claude-plan-stop')).toBe(false);
+      } finally {
+        (isSessionLimitError as unknown as jest.Mock).mockReturnValue(false);
+      }
     });
 
     it('hands the backend what the turn needs: delegation, the turn clock, the stamps and a progress sink that reaches the stream', async () => {

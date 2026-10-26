@@ -40,6 +40,7 @@ interface Harness {
     began?: { previousUnknownOutcome: boolean };
     lateReads: number;
     socketEmitted: Array<[string, string]>;
+    rearmed: Array<[string, string]>;
   };
 }
 
@@ -56,7 +57,7 @@ function harness(): Harness {
   let runClosedByCancel = false; // the real bridge ends the run on cancelSession: the drain of a closed run answers null
   const lateRecords: BridgeCallRecord[] = [];
   let n = 0;
-  const x: Harness['x'] = { stillRunning: 0, lateReads: 0, socketEmitted: [] };
+  const x: Harness['x'] = { stillRunning: 0, lateReads: 0, socketEmitted: [], rearmed: [] };
   const deps: ClaudeBackendDeps = {
     hostClient: () => (state.client ? ({} as any) : undefined),
     prepareTurnContext: async (input) => (calls.push('prepare'), (x.prepInput = input), { messages: state.messages }),
@@ -69,6 +70,7 @@ function harness(): Harness {
     bridge: {
       openRun: (claims, opts) => (calls.push(`open:${claims.runId}`), (x.openClaims = claims), (x.openOpts = opts), 'token-abc'),
       beginTurn: () => (calls.push('beginTurn'), x.began),
+      rearmUnknownOutcome: (u, s) => void x.rearmed.push([u, s]),
       noteToolUse: (_r, id, name) => void calls.push(`use:${id}:${name}`),
       noteToolResult: (_r, id) => void calls.push(`result:${id}`),
       // Like the real bridge: closing a run (drain, close, Stop) hands the executor's per-run state back, after any call still executing has finished.
@@ -475,6 +477,72 @@ describe('ClaudeCodeBackend', () => {
         await new ClaudeCodeBackend(clean.deps).run(params());
         expect(clean.state.hostReq.prompt).not.toContain(PREVIOUS_UNKNOWN_DIRECTIVE);
       }
+    });
+
+    describe('the "an earlier action may not have finished" warning', () => {
+      const unknownBefore = () => {
+        const h = harness();
+        h.x.began = { previousUnknownOutcome: true };
+        return h;
+      };
+
+      it('is put back when the turn ends before the model could read it: a Stop before the host ran', async () => {
+        const h = unknownBefore();
+        h.state.cancelled = true;
+        const r = await new ClaudeCodeBackend(h.deps).run(params());
+        expect(r.cancelled).toBe(true);
+        expect(h.x.rearmed).toEqual([['u1', 's1']]);
+      });
+
+      it('is put back when the host refuses the turn at admission', async () => {
+        for (const err of [new LoginHostError('EBUSY'), new LoginHostError('UNREACHABLE', 'x'), new LoginHostError('ESTALE'), new LoginHostError('ENOTFOUND')]) {
+          const h = unknownBefore();
+          h.setHost(async () => {
+            throw err;
+          });
+          await stopCode(new ClaudeCodeBackend(h.deps).run(params()));
+          expect(h.x.rearmed).toEqual([['u1', 's1']]);
+        }
+      });
+
+      it('is spent once the host produced an event: the model read it', async () => {
+        const h = unknownBefore();
+        h.setHost(async (_req, opts) => {
+          await opts.onEvent({ type: 'tool-use', operationId: 'a', name: 'mcp__emma__x', input: {} } as ProviderEvent);
+          return done('ok');
+        });
+        await new ClaudeCodeBackend(h.deps).run(params());
+        expect(h.x.rearmed).toEqual([]);
+      });
+
+      it('is spent when the host produced an event and then failed: the model read it', async () => {
+        const h = unknownBefore();
+        h.setHost(async (_req, opts) => {
+          await opts.onEvent({ type: 'text', delta: 'working' } as ProviderEvent);
+          throw new LoginHostError('UNREACHABLE', 'dropped');
+        });
+        await stopCode(new ClaudeCodeBackend(h.deps).run(params()));
+        expect(h.x.rearmed).toEqual([]);
+      });
+
+      it('is spent when the host gave an outcome, even a lost stream', async () => {
+        const h = unknownBefore();
+        h.setHost(async () => ({ kind: 'unknown_outcome', reason: 'stream_dropped' }));
+        await new ClaudeCodeBackend(h.deps).run(params());
+        expect(h.x.rearmed).toEqual([]);
+      });
+
+      it('is never re-armed when there was nothing to warn about', async () => {
+        const h = harness();
+        h.state.cancelled = true;
+        await new ClaudeCodeBackend(h.deps).run(params());
+        h.setHost(async () => {
+          throw new LoginHostError('EBUSY');
+        });
+        h.state.cancelled = false;
+        await stopCode(new ClaudeCodeBackend(h.deps).run(params()));
+        expect(h.x.rearmed).toEqual([]);
+      });
     });
 
     it('a refused second turn closes the bridge run it opened', async () => {

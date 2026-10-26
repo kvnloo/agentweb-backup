@@ -151,6 +151,15 @@ describe('renderPromptForCli', () => {
       expect(() => renderPromptForCli([{ role: 'user', content }])).toThrow(PromptTooLargeError);
     });
 
+    it('keeps a reserve below the host character cap for what is added after rendering', () => {
+      const room = 5_000; // a user block of this size plus the preamble lands inside the 4 KiB reserve
+      const nearCap = 'a'.repeat(HOST_PROMPT_MAX_CHARS - room + 3_000);
+      expect(() => renderPromptForCli([{ role: 'user', content: nearCap }])).toThrow(PromptTooLargeError);
+      const withRoom = renderPromptForCli([{ role: 'user', content: 'a'.repeat(HOST_PROMPT_MAX_CHARS - 12_000) }]);
+      expect(withRoom.chars).toBeLessThan(HOST_PROMPT_MAX_CHARS - 4 * 1024);
+      expect(appendDirective(withRoom.prompt, 'x'.repeat(300)).length).toBeLessThan(HOST_PROMPT_MAX_CHARS);
+    });
+
     it('keeps a reserve below the host body limit for the request around the prompt', () => {
       // Multi-byte text lands the body a little under the limit: inside the 32 KiB reserve it must already be refused, outside it accepted.
       const insideReserve = '日'.repeat(Math.floor((HOST_BODY_MAX_BYTES - 10_000) / 3));

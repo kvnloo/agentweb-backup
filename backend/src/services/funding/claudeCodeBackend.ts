@@ -82,6 +82,8 @@ export interface ClaudeBackendDeps {
   bridge: {
     openRun(claims: RunToolTokenClaims, opts?: { callGroupWaitMs?: number; onHalted?: (info: { fallbackNeeded: boolean }) => void }): string;
     beginTurn(userId: string, sessionId: string): { previousUnknownOutcome: boolean } | undefined;
+    /** Puts back the "an earlier action may not have finished" warning when a turn ended before the model could read it. */
+    rearmUnknownOutcome(userId: string, sessionId: string): void;
     noteToolUse(runId: string, callId: string, name: string, input: unknown, messageId?: string): void;
     noteToolResult(runId: string, callId?: string): void;
     closeRunAndDrain(runId: string, timeoutMs: number): Promise<CloseAndDrainResult | null>;
@@ -212,9 +214,11 @@ export class ClaudeCodeBackend {
     let executorRegistered = false;
     let outcome: HostTurnOutcome | undefined;
     let cancelledByUser = false;
+    let previousUnknown = false; // the bridge reported (and cleared) an unfinished action from an earlier turn
+    let hostStarted = false; //     the host produced at least one event: the model read the prompt
 
     const progress = (status: string, extra: Record<string, unknown> = {}) => {
-      if (seen.stopped || rawError !== undefined || pendingStop) return; // nothing is "executing" once the turn is stopped or failed
+      if (seen.stopped) return; // nothing is "executing" once the turn was stopped (a failed host call ends the event stream, so no event follows it)
       try {
         p.onProgress?.({ iteration: uses.length, status, ...extra });
       } catch {
@@ -224,7 +228,8 @@ export class ClaudeCodeBackend {
 
     try {
       d.executor.registerRun(runId, { llmModel: p.llmModel, isDelegatedAccess: p.isDelegatedAccess, excludeTools: p.excludeTools, screenshotUrl: p.screenshotUrl, socketEmit: d.socketEmit,
-        // The tools' own paid / LLM calls: AgentWeb-funded and attributed to this run, on purpose (decision 2026-10-23). Never the plan's scope.
+        // The tools' own paid / LLM calls: AgentWeb-funded and attributed to this run (decision 2026-10-23), never the plan's scope. Like a normal AgentWeb
+        // turn they follow the user's BYOK setting if one is on.
         fundingScope: { route: "agentweb", fallback: "agentweb", ownerUserId: p.userId, billingUserId: p.billingUserId ?? p.userId, runLabel: `claude_plan:${runId}`, resolvedAt: new Date(startedAt).toISOString() },
       });
       executorRegistered = true;
@@ -250,7 +255,10 @@ export class ClaudeCodeBackend {
         throw err;
       }
       const began = d.bridge.beginTurn(p.userId, p.sessionId);
-      if (began?.previousUnknownOutcome === true) prompt = appendDirective(prompt, PREVIOUS_UNKNOWN_DIRECTIVE);
+      if (began?.previousUnknownOutcome === true) {
+        previousUnknown = true;
+        prompt = appendDirective(prompt, PREVIOUS_UNKNOWN_DIRECTIVE);
+      }
       d.executor.beginTurn(runId, { agentRuntimeRunId: runId, priorSearchCallCount: d.seedSearchCount?.(p.sessionHistory) ?? 0 });
 
       if (d.isCancelled(p.sessionId)) {
@@ -278,6 +286,7 @@ export class ClaudeCodeBackend {
             {
               signal: ac.signal,
               onEvent: (e: ProviderEvent) => {
+                hostStarted = true;
                 if (e.type === "tool-use") {
                   const name = e.name.replace(/^mcp__[A-Za-z0-9_]+?__/, "");
                   uses.push({ id: e.operationId, name });
@@ -376,6 +385,15 @@ export class ClaudeCodeBackend {
         persistedResponseCount: 0,
       };
     } finally {
+      // The warning is only spent once the model could have read it. A Stop before the host ran, an admission refusal or a timeout before the
+      // first event leave it unspent: put it back for the next turn.
+      if (previousUnknown && !hostStarted && outcome === undefined) {
+        try {
+          d.bridge.rearmUnknownOutcome(p.userId, p.sessionId);
+        } catch {
+          /* best effort */
+        }
+      }
       registered?.release();
       if (opened) {
         try {

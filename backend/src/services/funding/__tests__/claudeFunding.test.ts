@@ -113,15 +113,28 @@ describe('resolveTurnFunding', () => {
     });
 
     it('an organisation member is stopped, but only after the allow-list and the connection have had their say', async () => {
-      expect(await code(resolveTurnFunding(input({ initiatorOrgId: 'org-1' }), deps().d))).toBe('org_not_supported');
-      expect(await code(resolveTurnFunding(input({ initiatorOrgId: 'org-1' }), deps({ enabled: false }).d))).toBe('not_enabled');
-      expect(await code(resolveTurnFunding(input({ initiatorOrgId: 'org-1' }), deps({ records: [] }).d))).toBe('no_connection');
-      await expect(resolveTurnFunding(input({ initiatorOrgId: null }), deps().d)).resolves.toMatchObject({ route: 'claude_subscription' });
-      await expect(resolveTurnFunding(input({ initiatorOrgId: undefined }), deps().d)).resolves.toMatchObject({ route: 'claude_subscription' });
+      const member = jest.fn(async () => 'org-1');
+      expect(await code(resolveTurnFunding(input({ lookupOrgId: member }), deps().d))).toBe('org_not_supported');
+      expect(member).toHaveBeenCalledTimes(1);
+      // not allow-listed / no usable connection: the organisation is never even looked up, and the answer says nothing about it
+      const never = jest.fn(async () => 'org-1');
+      expect(await code(resolveTurnFunding(input({ lookupOrgId: never }), deps({ enabled: false }).d))).toBe('not_enabled');
+      expect(await code(resolveTurnFunding(input({ lookupOrgId: never }), deps({ records: [] }).d))).toBe('no_connection');
+      expect(never).not.toHaveBeenCalled();
+      for (const none of [null, undefined, '']) {
+        await expect(resolveTurnFunding(input({ lookupOrgId: async () => none }), deps().d)).resolves.toMatchObject({ route: 'claude_subscription' });
+      }
+      await expect(resolveTurnFunding(input({}), deps().d)).resolves.toMatchObject({ route: 'claude_subscription' });
     });
 
-    it('an organisation member who asks for AgentWeb is not touched', async () => {
-      await expect(resolveTurnFunding(input({ rawFundingChoice: 'agentweb', initiatorOrgId: 'org-1' }), deps().d)).resolves.toEqual({ route: 'agentweb' });
+    it('a failed organisation lookup is an error, never read as "no organisation"', async () => {
+      await expect(resolveTurnFunding(input({ lookupOrgId: async () => { throw new Error('dynamo blip'); } }), deps().d)).rejects.toThrow('dynamo blip');
+    });
+
+    it('an organisation member who asks for AgentWeb is not touched, and nothing is looked up', async () => {
+      const member = jest.fn(async () => 'org-1');
+      await expect(resolveTurnFunding(input({ rawFundingChoice: 'agentweb', lookupOrgId: member }), deps().d)).resolves.toEqual({ route: 'agentweb' });
+      expect(member).not.toHaveBeenCalled();
     });
   });
 });
