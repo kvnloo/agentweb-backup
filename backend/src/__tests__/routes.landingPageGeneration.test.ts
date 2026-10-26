@@ -37,7 +37,7 @@ jest.mock("aws-sdk", () => {
 // Mock auth middleware
 jest.mock("../middleware/auth", () => ({
   authenticateToken: (req: any, _res: any, next: any) => {
-    req.user = { userId: "test-user-id", email: "test@example.com", isAdmin: false };
+    req.user = { userId: "test-user-id", email: "test@example.com", isAdmin: req.headers["x-admin"] === "1" };
     next();
   },
   AuthenticatedRequest: {},
@@ -54,9 +54,14 @@ const mockCanOrgMemberAccessList = jest.fn();
 // ENG-827: the publish route's last-moment consent re-check reads these two for real.
 const mockGetScheduleById = jest.fn();
 const mockGetChatSession = jest.fn();
+// ENG-2651: /generate reads the originating session's record to decide whether to attach it.
+const mockGetChatSessionRecord = jest.fn();
 
 jest.mock("../services/chatbotService", () => ({
-  chatbotDb: { getChatSession: (...args: any[]) => mockGetChatSession(...args) },
+  chatbotDb: {
+    getChatSession: (...args: any[]) => mockGetChatSession(...args),
+    getChatSessionRecord: (...args: any[]) => mockGetChatSessionRecord(...args),
+  },
 }));
 
 jest.mock("../services/db", () => ({
@@ -271,6 +276,85 @@ beforeEach(() => {
 // =============================================================================
 // POST /generate
 // =============================================================================
+// ENG-2651: the page's originatingSessionId is the chat its completion/failure message is written
+// into and the session its auto human-eval candidate mints an iShare link for. A session the caller
+// may not open (owner or admin) must never be attached; generation itself still proceeds, because
+// external MCP clients send their transport session id here.
+describe("POST /api/landing-pages/v0/generate — originating_session_id ownership (ENG-2651)", () => {
+  const generateOpts = () => mockGenerateLandingPage.mock.calls[0][6];
+
+  beforeEach(() => {
+    mockGenerateLandingPage.mockResolvedValue({ id: "page-new", status: "deployed" });
+  });
+
+  it("drops another account's session and still generates", async () => {
+    mockGetChatSessionRecord.mockResolvedValue({ sessionId: "victim-session", userId: "victim-user" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", lead_list_id: "list-1", originating_session_id: "victim-session" });
+
+    expect(res.status).toBe(201);
+    expect(mockGetChatSessionRecord).toHaveBeenCalledWith("victim-session", true);
+    expect(generateOpts().originatingSessionId).toBeUndefined();
+  });
+
+  it("drops an id that is not a chat session (an MCP transport session id)", async () => {
+    mockGetChatSessionRecord.mockResolvedValue(null);
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", lead_list_id: "list-1", originating_session_id: "mcp-transport-id" });
+
+    expect(res.status).toBe(201);
+    expect(generateOpts().originatingSessionId).toBeUndefined();
+  });
+
+  it("drops an oversized id without reading it (DynamoDB would reject the key with a 500)", async () => {
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", lead_list_id: "list-1", originating_session_id: "x".repeat(4000) });
+
+    expect(res.status).toBe(201);
+    expect(mockGetChatSessionRecord).not.toHaveBeenCalled();
+    expect(generateOpts().originatingSessionId).toBeUndefined();
+  });
+
+  it("drops the id instead of failing the generation when the session read fails", async () => {
+    mockGetChatSessionRecord.mockRejectedValue(new Error("ProvisionedThroughputExceededException"));
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", lead_list_id: "list-1", originating_session_id: "own-session" });
+
+    expect(res.status).toBe(201);
+    expect(generateOpts().originatingSessionId).toBeUndefined();
+  });
+
+  it("keeps the caller's own session", async () => {
+    mockGetChatSessionRecord.mockResolvedValue({ sessionId: "own-session", userId: "test-user-id" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", lead_list_id: "list-1", originating_session_id: "own-session" });
+
+    expect(res.status).toBe(201);
+    expect(generateOpts().originatingSessionId).toBe("own-session");
+  });
+
+  it("keeps any account's session for an admin", async () => {
+    mockGetChatSessionRecord.mockResolvedValue({ sessionId: "customer-session", userId: "customer-user" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .set("x-admin", "1")
+      .send({ prompt: "Create a page", lead_list_id: "list-1", originating_session_id: "customer-session" });
+
+    expect(res.status).toBe(201);
+    expect(generateOpts().originatingSessionId).toBe("customer-session");
+  });
+});
+
 describe("POST /api/landing-pages/v0/generate", () => {
   it("FAIL: no body → 400", async () => {
     const res = await request(app)
