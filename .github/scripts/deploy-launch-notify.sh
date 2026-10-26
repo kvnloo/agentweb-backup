@@ -56,11 +56,13 @@ build_launch_message() {
     end' "$1"
 }
 
-# collect_prs <base> <head> -> JSON array on stdout. PR numbers come from the
-# squash-merge subjects "... (#123)" in base..head; titles/bodies from the API.
+# collect_prs <base> <head> -> JSON array on stdout. PR numbers come from
+# first-parent subjects in base..head: "Merge pull request #123 ..." (merge
+# commits, this repo's default) or "... (#123)" (squash). Titles from the API.
 collect_prs() {
   local nums n
-  nums="$(git log --format=%s "$1..$2" | sed -nE 's/.*\(#([0-9]+)\)$/\1/p' | sort -un)"
+  nums="$(git log --first-parent --format=%s "$1..$2" |
+    sed -nE 's/^Merge pull request #([0-9]+) .*/\1/p; s/.*\(#([0-9]+)\)$/\1/p' | sort -un)"
   {
     for n in ${nums}; do
       gh pr view "${n}" --repo "${REPO}" --json number,title,body

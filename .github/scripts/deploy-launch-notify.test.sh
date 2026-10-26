@@ -59,11 +59,11 @@ check "no base: exit 0 + notice" '[ "$rc" -eq 0 ] && grep -q "LAUNCH_NOTIFY_SKIP
 mkdir -p "${TDIR}/bin"
 cat >"${TDIR}/bin/git" <<'M'
 #!/usr/bin/env bash
-printf 'feat: a thing (#41)\nMerge noise\n'
+printf 'Merge pull request #42 from o/b\nfeat: a thing (#41)\nMerge branch main into x\n'
 M
 cat >"${TDIR}/bin/gh" <<'M'
 #!/usr/bin/env bash
-echo '{"number":41,"title":"a thing","body":"ENG-1"}'
+echo "{\"number\":$3,\"title\":\"t$3\",\"body\":\"ENG-1\"}"
 M
 cat >"${TDIR}/bin/aws" <<'M'
 #!/usr/bin/env bash
@@ -83,6 +83,6 @@ out="$(run_full '{"ok":false,"error":"not_in_channel"}')"; rc=$?
 check "ok:false: fails loudly" '[ "$rc" -ne 0 ] && grep -q "not_in_channel" <<<"$out"'
 check "ok:false: token not printed" '! grep -q "xoxb-test" <<<"$out"'
 out="$(run_full '{"ok":true}')"; rc=$?
-check "ok:true: exit 0" '[ "$rc" -eq 0 ] && grep -q "1 PR" <<<"$out"'
+check "ok:true: exit 0" '[ "$rc" -eq 0 ] && grep -q "2 PR" <<<"$out"'
 
 exit "${FAILED}"
