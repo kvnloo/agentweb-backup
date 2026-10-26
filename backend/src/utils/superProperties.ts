@@ -59,7 +59,7 @@ const SERVER_ONLY: ReadonlySet<string> = new Set(['#ip']);
 const LONG: ReadonlySet<string> = new Set(['#url', '#referrer', '#ua', '#title']);
 const URLISH: ReadonlySet<string> = new Set(['#url', '#referrer']);
 
-const cleanText = (v: string, n: number): string => v.slice(0, n).replace(/[^\w.@+:/ -]/g, '').trim();
+const cleanText = (v: string, n: number): string => v.slice(0, n).replace(/[^\p{L}\p{M}\p{N}_.@+:/ -]/gu, '').trim();
 const cleanUrlText = (v: string, n: number): string => v.slice(0, n).replace(/[^\w.~:/?#[\]@!$&'()*+,;=%-]/g, '');
 
 /** Field name a super property is stored under. */

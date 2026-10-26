@@ -147,6 +147,12 @@ export const AW_SDK_SOURCE: string = String.raw`/* AgentWeb tracker v1. One sess
         body.journey = ''; body.clickLog = ''; body.showsClicked = '';
         s = JSON.stringify(body);
       }
+      // Registered super values (site-owner awSuper/awRegister) can still push it over: drop them, keep
+      // the automatic ones (#url, #title, ...) and the event.
+      if (s.length > 15000 && body['super']) {
+        for (var rk in superReg) if (Object.prototype.hasOwnProperty.call(superReg, rk)) delete body['super'][rk];
+        s = JSON.stringify(body);
+      }
       try {
         if (nav.sendBeacon && nav.sendBeacon(endpoint, new Blob([s], { type: 'text/plain;charset=UTF-8' }))) return true;
       } catch (e) {}
@@ -197,11 +203,13 @@ export const AW_SDK_SOURCE: string = String.raw`/* AgentWeb tracker v1. One sess
         if (!p || typeof p !== 'object') return false;
         for (var k in p) {
           if (!Object.prototype.hasOwnProperty.call(p, k) || typeof k !== 'string' || k.length > 40) continue;
-          var v = p[k];
+          var v = p[k], ok;
+          if (typeof v === 'string') { v = v.slice(0, 300); ok = true; }
+          else ok = (typeof v === 'number' && isFinite(v)) || typeof v === 'boolean';
+          // Count a key only once its value is accepted, so invalid values never consume a slot.
+          if (!ok) continue;
           if (!Object.prototype.hasOwnProperty.call(superReg, k)) { if (superN >= 60) continue; superN++; }
-          if (typeof v === 'string') superReg[k] = v.slice(0, 300);
-          else if (typeof v === 'number' && isFinite(v)) superReg[k] = v;
-          else if (typeof v === 'boolean') superReg[k] = v;
+          superReg[k] = v;
         }
         return true;
       } catch (e) { return false; }
