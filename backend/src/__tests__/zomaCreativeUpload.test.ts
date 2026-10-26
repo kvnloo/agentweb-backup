@@ -26,7 +26,7 @@ import {
   type MetaToolkitCreativeDeps,
 } from '../mcp/metaToolkitCreatives';
 import { MetaToolkitRefusal } from '../mcp/metaToolkitErrors';
-import { handleMetaToolkitCall } from '../mcp/metaToolkitGateway';
+import { handleMetaToolkitCall, stripCredentials } from '../mcp/metaToolkitGateway';
 import { getMetaToolkitManifest } from '../mcp/metaToolkitManifest';
 import { ZomaNotReadyError } from '../mcp/zomaOnboarding';
 
@@ -256,4 +256,26 @@ describe('isPrivateAddress', () => {
     '%s → %s',
     (ip, expected) => expect(isPrivateAddress(ip)).toBe(expected),
   );
+});
+
+describe('E2E regressions (2026-10-26 prod run)', () => {
+  it('skips the lagging ownership edge for a video it just uploaded, but not for caller ids', async () => {
+    const videoStatus = jest.fn().mockResolvedValue({ status: 'ready', thumbnail_url: 't' });
+    await executeMetaToolkitCreative(USER, call('UPLOAD_VIDEO', { video_url: 'https://cdn.x/v.mp4' }), deps({ videoStatus }));
+    expect(videoStatus).toHaveBeenCalledWith(USER, ACCOUNT, '998877', { justUploaded: true });
+    videoStatus.mockClear();
+    await executeMetaToolkitCreative(USER, call('UPLOAD_VIDEO', { video_id: '42' }), deps({ videoStatus }));
+    expect(videoStatus).toHaveBeenCalledWith(USER, ACCOUNT, '42', { justUploaded: false });
+  });
+
+  it('surfaces a video-status failure as a readable refusal', async () => {
+    const d = deps({ videoStatus: jest.fn().mockRejectedValue(new Error('That video is not in the selected ad account.')) });
+    await expect(executeMetaToolkitCreative(USER, call('UPLOAD_VIDEO', { video_id: '42' }), d)).rejects.toThrow(/not in the selected ad account/);
+  });
+
+  it('never returns Page or user access tokens to external agents', () => {
+    const out: any = stripCredentials({ pages: [{ id: '1', name: 'P', access_token: 'EAAsecret', nested: { refresh_token: 'r', ok: 1 } }], message: 'm' });
+    expect(JSON.stringify(out)).not.toMatch(/EAAsecret|refresh_token|access_token/);
+    expect(out.pages[0]).toMatchObject({ id: '1', name: 'P', nested: { ok: 1 } });
+  });
 });

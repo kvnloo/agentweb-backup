@@ -181,6 +181,24 @@ function toolAcceptsAccountId(name: string): boolean {
   return !!def?.inputSchema?.properties?.account_id;
 }
 
+const SECRET_KEYS = new Set(['access_token', 'page_access_token', 'accessToken', 'pageAccessToken', 'refresh_token', 'refreshToken']);
+
+/**
+ * Remove credential fields from anything returned to an external agent. Shared Emma
+ * readers (e.g. PAGE LIST) return the Page access token for internal use; an external
+ * caller must never receive it (found in the 2026-10-26 Zoma creative-upload E2E).
+ */
+export function stripCredentials<T>(value: T, depth = 0): T {
+  if (depth > 12 || value === null || typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.map((v) => stripCredentials(v, depth + 1)) as unknown as T;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    if (SECRET_KEYS.has(k)) continue;
+    out[k] = stripCredentials(v, depth + 1);
+  }
+  return out as T;
+}
+
 /**
  * Full external call: authenticate → resolve account → execute → meter once on success.
  * A refused or failed call is not metered.
@@ -262,5 +280,5 @@ export async function handleMetaToolkitCall(
   }
 
   await meter();
-  return result;
+  return stripCredentials(result);
 }
