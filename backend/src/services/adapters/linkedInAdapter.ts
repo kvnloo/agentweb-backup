@@ -232,7 +232,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
 
     try {
       // Get valid token (refreshes if expired)
-      const { token } = await this.getValidToken(account, userId);
+      const { token, wasRefreshed } = await this.getValidToken(account, userId);
 
       // ENG-827: the token refresh above is a network round-trip taken on a consent
       // decision read before it. This is the last moment before the comment is public.
@@ -243,7 +243,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       }
 
       // Create comment
-      const commentUrn = await linkedInService.createComment(token, postUrn, actorUrn, commentText, parentCommentUrn);
+      const commentUrn = await retryOnceIfFreshToken401(wasRefreshed, () => linkedInService.createComment(token, postUrn, actorUrn, commentText, parentCommentUrn));
 
       return {
         success: true,
