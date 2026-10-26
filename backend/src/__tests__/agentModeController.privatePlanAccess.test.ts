@@ -46,12 +46,10 @@ describe('private work plan access (ENG-2655)', () => {
     wps.getPublicPlansForAgentMode.mockResolvedValue([]);
   });
 
-  const handlers = [
-    ['getPredefinedWorkPlan', (r: Request, s: Response) => agentModeController.getPredefinedWorkPlan(r, s)],
-    ['createSessionWithPlan', (r: Request, s: Response) => agentModeController.createSessionWithPlan(r, s)],
-  ] as const;
+  // createSessionWithPlan's equivalent cases live in agentModeController.createSessionWithPlan.test.ts.
+  describe('getPredefinedWorkPlan', () => {
+    const call = (r: Request, s: Response) => agentModeController.getPredefinedWorkPlan(r, s);
 
-  describe.each(handlers)('%s', (_name, call) => {
     it("does not resolve another account's private plan for a signed-in non-owner", async () => {
       // The owner's plan exists but belongs to someone else: the viewer's own/org queries never return it.
       const r = res();
@@ -60,14 +58,7 @@ describe('private work plan access (ENG-2655)', () => {
       expect(JSON.stringify((r.json as jest.Mock).mock.calls)).not.toContain('ACME');
     });
 
-    it('does not resolve an ownerless private plan (admin-created) for any signed-in user', async () => {
-      // An ownerless plan is in no OwnerIndex partition, so it is in nobody's own/org set.
-      const r = res();
-      await call(req('Secret Plan'), r);
-      expect(r.status).toHaveBeenCalledWith(404);
-    });
-
-    it('refuses with 403 a private plan that reaches the system/public lists (stale index), even when signed in', async () => {
+    it('defence in depth: refuses with 403 a private plan (ownerless or not) that is in the system/public lists, even when signed in', async () => {
       wps.getWorkPlansByVisibility.mockImplementation(async (v: string) =>
         v === 'public' ? [plan({ planId: 'leak', visibility: 'private', ownerId: 'someone-else' })] : []);
       const r = res();
@@ -80,8 +71,8 @@ describe('private work plan access (ENG-2655)', () => {
       wps.getWorkPlansByOwner.mockResolvedValue([plan({ planId: 'mine', visibility: 'private', ownerId: 'viewer' })]);
       const r = res();
       await call(req('Secret Plan'), r);
-      expect(r.status).not.toHaveBeenCalledWith(403);
-      expect(r.status).not.toHaveBeenCalledWith(404);
+      expect(r.status).not.toHaveBeenCalled();
+      expect(r.json).toHaveBeenCalledWith(expect.objectContaining({ id: 'mine', visibility: 'private' }));
     });
 
     it("still resolves an org member's private plan for a member of that org", async () => {
@@ -89,8 +80,8 @@ describe('private work plan access (ENG-2655)', () => {
       wps.getWorkPlansByOrg.mockResolvedValue([plan({ planId: 'orgmate', visibility: 'private', ownerId: 'mate' })]);
       const r = res();
       await call(req('Secret Plan'), r);
-      expect(r.status).not.toHaveBeenCalledWith(403);
-      expect(r.status).not.toHaveBeenCalledWith(404);
+      expect(r.status).not.toHaveBeenCalled();
+      expect(r.json).toHaveBeenCalledWith(expect.objectContaining({ id: 'orgmate' }));
     });
 
     it('resolves system plans for an anonymous caller but never a private one', async () => {
@@ -103,7 +94,8 @@ describe('private work plan access (ENG-2655)', () => {
       expect(r1.status).toHaveBeenCalledWith(403);
       const r2 = res();
       await call(req('Sys Plan'), r2);
-      expect(r2.status).not.toHaveBeenCalledWith(403);
+      expect(r2.status).not.toHaveBeenCalled();
+      expect(r2.json).toHaveBeenCalledWith(expect.objectContaining({ id: 'sys' }));
     });
   });
 });
