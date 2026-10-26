@@ -9663,8 +9663,9 @@ export async function generateSessionResponse(
   // (session.llmModel), approval-inbox resumes, the plan-launch first turn (createSessionWithPlan), runVerifiedChat
   // callers that pass no model (the session's stored model runs), and every auto continuation (media and work plan,
   // from /generate, the interactive share timeout and the getSession backstop), each continuation being a turn of its
-  // own (routed again, so the switch and availability are re-checked and the replies are stamped). Emma email, GTM and
-  // result-endpoint turns pass the configured default, never a selection. With the switch
+  // own (routed again, so the switch and availability are re-checked and the replies are stamped). GTM and result-endpoint
+  // turns pass the configured default, never a selection; Emma email passes the continued chat's stored model (the
+  // default for a new chat), which the gate above checks against the owner's plan. With the switch
   // off it is refused like an unknown explicit model (never run on another). A caller that resolved first passes the
   // routed model with its own decision (`turnModelDecision`).
   let turnRouting: MessageModelRouting | undefined;

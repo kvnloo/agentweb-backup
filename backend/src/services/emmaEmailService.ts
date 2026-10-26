@@ -2,7 +2,8 @@ import axios from 'axios';
 import { EMMA_EMAIL_ADDRESS, EMMA_EMAIL_FROM, TEMP_EMAIL_PREFIX, TEMP_EMAIL_DOMAIN } from '../config';
 import { resendService } from './resendService';
 import { chatbotDb } from './chatbotService';
-import { generateSessionResponse } from '../controllers/agentModeController';
+import { generateSessionResponse, modelUnavailableBody } from '../controllers/agentModeController';
+import { isModelUnavailableError } from './agentMode/modelUnavailable';
 import { agentModeService } from './agentModeService';
 import { userDb } from './db';
 import { uploadFileToS3 } from '../utils/s3Utils';
@@ -284,18 +285,41 @@ export class EmmaEmailService {
     const fullMessage = isNewConversation && event.subject && messageBody
       ? `${event.subject}\n\n${messageBody}`
       : messageBody || event.subject || '';
-    const llmModel = await agentModeService.getDefaultModel();
+    // ENG-2648: a continued chat keeps the model it already runs on (the user may have picked one in the
+    // app), exactly like a Slack thread reply; only a new session uses the default (stamped above).
+    // Read here, after the session is decided, so the ownership rules above stay the only gate.
+    const continuedSession = sessionId === existingSessionId ? await chatbotDb.getChatSessionRecord(sessionId) : null;
+    const llmModel = continuedSession?.llmModel || await agentModeService.getDefaultModel();
     // ENG-1189: this turn's tool calls self-call back into this process via
     // mcpFetch — tracked so a deploy mid-run waits for it instead of
     // abandoning it against a closed listener.
-    const agentResponse = await cronJobRegistry.track('emmaEmailAgentTurn', generateSessionResponse(
-      sessionId,
-      fullMessage,
-      userId,
-      llmModel,
-      attachments
-    ));
-    const emmaResponse = agentResponse.content;
+    // ENG-2648: a continued chat's stored model can be outside the owner's plan (downgrade): the final gate in
+    // generateSessionResponse then refuses before anything runs. Same as a Slack thread reply, say so to the sender
+    // (and in the chat) instead of dying silently; nothing ran on another model.
+    let emmaResponse: string;
+    try {
+      const agentResponse = await cronJobRegistry.track('emmaEmailAgentTurn', generateSessionResponse(
+        sessionId,
+        fullMessage,
+        userId,
+        llmModel,
+        attachments
+      ));
+      emmaResponse = agentResponse.content;
+    } catch (genError) {
+      if (!isModelUnavailableError(genError)) throw genError;
+      emmaResponse = modelUnavailableBody(genError).error;
+      try {
+        await chatbotDb.addMessageToSession(sessionId, {
+          role: 'assistant',
+          content: emmaResponse,
+          timestamp: new Date().toISOString(),
+          metadata: { timestamp: new Date().toISOString(), isErrorMessage: true },
+        });
+      } catch (saveError) {
+        console.error('[EmmaEmail] Error saving model refusal to session:', saveError);
+      }
+    }
 
     // 9. Create ishare URL
     const ishareUrl = await chatbotDb.createOrReuseInteractiveShare(sessionId);

@@ -13,15 +13,18 @@ jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     createChatSession: jest.fn(),
     getChatSession: jest.fn(),
+    getChatSessionRecord: jest.fn(),
     createOrReuseInteractiveShare: jest.fn(),
     updateSessionEmailMetadata: jest.fn(),
     updateSessionTitle: jest.fn(),
     updateSessionLlmModel: jest.fn(),
+    addMessageToSession: jest.fn(),
   },
 }));
 
 jest.mock('../controllers/agentModeController', () => ({
   generateSessionResponse: jest.fn(),
+  modelUnavailableBody: jest.fn((err: { requestedModel: string }) => ({ error: `refused: ${err.requestedModel}` })),
 }));
 
 jest.mock('../services/agentModeService', () => ({
@@ -364,6 +367,54 @@ describe('EmmaEmailService', () => {
         'claude-sonnet-4-20250514',
         undefined
       );
+    });
+
+    // ENG-2648: like a Slack thread reply, an email continuing a chat runs on that chat's stored model.
+    it("continues an existing session on that session's stored model, not the default", async () => {
+      const sessionId = '12345678-1234-1234-1234-123456789012';
+      (resendService.getReceivedEmailContent as jest.Mock).mockResolvedValue({ text: 'Follow-up question' });
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ sessionId, userId: 'user-123', llmModel: 'openrouter/openai/gpt-6-sol' });
+      (chatbotDb.getChatSessionRecord as jest.Mock).mockResolvedValue({ sessionId, userId: 'user-123', llmModel: 'openrouter/openai/gpt-6-sol' });
+      (userDb.getUserByEmail as jest.Mock).mockResolvedValue({ userId: 'user-123', email: 'user@example.com' });
+      (generateSessionResponse as jest.Mock).mockResolvedValue({ content: 'Answer', toolCalls: [], knowledgeBaseQueries: [], sources: [], responseMessages: [] });
+      (chatbotDb.createOrReuseInteractiveShare as jest.Mock).mockResolvedValue(`https://app.agentweb.pro/ishare/${sessionId}?conversable=token`);
+      (chatbotDb.updateSessionEmailMetadata as jest.Mock).mockResolvedValue({});
+      (resendService.sendEmail as jest.Mock).mockResolvedValue({ id: 'sent-005' });
+
+      await service.processInboundEmail({ ...baseEvent, subject: `Re: Help [ref:${sessionId}]` });
+
+      expect(generateSessionResponse).toHaveBeenCalledWith(sessionId, 'Follow-up question', 'user-123', 'openrouter/openai/gpt-6-sol', undefined);
+      expect(chatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
+    });
+
+    // ENG-2648: the chat's stored model fell outside the owner's plan (downgrade): the sender is told, like Slack.
+    it('emails the model refusal and saves it to the chat when the stored model is no longer in the plan', async () => {
+      const sessionId = '12345678-1234-1234-1234-123456789012';
+      (resendService.getReceivedEmailContent as jest.Mock).mockResolvedValue({ text: 'Follow-up question' });
+      (chatbotDb.getChatSessionRecord as jest.Mock).mockResolvedValue({ sessionId, userId: 'user-123', llmModel: 'openrouter/openai/gpt-6-sol' });
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ sessionId, userId: 'user-123', llmModel: 'openrouter/openai/gpt-6-sol' });
+      (userDb.getUserByEmail as jest.Mock).mockResolvedValue({ userId: 'user-123', email: 'user@example.com' });
+      (generateSessionResponse as jest.Mock).mockRejectedValue(Object.assign(new Error('model_unavailable'), { code: 'model_unavailable', requestedModel: 'openrouter/openai/gpt-6-sol' }));
+      (chatbotDb.createOrReuseInteractiveShare as jest.Mock).mockResolvedValue(`https://app.agentweb.pro/ishare/${sessionId}?conversable=token`);
+      (chatbotDb.updateSessionEmailMetadata as jest.Mock).mockResolvedValue({});
+      (resendService.sendEmail as jest.Mock).mockResolvedValue({ id: 'sent-006' });
+
+      await service.processInboundEmail({ ...baseEvent, subject: `Re: Help [ref:${sessionId}]` });
+
+      expect(resendService.sendEmail).toHaveBeenCalledTimes(1);
+      expect((resendService.sendEmail as jest.Mock).mock.calls[0][0].text).toContain('refused: openrouter/openai/gpt-6-sol');
+      expect(chatbotDb.addMessageToSession).toHaveBeenCalledWith(sessionId, expect.objectContaining({ role: 'assistant', content: 'refused: openrouter/openai/gpt-6-sol', metadata: expect.objectContaining({ isErrorMessage: true }) }));
+    });
+
+    it('still rethrows any other generation error', async () => {
+      const sessionId = '12345678-1234-1234-1234-123456789012';
+      (resendService.getReceivedEmailContent as jest.Mock).mockResolvedValue({ text: 'Hi' });
+      (chatbotDb.getChatSessionRecord as jest.Mock).mockResolvedValue({ sessionId, userId: 'user-123' });
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ sessionId, userId: 'user-123' });
+      (userDb.getUserByEmail as jest.Mock).mockResolvedValue({ userId: 'user-123', email: 'user@example.com' });
+      (generateSessionResponse as jest.Mock).mockRejectedValue(new Error('boom'));
+      await expect(service.processInboundEmail({ ...baseEvent, subject: `Re: Help [ref:${sessionId}]` })).rejects.toThrow('boom');
+      expect(resendService.sendEmail).not.toHaveBeenCalled();
     });
 
     it('falls back to new session when ref tag session not found', async () => {
