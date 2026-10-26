@@ -635,6 +635,19 @@ describe('ToolBridge ledger, halts, stop and repeat guard', () => {
       expect(records.every((r) => typeof r.durationMs === 'number' && r.endedAt >= r.startedAt)).toBe(true);
     });
 
+    it('names the call a collapsed duplicate repeats', async () => {
+      const { bridge } = make();
+      const token = bridge.openRun(RUN);
+      bridge.noteToolUse(RUN.runId, 'a', 'get_leads', { q: 1 }, 'm1');
+      bridge.noteToolUse(RUN.runId, 'b', 'get_leads', { q: 1 }, 'm1');
+      await bridge.callTool(token, { name: 'get_leads', args: { q: 1 }, callId: 'a' });
+      await bridge.callTool(token, { name: 'get_leads', args: { q: 1 }, callId: 'b' });
+      const records = bridge.takeLedger(RUN.runId).records;
+      const dup = records.find((r) => r.toolCallId === 'b')!;
+      expect(dup).toMatchObject({ kind: 'collapsed', duplicateOfId: 'a' });
+      expect(records.find((r) => r.toolCallId === 'a')!.duplicateOfId).toBeUndefined();
+    });
+
     it('keeps a call that finishes after the run closed, under the same generation', async () => {
       const gate = deferred<BridgeExecuteOutcome>();
       const deps = makeDeps({ execute: jest.fn(async () => gate.promise) as any });
