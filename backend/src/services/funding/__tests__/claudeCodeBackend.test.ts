@@ -1,0 +1,310 @@
+import { ClaudeCodeBackend, CONFIRMATION_NOTE, OUTCOME_UNKNOWN_NOTE, type ClaudeBackendDeps, type ClaudeTurnParams } from '../claudeCodeBackend';
+import { ClaudeRouteStopError } from '../claudeRouteErrors';
+import { ClaudeRunRegistry } from '../claudeRunRegistry';
+import { LoginHostError } from '../loginHostClient';
+import type { BridgeCallRecord, BridgeHalt } from '../toolBridge';
+import type { HostTurnOutcome } from '../loginHostTurn';
+import type { ProviderEvent } from '../../../loginHost/adapter';
+import type { AttemptUsage } from '../attemptUsageJournal';
+
+const LLM = 'openrouter/anthropic/claude-sonnet-5.5';
+const FALLBACK = 'EMPTY_FALLBACK';
+const DECISION = { route: 'claude_subscription' as const, connectionId: 'conn-1', epoch: 3, alias: 'sonnet' as const, modelId: LLM, ownerUserId: 'u1' };
+
+let seq = 0;
+const rec = (over: Partial<BridgeCallRecord> & Pick<BridgeCallRecord, 'toolCallId' | 'name'>): BridgeCallRecord => ({
+  args: {}, kind: 'executed', isError: false, toolMessageContent: `${over.name} ok`, arrivalSeq: ++seq, startedAt: 1, endedAt: 2, durationMs: 1, ...over,
+});
+
+const done = (text: string, extra: Record<string, unknown> = {}): HostTurnOutcome => ({ kind: 'completed', result: { type: 'result', ok: true, text, ...extra } as any });
+
+interface Harness {
+  deps: ClaudeBackendDeps;
+  calls: string[];
+  persisted: any[][];
+  journal: AttemptUsage[];
+  reconnect: Array<[string, number, string]>;
+  registry: ClaudeRunRegistry;
+  setHost(fn: (req: any, opts: any) => Promise<HostTurnOutcome>): void;
+  setLedger(ledger: BridgeCallRecord[], halts?: BridgeHalt[]): void;
+  state: { cancelled: boolean; client: boolean; messages: any[]; hostReq?: any };
+}
+
+function harness(): Harness {
+  const calls: string[] = [];
+  const persisted: any[][] = [];
+  const journal: AttemptUsage[] = [];
+  const reconnect: Array<[string, number, string]> = [];
+  const registry = new ClaudeRunRegistry();
+  const state: Harness['state'] = { cancelled: false, client: true, messages: [{ role: 'system', content: 'sys' }, { role: 'user', content: 'hi' }] };
+  let host: (req: any, opts: any) => Promise<HostTurnOutcome> = async () => done('answer');
+  let ledger: BridgeCallRecord[] = [];
+  let halts: BridgeHalt[] = [];
+  let n = 0;
+  const deps: ClaudeBackendDeps = {
+    hostClient: () => (state.client ? ({} as any) : undefined),
+    prepareTurnContext: async () => (calls.push('prepare'), { messages: state.messages }),
+    trimToolMessages: (m) => m,
+    runHostTurn: async (_c, req, opts) => {
+      calls.push('host');
+      state.hostReq = req;
+      return host(req, opts);
+    },
+    bridge: {
+      openRun: (claims) => (calls.push(`open:${claims.runId}`), 'token-abc'),
+      beginTurn: () => void calls.push('beginTurn'),
+      noteToolUse: (_r, id, name) => void calls.push(`use:${id}:${name}`),
+      noteToolResult: (_r, id) => void calls.push(`result:${id}`),
+      closeRunAndDrain: async () => (calls.push('drain'), { settled: true, stillRunning: 0, ledger, ledgerTruncated: 0, halts, generation: 'g' }),
+      closeRun: () => void calls.push('closeRun'),
+      cancelSession: () => void calls.push('bridgeCancel'),
+      takeHalts: () => halts,
+    },
+    executor: {
+      registerRun: () => void calls.push('exec:register'),
+      beginTurn: () => void calls.push('exec:begin'),
+      releaseRun: () => void calls.push('exec:release'),
+    },
+    registry,
+    isCancelled: () => state.cancelled,
+    persistMessages: async (_s, m) => void persisted.push(m),
+    markNeedsReconnect: async (c, e, r) => void reconnect.push([c, e, r]),
+    writeJournal: async (row) => void journal.push(row),
+    emptyFallbackText: FALLBACK,
+    now: () => 1_000_000,
+    newRunId: () => `claude-run-${++n}`,
+  };
+  return { deps, calls, persisted, journal, reconnect, registry, state, setHost: (f) => (host = f), setLedger: (l, h = []) => ((ledger = l), (halts = h)) };
+}
+
+const params = (over: Partial<ClaudeTurnParams> = {}): ClaudeTurnParams => ({
+  decision: DECISION, sessionId: 's1', userId: 'u1', messageContent: 'hi', sessionHistory: [], llmModel: LLM, ...over,
+});
+
+const stopCode = async (p: Promise<unknown>) => {
+  try {
+    await p;
+    return 'no-throw';
+  } catch (e) {
+    return e instanceof ClaudeRouteStopError ? e.code : `other:${String(e)}`;
+  }
+};
+
+describe('ClaudeCodeBackend', () => {
+  beforeEach(() => {
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  describe('before anything is opened', () => {
+    it('stops with host_unavailable when there is no host client, opening nothing', async () => {
+      const h = harness();
+      h.state.client = false;
+      expect(await stopCode(new ClaudeCodeBackend(h.deps).run(params()))).toBe('host_unavailable');
+      expect(h.calls).toEqual([]);
+    });
+
+    it('stops with context_too_large when the prompt does not fit, opening nothing', async () => {
+      const h = harness();
+      h.state.messages = [{ role: 'user', content: 'a'.repeat(2_100_000) }];
+      expect(await stopCode(new ClaudeCodeBackend(h.deps).run(params()))).toBe('context_too_large');
+      expect(h.calls).toEqual(['prepare']);
+      expect(h.registry.size).toBe(0);
+    });
+  });
+
+  describe('a normal turn', () => {
+    it('runs the lifecycle in order, with the alias to the host and the registry id in the messages', async () => {
+      const h = harness();
+      h.setLedger([rec({ toolCallId: 'tc1', name: 'get_leads', groupId: 'g', groupIndex: 0, groupOrder: 0, result: { n: 1 } })]);
+      h.setHost(async (_req, opts) => {
+        await opts.onEvent({ type: 'tool-use', operationId: 'tc1', name: 'mcp__emma__get_leads', input: {} } as ProviderEvent);
+        await opts.onEvent({ type: 'tool-result', operationId: 'tc1', ok: true } as ProviderEvent);
+        await opts.onEvent({ type: 'usage', inputTokens: 100, outputTokens: 20, cacheReadTokens: 5 } as ProviderEvent);
+        return done('Here you go.');
+      });
+      const progress: string[] = [];
+      const r = await new ClaudeCodeBackend(h.deps).run(params({ onProgress: (x) => progress.push(x.status) }));
+
+      expect(h.calls).toEqual(['prepare', 'exec:register', 'open:claude-run-1', 'beginTurn', 'exec:begin', 'host', 'use:tc1:get_leads', 'result:tc1', 'drain', 'exec:release']);
+      expect(progress).toEqual(['thinking', 'executing_tools', 'tool_executed']);
+      expect(h.state.hostReq).toMatchObject({
+        connectionId: 'conn-1', epoch: 3, model: 'sonnet', bridgeToken: 'token-abc', turnId: 'claude-run-1', idempotencyKey: 'claude-run-1-t1', priority: 'interactive',
+      });
+      expect(h.state.hostReq.idempotencyKey).toMatch(/^[A-Za-z0-9_-]{1,64}$/);
+      expect(h.state.hostReq.prompt).toContain('<<AW:USER');
+      expect(r.content).toBe('Here you go.');
+      expect(r.persistedResponseCount).toBe(0);
+      expect(r.responseMessages.map((m) => m.role)).toEqual(['assistant', 'tool', 'assistant']);
+      const last = r.responseMessages[2];
+      expect(last).toMatchObject({ llm: LLM, usage: { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120, cache_read_input_tokens: 5, estimated_cost: 0 } });
+      expect(r.toolCalls).toHaveLength(1);
+      expect(h.journal).toHaveLength(1);
+      expect(h.journal[0]).toMatchObject({
+        attemptId: 'claude-run-1', runId: 's1', userId: 'u1', fundingSource: 'claude_subscription', fundingPrincipalId: 'u1', connectionId: 'conn-1', credentialEpoch: 3,
+        requestedModel: LLM, outcome: 'succeeded', usage: { inputTokens: 100, outputTokens: 20, cacheReadTokens: 5, cacheWriteTokens: 0 }, settlementState: 'settled',
+      });
+      expect(h.registry.size).toBe(0);
+    });
+
+    it('writes no journal row when the plan reported no usage (unknown is not zero)', async () => {
+      const h = harness();
+      await new ClaudeCodeBackend(h.deps).run(params());
+      expect(h.journal).toEqual([]);
+    });
+
+    it('a failing journal write never fails the turn', async () => {
+      const h = harness();
+      h.deps.writeJournal = async () => {
+        throw new Error('dynamo down');
+      };
+      h.setHost(async (_r, opts) => (await opts.onEvent({ type: 'usage', inputTokens: 1, outputTokens: 1 }), done('ok')));
+      await expect(new ClaudeCodeBackend(h.deps).run(params())).resolves.toMatchObject({ content: 'ok' });
+    });
+
+    it('a blank answer becomes the empty-response fallback', async () => {
+      const h = harness();
+      h.setHost(async () => done('   '));
+      expect((await new ClaudeCodeBackend(h.deps).run(params())).content).toBe(FALLBACK);
+    });
+
+    it('a tool that asked for confirmation ends the turn with the plain note, keeping the model\'s own text', async () => {
+      const h = harness();
+      const halt = { callId: 'tc1', name: 'meta_preview' } as BridgeHalt;
+      h.setLedger([rec({ toolCallId: 'tc1', name: 'meta_preview' })], [halt]);
+      h.setHost(async () => done('I prepared it.'));
+      const r = await new ClaudeCodeBackend(h.deps).run(params());
+      expect(r.content).toBe(`I prepared it.\n\n${CONFIRMATION_NOTE}`);
+      h.setHost(async () => done(''));
+      expect((await new ClaudeCodeBackend(h.deps).run(params())).content).toBe(CONFIRMATION_NOTE);
+    });
+
+    it('the host deadline is what is left of the turn cap', async () => {
+      const h = harness();
+      await new ClaudeCodeBackend(h.deps).run(params({ turnStartMs: 1_000_000 - 100_000 }));
+      expect(h.state.hostReq.deadlineMs).toBe(600_000 - 100_000 - 20_000);
+      await new ClaudeCodeBackend(h.deps).run(params({ turnStartMs: 1_000_000 - 590_000 }));
+      expect(h.state.hostReq.deadlineMs).toBe(30_000); // never below the floor
+    });
+
+    it('registers the cancel handle while the turn runs and releases it after', async () => {
+      const h = harness();
+      let during = -1;
+      h.setHost(async () => ((during = h.registry.size), done('ok')));
+      await new ClaudeCodeBackend(h.deps).run(params());
+      expect(during).toBe(1);
+      expect(h.registry.size).toBe(0);
+    });
+  });
+
+  describe('Stop', () => {
+    it('a Stop that landed before the turn started runs nothing on the host', async () => {
+      const h = harness();
+      h.state.cancelled = true;
+      const r = await new ClaudeCodeBackend(h.deps).run(params());
+      expect(r.cancelled).toBe(true);
+      expect(h.calls).not.toContain('host');
+      expect(h.registry.size).toBe(0);
+    });
+
+    it('a Stop during the turn refuses new bridge calls, aborts the host turn, keeps the settled tool work and drops the answer', async () => {
+      const h = harness();
+      h.setLedger([rec({ toolCallId: 'tc1', name: 'save_note', groupId: 'g', groupIndex: 0, groupOrder: 0 })]);
+      h.setHost(async (_req, opts) => {
+        h.registry.cancel('s1');
+        expect(opts.signal.aborted).toBe(true);
+        return { kind: 'completed', result: { type: 'result', ok: false, text: '', aborted: 'interrupted' } as any };
+      });
+      const r = await new ClaudeCodeBackend(h.deps).run(params());
+      expect(h.calls).toContain('bridgeCancel');
+      expect(r).toMatchObject({ cancelled: true, responseMessages: [], persistedResponseCount: 0 });
+      expect(h.persisted).toHaveLength(1);
+      expect(h.persisted[0].map((m) => m.role)).toEqual(['assistant', 'tool']); // the pair, no final answer
+      expect(h.registry.size).toBe(0);
+    });
+
+    it('a Stop with no tool work persists nothing', async () => {
+      const h = harness();
+      h.setHost(async () => (h.registry.cancel('s1'), { kind: 'completed', result: { type: 'result', ok: false, text: '', aborted: 'interrupted' } as any }));
+      await new ClaudeCodeBackend(h.deps).run(params());
+      expect(h.persisted).toEqual([]);
+    });
+  });
+
+  describe('failures are typed stops, never AgentWeb', () => {
+    it.each([
+      [new LoginHostError('EBUSY'), 'host_busy'],
+      [new LoginHostError('UNREACHABLE', 'ECONNREFUSED'), 'host_unavailable'],
+      [new LoginHostError('ESTALE'), 'connection_changed'],
+    ])('a host failure %# maps to its stop, after the settled tool work is persisted', async (err, code) => {
+      const h = harness();
+      h.setLedger([rec({ toolCallId: 'tc1', name: 'save_note' })]);
+      h.setHost(async () => {
+        throw err;
+      });
+      expect(await stopCode(new ClaudeCodeBackend(h.deps).run(params()))).toBe(code);
+      expect(h.persisted).toHaveLength(1);
+      expect(h.registry.size).toBe(0);
+      expect(h.calls).toContain('exec:release');
+    });
+
+    it('a host that no longer knows the connection flags it for reconnect', async () => {
+      const h = harness();
+      h.setHost(async () => {
+        throw new LoginHostError('ENOTFOUND');
+      });
+      expect(await stopCode(new ClaudeCodeBackend(h.deps).run(params()))).toBe('needs_reconnect');
+      expect(h.reconnect).toEqual([['conn-1', 3, 'host_denied']]);
+    });
+
+    it('a dead login reported by the turn flags the connection and stops', async () => {
+      const h = harness();
+      h.setHost(async () => done('', { ok: false, errorKind: 'auth_dead' }));
+      expect(await stopCode(new ClaudeCodeBackend(h.deps).run(params()))).toBe('needs_reconnect');
+      expect(h.reconnect).toEqual([['conn-1', 3, 'turn_auth_dead']]);
+    });
+
+    it('the plan\'s own usage limit stops with usage_limit and does not flag the connection', async () => {
+      const h = harness();
+      h.setLedger([rec({ toolCallId: 'tc1', name: 'save_note' })]);
+      h.setHost(async () => done('', { ok: false, errorKind: 'usage_limit' }));
+      expect(await stopCode(new ClaudeCodeBackend(h.deps).run(params()))).toBe('usage_limit');
+      expect(h.reconnect).toEqual([]);
+      expect(h.persisted).toHaveLength(1);
+    });
+
+    it('an unexpected error still releases the run, the executor and the cancel handle', async () => {
+      const h = harness();
+      h.setHost(async () => {
+        throw new Error('boom');
+      });
+      await expect(new ClaudeCodeBackend(h.deps).run(params())).rejects.toThrow('boom');
+      expect(h.calls).toEqual(expect.arrayContaining(['closeRun', 'exec:release']));
+      expect(h.registry.size).toBe(0);
+    });
+
+    it('a second turn for the same session is refused without touching the first', async () => {
+      const h = harness();
+      let inner: Promise<unknown> | undefined;
+      h.setHost(async (_req, opts) => {
+        inner = new ClaudeCodeBackend({ ...h.deps, newRunId: () => 'claude-run-2' }).run(params());
+        expect(await stopCode(inner)).toBe('host_busy');
+        expect(opts.signal.aborted).toBe(false);
+        return done('first ok');
+      });
+      expect((await new ClaudeCodeBackend(h.deps).run(params())).content).toBe('first ok');
+      expect(h.registry.size).toBe(0);
+    });
+
+    it('a lost stream is reported plainly, never retried, with the tool work that was seen', async () => {
+      const h = harness();
+      h.setLedger([rec({ toolCallId: 'tc1', name: 'save_note', groupId: 'g', groupIndex: 0, groupOrder: 0 })]);
+      h.setHost(async () => ({ kind: 'unknown_outcome', reason: 'stream_dropped' }));
+      const r = await new ClaudeCodeBackend(h.deps).run(params());
+      expect(r.content).toBe(OUTCOME_UNKNOWN_NOTE);
+      expect(r.cancelled).toBeUndefined();
+      expect(r.responseMessages.map((m) => m.role)).toEqual(['assistant', 'tool', 'assistant']);
+      expect(h.calls.filter((c) => c === 'host')).toHaveLength(1);
+    });
+  });
+});
