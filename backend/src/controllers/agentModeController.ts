@@ -674,6 +674,33 @@ export function modelUnavailableBody(err: ModelUnavailableError, audience: Model
 }
 
 /**
+ * ENG-2641: errors raised AFTER the turn's user message was stored in the chat. A send is refused before anything is
+ * stored almost everywhere; the exceptions are generateSessionResponse's Work Plan step-model refusal (the message is
+ * saved first, then the step's model is resolved) and a /verified-generate refusal after an earlier attempt saved the
+ * starting message. generateSessionResponse marks every error it raises after its save; runVerifiedChatInner marks a
+ * refusal that follows a saved attempt. Read where the refusal is answered.
+ */
+const errorsAfterUserMessageSaved = new WeakSet<object>();
+
+function markRaisedAfterUserMessageSaved(error: unknown): void {
+  if (typeof error === 'object' && error !== null) errorsAfterUserMessageSaved.add(error);
+}
+
+function wasRaisedAfterUserMessageSaved(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && errorsAfterUserMessageSaved.has(error);
+}
+
+/**
+ * ENG-2641: a refused send's body (422 `model_unavailable`, 409 `SESSION_BUSY`, 429 `TOO_MANY_CONCURRENT_RUNS` / usage
+ * paused) with `userMessageSaved`: true only when the user's message is already stored in the chat, so the client keeps
+ * it there instead of giving the draft back (a resend would store it twice). Older backends omit it, and a client must
+ * then keep its previous behaviour.
+ */
+function sendRefusalBody<T extends object>(body: T, userMessageSaved: boolean): T & { userMessageSaved: boolean } {
+  return { ...body, userMessageSaved };
+}
+
+/**
  * The customer-facing name of a model id, sanitized: the AgentWeb Model's display name (it is not a registry model, and
  * customers never see the raw id), else the registry name, else the id itself.
  */
@@ -5007,6 +5034,10 @@ async function runVerifiedChatInner(
   console.log('AgentMode runVerifiedChat: Received attachments:', attachmentsArray.length, attachmentsArray);
 
   let attempt = 0;
+  // ENG-2641: true once any attempt saved the starting message (its generateSessionResponse returned, or failed after
+  // the save, e.g. a transient worker error that is retried). A model refusal after that is answered as one whose
+  // message was already stored, even when the refusing attempt itself stopped before its own save.
+  let startingMessageSaved = false;
   // ENG-947: attempts spent specifically on the publish requirement — the first
   // attempt that ended with a publish tool as the ONLY outstanding requirement,
   // plus every press sent afterwards. Deliberately separate from `attempt`, which
@@ -5579,6 +5610,7 @@ async function runVerifiedChatInner(
         params.modelPolicyDecisionForAudit, // ENG-669 PR-C: routing provenance on the replies
         routerTaskType, // ENG-669 PR-C: the task's route for a stored AgentWeb Model selection
       );
+      startingMessageSaved = true;
 
       if (!hasAssistantOutput(response)) {
         throw new ZeroAssistantOutputError(
@@ -6082,10 +6114,12 @@ async function runVerifiedChatInner(
 
     } catch (error) {
       console.error(`Run verified chat attempt ${attempt} failed:`, error);
+      if (wasRaisedAfterUserMessageSaved(error)) startingMessageSaved = true;
       // ENG-669 PR-C: a refused model (the stored AgentWeb Model selection with the switch off or unavailable for the
       // owner, or a selection outside the plan) is never retried; it is saved to the chat (once per error) so the owner
       // sees why, and every caller (Slack, revisions, human-eval) gets it to present as a refusal, not an outage.
       if (isModelUnavailableError(error)) {
+        if (startingMessageSaved) markRaisedAfterUserMessageSaved(error);
         await recordModelRefusal(sessionId, error);
         throw error;
       }
@@ -9531,9 +9565,29 @@ function modelSourceAfter(
   return modelSourceAfterStamp(session, model, explicitPick, canonicalModelId);
 }
 
+/** ENG-2641: what one generateSessionResponse turn has done so far, for the errors it raises. */
+interface SessionTurnState {
+  /** The turn's user message is in the chat (saved by this turn, or an already-saved dangling directive reused). */
+  userMessageSaved: boolean;
+}
+type SessionTurnArgs = Parameters<typeof runSessionTurn> extends [SessionTurnState, ...infer Rest] ? Rest : never;
+
 // Common function to generate AI response for a session
 // Always uses worker process to prevent blocking the main event loop
-export async function generateSessionResponse(
+export async function generateSessionResponse(...args: SessionTurnArgs): ReturnType<typeof runSessionTurn> {
+  const turn: SessionTurnState = { userMessageSaved: false };
+  try {
+    return await runSessionTurn(turn, ...args);
+  } catch (error) {
+    // ENG-2641: any error raised once the user message is in the chat (e.g. the Work Plan step-model refusal, or a
+    // worker failure a /verified-generate retry follows) is marked, so a refusal answered for it says it was stored.
+    if (turn.userMessageSaved) markRaisedAfterUserMessageSaved(error);
+    throw error;
+  }
+}
+
+async function runSessionTurn(
+  turn: SessionTurnState,
   sessionId: string,
   userMessage: string,
   userId: string,
@@ -9919,6 +9973,7 @@ export async function generateSessionResponse(
   } else {
     console.log('AgentMode generateSessionResponse: reusing an already-dangling auto-continuation directive — skipped a redundant duplicate');
   }
+  turn.userMessageSaved = true;
 
   // Get updated session with the new user message
   const updatedSession = await chatbotDb.getChatSession(sessionId);
@@ -10915,7 +10970,7 @@ export const agentModeController = {
         if (!isModelUnavailableError(modelError)) throw modelError;
         const preflightUsage = await checkTokenUsage(user.userId);
         if (preflightUsage.allowed) {
-          return res.status(422).json(modelUnavailableBody(modelError));
+          return res.status(422).json(sendRefusalBody(modelUnavailableBody(modelError), false));
         }
       }
 
@@ -11097,6 +11152,7 @@ export const agentModeController = {
             message: 'A response is already being generated for this session. Please wait.',
             code: 'SESSION_BUSY',
             ...(claim.inFlightRunId ? { runId: claim.inFlightRunId } : {}),
+            userMessageSaved: false,
           });
         }
         idemKeyHeld = idemKey;
@@ -11120,6 +11176,7 @@ export const agentModeController = {
           error: 'Session is busy',
           message: 'A response is already being generated for this session. Please wait.',
           code: 'SESSION_BUSY',
+          userMessageSaved: false,
         });
       }
 
@@ -11139,6 +11196,7 @@ export const agentModeController = {
           error: 'Session is busy',
           message: 'A response is already being generated for this session. Please wait.',
           code: 'SESSION_BUSY',
+          userMessageSaved: false,
         });
       }
 
@@ -11152,7 +11210,7 @@ export const agentModeController = {
       const continuesPausedTurn = Boolean(deckAnswer || deckCancel || workPlanInputAnswer);
       const slot = await acquireInteractiveGenerationSlot(session.userId, sessionId, { bypassLimit: continuesPausedTurn });
       if (!slot.ok) {
-        return res.status(429).json(buildTooManyRunsBody(slot.current, slot.limit));
+        return res.status(429).json(sendRefusalBody(buildTooManyRunsBody(slot.current, slot.limit), false));
       }
       generationSlot = slot;
 
@@ -11234,12 +11292,12 @@ export const agentModeController = {
             });
           }
         }
-        return res.status(429).json(await buildUsagePausedBody({
+        return res.status(429).json(sendRefusalBody(await buildUsagePausedBody({
           usageStatus,
           session,
           requestedModel: llmModel || session.llmModel || null,
           backupModel: llmBackupModel,
-        }));
+        }), false));
       }
 
       // (Session was fetched + ownership-checked above, before the locks.)
@@ -11302,16 +11360,16 @@ export const agentModeController = {
         if (runSurvivalRunId) {
           void markRunTerminal(runSurvivalRunId, 'failed', { finishReason: 'model_unavailable' });
         }
-        return res.status(422).json(modelUnavailableBody(modelError));
+        return res.status(422).json(sendRefusalBody(modelUnavailableBody(modelError), false));
       }
       if (!modelPolicyDecision.effectiveModel) {
         // Paused: the one shared producer stamps the decision and builds the 429.
-        return res.status(429).json(await buildUsagePausedBody({
+        return res.status(429).json(sendRefusalBody(await buildUsagePausedBody({
           usageStatus,
           session,
           requestedModel: modelPolicyDecision.requestedModel,
           decision: modelPolicyDecision,
-        }));
+        }), false));
       }
       const modelToUse = modelPolicyDecision.effectiveModel;
       // ENG-669 PR-C: the session keeps the SELECTION (`agentweb-model` when routed); `modelToUse` is what runs. The
@@ -11735,12 +11793,13 @@ export const agentModeController = {
         }
       }
     } catch (error) {
-      // ENG-669: the final gate in generateSessionResponse refused the turn's model before anything was persisted
-      // (e.g. a race with a tier change): the same 422 the pre-flight answers, never a generic 500.
+      // ENG-669: generateSessionResponse refused the turn's model (e.g. a race with a tier change): the same 422 the
+      // pre-flight answers, never a generic 500. Its final gate refuses before anything is persisted; its Work Plan
+      // step-model refusal comes after the user message was saved, which the body says (ENG-2641).
       if (isModelUnavailableError(error) && !res.headersSent) {
         if (runSurvivalRunId) void markRunTerminal(runSurvivalRunId, 'failed', { finishReason: 'model_unavailable' });
         if (req.body?.sessionId) markProgressComplete(req.body.sessionId);
-        return res.status(422).json(modelUnavailableBody(error));
+        return res.status(422).json(sendRefusalBody(modelUnavailableBody(error), wasRaisedAfterUserMessageSaved(error)));
       }
       console.error('AgentMode: Generate response error:', error);
 
@@ -12624,6 +12683,7 @@ export const agentModeController = {
           error: 'Session is busy',
           message: 'A response is already being generated for this session. Please wait.',
           code: 'SESSION_BUSY',
+          userMessageSaved: false,
         });
       }
 
@@ -12640,7 +12700,7 @@ export const agentModeController = {
       } catch (modelError) {
         if (!isModelUnavailableError(modelError)) throw modelError;
         if ((await checkTokenUsage(session.userId)).allowed) {
-          return res.status(422).json(modelUnavailableBody(modelError, 'share_viewer'));
+          return res.status(422).json(sendRefusalBody(modelUnavailableBody(modelError, 'share_viewer'), false));
         }
       }
 
@@ -12778,6 +12838,7 @@ export const agentModeController = {
         // usage through the subscription-usage endpoint.
         return res.status(429).json({
           error: 'Monthly token limit reached for this shared session. Please contact the owner of this link.',
+          userMessageSaved: false,
         });
       }
 
@@ -12802,7 +12863,7 @@ export const agentModeController = {
         });
       } catch (modelError) {
         if (!isModelUnavailableError(modelError)) throw modelError;
-        return res.status(422).json(modelUnavailableBody(modelError, 'share_viewer'));
+        return res.status(422).json(sendRefusalBody(modelUnavailableBody(modelError, 'share_viewer'), false));
       }
       if (!modelPolicyDecision.effectiveModel) {
         // Runtime always exposes this method. The guard preserves older
@@ -12817,6 +12878,7 @@ export const agentModeController = {
         }
         return res.status(429).json({
           error: 'AI usage is paused for this shared session. Please contact the owner of this link.',
+          userMessageSaved: false,
         });
       }
       const modelToUse = modelPolicyDecision.effectiveModel;
@@ -12906,7 +12968,7 @@ export const agentModeController = {
       // ENG-669: a model refused by the final gate is a 422 (viewer body: no owner plan details), not a 500.
       if (isModelUnavailableError(error) && !res.headersSent) {
         if (req.params?.shareId) markProgressComplete(req.params.shareId);
-        return res.status(422).json(modelUnavailableBody(error, 'share_viewer'));
+        return res.status(422).json(sendRefusalBody(modelUnavailableBody(error, 'share_viewer'), wasRaisedAfterUserMessageSaved(error)));
       }
       console.error('AgentMode: Generate shared response error:', error);
 
@@ -16415,7 +16477,7 @@ export const agentModeController = {
         });
       } catch (modelError) {
         if (!isModelUnavailableError(modelError)) throw modelError;
-        return res.status(422).json(modelUnavailableBody(modelError, 'share_viewer'));
+        return res.status(422).json(sendRefusalBody(modelUnavailableBody(modelError, 'share_viewer'), false));
       }
       const modelToUse = conversablePolicy.effectiveModel || session.llmModel || defaultModel;
       // ENG-669 PR-C: a routed turn records its decision on the session (which model the AgentWeb Model ran and why;
@@ -16465,7 +16527,7 @@ export const agentModeController = {
       // ENG-669: a model refused by the final gate is a 422 (viewer body: no owner plan details), not a 500.
       if (isModelUnavailableError(error) && !res.headersSent) {
         if (req.params?.shareId) markProgressComplete(req.params.shareId);
-        return res.status(422).json(modelUnavailableBody(error, 'share_viewer'));
+        return res.status(422).json(sendRefusalBody(modelUnavailableBody(error, 'share_viewer'), wasRaisedAfterUserMessageSaved(error)));
       }
       console.error('AgentMode: Generate conversable response error:', error);
 
@@ -17333,11 +17395,11 @@ export const agentModeController = {
       // scheduled / Slack / email / result-endpoint callers of runVerifiedChat have their own.
       const usageStatus = await checkTokenUsage(user.userId, TURN_ADMISSION);
       if (!usageStatus.allowed) {
-        return res.status(429).json(await buildUsagePausedBody({
+        return res.status(429).json(sendRefusalBody(await buildUsagePausedBody({
           usageStatus,
           session,
           requestedModel: normalizeRequestedLlmModel(req.body?.llmModel) || session.llmModel || null,
-        }));
+        }), false));
       }
 
       // The model the user picked for this chat is used as-is for the whole turn:
@@ -17368,7 +17430,7 @@ export const agentModeController = {
           });
         } catch (modelError) {
           if (!isModelUnavailableError(modelError)) throw modelError;
-          return res.status(422).json(modelUnavailableBody(modelError));
+          return res.status(422).json(sendRefusalBody(modelUnavailableBody(modelError), false));
         }
         selectedModel = modelDecision.effectiveModel || session.llmModel || undefined;
         selectedModelDecision = modelDecision;
@@ -17455,9 +17517,10 @@ export const agentModeController = {
         sessionId: sessionId
       });
     } catch (error: any) {
-      // ENG-669: a model refused by the final gate is the same 422 as the pre-flight, never a 500.
+      // ENG-669: a model refused by the final gate is the same 422 as the pre-flight, never a 500. ENG-2641: a refusal
+      // on a later attempt (or a Work Plan step's) comes after the starting message was saved, which the body says.
       if (isModelUnavailableError(error) && !res.headersSent) {
-        return res.status(422).json(modelUnavailableBody(error));
+        return res.status(422).json(sendRefusalBody(modelUnavailableBody(error), wasRaisedAfterUserMessageSaved(error)));
       }
       // ENG-1696: a busy session is an expected, benign outcome (the other
       // side just needs to finish), not a real failure — return the same
@@ -17468,12 +17531,13 @@ export const agentModeController = {
           error: 'Session is busy',
           message: 'A response is already being generated for this session. Please wait.',
           code: 'SESSION_BUSY',
+          userMessageSaved: false,
         });
       }
 
       // ENG-110: per-user concurrent interactive generation cap.
       if (isTooManyConcurrentRunsError(error)) {
-        return res.status(429).json(buildTooManyRunsBody(error.current, error.limit));
+        return res.status(429).json(sendRefusalBody(buildTooManyRunsBody(error.current, error.limit), false));
       }
 
       // ENG-2293: same handled outcome as the other three generate-response

@@ -156,6 +156,7 @@ describe('verified-generate per-user cap (ENG-110)', () => {
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
       code: 'TOO_MANY_CONCURRENT_RUNS', limit: 1,
       message: 'You have 1 chats generating at once. Wait for one to finish, then try again.',
+      userMessageSaved: false, // ENG-2641: refused before the starting message was stored
     }));
     expect(activeSessionGenerations.has('b')).toBe(false);
     expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
