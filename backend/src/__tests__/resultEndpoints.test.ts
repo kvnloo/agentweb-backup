@@ -181,6 +181,9 @@ describe('Result Endpoints', () => {
 
       expect(res.body.success).toBe(true);
       expect(res.body.sessionId).toBe('test-session-123');
+      // ENG-2669: the conversable iShare link is a chat-as-owner credential; never hand it to the anonymous lead.
+      expect(res.body.ishareUrl).toBeUndefined();
+      expect(JSON.stringify(res.body)).not.toContain('conversable');
 
       // Should have created session
       expect(mockedChatbot.createChatSession).toHaveBeenCalledWith(
@@ -581,7 +584,6 @@ describe('Result Endpoints', () => {
 
       expect(res.body.status).toBe('completed');
       expect(res.body.reportUrl).toBe('https://s3.example.com/result.html');
-      expect(res.body.leadEmail).toBe('lead@example.com');
     });
 
     it('should return completed status with contentHtml when no contentUrl', async () => {
@@ -607,7 +609,6 @@ describe('Result Endpoints', () => {
 
       expect(res.body.status).toBe('completed');
       expect(res.body.reportUrl).toBeUndefined();
-      expect(res.body.contentHtml).toBe('<h1>Report</h1>');
     });
 
     it('should return 404 when result endpoint not found', async () => {
@@ -635,6 +636,61 @@ describe('Result Endpoints', () => {
         .expect(404);
 
       expect(res.body.error).toContain('Session not found');
+    });
+
+    // ENG-2669: the session id (in the lead's page URL) must not be a key to other endpoints' or
+    // other session types' data, and nothing but completion + report link may be returned.
+    describe('session ownership and exposure (ENG-2669)', () => {
+      const mockConfigs = () =>
+        mockedSettings.getSetting.mockResolvedValue({
+          settingName: 'result-endpoints-config',
+          settingValue: JSON.stringify([sampleConfig, { ...sampleConfig, name: 'other' }]),
+          updatedAt: new Date().toISOString(),
+          updatedBy: 'admin',
+        });
+
+      it('404s, identically to a missing session, for a session of a different result endpoint', async () => {
+        mockConfigs();
+        mockedChatbot.getChatSession.mockResolvedValue({
+          sessionId: 'sess-other',
+          resultEndpointMetadata: {
+            resultName: 'other',
+            leadEmail: 'victim@example.com',
+            contentUrl: 'https://s3.example.com/secret.html',
+            contentHtml: '<h1>Secret</h1>',
+          },
+        } as any);
+        const mismatch = await request(app).get('/r/gtm/status/sess-other').expect(404);
+
+        mockedChatbot.getChatSession.mockResolvedValue(null as any);
+        const missing = await request(app).get('/r/gtm/status/sess-other').expect(404);
+
+        expect(mismatch.body).toEqual(missing.body);
+        expect(JSON.stringify(mismatch.body)).not.toMatch(/victim|secret/i);
+      });
+
+      it('404s for a session that is not a result-endpoint session (no pending/404 existence oracle)', async () => {
+        mockConfigs();
+        mockedChatbot.getChatSession.mockResolvedValue({ sessionId: 'sess-chat', userId: 'user-1' } as any);
+        await request(app).get('/r/gtm/status/sess-chat').expect(404);
+      });
+
+      it('never returns the lead email, generated HTML or an iShare link for the matching session', async () => {
+        mockConfigs();
+        mockedChatbot.getChatSession.mockResolvedValue({
+          sessionId: 'sess-full',
+          resultEndpointMetadata: {
+            resultName: 'gtm',
+            leadEmail: 'lead@example.com',
+            contentUrl: 'https://s3.example.com/result.html',
+            contentHtml: '<h1>Report</h1>',
+          },
+        } as any);
+        const res = await request(app).get('/r/gtm/status/sess-full').expect(200);
+
+        expect(Object.keys(res.body).sort()).toEqual(['reportUrl', 'resultTitle', 'status', 'waitingContent']);
+        expect(JSON.stringify(res.body)).not.toMatch(/lead@example\.com|Report<|ishare|conversable/);
+      });
     });
 
     it('should include waitingContent in status response', async () => {
