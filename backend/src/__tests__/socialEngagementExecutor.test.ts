@@ -1223,6 +1223,33 @@ describe('SocialEngagementExecutor', () => {
       expect(mockScheduleDb.updateScheduleAfterRun).not.toHaveBeenCalled();
     });
 
+    it('reschedules (does not give up) when LinkedIn briefly rejected a freshly renewed token (ENG-2663)', async () => {
+      const action = makeAction();
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
+      mockGetGeminiClient.mockResolvedValue(makeMockGeminiClient('LIKE') as any);
+      mockAdapter.createReaction.mockRejectedValue(Object.assign(new Error('LinkedIn temporarily rejected the access'), { freshTokenRejected: true }));
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
+        'sched-1',
+        expect.objectContaining({ nextRunTime: expect.any(String) })
+      );
+      expect(mockScheduleDb.updateScheduleAfterRun).not.toHaveBeenCalled();
+    });
+
+    it('still marks done on a genuine "access token expired or invalid" 401 (ENG-2663)', async () => {
+      const action = makeAction();
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
+      mockGetGeminiClient.mockResolvedValue(makeMockGeminiClient('LIKE') as any);
+      mockAdapter.createReaction.mockRejectedValue(new Error('LinkedIn access token expired. Please reconnect your account.'));
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      expect(mockScheduleDb.updateScheduleAfterRun).toHaveBeenCalled();
+      expect(mockScheduleDb.updateSchedule).not.toHaveBeenCalled();
+    });
+
     it('should reschedule on "rate limit" in error message', async () => {
       const action = makeAction();
       mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
