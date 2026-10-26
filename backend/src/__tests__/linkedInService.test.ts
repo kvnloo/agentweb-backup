@@ -1550,4 +1550,45 @@ describe('LinkedInService', () => {
       ).rejects.toThrow('LinkedIn rate limit exceeded');
     });
   });
+
+  describe('401 on a freshly refreshed token (ENG-2663)', () => {
+    const revoked401 = (token: string) => ({
+      isAxiosError: true,
+      response: { status: 401, data: { message: 'The token used in the request has been revoked by the user' } },
+      config: { headers: { Authorization: `Bearer ${token}` } },
+    });
+    const profile = { data: { id: 'u1', localizedFirstName: 'A', localizedLastName: 'B' } };
+
+    beforeEach(() => {
+      (service as any).freshTokenRetryDelaysMs = [0, 0];
+      jest.spyOn(console, 'error').mockImplementation(() => {});
+      jest.spyOn(console, 'warn').mockImplementation(() => {});
+      jest.spyOn(console, 'log').mockImplementation(() => {});
+    });
+
+    it('retries a 401 on a token minted moments ago and succeeds once LinkedIn accepts it', async () => {
+      (axios.post as jest.Mock).mockResolvedValueOnce({ data: { access_token: 'fresh-ok', expires_in: 5184000 } });
+      await service.refreshAccessToken('rt', 'cid', 'secret');
+      mockClient.get.mockRejectedValueOnce(revoked401('fresh-ok')).mockResolvedValueOnce(profile);
+
+      await expect(service.getProfile('fresh-ok')).resolves.toMatchObject({ sub: 'u1' });
+      expect(mockClient.get).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not retry a 401 on a stored (not just refreshed) token', async () => {
+      mockClient.get.mockRejectedValue(revoked401('stored-token'));
+
+      await expect(service.getProfile('stored-token')).rejects.toThrow('LinkedIn access token expired or invalid');
+      expect(mockClient.get).toHaveBeenCalledTimes(1);
+    });
+
+    it('gives up after the bounded retries when a fresh token keeps getting 401', async () => {
+      (axios.post as jest.Mock).mockResolvedValueOnce({ data: { access_token: 'fresh-bad', expires_in: 5184000 } });
+      await service.refreshAccessToken('rt', 'cid', 'secret');
+      mockClient.get.mockRejectedValue(revoked401('fresh-bad'));
+
+      await expect(service.getProfile('fresh-bad')).rejects.toThrow('LinkedIn access token expired or invalid');
+      expect(mockClient.get).toHaveBeenCalledTimes(3);
+    });
+  });
 });
