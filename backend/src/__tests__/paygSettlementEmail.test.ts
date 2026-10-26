@@ -37,9 +37,23 @@ describe('ENG-668 settlement emails', () => {
     expect(subject).toBe('Your extra usage invoice for September 2026');
     // The bill follows the month's highest limit, so the percentage is of that limit (rvE2E R4).
     expect(text).toContain('using 60% of the highest extra usage limit you had set that month');
+    // Stripe sends its own receipt for the charge; the heads-up lives only in the "will charge" wording.
+    expect(text).toContain('Stripe will also email you a receipt for the payment.');
     expect(text).toContain('View your invoice: https://invoice.stripe.com/i/acct/in_1');
     expect(html).toContain('href="https://invoice.stripe.com/i/acct/in_1"');
     for (const body of [subject, text, html]) expect(body).not.toMatch(DOLLARS);
+  });
+
+  it('the receipt heads-up is only in the "will charge" wording, not the paid, failed or action-required emails', () => {
+    const RECEIPT = 'Stripe will also email you a receipt';
+    const joined = (c: { paragraphs: string[] }) => c.paragraphs.join(' ');
+    expect(joined(paygInvoiceCreatedEmailCopy({ month: '2026-09', percentOfCap: 40 }))).toContain(RECEIPT);
+    for (const c of [
+      paygInvoiceCreatedEmailCopy({ month: '2026-09', percentOfCap: 40, paid: true }),
+      paygPaymentActionRequiredEmailCopy({ month: '2026-09' }),
+      paygPaymentFailedEmailCopy({ month: '2026-09' }),
+      paygPaymentUnconfirmedEmailCopy({ month: '2026-09' }),
+    ]) expect(joined(c)).not.toContain(RECEIPT);
   });
 
   it('payment failed: PAYG on hold and what to do — no amount', async () => {
