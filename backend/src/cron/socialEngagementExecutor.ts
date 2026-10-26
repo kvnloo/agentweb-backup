@@ -298,7 +298,8 @@ export class SocialEngagementExecutor {
             errorMsg = err?.message || String(err);
             console.error(`[Executor] Action ${scheduleId} failed:`, errorMsg);
             // Rate limit is transient — retry in 30 minutes; all other errors are permanent
-            retryable = (err?.response?.status === 429) || (errorMsg?.includes('rate limit') ?? false);
+            // ENG-2663: LinkedIn briefly rejected a freshly renewed token — also transient.
+            retryable = (err?.response?.status === 429) || (errorMsg?.includes('rate limit') ?? false) || err?.freshTokenRejected === true;
         }
 
         // Record engagement outcome — postId is always the post URN, commentId for reply actions
