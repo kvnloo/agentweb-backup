@@ -16647,6 +16647,8 @@ export const agentModeController = {
       // Put user's private plans FIRST so they take priority over system/public plans with same title
       const result = await getUserFromToken(req);
       const allPlans: any[] = [];
+      // ENG-2655: the only private plans this caller may resolve — their own and their org members'.
+      const accessiblePrivatePlanIds = new Set<string>();
       if (result.user) {
         const user = await userDb.getUserById(result.user.userId);
         const [ownPlans, orgPlans] = await Promise.all([
@@ -16657,6 +16659,7 @@ export const agentModeController = {
         for (const p of [...ownPlans, ...orgPlans]) {
           if (p.visibility === 'private' && !seen.has(p.planId)) {
             seen.add(p.planId);
+            accessiblePrivatePlanIds.add(p.planId);
             allPlans.push(p);
           }
         }
@@ -16675,8 +16678,10 @@ export const agentModeController = {
         return res.status(404).json({ error: `Work plan "${planTitle}" not found` });
       }
 
-      // Enforce ownership/org-membership for private plans
-      if (workPlan.visibility === 'private' && !result.user) {
+      // Enforce ownership/org-membership for private plans (ENG-2655: the plan must be one of the caller's
+      // own / org members' plans loaded above, not merely "the caller is signed in"). Ownerless private
+      // plans (admin-created) are in nobody's set, so they never resolve here.
+      if (workPlan.visibility === 'private' && !accessiblePrivatePlanIds.has(workPlan.planId)) {
         return res.status(403).json({ error: 'Not authorized to view this private work plan' });
       }
 
@@ -16723,6 +16728,8 @@ export const agentModeController = {
       ]);
       // Put user's private plans FIRST so they take priority over system/public plans with same title
       const allPlans: any[] = [];
+      // ENG-2655: the only private plans this caller may resolve — their own and their org members'.
+      const accessiblePrivatePlanIds = new Set<string>();
       if (result.user) {
         const user = await userDb.getUserById(result.user.userId);
         const [ownPlans, orgPlans] = await Promise.all([
@@ -16733,6 +16740,7 @@ export const agentModeController = {
         for (const p of [...ownPlans, ...orgPlans]) {
           if (p.visibility === 'private' && !seen.has(p.planId)) {
             seen.add(p.planId);
+            accessiblePrivatePlanIds.add(p.planId);
             allPlans.push(p);
           }
         }
@@ -16751,10 +16759,9 @@ export const agentModeController = {
         return res.status(404).json({ error: `Work plan "${planTitle}" not found` });
       }
 
-      // Enforce ownership/org-membership for private plans.
-      // allPlans already only includes private plans belonging to the user or their org,
-      // so a plan found in allPlans is already authorized. Only block unauthenticated users.
-      if (predefinedPlan.visibility === 'private' && !result.user) {
+      // Enforce ownership/org-membership for private plans (ENG-2655: membership in the caller's own / org
+      // members' plans loaded above, not merely "signed in"; anonymous callers have an empty set).
+      if (predefinedPlan.visibility === 'private' && !accessiblePrivatePlanIds.has(predefinedPlan.planId)) {
         return res.status(403).json({ error: 'Not authorized to use this private work plan' });
       }
 
