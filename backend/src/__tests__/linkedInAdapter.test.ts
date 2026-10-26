@@ -160,7 +160,7 @@ describe('LinkedInAdapter', () => {
         mockLinkedInService.createPost.mockResolvedValue('urn:li:share:333444');
 
         const pending = adapter.createPost(expired, 'Post with image', ['https://example.com/image1.png']);
-        await jest.advanceTimersByTimeAsync(6000);
+        await jest.advanceTimersByTimeAsync(11000);
         const result: any = await pending;
 
         expect(result.success).toBe(true);
@@ -1351,7 +1351,7 @@ describe('LinkedInAdapter', () => {
           .mockResolvedValueOnce('urn:li:comment:(urn:li:share:123,789)');
 
         const pending = adapter.createComment(expiredAccount as any, 'urn:li:share:123', 'Great post!');
-        await jest.advanceTimersByTimeAsync(6000);
+        await jest.advanceTimersByTimeAsync(11000);
         const result = await pending;
 
         expect(result.success).toBe(true);
@@ -1706,7 +1706,7 @@ describe('LinkedInAdapter', () => {
           .mockResolvedValueOnce(repostUrn);
 
         const pending = adapter.createRepost(expiredAccount(), originalPostUrn, undefined, 'user-1');
-        await jest.advanceTimersByTimeAsync(6000);
+        await jest.advanceTimersByTimeAsync(11000);
 
         await expect(pending).resolves.toMatchObject({ success: true, postId: repostUrn });
         expect(mockLinkedInService.createRepost).toHaveBeenCalledTimes(2);
