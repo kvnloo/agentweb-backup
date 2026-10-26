@@ -13,6 +13,7 @@
  * is logged and swallowed so the Stripe webhook ack is never affected.
  */
 import type { ParsedIngest } from '../utils/trackingIngest';
+import { invoiceSubscriptionId } from '../utils/stripeInvoiceFields';
 
 export const DEFAULT_HIREEMMA_SIGNAL_LIST_ID = 'list_1793037224311_9umtchng7';
 
@@ -39,8 +40,8 @@ export interface BillingSignal {
 const customerIdOf = (obj: any): string =>
   typeof obj?.customer === 'string' ? obj.customer : typeof obj?.customer?.id === 'string' ? obj.customer.id : '';
 
-const subscriptionIdOf = (obj: any): string =>
-  typeof obj?.subscription === 'string' ? obj.subscription : obj?.subscription?.id || '';
+// Basil (2025-03-31+) moved invoice.subscription to parent.subscription_details.subscription.
+const subscriptionIdOf = (obj: any): string => invoiceSubscriptionId(obj) || '';
 
 const priceIdsOf = (items: any): string =>
   Array.isArray(items?.data) ? items.data.map((i: any) => i?.price?.id).filter(Boolean).sort().join(',') : '';

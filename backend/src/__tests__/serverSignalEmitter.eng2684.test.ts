@@ -48,6 +48,13 @@ describe('ENG-2684 Stripe → hireemma.ai session signals', () => {
     });
   });
 
+  it('reads the subscription id from a Basil invoice (parent.subscription_details) and a legacy one', () => {
+    const basil = mapStripeEventToSignals(ev('invoice.paid', { id: 'in_b', customer: 'cus_1', amount_paid: 9900, parent: { subscription_details: { subscription: 'sub_basil' } } }));
+    expect(basil[0].props.subscriptionId).toBe('sub_basil');
+    const legacy = mapStripeEventToSignals(ev('invoice.payment_failed', { id: 'in_l', customer: 'cus_1', amount_due: 9900, subscription: 'sub_legacy' }));
+    expect(legacy[0].props.subscriptionId).toBe('sub_legacy');
+  });
+
   it('ignores subscription updates without a price change and unmapped events', () => {
     expect(mapStripeEventToSignals(ev('customer.subscription.updated', { id: 's', customer: 'c' }, { status: 'trialing' }))).toEqual([]);
     expect(mapStripeEventToSignals(ev('checkout.session.completed', { id: 'cs', customer: 'c' }))).toEqual([]);
