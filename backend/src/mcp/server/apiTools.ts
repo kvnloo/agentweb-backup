@@ -23,6 +23,7 @@ import { SCHEDULED_CHATS_DEFAULT_LIMIT, SCHEDULED_CHATS_MAX_LIMIT } from '../../
 // ENG-982: `ctx` and `jsonResult` moved to ./toolHelpers so workflowTools.ts can
 // share them instead of keeping a second copy. Behaviour unchanged.
 import { omitBranchedFrom } from '../../utils/adminOnlyMessageFilter';
+import { branchOwnMessages } from '../../services/agentMode/chatBranching';
 import { omitActiveRun } from '../../services/agentMode/sessionActiveRunGuard';
 import { ctx, jsonResult, CLIENT_ID_SCHEMA_PROPERTY } from './toolHelpers';
 import { publishWithdrawnMidFlight } from '../../utils/scheduledPublishConsentGuard';
@@ -3405,7 +3406,9 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
       // spend from assistant turns timestamped inside [start_time, end_time).
       let inWindowCostMicro = 0;
       let timestampedAssistantTurns = 0;
-      for (const msg of messages) {
+      // ENG-2648: a branch's copied rows ran (with their models, waits and heap) in its SOURCE; attributing
+      // them to the branch would report models and turns that never ran here. Only its own rows count.
+      for (const msg of branchOwnMessages(messages)) {
         if (msg?.role !== 'assistant') continue;
         assistantTurnCount++;
         const turnCost = msg?.usage?.estimated_cost || 0;

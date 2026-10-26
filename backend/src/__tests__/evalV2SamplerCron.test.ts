@@ -60,7 +60,7 @@ interface FakeReader extends ReadOnlyDocReader {
 }
 
 /** `count` sessions last active on 2026-09-24; each with one user turn and one web_search call. */
-function fakeReader(count: number): FakeReader {
+function fakeReader(count: number, messagesOf?: (sessionId: string) => DocItem[] | undefined): FakeReader {
   const frame: DocItem[] = Array.from({ length: count }, (_, i) => ({
     sessionId: `s-${String(i).padStart(2, '0')}`,
     userId: 'u',
@@ -76,6 +76,8 @@ function fakeReader(count: number): FakeReader {
       return { Items: [{ ...frame[0], sessionId: request.ExpressionAttributeValues?.[':s'], updatedAt: '2026-09-25T09:00:00.000Z' }] };
     }
     if (request.TableName === 'M') {
+      const override = messagesOf?.(String(request.ExpressionAttributeValues?.[':s']));
+      if (override) return { Items: override };
       return {
         Items: [
           { messageIndex: 0, message: { role: 'user', content: 'go' } },
@@ -151,6 +153,19 @@ describe('runEvalV2Sample — live run', () => {
     expect(scoreRows(dynamo).map((r) => (r.dimensions as Record<string, unknown>).surface)).toEqual(
       expect.arrayContaining(['agent/regular']),
     );
+  });
+
+  it('ENG-2648: skips a sampled branch nobody continued (all its rows are a copy of its source)', async () => {
+    const dynamo = new FakeDynamo();
+    const branchCopy: DocItem[] = [
+      { messageIndex: 0, message: { role: 'system', content: 'sys', metadata: { branchOrigin: { sourceSessionId: 'src', sourceMessageIndex: 2, branchedAt: '2026-09-24T01:00:00.000Z' } } } },
+      { messageIndex: 1, message: { role: 'user', content: 'copied question' } },
+      { messageIndex: 2, message: { role: 'assistant', content: 'copied answer', metadata: { toolCalls: [{ id: 'c', name: 'web_search', arguments: {}, result: {} }] } } },
+    ];
+    const reader = fakeReader(4, (id) => (id === 's-01' ? branchCopy : undefined));
+    const result = await runEvalV2Sample(deps(dynamo, reader), { enabled: true, dryRun: false, sampleSize: 4 });
+    expect(result).toMatchObject({ status: 'sampled', sampled: 4, graded: 3, written: 3 });
+    expect(scoreRows(dynamo).map((r) => r.subjectId).sort()).toEqual(['s-00', 's-02', 's-03']);
   });
 
   it('is idempotent per day: a second run writes nothing', async () => {
