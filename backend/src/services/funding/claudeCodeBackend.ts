@@ -275,6 +275,8 @@ export class ClaudeCodeBackend {
         } catch (err) {
           const stop = fromHostFailure(err);
           if (stop) {
+            // Fields the host guarantees safe to log (a code and a short detail chosen by the host; never a path, token or text).
+            console.error("[claude-backend] host failure", { code: (err as { code?: string }).code, detail: (err as { detail?: string }).detail, stop: stop.code, session: p.sessionId });
             if (stop.markNeedsReconnect) await d.markNeedsReconnect(connectionId, epoch, "host_denied").catch(() => undefined);
             pendingStop = stop; // tool work that already ran is real: it is drained and persisted below, then this is thrown
           } else {
@@ -320,6 +322,7 @@ export class ClaudeCodeBackend {
         await this.persistSettled(p, ledger);
         await this.journal(p, runId, startedAt, result.aborted ? "aborted" : "failed", seen.usage);
         const stop = fromResultErrorKind(result.errorKind);
+        console.error("[claude-backend] turn ended not ok", { errorKind: result.errorKind, aborted: result.aborted, stop: stop.code, session: p.sessionId });
         if (stop.markNeedsReconnect) await d.markNeedsReconnect(connectionId, epoch, "turn_auth_dead").catch(() => undefined);
         throw stop;
       }

@@ -169,6 +169,8 @@ async function main() {
   check("setup: the real resolver routes the Dev test user to the plan (real flag, real connection row)", decision.route === "claude_subscription", decision.route === "stop" ? decision.reason : decision.route);
   if (decision.route !== "claude_subscription") return;
 
+  // The server does this at boot (server.ts); without it the tool registry is empty.
+  await agentModeService.initialize();
   const session = await chatbotDb.createChatSession(userId, undefined, "agent", "agent-mode");
   createdSession = session.sessionId;
   const sys = await agentModeService.getMarketingSystemPrompt();
@@ -193,6 +195,21 @@ async function main() {
   out("D1.cliSees", { count: seenByCli.length, names: seenByCli.slice(0, 60) });
   check("D1 the CLI is offered the tools the executor lists (same names)", offeredNames.length > 0 && offeredNames.every((n) => seenByCli.includes(n)), { executor: offeredNames.length, cli: seenByCli.length, missing: offeredNames.filter((n) => !seenByCli.includes(n)).slice(0, 20) });
 
+  // D2: repeat the heavy turn (98-tool listing under the real prompt) to expose an intermittent failure; each failure prints its safe fields only
+  if (process.argv.includes("--repeat")) {
+    let failures = 0;
+    for (let i = 0; i < 8; i++) {
+      try {
+        const rr = await chat(`D2.repeat${i}`, userId, cid, "List the exact names of every tool you can call whose name starts with mcp__emma__. Output only the names, comma separated, nothing else.");
+        void rr;
+      } catch (e) {
+        failures++;
+        out(`D2.repeat${i}.failed`, { code: (e as { code?: string }).code, name: (e as Error).name });
+      }
+    }
+    check("D2 the heavy turn did not fail in 8 repeats", failures === 0, { failures });
+  }
+
   // E2
   const e2 = await chat("E2.readTool", userId, cid, "Call the tool mcp__emma__list_available_skills exactly once. Then tell me how many skills it listed, as a number only.");
   check("E2 a real Emma read tool ran through the CLI, bridge and executor, once", e2.r.toolCalls.filter((t) => t.name === "list_available_skills").length === 1, e2.r.toolCalls.map((t) => t.name));
@@ -204,18 +221,25 @@ async function main() {
   const e3 = await chat("E3.replay", userId, cid, "Without calling any tool: what tool did you call earlier in this conversation? Reply with the tool name only.");
   check("E3 the follow-up turn used the persisted tool call from history (no new tool call)", /list_available_skills/.test(e3.r.content) && e3.r.toolCalls.length === 0, e3.r.content.slice(0, 80));
 
-  // E4
-  const listed: any = await agentModeService.listSkills(userId, session.sessionId);
-  const skillList: any[] = Array.isArray(listed?.availableSkills) ? listed.availableSkills : Array.isArray(listed?.skills) ? listed.skills : [];
-  const readTool = (s: any): string | undefined => (Array.isArray(s.toolNames) ? s.toolNames.find((t: string) => emmaToolBridgeExecutor.isReadOnly(t)) : undefined);
-  const candidate = skillList.find((s: any) => readTool(s) !== undefined);
+  // E4: a skill the session has not installed, with a read-only tool, taken from the real library (what the controller shows the user)
+  const display: any[] = await agentModeService.getSkillsForDisplay([], userId);
+  const readTool = (sk: any): string | undefined => (Array.isArray(sk.toolNames) ? sk.toolNames.find((t: string) => emmaToolBridgeExecutor.isReadOnly(t)) : undefined);
+  const candidate = display.find((sk: any) => sk.installed === false && readTool(sk) !== undefined);
   if (!candidate) {
-    out("E4.skip", { reason: "no skill with a read-only tool in the Dev library", seen: skillList.length, sample: skillList.slice(0, 3).map((s: any) => ({ id: s.skillId, tools: s.toolNames })) });
+    out("E4.skip", { reason: "no uninstalled skill with a read-only tool in the Dev library", seen: display.length, sample: display.slice(0, 3).map((sk: any) => ({ id: sk.skillId, tools: (sk.toolNames ?? []).slice(0, 3) })) });
   } else {
     const tool = readTool(candidate) as string;
+    const before = new Set((await emmaToolBridgeExecutor.resolveTools({ runId: "diag-run2", userId, sessionId: session.sessionId, connectionId: cid, epoch: 1 } as any).catch(() => [])).map((t) => t.name));
+    void before;
     const e4 = await chat("E4.install", userId, cid, `Call mcp__emma__install_skills for the skill id "${candidate.skillId}". As soon as it succeeds, call the newly available tool mcp__emma__${tool} once with no arguments (or the minimum it needs). Then reply DONE.`);
     const names = e4.r.toolCalls.map((t) => t.name);
-    check("E4 install_skills ran, then the newly unlocked tool was offered and called in the SAME run", names.includes("install_skills") && names.includes(tool), names);
+    out("E4.chosen", { skill: candidate.skillId, tool, calls: names });
+    const installMsg = e4.r.responseMessages.find((m) => m.role === "tool" && m.name === "install_skills");
+    out("E4.installResult", String(installMsg?.content ?? "").slice(0, 400));
+    check("E4 install_skills ran, then the newly unlocked tool was called in the SAME run (no restart)", names.includes("install_skills") && names.includes(tool), names);
+    check("E4 the install result names the tools it unlocked (the text the model relies on)", typeof installMsg?.content === "string" && installMsg.content.includes(tool), installMsg?.content?.slice(0, 160));
+    const reloaded = await chatbotDb.getChatSession(session.sessionId);
+    check("E4 the skill is installed on the session afterwards, as in production", Array.isArray((reloaded as any)?.associatedSkills) && (reloaded as any).associatedSkills.includes(candidate.skillId), (reloaded as any)?.associatedSkills);
   }
 
   // E5

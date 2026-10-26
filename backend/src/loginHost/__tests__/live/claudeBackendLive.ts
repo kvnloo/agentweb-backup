@@ -96,6 +96,7 @@ const http = createServer((req: IncomingMessage & { body?: unknown }, res: Serve
 const client = new LoginHostClient(new UnixSocketTransport(SOCK));
 const data = { persisted: [] as any[][], journal: [] as AttemptUsage[], reconnect: [] as Array<[string, number, string]>, cancelled: false, messages: [] as any[] };
 let n = 0;
+let lastBackend: ClaudeCodeBackend | undefined;
 
 function backend(connectionOverride?: string) {
   void connectionOverride;
@@ -115,6 +116,8 @@ function backend(connectionOverride?: string) {
     now: () => Date.now(),
     newRunId: () => (currentRunId = `claude-live-${++n}-${Date.now().toString(36)}`),
     drainTimeoutMs: 8_000,
+    lateWatchPollMs: 2_000,
+    lateWatchMaxMs: 90_000,
   });
 }
 
@@ -141,7 +144,8 @@ async function runCase(label: string, p: ClaudeTurnParams): Promise<{ r?: Claude
   const t0 = Date.now();
   const progress: string[] = [];
   try {
-    const r = await backend().run({ ...p, onProgress: (x) => void progress.push(x.status) });
+    lastBackend = backend();
+    const r = await lastBackend.run({ ...p, onProgress: (x) => void progress.push(x.status) });
     const seconds = Math.round((Date.now() - t0) / 100) / 10;
     out(`${label}.result`, { seconds, content: r.content.slice(0, 160), roles: r.responseMessages.map((m) => m.role), cancelled: r.cancelled === true, progress: [...new Set(progress)] });
     return { r, seconds, progress };
@@ -209,18 +213,15 @@ async function main() {
     ]);
     setTimeout(() => out("B4.registryCancel", registry.cancel("live-session")), 9_000);
     const c = await runCase("B4.stop", params(cid, { turnStartMs: Date.now() }));
-    await sleep(20_000);
+    await sleep(22_000); // the hold runs 25 s from its start; the late-result watcher then saves it
+    await lastBackend!.idle();
     check("B4 the backend returned a cancelled result with no answer to persist", c.r?.cancelled === true && c.r.responseMessages.length === 0, c.r && { cancelled: c.r.cancelled });
     check("B4 the stopped turn ended well before the model could finish both steps", c.seconds < 40, c.seconds);
     check("B4 the executing hold finished; the follow-up write never started", exec.calls.includes("live_hold") && !exec.calls.includes("live_write"), exec.calls);
     check("B4 nothing is left registered, and any journal row is an aborted attempt", registry.size === 0 && data.journal.every((j) => j.outcome === "aborted"), { rows: data.journal.map((j) => j.outcome) });
-    // The hold was still executing when the Stop landed (it runs 25 s; the backend drains for 8 s). Where does its record end up?
-    const generation = bridge.generationOf(currentRunId);
-    const late = generation ? bridge.takeLedgerByGeneration(generation).records : [];
-    out("B4.lateLedger", late.map((l) => ({ name: l.name, kind: l.kind, late: l.late, cancelledDuringCall: l.cancelledDuringCall })));
-    out("B4.persistedByBackend", data.persisted.map((m) => m.map((x) => x.role)));
-    check("B4 the write that was executing at Stop is kept by the bridge as a late record flagged cancelledDuringCall", late.some((l) => l.name === "live_hold" && l.late === true && l.cancelledDuringCall === true), late.map((l) => l.name));
-    check("B4 INFO: the backend did not persist that late write into the chat (known gap, see notes)", data.persisted.length === 0, data.persisted.length);
+    // The hold was still executing when the Stop landed (it runs 25 s; the backend drains for 8 s): the late-result watcher saves it when it finishes.
+    out("B4.persistedByBackend", data.persisted.map((m) => m.map((x: any) => x.role)));
+    check("B4 the write that was executing at Stop is saved into the chat when it finishes: the pair plus a note, once", data.persisted.length === 1 && data.persisted[0].map((m: any) => m.role).join(",") === "assistant,tool,assistant" && data.persisted[0][1].content === "HOLD_RECEIPT" && data.persisted[0][2].metadata?.kind === "claude-late-result", data.persisted.map((b) => b.map((m: any) => m.role)));
   }
 
   if (want("--unknown")) {
