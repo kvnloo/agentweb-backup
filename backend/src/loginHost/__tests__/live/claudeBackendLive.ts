@@ -45,6 +45,7 @@ const TOOLS: BridgeTool[] = [
   { name: "live_read", description: "Reads a value (read-only).", inputSchema: { type: "object", properties: { q: { type: "string" } }, required: ["q"] } },
   { name: "live_write", description: "Records a note (a write). Returns a receipt.", inputSchema: { type: "object", properties: { note: { type: "string" } }, required: ["note"] } },
   { name: "live_hold", description: "A write that takes 25 seconds and returns a receipt.", inputSchema: { type: "object", properties: { label: { type: "string" } }, required: ["label"] } },
+  { name: "live_long", description: "A write that takes 45 seconds and returns a receipt.", inputSchema: { type: "object", properties: { label: { type: "string" } }, required: ["label"] } },
   { name: "live_preview", description: "Previews an action and asks the user to confirm; nothing is done until they confirm.", inputSchema: { type: "object", properties: { item: { type: "string" } }, required: ["item"] } },
 ];
 
@@ -52,7 +53,7 @@ const exec = { calls: [] as string[], registered: new Set<string>(), released: [
 const toolDeps: ToolBridgeDeps & { registerRun(r: string, c: unknown): void; beginTurn(r: string, t: unknown): void; releaseRun(r: string): void } = {
   resolveTools: async () => TOOLS,
   isReadOnly: (n) => n === "live_read",
-  isStrictEffect: (n) => n === "live_write" || n === "live_hold",
+  isStrictEffect: (n) => n === "live_write" || n === "live_hold" || n === "live_long",
   isLive: async () => true,
   persistHalt: async () => undefined,
   registerRun: (r) => void exec.registered.add(r),
@@ -66,6 +67,10 @@ const toolDeps: ToolBridgeDeps & { registerRun(r: string, c: unknown): void; beg
     if (call.name === "live_hold") {
       await sleep(25_000);
       return { ...base, content: "HOLD_RECEIPT" };
+    }
+    if (call.name === "live_long") {
+      await sleep(45_000);
+      return { ...base, content: "LONG_RECEIPT" };
     }
     if (call.name === "live_preview") return { ...base, content: "PREVIEW awaiting user confirmation", requiresConfirmation: true, result: { awaitingUserConfirmation: true } };
     return { ...base, content: "unknown", isError: true };
@@ -118,7 +123,7 @@ function backend(over: Partial<ClaudeBackendDeps> = {}) {
     newRunId: () => (currentRunId = `claude-live-${++n}-${Date.now().toString(36)}`),
     drainTimeoutMs: 8_000,
     lateWatchPollMs: 2_000,
-    lateWatchMaxMs: 90_000,
+    lateWatchMaxMs: 120_000,
     ...over,
   });
 }
@@ -237,16 +242,17 @@ async function main() {
   if (want("--timeout")) {
     reset([
       { role: "system", content: "You are a concise assistant. Use the tools exactly as asked, in order." },
-      { role: "user", content: "Call mcp__emma__live_hold with label='a'. When it returns, call mcp__emma__live_hold with label='b'. Then reply DONE." },
+      { role: "user", content: "Call mcp__emma__live_write with note='before'. When it returns, call mcp__emma__live_long with label='b'. Then reply DONE." },
     ]);
-    // A 60 s turn cap makes the host deadline its 30 s floor: the first hold (25 s) settles, the second is still running when the host ends the turn.
+    // A 60 s turn cap makes the host deadline its 30 s floor. The write settles at once; the 45 s call starts within seconds, so it is still
+    // running when the host ends the turn, whatever the model's pace.
     const c = await runCase("B6.timeout", params(cid, { turnStartMs: Date.now() }), { turnHardCapMs: 60_000 });
-    await sleep(26_000); // the second hold runs 25 s from its start; the late-result watcher then saves it
+    await sleep(40_000); // the long call runs 45 s from its start; the late-result watcher then saves it
     await lastBackend!.idle();
     check("B6 the host's deadline ended the turn as the typed timeout stop", c.stop?.code === "turn_timeout" && c.stop.httpStatus === 504, c.stop?.code ?? c.err);
     check("B6 it ended at the deadline, not at the model's own pace", c.seconds >= 28 && c.seconds < 55, c.seconds);
-    check("B6 the call that finished before the deadline is kept in the chat", data.persisted.some((b) => b.some((m: any) => m.role === "tool" && m.content === "HOLD_RECEIPT")), data.persisted.map((b) => b.map((m: any) => m.role)));
-    check("B6 the call still running at the deadline ran once and is saved when it finishes, with a note", exec.calls.filter((x) => x === "live_hold").length === 2 && data.persisted.some((b) => b.some((m: any) => m.metadata?.kind === "claude-late-result")), { calls: exec.calls, batches: data.persisted.length });
+    check("B6 the call that finished before the deadline is kept in the chat", data.persisted.some((b) => b.some((m: any) => m.role === "tool" && m.content === "RECEIPT_before")), data.persisted.map((b) => b.map((m: any) => m.role)));
+    check("B6 the call still running at the deadline ran once and is saved when it finishes, with a note", exec.calls.join(",") === "live_write,live_long" && data.persisted.some((b) => b.some((m: any) => m.metadata?.kind === "claude-late-result") && b.some((m: any) => m.role === "tool" && m.content === "LONG_RECEIPT")), { calls: exec.calls, batches: data.persisted.length });
     check("B6 nothing is left registered", registry.size === 0);
   }
 
