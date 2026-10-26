@@ -18,6 +18,7 @@ import {
   narrowSkillsForShareViewer,
   toConversableShareMessages,
   toIShareFeedbackResponse,
+  toReadOnlyShareMessages,
 } from '../utils/shareViewerSerializers';
 import { ABOUT_AGENTWEB_TEAM, getUnattendedExecutionDirective } from '../docs/agentModeSystemPrompt';
 import { chatbotDb, updateTaskExecutionStatus, ChatMessage, getEmmaSystemContext } from '../services/chatbotService';
@@ -17669,6 +17670,8 @@ export const agentModeController = {
   async getShareOgMetadata(req: Request, res: Response) {
     try {
       const { shareId } = req.params;
+      // ENG-2654: an interactive (iShare) link is token-gated, so its preview is too.
+      const conversable = req.query?.conversable;
 
       const session = await chatbotDb.getChatSession(shareId);
       if (!session) {
@@ -17679,36 +17682,39 @@ export const agentModeController = {
         return res.status(403).json({ error: 'Sharing is not available in this sandbox workspace' });
       }
 
-      // Must have view-only or interactive sharing enabled
       const hasViewOnlyShare = session.shareMetadata?.isShared;
-      const hasInteractiveShare = session.interactiveShareMetadata?.isActive;
-      if (!hasViewOnlyShare && !hasInteractiveShare) {
-        return res.status(404).json({ error: 'This conversation is not shared' });
-      }
-
-      // Check if view-only share expired
-      if (hasViewOnlyShare && session.shareMetadata?.expiresAt && new Date() > new Date(session.shareMetadata.expiresAt)) {
-        return res.status(410).json({ error: 'Share link has expired' });
-      }
-
-      // Check if interactive share expired
-      if (!hasViewOnlyShare && hasInteractiveShare && session.interactiveShareMetadata &&
-          new Date() > getInteractiveShareExpiresAt(session.interactiveShareMetadata)) {
-        return res.status(410).json({ error: 'Interactive share link has expired' });
+      if (hasViewOnlyShare) {
+        if (session.shareMetadata?.expiresAt && new Date() > new Date(session.shareMetadata.expiresAt)) {
+          return res.status(410).json({ error: 'Share link has expired' });
+        }
+      } else {
+        // ENG-2654: no read-only share, so only the holder of the interactive token may see the title and
+        // first message — knowing the chat id is not enough. Same token + expiry rule as the /ishare routes,
+        // except this public reader never writes (no isActive flip on expiry).
+        const interactiveShare = session.interactiveShareMetadata;
+        if (!interactiveShare?.isActive || !conversable) {
+          return res.status(404).json({ error: 'This conversation is not shared' });
+        }
+        if (!interactiveShare.token || interactiveShare.token !== conversable) {
+          return res.status(401).json({ error: 'Invalid or expired conversable token' });
+        }
+        if (new Date() > getInteractiveShareExpiresAt(interactiveShare)) {
+          return res.status(410).json({ error: 'Interactive share link has expired' });
+        }
       }
 
       const title = session.title || 'AgentWeb Conversation';
 
-      // Extract first user message for description
+      // First user message the share viewer would see. ENG-2654: same filter as getSharedConversation, so a
+      // delegated admin's prompt (ENG-2163 admin-tainted turn) never becomes the preview text.
       let description = 'View this conversation on AgentWeb';
-      if (Array.isArray(session.messages)) {
-        const firstUserMessage = session.messages.find(
-          (m: any) => m && m.role === 'user' && typeof m.content === 'string'
-        );
-        if (firstUserMessage) {
-          const content = firstUserMessage.content.trim();
-          description = content.length > 160 ? content.substring(0, 157) + '...' : content;
-        }
+      // ENG-2645 serializers, picked by share type, so the preview is never richer than the share page.
+      const viewerMessages = filterMessagesForClient(session.messages, { omitBranchOrigin: true });
+      const firstUserMessage = (hasViewOnlyShare ? toReadOnlyShareMessages(viewerMessages) : toConversableShareMessages(viewerMessages))
+        .find((m: any) => m && m.role === 'user' && typeof m.content === 'string');
+      if (firstUserMessage) {
+        const content = String(firstUserMessage.content).trim();
+        description = content.length > 160 ? content.substring(0, 157) + '...' : content;
       }
 
       res.json({ title, description });
