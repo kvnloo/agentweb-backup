@@ -49,8 +49,17 @@ function scalar(v: unknown): string | number | boolean | undefined {
   return undefined;
 }
 
+/** Own-property write that is safe for names like `__proto__`. */
+function setOwn(props: Record<string, unknown>, name: string, v: unknown): void {
+  Object.defineProperty(props, name, { value: v, writable: true, enumerable: true, configurable: true });
+}
+
 function startMs(row: SessionRowLike): number {
-  const n = Number(row.customFields?.sessionStartMs);
+  const raw = row.customFields?.sessionStartMs;
+  if (raw === null || raw === undefined || (typeof raw === 'string' && raw.trim() === '')) {
+    return Number.POSITIVE_INFINITY;
+  }
+  const n = Number(raw);
   return Number.isFinite(n) ? n : Number.POSITIVE_INFINITY;
 }
 
@@ -74,14 +83,17 @@ export function applyUserPropOps(
       if (type === 'add') {
         const delta = typeof raw === 'number' ? raw : Number(raw);
         if (!Number.isFinite(delta)) continue;
-        const prev = typeof props[name] === 'number' ? (props[name] as number) : 0;
-        props[name] = prev + delta;
+        const prevNum = exists ? Number(props[name]) : 0;
+        const prev = Number.isFinite(prevNum) ? prevNum : 0;
+        const sum = prev + delta;
+        if (!Number.isFinite(sum)) continue;
+        setOwn(props, name, sum);
         continue;
       }
       const v = scalar(raw);
       if (v === undefined) continue;
       if (type === 'set_once' && exists) continue;
-      props[name] = v;
+      setOwn(props, name, v);
     }
   }
 }
