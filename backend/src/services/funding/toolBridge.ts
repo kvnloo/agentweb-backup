@@ -117,6 +117,8 @@ export interface BridgeCallRecord {
    * TURN_ENDED / PERSIST_FAILED). Anything that puts this call back into chat history must use `answeredContent ?? toolMessageContent`.
    */
   answeredContent?: string;
+  /** For a `collapsed` call: the id of the identical call that was already handled. */
+  duplicateOfId?: string;
   /** The minimal tool result (executed calls only). */
   result?: unknown;
   error?: string;
@@ -1211,7 +1213,7 @@ export class ToolBridge {
             `This call was collapsed: an identical ${call.name} call with the same arguments ` +
             `was already handled by tool_call_id ${handledBy}. Use that completed tool result — do not repeat this call.`,
           isError: false,
-        });
+        }, { duplicateOfId: handledBy });
       }
       seen.set(key, call.callId);
     }
@@ -1350,7 +1352,7 @@ export class ToolBridge {
     ctx: CallCtx,
     kind: BridgeRecordKind,
     result: BridgeCallResult,
-    extra: { outcome?: BridgeExecuteOutcome; error?: string; staleHalt?: boolean; shareable?: boolean; recordAs?: BridgeCallResult } = {},
+    extra: { outcome?: BridgeExecuteOutcome; error?: string; staleHalt?: boolean; shareable?: boolean; recordAs?: BridgeCallResult; duplicateOfId?: string } = {},
   ): Exec {
     this.record(ctx, kind, result, extra);
     return { result, shareable: extra.shareable === true && kind === "executed" };
@@ -1361,7 +1363,7 @@ export class ToolBridge {
     ctx: CallCtx,
     kind: BridgeRecordKind,
     result: BridgeCallResult,
-    extra: { outcome?: BridgeExecuteOutcome; error?: string; staleHalt?: boolean; recordAs?: BridgeCallResult } = {},
+    extra: { outcome?: BridgeExecuteOutcome; error?: string; staleHalt?: boolean; recordAs?: BridgeCallResult; duplicateOfId?: string } = {},
   ): BridgeCallResult {
     const { state, call } = ctx;
     const returned = result;
@@ -1380,6 +1382,7 @@ export class ToolBridge {
       isError: result.isError,
       toolMessageContent: content,
       ...(answered !== content ? { answeredContent: answered } : {}),
+      ...(extra.duplicateOfId ? { duplicateOfId: extra.duplicateOfId } : {}),
       ...(extra.outcome?.result !== undefined ? { result: deepCopy(extra.outcome.result) } : {}),
       ...((extra.error ?? extra.outcome?.error) ? { error: extra.error ?? extra.outcome?.error } : {}),
       ...(announced ? { groupId: announced.groupId, groupIndex: announced.groupIndex, groupOrder: announced.groupOrder } : {}),
