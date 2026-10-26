@@ -14,6 +14,7 @@ jest.mock('../services/linkedInService', () => ({
     getShareStatistics: jest.fn(),
     getAggregatedMetrics: jest.fn(),
     verifyToken: jest.fn(),
+    introspectToken: jest.fn(),
     refreshAccessToken: jest.fn(),
     uploadImageFromUrl: jest.fn(),
     getPersonalPostAnalytics: jest.fn(),
@@ -752,12 +753,46 @@ describe('LinkedInAdapter', () => {
   });
 
   describe('verifyToken', () => {
-    it('should return true for valid token (uses getValidToken internally)', async () => {
-      // verifyToken uses getValidToken which checks expiry and refreshes if needed
-      // Since the token is not expired, it should return the token without calling verifyToken service
+    it('should return true when LinkedIn reports the token active', async () => {
+      mockLinkedInService.introspectToken.mockResolvedValue({ active: true });
+
       const result = await adapter.verifyToken(mockPersonalAccount);
 
-      // getValidToken doesn't throw, so verifyToken returns true
+      expect(result).toBe(true);
+      expect(mockLinkedInService.introspectToken).toHaveBeenCalledWith(
+        'test-access-token', 'mock-client-id', 'mock-client-secret'
+      );
+    });
+
+    it('should return false when the token is unexpired by timestamp but revoked by the user (ENG-2663)', async () => {
+      mockLinkedInService.introspectToken.mockResolvedValue({ active: false, status: 'revoked' });
+
+      const result = await adapter.verifyToken(mockPersonalAccount);
+
+      expect(result).toBe(false);
+    });
+
+    it('should introspect the refreshed token, not the stale one', async () => {
+      mockLinkedInService.refreshAccessToken.mockResolvedValue({ access_token: 'fresh-token', expires_in: 5184000 });
+      mockLinkedInService.introspectToken.mockResolvedValue({ active: false, status: 'revoked' });
+      const expiredAccount = {
+        ...mockPersonalAccount,
+        config: { ...mockPersonalAccount.config, token_expires_at: Date.now() - 1000 },
+      } as ConnectedAccount;
+
+      const result = await adapter.verifyToken(expiredAccount);
+
+      expect(mockLinkedInService.introspectToken).toHaveBeenCalledWith(
+        'fresh-token', 'mock-client-id', 'mock-client-secret'
+      );
+      expect(result).toBe(false);
+    });
+
+    it('should stay optimistic when introspection is inconclusive (network error)', async () => {
+      mockLinkedInService.introspectToken.mockResolvedValue({ active: true, uncertain: true });
+
+      const result = await adapter.verifyToken(mockPersonalAccount);
+
       expect(result).toBe(true);
     });
 

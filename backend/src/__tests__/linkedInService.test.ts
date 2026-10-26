@@ -972,6 +972,27 @@ describe('LinkedInService', () => {
     });
   });
 
+  describe('introspectToken', () => {
+    it('reports a revoked token as inactive', async () => {
+      (axios.post as jest.Mock).mockResolvedValue({ data: { active: false, status: 'revoked' } });
+
+      const result = await service.introspectToken('tok', 'cid', 'secret');
+
+      expect(result).toEqual({ active: false, status: 'revoked' });
+      const [url, body] = (axios.post as jest.Mock).mock.calls.pop();
+      expect(url).toBe('https://www.linkedin.com/oauth/v2/introspectToken');
+      expect(body).toContain('token=tok');
+    });
+
+    it('is uncertain-but-active when LinkedIn errors or answers oddly', async () => {
+      (axios.post as jest.Mock).mockRejectedValueOnce({ response: { status: 500 } });
+      expect(await service.introspectToken('tok', 'cid', 'secret')).toEqual({ active: true, uncertain: true });
+
+      (axios.post as jest.Mock).mockResolvedValueOnce({ data: {} });
+      expect(await service.introspectToken('tok', 'cid', 'secret')).toEqual({ active: true, uncertain: true });
+    });
+  });
+
   describe('verifyToken', () => {
     it('should return valid: true for successful request', async () => {
       (axios.get as jest.Mock).mockResolvedValue({ data: { sub: 'user123' } });
