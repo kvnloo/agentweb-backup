@@ -26,13 +26,18 @@ function rethrowWithCode(message: string, code?: number): never {
 // accepted moments later (prod: 2026-10-13, 2026-10-25). A 401 creates nothing,
 // so one delayed retry is safe and avoids a false "reconnect" alarm.
 export const FRESH_TOKEN_RETRY_DELAY_MS = 5000;
+// A 401 surfaces either as an axios error or as linkedInService's rethrown plain Error.
+function isLinkedIn401(error: any): boolean {
+  return error?.response?.status === 401
+    || /LinkedIn access token expired or invalid/.test(error?.message || '');
+}
+
 export async function retryOnceIfFreshToken401<T>(wasRefreshed: boolean, call: () => Promise<T>, delayMs = FRESH_TOKEN_RETRY_DELAY_MS): Promise<T> {
   try {
     return await call();
   } catch (error: any) {
     // linkedInService's interceptor rethrows a 401 as a plain Error without `response`.
-    const is401 = error?.response?.status === 401
-      || /LinkedIn access token expired or invalid/.test(error?.message || '');
+    const is401 = isLinkedIn401(error);
     if (!wasRefreshed || !is401) throw error;
     console.warn(`[LinkedInAdapter] ENG-2663: 401 on a just-refreshed token; retrying once in ${delayMs}ms`);
     await new Promise((r) => setTimeout(r, delayMs));
@@ -214,7 +219,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       if (error.response?.status === 429) {
         rethrowWithCode('LinkedIn rate limit exceeded. Please try again later.', 429);
       }
-      if (error.response?.status === 401) {
+      if (isLinkedIn401(error)) {
         rethrowWithCode('LinkedIn access token expired. Please reconnect your account.', 401);
       }
       throw error;
@@ -348,7 +353,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       if (error.response?.status === 429) {
         rethrowWithCode('LinkedIn rate limit exceeded. Please try again later.', 429);
       }
-      if (error.response?.status === 401) {
+      if (isLinkedIn401(error)) {
         rethrowWithCode('LinkedIn access token expired. Please reconnect your account.', 401);
       }
       if (error.response?.status === 403) {
