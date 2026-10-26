@@ -86,14 +86,16 @@ describe('ENG-2663 FreshTokenRejectedError reaches the model as retryable, not "
   // Same shape the emma/impl/linkedin.ts handlers return from their catch block.
   const handlerResult = { success: false, message: `Failed to post: ${err.message}`, code: (err as any).code, errorClass: err.toolErrorClass };
 
-  it('classifies as upstream_5xx and carries Retryable: yes', () => {
+  it('classifies as rate_limit and carries Retryable: yes with wait_seconds guidance', () => {
     const asError = toolResultError(handlerResult)!;
     const cls = classifyToolErrorClass(asError);
-    expect(cls).toBe('upstream_5xx');
+    expect(cls).toBe('rate_limit');
     expect(retryabilityLine(cls)).toMatch(/^\[Retryable: yes/);
   });
   it('never tells the user to reconnect, and avoids the handlers\' "access token expired" remap', () => {
     expect(err.message).not.toMatch(/access token expired|please reconnect|settings/i);
     expect(err.message).toMatch(/do not ask the user to reconnect/i);
+    expect(err.message).toMatch(/wait_seconds/);
+    expect(retryabilityLine('rate_limit')).toMatch(/wait_seconds/);
   });
 });

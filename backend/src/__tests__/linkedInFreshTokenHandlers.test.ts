@@ -1,6 +1,6 @@
 /**
  * ENG-2663 — a FreshTokenRejectedError thrown by the adapter must reach the model as a
- * retryable result (declared class upstream_5xx), never as the "reconnect" auth result,
+ * retryable result (declared class rate_limit), never as the "reconnect" auth result,
  * through every real LinkedIn write handler.
  */
 jest.mock('unipile-node-sdk', () => ({ UnipileClient: jest.fn().mockImplementation(() => ({})) }), { virtual: true });
@@ -63,10 +63,10 @@ describe('ENG-2663 FreshTokenRejectedError through the real LinkedIn handlers', 
 
   const expectRetryableNotReconnect = (result: any) => {
     expect(result.success).toBe(false);
-    expect(result.errorClass).toBe('upstream_5xx');
+    expect(result.errorClass).toBe('rate_limit');
     expect(result.message).not.toMatch(/Account token expired|reconnect the account/i);
     const cls = classifyToolErrorClass(toolResultError(result)!);
-    expect(cls).toBe('upstream_5xx');
+    expect(cls).toBe('rate_limit');
     expect(retryabilityLine(cls)).toMatch(/^\[Retryable: yes/);
   };
 

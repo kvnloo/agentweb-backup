@@ -42,14 +42,15 @@ export function isFreshlyMintedToken(tokenExpiresAt: number, now = Date.now()): 
 
 export class FreshTokenRejectedError extends Error {
   readonly freshTokenRejected = true;
-  // Declared class (see KNOWN_TOOL_ERROR_CLASSES): yields "Retryable: yes" guidance, not the
-  // terminal "auth" verdict that tells the model to send the user to reconnect.
-  readonly toolErrorClass = 'upstream_5xx';
+  // Declared class (see KNOWN_TOOL_ERROR_CLASSES): "Retryable: yes, wait before ONE retry" guidance
+  // instead of the terminal "auth" verdict. rate_limit fits best: it is a temporary refusal, and
+  // for non-media tools it has no side effects (the gateway only special-cases it for media budgets).
+  readonly toolErrorClass = 'rate_limit';
   constructor() {
     super(
-      'LinkedIn temporarily rejected the access that was just renewed for this account, so nothing was published. '
+      'LinkedIn temporarily rejected the access that was just renewed for this account, so nothing was sent. '
       + 'This is a temporary LinkedIn-side issue, not a disconnected account - do not ask the user to reconnect. '
-      + 'Wait about a minute and try once more.'
+      + 'Do not retry immediately: call wait_seconds with 60, then try this once more.'
     );
     this.name = 'FreshTokenRejectedError';
   }

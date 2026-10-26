@@ -4,7 +4,7 @@
 
 **Theory (n=2, unproven):** LinkedIn briefly rejects an access token used right after a refresh grant minted it. LinkedIn's docs say nothing; one 2021 Stack Overflow report says 5-10s second-hand, 3-5 min first-hand.
 
-**Fix:** a 401 on a token minted under 5 minutes ago (age derived from `token_expires_at` and the 60-day lifetime, so it holds across calls and hosts) is retried once after 10s for post, image upload, comment, repost and reaction. If it still fails, the adapter throws `FreshTokenRejectedError` (declared class `upstream_5xx`, so the model sees `Retryable: yes` and is told not to ask for a reconnect); the engagement executor reschedules it 30 minutes later. A 401 on an older token still says reconnect.
+**Fix:** a 401 on a token minted under 5 minutes ago (age derived from `token_expires_at` and the 60-day lifetime, so it holds across calls and hosts) is retried once after 10s for post, image upload, comment, repost and reaction. If it still fails, the adapter throws `FreshTokenRejectedError` (declared class `rate_limit`, so the model sees `Retryable: yes` with wait_seconds guidance and is told not to ask for a reconnect); the engagement executor reschedules it 30 minutes later. A 401 on an older token still says reconnect.
 
 **Not done:** the delay is a guess; nothing was run against live LinkedIn. After deploy, grep prod logs for `ENG-2663: 401 on a just-refreshed token`. Refreshing tokens ahead of expiry was judged over-engineering for two incidents.
 
