@@ -154,6 +154,7 @@ import { isRunStoreEnabled, claimIdempotency } from '../services/agentMode/runSt
 import { modelAccess } from '../services/agentMode/modelAccessInstance';
 import { workPlanStepModels } from '../services/agentMode/workPlanStepModelsInstance';
 import { readTierAllowedModels, getUserSubscriptionResolution } from '../services/subscriptionService';
+import { isTransientLLMError } from '../utils/agentModeErrors';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockWorker = generateMarketingResponseWorkerService as jest.Mocked<typeof generateMarketingResponseWorkerService>;
@@ -304,6 +305,7 @@ describe('POST /generate (fail-loud)', () => {
       code: 'model_unavailable',
       requestedModel: UNSERVED,
       reason: 'not_served',
+      userMessageSaved: false,
     });
     assertNothingRan();
   });
@@ -847,6 +849,7 @@ describe('ENG-669 tier model allowlist', () => {
           requestedModel: DISALLOWED,
           reason: 'not_in_plan',
           ...PLAN_FIELDS,
+          userMessageSaved: false,
         });
         assertNothingRan();
       });
@@ -916,6 +919,7 @@ describe('ENG-669 tier model allowlist', () => {
         code: 'model_unavailable',
         requestedModel: DISALLOWED,
         reason: 'not_in_plan',
+        userMessageSaved: false,
       });
       expect(mockWorker.runInWorker).not.toHaveBeenCalled();
       expect(mockChatbotDb.addMessageToSession).not.toHaveBeenCalled();
@@ -1348,5 +1352,211 @@ describe('ENG-669 model source on canonical ids, final-gate 422, legacy side cha
     expect(res.statusCode).toBe(422);
     expect(res.body).toMatchObject({ code: 'model_unavailable', reason: 'not_in_plan' });
     expect(res.body).not.toHaveProperty('tier');
+  });
+});
+
+describe('ENG-2641: every refused send says whether the user message was stored (userMessageSaved)', () => {
+  const ALLOWED = 'gemini-3.5-flash';
+  const DISALLOWED = 'gpt-5.5';
+  const notInPlan = () => new ModelUnavailableError(DISALLOWED, 'not_in_plan', {
+    model: DISALLOWED, tier: 'Free', allowedModels: [ALLOWED], upgradeRequired: ['Pro'],
+  });
+  const savedUserMessages = () => mockChatbotDb.addMessageToSession.mock.calls
+    .map(([, message]) => message as any)
+    .filter((m) => m.role === 'user');
+  const verifiedReq = (body: Record<string, unknown> = {}) => ({
+    user: { userId: OWNER },
+    body: { sessionId: SESSION_ID, startingMessage: MESSAGE, attachments: [], llmModel: DISALLOWED, ...body },
+    on: jest.fn(),
+  } as any);
+  const shareReq = () => ({
+    params: { shareId: SESSION_ID }, query: { conversable: 'tok' }, body: { userMessage: MESSAGE, attachments: [] }, on: jest.fn(),
+  } as unknown as Request);
+  const sharedSession = (llmModel: string) => ({
+    ...baseSession(llmModel), llmModelSource: 'user',
+    interactiveShareMetadata: { isActive: true, token: 'tok', sharedAt: '2026-07-01T00:00:00Z' },
+  });
+  const exhausted = {
+    allowed: false, warning: false, used: 1, allowance: 1, bonus: 0, effectiveAllowance: 1, percentUsed: 100, month: '2026-07',
+  };
+  let assertSpy: jest.SpyInstance | undefined;
+
+  beforeEach(() => {
+    mockSettings.model_tier_allowlist_enabled = 'true';
+    mockSettings.subscription_types = JSON.stringify([{ name: 'Free', allowedModels: [ALLOWED] }, { name: 'Pro', allowedModels: ['*'] }]);
+    (getUserSubscriptionResolution as jest.Mock).mockResolvedValue({ subscriptionType: 'Free', resolved: true });
+    (readTierAllowedModels as jest.Mock).mockImplementation(async (tier: string) => {
+      const row = JSON.parse(mockSettings.subscription_types as string).find((t: any) => t.name === tier);
+      return row ? { configured: true, allowedModels: row.allowedModels } : { configured: false };
+    });
+    mockChatbotDb.getChatSession.mockResolvedValue({ ...baseSession(DISALLOWED), llmModelSource: 'user' } as any);
+  });
+  afterEach(() => {
+    assertSpy?.mockRestore();
+    assertSpy = undefined;
+  });
+
+  describe('POST /generate', () => {
+    it('pre-flight 422 (an explicit pick outside the plan): false, and no user message was written', async () => {
+      const res = makeRes();
+      await agentModeController.generateResponse(generateReq({ llmModel: DISALLOWED }), res);
+      expect(res.statusCode).toBe(422);
+      expect(res.body).toMatchObject({ code: 'model_unavailable', reason: 'not_in_plan', userMessageSaved: false });
+      expect(savedUserMessages()).toEqual([]);
+    });
+
+    it('final-gate 422 inside generateSessionResponse (before the save): false, and no user message was written', async () => {
+      assertSpy = jest.spyOn(modelAccess, 'assertModelAllowed');
+      assertSpy.mockResolvedValueOnce(undefined).mockRejectedValueOnce(notInPlan());
+      const res = makeRes();
+      await agentModeController.generateResponse(generateReq({ llmModel: DISALLOWED }), res);
+      expect(assertSpy).toHaveBeenCalledTimes(2);
+      expect(res.statusCode).toBe(422);
+      expect(res.body).toMatchObject({ code: 'model_unavailable', userMessageSaved: false });
+      expect(savedUserMessages()).toEqual([]);
+    });
+
+    it('Work Plan step-model 422 AFTER the save: true, and the stored message is the one this request sent', async () => {
+      mockSettings.work_plan_step_models_enabled = 'true';
+      assertSpy = jest.spyOn(modelAccess, 'assertModelAllowed');
+      assertSpy.mockResolvedValueOnce(undefined).mockResolvedValueOnce(undefined).mockRejectedValueOnce(notInPlan());
+      // A session store that keeps the model /generate stamps before the turn (as the real one does).
+      let stored: any = {
+        ...baseSession(ALLOWED), llmModelSource: 'user',
+        workPlan: { title: 'P', steps: [{ stepCount: 1, title: 'S1', status: 'pending', model: UNSERVED }], createdAt: 'x', updatedAt: 'x' },
+      };
+      mockChatbotDb.getChatSession.mockImplementation(async () => stored);
+      mockChatbotDb.updateSessionLlmModel.mockImplementation(async (_id: string, model: string, decision: any, source?: any) => {
+        stored = { ...stored, llmModel: model, llmUsagePolicyDecision: decision, llmModelSource: source };
+        return stored;
+      });
+      const res = makeRes();
+      await agentModeController.generateResponse(generateReq({ llmModel: DISALLOWED, clientId: 'msg-1' }), res);
+      expect(assertSpy).toHaveBeenCalledTimes(3);
+      expect(res.statusCode).toBe(422);
+      expect(res.body).toMatchObject({ code: 'model_unavailable', reason: 'not_in_plan', userMessageSaved: true });
+      expect(savedUserMessages()).toEqual([expect.objectContaining({ content: MESSAGE, clientId: 'msg-1' })]);
+      expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+    });
+
+    it('409 SESSION_BUSY: false, and no user message was written', async () => {
+      activeSessionGenerations.add(SESSION_ID);
+      const res = makeRes();
+      await agentModeController.generateResponse(generateReq({ llmModel: ALLOWED }), res);
+      expect(res.statusCode).toBe(409);
+      expect(res.body).toMatchObject({ code: 'SESSION_BUSY', userMessageSaved: false });
+      expect(savedUserMessages()).toEqual([]);
+    });
+
+    it('429 usage paused: false, and no user message was written', async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue({ ...baseSession(ALLOWED), llmModelSource: 'user' } as any);
+      mockCheckTokenUsage.mockResolvedValue(exhausted);
+      const res = makeRes();
+      await agentModeController.generateResponse(generateReq({ llmModel: ALLOWED }), res);
+      expect(res.statusCode).toBe(429);
+      expect(res.body).toMatchObject({ code: 'usage_paused', userMessageSaved: false });
+      expect(savedUserMessages()).toEqual([]);
+    });
+  });
+
+  describe('POST /ishare/:id/generate', () => {
+    it('pre-flight 422 (the stored model outside the owner\'s plan): false', async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue(sharedSession(DISALLOWED) as any);
+      const res = makeRes();
+      await agentModeController.generateSharedResponse(shareReq(), res);
+      expect(res.statusCode).toBe(422);
+      expect(res.body).toMatchObject({ code: 'model_unavailable', userMessageSaved: false });
+      expect(savedUserMessages()).toEqual([]);
+    });
+
+    it('final-gate 422 inside generateSessionResponse (before the save): false', async () => {
+      assertSpy = jest.spyOn(modelAccess, 'assertModelAllowed');
+      assertSpy.mockResolvedValueOnce(undefined).mockResolvedValueOnce(undefined).mockRejectedValueOnce(notInPlan());
+      mockChatbotDb.getChatSession.mockResolvedValue(sharedSession(DISALLOWED) as any);
+      const res = makeRes();
+      await agentModeController.generateSharedResponse(shareReq(), res);
+      expect(res.statusCode).toBe(422);
+      expect(res.body).toMatchObject({ code: 'model_unavailable', userMessageSaved: false });
+      expect(savedUserMessages()).toEqual([]);
+    });
+
+    it('409 SESSION_BUSY: false', async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue(sharedSession(ALLOWED) as any);
+      activeSessionGenerations.add(SESSION_ID);
+      const res = makeRes();
+      await agentModeController.generateSharedResponse(shareReq(), res);
+      expect(res.statusCode).toBe(409);
+      expect(res.body).toMatchObject({ code: 'SESSION_BUSY', userMessageSaved: false });
+    });
+
+    it("429 (the owner's allowance is exhausted): false", async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue(sharedSession(ALLOWED) as any);
+      mockCheckTokenUsage.mockResolvedValue(exhausted);
+      const res = makeRes();
+      await agentModeController.generateSharedResponse(shareReq(), res);
+      expect(res.statusCode).toBe(429);
+      expect(res.body).toMatchObject({ userMessageSaved: false });
+      expect(savedUserMessages()).toEqual([]);
+    });
+  });
+
+  describe('POST /verified-generate', () => {
+    it('pre-flight 422: false', async () => {
+      const res = makeRes();
+      await agentModeController.verifiedGenerate(verifiedReq(), res);
+      expect(res.statusCode).toBe(422);
+      expect(res.body).toMatchObject({ code: 'model_unavailable', userMessageSaved: false });
+      expect(savedUserMessages()).toEqual([]);
+    });
+
+    it('final-gate 422 on the FIRST attempt (before the starting message is saved): false', async () => {
+      assertSpy = jest.spyOn(modelAccess, 'assertModelAllowed');
+      assertSpy.mockResolvedValueOnce(undefined).mockRejectedValueOnce(notInPlan());
+      const res = makeRes();
+      await agentModeController.verifiedGenerate(verifiedReq(), res);
+      expect(res.statusCode).toBe(422);
+      expect(res.body).toMatchObject({ code: 'model_unavailable', userMessageSaved: false });
+      expect(savedUserMessages()).toEqual([]);
+    });
+
+    it('final-gate 422 on a LATER attempt (the first attempt saved the starting message): true', async () => {
+      assertSpy = jest.spyOn(modelAccess, 'assertModelAllowed');
+      assertSpy.mockResolvedValueOnce(undefined).mockResolvedValueOnce(undefined).mockRejectedValueOnce(notInPlan());
+      // Attempt 1 runs and saves the starting message, but answers nothing, so attempt 2 starts and is refused.
+      mockWorker.runInWorker.mockResolvedValueOnce({ ...workerResult, content: '' } as any);
+      const res = makeRes();
+      await agentModeController.verifiedGenerate(verifiedReq(), res);
+      expect(assertSpy).toHaveBeenCalledTimes(3);
+      expect(res.statusCode).toBe(422);
+      expect(res.body).toMatchObject({ code: 'model_unavailable', userMessageSaved: true });
+      expect(savedUserMessages()[0]).toMatchObject({ content: MESSAGE });
+    });
+
+    it('attempt 1 saves the message then fails transiently; attempt 2 is refused BEFORE its own save: still true', async () => {
+      assertSpy = jest.spyOn(modelAccess, 'assertModelAllowed');
+      assertSpy.mockResolvedValueOnce(undefined).mockResolvedValueOnce(undefined).mockRejectedValueOnce(notInPlan());
+      const transient = new Error('upstream overloaded');
+      (isTransientLLMError as jest.Mock).mockImplementation((e: unknown) => e === transient);
+      mockWorker.runInWorker.mockRejectedValueOnce(transient);
+      try {
+        const res = makeRes();
+        await agentModeController.verifiedGenerate(verifiedReq(), res);
+        expect(assertSpy).toHaveBeenCalledTimes(3);
+        expect(mockWorker.runInWorker).toHaveBeenCalledTimes(1);
+        expect(res.statusCode).toBe(422);
+        expect(res.body).toMatchObject({ code: 'model_unavailable', userMessageSaved: true });
+        expect(savedUserMessages()).toEqual([expect.objectContaining({ content: MESSAGE })]);
+      } finally {
+        (isTransientLLMError as jest.Mock).mockReset().mockReturnValue(false);
+      }
+    });
+
+    it('429 usage paused: false', async () => {
+      mockCheckTokenUsage.mockResolvedValue(exhausted);
+      const res = makeRes();
+      await agentModeController.verifiedGenerate(verifiedReq(), res);
+      expect(res.statusCode).toBe(429);
+      expect(res.body).toMatchObject({ code: 'usage_paused', userMessageSaved: false });
+    });
   });
 });

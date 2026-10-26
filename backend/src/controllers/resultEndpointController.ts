@@ -5,6 +5,7 @@ import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
 import { runVerifiedChat, RUN_VERIFIED_CHAT_LOCK_TIMEOUT_LONG_MS } from './agentModeController';
 import { cronJobRegistry } from '../utils/cronJobRegistry';
+import { isValidRecipientEmail } from '../services/resultEndpointReview';
 
 export interface WaitingContent {
   type: 'youtube' | 'url' | 'html';
@@ -112,6 +113,12 @@ export async function handleResult(req: Request, res: Response): Promise<void> {
     const leadEmail = allParams.leadEmail;
     const leadId = allParams.leadId;
     const externalSessionId = allParams.sessionId;
+
+    // ENG-2650: leadEmail is public input and later becomes the To: of the skipReview auto-send.
+    if (leadEmail !== undefined && leadEmail !== '' && !isValidRecipientEmail(leadEmail)) {
+      res.status(400).json({ error: 'leadEmail must be a single valid email address' });
+      return;
+    }
 
     // Remove special params from args
     const args: Record<string, string> = {};
