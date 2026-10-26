@@ -10,6 +10,7 @@ import { DRAIN_CEILING_MS, DRAIN_POLL_INTERVAL_MS } from '../utils/shutdownConst
 import type { WorkPlanTurnDisposition } from './agentMode/core/workPlanTurnDisposition';
 import type { PendingApprovalDeck } from './agentMode/core/approvalDeck';
 import type { RunFunding } from './funding/runFunding';
+import { claudeRunRegistry } from './funding/claudeRunRegistry';
 
 export interface GenerateMarketingResponseParams {
   messageContent: string;
@@ -371,6 +372,9 @@ export class GenerateMarketingResponseWorkerService {
    * Send a cancel signal to the worker for a given session
    */
   cancelSession(sessionId: string): void {
+    // ENG-2113: a turn on the user's own Claude plan runs in THIS process, not the worker, so the worker message below never reaches it.
+    // Every Stop / timeout / preemption site already calls this method; the registry is a no-op for any session without a Claude turn.
+    claudeRunRegistry.cancel(sessionId);
     const requestId = this.sessionToRequestId.get(sessionId);
     if (requestId && this.worker && !this.worker.killed) {
       this.worker.send({ type: 'cancel', requestId });
