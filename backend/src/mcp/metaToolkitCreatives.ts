@@ -69,7 +69,7 @@ export interface MetaToolkitCreativeDeps {
   resolveHost: (host: string) => Promise<string[]>;
   uploadImage: (userId: string, url: string, accountId: string) => Promise<any>;
   uploadVideo: (userId: string, url: string, accountId: string) => Promise<any>;
-  videoStatus: (userId: string, accountId: string, videoId: string) => Promise<{ status: string; thumbnail_url?: string; error?: string }>;
+  videoStatus: (userId: string, accountId: string, videoId: string, opts?: { justUploaded?: boolean }) => Promise<{ status: string; thumbnail_url?: string; error?: string }>;
   previewCreative: (userId: string, accountId: string, params: any) => Promise<any>;
   dispatch: (userId: string, dispatch: any) => Promise<{ result: any; createdId?: string }>;
   readCreative: (userId: string, accountId: string, creativeId: string) => Promise<any>;
@@ -103,7 +103,7 @@ const defaultDeps: MetaToolkitCreativeDeps = {
   resolveHost: async (host) => (await dns.lookup(host, { all: true })).map((a) => a.address),
   uploadImage: async (userId, url, accountId) => (await ams()).uploadMetaAdsImage(userId, url, accountId),
   uploadVideo: async (userId, url, accountId) => (await ams()).uploadMetaAdsVideo(userId, url, accountId),
-  videoStatus: async (userId, accountId, videoId) => (await ams()).readToolkitMetaVideoStatus(userId, accountId, videoId),
+  videoStatus: async (userId, accountId, videoId, opts) => (await ams()).readToolkitMetaVideoStatus(userId, accountId, videoId, opts),
   previewCreative: async (userId, accountId, params) =>
     (await ams()).previewToolkitMetaWrite(userId, 'AD_CREATIVE', 'CREATE', accountId, undefined, undefined, undefined, params),
   dispatch: async (userId, d) => (await ams()).dispatchToolkitConfirmedMetaWrite(userId, d),
@@ -271,12 +271,22 @@ function refuseForbidden(params: any) {
   }
 }
 
-async function waitForVideo(userId: string, accountId: string, videoId: string, deps: MetaToolkitCreativeDeps) {
+/** Video status as a refusal the agent can read, not an opaque 500. */
+async function readVideoStatus(userId: string, accountId: string, videoId: string, deps: MetaToolkitCreativeDeps, justUploaded: boolean) {
+  try {
+    return await deps.videoStatus(userId, accountId, videoId, { justUploaded });
+  } catch (error: any) {
+    const meta = error?.response?.data?.error?.message;
+    throw new MetaToolkitRefusal(`Could not read video ${videoId}: ${meta || (error instanceof Error ? error.message : 'unknown error')}`);
+  }
+}
+
+async function waitForVideo(userId: string, accountId: string, videoId: string, deps: MetaToolkitCreativeDeps, justUploaded = false) {
   const deadline = deps.now() + deps.videoWaitMs;
-  let last = await deps.videoStatus(userId, accountId, videoId);
+  let last = await readVideoStatus(userId, accountId, videoId, deps, justUploaded);
   while (last.status === 'processing' && deps.now() < deadline) {
     await deps.sleep(5000);
-    last = await deps.videoStatus(userId, accountId, videoId);
+    last = await readVideoStatus(userId, accountId, videoId, deps, justUploaded);
   }
   return last;
 }
@@ -359,7 +369,7 @@ export async function executeMetaToolkitCreative(userId: string, rawArgs: any, d
     if (!result?.success || !videoId) {
       return { success: false, status: 'FAILED', message: String(result?.message || result?.error || 'Meta did not accept the video.') };
     }
-    return videoResult(videoId, await waitForVideo(userId, accountId, videoId, deps));
+    return videoResult(videoId, await waitForVideo(userId, accountId, videoId, deps, true));
   }
 
   // CREATE
@@ -373,7 +383,7 @@ export async function executeMetaToolkitCreative(userId: string, rawArgs: any, d
     }
   }
   if (params.video_id) {
-    const st = await deps.videoStatus(userId, accountId, String(params.video_id));
+    const st = await readVideoStatus(userId, accountId, String(params.video_id), deps, false);
     if (st.status !== 'ready') {
       return { success: false, status: 'VIDEO_NOT_READY', video_status: st.status, message: `Video ${params.video_id} is ${st.status} at Meta; the creative cannot be built until it is ready. Re-check with AD_CREATIVE UPLOAD_VIDEO params.video_id.` };
     }
