@@ -395,9 +395,9 @@ check_alert_job() {
     return
   fi
   if printf '%s\n' "${block}" | grep -E "${pattern}" >/dev/null; then
-    [ "${expectation}" = 'present' ] && pass "${desc}" || record_fail "${desc}" "notify-deploy-failure unexpectedly matches: ${pattern}"
+    if [ "${expectation}" = 'present' ]; then pass "${desc}"; else record_fail "${desc}" "notify-deploy-failure unexpectedly matches: ${pattern}"; fi
   else
-    [ "${expectation}" = 'absent' ] && pass "${desc}" || record_fail "${desc}" "notify-deploy-failure does not match: ${pattern}"
+    if [ "${expectation}" = 'absent' ]; then pass "${desc}"; else record_fail "${desc}" "notify-deploy-failure does not match: ${pattern}"; fi
   fi
 }
 
