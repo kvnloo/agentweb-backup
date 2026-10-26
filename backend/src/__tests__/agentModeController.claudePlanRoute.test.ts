@@ -10,6 +10,8 @@
  *  - a backend stop after the user's message was saved leaves a fixed-copy note, uses no diagnosis agent, and releases the session lock;
  *  - a whole-turn timeout stops the turn and is reported as the timeout, with no salvage.
  */
+// The whole-turn cap is read when the controller loads: 0.3 s makes the real timeout race fire inside a test.
+process.env.AGENT_MODE_GENERATION_TIMEOUT_MS = '300';
 import { Request, Response } from 'express';
 import { agentModeController, activeSessionGenerations } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
@@ -19,6 +21,10 @@ import { agentModeService } from '../services/agentModeService';
 import { resolveTurnFunding } from '../services/funding/claudeFunding';
 import { claudeCodeBackend } from '../services/funding/claudeCodeBackendInstance';
 import { ClaudeRouteStopError } from '../services/funding/claudeRouteErrors';
+import { assertModelInOwnerPlan, modelAccess } from '../services/agentMode/modelAccessInstance';
+import { resolveRunFunding } from '../services/funding/runFunding';
+import { emitProgress, requestCancel } from '../utils/sseProgress';
+import { WORK_PLAN_NEEDS_YOU_MESSAGE } from '../controllers/agentModeController';
 
 jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
@@ -72,7 +78,18 @@ jest.mock('../utils/agentModeErrors', () => ({
   isWorkerShutdownError: jest.fn().mockReturnValue(false),
   isProviderNoEndpointsError: jest.fn().mockReturnValue(false),
 }));
+// The needs-you hand-back emits over Socket.IO through the real server module, which must not boot inside a unit test.
+jest.mock('../server', () => ({ io: { to: jest.fn().mockReturnValue({ emit: jest.fn() }) } }));
 jest.mock('../services/funding/claudeFunding', () => ({ resolveTurnFunding: jest.fn() }));
+// Real modules with one spy each, so the AgentWeb-only steps can be shown to run for a normal request and to stay out of a plan turn.
+jest.mock('../services/agentMode/modelAccessInstance', () => ({
+  ...jest.requireActual('../services/agentMode/modelAccessInstance'),
+  assertModelInOwnerPlan: jest.fn().mockResolvedValue(undefined),
+}));
+jest.mock('../services/funding/runFunding', () => {
+  const actual = jest.requireActual('../services/funding/runFunding');
+  return { ...actual, resolveRunFunding: jest.fn(actual.resolveRunFunding) };
+});
 jest.mock('../services/funding/claudeCodeBackendInstance', () => ({ claudeCodeBackend: { run: jest.fn() } }));
 
 const db = chatbotDb as jest.Mocked<typeof chatbotDb> & Record<string, jest.Mock>;
@@ -170,6 +187,61 @@ describe('/generate on the Claude plan route', () => {
       await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription' }), res);
       expect(worker.runInWorker).not.toHaveBeenCalled();
       expect(backend).not.toHaveBeenCalled();
+      // ...it is a typed stop the user can act on, nothing was saved, and the session is not left locked
+      expect(res.status).toHaveBeenCalledWith(503);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'lookup_failed', funding: 'claude_subscription', userMessageSaved: false }));
+      expect(db.addMessageToSession).not.toHaveBeenCalled();
+      expect(activeSessionGenerations.has('s1')).toBe(false);
+    });
+
+    it('an early stop says the user message was not saved', async () => {
+      funding.mockRejectedValueOnce(new ClaudeRouteStopError('not_enabled'));
+      const res = makeRes();
+      await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription' }), res);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'not_enabled', userMessageSaved: false }));
+    });
+
+    it('does not resolve the model pick for a request that never asked for the plan', async () => {
+      worker.runInWorker.mockResolvedValueOnce({ content: 'OK', toolCalls: [], knowledgeBaseQueries: [], sources: [], responseMessages: [] } as any);
+      await agentModeController.generateResponse(makeReq({ llmModel: PLAN_MODEL }), makeRes());
+      expect(funding).toHaveBeenCalledWith(expect.objectContaining({ explicitModelId: undefined }));
+    });
+
+    it('hands the resolver the organisation, the Fable acknowledgement, the initiator and a delegated session', async () => {
+      funding.mockRejectedValue(new ClaudeRouteStopError('not_enabled'));
+      db.getChatSession.mockResolvedValue({ ...SESSION, delegateInfo: { isDelegated: true } } as any);
+      const req = makeReq({ fundingChoice: 'claude_subscription', acknowledgeExtraUsage: true }) as any;
+      req.user = { userId: 'u1', email: 'u1@example.com', orgId: 'org-1' };
+      await agentModeController.generateResponse(req, makeRes());
+      expect(funding).toHaveBeenLastCalledWith(expect.objectContaining({ initiatorOrgId: 'org-1', acknowledgedExtraUsage: true, sessionIsDelegated: true, initiatorUserId: 'u1' }));
+      await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription', acknowledgeExtraUsage: 'yes' }), makeRes());
+      expect(funding).toHaveBeenLastCalledWith(expect.objectContaining({ acknowledgedExtraUsage: false })); // only the literal true counts
+      const admin = makeReq({ fundingChoice: 'claude_subscription' }) as any;
+      admin.user = { userId: 'admin-1', email: 'a@example.com', isAdmin: true };
+      db.getChatSession.mockResolvedValue(SESSION as any);
+      await agentModeController.generateResponse(admin, makeRes());
+      expect(funding).toHaveBeenLastCalledWith(expect.objectContaining({ initiatorUserId: 'admin-1', sessionOwnerUserId: 'u1' }));
+    });
+  });
+
+  describe('/verified-generate', () => {
+    it('refuses a request for the plan: it always runs on AgentWeb, so a plan request must hear no', async () => {
+      const res = makeRes();
+      await agentModeController.verifiedGenerate(makeReq({ fundingChoice: 'claude_subscription', startingMessage: 'x', requiredFunctions: [] }), res);
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'invalid_funding_choice', userMessageSaved: false }));
+      expect(db.getChatSession).not.toHaveBeenCalled();
+      expect(backend).not.toHaveBeenCalled();
+    });
+
+    it('lets an explicit "agentweb" or no choice through to the normal flow', async () => {
+      for (const fundingChoice of ['agentweb', undefined, null]) {
+        const res = makeRes();
+        await agentModeController.verifiedGenerate(makeReq({ fundingChoice, startingMessage: 'x', requiredFunctions: [] }), res);
+        expect(res.status).not.toHaveBeenCalledWith(400);
+        expect(db.getChatSession).toHaveBeenCalled();
+        db.getChatSession.mockClear();
+      }
     });
   });
 
@@ -237,14 +309,125 @@ describe('/generate on the Claude plan route', () => {
       expect(activeSessionGenerations.has('s1')).toBe(false);
     });
 
-    it('a whole-turn timeout cancels the turn through cancelSession, is reported as the timeout, and is never salvaged', async () => {
-      backend.mockRejectedValueOnce(Object.assign(new Error('Generation timed out'), { isGenerationTimeout: true }));
+    it('a backend stop after the message was saved says so in the body (the message is in the chat)', async () => {
+      backend.mockRejectedValueOnce(new ClaudeRouteStopError('host_busy'));
       const res = makeRes();
       await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription' }), res);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'host_busy', userMessageSaved: true }));
+    });
+
+    it('the whole-turn cap ends a turn that never answers: the real race fires, the turn is cancelled, and it is the fixed timeout note', async () => {
+      backend.mockImplementationOnce(() => new Promise(() => {})); // never settles
+      const res = makeRes();
+      await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription' }), res);
+      expect(requestCancel).toHaveBeenCalledWith('s1');
       expect(worker.cancelSession).toHaveBeenCalledWith('s1');
-      expect(db.getChatSession).not.toHaveBeenCalledWith('s1', true); // the salvage read
+      expect(res.status).toHaveBeenCalledWith(504);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'turn_timeout', funding: 'claude_subscription', userMessageSaved: true, retryable: false }));
+      const note = db.addMessageToSession.mock.calls.map((c) => c[1] as any).find((m) => m?.metadata?.kind === 'claude-plan-stop');
+      expect(note).toMatchObject({ metadata: { code: 'turn_timeout', isErrorMessage: true } });
+      expect(emitProgress).toHaveBeenCalledWith('s1', { iteration: 0, status: 'complete' }); // the progress stream is closed, not left "generating"
+      expect(agentModeService.generateDiagnosticMessage).not.toHaveBeenCalled(); // no AgentWeb money spent guessing
+      expect(db.getChatSession).not.toHaveBeenCalledWith('s1', true); // no salvage read
       expect(worker.runInWorker).not.toHaveBeenCalled();
       expect(activeSessionGenerations.has('s1')).toBe(false);
+    });
+
+    it('any other failure on a plan turn is also the fixed note: no diagnosis agent, no AgentWeb run', async () => {
+      // an error that escapes the backend's own handling (or comes from the code around it)
+      backend.mockRejectedValueOnce(new Error('dynamo down: secret-ish detail'));
+      const res = makeRes();
+      await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription' }), res);
+      expect(res.status).toHaveBeenCalledWith(502);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'turn_failed', funding: 'claude_subscription', userMessageSaved: true }));
+      expect(JSON.stringify((res.json as jest.Mock).mock.calls)).not.toContain('secret-ish');
+      expect(agentModeService.generateDiagnosticMessage).not.toHaveBeenCalled();
+      expect(worker.runInWorker).not.toHaveBeenCalled();
+      expect(activeSessionGenerations.has('s1')).toBe(false);
+    });
+
+    it('hands the backend what the turn needs: delegation, the turn clock, the stamps and a progress sink that reaches the stream', async () => {
+      backend.mockResolvedValueOnce(planResult());
+      const req = makeReq({ fundingChoice: 'claude_subscription' }) as any;
+      req.delegateInfo = { isDelegated: true };
+      await agentModeController.generateResponse(req, makeRes());
+      const arg = backend.mock.calls[0][0];
+      expect(arg).toMatchObject({ isDelegatedAccess: true, turnStartMs: expect.any(Number), onProgress: expect.any(Function) });
+      expect(Date.now() - arg.turnStartMs).toBeLessThan(10_000);
+      arg.onProgress({ iteration: 1, status: 'executing_tools' });
+      expect(emitProgress).toHaveBeenCalledWith('s1', { iteration: 1, status: 'executing_tools' });
+    });
+
+    describe('AgentWeb-only steps stay out of a plan turn', () => {
+      const normalAnswer = { content: 'OK', toolCalls: [], knowledgeBaseQueries: [], sources: [], responseMessages: [] } as any;
+      const enabledWithStoredModel = () => {
+        jest.spyOn(modelAccess, 'isEnabled').mockResolvedValue(true);
+        db.getChatSession.mockResolvedValue({ ...SESSION, llmModel: 'gpt-5-chat-2' } as any);
+      };
+
+      it('checks the model against the owner\'s AgentWeb plan for a normal request, and not for a plan turn', async () => {
+        enabledWithStoredModel();
+        funding.mockResolvedValueOnce({ route: 'agentweb' });
+        worker.runInWorker.mockResolvedValueOnce(normalAnswer);
+        await agentModeController.generateResponse(makeReq({ llmModel: 'gpt-5-chat-2' }), makeRes());
+        expect(assertModelInOwnerPlan).toHaveBeenCalled(); // the condition is live...
+        (assertModelInOwnerPlan as jest.Mock).mockClear();
+        // the same situation on a plan turn: the stored model IS the one the plan runs
+        db.getChatSession.mockResolvedValue({ ...SESSION, llmModel: PLAN_MODEL } as any);
+        backend.mockResolvedValueOnce(planResult());
+        await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription', llmModel: PLAN_MODEL }), makeRes());
+        expect(backend).toHaveBeenCalledTimes(1);
+        expect(assertModelInOwnerPlan).not.toHaveBeenCalled(); // ...and a plan turn is not held to AgentWeb's plan
+      });
+
+      it('resolves AgentWeb run funding for a normal request, and not for a plan turn', async () => {
+        funding.mockResolvedValueOnce({ route: 'agentweb' });
+        worker.runInWorker.mockResolvedValueOnce(normalAnswer);
+        await agentModeController.generateResponse(makeReq({ llmModel: 'gpt-5-chat-2' }), makeRes());
+        expect(resolveRunFunding).toHaveBeenCalled();
+        (resolveRunFunding as jest.Mock).mockClear();
+        backend.mockResolvedValueOnce(planResult());
+        await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription' }), makeRes());
+        expect(resolveRunFunding).not.toHaveBeenCalled();
+      });
+
+      it('hands a blocked autocomplete work plan back to the user once on AgentWeb, and never on the plan', async () => {
+        const blocked = [{ name: 'set_work_plan_status', result: { blocked: true, reason: 'workplan_unresolved_removed_requirements' } }];
+        const workPlan = { autocomplete: true, steps: [{ status: 'pending' }] };
+        db.getChatSession.mockResolvedValue({ ...SESSION, workPlan } as any); // the turn reads its work plan back from the session
+        funding.mockResolvedValueOnce({ route: 'agentweb' });
+        worker.runInWorker.mockResolvedValueOnce({ ...normalAnswer, toolCalls: blocked });
+        await agentModeController.generateResponse(makeReq({ llmModel: 'gpt-5-chat-2' }), makeRes());
+        await flush();
+        await flush();
+        const needsYou = () => db.addMessageToSession.mock.calls.filter((c) => (c[1] as any)?.content === WORK_PLAN_NEEDS_YOU_MESSAGE).length;
+        expect(needsYou()).toBe(1); // the check is live on the AgentWeb path
+        db.addMessageToSession.mockClear();
+        backend.mockResolvedValueOnce(planResult({ toolCalls: blocked }));
+        await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription' }), makeRes());
+        await flush();
+        await flush();
+        expect(needsYou()).toBe(0);
+      });
+
+      it('never auto-continues a stalled autocomplete work plan on the plan', async () => {
+        // A continuation starts by admitting itself against the AgentWeb allowance (checkTokenUsage); a plan turn is never admitted there.
+        db.getChatSession.mockResolvedValue({ ...SESSION, workPlan: { autocomplete: true, steps: [{ status: 'pending' }] } } as any);
+        backend.mockResolvedValueOnce(planResult({ toolCalls: [] }));
+        await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription' }), makeRes());
+        await flush();
+        await flush();
+        await flush();
+        expect(usage).not.toHaveBeenCalled();
+        expect(backend).toHaveBeenCalledTimes(1);
+        expect(worker.runInWorker).not.toHaveBeenCalled();
+      });
+
+      it('does not store the pick as the session\'s explicit model on the plan', async () => {
+        backend.mockResolvedValueOnce(planResult());
+        await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription', llmModel: PLAN_MODEL }), makeRes());
+        expect(db.updateSessionLlmModel).not.toHaveBeenCalled();
+      });
     });
   });
 });

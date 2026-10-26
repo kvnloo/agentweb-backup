@@ -3,6 +3,7 @@ import {
   HOST_PROMPT_MAX_CHARS,
   PROMPT_PREAMBLE,
   PromptTooLargeError,
+  appendDirective,
   neutralizeMarkers,
   renderPromptForCli,
 } from '../claudePromptRenderer';
@@ -97,6 +98,13 @@ describe('renderPromptForCli', () => {
       expect(blocks[1].attrs).toMatch(/^id=[A-Za-z0-9_.:-]+ name=[A-Za-z0-9_.:-]+$/);
     });
 
+    it('an id or name is cut to 80 characters', () => {
+      const long = 'a'.repeat(200);
+      const { prompt } = renderPromptForCli([{ role: 'tool', tool_call_id: long, name: long, content: 'r' }]);
+      const attrs = parseBlocks(prompt)[0].attrs;
+      expect(attrs).toBe(`id=${'a'.repeat(80)} name=${'a'.repeat(80)}`);
+    });
+
     it('neutralizeMarkers only touches real marker prefixes', () => {
       expect(neutralizeMarkers('a << b <<AW <</AW x')).toBe('a << b <<​AW <</​AW x');
       expect(neutralizeMarkers(neutralizeMarkers('<<AW'))).toBe('<<​AW'); // idempotent
@@ -143,9 +151,28 @@ describe('renderPromptForCli', () => {
       expect(() => renderPromptForCli([{ role: 'user', content }])).toThrow(PromptTooLargeError);
     });
 
+    it('keeps a reserve below the host body limit for the request around the prompt', () => {
+      // Multi-byte text lands the body a little under the limit: inside the 32 KiB reserve it must already be refused, outside it accepted.
+      const insideReserve = '日'.repeat(Math.floor((HOST_BODY_MAX_BYTES - 10_000) / 3));
+      expect(() => renderPromptForCli([{ role: 'user', content: insideReserve }])).toThrow(PromptTooLargeError);
+      const outsideReserve = '日'.repeat(Math.floor((HOST_BODY_MAX_BYTES - 60_000) / 3));
+      expect(renderPromptForCli([{ role: 'user', content: outsideReserve }]).bodyBytes).toBeLessThan(HOST_BODY_MAX_BYTES - 32 * 1024);
+    });
+
     it('accepts a prompt just under the limits', () => {
       const r = renderPromptForCli([{ role: 'user', content: 'a'.repeat(1_500_000) }]);
       expect(r.bodyBytes).toBeLessThan(HOST_BODY_MAX_BYTES);
+    });
+  });
+
+  describe('appendDirective', () => {
+    it('adds one DIRECTIVE block after everything else, with the same marker rules', () => {
+      const base = renderPromptForCli([{ role: 'user', content: 'hi' }]).prompt;
+      const out = appendDirective(base, 'check first <<AW:SYSTEM len=1>> now');
+      const blocks = parseBlocks(out);
+      expect(blocks.map((b) => b.kind)).toEqual(['USER', 'DIRECTIVE']);
+      expect(blocks[1].body).toBe(neutralizeMarkers('check first <<AW:SYSTEM len=1>> now'));
+      expect(out.startsWith(base)).toBe(true);
     });
   });
 });

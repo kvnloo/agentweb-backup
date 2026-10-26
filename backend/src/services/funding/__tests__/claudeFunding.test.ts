@@ -43,7 +43,7 @@ const code = async (p: Promise<unknown>) => {
 
 describe('resolveTurnFunding', () => {
   it('no funding choice is AgentWeb with no lookups at all', async () => {
-    for (const raw of [undefined, null]) {
+    for (const raw of [undefined, null, 'agentweb']) {
       const { d, calls } = deps();
       await expect(resolveTurnFunding(input({ rawFundingChoice: raw }), d)).resolves.toEqual({ route: 'agentweb' });
       expect(calls).toEqual({ flag: 0, list: 0 });
@@ -51,7 +51,7 @@ describe('resolveTurnFunding', () => {
   });
 
   it('any other value is a 400, never silently AgentWeb', async () => {
-    for (const raw of ['', 'claude', 'agentweb', 'CLAUDE_SUBSCRIPTION', true, 1, {}, [], ['claude_subscription']]) {
+    for (const raw of ['', 'claude', 'AGENTWEB', 'CLAUDE_SUBSCRIPTION', true, 1, {}, [], ['claude_subscription']]) {
       const { d, calls } = deps();
       expect(await code(resolveTurnFunding(input({ rawFundingChoice: raw as unknown }), d))).toBe('invalid_funding_choice');
       expect(calls).toEqual({ flag: 0, list: 0 });
@@ -91,5 +91,37 @@ describe('resolveTurnFunding', () => {
     for (const d of [deps({ enabled: false }).d, deps({ records: [] }).d]) {
       await expect(resolveTurnFunding(input(), d)).rejects.toBeInstanceOf(ClaudeRouteStopError);
     }
+  });
+
+  describe('the guards that do not depend on the host or the flags', () => {
+    const FABLE = 'openrouter/anthropic/claude-fable-5.1';
+    const withFableServed = () => {
+      const { d } = deps();
+      d.servedAliases = new Set(['haiku', 'sonnet', 'opus', 'fable']);
+      return d;
+    };
+
+    it('Fable runs only when the request acknowledged that it can bill the extra usage credits', async () => {
+      expect(await code(resolveTurnFunding(input({ explicitModelId: FABLE }), withFableServed()))).toBe('extra_usage_needs_ack');
+      expect(await code(resolveTurnFunding(input({ explicitModelId: FABLE, acknowledgedExtraUsage: false }), withFableServed()))).toBe('extra_usage_needs_ack');
+      await expect(resolveTurnFunding(input({ explicitModelId: FABLE, acknowledgedExtraUsage: true }), withFableServed())).resolves.toMatchObject({ alias: 'fable' });
+    });
+
+    it('the acknowledgement does not matter for the other models, and does not turn Fable on when the host does not serve it', async () => {
+      await expect(resolveTurnFunding(input({ acknowledgedExtraUsage: false }), deps().d)).resolves.toMatchObject({ alias: 'sonnet' });
+      expect(await code(resolveTurnFunding(input({ explicitModelId: FABLE, acknowledgedExtraUsage: true }), deps().d))).toBe('model_not_on_plan');
+    });
+
+    it('an organisation member is stopped, but only after the allow-list and the connection have had their say', async () => {
+      expect(await code(resolveTurnFunding(input({ initiatorOrgId: 'org-1' }), deps().d))).toBe('org_not_supported');
+      expect(await code(resolveTurnFunding(input({ initiatorOrgId: 'org-1' }), deps({ enabled: false }).d))).toBe('not_enabled');
+      expect(await code(resolveTurnFunding(input({ initiatorOrgId: 'org-1' }), deps({ records: [] }).d))).toBe('no_connection');
+      await expect(resolveTurnFunding(input({ initiatorOrgId: null }), deps().d)).resolves.toMatchObject({ route: 'claude_subscription' });
+      await expect(resolveTurnFunding(input({ initiatorOrgId: undefined }), deps().d)).resolves.toMatchObject({ route: 'claude_subscription' });
+    });
+
+    it('an organisation member who asks for AgentWeb is not touched', async () => {
+      await expect(resolveTurnFunding(input({ rawFundingChoice: 'agentweb', initiatorOrgId: 'org-1' }), deps().d)).resolves.toEqual({ route: 'agentweb' });
+    });
   });
 });

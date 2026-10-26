@@ -98,6 +98,16 @@ describe('mapLedgerToResponseMessages', () => {
     expect(hasUnresolvedMediaDeferral(responseMessages)).toBe(false);
   });
 
+  it('a refused or failed call is an error by its kind alone, even when the bridge did not flag it', () => {
+    const ledger = [
+      rec({ toolCallId: 'r', name: 'send_email', kind: 'refused', isError: false }),
+      rec({ toolCallId: 'f', name: 'get_leads', kind: 'failed', isError: false }),
+      rec({ toolCallId: 'e', name: 'get_leads', kind: 'executed', isError: false }),
+    ];
+    const { toolCalls } = mapLedgerToResponseMessages({ ...base, ledger, finalText: 'x' });
+    expect(toolCalls.map((t) => t.error !== undefined)).toEqual([true, true, false]);
+  });
+
   it('records refused and failed calls as errors without leaking detail', () => {
     const ledger = [
       rec({ toolCallId: 'r', name: 'send_email', kind: 'refused', isError: true, toolMessageContent: 'send_email is not available in this run.' }),

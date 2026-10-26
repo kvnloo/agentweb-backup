@@ -11,7 +11,39 @@ import type { StopReason } from '../subscriptionRoute';
 
 const ALL_REASONS: StopReason[] = ['not_enabled', 'not_allowed_here', 'model_not_on_plan', 'no_connection', 'needs_reconnect', 'expired', 'revoked_or_disabled', 'lookup_failed'];
 
+/** Every stop that is not a route-decision reason: its status and whether asking again can help. Pinned so a change is deliberate. */
+const EXPECTED: Record<string, { httpStatus: number; retryable: boolean }> = {
+  host_unavailable: { httpStatus: 503, retryable: true },
+  host_busy: { httpStatus: 429, retryable: true },
+  connection_changed: { httpStatus: 409, retryable: true },
+  context_too_large: { httpStatus: 413, retryable: false },
+  usage_limit: { httpStatus: 429, retryable: false },
+  policy_blocks: { httpStatus: 409, retryable: false },
+  turn_failed: { httpStatus: 502, retryable: true },
+  invalid_funding_choice: { httpStatus: 400, retryable: false },
+  turn_timeout: { httpStatus: 504, retryable: false },
+  server_restarting: { httpStatus: 503, retryable: true },
+  extra_usage_needs_ack: { httpStatus: 409, retryable: false },
+  org_not_supported: { httpStatus: 403, retryable: false },
+};
+
 describe('claude plan stops', () => {
+  it.each(Object.entries(EXPECTED))('%s has its pinned status and retry flag', (code, want) => {
+    const e = new ClaudeRouteStopError(code as ClaudeStopCode);
+    expect({ httpStatus: e.httpStatus, retryable: e.retryable }).toEqual(want);
+    expect(claudeStopBody(e).retryable).toBe(want.retryable);
+  });
+
+  it('a model the plan cannot run is not retryable', () => {
+    expect(new ClaudeRouteStopError('model_not_on_plan').retryable).toBe(false);
+  });
+
+  it('the host ending a turn at its deadline is the timeout stop whatever the error kind said', () => {
+    expect(fromResultErrorKind(undefined, 'deadline').code).toBe('turn_timeout');
+    expect(fromResultErrorKind('transient', 'deadline').code).toBe('turn_timeout');
+    expect(fromResultErrorKind('transient', 'interrupted').code).toBe('host_unavailable');
+  });
+
   it('every route-decision stop has copy, a status and a stable code', () => {
     for (const reason of ALL_REASONS) {
       const e = stopFromReason(reason);
@@ -30,7 +62,7 @@ describe('claude plan stops', () => {
   });
 
   it('never names AgentWeb as a silent fallback: every stop tells the user what to do', () => {
-    const codes: ClaudeStopCode[] = [...ALL_REASONS, 'host_unavailable', 'host_busy', 'connection_changed', 'context_too_large', 'usage_limit', 'policy_blocks', 'turn_failed'];
+    const codes: ClaudeStopCode[] = [...ALL_REASONS, ...Object.keys(EXPECTED) as ClaudeStopCode[]];
     for (const code of codes) {
       const msg = new ClaudeRouteStopError(code).userMessage;
       expect(msg).not.toMatch(/falling back|switched to|using AgentWeb/i);
