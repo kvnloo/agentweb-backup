@@ -1,6 +1,6 @@
 /**
  * ENG-2113 PR C: MANUAL live test, on the test instance, of the REAL `ClaudeCodeBackend` with EMMA'S REAL TOOLS, REAL PROMPT and REAL Dev DATA, driven
- * through the REAL login host and the REAL pinned `claude`, on the kept login (reuse only: no sign-in, no token handled). Haiku only. Bounded.
+ * through the REAL login host and the REAL pinned `claude`, on the kept login (reuse only: no sign-in, no token handled). Haiku or Sonnet (AW_LIVE_ALIAS), never Opus/Fable. Bounded.
  * Everything except the HTTP front door (the controller's route and the worker-reachable relay, which are later PRs) is the production code path:
  * `prepareTurnContext`, `trimToolMessagesForContext`, the renderer, `EmmaToolBridgeExecutor` + `executePreparedTools`, the bridge liveness check
  * against the real Dev connection record and flags, the mapper, the persistence calls, the attempt journal.
@@ -40,7 +40,10 @@ import { resolveSubscriptionRoute } from "../../../services/funding/subscription
 const SOCK = process.env.AW_HOST_SOCK ?? "/run/aw-login-host-test1/host.sock";
 const PORT = Number(process.env.AW_BRIDGE_PORT ?? 3991);
 const STATE_FILE = "/var/lib/aw-probe/kept-connection.json";
-const LLM = "openrouter/anthropic/claude-haiku-5.5";
+// Haiku by default, Sonnet with AW_LIVE_ALIAS=sonnet: every live run covers both. Never opus or fable on the kept login (Fable bills extra usage credits).
+const ALIAS: "haiku" | "sonnet" = process.env.AW_LIVE_ALIAS === "sonnet" ? "sonnet" : "haiku";
+if (process.env.AW_LIVE_ALIAS && process.env.AW_LIVE_ALIAS !== ALIAS) throw new Error("the kept login runs haiku or sonnet only");
+const LLM = `openrouter/anthropic/claude-${ALIAS}-5.5`; // the registry id the mapper stamps; the host gets the alias
 const results: Array<{ name: string; ok: boolean }> = [];
 const out = (k: string, v: unknown) => console.log(`RESULT ${k} = ${typeof v === "string" ? v : JSON.stringify(v)}`);
 const check = (name: string, ok: boolean, detail?: unknown) => {
@@ -118,7 +121,7 @@ async function chat(label: string, userId: string, cid: string, text: string): P
   const progress: string[] = [];
   const t0 = Date.now();
   const r = await backend.run({
-    decision: { route: "claude_subscription", connectionId: cid, epoch: 1, alias: "haiku", modelId: LLM, ownerUserId: userId },
+    decision: { route: "claude_subscription", connectionId: cid, epoch: 1, alias: ALIAS, modelId: LLM, ownerUserId: userId },
     sessionId,
     userId,
     messageContent: text,
@@ -193,6 +196,7 @@ async function main() {
   const d1 = await chat("D1.cliTools", userId, cid, "List the exact names of every tool you can call whose name starts with mcp__emma__. Output only the names, comma separated, nothing else.");
   const seenByCli = (d1.r.content.match(/mcp__emma__[A-Za-z0-9_]+/g) ?? []).map((x) => x.replace(/^mcp__emma__/, ""));
   out("D1.cliSees", { count: seenByCli.length, names: seenByCli.slice(0, 60) });
+  out("D1.diff", { missingFromAnswer: offeredNames.filter((n) => !seenByCli.includes(n)), notOffered: seenByCli.filter((n) => !offeredNames.includes(n)) });
   check("D1 the CLI is offered the tools the executor lists (same names)", offeredNames.length > 0 && offeredNames.every((n) => seenByCli.includes(n)), { executor: offeredNames.length, cli: seenByCli.length, missing: offeredNames.filter((n) => !seenByCli.includes(n)).slice(0, 20) });
 
   // D2: repeat the heavy turn (98-tool listing under the real prompt) to expose an intermittent failure; each failure prints its safe fields only

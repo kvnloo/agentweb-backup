@@ -1,7 +1,7 @@
 /**
  * ENG-2113 PR C: MANUAL live test, on the test instance, of the PR C building blocks that need no ClaudeCodeBackend: the prompt RENDERER, the ledger-to-
  * messages MAPPER (incl. answeredContent), and the Claude run CANCEL REGISTRY, driven by the REAL pinned `claude` through the REAL login host with the
- * REAL ToolBridge (stub tools, no Emma), on the kept login (reuse only: no sign-in, no token handled). Haiku only. Bounded. Lines start with RESULT and
+ * REAL ToolBridge (stub tools, no Emma), on the kept login (reuse only: no sign-in, no token handled). Haiku or Sonnet (AW_LIVE_ALIAS), never Opus/Fable. Bounded. Lines start with RESULT and
  * carry no secret.
  *
  *   --history   R1  the rendered transcript is read as a conversation: a fact from an earlier turn is used
@@ -28,7 +28,10 @@ const STATE_FILE = "/var/lib/aw-probe/kept-connection.json";
 const ALL = process.argv.includes("--all");
 const want = (f: string) => ALL || process.argv.includes(f);
 const RUN = { runId: "live-run", userId: "live-user", sessionId: "live-session" };
-const LLM = "openrouter/anthropic/claude-haiku-5.5"; // the registry id the mapper stamps; the host gets the alias
+// Haiku by default, Sonnet with AW_LIVE_ALIAS=sonnet: every live run covers both. Never opus or fable on the kept login (Fable bills extra usage credits).
+const ALIAS: "haiku" | "sonnet" = process.env.AW_LIVE_ALIAS === "sonnet" ? "sonnet" : "haiku";
+if (process.env.AW_LIVE_ALIAS && process.env.AW_LIVE_ALIAS !== ALIAS) throw new Error("the kept login runs haiku or sonnet only");
+const LLM = `openrouter/anthropic/claude-${ALIAS}-5.5`; // the registry id the mapper stamps; the host gets the alias
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const out = (k: string, v: unknown) => console.log(`RESULT ${k} = ${typeof v === "string" ? v : JSON.stringify(v)}`);
@@ -126,7 +129,7 @@ async function turn(label: string, cid: string, messages: any[], opts: { deadlin
   }
   const outcome = await runHostTurn(
     client,
-    { connectionId: cid, epoch: 1, idempotencyKey: `p-${n}-${Date.now()}`, turnId: `pt-${n}-${Date.now()}`, prompt, model: "haiku", bridgeToken: token, deadlineMs: opts.deadlineMs ?? 180_000 },
+    { connectionId: cid, epoch: 1, idempotencyKey: `p-${n}-${Date.now()}`, turnId: `pt-${n}-${Date.now()}`, prompt, model: ALIAS, bridgeToken: token, deadlineMs: opts.deadlineMs ?? 180_000 },
     {
       signal: ac.signal,
       onEvent: (e) => {
