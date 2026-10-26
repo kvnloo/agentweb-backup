@@ -35,6 +35,7 @@ import {
 } from '../services/scheduledReportAccess';
 import { settingsService } from '../services/settingsService';
 import { sessionActiveRunGuard } from '../services/agentMode/sessionActiveRunGuardInstance';
+import { getInteractiveShareExpiresAt } from '../utils/interactiveShare';
 import { workPlanService } from '../services/workPlanService';
 import { projectWorkPlanForCustomer } from '../services/workPlanCustomerProjection';
 import { v4 as uuidv4 } from 'uuid';
@@ -2786,21 +2787,6 @@ async function scheduleAutoWorkPlanContinuation(
         );
       }
     });
-}
-
-/**
- * Returns the effective expiration date for an interactive share.
- *
- * Only an explicit `expiresAt` causes expiry. Shares created without one —
- * every public plan/ishare link (createSessionWithPlan sets `sharedAt` only)
- * and all legacy shares — never expire on a timer; their availability is
- * governed solely by the `isActive` flag. (Previously, a missing `expiresAt`
- * was treated as "sharedAt + 7 days", which silently 410'd every such link a
- * week after creation and broke all ishare links.)
- */
-function getInteractiveShareExpiresAt(share: { expiresAt?: string; sharedAt?: string }): Date {
-  if (share.expiresAt) return new Date(share.expiresAt);
-  return new Date(8640000000000000); // No expiresAt — never expires
 }
 
 /**
