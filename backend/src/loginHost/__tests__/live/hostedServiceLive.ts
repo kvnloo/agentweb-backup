@@ -3,7 +3,12 @@
  * host (real systemd units, real pinned `claude`) AND the REAL Dev-AW-LlmConnections table, on the test instance. The HTTP layer is
  * covered by route tests; this is service + DynamoDB + host for real, with a REAL sign-in typed by the owner in their own terminal.
  *
- *   sudo NODE_ENV=development node hostedServiceLive.js [--reconnect]
+ *   sudo NODE_ENV=development node hostedServiceLive.js [--reconnect] [--swap]
+ *
+ * --swap (ENG-2110, sealed sign-in token): the sign-in is STARTED by one service object and COMPLETED by two other, freshly built ones at the
+ * same moment with the same code (what a deploy swap plus a double submit look like). Expected: exactly one succeeds, the other answers
+ * login_not_found, the first service (which never sees the complete) knows nothing of it, and the login on the host is intact. Needs the host
+ * to include the "refuse a second complete for a ready attempt" guard.
  *
  * Rows use the owner `zz-live-owner` and ids starting `zz-live-`; they are deleted at the end (and on failure the connection is
  * disconnected through the service first, so no login stays on the host). The code is read HIDDEN, goes only to the host API, is
@@ -58,13 +63,16 @@ function readHidden(prompt: string): Promise<string> {
 const db = new LlmConnectionDb();
 const dc = new AWS.DynamoDB.DocumentClient({ region: process.env.AWS_REGION || "us-west-2" });
 const provider: HostedProvider = { route: "claude", kind: "claude_subscription", recordProvider: "anthropic", hostProvider: "claude", isEnabledFor: async (u) => u === OWNER };
-const svc = new HostedSubscriptionService({
-  db,
-  client: () => new LoginHostClient(new UnixSocketTransport(SOCK)),
-  providers: { claude: provider },
-  now: () => Date.now(),
-  newId: () => `zz-live-${randomBytes(5).toString("hex")}`,
-});
+const makeSvc = () =>
+  new HostedSubscriptionService({
+    db,
+    client: () => new LoginHostClient(new UnixSocketTransport(SOCK)),
+    providers: { claude: provider },
+    now: () => Date.now(),
+    newId: () => `zz-live-${randomBytes(5).toString("hex")}`,
+  });
+const svc = makeSvc();
+const WITH_SWAP = process.argv.includes("--swap");
 const user = { userId: OWNER };
 const counter = async () => ((await dc.get({ TableName: LLM_CONNECTIONS_TABLE, Key: { connectionId: `limit#${OWNER}` } }).promise()).Item?.activeCount as number | undefined) ?? 0;
 const homesLeft = () => {
@@ -75,6 +83,24 @@ const homesLeft = () => {
   }
 };
 const touched = new Set<string>();
+
+/** Started here, completed by two OTHER service objects at once (a deploy swap plus a double submit). */
+async function signInSwap(label: string) {
+  const started = await svc.startLogin(user, "claude");
+  console.log(`\n[${label}] Open this URL in a browser (do NOT paste it anywhere), sign in, and copy the code shown:\n${started.authorizeUrl}\n`);
+  const code = await readHidden("Paste the code (hidden): ");
+  const b = makeSvc();
+  const c = makeSvc();
+  const outcomes = await Promise.all([b.completeLogin(user, started.loginId, code).then((v) => v, (e) => e), c.completeLogin(user, started.loginId, code).then((v) => v, (e) => e)]);
+  const winners = outcomes.filter((o) => !(o instanceof Error));
+  const losers = outcomes.filter((o): o is HostedSubscriptionError => o instanceof HostedSubscriptionError);
+  check("swap-exactly-one-completes", winners.length === 1 && losers.length === 1, `winners=${winners.length} losers=${losers.map((l) => l.code).join(",")}`);
+  check("swap-loser-is-login_not_found", losers.length === 1 && losers[0].code === "login_not_found");
+  check("swap-origin-instance-knew-nothing", svc.pendingCount() === 1); // its own pending entry is still there: it never saw the complete
+  await b.shutdown();
+  await c.shutdown();
+  return winners[0] as Awaited<ReturnType<typeof svc.completeLogin>>;
+}
 
 async function signIn(label: string, reconnectConnectionId?: string) {
   const started = await svc.startLogin(user, "claude", reconnectConnectionId ? { reconnectConnectionId } : {});
@@ -92,7 +118,7 @@ async function main() {
   await svc.cancelLogin(user, cancelled.loginId);
   check("start-then-cancel", svc.pendingCount() === 0 && (await codeOf(svc.completeLogin(user, cancelled.loginId, "AAAAAAAA#BBBBBBBB"))) === "login_not_found");
 
-  const view = await signIn("sign-in");
+  const view = WITH_SWAP ? await signInSwap("sign-in (swap)") : await signIn("sign-in");
   touched.add(view.connectionId);
   const row = (await db.get(view.connectionId))!;
   check("sign-in-active", view.status === "active" && view.subscription?.plan !== undefined, `plan=${view.subscription?.plan}`);
