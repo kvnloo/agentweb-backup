@@ -405,6 +405,8 @@ suite('SmartleadPushRunDb against DynamoDB Local (ENG-673)', () => {
     it('redacts the common key spellings, and stays fast on hostile input', () => {
       const out = redactSecrets('api_key: A1 {"apiKey":"B2"} x-api-key: C3 api_key%3DD4 apikey = E5 Authorization: Basic Zm9v token=F6');
       expect(out).not.toMatch(/A1|B2|C3|D4|E5|Zm9v|F6/);
+      expect(redactSecrets('api_key=' + 'A'.repeat(900) + 'TAILSECRET')).not.toContain('TAILSECRET');
+      expect(redactSecrets('Bearer ' + 'B'.repeat(900) + 'TAILSECRET')).not.toContain('TAILSECRET');
       for (const evil of ['a'.repeat(100_000), 'a'.repeat(50_000) + '@' + 'a'.repeat(50_000), 'a'.repeat(50_000) + '@' + '1.'.repeat(25_000)]) {
         const t0 = Date.now();
         redactSecrets(evil);

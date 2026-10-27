@@ -384,8 +384,8 @@ export function redactSecrets(text: string): string {
   // Cut first: the patterns below are cheap on bounded input, and callers store at most 500 characters anyway.
   return text
     .slice(0, 2000)
-    .replace(/(api[_-]?key|token|secret|password)(%3D|["']?\s{0,3}[:=]\s{0,3}["']?)[^&\s"',}]{1,500}/gi, "$1=[redacted]")
-    .replace(/(bearer|basic)\s{1,5}[A-Za-z0-9._~+/-]{1,500}=*/gi, "$1 [redacted]")
+    .replace(/(api[_-]?key|token|secret|password)(%3D|["']?\s{0,3}[:=]\s{0,3}["']?)[^&\s"',}]+/gi, "$1=[redacted]")
+    .replace(/(bearer|basic)\s{1,5}[A-Za-z0-9._~+/-]+=*/gi, "$1 [redacted]")
     .replace(/[A-Z0-9._%+-]{1,64}@[A-Z0-9.-]{1,255}\.[A-Z]{2,24}/gi, "[email]");
 }
 
