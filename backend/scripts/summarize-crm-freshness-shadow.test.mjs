@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseLines, parseCheckedLines, summarize, summarizeChecked, format } from './summarize-crm-freshness-shadow.mjs';
+import { parseLines, parseCheckedLines, summarize, summarizeChecked, format, unwrapAwsLogs } from './summarize-crm-freshness-shadow.mjs';
 
 const line = (o) => `[Worker] [crm-freshness-shadow] CRM freshness mismatch (message NOT modified) ${JSON.stringify(o)}`;
 
@@ -130,18 +130,18 @@ test('warns when there are flagged lines but no checked lines, because the pull 
   const flagged = summarize(parseLines(line({ sessionId: 's', model: 'm', kinds: ['cited_tool_not_run'], claimed: [], cited: [] })).records);
   const out = format(flagged, 0, {});
   assert.match(out, /no \[crm-freshness-checked\] lines/);
-  assert.match(out, /crm-freshness/, 'tells the reader which filter to use');
+  assert.match(out, /--filter-pattern/, 'tells the reader which filter to use');
   const withChecked = format(flagged, 0, summarizeChecked([{ model: 'm', flagged: true }]));
   assert.doesNotMatch(withChecked, /no \[crm-freshness-checked\] lines/);
   assert.doesNotMatch(format(summarize([]), 0, {}), /no \[crm-freshness-checked\] lines/, 'nothing at all is not a warning');
 });
 
-test('splits the flag rate by how crowded the session number set was, and skips lines that lack the key', () => {
+test('splits the flag rate by how many of the integers 0..20 the session number set holds, and skips lines that lack the key', () => {
   const rows = [
-    ...Array.from({ length: 40 }, () => ({ model: 'm', flagged: false, sessionDensity20: 0.1 })),
-    { model: 'm', flagged: true, sessionDensity20: 0.1 },
-    ...Array.from({ length: 9 }, () => ({ model: 'm', flagged: false, sessionDensity20: 0.6 })),
-    ...Array.from({ length: 3 }, () => ({ model: 'm', flagged: true, sessionDensity20: 0.6 })),
+    ...Array.from({ length: 40 }, () => ({ model: 'm', flagged: false, sessionNumberCount: 5, sessionDensity20: 0.1 })),
+    { model: 'm', flagged: true, sessionNumberCount: 5, sessionDensity20: 0.1 },
+    ...Array.from({ length: 9 }, () => ({ model: 'm', flagged: false, sessionNumberCount: 30, sessionDensity20: 0.62 })),
+    ...Array.from({ length: 3 }, () => ({ model: 'm', flagged: true, sessionNumberCount: 30, sessionDensity20: 0.62 })),
     { model: 'm', flagged: true },
   ];
   const c = summarizeChecked(rows);
@@ -149,15 +149,99 @@ test('splits the flag rate by how crowded the session number set was, and skips 
   assert.deepEqual(c.m.byDensity.crowded, { checked: 12, flagged: 3 });
   assert.deepEqual(c.m.byDensity.mid, { checked: 0, flagged: 0 });
   const out = format(summarize(parseLines(line({ sessionId: 's', model: 'm', kinds: ['cited_tool_not_run'], claimed: [], cited: [] })).records), 0, c);
-  assert.match(out, /by session number-set density: sparse \(<0\.2\) 1\/41 \(2\.4%\), mid \(0\.2-0\.5\) 0\/0, crowded \(>=0\.5\) 3\/12 \(25%\)/);
+  assert.match(out, /flag rate by how many of the integers 0\.\.20 the session number set holds \(all flag kinds; this only bears on echo lines\): .*sparse 0-4 1\/41 \(2\.4%\), mid 5-10 0\/0, crowded 11-21 3\/12 \(25%\)/);
 });
 
-test('density buckets: 0.2 is mid, 0.5 is crowded (boundaries are lower-inclusive)', () => {
-  const c = summarizeChecked([0.19, 0.2, 0.49, 0.5].map((d) => ({ model: 'm', flagged: false, sessionDensity20: d })));
-  assert.deepEqual([c.m.byDensity.sparse.checked, c.m.byDensity.mid.checked, c.m.byDensity.crowded.checked], [1, 2, 1]);
+test('an EMPTY session number set (first turn, no earlier evidence) is its own bucket and does not pollute "sparse"', () => {
+  const rows = [
+    ...Array.from({ length: 10 }, () => ({ model: 'm', flagged: false, sessionNumberCount: 0, sessionDensity20: 0 })),
+    { model: 'm', flagged: true, sessionNumberCount: 0, sessionDensity20: 0 },
+    { model: 'm', flagged: false, sessionNumberCount: 3, sessionDensity20: 0 },
+  ];
+  const c = summarizeChecked(rows);
+  assert.deepEqual(c.m.byDensity.none, { checked: 11, flagged: 1 });
+  assert.deepEqual(c.m.byDensity.sparse, { checked: 1, flagged: 0 });
+  const out = format(summarize(parseLines(line({ sessionId: 's', model: 'm', kinds: ['cited_tool_not_run'], claimed: [], cited: [] })).records), 0, c);
+  assert.match(out, /empty set 1\/11 \(9\.1%\)/);
+});
+
+test('density buckets use the values the guard can actually emit (k of 21 integers, 2 dp): 4 and 5 split sparse/mid, 10 and 11 split mid/crowded', () => {
+  const d = (k) => Math.round((k / 21) * 100) / 100;
+  const c = summarizeChecked(Array.from({ length: 22 }, (_, k) => ({ model: 'm', flagged: false, sessionNumberCount: 30, sessionDensity20: d(k) })));
+  assert.deepEqual([c.m.byDensity.sparse.checked, c.m.byDensity.mid.checked, c.m.byDensity.crowded.checked], [5, 6, 11], 'k=0..4 sparse, 5..10 mid, 11..21 crowded');
+  const edge = (k) => summarizeChecked([{ model: 'm', flagged: false, sessionNumberCount: 30, sessionDensity20: d(k) }]).m.byDensity;
+  assert.equal(edge(4).sparse.checked, 1); assert.equal(edge(5).mid.checked, 1);
+  assert.equal(edge(10).mid.checked, 1); assert.equal(edge(11).crowded.checked, 1);
+});
+
+test('splits the flag rate by session length (messages in the history at the start of the turn), skipping lines without it', () => {
+  const rows = [
+    ...Array.from({ length: 30 }, () => ({ model: 'm', flagged: false, sessionMessages: 12 })),
+    { model: 'm', flagged: false, sessionMessages: 49 },
+    { model: 'm', flagged: true, sessionMessages: 50 },
+    ...Array.from({ length: 4 }, () => ({ model: 'm', flagged: false, sessionMessages: 199 })),
+    { model: 'm', flagged: false, sessionMessages: 200 },
+    ...Array.from({ length: 2 }, () => ({ model: 'm', flagged: true, sessionMessages: 647 })),
+    { model: 'm', flagged: true },
+  ];
+  const c = summarizeChecked(rows);
+  assert.deepEqual(c.m.byLength.short, { checked: 31, flagged: 0 });
+  assert.deepEqual(c.m.byLength.medium, { checked: 5, flagged: 1 });
+  assert.deepEqual(c.m.byLength.long, { checked: 3, flagged: 2 });
+  const out = format(summarize(parseLines(line({ sessionId: 's', model: 'm', kinds: ['cited_tool_not_run'], claimed: [], cited: [] })).records), 0, c);
+  assert.match(out, /flag rate by session length \(messages\): short <50 0\/31 \(0%\), medium 50-199 1\/5 \(20%\), long 200\+ 2\/3 \(67%\)/);
 });
 
 test('no density line when no checked line carries the key (older lines)', () => {
   const out = format(summarize(parseLines(line({ sessionId: 's', model: 'm', kinds: ['cited_tool_not_run'], claimed: [], cited: [] })).records), 0, summarizeChecked([{ model: 'm', flagged: false }]));
   assert.doesNotMatch(out, /by session number-set density/);
+});
+
+test('no session-length line when no checked line carries sessionMessages', () => {
+  const out = format(summarize(parseLines(line({ sessionId: 's', model: 'm', kinds: ['cited_tool_not_run'], claimed: [], cited: [] })).records), 0, summarizeChecked([{ model: 'm', flagged: false, sessionDensity20: 0.3 }]));
+  assert.doesNotMatch(out, /by session length/);
+});
+
+test('a model with flagged lines but no checked lines says so while other models have a rate', () => {
+  const text = [
+    line({ sessionId: 's1', model: 'retired-model', kinds: ['cited_tool_not_run'], claimed: [], cited: [] }),
+    line({ sessionId: 's2', model: 'live-model', kinds: ['cited_tool_not_run'], claimed: [], cited: [] }),
+  ].join('\n');
+  const out = format(summarize(parseLines(text).records), 0, summarizeChecked([{ model: 'live-model', flagged: true }]));
+  assert.match(out, /retired-model: 1 line\(s\)[\s\S]*no checked lines for this model/);
+  assert.doesNotMatch(out.split('live-model:')[1], /no checked lines for this model/);
+});
+
+test('says when flagged and checked-flagged counts differ (the pull window straddles the deploy), and not when they agree', () => {
+  const flagged = (n) => Array.from({ length: n }, (_, i) => line({ sessionId: 's' + i, model: 'm', kinds: ['cited_tool_not_run'], claimed: [], cited: [] })).join('\n');
+  const checkedFor = (nFlagged) => summarizeChecked([...Array.from({ length: nFlagged }, () => ({ model: 'm', flagged: true })), { model: 'm', flagged: false }]);
+  const straddle = format(summarize(parseLines(flagged(5)).records), 0, checkedFor(2));
+  assert.match(straddle, /5 flagged line\(s\) but 2 flagged checked line\(s\).*straddles the deploy/);
+  assert.doesNotMatch(format(summarize(parseLines(flagged(2)).records), 0, checkedFor(2)), /straddles the deploy/);
+});
+
+test('counts unparseable checked lines, and does not call them "no checked lines"', () => {
+  const flagged = summarize(parseLines(line({ sessionId: 's', model: 'm', kinds: ['cited_tool_not_run'], claimed: [], cited: [] })).records);
+  const out = format(flagged, 0, {}, 3);
+  assert.match(out, /unparseable checked lines: 3/);
+  assert.match(out, /3 \[crm-freshness-checked\] lines could not be parsed/);
+  assert.doesNotMatch(out, /no \[crm-freshness-checked\] lines:/);
+});
+
+test('reads the aws logs JSON (the output of filter-log-events) as well as plain log text', () => {
+  const msgs = [
+    line({ sessionId: 's1', model: 'm', kinds: ['cited_tool_not_run'], claimed: [], cited: [] }),
+    checked({ model: 'm', flagged: true, claimsSeen: 0, tagsSeen: 1, crmToolsSucceeded: 0, totalsAbstained: false }),
+    'unrelated line',
+  ];
+  const awsJson = JSON.stringify({ events: msgs.map((message, i) => ({ message, timestamp: i, eventId: String(i) })), searchedLogStreams: [] });
+  const text = unwrapAwsLogs(awsJson);
+  assert.equal(parseLines(text).records.length, 1);
+  assert.equal(parseCheckedLines(text).records.length, 1);
+  assert.equal(parseLines(text).skipped, 0, 'no escaped-quote garbage from the JSON wrapper');
+  const plain = msgs.join('\n');
+  assert.equal(unwrapAwsLogs(plain), plain, 'plain log text passes through unchanged');
+  assert.equal(unwrapAwsLogs('{"not":"aws"}'), '{"not":"aws"}', 'JSON without events passes through');
+  assert.equal(unwrapAwsLogs('{broken'), '{broken', 'a broken document is not swallowed');
+  assert.equal(unwrapAwsLogs(JSON.stringify({ events: [{ message: 5 }, null, {}] })), '\n\n', 'events without a string message contribute nothing');
 });
