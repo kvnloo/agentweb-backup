@@ -34,6 +34,18 @@ describe("SMARTLEAD_API_BASE_URL override", () => {
     expect(request.mock.calls[0][0].url).toBe("http://smartlead-stub:4010/api/v1/email-accounts");
   });
 
+  it("honours the override in test", async () => {
+    const { mod, request } = loadWith({ NODE_ENV: "test", SMARTLEAD_API_BASE_URL: "http://localhost:4010/api/v1" });
+    await mod.smartleadRequest(KEY, "GET", "/email-accounts");
+    expect(request.mock.calls[0][0].url).toBe("http://localhost:4010/api/v1/email-accounts");
+  });
+
+  it("ignores the override when NODE_ENV is unset, as in a real deployment", async () => {
+    const { mod, request } = loadWith({ NODE_ENV: undefined, SMARTLEAD_API_BASE_URL: "http://evil.example/api/v1" });
+    await mod.smartleadRequest(KEY, "GET", "/email-accounts");
+    expect(request.mock.calls[0][0].url).toBe("https://server.smartlead.ai/api/v1/email-accounts");
+  });
+
   it("ignores the override in production", async () => {
     const { mod, request } = loadWith({ NODE_ENV: "production", SMARTLEAD_API_BASE_URL: "http://evil.example/api/v1" });
     await mod.smartleadRequest(KEY, "GET", "/email-accounts");

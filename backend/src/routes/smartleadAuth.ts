@@ -1,8 +1,8 @@
 import express from 'express';
 import rateLimit from 'express-rate-limit';
 import { authenticateToken } from '../middleware/auth';
-import { createAccount, deleteAccountById, getAccountsByUserId, SmartleadConfig } from '../services/connectedAccountsDb';
-import { listEmailAccounts, scrubSmartleadSecrets, SmartleadApiError } from '../services/smartleadService';
+import { createAccount, SmartleadConfig } from '../services/connectedAccountsDb';
+import { listEmailAccounts, scrubSmartleadSecrets, SmartleadApiError, SmartleadUnexpectedResponseError } from '../services/smartleadService';
 import { redactAccountSecrets } from '../utils/accountSecretRedaction';
 import { encryptPassword } from '../utils/crypto';
 import { NON_EXPIRING_TOKEN_TIMESTAMP } from '../utils/tokenUtils';
@@ -39,14 +39,21 @@ router.post('/connect', authenticateToken, connectLimiter, async (req: any, res)
 
   let mailboxCount: number;
   try {
-    // One retry at most: this request waits on the user's screen, so it must not sit through long 429 backoffs.
-    mailboxCount = (await listEmailAccounts(apiKey, { maxRetries: 1 })).length;
+    // First page only and no retries: this request waits on the user's screen (the portal gives up at 30 s), so it
+    // must not sit through 429 backoffs or paging. Validity is all we need; the count is "at least this many".
+    mailboxCount = (await listEmailAccounts(apiKey, { maxRetries: 0, maxPages: 1 })).length;
   } catch (error) {
     const status = error instanceof SmartleadApiError ? error.status : undefined;
     // An expired plan and a wrong key can both come back as 401, so the message names both.
     if (status === 401 || status === 403) {
       return res.status(422).json({
         error: 'Smartlead rejected this key. Check it is a current API key from a Smartlead Pro (or higher) account.',
+      });
+    }
+    if (error instanceof SmartleadUnexpectedResponseError) {
+      console.error('[Smartlead] Key validation got an unexpected response');
+      return res.status(502).json({
+        error: 'Smartlead answered in a way we did not expect. Check the key is from a Smartlead Pro (or higher) plan, then try again.',
       });
     }
     if (status === 429) {
@@ -64,14 +71,12 @@ router.post('/connect', authenticateToken, connectLimiter, async (req: any, res)
       mailbox_count: mailboxCount,
     };
     const accountId = smartleadAccountId(userId);
-    // createAccount keeps sharedWithOrg on reconnect; a replaced key is a different credential, so it must be re-shared on purpose.
-    const existing = (await getAccountsByUserId(userId)).find(a => a.platform === 'smartlead' && a.account_id === accountId);
-    if (existing?.sharedWithOrg) await deleteAccountById(userId, 'smartlead', accountId);
+    // resetSharing: a replaced key is a different credential, so it must be re-shared on purpose.
     const account = await createAccount(userId, 'smartlead', {
       account_id: accountId,
       account_name: 'Smartlead',
       config,
-    });
+    }, { resetSharing: true });
     return res.json({
       success: true,
       account: redactAccountSecrets(account),

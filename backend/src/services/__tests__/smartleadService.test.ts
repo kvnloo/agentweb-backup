@@ -5,6 +5,7 @@ import {
   listEmailAccounts,
   scrubSmartleadSecrets,
   SmartleadApiError,
+  SmartleadUnexpectedResponseError,
   smartleadRequest,
 } from "../smartleadService";
 
@@ -106,6 +107,16 @@ describe("smartleadService client hardening (ENG-2658)", () => {
     );
   });
 
+  it("leaves the metrics email-account count as before: a non-list reply counts 0 rather than failing", async () => {
+    process.env.SMARTLEAD_API_KEY = KEY;
+    mockedAxios.request.mockImplementation((async (cfg: { url: string }) =>
+      ({ data: cfg.url.endsWith("/email-accounts") ? { message: "x" } : [] })) as never);
+    const m = await getSmartLeadMetrics();
+    expect(m.status).toBe("ok");
+    expect(m.emailAccountsCount).toBe(0);
+    delete process.env.SMARTLEAD_API_KEY;
+  });
+
   describe("listEmailAccounts (ENG-673)", () => {
     const page = (from: number, count: number) =>
       Array.from({ length: count }, (_, i) => ({ id: from + i, from_email: `box${from + i}@mindd-outreach.com` }));
@@ -148,6 +159,19 @@ describe("smartleadService client hardening (ENG-2658)", () => {
       await expect(listEmailAccounts(KEY)).resolves.toEqual([{ id: 7, email: "a@x.com" }]);
     });
 
+    it("keeps rows whose id it cannot read, so a valid key never looks empty", async () => {
+      mockedAxios.request
+        .mockResolvedValueOnce({ data: [{ mailbox_id: 1, from_email: "a@x.com" }, { mailbox_id: 2, from_email: "b@x.com" }] } as never)
+        .mockResolvedValueOnce({ data: [] } as never);
+      await expect(listEmailAccounts(KEY)).resolves.toHaveLength(2);
+    });
+
+    it("reads one page when maxPages is 1", async () => {
+      mockedAxios.request.mockResolvedValue({ data: page(1, 100) } as never);
+      await expect(listEmailAccounts(KEY, { maxPages: 1 })).resolves.toHaveLength(100);
+      expect(mockedAxios.request).toHaveBeenCalledTimes(1);
+    });
+
     it("returns an empty list for a real empty array", async () => {
       mockedAxios.request.mockResolvedValue({ data: [] } as never);
       await expect(listEmailAccounts(KEY)).resolves.toEqual([]);
@@ -155,7 +179,7 @@ describe("smartleadService client hardening (ENG-2658)", () => {
 
     it("rejects a response that is not a list, so a key is never called valid on a guess", async () => {
       mockedAxios.request.mockResolvedValue({ data: { message: "Plan expired!" } } as never);
-      await expect(listEmailAccounts(KEY)).rejects.toBeInstanceOf(SmartleadApiError);
+      await expect(listEmailAccounts(KEY)).rejects.toBeInstanceOf(SmartleadUnexpectedResponseError);
     });
 
     it("surfaces a rejected key as a SmartleadApiError with the status and without the key", async () => {
