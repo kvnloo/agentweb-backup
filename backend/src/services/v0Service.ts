@@ -1525,7 +1525,7 @@ export async function generateLandingPage(
     // ── Add new page route to existing repo (no v0 call) ──
     // Legacy (DURABLE_LANDING_GENERATION off) also adds sub-pages, so the override has to
     // reach here too — otherwise the picker is silently ignored wherever the flag isn't on.
-    return addPageToExistingRepo(siteRecord, userId, prompt, name, brandContext, leadListId, templateHtml, undefined, bridgeOutUrl, metaPixelOverride);
+    return addPageToExistingRepo(siteRecord, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId, bridgeOutUrl, metaPixelOverride);
   }
 
   const existingPages = await listLandingPages(userId);
@@ -1543,7 +1543,7 @@ export async function generateLandingPage(
     await cleanupOrphanedFailedPages(userId, existingPages, recyclable.id);
   }
 
-  return generateFirstPage(userId, prompt, name, brandContext, leadListId, templateHtml, recyclable?.id, undefined, bridgeOutUrl, metaPixelOverride, googleAds);
+  return generateFirstPage(userId, prompt, name, brandContext, leadListId, templateHtml, recyclable?.id, originatingSessionId, bridgeOutUrl, metaPixelOverride, googleAds);
 }
 
 /**
