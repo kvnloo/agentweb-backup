@@ -1,8 +1,11 @@
 #!/usr/bin/env node
-// ENG-2263: summarise `[crm-freshness-shadow] {json}` log lines.
+// ENG-2263 / ENG-2382: summarise `[crm-freshness-shadow] {json}` (flagged replies) and `[crm-freshness-checked] {json}` (every CRM-relevant
+// reply, the denominator) log lines.
 //   node backend/scripts/summarize-crm-freshness-shadow.mjs web.stdout.log [more.log ...]
 //   cat web.stdout.log | node backend/scripts/summarize-crm-freshness-shadow.mjs
-// Counts are LOG LINES (one per flagged reply), not rates: the denominator (replies per model) comes from request logs.
+// Pull BOTH markers: aws logs filter-log-events --log-group-name <web.stdout.log group> --start-time <ms> --filter-pattern '"crm-freshness"'
+// (a filter of just crm-freshness-shadow leaves out the checked lines and so the flag rate). Flagged counts are LOG LINES, not rates; a
+// rate needs the checked lines, and a pull window that straddles the deploy can hold flagged lines with no matching checked lines.
 import { readFileSync } from 'node:fs';
 
 const MARK = '[crm-freshness-shadow]';
@@ -38,10 +41,15 @@ export function parseCheckedLines(text) {
 export function summarizeChecked(records) {
   const byModel = {};
   for (const r of records) {
-    const m = (byModel[r.model || 'unknown'] ||= { checked: 0, flagged: 0, abstained: 0 });
+    const m = (byModel[r.model || 'unknown'] ||= { checked: 0, flagged: 0, abstained: 0, byDensity: { sparse: { checked: 0, flagged: 0 }, mid: { checked: 0, flagged: 0 }, crowded: { checked: 0, flagged: 0 } } });
     m.checked++;
     if (r.flagged) m.flagged++;
     if (r.totalsAbstained) m.abstained++;
+    if (typeof r.sessionDensity20 === 'number') {
+      const b = m.byDensity[r.sessionDensity20 < 0.2 ? 'sparse' : r.sessionDensity20 < 0.5 ? 'mid' : 'crowded'];
+      b.checked++;
+      if (r.flagged) b.flagged++;
+    }
   }
   return byModel;
 }
@@ -90,9 +98,19 @@ export function format(summary, skipped = 0, checked = {}) {
     }
     if (Object.keys(m.citedTools).length) out.push(`  tools cited by unbacked tags: ${top(m.citedTools)}`);
     const c = checked[model];
-    if (c) out.push(`  CRM replies checked: ${c.checked}, flagged: ${c.flagged} (${pct(c.flagged / c.checked)})${c.abstained ? `, total check abstained on ${c.abstained}` : ''}`);
+    if (c) {
+      out.push(`  CRM replies checked: ${c.checked}, flagged: ${c.flagged} (${pct(c.flagged / c.checked)})${c.abstained ? `, total check abstained on ${c.abstained}` : ''}`);
+      const d = c.byDensity;
+      if (d.sparse.checked + d.mid.checked + d.crowded.checked > 0) {
+        const cell = (label, b) => `${label} ${b.flagged}/${b.checked}${b.checked ? ` (${pct(b.flagged / b.checked)})` : ''}`;
+        out.push(`  flag rate by session number-set density: ${cell('sparse (<0.2)', d.sparse)}, ${cell('mid (0.2-0.5)', d.mid)}, ${cell('crowded (>=0.5)', d.crowded)}`);
+      }
+    }
   }
   if (models.length === 0) out.push('(no [crm-freshness-shadow] lines found)');
+  else if (summary.totalLines > 0 && Object.keys(checked).length === 0) {
+    out.push(`\n(no [crm-freshness-checked] lines: the flag rate cannot be computed. Pull with --filter-pattern '"crm-freshness"' to include them; lines only exist from the deploy that added them.)`);
+  }
   return out.join('\n');
 }
 

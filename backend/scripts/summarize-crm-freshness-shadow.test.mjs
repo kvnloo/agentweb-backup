@@ -125,3 +125,39 @@ test('a small flag rate is not rounded down to 0%', () => {
 test('says nothing found only when there are neither flagged nor checked lines', () => {
   assert.match(format(summarize([]), 0, {}), /no \[crm-freshness-shadow\] lines found/);
 });
+
+test('warns when there are flagged lines but no checked lines, because the pull filter was too narrow to include the denominator', () => {
+  const flagged = summarize(parseLines(line({ sessionId: 's', model: 'm', kinds: ['cited_tool_not_run'], claimed: [], cited: [] })).records);
+  const out = format(flagged, 0, {});
+  assert.match(out, /no \[crm-freshness-checked\] lines/);
+  assert.match(out, /crm-freshness/, 'tells the reader which filter to use');
+  const withChecked = format(flagged, 0, summarizeChecked([{ model: 'm', flagged: true }]));
+  assert.doesNotMatch(withChecked, /no \[crm-freshness-checked\] lines/);
+  assert.doesNotMatch(format(summarize([]), 0, {}), /no \[crm-freshness-checked\] lines/, 'nothing at all is not a warning');
+});
+
+test('splits the flag rate by how crowded the session number set was, and skips lines that lack the key', () => {
+  const rows = [
+    ...Array.from({ length: 40 }, () => ({ model: 'm', flagged: false, sessionDensity20: 0.1 })),
+    { model: 'm', flagged: true, sessionDensity20: 0.1 },
+    ...Array.from({ length: 9 }, () => ({ model: 'm', flagged: false, sessionDensity20: 0.6 })),
+    ...Array.from({ length: 3 }, () => ({ model: 'm', flagged: true, sessionDensity20: 0.6 })),
+    { model: 'm', flagged: true },
+  ];
+  const c = summarizeChecked(rows);
+  assert.deepEqual(c.m.byDensity.sparse, { checked: 41, flagged: 1 });
+  assert.deepEqual(c.m.byDensity.crowded, { checked: 12, flagged: 3 });
+  assert.deepEqual(c.m.byDensity.mid, { checked: 0, flagged: 0 });
+  const out = format(summarize(parseLines(line({ sessionId: 's', model: 'm', kinds: ['cited_tool_not_run'], claimed: [], cited: [] })).records), 0, c);
+  assert.match(out, /by session number-set density: sparse \(<0\.2\) 1\/41 \(2\.4%\), mid \(0\.2-0\.5\) 0\/0, crowded \(>=0\.5\) 3\/12 \(25%\)/);
+});
+
+test('density buckets: 0.2 is mid, 0.5 is crowded (boundaries are lower-inclusive)', () => {
+  const c = summarizeChecked([0.19, 0.2, 0.49, 0.5].map((d) => ({ model: 'm', flagged: false, sessionDensity20: d })));
+  assert.deepEqual([c.m.byDensity.sparse.checked, c.m.byDensity.mid.checked, c.m.byDensity.crowded.checked], [1, 2, 1]);
+});
+
+test('no density line when no checked line carries the key (older lines)', () => {
+  const out = format(summarize(parseLines(line({ sessionId: 's', model: 'm', kinds: ['cited_tool_not_run'], claimed: [], cited: [] })).records), 0, summarizeChecked([{ model: 'm', flagged: false }]));
+  assert.doesNotMatch(out, /by session number-set density/);
+});

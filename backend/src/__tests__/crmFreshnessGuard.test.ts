@@ -1196,6 +1196,30 @@ describe('checked line: the denominator for the flag rate (ENG-2382)', () => {
     expect(checkedLines).toBeGreaterThanOrEqual(flaggedLines);
   });
 
+  it('the checked line carries the session size, number-set size and small-number density, so the flag rate can be split by how crowded the session was', () => {
+    const { logChecked } = run('17 lists [verified: get_lead_lists]', listsOk, { sessionNumbers: new Set([0, 1, 2, 3, 18, 47]), sessionMessages: 647 });
+    expect(logChecked.mock.calls[0][1]).toMatchObject({ sessionNumberCount: 6, sessionDensity20: 0.24, sessionMessages: 647 });
+  });
+
+  it('the density on the checked line is the same number the flagged line reports for the same reply', () => {
+    const log = jest.fn(); const logChecked = jest.fn();
+    runCrmFreshnessShadow({ finalText: '47 leads [verified: get_lead_lists]', toolCalls: [], sessionNumbers: new Set([0, 1, 2, 3, 4]), sessionMessages: 30, log, logChecked });
+    for (const k of ['sessionNumberCount', 'sessionDensity20', 'sessionMessages']) expect(logChecked.mock.calls[0][1][k]).toEqual(log.mock.calls[0][1][k]);
+  });
+
+  it('a flagged sink that throws still returns the findings (the caller ignores them, but tests and future callers rely on them)', () => {
+    const logChecked = jest.fn();
+    const findings = runCrmFreshnessShadow({ finalText: '47 leads [verified: get_lead_lists]', toolCalls: [], log: () => { throw new Error('down'); }, logChecked });
+    expect(findings).toHaveLength(1);
+  });
+
+  it('a checked sink that throws still returns the findings', () => {
+    const log = jest.fn();
+    const findings = runCrmFreshnessShadow({ finalText: '47 leads [verified: get_lead_lists]', toolCalls: [], log, logChecked: () => { throw new Error('down'); } });
+    expect(findings).toHaveLength(1);
+    expect(log).toHaveBeenCalledTimes(1);
+  });
+
   it('a failing flagged sink does not stop the checked line', () => {
     const logChecked = jest.fn();
     expect(() => runCrmFreshnessShadow({ finalText: '47 leads [verified: get_lead_lists]', toolCalls: [], log: () => { throw new Error('flagged sink down'); }, logChecked })).not.toThrow();
@@ -1204,9 +1228,9 @@ describe('checked line: the denominator for the flag rate (ENG-2382)', () => {
 
   it('carries numbers and a model name only: never reply text, session or user ids', () => {
     const logChecked = jest.fn();
-    runCrmFreshnessShadow({ finalText: 'Hi Jane Doe (jane.doe@acme.com), 18 lead lists, deal value $98,500 [verified: get_lead_lists]', toolCalls: [], sessionId: 's-secret', model: 'm1', log: jest.fn(), logChecked });
+    runCrmFreshnessShadow({ finalText: 'Hi Jane Doe (jane.doe@acme.com), 18 lead lists, deal value $98,500 [verified: get_lead_lists]', toolCalls: [], sessionId: 's-secret', model: 'm1', sessionMessages: 12, sessionNumbers: new Set([1, 2, 3]), log: jest.fn(), logChecked });
     const d = logChecked.mock.calls[0][1];
-    expect(Object.keys(d).sort()).toEqual(['claimsSeen', 'crmToolsSucceeded', 'findingCount', 'flagged', 'model', 'tagsSeen', 'totalsAbstained']);
+    expect(Object.keys(d).sort()).toEqual(['claimsSeen', 'crmToolsSucceeded', 'findingCount', 'flagged', 'model', 'sessionDensity20', 'sessionMessages', 'sessionNumberCount', 'tagsSeen', 'totalsAbstained']);
     const line = JSON.stringify(d);
     for (const secret of ['Jane', 'jane.doe', 'acme', '98,500', 's-secret']) expect(line).not.toContain(secret);
   });

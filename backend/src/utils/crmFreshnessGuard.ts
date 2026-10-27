@@ -690,6 +690,10 @@ export interface CrmFreshnessShadowInput {
 
 const SMALL_RANGE_MAX = 20;
 
+function validMessageCount(n: unknown): number | undefined {
+  return typeof n === 'number' && Number.isInteger(n) && n >= 0 ? n : undefined;
+}
+
 /**
  * Share of the integers 0..20 that the session's number set contains. `echoesEarlier` says "this claimed number is in the set";
  * when most small integers are in it, that is expected by chance and says nothing about staleness. Numbers in, one number out.
@@ -731,12 +735,12 @@ export function runCrmFreshnessShadow(input: CrmFreshnessShadowInput): CrmFreshn
           // ENG-2382: how crowded the session's number set was, so an `echoesEarlier` hit can be told from a coincidence.
           sessionNumberCount: input.sessionNumbers?.size ?? 0,
           sessionDensity20: smallNumberDensity(input.sessionNumbers),
-          sessionMessages: Number.isInteger(input.sessionMessages) && (input.sessionMessages as number) >= 0 ? input.sessionMessages : undefined,
+          sessionMessages: validMessageCount(input.sessionMessages),
         });
       } catch { /* a failing sink must not lose the denominator line below, nor reach the reply */ }
       findings = result.findings;
     }
-    logChecked(input, result);
+    writeCheckedLine(input, result);
     return findings;
   } catch {
     return [];
@@ -750,7 +754,7 @@ export function runCrmFreshnessShadow(input: CrmFreshnessShadowInput): CrmFreshn
  * so "5 lists of ideas" counts as a claim. The flagged line has the same property, so rate and numerator stay consistent.
  * Counts and a model name only: no reply text and no session id. Replies with nothing CRM-related write nothing.
  */
-function logChecked(input: CrmFreshnessShadowInput, result: CrmFreshnessResult): void {
+function writeCheckedLine(input: CrmFreshnessShadowInput, result: CrmFreshnessResult): void {
   try {
     if (result.claimsSeen === 0 && result.tagsSeen === 0 && result.crmToolsSucceeded.length === 0) return;
     const sink = input.logChecked ?? ((message, detail) => console.log(`${message} ${JSON.stringify(detail)}`));
@@ -762,6 +766,10 @@ function logChecked(input: CrmFreshnessShadowInput, result: CrmFreshnessResult):
       claimsSeen: result.claimsSeen,
       crmToolsSucceeded: result.crmToolsSucceeded.length,
       totalsAbstained: result.totalsAbstained,
+      // Same three numbers as the flagged line, so the flag rate can be split by session size and number-set crowding.
+      sessionNumberCount: input.sessionNumbers?.size ?? 0,
+      sessionDensity20: smallNumberDensity(input.sessionNumbers),
+      sessionMessages: validMessageCount(input.sessionMessages),
     });
   } catch { /* log-only: never reaches the reply */ }
 }
