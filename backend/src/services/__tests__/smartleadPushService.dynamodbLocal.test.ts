@@ -55,6 +55,9 @@ suite("SmartleadPushService on the real run store (ENG-673)", () => {
         writeMarker: async (_l, id, k, m) => { const l = leads.find(x => x.leadId === id)!; l.system = { ...(l.system ?? {}), [k]: m }; },
       },
       smartlead: {
+        listCampaigns: async () => [
+          { id: 1, name: "Draft", status: "DRAFTED" }, { id: 2, name: "Live", status: "ACTIVE" }, { id: 3, name: "Old", status: "ARCHIVED" }, { id: 4, name: "Paused", status: "PAUSED" },
+        ] as any,
         getCampaign: async () => (sl.campaignMissing ? null : ({ id: CAMPAIGN, name: "Q4", status: sl.status, maxLeadsPerDay: 100, addUnsubscribeTag: true } as any)),
         getSequences: async () => { if (!sl.sequences) throw new SmartleadApiError("boom", 500); return sl.sequences; },
         getMailboxes: async () => [{ id: 1, email: "a@x.com", dailyLimit: 30 }],
@@ -116,6 +119,22 @@ suite("SmartleadPushService on the real run store (ENG-673)", () => {
       expect(await e.svc.preview("owner", { listId: e.listId, campaignId: CAMPAIGN })).toMatchObject({ ok: false, status: 409, code: "campaign_not_pushable" });
       e.sl.status = "DRAFTED"; e.sl.campaignMissing = true;
       expect(await e.svc.preview("owner", { listId: e.listId, campaignId: CAMPAIGN })).toMatchObject({ ok: false, status: 404, code: "campaign_not_found" });
+    });
+  });
+
+  describe("campaigns", () => {
+    it("lists the user's own campaigns, marking which can be pushed to and which need a second confirmation", async () => {
+      const e = env();
+      const r = (await e.svc.campaigns("owner")) as any;
+      expect(r.campaigns).toEqual([
+        { id: 1, name: "Draft", status: "DRAFTED", pushable: true, needsConfirmation: false },
+        { id: 2, name: "Live", status: "ACTIVE", pushable: true, needsConfirmation: true },
+        { id: 3, name: "Old", status: "ARCHIVED", pushable: false, needsConfirmation: false },
+        { id: 4, name: "Paused", status: "PAUSED", pushable: true, needsConfirmation: false },
+      ]);
+      expect(await e.svc.campaigns("nokey")).toMatchObject({ ok: false, status: 409, code: "not_connected" });
+      e.flags.enabled = false;
+      expect(await e.svc.campaigns("owner")).toMatchObject({ ok: false, status: 503 });
     });
   });
 

@@ -12,7 +12,7 @@ import {
   type PushRunSummary,
   type SmartleadPushRunDb,
 } from "./smartleadPushRunDb";
-import type { SmartleadAddLeadsResult, SmartleadCampaignDetail, SmartleadEmailAccount, SmartleadLeadInput } from "./smartleadService";
+import type { SmartleadAddLeadsResult, SmartleadCampaignDetail, SmartleadCampaignSummary, SmartleadEmailAccount, SmartleadLeadInput } from "./smartleadService";
 import { scrubSmartleadSecrets } from "./smartleadService";
 
 /**
@@ -32,6 +32,7 @@ export type Result<T> = Ok<T> | Fail;
 const fail = (status: number, code: string, message: string, details?: unknown): Fail => ({ ok: false, status, code, message, ...(details !== undefined ? { details } : {}) });
 
 export interface SmartleadApi {
+  listCampaigns(apiKey: string): Promise<SmartleadCampaignSummary[]>;
   getCampaign(apiKey: string, campaignId: number): Promise<SmartleadCampaignDetail | null>;
   getSequences(apiKey: string, campaignId: number): Promise<unknown[]>;
   getMailboxes(apiKey: string, campaignId: number): Promise<SmartleadEmailAccount[]>;
@@ -188,6 +189,23 @@ export class SmartleadPushService {
       void this.deps.reportFailure(key, error).catch(() => undefined);
       throw error;
     }
+  }
+
+  /** The user's own Smartlead campaigns for the picker, each marked with whether leads can be added to it. */
+  campaigns(userId: string, accountId?: string): Promise<Result<{ campaigns: Array<{ id: number; name: string; status: string; pushable: boolean; needsConfirmation: boolean }> }>> {
+    return this.guard(async () => {
+      if (!this.deps.enabled()) return this.disabled();
+      const key = await this.ownKey(userId, accountId);
+      if (!key.ok) return key;
+      const rows = await this.smartleadCall(key.key, () => this.deps.smartlead.listCampaigns(key.key.apiKey));
+      return {
+        ok: true,
+        campaigns: rows.map(c => {
+          const decision = campaignStatusDecision(c.status);
+          return { id: c.id, name: c.name, status: c.status, pushable: decision !== "refused", needsConfirmation: decision === "needs_confirmation" };
+        }),
+      };
+    });
   }
 
   // ── start
