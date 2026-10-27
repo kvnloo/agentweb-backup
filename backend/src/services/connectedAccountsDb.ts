@@ -9,7 +9,7 @@ import { emitAppSignal } from './serverSignalEmitter';
 // Type Definitions
 // ============================================
 
-export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'outlook' | 'youtube' | 'fathom' | 'linkedin_ads' | 'hubspot' | 'attio' | 'google_ads' | 'google_drive' | 'calendly' | 'slack' | 'luma';
+export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'outlook' | 'youtube' | 'fathom' | 'linkedin_ads' | 'hubspot' | 'attio' | 'google_ads' | 'google_drive' | 'calendly' | 'slack' | 'luma' | 'smartlead';
 
 /**
  * ENG-1616 — the subset of `PlatformType` that `postOnConnectedAccount` treats as
@@ -297,6 +297,16 @@ export interface LumaConfig extends BaseOAuthConfig {
   needs_reconnect?: boolean;
 }
 
+/**
+ * A customer's own Smartlead API key (ENG-673). Smartlead sends their cold email in their account;
+ * AgentWeb only holds the key. Like Luma the key itself lives in `access_token` (so the shared
+ * secret redaction covers it) and never expires; one connection per user.
+ */
+export interface SmartleadConfig extends BaseOAuthConfig {
+  account_type: 'api_key';
+  mailbox_count: number;
+}
+
 export interface LinkedInAdsAdAccountConfig extends BaseOAuthConfig {
   account_type: 'ad_account';
   currency: string;
@@ -421,7 +431,7 @@ export interface SlackConfig extends BaseOAuthConfig {
   team_id: string;
 }
 
-export type PlatformConfig = SlackConfig | LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | OutlookConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig | GoogleDriveConfig | TwitterXConfig | CalendlyConfig | LumaConfig;
+export type PlatformConfig = SlackConfig | LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | OutlookConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig | GoogleDriveConfig | TwitterXConfig | CalendlyConfig | LumaConfig | SmartleadConfig;
 
 /**
  * Per-connection engagement memory: a persona profile generated from LinkedIn data
