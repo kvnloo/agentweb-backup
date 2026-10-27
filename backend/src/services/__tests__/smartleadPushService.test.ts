@@ -399,6 +399,23 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
       expect((await e.svc.start("owner", go((await approve(e)).token))).ok).toBe(true); // a fresh preview sees what is pushed and may go on
     });
 
+    it("confirms a start once it has told the user it worked, and cancels a start that was never confirmed (never claims it)", async () => {
+      const e = env({ maxConcurrentWorkers: 0 });
+      const r = (await e.svc.start("owner", go((await approve(e)).token))) as any;
+      expect((await db.getRun(r.run.runId))!.startUnconfirmed).toBeUndefined(); // confirmed by the service
+      await e.svc.cancel("owner", r.run.runId); // out of the way for the second half of this test
+      // a start that was written but never confirmed (reported as failed, or the process died first)
+      const e2 = env({ maxConcurrentWorkers: 0, listId: undefined });
+      const ghost = await db.startRun({ ownerId: "owner", pushedBy: "owner", keyOwnerId: "owner", smartleadAccountId: "smartlead-owner", channel: "ui", listId: e2.listId, campaignId: CAMPAIGN, campaignName: "Q", campaignSource: "selected", options: {}, sequenceHash: "h", previewEligible: 5 }, "w");
+      if (!ghost.started) throw new Error("expected a start");
+      clock += LEASE_MS + 31_000;
+      const alive = env({ shareDb: db, listId: e2.listId, leads: e2.leads, sl: e2.sl });
+      expect(await alive.svc.resumerTick()).toMatchObject({ claimed: 0, canceled: 1 });
+      await drain(alive);
+      expect((await db.getRun(ghost.run.runId))!.status).toBe("canceled");
+      expect(e2.sl.posts).toHaveLength(0);
+    });
+
     it("cancels, and never works, a running run that has no lock (a crash between a start's two writes)", async () => {
       const e = env({ maxConcurrentWorkers: 0 });
       const r = (await e.svc.start("owner", go((await approve(e)).token))) as any;

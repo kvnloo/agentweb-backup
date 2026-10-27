@@ -50,7 +50,7 @@ export class InMemoryPushRunDb {
       runId: ulid(now), schemaVersion: 1, status: "running", ownerId: input.ownerId, pushedBy: input.pushedBy, keyOwnerId: input.keyOwnerId, smartleadAccountId: input.smartleadAccountId,
       channel: input.channel, listId: input.listId, campaignId: input.campaignId, campaignName: input.campaignName, campaignSource: input.campaignSource, options: input.options,
       sequenceHash: input.sequenceHash, previewEligible: input.previewEligible, counts: { examined: 0, added: 0, alreadyInCampaign: 0, unconfirmed: 0, withdrawn: 0, skippedByReason: {} },
-      cursor: null, listExhausted: false, batchAttempts: 0, leaseOwner: workerId, leaseEpoch: 1, leaseUntil: now + LEASE_MS, createdAt: iso, startedAt: iso,
+      cursor: null, listExhausted: false, batchAttempts: 0, leaseOwner: workerId, leaseEpoch: 1, leaseUntil: now + LEASE_MS, createdAt: iso, startedAt: iso, startUnconfirmed: true,
     };
     this.runs.set(run.runId, run);
     this.locks.set(key, run.runId);
@@ -101,6 +101,7 @@ export class InMemoryPushRunDb {
     this.locks.set(this.lockKey(r.listId, r.campaignId), runId);
     r.status = "running"; r.batchAttempts = 0; r.leaseEpoch++; r.leaseOwner = workerId; r.leaseUntil = this.nowMs() + LEASE_MS;
     delete r.pauseReason;
+    delete r.startUnconfirmed;
     return this.clone(r);
   }
 
@@ -129,7 +130,7 @@ export class InMemoryPushRunDb {
   async claimLease(runId: string, workerId: string, seenEpoch: number, skewMs = 30_000) {
     const r = this.runs.get(runId);
     const now = this.nowMs();
-    if (!r || r.status !== "running" || r.leaseEpoch !== seenEpoch || !(r.leaseUntil < now - skewMs)) return null;
+    if (!r || r.status !== "running" || r.startUnconfirmed || r.leaseEpoch !== seenEpoch || !(r.leaseUntil < now - skewMs)) return null;
     if (this.locks.get(this.lockKey(r.listId, r.campaignId)) !== runId) return null; // never creates a missing lock (an orphan is cancelled instead)
     r.leaseEpoch++; r.leaseOwner = workerId; r.leaseUntil = now + LEASE_MS;
     return this.clone(r);
@@ -141,6 +142,7 @@ export class InMemoryPushRunDb {
   async listRunsForList(listId: string, limit = 25) { return [...this.runs.values()].filter(r => r.listId === listId).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, limit).map(this.summary); }
 
   async releaseLock(listId: string, campaignId: number, runId: string) { if (this.locks.get(this.lockKey(listId, campaignId)) === runId) this.locks.delete(this.lockKey(listId, campaignId)); }
+  async confirmStart(runId: string) { const r = this.runs.get(runId); if (r) delete r.startUnconfirmed; }
   async lockPointsAt(run: PushRun) { return this.locks.get(this.lockKey(run.listId, run.campaignId)) === run.runId; }
 
   async claimToken(jti: string) { if (this.tokens.has(jti)) return false; this.tokens.set(jti, {}); return true; }

@@ -323,6 +323,9 @@ export class SmartleadPushService {
         if (started.existing) return { ok: true, started: false, run: toRunView(started.existing) };
         return fail(409, "lock_held", "A previous push left this list and campaign locked. Ask support to release it.");
       }
+      // The start is now known to have succeeded: only from here may the run be claimed like any other. If this write fails the run stays
+      // unconfirmed, the resumer will cancel it once its lease lapses, and the user simply previews again (the safe direction).
+      await this.deps.db.confirmStart(started.run.runId).catch(error => { this.deps.log(`[SmartleadPush] could not confirm start of run=${started.run.runId}: ${scrubSmartleadSecrets(error instanceof Error ? error.message : String(error))}`); });
       await this.deps.db.setTokenRun(token.jti, started.run.runId).catch(() => undefined);
       this.deps.log(`[SmartleadPush] started run=${started.run.runId} user=${userId} list=${token.listId} campaign=${token.campaignId} approved=${token.eligible} status=${campaign.status}`);
       this.spawn(started.run);
@@ -445,6 +448,12 @@ export class SmartleadPushService {
         if (this.capacity() === 0) break;
         const run = await this.deps.db.getRun(row.runId); // the index is eventually consistent: act only on the strong read
         if (!run || run.status !== "running") continue;
+        // A run whose start was never confirmed to the user is cancelled once its lease lapsed, never claimed (it may have been reported as failed).
+        if (run.startUnconfirmed) {
+          if (run.leaseUntil + ORPHAN_GRACE_MS > this.deps.now().getTime()) continue;
+          if (await this.deps.db.cancelRun(run.runId)) { out.canceled++; this.deps.log(`[SmartleadPush] resumer canceled unconfirmed run=${run.runId}`); }
+          continue;
+        }
         // A running run whose lock does not point at it never really started (a crash between a start's two writes): cancel it, never run it.
         if (!(await this.deps.db.lockPointsAt(run))) {
           // Only once its lease has lapsed: a run in the middle of starting has a valid lease and no lock for a moment.

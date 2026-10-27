@@ -163,6 +163,12 @@ export interface PushRun {
   startedAt: string;
   finishedAt?: string;
   failure?: { code: string; message: string };
+  /**
+   * True from the moment a start writes the run until the service has confirmed to the user that it started (confirmStart). While it is
+   * set NOTHING may claim the run, and the resumer cancels it once its lease lapses: a start that failed or crashed half way, or was
+   * reported as failed, can therefore never be picked up and sent unannounced.
+   */
+  startUnconfirmed?: boolean;
 }
 
 /** What the history indexes return: a summary, not the whole run. */
@@ -273,6 +279,7 @@ export function toRunItem(run: PushRun, ttl: number): Item {
   if (run.orgId) item.orgId = run.orgId;
   if (run.cursor) item.cursor = run.cursor;
   if (run.pauseReason) item.pauseReason = run.pauseReason;
+  if (run.startUnconfirmed) item.startUnconfirmed = true;
   if (item.active === undefined) delete item.active; // a terminal run is absent from the sparse resume index
   return item;
 }
@@ -321,6 +328,7 @@ export function fromRunItem(item: Item): PushRun {
     createdAt: String(item.createdAt ?? ""),
     startedAt: String(item.startedAt ?? ""),
     ...(item.finishedAt ? { finishedAt: String(item.finishedAt) } : {}),
+    ...(item.startUnconfirmed === true ? { startUnconfirmed: true } : {}),
     ...(item.failure && typeof item.failure.code === "string" ? { failure: { code: item.failure.code, message: String(item.failure.message ?? "") } } : {}),
   };
 }
@@ -534,6 +542,7 @@ export class SmartleadPushRunDb {
       leaseUntil: now + LEASE_MS,
       createdAt: iso,
       startedAt: iso,
+      startUnconfirmed: true,
     };
 
     let put: { ok: boolean };
@@ -577,9 +586,19 @@ export class SmartleadPushRunDb {
       throw error;
     }
     if (!lock.ok) {
-      const winner = await this.getLock(input.listId, input.campaignId);
+      // The lock write was refused. Either our own earlier attempt committed (a retry hit its own write), or another run holds the lock. The
+      // read may itself fail: then we do not know, and the run we wrote is cancelled before anything is reported.
+      let winner: { runId: string } | null | undefined;
+      try {
+        winner = await this.getLock(input.listId, input.campaignId);
+      } catch {
+        winner = undefined;
+      }
       if (winner?.runId === run.runId) return { started: true, run }; // our own earlier lock write committed
-      await this.abandonRun(run.runId);
+      if (!(await this.abandonWithRetry(run.runId))) {
+        throw new SmartleadPushRunStoreError("unavailable", "A start could not be settled; the run it wrote must be cancelled", run.runId);
+      }
+      if (winner === undefined) throw new SmartleadPushRunStoreError("unavailable", "The lock could not be read after a conflicting start");
       const existing = winner ? await this.getRun(winner.runId) : null;
       return { started: false, existing, ...(winner && !existing ? { lockHeldBy: winner.runId } : {}) };
     }
@@ -590,6 +609,13 @@ export class SmartleadPushRunDb {
       return { started: false, existing: null };
     }
     return { started: true, run };
+  }
+
+  /** Tells the store the start was reported to the caller as started: from now on the run may be claimed like any other. */
+  async confirmStart(runId: string): Promise<void> {
+    await this.call(() =>
+      this.client.update({ TableName: this.table, Key: { pk: runId, sk: RUN_SK }, UpdateExpression: "REMOVE startUnconfirmed", ConditionExpression: "attribute_exists(pk)" }).promise(),
+    );
   }
 
   /** abandonRun with a few retries; true once the run is cancelled (or was already finished), false if it could not be confirmed. */
@@ -658,14 +684,14 @@ export class SmartleadPushRunDb {
     const current = await this.getRun(runId);
     // The lock must already point at this run. A running run with NO lock is an orphan (a crash between a start's two writes): letting it
     // take the lock would let an approval that never started run later, so the resumer cancels it instead.
-    if (!current || current.status !== "running" || !(await this.refreshLock(current))) return null;
+    if (!current || current.status !== "running" || current.startUnconfirmed || !(await this.refreshLock(current))) return null;
     const now = this.nowMs();
     const r = await this.call(() =>
       this.client.update({
         TableName: this.table,
         Key: { pk: runId, sk: RUN_SK },
         UpdateExpression: "SET leaseEpoch = leaseEpoch + :one, leaseOwner = :me, leaseUntil = :until",
-        ConditionExpression: "#a = :y AND #s = :running AND leaseUntil < :cutoff AND leaseEpoch = :seen",
+        ConditionExpression: "#a = :y AND #s = :running AND leaseUntil < :cutoff AND leaseEpoch = :seen AND attribute_not_exists(startUnconfirmed)",
         ExpressionAttributeNames: { "#a": "active", "#s": "status" },
         ExpressionAttributeValues: { ":one": 1, ":me": workerId, ":until": now + LEASE_MS, ":y": "Y", ":running": "running", ":cutoff": now - skewMs, ":seen": seenEpoch },
         ReturnValues: "ALL_NEW",
@@ -804,7 +830,7 @@ export class SmartleadPushRunDb {
       this.client.update({
         TableName: this.table,
         Key: { pk: runId, sk: RUN_SK },
-        UpdateExpression: "SET #s = :running, #a = :y, #ba = :zero, leaseEpoch = leaseEpoch + :one, leaseOwner = :me, leaseUntil = :until REMOVE pauseReason",
+        UpdateExpression: "SET #s = :running, #a = :y, #ba = :zero, leaseEpoch = leaseEpoch + :one, leaseOwner = :me, leaseUntil = :until REMOVE pauseReason, startUnconfirmed",
         ConditionExpression: "#s IN (:paused, :partial) AND leaseEpoch = :seen",
         ExpressionAttributeNames: { "#s": "status", "#a": "active", "#ba": "batchAttempts" },
         ExpressionAttributeValues: { ":running": "running", ":y": "Y", ":zero": 0, ":one": 1, ":me": workerId, ":until": now + LEASE_MS, ":paused": "paused", ":partial": "partial", ":seen": seenEpoch },
