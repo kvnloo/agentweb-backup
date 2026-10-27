@@ -11178,7 +11178,7 @@ export const agentModeController = {
           // in the chat only if the first copy has already stored it, which the chat itself says; a stale claim or a
           // first copy that has not reached its save yet leaves it false (nothing stored for this copy).
           const firstCopySaved = typeof clientId === 'string' && clientId !== ''
-            ? await chatbotDb.getChatSession(sessionId)
+            ? await chatbotDb.getChatSession(sessionId, true) // strongly consistent: a just-saved message must be seen
                 .then((current) => !!current?.messages?.some((m) => m.role === 'user' && m.clientId === clientId))
                 .catch(() => false)
             : false;

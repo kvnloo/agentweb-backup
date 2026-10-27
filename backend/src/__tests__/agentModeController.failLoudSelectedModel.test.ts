@@ -1705,6 +1705,8 @@ describe('ENG-2672: a generation that fails AFTER the user message was stored sa
       const res = await send({ clientId: 'msg-1' });
       expect(res.statusCode).toBe(409);
       expect(res.body).toMatchObject({ code: 'SESSION_BUSY', runId: 'run-1', userMessageSaved: true });
+      // The read is strongly consistent, so a message the first copy saved a moment ago is seen.
+      expect(mockChatbotDb.getChatSession).toHaveBeenLastCalledWith(SESSION_ID, true);
       expect(savedUserMessages()).toEqual([]);
     });
 
