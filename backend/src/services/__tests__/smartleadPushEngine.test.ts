@@ -250,22 +250,55 @@ describe("executeRun (ENG-673)", () => {
       expect(t.run.counts.added).toBe(0);
     });
 
-    it("after marking, when Smartlead's account lead limit is used up", async () => {
+    it("after marking, when Smartlead's account lead limit is used up, WITHOUT moving the cursor; a resume then finishes without re-sending", async () => {
       const t = setup(900);
       t.sl.limitExhausted = true;
       await expect(executeRun(t.run, t.deps)).resolves.toEqual({ outcome: "paused", reason: "smartlead_lead_limit" });
       expect(t.marked()).toBe(400);
-      expect(t.run.counts.added).toBe(400);
+      expect(t.run.counts.added).toBe(0);
+      expect(t.run.cursor).toBeNull();
+      t.sl.limitExhausted = false;
+      t.run.status = "running"; t.run.leaseEpoch = 2;
+      await expect(executeRun({ ...t.run }, t.deps)).resolves.toEqual({ outcome: "completed" });
+      expect(t.sl.emails.size).toBe(900);
+      expect(t.marked()).toBe(900);
+      expect(t.run.counts.added + t.run.counts.alreadyInCampaign).toBe(900);
+    });
+
+    it("pauses (not completes) when the lead limit is hit on the LAST batch", async () => {
+      const t = setup(5);
+      t.sl.limitExhausted = true;
+      await expect(executeRun(t.run, t.deps)).resolves.toEqual({ outcome: "paused", reason: "smartlead_lead_limit" });
+      expect(t.run.status).toBe("paused");
     });
   });
 
   describe("what Smartlead does not accept", () => {
-    it("counts a lead Smartlead did not account for as unconfirmed, leaves it unmarked, and still completes", async () => {
+    it("does NOT move on past a lead Smartlead did not name when its tallies do not explain it (it may be in the campaign unmarked): retries, then stops as partial", async () => {
       const t = setup(5);
       t.sl.dropFromMap = new Set(["p2@example.com"]);
+      await expect(executeRun(t.run, t.deps)).resolves.toEqual({ outcome: "partial" });
+      expect(t.run.cursor).toBeNull();
+      expect(t.marked()).toBe(4); // the named ones are marked
+      expect(t.sl.posts).toHaveLength(3); // each retry resent only what was not yet marked
+      expect(t.sl.posts[1]).toEqual(["p2@example.com"]);
+    });
+
+    it("accepts a lead Smartlead did not name when its own tallies explain it (block list), counted and unmarked", async () => {
+      const t = setup(5);
+      t.sl.dropFromMap = new Set(["p2@example.com"]);
+      t.sl.tallies = { blockList: 1 };
       await expect(executeRun(t.run, t.deps)).resolves.toEqual({ outcome: "completed" });
-      expect(t.run.counts.unconfirmed).toBe(1);
+      expect(t.run.counts.skippedByReason.smartlead_skipped).toBe(1);
       expect(t.marked()).toBe(4);
+    });
+
+    it("does not mark a lead Smartlead lists under 'existing in other campaigns' but did not add (it would look pushed when it is not)", async () => {
+      const t = setup(3);
+      t.sl.skipButListOther = new Set(["p2@example.com"]);
+      await expect(executeRun(t.run, t.deps)).resolves.toEqual({ outcome: "partial" }); // unexplained, so it retries then stops
+      expect(t.marked()).toBe(2);
+      expect(isMarkedForCampaign(t.leads[1], CAMPAIGN)).toBe(false);
     });
 
     it("counts an address Smartlead called invalid, and does not mark it", async () => {
@@ -274,6 +307,67 @@ describe("executeRun (ENG-673)", () => {
       await executeRun(t.run, t.deps);
       expect(t.run.counts.skippedByReason.smartlead_invalid).toBe(1);
       expect(t.marked()).toBe(4);
+    });
+  });
+
+  describe("review findings", () => {
+    it("never exceeds the approved count after a rebuilt batch: leads this run marked but never recorded count toward the ceiling", async () => {
+      const t = setup(1000, { run: { previewEligible: 400 } });
+      const write = t.deps.writeMarker;
+      t.deps.writeMarker = async (l, id, k, m) => { if (id === "lead_00300" && t.sl.posts.length === 1) throw new Error("ddb down"); return write(l, id, k, m); };
+      await expect(executeRun(t.run, t.deps)).resolves.toEqual({ outcome: "completed" });
+      expect(t.sl.emails.size).toBe(400);
+      expect(t.marked()).toBe(400);
+      expect(t.run.counts.added + t.run.counts.alreadyInCampaign).toBe(400);
+    });
+
+    it("counts leads left marked by a paused-mid-POST run toward the ceiling on resume", async () => {
+      const t = setup(1000, { run: { previewEligible: 400 } });
+      t.sl.onPost = () => { t.run.status = "paused"; };
+      await executeRun(t.run, t.deps);
+      t.sl.onPost = undefined;
+      t.run.status = "running"; t.run.leaseEpoch = 2;
+      await expect(executeRun({ ...t.run }, t.deps)).resolves.toEqual({ outcome: "completed" });
+      expect(t.sl.emails.size).toBe(400);
+    });
+
+    it("does not email an address that is opted out on ANOTHER record, wherever that record sits in the list (the pre-scan)", async () => {
+      const leads: any[] = Array.from({ length: 900 }, (_, i) => mkLead(i + 1));
+      leads[0] = mkLead(1, { email: "shared@example.com" });
+      leads[700] = mkLead(701, { email: "shared@example.com", contactStatus: "do-not-contact" });
+      const t = setup(899, { leads });
+      await executeRun(t.run, t.deps);
+      expect(t.sl.posts.flat()).not.toContain("shared@example.com");
+    });
+
+    it("keeps that suppression across a restart (a resume whose cursor is already past the opted-out record)", async () => {
+      const leads: any[] = Array.from({ length: 10 }, (_, i) => mkLead(i + 1));
+      leads[1] = mkLead(2, { email: "shared@example.com", contactStatus: "unsubscribed" });
+      leads[6] = mkLead(7, { email: "shared@example.com" });
+      const t = setup(9, { leads, run: { cursor: { listId: "L", leadId: "lead_00003" } } });
+      await executeRun(t.run, t.deps);
+      expect(t.sl.posts.flat()).not.toContain("shared@example.com");
+    });
+
+    it("re-runs the whole eligibility check on the fresh record: a bounce or an edited address after the page read is not sent", async () => {
+      const t = setup(4);
+      t.deps.readLeadConsistent = async (_l, id) => {
+        const l = t.leads.find(x => x.leadId === id)!;
+        if (id === "lead_00002") return { ...l, customFields: { email_validation: { status: "undeliverable" } } };
+        if (id === "lead_00003") return { ...l, email: "bad address" };
+        return l;
+      };
+      await executeRun(t.run, t.deps);
+      expect(t.sl.posts.flat().sort()).toEqual(["p1@example.com", "p4@example.com"]);
+    });
+
+    it("marks every accepted lead even when renewing the lease throws a store error after the POST", async () => {
+      const t = setup(5);
+      let calls = 0;
+      const hb = t.store.heartbeat.bind(t.store);
+      t.store.heartbeat = async (id: string, e: number) => { if (t.sl.posts.length === 1 && ++calls > 0) throw new Error("ddb blip"); return hb(id, e); };
+      await executeRun(t.run, t.deps).catch(() => undefined); // a later renewal may fail the run closed; what matters is the marking
+      expect(t.marked()).toBe(5);
     });
   });
 
