@@ -416,6 +416,19 @@ describe("executeRun (ENG-673)", () => {
     });
   });
 
+  it("pauses at the next batch when the operator's kill switch is on, and a resume carries on", async () => {
+    const t = setup(900);
+    let off = false;
+    t.deps.isDisabled = () => off;
+    t.sl.onPost = () => { off = true; };
+    await expect(executeRun(t.run, t.deps)).resolves.toEqual({ outcome: "paused", reason: "disabled_by_operator" });
+    expect(t.sl.posts).toHaveLength(1);
+    expect(t.marked()).toBe(400); // the batch in flight was recorded first
+    off = false; t.sl.onPost = undefined; t.run.status = "running"; t.run.leaseEpoch = 2;
+    await expect(executeRun({ ...t.run }, t.deps)).resolves.toEqual({ outcome: "completed" });
+    expect(t.sl.emails.size).toBe(900);
+  });
+
   it("completes an empty list without calling Smartlead's add", async () => {
     const t = setup(0, { leads: [] });
     await expect(executeRun(t.run, t.deps)).resolves.toEqual({ outcome: "completed" });

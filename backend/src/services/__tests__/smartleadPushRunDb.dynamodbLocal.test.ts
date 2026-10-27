@@ -46,10 +46,12 @@ suite('SmartleadPushRunDb against DynamoDB Local (ENG-673)', () => {
     listId: `list_${ulid()}`, campaignId: 4242, campaignName: 'Q4 outreach', campaignSource: 'selected', options: { includeUnverified: false },
     sequenceHash: 'hash1', previewEligible: 100, ...over,
   });
+  /** A started AND confirmed run (what the service leaves after it has told the user the start worked). */
   const fresh = async (over: Partial<NewPushRun> = {}) => {
     const r = await db.startRun(input(over), 'worker-A');
     if (!r.started) throw new Error('expected a started run');
-    return r.run;
+    await db.confirmStart(r.run.runId);
+    return (await db.getRun(r.run.runId))!;
   };
 
   beforeAll(async () => {
@@ -453,6 +455,211 @@ suite('SmartleadPushRunDb against DynamoDB Local (ENG-673)', () => {
       await expect(db.startRun(input({ ownerId: '' }), 'w')).rejects.toMatchObject({ code: 'invalid_input' });
       await expect(db.startRun(input({ pushedBy: '' }), 'w')).rejects.toMatchObject({ code: 'invalid_input' });
       await expect(db.startRun(input(), '')).rejects.toMatchObject({ code: 'invalid_input' });
+    });
+  });
+
+  describe('a reply lost after a write committed (the call is retried)', () => {
+    /** A client whose first matching put COMMITS and then fails with a retryable error, so the store retries into its own earlier write. */
+    const lossy = (match: (item: any) => boolean) => {
+      let lost = false;
+      return new SmartleadPushRunDb({
+        get: doc.get.bind(doc), query: doc.query.bind(doc), update: doc.update.bind(doc), delete: doc.delete.bind(doc),
+        put: (p: any) => {
+          if (lost || !match(p.Item)) return doc.put(p);
+          lost = true;
+          return { promise: async () => { await doc.put(p).promise(); throw Object.assign(new Error('reply lost'), { code: 'ServiceUnavailable' }); } };
+        },
+      } as any, table, () => clock, async () => {});
+    };
+
+    it('starts exactly one run when the run write committed but its reply was lost', async () => {
+      const i = input();
+      const r = await lossy(item => item.sk === 'RUN').startRun(i, 'w');
+      expect(r.started).toBe(true);
+      const runs = await db.listRunsForList(i.listId, 50);
+      expect(runs).toHaveLength(1);
+      expect(await db.getLock(i.listId, i.campaignId)).toEqual({ runId: runs[0].runId });
+      expect(runs[0].status).toBe('running');
+    });
+
+    it('starts exactly one run when the lock write committed but its reply was lost, and does not cancel its own run', async () => {
+      const i = input();
+      const r = await lossy(item => item.sk === 'LOCK').startRun(i, 'w');
+      expect(r.started).toBe(true);
+      const runs = await db.listRunsForList(i.listId, 50);
+      expect(runs.map(x => x.status)).toEqual(['running']);
+      expect(await db.getLock(i.listId, i.campaignId)).toEqual({ runId: (r as any).run.runId });
+    });
+
+    it('also holds for an error that is NOT retryable (a reset socket) after the lock committed: the run is reported started, never left as a live run the caller was told failed', async () => {
+      const i = input();
+      let lost = false;
+      const client = {
+        get: doc.get.bind(doc), query: doc.query.bind(doc), update: doc.update.bind(doc), delete: doc.delete.bind(doc),
+        put: (p: any) => (lost || p.Item?.sk !== 'LOCK' ? doc.put(p) : { promise: async () => { lost = true; await doc.put(p).promise(); throw Object.assign(new Error('socket reset'), { code: 'SocketError' }); } }),
+      } as any;
+      const r = await new SmartleadPushRunDb(client, table, () => clock, async () => {}).startRun(i, 'w');
+      expect(r.started).toBe(true);
+      expect(await db.getLock(i.listId, i.campaignId)).toEqual({ runId: (r as any).run.runId });
+    });
+
+    it('also holds for a non-retryable error after the RUN write committed', async () => {
+      const i = input();
+      let lost = false;
+      const client = {
+        get: doc.get.bind(doc), query: doc.query.bind(doc), update: doc.update.bind(doc), delete: doc.delete.bind(doc),
+        put: (p: any) => (lost || p.Item?.sk !== 'RUN' ? doc.put(p) : { promise: async () => { lost = true; await doc.put(p).promise(); throw Object.assign(new Error('socket reset'), { code: 'SocketError' }); } }),
+      } as any;
+      const r = await new SmartleadPushRunDb(client, table, () => clock, async () => {}).startRun(i, 'w');
+      expect(r.started).toBe(true);
+      expect((await db.listRunsForList(i.listId, 50)).map(x => x.status)).toEqual(['running']);
+    });
+
+    it('abandons its run, so nothing can claim it, when the lock write definitely failed', async () => {
+      const i = input();
+      const client = {
+        get: doc.get.bind(doc), query: doc.query.bind(doc), update: doc.update.bind(doc), delete: doc.delete.bind(doc),
+        put: (p: any) => (p.Item?.sk === 'LOCK' ? { promise: async () => { throw Object.assign(new Error('denied'), { code: 'AccessDeniedException' }); } } : doc.put(p)),
+      } as any;
+      await expect(new SmartleadPushRunDb(client, table, () => clock, async () => {}).startRun(i, 'w')).rejects.toMatchObject({ code: 'access_denied' });
+      expect((await db.listRunsForList(i.listId, 50)).map(x => x.status)).toEqual(['canceled']);
+      expect(await db.getLock(i.listId, i.campaignId)).toBeNull();
+      clock += LEASE_MS + 31_000;
+      expect((await db.findExpiredLeases(500)).map(x => x.runId)).not.toContain((await db.listRunsForList(i.listId, 50))[0].runId);
+    });
+
+    it('cancels its run FIRST when it cannot tell whether the lock committed (the read fails too), so nothing can claim it later', async () => {
+      const i = input();
+      let lost = false;
+      const client = {
+        get: (p: any) => (p.Key?.sk === 'LOCK' && lost ? { promise: async () => { throw Object.assign(new Error('read failed'), { code: 'SocketError' }); } } : doc.get(p)),
+        query: doc.query.bind(doc), update: doc.update.bind(doc), delete: doc.delete.bind(doc),
+        put: (p: any) => (lost || p.Item?.sk !== 'LOCK' ? doc.put(p) : { promise: async () => { lost = true; await doc.put(p).promise(); throw Object.assign(new Error('socket reset'), { code: 'SocketError' }); } }),
+      } as any;
+      await expect(new SmartleadPushRunDb(client, table, () => clock, async () => {}).startRun(i, 'w')).rejects.toThrow();
+      const runs = await db.listRunsForList(i.listId, 50);
+      expect(runs.map(x => x.status)).toEqual(['canceled']);
+      clock += LEASE_MS + 31_000;
+      expect(await db.claimLease(runs[0].runId, 'worker-B', 1)).toBeNull(); // the lock points at it, but it is dead
+      expect((await db.startRun(i, 'w2')).started).toBe(true); // and the next start simply takes the stale lock over
+    });
+
+    it('raises an error carrying the run id when it cannot even cancel, so the caller keeps trying', async () => {
+      const i = input();
+      let lost = false;
+      const client = {
+        get: (p: any) => (p.Key?.sk === 'LOCK' && lost ? { promise: async () => { throw Object.assign(new Error('read failed'), { code: 'SocketError' }); } } : doc.get(p)),
+        query: doc.query.bind(doc), delete: doc.delete.bind(doc),
+        update: () => ({ promise: async () => { throw Object.assign(new Error('write failed'), { code: 'SocketError' }); } }),
+        put: (p: any) => (lost || p.Item?.sk !== 'LOCK' ? doc.put(p) : { promise: async () => { lost = true; await doc.put(p).promise(); throw Object.assign(new Error('socket reset'), { code: 'SocketError' }); } }),
+      } as any;
+      const err: any = await new SmartleadPushRunDb(client, table, () => clock, async () => {}).startRun(i, 'w').catch(e => e);
+      expect(err).toBeInstanceOf(SmartleadPushRunStoreError);
+      expect(err.runId).toBe((await db.listRunsForList(i.listId, 50))[0].runId);
+      expect((await db.getRun(err.runId))!.status).toBe('running'); // still live: the service must cancel it
+    });
+
+    it('does the same for a takeover of a finished run\'s lock', async () => {
+      const old = await fresh();
+      await doc.update({ TableName: table, Key: { pk: old.runId, sk: 'RUN' }, UpdateExpression: 'SET #s = :c REMOVE #a', ExpressionAttributeNames: { '#s': 'status', '#a': 'active' }, ExpressionAttributeValues: { ':c': 'completed' } }).promise();
+      const r = await lossy(item => item.sk === 'LOCK').startRun(input({ listId: old.listId }), 'w');
+      expect(r.started).toBe(true);
+      expect(await db.getLock(old.listId, old.campaignId)).toEqual({ runId: (r as any).run.runId });
+    });
+  });
+
+  describe('an unconfirmed start', () => {
+    it('is born unconfirmed, can not be claimed even after its lease lapsed, and becomes claimable only once confirmed', async () => {
+      const i = input();
+      const r = await db.startRun(i, 'w');
+      if (!r.started) throw new Error('expected a start');
+      expect((await db.getRun(r.run.runId))!.startUnconfirmed).toBe(true);
+      clock += LEASE_MS + 31_000;
+      expect(await db.claimLease(r.run.runId, 'worker-B', 1)).toBeNull();
+      await db.confirmStart(r.run.runId);
+      expect((await db.getRun(r.run.runId))!.startUnconfirmed).toBeUndefined();
+      expect(await db.claimLease(r.run.runId, 'worker-B', 1)).toMatchObject({ leaseEpoch: 2 });
+    });
+
+    it('can not be resumed by pausing it first: a paused unconfirmed run stays unresumable', async () => {
+      const r = await db.startRun(input(), 'w');
+      if (!r.started) throw new Error('expected a start');
+      await db.pauseRun(r.run.runId, 'user');
+      expect(await db.resumeRun(r.run.runId, 'w', 1)).toBeNull();
+      await db.confirmStart(r.run.runId);
+      expect(await db.resumeRun(r.run.runId, 'w', 1)).toMatchObject({ status: 'running' });
+    });
+
+    it('settles a RETRYABLE lost reply on the lock write whose follow-up read also fails: the run is cancelled, not left to be claimed', async () => {
+      const i = input();
+      let lost = false;
+      const client = {
+        get: (p: any) => (p.Key?.sk === 'LOCK' && lost ? { promise: async () => { throw Object.assign(new Error('read failed'), { code: 'SocketError' }); } } : doc.get(p)),
+        query: doc.query.bind(doc), update: doc.update.bind(doc), delete: doc.delete.bind(doc),
+        put: (p: any) => (lost || p.Item?.sk !== 'LOCK' ? doc.put(p) : { promise: async () => { lost = true; await doc.put(p).promise(); throw Object.assign(new Error('timeout'), { code: 'ServiceUnavailable' }); } }),
+      } as any;
+      await expect(new SmartleadPushRunDb(client, table, () => clock, async () => {}).startRun(i, 'w')).rejects.toThrow();
+      expect((await db.listRunsForList(i.listId, 50)).map(x => x.status)).toEqual(['canceled']);
+    });
+
+    it('can not be claimed even when it could not be cancelled either (the store stayed down, or the process restarted)', async () => {
+      const i = input();
+      let lost = false;
+      const client = {
+        get: (p: any) => (p.Key?.sk === 'LOCK' && lost ? { promise: async () => { throw Object.assign(new Error('read failed'), { code: 'SocketError' }); } } : doc.get(p)),
+        query: doc.query.bind(doc), delete: doc.delete.bind(doc),
+        update: () => ({ promise: async () => { throw Object.assign(new Error('write failed'), { code: 'SocketError' }); } }),
+        put: (p: any) => (lost || p.Item?.sk !== 'LOCK' ? doc.put(p) : { promise: async () => { lost = true; await doc.put(p).promise(); throw Object.assign(new Error('timeout'), { code: 'ServiceUnavailable' }); } }),
+      } as any;
+      const err: any = await new SmartleadPushRunDb(client, table, () => clock, async () => {}).startRun(i, 'w').catch(e => e);
+      const run = (await db.getRun(err.runId))!;
+      expect(run).toMatchObject({ status: 'running', startUnconfirmed: true });
+      expect(await db.getLock(i.listId, i.campaignId)).toEqual({ runId: run.runId }); // live, locked, and reported as failed...
+      clock += LEASE_MS + 31_000;
+      expect(await db.claimLease(run.runId, 'worker-B', 1)).toBeNull(); // ...but nothing can ever claim and send it
+    });
+  });
+
+  describe('an orphan run (a crash between a start\'s two writes)', () => {
+    it('is never given a lock by a lease claim: it has none, and must not take one', async () => {
+      const orphan = await fresh();
+      await db.releaseLock(orphan.listId, orphan.campaignId, orphan.runId); // the crash: Run written, Lock never
+      clock += LEASE_MS + 31_000;
+      expect(await db.claimLease(orphan.runId, 'worker-B', 1)).toBeNull();
+      expect(await db.getLock(orphan.listId, orphan.campaignId)).toBeNull();
+      expect(await db.lockPointsAt(orphan)).toBe(false);
+    });
+
+    it('still lets a user resume a paused run whose lock expired meanwhile', async () => {
+      const a = await fresh();
+      await db.pauseRun(a.runId, 'user');
+      await db.releaseLock(a.listId, a.campaignId, a.runId);
+      expect(await db.resumeRun(a.runId, 'w', 1)).toMatchObject({ status: 'running' });
+      expect(await db.getLock(a.listId, a.campaignId)).toEqual({ runId: a.runId });
+    });
+  });
+
+  describe('single-use approvals', () => {
+    it('lets exactly one of several simultaneous claims win, remembers the run, and gives the approval back on release', async () => {
+      const jti = `jti-${ulid()}`;
+      const results = await Promise.all([1, 2, 3, 4].map(() => db.claimToken(jti, 7200)));
+      expect(results.filter(Boolean)).toHaveLength(1);
+      expect(await db.getTokenRun(jti)).toBeNull();
+      await db.setTokenRun(jti, 'run-1');
+      expect(await db.getTokenRun(jti)).toBe('run-1');
+      expect(await db.claimToken(jti, 7200)).toBe(false);
+      await db.releaseToken(jti);
+      expect(await db.claimToken(jti, 7200)).toBe(true);
+    });
+
+    it('stores the token with an expiry, and does not touch any index or other record', async () => {
+      const jti = `jti-${ulid()}`;
+      await db.claimToken(jti, 7200);
+      const item = (await doc.get({ TableName: table, Key: { pk: `TOKEN#${jti}`, sk: 'TOKEN' } }).promise()).Item!;
+      expect(item.ttl).toBeGreaterThan(Math.floor(clock / 1000) + 7000);
+      expect(item.kind).toBeUndefined();
+      expect(item.active).toBeUndefined();
+      await expect(db.claimToken('', 7200)).rejects.toMatchObject({ code: 'invalid_input' });
     });
   });
 
