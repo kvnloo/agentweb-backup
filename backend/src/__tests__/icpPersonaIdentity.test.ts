@@ -45,6 +45,7 @@ jest.mock("../middleware/auth", () => ({
 }));
 
 import onboardingStepsRoutes from "../routes/onboardingSteps";
+import { documentWriteFake } from "./helpers/icpDocumentWrites";
 import {
   ensurePersonaIds,
   sanitizeICPPersonas,
@@ -82,7 +83,7 @@ beforeEach(() => {
   userDb.updateUser.mockResolvedValue({ userId: "user-1" });
 });
 
-/** Last `icpResult` written across all updateUser calls. */
+/** Last `icpResult` written across all updateUser calls (whole-list writes, as the status backfill makes). */
 function lastWrittenIcps(): any[] | undefined {
   const calls = userDb.updateUser.mock.calls;
   for (let i = calls.length - 1; i >= 0; i--) {
@@ -157,28 +158,38 @@ describe("mutators address personas by id, not by position", () => {
 
   it("edits the persona the user clicked after an earlier delete shifted indices", async () => {
     const afterDelete = identified().filter((p) => p.id !== "icp_stable_0");
-    userDb.getUserById.mockResolvedValue({ userId: "user-1", icpResult: afterDelete });
+    const stored = { userId: "user-1", icpResult: afterDelete };
+    userDb.getUserById.mockResolvedValue(stored);
+    userDb.updateUser.mockImplementation(documentWriteFake(stored).updateUser);
 
     const res = await request(app)
       .post("/api/onboarding/icp/edit-one")
       .send({ icpId: "icp_stable_2", patch: { name: "ZZZ TEST 123" } });
 
     expect(res.status).toBe(200);
-    const written = lastWrittenIcps()!;
-    const edited = written.find((p: any) => p.id === "icp_stable_2");
-    expect(edited.name).toBe("ZZZ TEST 123");
+    // The write is pinned to the card the user clicked: it now sits at index 1 and the condition holds its id.
+    const [, , options] = userDb.updateUser.mock.calls[0];
+    expect(options.pathSets.every((s: any) => s.path[0] === "icpResult" && s.path[1] === 1)).toBe(true);
+    expect(options.condition.values[":cid"]).toBe("icp_stable_2");
+    const written = res.body.icpResult;
+    expect(written.find((p: any) => p.id === "icp_stable_2").name).toBe("ZZZ TEST 123");
     // Every other persona is untouched.
     expect(written.find((p: any) => p.id === "icp_stable_3").name).toBe("P3");
   });
 
   it("deletes the persona the user clicked, not the one at that index", async () => {
-    userDb.getUserById.mockResolvedValue({ userId: "user-1", icpResult: identified() });
+    const stored = { userId: "user-1", icpResult: identified() };
+    userDb.getUserById.mockResolvedValue(stored);
+    userDb.updateUser.mockImplementation(documentWriteFake(stored).updateUser);
 
     const res = await request(app)
       .post("/api/onboarding/icp/delete-one")
       .send({ icpId: "icp_stable_3" });
 
     expect(res.status).toBe(200);
+    const [, , options] = userDb.updateUser.mock.calls[0];
+    expect(options.pathRemoves).toEqual([{ path: ["icpResult", 3] }]);
+    expect(options.condition.values[":cid"]).toBe("icp_stable_3");
     expect(res.body.icpResult.map((p: any) => p.id)).toEqual([
       "icp_stable_0",
       "icp_stable_1",
