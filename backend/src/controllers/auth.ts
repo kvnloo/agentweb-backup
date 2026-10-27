@@ -17,6 +17,7 @@ import { isInitialPasswordExpired } from "../utils/secureRandom";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { getJwtSecret } from "../config/jwt";
 import { metaService } from "../services/metaService";
+import { emitAppSignal } from "../services/serverSignalEmitter";
 
 // ENG-1402: server-side half of the CompleteRegistration conversion for our OWN
 // customer-portal signup (not a customer's ad account — reuses sendCapiLeadEvent's
@@ -374,6 +375,8 @@ export const login = async (req: Request, res: Response) => {
       { expiresIn: "90d" }
     );
 
+    void emitAppSignal(user as any, "login", { method: "password" });
+
     const { password: _, ...userWithoutPassword } = user;
     res.json({
       token,
@@ -668,6 +671,8 @@ export const googleCallback = async (
       getJwtSecret(),
       { expiresIn: "90d" }
     );
+
+    void emitAppSignal(user as any, "login", { method: "google", isNewUser: isNewUser ? 1 : 0 });
 
     const resultUserObject = {
       token,

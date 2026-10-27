@@ -1,6 +1,7 @@
 import { classifyTraffic, type TrafficClassification } from './trafficSource';
 import { resolveIngestSessionIdentity, type SessionIdentity } from './sessionList';
 import { isPlausibleListId } from './trackingConfig';
+import { parseSuperProps } from './superProperties';
 
 /**
  * ENG-2315: parsing + row-building for the PUBLIC tracker ingest (POST /api/track/event).
@@ -50,6 +51,24 @@ export function int(v: unknown, min: number, max: number): number | undefined {
   return Math.max(min, Math.min(max, Math.round(n)));
 }
 
+/**
+ * ENG-2688: per-list event/property allow-list. When a list has one, a custom event's props are
+ * stored as separate namespaced fields (`cta_click.cta_name`) so one event's props never overwrite
+ * another's. Only allow-listed (event, prop) pairs are ever written, so the fieldNames a list can
+ * acquire stay bounded by this map, never by the request body. Unknown events/props are dropped.
+ */
+export type PropKind = 'string' | 'number' | 'boolean';
+export type EventAllowList = Readonly<Record<string, Readonly<Record<string, PropKind>>>>;
+
+/** Registry keyed by listId. Lists absent here keep the ENG-2315 single-blob behaviour. */
+export const TRACKING_ALLOW_LISTS: Readonly<Record<string, EventAllowList>> = {};
+
+export function allowListFor(listId: unknown): EventAllowList | undefined {
+  return typeof listId === 'string' && Object.prototype.hasOwnProperty.call(TRACKING_ALLOW_LISTS, listId)
+    ? TRACKING_ALLOW_LISTS[listId]
+    : undefined;
+}
+
 export interface ParsedIngest {
   listId: string;
   identity: SessionIdentity;
@@ -69,7 +88,7 @@ export type IngestParseResult =
 
 const fail = (code: string, message: string): IngestParseResult => ({ ok: false, code, message });
 
-export function parseIngestBody(body: unknown, nowMs: number): IngestParseResult {
+export function parseIngestBody(body: unknown, nowMs: number, allowList?: EventAllowList): IngestParseResult {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return fail('invalid_body', 'JSON object body required');
   const b = body as Record<string, unknown>;
 
@@ -126,7 +145,20 @@ export function parseIngestBody(body: unknown, nowMs: number): IngestParseResult
   put('clickCount', int(b.clickCount, 0, 1_000_000));
   put('clickLog', cleanFree(b.clickLog, 6000, /[^\w.:+>()[\]'&|, -]/g));
   put('showsClicked', cleanFree(b.showsClicked, 2000, /[^\w.:'&|, -]/g));
-  if (event === 'custom') {
+  if (event === 'custom' && allowList) {
+    const spec = Object.prototype.hasOwnProperty.call(allowList, customName!) ? allowList[customName!] : undefined;
+    const p = b.props;
+    if (spec && p && typeof p === 'object' && !Array.isArray(p)) {
+      for (const [k, kind] of Object.entries(spec)) {
+        if (!Object.prototype.hasOwnProperty.call(p, k)) continue;
+        const v = (p as Record<string, unknown>)[k];
+        const key = `${customName}.${k}`;
+        if (kind === 'string' && typeof v === 'string') put(key, clean(v, 120));
+        else if (kind === 'number' && typeof v === 'number' && Number.isFinite(v)) put(key, v);
+        else if (kind === 'boolean' && typeof v === 'boolean') put(key, v ? 1 : 0);
+      }
+    }
+  } else if (event === 'custom') {
     // One bounded blob, overwritten per custom event: per-property columns would let a caller
     // mint arbitrary new field names on the customer's list.
     const p = b.props;
@@ -142,6 +174,10 @@ export function parseIngestBody(body: unknown, nowMs: number): IngestParseResult
       if (json !== '{}') put('lastCustomProps', json.slice(0, 500));
     }
   }
+
+  // ENG-2689: super properties ride every event, but only lists that opted in with an allow-list store
+  // them, and only under the fixed SUPER_PROPERTIES names.
+  if (allowList) for (const [k, v] of Object.entries(parseSuperProps(b.super))) put(k, v);
 
   const landingUrl = repairEscapedQuery(cleanUrl(b.landingUrl, 1000));
   const referrer = cleanUrl(b.referrer, 1000);

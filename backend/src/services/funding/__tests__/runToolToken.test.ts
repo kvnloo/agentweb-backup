@@ -1,8 +1,35 @@
 import { RunToolTokenStore } from '../runToolToken';
+import { turnRunReq } from '../../../loginHost/protocol';
 
 const CLAIMS = { runId: 'run-1', userId: 'user-1', sessionId: 'session-1' };
 
 describe('RunToolTokenStore', () => {
+  describe('the token is accepted by the login host\'s own request schema', () => {
+    const accepted = (token: string) => turnRunReq.shape.bridgeToken.safeParse(token).success;
+
+    it('even when the random bytes would start the base64url text with "-" or "_" (a bare token failed ~1 turn in 32 before it was sent)', () => {
+      const spy = jest.spyOn(require('crypto'), 'randomBytes');
+      try {
+        for (const first of [0xf8, 0xfc]) {
+          // 0xf8... => base64url "-", 0xfc... => "_"
+          spy.mockReturnValueOnce(Buffer.concat([Buffer.from([first]), Buffer.alloc(31, 7)]) as never);
+          const store = new RunToolTokenStore();
+          const token = store.mint(CLAIMS);
+          expect(token).toContain(Buffer.concat([Buffer.from([first]), Buffer.alloc(31, 7)]).toString('base64url'));
+          expect(accepted(token)).toBe(true);
+          expect(store.verify(token)).toMatchObject({ ok: true });
+        }
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it('for every starting symbol, and for ordinary random tokens', () => {
+      const store = new RunToolTokenStore();
+      for (let i = 0; i < 2000; i++) expect(accepted(store.mint({ ...CLAIMS, runId: `run-${i}` }))).toBe(true);
+    });
+  });
+
   it('verifies a minted token and returns the run it is bound to', () => {
     const store = new RunToolTokenStore();
     const token = store.mint(CLAIMS);

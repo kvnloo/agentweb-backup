@@ -1,3 +1,406 @@
+## ENG-668: Stripe's own receipt for the overage invoice, and the extra test-mode cases (2026-10-26)
+
+Owner decision: customers also receive Stripe's successful-payment receipt for the month-end extra usage invoice. It cannot be suppressed per invoice, and turning receipts off account-wide was rejected. So the copy says so: "Stripe will also email you a receipt for the payment." appears in the "invoiced" email's "will charge" wording (`paygInvoiceCreatedEmailCopy`, not the paid, failed, action-required or unconfirmed emails) and in the portal's Extra usage card description. Percentages only: no dollar amounts.
+
+### Extra test-mode cases for the staging rehearsal (beyond PR #3659's plan)
+
+- Receipt timing vs the invoiced email: with an instant charge, which lands first, Stripe's receipt or our "invoiced" email? The email must not contradict the receipt (the `paid` wording covers an invoice already collected when the email goes out).
+- Invoice paid from the customer's credit balance: no card charge, so check what Stripe sends (receipt or not) and that the `paid` wording is used.
+- Decline sequence: after a failed attempt, read `next_payment_attempt` on the invoice and follow each retry through to the final one; check PAYG goes on hold exactly once and the failed email is sent once.
+- 3-D Secure: `payment_action_required` email, then confirm on the hosted invoice and see the hold lift; also leave one unconfirmed past the grace days (unconfirmed email and hold).
+- Hosted-invoice payment: pay an open or failed invoice from the hosted invoice page and check `invoice.paid` lifts the hold.
+- Void, uncollectible, refund and dispute on a settled invoice: each must leave PAYG state and usage accounting coherent (dispute puts it on hold).
+
+### Live Dashboard settings Harsha must confirm (not testable in code)
+
+- One-off invoice retry policy (Billing > Revenue recovery > Retries): about 3 tries over 1 week, ending with "mark the invoice as uncollectible".
+- Failed-payment email setting (Billing > Revenue recovery > Customer emails): on or off as intended, so the customer does not get a Stripe failure email on top of ours, or does when we rely on it.
+- 3-D Secure confirmation emails (Settings > Billing > Customer emails): on, since the action-required path relies on the bank challenge being reachable from the invoice.
+- Successful-payment receipts stay on (the copy promises them).
+
+## ENG-2677: auto-post successful prod backend deploys to #feature-launches (2026-10-26)
+
+- New `notify-feature-launch` job in `deploy.yml` runs after a successful `backend-deploy` and posts PR numbers, titles and ENG ids shipped since the previous successful deploy (`detect-changes.outputs.base_sha`) plus the run URL.
+- Channel: repo variable `FEATURE_LAUNCHES_CHANNEL`; unset -> notice + skip. The Emma bot must be invited to the channel (no `channels:join`).
+- Separate job; cannot gate or roll back the deploy. Slack `ok:false` fails only this job. Tests: `.github/scripts/deploy-launch-notify.test.sh`.
+
+## ENG-2676: Stop filing Linear Bug issues for like feedback votes (2026-10-26)
+
+Agent-mode and iShare message feedback now call `fileAutoIssue` only for `dislike` votes. Likes are still persisted and injected as system context; they are sentiment, not defects. Tests: `backend/src/__tests__/agentMode.feedbackLinear.test.ts`.
+
+## ENG-2669: result-endpoint status and trigger stop leaking lead data and the chat link (2026-10-26)
+
+- `GET /r/:name/status/:sessionId` loaded any session by id. It now answers only for a session whose
+  `resultEndpointMetadata.resultName` equals `:name`; anything else (missing, another endpoint's
+  session, a non-result session) returns the same `404 Session not found`, so the route no longer
+  reveals which session ids exist. The session id sits in the lead's page URL, so it is not a credential.
+- The response is now `status`, `resultTitle`, `waitingContent` and, once completed, `reportUrl`. It no
+  longer returns `leadEmail` or `contentHtml`. The only consumer, the portal's `/r/:name/:sessionId`
+  waiting page, reads `status` and `reportUrl` only.
+- `POST /r/:name/trigger` no longer returns `ishareUrl`. That link carries the conversable token
+  (chat as the session owner) and the portal's `/r/:name/new` page ignored it. The reviewer still gets
+  it from `GET /review/:sessionId`, which needs the ENG-2650 reviewer token or an admin. The share is
+  still minted at trigger time, as before.
+- External callers of `/trigger` that read `ishareUrl` from the response break; none was found in the
+  portal, `agentweb-landing-page`, `v0-xc-ures-landing-page`, `mintlify-docs` or `yugo-agent`.
+- Not changed: `reportUrl` is still returned as soon as `contentUrl` is set, before a required review
+  approves the result (unchanged behaviour).
+
+## ENG-2667: LP consent banner + Google Consent Mode v2 util (2026-10-26)
+
+- New pure `backend/src/utils/consentInjection.ts`: for sites in attributionCookies `consent` mode, prepends gtag consent default=denied before any tag, defers our Meta Pixel init behind `aw_consent=granted`, drops the ungateable noscript beacon, and appends a neutral Accept/Reject banner that writes `aw_consent`. `on`/`off` layouts are byte-identical.
+- Not yet called by generation: there is no persisted per-site mode (persisting it is data-plane, gated). Banner copy is placeholder pending Harsha review.
+
+## ENG-2663: LinkedIn rejects a just-refreshed token with 401 "revoked" (2026-10-26)
+
+**Symptom:** a scheduled post failed with "Account token expired. Please reconnect"; the customer got a false disconnect alarm. The account was never disconnected: the same stored token posted fine 71s later (session 60f683ab, 2026-10-25). Same signature on 2026-10-13. Only 2 such 401s in 14 days of prod logs, both recovered with no reconnect.
+
+**Theory (n=2, unproven):** LinkedIn briefly rejects an access token used right after a refresh grant minted it. LinkedIn's docs say nothing; one 2021 Stack Overflow report says 5-10s second-hand, 3-5 min first-hand.
+
+**Fix:** a 401 on a token minted under 5 minutes ago (age derived from `token_expires_at` and the 60-day lifetime, so it holds across calls and hosts) is retried once after 10s for post, image upload, comment, repost and reaction. If it still fails, the adapter throws `FreshTokenRejectedError` (declared class `rate_limit`, so the model sees `Retryable: yes` with wait_seconds guidance and is told not to ask for a reconnect); the engagement executor reschedules it 30 minutes later. A 401 on an older token still says reconnect.
+
+**Not done:** the delay is a guess; nothing was run against live LinkedIn. After deploy, grep prod logs for `ENG-2663: 401 on a just-refreshed token`. Refreshing tokens ahead of expiry was judged over-engineering for two incidents.
+
+**Do not re-introduce** token introspection in `verifyToken`: it checks a just-minted token and can mark healthy accounts inactive.
+
+## ENG-2655: private work plan access guard checks membership, not just "signed in" (2026-10-26)
+
+`getPredefinedWorkPlan` (by title) and `createSessionWithPlan` guarded a private plan with `!result.user` while commenting "ownership/org-membership". The candidate lists they search were already limited to the caller's own and org members' private plans (as are `applyPredefinedWorkPlan`, the Emma recommend/accept tools and the MCP list/launch tools via `predefinedWorkPlanResolver`), so no live leak was found; the guard itself was a no-op for signed-in users. It now requires the plan to be in the caller's own/org private set, so a private plan found in the system/public lists is refused with 403. This is defence in depth only: the VisibilityIndex lists only system/public plans, so that case cannot occur today. Ownerless private plans (the admin create route sets no `ownerId`, by design - "nobody launches it as an admin") are in no owner partition, so no user can read or launch them; they stay admin-managed via `/api/admin/work-plans`.
+
+## ENG-2644: public task-execution status requires the conversable token for an interactive share (2026-10-26)
+
+`GET /api/tasks/:id/executions/:executionId/public?sessionId=` (`getTaskExecutionPublic`) served a task execution
+(status, message, result file URLs and their tokens) to anyone holding the session id of an interactively shared
+chat: it only checked `interactiveShareMetadata.isActive` (the expiry check was commented out) and never the
+share's token. It now needs `&conversable=<token>` for an interactive share, with the same expiry/token checks as
+the `/ishare` routes (shared `getInteractiveShareExpiresAt`): expired or switched-off answers 410 (with no write: a stale-read deactivation could clobber a re-created share), a
+missing or wrong token answers 401. A live read-only share (`shareMetadata.isShared`) is unchanged and still
+needs no credential (portal `ShareConversation.tsx`). If the read-only share has expired but an interactive
+share is live, the token is required instead of the previous blanket 410. The portal's `TaskExecutionStatus`
+now sends the token (portal PR).
+
+## ENG-2644: public iShare stop compares the conversable token (2026-10-26)
+
+`POST /api/agent-mode/ishare/:id/stop` (`stopGenerationPublic`) required a `conversable` query token but
+never compared it with the session's interactive-share token, and skipped the expiry check. Anyone who had
+the id of an interactively shared chat could therefore cancel the owner's run. It now checks the token first (wrong or missing: 401), then answers 410 for an expired or switched-off share. The
+route deliberately writes nothing on expiry: stop only cancels a run, and deactivating from a stale read could
+overwrite a share the owner just re-created (the other `/ishare` routes still switch expired shares off). The portal already sends the token
+(`useAgentModeChat.tsx`), so no portal change is needed. `getInteractiveShareExpiresAt` moved unchanged to
+`utils/interactiveShare.ts` so other public routes can share it.
+
+## ENG-2113: turn preamble of generateMarketingResponse extracted into prepareTurnContext() (2026-10-25)
+
+Pure move, no behaviour change. Everything the model is told before Emma's loop starts (data fetch, system prompt, skills, memory, roster, conversation, unattended publish directive, anti-loop directive) is now built by `AgentModeService.prepareTurnContext()`, so the Claude Code backend (PR C) builds the identical context instead of a drifting copy. The moved block is byte-identical modulo indentation. `agentModeService.prepareTurnContext.golden.test.ts` pins, for 20 fixtures (memory, org memory, Slack roster, voice card, skills, delegated/admin access, loop breaker and its verification-press suppression, scheduled/unattended publish directive, long-pause pacing, screenshot), every message and the tool-filter inputs and call options of the first model call; it was recorded on the code before the move (separate commit). Not covered by the golden: the mid-turn skill reinstall inside the loop (unchanged code, still typechecks).
+
+## ENG-2662: Name the withheld publish tool in held-for-approval scheduled-run failures (2026-10-24)
+
+`describeScheduledRunFailureReasons` now reports which publish tool the model withheld and after how many attempts, and points at the schedule's unattended-publish authorization. The ENG-947 press budget is unchanged: re-pressing cannot make a model publish. The text is description-only (no dedupe key).
+
+## ENG-2113: tool bridge hardening for Claude subscription runs (2026-10-24)
+
+Dark: no production caller, the funding flag stays off. Findings from live probes against the pinned `claude` 2.1.294 on the test host:
+
+- **SSE mode breaks the CLI.** The MCP SDK's default streamable-HTTP transport answers `initialize` as an event stream; the CLI's handshake then fails and every turn dies in under a second (`errorKind: transient`). `toolBridgeMcp.ts` now sets `enableJsonResponse: true` (pinned by a test). Consequence: no progress keepalive over HTTP; long tools belong to the stdio shim / relay.
+- **A cut call is not an aborted call.** The CLI cuts a silent HTTP tool call at ~60 s, the server handler keeps running and `extra.signal` never fires; the model retries 2-4 s later with identical args and a new tool-use id. A write executed twice. The bridge now joins an identical call that arrives while the first is still executing, and returns the original outcome for an identical strict-effect call after completion in the same turn.
+- **Stop does not interrupt a running tool** (production behaviour, unchanged); `cancelSession` refuses everything not yet started and closes the session's runs, never touching a pending halt.
+- **Login safety (host, not the bridge):** killing the CLI with SIGKILL while it refreshes an expired access token destroys the login (the server rotates the refresh token, the new pair is never written). SIGTERM with a grace period kept the login in 5/5 forced-expiry rounds. Any stop/cancel/deadline/drain path must send SIGTERM first.
+- `call_*` tools are classified explicitly in `bridgeToolClassification.ts`; a test fails when one is added without a rule.
+
+## ENG-2113: customer units stop gracefully (SIGTERM first) so a login mid-refresh survives (2026-10-24)
+
+The login host stopped every customer `claude` unit with SIGKILL, including at the normal end of a turn. The CLI refreshes an expired access token in its first seconds: the server rotates BOTH tokens and the new pair is written afterwards, so a SIGKILL in that window destroys the login (reproduced live: kill at 700 ms lost it; the earlier "login died within 20 h" was this). Units now use `KillMode=mixed`, `KillSignal=SIGTERM`, `TimeoutStopSec=<limits.stopGraceSec>` (default 10, allowed 2..12), `SendSIGKILL=yes`; `systemctl stop` is the normal stop and SIGKILL only the fallback. Revoke and the hazard alarm still kill hard (the home is wiped right after). Live (test host, real forced-expiry refresh, aborts through the host's own interrupt path): login survived 8/8 (300-1200 ms). DEPLOY ORDER: the host config schema is closed; add `limits.stopGraceSec` only after the new host binary is deployed.
+
+## ENG-2656: Emma no longer fabricates attachment URLs (2026-10-23)
+
+read_file_content refuses non-AgentWeb S3 hosts without fetching and returns re-attach guidance; system prompt and tool description tell Emma to ask the user to re-attach when a message says "attached" but has no Attached Files link.
+
+## ENG-2654: Share link previews need the iShare token when there is no read-only share (2026-10-23)
+
+`GET /api/agent-mode/share/:id/og` returned the title and first user message for any session with an active interactive (iShare) share, given only the chat id. It now serves an iShare-only session only when `?conversable=` matches the active token and the share has not expired (404 with no token, 401 for a wrong one, 410 when expired). It never writes, so unlike `/ishare/:id` it does not flip `isActive` on expiry. A read-only share still previews without a token. The description is now taken from the same filtered messages the share page shows (`filterMessagesForClient` + the ENG-2645 `toReadOnlyShareMessages` / `toConversableShareMessages` serializer for that share type), so an ENG-2163 admin-tainted prompt or a system row is never the preview text. The portal link-preview server (`server.js`) only handles `/share/:id` (read-only links) and is unaffected; `/ishare/:id?conversable=` links have no server-side preview today.
+
+## ENG-2653: anonymous session transfer requires the visitor's conversable token (2026-10-23)
+
+`PUT /api/agent-mode/session/:id/transfer` reassigned any `anon_`-owned session to whichever signed-in
+user named its id, so anyone who learned an anonymous chat id (shared plan link, logs, referrers)
+could take the chat, including everything the visitor typed.
+
+Anonymous sessions come from two places: `createSessionWithPlan` (public plan pages / lead magnets;
+`sessionType: 'predefined-work-plan'`) and `resultEndpointController` (`/r/:name/trigger`;
+`sessionType: 'result-endpoint'`). The only secret the anonymous browser holds is the conversable
+token `createSessionWithPlan` returns with the session; the portal stores it next to the session id in
+localStorage `agentweb_plan_sessions` (PlanPage `setPlanSession`) and in the `?conversable=` URL.
+
+The route now requires `{ conversableToken }` in the body (400 when absent) and transfers only when it
+matches the session's active, unexpired `interactiveShareMetadata.token` (constant-time compare);
+otherwise 404, the same as a missing session. Only `predefined-work-plan` sessions transfer:
+result-endpoint tokens are served by the unauthenticated `GET /review/:sessionId`, so for those the
+token proves nothing, and the portal never stores them. The owner write is conditional on the
+anonymous owner just checked (`updateSessionUserId(..., expectedUserId)`), so a concurrent transfer
+cannot overwrite the winner. The portal's two callers (`AgentMode.tsx` home-page transfer and
+`useAgentModeSessions.transferPlanSessionIfNeeded`) send the stored token
+(agentweb-customer-portal PR). Deploy the portal change first or together: a portal without it gets
+400 and clears its plan-session list, so the visitor's chat is not moved into the new account.
+
+Not changed: after a transfer the conversable token stays active on the now-owned session (as before).
+
+## ENG-2652: Emma inbound email trusted the From header and any [ref:<id>] (2026-10-23)
+
+`emmaEmailService.processInboundEmail` resolved the account Emma acts for from the inbound
+`From` address (`userDb.getUserByEmail`) and continued whatever session the subject's
+`[ref:<uuid>]` named, without checking the session belonged to that account. A registered user could
+put another account's chat id in the subject, run a turn inside that chat (its context, memory and
+tools) and get the reply plus a `Continue in browser` iShare link (conversable token) for it by email.
+
+Fixed: the referenced session is continued only when `session.userId === <resolved sender>`; anything
+else (missing or foreign) starts a new session exactly like the not-found path, so the iShare link,
+the email metadata write and the agent turn are always on the sender's own session. Owner-only for
+admins too: email has no delegate context and its sender proof is weaker than a portal token. The
+reply's `[ref:]` tag now names the session that answered instead of echoing the inbound one.
+
+From spoofing: the Resend webhook itself is svix-verified (`webhookService.verifyWebhook`), but the
+`from` it carries is just the message's From header. Resend's `GET /emails/receiving/{id}` returns
+`authentication: { spf, dkim, dmarc }` verdicts (`pass | fail | gray | processing_failed | unknown`)
+computed by its receiving server (docs: resend.com/docs/api-reference/emails/retrieve-received-email;
+`gray` DKIM = unsigned or signed by a domain other than the From domain). `getReceivedEmailContent`
+now passes it through, and Emma only acts when `dmarc === 'pass' || dkim === 'pass'` (a From-aligned
+proof). SPF pass alone is not accepted (it covers the envelope sender). A missing/null verdict fails
+closed. Refused mail gets no reply (a reply would mail the forged address); it is logged as
+`[EmmaEmail] Ignoring inbound email <id>: sender not authenticated (authentication=...)`.
+Not verified against a live production payload (no prod access from this change): if that log line
+appears for genuine customer mail, check whether Resend populated `authentication` for it.
+
+## ENG-2651: caller-named session ids must be the caller's before an iShare link is minted (2026-10-23)
+
+`POST /api/human-eval/candidates` passed a caller-supplied `sessionId` straight to
+`humanEvalService.createCandidate`, whose `resolveChatUrl` calls
+`chatbotDb.createOrReuseInteractiveShare(sessionId)` and returns the link (with its conversable token)
+as `candidate.chatUrl`. Any signed-in user who knew another account's chat id got a link that opens
+and chats in that chat; reviewer feedback was later written into it (`addFeedbackToSession`). The
+route now accepts only a session the caller owns, or any session for an admin (the
+`agentModeController.getSession` / `routes/emmaApi.ts` rule; delegate tokens resolve `req.user` to the
+target), and answers anything else 404 before the artifact claim or any candidate exists.
+
+Same class, also fixed: `POST /api/landing-pages/v0/generate` stored `originating_session_id` unchecked
+as the page's `originatingSessionId`, which `durableLandingService.postToSession` writes the
+completion/failure message into and `enqueueLandingPageHumanEval` mints an iShare link for. A session
+the caller may not open is now dropped (not refused): the MCP `generate_landing_page` tool sends
+`context.sessionId`, which for external MCP clients is the MCP transport session id, not a chat.
+
+Audit of every other `createOrReuseInteractiveShare` / `createCandidate` caller (none reachable with a
+foreign id handed back to the caller):
+- `agentModeController.createConversableShare`: owner-only check already present.
+- `routes/admin.ts ensureIshareLinkForReview`: admin router (`isAdmin`).
+- `emma/tools.ts enqueue_human_eval`, `enqueueLeadEnrichmentEval`, `mediaVideo` image/video auto-eval,
+  `humanEvalActionService` rerun: `sessionId` comes from the running agent's context; the routes that
+  start a run gate the session (generateResponse; emmaApi `generate-image` / `generate-video` via
+  `sessionAccessAllowed`, #3702).
+- `emailService` scheduled-result / digest / session-notification emails: session ids come from the
+  owner's schedule run results or the running agent's context; recipients are owner-configured.
+- `conversation/sessionResponder.ts`, `routes/slack.ts`, `revisionService.ts`, `utils/agentModeAlerts.ts`:
+  server-created or server-bound sessions; links go to the Slack thread owner or internal on-call only.
+- `resultEndpointController` (`POST /r/:name/trigger`): mints for the anonymous session it just created.
+- `routes/resultEndpoints.ts GET /review/:sessionId` (unauthenticated): returns the iShare URL of any
+  result-endpoint session to whoever holds its session id. Different class (session id as a
+  capability, by design for reviewer links); not changed here, listed for follow-up.
+- `emmaEmailService.processInboundEmail`: `[ref:<id>]` continues any session — ENG-2652.
+
+## ENG-2650: result-endpoint review routes need a reviewer token or admin (2026-10-23)
+
+- `/review/:sessionId` (GET) and `/review/:sessionId/send` (POST), in
+  `backend/src/routes/resultEndpoints.ts`, used to trust the session id alone. That id
+  is also handed to the anonymous lead (the `/r/:name/trigger` response and the
+  `/r/:name/:sessionId` status page), so anyone with it could read the lead email, get
+  the conversable iShare link, and send AgentWeb-branded email with any link in it.
+- Every review route now runs `requireReviewAccess` first. It accepts either
+  - the reviewer capability token in the `X-Review-Token` header. The token is
+    `HMAC-SHA256(HMAC(JWT_SECRET, label), sessionId)` in base64url, compared in
+    constant time (`services/resultEndpointReview.ts`). It is not stored anywhere.
+    `send_for_review` puts it in the review link's URL fragment
+    (`/review/<id>#token=...`), and the portal page forwards it in the header; or
+  - a real admin JWT (not a delegate token).
+  A new route on `reviewRouter` must take `requireReviewAccess` as its first handler.
+  `resultEndpointReview.eng2650.test.ts` checks this.
+- Review links sent before this deploy have no token, so they now return 401 ("Access
+  Denied" on the page). To open one, sign in to the portal as an admin and open the same
+  link, or let `send_for_review` run again for that result to get a new link.
+  Rotating `JWT_SECRET` also breaks every outstanding review link.
+- `/send` only accepts one of the session's collected assets (http(s)), or
+  `__inline_html__` when `contentHtml` is set. It needs exactly one valid recipient
+  address, escapes everything it puts into the HTML, and allows at most 10 successful
+  sends per session per hour. The limiter is in memory, so the limit applies to each
+  backend instance separately.
+- The portal does not load third-party analytics (GTM, PixelFlow, Clarity) on
+  `/review/*`, so the token in the URL and the lead PII on the page are never sent to
+  them.
+
+## ENG-2649: blind A/B harness for the AgentWeb Model router vs today's defaults (2026-10-23)
+
+**What.** `backend/src/scripts/routerAbEval.ts` (logic in `src/loops/eval/routerAb.ts`, tasks in `routerAbTasks.ts`)
+runs ENG-669 AC3's quality-per-dollar A/B: per task type, the model the routing table sends it to (resolved with the
+router's own `parseRoutingTable`/`routeFor`) against the model that flow runs today (passed in explicitly). Cells
+whose two arms are the same model are not run. Inputs for v0: `backend/eval-artifacts/router-ab/`.
+
+**Commands.** `plan` (free, offline: cells, eligible judges, upper-bound spend), `generate` (paid), `judge` (paid),
+`report` (free; `--reprice model=in/out` for a price-change sensitivity, `--human ratings.csv`), `export-human` (free:
+blinded sheet, sealed key, ratings template). Every command resumes from `--out-dir`.
+
+**How a run works.** In-process `agentModeService.generateMarketingResponse(..., mockMode=true)` on the Dev tables, in a
+session shaped like the product's (report_generation / image-generation / video-generation / emma-sidebar), with the
+skills carrying the flow's required tool installed as `runVerifiedChat` does. The task is re-prompted ("Please try
+again. Make sure to <tool> (1 more time needed).") up to 5 turns while the required tool is skipped, as the product's
+`/verified-generate` does. Mock mode means no tool leaves the sandbox and both arms see identical tool results. Cost is
+what OpenRouter reported (`usage.cost`, via `openRouterCallCostUsd`) for EVERY LLM call of the run, wrapped at
+`agentModeService.callLLM` (suggested replies and side calls included). A call with no reported cost stops the run.
+A run fails if it errored, if any assistant message ran a model other than the arm's, if a required tool was not
+called, or if it returned nothing; a failed arm scores the floor without a judge call. Each pair is judged twice
+(router first, incumbent first) with model names redacted and the required tool's arguments (the report body in
+`create_blog_article`) shown in full; a judge must be from a provider that wrote neither arm.
+
+**Safety and spend.** `generate`/`judge` refuse anything but `NODE_ENV=development`, an unset or production
+`AWS_S3_BUCKET`, an exported `OPENROUTER_API_KEY` (unless `--allow-env-key`), a `--user-id` that is an admin, a shared
+QA account or not on an RFC 2606/6761 reserved domain, and a task set not marked synthetic. Create one budget file
+with `budget --generation-cap 150 --judge-cap 50`; every run (no-tier, Free, pilot, resume) passes it as
+`--budget-file`, so the caps are global. Each call is reserved at an upper bound (max of its estimate and the largest
+cost seen for that model) before it is sent and settled after; a crash leaves the reservation charged. Exit codes:
+0 done, 1 error/refused, 3 stopped at the cap, 4 a call reported no cost.
+
+**Not covered.** `scheduled` is refused (an in-process turn is not a faithful unattended run); v0 routes it to the same
+model as today, so it needs no A/B. Mock mode skips the work-plan reminder and the retry backoff sleep (latency only).
+
+**Finding while building it.** The Research Reports flow (`/verified-generate` with `create_blog_article`) runs
+`agent_mode_report_generation_default_model` (falling back to `agent_mode_default_model`), not
+`agent_mode_reports_model`: `runVerifiedChatInner` overwrites the session model the latter set at creation. The
+report cell's incumbent must be whichever of the two the measured flow actually runs.
+
+## ENG-2648: answer/cancel turns are capped at limit x2 (2026-10-23)
+
+Approval-deck answers/cancels and work-plan details answers continue a paused conversation, so the per-user concurrent-chat cap (`max_concurrent_generations_per_user`) admits them above the limit — but now only up to a hard ceiling of limit x2 (`PAUSED_TURN_CEILING_MULTIPLIER`). The slot is taken before the deck / request is consumed, so a 429 at the ceiling leaves it pending for a retry; the turn never gets refused after its writes ran. 0 still means unlimited.
+
+## ENG-2648: email continues on the chat's model; coding_agent falls back to the system default (2026-10-23)
+
+Owner decision on ENG-2648 #6. `emmaEmailService.processInboundEmail` used `getDefaultModel()` for every turn, even when an email continued an existing chat whose user had picked a model in the app; it now uses that session's stored `llmModel` (default only when none), the same rule as Slack thread replies (`routes/slack.ts`) and `sessionResponder`. New and fallback sessions are unchanged (stamped with the default, source `system`). The `coding_agent` Emma tool fell back to the hard-coded `anthropic.claude-sonnet-4-6` (a legacy model) when its context had no `llmModel`; it now falls back to `agentModeService.getDefaultModel()` (AW-Settings `agent_mode_default_model`).
+
+Follow-up: a continued chat whose stored model is outside the owner's plan (downgrade) is refused by generateSessionResponse's final gate; the email path now catches that ModelUnavailableError, emails `modelUnavailableBody(err).error` to the sender and saves it to the chat as an error message, exactly like a Slack thread reply (it does not silently switch models). Other errors still propagate.
+
+## ENG-2648: Compare output cap raised to 32000 (2026-10-23)
+
+`COMPARE_MAX_OUTPUT_TOKENS` was 8192 and includes reasoning tokens (OpenRouter counts reasoning against `max_tokens`; a model that spends the budget thinking returns `finish_reason: length` with empty content and the reasoning is still billed; OpenAI recommends reserving >= 25,000 tokens). The registry sets no reasoning effort, so models run at provider defaults (GPT medium, Claude Opus 5.5 mandatory high). Compare now uses 32000, the ceiling /generate already sends to every chat model, so a column no longer fails with `output_limit` where chat would answer. Not live-tested: a real Compare with a reasoning model (e.g. GPT-6 Sol + Claude Opus 5.5 + a fast Gemini Flash) on a long multi-part prompt; the 60s COMPARE_TIMEOUT_MS remains the binding limit for slow reasoners (timeout, not output_limit).
+
+## ENG-2648: Compare asks every model for Markdown (2026-10-23)
+
+`COMPARE_SYSTEM_PROMPT` now tells each compared model to answer in Markdown, without HTML tags, and to put requested HTML/code in a fenced code block. Before, output format differed by vendor (Claude Sonnet 5 answered in HTML tags, the others in Markdown) in side-by-side cards that all render through the portal's sanitized `MarkdownMessage` (rehype-raw + rehype-sanitize default schema), so HTML answers rendered differently from the rest. Display/safety unchanged: the portal already sanitized both forms.
+
+## ENG-2648: branch copies no longer counted twice by scoring, eval and admin readers (2026-10-23)
+
+A branch ("Branch from here", ENG-112/113) is an ordinary new session whose rows `[0..k]` are a COPY of its
+source (`buildBranchRows`, `services/agentMode/chatBranching.ts`). Billing was already clean: the copy strips
+`usage` (so `incrementTokenUsage` adds nothing), `addMessagesToSession` charges no quota (ENG-1134),
+`totalCost`/`toolCosts` are session fields that are not copied, and AW-SpendEvents rows reference the source
+session. What did double-count: every reader that treats the branch's rows as its own work.
+
+- Satisfaction scoring (`attemptSessionScore`, `judgeCohortExclusion`): a never-continued branch, and the
+  archived leftover of a failed copy, were scored as a full chat (a pure duplicate of the source's turns).
+- Eval-v2 graders (`buildLoadedSession`): copied tool calls, user turns and the final reply were graded again.
+- Admin `GET /api/admin/chat-sessions` recent list (and so the `get_chat_history` MCP tool / Daily
+  Satisfaction report): listed failed-copy leftovers (born `archived: true`, never revealed) and
+  never-continued branches, and created iShare review links on them; `get_chat_history` attributed the
+  copied turns' models, waits and heap to the branch.
+
+Fix: `branchOwnMessages(messages)` returns the rows from the branch's first OWN user message on: a user row
+positioned after the branched-from assistant row (`branchOrigin.sourceMessageIndex`). Position only — a copied
+row keeps its source timestamp, so timestamps cannot tell a copy from an own turn. A non-branch is returned
+unchanged. Where it is used:
+- Scoring: every turn-state check (user/assistant turns, no-task, blocked-external, mid-tool-loop, failed run,
+  `judgeScoringPath`) reads the own turns. The judge scores only the own turns; the copied prefix is sent first
+  as a marked, bounded "COPIED CONTEXT" block. The tool-call manifest still covers the whole history.
+- Eval-v2: turns, user-turn count, final reply and crash check are the own turns; the tool ledger stays the
+  whole history's (groundedness and repeated-write checks). A copy-only branch is flagged
+  (`LoadedSession.branchCopyOnly`) and the daily sampler skips it.
+- Admin: the recent list (and `get_chat_history`) leaves out copy-only branches and failed-copy leftovers; the
+  owner-filtered list keeps a revealed never-continued branch (archived leftovers are already excluded there);
+  no review iShare link is created for a copy-only branch on any path. `get_chat_history` stats count own rows.
+  The `?sessionId=` lookup still finds any session by id, so an orphan named in a
+  `ChatBranching: unexpected failure` log line can still be inspected.
+
+Orphan sweep: not built. Leftovers are hidden (archived) and are now excluded from every reader above.
+If they ever need removing, that is a data-plane delete (Harsha): candidates are sessions with
+`archived = true`, a `branchedFrom` attribute and no own user row per `branchOwnMessages` — a user-archived
+branch that was continued has own rows and must be kept.
+
+## ENG-2646: registry model names are the display names in every client (2026-10-23)
+
+`LLM_MODEL_REGISTRY[id].name` is what `/public/llm-models` returns as `name`, and the portal now resolves every model label from it (picker, per-reply label, branch panel, compare, Work Plans). Seven OpenRouter auto-additions (2026-10-07 catalog refresh) predated `cleanModelName` (added 2026-10-08 in `modelCatalogRefresh.ts`) and kept OpenRouter's `"<Vendor>: <Model>"` form, e.g. `"Z.ai: GLM 5.3 Flash"` next to the hand-curated `"GLM 5.2"`. The daily refresh only adds new models and refreshes scores, so it never rewrote those names; they were fixed by hand. `llmModelRegistry.test.ts` now fails on any registry name that `cleanModelName` would change, and on two models sharing a name. Compare alternatives saved before this keep the old name in their stored data; the portal shows the live registry name for any model the registry still lists.
+
+Renaming `openrouter/anthropic/claude-sonnet-5.5` exposed a bug in Emma's model-mention detection (`utils/modelMentionRequest.ts`). "5.5" tokenizes to "5" + "5", and the scan is position-first, so for "use Anthropic: Claude Sonnet 5.5" the Sonnet 5 id key `anthropic claude sonnet 5` matched at "Anthropic" and won. The old `"Anthropic: Claude Sonnet 5.5"` name had registered a longer key that hid this. The same was already true for hand-curated names such as Opus 5.5. `findModelMention` now skips a match that stops right before `.<digit>`.
+
+## ENG-2645: share-link responses are an allowlist of what the viewer's page reads (2026-10-23)
+
+`GET /api/agent-mode/share/:id` (unauthenticated) and `GET /api/agent-mode/ishare/:id?conversable=…` are the
+same handler (`agentModeController.getSharedConversation`). Before this change both returned the session record
+nearly as stored: row 0 is the stored system prompt (~100 KB), and `filterMessagesForClient` only drops `role:'tool'`
+rows and admin-tainted turns, so assistant rows kept `reasoning`, `reasoning_details`, `usage`, `refusal`. The
+read-only response also carried the owner's whole skills catalog (`getSkillsForDisplay` = everything the owner's plan
+allows, private/org skills, "Other Skills", and "Admin Tools" for admin owners), `supportNote` (the admin's
+internal free-text note about the account, `PUT /admin/users/:userId/support-note` — not a company name), `slackThread`, and
+`interactiveShareMetadata` — whose `token` is the conversable credential, so a read-only viewer could drive Emma on
+the owner's account whenever an interactive share was active.
+
+**Rule now:** `utils/shareViewerSerializers.ts` builds both responses from explicit allowlists.
+- Read-only (`ShareConversation.tsx`): `sessionId, title, messages, workPlan, pendingApprovalDeck`; only user and
+  assistant rows, each `{ role, content, metadata: timestamp|toolCalls|citations|attachments|pendingApprovalDeckId }`.
+  Server-written `role:'user'` rows (`metadata.kind` `auto-continuation` / `approval-inbox-resolution`, the
+  `userMessageKind` of generateSessionResponse) are left out: the page has no notion of `kind` and showed their
+  internal instruction text as customer bubbles. The catalog and the owner record are not read at all.
+- Conversable (`AgentMode.tsx` via `useAgentModeSessions`, plus the landing-page `/api/status` poll):
+  `sessionId, title, messages, createdAt, updatedAt, workPlan, llmModel, hasActiveProgress, slackThread, skills,
+  pendingWorkPlanInput, pendingApprovalDeck`. No `supportNote` (the ishare header falls back to "You're chatting with
+  Emma in a shared conversation"). Rows keep `role, content, llm, modelCorrection, messageIndex, clientId` and the
+  metadata keys the chat reads; `feedback` is narrowed to `type|comment|timestamp` (no rater `userId`). System rows
+  the chat does not render are sent as `{ role:'system', content:'', messageIndex, metadata: timestamp|kind|isErrorMessage }`
+  placeholders, NOT dropped: AgentMode counts rows (`messages.length > 1`, the empty-chat state, last-message checks)
+  and the landing-page `/api/status` poll marks a run failed on any row with `isErrorMessage`. For the same reason the
+  first-attempt telemetry row (`FIRST_ATTEMPT_TELEMETRY_PREFIX`, "a retry follows") loses `isErrorMessage` in its
+  placeholder; real failure rows keep it. Successful `upload_image`/`upload_video` system rows are rendered, so they are
+  kept whole. `skills` = this session's installed skills only, never `__admin_tools__` (an ishare turn cannot run
+  admin tools anyway); the generate response's `skills` is narrowed the same way.
+- `PUT /ishare/:id/message/:i/feedback` answers `{ success, message: { metadata: { feedback } } }` (all the portal
+  reads, feedback narrowed the same way) instead of the raw stored row — the index is raw, so the old response could return a row the viewer's chat
+  hides.
+
+When a share page starts reading a new field, add it to the allowlist in `shareViewerSerializers.ts`; the
+`agentModeController.shareViewerRedaction.test.ts` suite pins both the absences and the rendered fields. The stored
+session is never modified — generation still reads the system prompt server-side. The owner's own
+`GET /session/:id` is unchanged. `getConversableSession` is not routed (the ishare GET is `getSharedConversation`)
+but now shapes its rows the same way. This replaces the first ENG-2645 cut (#3722, `redactMessagesForShareViewer`,
+removed), which dropped every system row (incl. the upload rows the ishare chat renders, and shifting its row counts),
+stripped `llm` (the ishare model footer), and still sent `interactiveShareMetadata.token` to read-only viewers.
+
+## ENG-2643: Emoji-safe text cuts in the creative rubric judge and knowledge-base tool results (2026-10-23)
+
+- Moved `cutWithoutSplittingPair` to `backend/src/utils/surrogateSafeCut.ts` (re-exported from `agentRunTrace`), added `truncateToolContent`.
+- `creativeRubricJudge` brief-field clip and landing-page source cut, and all seven knowledge-base/Foreplay 5000-char tool-result cuts, no longer leave a lone surrogate half.
+
+## ENG-2641: refused sends say whether the user message was stored (2026-10-23)
+
+- Every refusal of `/generate`, `/ishare|share/:id/generate` and `/verified-generate` (422 `model_unavailable`, 409 `SESSION_BUSY`, 429 `TOO_MANY_CONCURRENT_RUNS` / usage paused) now carries `userMessageSaved: boolean`.
+- It is `false` everywhere except two refusals raised after the message was written: the Work Plan step-model refusal in `generateSessionResponse` (the message is saved, then `resolveWorkPlanStepModelForTurn` throws) and a `/verified-generate` refusal on a later attempt (attempt 1 saved the starting message).
+- Those errors are marked where they are raised (`markRaisedAfterUserMessageSaved`, a WeakSet keyed by the error) and read where the 422 is answered. A new post-save refusal must be marked the same way, or it would answer `false`.
+- The step-model refusal was not moved before the save: Slack, transports, approval resume and scheduled runs depend on the saved message plus the recorded refusal ("never an unanswered message").
+- `/compare/select` is not covered: its 409 is before the write, and a repeated select is answered as a replay, so it cannot duplicate.
+
+## ENG-1853: Approval Desk Slack reminder for staged Meta-write packets (2026-10-23)
+
+- Staging a Meta-write packet (`stageApprovalInboxMetaWriteManifest`) now posts ONE concise Slack reminder per packet (per ad account) to the assigned reviewer: an @-mention plus the Desk link (`FRONTEND_URL/approval-desk/<manifestId>`), no per-item text or buttons. Best-effort: a Slack failure is only logged and never affects staging.
+- Before this, only the plan_choice tool (`stage_pending_decision`) pinged anyone, so a staged Meta write sat unseen. Reviewers are Matt and Fangfang (Harsha is not a Desk reviewer); meta_write routes to Matt (`getDefaultApproverForGate`), matching the eval queue's type-based routing.
+- Channel: the reminder uses `getApproverReminderChannel` = `getApproverChannel` (`approval_inbox_channel_<approver>` / `approval_inbox_channel_default` / `APPROVAL_INBOX_DEFAULT_SLACK_CHANNEL`) with a last-resort fallback to the eval-queue channel (`human_eval_slack_channel`, env `HUMAN_EVAL_SLACK_CHANNEL`/`EVAL_QUEUE_SLACK_CHANNEL`/`SLACK_EVAL_CHANNEL`). The fallback is deliberately NOT in `getApproverChannel`: that also feeds the interactive queue message (Approve/Reject buttons), resolution/expiry notices and plan_choice staging, which stay dormant in prod until a channel is configured for them. The @-mention uses `human_eval_reviewer_<approver>_slack_user_id`.
+- The reminder is fire-and-forget (never holds up the agent turn), only announces rows created by that very call (a retried iteration that hits an already-staged row does not re-ping), only ever interpolates a numeric ad account id, and is skipped in production when `FRONTEND_URL` is unset (no dead localhost link).
+- env1 has `human_eval_slack_channel` set to the REAL eval-queue channel: set `approval_inbox_channel_matt` to a private target before testing there, or reminders would ping real reviewers.
+
+## ENG-2619: Classify LinkedIn identity-mismatch send refusal as by_design (2026-10-22)
+
+linkedin_identity_mismatch refusals were recorded as bug/config tool failures; BY_DESIGN_RE in toolFailureType.ts now classifies them by_design.
+
 ## ENG-2644: Archive/task-status session routes require owner or admin (2026-10-23)
 
 `DELETE /api/agent-mode/session/:id` and `PUT .../task/:taskId/execution/:executionId/status` now 404 unless the caller owns the session or is an admin; `chatbotDb.archiveSession` is conditional on the row existing so an unknown id no longer upserts a ghost row.
