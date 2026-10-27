@@ -29,6 +29,7 @@ import {
   SMARTLEAD_PUSH_RUNS_TABLE_SPEC,
   SmartleadPushRunDb,
   SmartleadPushRunStoreError,
+  redactSecrets,
   type NewPushRun,
 } from '../smartleadPushRunDb';
 
@@ -388,7 +389,43 @@ suite('SmartleadPushRunDb against DynamoDB Local (ENG-673)', () => {
 
     it('refuses an advance without a cursor instead of rewinding the walk', async () => {
       const a = await fresh();
-      await expect(db.advance(a.runId, 1, { cursor: null as any, counts: { examined: 1 } })).rejects.toMatchObject({ code: 'invalid_input' });
+      await expect(db.advance(a.runId, 1, { cursor: null, counts: { examined: 1 } })).rejects.toMatchObject({ code: 'invalid_input' });
+    });
+
+    it('completes an empty list (no cursor, exhausted) and never erases a stored cursor when exhausting', async () => {
+      const empty = await fresh();
+      expect(await db.advance(empty.runId, 1, { cursor: null, counts: {}, listExhausted: true })).toBe(true);
+      expect(await db.finishRun(empty.runId, 1, 'completed')).toBe(true);
+      const walked = await fresh();
+      await db.advance(walked.runId, 1, { cursor: { listId: walked.listId, leadId: 'L9' }, counts: { examined: 1 } });
+      await db.advance(walked.runId, 1, { cursor: null, counts: {}, listExhausted: true });
+      expect((await db.getRun(walked.runId))!.cursor).toEqual({ listId: walked.listId, leadId: 'L9' });
+    });
+
+    it('redacts the common key spellings, and stays fast on hostile input', () => {
+      const out = redactSecrets('api_key: A1 {"apiKey":"B2"} x-api-key: C3 api_key%3DD4 apikey = E5 Authorization: Basic Zm9v token=F6');
+      expect(out).not.toMatch(/A1|B2|C3|D4|E5|Zm9v|F6/);
+      for (const evil of ['a'.repeat(100_000), 'a'.repeat(50_000) + '@' + 'a'.repeat(50_000), 'a'.repeat(50_000) + '@' + '1.'.repeat(25_000)]) {
+        const t0 = Date.now();
+        redactSecrets(evil);
+        expect(Date.now() - t0).toBeLessThan(200);
+      }
+    });
+
+    it('keeps the lock of a run that was paused (not dead) between its two start writes', async () => {
+      const base = input();
+      const racing = new SmartleadPushRunDb({
+        get: doc.get.bind(doc), query: doc.query.bind(doc), update: doc.update.bind(doc), delete: doc.delete.bind(doc),
+        put: (p: any) => {
+          const out = doc.put(p);
+          if (p.Item?.sk !== 'LOCK') return out;
+          return { promise: async () => { const r = await out.promise();
+            await doc.update({ TableName: table, Key: { pk: p.Item.runId, sk: 'RUN' }, UpdateExpression: 'SET #s = :c', ExpressionAttributeNames: { '#s': 'status' }, ExpressionAttributeValues: { ':c': 'paused' } }).promise(); return r; } };
+        },
+      } as any, table, () => clock, async () => {});
+      await racing.startRun(base, 'w');
+      expect(await db.getLock(base.listId, base.campaignId)).not.toBeNull();
+      expect((await db.startRun(input({ listId: base.listId }), 'w2')).started).toBe(false);
     });
 
     it('does not report a started run that was canceled between its two writes', async () => {

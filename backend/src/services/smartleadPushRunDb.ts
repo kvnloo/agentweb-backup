@@ -200,7 +200,8 @@ export interface NewPushRun {
 
 export interface AdvanceStep {
   /** Where the walk is now: the key of the last lead examined. */
-  cursor: LeadCursor;
+  /** Null only together with `listExhausted` (an empty list); the stored cursor is then left as it is. */
+  cursor: LeadCursor | null;
   listExhausted?: boolean;
   counts: Partial<Record<"examined" | "added" | "alreadyInCampaign" | "unconfirmed" | "withdrawn", number>>;
   /** Skip reasons for this batch, e.g. `{ missing_tag: 3 }`. */
@@ -380,10 +381,12 @@ function storeError(error: any): SmartleadPushRunStoreError {
 
 /** Smartlead puts the API key in the URL (?api_key=), and error text can echo it: nothing free-form is stored unredacted. */
 export function redactSecrets(text: string): string {
+  // Cut first: the patterns below are cheap on bounded input, and callers store at most 500 characters anyway.
   return text
-    .replace(/(api[_-]?key|token|secret|password)=[^&\s"']+/gi, "$1=[redacted]")
-    .replace(/bearer\s+[A-Za-z0-9._~+/-]+=*/gi, "Bearer [redacted]")
-    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[email]");
+    .slice(0, 2000)
+    .replace(/(api[_-]?key|token|secret|password)(%3D|["']?\s{0,3}[:=]\s{0,3}["']?)[^&\s"',}]{1,500}/gi, "$1=[redacted]")
+    .replace(/(bearer|basic)\s{1,5}[A-Za-z0-9._~+/-]{1,500}=*/gi, "$1 [redacted]")
+    .replace(/[A-Z0-9._%+-]{1,64}@[A-Z0-9.-]{1,255}\.[A-Z]{2,24}/gi, "[email]");
 }
 
 const REASON = /^[a-z][a-z0-9_]{0,39}$/;
@@ -548,7 +551,7 @@ export class SmartleadPushRunDb {
     }
     // The resumer may have canceled our Run as an orphan between the two writes: do not hand back a run that is already dead.
     const check = await this.getRun(run.runId);
-    if (!check || check.status !== "running") {
+    if (!check || (TERMINAL_STATUSES as readonly string[]).includes(check.status)) {
       await this.safeRelease(input.listId, input.campaignId, run.runId);
       return { started: false, existing: null };
     }
@@ -633,9 +636,18 @@ export class SmartleadPushRunDb {
   async advance(runId: string, epoch: number, step: AdvanceStep): Promise<boolean> {
     // DynamoDB rejects a request that declares a name or value the expression does not use, so each is added only when it is used.
     const names: Record<string, string> = { "#s": "status", "#cur": "cursor", "#ba": "batchAttempts" };
-    if (!step.cursor?.listId || !step.cursor?.leadId) throw new SmartleadPushRunStoreError("invalid_input", "advance needs a cursor: a null cursor would rewind the walk");
-    const values: Record<string, any> = { ":e": epoch, ":running": "running", ":until": this.nowMs() + LEASE_MS, ":zero": 0, ":cursor": step.cursor };
-    const sets = ["#cur = :cursor", "#ba = :zero", "leaseUntil = :until"];
+    // A cursor is required to move the walk. Without one the stored cursor is left alone (never rewound), which is only meaningful when
+    // the walk ended: an empty list has no lead to point at but must still be markable as exhausted.
+    const hasCursor = !!(step.cursor?.listId && step.cursor?.leadId);
+    if (!hasCursor && !step.listExhausted) throw new SmartleadPushRunStoreError("invalid_input", "advance needs a cursor, unless it marks the list exhausted");
+    const values: Record<string, any> = { ":e": epoch, ":running": "running", ":until": this.nowMs() + LEASE_MS, ":zero": 0 };
+    const sets = ["#ba = :zero", "leaseUntil = :until"];
+    if (hasCursor) {
+      values[":cursor"] = step.cursor;
+      sets.push("#cur = :cursor");
+    } else {
+      delete names["#cur"];
+    }
     let i = 0;
     for (const [name, delta] of Object.entries(step.counts)) {
       if (!delta) continue;
