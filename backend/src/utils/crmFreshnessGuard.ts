@@ -55,6 +55,10 @@ export interface CrmFreshnessResult {
   /** CRM tools that ran AND succeeded this turn, distinct. */
   crmToolsSucceeded: string[];
   tagsSeen: number;
+  /** Inventory-total claims found in the reply (before any backing check). */
+  claimsSeen: number;
+  /** Claims were found but the total check abstained (a CRM write ran, or earlier evidence is missing). */
+  totalsAbstained: boolean;
 }
 
 // Every quantifier below is BOUNDED and the input is capped: an unbounded `[^\]]*` rescans to the end of the
@@ -613,7 +617,7 @@ export function detectCrmFreshnessMismatch(
   /** CRM numbers earlier turns of the session returned (see crmNumbersFromSessionHistory); used only to mark `echoesEarlier`. */
   sessionNumbers?: ReadonlySet<number>,
 ): CrmFreshnessResult {
-  const empty: CrmFreshnessResult = { findings: [], crmToolsSucceeded: [], tagsSeen: 0 };
+  const empty: CrmFreshnessResult = { findings: [], crmToolsSucceeded: [], tagsSeen: 0, claimsSeen: 0, totalsAbstained: false };
   if (typeof finalText !== 'string' || !finalText) return empty;
   const earlier = normalizeEarlier(earlierInput);
 
@@ -643,10 +647,12 @@ export function detectCrmFreshnessMismatch(
   }
 
   const claims = findInventoryClaims(text);
+  let totalsAbstained = false;
   if (claims.length > 0) {
     // null = a CRM tool ran but its numbers are unavailable: abstain rather than guess. For a continued task that means an
     // earlier invocation has no persisted evidence (saved before it existed, truncated, or a CRM write changed the totals).
     const current = !earlier.complete ? null : allowedNumbers(calls, succeeded, evidence);
+    totalsAbstained = current === null;
     if (current) {
       const allowed = earlier.numbers.size > 0 ? new Set<number>([...current, ...earlier.numbers]) : current;
       const seen = new Set<number>();
@@ -662,7 +668,7 @@ export function detectCrmFreshnessMismatch(
       }
     }
   }
-  return { findings, crmToolsSucceeded: [...succeeded].sort(), tagsSeen };
+  return { findings, crmToolsSucceeded: [...succeeded].sort(), tagsSeen, claimsSeen: claims.length, totalsAbstained };
 }
 
 export interface CrmFreshnessShadowInput {
@@ -675,7 +681,28 @@ export interface CrmFreshnessShadowInput {
   sessionNumbers?: ReadonlySet<number>;
   sessionId?: string;
   model?: string;
+  /** Messages in the session history at the start of this turn (a size, never content). */
+  sessionMessages?: number;
   log?: (message: string, detail: Record<string, unknown>) => void;
+  /** Sink for the per-reply "checked" line (the denominator for the flag rate); defaults to console.log. */
+  logChecked?: (message: string, detail: Record<string, unknown>) => void;
+}
+
+const SMALL_RANGE_MAX = 20;
+
+function validMessageCount(n: unknown): number | undefined {
+  return typeof n === 'number' && Number.isInteger(n) && n >= 0 ? n : undefined;
+}
+
+/**
+ * Share of the integers 0..20 that the session's number set contains. `echoesEarlier` says "this claimed number is in the set";
+ * when most small integers are in it, that is expected by chance and says nothing about staleness. Numbers in, one number out.
+ */
+function smallNumberDensity(numbers: ReadonlySet<number> | undefined): number {
+  if (!numbers || numbers.size === 0) return 0;
+  let hit = 0;
+  for (let n = 0; n <= SMALL_RANGE_MAX; n++) if (numbers.has(n)) hit++;
+  return Math.round((hit / (SMALL_RANGE_MAX + 1)) * 100) / 100;
 }
 
 /**
@@ -686,26 +713,63 @@ export function runCrmFreshnessShadow(input: CrmFreshnessShadowInput): CrmFreshn
   try {
     if (process.env.AGENT_CRM_FRESHNESS_GUARD === 'off') return [];
     const result = detectCrmFreshnessMismatch(input.finalText, input.toolCalls, input.evidence, input.earlier, input.sessionNumbers);
-    if (result.findings.length === 0) return [];
-    // One line of JSON, so a plain grep / log search / the summarizer script can read it (console.warn(obj)
-    // spreads a multi-line dump that log shippers split apart).
-    const log = input.log ?? ((message, detail) => console.warn(`${message} ${JSON.stringify(detail)}`));
-    log('[crm-freshness-shadow] CRM freshness mismatch (message NOT modified)', {
-      sessionId: input.sessionId,
-      model: input.model,
-      kinds: [...new Set(result.findings.map((f) => f.kind))],
-      findingCount: result.findings.length,
-      tagsSeen: result.tagsSeen,
-      crmToolsSucceeded: result.crmToolsSucceeded,
-      continuation: normalizeEarlier(input.earlier).tools.length > 0,
-      // Numbers and tool names only - never reply text (replies carry names, emails, deal values).
-      claimed: [...new Set(result.findings.map((f) => f.claimed).filter((n): n is number => typeof n === 'number'))].slice(0, 10),
-      cited: [...new Set(result.findings.flatMap((f) => f.cited))].slice(0, 10),
-      drift: result.findings.filter((f) => f.drift).length,
-      echoesEarlier: result.findings.filter((f) => f.echoesEarlier).length,
-    });
-    return result.findings;
+    let findings: CrmFreshnessFinding[] = [];
+    if (result.findings.length > 0) {
+      // One line of JSON, so a plain grep / log search / the summarizer script can read it (console.warn(obj)
+      // spreads a multi-line dump that log shippers split apart).
+      const log = input.log ?? ((message, detail) => console.warn(`${message} ${JSON.stringify(detail)}`));
+      try {
+        log('[crm-freshness-shadow] CRM freshness mismatch (message NOT modified)', {
+          sessionId: input.sessionId,
+          model: input.model,
+          kinds: [...new Set(result.findings.map((f) => f.kind))],
+          findingCount: result.findings.length,
+          tagsSeen: result.tagsSeen,
+          crmToolsSucceeded: result.crmToolsSucceeded,
+          continuation: normalizeEarlier(input.earlier).tools.length > 0,
+          // Numbers and tool names only - never reply text (replies carry names, emails, deal values).
+          claimed: [...new Set(result.findings.map((f) => f.claimed).filter((n): n is number => typeof n === 'number'))].slice(0, 10),
+          cited: [...new Set(result.findings.flatMap((f) => f.cited))].slice(0, 10),
+          drift: result.findings.filter((f) => f.drift).length,
+          echoesEarlier: result.findings.filter((f) => f.echoesEarlier).length,
+          // ENG-2382: how crowded the session's number set was, so an `echoesEarlier` hit can be told from a coincidence.
+          sessionNumberCount: input.sessionNumbers?.size ?? 0,
+          sessionDensity20: smallNumberDensity(input.sessionNumbers),
+          sessionMessages: validMessageCount(input.sessionMessages),
+        });
+      } catch { /* a failing sink must not lose the denominator line below, nor reach the reply */ }
+      findings = result.findings;
+    }
+    writeCheckedLine(input, result);
+    return findings;
   } catch {
     return [];
   }
+}
+
+/**
+ * ENG-2382: one line per reply the detector had something to look at (a CRM tool succeeded, a `[verified: ...]` tag, or an inventory
+ * total claim), flagged or not. The shadow line alone records only the flagged replies, so a flag rate had no denominator.
+ * "Looked at" is the detector's own scope, not proof the reply is about the CRM: the bare "N lists" pattern needs no CRM context,
+ * so "5 lists of ideas" counts as a claim. The flagged line has the same property, so rate and numerator stay consistent.
+ * Counts and a model name only: no reply text and no session id. Replies with nothing CRM-related write nothing.
+ */
+function writeCheckedLine(input: CrmFreshnessShadowInput, result: CrmFreshnessResult): void {
+  try {
+    if (result.claimsSeen === 0 && result.tagsSeen === 0 && result.crmToolsSucceeded.length === 0) return;
+    const sink = input.logChecked ?? ((message, detail) => console.log(`${message} ${JSON.stringify(detail)}`));
+    sink('[crm-freshness-checked] CRM reply checked', {
+      model: input.model,
+      flagged: result.findings.length > 0,
+      findingCount: result.findings.length,
+      tagsSeen: result.tagsSeen,
+      claimsSeen: result.claimsSeen,
+      crmToolsSucceeded: result.crmToolsSucceeded.length,
+      totalsAbstained: result.totalsAbstained,
+      // Same three numbers as the flagged line, so the flag rate can be split by session size and number-set crowding.
+      sessionNumberCount: input.sessionNumbers?.size ?? 0,
+      sessionDensity20: smallNumberDensity(input.sessionNumbers),
+      sessionMessages: validMessageCount(input.sessionMessages),
+    });
+  } catch { /* log-only: never reaches the reply */ }
 }
