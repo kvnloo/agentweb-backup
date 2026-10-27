@@ -22,7 +22,7 @@ import { MAX_ACTIVE_CONNECTIONS_PER_OWNER, toView, type Actor, type LlmConnectio
 import type { LoginReady } from "../../loginHost/connectionManager";
 import { LoginHostClient, LoginHostError, UnixSocketTransport } from "./loginHostClient";
 import { getLoginHostProvider } from "./loginHostProvider";
-import { openSignInToken, sealSignInToken } from "./hostedSignInToken";
+import { openSignInToken, sealSignInToken, signInKey } from "./hostedSignInToken";
 
 export type HostedErrorCode =
   | "disabled" | "forbidden" | "not_found" | "unsupported_provider" | "login_not_found" | "too_many_logins" | "bad_code_format"
@@ -182,9 +182,10 @@ export class HostedSubscriptionService {
       const expiresAtMs = Math.min(started.expiresAtMs, this.deps.now() + LOGIN_TTL_MS);
       // Sealed so that ANY backend instance can finish this sign-in (a deploy replaces the instance that started it).
       const loginId = sealSignInToken({ userId: actor.userId, provider: p.route, connectionId, loginRef: started.loginRef, reconnect: !!input.reconnectConnectionId, expiresAtMs });
-      const timer = setTimeout(() => void this.expire(loginId), Math.max(1_000, expiresAtMs - this.deps.now()));
+      const key = signInKey(connectionId, started.loginRef);
+      const timer = setTimeout(() => void this.expire(key), Math.max(1_000, expiresAtMs - this.deps.now()));
       timer.unref?.();
-      this.pending.set(loginId, { userId: actor.userId, provider: p, connectionId, loginRef: started.loginRef, reconnect: !!input.reconnectConnectionId, timer, expiresAtMs });
+      this.pending.set(key, { userId: actor.userId, provider: p, connectionId, loginRef: started.loginRef, reconnect: !!input.reconnectConnectionId, timer, expiresAtMs });
       return { loginId, authorizeUrl: started.url, ceremony: started.ceremony, ...(started.userCode ? { userCode: started.userCode } : {}), expiresAt: new Date(expiresAtMs).toISOString() };
     } finally {
       this.starting.delete(actor.userId);
@@ -203,43 +204,45 @@ export class HostedSubscriptionService {
 
   async completeLogin(actor: Actor, loginId: string, code: unknown): Promise<LlmConnectionView> {
     if (actor.adminId) throw new HostedSubscriptionError("forbidden");
-    const pending = this.lookup(loginId);
+    const found = this.lookup(loginId);
     // Same answer for unknown, expired and someone else's: a wrong caller never cancels the real login.
-    if (!pending || pending.userId !== actor.userId) throw new HostedSubscriptionError("login_not_found");
-    // Taken BEFORE any await: a double-submitted complete must not send the single-use code to the host twice.
-    if (this.completing.has(loginId)) throw new HostedSubscriptionError("login_not_found");
-    this.completing.add(loginId);
-    this.pending.delete(loginId);
+    if (!found || found.pending.userId !== actor.userId) throw new HostedSubscriptionError("login_not_found");
+    const { key, pending } = found;
+    // Taken BEFORE any await: a double-submitted complete must not send the single-use code to the host twice. Keyed by the attempt, not by the
+    // string the client sent, so no spelling of the token gets past it.
+    if (this.completing.has(key)) throw new HostedSubscriptionError("login_not_found");
+    this.completing.add(key);
+    this.pending.delete(key);
     clearTimeout(pending.timer);
     try {
-      return await this.completeTaken(actor, loginId, pending, code);
+      return await this.completeTaken(actor, key, pending, code);
     } finally {
-      this.completing.delete(loginId);
+      this.completing.delete(key);
     }
   }
 
   /** This instance's pending sign-in, or (started by another instance or before a deploy) the one the token describes. */
-  private lookup(loginId: unknown): Pending | undefined {
-    if (typeof loginId !== "string") return undefined;
-    const local = this.pending.get(loginId);
-    if (local) return local;
+  private lookup(loginId: unknown): { key: string; pending: Pending } | undefined {
     const t = openSignInToken(loginId, this.deps.now());
     const provider = t && Object.prototype.hasOwnProperty.call(this.providers, t.provider) ? this.providers[t.provider] : undefined;
     if (!t || !provider) return undefined;
-    return { userId: t.userId, provider, connectionId: t.connectionId, loginRef: t.loginRef, reconnect: t.reconnect, expiresAtMs: t.expiresAtMs };
+    const key = signInKey(t.connectionId, t.loginRef);
+    const local = this.pending.get(key);
+    if (local) return { key, pending: local };
+    return { key, pending: { userId: t.userId, provider, connectionId: t.connectionId, loginRef: t.loginRef, reconnect: t.reconnect, expiresAtMs: t.expiresAtMs } };
   }
 
-  private async completeTaken(actor: Actor, loginId: string, pending: Pending, code: unknown): Promise<LlmConnectionView> {
+  private async completeTaken(actor: Actor, key: string, pending: Pending, code: unknown): Promise<LlmConnectionView> {
     const { connectionId, loginRef, provider: p } = pending;
     if (!(await p.isEnabledFor(actor.userId))) {
-      this.restore(loginId, pending);
+      this.restore(key, pending);
       throw new HostedSubscriptionError("disabled");
     }
     let client: LoginHostClient;
     try {
       client = this.host();
     } catch (err) {
-      this.restore(loginId, pending);
+      this.restore(key, pending);
       throw err;
     }
 
@@ -249,7 +252,7 @@ export class HostedSubscriptionService {
     } catch (err) {
       if (err instanceof ZodError) {
         // Malformed code: nothing reached the host, so the sign-in is still pending and can be completed with a corrected code.
-        this.restore(loginId, pending);
+        this.restore(key, pending);
         throw new HostedSubscriptionError("bad_code_format");
       }
       ready = await this.afterCompleteError(client, err, connectionId, loginRef);
@@ -259,9 +262,9 @@ export class HostedSubscriptionService {
     return this.finishNew(actor, p, client, connectionId, loginRef, ready);
   }
 
-  private restore(loginId: string, pending: Pending): void {
-    this.pending.set(loginId, pending);
-    pending.timer = setTimeout(() => void this.expire(loginId), Math.max(1_000, pending.expiresAtMs - this.deps.now()));
+  private restore(key: string, pending: Pending): void {
+    this.pending.set(key, pending);
+    pending.timer = setTimeout(() => void this.expire(key), Math.max(1_000, pending.expiresAtMs - this.deps.now()));
     pending.timer.unref?.();
   }
 
@@ -380,20 +383,22 @@ export class HostedSubscriptionService {
   }
 
   async cancelLogin(actor: Actor, loginId: string): Promise<void> {
-    const pending = this.lookup(loginId);
-    if (!pending || pending.userId !== actor.userId) return; // nothing to say about someone else's
-    this.pending.set(loginId, pending);
-    await this.expire(loginId);
+    const found = this.lookup(loginId);
+    if (!found || found.pending.userId !== actor.userId) return; // nothing to say about someone else's
+    // A complete in flight owns the attempt: cancelling it now would discard the host's ready login after the code was spent.
+    if (this.completing.has(found.key)) return;
+    this.pending.set(found.key, found.pending);
+    await this.expire(found.key);
   }
 
   private async cancelFor(userId: string): Promise<void> {
     for (const [id, pend] of [...this.pending]) if (pend.userId === userId) await this.expire(id);
   }
 
-  private async expire(loginId: string): Promise<void> {
-    const pend = this.pending.get(loginId);
+  private async expire(key: string): Promise<void> {
+    const pend = this.pending.get(key);
     if (!pend) return;
-    this.pending.delete(loginId);
+    this.pending.delete(key);
     clearTimeout(pend.timer);
     // Best effort: the host expires an abandoned attempt itself.
     await this.deps.client()?.loginCancel({ connectionId: pend.connectionId, loginRef: pend.loginRef }).catch(() => undefined);

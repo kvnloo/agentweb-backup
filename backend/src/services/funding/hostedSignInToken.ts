@@ -34,6 +34,11 @@ function key(secret: string): Buffer {
   return Buffer.from(hkdfSync("sha256", Buffer.from(secret, "utf8"), Buffer.alloc(0), AAD, 32));
 }
 
+/** What identifies an attempt, whatever spelling of its token the client sends. */
+export function signInKey(connectionId: string, loginRef: string): string {
+  return `${connectionId}\u0000${loginRef}`;
+}
+
 export function sealSignInToken(p: SignInTokenPayload, secret: string = getJwtSecret()): string {
   const iv = randomBytes(IV_BYTES);
   const cipher = createCipheriv("aes-256-gcm", key(secret), iv);
@@ -47,6 +52,8 @@ export function openSignInToken(token: unknown, nowMs: number, secret?: string):
   try {
     if (typeof token !== "string" || token.length === 0 || token.length > MAX_SIGNIN_TOKEN_CHARS || !/^[A-Za-z0-9_-]+$/.test(token)) return undefined;
     const raw = Buffer.from(token, "base64url");
+    // base64url decoding is lenient (several spellings decode to the same bytes): accept only the one spelling we issue.
+    if (raw.toString("base64url") !== token) return undefined;
     if (raw.length <= IV_BYTES + TAG_BYTES) return undefined;
     const decipher = createDecipheriv("aes-256-gcm", key(secret ?? getJwtSecret()), raw.subarray(0, IV_BYTES));
     decipher.setAAD(AAD);

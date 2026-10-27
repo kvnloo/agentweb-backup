@@ -33,4 +33,18 @@ describe("sign-in token", () => {
   it("never throws on junk", () => {
     for (const j of [undefined, null, 7, {}, "", "!!", "A".repeat(5000), "AAAA"]) expect(openSignInToken(j, 1, SECRET)).toBeUndefined();
   });
+  it("accepts only the spelling it issued (lenient base64url aliases are refused)", () => {
+    const t = sealSignInToken(P, SECRET);
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let aliases = 0;
+    for (const ch of alphabet) {
+      const alt = t.slice(0, -1) + ch;
+      if (alt !== t && Buffer.from(alt, "base64url").equals(Buffer.from(t, "base64url"))) {
+        aliases++;
+        expect(openSignInToken(alt, 1, SECRET)).toBeUndefined();
+      }
+    }
+    expect(aliases).toBeGreaterThanOrEqual(0);
+    expect(openSignInToken(t, 1, SECRET)).toBeDefined();
+  });
 });

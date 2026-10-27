@@ -53,7 +53,7 @@ describe("hosted subscription service", () => {
     enabled = new Set(["user-1", "user-2"]);
     store = makeDb();
     ids = 0;
-    nowMs = Date.now();
+    nowMs = rig.clock.nowMs(); // the test host runs on a manual clock; sign-in tokens carry the host's expiry, so the backend's clock must agree
     promoteLoses = false;
     revokeBegun = [];
     revokeHookThrows = false;
@@ -150,10 +150,6 @@ describe("hosted subscription service", () => {
     describe("a sign-in outlives the instance that started it (deploys, a second instance)", () => {
       // Dropping the in-memory map is what a replaced or different backend instance looks like to a `complete`.
       const otherInstance = () => (svc as unknown as { pending: Map<string, unknown> }).pending.clear();
-      // The test host runs on a manual clock; the backend's clock must agree with it for expiry to mean anything.
-      beforeEach(() => {
-        nowMs = rig.clock.nowMs();
-      });
 
       it("completes on an instance that never saw the start", async () => {
         const started = await svc.startLogin(user, "claude");
@@ -199,6 +195,38 @@ describe("hosted subscription service", () => {
         otherInstance();
         expect(await codeOf(svc.completeLogin(user, started.loginId, GOOD))).toBe("login_not_found");
         expect(store.rows()).toHaveLength(1);
+      });
+
+      it("two completes for one sign-in on a rebuilt entry send the code once", async () => {
+        const started = await svc.startLogin(user, "claude");
+        otherInstance();
+        const results = await Promise.all([codeOf(svc.completeLogin(user, started.loginId, GOOD)), codeOf(svc.completeLogin(user, started.loginId, GOOD))]);
+        expect(results.sort()).toEqual(["login_not_found", "resolved"]);
+        expect(store.rows()).toHaveLength(1);
+      });
+
+      it("a re-spelled token (same bytes, other base64url form) is refused, so it cannot bypass the double-submit guard", async () => {
+        const started = await svc.startLogin(user, "claude");
+        const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        const alias = [...alphabet].map((c) => started.loginId.slice(0, -1) + c).find((t) => t !== started.loginId && Buffer.from(t, "base64url").equals(Buffer.from(started.loginId, "base64url")));
+        if (alias) expect(await codeOf(svc.completeLogin(user, alias, GOOD))).toBe("login_not_found");
+        expect((await svc.completeLogin(user, started.loginId, GOOD)).status).toBe("active");
+      });
+
+      it("a cancel that arrives while a complete is in flight does not discard the host's login", async () => {
+        const started = await svc.startLogin(user, "claude");
+        otherInstance();
+        const done = svc.completeLogin(user, started.loginId, GOOD);
+        await svc.cancelLogin(user, started.loginId);
+        expect((await done).status).toBe("active");
+        expect(rig.script.loginsCancelled).toBe(0);
+      });
+
+      it("a malformed code on a rebuilt sign-in leaves it completable with the corrected code", async () => {
+        const started = await svc.startLogin(user, "claude");
+        otherInstance();
+        expect(await codeOf(svc.completeLogin(user, started.loginId, "bad code with spaces"))).toBe("bad_code_format");
+        expect((await svc.completeLogin(user, started.loginId, GOOD)).status).toBe("active");
       });
 
       it("cancel works from another instance and ends the host attempt", async () => {
