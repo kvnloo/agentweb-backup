@@ -78,8 +78,49 @@ describe("selectSmartleadLeads (ENG-673)", () => {
     expect(two.counts.duplicate_in_run).toBe(1);
   });
 
-  it("skips tag requirements the user confirmed Smartlead supplies", () => {
-    expect(selectSmartleadLeads([lead("a")], ctx({ tags: ["sender_name"], acknowledgedTags: ["sender_name"] })).eligible).toHaveLength(1);
+  it("needs no lead value for a tag that is neither standard nor mapped (decided once for the run by the preflight)", () => {
+    expect(selectSmartleadLeads([lead("a")], ctx({ tags: ["sender_name"] })).eligible).toHaveLength(1);
+  });
+
+  it("reads createdAt as a time, not text: other formats, offsets, numbers and Dates compare correctly", () => {
+    const started = "2026-06-01T00:00:00Z";
+    const check = (createdAt: unknown) => selectSmartleadLeads([lead("a", { createdAt })], ctx({ runStartedAt: started })).skipped[0]?.reason;
+    expect(check("2026-06-01T00:00:00.000Z")).toBeUndefined(); // the same instant, written differently
+    expect(check("2026-06-01T05:30:00+05:30")).toBeUndefined(); // 00:00:00Z
+    expect(check("2026-06-01T05:29:59+05:30")).toBeUndefined(); // one second before
+    expect(check("2026-06-01T05:30:01+05:30")).toBe("created_after_start"); // one second after
+  });
+
+  it("skips a lead created after the run started, whatever the type of its createdAt", () => {
+    const started = "2026-06-01T00:00:00Z";
+    const later = Date.parse("2026-06-02T00:00:00Z");
+    for (const createdAt of ["2026-06-02T00:00:00.000Z", "2026-06-02T05:30:00+05:30", later, new Date(later)]) {
+      expect(selectSmartleadLeads([lead("a", { createdAt })], ctx({ runStartedAt: started })).skipped[0]?.reason).toBe("created_after_start");
+    }
+    expect(selectSmartleadLeads([lead("a", { createdAt: Date.parse("2026-05-01T00:00:00Z") })], ctx({ runStartedAt: started })).eligible).toHaveLength(1);
+  });
+
+  it("allows a lead with no createdAt (an old lead), but fails closed on one whose createdAt cannot be read", () => {
+    const base = ctx({ runStartedAt: "2026-06-01T00:00:00Z" });
+    expect(selectSmartleadLeads([lead("a", { createdAt: undefined })], base).eligible).toHaveLength(1);
+    for (const createdAt of ["not a date", {}, NaN]) {
+      expect(selectSmartleadLeads([lead("a", { createdAt })], base).skipped[0]?.reason).toBe("unknown_creation_time");
+    }
+  });
+
+  it("an opted-out address stops every record with that address, before or after it in the batch and in later batches", () => {
+    const optedOut = lead("a", { email: "same@example.com", contactStatus: "do-not-contact" });
+    const before = lead("b", { email: "SAME@example.com" });
+    const r = selectSmartleadLeads([before, optedOut], ctx());
+    expect(r.eligible).toHaveLength(0);
+    expect(r.counts.do_not_contact).toBe(2);
+    const suppressed = new Set<string>();
+    selectSmartleadLeads([optedOut], ctx({ suppressedEmails: suppressed }));
+    expect(selectSmartleadLeads([lead("c", { email: "same@example.com" })], ctx({ suppressedEmails: suppressed })).skipped[0].reason).toBe("do_not_contact");
+  });
+
+  it("reports markup and over-long values with their own reason", () => {
+    expect(selectSmartleadLeads([lead("a", { company: "<b>x</b>" })], ctx()).skipped[0]).toMatchObject({ reason: "unsafe_text", tag: "company_name" });
   });
 });
 
@@ -87,9 +128,15 @@ describe("campaignStatusDecision and preflightSequence", () => {
   const real = analyseSequence(realSequencesWithVariants);
 
   it("allows DRAFTED and PAUSED, asks for confirmation on ACTIVE, refuses the rest and anything unknown", () => {
-    expect(["DRAFTED", "drafted", "PAUSED"].map(campaignStatusDecision)).toEqual(["allowed", "allowed", "allowed"]);
+    expect(["DRAFTED", "drafted", " paused "].map(campaignStatusDecision)).toEqual(["allowed", "allowed", "allowed"]);
     expect(campaignStatusDecision("ACTIVE")).toBe("needs_confirmation");
-    for (const s of ["STOPPED", "ARCHIVED", "COMPLETED", "DRAFT", "", "WAT"]) expect(campaignStatusDecision(s)).toBe("refused");
+    for (const s of ["STOPPED", "ARCHIVED", "COMPLETED", "DRAFT", "", "WAT", undefined, null, 5, {}]) expect(campaignStatusDecision(s)).toBe("refused");
+  });
+
+  it("does not throw on a missing status and applies the stricter (ACTIVE) rules to it", () => {
+    const empty = analyseSequence([]);
+    expect(() => preflightSequence(empty, { status: undefined, mapping: {} })).not.toThrow();
+    expect(preflightSequence(empty, { status: undefined, mapping: {} }).blocks[0].code).toBe("empty");
   });
 
   it("passes a real A/B-variant sequence that uses only standard tags", () => {

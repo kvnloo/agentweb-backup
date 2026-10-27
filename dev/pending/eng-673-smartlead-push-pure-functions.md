@@ -9,3 +9,12 @@ The first building blocks of pushing a CRM list into a customer's own Smartlead 
 - `smartleadMarkers.ts`: the per-lead record of a push (`system.smartlead_<campaignId>`, a flat key because `setLeadFields` sets whole top-level `system` keys) and `isPushedToSmartlead(lead)` for the later check in AgentWeb's own senders. Deliberately separate from `isDoNotContact`.
 - `smartleadEstimate.ts`: days to send for the preview (leads over the mailboxes' limits, capped by the campaign's daily maximum).
 - Tests use shapes recorded from a live Smartlead account; breaking the code on purpose (six ways) makes tests fail.
+
+Review fixes (independent review, same day):
+- The sequence reader's tag pattern backtracked badly on a stray `{{` followed by whitespace (measured 23 seconds at 6,000 spaces, which would freeze the shared backend on a customer's template). It is now linear; a text longer than 200,000 characters counts as unreadable; a regression test covers it.
+- Values containing `<` or `>` are refused (Smartlead puts values into the customer's HTML email, so a scraped company name could become a link), zero-width and bidirectional-override characters are removed, values over 500 characters are refused, `NaN`, `Infinity` and booleans count as empty.
+- `company_url` is a standard tag (read from the CRM website). Acknowledging a standard or mapped tag no longer switches off the missing-value guard.
+- `createdAt` is compared as a time (strings, numbers and Dates; a lead with none is allowed, one that cannot be read is skipped).
+- An opted-out address stops every record with that address in the batch and in later batches of the run.
+- A missing or odd campaign status is refused instead of throwing; a non-string mapping value or a `__proto__` path reads as blank; the hash now includes follow-up delays; `[null]` is an unreadable sequence.
+

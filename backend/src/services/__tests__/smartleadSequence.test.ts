@@ -44,6 +44,25 @@ describe("analyseSequence (ENG-673)", () => {
     expect(a.tags).toEqual(["first_name", "company_name"]);
   });
 
+  it("does not freeze on a stray {{ followed by a lot of whitespace (the old pattern took 23 s at 6,000 spaces)", () => {
+    for (const body of ["{{" + " ".repeat(100_000) + "x", "{{ \n".repeat(20_000), ("{{ " + " ".repeat(100)).repeat(1500)]) {
+      const started = Date.now();
+      const a = analyseSequence([{ seq_number: 1, subject: "s", email_body: body, sequence_variants: [] }]);
+      expect(Date.now() - started).toBeLessThan(1000);
+      expect(a.readable).toBe(true);
+      expect(a.tags).toEqual([]);
+    }
+  });
+
+  it("treats a text longer than any real email as unreadable instead of scanning it", () => {
+    expect(analyseSequence([{ seq_number: 1, subject: "s", email_body: "x".repeat(200_001), sequence_variants: [] }])).toMatchObject({ readable: false, tags: [] });
+  });
+
+  it("treats a list with no step objects as unreadable, but an empty list as readable", () => {
+    for (const reply of [[null], [5], ["x"]]) expect(analyseSequence(reply).readable).toBe(false);
+    expect(analyseSequence([]).readable).toBe(true);
+  });
+
   it("detects single-brace spintax but not a merge tag", () => {
     expect(analyseSequence([{ seq_number: 1, subject: "{Hi|Hello} {{first_name}}", email_body: "x", sequence_variants: [] }]).usesSpintax).toBe(true);
     expect(analyseSequence([{ seq_number: 1, subject: "Hi {{first_name}}", email_body: "x", sequence_variants: [] }]).usesSpintax).toBe(false);
@@ -63,6 +82,11 @@ describe("analyseSequence (ENG-673)", () => {
       expect(analyseSequence(edited).hash).not.toBe(base);
       const added = clone(realSequencesWithVariants); added[0].sequence_variants.push({ variant_label: "C", subject: "s", email_body: "b", is_deleted: false });
       expect(analyseSequence(added).hash).not.toBe(base);
+    });
+
+    it("changes when a follow-up delay changes", () => {
+      const slower = clone(realSequencesWithVariants); slower[1].seq_delay_details.delayInDays = 9;
+      expect(analyseSequence(slower).hash).not.toBe(base);
     });
 
     it("does not change when only a deleted variant changes", () => {

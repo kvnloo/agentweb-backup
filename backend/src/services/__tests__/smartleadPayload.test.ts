@@ -8,15 +8,23 @@ const lead = (over: Record<string, any> = {}) => ({
 describe("sanitizeValue (ENG-673)", () => {
   it("sends plain text: newlines and control characters become spaces, nothing is HTML-escaped", () => {
     expect(sanitizeValue("Line1\nLine2\t  x")).toEqual({ ok: true, value: "Line1 Line2 x" });
-    expect(sanitizeValue("don't & Q&A <b>")).toEqual({ ok: true, value: "don't & Q&A <b>" });
+    expect(sanitizeValue("don't & Q&A")).toEqual({ ok: true, value: "don't & Q&A" });
+  });
+  it("refuses angle brackets, so a scraped value cannot become a link or tag in the customer's HTML email", () => {
+    for (const v of ["<a href=\"https://evil.example\">x</a>", "A<B Inc", "x > y", "<img src=x>"]) expect(sanitizeValue(v)).toEqual({ ok: false, reason: "unsafe_text" });
+  });
+  it("removes zero-width and bidirectional-override characters and unicode line separators", () => {
+    expect(sanitizeValue("Ann\u202e\u200bLee\u2028x\ufeff")).toEqual({ ok: true, value: "AnnLee x" });
+  });
+  it("refuses a value longer than the cap rather than truncating it", () => {
+    expect(sanitizeValue("x".repeat(500))).toMatchObject({ ok: true });
+    expect(sanitizeValue("x".repeat(501))).toEqual({ ok: false, reason: "unsafe_text" });
   });
   it("refuses template syntax and spintax so a literal tag never reaches a recipient", () => {
     for (const v of ["Hi {{first_name}}", "a }} b", "{a|b}", "x {one|two} y"]) expect(sanitizeValue(v)).toEqual({ ok: false, reason: "template_syntax" });
   });
-  it("treats null, objects and arrays as empty, and keeps numbers and booleans as text", () => {
-    expect(sanitizeValue(null)).toEqual({ ok: true, value: "" });
-    expect(sanitizeValue({ a: 1 })).toEqual({ ok: true, value: "" });
-    expect(sanitizeValue(["a"])).toEqual({ ok: true, value: "" });
+  it("treats null, objects, arrays, booleans, NaN and Infinity as empty, and keeps finite numbers as text", () => {
+    for (const v of [null, undefined, { a: 1 }, ["a"], false, true, NaN, Infinity]) expect(sanitizeValue(v)).toEqual({ ok: true, value: "" });
     expect(sanitizeValue(42)).toEqual({ ok: true, value: "42" });
   });
 });
@@ -73,8 +81,36 @@ describe("buildLeadPayload", () => {
     expect(r.ok && r.input.first_name).toBeUndefined();
   });
 
-  it("needs no value for a tag the user confirmed Smartlead supplies", () => {
-    expect(buildLeadPayload(lead(), { tagsUsed: ["sender_name"], mapping: {}, acknowledgedTags: ["sender_name"] }).ok).toBe(true);
+  it("needs no value from the lead for a tag that is neither standard nor mapped (unknown, or one Smartlead supplies)", () => {
+    expect(buildLeadPayload(lead(), { tagsUsed: ["sender_name"], mapping: {} }).ok).toBe(true);
+  });
+
+  it("still needs a value for a STANDARD or MAPPED tag even if the user acknowledged it (acknowledging never switches the guard off)", () => {
+    // the acknowledgement lives in classifyTags / the preflight; the payload guard has no acknowledgement input at all
+    expect(buildLeadPayload(lead({ firstName: "" }), { tagsUsed: ["first_name"], mapping: {} })).toEqual({ ok: false, reason: "missing_tag", tag: "first_name" });
+    expect(classifyTags(["first_name", "industry"], { industry: "customFields.industry" }, ["first_name", "industry"])).toMatchObject({ standard: ["first_name"], mapped: ["industry"], unknown: [] });
+  });
+
+  it("sends company_url from the CRM website, and a standard tag {{company_url}} is supplied", () => {
+    const r = buildLeadPayload(lead(), { tagsUsed: ["company_url"], mapping: {} });
+    expect(r).toMatchObject({ ok: true, input: { company_url: "acme.example", website: "acme.example" } });
+    expect(classifyTags(["company_url"], {}).standard).toEqual(["company_url"]);
+  });
+
+  it("refuses markup and over-long values in a used tag, with the reason", () => {
+    expect(buildLeadPayload(lead({ company: "<a href=x>Acme</a>" }), { tagsUsed: ["company_name"], mapping: {} })).toEqual({ ok: false, reason: "unsafe_text", tag: "company_name" });
+  });
+
+  it("does not throw on a mapping whose value is not a string, and reads such a tag as blank", () => {
+    const r = buildLeadPayload(lead(), { tagsUsed: ["industry"], mapping: { industry: undefined as any } });
+    expect(r).toEqual({ ok: false, reason: "missing_tag", tag: "industry" });
+    expect(buildLeadPayload(lead(), { tagsUsed: ["x"], mapping: { x: 5 as any } })).toEqual({ ok: false, reason: "missing_tag", tag: "x" });
+  });
+
+  it("reads nothing through a __proto__ or constructor path in a mapping", () => {
+    expect(buildLeadPayload(lead(), { tagsUsed: ["x"], mapping: { x: "__proto__" } })).toEqual({ ok: false, reason: "missing_tag", tag: "x" });
+    expect(buildLeadPayload(lead(), { tagsUsed: ["x"], mapping: { x: "customFields.constructor" } })).toEqual({ ok: false, reason: "missing_tag", tag: "x" });
+    expect(buildLeadPayload(lead(), { tagsUsed: ["x"], mapping: { x: "toString" } })).toEqual({ ok: false, reason: "missing_tag", tag: "x" });
   });
 
   it("refuses a missing or malformed email", () => {
