@@ -1,0 +1,167 @@
+import { selectSmartleadLeads } from "../smartleadEligibility";
+import { campaignStatusDecision, preflightSequence } from "../smartleadPreflight";
+import { analyseSequence } from "../smartleadSequence";
+import { buildSmartleadMarker, getSmartleadMarker, isMarkedForCampaign, isPushedToSmartlead, smartleadMarkerKey } from "../smartleadMarkers";
+import { estimateDaysToSend } from "../smartleadEstimate";
+import { realSequencesWithVariants } from "./fixtures/smartleadRealReplies";
+
+const lead = (id: string, over: Record<string, any> = {}) => ({
+  leadId: id, email: `${id}@example.com`, firstName: "Ann", company: "Acme", createdAt: "2026-01-01T00:00:00.000Z",
+  customFields: { email_validation: { status: "deliverable" } }, ...over,
+});
+const ctx = (over: Record<string, any> = {}) => ({ campaignId: 77, tags: ["first_name", "company_name"], mapping: {}, ...over });
+
+describe("selectSmartleadLeads (ENG-673)", () => {
+  it("keeps a good lead and builds its payload", () => {
+    const r = selectSmartleadLeads([lead("a")], ctx());
+    expect(r.eligible).toHaveLength(1);
+    expect(r.eligible[0].input).toMatchObject({ email: "a@example.com", first_name: "Ann", company_name: "Acme" });
+    expect(r.eligible[0].payloadHash).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it.each([
+    ["do_not_contact", { contactStatus: "do-not-contact" }],
+    ["do_not_contact", { contactStatus: "unsubscribed" }],
+    ["do_not_contact", { unsubscribedFromGroupEmail: true }],
+    ["undeliverable", { customFields: { email_validation: { status: "undeliverable" } } }],
+    ["unverified", { customFields: { email_validation: { status: "risky" } } }],
+    ["unverified", { customFields: { email_validation: { status: "unknown" } } }],
+    ["unverified", { customFields: {} }],
+    ["already_pushed", { system: { smartlead_77: { state: "pushed", pushedAt: "x", runId: "r", payloadHash: "h" } } }],
+    ["already_pushed", { system: { smartlead_77: { state: "withdrawn", pushedAt: "x", runId: "r", payloadHash: "h" } } }],
+    ["created_after_start", { createdAt: "2026-12-01T00:00:00.000Z" }],
+    ["missing_tag", { firstName: "" }],
+    ["template_syntax", { company: "{{x}}" }],
+    ["no_email", { email: "" }],
+  ])("skips a lead as %s", (reason, over) => {
+    const r = selectSmartleadLeads([lead("a", over as any)], ctx({ runStartedAt: "2026-06-01T00:00:00.000Z" }));
+    expect(r.eligible).toHaveLength(0);
+    expect(r.skipped[0].reason).toBe(reason);
+    expect(r.counts[reason as keyof typeof r.counts]).toBe(1);
+  });
+
+  it("names the tag when a value is missing", () => {
+    expect(selectSmartleadLeads([lead("a", { company: "" })], ctx()).skipped[0]).toMatchObject({ reason: "missing_tag", tag: "company_name" });
+  });
+
+  it("does not count a lead pushed to ANOTHER campaign, or a released marker, as already pushed", () => {
+    const other = lead("a", { system: { smartlead_99: { state: "pushed", pushedAt: "x", runId: "r", payloadHash: "h" } } });
+    const released = lead("b", { system: { smartlead_77: { state: "released", pushedAt: "x", runId: "r", payloadHash: "h" } } });
+    expect(selectSmartleadLeads([other, released], ctx()).eligible).toHaveLength(2);
+  });
+
+  it("leaves out risky, unknown and never-validated leads unless asked", () => {
+    const risky = lead("a", { customFields: { email_validation: { status: "risky" } } });
+    expect(selectSmartleadLeads([risky], ctx({ includeUnverified: true })).eligible).toHaveLength(1);
+    // asking for unverified never lets an undeliverable one through
+    const bad = lead("b", { customFields: { email_validation: { status: "undeliverable" } } });
+    expect(selectSmartleadLeads([bad], ctx({ includeUnverified: true })).eligible).toHaveLength(0);
+  });
+
+  it("catches a duplicate email case-insensitively, keeps the first, and lets a duplicate of a REJECTED lead through", () => {
+    const first = lead("a", { email: "Dup@Example.com" });
+    const second = lead("b", { email: "dup@example.com" });
+    const r = selectSmartleadLeads([first, second], ctx());
+    expect(r.eligible.map(e => e.lead.leadId)).toEqual(["a"]);
+    expect(r.skipped).toEqual([{ leadId: "b", email: "dup@example.com", reason: "duplicate_in_run" }]);
+    const rejected = lead("c", { email: "same@example.com", firstName: "" });
+    const later = lead("d", { email: "same@example.com" });
+    expect(selectSmartleadLeads([rejected, later], ctx()).eligible.map(e => e.lead.leadId)).toEqual(["d"]);
+  });
+
+  it("catches duplicates across batches through a shared set, and keeps the input order", () => {
+    const seen = new Set<string>();
+    const one = selectSmartleadLeads([lead("c"), lead("a")], ctx({ seenEmails: seen }));
+    const two = selectSmartleadLeads([lead("a", { leadId: "z" }), lead("b")], ctx({ seenEmails: seen }));
+    expect(one.eligible.map(e => e.lead.leadId)).toEqual(["c", "a"]);
+    expect(two.eligible.map(e => e.lead.leadId)).toEqual(["b"]);
+    expect(two.counts.duplicate_in_run).toBe(1);
+  });
+
+  it("skips tag requirements the user confirmed Smartlead supplies", () => {
+    expect(selectSmartleadLeads([lead("a")], ctx({ tags: ["sender_name"], acknowledgedTags: ["sender_name"] })).eligible).toHaveLength(1);
+  });
+});
+
+describe("campaignStatusDecision and preflightSequence", () => {
+  const real = analyseSequence(realSequencesWithVariants);
+
+  it("allows DRAFTED and PAUSED, asks for confirmation on ACTIVE, refuses the rest and anything unknown", () => {
+    expect(["DRAFTED", "drafted", "PAUSED"].map(campaignStatusDecision)).toEqual(["allowed", "allowed", "allowed"]);
+    expect(campaignStatusDecision("ACTIVE")).toBe("needs_confirmation");
+    for (const s of ["STOPPED", "ARCHIVED", "COMPLETED", "DRAFT", "", "WAT"]) expect(campaignStatusDecision(s)).toBe("refused");
+  });
+
+  it("passes a real A/B-variant sequence that uses only standard tags", () => {
+    for (const status of ["DRAFTED", "ACTIVE"]) {
+      const r = preflightSequence(real, { status, mapping: {} });
+      expect(r.blocks).toEqual([]);
+      expect(r.warnings).toEqual([]);
+    }
+  });
+
+  it("blocks an unreadable sequence only for an ACTIVE campaign, unless acknowledged, and records the acknowledgement", () => {
+    const bad = analyseSequence({ message: "?" });
+    expect(preflightSequence(bad, { status: "ACTIVE", mapping: {} }).blocks[0].code).toBe("unreadable");
+    expect(preflightSequence(bad, { status: "DRAFTED", mapping: {} })).toMatchObject({ blocks: [], warnings: [{ code: "unreadable" }] });
+    expect(preflightSequence(bad, { status: "ACTIVE", mapping: {}, acknowledgeUnreadable: true })).toMatchObject({ blocks: [], warnings: [{ code: "unreadable" }] });
+  });
+
+  it("blocks an empty sequence only for an ACTIVE campaign", () => {
+    const empty = analyseSequence([]);
+    expect(preflightSequence(empty, { status: "ACTIVE", mapping: {} }).blocks[0].code).toBe("empty");
+    expect(preflightSequence(empty, { status: "DRAFTED", mapping: {} }).warnings[0].code).toBe("empty");
+  });
+
+  it("blocks near-miss and unknown tags for EVERY status and lists the ones to map", () => {
+    const seq = analyseSequence([{ seq_number: 1, subject: "Hi {{First_Name}}", email_body: "{{industry}} {{signature}}", sequence_variants: [] }]);
+    const r = preflightSequence(seq, { status: "DRAFTED", mapping: { industry: "customFields.industry" } });
+    expect(r.blocks.map(b => [b.code, b.tag])).toEqual([["near_miss_tag", "First_Name"], ["unknown_tag", "signature"]]);
+    expect(r.tagsToMap).toEqual(["signature"]);
+    expect(preflightSequence(seq, { status: "DRAFTED", mapping: { industry: "customFields.industry" }, acknowledgedTags: ["signature"] }).blocks.map(b => b.code)).toEqual(["near_miss_tag"]);
+  });
+
+  it("warns about spintax and about a campaign with no unsubscribe tag", () => {
+    const seq = analyseSequence([{ seq_number: 1, subject: "{Hi|Hello} {{first_name}}", email_body: "x", sequence_variants: [] }]);
+    const codes = preflightSequence(seq, { status: "PAUSED", mapping: {}, addUnsubscribeTag: false }).warnings.map(w => w.code);
+    expect(codes).toEqual(["spintax", "no_unsubscribe"]);
+    expect(preflightSequence(seq, { status: "PAUSED", mapping: {}, addUnsubscribeTag: true }).warnings.map(w => w.code)).toEqual(["spintax"]);
+  });
+});
+
+describe("markers", () => {
+  it("uses one flat key per campaign", () => {
+    expect(smartleadMarkerKey(4251616)).toBe("smartlead_4251616");
+  });
+
+  it("reads a marker, treats a released one as not marked, and ignores other system keys", () => {
+    const m = buildSmartleadMarker({ runId: "r1", payloadHash: "h", smartleadLeadId: "9001", now: new Date("2026-10-27T00:00:00Z") });
+    expect(m).toEqual({ pushedAt: "2026-10-27T00:00:00.000Z", runId: "r1", smartleadLeadId: "9001", payloadHash: "h", state: "pushed" });
+    const l = { system: { smartlead_5: m, findReason: "x", smartlead_6: { state: "released" } } };
+    expect(getSmartleadMarker(l, 5)).toEqual(m);
+    expect(isMarkedForCampaign(l, 5)).toBe(true);
+    expect(isMarkedForCampaign(l, 6)).toBe(false);
+    expect(isMarkedForCampaign(l, 7)).toBe(false);
+    expect(isMarkedForCampaign(null, 5)).toBe(false);
+  });
+
+  it("isPushedToSmartlead is true for any live marker and false for none, released only, or other keys", () => {
+    expect(isPushedToSmartlead({ system: { smartlead_5: { state: "pushed" } } })).toBe(true);
+    expect(isPushedToSmartlead({ system: { smartlead_5: { state: "withdrawn" } } })).toBe(true);
+    expect(isPushedToSmartlead({ system: { smartlead_5: { state: "released" } } })).toBe(false);
+    expect(isPushedToSmartlead({ system: { findReason: "x", smartlead_note: "text" } })).toBe(false);
+    expect(isPushedToSmartlead({})).toBe(false);
+    expect(isPushedToSmartlead(undefined)).toBe(false);
+  });
+});
+
+describe("estimateDaysToSend", () => {
+  it("adds the mailbox limits, caps by the campaign's daily maximum, and rounds days up", () => {
+    expect(estimateDaysToSend({ leads: 8000, mailboxLimits: Array(10).fill(30) })).toEqual({ perDay: 300, days: 27 });
+    expect(estimateDaysToSend({ leads: 8000, mailboxLimits: Array(10).fill(30), campaignMaxLeadsPerDay: 100 })).toEqual({ perDay: 100, days: 80 });
+  });
+  it("says nothing when no mailbox limit is known or there is nothing to send", () => {
+    expect(estimateDaysToSend({ leads: 100, mailboxLimits: [undefined] })).toBeUndefined();
+    expect(estimateDaysToSend({ leads: 0, mailboxLimits: [30] })).toBeUndefined();
+  });
+});
