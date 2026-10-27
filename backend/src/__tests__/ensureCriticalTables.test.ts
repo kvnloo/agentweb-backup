@@ -226,8 +226,10 @@ describe('ensureCriticalTables', () => {
             TimeToLiveDescription: { TimeToLiveStatus: opts.ttl?.status ?? 'DISABLED', AttributeName: opts.ttl?.attribute },
           }),
         })),
+        // Only the journal's calls are modeled and recorded: other tables with settings (ENG-673 added one) just succeed.
         updateTimeToLive: jest.fn((p: any) => ({
           promise: async () => {
+            if (p.TableName !== TABLE) return {};
             if (opts.ttlDenied) throw denied();
             calls.updateTimeToLive.push(p);
             return {};
@@ -240,6 +242,7 @@ describe('ensureCriticalTables', () => {
         })),
         updateContinuousBackups: jest.fn((p: any) => ({
           promise: async () => {
+            if (p.TableName !== TABLE) return {};
             if (opts.pitrDenied) throw denied();
             calls.updateContinuousBackups.push(p);
             return {};
@@ -317,15 +320,18 @@ describe('ensureCriticalTables', () => {
     it('waits out the short window after creation when continuous backups are not available yet', async () => {
       const { client, calls } = settingsDynamo({});
       let n = 0;
-      (client as any).describeContinuousBackups = jest.fn(() => ({
+      (client as any).describeContinuousBackups = jest.fn((p: any) => ({
         promise: async () => {
+          // Only the journal is scripted; other tables with settings (ENG-673 added one) already have recovery on.
+          if (p.TableName !== TABLE) return { ContinuousBackupsDescription: { PointInTimeRecoveryDescription: { PointInTimeRecoveryStatus: 'ENABLED' } } };
           if (n++ < 2) throw Object.assign(new Error('not yet'), { code: 'ContinuousBackupsUnavailableException' });
           return { ContinuousBackupsDescription: { PointInTimeRecoveryDescription: { PointInTimeRecoveryStatus: 'DISABLED' } } };
         },
       }));
       await ensureCriticalTables(client as any, { sleep });
       expect(calls.updateContinuousBackups).toHaveLength(1);
-      expect((client as any).describeContinuousBackups).toHaveBeenCalledTimes(3);
+      const journalChecks = (client as any).describeContinuousBackups.mock.calls.filter((c: any[]) => c[0].TableName === TABLE);
+      expect(journalChecks).toHaveLength(3);
     });
 
     it('gives up quietly for this boot, and retries next boot, if the table never becomes ACTIVE', async () => {

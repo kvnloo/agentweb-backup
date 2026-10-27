@@ -41,13 +41,6 @@ export {};
 const ENDPOINT = process.env.DYNAMODB_LOCAL_ENDPOINT;
 const suite = ENDPOINT ? describe : describe.skip;
 
-// db.ts installs an https keep-alive agent in the global aws-sdk config (ENG-749); DynamoDB Local speaks
-// plain http, and an https agent on an http endpoint fails every request ("Protocol "http:" not supported").
-jest.mock('../utils/awsHttpOptions', () => {
-  const agent = new (require('http').Agent)({ keepAlive: false, maxSockets: 50 });
-  return { AWS_HTTP_MAX_SOCKETS: 50, getAwsKeepAliveAgent: () => agent, buildAwsHttpOptions: () => ({ agent }) };
-});
-
 jest.mock('../services/subscriptionService', () => ({
   getUserSubscriptionType: jest.fn(),
   getSubscriptionTypeConfig: jest.fn(),

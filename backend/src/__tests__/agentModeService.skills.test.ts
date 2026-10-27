@@ -988,6 +988,15 @@ describe('AgentModeService - Skills', () => {
       expect(result.allowedToolNames.has('tool2')).toBe(true);
     });
 
+    it('grants get_ga4_key_events alongside get_website_analytics (ENG-896 digest gate)', () => {
+      const digest = [{ skillId: 'digest', toolNames: ['get_website_analytics'] }];
+      expect((agentModeService as any).buildSkillContext(digest, ['*'], [], []).allowedToolNames.has('get_ga4_key_events')).toBe(true);
+      const other = [{ skillId: 'x', toolNames: ['tool1'] }];
+      expect((agentModeService as any).buildSkillContext(other, ['*'], [], []).allowedToolNames.has('get_ga4_key_events')).toBe(false);
+      // Not granted when the analytics skill is not allowed by subscription.
+      expect((agentModeService as any).buildSkillContext(digest, ['other'], [], []).allowedToolNames.has('get_ga4_key_events')).toBe(false);
+    });
+
     it('should filter tools by user subscription (skill-level)', () => {
       const skills = [
         { skillId: 's1', name: 'Skill A', toolNames: ['tool1', 'tool2'], description: '', isPublished: true },

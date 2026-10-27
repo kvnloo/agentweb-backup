@@ -113,6 +113,21 @@ describe("login host server", () => {
     expect(big.status).toBe(413); // the reply is delivered before the upload is cut
   });
 
+  it("protocol 3 request fields: the nonce and onlyIfPending are validated, and nothing else is accepted next to them", async () => {
+    const base = { connectionId: "c1", loginRef: "l1", code: "abcdefgh#12345678" };
+    // valid values pass the schema (the route then answers about the unknown attempt, not 400)
+    expect((await call(sock, "POST", "/v1/login.complete", { ...base, completionNonce: "AbC_-12345678" })).status).not.toBe(400);
+    expect((await call(sock, "POST", "/v1/login.cancel", { connectionId: "c1", loginRef: "l1", onlyIfPending: true })).status).not.toBe(400);
+    // bad values are 400 and never echoed
+    for (const nonce of ["short", "has space in it!!", "x".repeat(65), 12345678, ""]) {
+      expect((await call(sock, "POST", "/v1/login.complete", { ...base, completionNonce: nonce })).status).toBe(400);
+    }
+    for (const flag of ["yes", 1, null]) {
+      expect((await call(sock, "POST", "/v1/login.cancel", { connectionId: "c1", loginRef: "l1", onlyIfPending: flag })).status).toBe(400);
+    }
+    expect((await call(sock, "POST", "/v1/login.cancel", { connectionId: "c1", loginRef: "l1", onlyIfPending: true, extra: 1 })).status).toBe(400);
+  });
+
   it("never echoes an offending value back, whatever the field", async () => {
     const secret = "SECRET-TOKEN-VALUE-SHOULD-NOT-APPEAR";
     const r = await call(sock, "POST", "/v1/turn.run", { ...turnReq("c1", 1), bridgeToken: `${secret} bad token` });

@@ -27,6 +27,7 @@ import { SPEND_EVENTS_TABLE, SPEND_EVENTS_OCCURRED_AT_INDEX } from './spendEvent
 import { SPEND_PROJECTION_TABLE } from './spendProjectionDb';
 import { LLM_CONNECTIONS_TABLE_SPEC } from './funding/llmConnectionDb';
 import { ATTEMPT_USAGE_TABLE_SPEC, ATTEMPT_USAGE_TABLE, ATTEMPT_USAGE_TTL_ATTRIBUTE } from './funding/dynamoAttemptUsageJournal';
+import { SMARTLEAD_PUSH_RUNS_TABLE_SPEC, SMARTLEAD_PUSH_RUNS_TABLE, SMARTLEAD_PUSH_RUNS_TTL_ATTRIBUTE } from './smartleadPushRunDb';
 
 export const CRITICAL_TABLE_SPECS: AWS.DynamoDB.CreateTableInput[] = [
   {
@@ -107,6 +108,8 @@ export const CRITICAL_TABLE_SPECS: AWS.DynamoDB.CreateTableInput[] = [
   // ENG-2106 -- customer-funded usage journal (append-only, no secrets, 400-day TTL,
   // point-in-time recovery on). TTL and recovery are applied by reconcileTableSettings.
   ATTEMPT_USAGE_TABLE_SPEC,
+  // ENG-673 -- Smartlead push runs (a run item and a lock item per list and campaign; no deletion protection until proven).
+  SMARTLEAD_PUSH_RUNS_TABLE_SPEC,
   {
     TableName: LOOP_EVENTS_TABLE,
     AttributeDefinitions: [
@@ -190,6 +193,7 @@ export const CRITICAL_TABLE_SPECS: AWS.DynamoDB.CreateTableInput[] = [
  */
 export const CRITICAL_TABLE_SETTINGS: Record<string, { ttlAttribute?: string; pointInTimeRecovery?: boolean }> = {
   [ATTEMPT_USAGE_TABLE]: { ttlAttribute: ATTEMPT_USAGE_TTL_ATTRIBUTE, pointInTimeRecovery: true },
+  [SMARTLEAD_PUSH_RUNS_TABLE]: { ttlAttribute: SMARTLEAD_PUSH_RUNS_TTL_ATTRIBUTE, pointInTimeRecovery: true },
 };
 
 const ACTIVE_POLL_MS = 3_000;
