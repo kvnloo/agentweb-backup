@@ -117,6 +117,9 @@ for (const action of ['discard', 'rollback'] as const) {
         recordingId: req.params.recordingId,
         action,
         actorUserId: req.user.userId,
+        ...(action === 'rollback' && typeof req.body?.orgMemoryOrgId === 'string' && VALID_PATH_ID.test(req.body.orgMemoryOrgId)
+          ? { orgMemoryOrgId: req.body.orgMemoryOrgId }
+          : {}),
       });
       return res.json({ ingestion });
     } catch (error: any) {

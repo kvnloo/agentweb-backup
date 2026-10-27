@@ -699,7 +699,14 @@ async function flagDiscardedDraft(deps: ReviewActionDeps, item: FathomOnboarding
 }
 
 export async function applyFathomOnboardingReviewAction(
-  input: { userId: string; recordingId: string; action: FathomOnboardingReviewAction; actorUserId: string },
+  input: {
+    userId: string;
+    recordingId: string;
+    action: FathomOnboardingReviewAction;
+    actorUserId: string;
+    /** Admin-supplied org for a legacy entry whose user has since changed orgs (Opslane run 1336, P2). */
+    orgMemoryOrgId?: string;
+  },
   injectedDeps?: Partial<ReviewActionDeps>,
 ): Promise<FathomOnboardingIngestion> {
   const deps: ReviewActionDeps = {
@@ -757,12 +764,19 @@ export async function applyFathomOnboardingReviewAction(
           // approval. Only trust the current org if it actually holds every
           // memory; otherwise deleting there is a silent no-op that would report
           // success while the old org's memory stays live (Opslane run 417, P1).
-          if (orgId) {
+          // An admin may name the original org; it is trusted only if it
+          // actually holds every recorded memory (Opslane run 1336, P2).
+          const candidates = [input.orgMemoryOrgId, orgId].filter((id): id is string => !!id);
+          orgId = null;
+          for (const candidate of candidates) {
+            let holdsAll = true;
             for (const memoryId of item.orgMemoryIds || []) {
-              if (!(await deps.orgMemoryDb.getMemory(orgId, memoryId))) {
-                throw new FathomOnboardingReviewError(409, 'Org memories for this legacy ingestion are not in the user\'s current org; rollback not applied.');
-              }
+              if (!(await deps.orgMemoryDb.getMemory(candidate, memoryId))) { holdsAll = false; break; }
             }
+            if (holdsAll) { orgId = candidate; break; }
+          }
+          if (!orgId && candidates.length > 0) {
+            throw new FathomOnboardingReviewError(409, 'Org memories for this legacy ingestion are not in the user\'s current org; pass orgMemoryOrgId with the org they were written under. Rollback not applied.');
           }
         }
         if (!orgId) {

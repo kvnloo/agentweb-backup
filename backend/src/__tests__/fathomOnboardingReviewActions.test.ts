@@ -235,4 +235,29 @@ describe('applyFathomOnboardingReviewAction (ENG-270)', () => {
     expect(deps.accountMemoryDb.deleteMemory).not.toHaveBeenCalled();
     expect(users.legacy.fathomOnboardingIngestions[0]).toMatchObject({ status: 'reviewed', memoryIds: ['m1'], orgMemoryIds: ['o-legacy-1'] });
   });
+
+  it('rolls back a legacy entry in the admin-supplied original org when it holds every memory (Opslane run 1336, P2)', async () => {
+    const users: Record<string, any> = {
+      legacy: { userId: 'legacy', orgId: 'org-new', fathomOnboardingIngestions: [entry({ status: 'reviewed', targetUserId: 'legacy', memoryIds: ['m1'], orgMemoryIds: ['o-legacy-1'] })] },
+    };
+    const deps = setup(users);
+    deps.orgMemoryDb.getMemory.mockImplementation(async (orgId: string) => (orgId === 'org-old' ? { memoryId: 'o-legacy-1' } : null));
+    const out = await applyFathomOnboardingReviewAction({ userId: 'legacy', recordingId: 'rec-1', action: 'rollback', actorUserId: 'admin', orgMemoryOrgId: 'org-old' }, deps);
+    expect(out).toMatchObject({ status: 'needs_review', memoryIds: [], orgMemoryIds: [] });
+    expect(deps.orgMemoryDb.deleteMemory).toHaveBeenCalledWith('org-old', 'o-legacy-1');
+    expect(deps.orgMemoryDb.deleteMemory).not.toHaveBeenCalledWith('org-new', expect.anything());
+    expect(deps.accountMemoryDb.deleteMemory).toHaveBeenCalledWith('legacy', 'm1');
+  });
+
+  it('still refuses when the admin-supplied org does not hold the memories', async () => {
+    const users: Record<string, any> = {
+      legacy: { userId: 'legacy', orgId: 'org-new', fathomOnboardingIngestions: [entry({ status: 'reviewed', targetUserId: 'legacy', memoryIds: ['m1'], orgMemoryIds: ['o-legacy-1'] })] },
+    };
+    const deps = setup(users);
+    deps.orgMemoryDb.getMemory.mockResolvedValue(null);
+    await expect(applyFathomOnboardingReviewAction({ userId: 'legacy', recordingId: 'rec-1', action: 'rollback', actorUserId: 'admin', orgMemoryOrgId: 'org-wrong' }, deps))
+      .rejects.toMatchObject({ statusCode: 409 });
+    expect(deps.orgMemoryDb.deleteMemory).not.toHaveBeenCalled();
+    expect(deps.accountMemoryDb.deleteMemory).not.toHaveBeenCalled();
+  });
 });
