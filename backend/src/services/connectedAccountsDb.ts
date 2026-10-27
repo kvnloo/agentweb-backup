@@ -3,6 +3,7 @@ import { userDb, User } from './db';
 import { invalidateCachedPixels } from './metaPixelsCache';
 import { isEvaluationUser } from './evaluationPolicy';
 import type { DailyVolumeState } from './linkedInWritePacer';
+import { emitAppSignal } from './serverSignalEmitter';
 
 // ============================================
 // Type Definitions
@@ -483,7 +484,11 @@ export interface CreateAccountInput {
 export const createAccount = async (
   userId: string,
   platform: PlatformType,
-  input: CreateAccountInput
+  input: CreateAccountInput,
+  // ENG-2686: false when the provider could not confirm the account (e.g. a Unipile
+  // ID that getAccount refused); the row is still saved but no integration_connected
+  // signal fires for an integration that never happened.
+  opts: { providerVerified?: boolean } = {}
 ): Promise<ConnectedAccount> => {
   const user = await userDb.getUserById(userId);
   if (!user) {
@@ -532,6 +537,9 @@ export const createAccount = async (
   // page. See services/metaPixelsCache.ts.
   invalidateCachedPixels(userId);
   if (platform === 'hubspot') clearHubSpotPortalCache();
+
+  // ENG-2686: first connection only (a re-OAuth of the same account is not a new integration).
+  if (existingIndex < 0 && opts.providerVerified !== false) void emitAppSignal(user as any, 'integration_connected', { platform });
 
   return accountConfig;
 };
