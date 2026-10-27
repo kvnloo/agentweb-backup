@@ -296,7 +296,7 @@ describe("executeRun (ENG-673)", () => {
     it("does not mark a lead Smartlead lists under 'existing in other campaigns' but did not add (it would look pushed when it is not)", async () => {
       const t = setup(3);
       t.sl.skipButListOther = new Set(["p2@example.com"]);
-      await expect(executeRun(t.run, t.deps)).resolves.toEqual({ outcome: "partial" }); // unexplained, so it retries then stops
+      await expect(executeRun(t.run, t.deps)).resolves.toEqual({ outcome: "paused", reason: "other_campaign_leads" }); // unknowable, so a human decides
       expect(t.marked()).toBe(2);
       expect(isMarkedForCampaign(t.leads[1], CAMPAIGN)).toBe(false);
     });
@@ -334,6 +334,17 @@ describe("executeRun (ENG-673)", () => {
       expect(t.run.counts.alreadyInCampaign).toBe(3);
       expect(t.run.counts.added).toBe(3);
       expect(t.run.counts.skippedByReason.already_pushed).toBeUndefined();
+    });
+
+    it("pauses for a human, never completes, when a lead listed only under 'other campaigns' may have been added without a marker", async () => {
+      const t = setup(1);
+      t.sl.extraOther = { "p1@example.com": "77" }; // Smartlead added it (the fake does) but names it only in the other-campaigns map
+      t.sl.dropFromMap = new Set(["p1@example.com"]); // ...and not in the newly-added map
+      t.sl.tallies = { inOtherCampaign: 1 };
+      await expect(executeRun(t.run, t.deps)).resolves.toEqual({ outcome: "paused", reason: "other_campaign_leads" });
+      expect(t.sl.emails.size).toBe(1); // it IS in Smartlead, unmarked: exactly why a human must look
+      expect(t.run.cursor).toBeNull();
+      expect(t.run.status).toBe("paused");
     });
 
     it("trusts nothing in the 'other campaigns' map while Smartlead also reports leads skipped for being in other campaigns", async () => {
