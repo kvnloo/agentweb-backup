@@ -172,8 +172,16 @@ export async function fetchGa4KeyEvents(
         const url = new URL(`https://analyticsadmin.googleapis.com/v1beta/properties/${encodeURIComponent(propertyId)}/keyEvents`);
         url.searchParams.set("pageSize", "200");
         if (pageToken) url.searchParams.set("pageToken", pageToken);
-        const res = await fetch(url.toString(), { headers: { Authorization: `Bearer ${token}` } });
-        const body: any = await res.json().catch(() => ({}));
+        const res = await fetch(url.toString(), { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(15_000) });
+        let body: any;
+        try {
+          body = await res.json();
+        } catch {
+          if (res.ok) {
+            return { propertyId, label, error: `Unreadable key-event response from the GA4 Admin API for property ${propertyId}. ${GA4_KEY_EVENTS_MANUAL_CHECK}`, errorReason: "error" };
+          }
+          body = {};
+        }
         if (!res.ok) {
           const status = body?.error?.status || "";
           const msg = body?.error?.message || `HTTP ${res.status}`;

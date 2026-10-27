@@ -1,3 +1,4 @@
+import { addCompanionTools } from './agentMode/companionTools';
 import { metaWriteRateShaper, META_BUDGET_THROTTLE_SUBCODE } from './agentMode/metaWriteRateShaper';
 import { normalizeSkillIdArg } from './agentMode/skillIdArg';
 import { applyProviderPolicy, CompareProviderPolicy } from './agentMode/compareProviderPolicy';
@@ -7692,12 +7693,7 @@ export class AgentModeService {
       ADMIN_SKILL_TOOL_NAMES.forEach(t => allowedToolNames.add(t));
     }
 
-    // ENG-896: get_ga4_key_events is the read-only companion of get_website_analytics
-    // (same GA4 credentials, same scope). Seeded skills such as the daily digest list
-    // only the analytics tool, whose guidance points at key events — grant the pair.
-    if (allowedToolNames.has('get_website_analytics')) {
-      allowedToolNames.add('get_ga4_key_events');
-    }
+    addCompanionTools(allowedToolNames);
 
     let installedSkillContextMsg = '';
     const skillLines: string[] = [];
