@@ -2,7 +2,10 @@ import axios from "axios";
 import {
   __configureSmartleadClient,
   getSmartLeadMetrics,
+  listEmailAccounts,
   scrubSmartleadSecrets,
+  SmartleadApiError,
+  SmartleadUnexpectedResponseError,
   smartleadRequest,
 } from "../smartleadService";
 
@@ -102,5 +105,98 @@ describe("smartleadService client hardening (ENG-2658)", () => {
     expect(scrubSmartleadSecrets(`u?api_key=abc&y=2 and abc`, "abc")).toBe(
       "u?api_key=[REDACTED]&y=2 and [REDACTED]",
     );
+  });
+
+  it("leaves the metrics email-account count as before: a non-list reply counts 0 rather than failing", async () => {
+    process.env.SMARTLEAD_API_KEY = KEY;
+    mockedAxios.request.mockImplementation((async (cfg: { url: string }) =>
+      ({ data: cfg.url.endsWith("/email-accounts") ? { message: "x" } : [] })) as never);
+    const m = await getSmartLeadMetrics();
+    expect(m.status).toBe("ok");
+    expect(m.emailAccountsCount).toBe(0);
+    delete process.env.SMARTLEAD_API_KEY;
+  });
+
+  describe("listEmailAccounts (ENG-673)", () => {
+    const page = (from: number, count: number) =>
+      Array.from({ length: count }, (_, i) => ({ id: from + i, from_email: `box${from + i}@mindd-outreach.com` }));
+
+    it("returns the mailboxes of the key, with no paging parameters on the first request", async () => {
+      mockedAxios.request
+        .mockResolvedValueOnce({ data: page(1, 3) } as never)
+        .mockResolvedValueOnce({ data: [] } as never);
+      const accounts = await listEmailAccounts(KEY);
+      expect(accounts).toEqual([
+        { id: 1, email: "box1@mindd-outreach.com" },
+        { id: 2, email: "box2@mindd-outreach.com" },
+        { id: 3, email: "box3@mindd-outreach.com" },
+      ]);
+      expect(mockedAxios.request.mock.calls[0][0].params).toEqual({ api_key: KEY });
+    });
+
+    it("keeps paging by offset until a page is empty", async () => {
+      mockedAxios.request
+        .mockResolvedValueOnce({ data: page(1, 100) } as never)
+        .mockResolvedValueOnce({ data: page(101, 20) } as never)
+        .mockResolvedValueOnce({ data: [] } as never);
+      const accounts = await listEmailAccounts(KEY);
+      expect(accounts).toHaveLength(120);
+      expect(mockedAxios.request.mock.calls[1][0].params).toMatchObject({ offset: 100 });
+      expect(mockedAxios.request.mock.calls[2][0].params).toMatchObject({ offset: 120 });
+    });
+
+    it("stops if a page adds nothing new (API ignoring offset)", async () => {
+      mockedAxios.request.mockResolvedValue({ data: page(1, 100) } as never);
+      const accounts = await listEmailAccounts(KEY);
+      expect(accounts).toHaveLength(100);
+      expect(mockedAxios.request).toHaveBeenCalledTimes(2);
+    });
+
+    it("accepts string ids", async () => {
+      mockedAxios.request
+        .mockResolvedValueOnce({ data: [{ id: "7", from_email: "a@x.com" }] } as never)
+        .mockResolvedValueOnce({ data: [] } as never);
+      await expect(listEmailAccounts(KEY)).resolves.toEqual([{ id: 7, email: "a@x.com" }]);
+    });
+
+    it("keeps rows whose id it cannot read, so a valid key never looks empty", async () => {
+      mockedAxios.request
+        .mockResolvedValueOnce({ data: [{ mailbox_id: 1, from_email: "a@x.com" }, { mailbox_id: 2, from_email: "b@x.com" }] } as never)
+        .mockResolvedValueOnce({ data: [] } as never);
+      await expect(listEmailAccounts(KEY)).resolves.toHaveLength(2);
+    });
+
+    it("reads one page when maxPages is 1", async () => {
+      mockedAxios.request.mockResolvedValue({ data: page(1, 100) } as never);
+      await expect(listEmailAccounts(KEY, { maxPages: 1 })).resolves.toHaveLength(100);
+      expect(mockedAxios.request).toHaveBeenCalledTimes(1);
+    });
+
+    it("returns an empty list for a real empty array", async () => {
+      mockedAxios.request.mockResolvedValue({ data: [] } as never);
+      await expect(listEmailAccounts(KEY)).resolves.toEqual([]);
+    });
+
+    it("rejects a response that is not a list, so a key is never called valid on a guess", async () => {
+      mockedAxios.request.mockResolvedValue({ data: { message: "Plan expired!" } } as never);
+      await expect(listEmailAccounts(KEY)).rejects.toBeInstanceOf(SmartleadUnexpectedResponseError);
+    });
+
+    it("surfaces a rejected key as a SmartleadApiError with the status and without the key", async () => {
+      mockedAxios.request.mockRejectedValue(
+        Object.assign(new Error(`Request failed with status code 401 ?api_key=${KEY}`), {
+          response: { status: 401, headers: {} },
+        }),
+      );
+      const e = (await listEmailAccounts(KEY).catch((x: unknown) => x)) as { status?: number; message: string };
+      expect(e.status).toBe(401);
+      expect(e.message).not.toContain(KEY);
+    });
+
+    it("honours a lower retry budget on 429", async () => {
+      mockedAxios.request.mockRejectedValue(err429());
+      await expect(listEmailAccounts(KEY, { maxRetries: 1 })).rejects.toMatchObject({ status: 429 });
+      expect(mockedAxios.request).toHaveBeenCalledTimes(2);
+    });
   });
 });
