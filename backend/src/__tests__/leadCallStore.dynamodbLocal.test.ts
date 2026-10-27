@@ -10,8 +10,6 @@
  */
 // backend/__mocks__ would stub aws-sdk for every test; this suite needs the real SDK.
 jest.unmock('aws-sdk');
-// db.ts pins an https keep-alive agent, which cannot talk to an http:// DynamoDB Local endpoint.
-jest.mock('../utils/awsHttpOptions', () => ({ buildAwsHttpOptions: () => ({}) }));
 
 // A module (not a global script), so its top-level names cannot collide with other test files under tsc.
 export {};
