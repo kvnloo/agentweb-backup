@@ -29,6 +29,9 @@ describe("hosted subscription service", () => {
   let ids: number;
   let nowMs: number;
   let promoteLoses: boolean;
+  let completeLostBeforeSend: boolean;
+  let workerProto: number | undefined;
+  let sent: Array<{ route: string; body: Record<string, unknown> }> = [];
   let revokeBegun: string[] = [];
   let revokeHookThrows = false;
   const user = { userId: "user-1" };
@@ -55,6 +58,9 @@ describe("hosted subscription service", () => {
     ids = 0;
     nowMs = rig.clock.nowMs(); // the test host runs on a manual clock; sign-in tokens carry the host's expiry, so the backend's clock must agree
     promoteLoses = false;
+    completeLostBeforeSend = false;
+    workerProto = 3;
+    sent = [];
     revokeBegun = [];
     revokeHookThrows = false;
     svc = new HostedSubscriptionService({
@@ -67,6 +73,8 @@ describe("hosted subscription service", () => {
         return new LoginHostClient({
           stream: (r, b) => real.stream(r, b),
           json: async (r, b) => {
+            sent.push({ route: r, body: b as Record<string, unknown> });
+            if (completeLostBeforeSend && r === "login.complete") throw new LoginHostError("UNREACHABLE"); // the request never reaches the host
             const reply = await real.json(r, b);
             if (promoteLoses && r === "login.promote") throw new LoginHostError("UNREACHABLE");
             return reply;
@@ -74,6 +82,7 @@ describe("hosted subscription service", () => {
         });
       },
       providers: { claude: provider() },
+      workerProtocol: () => workerProto,
       now: () => nowMs,
       newId: () => `conn-${++ids}`,
       sleep: async () => undefined,
@@ -232,6 +241,78 @@ describe("hosted subscription service", () => {
         otherInstance();
         expect(await codeOf(svc.completeLogin(user, started.loginId, "bad code with spaces"))).toBe("bad_code_format");
         expect((await svc.completeLogin(user, started.loginId, GOOD)).status).toBe("active");
+      });
+
+      describe("protocol 3: the host tells whose complete took the code, and a stray cancel cannot discard a ready login", () => {
+        const rawClient = () => new LoginHostClient(new UnixSocketTransport(sock));
+        const loginRefOf = async (loginId: string) => (svc as unknown as { lookup(id: string): { pending: { loginRef: string; connectionId: string } } | undefined }).lookup(loginId)!.pending;
+
+        it("sends the nonce and onlyIfPending to a protocol-3 worker, and neither to an older one", async () => {
+          const s1 = await svc.startLogin(user, "claude");
+          await svc.completeLogin(user, s1.loginId, GOOD);
+          expect(sent.find((x) => x.route === "login.complete")!.body.completionNonce).toMatch(/^[A-Za-z0-9_-]{8,64}$/);
+          const s2 = await svc.startLogin(user, "claude");
+          await svc.cancelLogin(user, s2.loginId);
+          expect(sent.filter((x) => x.route === "login.cancel").pop()!.body.onlyIfPending).toBe(true);
+          sent.length = 0;
+          workerProto = 2;
+          const s3 = await svc.startLogin(user, "claude");
+          await svc.cancelLogin(user, s3.loginId);
+          const s4 = await svc.startLogin(user, "claude");
+          await svc.completeLogin(user, s4.loginId, GOOD);
+          for (const x of sent) {
+            expect(x.body.completionNonce).toBeUndefined();
+            expect(x.body.onlyIfPending).toBeUndefined();
+          }
+          workerProto = undefined; // unknown yet: the same as older
+          const s5 = await svc.startLogin(user, "claude");
+          await svc.cancelLogin(user, s5.loginId);
+          expect(sent.filter((x) => x.route === "login.cancel").pop()!.body.onlyIfPending).toBeUndefined();
+        });
+
+        it("the loser of a double submit whose reply was lost stands down: login_not_found, no cancel, and the winner's ready login survives and can be promoted", async () => {
+          const started = await svc.startLogin(user, "claude");
+          const { loginRef, connectionId } = await loginRefOf(started.loginId);
+          // the winner: another instance's complete (modelled with a raw client) took the code and the attempt is ready
+          await rawClient().loginComplete({ connectionId, loginRef, code: GOOD, completionNonce: "winner-nonce-0001" });
+          otherInstance();
+          completeLostBeforeSend = true; // the loser's own complete never reaches the host and times out
+          const cancelsBefore = rig.script.loginsCancelled;
+          expect(await codeOf(svc.completeLogin(user, started.loginId, GOOD))).toBe("login_not_found");
+          expect(rig.script.loginsCancelled).toBe(cancelsBefore); // it did NOT cancel
+          expect(rig.mgr.status({ connectionId }).state).toBe("attempting");
+          await expect(rawClient().loginPromote({ connectionId, loginRef, epoch: 1 })).resolves.toMatchObject({ state: "active", epoch: 1 });
+        });
+
+        it("a lost reply to the request that DID take the code is still a success (its own nonce comes back)", async () => {
+          const started = await svc.startLogin(user, "claude");
+          const { connectionId } = await loginRefOf(started.loginId);
+          // the service's own complete reaches the host and takes the code; only its reply is lost
+          const deps = (svc as unknown as { deps: { client: () => LoginHostClient | undefined } }).deps;
+          const baseClient = deps.client;
+          deps.client = () => {
+            const c = baseClient();
+            if (!c) return c;
+            const complete = c.loginComplete.bind(c);
+            c.loginComplete = async (input) => {
+              await complete(input);
+              throw new LoginHostError("UNREACHABLE");
+            };
+            return c;
+          };
+          const view = await svc.completeLogin(user, started.loginId, GOOD);
+          expect(view.status).toBe("active");
+          expect(rig.mgr.status({ connectionId })).toMatchObject({ state: "active", epoch: 1 });
+        });
+
+        it("a user's cancel (onlyIfPending) arriving after the code was taken leaves the ready login, which can still be promoted; a rollback cancel still discards it", async () => {
+          const started = await svc.startLogin(user, "claude");
+          const { loginRef, connectionId } = await loginRefOf(started.loginId);
+          await rawClient().loginComplete({ connectionId, loginRef, code: GOOD, completionNonce: "winner-nonce-0002" });
+          otherInstance();
+          await svc.cancelLogin(user, started.loginId); // the stray cancel from another instance
+          await expect(rawClient().loginPromote({ connectionId, loginRef, epoch: 1 })).resolves.toMatchObject({ state: "active" });
+        });
       });
 
       it("cancel works from another instance and ends the host attempt", async () => {
