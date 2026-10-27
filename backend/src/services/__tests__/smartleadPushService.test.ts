@@ -416,6 +416,39 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
       expect(e2.sl.posts).toHaveLength(0);
     });
 
+    it("tells the user the start FAILED, starts no worker and cancels the run when the start can not be confirmed", async () => {
+      const e = env();
+      const p = await approve(e);
+      (e.deps.db as any) = new Proxy(db, { get: (t, k) => (k === "confirmStart" ? async () => { throw new SmartleadPushRunStoreError("unavailable", "down"); } : (t as any)[k]?.bind?.(t) ?? (t as any)[k]) });
+      expect(await e.svc.start("owner", go(p.token))).toMatchObject({ ok: false, status: 503 });
+      await drain(e);
+      expect(e.sl.posts).toHaveLength(0); // no worker was started
+      const [run] = await db.listRunsForList(e.listId);
+      expect(run.status).toBe("canceled");
+      expect(await db.getLock(e.listId, CAMPAIGN)).toBeNull();
+    });
+
+    it("confirms after a transient failure and carries on as normal", async () => {
+      const e = env();
+      const p = await approve(e);
+      const confirm = db.confirmStart.bind(db);
+      let failures = 2;
+      (e.deps.db as any) = new Proxy(db, { get: (t, k) => (k === "confirmStart" ? async (id: string) => { if (failures-- > 0) throw new SmartleadPushRunStoreError("unavailable", "blip"); return confirm(id); } : (t as any)[k]?.bind?.(t) ?? (t as any)[k]) });
+      expect(await e.svc.start("owner", go(p.token))).toMatchObject({ ok: true, started: true });
+      await drain(e);
+      expect(e.sl.emails.size).toBe(5);
+    });
+
+    it("never lets an unconfirmed run be sent by pausing and resuming it: resuming cancels it instead", async () => {
+      const e = env({ maxConcurrentWorkers: 0 });
+      const ghost = await db.startRun({ ownerId: "owner", pushedBy: "owner", keyOwnerId: "owner", smartleadAccountId: "smartlead-owner", channel: "ui", listId: e.listId, campaignId: CAMPAIGN, campaignName: "Q", campaignSource: "selected", options: {}, sequenceHash: "h", previewEligible: 5 }, "w");
+      if (!ghost.started) throw new Error("expected a start");
+      expect((await e.svc.pause("owner", ghost.run.runId)).ok).toBe(true);
+      expect(await e.svc.resume("owner", ghost.run.runId)).toMatchObject({ ok: false, status: 409, code: "start_unconfirmed" });
+      expect((await db.getRun(ghost.run.runId))!.status).toBe("canceled");
+      expect(e.sl.posts).toHaveLength(0);
+    });
+
     it("cancels, and never works, a running run that has no lock (a crash between a start's two writes)", async () => {
       const e = env({ maxConcurrentWorkers: 0 });
       const r = (await e.svc.start("owner", go((await approve(e)).token))) as any;

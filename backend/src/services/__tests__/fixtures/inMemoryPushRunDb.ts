@@ -95,13 +95,12 @@ export class InMemoryPushRunDb {
 
   async resumeRun(runId: string, workerId: string, seenEpoch: number) {
     const r = this.runs.get(runId);
-    if (!r || (r.status !== "paused" && r.status !== "partial") || r.leaseEpoch !== seenEpoch) return null;
+    if (!r || (r.status !== "paused" && r.status !== "partial") || r.startUnconfirmed || r.leaseEpoch !== seenEpoch) return null;
     const holder = this.locks.get(this.lockKey(r.listId, r.campaignId));
     if (holder && holder !== runId) return null;
     this.locks.set(this.lockKey(r.listId, r.campaignId), runId);
     r.status = "running"; r.batchAttempts = 0; r.leaseEpoch++; r.leaseOwner = workerId; r.leaseUntil = this.nowMs() + LEASE_MS;
     delete r.pauseReason;
-    delete r.startUnconfirmed;
     return this.clone(r);
   }
 

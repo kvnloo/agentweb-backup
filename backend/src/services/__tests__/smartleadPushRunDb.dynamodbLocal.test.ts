@@ -581,12 +581,13 @@ suite('SmartleadPushRunDb against DynamoDB Local (ENG-673)', () => {
       expect(await db.claimLease(r.run.runId, 'worker-B', 1)).toMatchObject({ leaseEpoch: 2 });
     });
 
-    it('is cleared by a user resuming the run (they saw it)', async () => {
+    it('can not be resumed by pausing it first: a paused unconfirmed run stays unresumable', async () => {
       const r = await db.startRun(input(), 'w');
       if (!r.started) throw new Error('expected a start');
       await db.pauseRun(r.run.runId, 'user');
+      expect(await db.resumeRun(r.run.runId, 'w', 1)).toBeNull();
+      await db.confirmStart(r.run.runId);
       expect(await db.resumeRun(r.run.runId, 'w', 1)).toMatchObject({ status: 'running' });
-      expect((await db.getRun(r.run.runId))!.startUnconfirmed).toBeUndefined();
     });
 
     it('settles a RETRYABLE lost reply on the lock write whose follow-up read also fails: the run is cancelled, not left to be claimed', async () => {
