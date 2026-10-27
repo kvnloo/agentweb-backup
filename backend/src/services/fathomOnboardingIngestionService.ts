@@ -530,6 +530,22 @@ export async function ingestFathomOnboardingRecording(
     // ENG-270 (Opslane 962): approving a discarded recording would write memories while the
     // draft account stays flagged discarded; refuse it before any memory write.
     if (reviewed && previous?.status === 'discarded') {
+      // ENG-270 (Opslane 1336): a concurrent discard can land after an earlier attempt of
+      // this loop wrote memories; delete them so a refused approve leaves nothing behind.
+      if (target.userId) {
+        for (const memoryId of createdMemoryIds) {
+          try { await deps.accountMemoryDb.deleteMemory?.(target.userId, memoryId); } catch (error: any) {
+            console.warn('[FathomOnboarding] Failed to delete refused-approve account memory:', memoryId, error?.message);
+          }
+        }
+      }
+      if (createdOrgMemoryOrgId) {
+        for (const memoryId of createdOrgMemoryIds) {
+          try { await deps.orgMemoryDb.deleteMemory?.(createdOrgMemoryOrgId, memoryId); } catch (error: any) {
+            console.warn('[FathomOnboarding] Failed to delete refused-approve org memory:', memoryId, error?.message);
+          }
+        }
+      }
       throw new FathomOnboardingReviewError(409, 'Discarded ingestion cannot be approved.');
     }
     // ENG-270 (Opslane 357): an admin discard sticks across unreviewed re-ingests, so the

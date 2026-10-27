@@ -534,8 +534,33 @@ describe('fathomOnboardingIngestionService', () => {
 
     expect(result.memoryIds).toEqual(['mem-win']);
     expect(result.orgMemoryIds).toEqual(['org-mem-win']);
-    expect(deps.accountMemoryDb.deleteMemory).toHaveBeenCalledWith('target-user', 'mem-lose');
-    expect(deps.orgMemoryDb.deleteMemory).toHaveBeenCalledWith('org-1', 'org-mem-lose');
+    expect((deps.accountMemoryDb as any).deleteMemory).toHaveBeenCalledWith('target-user', 'mem-lose');
+    expect((deps.orgMemoryDb as any).deleteMemory).toHaveBeenCalledWith('org-1', 'org-mem-lose');
+  });
+
+  it('deletes memories a refused approve wrote when a concurrent discard lands mid-retry (Opslane 1336)', async () => {
+    const stamp = '2026-07-08T19:00:00.000Z';
+    const pending = [{ recordingId: 'race-1', status: 'needs_review', context: baseContext, memoryIds: [], orgMemoryIds: [], createdAt: stamp, updatedAt: stamp }];
+    const discarded = [{ ...pending[0], status: 'discarded' }];
+    let reads = 0;
+    const updateUser = jest.fn(async () => { throw Object.assign(new Error('cond'), { code: 'ConditionalCheckFailedException' }); });
+    const base = makeDeps();
+    const deps = makeDeps({
+      userDb: {
+        ...base.userDb,
+        getUserById: jest.fn(async (userId: string) => ({ userId, email: 'owner@acme.ai', orgId: 'org-1', fathomOnboardingIngestions: (userId === 'target-user' && reads++ > 0) ? discarded : pending })),
+        updateUser,
+      },
+      accountMemoryDb: { addMemory: jest.fn(async () => ({ memoryId: 'mem-race' })), deleteMemory: jest.fn(async () => undefined) },
+      orgMemoryDb: { addMemory: jest.fn(async () => ({ memoryId: 'org-mem-race' })), deleteMemory: jest.fn(async () => undefined) },
+    });
+
+    await expect(ingestFathomOnboardingRecording({
+      recordingId: 'race-1', targetUserId: 'target-user', reviewOwnerUserId: 'target-user', reviewed: true, extractedContext: baseContext,
+    }, deps as any)).rejects.toMatchObject({ statusCode: 409 });
+
+    expect((deps.accountMemoryDb as any).deleteMemory).toHaveBeenCalledWith('target-user', 'mem-race');
+    expect((deps.orgMemoryDb as any).deleteMemory).toHaveBeenCalledWith('org-1', 'org-mem-race');
   });
 
   it('routes existing account matches to review without creating another user', async () => {
