@@ -99,6 +99,9 @@ import {
 } from '../services/agentMode/runStore';
 import { assertSequentialStepCounts } from '../services/workPlanSteps';
 import { validateModelPin, normalizeRequestedLlmModel, resolvePlanLaunchModel, canonicalPinId } from '../services/agentMode/modelPin';
+import { resolveTurnFunding, type PlanRoute } from '../services/funding/claudeFunding';
+import { ClaudeRouteStopError, claudeStopBody } from '../services/funding/claudeRouteErrors';
+import type { claudeCodeBackend as ClaudeCodeBackendInstance } from '../services/funding/claudeCodeBackendInstance';
 import { workPlanStepModels } from '../services/agentMode/workPlanStepModelsInstance';
 import {
   assertModelInOwnerPlan, isSystemAuthoredPlan, legacyPlanPinSource, modelAccess, storedBindingSource, systemModelCheck,
@@ -9665,6 +9668,8 @@ async function runSessionTurn(
   // ENG-669 PR-C: the task type an `agentweb-model` `llmModel` is routed on this turn. Default: the session's
   // (taskTypeForSession). runVerifiedChat passes its required functions' task (report / image / video).
   routerTaskType?: AgentWebTaskType,
+  // ENG-2113: set only by the owner's /generate when this turn runs on their own Claude plan. Every other caller leaves it undefined and is unchanged.
+  planRoute?: PlanRoute,
 ): Promise<{
   content: string;
   toolCalls: any[];
@@ -9715,7 +9720,7 @@ async function runSessionTurn(
   // system model, so it must be in the owner's plan; a model the caller chose itself (a configured default, the
   // brand-build model, a task-type default) is AgentWeb's choice and differs from the stored one. Thrown before
   // anything is persisted; callers surface it as the model_unavailable message.
-  if (session.llmModel && (await modelAccess.isEnabled()) && sameModelId(llmModel, session.llmModel)) {
+  if (!planRoute && session.llmModel && (await modelAccess.isEnabled()) && sameModelId(llmModel, session.llmModel)) {
     await assertModelInOwnerPlan({ ownerUserId: session.userId, model: llmModel, session });
   }
   // ENG-669 PR-C: which model a selection of the AgentWeb Model runs this turn, and why (stamped on the replies next
@@ -9986,7 +9991,8 @@ async function runSessionTurn(
   // does). A step model that has become unavailable mid-plan PAUSES the plan, loudly: never a swap.
   let stepModelTurn: WorkPlanStepModelTurn;
   try {
-    stepModelTurn = await resolveWorkPlanStepModelForTurn(updatedSession, { explicitPick: explicitModelPick, viewerIsOwner: !isInteractiveShare });
+    // ENG-2113: a work-plan step's own model never replaces the plan pick (work plans on the plan route come in a later PR).
+    stepModelTurn = planRoute ? { kind: 'none' } : await resolveWorkPlanStepModelForTurn(updatedSession, { explicitPick: explicitModelPick, viewerIsOwner: !isInteractiveShare });
   } catch (stepModelError) {
     // ENG-669: the user's pick for a step whose own model is gone is outside the owner's plan. The user message is
     // already saved, so leave the refusal in the chat (as the generic error path does for other failures) before the
@@ -10143,11 +10149,34 @@ async function runSessionTurn(
   // wrapped immediately rather than added to this list. Found by manual review, not
   // by noteRunFundingUnset — see that function's own comment for why it can't be
   // trusted to surface gaps like this one.
-  const runFunding = await resolveRunFunding({ userId });
+  const runFunding = planRoute ? undefined : await resolveRunFunding({ userId });
 
   // Generate AI response using worker process to prevent blocking the main event loop
   // This allows health checks to continue working during long-running operations
-  const response = await generateMarketingResponseWorkerService.runInWorker(
+  // ENG-2113: the plan route runs in THIS process through the Claude backend and never reaches the worker below, so it can never end up on AgentWeb's
+  // models. Everything the backend cannot do yet is a typed stop or a documented limit, not a fallback.
+  let planResponse: Awaited<ReturnType<typeof ClaudeCodeBackendInstance.run>> | undefined;
+  if (planRoute) {
+    // Loaded here, not at module top: the instance pulls in the whole tool gateway, which a request that never takes the plan route has no use for.
+    const { claudeCodeBackend } = await import('../services/funding/claudeCodeBackendInstance');
+    planResponse = await claudeCodeBackend.run({
+      decision: planRoute,
+      sessionId,
+      userId,
+      messageContent,
+      sessionHistory: sessionHistoryForWorker,
+      llmModel,
+      isDelegatedAccess: effectiveIsDelegatedAccess,
+      screenshotUrl,
+      excludeTools,
+      turnStartMs,
+      stamps: turnRouting as Record<string, unknown> | undefined,
+      onProgress: (progress) => emitProgress(sessionId, progress),
+    });
+    // Fail closed: a plan request is never handed to the worker, whatever the backend returned.
+    if (!planResponse) throw new ClaudeRouteStopError('turn_failed');
+  }
+  const response = planRoute ? planResponse! : await generateMarketingResponseWorkerService.runInWorker(
     {
       messageContent,
       sessionHistory: sessionHistoryForWorker,
@@ -10893,6 +10922,9 @@ export const agentModeController = {
     // state is consumed. Hoisted so the outer `finally` releases it on the early returns
     // that precede the inner try (release() is idempotent; the inner finally also runs it).
     let pausedTurnSlot: { release: () => void } | undefined;
+    // ENG-2113: true once this request is a plan-route turn, so ANY failure after that (not only a typed stop) is answered with fixed copy and
+    // never reaches the diagnosis agent, which would spend AgentWeb money to guess at a turn that ran on the user's plan.
+    let planTurn = false;
     try {
       // A-019: do not admit a fresh interactive turn after shutdown drain starts.
       // This is intentionally before STT, idempotency/session claims, deck writes,
@@ -10944,6 +10976,37 @@ export const agentModeController = {
         return res.status(403).json({ error: 'Unauthorized access to session' });
       }
 
+      // ENG-2113: whose plan pays for THIS turn, decided once, before anything below mutates state (a stop consumes nothing).
+      // No `fundingChoice` in the body = AgentWeb, with no lookups, exactly as before. A stop is a typed answer, never an AgentWeb run.
+      let planRoute: PlanRoute | undefined;
+      try {
+        const funding = await resolveTurnFunding({
+          rawFundingChoice: req.body.fundingChoice,
+          initiatorUserId: user.userId,
+          sessionOwnerUserId: session.userId,
+          // Read from the stored user (strongly consistent: this is a gate), only after the allow-list has said yes. req.user never carries it.
+          lookupOrgId: async () => {
+            const stored = await userDb.getUserByIdConsistent(user.userId);
+            if (!stored) throw new Error('user record not found'); // a failed read is a typed lookup failure, never "no organisation"
+            return stored.orgId;
+          },
+          acknowledgedExtraUsage: req.body.acknowledgeExtraUsage === true,
+          requestIsDelegated: (req as any).delegateInfo?.isDelegated === true,
+          sessionIsDelegated: session.delegateInfo?.isDelegated === true,
+          // Only a plan request needs the pick resolved; everyone else skips the lookup (and its log line).
+          explicitModelId: llmModel && req.body.fundingChoice === 'claude_subscription' ? canonicalPinId(agentModeService, llmModel) : undefined,
+        });
+        if (funding.route === 'claude_subscription') {
+          planRoute = funding;
+          planTurn = true;
+        }
+      } catch (fundingError) {
+        // Nothing is saved yet. A lookup that failed for any reason other than a typed stop is still a stop (never an AgentWeb run, never a 500).
+        const fundingStop = fundingError instanceof ClaudeRouteStopError ? fundingError : new ClaudeRouteStopError('lookup_failed');
+        if (!(fundingError instanceof ClaudeRouteStopError)) console.error('AgentMode: plan funding lookup failed:', fundingError instanceof Error ? fundingError.message : String(fundingError));
+        return res.status(fundingStop.httpStatus).json(sendRefusalBody(claudeStopBody(fundingStop), false));
+      }
+
       // EXPLICIT = the REQUEST carries a model. A model merely STORED on the session is
       // never explicit: the system stamps the configured default into session.llmModel
       // (Slack, work-plan launch, GTM, onboarding...), no persisted flag can tell that
@@ -10962,7 +11025,8 @@ export const agentModeController = {
       const explicitModelSelection = Boolean(llmModel);
       let preflightDecision: EffectiveModelPolicyDecision | undefined;
       try {
-        preflightDecision = await resolveEffectiveModelForUser({
+        // ENG-2113: the plan route runs the explicit pick as is (the plan, not AgentWeb's allowance or tiers, pays for it): no AgentWeb policy swap.
+        if (!planRoute) preflightDecision = await resolveEffectiveModelForUser({
           userId: session.userId,
           requestedModel: llmModel || session.llmModel || null,
           backupModel: llmBackupModel,
@@ -11231,8 +11295,9 @@ export const agentModeController = {
       }
 
       // Check token usage limits
-      const usageStatus = await checkTokenUsage(user.userId, TURN_ADMISSION);
-      if (!usageStatus.allowed) {
+      // ENG-2113: a turn on the user's own plan takes no AgentWeb allowance and records no PAYG admission.
+      const usageStatus = planRoute ? undefined : await checkTokenUsage(user.userId, TURN_ADMISSION);
+      if (usageStatus && !usageStatus.allowed) {
         // ENG-527: product-feedback filing is never token-limited. An over-quota user who
         // explicitly asks Emma to file a bug/feature request (portal `feedbackIntent`) gets it
         // filed DETERMINISTICALLY — zero LLM calls, zero token spend — through the same shared
@@ -11354,52 +11419,62 @@ export const agentModeController = {
         }
       });
 
-      // A request/session model is a preference, not authority. Resolve it
-      // against the current cost state immediately before dispatch so an old
-      // MCP client or stored session cannot bypass optimized mode.
-      try {
-        // Same inputs as the pre-flight above (nothing in between changes the model
-        // or the request), so reuse its decision when it resolved cleanly.
-        modelPolicyDecision = preflightDecision ?? await resolveEffectiveModelForUser({
-          userId: session.userId,
-          requestedModel: llmModel || session.llmModel || null,
-          backupModel: llmBackupModel,
-          backupSource: llmBackupModel ? 'user' : null,
-          allowSilentSwap: !explicitModelSelection,
-          session,
-        });
-      } catch (modelError) {
-        if (!isModelUnavailableError(modelError)) throw modelError;
-        // FAIL-LOUD: nothing was sent to any model. No session write, no
-        // metering, user message not persisted. The inner finally releases the
-        // generation lock + idem claim; close the run record created above.
-        if (runSurvivalRunId) {
-          void markRunTerminal(runSurvivalRunId, 'failed', { finishReason: 'model_unavailable' });
+      // ENG-2113: on the plan route the model that runs is the explicit pick, and the session keeps whatever model it had (a later AgentWeb
+      // message must not inherit a plan pick it never asked for). Everything else in this branch is today's policy, unchanged.
+      let modelToUse: string;
+      let selectedModel: string;
+      if (planRoute) {
+        modelToUse = planRoute.modelId;
+        selectedModel = planRoute.modelId;
+      } else {
+        // A request/session model is a preference, not authority. Resolve it
+        // against the current cost state immediately before dispatch so an old
+        // MCP client or stored session cannot bypass optimized mode.
+        try {
+          // Same inputs as the pre-flight above (nothing in between changes the model
+          // or the request), so reuse its decision when it resolved cleanly.
+          modelPolicyDecision = preflightDecision ?? await resolveEffectiveModelForUser({
+            userId: session.userId,
+            requestedModel: llmModel || session.llmModel || null,
+            backupModel: llmBackupModel,
+            backupSource: llmBackupModel ? 'user' : null,
+            allowSilentSwap: !explicitModelSelection,
+            session,
+          });
+        } catch (modelError) {
+          if (!isModelUnavailableError(modelError)) throw modelError;
+          // FAIL-LOUD: nothing was sent to any model. No session write, no
+          // metering, user message not persisted. The inner finally releases the
+          // generation lock + idem claim; close the run record created above.
+          if (runSurvivalRunId) {
+            void markRunTerminal(runSurvivalRunId, 'failed', { finishReason: 'model_unavailable' });
+          }
+          return res.status(422).json(sendRefusalBody(modelUnavailableBody(modelError), false));
         }
-        return res.status(422).json(sendRefusalBody(modelUnavailableBody(modelError), false));
+        if (!modelPolicyDecision.effectiveModel) {
+          // Paused: the one shared producer stamps the decision and builds the 429.
+          return res.status(429).json(sendRefusalBody(await buildUsagePausedBody({
+            usageStatus: usageStatus!,
+            session,
+            requestedModel: modelPolicyDecision.requestedModel,
+            decision: modelPolicyDecision,
+          }), false));
+        }
+        modelToUse = modelPolicyDecision.effectiveModel;
+        // ENG-669 PR-C: the session keeps the SELECTION (`agentweb-model` when routed); `modelToUse` is what runs. The
+        // auto continuations this turn may start are handed the selection too: each continuation is a turn of its own, so
+        // it is routed again (deterministic: the same table routes it to the same model), re-checks the switch and the
+        // router's availability (a rollback stops the chain with a visible refusal), and its replies carry the stamp.
+        selectedModel = storedModelFor(modelPolicyDecision, modelToUse);
+        await chatbotDb.updateSessionLlmModel(
+          sessionId,
+          selectedModel,
+          toStoredModelPolicyDecision(modelPolicyDecision),
+          // ENG-669: the portal echoes the stored stamp every turn; that is not a new choice.
+          modelSourceAfter(session, selectedModel, llmModel),
+        );
+
       }
-      if (!modelPolicyDecision.effectiveModel) {
-        // Paused: the one shared producer stamps the decision and builds the 429.
-        return res.status(429).json(sendRefusalBody(await buildUsagePausedBody({
-          usageStatus,
-          session,
-          requestedModel: modelPolicyDecision.requestedModel,
-          decision: modelPolicyDecision,
-        }), false));
-      }
-      const modelToUse = modelPolicyDecision.effectiveModel;
-      // ENG-669 PR-C: the session keeps the SELECTION (`agentweb-model` when routed); `modelToUse` is what runs. The
-      // auto continuations this turn may start are handed the selection too: each continuation is a turn of its own, so
-      // it is routed again (deterministic: the same table routes it to the same model), re-checks the switch and the
-      // router's availability (a rollback stops the chain with a visible refusal), and its replies carry the stamp.
-      const selectedModel = storedModelFor(modelPolicyDecision, modelToUse);
-      await chatbotDb.updateSessionLlmModel(
-        sessionId,
-        selectedModel,
-        toStoredModelPolicyDecision(modelPolicyDecision),
-        // ENG-669: the portal echoes the stored stamp every turn; that is not a new choice.
-        modelSourceAfter(session, selectedModel, llmModel),
-      );
 
       // Build page context for emma-sidebar sessions
       const pageContext = session.portalType === 'emma-sidebar'
@@ -11475,14 +11550,26 @@ export const agentModeController = {
         false,
         // ENG-2378: an explicit model pick = a request model that differs from the stored stamp (the portal echoes the stamp).
         // ENG-669 PR-C: the pick is the selection (the engine routes an AgentWeb Model pick itself).
-        explicitModelSelection && selectedModel !== session.llmModel ? selectedModel : undefined,
+        !planRoute && explicitModelSelection && selectedModel !== session.llmModel ? selectedModel : undefined,
         modelPolicyDecision, // ENG-669 PR-C: this turn's decision (routing provenance on the replies)
+        undefined, // routerTaskType
+        planRoute, // ENG-2113: set only when this turn runs on the user's own Claude plan
       );
 
       let response: Awaited<ReturnType<typeof generateSessionResponse>>;
       try {
         response = await withGenerationTimeout(genPromise, sessionId);
       } catch (genErr: any) {
+        // ENG-2113: a plan turn that hits the whole-turn cap is stopped (this reaches the Claude run registry) and reported as the timeout it is.
+        // None of the salvage below applies: it would schedule automatic continuations, which run on AgentWeb's models.
+        if (planRoute && genErr?.isGenerationTimeout) {
+          requestCancel(sessionId);
+          generateMarketingResponseWorkerService.cancelSession(sessionId);
+          // A typed stop with fixed copy (not the generic error path / diagnosis agent). The user message was saved long before the cap.
+          const timeoutStop = new ClaudeRouteStopError('turn_timeout');
+          markRaisedAfterUserMessageSaved(timeoutStop);
+          throw timeoutStop;
+        }
         // A long landing-page build outlived the run timeout but is still running.
         // Don't report a false failure — tell the user it's still building and post
         // the result back to this session when it finishes. Scoped to landing builds
@@ -11673,7 +11760,8 @@ export const agentModeController = {
       // finishes without the customer's involvement. setImmediate defers the kickoff
       // past this request's own `finally` below, so scheduleAutoMediaContinuation
       // claims the generation lock only after THIS request has released it.
-      if (hasDeferredMediaBudgetToolCall(response.toolCalls)) {
+      // ENG-2113: automatic follow-up turns would run on AgentWeb's models; on the plan route the user is asked to continue instead.
+      if (!planRoute && hasDeferredMediaBudgetToolCall(response.toolCalls)) {
         setImmediate(() => scheduleAutoMediaContinuation(sessionId, session.userId, selectedModel, 1, false).catch((err) =>
           console.error(`AgentMode: media auto-continuation (soft deferral) failed for session ${sessionId}:`, err),
         ));
@@ -11685,11 +11773,11 @@ export const agentModeController = {
       // "retry" instead of just continuing per the plan's own "never wait on the user"
       // contract, and the session then sat idle for 3+ hours. Auto-fire the continuation
       // ourselves, same setImmediate-after-release pattern as the media case above.
-      if (hasStalledAutocompleteWorkPlan(response.workPlan, response.toolCalls, response.calledFunctions)) {
+      if (!planRoute && hasStalledAutocompleteWorkPlan(response.workPlan, response.toolCalls, response.calledFunctions)) {
         setImmediate(() => scheduleAutoWorkPlanContinuation(sessionId, session.userId, selectedModel, 1, false).catch((err) =>
           console.error(`AgentMode: work-plan auto-continuation failed for session ${sessionId}:`, err),
         ));
-      } else if (response.workPlan?.autocomplete && hasNonRetryableWorkPlanStatusBlock(response.toolCalls)) {
+      } else if (!planRoute && response.workPlan?.autocomplete && hasNonRetryableWorkPlanStatusBlock(response.toolCalls)) {
         // ENG-2019: non-retryable gate block — hand back once instead of auto-continuing.
         setImmediate(() => postWorkPlanNeedsYouMessage(sessionId, session.userId).catch((err) =>
           console.error(`AgentMode: work-plan needs-you message failed for session ${sessionId}:`, err),
@@ -11816,6 +11904,36 @@ export const agentModeController = {
         if (runSurvivalRunId) void markRunTerminal(runSurvivalRunId, 'failed', { finishReason: 'model_unavailable' });
         if (req.body?.sessionId) markProgressComplete(req.body.sessionId);
         return res.status(422).json(sendRefusalBody(modelUnavailableBody(error), wasRaisedAfterUserMessageSaved(error)));
+      }
+      // ENG-2113: the plan route stopped the turn after the user's message was saved (host busy, plan limit, login dead...). A fixed-copy
+      // note keeps the chat honest on reload; no diagnosis agent (it would spend AgentWeb money to guess at something already known).
+      const planStop =
+        error instanceof ClaudeRouteStopError
+          ? error
+          // A full session keeps its own answer (413, start a new chat): "try again" would never work. Everything else on a plan turn is a typed stop.
+          : planTurn && !res.headersSent && !(error instanceof Error && isSessionLimitError(error))
+            ? new ClaudeRouteStopError(error instanceof Error && isWorkerShutdownError(error) ? 'server_restarting' : 'turn_failed')
+            : undefined;
+      if (planStop && !res.headersSent) {
+        if (planStop !== error) {
+          console.error('AgentMode: plan turn failed outside the Claude backend:', error instanceof Error ? error.message : String(error));
+          if (wasRaisedAfterUserMessageSaved(error)) markRaisedAfterUserMessageSaved(planStop);
+        }
+        if (runSurvivalRunId) void markRunTerminal(runSurvivalRunId, 'failed', { finishReason: `claude_plan_${planStop.code}` });
+        const stoppedSessionId = req.body?.sessionId;
+        if (stoppedSessionId) {
+          markProgressComplete(stoppedSessionId);
+          // A note under a message that was never saved would be an answer to nothing.
+          if (wasRaisedAfterUserMessageSaved(planStop)) {
+            await chatbotDb.addMessageToSession(stoppedSessionId, {
+              role: 'assistant',
+              content: planStop.userMessage,
+              timestamp: new Date().toISOString(),
+              metadata: { timestamp: new Date().toISOString(), isErrorMessage: true, kind: 'claude-plan-stop', code: planStop.code },
+            } as ChatMessage).catch((persistErr) => console.error('AgentMode: failed to persist plan stop note:', persistErr));
+          }
+        }
+        return res.status(planStop.httpStatus).json(sendRefusalBody(claudeStopBody(planStop), wasRaisedAfterUserMessageSaved(planStop)));
       }
       console.error('AgentMode: Generate response error:', error);
 
@@ -12642,6 +12760,11 @@ export const agentModeController = {
     // error path needs this turn's starting point to attribute successes correctly.
     let turnStartCalledFunctions: Record<string, number> | null = null;
     try {
+      // ENG-2113: a shared link always runs on AgentWeb's models. A client that asks for the plan here must hear no, not be answered by AgentWeb
+      // (the same rule as /generate and /verified-generate).
+      if (req.body?.fundingChoice !== undefined && req.body?.fundingChoice !== null && req.body?.fundingChoice !== 'agentweb') {
+        return res.status(400).json(sendRefusalBody(claudeStopBody(new ClaudeRouteStopError('invalid_funding_choice')), false));
+      }
       const { shareId } = req.params;
       const { conversable } = req.query;
       const { userMessage, llmModel, attachments = [], workPlanInputAnswer, deckAnswer, deckCancel, clientId } = req.body;
@@ -17369,6 +17492,11 @@ export const agentModeController = {
   // Verified generate - ensures required functions are called minimum number of times
   async verifiedGenerate(req: Request, res: Response) {
     try {
+      // ENG-2113: this endpoint always runs on AgentWeb's models. A client that asks for the user's own plan here must hear no, not be silently
+      // run on AgentWeb (the same rule as /generate: a plan request is never turned into an AgentWeb run).
+      if (req.body?.fundingChoice !== undefined && req.body?.fundingChoice !== null && req.body?.fundingChoice !== 'agentweb') {
+        return res.status(400).json(sendRefusalBody(claudeStopBody(new ClaudeRouteStopError('invalid_funding_choice')), false));
+      }
       const user = req.user as User;
       const { sessionId, startingMessage, requiredFunctions, keywords, attachments, maxAttempts: maxAttemptsParam } = req.body;
       

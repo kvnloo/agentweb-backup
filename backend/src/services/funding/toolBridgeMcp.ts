@@ -94,6 +94,10 @@ export class ToolBridgeMcpAdapter {
   }
 
   /** The user pressed Stop. Closes the session's runs and MCP sessions; the caller must also end the host turn gracefully. */
+  rearmUnknownOutcome(userId: string, sessionId: string): void {
+    this.bridge.rearmUnknownOutcome(userId, sessionId);
+  }
+
   cancelSession(userId: string, sessionId: string): { cancelled: boolean; runIds: string[] } {
     const result = this.bridge.cancelSession(userId, sessionId);
     for (const runId of result.runIds) this.closeSessions(runId);
@@ -109,6 +113,11 @@ export class ToolBridgeMcpAdapter {
 
   takeLedger(runId: string, opts?: { clear?: boolean }): { records: BridgeCallRecord[]; truncated: number } {
     return this.bridge.takeLedger(runId, opts);
+  }
+
+  /** Id of the run's ledger, valid after the run has been closed (calls that finish late are added to it). */
+  generationOf(runId: string): string | undefined {
+    return this.bridge.generationOf(runId);
   }
 
   takeLedgerByGeneration(generation: string): { records: BridgeCallRecord[]; truncated: number } {
