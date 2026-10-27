@@ -293,6 +293,7 @@ export async function executeRun(run: PushRun, deps: EngineDeps): Promise<RunOut
         }
         // If Smartlead also reports leads it SKIPPED because they sit in other campaigns, the "other campaigns" map cannot be told
         // apart from them (what that tally counts is unverified), so none of its entries is trusted: those leads stay unmarked.
+        const otherMapEmails = new Set(Object.keys(result.leads.existingInOtherCampaigns ?? {}).map(e => e.toLowerCase()));
         if (result.skippedBy.inOtherCampaign === 0) {
           for (const [email, id] of Object.entries(result.leads.existingInOtherCampaigns ?? {})) {
             if (idByEmail.size < result.added + result.alreadyInCampaign) idByEmail.set(email.toLowerCase(), String(id));
@@ -303,6 +304,9 @@ export async function executeRun(run: PushRun, deps: EngineDeps): Promise<RunOut
 
         const toMark: Array<{ leadId: string; marker: SmartleadMarker }> = [];
         let missing = 0;
+        // Leads left unmarked that Smartlead listed under "other campaigns": whether they were added is unknown, and a lead that WAS
+        // added without a marker would be invisible to the opt-out safeguards, so these are never accepted as "explained".
+        let unresolvedOther = 0;
         let namedInvalid = 0;
         let namedUnsubscribed = 0;
         for (const e of toSend) {
@@ -311,6 +315,7 @@ export async function executeRun(run: PushRun, deps: EngineDeps): Promise<RunOut
           if (smartleadLeadId) toMark.push({ leadId: String(e.lead.leadId), marker: buildSmartleadMarker({ runId: run.runId, payloadHash: e.payloadHash, smartleadLeadId, now: deps.now() }) });
           else if (invalid.has(email)) { add(skipped, "smartlead_invalid"); namedInvalid++; }
           else if (unsubscribed.has(email)) { add(skipped, "smartlead_unsubscribed"); namedUnsubscribed++; }
+          else if (otherMapEmails.has(email)) unresolvedOther++;
           else missing++;
         }
 
@@ -345,6 +350,7 @@ export async function executeRun(run: PushRun, deps: EngineDeps): Promise<RunOut
         // not recorded as skipped. Stop WITHOUT moving the cursor, so a resume (after the customer raises the limit) rebuilds the
         // batch, skips what is marked and sends the rest.
         if (result.limitExhausted) return await pause("smartlead_lead_limit");
+        if (unresolvedOther > 0) return await pause("other_campaign_leads");
 
         // A lead Smartlead did not name is only acceptable when its own tallies explain it (block list, bounce, duplicate...).
         // Otherwise it may be in the campaign without a marker, which the opt-out safeguards could not see: stop and retry.
