@@ -24,9 +24,10 @@ export interface SmartLeadMetrics {
 // ─── Constants ──────────────────────────────────────────────────────────
 
 const DEFAULT_BASE_URL = "https://server.smartlead.ai/api/v1";
-// Test environments can point at a local stub (test-env/smartlead-stub.js); never honoured in production.
+// Test environments can point at a local stub (test-env/smartlead-stub.js). Honoured only when NODE_ENV is
+// explicitly development or test, so an unset NODE_ENV (as in a real deployment) can never redirect customer keys.
 const BASE_URL =
-  process.env.NODE_ENV !== "production" && process.env.SMARTLEAD_API_BASE_URL
+  (process.env.NODE_ENV === "development" || process.env.NODE_ENV === "test") && process.env.SMARTLEAD_API_BASE_URL
     ? process.env.SMARTLEAD_API_BASE_URL.replace(/\/+$/, "")
     : DEFAULT_BASE_URL;
 const LEADS_PAGE_LIMIT = 100;
@@ -150,6 +151,14 @@ export class SmartleadApiError extends Error {
   }
 }
 
+/** A 200 whose body is not the list we asked for (a wrong-key or wrong-plan reply may look like this). */
+export class SmartleadUnexpectedResponseError extends SmartleadApiError {
+  constructor(message: string) {
+    super(message);
+    this.name = "SmartleadUnexpectedResponseError";
+  }
+}
+
 export async function smartleadRequest<T>(
   apiKey: string,
   method: "GET" | "POST" | "PATCH" | "DELETE",
@@ -245,31 +254,33 @@ export interface SmartleadEmailAccount {
  */
 export async function listEmailAccounts(
   apiKey: string,
-  opts: { maxRetries?: number } = {},
+  opts: { maxRetries?: number; maxPages?: number } = {},
 ): Promise<SmartleadEmailAccount[]> {
-  const byId = new Map<number, SmartleadEmailAccount>();
-  for (let page = 0; page < EMAIL_ACCOUNTS_MAX_PAGES; page++) {
+  const maxPages = Math.min(opts.maxPages ?? EMAIL_ACCOUNTS_MAX_PAGES, EMAIL_ACCOUNTS_MAX_PAGES);
+  // Keyed by id; a row whose id we cannot read (the field name is unverified) is still a mailbox, so it is kept under a position key.
+  const seen = new Map<number | string, SmartleadEmailAccount>();
+  for (let page = 0; page < maxPages; page++) {
     const data = await smartleadRequest<unknown>(apiKey, "GET", "/email-accounts", {
-      params: page === 0 ? undefined : { offset: byId.size },
+      params: page === 0 ? undefined : { offset: seen.size },
       maxRetries: opts.maxRetries,
     });
     if (!Array.isArray(data)) {
-      throw new SmartleadApiError("Smartlead GET /email-accounts returned an unexpected response");
+      throw new SmartleadUnexpectedResponseError("Smartlead GET /email-accounts returned an unexpected response");
     }
-    const before = byId.size;
-    for (const row of data as Array<{ id?: unknown; from_email?: unknown }>) {
+    const before = seen.size;
+    data.forEach((row: { id?: unknown; from_email?: unknown } | null, i) => {
       const id = Number(row?.id);
-      if (Number.isFinite(id) && !byId.has(id)) {
-        byId.set(id, { id, email: String(row.from_email ?? "") });
-      }
-    }
-    if (data.length === 0 || byId.size === before) break;
+      const key = Number.isFinite(id) ? id : `row-${before + i}`;
+      if (!seen.has(key)) seen.set(key, { id: Number.isFinite(id) ? id : 0, email: String(row?.from_email ?? "") });
+    });
+    if (data.length === 0 || seen.size === before) break;
   }
-  return [...byId.values()];
+  return [...seen.values()];
 }
 
 async function fetchEmailAccounts(apiKey: string): Promise<number> {
-  return (await listEmailAccounts(apiKey)).length;
+  const data = await smartleadRequest<unknown[]>(apiKey, "GET", "/email-accounts");
+  return Array.isArray(data) ? data.length : 0;
 }
 
 // ─── Main Function ──────────────────────────────────────────────────────

@@ -498,7 +498,8 @@ export const createAccount = async (
   // ENG-2686: false when the provider could not confirm the account (e.g. a Unipile
   // ID that getAccount refused); the row is still saved but no integration_connected
   // signal fires for an integration that never happened.
-  opts: { providerVerified?: boolean } = {}
+  // ENG-673: resetSharing makes a reconnect private again (a replaced API key must not stay org-shared).
+  opts: { providerVerified?: boolean; resetSharing?: boolean } = {}
 ): Promise<ConnectedAccount> => {
   const user = await userDb.getUserById(userId);
   if (!user) {
@@ -523,6 +524,7 @@ export const createAccount = async (
     account_id: input.account_id,
     account_name: input.account_name,
     config: input.config,
+    ...(opts.resetSharing ? { sharedWithOrg: false } : {}),
     created_at: existingAccount?.created_at || now,
     updated_at: now,
   };

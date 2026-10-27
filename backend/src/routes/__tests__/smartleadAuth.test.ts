@@ -9,12 +9,8 @@ jest.mock('../../middleware/auth', () => ({
 }));
 
 const mockCreateAccount = jest.fn();
-const mockGetAccounts = jest.fn();
-const mockDeleteAccountById = jest.fn();
 jest.mock('../../services/connectedAccountsDb', () => ({
   createAccount: (...args: any[]) => mockCreateAccount(...args),
-  getAccountsByUserId: (...args: any[]) => mockGetAccounts(...args),
-  deleteAccountById: (...args: any[]) => mockDeleteAccountById(...args),
 }));
 
 const mockListEmailAccounts = jest.fn();
@@ -24,7 +20,7 @@ jest.mock('../../services/smartleadService', () => ({
 }));
 
 import smartleadAuthRouter from '../smartleadAuth';
-import { SmartleadApiError } from '../../services/smartleadService';
+import { SmartleadApiError, SmartleadUnexpectedResponseError } from '../../services/smartleadService';
 import { decryptPassword } from '../../utils/crypto';
 
 const KEY = 'sl_live_supersecret_key_123';
@@ -45,7 +41,6 @@ describe('POST /api/oauth/smartlead/connect (ENG-673)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     jest.spyOn(console, 'error').mockImplementation(() => {});
-    mockGetAccounts.mockResolvedValue([]);
     mockCreateAccount.mockImplementation(async (userId: string, platform: string, input: any) => ({
       platform,
       account_id: input.account_id,
@@ -104,7 +99,7 @@ describe('POST /api/oauth/smartlead/connect (ENG-673)', () => {
     mockListEmailAccounts.mockResolvedValue([{ id: 1, email: 'a@x.com' }, { id: 2, email: 'b@x.com' }]);
     const res = await connect({ api_key: `  ${KEY}  ` }, 'user-123');
     expect(res.status).toBe(200);
-    expect(mockListEmailAccounts).toHaveBeenCalledWith(KEY, { maxRetries: 1 });
+    expect(mockListEmailAccounts).toHaveBeenCalledWith(KEY, { maxRetries: 0, maxPages: 1 });
 
     const [userId, platform, input] = mockCreateAccount.mock.calls[0];
     expect(userId).toBe('user-123');
@@ -122,20 +117,19 @@ describe('POST /api/oauth/smartlead/connect (ENG-673)', () => {
     expect(res.body.warning).toBeUndefined();
   });
 
-  it('un-shares the connection when a shared key is replaced', async () => {
+  it('asks createAccount to make a replaced key private again, in the same write', async () => {
     mockListEmailAccounts.mockResolvedValue([{ id: 1, email: 'a@x.com' }]);
-    mockGetAccounts.mockResolvedValue([{ platform: 'smartlead', account_id: 'smartlead-user-123', sharedWithOrg: true }]);
-    const res = await connect({ api_key: KEY }, 'user-123');
-    expect(res.status).toBe(200);
-    expect(mockDeleteAccountById).toHaveBeenCalledWith('user-123', 'smartlead', 'smartlead-user-123');
-    expect(mockDeleteAccountById.mock.invocationCallOrder[0]).toBeLessThan(mockCreateAccount.mock.invocationCallOrder[0]);
+    await connect({ api_key: KEY }, 'user-123');
+    expect(mockCreateAccount).toHaveBeenCalledTimes(1);
+    expect(mockCreateAccount.mock.calls[0][3]).toEqual({ resetSharing: true });
   });
 
-  it('leaves an unshared connection alone when its key is replaced', async () => {
-    mockListEmailAccounts.mockResolvedValue([{ id: 1, email: 'a@x.com' }]);
-    mockGetAccounts.mockResolvedValue([{ platform: 'smartlead', account_id: 'smartlead-user-123', sharedWithOrg: false }]);
-    await connect({ api_key: KEY }, 'user-123');
-    expect(mockDeleteAccountById).not.toHaveBeenCalled();
+  it('answers a 200 that is not a list with its own message, not the generic retry-later one', async () => {
+    mockListEmailAccounts.mockRejectedValue(new SmartleadUnexpectedResponseError('Smartlead GET /email-accounts returned an unexpected response'));
+    const res = await connect({ api_key: KEY });
+    expect(res.status).toBe(502);
+    expect(res.body.error).toMatch(/did not expect/);
+    expect(mockCreateAccount).not.toHaveBeenCalled();
   });
 
   it('connects a valid key with no mailboxes and warns', async () => {
