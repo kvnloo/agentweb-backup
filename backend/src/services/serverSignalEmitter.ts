@@ -11,9 +11,14 @@
  *
  * Contract: fire-and-forget. emitSignal never throws; a missing list, unknown customer or a write failure
  * is logged and swallowed so the Stripe webhook ack is never affected.
+ *
+ * ENG-2686 adds two more families on the same row/ingest path: app lifecycle (login, onboarding,
+ * integration_connected, trial_activated) and engagement with PLATFORM email — mail AgentWeb itself
+ * sends to its users, identified by the system sender. Customer-sent email is never emitted.
  */
 import type { ParsedIngest } from '../utils/trackingIngest';
 import { invoiceSubscriptionId } from '../utils/stripeInvoiceFields';
+import { RESEND_SYSTEM_EMAIL } from '../config';
 
 export const DEFAULT_HIREEMMA_SIGNAL_LIST_ID = 'list_1793037224311_9umtchng7';
 
@@ -28,7 +33,32 @@ export type BillingSignalName =
   | 'subscription_started'
   | 'subscription_renewed'
   | 'subscription_plan_changed'
-  | 'subscription_cancelled';
+  | 'subscription_cancelled'
+  // ENG-2686: a subscription created in Stripe's `trialing` status.
+  | 'trial_activated';
+
+/** ENG-2686: engagement with PLATFORM email (AgentWeb → its own users), never customer-sent email. */
+export type EngagementSignalName =
+  | 'email_sent'
+  | 'email_suppressed'
+  | 'email_opened'
+  | 'email_clicked'
+  | 'email_unsubscribed'
+  | 'email_bounced'
+  | 'retargeting_audience_added';
+
+/** ENG-2686: account lifecycle inside the app. */
+export type AppSignalName =
+  | 'login'
+  | 'logout'
+  | 'trial_activated'
+  | 'onboarding_step_completed'
+  | 'onboarding_completed'
+  | 'onboarding_skipped'
+  | 'onboarding_abandoned'
+  | 'integration_connected';
+
+export type ServerSignalName = BillingSignalName | EngagementSignalName | AppSignalName;
 
 export interface BillingSignal {
   name: BillingSignalName;
@@ -64,8 +94,12 @@ export function mapStripeEventToSignals(event: { id?: string; type?: string; dat
   const base = { stripeEventId: String(event.id || '') };
 
   switch (event.type) {
-    case 'customer.subscription.created':
-      return [{ name: 'subscription_started', stripeCustomerId: customer, props: { ...base, subscriptionId: obj.id || '', status: obj.status || '' } }];
+    case 'customer.subscription.created': {
+      const props = { ...base, subscriptionId: obj.id || '', status: obj.status || '' };
+      const out: BillingSignal[] = [{ name: 'subscription_started', stripeCustomerId: customer, props }];
+      if (obj.status === 'trialing') out.push({ name: 'trial_activated', stripeCustomerId: customer, props });
+      return out;
+    }
     case 'customer.subscription.deleted':
       return [{ name: 'subscription_cancelled', stripeCustomerId: customer, props: { ...base, subscriptionId: obj.id || '' } }];
     case 'customer.subscription.updated': {
@@ -96,6 +130,8 @@ export interface EmitterDeps {
   getList: (listId: string) => Promise<Record<string, any> | null | undefined>;
   ingest: (input: { list: Record<string, any>; parsed: ParsedIngest; userAgent: string; visitorIp: string }) => Promise<unknown>;
   findUserByStripeCustomerId: (customerId: string) => Promise<any | null>;
+  findUserById: (userId: string) => Promise<any | null>;
+  findUserByEmail: (email: string) => Promise<any | null>;
   now: () => number;
   logger: Pick<typeof console, 'warn' | 'error'>;
 }
@@ -103,7 +139,16 @@ export interface EmitterDeps {
 async function defaultDeps(): Promise<EmitterDeps> {
   const { getIngestList, ingestTrackerEvent } = await import('./trackerIngestService');
   const { findUserByStripeCustomerId } = await import('./stripeService');
-  return { getList: getIngestList, ingest: ingestTrackerEvent, findUserByStripeCustomerId, now: Date.now, logger: console };
+  const { userDb } = await import('./db');
+  return {
+    getList: getIngestList,
+    ingest: ingestTrackerEvent,
+    findUserByStripeCustomerId,
+    findUserById: (id) => userDb.getUserById(id),
+    findUserByEmail: (email) => userDb.getUserByEmail(email),
+    now: Date.now,
+    logger: console,
+  };
 }
 
 /** Pure: the ParsedIngest for one server signal on an account's row. */
@@ -126,7 +171,7 @@ export function buildSignalIngest(listId: string, user: { userId: string; create
 /** Writes one signal for an already-resolved account. Never throws. */
 export async function emitAccountSignal(
   user: { userId: string; createdAt?: string } | null | undefined,
-  name: BillingSignalName,
+  name: ServerSignalName,
   props: Record<string, string | number>,
   overrides: Partial<EmitterDeps> = {},
 ): Promise<boolean> {
@@ -161,5 +206,128 @@ export async function emitStripeSignals(event: any, overrides: Partial<EmitterDe
   } catch (err: any) {
     (overrides.logger || console).error(`[serverSignal] stripe ${event?.type} failed: ${err?.message ?? err}`);
     return 0;
+  }
+}
+
+// ── ENG-2686: app lifecycle ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * Pure: the app signal one persisted onboarding event produces. Lateral (analytics-only) events
+ * produce none — they never move the lifecycle, so they don't belong in the funnel either.
+ */
+export function mapOnboardingEventToSignal(
+  event: string,
+  lateral: boolean,
+): { name: AppSignalName; props: Record<string, string> } | null {
+  if (!event || lateral) return null;
+  if (event === 'onboarding_completed' || event === 'onboarding_skipped' || event === 'onboarding_abandoned') {
+    return { name: event, props: {} };
+  }
+  return { name: 'onboarding_step_completed', props: { step: event.slice(0, 80) } };
+}
+
+/** App entry point: emits for an account object or a userId (resolved; unknown → dropped). Never throws. */
+export async function emitAppSignal(
+  userOrUserId: { userId: string; createdAt?: string } | string | null | undefined,
+  name: AppSignalName,
+  props: Record<string, string | number> = {},
+  overrides: Partial<EmitterDeps> = {},
+): Promise<boolean> {
+  try {
+    if (!userOrUserId) return false;
+    if (typeof userOrUserId !== 'string') return await emitAccountSignal(userOrUserId, name, props, overrides);
+    const deps = { ...(await defaultDeps()), ...overrides };
+    const user = await deps.findUserById(userOrUserId);
+    if (!user) return false;
+    return await emitAccountSignal(user, name, props, deps);
+  } catch (err: any) {
+    (overrides.logger || console).error(`[serverSignal] app ${name} failed: ${err?.message ?? err}`);
+    return false;
+  }
+}
+
+// ── ENG-2686: platform email engagement ─────────────────────────────────────────────────────────────
+
+/** The only sender whose mail is AgentWeb's own platform email (config.RESEND_SYSTEM_EMAIL). */
+export const PLATFORM_EMAIL_SENDER = RESEND_SYSTEM_EMAIL.toLowerCase();
+
+const bareEmail = (addr: unknown): string => {
+  const s = String(addr || '').trim();
+  const m = s.match(/<([^>]+)>/);
+  return (m ? m[1] : s).trim().toLowerCase();
+};
+
+const RESEND_ENGAGEMENT: Record<string, EngagementSignalName> = {
+  'email.sent': 'email_sent',
+  'email.suppressed': 'email_suppressed',
+  'email.opened': 'email_opened',
+  'email.clicked': 'email_clicked',
+  'email.bounced': 'email_bounced',
+  // A spam complaint is the recipient opting out of our mail; Resend has no separate unsubscribe event.
+  'email.complained': 'email_unsubscribed',
+};
+
+export interface EngagementSignal {
+  name: EngagementSignalName;
+  recipient: string;
+  props: Record<string, string>;
+}
+
+/**
+ * Pure: the engagement signal for one Resend webhook event, or null. Only mail sent FROM the
+ * platform sender qualifies — anything a customer (or Emma on a customer's behalf) sends to their
+ * own contacts is customer data, not hireemma.ai funnel, and is dropped here.
+ */
+export function mapResendEventToEngagementSignal(event: { type?: string; data?: any }): EngagementSignal | null {
+  const name = RESEND_ENGAGEMENT[String(event?.type || '')];
+  if (!name || bareEmail(event?.data?.from) !== PLATFORM_EMAIL_SENDER) return null;
+  const to = Array.isArray(event.data.to) ? event.data.to : [event.data.to];
+  const recipient = bareEmail(to.find(Boolean));
+  if (!recipient) return null;
+  const props: Record<string, string> = { emailId: String(event.data.email_id || ''), subject: String(event.data.subject || '').slice(0, 120) };
+  if (name === 'email_clicked') {
+    // Path only: clicked links can carry tokens (e.g. domain-join) in the query string.
+    const raw = String(event.data.click?.link || '');
+    let linkPath = '';
+    try { linkPath = new URL(raw).pathname; } catch { linkPath = raw.split(/[?#]/)[0]; }
+    props.link = linkPath.slice(0, 200);
+  }
+  if (name === 'email_bounced') props.bounceType = String(event.data.bounce?.type || '');
+  if (event.type === 'email.complained') props.reason = 'spam_complaint';
+  return { name, recipient, props };
+}
+
+/**
+ * Engagement entry point: resolves the recipient email to an AgentWeb account and emits on its row.
+ * No account → dropped (returns false). Never throws.
+ */
+export async function emitEmailEngagementSignal(
+  recipientEmail: string,
+  name: EngagementSignalName,
+  props: Record<string, string | number> = {},
+  overrides: Partial<EmitterDeps> = {},
+): Promise<boolean> {
+  try {
+    const email = bareEmail(recipientEmail);
+    if (!email) return false;
+    const deps = { ...(await defaultDeps()), ...overrides };
+    const user = await deps.findUserByEmail(email);
+    if (!user?.userId) return false;
+    return await emitAccountSignal(user, name, props, deps);
+  } catch (err: any) {
+    (overrides.logger || console).error(`[serverSignal] email ${name} failed: ${err?.message ?? err}`);
+    return false;
+  }
+}
+
+/** Resend webhook entry point. Never throws. */
+export async function emitResendEngagementSignal(event: any, overrides: Partial<EmitterDeps> = {}): Promise<boolean> {
+  try {
+    const signal = mapResendEventToEngagementSignal(event);
+    if (!signal) return false;
+    return await emitEmailEngagementSignal(signal.recipient, signal.name, signal.props, overrides);
+  } catch (err: any) {
+    (overrides.logger || console).error(`[serverSignal] resend ${event?.type} failed: ${err?.message ?? err}`);
+    return false;
   }
 }
