@@ -52,6 +52,18 @@ describe("classifyTags and acknowledgement", () => {
   });
 });
 
+describe("classifyTags on a hostile list of tags", () => {
+  it("stays fast for tens of thousands of long tags, with a large mapping and a large acknowledged list", () => {
+    const tags = Array.from({ length: 20_000 }, (_, i) => `tag_${i}_${"x".repeat(80)}`);
+    const mapping = Object.fromEntries(Array.from({ length: 500 }, (_, i) => [`m${i}`, "customFields.a"]));
+    const acknowledged = Array.from({ length: 5_000 }, (_, i) => `ack${i}`);
+    const started = Date.now();
+    const c = classifyTags(tags, mapping, acknowledged);
+    expect(Date.now() - started).toBeLessThan(1500);
+    expect(c.unknown).toHaveLength(20_000);
+  });
+});
+
 describe("tags that name object internals", () => {
   it("never treats {{constructor}}, {{toString}} or {{__proto__}} as standard or mapped", () => {
     const c = classifyTags(["constructor", "__proto__", "toString", "hasOwnProperty"], {});

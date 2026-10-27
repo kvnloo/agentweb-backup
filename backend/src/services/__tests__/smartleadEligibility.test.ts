@@ -101,6 +101,14 @@ describe("selectSmartleadLeads (ENG-673)", () => {
     expect(selectSmartleadLeads([lead("a", { createdAt: Date.parse("2026-05-01T00:00:00Z") })], ctx({ runStartedAt: started })).eligible).toHaveLength(1);
   });
 
+  it("reads a time with no zone as UTC, not as the server's local time", () => {
+    const started = "2026-06-01T10:00:00Z";
+    const reason = (createdAt: string) => selectSmartleadLeads([lead("a", { createdAt })], ctx({ runStartedAt: started })).skipped[0]?.reason;
+    expect(reason("2026-06-01T09:59:59")).toBeUndefined();
+    expect(reason("2026-06-01T10:00:01")).toBe("created_after_start");
+    expect(reason("2026-05-31")).toBeUndefined();
+  });
+
   it("reads a numeric createdAt in seconds as seconds, and refuses text that is not an ISO date instead of guessing", () => {
     const started = "2026-06-01T00:00:00Z";
     const sec = (iso: string) => Date.parse(iso) / 1000;
