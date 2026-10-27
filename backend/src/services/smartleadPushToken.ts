@@ -33,6 +33,8 @@ export interface PushTokenPayload {
   eligible: number;
   /** Warnings shown at preview, kept on the run for the audit. */
   warnings: string[];
+  /** When the preview was taken (epoch milliseconds). A run started on this list and campaign after this makes the approval stale. */
+  iat: number;
   /** Epoch milliseconds. */
   exp: number;
 }
@@ -48,7 +50,7 @@ function canonical(p: PushTokenPayload): string {
     v: p.v, jti: p.jti, userId: p.userId, accountId: p.accountId, acknowledgeUnreadable: p.acknowledgeUnreadable, listId: p.listId, campaignId: p.campaignId, includeUnverified: p.includeUnverified,
     mapping: Object.fromEntries(Object.keys(p.mapping).sort().map(k => [k, p.mapping[k]])),
     acknowledgedTags: [...p.acknowledgedTags].sort(), startStatus: p.startStatus, sequenceHash: p.sequenceHash,
-    eligible: p.eligible, warnings: p.warnings, exp: p.exp,
+    eligible: p.eligible, warnings: p.warnings, iat: p.iat, exp: p.exp,
   });
 }
 
@@ -69,7 +71,7 @@ export function verifyPushToken(secret: string, token: unknown, nowMs: number): 
   try {
     const p = JSON.parse(Buffer.from(body, "base64url").toString("utf8")) as PushTokenPayload;
     if (p?.v !== 1 || typeof p.jti !== "string" || !p.jti || typeof p.accountId !== "string" || typeof p.acknowledgeUnreadable !== "boolean" || typeof p.userId !== "string" || typeof p.listId !== "string" || !Number.isInteger(p.campaignId) || p.campaignId <= 0) return null;
-    if (!Number.isInteger(p.eligible) || p.eligible < 0 || typeof p.sequenceHash !== "string" || typeof p.exp !== "number" || !(p.exp > nowMs)) return null;
+    if (!Number.isInteger(p.eligible) || p.eligible < 0 || typeof p.sequenceHash !== "string" || typeof p.iat !== "number" || typeof p.exp !== "number" || !(p.exp > nowMs)) return null;
     if (typeof p.includeUnverified !== "boolean" || !p.mapping || typeof p.mapping !== "object" || !Array.isArray(p.acknowledgedTags) || !Array.isArray(p.warnings)) return null;
     return p;
   } catch {

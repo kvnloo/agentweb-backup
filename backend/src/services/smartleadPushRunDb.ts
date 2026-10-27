@@ -536,7 +536,11 @@ export class SmartleadPushRunDb {
     };
 
     const put = await this.call(() => this.client.put({ TableName: this.table, Item: toRunItem(run, Math.floor(now / 1000) + RUN_RETENTION_DAYS * DAY_S), ConditionExpression: "attribute_not_exists(pk)" }).promise());
-    if (!put.ok) throw new SmartleadPushRunStoreError("unavailable", "A run id collided; try again");
+    if (!put.ok) {
+      // A condition failure on a fresh id can only be OUR OWN earlier attempt having committed (the reply was lost and the call retried).
+      // Carry on with that run rather than failing: failing would leave a committed, running Run with no lock behind.
+      if (!(await this.getRun(run.runId))) throw new SmartleadPushRunStoreError("unavailable", "A run id collided; try again");
+    }
 
     const lockItem = { pk: lockKey(input.listId, input.campaignId), sk: LOCK_SK, runId: run.runId, ttl: Math.floor(now / 1000) + LOCK_RETENTION_DAYS * DAY_S };
     const lock = await this.call(() =>
@@ -545,8 +549,9 @@ export class SmartleadPushRunDb {
         : this.client.put({ TableName: this.table, Item: lockItem, ConditionExpression: "attribute_not_exists(pk)" }).promise(),
     );
     if (!lock.ok) {
-      await this.abandonRun(run.runId);
       const winner = await this.getLock(input.listId, input.campaignId);
+      if (winner?.runId === run.runId) return { started: true, run }; // our own earlier lock write committed
+      await this.abandonRun(run.runId);
       const existing = winner ? await this.getRun(winner.runId) : null;
       return { started: false, existing, ...(winner && !existing ? { lockHeldBy: winner.runId } : {}) };
     }
@@ -575,8 +580,22 @@ export class SmartleadPushRunDb {
 
   // ── lease
 
+  /** Extends the lock's expiry, only if it already points at this run (never creates it). */
+  private async refreshLock(run: PushRun): Promise<boolean> {
+    const r = await this.call(() =>
+      this.client.put({
+        TableName: this.table,
+        Item: { pk: lockKey(run.listId, run.campaignId), sk: LOCK_SK, runId: run.runId, ttl: Math.floor(this.nowMs() / 1000) + LOCK_RETENTION_DAYS * DAY_S },
+        ConditionExpression: "#r = :me",
+        ExpressionAttributeNames: { "#r": "runId" },
+        ExpressionAttributeValues: { ":me": run.runId },
+      }).promise(),
+    );
+    return r.ok;
+  }
+
   /**
-   * Re-takes the lock for a run about to become live again (claim or resume) and refreshes its expiry. Fails if the lock points at
+   * Re-takes the lock for a run the USER is resuming (creating it if it expired while the run sat paused) and refreshes its expiry. Fails if the lock points at
    * another run: the lock's 15-day expiry can pass while a run sits paused, and a new run may have started since.
    */
   private async retakeLock(run: PushRun): Promise<boolean> {
@@ -596,7 +615,9 @@ export class SmartleadPushRunDb {
   /** Takes over a run whose lease lapsed (or that was released). Returns the run with the new epoch, or null if someone else got it. */
   async claimLease(runId: string, workerId: string, seenEpoch: number, skewMs = 30_000): Promise<PushRun | null> {
     const current = await this.getRun(runId);
-    if (!current || current.status !== "running" || !(await this.retakeLock(current))) return null;
+    // The lock must already point at this run. A running run with NO lock is an orphan (a crash between a start's two writes): letting it
+    // take the lock would let an approval that never started run later, so the resumer cancels it instead.
+    if (!current || current.status !== "running" || !(await this.refreshLock(current))) return null;
     const now = this.nowMs();
     const r = await this.call(() =>
       this.client.update({

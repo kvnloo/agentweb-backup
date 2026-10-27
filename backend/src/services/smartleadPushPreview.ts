@@ -141,6 +141,7 @@ export async function buildPreview(deps: PreviewDeps, req: PreviewRequest): Prom
   const payload: PushTokenPayload = {
     v: 1, jti: randomUUID(), userId: req.userId, accountId: req.accountId, acknowledgeUnreadable: req.acknowledgeUnreadable === true, listId: req.listId, campaignId: req.campaignId, includeUnverified: req.includeUnverified === true, mapping, acknowledgedTags,
     startStatus: campaign.status, sequenceHash: analysis.hash, eligible: chosen, warnings: preflight.warnings.map(w => w.message).slice(0, 20),
+    iat: now.getTime(),
     exp: now.getTime() + PUSH_TOKEN_TTL_MS,
   };
 

@@ -9,10 +9,11 @@ export {};
 
 import AWS from "aws-sdk";
 import { ulid } from "ulid";
-import { SmartleadPushService, STALE_PAUSED_MS, type PushServiceDeps } from "../smartleadPushService";
+import { SmartleadPushService, STALE_OPERATOR_PAUSED_MS, STALE_PAUSED_MS, type PushServiceDeps } from "../smartleadPushService";
 import { LEASE_MS, SMARTLEAD_PUSH_RUNS_TABLE_SPEC, SmartleadPushRunDb, SmartleadPushRunStoreError } from "../smartleadPushRunDb";
 import { isMarkedForCampaign } from "../smartleadMarkers";
 import { SmartleadApiError } from "../smartleadService";
+import { verifyPushToken } from "../smartleadPushToken";
 import { CAMPAIGN, FakeSmartlead, SEQUENCE, mkLead } from "./fixtures/smartleadPushEngineFakes";
 import { InMemoryPushRunDb } from "./fixtures/inMemoryPushRunDb";
 
@@ -266,14 +267,16 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
       expect((await db.listRunsForList(e.listId))).toHaveLength(1);
     });
 
-    it("gives an approval back when the start did not happen, so it can be used again", async () => {
+    it("gives an approval back when the start definitely did not happen (it lost the race for the lock)", async () => {
       const e = env({ maxConcurrentWorkers: 0 });
-      const first = await approve(e);
-      const second = await approve(e);
-      const r1 = (await e.svc.start("owner", go(first.token))) as any;
-      expect(await e.svc.start("owner", go(second.token))).toMatchObject({ ok: true, started: false }); // a run is already live
-      await e.svc.cancel("owner", r1.run.runId);
-      expect(await e.svc.start("owner", go(second.token))).toMatchObject({ ok: true, started: true }); // not spent by the failed attempt
+      const one = await approve(e);
+      const two = await approve(e);
+      const results = (await Promise.all([e.svc.start("owner", go(one.token)), e.svc.start("owner", go(two.token))])) as any[];
+      expect(results.filter(r => r.started)).toHaveLength(1);
+      const loser = results.find(r => r.ok && !r.started) ? (results[0].started ? two : one) : null;
+      expect(loser).not.toBeNull();
+      const jti = verifyPushToken("svc-secret", loser!.token, clock)!.jti;
+      expect(await db.claimToken(jti, 60)).toBe(true); // not spent by the attempt that started nothing
     });
 
     it("lets only the person whose Smartlead connection a run uses resume it; other editors can pause and cancel", async () => {
@@ -311,7 +314,7 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
       expect(await e.svc.start("owner", go(p.token))).toMatchObject({ ok: false, status: 409, code: "connection_changed" });
     });
 
-    it("keeps a run the operator's kill switch paused, however long the switch was off", async () => {
+    it("keeps a run the operator's kill switch paused through a long outage, but not for ever", async () => {
       const e = env({ leads: Array.from({ length: 900 }, (_, i) => mkLead(i + 1)) });
       e.sl.onPost = () => { e.flags.enabled = false; };
       const r = (await e.svc.start("owner", go((await approve(e, "owner", { cohort: 900 })).token))) as any;
@@ -321,6 +324,46 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
       e.flags.enabled = true;
       await e.svc.resumerTick();
       expect(((await e.svc.status("owner", r.run.runId)) as any).run.status).toBe("paused");
+      clock += STALE_OPERATOR_PAUSED_MS; // but a month later it is released like any other forgotten run
+      await e.svc.resumerTick();
+      expect(((await e.svc.status("owner", r.run.runId)) as any).run.status).toBe("canceled");
+      expect(await db.getLock(e.listId, CAMPAIGN)).toBeNull();
+    });
+
+    it("does NOT hand the approval back when starting threw: a lost reply must not let it start a second run", async () => {
+      const e = env({ maxConcurrentWorkers: 0 });
+      const p = await approve(e);
+      const start = db.startRun.bind(db);
+      let fail = true;
+      (e.deps.db as any) = new Proxy(db, { get: (t, k) => (k === "startRun" ? async (...a: any[]) => { const r = await (start as any)(...a); if (fail) { fail = false; throw new SmartleadPushRunStoreError("unavailable", "reply lost"); } return r; } : (t as any)[k]?.bind?.(t) ?? (t as any)[k]) });
+      expect(await e.svc.start("owner", go(p.token))).toMatchObject({ ok: false, status: 503 });
+      // The write DID commit. The same approval must not start another run.
+      expect(await e.svc.start("owner", go(p.token))).toMatchObject({ ok: true, started: false }); // shown the run holding the lock
+      expect(await db.listRunsForList(e.listId)).toHaveLength(1);
+    });
+
+    it("refuses an approval that went stale because another run started on the list and campaign since the preview", async () => {
+      const e = env({ leads: Array.from({ length: 120 }, (_, i) => mkLead(i + 1)) });
+      const first = await approve(e);
+      const second = await approve(e); // taken while nothing had been pushed: both default to the 50-lead test cohort
+      expect(await e.svc.start("owner", go(first.token))).toMatchObject({ ok: true, started: true });
+      await drain(e);
+      expect(await e.svc.start("owner", go(second.token))).toMatchObject({ ok: false, status: 409, code: "changed_since_preview" });
+      expect(e.sl.emails.size).toBe(50);
+      clock += 1000;
+      expect((await e.svc.start("owner", go((await approve(e)).token))).ok).toBe(true); // a fresh preview sees what is pushed and may go on
+    });
+
+    it("cancels, and never works, a running run that has no lock (a crash between a start's two writes)", async () => {
+      const e = env({ maxConcurrentWorkers: 0 });
+      const r = (await e.svc.start("owner", go((await approve(e)).token))) as any;
+      await db.releaseLock(e.listId, CAMPAIGN, r.run.runId);
+      clock += LEASE_MS + 31_000;
+      const alive = env({ shareDb: db, listId: e.listId, leads: e.leads, sl: e.sl });
+      expect(await alive.svc.resumerTick()).toEqual({ claimed: 0, canceled: 1 });
+      await drain(alive);
+      expect(((await alive.svc.status("owner", r.run.runId)) as any).run.status).toBe("canceled");
+      expect(e.sl.posts).toHaveLength(0);
     });
 
     it("binds the 'send even though my sequence could not be read' acknowledgement to the preview (it blocks an ACTIVE campaign)", async () => {
@@ -337,15 +380,29 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
       await drain(e);
     });
 
-    it("tells a rejected key from a Smartlead outage and a rate limit, and sends nothing", async () => {
+    it("tells a rejected key from a refusal, a rate limit, a bad request and an outage, and sends nothing", async () => {
       const e = env();
-      for (const [status, expected] of [[401, 422], [403, 422], [429, 429], [500, 502], [undefined, 502]] as const) {
+      for (const [status, expectedStatus, code] of [[401, 422, "key_rejected"], [403, 422, "smartlead_forbidden"], [400, 422, "smartlead_rejected_request"], [429, 429, "smartlead_rate_limited"], [500, 502, "smartlead_unavailable"], [undefined, 502, "smartlead_unavailable"]] as const) {
         e.deps.smartlead.getCampaign = async () => { throw new SmartleadApiError("x", status); };
         const r = await e.svc.preview("owner", { listId: e.listId, campaignId: CAMPAIGN });
-        expect(r).toMatchObject({ ok: false, status: expected });
+        expect(r).toMatchObject({ ok: false, status: expectedStatus, code });
         expect((r as any).message).not.toMatch(/api_key|stack/i);
       }
       expect(e.sl.posts).toHaveLength(0);
+    });
+
+    it("does not hold a preview slot while it waits on Smartlead, only while it reads the list", async () => {
+      const e = env();
+      let release!: () => void;
+      const gate = new Promise<void>(r => { release = r; });
+      const original = e.deps.smartlead.getCampaign;
+      let calls = 0;
+      e.deps.smartlead.getCampaign = async (...a) => { if (calls++ < 3) await gate; return original(...a); };
+      const slow = [1, 2, 3].map(() => e.svc.preview("owner", { listId: e.listId, campaignId: CAMPAIGN }));
+      await new Promise(r => setTimeout(r, 20));
+      expect((await e.svc.preview("owner", { listId: e.listId, campaignId: CAMPAIGN })).ok).toBe(true); // not turned away as busy
+      release();
+      for (const r of await Promise.all(slow)) expect(r.ok).toBe(true);
     });
 
     it("refuses a fourth simultaneous preview instead of loading another whole list into memory", async () => {
