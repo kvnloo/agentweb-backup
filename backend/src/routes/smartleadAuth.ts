@@ -1,0 +1,77 @@
+import express from 'express';
+import rateLimit from 'express-rate-limit';
+import { authenticateToken } from '../middleware/auth';
+import { createAccount, SmartleadConfig } from '../services/connectedAccountsDb';
+import { listEmailAccounts, SmartleadApiError } from '../services/smartleadService';
+import { redactAccountSecrets } from '../utils/accountSecretRedaction';
+import { encryptPassword } from '../utils/crypto';
+import { NON_EXPIRING_TOKEN_TIMESTAMP } from '../utils/tokenUtils';
+
+const router = express.Router();
+
+// Smartlead has no "who am I" call to key a connection on, so a user has one: reconnecting replaces the key.
+const SMARTLEAD_ACCOUNT_ID = 'smartlead';
+
+// /connect makes an outbound call with a user-supplied key, so without a limit it is a free Smartlead-key validator.
+const connectLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req: any) => String(req.user?.userId ?? 'anonymous'),
+  validate: { keyGeneratorIpFallback: false },
+  message: { error: 'Too many attempts to connect a Smartlead key. Try again in a few minutes.' },
+});
+
+// POST /connect — validate a customer's Smartlead API key by listing its mailboxes, then store it
+// encrypted as a connected account (ENG-673). API and webhooks need Smartlead Pro or above.
+router.post('/connect', authenticateToken, connectLimiter, async (req: any, res) => {
+  const userId = req.user.userId;
+  const apiKey = typeof req.body?.api_key === 'string' ? req.body.api_key.trim() : '';
+  if (!apiKey) {
+    return res.status(400).json({ error: 'A Smartlead API key is required.' });
+  }
+
+  let mailboxCount: number;
+  try {
+    mailboxCount = (await listEmailAccounts(apiKey)).length;
+  } catch (error) {
+    const status = error instanceof SmartleadApiError ? error.status : undefined;
+    // An expired plan and a wrong key can both come back as 401, so the message names both.
+    if (status === 401 || status === 403) {
+      return res.status(422).json({
+        error: 'Smartlead rejected this key. Check it is a current API key from a Smartlead Pro (or higher) account.',
+      });
+    }
+    if (status === 429) {
+      return res.status(429).json({ error: 'Smartlead is rate-limiting requests. Try again in a minute.' });
+    }
+    console.error('[Smartlead] Key validation failed:', error instanceof Error ? error.message : error);
+    return res.status(502).json({ error: 'Could not verify the key with Smartlead. Try again shortly.' });
+  }
+
+  try {
+    const config: SmartleadConfig = {
+      account_type: 'api_key',
+      access_token: encryptPassword(apiKey, userId),
+      token_expires_at: NON_EXPIRING_TOKEN_TIMESTAMP,
+      mailbox_count: mailboxCount,
+    };
+    const account = await createAccount(userId, 'smartlead', {
+      account_id: SMARTLEAD_ACCOUNT_ID,
+      account_name: 'Smartlead',
+      config,
+    });
+    return res.json({
+      success: true,
+      account: redactAccountSecrets(account),
+      // A valid key with no mailboxes still connects: they may add mailboxes in Smartlead afterwards.
+      ...(mailboxCount === 0 ? { warning: 'This Smartlead account has no email accounts yet. Add mailboxes in Smartlead before sending.' } : {}),
+    });
+  } catch (error) {
+    console.error('[Smartlead] Failed to save connected account:', error instanceof Error ? error.message : error);
+    return res.status(500).json({ error: 'Failed to save the Smartlead connection.' });
+  }
+});
+
+export default router;
