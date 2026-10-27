@@ -535,7 +535,14 @@ export class SmartleadPushRunDb {
       startedAt: iso,
     };
 
-    const put = await this.call(() => this.client.put({ TableName: this.table, Item: toRunItem(run, Math.floor(now / 1000) + RUN_RETENTION_DAYS * DAY_S), ConditionExpression: "attribute_not_exists(pk)" }).promise());
+    let put: { ok: boolean };
+    try {
+      put = await this.call(() => this.client.put({ TableName: this.table, Item: toRunItem(run, Math.floor(now / 1000) + RUN_RETENTION_DAYS * DAY_S), ConditionExpression: "attribute_not_exists(pk)" }).promise());
+    } catch (error) {
+      // Any error here may have arrived AFTER the write committed (a lost reply). If the Run is there, carry on with it; if not, nothing was written.
+      if (!(await this.getRun(run.runId).catch(() => null))) throw error;
+      put = { ok: true };
+    }
     if (!put.ok) {
       // A condition failure on a fresh id can only be OUR OWN earlier attempt having committed (the reply was lost and the call retried).
       // Carry on with that run rather than failing: failing would leave a committed, running Run with no lock behind.
@@ -543,11 +550,22 @@ export class SmartleadPushRunDb {
     }
 
     const lockItem = { pk: lockKey(input.listId, input.campaignId), sk: LOCK_SK, runId: run.runId, ttl: Math.floor(now / 1000) + LOCK_RETENTION_DAYS * DAY_S };
-    const lock = await this.call(() =>
-      takeOver
-        ? this.client.put({ TableName: this.table, Item: lockItem, ConditionExpression: "#r = :old", ExpressionAttributeNames: { "#r": "runId" }, ExpressionAttributeValues: { ":old": takeOver } }).promise()
-        : this.client.put({ TableName: this.table, Item: lockItem, ConditionExpression: "attribute_not_exists(pk)" }).promise(),
-    );
+    let lock: { ok: boolean };
+    try {
+      lock = await this.call(() =>
+        takeOver
+          ? this.client.put({ TableName: this.table, Item: lockItem, ConditionExpression: "#r = :old", ExpressionAttributeNames: { "#r": "runId" }, ExpressionAttributeValues: { ":old": takeOver } }).promise()
+          : this.client.put({ TableName: this.table, Item: lockItem, ConditionExpression: "attribute_not_exists(pk)" }).promise(),
+      );
+    } catch (error) {
+      // Any error here may have arrived AFTER the lock write committed. If the lock is ours the run is live and the caller must hear
+      // "started" (a run that holds a lock but was reported as failed would be claimed and sent later, unannounced). Otherwise the
+      // Run we wrote is abandoned so it cannot be claimed either.
+      const ours = (await this.getLock(input.listId, input.campaignId).catch(() => null))?.runId === run.runId;
+      if (ours) return { started: true, run };
+      await this.abandonRun(run.runId).catch(() => undefined);
+      throw error;
+    }
     if (!lock.ok) {
       const winner = await this.getLock(input.listId, input.campaignId);
       if (winner?.runId === run.runId) return { started: true, run }; // our own earlier lock write committed

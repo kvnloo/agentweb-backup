@@ -9,7 +9,7 @@ export {};
 
 import AWS from "aws-sdk";
 import { ulid } from "ulid";
-import { SmartleadPushService, STALE_OPERATOR_PAUSED_MS, STALE_PAUSED_MS, type PushServiceDeps } from "../smartleadPushService";
+import { SmartleadPushService, STALE_PAUSED_MS, type PushServiceDeps } from "../smartleadPushService";
 import { LEASE_MS, SMARTLEAD_PUSH_RUNS_TABLE_SPEC, SmartleadPushRunDb, SmartleadPushRunStoreError } from "../smartleadPushRunDb";
 import { isMarkedForCampaign } from "../smartleadMarkers";
 import { SmartleadApiError } from "../smartleadService";
@@ -314,20 +314,41 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
       expect(await e.svc.start("owner", go(p.token))).toMatchObject({ ok: false, status: 409, code: "connection_changed" });
     });
 
-    it("keeps a run the operator's kill switch paused through a long outage, but not for ever", async () => {
+    it("never cancels a run the operator's kill switch paused: a long outage must not wipe them out when the switch comes back", async () => {
       const e = env({ leads: Array.from({ length: 900 }, (_, i) => mkLead(i + 1)) });
       e.sl.onPost = () => { e.flags.enabled = false; };
       const r = (await e.svc.start("owner", go((await approve(e, "owner", { cohort: 900 })).token))) as any;
       await drain(e);
       expect(((await e.svc.status("owner", r.run.runId)) as any).run.pauseReason).toBe("disabled_by_operator");
-      clock += STALE_PAUSED_MS + 24 * 60 * 60 * 1000; // the switch stayed off for more than a week
+      clock += 400 * 24 * 60 * 60 * 1000; // the switch stayed off for more than a year
       e.flags.enabled = true;
       await e.svc.resumerTick();
       expect(((await e.svc.status("owner", r.run.runId)) as any).run.status).toBe("paused");
-      clock += STALE_OPERATOR_PAUSED_MS; // but a month later it is released like any other forgotten run
-      await e.svc.resumerTick();
-      expect(((await e.svc.status("owner", r.run.runId)) as any).run.status).toBe("canceled");
+      expect(await e.svc.cancel("owner", r.run.runId)).toMatchObject({ ok: true }); // its owner can always release it
       expect(await db.getLock(e.listId, CAMPAIGN)).toBeNull();
+    });
+
+    it("gives the approval back when the check for newer runs could not run, since nothing started", async () => {
+      const e = env({ maxConcurrentWorkers: 0 });
+      const p = await approve(e);
+      const list = db.listRunsForList.bind(db);
+      let fail = true;
+      (e.deps.db as any) = new Proxy(db, { get: (t, k) => (k === "listRunsForList" ? async (...a: any[]) => { if (fail) { fail = false; throw new SmartleadPushRunStoreError("unavailable", "index down"); } return (list as any)(...a); } : (t as any)[k]?.bind?.(t) ?? (t as any)[k]) });
+      expect(await e.svc.start("owner", go(p.token))).toMatchObject({ ok: false, status: 503 });
+      expect(await e.svc.start("owner", go(p.token))).toMatchObject({ ok: true, started: true }); // not burned by the failed check
+    });
+
+    it("does not cancel a lockless run while its lease is still valid, even if a lagging index lists it (a start in progress)", async () => {
+      const e = env({ maxConcurrentWorkers: 0 });
+      const r = (await e.svc.start("owner", go((await approve(e)).token))) as any;
+      await db.releaseLock(e.listId, CAMPAIGN, r.run.runId);
+      const alive = env({ shareDb: db, listId: e.listId, leads: e.leads, sl: e.sl });
+      const row = (await db.listRunsForList(e.listId))[0];
+      (alive.deps.db as any) = new Proxy(db, { get: (t, k) => (k === "findExpiredLeases" ? async () => [row] : (t as any)[k]?.bind?.(t) ?? (t as any)[k]) });
+      expect(await alive.svc.resumerTick()).toEqual({ claimed: 0, canceled: 0 });
+      expect(((await alive.svc.status("owner", r.run.runId)) as any).run.status).toBe("running");
+      clock += LEASE_MS + 31_000; // once the lease has lapsed it IS an orphan
+      expect(await alive.svc.resumerTick()).toEqual({ claimed: 0, canceled: 1 });
     });
 
     it("does NOT hand the approval back when starting threw: a lost reply must not let it start a second run", async () => {
@@ -413,7 +434,11 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
       e.deps.crm.readLeads = async (...a) => { await gate; return read(...a); };
       const running = [1, 2, 3].map(() => e.svc.preview("owner", { listId: e.listId, campaignId: CAMPAIGN }));
       await new Promise(r => setTimeout(r, 20));
+      let campaignReads = 0;
+      const original = e.deps.smartlead.getCampaign;
+      e.deps.smartlead.getCampaign = async (...a) => { campaignReads++; return original(...a); };
       expect(await e.svc.preview("owner", { listId: e.listId, campaignId: CAMPAIGN })).toMatchObject({ ok: false, status: 429, code: "busy" });
+      expect(campaignReads).toBe(0); // turned away before it spent any of the customer's Smartlead quota
       release();
       for (const r of await Promise.all(running)) expect(r.ok).toBe(true);
       expect((await e.svc.preview("owner", { listId: e.listId, campaignId: CAMPAIGN })).ok).toBe(true);
