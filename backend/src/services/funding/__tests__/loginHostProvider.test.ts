@@ -345,6 +345,23 @@ describe("worker protocol check (host.info)", () => {
     expect(p.protocolStatus()).toBe("mismatch");
   });
 
+  it("an older worker (unknown route) stays 'unknown' with a logged cause, retried on each refresh until it answers, then flips to match without a restart", async () => {
+    let answer: "old" | "new" = "old";
+    const hostInfo = jest.fn(async () => {
+      if (answer === "old") throw new LoginHostError("EINVALID", "route");
+      return { protocol: PROTOCOL_VERSION, node: "v22", uptimeSec: 1 };
+    });
+    const p = mk(hostInfo);
+    await settle(p);
+    await settle(p);
+    expect(p.protocolStatus()).toBe("unknown");
+    expect(hostInfo.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(logged.filter((l) => l.includes("login_host_protocol_unknown cause=EINVALID/route"))).toHaveLength(1);
+    answer = "new";
+    await settle(p);
+    expect(p.protocolStatus()).toBe("match");
+  });
+
   it("re-verifies a matching worker after PROTOCOL_RECHECK_MS (a redeployed worker is noticed)", async () => {
     let protocol = PROTOCOL_VERSION;
     const p = mk(async () => ({ protocol, node: "v22", uptimeSec: 1 }));

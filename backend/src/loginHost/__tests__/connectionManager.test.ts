@@ -105,6 +105,16 @@ describe("ConnectionManager", () => {
         expect(again.loginRef).not.toBe(start.loginRef);
       });
 
+      it("a ready attempt saved by an older build (no readyAtMs) is not touched by the limit and can still be promoted", async () => {
+        const start = await rig.mgr.loginStart({ connectionId: "c1", provider: "fake" });
+        await rig.mgr.loginComplete(REQ(start.loginRef));
+        delete rig.store.get().connections.c1.attempt!.readyAtMs; // what a state file written before this build looks like
+        rig.clock.advance(DEFAULT_CONFIG.readyAttemptTtlMs + 60_000);
+        await rig.mgr.sweep();
+        expect(rig.store.get().connections.c1.attempt).toMatchObject({ state: "ready" });
+        await expect(rig.mgr.loginPromote({ connectionId: "c1", loginRef: start.loginRef, epoch: 1 })).resolves.toEqual({ state: "active", epoch: 1 });
+      });
+
       it("a ready attempt that IS promoted in time is untouched by the limit", async () => {
         const start = await rig.mgr.loginStart({ connectionId: "c1", provider: "fake" });
         await rig.mgr.loginComplete(REQ(start.loginRef));
