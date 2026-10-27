@@ -32,6 +32,16 @@ interface StopInfo {
   retryable: boolean;
 }
 
+/**
+ * Stops after which the client may OFFER the user to run this message on AgentWeb credits instead (the user decides; nothing moves on its own). Those are
+ * problems with the user's connected plan or with reaching it. Not offered: Stop/disconnect/organisation/acknowledgement/choice/feature-off cases (the
+ * plan is not what failed, or the user decided), a policy block (deliberate), a conversation too large for the plan, a turn that ran out of time (a
+ * second run would repeat the cost), or an AgentWeb restart (just send again).
+ */
+const OFFER_AGENTWEB_CREDITS: ReadonlySet<ClaudeStopCode> = new Set<ClaudeStopCode>([
+  "no_connection", "needs_reconnect", "expired", "revoked_or_disabled", "lookup_failed", "host_unavailable", "host_busy", "usage_limit", "turn_failed", "model_not_on_plan",
+]);
+
 const STOPS: Record<ClaudeStopCode, StopInfo> = {
   not_enabled: { httpStatus: 403, retryable: false, message: "Using your Claude plan is not enabled for your account." },
   not_allowed_here: { httpStatus: 403, retryable: false, message: "Your Claude plan can only be used in your own chats. Choose another model for this conversation." },
@@ -78,8 +88,8 @@ export class ClaudeRouteStopError extends Error {
 }
 
 /** The JSON body for the browser. Fixed shape, fixed copy: nothing from the failure itself is included. */
-export function claudeStopBody(err: ClaudeRouteStopError): { error: string; code: ClaudeStopCode; funding: "claude_subscription"; retryable: boolean } {
-  return { error: err.userMessage, code: err.code, funding: "claude_subscription", retryable: err.retryable };
+export function claudeStopBody(err: ClaudeRouteStopError): { error: string; code: ClaudeStopCode; funding: "claude_subscription"; retryable: boolean; canUseAgentWebCredits: boolean } {
+  return { error: err.userMessage, code: err.code, funding: "claude_subscription", retryable: err.retryable, canUseAgentWebCredits: OFFER_AGENTWEB_CREDITS.has(err.code) };
 }
 
 /** A route decision that is a stop. */
