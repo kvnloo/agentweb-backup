@@ -66,9 +66,9 @@ export interface PushServiceDeps {
 
 /** A run left paused or partial this long is canceled by the resumer, so it cannot hold its lock for ever. */
 export const STALE_PAUSED_MS = 7 * 24 * 60 * 60 * 1000;
-/** The same for a run the kill switch paused: it was not the user who left it, so it keeps its lock four times as long. */
-export const STALE_OPERATOR_PAUSED_MS = 30 * 24 * 60 * 60 * 1000;
 const RESUMER_BATCH = 100;
+/** A run with no lock is only called an orphan once its lease lapsed by this much. */
+const ORPHAN_GRACE_MS = 30_000;
 const MAX_CONCURRENT_PREVIEWS = 3;
 /** How long a consumed approval is remembered: longer than the token itself, so an expired token can never be claimed again. */
 const TOKEN_MEMORY_SECONDS = 2 * 60 * 60;
@@ -183,6 +183,8 @@ export class SmartleadPushService {
       if (!key.ok) return key;
       const apiKey = key.key.apiKey;
       if (!Number.isInteger(campaignId) || campaignId <= 0) return fail(400, "bad_request", "A campaign is required.");
+      // Turn a preview away BEFORE it spends the customer's Smartlead quota when every whole-list slot is taken (the slot itself is taken at the read).
+      if (this.previewsRunning >= MAX_CONCURRENT_PREVIEWS) throw new BusyError();
       let slotHeld = false;
       const previewDeps: PreviewDeps = {
         // A preview holds a whole list in memory: only a few at once per process. The slot is taken at the first list read, so slow
@@ -283,7 +285,14 @@ export class SmartleadPushService {
       // Another run on this list and campaign since the preview (a second preview approved too, or an editor pushed) makes the approval stale:
       // it was sized for a list in which nothing had been pushed yet.
       const since = new Date(token.iat).toISOString();
-      if ((await this.deps.db.listRunsForList(token.listId, 25)).some(r => r.campaignId === token.campaignId && (r.createdAt ?? "") >= since)) {
+      let recent;
+      try {
+        recent = await this.deps.db.listRunsForList(token.listId, 25);
+      } catch (error) {
+        await this.deps.db.releaseToken(token.jti).catch(() => undefined); // nothing has started, so the approval can safely be given back
+        throw error;
+      }
+      if (recent.some(r => r.campaignId === token.campaignId && (r.createdAt ?? "") >= since)) {
         return fail(409, "changed_since_preview", "Another push to this campaign started after you previewed. Preview again.");
       }
       let started: Awaited<ReturnType<SmartleadPushRunDb["startRun"]>>;
@@ -425,6 +434,8 @@ export class SmartleadPushService {
         if (!run || run.status !== "running") continue;
         // A running run whose lock does not point at it never really started (a crash between a start's two writes): cancel it, never run it.
         if (!(await this.deps.db.lockPointsAt(run))) {
+          // Only once its lease has lapsed: a run in the middle of starting has a valid lease and no lock for a moment.
+          if (run.leaseUntil + ORPHAN_GRACE_MS > this.deps.now().getTime()) continue;
           if (await this.deps.db.cancelRun(run.runId)) { out.canceled++; this.deps.log(`[SmartleadPush] resumer canceled orphan run=${run.runId}`); }
           continue;
         }
@@ -435,10 +446,10 @@ export class SmartleadPushService {
         this.spawn(claimed);
       }
       for (const row of await this.deps.db.findStalePaused(STALE_PAUSED_MS, RESUMER_BATCH)) {
-        // A run the operator's kill switch paused ages while the switch is off, so it gets a longer grace before it is cancelled.
+        // A run the operator's kill switch paused is the operator's to release: it ages while the switch is off, and (since the switch is
+        // an environment variable) a long outage would otherwise cancel every one the moment the switch came back. Its owner can cancel it.
         const stale = await this.deps.db.getRun(row.runId);
-        if (!stale) continue;
-        if (stale.pauseReason === "disabled_by_operator" && this.deps.now().getTime() - stale.leaseUntil < STALE_OPERATOR_PAUSED_MS) continue;
+        if (!stale || stale.pauseReason === "disabled_by_operator") continue;
         if (await this.deps.db.cancelRun(row.runId)) {
           out.canceled++;
           this.deps.log(`[SmartleadPush] resumer canceled stale run=${row.runId}`);

@@ -489,6 +489,43 @@ suite('SmartleadPushRunDb against DynamoDB Local (ENG-673)', () => {
       expect(await db.getLock(i.listId, i.campaignId)).toEqual({ runId: (r as any).run.runId });
     });
 
+    it('also holds for an error that is NOT retryable (a reset socket) after the lock committed: the run is reported started, never left as a live run the caller was told failed', async () => {
+      const i = input();
+      let lost = false;
+      const client = {
+        get: doc.get.bind(doc), query: doc.query.bind(doc), update: doc.update.bind(doc), delete: doc.delete.bind(doc),
+        put: (p: any) => (lost || p.Item?.sk !== 'LOCK' ? doc.put(p) : { promise: async () => { lost = true; await doc.put(p).promise(); throw Object.assign(new Error('socket reset'), { code: 'SocketError' }); } }),
+      } as any;
+      const r = await new SmartleadPushRunDb(client, table, () => clock, async () => {}).startRun(i, 'w');
+      expect(r.started).toBe(true);
+      expect(await db.getLock(i.listId, i.campaignId)).toEqual({ runId: (r as any).run.runId });
+    });
+
+    it('also holds for a non-retryable error after the RUN write committed', async () => {
+      const i = input();
+      let lost = false;
+      const client = {
+        get: doc.get.bind(doc), query: doc.query.bind(doc), update: doc.update.bind(doc), delete: doc.delete.bind(doc),
+        put: (p: any) => (lost || p.Item?.sk !== 'RUN' ? doc.put(p) : { promise: async () => { lost = true; await doc.put(p).promise(); throw Object.assign(new Error('socket reset'), { code: 'SocketError' }); } }),
+      } as any;
+      const r = await new SmartleadPushRunDb(client, table, () => clock, async () => {}).startRun(i, 'w');
+      expect(r.started).toBe(true);
+      expect((await db.listRunsForList(i.listId, 50)).map(x => x.status)).toEqual(['running']);
+    });
+
+    it('abandons its run, so nothing can claim it, when the lock write definitely failed', async () => {
+      const i = input();
+      const client = {
+        get: doc.get.bind(doc), query: doc.query.bind(doc), update: doc.update.bind(doc), delete: doc.delete.bind(doc),
+        put: (p: any) => (p.Item?.sk === 'LOCK' ? { promise: async () => { throw Object.assign(new Error('denied'), { code: 'AccessDeniedException' }); } } : doc.put(p)),
+      } as any;
+      await expect(new SmartleadPushRunDb(client, table, () => clock, async () => {}).startRun(i, 'w')).rejects.toMatchObject({ code: 'access_denied' });
+      expect((await db.listRunsForList(i.listId, 50)).map(x => x.status)).toEqual(['canceled']);
+      expect(await db.getLock(i.listId, i.campaignId)).toBeNull();
+      clock += LEASE_MS + 31_000;
+      expect((await db.findExpiredLeases(500)).map(x => x.runId)).not.toContain((await db.listRunsForList(i.listId, 50))[0].runId);
+    });
+
     it('does the same for a takeover of a finished run\'s lock', async () => {
       const old = await fresh();
       await doc.update({ TableName: table, Key: { pk: old.runId, sk: 'RUN' }, UpdateExpression: 'SET #s = :c REMOVE #a', ExpressionAttributeNames: { '#s': 'status', '#a': 'active' }, ExpressionAttributeValues: { ':c': 'completed' } }).promise();
