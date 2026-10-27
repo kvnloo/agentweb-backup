@@ -18,7 +18,7 @@
  * AW-PaymentHistory tables. Webhook events are PULLED from Stripe (`events.list`, the same event objects a webhook
  * endpoint would be sent) and replayed in order into the controller: no public endpoint or Stripe CLI is needed.
  *
- * What is not real (stubbed in this process only): outbound email (captured and printed; nothing is sent), the
+ * What is not real (stubbed in this process only): outbound email (captured and printed; nothing is sent), the CRM signup sync of created users, the
  * `payg_settlement_enabled` switch (forced on in-process; no Dev config is written), and the sweep's owner scan
  * (restricted to this run's users, so other developers' Dev rows are never settled).
  *
@@ -72,6 +72,7 @@ async function main() {
   const { createStripeClient, STRIPE_API_VERSION } = await import('../services/stripeClientFactory');
   const { userDb } = await import('../services/db');
   const { emailService } = await import('../services/emailService');
+  const crmSignalHooks = await import('../services/crmSignalHooks');
   const { settlePaygOverageMonth, runPaygSettlement } = await import('../services/paygSettlementService');
   const { previousUsageMonth } = await import('../services/paygSettlement');
   const { paygSettlementSwitch } = await import('../services/paygOverageService');
@@ -94,6 +95,9 @@ async function main() {
   for (const kind of ['sendPaygOverageInvoiceEmail', 'sendPaygOveragePaymentFailedEmail', 'sendPaygOveragePaymentActionRequiredEmail', 'sendOncallAlert']) {
     (emailService as any)[kind] = async (...args: any[]) => { sent.push({ kind, at: new Date().toISOString(), args }); return 'sent'; };
   }
+  // `userDb.createUser` fires the CRM signup sync (contact + lead in the founders' signups list). Those rows are not
+  // part of what is rehearsed and cleanup does not remove them, so the hook is a no-op here.
+  (crmSignalHooks as any).onUserSignup = async () => null;
   const mails = (u: U, kind: string) => sent.filter((m) => m.kind === kind && (m.kind === 'sendOncallAlert' ? JSON.stringify(m.args).includes(u.id) : m.args[0]?.to === u.email));
 
   // ---- fixtures --------------------------------------------------------------------------------------------------
