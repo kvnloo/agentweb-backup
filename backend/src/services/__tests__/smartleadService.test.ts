@@ -4,6 +4,7 @@ import {
   getSmartLeadMetrics,
   listEmailAccounts,
   scrubSmartleadSecrets,
+  SmartleadApiError,
   smartleadRequest,
 } from "../smartleadService";
 
@@ -107,27 +108,30 @@ describe("smartleadService client hardening (ENG-2658)", () => {
 
   describe("listEmailAccounts (ENG-673)", () => {
     const page = (from: number, count: number) =>
-      Array.from({ length: count }, (_, i) => ({ id: from + i, from_email: `box${from + i}@mindd-outreach.com`, message_per_day: 30 }));
+      Array.from({ length: count }, (_, i) => ({ id: from + i, from_email: `box${from + i}@mindd-outreach.com` }));
 
-    it("returns the mailboxes of the key", async () => {
-      mockedAxios.request.mockResolvedValue({ data: page(1, 3) } as never);
+    it("returns the mailboxes of the key, with no paging parameters on the first request", async () => {
+      mockedAxios.request
+        .mockResolvedValueOnce({ data: page(1, 3) } as never)
+        .mockResolvedValueOnce({ data: [] } as never);
       const accounts = await listEmailAccounts(KEY);
       expect(accounts).toEqual([
         { id: 1, email: "box1@mindd-outreach.com" },
         { id: 2, email: "box2@mindd-outreach.com" },
         { id: 3, email: "box3@mindd-outreach.com" },
       ]);
-      expect(mockedAxios.request).toHaveBeenCalledTimes(1);
+      expect(mockedAxios.request.mock.calls[0][0].params).toEqual({ api_key: KEY });
     });
 
-    it("pages through more than 100 mailboxes", async () => {
+    it("keeps paging by offset until a page is empty", async () => {
       mockedAxios.request
         .mockResolvedValueOnce({ data: page(1, 100) } as never)
-        .mockResolvedValueOnce({ data: page(101, 20) } as never);
+        .mockResolvedValueOnce({ data: page(101, 20) } as never)
+        .mockResolvedValueOnce({ data: [] } as never);
       const accounts = await listEmailAccounts(KEY);
       expect(accounts).toHaveLength(120);
-      expect(mockedAxios.request).toHaveBeenCalledTimes(2);
-      expect(mockedAxios.request.mock.calls[1][0].params).toMatchObject({ offset: 100, limit: 100 });
+      expect(mockedAxios.request.mock.calls[1][0].params).toMatchObject({ offset: 100 });
+      expect(mockedAxios.request.mock.calls[2][0].params).toMatchObject({ offset: 120 });
     });
 
     it("stops if a page adds nothing new (API ignoring offset)", async () => {
@@ -137,9 +141,21 @@ describe("smartleadService client hardening (ENG-2658)", () => {
       expect(mockedAxios.request).toHaveBeenCalledTimes(2);
     });
 
-    it("treats an empty or non-array response as no mailboxes", async () => {
-      mockedAxios.request.mockResolvedValue({ data: { message: "none" } } as never);
+    it("accepts string ids", async () => {
+      mockedAxios.request
+        .mockResolvedValueOnce({ data: [{ id: "7", from_email: "a@x.com" }] } as never)
+        .mockResolvedValueOnce({ data: [] } as never);
+      await expect(listEmailAccounts(KEY)).resolves.toEqual([{ id: 7, email: "a@x.com" }]);
+    });
+
+    it("returns an empty list for a real empty array", async () => {
+      mockedAxios.request.mockResolvedValue({ data: [] } as never);
       await expect(listEmailAccounts(KEY)).resolves.toEqual([]);
+    });
+
+    it("rejects a response that is not a list, so a key is never called valid on a guess", async () => {
+      mockedAxios.request.mockResolvedValue({ data: { message: "Plan expired!" } } as never);
+      await expect(listEmailAccounts(KEY)).rejects.toBeInstanceOf(SmartleadApiError);
     });
 
     it("surfaces a rejected key as a SmartleadApiError with the status and without the key", async () => {
@@ -151,6 +167,12 @@ describe("smartleadService client hardening (ENG-2658)", () => {
       const e = (await listEmailAccounts(KEY).catch((x: unknown) => x)) as { status?: number; message: string };
       expect(e.status).toBe(401);
       expect(e.message).not.toContain(KEY);
+    });
+
+    it("honours a lower retry budget on 429", async () => {
+      mockedAxios.request.mockRejectedValue(err429());
+      await expect(listEmailAccounts(KEY, { maxRetries: 1 })).rejects.toMatchObject({ status: 429 });
+      expect(mockedAxios.request).toHaveBeenCalledTimes(2);
     });
   });
 });

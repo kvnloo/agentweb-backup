@@ -2,7 +2,7 @@ import express from 'express';
 import rateLimit from 'express-rate-limit';
 import { authenticateToken } from '../middleware/auth';
 import { createAccount, SmartleadConfig } from '../services/connectedAccountsDb';
-import { listEmailAccounts, SmartleadApiError } from '../services/smartleadService';
+import { listEmailAccounts, scrubSmartleadSecrets, SmartleadApiError } from '../services/smartleadService';
 import { redactAccountSecrets } from '../utils/accountSecretRedaction';
 import { encryptPassword } from '../utils/crypto';
 import { NON_EXPIRING_TOKEN_TIMESTAMP } from '../utils/tokenUtils';
@@ -31,10 +31,15 @@ router.post('/connect', authenticateToken, connectLimiter, async (req: any, res)
   if (!apiKey) {
     return res.status(400).json({ error: 'A Smartlead API key is required.' });
   }
+  // Real keys are short and have no spaces; anything else is a paste mistake, and a huge value would only bounce off the URL limit.
+  if (apiKey.length > 200 || /\s/.test(apiKey)) {
+    return res.status(400).json({ error: 'That does not look like a Smartlead API key. Paste only the key.' });
+  }
 
   let mailboxCount: number;
   try {
-    mailboxCount = (await listEmailAccounts(apiKey)).length;
+    // One retry at most: this request waits on the user's screen, so it must not sit through long 429 backoffs.
+    mailboxCount = (await listEmailAccounts(apiKey, { maxRetries: 1 })).length;
   } catch (error) {
     const status = error instanceof SmartleadApiError ? error.status : undefined;
     // An expired plan and a wrong key can both come back as 401, so the message names both.
@@ -46,7 +51,7 @@ router.post('/connect', authenticateToken, connectLimiter, async (req: any, res)
     if (status === 429) {
       return res.status(429).json({ error: 'Smartlead is rate-limiting requests. Try again in a minute.' });
     }
-    console.error('[Smartlead] Key validation failed:', error instanceof Error ? error.message : error);
+    console.error('[Smartlead] Key validation failed:', scrubSmartleadSecrets(error instanceof Error ? error.message : String(error), apiKey));
     return res.status(502).json({ error: 'Could not verify the key with Smartlead. Try again shortly.' });
   }
 
@@ -69,7 +74,7 @@ router.post('/connect', authenticateToken, connectLimiter, async (req: any, res)
       ...(mailboxCount === 0 ? { warning: 'This Smartlead account has no email accounts yet. Add mailboxes in Smartlead before sending.' } : {}),
     });
   } catch (error) {
-    console.error('[Smartlead] Failed to save connected account:', error instanceof Error ? error.message : error);
+    console.error('[Smartlead] Failed to save connected account:', scrubSmartleadSecrets(error instanceof Error ? error.message : String(error), apiKey));
     return res.status(500).json({ error: 'Failed to save the Smartlead connection.' });
   }
 });
