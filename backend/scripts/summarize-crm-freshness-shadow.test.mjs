@@ -104,3 +104,24 @@ test('the density sentence is absent when no stale-looking line carries the key'
   const s = summarize(parseLines(line({ sessionId: 's', model: 'm1', kinds: [], claimed: [1], cited: [], echoesEarlier: 1 })).records);
   assert.doesNotMatch(format(s, 0), /density of 0\.\.20/);
 });
+
+test('a model with checked lines but NO flagged lines still shows its denominator (the best-behaved model)', () => {
+  const c = summarizeChecked(parseCheckedLines([
+    ...Array.from({ length: 4 }, () => checked({ model: 'clean-model', flagged: false, claimsSeen: 0, tagsSeen: 1, crmToolsSucceeded: 1, totalsAbstained: false })),
+  ].join('\n')).records);
+  const out = format(summarize([]), 0, c);
+  assert.match(out, /clean-model: 0 line\(s\)/);
+  assert.match(out, /CRM replies checked: 4, flagged: 0 \(0%\)/);
+  assert.doesNotMatch(out, /no \[crm-freshness-shadow\] lines found/, 'checked data alone is not "nothing found"');
+  assert.doesNotMatch(out, /kinds:/, 'no empty kinds line for a model with nothing flagged');
+});
+
+test('a small flag rate is not rounded down to 0%', () => {
+  const rows = [...Array.from({ length: 199 }, () => ({ model: 'm', flagged: false })), { model: 'm', flagged: true }];
+  const out = format(summarize(parseLines(line({ sessionId: 's', model: 'm', kinds: ['cited_tool_not_run'], claimed: [], cited: [] })).records), 0, summarizeChecked(rows));
+  assert.match(out, /checked: 200, flagged: 1 \(0\.5%\)/);
+});
+
+test('says nothing found only when there are neither flagged nor checked lines', () => {
+  assert.match(format(summarize([]), 0, {}), /no \[crm-freshness-shadow\] lines found/);
+});

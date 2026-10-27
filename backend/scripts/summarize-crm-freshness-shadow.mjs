@@ -46,6 +46,8 @@ export function summarizeChecked(records) {
   return byModel;
 }
 
+// Whole percent from 10% up, one decimal below, so a rate like 0.5% is not shown as 1% or 0%.
+const pct = (r) => { const p = r * 100; return `${p >= 10 ? Math.round(p) : Math.round(p * 10) / 10}%`; };
 const median = (xs) => { const a = [...xs].sort((x, y) => x - y); const n = a.length; return n % 2 ? a[(n - 1) / 2] : (a[n / 2 - 1] + a[n / 2]) / 2; };
 
 export function summarize(records) {
@@ -70,12 +72,16 @@ export function summarize(records) {
 
 export function format(summary, skipped = 0, checked = {}) {
   const out = [`flagged replies (log lines): ${summary.totalLines}   distinct sessions: ${summary.distinctSessions}   unparseable marker lines: ${skipped}`];
-  const models = Object.entries(summary.byModel).sort((a, b) => b[1].lines - a[1].lines);
+  // A model with checked replies but no flagged ones (the best behaved) must still show its denominator.
+  const EMPTY = () => ({ lines: 0, sessions: new Set(), kinds: {}, claimedNumbers: {}, citedTools: {}, drift: 0, echoes: 0, echoLines: 0, echoDensities: [] });
+  const byModel = { ...summary.byModel };
+  for (const name of Object.keys(checked)) byModel[name] ||= EMPTY();
+  const models = Object.entries(byModel).sort((a, b) => b[1].lines - a[1].lines);
   for (const [model, m] of models) {
     out.push(`\n${model}: ${m.lines} line(s), ${m.sessions.size} session(s)`);
-    out.push(`  kinds: ${JSON.stringify(m.kinds)}`);
+    if (m.lines > 0) out.push(`  kinds: ${JSON.stringify(m.kinds)}`);
     const top = (o) => Object.entries(o).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([k, v]) => `${k} x${v}`).join(', ');
-    if (Object.keys(m.claimedNumbers).length) out.push(`  most-claimed unbacked numbers: ${top(m.claimedNumbers)}`);
+    if (m.lines > 0 && Object.keys(m.claimedNumbers).length) out.push(`  most-claimed unbacked numbers: ${top(m.claimedNumbers)}`);
     if (m.drift) out.push(`  arithmetic drift (claim within 0.5% of a number the tool really returned): ${m.drift}`);
     if (m.echoLines) out.push(`  restated a number an EARLIER turn of the session returned (stale-looking): ${m.echoLines} of ${m.lines} line(s); the rest are unbacked but match no earlier value (or the session predates persisted evidence)`);
     if (m.echoDensities.length) {
@@ -84,7 +90,7 @@ export function format(summary, skipped = 0, checked = {}) {
     }
     if (Object.keys(m.citedTools).length) out.push(`  tools cited by unbacked tags: ${top(m.citedTools)}`);
     const c = checked[model];
-    if (c) out.push(`  CRM replies checked: ${c.checked}, flagged: ${c.flagged} (${Math.round((c.flagged / c.checked) * 100)}%)${c.abstained ? `, total check abstained on ${c.abstained}` : ''}`);
+    if (c) out.push(`  CRM replies checked: ${c.checked}, flagged: ${c.flagged} (${pct(c.flagged / c.checked)})${c.abstained ? `, total check abstained on ${c.abstained}` : ''}`);
   }
   if (models.length === 0) out.push('(no [crm-freshness-shadow] lines found)');
   return out.join('\n');

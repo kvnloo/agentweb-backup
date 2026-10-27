@@ -1181,6 +1181,21 @@ describe('checked line: the denominator for the flag rate (ENG-2382)', () => {
     expect(evaluated.logChecked.mock.calls[0][1]).toMatchObject({ claimsSeen: 1, totalsAbstained: false, flagged: true });
   });
 
+  it('a continuation whose earlier evidence is incomplete abstains on totals, and says so', () => {
+    // earlier invocations ran a CRM tool but their numbers were never persisted: the total check cannot judge a claim
+    const { logChecked, log } = run('You have 18 lead lists.', [], { earlier: ['get_lead_lists'] });
+    expect(log).not.toHaveBeenCalled();
+    expect(logChecked.mock.calls[0][1]).toMatchObject({ claimsSeen: 1, totalsAbstained: true, flagged: false });
+  });
+
+  it('every flagged reply also writes a checked line (flagged lines can never exceed checked lines)', () => {
+    const texts = ['47 leads [verified: get_lead_lists]', 'You have 18 lead lists and 47 leads in total.', '17 lists [verified: get_lead_lists]', 'unrelated'];
+    let flaggedLines = 0; let checkedLines = 0;
+    for (const t of texts) runCrmFreshnessShadow({ finalText: t, toolCalls: [], model: 'm', log: () => { flaggedLines++; }, logChecked: () => { checkedLines++; } });
+    expect(flaggedLines).toBeGreaterThan(0);
+    expect(checkedLines).toBeGreaterThanOrEqual(flaggedLines);
+  });
+
   it('a failing flagged sink does not stop the checked line', () => {
     const logChecked = jest.fn();
     expect(() => runCrmFreshnessShadow({ finalText: '47 leads [verified: get_lead_lists]', toolCalls: [], log: () => { throw new Error('flagged sink down'); }, logChecked })).not.toThrow();

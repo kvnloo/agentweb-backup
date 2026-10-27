@@ -746,6 +746,8 @@ export function runCrmFreshnessShadow(input: CrmFreshnessShadowInput): CrmFreshn
 /**
  * ENG-2382: one line per reply the detector had something to look at (a CRM tool succeeded, a `[verified: ...]` tag, or an inventory
  * total claim), flagged or not. The shadow line alone records only the flagged replies, so a flag rate had no denominator.
+ * "Looked at" is the detector's own scope, not proof the reply is about the CRM: the bare "N lists" pattern needs no CRM context,
+ * so "5 lists of ideas" counts as a claim. The flagged line has the same property, so rate and numerator stay consistent.
  * Counts and a model name only: no reply text and no session id. Replies with nothing CRM-related write nothing.
  */
 function logChecked(input: CrmFreshnessShadowInput, result: CrmFreshnessResult): void {
