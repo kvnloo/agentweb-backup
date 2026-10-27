@@ -546,7 +546,7 @@ async function generate(flags: Flags): Promise<number> {
     const { agentModeService } = await import('../services/agentModeService');
     // The server runs this at boot; without it the tool registry is empty (ENG-2649 pilot: every run hit "Unknown tool: install_skills").
     await agentModeService.initialize();
-    const registryProblems = toolRegistryProblems(agentModeService as any);
+    const registryProblems = toolRegistryProblems(agentModeService as any, ['install_skills', ...new Set(requiredTools)]);
     if (registryProblems.length) throw new Error(`agent mode did not initialize:\n- ${registryProblems.join('\n- ')}`);
     const meter = new CostMeter(ledger, 'generation', outDir, await loadCostOf());
     meterAgentModeService(agentModeService, await agentModeService.getOpenRouterClient(), meter);

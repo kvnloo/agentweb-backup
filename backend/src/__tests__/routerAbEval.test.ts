@@ -364,6 +364,7 @@ describe('environment refusals', () => {
     expect(toolRegistryProblems(empty)).toEqual(['install_skills is not registered after initialize()']);
     expect(toolRegistryProblems(ready)).toEqual([]);
     expect(toolRegistryProblems({})).toHaveLength(1);
+    expect(toolRegistryProblems(ready, ['install_skills', 'generate_image'])).toEqual(['generate_image is not registered after initialize()']);
   });
 });
 
