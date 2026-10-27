@@ -9,8 +9,12 @@ jest.mock('../../middleware/auth', () => ({
 }));
 
 const mockCreateAccount = jest.fn();
+const mockGetAccounts = jest.fn();
+const mockDeleteAccountById = jest.fn();
 jest.mock('../../services/connectedAccountsDb', () => ({
   createAccount: (...args: any[]) => mockCreateAccount(...args),
+  getAccountsByUserId: (...args: any[]) => mockGetAccounts(...args),
+  deleteAccountById: (...args: any[]) => mockDeleteAccountById(...args),
 }));
 
 const mockListEmailAccounts = jest.fn();
@@ -41,6 +45,7 @@ describe('POST /api/oauth/smartlead/connect (ENG-673)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     jest.spyOn(console, 'error').mockImplementation(() => {});
+    mockGetAccounts.mockResolvedValue([]);
     mockCreateAccount.mockImplementation(async (userId: string, platform: string, input: any) => ({
       platform,
       account_id: input.account_id,
@@ -104,7 +109,7 @@ describe('POST /api/oauth/smartlead/connect (ENG-673)', () => {
     const [userId, platform, input] = mockCreateAccount.mock.calls[0];
     expect(userId).toBe('user-123');
     expect(platform).toBe('smartlead');
-    expect(input.account_id).toBe('smartlead');
+    expect(input.account_id).toBe('smartlead-user-123');
     expect(input.config.account_type).toBe('api_key');
     expect(input.config.mailbox_count).toBe(2);
     expect(input.config.access_token).toBeTruthy();
@@ -115,6 +120,22 @@ describe('POST /api/oauth/smartlead/connect (ENG-673)', () => {
     expect(JSON.stringify(res.body)).not.toContain(KEY);
     expect(res.body.account.config.access_token).toBeUndefined();
     expect(res.body.warning).toBeUndefined();
+  });
+
+  it('un-shares the connection when a shared key is replaced', async () => {
+    mockListEmailAccounts.mockResolvedValue([{ id: 1, email: 'a@x.com' }]);
+    mockGetAccounts.mockResolvedValue([{ platform: 'smartlead', account_id: 'smartlead-user-123', sharedWithOrg: true }]);
+    const res = await connect({ api_key: KEY }, 'user-123');
+    expect(res.status).toBe(200);
+    expect(mockDeleteAccountById).toHaveBeenCalledWith('user-123', 'smartlead', 'smartlead-user-123');
+    expect(mockDeleteAccountById.mock.invocationCallOrder[0]).toBeLessThan(mockCreateAccount.mock.invocationCallOrder[0]);
+  });
+
+  it('leaves an unshared connection alone when its key is replaced', async () => {
+    mockListEmailAccounts.mockResolvedValue([{ id: 1, email: 'a@x.com' }]);
+    mockGetAccounts.mockResolvedValue([{ platform: 'smartlead', account_id: 'smartlead-user-123', sharedWithOrg: false }]);
+    await connect({ api_key: KEY }, 'user-123');
+    expect(mockDeleteAccountById).not.toHaveBeenCalled();
   });
 
   it('connects a valid key with no mailboxes and warns', async () => {
