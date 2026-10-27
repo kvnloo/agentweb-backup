@@ -72,6 +72,24 @@ export function generatePresignedUrl(
 }
 
 /**
+ * Presigned PUT URL for a direct client upload (Zoma creative upload). The caller must
+ * send exactly this Content-Type, so the stored object's type is the one we validated.
+ */
+export function generatePresignedPutUrl(
+  key: string,
+  contentType: string,
+  bucket: string = DEFAULT_BUCKET,
+  expiresIn: number = 15 * 60
+): string {
+  return s3.getSignedUrl('putObject', {
+    Bucket: bucket,
+    Key: key,
+    Expires: expiresIn,
+    ContentType: contentType,
+  });
+}
+
+/**
  * Convert a public S3 URL to a presigned URL.
  * Returns null if the URL doesn't belong to the specified bucket.
  */

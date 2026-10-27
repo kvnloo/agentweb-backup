@@ -11,6 +11,7 @@ import * as stripeController from "../controllers/stripeController";
 import { resolveBillingUserId } from '../services/tokenUsageService';
 import { getSubscriptionTypeConfig, getUserSubscriptionType } from '../services/subscriptionService';
 import { getActiveLlmUsageTopUpPackages, resolveLlmUsageTopUpPackage } from '../services/llmUsageTopUpService';
+import { emitAccountSignal } from '../services/serverSignalEmitter';
 
 dotenv.config();
 
@@ -257,6 +258,13 @@ router.post(
       };
 
       const session = await stripe.checkout.sessions.create(sessionParams);
+
+      // ENG-2684: fire-and-forget hireemma.ai session-list signal (this is the live
+      // billing route; the controller variant is not mounted here). Never affects the reply.
+      void emitAccountSignal(user ? { ...user, userId } : { userId }, "checkout_started", {
+        checkoutSessionId: session.id || "",
+        priceId: String(priceId).slice(0, 120),
+      }).catch(() => undefined);
 
       res.json({ clientSecret: session.client_secret });
     } catch (error: any) {

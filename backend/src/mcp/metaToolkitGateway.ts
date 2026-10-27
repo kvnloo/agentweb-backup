@@ -26,6 +26,7 @@ import { isZomaTool } from './zomaToolDefinitions';
 import { executeMetaToolkitWrite, isGuardedWriteRequest } from './metaToolkitWrites';
 import { metaConnectionIsUsable, runZomaTool, ZomaNotReadyError } from './zomaOnboarding';
 import { validateZomaToken, ZOMA_TOKEN_PREFIX } from './zomaDeviceFlow';
+import { executeMetaToolkitCreative, isCreativeAssetRequest, prepareZomaUpload } from './metaToolkitCreatives';
 
 export class MetaToolkitAuthError extends Error {
   readonly status: 401 | 403 | 429;
@@ -67,6 +68,10 @@ export interface MetaToolkitGatewayDeps {
   executeWrite?: (userId: string, args: any) => Promise<any>;
   /** ENG-2303 P4 distinct write metering; defaults to recordMcpWriteExecuted. */
   recordWrite?: typeof recordMcpWriteExecuted;
+  /** Creative assets (AD_CREATIVE UPLOAD_IMAGE/UPLOAD_VIDEO/CREATE); defaults to executeMetaToolkitCreative. */
+  executeCreative?: (userId: string, args: any) => Promise<any>;
+  /** zoma_prepare_upload; defaults to prepareZomaUpload. */
+  prepareUpload?: (userId: string, args: any) => Promise<any>;
 }
 
 /** Per-credential ceiling, so one key/token cannot exceed its limit by spreading calls across IPs. */
@@ -176,6 +181,24 @@ function toolAcceptsAccountId(name: string): boolean {
   return !!def?.inputSchema?.properties?.account_id;
 }
 
+const SECRET_KEYS = new Set(['access_token', 'page_access_token', 'accessToken', 'pageAccessToken', 'refresh_token', 'refreshToken']);
+
+/**
+ * Remove credential fields from anything returned to an external agent. Shared Emma
+ * readers (e.g. PAGE LIST) return the Page access token for internal use; an external
+ * caller must never receive it (found in the 2026-10-26 Zoma creative-upload E2E).
+ */
+export function stripCredentials<T>(value: T, depth = 0): T {
+  if (depth > 12 || value === null || typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.map((v) => stripCredentials(v, depth + 1)) as unknown as T;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    if (SECRET_KEYS.has(k)) continue;
+    out[k] = stripCredentials(v, depth + 1);
+  }
+  return out as T;
+}
+
 /**
  * Full external call: authenticate → resolve account → execute → meter once on success.
  * A refused or failed call is not metered.
@@ -196,6 +219,13 @@ export async function handleMetaToolkitCall(
       userAgent: request.userAgent,
     });
 
+  // Creative upload staging needs no Meta account (it only mints an S3 PUT for the caller's own prefix).
+  if (request.toolName === 'zoma_prepare_upload') {
+    const result = await (deps.prepareUpload ?? prepareZomaUpload)(caller.userId, request.args ?? {});
+    await meter();
+    return result;
+  }
+
   // ENG-2303: onboarding tools must work before Meta is connected, so they skip account resolution.
   if (isZomaTool(request.toolName)) {
     let result;
@@ -215,13 +245,16 @@ export async function handleMetaToolkitCall(
 
   // ENG-2303 P3: CAMPAIGN/AD_SET/AD CREATE + status/budget UPDATE go through the guarded
   // preview→confirm path; every other write stays refused by assertMetaToolkitV1Call.
-  const guardedWrite = isGuardedWriteRequest(request.toolName, args);
-  const result = guardedWrite
-    ? await (deps.executeWrite ?? executeMetaToolkitWrite)(caller.userId, args)
-    : await deps.execute(request.toolName, args, {
-        userId: caller.userId,
-        sessionId: request.sessionId,
-      });
+  const creativeAsset = isCreativeAssetRequest(request.toolName, args);
+  const guardedWrite = creativeAsset || isGuardedWriteRequest(request.toolName, args);
+  const result = creativeAsset
+    ? await (deps.executeCreative ?? executeMetaToolkitCreative)(caller.userId, args)
+    : guardedWrite
+      ? await (deps.executeWrite ?? executeMetaToolkitWrite)(caller.userId, args)
+      : await deps.execute(request.toolName, args, {
+          userId: caller.userId,
+          sessionId: request.sessionId,
+        });
 
   // ENG-2303 P4: a write that reached Meta (it has a read-back verdict) is metered as its
   // own event kind. Previews, mismatched confirms and refused/failed writes are not.
@@ -239,7 +272,7 @@ export async function handleMetaToolkitCall(
       entityType: String(args.entity_type),
       action: String(args.action),
       verification: (result as any).verification,
-      objectId: (result as any).id ?? undefined,
+      objectId: (result as any).id ?? (result as any).image_hash ?? (result as any).video_id ?? undefined,
     }).catch((error) => {
       console.error('[meta-toolkit] write metering failed:', error instanceof Error ? error.message : error);
       (result as any).metering = 'failed: this write executed but was not recorded in usage';
@@ -247,5 +280,5 @@ export async function handleMetaToolkitCall(
   }
 
   await meter();
-  return result;
+  return stripCredentials(result);
 }

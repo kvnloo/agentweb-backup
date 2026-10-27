@@ -58,7 +58,8 @@ describe('ENG-2282 Meta Toolkit manifest', () => {
     for (const def of manifest) expect(def.inputSchema.properties.client_id).toBeUndefined();
     const mkt = manifest.find((d: any) => d.name === 'call_meta_marketing_api');
     const actions: string[] = mkt.inputSchema.properties.action.enum;
-    for (const excluded of ['DELETE', 'UPLOAD_IMAGE', 'UPLOAD_VIDEO', 'UPLOAD_USERS', 'COPY_AD', 'RETAG_UTM']) {
+    // UPLOAD_IMAGE / UPLOAD_VIDEO are advertised for AD_CREATIVE only (zoma creative upload); routing enforces the entity.
+    for (const excluded of ['DELETE', 'UPLOAD_USERS', 'COPY_AD', 'RETAG_UTM']) {
       expect(actions).not.toContain(excluded);
     }
     // ENG-2303: guarded writes are advertised with the preview→confirm arguments.
