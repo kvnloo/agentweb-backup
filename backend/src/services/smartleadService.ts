@@ -154,7 +154,12 @@ function retryDelayMs(attempt: number, retryAfterHeader: unknown): number {
 }
 
 export class SmartleadApiError extends Error {
-  constructor(message: string, public readonly status?: number) {
+  /**
+   * True when a write may have been applied even though the call failed: no HTTP answer at all (timeout, dropped
+   * connection) or a 5xx on a non-GET, or a 2xx whose body we could not read. A caller must not report such a batch
+   * as "failed" or blindly resend it as "new"; a 429 is never unknown, because a rate-limited request added nothing.
+   */
+  constructor(message: string, public readonly status?: number, public readonly outcomeUnknown: boolean = false) {
     super(message);
     this.name = "SmartleadApiError";
   }
@@ -163,7 +168,7 @@ export class SmartleadApiError extends Error {
 /** A 200 whose body is not the list we asked for (a wrong-key or wrong-plan reply may look like this). */
 export class SmartleadUnexpectedResponseError extends SmartleadApiError {
   constructor(message: string) {
-    super(message);
+    super(message, undefined, true);
     this.name = "SmartleadUnexpectedResponseError";
   }
 }
@@ -200,6 +205,7 @@ export async function smartleadRequest<T>(
       throw new SmartleadApiError(
         scrubSmartleadSecrets(`Smartlead ${method} ${path} failed${status ? ` (${status})` : ""}: ${raw}`, apiKey),
         status,
+        method !== "GET" && (status === undefined || status >= 500),
       );
     }
   }
@@ -254,10 +260,23 @@ export interface SmartleadEmailAccount {
   dailyLimit?: number;
 }
 
-/** A positive whole number, or undefined. Never trust a vendor field to be numeric. */
+/**
+ * A whole number from a vendor field, or undefined. Only a finite number or a non-empty numeric string counts:
+ * `Number(null)`, `Number("")` and `Number([])` are all 0, which would turn a missing field into a real "0".
+ */
+function asWholeNumber(value: unknown): number | undefined {
+  if (typeof value === "number") return Number.isFinite(value) ? Math.floor(value) : undefined;
+  if (typeof value === "string" && value.trim() !== "") {
+    const n = Number(value);
+    return Number.isFinite(n) ? Math.floor(n) : undefined;
+  }
+  return undefined;
+}
+
+/** A positive whole number, or undefined. */
 function asLimit(value: unknown): number | undefined {
-  const n = Number(value);
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+  const n = asWholeNumber(value);
+  return n !== undefined && n > 0 ? n : undefined;
 }
 
 /**
@@ -287,11 +306,11 @@ export async function listEmailAccounts(
     const before = seen.size;
     // Project to the fields we use: the list response also carries SMTP/IMAP passwords, which must never be kept or logged.
     data.forEach((row: { id?: unknown; from_email?: unknown; max_email_per_day?: unknown; message_per_day?: unknown } | null, i) => {
-      const id = Number(row?.id);
-      const key = Number.isFinite(id) ? id : `row-${before + i}`;
+      const id = asWholeNumber(row?.id);
+      const key = id !== undefined ? id : `row-${before + i}`;
       if (!seen.has(key)) {
         seen.set(key, {
-          id: Number.isFinite(id) ? id : 0,
+          id: id !== undefined ? id : 0,
           email: String(row?.from_email ?? ""),
           dailyLimit: asLimit(row?.max_email_per_day ?? row?.message_per_day),
         });
@@ -332,6 +351,10 @@ function unwrapList(data: unknown, wrappers: string[]): unknown[] | undefined {
   return undefined;
 }
 
+function assertCampaignId(campaignId: number): void {
+  if (!Number.isInteger(campaignId) || campaignId <= 0) throw new SmartleadApiError("A Smartlead campaign id must be a positive whole number");
+}
+
 /** The customer's own campaigns, newest first as Smartlead returns them. Rows without a usable id are dropped. */
 export async function listCampaigns(apiKey: string, opts: { maxRetries?: number } = {}): Promise<SmartleadCampaignSummary[]> {
   const data = await smartleadRequest<unknown>(apiKey, "GET", "/campaigns/", { maxRetries: opts.maxRetries });
@@ -339,8 +362,8 @@ export async function listCampaigns(apiKey: string, opts: { maxRetries?: number 
   if (!rows) throw new SmartleadUnexpectedResponseError("Smartlead GET /campaigns returned an unexpected response");
   const out: SmartleadCampaignSummary[] = [];
   for (const row of rows as Array<Record<string, unknown> | null>) {
-    const id = Number(row?.id);
-    if (!Number.isFinite(id)) continue;
+    const id = asWholeNumber(row?.id);
+    if (id === undefined || id <= 0) continue;
     out.push({
       id,
       name: String(row?.name ?? ""),
@@ -357,15 +380,16 @@ export async function getCampaignEmailAccounts(
   campaignId: number,
   opts: { maxRetries?: number } = {},
 ): Promise<SmartleadEmailAccount[]> {
+  assertCampaignId(campaignId);
   const data = await smartleadRequest<unknown>(apiKey, "GET", `/campaigns/${encodeURIComponent(String(campaignId))}/email-accounts`, {
     maxRetries: opts.maxRetries,
   });
   const rows = unwrapList(data, ["data", "email_accounts"]);
   if (!rows) throw new SmartleadUnexpectedResponseError("Smartlead GET /campaigns/{id}/email-accounts returned an unexpected response");
   return (rows as Array<Record<string, unknown> | null>).map(row => {
-    const id = Number(row?.id);
+    const id = asWholeNumber(row?.id);
     return {
-      id: Number.isFinite(id) ? id : 0,
+      id: id !== undefined ? id : 0,
       email: String(row?.from_email ?? ""),
       dailyLimit: asLimit(row?.max_email_per_day ?? row?.message_per_day),
     };
@@ -393,16 +417,18 @@ export interface SmartleadAddLeadsResult {
   skipped: number;
   /** Per-lead reasons, only when Smartlead sends them. */
   skippedLeads: Array<{ email: string; reason: string }>;
+  /** False when Smartlead gave no skipped tally and `skipped` is inferred as (sent - added). */
+  skippedKnown: boolean;
 }
 
 const count = (value: unknown): number | undefined => {
-  const n = Number(value);
-  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : undefined;
+  const n = asWholeNumber(value);
+  return n !== undefined && n >= 0 ? n : undefined;
 };
 
 /**
- * Add up to 400 leads to a campaign the customer already made. The three block-list/duplicate overrides are sent as
- * false on purpose: AgentWeb never asks Smartlead to bypass its own protection. A reply with no count we recognise is
+ * Add up to 400 leads to a campaign the customer already made. The block-list/duplicate overrides are sent as
+ * false on purpose (all four overrides in the reference): AgentWeb never asks Smartlead to bypass its own protection. A reply with no count we recognise is
  * an error, never "0 added" and never "success", because the real reply shape is unverified against a live account.
  * Retrying a 429 is safe here: a rate-limited request added nothing.
  */
@@ -412,7 +438,8 @@ export async function addLeadsToCampaign(
   leads: SmartleadLeadInput[],
   opts: { maxRetries?: number } = {},
 ): Promise<SmartleadAddLeadsResult> {
-  if (leads.length === 0) return { added: 0, skipped: 0, skippedLeads: [] };
+  assertCampaignId(campaignId);
+  if (leads.length === 0) return { added: 0, skipped: 0, skippedLeads: [], skippedKnown: true };
   if (leads.length > SMARTLEAD_LEADS_PER_REQUEST) {
     throw new SmartleadApiError(`Smartlead accepts at most ${SMARTLEAD_LEADS_PER_REQUEST} leads per request (got ${leads.length})`);
   }
@@ -433,21 +460,25 @@ export async function addLeadsToCampaign(
   const added = count(body.added_count) ?? count(body.upload_count);
   const skippedList = Array.isArray(body.skipped_leads) ? body.skipped_leads : undefined;
   const legacySkipped = [body.duplicate_count, body.invalid_email_count, body.block_count, body.bounce_count].map(count);
-  const skipped =
+  const reported =
     count(body.skipped_count) ??
     (legacySkipped.some(n => n !== undefined)
       ? legacySkipped.reduce<number>((sum, n) => sum + (n ?? 0), 0) +
         (Array.isArray(body.unsubscribed_leads) ? body.unsubscribed_leads.length : 0)
       : undefined) ??
     skippedList?.length;
-  if (added === undefined || skipped === undefined) {
+  if (added === undefined) {
+    // A 2xx with no added count: the leads may be in the campaign. Say so, never "0 added" and never a plain failure.
     throw new SmartleadUnexpectedResponseError(`Smartlead POST /campaigns/{id}/leads returned an unexpected response`);
   }
+  // Added is known but skipped is not: the import happened, so report it, with skipped inferred, rather than throw.
+  const skippedKnown = reported !== undefined;
+  const skipped = skippedKnown ? reported : Math.max(leads.length - added, 0);
   const skippedLeads = (skippedList ?? [])
     .map(row => row as { email?: unknown; reason?: unknown })
     .filter(row => typeof row?.email === "string")
     .map(row => ({ email: String(row.email), reason: String(row.reason ?? "") }));
-  return { added, skipped, skippedLeads };
+  return { added, skipped, skippedLeads, skippedKnown };
 }
 
 // ─── Main Function ──────────────────────────────────────────────────────

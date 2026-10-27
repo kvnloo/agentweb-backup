@@ -259,6 +259,11 @@ describe("smartleadService slice 2 client (ENG-673)", () => {
       await expect(listCampaigns(KEY)).resolves.toEqual([{ id: 6, name: "B", status: "ACTIVE", maxLeadsPerDay: undefined }]);
     });
 
+    it("drops a campaign whose id is null, empty or zero rather than offering campaign 0", async () => {
+      mockedAxios.request.mockResolvedValue({ data: [{ id: null, name: "a" }, { id: "", name: "b" }, { id: 0, name: "c" }, { id: 8, name: "ok" }] } as never);
+      await expect(listCampaigns(KEY)).resolves.toEqual([{ id: 8, name: "ok", status: "", maxLeadsPerDay: undefined }]);
+    });
+
     it("rejects a reply that is not a list rather than showing no campaigns", async () => {
       mockedAxios.request.mockResolvedValue({ data: { message: "Plan expired!" } } as never);
       await expect(listCampaigns(KEY)).rejects.toBeInstanceOf(SmartleadUnexpectedResponseError);
@@ -306,6 +311,7 @@ describe("smartleadService slice 2 client (ENG-673)", () => {
         added: 1,
         skipped: 1,
         skippedLeads: [{ email: "b@x.com", reason: "On global block list" }],
+        skippedKnown: true,
       });
     });
 
@@ -321,6 +327,36 @@ describe("smartleadService slice 2 client (ENG-673)", () => {
       await expect(addLeadsToCampaign(KEY, 77, leads)).rejects.toBeInstanceOf(SmartleadUnexpectedResponseError);
     });
 
+    it("does not turn null or empty counts into a real zero", async () => {
+      mockedAxios.request.mockResolvedValue({ data: { added_count: null, skipped_count: "" } } as never);
+      await expect(addLeadsToCampaign(KEY, 77, leads)).rejects.toBeInstanceOf(SmartleadUnexpectedResponseError);
+    });
+
+    it("reports an import whose skipped tally is missing, inferring it, instead of throwing after the leads went in", async () => {
+      mockedAxios.request.mockResolvedValue({ data: { success: true, added_count: 1 } } as never);
+      await expect(addLeadsToCampaign(KEY, 77, leads)).resolves.toEqual({ added: 1, skipped: 1, skippedLeads: [], skippedKnown: false });
+    });
+
+    it.each([0, -3, 1.5, NaN])("refuses campaign id %p before any request", async (id) => {
+      await expect(addLeadsToCampaign(KEY, id, leads)).rejects.toThrow(/campaign id/);
+      await expect(getCampaignEmailAccounts(KEY, id)).rejects.toThrow(/campaign id/);
+      expect(mockedAxios.request).not.toHaveBeenCalled();
+    });
+
+    it("marks a write whose outcome is unknown (timeout, 5xx, unreadable 2xx) but not a rate limit or a read", async () => {
+      mockedAxios.request.mockRejectedValueOnce(new Error("timeout of 15000ms exceeded"));
+      await expect(addLeadsToCampaign(KEY, 77, leads)).rejects.toMatchObject({ outcomeUnknown: true });
+      mockedAxios.request.mockRejectedValueOnce(Object.assign(new Error("boom"), { response: { status: 502, headers: {} } }));
+      await expect(addLeadsToCampaign(KEY, 77, leads)).rejects.toMatchObject({ outcomeUnknown: true, status: 502 });
+      mockedAxios.request.mockResolvedValueOnce({ data: { message: "ok" } } as never);
+      await expect(addLeadsToCampaign(KEY, 77, leads)).rejects.toMatchObject({ outcomeUnknown: true });
+      mockedAxios.request.mockRejectedValue(err429());
+      await expect(addLeadsToCampaign(KEY, 77, leads, { maxRetries: 0 })).rejects.toMatchObject({ outcomeUnknown: false, status: 429 });
+      mockedAxios.request.mockReset();
+      mockedAxios.request.mockRejectedValue(Object.assign(new Error("boom"), { response: { status: 500, headers: {} } }));
+      await expect(listCampaigns(KEY)).rejects.toMatchObject({ outcomeUnknown: false, status: 500 });
+    });
+
     it("refuses more than 400 leads before any request", async () => {
       const many = Array.from({ length: 401 }, (_, i) => ({ email: `l${i}@x.com` }));
       await expect(addLeadsToCampaign(KEY, 77, many)).rejects.toThrow(/at most 400/);
@@ -328,7 +364,7 @@ describe("smartleadService slice 2 client (ENG-673)", () => {
     });
 
     it("sends nothing for an empty batch", async () => {
-      await expect(addLeadsToCampaign(KEY, 77, [])).resolves.toEqual({ added: 0, skipped: 0, skippedLeads: [] });
+      await expect(addLeadsToCampaign(KEY, 77, [])).resolves.toEqual({ added: 0, skipped: 0, skippedLeads: [], skippedKnown: true });
       expect(mockedAxios.request).not.toHaveBeenCalled();
     });
 

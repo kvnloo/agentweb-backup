@@ -49,7 +49,20 @@ describe('resolveSmartlead (ENG-673)', () => {
 
   it('does not guess between several shared connections when the caller has none', async () => {
     mockGetAccounts.mockResolvedValue([row('mate'), row('boss')]);
-    await expect(resolveSmartlead('me')).resolves.toMatchObject({ ok: false, reason: 'choose' });
+    const r = await resolveSmartlead('me');
+    expect(r).toMatchObject({ ok: false, reason: 'choose' });
+    expect((r as any).candidates).toEqual([
+      { accountId: 'smartlead-mate', ownerUserId: 'mate' },
+      { accountId: 'smartlead-boss', ownerUserId: 'boss' },
+    ]);
+  });
+
+  it('tells a teammate using a shared key that only the owner can replace it', async () => {
+    mockGetAccounts.mockResolvedValue([row('mate', { needs_reconnect: true })]);
+    mockListEmailAccounts.mockRejectedValueOnce(new SmartleadApiError('no', 401));
+    const r = await resolveSmartlead('me');
+    expect(r).toMatchObject({ ok: false, reason: 'key_rejected' });
+    expect((r as { message: string }).message).toMatch(/Ask the teammate/);
   });
 
   it('honours an explicit account id, and rejects one that is not available', async () => {
@@ -77,6 +90,8 @@ describe('resolveSmartlead (ENG-673)', () => {
     it('works again and clears the flag on the owners record once the probe succeeds', async () => {
       mockListEmailAccounts.mockResolvedValueOnce([]);
       await expect(resolveSmartlead('me')).resolves.toMatchObject({ ok: true });
+      // The probe is one cheap call: no retries, first page only.
+      expect(mockListEmailAccounts).toHaveBeenCalledWith('key-of-me', { maxRetries: 0, maxPages: 1 });
       expect(mockUpdateAccountConfig).toHaveBeenCalledTimes(1);
       const [owner, platform, accountId, mutation] = mockUpdateAccountConfig.mock.calls[0];
       expect([owner, platform, accountId]).toEqual(['me', 'smartlead', 'smartlead-me']);
@@ -110,6 +125,12 @@ describe('reportSmartleadFailure (ENG-673)', () => {
     mockListEmailAccounts.mockRejectedValueOnce(new SmartleadApiError('rejected', status));
     await expect(reportSmartleadFailure(resolved, new SmartleadApiError('first', status))).resolves.toBe('key_rejected');
     expect(mockUpdateAccountConfig).toHaveBeenCalledWith('owner-9', 'smartlead', 'smartlead-owner-9', { needs_reconnect: true });
+  });
+
+  it('calls a 403 on a healthy key a forbidden resource, so a caller does not retry it as transient', async () => {
+    mockListEmailAccounts.mockResolvedValueOnce([]);
+    await expect(reportSmartleadFailure(resolved, new SmartleadApiError('forbidden', 403))).resolves.toBe('forbidden_resource');
+    expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
   });
 
   it('does not flag the key when the probe still works', async () => {
