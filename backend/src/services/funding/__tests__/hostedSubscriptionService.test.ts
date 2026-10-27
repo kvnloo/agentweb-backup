@@ -153,7 +153,8 @@ describe("hosted subscription service", () => {
       try {
         await expect(svc.startLogin(user, "claude")).rejects.toThrow();
       } finally {
-        process.env.JWT_SECRET = saved;
+        if (saved === undefined) delete process.env.JWT_SECRET;
+        else process.env.JWT_SECRET = saved;
       }
       expect(rig.script.loginsCancelled).toBe(1);
       expect(await codeOf(svc.startLogin(user, "claude"))).toBe("resolved");
@@ -187,7 +188,7 @@ describe("hosted subscription service", () => {
         expect(started.loginId).toMatch(/^[A-Za-z0-9_-]+$/);
       });
 
-      it("a tampered, truncated, foreign or expired token is login_not_found and reaches no host", async () => {
+      it("a tampered, truncated, foreign or expired token is login_not_found and makes no record", async () => {
         const started = await svc.startLogin(user, "claude");
         otherInstance();
         const flipped = started.loginId.slice(0, 20) + (started.loginId[20] === "A" ? "B" : "A") + started.loginId.slice(21);
