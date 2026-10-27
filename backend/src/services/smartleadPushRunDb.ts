@@ -227,6 +227,7 @@ export class SmartleadPushRunStoreError extends Error {
 
 const RUN_SK = "RUN";
 const LOCK_SK = "LOCK";
+const TOKEN_SK = "TOKEN";
 const lockKey = (listId: string, campaignId: number) => `LOCK#${listId}#${campaignId}`;
 
 const emptyCounts = (): PushRunCounts => ({ examined: 0, added: 0, alreadyInCampaign: 0, unconfirmed: 0, withdrawn: 0, skippedByReason: {} });
@@ -797,6 +798,37 @@ export class SmartleadPushRunDb {
     const run = fromRunItem(r.value.Attributes);
     await this.safeRelease(run.listId, run.campaignId, runId);
     return true;
+  }
+
+  // ── single-use approvals
+
+  /**
+   * Consumes an approval token's id (`jti`) with one conditional put. True means this caller is the one that may start the run; false
+   * means the token was already used. A token item is just another record kind in this table (sk `TOKEN`): no new index, no key change.
+   */
+  async claimToken(jti: string, ttlSeconds: number): Promise<boolean> {
+    if (!jti || jti.length > 100) throw new SmartleadPushRunStoreError("invalid_input", "A token id is required");
+    const r = await this.call(() =>
+      this.client.put({ TableName: this.table, Item: { pk: `TOKEN#${jti}`, sk: TOKEN_SK, ttl: Math.floor(this.nowMs() / 1000) + ttlSeconds }, ConditionExpression: "attribute_not_exists(pk)" }).promise(),
+    );
+    return r.ok;
+  }
+
+  /** Remembers which run a consumed token started, so a second submit of the same approval can be shown that run. Best effort. */
+  async setTokenRun(jti: string, runId: string): Promise<void> {
+    await this.call(() =>
+      this.client.update({ TableName: this.table, Key: { pk: `TOKEN#${jti}`, sk: TOKEN_SK }, UpdateExpression: "SET runId = :r", ConditionExpression: "attribute_exists(pk)", ExpressionAttributeValues: { ":r": runId } }).promise(),
+    );
+  }
+
+  async getTokenRun(jti: string): Promise<string | null> {
+    const r = await this.call(() => this.client.get({ TableName: this.table, Key: { pk: `TOKEN#${jti}`, sk: TOKEN_SK }, ConsistentRead: true }).promise());
+    return r.ok && typeof r.value.Item?.runId === "string" ? r.value.Item.runId : null;
+  }
+
+  /** Gives an approval back when the start it was spent on did not happen (the user can submit it again). */
+  async releaseToken(jti: string): Promise<void> {
+    await this.call(() => this.client.delete({ TableName: this.table, Key: { pk: `TOKEN#${jti}`, sk: TOKEN_SK } }).promise());
   }
 
   // ── lock

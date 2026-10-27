@@ -17,6 +17,8 @@ const limiter = (limit: number, message: string) =>
 // A preview reads a whole list and calls Smartlead, and a start begins sending to real people: both are limited per user.
 const previewLimiter = limiter(30, 'Too many previews. Try again in a few minutes.');
 const startLimiter = limiter(10, 'Too many push attempts. Try again in a few minutes.');
+// Listing campaigns spends the customer's own Smartlead API budget, which a running push also needs.
+const campaignsLimiter = limiter(30, 'Too many requests. Try again in a few minutes.');
 
 function send(res: express.Response, result: { ok: boolean; status?: number; [k: string]: any }, okStatus = 200) {
   if (result.ok) {
@@ -37,7 +39,7 @@ const wrap = (fn: (req: any, res: express.Response) => Promise<unknown>) => asyn
 };
 
 // The user's own Smartlead campaigns, for the picker.
-router.get('/campaigns', authenticateToken, wrap(async (req, res) => {
+router.get('/campaigns', authenticateToken, campaignsLimiter, wrap(async (req, res) => {
   send(res, await getSmartleadPushService().campaigns(req.user.userId, typeof req.query.accountId === 'string' ? req.query.accountId : undefined));
 }));
 

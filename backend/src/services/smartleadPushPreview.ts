@@ -3,6 +3,7 @@ import { analyseSequence } from "./smartleadSequence";
 import { selectSmartleadLeads, type SkipReason } from "./smartleadEligibility";
 import { estimateDaysToSend, type SendEstimate } from "./smartleadEstimate";
 import type { TagMapping } from "./smartleadPayload";
+import { randomUUID } from "crypto";
 import { PUSH_TOKEN_TTL_MS, signPushToken, type PushTokenPayload } from "./smartleadPushToken";
 import type { SmartleadCampaignDetail, SmartleadEmailAccount } from "./smartleadService";
 import type { LeadCursor } from "./smartleadPushRunDb";
@@ -27,6 +28,8 @@ export interface PreviewRequest {
   listId: string;
   campaignId: number;
   userId: string;
+  /** The Smartlead connection in use (bound into the approval). */
+  accountId: string;
   includeUnverified?: boolean;
   mapping?: Record<string, unknown>;
   acknowledgedTags?: unknown[];
@@ -136,7 +139,7 @@ export async function buildPreview(deps: PreviewDeps, req: PreviewRequest): Prom
   }
 
   const payload: PushTokenPayload = {
-    v: 1, userId: req.userId, listId: req.listId, campaignId: req.campaignId, includeUnverified: req.includeUnverified === true, mapping, acknowledgedTags,
+    v: 1, jti: randomUUID(), userId: req.userId, accountId: req.accountId, acknowledgeUnreadable: req.acknowledgeUnreadable === true, listId: req.listId, campaignId: req.campaignId, includeUnverified: req.includeUnverified === true, mapping, acknowledgedTags,
     startStatus: campaign.status, sequenceHash: analysis.hash, eligible: chosen, warnings: preflight.warnings.map(w => w.message).slice(0, 20),
     exp: now.getTime() + PUSH_TOKEN_TTL_MS,
   };

@@ -19,7 +19,7 @@ function deps(leads: any[], over: Partial<PreviewDeps> = {}, campaign: any = { i
     ...over,
   };
 }
-const req = (over: Record<string, any> = {}) => ({ listId: "L", campaignId: 77, userId: "u1", ...over });
+const req = (over: Record<string, any> = {}) => ({ listId: "L", campaignId: 77, userId: "u1", accountId: "smartlead-u1", ...over });
 
 describe("buildPreview (ENG-673)", () => {
   it("evaluates the whole list, counts every skip reason, and shows what would be sent for three real leads", async () => {
@@ -84,6 +84,16 @@ describe("buildPreview (ENG-673)", () => {
     const t = verifyPushToken("test-secret", p.token, Date.parse("2026-10-28T10:00:00Z"))!;
     expect(t).toMatchObject({ userId: "u1", listId: "L", campaignId: 77, startStatus: "DRAFTED", sequenceHash: p.sequence.hash, mapping: { z: "customFields.z" } });
     expect(p.expiresAt).toBe("2026-10-28T10:30:00.000Z");
+  });
+
+  it("gives every approval its own id and binds the connection and the unreadable-sequence acknowledgement into it", async () => {
+    const now = Date.parse("2026-10-28T10:00:00Z");
+    const a = verifyPushToken("test-secret", (await buildPreview(deps([lead(1)]), req({ acknowledgeUnreadable: true }))).token, now)!;
+    const b = verifyPushToken("test-secret", (await buildPreview(deps([lead(1)]), req())).token, now)!;
+    expect(a.jti).toBeTruthy();
+    expect(a.jti).not.toBe(b.jti);
+    expect(a).toMatchObject({ accountId: "smartlead-u1", acknowledgeUnreadable: true });
+    expect(b.acknowledgeUnreadable).toBe(false);
   });
 
   it("refuses bad input before reading anything", async () => {
