@@ -5362,7 +5362,7 @@ export class AgentModeService {
       // a carried-over number dressed as fresh. Measures how often it happens, per model, before
       // anyone decides to enforce. Never edits `content`; kill switch AGENT_CRM_FRESHNESS_GUARD=off.
       if (content && !wasCancelled && !mockMode) {
-        runCrmFreshnessShadow({ finalText: content, toolCalls, evidence: crmEvidence.snapshot(), earlier: crmEarlier, sessionNumbers: crmSessionNumbers, sessionId, model: llmModel });
+        runCrmFreshnessShadow({ finalText: content, toolCalls, evidence: crmEvidence.snapshot(), earlier: crmEarlier, sessionNumbers: crmSessionNumbers, sessionMessages: Array.isArray(sessionHistory) ? sessionHistory.length : undefined, sessionId, model: llmModel });
       }
 
       // ENG-1207 AC3: a run must not finish silently on an unread page.
