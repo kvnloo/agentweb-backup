@@ -217,7 +217,8 @@ export type StoreErrorCode = "table_missing" | "access_denied" | "throttled" | "
 
 /** The store could not do what was asked. The caller must fail closed (HTTP 503, push nothing); it must never be swallowed. */
 export class SmartleadPushRunStoreError extends Error {
-  constructor(public readonly code: StoreErrorCode, message: string) {
+  /** Set when a start could not settle whether the run it wrote is live: the caller must keep trying to cancel THAT run. */
+  constructor(public readonly code: StoreErrorCode, message: string, public readonly runId?: string) {
     super(message);
     this.name = "SmartleadPushRunStoreError";
   }
@@ -561,9 +562,18 @@ export class SmartleadPushRunDb {
       // Any error here may have arrived AFTER the lock write committed. If the lock is ours the run is live and the caller must hear
       // "started" (a run that holds a lock but was reported as failed would be claimed and sent later, unannounced). Otherwise the
       // Run we wrote is abandoned so it cannot be claimed either.
-      const ours = (await this.getLock(input.listId, input.campaignId).catch(() => null))?.runId === run.runId;
-      if (ours) return { started: true, run };
-      await this.abandonRun(run.runId).catch(() => undefined);
+      let ours: boolean | undefined;
+      try {
+        ours = (await this.getLock(input.listId, input.campaignId))?.runId === run.runId;
+      } catch {
+        ours = undefined; // the read failed: we do not know
+      }
+      if (ours === true) return { started: true, run };
+      // Not ours, or unknown: cancel the run we wrote BEFORE reporting anything. A run cancelled before any worker was told "started" is
+      // dead whether or not the lock write committed, so nothing can claim it later. A lock left pointing at it is taken over by the next start.
+      if (!(await this.abandonWithRetry(run.runId))) {
+        throw new SmartleadPushRunStoreError("unavailable", "A start could not be settled; the run it wrote must be cancelled", run.runId);
+      }
       throw error;
     }
     if (!lock.ok) {
@@ -580,6 +590,19 @@ export class SmartleadPushRunDb {
       return { started: false, existing: null };
     }
     return { started: true, run };
+  }
+
+  /** abandonRun with a few retries; true once the run is cancelled (or was already finished), false if it could not be confirmed. */
+  private async abandonWithRetry(runId: string): Promise<boolean> {
+    for (let attempt = 0; attempt < 4; attempt++) {
+      try {
+        await this.abandonRun(runId);
+        return true;
+      } catch {
+        if (attempt < 3) await this.sleep(BACKOFF_MS[Math.min(attempt, BACKOFF_MS.length - 1)]);
+      }
+    }
+    return false;
   }
 
   /** Cancels a run that never got its lock. */

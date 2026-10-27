@@ -102,6 +102,8 @@ class BusyError extends Error {}
 export class SmartleadPushService {
   private active = 0;
   private previewsRunning = 0;
+  /** Runs whose start failed ambiguously and which must be cancelled; retried every resumer tick until confirmed (even while switched off). */
+  private readonly pendingCancels = new Set<string>();
   private readonly workerId: string;
 
   constructor(private readonly deps: PushServiceDeps) {
@@ -310,6 +312,8 @@ export class SmartleadPushService {
         this.workerId,
       );
       } catch (error) {
+        // A start that could not settle whether its run is live: keep cancelling THAT run until it is confirmed dead.
+        if (error instanceof SmartleadPushRunStoreError && error.runId) this.pendingCancels.add(error.runId);
         // NOT released: a store error can arrive after the run was written (the reply was lost), and handing the approval back would let it
         // start a second run. Losing an approval is the safe direction: the user previews again.
         throw error;
@@ -426,6 +430,15 @@ export class SmartleadPushService {
   /** One pass of the resumer (every minute): claims runs whose worker is gone, and cancels runs nobody resumed for a week. */
   async resumerTick(): Promise<{ claimed: number; canceled: number }> {
     const out = { claimed: 0, canceled: 0 };
+    for (const runId of [...this.pendingCancels]) {
+      try {
+        await this.deps.db.cancelRun(runId); // false means it is already finished, which is just as good
+        this.pendingCancels.delete(runId);
+        this.deps.log(`[SmartleadPush] resumer canceled run=${runId} from an unsettled start`);
+      } catch {
+        /* try again next tick */
+      }
+    }
     if (!this.deps.enabled()) return out;
     try {
       for (const row of await this.deps.db.findExpiredLeases(RESUMER_BATCH)) {

@@ -526,6 +526,37 @@ suite('SmartleadPushRunDb against DynamoDB Local (ENG-673)', () => {
       expect((await db.findExpiredLeases(500)).map(x => x.runId)).not.toContain((await db.listRunsForList(i.listId, 50))[0].runId);
     });
 
+    it('cancels its run FIRST when it cannot tell whether the lock committed (the read fails too), so nothing can claim it later', async () => {
+      const i = input();
+      let lost = false;
+      const client = {
+        get: (p: any) => (p.Key?.sk === 'LOCK' && lost ? { promise: async () => { throw Object.assign(new Error('read failed'), { code: 'SocketError' }); } } : doc.get(p)),
+        query: doc.query.bind(doc), update: doc.update.bind(doc), delete: doc.delete.bind(doc),
+        put: (p: any) => (lost || p.Item?.sk !== 'LOCK' ? doc.put(p) : { promise: async () => { lost = true; await doc.put(p).promise(); throw Object.assign(new Error('socket reset'), { code: 'SocketError' }); } }),
+      } as any;
+      await expect(new SmartleadPushRunDb(client, table, () => clock, async () => {}).startRun(i, 'w')).rejects.toThrow();
+      const runs = await db.listRunsForList(i.listId, 50);
+      expect(runs.map(x => x.status)).toEqual(['canceled']);
+      clock += LEASE_MS + 31_000;
+      expect(await db.claimLease(runs[0].runId, 'worker-B', 1)).toBeNull(); // the lock points at it, but it is dead
+      expect((await db.startRun(i, 'w2')).started).toBe(true); // and the next start simply takes the stale lock over
+    });
+
+    it('raises an error carrying the run id when it cannot even cancel, so the caller keeps trying', async () => {
+      const i = input();
+      let lost = false;
+      const client = {
+        get: (p: any) => (p.Key?.sk === 'LOCK' && lost ? { promise: async () => { throw Object.assign(new Error('read failed'), { code: 'SocketError' }); } } : doc.get(p)),
+        query: doc.query.bind(doc), delete: doc.delete.bind(doc),
+        update: () => ({ promise: async () => { throw Object.assign(new Error('write failed'), { code: 'SocketError' }); } }),
+        put: (p: any) => (lost || p.Item?.sk !== 'LOCK' ? doc.put(p) : { promise: async () => { lost = true; await doc.put(p).promise(); throw Object.assign(new Error('socket reset'), { code: 'SocketError' }); } }),
+      } as any;
+      const err: any = await new SmartleadPushRunDb(client, table, () => clock, async () => {}).startRun(i, 'w').catch(e => e);
+      expect(err).toBeInstanceOf(SmartleadPushRunStoreError);
+      expect(err.runId).toBe((await db.listRunsForList(i.listId, 50))[0].runId);
+      expect((await db.getRun(err.runId))!.status).toBe('running'); // still live: the service must cancel it
+    });
+
     it('does the same for a takeover of a finished run\'s lock', async () => {
       const old = await fresh();
       await doc.update({ TableName: table, Key: { pk: old.runId, sk: 'RUN' }, UpdateExpression: 'SET #s = :c REMOVE #a', ExpressionAttributeNames: { '#s': 'status', '#a': 'active' }, ExpressionAttributeValues: { ':c': 'completed' } }).promise();

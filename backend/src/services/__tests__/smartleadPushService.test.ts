@@ -363,6 +363,30 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
       expect(await db.listRunsForList(e.listId)).toHaveLength(1);
     });
 
+    it("keeps cancelling a run whose start could not be settled until it is confirmed dead (even while switched off)", async () => {
+      const e = env({ maxConcurrentWorkers: 0 });
+      const p = await approve(e);
+      const start = db.startRun.bind(db);
+      let cancelFails = 2;
+      (e.deps.db as any) = new Proxy(db, {
+        get: (t, k) => {
+          if (k === "startRun") return async (...a: any[]) => { const r: any = await (start as any)(...a); throw new SmartleadPushRunStoreError("unavailable", "could not settle", r.run.runId); };
+          if (k === "cancelRun") return async (id: string) => { if (cancelFails-- > 0) throw new SmartleadPushRunStoreError("unavailable", "down"); return (t as any).cancelRun(id); };
+          return (t as any)[k]?.bind?.(t) ?? (t as any)[k];
+        },
+      });
+      expect(await e.svc.start("owner", go(p.token))).toMatchObject({ ok: false, status: 503 });
+      const live = (await db.listRunsForList(e.listId))[0];
+      expect(live.status).toBe("running");
+      e.flags.enabled = false;
+      await e.svc.resumerTick(); // cancel fails
+      await e.svc.resumerTick(); // fails again
+      expect((await db.getRun(live.runId))!.status).toBe("running");
+      await e.svc.resumerTick(); // confirmed
+      expect((await db.getRun(live.runId))!.status).toBe("canceled");
+      expect(await db.getLock(e.listId, CAMPAIGN)).toBeNull();
+    });
+
     it("refuses an approval that went stale because another run started on the list and campaign since the preview", async () => {
       const e = env({ leads: Array.from({ length: 120 }, (_, i) => mkLead(i + 1)) });
       const first = await approve(e);
