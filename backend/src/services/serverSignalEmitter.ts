@@ -285,7 +285,13 @@ export function mapResendEventToEngagementSignal(event: { type?: string; data?: 
   const recipient = bareEmail(to.find(Boolean));
   if (!recipient) return null;
   const props: Record<string, string> = { emailId: String(event.data.email_id || ''), subject: String(event.data.subject || '').slice(0, 120) };
-  if (name === 'email_clicked') props.link = String(event.data.click?.link || '').slice(0, 200);
+  if (name === 'email_clicked') {
+    // Path only: clicked links can carry tokens (e.g. domain-join) in the query string.
+    const raw = String(event.data.click?.link || '');
+    let linkPath = '';
+    try { linkPath = new URL(raw).pathname; } catch { linkPath = raw.split(/[?#]/)[0]; }
+    props.link = linkPath.slice(0, 200);
+  }
   if (name === 'email_bounced') props.bounceType = String(event.data.bounce?.type || '');
   if (event.type === 'email.complained') props.reason = 'spam_complaint';
   return { name, recipient, props };
