@@ -4,6 +4,10 @@
  * covered by route tests; this is service + DynamoDB + host for real, with a REAL sign-in typed by the owner in their own terminal.
  *
  *   sudo NODE_ENV=development node hostedServiceLive.js [--reconnect] [--swap]
+ *   sudo NODE_ENV=development node hostedServiceLive.js --hardening     (ONE code) protocol-3 behaviours on a ready login: nonce reported, a loser whose reply is lost stands down
+ *                                                                       without cancelling, a stray user cancel leaves the ready login, then promote + revoke by hand
+ *   sudo NODE_ENV=development node hostedServiceLive.js --ready-ttl    (ONE code) a ready login that is never promoted is discarded by the host and the connection is free again
+ *                                                                       (needs "manager": {"readyAttemptTtlMs": 10000} in the test host config; takes up to ~3 minutes)
  *
  * --swap (ENG-2110, sealed sign-in token): the sign-in is STARTED by one service object and COMPLETED by two other, freshly built ones at the
  * same moment with the same code (what a deploy swap plus a double submit look like). Expected: exactly one succeeds, the other answers
@@ -63,16 +67,21 @@ function readHidden(prompt: string): Promise<string> {
 const db = new LlmConnectionDb();
 const dc = new AWS.DynamoDB.DocumentClient({ region: process.env.AWS_REGION || "us-west-2" });
 const provider: HostedProvider = { route: "claude", kind: "claude_subscription", recordProvider: "anthropic", hostProvider: "claude", isEnabledFor: async (u) => u === OWNER };
-const makeSvc = () =>
+const makeSvc = (wrapClient?: (c: LoginHostClient) => LoginHostClient) =>
   new HostedSubscriptionService({
     db,
-    client: () => new LoginHostClient(new UnixSocketTransport(SOCK)),
+    client: () => {
+      const c = new LoginHostClient(new UnixSocketTransport(SOCK));
+      return wrapClient ? wrapClient(c) : c;
+    },
     providers: { claude: provider },
     now: () => Date.now(),
     newId: () => `zz-live-${randomBytes(5).toString("hex")}`,
   });
 const svc = makeSvc();
 const WITH_SWAP = process.argv.includes("--swap");
+const HARDENING = process.argv.includes("--hardening");
+const READY_TTL = process.argv.includes("--ready-ttl");
 const user = { userId: OWNER };
 const counter = async () => ((await dc.get({ TableName: LLM_CONNECTIONS_TABLE, Key: { connectionId: `limit#${OWNER}` } }).promise()).Item?.activeCount as number | undefined) ?? 0;
 const homesLeft = () => {
@@ -83,6 +92,8 @@ const homesLeft = () => {
   }
 };
 const touched = new Set<string>();
+const touchedHost = new Set<string>(); // host-side connections made by hand in the --hardening / --ready-ttl scenarios
+let BASE_HOMES = 0;
 
 /** Started here, completed by two OTHER service objects at once (a deploy swap plus a double submit). */
 async function signInSwap(label: string) {
@@ -109,7 +120,80 @@ async function signIn(label: string, reconnectConnectionId?: string) {
   return svc.completeLogin(user, started.loginId, code);
 }
 
+/** Protocol-3 behaviours on a ready login, with the real CLI. One sign-in code. The "other instances" are fresh service objects; the "winner" is a raw host call. */
+async function hardening() {
+  const started = await svc.startLogin(user, "claude");
+  const { connectionId, loginRef } = (svc as unknown as { lookup(id: string): { pending: { connectionId: string; loginRef: string } } }).lookup(started.loginId).pending;
+  touchedHost.add(connectionId);
+  console.log(`\n[hardening] Open this URL in a browser (do NOT paste it anywhere), sign in, and copy the code shown:\n${started.authorizeUrl}\n`);
+  const code = await readHidden("Paste the code (hidden): ");
+  const raw = new LoginHostClient(new UnixSocketTransport(SOCK));
+  const ready = await raw.loginComplete({ connectionId, loginRef, code, completionNonce: "live-winner-0001" });
+  check("hardening-ready-reports-the-nonce", ready.status === "ready" && ready.completionNonce === "live-winner-0001");
+  const st = await raw.loginStatus({ connectionId, loginRef });
+  check("hardening-status-reports-the-same-nonce", st.status === "ready" && "completionNonce" in st && st.completionNonce === "live-winner-0001");
+  // a second complete (any nonce) is refused and does not change whose nonce is on the attempt
+  const second = await raw.loginComplete({ connectionId, loginRef, code: "AAAAAAAA#BBBBBBBB", completionNonce: "live-loser-0002" }).then(() => "no-error", (e) => `${(e as { code?: string }).code}/${(e as { detail?: string }).detail}`);
+  check("hardening-second-complete-refused", second === "ESTATE/login_not_pending", second);
+  // the loser: its own complete never reaches the host (lost), so it asks the status, sees another request's nonce and stands down WITHOUT cancelling
+  const loser = makeSvc((c) => {
+    c.loginComplete = async () => {
+      throw new (await import("../../../services/funding/loginHostClient")).LoginHostError("UNREACHABLE");
+    };
+    return c;
+  });
+  const outcome = await codeOf(loser.completeLogin(user, started.loginId, "AAAAAAAA#BBBBBBBB"));
+  check("hardening-loser-stands-down", outcome === "login_not_found", outcome);
+  const st2 = await raw.loginStatus({ connectionId, loginRef });
+  check("hardening-loser-did-not-cancel-the-winner", st2.status === "ready" && "completionNonce" in st2 && st2.completionNonce === "live-winner-0001");
+  // a stray user cancel at yet another instance (onlyIfPending) leaves the ready login
+  const other = makeSvc();
+  await other.cancelLogin(user, started.loginId);
+  const st3 = await raw.loginStatus({ connectionId, loginRef });
+  check("hardening-stray-cancel-leaves-the-ready-login", st3.status === "ready", st3.status);
+  await other.shutdown();
+  await loser.shutdown();
+  // the winner finishes: promote works, then the login is disconnected by hand (there is no backend record in this scenario)
+  const promoted = await raw.loginPromote({ connectionId, loginRef, epoch: 1 });
+  check("hardening-winner-promotes", promoted.state === "active" && promoted.epoch === 1, JSON.stringify(promoted));
+  const revoked = await raw.connectionRevoke({ connectionId, epoch: 1 });
+  check("hardening-revoked-by-hand", revoked.state === "revoked", JSON.stringify(revoked));
+  await sleep(4_000);
+  check("hardening-home-wiped", homesLeft() === BASE_HOMES, `homes=${homesLeft()} (base ${BASE_HOMES})`);
+}
+
+/** A ready login that is never promoted is discarded by the host after readyAttemptTtlMs and the connection is free again. One sign-in code. */
+async function readyTtl() {
+  const raw = new LoginHostClient(new UnixSocketTransport(SOCK));
+  const connectionId = `zz-live-ttl-${randomBytes(4).toString("hex")}`;
+  touchedHost.add(connectionId);
+  const started = await raw.loginStart({ connectionId, provider: "claude" });
+  console.log(`\n[ready-ttl] Open this URL in a browser (do NOT paste it anywhere), sign in, and copy the code shown:\n${started.url}\n`);
+  const code = await readHidden("Paste the code (hidden): ");
+  const ready = await raw.loginComplete({ connectionId, loginRef: started.loginRef, code, completionNonce: "live-ttl-000001" });
+  check("ttl-ready", ready.status === "ready");
+  const busy = await raw.loginStart({ connectionId, provider: "claude", reconnect: true }).then(() => "no-error", (e) => `${(e as { code?: string }).code}/${(e as { detail?: string }).detail}`);
+  check("ttl-start-is-busy-while-ready", /ESTATE/.test(busy), busy);
+  const t0 = Date.now();
+  let gone = false;
+  while (Date.now() - t0 < 240_000) {
+    const r = await raw.loginStatus({ connectionId, loginRef: started.loginRef }).then(() => "ready", (e) => (e as { code?: string }).code ?? "error");
+    if (r === "ENOTFOUND") { gone = true; break; }
+    await sleep(10_000);
+  }
+  const secs = Math.round((Date.now() - t0) / 1000);
+  check("ttl-unpromoted-attempt-discarded", gone, `after ${secs}s`);
+  const again = await raw.loginStart({ connectionId, provider: "claude" }).then((r) => r, () => undefined);
+  check("ttl-connection-is-free-again", !!again, again ? "started" : "still busy");
+  if (again) await raw.loginCancel({ connectionId, loginRef: again.loginRef }).catch(() => undefined);
+  await sleep(4_000);
+  check("ttl-home-wiped", homesLeft() === BASE_HOMES, `homes=${homesLeft()} (base ${BASE_HOMES})`);
+}
+
 async function main() {
+  BASE_HOMES = homesLeft();
+  if (HARDENING) return hardening();
+  if (READY_TTL) return readyTtl();
   const BASE = homesLeft(); // homes already on the host (e.g. the kept test login): the checks below count relative to this
   if (!LLM_CONNECTIONS_TABLE.startsWith("Dev-")) throw new Error("refusing: not the Dev table");
   check("unsupported-provider", (await codeOf(svc.startLogin(user, "nope"))) === "unsupported_provider");

@@ -30,6 +30,7 @@ describe("hosted subscription service", () => {
   let nowMs: number;
   let promoteLoses: boolean;
   let completeLostBeforeSend: boolean;
+  let statusLostBeforeSend: boolean;
   let workerProto: number | undefined;
   let sent: Array<{ route: string; body: Record<string, unknown> }> = [];
   let revokeBegun: string[] = [];
@@ -59,6 +60,7 @@ describe("hosted subscription service", () => {
     nowMs = rig.clock.nowMs(); // the test host runs on a manual clock; sign-in tokens carry the host's expiry, so the backend's clock must agree
     promoteLoses = false;
     completeLostBeforeSend = false;
+    statusLostBeforeSend = false;
     workerProto = 3;
     sent = [];
     revokeBegun = [];
@@ -75,6 +77,7 @@ describe("hosted subscription service", () => {
           json: async (r, b) => {
             sent.push({ route: r, body: b as Record<string, unknown> });
             if (completeLostBeforeSend && r === "login.complete") throw new LoginHostError("UNREACHABLE"); // the request never reaches the host
+            if (statusLostBeforeSend && r === "login.status") throw new LoginHostError("UNREACHABLE");
             const reply = await real.json(r, b);
             if (promoteLoses && r === "login.promote") throw new LoginHostError("UNREACHABLE");
             return reply;
@@ -282,6 +285,29 @@ describe("hosted subscription service", () => {
           expect(rig.script.loginsCancelled).toBe(cancelsBefore); // it did NOT cancel
           expect(rig.mgr.status({ connectionId }).state).toBe("attempting");
           await expect(rawClient().loginPromote({ connectionId, loginRef, epoch: 1 })).resolves.toMatchObject({ state: "active", epoch: 1 });
+        });
+
+        it("the winner is an OLDER backend instance (it sends no nonce, as in a rolling deploy): the loser still stands down and the old winner can promote", async () => {
+          const started = await svc.startLogin(user, "claude");
+          const { loginRef, connectionId } = await loginRefOf(started.loginId);
+          await rawClient().loginComplete({ connectionId, loginRef, code: GOOD }); // no nonce
+          otherInstance();
+          completeLostBeforeSend = true;
+          expect(await codeOf(svc.completeLogin(user, started.loginId, GOOD))).toBe("login_not_found");
+          expect(store.rows()).toHaveLength(0); // the loser created no record
+          await expect(rawClient().loginPromote({ connectionId, loginRef, epoch: 1 })).resolves.toMatchObject({ state: "active" });
+        });
+
+        it("the loser's reply AND its status read are both lost: it answers complete_timeout WITHOUT discarding the winner's ready login", async () => {
+          const started = await svc.startLogin(user, "claude");
+          const { loginRef, connectionId } = await loginRefOf(started.loginId);
+          await rawClient().loginComplete({ connectionId, loginRef, code: GOOD, completionNonce: "winner-nonce-0003" });
+          otherInstance();
+          completeLostBeforeSend = true;
+          statusLostBeforeSend = true;
+          expect(await codeOf(svc.completeLogin(user, started.loginId, GOOD))).toBe("complete_timeout");
+          expect(sent.filter((x) => x.route === "login.cancel").every((x) => x.body.onlyIfPending === true)).toBe(true);
+          await expect(rawClient().loginPromote({ connectionId, loginRef, epoch: 1 })).resolves.toMatchObject({ state: "active" });
         });
 
         it("a lost reply to the request that DID take the code is still a success (its own nonce comes back)", async () => {

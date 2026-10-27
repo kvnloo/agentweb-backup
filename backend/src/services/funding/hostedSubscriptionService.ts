@@ -301,20 +301,23 @@ export class HostedSubscriptionService {
         try {
           const st = await client.loginStatus({ connectionId, loginRef });
           if (st.status === "ready") {
-            // Ready, but another request took the code (a double submit that reached the host through another instance): this one lost. It must stand down WITHOUT
-            // cancelling, or it would discard the winner's login. (No nonce reported = an older worker: the previous behaviour.)
-            if (completionNonce && "completionNonce" in st && st.completionNonce !== undefined && st.completionNonce !== completionNonce) throw new HostedSubscriptionError("login_not_found");
+            // Ready, but did THIS request take the code? A protocol-3 host stores the nonce of the complete that took it, so a ready attempt with another nonce, or with
+            // none (the winner was an older backend instance that sends no nonce, as in a rolling deploy), was taken by someone else: this one lost. It must stand down
+            // WITHOUT cancelling, or it would discard the winner's login. (No nonce was sent = an older worker: the previous behaviour.)
+            if (completionNonce && st.completionNonce !== completionNonce) throw new HostedSubscriptionError("login_not_found");
             return st;
           }
         } catch (inner) {
           if (inner instanceof HostedSubscriptionError) throw inner;
           /* fall through */
         }
-        await client.loginCancel({ connectionId, loginRef }).catch(() => undefined);
+        // Neither the reply nor the status arrived: the attempt may be ready and taken by ANOTHER request, so this cancel must not discard it (onlyIfPending). If this
+        // request did take it, the host's ready-attempt limit clears it.
+        await client.loginCancel({ connectionId, loginRef, ...(completionNonce ? { onlyIfPending: true } : {}) }).catch(() => undefined);
         throw new HostedSubscriptionError("complete_timeout");
       }
     }
-    await client.loginCancel({ connectionId, loginRef }).catch(() => undefined);
+    await client.loginCancel({ connectionId, loginRef, ...(completionNonce ? { onlyIfPending: true } : {}) }).catch(() => undefined);
     throw new HostedSubscriptionError("start_failed");
   }
 
