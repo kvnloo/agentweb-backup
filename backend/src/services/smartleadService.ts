@@ -1,4 +1,5 @@
 import axios from "axios";
+import { createHash } from "crypto";
 
 // ─── Types ──────────────────────────────────────────────────────────────
 
@@ -101,7 +102,11 @@ let clientOptions: SmartleadClientOptions = { ...DEFAULT_CLIENT_OPTIONS };
 let sleepFn: (ms: number) => Promise<void> = ms => new Promise(r => setTimeout(r, ms));
 let randomFn: () => number = Math.random;
 let nowFn: () => number = Date.now;
-let nextSlotAt = 0;
+// Smartlead's limit is per API key, so each key has its own slot: one customer's push must not delay another's, or
+// AgentWeb's own metrics key. Keyed by a hash so the key itself is never held as a map key or logged.
+const nextSlotAtByKey = new Map<string, number>();
+const THROTTLE_PRUNE_ABOVE = 1000;
+const throttleKeyId = (apiKey: string) => createHash("sha256").update(apiKey).digest("hex").slice(0, 16);
 
 /** Test seam: override timing/randomness and client options. Resets throttle state. */
 export function __configureSmartleadClient(overrides: {
@@ -114,7 +119,7 @@ export function __configureSmartleadClient(overrides: {
   sleepFn = overrides.sleep || (ms => new Promise(r => setTimeout(r, ms)));
   randomFn = overrides.random || Math.random;
   nowFn = overrides.now || Date.now;
-  nextSlotAt = 0;
+  nextSlotAtByKey.clear();
 }
 
 /** Remove api_key values from any string (URLs, error messages, serialized configs). */
@@ -124,13 +129,17 @@ export function scrubSmartleadSecrets(text: string, apiKey?: string): string {
   return out;
 }
 
-async function acquireThrottleSlot(): Promise<void> {
+async function acquireThrottleSlot(apiKey: string): Promise<void> {
   const rpm = clientOptions.requestsPerMinute;
   if (!rpm || rpm <= 0) return;
   const interval = 60000 / rpm;
   const now = nowFn();
-  const slot = Math.max(now, nextSlotAt);
-  nextSlotAt = slot + interval;
+  if (nextSlotAtByKey.size > THROTTLE_PRUNE_ABOVE) {
+    for (const [id, at] of nextSlotAtByKey) if (at <= now) nextSlotAtByKey.delete(id);
+  }
+  const id = throttleKeyId(apiKey);
+  const slot = Math.max(now, nextSlotAtByKey.get(id) ?? 0);
+  nextSlotAtByKey.set(id, slot + interval);
   const wait = slot - now;
   if (wait > 0) await sleepFn(wait);
 }
@@ -167,7 +176,7 @@ export async function smartleadRequest<T>(
 ): Promise<T> {
   const maxRetries = opts.maxRetries ?? clientOptions.maxRetries;
   for (let attempt = 0; ; attempt++) {
-    await acquireThrottleSlot();
+    await acquireThrottleSlot(apiKey);
     try {
       const response = await axios.request<T>({
         method,
@@ -241,6 +250,14 @@ const EMAIL_ACCOUNTS_MAX_PAGES = 20;
 export interface SmartleadEmailAccount {
   id: number;
   email: string;
+  /** Mailbox daily cap. The docs name it `message_per_day` on the list call and `max_email_per_day` on update; either is read. */
+  dailyLimit?: number;
+}
+
+/** A positive whole number, or undefined. Never trust a vendor field to be numeric. */
+function asLimit(value: unknown): number | undefined {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
 }
 
 /**
@@ -268,10 +285,17 @@ export async function listEmailAccounts(
       throw new SmartleadUnexpectedResponseError("Smartlead GET /email-accounts returned an unexpected response");
     }
     const before = seen.size;
-    data.forEach((row: { id?: unknown; from_email?: unknown } | null, i) => {
+    // Project to the fields we use: the list response also carries SMTP/IMAP passwords, which must never be kept or logged.
+    data.forEach((row: { id?: unknown; from_email?: unknown; max_email_per_day?: unknown; message_per_day?: unknown } | null, i) => {
       const id = Number(row?.id);
       const key = Number.isFinite(id) ? id : `row-${before + i}`;
-      if (!seen.has(key)) seen.set(key, { id: Number.isFinite(id) ? id : 0, email: String(row?.from_email ?? "") });
+      if (!seen.has(key)) {
+        seen.set(key, {
+          id: Number.isFinite(id) ? id : 0,
+          email: String(row?.from_email ?? ""),
+          dailyLimit: asLimit(row?.max_email_per_day ?? row?.message_per_day),
+        });
+      }
     });
     if (data.length === 0 || seen.size === before) break;
   }
@@ -281,6 +305,149 @@ export async function listEmailAccounts(
 async function fetchEmailAccounts(apiKey: string): Promise<number> {
   const data = await smartleadRequest<unknown[]>(apiKey, "GET", "/email-accounts");
   return Array.isArray(data) ? data.length : 0;
+}
+
+// ─── Campaigns and lead import (ENG-673 slice 2) ────────────────────────
+//
+// Shapes below are from Smartlead's reference (api.smartlead.ai, read 2026-10-27), which contradicts itself in
+// places, so every reader accepts the variants the docs show and projects only the fields we use.
+
+export interface SmartleadCampaignSummary {
+  id: number;
+  name: string;
+  /** Upper-cased as sent. Documented values: ACTIVE, PAUSED, STOPPED, ARCHIVED, DRAFTED (elsewhere DRAFT, COMPLETED). */
+  status: string;
+  maxLeadsPerDay?: number;
+}
+
+/** A list reply is a bare array (the "direct array" note) or wrapped as `campaigns` / `data` (the response table). */
+function unwrapList(data: unknown, wrappers: string[]): unknown[] | undefined {
+  if (Array.isArray(data)) return data;
+  if (data && typeof data === "object") {
+    for (const key of wrappers) {
+      const inner = (data as Record<string, unknown>)[key];
+      if (Array.isArray(inner)) return inner;
+    }
+  }
+  return undefined;
+}
+
+/** The customer's own campaigns, newest first as Smartlead returns them. Rows without a usable id are dropped. */
+export async function listCampaigns(apiKey: string, opts: { maxRetries?: number } = {}): Promise<SmartleadCampaignSummary[]> {
+  const data = await smartleadRequest<unknown>(apiKey, "GET", "/campaigns/", { maxRetries: opts.maxRetries });
+  const rows = unwrapList(data, ["campaigns", "data"]);
+  if (!rows) throw new SmartleadUnexpectedResponseError("Smartlead GET /campaigns returned an unexpected response");
+  const out: SmartleadCampaignSummary[] = [];
+  for (const row of rows as Array<Record<string, unknown> | null>) {
+    const id = Number(row?.id);
+    if (!Number.isFinite(id)) continue;
+    out.push({
+      id,
+      name: String(row?.name ?? ""),
+      status: String(row?.status ?? "").toUpperCase(),
+      maxLeadsPerDay: asLimit(row?.max_leads_per_day),
+    });
+  }
+  return out;
+}
+
+/** The mailboxes attached to one campaign. The reference example omits their daily limit; join with listEmailAccounts for it. */
+export async function getCampaignEmailAccounts(
+  apiKey: string,
+  campaignId: number,
+  opts: { maxRetries?: number } = {},
+): Promise<SmartleadEmailAccount[]> {
+  const data = await smartleadRequest<unknown>(apiKey, "GET", `/campaigns/${encodeURIComponent(String(campaignId))}/email-accounts`, {
+    maxRetries: opts.maxRetries,
+  });
+  const rows = unwrapList(data, ["data", "email_accounts"]);
+  if (!rows) throw new SmartleadUnexpectedResponseError("Smartlead GET /campaigns/{id}/email-accounts returned an unexpected response");
+  return (rows as Array<Record<string, unknown> | null>).map(row => {
+    const id = Number(row?.id);
+    return {
+      id: Number.isFinite(id) ? id : 0,
+      email: String(row?.from_email ?? ""),
+      dailyLimit: asLimit(row?.max_email_per_day ?? row?.message_per_day),
+    };
+  });
+}
+
+export const SMARTLEAD_LEADS_PER_REQUEST = 400;
+
+export interface SmartleadLeadInput {
+  email: string;
+  first_name?: string;
+  last_name?: string;
+  company_name?: string;
+  phone_number?: string;
+  website?: string;
+  location?: string;
+  linkedin_profile?: string;
+  company_url?: string;
+  /** Free-form keys, case-sensitive in the customer's templates. Smartlead allows up to 200. */
+  custom_fields?: Record<string, string>;
+}
+
+export interface SmartleadAddLeadsResult {
+  added: number;
+  skipped: number;
+  /** Per-lead reasons, only when Smartlead sends them. */
+  skippedLeads: Array<{ email: string; reason: string }>;
+}
+
+const count = (value: unknown): number | undefined => {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : undefined;
+};
+
+/**
+ * Add up to 400 leads to a campaign the customer already made. The three block-list/duplicate overrides are sent as
+ * false on purpose: AgentWeb never asks Smartlead to bypass its own protection. A reply with no count we recognise is
+ * an error, never "0 added" and never "success", because the real reply shape is unverified against a live account.
+ * Retrying a 429 is safe here: a rate-limited request added nothing.
+ */
+export async function addLeadsToCampaign(
+  apiKey: string,
+  campaignId: number,
+  leads: SmartleadLeadInput[],
+  opts: { maxRetries?: number } = {},
+): Promise<SmartleadAddLeadsResult> {
+  if (leads.length === 0) return { added: 0, skipped: 0, skippedLeads: [] };
+  if (leads.length > SMARTLEAD_LEADS_PER_REQUEST) {
+    throw new SmartleadApiError(`Smartlead accepts at most ${SMARTLEAD_LEADS_PER_REQUEST} leads per request (got ${leads.length})`);
+  }
+  const data = await smartleadRequest<Record<string, unknown>>(apiKey, "POST", `/campaigns/${encodeURIComponent(String(campaignId))}/leads`, {
+    data: {
+      lead_list: leads,
+      settings: {
+        ignore_global_block_list: false,
+        ignore_unsubscribe_list: false,
+        ignore_duplicate_leads_in_other_campaign: false,
+        ignore_community_bounce_list: false,
+      },
+    },
+    maxRetries: opts.maxRetries,
+  });
+  const body = data && typeof data === "object" ? data : {};
+  // Reference shape: added_count / skipped_count. Older shape: upload_count plus separate duplicate/invalid/unsubscribed tallies.
+  const added = count(body.added_count) ?? count(body.upload_count);
+  const skippedList = Array.isArray(body.skipped_leads) ? body.skipped_leads : undefined;
+  const legacySkipped = [body.duplicate_count, body.invalid_email_count, body.block_count, body.bounce_count].map(count);
+  const skipped =
+    count(body.skipped_count) ??
+    (legacySkipped.some(n => n !== undefined)
+      ? legacySkipped.reduce<number>((sum, n) => sum + (n ?? 0), 0) +
+        (Array.isArray(body.unsubscribed_leads) ? body.unsubscribed_leads.length : 0)
+      : undefined) ??
+    skippedList?.length;
+  if (added === undefined || skipped === undefined) {
+    throw new SmartleadUnexpectedResponseError(`Smartlead POST /campaigns/{id}/leads returned an unexpected response`);
+  }
+  const skippedLeads = (skippedList ?? [])
+    .map(row => row as { email?: unknown; reason?: unknown })
+    .filter(row => typeof row?.email === "string")
+    .map(row => ({ email: String(row.email), reason: String(row.reason ?? "") }));
+  return { added, skipped, skippedLeads };
 }
 
 // ─── Main Function ──────────────────────────────────────────────────────
