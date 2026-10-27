@@ -76,6 +76,7 @@ async function main() {
   const { settlePaygOverageMonth, runPaygSettlement } = await import('../services/paygSettlementService');
   const { previousUsageMonth } = await import('../services/paygSettlement');
   const { paygSettlementSwitch } = await import('../services/paygOverageService');
+  const { paygSuspendedReasonOf } = await import('../services/paygOverage');
   const { recordSpendEvent, SPEND_EVENTS_TABLE } = await import('../services/spendEventDb');
   const { putProjection, SPEND_PROJECTION_TABLE } = await import('../services/spendProjectionDb');
   const { projectMonth } = await import('../services/spendProjection');
@@ -372,7 +373,7 @@ async function main() {
     note('Stripe dispute outcome', { status: d.status });
     if (closed) {
       const won = evidence === 'winning_evidence';
-      check(won ? 'won: hold lifted' : 'lost: hold stays (dispute_lost) and month written off', won ? !after.paygOverage?.suspended : after.paygOverage?.suspended?.reason === 'dispute_lost' && after.paygSettlements[month].status === 'written_off',
+      check(won ? 'won: hold lifted' : 'lost: hold stays (dispute_lost) and month written off', won ? !after.paygOverage?.suspended : paygSuspendedReasonOf(after.paygOverage?.suspended) === 'dispute_lost' && after.paygSettlements[month].status === 'written_off',
         { suspended: after.paygOverage?.suspended ?? null, status: after.paygSettlements[month].status, writtenOffReason: after.paygSettlements[month].writtenOffReason ?? null });
     }
   }
