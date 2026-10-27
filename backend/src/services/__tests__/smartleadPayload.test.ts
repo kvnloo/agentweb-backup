@@ -31,6 +31,22 @@ describe("classifyTags", () => {
   });
 });
 
+describe("tags that name object internals", () => {
+  it("never treats {{constructor}}, {{toString}} or {{__proto__}} as standard or mapped", () => {
+    const c = classifyTags(["constructor", "__proto__", "toString", "hasOwnProperty"], {});
+    expect(c.standard).toEqual([]);
+    expect(c.mapped).toEqual([]);
+    expect(c.unknown).toEqual(["constructor", "__proto__", "toString", "hasOwnProperty"]);
+  });
+
+  it("does not let a mapping key like __proto__ pollute the custom fields", () => {
+    const mapping = JSON.parse('{"__proto__": "customFields.industry", "industry": "customFields.industry"}');
+    const r = buildLeadPayload(lead(), { tagsUsed: ["__proto__", "industry"], mapping });
+    expect(r.ok && Object.keys(r.input.custom_fields ?? {})).toEqual(["industry"]);
+    expect(({} as any).industry).toBeUndefined();
+  });
+});
+
 describe("buildLeadPayload", () => {
   it("builds the standard fields from the CRM names, lower-cases the email, and adds a custom field for a mapped tag", () => {
     const r = buildLeadPayload(lead(), { tagsUsed: ["first_name", "industry"], mapping: { industry: "customFields.industry" } });
