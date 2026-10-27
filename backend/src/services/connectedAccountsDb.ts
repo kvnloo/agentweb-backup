@@ -3,6 +3,7 @@ import { userDb, User } from './db';
 import { invalidateCachedPixels } from './metaPixelsCache';
 import { isEvaluationUser } from './evaluationPolicy';
 import type { DailyVolumeState } from './linkedInWritePacer';
+import { emitAppSignal } from './serverSignalEmitter';
 
 // ============================================
 // Type Definitions
@@ -532,6 +533,9 @@ export const createAccount = async (
   // page. See services/metaPixelsCache.ts.
   invalidateCachedPixels(userId);
   if (platform === 'hubspot') clearHubSpotPortalCache();
+
+  // ENG-2686: first connection only (a re-OAuth of the same account is not a new integration).
+  if (existingIndex < 0) void emitAppSignal(user as any, 'integration_connected', { platform });
 
   return accountConfig;
 };
