@@ -6,8 +6,9 @@
  * uses (ingestTrackerEvent → upsertSessionLead), so no table, schema or key changes are involved.
  *
  * Keying: one server-side session row per account — sessionId `acct-<userId>`, sessionStartMs = the
- * account's createdAt (stable, so every event for the account lands on the same row). Linking that row
- * to anonymous visitor sessions is ENG-2682's identity-stitching slice, not this one.
+ * account's createdAt (stable, so every event for the account lands on the same row). ENG-2687 links that
+ * row to the browser's anonymous sessions by writing the browser's visitorId onto it (linkVisitorToAccount);
+ * utils/identityStitching resolves the rows into people at read time.
  *
  * Contract: fire-and-forget. emitSignal never throws; a missing list, unknown customer or a write failure
  * is logged and swallowed so the Stripe webhook ack is never affected.
@@ -17,6 +18,7 @@
  * sends to its users, identified by the system sender. Customer-sent email is never emitted.
  */
 import type { ParsedIngest } from '../utils/trackingIngest';
+import { VISITOR_ID_RE } from '../utils/trackingIngest';
 import { invoiceSubscriptionId } from '../utils/stripeInvoiceFields';
 import { RESEND_SYSTEM_EMAIL } from '../config';
 
@@ -59,6 +61,11 @@ export type AppSignalName =
   | 'integration_connected';
 
 export type ServerSignalName = BillingSignalName | EngagementSignalName | AppSignalName;
+
+/** ENG-2687: identity events that link the browser's visitorId to the server-generated account id. */
+export type IdentitySignalName = 'lead_identified' | 'registration_completed';
+
+export type SignalName = ServerSignalName | IdentitySignalName;
 
 export interface BillingSignal {
   name: BillingSignalName;
@@ -152,7 +159,15 @@ async function defaultDeps(): Promise<EmitterDeps> {
 }
 
 /** Pure: the ParsedIngest for one server signal on an account's row. */
-export function buildSignalIngest(listId: string, user: { userId: string; createdAt?: string }, name: string, props: Record<string, string | number>, nowMs: number): ParsedIngest {
+export function buildSignalIngest(
+  listId: string,
+  user: { userId: string; createdAt?: string },
+  name: string,
+  props: Record<string, string | number>,
+  nowMs: number,
+  /** ENG-2687: a validated browser visitorId to stitch onto the account row. */
+  visitorId?: string,
+): ParsedIngest {
   const created = Date.parse(user.createdAt || '');
   const lastCustomProps = JSON.stringify(props).slice(0, 500);
   return {
@@ -161,7 +176,7 @@ export function buildSignalIngest(listId: string, user: { userId: string; create
     event: 'custom',
     customName: name,
     // eventCount drives the merge's monotonic journey guard: wall-clock seconds keep later events winning.
-    client: { accountId: user.userId, eventCount: Math.floor(nowMs / 1000), lastEvent: `custom:${name}`, lastCustomProps },
+    client: { accountId: user.userId, ...(visitorId ? { visitorId } : {}), eventCount: Math.floor(nowMs / 1000), lastEvent: `custom:${name}`, lastCustomProps },
     landingUrl: '',
     referrer: '',
     firstTouchLanding: '',
@@ -171,9 +186,10 @@ export function buildSignalIngest(listId: string, user: { userId: string; create
 /** Writes one signal for an already-resolved account. Never throws. */
 export async function emitAccountSignal(
   user: { userId: string; createdAt?: string } | null | undefined,
-  name: ServerSignalName,
+  name: SignalName,
   props: Record<string, string | number>,
   overrides: Partial<EmitterDeps> = {},
+  visitorId?: string,
 ): Promise<boolean> {
   try {
     const deps = { ...(await defaultDeps()), ...overrides };
@@ -184,7 +200,7 @@ export async function emitAccountSignal(
       deps.logger.warn(`[serverSignal] list ${listId} missing or not a session list; dropping ${name}`);
       return false;
     }
-    await deps.ingest({ list, parsed: buildSignalIngest(listId, user, name, props, deps.now()), userAgent: '', visitorIp: '' });
+    await deps.ingest({ list, parsed: buildSignalIngest(listId, user, name, props, deps.now(), visitorId), userAgent: '', visitorIp: '' });
     return true;
   } catch (err: any) {
     (overrides.logger || console).error(`[serverSignal] ${name} failed: ${err?.message ?? err}`);
@@ -330,4 +346,26 @@ export async function emitResendEngagementSignal(event: any, overrides: Partial<
     (overrides.logger || console).error(`[serverSignal] resend ${event?.type} failed: ${err?.message ?? err}`);
     return false;
   }
+}
+
+/**
+ * ENG-2687: on lead_identified (password login of an existing account) and registration_completed,
+ * write the identity event onto the account's `acct-<userId>` row and stitch the browser's visitorId
+ * onto it, so the visitor's pre-signup sessions and the account's post-signup events resolve to one
+ * person (utils/identityStitching). The account id is the server-generated userId; the visitorId is
+ * the SDK's `aw_vid`, accepted only if it matches the ingest's own visitorId format, else the event
+ * is still written without a link.
+ *
+ * Idempotent: the row key is fixed per account and the merge is per-key SET, so re-linking the same
+ * visitor rewrites the same values. A different visitor (another device) replaces the link — the row
+ * holds the most recent one. Fire-and-forget: never throws.
+ */
+export async function linkVisitorToAccount(
+  user: { userId: string; createdAt?: string } | null | undefined,
+  name: IdentitySignalName,
+  visitorId: unknown,
+  overrides: Partial<EmitterDeps> = {},
+): Promise<boolean> {
+  const vid = typeof visitorId === 'string' && VISITOR_ID_RE.test(visitorId) ? visitorId : undefined;
+  return emitAccountSignal(user, name, vid ? { linked: 1 } : { linked: 0 }, overrides, vid);
 }

@@ -11,6 +11,7 @@ import crypto from "crypto";
 import { getTierConfig, DEFAULT_PAGES } from "../services/subscriptionService";
 import { syncNewUserToLeadList } from "../services/crmAutoSyncService";
 import { normalizeAttribution } from "../types/attribution";
+import { linkVisitorToAccount } from "../services/serverSignalEmitter";
 import { onUserRegistered } from "../services/contactCaptureHooks";
 import { isCompanyEmail } from "../utils/validation";
 import { isInitialPasswordExpired } from "../utils/secureRandom";
@@ -275,6 +276,9 @@ export const register = async (req: Request, res: Response) => {
         .catch((err) => console.error("Failed to send team introduction email:", err));
     }
 
+    // ENG-2687: stitch the browser's anonymous visitorId to the new account (fire-and-forget, never throws).
+    void linkVisitorToAccount(newUser, "registration_completed", req.body?.visitorId);
+
     // JWT includes roles array. sv:0 — brand-new account, no password changes yet.
     const token = jwt.sign(
       { userId, email, roles: finalRoles, isAdmin: false, sv: 0 }, // Include isAdmin=false for clarity
@@ -361,6 +365,9 @@ export const login = async (req: Request, res: Response) => {
       console.error("Error updating last login time:", updateError);
       // Don't fail login if lastLoginTime update fails
     }
+
+    // ENG-2687: an authenticated identify links this browser's visitorId to the account (fire-and-forget).
+    void linkVisitorToAccount({ userId: user.userId, createdAt: user.createdAt }, "lead_identified", req.body?.visitorId);
 
     const jwtPayload = {
       userId: user.userId,

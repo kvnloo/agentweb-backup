@@ -26,7 +26,7 @@ export type IngestEvent = (typeof INGEST_EVENTS)[number];
 /** Funnel order, used only to sanity-check `furthestStage` (a client value) against known stages. */
 const FUNNEL_STAGES: ReadonlySet<string> = new Set(['lp_view', 'play_start', 'episode_complete', 'gate_view', 'app_cta_click', 'lead_submit']);
 
-const VISITOR_ID_RE = /^[a-z0-9-]{8,64}$/i;
+export const VISITOR_ID_RE = /^[a-z0-9-]{8,64}$/i;
 const CUSTOM_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/i;
 const PROP_KEY_RE = /^[A-Za-z][A-Za-z0-9_]{0,31}$/;
 
