@@ -176,7 +176,8 @@ export function buildSignalIngest(
     event: 'custom',
     customName: name,
     // eventCount drives the merge's monotonic journey guard: wall-clock seconds keep later events winning.
-    client: { accountId: user.userId, ...(visitorId ? { visitorId } : {}), eventCount: Math.floor(nowMs / 1000), lastEvent: `custom:${name}`, lastCustomProps },
+    // visitorLinkedAt moves on every link; forwardedAt is first-capture only, so it cannot order re-links.
+    client: { accountId: user.userId, ...(visitorId ? { visitorId, visitorLinkedAt: new Date(nowMs).toISOString() } : {}), eventCount: Math.floor(nowMs / 1000), lastEvent: `custom:${name}`, lastCustomProps },
     landingUrl: '',
     referrer: '',
     firstTouchLanding: '',

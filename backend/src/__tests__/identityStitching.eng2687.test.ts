@@ -15,8 +15,9 @@ function fakeStore() {
   const write = (parsed: ParsedIngest) => {
     const nowIso = new Date(NOW + tick++ * 1000).toISOString();
     const { customFields } = buildSessionRow(parsed, { userAgent: '', nowIso });
-    customFields.forwardedAt = nowIso;
     const prev = rows.get(parsed.identity.sessionId);
+    // Like the real merge: forwardedAt is stamped once (first capture) and never rewritten.
+    customFields.forwardedAt = prev?.customFields.forwardedAt ?? nowIso;
     rows.set(parsed.identity.sessionId, { customFields: { ...(prev?.customFields || {}), ...customFields } });
   };
   return { rows, write };
@@ -105,5 +106,24 @@ describe('ENG-2687 identity stitching visitorId -> account_id', () => {
     const people = resolvePersons(rows);
     expect(people.find((p) => p.accountId === 'a')?.visitorIds).toEqual([]);
     expect(people.find((p) => p.accountId === 'b')?.visitorIds).toEqual([VID]);
+  });
+
+  it('re-link on a shared browser: the later sign-in wins even when its row was created first (Opslane P1)', async () => {
+    const store = fakeStore();
+    let now = NOW;
+    const d = { ...deps(store), now: () => now };
+    const paying = { userId: 'paying', createdAt: '2026-09-01T00:00:00.000Z' };
+    const admin = { userId: 'admin', createdAt: '2026-09-02T00:00:00.000Z' };
+    // Both account rows exist before the shared-browser sign-ins (paying's row is older).
+    await linkVisitorToAccount(paying, 'lead_identified', undefined, d);
+    await linkVisitorToAccount(admin, 'lead_identified', undefined, d);
+    now += 60_000;
+    await linkVisitorToAccount(admin, 'lead_identified', VID, d);
+    now += 60_000;
+    await linkVisitorToAccount(paying, 'lead_identified', VID, d);
+    browserEvent(store, 's-shared', 'lp_view');
+    const people = resolvePersons([...store.rows.values()]);
+    expect(people.find((p) => p.sessionIds.includes('s-shared'))?.accountId).toBe('paying');
+    expect(people.find((p) => p.accountId === 'admin')?.visitorIds).toEqual([]);
   });
 });

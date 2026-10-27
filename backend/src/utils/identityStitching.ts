@@ -25,7 +25,7 @@ const str = (v: unknown): string => (typeof v === 'string' ? v : '');
 
 /**
  * visitorId -> accountId from rows that carry both. If one browser was linked to two accounts
- * (a shared machine), the most recently written link (forwardedAt) wins, so the result does not
+ * (a shared machine), the most recently written link (visitorLinkedAt) wins, so the result does not
  * depend on row order.
  */
 export function buildVisitorAccountMap(rows: SessionRowLike[]): Map<string, string> {
@@ -35,7 +35,9 @@ export function buildVisitorAccountMap(rows: SessionRowLike[]): Map<string, stri
     const vid = str(f.visitorId);
     const acct = str(f.accountId);
     if (!vid || !acct) continue;
-    const at = str(f.forwardedAt);
+    // visitorLinkedAt is restamped on every link; forwardedAt is the row's first-capture time and
+    // never moves, so it is only a fallback for rows written before visitorLinkedAt existed.
+    const at = str(f.visitorLinkedAt) || str(f.forwardedAt);
     const cur = best.get(vid);
     if (!cur || at > cur.at || (at === cur.at && acct < cur.accountId)) best.set(vid, { accountId: acct, at });
   }
