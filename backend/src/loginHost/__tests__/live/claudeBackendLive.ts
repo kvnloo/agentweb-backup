@@ -21,7 +21,7 @@ import { ToolBridge, type BridgeExecuteOutcome, type BridgeTool, type ToolBridge
 import { ToolBridgeMcpAdapter } from "../../../services/funding/toolBridgeMcp";
 import { ClaudeRunRegistry } from "../../../services/funding/claudeRunRegistry";
 import { ClaudeCodeBackend, CONFIRMATION_NOTE, type ClaudeBackendDeps, type ClaudeTurnParams, type ClaudeTurnResult } from "../../../services/funding/claudeCodeBackend";
-import { ClaudeRouteStopError } from "../../../services/funding/claudeRouteErrors";
+import { ClaudeRouteStopError, claudeStopBody } from "../../../services/funding/claudeRouteErrors";
 import { EMPTY_FINAL_RESPONSE_FALLBACK } from "../../../services/agentMode/core/termination";
 import type { AttemptUsage } from "../../../services/funding/attemptUsageJournal";
 
@@ -280,6 +280,7 @@ async function main() {
     const c = await runCase("B5.unknown", params("zz-no-such-connection"));
     check("B5 the host's answer for an unknown connection is a typed stop, not an AgentWeb run", c.stop?.code === "needs_reconnect" || c.stop?.code === "host_unavailable" || c.stop?.code === "turn_failed", c.stop?.code ?? c.err);
     check("B5 when the host denies the connection it is flagged for reconnect", c.stop?.code !== "needs_reconnect" || (data.reconnect.length === 1 && data.reconnect[0][0] === "zz-no-such-connection"), data.reconnect);
+    check("B5 the stop body offers AgentWeb credits (the user decides) for a connection problem, and carries no host detail", !c.stop || (claudeStopBody(c.stop).canUseAgentWebCredits === (c.stop.code !== "turn_timeout") && !JSON.stringify(claudeStopBody(c.stop)).match(/zz-no-such|\/run\/|sock/)), c.stop && claudeStopBody(c.stop));
     check("B5 nothing is left registered", registry.size === 0);
   }
 
@@ -307,6 +308,7 @@ async function main() {
     check("B6 it ended at the deadline, not at the model's own pace", (c?.seconds ?? 0) >= 28 && (c?.seconds ?? 0) < 55, c?.seconds);
     check("B6 the call that finished before the deadline is kept in the chat", data.persisted.some((b) => b.some((m: any) => m.role === "tool" && m.content === "RECEIPT_before")), data.persisted.map((b) => b.map((m: any) => m.role)));
     check("B6 the call still running at the deadline ran once and is saved when it finishes, with a note", exec.calls.filter((x) => x === "live_long").length === 1 && exec.calls.includes("live_write") && exec.calls.indexOf("live_write") < exec.calls.indexOf("live_long") && data.persisted.some((b) => b.some((m: any) => m.metadata?.kind === "claude-late-result") && b.some((m: any) => m.role === "tool" && m.content === "LONG_RECEIPT")), { calls: exec.calls, batches: data.persisted.length });
+    check("B6 a turn timeout does NOT offer AgentWeb credits (a second run would repeat the cost)", !!c?.stop && claudeStopBody(c.stop).canUseAgentWebCredits === false, c?.stop && claudeStopBody(c.stop));
     check("B6 nothing is left registered", registry.size === 0);
   }
 
