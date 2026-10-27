@@ -11951,7 +11951,11 @@ export const agentModeController = {
             } as ChatMessage).catch((persistErr) => console.error('AgentMode: failed to persist plan stop note:', persistErr));
           }
         }
-        return res.status(planStop.httpStatus).json(sendRefusalBody(claudeStopBody(planStop), wasRaisedAfterUserMessageSaved(planStop)));
+        // Once the user's message is saved the plan turn may have run (tools included): offering a resend on AgentWeb credits would store the message twice
+        // and could repeat its side effects, so the offer is withheld until a "continue" option exists.
+        const planStopSaved = wasRaisedAfterUserMessageSaved(planStop);
+        const planStopBody = claudeStopBody(planStop);
+        return res.status(planStop.httpStatus).json(sendRefusalBody({ ...planStopBody, canUseAgentWebCredits: planStopBody.canUseAgentWebCredits && !planStopSaved }, planStopSaved));
       }
       console.error('AgentMode: Generate response error:', error);
 

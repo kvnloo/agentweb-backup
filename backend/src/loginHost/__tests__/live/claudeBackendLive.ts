@@ -280,7 +280,7 @@ async function main() {
     const c = await runCase("B5.unknown", params("zz-no-such-connection"));
     check("B5 the host's answer for an unknown connection is a typed stop, not an AgentWeb run", c.stop?.code === "needs_reconnect" || c.stop?.code === "host_unavailable" || c.stop?.code === "turn_failed", c.stop?.code ?? c.err);
     check("B5 when the host denies the connection it is flagged for reconnect", c.stop?.code !== "needs_reconnect" || (data.reconnect.length === 1 && data.reconnect[0][0] === "zz-no-such-connection"), data.reconnect);
-    check("B5 the stop body offers AgentWeb credits (the user decides) for a connection problem, and carries no host detail", !c.stop || (claudeStopBody(c.stop).canUseAgentWebCredits === (c.stop.code !== "turn_timeout") && !JSON.stringify(claudeStopBody(c.stop)).match(/zz-no-such|\/run\/|sock/)), c.stop && claudeStopBody(c.stop));
+    check("B5 the stop body offers AgentWeb credits (the user decides) for a connection problem, and carries no host detail", !c.stop || (claudeStopBody(c.stop).canUseAgentWebCredits === ["needs_reconnect", "host_unavailable", "turn_failed"].includes(c.stop.code) && !JSON.stringify(claudeStopBody(c.stop)).match(/zz-no-such|\/run\/|sock/)), c.stop && claudeStopBody(c.stop));
     check("B5 nothing is left registered", registry.size === 0);
   }
 

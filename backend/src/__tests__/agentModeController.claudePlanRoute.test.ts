@@ -191,7 +191,7 @@ describe('/generate on the Claude plan route', () => {
       expect(backend).not.toHaveBeenCalled();
       // ...it is a typed stop the user can act on, nothing was saved, and the session is not left locked
       expect(res.status).toHaveBeenCalledWith(503);
-      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'lookup_failed', funding: 'claude_subscription', userMessageSaved: false }));
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'lookup_failed', funding: 'claude_subscription', userMessageSaved: false, canUseAgentWebCredits: true }));
       expect(db.addMessageToSession).not.toHaveBeenCalled();
       expect(activeSessionGenerations.has('s1')).toBe(false);
     });
@@ -200,7 +200,14 @@ describe('/generate on the Claude plan route', () => {
       funding.mockRejectedValueOnce(new ClaudeRouteStopError('not_enabled'));
       const res = makeRes();
       await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription' }), res);
-      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'not_enabled', userMessageSaved: false }));
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'not_enabled', userMessageSaved: false, canUseAgentWebCredits: false }));
+    });
+
+    it('a pre-run stop that is a plan problem offers AgentWeb credits (the saved-message variants are pinned in the plan-turn tests as false)', async () => {
+      funding.mockRejectedValueOnce(new ClaudeRouteStopError('needs_reconnect'));
+      const res = makeRes();
+      await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription' }), res);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'needs_reconnect', userMessageSaved: false, canUseAgentWebCredits: true }));
     });
 
     it('does not resolve the model pick for a request that never asked for the plan', async () => {
@@ -352,7 +359,7 @@ describe('/generate on the Claude plan route', () => {
       backend.mockRejectedValueOnce(new ClaudeRouteStopError('host_busy'));
       const res = makeRes();
       await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription' }), res);
-      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'host_busy', userMessageSaved: true }));
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'host_busy', userMessageSaved: true, canUseAgentWebCredits: false })); // saved message: no offer until a continue option exists
     });
 
     it('the whole-turn cap ends a turn that never answers: the real race fires, the turn is cancelled, and it is the fixed timeout note', async () => {
@@ -362,7 +369,7 @@ describe('/generate on the Claude plan route', () => {
       expect(requestCancel).toHaveBeenCalledWith('s1');
       expect(worker.cancelSession).toHaveBeenCalledWith('s1');
       expect(res.status).toHaveBeenCalledWith(504);
-      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'turn_timeout', funding: 'claude_subscription', userMessageSaved: true, retryable: false }));
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'turn_timeout', funding: 'claude_subscription', userMessageSaved: true, retryable: false, canUseAgentWebCredits: false }));
       const note = db.addMessageToSession.mock.calls.map((c) => c[1] as any).find((m) => m?.metadata?.kind === 'claude-plan-stop');
       expect(note).toMatchObject({ metadata: { code: 'turn_timeout', isErrorMessage: true } });
       expect(emitProgress).toHaveBeenCalledWith('s1', { iteration: 0, status: 'complete' }); // the progress stream is closed, not left "generating"
@@ -378,7 +385,7 @@ describe('/generate on the Claude plan route', () => {
       const res = makeRes();
       await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription' }), res);
       expect(res.status).toHaveBeenCalledWith(502);
-      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'turn_failed', funding: 'claude_subscription', userMessageSaved: true }));
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'turn_failed', funding: 'claude_subscription', userMessageSaved: true, canUseAgentWebCredits: false }));
       expect(JSON.stringify((res.json as jest.Mock).mock.calls)).not.toContain('secret-ish');
       expect(agentModeService.generateDiagnosticMessage).not.toHaveBeenCalled();
       expect(worker.runInWorker).not.toHaveBeenCalled();
