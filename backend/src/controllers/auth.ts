@@ -366,8 +366,6 @@ export const login = async (req: Request, res: Response) => {
       // Don't fail login if lastLoginTime update fails
     }
 
-    // ENG-2687: an authenticated identify links this browser's visitorId to the account (fire-and-forget).
-    void linkVisitorToAccount({ userId: user.userId, createdAt: user.createdAt }, "lead_identified", req.body?.visitorId);
 
     const jwtPayload = {
       userId: user.userId,
@@ -382,7 +380,15 @@ export const login = async (req: Request, res: Response) => {
       { expiresIn: "90d" }
     );
 
-    void emitAppSignal(user as any, "login", { method: "password" });
+    // ENG-2687: an authenticated identify links this browser's visitorId to the account.
+    // Serialized before the login signal (both fire-and-forget) so the login write always lands
+    // last on the account row; concurrent writes let lead_identified overwrite login (Opslane P1).
+    const loginUser = user;
+    const loginVisitorId = req.body?.visitorId;
+    void (async () => {
+      await linkVisitorToAccount({ userId: loginUser.userId, createdAt: loginUser.createdAt }, "lead_identified", loginVisitorId).catch(() => false);
+      await emitAppSignal(loginUser as any, "login", { method: "password" });
+    })().catch(() => undefined);
 
     const { password: _, ...userWithoutPassword } = user;
     res.json({
