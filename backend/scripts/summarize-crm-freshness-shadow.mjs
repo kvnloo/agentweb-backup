@@ -6,6 +6,7 @@
 import { readFileSync } from 'node:fs';
 
 const MARK = '[crm-freshness-shadow]';
+const CHECKED_MARK = '[crm-freshness-checked]';
 
 export function parseLines(text) {
   const records = [];
@@ -20,24 +21,54 @@ export function parseLines(text) {
   return { records, skipped };
 }
 
+// ENG-2382: one line per CRM-relevant reply, flagged or not: the denominator the flagged lines never had.
+export function parseCheckedLines(text) {
+  const records = [];
+  let skipped = 0;
+  for (const line of String(text).split('\n')) {
+    const at = line.indexOf(CHECKED_MARK);
+    if (at === -1) continue;
+    const brace = line.indexOf('{', at);
+    if (brace === -1) { skipped++; continue; }
+    try { records.push(JSON.parse(line.slice(brace))); } catch { skipped++; }
+  }
+  return { records, skipped };
+}
+
+export function summarizeChecked(records) {
+  const byModel = {};
+  for (const r of records) {
+    const m = (byModel[r.model || 'unknown'] ||= { checked: 0, flagged: 0, abstained: 0 });
+    m.checked++;
+    if (r.flagged) m.flagged++;
+    if (r.totalsAbstained) m.abstained++;
+  }
+  return byModel;
+}
+
+const median = (xs) => { const a = [...xs].sort((x, y) => x - y); const n = a.length; return n % 2 ? a[(n - 1) / 2] : (a[n / 2 - 1] + a[n / 2]) / 2; };
+
 export function summarize(records) {
   const byModel = {};
   const sessions = new Set();
   for (const r of records) {
     const model = r.model || 'unknown';
-    const m = (byModel[model] ||= { lines: 0, sessions: new Set(), kinds: {}, claimedNumbers: {}, citedTools: {}, drift: 0, echoes: 0, echoLines: 0 });
+    const m = (byModel[model] ||= { lines: 0, sessions: new Set(), kinds: {}, claimedNumbers: {}, citedTools: {}, drift: 0, echoes: 0, echoLines: 0, echoDensities: [] });
     m.lines++;
     if (r.sessionId) { m.sessions.add(r.sessionId); sessions.add(r.sessionId); }
     for (const k of r.kinds || []) m.kinds[k] = (m.kinds[k] || 0) + 1;
     for (const n of r.claimed || []) m.claimedNumbers[n] = (m.claimedNumbers[n] || 0) + 1;
     for (const t of r.cited || []) m.citedTools[t] = (m.citedTools[t] || 0) + 1;
     m.drift += Number(r.drift) || 0;
-    if (Number(r.echoesEarlier) > 0) { m.echoes += Number(r.echoesEarlier); m.echoLines++; }
+    if (Number(r.echoesEarlier) > 0) {
+      m.echoes += Number(r.echoesEarlier); m.echoLines++;
+      if (typeof r.sessionDensity20 === 'number') m.echoDensities.push(r.sessionDensity20);
+    }
   }
   return { totalLines: records.length, distinctSessions: sessions.size, byModel };
 }
 
-export function format(summary, skipped = 0) {
+export function format(summary, skipped = 0, checked = {}) {
   const out = [`flagged replies (log lines): ${summary.totalLines}   distinct sessions: ${summary.distinctSessions}   unparseable marker lines: ${skipped}`];
   const models = Object.entries(summary.byModel).sort((a, b) => b[1].lines - a[1].lines);
   for (const [model, m] of models) {
@@ -47,7 +78,13 @@ export function format(summary, skipped = 0) {
     if (Object.keys(m.claimedNumbers).length) out.push(`  most-claimed unbacked numbers: ${top(m.claimedNumbers)}`);
     if (m.drift) out.push(`  arithmetic drift (claim within 0.5% of a number the tool really returned): ${m.drift}`);
     if (m.echoLines) out.push(`  restated a number an EARLIER turn of the session returned (stale-looking): ${m.echoLines} of ${m.lines} line(s); the rest are unbacked but match no earlier value (or the session predates persisted evidence)`);
+    if (m.echoDensities.length) {
+      const d = m.echoDensities;
+      out.push(`  session number set on those lines: density of 0..20 median ${median(d)} (range ${Math.min(...d)}-${Math.max(...d)}); a crowded set means a match is expected by chance, a sparse one makes a match meaningful`);
+    }
     if (Object.keys(m.citedTools).length) out.push(`  tools cited by unbacked tags: ${top(m.citedTools)}`);
+    const c = checked[model];
+    if (c) out.push(`  CRM replies checked: ${c.checked}, flagged: ${c.flagged} (${Math.round((c.flagged / c.checked) * 100)}%)${c.abstained ? `, total check abstained on ${c.abstained}` : ''}`);
   }
   if (models.length === 0) out.push('(no [crm-freshness-shadow] lines found)');
   return out.join('\n');
@@ -57,5 +94,5 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const files = process.argv.slice(2);
   const text = files.length ? files.map((f) => readFileSync(f, 'utf8')).join('\n') : readFileSync(0, 'utf8');
   const { records, skipped } = parseLines(text);
-  console.log(format(summarize(records), skipped));
+  console.log(format(summarize(records), skipped, summarizeChecked(parseCheckedLines(text).records)));
 }
