@@ -45,6 +45,14 @@ describe("ConnectionManager", () => {
       await expect(rig.mgr.loginPromote({ connectionId: "c1", loginRef: start.loginRef, epoch: 1 })).resolves.toEqual({ state: "active", epoch: 1 });
     });
 
+    it("two completes fired together for one attempt: one wins, the other is refused, and the ready login survives", async () => {
+      const start = await rig.mgr.loginStart({ connectionId: "c1", provider: "fake" });
+      const req = { connectionId: "c1", loginRef: start.loginRef, code: "abcdefgh#12345678" };
+      const results = await Promise.all([code(rig.mgr.loginComplete(req)), code(rig.mgr.loginComplete(req))]);
+      expect(results.sort()).toEqual(["ESTATE:login_not_pending", "OK"]);
+      expect(rig.store.get().connections.c1.attempt).toMatchObject({ state: "ready" });
+    });
+
     it("a wrong code discards the attempt, wipes it, frees its uid, and lets the user try again", async () => {
       rig.script.codeResult = "reject";
       const start = await rig.mgr.loginStart({ connectionId: "c1", provider: "fake" });
