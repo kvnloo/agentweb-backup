@@ -51,8 +51,7 @@ http
     const campaignLeads = /\/campaigns\/(\d+)\/leads$/.exec(url.pathname);
 
     if (campaignLeads && req.method === "POST") {
-      if (key === "lead-401") return send(res, 401, { message: "Invalid API key" });
-      if (!key.startsWith("lead-")) return send(res, 401, { message: "Invalid API key" });
+      if (key === "lead-401" || !key.startsWith("lead-")) return send(res, 401, { message: "Invalid API key" });
       let raw = "";
       req.on("data", chunk => (raw += chunk));
       req.on("end", () => {
@@ -78,7 +77,7 @@ http
     }
 
     if (campaignsList || campaignMailboxes) {
-      if (key !== "wrap-camps" && !/^good-\d+$/.test(key)) return send(res, 401, { message: "Invalid API key" });
+      if (key !== "wrap-camps" && !/^good-\d+$/.test(key) && !key.startsWith("lead-")) return send(res, 401, { message: "Invalid API key" });
       if (campaignMailboxes) {
         const total = Math.min(Number((/^good-(\d+)$/.exec(key) || [])[1] || 2), 5);
         return send(res, 200, { ok: true, data: Array.from({ length: total }, (_, i) => ({ id: 1000 + i, from_email: `box${i + 1}@stub-outreach.test`, from_name: "Stub", type: "SMTP", warmup_enabled: true, warmup_reputation: "excellent" })) });
@@ -103,7 +102,7 @@ http
 
     const alive = flipAlive(key);
     if (alive === false) return send(res, 401, { message: "Invalid API key" });
-    const m = alive ? [null, "2"] : /^good-(\d+)$/.exec(key);
+    const m = alive || key.startsWith("lead-") ? [null, "2"] : /^good-(\d+)$/.exec(key);
     if (!m) return send(res, 401, { message: "Invalid API key" });
     const total = Number(m[1]);
     const offset = Number(url.searchParams.get("offset") || 0);

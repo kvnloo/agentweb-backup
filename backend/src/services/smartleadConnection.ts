@@ -8,12 +8,21 @@ import { decryptPassword } from '../utils/crypto';
  * is only called dead after an independent probe agrees, because one 401 can be a Smartlead-side blip.
  */
 
+export interface SmartleadCandidate {
+  accountId: string;
+  ownerUserId: string;
+}
+
 export type ResolvedSmartlead =
   | { ok: true; apiKey: string; ownerUserId: string; accountId: string; accountName: string }
-  | { ok: false; reason: 'not_connected' | 'key_unreadable' | 'key_rejected' | 'choose'; message: string };
+  | { ok: false; reason: 'not_connected' | 'key_unreadable' | 'key_rejected'; message: string }
+  /** Several connections are available and none is clearly the caller's: the caller must pick one by `accountId`. */
+  | { ok: false; reason: 'choose'; message: string; candidates: SmartleadCandidate[] };
 
 const NOT_CONNECTED = 'No Smartlead account is connected. Add your Smartlead API key in Settings, Login Credentials.';
 const REJECTED = 'Smartlead rejected the saved API key (revoked, or the plan no longer includes API access). Replace the key in Settings, Login Credentials.';
+// A teammate using a shared connection cannot replace the key; only its owner can.
+const REJECTED_SHARED = 'Smartlead rejected the API key saved on the shared Smartlead connection (revoked, or the plan no longer includes API access). Ask the teammate who connected it to replace the key.';
 
 type Probe = 'ok' | 'rejected' | 'unknown';
 
@@ -62,20 +71,26 @@ export async function resolveSmartlead(userId: string, accountId?: string): Prom
     account = all[0];
   } else {
     // Several candidates and none clearly the caller's: do not guess whose Smartlead account to send into.
-    return { ok: false, reason: 'choose', message: 'Several Smartlead connections are available. Choose which one to use.' };
+    return {
+      ok: false,
+      reason: 'choose',
+      message: 'Several Smartlead connections are available. Choose which one to use.',
+      candidates: all.map(a => ({ accountId: a.account_id, ownerUserId: ownerOf(a) })),
+    };
   }
 
   const ownerUserId = ownerOf(account);
+  const rejected = ownerUserId === userId ? REJECTED : REJECTED_SHARED;
   let apiKey: string;
   try {
     apiKey = decryptPassword((account.config as { access_token: string }).access_token).password;
   } catch {
-    return { ok: false, reason: 'key_unreadable', message: REJECTED };
+    return { ok: false, reason: 'key_unreadable', message: rejected };
   }
 
   if ((account.config as { needs_reconnect?: boolean }).needs_reconnect) {
     const probe = await probeKey(apiKey);
-    if (probe === 'rejected') return { ok: false, reason: 'key_rejected', message: REJECTED };
+    if (probe === 'rejected') return { ok: false, reason: 'key_rejected', message: rejected };
     if (probe === 'ok') await setNeedsReconnect(ownerUserId, account.account_id, false);
     // 'unknown' (timeout, 429, 5xx): not proof either way, so let the real call report honestly.
   }
@@ -83,11 +98,13 @@ export async function resolveSmartlead(userId: string, accountId?: string): Prom
   return { ok: true, apiKey, ownerUserId, accountId: account.account_id, accountName: account.account_name };
 }
 
-export type SmartleadFailureVerdict = 'key_rejected' | 'transient_auth_error' | 'not_an_auth_error';
+export type SmartleadFailureVerdict = 'key_rejected' | 'forbidden_resource' | 'transient_auth_error' | 'not_an_auth_error';
 
 /**
  * Call after a Smartlead request failed. A 401 or 403 is checked with an independent probe before the key is flagged
  * dead, so the saved connection is not marked broken (and not shown as "Reconnect required") by a one-off error.
+ * A 403 with a healthy key is `forbidden_resource` (for example a campaign the key may not touch): permanent for that
+ * request, so a caller must not retry it the way it would a `transient_auth_error`.
  */
 export async function reportSmartleadFailure(
   resolved: Extract<ResolvedSmartlead, { ok: true }>,
@@ -99,5 +116,5 @@ export async function reportSmartleadFailure(
     await setNeedsReconnect(resolved.ownerUserId, resolved.accountId, true);
     return 'key_rejected';
   }
-  return 'transient_auth_error';
+  return error.status === 403 && probe === 'ok' ? 'forbidden_resource' : 'transient_auth_error';
 }
