@@ -260,4 +260,20 @@ describe('applyFathomOnboardingReviewAction (ENG-270)', () => {
     expect(deps.orgMemoryDb.deleteMemory).not.toHaveBeenCalled();
     expect(deps.accountMemoryDb.deleteMemory).not.toHaveBeenCalled();
   });
+
+  it('rollback undoes a mistaken discard: entry back to needs_review, draft un-flagged but still inactive (Opslane run 1336, P1)', async () => {
+    const users: Record<string, any> = {
+      'fathom-draft-rec-1': { userId: 'fathom-draft-rec-1', fathomDraftAccount: true, isActive: false, fathomOnboardingIngestions: [entry()] },
+    };
+    const deps = setup(users);
+    const args = { userId: 'fathom-draft-rec-1', recordingId: 'rec-1', actorUserId: 'admin' };
+    await applyFathomOnboardingReviewAction({ ...args, action: 'discard' }, deps);
+    expect(users['fathom-draft-rec-1'].fathomDraftStatus).toBe('discarded');
+    const out = await applyFathomOnboardingReviewAction({ ...args, action: 'rollback' }, deps);
+    expect(out.status).toBe('needs_review');
+    expect(users['fathom-draft-rec-1'].fathomOnboardingIngestions[0].status).toBe('needs_review');
+    expect(users['fathom-draft-rec-1'].fathomDraftStatus).toBe('needs_review');
+    expect(users['fathom-draft-rec-1'].isActive).toBe(false);
+    expect(deps.accountMemoryDb.deleteMemory).not.toHaveBeenCalled();
+  });
 });

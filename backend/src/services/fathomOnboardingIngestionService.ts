@@ -698,6 +698,15 @@ async function flagDiscardedDraft(deps: ReviewActionDeps, item: FathomOnboarding
   await deps.userDb.updateUser(item.draftUserId, { fathomDraftStatus: 'discarded', isActive: false } as any);
 }
 
+/** Clears the discarded flag a discard set; the draft stays inactive until an admin activates it. */
+async function unflagDiscardedDraft(deps: ReviewActionDeps, item: FathomOnboardingIngestion): Promise<void> {
+  if (!item.draftUserId) return;
+  const draft = await deps.userDb.getUserById(item.draftUserId);
+  if ((draft as any)?.fathomDraftAccount !== true) return;
+  if ((draft as any).fathomDraftStatus !== 'discarded') return;
+  await deps.userDb.updateUser(item.draftUserId, { fathomDraftStatus: 'needs_review' } as any);
+}
+
 export async function applyFathomOnboardingReviewAction(
   input: {
     userId: string;
@@ -750,7 +759,16 @@ export async function applyFathomOnboardingReviewAction(
       // A reviewed item re-ingested with reviewed:false becomes needs_review but keeps its
       // memory ids; rollback must still remove those approved memories.
       const hasApprovedMemories = (item.memoryIds || []).length > 0 || (item.orgMemoryIds || []).length > 0;
-      if (item.status !== 'reviewed' && !hasApprovedMemories) return item;
+      if (item.status === 'discarded' && !hasApprovedMemories) {
+        // ENG-270 (Opslane 1336): rollback undoes a mistaken discard: the entry returns
+        // to needs_review so it can be approved again, and its draft is un-flagged below.
+        next = { ...item, status: 'needs_review', updatedAt: now };
+      } else {
+      if (item.status !== 'reviewed' && !hasApprovedMemories) {
+        // A retry after a lost race may find the entry already restored; finish the draft step.
+        await unflagDiscardedDraft(deps, item);
+        return item;
+      }
       const targetUserId = item.targetUserId || input.userId;
       // Resolve the org BEFORE deleting anything so a refused rollback changes
       // nothing (Opslane run 355, P1).
@@ -804,6 +822,7 @@ export async function applyFathomOnboardingReviewAction(
         updatedAt: now,
       };
     }
+    }
 
     const slot = `#ing[${index}]`;
     const names: Record<string, string> = { '#ing': 'fathomOnboardingIngestions', '#rid': 'recordingId', '#st': 'status', '#upd': 'updatedAt' };
@@ -826,6 +845,7 @@ export async function applyFathomOnboardingReviewAction(
     }
 
     if (input.action === 'discard') await flagDiscardedDraft(deps, item);
+    if (input.action === 'rollback' && item.status === 'discarded') await unflagDiscardedDraft(deps, item);
     return next;
   }
   throw new FathomOnboardingReviewError(409, 'Ingestion changed concurrently; retry the action.');
