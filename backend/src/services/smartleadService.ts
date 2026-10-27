@@ -149,8 +149,9 @@ export async function smartleadRequest<T>(
   apiKey: string,
   method: "GET" | "POST" | "PATCH" | "DELETE",
   path: string,
-  opts: { params?: Record<string, unknown>; data?: unknown } = {},
+  opts: { params?: Record<string, unknown>; data?: unknown; maxRetries?: number } = {},
 ): Promise<T> {
+  const maxRetries = opts.maxRetries ?? clientOptions.maxRetries;
   for (let attempt = 0; ; attempt++) {
     await acquireThrottleSlot();
     try {
@@ -168,7 +169,7 @@ export async function smartleadRequest<T>(
         response?: { status?: number; headers?: Record<string, unknown> };
       };
       const status: number | undefined = error?.response?.status;
-      if (status === 429 && attempt < clientOptions.maxRetries) {
+      if (status === 429 && attempt < maxRetries) {
         await sleepFn(retryDelayMs(attempt, error?.response?.headers?.["retry-after"]));
         continue;
       }
@@ -221,7 +222,6 @@ async function fetchCampaignLeads(
   return { total, leads: allLeads };
 }
 
-const EMAIL_ACCOUNTS_PAGE_LIMIT = 100;
 const EMAIL_ACCOUNTS_MAX_PAGES = 20;
 
 export interface SmartleadEmailAccount {
@@ -231,23 +231,34 @@ export interface SmartleadEmailAccount {
 
 /**
  * The mailboxes attached to a Smartlead key (ENG-673). Also the key check on connect: a rejected
- * key or unusable plan throws a SmartleadApiError carrying the HTTP status. Pages by offset, and
- * stops early if a page adds no new ids, in case the API ignores the offset.
+ * key or unusable plan throws a SmartleadApiError carrying the HTTP status, and so does any
+ * response that is not a list (no status), so an unvalidated key is never reported as valid.
+ *
+ * The first request sends no paging parameters, because they are not verified against a live
+ * account; later pages ask for `offset` = mailboxes seen so far, and paging stops on an empty page
+ * or a page with nothing new (an API that ignores the offset).
  */
-export async function listEmailAccounts(apiKey: string): Promise<SmartleadEmailAccount[]> {
+export async function listEmailAccounts(
+  apiKey: string,
+  opts: { maxRetries?: number } = {},
+): Promise<SmartleadEmailAccount[]> {
   const byId = new Map<number, SmartleadEmailAccount>();
   for (let page = 0; page < EMAIL_ACCOUNTS_MAX_PAGES; page++) {
     const data = await smartleadRequest<unknown>(apiKey, "GET", "/email-accounts", {
-      params: { offset: page * EMAIL_ACCOUNTS_PAGE_LIMIT, limit: EMAIL_ACCOUNTS_PAGE_LIMIT },
+      params: page === 0 ? undefined : { offset: byId.size },
+      maxRetries: opts.maxRetries,
     });
-    const rows = Array.isArray(data) ? (data as Array<{ id?: number; from_email?: string }>) : [];
+    if (!Array.isArray(data)) {
+      throw new SmartleadApiError("Smartlead GET /email-accounts returned an unexpected response");
+    }
     const before = byId.size;
-    for (const row of rows) {
-      if (typeof row?.id === "number" && !byId.has(row.id)) {
-        byId.set(row.id, { id: row.id, email: String(row.from_email ?? "") });
+    for (const row of data as Array<{ id?: unknown; from_email?: unknown }>) {
+      const id = Number(row?.id);
+      if (Number.isFinite(id) && !byId.has(id)) {
+        byId.set(id, { id, email: String(row.from_email ?? "") });
       }
     }
-    if (rows.length < EMAIL_ACCOUNTS_PAGE_LIMIT || byId.size === before) break;
+    if (data.length === 0 || byId.size === before) break;
   }
   return [...byId.values()];
 }
