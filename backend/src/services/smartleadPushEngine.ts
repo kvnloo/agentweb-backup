@@ -243,6 +243,20 @@ export async function executeRun(run: PushRun, deps: EngineDeps): Promise<RunOut
       add(skipped, "lead_missing", fresh.length - present.length);
       const recheck = selectSmartleadLeads(present, { ...ctx, seenEmails: new Set<string>(), suppressedEmails: new Set(suppressed) });
       for (const [reason, n] of Object.entries(recheck.counts)) add(skipped, reason, n);
+      // A lead THIS run marked between the page read and now (an older worker of the same run finishing its marking) is in Smartlead:
+      // it counts toward the ceiling like any other own marker, not as a skip.
+      {
+        const freshById = new Map(present.map(l => [String(l.leadId), l]));
+        for (const sk of recheck.skipped) {
+          if (sk.reason !== "already_pushed") continue;
+          const marker = getSmartleadMarker(freshById.get(String(sk.leadId)), run.campaignId);
+          if (marker?.runId === run.runId && marker.state === "pushed") {
+            ownMarked++;
+            skipped.already_pushed -= 1;
+          }
+        }
+        if (skipped.already_pushed === 0) delete skipped.already_pushed;
+      }
       const toSend = recheck.eligible;
 
       let batchAdded = 0;
@@ -277,8 +291,12 @@ export async function executeRun(run: PushRun, deps: EngineDeps): Promise<RunOut
         for (const group of [result.leads.newlyAdded, result.leads.existingInCampaign]) {
           for (const [email, id] of Object.entries(group ?? {})) idByEmail.set(email.toLowerCase(), String(id));
         }
-        for (const [email, id] of Object.entries(result.leads.existingInOtherCampaigns ?? {})) {
-          if (idByEmail.size < result.added + result.alreadyInCampaign) idByEmail.set(email.toLowerCase(), String(id));
+        // If Smartlead also reports leads it SKIPPED because they sit in other campaigns, the "other campaigns" map cannot be told
+        // apart from them (what that tally counts is unverified), so none of its entries is trusted: those leads stay unmarked.
+        if (result.skippedBy.inOtherCampaign === 0) {
+          for (const [email, id] of Object.entries(result.leads.existingInOtherCampaigns ?? {})) {
+            if (idByEmail.size < result.added + result.alreadyInCampaign) idByEmail.set(email.toLowerCase(), String(id));
+          }
         }
         const invalid = new Set(result.invalidEmails.map(e => e.toLowerCase()));
         const unsubscribed = new Set(result.unsubscribedEmails.map(e => e.toLowerCase()));
