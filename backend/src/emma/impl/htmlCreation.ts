@@ -219,6 +219,57 @@ export function isCompleteHtmlDocument(draft: string): boolean {
   return hasOpen && hasClose;
 }
 
+// ENG-2679 — the single-pass render can come back cut off (upstream stream ends
+// early, or finish_reason=length) while still containing the opening of a valid
+// document. sanitize-html then auto-closes every open tag, so the stub uploads as
+// a "complete" file and create_html_file reports success — a 3-person brief
+// shipped with only the first person's header. Reject such renders BEFORE
+// sanitizing so the retry/deterministic-fallback paths (ENG-203/ENG-873) run.
+export class IncompleteHtmlRenderError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'IncompleteHtmlRenderError';
+  }
+}
+
+/** Visible text of an HTML (or markdown-ish) string, whitespace-collapsed. */
+function visibleTextLength(s: string): number {
+  return s
+    .replace(/<(script|style)[\s\S]*?<\/\1>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/[#*_`>|-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim().length;
+}
+
+// The render prompt tells the model to carry every fact from the draft over
+// verbatim, so a finished document's visible text is never a small fraction of
+// the draft's. Generous floor: styling may tighten wording, truncation drops
+// whole sections (the ENG-2679 file kept ~17% of its draft's text).
+export const CREATE_HTML_MIN_TEXT_COVERAGE = 0.4;
+// Tiny drafts legitimately expand or reshape; only apply the coverage check
+// where losing a whole section is possible.
+export const CREATE_HTML_COVERAGE_MIN_DRAFT_CHARS = 1500;
+
+export function assertCompleteHtmlRender(html: string, contentDraft: string): void {
+  if (!/<\/html\s*>/i.test(html)) {
+    throw new IncompleteHtmlRenderError('HTML render is incomplete: missing closing </html> (output truncated)');
+  }
+  const draftLen = visibleTextLength(contentDraft);
+  if (draftLen >= CREATE_HTML_COVERAGE_MIN_DRAFT_CHARS) {
+    const outLen = visibleTextLength(html);
+    if (outLen < draftLen * CREATE_HTML_MIN_TEXT_COVERAGE) {
+      throw new IncompleteHtmlRenderError(
+        `HTML render is incomplete: ${outLen} visible chars for a ${draftLen}-char draft (content dropped)`,
+      );
+    }
+  }
+}
+
+export function isIncompleteHtmlRenderError(error: unknown): boolean {
+  return (error as any)?.name === 'IncompleteHtmlRenderError';
+}
+
 /**
  * ENG-1685: build the S3-safe filename for a generated HTML artifact from its
  * (human-written, arbitrary-content) title.
@@ -471,11 +522,17 @@ Please generate a complete, professional HTML document that properly formats and
       const singlePassAttempts = renderInSections ? 0 : maxRenderAttempts;
       for (let attempt = 1; attempt <= singlePassAttempts; attempt++) {
         try {
-          htmlContent = await llmService.generateHTML(systemPrompt, userPrompt, makeToolUsageCallback(sessionId, 'createHTMLFile'), { userId, sessionId, feature: 'content_gen' });
+          const rendered = await llmService.generateHTML(systemPrompt, userPrompt, makeToolUsageCallback(sessionId, 'createHTMLFile'), { userId, sessionId, feature: 'content_gen' });
+          // ENG-2679: never accept a truncated render as the deliverable.
+          if (!isEmail && rendered && rendered.trim()) assertCompleteHtmlRender(rendered, contentDraft);
+          htmlContent = rendered;
           break;
         } catch (renderError) {
           const isLastAttempt = attempt === maxRenderAttempts;
-          const isTransient = isTransientLLMError(renderError);
+          const isTransient = isTransientLLMError(renderError) || isIncompleteHtmlRenderError(renderError);
+          if (isIncompleteHtmlRenderError(renderError)) {
+            console.warn(`AgentMode: ENG-2679 incomplete HTML render (attempt ${attempt}/${maxRenderAttempts}, session ${sessionId}): ${(renderError as Error).message}`);
+          }
           const renderErrorText = renderError instanceof Error ? renderError.message : renderError;
           if (timeoutIsDeterministic && isRenderTimeoutError(renderError)) {
             console.error(`AgentMode: HTML render timed out on a ${contentDraft.length}-char draft (session ${sessionId}) — too large to re-render inside the per-call budget, degrading instead of retrying:`, renderErrorText);
@@ -661,7 +718,7 @@ Return the HTML body fragment for this section only.`;
           // because of no activity for 300000 ms" with no name or code, so
           // isTransientLLMError alone does not recognise it — but on a section
           // this small a timeout really is a blip, so it is worth one retry.
-          const isTransient = isTransientLLMError(sectionError) || isRenderTimeoutError(sectionError);
+          const isTransient = isTransientLLMError(sectionError) || isRenderTimeoutError(sectionError) || isIncompleteHtmlRenderError(sectionError);
           if (attempt === maxSectionAttempts || !isTransient) throw sectionError;
           console.warn(`AgentMode: section ${index + 1}/${chunks.length} render failed transiently, retrying once:`, sectionError instanceof Error ? sectionError.message : sectionError);
           await sleep(1000);

@@ -79,6 +79,12 @@ export interface HostedSubscriptionDeps {
    * must never be read as "already wiped". Default: trusted (single-box test environments, unit tests).
    */
   workerSpeaksOurProtocol?: () => boolean;
+  /**
+   * Called once the record is fenced for revocation (before the host is asked to wipe it): the caller stops every running turn of THIS process that
+   * uses the connection, so a tool call cannot start under a login the user just disconnected. Never throws into the revoke; a failure is logged.
+   * Turns running in another process are caught by the bridge's per-write liveness check.
+   */
+  onRevokeBegun?: (connectionId: string) => void;
 }
 
 interface Pending {
@@ -386,6 +392,11 @@ export class HostedSubscriptionService {
     const began = await this.deps.db.hostedBeginRevoke(connectionId, (current.subHostEpoch ?? 0) + 1, { userId: actor.userId, adminId: actor.adminId }, this.nowIso());
     if (began.result === "missing" || began.result === "not_hosted") throw new HostedSubscriptionError("not_found");
     if (began.result === "contended") throw new HostedSubscriptionError("busy"); // the record kept moving under us: nothing was changed, try again
+    try {
+      this.deps.onRevokeBegun?.(connectionId);
+    } catch (err) {
+      console.error(`[hosted-subscription] stopping running turns failed connection=${connectionId}:`, err instanceof Error ? err.message : String(err));
+    }
     // Idempotent and atomic with the row's flag: a retry after a failed release gives the slot back, a repeat never gives it back twice.
     // A failure here leaves the row `revoking`; the caller (or the sweeper) retries before anything is marked revoked.
     await this.deps.db.hostedReleaseSlot(connectionId, current.ownerUserId);
@@ -528,6 +539,16 @@ export function getHostedSubscriptionService(): HostedSubscriptionService {
       newId: () => randomUUID(),
       // The test environment's unix-socket host is built from the same checkout; the production worker must have been VERIFIED.
       workerSpeaksOurProtocol: () => !!process.env.AW_LOGIN_HOST_SOCKET || getLoginHostProvider().protocolStatus() === "match",
+      // Required on first use, not at load: the bridge singletons pull in Emma's whole service, which the sweeper and the routes must not load
+      // just to exist. Synchronous on purpose: the turns are stopped before this call returns, i.e. before the host is asked to wipe the login.
+      onRevokeBegun: (connectionId) => {
+        /* eslint-disable @typescript-eslint/no-var-requires */
+        const { claudeRunRegistry } = require("./claudeRunRegistry") as typeof import("./claudeRunRegistry");
+        claudeRunRegistry.cancelConnection(connectionId);
+        const { toolBridgeMcp } = require("./toolBridgeService") as typeof import("./toolBridgeService");
+        toolBridgeMcp.revokeConnection(connectionId);
+        /* eslint-enable @typescript-eslint/no-var-requires */
+      },
     });
   }
   return defaultService;

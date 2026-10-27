@@ -35,6 +35,7 @@ import { chatbotDb } from "../chatbotService";
 import type { RunToolTokenClaims } from "./runToolToken";
 import type { BridgeExecuteOutcome, BridgeImage, BridgeTool, BridgeToolCall, ToolBridgeDeps } from "./toolBridge";
 import { isStrictRepeatEffect } from "./bridgeToolClassification";
+import { withRunFunding, type RunFunding } from "./runFunding";
 
 export interface EmmaBridgeRunContext {
   llmModel: string;
@@ -45,6 +46,12 @@ export interface EmmaBridgeRunContext {
   excludeTools?: string[];
   screenshotUrl?: string;
   socketEmit?: ToolDispatchPorts["socketEmit"];
+  /**
+   * The funding scope the tool's own LLM / paid calls run under. A plan turn sets an EXPLICIT agentweb scope (decision 2026-10-23): titles, embeddings
+   * and tool APIs stay AgentWeb-funded and attributed to the run. The bridge route is served from the HTTP handler, not from the controller's async
+   * context, so the scope has to be entered here for each call.
+   */
+  fundingScope?: RunFunding;
 }
 
 export interface EmmaBridgeTurn {
@@ -171,7 +178,7 @@ export class EmmaToolBridgeExecutor implements ToolBridgeDeps {
 
     let dispatched: Awaited<ReturnType<typeof executePreparedTools>>;
     try {
-      dispatched = await executePreparedTools({
+      const dispatch = () => executePreparedTools({
       toolCalls: [{ id: toolCallId, type: "function", function: { name: call.name, arguments: JSON.stringify(call.args) } }],
       messages,
       toolCallsLedger: ledger,
@@ -211,6 +218,7 @@ export class EmmaToolBridgeExecutor implements ToolBridgeDeps {
         socketEmit: context.socketEmit,
       }),
       });
+      dispatched = await (context.fundingScope ? withRunFunding(context.fundingScope, dispatch) : dispatch());
     } finally {
       if (isSearch) state.searchCallsInFlight -= 1;
     }

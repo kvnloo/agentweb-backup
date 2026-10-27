@@ -180,9 +180,16 @@ describe('RECORDS SEARCH / LIST', () => {
   });
 
   it('returns a clear error when entity_type is missing and cannot be inferred', async () => {
-    const result = await at({ action: 'get_workspace' });
+    const result = await at({ action: 'frobnicate' });
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/entity_type is required.*RECORDS/);
+    expect(mockAttioCreate).not.toHaveBeenCalled();
+  });
+
+  it('answers a workspace lookup with the actionable diagnostic instead of a missing-field error', async () => {
+    const result = await at({ action: 'get_workspace' });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/Workspace lookup is not supported.*LISTS LIST/);
     expect(mockAttioCreate).not.toHaveBeenCalled();
   });
 

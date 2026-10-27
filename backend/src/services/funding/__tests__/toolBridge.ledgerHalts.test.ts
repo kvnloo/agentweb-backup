@@ -286,6 +286,55 @@ describe('ToolBridge ledger, halts, stop and repeat guard', () => {
       expect(ledger[0].staleHalt).toBe(true);
     });
 
+    it('records what the model was actually handed when it differs from what the tool returned', async () => {
+      const execStarted = deferred<void>();
+      const release = deferred<BridgeExecuteOutcome>();
+      const deps = makeDeps({
+        execute: jest.fn(async () => {
+          execStarted.resolve();
+          return release.promise;
+        }) as any,
+        persistHalt: jest.fn(async () => {}),
+      });
+      const { bridge } = make(deps);
+      const token = bridge.openRun(RUN);
+      bridge.beginTurn(RUN.userId, RUN.sessionId);
+      const inFlight = bridge.callTool(token, { name: 'meta_preview', args: {}, callId: 'a' });
+      await execStarted.promise;
+      bridge.beginTurn(RUN.userId, RUN.sessionId);
+      release.resolve(preview('APPROVAL-TOKEN-abc'));
+      const answered = await inFlight;
+      const [rec] = bridge.takeLedger(RUN.runId).records;
+      expect(rec.toolMessageContent).toBe('APPROVAL-TOKEN-abc'); // the ledger keeps the real text
+      expect(answered.content).not.toContain('APPROVAL-TOKEN');
+      expect(rec.answeredContent).toBe(answered.content); // chat history must use this one
+      expect(rec.answeredContent).not.toContain('APPROVAL-TOKEN');
+    });
+
+    it('records answeredContent when persisting the halt failed, and omits it for an ordinary call', async () => {
+      const deps = makeDeps({
+        execute: jest.fn(async (_run, call) => (call.name === 'meta_preview' ? preview('secret preview text') : ok('plain'))) as any,
+        persistHalt: jest.fn(async () => {
+          throw new Error('boom');
+        }),
+      });
+      const { bridge } = make(deps);
+      const token = bridge.openRun(RUN);
+      bridge.beginTurn(RUN.userId, RUN.sessionId);
+      const failed = await bridge.callTool(token, { name: 'meta_preview', args: {}, callId: 'a' });
+      const [rec] = bridge.takeLedger(RUN.runId).records;
+      expect(rec.toolMessageContent).toBe('secret preview text');
+      expect(rec.answeredContent).toBe(failed.content);
+
+      const { bridge: b2 } = make();
+      const t2 = b2.openRun({ ...RUN, runId: 'run-2' });
+      b2.beginTurn(RUN.userId, RUN.sessionId);
+      await b2.callTool(t2, { name: 'get_leads', args: {}, callId: 'x' });
+      const [plain] = b2.takeLedger('run-2').records;
+      expect(plain.toolMessageContent).toBe('get_leads done');
+      expect(plain.answeredContent).toBeUndefined();
+    });
+
     it('refuses a call that was queued in an earlier epoch once the turn ended', async () => {
       const first = deferred<BridgeExecuteOutcome>();
       let n = 0;
@@ -584,6 +633,19 @@ describe('ToolBridge ledger, halts, stop and repeat guard', () => {
       expect(byId.b.toolMessageContent).not.toContain('private detail');
       expect(byId.c).toMatchObject({ kind: 'refused', isError: true });
       expect(records.every((r) => typeof r.durationMs === 'number' && r.endedAt >= r.startedAt)).toBe(true);
+    });
+
+    it('names the call a collapsed duplicate repeats', async () => {
+      const { bridge } = make();
+      const token = bridge.openRun(RUN);
+      bridge.noteToolUse(RUN.runId, 'a', 'get_leads', { q: 1 }, 'm1');
+      bridge.noteToolUse(RUN.runId, 'b', 'get_leads', { q: 1 }, 'm1');
+      await bridge.callTool(token, { name: 'get_leads', args: { q: 1 }, callId: 'a' });
+      await bridge.callTool(token, { name: 'get_leads', args: { q: 1 }, callId: 'b' });
+      const records = bridge.takeLedger(RUN.runId).records;
+      const dup = records.find((r) => r.toolCallId === 'b')!;
+      expect(dup).toMatchObject({ kind: 'collapsed', duplicateOfId: 'a' });
+      expect(records.find((r) => r.toolCallId === 'a')!.duplicateOfId).toBeUndefined();
     });
 
     it('keeps a call that finishes after the run closed, under the same generation', async () => {

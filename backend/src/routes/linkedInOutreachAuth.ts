@@ -183,7 +183,9 @@ router.post('/save-account', authenticateToken, async (req: any, res: any) => {
       },
     };
 
-    const account = await createAccount(userId, 'unipile', accountInput);
+    const account = await createAccount(userId, 'unipile', accountInput, {
+      providerVerified: accountDetails !== null,
+    });
 
     // Invalidate the cached connectivity status so the next GET /connected-accounts
     // re-checks Unipile rather than returning the stale "disconnected" result.

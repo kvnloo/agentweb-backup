@@ -3,6 +3,7 @@ import express from 'express';
 import { IncomingMessage } from 'http';
 import { WebhookRequiredHeaders } from 'svix';
 import { webhookService, ResendWebhookEvent } from '../services/webhookService';
+import { emitResendEngagementSignal } from '../services/serverSignalEmitter';
 import { emailEventsDb } from '../services/emailEventsDb';
 import { leadListAlertService } from '../services/leadListAlertService';
 import { crmDb, userDb, tempEmailDb } from '../services/db';
@@ -284,6 +285,10 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
     } else {
       console.log(`Skipping CRM event storage for Emma-related email: ${event.data.email_id}`);
     }
+
+    // ENG-2686: platform-email engagement → hireemma.ai session list. The mapper drops anything not
+    // sent by the AgentWeb system sender, so customer mail never reaches the funnel. Fire-and-forget.
+    void emitResendEngagementSignal(event);
 
     // Handle specific event types
     switch (event.type) {

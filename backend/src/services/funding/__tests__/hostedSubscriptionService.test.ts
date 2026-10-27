@@ -29,6 +29,8 @@ describe("hosted subscription service", () => {
   let ids: number;
   let nowMs: number;
   let promoteLoses: boolean;
+  let revokeBegun: string[] = [];
+  let revokeHookThrows = false;
   const user = { userId: "user-1" };
 
   const provider = (): HostedProvider => ({ route: "claude", kind: "claude_subscription", recordProvider: "anthropic", hostProvider: "fake", isEnabledFor: async (u) => enabled.has(u) });
@@ -53,6 +55,8 @@ describe("hosted subscription service", () => {
     ids = 0;
     nowMs = Date.now();
     promoteLoses = false;
+    revokeBegun = [];
+    revokeHookThrows = false;
     svc = new HostedSubscriptionService({
       db: store.db,
       // A host that is "down" answers like an unreachable socket; "unconfigured" has no client at all. `promoteLoses`: the host
@@ -73,6 +77,10 @@ describe("hosted subscription service", () => {
       now: () => nowMs,
       newId: () => `conn-${++ids}`,
       sleep: async () => undefined,
+      onRevokeBegun: (id) => {
+        if (revokeHookThrows) throw new Error("registry unavailable");
+        revokeBegun.push(id);
+      },
     });
   }
   afterEach(async () => {
@@ -254,6 +262,42 @@ describe("hosted subscription service", () => {
       expect(slots()).toBe(0);
       expect(await svc.revokeRecord(user, view.connectionId)).toBe("revoked"); // idempotent
       expect(slots()).toBe(0);
+    });
+
+    it("stops the running turns of the connection after the record is fenced and before the host is asked to wipe it", async () => {
+      const view = await connect();
+      revokeBegun = [];
+      const stoppedWhenFenced: number[] = [];
+      const stoppedWhenWiped: number[] = [];
+      const realBegin = store.db.hostedBeginRevoke.bind(store.db);
+      jest.spyOn(store.db, "hostedBeginRevoke").mockImplementation(async (...args: Parameters<typeof realBegin>) => {
+        const r = await realBegin(...args);
+        stoppedWhenFenced.push(revokeBegun.length);
+        return r;
+      });
+      const realRevoke = rig.mgr.revoke.bind(rig.mgr);
+      jest.spyOn(rig.mgr, "revoke").mockImplementation(((...args: Parameters<typeof realRevoke>) => {
+        stoppedWhenWiped.push(revokeBegun.length);
+        return realRevoke(...args);
+      }) as typeof rig.mgr.revoke);
+      await svc.revokeRecord(user, view.connectionId);
+      expect(revokeBegun).toEqual([view.connectionId]);
+      expect(stoppedWhenFenced).toEqual([0]); // not before the fence...
+      expect(stoppedWhenWiped).toEqual([1]); // ...and before the wipe
+    });
+
+    it("a hook that fails never blocks the disconnect", async () => {
+      const view = await connect();
+      revokeHookThrows = true;
+      jest.spyOn(console, "error").mockImplementation(() => undefined);
+      expect(await svc.revokeRecord(user, view.connectionId)).toBe("revoked");
+    });
+
+    it("does not call the hook for a connection that is not the caller's", async () => {
+      const view = await connect();
+      revokeBegun = [];
+      await expect(svc.revokeRecord({ userId: "user-2" }, view.connectionId)).rejects.toThrow();
+      expect(revokeBegun).toEqual([]);
     });
 
     it("repeated and concurrent disconnects release the slot once (the other connection keeps its slot)", async () => {
