@@ -816,6 +816,20 @@ createTestAccount().then(async () => {
         console.error('[DomainReachability] Failed to initialize:', error);
       }
 
+      // ENG-673: the Smartlead push resumer. Every minute it claims push runs whose worker is gone (a crash or a deploy) and cancels runs
+      // left paused for a week. It does nothing unless SMARTLEAD_PUSH_ENABLED=true. In-flight work is drained at shutdown by the registry.
+      try {
+        const { getSmartleadPushService, smartleadPushEnabled } = await import('./services/smartleadPushRuntime');
+        setInterval(() => {
+          if (!isCronEnabled() || !smartleadPushEnabled()) return;
+          cronJobRegistry.track('SmartleadPushResumer', getSmartleadPushService().resumerTick())
+            .catch(e => console.error('[SmartleadPush] Resumer error:', e));
+        }, 60 * 1000);
+        console.log('[SmartleadPush] Resumer initialized — every minute (active only when SMARTLEAD_PUSH_ENABLED=true)');
+      } catch (error) {
+        console.error('[SmartleadPush] Failed to initialize the resumer:', error);
+      }
+
       // ENG-2156: warn oncall at 80%/95% of the OpenRouter key's own monthly limit, before
       // the cap starts 402'ing every Agent Mode call. Read-only; hourly from boot.
       try {
