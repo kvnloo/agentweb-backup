@@ -56,6 +56,7 @@ import {
   runVerified,
   s3BucketProblem,
   skillEntitlementProblems,
+  toolRegistryProblems,
 } from '../scripts/routerAbEval';
 import { BudgetExceededError, BudgetLedger, CostMeter, readJsonlRepairing, reportedCostUsd } from '../loops/eval/routerAbBudget';
 import { appendFileSync, existsSync, mkdtempSync, readFileSync as readFile, rmSync, writeFileSync } from 'fs';
@@ -355,6 +356,15 @@ describe('environment refusals', () => {
     expect(skillEntitlementProblems(['create_blog_article'], skills, ['s1'])).toEqual([]);
     expect(skillEntitlementProblems(['create_blog_article'], skills, ['*'])).toEqual([]);
     expect(skillEntitlementProblems([], skills, null)).toHaveLength(1);
+  });
+
+  it('refuses to generate from an uninitialized agent-mode tool registry (install_skills "Unknown tool")', () => {
+    const empty = { toolRegistry: { getTool: () => undefined } };
+    const ready = { toolRegistry: { getTool: (n: string) => (n === 'install_skills' ? {} : undefined) } };
+    expect(toolRegistryProblems(empty)).toEqual(['install_skills is not registered after initialize()']);
+    expect(toolRegistryProblems(ready)).toEqual([]);
+    expect(toolRegistryProblems({})).toHaveLength(1);
+    expect(toolRegistryProblems(ready, ['install_skills', 'generate_image'])).toEqual(['generate_image is not registered after initialize()']);
   });
 });
 

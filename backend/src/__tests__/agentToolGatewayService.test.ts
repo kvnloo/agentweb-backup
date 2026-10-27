@@ -523,8 +523,10 @@ describe('agentToolGatewayService', () => {
         };
 
         it('coerces an integer list_id to a string (repro)', () => {
+          // Not call_hubspot_api: that tool's own argument normaliser (ENG-2610) already stringifies list_id, so the generic
+          // scalar coercion this test covers never sees an integer for it.
           const result = validateAndRepairToolArgs({
-            toolName: 'call_hubspot_api',
+            toolName: 'call_generic_lists_api',
             args: { entity_type: 'CONTACT_LIST', action: 'GET', list_id: 17 },
             inputSchema: hubspotSchema,
             effect: 'read',

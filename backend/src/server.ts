@@ -433,6 +433,10 @@ const runDrain = async (reason: string): Promise<void> => {
     drainLiveVoiceToolExecutions(remainingDrainMs()),
   ]);
   await generateMarketingResponseWorkerService.shutdown(remainingDrainMs());
+  // ENG-2113: a Claude-plan tool call that was still running when its turn ended is looked for one last time and saved, so it is not lost with the process.
+  await import('./services/funding/claudeCodeBackendInstance')
+    .then((m) => m.claudeCodeBackend.flush())
+    .catch(() => undefined);
   // ENG-2110: pending Claude sign-ins hold a child process and a private temp dir.
   await import('./services/funding/claudeSubscriptionService')
     .then((m) => m.shutdownClaudeSubscriptionService())

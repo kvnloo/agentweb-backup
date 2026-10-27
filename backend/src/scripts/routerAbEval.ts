@@ -201,6 +201,19 @@ export function skillEntitlementProblems(
   return problems;
 }
 
+/**
+ * A bare script process has not run the server's boot, so the agent-mode tool registry is empty: `install_skills` is then
+ * "Unknown tool" in mock mode and the model never reaches the flow's required tool. Refuse before any paid call.
+ */
+export function toolRegistryProblems(
+  service: { toolRegistry?: { getTool(name: string): unknown } },
+  names: readonly string[] = ['install_skills'],
+): string[] {
+  const registry = service.toolRegistry;
+  if (!registry || typeof registry.getTool !== 'function') return ['the agent-mode tool registry is not readable'];
+  return names.filter((name) => !registry.getTool(name)).map((name) => `${name} is not registered after initialize()`);
+}
+
 // ── inputs ───────────────────────────────────────────────────────────────────
 
 const providerOf = (model: string): string | undefined => LLM_MODEL_REGISTRY[model]?.provider;
@@ -531,6 +544,10 @@ async function generate(flags: Flags): Promise<number> {
   try {
     const { chatbotDb } = await import('../services/chatbotService');
     const { agentModeService } = await import('../services/agentModeService');
+    // The server runs this at boot; without it the tool registry is empty (ENG-2649 pilot: every run hit "Unknown tool: install_skills").
+    await agentModeService.initialize();
+    const registryProblems = toolRegistryProblems(agentModeService as any, ['install_skills', ...new Set(requiredTools)]);
+    if (registryProblems.length) throw new Error(`agent mode did not initialize:\n- ${registryProblems.join('\n- ')}`);
     const meter = new CostMeter(ledger, 'generation', outDir, await loadCostOf());
     meterAgentModeService(agentModeService, await agentModeService.getOpenRouterClient(), meter);
     const done = latestBy(readJsonlRepairing<RunRecord>(f.runs), runKey);
