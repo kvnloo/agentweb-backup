@@ -77,7 +77,11 @@ function createdAtMs(value: unknown): number | undefined {
   if (value === undefined || value === null || value === "") return undefined;
   if (value instanceof Date) return value.getTime();
   if (typeof value === "number") return Number.isFinite(value) ? (value < 1e11 ? value * 1000 : value) : NaN;
-  if (typeof value === "string") return /^\d{4}-\d{2}-\d{2}/.test(value) ? Date.parse(value) : NaN;
+  if (typeof value === "string") {
+    if (!/^\d{4}-\d{2}-\d{2}/.test(value)) return NaN;
+    // A time with no zone would be read in the SERVER's local zone; the CRM writes UTC, so a bare time is UTC.
+    return Date.parse(/(z|[+-]\d{2}:?\d{2})$/i.test(value) || value.length <= 10 ? value : `${value}Z`);
+  }
   return NaN;
 }
 

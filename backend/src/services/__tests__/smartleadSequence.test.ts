@@ -70,6 +70,16 @@ describe("analyseSequence (ENG-673)", () => {
     expect(Date.now() - started).toBeLessThan(1000);
   });
 
+  it("treats a 'tag' longer than any real tag name as an unreadable sequence", () => {
+    expect(analyseSequence([{ seq_number: 1, subject: "s", email_body: `{{${"a".repeat(101)}}}`, sequence_variants: [] }]).readable).toBe(false);
+    expect(analyseSequence([{ seq_number: 1, subject: "s", email_body: `{{${"a".repeat(100)}}}`, sequence_variants: [] }]).readable).toBe(true);
+  });
+
+  it("treats a sequence whose total text is absurd as unreadable, however it is split across steps and variants", () => {
+    const variants = Array.from({ length: 12 }, (_, i) => ({ variant_label: `V${i}`, subject: "s", email_body: "x".repeat(190_000), is_deleted: false }));
+    expect(analyseSequence([{ seq_number: 1, subject: "s", email_body: "b", sequence_variants: variants }]).readable).toBe(false);
+  });
+
   it("extracts tags correctly from triple braces and from HTML attributes", () => {
     const a = analyseSequence([{ seq_number: 1, subject: "{{{x}}}", email_body: '<a href="{{website}}">{{ Company Name }}</a>', sequence_variants: [] }]);
     expect(a.tags).toEqual(["x", "website", "Company Name"]);

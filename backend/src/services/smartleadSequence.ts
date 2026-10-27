@@ -34,6 +34,10 @@ const TAG = /\{\{([^{}]*)\}\}/g;
 /** A longer text, or a longer sequence, is not a real email; it is treated as an unreadable sequence rather than scanned. */
 const MAX_TEXT_CHARS = 200_000;
 const MAX_STEPS = 200;
+/** Smartlead tag names are short words; a "tag" longer than this is not one, and the sequence is treated as unreadable. */
+const MAX_TAG_CHARS = 100;
+/** Across ALL steps and variants: a real sequence is a few thousand characters, and variants per step are otherwise unbounded. */
+const MAX_TOTAL_CHARS = 2_000_000;
 
 /** A list reply is a bare array (seen live) or wrapped in `data` or `sequences` (the docs' variants). */
 function rowsOf(reply: unknown): Row[] | undefined {
@@ -68,13 +72,14 @@ export function analyseSequence(reply: unknown): SequenceAnalysis {
     for (const v of step.variants) texts.push(v.subject, v.body, v.optional);
   }
 
-  if (steps.length > MAX_STEPS || texts.some(t => t.length > MAX_TEXT_CHARS)) return { readable: false, stepCount: 0, hasContent: false, tags: [], usesSpintax: false, hash: "" };
+  if (steps.length > MAX_STEPS || texts.some(t => t.length > MAX_TEXT_CHARS) || texts.reduce((sum, t) => sum + t.length, 0) > MAX_TOTAL_CHARS) return { readable: false, stepCount: 0, hasContent: false, tags: [], usesSpintax: false, hash: "" };
 
   const tags = new Set<string>();
   let usesSpintax = false;
   for (const t of texts) {
     for (const match of t.matchAll(TAG)) {
       const tag = match[1].trim();
+      if (tag.length > MAX_TAG_CHARS) return { readable: false, stepCount: 0, hasContent: false, tags: [], usesSpintax: false, hash: "" };
       if (tag) tags.add(tag);
     }
     if (!usesSpintax && containsSpintax(t.replace(TAG, ""))) usesSpintax = true;

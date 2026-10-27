@@ -24,3 +24,8 @@ Second review fixes:
 - `runStartedAt` is a required input of the eligibility function (without it nothing would stop an unapproved lead). A numeric `createdAt` below 1e11 is read as epoch seconds; a text `createdAt` must look like an ISO date or the lead is skipped.
 - Acknowledging a near-miss tag (`{{First_Name}}`) no longer clears it: it still blocks.
 
+Third review fixes:
+- A sequence with hundreds of huge unique "tags" made the tag classifier take 4.5 seconds. A tag longer than 100 characters, more than 2,000,000 characters of text in all (steps and variants together), or more than 200 steps now makes the sequence unreadable (which blocks an ACTIVE campaign); `classifyTags` is linear (names normalised once, lookups in a map and a set). The reviewer's exact attack now ends in 59 ms; 18,000 tags just under the caps take 37 ms.
+- A `createdAt` with no time zone is read as UTC (the CRM writes UTC), not in the server's local zone; tested under three zones.
+- Known and accepted: an address with an apostrophe (`o'brien@acme.com`) is refused as invalid, because `{{email}}` goes into the customer's HTML; the run's counts show how many leads were skipped for it.
+

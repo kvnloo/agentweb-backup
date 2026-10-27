@@ -53,15 +53,19 @@ export interface TagClassification {
 
 export function classifyTags(tags: string[], mapping: TagMapping, acknowledged: string[] = []): TagClassification {
   const out: TagClassification = { standard: [], mapped: [], nearMiss: [], unknown: [] };
-  const known = [...Object.keys(STANDARD_TAG_SOURCES), ...Object.keys(mapping)];
+  // Normalised once per known name and once per tag (a lookup, not a scan), and the acknowledged list as a set: the work stays
+  // linear in the total size of the tags however many a hostile sequence contains.
+  const knownByNorm = new Map<string, string>();
+  for (const k of [...Object.keys(STANDARD_TAG_SOURCES), ...Object.keys(mapping)]) if (!knownByNorm.has(norm(k))) knownByNorm.set(norm(k), k);
+  const acknowledgedSet = new Set(acknowledged);
   for (const tag of tags) {
     if (usable(tag) && own(STANDARD_TAG_SOURCES, tag)) out.standard.push(tag);
     else if (usable(tag) && own(mapping, tag)) out.mapped.push(tag);
     else {
       // A near-miss is a typo of a tag we supply, so acknowledging it ("Smartlead supplies this") is never right: it still blocks.
-      const meant = known.find(k => norm(k) === norm(tag));
+      const meant = knownByNorm.get(norm(tag));
       if (meant) out.nearMiss.push({ tag, meant });
-      else if (!acknowledged.includes(tag)) out.unknown.push(tag);
+      else if (!acknowledgedSet.has(tag)) out.unknown.push(tag);
     }
   }
   return out;
