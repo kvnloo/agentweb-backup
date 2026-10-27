@@ -110,6 +110,7 @@ interface IngestDeps {
 }
 
 const MAX_INGESTIONS_PER_USER = 25;
+const INGEST_LEDGER_MAX_ATTEMPTS = 12;
 const AUTOMATION_CONFIDENCE_THRESHOLD = 0.75;
 const ACTIONABLE_CALL_CLASSIFICATIONS = new Set<FathomCallClassification>(['onboarding', 'prospect']);
 
@@ -519,7 +520,26 @@ export async function ingestFathomOnboardingRecording(
   let orgMemoryOrgId: string | null = null;
   let next!: FathomOnboardingIngestion;
   let written = false;
-  for (let attempt = 0; attempt < 5 && !written; attempt += 1) {
+  // ENG-270 (Opslane 1336): memories this call wrote must not outlive a refused/failed ledger write.
+  const deleteCreatedMemories = async () => {
+    if (target.userId) {
+      for (const memoryId of createdMemoryIds) {
+        try { await deps.accountMemoryDb.deleteMemory?.(target.userId, memoryId); } catch (error: any) {
+          console.warn('[FathomOnboarding] Failed to delete refused-approve account memory:', memoryId, error?.message);
+        }
+      }
+    }
+    if (createdOrgMemoryOrgId) {
+      for (const memoryId of createdOrgMemoryIds) {
+        try { await deps.orgMemoryDb.deleteMemory?.(createdOrgMemoryOrgId, memoryId); } catch (error: any) {
+          console.warn('[FathomOnboarding] Failed to delete refused-approve org memory:', memoryId, error?.message);
+        }
+      }
+    }
+  };
+  for (let attempt = 0; attempt < INGEST_LEDGER_MAX_ATTEMPTS && !written; attempt += 1) {
+    // ENG-270 (Opslane 1336 #3): jittered backoff so bursts of ingests for one account converge.
+    if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, Math.floor(Math.random() * 25 * attempt)));
     ledgerUser = await deps.userDb.getUserById(ledgerUserId);
     if (!ledgerUser) {
       throw new Error(`Target/review user ${ledgerUserId} was not found.`);
@@ -532,20 +552,7 @@ export async function ingestFathomOnboardingRecording(
     if (reviewed && previous?.status === 'discarded') {
       // ENG-270 (Opslane 1336): a concurrent discard can land after an earlier attempt of
       // this loop wrote memories; delete them so a refused approve leaves nothing behind.
-      if (target.userId) {
-        for (const memoryId of createdMemoryIds) {
-          try { await deps.accountMemoryDb.deleteMemory?.(target.userId, memoryId); } catch (error: any) {
-            console.warn('[FathomOnboarding] Failed to delete refused-approve account memory:', memoryId, error?.message);
-          }
-        }
-      }
-      if (createdOrgMemoryOrgId) {
-        for (const memoryId of createdOrgMemoryIds) {
-          try { await deps.orgMemoryDb.deleteMemory?.(createdOrgMemoryOrgId, memoryId); } catch (error: any) {
-            console.warn('[FathomOnboarding] Failed to delete refused-approve org memory:', memoryId, error?.message);
-          }
-        }
-      }
+      await deleteCreatedMemories();
       throw new FathomOnboardingReviewError(409, 'Discarded ingestion cannot be approved.');
     }
     // ENG-270 (Opslane 357): an admin discard sticks across unreviewed re-ingests, so the
@@ -619,7 +626,8 @@ export async function ingestFathomOnboardingRecording(
     }
   }
   if (!written) {
-    throw new Error('Fathom onboarding ledger changed concurrently; retry the ingest.');
+    await deleteCreatedMemories();
+    throw new FathomOnboardingReviewError(409, 'Fathom onboarding ledger changed concurrently; retry the ingest.');
   }
 
   // ENG-270 (Opslane 443): a losing concurrent reviewed ingest adopts the winner's

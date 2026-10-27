@@ -563,6 +563,30 @@ describe('fathomOnboardingIngestionService', () => {
     expect((deps.orgMemoryDb as any).deleteMemory).toHaveBeenCalledWith('org-1', 'org-mem-race');
   });
 
+  it('answers 409 and deletes its memories when ledger contention never clears (Opslane 1336 #3)', async () => {
+    const stamp = '2026-07-08T19:00:00.000Z';
+    const pending = [{ recordingId: 'burst-1', status: 'needs_review', context: baseContext, memoryIds: [], orgMemoryIds: [], createdAt: stamp, updatedAt: stamp }];
+    const updateUser = jest.fn(async () => { throw Object.assign(new Error('cond'), { code: 'ConditionalCheckFailedException' }); });
+    const base = makeDeps();
+    const deps = makeDeps({
+      userDb: {
+        ...base.userDb,
+        getUserById: jest.fn(async (userId: string) => ({ userId, email: 'owner@acme.ai', orgId: 'org-1', fathomOnboardingIngestions: pending })),
+        updateUser,
+      },
+      accountMemoryDb: { addMemory: jest.fn(async () => ({ memoryId: 'mem-burst' })), deleteMemory: jest.fn(async () => undefined) },
+      orgMemoryDb: { addMemory: jest.fn(async () => ({ memoryId: 'org-mem-burst' })), deleteMemory: jest.fn(async () => undefined) },
+    });
+
+    await expect(ingestFathomOnboardingRecording({
+      recordingId: 'burst-1', targetUserId: 'target-user', reviewOwnerUserId: 'target-user', reviewed: true, extractedContext: baseContext,
+    }, deps as any)).rejects.toMatchObject({ statusCode: 409 });
+
+    expect(updateUser.mock.calls.length).toBeGreaterThan(5);
+    expect((deps.accountMemoryDb as any).deleteMemory).toHaveBeenCalledWith('target-user', 'mem-burst');
+    expect((deps.orgMemoryDb as any).deleteMemory).toHaveBeenCalledWith('org-1', 'org-mem-burst');
+  });
+
   it('routes existing account matches to review without creating another user', async () => {
     const deps = makeDeps();
 
