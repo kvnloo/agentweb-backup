@@ -2202,36 +2202,6 @@ export const createAttemptUsageTable = async () => {
   }
 };
 
-/**
- * ENG-2496: Zoma device-flow onboarding (mcp/zomaDeviceStore.ts, the only module that touches it). Single-table: PK `pk` (S), no sort key,
- * no GSI. Items are `device#<sha256>`, `usercode#<CODE>` and `token#<sha256>`; device and user-code items carry a `ttl` (epoch seconds).
- * The table was first created by hand, so this definition only matters for a fresh environment; an existing table is left as it is.
- */
-export const createZomaDeviceAuthTable = async () => {
-  const params: AWS.DynamoDB.CreateTableInput = {
-    TableName: `${TABLE_PREFIX}AW-ZomaDeviceAuth`,
-    AttributeDefinitions: [{ AttributeName: 'pk', AttributeType: 'S' }],
-    KeySchema: [{ AttributeName: 'pk', KeyType: 'HASH' }],
-    BillingMode: 'PAY_PER_REQUEST',
-  };
-  try { await dynamodb.createTable(params).promise(); console.log(`Created ${params.TableName} table`); }
-  catch (error: any) { if (error.code !== 'ResourceInUseException') throw error; }
-  // TTL can only be set on an ACTIVE table. Never fatal (nothing after this table may be skipped): the role running setup may not be allowed
-  // to describe the table or to set TTL.
-  try {
-    await dynamodb.waitFor('tableExists', { TableName: params.TableName }).promise();
-    await dynamodb.updateTimeToLive({
-      TableName: params.TableName,
-      TimeToLiveSpecification: { Enabled: true, AttributeName: 'ttl' },
-    }).promise();
-    console.log(`Enabled TTL on ${params.TableName} (attribute: ttl)`);
-  } catch (error: any) {
-    if (!(error.code === 'ValidationException' && /already enabled/i.test(error.message || ''))) {
-      console.warn(`[create-tables] Could not enable TTL on ${params.TableName}: ${error.code || error.message}. Run: aws dynamodb update-time-to-live --table-name ${params.TableName} --time-to-live-specification "Enabled=true,AttributeName=ttl"`);
-    }
-  }
-};
-
 export const createModelChangeAuditTable = async () => {
   const params: AWS.DynamoDB.CreateTableInput = {
     TableName: `${TABLE_PREFIX}AW-ModelChangeAudit`,
@@ -2867,7 +2837,6 @@ const main = async () => {
     await createSpendEventsTable();
     await createSpendProjectionTable();
     await createModelChangeAuditTable();
-    await createZomaDeviceAuthTable();
     await createLlmConnectionsTable();
     await createAttemptUsageTable();
     await createLandingPagesTable();
