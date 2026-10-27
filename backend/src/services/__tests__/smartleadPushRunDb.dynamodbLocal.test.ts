@@ -456,6 +456,67 @@ suite('SmartleadPushRunDb against DynamoDB Local (ENG-673)', () => {
     });
   });
 
+  describe('a reply lost after a write committed (the call is retried)', () => {
+    /** A client whose first matching put COMMITS and then fails with a retryable error, so the store retries into its own earlier write. */
+    const lossy = (match: (item: any) => boolean) => {
+      let lost = false;
+      return new SmartleadPushRunDb({
+        get: doc.get.bind(doc), query: doc.query.bind(doc), update: doc.update.bind(doc), delete: doc.delete.bind(doc),
+        put: (p: any) => {
+          if (lost || !match(p.Item)) return doc.put(p);
+          lost = true;
+          return { promise: async () => { await doc.put(p).promise(); throw Object.assign(new Error('reply lost'), { code: 'ServiceUnavailable' }); } };
+        },
+      } as any, table, () => clock, async () => {});
+    };
+
+    it('starts exactly one run when the run write committed but its reply was lost', async () => {
+      const i = input();
+      const r = await lossy(item => item.sk === 'RUN').startRun(i, 'w');
+      expect(r.started).toBe(true);
+      const runs = await db.listRunsForList(i.listId, 50);
+      expect(runs).toHaveLength(1);
+      expect(await db.getLock(i.listId, i.campaignId)).toEqual({ runId: runs[0].runId });
+      expect(runs[0].status).toBe('running');
+    });
+
+    it('starts exactly one run when the lock write committed but its reply was lost, and does not cancel its own run', async () => {
+      const i = input();
+      const r = await lossy(item => item.sk === 'LOCK').startRun(i, 'w');
+      expect(r.started).toBe(true);
+      const runs = await db.listRunsForList(i.listId, 50);
+      expect(runs.map(x => x.status)).toEqual(['running']);
+      expect(await db.getLock(i.listId, i.campaignId)).toEqual({ runId: (r as any).run.runId });
+    });
+
+    it('does the same for a takeover of a finished run\'s lock', async () => {
+      const old = await fresh();
+      await doc.update({ TableName: table, Key: { pk: old.runId, sk: 'RUN' }, UpdateExpression: 'SET #s = :c REMOVE #a', ExpressionAttributeNames: { '#s': 'status', '#a': 'active' }, ExpressionAttributeValues: { ':c': 'completed' } }).promise();
+      const r = await lossy(item => item.sk === 'LOCK').startRun(input({ listId: old.listId }), 'w');
+      expect(r.started).toBe(true);
+      expect(await db.getLock(old.listId, old.campaignId)).toEqual({ runId: (r as any).run.runId });
+    });
+  });
+
+  describe('an orphan run (a crash between a start\'s two writes)', () => {
+    it('is never given a lock by a lease claim: it has none, and must not take one', async () => {
+      const orphan = await fresh();
+      await db.releaseLock(orphan.listId, orphan.campaignId, orphan.runId); // the crash: Run written, Lock never
+      clock += LEASE_MS + 31_000;
+      expect(await db.claimLease(orphan.runId, 'worker-B', 1)).toBeNull();
+      expect(await db.getLock(orphan.listId, orphan.campaignId)).toBeNull();
+      expect(await db.lockPointsAt(orphan)).toBe(false);
+    });
+
+    it('still lets a user resume a paused run whose lock expired meanwhile', async () => {
+      const a = await fresh();
+      await db.pauseRun(a.runId, 'user');
+      await db.releaseLock(a.listId, a.campaignId, a.runId);
+      expect(await db.resumeRun(a.runId, 'w', 1)).toMatchObject({ status: 'running' });
+      expect(await db.getLock(a.listId, a.campaignId)).toEqual({ runId: a.runId });
+    });
+  });
+
   describe('single-use approvals', () => {
     it('lets exactly one of several simultaneous claims win, remembers the run, and gives the approval back on release', async () => {
       const jti = `jti-${ulid()}`;

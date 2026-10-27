@@ -130,9 +130,7 @@ export class InMemoryPushRunDb {
     const r = this.runs.get(runId);
     const now = this.nowMs();
     if (!r || r.status !== "running" || r.leaseEpoch !== seenEpoch || !(r.leaseUntil < now - skewMs)) return null;
-    const holder = this.locks.get(this.lockKey(r.listId, r.campaignId));
-    if (holder && holder !== runId) return null;
-    this.locks.set(this.lockKey(r.listId, r.campaignId), runId);
+    if (this.locks.get(this.lockKey(r.listId, r.campaignId)) !== runId) return null; // never creates a missing lock (an orphan is cancelled instead)
     r.leaseEpoch++; r.leaseOwner = workerId; r.leaseUntil = now + LEASE_MS;
     return this.clone(r);
   }
@@ -141,6 +139,9 @@ export class InMemoryPushRunDb {
   async findExpiredLeases(limit = 50) { return [...this.runs.values()].filter(r => r.status === "running" && r.leaseUntil < this.nowMs()).slice(0, limit).map(this.summary); }
   async findStalePaused(olderThanMs: number, limit = 50) { return [...this.runs.values()].filter(r => (r.status === "paused" || r.status === "partial") && r.leaseUntil < this.nowMs() - olderThanMs).slice(0, limit).map(this.summary); }
   async listRunsForList(listId: string, limit = 25) { return [...this.runs.values()].filter(r => r.listId === listId).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, limit).map(this.summary); }
+
+  async releaseLock(listId: string, campaignId: number, runId: string) { if (this.locks.get(this.lockKey(listId, campaignId)) === runId) this.locks.delete(this.lockKey(listId, campaignId)); }
+  async lockPointsAt(run: PushRun) { return this.locks.get(this.lockKey(run.listId, run.campaignId)) === run.runId; }
 
   async claimToken(jti: string) { if (this.tokens.has(jti)) return false; this.tokens.set(jti, {}); return true; }
   async setTokenRun(jti: string, runId: string) { const t = this.tokens.get(jti); if (t) t.runId = runId; }

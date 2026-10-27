@@ -66,7 +66,9 @@ export interface PushServiceDeps {
 
 /** A run left paused or partial this long is canceled by the resumer, so it cannot hold its lock for ever. */
 export const STALE_PAUSED_MS = 7 * 24 * 60 * 60 * 1000;
-const RESUMER_BATCH = 25;
+/** The same for a run the kill switch paused: it was not the user who left it, so it keeps its lock four times as long. */
+export const STALE_OPERATOR_PAUSED_MS = 30 * 24 * 60 * 60 * 1000;
+const RESUMER_BATCH = 100;
 const MAX_CONCURRENT_PREVIEWS = 3;
 /** How long a consumed approval is remembered: longer than the token itself, so an expired token can never be claimed again. */
 const TOKEN_MEMORY_SECONDS = 2 * 60 * 60;
@@ -93,6 +95,9 @@ export function toRunView(run: PushRun): RunView {
     counts: run.counts, approved: run.previewEligible, startedAt: run.startedAt, ...(run.finishedAt ? { finishedAt: run.finishedAt } : {}), ...(run.failure ? { failure: run.failure } : {}), warnings,
   };
 }
+
+/** A preview could not take one of the few whole-list slots. */
+class BusyError extends Error {}
 
 export class SmartleadPushService {
   private active = 0;
@@ -151,10 +156,13 @@ export class SmartleadPushService {
         const status = error.code === "campaign_not_found" ? 404 : error.code === "campaign_not_pushable" ? 409 : 400;
         return fail(status, error.code, error.message);
       }
+      if (error instanceof BusyError) return fail(429, "busy", "Several previews are running. Try again in a moment.");
       if (error instanceof SmartleadApiError) {
-        // Tell a bad key from an outage; nothing was sent in either case.
-        if (error.status === 401 || error.status === 403) return fail(422, "key_rejected", "Smartlead rejected the saved API key (revoked, or the plan no longer includes API access). Replace the key in Settings, Login Credentials.");
+        // Tell a bad key from a refusal from an outage; nothing was sent in any case.
+        if (error.status === 401) return fail(422, "key_rejected", "Smartlead rejected the saved API key (revoked, or the plan no longer includes API access). Replace the key in Settings, Login Credentials.");
+        if (error.status === 403) return fail(422, "smartlead_forbidden", "Smartlead refused this request: the key may not have access to that campaign, or the plan may not include API access.");
         if (error.status === 429) return fail(429, "smartlead_rate_limited", "Smartlead is rate-limiting requests. Try again in a minute.");
+        if (error.status !== undefined && error.status >= 400 && error.status < 500) return fail(422, "smartlead_rejected_request", "Smartlead did not accept the request. Check the campaign and try again.");
         return fail(502, "smartlead_unavailable", "Smartlead could not be reached or answered unexpectedly. Nothing was sent. Try again shortly.");
       }
       throw error;
@@ -173,24 +181,31 @@ export class SmartleadPushService {
       if (!list.ok) return list;
       const key = await this.ownKey(userId, typeof body.accountId === "string" ? body.accountId : undefined);
       if (!key.ok) return key;
-      // A preview reads a whole list into memory: only a few at once per process.
-      if (this.previewsRunning >= MAX_CONCURRENT_PREVIEWS) return fail(429, "busy", "Several previews are running. Try again in a moment.");
       const apiKey = key.key.apiKey;
       if (!Number.isInteger(campaignId) || campaignId <= 0) return fail(400, "bad_request", "A campaign is required.");
+      let slotHeld = false;
       const previewDeps: PreviewDeps = {
-        readLeads: (l, a, n) => this.deps.crm.readLeads(l, a, n),
+        // A preview holds a whole list in memory: only a few at once per process. The slot is taken at the first list read, so slow
+        // Smartlead calls before it do not occupy one.
+        readLeads: async (l, a, n) => {
+          if (!slotHeld) {
+            if (this.previewsRunning >= MAX_CONCURRENT_PREVIEWS) throw new BusyError();
+            this.previewsRunning++;
+            slotHeld = true;
+          }
+          return this.deps.crm.readLeads(l, a, n);
+        },
         getCampaign: () => this.smartleadCall(key.key, () => this.deps.smartlead.getCampaign(apiKey, campaignId)),
         getSequences: () => this.smartleadCall(key.key, () => this.deps.smartlead.getSequences(apiKey, campaignId)),
         getCampaignMailboxes: () => this.deps.smartlead.getMailboxes(apiKey, campaignId),
         now: () => this.deps.now(),
         secret: this.deps.secret,
       };
-      this.previewsRunning++;
       const preview = await buildPreview(previewDeps, {
         listId: body.listId, campaignId, userId, accountId: key.key.accountId, includeUnverified: body.includeUnverified === true, mapping: body.mapping && typeof body.mapping === "object" ? body.mapping : undefined,
         acknowledgedTags: Array.isArray(body.acknowledgedTags) ? body.acknowledgedTags : undefined, acknowledgeUnreadable: body.acknowledgeUnreadable === true,
         cohort: body.cohort === undefined || body.cohort === null ? undefined : Number(body.cohort),
-      }).finally(() => { this.previewsRunning--; });
+      }).finally(() => { if (slotHeld) this.previewsRunning--; });
       return { ok: true, preview };
     });
   }
@@ -265,6 +280,12 @@ export class SmartleadPushService {
         if (existing) return { ok: true, started: false, run: toRunView(existing) };
         return fail(409, "token_used", "This approval was already used. Preview again to push more.");
       }
+      // Another run on this list and campaign since the preview (a second preview approved too, or an editor pushed) makes the approval stale:
+      // it was sized for a list in which nothing had been pushed yet.
+      const since = new Date(token.iat).toISOString();
+      if ((await this.deps.db.listRunsForList(token.listId, 25)).some(r => r.campaignId === token.campaignId && (r.createdAt ?? "") >= since)) {
+        return fail(409, "changed_since_preview", "Another push to this campaign started after you previewed. Preview again.");
+      }
       let started: Awaited<ReturnType<SmartleadPushRunDb["startRun"]>>;
       try {
         started = await this.deps.db.startRun(
@@ -280,7 +301,8 @@ export class SmartleadPushService {
         this.workerId,
       );
       } catch (error) {
-        await this.deps.db.releaseToken(token.jti).catch(() => undefined); // the start did not happen: give the approval back
+        // NOT released: a store error can arrive after the run was written (the reply was lost), and handing the approval back would let it
+        // start a second run. Losing an approval is the safe direction: the user previews again.
         throw error;
       }
       if (!started.started) {
@@ -401,6 +423,11 @@ export class SmartleadPushService {
         if (this.capacity() === 0) break;
         const run = await this.deps.db.getRun(row.runId); // the index is eventually consistent: act only on the strong read
         if (!run || run.status !== "running") continue;
+        // A running run whose lock does not point at it never really started (a crash between a start's two writes): cancel it, never run it.
+        if (!(await this.deps.db.lockPointsAt(run))) {
+          if (await this.deps.db.cancelRun(run.runId)) { out.canceled++; this.deps.log(`[SmartleadPush] resumer canceled orphan run=${run.runId}`); }
+          continue;
+        }
         const claimed = await this.deps.db.claimLease(run.runId, this.workerId, run.leaseEpoch);
         if (!claimed) continue;
         out.claimed++;
@@ -408,9 +435,10 @@ export class SmartleadPushService {
         this.spawn(claimed);
       }
       for (const row of await this.deps.db.findStalePaused(STALE_PAUSED_MS, RESUMER_BATCH)) {
-        // A run the operator's kill switch paused ages while the switch is off: it stays for its owner to resume or cancel.
+        // A run the operator's kill switch paused ages while the switch is off, so it gets a longer grace before it is cancelled.
         const stale = await this.deps.db.getRun(row.runId);
-        if (!stale || stale.pauseReason === "disabled_by_operator") continue;
+        if (!stale) continue;
+        if (stale.pauseReason === "disabled_by_operator" && this.deps.now().getTime() - stale.leaseUntil < STALE_OPERATOR_PAUSED_MS) continue;
         if (await this.deps.db.cancelRun(row.runId)) {
           out.canceled++;
           this.deps.log(`[SmartleadPush] resumer canceled stale run=${row.runId}`);
