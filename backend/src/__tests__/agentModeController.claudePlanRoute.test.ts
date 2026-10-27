@@ -258,6 +258,32 @@ describe('/generate on the Claude plan route', () => {
     });
   });
 
+  describe('shared link generate', () => {
+    const sharedReq = (body: Record<string, unknown>) =>
+      ({ ...(makeReq(body) as object), params: { shareId: 's1' }, query: { conversable: 'tok' } }) as unknown as Request;
+
+    it('refuses a request for the plan: a shared link always runs on AgentWeb, so a plan request must hear no', async () => {
+      for (const fundingChoice of ['claude_subscription', 'codex_subscription', 'bogus', 0, false]) {
+        const res = makeRes();
+        await agentModeController.generateSharedResponse(sharedReq({ fundingChoice }), res);
+        expect(res.status).toHaveBeenCalledWith(400);
+        expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'invalid_funding_choice', userMessageSaved: false }));
+      }
+      expect((chatbotDb as any).getChatSession).not.toHaveBeenCalled();
+      expect(backend).not.toHaveBeenCalled();
+    });
+
+    it('lets an explicit "agentweb" or no choice through to the normal flow', async () => {
+      for (const fundingChoice of ['agentweb', undefined, null]) {
+        const res = makeRes();
+        await agentModeController.generateSharedResponse(sharedReq({ fundingChoice }), res);
+        expect(res.status).not.toHaveBeenCalledWith(400);
+        expect((chatbotDb as any).getChatSession).toHaveBeenCalled();
+        (chatbotDb as any).getChatSession.mockClear();
+      }
+    });
+  });
+
   describe('a plan turn', () => {
     beforeEach(() => {
       funding.mockResolvedValue(DECISION);

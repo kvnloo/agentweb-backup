@@ -15,5 +15,5 @@
   - The bridge route is loopback-only until the relay exists, and tools run in the main process. A tool call over about 60 s is cut by the HTTP MCP transport.
   - The journal row has no `actualModel` or entitlement observation, and the result is not mapped for `refusal` / `max_tokens`. Usage on the message excludes cache tokens.
   - The CLI can switch models itself (fallback, retired-model remap); the exact-model-name work is a separate PR.
-  - `/verified-generate` always runs on AgentWeb and answers 400 to a plan request.
+  - `/verified-generate` and the shared-link generate routes (`/share/:shareId/generate`, `/ishare/:shareId/generate`) always run on AgentWeb and answer 400 to a plan request.
 - **Verification.** Unit + mutation tests (every guard has a killed mutant, including the controller and revoke wiring), a real-`ToolBridge` backend test, and live scripts on the test instance with the kept login (Haiku only): the real backend, the real host and CLI, and Emma's 98 real tools, real 100k-char prompt and Dev data. Scripts: `loginHost/__tests__/live/claude{TurnPipeline,Backend,EmmaTools}Live.ts`.

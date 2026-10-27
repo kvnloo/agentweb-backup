@@ -12760,6 +12760,11 @@ export const agentModeController = {
     // error path needs this turn's starting point to attribute successes correctly.
     let turnStartCalledFunctions: Record<string, number> | null = null;
     try {
+      // ENG-2113: a shared link always runs on AgentWeb's models. A client that asks for the plan here must hear no, not be answered by AgentWeb
+      // (the same rule as /generate and /verified-generate).
+      if (req.body?.fundingChoice !== undefined && req.body?.fundingChoice !== null && req.body?.fundingChoice !== 'agentweb') {
+        return res.status(400).json(sendRefusalBody(claudeStopBody(new ClaudeRouteStopError('invalid_funding_choice')), false));
+      }
       const { shareId } = req.params;
       const { conversable } = req.query;
       const { userMessage, llmModel, attachments = [], workPlanInputAnswer, deckAnswer, deckCancel, clientId } = req.body;
