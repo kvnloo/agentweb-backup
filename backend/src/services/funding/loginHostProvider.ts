@@ -131,6 +131,13 @@ export { CERT_WARN_DAYS };
 export const CERT_WARN_EVERY_MS = 60 * 60 * 1000;
 /** The worker's protocol version is re-verified this often (a redeployed worker flips to "match" without a backend restart). */
 export const PROTOCOL_RECHECK_MS = 10 * 60 * 1000;
+/**
+ * Worker protocol versions this backend works with for sign-in, revoke and the plain turn path. A worker one version ahead is accepted so the worker
+ * can deploy FIRST (a new request field needs the worker first, see PROTOCOL_VERSION) without every running backend reporting a mismatch: a mismatch
+ * makes `workerSpeaksOurProtocol` false, which stops a "no such connection" answer from counting as a confirmed wipe. Code that needs a specific newer
+ * feature (the tool relay) must test `workerProtocol()` itself, not `protocolStatus()`.
+ */
+export const ACCEPTED_WORKER_PROTOCOLS: ReadonlySet<number> = new Set([PROTOCOL_VERSION, PROTOCOL_VERSION + 1]);
 
 /** Whole days until a certificate's notAfter (negative once expired). Pure; shared with the host. */
 export { daysUntil };
@@ -276,8 +283,8 @@ export class LoginHostProvider {
     void (async () => {
       try {
         const info = await client.hostInfo();
-        const status: ProtocolStatus = info.protocol === PROTOCOL_VERSION ? "match" : "mismatch";
-        if (status === "mismatch" && this.protocol.status !== "mismatch") console.error(`[loginHostProvider] login_host_protocol_mismatch worker=${info.protocol} backend=${PROTOCOL_VERSION}`);
+        const status: ProtocolStatus = ACCEPTED_WORKER_PROTOCOLS.has(info.protocol) ? "match" : "mismatch";
+        if (status === "mismatch" && this.protocol.status !== "mismatch") console.error(`[loginHostProvider] login_host_protocol_mismatch worker=${info.protocol} backend=${PROTOCOL_VERSION} accepted=${[...ACCEPTED_WORKER_PROTOCOLS].join(",")}`);
         this.protocol = { status, worker: info.protocol, checkedAt: this.now() };
       } catch (e) {
         // An older worker answers EINVALID/route (or, before that change, ENOTFOUND) to a route it does not have; anything else is just "cannot tell yet".

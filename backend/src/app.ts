@@ -54,6 +54,7 @@ import gmailAuthRoutes from "./routes/gmailAuth";
 import outlookAuthRoutes from "./routes/outlookAuth";
 import calendlyAuthRoutes from "./routes/calendlyAuth";
 import lumaAuthRoutes from "./routes/lumaAuth";
+import smartleadAuthRoutes from "./routes/smartleadAuth";
 import googleDriveAuthRoutes from "./routes/googleDriveAuth";
 import twitterAuthRoutes from "./routes/twitterAuth";
 import metaAuthRoutes from "./routes/metaAuth";
@@ -88,7 +89,6 @@ import metaToolkitRoutes from "./routes/metaToolkit";
 import zomaRoutes from "./routes/zoma";
 import { createToolBridgeRouter } from "./routes/toolBridge";
 import { createLlmConnectionsRouter } from "./routes/llmConnections";
-import { createClaudeSubscriptionRouter } from "./routes/claudeSubscription";
 import { createHostedSubscriptionsRouter } from "./routes/hostedSubscriptions";
 import { toolBridgeMcp } from "./services/funding/toolBridgeService";
 import skillRoutes from "./routes/skillRoutes";
@@ -449,10 +449,9 @@ app.use("/api/admin", adminCustomSubscriptionLinksRoutes);
 app.use("/api/internal", internalUsageRoutes);
 // ENG-2109: MCP endpoint for claude -p sessions this backend spawned. Local-only; see routes/toolBridge.ts.
 app.use("/internal/tool-bridge", createToolBridgeRouter(toolBridgeMcp));
-// ENG-2110: connecting a Claude subscription (sign-in ceremony). Gated per user by the claudeSubscription flag.
-// Mounted before the generic router so its paths are never read as a connection id.
-app.use("/api/llm-connections/claude-subscription", createClaudeSubscriptionRouter());
-// ENG-2110 (1c): the same ceremony for a login that lives on the login host (dark: per-user flag, no host configured in prod).
+// ENG-2110 (1c): connecting a Claude subscription: the sign-in ceremony runs on the login host, so the backend never holds
+// the customer's token. Mounted before the generic router so its paths are never read as a connection id.
+// (The earlier backend-local ceremony, /claude-subscription/*, was removed: it sealed the token on the connection record.)
 app.use("/api/llm-connections/subscriptions/:provider", createHostedSubscriptionsRouter());
 // ENG-2105: a customer's own LLM provider keys (BYOK). Adding or re-validating a key
 // is gated by the eng1816_funding_flags row; listing and revoking always work.
@@ -532,6 +531,7 @@ app.use("/api/oauth/gmail", gmailAuthRoutes);
 app.use("/api/oauth/outlook", outlookAuthRoutes);
 app.use("/api/oauth/calendly", calendlyAuthRoutes);
 app.use("/api/oauth/luma", lumaAuthRoutes);
+app.use("/api/oauth/smartlead", smartleadAuthRoutes);
 app.use("/api/oauth/google-drive", googleDriveAuthRoutes);
 app.use("/api/oauth/twitter", twitterAuthRoutes);
 app.use("/api/oauth/meta", metaAuthRoutes);
