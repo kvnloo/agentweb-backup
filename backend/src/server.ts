@@ -441,7 +441,7 @@ const runDrain = async (reason: string): Promise<void> => {
   await import('./services/funding/claudeSubscriptionService')
     .then((m) => m.shutdownClaudeSubscriptionService())
     .catch(() => undefined);
-  // ENG-2110 1c: pending hosted sign-ins are cancelled on the login host (it also expires them itself).
+  // ENG-2110 1c: stops the hosted sign-in timers. Pending sign-ins are NOT cancelled on the login host: any instance can finish them, and the host expires abandoned ones itself.
   await import('./services/funding/hostedSubscriptionService')
     .then((m) => m.shutdownHostedSubscriptionService())
     .catch(() => undefined);

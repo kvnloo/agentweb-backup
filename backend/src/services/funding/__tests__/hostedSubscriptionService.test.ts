@@ -172,6 +172,16 @@ describe("hosted subscription service", () => {
       expect(await codeOf(svc.startLogin(user, "claude"))).toBe("resolved");
     });
 
+    it("a sign-in started by an instance that is then SHUT DOWN (a deploy's SIGTERM) can still be finished, and shutdown sent the host no cancel", async () => {
+      const started = await svc.startLogin(user, "claude");
+      sent.length = 0;
+      await svc.shutdown();
+      expect(sent.filter((x) => x.route === "login.cancel")).toHaveLength(0);
+      const view = await svc.completeLogin(user, started.loginId, GOOD); // the token is enough: the user pastes the code after the swap
+      expect(view.status).toBe("active");
+      expect(rig.mgr.status({ connectionId: view.connectionId })).toMatchObject({ state: "active", epoch: 1 });
+    });
+
     describe("a sign-in outlives the instance that started it (deploys, a second instance)", () => {
       // Dropping the in-memory map is what a replaced or different backend instance looks like to a `complete`.
       const otherInstance = () => (svc as unknown as { pending: Map<string, unknown> }).pending.clear();
@@ -331,7 +341,7 @@ describe("hosted subscription service", () => {
           expect(rig.mgr.status({ connectionId })).toMatchObject({ state: "active", epoch: 1 });
         });
 
-        it("a user's cancel (onlyIfPending) arriving after the code was taken leaves the ready login, which can still be promoted; a rollback cancel still discards it", async () => {
+        it("a user's cancel (onlyIfPending) arriving after the code was taken leaves the ready login, which can still be promoted", async () => {
           const started = await svc.startLogin(user, "claude");
           const { loginRef, connectionId } = await loginRefOf(started.loginId);
           await rawClient().loginComplete({ connectionId, loginRef, code: GOOD, completionNonce: "winner-nonce-0002" });

@@ -436,8 +436,13 @@ export class HostedSubscriptionService {
     await this.deps.client()?.loginCancel({ connectionId: pend.connectionId, loginRef: pend.loginRef, ...(this.workerHasProtocol3() ? { onlyIfPending: true } : {}) }).catch(() => undefined);
   }
 
+  /**
+   * Stops this instance's timers. It does NOT cancel the pending sign-ins on the host: a sign-in is no longer tied to the instance that started it (any instance can
+   * finish it from its token), and a deploy shuts the old instance down while the user is still on the sign-in page. The host expires an abandoned attempt itself.
+   */
   async shutdown(): Promise<void> {
-    for (const id of [...this.pending.keys()]) await this.expire(id);
+    for (const pend of this.pending.values()) clearTimeout(pend.timer);
+    this.pending.clear();
   }
 
   pendingCount(): number {
