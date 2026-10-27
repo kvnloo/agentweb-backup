@@ -34,17 +34,20 @@ describe("sign-in token", () => {
     for (const j of [undefined, null, 7, {}, "", "!!", "A".repeat(5000), "AAAA"]) expect(openSignInToken(j, 1, SECRET)).toBeUndefined();
   });
   it("accepts only the spelling it issued (lenient base64url aliases are refused)", () => {
-    const t = sealSignInToken(P, SECRET);
     const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let aliases = 0;
-    for (const ch of alphabet) {
-      const alt = t.slice(0, -1) + ch;
-      if (alt !== t && Buffer.from(alt, "base64url").equals(Buffer.from(t, "base64url"))) {
-        aliases++;
+    let checked = 0;
+    // A token has an alias spelling only when its byte length is not a multiple of 3, so try payloads until one does.
+    for (let n = 1; n <= 6; n++) {
+      const t = sealSignInToken({ ...P, loginRef: "r".repeat(n) }, SECRET);
+      const bytes = Buffer.from(t, "base64url");
+      for (const ch of alphabet) {
+        const alt = t.slice(0, -1) + ch;
+        if (alt === t || !Buffer.from(alt, "base64url").equals(bytes)) continue;
+        checked++;
         expect(openSignInToken(alt, 1, SECRET)).toBeUndefined();
+        expect(openSignInToken(t, 1, SECRET)).toBeDefined();
       }
     }
-    expect(aliases).toBeGreaterThanOrEqual(0);
-    expect(openSignInToken(t, 1, SECRET)).toBeDefined();
+    expect(checked).toBeGreaterThan(0);
   });
 });

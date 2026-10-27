@@ -205,14 +205,6 @@ describe("hosted subscription service", () => {
         expect(store.rows()).toHaveLength(1);
       });
 
-      it("a re-spelled token (same bytes, other base64url form) is refused, so it cannot bypass the double-submit guard", async () => {
-        const started = await svc.startLogin(user, "claude");
-        const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-        const alias = [...alphabet].map((c) => started.loginId.slice(0, -1) + c).find((t) => t !== started.loginId && Buffer.from(t, "base64url").equals(Buffer.from(started.loginId, "base64url")));
-        if (alias) expect(await codeOf(svc.completeLogin(user, alias, GOOD))).toBe("login_not_found");
-        expect((await svc.completeLogin(user, started.loginId, GOOD)).status).toBe("active");
-      });
-
       it("a cancel that arrives while a complete is in flight does not discard the host's login", async () => {
         const started = await svc.startLogin(user, "claude");
         otherInstance();
