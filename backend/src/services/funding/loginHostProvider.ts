@@ -284,7 +284,7 @@ export class LoginHostProvider {
       try {
         const info = await client.hostInfo();
         const status: ProtocolStatus = ACCEPTED_WORKER_PROTOCOLS.has(info.protocol) ? "match" : "mismatch";
-        if (status === "mismatch" && this.protocol.status !== "mismatch") console.error(`[loginHostProvider] login_host_protocol_mismatch worker=${info.protocol} backend=${PROTOCOL_VERSION}`);
+        if (status === "mismatch" && this.protocol.status !== "mismatch") console.error(`[loginHostProvider] login_host_protocol_mismatch worker=${info.protocol} backend=${PROTOCOL_VERSION} accepted=${[...ACCEPTED_WORKER_PROTOCOLS].join(",")}`);
         this.protocol = { status, worker: info.protocol, checkedAt: this.now() };
       } catch (e) {
         // An older worker answers EINVALID/route (or, before that change, ENOTFOUND) to a route it does not have; anything else is just "cannot tell yet".
