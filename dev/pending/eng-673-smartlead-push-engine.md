@@ -6,7 +6,7 @@ The worker loop of a push run: walks a CRM lead list and adds the eligible leads
 - Per batch: read the campaign and its sequence fresh (pause for a human if the campaign is gone, archived, started under a DRAFTED approval, or the sequence changed or became unreadable); build a batch from whole pages so the cursor is exactly the last lead examined; re-read the leads about to be sent with a consistent read (an opt-out recorded a moment ago is honoured); read the run strongly; POST; mark every lead (`system.smartlead_<campaignId>`) BEFORE the fenced cursor write; record the batch.
 - The markers, not the lock, stop a lead being pushed twice. After a crash the batch is rebuilt and resent; Smartlead answers per lead which already exist, so the run converges. After a resend `added` undercounts and `alreadyInCampaign` carries the leads (the total is right).
 - After a POST the leads are ALWAYS marked, even if the run was paused or the lease lost meanwhile: an unmarked lead would be invisible to the own-sender skip and the opt-out withdrawal. Only the cursor write is fenced. (Found by the real-store test.)
-- The approved count is a hard ceiling. A batch that fails (error, or an outcome we cannot know) does not move the cursor; three in a row make the run `partial`. A 401 or 403 pauses with `key_rejected`. A reply with no per-lead map pauses (nothing can be marked). A store error propagates: fail closed.
+- The approved count is a hard ceiling, and it counts leads THIS run already marked but never recorded (a crash, a lost lease, a failed batch): they are in Smartlead and the cursor has not passed them, so a rebuilt batch cannot fill the ceiling a second time. A batch that fails (error, or an outcome we cannot know) does not move the cursor; three in a row make the run `partial`. A 401 or 403 pauses with `key_rejected`. A reply with no per-lead map pauses (nothing can be marked). A store error propagates: fail closed.
 - `smartleadService.ts`: `getCampaign` and `getCampaignSequences`. Verified on a real account (2026-10-28): a campaign id that does not exist returns HTTP 200 with an EMPTY body (so `getCampaign` gives null), and its sequences return an `{error: ...}` object (so `getCampaignSequences` throws rather than reading it as an empty sequence).
 
 ### Tests
@@ -14,5 +14,11 @@ The worker loop of a push run: walks a CRM lead list and adds the eligible leads
 
 ### Known limits (for the next PRs)
 - Not in this PR: preview and the signed token, routes, the resumer cron, the kill switch, rate limits, audit (PR-C2); own-sender skip and the withdrawal sweep (PR-D, before the first real push); the portal (PR-E).
-- Emails seen so far are kept in memory per execution; after a resume a duplicate across the restart boundary is possible and Smartlead de-duplicates it.
-- Leads Smartlead did not account for are counted `unconfirmed` and left unmarked.
+- Each execution first reads the WHOLE list once (about 40 reads for 8,000 leads) to collect every opted-out email, so a second record with the same address is never emailed, on either side of the cursor or of a restart. A list over 100,000 leads pauses with `list_too_large`.
+- A lead Smartlead does not name in its per-lead answer is accepted only when Smartlead's own tallies explain it (block list, bounce, duplicate, import stopped...); otherwise it may be in the campaign without a marker, so the batch is retried and, after three tries, the run stops as `partial`. A lead listed under "existing in other campaigns" is marked only up to the number Smartlead says it added or already had.
+- Smartlead's account lead limit pauses the run WITHOUT moving the cursor, so a resume after the limit is raised rebuilds the batch, skips what is marked and sends the rest.
+- Just before each POST the whole eligibility check is run again on a consistent re-read of the leads (an opt-out, a bounce or an edited address recorded after the page read is honoured).
+
+### For PR-C2
+- `readLeads` must page the list with no filter, newest first, with the hand-built `{listId, leadId}` as `ExclusiveStartKey`; the engine treats an empty page as the end of the list.
+- The bound `addLeads` should use a small `maxRetries` (a POST that backs off for minutes outlives the 90 s lease; the markers make a second worker's resend safe, but it wastes the run).

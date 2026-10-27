@@ -23,6 +23,10 @@ export class FakeSmartlead {
   invalid = new Set<string>();
   omitMap = false;
   limitExhausted = false;
+  tallies: Partial<SmartleadAddLeadsResult["skippedBy"]> = {};
+  extraOther: Record<string, string> = {};
+  /** Emails Smartlead lists under "existing in other campaigns" but does NOT add (what `skipped_in_other_campaign_count` might mean). */
+  skipButListOther = new Set<string>();
   onPost?: () => void | Promise<void>;
   async addLeads(leads: SmartleadLeadInput[]): Promise<SmartleadAddLeadsResult> {
     const failure = this.failNext.shift();
@@ -31,7 +35,9 @@ export class FakeSmartlead {
     this.posts.push(leads.map(l => l.email));
     const newly: Record<string, string> = {}; const existing: Record<string, string> = {};
     let added = 0;
+    const listedOther: Record<string, string> = {};
     for (const l of leads) {
+      if (this.skipButListOther.has(l.email)) { listedOther[l.email] = "5000"; continue; }
       if (this.invalid.has(l.email)) continue;
       if (this.emails.has(l.email)) existing[l.email] = this.emails.get(l.email)!;
       else { const id = String(9000 + this.emails.size); this.emails.set(l.email, id); newly[l.email] = id; added++; }
@@ -39,9 +45,9 @@ export class FakeSmartlead {
     for (const e of this.dropFromMap) { delete newly[e]; delete existing[e]; }
     return {
       submitted: leads.length, added, alreadyInCampaign: Object.keys(existing).length, skipped: leads.length - added,
-      skippedBy: { invalidEmail: 0, alreadyInCampaign: 0, blockList: 0, duplicate: 0, inOtherCampaign: 0, unsubscribed: 0, bounced: 0, importStopped: 0 },
+      skippedBy: { invalidEmail: 0, alreadyInCampaign: 0, blockList: 0, duplicate: 0, inOtherCampaign: 0, unsubscribed: 0, bounced: 0, importStopped: 0, ...this.tallies },
       invalidEmails: [...this.invalid].filter(e => leads.some(l => l.email === e)), unsubscribedEmails: [], limitExhausted: this.limitExhausted,
-      ...(this.omitMap ? {} : { leads: { newlyAdded: newly, existingInCampaign: existing, existingInOtherCampaigns: {} } }),
+      ...(this.omitMap ? {} : { leads: { newlyAdded: newly, existingInCampaign: existing, existingInOtherCampaigns: { ...this.extraOther, ...listedOther } } }),
     } as SmartleadAddLeadsResult;
   }
 }
