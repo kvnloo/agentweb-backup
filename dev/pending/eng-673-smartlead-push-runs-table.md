@@ -16,6 +16,7 @@ The state store for the background Smartlead push (PR-C builds the engine on it)
 - Cancel releases the lock while a batch may still be in flight at Smartlead; the fence stops the cursor write, and the per-lead markers are what make a new run safe. The engine must treat markers as the truth.
 - History listings have no owner filter: routes must scope them by the caller.
 - GSIs use fixed partition values (`kind=RUN`, `active=Y/P`): fine at this volume, a hot-partition ceiling later.
+- The lock expires 15 days after its last claim or resume (heartbeats do not refresh it): a run that stays `running` for over 15 days could lose its lock. Runs are minutes to days; the engine caps run length.
 - Claim skew uses the caller's clock (`skewMs`, 30 s); the epoch fence limits the damage of a fast clock.
 
 ### How to extend
