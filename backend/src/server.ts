@@ -819,9 +819,10 @@ createTestAccount().then(async () => {
       // ENG-673: the Smartlead push resumer. Every minute it claims push runs whose worker is gone (a crash or a deploy) and cancels runs
       // left paused for a week. It does nothing unless SMARTLEAD_PUSH_ENABLED=true. In-flight work is drained at shutdown by the registry.
       try {
-        const { getSmartleadPushService, smartleadPushEnabled } = await import('./services/smartleadPushRuntime');
+        const { getSmartleadPushService } = await import('./services/smartleadPushRuntime');
         setInterval(() => {
-          if (!isCronEnabled() || !smartleadPushEnabled()) return;
+          // The tick itself does nothing but retry cancels of unsettled starts while the push is switched off.
+          if (!isCronEnabled()) return;
           cronJobRegistry.track('SmartleadPushResumer', getSmartleadPushService().resumerTick())
             .catch(e => console.error('[SmartleadPush] Resumer error:', e));
         }, 60 * 1000);

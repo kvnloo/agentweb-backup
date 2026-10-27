@@ -38,6 +38,7 @@ suite("executeRun on the real run store (ENG-673)", () => {
     const sl = new FakeSmartlead();
     const started = await db.startRun(input(900), "worker-A");
     if (!started.started) throw new Error("expected start");
+    await db.confirmStart(started.run.runId);
     await expect(executeRun(started.run, makeDeps(leads, sl, db))).resolves.toEqual({ outcome: "completed" });
     const run = (await db.getRun(started.run.runId))!;
     expect(run).toMatchObject({ status: "completed", listExhausted: true, cursor: { leadId: "lead_00900" } });
@@ -51,6 +52,7 @@ suite("executeRun on the real run store (ENG-673)", () => {
     const sl = new FakeSmartlead();
     const started = await db.startRun(input(900), "worker-A");
     if (!started.started) throw new Error("expected start");
+    await db.confirmStart(started.run.runId);
     // worker A "dies" right after the first batch is recorded: its next heartbeat throws
     const deps = makeDeps(leads, sl, db);
     let advances = 0;
@@ -75,6 +77,7 @@ suite("executeRun on the real run store (ENG-673)", () => {
     const sl = new FakeSmartlead();
     const started = await db.startRun(input(900), "worker-A");
     if (!started.started) throw new Error("expected start");
+    await db.confirmStart(started.run.runId);
     sl.onPost = async () => { clock += LEASE_MS + 31_000; await db.claimLease(started.run.runId, "worker-B", 1); }; // taken over during the first POST
     await new Promise<void>(resolve => { void executeRun(started.run, makeDeps(leads, sl, db)).then(o => { expect(o.outcome).toBe("lost"); resolve(); }); });
     expect(sl.posts.length).toBe(1);
@@ -87,6 +90,7 @@ suite("executeRun on the real run store (ENG-673)", () => {
     const sl = new FakeSmartlead();
     const started = await db.startRun(input(900), "worker-A");
     if (!started.started) throw new Error("expected start");
+    await db.confirmStart(started.run.runId);
     sl.onPost = async () => { if (sl.posts.length === 0) await db.pauseRun(started.run.runId, "user"); };
     const out = await executeRun(started.run, makeDeps(leads, sl, db));
     expect(out.outcome).toBe("lost");
