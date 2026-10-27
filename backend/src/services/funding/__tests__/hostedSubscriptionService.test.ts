@@ -147,6 +147,71 @@ describe("hosted subscription service", () => {
       expect(rig.mgr.status({ connectionId: "conn-1" }).state).toBe("active");
     });
 
+    describe("a sign-in outlives the instance that started it (deploys, a second instance)", () => {
+      // Dropping the in-memory map is what a replaced or different backend instance looks like to a `complete`.
+      const otherInstance = () => (svc as unknown as { pending: Map<string, unknown> }).pending.clear();
+      // The test host runs on a manual clock; the backend's clock must agree with it for expiry to mean anything.
+      beforeEach(() => {
+        nowMs = rig.clock.nowMs();
+      });
+
+      it("completes on an instance that never saw the start", async () => {
+        const started = await svc.startLogin(user, "claude");
+        otherInstance();
+        const view = await svc.completeLogin(user, started.loginId, GOOD);
+        expect(view.status).toBe("active");
+        expect(rig.mgr.status({ connectionId: view.connectionId })).toMatchObject({ state: "active", epoch: 1 });
+      });
+
+      it("a reconnect started before the swap finishes after it", async () => {
+        const view = await connect();
+        const started = await svc.startLogin(user, "claude", { reconnectConnectionId: view.connectionId });
+        otherInstance();
+        await svc.completeLogin(user, started.loginId, GOOD);
+        expect(rig.mgr.status({ connectionId: view.connectionId })).toMatchObject({ state: "active", epoch: 2 });
+        expect((await store.db.get(view.connectionId))!.subHostEpoch).toBe(2);
+      });
+
+      it("the token is opaque: it does not show the host's login reference or the connection id", async () => {
+        const started = await svc.startLogin(user, "claude");
+        const text = Buffer.from(started.loginId, "base64url").toString("utf8");
+        expect(text).not.toContain("conn-1");
+        expect(started.loginId).toMatch(/^[A-Za-z0-9_-]+$/);
+      });
+
+      it("a tampered, truncated, foreign or expired token is login_not_found and reaches no host", async () => {
+        const started = await svc.startLogin(user, "claude");
+        otherInstance();
+        const flipped = started.loginId.slice(0, 20) + (started.loginId[20] === "A" ? "B" : "A") + started.loginId.slice(21);
+        for (const bad of [flipped, started.loginId.slice(0, -4), "", "x".repeat(2000), "not a token!", 12345 as never]) {
+          expect(await codeOf(svc.completeLogin(user, bad, GOOD))).toBe("login_not_found");
+        }
+        expect(await codeOf(svc.completeLogin({ userId: "user-2" }, started.loginId, GOOD))).toBe("login_not_found");
+        nowMs += 11 * 60 * 1000;
+        expect(await codeOf(svc.completeLogin(user, started.loginId, GOOD))).toBe("login_not_found");
+        expect(store.rows()).toHaveLength(0);
+      });
+
+      it("a used token cannot be replayed, on this instance or another", async () => {
+        const started = await svc.startLogin(user, "claude");
+        await svc.completeLogin(user, started.loginId, GOOD);
+        expect(await codeOf(svc.completeLogin(user, started.loginId, GOOD))).toBe("login_not_found");
+        otherInstance();
+        expect(await codeOf(svc.completeLogin(user, started.loginId, GOOD))).toBe("login_not_found");
+        expect(store.rows()).toHaveLength(1);
+      });
+
+      it("cancel works from another instance and ends the host attempt", async () => {
+        const started = await svc.startLogin(user, "claude");
+        otherInstance();
+        await svc.cancelLogin({ userId: "user-2" }, started.loginId); // someone else's: nothing happens
+        expect(rig.script.loginsCancelled).toBe(0);
+        await svc.cancelLogin(user, started.loginId);
+        expect(rig.script.loginsCancelled).toBe(1);
+        expect(await codeOf(svc.completeLogin(user, started.loginId, GOOD))).toBe("login_not_found");
+      });
+    });
+
     it("a promote whose reply was lost but which landed is a success, not a second sign-in", async () => {
       promoteLoses = true;
       const view = await connect();

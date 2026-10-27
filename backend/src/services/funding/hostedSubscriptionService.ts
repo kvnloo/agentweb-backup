@@ -13,7 +13,7 @@
  *  - Disconnect never says "revoked" before the host does: the record goes `revoking` (slot released, fenced at epoch+1) and becomes
  *    `revoked` only when the host confirms the wipe (or has never heard of the connection). Until then the sweeper retries.
  */
-import { randomBytes, randomUUID } from "crypto";
+import { randomUUID } from "crypto";
 import { ZodError } from "zod";
 import { isClaudeSubscriptionEnabledFor } from "./fundingFlags";
 import type { LlmConnectionKind } from "./llmConnection";
@@ -22,6 +22,7 @@ import { MAX_ACTIVE_CONNECTIONS_PER_OWNER, toView, type Actor, type LlmConnectio
 import type { LoginReady } from "../../loginHost/connectionManager";
 import { LoginHostClient, LoginHostError, UnixSocketTransport } from "./loginHostClient";
 import { getLoginHostProvider } from "./loginHostProvider";
+import { openSignInToken, sealSignInToken } from "./hostedSignInToken";
 
 export type HostedErrorCode =
   | "disabled" | "forbidden" | "not_found" | "unsupported_provider" | "login_not_found" | "too_many_logins" | "bad_code_format"
@@ -93,7 +94,8 @@ interface Pending {
   connectionId: string;
   loginRef: string;
   reconnect: boolean;
-  timer: NodeJS.Timeout;
+  /** Unset for a sign-in rebuilt from its token (it is held by no timer on this instance). */
+  timer?: NodeJS.Timeout;
   expiresAtMs: number;
 }
 
@@ -111,6 +113,8 @@ export interface SweepResult {
 export class HostedSubscriptionService {
   private readonly pending = new Map<string, Pending>();
   private readonly starting = new Set<string>();
+  /** Sign-ins being completed by THIS instance: a double-submitted complete must not send the single-use code twice (the host also refuses it). */
+  private readonly completing = new Set<string>();
   private readonly providers: Record<string, HostedProvider>;
   private sweeping: Promise<SweepResult> | undefined;
 
@@ -175,8 +179,9 @@ export class HostedSubscriptionService {
       } catch (err) {
         throw this.startError(err);
       }
-      const loginId = randomBytes(16).toString("hex");
       const expiresAtMs = Math.min(started.expiresAtMs, this.deps.now() + LOGIN_TTL_MS);
+      // Sealed so that ANY backend instance can finish this sign-in (a deploy replaces the instance that started it).
+      const loginId = sealSignInToken({ userId: actor.userId, provider: p.route, connectionId, loginRef: started.loginRef, reconnect: !!input.reconnectConnectionId, expiresAtMs });
       const timer = setTimeout(() => void this.expire(loginId), Math.max(1_000, expiresAtMs - this.deps.now()));
       timer.unref?.();
       this.pending.set(loginId, { userId: actor.userId, provider: p, connectionId, loginRef: started.loginRef, reconnect: !!input.reconnectConnectionId, timer, expiresAtMs });
@@ -198,12 +203,33 @@ export class HostedSubscriptionService {
 
   async completeLogin(actor: Actor, loginId: string, code: unknown): Promise<LlmConnectionView> {
     if (actor.adminId) throw new HostedSubscriptionError("forbidden");
-    const pending = typeof loginId === "string" ? this.pending.get(loginId) : undefined;
+    const pending = this.lookup(loginId);
     // Same answer for unknown, expired and someone else's: a wrong caller never cancels the real login.
     if (!pending || pending.userId !== actor.userId) throw new HostedSubscriptionError("login_not_found");
     // Taken BEFORE any await: a double-submitted complete must not send the single-use code to the host twice.
+    if (this.completing.has(loginId)) throw new HostedSubscriptionError("login_not_found");
+    this.completing.add(loginId);
     this.pending.delete(loginId);
     clearTimeout(pending.timer);
+    try {
+      return await this.completeTaken(actor, loginId, pending, code);
+    } finally {
+      this.completing.delete(loginId);
+    }
+  }
+
+  /** This instance's pending sign-in, or (started by another instance or before a deploy) the one the token describes. */
+  private lookup(loginId: unknown): Pending | undefined {
+    if (typeof loginId !== "string") return undefined;
+    const local = this.pending.get(loginId);
+    if (local) return local;
+    const t = openSignInToken(loginId, this.deps.now());
+    const provider = t && Object.prototype.hasOwnProperty.call(this.providers, t.provider) ? this.providers[t.provider] : undefined;
+    if (!t || !provider) return undefined;
+    return { userId: t.userId, provider, connectionId: t.connectionId, loginRef: t.loginRef, reconnect: t.reconnect, expiresAtMs: t.expiresAtMs };
+  }
+
+  private async completeTaken(actor: Actor, loginId: string, pending: Pending, code: unknown): Promise<LlmConnectionView> {
     const { connectionId, loginRef, provider: p } = pending;
     if (!(await p.isEnabledFor(actor.userId))) {
       this.restore(loginId, pending);
@@ -354,8 +380,9 @@ export class HostedSubscriptionService {
   }
 
   async cancelLogin(actor: Actor, loginId: string): Promise<void> {
-    const pending = this.pending.get(loginId);
+    const pending = this.lookup(loginId);
     if (!pending || pending.userId !== actor.userId) return; // nothing to say about someone else's
+    this.pending.set(loginId, pending);
     await this.expire(loginId);
   }
 
