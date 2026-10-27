@@ -86,3 +86,17 @@ describe('verifyMetaAdAccountReadBack', () => {
     await expect(verifyMetaAdAccountReadBack('123', 't')).resolves.toEqual({ ok: false, error: '(#200) no permission' });
   });
 });
+
+
+describe('raiseMetaConnectionHandoff — stale expiry suppression', () => {
+  it('does not re-alert for a token expired more than 48h ago (survives restarts)', async () => {
+    const now = Date.UTC(2026, 9, 27);
+    const { raiseMetaConnectionHandoff } = require('../services/metaConnectionHandoff');
+    const sent = await raiseMetaConnectionHandoff({
+      reason: 'refresh_failed', userId: 'u-stale', now,
+      account: { account_id: 'act_stale', account_name: 'Stale', config: { token_expires_at: now - 3 * 24 * 3600 * 1000 } },
+      error: 'Error validating access token: Session has expired',
+    });
+    expect(sent).toBe(false);
+  });
+});

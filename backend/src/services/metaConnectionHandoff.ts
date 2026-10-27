@@ -21,6 +21,15 @@ import { TOKEN_ALERT_CLASS } from './metaTrackingMonitor';
 /** At most one handoff per account per day; the cron runs every 12h. */
 export const META_HANDOFF_DEDUPE_WINDOW_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * A token that has been expired longer than this is old news: the customer-reconnect
+ * handoff already fired on the first sweeps after expiry. The dedupe in
+ * sendAgentModeOncallAlert is in-memory, so every deploy/restart re-fired one email per
+ * long-dead account (dozens per thread). Gate on the token's own expiry clock instead,
+ * which survives restarts.
+ */
+export const META_HANDOFF_STALE_EXPIRY_MS = 48 * 60 * 60 * 1000;
+
 export type HandoffActor = 'Customer' | 'CS' | 'Engineering';
 
 export type MetaHandoffReason = 'refresh_failed' | 'reconnect_readback_failed';
@@ -90,6 +99,16 @@ export function metaAccountAlertContext(accountId: string): Record<string, strin
 /** Raise the handoff. Returns true only when an alert was actually delivered. Never throws. */
 export async function raiseMetaConnectionHandoff(input: MetaHandoffInput): Promise<boolean> {
   const decision = decideMetaHandoff(input);
+  const expiredAt = (input.account.config as any)?.token_expires_at as number | undefined;
+  if (
+    input.reason === 'refresh_failed' &&
+    decision.nextActor === 'Customer' &&
+    typeof expiredAt === 'number' &&
+    (input.now ?? Date.now()) - expiredAt > META_HANDOFF_STALE_EXPIRY_MS
+  ) {
+    // Already handed off when it first expired; nothing new to tell oncall.
+    return false;
+  }
   const who = input.customerEmail || input.userId;
   const accountLabel = `${input.account.account_name || 'Meta ad account'} (${input.account.account_id})`;
   const expiresAt = (input.account.config as any)?.token_expires_at as number | undefined;
