@@ -55,6 +55,8 @@ export interface EngineDeps {
     getCampaign(): Promise<SmartleadCampaignDetail | null>;
     getSequences(): Promise<unknown[]>;
   };
+  /** The operator's kill switch: checked before every batch; a true answer pauses the run (`disabled_by_operator`), it can be resumed later. */
+  isDisabled?(): boolean;
   /** Told about a failed Smartlead call, so the caller can flag a rejected key (reportSmartleadFailure). Must not throw. */
   onSmartleadError?(error: unknown): void;
   sleep(ms: number): Promise<void>;
@@ -164,6 +166,7 @@ export async function executeRun(run: PushRun, deps: EngineDeps): Promise<RunOut
 
     for (;;) {
       await beat();
+      if (deps.isDisabled?.()) return await pause("disabled_by_operator");
 
       // The approved count is a hard ceiling: a lead that became eligible after the preview can never widen the approved set.
       if (run.previewEligible - (added + already) <= 0 || run.listExhausted) {
