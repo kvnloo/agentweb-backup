@@ -102,5 +102,8 @@ describe('ENG-2687 identity stitching visitorId -> account_id', () => {
     const s1Owner = resolvePersons(rows).find((p) => p.sessionIds.includes('s1'));
     expect(s1Owner?.accountId).toBe('b');
     expect(resolvePersons([...rows].reverse()).find((p) => p.sessionIds.includes('s1'))?.accountId).toBe('b');
+    const people = resolvePersons(rows);
+    expect(people.find((p) => p.accountId === 'a')?.visitorIds).toEqual([]);
+    expect(people.find((p) => p.accountId === 'b')?.visitorIds).toEqual([VID]);
   });
 });

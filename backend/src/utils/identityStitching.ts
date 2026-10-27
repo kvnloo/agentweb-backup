@@ -57,7 +57,9 @@ export function resolvePersons(rows: SessionRowLike[]): PersonView[] {
       p = { personId, ...(acct ? { accountId: acct } : {}), visitorIds: [], sessionIds: [] };
       people.set(personId, p);
     }
-    if (vid && !p.visitorIds.includes(vid)) p.visitorIds.push(vid);
+    // A visitor shared across accounts belongs only to the view its latest link selects.
+    const ownsVid = !!vid && (!str(f.accountId) || map.get(vid) === acct);
+    if (ownsVid && !p.visitorIds.includes(vid)) p.visitorIds.push(vid);
     const sid = str(f.sessionId);
     if (sid && !p.sessionIds.includes(sid)) p.sessionIds.push(sid);
   }
