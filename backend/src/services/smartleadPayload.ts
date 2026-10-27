@@ -29,6 +29,11 @@ export function readLeadValue(lead: Lead, path: string): unknown {
   return lead[path];
 }
 
+const own = (obj: object, key: string): boolean => Object.prototype.hasOwnProperty.call(obj, key);
+/** Tag names that would hit the object prototype (`{{constructor}}`, `{{__proto__}}`): never standard, never mapped. */
+const FORBIDDEN_TAGS = new Set(["__proto__", "constructor", "prototype"]);
+const usable = (tag: string): boolean => !FORBIDDEN_TAGS.has(tag);
+
 const norm = (tag: string): string => tag.toLowerCase().replace(/[\s-]+/g, "_");
 
 export interface TagClassification {
@@ -44,8 +49,8 @@ export function classifyTags(tags: string[], mapping: TagMapping, acknowledged: 
   const out: TagClassification = { standard: [], mapped: [], nearMiss: [], unknown: [] };
   const known = [...Object.keys(STANDARD_TAG_SOURCES), ...Object.keys(mapping)];
   for (const tag of tags) {
-    if (tag in STANDARD_TAG_SOURCES) out.standard.push(tag);
-    else if (tag in mapping) out.mapped.push(tag);
+    if (usable(tag) && own(STANDARD_TAG_SOURCES, tag)) out.standard.push(tag);
+    else if (usable(tag) && own(mapping, tag)) out.mapped.push(tag);
     else if (acknowledged.includes(tag)) continue;
     else {
       const meant = known.find(k => norm(k) === norm(tag));
@@ -124,8 +129,9 @@ export function buildLeadPayload(lead: Lead, opts: { tagsUsed: string[]; mapping
   for (const tag of opts.tagsUsed) {
     if (opts.acknowledgedTags?.includes(tag)) continue;
     let result: SanitizeResult | undefined;
-    if (tag in STANDARD_TAG_SOURCES) result = values[tag];
-    else if (tag in opts.mapping) {
+    if (!usable(tag)) continue;
+    if (own(STANDARD_TAG_SOURCES, tag)) result = values[tag];
+    else if (own(opts.mapping, tag)) {
       result = sanitizeValue(readLeadValue(lead, opts.mapping[tag]));
       if (result.ok && result.value !== "") custom[tag] = result.value;
     } else continue; // unknown or near-miss tags are blocked once for the whole run, not per lead
