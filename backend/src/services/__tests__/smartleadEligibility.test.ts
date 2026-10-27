@@ -9,7 +9,8 @@ const lead = (id: string, over: Record<string, any> = {}) => ({
   leadId: id, email: `${id}@example.com`, firstName: "Ann", company: "Acme", createdAt: "2026-01-01T00:00:00.000Z",
   customFields: { email_validation: { status: "deliverable" } }, ...over,
 });
-const ctx = (over: Record<string, any> = {}) => ({ campaignId: 77, tags: ["first_name", "company_name"], mapping: {}, ...over });
+// runStartedAt is required; this default is later than every lead the tests create, so the created-after-start rule stays out of the way.
+const ctx = (over: Record<string, any> = {}) => ({ campaignId: 77, tags: ["first_name", "company_name"], mapping: {}, runStartedAt: "2030-01-01T00:00:00Z", ...over });
 
 describe("selectSmartleadLeads (ENG-673)", () => {
   it("keeps a good lead and builds its payload", () => {
@@ -98,6 +99,15 @@ describe("selectSmartleadLeads (ENG-673)", () => {
       expect(selectSmartleadLeads([lead("a", { createdAt })], ctx({ runStartedAt: started })).skipped[0]?.reason).toBe("created_after_start");
     }
     expect(selectSmartleadLeads([lead("a", { createdAt: Date.parse("2026-05-01T00:00:00Z") })], ctx({ runStartedAt: started })).eligible).toHaveLength(1);
+  });
+
+  it("reads a numeric createdAt in seconds as seconds, and refuses text that is not an ISO date instead of guessing", () => {
+    const started = "2026-06-01T00:00:00Z";
+    const sec = (iso: string) => Date.parse(iso) / 1000;
+    const reason = (createdAt: unknown) => selectSmartleadLeads([lead("a", { createdAt })], ctx({ runStartedAt: started })).skipped[0]?.reason;
+    expect(reason(sec("2026-05-01T00:00:00Z"))).toBeUndefined(); // seconds, before the start: an old lead
+    expect(reason(sec("2026-07-01T00:00:00Z"))).toBe("created_after_start"); // seconds, after the start
+    for (const odd of ["June 2, 2026", "06/02/2026", "tomorrow", "2026"]) expect(reason(odd)).toBe("unknown_creation_time");
   });
 
   it("allows a lead with no createdAt (an old lead), but fails closed on one whose createdAt cannot be read", () => {

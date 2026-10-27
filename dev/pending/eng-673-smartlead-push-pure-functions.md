@@ -18,3 +18,9 @@ Review fixes (independent review, same day):
 - An opted-out address stops every record with that address in the batch and in later batches of the run.
 - A missing or odd campaign status is refused instead of throwing; a non-string mapping value or a `__proto__` path reads as blank; the hash now includes follow-up delays; `[null]` is an unreadable sequence.
 
+Second review fixes:
+- The spintax pattern was quadratic too (`{` followed by 100,000 `|` took 3.5 seconds): replaced by a linear scan (`smartleadText.ts`, 4 ms for a million characters). `sanitizeValue` refuses an enormous raw value before running anything on it. A sequence over 200 steps counts as unreadable; tag de-duplication uses a set.
+- The lead's email is checked like any other value: no quotes, angle brackets, braces or backslashes (it goes into the customer's HTML as `{{email}}`), at most 254 characters.
+- `runStartedAt` is a required input of the eligibility function (without it nothing would stop an unapproved lead). A numeric `createdAt` below 1e11 is read as epoch seconds; a text `createdAt` must look like an ISO date or the lead is skipped.
+- Acknowledging a near-miss tag (`{{First_Name}}`) no longer clears it: it still blocks.
+

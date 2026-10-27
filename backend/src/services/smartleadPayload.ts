@@ -1,5 +1,6 @@
 import { createHash } from "crypto";
 import type { SmartleadLeadInput } from "./smartleadService";
+import { containsSpintax } from "./smartleadText";
 
 /**
  * Builds what AgentWeb sends to Smartlead for one lead (ENG-673). The customer writes the email in Smartlead (Harsha,
@@ -56,11 +57,11 @@ export function classifyTags(tags: string[], mapping: TagMapping, acknowledged: 
   for (const tag of tags) {
     if (usable(tag) && own(STANDARD_TAG_SOURCES, tag)) out.standard.push(tag);
     else if (usable(tag) && own(mapping, tag)) out.mapped.push(tag);
-    else if (acknowledged.includes(tag)) continue;
     else {
+      // A near-miss is a typo of a tag we supply, so acknowledging it ("Smartlead supplies this") is never right: it still blocks.
       const meant = known.find(k => norm(k) === norm(tag));
       if (meant) out.nearMiss.push({ tag, meant });
-      else out.unknown.push(tag);
+      else if (!acknowledged.includes(tag)) out.unknown.push(tag);
     }
   }
   return out;
@@ -68,6 +69,8 @@ export function classifyTags(tags: string[], mapping: TagMapping, acknowledged: 
 
 /** Longest value we send for one field; real names, companies and locations are far shorter. Refused, never truncated. */
 export const MAX_VALUE_CHARS = 500;
+/** Checked on the RAW text before anything else runs on it, so one enormous scraped value costs nothing. */
+const MAX_RAW_CHARS = MAX_VALUE_CHARS * 4;
 
 export type SanitizeResult = { ok: true; value: string } | { ok: false; reason: "template_syntax" | "unsafe_text" };
 
@@ -84,17 +87,21 @@ export function sanitizeValue(raw: unknown): SanitizeResult {
   if (typeof raw === "string") text = raw;
   else if (typeof raw === "number" && Number.isFinite(raw)) text = String(raw);
   else return { ok: true, value: "" }; // null, undefined, NaN, booleans, objects and arrays carry no usable text
+  if (text.length > MAX_RAW_CHARS) return { ok: false, reason: "unsafe_text" };
   const value = text
     .replace(/[\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/g, "")
     .replace(/[\u0000-\u001f\u007f\u0085\u2028\u2029]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
-  if (value.includes("{{") || value.includes("}}") || /\{[^{}]*\|[^{}]*\}/.test(value)) return { ok: false, reason: "template_syntax" };
+  if (value.includes("{{") || value.includes("}}") || containsSpintax(value)) return { ok: false, reason: "template_syntax" };
   if (/[<>]/.test(value) || value.length > MAX_VALUE_CHARS) return { ok: false, reason: "unsafe_text" };
   return { ok: true, value };
 }
 
-const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+// No quotes, angle brackets, braces or backslashes: `{{email}}` is put into the customer's HTML email, and a value such as
+// `a<b>@x.com` or `x{{y}}@z.com` must not reach it. Real addresses do not need them.
+const EMAIL = /^[^\s@<>{}"'\\]+@[^\s@<>{}"'\\]+\.[^\s@<>{}"'\\]{2,}$/;
+const MAX_EMAIL_CHARS = 254;
 
 export type PayloadResult =
   | { ok: true; input: SmartleadLeadInput; payloadHash: string }
@@ -117,7 +124,7 @@ function canonical(value: unknown): string {
 export function buildLeadPayload(lead: Lead, opts: { tagsUsed: string[]; mapping: TagMapping }): PayloadResult {
   const rawEmail = typeof lead.email === "string" ? lead.email.trim().toLowerCase() : "";
   if (!rawEmail) return { ok: false, reason: "no_email" };
-  if (!EMAIL.test(rawEmail)) return { ok: false, reason: "invalid_email" };
+  if (rawEmail.length > MAX_EMAIL_CHARS || !EMAIL.test(rawEmail)) return { ok: false, reason: "invalid_email" };
 
   const values: Record<string, SanitizeResult> = {};
   for (const [tag, paths] of Object.entries(STANDARD_TAG_SOURCES)) {

@@ -16,6 +16,11 @@ describe("sanitizeValue (ENG-673)", () => {
   it("removes zero-width and bidirectional-override characters and unicode line separators", () => {
     expect(sanitizeValue("Ann\u202e\u200bLee\u2028x\ufeff")).toEqual({ ok: true, value: "AnnLee x" });
   });
+  it("does not run any pattern on an enormous raw value: it is refused first, in milliseconds", () => {
+    const started = Date.now();
+    expect(sanitizeValue("{" + "|".repeat(1_000_000))).toEqual({ ok: false, reason: "unsafe_text" });
+    expect(Date.now() - started).toBeLessThan(500);
+  });
   it("refuses a value longer than the cap rather than truncating it", () => {
     expect(sanitizeValue("x".repeat(500))).toMatchObject({ ok: true });
     expect(sanitizeValue("x".repeat(501))).toEqual({ ok: false, reason: "unsafe_text" });
@@ -36,6 +41,14 @@ describe("classifyTags", () => {
     expect(c.mapped).toEqual(["industry"]);
     expect(c.nearMiss).toEqual([{ tag: "First_Name", meant: "first_name" }, { tag: "company name", meant: "company_name" }]);
     expect(c.unknown).toEqual(["signature"]);
+  });
+});
+
+describe("classifyTags and acknowledgement", () => {
+  it("acknowledging a near-miss tag does not clear it: it is a typo of a tag we supply, so it still blocks", () => {
+    const c = classifyTags(["First_Name", "signature"], {}, ["First_Name", "signature"]);
+    expect(c.nearMiss).toEqual([{ tag: "First_Name", meant: "first_name" }]);
+    expect(c.unknown).toEqual([]);
   });
 });
 
@@ -111,6 +124,14 @@ describe("buildLeadPayload", () => {
     expect(buildLeadPayload(lead(), { tagsUsed: ["x"], mapping: { x: "__proto__" } })).toEqual({ ok: false, reason: "missing_tag", tag: "x" });
     expect(buildLeadPayload(lead(), { tagsUsed: ["x"], mapping: { x: "customFields.constructor" } })).toEqual({ ok: false, reason: "missing_tag", tag: "x" });
     expect(buildLeadPayload(lead(), { tagsUsed: ["x"], mapping: { x: "toString" } })).toEqual({ ok: false, reason: "missing_tag", tag: "x" });
+  });
+
+  it("refuses an email carrying markup, braces, quotes or a backslash, which would reach the customer's HTML as {{email}}", () => {
+    for (const email of ["a<b>@x.com", "x{{y}}@z.com", 'a"b@x.com', "a'b@x.com", "a\\b@x.com", "a@x>.com"]) {
+      expect(buildLeadPayload(lead({ email }), { tagsUsed: [], mapping: {} })).toEqual({ ok: false, reason: "invalid_email" });
+    }
+    expect(buildLeadPayload(lead({ email: "a".repeat(250) + "@x.com" }), { tagsUsed: [], mapping: {} })).toEqual({ ok: false, reason: "invalid_email" });
+    expect(buildLeadPayload(lead({ email: "first.last+tag@sub.example.co.uk" }), { tagsUsed: [], mapping: {} }).ok).toBe(true);
   });
 
   it("refuses a missing or malformed email", () => {

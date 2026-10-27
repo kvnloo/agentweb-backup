@@ -1,4 +1,5 @@
 import { createHash } from "crypto";
+import { containsSpintax } from "./smartleadText";
 
 /**
  * Reads a Smartlead campaign's sequence (`GET /campaigns/{id}/sequences`) for the push (ENG-673). The customer writes the
@@ -30,9 +31,9 @@ const isRow = (value: unknown): value is Row => !!value && typeof value === "obj
 // No lazy quantifier and no nested whitespace match: `{{` followed by thousands of spaces and no `}}` froze the old pattern for
 // seconds (measured: 23 s at 6,000 spaces). The capture is trimmed in code instead.
 const TAG = /\{\{([^{}]*)\}\}/g;
-/** A longer text is not a real email; it is treated as an unreadable sequence rather than scanned. */
+/** A longer text, or a longer sequence, is not a real email; it is treated as an unreadable sequence rather than scanned. */
 const MAX_TEXT_CHARS = 200_000;
-const SPINTAX = /\{[^{}]*\|[^{}]*\}/;
+const MAX_STEPS = 200;
 
 /** A list reply is a bare array (seen live) or wrapped in `data` or `sequences` (the docs' variants). */
 function rowsOf(reply: unknown): Row[] | undefined {
@@ -67,23 +68,23 @@ export function analyseSequence(reply: unknown): SequenceAnalysis {
     for (const v of step.variants) texts.push(v.subject, v.body, v.optional);
   }
 
-  if (texts.some(t => t.length > MAX_TEXT_CHARS)) return { readable: false, stepCount: 0, hasContent: false, tags: [], usesSpintax: false, hash: "" };
+  if (steps.length > MAX_STEPS || texts.some(t => t.length > MAX_TEXT_CHARS)) return { readable: false, stepCount: 0, hasContent: false, tags: [], usesSpintax: false, hash: "" };
 
-  const tags: string[] = [];
+  const tags = new Set<string>();
   let usesSpintax = false;
   for (const t of texts) {
     for (const match of t.matchAll(TAG)) {
       const tag = match[1].trim();
-      if (tag && !tags.includes(tag)) tags.push(tag);
+      if (tag) tags.add(tag);
     }
-    if (SPINTAX.test(t.replace(TAG, ""))) usesSpintax = true;
+    if (!usesSpintax && containsSpintax(t.replace(TAG, ""))) usesSpintax = true;
   }
 
   return {
     readable: true,
     stepCount: steps.length,
     hasContent: texts.some(t => t !== ""),
-    tags,
+    tags: [...tags],
     usesSpintax,
     hash: createHash("sha256").update(JSON.stringify(steps)).digest("hex"),
   };
