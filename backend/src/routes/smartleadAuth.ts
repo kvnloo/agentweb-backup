@@ -1,7 +1,7 @@
 import express from 'express';
 import rateLimit from 'express-rate-limit';
 import { authenticateToken } from '../middleware/auth';
-import { createAccount, SmartleadConfig } from '../services/connectedAccountsDb';
+import { createAccount, deleteAccountById, getAccountsByUserId, SmartleadConfig } from '../services/connectedAccountsDb';
 import { listEmailAccounts, scrubSmartleadSecrets, SmartleadApiError } from '../services/smartleadService';
 import { redactAccountSecrets } from '../utils/accountSecretRedaction';
 import { encryptPassword } from '../utils/crypto';
@@ -10,7 +10,8 @@ import { NON_EXPIRING_TOKEN_TIMESTAMP } from '../utils/tokenUtils';
 const router = express.Router();
 
 // Smartlead has no "who am I" call to key a connection on, so a user has one: reconnecting replaces the key.
-const SMARTLEAD_ACCOUNT_ID = 'smartlead';
+// The id carries the user so two org members' shared keys do not collide in the org account listing.
+const smartleadAccountId = (userId: string) => `smartlead-${userId}`;
 
 // /connect makes an outbound call with a user-supplied key, so without a limit it is a free Smartlead-key validator.
 const connectLimiter = rateLimit({
@@ -62,8 +63,12 @@ router.post('/connect', authenticateToken, connectLimiter, async (req: any, res)
       token_expires_at: NON_EXPIRING_TOKEN_TIMESTAMP,
       mailbox_count: mailboxCount,
     };
+    const accountId = smartleadAccountId(userId);
+    // createAccount keeps sharedWithOrg on reconnect; a replaced key is a different credential, so it must be re-shared on purpose.
+    const existing = (await getAccountsByUserId(userId)).find(a => a.platform === 'smartlead' && a.account_id === accountId);
+    if (existing?.sharedWithOrg) await deleteAccountById(userId, 'smartlead', accountId);
     const account = await createAccount(userId, 'smartlead', {
-      account_id: SMARTLEAD_ACCOUNT_ID,
+      account_id: accountId,
       account_name: 'Smartlead',
       config,
     });
