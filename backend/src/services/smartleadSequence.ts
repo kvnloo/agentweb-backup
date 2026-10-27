@@ -27,13 +27,19 @@ type Row = Record<string, unknown>;
 const text = (value: unknown): string => (typeof value === "string" ? value.replace(/\r\n/g, "\n").trim() : "");
 const isRow = (value: unknown): value is Row => !!value && typeof value === "object" && !Array.isArray(value);
 
-const TAG = /\{\{\s*([^{}]*?)\s*\}\}/g;
+// No lazy quantifier and no nested whitespace match: `{{` followed by thousands of spaces and no `}}` froze the old pattern for
+// seconds (measured: 23 s at 6,000 spaces). The capture is trimmed in code instead.
+const TAG = /\{\{([^{}]*)\}\}/g;
+/** A longer text is not a real email; it is treated as an unreadable sequence rather than scanned. */
+const MAX_TEXT_CHARS = 200_000;
 const SPINTAX = /\{[^{}]*\|[^{}]*\}/;
 
 /** A list reply is a bare array (seen live) or wrapped in `data` or `sequences` (the docs' variants). */
 function rowsOf(reply: unknown): Row[] | undefined {
   const list = Array.isArray(reply) ? reply : isRow(reply) ? (Array.isArray(reply.data) ? reply.data : Array.isArray(reply.sequences) ? reply.sequences : undefined) : undefined;
-  return list ? list.filter(isRow) : undefined;
+  if (!list) return undefined;
+  const rows = list.filter(isRow);
+  return list.length > 0 && rows.length === 0 ? undefined : rows; // [null] or [5] is not a list of steps
 }
 
 export function analyseSequence(reply: unknown): SequenceAnalysis {
@@ -43,6 +49,7 @@ export function analyseSequence(reply: unknown): SequenceAnalysis {
   const steps = rows
     .map(row => ({
       seq: Number(row.seq_number),
+      delay: Number((isRow(row.seq_delay_details) ? row.seq_delay_details.delayInDays : undefined) ?? NaN),
       subject: text(row.subject),
       followUp: text(row.follow_up_subject),
       body: text(row.email_body),
@@ -60,11 +67,13 @@ export function analyseSequence(reply: unknown): SequenceAnalysis {
     for (const v of step.variants) texts.push(v.subject, v.body, v.optional);
   }
 
+  if (texts.some(t => t.length > MAX_TEXT_CHARS)) return { readable: false, stepCount: 0, hasContent: false, tags: [], usesSpintax: false, hash: "" };
+
   const tags: string[] = [];
   let usesSpintax = false;
   for (const t of texts) {
     for (const match of t.matchAll(TAG)) {
-      const tag = match[1];
+      const tag = match[1].trim();
       if (tag && !tags.includes(tag)) tags.push(tag);
     }
     if (SPINTAX.test(t.replace(TAG, ""))) usesSpintax = true;

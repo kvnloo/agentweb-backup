@@ -15,6 +15,7 @@ export const STANDARD_TAG_SOURCES: Record<string, string[]> = {
   company_name: ["company"],
   phone_number: ["phone"],
   website: ["website"],
+  company_url: ["website"],
   linkedin_profile: ["linkedin"],
   location: ["location", "customFields.location"],
 };
@@ -24,9 +25,13 @@ export type TagMapping = Record<string, string>;
 
 type Lead = Record<string, any>;
 
-export function readLeadValue(lead: Lead, path: string): unknown {
-  if (path.startsWith("customFields.")) return lead.customFields?.[path.slice("customFields.".length)];
-  return lead[path];
+export function readLeadValue(lead: Lead, path: unknown): unknown {
+  if (typeof path !== "string" || path === "" || FORBIDDEN_TAGS.has(path)) return undefined;
+  if (path.startsWith("customFields.")) {
+    const key = path.slice("customFields.".length);
+    return FORBIDDEN_TAGS.has(key) ? undefined : lead.customFields?.[key];
+  }
+  return own(lead, path) ? lead[path] : undefined;
 }
 
 const own = (obj: object, key: string): boolean => Object.prototype.hasOwnProperty.call(obj, key);
@@ -61,19 +66,31 @@ export function classifyTags(tags: string[], mapping: TagMapping, acknowledged: 
   return out;
 }
 
-export type SanitizeResult = { ok: true; value: string } | { ok: false; reason: "template_syntax" };
+/** Longest value we send for one field; real names, companies and locations are far shorter. Refused, never truncated. */
+export const MAX_VALUE_CHARS = 500;
+
+export type SanitizeResult = { ok: true; value: string } | { ok: false; reason: "template_syntax" | "unsafe_text" };
 
 /**
- * A value goes to Smartlead as plain text: control characters and newlines become spaces (a subject cannot carry a newline, and
- * the customer's template owns the markup, so HTML-escaping would show `don&#39;t`). A value containing `{{`, `}}` or spintax
- * `{a|b}` is refused: whether Smartlead substitutes a tag inside a custom-field value is unverified, and a literal tag must never
- * reach a recipient.
+ * A value goes to Smartlead as plain text. Control characters, newlines, zero-width and bidirectional-override characters
+ * become spaces or vanish (a subject cannot carry a newline). It is NOT HTML-escaped (that would show `don&#39;t` in a
+ * subject), so a value containing `<` or `>` is refused instead: Smartlead puts values into the customer's HTML email, and a
+ * scraped or enriched company name such as `<a href=...>` would otherwise become a link in mail sent from their domain.
+ * A value containing `{{`, `}}` or spintax `{a|b}` is refused too (whether Smartlead substitutes a tag inside a value is
+ * unverified, and a literal tag must never reach a recipient), as is one longer than MAX_VALUE_CHARS.
  */
 export function sanitizeValue(raw: unknown): SanitizeResult {
-  if (raw === null || raw === undefined) return { ok: true, value: "" };
-  if (typeof raw !== "string" && typeof raw !== "number" && typeof raw !== "boolean") return { ok: true, value: "" };
-  const value = String(raw).replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
+  let text: string;
+  if (typeof raw === "string") text = raw;
+  else if (typeof raw === "number" && Number.isFinite(raw)) text = String(raw);
+  else return { ok: true, value: "" }; // null, undefined, NaN, booleans, objects and arrays carry no usable text
+  const value = text
+    .replace(/[\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/g, "")
+    .replace(/[\u0000-\u001f\u007f\u0085\u2028\u2029]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
   if (value.includes("{{") || value.includes("}}") || /\{[^{}]*\|[^{}]*\}/.test(value)) return { ok: false, reason: "template_syntax" };
+  if (/[<>]/.test(value) || value.length > MAX_VALUE_CHARS) return { ok: false, reason: "unsafe_text" };
   return { ok: true, value };
 }
 
@@ -81,7 +98,7 @@ const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 
 export type PayloadResult =
   | { ok: true; input: SmartleadLeadInput; payloadHash: string }
-  | { ok: false; reason: "no_email" | "invalid_email" | "missing_tag" | "template_syntax"; tag?: string };
+  | { ok: false; reason: "no_email" | "invalid_email" | "missing_tag" | "template_syntax" | "unsafe_text"; tag?: string };
 
 function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
@@ -94,9 +111,10 @@ function canonical(value: unknown): string {
 /**
  * `tagsUsed` are the tags the customer's sequence uses. A lead is refused when a value is missing or unsafe for a tag the
  * sequence uses (Smartlead renders a missing variable blank, so the recipient would get "Hi ,"). Standard fields are always sent
- * when present and safe; an unsafe one is left out. Tags the user confirmed Smartlead supplies itself need no value.
+ * when present and safe; an unsafe one is left out. A tag that is neither standard nor mapped (unknown, or one the user confirmed
+ * Smartlead supplies itself) needs no value from the lead: those are decided once for the run by the preflight, not per lead.
  */
-export function buildLeadPayload(lead: Lead, opts: { tagsUsed: string[]; mapping: TagMapping; acknowledgedTags?: string[] }): PayloadResult {
+export function buildLeadPayload(lead: Lead, opts: { tagsUsed: string[]; mapping: TagMapping }): PayloadResult {
   const rawEmail = typeof lead.email === "string" ? lead.email.trim().toLowerCase() : "";
   if (!rawEmail) return { ok: false, reason: "no_email" };
   if (!EMAIL.test(rawEmail)) return { ok: false, reason: "invalid_email" };
@@ -122,20 +140,20 @@ export function buildLeadPayload(lead: Lead, opts: { tagsUsed: string[]; mapping
   set("company_name", "company_name");
   set("phone_number", "phone_number");
   set("website", "website");
+  set("company_url", "company_url");
   set("location", "location");
   set("linkedin_profile", "linkedin_profile");
 
   const custom: Record<string, string> = {};
   for (const tag of opts.tagsUsed) {
-    if (opts.acknowledgedTags?.includes(tag)) continue;
     let result: SanitizeResult | undefined;
     if (!usable(tag)) continue;
     if (own(STANDARD_TAG_SOURCES, tag)) result = values[tag];
     else if (own(opts.mapping, tag)) {
       result = sanitizeValue(readLeadValue(lead, opts.mapping[tag]));
       if (result.ok && result.value !== "") custom[tag] = result.value;
-    } else continue; // unknown or near-miss tags are blocked once for the whole run, not per lead
-    if (!result.ok) return { ok: false, reason: "template_syntax", tag };
+    } else continue; // unknown, near-miss and acknowledged tags are handled once for the whole run, not per lead
+    if (!result.ok) return { ok: false, reason: result.reason, tag };
     if (result.value === "") return { ok: false, reason: "missing_tag", tag };
   }
   if (Object.keys(custom).length > 0) input.custom_fields = custom;

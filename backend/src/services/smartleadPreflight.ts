@@ -11,8 +11,8 @@ import type { SequenceAnalysis } from "./smartleadSequence";
 export type CampaignStatusDecision = "allowed" | "needs_confirmation" | "refused";
 
 /** DRAFTED and PAUSED are allowed, ACTIVE needs a second confirmation, everything else (and anything unknown) is refused. */
-export function campaignStatusDecision(status: string): CampaignStatusDecision {
-  const s = status.trim().toUpperCase();
+export function campaignStatusDecision(status: unknown): CampaignStatusDecision {
+  const s = typeof status === "string" ? status.trim().toUpperCase() : ""; // a missing or odd status is refused, never guessed
   if (s === "DRAFTED" || s === "PAUSED") return "allowed";
   if (s === "ACTIVE") return "needs_confirmation";
   return "refused";
@@ -36,7 +36,7 @@ export interface PreflightResult {
 export function preflightSequence(
   analysis: SequenceAnalysis,
   opts: {
-    status: string;
+    status: unknown;
     mapping: TagMapping;
     acknowledgedTags?: string[];
     /** The user ticked "we could not read my sequence, send anyway". */
@@ -46,7 +46,9 @@ export function preflightSequence(
   },
 ): PreflightResult {
   const result: PreflightResult = { blocks: [], warnings: [], tagsToMap: [] };
-  const active = opts.status.trim().toUpperCase() === "ACTIVE";
+  // An unknown status is treated like ACTIVE (the stricter rules): the caller refuses it anyway, and this must not throw.
+  const status = typeof opts.status === "string" ? opts.status.trim().toUpperCase() : "";
+  const active = status === "ACTIVE" || campaignStatusDecision(status) === "refused";
   const add = (finding: PreflightFinding, blockWhenActive: boolean) => (active && blockWhenActive ? result.blocks : result.warnings).push(finding);
 
   if (!analysis.readable) {
