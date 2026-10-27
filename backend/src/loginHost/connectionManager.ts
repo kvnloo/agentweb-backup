@@ -333,6 +333,9 @@ export class ConnectionManager {
       const { c, login } = await this.requireAttempt(req.connectionId, req.loginRef);
       const adapter = this.adapter(login.provider);
       if (adapter.ceremony !== "paste_code" || !adapter.loginComplete) throw new HostError("ESTATE", "ceremony_not_paste_code");
+      // A second complete for an attempt that already took its code (a retry, or the same sign-in finished from another backend instance) is
+      // refused WITHOUT touching the attempt: handing the spent code to the finished process would fail and discard the ready login.
+      if (c.attempt?.state !== "pending") throw new HostError("ESTATE", "login_not_pending");
       try {
         await this.a("loginComplete", () => adapter.loginComplete!(login.proc, req.code));
       } catch (err) {

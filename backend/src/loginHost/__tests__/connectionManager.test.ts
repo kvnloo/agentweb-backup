@@ -36,6 +36,15 @@ describe("ConnectionManager", () => {
       expect(rig.script.prepared).toBe(1);
     });
 
+    it("a second complete for an attempt that is already ready is refused and leaves the ready login intact", async () => {
+      const start = await rig.mgr.loginStart({ connectionId: "c1", provider: "fake" });
+      await rig.mgr.loginComplete({ connectionId: "c1", loginRef: start.loginRef, code: "abcdefgh#12345678" });
+      rig.script.codeResult = "reject"; // had the second complete reached the adapter, the attempt would be discarded
+      expect(await code(rig.mgr.loginComplete({ connectionId: "c1", loginRef: start.loginRef, code: "abcdefgh#12345678" }))).toBe("ESTATE:login_not_pending");
+      expect(rig.store.get().connections.c1.attempt).toMatchObject({ state: "ready" });
+      await expect(rig.mgr.loginPromote({ connectionId: "c1", loginRef: start.loginRef, epoch: 1 })).resolves.toEqual({ state: "active", epoch: 1 });
+    });
+
     it("a wrong code discards the attempt, wipes it, frees its uid, and lets the user try again", async () => {
       rig.script.codeResult = "reject";
       const start = await rig.mgr.loginStart({ connectionId: "c1", provider: "fake" });
