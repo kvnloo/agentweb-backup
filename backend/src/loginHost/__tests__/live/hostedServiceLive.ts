@@ -110,6 +110,7 @@ async function signIn(label: string, reconnectConnectionId?: string) {
 }
 
 async function main() {
+  const BASE = homesLeft(); // homes already on the host (e.g. the kept test login): the checks below count relative to this
   if (!LLM_CONNECTIONS_TABLE.startsWith("Dev-")) throw new Error("refusing: not the Dev table");
   check("unsupported-provider", (await codeOf(svc.startLogin(user, "nope"))) === "unsupported_provider");
   check("unflagged-user-disabled", (await codeOf(svc.startLogin({ userId: "zz-someone-else" }, "claude"))) === "disabled");
@@ -124,7 +125,7 @@ async function main() {
   check("sign-in-active", view.status === "active" && view.subscription?.plan !== undefined, `plan=${view.subscription?.plan}`);
   check("record-reference-only", row.subHosted === true && row.subHostEpoch === 1 && row.sealed === undefined && row.subVersion === undefined);
   check("slot-taken", (await counter()) === 1, `count=${await counter()}`);
-  check("home-exists-on-host", homesLeft() === 1, `homes=${homesLeft()}`);
+  check("home-exists-on-host", homesLeft() === BASE + 1, `homes=${homesLeft()} (base ${BASE})`);
 
   let id = view.connectionId;
   if (WITH_RECONNECT) {
@@ -134,8 +135,8 @@ async function main() {
     check("reconnect-keeps-one-slot", (await counter()) === 1);
     // The host wipes the replaced home in its background sweep (every 60 s), not inside the promote: wait for it.
     const waitStart = Date.now();
-    while (homesLeft() !== 1 && Date.now() - waitStart < 90_000) await sleep(5_000);
-    check("old-home-wiped-after-reconnect", homesLeft() === 1, `homes=${homesLeft()} after ${Math.round((Date.now() - waitStart) / 1000)}s`);
+    while (homesLeft() !== BASE + 1 && Date.now() - waitStart < 90_000) await sleep(5_000);
+    check("old-home-wiped-after-reconnect", homesLeft() === BASE + 1, `homes=${homesLeft()} (base ${BASE}) after ${Math.round((Date.now() - waitStart) / 1000)}s`);
   }
 
   const outcome = await svc.revokeRecord(user, id);
@@ -144,7 +145,7 @@ async function main() {
   check("record-revoked", after.status === "revoked" && !!after.revokedAt && after.subSlotReleased === true);
   check("slot-released", (await counter()) === 0, `count=${await counter()}`);
   await sleep(4_000);
-  check("home-wiped", homesLeft() === 0, `homes=${homesLeft()}`);
+  check("home-wiped", homesLeft() === BASE, `homes=${homesLeft()} (base ${BASE})`);
   check("disconnect-idempotent", (await svc.revokeRecord(user, id)) === "revoked" && (await counter()) === 0);
   const sweep = await svc.sweepOnce();
   check("sweep-finds-nothing-to-do", sweep.revoking === 0 && !sweep.hostUnavailable, JSON.stringify(sweep));
