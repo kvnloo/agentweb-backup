@@ -101,7 +101,7 @@ import { assertSequentialStepCounts } from '../services/workPlanSteps';
 import { validateModelPin, normalizeRequestedLlmModel, resolvePlanLaunchModel, canonicalPinId } from '../services/agentMode/modelPin';
 import { resolveTurnFunding, type PlanRoute } from '../services/funding/claudeFunding';
 import { ClaudeRouteStopError, claudeStopBody } from '../services/funding/claudeRouteErrors';
-import { claudeCodeBackend } from '../services/funding/claudeCodeBackendInstance';
+import type { claudeCodeBackend as ClaudeCodeBackendInstance } from '../services/funding/claudeCodeBackendInstance';
 import { workPlanStepModels } from '../services/agentMode/workPlanStepModelsInstance';
 import {
   assertModelInOwnerPlan, isSystemAuthoredPlan, legacyPlanPinSource, modelAccess, storedBindingSource, systemModelCheck,
@@ -10155,8 +10155,10 @@ async function runSessionTurn(
   // This allows health checks to continue working during long-running operations
   // ENG-2113: the plan route runs in THIS process through the Claude backend and never reaches the worker below, so it can never end up on AgentWeb's
   // models. Everything the backend cannot do yet is a typed stop or a documented limit, not a fallback.
-  let planResponse: Awaited<ReturnType<typeof claudeCodeBackend.run>> | undefined;
+  let planResponse: Awaited<ReturnType<typeof ClaudeCodeBackendInstance.run>> | undefined;
   if (planRoute) {
+    // Loaded here, not at module top: the instance pulls in the whole tool gateway, which a request that never takes the plan route has no use for.
+    const { claudeCodeBackend } = await import('../services/funding/claudeCodeBackendInstance');
     planResponse = await claudeCodeBackend.run({
       decision: planRoute,
       sessionId,
