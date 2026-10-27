@@ -54,6 +54,27 @@ describe("analyseSequence (ENG-673)", () => {
     }
   });
 
+  it("does not freeze on a brace followed by a hundred thousand pipes (the spintax pattern was quadratic)", () => {
+    const started = Date.now();
+    const a = analyseSequence([{ seq_number: 1, subject: "s", email_body: "{" + "|".repeat(150_000), sequence_variants: [] }]);
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(a).toMatchObject({ readable: true, usesSpintax: false });
+  });
+
+  it("treats a sequence with an absurd number of steps as unreadable, and handles fifteen thousand distinct tags quickly", () => {
+    const steps = Array.from({ length: 201 }, (_, i) => ({ seq_number: i + 1, subject: "s", email_body: "b", sequence_variants: [] }));
+    expect(analyseSequence(steps).readable).toBe(false);
+    const started = Date.now();
+    const many = analyseSequence([{ seq_number: 1, subject: "s", email_body: Array.from({ length: 15_000 }, (_, i) => `{{t${i}}}`).join(" "), sequence_variants: [] }]);
+    expect(many.tags).toHaveLength(15_000);
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
+  it("extracts tags correctly from triple braces and from HTML attributes", () => {
+    const a = analyseSequence([{ seq_number: 1, subject: "{{{x}}}", email_body: '<a href="{{website}}">{{ Company Name }}</a>', sequence_variants: [] }]);
+    expect(a.tags).toEqual(["x", "website", "Company Name"]);
+  });
+
   it("treats a text longer than any real email as unreadable instead of scanning it", () => {
     expect(analyseSequence([{ seq_number: 1, subject: "s", email_body: "x".repeat(200_001), sequence_variants: [] }])).toMatchObject({ readable: false, tags: [] });
   });
