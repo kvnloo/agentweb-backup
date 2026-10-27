@@ -1,0 +1,5 @@
+## ENG-2113: the backend accepts a login host one protocol version ahead (2026-10-27)
+
+- **What changed.** `loginHostProvider` reports the worker protocol as `match` for version 2 (this build's) and 3, instead of only 2. `workerProtocol()` still returns the exact version.
+- **Why.** The tool relay needs a new `turn.run` field, and an old worker refuses unknown fields, so the worker must deploy first. Until now a worker at a newer version made every running backend log a mismatch, and a mismatch makes `workerSpeaksOurProtocol` false: a "no such connection" answer then no longer counts as a confirmed wipe for revoke and the sweeper, so disconnects would sit in `revoking` until the backend catches up. Accepting one version ahead removes that window.
+- **Limits.** Version 1 and anything two or more ahead are still a mismatch. Code that needs a specific newer feature (the relay) must check `workerProtocol()` itself; `protocolStatus()` only means "compatible for sign-in, revoke and plain turns".

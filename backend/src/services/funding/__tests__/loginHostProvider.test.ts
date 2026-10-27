@@ -317,15 +317,29 @@ describe("worker protocol check (host.info)", () => {
   });
 
   it("a different version is a logged 'mismatch' (never fatal: the client is still returned)", async () => {
-    const p = mk(async () => ({ protocol: PROTOCOL_VERSION + 1, node: "v22", uptimeSec: 1 }));
+    const p = mk(async () => ({ protocol: PROTOCOL_VERSION + 2, node: "v22", uptimeSec: 1 }));
     await settle(p);
     expect(p.protocolStatus()).toBe("mismatch");
-    expect(p.workerProtocol()).toBe(PROTOCOL_VERSION + 1);
+    expect(p.workerProtocol()).toBe(PROTOCOL_VERSION + 2);
     expect(p.client()).toBeInstanceOf(LoginHostClient);
     expect(logged.filter((l) => l.includes("login_host_protocol_mismatch"))).toHaveLength(1);
     await settle(p);
     await settle(p);
     expect(logged.filter((l) => l.includes("login_host_protocol_mismatch"))).toHaveLength(1); // once, not every minute
+  });
+
+  it("a worker ONE version ahead is accepted (the worker deploys first), and workerProtocol() still says which version it is", async () => {
+    const p = mk(async () => ({ protocol: PROTOCOL_VERSION + 1, node: "v22", uptimeSec: 1 }));
+    await settle(p);
+    expect(p.protocolStatus()).toBe("match");
+    expect(p.workerProtocol()).toBe(PROTOCOL_VERSION + 1);
+    expect(logged.filter((l) => l.includes("login_host_protocol_mismatch"))).toHaveLength(0);
+  });
+
+  it("an older worker is a mismatch (an old worker refuses fields this backend sends)", async () => {
+    const p = mk(async () => ({ protocol: PROTOCOL_VERSION - 1, node: "v22", uptimeSec: 1 }));
+    await settle(p);
+    expect(p.protocolStatus()).toBe("mismatch");
   });
 
   it("an older worker (unknown route) stays 'unknown' with a logged cause, retried on each refresh until it answers, then flips to match without a restart", async () => {
@@ -350,7 +364,7 @@ describe("worker protocol check (host.info)", () => {
     const p = mk(async () => ({ protocol, node: "v22", uptimeSec: 1 }));
     await settle(p);
     expect(p.protocolStatus()).toBe("match");
-    protocol = PROTOCOL_VERSION + 1;
+    protocol = PROTOCOL_VERSION + 2;
     now += PROTOCOL_RECHECK_MS - 1;
     await settle(p);
     expect(p.protocolStatus()).toBe("match"); // not yet
