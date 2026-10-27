@@ -325,7 +325,23 @@ export class SmartleadPushService {
       }
       // The start is now known to have succeeded: only from here may the run be claimed like any other. If this write fails the run stays
       // unconfirmed, the resumer will cancel it once its lease lapses, and the user simply previews again (the safe direction).
-      await this.deps.db.confirmStart(started.run.runId).catch(error => { this.deps.log(`[SmartleadPush] could not confirm start of run=${started.run.runId}: ${scrubSmartleadSecrets(error instanceof Error ? error.message : String(error))}`); });
+      // Retried a few times. If it still can not be confirmed the user is told the start FAILED, no worker is started, and the run is
+      // cancelled (now if possible, else by the resumer): "told failed" and "cancelled" are the only combination.
+      let confirmed = false;
+      for (let attempt = 0; attempt < 4 && !confirmed; attempt++) {
+        try {
+          await this.deps.db.confirmStart(started.run.runId);
+          confirmed = true;
+        } catch (error) {
+          this.deps.log(`[SmartleadPush] could not confirm start of run=${started.run.runId}: ${scrubSmartleadSecrets(error instanceof Error ? error.message : String(error))}`);
+          if (attempt < 3) await this.deps.sleep(50 * 4 ** attempt);
+        }
+      }
+      if (!confirmed) {
+        this.pendingCancels.add(started.run.runId);
+        await this.deps.db.cancelRun(started.run.runId).then(() => this.pendingCancels.delete(started.run.runId)).catch(() => undefined);
+        return fail(503, "unavailable", "Smartlead pushing is temporarily unavailable. Nothing was sent. Try again shortly.");
+      }
       await this.deps.db.setTokenRun(token.jti, started.run.runId).catch(() => undefined);
       this.deps.log(`[SmartleadPush] started run=${started.run.runId} user=${userId} list=${token.listId} campaign=${token.campaignId} approved=${token.eligible} status=${campaign.status}`);
       this.spawn(started.run);
@@ -365,6 +381,11 @@ export class SmartleadPushService {
       const r = await this.runFor(userId, runId);
       if (!r.ok) return r;
       if (r.run.status !== "paused" && r.run.status !== "partial") return fail(409, "not_paused", "This push is not paused.");
+      if (r.run.startUnconfirmed) {
+        // A start that was never confirmed to anyone (it was reported as failed): resuming it would send what the user was told did not start.
+        await this.deps.db.cancelRun(r.run.runId);
+        return fail(409, "start_unconfirmed", "This push never finished starting, so it was cancelled. Preview again to push.");
+      }
       // Resuming sends with the pusher's Smartlead connection, so only that person may resume it. Other editors can still pause and cancel.
       if (userId !== r.run.keyOwnerId) return fail(403, "resume_requires_pusher", "Only the person who started this push can resume it, because it sends with their Smartlead connection. You can cancel it and start again with your own.");
       const resumed = await this.deps.db.resumeRun(r.run.runId, this.workerId, r.run.leaseEpoch);

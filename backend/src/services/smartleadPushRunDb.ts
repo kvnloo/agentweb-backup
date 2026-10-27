@@ -824,14 +824,15 @@ export class SmartleadPushRunDb {
   /** Resumes a paused or partial run under a new lease epoch. */
   async resumeRun(runId: string, workerId: string, seenEpoch: number): Promise<PushRun | null> {
     const current = await this.getRun(runId);
-    if (!current || (current.status !== "paused" && current.status !== "partial") || !(await this.retakeLock(current))) return null;
+    // A start that was never confirmed to the user can not be resumed by pausing it first: it is cancelled instead.
+    if (!current || (current.status !== "paused" && current.status !== "partial") || current.startUnconfirmed || !(await this.retakeLock(current))) return null;
     const now = this.nowMs();
     const r = await this.call(() =>
       this.client.update({
         TableName: this.table,
         Key: { pk: runId, sk: RUN_SK },
-        UpdateExpression: "SET #s = :running, #a = :y, #ba = :zero, leaseEpoch = leaseEpoch + :one, leaseOwner = :me, leaseUntil = :until REMOVE pauseReason, startUnconfirmed",
-        ConditionExpression: "#s IN (:paused, :partial) AND leaseEpoch = :seen",
+        UpdateExpression: "SET #s = :running, #a = :y, #ba = :zero, leaseEpoch = leaseEpoch + :one, leaseOwner = :me, leaseUntil = :until REMOVE pauseReason",
+        ConditionExpression: "#s IN (:paused, :partial) AND leaseEpoch = :seen AND attribute_not_exists(startUnconfirmed)",
         ExpressionAttributeNames: { "#s": "status", "#a": "active", "#ba": "batchAttempts" },
         ExpressionAttributeValues: { ":running": "running", ":y": "Y", ":zero": 0, ":one": 1, ":me": workerId, ":until": now + LEASE_MS, ":paused": "paused", ":partial": "partial", ":seen": seenEpoch },
         ReturnValues: "ALL_NEW",
