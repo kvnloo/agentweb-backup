@@ -117,6 +117,7 @@ async function definedTables(environment: string, source = fs.readFileSync(creat
         return { promise: async () => ({}) };
       }
       updateTimeToLive() { return { promise: async () => ({}) }; }
+      waitFor() { return { promise: async () => ({}) }; }
     },
   };
   const sandbox = {
