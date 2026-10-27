@@ -1,3 +1,4 @@
+import { addCompanionTools } from './agentMode/companionTools';
 import { metaWriteRateShaper, META_BUDGET_THROTTLE_SUBCODE } from './agentMode/metaWriteRateShaper';
 import { normalizeSkillIdArg } from './agentMode/skillIdArg';
 import { applyProviderPolicy, CompareProviderPolicy } from './agentMode/compareProviderPolicy';
@@ -7691,6 +7692,8 @@ export class AgentModeService {
     if (hasAdminAccess || sessionAssociatedSkillIds.includes(ADMIN_SKILL_VIRTUAL_ID)) {
       ADMIN_SKILL_TOOL_NAMES.forEach(t => allowedToolNames.add(t));
     }
+
+    addCompanionTools(allowedToolNames);
 
     let installedSkillContextMsg = '';
     const skillLines: string[] = [];
