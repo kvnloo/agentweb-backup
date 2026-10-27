@@ -685,6 +685,8 @@ export function modelUnavailableBody(err: ModelUnavailableError, audience: Model
  */
 const errorsAfterUserMessageSaved = new WeakSet<object>();
 
+/** ENG-2672: the turn state of each generateSessionResponse promise, so withGenerationTimeout can tell whether its turn had saved the user message when the cap fired. */
+const turnOfGeneration = new WeakMap<Promise<unknown>, SessionTurnState>();
 function markRaisedAfterUserMessageSaved(error: unknown): void {
   if (typeof error === 'object' && error !== null) errorsAfterUserMessageSaved.add(error);
 }
@@ -695,7 +697,9 @@ function wasRaisedAfterUserMessageSaved(error: unknown): boolean {
 
 /**
  * ENG-2641: a refused send's body (422 `model_unavailable`, 409 `SESSION_BUSY`, 429 `TOO_MANY_CONCURRENT_RUNS` / usage
- * paused) with `userMessageSaved`: true only when the user's message is already stored in the chat, so the client keeps
+ * paused) with `userMessageSaved`. ENG-2672: also a generation that failed after the save (503 `PROVIDER_UNAVAILABLE` /
+ * `SERVER_RESTARTING`, 413 `CONTEXT_LIMIT_EXCEEDED`, 504 `GENERATION_TIMEOUT`) on /generate and the share generate routes.
+ * `userMessageSaved`: true only when the user's message is already stored in the chat, so the client keeps
  * it there instead of giving the draft back (a resend would store it twice). Older backends omit it, and a client must
  * then keep its previous behaviour.
  */
@@ -1788,6 +1792,8 @@ async function withGenerationTimeout<T>(
       // Tag so the durable-execution path can distinguish a run-timeout (where the
       // detached work may still finish) from a genuine generation error.
       err.isGenerationTimeout = true;
+      // ENG-2672: the user message is already in the chat if the turn had saved it by the time the cap fired.
+      if (turnOfGeneration.get(promise)?.userMessageSaved) markRaisedAfterUserMessageSaved(err);
       reject(err);
     }, timeoutMs);
   });
@@ -9577,16 +9583,21 @@ type SessionTurnArgs = Parameters<typeof runSessionTurn> extends [SessionTurnSta
 
 // Common function to generate AI response for a session
 // Always uses worker process to prevent blocking the main event loop
-export async function generateSessionResponse(...args: SessionTurnArgs): ReturnType<typeof runSessionTurn> {
+export function generateSessionResponse(...args: SessionTurnArgs): ReturnType<typeof runSessionTurn> {
   const turn: SessionTurnState = { userMessageSaved: false };
-  try {
-    return await runSessionTurn(turn, ...args);
-  } catch (error) {
-    // ENG-2641: any error raised once the user message is in the chat (e.g. the Work Plan step-model refusal, or a
-    // worker failure a /verified-generate retry follows) is marked, so a refusal answered for it says it was stored.
-    if (turn.userMessageSaved) markRaisedAfterUserMessageSaved(error);
-    throw error;
-  }
+  const generation = (async () => {
+    try {
+      return await runSessionTurn(turn, ...args);
+    } catch (error) {
+      // ENG-2641: any error raised once the user message is in the chat (e.g. the Work Plan step-model refusal, or a
+      // worker failure a /verified-generate retry follows) is marked, so a refusal answered for it says it was stored.
+      if (turn.userMessageSaved) markRaisedAfterUserMessageSaved(error);
+      throw error;
+    }
+  })();
+  // ENG-2672: withGenerationTimeout raises its own error while this promise is still pending; it reads the turn from here.
+  turnOfGeneration.set(generation, turn);
+  return generation;
 }
 
 async function runSessionTurn(
@@ -11227,13 +11238,20 @@ export const agentModeController = {
         const idemKey = interactiveIdempotencyKey(sessionId, userMessage, llmModel || '');
         const claim = await claimIdempotency(idemKey, runSurvivalRunId, IDEM_TTL_INTERACTIVE_S);
         if (!claim.claimed) {
-          return res.status(409).json({
+          // ENG-2672: a duplicate of a send whose first copy is still running (same client message id). The message is
+          // in the chat only if the first copy has already stored it, which the chat itself says; a stale claim or a
+          // first copy that has not reached its save yet leaves it false (nothing stored for this copy).
+          const firstCopySaved = typeof clientId === 'string' && clientId !== ''
+            ? await chatbotDb.getChatSession(sessionId, true) // strongly consistent: a just-saved message must be seen
+                .then((current) => !!current?.messages?.some((m) => m.role === 'user' && m.clientId === clientId))
+                .catch(() => false)
+            : false;
+          return res.status(409).json(sendRefusalBody({
             error: 'Session is busy',
             message: 'A response is already being generated for this session. Please wait.',
             code: 'SESSION_BUSY',
             ...(claim.inFlightRunId ? { runId: claim.inFlightRunId } : {}),
-            userMessageSaved: false,
-          });
+          }, firstCopySaved));
         }
         idemKeyHeld = idemKey;
       }
@@ -12066,22 +12084,22 @@ export const agentModeController = {
         }
 
         if (isWorkerShutdownError(error)) {
-          res.status(503).json({
+          res.status(503).json(sendRefusalBody({
             error: 'Server is restarting',
             message: 'The server is restarting. Please try again in a moment.',
             code: 'SERVER_RESTARTING',
             suggestion: 'wait_and_retry'
-          });
+          }, wasRaisedAfterUserMessageSaved(error)));
           return;
         }
 
         if (isProviderNoEndpointsError(error)) {
-          res.status(503).json({
+          res.status(503).json(sendRefusalBody({
             error: 'Model provider unavailable',
             message: 'The selected model has no available provider right now. Please try again, or pick a different model from the selector above.',
             code: 'PROVIDER_UNAVAILABLE',
             suggestion: 'wait_and_retry'
-          });
+          }, wasRaisedAfterUserMessageSaved(error)));
           return;
         }
 
@@ -12123,12 +12141,12 @@ export const agentModeController = {
           autoReportContextLimitToLinear(sessionId, user?.email, user?.userId, llmModel, session)
             .catch(err => console.error('autoReportContextLimitToLinear failed:', err));
 
-          res.status(413).json({
+          res.status(413).json(sendRefusalBody({
             error: 'Context limit exceeded',
             message: 'This conversation is too long for the current model context window. Please start a new session or shorten the request.',
             code: 'CONTEXT_LIMIT_EXCEEDED',
             suggestion: 'start_new_session'
-          });
+          }, wasRaisedAfterUserMessageSaved(error)));
           return;
         }
 
@@ -12164,22 +12182,22 @@ export const agentModeController = {
 
         // ENG-2381: a final upstream provider 5xx is an outage, not an unknown error.
         if (isProviderUnavailableError(error)) {
-          res.status(503).json({
+          res.status(503).json(sendRefusalBody({
             error: 'AI provider unavailable',
             message: error.message,
             code: 'PROVIDER_UNAVAILABLE',
             suggestion: 'wait_and_retry'
-          });
+          }, wasRaisedAfterUserMessageSaved(error)));
           return;
         }
 
         if (error.message.includes('Generation timed out')) {
-          res.status(504).json({
+          res.status(504).json(sendRefusalBody({
             error: 'Generation timed out',
             message: 'The response took too long to generate. Please try again — your session is still active.',
             code: 'GENERATION_TIMEOUT',
             suggestion: 'wait_and_retry'
-          });
+          }, wasRaisedAfterUserMessageSaved(error)));
           return;
         }
 
@@ -13320,12 +13338,12 @@ export const agentModeController = {
           autoReportContextLimitToLinear(shareId, session?.userId, session?.userId, llmModel || session?.llmModel, session)
             .catch(err => console.error('autoReportContextLimitToLinear failed (shared):', err));
 
-          res.status(413).json({
+          res.status(413).json(sendRefusalBody({
             error: 'Context limit exceeded',
             message: 'This conversation is too long for the current model context window. Please start a new session or shorten the request.',
             code: 'CONTEXT_LIMIT_EXCEEDED',
             suggestion: 'start_new_session'
-          });
+          }, wasRaisedAfterUserMessageSaved(error)));
           return;
         }
 
@@ -13361,42 +13379,42 @@ export const agentModeController = {
 
         // ENG-2381: a final upstream provider 5xx is an outage, not an unknown error.
         if (isProviderUnavailableError(error)) {
-          res.status(503).json({
+          res.status(503).json(sendRefusalBody({
             error: 'AI provider unavailable',
             message: error.message,
             code: 'PROVIDER_UNAVAILABLE',
             suggestion: 'wait_and_retry'
-          });
+          }, wasRaisedAfterUserMessageSaved(error)));
           return;
         }
 
         if (isWorkerShutdownError(error)) {
-          res.status(503).json({
+          res.status(503).json(sendRefusalBody({
             error: 'Server is restarting',
             message: 'The server is restarting. Please try again in a moment.',
             code: 'SERVER_RESTARTING',
             suggestion: 'wait_and_retry'
-          });
+          }, wasRaisedAfterUserMessageSaved(error)));
           return;
         }
 
         if (isProviderNoEndpointsError(error)) {
-          res.status(503).json({
+          res.status(503).json(sendRefusalBody({
             error: 'Model provider unavailable',
             message: 'The selected model has no available provider right now. Please try again, or pick a different model from the selector above.',
             code: 'PROVIDER_UNAVAILABLE',
             suggestion: 'wait_and_retry'
-          });
+          }, wasRaisedAfterUserMessageSaved(error)));
           return;
         }
 
         if (error.message.includes('Generation timed out')) {
-          res.status(504).json({
+          res.status(504).json(sendRefusalBody({
             error: 'Generation timed out',
             message: 'The response took too long to generate. Please try again — your session is still active.',
             code: 'GENERATION_TIMEOUT',
             suggestion: 'wait_and_retry'
-          });
+          }, wasRaisedAfterUserMessageSaved(error)));
           return;
         }
 
@@ -16724,42 +16742,42 @@ export const agentModeController = {
 
         // ENG-2381: a final upstream provider 5xx is an outage, not an unknown error.
         if (isProviderUnavailableError(error)) {
-          res.status(503).json({
+          res.status(503).json(sendRefusalBody({
             error: 'AI provider unavailable',
             message: error.message,
             code: 'PROVIDER_UNAVAILABLE',
             suggestion: 'wait_and_retry'
-          });
+          }, wasRaisedAfterUserMessageSaved(error)));
           return;
         }
 
         if (isWorkerShutdownError(error)) {
-          res.status(503).json({
+          res.status(503).json(sendRefusalBody({
             error: 'Server is restarting',
             message: 'The server is restarting. Please try again in a moment.',
             code: 'SERVER_RESTARTING',
             suggestion: 'wait_and_retry'
-          });
+          }, wasRaisedAfterUserMessageSaved(error)));
           return;
         }
 
         if (isProviderNoEndpointsError(error)) {
-          res.status(503).json({
+          res.status(503).json(sendRefusalBody({
             error: 'Model provider unavailable',
             message: 'The selected model has no available provider right now. Please try again, or pick a different model from the selector above.',
             code: 'PROVIDER_UNAVAILABLE',
             suggestion: 'wait_and_retry'
-          });
+          }, wasRaisedAfterUserMessageSaved(error)));
           return;
         }
 
         if (error.message.includes('Generation timed out')) {
-          res.status(504).json({
+          res.status(504).json(sendRefusalBody({
             error: 'Generation timed out',
             message: 'The response took too long to generate. Please try again — your session is still active.',
             code: 'GENERATION_TIMEOUT',
             suggestion: 'wait_and_retry'
-          });
+          }, wasRaisedAfterUserMessageSaved(error)));
           return;
         }
       }
