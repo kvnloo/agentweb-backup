@@ -221,9 +221,39 @@ async function fetchCampaignLeads(
   return { total, leads: allLeads };
 }
 
+const EMAIL_ACCOUNTS_PAGE_LIMIT = 100;
+const EMAIL_ACCOUNTS_MAX_PAGES = 20;
+
+export interface SmartleadEmailAccount {
+  id: number;
+  email: string;
+}
+
+/**
+ * The mailboxes attached to a Smartlead key (ENG-673). Also the key check on connect: a rejected
+ * key or unusable plan throws a SmartleadApiError carrying the HTTP status. Pages by offset, and
+ * stops early if a page adds no new ids, in case the API ignores the offset.
+ */
+export async function listEmailAccounts(apiKey: string): Promise<SmartleadEmailAccount[]> {
+  const byId = new Map<number, SmartleadEmailAccount>();
+  for (let page = 0; page < EMAIL_ACCOUNTS_MAX_PAGES; page++) {
+    const data = await smartleadRequest<unknown>(apiKey, "GET", "/email-accounts", {
+      params: { offset: page * EMAIL_ACCOUNTS_PAGE_LIMIT, limit: EMAIL_ACCOUNTS_PAGE_LIMIT },
+    });
+    const rows = Array.isArray(data) ? (data as Array<{ id?: number; from_email?: string }>) : [];
+    const before = byId.size;
+    for (const row of rows) {
+      if (typeof row?.id === "number" && !byId.has(row.id)) {
+        byId.set(row.id, { id: row.id, email: String(row.from_email ?? "") });
+      }
+    }
+    if (rows.length < EMAIL_ACCOUNTS_PAGE_LIMIT || byId.size === before) break;
+  }
+  return [...byId.values()];
+}
+
 async function fetchEmailAccounts(apiKey: string): Promise<number> {
-  const data = await smartleadRequest<unknown[]>(apiKey, "GET", "/email-accounts");
-  return Array.isArray(data) ? data.length : 0;
+  return (await listEmailAccounts(apiKey)).length;
 }
 
 // ─── Main Function ──────────────────────────────────────────────────────
