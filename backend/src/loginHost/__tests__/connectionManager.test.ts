@@ -1,6 +1,7 @@
 import { readdirSync, readFileSync } from "fs";
 import { join } from "path";
 import { HostError } from "../protocol";
+import { DEFAULT_CONFIG } from "../connectionManager";
 import { StateStore } from "../stateStore";
 import { drain, makeRig, signIn, turnReq, type Rig } from "./helpers";
 
@@ -51,6 +52,68 @@ describe("ConnectionManager", () => {
       const results = await Promise.all([code(rig.mgr.loginComplete(req)), code(rig.mgr.loginComplete(req))]);
       expect(results.sort()).toEqual(["ESTATE:login_not_pending", "OK"]);
       expect(rig.store.get().connections.c1.attempt).toMatchObject({ state: "ready" });
+    });
+
+    describe("protocol 3 hardening (ENG-2110)", () => {
+      const REQ = (loginRef: string, over: Record<string, unknown> = {}) => ({ connectionId: "c1", loginRef, code: "abcdefgh#12345678", ...over });
+
+      it("the complete that took the code is recorded and reported with the ready status; a second reader sees the same nonce", async () => {
+        const start = await rig.mgr.loginStart({ connectionId: "c1", provider: "fake" });
+        const ready = await rig.mgr.loginComplete(REQ(start.loginRef, { completionNonce: "nonce-AAAA-1111" }));
+        expect(ready.completionNonce).toBe("nonce-AAAA-1111");
+        const st = await rig.mgr.loginStatus({ connectionId: "c1", loginRef: start.loginRef });
+        expect(st).toMatchObject({ status: "ready", completionNonce: "nonce-AAAA-1111" });
+        // a later complete with ANOTHER nonce is refused and does not overwrite whose nonce is on the attempt
+        expect(await code(rig.mgr.loginComplete(REQ(start.loginRef, { completionNonce: "nonce-BBBB-2222" })))).toBe("ESTATE:login_not_pending");
+        expect(await rig.mgr.loginStatus({ connectionId: "c1", loginRef: start.loginRef })).toMatchObject({ completionNonce: "nonce-AAAA-1111" });
+      });
+
+      it("without a nonce (an older backend) nothing changes: no nonce is reported", async () => {
+        const start = await rig.mgr.loginStart({ connectionId: "c1", provider: "fake" });
+        const ready = await rig.mgr.loginComplete(REQ(start.loginRef));
+        expect(ready.completionNonce).toBeUndefined();
+      });
+
+      it("a cancel that says onlyIfPending leaves a ready attempt alone (and the sign-in can still be promoted); a plain cancel still discards it", async () => {
+        const start = await rig.mgr.loginStart({ connectionId: "c1", provider: "fake" });
+        await rig.mgr.loginComplete(REQ(start.loginRef));
+        await expect(rig.mgr.loginCancel({ connectionId: "c1", loginRef: start.loginRef, onlyIfPending: true })).resolves.toEqual({ cancelled: true });
+        expect(rig.store.get().connections.c1.attempt).toMatchObject({ state: "ready" });
+        await expect(rig.mgr.loginPromote({ connectionId: "c1", loginRef: start.loginRef, epoch: 1 })).resolves.toEqual({ state: "active", epoch: 1 });
+        const start2 = await rig.mgr.loginStart({ connectionId: "c2", provider: "fake" });
+        await rig.mgr.loginComplete({ ...REQ(start2.loginRef), connectionId: "c2" });
+        await rig.mgr.loginCancel({ connectionId: "c2", loginRef: start2.loginRef }); // a rollback: unconditional
+        expect(rig.store.get().connections.c2.attempt).toBeUndefined();
+      });
+
+      it("onlyIfPending still cancels an attempt that has not taken its code", async () => {
+        const start = await rig.mgr.loginStart({ connectionId: "c1", provider: "fake" });
+        await rig.mgr.loginCancel({ connectionId: "c1", loginRef: start.loginRef, onlyIfPending: true });
+        expect(rig.store.get().connections.c1.attempt).toBeUndefined();
+      });
+
+      it("a ready attempt that is never promoted is discarded after readyAttemptTtlMs, which frees a reconnect that was answering busy", async () => {
+        const start = await rig.mgr.loginStart({ connectionId: "c1", provider: "fake" });
+        await rig.mgr.loginComplete(REQ(start.loginRef));
+        rig.clock.advance(DEFAULT_CONFIG.readyAttemptTtlMs - 1_000);
+        await rig.mgr.sweep();
+        expect(rig.store.get().connections.c1.attempt).toMatchObject({ state: "ready" }); // not yet
+        rig.clock.advance(2_000);
+        await rig.mgr.sweep();
+        expect(rig.store.get().connections.c1?.attempt).toBeUndefined();
+        const again = await rig.mgr.loginStart({ connectionId: "c1", provider: "fake" });
+        expect(again.loginRef).not.toBe(start.loginRef);
+      });
+
+      it("a ready attempt that IS promoted in time is untouched by the limit", async () => {
+        const start = await rig.mgr.loginStart({ connectionId: "c1", provider: "fake" });
+        await rig.mgr.loginComplete(REQ(start.loginRef));
+        rig.clock.advance(DEFAULT_CONFIG.readyAttemptTtlMs - 5_000);
+        await expect(rig.mgr.loginPromote({ connectionId: "c1", loginRef: start.loginRef, epoch: 1 })).resolves.toEqual({ state: "active", epoch: 1 });
+        rig.clock.advance(10 * 60 * 1000);
+        await rig.mgr.sweep();
+        expect(rig.store.get().connections.c1.state).toBe("active");
+      });
     });
 
     it("a wrong code discards the attempt, wipes it, frees its uid, and lets the user try again", async () => {

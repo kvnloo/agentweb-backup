@@ -296,7 +296,7 @@ const loginStartReply = z.object({
   userCode: z.string().optional(),
   expiresAtMs: z.number(),
 });
-const loginReadyReply = z.object({ status: z.literal("ready"), planLabel: z.string().optional(), accountFingerprint: z.string().optional(), refreshExpiresAtMs: z.number().optional() });
+const loginReadyReply = z.object({ status: z.literal("ready"), planLabel: z.string().optional(), accountFingerprint: z.string().optional(), refreshExpiresAtMs: z.number().optional(), completionNonce: z.string().optional() });
 const loginStatusReply = z.union([loginReadyReply, z.object({ status: z.enum(["pending", "failed"]) })]);
 const renewReply = z.object({ leaseMs: z.number().int().positive() });
 const hostInfoReply = z.object({ protocol: z.number().int().min(0), node: z.string().max(40), uptimeSec: z.number().int().min(0) });

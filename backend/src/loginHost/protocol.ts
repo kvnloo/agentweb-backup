@@ -23,7 +23,11 @@ import { z } from "zod";
  * The backend asks `host.info` once after it builds its client and logs a mismatch; an unknown route answers EINVALID/route (never
  * ENOTFOUND, which means "no such connection" and has a destructive meaning for revoke and the sweeper).
  */
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
+// History: 2 = the first shipped protocol. 3 (ENG-2110) adds, all OPTIONAL and additive: login.complete.completionNonce (the host records which complete took
+// the code and reports it back, so a loser of a double submit can stand down), login.cancel.onlyIfPending (a user-initiated cancel never discards a login
+// that is already ready) and, on the host only, a time limit for a ready attempt that is never promoted. The backend sends the new fields only to a worker
+// that reports 3 or more (loginHostProvider.workerProtocol()), so the two can deploy in either order.
 
 const ID = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/, "id: letters, digits, _ and - only, 1-64 chars");
 const PROVIDER = z.string().regex(/^[a-z][a-z0-9_]{0,31}$/);
@@ -37,9 +41,12 @@ const BRIDGE_TOKEN = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._~-]{15,511}$/); /
 const LOGIN_CODE = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._~#-]{7,511}$/); // never starts with "-"
 
 export const loginStartReq = z.object({ connectionId: ID, provider: PROVIDER, reconnect: z.boolean().optional() }).strict();
-export const loginCompleteReq = z.object({ connectionId: ID, loginRef: ID, code: LOGIN_CODE }).strict();
+/** A random per-request value (not a secret) the backend sends with each complete; the host stores it on the attempt that took the code and returns it with the ready status. */
+const COMPLETION_NONCE = z.string().regex(/^[A-Za-z0-9_-]{8,64}$/);
+export const loginCompleteReq = z.object({ connectionId: ID, loginRef: ID, code: LOGIN_CODE, completionNonce: COMPLETION_NONCE.optional() }).strict();
 export const loginStatusReq = z.object({ connectionId: ID, loginRef: ID }).strict();
-export const loginCancelReq = z.object({ connectionId: ID, loginRef: ID }).strict();
+/** `onlyIfPending`: do nothing if the attempt already took its code (a stray cancel must not discard a ready login). Rollbacks leave it off. */
+export const loginCancelReq = z.object({ connectionId: ID, loginRef: ID, onlyIfPending: z.boolean().optional() }).strict();
 /** Phase 3 of sign-in: the backend created the record (epoch 1 or the reconnect epoch) and asks the host to promote the attempt. */
 export const loginPromoteReq = z.object({ connectionId: ID, loginRef: ID, epoch: EPOCH }).strict();
 
