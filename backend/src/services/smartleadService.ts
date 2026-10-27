@@ -23,7 +23,12 @@ export interface SmartLeadMetrics {
 
 // ─── Constants ──────────────────────────────────────────────────────────
 
-const BASE_URL = "https://server.smartlead.ai/api/v1";
+const DEFAULT_BASE_URL = "https://server.smartlead.ai/api/v1";
+// Test environments can point at a local stub (test-env/smartlead-stub.js); never honoured in production.
+const BASE_URL =
+  process.env.NODE_ENV !== "production" && process.env.SMARTLEAD_API_BASE_URL
+    ? process.env.SMARTLEAD_API_BASE_URL.replace(/\/+$/, "")
+    : DEFAULT_BASE_URL;
 const LEADS_PAGE_LIMIT = 100;
 
 // ─── Helpers ────────────────────────────────────────────────────────────
