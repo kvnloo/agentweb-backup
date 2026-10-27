@@ -181,7 +181,14 @@ export class HostedSubscriptionService {
       }
       const expiresAtMs = Math.min(started.expiresAtMs, this.deps.now() + LOGIN_TTL_MS);
       // Sealed so that ANY backend instance can finish this sign-in (a deploy replaces the instance that started it).
-      const loginId = sealSignInToken({ userId: actor.userId, provider: p.route, connectionId, loginRef: started.loginRef, reconnect: !!input.reconnectConnectionId, expiresAtMs });
+      let loginId: string;
+      try {
+        loginId = sealSignInToken({ userId: actor.userId, provider: p.route, connectionId, loginRef: started.loginRef, reconnect: !!input.reconnectConnectionId, expiresAtMs });
+      } catch (err) {
+        // No token, so nobody can ever complete this attempt: do not leave it on the host to block the next sign-in.
+        await client.loginCancel({ connectionId, loginRef: started.loginRef }).catch(() => undefined);
+        throw err;
+      }
       const key = signInKey(connectionId, started.loginRef);
       const timer = setTimeout(() => void this.expire(key), Math.max(1_000, expiresAtMs - this.deps.now()));
       timer.unref?.();

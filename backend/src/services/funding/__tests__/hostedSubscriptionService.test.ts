@@ -147,6 +147,18 @@ describe("hosted subscription service", () => {
       expect(rig.mgr.status({ connectionId: "conn-1" }).state).toBe("active");
     });
 
+    it("a sign-in whose token cannot be made is cancelled on the host, so it does not block the next one", async () => {
+      const saved = process.env.JWT_SECRET;
+      delete process.env.JWT_SECRET;
+      try {
+        await expect(svc.startLogin(user, "claude")).rejects.toThrow();
+      } finally {
+        process.env.JWT_SECRET = saved;
+      }
+      expect(rig.script.loginsCancelled).toBe(1);
+      expect(await codeOf(svc.startLogin(user, "claude"))).toBe("resolved");
+    });
+
     describe("a sign-in outlives the instance that started it (deploys, a second instance)", () => {
       // Dropping the in-memory map is what a replaced or different backend instance looks like to a `complete`.
       const otherInstance = () => (svc as unknown as { pending: Map<string, unknown> }).pending.clear();
