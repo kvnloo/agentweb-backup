@@ -92,7 +92,7 @@ const homesLeft = () => {
   }
 };
 const touched = new Set<string>();
-const touchedHost = new Set<string>(); // host-side connections made by hand in the --hardening / --ready-ttl scenarios
+const touchedHost = new Map<string, string>(); // connectionId -> loginRef of attempts made by hand in the --hardening / --ready-ttl scenarios
 let BASE_HOMES = 0;
 
 /** Started here, completed by two OTHER service objects at once (a deploy swap plus a double submit). */
@@ -124,7 +124,7 @@ async function signIn(label: string, reconnectConnectionId?: string) {
 async function hardening() {
   const started = await svc.startLogin(user, "claude");
   const { connectionId, loginRef } = (svc as unknown as { lookup(id: string): { pending: { connectionId: string; loginRef: string } } }).lookup(started.loginId).pending;
-  touchedHost.add(connectionId);
+  touchedHost.set(connectionId, loginRef);
   console.log(`\n[hardening] Open this URL in a browser (do NOT paste it anywhere), sign in, and copy the code shown:\n${started.authorizeUrl}\n`);
   const code = await readHidden("Paste the code (hidden): ");
   const raw = new LoginHostClient(new UnixSocketTransport(SOCK));
@@ -166,8 +166,8 @@ async function hardening() {
 async function readyTtl() {
   const raw = new LoginHostClient(new UnixSocketTransport(SOCK));
   const connectionId = `zz-live-ttl-${randomBytes(4).toString("hex")}`;
-  touchedHost.add(connectionId);
   const started = await raw.loginStart({ connectionId, provider: "claude" });
+  touchedHost.set(connectionId, started.loginRef);
   console.log(`\n[ready-ttl] Open this URL in a browser (do NOT paste it anywhere), sign in, and copy the code shown:\n${started.url}\n`);
   const code = await readHidden("Paste the code (hidden): ");
   const ready = await raw.loginComplete({ connectionId, loginRef: started.loginRef, code, completionNonce: "live-ttl-000001" });
@@ -240,6 +240,13 @@ main()
   .catch((e) => check("runner", false, e instanceof HostedSubscriptionError ? e.code : String((e as { code?: string }).code ?? (e as Error).message).slice(0, 120)))
   .finally(async () => {
     // Whatever happened: disconnect anything this run created (so no login stays on the host), then delete our rows.
+    // Attempts made by hand (--hardening / --ready-ttl): cancel the attempt, then disconnect the connection if one exists, so nothing is left on the host.
+    for (const [connectionId, loginRef] of touchedHost) {
+      const raw = new LoginHostClient(new UnixSocketTransport(SOCK));
+      await raw.loginCancel({ connectionId, loginRef }).catch(() => undefined);
+      const st = await raw.connectionStatus({ connectionId }).catch(() => undefined);
+      if (st && st.state !== "revoked") await raw.connectionRevoke({ connectionId, epoch: st.epoch }).catch(() => undefined);
+    }
     for (const id of touched) {
       try {
         const r = await db.get(id);
