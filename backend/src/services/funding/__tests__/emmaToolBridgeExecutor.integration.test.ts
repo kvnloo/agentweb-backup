@@ -8,6 +8,7 @@ import { agentModeService } from '../../agentModeService';
 import { ToolBridge } from '../toolBridge';
 import { EmmaToolBridgeExecutor } from '../emmaToolBridgeExecutor';
 import * as toolDispatch from '../../agentMode/core/toolDispatch';
+import { currentRunFunding, type RunFunding } from '../runFunding';
 
 jest.mock('openai');
 jest.mock('../../settingsService');
@@ -45,6 +46,12 @@ const probeLaunch = jest.fn(async (args: any) => {
 // Flags the loop does NOT stop the turn for.
 const probeSoftConfirm = jest.fn(async () => ({ success: true, requiresConfirmation: true, message: 'Are you sure?' }));
 const probeFailedConfirm = jest.fn(async () => ({ success: false, error: 'blocked', awaitingUserConfirmation: true }));
+// Records the funding scope the tool's own calls would run under.
+let seenFunding: RunFunding | undefined | 'unset' = 'unset';
+const probeFunding = jest.fn(async () => {
+  seenFunding = currentRunFunding();
+  return { success: true, content: 'funding probe ok' };
+});
 const probeFail = jest.fn(async () => {
   throw new Error('provider exploded');
 });
@@ -95,6 +102,7 @@ describe('tool bridge against the real agentModeService and dispatcher (ENG-2109
     registry.register(
       tool('launch_bridge_probe', probeLaunch, { confirm: { type: 'boolean' }, preview_token: { type: 'string' } }),
     );
+    registry.register(tool('get_bridge_funding_probe', probeFunding));
     registry.register(tool('update_bridge_failing_probe', probeFail));
     registry.register(tool('delete_bridge_soft_probe', probeSoftConfirm));
     registry.register(tool('update_bridge_failed_confirm_probe', probeFailedConfirm));
@@ -174,6 +182,22 @@ describe('tool bridge against the real agentModeService and dispatcher (ENG-2109
     const refused = await bridge.callTool(token, { name: 'get_bridge_probe', args: {} });
     expect(refused.isError).toBe(true);
     expect(probeRead).not.toHaveBeenCalled();
+  });
+
+  it('runs a tool under the funding scope the run was registered with, and under none when it has none', async () => {
+    const scope: RunFunding = { route: 'agentweb', fallback: 'agentweb', ownerUserId: 'u1', billingUserId: 'u1', runLabel: 'claude_plan:run-bridge-1', resolvedAt: '2026-10-26T00:00:00.000Z' };
+    const executor = new EmmaToolBridgeExecutor();
+    const bridge = new ToolBridge(executor);
+    executor.registerRun(RUN.runId, { llmModel: agentModeService.default_model, mockMode: false, fundingScope: scope });
+    const token = bridge.openRun(RUN);
+    seenFunding = 'unset';
+    expect((await bridge.callTool(token, { name: 'get_bridge_funding_probe', args: {} })).isError).toBe(false);
+    expect(seenFunding).toEqual(scope);
+
+    const plain = openBridge();
+    seenFunding = 'unset';
+    await plain.bridge.callTool(plain.token, { name: 'get_bridge_funding_probe', args: {} });
+    expect(seenFunding).toBeUndefined(); // no scope registered: the ambient store is empty, as before this change
   });
 
   it('executes an allowed tool through the real dispatcher and returns its result', async () => {

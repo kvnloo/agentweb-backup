@@ -10,6 +10,7 @@ import { DRAIN_CEILING_MS, DRAIN_POLL_INTERVAL_MS } from '../utils/shutdownConst
 import type { WorkPlanTurnDisposition } from './agentMode/core/workPlanTurnDisposition';
 import type { PendingApprovalDeck } from './agentMode/core/approvalDeck';
 import type { RunFunding } from './funding/runFunding';
+import { claudeRunRegistry } from './funding/claudeRunRegistry';
 
 export interface GenerateMarketingResponseParams {
   messageContent: string;
@@ -371,6 +372,9 @@ export class GenerateMarketingResponseWorkerService {
    * Send a cancel signal to the worker for a given session
    */
   cancelSession(sessionId: string): void {
+    // ENG-2113: a turn on the user's own Claude plan runs in THIS process, not the worker, so the worker message below never reaches it.
+    // Every Stop / timeout / preemption site already calls this method; the registry is a no-op for any session without a Claude turn.
+    claudeRunRegistry.cancel(sessionId);
     const requestId = this.sessionToRequestId.get(sessionId);
     if (requestId && this.worker && !this.worker.killed) {
       this.worker.send({ type: 'cancel', requestId });
@@ -406,10 +410,15 @@ export class GenerateMarketingResponseWorkerService {
 
     const deadline = Date.now() + Math.max(0, ceilingMs);
 
-    while (this.pendingRequests.size > 0 && Date.now() < deadline) {
+    // ENG-2113: a turn on the user's own Claude plan runs in this process, not the worker, so it is not in pendingRequests. It is waited for
+    // the same way (and stopped, gracefully for the host, if the ceiling is reached) so a deploy does not cut it off mid-write.
+    while ((this.pendingRequests.size > 0 || claudeRunRegistry.size > 0) && Date.now() < deadline) {
       await new Promise(resolve => setTimeout(resolve, Math.min(DRAIN_POLL_INTERVAL_MS, Math.max(0, deadline - Date.now()))));
     }
 
+    if (claudeRunRegistry.size > 0) {
+      console.warn(`[Worker] Drain ceiling reached — stopping ${claudeRunRegistry.cancelAll()} Claude plan turn(s)`);
+    }
     if (this.pendingRequests.size > 0) {
       console.warn(`[Worker] Drain ceiling reached — ${this.pendingRequests.size} request(s) still in-flight; force-killing`);
       this.failAllPendingRequests(new Error('Worker shutdown — drain ceiling exceeded'));

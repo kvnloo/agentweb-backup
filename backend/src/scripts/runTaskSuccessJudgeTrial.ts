@@ -24,6 +24,7 @@ import AWS from 'aws-sdk';
 import { createHash } from 'node:crypto';
 import { writeFileSync } from 'node:fs';
 import { argv, exit } from 'node:process';
+import { TABLE_PREFIX } from '../config/constants';
 import { goldenSetStoreFromEnv, GOLDEN_CASES_TABLE_ENV } from '../loops/eval/goldenSetStore';
 import { loadTraceForGrading } from '../loops/eval/runValidation';
 import type { ReadOnlyDocReader } from '../loops/eval/agentGraderLoader';
@@ -136,8 +137,7 @@ async function main(): Promise<void> {
     query: (request) => doc.query(request as AWS.DynamoDB.DocumentClient.QueryInput).promise(),
     scan: (request) => doc.scan(request as AWS.DynamoDB.DocumentClient.ScanInput).promise(),
   };
-  const prefix = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
-  const tables = { sessions: `${prefix}AW-ChatSessions`, messages: `${prefix}AW-ChatMessages` };
+  const tables = { sessions: `${TABLE_PREFIX}AW-ChatSessions`, messages: `${TABLE_PREFIX}AW-ChatMessages` };
 
   const cases = (await store.listCases('agent'))
     .filter((c) => c.split === args.split && c.sourceRef.kind === 'sessionId')

@@ -3,7 +3,7 @@
  * zomaOnboarding.ts so the Meta Toolkit manifest can advertise them without importing
  * services. Handlers live in zomaOnboarding.ts and are dispatched by the toolkit gateway.
  */
-export const ZOMA_TOOL_NAMES = ['zoma_status', 'zoma_usage'] as const;
+export const ZOMA_TOOL_NAMES = ['zoma_status', 'zoma_usage', 'zoma_prepare_upload'] as const;
 export type ZomaToolName = (typeof ZOMA_TOOL_NAMES)[number];
 
 export function isZomaTool(name: string): name is ZomaToolName {
@@ -22,5 +22,19 @@ export const ZOMA_TOOL_DEFINITIONS = [
     description:
       "Shows this month's Zoma usage for the logged-in user: tool calls, and writes sent to Meta with their read-back result (confirmed, mismatch, unconfirmed). Call when the user asks what they have used. Billing is not enabled yet; usage is only recorded.",
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  {
+    name: 'zoma_prepare_upload',
+    description:
+      'Upload a creative (image or video) that is on the user\'s computer, e.g. a batch exported from Higgsfield, Midjourney or Canva. Returns a one-time upload_command (curl PUT, 15 minutes) and a file_url. Run the command with the real local path, then pass file_url as params.image_url to AD_CREATIVE UPLOAD_IMAGE or params.video_url to AD_CREATIVE UPLOAD_VIDEO. Not needed when the file already has a public https URL; pass that URL directly. One call per file.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        filename: { type: 'string', description: 'The local file name including extension: .jpg .jpeg .png .gif .webp (images, max 30 MB) or .mp4 .mov .m4v .webm (videos, max 1 GB).' },
+        size_bytes: { type: 'number', description: 'Optional file size in bytes, checked against the limit before uploading.' },
+      },
+      required: ['filename'],
+      additionalProperties: false,
+    },
   },
 ];

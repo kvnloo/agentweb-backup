@@ -23,7 +23,13 @@ export interface SmartLeadMetrics {
 
 // ─── Constants ──────────────────────────────────────────────────────────
 
-const BASE_URL = "https://server.smartlead.ai/api/v1";
+const DEFAULT_BASE_URL = "https://server.smartlead.ai/api/v1";
+// Test environments can point at a local stub (test-env/smartlead-stub.js). Honoured only when NODE_ENV is
+// explicitly development or test, so an unset NODE_ENV (as in a real deployment) can never redirect customer keys.
+const BASE_URL =
+  (process.env.NODE_ENV === "development" || process.env.NODE_ENV === "test") && process.env.SMARTLEAD_API_BASE_URL
+    ? process.env.SMARTLEAD_API_BASE_URL.replace(/\/+$/, "")
+    : DEFAULT_BASE_URL;
 const LEADS_PAGE_LIMIT = 100;
 
 // ─── Helpers ────────────────────────────────────────────────────────────
@@ -145,12 +151,21 @@ export class SmartleadApiError extends Error {
   }
 }
 
+/** A 200 whose body is not the list we asked for (a wrong-key or wrong-plan reply may look like this). */
+export class SmartleadUnexpectedResponseError extends SmartleadApiError {
+  constructor(message: string) {
+    super(message);
+    this.name = "SmartleadUnexpectedResponseError";
+  }
+}
+
 export async function smartleadRequest<T>(
   apiKey: string,
   method: "GET" | "POST" | "PATCH" | "DELETE",
   path: string,
-  opts: { params?: Record<string, unknown>; data?: unknown } = {},
+  opts: { params?: Record<string, unknown>; data?: unknown; maxRetries?: number } = {},
 ): Promise<T> {
+  const maxRetries = opts.maxRetries ?? clientOptions.maxRetries;
   for (let attempt = 0; ; attempt++) {
     await acquireThrottleSlot();
     try {
@@ -168,7 +183,7 @@ export async function smartleadRequest<T>(
         response?: { status?: number; headers?: Record<string, unknown> };
       };
       const status: number | undefined = error?.response?.status;
-      if (status === 429 && attempt < clientOptions.maxRetries) {
+      if (status === 429 && attempt < maxRetries) {
         await sleepFn(retryDelayMs(attempt, error?.response?.headers?.["retry-after"]));
         continue;
       }
@@ -219,6 +234,48 @@ async function fetchCampaignLeads(
   }
 
   return { total, leads: allLeads };
+}
+
+const EMAIL_ACCOUNTS_MAX_PAGES = 20;
+
+export interface SmartleadEmailAccount {
+  id: number;
+  email: string;
+}
+
+/**
+ * The mailboxes attached to a Smartlead key (ENG-673). Also the key check on connect: a rejected
+ * key or unusable plan throws a SmartleadApiError carrying the HTTP status, and so does any
+ * response that is not a list (no status), so an unvalidated key is never reported as valid.
+ *
+ * The first request sends no paging parameters, because they are not verified against a live
+ * account; later pages ask for `offset` = mailboxes seen so far, and paging stops on an empty page
+ * or a page with nothing new (an API that ignores the offset).
+ */
+export async function listEmailAccounts(
+  apiKey: string,
+  opts: { maxRetries?: number; maxPages?: number } = {},
+): Promise<SmartleadEmailAccount[]> {
+  const maxPages = Math.min(opts.maxPages ?? EMAIL_ACCOUNTS_MAX_PAGES, EMAIL_ACCOUNTS_MAX_PAGES);
+  // Keyed by id; a row whose id we cannot read (the field name is unverified) is still a mailbox, so it is kept under a position key.
+  const seen = new Map<number | string, SmartleadEmailAccount>();
+  for (let page = 0; page < maxPages; page++) {
+    const data = await smartleadRequest<unknown>(apiKey, "GET", "/email-accounts", {
+      params: page === 0 ? undefined : { offset: seen.size },
+      maxRetries: opts.maxRetries,
+    });
+    if (!Array.isArray(data)) {
+      throw new SmartleadUnexpectedResponseError("Smartlead GET /email-accounts returned an unexpected response");
+    }
+    const before = seen.size;
+    data.forEach((row: { id?: unknown; from_email?: unknown } | null, i) => {
+      const id = Number(row?.id);
+      const key = Number.isFinite(id) ? id : `row-${before + i}`;
+      if (!seen.has(key)) seen.set(key, { id: Number.isFinite(id) ? id : 0, email: String(row?.from_email ?? "") });
+    });
+    if (data.length === 0 || seen.size === before) break;
+  }
+  return [...seen.values()];
 }
 
 async function fetchEmailAccounts(apiKey: string): Promise<number> {
