@@ -86,7 +86,7 @@ export const SMARTLEAD_PUSH_RUNS_TABLE_SPEC: AWS.DynamoDB.CreateTableInput = {
         { AttributeName: "ownerId", KeyType: "HASH" },
         { AttributeName: "createdAt", KeyType: "RANGE" },
       ],
-      Projection: { ProjectionType: "INCLUDE", NonKeyAttributes: SUMMARY_ATTRIBUTES },
+      Projection: { ProjectionType: "INCLUDE", NonKeyAttributes: [...SUMMARY_ATTRIBUTES, "listId"] },
     },
     {
       IndexName: RUNS_BY_TIME_INDEX,
@@ -200,7 +200,7 @@ export interface NewPushRun {
 
 export interface AdvanceStep {
   /** Where the walk is now: the key of the last lead examined. */
-  cursor: LeadCursor | null;
+  cursor: LeadCursor;
   listExhausted?: boolean;
   counts: Partial<Record<"examined" | "added" | "alreadyInCampaign" | "unconfirmed" | "withdrawn", number>>;
   /** Skip reasons for this batch, e.g. `{ missing_tag: 3 }`. */
@@ -378,6 +378,14 @@ function storeError(error: any): SmartleadPushRunStoreError {
   return new SmartleadPushRunStoreError("unavailable", `The Smartlead push runs table could not be used (${code ?? "unknown error"})`);
 }
 
+/** Smartlead puts the API key in the URL (?api_key=), and error text can echo it: nothing free-form is stored unredacted. */
+export function redactSecrets(text: string): string {
+  return text
+    .replace(/(api[_-]?key|token|secret|password)=[^&\s"']+/gi, "$1=[redacted]")
+    .replace(/bearer\s+[A-Za-z0-9._~+/-]+=*/gi, "Bearer [redacted]")
+    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[email]");
+}
+
 const REASON = /^[a-z][a-z0-9_]{0,39}$/;
 
 // ─── Repository ─────────────────────────────────────────────────────────
@@ -424,13 +432,30 @@ export class SmartleadPushRunDb {
   }
 
   private async queryIndex(index: string, keyExpr: string, names: Record<string, string>, values: Record<string, any>, limit: number, newestFirst: boolean): Promise<PushRunSummary[]> {
-    const r = await this.call(() =>
-      this.client.query({ TableName: this.table, IndexName: index, KeyConditionExpression: keyExpr, ExpressionAttributeNames: names, ExpressionAttributeValues: values, Limit: limit, ScanIndexForward: !newestFirst }).promise(),
-    );
-    if (!r.ok) return [];
-    const nowS = Math.floor(this.nowMs() / 1000);
-    // TTL deletion lags by up to about two days, so an expired item can still be returned: never show it.
-    return (r.value.Items ?? []).filter(i => !(typeof i.ttl === "number" && i.ttl <= nowS)).map(toSummary);
+    const out: PushRunSummary[] = [];
+    let startKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    // Pages until `limit` readable, unexpired rows are found: a TTL-expired or unreadable row must not hide a later healthy one.
+    for (let page = 0; page < 10 && out.length < limit; page++) {
+      const r = await this.call(() =>
+        this.client.query({ TableName: this.table, IndexName: index, KeyConditionExpression: keyExpr, ExpressionAttributeNames: names, ExpressionAttributeValues: values, Limit: limit, ScanIndexForward: !newestFirst, ...(startKey ? { ExclusiveStartKey: startKey } : {}) }).promise(),
+      );
+      if (!r.ok) return out;
+      const nowS = Math.floor(this.nowMs() / 1000);
+      for (const item of r.value.Items ?? []) {
+        // TTL deletion lags by up to about two days, so an expired item can still be returned: never show it.
+        if (typeof item.ttl === "number" && item.ttl <= nowS) continue;
+        try {
+          out.push(toSummary(item));
+        } catch (error) {
+          // One row written by newer code must not stop the resumer from seeing the healthy ones; getRun still refuses it.
+          console.warn("[smartleadPushRunDb] skipping an unreadable run row", item?.pk, (error as Error).message);
+        }
+        if (out.length >= limit) break;
+      }
+      startKey = r.value.LastEvaluatedKey;
+      if (!startKey) break;
+    }
+    return out;
   }
 
   listRunsForList(listId: string, limit = 25): Promise<PushRunSummary[]> {
@@ -465,6 +490,7 @@ export class SmartleadPushRunDb {
    */
   async startRun(input: NewPushRun, workerId: string): Promise<StartResult> {
     if (!Number.isInteger(input.campaignId) || input.campaignId <= 0 || !input.listId) throw new SmartleadPushRunStoreError("invalid_input", "A push run needs a list and a positive campaign id");
+    if (!input.ownerId || !input.pushedBy || !input.keyOwnerId || !workerId) throw new SmartleadPushRunStoreError("invalid_input", "A push run needs an owner, a pusher, a key owner and a worker id");
 
     const held = await this.getLock(input.listId, input.campaignId);
     let takeOver: string | undefined;
@@ -520,6 +546,12 @@ export class SmartleadPushRunDb {
       const existing = winner ? await this.getRun(winner.runId) : null;
       return { started: false, existing, ...(winner && !existing ? { lockHeldBy: winner.runId } : {}) };
     }
+    // The resumer may have canceled our Run as an orphan between the two writes: do not hand back a run that is already dead.
+    const check = await this.getRun(run.runId);
+    if (!check || check.status !== "running") {
+      await this.safeRelease(input.listId, input.campaignId, run.runId);
+      return { started: false, existing: null };
+    }
     return { started: true, run };
   }
 
@@ -539,8 +571,28 @@ export class SmartleadPushRunDb {
 
   // ── lease
 
+  /**
+   * Re-takes the lock for a run about to become live again (claim or resume) and refreshes its expiry. Fails if the lock points at
+   * another run: the lock's 15-day expiry can pass while a run sits paused, and a new run may have started since.
+   */
+  private async retakeLock(run: PushRun): Promise<boolean> {
+    const now = this.nowMs();
+    const r = await this.call(() =>
+      this.client.put({
+        TableName: this.table,
+        Item: { pk: lockKey(run.listId, run.campaignId), sk: LOCK_SK, runId: run.runId, ttl: Math.floor(now / 1000) + LOCK_RETENTION_DAYS * DAY_S },
+        ConditionExpression: "attribute_not_exists(pk) OR #r = :me",
+        ExpressionAttributeNames: { "#r": "runId" },
+        ExpressionAttributeValues: { ":me": run.runId },
+      }).promise(),
+    );
+    return r.ok;
+  }
+
   /** Takes over a run whose lease lapsed (or that was released). Returns the run with the new epoch, or null if someone else got it. */
   async claimLease(runId: string, workerId: string, seenEpoch: number, skewMs = 30_000): Promise<PushRun | null> {
+    const current = await this.getRun(runId);
+    if (!current || current.status !== "running" || !(await this.retakeLock(current))) return null;
     const now = this.nowMs();
     const r = await this.call(() =>
       this.client.update({
@@ -581,6 +633,7 @@ export class SmartleadPushRunDb {
   async advance(runId: string, epoch: number, step: AdvanceStep): Promise<boolean> {
     // DynamoDB rejects a request that declares a name or value the expression does not use, so each is added only when it is used.
     const names: Record<string, string> = { "#s": "status", "#cur": "cursor", "#ba": "batchAttempts" };
+    if (!step.cursor?.listId || !step.cursor?.leadId) throw new SmartleadPushRunStoreError("invalid_input", "advance needs a cursor: a null cursor would rewind the walk");
     const values: Record<string, any> = { ":e": epoch, ":running": "running", ":until": this.nowMs() + LEASE_MS, ":zero": 0, ":cursor": step.cursor };
     const sets = ["#cur = :cursor", "#ba = :zero", "leaseUntil = :until"];
     let i = 0;
@@ -661,7 +714,7 @@ export class SmartleadPushRunDb {
         UpdateExpression: "SET #s = :paused, #a = :p, pauseReason = :why",
         ConditionExpression: epoch === undefined ? "#s = :running" : "#s = :running AND leaseEpoch = :e",
         ExpressionAttributeNames: { "#s": "status", "#a": "active" },
-        ExpressionAttributeValues: { ":paused": "paused", ":p": "P", ":why": reason.slice(0, 200), ":running": "running", ...(epoch === undefined ? {} : { ":e": epoch }) },
+        ExpressionAttributeValues: { ":paused": "paused", ":p": "P", ":why": redactSecrets(reason).slice(0, 200), ":running": "running", ...(epoch === undefined ? {} : { ":e": epoch }) },
       }).promise(),
     );
     return r.ok;
@@ -669,6 +722,8 @@ export class SmartleadPushRunDb {
 
   /** Resumes a paused or partial run under a new lease epoch. */
   async resumeRun(runId: string, workerId: string, seenEpoch: number): Promise<PushRun | null> {
+    const current = await this.getRun(runId);
+    if (!current || (current.status !== "paused" && current.status !== "partial") || !(await this.retakeLock(current))) return null;
     const now = this.nowMs();
     const r = await this.call(() =>
       this.client.update({
@@ -700,7 +755,7 @@ export class SmartleadPushRunDb {
     );
     if (!r.ok || !r.value.Attributes) return false;
     const run = fromRunItem(r.value.Attributes);
-    await this.releaseLock(run.listId, run.campaignId, runId);
+    await this.safeRelease(run.listId, run.campaignId, runId);
     return true;
   }
 
@@ -721,18 +776,27 @@ export class SmartleadPushRunDb {
           ":e": epoch,
           ":running": "running",
           ...(status === "completed" ? { ":true": true } : {}),
-          ...(failure ? { ":failure": { code: failure.code.slice(0, 60), message: failure.message.slice(0, 500) } } : {}),
+          ...(failure ? { ":failure": { code: redactSecrets(failure.code).slice(0, 60), message: redactSecrets(failure.message).slice(0, 500) } } : {}),
         },
         ReturnValues: "ALL_NEW",
       }).promise(),
     );
     if (!r.ok || !r.value.Attributes) return false;
     const run = fromRunItem(r.value.Attributes);
-    await this.releaseLock(run.listId, run.campaignId, runId);
+    await this.safeRelease(run.listId, run.campaignId, runId);
     return true;
   }
 
   // ── lock
+
+  /** Release that never throws: the run's own write already succeeded, and a leaked lock is taken over by the next start. */
+  private async safeRelease(listId: string, campaignId: number, runId: string): Promise<void> {
+    try {
+      await this.releaseLock(listId, campaignId, runId);
+    } catch (error) {
+      console.warn("[smartleadPushRunDb] could not release the lock for", runId, (error as Error).message);
+    }
+  }
 
   /** Deletes the lock only if it still points at this run. */
   async releaseLock(listId: string, campaignId: number, runId: string): Promise<void> {

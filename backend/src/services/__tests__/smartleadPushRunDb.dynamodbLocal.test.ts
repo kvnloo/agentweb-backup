@@ -147,7 +147,7 @@ suite('SmartleadPushRunDb against DynamoDB Local (ENG-673)', () => {
 
     it('never claims a finished, canceled or paused run, even though its old lease has lapsed (a stale index row must not revive it)', async () => {
       const done = await fresh();
-      await db.advance(done.runId, 1, { cursor: null, counts: {}, listExhausted: true });
+      await db.advance(done.runId, 1, { cursor: { listId: 'l', leadId: 'x' }, counts: {}, listExhausted: true });
       await db.finishRun(done.runId, 1, 'completed');
       const canceled = await fresh();
       await db.cancelRun(canceled.runId);
@@ -190,19 +190,19 @@ suite('SmartleadPushRunDb against DynamoDB Local (ENG-673)', () => {
 
     it('rejects a bad count or skip-reason name before it reaches DynamoDB', async () => {
       const run = await fresh();
-      await expect(db.advance(run.runId, 1, { cursor: null, counts: {}, skipped: { 'bad reason!': 1 } })).rejects.toMatchObject({ code: 'invalid_input' });
-      await expect(db.advance(run.runId, 1, { cursor: null, counts: { examined: -1 } })).rejects.toMatchObject({ code: 'invalid_input' });
-      await expect(db.advance(run.runId, 1, { cursor: null, counts: { bogus: 1 } as any })).rejects.toMatchObject({ code: 'invalid_input' });
+      await expect(db.advance(run.runId, 1, { cursor: { listId: 'l', leadId: 'x' }, counts: {}, skipped: { 'bad reason!': 1 } })).rejects.toMatchObject({ code: 'invalid_input' });
+      await expect(db.advance(run.runId, 1, { cursor: { listId: 'l', leadId: 'x' }, counts: { examined: -1 } })).rejects.toMatchObject({ code: 'invalid_input' });
+      await expect(db.advance(run.runId, 1, { cursor: { listId: 'l', leadId: 'x' }, counts: { bogus: 1 } as any })).rejects.toMatchObject({ code: 'invalid_input' });
     });
 
     it('stops a worker whose run was paused or canceled: the next advance fails, and nothing is overwritten', async () => {
       const paused = await fresh();
       expect(await db.pauseRun(paused.runId, 'sequence_changed')).toBe(true);
-      expect(await db.advance(paused.runId, 1, { cursor: null, counts: { examined: 1 } })).toBe(false);
+      expect(await db.advance(paused.runId, 1, { cursor: { listId: 'l', leadId: 'x' }, counts: { examined: 1 } })).toBe(false);
       expect(await db.heartbeat(paused.runId, 1)).toBe(false);
       const canceled = await fresh();
       expect(await db.cancelRun(canceled.runId)).toBe(true);
-      expect(await db.advance(canceled.runId, 1, { cursor: null, counts: { examined: 1 } })).toBe(false);
+      expect(await db.advance(canceled.runId, 1, { cursor: { listId: 'l', leadId: 'x' }, counts: { examined: 1 } })).toBe(false);
       expect(await db.finishRun(canceled.runId, 1, 'completed')).toBe(false);
       expect((await db.getRun(canceled.runId))!.status).toBe('canceled');
     });
@@ -291,7 +291,7 @@ suite('SmartleadPushRunDb against DynamoDB Local (ENG-673)', () => {
 
     it('drops a finished run from the resume index', async () => {
       const run = await fresh();
-      await db.advance(run.runId, 1, { cursor: null, counts: {}, listExhausted: true });
+      await db.advance(run.runId, 1, { cursor: { listId: 'l', leadId: 'x' }, counts: {}, listExhausted: true });
       await db.finishRun(run.runId, 1, 'completed');
       clock += LEASE_MS + 100_000;
       expect((await db.findExpiredLeases(500)).map(r => r.runId)).not.toContain(run.runId);
@@ -314,6 +314,106 @@ suite('SmartleadPushRunDb against DynamoDB Local (ENG-673)', () => {
       const run = await fresh();
       await doc.update({ TableName: table, Key: { pk: run.runId, sk: 'RUN' }, UpdateExpression: 'SET #t = :t', ExpressionAttributeNames: { '#t': 'ttl' }, ExpressionAttributeValues: { ':t': Math.floor(clock / 1000) - 10 } }).promise();
       expect((await db.listRunsForList(run.listId)).map(r => r.runId)).not.toContain(run.runId);
+    });
+  });
+
+  describe('review findings (PR-B review 1)', () => {
+    it('redacts keys, tokens and emails from stored failure text and pause reasons', async () => {
+      const a = await fresh();
+      await db.finishRun(a.runId, 1, 'failed', { code: 'http_401', message: 'GET https://server.smartlead.ai/api/v1/campaigns?api_key=SECRET123&x=1 failed for a@b.com; Bearer abc.def' });
+      const stored = JSON.stringify((await db.getRun(a.runId))!.failure);
+      expect(stored).not.toMatch(/SECRET123|a@b\.com|abc\.def/);
+      const b = await fresh();
+      await db.pauseRun(b.runId, 'bad ?api_key=SECRET123');
+      expect((await db.getRun(b.runId))!.pauseReason).not.toContain('SECRET123');
+    });
+
+    it('will not revive a paused run whose lock now belongs to a newer run (resume and claim both re-take the lock)', async () => {
+      const a = await fresh();
+      await db.pauseRun(a.runId, 'user');
+      await doc.delete({ TableName: table, Key: { pk: `LOCK#${a.listId}#${a.campaignId}`, sk: 'LOCK' } }).promise(); // the lock's own expiry
+      const b = await db.startRun(input({ listId: a.listId }), 'w');
+      expect(b.started).toBe(true);
+      expect(await db.resumeRun(a.runId, 'w', 1)).toBeNull();
+      expect((await db.getRun(a.runId))!.status).toBe('paused');
+      // a running run whose lock was taken by another run cannot be claimed either
+      const c = await fresh();
+      await doc.put({ TableName: table, Item: { pk: `LOCK#${c.listId}#${c.campaignId}`, sk: 'LOCK', runId: 'OTHER', ttl: 9999999999 } }).promise();
+      clock += LEASE_MS + 100_000;
+      expect(await db.claimLease(c.runId, 'w', 1)).toBeNull();
+    });
+
+    it('resume re-creates a lock that expired, and refreshes it', async () => {
+      const a = await fresh();
+      await db.pauseRun(a.runId, 'user');
+      await doc.delete({ TableName: table, Key: { pk: `LOCK#${a.listId}#${a.campaignId}`, sk: 'LOCK' } }).promise();
+      expect(await db.resumeRun(a.runId, 'w', 1)).toMatchObject({ status: 'running' });
+      expect(await db.getLock(a.listId, a.campaignId)).toEqual({ runId: a.runId });
+    });
+
+    it("shows the list on an owner's history rows", async () => {
+      const a = await fresh({ ownerId: 'owner-L' });
+      expect((await db.listRunsForOwner('owner-L'))[0]).toMatchObject({ runId: a.runId, listId: a.listId });
+    });
+
+    it('skips an unreadable row instead of failing the whole resumer query', async () => {
+      const bad = await fresh();
+      const good = await fresh();
+      await doc.update({ TableName: table, Key: { pk: bad.runId, sk: 'RUN' }, UpdateExpression: 'SET #s = :s', ExpressionAttributeNames: { '#s': 'status' }, ExpressionAttributeValues: { ':s': 'preparing' } }).promise();
+      clock += LEASE_MS + 100_000;
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      const ids = (await db.findExpiredLeases(500)).map(r => r.runId);
+      warn.mockRestore();
+      expect(ids).toContain(good.runId);
+      expect(ids).not.toContain(bad.runId);
+    });
+
+    it('pages past expired rows to fill the limit', async () => {
+      const listId = `list_${ulid()}`;
+      const runs = [];
+      for (let n = 1; n <= 4; n++) { clock += 1000; runs.push(await fresh({ listId, campaignId: n })); }
+      for (const r of runs.slice(2)) await doc.update({ TableName: table, Key: { pk: r.runId, sk: 'RUN' }, UpdateExpression: 'SET #t = :t', ExpressionAttributeNames: { '#t': 'ttl' }, ExpressionAttributeValues: { ':t': Math.floor(clock / 1000) - 10 } }).promise();
+      expect((await db.listRunsForList(listId, 2)).map(r => r.runId).sort()).toEqual([runs[0].runId, runs[1].runId].sort());
+    });
+
+    it('does not throw when the lock cannot be released after the run itself ended', async () => {
+      const a = await fresh();
+      const flaky = new SmartleadPushRunDb({ get: doc.get.bind(doc), put: doc.put.bind(doc), query: doc.query.bind(doc), update: doc.update.bind(doc), delete: () => ({ promise: async () => { throw Object.assign(new Error('no'), { code: 'AccessDeniedException' }); } }) } as any, table, () => clock, async () => {});
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      expect(await flaky.cancelRun(a.runId)).toBe(true);
+      warn.mockRestore();
+      expect((await db.getRun(a.runId))!.status).toBe('canceled');
+      expect((await db.startRun(input({ listId: a.listId }), 'w')).started).toBe(true); // the leaked lock is taken over
+    });
+
+    it('refuses an advance without a cursor instead of rewinding the walk', async () => {
+      const a = await fresh();
+      await expect(db.advance(a.runId, 1, { cursor: null as any, counts: { examined: 1 } })).rejects.toMatchObject({ code: 'invalid_input' });
+    });
+
+    it('does not report a started run that was canceled between its two writes', async () => {
+      const base = input();
+      let calls = 0;
+      const racing = new SmartleadPushRunDb({
+        get: doc.get.bind(doc), query: doc.query.bind(doc), update: doc.update.bind(doc), delete: doc.delete.bind(doc),
+        put: (p: any) => {
+          const out = doc.put(p);
+          if (p.Item?.sk === 'LOCK' && calls++ === 0) {
+            return { promise: async () => { const r = await out.promise(); // the resumer cancels the orphan right after the lock lands
+              await doc.update({ TableName: table, Key: { pk: p.Item.runId, sk: 'RUN' }, UpdateExpression: 'SET #s = :c REMOVE #a', ExpressionAttributeNames: { '#s': 'status', '#a': 'active' }, ExpressionAttributeValues: { ':c': 'canceled' } }).promise(); return r; } };
+          }
+          return out;
+        },
+      } as any, table, () => clock, async () => {});
+      const r = await racing.startRun(base, 'w');
+      expect(r.started).toBe(false);
+      expect(await db.getLock(base.listId, base.campaignId)).toBeNull();
+    });
+
+    it('refuses empty owner, pusher or worker ids as invalid input', async () => {
+      await expect(db.startRun(input({ ownerId: '' }), 'w')).rejects.toMatchObject({ code: 'invalid_input' });
+      await expect(db.startRun(input({ pushedBy: '' }), 'w')).rejects.toMatchObject({ code: 'invalid_input' });
+      await expect(db.startRun(input(), '')).rejects.toMatchObject({ code: 'invalid_input' });
     });
   });
 
