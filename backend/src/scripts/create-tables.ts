@@ -2240,7 +2240,7 @@ export const createSmartleadPushRunsTable = async () => {
           { AttributeName: 'ownerId', KeyType: 'HASH' },
           { AttributeName: 'createdAt', KeyType: 'RANGE' },
         ],
-        Projection: { ProjectionType: 'INCLUDE', NonKeyAttributes: summary },
+        Projection: { ProjectionType: 'INCLUDE', NonKeyAttributes: [...summary, 'listId'] },
       },
       {
         IndexName: 'RunsByTimeIndex',
