@@ -413,12 +413,39 @@ export interface SmartleadLeadInput {
 }
 
 export interface SmartleadAddLeadsResult {
+  /** Leads we sent in this request. */
+  submitted: number;
+  /** Leads newly added to this campaign (Smartlead's `total_leads`). NOT `upload_count`, which counts every row we sent, invalid ones included. */
   added: number;
+  /** Leads that were already in this campaign (a resend returns these, not an error). */
+  alreadyInCampaign: number;
+  /** Everything Smartlead did not newly add: submitted minus added. */
   skipped: number;
-  /** Per-lead reasons, only when Smartlead sends them. */
-  skippedLeads: Array<{ email: string; reason: string }>;
-  /** False when Smartlead gave no skipped tally and `skipped` is inferred as (sent - added). */
-  skippedKnown: boolean;
+  /** Smartlead's own tallies of why; they do not name the leads (only `invalidEmails` and `unsubscribedEmails` do). */
+  skippedBy: {
+    invalidEmail: number;
+    alreadyInCampaign: number;
+    blockList: number;
+    duplicate: number;
+    inOtherCampaign: number;
+    unsubscribed: number;
+    bounced: number;
+    importStopped: number;
+  };
+  invalidEmails: string[];
+  unsubscribedEmails: string[];
+  /** True when Smartlead stopped importing because the account's lead limit is used up. */
+  limitExhausted: boolean;
+  /**
+   * Per-lead truth from `return_lead_ids`: lower-cased email to Smartlead lead id, split into leads newly added, leads
+   * already in this campaign, and leads that already existed only in another campaign (those are added to this one too).
+   * Undefined if Smartlead sent no map.
+   */
+  leads?: {
+    newlyAdded: Record<string, string>;
+    existingInCampaign: Record<string, string>;
+    existingInOtherCampaigns: Record<string, string>;
+  };
 }
 
 const count = (value: unknown): number | undefined => {
@@ -426,11 +453,28 @@ const count = (value: unknown): number | undefined => {
   return n !== undefined && n >= 0 ? n : undefined;
 };
 
+const toIdMap = (value: unknown): Record<string, string> => {
+  const out: Record<string, string> = {};
+  if (value && typeof value === "object") {
+    for (const [email, id] of Object.entries(value as Record<string, unknown>)) {
+      if (typeof id === "string" || typeof id === "number") out[email.toLowerCase()] = String(id);
+    }
+  }
+  return out;
+};
+
+const toStringList = (value: unknown): string[] =>
+  Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : [];
+
 /**
  * Add up to 400 leads to a campaign the customer already made. The block-list/duplicate overrides are sent as
- * false on purpose (all four overrides in the reference): AgentWeb never asks Smartlead to bypass its own protection. A reply with no count we recognise is
- * an error, never "0 added" and never "success", because the real reply shape is unverified against a live account.
- * Retrying a 429 is safe here: a rate-limited request added nothing.
+ * false on purpose (all four overrides in the reference): AgentWeb never asks Smartlead to bypass its own protection.
+ * `return_lead_ids` is always on: it makes Smartlead say, per lead, whether it was newly added, was already in this
+ * campaign, or already existed in another one, and gives the Smartlead lead id (needed to pause or unsubscribe a lead later).
+ *
+ * The reply shape here is the one a live Smartlead account returned on 2026-10-27, which differs from its docs:
+ * `upload_count` is everything submitted, `total_leads` is what was newly added. A reply with no count we recognise
+ * is an error, never "0 added" and never success. Retrying a 429 is safe: a rate-limited request added nothing.
  */
 export async function addLeadsToCampaign(
   apiKey: string,
@@ -439,7 +483,17 @@ export async function addLeadsToCampaign(
   opts: { maxRetries?: number } = {},
 ): Promise<SmartleadAddLeadsResult> {
   assertCampaignId(campaignId);
-  if (leads.length === 0) return { added: 0, skipped: 0, skippedLeads: [], skippedKnown: true };
+  const empty: SmartleadAddLeadsResult = {
+    submitted: 0,
+    added: 0,
+    alreadyInCampaign: 0,
+    skipped: 0,
+    skippedBy: { invalidEmail: 0, alreadyInCampaign: 0, blockList: 0, duplicate: 0, inOtherCampaign: 0, unsubscribed: 0, bounced: 0, importStopped: 0 },
+    invalidEmails: [],
+    unsubscribedEmails: [],
+    limitExhausted: false,
+  };
+  if (leads.length === 0) return empty;
   if (leads.length > SMARTLEAD_LEADS_PER_REQUEST) {
     throw new SmartleadApiError(`Smartlead accepts at most ${SMARTLEAD_LEADS_PER_REQUEST} leads per request (got ${leads.length})`);
   }
@@ -451,34 +505,51 @@ export async function addLeadsToCampaign(
         ignore_unsubscribe_list: false,
         ignore_duplicate_leads_in_other_campaign: false,
         ignore_community_bounce_list: false,
+        return_lead_ids: true,
       },
     },
     maxRetries: opts.maxRetries,
   });
   const body = data && typeof data === "object" ? data : {};
-  // Reference shape: added_count / skipped_count. Older shape: upload_count plus separate duplicate/invalid/unsubscribed tallies.
-  const added = count(body.added_count) ?? count(body.upload_count);
-  const skippedList = Array.isArray(body.skipped_leads) ? body.skipped_leads : undefined;
-  const legacySkipped = [body.duplicate_count, body.invalid_email_count, body.block_count, body.bounce_count].map(count);
-  const reported =
-    count(body.skipped_count) ??
-    (legacySkipped.some(n => n !== undefined)
-      ? legacySkipped.reduce<number>((sum, n) => sum + (n ?? 0), 0) +
-        (Array.isArray(body.unsubscribed_leads) ? body.unsubscribed_leads.length : 0)
-      : undefined) ??
-    skippedList?.length;
+  // `total_leads` is the live shape; `added_count` is what the reference documents but a live account did not send.
+  const added = count(body.total_leads) ?? count(body.added_count);
   if (added === undefined) {
     // A 2xx with no added count: the leads may be in the campaign. Say so, never "0 added" and never a plain failure.
     throw new SmartleadUnexpectedResponseError(`Smartlead POST /campaigns/{id}/leads returned an unexpected response`);
   }
-  // Added is known but skipped is not: the import happened, so report it, with skipped inferred, rather than throw.
-  const skippedKnown = reported !== undefined;
-  const skipped = skippedKnown ? reported : Math.max(leads.length - added, 0);
-  const skippedLeads = (skippedList ?? [])
-    .map(row => row as { email?: unknown; reason?: unknown })
-    .filter(row => typeof row?.email === "string")
-    .map(row => ({ email: String(row.email), reason: String(row.reason ?? "") }));
-  return { added, skipped, skippedLeads, skippedKnown };
+  const submitted = count(body.upload_count) ?? leads.length;
+  const invalidEmails = toStringList(body.invalid_emails);
+  const unsubscribedEmails = toStringList(body.unsubscribed_leads);
+  const map = body.emailToLeadIdMap && typeof body.emailToLeadIdMap === "object" ? (body.emailToLeadIdMap as Record<string, unknown>) : undefined;
+  const alreadyInCampaign = count(body.already_added_to_campaign) ?? 0;
+  return {
+    submitted,
+    added,
+    alreadyInCampaign,
+    skipped: Math.max(submitted - added, 0),
+    skippedBy: {
+      invalidEmail: count(body.invalid_email_count) ?? invalidEmails.length,
+      alreadyInCampaign,
+      blockList: count(body.block_count) ?? 0,
+      duplicate: count(body.duplicate_count) ?? 0,
+      inOtherCampaign: count(body.skipped_in_other_campaign_count) ?? 0,
+      unsubscribed: unsubscribedEmails.length,
+      bounced: count(body.bounce_count) ?? 0,
+      importStopped: count(body.lead_import_stopped_count) ?? 0,
+    },
+    invalidEmails,
+    unsubscribedEmails,
+    limitExhausted: body.is_lead_limit_exhausted === true,
+    ...(map
+      ? {
+          leads: {
+            newlyAdded: toIdMap(map.newlyAddedLeads),
+            existingInCampaign: toIdMap(map.existingLeads),
+            existingInOtherCampaigns: toIdMap(map.existingLeadsInOtherCampaigns),
+          },
+        }
+      : {}),
+  };
 }
 
 // ─── Main Function ──────────────────────────────────────────────────────

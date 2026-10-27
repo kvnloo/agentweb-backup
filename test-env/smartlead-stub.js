@@ -17,7 +17,7 @@
 // Slice 2 (campaigns and lead import), same keys plus:
 //   GET  /campaigns/                   good-<n>: three campaigns (DRAFTED, ACTIVE, PAUSED); wrap-camps: the same inside {success, campaigns}
 //   GET  /campaigns/:id/email-accounts good-<n>: {ok, data:[...]} (no daily limit, as in the reference example)
-//   POST /campaigns/:id/leads          lead-ref: {success, added_count, skipped_count, skipped_leads}; lead-legacy: {ok, upload_count, ...};
+//   POST /campaigns/:id/leads          lead-*: the real reply shape (upload_count = submitted, total_leads = added, emailToLeadIdMap with return_lead_ids);
 //                                      lead-weird: 200 with no counts; lead-401: 401; more than 400 leads: 422. Dedupes by email per campaign.
 //   email accounts carry message_per_day and fake passwords, to prove nothing downstream keeps them.
 const http = require("http");
@@ -25,7 +25,7 @@ const { URL } = require("url");
 
 const PORT = Number(process.env.PORT || 4010);
 const PAGE = 100;
-const leadsByCampaign = {};
+const leadsByCampaign = {}; // campaignId -> Map(email -> lead id)
 const flipCalls = {};
 // flip-<n>: behaves like good-2 for its first n requests since the stub started, then answers 401 (a key revoked mid-use).
 function flipAlive(key) {
@@ -59,19 +59,26 @@ http
         try { body = JSON.parse(raw || "{}"); } catch (e) { return send(res, 400, { error: "bad json" }); }
         const list = Array.isArray(body.lead_list) ? body.lead_list : [];
         if (list.length > 400) return send(res, 422, { error: "lead_list cannot exceed 400 leads per request", provided_count: list.length, max_allowed: 400 });
-        const seen = (leadsByCampaign[campaignLeads[1]] = leadsByCampaign[campaignLeads[1]] || new Set());
-        const skipped = [];
-        let added = 0;
+        const seen = (leadsByCampaign[campaignLeads[1]] = leadsByCampaign[campaignLeads[1]] || new Map());
+        const newly = {}, existing = {}, invalid = [];
+        let nextId = 9000 + seen.size;
         for (const lead of list) {
           const email = String((lead && lead.email) || "").toLowerCase();
-          if (!email.includes("@")) skipped.push({ email, reason: "Invalid email" });
-          else if (seen.has(email)) skipped.push({ email, reason: "Already exists in this campaign" });
-          else { seen.add(email); added++; }
+          if (!email.includes("@")) invalid.push(email);
+          else if (seen.has(email)) existing[email] = seen.get(email);
+          else { seen.set(email, String(++nextId)); newly[email] = seen.get(email); }
         }
+        const added = Object.keys(newly).length;
         console.log(`  leads campaign=${campaignLeads[1]} sent=${list.length} added=${added} settings=${JSON.stringify(body.settings)}`);
         if (key === "lead-weird") return send(res, 200, { message: "ok" });
-        if (key === "lead-legacy") return send(res, 200, { ok: true, upload_count: added, total_leads: list.length, duplicate_count: skipped.filter(s => /exists/.test(s.reason)).length, invalid_email_count: skipped.filter(s => /Invalid/.test(s.reason)).length, unsubscribed_leads: [], block_count: 0, bounce_count: 0 });
-        return send(res, 200, { success: true, added_count: added, skipped_count: skipped.length, skipped_leads: skipped });
+        // The shape a live Smartlead returned on 2026-10-27: upload_count is everything SUBMITTED, total_leads is what was ADDED.
+        const reply = {
+          ok: true, upload_count: list.length, total_leads: added, skipped_in_other_campaign_count: 0, block_count: 0, duplicate_count: 0,
+          invalid_email_count: invalid.length, invalid_emails: invalid, already_added_to_campaign: Object.keys(existing).length,
+          unsubscribed_leads: [], is_lead_limit_exhausted: false, lead_import_stopped_count: 0, bounce_count: 0,
+        };
+        if (body.settings && body.settings.return_lead_ids) reply.emailToLeadIdMap = { newlyAddedLeads: newly, existingLeads: existing, existingLeadsInOtherCampaigns: {} };
+        return send(res, 200, reply);
       });
       return;
     }
