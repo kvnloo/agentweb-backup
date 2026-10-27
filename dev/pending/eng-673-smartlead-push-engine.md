@@ -19,6 +19,10 @@ The worker loop of a push run: walks a CRM lead list and adds the eligible leads
 - Smartlead's account lead limit pauses the run WITHOUT moving the cursor, so a resume after the limit is raised rebuilds the batch, skips what is marked and sends the rest.
 - Just before each POST the whole eligibility check is run again on a consistent re-read of the leads (an opt-out, a bounce or an edited address recorded after the page read is honoured).
 
+- The run's counts include only batches that were recorded. A run that stops as `partial` can already have many leads in Smartlead (marked, and counted when a resume passes them): the markers, not the counts, are the truth, and the status page should say so.
+- A lead this run pushed that has since become do-not-contact is not counted toward the ceiling; PR-D's withdrawal (unsubscribing it in Smartlead) is what keeps the ceiling true.
+
 ### For PR-C2
+- The resumer must not auto-resume a run paused for `smartlead_lead_limit` (each resume POSTs once); resume that one on user action only.
 - `readLeads` must page the list with no filter, newest first, with the hand-built `{listId, leadId}` as `ExclusiveStartKey`; the engine treats an empty page as the end of the list.
 - The bound `addLeads` should use a small `maxRetries` (a POST that backs off for minutes outlives the 90 s lease; the markers make a second worker's resend safe, but it wastes the run).

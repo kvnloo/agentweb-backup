@@ -311,6 +311,40 @@ describe("executeRun (ENG-673)", () => {
   });
 
   describe("review findings", () => {
+    it("counts a lead its own run marked between the page read and the fresh re-read toward the ceiling", async () => {
+      const t = setup(10, { run: { previewEligible: 5 } });
+      t.deps.readLeadConsistent = async (_l, id) => {
+        const l = t.leads.find(x => x.leadId === id)!;
+        if (id === "lead_00001" || id === "lead_00002") {
+          t.sl.emails.set(l.email, `own${id}`); // already in Smartlead, pushed by an older worker of this same run
+          return { ...l, system: { [smartleadMarkerKey(CAMPAIGN)]: { state: "pushed", pushedAt: "x", runId: "run1", payloadHash: "h" } } };
+        }
+        return l;
+      };
+      await expect(executeRun(t.run, t.deps)).resolves.toEqual({ outcome: "completed" });
+      expect(t.sl.emails.size).toBe(5);
+      expect(t.run.counts.alreadyInCampaign).toBe(2);
+      expect(t.run.counts.skippedByReason.already_pushed).toBeUndefined();
+    });
+
+    it("reports a resumed run's own earlier markers as already in the campaign, not as skips", async () => {
+      const t = setup(6);
+      for (let i = 0; i < 3; i++) { t.leads[i].system = { [smartleadMarkerKey(CAMPAIGN)]: { state: "pushed", pushedAt: "x", runId: "run1", payloadHash: "h" } }; t.sl.emails.set(t.leads[i].email, `x${i}`); }
+      await executeRun(t.run, t.deps);
+      expect(t.run.counts.alreadyInCampaign).toBe(3);
+      expect(t.run.counts.added).toBe(3);
+      expect(t.run.counts.skippedByReason.already_pushed).toBeUndefined();
+    });
+
+    it("trusts nothing in the 'other campaigns' map while Smartlead also reports leads skipped for being in other campaigns", async () => {
+      const t = setup(3);
+      t.sl.dropFromMap = new Set(["p2@example.com"]); // added by Smartlead but not named, which leaves room under the size bound
+      t.sl.skipButListOther = new Set(["p3@example.com"]); // skipped, yet listed under "other campaigns"
+      t.sl.tallies = { inOtherCampaign: 1, blockList: 1 };
+      await executeRun(t.run, t.deps);
+      expect(isMarkedForCampaign(t.leads[2], CAMPAIGN)).toBe(false);
+    });
+
     it("never exceeds the approved count after a rebuilt batch: leads this run marked but never recorded count toward the ceiling", async () => {
       const t = setup(1000, { run: { previewEligible: 400 } });
       const write = t.deps.writeMarker;
