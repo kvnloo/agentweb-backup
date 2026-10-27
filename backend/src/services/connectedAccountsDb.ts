@@ -305,6 +305,8 @@ export interface LumaConfig extends BaseOAuthConfig {
 export interface SmartleadConfig extends BaseOAuthConfig {
   account_type: 'api_key';
   mailbox_count: number;
+  /** Set when Smartlead rejected the key on a probe (revoked, or the plan lapsed); cleared by a reconnect. See services/smartleadConnection.ts. */
+  needs_reconnect?: boolean;
 }
 
 export interface LinkedInAdsAdAccountConfig extends BaseOAuthConfig {
@@ -1292,7 +1294,7 @@ export const getAccountsByAttioWorkspaceId = async (
  * Attio would be better served by its own key (e.g. `webhook_scope_missing`); until then
  * the exception is explicit rather than implied.
  */
-const RECONNECT_MEANS_DEAD_CREDENTIAL = new Set(['hubspot', 'twitter', 'luma']);
+const RECONNECT_MEANS_DEAD_CREDENTIAL = new Set(['hubspot', 'twitter', 'luma', 'smartlead']);
 
 export const isTokenValid = async (account: ConnectedAccount): Promise<boolean> => {
   const now = Date.now();

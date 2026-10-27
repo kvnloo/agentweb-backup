@@ -341,6 +341,11 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
         // emma/lumaTools.ts, which sets this flag when a call comes back 401.
         status = 'disconnected';
         expiryMessage = 'Reconnect required — Luma rejected the API key';
+      } else if (acc.platform === 'smartlead' && (acc.config as any).needs_reconnect) {
+        // Smartlead rejected the API key (revoked, or the plan lapsed below Pro) — see
+        // services/smartleadConnection.ts, which sets this flag after a probe confirms it.
+        status = 'disconnected';
+        expiryMessage = 'Reconnect required — Smartlead rejected the API key';
       } else if (adsCapability.ads_capable === false) {
         // The token is valid and unexpired, but the Meta account never granted (or
         // has since lost) ads_read/ads_management, so this ad account cannot serve
