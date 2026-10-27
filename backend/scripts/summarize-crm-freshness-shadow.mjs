@@ -1,15 +1,27 @@
 #!/usr/bin/env node
 // ENG-2263 / ENG-2382: summarise `[crm-freshness-shadow] {json}` (flagged replies) and `[crm-freshness-checked] {json}` (every CRM-relevant
-// reply, the denominator) log lines.
-//   node backend/scripts/summarize-crm-freshness-shadow.mjs web.stdout.log [more.log ...]
-//   cat web.stdout.log | node backend/scripts/summarize-crm-freshness-shadow.mjs
-// Pull BOTH markers: aws logs filter-log-events --log-group-name <web.stdout.log group> --start-time <ms> --filter-pattern '"crm-freshness"'
-// (a filter of just crm-freshness-shadow leaves out the checked lines and so the flag rate). Flagged counts are LOG LINES, not rates; a
-// rate needs the checked lines, and a pull window that straddles the deploy can hold flagged lines with no matching checked lines.
+// reply, the denominator) log lines. Input: plain log text, or the JSON that `aws logs filter-log-events` prints.
+//   aws logs filter-log-events --region <r> --log-group-name <the web.stdout.log group> --start-time <epoch ms> \
+//     --filter-pattern '"crm-freshness"' --output json > pull.json
+//   node backend/scripts/summarize-crm-freshness-shadow.mjs pull.json [more files ...]      (or: cat pull.json | node ...)
+// Pull BOTH markers: a filter of just crm-freshness-shadow leaves out the checked lines and so the flag rate. Flagged counts are LOG LINES,
+// not rates; a rate needs the checked lines, which exist only from the deploy that added them (a window that starts earlier holds flagged
+// lines with no checked counterpart, and the output says so).
 import { readFileSync } from 'node:fs';
 
 const MARK = '[crm-freshness-shadow]';
 const CHECKED_MARK = '[crm-freshness-checked]';
+
+/** `aws logs filter-log-events --output json` wraps every log line in {"events":[{"message": "..."}]}: unwrap it, pass anything else through. */
+export function unwrapAwsLogs(raw) {
+  const text = String(raw);
+  if (!text.trimStart().startsWith('{')) return text;
+  try {
+    const doc = JSON.parse(text);
+    if (doc && Array.isArray(doc.events)) return doc.events.map((e) => (e && typeof e.message === 'string' ? e.message : '')).join('\n');
+  } catch { /* not that document: treat it as plain log text */ }
+  return text;
+}
 
 export function parseLines(text) {
   const records = [];
@@ -41,12 +53,19 @@ export function parseCheckedLines(text) {
 export function summarizeChecked(records) {
   const byModel = {};
   for (const r of records) {
-    const m = (byModel[r.model || 'unknown'] ||= { checked: 0, flagged: 0, abstained: 0, byDensity: { sparse: { checked: 0, flagged: 0 }, mid: { checked: 0, flagged: 0 }, crowded: { checked: 0, flagged: 0 } } });
+    const m = (byModel[r.model || 'unknown'] ||= { checked: 0, flagged: 0, abstained: 0, byDensity: { none: { checked: 0, flagged: 0 }, sparse: { checked: 0, flagged: 0 }, mid: { checked: 0, flagged: 0 }, crowded: { checked: 0, flagged: 0 } }, byLength: { short: { checked: 0, flagged: 0 }, medium: { checked: 0, flagged: 0 }, long: { checked: 0, flagged: 0 } } });
     m.checked++;
     if (r.flagged) m.flagged++;
     if (r.totalsAbstained) m.abstained++;
+    // Density is k/21 rounded to 2 dp (k of the integers 0..20 present), so the edges below fall between k=4|5 and k=10|11.
+    // An EMPTY set (a first turn, nothing persisted yet) is its own bucket: it can never echo, so it must not pad "sparse".
     if (typeof r.sessionDensity20 === 'number') {
-      const b = m.byDensity[r.sessionDensity20 < 0.2 ? 'sparse' : r.sessionDensity20 < 0.5 ? 'mid' : 'crowded'];
+      const b = m.byDensity[r.sessionNumberCount === 0 ? 'none' : r.sessionDensity20 < 0.2 ? 'sparse' : r.sessionDensity20 < 0.5 ? 'mid' : 'crowded'];
+      b.checked++;
+      if (r.flagged) b.flagged++;
+    }
+    if (typeof r.sessionMessages === 'number') {
+      const b = m.byLength[r.sessionMessages < 50 ? 'short' : r.sessionMessages < 200 ? 'medium' : 'long'];
       b.checked++;
       if (r.flagged) b.flagged++;
     }
@@ -78,8 +97,8 @@ export function summarize(records) {
   return { totalLines: records.length, distinctSessions: sessions.size, byModel };
 }
 
-export function format(summary, skipped = 0, checked = {}) {
-  const out = [`flagged replies (log lines): ${summary.totalLines}   distinct sessions: ${summary.distinctSessions}   unparseable marker lines: ${skipped}`];
+export function format(summary, skipped = 0, checked = {}, checkedSkipped = 0) {
+  const out = [`flagged replies (log lines): ${summary.totalLines}   distinct sessions: ${summary.distinctSessions}   unparseable marker lines: ${skipped}${checkedSkipped ? `   unparseable checked lines: ${checkedSkipped}` : ''}`];
   // A model with checked replies but no flagged ones (the best behaved) must still show its denominator.
   const EMPTY = () => ({ lines: 0, sessions: new Set(), kinds: {}, claimedNumbers: {}, citedTools: {}, drift: 0, echoes: 0, echoLines: 0, echoDensities: [] });
   const byModel = { ...summary.byModel };
@@ -100,23 +119,33 @@ export function format(summary, skipped = 0, checked = {}) {
     const c = checked[model];
     if (c) {
       out.push(`  CRM replies checked: ${c.checked}, flagged: ${c.flagged} (${pct(c.flagged / c.checked)})${c.abstained ? `, total check abstained on ${c.abstained}` : ''}`);
+      if (m.lines !== c.flagged) out.push(`  note: ${m.lines} flagged line(s) but ${c.flagged} flagged checked line(s): the window probably straddles the deploy that added the checked lines; the rate uses the checked lines only`);
+      const cell = (label, b) => `${label} ${b.flagged}/${b.checked}${b.checked ? ` (${pct(b.flagged / b.checked)})` : ''}`;
       const d = c.byDensity;
-      if (d.sparse.checked + d.mid.checked + d.crowded.checked > 0) {
-        const cell = (label, b) => `${label} ${b.flagged}/${b.checked}${b.checked ? ` (${pct(b.flagged / b.checked)})` : ''}`;
-        out.push(`  flag rate by session number-set density: ${cell('sparse (<0.2)', d.sparse)}, ${cell('mid (0.2-0.5)', d.mid)}, ${cell('crowded (>=0.5)', d.crowded)}`);
+      if (d.none.checked + d.sparse.checked + d.mid.checked + d.crowded.checked > 0) {
+        out.push(`  flag rate by how many of the integers 0..20 the session number set holds (all flag kinds; this only bears on echo lines): ${cell('empty set', d.none)}, ${cell('sparse 0-4', d.sparse)}, ${cell('mid 5-10', d.mid)}, ${cell('crowded 11-21', d.crowded)}`);
       }
+      const l = c.byLength;
+      if (l.short.checked + l.medium.checked + l.long.checked > 0) {
+        out.push(`  flag rate by session length (messages): ${cell('short <50', l.short)}, ${cell('medium 50-199', l.medium)}, ${cell('long 200+', l.long)}`);
+      }
+    } else if (m.lines > 0 && Object.keys(checked).length > 0) {
+      out.push('  (no checked lines for this model: no flag rate)');
     }
   }
   if (models.length === 0) out.push('(no [crm-freshness-shadow] lines found)');
   else if (summary.totalLines > 0 && Object.keys(checked).length === 0) {
-    out.push(`\n(no [crm-freshness-checked] lines: the flag rate cannot be computed. Pull with --filter-pattern '"crm-freshness"' to include them; lines only exist from the deploy that added them.)`);
+    out.push(checkedSkipped > 0
+      ? `\n(${checkedSkipped} [crm-freshness-checked] lines could not be parsed, so the flag rate cannot be computed.)`
+      : `\n(no [crm-freshness-checked] lines: the flag rate cannot be computed. Pull with --filter-pattern '"crm-freshness"' to include them; lines only exist from the deploy that added them.)`);
   }
   return out.join('\n');
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   const files = process.argv.slice(2);
-  const text = files.length ? files.map((f) => readFileSync(f, 'utf8')).join('\n') : readFileSync(0, 'utf8');
+  const text = files.length ? files.map((f) => unwrapAwsLogs(readFileSync(f, 'utf8'))).join('\n') : unwrapAwsLogs(readFileSync(0, 'utf8'));
   const { records, skipped } = parseLines(text);
-  console.log(format(summarize(records), skipped, summarizeChecked(parseCheckedLines(text).records)));
+  const checked = parseCheckedLines(text);
+  console.log(format(summarize(records), skipped, summarizeChecked(checked.records), checked.skipped));
 }
