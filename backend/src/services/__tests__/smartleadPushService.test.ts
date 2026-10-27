@@ -1,36 +1,50 @@
 /**
- * ENG-673: the Smartlead push service (access, keys, approval, starting, control, the worker and the resumer) on the REAL run store,
- * with in-memory CRM and Smartlead fakes. Opt-in like the other DynamoDB Local suites (DYNAMODB_LOCAL_ENDPOINT).
+ * ENG-673: the Smartlead push service (access, keys, approval, starting, control, the worker and the resumer), with in-memory CRM and
+ * Smartlead fakes. It runs on an in-memory run store everywhere (so CI and the pre-push hook exercise it), and again on the REAL run store
+ * when DYNAMODB_LOCAL_ENDPOINT points at a DynamoDB Local.
  */
 jest.unmock("aws-sdk");
 
 export {};
 
-const ENDPOINT = process.env.DYNAMODB_LOCAL_ENDPOINT;
-const suite = ENDPOINT ? describe : describe.skip;
-
 import AWS from "aws-sdk";
 import { ulid } from "ulid";
 import { SmartleadPushService, STALE_PAUSED_MS, type PushServiceDeps } from "../smartleadPushService";
-import { LEASE_MS, SMARTLEAD_PUSH_RUNS_TABLE_SPEC, SmartleadPushRunDb } from "../smartleadPushRunDb";
+import { LEASE_MS, SMARTLEAD_PUSH_RUNS_TABLE_SPEC, SmartleadPushRunDb, SmartleadPushRunStoreError } from "../smartleadPushRunDb";
 import { isMarkedForCampaign } from "../smartleadMarkers";
 import { SmartleadApiError } from "../smartleadService";
 import { CAMPAIGN, FakeSmartlead, SEQUENCE, mkLead } from "./fixtures/smartleadPushEngineFakes";
+import { InMemoryPushRunDb } from "./fixtures/inMemoryPushRunDb";
 
-suite("SmartleadPushService on the real run store (ENG-673)", () => {
-  // Each test gets its own table: a run left live by one test must never be claimed by another test's resumer.
-  let table = "";
-  const config = { endpoint: ENDPOINT, region: "us-west-2", accessKeyId: "x", secretAccessKey: "x" };
-  const raw = new AWS.DynamoDB(config);
-  const doc = new AWS.DynamoDB.DocumentClient(config);
-  let clock = Date.parse("2026-10-28T10:00:00Z");
+const ENDPOINT = process.env.DYNAMODB_LOCAL_ENDPOINT;
+const START = Date.parse("2026-10-28T10:00:00Z");
+let clock = START;
+
+interface Made { db: SmartleadPushRunDb; cleanup: () => Promise<void> }
+const stores: Array<[string, () => Promise<Made>, boolean]> = [
+  ["in-memory run store", async () => ({ db: new InMemoryPushRunDb(() => clock) as unknown as SmartleadPushRunDb, cleanup: async () => {} }), true],
+  [
+    "real run store on DynamoDB Local",
+    async () => {
+      // Each test gets its own table: a run left live by one test must never be claimed by another test's resumer.
+      const config = { endpoint: ENDPOINT, region: "us-west-2", accessKeyId: "x", secretAccessKey: "x" };
+      const raw = new AWS.DynamoDB(config);
+      const table = `Test-AW-SmartleadPushRuns-${ulid()}`;
+      await raw.createTable({ ...SMARTLEAD_PUSH_RUNS_TABLE_SPEC, TableName: table }).promise();
+      return { db: new SmartleadPushRunDb(new AWS.DynamoDB.DocumentClient(config), table, () => clock, async () => {}), cleanup: async () => { await raw.deleteTable({ TableName: table }).promise().catch(() => {}); } };
+    },
+    !!ENDPOINT,
+  ],
+];
+
+for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : describe.skip)(`SmartleadPushService on the ${storeName} (ENG-673)`, () => {
   let db: SmartleadPushRunDb;
+  let cleanup: () => Promise<void> = async () => {};
   beforeEach(async () => {
-    table = `Test-AW-SmartleadPushRuns-${ulid()}`;
-    db = new SmartleadPushRunDb(doc, table, () => clock, async () => {});
-    await raw.createTable({ ...SMARTLEAD_PUSH_RUNS_TABLE_SPEC, TableName: table }).promise();
+    clock = START;
+    ({ db, cleanup } = await makeStore());
   });
-  afterEach(async () => { await raw.deleteTable({ TableName: table }).promise().catch(() => {}); });
+  afterEach(async () => { await cleanup(); });
 
   interface Env { svc: SmartleadPushService; deps: PushServiceDeps; sl: FakeSmartlead; leads: any[]; jobs: Promise<unknown>[]; logs: string[]; listId: string; flags: { enabled: boolean }; editors: Set<string> }
 
@@ -218,10 +232,134 @@ suite("SmartleadPushService on the real run store (ENG-673)", () => {
     });
 
     it("fails closed with a 503 and sends nothing when the run table is unavailable", async () => {
-      const e = env({ shareDb: new SmartleadPushRunDb(doc, `Test-missing-${ulid()}`, () => clock, async () => {}) });
+      const broken = new Proxy({}, { get: () => async () => { throw new SmartleadPushRunStoreError("table_missing", "no table"); } }) as unknown as SmartleadPushRunDb;
+      const e = env({ shareDb: broken });
       const p = await approve(e);
       expect(await e.svc.start("owner", go(p.token))).toMatchObject({ ok: false, status: 503, code: "unavailable" });
       expect(e.sl.posts).toHaveLength(0);
+    });
+  });
+
+  describe("review findings (PR-C2)", () => {
+    it("lets an approval be used ONCE: a replay (a retry, a double click) never pushes another cohort", async () => {
+      const e = env({ leads: Array.from({ length: 120 }, (_, i) => mkLead(i + 1)) });
+      const p = await approve(e); // the first push defaults to a 50-lead test cohort
+      expect(p.cohort.chosen).toBe(50);
+      const first = (await e.svc.start("owner", go(p.token))) as any;
+      await drain(e);
+      expect(e.sl.emails.size).toBe(50);
+      const replay = (await e.svc.start("owner", go(p.token))) as any;
+      expect(replay).toMatchObject({ ok: true, started: false });
+      expect(replay.run.runId).toBe(first.run.runId); // shown the run it started, not a new one
+      await drain(e);
+      expect(e.sl.emails.size).toBe(50);
+      const widened = await approve(e); // pushing more takes a fresh, deliberate approval
+      expect(widened.list.alreadyPushed).toBe(50);
+      expect(widened.cohort.chosen).toBe(70);
+    });
+
+    it("lets only one of two simultaneous submits of the same approval start anything", async () => {
+      const e = env({ maxConcurrentWorkers: 0 });
+      const p = await approve(e);
+      const [a, b] = await Promise.all([e.svc.start("owner", go(p.token)), e.svc.start("owner", go(p.token))]);
+      expect([a, b].filter(r => r.ok && (r as any).started)).toHaveLength(1);
+      expect((await db.listRunsForList(e.listId))).toHaveLength(1);
+    });
+
+    it("gives an approval back when the start did not happen, so it can be used again", async () => {
+      const e = env({ maxConcurrentWorkers: 0 });
+      const first = await approve(e);
+      const second = await approve(e);
+      const r1 = (await e.svc.start("owner", go(first.token))) as any;
+      expect(await e.svc.start("owner", go(second.token))).toMatchObject({ ok: true, started: false }); // a run is already live
+      await e.svc.cancel("owner", r1.run.runId);
+      expect(await e.svc.start("owner", go(second.token))).toMatchObject({ ok: true, started: true }); // not spent by the failed attempt
+    });
+
+    it("lets only the person whose Smartlead connection a run uses resume it; other editors can pause and cancel", async () => {
+      const e = env({ maxConcurrentWorkers: 0 });
+      e.editors.add("editor");
+      const r = (await e.svc.start("owner", go((await approve(e)).token))) as any;
+      expect((await e.svc.pause("editor", r.run.runId)).ok).toBe(true);
+      expect(await e.svc.resume("editor", r.run.runId)).toMatchObject({ ok: false, status: 403, code: "resume_requires_pusher" });
+      expect(((await e.svc.status("owner", r.run.runId)) as any).run.status).toBe("paused");
+      expect((await e.svc.resume("owner", r.run.runId)).ok).toBe(true);
+      expect((await e.svc.cancel("editor", r.run.runId)).ok).toBe(true);
+    });
+
+    it("starts with the connection the preview used, whatever the start request names, and never picks between several of the user's connections", async () => {
+      const e = env();
+      const asked: Array<string | undefined> = [];
+      const resolve = e.deps.resolveKey;
+      e.deps.resolveKey = async (u, a) => { asked.push(a); return resolve(u, a); };
+      const p = await approve(e);
+      asked.length = 0;
+      const maxConcurrent = await e.svc.start("owner", go(p.token, { accountId: "smartlead-someone-else" }));
+      expect(maxConcurrent).toMatchObject({ ok: true, started: true });
+      expect(asked[0]).toBe("smartlead-owner"); // the start's own lookup, before the worker's
+      await drain(e);
+      // Two connections of the user's own: a lookup without an account id is ambiguous, one with an id is not.
+      e.deps.resolveKey = async (_u, a) => (a ? { ok: true, apiKey: "k", ownerUserId: "owner", accountId: a, accountName: "x" } : { ok: false, reason: "choose", message: "Several", candidates: [{ accountId: "a", ownerUserId: "owner" }, { accountId: "b", ownerUserId: "owner" }] });
+      expect(await e.svc.preview("owner", { listId: e.listId, campaignId: CAMPAIGN })).toMatchObject({ ok: false, status: 409, code: "choose_connection" });
+      expect((await e.svc.preview("owner", { listId: e.listId, campaignId: CAMPAIGN, accountId: "b" })).ok).toBe(true);
+    });
+
+    it("refuses a start when the connection is no longer the one that was previewed", async () => {
+      const e = env();
+      const p = await approve(e);
+      e.deps.resolveKey = async () => ({ ok: true, apiKey: "k", ownerUserId: "owner", accountId: "smartlead-other", accountName: "x" });
+      expect(await e.svc.start("owner", go(p.token))).toMatchObject({ ok: false, status: 409, code: "connection_changed" });
+    });
+
+    it("keeps a run the operator's kill switch paused, however long the switch was off", async () => {
+      const e = env({ leads: Array.from({ length: 900 }, (_, i) => mkLead(i + 1)) });
+      e.sl.onPost = () => { e.flags.enabled = false; };
+      const r = (await e.svc.start("owner", go((await approve(e, "owner", { cohort: 900 })).token))) as any;
+      await drain(e);
+      expect(((await e.svc.status("owner", r.run.runId)) as any).run.pauseReason).toBe("disabled_by_operator");
+      clock += STALE_PAUSED_MS + 24 * 60 * 60 * 1000; // the switch stayed off for more than a week
+      e.flags.enabled = true;
+      await e.svc.resumerTick();
+      expect(((await e.svc.status("owner", r.run.runId)) as any).run.status).toBe("paused");
+    });
+
+    it("binds the 'send even though my sequence could not be read' acknowledgement to the preview (it blocks an ACTIVE campaign)", async () => {
+      const e = env();
+      e.sl.sequences = [null];
+      e.sl.status = "ACTIVE";
+      const acknowledged = await approve(e, "owner", { acknowledgeUnreadable: true });
+      const not = await approve(e);
+      expect(not.canStart).toBe(false);
+      expect(acknowledged.canStart).toBe(true);
+      const confirm = { acknowledgements: { lawfulBasis: true, activeConfirmed: true } };
+      expect(await e.svc.start("owner", go(not.token, { ...confirm, acknowledgeUnreadable: true }))).toMatchObject({ ok: false, status: 409, code: "blocked" }); // a body flag cannot add it
+      expect(await e.svc.start("owner", go(acknowledged.token, confirm))).toMatchObject({ ok: true, started: true });
+      await drain(e);
+    });
+
+    it("tells a rejected key from a Smartlead outage and a rate limit, and sends nothing", async () => {
+      const e = env();
+      for (const [status, expected] of [[401, 422], [403, 422], [429, 429], [500, 502], [undefined, 502]] as const) {
+        e.deps.smartlead.getCampaign = async () => { throw new SmartleadApiError("x", status); };
+        const r = await e.svc.preview("owner", { listId: e.listId, campaignId: CAMPAIGN });
+        expect(r).toMatchObject({ ok: false, status: expected });
+        expect((r as any).message).not.toMatch(/api_key|stack/i);
+      }
+      expect(e.sl.posts).toHaveLength(0);
+    });
+
+    it("refuses a fourth simultaneous preview instead of loading another whole list into memory", async () => {
+      const e = env();
+      let release!: () => void;
+      const gate = new Promise<void>(r => { release = r; });
+      const read = e.deps.crm.readLeads;
+      e.deps.crm.readLeads = async (...a) => { await gate; return read(...a); };
+      const running = [1, 2, 3].map(() => e.svc.preview("owner", { listId: e.listId, campaignId: CAMPAIGN }));
+      await new Promise(r => setTimeout(r, 20));
+      expect(await e.svc.preview("owner", { listId: e.listId, campaignId: CAMPAIGN })).toMatchObject({ ok: false, status: 429, code: "busy" });
+      release();
+      for (const r of await Promise.all(running)) expect(r.ok).toBe(true);
+      expect((await e.svc.preview("owner", { listId: e.listId, campaignId: CAMPAIGN })).ok).toBe(true);
     });
   });
 

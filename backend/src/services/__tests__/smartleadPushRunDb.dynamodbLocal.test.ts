@@ -456,6 +456,30 @@ suite('SmartleadPushRunDb against DynamoDB Local (ENG-673)', () => {
     });
   });
 
+  describe('single-use approvals', () => {
+    it('lets exactly one of several simultaneous claims win, remembers the run, and gives the approval back on release', async () => {
+      const jti = `jti-${ulid()}`;
+      const results = await Promise.all([1, 2, 3, 4].map(() => db.claimToken(jti, 7200)));
+      expect(results.filter(Boolean)).toHaveLength(1);
+      expect(await db.getTokenRun(jti)).toBeNull();
+      await db.setTokenRun(jti, 'run-1');
+      expect(await db.getTokenRun(jti)).toBe('run-1');
+      expect(await db.claimToken(jti, 7200)).toBe(false);
+      await db.releaseToken(jti);
+      expect(await db.claimToken(jti, 7200)).toBe(true);
+    });
+
+    it('stores the token with an expiry, and does not touch any index or other record', async () => {
+      const jti = `jti-${ulid()}`;
+      await db.claimToken(jti, 7200);
+      const item = (await doc.get({ TableName: table, Key: { pk: `TOKEN#${jti}`, sk: 'TOKEN' } }).promise()).Item!;
+      expect(item.ttl).toBeGreaterThan(Math.floor(clock / 1000) + 7000);
+      expect(item.kind).toBeUndefined();
+      expect(item.active).toBeUndefined();
+      await expect(db.claimToken('', 7200)).rejects.toMatchObject({ code: 'invalid_input' });
+    });
+  });
+
   describe('older and newer writers', () => {
     it('reads a run that carries an attribute it does not know, and refuses one in a state it does not know', async () => {
       const run = await fresh();

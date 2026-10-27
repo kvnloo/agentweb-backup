@@ -101,6 +101,13 @@ describe('Smartlead push routes (ENG-673)', () => {
     expect((await request(app()).post(`${base}/start`).set('x-test-user', user()).send({ token: 'x' })).status).toBe(202);
   });
 
+  it('limits campaign listing per user, because it spends the customer\'s own Smartlead API budget', async () => {
+    svc.campaigns.mockResolvedValue({ ok: true, campaigns: [] });
+    const u = user();
+    for (let i = 0; i < 30; i++) await request(app()).get(`${base}/campaigns`).set('x-test-user', u);
+    expect((await request(app()).get(`${base}/campaigns`).set('x-test-user', u)).status).toBe(429);
+  });
+
   it('limits previews per user (30 in 15 minutes)', async () => {
     svc.preview.mockResolvedValue({ ok: true, preview: {} });
     const u = user();

@@ -3,8 +3,9 @@ import { createHmac, timingSafeEqual } from "crypto";
 /**
  * The stateless approval token of a Smartlead push (ENG-673). The preview signs what the user is about to approve (who, which list and
  * campaign, the options, the sequence as it was, how many leads) and the start call must present it back unchanged within 30 minutes, so
- * nothing is stored for an abandoned preview and the start cannot widen what was shown. It is not single use: a replay while a run is live
- * finds that run (the run table's lock), and after a run finished every lead carries a marker, so a replay has nothing left to send.
+ * nothing is stored for an abandoned preview and the start cannot widen what was shown. It is SINGLE USE: the start consumes its `jti` in the run
+ * table, because replaying an approval for a 50-lead test cohort would otherwise push 50 more each time (earlier runs' markers do not count
+ * toward a new run's ceiling).
  */
 
 export const PUSH_TOKEN_TTL_MS = 30 * 60 * 1000;
@@ -12,7 +13,13 @@ export const PUSH_TOKEN_TTL_MS = 30 * 60 * 1000;
 export interface PushTokenPayload {
   /** Format version, so a later change can refuse tokens it cannot read. */
   v: 1;
+  /** A unique id for this approval. The start consumes it once, so the same approval cannot be replayed to push more than was shown. */
+  jti: string;
   userId: string;
+  /** The Smartlead connection the preview used; the start must use the same one. */
+  accountId: string;
+  /** The user ticked "send even though my sequence could not be read" at preview. */
+  acknowledgeUnreadable: boolean;
   listId: string;
   campaignId: number;
   includeUnverified: boolean;
@@ -38,7 +45,7 @@ const mac = (secret: string, body: string) => createHmac("sha256", secret).updat
 /** Keys are written in a fixed order so the same payload always gives the same token. */
 function canonical(p: PushTokenPayload): string {
   return JSON.stringify({
-    v: p.v, userId: p.userId, listId: p.listId, campaignId: p.campaignId, includeUnverified: p.includeUnverified,
+    v: p.v, jti: p.jti, userId: p.userId, accountId: p.accountId, acknowledgeUnreadable: p.acknowledgeUnreadable, listId: p.listId, campaignId: p.campaignId, includeUnverified: p.includeUnverified,
     mapping: Object.fromEntries(Object.keys(p.mapping).sort().map(k => [k, p.mapping[k]])),
     acknowledgedTags: [...p.acknowledgedTags].sort(), startStatus: p.startStatus, sequenceHash: p.sequenceHash,
     eligible: p.eligible, warnings: p.warnings, exp: p.exp,
@@ -61,7 +68,7 @@ export function verifyPushToken(secret: string, token: unknown, nowMs: number): 
   if (given.length !== expected.length || !timingSafeEqual(given, expected)) return null;
   try {
     const p = JSON.parse(Buffer.from(body, "base64url").toString("utf8")) as PushTokenPayload;
-    if (p?.v !== 1 || typeof p.userId !== "string" || typeof p.listId !== "string" || !Number.isInteger(p.campaignId) || p.campaignId <= 0) return null;
+    if (p?.v !== 1 || typeof p.jti !== "string" || !p.jti || typeof p.accountId !== "string" || typeof p.acknowledgeUnreadable !== "boolean" || typeof p.userId !== "string" || typeof p.listId !== "string" || !Number.isInteger(p.campaignId) || p.campaignId <= 0) return null;
     if (!Number.isInteger(p.eligible) || p.eligible < 0 || typeof p.sequenceHash !== "string" || typeof p.exp !== "number" || !(p.exp > nowMs)) return null;
     if (typeof p.includeUnverified !== "boolean" || !p.mapping || typeof p.mapping !== "object" || !Array.isArray(p.acknowledgedTags) || !Array.isArray(p.warnings)) return null;
     return p;

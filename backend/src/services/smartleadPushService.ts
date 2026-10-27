@@ -13,7 +13,7 @@ import {
   type SmartleadPushRunDb,
 } from "./smartleadPushRunDb";
 import type { SmartleadAddLeadsResult, SmartleadCampaignDetail, SmartleadCampaignSummary, SmartleadEmailAccount, SmartleadLeadInput } from "./smartleadService";
-import { scrubSmartleadSecrets } from "./smartleadService";
+import { SmartleadApiError, scrubSmartleadSecrets } from "./smartleadService";
 
 /**
  * The service behind the Smartlead push routes and the resumer (ENG-673): who may push, which key is used, starting a run, controlling it,
@@ -67,6 +67,9 @@ export interface PushServiceDeps {
 /** A run left paused or partial this long is canceled by the resumer, so it cannot hold its lock for ever. */
 export const STALE_PAUSED_MS = 7 * 24 * 60 * 60 * 1000;
 const RESUMER_BATCH = 25;
+const MAX_CONCURRENT_PREVIEWS = 3;
+/** How long a consumed approval is remembered: longer than the token itself, so an expired token can never be claimed again. */
+const TOKEN_MEMORY_SECONDS = 2 * 60 * 60;
 
 export interface RunView {
   runId: string;
@@ -93,6 +96,7 @@ export function toRunView(run: PushRun): RunView {
 
 export class SmartleadPushService {
   private active = 0;
+  private previewsRunning = 0;
   private readonly workerId: string;
 
   constructor(private readonly deps: PushServiceDeps) {
@@ -113,8 +117,9 @@ export class SmartleadPushService {
   private async ownKey(userId: string, accountId?: string): Promise<Result<{ key: Extract<ResolvedSmartlead, { ok: true }> }>> {
     let resolved = await this.deps.resolveKey(userId, accountId);
     if (!resolved.ok && resolved.reason === "choose") {
-      const own = resolved.candidates.find(c => c.ownerUserId === userId);
-      if (own) resolved = await this.deps.resolveKey(userId, own.accountId);
+      // Several connections: only a single OWN one is unambiguous. Never pick between several (the user chooses by account id).
+      const own = resolved.candidates.filter(c => c.ownerUserId === userId);
+      if (own.length === 1) resolved = await this.deps.resolveKey(userId, own[0].accountId);
     }
     if (!resolved.ok) {
       if (resolved.reason === "not_connected") return fail(409, "not_connected", resolved.message);
@@ -146,6 +151,12 @@ export class SmartleadPushService {
         const status = error.code === "campaign_not_found" ? 404 : error.code === "campaign_not_pushable" ? 409 : 400;
         return fail(status, error.code, error.message);
       }
+      if (error instanceof SmartleadApiError) {
+        // Tell a bad key from an outage; nothing was sent in either case.
+        if (error.status === 401 || error.status === 403) return fail(422, "key_rejected", "Smartlead rejected the saved API key (revoked, or the plan no longer includes API access). Replace the key in Settings, Login Credentials.");
+        if (error.status === 429) return fail(429, "smartlead_rate_limited", "Smartlead is rate-limiting requests. Try again in a minute.");
+        return fail(502, "smartlead_unavailable", "Smartlead could not be reached or answered unexpectedly. Nothing was sent. Try again shortly.");
+      }
       throw error;
     });
   }
@@ -162,6 +173,8 @@ export class SmartleadPushService {
       if (!list.ok) return list;
       const key = await this.ownKey(userId, typeof body.accountId === "string" ? body.accountId : undefined);
       if (!key.ok) return key;
+      // A preview reads a whole list into memory: only a few at once per process.
+      if (this.previewsRunning >= MAX_CONCURRENT_PREVIEWS) return fail(429, "busy", "Several previews are running. Try again in a moment.");
       const apiKey = key.key.apiKey;
       if (!Number.isInteger(campaignId) || campaignId <= 0) return fail(400, "bad_request", "A campaign is required.");
       const previewDeps: PreviewDeps = {
@@ -172,11 +185,12 @@ export class SmartleadPushService {
         now: () => this.deps.now(),
         secret: this.deps.secret,
       };
+      this.previewsRunning++;
       const preview = await buildPreview(previewDeps, {
-        listId: body.listId, campaignId, userId, includeUnverified: body.includeUnverified === true, mapping: body.mapping && typeof body.mapping === "object" ? body.mapping : undefined,
+        listId: body.listId, campaignId, userId, accountId: key.key.accountId, includeUnverified: body.includeUnverified === true, mapping: body.mapping && typeof body.mapping === "object" ? body.mapping : undefined,
         acknowledgedTags: Array.isArray(body.acknowledgedTags) ? body.acknowledgedTags : undefined, acknowledgeUnreadable: body.acknowledgeUnreadable === true,
         cohort: body.cohort === undefined || body.cohort === null ? undefined : Number(body.cohort),
-      });
+      }).finally(() => { this.previewsRunning--; });
       return { ok: true, preview };
     });
   }
@@ -219,8 +233,10 @@ export class SmartleadPushService {
 
       const list = await this.ownList(userId, token.listId);
       if (!list.ok) return list;
-      const key = await this.ownKey(userId, typeof body.accountId === "string" ? body.accountId : undefined);
+      // The connection the preview used, never one named in the start request.
+      const key = await this.ownKey(userId, token.accountId);
       if (!key.ok) return key;
+      if (key.key.accountId !== token.accountId) return fail(409, "connection_changed", "Your Smartlead connection changed after you previewed. Preview again.");
       const apiKey = key.key.apiKey;
 
       // What was approved must still be true: the same sequence, a campaign that was not started under a draft approval, no new blocks.
@@ -232,11 +248,26 @@ export class SmartleadPushService {
       if (campaign.status === "ACTIVE" && body.acknowledgements?.activeConfirmed !== true) return fail(400, "active_confirmation_required", "This campaign is already sending. Confirm that leads should start receiving mail at once.");
       const analysis = analyseSequence(await this.smartleadCall(key.key, () => this.deps.smartlead.getSequences(apiKey, token.campaignId)));
       if (analysis.hash !== token.sequenceHash) return fail(409, "sequence_changed", "The campaign's sequence changed after you previewed. Preview again.");
-      const preflight = preflightSequence(analysis, { status: campaign.status, mapping: token.mapping, acknowledgedTags: token.acknowledgedTags, acknowledgeUnreadable: body.acknowledgeUnreadable === true, addUnsubscribeTag: campaign.addUnsubscribeTag });
+      const preflight = preflightSequence(analysis, { status: campaign.status, mapping: token.mapping, acknowledgedTags: token.acknowledgedTags, acknowledgeUnreadable: token.acknowledgeUnreadable, addUnsubscribeTag: campaign.addUnsubscribeTag });
       if (preflight.blocks.length > 0) return fail(409, "blocked", "The campaign cannot be pushed to as it stands.", preflight.blocks);
       if (token.eligible < 1) return fail(400, "nothing_to_push", "There is nothing to push.");
 
-      const started = await this.deps.db.startRun(
+      // The approval is single use: replaying it would push another cohort (earlier runs' markers do not count toward a new run's ceiling).
+      if (!(await this.deps.db.claimToken(token.jti, TOKEN_MEMORY_SECONDS))) {
+        // A double submit: the winner may not have recorded its run yet, so wait a moment, then fall back to the run holding the lock.
+        let spentOn = await this.deps.db.getTokenRun(token.jti);
+        for (let i = 0; i < 5 && !spentOn; i++) {
+          await this.deps.sleep(100);
+          spentOn = await this.deps.db.getTokenRun(token.jti);
+        }
+        if (!spentOn) spentOn = (await this.deps.db.getLock(token.listId, token.campaignId))?.runId ?? null;
+        const existing = spentOn ? await this.deps.db.getRun(spentOn) : null;
+        if (existing) return { ok: true, started: false, run: toRunView(existing) };
+        return fail(409, "token_used", "This approval was already used. Preview again to push more.");
+      }
+      let started: Awaited<ReturnType<SmartleadPushRunDb["startRun"]>>;
+      try {
+        started = await this.deps.db.startRun(
         {
           ownerId: String(list.list.userId ?? userId), pushedBy: userId, keyOwnerId: key.key.ownerUserId, smartleadAccountId: key.key.accountId, channel: "ui", listId: token.listId,
           campaignId: token.campaignId, campaignName: campaign.name, campaignSource: "selected",
@@ -248,10 +279,16 @@ export class SmartleadPushService {
         },
         this.workerId,
       );
+      } catch (error) {
+        await this.deps.db.releaseToken(token.jti).catch(() => undefined); // the start did not happen: give the approval back
+        throw error;
+      }
       if (!started.started) {
+        await this.deps.db.releaseToken(token.jti).catch(() => undefined);
         if (started.existing) return { ok: true, started: false, run: toRunView(started.existing) };
         return fail(409, "lock_held", "A previous push left this list and campaign locked. Ask support to release it.");
       }
+      await this.deps.db.setTokenRun(token.jti, started.run.runId).catch(() => undefined);
       this.deps.log(`[SmartleadPush] started run=${started.run.runId} user=${userId} list=${token.listId} campaign=${token.campaignId} approved=${token.eligible} status=${campaign.status}`);
       this.spawn(started.run);
       return { ok: true, started: true, run: toRunView(started.run) };
@@ -290,6 +327,8 @@ export class SmartleadPushService {
       const r = await this.runFor(userId, runId);
       if (!r.ok) return r;
       if (r.run.status !== "paused" && r.run.status !== "partial") return fail(409, "not_paused", "This push is not paused.");
+      // Resuming sends with the pusher's Smartlead connection, so only that person may resume it. Other editors can still pause and cancel.
+      if (userId !== r.run.keyOwnerId) return fail(403, "resume_requires_pusher", "Only the person who started this push can resume it, because it sends with their Smartlead connection. You can cancel it and start again with your own.");
       const resumed = await this.deps.db.resumeRun(r.run.runId, this.workerId, r.run.leaseEpoch);
       if (!resumed) return fail(409, "not_paused", "This push was changed by someone else. Reload and try again.");
       this.deps.log(`[SmartleadPush] resumed run=${resumed.runId} by=${userId}`);
@@ -369,6 +408,9 @@ export class SmartleadPushService {
         this.spawn(claimed);
       }
       for (const row of await this.deps.db.findStalePaused(STALE_PAUSED_MS, RESUMER_BATCH)) {
+        // A run the operator's kill switch paused ages while the switch is off: it stays for its owner to resume or cancel.
+        const stale = await this.deps.db.getRun(row.runId);
+        if (!stale || stale.pauseReason === "disabled_by_operator") continue;
         if (await this.deps.db.cancelRun(row.runId)) {
           out.canceled++;
           this.deps.log(`[SmartleadPush] resumer canceled stale run=${row.runId}`);
