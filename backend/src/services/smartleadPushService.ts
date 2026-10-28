@@ -285,6 +285,7 @@ export class SmartleadPushService {
         resolveKey: (u, a) => this.deps.resolveKey(u, a),
         reportFailure: (r, e) => this.deps.reportFailure(r, e),
         readLeads: (l, a, n) => this.deps.crm.readLeads(l, a, n),
+        readLeadConsistent: (l, id) => this.deps.crm.readLeadConsistent(l, id),
         writeMarker: (l, id, k, m) => this.deps.crm.writeMarker(l, id, k, m),
         smartlead: {
           unsubscribe: (apiKey, id) => this.deps.smartlead.unsubscribeLead(apiKey, id),

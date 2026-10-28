@@ -14,8 +14,13 @@ export interface SmartleadMarker {
   payloadHash: string;
   /** `withdrawn`: unsubscribed in Smartlead after the lead became do-not-contact here. `released`: a list editor cleared it. */
   state: "pushed" | "withdrawn" | "released";
+  /** The address that was pushed (lower case). The sweep trusts `smartleadLeadId` only while the lead still has this address. */
+  email?: string;
   /** When the withdrawal sweep unsubscribed the lead in Smartlead after it opted out here. */
   withdrawnAt?: string;
+  /** Failed attempts of the withdrawal sweep, so a lead that keeps failing does not starve the ones behind it. */
+  withdrawAttempts?: number;
+  withdrawAttemptedAt?: string;
   /** When a list editor released the lead, and who. */
   releasedAt?: string;
   releasedBy?: string;
@@ -63,11 +68,12 @@ export function listSmartleadMarkers(lead: { system?: Record<string, unknown> } 
   return out;
 }
 
-export function buildSmartleadMarker(input: { runId: string; payloadHash: string; smartleadLeadId?: string; now?: Date }): SmartleadMarker {
+export function buildSmartleadMarker(input: { runId: string; payloadHash: string; smartleadLeadId?: string; email?: string; now?: Date }): SmartleadMarker {
   return {
     pushedAt: (input.now ?? new Date()).toISOString(),
     runId: input.runId,
     ...(input.smartleadLeadId ? { smartleadLeadId: input.smartleadLeadId } : {}),
+    ...(input.email ? { email: input.email.trim().toLowerCase() } : {}),
     payloadHash: input.payloadHash,
     state: "pushed",
   };
