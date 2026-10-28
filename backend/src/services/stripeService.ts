@@ -2253,7 +2253,9 @@ export async function resolveSubscriptionTypeForPrice(
   let product: any = price && typeof price === 'object' && price.product && typeof price.product === 'object'
     ? price.product
     : null;
-  if (!product && typeof price?.product === 'string' && !price?.metadata?.plan) {
+  // Always retrieve the product: a price plan that is later rejected (denylisted or
+  // unconfigured) must still fall through to the product's plan.
+  if (!product && typeof price?.product === 'string') {
     try {
       product = await getStripeOrThrow().products.retrieve(price.product);
     } catch (err) {
