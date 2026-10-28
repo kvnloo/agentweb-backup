@@ -347,6 +347,24 @@ describe("executeRun (ENG-673)", () => {
       expect(t.run.status).toBe("paused");
     });
 
+    it("a lead already in ANOTHER campaign is skipped and reported, not marked and not a pause (the live shape, 2026-10-28)", async () => {
+      const t = setup(3);
+      t.sl.skipButListOther = new Set(["p2@example.com"]); // Smartlead skips it and lists it under "other campaigns" with its existing id
+      t.sl.tallies = { inOtherCampaign: 1 };
+      await expect(executeRun(t.run, t.deps)).resolves.toEqual({ outcome: "completed" });
+      expect(isMarkedForCampaign(t.leads[1], CAMPAIGN)).toBe(false);
+      expect(isMarkedForCampaign(t.leads[0], CAMPAIGN)).toBe(true);
+      expect(isMarkedForCampaign(t.leads[2], CAMPAIGN)).toBe(true);
+      expect(t.run.counts.skippedByReason).toMatchObject({ smartlead_in_other_campaign: 1 });
+    });
+
+    it("pauses when Smartlead names more 'other campaign' leads than it counts as skipped for that", async () => {
+      const t = setup(3);
+      t.sl.skipButListOther = new Set(["p2@example.com", "p3@example.com"]);
+      t.sl.tallies = { inOtherCampaign: 1 };
+      await expect(executeRun(t.run, t.deps)).resolves.toEqual({ outcome: "paused", reason: "other_campaign_leads" });
+    });
+
     it("trusts nothing in the 'other campaigns' map while Smartlead also reports leads skipped for being in other campaigns", async () => {
       const t = setup(3);
       t.sl.dropFromMap = new Set(["p2@example.com"]); // added by Smartlead but not named, which leaves room under the size bound

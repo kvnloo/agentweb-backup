@@ -612,7 +612,9 @@ export async function addLeadsToCampaign(
       settings: {
         ignore_global_block_list: false,
         ignore_unsubscribe_list: false,
-        ignore_duplicate_leads_in_other_campaign: false,
+        // TRUE skips a lead that is already in another of the account's campaigns (verified live 2026-10-28: skipped_in_other_campaign_count
+        // counts it and the map lists it under existingLeadsInOtherCampaigns); FALSE adds it anyway, so it would be emailed by both campaigns.
+        ignore_duplicate_leads_in_other_campaign: true,
         ignore_community_bounce_list: false,
         return_lead_ids: true,
       },
