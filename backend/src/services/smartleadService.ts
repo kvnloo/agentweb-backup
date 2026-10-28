@@ -554,7 +554,8 @@ export interface SmartleadAddLeadsResult {
   limitExhausted: boolean;
   /**
    * Per-lead truth from `return_lead_ids`: lower-cased email to Smartlead lead id, split into leads newly added, leads
-   * already in this campaign, and leads that already existed only in another campaign (those are added to this one too).
+   * already in this campaign, and leads that already exist in another campaign (with ignore_duplicate_leads_in_other_campaign on, those are
+   * skipped and NOT added here; verified live 2026-10-28).
    * Undefined if Smartlead sent no map.
    */
   leads?: {
@@ -583,8 +584,9 @@ const toStringList = (value: unknown): string[] =>
   Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : [];
 
 /**
- * Add up to 400 leads to a campaign the customer already made. The block-list/duplicate overrides are sent as
- * false on purpose (all four overrides in the reference): AgentWeb never asks Smartlead to bypass its own protection.
+ * Add up to 400 leads to a campaign the customer already made. The block-list, unsubscribe-list and bounce-list overrides are sent as
+ * false on purpose: AgentWeb never asks Smartlead to bypass its own protection. Leads already in another campaign are skipped
+ * (ignore_duplicate_leads_in_other_campaign: true), so nobody is emailed by two campaigns.
  * `return_lead_ids` is always on: it makes Smartlead say, per lead, whether it was newly added, was already in this
  * campaign, or already existed in another one, and gives the Smartlead lead id (needed to pause or unsubscribe a lead later).
  *
