@@ -2250,11 +2250,26 @@ export async function resolveSubscriptionTypeForPrice(
   const mapped = deriveSubscriptionTypeFromPriceId(priceId);
   if (mapped) return mapped;
 
+  const tryPlan = async (raw: unknown): Promise<string | null> => {
+    if (typeof raw !== 'string') return null;
+    const plan = raw.trim();
+    if (!plan || METADATA_PLAN_DENYLIST.has(plan)) return null;
+    try {
+      if (await getTierConfig(plan)) return plan;
+    } catch (err) {
+      console.warn(`[STRIPE] Tier lookup failed for metadata plan "${plan}" (price ${priceId}):`, err);
+    }
+    return null;
+  };
+
+  // Price metadata first; the product is retrieved only when the price plan is
+  // absent or rejected, so a valid price plan never waits on a Stripe call.
+  const fromPrice = await tryPlan(price?.metadata?.plan);
+  if (fromPrice) return fromPrice;
+
   let product: any = price && typeof price === 'object' && price.product && typeof price.product === 'object'
     ? price.product
     : null;
-  // Always retrieve the product: a price plan that is later rejected (denylisted or
-  // unconfigured) must still fall through to the product's plan.
   if (!product && typeof price?.product === 'string') {
     try {
       product = await getStripeOrThrow().products.retrieve(price.product);
@@ -2262,18 +2277,14 @@ export async function resolveSubscriptionTypeForPrice(
       console.warn(`[STRIPE] Product lookup failed for ${price.product} (price ${priceId}):`, err);
     }
   }
+  const fromProduct = await tryPlan(product?.metadata?.plan);
+  if (fromProduct) return fromProduct;
+  const fromSubscription = await tryPlan(subscription?.metadata?.plan);
+  if (fromSubscription) return fromSubscription;
+
   const candidates = [price?.metadata?.plan, product?.metadata?.plan, subscription?.metadata?.plan]
     .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
     .map((v) => v.trim());
-
-  for (const plan of candidates) {
-    if (METADATA_PLAN_DENYLIST.has(plan)) continue;
-    try {
-      if (await getTierConfig(plan)) return plan;
-    } catch (err) {
-      console.warn(`[STRIPE] Tier lookup failed for metadata plan "${plan}" (price ${priceId}):`, err);
-    }
-  }
 
   console.warn(
     `[STRIPE] Unmapped price ${priceId} on subscription ${subscription?.id ?? 'unknown'}: ` +
