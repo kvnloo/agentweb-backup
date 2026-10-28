@@ -328,8 +328,8 @@ describe("worker protocol check (host.info)", () => {
     expect(logged.filter((l) => l.includes("login_host_protocol_mismatch"))).toHaveLength(1); // once, not every minute
   });
 
-  it("workers at protocol 2 and 3 are both accepted, and workerProtocol() says which one it is", async () => {
-    for (const v of [2, 3]) {
+  it("workers at protocol 2, 3 and 4 (the relay, deployed ahead of the backend that speaks it) are accepted, and workerProtocol() says which one it is", async () => {
+    for (const v of [2, 3, 4]) {
       logged.length = 0;
       const p = mk(async () => ({ protocol: v, node: "v22", uptimeSec: 1 }));
       await settle(p);

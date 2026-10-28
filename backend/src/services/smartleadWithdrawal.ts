@@ -2,7 +2,8 @@ import { isDoNotContact } from "../utils/leadContactStatus";
 import { getSmartleadMarker, smartleadMarkerKey, type SmartleadMarker } from "./smartleadMarkers";
 import type { ResolvedSmartlead } from "./smartleadConnection";
 import type { LeadCursor, PushRun, PushRunSummary } from "./smartleadPushRunDb";
-import { SmartleadApiError, scrubSmartleadSecrets, type UnsubscribeOutcome } from "./smartleadService";
+import { SmartleadApiError, scrubSmartleadSecrets, type UnsubscribeOutcome, type UpdateLeadEmailOutcome } from "./smartleadService";
+import { isAcceptableEmail } from "./smartleadPayload";
 
 /**
  * The withdrawal sweep (ENG-673): an opt-out recorded in AgentWeb must reach Smartlead too. Smartlead sends on its own schedule, so a lead
@@ -69,7 +70,11 @@ export interface WithdrawalDeps {
   readLeadConsistent(listId: string, leadId: string): Promise<Lead | null>;
   writeMarker(listId: string, leadId: string, markerKey: string, marker: SmartleadMarker): Promise<void>;
   smartlead: {
+    /** Whether this key can SEE the campaign. A key from another Smartlead account answers 404 to everything, which must not be read as "the leads are gone". */
+    campaignVisible(apiKey: string, campaignId: number): Promise<boolean>;
     unsubscribe(apiKey: string, smartleadLeadId: string): Promise<UnsubscribeOutcome>;
+    /** Changes the address of a lead already in the campaign, in place (the same Smartlead lead id keeps its place and its opt-out). */
+    updateLeadEmail(apiKey: string, campaignId: number, smartleadLeadId: string, email: string): Promise<UpdateLeadEmailOutcome>;
     findLeadId(apiKey: string, email: string): Promise<string | null>;
   };
   now(): Date;
@@ -82,6 +87,8 @@ export interface SweepResult {
   /** Distinct list and campaign pairs looked at. */
   targets: number;
   withdrawn: number;
+  /** Leads whose edited address was pushed to Smartlead (the pushed address is replaced, so it is no longer emailed). */
+  synced: number;
   /** Leads whose unsubscribe did not go through; they stay as they were and are retried (after the others) next pass. */
   failed: number;
   /** Pairs left alone because no Smartlead key of theirs could be used. */
@@ -91,14 +98,14 @@ export interface SweepResult {
 }
 
 export async function withdrawalSweep(deps: WithdrawalDeps): Promise<SweepResult> {
-  const out: SweepResult = { targets: 0, withdrawn: 0, failed: 0, keyUnavailable: 0, targetErrors: 0 };
+  const out: SweepResult = { targets: 0, withdrawn: 0, synced: 0, failed: 0, keyUnavailable: 0, targetErrors: 0 };
   const windowMs = (deps.windowDays ?? WITHDRAWAL_WINDOW_DAYS) * 24 * 60 * 60 * 1000;
   const cap = deps.maxPerList ?? WITHDRAWALS_PER_LIST;
   const rows = await deps.db.listRunsSince(new Date(deps.now().getTime() - windowMs).toISOString(), RUNS_PER_SWEEP); // newest first
 
   // One target per list and campaign, with EVERY run for it (newest first): a Smartlead campaign belongs to one account, so any run's
   // key can reach it, and a newest run whose key is gone must not hide the others.
-  if (rows.length >= RUNS_PER_SWEEP) deps.log(`[SmartleadWithdrawal] WARNING: ${rows.length} runs in the window, the limit: the OLDEST list and campaign pairs are not being swept`);
+  if (rows.length >= RUNS_PER_SWEEP) logOnce(deps, "run-limit", `[SmartleadWithdrawal] WARNING: ${rows.length} runs in the window, the limit: the OLDEST list and campaign pairs are not being swept`);
   const targets = new Map<string, PushRunSummary[]>();
   for (const row of rows) {
     if (!row.listId || !row.campaignId) continue;
@@ -129,19 +136,27 @@ export async function withdrawalSweep(deps: WithdrawalDeps): Promise<SweepResult
       }
       if (!resolved) {
         out.keyUnavailable++;
-        deps.log(`[SmartleadWithdrawal] list=${first.listId} campaign=${first.campaignId}: NO usable Smartlead key (${lastReason}); opt-outs on this list are NOT being sent to Smartlead`);
+        logOnce(deps, `${first.listId}#${first.campaignId}#nokey#${lastReason}`, `[SmartleadWithdrawal] list=${first.listId} campaign=${first.campaignId}: NO usable Smartlead key (${lastReason}); opt-outs on this list are NOT being sent to Smartlead`);
         continue;
       }
       const result = await sweepTarget(deps, resolved, first.listId!, first.campaignId!, cap);
       out.withdrawn += result.withdrawn;
+      out.synced += result.synced;
       out.failed += result.failed;
+      if (result.invisible) {
+        out.keyUnavailable++;
+        logOnce(deps, `${first.listId}#${first.campaignId}#invisible`, `[SmartleadWithdrawal] list=${first.listId} campaign=${first.campaignId}: the connected key cannot see this campaign (it was deleted in Smartlead, or the key belongs to another Smartlead account); nothing was changed for this list, and if the campaign still exists for the customer its opt-outs are NOT being sent`);
+      }
     } catch (error) {
       out.targetErrors++;
-      deps.log(`[SmartleadWithdrawal] list=${first.listId} campaign=${first.campaignId}: ${scrubSmartleadSecrets(error instanceof Error ? error.message : String(error))}`);
+      logOnce(deps, `${first.listId}#${first.campaignId}#error#${error instanceof SmartleadApiError ? error.status ?? "net" : "other"}#${(error instanceof Error ? error.message : String(error)).slice(0, 40)}`, `[SmartleadWithdrawal] list=${first.listId} campaign=${first.campaignId}: ${scrubSmartleadSecrets(error instanceof Error ? error.message : String(error))}`);
     }
   }
-  if (out.withdrawn || out.failed || out.keyUnavailable || out.targetErrors) {
-    deps.log(`[SmartleadWithdrawal] pass: targets=${out.targets} withdrawn=${out.withdrawn} failed=${out.failed} keyUnavailable=${out.keyUnavailable} targetErrors=${out.targetErrors}`);
+  if (out.withdrawn || out.synced || out.failed || out.keyUnavailable || out.targetErrors) {
+    // Every pass that DID something is logged; a pass that only repeats the same problems is logged once a day.
+    const line = `[SmartleadWithdrawal] pass: targets=${out.targets} withdrawn=${out.withdrawn} synced=${out.synced} failed=${out.failed} keyUnavailable=${out.keyUnavailable} targetErrors=${out.targetErrors}`;
+    if (out.withdrawn || out.synced) deps.log(line);
+    else logOnce(deps, `pass#${out.targets}#${out.failed}#${out.keyUnavailable}#${out.targetErrors}`, line);
   }
   return out;
 }
@@ -151,39 +166,140 @@ const needsWithdrawal = (lead: Lead, campaignId: number): SmartleadMarker | unde
   return marker && (marker.state === "pushed" || marker.state === "released") && isDoNotContact(lead) ? marker : undefined;
 };
 
+/** A pushed lead whose address was edited in the CRM after the push, to an address that would be accepted: Smartlead still has the OLD one. */
+const needsAddressSync = (lead: Lead, campaignId: number): SmartleadMarker | undefined => {
+  const marker = getSmartleadMarker(lead, campaignId);
+  if (!marker || (marker.state !== "pushed" && marker.state !== "released") || !marker.smartleadLeadId || !marker.email) return undefined;
+  // An opted-out lead is STOPPED, never moved: moving it to a new address first would leave Smartlead emailing that address if the stop then failed.
+  if (isDoNotContact(lead)) return undefined;
+  const email = typeof lead.email === "string" ? lead.email.trim().toLowerCase() : "";
+  return isAcceptableEmail(email) && email !== marker.email ? marker : undefined;
+};
+
+type Outcome = { kind: "withdrawn" } | { kind: "synced" } | { kind: "skipped" } | { kind: "failed"; why: string; quiet?: boolean };
+
 async function sweepTarget(
   deps: WithdrawalDeps,
   resolved: Extract<ResolvedSmartlead, { ok: true }>,
   listId: string,
   campaignId: number,
   cap: number,
-): Promise<{ withdrawn: number; failed: number }> {
+): Promise<{ withdrawn: number; synced: number; failed: number; invisible?: boolean }> {
   const markerKey = smartleadMarkerKey(campaignId);
-  const result = { withdrawn: 0, failed: 0 };
+  const result: { withdrawn: number; synced: number; failed: number; invisible?: boolean } = { withdrawn: 0, synced: 0, failed: 0 };
 
-  // Every lead that opted out here and is still live in Smartlead; those that failed before are tried last.
+  // What needs doing in this list: leads whose address was edited since the push, and leads that opted out here and are still live in
+  // Smartlead. Leads that failed before are tried last.
+  const order = (ids: Array<{ leadId: string; attempts: number; at: number }>) => ids.sort((a, b) => a.attempts - b.attempts || a.at - b.at);
+  const entry = (lead: Lead) => {
+    const before = failedBefore.get(`${listId}#${lead.leadId}`);
+    const recent = before && deps.now().getTime() - before.at < FAILURE_DECAY_MS ? before : undefined;
+    return { leadId: String(lead.leadId), attempts: recent?.attempts ?? 0, at: recent?.at ?? 0 };
+  };
   const found: Array<{ leadId: string; attempts: number; at: number }> = [];
+  const drifted: Array<{ leadId: string; attempts: number; at: number }> = [];
   let after: LeadCursor | null = null;
   for (;;) {
     const page = await deps.readLeads(listId, after, PAGE);
     if (page.items.length === 0) break;
     for (const lead of page.items) {
-      if (needsWithdrawal(lead, campaignId)) {
-        const before = failedBefore.get(`${listId}#${lead.leadId}`);
-        const recent = before && deps.now().getTime() - before.at < FAILURE_DECAY_MS ? before : undefined;
-        found.push({ leadId: String(lead.leadId), attempts: recent?.attempts ?? 0, at: recent?.at ?? 0 });
-      }
+      if (needsAddressSync(lead, campaignId)) drifted.push(entry(lead));
+      if (needsWithdrawal(lead, campaignId)) found.push(entry(lead));
     }
     after = { listId, leadId: String(page.items[page.items.length - 1].leadId) };
     if (!page.hasMore) break;
   }
-  found.sort((a, b) => a.attempts - b.attempts || a.at - b.at);
+  order(found);
+  order(drifted);
+  if (found.length === 0 && drifted.length === 0) return result; // nothing to do here: no Smartlead call at all
 
-  let consecutiveFailures = 0;
-  type Outcome = { kind: "withdrawn" } | { kind: "skipped" } | { kind: "failed"; why: string; quiet?: boolean };
+  // The key must be able to SEE the campaign (a connection whose key was replaced by one from another Smartlead account answers 404 to every
+  // lead, which would be read as "gone" and closed as withdrawn while the person is still live in the old account). Checked only when there
+  // is something to do, so a quiet pass costs no Smartlead calls.
+  try {
+    if (!(await deps.smartlead.campaignVisible(resolved.apiKey, campaignId))) return { ...result, invisible: true };
+  } catch (error) {
+    // A key revoked since the last pass is found here first: report it (flagged after a confirming probe) before the pass moves on.
+    const status = error instanceof SmartleadApiError ? error.status : undefined;
+    if (status === 401 || status === 403) void deps.reportFailure(resolved, error).catch(() => undefined);
+    throw error;
+  }
 
-  /** One lead. Returns what happened; throws on a Smartlead or store error (the caller counts it). EVERY path ends in the caller's checks. */
-  const attempt = async (leadId: string): Promise<Outcome> => {
+  let hardStop = false; // a rate limit or a rejected key: nothing more is tried in this list this pass
+
+  /** Runs `attempt` over leads with the shared bookkeeping: failures are remembered, a rate limit or a rejected key stops the list, an outage stops it too. */
+  const runAll = async (ids: Array<{ leadId: string }>, attempt: (leadId: string) => Promise<Outcome>) => {
+    let consecutiveFailures = 0; // per phase: a run of refused address changes must not stop the opt-outs that come after
+    for (const { leadId } of ids.slice(0, cap)) {
+      if (hardStop) return;
+      let kind: Outcome["kind"];
+      try {
+        const outcome = await attempt(leadId);
+        kind = outcome.kind;
+        if (outcome.kind === "failed") {
+          noteFailure(listId, leadId, deps.now().getTime());
+          result.failed++;
+          const line = `[SmartleadWithdrawal] list=${listId} lead=${leadId}: ${outcome.why}`;
+          if (outcome.quiet) logOnce(deps, `${listId}#${leadId}#${outcome.why}`, line);
+          else deps.log(line);
+        } else if (outcome.kind === "withdrawn") {
+          result.withdrawn++;
+        } else if (outcome.kind === "synced") {
+          result.synced++;
+        }
+      } catch (error) {
+        kind = "failed";
+        noteFailure(listId, leadId, deps.now().getTime());
+        result.failed++;
+        deps.log(`[SmartleadWithdrawal] list=${listId} lead=${leadId}: ${scrubSmartleadSecrets(error instanceof Error ? error.message : String(error))}`);
+        const status = error instanceof SmartleadApiError ? error.status : undefined;
+        // A rejected key fails every lead the same way, and a rate limit means "stop for now": leave the list for the next pass.
+        if (status === 401 || status === 403) {
+          void deps.reportFailure(resolved, error).catch(() => undefined);
+          hardStop = true;
+          return;
+        }
+        if (status === 429) { hardStop = true; return; }
+      }
+      // Every failure counts, refused addresses too: Smartlead answers a refusal and an outage alike with HTTP 500, so ten in a row ends the
+      // edits for this pass (the opt-outs already ran first, and leads that failed are tried last next time, so others get their turn).
+      consecutiveFailures = kind === "failed" ? consecutiveFailures + 1 : kind === "skipped" ? consecutiveFailures : 0;
+      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) return;
+    }
+  };
+
+  // Push edited addresses to Smartlead FIRST. Update Lead changes the address on the same lead id, so the pushed (old) address stops
+  // being emailed, the stored id belongs to the CURRENT address again, and an opt-out below can use it safely.
+  const syncOne = async (leadId: string): Promise<Outcome> => {
+    const lead = await deps.readLeadConsistent(listId, leadId);
+    const marker = lead ? needsAddressSync(lead, campaignId) : undefined;
+    if (!lead || !marker) return { kind: "skipped" };
+    const email = String(lead.email).trim().toLowerCase();
+    const outcome = await deps.smartlead.updateLeadEmail(resolved.apiKey, campaignId, marker.smartleadLeadId!, email);
+    if (outcome === "ok") {
+      await deps.writeMarker(listId, leadId, markerKey, { ...marker, email });
+      return { kind: "synced" };
+    }
+    if (outcome === "not_found") {
+      // The stored id is gone. The customer may have deleted and re-imported the lead (a NEW id, still at the pushed address and still emailed):
+      // look the pushed address up before deciding there is nothing live to correct.
+      const current = await deps.smartlead.findLeadId(resolved.apiKey, marker.email!);
+      if (current) {
+        const again = await deps.smartlead.updateLeadEmail(resolved.apiKey, campaignId, current, email);
+        if (again !== "ok") return { kind: "failed", why: "its pushed address is still in Smartlead under another lead id and the edited address could not be applied; will retry" };
+        await deps.writeMarker(listId, leadId, markerKey, { ...marker, email, smartleadLeadId: current });
+        return { kind: "synced" };
+      }
+      // Neither the id nor the pushed address is in Smartlead: nothing live to correct. Remember the new address so this stops being retried.
+      await deps.writeMarker(listId, leadId, markerKey, { ...marker, email });
+      return { kind: "skipped" };
+    }
+    if (outcome === "rejected") return { kind: "failed", quiet: true, why: "its address was edited but Smartlead refused the new one (it may already be another lead), so the pushed address is still live there" };
+    return { kind: "failed", why: "Smartlead changed nothing for the edited address; will retry" };
+  };
+
+  // Stop opted-out leads.
+  const withdrawOne = async (leadId: string): Promise<Outcome> => {
     // Decide on a CONSISTENT read taken now: the unsubscribe cannot be undone, and the page read can be stale (a lead re-subscribed, or
     // already withdrawn, in the meantime). A failed read throws and is a failure like any other, not a reason to abandon the list.
     const lead = await deps.readLeadConsistent(listId, leadId);
@@ -195,25 +311,37 @@ async function sweepTarget(
       return { kind: "withdrawn" };
     };
 
-    // The stored Smartlead id is trusted only while the lead still has the address that was pushed; otherwise (or with no id) the lead is
-    // looked up by its CURRENT address, so an edited address can never unsubscribe somebody else by a stale id.
     const stored = marker.smartleadLeadId;
-    const trusted = !!stored && (!marker.email || marker.email === email);
-    const looked = trusted ? undefined : email ? (await deps.smartlead.findLeadId(resolved.apiKey, email)) ?? undefined : undefined;
-    const target = trusted ? stored : looked;
+    const drift = !!stored && !!marker.email && marker.email !== email;
 
-    if (!target) {
-      if (stored) {
-        // We KNOW this person was pushed under another address, which is still in Smartlead: closing this as "withdrawn" would leave them
-        // being emailed, and unsubscribing the old address could be the wrong person. Leave it open for a human.
-        return { kind: "failed", quiet: true, why: "its address changed since the push and the new address is not in Smartlead, so the pushed address could not be stopped; needs a human" };
+    if (drift) {
+      // The address was edited and could NOT be pushed to Smartlead (it refused the new address, or the lead has no address now). This record
+      // opted out, so its Smartlead counterpart (the stored id, which still has the PUSHED address) is stopped, and so is whatever lead has
+      // the new address, if that is a different one.
+      // The PUSHED address is looked up too: if the customer deleted and re-imported the lead, it is live under a NEW id that the stored id does not reach.
+      const ids = [stored!];
+      for (const address of [marker.email!, email]) {
+        const found = address ? await deps.smartlead.findLeadId(resolved.apiKey, address) : null;
+        if (found && !ids.includes(found)) ids.push(found);
       }
-      return withdrawn(); // never had a Smartlead id and the address is not there: nothing to unsubscribe
+      for (const id of ids) {
+        const outcome = await deps.smartlead.unsubscribe(resolved.apiKey, id);
+        if (outcome === "no_update") return { kind: "failed", why: "Smartlead changed nothing; will retry" };
+        // The stored id may be gone (deleted); an id that was JUST looked up and then 404s is Smartlead disagreeing with itself.
+        if (outcome === "not_found" && id !== stored) return { kind: "failed", why: "Smartlead returned this lead's id and then said it does not exist; will retry" };
+      }
+      return withdrawn();
     }
+
+    // No edited address: the stored id is the lead (a marker without an address is an older one and is trusted); with no id the lead is
+    // looked up by its address.
+    const looked = stored ? undefined : email ? (await deps.smartlead.findLeadId(resolved.apiKey, email)) ?? undefined : undefined;
+    const target = stored ?? looked;
+    if (!target) return withdrawn(); // never had a Smartlead id and the address is not there: nothing to unsubscribe
 
     let outcome = await deps.smartlead.unsubscribe(resolved.apiKey, target);
     if (outcome === "not_found") {
-      if (trusted && email) {
+      if (stored && email) {
         // A 404 on a stored id can mean the customer deleted and re-imported the lead, which changes its id: look the address up before
         // deciding the lead is gone. The SAME id again means the lead exists and Smartlead refused: a failure, not "gone".
         const current = await deps.smartlead.findLeadId(resolved.apiKey, email);
@@ -228,45 +356,11 @@ async function sweepTarget(
       }
     }
     if (outcome === "no_update") return { kind: "failed", why: "Smartlead changed nothing; will retry" };
-
-    // The address changed and the new address is a DIFFERENT Smartlead lead than the one that was pushed: the pushed address is still live
-    // there. The lead is opted out in the CRM, so stop that one too.
-    if (!trusted && stored && looked && looked !== stored) {
-      const old = await deps.smartlead.unsubscribe(resolved.apiKey, stored);
-      if (old === "no_update") return { kind: "failed", why: "stopped the new address but Smartlead changed nothing for the pushed one; will retry" };
-    }
     return withdrawn();
   };
 
-  for (const { leadId } of found.slice(0, cap)) {
-    let kind: Outcome["kind"];
-    try {
-      const outcome = await attempt(leadId);
-      kind = outcome.kind;
-      if (outcome.kind === "failed") {
-        noteFailure(listId, leadId, deps.now().getTime());
-        result.failed++;
-        const line = `[SmartleadWithdrawal] list=${listId} lead=${leadId}: ${outcome.why}`;
-        if (outcome.quiet) logOnce(deps, `${listId}#${leadId}#${outcome.why}`, line);
-        else deps.log(line);
-      } else if (outcome.kind === "withdrawn") {
-        result.withdrawn++;
-      }
-    } catch (error) {
-      kind = "failed";
-      noteFailure(listId, leadId, deps.now().getTime());
-      result.failed++;
-      deps.log(`[SmartleadWithdrawal] list=${listId} lead=${leadId}: ${scrubSmartleadSecrets(error instanceof Error ? error.message : String(error))}`);
-      const status = error instanceof SmartleadApiError ? error.status : undefined;
-      // A rejected key fails every lead the same way, and a rate limit means "stop for now": leave the list for the next pass.
-      if (status === 401 || status === 403) {
-        void deps.reportFailure(resolved, error).catch(() => undefined);
-        break;
-      }
-      if (status === 429) break;
-    }
-    consecutiveFailures = kind === "failed" ? consecutiveFailures + 1 : kind === "withdrawn" ? 0 : consecutiveFailures;
-    if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) break;
-  }
+  // Opt-outs come FIRST: a rate limit or a long backlog of address edits must never delay stopping somebody who said stop.
+  await runAll(found, withdrawOne);
+  await runAll(drifted, syncOne);
   return result;
 }

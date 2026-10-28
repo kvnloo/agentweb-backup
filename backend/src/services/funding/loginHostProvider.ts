@@ -133,10 +133,11 @@ export const CERT_WARN_EVERY_MS = 60 * 60 * 1000;
 export const PROTOCOL_RECHECK_MS = 10 * 60 * 1000;
 /**
  * Worker protocol versions this backend works with for sign-in, revoke and the plain turn path (explicit, not derived from PROTOCOL_VERSION, so a bump of the
- * constant cannot silently stop accepting the worker that is still running). A worker one version ahead is accepted so the worker
+ * constant cannot silently stop accepting the worker that is still running). Versions up to one AHEAD of PROTOCOL_VERSION are accepted so a worker
  * can deploy FIRST (a new request field needs the worker first, see PROTOCOL_VERSION) without every running backend reporting a mismatch: a mismatch
- * makes `workerSpeaksOurProtocol` false, which stops a "no such connection" answer from counting as a confirmed wipe. Code that needs a specific newer
- * feature (the tool relay) must test `workerProtocol()` itself, not `protocolStatus()`.
+ * makes `workerSpeaksOurProtocol` false, which stops a "no such connection" answer from counting as a confirmed wipe. Protocol 4 (the tool relay) is
+ * accepted here, ahead of the backend that speaks it, for that reason. Code that needs a specific newer feature (the tool relay) must test
+ * `workerProtocol()` itself, not `protocolStatus()`.
  */
 export const ACCEPTED_WORKER_PROTOCOLS: ReadonlySet<number> = new Set([2, 3, 4]);
 

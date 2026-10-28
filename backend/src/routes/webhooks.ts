@@ -1393,6 +1393,13 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
 
                     // ENG-673: this block also runs for an EXISTING lead that resubmits a form (isUpdated), and that lead keeps its Smartlead
                     // marker. A lead being emailed through the customer's Smartlead campaign is not also auto-emailed from here.
+                    // An existing lead that opted out and then resubmits a form must not be auto-emailed either: the auto-draft step has no
+                    // do-not-contact check of its own, and neither did this one (found by a review of ENG-673; older than that work).
+                    if (!autoSendStatus && isDoNotContact(freshLead ?? lead)) {
+                      console.log(`Auto send skipped: lead ${lead.leadId} in list ${leadList.listId} is do-not-contact`);
+                      autoSendStatus = 'skipped_do_not_contact';
+                    }
+
                     if (!autoSendStatus && isPushedToSmartlead(freshLead ?? lead)) {
                       console.log(`Auto send skipped: lead ${lead.leadId} in list ${leadList.listId} is being emailed through Smartlead`);
                       autoSendStatus = 'skipped_smartlead';
