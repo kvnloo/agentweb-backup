@@ -26,8 +26,6 @@ export const SOFT_DEADLINE_MESSAGE = "The time limit for this turn is almost rea
 export const STOPPED_MESSAGE = "This turn has ended; this call was not run.";
 export const NOT_IN_RUN_MESSAGE = "That tool is not available in this run.";
 export const BAD_INPUT_MESSAGE = "A tool call needs an object of arguments.";
-export const TOO_MANY_MESSAGE = "Too many tool calls are in progress. Wait for them to finish.";
-export const CALL_CAP_MESSAGE = "This turn has made too many tool calls. Write your final answer now.";
 export const DELIVERY_FAILED_MESSAGE = "The tool ran but its result could not be returned to you. Do not repeat it blindly; check its current state first or ask the user.";
 /** Written into the PERSISTED tool result of a call whose result the worker could no longer take (A1): the model reads it on the next turn. */
 export const RESULT_LOST_NOTE =
@@ -36,12 +34,14 @@ export const RESULT_LOST_NOTE =
 export const REPLAY_NOTE = "This identical call already ran earlier in this turn, but its result could not be delivered then. It was NOT run again. Its original result follows.\n";
 
 /** Hard limits of what is sent to the worker for one result (the worker's own are in loginHost/protocol.ts; these stay inside them). */
-const MAX_CONTENT_CHARS = 1_000_000;
-const MAX_BODY_CHARS = 7 * 1024 * 1024;
+/** UTF-8 BYTES of the text (the worker's caps are bytes: a multi-byte text must not slip past a character count). */
+const MAX_CONTENT_BYTES = 1_000_000;
+/** UTF-8 bytes of the whole serialized turn.toolResult body; the worker's cap for that route is 8 MiB. */
+const MAX_BODY_BYTES = 7.5 * 1024 * 1024;
 const MAX_IN_FLIGHT = 16;
 const DEFAULT_MAX_CALLS = 400;
 const MAX_REPLAYS = 8;
-const MAX_REPLAY_CHARS = 256 * 1024;
+const MAX_REPLAY_BYTES = 256 * 1024;
 const MAX_DELIVERY_ATTEMPTS = 3;
 const MESSAGE_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
 
@@ -49,6 +49,8 @@ export interface RelayBridgePort {
   callTool(token: string, call: { name: string; args: Record<string, unknown>; callId?: string }, runId: string, opts?: { signal?: AbortSignal }): Promise<BridgeCallResult>;
   listTools(token: string, runId: string): Promise<BridgeListedTool[]>;
   noteToolUse(runId: string, callId: string, name: string, input: unknown, messageId?: string): void;
+  /** Closes the current call group (what a tool-result in the stream does on the HTTP path). */
+  noteToolResult(runId: string): void;
   /** Non-clearing snapshot of the run's ledger (to learn whether a call really ran). */
   takeLedger(runId: string): { records: Array<{ toolCallId: string; kind: string }>; truncated: number };
 }
@@ -70,7 +72,11 @@ export interface RelayDispatcherOptions {
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
   maxCalls?: number;
-  /** Progress hooks (the chat's "executing" statuses). Must not throw. */
+  /** Called ONCE when the worker exceeds the call cap or the in-flight limit: the caller interrupts the turn (A16). Further calls are dropped unanswered. */
+  onLimitTripped?: () => void;
+  /** Whether the session is waiting on a confirmation (a halt latched). Absent = treated as yes (the safe direction). */
+  isHalted?: () => boolean;
+  /** Progress hooks (the chat's "executing" statuses). Must not throw. Never called after `close()`. */
   onCall?: (phase: "start" | "end", name: string) => void;
 }
 
@@ -88,7 +94,16 @@ interface Answer {
   images?: ToolImage[];
   unlock?: string[];
   /** For a real execution: how to remember its original text if the worker cannot take the answer. */
-  replay?: { key: string; content: string };
+  replay?: { key: string; content: string; isError: boolean };
+}
+
+const TRUNCATED_NOTE = "\n[truncated: the tool's output was longer than can be returned]";
+
+function truncateUtf8(text: string, maxBytes: number): string {
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  let out = Buffer.from(text, "utf8").subarray(0, maxBytes).toString("utf8");
+  while (out.endsWith("\ufffd")) out = out.slice(0, -1); // a cut multi-byte character
+  return out;
 }
 
 const realSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms).unref?.());
@@ -102,7 +117,11 @@ export class RelayToolDispatcher {
   private readonly seenOps = new Set<string>();
   private readonly unlocked = new Set<string>();
   private readonly lost = new Set<string>();
-  private readonly replays = new Map<string, string>();
+  private readonly replays = new Map<string, { content: string; isError: boolean }>();
+  /** Operations whose answer the worker ACCEPTED (the model read it). Every other executed call of the turn is "result lost". */
+  private readonly delivered = new Set<string>();
+  private closed = false;
+  private tripped = false;
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
   private calls = 0;
@@ -122,24 +141,67 @@ export class RelayToolDispatcher {
     return this.lost;
   }
 
+  /** Ids of calls whose answer the worker accepted. A call that executed and is NOT in here never reached the model (S1). */
+  deliveredCallIds(): ReadonlySet<string> {
+    return this.delivered;
+  }
+
+  /** The turn is over for the caller: no progress callback fires after this (calls still running are answered as usual). */
+  close(): void {
+    this.closed = true;
+  }
+
   /**
    * Starts a call and returns at once. Never throws, never rejects. An operationId this dispatcher already saw is dropped (a replayed event
    * must not execute twice), and the 128-bit id the worker generates is the only identity of the call.
    */
-  start(ev: RelayCallEvent): void {
+  start(ev: RelayCallEvent): boolean {
     try {
       const op = ev?.operationId;
-      if (typeof op !== "string" || op.length === 0) return;
+      if (typeof op !== "string" || op.length === 0) return false;
+      // A worker past the limits is misbehaving: its calls are not run, not answered, not counted and not reported, and the turn is interrupted (SF2).
+      // That also bounds everything kept per operation (seenOps, the caller's `uses`, pending promises and posts).
+      if (this.tripped) return false;
       if (this.seenOps.has(op)) {
         this.log("duplicate_operation");
-        return;
+        return false;
       }
+      if (this.seenOps.size >= (this.o.maxCalls ?? DEFAULT_MAX_CALLS)) return this.trip("call_cap");
+      if (this.inFlight.size >= MAX_IN_FLIGHT) return this.trip("in_flight_cap");
       this.seenOps.add(op);
+      this.calls++;
       const work = this.run(op, ev).catch(() => this.log("dispatch_failed"));
       this.inFlight.add(work);
       void work.finally(() => this.inFlight.delete(work));
+      return true;
     } catch {
       this.log("start_failed");
+      return false;
+    }
+  }
+
+  private trip(code: string): false {
+    this.tripped = true;
+    this.log(code);
+    try {
+      this.o.onLimitTripped?.();
+    } catch {
+      /* the calls are dropped either way */
+    }
+    return false;
+  }
+
+  private inManifest(name: string): boolean {
+    return this.o.manifest.open.has(name) || this.o.manifest.locked.has(name);
+  }
+
+  private progress(phase: "start" | "end", name: string): void {
+    // Only names of the manifest are ever shown to the user (a hostile worker must not be able to write arbitrary text into the progress status).
+    if (this.closed || !this.inManifest(name)) return;
+    try {
+      this.o.onCall?.(phase, name);
+    } catch {
+      /* best effort */
     }
   }
 
@@ -166,7 +228,7 @@ export class RelayToolDispatcher {
 
   private async run(op: string, ev: RelayCallEvent): Promise<void> {
     const name = typeof ev.name === "string" ? ev.name : "";
-    this.o.onCall?.("start", name);
+    this.progress("start", name);
     try {
       let answer: Answer;
       try {
@@ -179,7 +241,7 @@ export class RelayToolDispatcher {
       }
       await this.deliver(op, answer);
     } finally {
-      this.o.onCall?.("end", name);
+      this.progress("end", name);
     }
   }
 
@@ -188,8 +250,6 @@ export class RelayToolDispatcher {
     const refuse = (message: string): Answer => ({ content: message, isError: true });
     if (this.o.isStopped()) return refuse(STOPPED_MESSAGE);
     if (this.o.softDeadlineAt !== undefined && this.now() >= this.o.softDeadlineAt) return refuse(SOFT_DEADLINE_MESSAGE);
-    if (++this.calls > (this.o.maxCalls ?? DEFAULT_MAX_CALLS)) return refuse(CALL_CAP_MESSAGE);
-    if (this.inFlight.size > MAX_IN_FLIGHT) return refuse(TOO_MANY_MESSAGE);
     // The manifest is the worker's view; the bridge's current list (checked again inside callTool) is the authority. A name outside the manifest, or a locked
     // one that no accepted answer has unlocked, never reaches the bridge.
     const inManifest = this.o.manifest.open.has(name) || (this.o.manifest.locked.has(name) && this.unlocked.has(name));
@@ -198,7 +258,16 @@ export class RelayToolDispatcher {
 
     const key = `${name}\u0000${stableStringify(ev.input)}`;
     const replay = this.replays.get(key);
-    if (replay !== undefined) return { content: REPLAY_NOTE + replay, isError: false };
+    if (replay !== undefined) {
+      // Served only while the run is still live: a revoke (which closes the run) or a failed liveness check refuses the replay like any call.
+      try {
+        await this.o.bridge.listTools(this.o.token, this.o.runId);
+      } catch {
+        return refuse(STOPPED_MESSAGE);
+      }
+      if (this.o.isStopped()) return refuse(STOPPED_MESSAGE);
+      return { content: REPLAY_NOTE + replay.content, isError: replay.isError };
+    }
 
     // The message id groups the calls of one model message (collapsing identical ones, admitting siblings of a halted preview). The host reads it from the
     // CLI's stream; anything unusable becomes a unique id, which splits groups (the safe direction).
@@ -212,6 +281,10 @@ export class RelayToolDispatcher {
       this.log(err instanceof ToolBridgeAuthError ? "run_ended" : "bridge_failed");
       return refuse(STOPPED_MESSAGE);
     }
+    // SF1: once a halt is latched, the answer that is about to go back ends this call group, as a tool-result in the stream does on the HTTP path. Done
+    // BEFORE the post (the worker may hand the next call over before our post returns), so no later call can join the halted group by reusing its
+    // message id; only siblings that reached the bridge before this answer can be admitted.
+    if (this.o.isHalted ? this.o.isHalted() : true) this.o.bridge.noteToolResult(this.o.runId);
     const answer: Answer = { content: result.content, isError: result.isError === true };
     if (result.images?.length) {
       const { images, dropped } = this.fitImages(result.images);
@@ -220,7 +293,7 @@ export class RelayToolDispatcher {
     }
     const unlock = await this.newlyUnlocked();
     if (unlock.length) answer.unlock = unlock;
-    answer.replay = { key, content: result.content };
+    answer.replay = { key, content: result.content, isError: answer.isError };
     return answer;
   }
 
@@ -253,6 +326,9 @@ export class RelayToolDispatcher {
   private async deliver(op: string, first: Answer): Promise<void> {
     const ids = this.o.ids;
     let answer = this.bound(first);
+    // S2: the worker hands an unlock to the shim BEFORE it replies to us, so a fast call to the new tool can arrive before this post resolves. The names are
+    // marked first; the bridge still checks its CURRENT list on every call, so this grants nothing the bridge does not.
+    for (const n of answer.unlock ?? []) this.unlocked.add(n);
     let attempts = 0;
     let shrinks = 0;
     for (;;) {
@@ -267,7 +343,7 @@ export class RelayToolDispatcher {
           ...(answer.images?.length ? { images: answer.images } : {}),
           ...(answer.unlock?.length ? { unlock: answer.unlock } : {}),
         });
-        for (const n of answer.unlock ?? []) this.unlocked.add(n);
+        this.delivered.add(op);
         this.rememberReplay(op, answer);
         return;
       } catch (err) {
@@ -284,6 +360,7 @@ export class RelayToolDispatcher {
           continue;
         }
         if (err instanceof LoginHostError && err.code === "EINVALID" && err.detail === "unlock_unknown_tool" && answer.unlock) {
+          for (const n of answer.unlock) this.unlocked.delete(n); // the worker will not reveal them, so no call for them is expected
           answer = { ...answer, unlock: undefined };
           continue;
         }
@@ -302,24 +379,27 @@ export class RelayToolDispatcher {
     }
   }
 
-  /** The limits of what one answer may carry. The worker re-checks them; these keep a normal answer from ever being refused. */
+  /** The limits of what one answer may carry, in BYTES of the serialized body. The worker re-checks them; these keep a normal answer from being refused. */
   private bound(a: Answer): Answer {
     let content = a.content;
-    if (content.length > MAX_CONTENT_CHARS) content = `${content.slice(0, MAX_CONTENT_CHARS)}\n[truncated: the tool's output was longer than can be returned]`;
+    if (Buffer.byteLength(content, "utf8") > MAX_CONTENT_BYTES) content = `${truncateUtf8(content, MAX_CONTENT_BYTES)}${TRUNCATED_NOTE}`;
     let images = a.images;
     let dropped = 0;
-    while (images?.length && content.length + images.reduce((n, i) => n + i.data.length, 0) > MAX_BODY_CHARS) {
+    const size = () => Buffer.byteLength(JSON.stringify({ content, images, unlock: a.unlock, operationId: "x".repeat(64), connectionId: "x".repeat(64), turnId: "x".repeat(64), epoch: 1e9, isError: true }), "utf8");
+    while (images?.length && size() > MAX_BODY_BYTES) {
       images = images.slice(0, -1);
       dropped++;
     }
     if (dropped > 0) content += `\n[${dropped} image${dropped === 1 ? "" : "s"} could not be attached (too large).]`;
+    // Text that escapes badly in JSON (control characters) can still be too large: halve it until the body fits.
+    while (size() > MAX_BODY_BYTES && content.length > 1_000) content = `${truncateUtf8(content, Math.floor(Buffer.byteLength(content, "utf8") / 2))}${TRUNCATED_NOTE}`;
     return { ...a, content, images: images?.length ? images : undefined };
   }
 
   /** The worker refused the answer as too large: images go first, then the text is halved. */
   private shrink(a: Answer): Answer {
     if (a.images?.length) return { ...a, content: `${a.content}\n[the images could not be attached (too large).]`, images: undefined };
-    return { ...a, content: `${a.content.slice(0, Math.max(1_000, Math.floor(a.content.length / 2)))}\n[truncated: the tool's output was longer than can be returned]` };
+    return { ...a, content: `${truncateUtf8(a.content, Math.max(1_000, Math.floor(Buffer.byteLength(a.content, "utf8") / 2)))}${TRUNCATED_NOTE}` };
   }
 
   /** Remembers the original text of a call whose answer the worker could not take, so an identical retry gets it back instead of running again. */
@@ -329,7 +409,7 @@ export class RelayToolDispatcher {
     if (this.replays.size >= MAX_REPLAYS) return;
     // Only a call that really ran may be replayed: a refusal ("run ended", "too many") must not block a later honest retry.
     const ran = this.o.bridge.takeLedger(this.o.runId).records.some((r) => r.toolCallId === op && (r.kind === "executed" || r.kind === "failed"));
-    if (ran) this.replays.set(p.key, p.content.slice(0, MAX_REPLAY_CHARS));
+    if (ran) this.replays.set(p.key, { content: truncateUtf8(p.content, MAX_REPLAY_BYTES), isError: p.isError });
   }
 
   private log(code: string): void {

@@ -4,7 +4,7 @@
  */
 import { IMAGE_LIMITS } from '../../../loginHost/protocol';
 import { LoginHostError, ToolResultLostError } from '../loginHostClient';
-import { CALL_CAP_MESSAGE, DELIVERY_FAILED_MESSAGE, NOT_IN_RUN_MESSAGE, REPLAY_NOTE, RelayToolDispatcher, SOFT_DEADLINE_MESSAGE, STOPPED_MESSAGE, type RelayCallEvent } from '../relayToolDispatcher';
+import { DELIVERY_FAILED_MESSAGE, NOT_IN_RUN_MESSAGE, REPLAY_NOTE, RelayToolDispatcher, SOFT_DEADLINE_MESSAGE, STOPPED_MESSAGE, type RelayCallEvent } from '../relayToolDispatcher';
 import { ToolBridge, type BridgeExecuteOutcome, type ToolBridgeDeps } from '../toolBridge';
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -19,6 +19,12 @@ interface Opts {
   gate?: Record<string, Promise<void>>;
   images?: Record<string, Array<{ mimeType: string; data: string }>>;
   content?: Record<string, string>;
+  /** Tools whose result asks for the user's confirmation (latches a halt). */
+  confirm?: string[];
+  /** Tools whose result is an error. */
+  errors?: string[];
+  /** Runs inside client.turnToolResult before it answers (a post that is still in flight). */
+  onPost?: (input: any) => Promise<void> | void;
 }
 
 function rig(o: Opts = {}) {
@@ -26,7 +32,7 @@ function rig(o: Opts = {}) {
   let installed = false;
   const live = { value: true };
   const toolDeps = {
-    resolveTools: async () => [{ name: 'search' }, { name: 'save_note' }, { name: 'install_skills' }, ...(installed ? [{ name: 'late_tool' }] : [])],
+    resolveTools: async () => [{ name: 'search' }, { name: 'save_note' }, { name: 'install_skills' }, { name: 'send_email' }, ...(installed ? [{ name: 'late_tool' }] : [])],
     isReadOnly: (n: string) => n === 'search',
     isLive: async () => live.value,
     execute: async (_run: unknown, call: { name: string; args: Record<string, unknown> }): Promise<BridgeExecuteOutcome> => {
@@ -35,8 +41,8 @@ function rig(o: Opts = {}) {
       if (call.name === 'install_skills') installed = true;
       return {
         content: o.content?.[call.name] ?? `${call.name} done`,
-        isError: false,
-        requiresConfirmation: false,
+        isError: o.errors?.includes(call.name) === true,
+        requiresConfirmation: o.confirm?.includes(call.name) === true,
         toolsChanged: call.name === 'install_skills',
         ...(o.images?.[call.name] ? { images: o.images[call.name] } : {}),
       };
@@ -50,12 +56,14 @@ function rig(o: Opts = {}) {
   const client = {
     turnToolResult: jest.fn(async (input: any) => {
       posts.push(input);
+      await o.onPost?.(input);
       const b = behaviour.next.shift();
       if (b) throw b;
       return { ok: true as const };
     }),
   };
   const phases: string[] = [];
+  const tripped = { count: 0 };
   const d = new RelayToolDispatcher({
     client,
     ids: IDS,
@@ -65,18 +73,21 @@ function rig(o: Opts = {}) {
       callTool: (t, c, r, op) => bridge.callTool(t, c, r, op),
       listTools: (t, r) => bridge.listTools(t, r),
       noteToolUse: (r, c, n, i, m) => bridge.noteToolUse(r, c, n, i, m),
+      noteToolResult: (r) => bridge.noteToolResult(r),
       takeLedger: (r) => bridge.takeLedger(r),
     },
-    manifest: { open: new Set(['search', 'save_note', 'install_skills']), locked: new Set(['late_tool']) },
+    manifest: { open: new Set(['search', 'save_note', 'install_skills', 'send_email']), locked: new Set(['late_tool']) },
     isStopped: o.stopped ?? (() => false),
     softDeadlineAt: o.softDeadlineAt,
     now: o.now,
     maxCalls: o.maxCalls,
+    onLimitTripped: () => void tripped.count++,
+    isHalted: () => bridge.isHalted('s1', 'u1'),
     sleep: async () => undefined,
     onCall: (phase, name) => void phases.push(`${phase}:${name}`),
   });
   const ev = (op: string, name: string, input: unknown = {}, messageId = 'm1'): RelayCallEvent => ({ operationId: op, messageId, name, input });
-  return { d, bridge, token, posts, client, behaviour, executed, ev, live, phases };
+  return { d, bridge, token, posts, client, behaviour, executed, ev, live, phases, tripped };
 }
 
 describe('RelayToolDispatcher', () => {
@@ -228,12 +239,64 @@ describe('RelayToolDispatcher', () => {
     expect(t.posts[1].isError).toBe(true);
   });
 
-  it('caps the total number of calls of a turn', async () => {
+  it('SF2: past the call cap the worker is misbehaving: further calls are neither run nor answered, and the turn is interrupted once', async () => {
     const t = rig({ maxCalls: 2 });
-    for (let i = 1; i <= 4; i++) t.d.start(t.ev(`op-${i}`, 'search', { i }));
+    const started = [1, 2, 3, 4, 5].map((i) => t.d.start(t.ev(`op-${i}`, 'search', { i })));
     await t.d.settle(1_000);
+    expect(started).toEqual([true, true, false, false, false]);
     expect(t.executed).toHaveLength(2);
-    expect(t.posts.filter((p) => p.content === CALL_CAP_MESSAGE)).toHaveLength(2);
+    expect(t.posts).toHaveLength(2);
+    expect(t.tripped.count).toBe(1);
+  });
+
+  it('SF2: a flood of concurrent operations trips the in-flight limit: at most 16 pending, the rest dropped unanswered, the turn interrupted', async () => {
+    let release!: () => void;
+    const t = rig({ gate: { search: new Promise<void>((r) => (release = r)) } });
+    const started = Array.from({ length: 5000 }, (_, i) => t.d.start(t.ev(`op-${i}`, i % 2 ? 'search' : 'no_such_tool', { i })));
+    expect(started.filter(Boolean)).toHaveLength(16);
+    expect(t.d.pending).toBe(16);
+    expect(t.tripped.count).toBe(1);
+    release();
+    await t.d.settle(1_000);
+    expect(t.posts).toHaveLength(16);
+  });
+
+  it('SF2: progress is reported only for names of the manifest', async () => {
+    const t = rig();
+    t.d.start(t.ev('op-1', 'search'));
+    t.d.start(t.ev('op-2', '<script>evil</script>'));
+    await t.d.settle(1_000);
+    expect(t.phases).toEqual(['start:search', 'end:search']);
+  });
+
+  it('progress callbacks never fire after close()', async () => {
+    let release!: () => void;
+    const t = rig({ gate: { search: new Promise<void>((r) => (release = r)) } });
+    t.d.start(t.ev('op-1', 'search'));
+    t.d.close();
+    release();
+    await t.d.settle(1_000);
+    expect(t.phases).toEqual(['start:search']);
+  });
+
+  it('SF1: after a halted preview is answered, a later call reusing the SAME message id is refused (the group was closed)', async () => {
+    const t = rig({ confirm: ['send_email'] });
+    t.d.start(t.ev('op-1', 'send_email', { to: 'a' }, 'msg-1'));
+    await t.d.settle(1_000);
+    expect(t.bridge.isHalted('s1', 'u1')).toBe(true);
+    t.d.start(t.ev('op-2', 'save_note', { n: 1 }, 'msg-1'));
+    await t.d.settle(1_000);
+    expect(t.executed.map((e) => e.name)).toEqual(['send_email']);
+    expect(t.posts[1]).toMatchObject({ operationId: 'op-2', isError: true });
+  });
+
+  it('without a halt, identical calls of one message still collapse (the group is not closed by every answer)', async () => {
+    const t = rig();
+    t.d.start(t.ev('op-1', 'save_note', { n: 1 }, 'msg-1'));
+    await t.d.settle(1_000);
+    t.d.start(t.ev('op-2', 'save_note', { n: 1 }, 'msg-1'));
+    await t.d.settle(1_000);
+    expect(t.executed).toHaveLength(1);
   });
 
   it('identical calls of ONE model message collapse in the bridge; the same call in another message runs', async () => {
@@ -338,6 +401,42 @@ describe('RelayToolDispatcher', () => {
       expect(t.posts[1].content).toBe(`${REPLAY_NOTE}save_note done`);
     });
 
+    it('a replay keeps the original isError', async () => {
+      const t = rig({ errors: ['save_note'] });
+      t.behaviour.next = [new ToolResultLostError('result_lost')];
+      t.d.start(t.ev('op-1', 'save_note', { n: 1 }));
+      await t.d.settle(1_000);
+      t.d.start(t.ev('op-2', 'save_note', { n: 1 }, 'msg-later'));
+      await t.d.settle(1_000);
+      expect(t.executed).toHaveLength(1);
+      expect(t.posts[1]).toMatchObject({ isError: true });
+      expect(t.posts[1].content).toContain(REPLAY_NOTE);
+    });
+
+    it('a replay is not served once the run was revoked', async () => {
+      const t = rig();
+      t.behaviour.next = [new ToolResultLostError('result_lost')];
+      t.d.start(t.ev('op-1', 'save_note', { n: 1 }));
+      await t.d.settle(1_000);
+      t.bridge.revokeConnection('conn-1');
+      t.d.start(t.ev('op-2', 'save_note', { n: 1 }, 'msg-later'));
+      await t.d.settle(1_000);
+      expect(t.posts[1]).toMatchObject({ isError: true, content: STOPPED_MESSAGE });
+    });
+
+    it('at most 8 lost results are kept for replay; a 9th identical retry runs again', async () => {
+      const t = rig();
+      t.behaviour.next = Array.from({ length: 9 }, () => new ToolResultLostError('result_lost'));
+      for (let i = 1; i <= 9; i++) {
+        t.d.start(t.ev(`op-${i}`, 'search', { i }, `m${i}`));
+        await t.d.settle(1_000);
+      }
+      t.d.start(t.ev('op-a', 'search', { i: 1 }, 'mx'));
+      t.d.start(t.ev('op-b', 'search', { i: 9 }, 'my'));
+      await t.d.settle(1_000);
+      expect(t.executed).toHaveLength(10); // i:1 replayed, i:9 ran again
+    });
+
     it('a DIFFERENT call after a lost one runs normally', async () => {
       const t = rig();
       t.behaviour.next = [new ToolResultLostError('result_lost')];
@@ -380,6 +479,36 @@ describe('RelayToolDispatcher', () => {
       expect(t.posts).toHaveLength(2);
       expect(t.posts[1]).toMatchObject({ operationId: 'op-1', isError: true, content: DELIVERY_FAILED_MESSAGE });
       expect([...t.d.lostCallIds()]).toEqual(['op-1']);
+    });
+
+    it('S2: a call to a newly unlocked tool that arrives while the install answer is still being posted is accepted', async () => {
+      let t!: ReturnType<typeof rig>;
+      let lateStarted = false;
+      t = rig({
+        onPost: async (input) => {
+          if (input.operationId === 'op-1') {
+            t.d.start(t.ev('op-2', 'late_tool')); // the worker already handed the unlock to the shim and the CLI called the tool
+            lateStarted = true;
+            await sleep(20);
+          }
+        },
+      });
+      t.d.start(t.ev('op-1', 'install_skills'));
+      await t.d.settle(1_000);
+      expect(lateStarted).toBe(true);
+      expect(t.executed.map((e) => e.name)).toEqual(['install_skills', 'late_tool']);
+    });
+
+    it('limits are in BYTES: a multi-byte text is cut so the body never exceeds the worker cap', async () => {
+      const t = rig({ content: { search: 'é'.repeat(900_000) } }); // 900k characters, 1.8 MB
+      t.d.start(t.ev('op-1', 'search'));
+      await t.d.settle(1_000);
+      expect(Buffer.byteLength(t.posts[0].content)).toBeLessThan(1_000_200);
+      expect(t.posts[0].content).not.toContain('\ufffd');
+      const u = rig({ content: { search: '\u0001'.repeat(1_000_000) } }, ); // escapes to 6 bytes each in JSON
+      u.d.start(u.ev('op-1', 'search'));
+      await u.d.settle(1_000);
+      expect(Buffer.byteLength(JSON.stringify(u.posts[0]))).toBeLessThanOrEqual(7.5 * 1024 * 1024);
     });
 
     it('an unlock the worker does not know is dropped and the result is still delivered', async () => {
@@ -430,7 +559,7 @@ describe('RelayToolDispatcher: an unforeseen failure still answers the operation
       ids: IDS,
       runId: 'r1',
       token: 't',
-      bridge: { callTool: async () => ({ content: 'x', isError: false }), listTools: async () => [], noteToolUse: () => undefined, takeLedger: () => ({ records: [], truncated: 0 }) },
+      bridge: { callTool: async () => ({ content: 'x', isError: false }), listTools: async () => [], noteToolUse: () => undefined, noteToolResult: () => undefined, takeLedger: () => ({ records: [], truncated: 0 }) },
       manifest: { open: new Set(['search']), locked: new Set() },
       isStopped: () => false,
     });
