@@ -100,7 +100,8 @@ import {
 import { assertSequentialStepCounts } from '../services/workPlanSteps';
 import { validateModelPin, normalizeRequestedLlmModel, resolvePlanLaunchModel, canonicalPinId } from '../services/agentMode/modelPin';
 import { resolveTurnFunding, type PlanRoute } from '../services/funding/claudeFunding';
-import { ClaudeRouteStopError, claudeStopBody } from '../services/funding/claudeRouteErrors';
+import { ClaudeRouteStopError, claudeStopBody, turnRanNoTools } from '../services/funding/claudeRouteErrors';
+import { findResumableUserMessage, PLAN_STOP_NOTE_KIND } from '../services/funding/resumeSavedMessage';
 import type { claudeCodeBackend as ClaudeCodeBackendInstance } from '../services/funding/claudeCodeBackendInstance';
 import { workPlanStepModels } from '../services/agentMode/workPlanStepModelsInstance';
 import {
@@ -690,6 +691,9 @@ const turnOfGeneration = new WeakMap<Promise<unknown>, SessionTurnState>();
 function markRaisedAfterUserMessageSaved(error: unknown): void {
   if (typeof error === 'object' && error !== null) errorsAfterUserMessageSaved.add(error);
 }
+
+/** ENG-2113: `userMessageKind` of a turn that answers a message already saved by a stopped plan turn (never stored on a message). */
+const RESUME_SAVED_MESSAGE_KIND = 'resume-saved';
 
 function wasRaisedAfterUserMessageSaved(error: unknown): boolean {
   return typeof error === 'object' && error !== null && errorsAfterUserMessageSaved.has(error);
@@ -9973,7 +9977,16 @@ async function runSessionTurn(
 
   // ENG-1495: messageIndex of the just-persisted user message, for the return value.
   let userMessageIndex: number | undefined;
-  if (!reusingDanglingDirective) {
+  // ENG-2113: "continue" answers the message a stopped plan turn already saved. Checked again here, right before the save is skipped, so a chat that changed in
+  // between (a second tab, a concurrent turn) can never skip the save of a message that is not already stored.
+  const resumingSavedMessage = userMessageKind === RESUME_SAVED_MESSAGE_KIND;
+  if (resumingSavedMessage) {
+    const found = findResumableUserMessage(session.messages);
+    if (!found.ok || found.content !== userMessage) throw new Error('RESUME_SAVED_MESSAGE_NOT_AVAILABLE');
+  }
+  if (resumingSavedMessage) {
+    console.log('AgentMode generateSessionResponse: continuing an already-saved user message (plan stop) — save skipped');
+  } else if (!reusingDanglingDirective) {
     // Add user message to session in database
     console.log('AgentMode generateSessionResponse: Saving user message with attachments:', {
       hasAttachments: !!(userMessageObj.metadata?.attachments && userMessageObj.metadata.attachments.length > 0),
@@ -10987,6 +11000,17 @@ export const agentModeController = {
         return res.status(403).json({ error: 'Unauthorized access to session' });
       }
 
+      // ENG-2113: "continue" answers the message a stopped plan turn already saved, instead of storing it a second time. Only for a turn that is KNOWN to have
+      // run no tool (the stop note says so), and only for exactly that message: anything else is refused and the client sends a new message.
+      let resumeSavedMessage = false;
+      if (req.body.continueSavedMessage === true) {
+        const notContinuable = () => res.status(409).json({ error: 'That message can no longer be continued. Send it again as a new message.', code: 'CONTINUE_NOT_AVAILABLE' });
+        if ((Array.isArray(attachments) ? attachments.length > 0 : !!attachments) || questionAnswer || workPlanInputAnswer || deckAnswer || deckCancel || audioInput) return notContinuable();
+        const found = findResumableUserMessage(session.messages);
+        if (!found.ok || found.content !== userMessage) return notContinuable();
+        resumeSavedMessage = true;
+      }
+
       // ENG-2113: whose plan pays for THIS turn, decided once, before anything below mutates state (a stop consumes nothing).
       // No `fundingChoice` in the body = AgentWeb, with no lookups, exactly as before. A stop is a typed answer, never an AgentWeb run.
       let planRoute: PlanRoute | undefined;
@@ -11556,7 +11580,7 @@ export const agentModeController = {
         turnStartMs, // ENG-907: the deadline withGenerationTimeout below enforces
         undefined, // publishAuthorizationOverride — interactive path resolves per turn
         undefined, // approvedRevisionImageSources
-        undefined, // userMessageKind
+        resumeSavedMessage ? RESUME_SAVED_MESSAGE_KIND : undefined, // userMessageKind
         Boolean(questionAnswer || workPlanInputAnswer),
         typeof clientId === 'string' ? clientId : undefined, // ENG-1495
         approvalDeckAnswerMeta, // ENG-1635/1644: structured deck answer stamped on the reply
@@ -11933,6 +11957,7 @@ export const agentModeController = {
             ? new ClaudeRouteStopError(error instanceof Error && isWorkerShutdownError(error) ? 'server_restarting' : 'turn_failed')
             : undefined;
       if (planStop && !res.headersSent) {
+        const planStopResumable = turnRanNoTools(planStop) || (planStop !== error && turnRanNoTools(error));
         if (planStop !== error) {
           console.error('AgentMode: plan turn failed outside the Claude backend:', error instanceof Error ? error.message : String(error));
           if (wasRaisedAfterUserMessageSaved(error)) markRaisedAfterUserMessageSaved(planStop);
@@ -11947,15 +11972,17 @@ export const agentModeController = {
               role: 'assistant',
               content: planStop.userMessage,
               timestamp: new Date().toISOString(),
-              metadata: { timestamp: new Date().toISOString(), isErrorMessage: true, kind: 'claude-plan-stop', code: planStop.code },
+              // `resumable`: the turn is KNOWN to have run no tool, so the saved message may be answered again without repeating an action.
+              metadata: { timestamp: new Date().toISOString(), isErrorMessage: true, kind: PLAN_STOP_NOTE_KIND, code: planStop.code, resumable: planStopResumable },
             } as ChatMessage).catch((persistErr) => console.error('AgentMode: failed to persist plan stop note:', persistErr));
           }
         }
-        // Once the user's message is saved the plan turn may have run (tools included): offering a resend on AgentWeb credits would store the message twice
-        // and could repeat its side effects, so the offer is withheld until a "continue" option exists.
+        // `userMessageSaved` + `canContinueSavedMessage` tell the client which offer is safe: not saved = resend; saved and known to have run no tool =
+        // continue (the message is answered again with `continueSavedMessage: true`, never stored twice); saved and a tool may have run = only a new message,
+        // and the client says an action may repeat.
         const planStopSaved = wasRaisedAfterUserMessageSaved(planStop);
         const planStopBody = claudeStopBody(planStop);
-        return res.status(planStop.httpStatus).json(sendRefusalBody({ ...planStopBody, canUseAgentWebCredits: planStopBody.canUseAgentWebCredits && !planStopSaved }, planStopSaved));
+        return res.status(planStop.httpStatus).json(sendRefusalBody({ ...planStopBody, canContinueSavedMessage: planStopSaved && planStopResumable }, planStopSaved));
       }
       console.error('AgentMode: Generate response error:', error);
 

@@ -88,6 +88,19 @@ export class ClaudeRouteStopError extends Error {
   readonly markNeedsReconnect: boolean;
 }
 
+/**
+ * Whether the turn that raised an error may have run a tool. The backend marks it where it knows (the run's ledger); an error nobody marked is
+ * UNKNOWN, which is treated as "may have run" everywhere this is read. Kept beside the error, never on the wire.
+ */
+const toolsRanOf = new WeakMap<object, boolean>();
+export function markTurnToolsRan(err: unknown, ran: boolean): void {
+  if (typeof err === "object" && err !== null) toolsRanOf.set(err, ran);
+}
+/** True only when the turn is KNOWN to have run no tool at all. */
+export function turnRanNoTools(err: unknown): boolean {
+  return typeof err === "object" && err !== null && toolsRanOf.get(err) === false;
+}
+
 /** The JSON body for the browser. Fixed shape, fixed copy: nothing from the failure itself is included. */
 export function claudeStopBody(err: ClaudeRouteStopError): { error: string; code: ClaudeStopCode; funding: "claude_subscription"; retryable: boolean; canUseAgentWebCredits: boolean } {
   return { error: err.userMessage, code: err.code, funding: "claude_subscription", retryable: err.retryable, canUseAgentWebCredits: err.offerAgentWebCredits };
