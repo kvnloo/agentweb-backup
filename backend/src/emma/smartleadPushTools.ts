@@ -108,7 +108,7 @@ const pushBody = (p: PushArgs) => ({
 function previewSummary(p: any) {
   return {
     campaign: p.campaign,
-    sequenceSteps: p.sequence.stepCount,
+    emailStepsInCampaignSequence: p.sequence.stepCount,
     list: p.list,
     cohort: p.cohort,
     blocks: p.preflight.blocks,
@@ -251,6 +251,7 @@ emmaToolRegistry.register({
     return {
       success: true,
       started: started.started,
+      campaign: { ...preview.campaign, emailStepsInCampaignSequence: preview.sequence.stepCount },
       run: started.run,
       message: started.started ? 'The push is running in the background. Use get_smartlead_push_status for progress.' : 'A push to this campaign for this list was already running; it was not started twice.',
     };
