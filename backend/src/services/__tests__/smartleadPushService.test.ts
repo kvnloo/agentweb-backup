@@ -173,6 +173,30 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
       expect(e.logs.join("\n")).toMatch(/started run=.* approved=5/);
     });
 
+    it("records the channel the push came from: Emma's tools say 'agent', the routes and everything else stay 'ui'", async () => {
+      const viaAgent = env();
+      const p = await approve(viaAgent);
+      const r = (await viaAgent.svc.start("owner", go(p.token), { channel: "agent" })) as any;
+      expect((await db.getRun(r.run.runId))!.channel).toBe("agent");
+      await drain(viaAgent);
+      for (const opts of [undefined, {}, { channel: "ui" as const }, { channel: "robot" as any }]) {
+        const e = env();
+        const q = await approve(e);
+        const started = (await (opts === undefined ? e.svc.start("owner", go(q.token)) : e.svc.start("owner", go(q.token), opts))) as any;
+        expect((await db.getRun(started.run.runId))!.channel).toBe("ui");
+        await drain(e);
+      }
+    });
+
+    it("tells whether the user may push a list, and its name, before anything is previewed or asked", async () => {
+      const e = env();
+      e.editors.add("editor");
+      expect(await e.svc.canUseList("editor", e.listId)).toMatchObject({ ok: true, listName: expect.any(String) });
+      expect(await e.svc.canUseList("stranger", e.listId)).toMatchObject({ ok: false, status: 403, code: "forbidden" });
+      expect(await e.svc.canUseList("editor", "no-such-list")).toMatchObject({ ok: false, status: 404 });
+      expect(await e.svc.canUseList("editor", "")).toMatchObject({ ok: false, status: 400 });
+    });
+
     it("records who pushed, with which key, what they approved and acknowledged", async () => {
       const e = env();
       e.editors.add("editor");

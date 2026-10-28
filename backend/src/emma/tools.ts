@@ -2,6 +2,7 @@ import { randomUUID } from 'crypto';
 import { MODIFY_WORK_PLAN_INPUT_SCHEMA, validateModifyWorkPlanArgs } from './impl/modifyWorkPlanArgs';
 import { agentModeService } from '../services/agentModeService';
 import { APPROVAL_KIND_RESERVED_PREFIX } from '../services/voice/hotLeadCallApprovalGate';
+import { SMARTLEAD_APPROVAL_KIND_PREFIX } from '../services/smartleadPushApprovalGate';
 import { getAccessToken as getClickUpAccessToken, createTaskInList as createClickUpTaskInList, getListCustomFields as getClickUpListCustomFields, ClickUpTaskError } from '../services/clickupService';
 import { emmaToolRegistry } from './registry';
 import { auditCampaigns } from '../services/adUtmAuditService';
@@ -127,6 +128,7 @@ import './browserCookieTools';
 import './leadNotificationTools';
 import './hotLeadCallTools';
 import './hotLeadCallSetupTools';
+import './smartleadPushTools';
 
 // Register email lookup / find tool (provider-agnostic)
 import './emailLookupTool';
@@ -251,7 +253,7 @@ emmaToolRegistry.register({
 // only widens Emma's OWN judgment-based use of the card within Meta; it does
 // not add a new hard-enforced gate for other Meta entities — that requires its
 // own dedicated gate, built the same way ENG-400 was, per irreversible action.
-const RESERVED_QUESTION_KIND_PREFIXES = [APPROVAL_KIND_RESERVED_PREFIX];
+const RESERVED_QUESTION_KIND_PREFIXES = [APPROVAL_KIND_RESERVED_PREFIX, SMARTLEAD_APPROVAL_KIND_PREFIX];
 
 emmaToolRegistry.register({
   name: 'ask_user_question',

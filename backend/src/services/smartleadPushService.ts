@@ -127,6 +127,15 @@ export class SmartleadPushService {
     return { ok: true, list };
   }
 
+  /** Whether the user may push this list (edit access), and its name; used to refuse before an approval is asked for. */
+  async canUseList(userId: string, listId: unknown): Promise<Result<{ listName: string }>> {
+    return this.guard(async () => {
+      const list = await this.ownList(userId, listId);
+      if (!list.ok) return list;
+      return { ok: true as const, listName: typeof list.list.name === "string" ? list.list.name : "" };
+    });
+  }
+
   /** The pusher's OWN connection only. */
   private async ownKey(userId: string, accountId?: string): Promise<Result<{ key: Extract<ResolvedSmartlead, { ok: true }> }>> {
     let resolved = await this.deps.resolveKey(userId, accountId);
@@ -309,7 +318,7 @@ export class SmartleadPushService {
 
   // ── start
 
-  start(userId: string, body: Record<string, any>): Promise<Result<{ run: RunView; started: true } | { run: RunView; started: false }>> {
+  start(userId: string, body: Record<string, any>, opts: { channel?: "ui" | "agent" } = {}): Promise<Result<{ run: RunView; started: true } | { run: RunView; started: false }>> {
     return this.guard(async () => {
       if (!this.deps.enabled()) return this.disabled();
       const token = verifyPushToken(this.deps.secret, body.token, this.deps.now().getTime());
@@ -367,7 +376,7 @@ export class SmartleadPushService {
       try {
         started = await this.deps.db.startRun(
         {
-          ownerId: String(list.list.userId ?? userId), pushedBy: userId, keyOwnerId: key.key.ownerUserId, smartleadAccountId: key.key.accountId, channel: "ui", listId: token.listId,
+          ownerId: String(list.list.userId ?? userId), pushedBy: userId, keyOwnerId: key.key.ownerUserId, smartleadAccountId: key.key.accountId, channel: opts.channel === "agent" ? "agent" : "ui", listId: token.listId,
           campaignId: token.campaignId, campaignName: campaign.name, campaignSource: "selected",
           options: {
             includeUnverified: token.includeUnverified, mapping: token.mapping, acknowledgedTags: token.acknowledgedTags, startStatus: token.startStatus, warnings: token.warnings,
