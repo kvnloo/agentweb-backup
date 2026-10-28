@@ -57,7 +57,7 @@ describe('claude plan stops', () => {
   it('the body is fixed copy, never the underlying failure', () => {
     const e = fromHostFailure(new LoginHostError('UNREACHABLE', 'ECONNREFUSED 10.0.1.5:8443'))!;
     const body = claudeStopBody(e);
-    expect(body).toEqual({ error: e.userMessage, code: 'host_unavailable', funding: 'claude_subscription', retryable: true });
+    expect(body).toEqual({ error: e.userMessage, code: 'host_unavailable', funding: 'claude_subscription', retryable: true, canUseAgentWebCredits: true });
     expect(JSON.stringify(body)).not.toMatch(/10\.0\.1\.5|ECONNREFUSED|8443/);
   });
 
@@ -113,5 +113,25 @@ describe('claude plan stops', () => {
       expect(fromResultErrorKind('unknown').code).toBe('turn_failed');
       expect(fromResultErrorKind(undefined).code).toBe('turn_failed');
     });
+  });
+});
+
+describe('which stops offer AgentWeb credits (the user decides; nothing moves on its own)', () => {
+  const OFFERED: ClaudeStopCode[] = ['no_connection', 'needs_reconnect', 'expired', 'revoked_or_disabled', 'lookup_failed', 'host_unavailable', 'host_busy', 'usage_limit', 'turn_failed', 'model_not_on_plan'];
+  const NOT_OFFERED: ClaudeStopCode[] = [
+    'not_enabled', 'not_allowed_here', 'connection_changed', 'context_too_large', 'policy_blocks', 'invalid_funding_choice', 'turn_timeout', 'server_restarting',
+    'extra_usage_needs_ack', 'org_not_supported',
+  ];
+
+  it.each(OFFERED)('%s is offered', (code) => {
+    expect(claudeStopBody(new ClaudeRouteStopError(code)).canUseAgentWebCredits).toBe(true);
+  });
+  it.each(NOT_OFFERED)('%s is not offered', (code) => {
+    expect(claudeStopBody(new ClaudeRouteStopError(code)).canUseAgentWebCredits).toBe(false);
+  });
+  it('every stop code is decided one way or the other (a new code must not default silently)', () => {
+    const decided = new Set<string>([...OFFERED, ...NOT_OFFERED]);
+    for (const code of Object.keys(EXPECTED)) expect(decided.has(code)).toBe(true);
+    for (const r of ALL_REASONS) expect(decided.has(r)).toBe(true);
   });
 });
