@@ -63,7 +63,7 @@ async function withApproval(name: string, args: unknown, ctx = attended()) {
 
 // -- a realistic preview, with a fresh token each time (the real one is single use)
 let tokenCounter: number;
-type PreviewOver = Partial<{ eligible: number; total: number; hash: string; status: string; chosen: number; canStart: boolean; active: boolean; blocks: any[]; tagsToMap: string[]; name: string; fingerprint: string }>;
+type PreviewOver = Partial<{ eligible: number; total: number; hash: string; status: string; chosen: number; canStart: boolean; active: boolean; blocks: any[]; tagsToMap: string[]; name: string; fingerprint: string; shared: boolean }>;
 let previewOver: PreviewOver;
 const previewResult = () => {
   const o = previewOver;
@@ -80,6 +80,7 @@ const previewResult = () => {
       canStart: o.canStart ?? true,
       requiresActiveConfirmation: o.active ?? false,
       fingerprint: o.fingerprint ?? 'fp-1',
+      connection: { accountId: 'smartlead-owner', name: 'Mindd Smartlead', shared: o.shared ?? false },
       token: `signed-token-${++tokenCounter}`,
       expiresAt: '2026-10-28T14:00:00Z',
     },
@@ -99,7 +100,7 @@ beforeEach(() => {
   svc.release.mockResolvedValue({ ok: true, released: 3, skipped: { notFound: 0, nothingToRelease: 1, doNotContact: 0 } });
   for (const k of ['pause', 'resume', 'cancel', 'status']) (svc as any)[k].mockResolvedValue({ ok: true, run: runView() });
   svc.history.mockResolvedValue({ ok: true, runs: [] });
-  svc.campaigns.mockResolvedValue({ ok: true, campaigns: [{ id: 77, name: 'Mindd outreach', status: 'DRAFTED', pushable: true, needsConfirmation: false }] });
+  svc.campaigns.mockResolvedValue({ ok: true, connection: { accountId: 'smartlead-owner', name: 'Mindd Smartlead', shared: false }, campaigns: [{ id: 77, name: 'Mindd outreach', status: 'DRAFTED', pushable: true, needsConfirmation: false }] });
 });
 
 const PUSH = { listId: 'list-1', campaignId: 77 };
@@ -120,10 +121,24 @@ describe('registration', () => {
 });
 
 describe('read-only tools', () => {
-  it('lists campaigns for the caller only', async () => {
+  it('lists campaigns for the caller, and says which Smartlead account they are in', async () => {
     const r = await run('list_smartlead_campaigns', {}, { userId: 'owner' });
-    expect(svc.campaigns).toHaveBeenCalledWith('owner');
+    expect(svc.campaigns).toHaveBeenCalledWith('owner', undefined);
     expect(r.campaigns[0]).toMatchObject({ id: 77, pushable: true });
+    expect(r.smartleadAccount).toEqual({ accountId: 'smartlead-owner', name: 'Mindd Smartlead', shared: false });
+    await run('list_smartlead_campaigns', { accountId: 'smartlead-other' }, { userId: 'owner' });
+    expect(svc.campaigns).toHaveBeenLastCalledWith('owner', 'smartlead-other');
+  });
+
+  it('passes a chosen Smartlead connection through to the preview and start, and tells the model which account was used', async () => {
+    const r = await run('preview_smartlead_push', { ...PUSH, accountId: 'smartlead-other' });
+    expect(svc.preview).toHaveBeenCalledWith('owner', expect.objectContaining({ accountId: 'smartlead-other' }));
+    expect(r.preview.smartleadAccount).toEqual({ accountId: 'smartlead-owner', name: 'Mindd Smartlead', shared: false });
+    await withApproval('start_smartlead_push', { ...PUSH, accountId: 'smartlead-other' });
+    expect(svc.preview.mock.calls.every(([, body]) => body.accountId === 'smartlead-other')).toBe(true);
+    await expect(run('preview_smartlead_push', { ...PUSH, accountId: '' })).rejects.toThrow('accountId is required');
+    await run('preview_smartlead_push', PUSH);
+    expect(svc.preview.mock.calls[svc.preview.mock.calls.length - 1][1]).not.toHaveProperty('accountId');
   });
 
   it('preview tells the model the numbers and findings but never the signed token', async () => {
@@ -179,11 +194,18 @@ describe('start_smartlead_push: the approval card', () => {
     expect(card.allowEmmaDecide).toBe(false);
     expect(card.options.map((o: any) => o.id)).toEqual(['decline', 'approve']);
     expect(card.options[0].recommended).toBe(true);
-    expect(card.question).toContain('Add 50 contacts from "Mindd leads" to your Smartlead campaign "Mindd outreach"');
+    expect(card.question).toContain('Add 50 contacts from "Mindd leads" to the campaign "Mindd outreach" in your Smartlead account "Mindd Smartlead"');
     expect(card.question).toContain('50 of 60 contacts in the list can be added');
     expect(card.question).toContain('lawful basis');
     expect(card.question).toContain('opt out are stopped in Smartlead for good');
     expect(card.question).not.toContain('ALREADY SENDING');
+  });
+
+  it("names a teammate's shared Smartlead account on the card, since the emails go out from THAT account's mailboxes", async () => {
+    previewOver = { shared: true };
+    const r = await run('start_smartlead_push', PUSH, attended());
+    expect(r.questionDeckPayload[0].question).toContain("in a teammate's shared Smartlead account \"Mindd Smartlead\"");
+    expect(r.questionDeckPayload[0].question).toContain("from that account's own mailboxes");
   });
 
   it('says so on the card when the campaign is already sending, and when contacts without a verified email are included', async () => {
