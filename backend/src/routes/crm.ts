@@ -1888,6 +1888,9 @@ router.post('/lists/:listId/leads/enrich-v3', async (req: Request, res: Response
       },
     );
     console.log(`[v3][route] enrich-v3 response listId=${listId} processed=${result.processed} durationMs=${result.durationMs}`);
+    if (result.budgetStop) {
+      return res.status(result.processed === 0 ? 402 : 200).json({ ...result, message: result.budgetStop.message });
+    }
     return res.json(result);
   } catch (error) {
     console.error('[v3][route] enrich-v3 failed:', error);
