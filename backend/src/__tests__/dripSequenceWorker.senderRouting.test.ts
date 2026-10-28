@@ -220,6 +220,15 @@ describe('dripSequenceWorker — leads pushed to Smartlead (ENG-673)', () => {
     expect(mockDripSequenceDb.completeEnrollment).toHaveBeenCalledWith('enroll-1', 'completed_no_sends', 'completed', 'email', false); // the only step, skipped, delivered nothing
   });
 
+  it('does NOT email, and does not advance, when the lead could not be read (failing open would skip every per-lead check)', async () => {
+    mockCrmDb.getLeadById.mockRejectedValue(new Error('throttled'));
+    const stats = await processDueEnrollments();
+    expect(mockSendAsSender).not.toHaveBeenCalled();
+    expect(stats.errors).toBe(1);
+    expect(mockDripSequenceDb.advanceEnrollment).not.toHaveBeenCalled();
+    expect(mockDripSequenceDb.completeEnrollment).not.toHaveBeenCalled();
+  });
+
   it('emails the lead again once a list editor released the marker', async () => {
     mockCrmDb.getLeadById.mockResolvedValue(pushed('released') as any);
     const stats = await processDueEnrollments();
