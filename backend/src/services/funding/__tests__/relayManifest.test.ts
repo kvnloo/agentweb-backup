@@ -80,6 +80,15 @@ describe('buildRelayManifest', () => {
     expect(manifestProblem(m.tools)).toBeUndefined();
   });
 
+  it('install_skills survives the caps even when it is the LAST open tool', () => {
+    const fat = (n: string) => ({ name: n, description: 'd'.repeat(4000), inputSchema: { type: 'object', properties: { p: { description: 'x'.repeat(12_000) } } } });
+    const m = buildRelayManifest([...Array.from({ length: 60 }, (_, i) => fat(`open_${i}`)), tool(INSTALL_TOOL)]);
+    expect(m.open.has(INSTALL_TOOL)).toBe(true);
+    const many = buildRelayManifest([...Array.from({ length: 205 }, (_, i) => tool(`t_${i}`)), tool(INSTALL_TOOL)]);
+    expect(many.open.has(INSTALL_TOOL)).toBe(true);
+    expect(many.tools.length).toBe(TOOL_LIMITS.maxTools);
+  });
+
   it('manifestProblem reports a manifest the host would refuse (all tools locked)', () => {
     expect(manifestProblem([{ ...tool('a'), locked: true }])).toBe('tool_all_locked');
   });
