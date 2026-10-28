@@ -318,11 +318,17 @@ async function sweepTarget(
       // The address was edited and could NOT be pushed to Smartlead (it refused the new address, or the lead has no address now). This record
       // opted out, so its Smartlead counterpart (the stored id, which still has the PUSHED address) is stopped, and so is whatever lead has
       // the new address, if that is a different one.
+      // The PUSHED address is looked up too: if the customer deleted and re-imported the lead, it is live under a NEW id that the stored id does not reach.
       const ids = [stored!];
-      const looked = email ? await deps.smartlead.findLeadId(resolved.apiKey, email) : null;
-      if (looked && looked !== stored) ids.push(looked);
+      for (const address of [marker.email!, email]) {
+        const found = address ? await deps.smartlead.findLeadId(resolved.apiKey, address) : null;
+        if (found && !ids.includes(found)) ids.push(found);
+      }
       for (const id of ids) {
-        if ((await deps.smartlead.unsubscribe(resolved.apiKey, id)) === "no_update") return { kind: "failed", why: "Smartlead changed nothing; will retry" };
+        const outcome = await deps.smartlead.unsubscribe(resolved.apiKey, id);
+        if (outcome === "no_update") return { kind: "failed", why: "Smartlead changed nothing; will retry" };
+        // The stored id may be gone (deleted); an id that was JUST looked up and then 404s is Smartlead disagreeing with itself.
+        if (outcome === "not_found" && id !== stored) return { kind: "failed", why: "Smartlead returned this lead's id and then said it does not exist; will retry" };
       }
       return withdrawn();
     }
