@@ -18,7 +18,7 @@ import { connect } from "net";
 import { ZodError } from "zod";
 import type { ConnectionManager } from "./connectionManager";
 import type { Logger } from "./ports";
-import { DEFAULT_MAX_BODY_BYTES, HostError, HTTP_STATUS, LOCAL_ONLY_ROUTES, PROTOCOL_VERSION, ROUTES, TOOL_RESULT_MAX_BODY_BYTES, type RouteName } from "./protocol";
+import { HostError, HTTP_STATUS, LOCAL_ONLY_ROUTES, maxBodyBytes, PROTOCOL_VERSION, ROUTES, type RouteName } from "./protocol";
 
 /** A request body that stops arriving for this long is dropped (slowloris). */
 const BODY_IDLE_MS = 15_000;
@@ -211,7 +211,7 @@ async function handle(manager: ConnectionManager, req: IncomingMessage, res: Ser
 
   let body: unknown;
   try {
-    body = JSON.parse(await readBody(req, bodyIdleMs, route === "turn.toolResult" ? TOOL_RESULT_MAX_BODY_BYTES : DEFAULT_MAX_BODY_BYTES));
+    body = JSON.parse(await readBody(req, bodyIdleMs, maxBodyBytes(route)));
   } catch (err) {
     if (err instanceof HostError) {
       sendError(res, err, err.detail === "too_large" ? 413 : undefined);
