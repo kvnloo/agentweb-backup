@@ -64,7 +64,7 @@ describe("executeRun (ENG-673)", () => {
     expect(t.marked()).toBe(10);
     expect(t.run).toMatchObject({ status: "completed", listExhausted: true, cursor: { listId: "L", leadId: "lead_00010" } });
     expect(t.run.counts).toMatchObject({ examined: 10, added: 10, alreadyInCampaign: 0 });
-    expect(t.leads[0].system[smartleadMarkerKey(CAMPAIGN)]).toMatchObject({ state: "pushed", runId: "run1", smartleadLeadId: "9000" });
+    expect(t.leads[0].system[smartleadMarkerKey(CAMPAIGN)]).toMatchObject({ state: "pushed", runId: "run1", smartleadLeadId: "9000", email: "p1@example.com" }); // the address that was pushed: the sweep trusts the id only while it matches
   });
 
   it("sends at most 400 a request and moves the cursor exactly to the last lead examined", async () => {

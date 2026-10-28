@@ -9,7 +9,7 @@ jest.mock('../../middleware/auth', () => ({
 }));
 
 const svc = {
-  campaigns: jest.fn(), preview: jest.fn(), start: jest.fn(), history: jest.fn(), status: jest.fn(), pause: jest.fn(), resume: jest.fn(), cancel: jest.fn(),
+  campaigns: jest.fn(), preview: jest.fn(), start: jest.fn(), history: jest.fn(), status: jest.fn(), pause: jest.fn(), resume: jest.fn(), cancel: jest.fn(), release: jest.fn(),
 };
 jest.mock('../../services/smartleadPushRuntime', () => ({ getSmartleadPushService: () => svc }));
 
@@ -81,6 +81,17 @@ describe('Smartlead push routes (ENG-673)', () => {
     const res = await (request(app()) as any)[method](`${base}${path}`).set('x-test-user', 'u-7');
     expect(res.status).toBe(200);
     expect((svc as any)[fn].mock.calls[0][0]).toBe('u-7');
+  });
+
+  it('release passes the authenticated user (never one from the body) and is rate limited per user', async () => {
+    svc.release.mockResolvedValue({ ok: true, released: 2, skipped: { notFound: 0, nothingToRelease: 0 } });
+    const u = user();
+    const res = await request(app()).post(`${base}/leads/release`).set('x-test-user', u).send({ listId: 'L', leadIds: ['a'], userId: 'evil' });
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ released: 2 });
+    expect(svc.release.mock.calls[0][0]).toBe(u);
+    for (let i = 0; i < 29; i++) await request(app()).post(`${base}/leads/release`).set('x-test-user', u).send({ listId: 'L', leadIds: ['a'] });
+    expect((await request(app()).post(`${base}/leads/release`).set('x-test-user', u).send({ listId: 'L', leadIds: ['a'] })).status).toBe(429);
   });
 
   it('hides an unexpected error behind a generic 500 and never leaks it', async () => {

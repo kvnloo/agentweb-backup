@@ -29,6 +29,10 @@ describe("hosted subscription service", () => {
   let ids: number;
   let nowMs: number;
   let promoteLoses: boolean;
+  let completeLostBeforeSend: boolean;
+  let statusLostBeforeSend: boolean;
+  let workerProto: number | undefined;
+  let sent: Array<{ route: string; body: Record<string, unknown> }> = [];
   let revokeBegun: string[] = [];
   let revokeHookThrows = false;
   const user = { userId: "user-1" };
@@ -53,8 +57,12 @@ describe("hosted subscription service", () => {
     enabled = new Set(["user-1", "user-2"]);
     store = makeDb();
     ids = 0;
-    nowMs = Date.now();
+    nowMs = rig.clock.nowMs(); // the test host runs on a manual clock; sign-in tokens carry the host's expiry, so the backend's clock must agree
     promoteLoses = false;
+    completeLostBeforeSend = false;
+    statusLostBeforeSend = false;
+    workerProto = 3;
+    sent = [];
     revokeBegun = [];
     revokeHookThrows = false;
     svc = new HostedSubscriptionService({
@@ -67,6 +75,9 @@ describe("hosted subscription service", () => {
         return new LoginHostClient({
           stream: (r, b) => real.stream(r, b),
           json: async (r, b) => {
+            sent.push({ route: r, body: b as Record<string, unknown> });
+            if (completeLostBeforeSend && r === "login.complete") throw new LoginHostError("UNREACHABLE"); // the request never reaches the host
+            if (statusLostBeforeSend && r === "login.status") throw new LoginHostError("UNREACHABLE");
             const reply = await real.json(r, b);
             if (promoteLoses && r === "login.promote") throw new LoginHostError("UNREACHABLE");
             return reply;
@@ -74,6 +85,7 @@ describe("hosted subscription service", () => {
         });
       },
       providers: { claude: provider() },
+      workerProtocol: () => workerProto,
       now: () => nowMs,
       newId: () => `conn-${++ids}`,
       sleep: async () => undefined,
@@ -145,6 +157,218 @@ describe("hosted subscription service", () => {
       expect(store.rows()).toHaveLength(1);
       expect((await store.db.get("conn-1"))!.status).toBe("active");
       expect(rig.mgr.status({ connectionId: "conn-1" }).state).toBe("active");
+      // The host would also refuse the second code, so the result above does not prove the in-process guard: count what was sent.
+      expect(sent.filter((x) => x.route === "login.complete")).toHaveLength(1);
+    });
+
+    it("expiry follows the backend clock: a backend an hour ahead of the host still completes a fresh sign-in", async () => {
+      nowMs += 60 * 60 * 1000;
+      const started = await svc.startLogin(user, "claude");
+      (svc as unknown as { pending: Map<string, unknown> }).pending.clear(); // as if another instance, so only the token's expiry is in play
+      expect(await svc.completeLogin(user, started.loginId, GOOD)).toMatchObject({ status: "active" });
+    });
+
+    it("a sign-in whose token cannot be made is cancelled on the host, so it does not block the next one", async () => {
+      const saved = process.env.JWT_SECRET;
+      delete process.env.JWT_SECRET;
+      try {
+        await expect(svc.startLogin(user, "claude")).rejects.toThrow();
+      } finally {
+        if (saved === undefined) delete process.env.JWT_SECRET;
+        else process.env.JWT_SECRET = saved;
+      }
+      expect(rig.script.loginsCancelled).toBe(1);
+      expect(await codeOf(svc.startLogin(user, "claude"))).toBe("resolved");
+    });
+
+    it("a sign-in started by an instance that is then SHUT DOWN (a deploy's SIGTERM) can still be finished, and shutdown sent the host no cancel", async () => {
+      const started = await svc.startLogin(user, "claude");
+      sent.length = 0;
+      await svc.shutdown();
+      expect(sent.filter((x) => x.route === "login.cancel")).toHaveLength(0);
+      const view = await svc.completeLogin(user, started.loginId, GOOD); // the token is enough: the user pastes the code after the swap
+      expect(view.status).toBe("active");
+      expect(rig.mgr.status({ connectionId: view.connectionId })).toMatchObject({ state: "active", epoch: 1 });
+    });
+
+    describe("a sign-in outlives the instance that started it (deploys, a second instance)", () => {
+      // Dropping the in-memory map is what a replaced or different backend instance looks like to a `complete`.
+      const otherInstance = () => (svc as unknown as { pending: Map<string, unknown> }).pending.clear();
+
+      it("completes on an instance that never saw the start", async () => {
+        const started = await svc.startLogin(user, "claude");
+        otherInstance();
+        const view = await svc.completeLogin(user, started.loginId, GOOD);
+        expect(view.status).toBe("active");
+        expect(rig.mgr.status({ connectionId: view.connectionId })).toMatchObject({ state: "active", epoch: 1 });
+      });
+
+      it("a reconnect started before the swap finishes after it", async () => {
+        const view = await connect();
+        const started = await svc.startLogin(user, "claude", { reconnectConnectionId: view.connectionId });
+        otherInstance();
+        await svc.completeLogin(user, started.loginId, GOOD);
+        expect(rig.mgr.status({ connectionId: view.connectionId })).toMatchObject({ state: "active", epoch: 2 });
+        expect((await store.db.get(view.connectionId))!.subHostEpoch).toBe(2);
+      });
+
+      it("the token is opaque: it does not show the host's login reference or the connection id", async () => {
+        const started = await svc.startLogin(user, "claude");
+        const text = Buffer.from(started.loginId, "base64url").toString("utf8");
+        expect(text).not.toContain("conn-1");
+        expect(started.loginId).toMatch(/^[A-Za-z0-9_-]+$/);
+      });
+
+      it("a tampered, truncated, foreign or expired token is login_not_found and makes no record", async () => {
+        const started = await svc.startLogin(user, "claude");
+        otherInstance();
+        const flipped = started.loginId.slice(0, 20) + (started.loginId[20] === "A" ? "B" : "A") + started.loginId.slice(21);
+        for (const bad of [flipped, started.loginId.slice(0, -4), "", "x".repeat(2000), "not a token!", 12345 as never]) {
+          expect(await codeOf(svc.completeLogin(user, bad, GOOD))).toBe("login_not_found");
+        }
+        expect(await codeOf(svc.completeLogin({ userId: "user-2" }, started.loginId, GOOD))).toBe("login_not_found");
+        nowMs += 11 * 60 * 1000;
+        expect(await codeOf(svc.completeLogin(user, started.loginId, GOOD))).toBe("login_not_found");
+        expect(store.rows()).toHaveLength(0);
+      });
+
+      it("a used token cannot be replayed, on this instance or another", async () => {
+        const started = await svc.startLogin(user, "claude");
+        await svc.completeLogin(user, started.loginId, GOOD);
+        expect(await codeOf(svc.completeLogin(user, started.loginId, GOOD))).toBe("login_not_found");
+        otherInstance();
+        expect(await codeOf(svc.completeLogin(user, started.loginId, GOOD))).toBe("login_not_found");
+        expect(store.rows()).toHaveLength(1);
+      });
+
+      it("two completes for one sign-in on a rebuilt entry send the code once", async () => {
+        const started = await svc.startLogin(user, "claude");
+        otherInstance();
+        const results = await Promise.all([codeOf(svc.completeLogin(user, started.loginId, GOOD)), codeOf(svc.completeLogin(user, started.loginId, GOOD))]);
+        expect(results.sort()).toEqual(["login_not_found", "resolved"]);
+        expect(store.rows()).toHaveLength(1);
+      });
+
+      it("a cancel that arrives while a complete is in flight does not discard the host's login", async () => {
+        const started = await svc.startLogin(user, "claude");
+        otherInstance();
+        const done = svc.completeLogin(user, started.loginId, GOOD);
+        await svc.cancelLogin(user, started.loginId);
+        expect((await done).status).toBe("active");
+        expect(rig.script.loginsCancelled).toBe(0);
+      });
+
+      it("a malformed code on a rebuilt sign-in leaves it completable with the corrected code", async () => {
+        const started = await svc.startLogin(user, "claude");
+        otherInstance();
+        expect(await codeOf(svc.completeLogin(user, started.loginId, "bad code with spaces"))).toBe("bad_code_format");
+        expect((await svc.completeLogin(user, started.loginId, GOOD)).status).toBe("active");
+      });
+
+      describe("protocol 3: the host tells whose complete took the code, and a stray cancel cannot discard a ready login", () => {
+        const rawClient = () => new LoginHostClient(new UnixSocketTransport(sock));
+        const loginRefOf = async (loginId: string) => (svc as unknown as { lookup(id: string): { pending: { loginRef: string; connectionId: string } } | undefined }).lookup(loginId)!.pending;
+
+        it("sends the nonce and onlyIfPending to a protocol-3 worker, and neither to an older one", async () => {
+          const s1 = await svc.startLogin(user, "claude");
+          await svc.completeLogin(user, s1.loginId, GOOD);
+          expect(sent.find((x) => x.route === "login.complete")!.body.completionNonce).toMatch(/^[A-Za-z0-9_-]{8,64}$/);
+          const s2 = await svc.startLogin(user, "claude");
+          await svc.cancelLogin(user, s2.loginId);
+          expect(sent.filter((x) => x.route === "login.cancel").pop()!.body.onlyIfPending).toBe(true);
+          sent.length = 0;
+          workerProto = 2;
+          const s3 = await svc.startLogin(user, "claude");
+          await svc.cancelLogin(user, s3.loginId);
+          const s4 = await svc.startLogin(user, "claude");
+          await svc.completeLogin(user, s4.loginId, GOOD);
+          for (const x of sent) {
+            expect(x.body.completionNonce).toBeUndefined();
+            expect(x.body.onlyIfPending).toBeUndefined();
+          }
+          workerProto = undefined; // unknown yet: the same as older
+          const s5 = await svc.startLogin(user, "claude");
+          await svc.cancelLogin(user, s5.loginId);
+          expect(sent.filter((x) => x.route === "login.cancel").pop()!.body.onlyIfPending).toBeUndefined();
+        });
+
+        it("the loser of a double submit whose reply was lost stands down: login_not_found, no cancel, and the winner's ready login survives and can be promoted", async () => {
+          const started = await svc.startLogin(user, "claude");
+          const { loginRef, connectionId } = await loginRefOf(started.loginId);
+          // the winner: another instance's complete (modelled with a raw client) took the code and the attempt is ready
+          await rawClient().loginComplete({ connectionId, loginRef, code: GOOD, completionNonce: "winner-nonce-0001" });
+          otherInstance();
+          completeLostBeforeSend = true; // the loser's own complete never reaches the host and times out
+          const cancelsBefore = rig.script.loginsCancelled;
+          expect(await codeOf(svc.completeLogin(user, started.loginId, GOOD))).toBe("login_not_found");
+          expect(rig.script.loginsCancelled).toBe(cancelsBefore); // it did NOT cancel
+          expect(rig.mgr.status({ connectionId }).state).toBe("attempting");
+          await expect(rawClient().loginPromote({ connectionId, loginRef, epoch: 1 })).resolves.toMatchObject({ state: "active", epoch: 1 });
+        });
+
+        it("the winner is an OLDER backend instance (it sends no nonce, as in a rolling deploy): the loser still stands down and the old winner can promote", async () => {
+          const started = await svc.startLogin(user, "claude");
+          const { loginRef, connectionId } = await loginRefOf(started.loginId);
+          await rawClient().loginComplete({ connectionId, loginRef, code: GOOD }); // no nonce
+          otherInstance();
+          completeLostBeforeSend = true;
+          expect(await codeOf(svc.completeLogin(user, started.loginId, GOOD))).toBe("login_not_found");
+          expect(store.rows()).toHaveLength(0); // the loser created no record
+          await expect(rawClient().loginPromote({ connectionId, loginRef, epoch: 1 })).resolves.toMatchObject({ state: "active" });
+        });
+
+        it("the loser's reply AND its status read are both lost: it answers complete_timeout WITHOUT discarding the winner's ready login", async () => {
+          const started = await svc.startLogin(user, "claude");
+          const { loginRef, connectionId } = await loginRefOf(started.loginId);
+          await rawClient().loginComplete({ connectionId, loginRef, code: GOOD, completionNonce: "winner-nonce-0003" });
+          otherInstance();
+          completeLostBeforeSend = true;
+          statusLostBeforeSend = true;
+          expect(await codeOf(svc.completeLogin(user, started.loginId, GOOD))).toBe("complete_timeout");
+          expect(sent.filter((x) => x.route === "login.cancel").every((x) => x.body.onlyIfPending === true)).toBe(true);
+          await expect(rawClient().loginPromote({ connectionId, loginRef, epoch: 1 })).resolves.toMatchObject({ state: "active" });
+        });
+
+        it("a lost reply to the request that DID take the code is still a success (its own nonce comes back)", async () => {
+          const started = await svc.startLogin(user, "claude");
+          const { connectionId } = await loginRefOf(started.loginId);
+          // the service's own complete reaches the host and takes the code; only its reply is lost
+          const deps = (svc as unknown as { deps: { client: () => LoginHostClient | undefined } }).deps;
+          const baseClient = deps.client;
+          deps.client = () => {
+            const c = baseClient();
+            if (!c) return c;
+            const complete = c.loginComplete.bind(c);
+            c.loginComplete = async (input) => {
+              await complete(input);
+              throw new LoginHostError("UNREACHABLE");
+            };
+            return c;
+          };
+          const view = await svc.completeLogin(user, started.loginId, GOOD);
+          expect(view.status).toBe("active");
+          expect(rig.mgr.status({ connectionId })).toMatchObject({ state: "active", epoch: 1 });
+        });
+
+        it("a user's cancel (onlyIfPending) arriving after the code was taken leaves the ready login, which can still be promoted", async () => {
+          const started = await svc.startLogin(user, "claude");
+          const { loginRef, connectionId } = await loginRefOf(started.loginId);
+          await rawClient().loginComplete({ connectionId, loginRef, code: GOOD, completionNonce: "winner-nonce-0002" });
+          otherInstance();
+          await svc.cancelLogin(user, started.loginId); // the stray cancel from another instance
+          await expect(rawClient().loginPromote({ connectionId, loginRef, epoch: 1 })).resolves.toMatchObject({ state: "active" });
+        });
+      });
+
+      it("cancel works from another instance and ends the host attempt", async () => {
+        const started = await svc.startLogin(user, "claude");
+        otherInstance();
+        await svc.cancelLogin({ userId: "user-2" }, started.loginId); // someone else's: nothing happens
+        expect(rig.script.loginsCancelled).toBe(0);
+        await svc.cancelLogin(user, started.loginId);
+        expect(rig.script.loginsCancelled).toBe(1);
+        expect(await codeOf(svc.completeLogin(user, started.loginId, GOOD))).toBe("login_not_found");
+      });
     });
 
     it("a promote whose reply was lost but which landed is a success, not a second sign-in", async () => {

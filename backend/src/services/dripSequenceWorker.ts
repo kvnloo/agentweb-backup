@@ -13,6 +13,7 @@
 
 import { dripSequenceDb, DripSequence, SequenceEnrollment, StepCondition, SequenceChannel } from './dripSequenceDb';
 import { isReachableEmail, canonicalLinkedInProfile } from '../utils/leadReachability';
+import { isPushedToSmartlead } from './smartleadMarkers';
 import { sendAsSender, SenderDailyLimitExceededError } from './sendAsSender';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import { crmDb, userDb } from './db';
@@ -197,7 +198,11 @@ async function processEnrollment(
     (String(step.channel ?? 'email').trim().toLowerCase() as SequenceChannel);
 
   // Build variable context for substitution (shared by both channels)
-  const lead = await crmDb.getLeadById(enrollment.listId, enrollment.leadId).catch(() => null);
+  // A failed READ is not "no such lead": sending on with no lead would skip every per-lead check (do-not-contact, a Smartlead marker). It throws,
+  // so the enrollment is neither sent nor advanced and is retried on the next pass. (A lead that is simply gone still reads as null.)
+  let leadReadFailed = false;
+  const lead = await crmDb.getLeadById(enrollment.listId, enrollment.leadId).catch(() => { leadReadFailed = true; return null; });
+  if (leadReadFailed) throw new Error(`Could not read lead ${enrollment.leadId} for enrollment ${enrollment.enrollmentId}; will retry`);
 
   // Check enrollment condition — exit (not just skip) if lead no longer meets it
   if (sequence.enrollmentCondition) {
@@ -291,6 +296,15 @@ async function sendEmailStep(
   const recipient = String(lead?.email ?? enrollment.leadEmail ?? '').trim();
   if (!isReachableEmail(recipient)) {
     console.log(`[dripWorker] Email step ${step.stepNumber} skipped for enrollment ${enrollment.enrollmentId}: lead has no email address`);
+    return false;
+  }
+
+  // ENG-673: a lead pushed to a customer's Smartlead campaign is being emailed from there. AgentWeb's own sequence must not also write to
+  // them (two senders, and Smartlead's unsubscribe and bounce handling would not see these emails). Checked HERE, at send time, not at
+  // enrolment, because a lead can be pushed after it was enrolled. The step is skipped like any step the lead cannot receive; LinkedIn
+  // steps are unaffected.
+  if (isPushedToSmartlead(lead)) {
+    console.log(`[dripWorker] Email step ${step.stepNumber} skipped for enrollment ${enrollment.enrollmentId}: lead is being emailed through Smartlead`);
     return false;
   }
 

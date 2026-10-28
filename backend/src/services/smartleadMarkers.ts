@@ -14,6 +14,13 @@ export interface SmartleadMarker {
   payloadHash: string;
   /** `withdrawn`: unsubscribed in Smartlead after the lead became do-not-contact here. `released`: a list editor cleared it. */
   state: "pushed" | "withdrawn" | "released";
+  /** The address that was pushed (lower case). The sweep trusts `smartleadLeadId` only while the lead still has this address. */
+  email?: string;
+  /** When the withdrawal sweep unsubscribed the lead in Smartlead after it opted out here. */
+  withdrawnAt?: string;
+  /** When a list editor released the lead, and who. */
+  releasedAt?: string;
+  releasedBy?: string;
 }
 
 const PREFIX = "smartlead_";
@@ -45,11 +52,25 @@ export function isPushedToSmartlead(lead: { system?: Record<string, unknown> } |
   return Object.keys(system).some(key => key.startsWith(PREFIX) && isMarker(system[key]) && (system[key] as SmartleadMarker).state !== "released");
 }
 
-export function buildSmartleadMarker(input: { runId: string; payloadHash: string; smartleadLeadId?: string; now?: Date }): SmartleadMarker {
+/** Every Smartlead marker a lead carries, whatever its state, with the campaign it is for. */
+export function listSmartleadMarkers(lead: { system?: Record<string, unknown> } | null | undefined): Array<{ key: string; campaignId: number; marker: SmartleadMarker }> {
+  const system = lead?.system;
+  if (!system) return [];
+  const out: Array<{ key: string; campaignId: number; marker: SmartleadMarker }> = [];
+  for (const key of Object.keys(system)) {
+    if (!key.startsWith(PREFIX) || !isMarker(system[key])) continue;
+    const campaignId = Number(key.slice(PREFIX.length));
+    if (Number.isInteger(campaignId) && campaignId > 0) out.push({ key, campaignId, marker: system[key] as SmartleadMarker });
+  }
+  return out;
+}
+
+export function buildSmartleadMarker(input: { runId: string; payloadHash: string; smartleadLeadId?: string; email?: string; now?: Date }): SmartleadMarker {
   return {
     pushedAt: (input.now ?? new Date()).toISOString(),
     runId: input.runId,
     ...(input.smartleadLeadId ? { smartleadLeadId: input.smartleadLeadId } : {}),
+    ...(input.email ? { email: input.email.trim().toLowerCase() } : {}),
     payloadHash: input.payloadHash,
     state: "pushed",
   };
