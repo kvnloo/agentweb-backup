@@ -3,7 +3,7 @@ import { analyseSequence } from "./smartleadSequence";
 import { selectSmartleadLeads, type SkipReason } from "./smartleadEligibility";
 import { estimateDaysToSend, type SendEstimate } from "./smartleadEstimate";
 import type { TagMapping } from "./smartleadPayload";
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import { PUSH_TOKEN_TTL_MS, signPushToken, type PushTokenPayload } from "./smartleadPushToken";
 import type { SmartleadCampaignDetail, SmartleadEmailAccount } from "./smartleadService";
 import type { LeadCursor } from "./smartleadPushRunDb";
@@ -68,6 +68,11 @@ export interface PreviewResult {
   canStart: boolean;
   /** The campaign is already ACTIVE: the user must confirm separately, because leads start receiving mail at once. */
   requiresActiveConfirmation: boolean;
+  /**
+   * Identifies WHICH contacts (the first `cohort.chosen` eligible ones) would go to WHICH Smartlead connection. Two previews with the same
+   * counts but different contacts or a different connection differ here, so an approval given on one cannot be used on the other.
+   */
+  fingerprint: string;
   token: string;
   expiresAt: string;
 }
@@ -155,6 +160,7 @@ export async function buildPreview(deps: PreviewDeps, req: PreviewRequest): Prom
     ...(estimate ? { estimate } : {}),
     canStart: preflight.blocks.length === 0 && chosen > 0,
     requiresActiveConfirmation: decision === "needs_confirmation",
+    fingerprint: createHash("sha256").update(JSON.stringify({ a: req.accountId, ids: result.eligible.slice(0, chosen).map(e => String(e.lead.leadId)) })).digest("hex").slice(0, 32),
     token: signPushToken(deps.secret, payload),
     expiresAt: new Date(payload.exp).toISOString(),
   };

@@ -441,8 +441,25 @@ describe("executeRun (ENG-673)", () => {
     expect(t.store.heartbeats).toBeGreaterThanOrEqual(8);
   });
 
+  it("pins the cohort to the PREVIEW time: a lead created after the user previewed (but before the run started) is not pushed", async () => {
+    const leads = [mkLead(1, { createdAt: "2026-10-27T00:30:00.000Z" }), mkLead(2, { createdAt: "2026-10-27T00:10:00.000Z" }), mkLead(3, { createdAt: "2026-10-26T12:00:00.000Z" })];
+    const t = setup(2, { leads, run: { startedAt: "2026-10-27T00:40:00.000Z", options: { includeUnverified: false, mapping: {}, startStatus: "DRAFTED", approvedAt: "2026-10-27T00:20:00.000Z" } } });
+    await executeRun(t.run, t.deps);
+    expect(t.sl.posts.flat().sort()).toEqual(["p2@example.com", "p3@example.com"]); // lead 1 appeared after the preview
+    expect(t.run.counts.skippedByReason.created_after_start).toBe(1);
+  });
+
+  it("falls back to the run start when no preview time was recorded", async () => {
+    const t = setup(1, { leads: [mkLead(1, { createdAt: "2026-10-27T00:30:00.000Z" })], run: { startedAt: "2026-10-27T00:40:00.000Z" } });
+    await executeRun(t.run, t.deps);
+    expect(t.sl.posts.flat()).toEqual(["p1@example.com"]);
+  });
+
   it("reads the approved options defensively", () => {
     expect(readPushOptions({ includeUnverified: "yes", mapping: { industry: "customFields.industry", bad: 5 }, startStatus: "drafted" })).toEqual({ includeUnverified: false, mapping: { industry: "customFields.industry" }, startStatus: "DRAFTED" });
     expect(readPushOptions(undefined)).toEqual({ includeUnverified: false, mapping: {}, startStatus: "" });
+    expect(readPushOptions({ approvedAt: "2026-10-27T00:20:00.000Z" }).approvedAt).toBe("2026-10-27T00:20:00.000Z");
+    expect(readPushOptions({ approvedAt: "not a date" }).approvedAt).toBeUndefined();
+    expect(readPushOptions({ approvedAt: 5 }).approvedAt).toBeUndefined();
   });
 });

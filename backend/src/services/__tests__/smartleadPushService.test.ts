@@ -47,7 +47,7 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
   });
   afterEach(async () => { await cleanup(); });
 
-  interface Env { svc: SmartleadPushService; deps: PushServiceDeps; sl: FakeSmartlead; unsub: jest.Mock; leads: any[]; jobs: Promise<unknown>[]; logs: string[]; listId: string; flags: { enabled: boolean }; editors: Set<string> }
+  interface Env { svc: SmartleadPushService; deps: PushServiceDeps; sl: FakeSmartlead; unsub: jest.Mock; upd: jest.Mock; leads: any[]; jobs: Promise<unknown>[]; logs: string[]; listId: string; flags: { enabled: boolean }; editors: Set<string> }
 
   function env(opts: { leads?: any[]; maxConcurrentWorkers?: number; shareDb?: SmartleadPushRunDb; listId?: string; sl?: FakeSmartlead; leadsShared?: any[] } = {}): Env {
     const leads: any[] = opts.leads ?? Array.from({ length: 5 }, (_, i) => mkLead(i + 1));
@@ -56,6 +56,7 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
     const jobs: Promise<unknown>[] = [];
     const logs: string[] = [];
     const unsub = jest.fn(async (_k: string, _id: string): Promise<"ok" | "not_found" | "no_update"> => "ok");
+    const upd = jest.fn(async (..._a: any[]): Promise<"ok" | "rejected" | "not_found" | "no_update"> => "ok");
     const flags = { enabled: true };
     const editors = new Set<string>();
     const key = (userId: string) => ({ ok: true as const, apiKey: `key-of-${userId}`, ownerUserId: userId, accountId: `smartlead-${userId}`, accountName: "SL" });
@@ -79,6 +80,7 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
         getMailboxes: async () => [{ id: 1, email: "a@x.com", dailyLimit: 30 }],
         addLeads: (_k, _c, x) => sl.addLeads(x),
         unsubscribeLead: (k, id) => unsub(k, id),
+        updateLeadEmail: (k, c, id, email) => upd(k, c, id, email),
         findLeadId: async () => null,
       },
       secret: "svc-secret",
@@ -89,7 +91,7 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
       log: line => { logs.push(line); },
       maxConcurrentWorkers: opts.maxConcurrentWorkers,
     };
-    return { svc: new SmartleadPushService(deps), deps, sl, unsub, leads, jobs, logs, listId, flags, editors };
+    return { svc: new SmartleadPushService(deps), deps, sl, unsub, upd, leads, jobs, logs, listId, flags, editors };
   }
   const drain = async (e: Env) => { await Promise.all(e.jobs.splice(0)); };
 
@@ -171,6 +173,43 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
       expect(e.logs.join("\n")).toMatch(/started run=.* approved=5/);
     });
 
+    it("records the channel the push came from: Emma's tools say 'agent', the routes and everything else stay 'ui'", async () => {
+      const viaAgent = env();
+      const p = await approve(viaAgent);
+      const r = (await viaAgent.svc.start("owner", go(p.token), { channel: "agent" })) as any;
+      expect((await db.getRun(r.run.runId))!.channel).toBe("agent");
+      await drain(viaAgent);
+      for (const opts of [undefined, {}, { channel: "ui" as const }, { channel: "robot" as any }]) {
+        const e = env();
+        const q = await approve(e);
+        const started = (await (opts === undefined ? e.svc.start("owner", go(q.token)) : e.svc.start("owner", go(q.token), opts))) as any;
+        expect((await db.getRun(started.run.runId))!.channel).toBe("ui");
+        await drain(e);
+      }
+    });
+
+    it("samples a few contacts' addresses for an approval card: edit access needed, distinct ids, at most three, blanks and missing contacts skipped", async () => {
+      const e = env();
+      e.editors.add("editor");
+      const ids = e.leads.map(l => String(l.leadId));
+      const r = (await e.svc.sampleLeads("editor", e.listId, [ids[0], ids[0], "gone", ...ids.slice(1)])) as any;
+      expect(r.ok).toBe(true);
+      expect(r.emails).toHaveLength(3);
+      expect(new Set(r.emails).size).toBe(3);
+      expect(await e.svc.sampleLeads("stranger", e.listId, ids)).toMatchObject({ ok: false, status: 403 });
+      expect(await e.svc.sampleLeads("editor", e.listId, ["gone"])).toMatchObject({ ok: true, emails: [] });
+      expect(await e.svc.sampleLeads("editor", e.listId, ids, 1)).toMatchObject({ ok: true, emails: [expect.any(String)] });
+    });
+
+    it("tells whether the user may push a list, and its name, before anything is previewed or asked", async () => {
+      const e = env();
+      e.editors.add("editor");
+      expect(await e.svc.canUseList("editor", e.listId)).toMatchObject({ ok: true, listName: expect.any(String) });
+      expect(await e.svc.canUseList("stranger", e.listId)).toMatchObject({ ok: false, status: 403, code: "forbidden" });
+      expect(await e.svc.canUseList("editor", "no-such-list")).toMatchObject({ ok: false, status: 404 });
+      expect(await e.svc.canUseList("editor", "")).toMatchObject({ ok: false, status: 400 });
+    });
+
     it("records who pushed, with which key, what they approved and acknowledged", async () => {
       const e = env();
       e.editors.add("editor");
@@ -179,6 +218,7 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
       const run = (await db.getRun(r.run.runId))!;
       expect(run).toMatchObject({ ownerId: "owner", pushedBy: "editor", keyOwnerId: "editor", channel: "ui", campaignSource: "selected", previewEligible: 5 });
       expect(run.options).toMatchObject({ includeUnverified: false, startStatus: "DRAFTED", acknowledgements: { lawfulBasis: true } });
+      expect(run.options.approvedAt).toBe(new Date(clock).toISOString()); // the PREVIEW time: the engine only pushes leads that existed then
       await drain(e);
     });
 
@@ -431,6 +471,27 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
       expect(await db.getLock(e.listId, CAMPAIGN)).toBeNull();
     });
 
+    it("tells the user the start FAILED when the run is no longer running at confirmation (the resumer cancelled it), and starts no worker", async () => {
+      const e = env();
+      const p = await approve(e);
+      (e.deps.db as any) = new Proxy(db, { get: (t, k) => (k === "confirmStart" ? async (id: string) => { await (t as any).cancelRun(id); return (t as any).confirmStart(id); } : (t as any)[k]?.bind?.(t) ?? (t as any)[k]) });
+      expect(await e.svc.start("owner", go(p.token))).toMatchObject({ ok: false, status: 503 });
+      await drain(e);
+      expect(e.sl.posts).toHaveLength(0);
+      expect((await db.listRunsForList(e.listId))[0].status).toBe("canceled");
+    });
+
+    it("pauses a run, instead of working it, when its pusher no longer has edit access to the list (a resume by the resumer or a claim)", async () => {
+      const e = env({ maxConcurrentWorkers: 0 });
+      const r = (await e.svc.start("owner", go((await approve(e)).token))) as any;
+      const run = (await db.getRun(r.run.runId))!;
+      const original = e.deps.canEdit;
+      e.deps.canEdit = async (u, l) => (u === "owner" ? false : original(u, l)); // the pusher lost the role (the list owner check no longer passes for them)
+      await e.svc.work(run);
+      expect(((await e.svc.status("owner", r.run.runId)) as any).run).toMatchObject({ status: "paused", pauseReason: "access_revoked" });
+      expect(e.sl.posts).toHaveLength(0);
+    });
+
     it("confirms after a transient failure and carries on as normal", async () => {
       const e = env();
       const p = await approve(e);
@@ -549,6 +610,27 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
       expect(again).toMatchObject({ released: 0, skipped: { nothingToRelease: 1 } });
     });
 
+    it("does not release a lead that is do-not-contact (own senders skip it anyway and the sweep must keep stopping it); a withdrawn one stays withdrawn", async () => {
+      const e = env();
+      await pushedAll(e);
+      e.leads[0].contactStatus = "do-not-contact";
+      e.leads[0].system.smartlead_77 = { ...e.leads[0].system.smartlead_77, state: "withdrawn" };
+      const r = (await e.svc.release("owner", { listId: e.listId, leadIds: [e.leads[0].leadId, e.leads[1].leadId] })) as any;
+      expect(r).toMatchObject({ released: 1, skipped: { doNotContact: 1 } });
+      expect(e.leads[0].system.smartlead_77.state).toBe("withdrawn");
+      expect(e.leads[1].system.smartlead_77.state).toBe("released");
+    });
+
+    it("the sweep through the service refuses a key that cannot see the campaign", async () => {
+      const e = env();
+      await pushedAll(e);
+      e.leads[2].contactStatus = "do-not-contact";
+      e.sl.campaignMissing = true; // the connected key's account does not have this campaign
+      expect(await e.svc.sweepWithdrawals()).toMatchObject({ withdrawn: 0, keyUnavailable: 1 });
+      expect(e.unsub).not.toHaveBeenCalled();
+      expect(e.leads[2].system.smartlead_77.state).toBe("pushed");
+    });
+
     it("needs edit access to the list, and rejects bad input", async () => {
       const e = env();
       await pushedAll(e);
@@ -580,6 +662,20 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
       expect(e.unsub).toHaveBeenCalledWith("key-of-owner", e.leads[2].system.smartlead_77.smartleadLeadId);
       expect(e.leads[2].system.smartlead_77).toMatchObject({ state: "withdrawn" });
       expect(e.leads[0].system.smartlead_77.state).toBe("pushed");
+    });
+
+    it("pushes an edited address to Smartlead (the same lead id), and the opt-out that follows uses that id", async () => {
+      const e = env();
+      await e.svc.start("owner", go((await approve(e)).token));
+      await drain(e);
+      const id = e.leads[1].system.smartlead_77.smartleadLeadId;
+      e.leads[1].email = "corrected@example.com";
+      expect(await e.svc.sweepWithdrawals()).toMatchObject({ synced: 1, withdrawn: 0 });
+      expect(e.upd).toHaveBeenCalledWith("key-of-owner", CAMPAIGN, id, "corrected@example.com");
+      expect(e.leads[1].system.smartlead_77.email).toBe("corrected@example.com");
+      e.leads[1].contactStatus = "do-not-contact";
+      expect(await e.svc.sweepWithdrawals()).toMatchObject({ synced: 0, withdrawn: 1 });
+      expect(e.unsub).toHaveBeenCalledWith("key-of-owner", id);
     });
 
     it("runs even when pushing is switched off, and never throws", async () => {

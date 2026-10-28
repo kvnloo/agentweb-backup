@@ -13,9 +13,10 @@ import {
   type SmartleadPushRunDb,
 } from "./smartleadPushRunDb";
 import type { SmartleadAddLeadsResult, SmartleadCampaignDetail, SmartleadCampaignSummary, SmartleadEmailAccount, SmartleadLeadInput } from "./smartleadService";
-import { SmartleadApiError, scrubSmartleadSecrets, type UnsubscribeOutcome } from "./smartleadService";
+import { SmartleadApiError, scrubSmartleadSecrets, type UnsubscribeOutcome, type UpdateLeadEmailOutcome } from "./smartleadService";
 import { listSmartleadMarkers } from "./smartleadMarkers";
 import { withdrawalSweep, type SweepResult } from "./smartleadWithdrawal";
+import { isDoNotContact } from "../utils/leadContactStatus";
 
 /**
  * The service behind the Smartlead push routes and the resumer (ENG-673): who may push, which key is used, starting a run, controlling it,
@@ -40,6 +41,7 @@ export interface SmartleadApi {
   getMailboxes(apiKey: string, campaignId: number): Promise<SmartleadEmailAccount[]>;
   addLeads(apiKey: string, campaignId: number, leads: SmartleadLeadInput[]): Promise<SmartleadAddLeadsResult>;
   unsubscribeLead(apiKey: string, smartleadLeadId: string): Promise<UnsubscribeOutcome>;
+  updateLeadEmail(apiKey: string, campaignId: number, smartleadLeadId: string, email: string): Promise<UpdateLeadEmailOutcome>;
   findLeadId(apiKey: string, email: string): Promise<string | null>;
 }
 
@@ -123,6 +125,30 @@ export class SmartleadPushService {
     if (!list) return fail(404, "list_not_found", "That list does not exist.");
     if (!(await this.deps.canEdit(userId, list))) return fail(403, "forbidden", "You need edit access to this list to push it to Smartlead.");
     return { ok: true, list };
+  }
+
+  /** Whether the user may push this list (edit access), and its name; used to refuse before an approval is asked for. */
+  async canUseList(userId: string, listId: unknown): Promise<Result<{ listName: string }>> {
+    return this.guard(async () => {
+      const list = await this.ownList(userId, listId);
+      if (!list.ok) return list;
+      return { ok: true as const, listName: typeof list.list.name === "string" ? list.list.name : "" };
+    });
+  }
+
+  /** A few of the contacts' email addresses, for an approval card that must show WHO it is about. Edit access to the list is required. */
+  async sampleLeads(userId: string, listId: unknown, leadIds: string[], max = 3): Promise<Result<{ emails: string[] }>> {
+    return this.guard(async () => {
+      const list = await this.ownList(userId, listId);
+      if (!list.ok) return list;
+      const emails: string[] = [];
+      for (const id of [...new Set(leadIds)]) {
+        if (emails.length >= max) break;
+        const lead = await this.deps.crm.readLeadConsistent(String(listId), id);
+        if (lead && typeof lead.email === "string" && lead.email.trim()) emails.push(lead.email.trim());
+      }
+      return { ok: true as const, emails };
+    });
   }
 
   /** The pusher's OWN connection only. */
@@ -252,7 +278,7 @@ export class SmartleadPushService {
    * A list editor clears the Smartlead marker of leads, so AgentWeb's own senders may email them again (a mistaken push must not block a contact
    * for ever). It changes nothing in Smartlead: a lead still in an ACTIVE campaign is then emailed from two places, and the dialog says so.
    */
-  release(userId: string, body: Record<string, any>): Promise<Result<{ released: number; skipped: { notFound: number; nothingToRelease: number } }>> {
+  release(userId: string, body: Record<string, any>): Promise<Result<{ released: number; skipped: { notFound: number; nothingToRelease: number; doNotContact: number } }>> {
     return this.guard(async () => {
       const list = await this.ownList(userId, body.listId);
       if (!list.ok) return list;
@@ -262,11 +288,14 @@ export class SmartleadPushService {
       }
       const only = body.campaignId === undefined || body.campaignId === null ? undefined : Number(body.campaignId);
       if (only !== undefined && (!Number.isInteger(only) || only <= 0)) return fail(400, "bad_request", "The campaign must be a positive whole number.");
-      const result = { released: 0, skipped: { notFound: 0, nothingToRelease: 0 } };
+      const result = { released: 0, skipped: { notFound: 0, nothingToRelease: 0, doNotContact: 0 } };
       const at = this.deps.now().toISOString();
       for (const leadId of ids as string[]) {
         const lead = await this.deps.crm.readLeadConsistent(String(body.listId), leadId);
         if (!lead) { result.skipped.notFound++; continue; }
+        // A lead that is do-not-contact is not released: AgentWeb's own senders skip it anyway, and the withdrawal sweep must keep stopping it
+        // in Smartlead (releasing would only churn the marker, and a withdrawn marker keeps AgentWeb off a lead that is later re-subscribed).
+        if (isDoNotContact(lead)) { result.skipped.doNotContact++; continue; }
         const live = listSmartleadMarkers(lead).filter(m => (only === undefined || m.campaignId === only) && (m.marker.state === "pushed" || m.marker.state === "withdrawn"));
         if (live.length === 0) { result.skipped.nothingToRelease++; continue; }
         for (const m of live) await this.deps.crm.writeMarker(String(body.listId), leadId, m.key, { ...m.marker, state: "released", releasedAt: at, releasedBy: userId });
@@ -288,7 +317,9 @@ export class SmartleadPushService {
         readLeadConsistent: (l, id) => this.deps.crm.readLeadConsistent(l, id),
         writeMarker: (l, id, k, m) => this.deps.crm.writeMarker(l, id, k, m),
         smartlead: {
+          campaignVisible: async (apiKey, campaignId) => (await this.deps.smartlead.getCampaign(apiKey, campaignId)) !== null,
           unsubscribe: (apiKey, id) => this.deps.smartlead.unsubscribeLead(apiKey, id),
+          updateLeadEmail: (apiKey, campaignId, id, email) => this.deps.smartlead.updateLeadEmail(apiKey, campaignId, id, email),
           findLeadId: (apiKey, email) => this.deps.smartlead.findLeadId(apiKey, email),
         },
         now: () => this.deps.now(),
@@ -302,7 +333,7 @@ export class SmartleadPushService {
 
   // ── start
 
-  start(userId: string, body: Record<string, any>): Promise<Result<{ run: RunView; started: true } | { run: RunView; started: false }>> {
+  start(userId: string, body: Record<string, any>, opts: { channel?: "ui" | "agent" } = {}): Promise<Result<{ run: RunView; started: true } | { run: RunView; started: false }>> {
     return this.guard(async () => {
       if (!this.deps.enabled()) return this.disabled();
       const token = verifyPushToken(this.deps.secret, body.token, this.deps.now().getTime());
@@ -360,10 +391,11 @@ export class SmartleadPushService {
       try {
         started = await this.deps.db.startRun(
         {
-          ownerId: String(list.list.userId ?? userId), pushedBy: userId, keyOwnerId: key.key.ownerUserId, smartleadAccountId: key.key.accountId, channel: "ui", listId: token.listId,
+          ownerId: String(list.list.userId ?? userId), pushedBy: userId, keyOwnerId: key.key.ownerUserId, smartleadAccountId: key.key.accountId, channel: opts.channel === "agent" ? "agent" : "ui", listId: token.listId,
           campaignId: token.campaignId, campaignName: campaign.name, campaignSource: "selected",
           options: {
             includeUnverified: token.includeUnverified, mapping: token.mapping, acknowledgedTags: token.acknowledgedTags, startStatus: token.startStatus, warnings: token.warnings,
+            approvedAt: new Date(token.iat).toISOString(),
             acknowledgements: { lawfulBasis: true, ...(campaign.status === "ACTIVE" ? { activeConfirmed: true } : {}) },
           },
           sequenceHash: token.sequenceHash, previewEligible: token.eligible,
@@ -389,8 +421,8 @@ export class SmartleadPushService {
       let confirmed = false;
       for (let attempt = 0; attempt < 4 && !confirmed; attempt++) {
         try {
-          await this.deps.db.confirmStart(started.run.runId);
-          confirmed = true;
+          confirmed = await this.deps.db.confirmStart(started.run.runId); // false: the run is no longer running (the resumer cancelled it)
+          if (!confirmed) break;
         } catch (error) {
           this.deps.log(`[SmartleadPush] could not confirm start of run=${started.run.runId}: ${scrubSmartleadSecrets(error instanceof Error ? error.message : String(error))}`);
           if (attempt < 3) await this.deps.sleep(50 * 4 ** attempt);
@@ -481,6 +513,13 @@ export class SmartleadPushService {
   /** Runs one run to its end. Never throws: a store error leaves the lease to lapse, and the resumer decides. */
   async work(run: PushRun): Promise<void> {
     try {
+      // The pusher must STILL have edit access to the list (they may have left the org or lost the role since the run started or was paused).
+      const list = await this.deps.getList(run.listId);
+      if (!list || !(await this.deps.canEdit(run.pushedBy, list))) {
+        await this.deps.db.pauseRun(run.runId, "access_revoked", run.leaseEpoch);
+        this.deps.log(`[SmartleadPush] run=${run.runId} paused: the pusher no longer has edit access to the list`);
+        return;
+      }
       const resolved = await this.deps.resolveKey(run.keyOwnerId, run.smartleadAccountId);
       if (!resolved.ok) {
         await this.deps.db.pauseRun(run.runId, resolved.reason === "key_rejected" ? "key_rejected" : "key_unavailable", run.leaseEpoch);
