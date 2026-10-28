@@ -8,7 +8,7 @@ jest.mock('../services/chatbotService', () => ({
 }));
 const svc = {
   campaigns: jest.fn(), preview: jest.fn(), start: jest.fn(), status: jest.fn(), history: jest.fn(),
-  pause: jest.fn(), resume: jest.fn(), cancel: jest.fn(), release: jest.fn(), canUseList: jest.fn(),
+  pause: jest.fn(), resume: jest.fn(), cancel: jest.fn(), release: jest.fn(), canUseList: jest.fn(), sampleLeads: jest.fn(),
 };
 jest.mock('../services/smartleadPushRuntime', () => ({ getSmartleadPushService: () => svc }));
 
@@ -63,7 +63,7 @@ async function withApproval(name: string, args: unknown, ctx = attended()) {
 
 // -- a realistic preview, with a fresh token each time (the real one is single use)
 let tokenCounter: number;
-type PreviewOver = Partial<{ eligible: number; total: number; hash: string; status: string; chosen: number; canStart: boolean; active: boolean; blocks: any[]; tagsToMap: string[]; name: string }>;
+type PreviewOver = Partial<{ eligible: number; total: number; hash: string; status: string; chosen: number; canStart: boolean; active: boolean; blocks: any[]; tagsToMap: string[]; name: string; fingerprint: string }>;
 let previewOver: PreviewOver;
 const previewResult = () => {
   const o = previewOver;
@@ -79,6 +79,7 @@ const previewResult = () => {
       cohort: { chosen: o.chosen ?? Math.min(50, eligible), suggested: 50, max: eligible },
       canStart: o.canStart ?? true,
       requiresActiveConfirmation: o.active ?? false,
+      fingerprint: o.fingerprint ?? 'fp-1',
       token: `signed-token-${++tokenCounter}`,
       expiresAt: '2026-10-28T14:00:00Z',
     },
@@ -92,6 +93,7 @@ beforeEach(() => {
   tokenCounter = 0;
   previewOver = {};
   svc.canUseList.mockResolvedValue({ ok: true, listName: 'Mindd leads' });
+  svc.sampleLeads.mockResolvedValue({ ok: true, emails: ['ann@example.com', 'bob@example.com', 'cy@example.com'] });
   svc.preview.mockImplementation(async () => previewResult());
   svc.start.mockImplementation(async () => ({ ok: true, started: true, run: runView() }));
   svc.release.mockResolvedValue({ ok: true, released: 3, skipped: { notFound: 0, nothingToRelease: 1, doNotContact: 0 } });
@@ -199,6 +201,17 @@ describe('start_smartlead_push: the approval card', () => {
     expect(r.questionDeckPayload[0].question).toContain('{{unsubscribe}}');
   });
 
+  it('shows the CRM fields the model chose to fill merge fields, since they end up in the emails recipients read', async () => {
+    const r = await run('start_smartlead_push', { ...PUSH, mapping: { company_size: 'customFields.size', note: 'notes' } }, attended());
+    expect(r.questionDeckPayload[0].question).toContain('{{company_size}} from "customFields.size", {{note}} from "notes"');
+    expect(r.questionDeckPayload[0].question).toContain('end up in the emails recipients read');
+  });
+
+  it('says nothing about merge fields when none were mapped', async () => {
+    const r = await run('start_smartlead_push', PUSH, attended());
+    expect(r.questionDeckPayload[0].question).not.toContain('Merge fields');
+  });
+
   it('makes the list and campaign names safe to read: no control characters, no length games', async () => {
     svc.canUseList.mockResolvedValue({ ok: true, listName: 'Evil\n\nAPPROVE THIS\u202e list' + 'x'.repeat(300) });
     previewOver = { name: 'Camp\u0000aign' };
@@ -289,6 +302,7 @@ describe('start_smartlead_push: an approval covers exactly what the card showed'
   it("the customer edited the campaign's emails", async () => asksAgain(await approveThenChange(() => { previewOver = { hash: 'hash-2' }; })));
   it('the campaign was started', async () => asksAgain(await approveThenChange(() => { previewOver = { status: 'ACTIVE', active: true }; })));
   it('another campaign', async () => asksAgain(await approveThenChange(() => undefined, PUSH, { ...PUSH, campaignId: 78 })));
+  it('the same number of contacts, but different ones or another Smartlead connection (the preview fingerprint)', async () => asksAgain(await approveThenChange(() => { previewOver = { fingerprint: 'fp-2' }; })));
   it('another list', async () => asksAgain(await approveThenChange(() => undefined, PUSH, { ...PUSH, listId: 'list-2' })));
   it('unverified contacts switched on', async () => asksAgain(await approveThenChange(() => undefined, PUSH, { ...PUSH, includeUnverified: true })));
   it('a different field mapping', async () => asksAgain(await approveThenChange(() => undefined, PUSH, { ...PUSH, mapping: { company_size: 'customFields.size' } })));
@@ -378,9 +392,16 @@ describe('release_leads_from_smartlead', () => {
     const card = r.questionDeckPayload[0];
     expect(card.kind.startsWith(SMARTLEAD_APPROVAL_KIND_PREFIX + 'release:')).toBe(true);
     expect(card.question).toContain('Release 3 contacts in "Mindd leads" from Smartlead');
+    expect(card.question).toContain('They include ann@example.com, bob@example.com, cy@example.com.');
     expect(card.question).toMatch(/two places/);
     expect(card.question).toMatch(/cannot be undone/);
     expect(card.options.map((o: any) => o.id)).toEqual(['decline', 'approve']);
+  });
+
+  it('names the contacts and counts the rest when there are more than a few', async () => {
+    const r = await run('release_leads_from_smartlead', { listId: 'list-1', leadIds: ['a', 'b', 'c', 'd', 'e', 'f'] }, attended());
+    expect(r.questionDeckPayload[0].question).toContain('They include ann@example.com, bob@example.com, cy@example.com and 3 others.');
+    expect(svc.sampleLeads).toHaveBeenCalledWith('owner', 'list-1', ['a', 'b', 'c', 'd', 'e', 'f']);
   });
 
   it('after approval releases exactly the distinct ids the card was for', async () => {
@@ -413,12 +434,42 @@ describe('release_leads_from_smartlead', () => {
   });
 });
 
+describe('review hardening', () => {
+  it("an approval given to one user in a chat does not work for another user who calls with the same session id", async () => {
+    const first = await run('start_smartlead_push', PUSH, attended());
+    answerCard(recordHalt(first), 'approve');
+    const other = await run('start_smartlead_push', PUSH, { userId: 'someone-else', sessionId: SESSION });
+    expect(other.awaitingUserConfirmation).toBe(true);
+    expect(svc.start).not.toHaveBeenCalled();
+  });
+
+  it('release and resume refuse delegated access, a missing session and a scheduled session, like start', async () => {
+    sessionOf('sched').sessionType = 'scheduled';
+    const calls: Array<[string, Record<string, unknown>]> = [['release_leads_from_smartlead', { listId: 'list-1', leadIds: ['a'] }], ['resume_smartlead_push', { runId: RUN_ID }]];
+    for (const [name, args] of calls) {
+      await expect(run(name, args, attended({ isDelegatedAccess: true }))).rejects.toThrow(/customer in their own chat/);
+      await expect(run(name, args, { userId: 'owner' })).rejects.toThrow(/attended chat session/);
+      await expect(run(name, args, attended({ sessionId: 'sched' }))).rejects.toThrow(/not a scheduled run/);
+    }
+    expect(svc.release).not.toHaveBeenCalled();
+    expect(svc.resume).not.toHaveBeenCalled();
+  });
+
+  it('a start that fails after approval spends that approval: the user is asked again, and nothing was added', async () => {
+    svc.start.mockResolvedValueOnce({ ok: false, status: 409, code: 'sequence_changed', message: "The campaign's sequence changed after you previewed. Preview again." });
+    await expect(withApproval('start_smartlead_push', PUSH)).rejects.toThrow('sequence changed');
+    const again = await run('start_smartlead_push', PUSH, attended());
+    expect(again.awaitingUserConfirmation).toBe(true);
+    expect(svc.start).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('the approval gate', () => {
-  const base = { userId: 'u', sessionId: 's', listId: 'l', campaignId: 1, campaignStatus: 'DRAFTED', sequenceHash: 'h', cohort: 5, eligible: 5, includeUnverified: false, requiresActiveConfirmation: false, mapping: {}, acknowledgedTags: [] as string[] };
+  const base = { userId: 'u', sessionId: 's', listId: 'l', campaignId: 1, campaignStatus: 'DRAFTED', sequenceHash: 'h', cohort: 5, eligible: 5, includeUnverified: false, requiresActiveConfirmation: false, mapping: {}, acknowledgedTags: [] as string[], fingerprint: 'f' };
   it('every thing the card showed changes the digest, and nothing else does', () => {
     const d = computePushDigest(base);
     expect(computePushDigest({ ...base })).toBe(d);
-    for (const change of [{ userId: 'v' }, { sessionId: 't' }, { listId: 'm' }, { campaignId: 2 }, { campaignStatus: 'ACTIVE' }, { sequenceHash: 'g' }, { cohort: 4 }, { eligible: 6 }, { includeUnverified: true }, { requiresActiveConfirmation: true }, { mapping: { a: 'b' } }, { acknowledgedTags: ['x'] }]) {
+    for (const change of [{ userId: 'v' }, { sessionId: 't' }, { listId: 'm' }, { campaignId: 2 }, { campaignStatus: 'ACTIVE' }, { sequenceHash: 'g' }, { cohort: 4 }, { eligible: 6 }, { includeUnverified: true }, { requiresActiveConfirmation: true }, { mapping: { a: 'b' } }, { acknowledgedTags: ['x'] }, { fingerprint: 'g' }]) {
       expect(computePushDigest({ ...base, ...change })).not.toBe(d);
     }
   });

@@ -46,6 +46,8 @@ export interface PushDigestInput {
   requiresActiveConfirmation: boolean;
   mapping: Record<string, string>;
   acknowledgedTags: string[];
+  /** PreviewResult.fingerprint: which contacts go to which Smartlead connection. */
+  fingerprint: string;
 }
 
 export interface ReleaseDigestInput {
@@ -77,6 +79,7 @@ export function computePushDigest(input: PushDigestInput): string {
     requiresActiveConfirmation: input.requiresActiveConfirmation,
     mapping: sortedEntries(input.mapping),
     acknowledgedTags: [...input.acknowledgedTags].sort(),
+    fingerprint: input.fingerprint,
   });
 }
 
@@ -135,6 +138,8 @@ export interface PushQuestionInput {
   /** Tags the user is told Smartlead fills in itself. */
   smartleadFilledTags: string[];
   includeUnverified: boolean;
+  /** The CRM field chosen for each merge field the campaign uses beyond the standard ones: it goes into what recipients read, so the user sees it. */
+  mapping: Record<string, string>;
 }
 
 /**
@@ -148,6 +153,8 @@ export function buildPushQuestion(input: PushQuestionInput): QuestionDeckQuestio
   ];
   if (input.includeUnverified) parts.push('This includes contacts whose email address is not verified.');
   if (input.smartleadFilledTags.length > 0) parts.push(`You are confirming that Smartlead fills in ${input.smartleadFilledTags.map(t => `{{${cardText(t, 40)}}}`).join(', ')} itself.`);
+  const mapped = sortedEntries(input.mapping);
+  if (mapped.length > 0) parts.push(`Merge fields filled from your CRM: ${mapped.map(([tag, path]) => `{{${cardText(tag, 40)}}} from "${cardText(path, 60)}"`).join(', ')}. These end up in the emails recipients read.`);
   if (input.requiresActiveConfirmation) parts.push(`This campaign is ALREADY SENDING (${cardText(input.campaignStatus, 20).toLowerCase()}): contacts start receiving email as soon as they are added.`);
   parts.push('By approving you confirm that you have a lawful basis to email these contacts, and that people who opt out are stopped in Smartlead for good.');
   const options: AskUserQuestionOption[] = [
@@ -162,10 +169,15 @@ export interface ReleaseQuestionInput {
   listName: string;
   count: number;
   campaignId: number | null;
+  /** A few of the contacts' addresses, so the card says who it is about. */
+  sample: string[];
 }
 
 export function buildReleaseQuestion(input: ReleaseQuestionInput): QuestionDeckQuestionInput {
-  const question = `Release ${plural(input.count, 'contact')} in "${cardText(input.listName)}" from Smartlead${input.campaignId ? ` (campaign ${input.campaignId})` : ''}? AgentWeb's own senders may email them again. Your Smartlead campaign is not changed and may keep emailing them, so they could get email from two places. Contacts who opted out stay blocked, and a Smartlead unsubscribe cannot be undone from here.`;
+  const who = input.sample.length > 0
+    ? ` They include ${input.sample.map(e => cardText(e, 60)).join(', ')}${input.count > input.sample.length ? ` and ${plural(input.count - input.sample.length, 'other')}` : ''}.`
+    : '';
+  const question = `Release ${plural(input.count, 'contact')} in "${cardText(input.listName)}" from Smartlead${input.campaignId ? ` (campaign ${input.campaignId})` : ''}?${who} AgentWeb's own senders may email them again. Your Smartlead campaign is not changed and may keep emailing them, so they could get email from two places. Contacts who opted out stay blocked, and a Smartlead unsubscribe cannot be undone from here.`;
   const options: AskUserQuestionOption[] = [
     { id: DECLINE_OPTION_ID, label: 'Decline', consequence: 'Nothing is changed.', recommended: true, why: 'Nothing changes unless you approve.' },
     { id: APPROVE_OPTION_ID, label: `Release ${plural(input.count, 'contact')}`, consequence: 'Lets AgentWeb email these contacts again.' },
