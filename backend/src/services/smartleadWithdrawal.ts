@@ -138,7 +138,7 @@ export async function withdrawalSweep(deps: WithdrawalDeps): Promise<SweepResult
       // every lead, which would be read as "gone" and closed as withdrawn while the person is still live in the old account).
       if (!(await deps.smartlead.campaignVisible(resolved.apiKey, first.campaignId!))) {
         out.keyUnavailable++;
-        logOnce(deps, `${first.listId}#${first.campaignId}#invisible`, `[SmartleadWithdrawal] list=${first.listId} campaign=${first.campaignId}: the connected key cannot see this campaign (another Smartlead account?); opt-outs on this list are NOT being sent to Smartlead`);
+        logOnce(deps, `${first.listId}#${first.campaignId}#invisible`, `[SmartleadWithdrawal] list=${first.listId} campaign=${first.campaignId}: the connected key cannot see this campaign (it was deleted in Smartlead, or the key belongs to another Smartlead account); nothing was changed for this list, and if the campaign still exists for the customer its opt-outs are NOT being sent`);
         continue;
       }
       const result = await sweepTarget(deps, resolved, first.listId!, first.campaignId!, cap);
