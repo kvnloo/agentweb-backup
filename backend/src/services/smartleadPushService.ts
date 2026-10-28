@@ -493,6 +493,11 @@ export class SmartleadPushService {
         await this.deps.db.cancelRun(r.run.runId);
         return fail(409, "start_unconfirmed", "This push never finished starting, so it was cancelled. Preview again to push.");
       }
+      // A teammate's push whose connection is no longer shared with that teammate cannot be resumed by anyone (the worker would pause it again at
+      // once): share it again, or cancel and push afresh.
+      if ((await this.sharingVerdict(r.run)) === "connection_unshared") {
+        return fail(409, "connection_unshared", "This push was started through a Smartlead account that is no longer shared with the person who started it. Share it again, or cancel the push.");
+      }
       // Resuming sends with the connection the push started with: its owner may resume it, and so may anyone in the org that connection is shared
       // with (they could have started it). Anyone else cannot, but can still pause and cancel.
       if (userId !== r.run.keyOwnerId) {
@@ -532,6 +537,20 @@ export class SmartleadPushService {
     void this.deps.track(`SmartleadPush:${run.runId}`, this.work(run).finally(() => { this.active--; })).catch(() => undefined);
   }
 
+  /**
+   * For a run a teammate started through a shared connection: null while that connection is still usable by the pusher, else the pause reason.
+   * Un-shared (or resolving to another owner's connection) is `connection_unshared`; an unreadable key is `key_unavailable`; a rejected key is
+   * left to the key owner's own check (the connection is still shared, the key is what failed). The key owner's own run is never refused here.
+   */
+  private async sharingVerdict(run: PushRun): Promise<string | null> {
+    if (run.pushedBy === run.keyOwnerId) return null;
+    const usable = await this.deps.resolveKey(run.pushedBy, run.smartleadAccountId);
+    if (usable.ok) return usable.ownerUserId === run.keyOwnerId ? null : "connection_unshared";
+    if (usable.reason === "key_rejected") return null;
+    if (usable.reason === "key_unreadable") return "key_unavailable";
+    return "connection_unshared";
+  }
+
   /** Runs one run to its end. Never throws: a store error leaves the lease to lapse, and the resumer decides. */
   async work(run: PushRun): Promise<void> {
     try {
@@ -543,15 +562,12 @@ export class SmartleadPushService {
         return;
       }
       // A teammate pushing through a shared connection: it must STILL be shared with them. Un-sharing a connection stops the pushes that use it
-      // (the key owner's own resolution below ignores sharing, so it would carry on otherwise). A key that is merely rejected is left to that check.
-      if (run.pushedBy !== run.keyOwnerId) {
-        const usable = await this.deps.resolveKey(run.pushedBy, run.smartleadAccountId);
-        const rejected = !usable.ok && usable.reason === "key_rejected";
-        if (!rejected && (!usable.ok || usable.ownerUserId !== run.keyOwnerId)) {
-          await this.deps.db.pauseRun(run.runId, "connection_unshared", run.leaseEpoch);
-          this.deps.log(`[SmartleadPush] run=${run.runId} paused: the Smartlead connection is no longer shared with the pusher`);
-          return;
-        }
+      // (the key owner's own resolution below ignores sharing, so it would carry on otherwise); the engine asks again before every batch.
+      const refused = await this.sharingVerdict(run);
+      if (refused) {
+        await this.deps.db.pauseRun(run.runId, refused, run.leaseEpoch);
+        this.deps.log(`[SmartleadPush] run=${run.runId} paused (${refused}): the Smartlead connection is no longer usable by the pusher`);
+        return;
       }
       const resolved = await this.deps.resolveKey(run.keyOwnerId, run.smartleadAccountId);
       if (!resolved.ok) {
@@ -571,6 +587,7 @@ export class SmartleadPushService {
           getSequences: () => this.deps.smartlead.getSequences(apiKey, run.campaignId),
         },
         isDisabled: () => !this.deps.enabled(),
+        ...(run.pushedBy !== run.keyOwnerId ? { stillPermitted: () => this.sharingVerdict(run) } : {}),
         onSmartleadError: error => { void this.deps.reportFailure(resolved, error).catch(() => undefined); },
         sleep: ms => this.deps.sleep(ms),
         now: () => this.deps.now(),

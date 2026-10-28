@@ -60,6 +60,11 @@ export interface EngineDeps {
   };
   /** The operator's kill switch: checked before every batch; a true answer pauses the run (`disabled_by_operator`), it can be resumed later. */
   isDisabled?(): boolean;
+  /**
+   * Checked before every batch, after the kill switch: a reason (for example `connection_unshared`) pauses the run with it, null lets it go on.
+   * Used for a teammate pushing through a shared connection, so un-sharing stops the run at the next batch, not only at the next start.
+   */
+  stillPermitted?(): Promise<string | null>;
   /** Told about a failed Smartlead call, so the caller can flag a rejected key (reportSmartleadFailure). Must not throw. */
   onSmartleadError?(error: unknown): void;
   sleep(ms: number): Promise<void>;
@@ -170,6 +175,8 @@ export async function executeRun(run: PushRun, deps: EngineDeps): Promise<RunOut
     for (;;) {
       await beat();
       if (deps.isDisabled?.()) return await pause("disabled_by_operator");
+      const refused = deps.stillPermitted ? await deps.stillPermitted() : null;
+      if (refused) return await pause(refused);
 
       // The approved count is a hard ceiling: a lead that became eligible after the preview can never widen the approved set.
       if (run.previewEligible - (added + already) <= 0 || run.listExhausted) {

@@ -429,6 +429,25 @@ describe("executeRun (ENG-673)", () => {
     expect(t.sl.emails.size).toBe(900);
   });
 
+  it("pauses at the next batch with the reason the permission check gives (a shared connection un-shared mid-run), keeping what was already added", async () => {
+    const t = setup(900);
+    let verdict: string | null = null;
+    const asked: number[] = [];
+    t.deps.stillPermitted = async () => { asked.push(t.sl.posts.length); return verdict; };
+    t.sl.onPost = () => { verdict = "connection_unshared"; };
+    await expect(executeRun(t.run, t.deps)).resolves.toEqual({ outcome: "paused", reason: "connection_unshared" });
+    expect(t.sl.posts).toHaveLength(1);
+    expect(t.marked()).toBe(400); // the batch in flight was recorded first
+    expect(asked).toEqual([0, 1]); // asked before every batch
+  });
+
+  it("a permission check that always passes changes nothing", async () => {
+    const t = setup(900);
+    t.deps.stillPermitted = async () => null;
+    await expect(executeRun(t.run, t.deps)).resolves.toEqual({ outcome: "completed" });
+    expect(t.sl.emails.size).toBe(900);
+  });
+
   it("completes an empty list without calling Smartlead's add", async () => {
     const t = setup(0, { leads: [] });
     await expect(executeRun(t.run, t.deps)).resolves.toEqual({ outcome: "completed" });

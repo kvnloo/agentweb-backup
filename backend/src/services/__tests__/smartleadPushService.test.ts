@@ -719,7 +719,7 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
         expect(await e.svc.start("editor", go(p.preview.token))).toMatchObject({ ok: false, status: 409, code: "not_connected" });
       });
 
-      it("resume: the key owner and anyone the connection is shared with may resume; once sharing is withdrawn, the member may not; anyone may still pause and cancel", async () => {
+      it("resume: anyone the connection is shared with may resume a teammate's push; once it is no longer shared with the pusher, nobody can (the worker would stop it again); anyone may still pause and cancel", async () => {
         const e = env({ maxConcurrentWorkers: 0 });
         e.editors.add("editor");
         e.editors.add("editor2");
@@ -728,12 +728,16 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
         const p = (await e.svc.preview("editor", { listId: e.listId, campaignId: CAMPAIGN })) as any;
         const r = (await e.svc.start("editor", go(p.preview.token))) as any;
         expect((await e.svc.pause("editor2", r.run.runId)).ok).toBe(true);
+        expect((await e.svc.resume("editor2", r.run.runId)).ok).toBe(true); // shared with editor2 too
+        expect((await e.svc.pause("editor", r.run.runId)).ok).toBe(true);
         conns[0] = { ...OWNERS, sharedWith: ["editor2"] }; // sharing withdrawn from "editor", who started it
         install(e, conns);
-        expect(await e.svc.resume("editor", r.run.runId)).toMatchObject({ ok: false, status: 403, code: "resume_requires_connection" });
-        expect((await e.svc.resume("editor2", r.run.runId)).ok).toBe(true); // still shared with editor2
-        expect((await e.svc.pause("editor", r.run.runId)).ok).toBe(true);
-        expect((await e.svc.resume("owner", r.run.runId)).ok).toBe(true); // the owner always may
+        for (const who of ["editor", "editor2", "owner"]) {
+          expect(await e.svc.resume(who, r.run.runId)).toMatchObject({ ok: false, status: 409, code: "connection_unshared" });
+        }
+        conns[0] = OWNERS; // shared again
+        install(e, conns);
+        expect((await e.svc.resume("owner", r.run.runId)).ok).toBe(true);
         expect((await e.svc.cancel("editor", r.run.runId)).ok).toBe(true);
       });
 
@@ -752,7 +756,34 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
         await e.svc.work((await db.getRun(r.run.runId))!);
         expect(await db.getRun(r.run.runId)).toMatchObject({ status: "paused", pauseReason: "connection_unshared" });
         expect(added).toEqual([]);
-        expect(e.logs.join("\n")).toMatch(/no longer shared with the pusher/);
+        expect(e.logs.join("\n")).toMatch(/paused \(connection_unshared\): the Smartlead connection is no longer usable by the pusher/);
+      });
+
+      it("un-sharing in the MIDDLE of a teammate's push stops it at the next batch, keeping what was already added", async () => {
+        const e = env({ leads: Array.from({ length: 900 }, (_, i) => mkLead(i + 1)), maxConcurrentWorkers: 0 });
+        e.editors.add("editor");
+        const conns = [OWNERS];
+        install(e, conns);
+        const p = (await e.svc.preview("editor", { listId: e.listId, campaignId: CAMPAIGN, cohort: 900 })) as any;
+        const r = (await e.svc.start("editor", go(p.preview.token))) as any;
+        e.sl.onPost = () => { conns[0] = { ...OWNERS, sharedWith: [] }; install(e, conns); }; // un-shared while the first batch is in flight
+        await e.svc.work((await db.getRun(r.run.runId))!);
+        const run = (await db.getRun(r.run.runId))!;
+        expect(run).toMatchObject({ status: "paused", pauseReason: "connection_unshared" });
+        expect(run.counts.added).toBe(400);
+        expect(e.sl.posts).toHaveLength(1);
+      });
+
+      it("a teammate's push pauses with key_unavailable (not 'un-shared') when the shared key cannot be read", async () => {
+        const e = env({ maxConcurrentWorkers: 0 });
+        e.editors.add("editor");
+        install(e, [OWNERS]);
+        const p = (await e.svc.preview("editor", { listId: e.listId, campaignId: CAMPAIGN })) as any;
+        const r = (await e.svc.start("editor", go(p.preview.token))) as any;
+        const real = e.deps.resolveKey;
+        e.deps.resolveKey = async (u, a) => (u === "editor" ? { ok: false, reason: "key_unreadable", message: "x" } : real(u, a));
+        await e.svc.work((await db.getRun(r.run.runId))!);
+        expect((await db.getRun(r.run.runId))!.pauseReason).toBe("key_unavailable");
       });
 
       it("a running teammate push also pauses when the account id now resolves to a DIFFERENT owner's connection", async () => {
@@ -794,7 +825,7 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
         const r = (await e.svc.start("editor", go(p.preview.token))) as any;
         await e.svc.pause("editor", r.run.runId);
         e.deps.resolveKey = async (_u, a) => ({ ok: true, apiKey: "k", ownerUserId: "someone-else", accountId: a ?? "x", accountName: "x" });
-        expect(await e.svc.resume("editor", r.run.runId)).toMatchObject({ ok: false, status: 403, code: "resume_requires_connection" });
+        expect(await e.svc.resume("editor", r.run.runId)).toMatchObject({ ok: false, status: 409, code: "connection_unshared" });
       });
 
       it("the withdrawal sweep stops opted-out contacts with the KEY OWNER's key, even when a teammate did the push", async () => {
