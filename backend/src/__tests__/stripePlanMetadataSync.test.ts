@@ -88,14 +88,17 @@ describe('resolveSubscriptionTypeForPrice', () => {
     await expect(resolveSubscriptionTypeForPrice({ id: 'price_max', metadata: { plan: 'Max' } })).resolves.toBe('Max');
   });
 
-  it('prefers price metadata, then product, then subscription metadata', async () => {
+  it('prefers price metadata, then product, and never subscription metadata', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
     // A stale subscription label must not override the billed price's label.
     await expect(
       resolveSubscriptionTypeForPrice({ id: 'price_c', metadata: { plan: 'Max' } }, { metadata: { plan: 'Starter' } }),
     ).resolves.toBe('Max');
+    // Nor may it set the tier on its own (contract customer on unlabelled price).
     await expect(
-      resolveSubscriptionTypeForPrice({ id: 'price_c' }, { metadata: { plan: 'Max' } }),
-    ).resolves.toBe('Max');
+      resolveSubscriptionTypeForPrice({ id: 'price_c', product: { metadata: {} } }, { metadata: { plan: 'Starter' } }),
+    ).resolves.toBeNull();
+    warn.mockRestore();
     await expect(
       resolveSubscriptionTypeForPrice({ id: 'price_c', product: { metadata: { plan: 'Max' } } }),
     ).resolves.toBe('Max');
@@ -122,10 +125,15 @@ describe('resolveSubscriptionTypeForPrice', () => {
     expect(mockStripe.products.retrieve).toHaveBeenCalledWith('prod_c');
   });
 
+  it('propagates a failed product lookup so the webhook can be retried', async () => {
+    mockStripe.products.retrieve.mockRejectedValueOnce(new Error('stripe 500'));
+    await expect(resolveSubscriptionTypeForPrice({ id: 'price_c', product: 'prod_c' })).rejects.toThrow('stripe 500');
+  });
+
   it('never grants Free from metadata on a billed price', async () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
     await expect(
-      resolveSubscriptionTypeForPrice({ id: 'price_c' }, { metadata: { plan: 'Free' } }),
+      resolveSubscriptionTypeForPrice({ id: 'price_c', metadata: { plan: 'Free' } }),
     ).resolves.toBeNull();
     warn.mockRestore();
   });

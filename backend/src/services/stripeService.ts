@@ -2236,8 +2236,8 @@ const METADATA_PLAN_DENYLIST: ReadonlySet<string> = new Set(['Super Premium', 'F
  * ENG-2724: resolve the subscription tier for a Stripe price, falling back to
  * `plan` metadata for prices outside the Starter/Pro env mapping (Max, custom
  * contract prices). Metadata is read from the price (what is actually billed),
- * then its product (retrieved when not expanded), then the subscription as a
- * last resort, so a stale subscription label cannot override the price, and is only accepted when it names a tier defined
+ * then its product (retrieved when not expanded; lookup errors propagate so
+ * webhooks retry). Subscription metadata is never used. A plan is only accepted when it names a tier defined
  * in AW-Settings `subscription_types` (via getTierConfig). An unmappable price
  * returns null with a warning so callers keep the existing tier.
  */
@@ -2271,18 +2271,17 @@ export async function resolveSubscriptionTypeForPrice(
     ? price.product
     : null;
   if (!product && typeof price?.product === 'string') {
-    try {
-      product = await getStripeOrThrow().products.retrieve(price.product);
-    } catch (err) {
-      console.warn(`[STRIPE] Product lookup failed for ${price.product} (price ${priceId}):`, err);
-    }
+    // Let lookup errors propagate: swallowing them would answer the webhook 200
+    // (no Stripe retry) and leave the tier stale after a transient Stripe error.
+    product = await getStripeOrThrow().products.retrieve(price.product);
   }
   const fromProduct = await tryPlan(product?.metadata?.plan);
   if (fromProduct) return fromProduct;
-  const fromSubscription = await tryPlan(subscription?.metadata?.plan);
-  if (fromSubscription) return fromSubscription;
+  // Subscription-level metadata is deliberately NOT a tier source: it is not
+  // what is billed and can be a stale label (e.g. a contract customer moved to
+  // an unlabelled custom price would be downgraded by a leftover plan label).
 
-  const candidates = [price?.metadata?.plan, product?.metadata?.plan, subscription?.metadata?.plan]
+  const candidates = [price?.metadata?.plan, product?.metadata?.plan]
     .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
     .map((v) => v.trim());
 
