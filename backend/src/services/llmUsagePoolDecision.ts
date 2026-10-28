@@ -70,9 +70,18 @@ export async function resolveLlmUsagePoolDecision(input: {
    * no write at all: reading usage must never make a month billable or raise its cap.
    */
   recordAdmission?: boolean;
+  /** Read-only admission forecast. Never use with recordAdmission. */
+  projectedCostMicroUsd?: number;
+  minimumCostUsedMicroUsd?: number;
 }): Promise<LlmUsagePoolDecision> {
   const { billingUserId, billingUser, month, basePolicy } = input;
   const recordAdmission = input.recordAdmission === true;
+  const projected = input.projectedCostMicroUsd ?? 0;
+  const minimum = input.minimumCostUsedMicroUsd ?? 0;
+  if (!Number.isSafeInteger(projected) || projected < 0 || !Number.isSafeInteger(minimum) || minimum < 0
+    || (recordAdmission && (projected > 0 || minimum > 0))) {
+    throw new Error('Invalid read-only usage projection');
+  }
   // ENG-1250 §9.6 enforcement cutover (dark by default): swap the raw spend basis
   // onto the vendor-inclusive spend ledger and leave the rest of this pipeline —
   // credit application, threshold, predicate — untouched. See spendEnforcementBasis.ts.
@@ -93,7 +102,7 @@ export async function resolveLlmUsagePoolDecision(input: {
   const policy = basePolicy
     ? { ...basePolicy, hardCostThresholdMicroUsd: adjusted.effectiveHardThresholdMicroUsd }
     : null;
-  const costUsedMicroUsd = adjusted.policyCostUsedMicroUsd;
+  const costUsedMicroUsd = Math.max(adjusted.policyCostUsedMicroUsd, minimum) + projected;
   const mode = evaluateLlmUsageMode({ costUsedMicroUsd, policy });
   const base: LlmUsagePoolDecision = {
     policy,
