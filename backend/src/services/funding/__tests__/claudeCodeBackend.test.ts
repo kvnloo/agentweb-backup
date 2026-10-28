@@ -1,5 +1,5 @@
 import { ClaudeCodeBackend, CONFIRMATION_NOTE, OUTCOME_UNKNOWN_NOTE, PREVIOUS_UNKNOWN_DIRECTIVE, type ClaudeBackendDeps, type ClaudeTurnParams } from '../claudeCodeBackend';
-import { ClaudeRouteStopError } from '../claudeRouteErrors';
+import { ClaudeRouteStopError, turnRanNoTools } from '../claudeRouteErrors';
 import { ClaudeRunRegistry } from '../claudeRunRegistry';
 import { LoginHostError } from '../loginHostClient';
 import type { BridgeCallRecord, BridgeHalt } from '../toolBridge';
@@ -380,6 +380,68 @@ describe('ClaudeCodeBackend', () => {
       expect(h.calls).toEqual(expect.arrayContaining(['drain', 'exec:release']));
       expect(h.registry.size).toBe(0);
       expect(h.journal).toEqual([]);
+    });
+
+    describe('whether the failed turn is KNOWN to have run no tool (the "continue on AgentWeb credits" offer)', () => {
+      const failWith = async (h: ReturnType<typeof harness>) => (await new ClaudeCodeBackend(h.deps).run(params()).catch((e) => e)) as ClaudeRouteStopError;
+
+      it('a stop with no ledger record and no tool event is known to have run none', async () => {
+        const h = harness();
+        h.setHost(async () => done('', { ok: false, errorKind: 'usage_limit' }));
+        expect(turnRanNoTools(await failWith(h))).toBe(true);
+      });
+
+      it('a ledger record means a tool may have run, even one that was refused', async () => {
+        const h = harness();
+        h.setLedger([rec({ toolCallId: 'tc1', name: 'save_note' })]);
+        h.setHost(async () => done('', { ok: false, errorKind: 'usage_limit' }));
+        expect(turnRanNoTools(await failWith(h))).toBe(false);
+      });
+
+      it('a call still running when the turn ended means a tool may have run', async () => {
+        const h = harness();
+        h.x.stillRunning = 1;
+        h.setHost(async () => done('', { ok: false, errorKind: 'usage_limit' }));
+        expect(turnRanNoTools(await failWith(h))).toBe(false);
+      });
+
+      it('a closed run whose drain answered null is never treated as having run nothing', async () => {
+        const h = harness();
+        h.setHost(async () => done('', { ok: false, errorKind: 'usage_limit' }));
+        h.deps.bridge.closeRunAndDrain = async () => null;
+        expect(turnRanNoTools(await failWith(h))).toBe(false);
+      });
+
+      it('an unexpected error keeps what the run knew: none ran, or one did', async () => {
+        const quiet = harness();
+        quiet.setHost(async () => {
+          throw new Error('boom');
+        });
+        expect(turnRanNoTools(await failWith(quiet))).toBe(true);
+        const busy = harness();
+        busy.setLedger([rec({ toolCallId: 'tc1', name: 'save_note' })]);
+        busy.setHost(async () => {
+          throw new Error('boom');
+        });
+        expect(turnRanNoTools(await failWith(busy))).toBe(false);
+      });
+
+      it('a stop raised before the run opened ran nothing (no host client, prompt too large)', async () => {
+        const gone = harness();
+        gone.state.client = false;
+        expect(turnRanNoTools(await failWith(gone))).toBe(true);
+        const big = harness();
+        big.state.messages = [{ role: 'user', content: 'a'.repeat(2_100_000) }];
+        expect(turnRanNoTools(await failWith(big))).toBe(true);
+      });
+
+      it('an error nobody marked is unknown, which is not "none ran"', async () => {
+        const h = harness();
+        h.deps.prepareTurnContext = async () => {
+          throw new Error('dynamo down');
+        };
+        expect(turnRanNoTools(await failWith(h))).toBe(false);
+      });
     });
 
     it('an error before anything is opened (the context cannot be built) is also a typed stop, and opens nothing', async () => {
