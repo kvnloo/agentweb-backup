@@ -129,7 +129,7 @@ describe('read-only tools', () => {
   it('preview tells the model the numbers and findings but never the signed token', async () => {
     const r = await run('preview_smartlead_push', PUSH);
     expect(svc.preview).toHaveBeenCalledWith('owner', expect.objectContaining({ listId: 'list-1', campaignId: 77, includeUnverified: false }));
-    expect(r.preview).toMatchObject({ list: { eligible: 50, total: 60 }, cohort: { chosen: 50 }, canStart: true, campaignAlreadySending: false });
+    expect(r.preview).toMatchObject({ list: { eligible: 50, total: 60 }, cohort: { chosen: 50 }, canStart: true, campaignAlreadySending: false, emailStepsInCampaignSequence: 2 });
     expect(JSON.stringify(r)).not.toContain('signed-token');
   });
 
@@ -247,7 +247,7 @@ describe('start_smartlead_push: the approval card', () => {
 describe('start_smartlead_push: after the user approves', () => {
   it('starts the push once, with the fresh signed token, both acknowledgements the card stood for, and the agent channel', async () => {
     const r = await withApproval('start_smartlead_push', PUSH);
-    expect(r).toMatchObject({ success: true, started: true });
+    expect(r).toMatchObject({ success: true, started: true, campaign: { name: 'Mindd outreach', status: 'DRAFTED', emailStepsInCampaignSequence: 2 } });
     expect(svc.start).toHaveBeenCalledTimes(1);
     expect(svc.start).toHaveBeenCalledWith('owner', { token: 'signed-token-2', acknowledgements: { lawfulBasis: true } }, { channel: 'agent' });
     expect(svc.preview).toHaveBeenCalledTimes(2); // once for the card, once to act on what is true now
