@@ -6606,6 +6606,16 @@ export class AgentModeService {
     'start_hot_lead_call_verification',
     'confirm_hot_lead_call_verification',
 
+    // Smartlead push (ENG-673): the user's own Smartlead campaigns; starting and releasing are approval-card gated
+    'list_smartlead_campaigns',
+    'preview_smartlead_push',
+    'start_smartlead_push',
+    'get_smartlead_push_status',
+    'pause_smartlead_push',
+    'resume_smartlead_push',
+    'cancel_smartlead_push',
+    'release_leads_from_smartlead',
+
     // Scheduled Chat Management
     'list_scheduled_chats',
     'manage_scheduled_chat',
