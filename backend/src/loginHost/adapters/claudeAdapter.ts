@@ -745,7 +745,7 @@ class ClaudeSession implements ProviderSession {
       // The relay goes with the turn: no connection, pending call or socket outlives the process (or the turn that ended without one).
       if (this.waiting) clearTimeout(this.waiting.timer);
       this.waiting = undefined;
-      await Promise.all([this.relayEp?.close(), opening?.close()].map((p) => p?.catch(() => undefined)));
+      await opening?.close().catch(() => undefined); // the endpoint opened for this turn (the same object as relayEp), whether or not the turn got to use it
     } finally {
       this.resolveClosed();
     }
