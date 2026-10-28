@@ -168,7 +168,16 @@ export class RelayToolDispatcher {
     const name = typeof ev.name === "string" ? ev.name : "";
     this.o.onCall?.("start", name);
     try {
-      await this.deliver(op, await this.decide(op, ev, name));
+      let answer: Answer;
+      try {
+        answer = await this.decide(op, ev, name);
+      } catch {
+        // Something unforeseen before the tool was handed over (a hostile input that cannot be serialized, say). The operation must still be answered:
+        // an unanswered one holds the worker's single pending slot until the turn's deadline.
+        this.log("decide_failed");
+        answer = { content: STOPPED_MESSAGE, isError: true };
+      }
+      await this.deliver(op, answer);
     } finally {
       this.o.onCall?.("end", name);
     }

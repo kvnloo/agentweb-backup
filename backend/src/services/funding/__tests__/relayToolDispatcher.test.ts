@@ -396,3 +396,26 @@ describe('RelayToolDispatcher', () => {
     expect(errors.length).toBeGreaterThan(0);
   });
 });
+
+describe('RelayToolDispatcher: an unforeseen failure still answers the operation', () => {
+  it('input that cannot be serialized is refused and answered', async () => {
+    const posts: any[] = [];
+    const d = new RelayToolDispatcher({
+      client: { turnToolResult: async (i: any) => (posts.push(i), { ok: true as const }) },
+      ids: IDS,
+      runId: 'r1',
+      token: 't',
+      bridge: { callTool: async () => ({ content: 'x', isError: false }), listTools: async () => [], noteToolUse: () => undefined, takeLedger: () => ({ records: [], truncated: 0 }) },
+      manifest: { open: new Set(['search']), locked: new Set() },
+      isStopped: () => false,
+    });
+    let deep: unknown = {};
+    for (let i = 0; i < 20000; i++) deep = { a: deep };
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    d.start({ operationId: 'op-1', messageId: 'm', name: 'search', input: deep });
+    await d.settle(1_000);
+    expect(posts).toHaveLength(1);
+    expect(posts[0]).toMatchObject({ operationId: 'op-1', isError: true });
+    jest.restoreAllMocks();
+  });
+});
