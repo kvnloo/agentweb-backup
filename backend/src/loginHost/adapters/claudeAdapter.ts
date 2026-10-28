@@ -36,6 +36,8 @@ import type {
   SubscriptionProviderAdapter,
 } from "../adapter";
 import { RELAY_SOCKET_IN_UNIT } from "../ports/unitArgs";
+import { canonicalJson } from "../relay/canonical";
+import { createHash } from "crypto";
 import type { RelayCall, RelayEndpoint, RelayHost } from "../relay/relayServer";
 import { classifyFailureText, failureClassToKind, normalizeClaudeEvent, parseAuthStatus, parseDoctorHazards, usageFromResult } from "./claudeParse";
 
@@ -512,10 +514,14 @@ class ClaudeSession implements ProviderSession {
   // ── tool relay (ENG-2113) ──
 
   /** Model message ids of tool_use blocks seen in the stream and not yet claimed by a relayed call: (bare name, canonical input) -> message id. */
-  private readonly streamUses: Array<{ messageId: string; name: string; key: string; claimed: boolean }> = [];
+  private readonly streamUses: Array<{ messageId: string; name: string; key: string }> = [];
   private waiting: { call: RelayCall; timer: NodeJS.Timeout } | undefined;
   private events: AsyncQueue<ProviderEvent> | undefined;
   private relayEp: RelayEndpoint | undefined;
+  /** The in-flight relay.open(): a close that arrives meanwhile waits for it, so the endpoint it creates is never left behind. */
+  private relayOpening: Promise<RelayEndpoint> | undefined;
+  /** Names the manifest offers (the stream is hostile input: only these are ever remembered). */
+  private readonly manifestNames = new Set<string>();
   private readonly visibleTools = new Set<string>();
 
   /** A tool_use block from the stream (informational ONLY: it is never executed or registered, it just tells us which model message a relayed call belongs to). */
@@ -525,7 +531,12 @@ class ClaudeSession implements ProviderSession {
     if (!msg || typeof msg.id !== "string" || !Array.isArray(msg.content)) return;
     const prefix = `mcp__${this.cfg.mcpServerName}__`;
     for (const b of msg.content as Array<Record<string, unknown>>) {
-      if (b?.type === "tool_use" && typeof b.name === "string" && b.name.startsWith(prefix)) this.streamUses.push({ messageId: msg.id, name: b.name.slice(prefix.length), key: canonicalJson(b.input ?? {}), claimed: false });
+      if (b?.type !== "tool_use" || typeof b.name !== "string" || !b.name.startsWith(prefix)) continue;
+      const name = b.name.slice(prefix.length);
+      if (!this.manifestNames.has(name)) continue; // a tool the turn does not offer can never be a relayed call
+      // Bounded memory whatever the CLI prints: a fixed-size digest of the input (not the input), a truncated id, and at most MAX_STREAM_USES entries (oldest dropped).
+      this.streamUses.push({ messageId: msg.id.slice(0, MAX_MESSAGE_ID_CHARS), name, key: digest(canonicalJson(b.input ?? {})) });
+      if (this.streamUses.length > MAX_STREAM_USES) this.streamUses.splice(0, this.streamUses.length - MAX_STREAM_USES);
     }
     this.flushWaiting(false);
   }
@@ -534,12 +545,12 @@ class ClaudeSession implements ProviderSession {
   private flushWaiting(force: boolean): void {
     const w = this.waiting;
     if (!w || !this.events) return;
-    const key = canonicalJson(w.call.args);
-    const exact = this.streamUses.find((u) => !u.claimed && u.name === w.call.name && u.key === key);
-    const byName = this.streamUses.filter((u) => !u.claimed && u.name === w.call.name);
+    const key = digest(canonicalJson(w.call.args));
+    const exact = this.streamUses.find((u) => u.name === w.call.name && u.key === key);
+    const byName = this.streamUses.filter((u) => u.name === w.call.name);
     const hit = exact ?? (byName.length === 1 ? byName[0] : undefined);
     if (!hit && !force) return;
-    if (hit) hit.claimed = true;
+    if (hit) this.streamUses.splice(this.streamUses.indexOf(hit), 1); // claimed: forgotten
     clearTimeout(w.timer);
     this.waiting = undefined;
     // Without a match the id is unique to this call, so the backend never collapses it with another one (a duplicate EXECUTION is worse than a missed collapse).
@@ -581,7 +592,8 @@ class ClaudeSession implements ProviderSession {
         if (!relay) throw Object.assign(new Error("relay_unavailable"), { code: "open_failed" });
         for (const t of input.relay.tools) if (t.locked !== true) this.visibleTools.add(t.name);
         // The per-turn socket exists (and accepts) BEFORE the unit starts. Identity is fixed here, from the session, never from a frame.
-        this.relayEp = await relay.host.open({
+        for (const t of input.relay.tools) this.manifestNames.add(t.name);
+        this.relayOpening = relay.host.open({
           uid: this.ctx.uid,
           identity: { connectionId: this.spec.connectionId, epoch: this.spec.epoch, turnId: input.turnId },
           onCall: (c) => this.onRelayCall(c),
@@ -589,7 +601,8 @@ class ClaudeSession implements ProviderSession {
           allowTool: (n) => this.visibleTools.has(n),
           callTimeoutMs: input.relay.callTimeoutMs,
         });
-        if (this.closing || this.interrupted) return;
+        this.relayEp = await this.relayOpening;
+        if (this.closing || this.interrupted) return; // close() is waiting for this very endpoint and closes it (doClose)
         mcpServer = {
           name: this.cfg.mcpServerName,
           url: "",
@@ -719,6 +732,8 @@ class ClaudeSession implements ProviderSession {
       // (Defense in depth: `ctx.spawnAs` is synchronous today, so a process cannot appear between a close request and the
       // runner registering it; the randomized lifecycle test cannot open this window. Keep it for a port that stops being synchronous.)
       await this.spawning?.catch(() => undefined);
+      // An endpoint still being opened is closed once it exists (a close during open() must not leave its listener and directory behind).
+      const opening = await this.relayOpening?.catch(() => undefined);
       // Resolves only when the process is really gone (the core frees the cap slot and relies on it).
       let seen: number;
       do {
@@ -730,16 +745,14 @@ class ClaudeSession implements ProviderSession {
       // The relay goes with the turn: no connection, pending call or socket outlives the process (or the turn that ended without one).
       if (this.waiting) clearTimeout(this.waiting.timer);
       this.waiting = undefined;
-      await this.relayEp?.close().catch(() => undefined);
+      await Promise.all([this.relayEp?.close(), opening?.close()].map((p) => p?.catch(() => undefined)));
     } finally {
       this.resolveClosed();
     }
   }
 }
 
-/** JSON with sorted keys: the same arguments compare equal however the producer ordered them. */
-function canonicalJson(v: unknown): string {
-  if (Array.isArray(v)) return `[${v.map(canonicalJson).join(",")}]`;
-  if (v !== null && typeof v === "object") return `{${Object.keys(v as object).sort().map((k) => `${JSON.stringify(k)}:${canonicalJson((v as Record<string, unknown>)[k])}`).join(",")}}`;
-  return JSON.stringify(v) ?? "null";
-}
+
+const MAX_STREAM_USES = 64;
+const MAX_MESSAGE_ID_CHARS = 128;
+const digest = (text: string): string => createHash("sha256").update(text).digest("base64");

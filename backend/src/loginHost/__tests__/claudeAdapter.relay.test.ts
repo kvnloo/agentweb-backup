@@ -4,7 +4,7 @@
  * mount is replaced by an environment variable (AW_FAKE_RELAY_MOUNT = the host directory the unit would see at /run/aw-relay).
  */
 import { spawn } from "child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { dirname, join } from "path";
 import type { AdapterContext, ChildLike, ProviderEvent, ProviderSession, SpawnSpec } from "../adapter";
@@ -339,6 +339,72 @@ describe("claude adapter: relay wiring (stubbed socket)", () => {
     expect(session.answer("op", { kind: "tool-result", ok: true, content: "x" })).toBe(false);
     expect(session.answer("op", { kind: "decline" })).toBe(false);
     await session.close();
+  });
+});
+
+describe("claude adapter: lifecycle and memory bounds of the relay", () => {
+  it("MUTATION TARGET: a close() that arrives while relay.open() is pending leaves no listener and no directory behind", async () => {
+    const rig = makeRig();
+    rig.scenario({ turn: [RESULT_STEP] });
+    const wrapped = rig.host.open.bind(rig.host);
+    rig.host.open = async (o) => {
+      await new Promise((r) => setTimeout(r, 300)); // the window
+      return wrapped(o);
+    };
+    const session = await rig.adapter.openSession(rig.ctx, { connectionId: "conn1", epoch: 1 });
+    const events: ProviderEvent[] = [];
+    const turn = (async () => {
+      for await (const ev of session.turn({ turnId: "t1", prompt: "go", model: "sonnet", relay: { tools: TOOLS, callTimeoutMs: () => 1000 } })) events.push(ev);
+    })();
+    await new Promise((r) => setTimeout(r, 100));
+    await session.close(); // while open() is still pending
+    await turn;
+    const uidDir = join(rig.layout.relayRoot, "400001");
+    expect(existsSync(uidDir) ? readdirSync(uidDir) : []).toEqual([]);
+    expect(rig.spawns).toHaveLength(0); // and no unit was started for a closed turn
+  });
+
+  it("the same for interrupt() during open()", async () => {
+    const rig = makeRig();
+    rig.scenario({ turn: [RESULT_STEP] });
+    const wrapped = rig.host.open.bind(rig.host);
+    rig.host.open = async (o) => {
+      await new Promise((r) => setTimeout(r, 300));
+      return wrapped(o);
+    };
+    const session = await rig.adapter.openSession(rig.ctx, { connectionId: "conn1", epoch: 1 });
+    const turn = (async () => {
+      for await (const ev of session.turn({ turnId: "t1", prompt: "go", model: "sonnet", relay: { tools: TOOLS, callTimeoutMs: () => 1000 } })) void ev;
+    })();
+    await new Promise((r) => setTimeout(r, 100));
+    await session.interrupt("t1");
+    await turn;
+    await session.close();
+    const uidDir = join(rig.layout.relayRoot, "400001");
+    expect(existsSync(uidDir) ? readdirSync(uidDir) : []).toEqual([]);
+  });
+
+  it("MUTATION TARGET: stream tool_use blocks are bounded: 300 lines of 100 KB inputs retain a few dozen fixed-size digests, not megabytes", async () => {
+    const rig = makeRig();
+    const big = "x".repeat(100_000);
+    const lines: Array<Record<string, unknown>> = Array.from({ length: 300 }, (_, i) => ({ type: "assistant", message: { id: `m${i}`, content: [{ type: "tool_use", id: `tu${i}`, name: "mcp__emma__search", input: { pad: big, i } }] } }));
+    lines.push({ type: "assistant", message: { id: "mEvil", content: [{ type: "tool_use", id: "tuE", name: "mcp__emma__not_offered", input: { pad: big } }] } });
+    rig.scenario({ turn: [...lines, RESULT_STEP] });
+    const session = await rig.adapter.openSession(rig.ctx, { connectionId: "conn1", epoch: 1 });
+    for await (const ev of session.turn({ turnId: "t1", prompt: "go", model: "sonnet", relay: { tools: TOOLS, callTimeoutMs: () => 1000 } })) void ev;
+    const kept = (session as unknown as { streamUses: Array<{ name: string; messageId: string; key: string }> }).streamUses;
+    expect(kept.length).toBeLessThanOrEqual(64);
+    expect(kept.every((u) => u.name === "search")).toBe(true); // a tool the turn does not offer is never remembered
+    expect(JSON.stringify(kept).length).toBeLessThan(20_000);
+    expect(kept[kept.length - 1].messageId).toBe("m299"); // the newest are the ones kept
+    await session.close();
+  });
+
+  it("a claimed stream block is forgotten (each message is matched once), so repeated identical calls still pair with their own messages", async () => {
+    const rig = makeRig();
+    rig.scenario({ turn: [{ mcpCall: { name: "search", args: { q: "same" }, messageId: "mA" } }, { mcpCall: { name: "search", args: { q: "same" }, messageId: "mB" } }, RESULT_STEP] });
+    const { events } = await runTurn(rig, (ev, s) => void s.answer(ev.operationId, { kind: "tool-result", ok: true, content: "ok" }));
+    expect((events.filter((e) => e.type === "tool-call") as Array<{ messageId: string }>).map((c) => c.messageId)).toEqual(["mA", "mB"]);
   });
 });
 
