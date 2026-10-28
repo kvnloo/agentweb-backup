@@ -549,6 +549,27 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
       expect(again).toMatchObject({ released: 0, skipped: { nothingToRelease: 1 } });
     });
 
+    it("does not release a lead that is do-not-contact (own senders skip it anyway and the sweep must keep stopping it); a withdrawn one stays withdrawn", async () => {
+      const e = env();
+      await pushedAll(e);
+      e.leads[0].contactStatus = "do-not-contact";
+      e.leads[0].system.smartlead_77 = { ...e.leads[0].system.smartlead_77, state: "withdrawn" };
+      const r = (await e.svc.release("owner", { listId: e.listId, leadIds: [e.leads[0].leadId, e.leads[1].leadId] })) as any;
+      expect(r).toMatchObject({ released: 1, skipped: { doNotContact: 1 } });
+      expect(e.leads[0].system.smartlead_77.state).toBe("withdrawn");
+      expect(e.leads[1].system.smartlead_77.state).toBe("released");
+    });
+
+    it("the sweep through the service refuses a key that cannot see the campaign", async () => {
+      const e = env();
+      await pushedAll(e);
+      e.leads[2].contactStatus = "do-not-contact";
+      e.sl.campaignMissing = true; // the connected key's account does not have this campaign
+      expect(await e.svc.sweepWithdrawals()).toMatchObject({ withdrawn: 0, keyUnavailable: 1 });
+      expect(e.unsub).not.toHaveBeenCalled();
+      expect(e.leads[2].system.smartlead_77.state).toBe("pushed");
+    });
+
     it("needs edit access to the list, and rejects bad input", async () => {
       const e = env();
       await pushedAll(e);

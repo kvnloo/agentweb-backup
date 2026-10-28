@@ -9,7 +9,7 @@ const optedOut = { contactStatus: "do-not-contact" };
 
 interface Env { deps: WithdrawalDeps; leads: any[]; unsub: jest.Mock; find: jest.Mock; written: Array<{ leadId: string; marker: any }>; logs: string[]; runs: any[] }
 
-function env(over: { leads?: any[]; runs?: any[]; key?: any; unsub?: (id: string) => any; keyFor?: (owner: string) => any; consistent?: (leadId: string) => any; cap?: number } = {}): Env {
+function env(over: { visible?: boolean; leads?: any[]; runs?: any[]; key?: any; unsub?: (id: string) => any; keyFor?: (owner: string) => any; consistent?: (leadId: string) => any; cap?: number } = {}): Env {
   const leads = over.leads ?? [];
   const written: Env["written"] = [];
   const logs: string[] = [];
@@ -24,7 +24,7 @@ function env(over: { leads?: any[]; runs?: any[]; key?: any; unsub?: (id: string
     readLeadConsistent: async (_l, id) => (over.consistent ? over.consistent(id) : leads.find(x => x.leadId === id) ?? null),
     maxPerList: over.cap,
     writeMarker: async (_l, leadId, _k, m) => { written.push({ leadId, marker: m }); const l = leads.find(x => x.leadId === leadId); if (l) l.system = { ...l.system, [smartleadMarkerKey(77)]: m }; },
-    smartlead: { unsubscribe: unsub, findLeadId: find },
+    smartlead: { campaignVisible: jest.fn(async () => over.visible !== false), unsubscribe: unsub, findLeadId: find },
     now: () => NOW,
     log: l => logs.push(l),
   };
@@ -353,5 +353,30 @@ describe("withdrawalSweep (ENG-673)", () => {
     e.deps.db.getRun = jest.fn(async () => null);
     await withdrawalSweep(e.deps);
     expect(e.logs.join("\n")).toMatch(/WARNING: 1000 runs/);
+  });
+  it("does not sweep with a key that cannot SEE the campaign (another Smartlead account answers 404 to everything): nothing is closed as withdrawn, and it says so", async () => {
+    const e = env({ leads: [lead(1, optedOut), lead(2, optedOut)], visible: false, unsub: () => "not_found" });
+    expect(await withdrawalSweep(e.deps)).toMatchObject({ withdrawn: 0, keyUnavailable: 1, failed: 0 });
+    expect(e.unsub).not.toHaveBeenCalled();
+    expect(e.leads[0].system.smartlead_77.state).toBe("pushed");
+    expect(e.logs.join("\n")).toMatch(/cannot see this campaign/);
+  });
+
+  it("logs a list that has no usable key, one that throws, and the run limit ONCE a day, not every pass", async () => {
+    const a = env({ leads: [lead(1, optedOut)], key: { ok: false, reason: "not_connected", message: "x" } });
+    for (let i = 0; i < 5; i++) await withdrawalSweep(a.deps);
+    expect(a.logs.filter(l => /NO usable Smartlead key/.test(l))).toHaveLength(1);
+    const b = env({ leads: [lead(1, optedOut)], visible: false });
+    for (let i = 0; i < 5; i++) await withdrawalSweep(b.deps);
+    expect(b.logs.filter(l => /cannot see this campaign/.test(l))).toHaveLength(1);
+    const c = env({ leads: [lead(1, optedOut)] });
+    c.deps.readLeads = async () => { throw new Error("throttled"); };
+    for (let i = 0; i < 5; i++) await withdrawalSweep(c.deps);
+    expect(c.logs.filter(l => /list=L campaign=77: throttled/.test(l))).toHaveLength(1);
+    const d = env({ leads: [] });
+    d.deps.db.listRunsSince = jest.fn(async () => Array.from({ length: 1000 }, (_, i) => ({ runId: `r${i}`, listId: `L${i}`, campaignId: 1, createdAt: "2026-10-27T00:00:00Z" }) as any));
+    d.deps.db.getRun = jest.fn(async () => null);
+    for (let i = 0; i < 5; i++) await withdrawalSweep(d.deps);
+    expect(d.logs.filter(l => /WARNING: 1000 runs/.test(l))).toHaveLength(1);
   });
 });
