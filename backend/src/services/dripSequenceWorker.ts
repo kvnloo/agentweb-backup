@@ -198,7 +198,11 @@ async function processEnrollment(
     (String(step.channel ?? 'email').trim().toLowerCase() as SequenceChannel);
 
   // Build variable context for substitution (shared by both channels)
-  const lead = await crmDb.getLeadById(enrollment.listId, enrollment.leadId).catch(() => null);
+  // A failed READ is not "no such lead": sending on with no lead would skip every per-lead check (do-not-contact, a Smartlead marker). It throws,
+  // so the enrollment is neither sent nor advanced and is retried on the next pass. (A lead that is simply gone still reads as null.)
+  let leadReadFailed = false;
+  const lead = await crmDb.getLeadById(enrollment.listId, enrollment.leadId).catch(() => { leadReadFailed = true; return null; });
+  if (leadReadFailed) throw new Error(`Could not read lead ${enrollment.leadId} for enrollment ${enrollment.enrollmentId}; will retry`);
 
   // Check enrollment condition — exit (not just skip) if lead no longer meets it
   if (sequence.enrollmentCondition) {

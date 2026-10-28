@@ -8,12 +8,16 @@ A lead pushed to a customer's Smartlead campaign carries a marker (`system.smart
 - **Emma `send_email_to_lead`** (`emma/impl/leads.ts`): refuses, with a message that says why and what the customer can do.
 - **Manual one-to-one send** (`POST /lists/:listId/leads/:leadId/send-email`): a confirmation, not a block. It answers 409 `{code: "pushed_to_smartlead", message}` unless the body has `confirmPushedToSmartlead: true`. The portal does not send that flag yet, so until PR-E a manual send to a pushed lead shows the message and sends nothing.
 
+- **Webhook auto-send** (`routes/webhooks.ts`): that block also runs for an EXISTING lead that resubmits a form (it is `isUpdated`), and that lead keeps its marker, so it skips with `autoSendStatus: "skipped_smartlead"` (a review caught that my first reading, "it only emails a brand-new lead", was wrong).
+- **Drip worker, read failure:** a failed read of the lead (not "no such lead") now throws, so the enrollment is neither sent nor advanced and is retried. Before, it carried on with no lead and skipped every per-lead check (do-not-contact included).
+
 ### Deliberately not changed
-- **Webhook auto-send** (`routes/webhooks.ts`): it only emails a lead created moments earlier by the forward-lead webhook, which cannot carry a marker, so a check there would be dead code.
 - **Manual reply** (`reply-email`): a reply to an inbound message is a conversation the person started; left alone.
-- **Emma `send_email_from_sender`**, and any send to a raw address: no lead in hand, so it cannot be covered (a documented limit; the design says so).
+- **Emma `send_email_from_sender`, the `email` tool and `/email` in `emmaApi.ts`**, and any send to a raw address: no lead in hand, so they cannot be covered without a lookup (a documented limit, tracker row 35). Emma's refusal text tells the agent not to reach the person another way.
 - Test sends to caller-supplied addresses, `sendAsSender` itself (it only sees an address) and `dripSequenceDb` (storage only).
-- Enrolment: leaving the enrolment paths alone is deliberate; the worker check is the one that closes the gap.
+- Enrolment: the worker check is the one that closes the gap (a lead can be pushed after it was enrolled).
+- **A drip step skipped while a lead is pushed is lost, not snoozed**: if the marker is released later the sequence continues with the next step (a follow-up to an email AgentWeb never sent). Chosen on purpose for v1; tracked.
+- The portal (separate repo) does not show `smartleadCount`/`skippedSmartlead` or offer the confirmation yet: PR-E.
 
 ### Tests
-`dripSequenceWorker.senderRouting.test.ts` (pushed and withdrawn skipped, released and plain sent, a later step advances), `crm.groupEmail.test.ts` (preview, prepare, send), `crm.routes.test.ts` (confirmation), `agentModeService.crmTools.test.ts` (Emma), `smartleadEligibility.test.ts` (a pushed lead is not do-not-contact). The RFC 8058 List-Unsubscribe test in `crm.groupEmail.test.ts` already fails on main (not from this change).
+`dripSequenceWorker.senderRouting.test.ts` (pushed and withdrawn skipped, released and plain sent, a later step advances, a failed lead read does not send), `webhooks.leadForwarding.test.ts` (auto-send skipped), `crm.groupEmail.test.ts` (preview, prepare, send), `crm.routes.test.ts` (confirmation), `agentModeService.crmTools.test.ts` (Emma), `smartleadEligibility.test.ts` (a pushed lead is not do-not-contact). The RFC 8058 List-Unsubscribe test in `crm.groupEmail.test.ts` already fails on main (not from this change).

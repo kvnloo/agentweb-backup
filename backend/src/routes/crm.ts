@@ -6532,7 +6532,7 @@ router.post('/lists/:listId/leads/:leadId/send-email', async (req: Request, res:
     if (isPushedToSmartlead(lead) && req.body?.confirmPushedToSmartlead !== true) {
       return res.status(409).json({
         code: 'pushed_to_smartlead',
-        message: "This contact is being emailed through your Smartlead campaign. Sending from AgentWeb as well means they get email from two places. Send anyway?",
+        message: "This contact is being emailed through your Smartlead campaign, so nothing was sent from AgentWeb (they would get email from two places). To send anyway, confirm it in the lead panel.",
       });
     }
 

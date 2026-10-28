@@ -2282,7 +2282,7 @@ export async function sendEmailToLead(listId: string, leadId: string, userId: st
       // ENG-673: a lead pushed to the customer's Smartlead campaign is emailed from there; AgentWeb does not also email it on the agent's say-so.
       const { isPushedToSmartlead } = await import('../../services/smartleadMarkers');
       if (isPushedToSmartlead(lead)) {
-        return { success: false, message: 'Lead is in a Smartlead campaign', error: "This lead is being emailed through the customer's Smartlead campaign, so AgentWeb does not also email it. If the customer really wants an email from AgentWeb, they can send it by hand from the lead's panel (it asks for confirmation) or release the lead from Smartlead first." };
+        return { success: false, message: 'Lead is in a Smartlead campaign', error: "This lead is being emailed through the customer's Smartlead campaign, so AgentWeb does not also email it. Do not try to reach this person another way: tell the user, and let them decide." };
       }
 
       if (!lead.emailDraft) {
