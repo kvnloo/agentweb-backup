@@ -7,13 +7,14 @@
  *
  * Listing and disconnecting use the generic /api/llm-connections routes (a hosted login is disconnected through the login host).
  * Gated per user by the provider's funding flag (the `*` wildcard is not honoured). The one-time code appears in one request body and
- * in no response and no log line; errors log a code only. A pending sign-in is in this process's memory: completing it on another
- * instance (or after a deploy) answers 409 login_not_found, meaning "start again".
+ * in no response and no log line; errors log a code only. `loginId` is a sealed token (hostedSignInToken.ts), so a sign-in can be completed by any
+ * instance and survives a deploy; 409 login_not_found now means expired, already used or cancelled, i.e. "start again".
  */
 import { Router, type Request, type Response } from "express";
 import { rateLimit } from "express-rate-limit";
 import { authenticateToken, type AuthenticatedRequest } from "../middleware/auth";
 import { getHostedSubscriptionService, HostedSubscriptionError, type HostedSubscriptionService } from "../services/funding/hostedSubscriptionService";
+import { MAX_SIGNIN_TOKEN_CHARS } from "../services/funding/hostedSignInToken";
 import type { Actor } from "../services/funding/llmConnectionService";
 
 function actorOf(req: Request): Actor {
@@ -64,7 +65,7 @@ export function createHostedSubscriptionsRouter(service: () => HostedSubscriptio
   router.post("/complete", async (req, res) => {
     try {
       const { loginId, code } = (req.body ?? {}) as { loginId?: unknown; code?: unknown };
-      if (typeof loginId !== "string" || loginId.length > 64 || typeof code !== "string" || code.length > 512) {
+      if (typeof loginId !== "string" || loginId.length > MAX_SIGNIN_TOKEN_CHARS || typeof code !== "string" || code.length > 512) {
         res.status(400).json({ error: "bad_request" });
         return;
       }
