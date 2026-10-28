@@ -13,7 +13,9 @@ import {
   type SmartleadPushRunDb,
 } from "./smartleadPushRunDb";
 import type { SmartleadAddLeadsResult, SmartleadCampaignDetail, SmartleadCampaignSummary, SmartleadEmailAccount, SmartleadLeadInput } from "./smartleadService";
-import { SmartleadApiError, scrubSmartleadSecrets } from "./smartleadService";
+import { SmartleadApiError, scrubSmartleadSecrets, type UnsubscribeOutcome } from "./smartleadService";
+import { listSmartleadMarkers } from "./smartleadMarkers";
+import { withdrawalSweep, type SweepResult } from "./smartleadWithdrawal";
 
 /**
  * The service behind the Smartlead push routes and the resumer (ENG-673): who may push, which key is used, starting a run, controlling it,
@@ -37,6 +39,8 @@ export interface SmartleadApi {
   getSequences(apiKey: string, campaignId: number): Promise<unknown[]>;
   getMailboxes(apiKey: string, campaignId: number): Promise<SmartleadEmailAccount[]>;
   addLeads(apiKey: string, campaignId: number, leads: SmartleadLeadInput[]): Promise<SmartleadAddLeadsResult>;
+  unsubscribeLead(apiKey: string, smartleadLeadId: string): Promise<UnsubscribeOutcome>;
+  findLeadId(apiKey: string, email: string): Promise<string | null>;
 }
 
 export interface PushServiceDeps {
@@ -70,6 +74,7 @@ const RESUMER_BATCH = 100;
 /** A run with no lock is only called an orphan once its lease lapsed by this much. */
 const ORPHAN_GRACE_MS = 30_000;
 const MAX_CONCURRENT_PREVIEWS = 3;
+const MAX_RELEASE_LEADS = 500;
 /** How long a consumed approval is remembered: longer than the token itself, so an expired token can never be claimed again. */
 const TOKEN_MEMORY_SECONDS = 2 * 60 * 60;
 
@@ -239,6 +244,59 @@ export class SmartleadPushService {
         }),
       };
     });
+  }
+
+  // ── releasing leads, and the withdrawal sweep
+
+  /**
+   * A list editor clears the Smartlead marker of leads, so AgentWeb's own senders may email them again (a mistaken push must not block a contact
+   * for ever). It changes nothing in Smartlead: a lead still in an ACTIVE campaign is then emailed from two places, and the dialog says so.
+   */
+  release(userId: string, body: Record<string, any>): Promise<Result<{ released: number; skipped: { notFound: number; nothingToRelease: number } }>> {
+    return this.guard(async () => {
+      const list = await this.ownList(userId, body.listId);
+      if (!list.ok) return list;
+      const ids = body.leadIds;
+      if (!Array.isArray(ids) || ids.length === 0 || ids.length > MAX_RELEASE_LEADS || ids.some((id: unknown) => typeof id !== "string" || !id || id.length > 200)) {
+        return fail(400, "bad_request", `Give between 1 and ${MAX_RELEASE_LEADS} lead ids.`);
+      }
+      const only = body.campaignId === undefined || body.campaignId === null ? undefined : Number(body.campaignId);
+      if (only !== undefined && (!Number.isInteger(only) || only <= 0)) return fail(400, "bad_request", "The campaign must be a positive whole number.");
+      const result = { released: 0, skipped: { notFound: 0, nothingToRelease: 0 } };
+      const at = this.deps.now().toISOString();
+      for (const leadId of ids as string[]) {
+        const lead = await this.deps.crm.readLeadConsistent(String(body.listId), leadId);
+        if (!lead) { result.skipped.notFound++; continue; }
+        const live = listSmartleadMarkers(lead).filter(m => (only === undefined || m.campaignId === only) && (m.marker.state === "pushed" || m.marker.state === "withdrawn"));
+        if (live.length === 0) { result.skipped.nothingToRelease++; continue; }
+        for (const m of live) await this.deps.crm.writeMarker(String(body.listId), leadId, m.key, { ...m.marker, state: "released", releasedAt: at, releasedBy: userId });
+        result.released++;
+      }
+      this.deps.log(`[SmartleadPush] released ${result.released} lead(s) in list=${body.listId} by=${userId}`);
+      return { ok: true, ...result };
+    });
+  }
+
+  /** The hourly withdrawal sweep (smartleadWithdrawal.ts). Runs whether or not pushing is switched on: stopping pushes must never stop opt-outs. Never throws. */
+  async sweepWithdrawals(): Promise<SweepResult | null> {
+    try {
+      return await withdrawalSweep({
+        db: this.deps.db,
+        resolveKey: (u, a) => this.deps.resolveKey(u, a),
+        reportFailure: (r, e) => this.deps.reportFailure(r, e),
+        readLeads: (l, a, n) => this.deps.crm.readLeads(l, a, n),
+        writeMarker: (l, id, k, m) => this.deps.crm.writeMarker(l, id, k, m),
+        smartlead: {
+          unsubscribe: (apiKey, id) => this.deps.smartlead.unsubscribeLead(apiKey, id),
+          findLeadId: (apiKey, email) => this.deps.smartlead.findLeadId(apiKey, email),
+        },
+        now: () => this.deps.now(),
+        log: line => this.deps.log(line),
+      });
+    } catch (error) {
+      this.deps.log(`[SmartleadWithdrawal] sweep error: ${scrubSmartleadSecrets(error instanceof Error ? error.message : String(error))}`);
+      return null;
+    }
   }
 
   // ── start

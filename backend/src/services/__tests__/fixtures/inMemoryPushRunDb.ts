@@ -144,6 +144,8 @@ export class InMemoryPushRunDb {
   async confirmStart(runId: string) { const r = this.runs.get(runId); if (r) delete r.startUnconfirmed; }
   async lockPointsAt(run: PushRun) { return this.locks.get(this.lockKey(run.listId, run.campaignId)) === run.runId; }
 
+  async listRunsSince(sinceIso: string, limit = 100) { return [...this.runs.values()].filter(r => r.createdAt >= sinceIso).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, limit).map(this.summary); }
+
   async claimToken(jti: string) { if (this.tokens.has(jti)) return false; this.tokens.set(jti, {}); return true; }
   async setTokenRun(jti: string, runId: string) { const t = this.tokens.get(jti); if (t) t.runId = runId; }
   async getTokenRun(jti: string) { return this.tokens.get(jti)?.runId ?? null; }

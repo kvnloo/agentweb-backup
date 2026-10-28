@@ -827,6 +827,19 @@ createTestAccount().then(async () => {
             .catch(e => console.error('[SmartleadPush] Resumer error:', e));
         }, 60 * 1000);
         console.log('[SmartleadPush] Resumer initialized — every minute (active only when SMARTLEAD_PUSH_ENABLED=true)');
+
+        // The withdrawal sweep: an opt-out recorded here must reach Smartlead. Hourly, and deliberately NOT behind the kill switch (stopping
+        // pushes must never stop opt-outs); it only has work when a push has ever run.
+        setTimeout(() => {
+          const sweep = () => {
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('SmartleadWithdrawalSweep', getSmartleadPushService().sweepWithdrawals())
+              .catch(e => console.error('[SmartleadWithdrawal] Sweep error:', e));
+          };
+          sweep();
+          setInterval(sweep, 60 * 60 * 1000);
+        }, 5 * 60 * 1000);
+        console.log('[SmartleadWithdrawal] Sweep initialized — hourly, first pass in 5 minutes');
       } catch (error) {
         console.error('[SmartleadPush] Failed to initialize the resumer:', error);
       }

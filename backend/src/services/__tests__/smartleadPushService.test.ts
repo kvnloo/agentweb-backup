@@ -47,7 +47,7 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
   });
   afterEach(async () => { await cleanup(); });
 
-  interface Env { svc: SmartleadPushService; deps: PushServiceDeps; sl: FakeSmartlead; leads: any[]; jobs: Promise<unknown>[]; logs: string[]; listId: string; flags: { enabled: boolean }; editors: Set<string> }
+  interface Env { svc: SmartleadPushService; deps: PushServiceDeps; sl: FakeSmartlead; unsub: jest.Mock; leads: any[]; jobs: Promise<unknown>[]; logs: string[]; listId: string; flags: { enabled: boolean }; editors: Set<string> }
 
   function env(opts: { leads?: any[]; maxConcurrentWorkers?: number; shareDb?: SmartleadPushRunDb; listId?: string; sl?: FakeSmartlead; leadsShared?: any[] } = {}): Env {
     const leads: any[] = opts.leads ?? Array.from({ length: 5 }, (_, i) => mkLead(i + 1));
@@ -55,6 +55,7 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
     const listId = opts.listId ?? `list_${ulid()}`;
     const jobs: Promise<unknown>[] = [];
     const logs: string[] = [];
+    const unsub = jest.fn(async (_k: string, _id: string): Promise<"ok" | "not_found" | "no_update"> => "ok");
     const flags = { enabled: true };
     const editors = new Set<string>();
     const key = (userId: string) => ({ ok: true as const, apiKey: `key-of-${userId}`, ownerUserId: userId, accountId: `smartlead-${userId}`, accountName: "SL" });
@@ -77,6 +78,8 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
         getSequences: async () => { if (!sl.sequences) throw new SmartleadApiError("boom", 500); return sl.sequences; },
         getMailboxes: async () => [{ id: 1, email: "a@x.com", dailyLimit: 30 }],
         addLeads: (_k, _c, x) => sl.addLeads(x),
+        unsubscribeLead: (k, id) => unsub(k, id),
+        findLeadId: async () => null,
       },
       secret: "svc-secret",
       enabled: () => flags.enabled,
@@ -86,7 +89,7 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
       log: line => { logs.push(line); },
       maxConcurrentWorkers: opts.maxConcurrentWorkers,
     };
-    return { svc: new SmartleadPushService(deps), deps, sl, leads, jobs, logs, listId, flags, editors };
+    return { svc: new SmartleadPushService(deps), deps, sl, unsub, leads, jobs, logs, listId, flags, editors };
   }
   const drain = async (e: Env) => { await Promise.all(e.jobs.splice(0)); };
 
@@ -516,6 +519,80 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
       release();
       for (const r of await Promise.all(running)) expect(r.ok).toBe(true);
       expect((await e.svc.preview("owner", { listId: e.listId, campaignId: CAMPAIGN })).ok).toBe(true);
+    });
+  });
+
+  describe("releasing leads (PR-D2)", () => {
+    const pushedAll = async (e: Env) => { await e.svc.start("owner", go((await approve(e)).token)); await drain(e); };
+
+    it("lets a list editor clear the markers of chosen leads (pushed or withdrawn), records who and when, and leaves the others alone", async () => {
+      const e = env();
+      await pushedAll(e);
+      e.leads[1].system.smartlead_77 = { ...e.leads[1].system.smartlead_77, state: "withdrawn" };
+      e.editors.add("editor");
+      const r = (await e.svc.release("editor", { listId: e.listId, leadIds: [e.leads[0].leadId, e.leads[1].leadId] })) as any;
+      expect(r).toMatchObject({ ok: true, released: 2, skipped: { notFound: 0, nothingToRelease: 0 } });
+      expect(e.leads[0].system.smartlead_77).toMatchObject({ state: "released", releasedBy: "editor", releasedAt: new Date(clock).toISOString() });
+      expect(isMarkedForCampaign(e.leads[0], CAMPAIGN)).toBe(false);
+      expect(e.leads[2].system.smartlead_77.state).toBe("pushed");
+    });
+
+    it("counts leads that do not exist and leads with nothing to release, and only touches the named campaign when one is given", async () => {
+      const e = env();
+      await pushedAll(e);
+      e.leads[3].system.smartlead_88 = { ...e.leads[3].system.smartlead_77 };
+      const r = (await e.svc.release("owner", { listId: e.listId, leadIds: ["nope", e.leads[3].leadId], campaignId: 88 })) as any;
+      expect(r).toMatchObject({ released: 1, skipped: { notFound: 1, nothingToRelease: 0 } });
+      expect(e.leads[3].system.smartlead_88.state).toBe("released");
+      expect(e.leads[3].system.smartlead_77.state).toBe("pushed"); // another campaign: untouched
+      const again = (await e.svc.release("owner", { listId: e.listId, leadIds: [e.leads[3].leadId], campaignId: 88 })) as any;
+      expect(again).toMatchObject({ released: 0, skipped: { nothingToRelease: 1 } });
+    });
+
+    it("needs edit access to the list, and rejects bad input", async () => {
+      const e = env();
+      await pushedAll(e);
+      expect(await e.svc.release("stranger", { listId: e.listId, leadIds: [e.leads[0].leadId] })).toMatchObject({ ok: false, status: 403 });
+      expect(isMarkedForCampaign(e.leads[0], CAMPAIGN)).toBe(true);
+      for (const bad of [{ leadIds: [] }, { leadIds: "x" }, { leadIds: [5] }, { leadIds: [""] }, { leadIds: Array.from({ length: 501 }, (_, i) => `l${i}`) }, { leadIds: ["a"], campaignId: 0 }, { leadIds: ["a"], campaignId: "x" }]) {
+        expect(await e.svc.release("owner", { listId: e.listId, ...bad })).toMatchObject({ ok: false, status: 400 });
+      }
+      expect(await e.svc.release("owner", { listId: "missing", leadIds: ["a"] })).toMatchObject({ ok: false, status: 404 });
+    });
+
+    it("works while pushing is switched off (releasing is how a contact gets unblocked)", async () => {
+      const e = env();
+      await pushedAll(e);
+      e.flags.enabled = false;
+      expect(((await e.svc.release("owner", { listId: e.listId, leadIds: [e.leads[0].leadId] })) as any).released).toBe(1);
+    });
+  });
+
+  describe("the withdrawal sweep through the service (PR-D2)", () => {
+    it("unsubscribes, in Smartlead, a pushed lead that opted out here, and marks it withdrawn; nothing else is touched", async () => {
+      const e = env();
+      await e.svc.start("owner", go((await approve(e)).token));
+      await drain(e);
+      e.leads[2].contactStatus = "do-not-contact";
+      const r = await e.svc.sweepWithdrawals();
+      expect(r).toMatchObject({ withdrawn: 1, failed: 0 });
+      expect(e.unsub).toHaveBeenCalledTimes(1);
+      expect(e.unsub).toHaveBeenCalledWith("key-of-owner", e.leads[2].system.smartlead_77.smartleadLeadId);
+      expect(e.leads[2].system.smartlead_77).toMatchObject({ state: "withdrawn" });
+      expect(e.leads[0].system.smartlead_77.state).toBe("pushed");
+    });
+
+    it("runs even when pushing is switched off, and never throws", async () => {
+      const e = env();
+      await e.svc.start("owner", go((await approve(e)).token));
+      await drain(e);
+      e.leads[0].contactStatus = "unsubscribed";
+      e.flags.enabled = false;
+      expect(await e.svc.sweepWithdrawals()).toMatchObject({ withdrawn: 1 });
+      const broken = new Proxy(db, { get: (t, k) => (k === "listRunsSince" ? async () => { throw new SmartleadPushRunStoreError("table_missing", "no table"); } : (t as any)[k]?.bind?.(t) ?? (t as any)[k]) });
+      (e.deps.db as any) = broken;
+      await expect(e.svc.sweepWithdrawals()).resolves.toBeNull();
+      expect(e.logs.join("\n")).toMatch(/sweep error/);
     });
   });
 
