@@ -144,6 +144,23 @@ describe('tool bridge against the real agentModeService and dispatcher (ENG-2109
     for (const name of current) expect(candidates).toContain(name);
   });
 
+  it('ENG-2113 relay: candidates assume only the skills the user is ENTITLED to (no catch-all without entitlement)', async () => {
+    const chatbot = require('../../chatbotService');
+    chatbot.chatbotDb.getChatSession = jest.fn().mockResolvedValue({ sessionId: 's1', messages: [], associatedSkills: [] });
+    const subs = require('../../subscriptionService');
+    const skills = require('../../skillService').skillService;
+    subs.getAllowedSkills.mockResolvedValueOnce(['skill-a']);
+    skills.getPublishedSkills.mockResolvedValueOnce([
+      { skillId: 'skill-a', name: 'A', description: 'a', toolNames: ['get_bridge_probe'] },
+      { skillId: 'skill-b', name: 'B', description: 'b', toolNames: ['launch_bridge_probe'] },
+    ]);
+    const executor = new EmmaToolBridgeExecutor();
+    executor.registerRun(RUN.runId, { llmModel: agentModeService.default_model, mockMode: false });
+    const candidates = (await executor.resolveCandidateTools(RUN)).map((t) => t.name);
+    expect(candidates).toContain('get_bridge_probe');
+    expect(candidates).not.toContain('launch_bridge_probe');
+  });
+
   it('ENG-2113 relay: a delegated (admin) run gets the admin tools among its candidates, as a real turn would', async () => {
     const chatbot = require('../../chatbotService');
     chatbot.chatbotDb.getChatSession = jest.fn().mockResolvedValue({ sessionId: 's1', messages: [], associatedSkills: [] });

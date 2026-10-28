@@ -391,8 +391,8 @@ export class RelayToolDispatcher {
       dropped++;
     }
     if (dropped > 0) content += `\n[${dropped} image${dropped === 1 ? "" : "s"} could not be attached (too large).]`;
-    // Text that escapes badly in JSON (control characters) can still be too large: halve it until the body fits.
-    while (size() > MAX_BODY_BYTES && content.length > 1_000) content = `${truncateUtf8(content, Math.floor(Buffer.byteLength(content, "utf8") / 2))}${TRUNCATED_NOTE}`;
+    // No further text loop is needed: 1 MB of text escapes to at most 6 MB of JSON (a control character becomes \uXXXX), inside the body cap once the
+    // images are gone; the worker's own `result_too_large` check is still handled by `shrink`.
     return { ...a, content, images: images?.length ? images : undefined };
   }
 
