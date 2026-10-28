@@ -25,6 +25,8 @@ export interface RelayManifest {
   /** Names offered from the start. */
   open: ReadonlySet<string>;
   skipped: Partial<Record<SkipReason, number>>;
+  /** Descriptions cut to the byte limit (the tool is offered, with less text than an AgentWeb turn shows). */
+  truncated: number;
 }
 
 const byteLen = (v: unknown): number => Buffer.byteLength(JSON.stringify(v), "utf8");
@@ -54,6 +56,7 @@ export function buildRelayManifest(open: BridgeTool[], candidates: BridgeTool[] 
   const skip = (why: SkipReason) => void (skipped[why] = (skipped[why] ?? 0) + 1);
   const seen = new Set<string>();
   const out: ToolDef[] = [];
+  let truncated = 0;
 
   const add = (tool: BridgeTool, locked: boolean) => {
     const name = tool?.name;
@@ -65,7 +68,10 @@ export function buildRelayManifest(open: BridgeTool[], candidates: BridgeTool[] 
     else return skip("schema_not_object");
     if (byteLen(schema) > TOOL_LIMITS.maxSchemaBytes) return skip("schema_too_large");
     seen.add(name);
-    out.push({ name, description: truncateUtf8(typeof tool.description === "string" ? tool.description : "", TOOL_LIMITS.maxDescriptionBytes), inputSchema: schema, ...(locked ? { locked: true } : {}) });
+    const full = typeof tool.description === "string" ? tool.description : "";
+    const description = truncateUtf8(full, TOOL_LIMITS.maxDescriptionBytes);
+    if (description !== full) truncated++;
+    out.push({ name, description, inputSchema: schema, ...(locked ? { locked: true } : {}) });
   };
 
   for (const t of open) add(t, false);
@@ -98,7 +104,7 @@ export function buildRelayManifest(open: BridgeTool[], candidates: BridgeTool[] 
 
   const locked = new Set(out.filter((t) => t.locked).map((t) => t.name));
   const openNames = new Set(out.filter((t) => !t.locked).map((t) => t.name));
-  return { tools: out, locked, open: openNames, skipped };
+  return { tools: out, locked, open: openNames, skipped, truncated };
 }
 
 /** Checks a finished manifest with the protocol's own schema (the host would refuse the whole turn otherwise). Returns the failing code, or undefined. */

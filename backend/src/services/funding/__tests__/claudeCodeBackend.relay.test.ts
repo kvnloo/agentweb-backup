@@ -9,7 +9,9 @@ import { join } from 'path';
 import type { ProviderEvent } from '../../../loginHost/adapter';
 import { startHostServer, type HostServerHandle } from '../../../loginHost/server';
 import { makeRig, type Rig } from '../../../loginHost/__tests__/helpers';
-import { ClaudeCodeBackend, relayAvailable, type ClaudeBackendDeps, type ClaudeTurnParams } from '../claudeCodeBackend';
+import { ClaudeCodeBackend, chooseToolTransport, relayAvailable, type ClaudeBackendDeps, type ClaudeTurnParams } from '../claudeCodeBackend';
+import { turnRanNoTools } from '../claudeRouteErrors';
+import * as relayManifestModule from '../relayManifest';
 import { ClaudeRunRegistry } from '../claudeRunRegistry';
 import { LoginHostClient, UnixSocketTransport } from '../loginHostClient';
 import { runHostTurn } from '../loginHostTurn';
@@ -70,13 +72,14 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
       candidates?: BridgeTool[];
       now?: () => number;
       softLead?: number;
+      confirm?: string[];
     } = {},
   ) {
     const executions: Array<{ name: string; args: Record<string, unknown> }> = [];
     const persisted: any[][] = [];
     let installed = false;
     const live = { value: true };
-    const base: BridgeTool[] = over.tools ?? [{ name: 'save_note', description: 'Save', inputSchema: { type: 'object', properties: { note: { type: 'string' } } } }, { name: 'search' }, { name: 'slow_write' }, { name: 'install_skills' }];
+    const base: BridgeTool[] = over.tools ?? [{ name: 'save_note', description: 'Save', inputSchema: { type: 'object', properties: { note: { type: 'string' } } } }, { name: 'search' }, { name: 'slow_write' }, { name: 'install_skills' }, { name: 'send_email' }];
     const toolDeps = {
       resolveTools: async () => [...base, ...(installed ? [{ name: 'late_tool' }] : [])],
       isReadOnly: (name: string) => name === 'search',
@@ -85,7 +88,7 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
         executions.push({ name: c.name, args: c.args });
         if (over.holdMs?.[c.name]) await over.holdMs[c.name];
         if (c.name === 'install_skills') installed = true;
-        return { content: `${c.name} receipt`, isError: false, requiresConfirmation: false, toolsChanged: c.name === 'install_skills', ...(over.images?.[c.name] ? { images: over.images[c.name] } : {}) };
+        return { content: `${c.name} receipt`, isError: false, requiresConfirmation: over.confirm?.includes(c.name) === true, toolsChanged: c.name === 'install_skills', ...(over.images?.[c.name] ? { images: over.images[c.name] } : {}) };
       },
       registerRun: () => undefined,
       beginTurn: () => undefined,
@@ -125,18 +128,28 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
 
   const answers = () => rig.script.answers;
 
-  it('chooses the relay iff the worker reports protocol >= 4 and the version check says match', () => {
+  it('chooses the transport fail-closed: relay for a matching 4+ worker, legacy only for a KNOWN older worker, refuse for everything else', () => {
     const base = setup().deps;
-    const d = (protocol: number | undefined, status: 'match' | 'mismatch' | 'unknown') => ({ ...base, relay: { workerProtocol: () => protocol, protocolStatus: () => status } });
+    const fns = { listTools: async () => [], callTool: async () => ({ content: '', isError: false }) };
+    const d = (protocol: number | undefined, status: 'match' | 'mismatch' | 'unknown', bridge: Record<string, unknown> = fns) =>
+      ({ relay: { workerProtocol: () => protocol, protocolStatus: () => status }, bridge: { ...bridge } }) as unknown as Pick<ClaudeBackendDeps, 'relay' | 'bridge'>;
+    expect(chooseToolTransport(d(4, 'match'))).toEqual({ kind: 'relay' });
+    expect(chooseToolTransport(d(5, 'match'))).toEqual({ kind: 'relay' });
+    expect(chooseToolTransport(d(3, 'match'))).toEqual({ kind: 'legacy' });
+    expect(chooseToolTransport(d(2, 'match'))).toEqual({ kind: 'legacy' });
+    expect(chooseToolTransport(d(undefined, 'unknown'))).toEqual({ kind: 'refuse', cause: 'protocol_unknown' });
+    expect(chooseToolTransport(d(4, 'unknown'))).toEqual({ kind: 'refuse', cause: 'protocol_unknown' });
+    expect(chooseToolTransport(d(3, 'unknown'))).toEqual({ kind: 'refuse', cause: 'protocol_unknown' });
+    expect(chooseToolTransport(d(4, 'mismatch'))).toEqual({ kind: 'refuse', cause: 'protocol_mismatch' });
+    expect(chooseToolTransport(d(9, 'mismatch'))).toEqual({ kind: 'refuse', cause: 'protocol_mismatch' });
+    expect(chooseToolTransport(d(undefined, 'match'))).toEqual({ kind: 'refuse', cause: 'protocol_unknown' });
+    // a 4+ worker whose bridge cannot be called in process is refused, never sent to the HTTP bridge (each method checked on its own)
+    expect(chooseToolTransport(d(4, 'match', { listTools: fns.listTools }))).toEqual({ kind: 'refuse', cause: 'bridge_not_in_process' });
+    expect(chooseToolTransport(d(4, 'match', { callTool: fns.callTool }))).toEqual({ kind: 'refuse', cause: 'bridge_not_in_process' });
+    // without the relay dependency (tests, tools; production always has it) the legacy path is kept
+    expect(chooseToolTransport({ ...base, relay: undefined })).toEqual({ kind: 'legacy' });
     expect(relayAvailable(d(4, 'match'))).toBe(true);
-    expect(relayAvailable(d(5, 'match'))).toBe(true);
     expect(relayAvailable(d(3, 'match'))).toBe(false);
-    expect(relayAvailable(d(2, 'match'))).toBe(false);
-    expect(relayAvailable(d(undefined, 'unknown'))).toBe(false);
-    expect(relayAvailable(d(4, 'mismatch'))).toBe(false);
-    expect(relayAvailable(d(4, 'unknown'))).toBe(false);
-    expect(relayAvailable({ ...base, relay: undefined })).toBe(false);
-    expect(relayAvailable({ ...base, relay: d(4, 'match').relay, bridge: { ...base.bridge, callTool: undefined } })).toBe(false);
   });
 
   it('a full relay turn: the manifest goes to the worker instead of a bridge token, a tool call runs through the bridge, the result goes back, and the chat gets the pair', async () => {
@@ -151,7 +164,7 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
 
     const req = spy.mock.calls[0][0] as any;
     expect(req.bridgeToken).toBeUndefined();
-    expect(req.tools.map((x: any) => x.name)).toEqual(['save_note', 'search', 'slow_write', 'install_skills']);
+    expect(req.tools.map((x: any) => x.name)).toEqual(['save_note', 'search', 'slow_write', 'install_skills', 'send_email']);
     expect(req.turnId).toBe('claude-relay-1');
     expect(req.idempotencyKey).toBe('claude-relay-1-t1');
     const input = rig.script.turnInputs[0];
@@ -336,10 +349,17 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
       { type: 'tool-result', operationId: 'toolu_1', ok: true },
       result('text only'),
     ];
-    const r = await t.backend().run(t.params());
+    const noteUse = jest.spyOn(t.adapter, 'noteToolUse');
+    const noteResult = jest.spyOn(t.adapter, 'noteToolResult');
+    const statuses: string[] = [];
+    const r = await t.backend().run(t.params({ onProgress: (p) => void statuses.push(p.status) }));
     expect(t.executions).toEqual([]);
     expect(answers()).toEqual([]);
     expect(r.content).toBe('text only');
+    // they feed no bridge state (the stream ids are not operation ids) and report no tool progress
+    expect(noteUse).not.toHaveBeenCalled();
+    expect(noteResult).not.toHaveBeenCalled();
+    expect(statuses).toEqual(['thinking']);
   });
 
   it('double-execution conformance: a call that appears BOTH as a stream tool-use and as a relay tool-call executes exactly once', async () => {
@@ -398,7 +418,7 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
     expect((spy.mock.calls[0][0] as any).tools.map((x: any) => x.name)).toEqual(['save_note', 'install_skills']);
     expect(t.executions).toEqual([]);
     const logged = (console.error as jest.Mock).mock.calls.map((c) => JSON.stringify(c)).join('\n');
-    expect(logged).toContain('skipped tools');
+    expect(logged).toContain('relay_manifest_cut');
     expect(logged).not.toContain('SECRET-DESC');
   });
 
@@ -422,14 +442,12 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
     expect(answers()[1].answer).toMatchObject({ ok: false, content: SOFT_DEADLINE_MESSAGE });
   });
 
-  describe('dual mode: the HTTP bridge path is unchanged', () => {
+  describe('dual mode: the HTTP bridge path is unchanged for a KNOWN older worker', () => {
     it.each([
-      ['a protocol 3 worker', 3, 'match'],
-      ['a protocol 2 worker', 2, 'match'],
-      ['a worker that has not answered host.info yet', undefined, 'unknown'],
-      ['a worker whose version check says mismatch', 4, 'mismatch'],
-    ] as const)('%s: legacy request (bridgeToken, no tools), stream tool events feed the bridge as before, nothing is relayed', async (_label, protocol, status) => {
-      const t = setup({ protocol, status });
+      ['a protocol 3 worker', 3],
+      ['a protocol 2 worker', 2],
+    ] as const)('%s: legacy request (bridgeToken, no tools), stream tool events feed the bridge as before, nothing is relayed', async (_label, protocol) => {
+      const t = setup({ protocol, status: 'match' });
       rig.script.turnEvents = [{ type: 'tool-use', operationId: 'tc-1', name: 'mcp__emma__save_note', input: { n: 1 } }, { type: 'tool-result', operationId: 'tc-1', ok: true }, result('fine')];
       const spy = jest.spyOn(client, 'turnRun');
       const noteUse = jest.spyOn(t.adapter, 'noteToolUse');
@@ -446,15 +464,139 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
       expect(listTools).not.toHaveBeenCalled();
       expect(r.content).toBe('fine');
     });
+  });
 
-    it('a relay-capable worker with no tool the relay can carry falls back to the HTTP bridge for that turn', async () => {
+  describe('fail closed (B3): never the zero-tool HTTP bridge on a worker that is, or may be, relay-capable', () => {
+    it.each([
+      ['the version check has not answered yet (first turn after a start)', undefined, 'unknown'],
+      ['a failed recheck reset the status', 4, 'unknown'],
+      ['the version check says mismatch', 4, 'mismatch'],
+    ] as const)('%s: typed retryable stop, nothing opened, known to have run no tool', async (_label, protocol, status) => {
+      const t = setup({ protocol, status });
+      const spy = jest.spyOn(client, 'turnRun');
+      const open = jest.spyOn(t.adapter, 'openRun');
+      const err: any = await t.backend().run(t.params()).catch((e) => e);
+      expect(err.code).toBe('host_unavailable');
+      expect(err.retryable).toBe(true);
+      expect(err.offerAgentWebCredits).toBe(true);
+      expect(turnRanNoTools(err)).toBe(true);
+      expect(spy).not.toHaveBeenCalled();
+      expect(open).not.toHaveBeenCalled();
+      expect(t.registry.size).toBe(0);
+    });
+
+    it('a relay-capable worker with no tool the relay can carry: typed retryable stop, known to have run no tool, no HTTP-bridge turn', async () => {
       const t = setup({ tools: [{ name: 'Bad-Name' }] });
       rig.script.turnEvents = [result('fine')];
       const spy = jest.spyOn(client, 'turnRun');
-      await t.backend().run(t.params());
-      expect((spy.mock.calls[0][0] as any).tools).toBeUndefined();
-      expect(typeof (spy.mock.calls[0][0] as any).bridgeToken).toBe('string');
+      const err: any = await t.backend().run(t.params()).catch((e) => e);
+      expect(err.code).toBe('turn_failed');
+      expect(err.retryable).toBe(true);
+      expect(turnRanNoTools(err)).toBe(true);
+      expect(spy).not.toHaveBeenCalled();
+      expect(t.registry.size).toBe(0);
     });
+
+    it('a finished manifest the protocol schema would refuse is a typed stop before the worker is asked', async () => {
+      const t = setup();
+      jest.spyOn(relayManifestModule, 'buildRelayManifest').mockReturnValue({ tools: [{ name: 'BAD', description: '', inputSchema: { type: 'object' } }], open: new Set(['BAD']), locked: new Set(), skipped: {}, truncated: 0 });
+      const spy = jest.spyOn(client, 'turnRun');
+      const err: any = await t.backend().run(t.params()).catch((e) => e);
+      expect(err.code).toBe('turn_failed');
+      expect(turnRanNoTools(err)).toBe(true);
+      expect(spy).not.toHaveBeenCalled();
+    });
+  });
+
+  it('S1: a tool that finishes after the settle window but before the drain ends is persisted WITH the result-lost note', async () => {
+    const slow = gate();
+    const t = setup({ holdMs: { slow_write: slow.wait } });
+    rig.script.turnEvents = [call('op-1', 'slow_write'), result('answered early')];
+    const run = t.backend().run(t.params());
+    await sleep(700); // past the 600 ms settle, inside the 600 ms drain
+    slow.open();
+    const r = await run;
+    const tool = r.responseMessages.find((m) => m.role === 'tool');
+    expect(tool?.content).toBe(`slow_write receipt\n${RESULT_LOST_NOTE}`);
+  });
+
+  it('SF1 exploit: after a halted preview is answered, a later call reusing its message id is refused (end to end through the real host)', async () => {
+    const t = setup({ confirm: ['send_email'] });
+    const g = gate();
+    rig.script.turnEvents = [call('op-1', 'send_email', { to: 'x' }, 'msg-1'), { wait: g.wait }, call('op-2', 'save_note', { note: 'later' }, 'msg-1'), { wait: gate().wait }, result('x')];
+    const run = t.backend().run(t.params());
+    await waitFor(() => answers().length === 1);
+    g.open();
+    await waitFor(() => answers().length === 2);
+    expect(t.executions.map((e) => e.name)).toEqual(['send_email']);
+    expect(answers()[1].answer).toMatchObject({ ok: false });
+    t.registry.cancel('s1');
+    await run;
+  });
+
+  it('a delivered result is persisted WITHOUT the note', async () => {
+    const t = setup();
+    const g = gate();
+    rig.script.turnEvents = [call('op-1', 'save_note'), { wait: g.wait }, result('ok')];
+    const run = t.backend().run(t.params());
+    await waitFor(() => answers().length === 1);
+    g.open();
+    const r = await run;
+    expect(r.responseMessages[1].content).toBe('save_note receipt');
+  });
+
+  it('the backend Stop check stops the next relayed call even when closing the bridge session failed', async () => {
+    const t = setup();
+    jest.spyOn(t.adapter, 'cancelSession').mockImplementation(() => {
+      throw new Error('bridge cancel failed');
+    });
+    // A scripted stream (no host turn to interrupt): the Stop lands between two relayed calls.
+    t.deps.runHostTurn = async (_c, _req, opts) => {
+      t.registry.cancel('s1');
+      await opts.onEvent?.(call('op-2', 'save_note', { n: 2 }));
+      await sleep(30);
+      return { kind: 'completed', result: { type: 'result', ok: false, text: '', aborted: 'interrupted' } };
+    };
+    const r = await t.backend().run(t.params());
+    expect(r.cancelled).toBe(true);
+    expect(t.executions).toEqual([]);
+  });
+
+  it('SF2: a worker flooding operations trips the limit, the turn is interrupted, nothing beyond the limit runs', async () => {
+    const slow = gate();
+    const t = setup({ holdMs: { slow_write: slow.wait } });
+    rig.script.turnEvents = [...Array.from({ length: 40 }, (_, i) => call(`op-${i}`, 'slow_write', { i })), { wait: gate().wait }, result('x')];
+    const run = t.backend().run(t.params());
+    await waitFor(() => rig.script.interruptedTurns.length === 1);
+    slow.open();
+    const err: any = await run.catch((e) => e);
+    expect(err.code).toBe('turn_failed'); // the interrupted turn is a typed stop; what ran is persisted
+    expect(t.executions.length).toBeLessThanOrEqual(16);
+  });
+
+  it('a repeated operation id is counted once', async () => {
+    const t = setup();
+    const g = gate();
+    rig.script.turnEvents = [call('op-1', 'save_note'), call('op-1', 'save_note'), call('op-1', 'save_note'), { wait: g.wait }, result('x')];
+    const iterations: number[] = [];
+    const run = t.backend().run(t.params({ onProgress: (p) => void iterations.push(p.iteration) }));
+    await waitFor(() => answers().length === 1);
+    g.open();
+    await run;
+    expect(Math.max(...iterations)).toBe(1);
+  });
+
+  it('no progress callback fires after run() returned', async () => {
+    const slow = gate();
+    const t = setup({ holdMs: { slow_write: slow.wait } });
+    t.deps.drainTimeoutMs = 30;
+    rig.script.turnEvents = [call('op-1', 'slow_write'), result('early')];
+    const statuses: string[] = [];
+    await t.backend().run(t.params({ onProgress: (p) => void statuses.push(p.status) }));
+    const n = statuses.length;
+    slow.open();
+    await sleep(50);
+    expect(statuses.length).toBe(n);
   });
 
   it('logs no tool argument, result or image on the relay path (success, lost result and refusal)', async () => {
