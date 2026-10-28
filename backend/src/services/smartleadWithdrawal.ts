@@ -170,6 +170,8 @@ const needsWithdrawal = (lead: Lead, campaignId: number): SmartleadMarker | unde
 const needsAddressSync = (lead: Lead, campaignId: number): SmartleadMarker | undefined => {
   const marker = getSmartleadMarker(lead, campaignId);
   if (!marker || (marker.state !== "pushed" && marker.state !== "released") || !marker.smartleadLeadId || !marker.email) return undefined;
+  // An opted-out lead is STOPPED, never moved: moving it to a new address first would leave Smartlead emailing that address if the stop then failed.
+  if (isDoNotContact(lead)) return undefined;
   const email = typeof lead.email === "string" ? lead.email.trim().toLowerCase() : "";
   return isAcceptableEmail(email) && email !== marker.email ? marker : undefined;
 };
@@ -231,11 +233,9 @@ async function sweepTarget(
     for (const { leadId } of ids.slice(0, cap)) {
       if (hardStop) return;
       let kind: Outcome["kind"];
-      let quiet = false;
       try {
         const outcome = await attempt(leadId);
         kind = outcome.kind;
-        quiet = outcome.kind === "failed" && !!outcome.quiet;
         if (outcome.kind === "failed") {
           noteFailure(listId, leadId, deps.now().getTime());
           result.failed++;
@@ -261,13 +261,14 @@ async function sweepTarget(
         }
         if (status === 429) { hardStop = true; return; }
       }
-      // Only real trouble counts towards the outage stop: a quiet failure (Smartlead refusing an address) is a per-lead answer, not an outage.
-      consecutiveFailures = kind === "failed" && !quiet ? consecutiveFailures + 1 : kind === "skipped" || quiet ? consecutiveFailures : 0;
+      // Every failure counts, refused addresses too: Smartlead answers a refusal and an outage alike with HTTP 500, so ten in a row ends the
+      // edits for this pass (the opt-outs already ran first, and leads that failed are tried last next time, so others get their turn).
+      consecutiveFailures = kind === "failed" ? consecutiveFailures + 1 : kind === "skipped" ? consecutiveFailures : 0;
       if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) return;
     }
   };
 
-  // PHASE 1: push edited addresses to Smartlead FIRST. Update Lead changes the address on the same lead id, so the pushed (old) address stops
+  // Push edited addresses to Smartlead FIRST. Update Lead changes the address on the same lead id, so the pushed (old) address stops
   // being emailed, the stored id belongs to the CURRENT address again, and an opt-out below can use it safely.
   const syncOne = async (leadId: string): Promise<Outcome> => {
     const lead = await deps.readLeadConsistent(listId, leadId);
@@ -280,7 +281,16 @@ async function sweepTarget(
       return { kind: "synced" };
     }
     if (outcome === "not_found") {
-      // The lead is no longer in the campaign (the customer removed it): nothing live to correct. Remember the new address so this stops being retried.
+      // The stored id is gone. The customer may have deleted and re-imported the lead (a NEW id, still at the pushed address and still emailed):
+      // look the pushed address up before deciding there is nothing live to correct.
+      const current = await deps.smartlead.findLeadId(resolved.apiKey, marker.email!);
+      if (current) {
+        const again = await deps.smartlead.updateLeadEmail(resolved.apiKey, campaignId, current, email);
+        if (again !== "ok") return { kind: "failed", why: "its pushed address is still in Smartlead under another lead id and the edited address could not be applied; will retry" };
+        await deps.writeMarker(listId, leadId, markerKey, { ...marker, email, smartleadLeadId: current });
+        return { kind: "synced" };
+      }
+      // Neither the id nor the pushed address is in Smartlead: nothing live to correct. Remember the new address so this stops being retried.
       await deps.writeMarker(listId, leadId, markerKey, { ...marker, email });
       return { kind: "skipped" };
     }
@@ -288,7 +298,7 @@ async function sweepTarget(
     return { kind: "failed", why: "Smartlead changed nothing for the edited address; will retry" };
   };
 
-  // PHASE 2: stop opted-out leads.
+  // Stop opted-out leads.
   const withdrawOne = async (leadId: string): Promise<Outcome> => {
     // Decide on a CONSISTENT read taken now: the unsubscribe cannot be undone, and the page read can be stale (a lead re-subscribed, or
     // already withdrawn, in the meantime). A failed read throws and is a failure like any other, not a reason to abandon the list.
@@ -343,7 +353,8 @@ async function sweepTarget(
     return withdrawn();
   };
 
-  await runAll(drifted, syncOne);
+  // Opt-outs come FIRST: a rate limit or a long backlog of address edits must never delay stopping somebody who said stop.
   await runAll(found, withdrawOne);
+  await runAll(drifted, syncOne);
   return result;
 }

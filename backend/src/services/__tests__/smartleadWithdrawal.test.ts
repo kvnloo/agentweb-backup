@@ -413,12 +413,19 @@ describe("withdrawalSweep (ENG-673)", () => {
       expect(e.deps.smartlead.campaignVisible).not.toHaveBeenCalled();
     });
 
-    it("syncs first and then unsubscribes by the stored id when the lead is edited AND opted out: the id now belongs to the new address", async () => {
+    it("an opted-out lead is STOPPED by its stored id and never moved to the new address first", async () => {
       const e = env({ leads: [edited(1, "fixed@example.com", optedOut)] });
-      expect(await withdrawalSweep(e.deps)).toMatchObject({ synced: 1, withdrawn: 1, failed: 0 });
-      expect(e.upd.mock.invocationCallOrder[0]).toBeLessThan(e.unsub.mock.invocationCallOrder[0]);
+      e.find.mockResolvedValue(null);
+      expect(await withdrawalSweep(e.deps)).toMatchObject({ synced: 0, withdrawn: 1, failed: 0 });
+      expect(e.upd).not.toHaveBeenCalled();
       expect(e.unsub.mock.calls.map(c => c[1])).toEqual(["9001"]);
-      expect(e.find).not.toHaveBeenCalled();
+    });
+
+    it("when the stop fails for an edited, opted-out lead the pushed address is NOT moved to the new one", async () => {
+      const e = env({ leads: [edited(1, "fixed@example.com", optedOut)] });
+      e.unsub.mockResolvedValue("no_update");
+      expect(await withdrawalSweep(e.deps)).toMatchObject({ synced: 0, withdrawn: 0, failed: 1 });
+      expect(e.upd).not.toHaveBeenCalled();
     });
 
     it("stops the pushed address AND the lead that has the new address when Smartlead refuses the change (the new address is already another lead)", async () => {
@@ -448,29 +455,57 @@ describe("withdrawalSweep (ENG-673)", () => {
       expect(e.logs.filter(l => /Smartlead refused the new one/.test(l))).toHaveLength(2);
     });
 
-    it("refused address changes do not count towards the outage stop and never block the opt-outs behind them", async () => {
+    it("ten refused address changes in a row end the edits for this pass (a refusal and an outage both answer 500), after the opt-outs have run", async () => {
       const drifted = Array.from({ length: 15 }, (_, i) => edited(i + 1, `taken${i}@example.com`));
       const e = env({ leads: [...drifted, lead(100, optedOut)], update: () => "rejected" });
       const r = await withdrawalSweep(e.deps);
-      expect(r).toMatchObject({ failed: 15, withdrawn: 1 });
-      expect(e.upd).toHaveBeenCalledTimes(15);
+      expect(r).toMatchObject({ failed: 10, withdrawn: 1 });
+      expect(e.upd).toHaveBeenCalledTimes(10);
     });
 
-    it("a lead the customer removed from the campaign (404) stops being retried: the marker takes the new address, no failure", async () => {
+    it("a 404 on the stored id with the pushed address NOT in Smartlead: nothing live to correct, the marker takes the new address, no failure", async () => {
       const e = env({ leads: [edited(1, "new@example.com")], update: () => "not_found" });
+      e.find.mockResolvedValue(null);
       expect(await withdrawalSweep(e.deps)).toMatchObject({ synced: 0, failed: 0 });
+      expect(e.find).toHaveBeenCalledWith("KEY", "p1@example.com");
       expect(e.leads[0].system.smartlead_77.email).toBe("new@example.com");
       await withdrawalSweep(e.deps);
       expect(e.upd).toHaveBeenCalledTimes(1);
     });
 
-    it("counts 'Smartlead changed nothing' as a failure and a rate limit as a stop for the whole list (the opt-outs wait for the next pass)", async () => {
-      const a = env({ leads: [edited(1, "x@example.com")], update: () => "no_update" });
-      expect(await withdrawalSweep(a.deps)).toMatchObject({ synced: 0, failed: 1 });
-      const b = env({ leads: [edited(1, "x@example.com"), lead(2, optedOut)] });
-      b.upd.mockRejectedValueOnce(new SmartleadApiError("slow", 429));
-      expect(await withdrawalSweep(b.deps)).toMatchObject({ failed: 1, withdrawn: 0 });
-      expect(b.unsub).not.toHaveBeenCalled();
+    it("a 404 because the customer re-imported the lead (new id, pushed address still live): the NEW id gets the edited address and the marker follows it", async () => {
+      const e = env({ leads: [edited(1, "new@example.com")], update: id => (id === "9001" ? "not_found" : "ok") });
+      e.find.mockResolvedValue("8123");
+      expect(await withdrawalSweep(e.deps)).toMatchObject({ synced: 1, failed: 0 });
+      expect(e.upd.mock.calls.map(c => c[2])).toEqual(["9001", "8123"]);
+      expect(e.leads[0].system.smartlead_77).toMatchObject({ email: "new@example.com", smartleadLeadId: "8123" });
+    });
+
+    it("a re-imported lead whose edited address cannot be applied stays OPEN (the pushed address is still live), marker untouched", async () => {
+      const e = env({ leads: [edited(1, "new@example.com")], update: id => (id === "9001" ? "not_found" : "rejected") });
+      e.find.mockResolvedValue("8123");
+      expect(await withdrawalSweep(e.deps)).toMatchObject({ synced: 0, failed: 1 });
+      expect(e.leads[0].system.smartlead_77).toMatchObject({ email: "p1@example.com", smartleadLeadId: "9001" });
+    });
+
+    it("'Smartlead changed nothing' on an address change is a failure", async () => {
+      const e = env({ leads: [edited(1, "x@example.com")], update: () => "no_update" });
+      expect(await withdrawalSweep(e.deps)).toMatchObject({ synced: 0, failed: 1 });
+    });
+
+    it("opt-outs are handled BEFORE address edits, so a rate limit during the edits never leaves somebody who said stop emailed", async () => {
+      const e = env({ leads: [edited(1, "x@example.com"), lead(2, optedOut), lead(3, optedOut)] });
+      e.upd.mockRejectedValue(new SmartleadApiError("slow", 429));
+      expect(await withdrawalSweep(e.deps)).toMatchObject({ withdrawn: 2, synced: 0, failed: 1 });
+      expect(e.unsub).toHaveBeenCalledTimes(2);
+      expect(e.upd).toHaveBeenCalledTimes(1);
+    });
+
+    it("a rate limit while stopping leads leaves the address edits for the next pass", async () => {
+      const e = env({ leads: [lead(1, optedOut), edited(2, "x@example.com")] });
+      e.unsub.mockRejectedValue(new SmartleadApiError("slow", 429));
+      expect(await withdrawalSweep(e.deps)).toMatchObject({ withdrawn: 0, synced: 0 });
+      expect(e.upd).not.toHaveBeenCalled();
     });
 
     it("does not sync with a key that cannot see the campaign", async () => {
