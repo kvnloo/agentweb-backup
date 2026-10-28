@@ -12,6 +12,7 @@ import {
 import {
   __configureSmartleadClient,
   addLeadsToCampaign,
+  findLeadIdByEmail,
   getCampaign,
   getCampaignEmailAccounts,
   getCampaignSequences,
@@ -22,6 +23,7 @@ import {
   SmartleadApiError,
   SmartleadUnexpectedResponseError,
   smartleadRequest,
+  unsubscribeLeadGlobally,
 } from "../smartleadService";
 
 jest.mock("axios");
@@ -316,6 +318,47 @@ describe("smartleadService slice 2 client (ENG-673)", () => {
       await expect(getCampaign(KEY, 0)).rejects.toBeInstanceOf(SmartleadApiError);
       await expect(getCampaignSequences(KEY, 1.5)).rejects.toBeInstanceOf(SmartleadApiError);
       expect(mockedAxios.request).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("unsubscribeLeadGlobally and findLeadIdByEmail (live shapes, 2026-10-28)", () => {
+    it("unsubscribes through the account-wide path and reads ok / no-update", async () => {
+      mockedAxios.request.mockResolvedValueOnce({ data: { ok: true } } as never);
+      await expect(unsubscribeLeadGlobally(KEY, "4834410135")).resolves.toBe("ok");
+      expect(mockedAxios.request.mock.calls[0][0]).toMatchObject({ method: "POST" });
+      expect(mockedAxios.request.mock.calls[0][0].url).toMatch(/\/leads\/4834410135\/unsubscribe$/);
+      expect(mockedAxios.request.mock.calls[0][0].url).not.toMatch(/campaigns/);
+      mockedAxios.request.mockResolvedValueOnce({ data: { ok: false } } as never);
+      await expect(unsubscribeLeadGlobally(KEY, 7)).resolves.toBe("no_update");
+    });
+
+    it("reads a 404 as a lead that is gone, and refuses any other shape or error", async () => {
+      mockedAxios.request.mockRejectedValueOnce(Object.assign(new Error("Request failed with status code 404"), { response: { status: 404, headers: {} } }));
+      await expect(unsubscribeLeadGlobally(KEY, 7)).resolves.toBe("not_found");
+      mockedAxios.request.mockResolvedValueOnce({ data: { fine: 1 } } as never);
+      await expect(unsubscribeLeadGlobally(KEY, 7)).rejects.toBeInstanceOf(SmartleadUnexpectedResponseError);
+      mockedAxios.request.mockResolvedValueOnce({ data: "" } as never);
+      await expect(unsubscribeLeadGlobally(KEY, 7)).rejects.toBeInstanceOf(SmartleadUnexpectedResponseError);
+      mockedAxios.request.mockRejectedValueOnce(Object.assign(new Error("Request failed with status code 401"), { response: { status: 401, headers: {} } }));
+      await expect(unsubscribeLeadGlobally(KEY, 7)).rejects.toMatchObject({ status: 401 });
+    });
+
+    it("refuses a bad lead id before any request", async () => {
+      for (const bad of ["abc", "0", "-3", "1.5", "", "../campaigns/1", "99999999999999999"]) await expect(unsubscribeLeadGlobally(KEY, bad)).rejects.toBeInstanceOf(SmartleadApiError);
+      expect(mockedAxios.request).not.toHaveBeenCalled();
+    });
+
+    it("finds a lead's id by email; an empty object is 'not found'; a different lead or no id is an error", async () => {
+      mockedAxios.request.mockResolvedValueOnce({ data: { id: 4834487988, email: "A@Example.com" } } as never);
+      await expect(findLeadIdByEmail(KEY, " a@example.com ")).resolves.toBe("4834487988");
+      expect(mockedAxios.request.mock.calls[0][0].params).toMatchObject({ email: "a@example.com" });
+      mockedAxios.request.mockResolvedValueOnce({ data: {} } as never);
+      await expect(findLeadIdByEmail(KEY, "none@example.com")).resolves.toBeNull();
+      mockedAxios.request.mockResolvedValueOnce({ data: { id: 5, email: "other@example.com" } } as never);
+      await expect(findLeadIdByEmail(KEY, "a@example.com")).rejects.toBeInstanceOf(SmartleadUnexpectedResponseError);
+      mockedAxios.request.mockResolvedValueOnce({ data: { email: "a@example.com" } } as never);
+      await expect(findLeadIdByEmail(KEY, "a@example.com")).rejects.toBeInstanceOf(SmartleadUnexpectedResponseError);
+      await expect(findLeadIdByEmail(KEY, "")).rejects.toBeInstanceOf(SmartleadApiError);
     });
   });
 
