@@ -535,7 +535,9 @@ class ClaudeSession implements ProviderSession {
       const name = b.name.slice(prefix.length);
       if (!this.manifestNames.has(name)) continue; // a tool the turn does not offer can never be a relayed call
       // Bounded memory whatever the CLI prints: a fixed-size digest of the input (not the input), a truncated id, and at most MAX_STREAM_USES entries (oldest dropped).
-      this.streamUses.push({ messageId: msg.id.slice(0, MAX_MESSAGE_ID_CHARS), name, key: digest(canonicalJson(b.input ?? {})) });
+      // An over-long id is NOT recorded (never sliced: in V8 a slice keeps the whole original string alive). The call then gets a unique unmatched id.
+      if (msg.id.length > MAX_MESSAGE_ID_CHARS) continue;
+      this.streamUses.push({ messageId: msg.id, name, key: digest(canonicalJson(b.input ?? {})) });
       if (this.streamUses.length > MAX_STREAM_USES) this.streamUses.splice(0, this.streamUses.length - MAX_STREAM_USES);
     }
     this.flushWaiting(false);

@@ -400,6 +400,37 @@ describe("claude adapter: lifecycle and memory bounds of the relay", () => {
     await session.close();
   });
 
+  it("MUTATION TARGET: over-long message ids are not recorded at all, so they cannot pin memory (a V8 slice would keep each whole id alive)", async () => {
+    const v8 = await import("v8");
+    const vm = await import("vm");
+    v8.setFlagsFromString("--expose-gc");
+    const gc = vm.runInNewContext("gc") as () => void;
+    const rig = makeRig();
+    const session = await rig.adapter.openSession(rig.ctx, { connectionId: "conn1", epoch: 1 });
+    const s = session as unknown as { manifestNames: Set<string>; streamUses: Array<{ messageId: string }>; noteStreamUse(raw: Record<string, unknown>): void };
+    s.manifestNames.add("search");
+    const feed = (idChars: number, n: number) => {
+      for (let i = 0; i < n; i++) {
+        const id = Buffer.alloc(idChars, 120).toString("latin1") + String(i); // a fresh, flat string per message
+        s.noteStreamUse({ type: "assistant", message: { id, content: [{ type: "tool_use", id: `tu${i}`, name: "mcp__emma__search", input: { i } }] } });
+      }
+    };
+    // ids just above the cap are not kept (kills a raised cap); kept ids are all within it
+    feed(129, 10);
+    expect(s.streamUses).toHaveLength(0);
+    feed(100, 3);
+    expect(s.streamUses.map((u) => u.messageId.length)).toEqual([101, 101, 101]);
+    // 64 messages with 4 MiB ids must not retain hundreds of MB
+    gc();
+    const before = process.memoryUsage().heapUsed + process.memoryUsage().external;
+    feed(4 * 1024 * 1024, 64);
+    gc();
+    const after = process.memoryUsage().heapUsed + process.memoryUsage().external;
+    expect(after - before).toBeLessThan(32 * 1024 * 1024);
+    expect(s.streamUses.every((u) => u.messageId.length <= 128)).toBe(true);
+    await session.close();
+  });
+
   it("a claimed stream block is forgotten (each message is matched once), so repeated identical calls still pair with their own messages", async () => {
     const rig = makeRig();
     rig.scenario({ turn: [{ mcpCall: { name: "search", args: { q: "same" }, messageId: "mA" } }, { mcpCall: { name: "search", args: { q: "same" }, messageId: "mB" } }, RESULT_STEP] });
