@@ -116,12 +116,14 @@ function emailShapeOk(email: string): boolean {
   const local = email.slice(0, at);
   const domain = email.slice(at + 1);
   if (local.startsWith(".") || local.endsWith(".") || domain.startsWith(".") || domain.endsWith(".") || domain.startsWith("-")) return false;
-  return /\.[a-z]{2,}$/i.test(domain) || /\.xn--[a-z0-9-]{2,}$/i.test(domain);
+  // The top-level domain is letters in any script (internationalised domains such as .中国 or .рф), or punycode (xn--...); never digits.
+  return /\.\p{L}{2,}$/u.test(domain) || /\.xn--[a-z0-9-]{2,}$/i.test(domain);
 }
 
 // URL-type fields end up in the customer's template, possibly inside href="...": no quotes, backticks or spaces, and no script-style scheme.
 const URL_FIELDS = new Set(["website", "company_url", "linkedin_profile"]);
-const UNSAFE_URL = /["'`\s]|^\s*(javascript|data|vbscript):/i;
+// An HTML character reference (&#106; or &colon;) can spell a script scheme once a browser decodes it inside href="...", so none is allowed.
+const UNSAFE_URL = /["'`\s]|&#|&[a-z]+;|^\s*(javascript|data|vbscript):/i;
 
 export type PayloadResult =
   | { ok: true; input: SmartleadLeadInput; payloadHash: string }
