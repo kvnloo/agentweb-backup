@@ -1,8 +1,10 @@
 /**
  * ENG-2113 (tool relay, backend side): builds the bounded `tools` manifest of `turn.run` from the bridge's tool list.
  *
- * The relay's name charset is `^[a-z0-9_]{1,48}$` and the `aw_relay_` prefix is the shim's own. Emma's tool names are plain snake_case (the `mcp__emma__`
- * prefix seen in the CLI's stream is added by the CLI, it is not part of the name the bridge lists), so the mapping is the IDENTITY on every name that fits,
+ * The relay's name pattern is protocol.ts `TOOL_NAME` (today `^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$`: letters of both cases, digits, `_` and `-`, no leading `-`)
+ * and the `aw_relay_` prefix is the shim's own (case-sensitive, as the host checks it). Emma's tool names are snake_case, per-user MCP tools may use capitals
+ * and hyphens (the `mcp__emma__` prefix seen in the CLI's stream is added by the CLI, it is not part of the name the bridge lists), so the mapping is the
+ * IDENTITY on every name that fits,
  * which is a bijection by construction and needs no table that could drift. A name that does not fit is SKIPPED (never rewritten: a rewrite could collide with
  * another tool), counted, and logged by reason only. The same predicate decides, on a `tool-call`, whether a name can be mapped back.
  *
@@ -55,13 +57,17 @@ export function buildRelayManifest(open: BridgeTool[], candidates: BridgeTool[] 
   const skipped: Partial<Record<SkipReason, number>> = {};
   const skip = (why: SkipReason) => void (skipped[why] = (skipped[why] ?? 0) + 1);
   const seen = new Set<string>();
+  const openSeen = new Set<string>();
   const out: ToolDef[] = [];
   let truncated = 0;
 
   const add = (tool: BridgeTool, locked: boolean) => {
     const name = tool?.name;
     if (!relayName(name)) return skip(typeof (name as unknown) === "string" && String(name).startsWith(RELAY_RESERVED_PREFIX) && TOOL_NAME.safeParse(name).success ? "reserved" : "name");
-    if (seen.has(name)) return skip("duplicate");
+    if (seen.has(name)) {
+      if (locked && openSeen.has(name)) return; // a candidate the run already has open: offered once, nothing is lost
+      return skip("duplicate");
+    }
     let schema: Record<string, unknown>;
     if (tool.inputSchema === undefined || tool.inputSchema === null || !isObject(tool.inputSchema)) schema = { ...EMPTY_TOOL_SCHEMA };
     else if (tool.inputSchema.type === "object") schema = tool.inputSchema;
@@ -71,6 +77,7 @@ export function buildRelayManifest(open: BridgeTool[], candidates: BridgeTool[] 
     const full = typeof tool.description === "string" ? tool.description : "";
     const description = truncateUtf8(full, TOOL_LIMITS.maxDescriptionBytes);
     if (description !== full) truncated++;
+    if (!locked) openSeen.add(name);
     out.push({ name, description, inputSchema: schema, ...(locked ? { locked: true } : {}) });
   };
 
@@ -105,6 +112,11 @@ export function buildRelayManifest(open: BridgeTool[], candidates: BridgeTool[] 
   const locked = new Set(out.filter((t) => t.locked).map((t) => t.name));
   const openNames = new Set(out.filter((t) => !t.locked).map((t) => t.name));
   return { tools: out, locked, open: openNames, skipped, truncated };
+}
+
+/** True when the manifest offers less than the bridge listed: a tool left out (any reason) or a description cut. The backend refuses such a turn. */
+export function manifestCut(m: Pick<RelayManifest, "skipped" | "truncated">): boolean {
+  return Object.keys(m.skipped).length > 0 || m.truncated > 0;
 }
 
 /** Checks a finished manifest with the protocol's own schema (the host would refuse the whole turn otherwise). Returns the failing code, or undefined. */

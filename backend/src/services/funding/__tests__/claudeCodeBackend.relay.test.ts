@@ -406,20 +406,41 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
     expect(answers()[0].answer).toMatchObject({ ok: false });
   });
 
-  it('a tool whose name the relay cannot carry is left out of the manifest, logged by reason only, and cannot be called', async () => {
-    const t = setup({ tools: [{ name: 'save_note' }, { name: 'Has-Upper', description: 'SECRET-DESC' }, { name: 'install_skills' }] });
-    const g = gate();
-    rig.script.turnEvents = [call('op-1', 'Has-Upper'), { wait: g.wait }, result('x')];
-    const spy = jest.spyOn(client, 'turnRun');
-    const run = t.backend().run(t.params());
-    await waitFor(() => answers().length === 1);
-    g.open();
-    await run;
-    expect((spy.mock.calls[0][0] as any).tools.map((x: any) => x.name)).toEqual(['save_note', 'install_skills']);
-    expect(t.executions).toEqual([]);
-    const logged = (console.error as jest.Mock).mock.calls.map((c) => JSON.stringify(c)).join('\n');
-    expect(logged).toContain('relay_manifest_cut');
-    expect(logged).not.toContain('SECRET-DESC');
+  describe('never a degraded manifest: a turn that would offer fewer tools than the bridge lists is refused and the user told', () => {
+    const many = Array.from({ length: 700 }, (_, i) => ({ name: `mcp_user_tool_${i}`, description: 'per-user MCP tool' }));
+    it.each([
+      ['a per-user MCP tool whose name the relay cannot carry', { tools: [{ name: 'save_note' }, { name: 'my.tool', description: 'SECRET-DESC' }, { name: 'install_skills' }] }, 'name'],
+      ['a description over the per-tool limit', { tools: [{ name: 'save_note', description: 'SECRET-DESC' + 'd'.repeat(60_000) }, { name: 'install_skills' }] }, 'truncatedDescriptions'],
+      ['more per-user MCP tools than the manifest can hold', { tools: [{ name: 'install_skills' }, ...many] }, 'manifest_full'],
+      ['a locked candidate (after a skill install) that would be dropped', { candidates: [{ name: 'late.tool' }] }, 'name'],
+    ] as const)('%s: typed stop, not retryable, nothing run, logged by fixed code with counts only', async (_label, over, key) => {
+      const t = setup(over as any);
+      const spy = jest.spyOn(client, 'turnRun');
+      const err: any = await t.backend().run(t.params()).catch((e) => e);
+      expect(err.code).toBe('context_too_large');
+      expect(err.retryable).toBe(false);
+      expect(turnRanNoTools(err)).toBe(true);
+      expect(spy).not.toHaveBeenCalled();
+      expect(t.registry.size).toBe(0);
+      const logged = (console.error as jest.Mock).mock.calls.map((c) => JSON.stringify(c)).join('\n');
+      expect(logged).toContain('relay_manifest_cut');
+      expect(logged).toContain(`"${key}":`);
+      expect(logged).not.toContain('SECRET-DESC');
+      expect(logged).not.toContain('my.tool');
+    });
+
+    it('names with capitals and hyphens (the widened pattern) are offered by identity and called back by the same name', async () => {
+      const t = setup({ tools: [{ name: 'HubSpot-Contacts' }, { name: 'install_skills' }] });
+      const g = gate();
+      rig.script.turnEvents = [call('op-1', 'HubSpot-Contacts', { q: 1 }), { wait: g.wait }, result('x')];
+      const spy = jest.spyOn(client, 'turnRun');
+      const run = t.backend().run(t.params());
+      await waitFor(() => answers().length === 1);
+      g.open();
+      await run;
+      expect((spy.mock.calls[0][0] as any).tools.map((x: any) => x.name)).toEqual(['HubSpot-Contacts', 'install_skills']);
+      expect(t.executions).toEqual([{ name: 'HubSpot-Contacts', args: { q: 1 } }]);
+    });
   });
 
   it('near the soft deadline no further tool starts and the model is told to write its answer; deadlineMs sent to the worker is the hard one', async () => {
@@ -486,7 +507,7 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
     });
 
     it('a relay-capable worker with no tool the relay can carry: typed retryable stop, known to have run no tool, no HTTP-bridge turn', async () => {
-      const t = setup({ tools: [{ name: 'Bad-Name' }] });
+      const t = setup({ tools: [] });
       rig.script.turnEvents = [result('fine')];
       const spy = jest.spyOn(client, 'turnRun');
       const err: any = await t.backend().run(t.params()).catch((e) => e);
@@ -499,7 +520,7 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
 
     it('a finished manifest the protocol schema would refuse is a typed stop before the worker is asked', async () => {
       const t = setup();
-      jest.spyOn(relayManifestModule, 'buildRelayManifest').mockReturnValue({ tools: [{ name: 'BAD', description: '', inputSchema: { type: 'object' } }], open: new Set(['BAD']), locked: new Set(), skipped: {}, truncated: 0 });
+      jest.spyOn(relayManifestModule, 'buildRelayManifest').mockReturnValue({ tools: [{ name: 'only', description: '', inputSchema: { type: 'object' }, locked: true }], open: new Set(['only']), locked: new Set(['only']), skipped: {}, truncated: 0 }); // all locked: the host would refuse it
       const spy = jest.spyOn(client, 'turnRun');
       const err: any = await t.backend().run(t.params()).catch((e) => e);
       expect(err.code).toBe('turn_failed');

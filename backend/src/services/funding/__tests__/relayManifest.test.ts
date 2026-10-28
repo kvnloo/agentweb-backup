@@ -1,12 +1,15 @@
 /** ENG-2113 tool relay: the manifest the backend sends in turn.run `tools`. */
 import { TOOL_LIMITS } from '../../../loginHost/protocol';
-import { buildRelayManifest, manifestProblem, relayName, INSTALL_TOOL } from '../relayManifest';
+import { buildRelayManifest, manifestCut, manifestProblem, relayName, INSTALL_TOOL } from '../relayManifest';
 
 const tool = (name: string, extra: Record<string, unknown> = {}) => ({ name, description: `${name} d`, inputSchema: { type: 'object', properties: {} }, ...extra });
 
 describe('relayName', () => {
-  it.each(['search', 'get_crm_leads', 'a1_b2', 'x'.repeat(48)])('accepts %s', (n) => expect(relayName(n)).toBe(true));
-  it.each(['', 'Search', 'mcp__emma-x', 'call-meta', 'x'.repeat(49), 'aw_relay_x', 'a b', 'tool.name', 5, undefined])('rejects %p', (n) => expect(relayName(n)).toBe(false));
+  // The host's widened pattern: letters of both cases, digits, _ and -, 1-64 chars, no leading '-'. Identity mapping, so these ARE the names the CLI calls.
+  it.each(['search', 'get_crm_leads', 'a1_b2', 'Search', 'HubSpot-Contacts', 'call-meta', '_private', 'x'.repeat(64), 'AW_RELAY_x', 'aw-relay_x'])('accepts %s', (n) =>
+    expect(relayName(n)).toBe(true));
+  it.each(['', '-leading', 'x'.repeat(65), 'aw_relay_x', 'aw_relay_', 'a b', 'tool.name', 'a/b', 'ünïcode', 'a\nb', 5, undefined])('rejects %p', (n) =>
+    expect(relayName(n)).toBe(false));
 });
 
 describe('buildRelayManifest', () => {
@@ -22,14 +25,16 @@ describe('buildRelayManifest', () => {
   });
 
   it('skips (never rewrites) names the relay cannot carry, and counts them by reason', () => {
-    const m = buildRelayManifest([tool('ok_tool'), tool('Has-Upper'), tool('mcp-emma-x'), tool('x'.repeat(49)), tool('aw_relay_evil'), tool('ok_tool')]);
-    expect(m.tools.map((t) => t.name)).toEqual(['ok_tool']);
+    const m = buildRelayManifest([tool('ok_tool'), tool('Has-Upper'), tool('my.tool'), tool('-x'), tool('x'.repeat(65)), tool('aw_relay_evil'), tool('ok_tool')]);
+    expect(m.tools.map((t) => t.name)).toEqual(['ok_tool', 'Has-Upper']);
     expect(m.skipped).toEqual({ name: 3, reserved: 1, duplicate: 1 });
+    expect(manifestCut(m)).toBe(true);
   });
 
-  it('a name that would collide after a rewrite cannot exist: there is no rewrite', () => {
-    const m = buildRelayManifest([tool('Foo'), tool('foo')]);
-    expect(m.tools.map((t) => t.name)).toEqual(['foo']);
+  it('the mapping is a bijection: names differing only in case or hyphen/underscore stay distinct tools (no rewrite, no collision)', () => {
+    const m = buildRelayManifest([tool('Foo'), tool('foo'), tool('get-x'), tool('get_x')]);
+    expect(m.tools.map((t) => t.name)).toEqual(['Foo', 'foo', 'get-x', 'get_x']);
+    expect(manifestCut(m)).toBe(false);
   });
 
   it('a missing schema becomes the empty object schema; a non-object schema is skipped; an oversized one is skipped', () => {
@@ -45,7 +50,9 @@ describe('buildRelayManifest', () => {
   });
 
   it('cuts a long description to the byte limit without breaking a character', () => {
-    const m = buildRelayManifest([{ name: 'a', description: 'é'.repeat(5000), inputSchema: { type: 'object' } }]);
+    const m = buildRelayManifest([{ name: 'a', description: 'é'.repeat(30_000), inputSchema: { type: 'object' } }]);
+    expect(m.truncated).toBe(1);
+    expect(manifestCut(m)).toBe(true);
     expect(Buffer.byteLength(m.tools[0].description)).toBeLessThanOrEqual(TOOL_LIMITS.maxDescriptionBytes);
     expect(m.tools[0].description).not.toContain('�');
     expect(manifestProblem(m.tools)).toBeUndefined();
@@ -55,22 +62,24 @@ describe('buildRelayManifest', () => {
     const m = buildRelayManifest([tool('search'), tool(INSTALL_TOOL)], [tool('search'), tool('late_a'), tool('late_b')]);
     expect(m.tools.map((t) => [t.name, t.locked === true])).toEqual([['search', false], ['install_skills', false], ['late_a', true], ['late_b', true]]);
     expect([...m.locked]).toEqual(['late_a', 'late_b']);
+    expect(m.skipped).toEqual({}); // a candidate the run already has open is not a drop
+    expect(manifestCut(m)).toBe(false);
     expect(manifestProblem(m.tools)).toBeUndefined();
   });
 
   it('over the tool-count cap, locked candidates go first and install_skills is never dropped', () => {
-    const open = [tool(INSTALL_TOOL), ...Array.from({ length: 150 }, (_, i) => tool(`open_${i}`))];
-    const cands = Array.from({ length: 100 }, (_, i) => tool(`cand_${i}`));
+    const open = [tool(INSTALL_TOOL), ...Array.from({ length: 450 }, (_, i) => tool(`open_${i}`))];
+    const cands = Array.from({ length: 200 }, (_, i) => tool(`cand_${i}`));
     const m = buildRelayManifest(open, cands);
     expect(m.tools.length).toBe(TOOL_LIMITS.maxTools);
-    expect(m.open.size).toBe(151);
-    expect(m.locked.size).toBe(49);
+    expect(m.open.size).toBe(451);
+    expect(m.locked.size).toBe(149);
     expect(m.skipped.manifest_full).toBe(51);
     expect(manifestProblem(m.tools)).toBeUndefined();
   });
 
   it('over the byte cap the open tail is trimmed after the locked tools, still keeping install_skills first', () => {
-    const fat = (n: string) => ({ name: n, description: 'd'.repeat(4000), inputSchema: { type: 'object', properties: { p: { description: 'x'.repeat(12_000) } } } });
+    const fat = (n: string) => ({ name: n, description: 'd'.repeat(40_000), inputSchema: { type: 'object', properties: { p: { description: 'x'.repeat(30_000) } } } });
     const open = [tool(INSTALL_TOOL), ...Array.from({ length: 60 }, (_, i) => fat(`open_${i}`))];
     const m = buildRelayManifest(open, [fat('late')]);
     expect(Buffer.byteLength(JSON.stringify(m.tools))).toBeLessThanOrEqual(TOOL_LIMITS.maxTotalBytes);
@@ -81,10 +90,10 @@ describe('buildRelayManifest', () => {
   });
 
   it('install_skills survives the caps even when it is the LAST open tool', () => {
-    const fat = (n: string) => ({ name: n, description: 'd'.repeat(4000), inputSchema: { type: 'object', properties: { p: { description: 'x'.repeat(12_000) } } } });
+    const fat = (n: string) => ({ name: n, description: 'd'.repeat(40_000), inputSchema: { type: 'object', properties: { p: { description: 'x'.repeat(30_000) } } } });
     const m = buildRelayManifest([...Array.from({ length: 60 }, (_, i) => fat(`open_${i}`)), tool(INSTALL_TOOL)]);
     expect(m.open.has(INSTALL_TOOL)).toBe(true);
-    const many = buildRelayManifest([...Array.from({ length: 205 }, (_, i) => tool(`t_${i}`)), tool(INSTALL_TOOL)]);
+    const many = buildRelayManifest([...Array.from({ length: 605 }, (_, i) => tool(`t_${i}`)), tool(INSTALL_TOOL)]);
     expect(many.open.has(INSTALL_TOOL)).toBe(true);
     expect(many.tools.length).toBe(TOOL_LIMITS.maxTools);
   });

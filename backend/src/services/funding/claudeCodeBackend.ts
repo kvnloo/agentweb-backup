@@ -22,7 +22,7 @@ import type { LoginHostClient } from "./loginHostClient";
 import type { HostTurnOptions, HostTurnOutcome } from "./loginHostTurn";
 import type { RouteInput } from "../../loginHost/protocol";
 import type { BridgeCallOptions, BridgeCallRecord, BridgeCallResult, BridgeHalt, BridgeListedTool, BridgeTool, BridgeToolCall, CloseAndDrainResult } from "./toolBridge";
-import { buildRelayManifest, manifestProblem, type RelayManifest } from "./relayManifest";
+import { buildRelayManifest, manifestCut, manifestProblem, type RelayManifest } from "./relayManifest";
 import { RESULT_LOST_NOTE, RelayToolDispatcher } from "./relayToolDispatcher";
 import { ToolBridgeAuthError } from "./toolBridge";
 import type { RunToolTokenClaims } from "./runToolToken";
@@ -572,10 +572,13 @@ export class ClaudeCodeBackend {
       console.error("[claude-backend] relay candidate tools unavailable");
     }
     const manifest = buildRelayManifest(open, candidates);
-    // Never silent (B1/B2): a tool left out or a description cut is logged with a fixed code and counts. relayManifest.registry.test.ts keeps the real
-    // registry inside the limits, so this should never fire in production.
-    if (Object.keys(manifest.skipped).length > 0 || manifest.truncated > 0) {
+    // Never a degraded manifest (B1/B2): if any tool would be left out or any description cut (per-user MCP tools are unbounded in number and shape), the
+    // turn is refused and the user told, rather than run with fewer tools than an AgentWeb turn would have. relayManifest.registry.test.ts keeps the
+    // built-in registry inside the limits. `context_too_large` is the existing stop whose copy fits ("too large to send to your Claude plan ... or choose
+    // another model"); it is not retryable, and nothing has run.
+    if (manifestCut(manifest)) {
       console.error("[claude-backend] relay_manifest_cut", { ...manifest.skipped, truncatedDescriptions: manifest.truncated, offered: manifest.tools.length });
+      throw noToolsStop("context_too_large");
     }
     if (manifest.tools.length === 0 || manifest.open.size === 0) {
       // Fail closed (B3): never fall back to the HTTP bridge on a relay-capable worker. Nothing has run.
