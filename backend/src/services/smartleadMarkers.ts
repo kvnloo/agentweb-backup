@@ -18,9 +18,6 @@ export interface SmartleadMarker {
   email?: string;
   /** When the withdrawal sweep unsubscribed the lead in Smartlead after it opted out here. */
   withdrawnAt?: string;
-  /** Failed attempts of the withdrawal sweep, so a lead that keeps failing does not starve the ones behind it. */
-  withdrawAttempts?: number;
-  withdrawAttemptedAt?: string;
   /** When a list editor released the lead, and who. */
   releasedAt?: string;
   releasedBy?: string;

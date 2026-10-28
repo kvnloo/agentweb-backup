@@ -14,7 +14,7 @@ import { SmartleadApiError, scrubSmartleadSecrets, type UnsubscribeOutcome } fro
  * It runs whether or not pushing is switched on: stopping pushes must never stop opt-outs. A failure leaves the marker as it was, so the next
  * pass tries again; a lead that keeps failing is tried LAST on later passes, so it cannot block the ones behind it. Known limits (tracker): it
  * reads whole lists every hour (an event hook on contact-status changes should replace it); the same address in another list carries no
- * marker there; a lead deleted in the CRM stays in Smartlead; a run older than the window is no longer swept.
+ * marker there; a lead deleted in the CRM stays in Smartlead; a run older than the window (400 days) is no longer swept, and lists of finished campaigns are still read every hour.
  *
  * Policy, stated on purpose: EVERY do-not-contact status triggers the account-wide unsubscribe, bounces included. Smartlead's unsubscribe is
  * permanent and cannot be undone through its API, so a lead withdrawn here and later re-subscribed in AgentWeb stays blocked in Smartlead.
@@ -22,12 +22,26 @@ import { SmartleadApiError, scrubSmartleadSecrets, type UnsubscribeOutcome } fro
 
 type Lead = Record<string, any>;
 
-export const WITHDRAWAL_WINDOW_DAYS = 60;
+/** As long as the runs themselves are kept (the run table's retention): a long-running campaign's opt-outs must not stop being sent after 60 days. */
+export const WITHDRAWAL_WINDOW_DAYS = 400;
 export const WITHDRAWALS_PER_LIST = 200;
-const RUNS_PER_SWEEP = 500;
+const RUNS_PER_SWEEP = 1000;
 const PAGE = 200;
 /** Stop a list after this many failures in a row (an outage): the next pass continues, trying other leads first. */
 const MAX_CONSECUTIVE_FAILURES = 10;
+
+/**
+ * Which leads failed before, per process: they are tried LAST next time, so a lead that always fails cannot block the ones behind it. Kept in
+ * memory, not on the marker: writing it to the marker would rewrite the whole marker from a possibly stale read and could undo a release
+ * made meanwhile. A restart forgets it, which only costs fairness.
+ */
+const failedBefore = new Map<string, { attempts: number; at: number }>();
+export const __resetWithdrawalAttempts = () => failedBefore.clear();
+const noteFailure = (listId: string, leadId: string, nowMs: number) => {
+  const key = `${listId}#${leadId}`;
+  failedBefore.set(key, { attempts: (failedBefore.get(key)?.attempts ?? 0) + 1, at: nowMs });
+  if (failedBefore.size > 50_000) failedBefore.clear(); // never grows without bound
+};
 
 export interface WithdrawalDeps {
   db: {
@@ -133,59 +147,75 @@ async function sweepTarget(
   const result = { withdrawn: 0, failed: 0 };
 
   // Every lead that opted out here and is still live in Smartlead; those that failed before are tried last.
-  const found: Array<{ leadId: string; attempts: number; attemptedAt: string }> = [];
+  const found: Array<{ leadId: string; attempts: number; at: number }> = [];
   let after: LeadCursor | null = null;
   for (;;) {
     const page = await deps.readLeads(listId, after, PAGE);
     if (page.items.length === 0) break;
     for (const lead of page.items) {
-      const marker = needsWithdrawal(lead, campaignId);
-      if (marker) found.push({ leadId: String(lead.leadId), attempts: marker.withdrawAttempts ?? 0, attemptedAt: marker.withdrawAttemptedAt ?? "" });
+      if (needsWithdrawal(lead, campaignId)) {
+        const before = failedBefore.get(`${listId}#${lead.leadId}`);
+        found.push({ leadId: String(lead.leadId), attempts: before?.attempts ?? 0, at: before?.at ?? 0 });
+      }
     }
     after = { listId, leadId: String(page.items[page.items.length - 1].leadId) };
     if (!page.hasMore) break;
   }
-  found.sort((a, b) => a.attempts - b.attempts || a.attemptedAt.localeCompare(b.attemptedAt));
+  found.sort((a, b) => a.attempts - b.attempts || a.at - b.at);
 
   let consecutiveFailures = 0;
+  const fail = (leadId: string, why: string) => {
+    noteFailure(listId, leadId, deps.now().getTime());
+    result.failed++;
+    consecutiveFailures++;
+    deps.log(`[SmartleadWithdrawal] list=${listId} lead=${leadId}: ${why}`);
+  };
   for (const { leadId } of found.slice(0, cap)) {
-    // Decide on a CONSISTENT read taken now: the unsubscribe cannot be undone, and the page read can be stale (a lead re-subscribed, or
-    // already withdrawn, in the meantime).
-    const lead = await deps.readLeadConsistent(listId, leadId);
-    const marker = lead ? needsWithdrawal(lead, campaignId) : undefined;
-    if (!lead || !marker) continue;
-    const email = typeof lead.email === "string" ? lead.email.trim().toLowerCase() : "";
-
     try {
+      // Decide on a CONSISTENT read taken now: the unsubscribe cannot be undone, and the page read can be stale (a lead re-subscribed, or
+      // already withdrawn, in the meantime). A failed read is a failure like any other, not a reason to abandon the list.
+      const lead = await deps.readLeadConsistent(listId, leadId);
+      const marker = lead ? needsWithdrawal(lead, campaignId) : undefined;
+      if (!lead || !marker) continue;
+      const email = typeof lead.email === "string" ? lead.email.trim().toLowerCase() : "";
+
       // The stored Smartlead id is trusted only while the lead still has the address that was pushed; otherwise (or with no id) the lead is
       // looked up by its CURRENT address, so an edited address can never unsubscribe somebody else.
       const stored = marker.smartleadLeadId;
       const trusted = !!stored && (!marker.email || marker.email === email);
-      let smartleadLeadId: string | undefined = trusted ? stored : email ? (await deps.smartlead.findLeadId(resolved.apiKey, email)) ?? undefined : undefined;
-      let outcome: UnsubscribeOutcome = smartleadLeadId ? await deps.smartlead.unsubscribe(resolved.apiKey, smartleadLeadId) : "not_found";
-      // A 404 on a stored id can mean the customer deleted and re-imported the lead, which changes its id: look the address up before
-      // deciding the lead is gone.
-      if (outcome === "not_found" && smartleadLeadId && smartleadLeadId === stored && email) {
-        const current = await deps.smartlead.findLeadId(resolved.apiKey, email);
-        if (current && current !== stored) {
-          smartleadLeadId = current;
-          outcome = await deps.smartlead.unsubscribe(resolved.apiKey, current);
+      const smartleadLeadId: string | undefined = trusted ? stored : email ? (await deps.smartlead.findLeadId(resolved.apiKey, email)) ?? undefined : undefined;
+
+      if (!smartleadLeadId) {
+        if (stored) {
+          // We KNOW this person was pushed under another address, which is still in Smartlead: closing this as "withdrawn" would leave them
+          // being emailed, and unsubscribing the old address could be the wrong person. Leave it open for a human.
+          fail(leadId, "its address changed since the push and the new address is not in Smartlead, so the pushed address could not be stopped; needs a human");
+          continue;
         }
+        // Never had a Smartlead id and the address is not there: nothing to unsubscribe.
+        await deps.writeMarker(listId, leadId, markerKey, { ...marker, state: "withdrawn", withdrawnAt: deps.now().toISOString() });
+        result.withdrawn++;
+        consecutiveFailures = 0;
+        continue;
+      }
+
+      let outcome: UnsubscribeOutcome = await deps.smartlead.unsubscribe(resolved.apiKey, smartleadLeadId);
+      // A 404 on a stored id can mean the customer deleted and re-imported the lead, which changes its id: look the address up before
+      // deciding the lead is gone. If the lookup finds the SAME id the lead exists and Smartlead refused: that is a failure, not "gone".
+      if (outcome === "not_found" && trusted && email) {
+        const current = await deps.smartlead.findLeadId(resolved.apiKey, email);
+        if (current && current === smartleadLeadId) { fail(leadId, "Smartlead says the lead is gone yet finds it by address; will retry"); continue; }
+        if (current) outcome = await deps.smartlead.unsubscribe(resolved.apiKey, current);
       }
       if (outcome === "no_update") {
-        await recordFailure(deps, listId, leadId, markerKey, marker);
-        result.failed++;
-        consecutiveFailures++;
-        deps.log(`[SmartleadWithdrawal] list=${listId} lead=${leadId}: Smartlead changed nothing; will retry`);
+        fail(leadId, "Smartlead changed nothing; will retry");
       } else {
         await deps.writeMarker(listId, leadId, markerKey, { ...marker, state: "withdrawn", withdrawnAt: deps.now().toISOString() });
         result.withdrawn++;
         consecutiveFailures = 0;
       }
     } catch (error) {
-      result.failed++;
-      consecutiveFailures++;
-      deps.log(`[SmartleadWithdrawal] list=${listId} lead=${leadId}: ${scrubSmartleadSecrets(error instanceof Error ? error.message : String(error))}`);
+      fail(leadId, scrubSmartleadSecrets(error instanceof Error ? error.message : String(error)));
       const status = error instanceof SmartleadApiError ? error.status : undefined;
       // A rejected key fails every lead the same way, and a rate limit means "stop for now": leave the list for the next pass.
       if (status === 401 || status === 403) {
@@ -193,18 +223,8 @@ async function sweepTarget(
         break;
       }
       if (status === 429) break;
-      await recordFailure(deps, listId, leadId, markerKey, marker);
     }
     if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) break;
   }
   return result;
-}
-
-/** Notes a failed attempt on the marker (best effort), so the lead moves to the back of the queue. */
-async function recordFailure(deps: WithdrawalDeps, listId: string, leadId: string, markerKey: string, marker: SmartleadMarker): Promise<void> {
-  try {
-    await deps.writeMarker(listId, leadId, markerKey, { ...marker, withdrawAttempts: (marker.withdrawAttempts ?? 0) + 1, withdrawAttemptedAt: deps.now().toISOString() });
-  } catch {
-    /* it will be tried again next pass anyway */
-  }
 }
