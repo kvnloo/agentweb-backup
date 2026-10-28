@@ -317,10 +317,10 @@ describe("worker protocol check (host.info)", () => {
   });
 
   it("a version outside the accepted set is a logged 'mismatch' (never fatal: the client is still returned)", async () => {
-    const p = mk(async () => ({ protocol: 4, node: "v22", uptimeSec: 1 }));
+    const p = mk(async () => ({ protocol: 5, node: "v22", uptimeSec: 1 }));
     await settle(p);
     expect(p.protocolStatus()).toBe("mismatch");
-    expect(p.workerProtocol()).toBe(4);
+    expect(p.workerProtocol()).toBe(5);
     expect(p.client()).toBeInstanceOf(LoginHostClient);
     expect(logged.filter((l) => l.includes("login_host_protocol_mismatch"))).toHaveLength(1);
     await settle(p);
@@ -367,7 +367,7 @@ describe("worker protocol check (host.info)", () => {
     const p = mk(async () => ({ protocol, node: "v22", uptimeSec: 1 }));
     await settle(p);
     expect(p.protocolStatus()).toBe("match");
-    protocol = 4;
+    protocol = 5;
     now += PROTOCOL_RECHECK_MS - 1;
     await settle(p);
     expect(p.protocolStatus()).toBe("match"); // not yet

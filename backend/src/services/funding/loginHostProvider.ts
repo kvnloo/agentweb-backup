@@ -138,7 +138,7 @@ export const PROTOCOL_RECHECK_MS = 10 * 60 * 1000;
  * makes `workerSpeaksOurProtocol` false, which stops a "no such connection" answer from counting as a confirmed wipe. Code that needs a specific newer
  * feature (the tool relay) must test `workerProtocol()` itself, not `protocolStatus()`.
  */
-export const ACCEPTED_WORKER_PROTOCOLS: ReadonlySet<number> = new Set([2, 3]);
+export const ACCEPTED_WORKER_PROTOCOLS: ReadonlySet<number> = new Set([2, 3, 4]);
 
 /** Whole days until a certificate's notAfter (negative once expired). Pure; shared with the host. */
 export { daysUntil };
