@@ -59,8 +59,9 @@ describe("withdrawalSweep (ENG-673)", () => {
     expect(e.unsub).not.toHaveBeenCalled();
   });
 
-  it("treats a lead Smartlead no longer has (404) as withdrawn, so it stops being retried", async () => {
+  it("treats a lead Smartlead no longer has (404, and not found by address either) as withdrawn, so it stops being retried", async () => {
     const e = env({ leads: [lead(1, optedOut)], unsub: () => "not_found" });
+    e.find.mockResolvedValueOnce(null);
     expect(await withdrawalSweep(e.deps)).toMatchObject({ withdrawn: 1, failed: 0 });
     expect(e.written[0].marker.state).toBe("withdrawn");
   });
@@ -225,9 +226,10 @@ describe("withdrawalSweep (ENG-673)", () => {
   it("never unsubscribes by a stale id after the lead's address changed: it looks up the CURRENT address", async () => {
     const e = env({ leads: [lead(1, { ...optedOut, email: "new@example.com", system: { smartlead_77: { ...marker("pushed", "9001"), email: "old@example.com" } } })] });
     e.find.mockResolvedValueOnce("4242");
-    await withdrawalSweep(e.deps);
+    expect(await withdrawalSweep(e.deps)).toMatchObject({ withdrawn: 1, failed: 0 });
     expect(e.find).toHaveBeenCalledWith("KEY", "new@example.com");
-    expect(e.unsub.mock.calls.map(c => c[1])).toEqual(["4242"]); // not 9001, which belongs to the old address
+    // the CURRENT address is looked up and stopped, and so is the pushed one (still live in the campaign): the lead is opted out here
+    expect(e.unsub.mock.calls.map(c => c[1])).toEqual(["4242", "9001"]);
   });
 
   it("trusts the stored id for a marker that records no address (older markers) and for an unchanged address", async () => {
@@ -239,6 +241,7 @@ describe("withdrawalSweep (ENG-673)", () => {
   it("does NOT close a lead as withdrawn when its address changed and the pushed address could not be stopped: it stays open and is flagged for a human", async () => {
     const pushedAs = (email: string) => ({ ...marker("pushed", "9001"), email });
     for (const current of ["", "new@example.com"]) {
+      __resetWithdrawalAttempts();
       const e = env({ leads: [lead(1, { ...optedOut, email: current, system: { smartlead_77: pushedAs("old@example.com") } })] });
       e.find.mockResolvedValue(null);
       const r = await withdrawalSweep(e.deps);
@@ -281,5 +284,74 @@ describe("withdrawalSweep (ENG-673)", () => {
     ];
     const e = env({ runs, leads: [lead(1, optedOut)] });
     expect(await withdrawalSweep(e.deps)).toMatchObject({ targets: 1, withdrawn: 1 });
+  });
+  it("when the address changed and the pushed address could not be stopped too, it is a failure that stays open (not 'withdrawn')", async () => {
+    const e = env({ leads: [lead(1, { ...optedOut, email: "new@example.com", system: { smartlead_77: { ...marker("pushed", "9001"), email: "old@example.com" } } })], unsub: id => (id === "9001" ? "no_update" : "ok") });
+    e.find.mockResolvedValueOnce("4242");
+    expect(await withdrawalSweep(e.deps)).toMatchObject({ withdrawn: 0, failed: 1 });
+    expect(e.leads[0].system.smartlead_77.state).toBe("pushed");
+  });
+
+  it("a 404 on an id the lookup JUST returned is Smartlead disagreeing with itself: a failure, not 'gone'", async () => {
+    const e = env({ leads: [lead(1, { ...optedOut, system: { smartlead_77: marker("pushed", null) } })], unsub: () => "not_found" });
+    e.find.mockResolvedValueOnce("5555");
+    expect(await withdrawalSweep(e.deps)).toMatchObject({ withdrawn: 0, failed: 1 });
+    expect(e.leads[0].system.smartlead_77.state).toBe("pushed");
+  });
+
+  it("a 404 on the stored id, then a lookup that finds another id that also 404s, is a failure", async () => {
+    const e = env({ leads: [lead(1, optedOut)], unsub: () => "not_found" });
+    e.find.mockResolvedValueOnce("5555");
+    expect(await withdrawalSweep(e.deps)).toMatchObject({ withdrawn: 0, failed: 1 });
+  });
+
+  it("the outage stop also covers failures that do not throw (ten in a row, not two hundred)", async () => {
+    const e = env({ leads: Array.from({ length: 30 }, (_, i) => lead(i + 1, { ...optedOut, email: "", system: { smartlead_77: { ...marker("pushed", String(9000 + i)), email: "old@example.com" } } })) });
+    const r = await withdrawalSweep(e.deps);
+    expect(r.failed).toBe(10);
+  });
+
+  it("logs a lead that needs a person once a day, not every hour", async () => {
+    const e = env({ leads: [lead(1, { ...optedOut, email: "", system: { smartlead_77: { ...marker("pushed", "9001"), email: "old@example.com" } } })] });
+    await withdrawalSweep(e.deps);
+    await withdrawalSweep(e.deps);
+    expect(e.logs.filter(l => /needs a human/.test(l))).toHaveLength(1);
+    let later = NOW.getTime() + 25 * 60 * 60 * 1000;
+    e.deps.now = () => new Date(later);
+    await withdrawalSweep(e.deps);
+    expect(e.logs.filter(l => /needs a human/.test(l))).toHaveLength(2);
+  });
+
+  it("a lead that failed goes to the back of the queue for a few hours, and then back to its normal place", async () => {
+    let nowMs = NOW.getTime();
+    const failFirst = new Set(["9001"]);
+    const e = env({ cap: 1, leads: [lead(1, optedOut), lead(2, optedOut)], unsub: id => (failFirst.has(id) ? (() => { throw new SmartleadApiError("boom", 500); })() : "ok") });
+    e.deps.now = () => new Date(nowMs);
+    await withdrawalSweep(e.deps); // lead 1 is tried first and fails
+    failFirst.clear();
+    nowMs += 60 * 60 * 1000; // an hour later: lead 2 (never failed) goes first
+    await withdrawalSweep(e.deps);
+    expect(e.leads[1].system.smartlead_77.state).toBe("withdrawn");
+    expect(e.leads[0].system.smartlead_77.state).toBe("pushed");
+
+    // the same two leads again, but the retry comes after the failure has decayed: lead 1 is back in its normal place (first)
+    __resetWithdrawalAttempts();
+    const f = env({ cap: 1, leads: [lead(1, optedOut), lead(2, optedOut)], unsub: id => (id === "9001" && failFirst.size ? (() => { throw new SmartleadApiError("boom", 500); })() : "ok") });
+    failFirst.add("9001");
+    f.deps.now = () => new Date(nowMs);
+    await withdrawalSweep(f.deps); // lead 1 fails again
+    failFirst.clear();
+    nowMs += 7 * 60 * 60 * 1000;
+    await withdrawalSweep(f.deps);
+    expect(f.leads[0].system.smartlead_77.state).toBe("withdrawn"); // not starved behind lead 2
+    expect(f.leads[1].system.smartlead_77.state).toBe("pushed");
+  });
+
+  it("warns loudly when the run limit truncates the sweep", async () => {
+    const e = env({ leads: [] });
+    e.deps.db.listRunsSince = jest.fn(async () => Array.from({ length: 1000 }, (_, i) => ({ runId: `r${i}`, listId: `L${i}`, campaignId: 1, createdAt: "2026-10-27T00:00:00Z" }) as any));
+    e.deps.db.getRun = jest.fn(async () => null);
+    await withdrawalSweep(e.deps);
+    expect(e.logs.join("\n")).toMatch(/WARNING: 1000 runs/);
   });
 });
