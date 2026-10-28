@@ -10,6 +10,20 @@
 /** The note a plan stop leaves in the chat. `resumable` is written by the controller only when the turn is known to have run no tool. */
 export const PLAN_STOP_NOTE_KIND = "claude-plan-stop";
 
+/**
+ * Written when a continue starts, before anything runs. It sits after the notes it consumed, so a continue whose own stop note could not be saved (or that has
+ * not finished) leaves the chat NOT continuable: the tail must be a resumable plan-stop note written after the marker, i.e. by a turn that ran no tool.
+ */
+export const CONTINUE_MARKER_KIND = "claude-plan-continue";
+
+/** The chat changed, or could not be read, between the request check and the turn: the continue is refused (409), never turned into an AgentWeb error. */
+export class ResumeNotAvailableError extends Error {
+  constructor() {
+    super("RESUME_SAVED_MESSAGE_NOT_AVAILABLE");
+    this.name = "ResumeNotAvailableError";
+  }
+}
+
 interface StoredMessage {
   role?: string;
   content?: unknown;
@@ -24,19 +38,24 @@ export type ResumableMessage = { ok: true; content: string } | { ok: false };
  */
 export function findResumableUserMessage(messages: readonly StoredMessage[] | undefined): ResumableMessage {
   if (!Array.isArray(messages) || messages.length < 2) return { ok: false };
+  const last = messages[messages.length - 1];
+  // The very last message must be a resumable stop note: a continue marker last means a continue started and has not left a verdict.
+  if (!(last?.role === "assistant" && last.metadata?.kind === PLAN_STOP_NOTE_KIND && last.metadata.resumable === true)) return { ok: false };
   let i = messages.length - 1;
-  let notes = 0;
   while (i >= 0) {
     const m = messages[i];
     if (m?.role === "assistant" && m.metadata?.kind === PLAN_STOP_NOTE_KIND) {
       if (m.metadata.resumable !== true) return { ok: false };
-      notes++;
+      i--;
+      continue;
+    }
+    if (m?.role === "assistant" && m.metadata?.kind === CONTINUE_MARKER_KIND) {
       i--;
       continue;
     }
     break;
   }
-  if (notes === 0 || i < 0) return { ok: false };
+  if (i < 0) return { ok: false };
   const user = messages[i];
   if (user?.role !== "user" || typeof user.content !== "string" || user.content.length === 0) return { ok: false };
   if (user.metadata?.kind !== undefined && user.metadata.kind !== null) return { ok: false };
