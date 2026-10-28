@@ -633,7 +633,7 @@ function howToVerify(
 ): string[] {
   const delta = `${outcome.metricName}: ${metricValue(outcome.metricBefore)} → ${metricValue(outcome.metricAfter)} (${lift}; n=${outcome.sampleN})`;
   const prLines = prs.length
-    ? prs.map((pr) => `- Shipped by [${pr.title}](${pr.url}); follow its "How to test" steps.`)
+    ? prs.map((pr) => `- Linked PR [${pr.title}](${pr.url}); if it shipped this change, follow its "How to test" steps.`)
     : ['- No linked GitHub PR on this issue; verify against the metric below.'];
   return [
     '### How to verify',
