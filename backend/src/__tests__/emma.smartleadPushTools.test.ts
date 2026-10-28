@@ -402,13 +402,15 @@ describe('release_leads_from_smartlead', () => {
     const r = await run('release_leads_from_smartlead', { listId: 'list-1', leadIds: ['a', 'b', 'c', 'd', 'e', 'f'] }, attended());
     expect(r.questionDeckPayload[0].question).toContain('They include ann@example.com, bob@example.com, cy@example.com and 3 others.');
     expect(svc.sampleLeads).toHaveBeenCalledWith('owner', 'list-1', ['a', 'b', 'c', 'd', 'e', 'f']);
+    await run('release_leads_from_smartlead', { listId: 'list-1', leadIds: ['f', 'e', 'd', 'c', 'b', 'a'] }, attended());
+    expect(svc.sampleLeads).toHaveBeenLastCalledWith('owner', 'list-1', ['a', 'b', 'c', 'd', 'e', 'f']); // the same contacts are named whatever order the model lists them in
   });
 
   it('after approval releases exactly the distinct ids the card was for', async () => {
     const r = await withApproval('release_leads_from_smartlead', { ...REL, campaignId: 77 });
     expect(r).toMatchObject({ success: true, released: 3 });
     expect(svc.release).toHaveBeenCalledTimes(1);
-    expect(svc.release).toHaveBeenCalledWith('owner', { listId: 'list-1', leadIds: ['b', 'a', 'c'], campaignId: 77 });
+    expect(svc.release).toHaveBeenCalledWith('owner', { listId: 'list-1', leadIds: ['a', 'b', 'c'], campaignId: 77 });
   });
 
   it('an approval does not carry over to other contacts, another list or another campaign, and is used once', async () => {
