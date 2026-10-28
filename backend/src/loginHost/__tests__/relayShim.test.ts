@@ -228,6 +228,48 @@ describe("relay shim: keepalive and unlock", () => {
   });
 });
 
+describe("relay shim: notifications/cancelled", () => {
+  const send = (r: Awaited<ReturnType<typeof rig>>, o: unknown) => r.child.stdin.write(JSON.stringify(o) + "\n");
+
+  it("MUTATION TARGET: a cancelled pending call is not answered to the CLI, but keeps its host slot: the next call waits for the host's answer", async () => {
+    const r = await rig();
+    await r.rpc("initialize", {});
+    send(r, { jsonrpc: "2.0", id: 101, method: "tools/call", params: { name: "echo", arguments: { n: 1 } } });
+    await until(() => r.calls.length === 1);
+    send(r, { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 101 } });
+    send(r, { jsonrpc: "2.0", id: 102, method: "tools/call", params: { name: "echo", arguments: { n: 2 } } });
+    await new Promise((res) => setTimeout(res, 200));
+    expect(r.calls).toHaveLength(1); // the host still has the first one pending: the shim must not send a second
+    r.ep.answer(r.calls[0].operationId, { content: "one (dropped)" });
+    await until(() => r.calls.length === 2);
+    r.ep.answer(r.calls[1].operationId, { content: "two" });
+    await until(() => r.out.some((o) => o.id === 102));
+    expect(r.out.some((o) => o.id === 101)).toBe(false); // nothing was answered for the cancelled request
+    expect(r.out.find((o) => o.id === 102)!.result.content[0].text).toBe("two");
+    await r.ep.close();
+  });
+
+  it("MUTATION TARGET: a call cancelled before it was sent never reaches the host", async () => {
+    const r = await rig();
+    await r.rpc("initialize", {});
+    send(r, { jsonrpc: "2.0", id: 201, method: "tools/call", params: { name: "echo", arguments: { n: 1 } } });
+    await until(() => r.calls.length === 1);
+    send(r, { jsonrpc: "2.0", id: 202, method: "tools/call", params: { name: "echo", arguments: { n: 2 } } }); // queued behind 201
+    send(r, { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 202 } });
+    r.ep.answer(r.calls[0].operationId, { content: "one" });
+    await until(() => r.out.some((o) => o.id === 201));
+    await new Promise((res) => setTimeout(res, 200));
+    expect(r.calls).toHaveLength(1);
+    expect(r.out.some((o) => o.id === 202)).toBe(false);
+    // and the shim is still healthy
+    const p = r.rpc("tools/call", { name: "echo", arguments: {} });
+    await until(() => r.calls.length === 2);
+    r.ep.answer(r.calls[1].operationId, { content: "three" });
+    expect((await p).result.content[0].text).toBe("three");
+    await r.ep.close();
+  });
+});
+
 describe("relay shim: confidentiality", () => {
   it("never writes a request, argument or result to stderr", async () => {
     const r = await rig();

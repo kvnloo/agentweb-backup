@@ -3,7 +3,7 @@
  * changes are skipped (unprivileged). The unit-level isolation (a unit sees only its own bind) is systemd's; here we test what the HOST controls:
  * paths, modes, one connection, frame limits, identity, timeouts and the lifetime of the socket.
  */
-import { mkdtempSync, rmSync, statSync, existsSync, readdirSync } from "fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, existsSync, readdirSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { connect, type Socket } from "net";
@@ -132,6 +132,36 @@ describe("relay: layout and modes", () => {
     expect(layout.isRelayDirOf(400_001, ok + "/relay.sock")).toBe(false);
     expect(layout.isRelayDirOf(400_001, `${layout.relayUidDir(400_001)}/../400002/${"a".repeat(32)}`)).toBe(false);
     expect(() => layout.relayTurnDir(400_001, "../x")).toThrow();
+  });
+});
+
+describe("relay: path construction guards", () => {
+  it("MUTATION TARGET: relayTurnDir refuses, by itself, anything that is not exactly 32 lowercase hex characters", () => {
+    const { layout } = mkLayout();
+    const ok = "0123456789abcdef0123456789abcdef";
+    expect(layout.relayTurnDir(400_001, ok)).toBe(`${layout.relayRoot}/400001/${ok}`);
+    for (const bad of ["", "../x", "..", ".", "a/b", `${ok}/..`, `../${ok.slice(3)}`, ok.toUpperCase(), ok.slice(1), ok + "0", "g".repeat(32), "0123456789abcdef0123456789abcde-", `${ok}\n`, " " + ok.slice(1), "%2e%2e/x".padEnd(32, "0"), 5 as unknown as string]) {
+      expect(() => layout.relayTurnDir(400_001, bad)).toThrow();
+    }
+  });
+
+  it("MUTATION TARGET: the turn directory is created exclusively: a planted colliding directory (or file, or link) is refused, never reused", async () => {
+    const { layout } = mkLayout();
+    const fixed = "feedfacefeedfacefeedfacefeedface";
+    const host = new RelayHost({ layout, ownByUid: false, randomHex: () => fixed });
+    host.init();
+    const planted = layout.relayTurnDir(400_001, fixed);
+    mkdirSync(planted, { recursive: true });
+    writeFileSync(join(planted, "relay.sock"), "planted");
+    const opts = { uid: 400_001, identity: { connectionId: "c", epoch: 1, turnId: "t" }, onCall: () => undefined, allowTool: () => true, callTimeoutMs: () => 1000 };
+    await expect(host.open(opts)).rejects.toMatchObject({ code: "EEXIST" });
+    expect(readFileSync(join(planted, "relay.sock"), "utf8")).toBe("planted"); // untouched
+    // a second open with the same id while the first is live also fails and leaves the first working
+    rmSync(planted, { recursive: true });
+    const first = await host.open(opts);
+    await expect(host.open(opts)).rejects.toMatchObject({ code: "EEXIST" });
+    expect(existsSync(`${first.dir}/relay.sock`)).toBe(true);
+    await first.close();
   });
 });
 
@@ -458,7 +488,7 @@ describe("relay: timeouts and lifetime", () => {
 });
 
 describe("relay: unit isolation (what the host controls)", () => {
-  it("same uid, two turns: each unit is bound ONLY its own directory, so the other's socket path does not exist in it", async () => {
+  it("same uid, two turns: each unit is bound ONLY its own directory (path construction; same-uid /proc reachability is a documented residual, see deploy/README.md)", async () => {
     const r = rig();
     const a = await r.open();
     const b = await r.open();

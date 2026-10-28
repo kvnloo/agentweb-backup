@@ -186,6 +186,7 @@ async function callTool(name, args, meta) {
 
 // ── MCP over stdio ──
 let chain = Promise.resolve(); // calls are serialized: the host allows ONE pending operation per turn
+const cancelled = new Set(); // JSON-RPC ids of requests the CLI cancelled
 const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 rl.on("line", (line) => {
   let m;
@@ -196,7 +197,15 @@ rl.on("line", (line) => {
   }
   if (!m || typeof m !== "object") return;
   if (m.method === "tools/list") listCount++;
-  if (m.id === undefined) return; // a notification (initialized, cancelled, ...)
+  if (m.id === undefined) {
+    // notifications/cancelled: the CLI no longer wants the answer to that request. Nothing is answered for it. A call not yet sent is skipped; one already pending
+    // at the host keeps its slot until the host answers or times it out (the next call waits behind it, so the host never sees two), and its result is dropped.
+    if (m.method === "notifications/cancelled" && m.params && m.params.requestId !== undefined) {
+      if (cancelled.size >= 1000) cancelled.clear(); // bounded: ids of requests that were already answered would otherwise accumulate
+      cancelled.add(String(m.params.requestId));
+    }
+    return;
+  }
   switch (m.method) {
     case "initialize":
       return reply(m.id, {
@@ -210,12 +219,17 @@ rl.on("line", (line) => {
       return reply(m.id, { tools: listing() });
     case "tools/call":
       chain = chain.then(async () => {
+        const rid = String(m.id);
+        if (cancelled.delete(rid)) return; // cancelled before it was sent: nothing to do, nothing to answer
+        let result;
         try {
-          reply(m.id, await callTool(m.params && m.params.name, m.params && m.params.arguments, m.params && m.params._meta));
+          result = await callTool(m.params && m.params.name, m.params && m.params.arguments, m.params && m.params._meta);
         } catch {
           fail("E_CALL");
-          reply(m.id, textResult("The tool call failed.", true));
+          result = textResult("The tool call failed.", true);
         }
+        if (cancelled.delete(rid)) return; // cancelled while pending: the result is dropped
+        reply(m.id, result);
       });
       return;
     default:
