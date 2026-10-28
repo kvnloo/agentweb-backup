@@ -16,6 +16,7 @@ import type { SmartleadAddLeadsResult, SmartleadCampaignDetail, SmartleadCampaig
 import { SmartleadApiError, scrubSmartleadSecrets, type UnsubscribeOutcome } from "./smartleadService";
 import { listSmartleadMarkers } from "./smartleadMarkers";
 import { withdrawalSweep, type SweepResult } from "./smartleadWithdrawal";
+import { isDoNotContact } from "../utils/leadContactStatus";
 
 /**
  * The service behind the Smartlead push routes and the resumer (ENG-673): who may push, which key is used, starting a run, controlling it,
@@ -252,7 +253,7 @@ export class SmartleadPushService {
    * A list editor clears the Smartlead marker of leads, so AgentWeb's own senders may email them again (a mistaken push must not block a contact
    * for ever). It changes nothing in Smartlead: a lead still in an ACTIVE campaign is then emailed from two places, and the dialog says so.
    */
-  release(userId: string, body: Record<string, any>): Promise<Result<{ released: number; skipped: { notFound: number; nothingToRelease: number } }>> {
+  release(userId: string, body: Record<string, any>): Promise<Result<{ released: number; skipped: { notFound: number; nothingToRelease: number; doNotContact: number } }>> {
     return this.guard(async () => {
       const list = await this.ownList(userId, body.listId);
       if (!list.ok) return list;
@@ -262,11 +263,14 @@ export class SmartleadPushService {
       }
       const only = body.campaignId === undefined || body.campaignId === null ? undefined : Number(body.campaignId);
       if (only !== undefined && (!Number.isInteger(only) || only <= 0)) return fail(400, "bad_request", "The campaign must be a positive whole number.");
-      const result = { released: 0, skipped: { notFound: 0, nothingToRelease: 0 } };
+      const result = { released: 0, skipped: { notFound: 0, nothingToRelease: 0, doNotContact: 0 } };
       const at = this.deps.now().toISOString();
       for (const leadId of ids as string[]) {
         const lead = await this.deps.crm.readLeadConsistent(String(body.listId), leadId);
         if (!lead) { result.skipped.notFound++; continue; }
+        // A lead that is do-not-contact is not released: AgentWeb's own senders skip it anyway, and the withdrawal sweep must keep stopping it
+        // in Smartlead (releasing would only churn the marker, and a withdrawn marker keeps AgentWeb off a lead that is later re-subscribed).
+        if (isDoNotContact(lead)) { result.skipped.doNotContact++; continue; }
         const live = listSmartleadMarkers(lead).filter(m => (only === undefined || m.campaignId === only) && (m.marker.state === "pushed" || m.marker.state === "withdrawn"));
         if (live.length === 0) { result.skipped.nothingToRelease++; continue; }
         for (const m of live) await this.deps.crm.writeMarker(String(body.listId), leadId, m.key, { ...m.marker, state: "released", releasedAt: at, releasedBy: userId });
@@ -288,6 +292,7 @@ export class SmartleadPushService {
         readLeadConsistent: (l, id) => this.deps.crm.readLeadConsistent(l, id),
         writeMarker: (l, id, k, m) => this.deps.crm.writeMarker(l, id, k, m),
         smartlead: {
+          campaignVisible: async (apiKey, campaignId) => (await this.deps.smartlead.getCampaign(apiKey, campaignId)) !== null,
           unsubscribe: (apiKey, id) => this.deps.smartlead.unsubscribeLead(apiKey, id),
           findLeadId: (apiKey, email) => this.deps.smartlead.findLeadId(apiKey, email),
         },
