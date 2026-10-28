@@ -68,6 +68,7 @@ const schema = z
         turnWrapperPath: absPath.default("/opt/aw-login-host/claude-turn.sh"),
         /** ENG-2113 tool relay: the stdio MCP shim the CLI starts inside the unit, and the node binary that runs it (both root-controlled, trusted-path checked). */
         relayShimPath: absPath.default("/opt/aw-login-host/aw-relay-shim.js"),
+        /** MUST be a real path, not a symlink (assertTrustedPath refuses links): the prod template names /opt/aw-node/v<ver>/bin/node. The default only suits a host where /usr/bin/node is a real file. */
         nodePath: absPath.default("/usr/bin/node"),
         /** The Emma tool bridge's MCP endpoint as seen from a customer process. */
         bridgeUrl: z

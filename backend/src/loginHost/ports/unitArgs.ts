@@ -128,7 +128,9 @@ export function unitProperties(layout: Layout, spec: UnitSpec, limits: UnitLimit
           // /run is replaced by an empty read-only tmpfs so no host socket is even visible; only the egress proxy socket directory is bound in.
           "TemporaryFileSystem=/run:ro",
           `BindReadOnlyPaths=${assertAbsPath(paths.net.dir)}:/run/aw-egress`,
-          // This turn's relay directory ONLY (never the relay root or the uid's directory): another turn's socket is ENOENT in here, even for the same uid.
+          // This turn's relay directory ONLY (never the relay root or the uid's directory): another turn's relay PATH is absent from this unit's mount namespace.
+          // That is a path-level fact, NOT process isolation: a process of the SAME uid in another unit may still reach it through /proc/<pid>/root (ProtectProc=invisible
+          // hides other users' processes, not the same user's; PrivatePIDs needs systemd >= 255, the worker has 252). Same-uid turns are one trust domain (one customer's own login).
           ...(spec.relayDir !== undefined ? [`BindReadOnlyPaths=${assertAbsPath(spec.relayDir)}:${RELAY_MOUNT}`] : []),
         ]
       : []),
