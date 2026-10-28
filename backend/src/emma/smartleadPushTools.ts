@@ -327,7 +327,8 @@ emmaToolRegistry.register({
     const svc = getSmartleadPushService();
     await attendedSession(context);
     const { listName } = unwrap(await svc.canUseList(userId, listId));
-    const distinct = [...new Set(ids as string[])];
+    // Sorted, so the contacts the card names are not the ones the model chose to list first.
+    const distinct = [...new Set(ids as string[])].sort();
     const { emails: sample } = unwrap(await svc.sampleLeads(userId, listId, distinct));
     const halt = await requireApproval({
       context,
