@@ -64,7 +64,7 @@ describe("executeRun (ENG-673)", () => {
     expect(t.marked()).toBe(10);
     expect(t.run).toMatchObject({ status: "completed", listExhausted: true, cursor: { listId: "L", leadId: "lead_00010" } });
     expect(t.run.counts).toMatchObject({ examined: 10, added: 10, alreadyInCampaign: 0 });
-    expect(t.leads[0].system[smartleadMarkerKey(CAMPAIGN)]).toMatchObject({ state: "pushed", runId: "run1", smartleadLeadId: "9000" });
+    expect(t.leads[0].system[smartleadMarkerKey(CAMPAIGN)]).toMatchObject({ state: "pushed", runId: "run1", smartleadLeadId: "9000", email: "p1@example.com" }); // the address that was pushed: the sweep trusts the id only while it matches
   });
 
   it("sends at most 400 a request and moves the cursor exactly to the last lead examined", async () => {
@@ -429,6 +429,25 @@ describe("executeRun (ENG-673)", () => {
     expect(t.sl.emails.size).toBe(900);
   });
 
+  it("pauses at the next batch with the reason the permission check gives (a shared connection un-shared mid-run), keeping what was already added", async () => {
+    const t = setup(900);
+    let verdict: string | null = null;
+    const asked: number[] = [];
+    t.deps.stillPermitted = async () => { asked.push(t.sl.posts.length); return verdict; };
+    t.sl.onPost = () => { verdict = "connection_unshared"; };
+    await expect(executeRun(t.run, t.deps)).resolves.toEqual({ outcome: "paused", reason: "connection_unshared" });
+    expect(t.sl.posts).toHaveLength(1);
+    expect(t.marked()).toBe(400); // the batch in flight was recorded first
+    expect(asked).toEqual([0, 1]); // asked before every batch
+  });
+
+  it("a permission check that always passes changes nothing", async () => {
+    const t = setup(900);
+    t.deps.stillPermitted = async () => null;
+    await expect(executeRun(t.run, t.deps)).resolves.toEqual({ outcome: "completed" });
+    expect(t.sl.emails.size).toBe(900);
+  });
+
   it("completes an empty list without calling Smartlead's add", async () => {
     const t = setup(0, { leads: [] });
     await expect(executeRun(t.run, t.deps)).resolves.toEqual({ outcome: "completed" });
@@ -441,8 +460,25 @@ describe("executeRun (ENG-673)", () => {
     expect(t.store.heartbeats).toBeGreaterThanOrEqual(8);
   });
 
+  it("pins the cohort to the PREVIEW time: a lead created after the user previewed (but before the run started) is not pushed", async () => {
+    const leads = [mkLead(1, { createdAt: "2026-10-27T00:30:00.000Z" }), mkLead(2, { createdAt: "2026-10-27T00:10:00.000Z" }), mkLead(3, { createdAt: "2026-10-26T12:00:00.000Z" })];
+    const t = setup(2, { leads, run: { startedAt: "2026-10-27T00:40:00.000Z", options: { includeUnverified: false, mapping: {}, startStatus: "DRAFTED", approvedAt: "2026-10-27T00:20:00.000Z" } } });
+    await executeRun(t.run, t.deps);
+    expect(t.sl.posts.flat().sort()).toEqual(["p2@example.com", "p3@example.com"]); // lead 1 appeared after the preview
+    expect(t.run.counts.skippedByReason.created_after_start).toBe(1);
+  });
+
+  it("falls back to the run start when no preview time was recorded", async () => {
+    const t = setup(1, { leads: [mkLead(1, { createdAt: "2026-10-27T00:30:00.000Z" })], run: { startedAt: "2026-10-27T00:40:00.000Z" } });
+    await executeRun(t.run, t.deps);
+    expect(t.sl.posts.flat()).toEqual(["p1@example.com"]);
+  });
+
   it("reads the approved options defensively", () => {
     expect(readPushOptions({ includeUnverified: "yes", mapping: { industry: "customFields.industry", bad: 5 }, startStatus: "drafted" })).toEqual({ includeUnverified: false, mapping: { industry: "customFields.industry" }, startStatus: "DRAFTED" });
     expect(readPushOptions(undefined)).toEqual({ includeUnverified: false, mapping: {}, startStatus: "" });
+    expect(readPushOptions({ approvedAt: "2026-10-27T00:20:00.000Z" }).approvedAt).toBe("2026-10-27T00:20:00.000Z");
+    expect(readPushOptions({ approvedAt: "not a date" }).approvedAt).toBeUndefined();
+    expect(readPushOptions({ approvedAt: 5 }).approvedAt).toBeUndefined();
   });
 });

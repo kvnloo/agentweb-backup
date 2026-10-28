@@ -19,6 +19,7 @@ const previewLimiter = limiter(30, 'Too many previews. Try again in a few minute
 const startLimiter = limiter(10, 'Too many push attempts. Try again in a few minutes.');
 // Listing campaigns spends the customer's own Smartlead API budget, which a running push also needs.
 const campaignsLimiter = limiter(30, 'Too many requests. Try again in a few minutes.');
+const releaseLimiter = limiter(30, 'Too many requests. Try again in a few minutes.');
 
 function send(res: express.Response, result: { ok: boolean; status?: number; [k: string]: any }, okStatus = 200) {
   if (result.ok) {
@@ -49,6 +50,11 @@ router.post('/preview', authenticateToken, previewLimiter, wrap(async (req, res)
 
 router.post('/start', authenticateToken, startLimiter, wrap(async (req, res) => {
   send(res, await getSmartleadPushService().start(req.user.userId, req.body ?? {}));
+}));
+
+// A list editor releases leads from Smartlead: AgentWeb's own senders may email them again. Changes nothing in Smartlead.
+router.post('/leads/release', authenticateToken, releaseLimiter, wrap(async (req, res) => {
+  send(res, await getSmartleadPushService().release(req.user.userId, req.body ?? {}));
 }));
 
 router.get('/lists/:listId/runs', authenticateToken, wrap(async (req, res) => {

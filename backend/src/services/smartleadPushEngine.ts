@@ -32,6 +32,8 @@ type Lead = Record<string, any>;
 export interface PushRunOptions {
   includeUnverified: boolean;
   mapping: TagMapping;
+  /** When the user previewed (the approval token's issue time): leads created after this were never part of what they saw. Falls back to the run start. */
+  approvedAt?: string;
   /** The campaign's status when the run was approved: DRAFTED or PAUSED runs stop if the campaign is started under them. */
   startStatus: string;
 }
@@ -40,7 +42,8 @@ export function readPushOptions(raw: Record<string, unknown> | undefined): PushR
   const mapping: TagMapping = {};
   const m = raw?.mapping;
   if (m && typeof m === "object" && !Array.isArray(m)) for (const [k, v] of Object.entries(m)) if (typeof v === "string") mapping[k] = v;
-  return { includeUnverified: raw?.includeUnverified === true, mapping, startStatus: typeof raw?.startStatus === "string" ? raw.startStatus.toUpperCase() : "" };
+  const approvedAt = typeof raw?.approvedAt === "string" && !Number.isNaN(Date.parse(raw.approvedAt)) ? raw.approvedAt : undefined;
+  return { includeUnverified: raw?.includeUnverified === true, mapping, startStatus: typeof raw?.startStatus === "string" ? raw.startStatus.toUpperCase() : "", ...(approvedAt ? { approvedAt } : {}) };
 }
 
 export interface EngineDeps {
@@ -57,6 +60,11 @@ export interface EngineDeps {
   };
   /** The operator's kill switch: checked before every batch; a true answer pauses the run (`disabled_by_operator`), it can be resumed later. */
   isDisabled?(): boolean;
+  /**
+   * Checked before every batch, after the kill switch: a reason (for example `connection_unshared`) pauses the run with it, null lets it go on.
+   * Used for a teammate pushing through a shared connection, so un-sharing stops the run at the next batch, not only at the next start.
+   */
+  stillPermitted?(): Promise<string | null>;
   /** Told about a failed Smartlead call, so the caller can flag a rejected key (reportSmartleadFailure). Must not throw. */
   onSmartleadError?(error: unknown): void;
   sleep(ms: number): Promise<void>;
@@ -167,6 +175,8 @@ export async function executeRun(run: PushRun, deps: EngineDeps): Promise<RunOut
     for (;;) {
       await beat();
       if (deps.isDisabled?.()) return await pause("disabled_by_operator");
+      const refused = deps.stillPermitted ? await deps.stillPermitted() : null;
+      if (refused) return await pause(refused);
 
       // The approved count is a hard ceiling: a lead that became eligible after the preview can never widen the approved set.
       if (run.previewEligible - (added + already) <= 0 || run.listExhausted) {
@@ -200,7 +210,8 @@ export async function executeRun(run: PushRun, deps: EngineDeps): Promise<RunOut
         tags: analysis.tags,
         mapping: options.mapping,
         includeUnverified: options.includeUnverified,
-        runStartedAt: run.startedAt,
+        // Pinned to the PREVIEW, not the start: a lead created or imported in between was never shown to the user.
+        runStartedAt: options.approvedAt ?? run.startedAt,
       };
 
       // ── build one batch: whole pages only, so the cursor is exactly the last lead examined
@@ -315,7 +326,7 @@ export async function executeRun(run: PushRun, deps: EngineDeps): Promise<RunOut
         for (const e of toSend) {
           const email = e.input.email.toLowerCase();
           const smartleadLeadId = idByEmail.get(email);
-          if (smartleadLeadId) toMark.push({ leadId: String(e.lead.leadId), marker: buildSmartleadMarker({ runId: run.runId, payloadHash: e.payloadHash, smartleadLeadId, now: deps.now() }) });
+          if (smartleadLeadId) toMark.push({ leadId: String(e.lead.leadId), marker: buildSmartleadMarker({ runId: run.runId, payloadHash: e.payloadHash, smartleadLeadId, email: e.input.email, now: deps.now() }) });
           else if (invalid.has(email)) { add(skipped, "smartlead_invalid"); namedInvalid++; }
           else if (unsubscribed.has(email)) { add(skipped, "smartlead_unsubscribed"); namedUnsubscribed++; }
           else if (otherMapEmails.has(email)) unresolvedOther++;

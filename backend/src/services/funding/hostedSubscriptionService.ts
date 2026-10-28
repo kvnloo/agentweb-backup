@@ -22,6 +22,8 @@ import { MAX_ACTIVE_CONNECTIONS_PER_OWNER, toView, type Actor, type LlmConnectio
 import type { LoginReady } from "../../loginHost/connectionManager";
 import { LoginHostClient, LoginHostError, UnixSocketTransport } from "./loginHostClient";
 import { getLoginHostProvider } from "./loginHostProvider";
+import { PROTOCOL_VERSION } from "../../loginHost/protocol";
+import { openSignInToken, sealSignInToken, signInKey } from "./hostedSignInToken";
 
 export type HostedErrorCode =
   | "disabled" | "forbidden" | "not_found" | "unsupported_provider" | "login_not_found" | "too_many_logins" | "bad_code_format"
@@ -80,6 +82,11 @@ export interface HostedSubscriptionDeps {
    */
   workerSpeaksOurProtocol?: () => boolean;
   /**
+   * The protocol version the worker reported (undefined while unknown). Fields added in protocol 3 (completion nonce, cancel-only-if-pending) are sent only to a
+   * worker that reports 3 or more: an older worker refuses unknown fields, which would make every complete fail. Default: trusted (single-box test environments, unit tests).
+   */
+  workerProtocol?: () => number | undefined;
+  /**
    * Called once the record is fenced for revocation (before the host is asked to wipe it): the caller stops every running turn of THIS process that
    * uses the connection, so a tool call cannot start under a login the user just disconnected. Never throws into the revoke; a failure is logged.
    * Turns running in another process are caught by the bridge's per-write liveness check.
@@ -93,7 +100,8 @@ interface Pending {
   connectionId: string;
   loginRef: string;
   reconnect: boolean;
-  timer: NodeJS.Timeout;
+  /** Unset for a sign-in rebuilt from its token (it is held by no timer on this instance). */
+  timer?: NodeJS.Timeout;
   expiresAtMs: number;
 }
 
@@ -111,6 +119,8 @@ export interface SweepResult {
 export class HostedSubscriptionService {
   private readonly pending = new Map<string, Pending>();
   private readonly starting = new Set<string>();
+  /** Sign-ins being completed by THIS instance: a double-submitted complete must not send the single-use code twice (the host also refuses it). */
+  private readonly completing = new Set<string>();
   private readonly providers: Record<string, HostedProvider>;
   private sweeping: Promise<SweepResult> | undefined;
 
@@ -175,15 +185,31 @@ export class HostedSubscriptionService {
       } catch (err) {
         throw this.startError(err);
       }
-      const loginId = randomBytes(16).toString("hex");
-      const expiresAtMs = Math.min(started.expiresAtMs, this.deps.now() + LOGIN_TTL_MS);
-      const timer = setTimeout(() => void this.expire(loginId), Math.max(1_000, expiresAtMs - this.deps.now()));
+      // The token and the local timer use the BACKEND's clock only: mixing in the host's absolute time would shrink every window by any clock difference between the
+      // two machines, and the host enforces its own expiry anyway (an expired attempt answers login_not_found). The host's time only shortens what the user is shown.
+      const expiresAtMs = this.deps.now() + LOGIN_TTL_MS;
+      // Sealed so that ANY backend instance can finish this sign-in (a deploy replaces the instance that started it).
+      let loginId: string;
+      try {
+        loginId = sealSignInToken({ userId: actor.userId, provider: p.route, connectionId, loginRef: started.loginRef, reconnect: !!input.reconnectConnectionId, expiresAtMs });
+      } catch (err) {
+        // No token, so nobody can ever complete this attempt: do not leave it on the host to block the next sign-in.
+        await client.loginCancel({ connectionId, loginRef: started.loginRef }).catch(() => undefined);
+        throw err;
+      }
+      const key = signInKey(connectionId, started.loginRef);
+      const timer = setTimeout(() => void this.expire(key), Math.max(1_000, expiresAtMs - this.deps.now()));
       timer.unref?.();
-      this.pending.set(loginId, { userId: actor.userId, provider: p, connectionId, loginRef: started.loginRef, reconnect: !!input.reconnectConnectionId, timer, expiresAtMs });
-      return { loginId, authorizeUrl: started.url, ceremony: started.ceremony, ...(started.userCode ? { userCode: started.userCode } : {}), expiresAt: new Date(expiresAtMs).toISOString() };
+      this.pending.set(key, { userId: actor.userId, provider: p, connectionId, loginRef: started.loginRef, reconnect: !!input.reconnectConnectionId, timer, expiresAtMs });
+      return { loginId, authorizeUrl: started.url, ceremony: started.ceremony, ...(started.userCode ? { userCode: started.userCode } : {}), expiresAt: new Date(Math.min(started.expiresAtMs, expiresAtMs)).toISOString() };
     } finally {
       this.starting.delete(actor.userId);
     }
+  }
+
+  private workerHasProtocol3(): boolean {
+    const v = this.deps.workerProtocol ? this.deps.workerProtocol() : Number.MAX_SAFE_INTEGER;
+    return typeof v === "number" && v >= 3;
   }
 
   private startError(err: unknown): HostedSubscriptionError {
@@ -198,49 +224,74 @@ export class HostedSubscriptionService {
 
   async completeLogin(actor: Actor, loginId: string, code: unknown): Promise<LlmConnectionView> {
     if (actor.adminId) throw new HostedSubscriptionError("forbidden");
-    const pending = typeof loginId === "string" ? this.pending.get(loginId) : undefined;
+    const found = this.lookup(loginId);
     // Same answer for unknown, expired and someone else's: a wrong caller never cancels the real login.
-    if (!pending || pending.userId !== actor.userId) throw new HostedSubscriptionError("login_not_found");
-    // Taken BEFORE any await: a double-submitted complete must not send the single-use code to the host twice.
-    this.pending.delete(loginId);
+    if (!found || found.pending.userId !== actor.userId) throw new HostedSubscriptionError("login_not_found");
+    const { key, pending } = found;
+    // Taken BEFORE any await: a double-submitted complete must not send the single-use code to the host twice. Keyed by the attempt, not by the
+    // string the client sent, so no spelling of the token gets past it.
+    if (this.completing.has(key)) throw new HostedSubscriptionError("login_not_found");
+    this.completing.add(key);
+    this.pending.delete(key);
     clearTimeout(pending.timer);
+    try {
+      return await this.completeTaken(actor, key, pending, code);
+    } finally {
+      this.completing.delete(key);
+    }
+  }
+
+  /** This instance's pending sign-in, or (started by another instance or before a deploy) the one the token describes. */
+  private lookup(loginId: unknown): { key: string; pending: Pending } | undefined {
+    const t = openSignInToken(loginId, this.deps.now());
+    const provider = t && Object.prototype.hasOwnProperty.call(this.providers, t.provider) ? this.providers[t.provider] : undefined;
+    if (!t || !provider) return undefined;
+    const key = signInKey(t.connectionId, t.loginRef);
+    const local = this.pending.get(key);
+    if (local) return { key, pending: local };
+    return { key, pending: { userId: t.userId, provider, connectionId: t.connectionId, loginRef: t.loginRef, reconnect: t.reconnect, expiresAtMs: t.expiresAtMs } };
+  }
+
+  private async completeTaken(actor: Actor, key: string, pending: Pending, code: unknown): Promise<LlmConnectionView> {
     const { connectionId, loginRef, provider: p } = pending;
     if (!(await p.isEnabledFor(actor.userId))) {
-      this.restore(loginId, pending);
+      this.restore(key, pending);
       throw new HostedSubscriptionError("disabled");
     }
     let client: LoginHostClient;
     try {
       client = this.host();
     } catch (err) {
-      this.restore(loginId, pending);
+      this.restore(key, pending);
       throw err;
     }
 
+    // Protocol 3: a random per-request value the host stores on the attempt that takes the code, so a lost-reply read of the status can tell whose complete it was.
+    const completionNonce = this.workerHasProtocol3() ? randomBytes(12).toString("base64url") : undefined;
     let ready;
     try {
-      ready = await client.loginComplete({ connectionId, loginRef, code: code as string });
+      ready = await client.loginComplete({ connectionId, loginRef, code: code as string, ...(completionNonce ? { completionNonce } : {}) });
     } catch (err) {
       if (err instanceof ZodError) {
         // Malformed code: nothing reached the host, so the sign-in is still pending and can be completed with a corrected code.
-        this.restore(loginId, pending);
+        this.restore(key, pending);
         throw new HostedSubscriptionError("bad_code_format");
       }
-      ready = await this.afterCompleteError(client, err, connectionId, loginRef);
+      ready = await this.afterCompleteError(client, err, connectionId, loginRef, completionNonce);
     }
 
     if (pending.reconnect) return this.finishReconnect(actor, p, client, connectionId, loginRef, ready);
     return this.finishNew(actor, p, client, connectionId, loginRef, ready);
   }
 
-  private restore(loginId: string, pending: Pending): void {
-    this.pending.set(loginId, pending);
-    pending.timer = setTimeout(() => void this.expire(loginId), Math.max(1_000, pending.expiresAtMs - this.deps.now()));
+  private restore(key: string, pending: Pending): void {
+    this.pending.set(key, pending);
+    pending.timer = setTimeout(() => void this.expire(key), Math.max(1_000, pending.expiresAtMs - this.deps.now()));
     pending.timer.unref?.();
   }
 
   /** `login.complete` failed: decide between "start again", "wrong code" and (for a lost reply) "it may have worked". */
-  private async afterCompleteError(client: LoginHostClient, err: unknown, connectionId: string, loginRef: string): Promise<LoginReady> {
+  private async afterCompleteError(client: LoginHostClient, err: unknown, connectionId: string, loginRef: string, completionNonce: string | undefined): Promise<LoginReady> {
     if (err instanceof LoginHostError) {
       if (err.code === "EINVALID" && err.detail === "code_rejected") throw new HostedSubscriptionError("code_rejected");
       if (err.code === "ENOTFOUND" || err.code === "ESTATE") throw new HostedSubscriptionError("login_not_found");
@@ -249,15 +300,24 @@ export class HostedSubscriptionService {
         // The code is single-use and may have been spent: ask the host once whether the attempt became ready.
         try {
           const st = await client.loginStatus({ connectionId, loginRef });
-          if (st.status === "ready") return st;
-        } catch {
+          if (st.status === "ready") {
+            // Ready, but did THIS request take the code? A protocol-3 host stores the nonce of the complete that took it, so a ready attempt with another nonce, or with
+            // none (the winner was an older backend instance that sends no nonce, as in a rolling deploy), was taken by someone else: this one lost. It must stand down
+            // WITHOUT cancelling, or it would discard the winner's login. (No nonce was sent = an older worker: the previous behaviour.)
+            if (completionNonce && st.completionNonce !== completionNonce) throw new HostedSubscriptionError("login_not_found");
+            return st;
+          }
+        } catch (inner) {
+          if (inner instanceof HostedSubscriptionError) throw inner;
           /* fall through */
         }
-        await client.loginCancel({ connectionId, loginRef }).catch(() => undefined);
+        // Neither the reply nor the status arrived: the attempt may be ready and taken by ANOTHER request, so this cancel must not discard it (onlyIfPending). If this
+        // request did take it, the host's ready-attempt limit clears it.
+        await client.loginCancel({ connectionId, loginRef, ...(completionNonce ? { onlyIfPending: true } : {}) }).catch(() => undefined);
         throw new HostedSubscriptionError("complete_timeout");
       }
     }
-    await client.loginCancel({ connectionId, loginRef }).catch(() => undefined);
+    await client.loginCancel({ connectionId, loginRef, ...(completionNonce ? { onlyIfPending: true } : {}) }).catch(() => undefined);
     throw new HostedSubscriptionError("start_failed");
   }
 
@@ -354,26 +414,35 @@ export class HostedSubscriptionService {
   }
 
   async cancelLogin(actor: Actor, loginId: string): Promise<void> {
-    const pending = this.pending.get(loginId);
-    if (!pending || pending.userId !== actor.userId) return; // nothing to say about someone else's
-    await this.expire(loginId);
+    const found = this.lookup(loginId);
+    if (!found || found.pending.userId !== actor.userId) return; // nothing to say about someone else's
+    // A complete in flight owns the attempt: cancelling it now would discard the host's ready login after the code was spent.
+    if (this.completing.has(found.key)) return;
+    this.pending.set(found.key, found.pending);
+    await this.expire(found.key);
   }
 
   private async cancelFor(userId: string): Promise<void> {
     for (const [id, pend] of [...this.pending]) if (pend.userId === userId) await this.expire(id);
   }
 
-  private async expire(loginId: string): Promise<void> {
-    const pend = this.pending.get(loginId);
+  private async expire(key: string): Promise<void> {
+    const pend = this.pending.get(key);
     if (!pend) return;
-    this.pending.delete(loginId);
+    this.pending.delete(key);
     clearTimeout(pend.timer);
     // Best effort: the host expires an abandoned attempt itself.
-    await this.deps.client()?.loginCancel({ connectionId: pend.connectionId, loginRef: pend.loginRef }).catch(() => undefined);
+    // Protocol 3: a cancel that is only the user's or the timer's must not discard a sign-in that already took its code (it is being finished, maybe by another instance).
+    await this.deps.client()?.loginCancel({ connectionId: pend.connectionId, loginRef: pend.loginRef, ...(this.workerHasProtocol3() ? { onlyIfPending: true } : {}) }).catch(() => undefined);
   }
 
+  /**
+   * Stops this instance's timers. It does NOT cancel the pending sign-ins on the host: a sign-in is no longer tied to the instance that started it (any instance can
+   * finish it from its token), and a deploy shuts the old instance down while the user is still on the sign-in page. The host expires an abandoned attempt itself.
+   */
   async shutdown(): Promise<void> {
-    for (const id of [...this.pending.keys()]) await this.expire(id);
+    for (const pend of this.pending.values()) clearTimeout(pend.timer);
+    this.pending.clear();
   }
 
   pendingCount(): number {
@@ -539,6 +608,7 @@ export function getHostedSubscriptionService(): HostedSubscriptionService {
       newId: () => randomUUID(),
       // The test environment's unix-socket host is built from the same checkout; the production worker must have been VERIFIED.
       workerSpeaksOurProtocol: () => !!process.env.AW_LOGIN_HOST_SOCKET || getLoginHostProvider().protocolStatus() === "match",
+      workerProtocol: () => (process.env.AW_LOGIN_HOST_SOCKET ? PROTOCOL_VERSION : getLoginHostProvider().workerProtocol()),
       // Required on first use, not at load: the bridge singletons pull in Emma's whole service, which the sweeper and the routes must not load
       // just to exist. Synchronous on purpose: the turns are stopped before this call returns, i.e. before the host is asked to wipe the login.
       onRevokeBegun: (connectionId) => {

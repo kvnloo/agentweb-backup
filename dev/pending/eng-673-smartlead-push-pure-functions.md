@@ -1,4 +1,4 @@
-## ENG-673: pure functions for the Smartlead push (PR-A, 2026-10-27)
+## ENG-673: pure functions for the Smartlead push — PR-A (2026-10-27)
 
 The first building blocks of pushing a CRM list into a customer's own Smartlead campaign. All pure: no route, no table, no network call, nothing calls them yet.
 

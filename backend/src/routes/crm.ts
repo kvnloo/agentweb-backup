@@ -24,6 +24,7 @@ import { emailEventsDb } from '../services/emailEventsDb';
 import { dynamodb } from '../config/aws';
 import { io } from '../server';
 import { isDoNotContact } from '../utils/leadContactStatus';
+import { isPushedToSmartlead } from '../services/smartleadMarkers';
 import { contactSuppressionAuditEnabled, contactSuppressionAuditEvent, guardLeadPutBody, leadWriteChannel, touchesContactSuppression } from '../utils/leadWriteGuard';
 import { suppressLeadSideEffects } from '../utils/sessionList';
 import { isLinkedInInfraError, LINKEDIN_UNAVAILABLE_MESSAGE } from '../utils/linkedInInfraError';
@@ -1887,6 +1888,9 @@ router.post('/lists/:listId/leads/enrich-v3', async (req: Request, res: Response
       },
     );
     console.log(`[v3][route] enrich-v3 response listId=${listId} processed=${result.processed} durationMs=${result.durationMs}`);
+    if (result.budgetStop) {
+      return res.status(result.processed === 0 ? 402 : 200).json({ ...result, message: result.budgetStop.message });
+    }
     return res.json(result);
   } catch (error) {
     console.error('[v3][route] enrich-v3 failed:', error);
@@ -6526,6 +6530,15 @@ router.post('/lists/:listId/leads/:leadId/send-email', async (req: Request, res:
       return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
+    // ENG-673: this contact is being emailed through the customer's Smartlead campaign. A person sending ONE email by hand may still want to, so
+    // this is a confirmation (the portal asks), not a block; bulk and automated sends skip such leads outright.
+    if (isPushedToSmartlead(lead) && req.body?.confirmPushedToSmartlead !== true) {
+      return res.status(409).json({
+        code: 'pushed_to_smartlead',
+        message: "This contact is being emailed through your Smartlead campaign, so nothing was sent from AgentWeb (they would get email from two places). To send anyway, confirm it in the lead panel.",
+      });
+    }
+
     // ENG-266 Part 3: route through the sender's real provider. If senderId/senderEmail
     // don't resolve to a configured sender (an older client, or an ad-hoc address),
     // fall back to a synthesized resend sender from the raw fields — same as before.
@@ -6928,8 +6941,11 @@ router.post('/lists/:listId/group-email/preview', async (req: Request, res: Resp
     // Eligibility = has email && not DNC && not undeliverable && not
     // malformed/test-domain. Single boolean filter (not arithmetic
     // subtraction) so overlapping categories don't produce negative counts.
+    // ENG-673: a lead pushed to a customer's Smartlead campaign is emailed from there, so AgentWeb's own group email leaves it out (send, preview
+    // and prepare all apply the same rule, or the preview would promise recipients the send does not make).
+    const smartlead = leads.filter((l: any) => l.email && !isDoNotContact(l) && isPushedToSmartlead(l)).length;
     const eligibleLeads = leads.filter((l: any) =>
-      l.email && !isDoNotContact(l) && validationStatus(l) !== 'undeliverable' && isEligibleGroupEmailRecipient(l.email),
+      l.email && !isDoNotContact(l) && !isPushedToSmartlead(l) && validationStatus(l) !== 'undeliverable' && isEligibleGroupEmailRecipient(l.email),
     ).length;
 
     // Return small samples (first 50) of email lists so the UI modals can show
@@ -6943,6 +6959,8 @@ router.post('/lists/:listId/group-email/preview', async (req: Request, res: Resp
       eligibleLeads,
       unsubscribedCount: doNotContactCount,
       doNotContactCount,
+      /** Left out because they are being emailed through the customer's Smartlead campaign (ENG-673). */
+      smartleadCount: smartlead,
       noEmailCount,
       undeliverableCount,
       riskyCount,
@@ -6992,7 +7010,7 @@ router.post('/lists/:listId/group-email/prepare', async (req: Request, res: Resp
 
     // Only consider eligible leads (have email, not do-not-contact/unsubscribed, valid syntax/domain)
     const eligibleLeads = leads.filter(
-      (l: any) => l.email && !isDoNotContact(l) && isEligibleGroupEmailRecipient(l.email),
+      (l: any) => l.email && !isDoNotContact(l) && !isPushedToSmartlead(l) && isEligibleGroupEmailRecipient(l.email),
     );
     const eligibleCount = eligibleLeads.length;
 
@@ -7102,6 +7120,11 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
     // endpoint catching up. ENG-2082 turns the gap from a rarity into a routine one.
     const skippedNoEmail = leads.filter((l: any) => !l.email && !isDoNotContact(l)).length;
     let eligibleLeads = leads.filter((l: any) => l.email && !isDoNotContact(l));
+
+    // ENG-673: leads being emailed through the customer's Smartlead campaign are left to it. Counted and reported, never silently dropped.
+    const beforeSmartleadCount = eligibleLeads.length;
+    eligibleLeads = eligibleLeads.filter((l: any) => !isPushedToSmartlead(l));
+    const skippedSmartlead = beforeSmartleadCount - eligibleLeads.length;
 
     // ENG-1194: malformed addresses and provider-disallowed test domains (e.g.
     // example.com) always fail at the provider — same validator preview uses,
@@ -7285,6 +7308,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
       failureReasons,
       skippedUnsubscribed: skippedDoNotContact,
       skippedDoNotContact,
+      skippedSmartlead,
       skippedMissingVars,
       skippedUndeliverable,
       skippedInvalid,

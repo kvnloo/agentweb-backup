@@ -138,6 +138,30 @@ describe("buildLeadPayload", () => {
     expect(buildLeadPayload(lead(), { tagsUsed: ["x"], mapping: { x: "toString" } })).toEqual({ ok: false, reason: "missing_tag", tag: "x" });
   });
 
+  it("refuses addresses a real person never has: hidden or control characters, list separators, a pipe, a repeated or edge dot, a non-letter top-level domain", () => {
+    for (const email of ["a\u200b@x.com", "a@x.com,b", "a@x..com", "a\u0001@x.com", "a|b@x.com", "a;b@x.com", ".a@x.com", "a.@x.com", "a@.x.com", "a@x.com.", "a@x.123", "a@-x.com", "a`b@x.com", "a\u202e@x.com"]) {
+      expect(buildLeadPayload(lead({ email }), { tagsUsed: [], mapping: {} })).toEqual({ ok: false, reason: "invalid_email" });
+    }
+    for (const email of ["first.last+tag@sub.example.co.uk", "a_b-c@x.io", "A@X.COM", "o@xn--bcher-kva.example", "n@müller.de".replace("ü", "u"), "a@例え.日本", "a@x.中国", "用户@例子.广告", "a@пример.рф", "a@bücher.de"]) {
+      expect(buildLeadPayload(lead({ email }), { tagsUsed: [], mapping: {} }).ok).toBe(true);
+    }
+  });
+
+  it("leaves out a URL-type field with quotes, backticks, spaces or a script scheme (it may land inside href=\"...\" in the customer's template), but keeps an ordinary one", () => {
+    for (const website of ['https://x.com" onmouseover="alert(1)', "&#106;avascript:alert(1)", "&#x6A;avascript:alert(1)", "java&Tab;script:alert(1)", "https://x.com/?a=1&amp;b=2", "javascript:alert(1)", "JaVaScRiPt:alert(1)", "data:text/html;base64,AAAA", "vbscript:x", "https://x.com/a b", "https://x.com/`x`", "https://x.com/'x"]) {
+      const r = buildLeadPayload(lead({ website }), { tagsUsed: [], mapping: {} });
+      expect(r.ok && (r as any).input.website).toBeFalsy();
+      expect(r.ok && (r as any).input.company_url).toBeFalsy();
+    }
+    const unsafeAndUsed = buildLeadPayload(lead({ website: "javascript:alert(1)" }), { tagsUsed: ["website"], mapping: {} });
+    expect(unsafeAndUsed).toEqual({ ok: false, reason: "unsafe_text", tag: "website" });
+    for (const website of ["https://acme.com/path?x=1&y=2", "acme.com", "http://sub.acme.co.uk", "https://acme.com/a?x=1&y=2&z=3"]) {
+      expect((buildLeadPayload(lead({ website }), { tagsUsed: [], mapping: {} }) as any).input.website).toBe(website);
+    }
+    expect((buildLeadPayload(lead({ linkedin: 'https://linkedin.com/in/a"b' }), { tagsUsed: [], mapping: {} }) as any).input.linkedin_profile).toBeUndefined();
+    expect((buildLeadPayload(lead({ company: "Domino's Pizza" }), { tagsUsed: ["company_name"], mapping: {} }) as any).input.company_name).toBe("Domino's Pizza"); // quotes are fine in a company NAME
+  });
+
   it("refuses an email carrying markup, braces, quotes or a backslash, which would reach the customer's HTML as {{email}}", () => {
     for (const email of ["a<b>@x.com", "x{{y}}@z.com", 'a"b@x.com', "a'b@x.com", "a\\b@x.com", "a@x>.com"]) {
       expect(buildLeadPayload(lead({ email }), { tagsUsed: [], mapping: {} })).toEqual({ ok: false, reason: "invalid_email" });

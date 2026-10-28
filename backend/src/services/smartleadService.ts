@@ -374,6 +374,76 @@ export async function listCampaigns(apiKey: string, opts: { maxRetries?: number 
   return out;
 }
 
+export type UpdateLeadEmailOutcome = "ok" | "rejected" | "not_found" | "no_update";
+
+/**
+ * Changes the address of a lead that is already in a campaign, in place (`POST /campaigns/{campaign_id}/leads/{lead_id}/` with only `email`).
+ * Verified live (2026-10-28): the SAME lead id gets the new address, the old address is no longer in Smartlead (so it is no longer emailed),
+ * the lead's name, phone, website and custom fields are untouched, its campaign status is kept, and a lead that was unsubscribed stays
+ * unsubscribed. An address that already belongs to another lead is refused with HTTP 500 {"error":"Validation error"} and nothing changes:
+ * that is "rejected" (the body is not readable through the shared client, so any 500 from this call is read as a refusal, which the caller
+ * handles safely; a genuine outage that also answers 500 is retried on the next pass).
+ */
+export async function updateLeadEmail(apiKey: string, campaignId: number, leadId: string | number, email: string, opts: { maxRetries?: number } = {}): Promise<UpdateLeadEmailOutcome> {
+  assertCampaignId(campaignId);
+  const id = String(leadId);
+  if (!/^[1-9]\d{0,15}$/.test(id)) throw new SmartleadApiError("A Smartlead lead id must be a positive whole number");
+  const address = String(email ?? "").trim().toLowerCase();
+  if (!address || address.length > 254) throw new SmartleadApiError("An email address is required");
+  try {
+    const data = await smartleadRequest<unknown>(apiKey, "POST", `/campaigns/${encodeURIComponent(String(campaignId))}/leads/${id}/`, { data: { email: address }, maxRetries: opts.maxRetries });
+    const ok = (data as { ok?: unknown } | null)?.ok;
+    if (ok === true) return "ok";
+    if (ok === false) return "no_update";
+    throw new SmartleadUnexpectedResponseError("Smartlead POST /campaigns/{id}/leads/{id}/ returned an unexpected response");
+  } catch (error) {
+    if (error instanceof SmartleadApiError && error.status === 404) return "not_found";
+    if (error instanceof SmartleadApiError && error.status === 500) return "rejected";
+    throw error;
+  }
+}
+
+export type UnsubscribeOutcome = "ok" | "not_found" | "no_update";
+
+/**
+ * Unsubscribes a lead from EVERY campaign of the account, now and later (`POST /leads/{id}/unsubscribe`, no campaign in the path). It is the
+ * call for an opt-out recorded in AgentWeb. Verified live (2026-10-28): `{ok: true}`, idempotent (a repeat also answers `{ok: true}`), 404 for a
+ * lead that does not exist, and the docs say it cannot be undone through the API. `{ok: false}` means Smartlead changed nothing: the caller must
+ * not treat the lead as withdrawn. Any other shape is an error, never "ok".
+ */
+export async function unsubscribeLeadGlobally(apiKey: string, leadId: string | number, opts: { maxRetries?: number } = {}): Promise<UnsubscribeOutcome> {
+  const id = String(leadId);
+  if (!/^[1-9]\d{0,15}$/.test(id)) throw new SmartleadApiError("A Smartlead lead id must be a positive whole number");
+  try {
+    const data = await smartleadRequest<unknown>(apiKey, "POST", `/leads/${id}/unsubscribe`, { maxRetries: opts.maxRetries });
+    const ok = (data as { ok?: unknown } | null)?.ok;
+    if (ok === true) return "ok";
+    if (ok === false) return "no_update";
+    throw new SmartleadUnexpectedResponseError("Smartlead POST /leads/{id}/unsubscribe returned an unexpected response");
+  } catch (error) {
+    if (error instanceof SmartleadApiError && error.status === 404) return "not_found";
+    throw error;
+  }
+}
+
+/**
+ * Smartlead's id for the lead with this email in the account, or null when there is none. Verified live (2026-10-28): a found lead is an object
+ * with `id`; an unknown email is HTTP 200 with an EMPTY object, which is "not found", not an error. A reply for a different address is an error.
+ */
+export async function findLeadIdByEmail(apiKey: string, email: string, opts: { maxRetries?: number } = {}): Promise<string | null> {
+  const wanted = String(email ?? "").trim().toLowerCase();
+  if (!wanted || wanted.length > 254) throw new SmartleadApiError("An email address is required");
+  const data = await smartleadRequest<unknown>(apiKey, "GET", "/leads/", { params: { email: wanted }, maxRetries: opts.maxRetries });
+  if (data === "" || data === null || data === undefined) return null;
+  if (typeof data !== "object" || Array.isArray(data)) throw new SmartleadUnexpectedResponseError("Smartlead GET /leads/ returned an unexpected response");
+  const row = data as Record<string, unknown>;
+  if (Object.keys(row).length === 0) return null;
+  const id = asWholeNumber(row.id);
+  if (id === undefined || id <= 0) throw new SmartleadUnexpectedResponseError("Smartlead GET /leads/ returned a lead without an id");
+  if (typeof row.email === "string" && row.email.trim().toLowerCase() !== wanted) throw new SmartleadUnexpectedResponseError("Smartlead GET /leads/ returned a different lead than asked for");
+  return String(id);
+}
+
 export interface SmartleadCampaignDetail extends SmartleadCampaignSummary {
   /** Whether Smartlead adds its own unsubscribe link to each email (the sequence check warns when it does not and the body has none). */
   addUnsubscribeTag?: boolean;

@@ -441,7 +441,7 @@ const runDrain = async (reason: string): Promise<void> => {
   await import('./services/funding/claudeSubscriptionService')
     .then((m) => m.shutdownClaudeSubscriptionService())
     .catch(() => undefined);
-  // ENG-2110 1c: pending hosted sign-ins are cancelled on the login host (it also expires them itself).
+  // ENG-2110 1c: stops the hosted sign-in timers. Pending sign-ins are NOT cancelled on the login host: any instance can finish them, and the host expires abandoned ones itself.
   await import('./services/funding/hostedSubscriptionService')
     .then((m) => m.shutdownHostedSubscriptionService())
     .catch(() => undefined);
@@ -827,6 +827,22 @@ createTestAccount().then(async () => {
             .catch(e => console.error('[SmartleadPush] Resumer error:', e));
         }, 60 * 1000);
         console.log('[SmartleadPush] Resumer initialized — every minute (active only when SMARTLEAD_PUSH_ENABLED=true)');
+
+        // The withdrawal sweep: an opt-out recorded here must reach Smartlead. Hourly, and deliberately NOT behind the kill switch (stopping
+        // pushes must never stop opt-outs); it only has work when a push has ever run.
+        setTimeout(() => {
+          let sweeping = false; // a pass over many lists can outlast the hour: never overlap two
+          const sweep = () => {
+            if (!isCronEnabled() || sweeping) return;
+            sweeping = true;
+            cronJobRegistry.track('SmartleadWithdrawalSweep', getSmartleadPushService().sweepWithdrawals())
+              .catch(e => console.error('[SmartleadWithdrawal] Sweep error:', e))
+              .finally(() => { sweeping = false; });
+          };
+          sweep();
+          setInterval(sweep, 60 * 60 * 1000);
+        }, 5 * 60 * 1000);
+        console.log('[SmartleadWithdrawal] Sweep initialized — hourly, first pass in 5 minutes');
       } catch (error) {
         console.error('[SmartleadPush] Failed to initialize the resumer:', error);
       }

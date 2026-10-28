@@ -18,6 +18,7 @@ import {
   type EnigmaCardRevenueFetcher,
 } from './enigmaCardRevenueEnrichment';
 import type { MappedPerson, MappedOrganization } from './apolloFieldMapper';
+import { buildEnrichmentBudgetCheck } from './enrichmentBatchBudget';
 import type { OrchestratorDeps } from './crmEnrichmentServiceV3';
 import { CrmEnrichmentService, type LeadRecord } from './crmEnrichmentService';
 import { usablePublicIdentifier } from '../utils/linkedInAnonymizedProfile';
@@ -1210,6 +1211,7 @@ export function buildOrchestratorDeps(
   const enigmaFetcher = opts.enigma ? buildEnigmaFetcherForRun(userId) : null;
 
   return {
+    checkBudget: buildEnrichmentBudgetCheck(userId),
     loadLeads: async ({ listId, leadIds }) => {
       // Selection-scoped run (bulk-actions bar) → BatchGetItem on the
       // requested keys, no over-fetch.
