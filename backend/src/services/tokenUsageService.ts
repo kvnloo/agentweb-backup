@@ -309,7 +309,7 @@ export const TURN_ADMISSION = { recordAdmission: true } as const;
  */
 export async function checkTokenUsage(
   userId: string,
-  options: { recordAdmission?: boolean } = {},
+  options: { recordAdmission?: boolean; projectedCostMicroUsd?: number; minimumCostUsedMicroUsd?: number } = {},
 ): Promise<TokenUsageStatus> {
   // ENG-1163: an anonymous predefined-work-plan session (createSessionWithPlan)
   // is owned by a synthetic `anon_<uuid>` id that has no AW-Users row and never
@@ -403,6 +403,8 @@ export async function checkTokenUsage(
     legacyRawCostUsedMicroUsd: async (): Promise<number> =>
       Math.max(0, Math.round(((await getUserTokenUsage(billingUserId)).totalCost || 0) * 1_000_000)),
     recordAdmission: options.recordAdmission === true,
+    projectedCostMicroUsd: options.projectedCostMicroUsd,
+    minimumCostUsedMicroUsd: options.minimumCostUsedMicroUsd,
   });
   const effectiveLlmUsagePolicy = pool.policy;
   const costUsedMicroUsd = pool.costUsedMicroUsd;
