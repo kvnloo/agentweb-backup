@@ -321,7 +321,7 @@ export class SystemdUserFs implements UserFsPort {
     const refDir = this.layout.refDir(uid, kind, ref);
     const unitName = this.layout.unitName(uid, this.hex(8));
     const net = this.cfg.paths.net && this.cfg.egressFor ? { ...this.cfg.paths.net, dir: this.cfg.egressFor(uid) } : this.cfg.paths.net;
-    const args = systemRunArgs(this.layout, { uid, unitName, refDir, file: spec.file, args: spec.args, env: spec.env, cwd: spec.cwd }, this.cfg.limits, { ...this.cfg.paths, ...(net ? { net } : {}) });
+    const args = systemRunArgs(this.layout, { uid, unitName, refDir, file: spec.file, args: spec.args, env: spec.env, cwd: spec.cwd, ...(spec.relayDir !== undefined ? { relayDir: spec.relayDir } : {}) }, this.cfg.limits, { ...this.cfg.paths, ...(net ? { net } : {}) });
     const client = this.cmd.start(this.cfg.paths.systemRun, args);
     const set = this.clients.get(uid) ?? new Set<RunningCommand>();
     this.clients.set(uid, set);

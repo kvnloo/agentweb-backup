@@ -38,7 +38,13 @@ export interface UnitSpec {
   args: string[];
   env: Record<string, string>;
   cwd: string;
+  /** ENG-2113: this turn's relay directory (host path), bound READ-ONLY at /run/aw-relay. Only valid in the network-isolated shape (see unitProperties). */
+  relayDir?: string;
 }
+
+/** Where a unit sees its own relay directory, and the fixed socket path the shim connects to. */
+export const RELAY_MOUNT = "/run/aw-relay";
+export const RELAY_SOCKET_IN_UNIT = "/run/aw-relay/relay.sock";
 
 export interface UnitPaths {
   systemRun: string;
@@ -70,6 +76,12 @@ export function unitProperties(layout: Layout, spec: UnitSpec, limits: UnitLimit
   const grace = limits.stopGraceSec ?? DEFAULT_STOP_GRACE_SEC;
   if (!Number.isInteger(grace) || grace < MIN_STOP_GRACE_SEC || grace > MAX_STOP_GRACE_SEC) throw new Error("unit limits invalid");
   const ref = assertAbsPath(spec.refDir);
+  // The relay socket is reachable only because /run is an empty tmpfs and the unit has its OWN network namespace (no shared abstract unix sockets, no
+  // route anywhere). Without the net branch a unit would see the host's /run and share its network: refuse to build such a unit rather than hope.
+  if (spec.relayDir !== undefined) {
+    if (!paths.net) throw new Error("relay requires the network-isolated unit (paths.net)");
+    if (!layout.isRelayDirOf(spec.uid, assertAbsPath(spec.relayDir))) throw new Error("relay dir invalid");
+  }
   return [
     "ProtectSystem=strict",
     "ProtectHome=yes",
@@ -116,6 +128,8 @@ export function unitProperties(layout: Layout, spec: UnitSpec, limits: UnitLimit
           // /run is replaced by an empty read-only tmpfs so no host socket is even visible; only the egress proxy socket directory is bound in.
           "TemporaryFileSystem=/run:ro",
           `BindReadOnlyPaths=${assertAbsPath(paths.net.dir)}:/run/aw-egress`,
+          // This turn's relay directory ONLY (never the relay root or the uid's directory): another turn's socket is ENOENT in here, even for the same uid.
+          ...(spec.relayDir !== undefined ? [`BindReadOnlyPaths=${assertAbsPath(spec.relayDir)}:${RELAY_MOUNT}`] : []),
         ]
       : []),
     `MemoryMax=${limits.memoryMax}`,
