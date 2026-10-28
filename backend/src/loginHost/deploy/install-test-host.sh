@@ -1,6 +1,6 @@
 #!/bin/bash
 # TEST INSTANCE ONLY (not production): installs the login host for env test1 from /tmp/aw-install (idempotent). Run as root.
-# Expects: start.js, hostLiveAuth.js, claude-turn.sh, aw-net.sh, aw-write-file.sh, aw-login-host@.service (esbuild bundles of src/loginHost/host/start.ts and __tests__/live/hostLiveAuth.ts), node 22 at /opt/aw-live, pinned claude at /opt/aw-claude/2.1.294/claude.
+# Expects: start.js, hostLiveAuth.js, claude-turn.sh, aw-net.sh, aw-write-file.sh, aw-relay-shim.js, aw-login-host@.service (esbuild bundles of src/loginHost/host/start.ts and __tests__/live/hostLiveAuth.ts), node 22 at /opt/aw-live, pinned claude at /opt/aw-claude/2.1.294/claude.
 set -euo pipefail
 D=/opt/aw-login-host
 mkdir -p $D/dist/loginHost/host /etc/aw-login-host /run/aw-login-host-test1
@@ -8,6 +8,7 @@ install -m 0755 -o root -g root /tmp/aw-install/start.js $D/dist/loginHost/host/
 install -m 0755 -o root -g root /tmp/aw-install/claude-turn.sh $D/claude-turn.sh
 install -m 0755 -o root -g root /tmp/aw-install/aw-write-file.sh $D/aw-write-file.sh
 install -m 0755 -o root -g root /tmp/aw-install/aw-net.sh $D/aw-net.sh
+install -m 0755 -o root -g root /tmp/aw-install/aw-relay-shim.js $D/aw-relay-shim.js
 command -v socat >/dev/null || dnf -y install socat >/dev/null   # the in-sandbox loopback->proxy forwarder (PR 2)
 install -m 0644 -o root -g root /tmp/aw-install/hostLiveAuth.js $D/hostLiveAuth.js
 install -m 0644 -o root -g root /tmp/aw-install/aw-login-host@.service /etc/systemd/system/aw-login-host@.service

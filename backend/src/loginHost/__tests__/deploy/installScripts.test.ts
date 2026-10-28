@@ -205,6 +205,7 @@ describe("config template", () => {
     expect(cfg.claude.binaryPath).toBe(`/opt/aw-claude/${versions.CLAUDE_VERSION}/claude`);
     expect(cfg.claude.turnWrapperPath).toBe("/opt/aw-login-host/releases/login-host-abc-20261021000000/claude-turn.sh");
     expect(cfg.claude.systemPromptFile).toBe("/opt/aw-login-host/releases/login-host-abc-20261021000000/system-prompt.txt");
+    expect(cfg.claude.relayShimPath).toBe("/opt/aw-login-host/releases/login-host-abc-20261021000000/aw-relay-shim.js");
     expect(cfg.egress.launcherPath).toBe("/opt/aw-login-host/releases/login-host-abc-20261021000000/aw-net.sh");
     expect(cfg.tools.writeFileHelper).toBe("/opt/aw-login-host/releases/login-host-abc-20261021000000/aw-write-file.sh");
     expect(cfg.egress.allow).toEqual(expect.arrayContaining(["api.anthropic.com:443", "platform.claude.com:443"]));
@@ -604,7 +605,7 @@ case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${
     expect(manifest).toMatch(/^package_lock_sha256=[a-f0-9]{64}$/m);
     expect(manifest).toMatch(/^lockfile_check=/m);
     expect(manifest).not.toContain("WORKER_PRIVATE_IP");
-    for (const f of ["install.sh", "deploy.sh", "deployctl.js", "lib.sh", "versions.env", "check-config.js", "dist/loginHost/host/start.js", "files/aw-login-host@.service", "files/aw-login-host-failed@.service", "files/aw-env.slice.template", "files/host-config.template.json", "files/claude-turn.sh", "files/aw-net.sh", "files/aw-write-file.sh", "files/system-prompt.txt"]) {
+    for (const f of ["install.sh", "deploy.sh", "deployctl.js", "lib.sh", "versions.env", "check-config.js", "dist/loginHost/host/start.js", "files/aw-login-host@.service", "files/aw-login-host-failed@.service", "files/aw-env.slice.template", "files/host-config.template.json", "files/claude-turn.sh", "files/aw-net.sh", "files/aw-write-file.sh", "files/aw-relay-shim.js", "files/system-prompt.txt"]) {
       expect(existsSync(join(pkg, f))).toBe(true);
     }
     expect(text(join(pkg, "files/host-config.template.json"))).toContain("@@WORKER_IP@@"); // filled at install time
@@ -880,8 +881,9 @@ case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${
     expect(cfg.tls?.host).toBe("172.31.30.50");
     expect(cfg.claude.turnWrapperPath).toBe(join(b.opt, "releases", rels[0], "claude-turn.sh"));
     expect(cfg.egress.launcherPath).toBe(join(b.opt, "releases", rels[0], "aw-net.sh"));
+    expect(cfg.claude.relayShimPath).toBe(join(b.opt, "releases", rels[0], "aw-relay-shim.js"));
     expect(cfg.tls?.keyPath).toBe(join(b.conf, "tls", rels[0], "server.key"));
-    for (const p of [cfg.claude.turnWrapperPath, cfg.egress.launcherPath, cfg.tools.writeFileHelper, cfg.claude.systemPromptFile, cfg.tls!.certPath, cfg.tls!.keyPath, cfg.tls!.caPath]) {
+    for (const p of [cfg.claude.turnWrapperPath, cfg.claude.relayShimPath, cfg.egress.launcherPath, cfg.tools.writeFileHelper, cfg.claude.systemPromptFile, cfg.tls!.certPath, cfg.tls!.keyPath, cfg.tls!.caPath]) {
       expect(existsSync(p)).toBe(true);
       for (let q = p; q.startsWith(b.dir) && q !== b.dir; q = join(q, "..")) expect(lstatSync(q).isSymbolicLink()).toBe(false); // no symlink anywhere on a trusted path
     }

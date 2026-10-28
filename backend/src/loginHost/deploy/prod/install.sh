@@ -407,6 +407,7 @@ ins -m 0644 "$HERE/dist/loginHost/host/start.js" "$STAGE_REL_DIR/dist/loginHost/
 ins -m 0755 "$HERE/files/claude-turn.sh" "$STAGE_REL_DIR/claude-turn.sh"
 ins -m 0755 "$HERE/files/aw-net.sh" "$STAGE_REL_DIR/aw-net.sh"
 ins -m 0755 "$HERE/files/aw-write-file.sh" "$STAGE_REL_DIR/aw-write-file.sh"
+ins -m 0755 "$HERE/files/aw-relay-shim.js" "$STAGE_REL_DIR/aw-relay-shim.js"
 ins -m 0644 "$HERE/files/system-prompt.txt" "$STAGE_REL_DIR/system-prompt.txt"
 ins -m 0644 "$HERE/check-config.js" "$STAGE_REL_DIR/check-config.js"
 ins -m 0644 "$HERE/MANIFEST" "$STAGE_REL_DIR/MANIFEST"
@@ -443,7 +444,7 @@ ins -m 0644 "$HERE/files/aw-login-host@.service" "$STAGE_REL_DIR/aw-login-host@.
 ins -m 0644 "$HERE/files/aw-login-host-failed@.service" "$STAGE_REL_DIR/aw-login-host-failed@.service"
 
 # Last pre-switch checks on the staged files.
-for f in claude-turn.sh aw-net.sh aw-write-file.sh; do [ -x "$STAGE_REL_DIR/$f" ] || die "staged $f is not executable"; done
+for f in claude-turn.sh aw-net.sh aw-write-file.sh aw-relay-shim.js; do [ -x "$STAGE_REL_DIR/$f" ] || die "staged $f is not executable"; done
 [ "$SKIP_PREREQS" = 1 ] || [ -x "/opt/aw-claude/$CLAUDE_VERSION/claude" ] || [ "$DRY" = 1 ] || die "the pinned claude binary is missing"
 
 if [ "$DRY" = 1 ]; then

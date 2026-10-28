@@ -18,6 +18,7 @@ import { Layout } from "../ports/layout";
 import { nodeCommandPort, nodeRootFs, type CommandPort, type RootFs } from "../ports/system";
 import { SystemdUserFs, type SystemdPortConfig } from "../ports/systemdUserFs";
 import { startEgressProxy, type EgressProxyHandle } from "../egress/egressProxy";
+import { RelayHost } from "../relay/relayServer";
 import { startHostServer, type HostServerHandle } from "../server";
 import { StateStore } from "../stateStore";
 import { CERT_WARN_DAYS, certNotAfterMs, daysUntil } from "../certExpiry";
@@ -41,6 +42,8 @@ export interface HostDeps {
   socketDir?: string;
   /** Tests run unprivileged: a temp directory instead of /run/aw-egress-<env> for the egress proxy socket. */
   egressDir?: string;
+  /** Tests run unprivileged: a temp directory instead of /run/aw-relay-<env> for the per-turn relay sockets. */
+  relayRoot?: string;
   /** Tests: bind the mutual-TLS listener to this address/port (port 0 = any) instead of the configured private address. */
   tlsHost?: string;
   tlsPort?: number;
@@ -78,8 +81,8 @@ export function jsonLogger(write: (line: string) => void = (l) => process.stdout
   return { info: (e, f) => emit("info", e, f), warn: (e, f) => emit("warn", e, f) };
 }
 
-export function layoutFor(cfg: HostConfig): Layout {
-  return new Layout({ env: cfg.env, stateRoot: cfg.stateRoot, sharedParent: cfg.sharedParent, uidMin: cfg.uidMin, uidMax: cfg.uidMax });
+export function layoutFor(cfg: HostConfig, relayRoot: string = cfg.relayRoot): Layout {
+  return new Layout({ env: cfg.env, stateRoot: cfg.stateRoot, sharedParent: cfg.sharedParent, uidMin: cfg.uidMin, uidMax: cfg.uidMax, relayRoot });
 }
 
 /** The proxy is created after the port (start-up order), so the port reaches it through this holder; before it is set no unit can start. */
@@ -119,6 +122,7 @@ export interface BuiltHost {
   store: StateStore;
   manager: ConnectionManager;
   egressRef: EgressRef;
+  relay: RelayHost;
 }
 
 /** How long the Claude adapter waits for a stopping turn process: the unit's stop grace plus a margin. */
@@ -140,8 +144,14 @@ export function managerConfigFor(cfg: HostConfig, overrides: Partial<ManagerConf
 }
 
 export function buildHost(cfg: HostConfig, binary: VerifiedBinary, deps: HostDeps): BuiltHost {
-  const layout = layoutFor(cfg);
+  const layout = layoutFor(cfg, deps.relayRoot);
   const egressRef: EgressRef = {};
+  // The per-turn relay sockets: owned by the customer uid in production, created by the host process (root) before the unit starts.
+  const relay = new RelayHost({
+    layout,
+    ownByUid: deps.chownSocket !== false,
+    log: { warn: (event, fields) => deps.log.warn(event, Object.fromEntries(Object.entries(fields ?? {}).map(([k, v]) => [k, typeof v === "number" || typeof v === "boolean" ? v : String(v)]))) },
+  });
   const port = new SystemdUserFs({ layout, cmd: deps.cmd, root: deps.root, config: portConfigFor(cfg, egressRef) });
   const store = new StateStore(deps.stateDir ?? `${cfg.stateRoot}/state`);
   const adapters =
@@ -154,6 +164,7 @@ export function buildHost(cfg: HostConfig, binary: VerifiedBinary, deps: HostDep
           systemPromptFile: cfg.claude.systemPromptFile,
           turnWrapperPath: cfg.claude.turnWrapperPath,
           bridgeUrl: cfg.claude.bridgeUrl,
+          relay: { host: relay, shimPath: cfg.claude.relayShimPath, nodePath: cfg.claude.nodePath },
           ...(cfg.claude.models ? { models: cfg.claude.models } : {}),
           ...(cfg.claude.basePath ? { basePath: cfg.claude.basePath } : {}),
           // A stopping turn process gets the unit's grace period: waits for it (and the auth check that follows) must outlast it.
@@ -170,7 +181,7 @@ export function buildHost(cfg: HostConfig, binary: VerifiedBinary, deps: HostDep
     log: deps.log,
     config: managerConfigFor(cfg, deps.managerOverrides),
   });
-  return { layout, port, store, manager, egressRef };
+  return { layout, port, store, manager, egressRef, relay };
 }
 
 /**
@@ -245,6 +256,7 @@ export async function startHost(cfg: HostConfig, binary: VerifiedBinary, deps: H
       logger: { warn: (event, fields) => deps.log.warn(event, Object.fromEntries(Object.entries(fields).map(([k, v]) => [k, typeof v === "number" || typeof v === "boolean" ? v : String(v)]))) },
     });
     built.egressRef.current = egress;
+    built.relay.init(); // sockets of a previous run are dead: the root is emptied before any unit can ask for one
     const sockDir = deps.socketDir ?? cfg.socket.dir;
     const sockPath = `${sockDir}/host.sock`;
     if (!existsSync(sockDir)) mkdirSync(sockDir, { recursive: true, mode: 0o750 });
@@ -301,7 +313,7 @@ export async function runMain(argv: string[] = process.argv): Promise<void> {
     assertTrustedPath(configPath); // the config is root-owned and not writable by anyone else, like everything it points to
     const cfg = parseHostConfig(JSON.parse(readFileSync(configPath, "utf8")));
     // Everything the host or a customer unit executes or reads as policy must be root-controlled too.
-    for (const p of [...(cfg.tls ? [cfg.tls.certPath, cfg.tls.keyPath, cfg.tls.caPath] : []), cfg.claude.turnWrapperPath, cfg.egress.launcherPath, cfg.egress.socat, cfg.claude.systemPromptFile, cfg.tools.writeFileHelper, cfg.tools.systemRun, cfg.tools.systemctl, cfg.tools.setpriv, cfg.tools.env, cfg.tools.rm, cfg.tools.find, ...(cfg.quota ? [cfg.tools.setquota] : [])]) assertTrustedPath(p);
+    for (const p of [...(cfg.tls ? [cfg.tls.certPath, cfg.tls.keyPath, cfg.tls.caPath] : []), cfg.claude.turnWrapperPath, cfg.claude.relayShimPath, cfg.claude.nodePath, cfg.egress.launcherPath, cfg.egress.socat, cfg.claude.systemPromptFile, cfg.tools.writeFileHelper, cfg.tools.systemRun, cfg.tools.systemctl, cfg.tools.setpriv, cfg.tools.env, cfg.tools.rm, cfg.tools.find, ...(cfg.quota ? [cfg.tools.setquota] : [])]) assertTrustedPath(p);
     if (cfg.tls) assertKeyFileMode(cfg.tls.keyPath, statSync(cfg.tls.keyPath).mode);
     if (existsSync("/etc/subuid")) assertNoSubuidOverlap(readFileSync("/etc/subuid", "utf8"), cfg.uidMin, cfg.uidMax);
     registerRange(`${cfg.sharedParent}/ranges`, { env: cfg.env, uidMin: cfg.uidMin, uidMax: cfg.uidMax });
