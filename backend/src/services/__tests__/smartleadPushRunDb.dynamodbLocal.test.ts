@@ -586,8 +586,19 @@ suite('SmartleadPushRunDb against DynamoDB Local (ENG-673)', () => {
       if (!r.started) throw new Error('expected a start');
       await db.pauseRun(r.run.runId, 'user');
       expect(await db.resumeRun(r.run.runId, 'w', 1)).toBeNull();
-      await db.confirmStart(r.run.runId);
-      expect(await db.resumeRun(r.run.runId, 'w', 1)).toMatchObject({ status: 'running' });
+      expect(await db.confirmStart(r.run.runId)).toBe(false); // a paused run can not be "confirmed" into a resumable one either
+      expect(await db.resumeRun(r.run.runId, 'w', 1)).toBeNull();
+    });
+
+    it('confirms only a run that is still running: one the resumer already cancelled is not reported as started', async () => {
+      const r = await db.startRun(input(), 'w');
+      if (!r.started) throw new Error('expected a start');
+      await db.cancelRun(r.run.runId);
+      expect(await db.confirmStart(r.run.runId)).toBe(false);
+      expect((await db.getRun(r.run.runId))!.status).toBe('canceled');
+      const fresh2 = await db.startRun(input(), 'w');
+      if (!fresh2.started) throw new Error('expected a start');
+      expect(await db.confirmStart(fresh2.run.runId)).toBe(true);
     });
 
     it('settles a RETRYABLE lost reply on the lock write whose follow-up read also fails: the run is cancelled, not left to be claimed', async () => {

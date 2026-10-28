@@ -379,4 +379,49 @@ describe("withdrawalSweep (ENG-673)", () => {
     for (let i = 0; i < 5; i++) await withdrawalSweep(d.deps);
     expect(d.logs.filter(l => /WARNING: 1000 runs/.test(l))).toHaveLength(1);
   });
+  it("makes no Smartlead call at all on a quiet pass (nobody opted out): the visibility check only runs when there is something to withdraw", async () => {
+    const e = env({ leads: [lead(1), lead(2)] });
+    await withdrawalSweep(e.deps);
+    expect(e.deps.smartlead.campaignVisible).not.toHaveBeenCalled();
+    expect(e.unsub).not.toHaveBeenCalled();
+  });
+
+  it("reports a key that was rejected during the visibility check (so the connection is flagged and the customer told), and the other lists still run", async () => {
+    const runs = [
+      { runId: "a", listId: "BAD", campaignId: 88, keyOwnerId: "owner", smartleadAccountId: "a", createdAt: "2026-10-27T00:00:00Z" },
+      { runId: "b", listId: "L", campaignId: 77, keyOwnerId: "owner", smartleadAccountId: "a", createdAt: "2026-10-26T00:00:00Z" },
+    ];
+    const e = env({ runs, leads: [lead(1, optedOut)] });
+    const read = e.deps.readLeads;
+    e.deps.readLeads = async (l, a, n) => (l === "BAD" ? { items: [{ leadId: "x", email: "x@example.com", contactStatus: "do-not-contact", system: { smartlead_88: marker("pushed", "1") } }], hasMore: false } : read(l, a, n));
+    (e.deps.smartlead.campaignVisible as jest.Mock).mockImplementation(async (_k: string, campaignId: number) => { if (campaignId === 88) throw new SmartleadApiError("nope", 401); return true; });
+    const r = await withdrawalSweep(e.deps);
+    expect(e.deps.reportFailure).toHaveBeenCalledTimes(1);
+    expect(r).toMatchObject({ targetErrors: 1, withdrawn: 1 });
+  });
+
+  it("does not let the once-a-day log hide a DIFFERENT problem on the same list (a 429 today, a rejected key tomorrow)", async () => {
+    const e = env({ leads: [lead(1, optedOut)] });
+    let status = 429;
+    (e.deps.smartlead.campaignVisible as jest.Mock).mockImplementation(async () => { throw new SmartleadApiError(`status ${status}`, status); });
+    await withdrawalSweep(e.deps);
+    status = 401;
+    await withdrawalSweep(e.deps);
+    expect(e.logs.filter(l => /list=L campaign=77: /.test(l) && /status 429/.test(l))).toHaveLength(1);
+    expect(e.logs.filter(l => /list=L campaign=77: /.test(l) && /status 401/.test(l))).toHaveLength(1);
+    const k = env({ leads: [lead(1, optedOut)], key: { ok: false, reason: "not_connected", message: "x" } });
+    await withdrawalSweep(k.deps);
+    k.deps.resolveKey = jest.fn(async () => ({ ok: false, reason: "key_rejected", message: "x" }) as any);
+    await withdrawalSweep(k.deps);
+    expect(k.logs.filter(l => /NO usable Smartlead key/.test(l))).toHaveLength(2);
+  });
+
+  it("logs a pass summary that only repeats the same problems once a day, but every pass that withdrew something", async () => {
+    const same = env({ leads: [lead(1, optedOut)], visible: false });
+    for (let i = 0; i < 4; i++) await withdrawalSweep(same.deps);
+    expect(same.logs.filter(l => /\] pass:/.test(l))).toHaveLength(1);
+    const busy = env({ leads: [1, 2, 3].map(n => lead(n, optedOut)) });
+    await withdrawalSweep(busy.deps);
+    expect(busy.logs.filter(l => /\] pass:/.test(l))).toHaveLength(1);
+  });
 });
