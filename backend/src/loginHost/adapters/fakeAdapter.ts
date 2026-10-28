@@ -13,6 +13,7 @@ import type {
   ProviderEvent,
   ProviderSession,
   ServerRequestAnswer,
+  TurnInput,
   SubscriptionProviderAdapter,
 } from "../adapter";
 
@@ -51,6 +52,10 @@ export interface FakeScript {
   loginsStarted: number;
   loginsCancelled: number;
   answers: Array<{ operationId: string; answer: ServerRequestAnswer }>;
+  /** Every turn() input the sessions received (tests assert the manifest / bridge token the manager passed). */
+  turnInputs: TurnInput[];
+  /** Operation ids the provider no longer has (its own timer fired): answer() returns false for them. */
+  staleOperations: Set<string>;
   /** Number of turns currently inside session.turn() across all sessions. */
   activeTurns: number;
   maxActiveTurns: number;
@@ -73,6 +78,8 @@ export function newScript(): FakeScript {
     loginsStarted: 0,
     loginsCancelled: 0,
     answers: [],
+    turnInputs: [],
+    staleOperations: new Set(),
     activeTurns: 0,
     maxActiveTurns: 0,
     killSessions: [],
@@ -88,6 +95,8 @@ export interface FakeOptions {
   loginTtlMs?: number;
   toolTransport?: "mcp_direct" | "host_relay";
   singleUse?: boolean;
+  /** Serves turn.run `tools` (emits `tool-call` events from the script). */
+  relay?: boolean;
 }
 
 export function createFakeAdapter(script: FakeScript, opts: FakeOptions = {}): SubscriptionProviderAdapter {
@@ -101,6 +110,7 @@ export function createFakeAdapter(script: FakeScript, opts: FakeOptions = {}): S
     maxProcessesPerHome: opts.maxProcessesPerHome ?? 3,
     maxTurnsPerProcess: opts.maxTurnsPerProcess ?? 1,
     ...(opts.singleUse ? { singleUse: true } : {}),
+    ...(opts.relay ? { relay: true } : {}),
     loginTtlMs: opts.loginTtlMs ?? 10 * 60 * 1000,
     models: new Set(["fast", "smart"]),
     binary: () => ({ path: "/opt/fake/fake-cli", version: "0.0.0-fake", digest: "sha256:fake" }),
@@ -137,7 +147,9 @@ export function createFakeAdapter(script: FakeScript, opts: FakeOptions = {}): S
           if (script.preflightGate) await script.preflightGate;
           return script.preflight;
         },
-        async *turn({ turnId }) {
+        async *turn(input) {
+          const { turnId } = input;
+          script.turnInputs.push(input);
           script.activeTurns++;
           script.maxActiveTurns = Math.max(script.maxActiveTurns, script.activeTurns);
           try {
@@ -158,6 +170,7 @@ export function createFakeAdapter(script: FakeScript, opts: FakeOptions = {}): S
         },
         answer(operationId, answer) {
           script.answers.push({ operationId, answer });
+          return !script.staleOperations.has(operationId);
         },
         async interrupt(turnId) {
           script.interrupts++;

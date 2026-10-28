@@ -23,7 +23,8 @@
  */
 import { createHash } from "crypto";
 import type { Hazard, LoginProcess, ProviderEvent, ProviderSession, SubscriptionProviderAdapter } from "./adapter";
-import { HostError, type RouteInput } from "./protocol";
+import { HostError, RELAY_FRAME_LIMITS, type RouteInput } from "./protocol";
+import { resultFrameBytes } from "./relay/relayServer";
 import type { Clock, IdGen, Logger, UserFsPort } from "./ports";
 import { noopLogger } from "./ports";
 import type { ConnRecord, HostState, StateStore } from "./stateStore";
@@ -107,6 +108,10 @@ interface RunningTurn {
   priority: "interactive" | "scheduled";
   /** Relayed tool calls awaiting the backend's answer: operationId -> when it was issued (monotonic). */
   operations: Map<string, number>;
+  /** The operations that are `tool-call` events of the relay (their clock is the turn's deadline, not the host default). */
+  relayOps: Set<string>;
+  /** The turn's relay manifest: the names a result may unlock are the ones still locked. Absent on a legacy turn. */
+  lockedTools?: Set<string>;
   /** Ends the turn. Safe at any moment, including before the session has finished opening. */
   abort: (reason: string) => void;
   onAbort?: () => void;
@@ -443,7 +448,7 @@ export class ConnectionManager {
     // connection state synchronously before their first await.
     const st = this.state();
     const key = `turn:${req.connectionId}:${req.idempotencyKey}`;
-    const hash = hashOf({ c: req.connectionId, e: req.epoch, t: req.turnId, p: req.prompt, m: req.model, pr: req.priority ?? "interactive" });
+    const hash = hashOf({ c: req.connectionId, e: req.epoch, t: req.turnId, p: req.prompt, m: req.model, pr: req.priority ?? "interactive", ...(req.tools ? { tl: hashOf(req.tools) } : {}) });
     const prior = st.idempotency[key];
     if (prior) {
       if (prior.requestHash !== hash) throw new HostError("EEXISTS");
@@ -457,6 +462,8 @@ export class ConnectionManager {
     if ((this.killsInFlight.get(c.connectionId) ?? 0) > 0) throw new HostError("EBUSY", "connection_busy");
     const adapter = this.adapter(c.provider);
     if (!adapter.models.has(req.model)) throw new HostError("EINVALID", "model_not_allowed");
+    // Relay shape needs an adapter that can serve it; the legacy shape (bridgeToken) is unchanged.
+    if (req.tools && !adapter.relay) throw new HostError("EINVALID", "relay_unsupported");
     const tkey = this.turnKey(c.connectionId, req.turnId);
     if (this.turns.has(tkey)) throw new HostError("EEXISTS");
 
@@ -496,6 +503,8 @@ export class ConnectionManager {
       ...(req.deadlineMs ? { deadlineMono: nowMono + req.deadlineMs } : {}),
       priority,
       operations: new Map(),
+      relayOps: new Set(),
+      ...(req.tools ? { lockedTools: new Set(req.tools.filter((t) => t.locked).map((t) => t.name)) } : {}),
       abort: (reason: string) => {
         const first = running.aborted === undefined;
         running.aborted ??= reason;
@@ -561,7 +570,16 @@ export class ConnectionManager {
         yield { type: "result", ok: false, text: "", errorKind: pre.kind };
         return;
       }
-      iterator = providerSession.turn({ turnId: req.turnId, prompt: req.prompt, model: req.model, bridgeToken: req.bridgeToken })[Symbol.asyncIterator]();
+      iterator = providerSession
+        .turn({
+          turnId: req.turnId,
+          prompt: req.prompt,
+          model: req.model,
+          ...(req.bridgeToken !== undefined ? { bridgeToken: req.bridgeToken } : {}),
+          // The relay's clock for a call is the turn's remaining time (its deadline), read when the call arrives; without a deadline, the host default.
+          ...(req.tools ? { relay: { tools: req.tools, callTimeoutMs: () => this.relayCallTimeoutMs(running) } } : {}),
+        })
+        [Symbol.asyncIterator]();
       for (;;) {
         const next = await gate.race(iterator.next());
         if (next === "hung") return yield* this.abandonHung(c, session, running, () => (status = "aborted"));
@@ -588,6 +606,11 @@ export class ConnectionManager {
           await this.locked(c.connectionId, async () => (c.epoch === running.epoch && running.aborted === undefined ? this.markNeedsReconnect(c, "auth_dead") : undefined));
         }
         if (ev.type === "tool-use" && adapter.toolTransport === "host_relay") running.operations.set(ev.operationId, this.deps.clock.monotonicMs());
+        // The ONLY operation a Claude turn registers: a host-generated relay call. Its stream-derived `tool-use` is informational and never executable.
+        if (ev.type === "tool-call" && !running.aborted) {
+          running.operations.set(ev.operationId, this.deps.clock.monotonicMs());
+          running.relayOps.add(ev.operationId);
+        }
         if (ev.type === "tool-result") running.operations.delete(ev.operationId);
         yield ev;
         if (ev.type === "result") {
@@ -656,10 +679,32 @@ export class ConnectionManager {
   async turnToolResult(req: RouteInput<"turn.toolResult">): Promise<{ ok: true }> {
     const t = this.requireTurn(req.connectionId, req.turnId);
     this.requireEpochNumber(t.epoch, req.epoch);
-    if (!t.operations.delete(req.operationId)) throw new HostError("ENOTFOUND");
+    // "Result lost" answers: the backend persists the tool's outcome itself and tells the model so. ESTALE = the turn was ended by the host
+    // (abort, deadline, lease); ENOTFOUND = no such pending operation (never issued, already answered, timed out, or the turn is gone).
+    if (t.aborted !== undefined) throw new HostError("ESTALE", "turn_aborted");
+    if (!t.operations.has(req.operationId)) throw new HostError("ENOTFOUND", "operation_unknown");
+    // Everything that can be refused is refused BEFORE the operation is consumed, so the backend can retry with a smaller/valid answer.
+    for (const name of req.unlock ?? []) if (!t.lockedTools?.has(name)) throw new HostError("EINVALID", "unlock_unknown_tool");
+    if (resultFrameBytes("x".repeat(64), { content: req.content, ...(req.images ? { images: req.images } : {}), ...(req.unlock ? { unlock: req.unlock } : {}) }) > RELAY_FRAME_LIMITS.hostToShimBytes) throw new HostError("EINVALID", "result_too_large");
+    t.operations.delete(req.operationId);
+    t.relayOps.delete(req.operationId);
     const session = await t.hs.ready;
-    session.answer(req.operationId, { kind: "tool-result", ok: req.ok, content: req.content });
+    const accepted = session.answer(req.operationId, {
+      kind: "tool-result",
+      ok: req.isError !== true,
+      content: req.content,
+      ...(req.images ? { images: req.images } : {}),
+      ...(req.unlock ? { unlock: req.unlock } : {}),
+    });
+    if (accepted === false) throw new HostError("ESTALE", "result_lost"); // the provider no longer has that operation (its own timer fired first)
+    for (const name of req.unlock ?? []) t.lockedTools?.delete(name);
     return { ok: true };
+  }
+
+  /** How long a relayed call that arrives now may take: the turn's remaining time to its deadline, or the host default when the turn has none. */
+  private relayCallTimeoutMs(t: RunningTurn): number {
+    if (t.deadlineMono === undefined) return this.cfg.toolCallTimeoutMs;
+    return Math.max(0, t.deadlineMono - this.deps.clock.monotonicMs());
   }
 
   /** Ends a turn from inside the host (the caller's stream dropped). Unknown turns are ignored. */
@@ -676,8 +721,11 @@ export class ConnectionManager {
         else if (t.deadlineMono !== undefined && mono > t.deadlineMono) t.abort("deadline");
       }
       for (const [op, issuedAt] of [...t.operations]) {
-        if (mono - issuedAt > this.cfg.toolCallTimeoutMs) {
+        // A relay call lives as long as the turn does (the provider's own timer answers the shim); every other operation gets the host default.
+        const expired = t.relayOps.has(op) && t.deadlineMono !== undefined ? mono > t.deadlineMono : mono - issuedAt > this.cfg.toolCallTimeoutMs;
+        if (expired) {
           t.operations.delete(op);
+          t.relayOps.delete(op);
           void t.hs.ready.then((s) => s.answer(op, { kind: "tool-result", ok: false, content: "tool_call_timeout" })).catch(() => undefined);
         }
       }
