@@ -138,6 +138,8 @@ export interface PushQuestionInput {
   /** Tags the user is told Smartlead fills in itself. */
   smartleadFilledTags: string[];
   includeUnverified: boolean;
+  /** The Smartlead account the contacts go into, and whether it is a teammate's shared connection: it sends from THAT account's mailboxes. */
+  connection: { name: string; shared: boolean };
   /** The CRM field chosen for each merge field the campaign uses beyond the standard ones: it goes into what recipients read, so the user sees it. */
   mapping: Record<string, string>;
 }
@@ -147,9 +149,12 @@ export interface PushQuestionInput {
  * without a person choosing resolves to "do not send".
  */
 export function buildPushQuestion(input: PushQuestionInput): QuestionDeckQuestionInput {
+  const account = input.connection.shared
+    ? `a teammate's shared Smartlead account "${cardText(input.connection.name)}"`
+    : `your Smartlead account "${cardText(input.connection.name)}"`;
   const parts = [
-    `Add ${plural(input.cohort, 'contact')} from "${cardText(input.listName)}" to your Smartlead campaign "${cardText(input.campaignName)}"?`,
-    `Smartlead sends the emails, from your own mailboxes and with the campaign's own sequence; AgentWeb only adds the contacts. ${input.eligible.toLocaleString('en-US')} of ${input.listTotal.toLocaleString('en-US')} contacts in the list can be added${input.cohort < input.eligible ? `, and this adds the first ${input.cohort.toLocaleString('en-US')}` : ''}.`,
+    `Add ${plural(input.cohort, 'contact')} from "${cardText(input.listName)}" to the campaign "${cardText(input.campaignName)}" in ${account}?`,
+    `Smartlead sends the emails, from that account's own mailboxes and with the campaign's own sequence; AgentWeb only adds the contacts. ${input.eligible.toLocaleString('en-US')} of ${input.listTotal.toLocaleString('en-US')} contacts in the list can be added${input.cohort < input.eligible ? `, and this adds the first ${input.cohort.toLocaleString('en-US')}` : ''}.`,
   ];
   if (input.includeUnverified) parts.push('This includes contacts whose email address is not verified.');
   if (input.smartleadFilledTags.length > 0) parts.push(`You are confirming that Smartlead fills in ${input.smartleadFilledTags.map(t => `{{${cardText(t, 40)}}}`).join(', ')} itself.`);
