@@ -9,8 +9,6 @@
  * ), otherwise the suite is skipped. Stop the container afterwards.
  */
 jest.unmock('aws-sdk');
-// db.ts pins an https keep-alive agent, which cannot talk to an http:// DynamoDB Local endpoint.
-jest.mock('../utils/awsHttpOptions', () => ({ buildAwsHttpOptions: () => ({}) }));
 jest.mock('../services/usageRecorderService', () => ({ recordVendorUsage: jest.fn().mockResolvedValue(undefined) }));
 
 import { spokenCode } from './helpers/spokenCode';

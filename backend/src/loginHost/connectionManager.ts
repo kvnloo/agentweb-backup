@@ -46,6 +46,8 @@ export interface ManagerConfig {
   idleSessionMs: number;
   /** A relayed tool call the backend does not answer within this window is answered with a failure. */
   toolCallTimeoutMs: number;
+  /** A sign-in that is ready but never promoted (the backend died between its complete and its promote) is discarded after this. A real sign-in promotes within seconds. */
+  readyAttemptTtlMs: number;
   idempotencyTtlMs: number;
   /** Every adapter call made while a connection's lock is held is bounded by this; a hung CLI must not wedge a connection (or its revoke) forever. */
   adapterCallTimeoutMs: number;
@@ -65,6 +67,7 @@ export const DEFAULT_CONFIG: ManagerConfig = {
   scheduledReserve: 2,
   idleSessionMs: 10 * 60 * 1000,
   toolCallTimeoutMs: 120_000,
+  readyAttemptTtlMs: 2 * 60 * 1000,
   idempotencyTtlMs: 6 * 60 * 60 * 1000,
   adapterCallTimeoutMs: 60_000,
   portCallTimeoutMs: 30_000,
@@ -125,6 +128,8 @@ export interface LoginReady {
   planLabel?: string;
   accountFingerprint?: string;
   refreshExpiresAtMs?: number;
+  /** The completionNonce of the complete that took the code, when the caller sent one. */
+  completionNonce?: string;
 }
 
 export interface TurnStarted {
@@ -333,6 +338,10 @@ export class ConnectionManager {
       const { c, login } = await this.requireAttempt(req.connectionId, req.loginRef);
       const adapter = this.adapter(login.provider);
       if (adapter.ceremony !== "paste_code" || !adapter.loginComplete) throw new HostError("ESTATE", "ceremony_not_paste_code");
+      // A second complete for an attempt that already took its code (a retry, or the same sign-in finished from another backend instance) is
+      // refused WITHOUT touching the attempt: handing the spent code to the finished process would fail and discard the ready login.
+      if (c.attempt?.state !== "pending") throw new HostError("ESTATE", "login_not_pending");
+      if (req.completionNonce) c.attempt.completionNonce = req.completionNonce; // recorded BEFORE the code is used: this request is the one that took it
       try {
         await this.a("loginComplete", () => adapter.loginComplete!(login.proc, req.code));
       } catch (err) {
@@ -363,8 +372,12 @@ export class ConnectionManager {
   loginCancel(req: RouteInput<"login.cancel">): Promise<{ cancelled: true }> {
     return this.locked(req.connectionId, async () => {
       const c = this.state().connections[req.connectionId];
-      if (c?.attempt && c.attempt.loginRef === req.loginRef) await this.discardAttempt(c, "cancelled");
-      return { cancelled: true as const }; // already gone: idempotent
+      if (c?.attempt && c.attempt.loginRef === req.loginRef) {
+        // A user-initiated cancel that arrives after the code was taken must not destroy the ready login (the sign-in is being finished, possibly by another instance).
+        if (req.onlyIfPending && c.attempt.state !== "pending") return { cancelled: true as const };
+        await this.discardAttempt(c, "cancelled");
+      }
+      return { cancelled: true as const }; // already gone (or deliberately left alone): idempotent
     });
   }
 
@@ -917,6 +930,7 @@ export class ConnectionManager {
       throw new HostError("EHAZARD", blocking.kind);
     }
     attempt.state = "ready";
+    attempt.readyAtMs = this.deps.clock.nowMs();
     c.planLabel = status.planLabel;
     c.accountFingerprint = status.accountFingerprint;
     this.save();
@@ -925,11 +939,15 @@ export class ConnectionManager {
 
   private readyInfo(c: ConnRecord, adapter: SubscriptionProviderAdapter): LoginReady {
     const expiry = adapter.expiryModel(this.deps.clock.nowMs());
-    return { status: "ready", ...(c.planLabel ? { planLabel: c.planLabel } : {}), ...(c.accountFingerprint ? { accountFingerprint: c.accountFingerprint } : {}), ...(expiry?.refreshExpiresAtMs ? { refreshExpiresAtMs: expiry.refreshExpiresAtMs } : {}) };
+    return { status: "ready", ...(c.planLabel ? { planLabel: c.planLabel } : {}), ...(c.accountFingerprint ? { accountFingerprint: c.accountFingerprint } : {}), ...(expiry?.refreshExpiresAtMs ? { refreshExpiresAtMs: expiry.refreshExpiresAtMs } : {}), ...(c.attempt?.completionNonce ? { completionNonce: c.attempt.completionNonce } : {}) };
   }
 
   private async expireStaleAttempt(c: ConnRecord): Promise<void> {
-    if (c.attempt && this.deps.clock.nowMs() > c.attempt.expiresAtMs) await this.discardAttempt(c, "expired");
+    if (!c.attempt) return;
+    const now = this.deps.clock.nowMs();
+    if (now > c.attempt.expiresAtMs) await this.discardAttempt(c, "expired");
+    // Ready but never promoted: the backend that completed it died before its promote. Waiting for the full attempt lifetime would keep a reconnect for this connection `busy`.
+    else if (c.attempt.state === "ready" && c.attempt.readyAtMs !== undefined && now - c.attempt.readyAtMs > this.cfg.readyAttemptTtlMs) await this.discardAttempt(c, "ready_unpromoted");
   }
 
   /** Caller holds the connection's lock (or the host is starting up). The uid is freed only after a confirmed clean wipe. */
