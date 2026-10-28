@@ -13,6 +13,7 @@
 
 import { dripSequenceDb, DripSequence, SequenceEnrollment, StepCondition, SequenceChannel } from './dripSequenceDb';
 import { isReachableEmail, canonicalLinkedInProfile } from '../utils/leadReachability';
+import { isPushedToSmartlead } from './smartleadMarkers';
 import { sendAsSender, SenderDailyLimitExceededError } from './sendAsSender';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import { crmDb, userDb } from './db';
@@ -291,6 +292,15 @@ async function sendEmailStep(
   const recipient = String(lead?.email ?? enrollment.leadEmail ?? '').trim();
   if (!isReachableEmail(recipient)) {
     console.log(`[dripWorker] Email step ${step.stepNumber} skipped for enrollment ${enrollment.enrollmentId}: lead has no email address`);
+    return false;
+  }
+
+  // ENG-673: a lead pushed to a customer's Smartlead campaign is being emailed from there. AgentWeb's own sequence must not also write to
+  // them (two senders, and Smartlead's unsubscribe and bounce handling would not see these emails). Checked HERE, at send time, not at
+  // enrolment, because a lead can be pushed after it was enrolled. The step is skipped like any step the lead cannot receive; LinkedIn
+  // steps are unaffected.
+  if (isPushedToSmartlead(lead)) {
+    console.log(`[dripWorker] Email step ${step.stepNumber} skipped for enrollment ${enrollment.enrollmentId}: lead is being emailed through Smartlead`);
     return false;
   }
 
