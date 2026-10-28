@@ -12,7 +12,9 @@ import {
 import {
   __configureSmartleadClient,
   addLeadsToCampaign,
+  getCampaign,
   getCampaignEmailAccounts,
+  getCampaignSequences,
   listCampaigns,
   getSmartLeadMetrics,
   listEmailAccounts,
@@ -277,6 +279,43 @@ describe("smartleadService slice 2 client (ENG-673)", () => {
     it("rejects a reply that is not a list rather than showing no campaigns", async () => {
       mockedAxios.request.mockResolvedValue({ data: { message: "Plan expired!" } } as never);
       await expect(listCampaigns(KEY)).rejects.toBeInstanceOf(SmartleadUnexpectedResponseError);
+    });
+  });
+
+  describe("getCampaign and getCampaignSequences (live shapes, 2026-10-28)", () => {
+    it("reads one campaign's status, name, limit and unsubscribe setting", async () => {
+      mockedAxios.request.mockResolvedValueOnce({ data: { id: 9, name: "Q4", status: "drafted", max_leads_per_day: 100, add_unsubscribe_tag: true } } as never);
+      await expect(getCampaign(KEY, 9)).resolves.toEqual({ id: 9, name: "Q4", status: "DRAFTED", maxLeadsPerDay: 100, addUnsubscribeTag: true });
+      expect(mockedAxios.request.mock.calls[0][0].url).toMatch(/\/campaigns\/9$/);
+    });
+
+    it("treats the EMPTY 200 a missing campaign returns as no campaign, and any other non-campaign reply as an error", async () => {
+      mockedAxios.request.mockResolvedValueOnce({ data: "" } as never);
+      await expect(getCampaign(KEY, 9)).resolves.toBeNull();
+      mockedAxios.request.mockResolvedValueOnce({ data: { error: "nope" } } as never);
+      await expect(getCampaign(KEY, 9)).rejects.toBeInstanceOf(SmartleadUnexpectedResponseError);
+      mockedAxios.request.mockResolvedValueOnce({ data: [{ id: 9 }] } as never);
+      await expect(getCampaign(KEY, 9)).rejects.toBeInstanceOf(SmartleadUnexpectedResponseError);
+    });
+
+    it("refuses a reply for a different campaign than asked for", async () => {
+      mockedAxios.request.mockResolvedValueOnce({ data: { id: 10, status: "ACTIVE" } } as never);
+      await expect(getCampaign(KEY, 9)).rejects.toBeInstanceOf(SmartleadUnexpectedResponseError);
+    });
+
+    it("returns the steps, an empty array for a campaign with none, and never reads a not-found object as an empty sequence", async () => {
+      mockedAxios.request.mockResolvedValueOnce({ data: realSequencesWithVariants } as never);
+      await expect(getCampaignSequences(KEY, 9)).resolves.toEqual(realSequencesWithVariants);
+      mockedAxios.request.mockResolvedValueOnce({ data: [] } as never);
+      await expect(getCampaignSequences(KEY, 9)).resolves.toEqual([]);
+      mockedAxios.request.mockResolvedValueOnce({ data: { error: "Campaign not found - Invalid campaign_id." } } as never);
+      await expect(getCampaignSequences(KEY, 9)).rejects.toBeInstanceOf(SmartleadUnexpectedResponseError);
+    });
+
+    it("refuses a bad campaign id before any request", async () => {
+      await expect(getCampaign(KEY, 0)).rejects.toBeInstanceOf(SmartleadApiError);
+      await expect(getCampaignSequences(KEY, 1.5)).rejects.toBeInstanceOf(SmartleadApiError);
+      expect(mockedAxios.request).not.toHaveBeenCalled();
     });
   });
 

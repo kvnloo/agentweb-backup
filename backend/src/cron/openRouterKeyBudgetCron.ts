@@ -100,8 +100,12 @@ export async function runOpenRouterKeyBudgetCheck(
       return { ...verdict, alerted: false };
     }
     const pct = Math.round(verdict.fraction * 100);
+    const band = Math.round(verdict.threshold * 100);
     const alerted = await alert({
-      subject: `OpenRouter key at ${pct}% of its monthly limit`,
+      // ENG-2706: the subject must be stable per threshold band. The Linear oncall filer dedupes
+      // on subject, so embedding the live % filed a new issue at every 1% step. Live % lives in
+      // the message/context only.
+      subject: `OpenRouter key past ${band}% of its monthly limit`,
       message:
         `The production OpenRouter key${info.label ? ` (${info.label})` : ''} has used ${pct}% of its ` +
         `per-key limit. At 100% every Agent Mode LLM call fails with 402 (ENG-2156, 2026-09-25). ` +
@@ -110,7 +114,8 @@ export async function runOpenRouterKeyBudgetCheck(
         'Limit (USD)': info.limit,
         'Remaining (USD)': info.limit_remaining ?? 'unknown',
         'Limit reset': info.limit_reset ?? 'unknown',
-        Threshold: `${Math.round(verdict.threshold * 100)}%`,
+        'Used (%)': `${pct}%`,
+        Threshold: `${band}%`,
       },
       dedupeKey: `openrouter-key-budget:${verdict.threshold}`,
       dedupeWindowMs: KEY_BUDGET_DEDUPE_WINDOW_MS,

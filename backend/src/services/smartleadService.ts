@@ -374,6 +374,45 @@ export async function listCampaigns(apiKey: string, opts: { maxRetries?: number 
   return out;
 }
 
+export interface SmartleadCampaignDetail extends SmartleadCampaignSummary {
+  /** Whether Smartlead adds its own unsubscribe link to each email (the sequence check warns when it does not and the body has none). */
+  addUnsubscribeTag?: boolean;
+}
+
+/**
+ * One campaign, read fresh (the engine re-reads status before every batch). Verified on a real account (2026-10-28): an id that does
+ * not exist returns HTTP 200 with an EMPTY body, not a 404, so an empty reply means "no such campaign" and gives null; any other
+ * reply that is not a campaign object is an error, never a campaign.
+ */
+export async function getCampaign(apiKey: string, campaignId: number, opts: { maxRetries?: number } = {}): Promise<SmartleadCampaignDetail | null> {
+  assertCampaignId(campaignId);
+  const data = await smartleadRequest<unknown>(apiKey, "GET", `/campaigns/${encodeURIComponent(String(campaignId))}`, { maxRetries: opts.maxRetries });
+  if (data === "" || data === null || data === undefined) return null;
+  if (typeof data !== "object" || Array.isArray(data)) throw new SmartleadUnexpectedResponseError("Smartlead GET /campaigns/{id} returned an unexpected response");
+  const row = data as Record<string, unknown>;
+  const id = asWholeNumber(row.id);
+  if (id === undefined || id !== campaignId) throw new SmartleadUnexpectedResponseError("Smartlead GET /campaigns/{id} returned a different campaign than asked for");
+  return {
+    id,
+    name: String(row.name ?? ""),
+    status: String(row.status ?? "").toUpperCase(),
+    maxLeadsPerDay: asLimit(row.max_leads_per_day),
+    ...(typeof row.add_unsubscribe_tag === "boolean" ? { addUnsubscribeTag: row.add_unsubscribe_tag } : {}),
+  };
+}
+
+/**
+ * The raw sequence steps of a campaign, for `analyseSequence`. Verified live (2026-10-28): a real campaign gives a bare array (empty
+ * for a campaign with no steps), and an id that does not exist gives an `{error: "Campaign not found..."}` object. Anything that is
+ * not an array is an error here, so a "campaign not found" reply can never be read as an empty sequence and pushed against.
+ */
+export async function getCampaignSequences(apiKey: string, campaignId: number, opts: { maxRetries?: number } = {}): Promise<unknown[]> {
+  assertCampaignId(campaignId);
+  const data = await smartleadRequest<unknown>(apiKey, "GET", `/campaigns/${encodeURIComponent(String(campaignId))}/sequences`, { maxRetries: opts.maxRetries });
+  if (!Array.isArray(data)) throw new SmartleadUnexpectedResponseError("Smartlead GET /campaigns/{id}/sequences did not return a list of steps");
+  return data;
+}
+
 /** The mailboxes attached to one campaign. The reference example omits their daily limit; join with listEmailAccounts for it. */
 export async function getCampaignEmailAccounts(
   apiKey: string,

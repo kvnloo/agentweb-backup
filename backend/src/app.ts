@@ -55,6 +55,7 @@ import outlookAuthRoutes from "./routes/outlookAuth";
 import calendlyAuthRoutes from "./routes/calendlyAuth";
 import lumaAuthRoutes from "./routes/lumaAuth";
 import smartleadAuthRoutes from "./routes/smartleadAuth";
+import smartleadPushRoutes from "./routes/smartleadPush";
 import googleDriveAuthRoutes from "./routes/googleDriveAuth";
 import twitterAuthRoutes from "./routes/twitterAuth";
 import metaAuthRoutes from "./routes/metaAuth";
@@ -509,6 +510,7 @@ app.use("/api/crm", crmWebhookRoutes);  // per-list webhook URLs — must be aft
 // mounted BEFORE crmRoutes which applies authenticateToken to everything.
 import apolloWebhookRoutes from "./routes/apolloWebhook";
 app.use("/api/crm/webhooks/apollo", apolloWebhookRoutes);
+app.use("/api/crm/smartlead-push", smartleadPushRoutes);  // before the main crm routes
 app.use("/api/crm/sequences", sequenceRoutes);
 app.use("/api/crm/companies", crmCompaniesRoutes);
 app.use("/api/crm", crmRoutes);
