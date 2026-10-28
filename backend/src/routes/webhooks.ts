@@ -23,6 +23,7 @@ import { sendRoadmapDeliveryEmail } from '../services/roadmapDelivery';
 import { emmaEmailService } from '../services/emmaEmailService';
 import { TEMP_EMAIL_PREFIX, TEMP_EMAIL_DOMAIN } from '../config';
 import { isDoNotContact } from '../utils/leadContactStatus';
+import { isPushedToSmartlead } from '../services/smartleadMarkers';
 import { pruneClickIds } from '../utils/leadSchema';
 import { resolveClientIdentityWithForwarded } from '../utils/clientIdentity';
 import { normalizeAttribution, promoteAttributionFromCustomFields } from '../types/attribution';
@@ -1388,6 +1389,13 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
                         console.log(`Auto send skipped: email already sent today to lead ${lead.leadId} in list ${leadList.listId}`);
                         autoSendStatus = 'skipped_already_sent_today';
                       }
+                    }
+
+                    // ENG-673: this block also runs for an EXISTING lead that resubmits a form (isUpdated), and that lead keeps its Smartlead
+                    // marker. A lead being emailed through the customer's Smartlead campaign is not also auto-emailed from here.
+                    if (!autoSendStatus && isPushedToSmartlead(freshLead ?? lead)) {
+                      console.log(`Auto send skipped: lead ${lead.leadId} in list ${leadList.listId} is being emailed through Smartlead`);
+                      autoSendStatus = 'skipped_smartlead';
                     }
 
                     if (!autoSendStatus) {

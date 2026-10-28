@@ -12,6 +12,15 @@ const lead = (id: string, over: Record<string, any> = {}) => ({
 // runStartedAt is required; this default is later than every lead the tests create, so the created-after-start rule stays out of the way.
 const ctx = (over: Record<string, any> = {}) => ({ campaignId: 77, tags: ["first_name", "company_name"], mapping: {}, runStartedAt: "2030-01-01T00:00:00Z", ...over });
 
+describe("pushed leads and do-not-contact (ENG-673)", () => {
+  it("a lead pushed to Smartlead is NOT do-not-contact: bounce recording and the unsubscribe page rely on isDoNotContact staying as it was", () => {
+    const { isDoNotContact } = require("../../utils/leadContactStatus");
+    const marker = { state: "pushed", pushedAt: "x", runId: "r", payloadHash: "h" };
+    expect(isDoNotContact({ email: "a@b.com", system: { smartlead_77: marker } })).toBe(false);
+    expect(isPushedToSmartlead({ system: { smartlead_77: marker } })).toBe(true);
+  });
+});
+
 describe("selectSmartleadLeads (ENG-673)", () => {
   it("keeps a good lead and builds its payload", () => {
     const r = selectSmartleadLeads([lead("a")], ctx());

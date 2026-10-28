@@ -2279,6 +2279,12 @@ export async function sendEmailToLead(listId: string, leadId: string, userId: st
         return { success: false, message: 'Do not contact', error: `Cannot send email to this lead: ${reason}. Remove the do-not-contact flag first if you want to contact them.` };
       }
 
+      // ENG-673: a lead pushed to the customer's Smartlead campaign is emailed from there; AgentWeb does not also email it on the agent's say-so.
+      const { isPushedToSmartlead } = await import('../../services/smartleadMarkers');
+      if (isPushedToSmartlead(lead)) {
+        return { success: false, message: 'Lead is in a Smartlead campaign', error: "This lead is being emailed through the customer's Smartlead campaign, so AgentWeb does not also email it. Do not try to reach this person another way: tell the user, and let them decide." };
+      }
+
       if (!lead.emailDraft) {
         return { success: false, message: 'No email draft', error: 'This lead does not have an email draft. Use update_email_draft_for_lead to create one first.' };
       }
