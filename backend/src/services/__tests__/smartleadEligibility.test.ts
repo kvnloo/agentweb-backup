@@ -151,6 +151,30 @@ describe("selectSmartleadLeads (ENG-673)", () => {
   });
 });
 
+describe("the unsubscribe-link warning (verified with received emails, 2026-10-28)", () => {
+  const seq = (body: string) => analyseSequence([{ seq_number: 1, subject: "Hi {{first_name}}", email_body: body }]);
+  const warned = (body: string, opts: Record<string, unknown>) => preflightSequence(seq(body), { status: "DRAFTED", mapping: {}, ...opts }).warnings.some(w => w.code === "no_unsubscribe");
+
+  it("warns when the setting is on but the footer text is empty: Smartlead then adds no link", () => {
+    expect(warned("<p>Hi</p>", { addUnsubscribeTag: true, unsubscribeText: null })).toBe(true);
+    expect(warned("<p>Hi</p>", { addUnsubscribeTag: true, unsubscribeText: "   " })).toBe(true);
+  });
+
+  it("does not warn when the setting is on and the footer text is set", () => {
+    expect(warned("<p>Hi</p>", { addUnsubscribeTag: true, unsubscribeText: "Unsubscribe here" })).toBe(false);
+  });
+
+  it("still warns when the setting is off, and does not guess when Smartlead did not say", () => {
+    expect(warned("<p>Hi</p>", { addUnsubscribeTag: false })).toBe(true);
+    expect(warned("<p>Hi</p>", { addUnsubscribeTag: true })).toBe(false); // text unknown: no claim either way
+    expect(warned("<p>Hi</p>", {})).toBe(false);
+  });
+
+  it("an unsubscribe tag in the sequence itself silences the warning", () => {
+    expect(warned("<p>Hi {{unsubscribe_link}}</p>", { addUnsubscribeTag: true, unsubscribeText: null })).toBe(false);
+  });
+});
+
 describe("campaignStatusDecision and preflightSequence", () => {
   const real = analyseSequence(realSequencesWithVariants);
 

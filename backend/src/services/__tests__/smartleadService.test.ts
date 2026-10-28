@@ -289,6 +289,11 @@ describe("smartleadService slice 2 client (ENG-673)", () => {
     it("reads one campaign's status, name, limit and unsubscribe setting", async () => {
       mockedAxios.request.mockResolvedValueOnce({ data: { id: 9, name: "Q4", status: "drafted", max_leads_per_day: 100, add_unsubscribe_tag: true } } as never);
       await expect(getCampaign(KEY, 9)).resolves.toEqual({ id: 9, name: "Q4", status: "DRAFTED", maxLeadsPerDay: 100, addUnsubscribeTag: true });
+      // the footer text (live shape: null when empty), which decides whether Smartlead adds the link at all
+      mockedAxios.request.mockResolvedValueOnce({ data: { id: 9, name: "Q4", status: "drafted", add_unsubscribe_tag: true, unsubscribe_text: null } } as never);
+      await expect(getCampaign(KEY, 9)).resolves.toMatchObject({ addUnsubscribeTag: true, unsubscribeText: null });
+      mockedAxios.request.mockResolvedValueOnce({ data: { id: 9, name: "Q4", status: "drafted", add_unsubscribe_tag: true, unsubscribe_text: "Unsubscribe here" } } as never);
+      await expect(getCampaign(KEY, 9)).resolves.toMatchObject({ unsubscribeText: "Unsubscribe here" });
       expect(mockedAxios.request.mock.calls[0][0].url).toMatch(/\/campaigns\/9$/);
     });
 
