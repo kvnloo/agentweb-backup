@@ -137,15 +137,24 @@ export class EmmaToolBridgeExecutor implements ToolBridgeDeps {
   }
 
   /**
-   * Tools the run could have AFTER a skill install: the entitled registry without the session's skill filter. The tool relay offers them to the worker as
+   * Tools the run could have AFTER a skill install: this session's access resolved as if every entitled skill (and the catch-all) were installed, through
+   * the same skill context a real install uses (companion tools, voice-profile publish schemas, exclusions). The tool relay offers them to the worker as
    * `locked` from the start of the turn (the CLI's tool list can only grow through a result that unlocks names). This list grants nothing: every call is
    * checked against `resolveTools` (the CURRENT list) again when it executes.
    */
   async resolveCandidateTools(run: RunToolTokenClaims): Promise<BridgeTool[]> {
     const state = this.requireRun(run.runId);
-    const exclude = new Set(state.context.excludeTools ?? []);
-    const tools = await agentModeService.getFilteredTools(run.userId);
-    return tools.filter((t: any) => !exclude.has(t?.function?.name)).map(toBridgeTool).filter((tool): tool is BridgeTool => tool !== null);
+    // The same resolution as `resolveTools`, with every entitled skill assumed installed: the tools, their companion tools and their schemas are exactly
+    // what this session would be offered after a real install.
+    const access = await agentModeService.resolveRunToolAccess({
+      userId: run.userId,
+      sessionId: run.sessionId,
+      isDelegatedAccess: state.context.isDelegatedAccess,
+      isInteractiveShare: state.context.isInteractiveShare,
+      excludeTools: state.context.excludeTools,
+      assumeAllEntitledSkillsInstalled: true,
+    });
+    return access.tools.map(toBridgeTool).filter((tool): tool is BridgeTool => tool !== null);
   }
 
   /**

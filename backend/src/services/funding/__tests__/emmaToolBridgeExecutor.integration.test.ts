@@ -4,7 +4,7 @@
  * Nothing in production calls the bridge yet, so this is the closest check available
  * that a tool call made through it gets Emma's own gating, execution and results.
  */
-import { agentModeService } from '../../agentModeService';
+import { agentModeService, ADMIN_SKILL_TOOL_NAMES } from '../../agentModeService';
 import { ToolBridge } from '../toolBridge';
 import { EmmaToolBridgeExecutor } from '../emmaToolBridgeExecutor';
 import * as toolDispatch from '../../agentMode/core/toolDispatch';
@@ -126,6 +126,34 @@ describe('tool bridge against the real agentModeService and dispatcher (ENG-2109
     expect(byName.get('launch_bridge_probe')?.readOnly).toBe(false);
     expect(byName.get('update_bridge_failing_probe')?.readOnly).toBe(false);
     expect(byName.get('get_bridge_probe')?.inputSchema).toEqual({ type: 'object', properties: { q: { type: 'string' } } });
+  });
+
+  it('ENG-2113 relay: candidate tools come from the same skill context as a real install, keep excludeTools and the admin gate', async () => {
+    const chatbot = require('../../chatbotService');
+    chatbot.chatbotDb.getChatSession = jest.fn().mockResolvedValue({ sessionId: 's1', messages: [], associatedSkills: [] }); // a skill-gated session
+    const registry = (agentModeService as any).toolRegistry;
+    if (!registry.getTool(ADMIN_SKILL_TOOL_NAMES[0])) registry.register(tool(ADMIN_SKILL_TOOL_NAMES[0], probeRead)); // an admin tool to be gated
+    const executor = new EmmaToolBridgeExecutor();
+    executor.registerRun(RUN.runId, { llmModel: agentModeService.default_model, mockMode: false, excludeTools: ['launch_bridge_probe'] });
+    const candidates = (await executor.resolveCandidateTools(RUN)).map((t) => t.name);
+    const current = (await executor.resolveTools(RUN)).map((t) => t.name);
+    expect(candidates).toContain('get_bridge_probe'); // a tool the session does not have yet (no skill installed) is offered ahead
+    expect(current).not.toContain('get_bridge_probe');
+    expect(candidates).not.toContain('launch_bridge_probe'); // excluded for this run, so never offered, not even locked
+    for (const admin of ADMIN_SKILL_TOOL_NAMES) expect(candidates).not.toContain(admin); // not an admin, not delegated
+    for (const name of current) expect(candidates).toContain(name);
+  });
+
+  it('ENG-2113 relay: a delegated (admin) run gets the admin tools among its candidates, as a real turn would', async () => {
+    const chatbot = require('../../chatbotService');
+    chatbot.chatbotDb.getChatSession = jest.fn().mockResolvedValue({ sessionId: 's1', messages: [], associatedSkills: [] });
+    const executor = new EmmaToolBridgeExecutor();
+    executor.registerRun(RUN.runId, { llmModel: agentModeService.default_model, mockMode: false, isDelegatedAccess: true });
+    const candidates = (await executor.resolveCandidateTools(RUN)).map((t) => t.name);
+    const registered = new Set(((agentModeService as any).toolRegistry.getAllTools() as any[]).map((t) => t.name));
+    const adminRegistered = ADMIN_SKILL_TOOL_NAMES.filter((n) => registered.has(n));
+    expect(adminRegistered.length).toBeGreaterThan(0); // not vacuous: the registry has admin tools
+    for (const admin of adminRegistered) expect(candidates).toContain(admin);
   });
 
   it('never marks an argument-dependent API tool as read-only', () => {
