@@ -1269,11 +1269,11 @@ export async function handleSubscriptionUpdated(
   // items.data[0] — a subscription can now also carry a seat-billing extra-
   // seat item (ENG-2243..2246), and Stripe doesn't guarantee the originally-
   // subscribed item stays first in `items.data` once a second item exists.
-  const basePlanPriceId = subscription.items?.data?.length
-    ? findBasePlanItem(subscription)?.price?.id
+  const basePlanPrice = subscription.items?.data?.length
+    ? findBasePlanItem(subscription)?.price
     : undefined;
-  if (basePlanPriceId) {
-    const newType = deriveSubscriptionTypeFromPriceId(basePlanPriceId);
+  if (basePlanPrice?.id) {
+    const newType = await resolveSubscriptionTypeForPrice(basePlanPrice, subscription);
     if (newType) {
       updateData.subscriptionType = newType;
       const tierConfig = await getTierConfig(newType);
@@ -1536,9 +1536,9 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
           // than corrupt billing state. See findBasePlanItem's doc comment
           // for why position-based lookup is otherwise unsafe once a seat
           // item can coexist on the same subscription.
-          const priceId = activeSub.items?.data?.[0]?.price?.id;
-          if (priceId) {
-            const newType = deriveSubscriptionTypeFromPriceId(priceId);
+          const activePrice = activeSub.items?.data?.[0]?.price;
+          if (activePrice?.id) {
+            const newType = await resolveSubscriptionTypeForPrice(activePrice, activeSub);
             if (newType) {
               updateData.subscriptionType = newType;
               const tierConfig = await getTierConfig(newType);
@@ -2228,6 +2228,49 @@ export function deriveSubscriptionTypeFromPriceId(priceId: string): string | nul
   return null;
 }
 
+/** Tiers that must never be granted from Stripe metadata (internal-only). */
+const METADATA_PLAN_DENYLIST: ReadonlySet<string> = new Set(['Super Premium']);
+
+/**
+ * ENG-2724: resolve the subscription tier for a Stripe price, falling back to
+ * `plan` metadata for prices outside the Starter/Pro env mapping (Max, custom
+ * contract prices). Metadata is read from the subscription, then the price,
+ * then an expanded product, and is only accepted when it names a tier defined
+ * in AW-Settings `subscription_types` (via getTierConfig). An unmappable price
+ * returns null with a warning so callers keep the existing tier.
+ */
+export async function resolveSubscriptionTypeForPrice(
+  price: any,
+  subscription?: any,
+): Promise<string | null> {
+  const priceId: string | undefined = typeof price === 'string' ? price : price?.id;
+  if (!priceId) return null;
+  const mapped = deriveSubscriptionTypeFromPriceId(priceId);
+  if (mapped) return mapped;
+
+  const product = price && typeof price === 'object' && price.product && typeof price.product === 'object'
+    ? price.product
+    : null;
+  const candidates = [subscription?.metadata?.plan, price?.metadata?.plan, product?.metadata?.plan]
+    .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
+    .map((v) => v.trim());
+
+  for (const plan of candidates) {
+    if (METADATA_PLAN_DENYLIST.has(plan)) continue;
+    try {
+      if (await getTierConfig(plan)) return plan;
+    } catch (err) {
+      console.warn(`[STRIPE] Tier lookup failed for metadata plan "${plan}" (price ${priceId}):`, err);
+    }
+  }
+
+  console.warn(
+    `[STRIPE] Unmapped price ${priceId} on subscription ${subscription?.id ?? 'unknown'}: ` +
+    `no env mapping and no valid metadata.plan (candidates: ${JSON.stringify(candidates)}). Tier not synced.`
+  );
+  return null;
+}
+
 function deriveSubscriptionType(session: any, subscription?: any): string | null {
   // Stripe webhook events for checkout.session.completed do NOT expand
   // line_items by default, so session.line_items is typically undefined
@@ -2362,8 +2405,8 @@ export async function reconcileStripeUser(
   // reconciliation skipping a tier overwrite rather than corrupting billing
   // state. See findBasePlanItem's doc comment before reusing this pattern
   // anywhere a subscription's items can include a seat line item.
-  const priceId = sub.items?.data?.[0]?.price?.id;
-  const derivedType = priceId ? deriveSubscriptionTypeFromPriceId(priceId) : null;
+  const basePrice = sub.items?.data?.[0]?.price;
+  const derivedType = basePrice?.id ? await resolveSubscriptionTypeForPrice(basePrice, sub) : null;
 
   // Build updates only for fields that are wrong
   const updates: Record<string, any> = {};
