@@ -409,6 +409,12 @@ function linkedInPublicIdFromUrl(url: string | undefined | null): string | null 
   return match ? match[1] : null;
 }
 
+// ENG-2663: an error that declares its own tool-error class (FreshTokenRejectedError) keeps it
+// across the catch-and-return, so the dispatcher gives retry guidance instead of "auth".
+function declaredErrorClass(error: any): { errorClass?: string } {
+  return typeof error?.toolErrorClass === 'string' ? { errorClass: error.toolErrorClass } : {};
+}
+
 // Post on connected account helper
 export async function postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any, options?: { saveAsDraft?: boolean; inReplyToPostId?: string }): Promise<any> {
   console.log('[AgentMode] postOnConnectedAccount called:', {
@@ -581,7 +587,7 @@ export async function postOnConnectedAccount(userId: string, accountId: string |
     // ENG-1300: the LinkedIn adapter (and X's mapListScopeError) attach the
     // real HTTP status as .code on the thrown error — carry it through so a
     // 401/403 classifies as auth/config instead of the generic bug fallback.
-    return { success: false, message: `Failed to post: ${message}`, code: error?.code };
+    return { success: false, message: `Failed to post: ${message}`, code: error?.code, ...declaredErrorClass(error) };
   }
 }
 
@@ -625,6 +631,8 @@ export async function linkedinRepost(userId: string, accountId: string, postUrn:
       toolContext?.assertPublishStillAuthorized
     );
 
+    if (result.success === false) return { success: false, message: result.message };
+
     return {
       success: true,
       message: result.message,
@@ -636,7 +644,7 @@ export async function linkedinRepost(userId: string, accountId: string, postUrn:
     if (message.includes('access token expired')) {
       message = 'Account token expired. Please reconnect the account in Settings.';
     }
-    return { success: false, message: `Failed to repost: ${message}`, code: error?.code };
+    return { success: false, message: `Failed to repost: ${message}`, code: error?.code, ...declaredErrorClass(error) };
   }
 }
 
@@ -735,6 +743,8 @@ export async function commentOnLinkedInPost(userId: string, accountId: string, p
         toolContext?.assertPublishStillAuthorized
       );
 
+      if (result.success === false) return { success: false, message: result.message };
+
       return {
         success: true,
         message: result.message,
@@ -751,7 +761,8 @@ export async function commentOnLinkedInPost(userId: string, accountId: string, p
       return {
         success: false,
         message: `Failed to comment: ${message}`,
-        code: error?.code
+        code: error?.code,
+        ...declaredErrorClass(error)
       };
     }
 
@@ -927,7 +938,8 @@ export async function reactToLinkedInPost(userId: string, accountId: string, pos
       return {
         success: false,
         message: `Failed to react: ${message}`,
-        code: error?.code
+        code: error?.code,
+        ...declaredErrorClass(error)
       };
     }
 

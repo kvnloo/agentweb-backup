@@ -478,10 +478,12 @@ router.post("/unipile-accounts/:accountId/assign", async (req, res) => {
     // Fetch account details from Unipile to get the real name
     let accountName = 'LinkedIn Account';
     let username: string | undefined;
+    let providerVerified = false;
     try {
       const unipileAccount = await linkedInOutreachService.getAccount(accountId);
       if ((unipileAccount as any).name) accountName = (unipileAccount as any).name;
       username = (unipileAccount as any).connection_params?.im?.username;
+      providerVerified = true;
     } catch (unipileErr: any) {
       console.warn(`[Admin] Could not fetch Unipile account details for ${accountId}:`, unipileErr?.message);
     }
@@ -497,7 +499,7 @@ router.post("/unipile-accounts/:accountId/assign", async (req, res) => {
         token_expires_at: Number.MAX_SAFE_INTEGER,
         scopes: [],
       },
-    });
+    }, { providerVerified });
 
     linkedInOutreachService.clearStatusCache(accountId);
     console.log(`[Admin] Assigned orphan Unipile account ${accountId} to user ${normalizedEmail}`);

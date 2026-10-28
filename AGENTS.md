@@ -80,6 +80,23 @@ instructions narrow and operational.
   version of this doctrine for cross-repo consistency; this paragraph is the
   authoritative in-repo copy — if they ever disagree, this one wins here.)
 
+## Customer-visible changes (Harsha, 2026-10-26)
+
+Applies to every engineer and agent, including Argusoft.
+
+- Default is pull: the team asks an agent (Yugo) for product state, sourced
+  from `main`, Linear and prod config. Nobody is briefed by hand.
+- The only push is Slack `#feature-launches`, and only for changes to what a
+  customer sees, pays, or is told. Yugo writes those posts from merged PRs;
+  engineers write nothing extra.
+- If a customer-visible change merges dark (behind a switch or flag), say
+  "dark" in the PR title or body, plus what turns it on.
+- When you switch a customer-visible change on in production, comment
+  "switched on <date>" on its Linear issue. That triggers the post.
+- A customer-visible billing or pricing change does not switch on before its
+  `#feature-launches` post exists.
+- Yugo maintains the posting job (doctrine rule `feature-launch-sync`).
+
 ## dev.md notes
 
 - Never edit `dev.md` directly; the `dev.md fragment guard` check fails the PR.

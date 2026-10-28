@@ -52,6 +52,7 @@ const schema = z
         abortGraceMs: z.number().int().min(100).optional(),
         idleSessionMs: z.number().int().min(1000).optional(),
         toolCallTimeoutMs: z.number().int().min(1000).optional(),
+        readyAttemptTtlMs: z.number().int().min(10_000).max(30 * 60 * 1000).optional(),
         adapterCallTimeoutMs: z.number().int().min(1000).optional(),
         portCallTimeoutMs: z.number().int().min(1000).optional(),
       })

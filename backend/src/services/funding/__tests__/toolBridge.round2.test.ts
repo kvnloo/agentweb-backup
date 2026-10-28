@@ -154,6 +154,18 @@ describe('ToolBridge review round 2', () => {
       gate.resolve(ok('first'));
     });
 
+    it('a warning re-armed after a turn that never reached the model is reported by the next beginTurn, once', () => {
+      const { bridge } = make({}, {});
+      expect(bridge.beginTurn(RUN.userId, RUN.sessionId).previousUnknownOutcome).toBe(false);
+      bridge.rearmUnknownOutcome(RUN.userId, RUN.sessionId);
+      expect(bridge.beginTurn(RUN.userId, RUN.sessionId).previousUnknownOutcome).toBe(true);
+      expect(bridge.beginTurn(RUN.userId, RUN.sessionId).previousUnknownOutcome).toBe(false); // heard once, then spent
+      // a different session is untouched
+      bridge.rearmUnknownOutcome(RUN.userId, 'other-session');
+      expect(bridge.beginTurn(RUN.userId, RUN.sessionId).previousUnknownOutcome).toBe(false);
+      expect(bridge.beginTurn(RUN.userId, 'other-session').previousUnknownOutcome).toBe(true);
+    });
+
     it('a late event from an earlier turn does not block the new turn, and is reported by the next beginTurn', async () => {
       const hung = deferred<BridgeExecuteOutcome>();
       let n = 0;

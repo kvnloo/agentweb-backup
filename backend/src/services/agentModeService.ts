@@ -1,3 +1,4 @@
+import { addCompanionTools } from './agentMode/companionTools';
 import { metaWriteRateShaper, META_BUDGET_THROTTLE_SUBCODE } from './agentMode/metaWriteRateShaper';
 import { normalizeSkillIdArg } from './agentMode/skillIdArg';
 import { applyProviderPolicy, CompareProviderPolicy } from './agentMode/compareProviderPolicy';
@@ -3007,7 +3008,7 @@ export class AgentModeService {
    * publish directive and the anti-loop directive, and returns the messages plus every value the loop derives from them.
    * Any change here changes what the model reads: agentModeService.prepareTurnContext.golden.test.ts pins it.
    */
-  private async prepareTurnContext(input: {
+  async prepareTurnContext(input: {
     messageContent: string;
     sessionHistory: ChatMessage[];
     userId: string;
@@ -5362,7 +5363,7 @@ export class AgentModeService {
       // a carried-over number dressed as fresh. Measures how often it happens, per model, before
       // anyone decides to enforce. Never edits `content`; kill switch AGENT_CRM_FRESHNESS_GUARD=off.
       if (content && !wasCancelled && !mockMode) {
-        runCrmFreshnessShadow({ finalText: content, toolCalls, evidence: crmEvidence.snapshot(), earlier: crmEarlier, sessionNumbers: crmSessionNumbers, sessionId, model: llmModel });
+        runCrmFreshnessShadow({ finalText: content, toolCalls, evidence: crmEvidence.snapshot(), earlier: crmEarlier, sessionNumbers: crmSessionNumbers, sessionMessages: Array.isArray(sessionHistory) ? sessionHistory.length : undefined, sessionId, model: llmModel });
       }
 
       // ENG-1207 AC3: a run must not finish silently on an unread page.
@@ -7691,6 +7692,8 @@ export class AgentModeService {
     if (hasAdminAccess || sessionAssociatedSkillIds.includes(ADMIN_SKILL_VIRTUAL_ID)) {
       ADMIN_SKILL_TOOL_NAMES.forEach(t => allowedToolNames.add(t));
     }
+
+    addCompanionTools(allowedToolNames);
 
     let installedSkillContextMsg = '';
     const skillLines: string[] = [];
@@ -15321,6 +15324,43 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       dispatch.campaign_id, dispatch.ad_set_id, dispatch.ad_id, dispatch.params, false, undefined,
     );
     return { result, createdId: AgentModeService.extractDispatchedObjectId(result) };
+  }
+
+  /**
+   * Zoma creative upload: Meta processing state of an uploaded video, ownership-scoped to the
+   * selected ad account (a video id addresses a node globally). Returns Meta's preferred
+   * thumbnail once ready, so the caller can build a video creative without a second upload.
+   */
+  public async readToolkitMetaVideoStatus(
+    userId: string, account_id: string, videoId: string, opts: { justUploaded?: boolean } = {},
+  ): Promise<{ status: string; thumbnail_url?: string; error?: string }> {
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    const base = `https://graph.facebook.com/${apiVersion}`;
+    const { data: node } = await axios.get(`${base}/${encodeURIComponent(videoId)}`, {
+      params: { fields: 'id,status,thumbnails{uri,is_preferred}', access_token: accessToken },
+    });
+    // AdVideo has no account_id field; confirm ownership through the account's own edge.
+    // A video we uploaded to this account a moment ago is owned by construction, and the
+    // advideos edge lags new uploads by a few seconds (it 404'd every fresh upload in prod),
+    // so the check only applies to caller-supplied ids.
+    if (!opts.justUploaded) {
+      const { data: owned } = await axios.get(`${base}/act_${accountId.replace(/^act_/, '')}/advideos`, {
+        params: { fields: 'id', filtering: JSON.stringify([{ field: 'id', operator: 'IN', value: [videoId] }]), access_token: accessToken },
+      });
+      if (!Array.isArray(owned?.data) || !owned.data.some((v: any) => String(v?.id) === String(videoId))) {
+        throw new Error('That video is not in the selected ad account (a video uploaded in the last few seconds may not be listed yet; retry shortly).');
+      }
+    }
+    const raw = String(node?.status?.video_status || 'processing').toLowerCase();
+    const status = raw === 'ready' ? 'ready' : raw === 'error' ? 'error' : 'processing';
+    const thumbs: any[] = node?.thumbnails?.data ?? [];
+    const thumb = thumbs.find((t) => t?.is_preferred) ?? thumbs[0];
+    return {
+      status,
+      ...(thumb?.uri ? { thumbnail_url: String(thumb.uri) } : {}),
+      ...(status === 'error' ? { error: String(node?.status?.processing_progress ?? 'processing failed') } : {}),
+    };
   }
 
   /** Read-back after a toolkit write: status + effective status + budgets, ownership-scoped. */

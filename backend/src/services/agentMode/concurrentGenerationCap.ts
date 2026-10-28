@@ -14,11 +14,18 @@
  *
  * Limit: AW-Settings `max_concurrent_generations_per_user` (cached ~60s, last
  * known value used if a refresh fails). Absent/invalid => 3. 0 => unlimited.
+ *
+ * ENG-2648: a turn that continues a paused conversation (an approval-deck answer
+ * or cancel, a work-plan details answer) may exceed `limit` — refusing it after
+ * its pending state was consumed would lose the outcome — but never the hard
+ * ceiling `limit * PAUSED_TURN_CEILING_MULTIPLIER`. The caller takes that slot
+ * BEFORE consuming the pending state, so a refusal at the ceiling loses nothing.
  */
 import { settingsService } from '../settingsService';
 
 export const MAX_CONCURRENT_GENERATIONS_SETTING = 'max_concurrent_generations_per_user';
 export const DEFAULT_MAX_CONCURRENT_GENERATIONS_PER_USER = 3;
+export const PAUSED_TURN_CEILING_MULTIPLIER = 2;
 const CACHE_TTL_MS = 60_000;
 
 let cachedLimit: number | null = null; // last known good (or default-from-absent) value
@@ -54,22 +61,26 @@ export type SlotResult =
   | { ok: false; limit: number; current: number };
 
 /**
- * Call AFTER the session generation claim succeeded. On `ok`, the caller MUST
- * call `release()` in a `finally`. A rejected result holds nothing.
- * The check-and-add is synchronous (after the limit read), so it is race-free.
+ * On `ok`, the caller MUST call `release()` in a `finally` (release is idempotent).
+ * A rejected result holds nothing. The check-and-add is synchronous (after the
+ * limit read), so it is race-free.
+ *
+ * A normal turn is taken AFTER the session generation claim succeeded and is
+ * refused at `limit`. A `continuesPausedTurn` slot is taken BEFORE the paused
+ * state is consumed (see /generate) and is refused only at the hard ceiling
+ * `limit * PAUSED_TURN_CEILING_MULTIPLIER`; the refusal body reports that ceiling.
  */
 export async function acquireInteractiveGenerationSlot(
   userId: string,
   sessionId: string,
-  options?: { bypassLimit?: boolean },
+  options?: { continuesPausedTurn?: boolean },
 ): Promise<SlotResult> {
   const limit = await getMaxConcurrentGenerationsPerUser();
   let sessions = active.get(userId);
-  // bypassLimit: the turn continues a paused conversation whose answer was already consumed
-  // (see /generate). It is never refused but is still counted, so it occupies a slot.
-  if (limit > 0 && !options?.bypassLimit) {
-    const others = sessions ? [...sessions.keys()].filter((s) => s !== sessionId).length : 0;
-    if (others >= limit) return { ok: false, limit, current: others };
+  if (limit > 0) {
+    const max = options?.continuesPausedTurn ? limit * PAUSED_TURN_CEILING_MULTIPLIER : limit;
+    const others = sessions ? sessions.size - (sessions.has(sessionId) ? 1 : 0) : 0;
+    if (others >= max) return { ok: false, limit: max, current: others };
   }
   if (!sessions) {
     sessions = new Map();

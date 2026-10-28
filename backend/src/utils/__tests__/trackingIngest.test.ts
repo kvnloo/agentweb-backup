@@ -2,7 +2,7 @@
  * ENG-2315 — the public ingest body contract: only allow-listed keys are ever stored, every field is
  * bounded, identity uses the shared 48h/5min window, and the SERVER owns classification.
  */
-import { parseIngestBody, buildSessionRow, clean, int } from '../trackingIngest';
+import { parseIngestBody, buildSessionRow, clean, int, allowListFor } from '../trackingIngest';
 
 const NOW = 1_800_000_000_000;
 const base = (extra: Record<string, unknown> = {}) => ({
@@ -242,5 +242,79 @@ describe('repairEscapedQuery (HTML-escaped share links)', () => {
   it('leaves clean links and values that only contain "amp" unchanged', () => {
     expect(repairEscapedQuery('https://a.b/x?utm_source=ok&utm_medium=s')).toBe('https://a.b/x?utm_source=ok&utm_medium=s');
     expect(repairEscapedQuery('https://a.b/x?utm_source=campamp;x')).toBe('https://a.b/x?utm_source=campamp;x');
+  });
+});
+
+describe('ENG-2688 per-list event/property allow-list', () => {
+  const AL = { cta_click: { cta_name: 'string', position: 'number' }, form_submit: { form_id: 'string', valid: 'boolean' } } as const;
+  const parse = (extra: Record<string, unknown>, al?: any) => {
+    const r = parseIngestBody({ listId: 'list_1793037224311_9umtchng7', event: 'custom', sessionId: 's1234567', sessionStartMs: 1_000_000, ...extra }, 1_000_000 + 1000, al);
+    if (!r.ok) throw new Error(r.message);
+    return r.value;
+  };
+
+  it('stores allow-listed props namespaced per event, so two events do not overwrite each other', () => {
+    const a = buildSessionRow(parse({ name: 'cta_click', props: { cta_name: 'Start trial', position: 2 } }, AL), { userAgent: 'x', nowIso: 'T' }).customFields;
+    const b = buildSessionRow(parse({ name: 'form_submit', props: { form_id: 'signup', valid: true } }, AL), { userAgent: 'x', nowIso: 'T' }).customFields;
+    expect(a).toMatchObject({ 'cta_click.cta_name': 'Start trial', 'cta_click.position': 2 });
+    expect(b).toMatchObject({ 'form_submit.form_id': 'signup', 'form_submit.valid': 1 });
+    // Per-key SET merge: b carries no cta_click.* keys, so a's values survive.
+    expect(Object.keys(b).some((k) => k.startsWith('cta_click.'))).toBe(false);
+    expect(a).not.toHaveProperty('lastCustomProps');
+  });
+
+  it('drops non-allow-listed props, wrong types, and unknown events', () => {
+    const v = parse({ name: 'cta_click', props: { cta_name: 5, position: 1, evil: 'x', __proto__: { y: 1 } } }, AL);
+    expect(Object.keys(v.client).filter((k) => k.includes('.'))).toEqual(['cta_click.position']);
+    const u = parse({ name: 'unknown_evt', props: { cta_name: 'x' } }, AL);
+    expect(Object.keys(u.client).some((k) => k.includes('.') || k === 'lastCustomProps')).toBe(false);
+  });
+
+  it('lists without an allow-list keep the single capped blob', () => {
+    const v = parse({ name: 'cta_click', props: { cta_name: 'x' } });
+    expect(v.client.lastCustomProps).toBe('{"cta_name":"x"}');
+    expect(allowListFor('list_without_one')).toBeUndefined();
+    expect(allowListFor('__proto__')).toBeUndefined();
+  });
+});
+
+describe('ENG-2689 super properties', () => {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { SUPER_PROPERTIES, parseSuperProps } = require('../superProperties');
+  const AL = { cta_click: { cta_name: 'string' } } as const;
+  const SUPER = {
+    '#event_time': 1_000_500, '#os': 'macOS', '#screen_width': 1440, '#url': 'https://www.hireemma.ai/pricing?x=1',
+    '#ip': '1.2.3.4', funnel_type: 'free_trial', is_login: true, session_intent_score: 4, evil: 'x', '#title': 7,
+  };
+  const parse = (event: string, extra: Record<string, unknown>, al?: any) => {
+    const r = parseIngestBody({ listId: 'list_1793037224311_9umtchng7', event, sessionId: 's1234567', sessionStartMs: 1_000_000, ...extra }, 1_000_000 + 1000, al);
+    if (!r.ok) throw new Error(r.message);
+    return r.value;
+  };
+
+  it('the table is the 40 properties from the tracking plan', () => {
+    expect(Object.keys(SUPER_PROPERTIES)).toHaveLength(40);
+  });
+
+  it.each(['lp_view', 'click', 'page_exit', 'custom'])('a %s event carries the registered super properties, typed', (event) => {
+    const v = parse(event, { super: SUPER, ...(event === 'custom' ? { name: 'cta_click' } : {}) }, AL);
+    expect(v.client).toMatchObject({
+      'super.event_time': 1_000_500, 'super.os': 'macOS', 'super.screen_width': 1440, 'super.url': 'https://www.hireemma.ai/pricing?x=1',
+      'super.funnel_type': 'free_trial', 'super.is_login': 1, 'super.session_intent_score': 4,
+    });
+    expect(v.client).not.toHaveProperty('super.ip'); // server-derived, never from the browser
+    expect(v.client).not.toHaveProperty('super.title'); // wrong type
+    expect(Object.keys(v.client).filter((k) => k.startsWith('super.')).every((k) => k.slice(6) in SUPER_PROPERTIES || `#${k.slice(6)}` in SUPER_PROPERTIES)).toBe(true);
+  });
+
+  it('values are bounded and lists without an allow-list store none', () => {
+    const big = parseSuperProps({ '#os': 'a'.repeat(5000), '#ua': 'b'.repeat(5000), '#screen_width': 1e20, '#zone_offset': Number.NaN });
+    expect(String(big['super.os']).length).toBeLessThanOrEqual(120);
+    expect(String(big['super.ua']).length).toBeLessThanOrEqual(300);
+    expect(big['super.screen_width']).toBe(1e9);
+    expect(big).not.toHaveProperty('super.zone_offset');
+    expect(parseSuperProps(['x'])).toEqual({});
+    const v = parse('lp_view', { super: SUPER });
+    expect(Object.keys(v.client).some((k) => k.startsWith('super.'))).toBe(false);
   });
 });

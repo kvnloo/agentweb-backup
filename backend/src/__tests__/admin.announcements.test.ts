@@ -2,16 +2,20 @@ import { Request } from 'express';
 import adminRoutes from '../routes/admin';
 import { userDb } from '../services/db';
 import { resendService } from '../services/resendService';
-import axios from 'axios';
+import { fetchPublicHtml, SsrfBlockedError } from '../utils/ssrfGuard';
 
 // Mock the dependencies
 jest.mock('../services/db');
 jest.mock('../services/resendService');
-jest.mock('axios');
+// The route fetches through the SSRF-safe fetcher (ENG-2425), not axios directly.
+jest.mock('../utils/ssrfGuard', () => ({
+  ...jest.requireActual('../utils/ssrfGuard'),
+  fetchPublicHtml: jest.fn(),
+}));
 
 const mockUserDb = userDb as jest.Mocked<typeof userDb>;
 const mockResendService = resendService as jest.Mocked<typeof resendService>;
-const mockAxios = axios as jest.Mocked<typeof axios>;
+const mockFetchPublicHtml = fetchPublicHtml as jest.Mock;
 
 // Mock auth middleware
 jest.mock('../middleware/auth', () => ({
@@ -371,10 +375,7 @@ describe('Admin Announcements', () => {
         </html>
       `;
 
-      (mockAxios.get as jest.Mock).mockResolvedValueOnce({
-        data: mockHtml,
-        headers: { 'content-type': 'text/html' }
-      });
+      mockFetchPublicHtml.mockResolvedValueOnce(mockHtml);
 
       const res = await invokeRoute('/announcements/load-from-url', 'post', { url: 'https://example.com/page.html' });
 
@@ -382,16 +383,7 @@ describe('Admin Announcements', () => {
       expect(res.body.title).toBe('Test Page Title');
       expect(res.body.message).toContain('Main Content');
       expect(res.body.message).toContain('This is the body content');
-      expect(mockAxios.get).toHaveBeenCalledWith(
-        'https://example.com/page.html',
-        expect.objectContaining({
-          timeout: 15000,
-          responseType: 'text',
-          headers: expect.objectContaining({
-            'User-Agent': 'AgentWeb-Backend/1.0'
-          })
-        })
-      );
+      expect(mockFetchPublicHtml).toHaveBeenCalledWith('https://example.com/page.html');
     });
 
     it('should extract title from h1 if title tag is missing', async () => {
@@ -404,9 +396,7 @@ describe('Admin Announcements', () => {
         </html>
       `;
 
-      (mockAxios.get as jest.Mock).mockResolvedValueOnce({
-        data: mockHtml
-      });
+      mockFetchPublicHtml.mockResolvedValueOnce(mockHtml);
 
       const res = await invokeRoute('/announcements/load-from-url', 'post', { url: 'https://example.com/page.html' });
 
@@ -416,9 +406,7 @@ describe('Admin Announcements', () => {
     it('should use default title if neither title nor h1 found', async () => {
       const mockHtml = '<html><body><p>Content only</p></body></html>';
 
-      (mockAxios.get as jest.Mock).mockResolvedValueOnce({
-        data: mockHtml
-      });
+      mockFetchPublicHtml.mockResolvedValueOnce(mockHtml);
 
       const res = await invokeRoute('/announcements/load-from-url', 'post', { url: 'https://example.com/page.html' });
 
@@ -436,9 +424,7 @@ describe('Admin Announcements', () => {
         </html>
       `;
 
-      (mockAxios.get as jest.Mock).mockResolvedValueOnce({
-        data: mockHtml
-      });
+      mockFetchPublicHtml.mockResolvedValueOnce(mockHtml);
 
       const res = await invokeRoute('/announcements/load-from-url', 'post', { url: 'https://example.com/page.html' });
 
@@ -462,9 +448,7 @@ describe('Admin Announcements', () => {
         </html>
       `;
 
-      (mockAxios.get as jest.Mock).mockResolvedValueOnce({
-        data: mockHtml
-      });
+      mockFetchPublicHtml.mockResolvedValueOnce(mockHtml);
 
       const res = await invokeRoute('/announcements/load-from-url', 'post', { url: 'https://example.com/page.html' });
 
@@ -492,8 +476,17 @@ describe('Admin Announcements', () => {
       expect(res.body.message).toBe('Invalid URL format. Must be HTTP or HTTPS.');
     });
 
-    it('should handle HTTP errors from axios', async () => {
-      (mockAxios.get as jest.Mock).mockRejectedValueOnce({
+    it('refuses a URL that points at a non-public address, without fetching anything else', async () => {
+      mockFetchPublicHtml.mockRejectedValueOnce(new SsrfBlockedError('blocked'));
+
+      const res = await invokeRoute('/announcements/load-from-url', 'post', { url: 'http://169.254.169.254/latest/meta-data/' });
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.body).toEqual({ success: false, message: 'URL must point to a public internet address' });
+    });
+
+    it('should handle HTTP errors from the fetch', async () => {
+      mockFetchPublicHtml.mockRejectedValueOnce({
         response: {
           status: 404,
           statusText: 'Not Found'
@@ -508,7 +501,7 @@ describe('Admin Announcements', () => {
     });
 
     it('should handle network errors', async () => {
-      (mockAxios.get as jest.Mock).mockRejectedValueOnce({
+      mockFetchPublicHtml.mockRejectedValueOnce({
         code: 'ENOTFOUND',
         message: 'DNS lookup failed'
       });
@@ -521,7 +514,7 @@ describe('Admin Announcements', () => {
     });
 
     it('should handle timeout errors', async () => {
-      (mockAxios.get as jest.Mock).mockRejectedValueOnce({
+      mockFetchPublicHtml.mockRejectedValueOnce({
         code: 'ETIMEDOUT',
         message: 'Request timeout'
       });
@@ -534,7 +527,7 @@ describe('Admin Announcements', () => {
     });
 
     it('should handle connection refused errors', async () => {
-      (mockAxios.get as jest.Mock).mockRejectedValueOnce({
+      mockFetchPublicHtml.mockRejectedValueOnce({
         code: 'ECONNREFUSED',
         message: 'Connection refused'
       });
@@ -558,9 +551,7 @@ describe('Admin Announcements', () => {
         </html>
       `;
 
-      (mockAxios.get as jest.Mock).mockResolvedValueOnce({
-        data: mockHtml
-      });
+      mockFetchPublicHtml.mockResolvedValueOnce(mockHtml);
 
       const res = await invokeRoute('/announcements/load-from-url', 'post', { url: 'https://example.com/page.html' });
 
@@ -571,9 +562,7 @@ describe('Admin Announcements', () => {
       const longContent = '<p>' + 'x'.repeat(210000) + '</p>';
       const mockHtml = `<html><body>${longContent}</body></html>`;
 
-      (mockAxios.get as jest.Mock).mockResolvedValueOnce({
-        data: mockHtml
-      });
+      mockFetchPublicHtml.mockResolvedValueOnce(mockHtml);
 
       const res = await invokeRoute('/announcements/load-from-url', 'post', { url: 'https://example.com/page.html' });
 

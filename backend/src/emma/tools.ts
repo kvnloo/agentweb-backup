@@ -6983,7 +6983,7 @@ emmaToolRegistry.register({
   name: 'get_website_analytics',
   definition: {
     name: 'get_website_analytics',
-    description: 'Get Google Analytics (GA4) website analytics data. Returns sessions, users, page views, bounce rate, average session duration, traffic sources (with conversion counts per source/medium), a conversion breakdown by traffic source and event name (conversionsBySource), top pages by engagement (topPagesByEngagement), the same pages independently queried and sorted by session volume (topPagesBySessions), and daily trends. Use conversionsBySource for UTM-source-level attribution of form fills and other conversion events. For any "top/highest/most pages by sessions/volume" question, read it off topPagesBySessions — it is already sorted by sessions; do not re-sort topPagesByEngagement yourself, and do not answer a volume-ranking question from a field sorted by a different metric. If topPagesBySessions is missing and topPagesBySessionsError is present instead, that ranking could not be fetched this request — say so plainly; do not report zero pages, and do not substitute topPagesByEngagement ordering as if it answered the volume question. Its conversion counts are historical — they show which events were counted as conversions when they were collected, not which events are currently marked as key events (GA4 key-event changes are not retroactive); this tool cannot read key-event configuration, so never infer it from this data. If the user has multiple GA4 properties configured, returns analytics for all properties unless a specific property is requested.',
+    description: 'Get Google Analytics (GA4) website analytics data. Returns sessions, users, page views, bounce rate, average session duration, traffic sources (with conversion counts per source/medium), a conversion breakdown by traffic source and event name (conversionsBySource), top pages by engagement (topPagesByEngagement), the same pages independently queried and sorted by session volume (topPagesBySessions), and daily trends. Use conversionsBySource for UTM-source-level attribution of form fills and other conversion events. For any "top/highest/most pages by sessions/volume" question, read it off topPagesBySessions — it is already sorted by sessions; do not re-sort topPagesByEngagement yourself, and do not answer a volume-ranking question from a field sorted by a different metric. If topPagesBySessions is missing and topPagesBySessionsError is present instead, that ranking could not be fetched this request — say so plainly; do not report zero pages, and do not substitute topPagesByEngagement ordering as if it answered the volume question. Its conversion counts are historical — they show which events were counted as conversions when they were collected, not which events are currently marked as key events (GA4 key-event changes are not retroactive); this tool cannot read key-event configuration, so never infer it from this data — if get_ga4_key_events is among your available tools, call it for that; if it is not available (or is refused), say plainly that the current key-event configuration could not be checked in this session and give the manual check (GA4 Admin > Events / Key events) — never call install_skills for it. If a property result has noData=true, lead your reply with its noDataNote (property ID and date range). If the user has multiple GA4 properties configured, returns analytics for all properties unless a specific property is requested.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -7006,6 +7006,29 @@ emmaToolRegistry.register({
 
     const { fetchGoogleAnalyticsMetrics } = await import('../services/seoService');
     return await fetchGoogleAnalyticsMetrics(userId, args.timeframe || '30d', args.property_id);
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'get_ga4_key_events',
+  definition: {
+    name: 'get_ga4_key_events',
+    description: 'Read the CURRENT GA4 key-event (conversion) configuration for the user\'s configured GA4 properties via the GA4 Admin API. Read-only. Use this whenever the user asks which events are marked as Key Events / conversions, or whether a specific event (e.g. page_view, generate_lead) is a key event — pass event_name to get a direct isKeyEvent true/false. Returns keyEventNames per property. If a property returns an error (e.g. permission_denied), say so plainly in one line and give the included manual check path; never guess the configuration.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        property_id: { type: 'string', description: 'Specific GA4 property ID (e.g. "123456789"). If omitted, reads all configured properties.' },
+        event_name: { type: 'string', description: 'Optional event name to check, e.g. "page_view". The result includes isKeyEvent for it.' }
+      },
+      required: []
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+
+    const { fetchGa4KeyEvents } = await import('../services/seoService');
+    return await fetchGa4KeyEvents(userId, args.property_id, args.event_name);
   }
 });
 
