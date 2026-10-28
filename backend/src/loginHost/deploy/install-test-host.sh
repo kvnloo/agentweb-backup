@@ -31,6 +31,17 @@ if ! mountpoint -q /var/lib/aw-login-host/test1/u; then
   mount -o remount,nosuid,nodev,usrquota /var/lib/aw-login-host/test1/u
 fi
 SHA=$(sha256sum /opt/aw-claude/2.1.294/claude | cut -d' ' -f1)
+# The host refuses to start if a path it hands to a customer unit has a symlink on it, a non-root owner or a group/other-writable component, so the config
+# must name the REAL node (/usr/bin/node is a link here too). Check the same things now, with a clear message, before the restart.
+NODE_REAL=$(readlink -f /usr/bin/node)
+p=$NODE_REAL
+while :; do
+  [ ! -L "$p" ] || { echo "install-test-host: $p is a symlink: the host would refuse to start" >&2; exit 1; }
+  [ "$(stat -c %u "$p")" = 0 ] || { echo "install-test-host: $p is not owned by root (the node tarball may carry another owner: chown -R root:root its directory): the host would refuse to start" >&2; exit 1; }
+  m=$(stat -c %a "$p"); [ $(( 0$m & 022 )) = 0 ] || { echo "install-test-host: $p is writable by group or others: the host would refuse to start" >&2; exit 1; }
+  [ "$p" = / ] && break
+  p=$(dirname "$p")
+done
 cat > /etc/aw-login-host/test1.json <<CFG
 {
   "env": "test1", "uidMin": 420000, "uidMax": 430000,
@@ -39,7 +50,8 @@ cat > /etc/aw-login-host/test1.json <<CFG
   "quota": { "blocksKb": 102400, "inodes": 10000 },
   "egress": { "allow": ["api.anthropic.com:443", "platform.claude.com:443", "console.anthropic.com:443", "claude.ai:443"] },
   "claude": { "binaryPath": "/opt/aw-claude/2.1.294/claude", "expectedSha256": "$SHA", "version": "2.1.294",
-              "systemPromptFile": "/opt/aw-login-host/system-prompt.txt", "bridgeUrl": "http://127.0.0.1:3991/mcp" }
+              "systemPromptFile": "/opt/aw-login-host/system-prompt.txt", "bridgeUrl": "http://127.0.0.1:3991/mcp",
+              "relayShimPath": "/opt/aw-login-host/aw-relay-shim.js", "nodePath": "$NODE_REAL" }
 }
 CFG
 chmod 0600 /etc/aw-login-host/test1.json; chown root:root /etc/aw-login-host /etc/aw-login-host/test1.json; chmod 0755 /etc/aw-login-host

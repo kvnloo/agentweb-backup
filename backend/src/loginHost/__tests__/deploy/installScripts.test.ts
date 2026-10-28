@@ -192,7 +192,8 @@ describe("config template", () => {
       .replace(/@@WORKER_IP@@/g, over.ip ?? "172.31.30.50")
       .replace(/@@RELEASE_DIR@@/g, over.rel ?? "/opt/aw-login-host/releases/login-host-abc-20261021000000")
       .replace(/@@TLS_DIR@@/g, over.tls ?? "/etc/aw-login-host/tls/login-host-abc-20261021000000")
-      .replace(/@@CLAUDE_VERSION@@/g, over.ver ?? versions.CLAUDE_VERSION);
+      .replace(/@@CLAUDE_VERSION@@/g, over.ver ?? versions.CLAUDE_VERSION)
+      .replace(/@@NODE_VERSION@@/g, versions.NODE_VERSION);
 
   it("is accepted by the host's own schema once the placeholders are filled, and every path points into the release / its TLS set", () => {
     const cfg = parseHostConfig(JSON.parse(fill()));
@@ -206,6 +207,7 @@ describe("config template", () => {
     expect(cfg.claude.turnWrapperPath).toBe("/opt/aw-login-host/releases/login-host-abc-20261021000000/claude-turn.sh");
     expect(cfg.claude.systemPromptFile).toBe("/opt/aw-login-host/releases/login-host-abc-20261021000000/system-prompt.txt");
     expect(cfg.claude.relayShimPath).toBe("/opt/aw-login-host/releases/login-host-abc-20261021000000/aw-relay-shim.js");
+    expect(cfg.claude.nodePath).toBe(`/opt/aw-node/v${versions.NODE_VERSION}/bin/node`);
     expect(cfg.egress.launcherPath).toBe("/opt/aw-login-host/releases/login-host-abc-20261021000000/aw-net.sh");
     expect(cfg.tools.writeFileHelper).toBe("/opt/aw-login-host/releases/login-host-abc-20261021000000/aw-write-file.sh");
     expect(cfg.egress.allow).toEqual(expect.arrayContaining(["api.anthropic.com:443", "platform.claude.com:443"]));
@@ -882,6 +884,7 @@ case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${
     expect(cfg.claude.turnWrapperPath).toBe(join(b.opt, "releases", rels[0], "claude-turn.sh"));
     expect(cfg.egress.launcherPath).toBe(join(b.opt, "releases", rels[0], "aw-net.sh"));
     expect(cfg.claude.relayShimPath).toBe(join(b.opt, "releases", rels[0], "aw-relay-shim.js"));
+    expect(cfg.claude.nodePath).toBe(`/opt/aw-node/v${versions.NODE_VERSION}/bin/node`); // the REAL path: /usr/bin/node is a symlink and assertTrustedPath refuses those
     expect(cfg.tls?.keyPath).toBe(join(b.conf, "tls", rels[0], "server.key"));
     for (const p of [cfg.claude.turnWrapperPath, cfg.claude.relayShimPath, cfg.egress.launcherPath, cfg.tools.writeFileHelper, cfg.claude.systemPromptFile, cfg.tls!.certPath, cfg.tls!.keyPath, cfg.tls!.caPath]) {
       expect(existsSync(p)).toBe(true);

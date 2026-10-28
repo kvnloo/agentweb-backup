@@ -303,6 +303,34 @@ export async function startHost(cfg: HostConfig, binary: VerifiedBinary, deps: H
   }
 }
 
+/**
+ * Everything the host or a customer unit executes or reads as policy must be root-controlled: root-owned, not group/other-writable, and NO SYMLINK anywhere
+ * on the path (assertTrustedPath). So a configured path must be the REAL path: /usr/bin/node on the prod worker is a symlink (install.sh), which is why the
+ * prod config names /opt/aw-node/v<version>/bin/node. Shared by runMain and the tests; `check` is a seam for tests (a temp tree owned by the current uid).
+ */
+export function hostTrustedPaths(cfg: HostConfig): string[] {
+  return [
+    ...(cfg.tls ? [cfg.tls.certPath, cfg.tls.keyPath, cfg.tls.caPath] : []),
+    cfg.claude.turnWrapperPath,
+    cfg.claude.relayShimPath,
+    cfg.claude.nodePath,
+    cfg.egress.launcherPath,
+    cfg.egress.socat,
+    cfg.claude.systemPromptFile,
+    cfg.tools.writeFileHelper,
+    cfg.tools.systemRun,
+    cfg.tools.systemctl,
+    cfg.tools.setpriv,
+    cfg.tools.env,
+    cfg.tools.rm,
+    cfg.tools.find,
+    ...(cfg.quota ? [cfg.tools.setquota] : []),
+  ];
+}
+export function assertHostTrustedPaths(cfg: HostConfig, check: (p: string) => void = (p) => assertTrustedPath(p)): void {
+  for (const p of hostTrustedPaths(cfg)) check(p);
+}
+
 /** The root-only entry: reads the config, checks the machine, starts, handles signals. */
 export async function runMain(argv: string[] = process.argv): Promise<void> {
   const log = jsonLogger();
@@ -313,7 +341,7 @@ export async function runMain(argv: string[] = process.argv): Promise<void> {
     assertTrustedPath(configPath); // the config is root-owned and not writable by anyone else, like everything it points to
     const cfg = parseHostConfig(JSON.parse(readFileSync(configPath, "utf8")));
     // Everything the host or a customer unit executes or reads as policy must be root-controlled too.
-    for (const p of [...(cfg.tls ? [cfg.tls.certPath, cfg.tls.keyPath, cfg.tls.caPath] : []), cfg.claude.turnWrapperPath, cfg.claude.relayShimPath, cfg.claude.nodePath, cfg.egress.launcherPath, cfg.egress.socat, cfg.claude.systemPromptFile, cfg.tools.writeFileHelper, cfg.tools.systemRun, cfg.tools.systemctl, cfg.tools.setpriv, cfg.tools.env, cfg.tools.rm, cfg.tools.find, ...(cfg.quota ? [cfg.tools.setquota] : [])]) assertTrustedPath(p);
+    assertHostTrustedPaths(cfg);
     if (cfg.tls) assertKeyFileMode(cfg.tls.keyPath, statSync(cfg.tls.keyPath).mode);
     if (existsSync("/etc/subuid")) assertNoSubuidOverlap(readFileSync("/etc/subuid", "utf8"), cfg.uidMin, cfg.uidMax);
     registerRange(`${cfg.sharedParent}/ranges`, { env: cfg.env, uidMin: cfg.uidMin, uidMax: cfg.uidMax });

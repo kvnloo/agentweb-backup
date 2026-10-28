@@ -418,11 +418,11 @@ chmod 0644 "$STAGE_REL_DIR/FINGERPRINT" "$STAGE_REL_DIR/TLS_DIR" "$STAGE_REL_DIR
 
 # The config, with every path pointing into THIS release and ITS TLS set; accepted by the host's own parser before it is used.
 cfg_tmp="$STAGE_REL_DIR/prod.json"
-python3 - "$HERE/files/host-config.template.json" "$cfg_tmp" "$CLAUDE_BIN_SHA256" "$BRIDGE_URL" "$WORKER_IP" "$REL_DIR" "$TLS_DIR" "$CLAUDE_VERSION" <<'PY' || die "could not render the config"
+python3 - "$HERE/files/host-config.template.json" "$cfg_tmp" "$CLAUDE_BIN_SHA256" "$BRIDGE_URL" "$WORKER_IP" "$REL_DIR" "$TLS_DIR" "$CLAUDE_VERSION" "$NODE_VERSION" <<'PY' || die "could not render the config"
 import json, sys
-tpl, out, sha, bridge, ip, rel, tls, ver = sys.argv[1:9]
+tpl, out, sha, bridge, ip, rel, tls, ver, nodever = sys.argv[1:10]
 text = open(tpl).read()
-for k, v in (("@@CLAUDE_BIN_SHA256@@", sha), ("@@BRIDGE_URL@@", bridge), ("@@WORKER_IP@@", ip), ("@@RELEASE_DIR@@", rel), ("@@TLS_DIR@@", tls), ("@@CLAUDE_VERSION@@", ver)):
+for k, v in (("@@CLAUDE_BIN_SHA256@@", sha), ("@@BRIDGE_URL@@", bridge), ("@@WORKER_IP@@", ip), ("@@RELEASE_DIR@@", rel), ("@@TLS_DIR@@", tls), ("@@CLAUDE_VERSION@@", ver), ("@@NODE_VERSION@@", nodever)):
     text = text.replace(k, v)
 if "@@" in text:
     raise SystemExit("an unfilled placeholder is left in the config")
