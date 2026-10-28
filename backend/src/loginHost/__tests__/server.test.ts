@@ -149,7 +149,7 @@ describe("login host server", () => {
       "turn.run": { connectionId: "c1", epoch: 1, idempotencyKey: "k1", turnId: "t1", prompt: "hi", model: "fast", bridgeToken: "bridge-token-0123456789" },
       "turn.renew": { connectionId: "c1", turnId: "t1", epoch: 1 },
       "turn.interrupt": { connectionId: "c1", turnId: "t1", epoch: 1 },
-      "turn.toolResult": { connectionId: "c1", turnId: "t1", epoch: 1, operationId: "o1", ok: true, content: "r" },
+      "turn.toolResult": { connectionId: "c1", turnId: "t1", epoch: 1, operationId: "o1", content: "r" },
       "connection.disable": { connectionId: "c1", epoch: 1 },
       "connection.enable": { connectionId: "c1", epoch: 1 },
       "connection.revoke": { connectionId: "c1", epoch: 1 },

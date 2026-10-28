@@ -18,9 +18,8 @@ import { connect } from "net";
 import { ZodError } from "zod";
 import type { ConnectionManager } from "./connectionManager";
 import type { Logger } from "./ports";
-import { HostError, HTTP_STATUS, LOCAL_ONLY_ROUTES, PROTOCOL_VERSION, ROUTES, type RouteName } from "./protocol";
+import { DEFAULT_MAX_BODY_BYTES, HostError, HTTP_STATUS, LOCAL_ONLY_ROUTES, PROTOCOL_VERSION, ROUTES, TOOL_RESULT_MAX_BODY_BYTES, type RouteName } from "./protocol";
 
-const MAX_BODY_BYTES = 5 * 1024 * 1024;
 /** A request body that stops arriving for this long is dropped (slowloris). */
 const BODY_IDLE_MS = 15_000;
 /** A rejected TLS client is logged at most once per this window per reason (a scanner or a misconfigured peer must not flood the journal). */
@@ -212,7 +211,7 @@ async function handle(manager: ConnectionManager, req: IncomingMessage, res: Ser
 
   let body: unknown;
   try {
-    body = JSON.parse(await readBody(req, bodyIdleMs));
+    body = JSON.parse(await readBody(req, bodyIdleMs, route === "turn.toolResult" ? TOOL_RESULT_MAX_BODY_BYTES : DEFAULT_MAX_BODY_BYTES));
   } catch (err) {
     if (err instanceof HostError) {
       sendError(res, err, err.detail === "too_large" ? 413 : undefined);
@@ -226,7 +225,7 @@ async function handle(manager: ConnectionManager, req: IncomingMessage, res: Ser
     input = ROUTES[route].parse(body) as never;
   } catch (err) {
     // Only the field names and the kind of problem; never the offending value (it may be a token or a code).
-    const detail = err instanceof ZodError ? err.issues.map((i) => `${i.path.join(".") || "body"}:${i.code}`).slice(0, 5).join(",") : "invalid";
+    const detail = err instanceof ZodError ? err.issues.map((i) => `${i.path.join(".") || "body"}:${i.code === "custom" && /^[a-z_]{1,40}$/.test(i.message) ? i.message : i.code}`).slice(0, 5).join(",") : "invalid";
     return sendError(res, new HostError("EINVALID", detail));
   }
 
@@ -307,13 +306,13 @@ async function streamTurn(m: ConnectionManager, input: never, res: ServerRespons
   }
 }
 
-function readBody(req: IncomingMessage, bodyIdleMs: number): Promise<string> {
+function readBody(req: IncomingMessage, bodyIdleMs: number, maxBytes: number): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
     req.on("data", (c: Buffer) => {
       size += c.length;
-      if (size > MAX_BODY_BYTES) {
+      if (size > maxBytes) {
         clearTimeout(idle);
         req.pause();
         reject(new HostError("EINVALID", "too_large"));
