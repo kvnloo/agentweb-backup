@@ -79,7 +79,7 @@ export function evaluateCampaignHealth(
 ): CampaignHealthSignal | null {
   if (!config.enabled) return null;
   const t = config.thresholds;
-  const minLeads = isNum(t.minLeadsForRate) ? t.minLeadsForRate : 1;
+  const minLeads = isNum(t.minLeadsForRate) && t.minLeadsForRate >= 1 ? t.minLeadsForRate : 1;
   const struggling: CampaignHealthReason[] = [];
 
   const { reportedLeads, landedLeads, spend, qualityEvaluatedLeads, badLeads } = stats;
