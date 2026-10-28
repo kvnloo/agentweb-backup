@@ -41,8 +41,10 @@ describe("turn.run: exactly one tool transport", () => {
 
 describe("tools manifest bounds", () => {
   const bad = (tools: unknown[]) => detail(run({ tools }));
-  it("names are ^[a-z0-9_]{1,48}$", () => {
-    for (const n of ["", "A", "a-b", "a b", "a.b", "../x", "x".repeat(49), "é", "a\0"]) expect(run({ tools: [tool(n)] }).success).toBe(false);
+  it("names are the function-name shape every Emma tool already has: ^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$", () => {
+    for (const n of ["", "-a", "--dangerously-skip-permissions", "a b", "a.b", "../x", "a/b", "x".repeat(65), "é", "a\0", "a$b", "a%b"]) expect(run({ tools: [tool(n)] }).success).toBe(false);
+    // what user-connected MCP servers and the registry produce today
+    expect(run({ tools: [tool("browser_navigate"), tool("getIssue"), tool("list-pages"), tool("x".repeat(64)), tool("A_1")] }).success).toBe(true);
     expect(run({ tools: [tool("x".repeat(48)), tool("a_1")] }).success).toBe(true);
   });
   it("the shim-reserved prefix, duplicates and an all-locked manifest are refused", () => {
@@ -59,8 +61,9 @@ describe("tools manifest bounds", () => {
     const bigSchema = { type: "object", properties: { p: { type: "string", description: "x".repeat(TOOL_LIMITS.maxSchemaBytes) } } };
     expect(bad([tool("a", { inputSchema: bigSchema })])).toBe("tools:tool_schema_too_large");
     // 60 tools x ~12 KB each pass the per-tool caps but not the 512 KiB total
-    const mid = { type: "object", properties: { p: { type: "string", description: "x".repeat(12_000) } } };
-    expect(bad(Array.from({ length: 60 }, (_, i) => tool(`t${i}`, { inputSchema: mid })))).toBe("tools:tools_too_large");
+    // 40 tools x ~30 KB each pass the per-tool caps but not the 1 MiB total
+    const mid = { type: "object", properties: { p: { type: "string", description: "x".repeat(30_000) } } };
+    expect(bad(Array.from({ length: 40 }, (_, i) => tool(`t${i}`, { inputSchema: mid })))).toBe("tools:tools_too_large");
   });
   it("a schema must be an object schema; unknown tool fields are refused", () => {
     expect(bad([tool("a", { inputSchema: { type: "string" } })])).toBe("tools:tool_schema_not_object");
@@ -134,7 +137,7 @@ describe("per-route body cap (through the socket)", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it("turn.toolResult accepts a body of ~6 MiB (images); every other route still stops at 5 MiB; toolResult stops at 8 MiB", async () => {
+  it("turn.toolResult accepts a body of ~6 MiB (images); turn.run and toolResult stop at 8 MiB; every other route still stops at 5 MiB", async () => {
     await signIn(rig, "c1", 1);
     const big = JSON.stringify({
       connectionId: "c1",
@@ -148,8 +151,10 @@ describe("per-route body cap (through the socket)", () => {
     expect(big.length).toBeLessThan(8 * 1024 * 1024);
     const r = await post(sock, "turn.toolResult", big);
     expect(r.status).toBe(404); // passed the cap and the schema: no such turn
-    const pad = JSON.stringify({ ...turnReq("c1", 1), prompt: "p".repeat(5 * 1024 * 1024 + 10) });
+    const pad = JSON.stringify({ ...turnReq("c1", 1), prompt: "p".repeat(8 * 1024 * 1024 + 10) });
     expect((await post(sock, "turn.run", pad)).status).toBe(413);
+    const other = JSON.stringify({ connectionId: "c1", loginRef: "l1", code: "abcdefgh#" + "1".repeat(5 * 1024 * 1024) });
+    expect((await post(sock, "login.complete", other)).status).toBe(413);
     const over = JSON.stringify({ connectionId: "c1", turnId: "t1", epoch: 1, operationId: "a".repeat(32), content: "x".repeat(8 * 1024 * 1024 + 10) });
     expect((await post(sock, "turn.toolResult", over)).status).toBe(413);
   });

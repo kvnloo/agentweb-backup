@@ -57,15 +57,25 @@ export const loginPromoteReq = z.object({ connectionId: ID, loginRef: ID, epoch:
 // ───────────────────────────── tool relay (protocol 4) ─────────────────────────────
 
 /** A tool the customer's CLI is offered through the relay shim. The name is also a path-free, shell-free token. */
-export const TOOL_NAME = z.string().regex(/^[a-z0-9_]{1,48}$/, "tool name: a-z 0-9 _ only, 1-48 chars");
+/**
+ * The function-name shape every Emma tool already has to satisfy (OpenAI tool names: [A-Za-z0-9_-], at most 64), so the plan route can offer EXACTLY the
+ * tools AgentWeb offers, user-connected MCP tools included. Never a leading "-"; no dot, slash or space (it is a name, not a path, and never reaches argv).
+ */
+export const TOOL_NAME = z.string().regex(/^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$/, "tool name: A-Z a-z 0-9 _ - only, 1-64 chars, no leading -");
 /** Names the relay shim keeps for itself (the whole `aw_relay_` prefix): a manifest may not use them. */
 export const RELAY_RESERVED_PREFIX = "aw_relay_";
+/**
+ * DoS guards, NOT a tool budget: the plan route must offer the same tools as AgentWeb, so these sit at about 2x the real registry (measured 2026-10-28 on
+ * the Emma registry: 263 registered tools + the agent-mode built-ins and per-user MCP tools, ~271 in a full session; largest description 24,232 bytes
+ * (call_meta_marketing_api), largest schema 15,084 bytes (call_google_ads_api), whole manifest ~502 KB). A registry that outgrows them must raise them here
+ * (worker first), never be trimmed silently by the backend.
+ */
 export const TOOL_LIMITS = {
-  maxTools: 200,
+  maxTools: 600,
   /** Serialized size of the whole manifest as the host writes it into the shim's config. */
-  maxTotalBytes: 512 * 1024,
-  maxDescriptionBytes: 4 * 1024,
-  maxSchemaBytes: 16 * 1024,
+  maxTotalBytes: 1024 * 1024,
+  maxDescriptionBytes: 48 * 1024,
+  maxSchemaBytes: 32 * 1024,
 } as const;
 const byteLen = (v: unknown): number => Buffer.byteLength(JSON.stringify(v), "utf8");
 
@@ -116,6 +126,14 @@ export type ToolImage = z.infer<typeof toolImage>;
 export const DEFAULT_MAX_BODY_BYTES = 5 * 1024 * 1024;
 /** turn.toolResult carries up to 6M base64 image characters plus text. */
 export const TOOL_RESULT_MAX_BODY_BYTES = 8 * 1024 * 1024;
+/** turn.run: a 2,000,000-character prompt (up to ~6 MB as UTF-8) plus a manifest at its 1 MiB limit must fit. */
+export const TURN_RUN_MAX_BODY_BYTES = 8 * 1024 * 1024;
+/** The body limit of each route (finite: the body is buffered whole before parsing). */
+export function maxBodyBytes(route: string): number {
+  if (route === "turn.toolResult") return TOOL_RESULT_MAX_BODY_BYTES;
+  if (route === "turn.run") return TURN_RUN_MAX_BODY_BYTES;
+  return DEFAULT_MAX_BODY_BYTES;
+}
 /** Frames between the shim and the host (newline-delimited JSON). */
 export const RELAY_FRAME_LIMITS = { shimToHostBytes: 1024 * 1024, hostToShimBytes: 8 * 1024 * 1024 } as const;
 
