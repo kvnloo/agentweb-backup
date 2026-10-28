@@ -50,6 +50,11 @@ describe("tools manifest bounds", () => {
   it("the shim-reserved prefix, duplicates and an all-locked manifest are refused", () => {
     expect(bad([tool("aw_relay_ping")])).toBe("tools:tool_name_reserved");
     expect(bad([tool("a"), tool("a")])).toBe("tools:tool_duplicate");
+    // case-insensitive: names differing only in case, and the reserved prefix in any case
+    expect(bad([tool("getIssue"), tool("getissue")])).toBe("tools:tool_duplicate");
+    expect(bad([tool("AW_RELAY_x")])).toBe("tools:tool_name_reserved");
+    expect(bad([tool("Aw_Relay_ping")])).toBe("tools:tool_name_reserved");
+    expect(run({ tools: [tool("getIssue"), tool("getIssues")] }).success).toBe(true);
     expect(bad([tool("a", { locked: true })])).toBe("tools:tool_all_locked");
     expect(run({ tools: [tool("a"), tool("b", { locked: true })] }).success).toBe(true);
   });

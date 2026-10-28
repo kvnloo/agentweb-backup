@@ -98,9 +98,11 @@ export const toolManifest = z
     const fail = (message: string) => ctx.addIssue({ code: "custom", message });
     const seen = new Set<string>();
     for (const t of tools) {
-      if (seen.has(t.name)) return fail("tool_duplicate");
-      seen.add(t.name);
-      if (t.name.startsWith(RELAY_RESERVED_PREFIX)) return fail("tool_name_reserved");
+      // Case-insensitive: two names that differ only in case are too easy to confuse (for the model and in logs) to be two tools.
+      const folded = t.name.toLowerCase();
+      if (seen.has(folded)) return fail("tool_duplicate");
+      seen.add(folded);
+      if (folded.startsWith(RELAY_RESERVED_PREFIX)) return fail("tool_name_reserved");
       if (t.inputSchema.type !== "object") return fail("tool_schema_not_object");
       if (byteLen(t.inputSchema) > TOOL_LIMITS.maxSchemaBytes) return fail("tool_schema_too_large");
       if (Buffer.byteLength(t.description, "utf8") > TOOL_LIMITS.maxDescriptionBytes) return fail("tool_description_too_large");
@@ -126,7 +128,10 @@ export type ToolImage = z.infer<typeof toolImage>;
 export const DEFAULT_MAX_BODY_BYTES = 5 * 1024 * 1024;
 /** turn.toolResult carries up to 6M base64 image characters plus text. */
 export const TOOL_RESULT_MAX_BODY_BYTES = 8 * 1024 * 1024;
-/** turn.run: a 2,000,000-character prompt (up to ~6 MB as UTF-8) plus a manifest at its 1 MiB limit must fit. */
+/**
+ * turn.run: a manifest at its 1 MiB limit plus a prompt of up to ~6.9 MiB as JSON, e.g. 2,000,000 characters of ordinary text (up to 3 bytes each as UTF-8, ~6 MB).
+ * NOT every 2,000,000-character prompt: control characters JSON-escape to 6 bytes each (\u0000), so a prompt made mostly of them (~12 MB) is refused with 413.
+ */
 export const TURN_RUN_MAX_BODY_BYTES = 8 * 1024 * 1024;
 /** The body limit of each route (finite: the body is buffered whole before parsing). */
 export function maxBodyBytes(route: string): number {
