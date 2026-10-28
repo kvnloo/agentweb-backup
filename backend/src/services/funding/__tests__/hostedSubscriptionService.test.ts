@@ -157,6 +157,15 @@ describe("hosted subscription service", () => {
       expect(store.rows()).toHaveLength(1);
       expect((await store.db.get("conn-1"))!.status).toBe("active");
       expect(rig.mgr.status({ connectionId: "conn-1" }).state).toBe("active");
+      // The host would also refuse the second code, so the result above does not prove the in-process guard: count what was sent.
+      expect(sent.filter((x) => x.route === "login.complete")).toHaveLength(1);
+    });
+
+    it("expiry follows the backend clock: a backend an hour ahead of the host still completes a fresh sign-in", async () => {
+      nowMs += 60 * 60 * 1000;
+      const started = await svc.startLogin(user, "claude");
+      (svc as unknown as { pending: Map<string, unknown> }).pending.clear(); // as if another instance, so only the token's expiry is in play
+      expect(await svc.completeLogin(user, started.loginId, GOOD)).toMatchObject({ status: "active" });
     });
 
     it("a sign-in whose token cannot be made is cancelled on the host, so it does not block the next one", async () => {
