@@ -32,6 +32,8 @@ type Lead = Record<string, any>;
 export interface PushRunOptions {
   includeUnverified: boolean;
   mapping: TagMapping;
+  /** When the user previewed (the approval token's issue time): leads created after this were never part of what they saw. Falls back to the run start. */
+  approvedAt?: string;
   /** The campaign's status when the run was approved: DRAFTED or PAUSED runs stop if the campaign is started under them. */
   startStatus: string;
 }
@@ -40,7 +42,8 @@ export function readPushOptions(raw: Record<string, unknown> | undefined): PushR
   const mapping: TagMapping = {};
   const m = raw?.mapping;
   if (m && typeof m === "object" && !Array.isArray(m)) for (const [k, v] of Object.entries(m)) if (typeof v === "string") mapping[k] = v;
-  return { includeUnverified: raw?.includeUnverified === true, mapping, startStatus: typeof raw?.startStatus === "string" ? raw.startStatus.toUpperCase() : "" };
+  const approvedAt = typeof raw?.approvedAt === "string" && !Number.isNaN(Date.parse(raw.approvedAt)) ? raw.approvedAt : undefined;
+  return { includeUnverified: raw?.includeUnverified === true, mapping, startStatus: typeof raw?.startStatus === "string" ? raw.startStatus.toUpperCase() : "", ...(approvedAt ? { approvedAt } : {}) };
 }
 
 export interface EngineDeps {
@@ -200,7 +203,8 @@ export async function executeRun(run: PushRun, deps: EngineDeps): Promise<RunOut
         tags: analysis.tags,
         mapping: options.mapping,
         includeUnverified: options.includeUnverified,
-        runStartedAt: run.startedAt,
+        // Pinned to the PREVIEW, not the start: a lead created or imported in between was never shown to the user.
+        runStartedAt: options.approvedAt ?? run.startedAt,
       };
 
       // ── build one batch: whole pages only, so the cursor is exactly the last lead examined

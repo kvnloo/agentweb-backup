@@ -179,6 +179,7 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
       const run = (await db.getRun(r.run.runId))!;
       expect(run).toMatchObject({ ownerId: "owner", pushedBy: "editor", keyOwnerId: "editor", channel: "ui", campaignSource: "selected", previewEligible: 5 });
       expect(run.options).toMatchObject({ includeUnverified: false, startStatus: "DRAFTED", acknowledgements: { lawfulBasis: true } });
+      expect(run.options.approvedAt).toBe(new Date(clock).toISOString()); // the PREVIEW time: the engine only pushes leads that existed then
       await drain(e);
     });
 
@@ -429,6 +430,27 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
       const [run] = await db.listRunsForList(e.listId);
       expect(run.status).toBe("canceled");
       expect(await db.getLock(e.listId, CAMPAIGN)).toBeNull();
+    });
+
+    it("tells the user the start FAILED when the run is no longer running at confirmation (the resumer cancelled it), and starts no worker", async () => {
+      const e = env();
+      const p = await approve(e);
+      (e.deps.db as any) = new Proxy(db, { get: (t, k) => (k === "confirmStart" ? async (id: string) => { await (t as any).cancelRun(id); return (t as any).confirmStart(id); } : (t as any)[k]?.bind?.(t) ?? (t as any)[k]) });
+      expect(await e.svc.start("owner", go(p.token))).toMatchObject({ ok: false, status: 503 });
+      await drain(e);
+      expect(e.sl.posts).toHaveLength(0);
+      expect((await db.listRunsForList(e.listId))[0].status).toBe("canceled");
+    });
+
+    it("pauses a run, instead of working it, when its pusher no longer has edit access to the list (a resume by the resumer or a claim)", async () => {
+      const e = env({ maxConcurrentWorkers: 0 });
+      const r = (await e.svc.start("owner", go((await approve(e)).token))) as any;
+      const run = (await db.getRun(r.run.runId))!;
+      const original = e.deps.canEdit;
+      e.deps.canEdit = async (u, l) => (u === "owner" ? false : original(u, l)); // the pusher lost the role (the list owner check no longer passes for them)
+      await e.svc.work(run);
+      expect(((await e.svc.status("owner", r.run.runId)) as any).run).toMatchObject({ status: "paused", pauseReason: "access_revoked" });
+      expect(e.sl.posts).toHaveLength(0);
     });
 
     it("confirms after a transient failure and carries on as normal", async () => {

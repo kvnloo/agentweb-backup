@@ -131,26 +131,26 @@ export async function withdrawalSweep(deps: WithdrawalDeps): Promise<SweepResult
       }
       if (!resolved) {
         out.keyUnavailable++;
-        logOnce(deps, `${first.listId}#${first.campaignId}#nokey`, `[SmartleadWithdrawal] list=${first.listId} campaign=${first.campaignId}: NO usable Smartlead key (${lastReason}); opt-outs on this list are NOT being sent to Smartlead`);
-        continue;
-      }
-      // The key must be able to SEE the campaign (a connection whose key was replaced by one from another Smartlead account answers 404 to
-      // every lead, which would be read as "gone" and closed as withdrawn while the person is still live in the old account).
-      if (!(await deps.smartlead.campaignVisible(resolved.apiKey, first.campaignId!))) {
-        out.keyUnavailable++;
-        logOnce(deps, `${first.listId}#${first.campaignId}#invisible`, `[SmartleadWithdrawal] list=${first.listId} campaign=${first.campaignId}: the connected key cannot see this campaign (it was deleted in Smartlead, or the key belongs to another Smartlead account); nothing was changed for this list, and if the campaign still exists for the customer its opt-outs are NOT being sent`);
+        logOnce(deps, `${first.listId}#${first.campaignId}#nokey#${lastReason}`, `[SmartleadWithdrawal] list=${first.listId} campaign=${first.campaignId}: NO usable Smartlead key (${lastReason}); opt-outs on this list are NOT being sent to Smartlead`);
         continue;
       }
       const result = await sweepTarget(deps, resolved, first.listId!, first.campaignId!, cap);
       out.withdrawn += result.withdrawn;
       out.failed += result.failed;
+      if (result.invisible) {
+        out.keyUnavailable++;
+        logOnce(deps, `${first.listId}#${first.campaignId}#invisible`, `[SmartleadWithdrawal] list=${first.listId} campaign=${first.campaignId}: the connected key cannot see this campaign (it was deleted in Smartlead, or the key belongs to another Smartlead account); nothing was changed for this list, and if the campaign still exists for the customer its opt-outs are NOT being sent`);
+      }
     } catch (error) {
       out.targetErrors++;
-      logOnce(deps, `${first.listId}#${first.campaignId}#error`, `[SmartleadWithdrawal] list=${first.listId} campaign=${first.campaignId}: ${scrubSmartleadSecrets(error instanceof Error ? error.message : String(error))}`);
+      logOnce(deps, `${first.listId}#${first.campaignId}#error#${error instanceof SmartleadApiError ? error.status ?? "net" : "other"}#${(error instanceof Error ? error.message : String(error)).slice(0, 40)}`, `[SmartleadWithdrawal] list=${first.listId} campaign=${first.campaignId}: ${scrubSmartleadSecrets(error instanceof Error ? error.message : String(error))}`);
     }
   }
   if (out.withdrawn || out.failed || out.keyUnavailable || out.targetErrors) {
-    deps.log(`[SmartleadWithdrawal] pass: targets=${out.targets} withdrawn=${out.withdrawn} failed=${out.failed} keyUnavailable=${out.keyUnavailable} targetErrors=${out.targetErrors}`);
+    // Every pass that DID something is logged; a pass that only repeats the same problems is logged once a day.
+    const line = `[SmartleadWithdrawal] pass: targets=${out.targets} withdrawn=${out.withdrawn} failed=${out.failed} keyUnavailable=${out.keyUnavailable} targetErrors=${out.targetErrors}`;
+    if (out.withdrawn) deps.log(line);
+    else logOnce(deps, `pass#${out.targets}#${out.failed}#${out.keyUnavailable}#${out.targetErrors}`, line);
   }
   return out;
 }
@@ -166,9 +166,9 @@ async function sweepTarget(
   listId: string,
   campaignId: number,
   cap: number,
-): Promise<{ withdrawn: number; failed: number }> {
+): Promise<{ withdrawn: number; failed: number; invisible?: boolean }> {
   const markerKey = smartleadMarkerKey(campaignId);
-  const result = { withdrawn: 0, failed: 0 };
+  const result: { withdrawn: number; failed: number; invisible?: boolean } = { withdrawn: 0, failed: 0 };
 
   // Every lead that opted out here and is still live in Smartlead; those that failed before are tried last.
   const found: Array<{ leadId: string; attempts: number; at: number }> = [];
@@ -187,6 +187,19 @@ async function sweepTarget(
     if (!page.hasMore) break;
   }
   found.sort((a, b) => a.attempts - b.attempts || a.at - b.at);
+  if (found.length === 0) return result; // nothing opted out here: no Smartlead call at all
+
+  // The key must be able to SEE the campaign (a connection whose key was replaced by one from another Smartlead account answers 404 to every
+  // lead, which would be read as "gone" and closed as withdrawn while the person is still live in the old account). Checked only when there
+  // is something to withdraw, so a quiet pass costs no Smartlead calls.
+  try {
+    if (!(await deps.smartlead.campaignVisible(resolved.apiKey, campaignId))) return { ...result, invisible: true };
+  } catch (error) {
+    // A key revoked since the last pass is found here first: report it (flagged after a confirming probe) before the pass moves on.
+    const status = error instanceof SmartleadApiError ? error.status : undefined;
+    if (status === 401 || status === 403) void deps.reportFailure(resolved, error).catch(() => undefined);
+    throw error;
+  }
 
   let consecutiveFailures = 0;
   type Outcome = { kind: "withdrawn" } | { kind: "skipped" } | { kind: "failed"; why: string; quiet?: boolean };

@@ -369,6 +369,7 @@ export class SmartleadPushService {
           campaignId: token.campaignId, campaignName: campaign.name, campaignSource: "selected",
           options: {
             includeUnverified: token.includeUnverified, mapping: token.mapping, acknowledgedTags: token.acknowledgedTags, startStatus: token.startStatus, warnings: token.warnings,
+            approvedAt: new Date(token.iat).toISOString(),
             acknowledgements: { lawfulBasis: true, ...(campaign.status === "ACTIVE" ? { activeConfirmed: true } : {}) },
           },
           sequenceHash: token.sequenceHash, previewEligible: token.eligible,
@@ -394,8 +395,8 @@ export class SmartleadPushService {
       let confirmed = false;
       for (let attempt = 0; attempt < 4 && !confirmed; attempt++) {
         try {
-          await this.deps.db.confirmStart(started.run.runId);
-          confirmed = true;
+          confirmed = await this.deps.db.confirmStart(started.run.runId); // false: the run is no longer running (the resumer cancelled it)
+          if (!confirmed) break;
         } catch (error) {
           this.deps.log(`[SmartleadPush] could not confirm start of run=${started.run.runId}: ${scrubSmartleadSecrets(error instanceof Error ? error.message : String(error))}`);
           if (attempt < 3) await this.deps.sleep(50 * 4 ** attempt);
@@ -486,6 +487,13 @@ export class SmartleadPushService {
   /** Runs one run to its end. Never throws: a store error leaves the lease to lapse, and the resumer decides. */
   async work(run: PushRun): Promise<void> {
     try {
+      // The pusher must STILL have edit access to the list (they may have left the org or lost the role since the run started or was paused).
+      const list = await this.deps.getList(run.listId);
+      if (!list || !(await this.deps.canEdit(run.pushedBy, list))) {
+        await this.deps.db.pauseRun(run.runId, "access_revoked", run.leaseEpoch);
+        this.deps.log(`[SmartleadPush] run=${run.runId} paused: the pusher no longer has edit access to the list`);
+        return;
+      }
       const resolved = await this.deps.resolveKey(run.keyOwnerId, run.smartleadAccountId);
       if (!resolved.ok) {
         await this.deps.db.pauseRun(run.runId, resolved.reason === "key_rejected" ? "key_rejected" : "key_unavailable", run.leaseEpoch);

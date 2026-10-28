@@ -612,10 +612,19 @@ export class SmartleadPushRunDb {
   }
 
   /** Tells the store the start was reported to the caller as started: from now on the run may be claimed like any other. */
-  async confirmStart(runId: string): Promise<void> {
-    await this.call(() =>
-      this.client.update({ TableName: this.table, Key: { pk: runId, sk: RUN_SK }, UpdateExpression: "REMOVE startUnconfirmed", ConditionExpression: "attribute_exists(pk)" }).promise(),
+  async confirmStart(runId: string): Promise<boolean> {
+    // Only a run that is still running: one the resumer already cancelled must not be reported as started.
+    const r = await this.call(() =>
+      this.client.update({
+        TableName: this.table,
+        Key: { pk: runId, sk: RUN_SK },
+        UpdateExpression: "REMOVE startUnconfirmed",
+        ConditionExpression: "attribute_exists(pk) AND #s = :running",
+        ExpressionAttributeNames: { "#s": "status" },
+        ExpressionAttributeValues: { ":running": "running" },
+      }).promise(),
     );
+    return r.ok;
   }
 
   /** abandonRun with a few retries; true once the run is cancelled (or was already finished), false if it could not be confirmed. */
