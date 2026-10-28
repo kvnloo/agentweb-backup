@@ -315,7 +315,7 @@ export async function executeRun(run: PushRun, deps: EngineDeps): Promise<RunOut
         for (const e of toSend) {
           const email = e.input.email.toLowerCase();
           const smartleadLeadId = idByEmail.get(email);
-          if (smartleadLeadId) toMark.push({ leadId: String(e.lead.leadId), marker: buildSmartleadMarker({ runId: run.runId, payloadHash: e.payloadHash, smartleadLeadId, now: deps.now() }) });
+          if (smartleadLeadId) toMark.push({ leadId: String(e.lead.leadId), marker: buildSmartleadMarker({ runId: run.runId, payloadHash: e.payloadHash, smartleadLeadId, email: e.input.email, now: deps.now() }) });
           else if (invalid.has(email)) { add(skipped, "smartlead_invalid"); namedInvalid++; }
           else if (unsubscribed.has(email)) { add(skipped, "smartlead_unsubscribed"); namedUnsubscribed++; }
           else if (otherMapEmails.has(email)) unresolvedOther++;

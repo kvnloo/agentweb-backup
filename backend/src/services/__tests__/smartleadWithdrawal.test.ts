@@ -9,7 +9,7 @@ const optedOut = { contactStatus: "do-not-contact" };
 
 interface Env { deps: WithdrawalDeps; leads: any[]; unsub: jest.Mock; find: jest.Mock; written: Array<{ leadId: string; marker: any }>; logs: string[]; runs: any[] }
 
-function env(over: { leads?: any[]; runs?: any[]; key?: any; unsub?: (id: string) => any } = {}): Env {
+function env(over: { leads?: any[]; runs?: any[]; key?: any; unsub?: (id: string) => any; keyFor?: (owner: string) => any; consistent?: (leadId: string) => any; cap?: number } = {}): Env {
   const leads = over.leads ?? [];
   const written: Env["written"] = [];
   const logs: string[] = [];
@@ -18,9 +18,11 @@ function env(over: { leads?: any[]; runs?: any[]; key?: any; unsub?: (id: string
   const find = jest.fn(async () => "7777" as string | null);
   const deps: WithdrawalDeps = {
     db: { listRunsSince: jest.fn(async (since: string) => runs.filter(r => r.createdAt >= since) as any), getRun: jest.fn(async (id: string) => runs.find(r => r.runId === id) ?? null) },
-    resolveKey: jest.fn(async () => over.key ?? ({ ok: true, apiKey: "KEY", ownerUserId: "owner", accountId: "smartlead-owner", accountName: "x" })),
+    resolveKey: jest.fn(async (owner: string) => over.keyFor?.(owner) ?? over.key ?? ({ ok: true, apiKey: "KEY", ownerUserId: owner, accountId: "smartlead-owner", accountName: "x" })),
     reportFailure: jest.fn(async () => "key_rejected"),
     readLeads: async (_l, after, limit) => { const start = after ? leads.findIndex(x => x.leadId === after.leadId) + 1 : 0; return { items: leads.slice(start, start + limit), hasMore: start + limit < leads.length }; },
+    readLeadConsistent: async (_l, id) => (over.consistent ? over.consistent(id) : leads.find(x => x.leadId === id) ?? null),
+    maxPerList: over.cap,
     writeMarker: async (_l, leadId, _k, m) => { written.push({ leadId, marker: m }); const l = leads.find(x => x.leadId === leadId); if (l) l.system = { ...l.system, [smartleadMarkerKey(77)]: m }; },
     smartlead: { unsubscribe: unsub, findLeadId: find },
     now: () => NOW,
@@ -41,8 +43,8 @@ describe("withdrawalSweep (ENG-673)", () => {
     expect(e.leads[1].system.smartlead_77.state).toBe("pushed"); // lead 2 did not opt out
   });
 
-  it("leaves alone leads that are already withdrawn or released, and leads with no marker for the campaign", async () => {
-    const e = env({ leads: [lead(1, { ...optedOut, system: { smartlead_77: marker("withdrawn") } }), lead(2, { ...optedOut, system: { smartlead_77: marker("released") } }), lead(3, { ...optedOut, system: {} }), lead(4, { ...optedOut, system: { smartlead_99: marker() } })] });
+  it("leaves alone leads that are already withdrawn, and leads with no marker for the campaign", async () => {
+    const e = env({ leads: [lead(1, { ...optedOut, system: { smartlead_77: marker("withdrawn") } }), lead(3, { ...optedOut, system: {} }), lead(4, { ...optedOut, system: { smartlead_99: marker() } })] });
     expect(await withdrawalSweep(e.deps)).toMatchObject({ withdrawn: 0, failed: 0 });
     expect(e.unsub).not.toHaveBeenCalled();
   });
@@ -64,16 +66,32 @@ describe("withdrawalSweep (ENG-673)", () => {
   it("leaves the marker 'pushed' and counts a failure when Smartlead changed nothing, so the next pass tries again", async () => {
     const e = env({ leads: [lead(1, optedOut)], unsub: () => "no_update" });
     expect(await withdrawalSweep(e.deps)).toMatchObject({ withdrawn: 0, failed: 1 });
-    expect(e.written).toHaveLength(0);
+    expect(e.leads[0].system.smartlead_77).toMatchObject({ state: "pushed", withdrawAttempts: 1 }); // still pushed; the attempt is noted
   });
 
-  it("leaves the marker 'pushed' after a rate limit or an outage, and stops the list after three failures in a row", async () => {
-    const e = env({ leads: [1, 2, 3, 4, 5].map(n => lead(n, optedOut)), unsub: () => { throw new SmartleadApiError("slow", 429); } });
+  it("stops a list at the first rate limit (nothing is marked), and after ten failures in a row in an outage", async () => {
+    const limited = env({ leads: [1, 2, 3].map(n => lead(n, optedOut)), unsub: () => { throw new SmartleadApiError("slow", 429); } });
+    expect(await withdrawalSweep(limited.deps)).toMatchObject({ withdrawn: 0, failed: 1 });
+    expect(limited.unsub).toHaveBeenCalledTimes(1);
+    const outage = env({ leads: Array.from({ length: 15 }, (_, i) => lead(i + 1, optedOut)), unsub: () => { throw new SmartleadApiError("down", 503); } });
+    const r = await withdrawalSweep(outage.deps);
+    expect(r.failed).toBe(10);
+    expect(outage.unsub).toHaveBeenCalledTimes(10);
+  });
+
+  it("a lead that keeps failing does not block the ones behind it: it is tried last next time, and the others go out the same pass", async () => {
+    const e = env({ leads: [lead(1, optedOut), lead(2, optedOut), lead(3, optedOut), lead(4, optedOut)], unsub: id => { if (["9001", "9002", "9003"].includes(id)) throw new SmartleadApiError("boom", 500); return "ok"; } });
     const r = await withdrawalSweep(e.deps);
-    expect(r.withdrawn).toBe(0);
-    expect(r.failed).toBe(3); // not five: the list was left for the next pass
-    expect(e.unsub).toHaveBeenCalledTimes(3);
-    expect(e.written).toHaveLength(0);
+    expect(r).toMatchObject({ withdrawn: 1, failed: 3 }); // the good lead behind three failures still went out
+    expect(e.leads[3].system.smartlead_77.state).toBe("withdrawn");
+    expect(e.leads[0].system.smartlead_77).toMatchObject({ state: "pushed", withdrawAttempts: 1 });
+  });
+
+  it("rotates: with a small cap, leads that failed before go to the back, so a good lead is reached on the next pass", async () => {
+    const e = env({ cap: 2, leads: [lead(1, optedOut), lead(2, optedOut), lead(3, optedOut), lead(4, optedOut)], unsub: id => { if (["9001", "9002", "9003"].includes(id)) throw new SmartleadApiError("boom", 500); return "ok"; } });
+    expect(await withdrawalSweep(e.deps)).toMatchObject({ withdrawn: 0, failed: 2 }); // tried leads 1 and 2
+    expect(await withdrawalSweep(e.deps)).toMatchObject({ withdrawn: 1, failed: 1 }); // leads 3 and 4 first (never tried): 4 goes out
+    expect(e.leads[3].system.smartlead_77.state).toBe("withdrawn");
   });
 
   it("keeps going after one failure that is followed by a success", async () => {
@@ -102,7 +120,7 @@ describe("withdrawalSweep (ENG-673)", () => {
     const e = env({ leads: [lead(1, optedOut)], key: { ok: false, reason: "key_rejected", message: "no" } });
     expect(await withdrawalSweep(e.deps)).toMatchObject({ targets: 1, keyUnavailable: 1, withdrawn: 0 });
     expect(e.unsub).not.toHaveBeenCalled();
-    expect(e.logs.join("\n")).toMatch(/key unavailable/);
+    expect(e.logs.join("\n")).toMatch(/NO usable Smartlead key/);
   });
 
   it("limits each list per pass; the rest wait for the next one", async () => {
@@ -141,5 +159,77 @@ describe("withdrawalSweep (ENG-673)", () => {
     expect(await withdrawalSweep(e.deps)).toMatchObject({ withdrawn: 0, failed: 1 });
     expect(await withdrawalSweep(e.deps)).toMatchObject({ withdrawn: 1, failed: 0 });
     expect(e.unsub).toHaveBeenCalledTimes(2);
+  });
+  it("also stops a RELEASED lead that is do-not-contact (releasing changes nothing in Smartlead), and leaves a released lead that is fine", async () => {
+    const e = env({ leads: [lead(1, { ...optedOut, system: { smartlead_77: marker("released") } }), lead(2, { system: { smartlead_77: marker("released") } })] });
+    expect(await withdrawalSweep(e.deps)).toMatchObject({ withdrawn: 1 });
+    expect(e.leads[0].system.smartlead_77.state).toBe("withdrawn");
+    expect(e.leads[1].system.smartlead_77.state).toBe("released");
+  });
+
+  it("one list that throws does not stop the others, and is counted and logged", async () => {
+    const runs = [
+      { runId: "a", listId: "BAD", campaignId: 77, keyOwnerId: "owner", smartleadAccountId: "a", createdAt: "2026-10-27T00:00:00Z" },
+      { runId: "b", listId: "L", campaignId: 77, keyOwnerId: "owner", smartleadAccountId: "a", createdAt: "2026-10-26T00:00:00Z" },
+    ];
+    const e = env({ runs, leads: [lead(1, optedOut)] });
+    const read = e.deps.readLeads;
+    e.deps.readLeads = async (l, a, n) => { if (l === "BAD") throw new Error("throttled"); return read(l, a, n); };
+    expect(await withdrawalSweep(e.deps)).toMatchObject({ targets: 2, targetErrors: 1, withdrawn: 1 });
+    expect(e.logs.join("\n")).toMatch(/list=BAD/);
+  });
+
+  it("falls back to an OLDER run's key when the newest run's key is gone", async () => {
+    const runs = [
+      { runId: "new", listId: "L", campaignId: 77, keyOwnerId: "gone", smartleadAccountId: "a", createdAt: "2026-10-27T00:00:00Z" },
+      { runId: "old", listId: "L", campaignId: 77, keyOwnerId: "owner", smartleadAccountId: "a", createdAt: "2026-10-20T00:00:00Z" },
+    ];
+    const e = env({ runs, leads: [lead(1, optedOut)], keyFor: o => (o === "gone" ? { ok: false, reason: "not_connected", message: "x" } : undefined) });
+    expect(await withdrawalSweep(e.deps)).toMatchObject({ withdrawn: 1, keyUnavailable: 0 });
+  });
+
+  it("says loudly that opt-outs are not being sent when no run's key works", async () => {
+    const e = env({ leads: [lead(1, optedOut)], key: { ok: false, reason: "key_rejected", message: "no" } });
+    await withdrawalSweep(e.deps);
+    expect(e.logs.join("\n")).toMatch(/NOT being sent/);
+  });
+
+  it("a 404 on the stored id looks the address up first: a lead the customer re-imported has a NEW id and is still emailed", async () => {
+    const e = env({ leads: [lead(1, optedOut)], unsub: id => (id === "9001" ? "not_found" : "ok") });
+    e.find.mockResolvedValueOnce("5555");
+    expect(await withdrawalSweep(e.deps)).toMatchObject({ withdrawn: 1 });
+    expect(e.unsub.mock.calls.map(c => c[1])).toEqual(["9001", "5555"]);
+  });
+
+  it("a 404 whose address is not in Smartlead either means the lead is gone: withdrawn", async () => {
+    const e = env({ leads: [lead(1, optedOut)], unsub: () => "not_found" });
+    e.find.mockResolvedValueOnce(null);
+    expect(await withdrawalSweep(e.deps)).toMatchObject({ withdrawn: 1 });
+    expect(e.unsub).toHaveBeenCalledTimes(1);
+  });
+
+  it("decides on a CONSISTENT re-read: a lead re-subscribed (or already withdrawn) since the page read is left alone", async () => {
+    const e = env({ leads: [lead(1, optedOut), lead(2, optedOut), lead(3, optedOut)], consistent: id => {
+      if (id === "lead_00001") return { ...lead(1), contactStatus: "active" }; // re-subscribed since the page read
+      if (id === "lead_00002") return { ...lead(2, optedOut), system: { smartlead_77: marker("withdrawn") } }; // another pass got there first
+      return null; // deleted
+    } });
+    expect(await withdrawalSweep(e.deps)).toMatchObject({ withdrawn: 0, failed: 0 });
+    expect(e.unsub).not.toHaveBeenCalled();
+  });
+
+  it("never unsubscribes by a stale id after the lead's address changed: it looks up the CURRENT address", async () => {
+    const e = env({ leads: [lead(1, { ...optedOut, email: "new@example.com", system: { smartlead_77: { ...marker("pushed", "9001"), email: "old@example.com" } } })] });
+    e.find.mockResolvedValueOnce("4242");
+    await withdrawalSweep(e.deps);
+    expect(e.find).toHaveBeenCalledWith("KEY", "new@example.com");
+    expect(e.unsub.mock.calls.map(c => c[1])).toEqual(["4242"]); // not 9001, which belongs to the old address
+  });
+
+  it("trusts the stored id for a marker that records no address (older markers) and for an unchanged address", async () => {
+    const e = env({ leads: [lead(1, { ...optedOut, system: { smartlead_77: { ...marker("pushed", "9001"), email: "p1@example.com" } } }), lead(2, optedOut)] });
+    await withdrawalSweep(e.deps);
+    expect(e.find).not.toHaveBeenCalled();
+    expect(e.unsub.mock.calls.map(c => c[1]).sort()).toEqual(["9001", "9002"]);
   });
 });

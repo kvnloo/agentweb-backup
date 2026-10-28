@@ -831,10 +831,13 @@ createTestAccount().then(async () => {
         // The withdrawal sweep: an opt-out recorded here must reach Smartlead. Hourly, and deliberately NOT behind the kill switch (stopping
         // pushes must never stop opt-outs); it only has work when a push has ever run.
         setTimeout(() => {
+          let sweeping = false; // a pass over many lists can outlast the hour: never overlap two
           const sweep = () => {
-            if (!isCronEnabled()) return;
+            if (!isCronEnabled() || sweeping) return;
+            sweeping = true;
             cronJobRegistry.track('SmartleadWithdrawalSweep', getSmartleadPushService().sweepWithdrawals())
-              .catch(e => console.error('[SmartleadWithdrawal] Sweep error:', e));
+              .catch(e => console.error('[SmartleadWithdrawal] Sweep error:', e))
+              .finally(() => { sweeping = false; });
           };
           sweep();
           setInterval(sweep, 60 * 60 * 1000);
