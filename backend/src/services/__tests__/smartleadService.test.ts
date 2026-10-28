@@ -24,6 +24,7 @@ import {
   SmartleadUnexpectedResponseError,
   smartleadRequest,
   unsubscribeLeadGlobally,
+  updateLeadEmail,
 } from "../smartleadService";
 
 jest.mock("axios");
@@ -359,6 +360,40 @@ describe("smartleadService slice 2 client (ENG-673)", () => {
       mockedAxios.request.mockResolvedValueOnce({ data: { email: "a@example.com" } } as never);
       await expect(findLeadIdByEmail(KEY, "a@example.com")).rejects.toBeInstanceOf(SmartleadUnexpectedResponseError);
       await expect(findLeadIdByEmail(KEY, "")).rejects.toBeInstanceOf(SmartleadApiError);
+    });
+  });
+
+  describe("updateLeadEmail (live shapes, 2026-10-28)", () => {
+    it("changes a lead's address in place with ONLY the email in the body (the other fields stay)", async () => {
+      mockedAxios.request.mockResolvedValueOnce({ data: { ok: true } } as never);
+      await expect(updateLeadEmail(KEY, 77, "4835397655", " New@Example.COM ")).resolves.toBe("ok");
+      const call = mockedAxios.request.mock.calls[0][0];
+      expect(call.method).toBe("POST");
+      expect(call.url).toMatch(/\/campaigns\/77\/leads\/4835397655\/$/);
+      expect(call.data).toEqual({ email: "new@example.com" });
+    });
+
+    it("reads a refusal (HTTP 500, as for an address that already belongs to another lead), a missing lead and a no-op", async () => {
+      mockedAxios.request.mockRejectedValueOnce(Object.assign(new Error("Request failed with status code 500"), { response: { status: 500, headers: {} } }));
+      await expect(updateLeadEmail(KEY, 77, "1", "a@b.com", { maxRetries: 0 })).resolves.toBe("rejected");
+      mockedAxios.request.mockRejectedValueOnce(Object.assign(new Error("Request failed with status code 404"), { response: { status: 404, headers: {} } }));
+      await expect(updateLeadEmail(KEY, 77, "1", "a@b.com")).resolves.toBe("not_found");
+      mockedAxios.request.mockResolvedValueOnce({ data: { ok: false } } as never);
+      await expect(updateLeadEmail(KEY, 77, "1", "a@b.com")).resolves.toBe("no_update");
+    });
+
+    it("lets an auth failure, a rate limit and an odd reply through as errors, never as success", async () => {
+      mockedAxios.request.mockRejectedValueOnce(Object.assign(new Error("Request failed with status code 401"), { response: { status: 401, headers: {} } }));
+      await expect(updateLeadEmail(KEY, 77, "1", "a@b.com")).rejects.toMatchObject({ status: 401 });
+      mockedAxios.request.mockResolvedValueOnce({ data: "" } as never);
+      await expect(updateLeadEmail(KEY, 77, "1", "a@b.com")).rejects.toBeInstanceOf(SmartleadUnexpectedResponseError);
+    });
+
+    it("refuses bad input before any request", async () => {
+      await expect(updateLeadEmail(KEY, 0, "1", "a@b.com")).rejects.toBeInstanceOf(SmartleadApiError);
+      await expect(updateLeadEmail(KEY, 77, "abc", "a@b.com")).rejects.toBeInstanceOf(SmartleadApiError);
+      await expect(updateLeadEmail(KEY, 77, "1", "  ")).rejects.toBeInstanceOf(SmartleadApiError);
+      expect(mockedAxios.request).not.toHaveBeenCalled();
     });
   });
 

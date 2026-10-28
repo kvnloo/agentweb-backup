@@ -4,7 +4,7 @@ import { resolveSmartlead, reportSmartleadFailure } from "./smartleadConnection"
 import { SmartleadPushRunDb } from "./smartleadPushRunDb";
 import { SmartleadPushService } from "./smartleadPushService";
 import { smartleadMarkerKey } from "./smartleadMarkers";
-import { addLeadsToCampaign, findLeadIdByEmail, getCampaign, getCampaignEmailAccounts, getCampaignSequences, listCampaigns, unsubscribeLeadGlobally } from "./smartleadService";
+import { addLeadsToCampaign, findLeadIdByEmail, getCampaign, getCampaignEmailAccounts, getCampaignSequences, listCampaigns, unsubscribeLeadGlobally, updateLeadEmail } from "./smartleadService";
 import { getJwtSecret } from "../config/jwt";
 import { cronJobRegistry } from "../utils/cronJobRegistry";
 
@@ -47,6 +47,7 @@ export function getSmartleadPushService(): SmartleadPushService {
       // One retry: a POST that backs off for minutes would outlive the run's 90-second lease, and the lead markers make a resend safe.
       addLeads: (apiKey, id, leads) => addLeadsToCampaign(apiKey, id, leads, { maxRetries: 1 }),
       unsubscribeLead: (apiKey, leadId) => unsubscribeLeadGlobally(apiKey, leadId, { maxRetries: 1 }),
+      updateLeadEmail: (apiKey, campaignId, leadId, email) => updateLeadEmail(apiKey, campaignId, leadId, email, { maxRetries: 1 }),
       findLeadId: (apiKey, email) => findLeadIdByEmail(apiKey, email, { maxRetries: 1 }),
     },
     secret: getJwtSecret(),

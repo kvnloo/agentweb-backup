@@ -125,6 +125,12 @@ const URL_FIELDS = new Set(["website", "company_url", "linkedin_profile"]);
 // An HTML character reference (&#106; or &colon;) can spell a script scheme once a browser decodes it inside href="...", so none is allowed.
 const UNSAFE_URL = /["'`\s]|&#|&[a-z]+;|^\s*(javascript|data|vbscript):/i;
 
+/** True when the address would be accepted for a push (the same checks buildLeadPayload applies). */
+export function isAcceptableEmail(raw: unknown): boolean {
+  const email = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  return !!email && email.length <= MAX_EMAIL_CHARS && EMAIL.test(email) && emailShapeOk(email);
+}
+
 export type PayloadResult =
   | { ok: true; input: SmartleadLeadInput; payloadHash: string }
   | { ok: false; reason: "no_email" | "invalid_email" | "missing_tag" | "template_syntax" | "unsafe_text"; tag?: string };

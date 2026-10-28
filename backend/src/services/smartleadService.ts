@@ -374,6 +374,35 @@ export async function listCampaigns(apiKey: string, opts: { maxRetries?: number 
   return out;
 }
 
+export type UpdateLeadEmailOutcome = "ok" | "rejected" | "not_found" | "no_update";
+
+/**
+ * Changes the address of a lead that is already in a campaign, in place (`POST /campaigns/{campaign_id}/leads/{lead_id}/` with only `email`).
+ * Verified live (2026-10-28): the SAME lead id gets the new address, the old address is no longer in Smartlead (so it is no longer emailed),
+ * the lead's name, phone, website and custom fields are untouched, its campaign status is kept, and a lead that was unsubscribed stays
+ * unsubscribed. An address that already belongs to another lead is refused with HTTP 500 {"error":"Validation error"} and nothing changes:
+ * that is "rejected" (the body is not readable through the shared client, so any 500 from this call is read as a refusal, which the caller
+ * handles safely; a genuine outage that also answers 500 is retried on the next pass).
+ */
+export async function updateLeadEmail(apiKey: string, campaignId: number, leadId: string | number, email: string, opts: { maxRetries?: number } = {}): Promise<UpdateLeadEmailOutcome> {
+  assertCampaignId(campaignId);
+  const id = String(leadId);
+  if (!/^[1-9]\d{0,15}$/.test(id)) throw new SmartleadApiError("A Smartlead lead id must be a positive whole number");
+  const address = String(email ?? "").trim().toLowerCase();
+  if (!address || address.length > 254) throw new SmartleadApiError("An email address is required");
+  try {
+    const data = await smartleadRequest<unknown>(apiKey, "POST", `/campaigns/${encodeURIComponent(String(campaignId))}/leads/${id}/`, { data: { email: address }, maxRetries: opts.maxRetries });
+    const ok = (data as { ok?: unknown } | null)?.ok;
+    if (ok === true) return "ok";
+    if (ok === false) return "no_update";
+    throw new SmartleadUnexpectedResponseError("Smartlead POST /campaigns/{id}/leads/{id}/ returned an unexpected response");
+  } catch (error) {
+    if (error instanceof SmartleadApiError && error.status === 404) return "not_found";
+    if (error instanceof SmartleadApiError && error.status === 500) return "rejected";
+    throw error;
+  }
+}
+
 export type UnsubscribeOutcome = "ok" | "not_found" | "no_update";
 
 /**
