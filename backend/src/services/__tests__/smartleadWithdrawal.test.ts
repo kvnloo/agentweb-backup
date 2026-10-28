@@ -430,17 +430,36 @@ describe("withdrawalSweep (ENG-673)", () => {
 
     it("stops the pushed address AND the lead that has the new address when Smartlead refuses the change (the new address is already another lead)", async () => {
       const e = env({ leads: [edited(1, "taken@example.com", optedOut)], update: () => "rejected" });
-      e.find.mockResolvedValueOnce("5555");
+      e.find.mockImplementation(async (_k: string, address: string) => (address === "taken@example.com" ? "5555" : null));
       expect(await withdrawalSweep(e.deps)).toMatchObject({ withdrawn: 1, synced: 0 });
       expect(e.unsub.mock.calls.map(c => c[1])).toEqual(["9001", "5555"]);
+    });
+
+    it("an opted-out, edited lead that the customer RE-IMPORTED in Smartlead (new id, pushed address still live) is stopped there too, not closed", async () => {
+      const e = env({ leads: [edited(1, "fixed@example.com", optedOut)] });
+      e.unsub.mockImplementation(async (_k: string, id: string) => (id === "9001" ? "not_found" : "ok") as any);
+      e.find.mockImplementation(async (_k: string, address: string) => (address === "p1@example.com" ? "8123" : null));
+      expect(await withdrawalSweep(e.deps)).toMatchObject({ withdrawn: 1, failed: 0 });
+      expect(e.unsub.mock.calls.map(c => c[1])).toEqual(["9001", "8123"]);
+    });
+
+    it("a stored id that is gone with nothing live at the pushed or the new address closes the lead; a looked-up id that 404s keeps it open", async () => {
+      const gone = env({ leads: [edited(1, "fixed@example.com", optedOut)] });
+      gone.unsub.mockResolvedValue("not_found");
+      gone.find.mockResolvedValue(null);
+      expect(await withdrawalSweep(gone.deps)).toMatchObject({ withdrawn: 1, failed: 0 });
+      const odd = env({ leads: [edited(1, "fixed@example.com", optedOut)] });
+      odd.unsub.mockResolvedValue("not_found");
+      odd.find.mockImplementation(async (_k: string, address: string) => (address === "p1@example.com" ? "8123" : null));
+      expect(await withdrawalSweep(odd.deps)).toMatchObject({ withdrawn: 0, failed: 1 });
     });
 
     it("stops the stored lead when an opted-out lead's address was cleared (nothing to sync, nothing to look up)", async () => {
       const e = env({ leads: [edited(1, "", optedOut)] });
       expect(await withdrawalSweep(e.deps)).toMatchObject({ withdrawn: 1 });
       expect(e.upd).not.toHaveBeenCalled();
-      expect(e.find).not.toHaveBeenCalled();
-      expect(e.unsub.mock.calls.map(c => c[1])).toEqual(["9001"]);
+      expect(e.find.mock.calls.map(c => c[1])).toEqual(["p1@example.com"]); // only the pushed address is looked up: there is no new one
+      expect(e.unsub.mock.calls.map(c => c[1])).toEqual(["9001", "7777"]);
     });
 
     it("a refused change on a lead that did NOT opt out is a failure that is logged once a day and leaves the marker alone", async () => {
