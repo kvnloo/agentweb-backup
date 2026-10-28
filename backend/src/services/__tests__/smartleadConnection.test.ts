@@ -52,8 +52,8 @@ describe('resolveSmartlead (ENG-673)', () => {
     const r = await resolveSmartlead('me');
     expect(r).toMatchObject({ ok: false, reason: 'choose' });
     expect((r as any).candidates).toEqual([
-      { accountId: 'smartlead-mate', ownerUserId: 'mate' },
-      { accountId: 'smartlead-boss', ownerUserId: 'boss' },
+      { accountId: 'smartlead-mate', ownerUserId: 'mate', accountName: 'Smartlead' }, // the saved name, so a picker can show it
+      { accountId: 'smartlead-boss', ownerUserId: 'boss', accountName: 'Smartlead' },
     ]);
   });
 
