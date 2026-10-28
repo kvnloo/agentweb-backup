@@ -122,7 +122,7 @@ describe('resolveSubscriptionTypeForPrice', () => {
   it('retrieves an unexpanded product to read its plan label', async () => {
     mockStripe.products.retrieve.mockResolvedValueOnce({ id: 'prod_c', metadata: { plan: 'Max' } });
     await expect(resolveSubscriptionTypeForPrice({ id: 'price_c', product: 'prod_c' })).resolves.toBe('Max');
-    expect(mockStripe.products.retrieve).toHaveBeenCalledWith('prod_c');
+    expect(mockStripe.products.retrieve).toHaveBeenCalledWith('prod_c', {}, { timeout: 5000 });
   });
 
   it('propagates a failed product lookup so the webhook can be retried', async () => {
@@ -148,7 +148,7 @@ describe('resolveSubscriptionTypeForPrice', () => {
 describe('handleSubscriptionUpdated — Max/custom price', () => {
   it('syncs subscriptionType and tier config from price metadata.plan', async () => {
     await handleSubscriptionUpdated(makeSub({ id: 'price_max_custom', metadata: { plan: 'Max' } }));
-    const updates = mockUpdateUser.mock.calls[0][1];
+    const updates = Object.assign({}, ...mockUpdateUser.mock.calls.map((c: any[]) => c[1]));
     expect(updates.subscriptionType).toBe('Max');
     expect(updates.allowedPages).toEqual(['max']);
   });
@@ -159,5 +159,15 @@ describe('handleSubscriptionUpdated — Max/custom price', () => {
     const updates = mockUpdateUser.mock.calls[0]?.[1] ?? {};
     expect(updates.subscriptionType).toBeUndefined();
     warn.mockRestore();
+  });
+
+  it('persists status and renewal before a failing product lookup, then errors for retry', async () => {
+    mockStripe.products.retrieve.mockRejectedValueOnce(new Error('stripe timeout'));
+    await expect(handleSubscriptionUpdated(makeSub({ id: 'price_custom', product: 'prod_slow' }))).rejects.toThrow('stripe timeout');
+    expect(mockUpdateUser).toHaveBeenCalledTimes(1);
+    const updates = mockUpdateUser.mock.calls[0][1];
+    expect(updates.subscription_status).toBe('active');
+    expect(updates.current_period_end).toBeDefined();
+    expect(updates.subscriptionType).toBeUndefined();
   });
 });

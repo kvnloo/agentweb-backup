@@ -1265,25 +1265,6 @@ export async function handleSubscriptionUpdated(
     updateData.current_period_end = updatedPeriodEndIso;
   }
 
-  // Sync plan tier on upgrades/downgrades. Use findBasePlanItem rather than
-  // items.data[0] — a subscription can now also carry a seat-billing extra-
-  // seat item (ENG-2243..2246), and Stripe doesn't guarantee the originally-
-  // subscribed item stays first in `items.data` once a second item exists.
-  const basePlanPrice = subscription.items?.data?.length
-    ? findBasePlanItem(subscription)?.price
-    : undefined;
-  if (basePlanPrice?.id) {
-    const newType = await resolveSubscriptionTypeForPrice(basePlanPrice, subscription);
-    if (newType) {
-      updateData.subscriptionType = newType;
-      const tierConfig = await getTierConfig(newType);
-      if (tierConfig) {
-        updateData.allowedPages = tierConfig.allowedPages;
-        updateData.allowedSkills = tierConfig.allowedSkills;
-      }
-    }
-  }
-
   // Always sync activeOffer — set to null when discount is removed. A webhook
   // payload carries Basil `discounts` as ids, so fetch them expanded rather
   // than clear a live offer; if that fetch fails, leave activeOffer as it is
@@ -1301,7 +1282,36 @@ export async function handleSubscriptionUpdated(
     updateData.activeOffer = extractActiveOffer(offerSource);
   }
 
+  // ENG-2724: persist status / renewal / offer BEFORE the tier lookup, which
+  // may need a Stripe product retrieve. A slow or failing lookup must not
+  // delay these facts; if it throws, the webhook still errors so Stripe
+  // retries, and the retry re-applies these idempotent fields.
   await userDb.updateUser(user.userId, updateData);
+
+  const tierUpdate: Record<string, any> = {};
+  // Sync plan tier on upgrades/downgrades. Use findBasePlanItem rather than
+  // items.data[0] — a subscription can now also carry a seat-billing extra-
+  // seat item (ENG-2243..2246), and Stripe doesn't guarantee the originally-
+  // subscribed item stays first in `items.data` once a second item exists.
+  const basePlanPrice = subscription.items?.data?.length
+    ? findBasePlanItem(subscription)?.price
+    : undefined;
+  if (basePlanPrice?.id) {
+    const newType = await resolveSubscriptionTypeForPrice(basePlanPrice, subscription);
+    if (newType) {
+      tierUpdate.subscriptionType = newType;
+      const tierConfig = await getTierConfig(newType);
+      if (tierConfig) {
+        tierUpdate.allowedPages = tierConfig.allowedPages;
+        tierUpdate.allowedSkills = tierConfig.allowedSkills;
+      }
+    }
+  }
+
+  if (Object.keys(tierUpdate).length) {
+    await userDb.updateUser(user.userId, tierUpdate);
+    Object.assign(updateData, tierUpdate);
+  }
   syncUserUpdateToLeadList(user.email, {
     subscriptionType: updateData.subscriptionType,
     subscription_status: updateData.subscription_status,
@@ -2273,7 +2283,7 @@ export async function resolveSubscriptionTypeForPrice(
   if (!product && typeof price?.product === 'string') {
     // Let lookup errors propagate: swallowing them would answer the webhook 200
     // (no Stripe retry) and leave the tier stale after a transient Stripe error.
-    product = await getStripeOrThrow().products.retrieve(price.product);
+    product = await getStripeOrThrow().products.retrieve(price.product, {}, { timeout: 5000 });
   }
   const fromProduct = await tryPlan(product?.metadata?.plan);
   if (fromProduct) return fromProduct;
