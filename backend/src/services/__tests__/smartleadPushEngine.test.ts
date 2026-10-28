@@ -377,16 +377,17 @@ describe("executeRun (ENG-673)", () => {
     });
 
     it("a lead counted as ALREADY in the campaign but not named is never accepted either", async () => {
-      const t = setup(3);
-      await executeRun({ ...t.run }, t.deps); // first pass adds all three
-      t.sl.dropFromMap = new Set(["p2@example.com"]);
-      const leads2 = t.leads.map(l => ({ ...l, system: {} })); // markers lost: all three are resent
-      const t2 = { ...t, leads: leads2 };
-      const deps2 = { ...t.deps, readLeads: async (_l: string, after: any, limit: number) => { const start = after ? leads2.findIndex(l => l.leadId === after.leadId) + 1 : 0; return { items: leads2.slice(start, start + limit), hasMore: start + limit < leads2.length }; }, readLeadConsistent: async (_l: string, id: string) => leads2.find(l => l.leadId === id) ?? null, writeMarker: async (_l: string, id: string, key: string, marker: any) => { const l = leads2.find(x => x.leadId === id)!; l.system = { ...(l.system ?? {}), [key]: marker }; } };
-      const run2 = { ...t.run, status: "running" as const, cursor: null, listExhausted: false, leaseEpoch: 2, counts: { ...t.run.counts, added: 0, alreadyInCampaign: 0 } };
-      const outcome = await executeRun(run2 as any, deps2 as any);
-      expect(outcome.outcome).not.toBe("completed");
-      void t2;
+      const first = setup(3);
+      await expect(executeRun(first.run, first.deps)).resolves.toEqual({ outcome: "completed" }); // Smartlead now holds all three
+      // A second run of the same three leads WITHOUT markers (e.g. they were lost), against the same Smartlead account.
+      const second = setup(3);
+      const deps = makeDeps(second.leads, first.sl, second.store);
+      first.sl.dropFromMap = new Set(["p2@example.com"]); // counted as already in the campaign, but not named
+      first.sl.tallies = { blockList: 1 }; // a tally that could "explain" one unnamed lead: it must not excuse a lead counted as in the campaign
+      const outcome = await executeRun(second.run, deps);
+      expect(outcome).toEqual({ outcome: "partial" }); // retried, never accepted
+      expect(isMarkedForCampaign(second.leads[1], CAMPAIGN)).toBe(false);
+      expect(second.run.counts.skippedByReason.smartlead_skipped ?? 0).toBe(0);
     });
 
     it("the other-campaign tally is matched to the leads it names: what is left can explain only that many unnamed skips", async () => {
