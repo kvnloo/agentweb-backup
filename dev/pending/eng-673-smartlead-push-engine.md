@@ -1,4 +1,4 @@
-## ENG-673: the Smartlead push engine (PR-C1, 2026-10-28)
+## ENG-673: the Smartlead push engine — PR-C1 (2026-10-28)
 
 The worker loop of a push run: walks a CRM lead list and adds the eligible leads to the customer's own Smartlead campaign, in batches of up to 400, resumably. Nothing calls it yet (routes, the resumer cron and the kill switch are PR-C2), so there is no runtime change.
 

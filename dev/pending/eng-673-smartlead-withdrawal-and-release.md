@@ -1,4 +1,4 @@
-## ENG-673: the withdrawal sweep and the release path (PR-D2, 2026-10-28)
+## ENG-673: the withdrawal sweep and the release path — PR-D2 (2026-10-28)
 
 PR-D1 made AgentWeb's own senders skip leads pushed to Smartlead. This is the other direction, plus a way out.
 
