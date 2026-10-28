@@ -48,6 +48,7 @@ const realSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(reso
 /** Resolves when `p` does or when the signal aborts, whichever is first (the loser is left to finish by itself). */
 function abortable(p: Promise<void>, signal: AbortSignal | undefined): Promise<void> {
   if (!signal) return p;
+  if (signal.aborted) return Promise.resolve(); // an abort that already happened never fires its event again
   return new Promise<void>((resolve) => {
     const done = () => {
       signal.removeEventListener("abort", done);
