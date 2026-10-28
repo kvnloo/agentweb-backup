@@ -75,7 +75,7 @@ async function boot(existing?: { sys: FakeSystem; dir: string }): Promise<Rig> {
   const binary: VerifiedBinary = { path: cfg.claude.binaryPath, version: "2.1.294", digest: "sha256:" + "a".repeat(64) };
   const stateDir = join(dir, "state");
   const log = noopLogger;
-  const host = await startHost(cfg, binary, { cmd: sys, root: sys, log, stateDir, adapters: new Map([["fake", adapter]]), chownSocket: false, socketDir: join(dir, "run"), egressDir: join(dir, "egress") });
+  const host = await startHost(cfg, binary, { cmd: sys, root: sys, log, stateDir, adapters: new Map([["fake", adapter]]), chownSocket: false, socketDir: join(dir, "run"), egressDir: join(dir, "egress"), relayRoot: join(dir, "relay") });
   const rig: Rig = {
     sys,
     cfg,
@@ -196,7 +196,7 @@ describe("the whole host over a real socket", () => {
       const recording = { info: (event: string, fields?: Record<string, unknown>) => void lines.push({ level: "info", event, fields }), warn: (event: string, fields?: Record<string, unknown>) => void lines.push({ level: "warn", event, fields }) };
       const host = await startHost(cfg, { path: cfg.claude.binaryPath, version: "1", digest: "sha256:" + "a".repeat(64) }, {
         cmd: sys, root: sys, log: recording as never, stateDir: join(dir, "state"), adapters: new Map([["fake", adapter]]), chownSocket: false,
-        socketDir: join(dir, "run"), egressDir: join(dir, "egress"), tlsHost: "127.0.0.1", tlsPort: 0,
+        socketDir: join(dir, "run"), egressDir: join(dir, "egress"), relayRoot: join(dir, "relay"), tlsHost: "127.0.0.1", tlsPort: 0,
       });
       try {
         expect(host.handle.tlsPort).toBeGreaterThan(0);

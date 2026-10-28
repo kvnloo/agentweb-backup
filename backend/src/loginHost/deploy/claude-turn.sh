@@ -7,6 +7,9 @@
 # the CLI with the rest of stdin untouched (the stream-json conversation). The token is therefore in
 # no argv, no environment and no persistent file, and it disappears with the unit's private tmp.
 #
+# ENG-2113 (tool relay): when AW_TURN_TOOLS=1 the SECOND stdin line is the turn's tool manifest (JSON, written by the host); it is placed next to the MCP config as
+# aw-cfg/tools.json (0600) for the relay shim. The variable is removed from the environment before the CLI starts. Without it nothing changes.
+#
 # Requirements: TMPDIR is the unit-private tmp; stdin is a pipe (POSIX `read` consumes byte by byte on a
 # pipe, so nothing after the first newline is lost).
 set -eu
@@ -20,4 +23,10 @@ mkdir "$TMPDIR/aw-home"
 mkdir "$TMPDIR/aw-cfg"
 printf '%s\n' "$mcp_config" > "$TMPDIR/aw-cfg/mcp.json"
 unset mcp_config
+if [ "${AW_TURN_TOOLS:-}" = 1 ]; then
+  IFS= read -r tools_json || exit 64
+  printf '%s\n' "$tools_json" > "$TMPDIR/aw-cfg/tools.json"
+  unset tools_json
+fi
+unset AW_TURN_TOOLS
 exec "$@"

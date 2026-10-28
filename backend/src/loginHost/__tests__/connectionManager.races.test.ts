@@ -224,11 +224,11 @@ describe("ConnectionManager: provider failures", () => {
     const it = started.events![Symbol.asyncIterator]();
     expect((await it.next()).value).toMatchObject({ type: "tool-use", operationId: "op1" });
     expect((await it.next()).value).toMatchObject({ type: "tool-use", operationId: "op2" });
-    const answer = (conn: string, op: string) => rig.mgr.turnToolResult({ connectionId: conn, turnId: "tr1", epoch: 1, operationId: op, ok: true, content: "r" });
-    expect(await code(answer("c1", "nope"))).toBe("ENOTFOUND");
-    expect(await code(answer("c2", "op1"))).toBe("ENOTFOUND"); // another connection cannot answer it
+    const answer = (conn: string, op: string) => rig.mgr.turnToolResult({ connectionId: conn, turnId: "tr1", epoch: 1, operationId: op, content: "r" });
+    expect(await code(answer("c1", "nope"))).toBe("ENOTFOUND:operation_unknown");
+    expect(await code(answer("c2", "op1"))).toBe("ENOTFOUND:operation_unknown"); // another connection cannot answer it
     expect(await code(answer("c1", "op1"))).toBe("OK");
-    expect(await code(answer("c1", "op1"))).toBe("ENOTFOUND"); // once
+    expect(await code(answer("c1", "op1"))).toBe("ENOTFOUND:operation_unknown"); // once
     rig.clock.advance(2_000);
     rig.mgr.tick();
     await flush();

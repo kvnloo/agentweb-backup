@@ -21,6 +21,8 @@ import {
 } from "../../services/funding/claudeCliRunner";
 import { CODE_PATTERN, extractAuthorizeUrl, MAX_LOGIN_OUTPUT_CHARS } from "../../services/funding/claudeLoginParse";
 import type {
+  ServerRequestAnswer,
+  TurnInput,
   AdapterContext,
   AuthStatus,
   ChildLike,
@@ -33,6 +35,10 @@ import type {
   SpawnSpec,
   SubscriptionProviderAdapter,
 } from "../adapter";
+import { RELAY_SOCKET_IN_UNIT } from "../ports/unitArgs";
+import { canonicalJson } from "../relay/canonical";
+import { createHash } from "crypto";
+import type { RelayCall, RelayEndpoint, RelayHost } from "../relay/relayServer";
 import { classifyFailureText, failureClassToKind, normalizeClaudeEvent, parseAuthStatus, parseDoctorHazards, usageFromResult } from "./claudeParse";
 
 export interface ClaudeAdapterConfig {
@@ -44,6 +50,13 @@ export interface ClaudeAdapterConfig {
   turnWrapperPath: string;
   /** The Emma tool bridge's MCP endpoint, as seen from a customer process. */
   bridgeUrl: string;
+  /**
+   * ENG-2113 tool relay. Absent = a turn that asks for the relay is refused (the legacy HTTP bridge path is unaffected). `shimPath` and `nodePath` are
+   * host-owned, root-controlled files (trusted-path checked at start-up); they are run INSIDE the customer's unit by the CLI.
+   */
+  relay?: { host: RelayHost; shimPath: string; nodePath: string };
+  /** How long a relayed call waits for the stream to show its model message id before it is emitted without one (default 2 s). */
+  messageIdWaitMs?: number;
   models?: Iterable<string>;
   /** PATH inside customer processes (default a fixed system path; the host's own PATH is never used). */
   basePath?: string;
@@ -64,6 +77,7 @@ export interface ClaudeAdapterConfig {
 }
 
 const DEFAULTS = {
+  messageIdWaitMs: 2_000,
   maxQueuedBytes: 8 * 1024 * 1024,
   maxLineBytes: 16 * 1024 * 1024,
   authConfirmTimeoutMs: 4_000,
@@ -209,15 +223,18 @@ export class ClaudeAdapter implements SubscriptionProviderAdapter {
   readonly maxProcessesPerHome = 3;
   readonly maxTurnsPerProcess = 1;
   readonly singleUse = true;
+  /** Serves a turn's tools through the host relay when configured (turn.run `tools`). */
+  readonly relay: boolean;
   readonly loginTtlMs = 10 * 60 * 1000;
   readonly models: ReadonlySet<string>;
 
   private readonly logins = new WeakMap<LoginProcess, LoginState>();
-  private readonly cfg: Required<Omit<ClaudeAdapterConfig, "binary" | "models">> & Pick<ClaudeAdapterConfig, "binary">;
+  private readonly cfg: Required<Omit<ClaudeAdapterConfig, "binary" | "models" | "relay">> & Pick<ClaudeAdapterConfig, "binary" | "relay">;
 
   constructor(config: ClaudeAdapterConfig) {
     this.cfg = { ...DEFAULTS, ...stripUndefined(config) } as ClaudeAdapter["cfg"];
     this.models = new Set(config.models ?? DEFAULTS.models);
+    this.relay = !!config.relay;
   }
 
   binary(): { path: string; version: string; digest: string } {
@@ -430,7 +447,7 @@ interface LoginState {
 /** Cheap size estimate of one normalized event (the text it carries plus a fixed overhead); exactness is not needed for a memory bound. */
 function approxSize(ev: ProviderEvent): number {
   if (ev.type === "text") return 64 + ev.delta.length;
-  if (ev.type === "tool-use") return 128 + JSON.stringify(ev.input ?? null).length;
+  if (ev.type === "tool-use" || ev.type === "tool-call") return 128 + JSON.stringify(ev.input ?? null).length;
   return 256;
 }
 
@@ -465,7 +482,7 @@ class ClaudeSession implements ProviderSession {
       ports: {
         spawnProcess: (s: ClaudeCliSpawnSpec) => {
           const child = new RunnerChildAdapter(
-            ctx.spawnAs({ file: cfg.turnWrapperPath, args: [s.file, ...s.args], env: s.env as Record<string, string>, cwd: s.cwd }),
+            ctx.spawnAs({ file: cfg.turnWrapperPath, args: [s.file, ...s.args], env: s.env as Record<string, string>, cwd: s.cwd, ...(this.relayEp ? { relayDir: this.relayEp.dir } : {}) }),
             cfg.maxLineBytes,
           );
           this.exits.push(child.exited);
@@ -473,7 +490,7 @@ class ClaudeSession implements ProviderSession {
         },
         scratch: { create: () => join(cfg.unitTmp, "aw-home"), remove: () => undefined }, // created by the wrapper inside the unit's private tmp; it vanishes with the unit
         binaryPath: cfg.binary.path,
-        buildEnv: (configDir, home) => allowlistedEnv(cfg.basePath, configDir, home, { TMPDIR: cfg.unitTmp }),
+        buildEnv: (configDir, home) => allowlistedEnv(cfg.basePath, configDir, home, { TMPDIR: cfg.unitTmp, ...(this.relayEp ? { AW_TURN_TOOLS: "1" } : {}) }), // the wrapper reads the tool manifest line and removes the variable
       },
     });
   }
@@ -483,25 +500,125 @@ class ClaudeSession implements ProviderSession {
     return { ok: true };
   }
 
-  answer(): void {
-    /* mcp_direct: the CLI calls the bridge itself; nothing is relayed through the host */
+  /**
+   * Legacy turns (mcp_direct): the CLI calls the HTTP bridge itself, nothing is relayed. Relay turns: the answer to a `tool-call` goes to the shim's socket.
+   * Returns false when that operation is no longer pending (the relay's own timer fired, the shim is gone, the turn ended): "result lost".
+   */
+  answer(operationId: string, answer: ServerRequestAnswer): boolean {
+    if (!this.relayEp || answer.kind !== "tool-result") return false;
+    const sent = this.relayEp.answer(operationId, { content: answer.content, isError: !answer.ok, ...(answer.images ? { images: answer.images } : {}), ...(answer.unlock ? { unlock: answer.unlock } : {}) });
+    if (sent) for (const n of answer.unlock ?? []) this.visibleTools.add(n);
+    return sent;
   }
 
-  async *turn(input: { turnId: string; prompt: string; model: string; bridgeToken: string }): AsyncGenerator<ProviderEvent> {
+  // ── tool relay (ENG-2113) ──
+
+  /** Model message ids of tool_use blocks seen in the stream and not yet claimed by a relayed call: (bare name, canonical input) -> message id. */
+  private readonly streamUses: Array<{ messageId: string; name: string; key: string }> = [];
+  private waiting: { call: RelayCall; timer: NodeJS.Timeout } | undefined;
+  private events: AsyncQueue<ProviderEvent> | undefined;
+  private relayEp: RelayEndpoint | undefined;
+  /** The in-flight relay.open(): a close that arrives meanwhile waits for it, so the endpoint it creates is never left behind. */
+  private relayOpening: Promise<RelayEndpoint> | undefined;
+  /** Names the manifest offers (the stream is hostile input: only these are ever remembered). */
+  private readonly manifestNames = new Set<string>();
+  private readonly visibleTools = new Set<string>();
+
+  /** A tool_use block from the stream (informational ONLY: it is never executed or registered, it just tells us which model message a relayed call belongs to). */
+  private noteStreamUse(raw: Record<string, unknown>): void {
+    if (raw.type !== "assistant") return;
+    const msg = raw.message as { id?: unknown; content?: unknown } | undefined;
+    if (!msg || typeof msg.id !== "string" || !Array.isArray(msg.content)) return;
+    const prefix = `mcp__${this.cfg.mcpServerName}__`;
+    for (const b of msg.content as Array<Record<string, unknown>>) {
+      if (b?.type !== "tool_use" || typeof b.name !== "string" || !b.name.startsWith(prefix)) continue;
+      const name = b.name.slice(prefix.length);
+      if (!this.manifestNames.has(name)) continue; // a tool the turn does not offer can never be a relayed call
+      // Bounded memory whatever the CLI prints: a fixed-size digest of the input (not the input), a truncated id, and at most MAX_STREAM_USES entries (oldest dropped).
+      this.streamUses.push({ messageId: msg.id.slice(0, MAX_MESSAGE_ID_CHARS), name, key: digest(canonicalJson(b.input ?? {})) });
+      if (this.streamUses.length > MAX_STREAM_USES) this.streamUses.splice(0, this.streamUses.length - MAX_STREAM_USES);
+    }
+    this.flushWaiting(false);
+  }
+
+  /** Emits the waiting call once the stream has shown its model message (or, with `force`, without one after the wait). */
+  private flushWaiting(force: boolean): void {
+    const w = this.waiting;
+    if (!w || !this.events) return;
+    const key = digest(canonicalJson(w.call.args));
+    const exact = this.streamUses.find((u) => u.name === w.call.name && u.key === key);
+    const byName = this.streamUses.filter((u) => u.name === w.call.name);
+    const hit = exact ?? (byName.length === 1 ? byName[0] : undefined);
+    if (!hit && !force) return;
+    if (hit) this.streamUses.splice(this.streamUses.indexOf(hit), 1); // claimed: forgotten
+    clearTimeout(w.timer);
+    this.waiting = undefined;
+    // Without a match the id is unique to this call, so the backend never collapses it with another one (a duplicate EXECUTION is worse than a missed collapse).
+    const messageId = hit?.messageId ?? `unmatched-${w.call.operationId.slice(0, 16)}`;
+    const ev: ProviderEvent = { type: "tool-call", operationId: w.call.operationId, messageId, name: w.call.name, input: w.call.args };
+    this.events.push(ev, approxSize(ev));
+    if (this.events.overflowed) void this.close();
+  }
+
+  private onRelayCall(call: RelayCall): void {
+    if (this.closing || this.interrupted || !this.events) return;
+    const timer = setTimeout(() => this.flushWaiting(true), this.cfg.messageIdWaitMs);
+    timer.unref?.();
+    this.waiting = { call, timer };
+    this.flushWaiting(false);
+  }
+
+  private onRelayCallEnded(operationId: string): void {
+    if (this.waiting?.call.operationId !== operationId) return; // already emitted: the manager's bookkeeping expires it
+    clearTimeout(this.waiting.timer);
+    this.waiting = undefined;
+  }
+
+  async *turn(input: TurnInput): AsyncGenerator<ProviderEvent> {
     if (this.used) throw new Error("claude_session_single_use");
     this.used = true;
     if (this.closing || this.interrupted) return;
     const events = new AsyncQueue<ProviderEvent>(this.cfg.maxQueuedBytes);
+    this.events = events;
     const key = `${this.spec.connectionId}/${input.turnId}`;
     this.key = key;
     let result: Awaited<ReturnType<ClaudeCliRunner["send"]>> | undefined;
     let failure: unknown;
     try {
+      let mcpServer: { name: string; url: string; bearerToken: string; stdio?: { command: string; args: string[]; env?: Record<string, string> } };
+      let extraLines: string[] | undefined;
+      if (input.relay) {
+        const relay = this.cfg.relay;
+        if (!relay) throw Object.assign(new Error("relay_unavailable"), { code: "open_failed" });
+        for (const t of input.relay.tools) if (t.locked !== true) this.visibleTools.add(t.name);
+        // The per-turn socket exists (and accepts) BEFORE the unit starts. Identity is fixed here, from the session, never from a frame.
+        for (const t of input.relay.tools) this.manifestNames.add(t.name);
+        this.relayOpening = relay.host.open({
+          uid: this.ctx.uid,
+          identity: { connectionId: this.spec.connectionId, epoch: this.spec.epoch, turnId: input.turnId },
+          onCall: (c) => this.onRelayCall(c),
+          onCallEnded: (op) => this.onRelayCallEnded(op),
+          allowTool: (n) => this.visibleTools.has(n),
+          callTimeoutMs: input.relay.callTimeoutMs,
+        });
+        this.relayEp = await this.relayOpening;
+        if (this.closing || this.interrupted) return; // close() is waiting for this very endpoint and closes it (doClose)
+        mcpServer = {
+          name: this.cfg.mcpServerName,
+          url: "",
+          bearerToken: "",
+          stdio: { command: relay.nodePath, args: [relay.shimPath], env: { AW_RELAY_SOCKET: RELAY_SOCKET_IN_UNIT, AW_RELAY_TOOLS: join(this.cfg.unitTmp, "aw-cfg", "tools.json") } },
+        };
+        extraLines = [JSON.stringify(input.relay.tools)];
+      } else {
+        if (input.bridgeToken === undefined) throw Object.assign(new Error("no_tool_transport"), { code: "open_failed" });
+        mcpServer = { name: this.cfg.mcpServerName, url: this.cfg.bridgeUrl, bearerToken: input.bridgeToken };
+      }
       this.spawning = this.runner.spawn(key, this.ctx.homeDir, this.cfg.systemPromptFile, {
         model: input.model,
         cwd: this.ctx.workDir,
-        mcpServer: { name: this.cfg.mcpServerName, url: this.cfg.bridgeUrl, bearerToken: input.bridgeToken },
-        mcpDelivery: { via: "stdin", path: join(this.cfg.unitTmp, "aw-cfg", "mcp.json") },
+        mcpServer,
+        mcpDelivery: { via: "stdin", path: join(this.cfg.unitTmp, "aw-cfg", "mcp.json"), ...(extraLines ? { extraLines } : {}) },
       });
       await this.spawning;
       if (this.closing || this.interrupted) return;
@@ -509,6 +626,7 @@ class ClaudeSession implements ProviderSession {
       this.runner
         .send(this.handle, input.prompt, {
           onEvent: (raw) => {
+            this.noteStreamUse(raw);
             for (const ev of normalizeClaudeEvent(raw)) events.push(ev, approxSize(ev));
             if (events.overflowed) void this.close(); // the consumer is not keeping up: end the process rather than buffer without bound
           },
@@ -614,6 +732,8 @@ class ClaudeSession implements ProviderSession {
       // (Defense in depth: `ctx.spawnAs` is synchronous today, so a process cannot appear between a close request and the
       // runner registering it; the randomized lifecycle test cannot open this window. Keep it for a port that stops being synchronous.)
       await this.spawning?.catch(() => undefined);
+      // An endpoint still being opened is closed once it exists (a close during open() must not leave its listener and directory behind).
+      const opening = await this.relayOpening?.catch(() => undefined);
       // Resolves only when the process is really gone (the core frees the cap slot and relies on it).
       let seen: number;
       do {
@@ -622,8 +742,17 @@ class ClaudeSession implements ProviderSession {
       } while (this.exits.length !== seen);
       // ...and when the auth confirmation (a second, short-lived process on this home) has finished.
       await this.confirming?.catch(() => undefined);
+      // The relay goes with the turn: no connection, pending call or socket outlives the process (or the turn that ended without one).
+      if (this.waiting) clearTimeout(this.waiting.timer);
+      this.waiting = undefined;
+      await opening?.close().catch(() => undefined); // the endpoint opened for this turn (the same object as relayEp), whether or not the turn got to use it
     } finally {
       this.resolveClosed();
     }
   }
 }
+
+
+const MAX_STREAM_USES = 64;
+const MAX_MESSAGE_ID_CHARS = 128;
+const digest = (text: string): string => createHash("sha256").update(text).digest("base64");

@@ -137,10 +137,10 @@ fi
 if [ "$STAGE" != "$WORK/$NAME" ]; then mv "$STAGE" "$WORK/$NAME"; STAGE="$WORK/$NAME"; fi
 
 cp "$PROD/install.sh" "$PROD/deploy.sh" "$PROD/lib.sh" "$PROD/versions.env" "$STAGE/"
-cp "$DEPLOY/claude-turn.sh" "$DEPLOY/aw-net.sh" "$DEPLOY/aw-write-file.sh" "$DEPLOY/aw-login-host@.service" "$DEPLOY/aw-login-host-failed@.service" \
+cp "$DEPLOY/claude-turn.sh" "$DEPLOY/aw-net.sh" "$DEPLOY/aw-write-file.sh" "$DEPLOY/aw-relay-shim.js" "$DEPLOY/aw-login-host@.service" "$DEPLOY/aw-login-host-failed@.service" \
   "$PROD/host-config.template.json" "$PROD/system-prompt.txt" "$STAGE/files/"
 cp "$DEPLOY/aw-env.slice.example" "$STAGE/files/aw-env.slice.template"
-chmod 0755 "$STAGE/install.sh" "$STAGE/deploy.sh" "$STAGE/files/claude-turn.sh" "$STAGE/files/aw-net.sh" "$STAGE/files/aw-write-file.sh"
+chmod 0755 "$STAGE/install.sh" "$STAGE/deploy.sh" "$STAGE/files/claude-turn.sh" "$STAGE/files/aw-net.sh" "$STAGE/files/aw-write-file.sh" "$STAGE/files/aw-relay-shim.js"
 chmod 0644 "$STAGE/lib.sh"
 
 # Never ship key material.

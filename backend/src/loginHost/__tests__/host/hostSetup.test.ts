@@ -72,6 +72,9 @@ describe("host config (a CLOSED schema)", () => {
     expect(c.limits).toEqual({ memoryMax: "1G", tasksMax: 256, tmpSize: "128M", shmSize: "64M", runtimeMaxSec: 7200, stopGraceSec: 10 });
     expect(c.tools.systemRun).toBe("/usr/bin/systemd-run");
     expect(c.claude.turnWrapperPath).toBe("/opt/aw-login-host/claude-turn.sh");
+    expect(c.claude.relayShimPath).toBe("/opt/aw-login-host/aw-relay-shim.js");
+    expect(c.claude.nodePath).toBe("/usr/bin/node");
+    expect(c.relayRoot).toBe("/run/aw-relay-test1");
     expect(c.socket.mode).toBe(0o660);
   });
   it("requires an egress policy (a host with no allowlist does not start) and derives the proxy socket path", () => {

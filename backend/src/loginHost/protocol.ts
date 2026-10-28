@@ -23,11 +23,15 @@ import { z } from "zod";
  * The backend asks `host.info` once after it builds its client and logs a mismatch; an unknown route answers EINVALID/route (never
  * ENOTFOUND, which means "no such connection" and has a destructive meaning for revoke and the sweeper).
  */
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 // History: 2 = the first shipped protocol. 3 (ENG-2110) adds, all OPTIONAL and additive: login.complete.completionNonce (the host records which complete took
 // the code and reports it back, so a loser of a double submit can stand down), login.cancel.onlyIfPending (a user-initiated cancel never discards a login
 // that is already ready) and, on the host only, a time limit for a ready attempt that is never promoted. The backend sends the new fields only to a worker
 // that reports 3 or more (loginHostProvider.workerProtocol()), so the two can deploy in either order.
+// 4 (ENG-2113) adds the tool relay, all additive on the worker side: turn.run takes an optional bounded `tools` manifest INSTEAD of `bridgeToken` (a request
+// with `bridgeToken` and no `tools` is the legacy shape and behaves exactly as under 3; both together, or neither, is refused), turn events gain `tool-call`
+// (host-generated operationId), and turn.toolResult is reshaped (`isError`, `images`, `unlock`; its body limit is 8 MiB). The backend sends `tools` only to a
+// worker that reports 4 or more, so the worker deploys first.
 
 const ID = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/, "id: letters, digits, _ and - only, 1-64 chars");
 const PROVIDER = z.string().regex(/^[a-z][a-z0-9_]{0,31}$/);
@@ -50,6 +54,71 @@ export const loginCancelReq = z.object({ connectionId: ID, loginRef: ID, onlyIfP
 /** Phase 3 of sign-in: the backend created the record (epoch 1 or the reconnect epoch) and asks the host to promote the attempt. */
 export const loginPromoteReq = z.object({ connectionId: ID, loginRef: ID, epoch: EPOCH }).strict();
 
+// ───────────────────────────── tool relay (protocol 4) ─────────────────────────────
+
+/** A tool the customer's CLI is offered through the relay shim. The name is also a path-free, shell-free token. */
+export const TOOL_NAME = z.string().regex(/^[a-z0-9_]{1,48}$/, "tool name: a-z 0-9 _ only, 1-48 chars");
+/** Names the relay shim keeps for itself (the whole `aw_relay_` prefix): a manifest may not use them. */
+export const RELAY_RESERVED_PREFIX = "aw_relay_";
+export const TOOL_LIMITS = {
+  maxTools: 200,
+  /** Serialized size of the whole manifest as the host writes it into the shim's config. */
+  maxTotalBytes: 512 * 1024,
+  maxDescriptionBytes: 4 * 1024,
+  maxSchemaBytes: 16 * 1024,
+} as const;
+const byteLen = (v: unknown): number => Buffer.byteLength(JSON.stringify(v), "utf8");
+
+/** `locked` tools are in the manifest from the start but not listed to the model until a tool result unlocks them (skills installed mid-turn). */
+export const toolDef = z
+  .object({
+    name: TOOL_NAME,
+    description: z.string().max(TOOL_LIMITS.maxDescriptionBytes),
+    inputSchema: z.record(z.string(), z.unknown()),
+    locked: z.boolean().optional(),
+  })
+  .strict();
+export type ToolDef = z.infer<typeof toolDef>;
+
+export const toolManifest = z
+  .array(toolDef)
+  .min(1)
+  .max(TOOL_LIMITS.maxTools)
+  .superRefine((tools, ctx) => {
+    const fail = (message: string) => ctx.addIssue({ code: "custom", message });
+    const seen = new Set<string>();
+    for (const t of tools) {
+      if (seen.has(t.name)) return fail("tool_duplicate");
+      seen.add(t.name);
+      if (t.name.startsWith(RELAY_RESERVED_PREFIX)) return fail("tool_name_reserved");
+      if (t.inputSchema.type !== "object") return fail("tool_schema_not_object");
+      if (byteLen(t.inputSchema) > TOOL_LIMITS.maxSchemaBytes) return fail("tool_schema_too_large");
+      if (Buffer.byteLength(t.description, "utf8") > TOOL_LIMITS.maxDescriptionBytes) return fail("tool_description_too_large");
+    }
+    if (tools.every((t) => t.locked)) return fail("tool_all_locked");
+    if (byteLen(tools) > TOOL_LIMITS.maxTotalBytes) return fail("tools_too_large");
+  });
+
+export const IMAGE_LIMITS = { maxImages: 4, maxBase64Each: 2_500_000, maxBase64Total: 6_000_000 } as const;
+export const toolImage = z
+  .object({
+    mimeType: z.enum(["image/png", "image/jpeg", "image/webp", "image/gif"]),
+    data: z
+      .string()
+      .min(4)
+      .max(IMAGE_LIMITS.maxBase64Each)
+      .refine((d) => d.length % 4 === 0 && /^[A-Za-z0-9+/]+={0,2}$/.test(d), "image_not_base64"),
+  })
+  .strict();
+export type ToolImage = z.infer<typeof toolImage>;
+
+/** Largest body any route accepts, except turn.toolResult (images). */
+export const DEFAULT_MAX_BODY_BYTES = 5 * 1024 * 1024;
+/** turn.toolResult carries up to 6M base64 image characters plus text. */
+export const TOOL_RESULT_MAX_BODY_BYTES = 8 * 1024 * 1024;
+/** Frames between the shim and the host (newline-delimited JSON). */
+export const RELAY_FRAME_LIMITS = { shimToHostBytes: 1024 * 1024, hostToShimBytes: 8 * 1024 * 1024 } as const;
+
 export const turnRunReq = z
   .object({
     connectionId: ID,
@@ -58,16 +127,40 @@ export const turnRunReq = z
     turnId: ID,
     prompt: PROMPT,
     model: MODEL,
-    bridgeToken: BRIDGE_TOKEN,
+    /** Legacy shape (protocol <= 3): the HTTP tool bridge. Exactly one of `bridgeToken` / `tools` must be present. */
+    bridgeToken: BRIDGE_TOKEN.optional(),
+    /** Relay shape (protocol 4): the tools the CLI is offered through the host's stdio shim. */
+    tools: toolManifest.optional(),
     deadlineMs: z.number().int().min(1_000).max(3_600_000).optional(),
     priority: z.enum(["interactive", "scheduled"]).optional(),
   })
   .strict();
+/** The route's schema: the object above plus the rule that exactly one tool transport is named (the plain object stays exported for its `.shape`). */
+export const turnRunChecked = turnRunReq.superRefine((r, ctx) => {
+  if (r.bridgeToken !== undefined && r.tools !== undefined) ctx.addIssue({ code: "custom", path: ["tools"], message: "bridge_and_tools_mixed" });
+  else if (r.bridgeToken === undefined && r.tools === undefined) ctx.addIssue({ code: "custom", path: ["tools"], message: "bridge_or_tools_required" });
+});
 export const turnRenewReq = z.object({ connectionId: ID, turnId: ID, epoch: EPOCH }).strict();
 export const turnInterruptReq = z.object({ connectionId: ID, turnId: ID, epoch: EPOCH }).strict();
-/** Answer to a server-initiated request inside a turn (host-relayed tool call); `operationId` pairs it with the request. */
+/**
+ * Answer to a pending operation inside a turn (a `tool-call` event, or a host-relayed Codex request); `operationId` pairs it with the request.
+ * `unlock` names tools of the turn's manifest that were `locked` and become visible now (the shim announces them and waits for the CLI to re-list).
+ */
 export const turnToolResultReq = z
-  .object({ connectionId: ID, turnId: ID, epoch: EPOCH, operationId: ID, ok: z.boolean(), content: z.string().max(4_000_000) })
+  .object({
+    connectionId: ID,
+    turnId: ID,
+    epoch: EPOCH,
+    operationId: ID,
+    content: z.string().max(4_000_000),
+    isError: z.boolean().optional(),
+    images: z
+      .array(toolImage)
+      .max(IMAGE_LIMITS.maxImages)
+      .refine((imgs) => imgs.reduce((n, i) => n + i.data.length, 0) <= IMAGE_LIMITS.maxBase64Total, "images_too_large")
+      .optional(),
+    unlock: z.array(TOOL_NAME).min(1).max(TOOL_LIMITS.maxTools).optional(),
+  })
   .strict();
 
 export const hostInfoReq = z.object({}).strict();
@@ -88,7 +181,7 @@ export const ROUTES = {
   "login.status": loginStatusReq,
   "login.cancel": loginCancelReq,
   "login.promote": loginPromoteReq,
-  "turn.run": turnRunReq,
+  "turn.run": turnRunChecked,
   "turn.renew": turnRenewReq,
   "turn.interrupt": turnInterruptReq,
   "turn.toolResult": turnToolResultReq,
