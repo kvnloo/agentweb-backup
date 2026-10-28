@@ -609,7 +609,11 @@ interface LinkedPullRequest {
   title: string;
 }
 
-const GITHUB_PR_URL = /^https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+/;
+const GITHUB_PR_URL = /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+$/;
+
+function escapeMarkdownLinkText(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/\[/g, '\\[').replace(/\]/g, '\\]');
+}
 
 /** GitHub PRs the Linear GitHub integration attached to the issue (ENG-590). */
 function linkedPullRequests(
@@ -633,7 +637,7 @@ function howToVerify(
 ): string[] {
   const delta = `${outcome.metricName}: ${metricValue(outcome.metricBefore)} → ${metricValue(outcome.metricAfter)} (${lift}; n=${outcome.sampleN})`;
   const prLines = prs.length
-    ? prs.map((pr) => `- Linked PR [${pr.title}](${pr.url}); if it shipped this change, follow its "How to test" steps.`)
+    ? prs.map((pr) => `- Linked PR [${escapeMarkdownLinkText(pr.title)}](${pr.url}); if it shipped this change, follow its "How to test" steps.`)
     : ['- No linked GitHub PR on this issue; verify against the metric below.'];
   return [
     '### How to verify',
