@@ -29,9 +29,7 @@ describe('relay manifest from the real tool registry', () => {
   });
   afterEach(() => jest.restoreAllMocks());
 
-  // PENDING the host's limit raise (B1/B2, branch manan/eng-2113-relay-host): under today's TOOL_LIMITS the registry has 275 tools (cap 200) and 8 descriptions over
-  // 4 KiB. Un-skip this when the host branch with the raised limits is merged in; it must then pass and stay green.
-  it.skip('every registry tool (all skills) fits the relay limits: nothing truncated, nothing dropped', async () => {
+  it('every registry tool (all skills) fits the relay limits: nothing truncated, nothing dropped', async () => {
     await (agentModeService as any).registerTools(); // the real registration path (Emma tools + built-ins), without MCP or DynamoDB
     // The whole registry: what a session with every skill ("*" access) can be offered.
     const defs: any[] = (agentModeService as any).toolRegistry.getAllTools().map((t: any) => t.definition);
