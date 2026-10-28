@@ -248,6 +248,15 @@ describe('RelayToolDispatcher', () => {
     expect(t.posts[1].content).toMatch(/collapsed/);
   });
 
+  it('a message id that is not usable never groups calls: identical calls with a bad id both run', async () => {
+    const t = rig();
+    t.d.start(t.ev('op-1', 'search', { q: 'x' }, 'bad id!'));
+    await t.d.settle(1_000);
+    t.d.start(t.ev('op-2', 'search', { q: 'x' }, 'bad id!'));
+    await t.d.settle(1_000);
+    expect(t.executed).toHaveLength(2);
+  });
+
   describe('images', () => {
     it('forwards an executor image in turn.toolResult.images', async () => {
       const t = rig({ images: { search: [img(8)] } });
@@ -266,6 +275,22 @@ describe('RelayToolDispatcher', () => {
       expect(sent.reduce((n, i) => n + i.data.length, 0)).toBeLessThanOrEqual(IMAGE_LIMITS.maxBase64Total);
       expect(sent.every((i) => i.data.length <= IMAGE_LIMITS.maxBase64Each)).toBe(true);
       expect(t.posts[0].content).toMatch(/could not be attached/);
+    });
+
+    it('keeps at most 4 images even when they are small', async () => {
+      const t = rig({ images: { search: Array.from({ length: 6 }, () => img(8)) } });
+      t.d.start(t.ev('op-1', 'search'));
+      await t.d.settle(1_000);
+      expect(t.posts[0].images).toHaveLength(IMAGE_LIMITS.maxImages);
+      expect(t.posts[0].content).toMatch(/2 images could not be attached/);
+    });
+
+    it('keeps the total under 6M characters even when the body would still fit', async () => {
+      const t = rig({ images: { search: [img(2_200_000), img(2_200_000), img(2_200_000)] } });
+      t.d.start(t.ev('op-1', 'search'));
+      await t.d.settle(1_000);
+      expect(t.posts[0].images).toHaveLength(2);
+      expect(t.posts[0].content).toMatch(/1 image could not be attached/);
     });
 
     it('drops an unsupported type or a malformed payload', async () => {
