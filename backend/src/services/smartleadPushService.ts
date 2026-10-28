@@ -13,7 +13,7 @@ import {
   type SmartleadPushRunDb,
 } from "./smartleadPushRunDb";
 import type { SmartleadAddLeadsResult, SmartleadCampaignDetail, SmartleadCampaignSummary, SmartleadEmailAccount, SmartleadLeadInput } from "./smartleadService";
-import { SmartleadApiError, scrubSmartleadSecrets, type UnsubscribeOutcome } from "./smartleadService";
+import { SmartleadApiError, scrubSmartleadSecrets, type UnsubscribeOutcome, type UpdateLeadEmailOutcome } from "./smartleadService";
 import { listSmartleadMarkers } from "./smartleadMarkers";
 import { withdrawalSweep, type SweepResult } from "./smartleadWithdrawal";
 import { isDoNotContact } from "../utils/leadContactStatus";
@@ -41,6 +41,7 @@ export interface SmartleadApi {
   getMailboxes(apiKey: string, campaignId: number): Promise<SmartleadEmailAccount[]>;
   addLeads(apiKey: string, campaignId: number, leads: SmartleadLeadInput[]): Promise<SmartleadAddLeadsResult>;
   unsubscribeLead(apiKey: string, smartleadLeadId: string): Promise<UnsubscribeOutcome>;
+  updateLeadEmail(apiKey: string, campaignId: number, smartleadLeadId: string, email: string): Promise<UpdateLeadEmailOutcome>;
   findLeadId(apiKey: string, email: string): Promise<string | null>;
 }
 
@@ -294,6 +295,7 @@ export class SmartleadPushService {
         smartlead: {
           campaignVisible: async (apiKey, campaignId) => (await this.deps.smartlead.getCampaign(apiKey, campaignId)) !== null,
           unsubscribe: (apiKey, id) => this.deps.smartlead.unsubscribeLead(apiKey, id),
+          updateLeadEmail: (apiKey, campaignId, id, email) => this.deps.smartlead.updateLeadEmail(apiKey, campaignId, id, email),
           findLeadId: (apiKey, email) => this.deps.smartlead.findLeadId(apiKey, email),
         },
         now: () => this.deps.now(),

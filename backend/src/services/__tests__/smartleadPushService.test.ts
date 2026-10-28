@@ -47,7 +47,7 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
   });
   afterEach(async () => { await cleanup(); });
 
-  interface Env { svc: SmartleadPushService; deps: PushServiceDeps; sl: FakeSmartlead; unsub: jest.Mock; leads: any[]; jobs: Promise<unknown>[]; logs: string[]; listId: string; flags: { enabled: boolean }; editors: Set<string> }
+  interface Env { svc: SmartleadPushService; deps: PushServiceDeps; sl: FakeSmartlead; unsub: jest.Mock; upd: jest.Mock; leads: any[]; jobs: Promise<unknown>[]; logs: string[]; listId: string; flags: { enabled: boolean }; editors: Set<string> }
 
   function env(opts: { leads?: any[]; maxConcurrentWorkers?: number; shareDb?: SmartleadPushRunDb; listId?: string; sl?: FakeSmartlead; leadsShared?: any[] } = {}): Env {
     const leads: any[] = opts.leads ?? Array.from({ length: 5 }, (_, i) => mkLead(i + 1));
@@ -56,6 +56,7 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
     const jobs: Promise<unknown>[] = [];
     const logs: string[] = [];
     const unsub = jest.fn(async (_k: string, _id: string): Promise<"ok" | "not_found" | "no_update"> => "ok");
+    const upd = jest.fn(async (..._a: any[]): Promise<"ok" | "rejected" | "not_found" | "no_update"> => "ok");
     const flags = { enabled: true };
     const editors = new Set<string>();
     const key = (userId: string) => ({ ok: true as const, apiKey: `key-of-${userId}`, ownerUserId: userId, accountId: `smartlead-${userId}`, accountName: "SL" });
@@ -79,6 +80,7 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
         getMailboxes: async () => [{ id: 1, email: "a@x.com", dailyLimit: 30 }],
         addLeads: (_k, _c, x) => sl.addLeads(x),
         unsubscribeLead: (k, id) => unsub(k, id),
+        updateLeadEmail: (k, c, id, email) => upd(k, c, id, email),
         findLeadId: async () => null,
       },
       secret: "svc-secret",
@@ -89,7 +91,7 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
       log: line => { logs.push(line); },
       maxConcurrentWorkers: opts.maxConcurrentWorkers,
     };
-    return { svc: new SmartleadPushService(deps), deps, sl, unsub, leads, jobs, logs, listId, flags, editors };
+    return { svc: new SmartleadPushService(deps), deps, sl, unsub, upd, leads, jobs, logs, listId, flags, editors };
   }
   const drain = async (e: Env) => { await Promise.all(e.jobs.splice(0)); };
 
@@ -623,6 +625,20 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
       expect(e.unsub).toHaveBeenCalledWith("key-of-owner", e.leads[2].system.smartlead_77.smartleadLeadId);
       expect(e.leads[2].system.smartlead_77).toMatchObject({ state: "withdrawn" });
       expect(e.leads[0].system.smartlead_77.state).toBe("pushed");
+    });
+
+    it("pushes an edited address to Smartlead (the same lead id), and the opt-out that follows uses that id", async () => {
+      const e = env();
+      await e.svc.start("owner", go((await approve(e)).token));
+      await drain(e);
+      const id = e.leads[1].system.smartlead_77.smartleadLeadId;
+      e.leads[1].email = "corrected@example.com";
+      expect(await e.svc.sweepWithdrawals()).toMatchObject({ synced: 1, withdrawn: 0 });
+      expect(e.upd).toHaveBeenCalledWith("key-of-owner", CAMPAIGN, id, "corrected@example.com");
+      expect(e.leads[1].system.smartlead_77.email).toBe("corrected@example.com");
+      e.leads[1].contactStatus = "do-not-contact";
+      expect(await e.svc.sweepWithdrawals()).toMatchObject({ synced: 0, withdrawn: 1 });
+      expect(e.unsub).toHaveBeenCalledWith("key-of-owner", id);
     });
 
     it("runs even when pushing is switched off, and never throws", async () => {
