@@ -441,7 +441,7 @@ const runDrain = async (reason: string): Promise<void> => {
   await import('./services/funding/claudeSubscriptionService')
     .then((m) => m.shutdownClaudeSubscriptionService())
     .catch(() => undefined);
-  // ENG-2110 1c: pending hosted sign-ins are cancelled on the login host (it also expires them itself).
+  // ENG-2110 1c: stops the hosted sign-in timers. Pending sign-ins are NOT cancelled on the login host: any instance can finish them, and the host expires abandoned ones itself.
   await import('./services/funding/hostedSubscriptionService')
     .then((m) => m.shutdownHostedSubscriptionService())
     .catch(() => undefined);
@@ -814,6 +814,37 @@ createTestAccount().then(async () => {
         }, msUntilReach);
       } catch (error) {
         console.error('[DomainReachability] Failed to initialize:', error);
+      }
+
+      // ENG-673: the Smartlead push resumer. Every minute it claims push runs whose worker is gone (a crash or a deploy) and cancels runs
+      // left paused for a week. It does nothing unless SMARTLEAD_PUSH_ENABLED=true. In-flight work is drained at shutdown by the registry.
+      try {
+        const { getSmartleadPushService } = await import('./services/smartleadPushRuntime');
+        setInterval(() => {
+          // The tick itself does nothing but retry cancels of unsettled starts while the push is switched off.
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('SmartleadPushResumer', getSmartleadPushService().resumerTick())
+            .catch(e => console.error('[SmartleadPush] Resumer error:', e));
+        }, 60 * 1000);
+        console.log('[SmartleadPush] Resumer initialized — every minute (active only when SMARTLEAD_PUSH_ENABLED=true)');
+
+        // The withdrawal sweep: an opt-out recorded here must reach Smartlead. Hourly, and deliberately NOT behind the kill switch (stopping
+        // pushes must never stop opt-outs); it only has work when a push has ever run.
+        setTimeout(() => {
+          let sweeping = false; // a pass over many lists can outlast the hour: never overlap two
+          const sweep = () => {
+            if (!isCronEnabled() || sweeping) return;
+            sweeping = true;
+            cronJobRegistry.track('SmartleadWithdrawalSweep', getSmartleadPushService().sweepWithdrawals())
+              .catch(e => console.error('[SmartleadWithdrawal] Sweep error:', e))
+              .finally(() => { sweeping = false; });
+          };
+          sweep();
+          setInterval(sweep, 60 * 60 * 1000);
+        }, 5 * 60 * 1000);
+        console.log('[SmartleadWithdrawal] Sweep initialized — hourly, first pass in 5 minutes');
+      } catch (error) {
+        console.error('[SmartleadPush] Failed to initialize the resumer:', error);
       }
 
       // ENG-2156: warn oncall at 80%/95% of the OpenRouter key's own monthly limit, before
