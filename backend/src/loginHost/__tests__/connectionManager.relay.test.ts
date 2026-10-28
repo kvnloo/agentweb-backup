@@ -71,6 +71,23 @@ describe("relay: dual request shape", () => {
   });
 });
 
+describe("relay: idempotency hash of the manifest", () => {
+  let rig: Rig;
+  afterEach(() => rig?.cleanup());
+  it("is independent of key order (a retry whose JSON was re-serialized is a duplicate, not EEXISTS)", async () => {
+    rig = makeRig({ adapter: { relay: true } });
+    await signIn(rig, "c1", 1);
+    rig.script.turnEvents = [{ type: "result", ok: true, text: "x" }];
+    const req = relayReq("c1", { idempotencyKey: "k1" });
+    await drain((await rig.mgr.runTurn(req)).events!);
+    const reordered = TOOLS.map((t) => ({ locked: t.locked, inputSchema: { properties: (t.inputSchema as { properties: object }).properties, type: "object" }, description: t.description, name: t.name }));
+    expect(JSON.stringify(reordered)).not.toBe(JSON.stringify(TOOLS));
+    expect((await rig.mgr.runTurn({ ...req, tools: reordered as ToolDef[] })).duplicate).toBe(true);
+    // a genuinely different manifest still conflicts
+    expect(await code(rig.mgr.runTurn({ ...req, tools: [{ ...TOOLS[0], description: "other" }, TOOLS[1]] }))).toBe("EEXISTS");
+  });
+});
+
 describe("relay: tool-call operations and turn.toolResult", () => {
   let rig: Rig;
   afterEach(() => rig?.cleanup());
@@ -98,7 +115,8 @@ describe("relay: tool-call operations and turn.toolResult", () => {
   it("a different connection, an unknown operation and a wrong epoch cannot answer", async () => {
     const it = await start();
     await signIn(rig, "c2", 1);
-    expect(await code(answer(rig, "op1", {}, "c2"))).toBe("ENOTFOUND");
+    expect(await code(answer(rig, "op1", {}, "c2"))).toBe("ENOTFOUND:operation_unknown"); // never a bare ENOTFOUND ("no such connection": destructive for revoke)
+    expect(await code(rig.mgr.turnToolResult({ connectionId: "c1", turnId: "no-such-turn", epoch: 1, operationId: "op1", content: "r" }))).toBe("ENOTFOUND:operation_unknown");
     expect(await code(answer(rig, "nope"))).toBe("ENOTFOUND:operation_unknown");
     expect(await code(rig.mgr.turnToolResult({ connectionId: "c1", turnId: "tr1", epoch: 2, operationId: "op1", content: "r" }))).toMatch(/^ESTALE|EINVALID|ENOTFOUND/);
     expect(rig.script.answers).toHaveLength(0);
@@ -168,7 +186,54 @@ describe("relay: tool-call operations and turn.toolResult", () => {
     const it = await start({}, [call("op1"), call("op2"), { wait: new Promise<void>(() => undefined) }, { type: "result", ok: true, text: "x" }]);
     await it.next();
     expect(await code(answer(rig, "op1", { unlock: ["late_tool"] }))).toBe("OK");
-    expect(await code(answer(rig, "op2", { unlock: ["late_tool"] }))).toBe("EINVALID:unlock_unknown_tool");
+    // already unlocked: a harmless no-op (a backend retry), the operation is answered, and the provider is NOT told to unlock it again
+    expect(await code(answer(rig, "op2", { unlock: ["late_tool"] }))).toBe("OK");
+    expect(rig.script.answers.map((a) => a.answer)).toEqual([
+      { kind: "tool-result", ok: true, content: "r", unlock: ["late_tool"] },
+      { kind: "tool-result", ok: true, content: "r" },
+    ]);
+    await it.return?.();
+  });
+
+  it("a name the manifest never marked locked is still refused even after other unlocks (validated against the locked set from the start)", async () => {
+    const it = await start({}, [call("op1"), call("op2"), { wait: new Promise<void>(() => undefined) }, { type: "result", ok: true, text: "x" }]);
+    await it.next();
+    expect(await code(answer(rig, "op1", { unlock: ["late_tool"] }))).toBe("OK");
+    expect(await code(answer(rig, "op2", { unlock: ["search", "late_tool"] }))).toBe("EINVALID:unlock_unknown_tool");
+    expect(await code(answer(rig, "op2", { unlock: ["late_tool", "late_tool"] }))).toBe("OK"); // duplicates in one answer are fine too
+    await it.return?.();
+  });
+
+  it("a refused answer followed by the same unlock again (backend retry) works once the problem is fixed", async () => {
+    const it = await start();
+    const big = "a".repeat(2_400_000);
+    const images = Array.from({ length: 3 }, () => ({ mimeType: "image/png" as const, data: big }));
+    expect(await code(answer(rig, "op1", { content: "é".repeat(2_000_000), images, unlock: ["late_tool"] }))).toBe("EINVALID:result_too_large");
+    expect(await code(answer(rig, "op1", { unlock: ["late_tool"] }))).toBe("OK");
+    expect(rig.script.answers[0].answer).toMatchObject({ unlock: ["late_tool"] });
+    await it.return?.();
+  });
+
+  it("a result for a turn that has FINISHED is ENOTFOUND with a detail, never a bare ENOTFOUND, and differs from an aborted turn (ESTALE)", async () => {
+    rig = makeRig({ adapter: { relay: true } });
+    await signIn(rig, "c1", 1);
+    rig.script.turnEvents = [call("op1"), { type: "result", ok: true, text: "x" }];
+    await drain((await rig.mgr.runTurn(relayReq("c1"))).events!);
+    expect(await code(answer(rig, "op1"))).toBe("ENOTFOUND:operation_unknown");
+    expect(await code(answer(rig, "op1"))).not.toBe("ENOTFOUND");
+  });
+
+  it("MUTATION TARGET: a tool-call event is registered as an operation (a tick past the host default answers an unanswered one with a timeout; a stream tool-use never is)", async () => {
+    rig = makeRig({ adapter: { relay: true }, config: { toolCallTimeoutMs: 1_000 } });
+    await signIn(rig, "c1", 1);
+    rig.script.turnEvents = [{ type: "tool-use", operationId: "tu1", name: "search", input: {} }, { type: "tool-call", operationId: "op1", messageId: "m", name: "search", input: {} }, { wait: new Promise<void>(() => undefined) }];
+    const it = (await rig.mgr.runTurn(relayReq("c1"))).events![Symbol.asyncIterator]();
+    await it.next();
+    await it.next();
+    rig.clock.advance(2_000);
+    rig.mgr.tick();
+    await flush();
+    expect(rig.script.answers.map((a) => a.operationId)).toEqual(["op1"]); // only the relay call; tu1 was never an operation
     await it.return?.();
   });
 

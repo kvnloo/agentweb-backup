@@ -24,6 +24,7 @@
 import { createHash } from "crypto";
 import type { Hazard, LoginProcess, ProviderEvent, ProviderSession, SubscriptionProviderAdapter } from "./adapter";
 import { HostError, RELAY_FRAME_LIMITS, type RouteInput } from "./protocol";
+import { canonicalJson } from "./relay/canonical";
 import { resultFrameBytes } from "./relay/relayServer";
 import type { Clock, IdGen, Logger, UserFsPort } from "./ports";
 import { noopLogger } from "./ports";
@@ -110,8 +111,10 @@ interface RunningTurn {
   operations: Map<string, number>;
   /** The operations that are `tool-call` events of the relay (their clock is the turn's deadline, not the host default). */
   relayOps: Set<string>;
-  /** The turn's relay manifest: the names a result may unlock are the ones still locked. Absent on a legacy turn. */
-  lockedTools?: Set<string>;
+  /** The turn's relay manifest: the names a result may unlock are the ones marked `locked` at the START (fixed). Absent on a legacy turn. */
+  lockedTools?: ReadonlySet<string>;
+  /** Locked names an accepted answer has already unlocked: naming one again is a harmless no-op (a backend retry), not an error. */
+  unlockedTools?: Set<string>;
   /** Ends the turn. Safe at any moment, including before the session has finished opening. */
   abort: (reason: string) => void;
   onAbort?: () => void;
@@ -448,7 +451,7 @@ export class ConnectionManager {
     // connection state synchronously before their first await.
     const st = this.state();
     const key = `turn:${req.connectionId}:${req.idempotencyKey}`;
-    const hash = hashOf({ c: req.connectionId, e: req.epoch, t: req.turnId, p: req.prompt, m: req.model, pr: req.priority ?? "interactive", ...(req.tools ? { tl: hashOf(req.tools) } : {}) });
+    const hash = hashOf({ c: req.connectionId, e: req.epoch, t: req.turnId, p: req.prompt, m: req.model, pr: req.priority ?? "interactive", ...(req.tools ? { tl: hashOf(canonicalJson(req.tools)) } : {}) });
     const prior = st.idempotency[key];
     if (prior) {
       if (prior.requestHash !== hash) throw new HostError("EEXISTS");
@@ -504,7 +507,7 @@ export class ConnectionManager {
       priority,
       operations: new Map(),
       relayOps: new Set(),
-      ...(req.tools ? { lockedTools: new Set(req.tools.filter((t) => t.locked).map((t) => t.name)) } : {}),
+      ...(req.tools ? { lockedTools: new Set(req.tools.filter((t) => t.locked).map((t) => t.name)), unlockedTools: new Set<string>() } : {}),
       abort: (reason: string) => {
         const first = running.aborted === undefined;
         running.aborted ??= reason;
@@ -607,7 +610,7 @@ export class ConnectionManager {
         }
         if (ev.type === "tool-use" && adapter.toolTransport === "host_relay") running.operations.set(ev.operationId, this.deps.clock.monotonicMs());
         // The ONLY operation a Claude turn registers: a host-generated relay call. Its stream-derived `tool-use` is informational and never executable.
-        if (ev.type === "tool-call" && !running.aborted) {
+        if (ev.type === "tool-call") {
           running.operations.set(ev.operationId, this.deps.clock.monotonicMs());
           running.relayOps.add(ev.operationId);
         }
@@ -677,15 +680,19 @@ export class ConnectionManager {
 
   /** The backend's answer to a relayed tool call; the operation must be one this turn issued and not yet answered. */
   async turnToolResult(req: RouteInput<"turn.toolResult">): Promise<{ ok: true }> {
-    const t = this.requireTurn(req.connectionId, req.turnId);
+    // A turn that is gone (finished, aborted and cleaned up, never existed, another connection's) is NEVER a bare ENOTFOUND here: protocol.ts defines a bare
+    // ENOTFOUND as "no such connection", which has a destructive meaning for revoke and the sweeper. Same answer as an unknown operation: result lost.
+    const t = this.turns.get(this.turnKey(req.connectionId, req.turnId));
+    if (!t) throw new HostError("ENOTFOUND", "operation_unknown");
     this.requireEpochNumber(t.epoch, req.epoch);
     // "Result lost" answers: the backend persists the tool's outcome itself and tells the model so. ESTALE = the turn was ended by the host
     // (abort, deadline, lease); ENOTFOUND = no such pending operation (never issued, already answered, timed out, or the turn is gone).
     if (t.aborted !== undefined) throw new HostError("ESTALE", "turn_aborted");
     if (!t.operations.has(req.operationId)) throw new HostError("ENOTFOUND", "operation_unknown");
     // Everything that can be refused is refused BEFORE the operation is consumed, so the backend can retry with a smaller/valid answer.
-    for (const name of req.unlock ?? []) if (!t.lockedTools?.has(name)) throw new HostError("EINVALID", "unlock_unknown_tool");
-    if (resultFrameBytes("x".repeat(64), { content: req.content, ...(req.images ? { images: req.images } : {}), ...(req.unlock ? { unlock: req.unlock } : {}) }) > RELAY_FRAME_LIMITS.hostToShimBytes) throw new HostError("EINVALID", "result_too_large");
+    for (const name of req.unlock ?? []) if (!t.lockedTools?.has(name)) throw new HostError("EINVALID", "unlock_unknown_tool"); // validated against the manifest's locked set from the start
+    const fresh = (req.unlock ?? []).filter((n) => !t.unlockedTools?.has(n)); // an already unlocked name is a no-op, not an error
+    if (resultFrameBytes("x".repeat(64), { content: req.content, ...(req.images ? { images: req.images } : {}), ...(fresh.length ? { unlock: fresh } : {}) }) > RELAY_FRAME_LIMITS.hostToShimBytes) throw new HostError("EINVALID", "result_too_large");
     t.operations.delete(req.operationId);
     t.relayOps.delete(req.operationId);
     const session = await t.hs.ready;
@@ -694,10 +701,10 @@ export class ConnectionManager {
       ok: req.isError !== true,
       content: req.content,
       ...(req.images ? { images: req.images } : {}),
-      ...(req.unlock ? { unlock: req.unlock } : {}),
+      ...(fresh.length ? { unlock: fresh } : {}),
     });
     if (accepted === false) throw new HostError("ESTALE", "result_lost"); // the provider no longer has that operation (its own timer fired first)
-    for (const name of req.unlock ?? []) t.lockedTools?.delete(name);
+    for (const name of fresh) t.unlockedTools?.add(name);
     return { ok: true };
   }
 

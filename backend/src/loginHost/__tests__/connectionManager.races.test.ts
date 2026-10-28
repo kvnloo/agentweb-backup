@@ -226,7 +226,7 @@ describe("ConnectionManager: provider failures", () => {
     expect((await it.next()).value).toMatchObject({ type: "tool-use", operationId: "op2" });
     const answer = (conn: string, op: string) => rig.mgr.turnToolResult({ connectionId: conn, turnId: "tr1", epoch: 1, operationId: op, content: "r" });
     expect(await code(answer("c1", "nope"))).toBe("ENOTFOUND:operation_unknown");
-    expect(await code(answer("c2", "op1"))).toBe("ENOTFOUND"); // another connection cannot answer it
+    expect(await code(answer("c2", "op1"))).toBe("ENOTFOUND:operation_unknown"); // another connection cannot answer it
     expect(await code(answer("c1", "op1"))).toBe("OK");
     expect(await code(answer("c1", "op1"))).toBe("ENOTFOUND:operation_unknown"); // once
     rig.clock.advance(2_000);
