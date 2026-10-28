@@ -170,8 +170,9 @@ describe("the unsubscribe-link warning (verified with received emails, 2026-10-2
     expect(warned("<p>Hi</p>", {})).toBe(false);
   });
 
-  it("an unsubscribe tag in the sequence itself silences the warning", () => {
-    expect(warned("<p>Hi {{unsubscribe_link}}</p>", { addUnsubscribeTag: true, unsubscribeText: null })).toBe(false);
+  it("an unsubscribe-like tag silences the 'setting off' warning, but NOT the 'empty footer text' one (that it renders a link is unverified)", () => {
+    expect(warned("<p>Hi {{unsubscribe_link}}</p>", { addUnsubscribeTag: false })).toBe(false);
+    expect(warned("<p>Hi {{unsubscribe_link}}</p>", { addUnsubscribeTag: true, unsubscribeText: null })).toBe(true);
   });
 });
 
