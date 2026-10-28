@@ -24,6 +24,12 @@ export const claudeCodeBackend = new ClaudeCodeBackend({
   trimToolMessages: (messages) => agentModeService.trimToolMessagesForContext(messages),
   runHostTurn,
   bridge: toolBridgeMcp,
+  // The tool relay (worker protocol >= 4 and a matching version check); anything else runs on the HTTP bridge as before.
+  relay: {
+    workerProtocol: () => getLoginHostProvider().workerProtocol(),
+    protocolStatus: () => getLoginHostProvider().protocolStatus(),
+    candidateTools: (run) => emmaToolBridgeExecutor.resolveCandidateTools({ runId: run.runId, userId: run.userId, sessionId: run.sessionId }),
+  },
   executor: emmaToolBridgeExecutor,
   registry: claudeRunRegistry,
   isCancelled,

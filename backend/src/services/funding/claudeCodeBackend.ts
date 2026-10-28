@@ -21,7 +21,10 @@ import type { ProviderEvent } from "../../loginHost/adapter";
 import type { LoginHostClient } from "./loginHostClient";
 import type { HostTurnOptions, HostTurnOutcome } from "./loginHostTurn";
 import type { RouteInput } from "../../loginHost/protocol";
-import type { BridgeCallRecord, BridgeHalt, CloseAndDrainResult } from "./toolBridge";
+import type { BridgeCallOptions, BridgeCallRecord, BridgeCallResult, BridgeHalt, BridgeListedTool, BridgeTool, BridgeToolCall, CloseAndDrainResult } from "./toolBridge";
+import { buildRelayManifest, manifestProblem, type RelayManifest } from "./relayManifest";
+import { RESULT_LOST_NOTE, RelayToolDispatcher } from "./relayToolDispatcher";
+import { ToolBridgeAuthError } from "./toolBridge";
 import type { RunToolTokenClaims } from "./runToolToken";
 import type { PlanRoute } from "./claudeFunding";
 import type { ClaudeRunRegistry } from "./claudeRunRegistry";
@@ -94,7 +97,22 @@ export interface ClaudeBackendDeps {
     takeLedger(runId: string): { records: BridgeCallRecord[]; truncated: number };
     generationOf(runId: string): string | undefined;
     takeLedgerByGeneration(generation: string): { records: BridgeCallRecord[]; truncated: number };
+    /** The tool relay (protocol 4) calls the bridge in process with the run's internal token: both are needed for it, and without them the HTTP bridge path is used. */
+    listTools?(token: string, runId: string): Promise<BridgeListedTool[]>;
+    callTool?(token: string, call: BridgeToolCall, runId: string, opts?: BridgeCallOptions): Promise<BridgeCallResult>;
   };
+  /**
+   * The tool relay is used for a turn iff the worker reports protocol >= 4 AND the version check says `match` AND the bridge can be called in process. Any other
+   * answer (older worker, not yet asked, mismatch, no `relay` dependency) runs the turn on the HTTP bridge exactly as before.
+   */
+  relay?: {
+    workerProtocol(): number | undefined;
+    protocolStatus(): "match" | "mismatch" | "unknown";
+    /** Tools the run could have after a skill install; offered to the worker as `locked`. Failure or absence = none are offered ahead. */
+    candidateTools?(run: { runId: string; userId: string; sessionId: string }): Promise<BridgeTool[]>;
+  };
+  /** How long before the turn's deadline no further tool may start (the model is told to write its answer). Default 75 s, never more than half the deadline. */
+  softDeadlineLeadMs?: number;
   executor: {
     registerRun(runId: string, ctx: { llmModel: string; isDelegatedAccess?: boolean; excludeTools?: string[]; screenshotUrl?: string; socketEmit?: (room: string, event: string, payload: any) => void; fundingScope?: RunFunding }): void;
     beginTurn(runId: string, turn: { agentRuntimeRunId?: string; priorSearchCallCount?: number }): void;
@@ -129,6 +147,33 @@ const HOST_BUSY_WAIT_MS = 40_000;
 const MAX_DEADLINE_MS = 3_600_000;
 /** The bridge gives up on a call it is still holding after this long (the longest a late record can still arrive). */
 const LATE_WATCH_DEFAULT_MS = 15 * 60_000;
+/** The first worker protocol that serves the tool relay. */
+export const RELAY_MIN_PROTOCOL = 4;
+const SOFT_DEADLINE_LEAD_MS = 75_000;
+
+/** The one condition that selects the relay path for a turn. Exported so the tests (and the pilot's checks) state it once. */
+export function relayAvailable(d: Pick<ClaudeBackendDeps, "relay" | "bridge">): boolean {
+  const r = d.relay;
+  if (!r || typeof d.bridge.listTools !== "function" || typeof d.bridge.callTool !== "function") return false;
+  const protocol = r.workerProtocol();
+  return typeof protocol === "number" && protocol >= RELAY_MIN_PROTOCOL && r.protocolStatus() === "match";
+}
+
+/**
+ * A call whose result the worker could no longer take ran (or may have) but the model never read the answer: the persisted tool result says so (A1), so the
+ * next turn does not repeat it blindly. Only calls that really ran are marked; a refusal executed nothing.
+ */
+export function annotateLostResults(ledger: BridgeCallRecord[], lost: ReadonlySet<string>, all = false): BridgeCallRecord[] {
+  if (!all && lost.size === 0) return ledger;
+  return ledger.map((r) => {
+    if ((r.kind !== "executed" && r.kind !== "failed") || (!all && !lost.has(r.toolCallId))) return r;
+    return {
+      ...r,
+      toolMessageContent: `${r.toolMessageContent}\n${RESULT_LOST_NOTE}`,
+      ...(r.answeredContent !== undefined ? { answeredContent: `${r.answeredContent}\n${RESULT_LOST_NOTE}` } : {}),
+    };
+  });
+}
 
 export const OUTCOME_UNKNOWN_NOTE =
   "I lost the connection to your Claude plan while working on this. It may or may not have finished. Please check the results before asking me to repeat anything.";
@@ -218,6 +263,7 @@ export class ClaudeCodeBackend {
     let cancelledByUser = false;
     let previousUnknown = false; // the bridge reported (and cleared) an unfinished action from an earlier turn
     let hostStarted = false; //     the host produced at least one event: the model read the prompt
+    let dispatcher: RelayToolDispatcher | undefined; // set only on the relay path
     let ledgerShowedCalls = false; // step 6 saw a call record, a call still running, or could not read the ledger (the drain removes it, so remember)
 
     const progress = (status: string, extra: Record<string, unknown> = {}) => {
@@ -273,6 +319,31 @@ export class ClaudeCodeBackend {
         const deadlineMs = Math.min(MAX_DEADLINE_MS, Math.max(MIN_DEADLINE_MS, cap - elapsed - GRACE_MS - HOST_BUSY_WAIT_MS));
         progress("thinking");
         try {
+          // The tool transport of this turn: the relay iff `relayAvailable`, else the HTTP bridge exactly as before.
+          let transport: { bridgeToken: string } | { tools: RelayManifest["tools"] } = { bridgeToken: token };
+          if (relayAvailable(d)) {
+            const built = await this.buildRelay(p, runId, token);
+            if (built) {
+              transport = { tools: built.manifest.tools };
+              const lead = Math.min(d.softDeadlineLeadMs ?? SOFT_DEADLINE_LEAD_MS, Math.floor(deadlineMs / 2));
+              dispatcher = new RelayToolDispatcher({
+                client,
+                ids: { connectionId, turnId: runId, epoch }, // this closure is the only source of identity; an event's fields are never read for it
+                runId,
+                token,
+                bridge: { callTool: (t, c, r, o) => d.bridge.callTool!(t, c, r, o), listTools: (t, r) => d.bridge.listTools!(t, r), noteToolUse: (r, c, n, i, m) => d.bridge.noteToolUse(r, c, n, i, m), takeLedger: (r) => d.bridge.takeLedger(r) },
+                manifest: { open: built.manifest.open, locked: built.manifest.locked },
+                isStopped: () => seen.stopped || ac.signal.aborted,
+                softDeadlineAt: d.now() + deadlineMs - lead,
+                now: d.now,
+                onCall: (phase, name) => {
+                  if (phase === "start") progress("executing_tools", { pendingTools: [name] });
+                  else progress("tool_executed");
+                },
+              });
+            }
+          }
+          const relayMode = dispatcher !== undefined;
           outcome = await d.runHostTurn(
             client,
             {
@@ -282,7 +353,7 @@ export class ClaudeCodeBackend {
               turnId: runId,
               prompt,
               model: p.decision.alias,
-              bridgeToken: token,
+              ...transport,
               deadlineMs,
               priority: "interactive",
             },
@@ -290,12 +361,23 @@ export class ClaudeCodeBackend {
               signal: ac.signal,
               onEvent: (e: ProviderEvent) => {
                 hostStarted = true;
-                if (e.type === "tool-use") {
+                if (e.type === "tool-call") {
+                  // The ONLY thing that executes on the relay path, and it never blocks the stream: the dispatcher runs it as its own tracked promise.
+                  if (dispatcher) {
+                    uses.push({ id: e.operationId, name: e.name });
+                    dispatcher.start(e);
+                  }
+                } else if (e.type === "tool-use") {
+                  if (relayMode) {
+                    // Informational only on the relay path (progress): the stream's ids are not the worker's operation ids, so they feed no bridge state and execute nothing.
+                    return;
+                  }
                   const name = e.name.replace(/^mcp__[A-Za-z0-9_]+?__/, "");
                   uses.push({ id: e.operationId, name });
                   d.bridge.noteToolUse(runId, e.operationId, name, e.input);
                   progress("executing_tools", { pendingTools: [name] });
                 } else if (e.type === "tool-result") {
+                  if (relayMode) return;
                   d.bridge.noteToolResult(runId, e.operationId);
                   progress("tool_executed");
                 } else if (e.type === "usage") {
@@ -328,12 +410,15 @@ export class ClaudeCodeBackend {
 
       // 6. wait for in-flight calls, take the ledger. A Stop (or a revoke) closes the bridge run BEFORE this point, and the drain of a closed run
       // answers null: the ledger is then read from where the bridge keeps it, never treated as empty.
+      // Relay calls run out of band: they are waited for first (their toolResult posts included), then the bridge run is drained and closed.
+      if (dispatcher) await dispatcher.settle(d.drainTimeoutMs ?? 10_000);
       const generation = d.bridge.generationOf(runId);
       const drained = await d.bridge.closeRunAndDrain(runId, d.drainTimeoutMs ?? 10_000);
       opened = false;
-      const ledger: BridgeCallRecord[] = drained ? drained.ledger : d.bridge.takeLedger(runId).records;
+      let ledger: BridgeCallRecord[] = drained ? drained.ledger : d.bridge.takeLedger(runId).records;
+      if (dispatcher) ledger = annotateLostResults(ledger, dispatcher.lostCallIds());
       ledgerShowedCalls = ledger.length > 0 || !drained || drained.stillRunning > 0;
-      if (!drained || drained.stillRunning > 0) this.watchLate(p, generation, ledger, drained ? drained.stillRunning : undefined);
+      if (!drained || drained.stillRunning > 0) this.watchLate(p, generation, ledger, drained ? drained.stillRunning : undefined, dispatcher !== undefined);
 
       // 7. map
       if (seen.stopped || cancelledByUser || d.isCancelled(p.sessionId)) {
@@ -434,10 +519,45 @@ export class ClaudeCodeBackend {
   }
 
   /**
+   * The relay's tool manifest for this turn, from the bridge's current list (which also makes the executor resolve the run's tool access, as the HTTP route's
+   * `tools/list` does). Returns undefined when nothing can be offered through the relay (the turn then uses the HTTP bridge). Failures are typed stops:
+   * nothing has run yet.
+   */
+  private async buildRelay(p: ClaudeTurnParams, runId: string, token: string): Promise<{ manifest: RelayManifest } | undefined> {
+    const d = this.deps;
+    let open: BridgeListedTool[];
+    try {
+      open = await d.bridge.listTools!(token, runId);
+    } catch (err) {
+      throw noToolsStop(err instanceof ToolBridgeAuthError ? "revoked_or_disabled" : "lookup_failed");
+    }
+    let candidates: BridgeTool[] = [];
+    try {
+      candidates = (await d.relay?.candidateTools?.({ runId, userId: p.userId, sessionId: p.sessionId })) ?? [];
+    } catch {
+      candidates = []; // no tools are offered ahead; a skill install then needs a new turn to show its tools
+      console.error("[claude-backend] relay candidate tools unavailable");
+    }
+    const manifest = buildRelayManifest(open, candidates);
+    const skipped = Object.entries(manifest.skipped);
+    if (skipped.length > 0) console.error("[claude-backend] relay manifest skipped tools", Object.fromEntries(skipped), { offered: manifest.tools.length });
+    if (manifest.tools.length === 0 || manifest.open.size === 0) {
+      console.error("[claude-backend] relay manifest empty; using the HTTP bridge for this turn");
+      return undefined;
+    }
+    const problem = manifestProblem(manifest.tools);
+    if (problem) {
+      console.error("[claude-backend] relay manifest refused by the protocol schema", { problem });
+      throw noToolsStop("turn_failed");
+    }
+    return { manifest };
+  }
+
+  /**
    * A call that was still executing when the turn ended (a Stop mid-write) finishes later and is recorded by the bridge as a late record. Nothing
    * else would ever show it in the chat, so it is looked for, for a bounded time, and saved with a note. Each call is saved once.
    */
-  private watchLate(p: ClaudeTurnParams, generation: string | undefined, settled: BridgeCallRecord[], expectedLate: number | undefined): void {
+  private watchLate(p: ClaudeTurnParams, generation: string | undefined, settled: BridgeCallRecord[], expectedLate: number | undefined, relayed = false): void {
     const d = this.deps;
     if (!generation) return;
     const pollMs = d.lateWatchPollMs ?? 3_000;
@@ -459,9 +579,11 @@ export class ClaudeCodeBackend {
       for (let i = 0; i < polls; i++) {
         await sleep();
         // Only a call that really ran is worth showing. A refused / collapsed / joined late record executed nothing.
-        const late = d.bridge
+        let late = d.bridge
           .takeLedgerByGeneration(generation)
           .records.filter((r) => r.late === true && (r.kind === "executed" || r.kind === "failed") && !done.has(r.toolCallId));
+        // On the relay path the worker's turn is over by now, so no late result can have reached the model: the persisted result says so.
+        if (relayed) late = annotateLostResults(late, new Set(), true);
         if (late.length > 0) {
           for (const r of late) done.add(r.toolCallId);
           saved += late.length;
