@@ -122,7 +122,7 @@ export async function buildPreview(deps: PreviewDeps, req: PreviewRequest): Prom
 
   const analysis = analyseSequence(await deps.getSequences());
   const preflight = preflightSequence(analysis, {
-    status: campaign.status, mapping, acknowledgedTags, acknowledgeUnreadable: req.acknowledgeUnreadable, addUnsubscribeTag: campaign.addUnsubscribeTag,
+    status: campaign.status, mapping, acknowledgedTags, acknowledgeUnreadable: req.acknowledgeUnreadable, addUnsubscribeTag: campaign.addUnsubscribeTag, unsubscribeText: campaign.unsubscribeText,
   });
 
   const leads = await readWholeList(deps, req.listId);

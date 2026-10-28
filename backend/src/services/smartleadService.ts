@@ -447,6 +447,12 @@ export async function findLeadIdByEmail(apiKey: string, email: string, opts: { m
 export interface SmartleadCampaignDetail extends SmartleadCampaignSummary {
   /** Whether Smartlead adds its own unsubscribe link to each email (the sequence check warns when it does not and the body has none). */
   addUnsubscribeTag?: boolean;
+  /**
+   * The campaign's unsubscribe footer text. Verified with received emails (2026-10-28): Smartlead adds the unsubscribe link (and the
+   * List-Unsubscribe header) only when `add_unsubscribe_tag` is on AND this text is set; with the setting on and the text empty it adds
+   * nothing. `null` here means the campaign has no text; absent means Smartlead did not say.
+   */
+  unsubscribeText?: string | null;
 }
 
 /**
@@ -468,6 +474,7 @@ export async function getCampaign(apiKey: string, campaignId: number, opts: { ma
     status: String(row.status ?? "").toUpperCase(),
     maxLeadsPerDay: asLimit(row.max_leads_per_day),
     ...(typeof row.add_unsubscribe_tag === "boolean" ? { addUnsubscribeTag: row.add_unsubscribe_tag } : {}),
+    ...("unsubscribe_text" in row ? { unsubscribeText: typeof row.unsubscribe_text === "string" ? row.unsubscribe_text : null } : {}),
   };
 }
 
