@@ -425,7 +425,7 @@ describe("smartleadService slice 2 client (ENG-673)", () => {
       expect(call.data.settings).toEqual({
         ignore_global_block_list: false,
         ignore_unsubscribe_list: false,
-        ignore_duplicate_leads_in_other_campaign: false,
+        ignore_duplicate_leads_in_other_campaign: true, // TRUE skips a lead already in another campaign (verified live 2026-10-28)
         ignore_community_bounce_list: false,
         return_lead_ids: true,
       });
