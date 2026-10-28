@@ -20,6 +20,20 @@ import { ROUTES, type HostErrorCode, type RouteInput, type RouteName } from "../
 
 const HOST_CODES: ReadonlySet<string> = new Set<HostErrorCode>(["EINVALID", "ENOTFOUND", "ESTALE", "ESTATE", "EBUSY", "EEXISTS", "EUNSUPPORTED", "EHAZARD", "EINTERNAL"]);
 
+/**
+ * The tool relay's "result lost" answers to `turn.toolResult`: the turn was ended by the host (`ESTALE turn_aborted`), the operation is not pending any more
+ * (`ENOTFOUND operation_unknown`: never issued, already answered, timed out, or the turn is gone) or the provider's own timer fired first (`ESTALE result_lost`).
+ * In all three the tool MAY HAVE RUN; only the answer did not arrive. This is deliberately NOT a LoginHostError: on every other route a bare ENOTFOUND means
+ * "no such connection" and has a destructive meaning for revoke and the sweeper (protocol.ts), and this route must never be mistaken for that.
+ */
+export type ToolResultLostReason = "turn_aborted" | "operation_unknown" | "result_lost";
+export class ToolResultLostError extends Error {
+  constructor(readonly reason: ToolResultLostReason) {
+    super(`tool result lost (${reason})`);
+    this.name = "ToolResultLostError";
+  }
+}
+
 export type LoginHostErrorCode = HostErrorCode | "UNREACHABLE" | "TIMEOUT" | "BAD_RESPONSE";
 
 /** A failed host call. `code` and `detail` are safe to log; neither can contain a path, token or code. */
@@ -307,6 +321,9 @@ const count = z.number().finite().nonnegative().optional();
 const EVENT_SHAPES: Record<string, z.ZodTypeAny> = {
   text: z.object({ delta: z.string() }),
   "tool-use": z.object({ operationId: z.string(), name: z.string(), input: z.unknown() }),
+  // ENG-2113 relay: a host-generated operation the backend must answer. `name` and `input` are NOT trusted here (the dispatcher re-validates them against the
+  // run's tool list); only the envelope is checked. A bad envelope is a bad answer from the host, never something to execute.
+  "tool-call": z.object({ operationId: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/), messageId: z.string().max(200), name: z.string().max(200), input: z.unknown() }),
   "tool-result": z.object({ operationId: z.string(), ok: z.boolean() }),
   usage: z.object({ inputTokens: count, outputTokens: count, cacheReadTokens: count, cacheWriteTokens: count }),
   entitlement: z.object({ observation: z.object({ windows: z.array(z.object({ name: z.string(), utilization: z.number().optional(), resetsAtMs: z.number().optional() })) }) }),
@@ -374,9 +391,22 @@ export class LoginHostClient {
   turnInterrupt(input: RouteInput<"turn.interrupt">): Promise<{ interrupted: true }> {
     return this.call("turn.interrupt", input, z.object({ interrupted: z.literal(true) }));
   }
-  /** Answer to a `tool-use` event of a turn run with a host-relayed tool transport. */
-  turnToolResult(input: RouteInput<"turn.toolResult">): Promise<{ ok: true }> {
-    return this.call("turn.toolResult", input, z.object({ ok: z.literal(true) }));
+  /**
+   * Answer to a `tool-call` event of a relay turn (protocol 4: `{operationId, content, isError?, images?, unlock?}`; the host replies `{ok:true}`).
+   * Resolves only when the host accepted the answer. Rejects with ToolResultLostError for the three "result lost" answers (see there), with a
+   * LoginHostError for anything else (EINVALID `result_too_large` / `unlock_unknown_tool` leave the operation pending, so the caller may retry with a valid answer).
+   */
+  async turnToolResult(input: RouteInput<"turn.toolResult">): Promise<{ ok: true }> {
+    try {
+      return await this.call("turn.toolResult", input, z.object({ ok: z.literal(true) }));
+    } catch (err) {
+      if (err instanceof LoginHostError) {
+        // Any ESTALE or ENOTFOUND on THIS route is "the answer cannot be taken", whatever the detail (an older or newer host may word it differently).
+        if (err.code === "ESTALE") throw new ToolResultLostError(err.detail === "result_lost" ? "result_lost" : "turn_aborted");
+        if (err.code === "ENOTFOUND") throw new ToolResultLostError("operation_unknown");
+      }
+      throw err;
+    }
   }
 
   /**
