@@ -405,6 +405,15 @@ describe('ClaudeCodeBackend', () => {
         expect(turnRanNoTools(await failWith(h))).toBe(false);
       });
 
+      it('a tool call the model made counts as "may have run" even when the bridge holds no record of it', async () => {
+        const h = harness();
+        h.setHost(async (_req, opts) => {
+          await opts.onEvent({ type: 'tool-use', operationId: 'tc1', name: 'mcp__emma__get_leads', input: {} } as ProviderEvent);
+          return done('', { ok: false, errorKind: 'usage_limit' });
+        });
+        expect(turnRanNoTools(await failWith(h))).toBe(false);
+      });
+
       it('a closed run whose drain answered null is never treated as having run nothing', async () => {
         const h = harness();
         h.setHost(async () => done('', { ok: false, errorKind: 'usage_limit' }));

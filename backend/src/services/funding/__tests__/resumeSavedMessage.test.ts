@@ -27,6 +27,12 @@ describe("findResumableUserMessage", () => {
     expect(findResumableUserMessage([{ role: "assistant", content: "a" }, note()])).toEqual({ ok: false }); // the message under the note is not a user message
   });
 
+  it("refuses a message that carries attachments (a continue would answer without the files), but not an empty list", () => {
+    expect(findResumableUserMessage([user("hi", { attachments: [{ url: "u", filename: "f" }] }), note()])).toEqual({ ok: false });
+    expect(findResumableUserMessage([user("hi", { attachments: "x" }), note()])).toEqual({ ok: false });
+    expect(findResumableUserMessage([user("hi", { attachments: [] }), note()])).toEqual({ ok: true, content: "hi" });
+  });
+
   it("refuses an automatic continuation or any other kind of user message, and an empty one", () => {
     expect(findResumableUserMessage([user("hi", { kind: "auto-continuation" }), note()])).toEqual({ ok: false });
     expect(findResumableUserMessage([user(""), note()])).toEqual({ ok: false });

@@ -9981,7 +9981,8 @@ async function runSessionTurn(
   // between (a second tab, a concurrent turn) can never skip the save of a message that is not already stored.
   const resumingSavedMessage = userMessageKind === RESUME_SAVED_MESSAGE_KIND;
   if (resumingSavedMessage) {
-    const found = findResumableUserMessage(session.messages);
+    const fresh = await chatbotDb.getChatSession(sessionId, true); // strongly consistent, see the request check
+    const found = findResumableUserMessage(fresh?.messages);
     if (!found.ok || found.content !== userMessage) throw new Error('RESUME_SAVED_MESSAGE_NOT_AVAILABLE');
   }
   if (resumingSavedMessage) {
@@ -10106,6 +10107,15 @@ async function runSessionTurn(
   const sessionHistoryForWorker = (updatedSession.messages || []).filter(
     (m: any) => !isRunFailurePlaceholder(m)
   );
+  // ENG-2113: a continue answers the message already in the chat. The plan-stop notes under it are not part of the conversation, and while they sit last the
+  // context builder cannot recognise the saved message as THE current one (it would be sent twice): drop the trailing notes so it is.
+  if (resumingSavedMessage) {
+    while (sessionHistoryForWorker.length > 0) {
+      const last: any = sessionHistoryForWorker[sessionHistoryForWorker.length - 1];
+      if (last?.role === 'assistant' && last?.metadata?.kind === PLAN_STOP_NOTE_KIND) sessionHistoryForWorker.pop();
+      else break;
+    }
+  }
 
   // If this session is linked to a GTM work item, update status to agent_in_progress
   if (updatedSession.gtmWorkItem) {
@@ -11006,7 +11016,9 @@ export const agentModeController = {
       if (req.body.continueSavedMessage === true) {
         const notContinuable = () => res.status(409).json({ error: 'That message can no longer be continued. Send it again as a new message.', code: 'CONTINUE_NOT_AVAILABLE' });
         if ((Array.isArray(attachments) ? attachments.length > 0 : !!attachments) || questionAnswer || workPlanInputAnswer || deckAnswer || deckCancel || audioInput) return notContinuable();
-        const found = findResumableUserMessage(session.messages);
+        // Strongly consistent: this read is the guard against skipping a save, so a just-written answer or message must be seen.
+        const fresh = await chatbotDb.getChatSession(sessionId, true);
+        const found = findResumableUserMessage(fresh?.messages);
         if (!found.ok || found.content !== userMessage) return notContinuable();
         resumeSavedMessage = true;
       }
@@ -11982,7 +11994,14 @@ export const agentModeController = {
         // and the client says an action may repeat.
         const planStopSaved = wasRaisedAfterUserMessageSaved(planStop);
         const planStopBody = claudeStopBody(planStop);
-        return res.status(planStop.httpStatus).json(sendRefusalBody({ ...planStopBody, canContinueSavedMessage: planStopSaved && planStopResumable }, planStopSaved));
+        return res.status(planStop.httpStatus).json(sendRefusalBody({
+          ...planStopBody,
+          canContinueSavedMessage: planStopSaved && planStopResumable,
+          // What the client may offer for AgentWeb credits, spelled out so no client acts on `canUseAgentWebCredits` alone: 'resend' = nothing was saved, send the
+          // same request again; 'continue' = saved and known to have run no tool, send it with `continueSavedMessage: true`; 'new_message' = saved and a tool may
+          // have run, only a NEW message is possible and an action may repeat (say so). null = no offer.
+          agentWebOffer: !planStopBody.canUseAgentWebCredits ? null : !planStopSaved ? 'resend' : planStopResumable ? 'continue' : 'new_message',
+        }, planStopSaved));
       }
       console.error('AgentMode: Generate response error:', error);
 
