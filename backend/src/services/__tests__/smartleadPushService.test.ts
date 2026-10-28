@@ -737,6 +737,66 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
         expect((await e.svc.cancel("editor", r.run.runId)).ok).toBe(true);
       });
 
+      it("un-sharing the connection stops a teammate's push that is still running: it pauses with that reason and adds nothing more", async () => {
+        const e = env({ maxConcurrentWorkers: 0 });
+        e.editors.add("editor");
+        const conns = [OWNERS];
+        install(e, conns);
+        const added: number[] = [];
+        const add = e.deps.smartlead.addLeads;
+        e.deps.smartlead.addLeads = async (k, c, x) => { added.push(x.length); return add(k, c, x); };
+        const p = (await e.svc.preview("editor", { listId: e.listId, campaignId: CAMPAIGN })) as any;
+        const r = (await e.svc.start("editor", go(p.preview.token))) as any;
+        conns[0] = { ...OWNERS, sharedWith: [] }; // the owner stops sharing before the worker gets to it
+        install(e, conns);
+        await e.svc.work((await db.getRun(r.run.runId))!);
+        expect(await db.getRun(r.run.runId)).toMatchObject({ status: "paused", pauseReason: "connection_unshared" });
+        expect(added).toEqual([]);
+        expect(e.logs.join("\n")).toMatch(/no longer shared with the pusher/);
+      });
+
+      it("a running teammate push also pauses when the account id now resolves to a DIFFERENT owner's connection", async () => {
+        const e = env({ maxConcurrentWorkers: 0 });
+        e.editors.add("editor");
+        install(e, [OWNERS]);
+        const p = (await e.svc.preview("editor", { listId: e.listId, campaignId: CAMPAIGN })) as any;
+        const r = (await e.svc.start("editor", go(p.preview.token))) as any;
+        const real = e.deps.resolveKey;
+        e.deps.resolveKey = async (u, a) => (u === "editor" ? { ok: true, apiKey: "k", ownerUserId: "someone-else", accountId: a ?? "x", accountName: "x" } : real(u, a));
+        await e.svc.work((await db.getRun(r.run.runId))!);
+        expect((await db.getRun(r.run.runId))!.pauseReason).toBe("connection_unshared");
+      });
+
+      it("the owner's own push is not affected by sharing, and a rejected shared key is reported as a rejected key, not as un-shared", async () => {
+        const own = env({ maxConcurrentWorkers: 0 });
+        const conns = [{ ...OWNERS, sharedWith: [] }];
+        install(own, conns);
+        const p = (await own.svc.preview("owner", { listId: own.listId, campaignId: CAMPAIGN })) as any;
+        const r = (await own.svc.start("owner", go(p.preview.token))) as any;
+        await own.svc.work((await db.getRun(r.run.runId))!);
+        expect((await db.getRun(r.run.runId))!.status).toBe("completed");
+
+        const e = env({ maxConcurrentWorkers: 0 });
+        e.editors.add("editor");
+        install(e, [OWNERS]);
+        const q = (await e.svc.preview("editor", { listId: e.listId, campaignId: CAMPAIGN })) as any;
+        const s2 = (await e.svc.start("editor", go(q.preview.token))) as any;
+        e.deps.resolveKey = async () => ({ ok: false, reason: "key_rejected", message: "rejected" });
+        await e.svc.work((await db.getRun(s2.run.runId))!);
+        expect((await db.getRun(s2.run.runId))!.pauseReason).toBe("key_rejected");
+      });
+
+      it("resume is refused when the connection the member can see is a DIFFERENT owner's than the run's", async () => {
+        const e = env({ maxConcurrentWorkers: 0 });
+        e.editors.add("editor");
+        install(e, [OWNERS]);
+        const p = (await e.svc.preview("editor", { listId: e.listId, campaignId: CAMPAIGN })) as any;
+        const r = (await e.svc.start("editor", go(p.preview.token))) as any;
+        await e.svc.pause("editor", r.run.runId);
+        e.deps.resolveKey = async (_u, a) => ({ ok: true, apiKey: "k", ownerUserId: "someone-else", accountId: a ?? "x", accountName: "x" });
+        expect(await e.svc.resume("editor", r.run.runId)).toMatchObject({ ok: false, status: 403, code: "resume_requires_connection" });
+      });
+
       it("the withdrawal sweep stops opted-out contacts with the KEY OWNER's key, even when a teammate did the push", async () => {
         const e = env();
         e.editors.add("editor");

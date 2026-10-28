@@ -542,6 +542,17 @@ export class SmartleadPushService {
         this.deps.log(`[SmartleadPush] run=${run.runId} paused: the pusher no longer has edit access to the list`);
         return;
       }
+      // A teammate pushing through a shared connection: it must STILL be shared with them. Un-sharing a connection stops the pushes that use it
+      // (the key owner's own resolution below ignores sharing, so it would carry on otherwise). A key that is merely rejected is left to that check.
+      if (run.pushedBy !== run.keyOwnerId) {
+        const usable = await this.deps.resolveKey(run.pushedBy, run.smartleadAccountId);
+        const rejected = !usable.ok && usable.reason === "key_rejected";
+        if (!rejected && (!usable.ok || usable.ownerUserId !== run.keyOwnerId)) {
+          await this.deps.db.pauseRun(run.runId, "connection_unshared", run.leaseEpoch);
+          this.deps.log(`[SmartleadPush] run=${run.runId} paused: the Smartlead connection is no longer shared with the pusher`);
+          return;
+        }
+      }
       const resolved = await this.deps.resolveKey(run.keyOwnerId, run.smartleadAccountId);
       if (!resolved.ok) {
         await this.deps.db.pauseRun(run.runId, resolved.reason === "key_rejected" ? "key_rejected" : "key_unavailable", run.leaseEpoch);
