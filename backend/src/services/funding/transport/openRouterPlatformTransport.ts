@@ -42,12 +42,14 @@ export class OpenRouterPlatformTransport implements LlmTransport {
           const { ms: backoffMs, honoredRetryAfter } = computeBackoff(error, attempt);
           console.warn(
             `AgentMode: OpenRouter call failed with a transient error for model "${model}"; retrying (attempt ${attempt + 1}/${maxAttempts}) after ${backoffMs}ms${honoredRetryAfter ? ' (honoring Retry-After)' : ''}`,
-            {
+            // ENG-2721: single-line JSON so line-based log sinks (CloudWatch) keep
+            // provider + upstream_error on the same line as the message.
+            JSON.stringify({
               error: error instanceof Error ? error.message : String(error),
               // ENG-1712: OpenRouter surfaces the attempted provider/BYOK slot on some
               // error shapes too (varies by failure type); include when present.
               ...normalizeOpenRouterErrorMetadata(error),
-            },
+            }),
           );
           await sleep(backoffMs);
           continue;
@@ -55,11 +57,16 @@ export class OpenRouterPlatformTransport implements LlmTransport {
         break;
       }
     }
-    console.error(`AgentMode: OpenRouter call failed for model "${model}":`, {
-      error: lastError instanceof Error ? lastError.message : String(lastError),
-      stack: lastError instanceof Error ? lastError.stack : undefined,
-      ...normalizeOpenRouterErrorMetadata(lastError),
-    });
+    console.error(
+      `AgentMode: OpenRouter call failed for model "${model}":`,
+      JSON.stringify({
+        error: lastError instanceof Error ? lastError.message : String(lastError),
+        ...normalizeOpenRouterErrorMetadata(lastError),
+      }),
+    );
+    if (lastError instanceof Error && lastError.stack) {
+      console.error(`AgentMode: OpenRouter failure stack for model "${model}":`, lastError.stack);
+    }
     throw lastError;
   }
 }
