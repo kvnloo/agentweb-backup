@@ -188,6 +188,19 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
       }
     });
 
+    it("samples a few contacts' addresses for an approval card: edit access needed, distinct ids, at most three, blanks and missing contacts skipped", async () => {
+      const e = env();
+      e.editors.add("editor");
+      const ids = e.leads.map(l => String(l.leadId));
+      const r = (await e.svc.sampleLeads("editor", e.listId, [ids[0], ids[0], "gone", ...ids.slice(1)])) as any;
+      expect(r.ok).toBe(true);
+      expect(r.emails).toHaveLength(3);
+      expect(new Set(r.emails).size).toBe(3);
+      expect(await e.svc.sampleLeads("stranger", e.listId, ids)).toMatchObject({ ok: false, status: 403 });
+      expect(await e.svc.sampleLeads("editor", e.listId, ["gone"])).toMatchObject({ ok: true, emails: [] });
+      expect(await e.svc.sampleLeads("editor", e.listId, ids, 1)).toMatchObject({ ok: true, emails: [expect.any(String)] });
+    });
+
     it("tells whether the user may push a list, and its name, before anything is previewed or asked", async () => {
       const e = env();
       e.editors.add("editor");

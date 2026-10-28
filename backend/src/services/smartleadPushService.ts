@@ -136,6 +136,21 @@ export class SmartleadPushService {
     });
   }
 
+  /** A few of the contacts' email addresses, for an approval card that must show WHO it is about. Edit access to the list is required. */
+  async sampleLeads(userId: string, listId: unknown, leadIds: string[], max = 3): Promise<Result<{ emails: string[] }>> {
+    return this.guard(async () => {
+      const list = await this.ownList(userId, listId);
+      if (!list.ok) return list;
+      const emails: string[] = [];
+      for (const id of [...new Set(leadIds)]) {
+        if (emails.length >= max) break;
+        const lead = await this.deps.crm.readLeadConsistent(String(listId), id);
+        if (lead && typeof lead.email === "string" && lead.email.trim()) emails.push(lead.email.trim());
+      }
+      return { ok: true as const, emails };
+    });
+  }
+
   /** The pusher's OWN connection only. */
   private async ownKey(userId: string, accountId?: string): Promise<Result<{ key: Extract<ResolvedSmartlead, { ok: true }> }>> {
     let resolved = await this.deps.resolveKey(userId, accountId);

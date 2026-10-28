@@ -235,11 +235,12 @@ emmaToolRegistry.register({
         userId, sessionId, listId: p.listId, campaignId: p.campaignId, campaignStatus: String(preview.campaign.status ?? ''),
         sequenceHash: preview.sequence.hash, cohort: preview.cohort.chosen, eligible: preview.list.eligible, includeUnverified: p.includeUnverified,
         requiresActiveConfirmation: preview.requiresActiveConfirmation === true, mapping: p.mapping, acknowledgedTags: p.acknowledgedTags,
+        fingerprint: preview.fingerprint,
       }),
       question: kind => gate.buildPushQuestion({
         kind, listName, campaignName: preview.campaign.name, campaignStatus: String(preview.campaign.status ?? ''),
         cohort: preview.cohort.chosen, eligible: preview.list.eligible, listTotal: preview.list.total,
-        requiresActiveConfirmation: preview.requiresActiveConfirmation === true, smartleadFilledTags: p.acknowledgedTags, includeUnverified: p.includeUnverified,
+        requiresActiveConfirmation: preview.requiresActiveConfirmation === true, smartleadFilledTags: p.acknowledgedTags, includeUnverified: p.includeUnverified, mapping: p.mapping,
       }),
     });
     if (halt) return halt;
@@ -326,11 +327,12 @@ emmaToolRegistry.register({
     await attendedSession(context);
     const { listName } = unwrap(await svc.canUseList(userId, listId));
     const distinct = [...new Set(ids as string[])];
+    const { emails: sample } = unwrap(await svc.sampleLeads(userId, listId, distinct));
     const halt = await requireApproval({
       context,
       action: 'release',
       digestFor: sessionId => gate.computeReleaseDigest({ userId, sessionId, listId, campaignId, leadIds: distinct }),
-      question: kind => gate.buildReleaseQuestion({ kind, listName, count: distinct.length, campaignId }),
+      question: kind => gate.buildReleaseQuestion({ kind, listName, count: distinct.length, campaignId, sample }),
     });
     if (halt) return halt;
     const released = unwrap(await svc.release(userId, { listId, leadIds: distinct, ...(campaignId ? { campaignId } : {}) }));
