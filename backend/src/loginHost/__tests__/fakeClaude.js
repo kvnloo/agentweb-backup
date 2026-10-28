@@ -15,6 +15,97 @@ const record = (extra) => {
     fs.writeFileSync(cfgDir + "/.fake-last-" + (extra.mode || "x") + ".json", JSON.stringify({ args, env: process.env, cwd: process.cwd(), pid: process.pid, ...extra }));
   } catch {}
 };
+// ── stdio MCP client (ENG-2113): what the real CLI does with a {type:"stdio"} server in --mcp-config ──
+const { spawn: spawnChild } = require("child_process");
+let mcpChild;
+let mcpBuf = "";
+let mcpId = 0;
+const mcpPending = new Map();
+const mcpLog = { lists: [], calls: [], stderr: "", listChanged: 0 };
+const saveMcpLog = () => {
+  try {
+    fs.writeFileSync(cfgDir + "/.fake-mcp-log.json", JSON.stringify(mcpLog));
+  } catch {}
+};
+function mcpSend(o) {
+  mcpChild.stdin.write(JSON.stringify(o) + "\n");
+}
+function mcpRequest(method, params) {
+  const id = ++mcpId;
+  return new Promise((resolve) => {
+    mcpPending.set(id, resolve);
+    mcpSend({ jsonrpc: "2.0", id, method, params });
+  });
+}
+function mcpOnLine(line) {
+  let m;
+  try {
+    m = JSON.parse(line);
+  } catch {
+    return;
+  }
+  if (m.id !== undefined && mcpPending.has(m.id)) {
+    const r = mcpPending.get(m.id);
+    mcpPending.delete(m.id);
+    return r(m);
+  }
+  if (m.method === "notifications/tools/list_changed") {
+    mcpLog.listChanged++;
+    // like the CLI: re-fetch the tool list
+    mcpRequest("tools/list", {}).then((r) => {
+      mcpLog.lists.push((r.result.tools || []).map((t) => t.name));
+      saveMcpLog();
+    });
+  }
+}
+async function mcpStart(def) {
+  const env = { ...process.env, ...(def.env || {}) };
+  // The real unit has the turn's relay directory bind-mounted at /run/aw-relay; the test's stand-in for that bind exports the host directory here.
+  if (env.AW_RELAY_SOCKET === "/run/aw-relay/relay.sock" && process.env.AW_FAKE_RELAY_MOUNT) env.AW_RELAY_SOCKET = process.env.AW_FAKE_RELAY_MOUNT + "/relay.sock";
+  mcpChild = spawnChild(def.command, def.args || [], { env, stdio: ["pipe", "pipe", "pipe"] });
+  mcpLog.shimPid = mcpChild.pid;
+  mcpChild.stdout.on("data", (d) => {
+    mcpBuf += d.toString("utf8");
+    let i;
+    while ((i = mcpBuf.indexOf("\n")) >= 0) {
+      mcpOnLine(mcpBuf.slice(0, i));
+      mcpBuf = mcpBuf.slice(i + 1);
+    }
+  });
+  mcpChild.stderr.on("data", (d) => {
+    mcpLog.stderr += d.toString("utf8");
+    saveMcpLog();
+  });
+  mcpChild.on("exit", () => {
+    mcpLog.exited = true;
+    saveMcpLog();
+  });
+  process.on("exit", () => {
+    try {
+      mcpChild.kill("SIGKILL");
+    } catch {}
+  });
+  const init = await mcpRequest("initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "fake-claude", version: "0" } });
+  mcpSend({ jsonrpc: "2.0", method: "notifications/initialized" });
+  const list = await mcpRequest("tools/list", {});
+  mcpLog.lists.push((list.result.tools || []).map((t) => t.name));
+  mcpLog.serverInfo = init.result && init.result.serverInfo;
+  saveMcpLog();
+}
+let msgN = 0;
+async function mcpToolCall(spec, serverName) {
+  const messageId = spec.messageId || "msg" + ++msgN;
+  const toolUseId = "tu" + messageId + "-" + (mcpLog.calls.length + 1);
+  if (!spec.noStream) out({ type: "assistant", message: { id: messageId, content: [{ type: "tool_use", id: toolUseId, name: "mcp__" + serverName + "__" + spec.name, input: spec.args || {} }] } });
+  if (spec.streamDelayMs) await new Promise((r) => setTimeout(r, spec.streamDelayMs));
+  const t0 = Date.now();
+  const r = await mcpRequest("tools/call", { name: spec.name, arguments: spec.args || {}, ...(spec.progress ? { _meta: { progressToken: "p1" } } : {}) });
+  const res = r.result || {};
+  mcpLog.calls.push({ name: spec.name, ms: Date.now() - t0, isError: res.isError === true, text: (res.content || []).filter((c) => c.type === "text").map((c) => c.text).join(""), images: (res.content || []).filter((c) => c.type === "image").length });
+  saveMcpLog();
+  out({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: toolUseId, is_error: res.isError === true }] } });
+}
+
 const OK_DOCTOR = "Diagnostics\n └ Managed settings (remote): not fetched — requires an Enterprise or Team subscription\n └ Organization policy: not applicable to Pro and Max accounts\n";
 
 if (args[0] === "auth" && args[1] === "login") {
@@ -84,6 +175,8 @@ if (args[0] === "auth" && args[1] === "login") {
       process.stdout.write("x".repeat(scenario.bigline)); // one enormous line, no newline
       await new Promise(() => {});
     }
+    const serverDef = mcp && server && mcp.mcpServers[server];
+    if (serverDef && serverDef.type === "stdio") await mcpStart(serverDef);
     out({ type: "system", subtype: "init", apiKeySource: scenario.apiKeySource || "none", mcp_servers: server ? [{ name: server, status: scenario.mcpStatus || "connected" }] : [] });
     for (const step of scenario.turn || [
       { type: "assistant", message: { id: "m1", content: [{ type: "text", text: "hello" }, { type: "tool_use", id: "tu1", name: "mcp__emma__search", input: { q: "x" } }] } },
@@ -94,6 +187,7 @@ if (args[0] === "auth" && args[1] === "login") {
       if (step.wait) await new Promise((r) => setTimeout(r, step.wait));
       else if (step.hang) await new Promise(() => {});
       else if (step.exit !== undefined) process.exit(step.exit);
+      else if (step.mcpCall) await mcpToolCall(step.mcpCall, server);
       else out(step);
     }
   });
