@@ -11,6 +11,7 @@ const mockStripe = {
   paymentMethods: { list: jest.fn().mockResolvedValue({ data: [{ id: 'pm_test' }] }) },
   invoices: { list: jest.fn() },
   prices: { retrieve: jest.fn() },
+  products: { retrieve: jest.fn() },
 };
 
 jest.mock('stripe', () => jest.fn().mockImplementation(() => mockStripe));
@@ -32,6 +33,7 @@ const KNOWN_TIERS: Record<string, any> = {
   Pro: { allowedPages: ['pro'], allowedSkills: [] },
   Max: { allowedPages: ['max'], allowedSkills: ['*'] },
   'Super Premium': { allowedPages: ['*'], allowedSkills: ['*'] },
+  Free: { allowedPages: ['/'], allowedSkills: [] },
 };
 const mockGetTierConfig = jest.fn(async (name: string) => KNOWN_TIERS[name] ?? null);
 
@@ -86,9 +88,13 @@ describe('resolveSubscriptionTypeForPrice', () => {
     await expect(resolveSubscriptionTypeForPrice({ id: 'price_max', metadata: { plan: 'Max' } })).resolves.toBe('Max');
   });
 
-  it('prefers subscription metadata, then price, then expanded product metadata', async () => {
+  it('prefers price metadata, then product, then subscription metadata', async () => {
+    // A stale subscription label must not override the billed price's label.
     await expect(
-      resolveSubscriptionTypeForPrice({ id: 'price_c', metadata: { plan: 'Pro' } }, { metadata: { plan: 'Max' } }),
+      resolveSubscriptionTypeForPrice({ id: 'price_c', metadata: { plan: 'Max' } }, { metadata: { plan: 'Starter' } }),
+    ).resolves.toBe('Max');
+    await expect(
+      resolveSubscriptionTypeForPrice({ id: 'price_c' }, { metadata: { plan: 'Max' } }),
     ).resolves.toBe('Max');
     await expect(
       resolveSubscriptionTypeForPrice({ id: 'price_c', product: { metadata: { plan: 'Max' } } }),
@@ -106,6 +112,20 @@ describe('resolveSubscriptionTypeForPrice', () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
     await expect(
       resolveSubscriptionTypeForPrice({ id: 'price_c', metadata: { plan: 'Super Premium' } }),
+    ).resolves.toBeNull();
+    warn.mockRestore();
+  });
+
+  it('retrieves an unexpanded product to read its plan label', async () => {
+    mockStripe.products.retrieve.mockResolvedValueOnce({ id: 'prod_c', metadata: { plan: 'Max' } });
+    await expect(resolveSubscriptionTypeForPrice({ id: 'price_c', product: 'prod_c' })).resolves.toBe('Max');
+    expect(mockStripe.products.retrieve).toHaveBeenCalledWith('prod_c');
+  });
+
+  it('never grants Free from metadata on a billed price', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    await expect(
+      resolveSubscriptionTypeForPrice({ id: 'price_c' }, { metadata: { plan: 'Free' } }),
     ).resolves.toBeNull();
     warn.mockRestore();
   });

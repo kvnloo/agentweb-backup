@@ -2228,14 +2228,16 @@ export function deriveSubscriptionTypeFromPriceId(priceId: string): string | nul
   return null;
 }
 
-/** Tiers that must never be granted from Stripe metadata (internal-only). */
-const METADATA_PLAN_DENYLIST: ReadonlySet<string> = new Set(['Super Premium']);
+/** Tiers that must never be granted from Stripe metadata: internal-only tiers,
+ * and Free (a billed subscription can never resolve to the unpaid tier). */
+const METADATA_PLAN_DENYLIST: ReadonlySet<string> = new Set(['Super Premium', 'Free']);
 
 /**
  * ENG-2724: resolve the subscription tier for a Stripe price, falling back to
  * `plan` metadata for prices outside the Starter/Pro env mapping (Max, custom
- * contract prices). Metadata is read from the subscription, then the price,
- * then an expanded product, and is only accepted when it names a tier defined
+ * contract prices). Metadata is read from the price (what is actually billed),
+ * then its product (retrieved when not expanded), then the subscription as a
+ * last resort, so a stale subscription label cannot override the price, and is only accepted when it names a tier defined
  * in AW-Settings `subscription_types` (via getTierConfig). An unmappable price
  * returns null with a warning so callers keep the existing tier.
  */
@@ -2248,10 +2250,17 @@ export async function resolveSubscriptionTypeForPrice(
   const mapped = deriveSubscriptionTypeFromPriceId(priceId);
   if (mapped) return mapped;
 
-  const product = price && typeof price === 'object' && price.product && typeof price.product === 'object'
+  let product: any = price && typeof price === 'object' && price.product && typeof price.product === 'object'
     ? price.product
     : null;
-  const candidates = [subscription?.metadata?.plan, price?.metadata?.plan, product?.metadata?.plan]
+  if (!product && typeof price?.product === 'string' && !price?.metadata?.plan) {
+    try {
+      product = await getStripeOrThrow().products.retrieve(price.product);
+    } catch (err) {
+      console.warn(`[STRIPE] Product lookup failed for ${price.product} (price ${priceId}):`, err);
+    }
+  }
+  const candidates = [price?.metadata?.plan, product?.metadata?.plan, subscription?.metadata?.plan]
     .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
     .map((v) => v.trim());
 
