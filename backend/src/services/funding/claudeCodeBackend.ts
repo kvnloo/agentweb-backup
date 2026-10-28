@@ -28,7 +28,7 @@ import type { ClaudeRunRegistry } from "./claudeRunRegistry";
 import { ClaudeRunConflictError } from "./claudeRunRegistry";
 import { PromptTooLargeError, appendDirective, renderPromptForCli } from "./claudePromptRenderer";
 import { mapLedgerToResponseMessages, type ClaudeTurnUsage } from "./claudeTurnMessages";
-import { ClaudeRouteStopError, fromHostFailure, fromResultErrorKind } from "./claudeRouteErrors";
+import { ClaudeRouteStopError, fromHostFailure, fromResultErrorKind, markTurnToolsRan, turnRanNoTools } from "./claudeRouteErrors";
 import type { AttemptUsage } from "./attemptUsageJournal";
 import type { RunFunding } from "./runFunding";
 
@@ -168,14 +168,16 @@ export class ClaudeCodeBackend {
     } catch (err) {
       if (err instanceof ClaudeRouteStopError) throw err;
       console.error("[claude-backend] turn failed:", err instanceof Error ? err.message : String(err));
-      throw new ClaudeRouteStopError("turn_failed");
+      const stop = new ClaudeRouteStopError("turn_failed");
+      markTurnToolsRan(stop, !turnRanNoTools(err)); // the raw error carries what the run knew; an unmarked one stays "may have run"
+      throw stop;
     }
   }
 
   private async runInner(p: ClaudeTurnParams): Promise<ClaudeTurnResult> {
     const d = this.deps;
     const client = d.hostClient();
-    if (!client) throw new ClaudeRouteStopError("host_unavailable");
+    if (!client) throw noToolsStop("host_unavailable");
 
     // 2. prompt (before anything is opened)
     const ctx = await d.prepareTurnContext({
@@ -195,7 +197,7 @@ export class ClaudeCodeBackend {
     try {
       prompt = renderPromptForCli(d.trimToolMessages(ctx.messages)).prompt;
     } catch (err) {
-      if (err instanceof PromptTooLargeError) throw new ClaudeRouteStopError("context_too_large");
+      if (err instanceof PromptTooLargeError) throw noToolsStop("context_too_large");
       throw err;
     }
 
@@ -216,6 +218,7 @@ export class ClaudeCodeBackend {
     let cancelledByUser = false;
     let previousUnknown = false; // the bridge reported (and cleared) an unfinished action from an earlier turn
     let hostStarted = false; //     the host produced at least one event: the model read the prompt
+    let ledgerShowedCalls = false; // step 6 saw a call record, a call still running, or could not read the ledger (the drain removes it, so remember)
 
     const progress = (status: string, extra: Record<string, unknown> = {}) => {
       if (seen.stopped) return; // nothing is "executing" once the turn was stopped (a failed host call ends the event stream, so no event follows it)
@@ -329,6 +332,7 @@ export class ClaudeCodeBackend {
       const drained = await d.bridge.closeRunAndDrain(runId, d.drainTimeoutMs ?? 10_000);
       opened = false;
       const ledger: BridgeCallRecord[] = drained ? drained.ledger : d.bridge.takeLedger(runId).records;
+      ledgerShowedCalls = ledger.length > 0 || !drained || drained.stillRunning > 0;
       if (!drained || drained.stillRunning > 0) this.watchLate(p, generation, ledger, drained ? drained.stillRunning : undefined);
 
       // 7. map
@@ -384,6 +388,21 @@ export class ClaudeCodeBackend {
         responseMessages: mapped.responseMessages,
         persistedResponseCount: 0,
       };
+    } catch (err) {
+      // Whether this failed turn may have run a tool, kept for the "continue on AgentWeb credits" offer: only a turn that is KNOWN to have run none is
+      // offered a continue (a message answered twice would repeat its actions). Any ledger record, or a ledger that cannot be read, counts as "ran".
+      let ran = true;
+      try {
+        if (!everOpened) ran = false;
+        else {
+          const peek = d.bridge.takeLedger(runId);
+          ran = ledgerShowedCalls || peek.records.length > 0 || peek.truncated > 0 || uses.length > 0;
+        }
+      } catch {
+        ran = true;
+      }
+      markTurnToolsRan(err, ran);
+      throw err;
     } finally {
       // The warning is only spent once the model could have read it. A Stop before the host ran, an admission refusal or a timeout before the
       // first event leave it unspent: put it back for the next turn.
@@ -503,6 +522,13 @@ export class ClaudeCodeBackend {
       console.error("[claude-backend] journal write failed (fail-open):", err instanceof Error ? err.message : String(err));
     }
   }
+}
+
+/** A stop raised before the run opened: nothing could have run. */
+function noToolsStop(code: ConstructorParameters<typeof ClaudeRouteStopError>[0]): ClaudeRouteStopError {
+  const stop = new ClaudeRouteStopError(code);
+  markTurnToolsRan(stop, false);
+  return stop;
 }
 
 export function newClaudeRunId(): string {

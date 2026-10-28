@@ -13,7 +13,8 @@
 // The whole-turn cap is read when the controller loads: 0.3 s makes the real timeout race fire inside a test.
 process.env.AGENT_MODE_GENERATION_TIMEOUT_MS = '300';
 import { Request, Response } from 'express';
-import { agentModeController, activeSessionGenerations } from '../controllers/agentModeController';
+import { markTurnToolsRan } from '../services/funding/claudeRouteErrors';
+import { agentModeController, activeSessionGenerations, generateSessionResponse } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { checkTokenUsage } from '../services/tokenUsageService';
@@ -359,7 +360,209 @@ describe('/generate on the Claude plan route', () => {
       backend.mockRejectedValueOnce(new ClaudeRouteStopError('host_busy'));
       const res = makeRes();
       await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription' }), res);
-      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'host_busy', userMessageSaved: true, canUseAgentWebCredits: false })); // saved message: no offer until a continue option exists
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'host_busy', userMessageSaved: true, canUseAgentWebCredits: false, canContinueSavedMessage: false, agentWebOffer: 'new_message' })); // saved, nothing says no tool ran: only "send as a new message"; never a plain resend
+    });
+
+    it('a stop that is KNOWN to have run no tool is continuable: the note says so and the body offers the continue', async () => {
+      const stop = new ClaudeRouteStopError('host_busy');
+      markTurnToolsRan(stop, false);
+      backend.mockRejectedValueOnce(stop);
+      const res = makeRes();
+      await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription' }), res);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'host_busy', userMessageSaved: true, canUseAgentWebCredits: false, canContinueSavedMessage: true, agentWebOffer: 'continue' }));
+      const note = db.addMessageToSession.mock.calls.map((c) => c[1] as any).find((m) => m?.metadata?.kind === 'claude-plan-stop');
+      expect(note.metadata.resumable).toBe(true);
+    });
+
+    it('a stop after a tool ran is never continuable', async () => {
+      const stop = new ClaudeRouteStopError('turn_failed');
+      markTurnToolsRan(stop, true);
+      backend.mockRejectedValueOnce(stop);
+      const res = makeRes();
+      await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription' }), res);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ userMessageSaved: true, canContinueSavedMessage: false, agentWebOffer: 'new_message' }));
+      const note = db.addMessageToSession.mock.calls.map((c) => c[1] as any).find((m) => m?.metadata?.kind === 'claude-plan-stop');
+      expect(note.metadata.resumable).toBe(false);
+    });
+
+    describe('continueSavedMessage', () => {
+      const note = (over: Record<string, unknown> = {}) => ({ role: 'assistant', content: 'stopped', metadata: { kind: 'claude-plan-stop', isErrorMessage: true, resumable: true, ...over } });
+      const stoppedSession = (messages: unknown[]) => ({ ...SESSION, messages });
+      const refused = (res: Response) => {
+        expect(res.status).toHaveBeenCalledWith(409);
+        expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'CONTINUE_NOT_AVAILABLE' }));
+        expect(db.addMessageToSession).not.toHaveBeenCalled();
+        expect(backend).not.toHaveBeenCalled();
+        expect(worker.runInWorker).not.toHaveBeenCalled();
+      };
+
+      it('answers the saved message on AgentWeb WITHOUT storing the user message a second time', async () => {
+        funding.mockResolvedValue({ route: 'agentweb' });
+        db.getChatSession.mockResolvedValue(stoppedSession([{ role: 'user', content: 'Hello' }, note()]) as any);
+        worker.runInWorker.mockResolvedValueOnce({ content: 'OK', toolCalls: [], knowledgeBaseQueries: [], sources: [], responseMessages: [] } as any);
+        const res = makeRes();
+        await agentModeController.generateResponse(makeReq({ llmModel: 'gpt-5-chat-2', continueSavedMessage: true }), res);
+        expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ content: 'OK' }));
+        expect(worker.runInWorker).toHaveBeenCalledTimes(1);
+        const stored = db.addMessageToSession.mock.calls.map((c) => c[1] as any);
+        expect(stored.filter((m) => m?.role === 'user')).toHaveLength(0);
+        // The continue marker is saved BEFORE anything runs (it ends the "continuable" state until a verdict note follows).
+        expect(stored.some((m) => m?.metadata?.kind === 'claude-plan-continue')).toBe(true);
+        // The guard that skips the save reads the chat strongly consistent (a stale read could skip the save of a message that is not stored).
+        expect(db.getChatSession.mock.calls.filter((c) => c[0] === 's1' && c[1] === true).length).toBeGreaterThanOrEqual(2);
+        // The model gets the saved message once: the plan-stop note under it is not part of the history it is given.
+        const history = JSON.stringify(worker.runInWorker.mock.calls[0]);
+        expect(history).not.toContain('claude-plan-stop');
+      });
+
+      it('the continue marker and the stop notes are not part of the history the model gets (the saved message is the last thing it sees)', async () => {
+        funding.mockResolvedValue({ route: 'agentweb' });
+        const marker = { role: 'assistant', content: 'Continuing your last message.', metadata: { kind: 'claude-plan-continue', isErrorMessage: true } };
+        db.getChatSession.mockImplementation((async (_id: string, consistent?: boolean) =>
+          consistent ? stoppedSession([{ role: 'user', content: 'Hello' }, note()]) : stoppedSession([{ role: 'user', content: 'Hello' }, note(), marker])) as any);
+        worker.runInWorker.mockResolvedValueOnce({ content: 'OK', toolCalls: [], knowledgeBaseQueries: [], sources: [], responseMessages: [] } as any);
+        await agentModeController.generateResponse(makeReq({ llmModel: 'gpt-5-chat-2', continueSavedMessage: true }), makeRes());
+        const sent = JSON.stringify(worker.runInWorker.mock.calls[0]);
+        expect(sent).not.toContain('claude-plan-continue');
+        expect(sent).not.toContain('claude-plan-stop');
+        expect(sent).toContain('Hello');
+      });
+
+      it('answers the saved message on the plan again (a retry) without storing it a second time', async () => {
+        db.getChatSession.mockResolvedValue(stoppedSession([{ role: 'user', content: 'Hello' }, note()]) as any);
+        backend.mockResolvedValueOnce(planResult());
+        const res = makeRes();
+        await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription', continueSavedMessage: true }), res);
+        expect(backend).toHaveBeenCalledTimes(1);
+        expect(db.addMessageToSession.mock.calls.map((c) => c[1] as any).filter((m) => m?.role === 'user')).toHaveLength(0);
+      });
+
+      it('a normal send of the same text still stores the user message (the skip is only for a continue)', async () => {
+        funding.mockResolvedValue({ route: 'agentweb' });
+        db.getChatSession.mockResolvedValue(stoppedSession([{ role: 'user', content: 'Hello' }, note()]) as any);
+        worker.runInWorker.mockResolvedValueOnce({ content: 'OK', toolCalls: [], knowledgeBaseQueries: [], sources: [], responseMessages: [] } as any);
+        await agentModeController.generateResponse(makeReq({ llmModel: 'gpt-5-chat-2' }), makeRes());
+        expect(db.addMessageToSession.mock.calls.map((c) => c[1] as any).filter((m) => m?.role === 'user')).toHaveLength(1);
+      });
+
+      it('is refused when the stop is not marked resumable (a tool may have run)', async () => {
+        db.getChatSession.mockResolvedValue(stoppedSession([{ role: 'user', content: 'Hello' }, note({ resumable: false })]) as any);
+        const res = makeRes();
+        await agentModeController.generateResponse(makeReq({ llmModel: 'gpt-5-chat-2', continueSavedMessage: true }), res);
+        refused(res);
+      });
+
+      it('is refused when nothing was saved (no stop note), when the text differs, and when the chat moved on', async () => {
+        for (const messages of [[], [{ role: 'user', content: 'Hello' }], [{ role: 'user', content: 'Something else' }, note()], [{ role: 'user', content: 'Hello' }, note(), { role: 'assistant', content: 'answered' }]]) {
+          jest.clearAllMocks();
+          db.getChatSession.mockResolvedValue(stoppedSession(messages) as any);
+          const res = makeRes();
+          await agentModeController.generateResponse(makeReq({ llmModel: 'gpt-5-chat-2', continueSavedMessage: true }), res);
+          refused(res);
+        }
+      });
+
+      it('the turn itself re-checks right before it skips the save: a chat that changed after the request check never skips it', async () => {
+        db.getChatSession.mockResolvedValue(stoppedSession([{ role: 'user', content: 'Hello' }, note(), { role: 'assistant', content: 'answered in another tab' }]) as any);
+        await expect(
+          generateSessionResponse('s1', 'Hello', 'u1', 'gpt-5-chat-2', undefined, undefined, undefined, false, undefined, undefined, undefined, undefined, undefined, undefined, 'resume-saved'),
+        ).rejects.toThrow('RESUME_SAVED_MESSAGE_NOT_AVAILABLE');
+        expect(db.addMessageToSession).not.toHaveBeenCalled();
+      });
+
+      it('a chat that changes between the request check and the turn is a typed 409: no error note, no diagnosis agent, nothing saved, lock released', async () => {
+        funding.mockResolvedValue({ route: 'agentweb' });
+        const good = stoppedSession([{ role: 'user', content: 'Hello' }, note()]);
+        const moved = stoppedSession([{ role: 'user', content: 'Hello' }, note(), { role: 'assistant', content: 'answered in another tab' }]);
+        let consistentReads = 0;
+        db.getChatSession.mockImplementation((async (_id: string, consistent?: boolean) => (consistent ? (++consistentReads === 1 ? good : moved) : good)) as any);
+        const res = makeRes();
+        await agentModeController.generateResponse(makeReq({ llmModel: 'gpt-5-chat-2', continueSavedMessage: true }), res);
+        expect(res.status).toHaveBeenCalledWith(409);
+        expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'CONTINUE_NOT_AVAILABLE' }));
+        expect(db.addMessageToSession).not.toHaveBeenCalled();
+        expect(agentModeService.generateDiagnosticMessage).not.toHaveBeenCalled();
+        expect(worker.runInWorker).not.toHaveBeenCalled();
+        expect(activeSessionGenerations.has('s1')).toBe(false);
+      });
+
+      it('a plan-route continue that loses that race is the same 409, not a plan stop that claims nothing was saved', async () => {
+        const good = stoppedSession([{ role: 'user', content: 'Hello' }, note()]);
+        const moved = stoppedSession([{ role: 'user', content: 'Hello' }, note(), { role: 'assistant', content: 'answered in another tab' }]);
+        let consistentReads = 0;
+        db.getChatSession.mockImplementation((async (_id: string, consistent?: boolean) => (consistent ? (++consistentReads === 1 ? good : moved) : good)) as any);
+        const res = makeRes();
+        await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription', continueSavedMessage: true }), res);
+        expect(res.status).toHaveBeenCalledWith(409);
+        expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'CONTINUE_NOT_AVAILABLE' }));
+        expect(backend).not.toHaveBeenCalled();
+      });
+
+      it('a continue whose marker cannot be saved does not start (409), and a read that fails is also a 409', async () => {
+        funding.mockResolvedValue({ route: 'agentweb' });
+        db.getChatSession.mockResolvedValue(stoppedSession([{ role: 'user', content: 'Hello' }, note()]) as any);
+        db.addMessageToSession.mockRejectedValueOnce(new Error('dynamo down'));
+        let res = makeRes();
+        await agentModeController.generateResponse(makeReq({ llmModel: 'gpt-5-chat-2', continueSavedMessage: true }), res);
+        expect(res.status).toHaveBeenCalledWith(409);
+        expect(worker.runInWorker).not.toHaveBeenCalled();
+        jest.clearAllMocks();
+        db.getChatSession.mockImplementation((async (_id: string, consistent?: boolean) => {
+          if (consistent) throw new Error('dynamo down');
+          return stoppedSession([{ role: 'user', content: 'Hello' }, note()]);
+        }) as any);
+        res = makeRes();
+        await agentModeController.generateResponse(makeReq({ llmModel: 'gpt-5-chat-2', continueSavedMessage: true }), res);
+        expect(res.status).toHaveBeenCalledWith(409);
+        expect(db.addMessageToSession).not.toHaveBeenCalled();
+      });
+
+      it('a stop before the continue starts (the plan is not reachable) still says the message is saved and continuable, never a plain resend', async () => {
+        db.getChatSession.mockResolvedValue(stoppedSession([{ role: 'user', content: 'Hello' }, note()]) as any);
+        funding.mockRejectedValueOnce(new ClaudeRouteStopError('host_unavailable'));
+        const res = makeRes();
+        await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription', continueSavedMessage: true }), res);
+        expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'host_unavailable', userMessageSaved: true, canUseAgentWebCredits: false, canContinueSavedMessage: true, agentWebOffer: 'continue' }));
+        expect(db.addMessageToSession).not.toHaveBeenCalled();
+      });
+
+      it('a nothing-saved stop is still a plain resend, and a stop with no AgentWeb offer has no offer', async () => {
+        funding.mockRejectedValueOnce(new ClaudeRouteStopError('host_unavailable'));
+        let res = makeRes();
+        await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription' }), res);
+        expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ userMessageSaved: false, canUseAgentWebCredits: true, canContinueSavedMessage: false, agentWebOffer: 'resend' }));
+        funding.mockRejectedValueOnce(new ClaudeRouteStopError('not_enabled'));
+        res = makeRes();
+        await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription' }), res);
+        expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ canUseAgentWebCredits: false, agentWebOffer: null }));
+      });
+
+      it('a stop that cannot be retried or offered (context too large) is not continuable either', async () => {
+        const stop = new ClaudeRouteStopError('context_too_large');
+        markTurnToolsRan(stop, false);
+        backend.mockRejectedValueOnce(stop);
+        const res = makeRes();
+        await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription' }), res);
+        expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'context_too_large', userMessageSaved: true, canContinueSavedMessage: false, agentWebOffer: null }));
+      });
+
+      it('is refused together with attachments, an answer or a deck', async () => {
+        db.getChatSession.mockResolvedValue(stoppedSession([{ role: 'user', content: 'Hello' }, note()]) as any);
+        for (const extra of [{ attachments: [{ url: 'u', filename: 'f' }] }, { questionAnswer: { questionId: 'q', answer: 'a' } }, { deckCancel: { deckId: 'd' } }]) {
+          jest.clearAllMocks();
+          const res = makeRes();
+          await agentModeController.generateResponse(makeReq({ llmModel: 'gpt-5-chat-2', continueSavedMessage: true, ...extra }), res);
+          refused(res);
+        }
+      });
+
+      it('only a literal true counts (a truthy string does not skip the save)', async () => {
+        funding.mockResolvedValue({ route: 'agentweb' });
+        db.getChatSession.mockResolvedValue(stoppedSession([{ role: 'user', content: 'Hello' }, note()]) as any);
+        worker.runInWorker.mockResolvedValueOnce({ content: 'OK', toolCalls: [], knowledgeBaseQueries: [], sources: [], responseMessages: [] } as any);
+        await agentModeController.generateResponse(makeReq({ llmModel: 'gpt-5-chat-2', continueSavedMessage: 'true' }), makeRes());
+        expect(db.addMessageToSession.mock.calls.map((c) => c[1] as any).filter((m) => m?.role === 'user')).toHaveLength(1);
+      });
     });
 
     it('the whole-turn cap ends a turn that never answers: the real race fires, the turn is cancelled, and it is the fixed timeout note', async () => {
@@ -369,7 +572,7 @@ describe('/generate on the Claude plan route', () => {
       expect(requestCancel).toHaveBeenCalledWith('s1');
       expect(worker.cancelSession).toHaveBeenCalledWith('s1');
       expect(res.status).toHaveBeenCalledWith(504);
-      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'turn_timeout', funding: 'claude_subscription', userMessageSaved: true, retryable: false, canUseAgentWebCredits: false }));
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'turn_timeout', funding: 'claude_subscription', userMessageSaved: true, retryable: false, canUseAgentWebCredits: false, canContinueSavedMessage: false, agentWebOffer: null }));
       const note = db.addMessageToSession.mock.calls.map((c) => c[1] as any).find((m) => m?.metadata?.kind === 'claude-plan-stop');
       expect(note).toMatchObject({ metadata: { code: 'turn_timeout', isErrorMessage: true } });
       expect(emitProgress).toHaveBeenCalledWith('s1', { iteration: 0, status: 'complete' }); // the progress stream is closed, not left "generating"
@@ -385,7 +588,7 @@ describe('/generate on the Claude plan route', () => {
       const res = makeRes();
       await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription' }), res);
       expect(res.status).toHaveBeenCalledWith(502);
-      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'turn_failed', funding: 'claude_subscription', userMessageSaved: true, canUseAgentWebCredits: false }));
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'turn_failed', funding: 'claude_subscription', userMessageSaved: true, canUseAgentWebCredits: false, canContinueSavedMessage: false, agentWebOffer: 'new_message' }));
       expect(JSON.stringify((res.json as jest.Mock).mock.calls)).not.toContain('secret-ish');
       expect(agentModeService.generateDiagnosticMessage).not.toHaveBeenCalled();
       expect(worker.runInWorker).not.toHaveBeenCalled();
