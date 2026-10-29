@@ -39,7 +39,7 @@ describe('claude plan stops', () => {
   it('tools_too_large_for_plan: the exact copy (pending Manan OK), not retryable, AgentWeb credits offered', () => {
     const e = new ClaudeRouteStopError('tools_too_large_for_plan');
     expect(claudeStopBody(e)).toEqual({
-      error: 'One of the tools connected to your account is too large to use with your Claude plan. Disconnect or shorten it in Settings, or continue on AgentWeb credits.',
+      error: "A tool connected to your account can't be used with your Claude plan. Disconnect it in Settings, or continue on AgentWeb credits.",
       code: 'tools_too_large_for_plan',
       funding: 'claude_subscription',
       retryable: false,
@@ -49,7 +49,7 @@ describe('claude plan stops', () => {
 
   it('tools_unavailable_for_plan: the exact copy (pending Manan OK), retryable, AgentWeb credits offered', () => {
     expect(claudeStopBody(new ClaudeRouteStopError('tools_unavailable_for_plan'))).toEqual({
-      error: "We couldn't load your tools for your Claude plan just now. Please try again in a moment, or continue on AgentWeb credits.",
+      error: "We couldn't prepare your tools for your Claude plan. Please try again, or continue on AgentWeb credits.",
       code: 'tools_unavailable_for_plan',
       funding: 'claude_subscription',
       retryable: true,
