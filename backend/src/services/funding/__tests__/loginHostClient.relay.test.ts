@@ -8,12 +8,13 @@ import { join } from 'path';
 import type { ProviderEvent } from '../../../loginHost/adapter';
 import { startHostServer, type HostServerHandle } from '../../../loginHost/server';
 import { makeRig, turnReq, type Rig } from '../../../loginHost/__tests__/helpers';
+import { TOOL_LIMITS } from '../../../loginHost/protocol';
 import { LoginHostClient, LoginHostError, ToolResultLostError, UnixSocketTransport, type HostTransport } from '../loginHostClient';
 
 const TOOLS = [
   { name: 'search', description: 'Search', inputSchema: { type: 'object', properties: {} } },
-  { name: 'late_tool', description: 'after install', inputSchema: { type: 'object', properties: {} }, locked: true },
 ];
+const LATE = { name: 'late_tool', description: 'after install', inputSchema: { type: 'object', properties: {} } };
 const callEvent = (op: string): ProviderEvent => ({ type: 'tool-call', operationId: op, messageId: 'm1', name: 'search', input: { q: 'x' } });
 
 describe('login host client: the tool relay wire', () => {
@@ -77,11 +78,11 @@ describe('login host client: the tool relay wire', () => {
     expect(rig.script.turnInputs).toHaveLength(0);
   });
 
-  it('turnToolResult carries content, isError, images and unlock to the provider and resolves {ok:true}', async () => {
+  it('turnToolResult carries content, isError, images and new tool definitions to the provider and resolves {ok:true}', async () => {
     const { stream, it } = await firstCall();
     const images = [{ mimeType: 'image/png' as const, data: 'AAAAAAAA' }];
-    expect(await client.turnToolResult({ ...ids, operationId: 'op1', content: 'found it', isError: true, images, unlock: ['late_tool'] })).toEqual({ ok: true });
-    expect(rig.script.answers).toEqual([{ operationId: 'op1', answer: { kind: 'tool-result', ok: false, content: 'found it', images, unlock: ['late_tool'] } }]);
+    expect(await client.turnToolResult({ ...ids, operationId: 'op1', content: 'found it', isError: true, images, tools: [LATE] })).toEqual({ ok: true });
+    expect(rig.script.answers).toEqual([{ operationId: 'op1', answer: { kind: 'tool-result', ok: false, content: 'found it', images, tools: [LATE] } }]);
     gate();
     expect((await it.next()).value).toMatchObject({ type: 'result', ok: true });
     stream.close();
@@ -142,13 +143,28 @@ describe('login host client: the tool relay wire', () => {
     stream.close();
   });
 
-  it('an unlock naming a tool that is not locked is EINVALID and leaves the operation pending, so a corrected answer is accepted', async () => {
+  it('definitions the host refuses are EINVALID tools_invalid / tools_limit and leave the operation pending, so the answer can be re-sent without them', async () => {
     const { stream } = await firstCall();
-    const err = await client.turnToolResult({ ...ids, operationId: 'op1', content: 'x', unlock: ['search'] }).catch((e) => e);
-    expect(err).toBeInstanceOf(LoginHostError);
-    expect(err).toMatchObject({ code: 'EINVALID', detail: 'unlock_unknown_tool' });
-    expect(await client.turnToolResult({ ...ids, operationId: 'op1', content: 'x', unlock: ['late_tool'] })).toEqual({ ok: true });
+    const dup = await client.turnToolResult({ ...ids, operationId: 'op1', content: 'x', tools: [{ ...LATE, name: 'SEARCH' }] }).catch((e) => e); // differs from a sent name only in case
+    expect(dup).toBeInstanceOf(LoginHostError);
+    expect(dup).toMatchObject({ code: 'EINVALID', detail: 'tools_invalid' });
+    const many = Array.from({ length: TOOL_LIMITS.maxTools }, (_, i) => ({ ...LATE, name: `t_${i}` }));
+    const over = await client.turnToolResult({ ...ids, operationId: 'op1', content: 'x', tools: many }).catch((e) => e);
+    expect(over).toMatchObject({ code: 'EINVALID', detail: 'tools_limit' });
+    expect(await client.turnToolResult({ ...ids, operationId: 'op1', content: 'x' })).toEqual({ ok: true });
     stream.close();
+  });
+
+  it('a name already sent is a no-op: the same definition twice is accepted', async () => {
+    const { stream, it } = await firstCall();
+    expect(await client.turnToolResult({ ...ids, operationId: 'op1', content: 'x', tools: [LATE, LATE] })).toEqual({ ok: true });
+    gate();
+    await it.next();
+    stream.close();
+  });
+
+  it('the turn.run manifest has no `locked` and a leftover `locked` is refused', async () => {
+    await expect(client.turnRun({ ...(relayReq() as object), tools: [{ ...TOOLS[0], locked: true }] } as never)).rejects.toThrow();
   });
 
   it('our own schema refuses an oversized image set before a round trip', async () => {

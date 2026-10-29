@@ -1,15 +1,32 @@
 /** ENG-2113 tool relay: the manifest the backend sends in turn.run `tools`. */
-import { TOOL_LIMITS } from '../../../loginHost/protocol';
+import { TOOL_LIMITS, TOOL_NAME_MAX_CHARS } from '../../../loginHost/protocol';
 import { buildRelayManifest, manifestCut, manifestProblem, relayName, toToolDef } from '../relayManifest';
 
 const tool = (name: string, extra: Record<string, unknown> = {}) => ({ name, description: `${name} d`, inputSchema: { type: 'object', properties: {} }, ...extra });
 
 describe('relayName', () => {
   // The host's widened pattern: letters of both cases, digits, _ and -, 1-64 chars, no leading '-'. Identity mapping, so these ARE the names the CLI calls.
-  it.each(['search', 'get_crm_leads', 'a1_b2', 'Search', 'HubSpot-Contacts', 'call-meta', '_private', 'x'.repeat(64), 'aw-relay_x'])('accepts %s', (n) =>
+  it.each(['search', 'get_crm_leads', 'a1_b2', 'Search', 'HubSpot-Contacts', 'call-meta', '_private', 'x'.repeat(TOOL_NAME_MAX_CHARS), 'aw-relay_x'])('accepts %s', (n) =>
     expect(relayName(n)).toBe(true));
-  it.each(['', '-leading', 'x'.repeat(65), 'aw_relay_x', 'AW_Relay_x', 'aw_relay_', 'a b', 'tool.name', 'a/b', 'ünïcode', 'a\nb', 5, undefined])('rejects %p', (n) =>
+  it.each(['', '-leading', 'x'.repeat(TOOL_NAME_MAX_CHARS + 1), 'aw_relay_x', 'AW_Relay_x', 'aw_relay_', 'a b', 'tool.name', 'a/b', 'ünïcode', 'a\nb', 5, undefined])('rejects %p', (n) =>
     expect(relayName(n)).toBe(false));
+});
+
+describe('tool name length (the host constant, 64 minus the qualifying prefix)', () => {
+  beforeEach(() => void jest.spyOn(console, 'error').mockImplementation(() => {}));
+  afterEach(() => jest.restoreAllMocks());
+  it('a name of exactly TOOL_NAME_MAX_CHARS is offered; one more character is refused like any unmappable name', () => {
+    expect(TOOL_NAME_MAX_CHARS).toBe(53);
+    const ok = 'a'.repeat(TOOL_NAME_MAX_CHARS);
+    const tooLong = 'a'.repeat(TOOL_NAME_MAX_CHARS + 1);
+    expect(relayName(ok)).toBe(true);
+    expect(relayName(tooLong)).toBe(false);
+    const m = buildRelayManifest([tool(ok), tool(tooLong)]);
+    expect(m.tools.map((t) => t.name)).toEqual([ok]);
+    expect(m.skipped).toEqual({ name: 1 });
+    expect(manifestCut(m)).toBe(true);
+    expect(toToolDef(tool(tooLong))).toEqual({ skip: 'name' });
+  });
 });
 
 describe('buildRelayManifest', () => {
@@ -24,7 +41,7 @@ describe('buildRelayManifest', () => {
   });
 
   it('skips (never rewrites) names the relay cannot carry, and counts them by reason', () => {
-    const m = buildRelayManifest([tool('ok_tool'), tool('Has-Upper'), tool('my.tool'), tool('-x'), tool('x'.repeat(65)), tool('aw_relay_evil'), tool('ok_tool')]);
+    const m = buildRelayManifest([tool('ok_tool'), tool('Has-Upper'), tool('my.tool'), tool('-x'), tool('x'.repeat(TOOL_NAME_MAX_CHARS + 1)), tool('aw_relay_evil'), tool('ok_tool')]);
     expect(m.tools.map((t) => t.name)).toEqual(['ok_tool', 'Has-Upper']);
     expect(m.skipped).toEqual({ name: 3, reserved: 1, duplicate: 1 });
     expect(manifestCut(m)).toBe(true);
