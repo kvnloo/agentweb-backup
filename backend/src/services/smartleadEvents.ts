@@ -106,7 +106,7 @@ export function parseSmartleadEvent(body: unknown): ParseResult {
   // With no time or id in the payload, the body itself identifies the delivery (a retry sends the same body); otherwise two different replies
   // from one contact would share a key and the second would be dropped as a duplicate.
   const identity = occurredAt || sequence || messageId ? "" : createHash("sha256").update(canonicalJson(body)).digest("hex");
-  const eventId = str(b.event_id);
+  const eventId = typeof b.event_id === "number" ? String(b.event_id) : str(b.event_id);
   // With an event id, ONLY it (plus the kind and campaign) decides the key: nothing else in a retried delivery can change it.
   const eventKey = createHash("sha256").update(JSON.stringify(eventId ? [kind, campaignId, eventId] : [kind, campaignId, candidateEmails[0], occurredAt ?? "", sequence, messageId, identity])).digest("hex").slice(0, 32);
 
