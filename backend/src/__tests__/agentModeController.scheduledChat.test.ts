@@ -1865,6 +1865,24 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         await new Promise((r) => setImmediate(r));
         expect(mockFileAutoIssue).toHaveBeenCalledTimes(1);
       });
+
+      it('still files an auto-issue on a first-attempt worker crash (not a drain)', async () => {
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(
+          new Error('Worker process exited with code 137')
+        );
+        (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([
+          { role: 'user', content: 'Distribute the issue.' },
+        ]);
+
+        await runScheduledChat(
+          { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 0 } as any,
+          mockUserId,
+          false
+        );
+
+        await new Promise((r) => setImmediate(r));
+        expect(mockFileAutoIssue).toHaveBeenCalledTimes(1);
+      });
     });
 
     it('should still requeue after zero assistant output even when persisting the job-incomplete message fails', async () => {
