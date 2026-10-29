@@ -44,8 +44,9 @@ export type EngagementSignalName =
   | 'email_opened'
   | 'email_clicked'
   | 'email_unsubscribed'
-  | 'email_bounced'
-  | 'retargeting_audience_added';
+  | 'email_bounced';
+// ENG-2740: `retargeting_audience_added` dropped — no platform-owned retargeting audience sync exists.
+// Re-add it (one fire-and-forget emit + mocked test) when one ships.
 
 /** ENG-2686: account lifecycle inside the app. */
 export type AppSignalName =
