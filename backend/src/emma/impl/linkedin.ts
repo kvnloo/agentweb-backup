@@ -1168,6 +1168,15 @@ export async function linkedinOutreach(
   // is threaded into every read-action response below so callers can caveat
   // or refuse degree-based logic instead of silently trusting it.
   const READ_ACTIONS_WITH_FALLBACK = ['get-profile', 'search-people', 'get-company', 'search-parameters', 'list-post-engagers'];
+  // ENG-2739: validate post_id before account resolution/session preflight so a
+  // missing post id is reported as such, not as a disconnected account, and no
+  // Unipile call is spent on it.
+  if (action === 'list-post-engagers' && !(typeof args.post_id === 'string' && args.post_id.trim())) {
+    return {
+      success: false,
+      error: 'post_id is required for list-post-engagers (a LinkedIn post URL, urn:li:activity:… URN, or Unipile social id)',
+    };
+  }
   let usedSharedAccount = false;
   if (READ_ACTIONS_WITH_FALLBACK.includes(action)) {
     if (!account_id) {

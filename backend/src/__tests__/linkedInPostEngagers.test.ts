@@ -158,6 +158,13 @@ describe("linkedinOutreach action 'list-post-engagers' (AC #1-#4)", () => {
     expect(listPostComments).not.toHaveBeenCalled();
   });
 
+  it('reports a missing post_id before resolving any account', async () => {
+    const res = await linkedinOutreach(callLLM, 'user-1', { action: 'list-post-engagers' });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/post_id is required for list-post-engagers/);
+    expect(listPostComments).not.toHaveBeenCalled();
+  });
+
   it('surfaces a Unipile error from the service as a failed result', async () => {
     const err: any = new Error('Post not found');
     err.structuredError = { classification: 'NOT_FOUND', status: 404, message: 'Post not found' };
