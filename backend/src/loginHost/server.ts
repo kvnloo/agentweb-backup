@@ -18,7 +18,7 @@ import { connect } from "net";
 import { ZodError } from "zod";
 import type { ConnectionManager } from "./connectionManager";
 import type { Logger } from "./ports";
-import { HostError, HTTP_STATUS, LOCAL_ONLY_ROUTES, maxBodyBytes, PROTOCOL_VERSION, ROUTES, type RouteName } from "./protocol";
+import { DEFAULT_MAX_BODY_BYTES, HostError, HTTP_STATUS, LOCAL_ONLY_ROUTES, maxBodyBytes, PROTOCOL_VERSION, ROUTES, type RouteName } from "./protocol";
 
 /** A request body that stops arriving for this long is dropped (slowloris). */
 const BODY_IDLE_MS = 15_000;
@@ -145,7 +145,13 @@ export async function startHostServer(manager: ConnectionManager, opts: HostServ
     tlsServer = secure;
     tlsPort = (secure.address() as { port: number }).port;
   }
-  const tick = setInterval(() => manager.tick(), opts.tickMs ?? 5_000);
+  const tick = setInterval(() => {
+    try {
+      manager.tick();
+    } catch {
+      opts.log?.warn("host_tick_failed"); // a failing tick must not be an uncaught exception (it would end the host for every customer); the next tick tries again
+    }
+  }, opts.tickMs ?? 5_000);
   const sweep = setInterval(() => void manager.sweep().catch(() => undefined), opts.sweepMs ?? 60_000);
   tick.unref();
   sweep.unref();
@@ -211,7 +217,10 @@ async function handle(manager: ConnectionManager, req: IncomingMessage, res: Ser
 
   let body: unknown;
   try {
-    body = JSON.parse(await readBody(req, bodyIdleMs, maxBodyBytes(route)));
+    const text = await readBody(req, bodyIdleMs, maxBodyBytes(route));
+    body = JSON.parse(text);
+    // turn.run's cap is 8 MiB only for the relay shape (a manifest rides along); the LEGACY shape (no `tools`) keeps exactly protocol 3's 5 MiB. The upload is already complete here.
+    if (route === "turn.run" && Buffer.byteLength(text) > DEFAULT_MAX_BODY_BYTES && !(body !== null && typeof body === "object" && "tools" in body)) throw new HostError("EINVALID", "too_large");
   } catch (err) {
     if (err instanceof HostError) {
       sendError(res, err, err.detail === "too_large" ? 413 : undefined);
@@ -285,7 +294,15 @@ async function streamTurn(m: ConnectionManager, input: never, res: ServerRespons
     for await (const ev of started.events) {
       if (res.destroyed) break;
       // Backpressure: wait for a slow reader to drain instead of buffering without bound.
-      if (!res.write(JSON.stringify(ev) + "\n")) {
+      let line: string;
+      try {
+        line = JSON.stringify(ev) + "\n";
+      } catch {
+        // An event that cannot be serialized (data from a customer's unit or CLI): end the turn instead of throwing out of the stream.
+        m.abortTurn((input as { connectionId: string }).connectionId, started.turnId, "event_unserializable");
+        break;
+      }
+      if (!res.write(line)) {
         // A reader that stops draining must not park the turn (and its slot) forever: cut the stream after stallMs.
         await new Promise<void>((resolve) => {
           const stall = setTimeout(() => res.destroy(), stallMs);

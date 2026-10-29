@@ -20,6 +20,7 @@ import {
   type RunnerChild,
 } from "../../services/funding/claudeCliRunner";
 import { CODE_PATTERN, extractAuthorizeUrl, MAX_LOGIN_OUTPUT_CHARS } from "../../services/funding/claudeLoginParse";
+import type { Logger } from "../ports";
 import type {
   ServerRequestAnswer,
   TurnInput,
@@ -37,10 +38,11 @@ import type {
 } from "../adapter";
 import { qualifiedToolPrefix, RELAY_MCP_SERVER_NAME } from "../protocol";
 import { RELAY_SOCKET_IN_UNIT } from "../ports/unitArgs";
+import { approxJsonBytes, LogThrottle, MAX_CLI_LINE_DEPTH, MAX_FORWARDED_DEPTH, valueDepthExceeds } from "../relay/bounds";
 import { canonicalJson } from "../relay/canonical";
 import { createHash } from "crypto";
 import type { RelayCall, RelayEndpoint, RelayHost } from "../relay/relayServer";
-import { classifyFailureText, failureClassToKind, normalizeClaudeEvent, parseAuthStatus, parseDoctorHazards, usageFromResult } from "./claudeParse";
+import { MAX_CLASSIFY_CHARS, classifyFailureText, failureClassToKind, normalizeClaudeEvent, parseAuthStatus, parseDoctorHazards, usageFromResult } from "./claudeParse";
 
 export interface ClaudeAdapterConfig {
   /** Pinned binary: absolute path, `--version` output and content digest, verified by the host at startup (never recomputed per call). */
@@ -58,6 +60,8 @@ export interface ClaudeAdapterConfig {
   relay?: { host: RelayHost; shimPath: string; nodePath: string };
   /** How long a relayed call waits for the stream to show its model message id before it is emitted without one (default 2 s). */
   messageIdWaitMs?: number;
+  /** Secret-free structured logging (fixed codes only). Without it nothing is logged. */
+  log?: Pick<Logger, "warn">;
   models?: Iterable<string>;
   /** PATH inside customer processes (default a fixed system path; the host's own PATH is never used). */
   basePath?: string;
@@ -106,6 +110,7 @@ export class RunnerChildAdapter extends EventEmitter implements RunnerChild {
   constructor(
     private readonly child: ChildLike,
     maxLineBytes: number,
+    onDeepLine?: () => void,
   ) {
     super();
     this.stdin = child.stdin;
@@ -113,10 +118,14 @@ export class RunnerChildAdapter extends EventEmitter implements RunnerChild {
     let done!: () => void;
     this.exited = new Promise<void>((r) => (done = r));
     // The runner's line reader buffers a whole line: a CLI that never prints a newline must not grow the host's memory without bound.
-    this.stdout = new LineLimit(maxLineBytes, () => {
-      this.kill();
-      this.emit("error", new Error("stdout_line_too_long"));
-    });
+    this.stdout = new LineLimit(
+      maxLineBytes,
+      () => {
+        this.kill();
+        this.emit("error", new Error("stdout_line_too_long"));
+      },
+      onDeepLine,
+    );
     child.stdout.on("error", () => undefined);
     child.stdout.pipe(this.stdout);
     child.onExit((code, signal) => {
@@ -142,13 +151,26 @@ export class RunnerChildAdapter extends EventEmitter implements RunnerChild {
   }
 }
 
-/** Passes bytes through and calls `onOverflow` once if a single line (bytes since the last newline) exceeds `max`; nothing after that is forwarded. */
+const LINE_DROPPED = Buffer.from("\n{\"type\":\"aw_line_dropped\"}\n");
+
+/**
+ * Passes bytes through and calls `onOverflow` once if a single line (bytes since the last newline) exceeds `max`; nothing after that is forwarded.
+ * It ALSO bounds the JSON nesting of every line BEFORE the runner parses it: a line nested deeper than MAX_CLI_LINE_DEPTH (real events are a handful of levels
+ * deep) is cut where it passes the limit, the rest of it is discarded up to its newline and replaced by a fixed placeholder line, and `onDeep` is called. A
+ * megabytes-deep line would otherwise cost the host seconds of event-loop time in JSON.parse. One pass over the bytes, no recursion; the scanner state
+ * (depth, in-string, escape) survives chunk boundaries.
+ */
 class LineLimit extends Transform {
   private run = 0;
   private tripped = false;
+  private depth = 0;
+  private inString = false;
+  private esc = false;
+  private dropping = false;
   constructor(
     private readonly max: number,
     private readonly onOverflow: () => void,
+    private readonly onDeep: () => void = () => undefined,
   ) {
     super();
   }
@@ -163,7 +185,44 @@ class LineLimit extends Transform {
       this.onOverflow();
       return cb();
     }
-    cb(null, chunk);
+    const out: Buffer[] = [];
+    let start = 0; // start of the bytes still to be forwarded
+    for (let i = 0; i < chunk.length; i++) {
+      if (this.dropping) {
+        const nl = chunk.indexOf(10, i);
+        if (nl < 0) {
+          start = chunk.length;
+          break;
+        }
+        this.dropping = false;
+        this.depth = 0;
+        this.inString = false;
+        this.esc = false;
+        start = nl + 1;
+        i = nl;
+        continue;
+      }
+      const c = chunk[i];
+      if (c === 10) {
+        this.depth = 0;
+        this.inString = false;
+        this.esc = false;
+      } else if (this.inString) {
+        if (this.esc) this.esc = false;
+        else if (c === 0x5c) this.esc = true;
+        else if (c === 0x22) this.inString = false;
+      } else if (c === 0x22) this.inString = true;
+      else if (c === 0x7b || c === 0x5b) {
+        if (++this.depth > MAX_CLI_LINE_DEPTH) {
+          out.push(chunk.subarray(start, i), LINE_DROPPED); // what came before this point, the line ended, a placeholder
+          this.dropping = true;
+          start = chunk.length;
+          this.onDeep();
+        }
+      } else if ((c === 0x7d || c === 0x5d) && this.depth > 0) this.depth--;
+    }
+    if (start < chunk.length) out.push(chunk.subarray(start));
+    cb(null, out.length === 1 ? out[0] : Buffer.concat(out));
   }
 }
 
@@ -230,7 +289,7 @@ export class ClaudeAdapter implements SubscriptionProviderAdapter {
   readonly models: ReadonlySet<string>;
 
   private readonly logins = new WeakMap<LoginProcess, LoginState>();
-  private readonly cfg: Required<Omit<ClaudeAdapterConfig, "binary" | "models" | "relay">> & Pick<ClaudeAdapterConfig, "binary" | "relay">;
+  private readonly cfg: Required<Omit<ClaudeAdapterConfig, "binary" | "models" | "relay" | "log">> & Pick<ClaudeAdapterConfig, "binary" | "relay" | "log">;
 
   constructor(config: ClaudeAdapterConfig) {
     this.cfg = { ...DEFAULTS, ...stripUndefined(config) } as ClaudeAdapter["cfg"];
@@ -413,7 +472,7 @@ export class ClaudeAdapter implements SubscriptionProviderAdapter {
 
   mapError(raw: unknown): ErrorKind {
     if (raw instanceof ClaudeCliTurnError) return "transient";
-    const message = raw instanceof Error ? raw.message : typeof raw === "string" ? raw : "";
+    const message = (raw instanceof Error ? raw.message : typeof raw === "string" ? raw : "").slice(0, MAX_CLASSIFY_CHARS); // bounded: the patterns below must never scan CLI-controlled text of any length
     if (/mcp server .* is not connected|stdout_line_too_long/i.test(message)) return "transient";
     if ((raw as { code?: string } | null)?.code === "open_failed") return "transient";
     return failureClassToKind(classifyFailureText(message)); // never auth_dead: host faults must not park a healthy login
@@ -448,11 +507,15 @@ interface LoginState {
 }
 
 /** Cheap size estimate of one normalized event (the text it carries plus a fixed overhead); exactness is not needed for a memory bound. */
-function approxSize(ev: ProviderEvent): number {
+function approxSize(ev: ProviderEvent, measuredBytes?: number): number {
   if (ev.type === "text") return 64 + ev.delta.length;
-  if (ev.type === "tool-use" || ev.type === "tool-call") return 128 + JSON.stringify(ev.input ?? null).length;
+  // NEVER JSON.stringify an input here: it is the shim's (tool-call) or the CLI's (tool-use) data, and a deeply nested value makes stringify throw a RangeError, which
+  // from a timer or an event handler is an uncaught exception that ends the whole host. A tool-call uses the frame size the relay already measured.
+  if (ev.type === "tool-call") return 128 + (measuredBytes ?? approxJsonBytes(ev.input, MAX_EVENT_BYTES));
+  if (ev.type === "tool-use") return 128 + approxJsonBytes(ev.input, MAX_EVENT_BYTES);
   return 256;
 }
+const MAX_EVENT_BYTES = 16 * 1024 * 1024;
 
 function stripUndefined<T extends object>(o: T): Partial<T> {
   return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined)) as Partial<T>;
@@ -487,6 +550,7 @@ class ClaudeSession implements ProviderSession {
           const child = new RunnerChildAdapter(
             ctx.spawnAs({ file: cfg.turnWrapperPath, args: [s.file, ...s.args], env: s.env as Record<string, string>, cwd: s.cwd, ...(this.relayEp ? { relayDir: this.relayEp.dir } : {}) }),
             cfg.maxLineBytes,
+            () => this.noteDeepLine(),
           );
           this.exits.push(child.exited);
           return child;
@@ -496,6 +560,16 @@ class ClaudeSession implements ProviderSession {
         buildEnv: (configDir, home) => allowlistedEnv(cfg.basePath, configDir, home, { TMPDIR: cfg.unitTmp, ...(this.relayEp ? { AW_TURN_TOOLS: "1" } : {}) }), // the wrapper reads the tool manifest line and removes the variable
       },
     });
+  }
+
+  private readonly deepLineLog = new LogThrottle(3, 60_000);
+  /** A line of the CLI's stdout nested too deeply was dropped (see LineLimit): one fixed-code line, throttled; the customer's process is not otherwise punished. */
+  private noteDeepLine(): void {
+    try {
+      if (this.deepLineLog.check("cli_line_too_deep").log) this.cfg.log?.warn("cli_line_too_deep");
+    } catch {
+      /* logging is best effort */
+    }
   }
 
   /** Lazy: the process starts with the turn (it needs that turn's token and model), so there is nothing to check yet. */
@@ -509,7 +583,12 @@ class ClaudeSession implements ProviderSession {
    */
   answer(operationId: string, answer: ServerRequestAnswer): boolean {
     if (!this.relayEp || answer.kind !== "tool-result") return false;
-    const sent = this.relayEp.answer(operationId, { content: answer.content, isError: !answer.ok, ...(answer.images ? { images: answer.images } : {}), ...(answer.tools ? { tools: answer.tools } : {}) });
+    let sent: boolean;
+    try {
+      sent = this.relayEp.answer(operationId, { content: answer.content, isError: !answer.ok, ...(answer.images ? { images: answer.images } : {}), ...(answer.tools ? { tools: answer.tools } : {}) });
+    } catch {
+      return false; // fails closed: the caller reports the result as lost
+    }
     if (sent) for (const t of answer.tools ?? []) this.visibleTools.add(t.name); // the shim lists them now: the host must accept calls to them
     return sent;
   }
@@ -548,6 +627,8 @@ class ClaudeSession implements ProviderSession {
   private flushWaiting(force: boolean): void {
     const w = this.waiting;
     if (!w || !this.events) return;
+    // A call is EXECUTED by the backend: its input is forwarded exactly or not at all (never replaced by a marker). The relay already refused deeper frames; this is the check.
+    if (valueDepthExceeds(w.call.args, MAX_FORWARDED_DEPTH)) throw new Error("args_too_deep");
     const key = digest(canonicalJson(w.call.args));
     const exact = this.streamUses.find((u) => u.name === w.call.name && u.key === key);
     const byName = this.streamUses.filter((u) => u.name === w.call.name);
@@ -559,16 +640,36 @@ class ClaudeSession implements ProviderSession {
     // Without a match the id is unique to this call, so the backend never collapses it with another one (a duplicate EXECUTION is worse than a missed collapse).
     const messageId = hit?.messageId ?? `unmatched-${w.call.operationId.slice(0, 16)}`;
     const ev: ProviderEvent = { type: "tool-call", operationId: w.call.operationId, messageId, name: w.call.name, input: w.call.args };
-    this.events.push(ev, approxSize(ev));
+    this.events.push(ev, approxSize(ev, w.call.bytes + 64));
     if (this.events.overflowed) void this.close();
+  }
+
+  /**
+   * Runs relay work that follows shim- or CLI-controlled input. Nothing here may throw into a timer or an event handler (an uncaught exception ends the whole
+   * host for every customer): on any failure the pending call is answered with an internal error and the endpoint is closed (the shim loses its socket, the
+   * turn carries on without tools). The log line carries a fixed code only.
+   */
+  private guarded(operationId: string | undefined, fn: () => void): void {
+    try {
+      fn();
+    } catch {
+      try {
+        if (operationId) this.relayEp?.reject(operationId, "internal");
+        if (this.waiting) clearTimeout(this.waiting.timer);
+        this.waiting = undefined;
+        void this.relayEp?.close().catch(() => undefined);
+      } catch {
+        /* closing is best effort; the turn ends with its process */
+      }
+    }
   }
 
   private onRelayCall(call: RelayCall): void {
     if (this.closing || this.interrupted || !this.events) return;
-    const timer = setTimeout(() => this.flushWaiting(true), this.cfg.messageIdWaitMs);
+    const timer = setTimeout(() => this.guarded(call.operationId, () => this.flushWaiting(true)), this.cfg.messageIdWaitMs);
     timer.unref?.();
     this.waiting = { call, timer };
-    this.flushWaiting(false);
+    this.guarded(call.operationId, () => this.flushWaiting(false));
   }
 
   private onRelayCallEnded(operationId: string): void {
@@ -628,7 +729,7 @@ class ClaudeSession implements ProviderSession {
       this.runner
         .send(this.handle, input.prompt, {
           onEvent: (raw) => {
-            this.noteStreamUse(raw);
+            this.guarded(this.waiting?.call.operationId, () => this.noteStreamUse(raw));
             for (const ev of normalizeClaudeEvent(raw)) events.push(ev, approxSize(ev));
             if (events.overflowed) void this.close(); // the consumer is not keeping up: end the process rather than buffer without bound
           },

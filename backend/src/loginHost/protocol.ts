@@ -88,7 +88,14 @@ export const TOOL_LIMITS = {
   maxDescriptionBytes: 48 * 1024,
   maxSchemaBytes: 32 * 1024,
 } as const;
-const byteLen = (v: unknown): number => Buffer.byteLength(JSON.stringify(v), "utf8");
+/** Serialized size; a value that cannot be serialized (nested past the stack, from a hostile body) is infinitely large, so it is refused instead of throwing. */
+const byteLen = (v: unknown): number => {
+  try {
+    return Buffer.byteLength(JSON.stringify(v), "utf8");
+  } catch {
+    return Infinity;
+  }
+};
 
 /** A tool definition as the CLI sees it. */
 export const toolDef = z

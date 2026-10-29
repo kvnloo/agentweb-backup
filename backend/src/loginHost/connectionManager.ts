@@ -24,7 +24,7 @@
 import { createHash } from "crypto";
 import type { Hazard, LoginProcess, ProviderEvent, ProviderSession, SubscriptionProviderAdapter } from "./adapter";
 import { admitNewTools, HostError, RELAY_FRAME_LIMITS, type RouteInput, type ToolDef, type VisibleTools, visibleFromManifest } from "./protocol";
-import { canonicalJson } from "./relay/canonical";
+import { canonicalDigest } from "./relay/canonical";
 import { resultFrameBytes } from "./relay/relayServer";
 import type { Clock, IdGen, Logger, UserFsPort } from "./ports";
 import { noopLogger } from "./ports";
@@ -449,7 +449,7 @@ export class ConnectionManager {
     // connection state synchronously before their first await.
     const st = this.state();
     const key = `turn:${req.connectionId}:${req.idempotencyKey}`;
-    const hash = hashOf({ c: req.connectionId, e: req.epoch, t: req.turnId, p: req.prompt, m: req.model, pr: req.priority ?? "interactive", ...(req.tools ? { tl: hashOf(canonicalJson(req.tools)) } : {}) });
+    const hash = hashOf({ c: req.connectionId, e: req.epoch, t: req.turnId, p: req.prompt, m: req.model, pr: req.priority ?? "interactive", ...(req.tools ? { tl: canonicalDigest(req.tools) } : {}) });
     const prior = st.idempotency[key];
     if (prior) {
       if (prior.requestHash !== hash) throw new HostError("EEXISTS");

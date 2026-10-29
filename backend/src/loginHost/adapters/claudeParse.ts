@@ -5,6 +5,10 @@
  */
 import type { AuthStatus, ErrorKind, Hazard, ProviderEvent } from "../adapter";
 import { stripAnsi } from "../../services/funding/claudeLoginParse";
+import { boundedValue } from "../relay/bounds";
+
+/** Ids and names forwarded from the CLI's stream: an event with a longer one is dropped (informational events only). */
+const MAX_FIELD_CHARS = 256;
 
 /** `claude auth status` JSON (verified on 2.1.294: signed in => loggedIn + subscriptionType; logged out => loggedIn:false, exit 1). */
 export function parseAuthStatus(stdout: string): AuthStatus | undefined {
@@ -74,7 +78,7 @@ export function normalizeClaudeEvent(raw: Record<string, unknown>): ProviderEven
         const b = asRecord(block);
         if (!b) continue;
         if (b.type === "text" && typeof b.text === "string" && b.text.length > 0) out.push({ type: "text", delta: b.text });
-        else if (b.type === "tool_use" && typeof b.id === "string" && typeof b.name === "string") out.push({ type: "tool-use", operationId: b.id, name: b.name, input: b.input });
+        else if (b.type === "tool_use" && typeof b.id === "string" && typeof b.name === "string" && b.id.length <= MAX_FIELD_CHARS && b.name.length <= MAX_FIELD_CHARS) out.push({ type: "tool-use", operationId: b.id, name: b.name, input: boundedValue(b.input) }); // informational only: a hostile CLI's deep or huge input becomes a fixed marker before it is forwarded to the backend
       }
       return out;
     }
@@ -84,7 +88,7 @@ export function normalizeClaudeEvent(raw: Record<string, unknown>): ProviderEven
       const out: ProviderEvent[] = [];
       for (const block of content) {
         const b = asRecord(block);
-        if (b?.type === "tool_result" && typeof b.tool_use_id === "string") out.push({ type: "tool-result", operationId: b.tool_use_id, ok: b.is_error !== true });
+        if (b?.type === "tool_result" && typeof b.tool_use_id === "string" && b.tool_use_id.length <= MAX_FIELD_CHARS) out.push({ type: "tool-result", operationId: b.tool_use_id, ok: b.is_error !== true });
       }
       return out;
     }
@@ -147,8 +151,10 @@ export type FailureClass = "auth_like" | "usage_limit" | "transient" | "unknown"
  * `claude auth status` before reporting `auth_dead`, because a refresh that failed on the network prints
  * similar words.
  */
+/** The failure text comes from the customer's CLI (any length up to the line cap): the patterns below have unbounded gaps, so only a bounded head is ever searched (no quadratic scan). */
+export const MAX_CLASSIFY_CHARS = 8192;
 export function classifyFailureText(text: string): FailureClass {
-  const t = text.toLowerCase();
+  const t = text.slice(0, MAX_CLASSIFY_CHARS).toLowerCase();
   if (/(session|weekly|opus|sonnet|usage) limit|rate[_ ]limit|\b429\b|quota|credits? (are )?(required|exhausted)/.test(t)) return "usage_limit";
   if (/not logged in|please run \/login|oauth[^.]*\b(expired|revoked|invalid)|authentication_error|invalid (api key|credentials)|session expired|\b401\b/.test(t)) return "auth_like";
   if (/overloaded|\b5\d\d\b|econn|etimedout|enotfound|socket hang up|network|timed? ?out|stream[^.]*(closed|disconnect)|temporar/.test(t)) return "transient";
