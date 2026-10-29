@@ -119,6 +119,7 @@ function previewSummary(p: any) {
     warnings: p.preflight.warnings,
     fieldsToDecide: p.preflight.tagsToMap,
     campaignAlreadySending: p.requiresActiveConfirmation === true,
+    sendingWithNoUnsubscribeLink: p.requiresUnsubscribeAcknowledgement === true,
     canStart: p.canStart === true,
   };
 }
@@ -239,19 +240,19 @@ emmaToolRegistry.register({
       digestFor: sessionId => gate.computePushDigest({
         userId, sessionId, listId: p.listId, campaignId: p.campaignId, campaignStatus: String(preview.campaign.status ?? ''),
         sequenceHash: preview.sequence.hash, cohort: preview.cohort.chosen, eligible: preview.list.eligible, includeUnverified: p.includeUnverified,
-        requiresActiveConfirmation: preview.requiresActiveConfirmation === true, mapping: p.mapping, acknowledgedTags: p.acknowledgedTags,
+        requiresActiveConfirmation: preview.requiresActiveConfirmation === true, requiresUnsubscribeAcknowledgement: preview.requiresUnsubscribeAcknowledgement === true, mapping: p.mapping, acknowledgedTags: p.acknowledgedTags,
         fingerprint: preview.fingerprint,
       }),
       question: kind => gate.buildPushQuestion({
         kind, listName, campaignName: preview.campaign.name, campaignStatus: String(preview.campaign.status ?? ''),
         cohort: preview.cohort.chosen, eligible: preview.list.eligible, listTotal: preview.list.total,
-        requiresActiveConfirmation: preview.requiresActiveConfirmation === true, smartleadFilledTags: p.acknowledgedTags, includeUnverified: p.includeUnverified, mapping: p.mapping, connection: { name: preview.connection.name, shared: preview.connection.shared },
+        requiresActiveConfirmation: preview.requiresActiveConfirmation === true, requiresUnsubscribeAcknowledgement: preview.requiresUnsubscribeAcknowledgement === true, smartleadFilledTags: p.acknowledgedTags, includeUnverified: p.includeUnverified, mapping: p.mapping, connection: { name: preview.connection.name, shared: preview.connection.shared },
       }),
     });
     if (halt) return halt;
     const started = unwrap(await svc.start(userId, {
       token: preview.token,
-      acknowledgements: { lawfulBasis: true, ...(preview.requiresActiveConfirmation ? { activeConfirmed: true } : {}) },
+      acknowledgements: { lawfulBasis: true, ...(preview.requiresActiveConfirmation ? { activeConfirmed: true } : {}), ...(preview.requiresUnsubscribeAcknowledgement ? { noUnsubscribeAccepted: true } : {}) },
     }, { channel: 'agent' }));
     return {
       success: true,

@@ -16,6 +16,8 @@ export class FakeSmartlead {
   emails = new Map<string, string>();
   posts: string[][] = [];
   status = "DRAFTED";
+  /** The campaign's own add_unsubscribe_tag setting. */
+  addUnsubscribeTag = true;
   sequences: unknown[] | null = SEQUENCE;
   campaignMissing = false;
   failNext: unknown[] = [];
@@ -25,8 +27,10 @@ export class FakeSmartlead {
   limitExhausted = false;
   tallies: Partial<SmartleadAddLeadsResult["skippedBy"]> = {};
   extraOther: Record<string, string> = {};
-  /** Emails Smartlead lists under "existing in other campaigns" but does NOT add (what `skipped_in_other_campaign_count` might mean). */
+  /** Emails Smartlead lists under "existing in other campaigns" and does NOT add (verified live: what `skipped_in_other_campaign_count` counts). */
   skipButListOther = new Set<string>();
+  /** Emails Smartlead skips WITHOUT adding or naming them (block list, bounce list...): only its tallies say why. */
+  silentSkip = new Set<string>();
   onPost?: () => void | Promise<void>;
   async addLeads(leads: SmartleadLeadInput[]): Promise<SmartleadAddLeadsResult> {
     const failure = this.failNext.shift();
@@ -38,13 +42,16 @@ export class FakeSmartlead {
     const listedOther: Record<string, string> = {};
     for (const l of leads) {
       if (this.skipButListOther.has(l.email)) { listedOther[l.email] = "5000"; continue; }
+      if (this.silentSkip.has(l.email)) continue;
       if (this.invalid.has(l.email)) continue;
       if (this.emails.has(l.email)) existing[l.email] = this.emails.get(l.email)!;
       else { const id = String(9000 + this.emails.size); this.emails.set(l.email, id); newly[l.email] = id; added++; }
     }
+    // Counted BEFORE dropping names from the map: a dropped lead is still added or already there, Smartlead just does not name it.
+    const alreadyInCampaign = Object.keys(existing).length;
     for (const e of this.dropFromMap) { delete newly[e]; delete existing[e]; }
     return {
-      submitted: leads.length, added, alreadyInCampaign: Object.keys(existing).length, skipped: leads.length - added,
+      submitted: leads.length, added, alreadyInCampaign, skipped: leads.length - added,
       skippedBy: { invalidEmail: 0, alreadyInCampaign: 0, blockList: 0, duplicate: 0, inOtherCampaign: 0, unsubscribed: 0, bounced: 0, importStopped: 0, ...this.tallies },
       invalidEmails: [...this.invalid].filter(e => leads.some(l => l.email === e)), unsubscribedEmails: [], limitExhausted: this.limitExhausted,
       ...(this.omitMap ? {} : { leads: { newlyAdded: newly, existingInCampaign: existing, existingInOtherCampaigns: { ...this.extraOther, ...listedOther } } }),
