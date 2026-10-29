@@ -7592,6 +7592,36 @@ export const crmDb = {
     }
   },
 
+  /**
+   * Every lead with this address across all lists (ENG-673, Smartlead events), all pages, newest first. `findLeadsByEmail` stops at 10 rows,
+   * which is right for "the freshest match" but would miss a pushed contact who is in more than 10 lists. Capped so one address can never turn
+   * into an unbounded read. Same cross-tenant index: the caller must prove ownership of every row it acts on.
+   */
+  async findAllLeadsByEmail(email: string, maxItems = 200) {
+    const value = (email ?? '').trim().toLowerCase();
+    if (!value) return [];
+    try {
+      const items: any[] = [];
+      let startKey: any = undefined;
+      do {
+        const result: any = await dynamodb.query({
+          TableName: `${TABLE_PREFIX}AW-Leads`,
+          IndexName: 'EmailLookupIndex',
+          KeyConditionExpression: 'email = :email',
+          ExpressionAttributeValues: { ':email': value },
+          ScanIndexForward: false,
+          ...(startKey ? { ExclusiveStartKey: startKey } : {}),
+        }).promise();
+        items.push(...(result.Items || []));
+        startKey = result.LastEvaluatedKey;
+      } while (startKey && items.length < maxItems);
+      return items.slice(0, maxItems);
+    } catch (error) {
+      handleDynamoDbError(error, 'findAllLeadsByEmail');
+      throw error;
+    }
+  },
+
   async findLeadsByLinkedin(linkedin: string) {
     const value = (linkedin ?? '').trim();
     if (!value) return [];
