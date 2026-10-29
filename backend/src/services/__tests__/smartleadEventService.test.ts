@@ -104,6 +104,18 @@ describe("applying a Smartlead event to the CRM (ENG-673)", () => {
     expect(w.statusWrites).toHaveLength(1);
   });
 
+  it("keeps free text out of a bounce or unsubscribe engagement (the CRM reads words like 'received' in event data as engagement); the reason lives only in the status note", async () => {
+    const w = world();
+    await make(w).handle(ctx, bounce({ reason: "Message not received by the remote server" }));
+    const data = w.appended[0].eventData;
+    expect(Object.keys(data).sort()).toEqual(["campaignId", "smartleadEventKey", "source"]);
+    expect(JSON.stringify(data)).not.toMatch(/received|replied|clicked/i);
+    expect(w.statusWrites[0].contactStatusNote).toContain("not received");
+    const w2 = world();
+    await make(w2).handle(ctx, unsub());
+    expect(JSON.stringify(w2.appended[0].eventData)).not.toMatch(/Q4/); // the campaign's name is not carried either
+  });
+
   it("a temporary bounce is recorded but does not block", async () => {
     const w = world();
     await make(w).handle(ctx, bounce({ reason: "Mailbox full, try again later" }));

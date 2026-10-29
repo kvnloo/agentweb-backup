@@ -12,6 +12,8 @@ describe("parsing a Smartlead event (ENG-673)", () => {
     for (const n of ["EMAIL_BOUNCE", "LEAD_BOUNCED", "email.bounce"]) expect(kindOf(n)).toBe("bounce");
     for (const n of ["LEAD_UNSUBSCRIBED", "EMAIL_UNSUBSCRIBED", "lead unsubscribed"]) expect(kindOf(n)).toBe("unsubscribe");
     for (const n of ["EMAIL_SENT", "LEAD_CATEGORY_UPDATED", "CAMPAIGN_STATUS_CHANGED", "", undefined, 5, null]) expect(kindOf(n)).toBeUndefined();
+    // a longer name that merely CONTAINS a word is a different event
+    for (const n of ["EMAIL_REPLY_CATEGORY_UPDATED", "LEAD_UNSUBSCRIBED_FROM_LIST_CHANGED", "BOUNCE_RATE_ALERT", "constructor", "__proto__", "toString"]) expect(kindOf(n)).toBeUndefined();
   });
 
   it("reads a reply: the contact is the sender, the subject and time are kept", () => {
@@ -41,6 +43,26 @@ describe("parsing a Smartlead event (ENG-673)", () => {
     expect(ok({ event_type: "EMAIL_BOUNCE", campaign_id: 5, lead_email: "a@b.co", bounce_type: "hard", reason: "Mailbox full" }).soft).toBe(false); // an explicit hard wins
     expect(ok({ event_type: "EMAIL_BOUNCE", campaign_id: 5, lead_email: "a@b.co" }).soft).toBe(false); // unknown: treated as hard, the safe side for an opt-out
     expect(ok({ event_type: "EMAIL_BOUNCE", campaign_id: 5, lead_email: "a@b.co", reason: "550 user unknown" }).reason).toBe("550 user unknown");
+  });
+
+  it("never calls a permanent failure temporary, even when its text has a 4xx-looking number or the words 'try again'", () => {
+    const soft = (reason: string) => ok({ event_type: "EMAIL_BOUNCE", campaign_id: 5, lead_email: "a@b.co", reason }).soft;
+    expect(soft("450 4.2.2 mailbox busy, try again later")).toBe(true);
+    expect(soft("452 4.2.2 over quota")).toBe(true);
+    expect(soft("Mailbox full")).toBe(true);
+    expect(soft("554 5.7.1 message size 450 bytes rejected")).toBe(false);
+    expect(soft("Permanent failure, do not try again")).toBe(false);
+    expect(soft("550 5.1.1 user unknown, try again later")).toBe(false);
+    expect(soft("The recipient mailbox does not exist")).toBe(false);
+    expect(soft("Delivery has failed")).toBe(false); // no clear sign of a temporary problem: treated as permanent
+  });
+
+  it("a payload with no time or id still gets a key that tells two different replies apart and survives a retry", () => {
+    const a = { event_type: "EMAIL_REPLY", campaign_id: 5, from_email: "a@b.co", subject: "first" };
+    const b = { event_type: "EMAIL_REPLY", campaign_id: 5, from_email: "a@b.co", subject: "second" };
+    expect(ok(a).eventKey).toBe(ok({ ...a }).eventKey);
+    expect(ok(a).eventKey).toBe(ok({ subject: "first", from_email: "a@b.co", campaign_id: 5, event_type: "EMAIL_REPLY" }).eventKey); // field order does not matter
+    expect(ok(a).eventKey).not.toBe(ok(b).eventKey);
   });
 
   it("only a bounce can be soft", () => {
