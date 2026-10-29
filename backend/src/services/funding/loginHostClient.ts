@@ -17,6 +17,7 @@ import { z } from "zod";
 import type { ProviderEvent } from "../../loginHost/adapter";
 import type { LoginReady, LoginStartResult } from "../../loginHost/connectionManager";
 import { jsonTooDeep } from "./jsonDepthGuard";
+import { LineSplitter } from "./ndjsonLines";
 import { ROUTES, type HostErrorCode, type RouteInput, type RouteName } from "../../loginHost/protocol";
 
 const HOST_CODES: ReadonlySet<string> = new Set<HostErrorCode>(["EINVALID", "ENOTFOUND", "ESTALE", "ESTATE", "EBUSY", "EEXISTS", "EUNSUPPORTED", "EHAZARD", "EINTERNAL"]);
@@ -248,16 +249,11 @@ class NodeTransport implements HostTransport {
             return;
           }
           const lines = (async function* (): AsyncGenerator<unknown> {
-            let buf = "";
+            const splitter = new LineSplitter(maxLine, () => new LoginHostError("BAD_RESPONSE", "too_large"));
             res.setEncoding("utf8");
             try {
               for await (const chunk of res as AsyncIterable<string>) {
-                buf += chunk;
-                let nl: number;
-                while ((nl = buf.indexOf("\n")) >= 0) {
-                  const line = buf.slice(0, nl);
-                  buf = buf.slice(nl + 1);
-                  if (!line) continue;
+                for (const line of splitter.push(chunk)) {
                   // A line nested deeper than anything legitimate is dropped unparsed (JSON.parse would stall the event loop) and ends the stream.
                   if (jsonTooDeep(line)) throw tooDeep(line.length);
                   let parsed: unknown;
@@ -268,7 +264,6 @@ class NodeTransport implements HostTransport {
                   }
                   yield parsed;
                 }
-                if (buf.length > maxLine) throw new LoginHostError("BAD_RESPONSE", "too_large");
               }
             } catch (e) {
               // A cut connection ends the stream as an error the caller treats as "outcome unknown".

@@ -21,6 +21,11 @@ describe('jsonTooDeep', () => {
     expect(jsonTooDeep('{"a":'.repeat(65) + '1' + '}'.repeat(65))).toBe(true);
     expect(jsonTooDeep('[{"a":'.repeat(33) + '1' + '}]'.repeat(33))).toBe(true); // 66
   });
+  it('Buffer path: an escaped quote does not end a string, brackets inside strings never count', () => {
+    expect(jsonTooDeep(Buffer.from('{"s":"a\\"' + '['.repeat(100) + '"}'))).toBe(false);
+    expect(jsonTooDeep(Buffer.from(JSON.stringify({ s: '\\"' + '['.repeat(100) })))).toBe(false);
+    expect(jsonTooDeep(Buffer.from('{"s":"a\\\\"' + ',"t":' + '['.repeat(70) + '}'))).toBe(true); // an escaped backslash does end at the next quote
+  });
   it('depth is nesting, not count: many siblings are fine', () => {
     expect(jsonTooDeep('[' + '[1],'.repeat(100_000) + '[2]]')).toBe(false);
     expect(jsonTooDeep(JSON.stringify(Array.from({ length: 5000 }, (_, i) => ({ i, a: [1, 2, { b: [] }] }))))).toBe(false);
