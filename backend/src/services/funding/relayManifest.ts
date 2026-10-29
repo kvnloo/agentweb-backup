@@ -8,23 +8,21 @@
  * which is a bijection by construction and needs no table that could drift. A name that does not fit is SKIPPED (never rewritten: a rewrite could collide with
  * another tool), counted, and logged by reason only. The same predicate decides, on a `tool-call`, whether a name can be mapped back.
  *
- * Tools that only become available after `install_skills` are included from the start as `locked` (the host reveals them when a result carries `unlock`).
- * Nothing here trusts the CLI: the dispatcher re-validates every call against the bridge's CURRENT list.
+ * Like Emma (which starts a chat with only the foundation tools plus `install_skills` and adds a skill's tools when the model installs it), the manifest is
+ * the run's OPEN tool list at turn start, nothing else. Tools that become available later travel in the `tools` of the `turn.toolResult` of the call that made
+ * them available (`toToolDef` builds each definition with the same rules). Nothing here trusts the CLI: the dispatcher re-validates every call against the
+ * bridge's CURRENT list.
  */
 import { RELAY_RESERVED_PREFIX, TOOL_LIMITS, TOOL_NAME, toolManifest, type ToolDef } from "../../loginHost/protocol";
 import type { BridgeTool } from "./toolBridge";
 
 export const EMPTY_TOOL_SCHEMA = { type: "object", properties: {} } as const;
-/** The tool the model uses to get more tools; it must always survive the size caps. */
-export const INSTALL_TOOL = "install_skills";
 
 export type SkipReason = "name" | "reserved" | "duplicate" | "schema_not_object" | "schema_too_large" | "manifest_full" | "manifest_too_large";
 
 export interface RelayManifest {
   tools: ToolDef[];
-  /** Names the manifest marks `locked`. */
-  locked: ReadonlySet<string>;
-  /** Names offered from the start. */
+  /** Names offered at turn start. */
   open: ReadonlySet<string>;
   skipped: Partial<Record<SkipReason, number>>;
   /** Descriptions cut to the byte limit (the tool is offered, with less text than an AgentWeb turn shows). */
@@ -41,7 +39,7 @@ export function relayName(name: unknown): name is string {
 function truncateUtf8(text: string, maxBytes: number): string {
   if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
   let out = Buffer.from(text, "utf8").subarray(0, maxBytes).toString("utf8");
-  while (out.endsWith("�")) out = out.slice(0, -1); // a cut multi-byte character
+  while (out.endsWith("\ufffd")) out = out.slice(0, -1); // a cut multi-byte character
   return out;
 }
 
@@ -49,71 +47,54 @@ function isObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
+/** One bridge tool as a relay definition, or the reason it cannot be offered. A description over the limit is cut and reported (`truncated`). */
+export function toToolDef(tool: BridgeTool): { def: ToolDef; truncated: boolean } | { skip: SkipReason } {
+  const name = tool?.name;
+  if (!relayName(name)) return { skip: typeof (name as unknown) === "string" && String(name).toLowerCase().startsWith(RELAY_RESERVED_PREFIX) && TOOL_NAME.safeParse(name).success ? "reserved" : "name" };
+  let schema: Record<string, unknown>;
+  if (tool.inputSchema === undefined || tool.inputSchema === null || !isObject(tool.inputSchema)) schema = { ...EMPTY_TOOL_SCHEMA };
+  else if (tool.inputSchema.type === "object") schema = tool.inputSchema;
+  else return { skip: "schema_not_object" };
+  if (byteLen(schema) > TOOL_LIMITS.maxSchemaBytes) return { skip: "schema_too_large" };
+  const full = typeof tool.description === "string" ? tool.description : "";
+  const description = truncateUtf8(full, TOOL_LIMITS.maxDescriptionBytes);
+  return { def: { name, description, inputSchema: schema }, truncated: description !== full };
+}
+
 /**
- * `open`: the run's current tool list. `candidates`: tools the run could have after a skill install (they are marked `locked` unless already open).
- * Throws only if the finished manifest fails the protocol's own schema (a bug: the caller turns it into a typed stop).
+ * `open`: the run's tool list at turn start. Every tool that cannot be offered whole is counted in `skipped` / `truncated`; the caller refuses the turn then
+ * (never a degraded manifest). The host folds case for duplicates and for the reserved prefix: so do we.
  */
-export function buildRelayManifest(open: BridgeTool[], candidates: BridgeTool[] = []): RelayManifest {
+export function buildRelayManifest(open: BridgeTool[]): RelayManifest {
   const skipped: Partial<Record<SkipReason, number>> = {};
   const skip = (why: SkipReason) => void (skipped[why] = (skipped[why] ?? 0) + 1);
   const seen = new Set<string>();
-  const openSeen = new Set<string>();
   const out: ToolDef[] = [];
   let truncated = 0;
-
-  const add = (tool: BridgeTool, locked: boolean) => {
-    const name = tool?.name;
-    if (!relayName(name)) return skip(typeof (name as unknown) === "string" && String(name).toLowerCase().startsWith(RELAY_RESERVED_PREFIX) && TOOL_NAME.safeParse(name).success ? "reserved" : "name");
-    // The host folds case for duplicates and for the reserved prefix: so do we (a name differing only in case is a duplicate, and a refusal of the turn).
-    const folded = name.toLowerCase();
+  for (const tool of open) {
+    const made = toToolDef(tool);
+    if ("skip" in made) {
+      skip(made.skip);
+      continue;
+    }
+    const folded = made.def.name.toLowerCase();
     if (seen.has(folded)) {
-      if (locked && openSeen.has(name)) return; // a candidate the run already has open: offered once, nothing is lost
-      return skip("duplicate");
+      skip("duplicate");
+      continue;
     }
-    let schema: Record<string, unknown>;
-    if (tool.inputSchema === undefined || tool.inputSchema === null || !isObject(tool.inputSchema)) schema = { ...EMPTY_TOOL_SCHEMA };
-    else if (tool.inputSchema.type === "object") schema = tool.inputSchema;
-    else return skip("schema_not_object");
-    if (byteLen(schema) > TOOL_LIMITS.maxSchemaBytes) return skip("schema_too_large");
     seen.add(folded);
-    const full = typeof tool.description === "string" ? tool.description : "";
-    const description = truncateUtf8(full, TOOL_LIMITS.maxDescriptionBytes);
-    if (description !== full) truncated++;
-    if (!locked) openSeen.add(name);
-    out.push({ name, description, inputSchema: schema, ...(locked ? { locked: true } : {}) });
-  };
-
-  for (const t of open) add(t, false);
-  for (const t of candidates) add(t, true);
-
-  // The caps. Locked candidates go first, then the tail of the open list, and `install_skills` is never dropped.
-  const drop = (): boolean => {
-    for (let i = out.length - 1; i >= 0; i--) {
-      if (out[i].locked) {
-        out.splice(i, 1);
-        return true;
-      }
-    }
-    for (let i = out.length - 1; i >= 0; i--) {
-      if (out[i].name !== INSTALL_TOOL) {
-        out.splice(i, 1);
-        return true;
-      }
-    }
-    return false;
-  };
-  while (out.length > TOOL_LIMITS.maxTools) {
-    if (!drop()) break;
-    skip("manifest_full");
+    if (made.truncated) truncated++;
+    out.push(made.def);
+  }
+  if (out.length > TOOL_LIMITS.maxTools) {
+    for (let i = 0; i < out.length - TOOL_LIMITS.maxTools; i++) skip("manifest_full");
+    out.length = TOOL_LIMITS.maxTools;
   }
   while (out.length > 1 && byteLen(out) > TOOL_LIMITS.maxTotalBytes) {
-    if (!drop()) break;
+    out.pop();
     skip("manifest_too_large");
   }
-
-  const locked = new Set(out.filter((t) => t.locked).map((t) => t.name));
-  const openNames = new Set(out.filter((t) => !t.locked).map((t) => t.name));
-  return { tools: out, locked, open: openNames, skipped, truncated };
+  return { tools: out, open: new Set(out.map((t) => t.name)), skipped, truncated };
 }
 
 /** True when the manifest offers less than the bridge listed: a tool left out (any reason) or a description cut. The backend refuses such a turn. */

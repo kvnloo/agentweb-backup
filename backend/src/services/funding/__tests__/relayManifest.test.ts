@@ -1,6 +1,6 @@
 /** ENG-2113 tool relay: the manifest the backend sends in turn.run `tools`. */
 import { TOOL_LIMITS } from '../../../loginHost/protocol';
-import { buildRelayManifest, manifestCut, manifestProblem, relayName, INSTALL_TOOL } from '../relayManifest';
+import { buildRelayManifest, manifestCut, manifestProblem, relayName, toToolDef } from '../relayManifest';
 
 const tool = (name: string, extra: Record<string, unknown> = {}) => ({ name, description: `${name} d`, inputSchema: { type: 'object', properties: {} }, ...extra });
 
@@ -17,10 +17,9 @@ describe('buildRelayManifest', () => {
   afterEach(() => jest.restoreAllMocks());
 
   it('maps names by identity, so every offered name maps back to the very same bridge tool', () => {
-    const m = buildRelayManifest([tool('search'), tool('save_note'), tool(INSTALL_TOOL)]);
+    const m = buildRelayManifest([tool('search'), tool('save_note'), tool('install_skills')]);
     expect(m.tools.map((t) => t.name)).toEqual(['search', 'save_note', 'install_skills']);
     expect([...m.open]).toEqual(['search', 'save_note', 'install_skills']);
-    expect(m.locked.size).toBe(0);
     expect(manifestProblem(m.tools)).toBeUndefined();
   });
 
@@ -66,47 +65,47 @@ describe('buildRelayManifest', () => {
     expect(manifestProblem(m.tools)).toBeUndefined();
   });
 
-  it('candidates become locked unless they are already open; a locked name is never duplicated', () => {
-    const m = buildRelayManifest([tool('search'), tool(INSTALL_TOOL)], [tool('search'), tool('late_a'), tool('late_b')]);
-    expect(m.tools.map((t) => [t.name, t.locked === true])).toEqual([['search', false], ['install_skills', false], ['late_a', true], ['late_b', true]]);
-    expect([...m.locked]).toEqual(['late_a', 'late_b']);
-    expect(m.skipped).toEqual({}); // a candidate the run already has open is not a drop
-    expect(manifestCut(m)).toBe(false);
-    expect(manifestProblem(m.tools)).toBeUndefined();
-  });
-
-  it('over the tool-count cap, locked candidates go first and install_skills is never dropped', () => {
-    const open = [tool(INSTALL_TOOL), ...Array.from({ length: 450 }, (_, i) => tool(`open_${i}`))];
-    const cands = Array.from({ length: 200 }, (_, i) => tool(`cand_${i}`));
-    const m = buildRelayManifest(open, cands);
+  it('over the tool-count cap the overflow is counted (the caller refuses the turn: never a degraded manifest)', () => {
+    const m = buildRelayManifest(Array.from({ length: TOOL_LIMITS.maxTools + 7 }, (_, i) => tool(`open_${i}`)));
     expect(m.tools.length).toBe(TOOL_LIMITS.maxTools);
-    expect(m.open.size).toBe(451);
-    expect(m.locked.size).toBe(149);
-    expect(m.skipped.manifest_full).toBe(51);
+    expect(m.skipped.manifest_full).toBe(7);
+    expect(manifestCut(m)).toBe(true);
     expect(manifestProblem(m.tools)).toBeUndefined();
   });
 
-  it('over the byte cap the open tail is trimmed after the locked tools, still keeping install_skills first', () => {
+  it('over the byte cap the tail is counted as cut', () => {
     const fat = (n: string) => ({ name: n, description: 'd'.repeat(40_000), inputSchema: { type: 'object', properties: { p: { description: 'x'.repeat(30_000) } } } });
-    const open = [tool(INSTALL_TOOL), ...Array.from({ length: 60 }, (_, i) => fat(`open_${i}`))];
-    const m = buildRelayManifest(open, [fat('late')]);
+    const m = buildRelayManifest(Array.from({ length: 30 }, (_, i) => fat(`open_${i}`)));
     expect(Buffer.byteLength(JSON.stringify(m.tools))).toBeLessThanOrEqual(TOOL_LIMITS.maxTotalBytes);
-    expect(m.tools[0].name).toBe(INSTALL_TOOL);
-    expect(m.locked.size).toBe(0);
     expect(m.skipped.manifest_too_large).toBeGreaterThan(0);
+    expect(manifestCut(m)).toBe(true);
     expect(manifestProblem(m.tools)).toBeUndefined();
   });
 
-  it('install_skills survives the caps even when it is the LAST open tool', () => {
-    const fat = (n: string) => ({ name: n, description: 'd'.repeat(40_000), inputSchema: { type: 'object', properties: { p: { description: 'x'.repeat(30_000) } } } });
-    const m = buildRelayManifest([...Array.from({ length: 60 }, (_, i) => fat(`open_${i}`)), tool(INSTALL_TOOL)]);
-    expect(m.open.has(INSTALL_TOOL)).toBe(true);
-    const many = buildRelayManifest([...Array.from({ length: 605 }, (_, i) => tool(`t_${i}`)), tool(INSTALL_TOOL)]);
-    expect(many.open.has(INSTALL_TOOL)).toBe(true);
-    expect(many.tools.length).toBe(TOOL_LIMITS.maxTools);
+  it('there are no locked tools and no candidates: the manifest is the open list, in order, nothing else', () => {
+    const m = buildRelayManifest([tool('search'), tool('install_skills')]);
+    expect(m.tools).toEqual([expect.objectContaining({ name: 'search' }), expect.objectContaining({ name: 'install_skills' })]);
+    expect(m.tools.every((t) => !('locked' in t))).toBe(true);
+    expect([...m.open]).toEqual(['search', 'install_skills']);
   });
 
-  it('manifestProblem reports a manifest the host would refuse (all tools locked)', () => {
-    expect(manifestProblem([{ ...tool('a'), locked: true }])).toBe('tool_all_locked');
+  it('manifestProblem reports a manifest the host would refuse (empty)', () => {
+    expect(manifestProblem([])).toBeDefined();
+  });
+});
+
+describe('toToolDef (the definition of one tool that became available mid-turn)', () => {
+  it('builds the same definition the manifest would', () => {
+    expect(toToolDef(tool('late_tool'))).toEqual({ def: { name: 'late_tool', description: 'late_tool d', inputSchema: { type: 'object', properties: {} } }, truncated: false });
+  });
+  it.each([
+    ['a name the relay cannot carry', tool('my.tool'), 'name'],
+    ['the reserved prefix', tool('aw_relay_x'), 'reserved'],
+    ['a non-object schema', { name: 'x', inputSchema: { type: 'array' } }, 'schema_not_object'],
+    ['an oversized schema', { name: 'x', inputSchema: { type: 'object', properties: { p: { description: 'x'.repeat(TOOL_LIMITS.maxSchemaBytes) } } } }, 'schema_too_large'],
+  ])('refuses %s', (_l, t, skip) => expect(toToolDef(t as never)).toEqual({ skip }));
+  it('reports a cut description', () => {
+    const made = toToolDef({ name: 'x', description: 'é'.repeat(30_000), inputSchema: { type: 'object' } }) as { truncated: boolean };
+    expect(made.truncated).toBe(true);
   });
 });
