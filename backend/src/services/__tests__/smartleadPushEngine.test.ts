@@ -286,7 +286,7 @@ describe("executeRun (ENG-673)", () => {
 
     it("accepts a lead Smartlead did not name when its own tallies explain it (block list), counted and unmarked", async () => {
       const t = setup(5);
-      t.sl.dropFromMap = new Set(["p2@example.com"]);
+      t.sl.silentSkip = new Set(["p2@example.com"]); // a block-listed lead: not added, not named, only counted
       t.sl.tallies = { blockList: 1 };
       await expect(executeRun(t.run, t.deps)).resolves.toEqual({ outcome: "completed" });
       expect(t.run.counts.skippedByReason.smartlead_skipped).toBe(1);
@@ -345,6 +345,67 @@ describe("executeRun (ENG-673)", () => {
       expect(t.sl.emails.size).toBe(1); // it IS in Smartlead, unmarked: exactly why a human must look
       expect(t.run.cursor).toBeNull();
       expect(t.run.status).toBe("paused");
+    });
+
+    it("a lead already in ANOTHER campaign is skipped and reported, not marked and not a pause (the live shape, 2026-10-28)", async () => {
+      const t = setup(3);
+      t.sl.skipButListOther = new Set(["p2@example.com"]); // Smartlead skips it and lists it under "other campaigns" with its existing id
+      t.sl.tallies = { inOtherCampaign: 1 };
+      await expect(executeRun(t.run, t.deps)).resolves.toEqual({ outcome: "completed" });
+      expect(isMarkedForCampaign(t.leads[1], CAMPAIGN)).toBe(false);
+      expect(isMarkedForCampaign(t.leads[0], CAMPAIGN)).toBe(true);
+      expect(isMarkedForCampaign(t.leads[2], CAMPAIGN)).toBe(true);
+      expect(t.run.counts.skippedByReason).toMatchObject({ smartlead_in_other_campaign: 1 });
+    });
+
+    it("pauses when Smartlead names more 'other campaign' leads than it counts as skipped for that", async () => {
+      const t = setup(3);
+      t.sl.skipButListOther = new Set(["p2@example.com", "p3@example.com"]);
+      t.sl.tallies = { inOtherCampaign: 1 };
+      await expect(executeRun(t.run, t.deps)).resolves.toEqual({ outcome: "paused", reason: "other_campaign_leads" });
+    });
+
+    it("a lead Smartlead ADDED but did not name is never explained away by a tally (other-campaign or block list): the batch is retried", async () => {
+      for (const tallies of [{ inOtherCampaign: 1 }, { blockList: 1 }]) {
+        const t = setup(3);
+        t.sl.dropFromMap = new Set(["p2@example.com"]); // added, but missing from the map
+        t.sl.tallies = tallies;
+        const outcome = await executeRun(t.run, t.deps);
+        expect(outcome.outcome).not.toBe("completed");
+        expect(t.run.counts.skippedByReason.smartlead_skipped ?? 0).toBe(0);
+      }
+    });
+
+    it("a lead counted as ALREADY in the campaign but not named is never accepted either", async () => {
+      const first = setup(3);
+      await expect(executeRun(first.run, first.deps)).resolves.toEqual({ outcome: "completed" }); // Smartlead now holds all three
+      // A second run of the same three leads WITHOUT markers (e.g. they were lost), against the same Smartlead account.
+      const second = setup(3);
+      const deps = makeDeps(second.leads, first.sl, second.store);
+      first.sl.dropFromMap = new Set(["p2@example.com"]); // counted as already in the campaign, but not named
+      first.sl.tallies = { blockList: 1 }; // a tally that could "explain" one unnamed lead: it must not excuse a lead counted as in the campaign
+      const outcome = await executeRun(second.run, deps);
+      expect(outcome).toEqual({ outcome: "partial" }); // retried, never accepted
+      expect(isMarkedForCampaign(second.leads[1], CAMPAIGN)).toBe(false);
+      expect(second.run.counts.skippedByReason.smartlead_skipped ?? 0).toBe(0);
+    });
+
+    it("the other-campaign tally is matched to the leads it names: what is left can explain only that many unnamed skips", async () => {
+      const t = setup(3);
+      t.sl.skipButListOther = new Set(["p1@example.com"]); // named, counted
+      t.sl.silentSkip = new Set(["p2@example.com"]);       // not named; the other-campaign tally of 1 is used up by p1
+      t.sl.tallies = { inOtherCampaign: 1 };
+      const outcome = await executeRun(t.run, t.deps);
+      expect(outcome.outcome).not.toBe("completed"); // p2 is unexplained: retried, never accepted
+      expect(isMarkedForCampaign(t.leads[1], CAMPAIGN)).toBe(false);
+    });
+
+    it("a lead named in THIS campaign and also listed under other campaigns is marked (it is in this campaign)", async () => {
+      const t = setup(2);
+      t.sl.extraOther = { "p1@example.com": "77" }; // named under other campaigns AND newly added here
+      await expect(executeRun(t.run, t.deps)).resolves.toEqual({ outcome: "completed" });
+      expect(isMarkedForCampaign(t.leads[0], CAMPAIGN)).toBe(true);
+      expect(t.run.counts.skippedByReason.smartlead_in_other_campaign ?? 0).toBe(0);
     });
 
     it("trusts nothing in the 'other campaigns' map while Smartlead also reports leads skipped for being in other campaigns", async () => {

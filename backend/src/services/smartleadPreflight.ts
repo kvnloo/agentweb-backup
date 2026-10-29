@@ -43,6 +43,8 @@ export function preflightSequence(
     acknowledgeUnreadable?: boolean;
     /** The campaign's own `add_unsubscribe_tag` setting, when known. */
     addUnsubscribeTag?: boolean;
+    /** The campaign's unsubscribe footer text, when known (null: none). The link is only added when the setting is on AND this is set. */
+    unsubscribeText?: string | null;
   },
 ): PreflightResult {
   const result: PreflightResult = { blocks: [], warnings: [], tagsToMap: [] };
@@ -69,8 +71,13 @@ export function preflightSequence(
     result.tagsToMap.push(tag);
   }
   if (analysis.usesSpintax) result.warnings.push({ code: "spintax", message: "The template uses {a|b} spintax; AgentWeb does not touch it." });
+  // Smartlead adds its unsubscribe link only when the setting is on AND the footer text is set (verified with received emails, 2026-10-28).
+  // A merge tag named like "unsubscribe" in the sequence is NOT trusted to produce a link when the footer text is empty (unverified).
+  const noTextKnown = opts.unsubscribeText !== undefined && !(typeof opts.unsubscribeText === "string" && opts.unsubscribeText.trim());
   if (opts.addUnsubscribeTag === false && !analysis.tags.some(t => /unsub/i.test(t))) {
     result.warnings.push({ code: "no_unsubscribe", message: "The campaign's unsubscribe tag is off and no unsubscribe link appears in the sequence." });
+  } else if (opts.addUnsubscribeTag === true && noTextKnown) {
+    result.warnings.push({ code: "no_unsubscribe", message: "The campaign's unsubscribe option is on, but its unsubscribe text is empty, so Smartlead adds no unsubscribe link to the emails. Set the unsubscribe text in the campaign's settings in Smartlead." });
   }
   return result;
 }

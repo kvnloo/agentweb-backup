@@ -3021,18 +3021,32 @@ export async function writeClickUpDoc(
   content: string,
   userId: string,
   parentDocId?: string
-): Promise<{ success: boolean; message: string; docId?: string; code?: number }> {
+): Promise<{ success: boolean; message: string; docId?: string; code?: number; errorType?: ClickUpDocErrorType }> {
+  // ENG-1892: reject malformed arguments locally and name the bad parameter,
+  // instead of letting ClickUp answer with an unreadable 400.
+  const badParam = !isNonEmptyString(workspaceId) ? 'workspace_id'
+    : !isNonEmptyString(name) ? 'name'
+    : typeof content !== 'string' ? 'content'
+    : parentDocId !== undefined && parentDocId !== null && !isNonEmptyString(parentDocId) ? 'parent_doc_id'
+    : null;
+  if (badParam) {
+    return {
+      success: false,
+      errorType: 'invalid_parameter',
+      message: `Invalid parameter "${badParam}" for write_clickup_doc: ${badParam === 'content' ? 'must be a string' : 'must be a non-empty string'}.`,
+    };
+  }
   try {
     const clickUpToken = await getClickUpAccessToken(userId);
     if (!clickUpToken) {
-      return { success: false, message: 'ClickUp not connected' };
+      return { success: false, errorType: 'configuration', message: 'ClickUp not connected' };
     }
 
     // Verify user has access to this workspace
     const workspaces = await getClickUpWorkspaces(clickUpToken);
     const workspace = workspaces.find(w => w.id === workspaceId);
     if (!workspace) {
-      return { success: false, message: 'Not authorized to access this ClickUp workspace' };
+      return { success: false, errorType: 'configuration', message: 'Not authorized to access this ClickUp workspace' };
     }
 
     if (parentDocId) {
@@ -3086,13 +3100,49 @@ export async function writeClickUpDoc(
     // above. Deliberately NOT the ECODE extracted above, which is ClickUp's own
     // business code (e.g. "OAUTH_019"), not an HTTP status.
     const code = error?.response?.status;
+    const errorType = classifyClickUpDocError(code);
+    const bodySnippet = !clickUpError?.err && clickUpError !== undefined
+      ? ` ClickUp response: ${truncateForError(clickUpError)}`
+      : '';
+    const statusText = typeof code === 'number' ? ` (HTTP ${code})` : '';
+    const guidance = errorType === 'configuration'
+      ? ' Reconnect ClickUp in Settings > Integrations and make sure the AgentWeb app is allowed to create Docs in this workspace.'
+      : errorType === 'invalid_parameter'
+        ? ' Check workspace_id, name, content and parent_doc_id (parent_doc_id must be a docId from list_knowledge_base_files).'
+        : '';
 
     return {
       success: false,
-      message: `Failed to create ClickUp document "${name}": ${errorMessage}`,
+      errorType,
+      message: `Failed to create ClickUp document "${name}"${statusText}: ${errorMessage}.${bodySnippet}${guidance}`,
       code,
     };
   }
+}
+
+export type ClickUpDocErrorType = 'configuration' | 'invalid_parameter' | 'not_found' | 'runtime';
+
+// ENG-1892: one class per failure family so the agent (and reliability runs)
+// can tell auth/config from schema from runtime failures.
+export function classifyClickUpDocError(status: unknown): ClickUpDocErrorType {
+  if (status === 401 || status === 403) return 'configuration';
+  if (status === 400 || status === 422) return 'invalid_parameter';
+  if (status === 404) return 'not_found';
+  return 'runtime';
+}
+
+function isNonEmptyString(v: unknown): v is string {
+  return typeof v === 'string' && v.trim().length > 0;
+}
+
+function truncateForError(body: unknown): string {
+  let text: string;
+  try {
+    text = typeof body === 'string' ? body : JSON.stringify(body);
+  } catch {
+    text = String(body);
+  }
+  return text.length > 300 ? `${text.slice(0, 300)}...` : text;
 }
 
 // Helper: read a Foreplay ad from swipefile or a board
