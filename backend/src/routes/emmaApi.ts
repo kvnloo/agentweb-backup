@@ -301,6 +301,8 @@ router.post('/remove-c2pa', async (req: Request, res: Response) => {
 
 // ─── Email ──────────────────────────────────────────────────────────────────
 
+const MAX_GET_MESSAGE_IDS = 50;
+
 router.post('/email', async (req: Request, res: Response) => {
   try {
     const { bootstrapEmailProviders, resolveEmailAccount, withAccessGuard } = await import('../services/emailProviderService');
@@ -311,6 +313,11 @@ router.post('/email', async (req: Request, res: Response) => {
     const operation = req.body.action === 'send' ? 'send' : 'read';
     const resolved = await resolveEmailAccount(userId(req), req.body.account_id, operation);
     const { provider, ownerUserId } = resolved;
+    // External MCP read_email sets own_mailbox_only: the caller's own mailbox is
+    // the only one an external API key may read — never a teammate's shared one.
+    if (req.body.own_mailbox_only === true && ownerUserId !== userId(req)) {
+      return res.status(403).json({ message: 'This mailbox is shared by a teammate and cannot be read by external clients. Only your own connected accounts are available.' });
+    }
     // Every provider call runs inside withAccessGuard: a teammate's shared
     // mailbox is re-checked immediately before the call AND before the result is
     // returned, so a share revoked mid-read discloses nothing.
@@ -333,6 +340,9 @@ router.post('/email', async (req: Request, res: Response) => {
       }
       case 'get': {
         const ids: string[] = Array.isArray(req.body.message_ids) ? req.body.message_ids : [];
+        if (ids.length > MAX_GET_MESSAGE_IDS || ids.some((id) => typeof id !== 'string')) {
+          return res.status(400).json({ message: `message_ids must be at most ${MAX_GET_MESSAGE_IDS} strings` });
+        }
         const emails = await guarded(() => provider.getEmails(ownerUserId, req.body.account_id, ids));
         result = { emails, count: emails.length };
         break;
