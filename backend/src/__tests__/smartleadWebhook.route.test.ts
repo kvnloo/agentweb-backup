@@ -9,8 +9,6 @@ import express from "express";
 const mockHandle = jest.fn();
 jest.mock("../services/smartleadEventRuntime", () => ({ getSmartleadEventService: () => ({ handle: mockHandle }) }));
 jest.mock("../config/jwt", () => ({ getJwtSecret: () => "route-test-secret" }));
-// anything the app's own error handler would do must NOT happen for a bad caller: it reports and answers 500
-const reachedGlobalErrorHandler = jest.fn();
 
 import smartleadWebhookRouter, { smartleadWebhookPreParse } from "../routes/smartleadWebhook";
 import { signWebhookToken } from "../services/smartleadWebhookToken";
@@ -94,8 +92,10 @@ describe("POST /api/webhooks/smartlead/:accountId/:campaignId/:token", () => {
 
   it("logs the body only when a test environment turns that on, and never in production", async () => {
     process.env.SMARTLEAD_WEBHOOK_LOG_BODY = "true";
-    await send(url(), reply);
-    expect(logs.join("\n")).toContain("PRIVATE TEXT");
+    await send(url(), { ...reply, secret_key: "HOOKSECRET", webhook_url: "http://x/TOKENINURL" });
+    const logged = logs.join("\n");
+    expect(logged).toContain("SECRET SUBJECT"); // the field names and the ordinary values are there to learn from
+    for (const never of ["PRIVATE TEXT", "HOOKSECRET", "TOKENINURL"]) expect(logged).not.toContain(never); // but not secrets or reply text
     logs.length = 0;
     const before = process.env.NODE_ENV;
     process.env.NODE_ENV = "production";

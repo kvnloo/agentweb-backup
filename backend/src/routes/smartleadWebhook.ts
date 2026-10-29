@@ -61,7 +61,7 @@ const router = express.Router();
 const shape = (body: unknown): string => (body && typeof body === "object" && !Array.isArray(body) ? Object.keys(body as object).slice(0, 40).join(",") : typeof body);
 
 router.post("/:accountId/:campaignId/:token", async (req: express.Request, res: express.Response) => {
-  // The gate already proved the token; these are the same values it checked.
+  // The gate already proved the token against the raw path segments; account ids and campaign ids are URL-safe, so these are the same values.
   const { accountId, campaignId } = req.params;
 
   let body: unknown;
@@ -73,7 +73,12 @@ router.post("/:accountId/:campaignId/:token", async (req: express.Request, res: 
     return res.status(200).json({ ok: true, ignored: "bad_json" });
   }
   // Discovery aid for a TEST environment only: refused in production whatever the variable says. The whole body, cut short.
-  if (process.env.SMARTLEAD_WEBHOOK_LOG_BODY === "true" && process.env.NODE_ENV !== "production") console.log(`[SmartleadWebhook] body campaign=${campaignId} ${JSON.stringify(body).slice(0, 2000)}`);
+  if (process.env.SMARTLEAD_WEBHOOK_LOG_BODY === "true" && process.env.NODE_ENV !== "production") {
+    // Even there: never the secrets a payload carries (our URL token is inside webhook_url) or the text of a reply.
+    const redacted = { ...(body && typeof body === "object" && !Array.isArray(body) ? (body as Record<string, unknown>) : { value: body }) };
+    for (const k of ["secret_key", "webhook_url", "reply_body", "reply_message", "sent_message", "sent_message_body", "preview_text"]) if (k in redacted) redacted[k] = "<redacted>";
+    console.log(`[SmartleadWebhook] body campaign=${campaignId} ${JSON.stringify(redacted).slice(0, 2000)}`);
+  }
 
   const parsed = parseSmartleadEvent(body);
   if (!parsed.ok) {

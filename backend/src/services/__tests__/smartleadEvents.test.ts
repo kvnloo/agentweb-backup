@@ -19,24 +19,24 @@ describe("parsing a Smartlead event (ENG-673)", () => {
   // Real deliveries captured from Smartlead on 2026-10-29 (trimmed; identifiers are test data). Note: `from_email` is the SENDING MAILBOX.
   const REAL_REPLY = {
     campaign_status: "COMPLETED", stats_id: "e3d94c2b-a220-472f-b077-9eb5c3a64f19", reply_source: "CAMPAIGN", sl_email_lead_id: "4843221306", sl_email_lead_map_id: 3930296647,
-    sl_lead_email: "mvarma@argusoft.com", sl_senders_mailbox: "harsha.vankayalapati@withagentweb.com", from_email: "harsha.vankayalapati@withagentweb.com", cc_emails: [],
-    subject: "AgentWeb event test for Manan", to_email: "mvarma@argusoft.com", to_name: "Manan Varma", time_replied: "2026-10-29T14:57:20+00:00", event_timestamp: "2026-10-29T14:57:20+00:00",
+    sl_lead_email: "ann@example.com", sl_senders_mailbox: "sender@example.org", from_email: "sender@example.org", cc_emails: [],
+    subject: "AgentWeb event test for Ann", to_email: "ann@example.com", to_name: "Ann Test", time_replied: "2026-10-29T14:57:20+00:00", event_timestamp: "2026-10-29T14:57:20+00:00",
     reply_message: { message_id: "<CAAv@mail.gmail.com>", text: "I am replying to this mail for testing.\n" }, reply_body: "<html>PRIVATE REPLY</html>", message_id: "<CAAv@mail.gmail.com>",
     campaign_name: "AW-TEST events slice3 (delete me)", campaign_id: 4270665, sequence_number: 1, secret_key: "S3CRET", webhook_url: "http://host/api/webhooks/smartlead/a/b/TOKEN",
-    leadCorrespondence: { targetLeadEmail: "mvarma@argusoft.com", replyReceivedFrom: "mvarma@argusoft.com", repliedCompanyDomain: "SameCompany" }, event_type: "EMAIL_REPLY", event_id: "4ac42b51-84a7-4d7a-9a10-f356e65241e7",
+    leadCorrespondence: { targetLeadEmail: "ann@example.com", replyReceivedFrom: "ann@example.com", repliedCompanyDomain: "SameCompany" }, event_type: "EMAIL_REPLY", event_id: "4ac42b51-84a7-4d7a-9a10-f356e65241e7",
   };
   const REAL_UNSUB = {
-    campaign_status: "COMPLETED", event_timestamp: "2026-10-29T14:57:29.266Z", lead_id: 4843221306, lead_email: "mvarma@argusoft.com", to_email: "mvarma@argusoft.com",
-    from_email: "harsha.vankayalapati@withagentweb.com", lead_name: "Manan Varma", sequence_number: 1, campaign_name: "AW-TEST events slice3 (delete me)", campaign_id: 4270665,
-    unsubscribed_client_id_map: { "0": "2026-10-29T14:57:28.687636+00:00" }, secret_key: "S3CRET", description: "Lead - mvarma@argusoft.com unsubscribed from the campaign - AW-TEST events slice3 (delete me)",
+    campaign_status: "COMPLETED", event_timestamp: "2026-10-29T14:57:29.266Z", lead_id: 4843221306, lead_email: "ann@example.com", to_email: "ann@example.com",
+    from_email: "sender@example.org", lead_name: "Ann Test", sequence_number: 1, campaign_name: "AW-TEST events slice3 (delete me)", campaign_id: 4270665,
+    unsubscribed_client_id_map: { "0": "2026-10-29T14:57:28.687636+00:00" }, secret_key: "S3CRET", description: "Lead - ann@example.com unsubscribed from the campaign - AW-TEST events slice3 (delete me)",
     event_type: "LEAD_UNSUBSCRIBED", event_id: "ad65b227-b71c-4256-a3d9-455623d720c2", sl_email_lead_map_id: "3930296647",
   };
 
   it("reads the REAL reply payload: the contact is found (never the sending mailbox), the subject and time are kept, the reply text and secrets are not", () => {
     const e = ok(REAL_REPLY);
-    expect(e).toMatchObject({ kind: "reply", campaignId: 4270665, subject: "AgentWeb event test for Manan", from: "mvarma@argusoft.com", to: "harsha.vankayalapati@withagentweb.com", occurredAt: "2026-10-29T14:57:20.000Z", soft: false });
-    expect(e.candidateEmails[0]).toBe("mvarma@argusoft.com");
-    expect(e.candidateEmails[e.candidateEmails.length - 1]).toBe("harsha.vankayalapati@withagentweb.com"); // the mailbox is only a last resort
+    expect(e).toMatchObject({ kind: "reply", campaignId: 4270665, subject: "AgentWeb event test for Ann", from: "ann@example.com", to: "sender@example.org", occurredAt: "2026-10-29T14:57:20.000Z", soft: false });
+    expect(e.candidateEmails[0]).toBe("ann@example.com");
+    expect(e.candidateEmails[e.candidateEmails.length - 1]).toBe("sender@example.org"); // the mailbox is only a last resort
     const all = JSON.stringify(e);
     for (const secret of ["PRIVATE REPLY", "I am replying", "S3CRET", "TOKEN"]) expect(all).not.toContain(secret);
   });
@@ -44,7 +44,7 @@ describe("parsing a Smartlead event (ENG-673)", () => {
   it("reads the REAL unsubscribe payload", () => {
     const e = ok(REAL_UNSUB);
     expect(e).toMatchObject({ kind: "unsubscribe", campaignId: 4270665, occurredAt: "2026-10-29T14:57:29.266Z" });
-    expect(e.candidateEmails[0]).toBe("mvarma@argusoft.com");
+    expect(e.candidateEmails[0]).toBe("ann@example.com");
     expect(JSON.stringify(e)).not.toContain("S3CRET");
   });
 
