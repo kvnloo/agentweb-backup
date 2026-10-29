@@ -139,4 +139,32 @@ describe('formatRelativeTime', () => {
   ])('%s → %s', (iso, expected) => {
     expect(formatRelativeTime(new Date(iso), NOW)).toBe(expected);
   });
+
+  describe('failed posts (ENG-2745)', () => {
+    const failed = rec({
+      id: 'bad',
+      platform: 'linkedin',
+      status: 'failed',
+      lastError: 'LinkedIn API 503: service unavailable\n  retry budget exhausted',
+    });
+
+    it('renders failed posts in their own Failed group with an error preview, shown by default', () => {
+      const v = formatScheduledPostList([rec({ id: 'p' }), failed], { now: NOW, timeZone: LA });
+      if (v.empty) throw new Error('expected rows');
+      expect(v.groups.map((g) => g.label)).toEqual(['X', 'Failed']);
+      const row = v.groups[1].rows[0];
+      expect(row.status).toBe('failed');
+      expect(row.pastDue).toBe(false);
+      expect(row.line).toContain('LinkedIn');
+      expect(row.line).toContain('error: LinkedIn API 503: service unavailable retry budget exhausted');
+      expect(v.text).toContain('\n\nFailed:\n');
+    });
+
+    it('omits the error suffix when no lastError is present', () => {
+      const v = formatScheduledPostList([rec({ id: 'f2', status: 'failed' })], { now: NOW, timeZone: LA });
+      if (v.empty) throw new Error('expected rows');
+      expect(v.groups[0].label).toBe('Failed');
+      expect(v.groups[0].rows[0].line).not.toContain('error:');
+    });
+  });
 });
