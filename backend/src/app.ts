@@ -56,6 +56,7 @@ import calendlyAuthRoutes from "./routes/calendlyAuth";
 import lumaAuthRoutes from "./routes/lumaAuth";
 import smartleadAuthRoutes from "./routes/smartleadAuth";
 import smartleadPushRoutes from "./routes/smartleadPush";
+import smartleadWebhookRoutes from "./routes/smartleadWebhook";
 import googleDriveAuthRoutes from "./routes/googleDriveAuth";
 import twitterAuthRoutes from "./routes/twitterAuth";
 import metaAuthRoutes from "./routes/metaAuth";
@@ -368,6 +369,7 @@ app.use("/api/stripe/connect/webhook", express.raw({ type: "application/json" })
 // HubSpot webhook needs raw body for HMAC-SHA256 signature verification.
 app.use("/api/webhooks/hubspot", express.raw({ type: "application/json" }));
 app.use("/api/webhooks/calendly", express.raw({ type: "application/json" })); // raw body needed for HMAC signature verification
+app.use("/api/webhooks/smartlead", express.raw({ type: "*/*", limit: "256kb" })); // ENG-673: parsed by the route (the body is JSON, the size is capped)
 app.use("/api/webhooks/attio", express.raw({ type: "application/json" })); // raw body needed for Attio-Signature HMAC verification
 // Linear webhook (bug-resolve bridge) needs raw body for HMAC signature verification — before express.json().
 app.use("/api/integrations/linear/webhook", express.raw({ type: "application/json" }));
@@ -495,6 +497,7 @@ app.use("/api/webhooks/whatsapp", whatsappWebhookRoutes);
 app.use("/api/messaging-channels", messagingChannelsRoutes);
 app.use("/api/approval-requests", approvalRequestsRoutes);
 app.use("/api/webhooks/calendly", calendlyWebhookRoutes);
+app.use("/api/webhooks/smartlead", smartleadWebhookRoutes); // ENG-673: no user auth; the URL token proves the caller (see the route)
 app.use("/api/webhooks/unipile", unipileWebhookRoutes);
 registerConversionRelayProcessor();
 registerLeadNotificationProcessor();
