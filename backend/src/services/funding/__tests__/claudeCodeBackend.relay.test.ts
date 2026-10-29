@@ -69,7 +69,7 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
       holdMs?: Record<string, Promise<void>>;
       images?: Record<string, Array<{ mimeType: string; data: string }>>;
       tools?: BridgeTool[];
-      candidates?: BridgeTool[];
+      appearAfter?: Record<string, BridgeTool[]>;
       now?: () => number;
       softLead?: number;
       confirm?: string[];
@@ -78,18 +78,18 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
   ) {
     const executions: Array<{ name: string; args: Record<string, unknown> }> = [];
     const persisted: any[][] = [];
-    let installed = false;
+    const extra: BridgeTool[] = [];
     const live = { value: true };
     const base: BridgeTool[] = over.tools ?? [{ name: 'save_note', description: 'Save', inputSchema: { type: 'object', properties: { note: { type: 'string' } } } }, { name: 'search' }, { name: 'slow_write' }, { name: 'install_skills' }, { name: 'send_email' }];
     const toolDeps = {
-      resolveTools: async () => [...base, ...(installed ? [{ name: 'late_tool' }] : [])],
+      resolveTools: async () => [...base, ...extra],
       isReadOnly: (name: string) => name === 'search',
       isLive: async () => live.value,
       execute: async (_run: unknown, c: { name: string; args: Record<string, unknown> }): Promise<BridgeExecuteOutcome> => {
         executions.push({ name: c.name, args: c.args });
         if (over.holdMs?.[c.name]) await over.holdMs[c.name];
-        if (c.name === 'install_skills') installed = true;
-        return { content: `${c.name} receipt`, isError: false, requiresConfirmation: over.confirm?.includes(c.name) === true, toolsChanged: c.name === 'install_skills', ...(over.images?.[c.name] ? { images: over.images[c.name] } : {}) };
+        for (const x of (over.appearAfter ?? { install_skills: [{ name: 'late_tool', description: 'after install', inputSchema: { type: 'object', properties: {} } }] })[c.name] ?? []) extra.push(x);
+        return { content: `${c.name} receipt`, isError: false, requiresConfirmation: over.confirm?.includes(c.name) === true, toolsChanged: (over.appearAfter ?? { install_skills: [] })[c.name] !== undefined, ...(over.images?.[c.name] ? { images: over.images[c.name] } : {}) };
       },
       registerRun: () => undefined,
       beginTurn: () => undefined,
@@ -107,7 +107,6 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
       relay: {
         workerProtocol: () => ('protocol' in over ? over.protocol : 4),
         protocolStatus: () => over.status ?? 'match',
-        candidateTools: async () => over.candidates ?? [],
         allowLegacyBridge: () => over.allowLegacy === true,
       },
       executor: toolDeps,
@@ -217,16 +216,18 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
     expect(r.responseMessages.filter((m) => m.role === 'tool').map((m) => m.tool_call_id).sort()).toEqual(['op-1', 'op-2']);
   });
 
-  it('install_skills: the same result unlocks the late tool at the real host, and the late tool then runs in the same turn', async () => {
-    const t = setup({ candidates: [{ name: 'late_tool', description: 'after install' }, { name: 'save_note' }] });
+  it('install_skills: the same answer carries the new tool definition to the real host, and the tool then runs in the same turn (Emma behaviour)', async () => {
+    const t = setup();
     const g1 = gate();
     const g2 = gate();
     rig.script.turnEvents = [call('op-1', 'install_skills', { skills: ['x'] }), { wait: g1.wait }, call('op-2', 'late_tool'), { wait: g2.wait }, result('used it')];
     const spy = jest.spyOn(client, 'turnRun');
     const run = t.backend().run(t.params());
     await waitFor(() => answers().length === 1);
-    expect((spy.mock.calls[0][0] as any).tools.filter((x: any) => x.locked).map((x: any) => x.name)).toEqual(['late_tool']);
-    expect(answers()[0].answer).toMatchObject({ kind: 'tool-result', ok: true, unlock: ['late_tool'] });
+    const open = (spy.mock.calls[0][0] as any).tools.map((x: any) => x.name);
+    expect(open).toEqual(['save_note', 'search', 'slow_write', 'install_skills', 'send_email']); // the OPEN set only: no late_tool, no locked flag
+    expect((spy.mock.calls[0][0] as any).tools.some((x: any) => 'locked' in x)).toBe(false);
+    expect(answers()[0].answer).toMatchObject({ kind: 'tool-result', ok: true, tools: [{ name: 'late_tool', description: 'after install' }] });
     g1.open();
     await waitFor(() => answers().length === 2);
     g2.open();
@@ -234,8 +235,8 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
     expect(t.executions.map((e) => e.name)).toEqual(['install_skills', 'late_tool']);
   });
 
-  it('a tool that is locked and not unlocked is refused even if the (compromised) worker emits a call for it', async () => {
-    const t = setup({ candidates: [{ name: 'late_tool' }] });
+  it('a tool the worker was never sent is refused even if the (compromised) worker emits a call for it', async () => {
+    const t = setup();
     const g = gate();
     rig.script.turnEvents = [call('op-1', 'late_tool'), { wait: g.wait }, result('x')];
     const run = t.backend().run(t.params());
@@ -424,7 +425,6 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
       ['a description over the per-tool limit', { tools: [{ name: 'save_note', description: 'SECRET-DESC' + 'd'.repeat(60_000) }, { name: 'install_skills' }] }, 'truncatedDescriptions'],
       ['more per-user MCP tools than the manifest can hold', { tools: [{ name: 'install_skills' }, ...many] }, 'manifest_full'],
       ['every tool the bridge lists is one the relay cannot carry (empty only BECAUSE tools were dropped: too large, not unavailable)', { tools: [{ name: 'my.tool' }] }, 'name'],
-      ['a locked candidate (after a skill install) that would be dropped', { candidates: [{ name: 'late.tool' }] }, 'name'],
     ] as const)('%s: typed stop, not retryable, nothing run, logged by fixed code with counts only', async (_label, over, key) => {
       const t = setup(over as any);
       const spy = jest.spyOn(client, 'turnRun');
@@ -549,7 +549,7 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
 
     it('a finished manifest the protocol schema would refuse is a typed stop before the worker is asked', async () => {
       const t = setup();
-      jest.spyOn(relayManifestModule, 'buildRelayManifest').mockReturnValue({ tools: [{ name: 'only', description: '', inputSchema: { type: 'object' }, locked: true }], open: new Set(['only']), locked: new Set(['only']), skipped: {}, truncated: 0 }); // all locked: the host would refuse it
+      jest.spyOn(relayManifestModule, 'buildRelayManifest').mockReturnValue({ tools: [{ name: 'Dup', description: '', inputSchema: { type: 'object' } }, { name: 'dup', description: '', inputSchema: { type: 'object' } }], open: new Set(['Dup', 'dup']), skipped: {}, truncated: 0 }); // case-insensitive duplicate: the host would refuse it
       const spy = jest.spyOn(client, 'turnRun');
       const err: any = await t.backend().run(t.params()).catch((e) => e);
       expect(err.code).toBe('tools_unavailable_for_plan');
@@ -558,16 +558,6 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
       expect(spy).not.toHaveBeenCalled();
       const logged = (console.error as jest.Mock).mock.calls.map((c) => JSON.stringify(c)).join('\n');
       expect(logged).toContain('relay_refused cause=manifest_schema');
-    });
-
-    it('a manifest whose every tool is locked (nothing open) is refused as empty before the schema check', async () => {
-      const t = setup({ tools: [], candidates: [{ name: 'late_only' }] });
-      const spy = jest.spyOn(client, 'turnRun');
-      const err: any = await t.backend().run(t.params()).catch((e) => e);
-      expect(err.code).toBe('tools_unavailable_for_plan');
-      expect(spy).not.toHaveBeenCalled();
-      const logged = (console.error as jest.Mock).mock.calls.map((c) => JSON.stringify(c)).join('\n');
-      expect(logged).toContain('relay_refused cause=manifest_empty');
     });
   });
 

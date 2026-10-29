@@ -21,7 +21,7 @@ import type { ProviderEvent } from "../../loginHost/adapter";
 import type { LoginHostClient } from "./loginHostClient";
 import type { HostTurnOptions, HostTurnOutcome } from "./loginHostTurn";
 import type { RouteInput } from "../../loginHost/protocol";
-import type { BridgeCallOptions, BridgeCallRecord, BridgeCallResult, BridgeHalt, BridgeListedTool, BridgeTool, BridgeToolCall, CloseAndDrainResult } from "./toolBridge";
+import type { BridgeCallOptions, BridgeCallRecord, BridgeCallResult, BridgeHalt, BridgeListedTool, BridgeToolCall, CloseAndDrainResult } from "./toolBridge";
 import { buildRelayManifest, manifestCut, manifestProblem, type RelayManifest } from "./relayManifest";
 import { RESULT_LOST_NOTE, RelayToolDispatcher } from "./relayToolDispatcher";
 import { ToolBridgeAuthError } from "./toolBridge";
@@ -110,8 +110,6 @@ export interface ClaudeBackendDeps {
   relay?: {
     workerProtocol(): number | undefined;
     protocolStatus(): "match" | "mismatch" | "unknown";
-    /** Tools the run could have after a skill install; offered to the worker as `locked`. Failure or absence = none are offered ahead. */
-    candidateTools?(run: { runId: string; userId: string; sessionId: string }): Promise<BridgeTool[]>;
     /** Whether a worker older than protocol 4 may run turns on the HTTP bridge. Absent or false (the production default) = refused. */
     allowLegacyBridge?(): boolean;
   };
@@ -366,7 +364,7 @@ export class ClaudeCodeBackend {
               runId,
               token,
               bridge: { callTool: (t, c, r, o) => d.bridge.callTool!(t, c, r, o), listTools: (t, r) => d.bridge.listTools!(t, r), noteToolUse: (r, c, n, i, m) => d.bridge.noteToolUse(r, c, n, i, m), noteToolResult: (r) => d.bridge.noteToolResult(r), takeLedger: (r) => d.bridge.takeLedger(r) },
-              manifest: { open: built.manifest.open, locked: built.manifest.locked },
+              manifest: { open: built.manifest.open },
               isStopped: () => seen.stopped || ac.signal.aborted,
               softDeadlineAt: d.now() + deadlineMs - lead,
               now: d.now,
@@ -576,14 +574,7 @@ export class ClaudeCodeBackend {
     } catch (err) {
       throw noToolsStop(err instanceof ToolBridgeAuthError ? "revoked_or_disabled" : "lookup_failed");
     }
-    let candidates: BridgeTool[] = [];
-    try {
-      candidates = (await d.relay?.candidateTools?.({ runId, userId: p.userId, sessionId: p.sessionId })) ?? [];
-    } catch {
-      candidates = []; // no tools are offered ahead; a skill install then needs a new turn to show its tools
-      console.error("[claude-backend] relay candidate tools unavailable");
-    }
-    const manifest = buildRelayManifest(open, candidates);
+    const manifest = buildRelayManifest(open);
     // Never a degraded manifest (B1/B2): if any tool would be left out or any description cut (per-user MCP tools are unbounded in number and shape), the
     // turn is refused and the user told, rather than run with fewer tools than an AgentWeb turn would have. relayManifest.registry.test.ts keeps the
     // built-in registry inside the limits. `tools_too_large_for_plan`: not retryable, nothing has run, AgentWeb credits offered (AgentWeb can run them).

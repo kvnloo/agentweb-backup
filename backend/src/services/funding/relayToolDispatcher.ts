@@ -10,7 +10,7 @@
  *     operationId, a tool name, an input and a message id, and nothing else is read from it.
  *   - Every call goes through `ToolBridge.callTool` with the run's INTERNAL token (never sent to the worker), so the liveness check before each execution, the
  *     run's tool list, the halts, the ledger and the write confirmation are exactly the ones the HTTP path has. The dispatcher additionally refuses a name
- *     that is not in the manifest, a locked name that has not been unlocked, and a second event with an operationId it already saw.
+ *     that is not in the manifest or in the definitions an accepted answer added, and a second event with an operationId it already saw.
  *   - Only `tool-call` events are executed. The stream-derived `tool-use` / `tool-result` events are informational and never reach this class.
  *   - Near the soft deadline no further tool runs ("write your final answer now"), after a Stop / revoke no further tool runs, and every operation is
  *     ANSWERED (an unanswered one holds the worker's single pending slot until the turn's deadline).
@@ -19,7 +19,8 @@
  *   - Nothing here logs a frame, an argument, a result or an image: log lines carry fixed codes and counts.
  */
 import { createHash } from "crypto";
-import { IMAGE_LIMITS, toolImage, type ToolImage } from "../../loginHost/protocol";
+import { IMAGE_LIMITS, toolImage, type ToolDef, type ToolImage } from "../../loginHost/protocol";
+import { toToolDef } from "./relayManifest";
 import { LoginHostError, ToolResultLostError, type LoginHostClient } from "./loginHostClient";
 import { ToolBridgeAuthError, stableStringify, type BridgeCallResult, type BridgeListedTool } from "./toolBridge";
 
@@ -32,6 +33,8 @@ export const DELIVERY_FAILED_MESSAGE = "The tool ran but its result could not be
 export const RESULT_LOST_NOTE =
   "[Note: this action ran, but its result did not reach the assistant before the turn ended. It was not repeated. Check its current state before doing it again.]";
 /** Prefix of the answer to an identical retry of a call whose result was lost. */
+/** Appended to a result when a tool that became available could not be loaded for the worker: the model must not wait for it. */
+export const UNLOADABLE_NOTE = "[Note: a tool that just became available could not be loaded on your Claude plan, so it cannot be used in this turn.]";
 export const REPLAY_NOTE = "This identical call already ran earlier in this turn, but its result could not be delivered then. It was NOT run again. Its original result follows.\n";
 
 /** Hard limits of what is sent to the worker for one result (the worker's own are in loginHost/protocol.ts; these stay inside them). */
@@ -67,8 +70,8 @@ export interface RelayDispatcherOptions {
   /** The run's internal token: it stays in this process. */
   token: string;
   bridge: RelayBridgePort;
-  /** The manifest sent to the worker: `open` names are callable from the start, `locked` ones after a result unlocked them. */
-  manifest: { open: ReadonlySet<string>; locked: ReadonlySet<string> };
+  /** The manifest sent to the worker: the tools callable from the start. Later ones are added by `tools` in an answer (see `newTools`). */
+  manifest: { open: ReadonlySet<string> };
   /** True once a Stop, a revoke, a kill switch or a flag-off aborted the turn. */
   isStopped(): boolean;
   /** Epoch ms after which no further tool may start. */
@@ -98,7 +101,8 @@ interface Answer {
   content: string;
   isError: boolean;
   images?: ToolImage[];
-  unlock?: string[];
+  /** Definitions of tools that became available because of this call (the `tools` of turn.toolResult). */
+  tools?: ToolDef[];
   /** For a real execution: how to remember its original text if the worker cannot take the answer. */
   replay?: { key: string; content: string; isError: boolean };
 }
@@ -126,7 +130,11 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
 export class RelayToolDispatcher {
   private readonly inFlight = new Set<Promise<void>>();
   private readonly seenOps = new Set<string>();
-  private readonly unlocked = new Set<string>();
+  /** Names the worker has been sent (the manifest, plus definitions of answers it accepted or is being asked to accept). Case-folded, like the host. */
+  private readonly sent = new Set<string>();
+  private readonly sentExact = new Set<string>();
+  /** Newly available tools the worker refused (or that cannot be offered): not tried again this turn, the model was told once. */
+  private readonly rejected = new Set<string>();
   private readonly lost = new Set<string>();
   private readonly replays = new Map<string, { content: string; isError: boolean }>();
   /** Operations whose answer the worker ACCEPTED (the model read it). Every other executed call of the turn is "result lost". */
@@ -150,6 +158,7 @@ export class RelayToolDispatcher {
   private calls = 0;
 
   constructor(private readonly o: RelayDispatcherOptions) {
+    for (const n of o.manifest.open) this.markSent(n);
     this.now = o.now ?? Date.now;
     this.sleep = o.sleep ?? realSleep;
   }
@@ -276,8 +285,19 @@ export class RelayToolDispatcher {
     return false;
   }
 
+  private markSent(name: string): void {
+    this.sent.add(name.toLowerCase());
+    this.sentExact.add(name);
+  }
+
+  private unmarkSent(name: string): void {
+    this.sent.delete(name.toLowerCase());
+    this.sentExact.delete(name);
+  }
+
+  /** The tool names the worker may call: what it was sent. */
   private inManifest(name: string): boolean {
-    return this.o.manifest.open.has(name) || this.o.manifest.locked.has(name);
+    return this.sentExact.has(name);
   }
 
   private progress(phase: "start" | "end", name: string): void {
@@ -335,10 +355,9 @@ export class RelayToolDispatcher {
     const refuse = (message: string): Answer => ({ content: message, isError: true });
     if (this.o.isStopped()) return refuse(STOPPED_MESSAGE);
     if (this.o.softDeadlineAt !== undefined && this.now() >= this.o.softDeadlineAt) return refuse(SOFT_DEADLINE_MESSAGE);
-    // The manifest is the worker's view; the bridge's current list (checked again inside callTool) is the authority. A name outside the manifest, or a locked
-    // one that no accepted answer has unlocked, never reaches the bridge.
-    const inManifest = this.o.manifest.open.has(name) || (this.o.manifest.locked.has(name) && this.unlocked.has(name));
-    if (!inManifest) return refuse(NOT_IN_RUN_MESSAGE);
+    // The manifest is the worker's view; the bridge's current list (checked again inside callTool) is the authority. A name the worker was never sent
+    // (not in the manifest, not in the definitions of an answer) never reaches the bridge.
+    if (!this.inManifest(name)) return refuse(NOT_IN_RUN_MESSAGE);
     if (!isPlainObject(ev.input)) return refuse(BAD_INPUT_MESSAGE);
 
     const key = `${name}\u0000${stableStringify(ev.input)}`;
@@ -388,8 +407,10 @@ export class RelayToolDispatcher {
       if (images.length) answer.images = images;
       if (dropped > 0) answer.content += `\n[${dropped} image${dropped === 1 ? "" : "s"} could not be attached (unsupported, too large, or over the limit of ${IMAGE_LIMITS.maxImages}).]`;
     }
-    const unlock = await this.newlyUnlocked();
-    if (unlock.length) answer.unlock = unlock;
+    // After EVERY executed call (not only install_skills): any tool the run has now that the worker was not sent travels in this answer.
+    const fresh = await this.newTools();
+    if (fresh.defs.length) answer.tools = fresh.defs;
+    if (fresh.notes.length) answer.content += `\n${fresh.notes.join("\n")}`;
     answer.replay = { key, content: result.content, isError: answer.isError };
     return answer;
   }
@@ -406,16 +427,36 @@ export class RelayToolDispatcher {
     return { images: kept, dropped: images.length - kept.length };
   }
 
-  /** Locked manifest tools the bridge's CURRENT list now offers (a skill install), not yet unlocked. Never throws. */
-  private async newlyUnlocked(): Promise<string[]> {
-    const waiting = [...this.o.manifest.locked].filter((n) => !this.unlocked.has(n));
-    if (waiting.length === 0) return [];
+  /**
+   * "Newly available" = the bridge's CURRENT tool list for the run, minus the names already sent to the worker (case-folded). The definitions are built with
+   * the manifest's own rules; a tool that cannot be offered whole (bad name, oversized schema or description, a case-only duplicate) is NOT sent, stays
+   * invisible to the model this turn, and the result text says so (one fixed log code with counts). Never throws.
+   */
+  private async newTools(): Promise<{ defs: ToolDef[]; notes: string[] }> {
+    let list: BridgeListedTool[];
     try {
-      const current = new Set((await this.o.bridge.listTools(this.o.token, this.o.runId)).map((t) => t.name));
-      return waiting.filter((n) => current.has(n));
+      list = await this.o.bridge.listTools(this.o.token, this.o.runId);
     } catch {
-      return [];
+      return { defs: [], notes: [] };
     }
+    const defs: ToolDef[] = [];
+    let problems = 0;
+    const pending = new Set<string>();
+    for (const tool of list) {
+      const name = tool?.name;
+      if (typeof name !== "string" || this.sentExact.has(name) || this.rejected.has(name)) continue;
+      const made = toToolDef(tool);
+      const folded = typeof name === "string" ? name.toLowerCase() : "";
+      if ("skip" in made || made.truncated || this.sent.has(folded) || pending.has(folded)) {
+        this.rejected.add(name);
+        problems++;
+        continue;
+      }
+      pending.add(folded);
+      defs.push(made.def);
+    }
+    if (problems > 0) this.log(`new_tool_unloadable count=${problems}`);
+    return { defs, notes: problems > 0 ? [UNLOADABLE_NOTE] : [] };
   }
 
   // ───────────────────────────── the answer ─────────────────────────────
@@ -423,9 +464,9 @@ export class RelayToolDispatcher {
   private async deliver(op: string, first: Answer): Promise<void> {
     const ids = this.o.ids;
     let answer = this.bound(first);
-    // S2: the worker hands an unlock to the shim BEFORE it replies to us, so a fast call to the new tool can arrive before this post resolves. The names are
-    // marked first; the bridge still checks its CURRENT list on every call, so this grants nothing the bridge does not.
-    for (const n of answer.unlock ?? []) this.unlocked.add(n);
+    // S2: the worker hands new definitions to the shim BEFORE it replies to us, so a fast call to a new tool can arrive before this post resolves. The names
+    // are marked first (and unmarked if the worker refuses them); the bridge still checks its CURRENT list on every call, so this grants nothing it does not.
+    for (const t of answer.tools ?? []) this.markSent(t.name);
     let attempts = 0;
     let shrinks = 0;
     for (;;) {
@@ -438,7 +479,7 @@ export class RelayToolDispatcher {
           content: answer.content,
           ...(answer.isError ? { isError: true } : {}),
           ...(answer.images?.length ? { images: answer.images } : {}),
-          ...(answer.unlock?.length ? { unlock: answer.unlock } : {}),
+          ...(answer.tools?.length ? { tools: answer.tools } : {}),
         });
         this.delivered.add(op);
         this.rememberReplay(op, answer);
@@ -456,9 +497,15 @@ export class RelayToolDispatcher {
           answer = this.shrink(answer);
           continue;
         }
-        if (err instanceof LoginHostError && err.code === "EINVALID" && err.detail === "unlock_unknown_tool" && answer.unlock) {
-          for (const n of answer.unlock) this.unlocked.delete(n); // the worker will not reveal them, so no call for them is expected
-          answer = { ...answer, unlock: undefined };
+        if (err instanceof LoginHostError && err.code === "EINVALID" && (err.detail ?? "").startsWith("tools_") && answer.tools) {
+          // The worker refused the definitions (invalid, or over its cumulative caps) and kept the operation pending: answer again WITHOUT them. They are not
+          // marked sent, so the model never sees them this turn, and it is told so.
+          for (const t of answer.tools) {
+            this.unmarkSent(t.name);
+            this.rejected.add(t.name);
+          }
+          this.log("new_tools_refused");
+          answer = { ...answer, tools: undefined, content: `${answer.content}\n${UNLOADABLE_NOTE}` };
           continue;
         }
         if (err instanceof LoginHostError && err.ambiguous && ++attempts < MAX_DELIVERY_ATTEMPTS) {
@@ -470,6 +517,7 @@ export class RelayToolDispatcher {
         this.rememberReplay(op, answer);
         this.log(err instanceof LoginHostError ? `deliver_${err.code}` : "deliver_invalid");
         if (answer.content === DELIVERY_FAILED_MESSAGE) return;
+        for (const t of answer.tools ?? []) this.unmarkSent(t.name);
         answer = { content: DELIVERY_FAILED_MESSAGE, isError: true };
         attempts = 0;
       }
@@ -482,7 +530,7 @@ export class RelayToolDispatcher {
     if (Buffer.byteLength(content, "utf8") > MAX_CONTENT_BYTES) content = `${truncateUtf8(content, MAX_CONTENT_BYTES)}${TRUNCATED_NOTE}`;
     let images = a.images;
     let dropped = 0;
-    const size = () => Buffer.byteLength(JSON.stringify({ content, images, unlock: a.unlock, operationId: "x".repeat(64), connectionId: "x".repeat(64), turnId: "x".repeat(64), epoch: 1e9, isError: true }), "utf8");
+    const size = () => Buffer.byteLength(JSON.stringify({ content, images, tools: a.tools, operationId: "x".repeat(64), connectionId: "x".repeat(64), turnId: "x".repeat(64), epoch: 1e9, isError: true }), "utf8");
     while (images?.length && size() > MAX_BODY_BYTES) {
       images = images.slice(0, -1);
       dropped++;
@@ -496,6 +544,13 @@ export class RelayToolDispatcher {
   /** The worker refused the answer as too large: images go first, then the text is halved. */
   private shrink(a: Answer): Answer {
     if (a.images?.length) return { ...a, content: `${a.content}\n[the images could not be attached (too large).]`, images: undefined };
+    if (a.tools?.length) {
+      for (const t of a.tools) {
+        this.unmarkSent(t.name);
+        this.rejected.add(t.name);
+      }
+      return { ...a, content: `${a.content}\n${UNLOADABLE_NOTE}`, tools: undefined };
+    }
     return { ...a, content: `${truncateUtf8(a.content, Math.max(1_000, Math.floor(Buffer.byteLength(a.content, "utf8") / 2)))}${TRUNCATED_NOTE}` };
   }
 

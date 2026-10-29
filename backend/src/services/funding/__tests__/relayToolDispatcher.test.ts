@@ -4,7 +4,7 @@
  */
 import { IMAGE_LIMITS } from '../../../loginHost/protocol';
 import { LoginHostError, ToolResultLostError } from '../loginHostClient';
-import { DELIVERY_FAILED_MESSAGE, NOT_IN_RUN_MESSAGE, REPLAY_NOTE, RelayToolDispatcher, SOFT_DEADLINE_MESSAGE, STOPPED_MESSAGE, type RelayCallEvent } from '../relayToolDispatcher';
+import { DELIVERY_FAILED_MESSAGE, NOT_IN_RUN_MESSAGE, REPLAY_NOTE, UNLOADABLE_NOTE, RelayToolDispatcher, SOFT_DEADLINE_MESSAGE, STOPPED_MESSAGE, type RelayCallEvent } from '../relayToolDispatcher';
 import { ToolBridge, type BridgeExecuteOutcome, type ToolBridgeDeps } from '../toolBridge';
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -26,25 +26,28 @@ interface Opts {
   /** Runs inside client.turnToolResult before it answers (a post that is still in flight). */
   onPost?: (input: any) => Promise<void> | void;
   announceWaitMs?: number;
+  /** Tools that appear in the run's list after the named tool executes (default: install_skills adds late_tool). */
+  appearAfter?: Record<string, Array<Record<string, unknown>>>;
 }
 
 function rig(o: Opts = {}) {
   const executed: Array<{ name: string; args: Record<string, unknown> }> = [];
-  let installed = false;
+  const extra: Array<Record<string, unknown>> = []; // tools the run gains while executing
+  const appear: Record<string, Array<Record<string, unknown>>> = o.appearAfter ?? { install_skills: [{ name: 'late_tool', description: 'Late', inputSchema: { type: 'object', properties: {} } }] };
   const live = { value: true };
   const toolDeps = {
-    resolveTools: async () => [{ name: 'search' }, { name: 'save_note' }, { name: 'install_skills' }, { name: 'send_email' }, ...(installed ? [{ name: 'late_tool' }] : [])],
+    resolveTools: async () => [{ name: 'search' }, { name: 'save_note' }, { name: 'install_skills' }, { name: 'send_email' }, ...extra],
     isReadOnly: (n: string) => n === 'search',
     isLive: async () => live.value,
     execute: async (_run: unknown, call: { name: string; args: Record<string, unknown> }): Promise<BridgeExecuteOutcome> => {
       executed.push({ name: call.name, args: call.args });
       if (o.gate?.[call.name]) await o.gate[call.name];
-      if (call.name === 'install_skills') installed = true;
+      for (const t of appear[call.name] ?? []) extra.push(t);
       return {
         content: o.content?.[call.name] ?? `${call.name} done`,
         isError: o.errors?.includes(call.name) === true,
         requiresConfirmation: o.confirm?.includes(call.name) === true,
-        toolsChanged: call.name === 'install_skills',
+        toolsChanged: appear[call.name] !== undefined,
         ...(o.images?.[call.name] ? { images: o.images[call.name] } : {}),
       };
     },
@@ -77,7 +80,7 @@ function rig(o: Opts = {}) {
       noteToolResult: (r) => bridge.noteToolResult(r),
       takeLedger: (r) => bridge.takeLedger(r),
     },
-    manifest: { open: new Set(['search', 'save_note', 'install_skills', 'send_email']), locked: new Set(['late_tool']) },
+    manifest: { open: new Set(['search', 'save_note', 'install_skills', 'send_email']) },
     isStopped: o.stopped ?? (() => false),
     softDeadlineAt: o.softDeadlineAt,
     now: o.now,
@@ -155,7 +158,7 @@ describe('RelayToolDispatcher', () => {
     expect(t.posts.map((p) => p.operationId).sort()).toEqual(['op-1', 'op-2']);
   });
 
-  it('refuses a name outside the manifest and a locked name that was not unlocked, without touching the bridge', async () => {
+  it('refuses a name outside the manifest and a tool the worker was never sent, without touching the bridge', async () => {
     const t = rig();
     t.d.start(t.ev('op-1', 'drop_tables'));
     t.d.start(t.ev('op-2', 'late_tool'));
@@ -179,22 +182,120 @@ describe('RelayToolDispatcher', () => {
     expect(t.posts.every((p) => p.isError === true)).toBe(true);
   });
 
-  it('install_skills unlocks a locked tool: the SAME result carries `unlock`, and only then is the tool callable', async () => {
-    const t = rig();
-    t.d.start(t.ev('op-1', 'install_skills', { skills: ['x'] }));
-    await t.d.settle(1_000);
-    expect(t.posts[0]).toMatchObject({ operationId: 'op-1', content: 'install_skills done', unlock: ['late_tool'] });
-    t.d.start(t.ev('op-2', 'late_tool'));
-    await t.d.settle(1_000);
-    expect(t.executed.map((e) => e.name)).toEqual(['install_skills', 'late_tool']);
-    expect(t.posts[1].unlock).toBeUndefined();
-  });
+  describe('tools that become available mid-turn travel as definitions in the answer', () => {
+    it('install_skills: the SAME answer carries the new tool\'s definition, and only then is the tool callable (same-turn use)', async () => {
+      const t = rig();
+      t.d.start(t.ev('op-1', 'install_skills', { skills: ['x'] }));
+      await t.d.settle(1_000);
+      expect(t.posts[0]).toMatchObject({ operationId: 'op-1', content: 'install_skills done', tools: [{ name: 'late_tool', description: 'Late', inputSchema: { type: 'object', properties: {} } }] });
+      expect(t.posts[0].unlock).toBeUndefined();
+      t.d.start(t.ev('op-2', 'late_tool'));
+      await t.d.settle(1_000);
+      expect(t.executed.map((e) => e.name)).toEqual(['install_skills', 'late_tool']);
+      expect(t.posts[1].tools).toBeUndefined(); // already sent: nothing to add
+    });
 
-  it('a locked tool that the bridge does not list is never unlocked (the bridge list is the authority)', async () => {
-    const t = rig();
-    t.d.start(t.ev('op-1', 'search'));
-    await t.d.settle(1_000);
-    expect(t.posts[0].unlock).toBeUndefined();
+    it('a call that is not install_skills can make a tool available too (the diff runs after EVERY executed call)', async () => {
+      const t = rig({ appearAfter: { save_note: [{ name: 'followup', description: 'F' }] } });
+      t.d.start(t.ev('op-1', 'save_note', { n: 1 }));
+      await t.d.settle(1_000);
+      expect(t.posts[0].tools?.map((x: any) => x.name)).toEqual(['followup']);
+      expect(t.posts[0].tools[0].inputSchema).toEqual({ type: 'object', properties: {} });
+    });
+
+    it('a tool the bridge does not list (its skill is not installed or not entitled) never appears and cannot be called', async () => {
+      const t = rig({ appearAfter: {} });
+      t.d.start(t.ev('op-1', 'save_note'));
+      t.d.start(t.ev('op-2', 'search'));
+      await t.d.settle(1_000);
+      t.d.start(t.ev('op-3', 'late_tool'));
+      await t.d.settle(1_000);
+      expect(t.posts.slice(0, 2).every((p) => p.tools === undefined)).toBe(true);
+      expect(t.executed.map((e) => e.name).sort()).toEqual(['save_note', 'search']);
+      expect(t.posts[2]).toMatchObject({ isError: true, content: NOT_IN_RUN_MESSAGE });
+    });
+
+    it('a definition is sent once: the next call does not repeat it', async () => {
+      const t = rig();
+      t.d.start(t.ev('op-1', 'install_skills'));
+      await t.d.settle(1_000);
+      t.d.start(t.ev('op-2', 'save_note'));
+      await t.d.settle(1_000);
+      expect(t.posts[0].tools).toHaveLength(1);
+      expect(t.posts[1].tools).toBeUndefined();
+    });
+
+    it('a retry after the post failed ambiguously re-sends the same definitions (idempotent; they count as sent only once accepted)', async () => {
+      const t = rig();
+      t.behaviour.next = [new LoginHostError('TIMEOUT', 'request')];
+      t.d.start(t.ev('op-1', 'install_skills'));
+      await t.d.settle(1_000);
+      expect(t.posts).toHaveLength(2);
+      expect(t.posts[1].tools).toEqual(t.posts[0].tools);
+    });
+
+    it('definitions the worker refuses (tools_invalid / tools_limit): the answer is re-sent WITHOUT them, they are not marked sent, the model is told, and the tool cannot be called', async () => {
+      for (const detail of ['tools_invalid', 'tools_limit']) {
+        const t = rig();
+        t.behaviour.next = [new LoginHostError('EINVALID', detail)];
+        t.d.start(t.ev('op-1', 'install_skills'));
+        await t.d.settle(1_000);
+        expect(t.posts).toHaveLength(2);
+        expect(t.posts[0].tools).toHaveLength(1);
+        expect(t.posts[1].tools).toBeUndefined();
+        expect(t.posts[1].content).toContain(UNLOADABLE_NOTE);
+        expect(t.d.lostCallIds().size).toBe(0);
+        t.d.start(t.ev('op-2', 'late_tool'));
+        await t.d.settle(1_000);
+        expect(t.executed.map((e) => e.name)).toEqual(['install_skills']);
+        expect(t.posts[2]).toMatchObject({ isError: true, content: NOT_IN_RUN_MESSAGE });
+        t.d.start(t.ev('op-3', 'save_note'));
+        await t.d.settle(1_000);
+        expect(t.posts[3].tools).toBeUndefined(); // not retried on every later call
+      }
+    });
+
+    it('a definition that cannot be built (oversized schema, bad name, cut description) is never sent: invisible this turn, the model is told, a fixed code is logged', async () => {
+      const t = rig({
+        appearAfter: {
+          install_skills: [
+            { name: 'ok_tool', description: 'fine', inputSchema: { type: 'object' } },
+            { name: 'huge', inputSchema: { type: 'object', properties: { p: { description: 'x'.repeat(40_000) } } } },
+            { name: 'bad.name' },
+            { name: 'long_desc', description: 'é'.repeat(30_000), inputSchema: { type: 'object' } },
+          ],
+        },
+      });
+      t.d.start(t.ev('op-1', 'install_skills'));
+      await t.d.settle(1_000);
+      expect(t.posts[0].tools.map((x: any) => x.name)).toEqual(['ok_tool']);
+      expect(t.posts[0].content).toContain(UNLOADABLE_NOTE);
+      const logged = errors.join('\n');
+      expect(logged).toContain('new_tool_unloadable count=3');
+      expect(logged).not.toMatch(/huge|bad\.name|long_desc/);
+      t.d.start(t.ev('op-2', 'huge'));
+      await t.d.settle(1_000);
+      expect(t.executed.map((e) => e.name)).toEqual(['install_skills']);
+    });
+
+    it('a new tool whose name differs from an already sent one only in case is not sent (the host folds case)', async () => {
+      const t = rig({ appearAfter: { install_skills: [{ name: 'Save_Note', description: 'dup' }] } });
+      t.d.start(t.ev('op-1', 'install_skills'));
+      await t.d.settle(1_000);
+      expect(t.posts[0].tools).toBeUndefined();
+      expect(t.posts[0].content).toContain(UNLOADABLE_NOTE);
+    });
+
+    it('a body the worker finds too large drops the definitions after the images, and the model is told', async () => {
+      const t = rig({ images: { install_skills: [img(8)] } });
+      t.behaviour.next = [new LoginHostError('EINVALID', 'result_too_large'), new LoginHostError('EINVALID', 'result_too_large')];
+      t.d.start(t.ev('op-1', 'install_skills'));
+      await t.d.settle(1_000);
+      expect(t.posts[1].images).toBeUndefined();
+      expect(t.posts[1].tools).toHaveLength(1);
+      expect(t.posts[2].tools).toBeUndefined();
+      expect(t.posts[2].content).toContain(UNLOADABLE_NOTE);
+    });
   });
 
   it('after the soft deadline no tool runs: the model is told to write its answer', async () => {
@@ -572,13 +673,13 @@ describe('RelayToolDispatcher', () => {
       expect([...t.d.lostCallIds()]).toEqual(['op-1']);
     });
 
-    it('S2: a call to a newly unlocked tool that arrives while the install answer is still being posted is accepted', async () => {
+    it('S2: a call to a newly available tool that arrives while the install answer is still being posted is accepted', async () => {
       let t!: ReturnType<typeof rig>;
       let lateStarted = false;
       t = rig({
         onPost: async (input) => {
           if (input.operationId === 'op-1') {
-            t.d.start(t.ev('op-2', 'late_tool')); // the worker already handed the unlock to the shim and the CLI called the tool
+            t.d.start(t.ev('op-2', 'late_tool')); // the worker already handed the definition to the shim and the CLI called the tool
             lateStarted = true;
             await sleep(20);
           }
@@ -600,18 +701,6 @@ describe('RelayToolDispatcher', () => {
       u.d.start(u.ev('op-1', 'search'));
       await u.d.settle(1_000);
       expect(Buffer.byteLength(JSON.stringify(u.posts[0]))).toBeLessThanOrEqual(7.5 * 1024 * 1024);
-    });
-
-    it('an unlock the worker does not know is dropped and the result is still delivered', async () => {
-      const t = rig();
-      t.behaviour.next = [new LoginHostError('EINVALID', 'unlock_unknown_tool')];
-      t.d.start(t.ev('op-1', 'install_skills'));
-      await t.d.settle(1_000);
-      expect(t.posts[0].unlock).toEqual(['late_tool']);
-      expect(t.posts[1].unlock).toBeUndefined();
-      t.d.start(t.ev('op-2', 'late_tool'));
-      await t.d.settle(1_000);
-      expect(t.posts[2]).toMatchObject({ isError: true, content: NOT_IN_RUN_MESSAGE }); // the worker never revealed it, so it stays locked here
     });
 
     it('a very long result is truncated with a note; one the worker still finds too large is halved until it fits', async () => {
@@ -651,7 +740,7 @@ describe('RelayToolDispatcher: an unforeseen failure still answers the operation
       runId: 'r1',
       token: 't',
       bridge: { callTool: async () => ({ content: 'x', isError: false }), listTools: async () => [], noteToolUse: () => undefined, noteToolResult: () => undefined, takeLedger: () => ({ records: [], truncated: 0 }) },
-      manifest: { open: new Set(['search']), locked: new Set() },
+      manifest: { open: new Set(['search']) },
       isStopped: () => false,
       isHalted: () => false,
     });
