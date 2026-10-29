@@ -34,7 +34,8 @@ import { isEligibleGroupEmailRecipient } from '../utils/groupEmailRecipientValid
 import { syncContact, SyncInput } from '../services/contactSyncService';
 import { isCardRevenueField } from '../services/enrichmentGroups';
 import { stripImplicitCardRevenueRouting } from '../services/enrichmentConfigService';
-import { estimateEnrichmentCost, checkEstimateConfirmation } from '../services/enrichmentCostEstimate';
+import { estimateEnrichmentCost,
+  normalizeLeadSelection, checkEstimateConfirmation } from '../services/enrichmentCostEstimate';
 import { enrichContact, defaultEnrichmentCache, EnrichmentDeps } from '../services/internalEnrichmentService';
 import { dedupContactsForUser } from '../services/contactDedupService';
 import {
@@ -1835,10 +1836,7 @@ const countLeadsForEnrichment = async (listId: string, leadIds?: string[]): Prom
   return total;
 };
 
-const parseLeadIds = (body: any): string[] | undefined =>
-  Array.isArray(body?.leadIds)
-    ? body.leadIds.filter((id: unknown): id is string => typeof id === 'string')
-    : undefined;
+const parseLeadIds = (body: any): string[] | undefined => normalizeLeadSelection(body?.leadIds);
 
 /**
  * @route POST /api/crm/lists/:listId/leads/enrich-v3/estimate

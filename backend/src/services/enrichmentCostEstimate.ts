@@ -87,3 +87,14 @@ export function checkEstimateConfirmation(
   }
   return supplied === estimate.confirmationToken ? { ok: true } : { ok: false, reason: 'stale' };
 }
+
+/**
+ * Normalize a client lead selection. An absent or empty array means "whole
+ * list" (the enrich run already treats it that way), so the estimate must
+ * price the same leads the run will process.
+ */
+export function normalizeLeadSelection(raw: unknown): string[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const ids = raw.filter((id: unknown): id is string => typeof id === 'string');
+  return ids.length > 0 ? ids : undefined;
+}
