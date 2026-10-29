@@ -1,4 +1,4 @@
-## ENG-673: AgentWeb's own senders skip leads pushed to Smartlead (PR-D1, 2026-10-28)
+## ENG-673: AgentWeb's own senders skip leads pushed to Smartlead — PR-D1 (2026-10-28)
 
 A lead pushed to a customer's Smartlead campaign carries a marker (`system.smartlead_<campaignId>`, state `pushed`, or `withdrawn` after an opt-out). It is emailed from Smartlead, so AgentWeb's own senders must not also email it (two senders, and Smartlead's unsubscribe and bounce handling would not see AgentWeb's mail). A `released` marker (a list editor cleared it, PR-D2) counts as not pushed. The check is `isPushedToSmartlead(lead)` in `services/smartleadMarkers.ts`. It is deliberately NOT part of `isDoNotContact`: bounce recording (`routes/webhooks.ts`, `outlookBounceMonitorCron`) and the unsubscribe page (`routes/crmPublic.ts`) use that and must not change (a test pins it).
 

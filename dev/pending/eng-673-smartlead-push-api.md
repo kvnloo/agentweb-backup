@@ -1,4 +1,4 @@
-## ENG-673: Smartlead push API (PR-C2, 2026-10-28)
+## ENG-673: Smartlead push API — PR-C2 (2026-10-28)
 
 The routes, the signed approval, the service and the resumer that make the push engine (PR-C1) usable. OFF unless `SMARTLEAD_PUSH_ENABLED=true`; nothing in the portal calls it yet (PR-E).
 

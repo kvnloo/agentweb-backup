@@ -64,13 +64,14 @@ function unwrap<T extends { ok: boolean }>(result: T): Extract<T, { ok: true }> 
 interface PushArgs {
   listId: string;
   campaignId: number;
+  accountId?: string;
   includeUnverified: boolean;
   mapping: Record<string, string>;
   acknowledgedTags: string[];
   cohort?: number;
 }
 
-const PUSH_KEYS = ['listId', 'campaignId', 'includeUnverified', 'mapping', 'acknowledgedTags', 'cohort', 'confirm'] as const;
+const PUSH_KEYS = ['listId', 'campaignId', 'accountId', 'includeUnverified', 'mapping', 'acknowledgedTags', 'cohort', 'confirm'] as const;
 
 function pushArgs(args: unknown): PushArgs {
   const a = onlyKeys(args, PUSH_KEYS);
@@ -88,6 +89,7 @@ function pushArgs(args: unknown): PushArgs {
   return {
     listId: idArg(a.listId, 'listId'),
     campaignId: campaignArg(a.campaignId),
+    ...(a.accountId !== undefined ? { accountId: idArg(a.accountId, 'accountId') } : {}),
     includeUnverified: a.includeUnverified === true,
     mapping,
     acknowledgedTags: tagsRaw as string[],
@@ -98,6 +100,7 @@ function pushArgs(args: unknown): PushArgs {
 const pushBody = (p: PushArgs) => ({
   listId: p.listId,
   campaignId: p.campaignId,
+  ...(p.accountId ? { accountId: p.accountId } : {}),
   includeUnverified: p.includeUnverified,
   mapping: p.mapping,
   acknowledgedTags: p.acknowledgedTags,
@@ -108,6 +111,7 @@ const pushBody = (p: PushArgs) => ({
 function previewSummary(p: any) {
   return {
     campaign: p.campaign,
+    smartleadAccount: p.connection,
     emailStepsInCampaignSequence: p.sequence.stepCount,
     list: p.list,
     cohort: p.cohort,
@@ -121,7 +125,8 @@ function previewSummary(p: any) {
 
 const PUSH_PROPERTIES = {
   listId: { type: 'string', description: 'The CRM list to push (its id from get_lead_lists).' },
-  campaignId: { type: 'number', description: "The id of one of the user's own Smartlead campaigns (from list_smartlead_campaigns)." },
+  campaignId: { type: 'number', description: "The id of one of the campaigns in the user's Smartlead account (from list_smartlead_campaigns)." },
+  accountId: { type: 'string', description: "Which Smartlead connection to use, only when more than one is available (the error lists them); by default the user's own, else the one a teammate shared." },
   includeUnverified: { type: 'boolean', description: 'Also push contacts whose email is not verified. Default false; do not turn this on unless the user asks.' },
   mapping: { type: 'object', additionalProperties: { type: 'string' }, description: 'For a merge field the campaign uses that is not a standard one: its name mapped to the CRM field that fills it, from fieldsToDecide in the preview.' },
   acknowledgedTags: { type: 'array', items: { type: 'string' }, description: 'Merge fields the user said Smartlead fills in itself. Only what the user said.' },
@@ -182,12 +187,12 @@ emmaToolRegistry.register({
   definition: {
     name: 'list_smartlead_campaigns',
     description: "List the campaigns in the user's own connected Smartlead account, with their status and whether leads can be added to them. Smartlead sends the emails; the user makes and starts campaigns in Smartlead. Use this to let the user pick a campaign before push preview.",
-    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    inputSchema: { type: 'object', properties: { accountId: PUSH_PROPERTIES.accountId }, additionalProperties: false },
   },
   execute: async (args: unknown, context?: ToolContext) => {
-    onlyKeys(args, []);
-    const { campaigns } = unwrap(await getSmartleadPushService().campaigns(userIdOf(context)));
-    return { success: true, campaigns };
+    const a = onlyKeys(args, ['accountId']);
+    const { campaigns, connection } = unwrap(await getSmartleadPushService().campaigns(userIdOf(context), a.accountId === undefined ? undefined : idArg(a.accountId, 'accountId')));
+    return { success: true, smartleadAccount: connection, campaigns };
   },
 });
 
@@ -240,7 +245,7 @@ emmaToolRegistry.register({
       question: kind => gate.buildPushQuestion({
         kind, listName, campaignName: preview.campaign.name, campaignStatus: String(preview.campaign.status ?? ''),
         cohort: preview.cohort.chosen, eligible: preview.list.eligible, listTotal: preview.list.total,
-        requiresActiveConfirmation: preview.requiresActiveConfirmation === true, smartleadFilledTags: p.acknowledgedTags, includeUnverified: p.includeUnverified, mapping: p.mapping,
+        requiresActiveConfirmation: preview.requiresActiveConfirmation === true, smartleadFilledTags: p.acknowledgedTags, includeUnverified: p.includeUnverified, mapping: p.mapping, connection: { name: preview.connection.name, shared: preview.connection.shared },
       }),
     });
     if (halt) return halt;

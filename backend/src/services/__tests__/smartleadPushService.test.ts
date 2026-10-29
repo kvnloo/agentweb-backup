@@ -111,14 +111,12 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
       expect(p.token).toBeTruthy();
     });
 
-    it("refuses without edit access, for a missing list, with no connection, with a teammate-only key, and while switched off", async () => {
+    it("refuses without edit access, for a missing list, with no connection, and while switched off", async () => {
       const e = env();
       expect(await e.svc.preview("stranger", { listId: e.listId, campaignId: CAMPAIGN })).toMatchObject({ ok: false, status: 403, code: "forbidden" });
       expect(await e.svc.preview("owner", { listId: "nope", campaignId: CAMPAIGN })).toMatchObject({ ok: false, status: 404 });
       e.editors.add("nokey");
       expect(await e.svc.preview("nokey", { listId: e.listId, campaignId: CAMPAIGN })).toMatchObject({ ok: false, status: 409, code: "not_connected" });
-      e.deps.resolveKey = async () => ({ ok: true, apiKey: "k", ownerUserId: "teammate", accountId: "smartlead-teammate", accountName: "x" });
-      expect(await e.svc.preview("owner", { listId: e.listId, campaignId: CAMPAIGN })).toMatchObject({ ok: false, status: 403, code: "shared_key_not_supported" });
       e.flags.enabled = false;
       expect(await e.svc.preview("owner", { listId: e.listId, campaignId: CAMPAIGN })).toMatchObject({ ok: false, status: 503, code: "disabled" });
     });
@@ -322,12 +320,12 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
       expect(await db.claimToken(jti, 60)).toBe(true); // not spent by the attempt that started nothing
     });
 
-    it("lets only the person whose Smartlead connection a run uses resume it; other editors can pause and cancel", async () => {
+    it("lets only people who can use the Smartlead connection a run uses resume it; other editors can pause and cancel", async () => {
       const e = env({ maxConcurrentWorkers: 0 });
       e.editors.add("editor");
       const r = (await e.svc.start("owner", go((await approve(e)).token))) as any;
       expect((await e.svc.pause("editor", r.run.runId)).ok).toBe(true);
-      expect(await e.svc.resume("editor", r.run.runId)).toMatchObject({ ok: false, status: 403, code: "resume_requires_pusher" });
+      expect(await e.svc.resume("editor", r.run.runId)).toMatchObject({ ok: false, status: 403, code: "resume_requires_connection" });
       expect(((await e.svc.status("owner", r.run.runId)) as any).run.status).toBe("paused");
       expect((await e.svc.resume("owner", r.run.runId)).ok).toBe(true);
       expect((await e.svc.cancel("editor", r.run.runId)).ok).toBe(true);
@@ -629,6 +627,218 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
       expect(await e.svc.sweepWithdrawals()).toMatchObject({ withdrawn: 0, keyUnavailable: 1 });
       expect(e.unsub).not.toHaveBeenCalled();
       expect(e.leads[2].system.smartlead_77.state).toBe("pushed");
+    });
+
+    // ── a Smartlead key is stored per user and shareable with the org (owner decision 2026-10-28)
+    describe("a connection shared with the org", () => {
+      type Conn = { accountId: string; owner: string; name: string; sharedWith: string[] };
+      /** Mimics resolveSmartlead: the caller's own connection first, else the single shared one, else a choice; an explicit account id picks one. */
+      const install = (e: ReturnType<typeof env>, conns: Conn[]) => {
+        e.deps.resolveKey = async (userId, accountId) => {
+          const visible = conns.filter(c => c.owner === userId || c.sharedWith.includes(userId));
+          if (visible.length === 0) return { ok: false, reason: "not_connected", message: "No Smartlead account is connected." };
+          const own = visible.filter(c => c.owner === userId);
+          const pick = accountId ? visible.find(c => c.accountId === accountId) : own.length === 1 ? own[0] : own.length === 0 && visible.length === 1 ? visible[0] : undefined;
+          if (accountId && !pick) return { ok: false, reason: "not_connected", message: "No Smartlead account is connected." };
+          if (!pick) return { ok: false, reason: "choose", message: "Several Smartlead connections are available. Choose which one to use.", candidates: visible.map(c => ({ accountId: c.accountId, ownerUserId: c.owner, accountName: c.name })) };
+          return { ok: true, apiKey: `key-of-${pick.owner}`, ownerUserId: pick.owner, accountId: pick.accountId, accountName: pick.name };
+        };
+      };
+      const OWNERS: Conn = { accountId: "smartlead-owner", owner: "owner", name: "Mindd Smartlead", sharedWith: ["editor", "editor2"] };
+
+      it("a teammate with no connection of their own pushes through the shared one: the run records whose key it was, and the key used is the owner's", async () => {
+        const e = env();
+        e.editors.add("editor");
+        install(e, [OWNERS]);
+        const keys: string[] = [];
+        const add = e.deps.smartlead.addLeads;
+        e.deps.smartlead.addLeads = async (k, c, x) => { keys.push(k); return add(k, c, x); };
+        const p = (await e.svc.preview("editor", { listId: e.listId, campaignId: CAMPAIGN })) as any;
+        expect(p.ok).toBe(true);
+        expect(p.preview.connection).toEqual({ accountId: "smartlead-owner", name: "Mindd Smartlead", shared: true });
+        const r = (await e.svc.start("editor", go(p.preview.token))) as any;
+        expect(r.ok).toBe(true);
+        expect(await db.getRun(r.run.runId)).toMatchObject({ pushedBy: "editor", keyOwnerId: "owner", smartleadAccountId: "smartlead-owner", ownerId: "owner" });
+        await drain(e);
+        expect(keys.length).toBeGreaterThan(0);
+        expect(new Set(keys)).toEqual(new Set(["key-of-owner"]));
+      });
+
+      it("the owner's own connection says it is not shared, and the campaigns list names the connection", async () => {
+        const e = env();
+        install(e, [OWNERS]);
+        const c = (await e.svc.campaigns("owner")) as any;
+        expect(c.connection).toEqual({ accountId: "smartlead-owner", name: "Mindd Smartlead", shared: false });
+        e.editors.add("editor");
+        expect(((await e.svc.campaigns("editor")) as any).connection.shared).toBe(true);
+      });
+
+      it("a member's own connection wins over a shared one", async () => {
+        const e = env();
+        e.editors.add("editor");
+        install(e, [OWNERS, { accountId: "smartlead-editor", owner: "editor", name: "Editor's own", sharedWith: [] }]);
+        const p = (await e.svc.preview("editor", { listId: e.listId, campaignId: CAMPAIGN })) as any;
+        expect(p.preview.connection).toEqual({ accountId: "smartlead-editor", name: "Editor's own", shared: false });
+      });
+
+      it("when the resolver reports a choice but exactly one candidate is the caller's own, that one is used (the service never guesses between teammates' connections)", async () => {
+        const e = env();
+        e.editors.add("editor");
+        e.deps.resolveKey = async (_u, a) => a
+          ? { ok: true, apiKey: `key-of-${a}`, ownerUserId: a === "mine" ? "editor" : "owner", accountId: a, accountName: a }
+          : { ok: false, reason: "choose", message: "Several", candidates: [{ accountId: "theirs", ownerUserId: "owner", accountName: "theirs" }, { accountId: "mine", ownerUserId: "editor", accountName: "mine" }] };
+        expect(((await e.svc.preview("editor", { listId: e.listId, campaignId: CAMPAIGN })) as any).preview.connection).toEqual({ accountId: "mine", name: "mine", shared: false });
+        e.deps.resolveKey = async () => ({ ok: false, reason: "choose", message: "Several", candidates: [{ accountId: "a", ownerUserId: "owner" }, { accountId: "b", ownerUserId: "other" }] });
+        expect(await e.svc.preview("editor", { listId: e.listId, campaignId: CAMPAIGN })).toMatchObject({ ok: false, code: "choose_connection" });
+      });
+
+      it("several shared connections and none of their own: the caller must choose, is told which are available, and can then pick one", async () => {
+        const e = env();
+        e.editors.add("editor");
+        install(e, [OWNERS, { accountId: "smartlead-other", owner: "other", name: "Other SL", sharedWith: ["editor"] }]);
+        const r = (await e.svc.preview("editor", { listId: e.listId, campaignId: CAMPAIGN })) as any;
+        expect(r).toMatchObject({ ok: false, status: 409, code: "choose_connection" });
+        expect(r.details).toEqual([{ accountId: "smartlead-owner", accountName: "Mindd Smartlead", shared: true }, { accountId: "smartlead-other", accountName: "Other SL", shared: true }]);
+        expect((await e.svc.preview("editor", { listId: e.listId, campaignId: CAMPAIGN, accountId: "smartlead-other" }) as any).preview.connection.name).toBe("Other SL");
+      });
+
+      it("a connection that is NOT shared with the member is not usable by them", async () => {
+        const e = env();
+        e.editors.add("editor");
+        install(e, [{ ...OWNERS, sharedWith: [] }]);
+        expect(await e.svc.preview("editor", { listId: e.listId, campaignId: CAMPAIGN })).toMatchObject({ ok: false, status: 409, code: "not_connected" });
+        expect(await e.svc.preview("editor", { listId: e.listId, campaignId: CAMPAIGN, accountId: "smartlead-owner" })).toMatchObject({ ok: false, code: "not_connected" });
+      });
+
+      it("a start is refused when the shared connection the preview used is no longer available to the member", async () => {
+        const e = env();
+        e.editors.add("editor");
+        install(e, [OWNERS]);
+        const p = (await e.svc.preview("editor", { listId: e.listId, campaignId: CAMPAIGN })) as any;
+        install(e, [{ ...OWNERS, accountId: "smartlead-new", name: "Replaced" }]);
+        expect(await e.svc.start("editor", go(p.preview.token))).toMatchObject({ ok: false, status: 409, code: "not_connected" });
+      });
+
+      it("resume: anyone the connection is shared with may resume a teammate's push; once it is no longer shared with the pusher, nobody can (the worker would stop it again); anyone may still pause and cancel", async () => {
+        const e = env({ maxConcurrentWorkers: 0 });
+        e.editors.add("editor");
+        e.editors.add("editor2");
+        const conns = [OWNERS];
+        install(e, conns);
+        const p = (await e.svc.preview("editor", { listId: e.listId, campaignId: CAMPAIGN })) as any;
+        const r = (await e.svc.start("editor", go(p.preview.token))) as any;
+        expect((await e.svc.pause("editor2", r.run.runId)).ok).toBe(true);
+        expect((await e.svc.resume("editor2", r.run.runId)).ok).toBe(true); // shared with editor2 too
+        expect((await e.svc.pause("editor", r.run.runId)).ok).toBe(true);
+        conns[0] = { ...OWNERS, sharedWith: ["editor2"] }; // sharing withdrawn from "editor", who started it
+        install(e, conns);
+        for (const who of ["editor", "editor2", "owner"]) {
+          expect(await e.svc.resume(who, r.run.runId)).toMatchObject({ ok: false, status: 409, code: "connection_unshared" });
+        }
+        conns[0] = OWNERS; // shared again
+        install(e, conns);
+        expect((await e.svc.resume("owner", r.run.runId)).ok).toBe(true);
+        expect((await e.svc.cancel("editor", r.run.runId)).ok).toBe(true);
+      });
+
+      it("un-sharing the connection stops a teammate's push that is still running: it pauses with that reason and adds nothing more", async () => {
+        const e = env({ maxConcurrentWorkers: 0 });
+        e.editors.add("editor");
+        const conns = [OWNERS];
+        install(e, conns);
+        const added: number[] = [];
+        const add = e.deps.smartlead.addLeads;
+        e.deps.smartlead.addLeads = async (k, c, x) => { added.push(x.length); return add(k, c, x); };
+        const p = (await e.svc.preview("editor", { listId: e.listId, campaignId: CAMPAIGN })) as any;
+        const r = (await e.svc.start("editor", go(p.preview.token))) as any;
+        conns[0] = { ...OWNERS, sharedWith: [] }; // the owner stops sharing before the worker gets to it
+        install(e, conns);
+        await e.svc.work((await db.getRun(r.run.runId))!);
+        expect(await db.getRun(r.run.runId)).toMatchObject({ status: "paused", pauseReason: "connection_unshared" });
+        expect(added).toEqual([]);
+        expect(e.logs.join("\n")).toMatch(/paused \(connection_unshared\): the Smartlead connection is no longer usable by the pusher/);
+      });
+
+      it("un-sharing in the MIDDLE of a teammate's push stops it at the next batch, keeping what was already added", async () => {
+        const e = env({ leads: Array.from({ length: 900 }, (_, i) => mkLead(i + 1)), maxConcurrentWorkers: 0 });
+        e.editors.add("editor");
+        const conns = [OWNERS];
+        install(e, conns);
+        const p = (await e.svc.preview("editor", { listId: e.listId, campaignId: CAMPAIGN, cohort: 900 })) as any;
+        const r = (await e.svc.start("editor", go(p.preview.token))) as any;
+        e.sl.onPost = () => { conns[0] = { ...OWNERS, sharedWith: [] }; install(e, conns); }; // un-shared while the first batch is in flight
+        await e.svc.work((await db.getRun(r.run.runId))!);
+        const run = (await db.getRun(r.run.runId))!;
+        expect(run).toMatchObject({ status: "paused", pauseReason: "connection_unshared" });
+        expect(run.counts.added).toBe(400);
+        expect(e.sl.posts).toHaveLength(1);
+      });
+
+      it("a teammate's push pauses with key_unavailable (not 'un-shared') when the shared key cannot be read", async () => {
+        const e = env({ maxConcurrentWorkers: 0 });
+        e.editors.add("editor");
+        install(e, [OWNERS]);
+        const p = (await e.svc.preview("editor", { listId: e.listId, campaignId: CAMPAIGN })) as any;
+        const r = (await e.svc.start("editor", go(p.preview.token))) as any;
+        const real = e.deps.resolveKey;
+        e.deps.resolveKey = async (u, a) => (u === "editor" ? { ok: false, reason: "key_unreadable", message: "x" } : real(u, a));
+        await e.svc.work((await db.getRun(r.run.runId))!);
+        expect((await db.getRun(r.run.runId))!.pauseReason).toBe("key_unavailable");
+      });
+
+      it("a running teammate push also pauses when the account id now resolves to a DIFFERENT owner's connection", async () => {
+        const e = env({ maxConcurrentWorkers: 0 });
+        e.editors.add("editor");
+        install(e, [OWNERS]);
+        const p = (await e.svc.preview("editor", { listId: e.listId, campaignId: CAMPAIGN })) as any;
+        const r = (await e.svc.start("editor", go(p.preview.token))) as any;
+        const real = e.deps.resolveKey;
+        e.deps.resolveKey = async (u, a) => (u === "editor" ? { ok: true, apiKey: "k", ownerUserId: "someone-else", accountId: a ?? "x", accountName: "x" } : real(u, a));
+        await e.svc.work((await db.getRun(r.run.runId))!);
+        expect((await db.getRun(r.run.runId))!.pauseReason).toBe("connection_unshared");
+      });
+
+      it("the owner's own push is not affected by sharing, and a rejected shared key is reported as a rejected key, not as un-shared", async () => {
+        const own = env({ maxConcurrentWorkers: 0 });
+        const conns = [{ ...OWNERS, sharedWith: [] }];
+        install(own, conns);
+        const p = (await own.svc.preview("owner", { listId: own.listId, campaignId: CAMPAIGN })) as any;
+        const r = (await own.svc.start("owner", go(p.preview.token))) as any;
+        await own.svc.work((await db.getRun(r.run.runId))!);
+        expect((await db.getRun(r.run.runId))!.status).toBe("completed");
+
+        const e = env({ maxConcurrentWorkers: 0 });
+        e.editors.add("editor");
+        install(e, [OWNERS]);
+        const q = (await e.svc.preview("editor", { listId: e.listId, campaignId: CAMPAIGN })) as any;
+        const s2 = (await e.svc.start("editor", go(q.preview.token))) as any;
+        e.deps.resolveKey = async () => ({ ok: false, reason: "key_rejected", message: "rejected" });
+        await e.svc.work((await db.getRun(s2.run.runId))!);
+        expect((await db.getRun(s2.run.runId))!.pauseReason).toBe("key_rejected");
+      });
+
+      it("resume is refused when the connection the member can see is a DIFFERENT owner's than the run's", async () => {
+        const e = env({ maxConcurrentWorkers: 0 });
+        e.editors.add("editor");
+        install(e, [OWNERS]);
+        const p = (await e.svc.preview("editor", { listId: e.listId, campaignId: CAMPAIGN })) as any;
+        const r = (await e.svc.start("editor", go(p.preview.token))) as any;
+        await e.svc.pause("editor", r.run.runId);
+        e.deps.resolveKey = async (_u, a) => ({ ok: true, apiKey: "k", ownerUserId: "someone-else", accountId: a ?? "x", accountName: "x" });
+        expect(await e.svc.resume("editor", r.run.runId)).toMatchObject({ ok: false, status: 409, code: "connection_unshared" });
+      });
+
+      it("the withdrawal sweep stops opted-out contacts with the KEY OWNER's key, even when a teammate did the push", async () => {
+        const e = env();
+        e.editors.add("editor");
+        install(e, [OWNERS]);
+        const p = (await e.svc.preview("editor", { listId: e.listId, campaignId: CAMPAIGN })) as any;
+        await e.svc.start("editor", go(p.preview.token));
+        await drain(e);
+        e.leads[1].contactStatus = "do-not-contact";
+        expect(await e.svc.sweepWithdrawals()).toMatchObject({ withdrawn: 1 });
+        expect(e.unsub).toHaveBeenCalledWith("key-of-owner", expect.any(String));
+      });
     });
 
     it("needs edit access to the list, and rejects bad input", async () => {

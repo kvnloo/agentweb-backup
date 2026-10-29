@@ -81,6 +81,14 @@ describe("buildPreview (ENG-673)", () => {
     expect(mapped.samples[0].sends).toMatchObject({ custom_fields: { industry: "SaaS" } });
   });
 
+  it("warns that no unsubscribe link will be added when the campaign's footer text is empty, and not when it is set", async () => {
+    const base = { id: 77, name: "Q4", status: "DRAFTED", maxLeadsPerDay: 100, addUnsubscribeTag: true };
+    const empty = await buildPreview(deps([lead(1)], {}, { ...base, unsubscribeText: null }), req());
+    expect(empty.preflight.warnings.map(w => w.code)).toContain("no_unsubscribe");
+    const set = await buildPreview(deps([lead(1)], {}, { ...base, unsubscribeText: "Unsubscribe here" }), req());
+    expect(set.preflight.warnings.map(w => w.code)).not.toContain("no_unsubscribe");
+  });
+
   it("cannot start with nothing to send", async () => {
     expect((await buildPreview(deps([lead(1, { email: "" })]), req())).canStart).toBe(false);
   });
