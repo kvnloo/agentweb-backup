@@ -16,6 +16,8 @@ export class FakeSmartlead {
   emails = new Map<string, string>();
   posts: string[][] = [];
   status = "DRAFTED";
+  /** The campaign's own add_unsubscribe_tag setting. */
+  addUnsubscribeTag = true;
   sequences: unknown[] | null = SEQUENCE;
   campaignMissing = false;
   failNext: unknown[] = [];

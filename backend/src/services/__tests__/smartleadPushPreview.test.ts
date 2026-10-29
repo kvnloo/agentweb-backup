@@ -1,6 +1,7 @@
 import { FIRST_PUSH_COHORT, PREVIEW_MAX_LEADS, PreviewError, buildPreview, type PreviewDeps } from "../smartleadPushPreview";
 import { verifyPushToken } from "../smartleadPushToken";
 import { smartleadMarkerKey } from "../smartleadMarkers";
+import { preflightSequence } from "../smartleadPreflight";
 
 const SEQ = [{ seq_number: 1, subject: "Hi {{first_name}}", email_body: "<p>{{first_name}} at {{company_name}}</p>" }];
 const lead = (n: number, over: Record<string, any> = {}) => ({
@@ -87,6 +88,24 @@ describe("buildPreview (ENG-673)", () => {
     expect(empty.preflight.warnings.map(w => w.code)).toContain("no_unsubscribe");
     const set = await buildPreview(deps([lead(1)], {}, { ...base, unsubscribeText: "Unsubscribe here" }), req());
     expect(set.preflight.warnings.map(w => w.code)).not.toContain("no_unsubscribe");
+  });
+
+  it("asks for the unsubscribe acknowledgement only when the campaign is already sending and its emails have no unsubscribe link", async () => {
+    const noLink = (status: string, over: any = {}) => deps([lead(1)], {}, { id: 77, name: "Q", status, maxLeadsPerDay: 100, addUnsubscribeTag: false, ...over });
+    expect((await buildPreview(noLink("ACTIVE"), req())).requiresUnsubscribeAcknowledgement).toBe(true);
+    expect((await buildPreview(noLink("ACTIVE", { addUnsubscribeTag: true, unsubscribeText: "" }), req())).requiresUnsubscribeAcknowledgement).toBe(true); // on, but no footer text
+    expect((await buildPreview(noLink("ACTIVE", { addUnsubscribeTag: true, unsubscribeText: "   " }), req())).requiresUnsubscribeAcknowledgement).toBe(true); // whitespace is no text
+    expect((await buildPreview(noLink("ACTIVE", { addUnsubscribeTag: true, unsubscribeText: null }), req())).requiresUnsubscribeAcknowledgement).toBe(true); // null: Smartlead has none
+    expect((await buildPreview(noLink("ACTIVE", { addUnsubscribeTag: true, unsubscribeText: undefined }), req())).requiresUnsubscribeAcknowledgement).toBe(false); // unknown is not "missing"
+    expect((await buildPreview(noLink("DRAFTED"), req())).requiresUnsubscribeAcknowledgement).toBe(false);
+    expect((await buildPreview(noLink("PAUSED"), req())).requiresUnsubscribeAcknowledgement).toBe(false);
+    expect((await buildPreview(noLink("ACTIVE", { addUnsubscribeTag: true }), req())).requiresUnsubscribeAcknowledgement).toBe(false);
+  });
+
+  it("flags a missing unsubscribe link even when the sequence could not be read (the setting is a campaign setting)", () => {
+    const unreadable = { readable: false, hasContent: false, tags: [], usesSpintax: false, stepCount: 0, hash: "h" } as any;
+    expect(preflightSequence(unreadable, { status: "ACTIVE", mapping: {}, acknowledgeUnreadable: true, addUnsubscribeTag: false }).missingUnsubscribe).toBe(true);
+    expect(preflightSequence(unreadable, { status: "ACTIVE", mapping: {}, acknowledgeUnreadable: true, addUnsubscribeTag: true, unsubscribeText: "Unsubscribe" }).missingUnsubscribe).toBe(false);
   });
 
   it("cannot start with nothing to send", async () => {

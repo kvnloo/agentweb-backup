@@ -44,6 +44,8 @@ export interface PushDigestInput {
   eligible: number;
   includeUnverified: boolean;
   requiresActiveConfirmation: boolean;
+  /** The campaign is sending and its emails carry no unsubscribe link: approving accepts that, so a change in it needs a new card. */
+  requiresUnsubscribeAcknowledgement: boolean;
   mapping: Record<string, string>;
   acknowledgedTags: string[];
   /** PreviewResult.fingerprint: which contacts go to which Smartlead connection. */
@@ -77,6 +79,7 @@ export function computePushDigest(input: PushDigestInput): string {
     eligible: input.eligible,
     includeUnverified: input.includeUnverified,
     requiresActiveConfirmation: input.requiresActiveConfirmation,
+    requiresUnsubscribeAcknowledgement: input.requiresUnsubscribeAcknowledgement,
     mapping: sortedEntries(input.mapping),
     acknowledgedTags: [...input.acknowledgedTags].sort(),
     fingerprint: input.fingerprint,
@@ -135,6 +138,7 @@ export interface PushQuestionInput {
   eligible: number;
   listTotal: number;
   requiresActiveConfirmation: boolean;
+  requiresUnsubscribeAcknowledgement: boolean;
   /** Tags the user is told Smartlead fills in itself. */
   smartleadFilledTags: string[];
   includeUnverified: boolean;
@@ -161,6 +165,7 @@ export function buildPushQuestion(input: PushQuestionInput): QuestionDeckQuestio
   const mapped = sortedEntries(input.mapping);
   if (mapped.length > 0) parts.push(`Merge fields filled from your CRM: ${mapped.map(([tag, path]) => `{{${cardText(tag, 40)}}} from "${cardText(path, 60)}"`).join(', ')}. These end up in the emails recipients read.`);
   if (input.requiresActiveConfirmation) parts.push(`This campaign is ALREADY SENDING (${cardText(input.campaignStatus, 20).toLowerCase()}): contacts start receiving email as soon as they are added.`);
+  if (input.requiresUnsubscribeAcknowledgement) parts.push('These emails have NO UNSUBSCRIBE LINK, and the campaign is already sending: recipients get them with no way to opt out. Approving accepts that. Declining and setting the unsubscribe text in the campaign in Smartlead first is safer.');
   parts.push('By approving you confirm that you have a lawful basis to email these contacts, and that people who opt out are stopped in Smartlead for good.');
   const options: AskUserQuestionOption[] = [
     { id: DECLINE_OPTION_ID, label: 'Decline', consequence: 'Nothing is added to Smartlead.', recommended: true, why: 'Nothing is sent unless you approve.' },
