@@ -336,6 +336,27 @@ describe('MCP Server Security', () => {
       expect(tool!.internal).not.toBe(true);
       expect(tool!.internalOnly).not.toBe(true);
     });
+
+    it('read_email: listed externally, read-only, gated on the opt-in email:read scope', () => {
+      const tool = mcpToolRegistry.getTool('read_email');
+      expect(tool).toBeDefined();
+      expect(tool!.internalOnly).not.toBe(true);
+      expect(tool!.readOnly).toBe(true);
+      expect(tool!.requiredScope).toBe('email:read');
+      const props = Object.keys(tool!.definition.inputSchema.properties);
+      for (const sendField of ['to', 'subject', 'body', 'cc', 'bcc', 'reply_to_message_id', 'is_html']) {
+        expect(props).not.toContain(sendField);
+      }
+      expect(tool!.definition.inputSchema.properties.action.enum).toEqual(['search', 'list', 'get']);
+    });
+
+    it('read_email does not change Emma internal send_email: still internalOnly, still forwards a send', async () => {
+      const sendEmail = mcpToolRegistry.getTool('send_email')!;
+      expect(sendEmail.internalOnly).toBe(true);
+      const args = { account_id: 'acct-1', action: 'send', to: 'a@b.com', subject: 's', body: 'b' };
+      await sendEmail.execute(args, { userId: 'user-1', sessionId: 'sess-1' });
+      expect(mcpFetch).toHaveBeenCalledWith(expect.objectContaining({ path: '/api/emma/email', body: args }));
+    });
   });
 
   // ─── B. userId override (IDOR protection) ─────────────────────────────
