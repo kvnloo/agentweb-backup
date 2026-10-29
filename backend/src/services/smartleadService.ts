@@ -593,6 +593,12 @@ const toStringList = (value: unknown): string[] =>
  * The reply shape here is the one a live Smartlead account returned on 2026-10-27, which differs from its docs:
  * `upload_count` is everything submitted, `total_leads` is what was newly added. A reply with no count we recognise
  * is an error, never "0 added" and never success. Retrying a 429 is safe: a rate-limited request added nothing.
+ *
+ * DO NOT verify an add by re-reading the campaign's lead listing right afterwards (GET /campaigns/{id}/leads, or Smartlead's MCP list):
+ * that listing lags behind a large add. Observed on production on 2026-10-29: after a 450-lead add it showed 1 lead for several minutes
+ * (451 were present and the call itself had returned 450 lead ids), while the account-wide lead total and a status-filtered listing
+ * (`status=STARTED`) were correct immediately. Trust THIS response (per-lead outcome and ids from `return_lead_ids`); any check or test
+ * that counts a campaign's leads must wait for the listing to settle (a few minutes) or use the account total or a status filter.
  */
 export async function addLeadsToCampaign(
   apiKey: string,
