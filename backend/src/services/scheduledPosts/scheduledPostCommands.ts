@@ -28,6 +28,15 @@ export interface ScheduledPostCommandRepository extends ScheduledPostRepository 
   get(id: string): Promise<OwnedScheduledPost | undefined>;
   save(record: OwnedScheduledPost): Promise<void>;
   listByUser(userId: string): Promise<OwnedScheduledPost[]>;
+  /**
+   * Atomically write `record` only if the stored row still has `expected.status` and
+   * `expected.updatedAt` (optimistic concurrency). Returns false when the row changed
+   * since it was read, so a stale edit can never resurrect a cancelled/fired post.
+   */
+  saveIfUnchanged(
+    record: OwnedScheduledPost,
+    expected: { status: OwnedScheduledPost['status']; updatedAt?: Date },
+  ): Promise<boolean>;
 }
 
 export interface ScheduledPostCommandDeps {
@@ -37,7 +46,7 @@ export interface ScheduledPostCommandDeps {
   newId: () => string;
 }
 
-export type CommandErrorCode = 'VALIDATION_FAILED' | 'NOT_FOUND' | TransitionErrorCode;
+export type CommandErrorCode = 'VALIDATION_FAILED' | 'NOT_FOUND' | 'CONFLICT' | TransitionErrorCode;
 
 export type CommandResult<T> =
   | { ok: true; value: T }
@@ -84,22 +93,56 @@ async function applyTransition(
   deps: ScheduledPostCommandDeps,
   id: string,
   action: Parameters<typeof transition>[1],
+  preloaded?: OwnedScheduledPost,
 ): Promise<CommandResult<OwnedScheduledPost>> {
-  const record = await loadOwned(deps, id);
+  const record = preloaded ?? (await loadOwned(deps, id));
   if (!record) return { ok: false, code: 'NOT_FOUND', message: `No scheduled post ${id}.` };
   const result = transition(record, action);
   if (!result.ok) return { ok: false, code: result.code, message: result.message };
   const next: OwnedScheduledPost = { ...record, ...result.record, userId: record.userId, platform: record.platform };
-  if (result.changed) await deps.repo.save(next);
+  if (result.changed) {
+    const saved = await deps.repo.saveIfUnchanged(next, { status: record.status, updatedAt: record.updatedAt });
+    if (!saved) {
+      return { ok: false, code: 'CONFLICT', message: `Scheduled post ${id} changed concurrently; reload and retry.` };
+    }
+  }
   return { ok: true, value: next };
 }
+
+type EditableChanges = Partial<Pick<ScheduledPostRecord, 'publishAt' | 'content' | 'mediaUrls'>>;
 
 export async function editScheduledPost(
   deps: ScheduledPostCommandDeps,
   id: string,
-  changes: Partial<Pick<ScheduledPostRecord, 'publishAt' | 'content' | 'mediaUrls'>>,
+  changes: EditableChanges,
 ): Promise<CommandResult<OwnedScheduledPost>> {
-  return applyTransition(deps, id, { type: 'edit', now: deps.now(), changes });
+  // Allowlist: only these fields may change via edit, whatever the caller's object carries.
+  const allowed: EditableChanges = {};
+  if (changes.publishAt !== undefined) allowed.publishAt = changes.publishAt;
+  if (changes.content !== undefined) allowed.content = changes.content;
+  if (changes.mediaUrls !== undefined) allowed.mediaUrls = changes.mediaUrls;
+
+  const record = await loadOwned(deps, id);
+  if (!record) return { ok: false, code: 'NOT_FOUND', message: `No scheduled post ${id}.` };
+  // Re-apply the create rules to the post as it would look after the edit. Only pending
+  // posts can be edited, so skip validation for others and let transition() report it.
+  if (record.status === 'pending') {
+    const at = allowed.publishAt ?? record.publishAt;
+    const validAt = at instanceof Date && !Number.isNaN(at.getTime());
+    const validation = validateScheduledPostRequest(
+      {
+        platform: record.platform,
+        publishAt: validAt ? at.toISOString() : '',
+        content: allowed.content ?? record.content,
+        mediaUrls: allowed.mediaUrls ?? record.mediaUrls,
+      },
+      deps.now,
+    );
+    if (!validation.ok) {
+      return { ok: false, code: 'VALIDATION_FAILED', message: 'Invalid scheduled post edit.', errors: validation.errors };
+    }
+  }
+  return applyTransition(deps, id, { type: 'edit', now: deps.now(), changes: allowed }, record);
 }
 
 export async function cancelScheduledPost(

@@ -23,6 +23,12 @@ function fakeRepo(): ScheduledPostCommandRepository & { rows: Map<string, OwnedS
     async save(record: OwnedScheduledPost) {
       rows.set(record.id, record);
     },
+    async saveIfUnchanged(record: OwnedScheduledPost, expected: { status: OwnedScheduledPost['status']; updatedAt?: Date }) {
+      const cur = rows.get(record.id);
+      if (!cur || cur.status !== expected.status || cur.updatedAt?.getTime() !== expected.updatedAt?.getTime()) return false;
+      rows.set(record.id, record);
+      return true;
+    },
     async listByUser(userId: string) {
       return [...rows.values()].filter((r) => r.userId === userId);
     },
@@ -100,5 +106,50 @@ describe('scheduledPostCommands', () => {
 
   it('returns NOT_FOUND for an unknown id', async () => {
     expect(await cancelScheduledPost(depsFor(fakeRepo(), 'u1'), 'missing')).toMatchObject({ ok: false, code: 'NOT_FOUND' });
+  });
+
+  it('edit rejects invalid values with VALIDATION_FAILED and does not save', async () => {
+    const repo = fakeRepo();
+    const deps = depsFor(repo, 'u1');
+    const created = await createScheduledPost(deps, validInput);
+    if (!created.ok) throw new Error('setup');
+    for (const bad of [{ content: '   ' }, { publishAt: new Date('nope') }, { publishAt: new Date('2020-01-01T00:00:00Z') }]) {
+      expect(await editScheduledPost(deps, created.value.id, bad)).toMatchObject({ ok: false, code: 'VALIDATION_FAILED' });
+    }
+    const ig = await createScheduledPost(deps, { ...validInput, platform: 'instagram', mediaUrls: ['https://x.test/a.png'] });
+    if (!ig.ok) throw new Error('setup');
+    expect(await editScheduledPost(deps, ig.value.id, { mediaUrls: [] })).toMatchObject({ ok: false, code: 'VALIDATION_FAILED' });
+    expect(repo.rows.get(created.value.id)).toEqual(created.value);
+  });
+
+  it('edit ignores non-editable fields such as status', async () => {
+    const repo = fakeRepo();
+    const deps = depsFor(repo, 'u1');
+    const created = await createScheduledPost(deps, validInput);
+    if (!created.ok) throw new Error('setup');
+    const sneaky = { content: 'updated', status: 'fired' } as unknown as { content: string };
+    const edited = await editScheduledPost(deps, created.value.id, sneaky);
+    expect(edited).toMatchObject({ ok: true, value: { content: 'updated', status: 'pending' } });
+    expect(repo.rows.get(created.value.id)?.status).toBe('pending');
+  });
+
+  it('a stale edit cannot overwrite a concurrent cancel (CONFLICT)', async () => {
+    const repo = fakeRepo();
+    const deps = depsFor(repo, 'u1');
+    const created = await createScheduledPost(deps, validInput);
+    if (!created.ok) throw new Error('setup');
+    const realGet = repo.get.bind(repo);
+    // Edit reads the pending row, then a cancel lands before the edit writes.
+    let raced = false;
+    repo.get = async (id: string) => {
+      const row = await realGet(id);
+      if (!raced) {
+        raced = true;
+        repo.rows.set(id, { ...row!, status: 'cancelled', cancelledAt: NOW, updatedAt: new Date(NOW.getTime() + 1) });
+      }
+      return row;
+    };
+    expect(await editScheduledPost(deps, created.value.id, { content: 'late edit' })).toMatchObject({ ok: false, code: 'CONFLICT' });
+    expect(repo.rows.get(created.value.id)?.status).toBe('cancelled');
   });
 });
