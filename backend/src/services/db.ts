@@ -7615,6 +7615,7 @@ export const crmDb = {
         items.push(...(result.Items || []));
         startKey = result.LastEvaluatedKey;
       } while (startKey && items.length < maxItems);
+      if (items.length >= maxItems) console.warn(`[crmDb.findAllLeadsByEmail] hit the ${maxItems}-row cap for one address: a matching lead may be missing from the result`);
       return items.slice(0, maxItems);
     } catch (error) {
       handleDynamoDbError(error, 'findAllLeadsByEmail');

@@ -9,12 +9,15 @@ import express from "express";
 const mockHandle = jest.fn();
 jest.mock("../services/smartleadEventRuntime", () => ({ getSmartleadEventService: () => ({ handle: mockHandle }) }));
 jest.mock("../config/jwt", () => ({ getJwtSecret: () => "route-test-secret" }));
+// anything the app's own error handler would do must NOT happen for a bad caller: it reports and answers 500
+const reachedGlobalErrorHandler = jest.fn();
 
-import smartleadWebhookRouter from "../routes/smartleadWebhook";
+import smartleadWebhookRouter, { smartleadWebhookPreParse } from "../routes/smartleadWebhook";
 import { signWebhookToken } from "../services/smartleadWebhookToken";
 
 const app = express();
-app.use("/api/webhooks/smartlead", express.raw({ type: "*/*", limit: "256kb" }));
+// the same chain app.ts mounts before the global body parsers
+app.use("/api/webhooks/smartlead", ...smartleadWebhookPreParse);
 app.use("/api/webhooks/smartlead", smartleadWebhookRouter);
 
 const ACCOUNT = "smartlead-u1";
@@ -89,9 +92,53 @@ describe("POST /api/webhooks/smartlead/:accountId/:campaignId/:token", () => {
     expect(all).toContain("keys=event_type,campaign_id"); // what a payload carries is logged; what it says is not
   });
 
-  it("logs the body only when a test environment turns that on", async () => {
+  it("logs the body only when a test environment turns that on, and never in production", async () => {
     process.env.SMARTLEAD_WEBHOOK_LOG_BODY = "true";
     await send(url(), reply);
     expect(logs.join("\n")).toContain("PRIVATE TEXT");
+    logs.length = 0;
+    const before = process.env.NODE_ENV;
+    process.env.NODE_ENV = "production";
+    try {
+      await send(url(), reply);
+      expect(logs.join("\n")).not.toContain("PRIVATE TEXT");
+    } finally {
+      process.env.NODE_ENV = before;
+    }
+  });
+
+  it("an oversize or malformed body from a caller WITHOUT a valid token is a bare 404, before the body is read (no 500, nothing reaches the app's error handler)", async () => {
+    const big = JSON.stringify({ event_type: "EMAIL_REPLY", campaign_id: 77, pad: "x".repeat(300 * 1024) });
+    const res = await send(url(77, "nope"), big);
+    expect(res.status).toBe(404);
+    expect(res.body).toEqual({});
+    expect(mockHandle).not.toHaveBeenCalled();
+    const odd = await request(app).post(url(77, "nope")).set("content-type", "application/json").set("content-encoding", "gzip").send("not gzip");
+    expect(odd.status).toBe(404);
+  });
+
+  it("an oversize body WITH a valid token is a bare 413 from the route itself", async () => {
+    const big = JSON.stringify({ event_type: "EMAIL_REPLY", campaign_id: 77, pad: "x".repeat(300 * 1024) });
+    const res = await send(url(), big);
+    expect(res.status).toBe(413);
+    expect(res.body).toEqual({});
+    expect(mockHandle).not.toHaveBeenCalled();
+  });
+
+  it("only POST with a well-formed path and a valid token gets through; anything else is a bare 404", async () => {
+    expect((await request(app).get(url())).status).toBe(404);
+    expect((await send(`/api/webhooks/smartlead/${ACCOUNT}/77`, reply)).status).toBe(404);
+    expect((await send(`/api/webhooks/smartlead/${ACCOUNT}/77/${signWebhookToken("route-test-secret", ACCOUNT, 77)}/extra`, reply)).status).toBe(404);
+    expect(mockHandle).not.toHaveBeenCalled();
+  });
+
+  it("accepts a token made with the dedicated secret when one is set", async () => {
+    process.env.SMARTLEAD_WEBHOOK_SECRET = "dedicated";
+    try {
+      expect((await send(url(), reply)).status).toBe(404); // the JWT-secret token no longer works
+      expect((await send(url(77, signWebhookToken("dedicated", ACCOUNT, 77)), reply)).status).toBe(200);
+    } finally {
+      delete process.env.SMARTLEAD_WEBHOOK_SECRET;
+    }
   });
 });

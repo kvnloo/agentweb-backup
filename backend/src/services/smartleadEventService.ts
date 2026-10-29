@@ -111,7 +111,9 @@ export class SmartleadEventService {
     }
 
     const bounced = event.kind === "bounce";
-    const added = await this.record(lead, bounced ? "email.bounced" : "email.unsubscribed", { ...base, ...(bounced && event.soft ? { soft: true } : {}), ...(event.reason ? { reason: event.reason } : {}) }, at);
+    // No free text here (the campaign's name, Smartlead's reason): the CRM scans event data for words like "received" to decide a contact is
+    // engaged, and a bounced or opted-out contact must never look engaged. The reason goes only into the status note below.
+    const added = await this.record(lead, bounced ? "email.bounced" : "email.unsubscribed", { source: "smartlead", smartleadEventKey: event.eventKey, campaignId: event.campaignId, ...(bounced && event.soft ? { soft: true } : {}) }, at);
     if (added.recorded) changed++; else duplicate++;
     if (bounced && event.soft) return { changed, duplicate }; // a temporary bounce is recorded, the contact is not blocked
 

@@ -53,16 +53,28 @@ const isoTime = (v: unknown): string | undefined => {
 };
 
 /** The event kind from whatever name field the payload uses; unknown names are ignored. */
+const NAMES: Record<string, SmartleadEventKind> = {
+  EMAIL_REPLY: "reply", EMAIL_REPLIED: "reply", LEAD_REPLY: "reply", LEAD_REPLIED: "reply",
+  EMAIL_BOUNCE: "bounce", EMAIL_BOUNCED: "bounce", LEAD_BOUNCE: "bounce", LEAD_BOUNCED: "bounce",
+  LEAD_UNSUBSCRIBED: "unsubscribe", EMAIL_UNSUBSCRIBED: "unsubscribe", LEAD_UNSUBSCRIBE: "unsubscribe", EMAIL_UNSUBSCRIBE: "unsubscribe",
+};
+/** Only the exact documented names (any case or separator): a longer name such as a category change on a reply is NOT a reply. */
 export function kindOf(name: unknown): SmartleadEventKind | undefined {
-  const n = typeof name === "string" ? name.toUpperCase().replace(/[^A-Z]+/g, "_") : "";
-  if (!n) return undefined;
-  if (n.includes("UNSUBSCRIBE")) return "unsubscribe";
-  if (n.includes("BOUNCE")) return "bounce";
-  if (n.includes("REPLY") || n.includes("REPLIED")) return "reply";
-  return undefined;
+  const n = typeof name === "string" ? name.toUpperCase().replace(/[^A-Z]+/g, "_").replace(/^_+|_+$/g, "") : "";
+  return Object.prototype.hasOwnProperty.call(NAMES, n) ? NAMES[n] : undefined;
 }
 
-const SOFT = /mailbox (is )?full|over quota|quota exceeded|temporar|try again|greylist|deferred|\b4\d\d\b/i;
+// A bounce is only called temporary on clear signs, and never when the same text also says it is permanent: a wrongly "soft" hard bounce would
+// leave an address that cannot receive mail unblocked.
+const SOFT = /mailbox (is )?full|over quota|quota exceeded|temporar(y|ily)|try again later|greylist|deferred|^\s*4\d\d[ -]|\b4\.\d\.\d{1,3}\b/i;
+const HARD = /permanent|do not try again|don't try again|user unknown|no such user|does not exist|invalid (recipient|address|mailbox)|unknown (user|recipient)|address rejected|\b5\d\d\b|\b5\.\d\.\d{1,3}\b/i;
+
+/** JSON with object keys in a fixed order, so the same body always gives the same text. */
+function canonicalJson(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(canonicalJson).join(",")}]`;
+  if (v && typeof v === "object") return `{${Object.keys(v as object).sort().map(k => `${JSON.stringify(k)}:${canonicalJson((v as Record<string, unknown>)[k])}`).join(",")}}`;
+  return JSON.stringify(v) ?? "null";
+}
 
 export function parseSmartleadEvent(body: unknown): ParseResult {
   if (!body || typeof body !== "object" || Array.isArray(body)) return { ok: false, reason: "not_an_object" };
@@ -84,11 +96,14 @@ export function parseSmartleadEvent(body: unknown): ParseResult {
   const occurredAt = isoTime(b.time_replied ?? b.event_timestamp ?? b.timestamp ?? b.time_bounced ?? b.time ?? b.created_at);
   const reasonText = short(b.bounce_reason ?? b.reason ?? b.error ?? b.bounce_message ?? b.message ?? (b.bounce as Record<string, unknown> | undefined)?.reason, 160);
   const bounceType = str(b.bounce_type ?? b.bounceType ?? (b.bounce as Record<string, unknown> | undefined)?.type)?.toLowerCase();
-  const soft = kind === "bounce" && (/(soft|temporary|transient)/.test(bounceType ?? "") || (!/(hard|permanent)/.test(bounceType ?? "") && !!reasonText && SOFT.test(reasonText)));
+  const soft = kind === "bounce" && (/(soft|temporary|transient)/.test(bounceType ?? "") || (!/(hard|permanent)/.test(bounceType ?? "") && !!reasonText && SOFT.test(reasonText) && !HARD.test(reasonText)));
 
   const sequence = str(String(b.sequence_number ?? b.seq_number ?? "")) ?? "";
   const messageId = str(b.message_id ?? b.messageId ?? b.stats_id ?? b.email_stats_id ?? b.sl_email_lead_id) ?? "";
-  const eventKey = createHash("sha256").update(JSON.stringify([kind, campaignId, candidateEmails[0], occurredAt ?? "", sequence, messageId])).digest("hex").slice(0, 32);
+  // With no time or id in the payload, the body itself identifies the delivery (a retry sends the same body); otherwise two different replies
+  // from one contact would share a key and the second would be dropped as a duplicate.
+  const identity = occurredAt || sequence || messageId ? "" : createHash("sha256").update(canonicalJson(body)).digest("hex");
+  const eventKey = createHash("sha256").update(JSON.stringify([kind, campaignId, candidateEmails[0], occurredAt ?? "", sequence, messageId, identity])).digest("hex").slice(0, 32);
 
   return {
     ok: true,

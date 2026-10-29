@@ -1,4 +1,5 @@
 import { createHmac, timingSafeEqual } from "crypto";
+import { getJwtSecret } from "../config/jwt";
 
 /**
  * The secret part of the URL AgentWeb gives Smartlead for a campaign's events (ENG-673, slice 3):
@@ -7,6 +8,13 @@ import { createHmac, timingSafeEqual } from "crypto";
  * about another. Smartlead's own signature (a header the docs describe but do not explain how to key) is not relied on.
  */
 const DOMAIN = "smartlead-webhook:v1:";
+
+/**
+ * The key the URL tokens are made with: SMARTLEAD_WEBHOOK_SECRET when set, else the JWT secret. NOTE the coupling when it is not set:
+ * rotating the JWT secret changes every token, so every webhook URL already registered in a customer's Smartlead account stops working
+ * (a bad token answers 404). Set a dedicated secret before rotating the JWT secret.
+ */
+export const webhookSecret = (): string => process.env.SMARTLEAD_WEBHOOK_SECRET || getJwtSecret();
 
 const mac = (secret: string, accountId: string, campaignId: number | string): string =>
   createHmac("sha256", secret).update(DOMAIN + JSON.stringify([accountId, String(campaignId)])).digest("base64url"); // JSON, so no value can be shifted across a separator
