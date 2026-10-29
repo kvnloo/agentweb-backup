@@ -35,7 +35,7 @@ const byteLen = (v: unknown): number => Buffer.byteLength(JSON.stringify(v), "ut
 
 /** Whether a bridge tool name can be offered through the relay (and so mapped back). */
 export function relayName(name: unknown): name is string {
-  return typeof name === "string" && TOOL_NAME.safeParse(name).success && !name.startsWith(RELAY_RESERVED_PREFIX);
+  return typeof name === "string" && TOOL_NAME.safeParse(name).success && !name.toLowerCase().startsWith(RELAY_RESERVED_PREFIX);
 }
 
 function truncateUtf8(text: string, maxBytes: number): string {
@@ -63,8 +63,10 @@ export function buildRelayManifest(open: BridgeTool[], candidates: BridgeTool[] 
 
   const add = (tool: BridgeTool, locked: boolean) => {
     const name = tool?.name;
-    if (!relayName(name)) return skip(typeof (name as unknown) === "string" && String(name).startsWith(RELAY_RESERVED_PREFIX) && TOOL_NAME.safeParse(name).success ? "reserved" : "name");
-    if (seen.has(name)) {
+    if (!relayName(name)) return skip(typeof (name as unknown) === "string" && String(name).toLowerCase().startsWith(RELAY_RESERVED_PREFIX) && TOOL_NAME.safeParse(name).success ? "reserved" : "name");
+    // The host folds case for duplicates and for the reserved prefix: so do we (a name differing only in case is a duplicate, and a refusal of the turn).
+    const folded = name.toLowerCase();
+    if (seen.has(folded)) {
       if (locked && openSeen.has(name)) return; // a candidate the run already has open: offered once, nothing is lost
       return skip("duplicate");
     }
@@ -73,7 +75,7 @@ export function buildRelayManifest(open: BridgeTool[], candidates: BridgeTool[] 
     else if (tool.inputSchema.type === "object") schema = tool.inputSchema;
     else return skip("schema_not_object");
     if (byteLen(schema) > TOOL_LIMITS.maxSchemaBytes) return skip("schema_too_large");
-    seen.add(name);
+    seen.add(folded);
     const full = typeof tool.description === "string" ? tool.description : "";
     const description = truncateUtf8(full, TOOL_LIMITS.maxDescriptionBytes);
     if (description !== full) truncated++;

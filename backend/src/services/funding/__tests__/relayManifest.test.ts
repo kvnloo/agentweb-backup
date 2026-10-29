@@ -6,9 +6,9 @@ const tool = (name: string, extra: Record<string, unknown> = {}) => ({ name, des
 
 describe('relayName', () => {
   // The host's widened pattern: letters of both cases, digits, _ and -, 1-64 chars, no leading '-'. Identity mapping, so these ARE the names the CLI calls.
-  it.each(['search', 'get_crm_leads', 'a1_b2', 'Search', 'HubSpot-Contacts', 'call-meta', '_private', 'x'.repeat(64), 'AW_RELAY_x', 'aw-relay_x'])('accepts %s', (n) =>
+  it.each(['search', 'get_crm_leads', 'a1_b2', 'Search', 'HubSpot-Contacts', 'call-meta', '_private', 'x'.repeat(64), 'aw-relay_x'])('accepts %s', (n) =>
     expect(relayName(n)).toBe(true));
-  it.each(['', '-leading', 'x'.repeat(65), 'aw_relay_x', 'aw_relay_', 'a b', 'tool.name', 'a/b', 'ünïcode', 'a\nb', 5, undefined])('rejects %p', (n) =>
+  it.each(['', '-leading', 'x'.repeat(65), 'aw_relay_x', 'AW_Relay_x', 'aw_relay_', 'a b', 'tool.name', 'a/b', 'ünïcode', 'a\nb', 5, undefined])('rejects %p', (n) =>
     expect(relayName(n)).toBe(false));
 });
 
@@ -31,10 +31,18 @@ describe('buildRelayManifest', () => {
     expect(manifestCut(m)).toBe(true);
   });
 
-  it('the mapping is a bijection: names differing only in case or hyphen/underscore stay distinct tools (no rewrite, no collision)', () => {
-    const m = buildRelayManifest([tool('Foo'), tool('foo'), tool('get-x'), tool('get_x')]);
-    expect(m.tools.map((t) => t.name)).toEqual(['Foo', 'foo', 'get-x', 'get_x']);
-    expect(manifestCut(m)).toBe(false);
+  it('the mapping is an identity: hyphen vs underscore stay distinct tools; names differing only in case are a duplicate (the host folds case), counted as a cut', () => {
+    const m = buildRelayManifest([tool('get-x'), tool('get_x'), tool('Foo'), tool('foo')]);
+    expect(m.tools.map((t) => t.name)).toEqual(['get-x', 'get_x', 'Foo']);
+    expect(m.skipped).toEqual({ duplicate: 1 });
+    expect(manifestCut(m)).toBe(true);
+    expect(manifestProblem(m.tools)).toBeUndefined(); // what is offered is always acceptable to the host
+  });
+
+  it('the reserved prefix is matched case-insensitively, like the host', () => {
+    const m = buildRelayManifest([tool('ok'), tool('AW_RELAY_x'), tool('Aw_Relay_y')]);
+    expect(m.tools.map((t) => t.name)).toEqual(['ok']);
+    expect(m.skipped).toEqual({ reserved: 2 });
   });
 
   it('a missing schema becomes the empty object schema; a non-object schema is skipped; an oversized one is skipped', () => {
