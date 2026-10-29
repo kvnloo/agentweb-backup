@@ -311,6 +311,11 @@ router.post('/email', async (req: Request, res: Response) => {
     const operation = req.body.action === 'send' ? 'send' : 'read';
     const resolved = await resolveEmailAccount(userId(req), req.body.account_id, operation);
     const { provider, ownerUserId } = resolved;
+    // External MCP read_email sets own_mailbox_only: the caller's own mailbox is
+    // the only one an external API key may read — never a teammate's shared one.
+    if (req.body.own_mailbox_only === true && ownerUserId !== userId(req)) {
+      return res.status(403).json({ message: 'This mailbox is shared by a teammate and cannot be read by external clients. Only your own connected accounts are available.' });
+    }
     // Every provider call runs inside withAccessGuard: a teammate's shared
     // mailbox is re-checked immediately before the call AND before the result is
     // returned, so a share revoked mid-read discloses nothing.
