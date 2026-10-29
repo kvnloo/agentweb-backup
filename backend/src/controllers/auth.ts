@@ -287,6 +287,8 @@ export const register = async (req: Request, res: Response) => {
     // must never affect the registration response the user is waiting on.
     const metaEventId = crypto.randomUUID();
     sendCompleteRegistrationCapiEvent(metaEventId, email).catch(() => {});
+    // ENG-2738: hireemma.ai signal plan — fire-and-forget, never affects the response.
+    void emitAppSignal({ userId, createdAt: new Date().toISOString() }, "registration_completed", { method: "password" });
 
     res.status(201).json({
       token,
@@ -673,6 +675,7 @@ export const googleCallback = async (
     );
 
     void emitAppSignal(user as any, "login", { method: "google", isNewUser: isNewUser ? 1 : 0 });
+    if (isNewUser) void emitAppSignal(user as any, "registration_completed", { method: "google" });
 
     const resultUserObject = {
       token,
