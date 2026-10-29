@@ -123,6 +123,16 @@ function truncateUtf8(text: string, maxBytes: number): string {
 
 const realSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms).unref?.());
 
+/**
+ * Whether an error means "the definitions in this answer are not acceptable" (and the operation is still pending): the worker's EINVALID `tools_invalid`,
+ * `tools_limit` or `tools:<reason>`, or our own client-side schema check failing on the `tools` field (the same rules, applied before the round trip).
+ */
+function refusesTools(err: unknown): boolean {
+  if (err instanceof LoginHostError) return err.code === "EINVALID" && /^tools[_:]/.test(err.detail ?? "");
+  const issues = (err as { issues?: Array<{ path?: unknown[] }> } | undefined)?.issues;
+  return (err as { name?: string })?.name === "ZodError" && Array.isArray(issues) && issues.length > 0 && issues.every((i) => i.path?.[0] === "tools");
+}
+
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
@@ -497,7 +507,7 @@ export class RelayToolDispatcher {
           answer = this.shrink(answer);
           continue;
         }
-        if (err instanceof LoginHostError && err.code === "EINVALID" && (err.detail ?? "").startsWith("tools_") && answer.tools) {
+        if (answer.tools && refusesTools(err)) {
           // The worker refused the definitions (invalid, or over its cumulative caps) and kept the operation pending: answer again WITHOUT them. They are not
           // marked sent, so the model never sees them this turn, and it is told so.
           for (const t of answer.tools) {

@@ -235,7 +235,7 @@ describe('RelayToolDispatcher', () => {
     });
 
     it('definitions the worker refuses (tools_invalid / tools_limit): the answer is re-sent WITHOUT them, they are not marked sent, the model is told, and the tool cannot be called', async () => {
-      for (const detail of ['tools_invalid', 'tools_limit']) {
+      for (const detail of ['tools_invalid', 'tools_limit', 'tools:name']) {
         const t = rig();
         t.behaviour.next = [new LoginHostError('EINVALID', detail)];
         t.d.start(t.ev('op-1', 'install_skills'));
@@ -253,6 +253,23 @@ describe('RelayToolDispatcher', () => {
         await t.d.settle(1_000);
         expect(t.posts[3].tools).toBeUndefined(); // not retried on every later call
       }
+    });
+
+    it('our own client-side schema check failing on `tools` (the same rules) is handled like a worker refusal; a failure elsewhere in the body is not', async () => {
+      const zodOnTools = Object.assign(new Error('zod'), { name: 'ZodError', issues: [{ path: ['tools'] }] });
+      const t = rig();
+      t.behaviour.next = [zodOnTools];
+      t.d.start(t.ev('op-1', 'install_skills'));
+      await t.d.settle(1_000);
+      expect(t.posts).toHaveLength(2);
+      expect(t.posts[1].tools).toBeUndefined();
+      expect(t.posts[1].content).toContain(UNLOADABLE_NOTE);
+      const zodElsewhere = Object.assign(new Error('zod'), { name: 'ZodError', issues: [{ path: ['content'] }] });
+      const u = rig();
+      u.behaviour.next = [zodElsewhere];
+      u.d.start(u.ev('op-1', 'install_skills'));
+      await u.d.settle(1_000);
+      expect(u.posts[1]).toMatchObject({ content: DELIVERY_FAILED_MESSAGE });
     });
 
     it('a definition that cannot be built (oversized schema, bad name, cut description) is never sent: invisible this turn, the model is told, a fixed code is logged', async () => {

@@ -15,7 +15,7 @@ import * as relayManifestModule from '../relayManifest';
 import { ClaudeRunRegistry } from '../claudeRunRegistry';
 import { LoginHostClient, UnixSocketTransport } from '../loginHostClient';
 import { runHostTurn } from '../loginHostTurn';
-import { RESULT_LOST_NOTE, SOFT_DEADLINE_MESSAGE, STOPPED_MESSAGE } from '../relayToolDispatcher';
+import { RESULT_LOST_NOTE, SOFT_DEADLINE_MESSAGE, STOPPED_MESSAGE, UNLOADABLE_NOTE } from '../relayToolDispatcher';
 import { ToolBridge, type BridgeExecuteOutcome, type BridgeTool, type ToolBridgeDeps } from '../toolBridge';
 import { ToolBridgeMcpAdapter } from '../toolBridgeMcp';
 
@@ -233,6 +233,25 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
     g2.open();
     await run;
     expect(t.executions.map((e) => e.name)).toEqual(['install_skills', 'late_tool']);
+  });
+
+  it('definitions over the real host\'s cumulative cap (tools_limit): the answer is re-sent without them, the model is told, the tools stay unknown', async () => {
+    const flood = Array.from({ length: 700 }, (_, i) => ({ name: `new_tool_${i}`, description: 'd', inputSchema: { type: 'object', properties: {} } }));
+    const t = setup({ appearAfter: { install_skills: flood } });
+    const g1 = gate();
+    const g2 = gate();
+    rig.script.turnEvents = [call('op-1', 'install_skills'), { wait: g1.wait }, call('op-2', 'new_tool_1'), { wait: g2.wait }, result('x')];
+    const run = t.backend().run(t.params());
+    await waitFor(() => answers().length === 1);
+    expect(answers()[0].answer).toMatchObject({ kind: 'tool-result', ok: true });
+    expect((answers()[0].answer as any).content).toContain(UNLOADABLE_NOTE);
+    expect((answers()[0].answer as any).tools).toBeUndefined();
+    g1.open();
+    await waitFor(() => answers().length === 2);
+    expect(answers()[1].answer).toMatchObject({ ok: false });
+    expect(t.executions.map((e) => e.name)).toEqual(['install_skills']);
+    g2.open();
+    await run;
   });
 
   it('a tool the worker was never sent is refused even if the (compromised) worker emits a call for it', async () => {
