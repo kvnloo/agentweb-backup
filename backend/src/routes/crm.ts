@@ -1846,6 +1846,28 @@ router.post('/lists/:listId/leads/enrich-v3', async (req: Request, res: Response
       return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
+    if (req.query.mode !== undefined && typeof req.query.mode !== 'string') {
+      return res.status(400).json({ message: 'mode must be a single value' });
+    }
+
+    if (req.query.mode === 'estimate') {
+      // ENG-2715: cost estimate before the user confirms a run. Read-only.
+      const stored = await svcGetEnrichmentConfig({ listId, userId }, enrichmentConfigDeps);
+      if (stored.isDefault) {
+        return res.status(400).json({
+          message: 'No enrichment config saved for this list. Open Enrichment Config and save one first.',
+        });
+      }
+      const estimateLeadIds = Array.isArray(req.body?.leadIds)
+        ? req.body.leadIds.filter((id: unknown): id is string => typeof id === 'string')
+        : [];
+      const leads = await buildV3OrchestratorDeps(userId).loadLeads({
+        listId, userId, leadIds: estimateLeadIds.length > 0 ? estimateLeadIds : undefined,
+      });
+      const { estimateEnrichmentRun } = await import('../services/enrichmentBatchBudget');
+      return res.json(await estimateEnrichmentRun(userId, stored.config, leads.length));
+    }
+
     const mode = (req.query.mode === 'preview' ? 'preview' : 'enrich') as 'preview' | 'enrich';
 
     // Preview accepts a full inline config in body.inlineConfig; enrich uses
