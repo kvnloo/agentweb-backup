@@ -6,6 +6,7 @@ import { createServer, type Server } from 'http';
 import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { MAX_FORWARDED_DEPTH, MAX_FORWARDED_BYTES, boundedValue } from '../../../loginHost/relay/bounds';
 import { MAX_JSON_DEPTH, jsonDepth, jsonTooDeep } from '../jsonDepthGuard';
 import { LoginHostClient, UnixSocketTransport } from '../loginHostClient';
 
@@ -118,6 +119,35 @@ describe('the login host client drops deeply nested worker data unparsed', () =>
     const got: string[] = [];
     for await (const e of stream.events) got.push(e.type);
     expect(got).toEqual(['tool-call', 'result']);
+  });
+
+  it('the host\'s legitimate MAXIMUM events pass the guard: a tool-call input at the forwarded depth limit, a stream tool-use at the limit, and a truncation marker', async () => {
+    const atLimit = (depth: number) => {
+      let v: unknown = 1;
+      for (let i = 0; i < depth; i++) v = { k: v };
+      return v;
+    };
+    expect(jsonDepth(JSON.stringify(atLimit(MAX_FORWARDED_DEPTH)))).toBe(MAX_FORWARDED_DEPTH);
+    const maxCall = { type: 'tool-call', operationId: 'op1', messageId: 'm1', name: 'search', input: atLimit(MAX_FORWARDED_DEPTH) };
+    const maxUse = { type: 'tool-use', operationId: 'toolu_1', name: 'mcp__emma__search', input: boundedValue(atLimit(MAX_FORWARDED_DEPTH)) };
+    const marker = { type: 'tool-use', operationId: 'toolu_2', name: 'mcp__emma__search', input: boundedValue(atLimit(MAX_FORWARDED_DEPTH + 1)) };
+    const bigMarker = { type: 'tool-use', operationId: 'toolu_3', name: 'mcp__emma__search', input: boundedValue({ s: 'x'.repeat(MAX_FORWARDED_BYTES + 10) }) };
+    expect(marker.input).toEqual({ _truncated: 'depth' });
+    expect(bigMarker.input).toEqual({ _truncated: 'size' });
+    for (const ev of [maxCall, maxUse, marker, bigMarker]) {
+      expect(jsonDepth(JSON.stringify(ev))).toBeLessThanOrEqual(MAX_FORWARDED_DEPTH + 2); // the event envelope adds a level or two
+      expect(jsonTooDeep(JSON.stringify(ev))).toBe(false);
+    }
+    expect(MAX_JSON_DEPTH).toBeGreaterThan(MAX_FORWARDED_DEPTH + 2); // headroom between the host\'s limit and ours
+    routes['/v1/turn.run'] = (res) => {
+      res.writeHead(200);
+      res.write(accepted);
+      res.end([maxCall, maxUse, marker, bigMarker, { type: 'result', ok: true, text: 'x' }].map((e) => JSON.stringify(e)).join('\n') + '\n');
+    };
+    const stream = await client.turnRun(turnReq);
+    const got: string[] = [];
+    for await (const e of stream.events) got.push(`${e.type}`);
+    expect(got).toEqual(['tool-call', 'tool-use', 'tool-use', 'tool-use', 'result']);
   });
 
   it('a deep reply to an ordinary call is a bad answer, not parsed', async () => {
