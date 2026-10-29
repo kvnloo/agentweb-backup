@@ -238,3 +238,15 @@ export const PROVIDER_UNAVAILABLE_USER_MESSAGE =
 export function isProviderUnavailableError(error: unknown): boolean {
   return error instanceof Error && error.message === PROVIDER_UNAVAILABLE_USER_MESSAGE;
 }
+
+/**
+ * ENG-2763: user-facing message when the OpenRouter key/credits are exhausted until a
+ * reset (`403 Key limit exceeded (monthly limit)` / 402 credits). Retrying is guaranteed
+ * to fail, so this deliberately does NOT say "please try again".
+ */
+export const QUOTA_EXHAUSTED_USER_MESSAGE =
+  'Our AI service is temporarily at capacity. Our team has been notified and is restoring it — no need to resend your message right now.';
+
+export function isQuotaExhaustedError(error: unknown): boolean {
+  return error instanceof Error && error.message === QUOTA_EXHAUSTED_USER_MESSAGE;
+}
