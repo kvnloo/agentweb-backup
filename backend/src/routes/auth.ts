@@ -317,6 +317,8 @@ router.get('/slack-channel-name', authenticateToken, async (req, res) => {
 // Regular auth routes (rate-limited to prevent brute-force)
 router.post('/register', authRateLimiter, authController.register);
 router.post('/login', authRateLimiter, authController.login);
+// ENG-2686: observe logout (client still discards the JWT); always 204.
+router.post('/logout', authenticateToken, authController.logout);
 
 // Password reset routes
 router.post('/forgot-password', authController.forgotPassword);
