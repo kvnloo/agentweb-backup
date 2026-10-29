@@ -117,6 +117,14 @@ describe("applying a Smartlead event to the CRM (ENG-673)", () => {
     expect(JSON.stringify(w2.appended[0].eventData)).not.toMatch(/Q4/); // the campaign's name is not carried either
   });
 
+  it("a bounce Smartlead says came from our own side is recorded but blocks nobody", async () => {
+    const w = world();
+    await make(w).handle(ctx, bounce({ is_sender_originated_bounce: true, reason: "Sender mailbox rejected" }));
+    expect(w.statusWrites).toHaveLength(0);
+    expect(w.appended[0].eventType).toBe("email.bounced");
+    expect(w.leads[0].contactStatus).toBeUndefined();
+  });
+
   it("a temporary bounce is recorded but does not block", async () => {
     const w = world();
     await make(w).handle(ctx, bounce({ reason: "Mailbox full, try again later" }));

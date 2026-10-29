@@ -41,6 +41,32 @@ describe("parsing a Smartlead event (ENG-673)", () => {
     for (const secret of ["PRIVATE REPLY", "I am replying", "S3CRET", "TOKEN"]) expect(all).not.toContain(secret);
   });
 
+  const REAL_BOUNCE = {
+    sl_email_lead_id: "4843221319", campaign_status: "COMPLETED", stats_id: "f1d7bbc8-d080-40dc-9c30-66ca96a17b0f", from_email: "sender@example.org", to_email: "nosuchuser@example.com",
+    to_name: "Bounce Test", time_sent: "2026-10-29T14:40:14.551+00:00", event_timestamp: "2026-10-29T14:40:14.551+00:00", campaign_name: "AW-TEST events slice3 (delete me)", campaign_id: 4270665,
+    sequence_number: 1, custom_subject: "AgentWeb event test", sent_message_body: "<p>Hi Bounce</p>", subject: "AgentWeb event test", is_bounced: true, is_sender_originated_bounce: false,
+    bounce_reply_message_id: "<2812cd5f@PN5PR01MB025717.INDPRD01.PROD.OUTLOOK.COM>", bounce_reply_email: "<html>HTML OF THE NOTICE</html>",
+    bounce_reply_email_preview: "Your message to nosuchuser@example.com couldn't be delivered.\nnosuchuser wasn't found at example.com.\nsender    Office 365      nosuchuser\nAction Required",
+    bounce_message: { message_id: "<2812cd5f@PN5PR01MB025717.INDPRD01.PROD.OUTLOOK.COM>", html: "<html>HTML OF THE NOTICE</html>", text: "Your message to nosuchuser@example.com couldn't be delivered.\nnosuchuser wasn't found at example.com.\nsender    Office 365      nosuchuser\nAction Required", time: "2026-10-29T14:40:15.000Z" },
+    secret_key: "S3CRET", webhook_url: "http://host/api/webhooks/smartlead/a/b/TOKEN", event_type: "EMAIL_BOUNCE", event_id: "4a549622-3b9d-4251-940a-151b57d1702e", sl_email_lead_map_id: 3930296648,
+  };
+
+  it("reads the REAL bounce payload: the contact is to_email, the reason comes from the receiving server's notice, a missing mailbox is a hard bounce", () => {
+    const e = ok(REAL_BOUNCE);
+    expect(e).toMatchObject({ kind: "bounce", campaignId: 4270665, soft: false });
+    expect(e.candidateEmails[0]).toBe("nosuchuser@example.com");
+    expect(e.reason).toContain("wasn't found at example.com");
+    expect(e.reason!.length).toBeLessThanOrEqual(160);
+    const all = JSON.stringify(e);
+    for (const never of ["HTML OF THE NOTICE", "S3CRET", "TOKEN"]) expect(all).not.toContain(never);
+  });
+
+  it("a bounce that came from OUR side, or that is not a bounce at all, never blocks the contact", () => {
+    expect(ok({ ...REAL_BOUNCE, is_sender_originated_bounce: true }).soft).toBe(true);
+    expect(ok({ ...REAL_BOUNCE, is_bounced: false }).soft).toBe(true);
+    expect(ok({ ...REAL_BOUNCE, is_sender_originated_bounce: true, bounce_type: "hard" }).soft).toBe(true); // a hard label does not make our own mailbox problem the contact's
+  });
+
   it("reads the REAL unsubscribe payload", () => {
     const e = ok(REAL_UNSUB);
     expect(e).toMatchObject({ kind: "unsubscribe", campaignId: 4270665, occurredAt: "2026-10-29T14:57:29.266Z" });

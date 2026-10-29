@@ -96,9 +96,15 @@ export function parseSmartleadEvent(body: unknown): ParseResult {
   if (candidateEmails.length === 0) return { ok: false, reason: "no_contact_address" };
 
   const occurredAt = isoTime(b.time_replied ?? b.event_timestamp ?? b.timestamp ?? b.time_bounced ?? b.time ?? b.created_at);
-  const reasonText = short(b.bounce_reason ?? b.reason ?? b.error ?? b.bounce_message ?? b.message ?? (b.bounce as Record<string, unknown> | undefined)?.reason, 160);
+  // Seen in a real bounce (2026-10-29): the receiving server's notice is `bounce_message.text` (also `bounce_reply_email_preview`), e.g.
+  // "slice3-nosuchuser wasn't found at withagentweb.com". The HTML copies of it are never used.
+  const bounceMessage = b.bounce_message && typeof b.bounce_message === "object" ? (b.bounce_message as Record<string, unknown>).text : b.bounce_message;
+  const reasonText = short(b.bounce_reason ?? b.reason ?? b.error ?? bounceMessage ?? b.bounce_reply_email_preview ?? b.message ?? (b.bounce as Record<string, unknown> | undefined)?.reason, 160);
   const bounceType = str(b.bounce_type ?? b.bounceType ?? (b.bounce as Record<string, unknown> | undefined)?.type)?.toLowerCase();
-  const soft = kind === "bounce" && (/(soft|temporary|transient)/.test(bounceType ?? "") || (!/(hard|permanent)/.test(bounceType ?? "") && !!reasonText && SOFT.test(reasonText) && !HARD.test(reasonText)));
+  // A bounce Smartlead says came from OUR side (`is_sender_originated_bounce`, e.g. the sending mailbox was refused or is broken) says nothing
+  // about the contact's address, and `is_bounced: false` is no bounce at all: both are recorded but never block the contact.
+  const notTheContacts = b.is_sender_originated_bounce === true || b.is_bounced === false;
+  const soft = kind === "bounce" && (notTheContacts || /(soft|temporary|transient)/.test(bounceType ?? "") || (!/(hard|permanent)/.test(bounceType ?? "") && !!reasonText && SOFT.test(reasonText) && !HARD.test(reasonText)));
 
   const sequence = str(String(b.sequence_number ?? b.seq_number ?? "")) ?? "";
   // `event_id` is unique per event and the same on every retry of it (it is also the `webhook-id` header): the best identity there is.
