@@ -201,6 +201,12 @@ export const register = async (req: Request, res: Response) => {
 
     // Nothing below this boundary is safe unless createUser persisted the row.
     if (!newUser) {
+      // A concurrent duplicate submit loses the conditional account write;
+      // answer it exactly like a later repeat would.
+      const raced = await userDb.getUserByEmail(email).catch(() => undefined);
+      if (raced) {
+        return res.status(400).json({ message: "User already exists" });
+      }
       console.error("Registration persistence failed before post-create side effects");
       return res.status(503).json({
         message: "We could not create your account. Please try again.",
