@@ -25,6 +25,7 @@ const EXPECTED: Record<string, { httpStatus: number; retryable: boolean }> = {
   server_restarting: { httpStatus: 503, retryable: true },
   extra_usage_needs_ack: { httpStatus: 409, retryable: false },
   org_not_supported: { httpStatus: 403, retryable: false },
+  tools_too_large_for_plan: { httpStatus: 422, retryable: false },
 };
 
 describe('claude plan stops', () => {
@@ -32,6 +33,17 @@ describe('claude plan stops', () => {
     const e = new ClaudeRouteStopError(code as ClaudeStopCode);
     expect({ httpStatus: e.httpStatus, retryable: e.retryable }).toEqual(want);
     expect(claudeStopBody(e).retryable).toBe(want.retryable);
+  });
+
+  it('tools_too_large_for_plan: the exact copy (pending Manan OK), not retryable, AgentWeb credits offered', () => {
+    const e = new ClaudeRouteStopError('tools_too_large_for_plan');
+    expect(claudeStopBody(e)).toEqual({
+      error: 'One of the tools connected to your account is too large to use with your Claude plan. Disconnect or shorten it in Settings, or continue on AgentWeb credits.',
+      code: 'tools_too_large_for_plan',
+      funding: 'claude_subscription',
+      retryable: false,
+      canUseAgentWebCredits: true,
+    });
   });
 
   it('a model the plan cannot run is not retryable', () => {
@@ -117,7 +129,7 @@ describe('claude plan stops', () => {
 });
 
 describe('which stops offer AgentWeb credits (the user decides; nothing moves on its own)', () => {
-  const OFFERED: ClaudeStopCode[] = ['no_connection', 'needs_reconnect', 'expired', 'revoked_or_disabled', 'lookup_failed', 'host_unavailable', 'host_busy', 'usage_limit', 'turn_failed', 'model_not_on_plan'];
+  const OFFERED: ClaudeStopCode[] = ['no_connection', 'needs_reconnect', 'expired', 'revoked_or_disabled', 'lookup_failed', 'host_unavailable', 'host_busy', 'usage_limit', 'turn_failed', 'model_not_on_plan', 'tools_too_large_for_plan'];
   const NOT_OFFERED: ClaudeStopCode[] = [
     'not_enabled', 'not_allowed_here', 'connection_changed', 'context_too_large', 'policy_blocks', 'invalid_funding_choice', 'turn_timeout', 'server_restarting',
     'extra_usage_needs_ack', 'org_not_supported',
