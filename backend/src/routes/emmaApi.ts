@@ -301,6 +301,8 @@ router.post('/remove-c2pa', async (req: Request, res: Response) => {
 
 // ─── Email ──────────────────────────────────────────────────────────────────
 
+const MAX_GET_MESSAGE_IDS = 50;
+
 router.post('/email', async (req: Request, res: Response) => {
   try {
     const { bootstrapEmailProviders, resolveEmailAccount, withAccessGuard } = await import('../services/emailProviderService');
@@ -338,6 +340,9 @@ router.post('/email', async (req: Request, res: Response) => {
       }
       case 'get': {
         const ids: string[] = Array.isArray(req.body.message_ids) ? req.body.message_ids : [];
+        if (ids.length > MAX_GET_MESSAGE_IDS || ids.some((id) => typeof id !== 'string')) {
+          return res.status(400).json({ message: `message_ids must be at most ${MAX_GET_MESSAGE_IDS} strings` });
+        }
         const emails = await guarded(() => provider.getEmails(ownerUserId, req.body.account_id, ids));
         result = { emails, count: emails.length };
         break;

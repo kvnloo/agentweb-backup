@@ -104,4 +104,41 @@ describe('read_email execution', () => {
     await mcpToolRegistry.execute('read_email', { account_id: 'a', action: 'list' }, { ...API_KEY_CTX, userId: 'user-2' });
     expect(mockMcpFetch).toHaveBeenCalledTimes(READ_EMAIL_RATE_LIMIT + 1);
   });
+
+  it('requires message_ids to be 1-50 strings for get, before fetching', async () => {
+    jest.spyOn(console, 'info').mockImplementation(() => {});
+    const bad = [undefined, 'm1', [], [1, 2], [''], Array.from({ length: 51 }, (_, i) => `m${i}`)];
+    for (const message_ids of bad) {
+      await expect(mcpToolRegistry.execute('read_email', { account_id: 'a', action: 'get', message_ids }, API_KEY_CTX))
+        .rejects.toThrow(/message_ids/);
+    }
+    expect(mockMcpFetch).not.toHaveBeenCalled();
+
+    const fifty = Array.from({ length: 50 }, (_, i) => `m${i}`);
+    await mcpToolRegistry.execute('read_email', { account_id: 'a', action: 'get', message_ids: fifty }, API_KEY_CTX);
+    expect(mockMcpFetch.mock.calls[0][0].body.message_ids).toEqual(fifty);
+  });
+
+  it('clamps max_results to an integer in 1..50', async () => {
+    jest.spyOn(console, 'info').mockImplementation(() => {});
+    const cases: Array<[unknown, number]> = [[500, 50], [0, 1], [-3, 1], [7.9, 7], ['12', 12], ['abc', 10]];
+    for (const [input] of cases) {
+      await mcpToolRegistry.execute('read_email', { account_id: 'a', action: 'list', max_results: input }, API_KEY_CTX);
+    }
+    expect(mockMcpFetch.mock.calls.map((c) => c[0].body.max_results)).toEqual(cases.map(([, out]) => out));
+  });
+
+  it('audits refusals and errors with apiKeyId, then rethrows', async () => {
+    const info = jest.spyOn(console, 'info').mockImplementation(() => {});
+    await expect(mcpToolRegistry.execute('read_email', { account_id: 'a', action: 'send' }, API_KEY_CTX)).rejects.toThrow();
+    mockMcpFetch.mockRejectedValueOnce(new Error('upstream 500'));
+    await expect(mcpToolRegistry.execute('read_email', { account_id: 'a', action: 'list' }, API_KEY_CTX)).rejects.toThrow('upstream 500');
+
+    const lines = info.mock.calls.map((c) => String(c[0])).filter((s) => s.includes('mcp_read_email')).map((s) => JSON.parse(s));
+    expect(lines).toEqual([
+      expect.objectContaining({ event: 'mcp_read_email', outcome: 'refused', userId: 'user-1', apiKeyId: 'k1', action: 'send' }),
+      expect.objectContaining({ event: 'mcp_read_email', outcome: 'error', userId: 'user-1', apiKeyId: 'k1', action: 'list', error: 'upstream 500' }),
+    ]);
+    info.mockRestore();
+  });
 });

@@ -3222,11 +3222,14 @@
           "items": {
             "type": "string"
           },
-          "description": "Message IDs (get action)"
+          "maxItems": 50,
+          "description": "Message IDs (get action, at most 50)"
         },
         "max_results": {
-          "type": "number",
-          "description": "Max results (search/list, capped at 50)",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 50,
+          "description": "Max results (search/list, 1-50)",
           "default": 10
         }
       },

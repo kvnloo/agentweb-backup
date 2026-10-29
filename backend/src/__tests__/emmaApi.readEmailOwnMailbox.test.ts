@@ -77,4 +77,17 @@ describe('POST /api/emma/email own_mailbox_only', () => {
     expect(res.status).toBe(200);
     expect(mockListEmails).toHaveBeenCalledWith('teammate-9', 'acct-1', 'INBOX', 20);
   });
+
+  it('rejects a get with more than 50 message_ids before calling the provider', async () => {
+    const mockGetEmails = jest.fn().mockResolvedValue([]);
+    mockResolveEmailAccount.mockResolvedValue({ ...accountOwnedBy('caller-1'), provider: { ...PROVIDER, getEmails: mockGetEmails } });
+    const ids = Array.from({ length: 51 }, (_, i) => `m${i}`);
+    const res = await post({ account_id: 'acct-1', action: 'get', message_ids: ids, own_mailbox_only: true });
+    expect(res.status).toBe(400);
+    expect(mockGetEmails).not.toHaveBeenCalled();
+
+    const ok = await post({ account_id: 'acct-1', action: 'get', message_ids: ids.slice(0, 50), own_mailbox_only: true });
+    expect(ok.status).toBe(200);
+    expect(mockGetEmails).toHaveBeenCalledTimes(1);
+  });
 });
