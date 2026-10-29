@@ -20,7 +20,7 @@ const TOOLS: ToolDef[] = [
   { name: "echo", description: "Echo", inputSchema: { type: "object", properties: { q: { type: "string" } } } },
 ];
 
-async function rig(env: Record<string, string> = {}, limits: { idleMs?: number } = {}, tools: unknown = TOOLS) {
+async function rig(env: Record<string, string> = {}, limits: { idleMs?: number } = {}, tools: unknown = TOOLS, hostAllowsAll = false) {
   const root = mkdtempSync(join(tmpdir(), "relay-shim-"));
   roots.push(root);
   const layout = new Layout({ env: "t1", stateRoot: "/var/lib/aw-login-host/t1", sharedParent: "/var/lib/aw-login-host", uidMin: 400_000, uidMax: 400_100, relayRoot: join(root, "relay") });
@@ -28,7 +28,7 @@ async function rig(env: Record<string, string> = {}, limits: { idleMs?: number }
   host.init();
   const calls: RelayCall[] = [];
   const visible = new Set(TOOLS.map((t) => t.name));
-  const ep: RelayEndpoint = await host.open({ uid: 400_001, identity: { connectionId: "c", epoch: 1, turnId: "t" }, onCall: (c) => void calls.push(c), allowTool: (n) => visible.has(n), callTimeoutMs: () => 10_000 });
+  const ep: RelayEndpoint = await host.open({ uid: 400_001, identity: { connectionId: "c", epoch: 1, turnId: "t" }, onCall: (c) => void calls.push(c), allowTool: (n) => hostAllowsAll || visible.has(n), callTimeoutMs: () => 10_000 });
   mkdirSync(join(root, "cfg"));
   const toolsFile = join(root, "cfg", "tools.json");
   writeFileSync(toolsFile, JSON.stringify(tools));
@@ -120,6 +120,14 @@ describe("relay shim: MCP surface", () => {
       const res = (await r.rpc("tools/call", { name, arguments: {} })).result;
       expect(res).toMatchObject({ isError: true });
     }
+    expect(r.calls).toHaveLength(0);
+    await r.ep.close();
+  });
+
+  it("MUTATION TARGET: the shim's OWN gate: with a host that would allow anything, a tool that is not in its list still never leaves the shim", async () => {
+    const r = await rig({}, {}, TOOLS, true);
+    await r.rpc("initialize", {});
+    for (const name of ["later", "nope", "../x"]) expect((await r.rpc("tools/call", { name, arguments: {} })).result).toMatchObject({ isError: true });
     expect(r.calls).toHaveLength(0);
     await r.ep.close();
   });

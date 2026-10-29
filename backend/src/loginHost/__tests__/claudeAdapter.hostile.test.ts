@@ -126,6 +126,23 @@ describe("hostile shim over the real relay socket (the reviewer's reproduction)"
   });
 });
 
+describe("a hostile CLI printing a deeply nested line", () => {
+  it.each([5_000, 100_000, 1_000_000])("MUTATION TARGET: a stdout line nested %i deep is dropped before anything parses it; the turn completes normally and one fixed-code line is logged", async (k) => {
+    const rig = makeRig();
+    rig.scenario({ deepline: k, turn: [{ type: "assistant", message: { id: "m1", content: [{ type: "text", text: "hello" }] } }, RESULT_STEP] });
+    const session = await rig.adapter.openSession(rig.ctx, { connectionId: "conn1", epoch: 3 });
+    const events: ProviderEvent[] = [];
+    const t0 = Date.now();
+    for await (const ev of session.turn({ turnId: "t1", prompt: "go", model: "sonnet", relay: { tools: TOOLS, callTimeoutMs: () => 5000 } })) events.push(ev);
+    await session.close();
+    expect(Date.now() - t0).toBeLessThan(15_000);
+    expect(events.map((e) => e.type)).toEqual(["text", "usage", "result"]);
+    expect(events[events.length - 1]).toMatchObject({ type: "result", ok: true });
+    expect(rig.logs.filter((l) => l.event === "cli_line_too_deep")).toEqual([{ event: "cli_line_too_deep", fields: undefined }]);
+    expect(uncaught).toEqual([]);
+  });
+});
+
 /** The relay replaced by a stub that hands the test its callbacks, so a call can be injected exactly as a bug in the relay would deliver it. */
 function stubbed() {
   const rig = makeRig(100);

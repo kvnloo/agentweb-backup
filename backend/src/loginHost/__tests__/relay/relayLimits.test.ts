@@ -4,7 +4,7 @@
  * (2) pushes a manifest AT the limits through the request schema, the body cap, the turn wrapper's manifest line and the shim's tools/list.
  */
 import { spawn } from "child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "fs";
 import { request } from "http";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -174,6 +174,9 @@ describe("a manifest AT the limits", () => {
     const wrapMs = Date.now() - t0;
     expect(out).toBe("REST-OF-STDIN\n");
     expect(readFileSync(join(unitTmp, "aw-cfg", "tools.json"), "utf8")).toBe(line + "\n");
+    // the wrapper's umask 077: the manifest and the MCP config are private to the unit's uid whatever the caller's umask
+    expect(statSync(join(unitTmp, "aw-cfg", "tools.json")).mode & 0o777).toBe(0o600);
+    expect(statSync(join(unitTmp, "aw-cfg", "mcp.json")).mode & 0o777).toBe(0o600);
     console.log(`wrapper manifest line at the limit: ${wrapMs} ms`);
     expect(wrapMs).toBeLessThan(30_000); // POSIX `read` takes the line a byte at a time; it must still be bounded and finish
     // The shim lists every tool from that file.

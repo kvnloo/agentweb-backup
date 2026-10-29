@@ -170,6 +170,7 @@ if (args[0] === "auth" && args[1] === "login") {
       return;
     }
     record({ mode: "turn-input", mcpFile, mcpMode, firstUser: msg });
+    if (scenario.deepline) process.stdout.write("[".repeat(scenario.deepline) + "]".repeat(scenario.deepline) + "\n"); // a hostile CLI: one line nested this deep
     if (scenario.noise) process.stdout.write("warning: not json\n\n[1,2,3]\nnull\n");
     if (scenario.bigline) {
       process.stdout.write("x".repeat(scenario.bigline)); // one enormous line, no newline
