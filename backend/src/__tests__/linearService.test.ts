@@ -299,6 +299,35 @@ describe('linearService.listOpenIssuesByLabel', () => {
   });
 });
 
+describe('linearService.listOpenIssuesByLabel — pagination (ENG-2766)', () => {
+  afterEach(() => jest.clearAllMocks());
+  const page = (start: number, n: number, hasNextPage: boolean, endCursor: string | null) => ({
+    ok: true, status: 200, json: () => Promise.resolve({ data: { issues: {
+      nodes: Array.from({ length: n }, (_, i) => ({ id: `u${start + i}`, identifier: `ENG-${start + i}`, title: 't', description: '' })),
+      pageInfo: { hasNextPage, endCursor },
+    } } }),
+  });
+
+  it('follows endCursor past the first page so an older open canonical stays a dedupe candidate', async () => {
+    (global.fetch as any) = jest.fn()
+      .mockResolvedValueOnce(page(1, 100, true, 'c1'))
+      .mockResolvedValueOnce(page(101, 30, false, 'c2'));
+    const res = await listOpenIssuesByLabel('Auto');
+    expect(res).toHaveLength(130);
+    expect(res[129].identifier).toBe('ENG-130');
+    const calls = (global.fetch as jest.Mock).mock.calls.map((c) => JSON.parse(c[1].body).variables);
+    expect(calls[0].after).toBeNull();
+    expect(calls[1].after).toBe('c1');
+  });
+
+  it('stops at the cap even if Linear keeps reporting more pages', async () => {
+    (global.fetch as any) = jest.fn().mockImplementation(() => Promise.resolve(page(1, 100, true, 'c')));
+    const res = await listOpenIssuesByLabel('Auto', 250);
+    expect(res).toHaveLength(250);
+    expect((global.fetch as jest.Mock).mock.calls.length).toBe(3);
+  });
+});
+
 describe('linearService.listOpenBugCanonicals — open-state whitelist (ENG-358)', () => {
   afterEach(() => jest.clearAllMocks());
 
