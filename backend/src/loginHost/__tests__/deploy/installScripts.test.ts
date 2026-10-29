@@ -9,7 +9,7 @@
 // The test-only TLS keys and certificates are generated on first use (they are not committed): this import must come first.
 import "../fixtures/tls/ensureFixtures";
 import { spawn, spawnSync, type SpawnSyncReturns } from "child_process";
-import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, statSync, writeFileSync } from "fs";
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { parseHostConfig } from "../../host/hostConfig";
@@ -544,7 +544,7 @@ describe("install.sh: stage -> validate -> switch, rollback, and 'a failure neve
   }
 
   /** A fresh fake machine: scratch OPT/CONF/UNIT_DIR, a fake `aws` serving the test certificates, a fake `systemctl` that logs, a bridge-url file. */
-  function box(opts: { bridge?: string | null; cert?: string; copyPkg?: string } = {}): Box {
+  function box(opts: { bridge?: string | null; cert?: string; copyPkg?: string; node?: "file" | "symlink" | "none" } = {}): Box {
     const dir = mkdtempSync(join(root, "box-"));
     const p = join(dir, "pkg");
     spawnSync("cp", ["-a", opts.copyPkg ?? pkg, p]);
@@ -570,7 +570,22 @@ case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${
     const units = join(dir, "units");
     for (const d of [opt, conf, units]) mkdirSync(d);
     if (opts.bridge !== null) writeFileSync(join(conf, "bridge-url"), `${opts.bridge ?? "https://backend.example.test/internal/tool-bridge/run/mcp"}\n`);
+    // The pinned node the config names (/opt/aw-node/v<ver>/bin/node on the worker): a real file here, or a symlink to one (what /usr/bin/node is), or missing.
+    const nodeRoot = join(dir, "aw-node");
+    const nodeBin = join(nodeRoot, `v${versions.NODE_VERSION}`, "bin");
+    if (opts.node !== "none") {
+      mkdirSync(opts.node === "symlink" ? join(dir, "real-node") : nodeBin, { recursive: true });
+      if (opts.node === "symlink") {
+        writeFileSync(join(dir, "real-node", "node"), "#!/bin/sh\n", { mode: 0o755 });
+        mkdirSync(nodeBin, { recursive: true });
+        symlinkSync(join(dir, "real-node", "node"), join(nodeBin, "node"));
+      } else writeFileSync(join(nodeBin, "node"), "#!/bin/sh\n", { mode: 0o755 });
+      // the directories as root would have made them (the test process may run with a group-writable umask)
+      for (const d of [nodeRoot, join(nodeRoot, `v${versions.NODE_VERSION}`), nodeBin, join(dir, "real-node")]) if (existsSync(d)) chmodSync(d, 0o755);
+    }
+    chmodSync(dir, 0o755);
     const env = {
+      AW_NODE_ROOT: nodeRoot, AW_TRUST_BOUNDARY: dir,
       PATH: `${bin}:${process.env.PATH}`,
       AW_OPT: opt, AW_CONF: conf, AW_UNIT_DIR: units, AW_LOCK: join(dir, "lock"), AW_SYSTEMCTL: join(bin, "systemctl"),
       AW_SKIP_PREREQS: "1", AW_WORKER_IP: "172.31.30.50", AW_TMP: dir,
@@ -730,6 +745,49 @@ case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${
       expect(run(b).status).toBe(0);
       expect(text(unit)).toBe(good);
       expect(systemctlCalls(b)).toContain("systemctl daemon-reload");
+    });
+
+    describe("pre-switch trusted-path check of the rendered config (ENG-2113)", () => {
+      it("a normal install runs the check and reports it", () => {
+        const b = box();
+        const r = run(b);
+        expect(r.status).toBe(0);
+        expect(r.stdout).toContain("every release path the host will check is root-controlled");
+      });
+
+      it("MUTATION TARGET: a pinned node reached through a SYMLINK refuses the install BEFORE the switch, with a clear message, changing nothing", () => {
+        const b = box({ node: "symlink" });
+        const r = run(b);
+        expect(r.status).not.toBe(0);
+        expect(r.stdout + r.stderr).toMatch(/would refuse to start with this release \(trusted-path check\).*\/opt\/aw-node\/v[0-9.]+\/bin\/node is not trusted: .*is a symlink/s);
+        expect(existsSync(join(b.opt, "current"))).toBe(false);
+        expect(releases(b)).toEqual([]);
+        expect(tlsDirs(b)).toEqual([]);
+        expect(stagingLeft(b)).toEqual([]);
+        expect(systemctlCalls(b).filter((c) => c.includes("restart") || c.includes("enable"))).toEqual([]);
+      });
+
+      it("MUTATION TARGET: a missing pinned node refuses the install before the switch too", () => {
+        const b = box({ node: "none" });
+        const r = run(b);
+        expect(r.status).not.toBe(0);
+        expect(r.stdout + r.stderr).toContain("is not trusted");
+        expect(existsSync(join(b.opt, "current"))).toBe(false);
+      });
+
+      it("MUTATION TARGET: a pinned node whose directory is group-writable refuses the install before the switch", () => {
+        const b = box();
+        chmodSync(join(b.dir, "aw-node", `v${versions.NODE_VERSION}`, "bin"), 0o775);
+        const r = run(b);
+        expect(r.status).not.toBe(0);
+        expect(r.stdout + r.stderr).toContain("writable by group or others");
+        expect(existsSync(join(b.opt, "current"))).toBe(false);
+      });
+
+      it("--prepare does not run the release check (it stages nothing); the node link is not part of this", () => {
+        const b = box({ node: "symlink" });
+        expect(run(b, "--prepare").stdout).not.toContain("trusted-path check");
+      });
     });
 
     it("a failed --prepare never stops or disables anything (it only gets the machine ready)", () => {
