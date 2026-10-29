@@ -373,6 +373,20 @@ describe('RelayToolDispatcher', () => {
       expect(t.executed.map((e) => e.name)).toEqual(['send_email']);
     });
 
+    it('a call that matches an announcement of an EARLIER batch is refused after a halt (batch check, even though it was announced before the answer)', async () => {
+      const t = rig({ confirm: ['send_email'] });
+      t.d.noteStreamUse('mcp__aw__save_note', { n: 1 }); // batch 1, never run yet
+      t.d.noteStreamResult();
+      t.d.noteStreamUse('mcp__aw__send_email', { to: 'a' }); // batch 2
+      t.d.start(t.ev('op-1', 'send_email', { to: 'a' }));
+      await t.d.settle(1_000);
+      const closed = jest.spyOn(t.bridge, 'noteToolResult');
+      t.d.start(t.ev('op-2', 'save_note', { n: 1 }));
+      await t.d.settle(1_000);
+      expect(t.executed.map((e) => e.name)).toEqual(['send_email']);
+      expect(closed).toHaveBeenCalled(); // the halted group was closed before it was refused
+    });
+
     it('a call announced in an EARLIER message is not a sibling of the halt', async () => {
       const t = rig({ confirm: ['send_email'] });
       t.d.noteStreamUse('mcp__aw__save_note', { n: 1 });
