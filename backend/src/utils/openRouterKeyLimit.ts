@@ -33,7 +33,9 @@ function collectStatus(error: unknown, text: string): number | undefined {
   const e = error as any;
   for (const v of [e?.status, e?.statusCode, e?.code, e?.response?.status, e?.error?.code]) {
     const n = typeof v === 'string' ? Number(v) : v;
-    if (n === 402 || n === 403) return n;
+    // Preserve any explicit HTTP status (e.g. 429/500) so a transient error is not
+    // misread as quota exhaustion; the text fallback applies only with no status.
+    if (typeof n === 'number' && Number.isInteger(n) && n >= 100 && n <= 599) return n;
   }
   const m = /\b(402|403)\b/.exec(text);
   return m ? Number(m[1]) : undefined;

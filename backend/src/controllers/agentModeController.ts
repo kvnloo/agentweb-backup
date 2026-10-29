@@ -8818,12 +8818,25 @@ export async function runScheduledChat(
         // short-interval requeue is guaranteed to fail again. Defer to the stated
         // reset (else the next natural slot); keep the schedule active and do not
         // spend a zero-output retry on it.
+        // Anchor the natural-next fallback to the scheduled slot (as the normal
+        // dispatcher does) so the cadence's time-of-day is preserved.
+        const scheduledSlot = schedule.nextRunTime ? new Date(schedule.nextRunTime) : new Date();
         const deferredTo = resolveQuotaDeferral(
           quotaExhaustion,
           new Date(),
-          calculateNextRunTime(schedule.frequency, new Date(), schedule.frequencyIntervalDays, schedule.scheduleId)
+          calculateNextRunTime(
+            schedule.frequency,
+            Number.isFinite(scheduledSlot.getTime()) ? scheduledSlot : new Date(),
+            schedule.frequencyIntervalDays,
+            schedule.scheduleId
+          )
         );
         try {
+          // Do not reactivate a schedule the owner paused/stopped while this run was in flight.
+          const current: any = await scheduleDb.getScheduleById(schedule.scheduleId);
+          if (current && current.status && current.status !== 'active') {
+            throw new Error(`schedule status is '${current.status}', not deferring`);
+          }
           await scheduleDb.updateSchedule(schedule.scheduleId, {
             status: 'active',
             nextRunTime: deferredTo,

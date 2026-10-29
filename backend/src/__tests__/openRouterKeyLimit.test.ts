@@ -69,4 +69,8 @@ describe('ENG-2758 classifyOpenRouterQuotaExhaustion', () => {
     const weeklyNatural = new Date('2026-11-05T17:00:00.000Z');
     expect(resolveQuotaDeferral({ kind: 'credits' }, now, weeklyNatural)).toBe(capAt);
   });
+
+  it('explicit non-quota status (429) with "Key limit exceeded" text is not quota exhaustion', () => {
+    expect(classifyOpenRouterQuotaExhaustion({ status: 429, message: 'Key limit exceeded (monthly limit)' })).toBeNull();
+  });
 });
