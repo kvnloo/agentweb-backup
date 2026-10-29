@@ -198,6 +198,13 @@ describe("relay: tool-call operations and turn.toolResult", () => {
     await it.return?.();
   });
 
+  it("MUTATION TARGET: an exact repeat WITHIN one answer is sent once (not twice to the shim, not double-counted)", async () => {
+    const it = await start();
+    expect(await code(answer(rig, "op1", { tools: [LATE, { ...LATE }, LATE] }))).toBe("OK");
+    expect(rig.script.answers[0].answer).toEqual({ kind: "tool-result", ok: true, content: "r", tools: [LATE] });
+    await it.return?.();
+  });
+
   it("MUTATION TARGET: a name that differs only in case from a visible tool is refused (tools_invalid) and the operation stays pending", async () => {
     const it = await start();
     expect(await code(answer(rig, "op1", { tools: [def("SEARCH")] }))).toBe("EINVALID:tools_invalid"); // open at the start
