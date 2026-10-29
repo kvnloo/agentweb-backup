@@ -15,6 +15,8 @@ import {
   basesForDeletedPaths,
   distinctBasesForDeletedPaths,
   pathsForBase,
+  checkNodeVersion,
+  REQUIRED_NODE_MAJOR,
 } from './logic.mjs';
 
 test('parsePushLine: normal branch push', () => {
@@ -476,4 +478,28 @@ test('pathsForBase: mixed paths split correctly for the same base pass — the c
 
 test('pathsForBase: no candidate bases at all for a path -> always absent', () => {
   assert.deepEqual(pathsForBase('base-1', ['src/a.ts'], {}), { recoverable: [], absent: ['src/a.ts'] });
+});
+
+test('checkNodeVersion: CI major or newer passes', () => {
+  assert.equal(REQUIRED_NODE_MAJOR, 22);
+  for (const v of ['22.0.0', '22.23.3', '24.1.0']) assert.deepEqual(checkNodeVersion(v), { ok: true, major: Number(v.split('.')[0]), message: '' });
+});
+
+test('checkNodeVersion: an older node is refused with the instruction to switch', () => {
+  const r = checkNodeVersion('18.19.1');
+  assert.equal(r.ok, false);
+  assert.equal(r.major, 18);
+  assert.match(r.message, /v18\.19\.1/);
+  assert.match(r.message, /nvm use 22/); // the fix is named
+  assert.equal(checkNodeVersion('21.9.0').ok, false); // one short of the CI major
+});
+
+test('checkNodeVersion: an unreadable version fails closed, and the required major can be overridden', () => {
+  for (const v of ['', undefined, null, 'x.y']) {
+    const r = checkNodeVersion(v);
+    assert.equal(r.ok, false);
+    assert.equal(r.major, null);
+    assert.match(r.message, /unknown version/);
+  }
+  assert.equal(checkNodeVersion('20.0.0', 20).ok, true);
 });
