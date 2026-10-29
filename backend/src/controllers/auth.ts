@@ -201,6 +201,12 @@ export const register = async (req: Request, res: Response) => {
 
     // Nothing below this boundary is safe unless createUser persisted the row.
     if (!newUser) {
+      // A concurrent duplicate submit loses the conditional account write;
+      // answer it exactly like a later repeat would.
+      const raced = await userDb.getUserByEmail(email).catch(() => undefined);
+      if (raced) {
+        return res.status(400).json({ message: "User already exists" });
+      }
       console.error("Registration persistence failed before post-create side effects");
       return res.status(503).json({
         message: "We could not create your account. Please try again.",
@@ -287,6 +293,8 @@ export const register = async (req: Request, res: Response) => {
     // must never affect the registration response the user is waiting on.
     const metaEventId = crypto.randomUUID();
     sendCompleteRegistrationCapiEvent(metaEventId, email).catch(() => {});
+    // ENG-2738: hireemma.ai signal plan — fire-and-forget, never affects the response.
+    void emitAppSignal({ userId, createdAt: new Date().toISOString() }, "registration_completed", { method: "password" });
 
     res.status(201).json({
       token,
@@ -673,6 +681,7 @@ export const googleCallback = async (
     );
 
     void emitAppSignal(user as any, "login", { method: "google", isNewUser: isNewUser ? 1 : 0 });
+    if (isNewUser) void emitAppSignal(user as any, "registration_completed", { method: "google" });
 
     const resultUserObject = {
       token,

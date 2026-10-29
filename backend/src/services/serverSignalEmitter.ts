@@ -51,6 +51,8 @@ export type EngagementSignalName =
 export type AppSignalName =
   | 'login'
   | 'logout'
+  // ENG-2738: a new account was created (password or Google OAuth signup).
+  | 'registration_completed'
   | 'trial_activated'
   | 'onboarding_step_completed'
   | 'onboarding_completed'
