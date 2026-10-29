@@ -4,7 +4,7 @@
  */
 import { IMAGE_LIMITS } from '../../../loginHost/protocol';
 import { LoginHostError, ToolResultLostError } from '../loginHostClient';
-import { DELIVERY_FAILED_MESSAGE, NOT_IN_RUN_MESSAGE, REPLAY_NOTE, UNLOADABLE_NOTE, RelayToolDispatcher, SOFT_DEADLINE_MESSAGE, STOPPED_MESSAGE, type RelayCallEvent } from '../relayToolDispatcher';
+import { BAD_ARGS_MESSAGE, DELIVERY_FAILED_MESSAGE, NOT_IN_RUN_MESSAGE, REPLAY_NOTE, UNLOADABLE_NOTE, RelayToolDispatcher, SOFT_DEADLINE_MESSAGE, STOPPED_MESSAGE, type RelayCallEvent } from '../relayToolDispatcher';
 import { ToolBridge, type BridgeExecuteOutcome, type ToolBridgeDeps } from '../toolBridge';
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -26,6 +26,8 @@ interface Opts {
   /** Runs inside client.turnToolResult before it answers (a post that is still in flight). */
   onPost?: (input: any) => Promise<void> | void;
   announceWaitMs?: number;
+  /** Runs after every bridge.listTools the dispatcher makes (with the call count). */
+  onList?: (n: number) => void;
   /** Tools that appear in the run's list after the named tool executes (default: install_skills adds late_tool). */
   appearAfter?: Record<string, Array<Record<string, unknown>>>;
 }
@@ -67,6 +69,7 @@ function rig(o: Opts = {}) {
     }),
   };
   const phases: string[] = [];
+  let listCalls = 0;
   const tripped = { count: 0 };
   const d = new RelayToolDispatcher({
     client,
@@ -75,7 +78,11 @@ function rig(o: Opts = {}) {
     token,
     bridge: {
       callTool: (t, c, r, op) => bridge.callTool(t, c, r, op),
-      listTools: (t, r) => bridge.listTools(t, r),
+      listTools: async (t, r) => {
+        const v = await bridge.listTools(t, r);
+        o.onList?.(++listCalls);
+        return v;
+      },
       noteToolUse: (r, c, n, i, m) => bridge.noteToolUse(r, c, n, i, m),
       noteToolResult: (r) => bridge.noteToolResult(r),
       takeLedger: (r) => bridge.takeLedger(r),
@@ -469,6 +476,22 @@ describe('RelayToolDispatcher', () => {
     expect(t.executed).toHaveLength(1); // collapsed: it found its message
   });
 
+  describe('G19: the first halt fixes the sibling window', () => {
+    it('a second halting sibling does not widen the window: a call announced after the FIRST halted answer stays refused', async () => {
+      const t = rig({ confirm: ['send_email'] });
+      t.d.noteStreamUse('mcp__aw__send_email', { to: 'a' });
+      t.d.noteStreamUse('mcp__aw__send_email', { to: 'b' });
+      t.d.start(t.ev('op-1', 'send_email', { to: 'a' }));
+      await t.d.settle(1_000);
+      t.d.noteStreamUse('mcp__aw__save_note', { n: 1 }); // same message, announced after the first answer went back
+      t.d.start(t.ev('op-2', 'send_email', { to: 'b' })); // a sibling announced before it: runs and halts too
+      await t.d.settle(1_000);
+      t.d.start(t.ev('op-3', 'save_note', { n: 1 }));
+      await t.d.settle(1_000);
+      expect(t.executed.map((e) => e.name)).toEqual(['send_email', 'send_email']);
+    });
+  });
+
   describe('B1: batched confirmations (parity with AgentWeb: one deck for every preview of one model message)', () => {
     it('five previews announced in one message: all five run and all five halts are recorded', async () => {
       const t = rig({ confirm: ['send_email'] });
@@ -649,13 +672,91 @@ describe('RelayToolDispatcher', () => {
       const t = rig();
       t.behaviour.next = Array.from({ length: 9 }, () => new ToolResultLostError('result_lost'));
       for (let i = 1; i <= 9; i++) {
-        t.d.start(t.ev(`op-${i}`, 'search', { i }, `m${i}`));
+        t.d.start(t.ev(`op-${i}`, 'save_note', { i }, `m${i}`));
         await t.d.settle(1_000);
       }
-      t.d.start(t.ev('op-a', 'search', { i: 1 }, 'mx'));
-      t.d.start(t.ev('op-b', 'search', { i: 9 }, 'my'));
+      t.d.start(t.ev('op-a', 'save_note', { i: 1 }, 'mx'));
+      t.d.start(t.ev('op-b', 'save_note', { i: 9 }, 'my'));
       await t.d.settle(1_000);
       expect(t.executed).toHaveLength(10); // i:1 replayed, i:9 ran again
+    });
+
+    it('S1: a lost READ-ONLY answer is never replayed: an identical retry runs again and sees current data', async () => {
+      const t = rig();
+      t.behaviour.next = [new ToolResultLostError('result_lost')];
+      t.d.start(t.ev('op-1', 'search', { q: 'x' }));
+      await t.d.settle(1_000);
+      t.d.start(t.ev('op-2', 'search', { q: 'x' }, 'later-1'));
+      await t.d.settle(1_000);
+      t.d.start(t.ev('op-3', 'search', { q: 'x' }, 'later-2'));
+      await t.d.settle(1_000);
+      expect(t.executed.map((e) => e.name)).toEqual(['search', 'search', 'search']);
+      expect(t.posts.some((p) => p.content.includes(REPLAY_NOTE))).toBe(false);
+    });
+
+    it('S1: a lost WRITE answer is still never run twice (the guarantee stays)', async () => {
+      const t = rig();
+      t.behaviour.next = [new ToolResultLostError('result_lost')];
+      t.d.start(t.ev('op-1', 'save_note', { n: 1 }));
+      await t.d.settle(1_000);
+      t.d.start(t.ev('op-2', 'save_note', { n: 1 }, 'later-1'));
+      t.d.start(t.ev('op-3', 'save_note', { n: 1 }, 'later-2'));
+      await t.d.settle(1_000);
+      expect(t.executed).toHaveLength(1);
+    });
+
+    it('a tool whose kind is unknown (the listing failed) is treated as a write: replayed, never re-run', async () => {
+      let fail = false;
+      const t = rig({ onList: () => { if (fail) throw new Error('list failed'); } });
+      fail = true;
+      t.behaviour.next = [new ToolResultLostError('result_lost')];
+      t.d.start(t.ev('op-1', 'search', { q: 'x' }));
+      await t.d.settle(1_000);
+      fail = false;
+      t.d.start(t.ev('op-2', 'search', { q: 'x' }, 'later'));
+      await t.d.settle(1_000);
+      expect(t.executed).toHaveLength(1);
+    });
+
+    it('S3: only a call that really ran is replayed: a bridge refusal whose answer was lost is never cached, and an honest retry runs', async () => {
+      const calls: string[] = [];
+      let first = true;
+      const posts: any[] = [];
+      let lose = true;
+      const d = new RelayToolDispatcher({
+        client: { turnToolResult: async (i: any) => { posts.push(i); if (lose) { lose = false; throw new ToolResultLostError('turn_aborted'); } return { ok: true as const }; } },
+        ids: IDS,
+        runId: 'r1',
+        token: 't',
+        bridge: {
+          callTool: async (_t, c) => { calls.push(c.name); if (first) { first = false; return { content: 'Too busy, try again.', isError: true }; } return { content: 'saved', isError: false }; },
+          listTools: async () => [{ name: 'save_note', readOnly: false }],
+          noteToolUse: () => undefined,
+          noteToolResult: () => undefined,
+          takeLedger: () => ({ records: [{ toolCallId: 'op-1', kind: 'refused' }], truncated: 0 }), // what the real bridge records for a refusal
+        },
+        manifest: { open: new Set(['save_note']) },
+        isStopped: () => false,
+        isHalted: () => false,
+        announceWaitMs: 0,
+      });
+      d.start({ operationId: 'op-1', messageId: 'm', name: 'save_note', input: { n: 1 } });
+      await d.settle(1_000);
+      d.start({ operationId: 'op-2', messageId: 'm2', name: 'save_note', input: { n: 1 } });
+      await d.settle(1_000);
+      expect(calls).toEqual(['save_note', 'save_note']); // the retry ran
+      expect(posts[1].content).toBe('saved');
+    });
+
+    it('a replay is refused if a Stop lands while its liveness check is in flight', async () => {
+      let stopped = false;
+      const t = rig({ stopped: () => stopped, onList: (n) => { if (n === 2) stopped = true; } });
+      t.behaviour.next = [new ToolResultLostError('result_lost')];
+      t.d.start(t.ev('op-1', 'save_note', { n: 1 }));
+      await t.d.settle(1_000);
+      t.d.start(t.ev('op-2', 'save_note', { n: 1 }, 'later'));
+      await t.d.settle(1_000);
+      expect(t.posts[1]).toMatchObject({ isError: true, content: STOPPED_MESSAGE });
     });
 
     it('a DIFFERENT call after a lost one runs normally', async () => {
@@ -666,19 +767,6 @@ describe('RelayToolDispatcher', () => {
       t.d.start(t.ev('op-2', 'save_note', { n: 2 }));
       await t.d.settle(1_000);
       expect(t.executed).toHaveLength(2);
-    });
-
-    it('a REFUSED call whose answer was lost is not replayed (it executed nothing)', async () => {
-      const t = rig();
-      t.live.value = false;
-      t.behaviour.next = [new ToolResultLostError('turn_aborted')];
-      t.d.start(t.ev('op-1', 'save_note', { n: 1 }));
-      await t.d.settle(1_000);
-      t.live.value = true;
-      t.bridge.closeRun('r1'); // (a fresh run would be opened by the caller; here only the replay map matters)
-      t.d.start(t.ev('op-2', 'save_note', { n: 1 }));
-      await t.d.settle(1_000);
-      expect(t.posts[1].content).not.toContain(REPLAY_NOTE);
     });
   });
 
@@ -718,6 +806,57 @@ describe('RelayToolDispatcher', () => {
       await t.d.settle(1_000);
       expect(lateStarted).toBe(true);
       expect(t.executed.map((e) => e.name)).toEqual(['install_skills', 'late_tool']);
+    });
+
+    it('S2: the shrink retries are bounded: a worker that keeps saying result_too_large gets at most 4 smaller answers and then the plain failure answer', async () => {
+      const t = rig({ content: { search: 'x'.repeat(200_000) } });
+      t.behaviour.next = Array.from({ length: 12 }, () => new LoginHostError('EINVALID', 'result_too_large'));
+      t.d.start(t.ev('op-1', 'search'));
+      await t.d.settle(1_000);
+      expect(t.posts).toHaveLength(6); // first + 4 shrinks + the plain failure answer
+      expect(t.posts[5].content).toBe(DELIVERY_FAILED_MESSAGE);
+      expect([...t.d.lostCallIds()]).toEqual(['op-1']);
+    });
+
+    it('S2: ambiguous failures are retried at most twice per answer (3 tries), then the plain failure answer gets its own 3 tries', async () => {
+      const t = rig();
+      t.behaviour.next = Array.from({ length: 20 }, () => new LoginHostError('UNREACHABLE', 'ECONNRESET'));
+      t.d.start(t.ev('op-1', 'search'));
+      await t.d.settle(1_000);
+      expect(t.posts).toHaveLength(6); // 3 tries of the real answer + 3 of the plain one
+      expect(t.posts[3].content).toBe(DELIVERY_FAILED_MESSAGE);
+      expect([...t.d.lostCallIds()]).toEqual(['op-1']);
+    });
+
+    it('N2: an answer reported lost and then replaced by the plain failure text is NOT counted as delivered (the persisted result keeps the note)', async () => {
+      const t = rig();
+      t.behaviour.next = [new LoginHostError('EINVALID', 'content:too_big')];
+      t.d.start(t.ev('op-1', 'save_note', { n: 1 }));
+      await t.d.settle(1_000);
+      expect(t.posts[1].content).toBe(DELIVERY_FAILED_MESSAGE); // accepted by the worker
+      expect(t.d.lostCallIds().has('op-1')).toBe(true);
+      expect(t.d.deliveredCallIds().has('op-1')).toBe(false);
+    });
+
+    it('N1: input that cannot be canonicalized is refused with its own message and nothing runs', async () => {
+      const t = rig();
+      let deep: unknown = {};
+      for (let i = 0; i < 20000; i++) deep = { a: deep };
+      t.d.start(t.ev('op-1', 'save_note', deep));
+      await t.d.settle(1_000);
+      expect(t.executed).toEqual([]);
+      expect(t.posts[0]).toMatchObject({ isError: true, content: BAD_ARGS_MESSAGE });
+    });
+
+    it('N3: two calls finishing together that both make the same tool available: exactly one answer carries the definition', async () => {
+      let release!: () => void;
+      const t = rig({ gate: { search: new Promise<void>((r) => (release = r)) }, appearAfter: { search: [{ name: 'shared_new', description: 'S' }] } });
+      t.d.start(t.ev('op-1', 'search', { q: 'a' }));
+      t.d.start(t.ev('op-2', 'search', { q: 'b' }));
+      await sleep(20);
+      release();
+      await t.d.settle(1_000);
+      expect(t.posts.filter((p) => p.tools?.some((x: any) => x.name === 'shared_new'))).toHaveLength(1);
     });
 
     it('limits are in BYTES: a multi-byte text is cut so the body never exceeds the worker cap', async () => {

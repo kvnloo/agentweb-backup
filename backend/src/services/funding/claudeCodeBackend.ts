@@ -99,8 +99,8 @@ export interface ClaudeBackendDeps {
     takeLedgerByGeneration(generation: string): { records: BridgeCallRecord[]; truncated: number };
     /** The tool relay (protocol 4) calls the bridge in process with the run's internal token: both are needed for it, and without them the HTTP bridge path is used. */
     listTools?(token: string, runId: string): Promise<BridgeListedTool[]>;
-    /** Whether the session waits on a confirmation (the relay closes the call group before answering then). Absent = treated as yes. */
-    isHalted?(sessionId: string, userId?: string): boolean;
+    /** Whether the session waits on a confirmation (the relay's halt grouping depends on it, so there is no default). */
+    isHalted(sessionId: string, userId?: string): boolean;
     callTool?(token: string, call: BridgeToolCall, runId: string, opts?: BridgeCallOptions): Promise<BridgeCallResult>;
   };
   /**
@@ -370,7 +370,7 @@ export class ClaudeCodeBackend {
               now: d.now,
               // A16 / SF2: a worker past the call cap or the in-flight limit ends the turn (the host turn is interrupted; what ran is kept and persisted).
               onLimitTripped: () => ac.abort(),
-              isHalted: () => (d.bridge.isHalted ? d.bridge.isHalted(p.sessionId, p.userId) : true),
+              isHalted: () => d.bridge.isHalted(p.sessionId, p.userId),
               ...(d.relayAnnounceWaitMs !== undefined ? { announceWaitMs: d.relayAnnounceWaitMs } : {}),
               onCall: (phase, name) => {
                 if (phase === "start") progress("executing_tools", { pendingTools: [name] });

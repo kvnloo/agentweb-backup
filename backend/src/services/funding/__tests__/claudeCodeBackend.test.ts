@@ -78,6 +78,7 @@ function harness(): Harness {
       closeRun: () => (calls.push('closeRun'), void deps.executor.releaseRun('x')),
       cancelSession: () => ((runClosedByCancel = true), void calls.push('bridgeCancel')),
       takeHalts: () => halts,
+      isHalted: () => false,
       takeLedger: () => ({ records: ledger, truncated: 0 }),
       generationOf: () => 'g',
       takeLedgerByGeneration: () => (x.lateReads++, { records: [...ledger, ...lateRecords], truncated: 0 }),

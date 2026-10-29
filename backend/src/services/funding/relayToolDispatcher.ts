@@ -28,6 +28,7 @@ export const SOFT_DEADLINE_MESSAGE = "The time limit for this turn is almost rea
 export const STOPPED_MESSAGE = "This turn has ended; this call was not run.";
 export const NOT_IN_RUN_MESSAGE = "That tool is not available in this run.";
 export const BAD_INPUT_MESSAGE = "A tool call needs an object of arguments.";
+export const BAD_ARGS_MESSAGE = "The arguments of this call could not be read (they are nested too deeply). The tool was not run.";
 export const DELIVERY_FAILED_MESSAGE = "The tool ran but its result could not be returned to you. Do not repeat it blindly; check its current state first or ask the user.";
 /** Written into the PERSISTED tool result of a call whose result the worker could no longer take (A1): the model reads it on the next turn. */
 export const RESULT_LOST_NOTE =
@@ -149,6 +150,7 @@ export class RelayToolDispatcher {
   private readonly replays = new Map<string, { content: string; isError: boolean }>();
   /** Operations whose answer the worker ACCEPTED (the model read it). Every other executed call of the turn is "result lost". */
   private readonly delivered = new Set<string>();
+  private defsLock: Promise<void> = Promise.resolve();
   private closed = false;
   private tripped = false;
   /**
@@ -370,7 +372,14 @@ export class RelayToolDispatcher {
     if (!this.inManifest(name)) return refuse(NOT_IN_RUN_MESSAGE);
     if (!isPlainObject(ev.input)) return refuse(BAD_INPUT_MESSAGE);
 
-    const key = `${name}\u0000${stableStringify(ev.input)}`;
+    let key: string;
+    let argsKey: string;
+    try {
+      key = `${name}\u0000${stableStringify(ev.input)}`;
+      argsKey = argKey(ev.input);
+    } catch {
+      return refuse(BAD_ARGS_MESSAGE); // input that cannot be canonicalized (absurd nesting, say): nothing ran, and the model is told why
+    }
     const replay = this.replays.get(key);
     if (replay !== undefined) {
       // Served only while the run is still live: a revoke (which closes the run) or a failed liveness check refuses the replay like any call.
@@ -388,7 +397,7 @@ export class RelayToolDispatcher {
     // ONLY if it matches an announcement of THAT message recorded BEFORE the halted answer went back: the batched confirmation AgentWeb gives (one deck
     // for "pause these 5 ad sets"). Anything else, whatever message id the worker sends, starts a new group and the bridge refuses it. A forged follow-up
     // cannot match: the stream announced the message before the answer existed (a confirm needs the approval token that only the answer carries).
-    const ann = await this.claimOrWait(name, argKey(ev.input));
+    const ann = await this.claimOrWait(name, argsKey);
     if (this.o.isStopped()) return refuse(STOPPED_MESSAGE);
     let messageId: string;
     if (this.o.isHalted()) {
@@ -421,7 +430,9 @@ export class RelayToolDispatcher {
     const fresh = await this.newTools();
     if (fresh.defs.length) answer.tools = fresh.defs;
     if (fresh.notes.length) answer.content += `\n${fresh.notes.join("\n")}`;
-    answer.replay = { key, content: result.content, isError: answer.isError };
+    // A lost answer is replayed to an identical retry only for a tool that may have changed something (a write, or one whose kind is unknown): re-running a
+    // READ-ONLY tool is harmless and returns current data, a replay would hand the model stale data for the rest of the turn.
+    if (fresh.readOnly.get(name) !== true) answer.replay = { key, content: result.content, isError: answer.isError };
     return answer;
   }
 
@@ -442,31 +453,43 @@ export class RelayToolDispatcher {
    * the manifest's own rules; a tool that cannot be offered whole (bad name, oversized schema or description, a case-only duplicate) is NOT sent, stays
    * invisible to the model this turn, and the result text says so (one fixed log code with counts). Never throws.
    */
-  private async newTools(): Promise<{ defs: ToolDef[]; notes: string[] }> {
+  private async newTools(): Promise<{ defs: ToolDef[]; notes: string[]; readOnly: Map<string, boolean> }> {
+    // Serialized (N3): two calls finishing together must not both pick the same new tools, and the "sent" marks must be exact. The names are marked sent
+    // INSIDE the lock; `deliver` unmarks them if the worker refuses.
+    const run = this.defsLock.then(() => this.computeNewTools());
+    this.defsLock = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private async computeNewTools(): Promise<{ defs: ToolDef[]; notes: string[]; readOnly: Map<string, boolean> }> {
+    const readOnly = new Map<string, boolean>();
     let list: BridgeListedTool[];
     try {
       list = await this.o.bridge.listTools(this.o.token, this.o.runId);
     } catch {
-      return { defs: [], notes: [] };
+      return { defs: [], notes: [], readOnly };
     }
     const defs: ToolDef[] = [];
     let problems = 0;
-    const pending = new Set<string>();
     for (const tool of list) {
       const name = tool?.name;
-      if (typeof name !== "string" || this.sentExact.has(name) || this.rejected.has(name)) continue;
+      if (typeof name !== "string") continue;
+      readOnly.set(name, tool.readOnly === true);
+      if (this.sentExact.has(name) || this.rejected.has(name)) continue;
       const made = toToolDef(tool);
-      const folded = typeof name === "string" ? name.toLowerCase() : "";
-      if ("skip" in made || made.truncated || this.sent.has(folded) || pending.has(folded)) {
+      if ("skip" in made || made.truncated || this.sent.has(name.toLowerCase())) {
         this.rejected.add(name);
         problems++;
         continue;
       }
-      pending.add(folded);
+      this.markSent(name); // also makes a later case-only duplicate in this same list a "sent" duplicate
       defs.push(made.def);
     }
     if (problems > 0) this.log(`new_tool_unloadable count=${problems}`);
-    return { defs, notes: problems > 0 ? [UNLOADABLE_NOTE] : [] };
+    return { defs, notes: problems > 0 ? [UNLOADABLE_NOTE] : [], readOnly };
   }
 
   // ───────────────────────────── the answer ─────────────────────────────
@@ -475,8 +498,8 @@ export class RelayToolDispatcher {
     const ids = this.o.ids;
     let answer = this.bound(first);
     // S2: the worker hands new definitions to the shim BEFORE it replies to us, so a fast call to a new tool can arrive before this post resolves. The names
-    // are marked first (and unmarked if the worker refuses them); the bridge still checks its CURRENT list on every call, so this grants nothing it does not.
-    for (const t of answer.tools ?? []) this.markSent(t.name);
+    // were marked sent when they were picked (in `newTools`, under its lock) and are unmarked if the worker refuses them; the bridge still checks its
+    // CURRENT list on every call, so this grants nothing it does not.
     let attempts = 0;
     let shrinks = 0;
     for (;;) {
@@ -491,7 +514,8 @@ export class RelayToolDispatcher {
           ...(answer.images?.length ? { images: answer.images } : {}),
           ...(answer.tools?.length ? { tools: answer.tools } : {}),
         });
-        this.delivered.add(op);
+        // N2: an operation that was first reported lost and then answered with the plain "could not be returned" text did NOT deliver its real result.
+        if (!this.lost.has(op)) this.delivered.add(op);
         this.rememberReplay(op, answer);
         return;
       } catch (err) {
