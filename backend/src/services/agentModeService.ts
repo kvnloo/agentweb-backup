@@ -7522,12 +7522,6 @@ export class AgentModeService {
     isDelegatedAccess?: boolean;
     isInteractiveShare?: boolean;
     excludeTools?: string[];
-    /**
-     * ENG-2113 (tool relay): resolve as if every published skill the user is entitled to (and the catch-all) were installed in this session, through
-     * the SAME skill context a real install produces (companion tools, voice-profile publish-tool schemas, exclusions). Used only to offer those tools
-     * to the relay ahead as `locked`; it grants nothing (every call is checked against the session's real access when it executes).
-     */
-    assumeAllEntitledSkillsInstalled?: boolean;
   }): Promise<{
     tools: any[];
     allowedToolNames: Set<string>;
@@ -7555,17 +7549,11 @@ export class AgentModeService {
     const userAllowedSkillIdsForDisplay: string[] = userAllowedSkillIds ?? [];
 
     const rawAssociatedSkills = currentSession?.associatedSkills;
-    const assumeAll = input.assumeAllEntitledSkillsInstalled === true;
-    const isLegacySession = !assumeAll && (rawAssociatedSkills === undefined || rawAssociatedSkills === null);
-    const entitled = (id: string) => userAllowedSkillIdsForDisplay.includes('*') || userAllowedSkillIdsForDisplay.includes(id);
-    const sessionAssociatedSkillIds: string[] = assumeAll
-      ? [...publishedSkills.map((sk: any) => sk.skillId).filter((id: unknown): id is string => typeof id === 'string' && entitled(id)), OTHER_SKILLS_VIRTUAL_ID]
-      : Array.isArray(rawAssociatedSkills) ? rawAssociatedSkills : [];
-    const associatedSkills = assumeAll
-      ? publishedSkills.filter((sk: any) => typeof sk?.skillId === 'string' && entitled(sk.skillId))
-      : sessionAssociatedSkillIds.length
-        ? await skillService.getSkillsByIds(sessionAssociatedSkillIds)
-        : [];
+    const isLegacySession = rawAssociatedSkills === undefined || rawAssociatedSkills === null;
+    const sessionAssociatedSkillIds: string[] = Array.isArray(rawAssociatedSkills) ? rawAssociatedSkills : [];
+    const associatedSkills = sessionAssociatedSkillIds.length
+      ? await skillService.getSkillsByIds(sessionAssociatedSkillIds)
+      : [];
     const { allowedToolNames } = this.buildSkillContext(
       associatedSkills,
       userAllowedSkillIdsForDisplay,

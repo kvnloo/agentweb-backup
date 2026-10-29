@@ -137,27 +137,6 @@ export class EmmaToolBridgeExecutor implements ToolBridgeDeps {
   }
 
   /**
-   * Tools the run could have AFTER a skill install: this session's access resolved as if every entitled skill (and the catch-all) were installed, through
-   * the same skill context a real install uses (companion tools, voice-profile publish schemas, exclusions). The tool relay offers them to the worker as
-   * `locked` from the start of the turn (the CLI's tool list can only grow through a result that unlocks names). This list grants nothing: every call is
-   * checked against `resolveTools` (the CURRENT list) again when it executes.
-   */
-  async resolveCandidateTools(run: RunToolTokenClaims): Promise<BridgeTool[]> {
-    const state = this.requireRun(run.runId);
-    // The same resolution as `resolveTools`, with every entitled skill assumed installed: the tools, their companion tools and their schemas are exactly
-    // what this session would be offered after a real install.
-    const access = await agentModeService.resolveRunToolAccess({
-      userId: run.userId,
-      sessionId: run.sessionId,
-      isDelegatedAccess: state.context.isDelegatedAccess,
-      isInteractiveShare: state.context.isInteractiveShare,
-      excludeTools: state.context.excludeTools,
-      assumeAllEntitledSkillsInstalled: true,
-    });
-    return access.tools.map(toBridgeTool).filter((tool): tool is BridgeTool => tool !== null);
-  }
-
-  /**
    * Read-only only when Emma's own policy classifies the tool as a read whatever its
    * arguments. The `call_*` API tools are excluded because their effect depends on the
    * action argument, which a static annotation cannot express. The `ask_*` tools read
