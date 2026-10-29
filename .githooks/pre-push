@@ -23,7 +23,7 @@ fi
 # The checks need CI's node major (tests.yml). If the default node is older, use an nvm-installed
 # one when there is one; ci-prepush.mjs still refuses to run on an older node, with instructions.
 REQUIRED_NODE_MAJOR=22
-node_major() { node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0; }
+node_major() { local m; m=$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null) || m=0; echo "${m:-0}"; }
 if [ "$(node_major)" -lt "$REQUIRED_NODE_MAJOR" ]; then
   NVM_NODE="$(ls -d "${NVM_DIR:-$HOME/.nvm}"/versions/node/v${REQUIRED_NODE_MAJOR}.*/bin 2>/dev/null | sort -V | tail -1)"
   if [ -n "$NVM_NODE" ] && [ -x "$NVM_NODE/node" ]; then

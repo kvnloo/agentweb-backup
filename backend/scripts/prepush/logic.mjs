@@ -17,7 +17,7 @@ export function checkNodeVersion(version, required = REQUIRED_NODE_MAJOR) {
   return {
     ok: false,
     major: Number.isInteger(major) ? major : null,
-    message: `this shell runs node ${shown}, but CI runs node ${required} and the checks here fail on older Nodes with errors that are not about your code. Put node ${required} on PATH (nvm use ${required}) and push again.`,
+    message: `this shell runs node ${shown}, but CI runs node ${required} and the checks here fail on older Nodes with errors that are not about your code. Put node ${required} on PATH (for example: nvm use ${required}) and push again.`,
   };
 }
 
