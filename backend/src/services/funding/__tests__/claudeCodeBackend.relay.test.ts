@@ -9,7 +9,7 @@ import { join } from 'path';
 import type { ProviderEvent } from '../../../loginHost/adapter';
 import { startHostServer, type HostServerHandle } from '../../../loginHost/server';
 import { makeRig, type Rig } from '../../../loginHost/__tests__/helpers';
-import { ClaudeCodeBackend, chooseToolTransport, relayAvailable, type ClaudeBackendDeps, type ClaudeTurnParams } from '../claudeCodeBackend';
+import { ClaudeCodeBackend, chooseToolTransport, legacyBridgeAllowed, relayAvailable, type ClaudeBackendDeps, type ClaudeTurnParams } from '../claudeCodeBackend';
 import { turnRanNoTools } from '../claudeRouteErrors';
 import * as relayManifestModule from '../relayManifest';
 import { ClaudeRunRegistry } from '../claudeRunRegistry';
@@ -495,6 +495,23 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
     expect(answers()[1].answer).toMatchObject({ ok: false, content: SOFT_DEADLINE_MESSAGE });
   });
 
+  it('CLAUDE_PLAN_ALLOW_LEGACY_BRIDGE: only the exact string "true" turns the legacy bridge on; unset, empty and every other value are off', () => {
+    expect(legacyBridgeAllowed({})).toBe(false);
+    expect(legacyBridgeAllowed({ CLAUDE_PLAN_ALLOW_LEGACY_BRIDGE: 'true' })).toBe(true);
+    for (const v of ['', 'false', '1', 'yes', 'TRUE', 'True', ' true', 'true ', '0', 'on']) expect(legacyBridgeAllowed({ CLAUDE_PLAN_ALLOW_LEGACY_BRIDGE: v })).toBe(false);
+    expect(legacyBridgeAllowed({ OTHER: 'true' })).toBe(false);
+  });
+
+  it('a call already waiting for its announcement when the turn is aborted by the call/flight limit (not a Stop) does not run', async () => {
+    const t = setup();
+    t.deps.relayAnnounceWaitMs = 500;
+    // 20 unannounced calls: the 17th trips the in-flight limit and aborts the host turn (ac.abort(), no Stop); the 16 already past start() are waiting
+    rig.script.turnEvents = [...Array.from({ length: 20 }, (_, i) => call(`op-${i}`, 'save_note', { i })), { wait: gate().wait }, result('x')];
+    const err: any = await t.backend().run(t.params()).catch((e) => e);
+    expect(err).toBeDefined();
+    expect(t.executions).toEqual([]);
+  });
+
   describe('dual mode: the HTTP bridge path is unchanged for a KNOWN older worker', () => {
     it.each([
       ['a protocol 3 worker', 3],
@@ -610,7 +627,7 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
       }
       const r = await run;
       expect(t.executions.map((e) => e.args.to)).toEqual(['p0', 'p1', 'p2', 'p3', 'p4']);
-      expect(halts.mock.results[0].value).toHaveLength(5);
+      expect(halts.mock.results[halts.mock.results.length - 1].value).toHaveLength(5); // the last read: the dispatcher also reads the halts to learn which call halted
       expect(r.content).toContain('confirm');
     });
 

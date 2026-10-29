@@ -179,6 +179,11 @@ export function chooseToolTransport(d: Pick<ClaudeBackendDeps, "relay" | "bridge
   return { kind: "relay" };
 }
 
+/** `CLAUDE_PLAN_ALLOW_LEGACY_BRIDGE`: only the exact string "true" allows the HTTP bridge for a worker older than protocol 4; unset or anything else is off. */
+export function legacyBridgeAllowed(env: Record<string, string | undefined> = process.env): boolean {
+  return env.CLAUDE_PLAN_ALLOW_LEGACY_BRIDGE === "true";
+}
+
 /** True iff `chooseToolTransport` picks the relay. */
 export function relayAvailable(d: Pick<ClaudeBackendDeps, "relay" | "bridge">): boolean {
   return chooseToolTransport(d).kind === "relay";
@@ -371,6 +376,7 @@ export class ClaudeCodeBackend {
               // A16 / SF2: a worker past the call cap or the in-flight limit ends the turn (the host turn is interrupted; what ran is kept and persisted).
               onLimitTripped: () => ac.abort(),
               isHalted: () => d.bridge.isHalted(p.sessionId, p.userId),
+              isHaltingCall: (op) => d.bridge.takeHalts(p.userId, p.sessionId).some((h) => h.callId === op),
               ...(d.relayAnnounceWaitMs !== undefined ? { announceWaitMs: d.relayAnnounceWaitMs } : {}),
               onCall: (phase, name) => {
                 if (phase === "start") progress("executing_tools", { pendingTools: [name] });

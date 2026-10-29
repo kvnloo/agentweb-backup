@@ -43,7 +43,7 @@ describe('relay manifest from the real tool registry', () => {
     const m = buildRelayManifest(open);
     const stats = { open: open.length, offered: m.tools.length, totalBytes: Buffer.byteLength(JSON.stringify(m.tools)), maxTools: TOOL_LIMITS.maxTools, maxTotalBytes: TOOL_LIMITS.maxTotalBytes, skipped: m.skipped, truncated: m.truncated };
     process.stdout.write(`relay manifest OPEN set stats ${JSON.stringify(stats)}\n`);
-    expect(open.length).toBeGreaterThan(40); // the foundation set really loaded
+    expect(open.length).toBeGreaterThanOrEqual(70); // the foundation set really loaded (78 today): a drop in foundation tools is caught
     expect(open.some((t) => t.name === 'install_skills')).toBe(true);
     expect(m.skipped).toEqual({});
     expect(m.truncated).toBe(0);

@@ -19,6 +19,7 @@
  *   - Nothing here logs a frame, an argument, a result or an image: log lines carry fixed codes and counts.
  */
 import { createHash } from "crypto";
+import { LogThrottle, approxJsonBytes } from "../../loginHost/relay/bounds";
 import { IMAGE_LIMITS, toolImage, type ToolDef, type ToolImage } from "../../loginHost/protocol";
 import { toToolDef } from "./relayManifest";
 import { LoginHostError, ToolResultLostError, type LoginHostClient } from "./loginHostClient";
@@ -28,6 +29,9 @@ export const SOFT_DEADLINE_MESSAGE = "The time limit for this turn is almost rea
 export const STOPPED_MESSAGE = "This turn has ended; this call was not run.";
 export const NOT_IN_RUN_MESSAGE = "That tool is not available in this run.";
 export const BAD_INPUT_MESSAGE = "A tool call needs an object of arguments.";
+export const ARGS_TOO_LARGE_MESSAGE = "The arguments of this call are too large to be processed. The tool was not run; send a smaller request.";
+/** A write whose answer was lost and whose identical retry must not run again (the replay table may no longer hold its result). */
+export const ALREADY_RAN_MESSAGE = "This identical action already ran earlier in this turn, but its result could not be returned. It was NOT run again. Check its current state before doing it again.";
 export const BAD_ARGS_MESSAGE = "The arguments of this call could not be read (they are nested too deeply). The tool was not run.";
 export const DELIVERY_FAILED_MESSAGE = "The tool ran but its result could not be returned to you. Do not repeat it blindly; check its current state first or ask the user.";
 /** Written into the PERSISTED tool result of a call whose result the worker could no longer take (A1): the model reads it on the next turn. */
@@ -50,6 +54,26 @@ const MAX_REPLAY_BYTES = 256 * 1024;
 const MAX_DELIVERY_ATTEMPTS = 3;
 /** Stream announcements kept per turn (oldest dropped). */
 const MAX_ANNOUNCED = 512;
+/**
+ * Work bounds on data the worker controls (a stream tool-use costs a canonicalization + a hash; measured: 67 ms for a 700 KB object, 95 ms for a 1 MB array, so
+ * ~100 events/s would pin the API server's event loop).
+ *  - at most MAX_ANNOUNCEMENTS_PER_TURN announcements are recorded per turn (a turn is capped at 400 calls); later stream events are ignored;
+ *  - one input larger than ANNOUNCE_HASH_MAX_INPUT is never hashed: it is recorded by name only, like the host's truncation marker;
+ *  - the inputs hashed in a turn add up to at most ANNOUNCE_BUDGET_BYTES (about 8 MB, roughly 0.1 s of work); after that stream events are ignored.
+ * An ignored or name-only announcement never matches a call by content: the call runs unannounced (its own group; refused after a halt): the safe direction.
+ */
+const MAX_ANNOUNCEMENTS_PER_TURN = 1_024;
+const ANNOUNCE_HASH_MAX_INPUT = 64 * 1024;
+const ANNOUNCE_BUDGET_BYTES = 8 * 1024 * 1024;
+/**
+ * A tool call's arguments are canonicalized (stringify + hash) before they run. One argument over CALL_INPUT_MAX_BYTES is refused unread (700 KB cost ~350 ms
+ * of synchronous work); the larger inputs of a turn add up to at most CALL_INPUT_BUDGET_BYTES, after which only inputs up to SMALL_INPUT_BYTES are accepted.
+ * 256 KiB is about 60,000 words in one argument: far above any real tool call (the registry's largest SCHEMA is 15 KB and the host already caps a call
+ * at 1 MiB and 32 levels); a measurement of real call sizes is not possible from the registry, so this is a judgment, flagged in the fragment.
+ */
+const CALL_INPUT_MAX_BYTES = 256 * 1024;
+const CALL_INPUT_BUDGET_BYTES = 2 * 1024 * 1024;
+const SMALL_INPUT_BYTES = 16 * 1024;
 /** How long a call waits for the stream line that announces it (the worker can hand the call over a moment before that line). */
 const DEFAULT_ANNOUNCE_WAIT_MS = 1_500;
 
@@ -82,6 +106,8 @@ export interface RelayDispatcherOptions {
   onLimitTripped?: () => void;
   /** Whether the session is waiting on a confirmation (a halt latched). Required: the relay's halt grouping depends on it. */
   isHalted: () => boolean;
+  /** Whether THIS call is the one whose result carries the confirmation request (the bridge recorded a halt for it). */
+  isHaltingCall: (operationId: string) => boolean;
   /** See DEFAULT_ANNOUNCE_WAIT_MS (tests shorten it). */
   announceWaitMs?: number;
   /** Progress hooks (the chat's "executing" statuses). Must not throw. Never called after `close()`. */
@@ -116,7 +142,10 @@ function isTruncationMarker(v: unknown): boolean {
 
 /** A bounded, canonical key for a tool input (key order does not matter). */
 function argKey(input: unknown): string {
-  return createHash("sha256").update(stableStringify(input ?? {})).digest("hex");
+  return digestOf(stableStringify(input ?? {}));
+}
+function digestOf(canonical: string): string {
+  return createHash("sha256").update(canonical).digest("hex");
 }
 
 const TRUNCATED_NOTE = "\n[truncated: the tool's output was longer than can be returned]";
@@ -153,7 +182,14 @@ export class RelayToolDispatcher {
   /** Newly available tools the worker refused (or that cannot be offered): not tried again this turn, the model was told once. */
   private readonly rejected = new Set<string>();
   private readonly lost = new Set<string>();
+  /** Keys are `name\0sha256(canonical input)`: small, whatever the input. */
   private readonly replays = new Map<string, { content: string; isError: boolean }>();
+  /** Every non-read-only call whose answer was lost (at most one per call, so at most the call cap): an identical retry is refused, never run again. */
+  private readonly lostWrites = new Set<string>();
+  private announceCount = 0;
+  private hashedBytes = 0;
+  private inputBudget = CALL_INPUT_BUDGET_BYTES;
+  private readonly throttle = new LogThrottle(5, 60_000);
   /** Operations whose answer the worker ACCEPTED (the model read it). Every other executed call of the turn is "result lost". */
   private readonly delivered = new Set<string>();
   private defsLock: Promise<void> = Promise.resolve();
@@ -236,6 +272,7 @@ export class RelayToolDispatcher {
       if (typeof rawName !== "string") return;
       const name = rawName.replace(/^mcp__[A-Za-z0-9_-]+?__/, "");
       if (!this.inManifest(name)) return;
+      if (this.announceCount >= MAX_ANNOUNCEMENTS_PER_TURN) return; // work bound: later stream events are ignored (see the constants)
       if (!this.batchOpen) {
         this.batch++;
         this.batchOpen = true;
@@ -243,8 +280,16 @@ export class RelayToolDispatcher {
       // The host replaces a stream input that is too deep or too large with a fixed marker. A marker says "a call of this tool was announced" and nothing
       // about its arguments, so it can NEVER be matched to a real call by content (a real call whose arguments look exactly like the marker included):
       // it carries no key, and is only consumed by a call that found no exact announcement (which then runs in a group of its own).
-      if (isTruncationMarker(input)) this.announced.push({ seq: ++this.announceSeq, batch: this.batch, name, key: "", claimed: false, marker: true });
-      else this.announced.push({ seq: ++this.announceSeq, batch: this.batch, name, key: argKey(input), claimed: false });
+      const size = approxJsonBytes(input, ANNOUNCE_HASH_MAX_INPUT + 1); // iterative and bounded: never walks more than it will hash
+      if (isTruncationMarker(input) || size > ANNOUNCE_HASH_MAX_INPUT) {
+        this.announceCount++;
+        this.announced.push({ seq: ++this.announceSeq, batch: this.batch, name, key: "", claimed: false, marker: true });
+      } else {
+        if (this.hashedBytes + size > ANNOUNCE_BUDGET_BYTES) return; // budget spent: ignored
+        this.hashedBytes += size;
+        this.announceCount++;
+        this.announced.push({ seq: ++this.announceSeq, batch: this.batch, name, key: argKey(input), claimed: false });
+      }
       if (this.announced.length > MAX_ANNOUNCED) this.announced.splice(0, this.announced.length - MAX_ANNOUNCED);
       for (const wake of [...this.announceWaiters]) wake();
     } catch {
@@ -389,15 +434,23 @@ export class RelayToolDispatcher {
     if (!this.inManifest(name)) return refuse(NOT_IN_RUN_MESSAGE);
     if (!isPlainObject(ev.input)) return refuse(BAD_INPUT_MESSAGE);
 
+    // Work bound before anything is serialized: the size is estimated iteratively and capped.
+    const inputSize = approxJsonBytes(ev.input, CALL_INPUT_MAX_BYTES + 1);
+    if (inputSize > CALL_INPUT_MAX_BYTES) return refuse(ARGS_TOO_LARGE_MESSAGE);
+    if (inputSize > SMALL_INPUT_BYTES) {
+      if (inputSize > this.inputBudget) return refuse(ARGS_TOO_LARGE_MESSAGE);
+      this.inputBudget -= inputSize;
+    }
     let key: string;
     let argsKey: string;
     try {
-      key = `${name}\u0000${stableStringify(ev.input)}`;
-      argsKey = argKey(ev.input);
+      argsKey = digestOf(stableStringify(ev.input)); // one canonicalization serves the replay key and the announcement match
+      key = `${name}\u0000${argsKey}`;
     } catch {
       return refuse(BAD_ARGS_MESSAGE); // input that cannot be canonicalized (absurd nesting, say): nothing ran, and the model is told why
     }
     const replay = this.replays.get(key);
+    if (replay === undefined && this.lostWrites.has(key)) return refuse(ALREADY_RAN_MESSAGE); // its result is no longer held: still never run a second time
     if (replay !== undefined) {
       // Served only while the run is still live: a revoke (which closes the run) or a failed liveness check refuses the replay like any call.
       try {
@@ -434,7 +487,7 @@ export class RelayToolDispatcher {
     }
     // The first halt of the turn fixes which message's siblings may still be admitted, and which announcements count (those recorded before this answer
     // goes back). Set BEFORE the post: the worker may hand the next call over before our post returns.
-    if (this.halt === undefined && this.o.isHalted()) this.halt = { batch: ann ? ann.batch : -1, cutoff: this.announceSeq };
+    if (this.halt === undefined && this.o.isHaltingCall(op)) this.halt = { batch: ann ? ann.batch : -1, cutoff: this.announceSeq };
     const answer: Answer = { content: result.content, isError: result.isError === true };
     if (result.images?.length) {
       const { images, dropped } = this.fitImages(result.images);
@@ -503,7 +556,7 @@ export class RelayToolDispatcher {
       this.markSent(name); // also makes a later case-only duplicate in this same list a "sent" duplicate
       defs.push(made.def);
     }
-    if (problems > 0) this.log(`new_tool_unloadable count=${problems}`);
+    if (problems > 0) this.log("new_tool_unloadable", { count: problems });
     return { defs, notes: problems > 0 ? [UNLOADABLE_NOTE] : [], readOnly };
   }
 
@@ -607,13 +660,17 @@ export class RelayToolDispatcher {
   private rememberReplay(op: string, a: Answer): void {
     const p = a.replay;
     if (!p || !this.lost.has(op)) return;
-    if (this.replays.size >= MAX_REPLAYS) return;
-    // Only a call that really ran may be replayed: a refusal ("run ended", "too many") must not block a later honest retry.
+    // Only a call that really ran may be remembered: a refusal ("run ended", "too many") must not block a later honest retry.
     const ran = this.o.bridge.takeLedger(this.o.runId).records.some((r) => r.toolCallId === op && (r.kind === "executed" || r.kind === "failed"));
-    if (ran) this.replays.set(p.key, { content: truncateUtf8(p.content, MAX_REPLAY_BYTES), isError: p.isError });
+    if (!ran) return;
+    this.lostWrites.add(p.key); // a digest only: a write is never run twice, however many answers were lost
+    if (this.replays.size < MAX_REPLAYS) this.replays.set(p.key, { content: truncateUtf8(p.content, MAX_REPLAY_BYTES), isError: p.isError });
   }
 
-  private log(code: string): void {
-    console.error(`[relay-dispatch] ${code}`, { calls: this.calls, pending: this.inFlight.size });
+  /** A fixed code per line (`extra` carries only counts). Throttled per code: a worker can trigger most of these at will, one line per event would flood the log. */
+  private log(code: string, extra: Record<string, number> = {}): void {
+    const t = this.throttle.check(code);
+    if (!t.log) return;
+    console.error(`[relay-dispatch] ${code}`, { calls: this.calls, pending: this.inFlight.size, ...extra, ...(t.suppressedBefore > 0 ? { suppressedBefore: t.suppressedBefore } : {}) });
   }
 }

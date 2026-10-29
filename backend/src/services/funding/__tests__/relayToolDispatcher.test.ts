@@ -4,11 +4,12 @@
  */
 import { IMAGE_LIMITS } from '../../../loginHost/protocol';
 import { LoginHostError, ToolResultLostError } from '../loginHostClient';
-import { BAD_ARGS_MESSAGE, DELIVERY_FAILED_MESSAGE, NOT_IN_RUN_MESSAGE, REPLAY_NOTE, UNLOADABLE_NOTE, RelayToolDispatcher, SOFT_DEADLINE_MESSAGE, STOPPED_MESSAGE, type RelayCallEvent } from '../relayToolDispatcher';
+import { ALREADY_RAN_MESSAGE, ARGS_TOO_LARGE_MESSAGE, BAD_ARGS_MESSAGE, DELIVERY_FAILED_MESSAGE, NOT_IN_RUN_MESSAGE, REPLAY_NOTE, UNLOADABLE_NOTE, RelayToolDispatcher, SOFT_DEADLINE_MESSAGE, STOPPED_MESSAGE, type RelayCallEvent } from '../relayToolDispatcher';
 import { ToolBridge, type BridgeExecuteOutcome, type ToolBridgeDeps } from '../toolBridge';
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const IDS = { connectionId: 'conn-1', turnId: 'claude-run-1', epoch: 3 };
+const big = (kb: number) => ({ s: 'x'.repeat(kb * 1024) });
 const img = (chars: number, mimeType = 'image/png') => ({ mimeType, data: 'A'.repeat(chars) });
 
 interface Opts {
@@ -26,6 +27,8 @@ interface Opts {
   /** Runs inside client.turnToolResult before it answers (a post that is still in flight). */
   onPost?: (input: any) => Promise<void> | void;
   announceWaitMs?: number;
+  /** Makes the bridge wait on this before a halt is recorded durably (the halting call is answered only after it). */
+  persistGate?: Promise<void>;
   /** Runs after every bridge.listTools the dispatcher makes (with the call count). */
   onList?: (n: number) => void;
   /** Tools that appear in the run's list after the named tool executes (default: install_skills adds late_tool). */
@@ -41,6 +44,7 @@ function rig(o: Opts = {}) {
     resolveTools: async () => [{ name: 'search' }, { name: 'save_note' }, { name: 'install_skills' }, { name: 'send_email' }, ...extra],
     isReadOnly: (n: string) => n === 'search',
     isLive: async () => live.value,
+    persistHalt: async () => { await o.persistGate; },
     execute: async (_run: unknown, call: { name: string; args: Record<string, unknown> }): Promise<BridgeExecuteOutcome> => {
       executed.push({ name: call.name, args: call.args });
       if (o.gate?.[call.name]) await o.gate[call.name];
@@ -93,6 +97,7 @@ function rig(o: Opts = {}) {
     maxCalls: o.maxCalls,
     onLimitTripped: () => void tripped.count++,
     isHalted: () => bridge.isHalted('s1', 'u1'),
+    isHaltingCall: (op) => bridge.takeHalts('u1', 's1').some((h) => h.callId === op),
     announceWaitMs: o.announceWaitMs ?? 0,
     sleep: async () => undefined,
     onCall: (phase, name) => void phases.push(`${phase}:${name}`),
@@ -294,7 +299,8 @@ describe('RelayToolDispatcher', () => {
       expect(t.posts[0].tools.map((x: any) => x.name)).toEqual(['ok_tool']);
       expect(t.posts[0].content).toContain(UNLOADABLE_NOTE);
       const logged = errors.join('\n');
-      expect(logged).toContain('new_tool_unloadable count=3');
+      expect(logged).toContain('new_tool_unloadable');
+      expect(logged).toContain('"count":3');
       expect(logged).not.toMatch(/huge|bad\.name|long_desc/);
       t.d.start(t.ev('op-2', 'huge'));
       await t.d.settle(1_000);
@@ -589,6 +595,169 @@ describe('RelayToolDispatcher', () => {
     });
   });
 
+  describe('work bounds on worker-controlled data (DoS)', () => {
+    it('5,000 stream tool-use events with 700 KB inputs cost almost nothing (they used to be hashed one by one)', () => {
+      const t = rig();
+      const input = { items: Array.from({ length: 700 }, (_, i) => ({ i, s: 'y'.repeat(1000) })) };
+      const t0 = process.hrtime.bigint();
+      for (let i = 0; i < 5000; i++) t.d.noteStreamUse('mcp__aw__save_note', input);
+      expect(Number(process.hrtime.bigint() - t0) / 1e6).toBeLessThan(500);
+    });
+
+    it('an announcement with an input over 64 KB is recorded by name only: it never matches a call by content (like the host marker)', async () => {
+      const t = rig();
+      t.d.noteStreamUse('mcp__aw__save_note', big(70));
+      t.d.noteStreamUse('mcp__aw__save_note', big(70));
+      t.d.start(t.ev('op-1', 'save_note', big(70)));
+      await t.d.settle(2_000);
+      t.d.start(t.ev('op-2', 'save_note', big(70)));
+      await t.d.settle(2_000);
+      expect(t.executed).toHaveLength(2); // matched by content they would be one message and collapse
+    });
+
+    it('at most 1,024 announcements are recorded per turn; later ones are ignored (the call then runs unannounced)', async () => {
+      const t = rig();
+      for (let i = 0; i < 1024; i++) t.d.noteStreamUse('mcp__aw__search', { i });
+      t.d.noteStreamUse('mcp__aw__save_note', { n: 1 });
+      t.d.noteStreamUse('mcp__aw__save_note', { n: 1 });
+      t.d.start(t.ev('op-1', 'save_note', { n: 1 }));
+      await t.d.settle(1_000);
+      t.d.start(t.ev('op-2', 'save_note', { n: 1 }));
+      await t.d.settle(1_000);
+      expect(t.executed).toHaveLength(2);
+    });
+
+    it('the hashed bytes of a turn add up to at most 8 MB; after that stream events are ignored', async () => {
+      const t = rig();
+      for (let i = 0; i < 160; i++) t.d.noteStreamUse('mcp__aw__search', { i, s: 'z'.repeat(60 * 1024) }); // 160 x 60 KB = 9.6 MB
+      const input = { n: 1, s: 'q'.repeat(30 * 1024) }; // does not fit in what is left of the budget
+      t.d.noteStreamUse('mcp__aw__save_note', input);
+      t.d.noteStreamUse('mcp__aw__save_note', input);
+      t.d.start(t.ev('op-1', 'save_note', input));
+      await t.d.settle(1_000);
+      t.d.start(t.ev('op-2', 'save_note', input));
+      await t.d.settle(1_000);
+      expect(t.executed).toHaveLength(2);
+    });
+
+    it('a tool call whose arguments exceed 256 KiB is refused unread, fast, and nothing runs', async () => {
+      const t = rig();
+      const t0 = Date.now();
+      t.d.start(t.ev('op-1', 'save_note', big(700)));
+      await t.d.settle(2_000);
+      expect(Date.now() - t0).toBeLessThan(200);
+      expect(t.executed).toEqual([]);
+      expect(t.posts[0]).toMatchObject({ isError: true, content: ARGS_TOO_LARGE_MESSAGE });
+    });
+
+    it('arguments just under the cap run', async () => {
+      const t = rig();
+      t.d.start(t.ev('op-1', 'save_note', big(200)));
+      await t.d.settle(2_000);
+      expect(t.executed).toHaveLength(1);
+    });
+
+    it('the larger inputs of a turn add up to 2 MiB; after that only small ones (16 KiB) run', async () => {
+      const t = rig();
+      for (let i = 0; i < 14; i++) {
+        t.d.start(t.ev(`op-${i}`, 'save_note', { i, ...big(200) }));
+        await t.d.settle(2_000);
+      }
+      expect(t.executed.length).toBeGreaterThanOrEqual(9);
+      expect(t.executed.length).toBeLessThanOrEqual(11); // about 2 MiB / 200 KiB
+      const before = t.executed.length;
+      t.d.start(t.ev('op-late-big', 'save_note', { late: 1, ...big(100) }));
+      t.d.start(t.ev('op-late-small', 'save_note', { late: 2, s: 'small' }));
+      await t.d.settle(2_000);
+      expect(t.executed.length).toBe(before + 1);
+      expect(t.posts.find((p) => p.operationId === 'op-late-big')).toMatchObject({ content: ARGS_TOO_LARGE_MESSAGE });
+    });
+
+    it('inputs of 16 KiB or less are exempt from the budget even when the budget is spent', async () => {
+      const t = rig();
+      for (let i = 0; i < 8; i++) {
+        t.d.start(t.ev(`op-b${i}`, 'save_note', { i, ...big(250) }));
+        await t.d.settle(2_000);
+      }
+      t.d.start(t.ev('op-mid', 'save_note', { mid: 1, ...big(40) })); // leaves under 16 KiB of budget
+      await t.d.settle(2_000);
+      const before = t.executed.length;
+      t.d.start(t.ev('op-small', 'save_note', { small: 1, ...big(10) }));
+      await t.d.settle(2_000);
+      expect(t.executed.length).toBe(before + 1);
+    });
+
+    it('100,000 duplicate operation events log a handful of lines, not 100,000 (and the count is reported)', async () => {
+      const t = rig();
+      t.d.start(t.ev('op-1', 'search', { q: 'x' }));
+      errors.length = 0;
+      for (let i = 0; i < 100_000; i++) t.d.start(t.ev('op-1', 'search', { q: 'x' }));
+      await t.d.settle(1_000);
+      expect(errors.filter((e) => e.includes('duplicate_operation')).length).toBeLessThanOrEqual(6);
+      expect(t.executed).toHaveLength(1);
+    });
+  });
+
+  describe('a write is never run twice, however many answers were lost', () => {
+    it('after the replay table is full (8), the 9th and 10th lost writes are refused as "already ran" when retried, never executed again', async () => {
+      const t = rig();
+      t.behaviour.next = Array.from({ length: 10 }, () => new ToolResultLostError('result_lost'));
+      for (let i = 1; i <= 10; i++) {
+        t.d.start(t.ev(`op-${i}`, 'save_note', { i }, `m${i}`));
+        await t.d.settle(1_000);
+      }
+      expect(t.executed).toHaveLength(10);
+      t.d.start(t.ev('retry-1', 'save_note', { i: 1 }, 'r1')); // in the table: replayed with its result
+      t.d.start(t.ev('retry-9', 'save_note', { i: 9 }, 'r9')); // not in the table
+      t.d.start(t.ev('retry-10', 'save_note', { i: 10 }, 'r10'));
+      await t.d.settle(1_000);
+      expect(t.executed).toHaveLength(10);
+      expect(t.posts.find((p) => p.operationId === 'retry-1')?.content).toContain(REPLAY_NOTE);
+      for (const op of ['retry-9', 'retry-10']) expect(t.posts.find((p) => p.operationId === op)).toMatchObject({ isError: true, content: ALREADY_RAN_MESSAGE });
+    });
+
+    it('the memory kept per lost write is a digest: the key does not contain the input', async () => {
+      const t = rig();
+      t.behaviour.next = [new ToolResultLostError('result_lost')];
+      t.d.start(t.ev('op-1', 'save_note', big(100)));
+      await t.d.settle(2_000);
+      const keys = [...((t.d as any).lostWrites as Set<string>)];
+      expect(keys).toHaveLength(1);
+      expect(keys[0].length).toBeLessThan(100);
+    });
+  });
+
+  describe('the halt is taken from the call that halted', () => {
+    it('a read-only call that returns first after the latch does not set the sibling window', async () => {
+      let release!: () => void;
+      const t = rig({ confirm: ['send_email'], persistGate: new Promise<void>((r) => (release = r)) });
+      t.d.noteStreamUse('mcp__aw__send_email', { to: 'a' }); // batch 1
+      t.d.noteStreamUse('mcp__aw__send_email', { to: 'b' }); // batch 1: a sibling of the halted preview
+      t.d.noteStreamResult();
+      t.d.noteStreamUse('mcp__aw__search', { q: 'later' }); // batch 2
+      t.d.start(t.ev('op-1', 'send_email', { to: 'a' })); // halts; its answer waits for the durable halt record
+      await sleep(30);
+      t.d.start(t.ev('op-2', 'search', { q: 'later' })); // returns first, refused by the latch
+      await sleep(30);
+      expect(t.posts.map((p) => p.operationId)).toEqual(['op-2']);
+      release();
+      await t.d.settle(1_000);
+      t.d.start(t.ev('op-3', 'send_email', { to: 'b' }));
+      await t.d.settle(1_000);
+      expect(t.executed.map((e) => e.args.to ?? e.name)).toEqual(['a', 'b']); // the sibling of the HALTED call is admitted
+    });
+
+    it('a halt from a call with no announcement fixes batch -1: no later announced call is admitted as a sibling', async () => {
+      const t = rig({ confirm: ['send_email'], announceWaitMs: 0 });
+      t.d.noteStreamUse('mcp__aw__save_note', { n: 1 });
+      t.d.start(t.ev('op-1', 'send_email', { to: 'a' })); // unannounced: halts
+      await t.d.settle(1_000);
+      t.d.start(t.ev('op-2', 'save_note', { n: 1 }));
+      await t.d.settle(1_000);
+      expect(t.executed.map((e) => e.name)).toEqual(['send_email']);
+    });
+  });
+
   describe('B1: batched confirmations (parity with AgentWeb: one deck for every preview of one model message)', () => {
     it('five previews announced in one message: all five run and all five halts are recorded', async () => {
       const t = rig({ confirm: ['send_email'] });
@@ -765,19 +934,6 @@ describe('RelayToolDispatcher', () => {
       expect(t.posts[1]).toMatchObject({ isError: true, content: STOPPED_MESSAGE });
     });
 
-    it('at most 8 lost results are kept for replay; a 9th identical retry runs again', async () => {
-      const t = rig();
-      t.behaviour.next = Array.from({ length: 9 }, () => new ToolResultLostError('result_lost'));
-      for (let i = 1; i <= 9; i++) {
-        t.d.start(t.ev(`op-${i}`, 'save_note', { i }, `m${i}`));
-        await t.d.settle(1_000);
-      }
-      t.d.start(t.ev('op-a', 'save_note', { i: 1 }, 'mx'));
-      t.d.start(t.ev('op-b', 'save_note', { i: 9 }, 'my'));
-      await t.d.settle(1_000);
-      expect(t.executed).toHaveLength(10); // i:1 replayed, i:9 ran again
-    });
-
     it('S1: a lost READ-ONLY answer is never replayed: an identical retry runs again and sees current data', async () => {
       const t = rig();
       t.behaviour.next = [new ToolResultLostError('result_lost')];
@@ -834,6 +990,7 @@ describe('RelayToolDispatcher', () => {
         manifest: { open: new Set(['save_note']) },
         isStopped: () => false,
         isHalted: () => false,
+        isHaltingCall: () => false,
         announceWaitMs: 0,
       });
       d.start({ operationId: 'op-1', messageId: 'm', name: 'save_note', input: { n: 1 } });
@@ -1007,6 +1164,7 @@ describe('RelayToolDispatcher: an unforeseen failure still answers the operation
       manifest: { open: new Set(['search']) },
       isStopped: () => false,
       isHalted: () => false,
+      isHaltingCall: () => false,
     });
     let deep: unknown = {};
     for (let i = 0; i < 20000; i++) deep = { a: deep };
