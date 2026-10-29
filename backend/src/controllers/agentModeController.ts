@@ -8970,7 +8970,14 @@ export async function runScheduledChat(
     // event with automatic recovery, not a defect — don't file a Linear issue for
     // it (the deduped oncall alert below still records the occurrence). One that
     // could NOT be requeued (paused, cap exhausted, write failed) still files.
-    const skipAutoIssue = workerShutdownInterrupted && Boolean(zeroAssistantRequeuedAt);
+    // ENG-2750: the same holds when the drain hit BEFORE any assistant output
+    // (zero-output path) — but only for the FIRST requeue. A drain retry is
+    // bounded to one silent attempt; if the retried run fails too, it files.
+    const drainRequeuedFirstAttempt = isWorkerShutdownError(error)
+      && Boolean(zeroAssistantRequeuedAt)
+      && getZeroAssistantRetryCount(schedule) === 0;
+    const skipAutoIssue = (workerShutdownInterrupted && Boolean(zeroAssistantRequeuedAt))
+      || drainRequeuedFirstAttempt;
     void (skipAutoIssue ? Promise.resolve() : fileAutoIssue({
       title: zeroAssistantOutput
         ? `Scheduled Chat Zero Assistant Output: ${schedule.scheduleName}`

@@ -93,6 +93,9 @@ export function isWorkerShutdownError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   // Graceful shutdown (server stopping)
   if (message === 'Worker shutdown') return true;
+  // ENG-2750: drain ceiling hit during graceful shutdown — the worker was killed
+  // mid-run by deploy timing, the same class (generateMarketingResponseWorkerService).
+  if (message === 'Worker shutdown — drain ceiling exceeded') return true;
   // Unexpected worker subprocess crash (e.g. OOM kill, EB instance replacement)
   if (message.startsWith('Worker process exited with code')) return true;
   // Dispatch raced a graceful-shutdown drain window (deploy/restart) — same

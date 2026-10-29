@@ -1824,6 +1824,49 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       });
     });
 
+    // ENG-2750: drain ceiling exceeded BEFORE any assistant output -> one silent
+    // requeue; if the retried run also fails, a single incident is filed.
+    describe('drain ceiling before any assistant output (ENG-2750)', () => {
+      const drainCeiling = () => new Error('Worker shutdown — drain ceiling exceeded');
+
+      it('requeues the run and does not file an auto-issue on the first drain', async () => {
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(drainCeiling());
+        (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([
+          { role: 'user', content: 'Distribute the issue.' },
+        ]);
+
+        const result: any = await runScheduledChat(
+          { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 0 } as any,
+          mockUserId,
+          false
+        );
+
+        expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
+          baseSchedule.scheduleId,
+          expect.objectContaining({ status: 'active', zeroAssistantRetryCount: 1, nextRunTime: expect.any(String) })
+        );
+        expect(result.requeuedAt).toEqual(expect.any(String));
+        await new Promise((r) => setImmediate(r));
+        expect(mockFileAutoIssue).not.toHaveBeenCalled();
+      });
+
+      it('files exactly one auto-issue when the retried run also fails', async () => {
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(drainCeiling());
+        (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([
+          { role: 'user', content: 'Distribute the issue.' },
+        ]);
+
+        await runScheduledChat(
+          { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 1 } as any,
+          mockUserId,
+          false
+        );
+
+        await new Promise((r) => setImmediate(r));
+        expect(mockFileAutoIssue).toHaveBeenCalledTimes(1);
+      });
+    });
+
     it('should still requeue after zero assistant output even when persisting the job-incomplete message fails', async () => {
       // The job-incomplete persist runs inside a try/catch (ENG-209): if DynamoDB
       // rejects, the error must be swallowed so the requeue still proceeds and the
