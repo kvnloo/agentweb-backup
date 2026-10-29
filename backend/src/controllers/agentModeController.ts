@@ -161,6 +161,11 @@ import {
 import { collectLeadImportTotals, describeLeadImportTotals } from '../utils/leadImportLedger';
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
 import { fileAutoIssue } from '../services/intakeService';
+import {
+  classifyOpenRouterQuotaExhaustion,
+  resolveQuotaDeferral,
+  OPENROUTER_QUOTA_ALERT_CLASS,
+} from '../utils/openRouterKeyLimit';
 import { skillService } from '../services/skillService';
 import { validateWelcomeMessage } from '../utils/welcomeMessageValidation';
 import { validateOpeningAction } from '../utils/openingActionValidation';
@@ -8579,6 +8584,8 @@ export async function runScheduledChat(
     // resume (published + settled), pause (published + not resumable) and a fresh
     // requeue (nothing published) — never a blind restart over published work.
     const workerShutdownInterrupted = !zeroAssistantOutput && isWorkerShutdownError(error);
+    // ENG-2758: OpenRouter key-limit / credits exhaustion — defer, and alert once per class.
+    const quotaExhaustion = classifyOpenRouterQuotaExhaustion(error);
     let zeroAssistantRequeuedAt: string | undefined;
     if (zeroAssistantOutput || workerShutdownInterrupted) {
       // ENG-971: zero assistant output does NOT mean the run did nothing. A publish
@@ -8806,6 +8813,28 @@ export async function runScheduledChat(
             console.error('Failed to persist published-run job-incomplete message:', persistError);
           }
         }
+      } else if (!isTest && quotaExhaustion) {
+        // ENG-2758: the OpenRouter key/credits are exhausted until a reset, so a
+        // short-interval requeue is guaranteed to fail again. Defer to the stated
+        // reset (else the next natural slot); keep the schedule active and do not
+        // spend a zero-output retry on it.
+        const deferredTo = resolveQuotaDeferral(
+          quotaExhaustion,
+          new Date(),
+          calculateNextRunTime(schedule.frequency, new Date(), schedule.frequencyIntervalDays, schedule.scheduleId)
+        );
+        try {
+          await scheduleDb.updateSchedule(schedule.scheduleId, {
+            status: 'active',
+            nextRunTime: deferredTo,
+            lastZeroAssistantOutputAt: new Date().toISOString(),
+            lastZeroAssistantOutputSessionId: sessionId || '',
+            updatedAt: new Date().toISOString(),
+          });
+          zeroAssistantRequeuedAt = deferredTo;
+        } catch (deferError) {
+          console.error(`Failed to defer quota-exhausted scheduled chat ${schedule.scheduleId}:`, deferError);
+        }
       } else if (!isTest) {
         const nextRetryCount = zeroOutputNextRetryCount;
         if (nextRetryCount <= ZERO_ASSISTANT_MAX_REQUEUES) {
@@ -8990,6 +9019,8 @@ export async function runScheduledChat(
         ...(zeroAssistantRequeuedAt ? { 'Requeued At': zeroAssistantRequeuedAt } : {}),
         'Error Message': errorMessage,
         ...(originalMessage ? { 'Original Error (Bedrock/API)': originalMessage } : {}),
+        // ENG-2758: one canonical per (source x errorClass), not one per schedule.
+        ...(quotaExhaustion ? { 'Alert Class': OPENROUTER_QUOTA_ALERT_CLASS } : {}),
       }
     }))
       .catch(err => console.error('Failed to file scheduled-chat-error issue:', err))
@@ -9003,7 +9034,9 @@ export async function runScheduledChat(
         // One alert per (user, schedule, errorClass) per hour (ENG-145/146
         // class). Gated so flag off = today's exact behavior.
         ...(isRunStoreEnabled()
-          ? { dedupeKey: `scheduled_chat:${userId}:${schedule.scheduleId}:${zeroAssistantOutput ? 'zero_output' : 'run_error'}`, dedupeWindowMs: 60 * 60 * 1000 }
+          ? quotaExhaustion
+            ? { dedupeKey: `scheduled_chat:${OPENROUTER_QUOTA_ALERT_CLASS}`, dedupeWindowMs: 60 * 60 * 1000 }
+            : { dedupeKey: `scheduled_chat:${userId}:${schedule.scheduleId}:${zeroAssistantOutput ? 'zero_output' : 'run_error'}`, dedupeWindowMs: 60 * 60 * 1000 }
           : {}),
         sessionId: sessionId || undefined,
         context: {
