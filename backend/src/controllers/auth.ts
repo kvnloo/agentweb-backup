@@ -201,6 +201,12 @@ export const register = async (req: Request, res: Response) => {
 
     // Nothing below this boundary is safe unless createUser persisted the row.
     if (!newUser) {
+      // A concurrent duplicate submit loses the conditional account write;
+      // answer it exactly like a later repeat would.
+      const raced = await userDb.getUserByEmail(email).catch(() => undefined);
+      if (raced) {
+        return res.status(400).json({ message: "User already exists" });
+      }
       console.error("Registration persistence failed before post-create side effects");
       return res.status(503).json({
         message: "We could not create your account. Please try again.",
@@ -287,6 +293,8 @@ export const register = async (req: Request, res: Response) => {
     // must never affect the registration response the user is waiting on.
     const metaEventId = crypto.randomUUID();
     sendCompleteRegistrationCapiEvent(metaEventId, email).catch(() => {});
+    // ENG-2738: hireemma.ai signal plan — fire-and-forget, never affects the response.
+    void emitAppSignal({ userId, createdAt: new Date().toISOString() }, "registration_completed", { method: "password" });
 
     res.status(201).json({
       token,
@@ -673,6 +681,7 @@ export const googleCallback = async (
     );
 
     void emitAppSignal(user as any, "login", { method: "google", isNewUser: isNewUser ? 1 : 0 });
+    if (isNewUser) void emitAppSignal(user as any, "registration_completed", { method: "google" });
 
     const resultUserObject = {
       token,
@@ -861,6 +870,21 @@ export const resetPassword = async (req: Request, res: Response) => {
 // long-term password, so it MUST clear the temporary password lifecycle flags.
 // On success, all OTHER sessions are terminated and the caller receives a fresh
 // token minted with the new sessionVersion so the current device stays signed in.
+/**
+ * ENG-2686: records the `logout` lifecycle signal. Auth is a stateless JWT, so the
+ * client still clears its token itself; this endpoint only observes the event.
+ * Delegated sessions do not emit (the account owner did not log out). Always 204 —
+ * a signal failure must never make logout look broken.
+ */
+export const logout = async (req: Request, res: Response) => {
+  const authReq = req as AuthenticatedRequest;
+  const userId = authReq.user?.userId;
+  if (userId && !authReq.delegateInfo?.isDelegated) {
+    void emitAppSignal(userId, "logout", { method: "user" }).catch(() => undefined);
+  }
+  return res.status(204).end();
+};
+
 export const changePassword = async (req: Request, res: Response) => {
   try {
     const authReq = req as AuthenticatedRequest;

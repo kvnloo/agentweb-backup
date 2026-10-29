@@ -69,6 +69,11 @@ export interface PreviewResult {
   /** The campaign is already ACTIVE: the user must confirm separately, because leads start receiving mail at once. */
   requiresActiveConfirmation: boolean;
   /**
+   * The campaign is already sending AND its emails would carry no unsubscribe link: the user must accept that explicitly (start refuses
+   * without `acknowledgements.noUnsubscribeAccepted`). A DRAFTED or PAUSED campaign only warns: nothing sends until the customer starts it.
+   */
+  requiresUnsubscribeAcknowledgement: boolean;
+  /**
    * Identifies WHICH contacts (the first `cohort.chosen` eligible ones) would go to WHICH Smartlead connection. Two previews with the same
    * counts but different contacts or a different connection differ here, so an approval given on one cannot be used on the other.
    */
@@ -122,7 +127,7 @@ export async function buildPreview(deps: PreviewDeps, req: PreviewRequest): Prom
 
   const analysis = analyseSequence(await deps.getSequences());
   const preflight = preflightSequence(analysis, {
-    status: campaign.status, mapping, acknowledgedTags, acknowledgeUnreadable: req.acknowledgeUnreadable, addUnsubscribeTag: campaign.addUnsubscribeTag,
+    status: campaign.status, mapping, acknowledgedTags, acknowledgeUnreadable: req.acknowledgeUnreadable, addUnsubscribeTag: campaign.addUnsubscribeTag, unsubscribeText: campaign.unsubscribeText,
   });
 
   const leads = await readWholeList(deps, req.listId);
@@ -160,6 +165,7 @@ export async function buildPreview(deps: PreviewDeps, req: PreviewRequest): Prom
     ...(estimate ? { estimate } : {}),
     canStart: preflight.blocks.length === 0 && chosen > 0,
     requiresActiveConfirmation: decision === "needs_confirmation",
+    requiresUnsubscribeAcknowledgement: decision === "needs_confirmation" && preflight.missingUnsubscribe,
     fingerprint: createHash("sha256").update(JSON.stringify({ a: req.accountId, ids: result.eligible.slice(0, chosen).map(e => String(e.lead.leadId)) })).digest("hex").slice(0, 32),
     token: signPushToken(deps.secret, payload),
     expiresAt: new Date(payload.exp).toISOString(),
