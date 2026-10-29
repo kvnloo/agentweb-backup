@@ -575,6 +575,51 @@ describe('linearService.recordLoopAttributionOutcome (ENG-535)', () => {
     expect(global.fetch).toHaveBeenCalledTimes(1);
   });
 
+  it('adds a How to verify section from the linked GitHub PR attachment inside the marker comment (ENG-590)', async () => {
+    sequence(
+      { data: { issue: {
+        id: 'uuid-600',
+        attachments: { nodes: [
+          { url: 'https://github.com/AgentWebPro/agentweb/pull/4242', title: 'fix: capture (ENG-600)' },
+          { url: 'https://github.com/AgentWebPro/agentweb/pull/4242', title: 'dup' },
+          { url: 'https://example.com/doc', title: 'Not a PR' },
+        ] },
+        comments: { nodes: [], pageInfo: { hasNextPage: false } },
+      } } },
+      TEAM_WITH_LIFECYCLE,
+      { data: { issueUpdate: { success: true } } },
+      { data: { commentCreate: { success: true } } },
+    );
+
+    await recordLoopAttributionOutcome(outcome);
+
+    const calls = (global.fetch as jest.Mock).mock.calls.map((c) => JSON.parse(c[1].body));
+    expect(calls[0].query).toContain('attachments');
+    const comments = calls.filter((c) => c.query.includes('commentCreate'));
+    expect(comments).toHaveLength(1);
+    const body: string = comments[0].variables.input.body;
+    expect(body).toContain('### How to verify');
+    expect(body).toContain('[fix: capture (ENG-600)](https://github.com/AgentWebPro/agentweb/pull/4242)');
+    expect(body.match(/pull\/4242/g)).toHaveLength(1);
+    expect(body).not.toContain('example.com');
+    expect(body).toContain('eval_to_signup_rate: 0.1000 → 0.4000 (+300.0%; n=20)');
+    expect(body.indexOf('### How to verify')).toBeLessThan(body.indexOf('<!-- loop-attribution:'));
+  });
+
+  it('still writes How to verify from the metric when no PR is attached', async () => {
+    sequence(
+      { data: { issue: { id: 'uuid-600', comments: { nodes: [], pageInfo: { hasNextPage: false } } } } },
+      TEAM_WITH_LIFECYCLE,
+      { data: { issueUpdate: { success: true } } },
+      { data: { commentCreate: { success: true } } },
+    );
+    await recordLoopAttributionOutcome(outcome);
+    const calls = (global.fetch as jest.Mock).mock.calls.map((c) => JSON.parse(c[1].body));
+    const body: string = calls.find((c) => c.query.includes('commentCreate')).variables.input.body;
+    expect(body).toContain('### How to verify');
+    expect(body).toContain('No linked GitHub PR');
+  });
+
   it('returns missing_issue without issuing a mutation', async () => {
     sequence({ data: { issue: null } });
     await expect(recordLoopAttributionOutcome(outcome)).resolves.toEqual({ status: 'missing_issue' });
