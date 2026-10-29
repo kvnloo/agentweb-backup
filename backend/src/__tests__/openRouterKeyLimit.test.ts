@@ -64,4 +64,9 @@ describe('ENG-2758 classifyOpenRouterQuotaExhaustion', () => {
     expect(resolveQuotaDeferral({ kind: 'credits' }, now, new Date('2026-10-29T17:45:00.000Z')))
       .toBe('2026-10-29T17:45:00.000Z');
   });
+
+  it('weekly schedule + credits error with no reset does not skip a week (Opslane P1 #2 on #3841)', () => {
+    const weeklyNatural = new Date('2026-11-05T17:00:00.000Z');
+    expect(resolveQuotaDeferral({ kind: 'credits' }, now, weeklyNatural)).toBe(capAt);
+  });
 });
