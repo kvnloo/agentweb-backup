@@ -1686,3 +1686,53 @@ describe('intakeService.fileAutoIssue — legacy canonical fold (ENG-2492)', () 
     expect(r).toMatchObject({ deduped: false });
   });
 });
+
+// ENG-2766: a Meta connection handoff for an account whose tracking-monitor canonical
+// ("Meta ad account X cannot be read — token invalid") is open must recur on THAT issue.
+// Prod regression: the candidate scan was capped at the newest 50 open Auto issues, so an
+// older canonical fell out of view and every handoff filed a parallel issue.
+describe('fileAutoIssue — Meta handoff converges on the tracking-monitor canonical (ENG-2766)', () => {
+  afterEach(() => jest.clearAllMocks());
+  const canonical = (acct: string, id: string) => ({
+    identifier: id,
+    issueId: `uuid-${id}`,
+    title: `Meta ad account ${acct} cannot be read — token invalid`,
+    description:
+      `Meta rejected our stored credentials for ad account ${acct}.\n\n---\n\nSource: Oncall alert — auto-identified by the system.\n\n` +
+      `* Alert Class: meta-token-invalid\n* Alert Scope: meta-ad-account:${acct}\n* Alert Priority: high\n* Ad Account: ${acct}`,
+  });
+  const handoff = (acct: string) => ({
+    title: `Meta connection: order@kraftersland.com — krafter's Land Cabinetry (${acct}) token expired`,
+    description: 'Next actor: Customer',
+    source: 'Oncall alert',
+    executionRoute: 'human-triage' as const,
+    extraLabels: ['Oncall'],
+    notionContext: {
+      'Alert Class': 'meta-token-invalid',
+      'Alert Scope': `meta-ad-account:${acct}`,
+      userId: 'u-1',
+      accountId: acct,
+      reason: 'refresh_failed',
+    },
+  });
+  const noise = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({ identifier: `ENG-${3000 + i}`, issueId: `uuid-n${i}`, title: `noise ${i}`, description: 'x' }));
+
+  it('recurs on the open canonical even when it is older than 50 other open Auto issues', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([...noise(80), canonical('4220433474834949', 'ENG-2374')]);
+    const r = await fileAutoIssue(handoff('4220433474834949'));
+    expect(linear.listOpenIssuesByLabel).toHaveBeenCalledWith('Auto');
+    expect(linear.createInternalLinearIssue).not.toHaveBeenCalled();
+    expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-ENG-2374', expect.stringContaining('Recurred on'));
+    expect(r).toMatchObject({ pageId: 'ENG-2374', deduped: true });
+  });
+
+  it('a different account still files its own issue', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([...noise(80), canonical('4220433474834949', 'ENG-2374')]);
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9100', id: 'uuid-9100', url: 'u' });
+    const r = await fileAutoIssue(handoff('1430365244346362'));
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(1);
+    expect(linear.addIssueComment).not.toHaveBeenCalled();
+    expect(r).toMatchObject({ deduped: false });
+  });
+});
