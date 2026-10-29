@@ -132,6 +132,21 @@ describe('register persistence boundary', () => {
     expect(mockJwtSign).not.toHaveBeenCalled();
   });
 
+  it('answers a concurrent duplicate signup that lost the account write with 400 User already exists', async () => {
+    mockGetUserByEmail
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ userId: 'winner', email: 'ghost@unresolvable.test' });
+    mockCreateUser.mockRejectedValue(new Error('ConditionalCheckFailedException'));
+
+    const response = await registerRequest();
+
+    expect(response.status).toBe(400);
+    expect(response.body).toEqual({ message: 'User already exists' });
+    expect(mockUpdateUser).not.toHaveBeenCalled();
+    expect(mockOnUserRegistered).not.toHaveBeenCalled();
+    expect(mockJwtSign).not.toHaveBeenCalled();
+  });
+
   it('creates no pending organization request when persistence fails', async () => {
     mockCreateUser.mockResolvedValue(undefined);
     mockGetOrgsWithAutoJoinDomain.mockResolvedValue([{ orgId: 'org-1' }]);

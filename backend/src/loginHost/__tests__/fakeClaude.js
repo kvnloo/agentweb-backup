@@ -170,13 +170,14 @@ if (args[0] === "auth" && args[1] === "login") {
       return;
     }
     record({ mode: "turn-input", mcpFile, mcpMode, firstUser: msg });
+    if (scenario.deepline) process.stdout.write("[".repeat(scenario.deepline) + "]".repeat(scenario.deepline) + "\n"); // a hostile CLI: one line nested this deep
     if (scenario.noise) process.stdout.write("warning: not json\n\n[1,2,3]\nnull\n");
     if (scenario.bigline) {
       process.stdout.write("x".repeat(scenario.bigline)); // one enormous line, no newline
       await new Promise(() => {});
     }
     const serverDef = mcp && server && mcp.mcpServers[server];
-    if (serverDef && serverDef.type === "stdio") await mcpStart(serverDef);
+    if (serverDef && serverDef.type === "stdio" && !scenario.noShim) await mcpStart(serverDef); // noShim: the test plays the shim itself over the relay socket
     out({ type: "system", subtype: "init", apiKeySource: scenario.apiKeySource || "none", mcp_servers: server ? [{ name: server, status: scenario.mcpStatus || "connected" }] : [] });
     for (const step of scenario.turn || [
       { type: "assistant", message: { id: "m1", content: [{ type: "text", text: "hello" }, { type: "tool_use", id: "tu1", name: "mcp__emma__search", input: { q: "x" } }] } },

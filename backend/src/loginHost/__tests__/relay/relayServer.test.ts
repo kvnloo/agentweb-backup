@@ -412,6 +412,122 @@ describe("relay: limits and abuse", () => {
   });
 });
 
+describe("relay: hostile frames cannot take the host down", () => {
+  const deepFrame = (k: number, callId = "d1") => `{"type":"call","callId":"${callId}","name":"echo","args":{"a":${"[".repeat(k)}${"]".repeat(k)}}}\n`;
+  let uncaught: unknown[];
+  const onU = (e: unknown) => void uncaught.push(e);
+  beforeEach(() => {
+    uncaught = [];
+    process.on("uncaughtException", onU);
+  });
+  afterEach(() => void process.off("uncaughtException", onU));
+
+  it("MUTATION TARGET: a frame nested hundreds of thousands deep (it fits in 1 MiB and JSON.parse accepts it) drops the connection; nothing is thrown, nothing reaches onCall", async () => {
+    const r = rig();
+    const { ep, calls } = await r.open();
+    const other = await r.open({ uid: 400_002 });
+    const c = new Client(sockOf(ep));
+    await c.ready();
+    const frame = deepFrame(300_000);
+    expect(Buffer.byteLength(frame)).toBeLessThan(1024 * 1024);
+    expect(() => JSON.stringify(JSON.parse(frame))).toThrow(RangeError); // the crash the unbounded path had: stringify of what parse accepted
+    c.raw(frame);
+    await until(() => c.closed);
+    await new Promise((res) => setTimeout(res, 100));
+    expect(calls).toHaveLength(0);
+    expect(r.logs.map((l) => l.fields?.code)).toEqual(["frame_too_deep"]);
+    expect(uncaught).toEqual([]);
+    // the endpoint still works for a well-formed call on a new connection, and another turn's endpoint was never affected
+    const c2 = new Client(sockOf(ep));
+    await c2.ready();
+    c2.send(call("ok1"));
+    await until(() => calls.length === 1);
+    expect(ep.answer(calls[0].operationId, { content: "fine" })).toBe(true);
+    const o = new Client(sockOf(other.ep));
+    await o.ready();
+    o.send(call("ok2"));
+    await until(() => other.calls.length === 1);
+    await ep.close();
+    await other.ep.close();
+  });
+
+  it("MUTATION TARGET: the depth boundary is exact (33 levels including the frame and args), for calls and pings alike", async () => {
+    const r = rig();
+    const { ep, calls } = await r.open();
+    const ok = new Client(sockOf(ep));
+    await ok.ready();
+    ok.raw(deepFrame(31));
+    await until(() => calls.length === 1);
+    expect(ok.closed).toBe(false);
+    expect(ep.answer(calls[0].operationId, { content: "x" })).toBe(true);
+    ok.raw(deepFrame(32, "d2"));
+    await until(() => ok.closed);
+    expect(r.logs.map((l) => l.fields?.code)).toEqual(["frame_too_deep"]);
+    expect(calls).toHaveLength(1);
+    await ep.close();
+  });
+
+  it("MUTATION TARGET: a handler that throws (here: allowTool) is contained: the connection is dropped with a fixed code, the process is not", async () => {
+    const r = rig();
+    const { ep, calls } = await r.open({
+      allowTool: () => {
+        throw new Error("boom: SECRET-FRAME-TEXT");
+      },
+    });
+    const c = new Client(sockOf(ep));
+    await c.ready();
+    c.send(call());
+    await until(() => c.closed);
+    expect(calls).toHaveLength(0);
+    expect(r.logs.map((l) => l.fields?.code)).toEqual(["internal_error"]);
+    expect(JSON.stringify(r.logs)).not.toContain("SECRET");
+    expect(uncaught).toEqual([]);
+    await ep.close();
+  });
+
+  it("MUTATION TARGET: a logger that throws cannot turn a violation into an uncaught exception", async () => {
+    const { layout } = mkLayout();
+    const host = new RelayHost({ layout, ownByUid: false, log: { warn: () => { throw new Error("logger down"); } } });
+    host.init();
+    const ep = await host.open({ uid: 400_001, identity: { connectionId: "c", epoch: 1, turnId: "t" }, onCall: () => undefined, allowTool: () => true, callTimeoutMs: () => 1000 });
+    const c = new Client(sockOf(ep));
+    await c.ready();
+    c.raw("not json\n");
+    await until(() => c.closed);
+    await new Promise((res) => setTimeout(res, 100));
+    expect(uncaught).toEqual([]);
+    await ep.close();
+  });
+
+  it("MUTATION TARGET: reject() answers the pending call with a fixed internal error frame (once)", async () => {
+    const r = rig();
+    const { ep, calls } = await r.open();
+    const c = new Client(sockOf(ep));
+    await c.ready();
+    c.send(call("rj"));
+    await until(() => calls.length === 1);
+    expect(ep.reject("0".repeat(32), "internal")).toBe(false);
+    expect(ep.reject(calls[0].operationId, "internal")).toBe(true);
+    await until(() => c.lines.length === 1);
+    expect(JSON.parse(c.lines[0])).toEqual({ type: "error", callId: "rj", code: "internal" });
+    expect(ep.reject(calls[0].operationId, "internal")).toBe(false);
+    expect(ep.answer(calls[0].operationId, { content: "late" })).toBe(false);
+    await ep.close();
+  });
+
+  it("each call reports the size of the frame the host measured (memory accounting never needs a stringify of args)", async () => {
+    const r = rig();
+    const { ep, calls } = await r.open();
+    const c = new Client(sockOf(ep));
+    await c.ready();
+    const line = JSON.stringify(call("sz", "echo", { q: "x".repeat(500) }));
+    c.raw(line + "\n");
+    await until(() => calls.length === 1);
+    expect(calls[0].bytes).toBe(Buffer.byteLength(line));
+    await ep.close();
+  });
+});
+
 describe("relay: timeouts and lifetime", () => {
   it("a call that outlives its per-turn timeout gets an error frame; the late answer is refused (result lost) and the adapter is told", async () => {
     const r = rig();

@@ -63,6 +63,8 @@ LOCK=/run/aw-deploy/install.lock # in a root-only directory (see deploy.sh): a f
 SKIP_PREREQS=0
 DRY_BASE=/run
 OWN=(-o root -g root)
+NODE_ROOT=/opt/aw-node # where install.sh puts the pinned node (the config names the real path under it: /usr/bin/node is a symlink)
+TRUST_UID=0 TRUST_BOUNDARY=
 # Test seam: a copy of these scripts in a scratch directory with a `.aw-test-mode` file next to them may redirect every path and fake the tools.
 # The marker is never part of a build tarball, so on the worker none of the AW_* variables below has any effect.
 TEST=0
@@ -70,6 +72,7 @@ if [ -e "$HERE/.aw-test-mode" ]; then
   TEST=1
   OPT=${AW_OPT:?AW_OPT}; CONF=${AW_CONF:?AW_CONF}; UNIT_DIR=${AW_UNIT_DIR:?AW_UNIT_DIR}; LOCK=${AW_LOCK:?AW_LOCK}
   SYSTEMCTL=${AW_SYSTEMCTL:-systemctl}; SKIP_PREREQS=${AW_SKIP_PREREQS:-0}
+  NODE_ROOT=${AW_NODE_ROOT:-/opt/aw-node}; TRUST_UID=$(id -u); TRUST_BOUNDARY=${AW_TRUST_BOUNDARY:-}
   DRY_BASE=${AW_TMP:-${TMPDIR:-/tmp}}
   [ "$(id -u)" = 0 ] || OWN=()
 fi
@@ -135,10 +138,11 @@ fi
 
 NODE_BIN=/usr/bin/node
 [ "$TEST" != 1 ] || NODE_BIN=$(command -v node || echo /usr/bin/node)
-check_config() { # check_config <config.json> <check-config.js>
-  local nb=$NODE_BIN
+check_config() { # check_config <config.json> <check-config.js> [extra check-config.js arguments]
+  local nb=$NODE_BIN cfg=$1 js=$2
+  shift 2
   [ -x "$nb" ] || nb=$(command -v node || true)
-  [ -n "$nb" ] && "$nb" "$2" "$1"
+  [ -n "$nb" ] && "$nb" "$js" "$cfg" "$@"
 }
 
 # A valid install = an active release whose files, config and TLS set are all there.
@@ -432,6 +436,12 @@ PY
 chmod 0600 "$cfg_tmp"
 check_config "$cfg_tmp" "$HERE/check-config.js" >/dev/null || die "the generated config is rejected by the host's own schema (or there is no node to check it with): nothing was changed"
 ok "generated config accepted by the host's parser"
+# The host refuses to start when a path it hands to a customer unit has a symlink on it, a non-root owner or a group/other-writable component. Run that same check
+# NOW, on the staged files (the release and TLS set are not at their final paths yet) and the pinned node, so a config the host would refuse at start-up never gets
+# switched to: this is the step that catches a symlinked node path or a shim that is not root-owned.
+trust_out=$(check_config "$cfg_tmp" "$HERE/check-config.js" --owner "$TRUST_UID" ${TRUST_BOUNDARY:+--boundary "$TRUST_BOUNDARY"} --map "$REL_DIR=$STAGE_REL_DIR" --map "$TLS_DIR=$STAGE_TLS_DIR" --map "/opt/aw-node=$NODE_ROOT" 2>&1) \
+  || die "the host would refuse to start with this release (trusted-path check): ${trust_out:-no output}. Nothing was changed."
+ok "every release path the host will check is root-controlled (no symlink, owner, write bits)"
 
 # The slice that caps ALL customer units (values pinned in versions.env; CPU quota leaves ~20% of one vCPU for the host).
 CPU_QUOTA="$(( $(nproc) * 100 - 20 ))%"

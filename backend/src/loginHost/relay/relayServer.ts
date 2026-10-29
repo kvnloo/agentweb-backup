@@ -20,6 +20,7 @@ import { createServer, type Server, type Socket } from "net";
 import type { Logger } from "../ports";
 import type { Layout } from "../ports/layout";
 import { RELAY_FRAME_LIMITS, TOOL_NAME, type ToolDef } from "../protocol";
+import { LogThrottle, MAX_FRAME_DEPTH, rawJsonDepthExceeds } from "./bounds";
 
 export interface RelayIdentity {
   connectionId: string;
@@ -33,6 +34,8 @@ export interface RelayCall {
   operationId: string;
   name: string;
   args: Record<string, unknown>;
+  /** The size of the frame the shim sent (what the host measured); memory accounting uses this, never a stringify of `args`. */
+  bytes: number;
 }
 
 export interface RelayResult {
@@ -82,6 +85,8 @@ export interface RelayEndpoint {
   readonly dir: string;
   /** Answers the pending operation. False = there is no such pending operation (timed out, ended, or never issued): the result is lost. */
   answer(operationId: string, result: RelayResult): boolean;
+  /** Fails the pending call with a fixed error code (the shim gets an error frame). False = no such pending call. */
+  reject(operationId: string, code: "internal"): boolean;
   /** Ends the connection and the pending call, closes the listener and removes the directory. Idempotent. */
   close(): Promise<void>;
   readonly closed: boolean;
@@ -91,6 +96,10 @@ export interface RelayHostOptions {
   layout: Layout;
   /** Production: sockets and directories belong to the customer uid. Tests run unprivileged. */
   ownByUid?: boolean;
+  /** Test seam for the ownership change (default fs.chownSync). */
+  chown?: (path: string, uid: number, gid: number) => void;
+  /** Test seam for the log throttle's clock. */
+  now?: () => number;
   log?: Pick<Logger, "warn">;
   limits?: Partial<RelayLimits>;
   randomHex?: (bytes: number) => string;
@@ -100,7 +109,11 @@ const CALL_ID = /^[A-Za-z0-9_-]{1,64}$/;
 
 /** Serialized size of the result frame the host would send (the manager refuses an answer that cannot fit BEFORE it consumes the operation). */
 export function resultFrameBytes(callId: string, r: RelayResult): number {
-  return Buffer.byteLength(JSON.stringify(resultFrame(callId, r)) + "\n", "utf8");
+  try {
+    return Buffer.byteLength(JSON.stringify(resultFrame(callId, r)) + "\n", "utf8");
+  } catch {
+    return Infinity; // not serializable: never fits
+  }
 }
 
 function resultFrame(callId: string, r: RelayResult): Record<string, unknown> {
@@ -111,8 +124,16 @@ export class RelayHost {
   private readonly layout: Layout;
   private readonly limits: RelayLimits;
   private readonly hex: (n: number) => string;
+  /** Production passes true: sockets and directories belong to the customer uid. Public so a start-up test can pin it. */
+  readonly ownByUid: boolean;
+  private readonly chown: (path: string, uid: number, gid: number) => void;
+  /** Violation lines across ALL turns: a hostile unit opening turns cannot flood the journal either. */
+  private readonly sharedThrottle: LogThrottle;
 
   constructor(private readonly opts: RelayHostOptions) {
+    this.ownByUid = opts.ownByUid !== false;
+    this.chown = opts.chown ?? chownSync;
+    this.sharedThrottle = new LogThrottle(LOG_MAX_PER_CODE_HOST, LOG_WINDOW_MS, opts.now);
     this.layout = opts.layout;
     this.limits = { ...DEFAULT_RELAY_LIMITS, ...(opts.limits ?? {}) };
     this.hex = opts.randomHex ?? ((n) => randomBytes(n).toString("hex"));
@@ -127,7 +148,7 @@ export class RelayHost {
       mkdirSync(root, { recursive: true, mode: 0o755 });
     }
     chmodSync(root, 0o755);
-    if (this.opts.ownByUid !== false) chownSync(root, 0, 0);
+    if (this.ownByUid) this.chown(root, 0, 0);
   }
 
   /** Creates this turn's directory and listening socket. Resolves when the socket accepts connections; only then may the unit be started. */
@@ -135,19 +156,20 @@ export class RelayHost {
     const uidDir = this.layout.relayUidDir(o.uid);
     const dir = this.layout.relayTurnDir(o.uid, this.hex(16));
     const sock = `${dir}/relay.sock`;
-    const own = this.opts.ownByUid !== false;
+    const own = this.ownByUid;
     // The uid directory is root-owned and only traversable: the customer never gets write access above its own turn directory.
     mkdirSync(uidDir, { recursive: true, mode: 0o711 });
     chmodSync(uidDir, 0o711);
     mkdirSync(dir, { mode: 0o700 }); // exclusive: a leftover is an error, never reused
     chmodSync(dir, 0o700);
-    const ep = new Endpoint(this.limits, this.opts.log, dir, o);
+    const ep = new Endpoint(this.limits, this.opts.log, dir, o, this.sharedThrottle, new LogThrottle(LOG_MAX_PER_CODE_ENDPOINT, LOG_WINDOW_MS, this.opts.now));
     try {
       await ep.listen(sock);
       chmodSync(sock, 0o600);
       if (own) {
-        chownSync(sock, o.uid, o.uid);
-        chownSync(dir, o.uid, o.uid);
+        // The socket first, the DIRECTORY LAST: until the directory is the customer's, nobody but root can even reach the socket.
+        this.chown(sock, o.uid, o.uid);
+        this.chown(dir, o.uid, o.uid);
       }
     } catch (e) {
       await ep.close();
@@ -156,6 +178,11 @@ export class RelayHost {
     return ep;
   }
 }
+
+/** Violation logs: per endpoint and per code at most this many per window (then counted, not logged), and across the whole host a larger number. */
+const LOG_MAX_PER_CODE_ENDPOINT = 5;
+const LOG_MAX_PER_CODE_HOST = 50;
+const LOG_WINDOW_MS = 10_000;
 
 class Endpoint implements RelayEndpoint {
   private readonly server: Server;
@@ -170,8 +197,17 @@ class Endpoint implements RelayEndpoint {
     private readonly log: Pick<Logger, "warn"> | undefined,
     readonly dir: string,
     private readonly o: RelayOpenOptions,
+    private readonly sharedThrottle: LogThrottle,
+    private readonly throttle: LogThrottle,
   ) {
-    this.server = createServer((s) => this.onConnection(s));
+    this.server = createServer((s) => {
+      try {
+        this.onConnection(s);
+      } catch {
+        this.violate("internal_error");
+        s.destroy();
+      }
+    });
     this.server.maxConnections = 8; // refused at the listener beyond this; the one-connection rule below is the real limit
     this.server.on("error", () => this.violate("server_error"));
   }
@@ -191,7 +227,15 @@ class Endpoint implements RelayEndpoint {
   }
 
   private violate(code: string): void {
-    this.log?.warn("relay_violation", { code });
+    try {
+      const mine = this.throttle.check(code);
+      const shared = this.sharedThrottle.check(code);
+      if (mine.log && shared.log) this.log?.warn("relay_violation", { code });
+      const before = Math.max(mine.suppressedBefore, shared.suppressedBefore);
+      if (before > 0) this.log?.warn("relay_violation_suppressed", { code, count: before });
+    } catch {
+      /* a failing logger must not become an uncaught exception either */
+    }
   }
 
   private onConnection(s: Socket): void {
@@ -215,6 +259,14 @@ class Endpoint implements RelayEndpoint {
       if (this.pending?.socket === s) this.endPending("disconnected");
     });
     s.on("data", (chunk: Buffer) => {
+      try {
+        onData(chunk);
+      } catch {
+        // Nothing a shim sends may throw out of an event handler: that would be an uncaught exception, which ends the whole host. Drop the connection, fixed code.
+        this.drop(s, "internal_error");
+      }
+    });
+    const onData = (chunk: Buffer): void => {
       if (this.conn !== s) return;
       buf = buf.length ? Buffer.concat([buf, chunk]) : chunk;
       for (;;) {
@@ -237,7 +289,7 @@ class Endpoint implements RelayEndpoint {
         idle.unref?.();
         if (!this.frame(s, line)) return;
       }
-    });
+    };
   }
 
   private drop(s: Socket, code: string): void {
@@ -247,6 +299,12 @@ class Endpoint implements RelayEndpoint {
 
   /** Handles one complete line. Returns false when the connection was dropped. */
   private frame(s: Socket, line: Buffer): boolean {
+    // BEFORE parsing: a hostile frame nested hundreds of thousands deep fits in 1 MiB, JSON.parse accepts it, and every later stringify or walk of it throws a
+    // RangeError that no handler catches. The single-pass scan rejects it without ever building the object.
+    if (rawJsonDepthExceeds(line, MAX_FRAME_DEPTH)) {
+      this.drop(s, "frame_too_deep");
+      return false;
+    }
     let f: unknown;
     try {
       f = JSON.parse(line.toString("utf8"));
@@ -288,14 +346,19 @@ class Endpoint implements RelayEndpoint {
     const operationId = randomBytes(16).toString("hex");
     const ms = Math.max(0, Math.floor(this.o.callTimeoutMs()));
     const timer = setTimeout(() => {
-      if (this.pending?.operationId !== operationId) return;
-      this.send(s, { type: "error", callId, code: "timeout" });
-      this.endPending("timeout");
+      try {
+        if (this.pending?.operationId !== operationId) return;
+        this.send(s, { type: "error", callId, code: "timeout" });
+        this.endPending("timeout");
+      } catch {
+        this.violate("internal_error");
+        s.destroy();
+      }
     }, ms);
     timer.unref?.();
     this.pending = { callId, operationId, timer, socket: s };
     try {
-      this.o.onCall({ identity: this.o.identity, operationId, name, args: args as Record<string, unknown> });
+      this.o.onCall({ identity: this.o.identity, operationId, name, args: args as Record<string, unknown>, bytes: line.length });
     } catch {
       this.send(s, { type: "error", callId, code: "internal" });
       this.endPending("disconnected");
@@ -313,8 +376,20 @@ class Endpoint implements RelayEndpoint {
 
   private send(s: Socket, frame: Record<string, unknown>): boolean {
     if (s.destroyed) return false;
-    const text = JSON.stringify(frame) + "\n";
-    if (Buffer.byteLength(text, "utf8") > this.limits.hostToShimBytes) return false;
+    let text: string;
+    try {
+      text = JSON.stringify(frame) + "\n";
+    } catch {
+      return false; // not serializable: nothing is sent, the call times out or is ended by the caller
+    }
+    const size = Buffer.byteLength(text, "utf8");
+    if (size > this.limits.hostToShimBytes) return false;
+    // A peer that never reads must not make the host buffer without bound (answers are up to 8 MiB each): past two maximum frames queued, the connection is cut.
+    if (s.writableLength + size > 2 * this.limits.hostToShimBytes) {
+      this.drop(s, "write_backlog");
+      this.endPending("disconnected");
+      return false;
+    }
     s.write(text);
     return true;
   }
@@ -323,10 +398,24 @@ class Endpoint implements RelayEndpoint {
     const p = this.pending;
     if (this.isClosed || !p || p.operationId !== operationId || p.socket.destroyed) return false;
     let frame = resultFrame(p.callId, r);
-    if (Buffer.byteLength(JSON.stringify(frame) + "\n", "utf8") > this.limits.hostToShimBytes) frame = { type: "error", callId: p.callId, code: "result_too_large" };
+    let size = Infinity;
+    try {
+      size = Buffer.byteLength(JSON.stringify(frame) + "\n", "utf8");
+    } catch {
+      /* not serializable: treated as too large */
+    }
+    if (size > this.limits.hostToShimBytes) frame = { type: "error", callId: p.callId, code: "result_too_large" };
     clearTimeout(p.timer);
     this.pending = undefined;
-    this.send(p.socket, frame);
+    return this.send(p.socket, frame); // false (queue cap hit, not serializable): the result did not reach the shim
+  }
+
+  reject(operationId: string, code: "internal"): boolean {
+    const p = this.pending;
+    if (this.isClosed || !p || p.operationId !== operationId) return false;
+    clearTimeout(p.timer);
+    this.pending = undefined;
+    this.send(p.socket, { type: "error", callId: p.callId, code });
     return true;
   }
 
@@ -339,6 +428,11 @@ class Endpoint implements RelayEndpoint {
       }
       this.conn?.destroy();
       this.conn = undefined;
+      try {
+        for (const [code, count] of this.throttle.flush()) this.log?.warn("relay_violation_suppressed", { code, count });
+      } catch {
+        /* logging is best effort */
+      }
       await new Promise<void>((resolve) => {
         if (!this.server.listening) return resolve();
         this.server.close(() => resolve());

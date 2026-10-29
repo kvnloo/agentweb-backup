@@ -23,9 +23,12 @@ import { startHostServer, type HostServerHandle } from "../server";
 import { StateStore } from "../stateStore";
 import { CERT_WARN_DAYS, certNotAfterMs, daysUntil } from "../certExpiry";
 import { assertTrustedPath, verifyBinary, type VerifiedBinary } from "./binary";
+import { assertHostTrustedPaths } from "./trustedPaths";
 import { assertNoSubuidOverlap, HostConfigError, parseHostConfig, type HostConfig } from "./hostConfig";
 import { registerRange } from "./ranges";
 import { assertHomesMount, assertRoot, parseMounts } from "./startupChecks";
+
+export { assertHostTrustedPaths, hostTrustedPaths } from "./trustedPaths";
 
 export interface HostDeps {
   cmd: CommandPort;
@@ -165,6 +168,7 @@ export function buildHost(cfg: HostConfig, binary: VerifiedBinary, deps: HostDep
           turnWrapperPath: cfg.claude.turnWrapperPath,
           bridgeUrl: cfg.claude.bridgeUrl,
           relay: { host: relay, shimPath: cfg.claude.relayShimPath, nodePath: cfg.claude.nodePath },
+          log: { warn: (event, fields) => deps.log.warn(event, fields) },
           ...(cfg.claude.models ? { models: cfg.claude.models } : {}),
           ...(cfg.claude.basePath ? { basePath: cfg.claude.basePath } : {}),
           // A stopping turn process gets the unit's grace period: waits for it (and the auth check that follows) must outlast it.
@@ -304,36 +308,32 @@ export async function startHost(cfg: HostConfig, binary: VerifiedBinary, deps: H
 }
 
 /**
- * Everything the host or a customer unit executes or reads as policy must be root-controlled: root-owned, not group/other-writable, and NO SYMLINK anywhere
- * on the path (assertTrustedPath). So a configured path must be the REAL path: /usr/bin/node on the prod worker is a symlink (install.sh), which is why the
- * prod config names /opt/aw-node/v<version>/bin/node. Shared by runMain and the tests; `check` is a seam for tests (a temp tree owned by the current uid).
+ * LAST RESORT, not a feature: whatever slips past the guards on shim-, CLI- and request-controlled data (relay/bounds.ts, the try/catch around every handler) must
+ * not leave the host running in an unknown state. Node's own default is the same exit (code 1 for an uncaught exception, and an unhandled rejection is thrown as
+ * one since Node 15), so this does not change WHEN the host stops, only WHAT it says: one fixed-code log line instead of the error's message and stack, which can
+ * quote customer-controlled input (a JSON.parse error names the text it choked on). Exit code 1 keeps `Restart=on-failure` restarting it. It never swallows an
+ * error and keeps nothing running: the exit is immediate and synchronous (customer units are separate transient units; the next start stops them all).
  */
-export function hostTrustedPaths(cfg: HostConfig): string[] {
-  return [
-    ...(cfg.tls ? [cfg.tls.certPath, cfg.tls.keyPath, cfg.tls.caPath] : []),
-    cfg.claude.turnWrapperPath,
-    cfg.claude.relayShimPath,
-    cfg.claude.nodePath,
-    cfg.egress.launcherPath,
-    cfg.egress.socat,
-    cfg.claude.systemPromptFile,
-    cfg.tools.writeFileHelper,
-    cfg.tools.systemRun,
-    cfg.tools.systemctl,
-    cfg.tools.setpriv,
-    cfg.tools.env,
-    cfg.tools.rm,
-    cfg.tools.find,
-    ...(cfg.quota ? [cfg.tools.setquota] : []),
-  ];
-}
-export function assertHostTrustedPaths(cfg: HostConfig, check: (p: string) => void = (p) => assertTrustedPath(p)): void {
-  for (const p of hostTrustedPaths(cfg)) check(p);
+export function installLastResortHandlers(log: Logger, exit: (code: number) => void = (c) => process.exit(c), proc: Pick<NodeJS.Process, "on"> = process): void {
+  let dying = false;
+  const die = (code: "host_uncaught_exception" | "host_unhandled_rejection") => {
+    if (dying) return; // a second failure while exiting: the first exit is already on its way
+    dying = true;
+    try {
+      log.warn(code);
+    } catch {
+      /* the exit below is what matters */
+    }
+    exit(1);
+  };
+  proc.on("uncaughtException", () => die("host_uncaught_exception"));
+  proc.on("unhandledRejection", () => die("host_unhandled_rejection"));
 }
 
 /** The root-only entry: reads the config, checks the machine, starts, handles signals. */
 export async function runMain(argv: string[] = process.argv): Promise<void> {
   const log = jsonLogger();
+  installLastResortHandlers(log);
   try {
     assertRoot(process.getuid?.());
     const configPath = argv[2] ?? process.env.AW_LOGIN_HOST_CONFIG;

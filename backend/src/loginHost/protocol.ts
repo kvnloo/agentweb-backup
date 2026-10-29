@@ -28,7 +28,8 @@ export const PROTOCOL_VERSION = 4;
 // the code and reports it back, so a loser of a double submit can stand down), login.cancel.onlyIfPending (a user-initiated cancel never discards a login
 // that is already ready) and, on the host only, a time limit for a ready attempt that is never promoted. The backend sends the new fields only to a worker
 // that reports 3 or more (loginHostProvider.workerProtocol()), so the two can deploy in either order.
-// 4 (ENG-2113) adds the tool relay, all additive on the worker side: turn.run takes an optional bounded `tools` manifest INSTEAD of `bridgeToken` (a request
+// 4 (ENG-2113) adds the tool relay. turn.run is additive (the legacy shape is unchanged), but turn.toolResult is NOT: `ok` is replaced by `isError`, `images`
+// and `tools` are new and the schema is strict (nothing called the old shape; Codex relays are not implemented). turn.run takes an optional bounded `tools` manifest INSTEAD of `bridgeToken` (a request
 // with `bridgeToken` and no `tools` is the legacy shape and behaves exactly as under 3; both together, or neither, is refused), turn events gain `tool-call`
 // (host-generated operationId), and turn.toolResult is reshaped (`isError`, `images`, `tools` = definitions newly available because of that call; its body limit is 8 MiB). The backend sends `tools` only to a
 // worker that reports 4 or more, so the worker deploys first.
@@ -88,7 +89,14 @@ export const TOOL_LIMITS = {
   maxDescriptionBytes: 48 * 1024,
   maxSchemaBytes: 32 * 1024,
 } as const;
-const byteLen = (v: unknown): number => Buffer.byteLength(JSON.stringify(v), "utf8");
+/** Serialized size; a value that cannot be serialized (nested past the stack, from a hostile body) is infinitely large, so it is refused instead of throwing. */
+const byteLen = (v: unknown): number => {
+  try {
+    return Buffer.byteLength(JSON.stringify(v), "utf8");
+  } catch {
+    return Infinity;
+  }
+};
 
 /** A tool definition as the CLI sees it. */
 export const toolDef = z

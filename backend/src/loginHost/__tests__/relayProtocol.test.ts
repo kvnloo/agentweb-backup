@@ -71,6 +71,14 @@ describe("tools manifest bounds", () => {
     expect(run({ tools: [tool("getIssue"), tool("getIssues")] }).success).toBe(true);
     expect(run({ tools: [tool("a", { locked: true })] }).success).toBe(false); // a closed schema: the open set is all there is
   });
+  it("MUTATION TARGET: the limits are pinned by literal (the plan route must be able to offer the whole registry, and nothing unbounded)", () => {
+    expect(TOOL_LIMITS).toEqual({ maxTools: 600, maxTotalBytes: 1024 * 1024, maxDescriptionBytes: 48 * 1024, maxSchemaBytes: 32 * 1024 });
+    expect(run({ tools: Array.from({ length: 600 }, (_, i) => tool(`t${i}`)) }).success).toBe(true);
+    expect(run({ tools: Array.from({ length: 601 }, (_, i) => tool(`t${i}`)) }).success).toBe(false);
+    const answer = (tools: unknown[]) => ROUTES["turn.toolResult"].safeParse({ connectionId: "c1", turnId: "t1", epoch: 1, operationId: "a".repeat(32), content: "r", tools });
+    expect(answer(Array.from({ length: 600 }, (_, i) => tool(`t${i}`))).success).toBe(true);
+    expect(answer(Array.from({ length: 601 }, (_, i) => tool(`t${i}`))).success).toBe(false);
+  });
   it("count, total bytes, description and schema sizes are capped", () => {
     expect(run({ tools: Array.from({ length: TOOL_LIMITS.maxTools }, (_, i) => tool(`t${i}`)) }).success).toBe(true);
     expect(run({ tools: Array.from({ length: TOOL_LIMITS.maxTools + 1 }, (_, i) => tool(`t${i}`)) }).success).toBe(false);
@@ -83,6 +91,15 @@ describe("tools manifest bounds", () => {
     const mid = { type: "object", properties: { p: { type: "string", description: "x".repeat(30_000) } } };
     expect(bad(Array.from({ length: 40 }, (_, i) => tool(`t${i}`, { inputSchema: mid })))).toBe("tools:tools_too_large");
   });
+  it("MUTATION TARGET: a schema nested past the stack is refused as too large (the size check must not throw), in a manifest and in an answer", () => {
+    let deep: unknown = "leaf";
+    for (let i = 0; i < 200_000; i++) deep = [deep];
+    const schema = { type: "object", properties: { p: deep } };
+    expect(() => JSON.stringify(schema)).toThrow(RangeError);
+    expect(bad([tool("a", { inputSchema: schema })])).toBe("tools:tool_schema_too_large");
+    const r = ROUTES["turn.toolResult"].safeParse({ connectionId: "c1", turnId: "t1", epoch: 1, operationId: "a".repeat(32), content: "r", tools: [tool("a", { inputSchema: schema })] });
+    expect(r.success ? "" : r.error.issues[0].message).toBe("tool_schema_too_large");
+  });
   it("a schema must be an object schema; unknown tool fields are refused", () => {
     expect(bad([tool("a", { inputSchema: { type: "string" } })])).toBe("tools:tool_schema_not_object");
     expect(bad([tool("a", { inputSchema: {} })])).toBe("tools:tool_schema_not_object");
@@ -94,6 +111,13 @@ describe("turn.toolResult shape", () => {
   const base = { connectionId: "c1", turnId: "t1", epoch: 1, operationId: "a".repeat(32), content: "r" };
   const parse = (o: Record<string, unknown>) => ROUTES["turn.toolResult"].safeParse({ ...base, ...o });
   const img = (n: number, mimeType = "image/png") => ({ mimeType, data: "A".repeat(n) });
+  it("MUTATION TARGET: the image count is pinned by literal (4 pass, 5 fail), not through the constant it is defined by", () => {
+    expect(parse({ images: Array.from({ length: 4 }, () => img(8)) }).success).toBe(true);
+    expect(parse({ images: Array.from({ length: 5 }, () => img(8)) }).success).toBe(false);
+    expect(IMAGE_LIMITS.maxImages).toBe(4);
+    expect(IMAGE_LIMITS.maxBase64Each).toBe(2_500_000);
+    expect(IMAGE_LIMITS.maxBase64Total).toBe(6_000_000);
+  });
   it("accepts text, isError, up to 4 images of the 4 mime types, and new tool definitions", () => {
     expect(parse({}).success).toBe(true);
     expect(parse({ isError: true }).success).toBe(true);
@@ -207,6 +231,17 @@ describe("per-route body cap (through the socket)", () => {
     expect((await post(sock, "turn.toolResult", body([tool("late")]))).status).toBe(200); // still pending
     expect(rig.script.answers).toHaveLength(1);
     await it.return?.();
+  });
+
+  it("MUTATION TARGET: turn.run over 5 MiB is accepted ONLY in the relay shape (a legacy request keeps protocol 3's cap)", async () => {
+    await signIn(rig, "c1", 1);
+    const prompt = "€".repeat(2_000_000); // ~6 MB as UTF-8
+    const legacy = JSON.stringify({ ...turnReq("c1", 1), prompt });
+    const relay = JSON.stringify({ ...turnReq("c1", 1), bridgeToken: undefined, tools: [tool("search")], prompt });
+    expect(Buffer.byteLength(legacy)).toBeGreaterThan(5 * 1024 * 1024);
+    expect((await post(sock, "turn.run", legacy)).status).toBe(413);
+    const r = await post(sock, "turn.run", relay);
+    expect(r.status).not.toBe(413); // read in full, parsed and run (the point is the cap)
   });
 
   it("mixing bridgeToken and tools answers EINVALID with the reason, end to end", async () => {

@@ -31,6 +31,8 @@ export interface PreflightResult {
   warnings: PreflightFinding[];
   /** Tags the user must map to a CRM field, or confirm Smartlead supplies. */
   tagsToMap: string[];
+  /** The emails would go out with no unsubscribe link (the no_unsubscribe warning). For a campaign already sending, the user must accept that explicitly. */
+  missingUnsubscribe: boolean;
 }
 
 export function preflightSequence(
@@ -47,17 +49,33 @@ export function preflightSequence(
     unsubscribeText?: string | null;
   },
 ): PreflightResult {
-  const result: PreflightResult = { blocks: [], warnings: [], tagsToMap: [] };
+  const result: PreflightResult = { blocks: [], warnings: [], tagsToMap: [], missingUnsubscribe: false };
   // An unknown status is treated like ACTIVE (the stricter rules): the caller refuses it anyway, and this must not throw.
   const status = typeof opts.status === "string" ? opts.status.trim().toUpperCase() : "";
   const active = status === "ACTIVE" || campaignStatusDecision(status) === "refused";
   const add = (finding: PreflightFinding, blockWhenActive: boolean) => (active && blockWhenActive ? result.blocks : result.warnings).push(finding);
+
+  // The unsubscribe setting is a campaign setting, so it is known even when the sequence cannot be read (then no tag can excuse it).
+  const checkUnsubscribe = () => {
+    const seqTags = analysis.readable ? analysis.tags : [];
+    // Smartlead adds its unsubscribe link only when the setting is on AND the footer text is set (verified with received emails, 2026-10-28).
+    // A merge tag named like "unsubscribe" in the sequence is NOT trusted to produce a link when the footer text is empty (unverified).
+    const noTextKnown = opts.unsubscribeText !== undefined && !(typeof opts.unsubscribeText === "string" && opts.unsubscribeText.trim());
+    if (opts.addUnsubscribeTag === false && !seqTags.some(t => /unsub/i.test(t))) {
+      result.warnings.push({ code: "no_unsubscribe", message: "The campaign's unsubscribe tag is off and no unsubscribe link appears in the sequence." });
+      result.missingUnsubscribe = true;
+    } else if (opts.addUnsubscribeTag === true && noTextKnown) {
+      result.warnings.push({ code: "no_unsubscribe", message: "The campaign's unsubscribe option is on, but its unsubscribe text is empty, so Smartlead adds no unsubscribe link to the emails. Set the unsubscribe text in the campaign's settings in Smartlead." });
+      result.missingUnsubscribe = true;
+    }
+  };
 
   if (!analysis.readable) {
     const finding: PreflightFinding = { code: "unreadable", message: "Smartlead's answer about this campaign's sequence could not be read." };
     // Acknowledged: still recorded as a warning, so the run's audit shows the user sent it anyway.
     if (opts.acknowledgeUnreadable) result.warnings.push(finding);
     else add(finding, true);
+    checkUnsubscribe();
     return result; // nothing else can be said about a sequence we cannot read
   }
   if (!analysis.hasContent) add({ code: "empty", message: "This campaign's sequence has no content yet, so nothing useful will be sent until you add it." }, true);
@@ -71,13 +89,6 @@ export function preflightSequence(
     result.tagsToMap.push(tag);
   }
   if (analysis.usesSpintax) result.warnings.push({ code: "spintax", message: "The template uses {a|b} spintax; AgentWeb does not touch it." });
-  // Smartlead adds its unsubscribe link only when the setting is on AND the footer text is set (verified with received emails, 2026-10-28).
-  // A merge tag named like "unsubscribe" in the sequence is NOT trusted to produce a link when the footer text is empty (unverified).
-  const noTextKnown = opts.unsubscribeText !== undefined && !(typeof opts.unsubscribeText === "string" && opts.unsubscribeText.trim());
-  if (opts.addUnsubscribeTag === false && !analysis.tags.some(t => /unsub/i.test(t))) {
-    result.warnings.push({ code: "no_unsubscribe", message: "The campaign's unsubscribe tag is off and no unsubscribe link appears in the sequence." });
-  } else if (opts.addUnsubscribeTag === true && noTextKnown) {
-    result.warnings.push({ code: "no_unsubscribe", message: "The campaign's unsubscribe option is on, but its unsubscribe text is empty, so Smartlead adds no unsubscribe link to the emails. Set the unsubscribe text in the campaign's settings in Smartlead." });
-  }
+  checkUnsubscribe();
   return result;
 }

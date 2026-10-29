@@ -109,8 +109,10 @@ describe("login host server", () => {
     expect((await call(sock, "POST", "/v1/__proto__", {})).json).toEqual({ error: "EINVALID", detail: "route" });
     expect((await call(sock, "POST", "/v1/connection.status", { connectionId: "c1" }, { "content-type": "text/plain" })).status).toBe(415);
     expect((await call(sock, "POST", "/v1/connection.status", "{not json")).json).toMatchObject({ error: "EINVALID", detail: "json" });
-    const big = await call(sock, "POST", "/v1/turn.run", JSON.stringify({ prompt: "x".repeat(9 * 1024 * 1024) }) /* above turn.run's 8 MiB cap */).catch(() => ({ status: 0, text: "", json: undefined }));
-    expect(big.status).toBe(413); // the reply is delivered before the upload is cut
+    const big = await call(sock, "POST", "/v1/turn.run", JSON.stringify({ prompt: "x".repeat(6 * 1024 * 1024) })).catch(() => ({ status: 0, text: "", json: undefined }));
+    expect(big.status).toBe(413); // protocol 3's case, unchanged: a LEGACY-shape turn.run over 5 MiB is refused (the 8 MiB cap is for the relay shape only)
+    const huge = await call(sock, "POST", "/v1/turn.run", JSON.stringify({ prompt: "x".repeat(9 * 1024 * 1024) })).catch(() => ({ status: 0, text: "", json: undefined }));
+    expect(huge.status).toBe(413); // and nothing passes 8 MiB at all
   });
 
   it("protocol 3 request fields: the nonce and onlyIfPending are validated, and nothing else is accepted next to them", async () => {

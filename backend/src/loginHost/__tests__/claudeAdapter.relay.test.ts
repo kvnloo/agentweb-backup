@@ -309,7 +309,7 @@ describe("claude adapter: relay wiring (stubbed socket)", () => {
     roots.push(dir);
     rig.host.open = async (o) => {
       captured = o;
-      return { dir, closed: false, answer: (op) => (answers.push(op), !refuse.on), close: async () => undefined };
+      return { dir, closed: false, answer: (op) => (answers.push(op), !refuse.on), reject: () => false, close: async () => undefined };
     };
     return { rig, opts: () => captured!, answers, refuse };
   }
@@ -405,33 +405,23 @@ describe("claude adapter: lifecycle and memory bounds of the relay", () => {
     await session.close();
   });
 
-  it("MUTATION TARGET: over-long message ids are not recorded at all, so they cannot pin memory (a V8 slice would keep each whole id alive)", async () => {
-    const v8 = await import("v8");
-    const vm = await import("vm");
-    v8.setFlagsFromString("--expose-gc");
-    const gc = vm.runInNewContext("gc") as () => void;
+  it("MUTATION TARGET: over-long message ids are not recorded at all (a V8 slice would pin each whole id); deterministic: asserts the adapter's own structure, not process heap", async () => {
     const rig = makeRig();
     const session = await rig.adapter.openSession(rig.ctx, { connectionId: "conn1", epoch: 1 });
     const s = session as unknown as { visibleTools: Set<string>; streamUses: Array<{ messageId: string }>; noteStreamUse(raw: Record<string, unknown>): void };
     s.visibleTools.add("search");
     const feed = (idChars: number, n: number) => {
       for (let i = 0; i < n; i++) {
-        const id = Buffer.alloc(idChars, 120).toString("latin1") + String(i); // a fresh, flat string per message
+        const id = "x".repeat(idChars) + String(i);
         s.noteStreamUse({ type: "assistant", message: { id, content: [{ type: "tool_use", id: `tu${i}`, name: "mcp__emma__search", input: { i } }] } });
       }
     };
-    // ids just above the cap are not kept (kills a raised cap); kept ids are all within it
-    feed(129, 10);
+    feed(128, 5); // 129 characters with the counter: just over the cap
     expect(s.streamUses).toHaveLength(0);
-    feed(100, 3);
+    feed(4 * 1024 * 1024, 64); // and enormous ones
+    expect(s.streamUses).toHaveLength(0);
+    feed(100, 3); // within the cap: kept, whole (never a slice of something longer)
     expect(s.streamUses.map((u) => u.messageId.length)).toEqual([101, 101, 101]);
-    // 64 messages with 4 MiB ids must not retain hundreds of MB
-    gc();
-    const before = process.memoryUsage().heapUsed + process.memoryUsage().external;
-    feed(4 * 1024 * 1024, 64);
-    gc();
-    const after = process.memoryUsage().heapUsed + process.memoryUsage().external;
-    expect(after - before).toBeLessThan(32 * 1024 * 1024);
     expect(s.streamUses.every((u) => u.messageId.length <= 128)).toBe(true);
     await session.close();
   });

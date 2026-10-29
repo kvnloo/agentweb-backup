@@ -63,7 +63,7 @@ async function withApproval(name: string, args: unknown, ctx = attended()) {
 
 // -- a realistic preview, with a fresh token each time (the real one is single use)
 let tokenCounter: number;
-type PreviewOver = Partial<{ eligible: number; total: number; hash: string; status: string; chosen: number; canStart: boolean; active: boolean; blocks: any[]; tagsToMap: string[]; name: string; fingerprint: string; shared: boolean }>;
+type PreviewOver = Partial<{ eligible: number; total: number; hash: string; status: string; chosen: number; canStart: boolean; active: boolean; blocks: any[]; tagsToMap: string[]; name: string; fingerprint: string; shared: boolean; noUnsub: boolean }>;
 let previewOver: PreviewOver;
 const previewResult = () => {
   const o = previewOver;
@@ -79,6 +79,7 @@ const previewResult = () => {
       cohort: { chosen: o.chosen ?? Math.min(50, eligible), suggested: 50, max: eligible },
       canStart: o.canStart ?? true,
       requiresActiveConfirmation: o.active ?? false,
+      requiresUnsubscribeAcknowledgement: o.noUnsub ?? false,
       fingerprint: o.fingerprint ?? 'fp-1',
       connection: { accountId: 'smartlead-owner', name: 'Mindd Smartlead', shared: o.shared ?? false },
       token: `signed-token-${++tokenCounter}`,
@@ -213,6 +214,22 @@ describe('start_smartlead_push: the approval card', () => {
     const r = await run('start_smartlead_push', { ...PUSH, includeUnverified: true }, attended());
     expect(r.questionDeckPayload[0].question).toContain('ALREADY SENDING (active)');
     expect(r.questionDeckPayload[0].question).toContain('not verified');
+  });
+
+  it('says plainly on the card that a sending campaign has no unsubscribe link, and a draft does not say it', async () => {
+    previewOver = { status: 'ACTIVE', active: true, noUnsub: true };
+    const r = await run('start_smartlead_push', PUSH, attended());
+    expect(r.questionDeckPayload[0].question).toContain('NO UNSUBSCRIBE LINK');
+    expect(r.questionDeckPayload[0].question).toContain('no way to opt out');
+    previewOver = { status: 'DRAFTED', noUnsub: false };
+    const d = await run('start_smartlead_push', PUSH, attended());
+    expect(d.questionDeckPayload[0].question).not.toContain('NO UNSUBSCRIBE LINK');
+  });
+
+  it('an approval of the card with the unsubscribe wording carries the acknowledgement to start', async () => {
+    previewOver = { status: 'ACTIVE', active: true, noUnsub: true };
+    await withApproval('start_smartlead_push', PUSH);
+    expect(svc.start.mock.calls[0][1].acknowledgements).toEqual({ lawfulBasis: true, activeConfirmed: true, noUnsubscribeAccepted: true });
   });
 
   it('states a cohort smaller than the eligible number, and the merge fields the user said Smartlead fills', async () => {
@@ -489,11 +506,11 @@ describe('review hardening', () => {
 });
 
 describe('the approval gate', () => {
-  const base = { userId: 'u', sessionId: 's', listId: 'l', campaignId: 1, campaignStatus: 'DRAFTED', sequenceHash: 'h', cohort: 5, eligible: 5, includeUnverified: false, requiresActiveConfirmation: false, mapping: {}, acknowledgedTags: [] as string[], fingerprint: 'f' };
+  const base = { userId: 'u', sessionId: 's', listId: 'l', campaignId: 1, campaignStatus: 'DRAFTED', sequenceHash: 'h', cohort: 5, eligible: 5, includeUnverified: false, requiresActiveConfirmation: false, requiresUnsubscribeAcknowledgement: false, mapping: {}, acknowledgedTags: [] as string[], fingerprint: 'f' };
   it('every thing the card showed changes the digest, and nothing else does', () => {
     const d = computePushDigest(base);
     expect(computePushDigest({ ...base })).toBe(d);
-    for (const change of [{ userId: 'v' }, { sessionId: 't' }, { listId: 'm' }, { campaignId: 2 }, { campaignStatus: 'ACTIVE' }, { sequenceHash: 'g' }, { cohort: 4 }, { eligible: 6 }, { includeUnverified: true }, { requiresActiveConfirmation: true }, { mapping: { a: 'b' } }, { acknowledgedTags: ['x'] }, { fingerprint: 'g' }]) {
+    for (const change of [{ userId: 'v' }, { sessionId: 't' }, { listId: 'm' }, { campaignId: 2 }, { campaignStatus: 'ACTIVE' }, { sequenceHash: 'g' }, { cohort: 4 }, { eligible: 6 }, { requiresUnsubscribeAcknowledgement: true }, { includeUnverified: true }, { requiresActiveConfirmation: true }, { mapping: { a: 'b' } }, { acknowledgedTags: ['x'] }, { fingerprint: 'g' }]) {
       expect(computePushDigest({ ...base, ...change })).not.toBe(d);
     }
   });

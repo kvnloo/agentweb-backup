@@ -85,6 +85,11 @@ describe("relay: idempotency hash of the manifest", () => {
     const reordered = TOOLS.map((t) => ({ inputSchema: { properties: (t.inputSchema as { properties: object }).properties, type: "object" }, description: t.description, name: t.name }));
     expect(JSON.stringify(reordered)).not.toBe(JSON.stringify(TOOLS));
     expect((await rig.mgr.runTurn({ ...req, tools: reordered as ToolDef[] })).duplicate).toBe(true);
+    // a difference far below the 32 levels canonicalJson looks at is still a different manifest (the idempotency digest covers everything)
+    const nestedDesc = (leaf: string) => ({ ...TOOLS[0], inputSchema: { type: "object", properties: Array.from({ length: 40 }).reduce<Record<string, unknown>>((acc) => ({ x: acc }), { leaf }) } });
+    const k2 = relayReq("c1", { idempotencyKey: "k2", turnId: "tr2" });
+    await drain((await rig.mgr.runTurn({ ...k2, tools: [nestedDesc("one")] })).events!);
+    expect(await code(rig.mgr.runTurn({ ...k2, tools: [nestedDesc("two")] }))).toBe("EEXISTS");
     // a genuinely different manifest still conflicts
     expect(await code(rig.mgr.runTurn({ ...req, tools: [{ ...TOOLS[0], description: "other" }] }))).toBe("EEXISTS");
   });
