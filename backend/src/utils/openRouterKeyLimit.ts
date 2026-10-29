@@ -63,10 +63,20 @@ export function classifyOpenRouterQuotaExhaustion(error: unknown): OpenRouterQuo
 }
 
 /**
- * When to run next: the parsed reset if it is in the future, else the schedule's next
- * natural occurrence (`naturalNext`). Never a short-interval retry.
+ * Longest a quota-exhausted schedule waits before re-checking. The stated reset (or the
+ * schedule's next natural slot) is only an upper bound: an operator can raise the key
+ * limit or top up credits at any time, so a weekly schedule or a reset days away must not
+ * silently skip runs (Opslane P1s on #3841). One hour is still well above the ~30-min
+ * zero-output requeue that ENG-2758 removes, and it does not consume a retry.
+ */
+export const QUOTA_RECHECK_MAX_MS = 60 * 60 * 1000;
+
+/**
+ * When to run next: the earliest of (parsed future reset, else the schedule's next natural
+ * occurrence) and `now + QUOTA_RECHECK_MAX_MS`.
  */
 export function resolveQuotaDeferral(q: OpenRouterQuotaExhaustion, now: Date, naturalNext: Date): string {
-  if (q.resetAt && Date.parse(q.resetAt) > now.getTime()) return q.resetAt;
-  return naturalNext.toISOString();
+  const target = q.resetAt && Date.parse(q.resetAt) > now.getTime() ? Date.parse(q.resetAt) : naturalNext.getTime();
+  const cap = now.getTime() + QUOTA_RECHECK_MAX_MS;
+  return new Date(Math.min(target, cap)).toISOString();
 }
