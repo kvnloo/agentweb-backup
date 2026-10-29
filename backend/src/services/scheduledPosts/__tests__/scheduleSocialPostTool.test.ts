@@ -173,6 +173,10 @@ describe('schedule_social_post tool (ENG-2751)', () => {
       ...deps,
       commands: { ...deps.commands, cancel: async () => { throw new Error('boom'); } },
     };
-    expect(await handleScheduleSocialPost(throwing, { action: 'cancel', postId: 'p1' })).toMatchObject({ success: false, code: 'INTERNAL_ERROR' });
+    const errSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const res = await handleScheduleSocialPost(throwing, { action: 'cancel', postId: 'p1' });
+    expect(res).toMatchObject({ success: false, code: 'INTERNAL_ERROR' });
+    expect(JSON.stringify(res)).not.toMatch(/boom|SQL|table/i);
+    errSpy.mockRestore();
   });
 });

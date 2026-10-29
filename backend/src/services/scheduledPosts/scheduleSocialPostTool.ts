@@ -237,7 +237,10 @@ export async function handleScheduleSocialPost(
       }
     }
   } catch (err) {
-    return fail('INTERNAL_ERROR', `schedule_social_post ${action} failed: ${err instanceof Error ? err.message : String(err)}`, action);
+    // Log internals server-side only; the agent-facing result stays generic so store/driver
+    // error text (SQL, hostnames, table names) never reaches the model or user.
+    console.error(`[schedule_social_post] ${action} failed`, err);
+    return fail('INTERNAL_ERROR', `schedule_social_post ${action} failed due to an internal error. Please try again later.`, action);
   }
   return fail('INVALID_ARGUMENTS', 'Unsupported action.');
 }
