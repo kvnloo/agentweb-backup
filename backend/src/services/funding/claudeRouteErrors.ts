@@ -35,8 +35,8 @@ interface StopInfo {
    * with the user's connected plan or with reaching it. False for Stop/disconnect/organisation/acknowledgement/choice/feature-off cases (the plan is not
    * what failed, or the user decided), a policy block (deliberate), a conversation too large for the plan, a turn that ran out of time (a second run would
    * repeat the cost), a connection that changed under the message, and an AgentWeb restart (just send again). Decided per code here so a new code cannot
-   * default silently. The controller additionally withholds it once the user's message is saved (see claudeStopBody callers): a resend would store the
-   * message twice and could repeat tool side effects of a turn that already ran.
+   * default silently. The controller additionally withholds it once the user's message is saved (see `planStopResponse` in the controller): a resend would
+   * store the message twice and could repeat tool side effects of a turn that already ran. A saved message is offered through `agentWebOffer` instead.
    */
   offerAgentWebCredits: boolean;
 }
@@ -86,6 +86,19 @@ export class ClaudeRouteStopError extends Error {
     this.markNeedsReconnect = opts.markNeedsReconnect === true;
   }
   readonly markNeedsReconnect: boolean;
+}
+
+/**
+ * Whether the turn that raised an error may have run a tool. The backend marks it where it knows (the run's ledger); an error nobody marked is
+ * UNKNOWN, which is treated as "may have run" everywhere this is read. Kept beside the error, never on the wire.
+ */
+const toolsRanOf = new WeakMap<object, boolean>();
+export function markTurnToolsRan(err: unknown, ran: boolean): void {
+  if (typeof err === "object" && err !== null) toolsRanOf.set(err, ran);
+}
+/** True only when the turn is KNOWN to have run no tool at all. */
+export function turnRanNoTools(err: unknown): boolean {
+  return typeof err === "object" && err !== null && toolsRanOf.get(err) === false;
 }
 
 /** The JSON body for the browser. Fixed shape, fixed copy: nothing from the failure itself is included. */

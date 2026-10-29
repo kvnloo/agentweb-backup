@@ -23,8 +23,8 @@ import { isDoNotContact } from "../utils/leadContactStatus";
  * and the background worker. Every outside dependency is injected (smartleadPushRuntime.ts builds the real ones), so it is tested without
  * a network or a database. Results are plain `{ok}` objects that carry an HTTP status; the routes only translate them.
  *
- * For Mindd the push uses ONLY the pusher's own Smartlead connection (a teammate's shared key is never used here): `keyOwnerId` on the
- * run is the seam for turning that on later.
+ * The push uses the pusher's own Smartlead connection, else the one a teammate shared with the org (owner decision 2026-10-28); `keyOwnerId`
+ * on the run records whose connection it was, and the worker and the withdrawal sweep keep using that owner's key.
  */
 
 type Lead = Record<string, any>;
@@ -80,6 +80,13 @@ const MAX_RELEASE_LEADS = 500;
 /** How long a consumed approval is remembered: longer than the token itself, so an expired token can never be claimed again. */
 const TOKEN_MEMORY_SECONDS = 2 * 60 * 60;
 
+/** Which Smartlead account a screen or card is about: its saved name, and whether it is a teammate's shared connection rather than the caller's own. */
+export interface ConnectionView {
+  accountId: string;
+  name: string;
+  shared: boolean;
+}
+
 export interface RunView {
   runId: string;
   status: string;
@@ -127,8 +134,36 @@ export class SmartleadPushService {
     return { ok: true, list };
   }
 
-  /** The pusher's OWN connection only. */
-  private async ownKey(userId: string, accountId?: string): Promise<Result<{ key: Extract<ResolvedSmartlead, { ok: true }> }>> {
+  /** Whether the user may push this list (edit access), and its name; used to refuse before an approval is asked for. */
+  async canUseList(userId: string, listId: unknown): Promise<Result<{ listName: string }>> {
+    return this.guard(async () => {
+      const list = await this.ownList(userId, listId);
+      if (!list.ok) return list;
+      return { ok: true as const, listName: typeof list.list.name === "string" ? list.list.name : "" };
+    });
+  }
+
+  /** A few of the contacts' email addresses, for an approval card that must show WHO it is about. Edit access to the list is required. */
+  async sampleLeads(userId: string, listId: unknown, leadIds: string[], max = 3): Promise<Result<{ emails: string[] }>> {
+    return this.guard(async () => {
+      const list = await this.ownList(userId, listId);
+      if (!list.ok) return list;
+      const emails: string[] = [];
+      for (const id of [...new Set(leadIds)]) {
+        if (emails.length >= max) break;
+        const lead = await this.deps.crm.readLeadConsistent(String(listId), id);
+        if (lead && typeof lead.email === "string" && lead.email.trim()) emails.push(lead.email.trim());
+      }
+      return { ok: true as const, emails };
+    });
+  }
+
+  /**
+   * The Smartlead connection a push uses: the caller's own first, else the single one a teammate shared with the org (owner decision
+   * 2026-10-28: a key is stored per user and shareable among the org, so anybody in the org may push, release and control pushes through
+   * the portal and Emma). Several candidates and none clearly the caller's are never guessed between: the caller picks one by `accountId`.
+   */
+  private async resolveConnection(userId: string, accountId?: string): Promise<Result<{ key: Extract<ResolvedSmartlead, { ok: true }> }>> {
     let resolved = await this.deps.resolveKey(userId, accountId);
     if (!resolved.ok && resolved.reason === "choose") {
       // Several connections: only a single OWN one is unambiguous. Never pick between several (the user chooses by account id).
@@ -137,11 +172,15 @@ export class SmartleadPushService {
     }
     if (!resolved.ok) {
       if (resolved.reason === "not_connected") return fail(409, "not_connected", resolved.message);
-      if (resolved.reason === "choose") return fail(409, "choose_connection", resolved.message);
+      if (resolved.reason === "choose") return fail(409, "choose_connection", resolved.message, resolved.candidates.map(c => ({ accountId: c.accountId, accountName: c.accountName ?? "", shared: c.ownerUserId !== userId })));
       return fail(422, resolved.reason, resolved.message);
     }
-    if (resolved.ownerUserId !== userId) return fail(403, "shared_key_not_supported", "Pushing uses your own Smartlead connection. Connect your Smartlead API key in Settings.");
     return { ok: true, key: resolved };
+  }
+
+  /** What the screen and the approval card say about the connection in use. */
+  private connectionOf(userId: string, key: Extract<ResolvedSmartlead, { ok: true }>): ConnectionView {
+    return { accountId: key.accountId, name: key.accountName, shared: key.ownerUserId !== userId };
   }
 
   private async runFor(userId: string, runId: unknown): Promise<Result<{ run: PushRun }>> {
@@ -182,13 +221,13 @@ export class SmartleadPushService {
 
   // ── preview
 
-  preview(userId: string, body: Record<string, any>): Promise<Result<{ preview: PreviewResult }>> {
+  preview(userId: string, body: Record<string, any>): Promise<Result<{ preview: PreviewResult & { connection: ConnectionView } }>> {
     return this.guard(async () => {
       if (!this.deps.enabled()) return this.disabled();
       const campaignId = Number(body.campaignId);
       const list = await this.ownList(userId, body.listId);
       if (!list.ok) return list;
-      const key = await this.ownKey(userId, typeof body.accountId === "string" ? body.accountId : undefined);
+      const key = await this.resolveConnection(userId, typeof body.accountId === "string" ? body.accountId : undefined);
       if (!key.ok) return key;
       const apiKey = key.key.apiKey;
       if (!Number.isInteger(campaignId) || campaignId <= 0) return fail(400, "bad_request", "A campaign is required.");
@@ -217,7 +256,7 @@ export class SmartleadPushService {
         acknowledgedTags: Array.isArray(body.acknowledgedTags) ? body.acknowledgedTags : undefined, acknowledgeUnreadable: body.acknowledgeUnreadable === true,
         cohort: body.cohort === undefined || body.cohort === null ? undefined : Number(body.cohort),
       }).finally(() => { if (slotHeld) this.previewsRunning--; });
-      return { ok: true, preview };
+      return { ok: true, preview: { ...preview, connection: this.connectionOf(userId, key.key) } };
     });
   }
 
@@ -232,14 +271,15 @@ export class SmartleadPushService {
   }
 
   /** The user's own Smartlead campaigns for the picker, each marked with whether leads can be added to it. */
-  campaigns(userId: string, accountId?: string): Promise<Result<{ campaigns: Array<{ id: number; name: string; status: string; pushable: boolean; needsConfirmation: boolean }> }>> {
+  campaigns(userId: string, accountId?: string): Promise<Result<{ connection: ConnectionView; campaigns: Array<{ id: number; name: string; status: string; pushable: boolean; needsConfirmation: boolean }> }>> {
     return this.guard(async () => {
       if (!this.deps.enabled()) return this.disabled();
-      const key = await this.ownKey(userId, accountId);
+      const key = await this.resolveConnection(userId, accountId);
       if (!key.ok) return key;
       const rows = await this.smartleadCall(key.key, () => this.deps.smartlead.listCampaigns(key.key.apiKey));
       return {
         ok: true,
+        connection: this.connectionOf(userId, key.key),
         campaigns: rows.map(c => {
           const decision = campaignStatusDecision(c.status);
           return { id: c.id, name: c.name, status: c.status, pushable: decision !== "refused", needsConfirmation: decision === "needs_confirmation" };
@@ -309,7 +349,7 @@ export class SmartleadPushService {
 
   // ── start
 
-  start(userId: string, body: Record<string, any>): Promise<Result<{ run: RunView; started: true } | { run: RunView; started: false }>> {
+  start(userId: string, body: Record<string, any>, opts: { channel?: "ui" | "agent" } = {}): Promise<Result<{ run: RunView; started: true } | { run: RunView; started: false }>> {
     return this.guard(async () => {
       if (!this.deps.enabled()) return this.disabled();
       const token = verifyPushToken(this.deps.secret, body.token, this.deps.now().getTime());
@@ -319,7 +359,7 @@ export class SmartleadPushService {
       const list = await this.ownList(userId, token.listId);
       if (!list.ok) return list;
       // The connection the preview used, never one named in the start request.
-      const key = await this.ownKey(userId, token.accountId);
+      const key = await this.resolveConnection(userId, token.accountId);
       if (!key.ok) return key;
       if (key.key.accountId !== token.accountId) return fail(409, "connection_changed", "Your Smartlead connection changed after you previewed. Preview again.");
       const apiKey = key.key.apiKey;
@@ -333,7 +373,7 @@ export class SmartleadPushService {
       if (campaign.status === "ACTIVE" && body.acknowledgements?.activeConfirmed !== true) return fail(400, "active_confirmation_required", "This campaign is already sending. Confirm that leads should start receiving mail at once.");
       const analysis = analyseSequence(await this.smartleadCall(key.key, () => this.deps.smartlead.getSequences(apiKey, token.campaignId)));
       if (analysis.hash !== token.sequenceHash) return fail(409, "sequence_changed", "The campaign's sequence changed after you previewed. Preview again.");
-      const preflight = preflightSequence(analysis, { status: campaign.status, mapping: token.mapping, acknowledgedTags: token.acknowledgedTags, acknowledgeUnreadable: token.acknowledgeUnreadable, addUnsubscribeTag: campaign.addUnsubscribeTag });
+      const preflight = preflightSequence(analysis, { status: campaign.status, mapping: token.mapping, acknowledgedTags: token.acknowledgedTags, acknowledgeUnreadable: token.acknowledgeUnreadable, addUnsubscribeTag: campaign.addUnsubscribeTag, unsubscribeText: campaign.unsubscribeText });
       if (preflight.blocks.length > 0) return fail(409, "blocked", "The campaign cannot be pushed to as it stands.", preflight.blocks);
       if (token.eligible < 1) return fail(400, "nothing_to_push", "There is nothing to push.");
 
@@ -367,7 +407,7 @@ export class SmartleadPushService {
       try {
         started = await this.deps.db.startRun(
         {
-          ownerId: String(list.list.userId ?? userId), pushedBy: userId, keyOwnerId: key.key.ownerUserId, smartleadAccountId: key.key.accountId, channel: "ui", listId: token.listId,
+          ownerId: String(list.list.userId ?? userId), pushedBy: userId, keyOwnerId: key.key.ownerUserId, smartleadAccountId: key.key.accountId, channel: opts.channel === "agent" ? "agent" : "ui", listId: token.listId,
           campaignId: token.campaignId, campaignName: campaign.name, campaignSource: "selected",
           options: {
             includeUnverified: token.includeUnverified, mapping: token.mapping, acknowledgedTags: token.acknowledgedTags, startStatus: token.startStatus, warnings: token.warnings,
@@ -453,8 +493,19 @@ export class SmartleadPushService {
         await this.deps.db.cancelRun(r.run.runId);
         return fail(409, "start_unconfirmed", "This push never finished starting, so it was cancelled. Preview again to push.");
       }
-      // Resuming sends with the pusher's Smartlead connection, so only that person may resume it. Other editors can still pause and cancel.
-      if (userId !== r.run.keyOwnerId) return fail(403, "resume_requires_pusher", "Only the person who started this push can resume it, because it sends with their Smartlead connection. You can cancel it and start again with your own.");
+      // A teammate's push whose connection is no longer shared with that teammate cannot be resumed by anyone (the worker would pause it again at
+      // once): share it again, or cancel and push afresh.
+      if ((await this.sharingVerdict(r.run)) === "connection_unshared") {
+        return fail(409, "connection_unshared", "This push was started through a Smartlead account that is no longer shared with the person who started it. Share it again, or cancel the push.");
+      }
+      // Resuming sends with the connection the push started with: its owner may resume it, and so may anyone in the org that connection is shared
+      // with (they could have started it). Anyone else cannot, but can still pause and cancel.
+      if (userId !== r.run.keyOwnerId) {
+        const usable = await this.deps.resolveKey(userId, r.run.smartleadAccountId);
+        if (!usable.ok || usable.ownerUserId !== r.run.keyOwnerId) {
+          return fail(403, "resume_requires_connection", "This push sends with a Smartlead connection you cannot use, so it cannot be resumed by you. You can cancel it and start again with your own.");
+        }
+      }
       const resumed = await this.deps.db.resumeRun(r.run.runId, this.workerId, r.run.leaseEpoch);
       if (!resumed) return fail(409, "not_paused", "This push was changed by someone else. Reload and try again.");
       this.deps.log(`[SmartleadPush] resumed run=${resumed.runId} by=${userId}`);
@@ -486,6 +537,20 @@ export class SmartleadPushService {
     void this.deps.track(`SmartleadPush:${run.runId}`, this.work(run).finally(() => { this.active--; })).catch(() => undefined);
   }
 
+  /**
+   * For a run a teammate started through a shared connection: null while that connection is still usable by the pusher, else the pause reason.
+   * Un-shared (or resolving to another owner's connection) is `connection_unshared`; an unreadable key is `key_unavailable`; a rejected key is
+   * left to the key owner's own check (the connection is still shared, the key is what failed). The key owner's own run is never refused here.
+   */
+  private async sharingVerdict(run: PushRun): Promise<string | null> {
+    if (run.pushedBy === run.keyOwnerId) return null;
+    const usable = await this.deps.resolveKey(run.pushedBy, run.smartleadAccountId);
+    if (usable.ok) return usable.ownerUserId === run.keyOwnerId ? null : "connection_unshared";
+    if (usable.reason === "key_rejected") return null;
+    if (usable.reason === "key_unreadable") return "key_unavailable";
+    return "connection_unshared";
+  }
+
   /** Runs one run to its end. Never throws: a store error leaves the lease to lapse, and the resumer decides. */
   async work(run: PushRun): Promise<void> {
     try {
@@ -494,6 +559,14 @@ export class SmartleadPushService {
       if (!list || !(await this.deps.canEdit(run.pushedBy, list))) {
         await this.deps.db.pauseRun(run.runId, "access_revoked", run.leaseEpoch);
         this.deps.log(`[SmartleadPush] run=${run.runId} paused: the pusher no longer has edit access to the list`);
+        return;
+      }
+      // A teammate pushing through a shared connection: it must STILL be shared with them. Un-sharing a connection stops the pushes that use it
+      // (the key owner's own resolution below ignores sharing, so it would carry on otherwise); the engine asks again before every batch.
+      const refused = await this.sharingVerdict(run);
+      if (refused) {
+        await this.deps.db.pauseRun(run.runId, refused, run.leaseEpoch);
+        this.deps.log(`[SmartleadPush] run=${run.runId} paused (${refused}): the Smartlead connection is no longer usable by the pusher`);
         return;
       }
       const resolved = await this.deps.resolveKey(run.keyOwnerId, run.smartleadAccountId);
@@ -514,6 +587,7 @@ export class SmartleadPushService {
           getSequences: () => this.deps.smartlead.getSequences(apiKey, run.campaignId),
         },
         isDisabled: () => !this.deps.enabled(),
+        ...(run.pushedBy !== run.keyOwnerId ? { stillPermitted: () => this.sharingVerdict(run) } : {}),
         onSmartleadError: error => { void this.deps.reportFailure(resolved, error).catch(() => undefined); },
         sleep: ms => this.deps.sleep(ms),
         now: () => this.deps.now(),

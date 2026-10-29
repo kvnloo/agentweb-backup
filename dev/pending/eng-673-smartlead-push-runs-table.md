@@ -1,4 +1,4 @@
-## ENG-673: DynamoDB table for Smartlead push runs (PR-B, 2026-10-27)
+## ENG-673: DynamoDB table for Smartlead push runs — PR-B (2026-10-27)
 
 The state store for the background Smartlead push (PR-C builds the engine on it). Nothing calls it yet; the only runtime effect is that the backend creates the table at boot.
 

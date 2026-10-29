@@ -11,6 +11,8 @@ import { decryptPassword } from '../utils/crypto';
 export interface SmartleadCandidate {
   accountId: string;
   ownerUserId: string;
+  /** The Smartlead account's name as saved with the connection, for a picker. */
+  accountName?: string;
 }
 
 export type ResolvedSmartlead =
@@ -75,7 +77,7 @@ export async function resolveSmartlead(userId: string, accountId?: string): Prom
       ok: false,
       reason: 'choose',
       message: 'Several Smartlead connections are available. Choose which one to use.',
-      candidates: all.map(a => ({ accountId: a.account_id, ownerUserId: ownerOf(a) })),
+      candidates: all.map(a => ({ accountId: a.account_id, ownerUserId: ownerOf(a), accountName: a.account_name })),
     };
   }
 

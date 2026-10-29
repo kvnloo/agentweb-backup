@@ -44,6 +44,20 @@ describe("buildPreview (ENG-673)", () => {
     expect(verifyPushToken("test-secret", p.token, Date.parse("2026-10-28T10:00:00Z"))!.eligible).toBe(50);
   });
 
+  it("fingerprints WHICH contacts go to WHICH connection: the same counts with different contacts, another connection or another cohort differ", async () => {
+    const a = Array.from({ length: 5 }, (_, i) => lead(i + 1));
+    const base = await buildPreview(deps(a), req());
+    expect(base.fingerprint).toMatch(/^[0-9a-f]{32}$/);
+    expect((await buildPreview(deps(a), req())).fingerprint).toBe(base.fingerprint); // stable
+    const swapped = [lead(1), lead(2), lead(3), lead(4), lead(6)]; // same count, one different contact
+    expect((await buildPreview(deps(swapped), req())).fingerprint).not.toBe(base.fingerprint);
+    expect((await buildPreview(deps(a), req({ accountId: "smartlead-u2" }))).fingerprint).not.toBe(base.fingerprint);
+    expect((await buildPreview(deps(a), req({ cohort: 3 }))).fingerprint).not.toBe(base.fingerprint);
+    // contacts beyond the cohort do not matter: the cohort is the first N eligible ones
+    const grown = [...a, lead(9)];
+    expect((await buildPreview(deps(grown), req({ cohort: 5 }))).fingerprint).toBe(base.fingerprint);
+  });
+
   it("never offers more than is eligible, and defaults to everything once leads are already in the campaign", async () => {
     const leads = [...Array.from({ length: 80 }, (_, i) => lead(i + 1)), lead(500, { system: { [smartleadMarkerKey(77)]: { state: "pushed" } } })];
     expect((await buildPreview(deps(leads), req({ cohort: 9999 }))).cohort.chosen).toBe(80);
@@ -65,6 +79,14 @@ describe("buildPreview (ENG-673)", () => {
     const mapped = await buildPreview(deps([lead(1, { customFields: { industry: "SaaS", email_validation: { status: "deliverable" } } })], { getSequences: async () => [{ seq_number: 1, subject: "Hi", email_body: "<p>About {{industry}}</p>" }] }), req({ mapping: { industry: "customFields.industry" } }));
     expect(mapped.canStart).toBe(true);
     expect(mapped.samples[0].sends).toMatchObject({ custom_fields: { industry: "SaaS" } });
+  });
+
+  it("warns that no unsubscribe link will be added when the campaign's footer text is empty, and not when it is set", async () => {
+    const base = { id: 77, name: "Q4", status: "DRAFTED", maxLeadsPerDay: 100, addUnsubscribeTag: true };
+    const empty = await buildPreview(deps([lead(1)], {}, { ...base, unsubscribeText: null }), req());
+    expect(empty.preflight.warnings.map(w => w.code)).toContain("no_unsubscribe");
+    const set = await buildPreview(deps([lead(1)], {}, { ...base, unsubscribeText: "Unsubscribe here" }), req());
+    expect(set.preflight.warnings.map(w => w.code)).not.toContain("no_unsubscribe");
   });
 
   it("cannot start with nothing to send", async () => {

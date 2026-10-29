@@ -170,6 +170,34 @@ beforeEach(() => {
   mockUpdateUser.mockResolvedValue({});
 });
 
+describe('ENG-2717 projected batch admission', () => {
+  it('allows a forecast into Extra Usage but blocks one beyond its cap, without writes', async () => {
+    setup({ spendUsd: 95 });
+    expect((await checkTokenUsage(OWNER, { projectedCostMicroUsd: 40 * USD })).allowed).toBe(true);
+    const blocked = await checkTokenUsage(OWNER, { projectedCostMicroUsd: 56 * USD });
+    expect(blocked.allowed).toBe(false);
+    expect(blocked.paygBlock?.reason).toBe('payg_cap_reached');
+    expect(mockUpdateUser).not.toHaveBeenCalled();
+  });
+  it('honors a local spend floor when the ledger has not caught up', async () => {
+    setup({ spendUsd: 95 });
+    expect((await checkTokenUsage(OWNER, {
+      minimumCostUsedMicroUsd: 145 * USD, projectedCostMicroUsd: 6 * USD,
+    })).allowed).toBe(false);
+    expect(mockUpdateUser).not.toHaveBeenCalled();
+  });
+  it('does not grant Extra Usage when opted out', async () => {
+    setup({ spendUsd: 95, user: { paygOverage: payg({ enabled: false }) } });
+    expect((await checkTokenUsage(OWNER, { projectedCostMicroUsd: 6 * USD })).allowed).toBe(false);
+  });
+  it('rejects attempts to persist a hypothetical admission', async () => {
+    setup({ spendUsd: 95 });
+    await expect(checkTokenUsage(OWNER, { recordAdmission: true, projectedCostMicroUsd: USD }))
+      .rejects.toThrow('Invalid read-only usage projection');
+    expect(mockUpdateUser).not.toHaveBeenCalled();
+  });
+});
+
 describe('ENG-668 PAYG — both gates agree', () => {
   it('admits past the pool through BOTH gates when PAYG is on, on the model the customer chose', async () => {
     setup({ spendUsd: 120 });

@@ -26,7 +26,6 @@ jobs:
       partner: ${{ steps.filter.outputs.partner }}
       workflows: ${{ steps.filter.outputs.workflows }}
       ebconfig: ${{ steps.filter.outputs.ebconfig }}
-      relay: ${{ steps.filter.outputs.relay }}
       remotion: ${{ steps.filter.outputs.remotion }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -46,15 +45,9 @@ jobs:
               - 'partner-portal/**'
             workflows:
               - '.github/**'
-            # ENG-1377: local-agent-relay and remotion-lambda had no CI of any
-            # kind — not dormant projects, 20 commits between them in the six
-            # months to 2026-08-21. Under ENG-1463 these get build checks, not
-            # a product test suite (see relay-build/remotion-build below).
-            # Included here for the ENG-743 reason: what gates a project's
-            # merges has to gate its own changes.
-            relay:
-              - 'local-agent-relay/**'
-              - '.github/workflows/tests.yml'
+            # ENG-1377: remotion-lambda had no CI of any kind. Under ENG-1463
+            # it gets a build check, not a product test suite (see
+            # remotion-build below). ENG-381 removed local-agent-relay.
             remotion:
               - 'remotion-lambda/**'
               - '.github/workflows/tests.yml'
@@ -159,47 +152,7 @@ jobs:
           bash .github/scripts/offline-eval-report.test.sh
           bash .github/scripts/dev-md-fragments.test.sh
 
-  # ENG-1377: local-agent-relay and remotion-lambda had no CI of any kind.
-  # Under ENG-1463, GitHub Actions proves buildability, not correctness, so
-  # these are build checks, not the product test suites an earlier version of
-  # this change ran directly in Actions. local-agent-relay's existing 35-test
-  # unittest suite is exactly the kind of thing that now belongs on Atem
-  # instead, if it is ever selected as protecting a retained invariant.
-  relay-build:
-    name: Local agent relay build
-    needs: detect-changes
-    if: needs.detect-changes.outputs.relay == 'true' && github.event.pull_request.draft == false
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    concurrency:
-      group: ${{ github.workflow }}-relay-build-${{ github.ref }}-${{ github.event.pull_request.draft }}
-      cancel-in-progress: true
-    steps:
-      # persist-credentials: false — zizmor, via CodeRabbit on #2552. checkout
-      # defaults to leaving a GITHUB_TOKEN auth header in .git/config, and this
-      # job then builds the PR-authored code (the setuptools build backend runs
-      # from the PR head), which could read the credential back out. Nothing
-      # here needs it afterwards.
-      - name: Checkout PR head
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 1
-          persist-credentials: false
-
-      - name: Setup Python
-        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        with:
-          python-version: '3.11'
-
-      # local-agent-relay is a setuptools package (pyproject.toml), not an
-      # application with its own build script. `pip install .` runs that build
-      # backend end to end — packaging metadata, `src/`-layout module
-      # discovery, dependency resolution — the same class of proof `npm run
-      # build` gives the Node projects here.
-      - name: Build package
-        working-directory: local-agent-relay
-        run: python -m pip install --disable-pip-version-check .
-
+  # ENG-1377 / ENG-1463: build check only, not a product test suite.
   remotion-build:
     name: Remotion lambda build
     needs: detect-changes
