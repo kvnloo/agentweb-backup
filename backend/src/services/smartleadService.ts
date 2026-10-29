@@ -594,11 +594,12 @@ const toStringList = (value: unknown): string[] =>
  * `upload_count` is everything submitted, `total_leads` is what was newly added. A reply with no count we recognise
  * is an error, never "0 added" and never success. Retrying a 429 is safe: a rate-limited request added nothing.
  *
- * DO NOT verify an add by re-reading the campaign's lead listing right afterwards (GET /campaigns/{id}/leads, or Smartlead's MCP list):
- * that listing lags behind a large add. Observed on production on 2026-10-29: after a 450-lead add it showed 1 lead for several minutes
- * (451 were present and the call itself had returned 450 lead ids), while the account-wide lead total and a status-filtered listing
- * (`status=STARTED`) were correct immediately. Trust THIS response (per-lead outcome and ids from `return_lead_ids`); any check or test
- * that counts a campaign's leads must wait for the listing to settle (a few minutes) or use the account total or a status filter.
+ * Do not verify an add by re-reading the campaign's lead listing right afterwards (GET /campaigns/{id}/leads, or Smartlead's MCP list): that
+ * listing can lag behind a large add. Seen once, on production on 2026-10-29: after a 450-lead add (one lead was already in the campaign, so 451
+ * in all) it showed 1 lead for several minutes, while the account-wide lead total and a status-filtered listing (`status=STARTED`) were right
+ * immediately. The cause, the size at which it starts, how long it lasts, and whether the status filter is always reliable are all unconfirmed.
+ * Treat THIS response (per-lead outcome and ids from `return_lead_ids`) as the source of truth; any check or test that counts a campaign's leads
+ * should wait for the listing to settle, or use the account total or a status filter, and say so if it is wrong.
  */
 export async function addLeadsToCampaign(
   apiKey: string,
