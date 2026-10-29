@@ -265,6 +265,8 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
       expect(await e.svc.start("owner", go(p.token, { acknowledgements: { lawfulBasis: true, activeConfirmed: true } }))).toMatchObject({ ok: false, status: 400, code: "unsubscribe_acknowledgement_required" });
       const ok = await e.svc.start("owner", go(p.token, { acknowledgements: { lawfulBasis: true, activeConfirmed: true, noUnsubscribeAccepted: true } }));
       expect(ok).toMatchObject({ ok: true, started: true });
+      // the acceptance is kept in the run's audit
+      expect((await db.getRun((ok as any).run.runId))!.options.acknowledgements).toEqual({ lawfulBasis: true, activeConfirmed: true, noUnsubscribeAccepted: true });
       await drain(e);
 
       const d = env();
