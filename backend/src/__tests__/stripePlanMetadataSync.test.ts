@@ -122,7 +122,7 @@ describe('resolveSubscriptionTypeForPrice', () => {
   it('retrieves an unexpanded product to read its plan label', async () => {
     mockStripe.products.retrieve.mockResolvedValueOnce({ id: 'prod_c', metadata: { plan: 'Max' } });
     await expect(resolveSubscriptionTypeForPrice({ id: 'price_c', product: 'prod_c' })).resolves.toBe('Max');
-    expect(mockStripe.products.retrieve).toHaveBeenCalledWith('prod_c', {}, { timeout: 5000 });
+    expect(mockStripe.products.retrieve).toHaveBeenCalledWith('prod_c', {}, { timeout: 5000, maxNetworkRetries: 0 });
   });
 
   it('propagates a failed product lookup so the webhook can be retried', async () => {

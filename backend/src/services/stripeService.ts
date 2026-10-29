@@ -2283,7 +2283,7 @@ export async function resolveSubscriptionTypeForPrice(
   if (!product && typeof price?.product === 'string') {
     // Let lookup errors propagate: swallowing them would answer the webhook 200
     // (no Stripe retry) and leave the tier stale after a transient Stripe error.
-    product = await getStripeOrThrow().products.retrieve(price.product, {}, { timeout: 5000 });
+    product = await getStripeOrThrow().products.retrieve(price.product, {}, { timeout: 5000, maxNetworkRetries: 0 });
   }
   const fromProduct = await tryPlan(product?.metadata?.plan);
   if (fromProduct) return fromProduct;
