@@ -12,8 +12,8 @@
  *  - Before every POST the run is read strongly and the leads about to be sent are re-read with a consistent read, so an opt-out
  *    recorded a moment ago is honoured, and a run that was paused or canceled sends nothing more.
  *  - Before every batch the campaign and its sequence are read again: a change of status, a missing campaign or an edited sequence
- *    pauses the run for a human decision. Smartlead's own block, unsubscribe and bounce lists still apply (the four override flags
- *    stay false in `addLeadsToCampaign`).
+ *    pauses the run for a human decision. Smartlead's own block, unsubscribe and bounce lists still apply (those override flags
+ *    stay false in `addLeadsToCampaign`), and a lead already in another campaign is skipped and reported, never added a second time.
  *  - A store error (table missing, access denied) propagates: the caller fails closed and nothing more is sent.
  */
 
@@ -298,29 +298,23 @@ export async function executeRun(run: PushRun, deps: EngineDeps): Promise<RunOut
         // Without the per-lead map nothing can be marked, and an unmarked lead would be pushed again: stop for a human.
         if (!result.leads) return await pause("no_lead_map");
 
-        // A lead is marked only when Smartlead names it as in THIS campaign. Entries listed under "existing in other campaigns" were
-        // added here in the one case observed (a draft elsewhere), but are trusted only up to the number Smartlead says it added or
-        // already had, so a lead it skipped cannot be marked as pushed.
+        // A lead is marked only when Smartlead names it as in THIS campaign.
         const idByEmail = new Map<string, string>();
         for (const group of [result.leads.newlyAdded, result.leads.existingInCampaign]) {
           for (const [email, id] of Object.entries(group ?? {})) idByEmail.set(email.toLowerCase(), String(id));
         }
-        // If Smartlead also reports leads it SKIPPED because they sit in other campaigns, the "other campaigns" map cannot be told
-        // apart from them (what that tally counts is unverified), so none of its entries is trusted: those leads stay unmarked.
+        // The push asks Smartlead to SKIP a lead that is already in another of the account's campaigns (verified live 2026-10-28): such a
+        // lead is listed under "existing in other campaigns" and counted in skipped_in_other_campaign_count, and it is NOT in this campaign.
         const otherMapEmails = new Set(Object.keys(result.leads.existingInOtherCampaigns ?? {}).map(e => e.toLowerCase()));
-        if (result.skippedBy.inOtherCampaign === 0) {
-          for (const [email, id] of Object.entries(result.leads.existingInOtherCampaigns ?? {})) {
-            if (idByEmail.size < result.added + result.alreadyInCampaign) idByEmail.set(email.toLowerCase(), String(id));
-          }
-        }
         const invalid = new Set(result.invalidEmails.map(e => e.toLowerCase()));
         const unsubscribed = new Set(result.unsubscribedEmails.map(e => e.toLowerCase()));
 
         const toMark: Array<{ leadId: string; marker: SmartleadMarker }> = [];
         let missing = 0;
-        // Leads left unmarked that Smartlead listed under "other campaigns": whether they were added is unknown, and a lead that WAS
-        // added without a marker would be invisible to the opt-out safeguards, so these are never accepted as "explained".
-        let unresolvedOther = 0;
+        // Leads Smartlead listed under "other campaigns" and did not put in this one: skipped because they are in another campaign, as long
+        // as its own tally covers every one of them. If it does not, whether they were added is unknown, and a lead that WAS added without a
+        // marker would be invisible to the opt-out safeguards, so the run stops for a human.
+        let inOther = 0;
         let namedInvalid = 0;
         let namedUnsubscribed = 0;
         for (const e of toSend) {
@@ -329,7 +323,7 @@ export async function executeRun(run: PushRun, deps: EngineDeps): Promise<RunOut
           if (smartleadLeadId) toMark.push({ leadId: String(e.lead.leadId), marker: buildSmartleadMarker({ runId: run.runId, payloadHash: e.payloadHash, smartleadLeadId, email: e.input.email, now: deps.now() }) });
           else if (invalid.has(email)) { add(skipped, "smartlead_invalid"); namedInvalid++; }
           else if (unsubscribed.has(email)) { add(skipped, "smartlead_unsubscribed"); namedUnsubscribed++; }
-          else if (otherMapEmails.has(email)) unresolvedOther++;
+          else if (otherMapEmails.has(email)) inOther++;
           else missing++;
         }
 
@@ -364,13 +358,29 @@ export async function executeRun(run: PushRun, deps: EngineDeps): Promise<RunOut
         // not recorded as skipped. Stop WITHOUT moving the cursor, so a resume (after the customer raises the limit) rebuilds the
         // batch, skips what is marked and sends the rest.
         if (result.limitExhausted) return await pause("smartlead_lead_limit");
-        if (unresolvedOther > 0) return await pause("other_campaign_leads");
+        // Smartlead added (or found already here) more leads than it NAMED in this campaign: one of them is in the campaign without an id, so
+        // it cannot be marked and the opt-out safeguards could not see it. Never explain that away with a tally: stop (a human looks when
+        // "other campaigns" leads are involved), else retry the batch.
+        const namedNew = Object.keys(result.leads.newlyAdded ?? {}).length;
+        const namedExisting = Object.keys(result.leads.existingInCampaign ?? {}).length;
+        if (result.added > namedNew || result.alreadyInCampaign > namedExisting) {
+          if (inOther > 0) return await pause("other_campaign_leads");
+          const stop = await failBatch();
+          if (stop) return stop;
+          continue;
+        }
+        // ...and only when Smartlead's own tally covers every lead it listed under "other campaigns" (verified live 2026-10-28: a lead that is
+        // in THIS campaign as well is named under existing leads instead, so it is marked above).
+        if (inOther > result.skippedBy.inOtherCampaign) return await pause("other_campaign_leads");
+        if (inOther > 0) add(skipped, "smartlead_in_other_campaign", inOther);
 
         // A lead Smartlead did not name is only acceptable when its own tallies explain it (block list, bounce, duplicate...).
         // Otherwise it may be in the campaign without a marker, which the opt-out safeguards could not see: stop and retry.
         const tallies = result.skippedBy;
         const explained =
-          tallies.blockList + tallies.bounced + tallies.importStopped + tallies.duplicate + tallies.inOtherCampaign +
+          // The other-campaign tally never explains an UNNAMED lead: Smartlead names every lead it skips for that (verified live), so it is matched
+          // to those names above and is not room to excuse anything else.
+          tallies.blockList + tallies.bounced + tallies.importStopped + tallies.duplicate +
           Math.max(0, tallies.unsubscribed - namedUnsubscribed) + Math.max(0, tallies.invalidEmail - namedInvalid);
         if (missing > explained) {
           const stop = await failBatch();

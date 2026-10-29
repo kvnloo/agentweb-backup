@@ -447,6 +447,12 @@ export async function findLeadIdByEmail(apiKey: string, email: string, opts: { m
 export interface SmartleadCampaignDetail extends SmartleadCampaignSummary {
   /** Whether Smartlead adds its own unsubscribe link to each email (the sequence check warns when it does not and the body has none). */
   addUnsubscribeTag?: boolean;
+  /**
+   * The campaign's unsubscribe footer text. Verified with received emails (2026-10-28): Smartlead adds the unsubscribe link (and the
+   * List-Unsubscribe header) only when `add_unsubscribe_tag` is on AND this text is set; with the setting on and the text empty it adds
+   * nothing. `null` here means the campaign has no text; absent means Smartlead did not say.
+   */
+  unsubscribeText?: string | null;
 }
 
 /**
@@ -468,6 +474,7 @@ export async function getCampaign(apiKey: string, campaignId: number, opts: { ma
     status: String(row.status ?? "").toUpperCase(),
     maxLeadsPerDay: asLimit(row.max_leads_per_day),
     ...(typeof row.add_unsubscribe_tag === "boolean" ? { addUnsubscribeTag: row.add_unsubscribe_tag } : {}),
+    ...("unsubscribe_text" in row ? { unsubscribeText: typeof row.unsubscribe_text === "string" ? row.unsubscribe_text : null } : {}),
   };
 }
 
@@ -547,7 +554,8 @@ export interface SmartleadAddLeadsResult {
   limitExhausted: boolean;
   /**
    * Per-lead truth from `return_lead_ids`: lower-cased email to Smartlead lead id, split into leads newly added, leads
-   * already in this campaign, and leads that already existed only in another campaign (those are added to this one too).
+   * already in this campaign, and leads that already exist in another campaign (with ignore_duplicate_leads_in_other_campaign on, those are
+   * skipped and NOT added here; verified live 2026-10-28).
    * Undefined if Smartlead sent no map.
    */
   leads?: {
@@ -576,8 +584,9 @@ const toStringList = (value: unknown): string[] =>
   Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : [];
 
 /**
- * Add up to 400 leads to a campaign the customer already made. The block-list/duplicate overrides are sent as
- * false on purpose (all four overrides in the reference): AgentWeb never asks Smartlead to bypass its own protection.
+ * Add up to 400 leads to a campaign the customer already made. The block-list, unsubscribe-list and bounce-list overrides are sent as
+ * false on purpose: AgentWeb never asks Smartlead to bypass its own protection. Leads already in another campaign are skipped
+ * (ignore_duplicate_leads_in_other_campaign: true), so nobody is emailed by two campaigns.
  * `return_lead_ids` is always on: it makes Smartlead say, per lead, whether it was newly added, was already in this
  * campaign, or already existed in another one, and gives the Smartlead lead id (needed to pause or unsubscribe a lead later).
  *
@@ -612,7 +621,9 @@ export async function addLeadsToCampaign(
       settings: {
         ignore_global_block_list: false,
         ignore_unsubscribe_list: false,
-        ignore_duplicate_leads_in_other_campaign: false,
+        // TRUE skips a lead that is already in another of the account's campaigns (verified live 2026-10-28: skipped_in_other_campaign_count
+        // counts it and the map lists it under existingLeadsInOtherCampaigns); FALSE adds it anyway, so it would be emailed by both campaigns.
+        ignore_duplicate_leads_in_other_campaign: true,
         ignore_community_bounce_list: false,
         return_lead_ids: true,
       },

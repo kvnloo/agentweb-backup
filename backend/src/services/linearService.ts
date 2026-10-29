@@ -604,7 +604,55 @@ function metricValue(value: number | null): string {
   return value == null ? 'n/a' : value.toFixed(4);
 }
 
-function attributionEvidence(outcome: AttributionIssueOutcome, marker: string): string {
+interface LinkedPullRequest {
+  url: string;
+  title: string;
+}
+
+const GITHUB_PR_URL = /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+$/;
+
+function escapeMarkdownLinkText(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/\[/g, '\\[').replace(/\]/g, '\\]');
+}
+
+/** GitHub PRs the Linear GitHub integration attached to the issue (ENG-590). */
+function linkedPullRequests(
+  attachments: Array<{ url?: string | null; title?: string | null } | null> | undefined,
+): LinkedPullRequest[] {
+  const seen = new Set<string>();
+  const prs: LinkedPullRequest[] = [];
+  for (const attachment of attachments ?? []) {
+    const url = attachment?.url?.trim();
+    if (!url || !GITHUB_PR_URL.test(url) || seen.has(url)) continue;
+    seen.add(url);
+    prs.push({ url, title: attachment?.title?.trim() || url });
+  }
+  return prs;
+}
+
+function howToVerify(
+  outcome: AttributionIssueOutcome,
+  prs: LinkedPullRequest[],
+  lift: string,
+): string[] {
+  const delta = `${outcome.metricName}: ${metricValue(outcome.metricBefore)} → ${metricValue(outcome.metricAfter)} (${lift}; n=${outcome.sampleN})`;
+  const prLines = prs.length
+    ? prs.map((pr) => `- Linked PR [${escapeMarkdownLinkText(pr.title)}](${pr.url}); if it shipped this change, follow its "How to test" steps.`)
+    : ['- No linked GitHub PR on this issue; verify against the metric below.'];
+  return [
+    '### How to verify',
+    '',
+    ...prLines,
+    `- Confirm the metric moved as attributed: ${delta}.`,
+    '',
+  ];
+}
+
+function attributionEvidence(
+  outcome: AttributionIssueOutcome,
+  marker: string,
+  prs: LinkedPullRequest[] = [],
+): string {
   const lift = outcome.observedLiftPct == null
     ? 'n/a'
     : `${outcome.observedLiftPct >= 0 ? '+' : ''}${outcome.observedLiftPct.toFixed(1)}%`;
@@ -623,6 +671,7 @@ function attributionEvidence(outcome: AttributionIssueOutcome, marker: string): 
     `- ${outcome.metricName}: ${metricValue(outcome.metricBefore)} → ${metricValue(outcome.metricAfter)} (${lift}; n=${outcome.sampleN})`,
     `- Result: ${state}`,
     '',
+    ...howToVerify(outcome, prs, lift),
     marker,
   ].join('\n');
 }
@@ -644,6 +693,7 @@ export async function recordLoopAttributionOutcome(
     `query($id: String!) {
       issue(id: $id) {
         id
+        attachments(first: 50) { nodes { url title } }
         comments(first: 250, orderBy: createdAt) {
           nodes { body }
           pageInfo { hasNextPage }
@@ -696,7 +746,7 @@ export async function recordLoopAttributionOutcome(
     {
       input: {
         issueId: issue.id,
-        body: attributionEvidence(outcome, marker),
+        body: attributionEvidence(outcome, marker, linkedPullRequests(issue.attachments?.nodes)),
       },
     },
   );
