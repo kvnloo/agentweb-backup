@@ -59,7 +59,8 @@ const ev = (body: Record<string, unknown>): SmartleadEvent => {
   if (!r.ok) throw new Error(r.reason);
   return r.event;
 };
-const reply = (extra: Record<string, unknown> = {}) => ev({ event_type: "EMAIL_REPLY", from_email: "ann@example.com", to_email: "us@ours.com", subject: "Re: Hi", time_replied: "2026-10-29T11:00:00Z", ...extra });
+// the real shape: from_email is the sending mailbox, the contact is sl_lead_email / to_email
+const reply = (extra: Record<string, unknown> = {}) => ev({ event_type: "EMAIL_REPLY", sl_lead_email: "ann@example.com", from_email: "us@ours.com", to_email: "ann@example.com", subject: "Re: Hi", time_replied: "2026-10-29T11:00:00Z", ...extra });
 const unsub = () => ev({ event_type: "LEAD_UNSUBSCRIBED", lead_email: "ann@example.com" });
 const bounce = (extra: Record<string, unknown> = {}) => ev({ event_type: "EMAIL_BOUNCE", lead_email: "ann@example.com", ...extra });
 const ctx = { accountId: ACCOUNT, campaignId: CAMPAIGN };

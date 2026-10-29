@@ -89,8 +89,10 @@ export function parseSmartleadEvent(body: unknown): ParseResult {
   const lead = (b.lead && typeof b.lead === "object" ? b.lead : b.lead_data && typeof b.lead_data === "object" ? b.lead_data : {}) as Record<string, unknown>;
   // The contact's own field names first, then the two mailbox fields in the order that fits the kind (a reply comes FROM the contact;
   // a bounce goes TO them).
-  const order = kind === "reply" ? [b.from_email, b.to_email] : [b.to_email, b.from_email];
-  const candidateEmails = [...new Set([b.lead_email, b.leadEmail, b.email, lead.email, lead.lead_email, ...order].map(email).filter((e): e is string => !!e))].slice(0, 6);
+  // Seen in real payloads (2026-10-29): `from_email` is the SENDING MAILBOX and `to_email` the contact, for a reply as well as an unsubscribe;
+  // a reply also carries the contact as `sl_lead_email` and in `leadCorrespondence`. The mailbox address goes last.
+  const corr = (b.leadCorrespondence && typeof b.leadCorrespondence === "object" ? b.leadCorrespondence : {}) as Record<string, unknown>;
+  const candidateEmails = [...new Set([b.sl_lead_email, b.lead_email, corr.targetLeadEmail, corr.replyReceivedFrom, b.leadEmail, b.email, lead.email, lead.lead_email, b.to_email, b.from_email].map(email).filter((e): e is string => !!e))].slice(0, 6);
   if (candidateEmails.length === 0) return { ok: false, reason: "no_contact_address" };
 
   const occurredAt = isoTime(b.time_replied ?? b.event_timestamp ?? b.timestamp ?? b.time_bounced ?? b.time ?? b.created_at);
@@ -99,17 +101,20 @@ export function parseSmartleadEvent(body: unknown): ParseResult {
   const soft = kind === "bounce" && (/(soft|temporary|transient)/.test(bounceType ?? "") || (!/(hard|permanent)/.test(bounceType ?? "") && !!reasonText && SOFT.test(reasonText) && !HARD.test(reasonText)));
 
   const sequence = str(String(b.sequence_number ?? b.seq_number ?? "")) ?? "";
-  const messageId = str(b.message_id ?? b.messageId ?? b.stats_id ?? b.email_stats_id ?? b.sl_email_lead_id) ?? "";
+  // `event_id` is unique per event and the same on every retry of it (it is also the `webhook-id` header): the best identity there is.
+  const messageId = str(b.event_id ?? b.message_id ?? b.messageId ?? b.stats_id ?? b.email_stats_id ?? b.sl_email_lead_id) ?? "";
   // With no time or id in the payload, the body itself identifies the delivery (a retry sends the same body); otherwise two different replies
   // from one contact would share a key and the second would be dropped as a duplicate.
   const identity = occurredAt || sequence || messageId ? "" : createHash("sha256").update(canonicalJson(body)).digest("hex");
-  const eventKey = createHash("sha256").update(JSON.stringify([kind, campaignId, candidateEmails[0], occurredAt ?? "", sequence, messageId, identity])).digest("hex").slice(0, 32);
+  const eventId = str(b.event_id);
+  // With an event id, ONLY it (plus the kind and campaign) decides the key: nothing else in a retried delivery can change it.
+  const eventKey = createHash("sha256").update(JSON.stringify(eventId ? [kind, campaignId, eventId] : [kind, campaignId, candidateEmails[0], occurredAt ?? "", sequence, messageId, identity])).digest("hex").slice(0, 32);
 
   return {
     ok: true,
     event: {
       kind, campaignId, candidateEmails,
-      ...(kind === "reply" ? { subject: short(b.subject ?? b.email_subject, 200), from: email(b.from_email), to: email(b.to_email) } : {}),
+      ...(kind === "reply" ? { subject: short(b.subject ?? b.email_subject, 200), from: candidateEmails[0], to: email(b.sl_senders_mailbox) ?? email(b.from_email) } : {}),
       ...(occurredAt ? { occurredAt } : {}),
       soft,
       ...(reasonText ? { reason: reasonText } : {}),
