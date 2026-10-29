@@ -31,6 +31,8 @@ export const NOT_IN_RUN_MESSAGE = "That tool is not available in this run.";
 export const BAD_INPUT_MESSAGE = "A tool call needs an object of arguments.";
 export const ARGS_TOO_LARGE_MESSAGE = "The arguments of this call are too large to be processed. The tool was not run; send a smaller request.";
 /** A write whose answer was lost and whose identical retry must not run again (the replay table may no longer hold its result). */
+/** The tool ran but the answer could not be prepared (an internal failure after the bridge returned). */
+export const RAN_NOT_PREPARED_MESSAGE = "The tool ran, but its result could not be prepared. Do not repeat it blindly; check its current state first or ask the user.";
 export const ALREADY_RAN_MESSAGE = "This identical action already ran earlier in this turn, but its result could not be returned. It was NOT run again. Check its current state before doing it again.";
 export const BAD_ARGS_MESSAGE = "The arguments of this call could not be read (they are nested too deeply). The tool was not run.";
 export const DELIVERY_FAILED_MESSAGE = "The tool ran but its result could not be returned to you. Do not repeat it blindly; check its current state first or ask the user.";
@@ -130,6 +132,15 @@ interface Answer {
   tools?: ToolDef[];
   /** For a real execution: how to remember its original text if the worker cannot take the answer. */
   replay?: { key: string; content: string; isError: boolean };
+}
+
+/** What one call has done so far (a record per call, never shared between concurrent calls). */
+interface CallState {
+  /** The bridge's `callTool` returned: the tool ran (or was refused by the bridge). */
+  executed: boolean;
+  key?: string;
+  content?: string;
+  isError?: boolean;
 }
 
 /** The fixed stand-in the host forwards for a stream input nested deeper than 32 levels or larger than 1 MiB (loginHost/relay/bounds.ts `boundedValue`). */
@@ -410,13 +421,26 @@ export class RelayToolDispatcher {
     this.progress("start", name);
     try {
       let answer: Answer;
+      const st: CallState = { executed: false };
       try {
-        answer = await this.decide(op, ev, name);
+        answer = await this.decide(op, ev, name, st);
       } catch {
-        // Something unforeseen before the tool was handed over (a hostile input that cannot be serialized, say). The operation must still be answered:
-        // an unanswered one holds the worker's single pending slot until the turn's deadline.
-        this.log("decide_failed");
-        answer = { content: STOPPED_MESSAGE, isError: true };
+        // Something unforeseen. The operation must still be answered: an unanswered one holds the worker's single pending slot until the turn's deadline.
+        if (!st.executed) {
+          // Before the bridge was called nothing ran (a hostile input that cannot be serialized, say).
+          this.log("decide_failed");
+          answer = { content: STOPPED_MESSAGE, isError: true };
+        } else {
+          // AFTER the bridge returned: the tool ran. Never say "not run" (the model would repeat a write). Treat it like a lost result: the persisted result
+          // is noted, the outcome is remembered so an identical retry is answered from it or refused, never run again.
+          this.log("decide_failed_after_run");
+          this.lost.add(op);
+          if (st.key !== undefined) {
+            this.lostWrites.add(st.key); // its kind is unknown here: treated as a write
+            if (this.replays.size < MAX_REPLAYS && st.content !== undefined) this.replays.set(st.key, { content: truncateUtf8(st.content, MAX_REPLAY_BYTES), isError: st.isError === true });
+          }
+          answer = { content: RAN_NOT_PREPARED_MESSAGE, isError: true };
+        }
       }
       await this.deliver(op, answer);
     } finally {
@@ -425,7 +449,7 @@ export class RelayToolDispatcher {
   }
 
   /** Runs the call (or refuses it) and returns the answer to send. */
-  private async decide(op: string, ev: RelayCallEvent, name: string): Promise<Answer> {
+  private async decide(op: string, ev: RelayCallEvent, name: string, st: CallState): Promise<Answer> {
     const refuse = (message: string): Answer => ({ content: message, isError: true });
     if (this.o.isStopped()) return refuse(STOPPED_MESSAGE);
     if (this.o.softDeadlineAt !== undefined && this.now() >= this.o.softDeadlineAt) return refuse(SOFT_DEADLINE_MESSAGE);
@@ -449,6 +473,7 @@ export class RelayToolDispatcher {
     } catch {
       return refuse(BAD_ARGS_MESSAGE); // input that cannot be canonicalized (absurd nesting, say): nothing ran, and the model is told why
     }
+    st.key = key;
     const replay = this.replays.get(key);
     if (replay === undefined && this.lostWrites.has(key)) return refuse(ALREADY_RAN_MESSAGE); // its result is no longer held: still never run a second time
     if (replay !== undefined) {
@@ -485,6 +510,9 @@ export class RelayToolDispatcher {
       this.log(err instanceof ToolBridgeAuthError ? "run_ended" : "bridge_failed");
       return refuse(STOPPED_MESSAGE);
     }
+    st.executed = true; // from here on the tool has run: an unforeseen throw must not be reported as "not run"
+    st.content = result.content;
+    st.isError = result.isError === true;
     // The first halt of the turn fixes which message's siblings may still be admitted, and which announcements count (those recorded before this answer
     // goes back). Set BEFORE the post: the worker may hand the next call over before our post returns.
     if (this.halt === undefined && this.o.isHaltingCall(op)) this.halt = { batch: ann ? ann.batch : -1, cutoff: this.announceSeq };

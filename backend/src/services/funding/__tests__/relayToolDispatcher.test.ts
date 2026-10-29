@@ -4,7 +4,8 @@
  */
 import { IMAGE_LIMITS } from '../../../loginHost/protocol';
 import { LoginHostError, ToolResultLostError } from '../loginHostClient';
-import { ALREADY_RAN_MESSAGE, ARGS_TOO_LARGE_MESSAGE, BAD_ARGS_MESSAGE, DELIVERY_FAILED_MESSAGE, NOT_IN_RUN_MESSAGE, REPLAY_NOTE, UNLOADABLE_NOTE, RelayToolDispatcher, SOFT_DEADLINE_MESSAGE, STOPPED_MESSAGE, type RelayCallEvent } from '../relayToolDispatcher';
+import { ALREADY_RAN_MESSAGE, RAN_NOT_PREPARED_MESSAGE, RESULT_LOST_NOTE, ARGS_TOO_LARGE_MESSAGE, BAD_ARGS_MESSAGE, DELIVERY_FAILED_MESSAGE, NOT_IN_RUN_MESSAGE, REPLAY_NOTE, UNLOADABLE_NOTE, RelayToolDispatcher, SOFT_DEADLINE_MESSAGE, STOPPED_MESSAGE, type RelayCallEvent } from '../relayToolDispatcher';
+import { annotateLostResults } from '../claudeCodeBackend';
 import { ToolBridge, type BridgeExecuteOutcome, type ToolBridgeDeps } from '../toolBridge';
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -29,6 +30,8 @@ interface Opts {
   announceWaitMs?: number;
   /** Makes the bridge wait on this before a halt is recorded durably (the halting call is answered only after it). */
   persistGate?: Promise<void>;
+  /** Makes the dispatcher's own bookkeeping throw AFTER the bridge returned (an unforeseen failure). */
+  throwAfterRun?: boolean;
   /** Runs after every bridge.listTools the dispatcher makes (with the call count). */
   onList?: (n: number) => void;
   /** Tools that appear in the run's list after the named tool executes (default: install_skills adds late_tool). */
@@ -97,7 +100,10 @@ function rig(o: Opts = {}) {
     maxCalls: o.maxCalls,
     onLimitTripped: () => void tripped.count++,
     isHalted: () => bridge.isHalted('s1', 'u1'),
-    isHaltingCall: (op) => bridge.takeHalts('u1', 's1').some((h) => h.callId === op),
+    isHaltingCall: (op) => {
+      if (o.throwAfterRun) throw new Error('boom after the tool ran');
+      return bridge.takeHalts('u1', 's1').some((h) => h.callId === op);
+    },
     announceWaitMs: o.announceWaitMs ?? 0,
     sleep: async () => undefined,
     onCall: (phase, name) => void phases.push(`${phase}:${name}`),
@@ -724,6 +730,54 @@ describe('RelayToolDispatcher', () => {
       const keys = [...((t.d as any).lostWrites as Set<string>)];
       expect(keys).toHaveLength(1);
       expect(keys[0].length).toBeLessThan(100);
+    });
+  });
+
+  describe('an unforeseen failure AFTER the tool ran is never reported as "not run"', () => {
+    it('answers that the tool ran, marks the call lost (persisted note), and never runs an identical retry again', async () => {
+      const t = rig({ throwAfterRun: true });
+      t.d.start(t.ev('op-1', 'save_note', { n: 1 }));
+      await t.d.settle(1_000);
+      expect(t.executed).toHaveLength(1);
+      expect(t.posts[0]).toMatchObject({ operationId: 'op-1', isError: true, content: RAN_NOT_PREPARED_MESSAGE });
+      expect(t.posts[0].content).not.toBe(STOPPED_MESSAGE);
+      expect(t.d.lostCallIds().has('op-1')).toBe(true);
+      expect(t.d.deliveredCallIds().has('op-1')).toBe(false); // so the persisted tool result carries the lost note
+      expect(errors.join('\n')).toContain('decide_failed_after_run');
+      t.d.start(t.ev('op-2', 'save_note', { n: 1 }, 'later'));
+      await t.d.settle(1_000);
+      expect(t.executed).toHaveLength(1); // never run again
+      expect(t.posts[1].content).toContain(REPLAY_NOTE); // answered from what the first run returned
+    });
+
+    it('the persisted tool result of that call carries the result-lost note', async () => {
+      const t = rig({ throwAfterRun: true });
+      t.d.start(t.ev('op-1', 'save_note', { n: 1 }));
+      await t.d.settle(1_000);
+      const delivered = t.d.deliveredCallIds();
+      const ledger = annotateLostResults(t.bridge.takeLedger('r1').records, (id) => !delivered.has(id));
+      expect(ledger[0].toolMessageContent).toContain(RESULT_LOST_NOTE);
+    });
+
+    it('a retry is refused (not run) once the replay table is full', async () => {
+      const t = rig({ throwAfterRun: true });
+      for (let i = 1; i <= 10; i++) {
+        t.d.start(t.ev(`op-${i}`, 'save_note', { i }, `m${i}`));
+        await t.d.settle(1_000);
+      }
+      t.d.start(t.ev('retry-10', 'save_note', { i: 10 }, 'r'));
+      await t.d.settle(1_000);
+      expect(t.executed).toHaveLength(10);
+      expect(t.posts.find((p) => p.operationId === 'retry-10')).toMatchObject({ isError: true, content: ALREADY_RAN_MESSAGE });
+    });
+
+    it('a throw BEFORE the bridge call still says the call was not run, and does not mark it lost', async () => {
+      const t = rig({ stopped: () => { throw new Error('boom before the bridge'); } });
+      t.d.start(t.ev('op-1', 'save_note', { n: 1 }));
+      await t.d.settle(1_000);
+      expect(t.executed).toEqual([]);
+      expect(t.posts[0]).toMatchObject({ isError: true, content: STOPPED_MESSAGE });
+      expect(t.d.lostCallIds().size).toBe(0);
     });
   });
 
