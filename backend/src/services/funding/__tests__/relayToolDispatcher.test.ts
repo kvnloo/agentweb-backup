@@ -84,7 +84,6 @@ function rig(o: Opts = {}) {
         return v;
       },
       noteToolUse: (r, c, n, i, m) => bridge.noteToolUse(r, c, n, i, m),
-      noteToolResult: (r) => bridge.noteToolResult(r),
       takeLedger: (r) => bridge.takeLedger(r),
     },
     manifest: { open: new Set(['search', 'save_note', 'install_skills', 'send_email']) },
@@ -492,6 +491,104 @@ describe('RelayToolDispatcher', () => {
     });
   });
 
+  describe('the host\'s truncation marker for stream inputs ({"_truncated":"depth"|"size"})', () => {
+    const marker = (kind: 'depth' | 'size' = 'depth') => ({ _truncated: kind });
+
+    it('a real call whose arguments look exactly like the marker is never matched to a marker announcement (it does not collapse into it)', async () => {
+      const t = rig();
+      t.d.noteStreamUse('mcp__aw__save_note', marker());
+      t.d.noteStreamUse('mcp__aw__save_note', marker());
+      t.d.start(t.ev('op-1', 'save_note', marker()));
+      await t.d.settle(1_000);
+      t.d.start(t.ev('op-2', 'save_note', marker()));
+      await t.d.settle(1_000);
+      expect(t.executed).toHaveLength(2); // matched by content they would have been one message and collapsed
+    });
+
+    it('a marker-announced call does not wait for an announcement that will never match', async () => {
+      const t = rig({ announceWaitMs: 5_000 });
+      t.d.noteStreamUse('mcp__aw__save_note', marker('size'));
+      const t0 = Date.now();
+      t.d.start(t.ev('op-1', 'save_note', { note: 'x'.repeat(100) }));
+      await t.d.settle(4_000);
+      expect(Date.now() - t0).toBeLessThan(1_000);
+      expect(t.executed).toHaveLength(1);
+    });
+
+    it('a halted batch with a truncated member stays usable: real siblings are admitted, the truncated one falls back to its own group and is refused', async () => {
+      const t = rig({ confirm: ['send_email'] });
+      t.d.noteStreamUse('mcp__aw__send_email', { to: 'a' });
+      t.d.noteStreamUse('mcp__aw__send_email', marker('depth')); // the 2nd preview had a huge or absurdly nested input
+      t.d.noteStreamUse('mcp__aw__send_email', { to: 'c' });
+      t.d.start(t.ev('op-1', 'send_email', { to: 'a' }));
+      await t.d.settle(1_000);
+      t.d.start(t.ev('op-2', 'send_email', { to: 'b-huge' })); // its stream input was truncated
+      await t.d.settle(1_000);
+      t.d.start(t.ev('op-3', 'send_email', { to: 'c' }));
+      await t.d.settle(1_000);
+      expect(t.executed.map((e) => e.args.to)).toEqual(['a', 'c']);
+      expect(t.posts[1]).toMatchObject({ operationId: 'op-2', isError: true });
+      expect(t.bridge.takeHalts('u1', 's1')).toHaveLength(2);
+    });
+
+    it('a marker is consumed once: two calls, one marker', async () => {
+      const t = rig({ confirm: ['send_email'], announceWaitMs: 0 });
+      t.d.noteStreamUse('mcp__aw__send_email', { to: 'a' });
+      t.d.noteStreamUse('mcp__aw__send_email', marker());
+      t.d.start(t.ev('op-1', 'send_email', { to: 'a' }));
+      await t.d.settle(1_000);
+      t.d.start(t.ev('op-2', 'send_email', { to: 'big-1' }));
+      t.d.start(t.ev('op-3', 'send_email', { to: 'big-2' }));
+      await t.d.settle(1_000);
+      expect(t.executed).toHaveLength(1);
+    });
+
+    it('a marker is consumed ONCE: the second unmatched call waits for its own announcement like any other', async () => {
+      const t = rig({ confirm: ['send_email'], announceWaitMs: 400 });
+      t.d.noteStreamUse('mcp__aw__send_email', marker());
+      t.d.start(t.ev('op-1', 'send_email', { to: 'big-1' })); // takes the marker, no wait
+      await t.d.settle(1_000);
+      const t0 = Date.now();
+      t.d.start(t.ev('op-2', 'send_email', { to: 'big-2' })); // no marker left: waits out the announcement window
+      await t.d.settle(2_000);
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(300);
+    });
+
+    it('a stand-in with another value is not a marker', async () => {
+      const t = rig();
+      t.d.noteStreamUse('mcp__aw__search', { _truncated: 'other' });
+      t.d.noteStreamUse('mcp__aw__search', { _truncated: 'other' });
+      t.d.start(t.ev('op-1', 'search', { _truncated: 'other' }));
+      await t.d.settle(1_000);
+      t.d.start(t.ev('op-2', 'search', { _truncated: 'other' }));
+      await t.d.settle(1_000);
+      expect(t.executed).toHaveLength(1); // matched by content, one message, collapsed
+    });
+
+    it('lookalikes are not markers: extra keys, other values, arrays and non-objects are recorded by content as usual', async () => {
+      const t = rig();
+      const lookalikes: unknown[] = [{ _truncated: 'depth', extra: 1 }, { _truncated: 'other' }, { _truncated: 1 }, ['_truncated'], null, 'depth'];
+      for (const l of lookalikes) t.d.noteStreamUse('mcp__aw__search', l);
+      t.d.noteStreamUse('mcp__aw__search', { _truncated: 'depth', extra: 1 }); // announced twice: one message, two identical calls
+      expect(() => t.d.noteStreamUse('mcp__aw__search', undefined)).not.toThrow();
+      t.d.start(t.ev('op-1', 'search', { _truncated: 'depth', extra: 1 }));
+      await t.d.settle(1_000);
+      t.d.start(t.ev('op-2', 'search', { _truncated: 'depth', extra: 1 }));
+      await t.d.settle(1_000);
+      expect(t.executed).toHaveLength(1); // matched by content to the same message and collapsed
+    });
+
+    it('an unserializable or absurdly deep announcement never throws', () => {
+      const t = rig();
+      let deep: unknown = {};
+      for (let i = 0; i < 20000; i++) deep = { a: deep };
+      expect(() => t.d.noteStreamUse('mcp__aw__search', deep)).not.toThrow();
+      const cyc: Record<string, unknown> = {};
+      cyc.self = cyc;
+      expect(() => t.d.noteStreamUse('mcp__aw__search', cyc)).not.toThrow();
+    });
+  });
+
   describe('B1: batched confirmations (parity with AgentWeb: one deck for every preview of one model message)', () => {
     it('five previews announced in one message: all five run and all five halts are recorded', async () => {
       const t = rig({ confirm: ['send_email'] });
@@ -533,11 +630,11 @@ describe('RelayToolDispatcher', () => {
       t.d.noteStreamUse('mcp__aw__send_email', { to: 'a' }); // batch 2
       t.d.start(t.ev('op-1', 'send_email', { to: 'a' }));
       await t.d.settle(1_000);
-      const closed = jest.spyOn(t.bridge, 'noteToolResult');
+      const announced = jest.spyOn(t.bridge, 'noteToolUse');
       t.d.start(t.ev('op-2', 'save_note', { n: 1 }));
       await t.d.settle(1_000);
       expect(t.executed.map((e) => e.name)).toEqual(['send_email']);
-      expect(closed).toHaveBeenCalled(); // the halted group was closed before it was refused
+      expect(announced).not.toHaveBeenCalled(); // not announced to the bridge at all: it refuses it, and the halted group is left untouched
     });
 
     it('a call announced in an EARLIER message is not a sibling of the halt', async () => {
@@ -732,7 +829,6 @@ describe('RelayToolDispatcher', () => {
           callTool: async (_t, c) => { calls.push(c.name); if (first) { first = false; return { content: 'Too busy, try again.', isError: true }; } return { content: 'saved', isError: false }; },
           listTools: async () => [{ name: 'save_note', readOnly: false }],
           noteToolUse: () => undefined,
-          noteToolResult: () => undefined,
           takeLedger: () => ({ records: [{ toolCallId: 'op-1', kind: 'refused' }], truncated: 0 }), // what the real bridge records for a refusal
         },
         manifest: { open: new Set(['save_note']) },
@@ -907,7 +1003,7 @@ describe('RelayToolDispatcher: an unforeseen failure still answers the operation
       ids: IDS,
       runId: 'r1',
       token: 't',
-      bridge: { callTool: async () => ({ content: 'x', isError: false }), listTools: async () => [], noteToolUse: () => undefined, noteToolResult: () => undefined, takeLedger: () => ({ records: [], truncated: 0 }) },
+      bridge: { callTool: async () => ({ content: 'x', isError: false }), listTools: async () => [], noteToolUse: () => undefined, takeLedger: () => ({ records: [], truncated: 0 }) },
       manifest: { open: new Set(['search']) },
       isStopped: () => false,
       isHalted: () => false,

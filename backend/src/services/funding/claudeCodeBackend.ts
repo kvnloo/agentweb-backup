@@ -363,7 +363,7 @@ export class ClaudeCodeBackend {
               ids: { connectionId, turnId: runId, epoch }, // this closure is the only source of identity; an event's fields are never read for it
               runId,
               token,
-              bridge: { callTool: (t, c, r, o) => d.bridge.callTool!(t, c, r, o), listTools: (t, r) => d.bridge.listTools!(t, r), noteToolUse: (r, c, n, i, m) => d.bridge.noteToolUse(r, c, n, i, m), noteToolResult: (r) => d.bridge.noteToolResult(r), takeLedger: (r) => d.bridge.takeLedger(r) },
+              bridge: { callTool: (t, c, r, o) => d.bridge.callTool!(t, c, r, o), listTools: (t, r) => d.bridge.listTools!(t, r), noteToolUse: (r, c, n, i, m) => d.bridge.noteToolUse(r, c, n, i, m), takeLedger: (r) => d.bridge.takeLedger(r) },
               manifest: { open: built.manifest.open },
               isStopped: () => seen.stopped || ac.signal.aborted,
               softDeadlineAt: d.now() + deadlineMs - lead,

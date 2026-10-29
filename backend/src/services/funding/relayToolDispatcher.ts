@@ -57,8 +57,6 @@ export interface RelayBridgePort {
   callTool(token: string, call: { name: string; args: Record<string, unknown>; callId?: string }, runId: string, opts?: { signal?: AbortSignal }): Promise<BridgeCallResult>;
   listTools(token: string, runId: string): Promise<BridgeListedTool[]>;
   noteToolUse(runId: string, callId: string, name: string, input: unknown, messageId?: string): void;
-  /** Closes the current call group (what a tool-result in the stream does on the HTTP path). */
-  noteToolResult(runId: string): void;
   /** Non-clearing snapshot of the run's ledger (to learn whether a call really ran). */
   takeLedger(runId: string): { records: Array<{ toolCallId: string; kind: string }>; truncated: number };
 }
@@ -106,6 +104,14 @@ interface Answer {
   tools?: ToolDef[];
   /** For a real execution: how to remember its original text if the worker cannot take the answer. */
   replay?: { key: string; content: string; isError: boolean };
+}
+
+/** The fixed stand-in the host forwards for a stream input nested deeper than 32 levels or larger than 1 MiB (loginHost/relay/bounds.ts `boundedValue`). */
+function isTruncationMarker(v: unknown): boolean {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
+  const keys = Object.keys(v);
+  const t = (v as { _truncated?: unknown })._truncated;
+  return keys.length === 1 && keys[0] === "_truncated" && (t === "depth" || t === "size");
 }
 
 /** A bounded, canonical key for a tool input (key order does not matter). */
@@ -158,7 +164,7 @@ export class RelayToolDispatcher {
    * canonical form of the input) in BATCHES: consecutive tool-uses with no tool-result between them are one model message. A relayed call is grouped by
    * the announcement it matches, NOT by the worker's message id (which a worker can get wrong, or forge).
    */
-  private readonly announced: Array<{ seq: number; batch: number; name: string; key: string; claimed: boolean }> = [];
+  private readonly announced: Array<{ seq: number; batch: number; name: string; key: string; claimed: boolean; marker?: true }> = [];
   private announceSeq = 0;
   private batch = 0;
   private batchOpen = false;
@@ -234,7 +240,11 @@ export class RelayToolDispatcher {
         this.batch++;
         this.batchOpen = true;
       }
-      this.announced.push({ seq: ++this.announceSeq, batch: this.batch, name, key: argKey(input), claimed: false });
+      // The host replaces a stream input that is too deep or too large with a fixed marker. A marker says "a call of this tool was announced" and nothing
+      // about its arguments, so it can NEVER be matched to a real call by content (a real call whose arguments look exactly like the marker included):
+      // it carries no key, and is only consumed by a call that found no exact announcement (which then runs in a group of its own).
+      if (isTruncationMarker(input)) this.announced.push({ seq: ++this.announceSeq, batch: this.batch, name, key: "", claimed: false, marker: true });
+      else this.announced.push({ seq: ++this.announceSeq, batch: this.batch, name, key: argKey(input), claimed: false });
       if (this.announced.length > MAX_ANNOUNCED) this.announced.splice(0, this.announced.length - MAX_ANNOUNCED);
       for (const wake of [...this.announceWaiters]) wake();
     } catch {
@@ -257,6 +267,13 @@ export class RelayToolDispatcher {
   private async claimOrWait(name: string, key: string): Promise<{ seq: number; batch: number } | undefined> {
     const first = this.claim(name, key);
     if (first) return first;
+    // No exact announcement. If the stream announced a call of this tool with a truncated input, this is probably it: do not wait for an announcement that
+    // will never match, and do not group it (its own group: after a halt it is refused, never admitted on a guess).
+    const marker = this.announced.find((a) => !a.claimed && a.marker === true && a.name === name);
+    if (marker) {
+      marker.claimed = true;
+      return undefined;
+    }
     const waitMs = this.o.announceWaitMs ?? DEFAULT_ANNOUNCE_WAIT_MS;
     if (waitMs <= 0) return undefined;
     // A real-time bound (not the injectable deadline clock): one timer for the whole wait, each announcement re-checks the claim.
@@ -399,18 +416,16 @@ export class RelayToolDispatcher {
     // cannot match: the stream announced the message before the answer existed (a confirm needs the approval token that only the answer carries).
     const ann = await this.claimOrWait(name, argsKey);
     if (this.o.isStopped()) return refuse(STOPPED_MESSAGE);
-    let messageId: string;
-    if (this.o.isHalted()) {
-      const sibling = ann !== undefined && this.halt !== undefined && ann.batch === this.halt.batch && ann.seq <= this.halt.cutoff;
-      if (sibling) messageId = `msg-${ann.batch}`;
-      else {
-        this.o.bridge.noteToolResult(this.o.runId); // closes the halted group: this call cannot join it
-        messageId = `call-${op}`;
-      }
-    } else messageId = ann ? `msg-${ann.batch}` : `call-${op}`;
+    // After a halt a call that is not an announced sibling of the halted message is NOT announced to the bridge at all (neither `noteToolUse` nor a group
+    // close): the bridge admits only announced siblings, so it refuses this call, and the halted group's cursor is left alone, so the REAL siblings that follow
+    // (a call whose stream input was truncated falls in here) are still admitted: the batch stays usable.
+    const halted = this.o.isHalted();
+    const sibling = halted && ann !== undefined && this.halt !== undefined && ann.batch === this.halt.batch && ann.seq <= this.halt.cutoff;
+    const announce = !halted || sibling;
+    const messageId = sibling ? `msg-${ann!.batch}` : !halted && ann ? `msg-${ann.batch}` : `call-${op}`;
     let result: BridgeCallResult;
     try {
-      this.o.bridge.noteToolUse(this.o.runId, op, name, ev.input, messageId);
+      if (announce) this.o.bridge.noteToolUse(this.o.runId, op, name, ev.input, messageId);
       result = await this.o.bridge.callTool(this.o.token, { name, args: ev.input, callId: op }, this.o.runId);
     } catch (err) {
       // A closed run (Stop, revoke, kill switch) rejects here: nothing executed.

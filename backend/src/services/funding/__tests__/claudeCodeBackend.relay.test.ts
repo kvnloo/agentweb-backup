@@ -614,6 +614,31 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
       expect(r.content).toContain('confirm');
     });
 
+    it('the host\'s final behaviour: a preview whose stream input was truncated ({"_truncated":"depth"}) falls back to its own group; the rest of the batch still builds one confirmation', async () => {
+      const t = setup({ confirm: ['send_email'] });
+      const gates = Array.from({ length: 3 }, () => gate());
+      rig.script.turnEvents = [
+        use(0, 'send_email', { to: 'p0' }),
+        use(1, 'send_email', { _truncated: 'depth' }), // what the host forwards for an absurdly nested or huge input
+        use(2, 'send_email', { to: 'p2' }),
+        call('op-0', 'send_email', { to: 'p0' }),
+        { wait: gates[0].wait },
+        call('op-1', 'send_email', { to: 'p1-huge' }),
+        { wait: gates[1].wait },
+        call('op-2', 'send_email', { to: 'p2' }),
+        { wait: gates[2].wait },
+        result('Please confirm.'),
+      ];
+      const run = t.backend().run(t.params());
+      for (let i = 0; i < 3; i++) {
+        await waitFor(() => answers().length === i + 1);
+        gates[i].open();
+      }
+      await run;
+      expect(t.executions.map((e) => e.args.to)).toEqual(['p0', 'p2']);
+      expect(answers()[1].answer).toMatchObject({ kind: 'tool-result', ok: false });
+    });
+
     it('a read of the same message after the halted preview runs', async () => {
       const t = setup({ confirm: ['send_email'] });
       const g1 = gate();
