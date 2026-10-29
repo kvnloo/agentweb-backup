@@ -17,7 +17,7 @@ const TOOLS_FILE = process.env.AW_RELAY_TOOLS || "";
 const SHIM_TO_HOST_MAX = 1024 * 1024; // must match RELAY_FRAME_LIMITS.shimToHostBytes
 const HOST_TO_SHIM_MAX = 8 * 1024 * 1024; // must match RELAY_FRAME_LIMITS.hostToShimBytes
 // Timings. The host drops a connection that is silent for 15 s, so the shim pings every 5 s; while a call is pending it sends a progress notification to the CLI
-// at most every 15 s as a keepalive; after an unlock it waits up to 3 s for the CLI to re-list the tools. The environment can only SHORTEN them (tests).
+// at most every 15 s as a keepalive; after tools arrive with an answer it waits up to 3 s for the CLI to re-list the tools. The environment can only SHORTEN them (tests).
 const ms = (name, dflt, min) => {
   const v = Number(process.env[name]);
   return Number.isInteger(v) && v >= min && v <= dflt ? v : dflt;
@@ -43,10 +43,17 @@ try {
 } catch {
   die("E_TOOLS");
 }
-const visible = new Set(manifest.filter((t) => t && t.locked !== true).map((t) => t.name));
-const known = new Map(manifest.map((t) => [t.name, t]));
-const listing = () =>
-  manifest.filter((t) => visible.has(t.name)).map((t) => ({ name: t.name, description: String(t.description || ""), inputSchema: t.inputSchema }));
+// The tools the model can call right now: the turn's open set, plus whatever answers add (the host validated and bounded them; the shim only guards its own shape).
+const MAX_TOOLS = 600; // must match TOOL_LIMITS.maxTools
+const tools = new Map();
+const addTool = (t) => {
+  if (!t || typeof t.name !== "string" || tools.has(t.name) || tools.size >= MAX_TOOLS || !t.inputSchema || typeof t.inputSchema !== "object") return false;
+  tools.set(t.name, { name: t.name, description: String(t.description || ""), inputSchema: t.inputSchema });
+  return true;
+};
+for (const t of manifest) addTool(t);
+const visible = { has: (n) => tools.has(n) };
+const listing = () => [...tools.values()];
 
 // ── stdout (MCP) ──
 const send = (o) => process.stdout.write(JSON.stringify(o) + "\n");
@@ -126,7 +133,7 @@ async function ensureConnected() {
   return !!sock;
 }
 
-// ── tools/list bookkeeping (for the unlock wait) ──
+// ── tools/list bookkeeping (for the wait after new tools) ──
 let listCount = 0;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -173,9 +180,9 @@ async function callTool(name, args, meta) {
   const content = [{ type: "text", text: typeof f.content === "string" ? f.content : "" }];
   if (Array.isArray(f.images)) for (const img of f.images) if (img && typeof img.data === "string" && typeof img.mimeType === "string") content.push({ type: "image", data: img.data, mimeType: img.mimeType });
   const out = { content, isError: f.isError === true };
-  const unlock = Array.isArray(f.unlock) ? f.unlock.filter((n) => typeof n === "string" && known.has(n) && !visible.has(n)) : [];
-  if (unlock.length) {
-    for (const n of unlock) visible.add(n);
+  // Tools that became available because of this call (a skill install): add them, tell the CLI, and WAIT for its re-list before returning the result.
+  const added = Array.isArray(f.tools) ? f.tools.filter(addTool) : [];
+  if (added.length) {
     const before = listCount;
     send({ jsonrpc: "2.0", method: "notifications/tools/list_changed" });
     const t0 = Date.now();

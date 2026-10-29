@@ -15,9 +15,9 @@ afterAll(() => roots.forEach((r) => rmSync(r, { recursive: true, force: true }))
 const procs: ChildProcessWithoutNullStreams[] = [];
 afterEach(() => procs.splice(0).forEach((p) => p.kill("SIGKILL")));
 
+const LATER: ToolDef = { name: "later", description: "Arrives with an answer", inputSchema: { type: "object", properties: {} } };
 const TOOLS: ToolDef[] = [
   { name: "echo", description: "Echo", inputSchema: { type: "object", properties: { q: { type: "string" } } } },
-  { name: "later", description: "Locked", inputSchema: { type: "object", properties: {} }, locked: true },
 ];
 
 async function rig(env: Record<string, string> = {}, limits: { idleMs?: number } = {}, tools: unknown = TOOLS) {
@@ -27,7 +27,7 @@ async function rig(env: Record<string, string> = {}, limits: { idleMs?: number }
   const host = new RelayHost({ layout, ownByUid: false, limits });
   host.init();
   const calls: RelayCall[] = [];
-  const visible = new Set(TOOLS.filter((t) => !t.locked).map((t) => t.name));
+  const visible = new Set(TOOLS.map((t) => t.name));
   const ep: RelayEndpoint = await host.open({ uid: 400_001, identity: { connectionId: "c", epoch: 1, turnId: "t" }, onCall: (c) => void calls.push(c), allowTool: (n) => visible.has(n), callTimeoutMs: () => 10_000 });
   mkdirSync(join(root, "cfg"));
   const toolsFile = join(root, "cfg", "tools.json");
@@ -62,7 +62,7 @@ async function until(cond: () => boolean, ms = 4000): Promise<void> {
 }
 
 describe("relay shim: MCP surface", () => {
-  it("initialize advertises listChanged; tools/list shows only unlocked tools; ping works; unknown methods are errors", async () => {
+  it("initialize advertises listChanged; tools/list shows the open set; ping works; unknown methods are errors", async () => {
     const r = await rig();
     const init = await r.rpc("initialize", { protocolVersion: "2025-03-26" });
     expect(init.result).toMatchObject({ protocolVersion: "2025-03-26", capabilities: { tools: { listChanged: true } } });
@@ -113,7 +113,7 @@ describe("relay shim: MCP surface", () => {
     await r.ep.close();
   });
 
-  it("a tool that is not listed (locked, or unknown) is refused locally and never sent", async () => {
+  it("a tool that is not listed (not yet arrived, or unknown) is refused locally and never sent", async () => {
     const r = await rig();
     await r.rpc("initialize", {});
     for (const name of ["later", "nope", 5, undefined]) {
@@ -152,7 +152,7 @@ describe("relay shim: MCP surface", () => {
   });
 });
 
-describe("relay shim: keepalive and unlock", () => {
+describe("relay shim: keepalive and tools that arrive with an answer", () => {
   it("while a call is pending the shim pings the host (so a long call outlives the 15 s idle rule) and sends progress notifications to the CLI", async () => {
     const r = await rig({ AW_RELAY_PING_MS: "50", AW_RELAY_PROGRESS_MS: "80" }, { idleMs: 300 });
     await r.rpc("initialize", {});
@@ -187,13 +187,13 @@ describe("relay shim: keepalive and unlock", () => {
     await r.ep.close();
   });
 
-  it("an unlock adds the tool, sends tools/list_changed and WAITS for the CLI's re-list before returning the result", async () => {
+  it("tools carried by an answer are added, announced with tools/list_changed and WAITS for the CLI's re-list before returning the result", async () => {
     const r = await rig({ AW_RELAY_RELIST_MS: "3000" });
     await r.rpc("initialize", {});
     const p = r.rpc("tools/call", { name: "echo", arguments: {} });
     await until(() => r.calls.length === 1);
-    r.visible.add("later"); // what the adapter does when it forwards an unlock
-    r.ep.answer(r.calls[0].operationId, { content: "installed", unlock: ["later"] });
+    r.visible.add("later"); // what the adapter does when it forwards new tools
+    r.ep.answer(r.calls[0].operationId, { content: "installed", tools: [LATER] });
     await until(() => r.out.some((o) => o.method === "notifications/tools/list_changed"));
     await new Promise((res) => setTimeout(res, 150));
     expect(r.out.some((o) => o.id === 2)).toBe(false); // still waiting for the re-list
@@ -209,18 +209,29 @@ describe("relay shim: keepalive and unlock", () => {
     const t0 = Date.now();
     const p = r.rpc("tools/call", { name: "echo", arguments: {} });
     await until(() => r.calls.length === 1);
-    r.ep.answer(r.calls[0].operationId, { content: "installed", unlock: ["later"] });
+    r.ep.answer(r.calls[0].operationId, { content: "installed", tools: [LATER] });
     expect((await p).result.content[0].text).toBe("installed");
     expect(Date.now() - t0).toBeLessThan(2500);
     await r.ep.close();
   });
 
-  it("an unlock naming a tool outside the manifest, or one already visible, changes nothing", async () => {
+  it("MUTATION TARGET: the shim never lists more than 600 tools, however many arrive", async () => {
+    const r = await rig({ AW_RELAY_RELIST_MS: "50" });
+    await r.rpc("initialize", {});
+    const p = r.rpc("tools/call", { name: "echo", arguments: {} });
+    await until(() => r.calls.length === 1);
+    r.ep.answer(r.calls[0].operationId, { content: "x", tools: Array.from({ length: 700 }, (_, i) => ({ name: `t${i}`, description: "d", inputSchema: { type: "object" } })) });
+    await p;
+    expect((await r.rpc("tools/list")).result.tools).toHaveLength(600);
+    await r.ep.close();
+  });
+
+  it("a tool that is already visible, or a malformed one, changes nothing (no list_changed, no wait)", async () => {
     const r = await rig({ AW_RELAY_RELIST_MS: "100" });
     await r.rpc("initialize", {});
     const p = r.rpc("tools/call", { name: "echo", arguments: {} });
     await until(() => r.calls.length === 1);
-    r.ep.answer(r.calls[0].operationId, { content: "x", unlock: ["ghost", "echo"] });
+    r.ep.answer(r.calls[0].operationId, { content: "x", tools: [TOOLS[0], { name: 5 }, null, { name: "nope" }] as never });
     await p;
     expect(r.out.some((o) => o.method === "notifications/tools/list_changed")).toBe(false);
     expect((await r.rpc("tools/list")).result.tools.map((t: { name: string }) => t.name)).toEqual(["echo"]);

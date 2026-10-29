@@ -35,6 +35,7 @@ import type {
   SpawnSpec,
   SubscriptionProviderAdapter,
 } from "../adapter";
+import { qualifiedToolPrefix, RELAY_MCP_SERVER_NAME } from "../protocol";
 import { RELAY_SOCKET_IN_UNIT } from "../ports/unitArgs";
 import { canonicalJson } from "../relay/canonical";
 import { createHash } from "crypto";
@@ -83,7 +84,7 @@ const DEFAULTS = {
   authConfirmTimeoutMs: 4_000,
   basePath: "/usr/local/bin:/usr/bin:/bin",
   unitTmp: "/tmp",
-  mcpServerName: "emma",
+  mcpServerName: RELAY_MCP_SERVER_NAME,
   startTimeoutMs: 30_000,
   completeTimeoutMs: 30_000,
   shortCommandTimeoutMs: 30_000,
@@ -233,6 +234,8 @@ export class ClaudeAdapter implements SubscriptionProviderAdapter {
 
   constructor(config: ClaudeAdapterConfig) {
     this.cfg = { ...DEFAULTS, ...stripUndefined(config) } as ClaudeAdapter["cfg"];
+    // The protocol's name cap assumes the default server name; a longer one would let a name through that the model API refuses once qualified.
+    if (qualifiedToolPrefix(this.cfg.mcpServerName).length > qualifiedToolPrefix(RELAY_MCP_SERVER_NAME).length) throw new Error("claude adapter: mcpServerName longer than the protocol's tool-name cap allows");
     this.models = new Set(config.models ?? DEFAULTS.models);
     this.relay = !!config.relay;
   }
@@ -506,8 +509,8 @@ class ClaudeSession implements ProviderSession {
    */
   answer(operationId: string, answer: ServerRequestAnswer): boolean {
     if (!this.relayEp || answer.kind !== "tool-result") return false;
-    const sent = this.relayEp.answer(operationId, { content: answer.content, isError: !answer.ok, ...(answer.images ? { images: answer.images } : {}), ...(answer.unlock ? { unlock: answer.unlock } : {}) });
-    if (sent) for (const n of answer.unlock ?? []) this.visibleTools.add(n);
+    const sent = this.relayEp.answer(operationId, { content: answer.content, isError: !answer.ok, ...(answer.images ? { images: answer.images } : {}), ...(answer.tools ? { tools: answer.tools } : {}) });
+    if (sent) for (const t of answer.tools ?? []) this.visibleTools.add(t.name); // the shim lists them now: the host must accept calls to them
     return sent;
   }
 
@@ -520,8 +523,6 @@ class ClaudeSession implements ProviderSession {
   private relayEp: RelayEndpoint | undefined;
   /** The in-flight relay.open(): a close that arrives meanwhile waits for it, so the endpoint it creates is never left behind. */
   private relayOpening: Promise<RelayEndpoint> | undefined;
-  /** Names the manifest offers (the stream is hostile input: only these are ever remembered). */
-  private readonly manifestNames = new Set<string>();
   private readonly visibleTools = new Set<string>();
 
   /** A tool_use block from the stream (informational ONLY: it is never executed or registered, it just tells us which model message a relayed call belongs to). */
@@ -529,11 +530,11 @@ class ClaudeSession implements ProviderSession {
     if (raw.type !== "assistant") return;
     const msg = raw.message as { id?: unknown; content?: unknown } | undefined;
     if (!msg || typeof msg.id !== "string" || !Array.isArray(msg.content)) return;
-    const prefix = `mcp__${this.cfg.mcpServerName}__`;
+    const prefix = qualifiedToolPrefix(this.cfg.mcpServerName);
     for (const b of msg.content as Array<Record<string, unknown>>) {
       if (b?.type !== "tool_use" || typeof b.name !== "string" || !b.name.startsWith(prefix)) continue;
       const name = b.name.slice(prefix.length);
-      if (!this.manifestNames.has(name)) continue; // a tool the turn does not offer can never be a relayed call
+      if (!this.visibleTools.has(name)) continue; // the stream is hostile input: only tools the turn can call are ever remembered
       // Bounded memory whatever the CLI prints: a fixed-size digest of the input (not the input), a truncated id, and at most MAX_STREAM_USES entries (oldest dropped).
       // An over-long id is NOT recorded (never sliced: in V8 a slice keeps the whole original string alive). The call then gets a unique unmatched id.
       if (msg.id.length > MAX_MESSAGE_ID_CHARS) continue;
@@ -592,9 +593,8 @@ class ClaudeSession implements ProviderSession {
       if (input.relay) {
         const relay = this.cfg.relay;
         if (!relay) throw Object.assign(new Error("relay_unavailable"), { code: "open_failed" });
-        for (const t of input.relay.tools) if (t.locked !== true) this.visibleTools.add(t.name);
+        for (const t of input.relay.tools) this.visibleTools.add(t.name);
         // The per-turn socket exists (and accepts) BEFORE the unit starts. Identity is fixed here, from the session, never from a frame.
-        for (const t of input.relay.tools) this.manifestNames.add(t.name);
         this.relayOpening = relay.host.open({
           uid: this.ctx.uid,
           identity: { connectionId: this.spec.connectionId, epoch: this.spec.epoch, turnId: input.turnId },

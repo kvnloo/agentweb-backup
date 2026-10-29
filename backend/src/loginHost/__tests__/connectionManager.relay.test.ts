@@ -2,7 +2,7 @@
  * ENG-2113: the host core's side of the tool relay: the dual request shape, the `tool-call` operation, turn.toolResult's typed "result lost" answers,
  * the per-turn call clock and the double-execution conformance rule.
  */
-import { HostError, type ToolDef } from "../protocol";
+import { HostError, TOOL_LIMITS, type ToolDef } from "../protocol";
 import { drain, makeRig, signIn, turnReq, type Rig } from "./helpers";
 
 async function code<T>(p: Promise<T> | T): Promise<string> {
@@ -19,8 +19,10 @@ const flush = async () => {
 
 const TOOLS: ToolDef[] = [
   { name: "search", description: "Search", inputSchema: { type: "object", properties: {} } },
-  { name: "late_tool", description: "Only after install_skills", inputSchema: { type: "object", properties: {} }, locked: true },
 ];
+/** Arrives with an answer (a skill install). */
+const LATE: ToolDef = { name: "late_tool", description: "Appears after install_skills", inputSchema: { type: "object", properties: {} } };
+const def = (name: string, extra: Partial<ToolDef> = {}): ToolDef => ({ name, description: "d", inputSchema: { type: "object", properties: {} }, ...extra });
 const relayReq = (conn: string, extra: Record<string, unknown> = {}) => ({ ...turnReq(conn, 1, { turnId: "tr1", ...extra }), bridgeToken: undefined, tools: TOOLS });
 const call = (op: string, messageId = "m1") => ({ type: "tool-call" as const, operationId: op, messageId, name: "search", input: { q: "x" } });
 const answer = (rig: Rig, op: string, extra: Record<string, unknown> = {}, conn = "c1") =>
@@ -63,7 +65,7 @@ describe("relay: dual request shape", () => {
     rig.script.turnEvents = [{ type: "result", ok: true, text: "x" }];
     await drain((await rig.mgr.runTurn(req)).events!);
     expect((await rig.mgr.runTurn({ ...req })).duplicate).toBe(true);
-    expect(await code(rig.mgr.runTurn({ ...req, tools: [TOOLS[0]] }))).toBe("EEXISTS");
+    expect(await code(rig.mgr.runTurn({ ...req, tools: [{ ...TOOLS[0], description: "different" }] }))).toBe("EEXISTS");
     // A legacy request's hash has no tools component, so a turn recorded before this change still de-duplicates after an upgrade.
     const legacy = turnReq("c1", 1, { idempotencyKey: "k2", turnId: "tr2" });
     await drain((await rig.mgr.runTurn(legacy)).events!);
@@ -80,11 +82,11 @@ describe("relay: idempotency hash of the manifest", () => {
     rig.script.turnEvents = [{ type: "result", ok: true, text: "x" }];
     const req = relayReq("c1", { idempotencyKey: "k1" });
     await drain((await rig.mgr.runTurn(req)).events!);
-    const reordered = TOOLS.map((t) => ({ locked: t.locked, inputSchema: { properties: (t.inputSchema as { properties: object }).properties, type: "object" }, description: t.description, name: t.name }));
+    const reordered = TOOLS.map((t) => ({ inputSchema: { properties: (t.inputSchema as { properties: object }).properties, type: "object" }, description: t.description, name: t.name }));
     expect(JSON.stringify(reordered)).not.toBe(JSON.stringify(TOOLS));
     expect((await rig.mgr.runTurn({ ...req, tools: reordered as ToolDef[] })).duplicate).toBe(true);
     // a genuinely different manifest still conflicts
-    expect(await code(rig.mgr.runTurn({ ...req, tools: [{ ...TOOLS[0], description: "other" }, TOOLS[1]] }))).toBe("EEXISTS");
+    expect(await code(rig.mgr.runTurn({ ...req, tools: [{ ...TOOLS[0], description: "other" }] }))).toBe("EEXISTS");
   });
 });
 
@@ -102,12 +104,12 @@ describe("relay: tool-call operations and turn.toolResult", () => {
     return it;
   }
 
-  it("a tool-call is answerable once; the provider gets the content, error flag, images and unlock", async () => {
+  it("a tool-call is answerable once; the provider gets the content, error flag, images and new tools", async () => {
     const it = await start();
     const image = { mimeType: "image/png" as const, data: "AAAA" };
-    expect(await code(answer(rig, "op1", { isError: true, images: [image], unlock: ["late_tool"] }))).toBe("OK");
+    expect(await code(answer(rig, "op1", { isError: true, images: [image], tools: [LATE] }))).toBe("OK");
     expect(rig.script.answers).toHaveLength(1);
-    expect(rig.script.answers[0]).toEqual({ operationId: "op1", answer: { kind: "tool-result", ok: false, content: "r", images: [image], unlock: ["late_tool"] } });
+    expect(rig.script.answers[0]).toEqual({ operationId: "op1", answer: { kind: "tool-result", ok: false, content: "r", images: [image], tools: [LATE] } });
     expect(await code(answer(rig, "op1"))).toBe("ENOTFOUND:operation_unknown"); // once
     await it.return?.();
   });
@@ -173,67 +175,131 @@ describe("relay: tool-call operations and turn.toolResult", () => {
     await it.return?.();
   });
 
-  it("unlock: only names the manifest marked locked, and a refused answer does not consume the operation (the backend can retry)", async () => {
-    const it = await start();
-    expect(await code(answer(rig, "op1", { unlock: ["search"] }))).toBe("EINVALID:unlock_unknown_tool"); // not locked
-    expect(await code(answer(rig, "op1", { unlock: ["nope"] }))).toBe("EINVALID:unlock_unknown_tool"); // not in the manifest
-    expect(rig.script.answers).toHaveLength(0);
-    expect(await code(answer(rig, "op1", { unlock: ["late_tool"] }))).toBe("OK");
+  it("tools that arrive with an answer are added to the turn's visible set and handed to the provider with the definitions", async () => {
+    const it = await start({}, [call("op1"), call("op2"), { wait: new Promise<void>(() => undefined) }, { type: "result", ok: true, text: "x" }]);
+    await it.next();
+    expect(await code(answer(rig, "op1", { tools: [LATE] }))).toBe("OK");
+    expect(rig.script.answers[0].answer).toEqual({ kind: "tool-result", ok: true, content: "r", tools: [LATE] });
     await it.return?.();
   });
 
-  it("an unlocked name cannot be unlocked twice", async () => {
-    const it = await start({}, [call("op1"), call("op2"), { wait: new Promise<void>(() => undefined) }, { type: "result", ok: true, text: "x" }]);
+  it("IDEMPOTENT: a tool that is already visible (open at the start, or added earlier) is a no-op; the provider is not sent it again", async () => {
+    const it = await start({}, [call("op1"), call("op2"), call("op3"), { wait: new Promise<void>(() => undefined) }, { type: "result", ok: true, text: "x" }]);
     await it.next();
-    expect(await code(answer(rig, "op1", { unlock: ["late_tool"] }))).toBe("OK");
-    // already unlocked: a harmless no-op (a backend retry), the operation is answered, and the provider is NOT told to unlock it again
-    expect(await code(answer(rig, "op2", { unlock: ["late_tool"] }))).toBe("OK");
+    await it.next();
+    expect(await code(answer(rig, "op1", { tools: [LATE, TOOLS[0]] }))).toBe("OK"); // search is open already
+    expect(await code(answer(rig, "op2", { tools: [LATE, { ...LATE, description: "changed" }] }))).toBe("OK"); // repeat of a visible name: first definition stays
+    expect(await code(answer(rig, "op3", { tools: [TOOLS[0]] }))).toBe("OK");
     expect(rig.script.answers.map((a) => a.answer)).toEqual([
-      { kind: "tool-result", ok: true, content: "r", unlock: ["late_tool"] },
+      { kind: "tool-result", ok: true, content: "r", tools: [LATE] },
+      { kind: "tool-result", ok: true, content: "r" },
       { kind: "tool-result", ok: true, content: "r" },
     ]);
     await it.return?.();
   });
 
-  it("a name the manifest never marked locked is still refused even after other unlocks (validated against the locked set from the start)", async () => {
+  it("MUTATION TARGET: an exact repeat WITHIN one answer is sent once (not twice to the shim, not double-counted)", async () => {
+    const it = await start();
+    expect(await code(answer(rig, "op1", { tools: [LATE, { ...LATE }, LATE] }))).toBe("OK");
+    expect(rig.script.answers[0].answer).toEqual({ kind: "tool-result", ok: true, content: "r", tools: [LATE] });
+    await it.return?.();
+  });
+
+  it("MUTATION TARGET: a name that differs only in case from a visible tool is refused (tools_invalid) and the operation stays pending", async () => {
+    const it = await start();
+    expect(await code(answer(rig, "op1", { tools: [def("SEARCH")] }))).toBe("EINVALID:tools_invalid"); // open at the start
+    expect(rig.script.answers).toHaveLength(0);
+    expect(await code(answer(rig, "op1", { tools: [LATE] }))).toBe("OK"); // the operation was still pending: the backend retries without it
+    await it.return?.();
+  });
+
+  it("a case variant of a tool ADDED by an earlier answer is refused too", async () => {
     const it = await start({}, [call("op1"), call("op2"), { wait: new Promise<void>(() => undefined) }, { type: "result", ok: true, text: "x" }]);
     await it.next();
-    expect(await code(answer(rig, "op1", { unlock: ["late_tool"] }))).toBe("OK");
-    expect(await code(answer(rig, "op2", { unlock: ["search", "late_tool"] }))).toBe("EINVALID:unlock_unknown_tool");
-    expect(await code(answer(rig, "op2", { unlock: ["late_tool", "late_tool"] }))).toBe("OK"); // duplicates in one answer are fine too
+    expect(await code(answer(rig, "op1", { tools: [LATE] }))).toBe("OK");
+    expect(await code(answer(rig, "op2", { tools: [def("LATE_TOOL")] }))).toBe("EINVALID:tools_invalid");
     await it.return?.();
   });
 
-  it("a refused answer followed by the same unlock again (backend retry) works once the problem is fixed", async () => {
-    const it = await start();
-    const big = "a".repeat(2_400_000);
-    const images = Array.from({ length: 3 }, () => ({ mimeType: "image/png" as const, data: big }));
-    expect(await code(answer(rig, "op1", { content: "é".repeat(2_000_000), images, unlock: ["late_tool"] }))).toBe("EINVALID:result_too_large");
-    expect(await code(answer(rig, "op1", { unlock: ["late_tool"] }))).toBe("OK");
-    expect(rig.script.answers[0].answer).toMatchObject({ unlock: ["late_tool"] });
-    await it.return?.();
-  });
-
-  it("a result for a turn that has FINISHED is ENOTFOUND with a detail, never a bare ENOTFOUND, and differs from an aborted turn (ESTALE)", async () => {
+  it("MUTATION TARGET: the cumulative caps cover everything visible so far (count and bytes); a refused answer leaves the operation pending and the set unchanged", async () => {
+    const open = Array.from({ length: TOOL_LIMITS.maxTools - 1 }, (_, i) => def(`open_${i}`));
     rig = makeRig({ adapter: { relay: true } });
     await signIn(rig, "c1", 1);
-    rig.script.turnEvents = [call("op1"), { type: "result", ok: true, text: "x" }];
-    await drain((await rig.mgr.runTurn(relayReq("c1"))).events!);
-    expect(await code(answer(rig, "op1"))).toBe("ENOTFOUND:operation_unknown");
-    expect(await code(answer(rig, "op1"))).not.toBe("ENOTFOUND");
+    rig.script.turnEvents = [call("op1"), call("op2"), { wait: new Promise<void>(() => undefined) }, { type: "result", ok: true, text: "x" }];
+    const it = (await rig.mgr.runTurn({ ...relayReq("c1"), tools: open })).events![Symbol.asyncIterator]();
+    await it.next();
+    expect(await code(answer(rig, "op1", { tools: [def("one_more"), def("two_more")] }))).toBe("EINVALID:tools_limit"); // 600 + 1
+    expect(rig.script.answers).toHaveLength(0);
+    expect(await code(answer(rig, "op1", { tools: [def("one_more")] }))).toBe("OK"); // exactly at the cap
+    await it.next();
+    expect(await code(answer(rig, "op2", { tools: [def("over")] }))).toBe("EINVALID:tools_limit"); // full now
+    expect(await code(answer(rig, "op2", { tools: [def("one_more")] }))).toBe("OK"); // already visible: still a no-op at the cap
+    await it.return?.();
   });
 
-  it("MUTATION TARGET: a tool-call event is registered as an operation (a tick past the host default answers an unanswered one with a timeout; a stream tool-use never is)", async () => {
-    rig = makeRig({ adapter: { relay: true }, config: { toolCallTimeoutMs: 1_000 } });
+  it("MUTATION TARGET: the byte cap is cumulative too (a turn that opened near 1 MiB cannot add a large definition)", async () => {
+    const big = (n: number) => def(`big_${n}`, { description: "x".repeat(TOOL_LIMITS.maxDescriptionBytes) });
+    const open = Array.from({ length: 21 }, (_, i) => big(i)); // 21 x 48 KiB: just over 1000 KiB
+    rig = makeRig({ adapter: { relay: true } });
     await signIn(rig, "c1", 1);
-    rig.script.turnEvents = [{ type: "tool-use", operationId: "tu1", name: "search", input: {} }, { type: "tool-call", operationId: "op1", messageId: "m", name: "search", input: {} }, { wait: new Promise<void>(() => undefined) }];
+    rig.script.turnEvents = [call("op1"), { wait: new Promise<void>(() => undefined) }, { type: "result", ok: true, text: "x" }];
+    const it = (await rig.mgr.runTurn({ ...relayReq("c1"), tools: open })).events![Symbol.asyncIterator]();
+    await it.next();
+    expect(await code(answer(rig, "op1", { tools: [big(99)] }))).toBe("EINVALID:tools_limit");
+    expect(await code(answer(rig, "op1", { tools: [def("tiny")] }))).toBe("OK"); // small ones still fit
+    await it.return?.();
+  });
+
+  it("MUTATION TARGET: accepted answers ACCUMULATE against the byte cap (two answers that each fit alone cannot together exceed it)", async () => {
+    const big = (n: number) => def(`acc_${n}`, { description: "x".repeat(TOOL_LIMITS.maxDescriptionBytes) });
+    rig = makeRig({ adapter: { relay: true } });
+    await signIn(rig, "c1", 1);
+    rig.script.turnEvents = [call("op1"), call("op2"), { wait: new Promise<void>(() => undefined) }, { type: "result", ok: true, text: "x" }];
     const it = (await rig.mgr.runTurn(relayReq("c1"))).events![Symbol.asyncIterator]();
     await it.next();
     await it.next();
-    rig.clock.advance(2_000);
-    rig.mgr.tick();
-    await flush();
-    expect(rig.script.answers.map((a) => a.operationId)).toEqual(["op1"]); // only the relay call; tu1 was never an operation
+    expect(await code(answer(rig, "op1", { tools: Array.from({ length: 15 }, (_, i) => big(i)) }))).toBe("OK"); // ~720 KiB: fits
+    expect(await code(answer(rig, "op2", { tools: Array.from({ length: 10 }, (_, i) => big(100 + i)) }))).toBe("EINVALID:tools_limit"); // ~480 KiB more: fits alone, not together
+    expect(await code(answer(rig, "op2", { tools: Array.from({ length: 5 }, (_, i) => big(100 + i)) }))).toBe("OK"); // ~240 KiB: still under 1 MiB
+    await it.return?.();
+  });
+
+  it("tools in an answer for a turn without a relay manifest (legacy bridge turn) are refused", async () => {
+    rig = makeRig({ adapter: { toolTransport: "host_relay" } });
+    await signIn(rig, "c1", 1);
+    rig.script.turnEvents = [{ type: "tool-use", operationId: "op1", name: "t", input: {} }, { wait: new Promise<void>(() => undefined) }];
+    const it = (await rig.mgr.runTurn(turnReq("c1", 1, { turnId: "tr1" }))).events![Symbol.asyncIterator]();
+    await it.next();
+    expect(await code(answer(rig, "op1", { tools: [LATE] }))).toBe("EINVALID:tools_invalid");
+    await it.return?.();
+  });
+
+  it("MUTATION TARGET: an answer carrying tools for an ABORTED turn is refused (ESTALE) and adds nothing", async () => {
+    const it = await start();
+    await rig.mgr.interruptTurn({ connectionId: "c1", turnId: "tr1", epoch: 1 });
+    expect(await code(answer(rig, "op1", { tools: [LATE] }))).toBe("ESTALE:turn_aborted");
+    expect(rig.script.answers).toHaveLength(0);
+    await it.return?.();
+  });
+
+  it("a refused answer followed by the same tools again (backend retry) works once the problem is fixed", async () => {
+    const it = await start();
+    const big = "a".repeat(2_400_000);
+    const images = Array.from({ length: 3 }, () => ({ mimeType: "image/png" as const, data: big }));
+    expect(await code(answer(rig, "op1", { content: "é".repeat(2_000_000), images, tools: [LATE] }))).toBe("EINVALID:result_too_large");
+    expect(await code(answer(rig, "op1", { tools: [LATE] }))).toBe("OK");
+    expect(rig.script.answers[0].answer).toMatchObject({ tools: [LATE] });
+    await it.return?.();
+  });
+
+  it("a provider that already dropped the operation does not make the tools visible (ESTALE result_lost; the retry path stays open)", async () => {
+    const it = await start({}, [call("op1"), call("op2"), { wait: new Promise<void>(() => undefined) }, { type: "result", ok: true, text: "x" }]);
+    await it.next();
+    rig.script.staleOperations.add("op1");
+    expect(await code(answer(rig, "op1", { tools: [LATE] }))).toBe("ESTALE:result_lost");
+    // LATE was not committed: a later answer still carries it to the provider
+    expect(await code(answer(rig, "op2", { tools: [LATE] }))).toBe("OK");
+    expect(rig.script.answers[1].answer).toMatchObject({ tools: [LATE] });
     await it.return?.();
   });
 
