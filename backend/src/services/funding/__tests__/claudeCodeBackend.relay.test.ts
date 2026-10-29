@@ -423,6 +423,7 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
       ['a per-user MCP tool whose name the relay cannot carry', { tools: [{ name: 'save_note' }, { name: 'my.tool', description: 'SECRET-DESC' }, { name: 'install_skills' }] }, 'name'],
       ['a description over the per-tool limit', { tools: [{ name: 'save_note', description: 'SECRET-DESC' + 'd'.repeat(60_000) }, { name: 'install_skills' }] }, 'truncatedDescriptions'],
       ['more per-user MCP tools than the manifest can hold', { tools: [{ name: 'install_skills' }, ...many] }, 'manifest_full'],
+      ['every tool the bridge lists is one the relay cannot carry (empty only BECAUSE tools were dropped: too large, not unavailable)', { tools: [{ name: 'my.tool' }] }, 'name'],
       ['a locked candidate (after a skill install) that would be dropped', { candidates: [{ name: 'late.tool' }] }, 'name'],
     ] as const)('%s: typed stop, not retryable, nothing run, logged by fixed code with counts only', async (_label, over, key) => {
       const t = setup(over as any);
@@ -530,13 +531,15 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
       expect(logged).toContain('relay_refused cause=protocol_too_old');
     });
 
-    it('a relay-capable worker with no tool to offer: typed NON-retryable stop, known to have run no tool, no HTTP-bridge turn', async () => {
+    it('a relay-capable worker whose tool list came back EMPTY: tools_unavailable_for_plan (retryable, AgentWeb offered), known to have run no tool, no HTTP-bridge turn', async () => {
       const t = setup({ tools: [] });
       rig.script.turnEvents = [result('fine')];
       const spy = jest.spyOn(client, 'turnRun');
       const err: any = await t.backend().run(t.params()).catch((e) => e);
-      expect(err.code).toBe('tools_too_large_for_plan');
-      expect(err.retryable).toBe(false);
+      expect(err.code).toBe('tools_unavailable_for_plan');
+      expect(err.retryable).toBe(true);
+      expect(err.offerAgentWebCredits).toBe(true);
+      expect(turnRanNoTools(err)).toBe(true);
       const logged = (console.error as jest.Mock).mock.calls.map((c) => JSON.stringify(c)).join('\n');
       expect(logged).toContain('relay_refused cause=manifest_empty');
       expect(turnRanNoTools(err)).toBe(true);
@@ -549,8 +552,8 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
       jest.spyOn(relayManifestModule, 'buildRelayManifest').mockReturnValue({ tools: [{ name: 'only', description: '', inputSchema: { type: 'object' }, locked: true }], open: new Set(['only']), locked: new Set(['only']), skipped: {}, truncated: 0 }); // all locked: the host would refuse it
       const spy = jest.spyOn(client, 'turnRun');
       const err: any = await t.backend().run(t.params()).catch((e) => e);
-      expect(err.code).toBe('tools_too_large_for_plan');
-      expect(err.retryable).toBe(false);
+      expect(err.code).toBe('tools_unavailable_for_plan');
+      expect(err.retryable).toBe(true);
       expect(turnRanNoTools(err)).toBe(true);
       expect(spy).not.toHaveBeenCalled();
       const logged = (console.error as jest.Mock).mock.calls.map((c) => JSON.stringify(c)).join('\n');
@@ -561,7 +564,7 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
       const t = setup({ tools: [], candidates: [{ name: 'late_only' }] });
       const spy = jest.spyOn(client, 'turnRun');
       const err: any = await t.backend().run(t.params()).catch((e) => e);
-      expect(err.code).toBe('tools_too_large_for_plan');
+      expect(err.code).toBe('tools_unavailable_for_plan');
       expect(spy).not.toHaveBeenCalled();
       const logged = (console.error as jest.Mock).mock.calls.map((c) => JSON.stringify(c)).join('\n');
       expect(logged).toContain('relay_refused cause=manifest_empty');

@@ -594,12 +594,12 @@ export class ClaudeCodeBackend {
     if (manifest.tools.length === 0 || manifest.open.size === 0) {
       // Fail closed (B3): never fall back to the HTTP bridge on a relay-capable worker. Nothing has run.
       console.error("[claude-backend] relay_refused cause=manifest_empty");
-      throw noToolsStop("tools_too_large_for_plan"); // not retryable: asking again builds the same manifest
+      throw noToolsStop("tools_unavailable_for_plan"); // no tool was cut (that was refused above): the list itself came back empty, so asking again can work
     }
     const problem = manifestProblem(manifest.tools);
     if (problem) {
       console.error("[claude-backend] relay_refused cause=manifest_schema", { problem });
-      throw noToolsStop("tools_too_large_for_plan"); // not retryable: asking again builds the same manifest
+      throw noToolsStop("tools_unavailable_for_plan"); // no tool was cut (refused above): a bug-shaped refusal, retryable and offered like any host-side failure
     }
     return { manifest };
   }
