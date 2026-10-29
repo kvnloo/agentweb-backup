@@ -490,7 +490,7 @@ test('checkNodeVersion: an older node is refused with the instruction to switch'
   assert.equal(r.ok, false);
   assert.equal(r.major, 18);
   assert.match(r.message, /v18\.19\.1/);
-  assert.match(r.message, /nvm use 22/);
+  assert.match(r.message, /nvm use 22/); // the fix is named
   assert.equal(checkNodeVersion('21.9.0').ok, false); // one short of the CI major
 });
 
