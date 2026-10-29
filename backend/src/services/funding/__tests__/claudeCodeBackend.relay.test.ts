@@ -73,6 +73,7 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
       now?: () => number;
       softLead?: number;
       confirm?: string[];
+      allowLegacy?: boolean;
     } = {},
   ) {
     const executions: Array<{ name: string; args: Record<string, unknown> }> = [];
@@ -107,6 +108,7 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
         workerProtocol: () => ('protocol' in over ? over.protocol : 4),
         protocolStatus: () => over.status ?? 'match',
         candidateTools: async () => over.candidates ?? [],
+        allowLegacyBridge: () => over.allowLegacy === true,
       },
       executor: toolDeps,
       registry,
@@ -118,6 +120,7 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
       now: over.now ?? (() => Date.now()),
       newRunId: () => `claude-relay-${++n}`,
       drainTimeoutMs: 600,
+      relayAnnounceWaitMs: 20,
       lateWatchPollMs: 15,
       lateWatchMaxMs: 800,
       ...(over.softLead !== undefined ? { softDeadlineLeadMs: over.softLead } : {}),
@@ -132,11 +135,19 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
     const base = setup().deps;
     const fns = { listTools: async () => [], callTool: async () => ({ content: '', isError: false }) };
     const d = (protocol: number | undefined, status: 'match' | 'mismatch' | 'unknown', bridge: Record<string, unknown> = fns) =>
-      ({ relay: { workerProtocol: () => protocol, protocolStatus: () => status }, bridge: { ...bridge } }) as unknown as Pick<ClaudeBackendDeps, 'relay' | 'bridge'>;
+      ({ relay: { workerProtocol: () => protocol, protocolStatus: () => status, allowLegacyBridge: () => legacyAllowed }, bridge: { ...bridge } }) as unknown as Pick<ClaudeBackendDeps, 'relay' | 'bridge'>;
+    let legacyAllowed = false;
     expect(chooseToolTransport(d(4, 'match'))).toEqual({ kind: 'relay' });
     expect(chooseToolTransport(d(5, 'match'))).toEqual({ kind: 'relay' });
+    // S2: an older worker (a rollback) is refused by default; the HTTP bridge only where it is explicitly allowed
+    expect(chooseToolTransport(d(3, 'match'))).toEqual({ kind: 'refuse', cause: 'protocol_too_old' });
+    expect(chooseToolTransport(d(2, 'match'))).toEqual({ kind: 'refuse', cause: 'protocol_too_old' });
+    legacyAllowed = true;
     expect(chooseToolTransport(d(3, 'match'))).toEqual({ kind: 'legacy' });
     expect(chooseToolTransport(d(2, 'match'))).toEqual({ kind: 'legacy' });
+    expect(chooseToolTransport(d(4, 'match'))).toEqual({ kind: 'relay' }); // the setting never downgrades a relay-capable worker
+    expect(chooseToolTransport(d(3, 'unknown'))).toEqual({ kind: 'refuse', cause: 'protocol_unknown' });
+    legacyAllowed = false;
     expect(chooseToolTransport(d(undefined, 'unknown'))).toEqual({ kind: 'refuse', cause: 'protocol_unknown' });
     expect(chooseToolTransport(d(4, 'unknown'))).toEqual({ kind: 'refuse', cause: 'protocol_unknown' });
     expect(chooseToolTransport(d(3, 'unknown'))).toEqual({ kind: 'refuse', cause: 'protocol_unknown' });
@@ -417,7 +428,8 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
       const t = setup(over as any);
       const spy = jest.spyOn(client, 'turnRun');
       const err: any = await t.backend().run(t.params()).catch((e) => e);
-      expect(err.code).toBe('context_too_large');
+      expect(err.code).toBe('tools_too_large_for_plan');
+      expect(err.offerAgentWebCredits).toBe(true);
       expect(err.retryable).toBe(false);
       expect(turnRanNoTools(err)).toBe(true);
       expect(spy).not.toHaveBeenCalled();
@@ -468,7 +480,7 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
       ['a protocol 3 worker', 3],
       ['a protocol 2 worker', 2],
     ] as const)('%s: legacy request (bridgeToken, no tools), stream tool events feed the bridge as before, nothing is relayed', async (_label, protocol) => {
-      const t = setup({ protocol, status: 'match' });
+      const t = setup({ protocol, status: 'match', allowLegacy: true });
       rig.script.turnEvents = [{ type: 'tool-use', operationId: 'tc-1', name: 'mcp__emma__save_note', input: { n: 1 } }, { type: 'tool-result', operationId: 'tc-1', ok: true }, result('fine')];
       const spy = jest.spyOn(client, 'turnRun');
       const noteUse = jest.spyOn(t.adapter, 'noteToolUse');
@@ -506,13 +518,27 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
       expect(t.registry.size).toBe(0);
     });
 
-    it('a relay-capable worker with no tool the relay can carry: typed retryable stop, known to have run no tool, no HTTP-bridge turn', async () => {
+    it('S2: an older worker (rollback) without the explicit legacy setting: typed retryable stop, nothing opened, no zero-tool turn', async () => {
+      const t = setup({ protocol: 3, status: 'match' });
+      const spy = jest.spyOn(client, 'turnRun');
+      const err: any = await t.backend().run(t.params()).catch((e) => e);
+      expect(err.code).toBe('host_unavailable');
+      expect(err.retryable).toBe(true);
+      expect(turnRanNoTools(err)).toBe(true);
+      expect(spy).not.toHaveBeenCalled();
+      const logged = (console.error as jest.Mock).mock.calls.map((c) => JSON.stringify(c)).join('\n');
+      expect(logged).toContain('relay_refused cause=protocol_too_old');
+    });
+
+    it('a relay-capable worker with no tool to offer: typed NON-retryable stop, known to have run no tool, no HTTP-bridge turn', async () => {
       const t = setup({ tools: [] });
       rig.script.turnEvents = [result('fine')];
       const spy = jest.spyOn(client, 'turnRun');
       const err: any = await t.backend().run(t.params()).catch((e) => e);
-      expect(err.code).toBe('turn_failed');
-      expect(err.retryable).toBe(true);
+      expect(err.code).toBe('tools_too_large_for_plan');
+      expect(err.retryable).toBe(false);
+      const logged = (console.error as jest.Mock).mock.calls.map((c) => JSON.stringify(c)).join('\n');
+      expect(logged).toContain('relay_refused cause=manifest_empty');
       expect(turnRanNoTools(err)).toBe(true);
       expect(spy).not.toHaveBeenCalled();
       expect(t.registry.size).toBe(0);
@@ -523,9 +549,22 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
       jest.spyOn(relayManifestModule, 'buildRelayManifest').mockReturnValue({ tools: [{ name: 'only', description: '', inputSchema: { type: 'object' }, locked: true }], open: new Set(['only']), locked: new Set(['only']), skipped: {}, truncated: 0 }); // all locked: the host would refuse it
       const spy = jest.spyOn(client, 'turnRun');
       const err: any = await t.backend().run(t.params()).catch((e) => e);
-      expect(err.code).toBe('turn_failed');
+      expect(err.code).toBe('tools_too_large_for_plan');
+      expect(err.retryable).toBe(false);
       expect(turnRanNoTools(err)).toBe(true);
       expect(spy).not.toHaveBeenCalled();
+      const logged = (console.error as jest.Mock).mock.calls.map((c) => JSON.stringify(c)).join('\n');
+      expect(logged).toContain('relay_refused cause=manifest_schema');
+    });
+
+    it('a manifest whose every tool is locked (nothing open) is refused as empty before the schema check', async () => {
+      const t = setup({ tools: [], candidates: [{ name: 'late_only' }] });
+      const spy = jest.spyOn(client, 'turnRun');
+      const err: any = await t.backend().run(t.params()).catch((e) => e);
+      expect(err.code).toBe('tools_too_large_for_plan');
+      expect(spy).not.toHaveBeenCalled();
+      const logged = (console.error as jest.Mock).mock.calls.map((c) => JSON.stringify(c)).join('\n');
+      expect(logged).toContain('relay_refused cause=manifest_empty');
     });
   });
 
@@ -539,6 +578,56 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
     const r = await run;
     const tool = r.responseMessages.find((m) => m.role === 'tool');
     expect(tool?.content).toBe(`slow_write receipt\n${RESULT_LOST_NOTE}`);
+  });
+
+  describe('B1: batched confirmations end to end (parity with the AgentWeb path: one deck with every preview of the message)', () => {
+    const use = (i: number, name: string, input: Record<string, unknown>): ProviderEvent => ({ type: 'tool-use', operationId: `toolu_${i}`, name: `mcp__aw-relay__${name}`, input });
+    it('"pause these 5 ad sets": five previews of one message all run, five halts, one confirmation', async () => {
+      const t = setup({ confirm: ['send_email'] });
+      const gates = Array.from({ length: 5 }, () => gate());
+      rig.script.turnEvents = [
+        ...Array.from({ length: 5 }, (_, i) => use(i, 'send_email', { to: `p${i}` })),
+        ...gates.flatMap((g, i) => [call(`op-${i}`, 'send_email', { to: `p${i}` }), { wait: g.wait }]),
+        result('Please confirm.'),
+      ];
+      const halts = jest.spyOn(t.adapter, 'takeHalts');
+      const run = t.backend().run(t.params());
+      for (let i = 0; i < 5; i++) {
+        await waitFor(() => answers().length === i + 1);
+        gates[i].open();
+      }
+      const r = await run;
+      expect(t.executions.map((e) => e.args.to)).toEqual(['p0', 'p1', 'p2', 'p3', 'p4']);
+      expect(halts.mock.results[0].value).toHaveLength(5);
+      expect(r.content).toContain('confirm');
+    });
+
+    it('a read of the same message after the halted preview runs', async () => {
+      const t = setup({ confirm: ['send_email'] });
+      const g1 = gate();
+      const g2 = gate();
+      rig.script.turnEvents = [use(1, 'send_email', { to: 'a' }), use(2, 'search', { q: 's' }), call('op-1', 'send_email', { to: 'a' }), { wait: g1.wait }, call('op-2', 'search', { q: 's' }), { wait: g2.wait }, result('x')];
+      const run = t.backend().run(t.params());
+      await waitFor(() => answers().length === 1);
+      g1.open();
+      await waitFor(() => answers().length === 2);
+      g2.open();
+      await run;
+      expect(t.executions.map((e) => e.name)).toEqual(['send_email', 'search']);
+    });
+
+    it('a call of a LATER message (after the stream showed a result) is refused after a halt', async () => {
+      const t = setup({ confirm: ['send_email'] });
+      const g1 = gate();
+      rig.script.turnEvents = [use(1, 'send_email', { to: 'a' }), call('op-1', 'send_email', { to: 'a' }), { wait: g1.wait }, { type: 'tool-result', operationId: 'toolu_1', ok: true }, use(2, 'save_note', { n: 1 }), call('op-2', 'save_note', { n: 1 }), { wait: gate().wait }, result('x')];
+      const run = t.backend().run(t.params());
+      await waitFor(() => answers().length === 1);
+      g1.open();
+      await waitFor(() => answers().length === 2);
+      expect(t.executions.map((e) => e.name)).toEqual(['send_email']);
+      t.registry.cancel('s1');
+      await run;
+    });
   });
 
   it('SF1 exploit: after a halted preview is answered, a later call reusing its message id is refused (end to end through the real host)', async () => {

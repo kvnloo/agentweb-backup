@@ -112,9 +112,13 @@ export interface ClaudeBackendDeps {
     protocolStatus(): "match" | "mismatch" | "unknown";
     /** Tools the run could have after a skill install; offered to the worker as `locked`. Failure or absence = none are offered ahead. */
     candidateTools?(run: { runId: string; userId: string; sessionId: string }): Promise<BridgeTool[]>;
+    /** Whether a worker older than protocol 4 may run turns on the HTTP bridge. Absent or false (the production default) = refused. */
+    allowLegacyBridge?(): boolean;
   };
   /** How long before the turn's deadline no further tool may start (the model is told to write its answer). Default 75 s, never more than half the deadline. */
   softDeadlineLeadMs?: number;
+  /** How long a relayed call waits for the stream line that announces it (default 1.5 s; tests shorten it). */
+  relayAnnounceWaitMs?: number;
   executor: {
     registerRun(runId: string, ctx: { llmModel: string; isDelegatedAccess?: boolean; excludeTools?: string[]; screenshotUrl?: string; socketEmit?: (room: string, event: string, payload: any) => void; fundingScope?: RunFunding }): void;
     beginTurn(runId: string, turn: { agentRuntimeRunId?: string; priorSearchCallCount?: number }): void;
@@ -153,14 +157,14 @@ const LATE_WATCH_DEFAULT_MS = 15 * 60_000;
 export const RELAY_MIN_PROTOCOL = 4;
 const SOFT_DEADLINE_LEAD_MS = 75_000;
 
-export type ToolTransportChoice = { kind: "relay" } | { kind: "legacy" } | { kind: "refuse"; cause: "protocol_unknown" | "protocol_mismatch" | "bridge_not_in_process" };
+export type ToolTransportChoice = { kind: "relay" } | { kind: "legacy" } | { kind: "refuse"; cause: "protocol_unknown" | "protocol_mismatch" | "protocol_too_old" | "bridge_not_in_process" };
 
 /**
  * The one decision about a turn's tool transport, made BEFORE anything is opened. Fail closed (B3): the HTTP bridge is used only for a worker KNOWN to speak
  * an older protocol (on production its bridge URL is a zero-tool stub, so a relay-capable worker must never silently get it). Exported so the tests and the
  * pilot's checks state it once.
  *   - status "match" and protocol >= 4, bridge callable in process  -> relay
- *   - status "match" and protocol a known number < 4                -> legacy HTTP bridge (unchanged behaviour)
+ *   - status "match" and protocol a known number < 4                -> legacy HTTP bridge ONLY where `allowLegacyBridge()` says so, else refuse
  *   - status "unknown" (not asked yet, or a failed recheck), "mismatch", or a 4+ worker without an in-process bridge -> refuse (typed, retryable stop)
  * A backend built without the `relay` dependency (tests, tools) keeps the legacy path; the production instance always has it.
  */
@@ -170,7 +174,9 @@ export function chooseToolTransport(d: Pick<ClaudeBackendDeps, "relay" | "bridge
   const status = r.protocolStatus();
   const protocol = r.workerProtocol();
   if (status !== "match" || typeof protocol !== "number") return { kind: "refuse", cause: status === "mismatch" ? "protocol_mismatch" : "protocol_unknown" };
-  if (protocol < RELAY_MIN_PROTOCOL) return { kind: "legacy" };
+  // S2: on production the HTTP bridge is a zero-tool stub, so an older worker (a rollback) must not silently run turns without tools. The legacy path is
+  // reachable only where it is explicitly allowed (a test or dev environment whose bridge URL serves real tools).
+  if (protocol < RELAY_MIN_PROTOCOL) return r.allowLegacyBridge?.() === true ? { kind: "legacy" } : { kind: "refuse", cause: "protocol_too_old" };
   if (typeof d.bridge.listTools !== "function" || typeof d.bridge.callTool !== "function") return { kind: "refuse", cause: "bridge_not_in_process" };
   return { kind: "relay" };
 }
@@ -367,6 +373,7 @@ export class ClaudeCodeBackend {
               // A16 / SF2: a worker past the call cap or the in-flight limit ends the turn (the host turn is interrupted; what ran is kept and persisted).
               onLimitTripped: () => ac.abort(),
               isHalted: () => (d.bridge.isHalted ? d.bridge.isHalted(p.sessionId, p.userId) : true),
+              ...(d.relayAnnounceWaitMs !== undefined ? { announceWaitMs: d.relayAnnounceWaitMs } : {}),
               onCall: (phase, name) => {
                 if (phase === "start") progress("executing_tools", { pendingTools: [name] });
                 else progress("tool_executed");
@@ -396,7 +403,9 @@ export class ClaudeCodeBackend {
                   if (dispatcher && dispatcher.start(e)) uses.push({ id: e.operationId, name: e.name }); // a repeated operation id is neither run nor counted
                 } else if (e.type === "tool-use") {
                   if (relayMode) {
-                    // Informational only on the relay path (progress): the stream's ids are not the worker's operation ids, so they feed no bridge state and execute nothing.
+                    // Informational only on the relay path: it tells the dispatcher which model message a relayed call belongs to (B1). The stream's ids
+                    // are not the worker's operation ids: nothing is executed, registered or reported from it.
+                    dispatcher?.noteStreamUse(e.name, e.input);
                     return;
                   }
                   const name = e.name.replace(/^mcp__[A-Za-z0-9_]+?__/, "");
@@ -404,7 +413,10 @@ export class ClaudeCodeBackend {
                   d.bridge.noteToolUse(runId, e.operationId, name, e.input);
                   progress("executing_tools", { pendingTools: [name] });
                 } else if (e.type === "tool-result") {
-                  if (relayMode) return;
+                  if (relayMode) {
+                    dispatcher?.noteStreamResult();
+                    return;
+                  }
                   d.bridge.noteToolResult(runId, e.operationId);
                   progress("tool_executed");
                 } else if (e.type === "usage") {
@@ -574,21 +586,20 @@ export class ClaudeCodeBackend {
     const manifest = buildRelayManifest(open, candidates);
     // Never a degraded manifest (B1/B2): if any tool would be left out or any description cut (per-user MCP tools are unbounded in number and shape), the
     // turn is refused and the user told, rather than run with fewer tools than an AgentWeb turn would have. relayManifest.registry.test.ts keeps the
-    // built-in registry inside the limits. `context_too_large` is the existing stop whose copy fits ("too large to send to your Claude plan ... or choose
-    // another model"); it is not retryable, and nothing has run.
+    // built-in registry inside the limits. `tools_too_large_for_plan`: not retryable, nothing has run, AgentWeb credits offered (AgentWeb can run them).
     if (manifestCut(manifest)) {
       console.error("[claude-backend] relay_manifest_cut", { ...manifest.skipped, truncatedDescriptions: manifest.truncated, offered: manifest.tools.length });
-      throw noToolsStop("context_too_large");
+      throw noToolsStop("tools_too_large_for_plan");
     }
     if (manifest.tools.length === 0 || manifest.open.size === 0) {
       // Fail closed (B3): never fall back to the HTTP bridge on a relay-capable worker. Nothing has run.
       console.error("[claude-backend] relay_refused cause=manifest_empty");
-      throw noToolsStop("turn_failed");
+      throw noToolsStop("tools_too_large_for_plan"); // not retryable: asking again builds the same manifest
     }
     const problem = manifestProblem(manifest.tools);
     if (problem) {
-      console.error("[claude-backend] relay manifest refused by the protocol schema", { problem });
-      throw noToolsStop("turn_failed");
+      console.error("[claude-backend] relay_refused cause=manifest_schema", { problem });
+      throw noToolsStop("tools_too_large_for_plan"); // not retryable: asking again builds the same manifest
     }
     return { manifest };
   }
