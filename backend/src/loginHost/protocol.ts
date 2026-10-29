@@ -30,7 +30,7 @@ export const PROTOCOL_VERSION = 4;
 // that reports 3 or more (loginHostProvider.workerProtocol()), so the two can deploy in either order.
 // 4 (ENG-2113) adds the tool relay, all additive on the worker side: turn.run takes an optional bounded `tools` manifest INSTEAD of `bridgeToken` (a request
 // with `bridgeToken` and no `tools` is the legacy shape and behaves exactly as under 3; both together, or neither, is refused), turn events gain `tool-call`
-// (host-generated operationId), and turn.toolResult is reshaped (`isError`, `images`, `unlock`; its body limit is 8 MiB). The backend sends `tools` only to a
+// (host-generated operationId), and turn.toolResult is reshaped (`isError`, `images`, `tools` = definitions newly available because of that call; its body limit is 8 MiB). The backend sends `tools` only to a
 // worker that reports 4 or more, so the worker deploys first.
 
 const ID = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/, "id: letters, digits, _ and - only, 1-64 chars");
@@ -56,18 +56,29 @@ export const loginPromoteReq = z.object({ connectionId: ID, loginRef: ID, epoch:
 
 // ───────────────────────────── tool relay (protocol 4) ─────────────────────────────
 
-/** A tool the customer's CLI is offered through the relay shim. The name is also a path-free, shell-free token. */
+/** The MCP server name the adapter configures for the relay (and the legacy bridge): the CLI exposes every tool as `mcp__<server>__<tool>`. */
+export const RELAY_MCP_SERVER_NAME = "emma";
+/** The model API refuses a tool name longer than this; the NAME the model sees is the qualified one. */
+export const MODEL_TOOL_NAME_MAX_CHARS = 64;
+export const qualifiedToolPrefix = (server: string): string => `mcp__${server}__`;
+/** The longest bare tool name that still fits the model's limit once the CLI qualifies it for `server`. */
+export const maxToolNameChars = (server: string): number => MODEL_TOOL_NAME_MAX_CHARS - qualifiedToolPrefix(server).length;
 /**
- * The function-name shape every Emma tool already has to satisfy (OpenAI tool names: [A-Za-z0-9_-], at most 64), so the plan route can offer EXACTLY the
- * tools AgentWeb offers, user-connected MCP tools included. Never a leading "-"; no dot, slash or space (it is a name, not a path, and never reaches argv).
+ * The longest tool name the host accepts (53 for "emma": "mcp__emma__" is 11 characters). Derived from the prefix, never a bare number: a longer name would
+ * become a qualified name the model API refuses, which fails the WHOLE turn. The real registry's longest name is 38.
  */
-export const TOOL_NAME = z.string().regex(/^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$/, "tool name: A-Z a-z 0-9 _ - only, 1-64 chars, no leading -");
+export const TOOL_NAME_MAX_CHARS = maxToolNameChars(RELAY_MCP_SERVER_NAME);
+/**
+ * The function-name shape every Emma tool already has to satisfy (OpenAI tool names: [A-Za-z0-9_-]), so the plan route can offer EXACTLY the tools AgentWeb
+ * offers, user-connected MCP tools included. Never a leading "-"; no dot, slash or space (it is a name, not a path, and never reaches argv).
+ */
+export const TOOL_NAME = z.string().regex(new RegExp(`^[A-Za-z0-9_][A-Za-z0-9_-]{0,${TOOL_NAME_MAX_CHARS - 1}}$`), `tool name: A-Z a-z 0-9 _ - only, 1-${TOOL_NAME_MAX_CHARS} chars, no leading -`);
 /** Names the relay shim keeps for itself (the whole `aw_relay_` prefix): a manifest may not use them. */
 export const RELAY_RESERVED_PREFIX = "aw_relay_";
 /**
- * DoS guards, NOT a tool budget: the plan route must offer the same tools as AgentWeb, so these sit at about 2x the real registry (measured 2026-10-28 on
- * the Emma registry: 263 registered tools + the agent-mode built-ins and per-user MCP tools, ~271 in a full session; largest description 24,232 bytes
- * (call_meta_marketing_api), largest schema 15,084 bytes (call_google_ads_api), whole manifest ~502 KB). A registry that outgrows them must raise them here
+ * DoS guards, NOT a tool budget, and CUMULATIVE per turn (the open set plus every tool added by an answer): the plan route must be able to offer the same tools
+ * as AgentWeb, so these sit at about 2x the whole registry (measured 2026-10-29: 271 tools, ~503 KB; largest description 24,232 bytes (call_meta_marketing_api),
+ * largest schema 15,084 bytes (call_google_ads_api)); a chat normally opens with ~74 foundation tools, ~93 KB. A registry that outgrows them must raise them here
  * (worker first), never be trimmed silently by the backend.
  */
 export const TOOL_LIMITS = {
@@ -79,17 +90,30 @@ export const TOOL_LIMITS = {
 } as const;
 const byteLen = (v: unknown): number => Buffer.byteLength(JSON.stringify(v), "utf8");
 
-/** `locked` tools are in the manifest from the start but not listed to the model until a tool result unlocks them (skills installed mid-turn). */
+/** A tool definition as the CLI sees it. */
 export const toolDef = z
   .object({
     name: TOOL_NAME,
     description: z.string().max(TOOL_LIMITS.maxDescriptionBytes),
     inputSchema: z.record(z.string(), z.unknown()),
-    locked: z.boolean().optional(),
   })
   .strict();
 export type ToolDef = z.infer<typeof toolDef>;
 
+/** What is wrong with ONE definition on its own (shared by the turn's open set and by tools that arrive with a result), or undefined. */
+export function toolEntryProblem(t: ToolDef): string | undefined {
+  if (t.name.toLowerCase().startsWith(RELAY_RESERVED_PREFIX)) return "tool_name_reserved";
+  if (t.inputSchema.type !== "object") return "tool_schema_not_object";
+  if (byteLen(t.inputSchema) > TOOL_LIMITS.maxSchemaBytes) return "tool_schema_too_large";
+  if (Buffer.byteLength(t.description, "utf8") > TOOL_LIMITS.maxDescriptionBytes) return "tool_description_too_large";
+  return undefined;
+}
+
+/**
+ * The turn's OPEN set at its start (Emma starts a chat with only the foundation tools and adds a skill's tools when the model installs the skill; the plan
+ * route does the same, so this is NOT the whole catalogue). More tools arrive later with a turn.toolResult (`tools`), bounded by the same TOOL_LIMITS
+ * cumulatively (see admitNewTools).
+ */
 export const toolManifest = z
   .array(toolDef)
   .min(1)
@@ -102,14 +126,57 @@ export const toolManifest = z
       const folded = t.name.toLowerCase();
       if (seen.has(folded)) return fail("tool_duplicate");
       seen.add(folded);
-      if (folded.startsWith(RELAY_RESERVED_PREFIX)) return fail("tool_name_reserved");
-      if (t.inputSchema.type !== "object") return fail("tool_schema_not_object");
-      if (byteLen(t.inputSchema) > TOOL_LIMITS.maxSchemaBytes) return fail("tool_schema_too_large");
-      if (Buffer.byteLength(t.description, "utf8") > TOOL_LIMITS.maxDescriptionBytes) return fail("tool_description_too_large");
+      const problem = toolEntryProblem(t);
+      if (problem) return fail(problem);
     }
-    if (tools.every((t) => t.locked)) return fail("tool_all_locked");
     if (byteLen(tools) > TOOL_LIMITS.maxTotalBytes) return fail("tools_too_large");
   });
+
+/** Tools newly available because of one call (turn.toolResult `tools`): each entry valid on its own; the cumulative checks need the turn (admitNewTools). */
+export const newToolsList = z
+  .array(toolDef)
+  .min(1)
+  .max(TOOL_LIMITS.maxTools)
+  .superRefine((tools, ctx) => {
+    const byFolded = new Map<string, string>();
+    for (const t of tools) {
+      const folded = t.name.toLowerCase();
+      const prior = byFolded.get(folded);
+      if (prior !== undefined && prior !== t.name) return ctx.addIssue({ code: "custom", message: "tool_duplicate" }); // an exact repeat is a harmless no-op, a case variant is not
+      byFolded.set(folded, t.name);
+      const problem = toolEntryProblem(t);
+      if (problem) return ctx.addIssue({ code: "custom", message: problem });
+    }
+  });
+
+/** The tools a turn can currently call, as the host tracks them (bounded by TOOL_LIMITS, cumulatively). */
+export interface VisibleTools {
+  names: Set<string>;
+  folded: Set<string>;
+  bytes: number;
+}
+export function visibleFromManifest(tools: ToolDef[]): VisibleTools {
+  return { names: new Set(tools.map((t) => t.name)), folded: new Set(tools.map((t) => t.name.toLowerCase())), bytes: byteLen(tools) };
+}
+/**
+ * Decides whether `incoming` may join the visible set: an exact name already visible is a no-op (idempotent for a retrying backend, the first definition
+ * stays); a name that differs from a visible one only in case is refused; the cumulative count and bytes may not pass TOOL_LIMITS. Pure: the caller commits
+ * `fresh` (and `bytes`) only after the answer was really delivered.
+ */
+export function admitNewTools(visible: VisibleTools, incoming: ToolDef[]): { ok: true; fresh: ToolDef[]; bytes: number } | { ok: false; code: "tools_invalid" | "tools_limit" } {
+  const fresh: ToolDef[] = [];
+  const seen = new Set<string>();
+  let bytes = visible.bytes;
+  for (const t of incoming) {
+    if (visible.names.has(t.name) || seen.has(t.name)) continue;
+    if (visible.folded.has(t.name.toLowerCase())) return { ok: false, code: "tools_invalid" };
+    seen.add(t.name);
+    fresh.push(t);
+    bytes += byteLen(t) + 1;
+  }
+  if (visible.names.size + fresh.length > TOOL_LIMITS.maxTools || bytes > TOOL_LIMITS.maxTotalBytes) return { ok: false, code: "tools_limit" };
+  return { ok: true, fresh, bytes };
+}
 
 export const IMAGE_LIMITS = { maxImages: 4, maxBase64Each: 2_500_000, maxBase64Total: 6_000_000 } as const;
 export const toolImage = z
@@ -167,7 +234,9 @@ export const turnRenewReq = z.object({ connectionId: ID, turnId: ID, epoch: EPOC
 export const turnInterruptReq = z.object({ connectionId: ID, turnId: ID, epoch: EPOCH }).strict();
 /**
  * Answer to a pending operation inside a turn (a `tool-call` event, or a host-relayed Codex request); `operationId` pairs it with the request.
- * `unlock` names tools of the turn's manifest that were `locked` and become visible now (the shim announces them and waits for the CLI to re-list).
+ * `tools` are definitions that become available because of THIS call (a skill install): the shim adds them, announces tools/list_changed and waits for the CLI
+ * to re-list before it returns the result. Names already visible are a no-op; anything invalid or over the cumulative caps refuses the whole answer and leaves the
+ * operation pending.
  */
 export const turnToolResultReq = z
   .object({
@@ -182,7 +251,7 @@ export const turnToolResultReq = z
       .max(IMAGE_LIMITS.maxImages)
       .refine((imgs) => imgs.reduce((n, i) => n + i.data.length, 0) <= IMAGE_LIMITS.maxBase64Total, "images_too_large")
       .optional(),
-    unlock: z.array(TOOL_NAME).min(1).max(TOOL_LIMITS.maxTools).optional(),
+    tools: newToolsList.optional(),
   })
   .strict();
 

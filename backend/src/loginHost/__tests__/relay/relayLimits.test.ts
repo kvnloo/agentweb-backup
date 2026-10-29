@@ -8,7 +8,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs"
 import { request } from "http";
 import { tmpdir } from "os";
 import { join } from "path";
-import { ROUTES, TOOL_LIMITS, toolManifest, TURN_RUN_MAX_BODY_BYTES, type ToolDef } from "../../protocol";
+import { admitNewTools, MODEL_TOOL_NAME_MAX_CHARS, qualifiedToolPrefix, RELAY_MCP_SERVER_NAME, ROUTES, TOOL_LIMITS, TOOL_NAME_MAX_CHARS, toolEntryProblem, toolManifest, TURN_RUN_MAX_BODY_BYTES, visibleFromManifest, type ToolDef } from "../../protocol";
 import { startHostServer } from "../../server";
 import { makeRig } from "../helpers";
 
@@ -62,28 +62,57 @@ function maxManifest(): ToolDef[] {
   return tools;
 }
 
-describe("the real Emma registry fits the manifest limits with headroom", () => {
+const fits = (tools: ToolDef[], extraTools = 0) => {
+  const maxDesc = Math.max(...tools.map((t) => Buffer.byteLength(t.description, "utf8")));
+  const maxSchema = Math.max(...tools.map((t) => bytes(t.inputSchema)));
+  const total = bytes(tools);
+  return { count: (tools.length + extraTools) * 1.5 <= TOOL_LIMITS.maxTools, desc: maxDesc * 1.5 <= TOOL_LIMITS.maxDescriptionBytes, schema: maxSchema * 1.5 <= TOOL_LIMITS.maxSchemaBytes, total: total * 1.5 <= TOOL_LIMITS.maxTotalBytes, name: Math.max(...tools.map((t) => t.name.length)) <= TOOL_NAME_MAX_CHARS };
+};
+const ALL_TRUE = { count: true, desc: true, schema: true, total: true, name: true };
+
+describe("the real Emma registry against the limits (Emma opens a chat with the foundation tools and adds a skill's tools when it is installed)", () => {
   let tools: ToolDef[];
+  let foundation: ToolDef[];
   beforeAll(async () => {
     tools = await realRegistry();
+    const { AgentModeService } = await import("../../../services/agentModeService");
+    const names = new Set([...AgentModeService.DEFAULT_FOUNDATION_TOOLS, "install_skills"]);
+    foundation = tools.filter((t) => names.has(t.name));
   });
 
-  it("every registered tool is a valid manifest entry and the whole registry is one valid manifest (nothing would be dropped)", () => {
+  it("every registered tool is a valid manifest entry (names fit the 64-character model limit once qualified), and the whole registry is one valid manifest", () => {
     expect(tools.length).toBeGreaterThan(200);
+    for (const t of tools) expect({ name: t.name, problem: toolEntryProblem(t), qualified: `${qualifiedToolPrefix(RELAY_MCP_SERVER_NAME)}${t.name}`.length <= MODEL_TOOL_NAME_MAX_CHARS }).toEqual({ name: t.name, problem: undefined, qualified: true });
     const r = toolManifest.safeParse(tools);
     expect(r.success ? "ok" : r.error.issues.map((i) => `${i.path.join(".")}:${i.message}`).slice(0, 5)).toBe("ok");
   });
 
-  it("with at least 1.5x headroom on count, largest description, largest schema and total bytes (agent-mode built-ins and MCP tools come on top)", () => {
-    const maxDesc = Math.max(...tools.map((t) => Buffer.byteLength(t.description, "utf8")));
-    const maxSchema = Math.max(...tools.map((t) => bytes(t.inputSchema)));
-    const total = bytes(tools);
-    expect({ count: tools.length * 1.5 <= TOOL_LIMITS.maxTools, desc: maxDesc * 1.5 <= TOOL_LIMITS.maxDescriptionBytes, schema: maxSchema * 1.5 <= TOOL_LIMITS.maxSchemaBytes, total: total * 1.5 <= TOOL_LIMITS.maxTotalBytes }).toEqual({
-      count: true,
-      desc: true,
-      schema: true,
-      total: true,
-    });
+  it("(a) the foundation set (what a chat opens with) is a valid open set with plenty of headroom", () => {
+    expect(foundation.length).toBeGreaterThan(40); // the registry holds most of the 78 (some foundation entries are agent-mode built-ins registered elsewhere)
+    expect(toolManifest.safeParse(foundation).success).toBe(true);
+    expect(fits(foundation)).toEqual(ALL_TRUE);
+    expect(bytes(foundation) * 4).toBeLessThan(TOOL_LIMITS.maxTotalBytes);
+    console.log(`foundation set from the registry: ${foundation.length} tools, ${bytes(foundation)} bytes`);
+  });
+
+  it("(b) the WHOLE registry, delivered in steps on top of the foundation set (worst case: every skill installed), fits the cumulative caps with >= 1.5x headroom", () => {
+    expect(fits(tools, 20)).toEqual(ALL_TRUE); // +20: the agent-mode built-ins (search_tool_response, install_skills, ...) and a user's MCP tools come on top
+    let visible = visibleFromManifest(foundation);
+    const open = new Set(foundation.map((t) => t.name));
+    const rest = tools.filter((t) => !open.has(t.name));
+    for (let i = 0; i < rest.length; i += 7) {
+      const r = admitNewTools(visible, rest.slice(i, i + 7));
+      expect(r.ok).toBe(true);
+      if (!r.ok) return;
+      for (const t of r.fresh) {
+        visible.names.add(t.name);
+        visible.folded.add(t.name.toLowerCase());
+      }
+      visible = { ...visible, bytes: r.bytes };
+    }
+    expect(visible.names.size).toBe(tools.length);
+    expect(visible.bytes * 1.5).toBeLessThanOrEqual(TOOL_LIMITS.maxTotalBytes);
+    console.log(`whole registry: ${tools.length} tools, ${bytes(tools)} bytes`);
   });
 });
 

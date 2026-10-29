@@ -87,6 +87,7 @@ async function until(cond: () => boolean, ms = 2000): Promise<void> {
   while (!cond() && Date.now() - t0 < ms) await new Promise((r) => setTimeout(r, 10));
   if (!cond()) throw new Error("until: timed out");
 }
+const LATE = { name: "late", description: "d", inputSchema: { type: "object", properties: {} } };
 const sockOf = (ep: RelayEndpoint) => `${ep.dir}/relay.sock`;
 const call = (id = "c1", name = "echo", args: unknown = { a: 1 }) => ({ type: "call", callId: id, name, args });
 
@@ -178,9 +179,9 @@ describe("relay: calls and identity", () => {
     expect(calls[0].operationId).not.toContain("shim-1");
     expect(calls[0].name).toBe("echo");
     expect(calls[0].args).toEqual({ q: "x" });
-    expect(ep.answer(calls[0].operationId, { content: "hi", images: [{ mimeType: "image/png", data: "AAAA" }], unlock: ["late"] })).toBe(true);
+    expect(ep.answer(calls[0].operationId, { content: "hi", images: [{ mimeType: "image/png", data: "AAAA" }], tools: [LATE] })).toBe(true);
     await until(() => c.lines.length === 1);
-    expect(JSON.parse(c.lines[0])).toEqual({ type: "result", callId: "shim-1", content: "hi", isError: false, images: [{ mimeType: "image/png", data: "AAAA" }], unlock: ["late"] });
+    expect(JSON.parse(c.lines[0])).toEqual({ type: "result", callId: "shim-1", content: "hi", isError: false, images: [{ mimeType: "image/png", data: "AAAA" }], tools: [LATE] });
     await ep.close();
   });
 
@@ -217,7 +218,7 @@ describe("relay: calls and identity", () => {
     }
   });
 
-  it("a tool the turn does not offer (or has not unlocked) is answered with an error frame and never reaches onCall", async () => {
+  it("a tool the turn does not offer (not in the visible set) is answered with an error frame and never reaches onCall", async () => {
     const r = rig();
     const { ep, calls } = await r.open();
     const c = new Client(sockOf(ep));

@@ -23,8 +23,9 @@ afterAll(() => roots.forEach((r) => rmSync(r, { recursive: true, force: true }))
 const TOOLS: ToolDef[] = [
   { name: "search", description: "Search the knowledge base", inputSchema: { type: "object", properties: { q: { type: "string" } } } },
   { name: "write_note", description: "Write a note", inputSchema: { type: "object", properties: {} } },
-  { name: "late", description: "Appears after an unlock", inputSchema: { type: "object", properties: {} }, locked: true },
 ];
+/** Arrives with an answer (a skill install), not in the open set. */
+const LATE: ToolDef = { name: "late", description: "Appears after an install", inputSchema: { type: "object", properties: {} } };
 
 interface Rig {
   adapter: ClaudeAdapter;
@@ -139,7 +140,7 @@ describe("claude adapter: tool relay end to end", () => {
     const log = rig.mcpLog();
     expect(log.calls).toHaveLength(1);
     expect(log.calls[0]).toMatchObject({ name: "search", isError: false, text: "RESULT-TEXT" });
-    expect(log.lists[0]).toEqual(["search", "write_note"]); // the locked tool is not listed
+    expect(log.lists[0]).toEqual(["search", "write_note"]); // a tool that has not arrived yet is not listed
   });
 
   it("DOUBLE EXECUTION: the stream's tool_use/tool_result are informational events with their own ids; exactly one tool-call per shim call", async () => {
@@ -184,16 +185,16 @@ describe("claude adapter: tool relay end to end", () => {
     expect(rig.mcpLog().calls[0]).toMatchObject({ isError: true, text: "shot", images: 1 });
   });
 
-  it("unlock: the shim announces the tool, the CLI re-lists, and the unlocked tool can be called in the SAME run", async () => {
+  it("tools that arrive with an answer: the shim announces them, the CLI re-lists, and the new tool can be called in the SAME run", async () => {
     const rig = makeRig();
     rig.scenario({ turn: [{ mcpCall: { name: "search", args: {} } }, { mcpCall: { name: "late", args: {} } }, RESULT_STEP] });
-    await runTurn(rig, (ev, s) => void s.answer(ev.operationId, { kind: "tool-result", ok: true, content: ev.name === "search" ? "installed" : "late-ok", ...(ev.name === "search" ? { unlock: ["late"] } : {}) }));
+    await runTurn(rig, (ev, s) => void s.answer(ev.operationId, { kind: "tool-result", ok: true, content: ev.name === "search" ? "installed" : "late-ok", ...(ev.name === "search" ? { tools: [LATE] } : {}) }));
     const log = rig.mcpLog();
     expect(log.lists).toEqual([["search", "write_note"], ["search", "write_note", "late"]]);
     expect(log.calls.map((c) => [c.name, c.text, c.isError])).toEqual([["search", "installed", false], ["late", "late-ok", false]]);
   });
 
-  it("a locked tool that was never unlocked is refused by the shim and never reaches the host", async () => {
+  it("a tool that never arrived is refused by the shim and never reaches the host", async () => {
     const rig = makeRig();
     rig.scenario({ turn: [{ mcpCall: { name: "late", args: {} } }, RESULT_STEP] });
     const { events } = await runTurn(rig, (ev, s) => void s.answer(ev.operationId, { kind: "tool-result", ok: true, content: "should not run" }));
@@ -269,8 +270,7 @@ describe("claude adapter: tool relay end to end", () => {
     rig.scenario({ turn: [RESULT_STEP] });
     await runTurn(rig, () => undefined);
     const tools = JSON.parse(readFileSync(join(rig.unitTmp, "aw-cfg", "tools.json"), "utf8"));
-    expect(tools.map((t: ToolDef) => t.name)).toEqual(["search", "write_note", "late"]);
-    expect(tools[2].locked).toBe(true);
+    expect(tools).toEqual(TOOLS); // exactly the open set, nothing else (no flags)
     const cfg = JSON.parse(readFileSync(join(rig.unitTmp, "aw-cfg", "mcp.json"), "utf8"));
     expect(cfg.mcpServers.emma).toEqual({ type: "stdio", command: process.execPath, args: [SHIM], env: { AW_RELAY_SOCKET: "/run/aw-relay/relay.sock", AW_RELAY_TOOLS: `${rig.unitTmp}/aw-cfg/tools.json` } });
     const last = JSON.parse(readFileSync(join(rig.ctx.homeDir, ".fake-last-turn.json"), "utf8"));
@@ -302,18 +302,19 @@ describe("claude adapter: relay wiring (stubbed socket)", () => {
   function stubbed() {
     const rig = makeRig();
     let captured: Parameters<RelayHost["open"]>[0] | undefined;
+    const refuse = { on: false };
     const answers: string[] = [];
     const dir = join(tmpdir(), `stub-relay-${process.pid}-${Date.now()}`);
     mkdirSync(dir, { recursive: true });
     roots.push(dir);
     rig.host.open = async (o) => {
       captured = o;
-      return { dir, closed: false, answer: (op) => (answers.push(op), true), close: async () => undefined };
+      return { dir, closed: false, answer: (op) => (answers.push(op), !refuse.on), close: async () => undefined };
     };
-    return { rig, opts: () => captured!, answers };
+    return { rig, opts: () => captured!, answers, refuse };
   }
 
-  it("allowTool follows the manifest: a locked tool is not callable until an accepted answer unlocks it", async () => {
+  it("allowTool follows the visible set: a tool that has not arrived is not callable until an accepted answer carries it", async () => {
     const { rig, opts } = stubbed();
     rig.scenario({ turn: [RESULT_STEP] });
     const session = await rig.adapter.openSession(rig.ctx, { connectionId: "conn1", epoch: 1 });
@@ -323,12 +324,16 @@ describe("claude adapter: relay wiring (stubbed socket)", () => {
     await session.close();
   });
 
-  it("an accepted answer with unlock makes the tool callable; a refused answer (operation gone) does not", async () => {
-    const { rig, opts } = stubbed();
+  it("an accepted answer carrying tools makes them callable; a refused answer (operation gone) does not", async () => {
+    const { rig, opts, refuse } = stubbed();
     rig.scenario({ turn: [RESULT_STEP] });
     const session = await rig.adapter.openSession(rig.ctx, { connectionId: "conn1", epoch: 1 });
     for await (const ev of session.turn({ turnId: "t1", prompt: "go", model: "sonnet", relay: { tools: TOOLS, callTimeoutMs: () => 1000 } })) void ev;
-    expect(session.answer("op", { kind: "tool-result", ok: true, content: "x", unlock: ["late"] })).toBe(true);
+    refuse.on = true;
+    expect(session.answer("op", { kind: "tool-result", ok: true, content: "x", tools: [LATE] })).toBe(false);
+    expect(opts().allowTool("late")).toBe(false); // the shim never received them
+    refuse.on = false;
+    expect(session.answer("op", { kind: "tool-result", ok: true, content: "x", tools: [LATE] })).toBe(true);
     expect(opts().allowTool("late")).toBe(true);
     await session.close();
   });
@@ -407,8 +412,8 @@ describe("claude adapter: lifecycle and memory bounds of the relay", () => {
     const gc = vm.runInNewContext("gc") as () => void;
     const rig = makeRig();
     const session = await rig.adapter.openSession(rig.ctx, { connectionId: "conn1", epoch: 1 });
-    const s = session as unknown as { manifestNames: Set<string>; streamUses: Array<{ messageId: string }>; noteStreamUse(raw: Record<string, unknown>): void };
-    s.manifestNames.add("search");
+    const s = session as unknown as { visibleTools: Set<string>; streamUses: Array<{ messageId: string }>; noteStreamUse(raw: Record<string, unknown>): void };
+    s.visibleTools.add("search");
     const feed = (idChars: number, n: number) => {
       for (let i = 0; i < n; i++) {
         const id = Buffer.alloc(idChars, 120).toString("latin1") + String(i); // a fresh, flat string per message
@@ -436,6 +441,16 @@ describe("claude adapter: lifecycle and memory bounds of the relay", () => {
     rig.scenario({ turn: [{ mcpCall: { name: "search", args: { q: "same" }, messageId: "mA" } }, { mcpCall: { name: "search", args: { q: "same" }, messageId: "mB" } }, RESULT_STEP] });
     const { events } = await runTurn(rig, (ev, s) => void s.answer(ev.operationId, { kind: "tool-result", ok: true, content: "ok" }));
     expect((events.filter((e) => e.type === "tool-call") as Array<{ messageId: string }>).map((c) => c.messageId)).toEqual(["mA", "mB"]);
+  });
+});
+
+describe("claude adapter: MCP server name vs the tool-name cap", () => {
+  const mk = (mcpServerName?: string) => () => new ClaudeAdapter({ binary: { path: FAKE, version: "2.1.294", digest: "sha256:fake" }, systemPromptFile: "/p", turnWrapperPath: WRAPPER, bridgeUrl: "http://127.0.0.1:1/mcp", ...(mcpServerName ? { mcpServerName } : {}) });
+  it("MUTATION TARGET: a server name whose qualified prefix is longer than the protocol's default is refused (the host's name cap would let through names the model API rejects)", () => {
+    expect(mk()).not.toThrow();
+    expect(mk("emma")).not.toThrow();
+    expect(mk("em")).not.toThrow(); // shorter: the cap only gets safer
+    expect(mk("emma2")).toThrow(/mcpServerName longer/);
   });
 });
 

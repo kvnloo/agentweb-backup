@@ -19,7 +19,7 @@ import { chmodSync, chownSync, existsSync, mkdirSync, readdirSync, rmSync } from
 import { createServer, type Server, type Socket } from "net";
 import type { Logger } from "../ports";
 import type { Layout } from "../ports/layout";
-import { RELAY_FRAME_LIMITS, TOOL_NAME } from "../protocol";
+import { RELAY_FRAME_LIMITS, TOOL_NAME, type ToolDef } from "../protocol";
 
 export interface RelayIdentity {
   connectionId: string;
@@ -39,7 +39,8 @@ export interface RelayResult {
   content: string;
   isError?: boolean;
   images?: Array<{ mimeType: string; data: string }>;
-  unlock?: string[];
+  /** Definitions newly available because of this call (already validated by the manager); the shim adds them and waits for the CLI to re-list. */
+  tools?: ToolDef[];
 }
 
 export interface RelayLimits {
@@ -70,7 +71,7 @@ export interface RelayOpenOptions {
   onCall(call: RelayCall): void;
   /** A call that ended without an answer (timeout, shim gone): the adapter forgets its bookkeeping for it. */
   onCallEnded?(operationId: string, why: "timeout" | "disconnected"): void;
-  /** Whether the shim may call this tool now (known to the manifest and not still locked). */
+  /** Whether the shim may call this tool now (in the turn's visible set). */
   allowTool(name: string): boolean;
   /** Milliseconds a call that starts now may take. */
   callTimeoutMs(): number;
@@ -103,7 +104,7 @@ export function resultFrameBytes(callId: string, r: RelayResult): number {
 }
 
 function resultFrame(callId: string, r: RelayResult): Record<string, unknown> {
-  return { type: "result", callId, content: r.content, isError: r.isError === true, ...(r.images?.length ? { images: r.images } : {}), ...(r.unlock?.length ? { unlock: r.unlock } : {}) };
+  return { type: "result", callId, content: r.content, isError: r.isError === true, ...(r.images?.length ? { images: r.images } : {}), ...(r.tools?.length ? { tools: r.tools } : {}) };
 }
 
 export class RelayHost {

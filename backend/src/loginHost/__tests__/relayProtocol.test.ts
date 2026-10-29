@@ -1,11 +1,11 @@
 /**
- * ENG-2113: protocol 4 — the tools manifest, the dual turn.run shape, turn.toolResult's images/unlock and the per-route body cap (through the socket).
+ * ENG-2113: protocol 4 — the tools manifest, the dual turn.run shape, turn.toolResult's images/tools and the per-route body cap (through the socket).
  */
 import { mkdtempSync, rmSync } from "fs";
 import { request } from "http";
 import { tmpdir } from "os";
 import { join } from "path";
-import { IMAGE_LIMITS, PROTOCOL_VERSION, ROUTES, TOOL_LIMITS } from "../protocol";
+import { IMAGE_LIMITS, MODEL_TOOL_NAME_MAX_CHARS, PROTOCOL_VERSION, qualifiedToolPrefix, RELAY_MCP_SERVER_NAME, maxToolNameChars, ROUTES, TOOL_LIMITS, TOOL_NAME, TOOL_NAME_MAX_CHARS } from "../protocol";
 import { startHostServer, type HostServerHandle } from "../server";
 import { makeRig, signIn, turnReq, type Rig } from "./helpers";
 
@@ -41,13 +41,27 @@ describe("turn.run: exactly one tool transport", () => {
 
 describe("tools manifest bounds", () => {
   const bad = (tools: unknown[]) => detail(run({ tools }));
-  it("names are the function-name shape every Emma tool already has: ^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$", () => {
-    for (const n of ["", "-a", "--dangerously-skip-permissions", "a b", "a.b", "../x", "a/b", "x".repeat(65), "é", "a\0", "a$b", "a%b"]) expect(run({ tools: [tool(n)] }).success).toBe(false);
+  it("names are the function-name shape every Emma tool already has, at most TOOL_NAME_MAX_CHARS (53)", () => {
+    for (const n of ["", "-a", "--dangerously-skip-permissions", "a b", "a.b", "../x", "a/b", "x".repeat(54), "x".repeat(64), "é", "a\0", "a$b", "a%b"]) expect(run({ tools: [tool(n)] }).success).toBe(false);
     // what user-connected MCP servers and the registry produce today
-    expect(run({ tools: [tool("browser_navigate"), tool("getIssue"), tool("list-pages"), tool("x".repeat(64)), tool("A_1")] }).success).toBe(true);
-    expect(run({ tools: [tool("x".repeat(48)), tool("a_1")] }).success).toBe(true);
+    expect(run({ tools: [tool("browser_navigate"), tool("getIssue"), tool("list-pages"), tool("x".repeat(53)), tool("A_1")] }).success).toBe(true);
+    expect(run({ tools: [tool("x".repeat(54))] }).success).toBe(false);
   });
-  it("the shim-reserved prefix, duplicates and an all-locked manifest are refused", () => {
+  it("MUTATION TARGET: the name cap is DERIVED from the qualified prefix the CLI adds (mcp__<server>__) and the model API's 64 characters", () => {
+    expect(qualifiedToolPrefix(RELAY_MCP_SERVER_NAME)).toBe("mcp__emma__");
+    expect(qualifiedToolPrefix(RELAY_MCP_SERVER_NAME)).toHaveLength(11);
+    expect(TOOL_NAME_MAX_CHARS).toBe(MODEL_TOOL_NAME_MAX_CHARS - qualifiedToolPrefix(RELAY_MCP_SERVER_NAME).length);
+    expect(TOOL_NAME_MAX_CHARS).toBe(53);
+    // a different server name changes the cap
+    expect(maxToolNameChars("emma")).toBe(53);
+    expect(maxToolNameChars("emma2")).toBe(52);
+    expect(maxToolNameChars("x")).toBe(64 - "mcp__x__".length);
+    // the longest accepted name, qualified, is exactly what the model API takes; one more is not
+    expect(`${qualifiedToolPrefix(RELAY_MCP_SERVER_NAME)}${"x".repeat(TOOL_NAME_MAX_CHARS)}`).toHaveLength(64);
+    expect(TOOL_NAME.safeParse("x".repeat(TOOL_NAME_MAX_CHARS)).success).toBe(true);
+    expect(TOOL_NAME.safeParse("x".repeat(TOOL_NAME_MAX_CHARS + 1)).success).toBe(false);
+  });
+  it("the shim-reserved prefix and duplicates are refused, and there is no `locked` flag any more", () => {
     expect(bad([tool("aw_relay_ping")])).toBe("tools:tool_name_reserved");
     expect(bad([tool("a"), tool("a")])).toBe("tools:tool_duplicate");
     // case-insensitive: names differing only in case, and the reserved prefix in any case
@@ -55,8 +69,7 @@ describe("tools manifest bounds", () => {
     expect(bad([tool("AW_RELAY_x")])).toBe("tools:tool_name_reserved");
     expect(bad([tool("Aw_Relay_ping")])).toBe("tools:tool_name_reserved");
     expect(run({ tools: [tool("getIssue"), tool("getIssues")] }).success).toBe(true);
-    expect(bad([tool("a", { locked: true })])).toBe("tools:tool_all_locked");
-    expect(run({ tools: [tool("a"), tool("b", { locked: true })] }).success).toBe(true);
+    expect(run({ tools: [tool("a", { locked: true })] }).success).toBe(false); // a closed schema: the open set is all there is
   });
   it("count, total bytes, description and schema sizes are capped", () => {
     expect(run({ tools: Array.from({ length: TOOL_LIMITS.maxTools }, (_, i) => tool(`t${i}`)) }).success).toBe(true);
@@ -81,10 +94,10 @@ describe("turn.toolResult shape", () => {
   const base = { connectionId: "c1", turnId: "t1", epoch: 1, operationId: "a".repeat(32), content: "r" };
   const parse = (o: Record<string, unknown>) => ROUTES["turn.toolResult"].safeParse({ ...base, ...o });
   const img = (n: number, mimeType = "image/png") => ({ mimeType, data: "A".repeat(n) });
-  it("accepts text, isError, up to 4 images of the 4 mime types, and unlock names", () => {
+  it("accepts text, isError, up to 4 images of the 4 mime types, and new tool definitions", () => {
     expect(parse({}).success).toBe(true);
     expect(parse({ isError: true }).success).toBe(true);
-    expect(parse({ images: ["image/png", "image/jpeg", "image/webp", "image/gif"].map((m) => img(8, m)), unlock: ["late_tool"] }).success).toBe(true);
+    expect(parse({ images: ["image/png", "image/jpeg", "image/webp", "image/gif"].map((m) => img(8, m)), tools: [tool("late_tool")] }).success).toBe(true);
   });
   it("refuses a fifth image, other mime types, non-base64, per-image and total overflows", () => {
     expect(parse({ images: Array.from({ length: IMAGE_LIMITS.maxImages + 1 }, () => img(8)) }).success).toBe(false);
@@ -96,9 +109,26 @@ describe("turn.toolResult shape", () => {
     expect(parse({ images: [img(2_000_000), img(2_000_000), img(2_000_000)] }).success).toBe(true); // exactly 6M
     expect(parse({ images: [img(2_000_000), img(2_000_000), img(2_000_000), img(4)] }).success).toBe(false);
   });
-  it("refuses bad unlock names, a legacy `ok` field and any unknown field", () => {
-    expect(parse({ unlock: ["../x"] }).success).toBe(false);
-    expect(parse({ unlock: [] }).success).toBe(false);
+  it("tools carried by a result: each entry validated like the manifest's (name pattern and length, reserved prefix in any case, schema and description caps, object schema)", () => {
+    const bad = (tools: unknown[]) => (parse({ tools }).success ? "" : parse({ tools }).error!.issues.map((i) => i.message).join(","));
+    expect(parse({ tools: [tool("late_tool")] }).success).toBe(true);
+    for (const n of ["", "-x", "../x", "a b", "x".repeat(TOOL_NAME_MAX_CHARS + 1)]) expect(parse({ tools: [tool(n)] }).success).toBe(false);
+    expect(bad([tool("aw_relay_x")])).toBe("tool_name_reserved");
+    expect(bad([tool("AW_RELAY_x")])).toBe("tool_name_reserved");
+    expect(bad([tool("a", { inputSchema: { type: "string" } })])).toBe("tool_schema_not_object");
+    expect(bad([tool("a", { inputSchema: { type: "object", properties: { p: { type: "string", description: "x".repeat(TOOL_LIMITS.maxSchemaBytes) } } } })])).toBe("tool_schema_too_large");
+    expect(parse({ tools: [tool("a", { description: "x".repeat(TOOL_LIMITS.maxDescriptionBytes + 1) })] }).success).toBe(false);
+    expect(parse({ tools: [tool("a", { locked: true })] }).success).toBe(false);
+    expect(parse({ tools: [] }).success).toBe(false);
+    expect(parse({ tools: Array.from({ length: TOOL_LIMITS.maxTools + 1 }, (_, i) => tool(`t${i}`)) }).success).toBe(false);
+  });
+  it("tools carried by a result: case variants inside one answer are refused, an exact repeat is a harmless no-op", () => {
+    const bad = parse({ tools: [tool("getIssue"), tool("getissue")] });
+    expect(bad.success ? "" : bad.error.issues[0].message).toBe("tool_duplicate");
+    expect(parse({ tools: [tool("getIssue"), tool("getIssue")] }).success).toBe(true);
+  });
+  it("refuses the old `unlock` field, a legacy `ok` field and any unknown field", () => {
+    expect(parse({ unlock: ["late_tool"] }).success).toBe(false);
     expect(parse({ ok: true }).success).toBe(false);
     expect(parse({ images: [{ ...img(8), extra: 1 }] }).success).toBe(false);
   });
@@ -162,6 +192,21 @@ describe("per-route body cap (through the socket)", () => {
     expect((await post(sock, "login.complete", other)).status).toBe(413);
     const over = JSON.stringify({ connectionId: "c1", turnId: "t1", epoch: 1, operationId: "a".repeat(32), content: "x".repeat(8 * 1024 * 1024 + 10) });
     expect((await post(sock, "turn.toolResult", over)).status).toBe(413);
+  });
+
+  it("invalid tool definitions in a result are refused (route or host) and the operation stays PENDING; the retry without them succeeds", async () => {
+    await signIn(rig, "c1", 1);
+    rig.script.turnEvents = [{ type: "tool-call", operationId: "op1", messageId: "m", name: "t", input: {} }, { wait: new Promise<void>(() => undefined) }];
+    const it = (await rig.mgr.runTurn({ ...turnReq("c1", 1, { turnId: "t1" }), bridgeToken: undefined, tools: [tool("t")] })).events![Symbol.asyncIterator]();
+    await it.next();
+    const body = (tools: unknown[]) => JSON.stringify({ connectionId: "c1", turnId: "t1", epoch: 1, operationId: "op1", content: "r", tools });
+    expect(await post(sock, "turn.toolResult", body([tool("aw_relay_x")]))).toMatchObject({ status: 400, json: { error: "EINVALID", detail: "tools:tool_name_reserved" } });
+    expect(await post(sock, "turn.toolResult", body([tool("x".repeat(TOOL_NAME_MAX_CHARS + 1))]))).toMatchObject({ status: 400, json: { error: "EINVALID" } });
+    expect(await post(sock, "turn.toolResult", body([tool("T")]))).toMatchObject({ status: 400, json: { error: "EINVALID", detail: "tools_invalid" } }); // case variant of the visible "t"
+    expect(rig.script.answers).toHaveLength(0);
+    expect((await post(sock, "turn.toolResult", body([tool("late")]))).status).toBe(200); // still pending
+    expect(rig.script.answers).toHaveLength(1);
+    await it.return?.();
   });
 
   it("mixing bridgeToken and tools answers EINVALID with the reason, end to end", async () => {

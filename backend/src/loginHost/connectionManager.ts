@@ -23,7 +23,7 @@
  */
 import { createHash } from "crypto";
 import type { Hazard, LoginProcess, ProviderEvent, ProviderSession, SubscriptionProviderAdapter } from "./adapter";
-import { HostError, RELAY_FRAME_LIMITS, type RouteInput } from "./protocol";
+import { admitNewTools, HostError, RELAY_FRAME_LIMITS, type RouteInput, type ToolDef, type VisibleTools, visibleFromManifest } from "./protocol";
 import { canonicalJson } from "./relay/canonical";
 import { resultFrameBytes } from "./relay/relayServer";
 import type { Clock, IdGen, Logger, UserFsPort } from "./ports";
@@ -111,10 +111,8 @@ interface RunningTurn {
   operations: Map<string, number>;
   /** The operations that are `tool-call` events of the relay (their clock is the turn's deadline, not the host default). */
   relayOps: Set<string>;
-  /** The turn's relay manifest: the names a result may unlock are the ones marked `locked` at the START (fixed). Absent on a legacy turn. */
-  lockedTools?: ReadonlySet<string>;
-  /** Locked names an accepted answer has already unlocked: naming one again is a harmless no-op (a backend retry), not an error. */
-  unlockedTools?: Set<string>;
+  /** The tools this relay turn can call right now: its open set at the start plus what accepted answers added (bounded by TOOL_LIMITS, cumulatively). Absent on a legacy turn. */
+  visible?: VisibleTools;
   /** Ends the turn. Safe at any moment, including before the session has finished opening. */
   abort: (reason: string) => void;
   onAbort?: () => void;
@@ -507,7 +505,7 @@ export class ConnectionManager {
       priority,
       operations: new Map(),
       relayOps: new Set(),
-      ...(req.tools ? { lockedTools: new Set(req.tools.filter((t) => t.locked).map((t) => t.name)), unlockedTools: new Set<string>() } : {}),
+      ...(req.tools ? { visible: visibleFromManifest(req.tools) } : {}),
       abort: (reason: string) => {
         const first = running.aborted === undefined;
         running.aborted ??= reason;
@@ -690,9 +688,16 @@ export class ConnectionManager {
     if (t.aborted !== undefined) throw new HostError("ESTALE", "turn_aborted");
     if (!t.operations.has(req.operationId)) throw new HostError("ENOTFOUND", "operation_unknown");
     // Everything that can be refused is refused BEFORE the operation is consumed, so the backend can retry with a smaller/valid answer.
-    for (const name of req.unlock ?? []) if (!t.lockedTools?.has(name)) throw new HostError("EINVALID", "unlock_unknown_tool"); // validated against the manifest's locked set from the start
-    const fresh = (req.unlock ?? []).filter((n) => !t.unlockedTools?.has(n)); // an already unlocked name is a no-op, not an error
-    if (resultFrameBytes("x".repeat(64), { content: req.content, ...(req.images ? { images: req.images } : {}), ...(fresh.length ? { unlock: fresh } : {}) }) > RELAY_FRAME_LIMITS.hostToShimBytes) throw new HostError("EINVALID", "result_too_large");
+    // Tools that arrive with the answer: only a relay turn has a visible set; names already visible are a no-op (a backend retry), the rest must fit the cumulative caps.
+    let admitted: { fresh: ToolDef[]; bytes: number } | undefined;
+    if (req.tools) {
+      if (!t.visible) throw new HostError("EINVALID", "tools_invalid");
+      const r = admitNewTools(t.visible, req.tools);
+      if (!r.ok) throw new HostError("EINVALID", r.code);
+      admitted = r;
+    }
+    const fresh = admitted?.fresh ?? [];
+    if (resultFrameBytes("x".repeat(64), { content: req.content, ...(req.images ? { images: req.images } : {}), ...(fresh.length ? { tools: fresh } : {}) }) > RELAY_FRAME_LIMITS.hostToShimBytes) throw new HostError("EINVALID", "result_too_large");
     t.operations.delete(req.operationId);
     t.relayOps.delete(req.operationId);
     const session = await t.hs.ready;
@@ -701,10 +706,16 @@ export class ConnectionManager {
       ok: req.isError !== true,
       content: req.content,
       ...(req.images ? { images: req.images } : {}),
-      ...(fresh.length ? { unlock: fresh } : {}),
+      ...(fresh.length ? { tools: fresh } : {}),
     });
     if (accepted === false) throw new HostError("ESTALE", "result_lost"); // the provider no longer has that operation (its own timer fired first)
-    for (const name of fresh) t.unlockedTools?.add(name);
+    if (admitted && t.visible) {
+      for (const tool of admitted.fresh) {
+        t.visible.names.add(tool.name);
+        t.visible.folded.add(tool.name.toLowerCase());
+      }
+      t.visible.bytes = admitted.bytes;
+    }
     return { ok: true };
   }
 

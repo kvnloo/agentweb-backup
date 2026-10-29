@@ -67,7 +67,7 @@ export type ServerRequest =
   | { kind: "elicitation"; detail: string };
 
 export type ServerRequestAnswer =
-  | { kind: "tool-result"; ok: boolean; content: string; images?: Array<{ mimeType: string; data: string }>; unlock?: string[] }
+  | { kind: "tool-result"; ok: boolean; content: string; images?: Array<{ mimeType: string; data: string }>; tools?: import("./protocol").ToolDef[] }
   | { kind: "decline" };
 
 /** What a turn needs besides the prompt. Legacy: `bridgeToken` (HTTP bridge). Relay: `relay` (stdio shim + per-turn socket). */
