@@ -1167,7 +1167,7 @@ export async function linkedinOutreach(
   // relative to a stranger's account. `usedSharedAccount` (+ `sharedAccountId`)
   // is threaded into every read-action response below so callers can caveat
   // or refuse degree-based logic instead of silently trusting it.
-  const READ_ACTIONS_WITH_FALLBACK = ['get-profile', 'search-people', 'get-company', 'search-parameters'];
+  const READ_ACTIONS_WITH_FALLBACK = ['get-profile', 'search-people', 'get-company', 'search-parameters', 'list-post-engagers'];
   let usedSharedAccount = false;
   if (READ_ACTIONS_WITH_FALLBACK.includes(action)) {
     if (!account_id) {
@@ -2135,6 +2135,44 @@ export async function linkedinOutreach(
         return { success: true, data: withAccountMeta(companyResult.rawData) };
       }
 
+      case 'list-post-engagers': {
+        // ENG-2739: one row per distinct commenter on a post — a warm-lead source.
+        // Reactors are not covered: the Unipile SDK exposes no reactions listing.
+        const postId = typeof args.post_id === 'string' ? args.post_id.trim() : '';
+        if (!postId) throw new Error('post_id is required for list-post-engagers (a LinkedIn post URL, urn:li:activity:… URN, or Unipile social id)');
+        const rawLimit = Number(args.limit);
+        const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.floor(rawLimit), 100) : undefined;
+        const comments = await linkedInOutreachService.listPostComments(postId, account_id, { cursor: args.cursor, limit });
+        const seen = new Set<string>();
+        const engagers: any[] = [];
+        let anonymizedSkipped = 0;
+        for (const comment of comments.items) {
+          const details = comment?.author_details ?? {};
+          const providerId = typeof details.id === 'string' ? details.id : null;
+          const profileUrl = usableProfileUrl(details.profile_url);
+          // ENG-1198 pattern: an out-of-network author has no profile we can reach
+          // or dedup on — drop it and report the count instead of a fake lead.
+          if (!providerId || !profileUrl || details.network_distance === 'OUT_OF_NETWORK') {
+            anonymizedSkipped++;
+            continue;
+          }
+          if (seen.has(providerId)) continue;
+          seen.add(providerId);
+          const text = typeof comment.text === 'string' ? comment.text : '';
+          engagers.push({
+            name: comment.author ?? null,
+            headline: details.headline ?? null,
+            profile_url: profileUrl,
+            provider_id: providerId,
+            comment_snippet: text.length > 200 ? `${text.slice(0, 197)}...` : text,
+          });
+        }
+        return {
+          success: true,
+          data: withAccountMeta({ post_id: comments.socialId, items: engagers, anonymizedSkipped, cursor: comments.cursor }),
+        };
+      }
+
       case 'cancel-invitation': {
         const invitationId = args.invitation_id;
         if (!invitationId) throw new Error('invitation_id is required for cancel-invitation');
@@ -2291,7 +2329,7 @@ export async function linkedinOutreach(
       }
 
       default: {
-        const validActions = ['search-people','get-profile','list-connections','list-sent-invitations','list-received-invitations','send-invite','send-message','send-inmail','get-company','cancel-invitation','accept-invitation','update-conversation-history','search-parameters','set-daily-invite-cap'];
+        const validActions = ['search-people','get-profile','list-connections','list-sent-invitations','list-received-invitations','send-invite','send-message','send-inmail','get-company','cancel-invitation','accept-invitation','update-conversation-history','search-parameters','set-daily-invite-cap','withdraw-stale-invitations','list-post-engagers'];
         throw new Error(`Unsupported LinkedIn outreach action: "${action}". Valid actions are: ${validActions.join(', ')}`);
       }
     }

@@ -1505,6 +1505,56 @@ export class LinkedInOutreachService {
   }
 
   /**
+   * ENG-2739: list the comments on a LinkedIn post.
+   *
+   * Unipile's comments endpoint keys on the post's social id
+   * (`urn:li:activity:…` / `urn:li:ugcPost:…`). A URN — bare or embedded in a
+   * `/feed/update/…` URL — is used as-is; anything else (a `/posts/…-activity-<n>-…`
+   * URL or a bare numeric id) is resolved through `getPost`, which reports the
+   * authoritative social id (a share URL's activity number can belong to a ugcPost).
+   */
+  async listPostComments(
+    postId: string,
+    accountId: string,
+    opts: { cursor?: string; limit?: number } = {},
+  ): Promise<{ socialId: string; items: any[]; cursor: string | null }> {
+    try {
+      const client = await this.getClient();
+      let socialId = LinkedInOutreachService.extractPostUrn(postId);
+      if (!socialId) {
+        const numericId = LinkedInOutreachService.extractPostNumericId(postId);
+        if (!numericId) {
+          throw new Error(`Could not read a LinkedIn post id from "${postId}". Pass a post URL, a urn:li:activity:… URN, or a Unipile social id.`);
+        }
+        const post = await client.users.getPost({ account_id: accountId, post_id: numericId });
+        socialId = post.social_id;
+      }
+      this.log(`Listing post comments: ${socialId}`, { accountId, cursor: opts.cursor });
+      const result = await client.users.getAllPostComments({
+        account_id: accountId,
+        post_id: socialId,
+        ...(opts.limit ? { limit: opts.limit } : {}),
+        ...(opts.cursor ? { cursor: opts.cursor } : {}),
+      });
+      return { socialId, items: Array.isArray(result?.items) ? result.items : [], cursor: result?.cursor ?? null };
+    } catch (error: any) {
+      return this.handleError(error, 'listPostComments');
+    }
+  }
+
+  private static extractPostUrn(postId: string): string | null {
+    let decoded = postId.trim();
+    try { decoded = decodeURIComponent(decoded); } catch { /* keep raw */ }
+    return decoded.match(/urn:li:(?:activity|ugcPost|share):\d+/)?.[0] ?? null;
+  }
+
+  private static extractPostNumericId(postId: string): string | null {
+    const trimmed = postId.trim();
+    if (/^\d+$/.test(trimmed)) return trimmed;
+    return trimmed.match(/activity-(\d+)/)?.[1] ?? null;
+  }
+
+  /**
    * Cancel a pending connection invitation.
    */
   async cancelInvitation(invitationId: string, accountId: string): Promise<any> {

@@ -125,7 +125,8 @@ preference:
 
 1. ENGAGEMENT MINING — people who commented on or reacted to posts relevant to
    the target audience. They have already shown the interest you are selecting
-   for.
+   for. Use linkedin_outreach action 'list-post-engagers' on a relevant post to
+   get its commenters.
 2. EMPLOYER-EVENT TWO-HOP — find companies with a recent trigger event first
    (funding, launch, hiring surge, leadership change), then find the people at
    those companies who match the audience above.
