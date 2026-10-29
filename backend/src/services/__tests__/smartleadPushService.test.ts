@@ -75,7 +75,7 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
         listCampaigns: async () => [
           { id: 1, name: "Draft", status: "DRAFTED" }, { id: 2, name: "Live", status: "ACTIVE" }, { id: 3, name: "Old", status: "ARCHIVED" }, { id: 4, name: "Paused", status: "PAUSED" },
         ] as any,
-        getCampaign: async () => (sl.campaignMissing ? null : ({ id: CAMPAIGN, name: "Q4", status: sl.status, maxLeadsPerDay: 100, addUnsubscribeTag: true } as any)),
+        getCampaign: async () => (sl.campaignMissing ? null : ({ id: CAMPAIGN, name: "Q4", status: sl.status, maxLeadsPerDay: 100, addUnsubscribeTag: sl.addUnsubscribeTag } as any)),
         getSequences: async () => { if (!sl.sequences) throw new SmartleadApiError("boom", 500); return sl.sequences; },
         getMailboxes: async () => [{ id: 1, email: "a@x.com", dailyLimit: 30 }],
         addLeads: (_k, _c, x) => sl.addLeads(x),
@@ -252,6 +252,36 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
       expect(await e.svc.start("owner", go(p.token))).toMatchObject({ ok: false, status: 400, code: "active_confirmation_required" });
       expect(await e.svc.start("owner", go(p.token, { acknowledgements: { lawfulBasis: true, activeConfirmed: true } }))).toMatchObject({ ok: true, started: true });
       await drain(e);
+    });
+
+    it("a campaign already sending with no unsubscribe link needs its own acknowledgement; a draft only warns", async () => {
+      const e = env();
+      e.sl.status = "ACTIVE";
+      e.sl.addUnsubscribeTag = false;
+      const p = await approve(e);
+      expect(p.requiresUnsubscribeAcknowledgement).toBe(true);
+      expect(p.preflight.warnings.map((w: any) => w.code)).toContain("no_unsubscribe");
+      // the active confirmation alone is not enough
+      expect(await e.svc.start("owner", go(p.token, { acknowledgements: { lawfulBasis: true, activeConfirmed: true } }))).toMatchObject({ ok: false, status: 400, code: "unsubscribe_acknowledgement_required" });
+      const ok = await e.svc.start("owner", go(p.token, { acknowledgements: { lawfulBasis: true, activeConfirmed: true, noUnsubscribeAccepted: true } }));
+      expect(ok).toMatchObject({ ok: true, started: true });
+      // the acceptance is kept in the run's audit
+      expect((await db.getRun((ok as any).run.runId))!.options.acknowledgements).toEqual({ lawfulBasis: true, activeConfirmed: true, noUnsubscribeAccepted: true });
+      await drain(e);
+
+      const d = env();
+      d.sl.addUnsubscribeTag = false; // DRAFTED
+      const dp = await approve(d);
+      expect(dp.requiresUnsubscribeAcknowledgement).toBe(false);
+      expect(await d.svc.start("owner", go(dp.token))).toMatchObject({ ok: true, started: true });
+      await drain(d);
+
+      const f = env();
+      f.sl.status = "ACTIVE"; // sending, but the link is there
+      const fp = await approve(f);
+      expect(fp.requiresUnsubscribeAcknowledgement).toBe(false);
+      expect(await f.svc.start("owner", go(fp.token, { acknowledgements: { lawfulBasis: true, activeConfirmed: true } }))).toMatchObject({ ok: true, started: true });
+      await drain(f);
     });
 
     it("lets exactly one of two simultaneous starts win; the other is told which run is live", async () => {

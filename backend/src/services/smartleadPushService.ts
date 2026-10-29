@@ -375,6 +375,10 @@ export class SmartleadPushService {
       if (analysis.hash !== token.sequenceHash) return fail(409, "sequence_changed", "The campaign's sequence changed after you previewed. Preview again.");
       const preflight = preflightSequence(analysis, { status: campaign.status, mapping: token.mapping, acknowledgedTags: token.acknowledgedTags, acknowledgeUnreadable: token.acknowledgeUnreadable, addUnsubscribeTag: campaign.addUnsubscribeTag, unsubscribeText: campaign.unsubscribeText });
       if (preflight.blocks.length > 0) return fail(409, "blocked", "The campaign cannot be pushed to as it stands.", preflight.blocks);
+      // A campaign that is already sending and whose emails carry no unsubscribe link: people would be emailed with no way to opt out, so the user accepts that in words.
+      if (decision === "needs_confirmation" && preflight.missingUnsubscribe && body.acknowledgements?.noUnsubscribeAccepted !== true) {
+        return fail(400, "unsubscribe_acknowledgement_required", "This campaign is already sending and its emails have no unsubscribe link. Confirm that contacts may receive them without one, or set the unsubscribe text in Smartlead first.");
+      }
       if (token.eligible < 1) return fail(400, "nothing_to_push", "There is nothing to push.");
 
       // The approval is single use: replaying it would push another cohort (earlier runs' markers do not count toward a new run's ceiling).
@@ -412,7 +416,7 @@ export class SmartleadPushService {
           options: {
             includeUnverified: token.includeUnverified, mapping: token.mapping, acknowledgedTags: token.acknowledgedTags, startStatus: token.startStatus, warnings: token.warnings,
             approvedAt: new Date(token.iat).toISOString(),
-            acknowledgements: { lawfulBasis: true, ...(campaign.status === "ACTIVE" ? { activeConfirmed: true } : {}) },
+            acknowledgements: { lawfulBasis: true, ...(campaign.status === "ACTIVE" ? { activeConfirmed: true } : {}), ...(decision === "needs_confirmation" && preflight.missingUnsubscribe ? { noUnsubscribeAccepted: true } : {}) },
           },
           sequenceHash: token.sequenceHash, previewEligible: token.eligible,
         },

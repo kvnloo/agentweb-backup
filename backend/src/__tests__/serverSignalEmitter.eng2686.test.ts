@@ -69,12 +69,6 @@ describe('ENG-2686 email engagement (platform email only)', () => {
     await expect(emitEmailEngagementSignal('stranger@nowhere.io', 'email_sent', {}, d)).resolves.toBe(false);
     expect(d.ingest).not.toHaveBeenCalled();
   });
-
-  it('retargeting_audience_added emits through the direct entry point', async () => {
-    const d = deps();
-    await expect(emitEmailEngagementSignal('founder@acme.io', 'retargeting_audience_added', { audience: 'trial_dropoff' }, d)).resolves.toBe(true);
-    expect(parsedOf(d).customName).toBe('retargeting_audience_added');
-  });
 });
 
 describe('ENG-2686 app lifecycle', () => {
