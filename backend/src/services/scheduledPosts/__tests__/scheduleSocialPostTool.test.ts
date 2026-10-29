@@ -21,10 +21,10 @@ function makeRepo(): ScheduledPostCommandRepository & { rows: Map<string, OwnedS
   const rows = new Map<string, OwnedScheduledPost>();
   return {
     rows,
-    async get(id) { return rows.get(id); },
-    async save(r) { rows.set(r.id, r); },
-    async listByUser(userId) { return [...rows.values()].filter((r) => r.userId === userId); },
-    async saveIfUnchanged(r, expected) {
+    async get(id: string) { return rows.get(id); },
+    async save(r: OwnedScheduledPost) { rows.set(r.id, r); },
+    async listByUser(userId: string) { return [...rows.values()].filter((r) => r.userId === userId); },
+    async saveIfUnchanged(r: OwnedScheduledPost, expected: { status: OwnedScheduledPost['status']; updatedAt?: Date }) {
       const cur = rows.get(r.id);
       if (!cur || cur.status !== expected.status || cur.updatedAt?.getTime() !== expected.updatedAt?.getTime()) return false;
       rows.set(r.id, r);
