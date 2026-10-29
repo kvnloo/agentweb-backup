@@ -18,6 +18,7 @@
  *     persisted tool result gets the deterministic note, and an identical retry gets the original outcome back instead of running again.
  *   - Nothing here logs a frame, an argument, a result or an image: log lines carry fixed codes and counts.
  */
+import { createHash } from "crypto";
 import { IMAGE_LIMITS, toolImage, type ToolImage } from "../../loginHost/protocol";
 import { LoginHostError, ToolResultLostError, type LoginHostClient } from "./loginHostClient";
 import { ToolBridgeAuthError, stableStringify, type BridgeCallResult, type BridgeListedTool } from "./toolBridge";
@@ -43,7 +44,10 @@ const DEFAULT_MAX_CALLS = 400;
 const MAX_REPLAYS = 8;
 const MAX_REPLAY_BYTES = 256 * 1024;
 const MAX_DELIVERY_ATTEMPTS = 3;
-const MESSAGE_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
+/** Stream announcements kept per turn (oldest dropped). */
+const MAX_ANNOUNCED = 512;
+/** How long a call waits for the stream line that announces it (the worker can hand the call over a moment before that line). */
+const DEFAULT_ANNOUNCE_WAIT_MS = 1_500;
 
 export interface RelayBridgePort {
   callTool(token: string, call: { name: string; args: Record<string, unknown>; callId?: string }, runId: string, opts?: { signal?: AbortSignal }): Promise<BridgeCallResult>;
@@ -74,8 +78,10 @@ export interface RelayDispatcherOptions {
   maxCalls?: number;
   /** Called ONCE when the worker exceeds the call cap or the in-flight limit: the caller interrupts the turn (A16). Further calls are dropped unanswered. */
   onLimitTripped?: () => void;
-  /** Whether the session is waiting on a confirmation (a halt latched). Absent = treated as yes (the safe direction). */
-  isHalted?: () => boolean;
+  /** Whether the session is waiting on a confirmation (a halt latched). Required: the relay's halt grouping depends on it. */
+  isHalted: () => boolean;
+  /** See DEFAULT_ANNOUNCE_WAIT_MS (tests shorten it). */
+  announceWaitMs?: number;
   /** Progress hooks (the chat's "executing" statuses). Must not throw. Never called after `close()`. */
   onCall?: (phase: "start" | "end", name: string) => void;
 }
@@ -95,6 +101,11 @@ interface Answer {
   unlock?: string[];
   /** For a real execution: how to remember its original text if the worker cannot take the answer. */
   replay?: { key: string; content: string; isError: boolean };
+}
+
+/** A bounded, canonical key for a tool input (key order does not matter). */
+function argKey(input: unknown): string {
+  return createHash("sha256").update(stableStringify(input ?? {})).digest("hex");
 }
 
 const TRUNCATED_NOTE = "\n[truncated: the tool's output was longer than can be returned]";
@@ -122,6 +133,18 @@ export class RelayToolDispatcher {
   private readonly delivered = new Set<string>();
   private closed = false;
   private tripped = false;
+  /**
+   * The model messages, as the CLI's stream announced them (B1). A stream `tool-use` is informational and never executed; it is recorded here (name, a
+   * canonical form of the input) in BATCHES: consecutive tool-uses with no tool-result between them are one model message. A relayed call is grouped by
+   * the announcement it matches, NOT by the worker's message id (which a worker can get wrong, or forge).
+   */
+  private readonly announced: Array<{ seq: number; batch: number; name: string; key: string; claimed: boolean }> = [];
+  private announceSeq = 0;
+  private batch = 0;
+  private batchOpen = false;
+  private readonly announceWaiters = new Set<() => void>();
+  /** The model message of the call that latched this turn's halt, and the last announcement recorded before its answer went back. */
+  private halt: { batch: number; cutoff: number } | undefined;
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
   private calls = 0;
@@ -177,6 +200,68 @@ export class RelayToolDispatcher {
     } catch {
       this.log("start_failed");
       return false;
+    }
+  }
+
+  /** A stream tool-use (informational). Only names of the manifest are kept; never executed, never handed to the bridge. Never throws. */
+  noteStreamUse(rawName: unknown, input: unknown): void {
+    try {
+      if (typeof rawName !== "string") return;
+      const name = rawName.replace(/^mcp__[A-Za-z0-9_-]+?__/, "");
+      if (!this.inManifest(name)) return;
+      if (!this.batchOpen) {
+        this.batch++;
+        this.batchOpen = true;
+      }
+      this.announced.push({ seq: ++this.announceSeq, batch: this.batch, name, key: argKey(input), claimed: false });
+      if (this.announced.length > MAX_ANNOUNCED) this.announced.splice(0, this.announced.length - MAX_ANNOUNCED);
+      for (const wake of [...this.announceWaiters]) wake();
+    } catch {
+      /* an input that cannot be serialized is simply not an announcement */
+    }
+  }
+
+  /** A stream tool-result: the model message that was being announced is complete; the next tool-use starts a new one. */
+  noteStreamResult(): void {
+    this.batchOpen = false;
+  }
+
+  private claim(name: string, key: string): { seq: number; batch: number } | undefined {
+    const hit = this.announced.find((a) => !a.claimed && a.name === name && a.key === key);
+    if (!hit) return undefined;
+    hit.claimed = true;
+    return hit;
+  }
+
+  private async claimOrWait(name: string, key: string): Promise<{ seq: number; batch: number } | undefined> {
+    const first = this.claim(name, key);
+    if (first) return first;
+    const waitMs = this.o.announceWaitMs ?? DEFAULT_ANNOUNCE_WAIT_MS;
+    if (waitMs <= 0) return undefined;
+    // A real-time bound (not the injectable deadline clock): one timer for the whole wait, each announcement re-checks the claim.
+    let expired = false;
+    let wakeAll: () => void = () => undefined;
+    const timer = setTimeout(() => {
+      expired = true;
+      wakeAll();
+    }, waitMs);
+    timer.unref?.();
+    try {
+      for (;;) {
+        await new Promise<void>((resolve) => {
+          const wake = () => {
+            this.announceWaiters.delete(wake);
+            resolve();
+          };
+          wakeAll = wake;
+          this.announceWaiters.add(wake);
+        });
+        const hit = this.claim(name, key);
+        if (hit) return hit;
+        if (expired || this.o.isStopped()) return undefined;
+      }
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -269,9 +354,22 @@ export class RelayToolDispatcher {
       return { content: REPLAY_NOTE + replay.content, isError: replay.isError };
     }
 
-    // The message id groups the calls of one model message (collapsing identical ones, admitting siblings of a halted preview). The host reads it from the
-    // CLI's stream; anything unusable becomes a unique id, which splits groups (the safe direction).
-    const messageId = typeof ev.messageId === "string" && MESSAGE_ID.test(ev.messageId) ? ev.messageId : `msg-${op}`;
+    // Grouping (B1 + SF1). A call belongs to the model message whose stream announcement it matches (name + canonical input); an unmatched call is a group
+    // of its own (no collapsing, no admission next to a halt: the safe direction). Once a halt is latched, a call is placed in the halted message's group
+    // ONLY if it matches an announcement of THAT message recorded BEFORE the halted answer went back: the batched confirmation AgentWeb gives (one deck
+    // for "pause these 5 ad sets"). Anything else, whatever message id the worker sends, starts a new group and the bridge refuses it. A forged follow-up
+    // cannot match: the stream announced the message before the answer existed (a confirm needs the approval token that only the answer carries).
+    const ann = await this.claimOrWait(name, argKey(ev.input));
+    if (this.o.isStopped()) return refuse(STOPPED_MESSAGE);
+    let messageId: string;
+    if (this.o.isHalted()) {
+      const sibling = ann !== undefined && this.halt !== undefined && ann.batch === this.halt.batch && ann.seq <= this.halt.cutoff;
+      if (sibling) messageId = `msg-${ann.batch}`;
+      else {
+        this.o.bridge.noteToolResult(this.o.runId); // closes the halted group: this call cannot join it
+        messageId = `call-${op}`;
+      }
+    } else messageId = ann ? `msg-${ann.batch}` : `call-${op}`;
     let result: BridgeCallResult;
     try {
       this.o.bridge.noteToolUse(this.o.runId, op, name, ev.input, messageId);
@@ -281,10 +379,9 @@ export class RelayToolDispatcher {
       this.log(err instanceof ToolBridgeAuthError ? "run_ended" : "bridge_failed");
       return refuse(STOPPED_MESSAGE);
     }
-    // SF1: once a halt is latched, the answer that is about to go back ends this call group, as a tool-result in the stream does on the HTTP path. Done
-    // BEFORE the post (the worker may hand the next call over before our post returns), so no later call can join the halted group by reusing its
-    // message id; only siblings that reached the bridge before this answer can be admitted.
-    if (this.o.isHalted ? this.o.isHalted() : true) this.o.bridge.noteToolResult(this.o.runId);
+    // The first halt of the turn fixes which message's siblings may still be admitted, and which announcements count (those recorded before this answer
+    // goes back). Set BEFORE the post: the worker may hand the next call over before our post returns.
+    if (this.halt === undefined && this.o.isHalted()) this.halt = { batch: ann ? ann.batch : -1, cutoff: this.announceSeq };
     const answer: Answer = { content: result.content, isError: result.isError === true };
     if (result.images?.length) {
       const { images, dropped } = this.fitImages(result.images);

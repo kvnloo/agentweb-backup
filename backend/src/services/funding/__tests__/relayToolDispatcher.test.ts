@@ -25,6 +25,7 @@ interface Opts {
   errors?: string[];
   /** Runs inside client.turnToolResult before it answers (a post that is still in flight). */
   onPost?: (input: any) => Promise<void> | void;
+  announceWaitMs?: number;
 }
 
 function rig(o: Opts = {}) {
@@ -83,6 +84,7 @@ function rig(o: Opts = {}) {
     maxCalls: o.maxCalls,
     onLimitTripped: () => void tripped.count++,
     isHalted: () => bridge.isHalted('s1', 'u1'),
+    announceWaitMs: o.announceWaitMs ?? 0,
     sleep: async () => undefined,
     onCall: (phase, name) => void phases.push(`${phase}:${name}`),
   });
@@ -290,34 +292,109 @@ describe('RelayToolDispatcher', () => {
     expect(t.posts[1]).toMatchObject({ operationId: 'op-2', isError: true });
   });
 
-  it('without a halt, identical calls of one message still collapse (the group is not closed by every answer)', async () => {
+  it('without a halt, identical calls of one ANNOUNCED message still collapse (the group is not closed by every answer)', async () => {
     const t = rig();
-    t.d.start(t.ev('op-1', 'save_note', { n: 1 }, 'msg-1'));
+    t.d.noteStreamUse('mcp__aw__save_note', { n: 1 });
+    t.d.noteStreamUse('mcp__aw__save_note', { n: 1 });
+    t.d.start(t.ev('op-1', 'save_note', { n: 1 }));
     await t.d.settle(1_000);
-    t.d.start(t.ev('op-2', 'save_note', { n: 1 }, 'msg-1'));
+    t.d.start(t.ev('op-2', 'save_note', { n: 1 }));
     await t.d.settle(1_000);
     expect(t.executed).toHaveLength(1);
   });
 
-  it('identical calls of ONE model message collapse in the bridge; the same call in another message runs', async () => {
+  it('identical calls of ONE announced message collapse in the bridge; the same call in the next message runs', async () => {
     const t = rig();
-    t.d.start(t.ev('op-1', 'search', { q: 'x' }, 'msg-a'));
+    t.d.noteStreamUse('mcp__aw__search', { q: 'x' });
+    t.d.noteStreamUse('mcp__aw__search', { q: 'x' });
+    t.d.start(t.ev('op-1', 'search', { q: 'x' }));
     await t.d.settle(1_000);
-    t.d.start(t.ev('op-2', 'search', { q: 'x' }, 'msg-a'));
+    t.d.start(t.ev('op-2', 'search', { q: 'x' }));
     await t.d.settle(1_000);
-    t.d.start(t.ev('op-3', 'search', { q: 'x' }, 'msg-b'));
+    t.d.noteStreamResult();
+    t.d.noteStreamUse('mcp__aw__search', { q: 'x' });
+    t.d.start(t.ev('op-3', 'search', { q: 'x' }));
     await t.d.settle(1_000);
     expect(t.executed).toHaveLength(2);
     expect(t.posts[1].content).toMatch(/collapsed/);
   });
 
-  it('a message id that is not usable never groups calls: identical calls with a bad id both run', async () => {
+  it('the worker\'s message id is never trusted: unannounced calls never group, whatever id they carry', async () => {
     const t = rig();
-    t.d.start(t.ev('op-1', 'search', { q: 'x' }, 'bad id!'));
+    t.d.start(t.ev('op-1', 'search', { q: 'x' }, 'same-id'));
     await t.d.settle(1_000);
-    t.d.start(t.ev('op-2', 'search', { q: 'x' }, 'bad id!'));
+    t.d.start(t.ev('op-2', 'search', { q: 'x' }, 'same-id'));
     await t.d.settle(1_000);
     expect(t.executed).toHaveLength(2);
+  });
+
+  it('a call that arrives just before its stream line waits for it (bounded) and is grouped with its message', async () => {
+    const t = rig({ announceWaitMs: 500 });
+    t.d.noteStreamUse('mcp__aw__search', { q: 'x' });
+    t.d.start(t.ev('op-1', 'search', { q: 'x' }));
+    await t.d.settle(1_000);
+    t.d.start(t.ev('op-2', 'search', { q: 'x' }));
+    setTimeout(() => t.d.noteStreamUse('mcp__aw__search', { q: 'x' }), 30); // the announcement lands after the call
+    await t.d.settle(1_000);
+    expect(t.executed).toHaveLength(1); // collapsed: it found its message
+  });
+
+  describe('B1: batched confirmations (parity with AgentWeb: one deck for every preview of one model message)', () => {
+    it('five previews announced in one message: all five run and all five halts are recorded', async () => {
+      const t = rig({ confirm: ['send_email'] });
+      for (let i = 1; i <= 5; i++) t.d.noteStreamUse('mcp__aw__send_email', { to: `p${i}` });
+      for (let i = 1; i <= 5; i++) {
+        t.d.start(t.ev(`op-${i}`, 'send_email', { to: `p${i}` }));
+        await t.d.settle(1_000);
+      }
+      expect(t.executed.map((e) => e.args.to)).toEqual(['p1', 'p2', 'p3', 'p4', 'p5']);
+      expect(t.bridge.takeHalts('u1', 's1')).toHaveLength(5);
+    });
+
+    it('a read-only call announced in the same message as the halted preview still runs', async () => {
+      const t = rig({ confirm: ['send_email'] });
+      t.d.noteStreamUse('mcp__aw__send_email', { to: 'a' });
+      t.d.noteStreamUse('mcp__aw__search', { q: 'status' });
+      t.d.start(t.ev('op-1', 'send_email', { to: 'a' }));
+      await t.d.settle(1_000);
+      t.d.start(t.ev('op-2', 'search', { q: 'status' }));
+      await t.d.settle(1_000);
+      expect(t.executed.map((e) => e.name)).toEqual(['send_email', 'search']);
+    });
+
+    it('a call announced AFTER the halted answer went back is refused, even with no tool-result between (the cutoff)', async () => {
+      const t = rig({ confirm: ['send_email'] });
+      t.d.noteStreamUse('mcp__aw__send_email', { to: 'a' });
+      t.d.start(t.ev('op-1', 'send_email', { to: 'a' }));
+      await t.d.settle(1_000);
+      t.d.noteStreamUse('mcp__aw__save_note', { n: 1 }); // same batch (no tool-result yet), but after the answer
+      t.d.start(t.ev('op-2', 'save_note', { n: 1 }));
+      await t.d.settle(1_000);
+      expect(t.executed.map((e) => e.name)).toEqual(['send_email']);
+    });
+
+    it('a call announced in an EARLIER message is not a sibling of the halt', async () => {
+      const t = rig({ confirm: ['send_email'] });
+      t.d.noteStreamUse('mcp__aw__save_note', { n: 1 });
+      t.d.noteStreamResult();
+      t.d.noteStreamUse('mcp__aw__send_email', { to: 'a' });
+      t.d.start(t.ev('op-1', 'send_email', { to: 'a' }));
+      await t.d.settle(1_000);
+      t.d.start(t.ev('op-2', 'save_note', { n: 1 }));
+      await t.d.settle(1_000);
+      expect(t.executed.map((e) => e.name)).toEqual(['send_email']);
+    });
+
+    it('an announcement for a name outside the manifest is ignored', async () => {
+      const t = rig({ confirm: ['send_email'] });
+      t.d.noteStreamUse('mcp__aw__send_email', { to: 'a' });
+      t.d.noteStreamUse('mcp__aw__drop_tables', {});
+      t.d.start(t.ev('op-1', 'send_email', { to: 'a' }));
+      await t.d.settle(1_000);
+      t.d.start(t.ev('op-2', 'drop_tables', {}));
+      await t.d.settle(1_000);
+      expect(t.executed.map((e) => e.name)).toEqual(['send_email']);
+    });
   });
 
   describe('images', () => {
@@ -562,6 +639,7 @@ describe('RelayToolDispatcher: an unforeseen failure still answers the operation
       bridge: { callTool: async () => ({ content: 'x', isError: false }), listTools: async () => [], noteToolUse: () => undefined, noteToolResult: () => undefined, takeLedger: () => ({ records: [], truncated: 0 }) },
       manifest: { open: new Set(['search']), locked: new Set() },
       isStopped: () => false,
+      isHalted: () => false,
     });
     let deep: unknown = {};
     for (let i = 0; i < 20000; i++) deep = { a: deep };
