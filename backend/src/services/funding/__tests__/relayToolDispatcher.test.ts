@@ -286,6 +286,18 @@ describe('RelayToolDispatcher', () => {
       expect(t.posts[0].content).toContain(UNLOADABLE_NOTE);
     });
 
+    it('an answer that can never be delivered is replaced by a plain one WITHOUT the definitions: the tool stays unknown to the worker and is refused', async () => {
+      const t = rig();
+      t.behaviour.next = [new LoginHostError('EINVALID', 'content:too_big')];
+      t.d.start(t.ev('op-1', 'install_skills'));
+      await t.d.settle(1_000);
+      expect(t.posts[1]).toMatchObject({ content: DELIVERY_FAILED_MESSAGE });
+      expect(t.posts[1].tools).toBeUndefined();
+      t.d.start(t.ev('op-2', 'late_tool'));
+      await t.d.settle(1_000);
+      expect(t.executed.map((e) => e.name)).toEqual(['install_skills']);
+    });
+
     it('a body the worker finds too large drops the definitions after the images, and the model is told', async () => {
       const t = rig({ images: { install_skills: [img(8)] } });
       t.behaviour.next = [new LoginHostError('EINVALID', 'result_too_large'), new LoginHostError('EINVALID', 'result_too_large')];
