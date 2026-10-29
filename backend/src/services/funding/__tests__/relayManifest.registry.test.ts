@@ -5,6 +5,7 @@
 import { agentModeService } from '../../agentModeService';
 import { TOOL_LIMITS } from '../../../loginHost/protocol';
 import { buildRelayManifest, manifestProblem } from '../relayManifest';
+import { MAX_JSON_DEPTH, jsonDepth } from '../jsonDepthGuard';
 
 jest.mock('openai');
 jest.mock('../../settingsService');
@@ -66,6 +67,7 @@ describe('relay manifest from the real tool registry', () => {
       longestDescription: Math.max(...tools.map((t) => Buffer.byteLength(t.description ?? ''))),
       largestSchema: Math.max(...tools.map((t) => Buffer.byteLength(JSON.stringify(t.inputSchema ?? {})))),
       longestName: Math.max(...tools.map((t) => t.name.length)),
+      deepestSchema: Math.max(...tools.map((t) => jsonDepth(JSON.stringify(t.inputSchema ?? {})))),
     };
     process.stdout.write(`relay manifest registry stats ${JSON.stringify(stats)}\n`);
     expect(tools.length).toBeGreaterThan(50); // the registry really loaded
@@ -73,5 +75,7 @@ describe('relay manifest from the real tool registry', () => {
     expect(m.truncated).toBe(0);
     expect(m.tools.length).toBe(tools.length);
     expect(manifestProblem(m.tools)).toBeUndefined();
+    // A tool call's arguments follow its schema, so the schemas' depth bounds what the worker legitimately sends back: well under the pre-parse guard.
+    expect(stats.deepestSchema).toBeLessThan(MAX_JSON_DEPTH / 2);
   });
 });

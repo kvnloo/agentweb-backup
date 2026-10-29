@@ -16,6 +16,7 @@ import { request as httpsRequest } from "https";
 import { z } from "zod";
 import type { ProviderEvent } from "../../loginHost/adapter";
 import type { LoginReady, LoginStartResult } from "../../loginHost/connectionManager";
+import { jsonTooDeep } from "./jsonDepthGuard";
 import { ROUTES, type HostErrorCode, type RouteInput, type RouteName } from "../../loginHost/protocol";
 
 const HOST_CODES: ReadonlySet<string> = new Set<HostErrorCode>(["EINVALID", "ENOTFOUND", "ESTALE", "ESTATE", "EBUSY", "EEXISTS", "EUNSUPPORTED", "EHAZARD", "EINTERNAL"]);
@@ -110,6 +111,15 @@ function timeoutError(phase: Phase): Error {
   return Object.assign(new Error("timeout"), { code: "ETIMEDOUT", awPhase: phase });
 }
 
+/** A reply nested deeper than MAX_JSON_DEPTH: logged by length only (a fixed code, never content), then a bad answer from the host. */
+function logTooDeep(bytes: number): void {
+  console.error("[login-host-client] json_too_deep", { bytes });
+}
+function tooDeep(bytes: number): LoginHostError {
+  logTooDeep(bytes);
+  return new LoginHostError("BAD_RESPONSE", "too_deep");
+}
+
 function mapSocketError(err: unknown): LoginHostError {
   if (err instanceof LoginHostError) return err;
   const code = (err as { code?: string })?.code;
@@ -196,9 +206,11 @@ class NodeTransport implements HostTransport {
           res.on("error", (e) => reject(mapSocketError(e)));
           res.on("end", () => {
             try {
-              resolve({ status: res.statusCode ?? 0, json: JSON.parse(Buffer.concat(chunks).toString("utf8")) });
-            } catch {
-              reject(new LoginHostError("BAD_RESPONSE", `http_${res.statusCode ?? 0}`));
+              const raw = Buffer.concat(chunks);
+              if (jsonTooDeep(raw)) throw tooDeep(raw.length);
+              resolve({ status: res.statusCode ?? 0, json: JSON.parse(raw.toString("utf8")) });
+            } catch (e) {
+              reject(e instanceof LoginHostError ? e : new LoginHostError("BAD_RESPONSE", `http_${res.statusCode ?? 0}`));
             }
           });
         },
@@ -225,7 +237,9 @@ class NodeTransport implements HostTransport {
             res.on("end", () => {
               let json: unknown;
               try {
-                json = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+                const raw = Buffer.concat(chunks);
+                if (jsonTooDeep(raw)) logTooDeep(raw.length);
+                else json = JSON.parse(raw.toString("utf8"));
               } catch {
                 /* falls through to BAD_RESPONSE */
               }
@@ -244,11 +258,15 @@ class NodeTransport implements HostTransport {
                   const line = buf.slice(0, nl);
                   buf = buf.slice(nl + 1);
                   if (!line) continue;
+                  // A line nested deeper than anything legitimate is dropped unparsed (JSON.parse would stall the event loop) and ends the stream.
+                  if (jsonTooDeep(line)) throw tooDeep(line.length);
+                  let parsed: unknown;
                   try {
-                    yield JSON.parse(line);
+                    parsed = JSON.parse(line);
                   } catch {
                     throw new LoginHostError("BAD_RESPONSE", "line");
                   }
+                  yield parsed;
                 }
                 if (buf.length > maxLine) throw new LoginHostError("BAD_RESPONSE", "too_large");
               }
