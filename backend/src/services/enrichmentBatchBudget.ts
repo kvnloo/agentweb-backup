@@ -54,3 +54,27 @@ export function buildEnrichmentBudgetCheck(userId: string): NonNullable<Orchestr
     return true;
   };
 }
+
+export interface EnrichmentRunEstimate {
+  leadCount: number;
+  estimatedCostUsd: number;
+  withinAllowance: boolean;
+}
+
+/** ENG-2715: pre-run estimate shown before the user confirms a CRM
+ * enrichment. Strictly read-only: a forecast-only usage check, no admission
+ * write, no enrichment. Uses the same conservative per-lead number the
+ * per-batch cap enforces, so "within allowance" here predicts admission.
+ */
+export async function estimateEnrichmentRun(
+  userId: string,
+  config: EnrichmentConfig,
+  leadCount: number,
+): Promise<EnrichmentRunEstimate> {
+  const count = Math.max(0, Math.floor(leadCount));
+  const microUsd = count === 0 ? 0 : estimateEnrichmentBatchMicroUsd(config, count);
+  const estimatedCostUsd = Math.ceil(microUsd / 10_000) / 100;
+  if (count === 0) return { leadCount: 0, estimatedCostUsd: 0, withinAllowance: true };
+  const projected = await checkTokenUsage(userId, { projectedCostMicroUsd: microUsd });
+  return { leadCount: count, estimatedCostUsd, withinAllowance: projected.allowed === true };
+}
