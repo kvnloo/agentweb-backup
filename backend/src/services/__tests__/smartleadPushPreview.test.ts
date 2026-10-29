@@ -89,6 +89,15 @@ describe("buildPreview (ENG-673)", () => {
     expect(set.preflight.warnings.map(w => w.code)).not.toContain("no_unsubscribe");
   });
 
+  it("asks for the unsubscribe acknowledgement only when the campaign is already sending and its emails have no unsubscribe link", async () => {
+    const noLink = (status: string, over: any = {}) => deps([lead(1)], {}, { id: 77, name: "Q", status, maxLeadsPerDay: 100, addUnsubscribeTag: false, ...over });
+    expect((await buildPreview(noLink("ACTIVE"), req())).requiresUnsubscribeAcknowledgement).toBe(true);
+    expect((await buildPreview(noLink("ACTIVE", { addUnsubscribeTag: true, unsubscribeText: "" }), req())).requiresUnsubscribeAcknowledgement).toBe(true); // on, but no footer text
+    expect((await buildPreview(noLink("DRAFTED"), req())).requiresUnsubscribeAcknowledgement).toBe(false);
+    expect((await buildPreview(noLink("PAUSED"), req())).requiresUnsubscribeAcknowledgement).toBe(false);
+    expect((await buildPreview(noLink("ACTIVE", { addUnsubscribeTag: true }), req())).requiresUnsubscribeAcknowledgement).toBe(false);
+  });
+
   it("cannot start with nothing to send", async () => {
     expect((await buildPreview(deps([lead(1, { email: "" })]), req())).canStart).toBe(false);
   });

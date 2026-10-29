@@ -31,6 +31,8 @@ export interface PreflightResult {
   warnings: PreflightFinding[];
   /** Tags the user must map to a CRM field, or confirm Smartlead supplies. */
   tagsToMap: string[];
+  /** The emails would go out with no unsubscribe link (the no_unsubscribe warning). For a campaign already sending, the user must accept that explicitly. */
+  missingUnsubscribe: boolean;
 }
 
 export function preflightSequence(
@@ -47,7 +49,7 @@ export function preflightSequence(
     unsubscribeText?: string | null;
   },
 ): PreflightResult {
-  const result: PreflightResult = { blocks: [], warnings: [], tagsToMap: [] };
+  const result: PreflightResult = { blocks: [], warnings: [], tagsToMap: [], missingUnsubscribe: false };
   // An unknown status is treated like ACTIVE (the stricter rules): the caller refuses it anyway, and this must not throw.
   const status = typeof opts.status === "string" ? opts.status.trim().toUpperCase() : "";
   const active = status === "ACTIVE" || campaignStatusDecision(status) === "refused";
@@ -76,8 +78,10 @@ export function preflightSequence(
   const noTextKnown = opts.unsubscribeText !== undefined && !(typeof opts.unsubscribeText === "string" && opts.unsubscribeText.trim());
   if (opts.addUnsubscribeTag === false && !analysis.tags.some(t => /unsub/i.test(t))) {
     result.warnings.push({ code: "no_unsubscribe", message: "The campaign's unsubscribe tag is off and no unsubscribe link appears in the sequence." });
+    result.missingUnsubscribe = true;
   } else if (opts.addUnsubscribeTag === true && noTextKnown) {
     result.warnings.push({ code: "no_unsubscribe", message: "The campaign's unsubscribe option is on, but its unsubscribe text is empty, so Smartlead adds no unsubscribe link to the emails. Set the unsubscribe text in the campaign's settings in Smartlead." });
+    result.missingUnsubscribe = true;
   }
   return result;
 }
