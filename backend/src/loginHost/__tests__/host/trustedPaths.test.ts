@@ -99,8 +99,32 @@ describe("the rendered config through the host's trusted-path list (real temp tr
     expect(() => assertHostTrustedPaths(cfg, check)).toThrow(/is a symlink/);
   });
 
-  it("the list covers the node path and the shim (a regression that drops one would let an untrusted file run in a customer unit)", () => {
+  it("MUTATION TARGET: the list is exactly every executed or policy file (a regression that drops one would let an untrusted file run)", () => {
     const cfg = parseHostConfig(JSON.parse(render()));
-    expect(hostTrustedPaths(cfg)).toEqual(expect.arrayContaining([cfg.claude.nodePath, cfg.claude.relayShimPath, cfg.claude.turnWrapperPath, cfg.claude.systemPromptFile]));
+    const rel = "/opt/aw-login-host/releases/login-host-abc-20261021000000";
+    const tls = "/etc/aw-login-host/tls/login-host-abc-20261021000000";
+    // EXACTLY this list, in this order (runMainTrusted.test.ts relies on the order): every file a customer unit runs or reads as policy, and every tool the host runs as root.
+    expect(hostTrustedPaths(cfg)).toEqual([
+      `${tls}/server.crt`,
+      `${tls}/server.key`,
+      `${tls}/ca.crt`,
+      `${rel}/claude-turn.sh`,
+      `${rel}/aw-relay-shim.js`,
+      `/opt/aw-node/v${versions.NODE_VERSION}/bin/node`,
+      `${rel}/aw-net.sh`,
+      "/usr/bin/socat",
+      `${rel}/system-prompt.txt`,
+      `${rel}/aw-write-file.sh`,
+      "/usr/bin/systemd-run",
+      "/usr/bin/systemctl",
+      "/usr/bin/setpriv",
+      "/usr/bin/env",
+      "/usr/bin/rm",
+      "/usr/bin/find",
+      "/usr/sbin/setquota",
+    ]);
+    // without TLS and quota, exactly those entries drop out
+    const plain = parseHostConfig({ ...JSON.parse(render()), tls: undefined, quota: undefined });
+    expect(hostTrustedPaths(plain)).toEqual(hostTrustedPaths(cfg).filter((p) => !p.startsWith(tls) && p !== "/usr/sbin/setquota"));
   });
 });
