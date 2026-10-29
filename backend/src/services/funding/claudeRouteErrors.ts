@@ -25,6 +25,7 @@ export type ClaudeStopCode =
   | "server_restarting" // AgentWeb is restarting; no new plan turn is started
   | "extra_usage_needs_ack" // Fable can bill the customer's extra usage credits; it runs only when the request acknowledges that
   | "org_not_supported" // organisation members cannot use the plan route yet (data governance not decided)
+  | "tools_unavailable_for_plan" // the tool list for the plan route could not be built (empty or refused for a reason that is not a too-large tool); asking again can work
   | "tools_too_large_for_plan"; // a tool connected to the account does not fit the plan route's tool limits (ENG-2113 relay); AgentWeb can run it
 
 interface StopInfo {
@@ -63,6 +64,8 @@ const STOPS: Record<ClaudeStopCode, StopInfo> = {
   extra_usage_needs_ack: { httpStatus: 409, offerAgentWebCredits: false, retryable: false, message: "This model can use your Claude plan's extra usage credits, which are billed to you by Anthropic. Confirm that you want this, or choose another model." },
   org_not_supported: { httpStatus: 403, offerAgentWebCredits: false, retryable: false, message: "Using your own Claude plan is not available for organisation accounts yet. Choose another model." },
   // Offered: AgentWeb's own route can run those tools, and nothing ran on the plan (the turn is refused before the worker is asked). COPY PENDING MANAN'S OK.
+  // Nothing ran on the plan; AgentWeb can run the turn. COPY PENDING MANAN'S OK.
+  tools_unavailable_for_plan: { httpStatus: 503, offerAgentWebCredits: true, retryable: true, message: "We couldn't load your tools for your Claude plan just now. Please try again in a moment, or continue on AgentWeb credits." },
   tools_too_large_for_plan: { httpStatus: 422, offerAgentWebCredits: true, retryable: false, message: "One of the tools connected to your account is too large to use with your Claude plan. Disconnect or shorten it in Settings, or continue on AgentWeb credits." },
   turn_failed: { httpStatus: 502, offerAgentWebCredits: true, retryable: true, message: "Your Claude plan could not complete this message. Please try again, or choose another model." },
 };
