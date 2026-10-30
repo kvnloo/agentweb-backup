@@ -427,6 +427,17 @@ const MAX_ADMISSIONS_PER_LATCH = 64;
 const MAX_LEDGER_RECORDS = 512;
 const MAX_LEDGER_BYTES = 4 * 1024 * 1024;
 const MAX_RECORD_CONTENT_BYTES = 64 * 1024;
+/**
+ * Room the ledger keeps for calls that CHANGED something (writes, halts) when it fills up: reads may only use the ledger up to this far below its caps, a write may
+ * use all of it, and when even that is full the oldest READ record makes room. A record of a write is never silently absent from the persisted chat (a later
+ * `send_email` executed but missing from the record was the failure); the INPUT and the text of a big read are cut to a marker first.
+ */
+const LEDGER_RESERVE_RECORDS = 64;
+const LEDGER_RESERVE_BYTES = 1024 * 1024;
+/** A write that no longer fits the byte cap is cut to a short text and may still go over the cap by this much in all (a turn has at most 400 calls). */
+const LEDGER_WRITE_OVERFLOW_BYTES = 2 * 1024 * 1024;
+const BIG_READ_RECORD_BYTES = 8 * 1024;
+const SHRUNK_READ_CONTENT_BYTES = 4 * 1024;
 const MAX_COMPLETED_ENTRIES = 32;
 const MAX_COMPLETED_BYTES = 512 * 1024;
 const MAX_SESSIONS_TRACKED = 2048;
@@ -440,6 +451,8 @@ export class ToolBridge {
   private readonly sessions = new Map<string, SessionState>();
   private readonly ledgers = new Map<string, Ledger>();
   private readonly lastGenerationByRun = new Map<string, string>();
+  /** Size and write-ness of each ledger record (kept out of the record itself, which is persisted and compared in tests). */
+  private readonly recordMeta = new WeakMap<BridgeCallRecord, { size: number; write: boolean }>();
   /** Executor calls in progress per run id, across run generations. */
   private readonly execCount = new Map<string, number>();
   /** Run ids whose executor state is released when their last executing call finishes. */
@@ -1406,17 +1419,57 @@ export class ToolBridge {
       ...(state.closed ? { late: true } : {}),
     };
     try {
-      const size = Buffer.byteLength(JSON.stringify(entry));
-      if (ledger.records.length >= MAX_LEDGER_RECORDS || ledger.bytes + size > MAX_LEDGER_BYTES) {
-        ledger.truncated++;
-      } else {
-        ledger.records.push(entry);
-        ledger.bytes += size;
-      }
+      this.keep(ledger, entry, ctx.write);
     } catch {
       ledger.truncated++; // an unserializable result must never break the call it describes
     }
     return returned;
+  }
+
+  /** Adds a record under the ledger's caps: reads give way to writes (see LEDGER_RESERVE_RECORDS). `ledger.truncated` counts everything cut or dropped. */
+  private keep(ledger: Ledger, entry: BridgeCallRecord, write: boolean): void {
+    let size = Buffer.byteLength(JSON.stringify(entry));
+    if (size > BIG_READ_RECORD_BYTES && !write) {
+      // a big READ: its input and text are not worth the room they take from the writes that may follow
+      entry.args = { _truncated: "input not kept" };
+      entry.toolMessageContent = capText(entry.toolMessageContent, SHRUNK_READ_CONTENT_BYTES);
+      if (entry.answeredContent !== undefined) entry.answeredContent = capText(entry.answeredContent, SHRUNK_READ_CONTENT_BYTES);
+      size = Buffer.byteLength(JSON.stringify(entry));
+      ledger.truncated++;
+    }
+    const maxRecords = write ? MAX_LEDGER_RECORDS : MAX_LEDGER_RECORDS - LEDGER_RESERVE_RECORDS;
+    const maxBytes = write ? MAX_LEDGER_BYTES : MAX_LEDGER_BYTES - LEDGER_RESERVE_BYTES;
+    if (write) {
+      // a write is never dropped: older reads make room first
+      while ((ledger.records.length >= maxRecords || ledger.bytes + size > maxBytes) && this.dropOldestRead(ledger)) ledger.truncated++;
+      if (ledger.bytes + size > maxBytes) {
+        entry.toolMessageContent = capText(entry.toolMessageContent, SHRUNK_READ_CONTENT_BYTES);
+        if (entry.answeredContent !== undefined) entry.answeredContent = capText(entry.answeredContent, SHRUNK_READ_CONTENT_BYTES);
+        size = Buffer.byteLength(JSON.stringify(entry));
+        ledger.truncated++;
+        if (ledger.records.length < maxRecords && ledger.bytes + size <= maxBytes + LEDGER_WRITE_OVERFLOW_BYTES) {
+          ledger.records.push(entry);
+          ledger.bytes += size;
+          this.recordMeta.set(entry, { size, write });
+          return;
+        }
+      }
+    }
+    if (ledger.records.length >= maxRecords || ledger.bytes + size > maxBytes) {
+      ledger.truncated++;
+      return;
+    }
+    ledger.records.push(entry);
+    ledger.bytes += size;
+    this.recordMeta.set(entry, { size, write });
+  }
+
+  private dropOldestRead(ledger: Ledger): boolean {
+    const i = ledger.records.findIndex((r) => this.recordMeta.get(r)?.write !== true);
+    if (i < 0) return false;
+    const [gone] = ledger.records.splice(i, 1);
+    ledger.bytes -= this.recordMeta.get(gone)?.size ?? 0;
+    return true;
   }
 
   private snapshotLedger(ledger: Ledger): { records: BridgeCallRecord[]; truncated: number } {
