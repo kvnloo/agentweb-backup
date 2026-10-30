@@ -870,6 +870,21 @@ export const resetPassword = async (req: Request, res: Response) => {
 // long-term password, so it MUST clear the temporary password lifecycle flags.
 // On success, all OTHER sessions are terminated and the caller receives a fresh
 // token minted with the new sessionVersion so the current device stays signed in.
+/**
+ * ENG-2686: records the `logout` lifecycle signal. Auth is a stateless JWT, so the
+ * client still clears its token itself; this endpoint only observes the event.
+ * Delegated sessions do not emit (the account owner did not log out). Always 204 —
+ * a signal failure must never make logout look broken.
+ */
+export const logout = async (req: Request, res: Response) => {
+  const authReq = req as AuthenticatedRequest;
+  const userId = authReq.user?.userId;
+  if (userId && !authReq.delegateInfo?.isDelegated) {
+    void emitAppSignal(userId, "logout", { method: "user" }).catch(() => undefined);
+  }
+  return res.status(204).end();
+};
+
 export const changePassword = async (req: Request, res: Response) => {
   try {
     const authReq = req as AuthenticatedRequest;
