@@ -387,6 +387,25 @@ describe("relay: limits and abuse", () => {
     await ep.close();
   });
 
+  it("MUTATION TARGET: the ANSWER path is charged to the turn's CPU meter too (two answers that each read as 60 ms spend a 100 ms budget)", async () => {
+    const r = rig();
+    let t = 0;
+    let step = 0;
+    const meter = new CpuMeter(100, 0, () => (t += step)); // the clock only moves while an answer is being handled
+    const { ep, calls } = await r.open({ meter });
+    const c = new Client(sockOf(ep));
+    await c.ready();
+    for (let i = 1; i <= 2; i++) {
+      c.send(call("c" + i, "echo", {}));
+      await until(() => calls.length === i);
+      step = 60;
+      ep.answer(calls[i - 1].operationId, { content: "ok" });
+      step = 0;
+    }
+    expect(meter.exhausted).toBe(true);
+    await ep.close();
+  });
+
   it("MUTATION TARGET: a frame with an absurd number of keys is dropped as bad_frame (before the keys are sorted)", async () => {
     const r = rig();
     const { ep, calls } = await r.open();

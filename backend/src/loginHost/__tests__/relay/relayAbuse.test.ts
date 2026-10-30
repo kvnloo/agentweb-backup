@@ -245,6 +245,19 @@ describe("the relay's frame handling is charged to the turn's CPU meter (pinned 
     await ep.close();
   });
 
+  it("MUTATION TARGET: every socket read costs the meter a fixed 0.08 ms even when the section itself is instant (clock frozen): two reads spend a 0.15 ms budget", async () => {
+    const s = setup();
+    const meter = new CpuMeter(0.15, 0, () => 0);
+    const { ep } = await s.open(400_001, meter);
+    const c = await client(sockOf(ep.dir));
+    c.s.write(JSON.stringify({ type: "ping" }) + "\n");
+    await new Promise((r) => setTimeout(r, 50));
+    expect(meter.exhausted).toBe(false);
+    c.s.write(JSON.stringify({ type: "ping" }) + "\n");
+    await until(() => meter.exhausted);
+    await ep.close();
+  });
+
   it("MUTATION TARGET: the sustained read rate is 200 a second: a trickle of separate one-byte writes (hundreds of reads a second) is dropped (rate_limited), well inside the 2,000-read burst plus a few seconds", async () => {
     const s = setup();
     const { ep } = await s.open();
