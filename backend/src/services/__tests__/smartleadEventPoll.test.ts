@@ -314,6 +314,51 @@ describe("the hourly event poll (ENG-673)", () => {
       expect(w.handled).toHaveLength(0);
     });
 
+    it("a contact that left the bounced list and came back much later starts its wait again: an old first sighting is not the second one", async () => {
+      const w = world({ campaignSize: 1000, leads: { is_bounced: { 77: rows(1, "b") } } });
+      const d = deps(w, on);
+      await eventPoll(d); // first sighting
+      w.leads.is_bounced = { 77: [] }; // it drops out of the list...
+      clock += 2 * hour; await eventPoll(d);
+      w.leads.is_bounced = { 77: rows(1, "b") }; // ...and is back 13 hours after it was last seen
+      clock += 13 * hour; await eventPoll(d);
+      expect(w.handled).toHaveLength(0); // a new first sighting, not an acted-on second
+      clock += hour; await eventPoll(d);
+      expect(w.handled.map(h => h.event.eventKey)).toEqual(["poll:bounce:77:b0"]); // the real second sighting
+    });
+
+    it("a campaign polled only every few passes still completes its wait (the wait is not restarted by a 3 h gap)", async () => {
+      const w = world({ campaignSize: 1000, leads: { is_bounced: { 77: rows(1, "b") } } });
+      const d = deps(w, on);
+      await eventPoll(d);
+      clock += 3 * hour; await eventPoll(d);
+      expect(w.handled).toHaveLength(1);
+    });
+
+    it("a contact whose handling failed keeps its wait, so the next pass retries at once", async () => {
+      const w = world({ campaignSize: 1000, leads: { is_bounced: { 77: rows(1, "b") } } });
+      let fail = true;
+      const d = deps(w, { ...on, events: { handle: async (ctx, event) => { if (fail) throw new Error("db down"); w.handled.push({ ctx, event }); return { matched: 1, changed: 1, duplicates: 0 }; } } });
+      await eventPoll(d);
+      clock += hour; expect((await eventPoll(d)).errors).toBe(1);
+      fail = false;
+      clock += 5 * 60 * 1000; await eventPoll(d); // five minutes later, not another hour
+      expect(w.handled).toHaveLength(1);
+    });
+
+    it("a sender-side list that cannot be read leaves the waits alone and acts on nothing", async () => {
+      const w = world({ campaignSize: 1000, leads: { is_bounced: { 77: rows(1, "b") } } });
+      const d = deps(w, on);
+      await eventPoll(d); // first sighting recorded
+      w.failOn = ["is_sender_bounced"];
+      clock += hour; const out = await eventPoll(d);
+      expect(w.handled).toHaveLength(0);
+      expect(out.errors).toBeGreaterThan(0);
+      w.failOn = [];
+      clock += 5 * 60 * 1000; await eventPoll(d); // the wait was not lost
+      expect(w.handled).toHaveLength(1);
+    });
+
     it("a restart (nothing remembered) starts the wait again", async () => {
       const w = world({ campaignSize: 1000, leads: { is_bounced: { 77: rows(1, "b") } } });
       const d = deps(w, on);
@@ -353,6 +398,23 @@ describe("the hourly event poll (ENG-673)", () => {
       const over = world({ campaignSize: 5000, leads: { is_bounced: { 77: rows(150, "b") }, is_sender_bounced: { 77: rows(201, "s") } } });
       await eventPoll(deps(over, { maxPages: 2 }));
       expect(over.handled.filter(h => h.event.kind === "bounce")).toHaveLength(0); // 201 > 2 pages: cannot be proven, nothing acted on
+    });
+
+    it("an empty page before the end of the sender-side list means it is incomplete: no bounce is acted on", async () => {
+      const w = world({ campaignSize: 1000, leads: { is_bounced: { 77: rows(2, "b") }, is_sender_bounced: { 77: rows(250, "s") } } });
+      const d = deps(w);
+      const real = d.smartlead.listLeads;
+      d.smartlead.listLeads = async (k, c, status, offset, limit) => { const r = await real(k, c, status, offset, limit); return status === "is_sender_bounced" && offset >= 100 ? { total: r.total, rows: [] } : r; };
+      await eventPoll(d);
+      expect(w.handled.filter(h => h.event.kind === "bounce")).toHaveLength(0);
+    });
+
+    it("a sender-side list that is null stops only the bounce kind: it is read once, not once per page, and replies still come through", async () => {
+      const w = world({ campaignSize: 1000, failOn: ["is_sender_bounced"], leads: { is_bounced: { 77: rows(250, "b") }, is_replied: { 77: rows(1, "r") } } });
+      await eventPoll(deps(w));
+      expect(w.calls.filter(c => c.includes("is_sender_bounced"))).toHaveLength(1);
+      expect(w.calls.filter(c => c.includes("is_bounced"))).toHaveLength(1);
+      expect(w.handled.map(h => h.event.kind)).toEqual(["reply"]);
     });
 
     it("a sender-side contact that is not in the bounced list changes nothing", async () => {
