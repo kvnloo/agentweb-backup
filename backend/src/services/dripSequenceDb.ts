@@ -264,8 +264,9 @@ async function createSequence(input: CreateSequenceInput): Promise<DripSequence>
     enrollmentTrigger: input.enrollmentTrigger ?? { type: 'manual' },
     ...(input.enrollmentCondition ? { enrollmentCondition: input.enrollmentCondition } : {}),
     exitConditions: {
-      onUnsubscribe: true,
       ...input.exitConditions,
+      // Always on: a contact who opted out (or was blocked) must stop receiving the sequence; it is not a setting.
+      onUnsubscribe: true,
     },
     steps,
     status: input.status ?? 'draft',

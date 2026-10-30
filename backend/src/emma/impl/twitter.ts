@@ -477,6 +477,13 @@ async function _twitterOutreachImpl(userId: string, args: any): Promise<any> {
         const target = recipient_handle || handle;
         if (!target) throw new Error('handle is required for send_dm');
         if (!text) throw new Error('text is required for send_dm');
+        // ENG-673: never DM a contact marked do-not-contact (the lead named by list_id/lead_id, or its address).
+        {
+          const guard = await import('../../services/contactGuard');
+          if ((await guard.leadIsBlocked([userId, ownerUserId], list_id, lead_id)) || (lead_email && (await guard.blockedRecipients([userId, ownerUserId], lead_email)).length > 0)) {
+            return { success: false, error: guard.blockedContactError, reason: 'do_not_contact' };
+          }
+        }
         const result = await twitterService.sendDm(ownerUserId, account_id, target, text);
         await logCrm(result?.dm_event_id || `${account_id}_dm`, text);
         return { success: true, data: result };

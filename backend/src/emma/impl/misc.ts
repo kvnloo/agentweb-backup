@@ -1042,6 +1042,13 @@ export async function sendEmailFromConfiguredSender(
     }
     const label = providerLabel(senderProvider);
 
+    // ENG-673: this send names an address, not a lead, so a contact marked do-not-contact is looked up and refused here.
+    const { blockedRecipients, blockedMessage } = await import('../../services/contactGuard');
+    const blockedTo = await blockedRecipients([userId], to);
+    if (blockedTo.length > 0) {
+      return { success: false, reason: 'do_not_contact', code: 409, message: 'Do not contact', error: blockedMessage(blockedTo) };
+    }
+
     // ENG-265: route through sendAsSender so this chat-driven ad-hoc send is subject
     // to the same daily-cap/warmup enforcement as every other send path.
     const { resolveSenderForSend } = await import('../../services/crmSenderService');

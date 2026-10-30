@@ -8,6 +8,17 @@ jest.mock('unipile-node-sdk', () => ({
   UnipileClient: jest.fn().mockImplementation(() => ({})),
 }), { virtual: true });
 
+// ENG-673: the do-not-contact guard has its own tests (contactGuard.test.ts); here it is controlled, and defaults to "not blocked".
+const mockLeadIsBlocked = jest.fn().mockResolvedValue(false);
+const mockLinkedinProfileIsBlocked = jest.fn().mockResolvedValue(false);
+const mockBlockedRecipients = jest.fn().mockResolvedValue([]);
+jest.mock('../services/contactGuard', () => ({
+  leadIsBlocked: (...a: any[]) => mockLeadIsBlocked(...a),
+  linkedinProfileIsBlocked: (...a: any[]) => mockLinkedinProfileIsBlocked(...a),
+  blockedRecipients: (...a: any[]) => mockBlockedRecipients(...a),
+  blockedContactError: 'Not sent: do-not-contact',
+}));
+
 jest.mock('../utils/secretsManager', () => ({
   getUnipileCredentials: jest.fn().mockResolvedValue({ dsn: 'https://api.unipile.com', apiKey: 'k' }),
   getTwitterCredentials: jest.fn().mockResolvedValue({ clientId: 'cid', clientSecret: 'cs' }),
@@ -612,6 +623,16 @@ describe('AgentModeService.twitterOutreach', () => {
     expect(mockGetUserTweets).toHaveBeenCalledWith(OWNER, 'tw1', '@sam', undefined);
     expect(res.success).toBe(true);
     expect(res.data).toHaveLength(1);
+  });
+
+  it('send_dm refuses a do-not-contact lead (by lead, or by address) and sends nothing (ENG-673)', async () => {
+    mockLeadIsBlocked.mockResolvedValueOnce(true);
+    const a = await service.twitterOutreach('u', { action: 'send_dm', handle: 'target', text: 'hey', list_id: 'L1', lead_id: 'LD1' });
+    expect(a).toEqual(expect.objectContaining({ success: false, reason: 'do_not_contact' }));
+    mockBlockedRecipients.mockResolvedValueOnce(['a@b.com']);
+    const b = await service.twitterOutreach('u', { action: 'send_dm', handle: 'target', text: 'hey', lead_email: 'a@b.com' });
+    expect(b).toEqual(expect.objectContaining({ success: false, reason: 'do_not_contact' }));
+    expect(mockSendDm).not.toHaveBeenCalled();
   });
 
   it('send_dm calls sendDm with handle and text', async () => {

@@ -204,6 +204,16 @@ async function processEnrollment(
   const lead = await crmDb.getLeadById(enrollment.listId, enrollment.leadId).catch(() => { leadReadFailed = true; return null; });
   if (leadReadFailed) throw new Error(`Could not read lead ${enrollment.leadId} for enrollment ${enrollment.enrollmentId}; will retry`);
 
+  // ENG-673: this send must not reach a contact that is gone or marked do-not-contact, whatever the sequence's exit settings say (a sequence saved
+  // with onUnsubscribe off, or an older one without the field, used to skip the check in checkExitConditions). Checked on the lead just read,
+  // right before the send, so it cannot be skipped by a second read failing.
+  if (!lead || isDoNotContact(lead)) {
+    console.log(`[dripWorker] Enrollment ${enrollment.enrollmentId} exited: ${lead ? 'lead is marked do-not-contact' : 'lead no longer exists'}`);
+    await dripSequenceDb.exitEnrollment(enrollment.enrollmentId, lead ? 'unsubscribed' : 'manual');
+    stats.exited++;
+    return;
+  }
+
   // Check enrollment condition — exit (not just skip) if lead no longer meets it
   if (sequence.enrollmentCondition) {
     if (!evaluateCondition(sequence.enrollmentCondition, lead)) {
