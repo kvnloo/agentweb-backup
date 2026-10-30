@@ -2,7 +2,7 @@
  * ENG-2113 (review): the relay's line reader must be LINEAR in the bytes received however a hostile unit chunks them. The naive reader (concat the whole buffer and
  * re-scan it on every 'data' event) cost ~1.5 s of the shared host's event loop for one 1 MiB line fed in 64-byte chunks.
  */
-import { LineAssembler } from "../../relay/bounds";
+import { LineAssembler, MAX_LINES_PER_PUSH } from "../../relay/bounds";
 
 const B = (s: string) => Buffer.from(s, "utf8");
 const feed = (a: LineAssembler, chunks: Buffer[]) => {
@@ -68,6 +68,63 @@ describe("LineAssembler: correctness", () => {
     c.push(src);
     src.fill(0x7a);
     expect(c.push(B("\n")).lines.map(String)).toEqual(["abc"]);
+  });
+});
+
+describe("LineAssembler: memory", () => {
+  it.each([1, 3, 64])("MUTATION TARGET: one 1 MiB line trickled in %i-byte chunks is held in ONE buffer within twice its pending bytes (never one object per chunk)", (size) => {
+    const max = 1024 * 1024;
+    const a = new LineAssembler(max);
+    const chunk = Buffer.alloc(size, 0x61);
+    let fed = 0;
+    let worst = 0;
+    while (fed + size <= max) {
+      a.push(chunk);
+      fed += size;
+      const r = a.retained;
+      expect(r.pending).toBe(fed);
+      if (r.capacity > worst) worst = r.capacity;
+      expect(r.capacity).toBeLessThanOrEqual(Math.max(1024, 2 * r.pending));
+    }
+    expect(worst).toBeLessThanOrEqual(max);
+    // the line completes: one copy out, and a big buffer is not kept for the next line
+    const done = a.push(Buffer.from("\n"));
+    expect(done.lines).toHaveLength(1);
+    expect(done.lines[0].length).toBe(fed);
+    expect(a.retained).toEqual({ capacity: 0, pending: 0 });
+  });
+
+  it("MUTATION TARGET: a small buffer is reused for the next line, a big one released; the buffer never exceeds the cap", () => {
+    const a = new LineAssembler(100);
+    a.push(B("abc"));
+    a.push(B("def\n"));
+    expect(a.retained.capacity).toBeGreaterThan(0);
+    expect(a.retained.capacity).toBeLessThanOrEqual(100);
+    expect(a.retained.pending).toBe(0);
+    const r = a.push(B("x".repeat(99)));
+    expect(r.tooLarge).toBe(false);
+    expect(a.retained.capacity).toBeLessThanOrEqual(100);
+  });
+
+  it("returned lines are independent copies: later pushes cannot change them", () => {
+    const a = new LineAssembler(100);
+    a.push(B("one"));
+    const first = a.push(B("\n")).lines[0];
+    a.push(B("two"));
+    a.push(B("\n"));
+    expect(first.toString()).toBe("one");
+  });
+});
+
+describe("LineAssembler: floods", () => {
+  it("MUTATION TARGET: a chunk of thousands of empty lines is refused before it becomes thousands of buffers", () => {
+    const a = new LineAssembler(1000);
+    const r = a.push(Buffer.alloc(64 * 1024, 10)); // 65,536 newlines
+    expect(r.tooLarge).toBe(true);
+    expect(r.lines.length).toBeLessThanOrEqual(MAX_LINES_PER_PUSH);
+    const ok = new LineAssembler(1000).push(Buffer.alloc(MAX_LINES_PER_PUSH, 10));
+    expect(ok.tooLarge).toBe(false);
+    expect(ok.lines).toHaveLength(MAX_LINES_PER_PUSH);
   });
 });
 

@@ -3,11 +3,12 @@
  * in the backend that receives what the host forwards), so the host cuts such a line BEFORE anything parses it and forwards a fixed placeholder instead.
  * Everything below is time-bounded: handling must stay well under 100 ms however deep the line is.
  */
+import { createInterface } from "readline";
 import { PassThrough } from "stream";
 import type { ChildLike } from "../adapter";
 import { RunnerChildAdapter } from "../adapters/claudeAdapter";
 import { classifyFailureText, MAX_CLASSIFY_CHARS, normalizeClaudeEvent } from "../adapters/claudeParse";
-import { MAX_CLI_LINE_DEPTH } from "../relay/bounds";
+import { MAX_CLI_LINE_DEPTH, rawJsonDepthExceeds } from "../relay/bounds";
 
 function rig(maxLine = 16 * 1024 * 1024) {
   const stdout = new PassThrough();
@@ -79,6 +80,106 @@ describe("CLI stdout: lines nested deeper than the cap are dropped before anythi
     expect(Date.now() - t0).toBeLessThan(300);
     expect(r.deep).toHaveLength(1);
     expect(r.out()).toBe(`{"s":"x\\"y"}\n${"[".repeat(64)}\n${PLACEHOLDER}\n{"ok":1}\n`);
+  });
+
+  describe("the runner's readline splits lines at a LONE \\r too (Node 22: \\n, \\r\\n and \\r; U+2028/2029 do NOT split): the scanner must end its lines at exactly the same places", () => {
+    it("MUTATION TARGET: the bypass: a string-opening quote, a lone \\r, then a deep nesting is still cut", async () => {
+      const r = rig();
+      await r.feed('"\r' + nested(100) + "\nafter\n");
+      expect(r.deep).toHaveLength(1);
+      expect(r.out()).toBe('"\n' + "[".repeat(64) + `\n${PLACEHOLDER}\nafter\n`);
+    });
+
+    it("MUTATION TARGET: the OUTPUT has only \\n as a separator: a lone \\r and \\r\\n become one \\n each (also across a chunk edge); lines are untouched", async () => {
+      const text = "one\rtwo\r\nthree\n\nfour\r\rfive\n";
+      const want = "one\ntwo\nthree\n\nfour\n\nfive\n";
+      for (let size = 1; size <= 9; size += 4) {
+        const r = rig();
+        const bytes = Buffer.from(text);
+        await r.feed(...Array.from({ length: Math.ceil(bytes.length / size) }, (_, i) => bytes.subarray(i * size, (i + 1) * size)));
+        expect({ size, out: r.out() }).toEqual({ size, out: want });
+        expect(r.out()).not.toContain("\r");
+      }
+    });
+
+    it("MUTATION TARGET: a lone \\r ends a line (depth and string state reset), so each segment is counted from zero", async () => {
+      const r = rig();
+      await r.feed(nested(40) + "\r" + nested(40) + "\r" + nested(40) + "\n"); // each segment is 40 deep: none passes 64
+      expect(r.deep).toHaveLength(0);
+      expect(r.out()).toBe(nested(40) + "\n" + nested(40) + "\n" + nested(40) + "\n");
+    });
+
+    it("MUTATION TARGET: a \\r\\n split between two chunks is ONE line end, and a deep line after a \\r is still dropped", async () => {
+      const r = rig();
+      await r.feed("a\r", "\nb\r", nested(100), "\n", "c\n");
+      expect(r.out()).toBe(`a\nb\n${"[".repeat(64)}\n${PLACEHOLDER}\nc\n`);
+    });
+
+    it("DIFFERENTIAL: random and adversarial byte streams through LineLimit into the REAL readline: no delivered line is deeper than the cap, and no ordinary line is changed or lost", async () => {
+      let seed = 12345;
+      const rnd = (n: number) => ((seed = (Math.imul(seed, 1103515245) + 12345) >>> 0) % n);
+      const atoms = ["[", "[", "]", "{", "}", '"', "\\", "\r", "\n", "\r\n", "a", " ", "[".repeat(30), "]".repeat(30), "[".repeat(40), "[".repeat(40), "\r", "\r", '"', '{"k":1}', "\u2028"];
+      for (let round = 0; round < 150; round++) {
+        let text = "";
+        const n = 5 + rnd(60);
+        for (let i = 0; i < n; i++) text += atoms[rnd(atoms.length)];
+        const bytes = Buffer.from(text);
+        const chunks: Buffer[] = [];
+        for (let p = 0; p < bytes.length; ) {
+          const len = 1 + rnd(12);
+          chunks.push(bytes.subarray(p, p + len));
+          p += len;
+        }
+        const stdout = new PassThrough();
+        const child: ChildLike = { stdin: new PassThrough(), stdout, stderr: new PassThrough(), kill: () => undefined, onExit: () => undefined };
+        const adapter = new RunnerChildAdapter(child, 1 << 20, () => undefined);
+        const got: string[] = [];
+        const rl = createInterface({ input: adapter.stdout });
+        rl.on("line", (l) => got.push(l));
+        for (const c of chunks) stdout.write(c);
+        stdout.end();
+        await new Promise((r) => rl.on("close", r));
+        for (const l of got) expect({ round, deep: rawJsonDepthExceeds(Buffer.from(l), MAX_CLI_LINE_DEPTH) }).toEqual({ round, deep: false });
+        // every ordinary (shallow) line of the input, split the way readline splits it, is delivered unchanged and in order
+        const expected: string[] = [];
+        for (const seg of text.split(/\r?\n|\r/)) if (!rawJsonDepthExceeds(Buffer.from(seg), MAX_CLI_LINE_DEPTH) && seg.length > 0) expected.push(seg);
+        const delivered = got.filter((l) => l.length > 0 && l !== PLACEHOLDER);
+        // a segment cut mid-line keeps its shallow head, so compare only segments the scanner would never cut: whole-line membership, in order
+        let at = 0;
+        for (const e of expected) {
+          const hit = delivered.indexOf(e, at);
+          if (hit >= 0) at = hit + 1;
+        }
+        // every segment shallow (what readline hands JSON.parse): nothing may be cut, altered or lost
+        const segs = text.split(/\r?\n|\r/);
+        if (segs.every((g) => !rawJsonDepthExceeds(Buffer.from(g), MAX_CLI_LINE_DEPTH))) expect({ round, got: got.filter((l) => l.length > 0) }).toEqual({ round, got: expected });
+      }
+    });
+
+    it("MUTATION TARGET: end to end through the REAL readline the runner uses: no line that reaches JSON.parse is deeper than the cap", async () => {
+      const stdout = new PassThrough();
+      const child: ChildLike = { stdin: new PassThrough(), stdout, stderr: new PassThrough(), kill: () => undefined, onExit: () => undefined };
+      const adapter = new RunnerChildAdapter(child, 16 * 1024 * 1024, () => undefined);
+      const lines: string[] = [];
+      const rl = createInterface({ input: adapter.stdout });
+      rl.on("line", (l) => lines.push(l));
+      stdout.write('{"a":"\r' + nested(200_000) + "\n");
+      stdout.write('"\r' + nested(200_000) + "\r\n");
+      stdout.write('{"type":"ok"}\n');
+      stdout.end();
+      await new Promise((r) => rl.on("close", r));
+      expect(Math.max(...lines.map((l) => l.length))).toBeLessThan(200);
+      expect(lines).toContain('{"type":"ok"}');
+      for (const l of lines) expect(l.split("[").length - 1).toBeLessThanOrEqual(64);
+    });
+
+    it("the byte cap counts each \\r/\\n segment on its own", async () => {
+      const r = rig(100);
+      await r.feed("x".repeat(60) + "\r" + "y".repeat(60) + "\r" + "z".repeat(60) + "\n"); // 180 bytes in all, no segment over 100
+      expect(r.errors).toHaveLength(0);
+      await r.feed("w".repeat(101));
+      expect(r.errors.map((e) => e.message)).toEqual(["stdout_line_too_long"]);
+    });
   });
 
   it("two deep lines in a row are each dropped (the state resets at the newline)", async () => {

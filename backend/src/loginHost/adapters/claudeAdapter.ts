@@ -151,6 +151,7 @@ export class RunnerChildAdapter extends EventEmitter implements RunnerChild {
   }
 }
 
+const NEWLINE = Buffer.from("\n");
 const LINE_DROPPED = Buffer.from("\n{\"type\":\"aw_line_dropped\"}\n");
 
 /**
@@ -167,6 +168,7 @@ class LineLimit extends Transform {
   private inString = false;
   private esc = false;
   private dropping = false;
+  private afterCR = false;
   constructor(
     private readonly max: number,
     private readonly onOverflow: () => void,
@@ -174,40 +176,62 @@ class LineLimit extends Transform {
   ) {
     super();
   }
+  private resetLine(): void {
+    this.run = 0;
+    this.depth = 0;
+    this.inString = false;
+    this.esc = false;
+    this.dropping = false;
+  }
+  /**
+   * THE authority on what a line is. The runner's readline ends a line at \n, at \r\n and at a LONE \r (U+2028/2029 and the other Unicode separators do not
+   * split), so a scanner that knows only \n can be shown one string-containing line while readline hands JSON.parse a deep segment. Here every \r is
+   * rewritten to \n and the \n that follows a \r is swallowed (also across a chunk edge): what leaves this stream has \n as its ONLY separator, so the runner
+   * sees exactly the lines counted here. Empty lines are ignored by the runner.
+   */
   override _transform(chunk: Buffer, _enc: BufferEncoding, cb: (err?: Error | null, data?: Buffer) => void): void {
     if (this.tripped) return cb();
-    const first = chunk.indexOf(10);
-    const last = chunk.lastIndexOf(10);
-    const headRun = this.run + (first === -1 ? chunk.length : first);
-    this.run = last === -1 ? this.run + chunk.length : chunk.length - last - 1;
-    if (headRun > this.max || this.run > this.max) {
-      this.tripped = true;
-      this.onOverflow();
-      return cb();
-    }
     const out: Buffer[] = [];
     let start = 0; // start of the bytes still to be forwarded
     for (let i = 0; i < chunk.length; i++) {
+      const c = chunk[i];
       if (this.dropping) {
-        const nl = chunk.indexOf(10, i);
+        // skip to the next line terminator (\n or \r), counting the bytes against the line cap
+        const x = chunk.indexOf(10, i);
+        const y = chunk.indexOf(13, i);
+        const nl = x < 0 ? y : y < 0 ? x : Math.min(x, y);
+        const skipTo = nl < 0 ? chunk.length : nl;
+        this.run += skipTo - i;
+        if (this.run > this.max) return this.overflow(cb);
         if (nl < 0) {
           start = chunk.length;
           break;
         }
-        this.dropping = false;
-        this.depth = 0;
-        this.inString = false;
-        this.esc = false;
-        start = nl + 1;
+        this.resetLine();
+        this.afterCR = chunk[nl] === 13;
+        start = nl + 1; // the terminator itself is part of the placeholder line already sent
         i = nl;
         continue;
       }
-      const c = chunk[i];
-      if (c === 10) {
-        this.depth = 0;
-        this.inString = false;
-        this.esc = false;
-      } else if (this.inString) {
+      if (c === 10 && this.afterCR) {
+        // the \n of a \r\n: the \r was already turned into the line end
+        this.afterCR = false;
+        out.push(chunk.subarray(start, i));
+        start = i + 1;
+        continue;
+      }
+      this.afterCR = false;
+      if (c === 13 || c === 10) {
+        this.resetLine();
+        if (c === 13) {
+          out.push(chunk.subarray(start, i), NEWLINE);
+          start = i + 1;
+          this.afterCR = true;
+        }
+        continue;
+      }
+      if (++this.run > this.max) return this.overflow(cb);
+      if (this.inString) {
         if (this.esc) this.esc = false;
         else if (c === 0x5c) this.esc = true;
         else if (c === 0x22) this.inString = false;
@@ -223,6 +247,11 @@ class LineLimit extends Transform {
     }
     if (start < chunk.length) out.push(chunk.subarray(start));
     cb(null, out.length === 1 ? out[0] : Buffer.concat(out));
+  }
+  private overflow(cb: (err?: Error | null, data?: Buffer) => void): void {
+    this.tripped = true;
+    this.onOverflow();
+    cb();
   }
 }
 
@@ -597,12 +626,20 @@ class ClaudeSession implements ProviderSession {
 
   /** Model message ids of tool_use blocks seen in the stream and not yet claimed by a relayed call: (bare name, canonical input) -> message id. */
   private readonly streamUses: Array<{ messageId: string; name: string; key: string }> = [];
-  private waiting: { call: RelayCall; timer: NodeJS.Timeout } | undefined;
+  /** The call waiting for its message id. `key` is its input's digest, computed ONCE when the call arrives (undefined: too large to hash, matched by name only). */
+  private waiting: { call: RelayCall; timer: NodeJS.Timeout; key: string | undefined } | undefined;
   private events: AsyncQueue<ProviderEvent> | undefined;
   private relayEp: RelayEndpoint | undefined;
   /** The in-flight relay.open(): a close that arrives meanwhile waits for it, so the endpoint it creates is never left behind. */
   private relayOpening: Promise<RelayEndpoint> | undefined;
   private readonly visibleTools = new Set<string>();
+  /** Bytes canonicalized and hashed for matching in the current turn (stream announcements and call inputs together): a hard budget, then name-only matching. */
+  private hashedBytes = 0;
+  private spendHash(bytes: number): boolean {
+    if (this.hashedBytes + bytes > TURN_HASH_BUDGET_BYTES) return false;
+    this.hashedBytes += bytes;
+    return true;
+  }
 
   /** A tool_use block from the stream (informational ONLY: it is never executed or registered, it just tells us which model message a relayed call belongs to). */
   private noteStreamUse(raw: Record<string, unknown>): void {
@@ -610,31 +647,37 @@ class ClaudeSession implements ProviderSession {
     const msg = raw.message as { id?: unknown; content?: unknown } | undefined;
     if (!msg || typeof msg.id !== "string" || !Array.isArray(msg.content)) return;
     const prefix = qualifiedToolPrefix(this.cfg.mcpServerName);
-    for (const b of msg.content as Array<Record<string, unknown>>) {
+    // A hostile CLI can print a 16 MB line of a quarter million tiny blocks: look at a bounded number of blocks per event, and record a bounded number of announcements.
+    const blocks = msg.content as Array<Record<string, unknown>>;
+    let recorded = 0;
+    for (let i = 0; i < blocks.length && i < MAX_BLOCKS_PER_EVENT && recorded < MAX_STREAM_USES; i++) {
+      const b = blocks[i];
       if (b?.type !== "tool_use" || typeof b.name !== "string" || !b.name.startsWith(prefix)) continue;
       const name = b.name.slice(prefix.length);
       if (!this.visibleTools.has(name)) continue; // the stream is hostile input: only tools the turn can call are ever remembered
       // Bounded memory whatever the CLI prints: a fixed-size digest of the input (not the input), a truncated id, and at most MAX_STREAM_USES entries (oldest dropped).
       // An over-long id is NOT recorded (never sliced: in V8 a slice keeps the whole original string alive). The call then gets a unique unmatched id.
       if (msg.id.length > MAX_MESSAGE_ID_CHARS) continue;
-      // An announcement whose input is larger than a forwarded value is recorded by NAME only: hashing a 16 MB hostile input would block the event loop for seconds. It can
-      // still be matched by name when it is the only one of that name (see flushWaiting).
+      // An announcement whose input is larger than a forwarded value is NOT recorded: hashing a 16 MB hostile input would block the event loop for seconds, and it
+      // could never match a real call anyway (a relay frame over 1 MiB is refused). The call then gets a unique unmatched id.
       const input = b.input ?? {};
-      const key = approxJsonBytes(input, MAX_FORWARDED_BYTES + 1) > MAX_FORWARDED_BYTES ? OVERSIZE_KEY : digest(canonicalJson(input));
-      this.streamUses.push({ messageId: msg.id, name, key });
+      const inputBytes = approxJsonBytes(input, MAX_FORWARDED_BYTES + 1);
+      if (inputBytes > MAX_FORWARDED_BYTES) continue;
+      if (!this.spendHash(inputBytes + 64)) continue; // the turn's hashing budget is spent: not recorded (the call then gets a unique unmatched id)
+      this.streamUses.push({ messageId: msg.id, name, key: digest(canonicalJson(input)) });
+      recorded++;
       if (this.streamUses.length > MAX_STREAM_USES) this.streamUses.splice(0, this.streamUses.length - MAX_STREAM_USES);
     }
-    this.flushWaiting(false);
+    // Only a NEW announcement can change which message a waiting call belongs to: re-checking on every line a hostile CLI prints would let it multiply the work.
+    if (recorded > 0) this.flushWaiting(false);
   }
 
   /** Emits the waiting call once the stream has shown its model message (or, with `force`, without one after the wait). */
   private flushWaiting(force: boolean): void {
     const w = this.waiting;
     if (!w || !this.events) return;
-    // A call is EXECUTED by the backend: its input is forwarded exactly or not at all (never replaced by a marker). The relay already refused deeper frames; this is the check.
-    if (valueDepthExceeds(w.call.args, MAX_FORWARDED_DEPTH)) throw new Error("args_too_deep");
-    const key = digest(canonicalJson(w.call.args));
-    const exact = this.streamUses.find((u) => u.name === w.call.name && u.key === key);
+    const key = w.key;
+    const exact = key === undefined ? undefined : this.streamUses.find((u) => u.name === w.call.name && u.key === key);
     const byName = this.streamUses.filter((u) => u.name === w.call.name);
     const hit = exact ?? (byName.length === 1 ? byName[0] : undefined);
     if (!hit && !force) return;
@@ -670,9 +713,22 @@ class ClaudeSession implements ProviderSession {
 
   private onRelayCall(call: RelayCall): void {
     if (this.closing || this.interrupted || !this.events) return;
+    // A call is EXECUTED by the backend: its input is forwarded exactly or not at all (never replaced by a marker). The relay already refused deeper frames; this is the check.
+    // The digest used to find the call's message is computed ONCE, here, and only for a call small enough to be worth it: re-hashing a ~1 MiB input on every stream line
+    // let a hostile unit stall the event loop for tens of seconds. A larger call is matched by name only (see flushWaiting).
+    let key: string | undefined;
+    try {
+      if (valueDepthExceeds(call.args, MAX_FORWARDED_DEPTH)) throw new Error("args_too_deep");
+      if (call.bytes <= MAX_HASHED_CALL_BYTES && this.spendHash(call.bytes + 64)) key = digest(canonicalJson(call.args));
+    } catch {
+      this.guarded(call.operationId, () => {
+        throw new Error("call_unusable");
+      });
+      return;
+    }
     const timer = setTimeout(() => this.guarded(call.operationId, () => this.flushWaiting(true)), this.cfg.messageIdWaitMs);
     timer.unref?.();
-    this.waiting = { call, timer };
+    this.waiting = { call, timer, key };
     this.guarded(call.operationId, () => this.flushWaiting(false));
   }
 
@@ -698,6 +754,7 @@ class ClaudeSession implements ProviderSession {
       if (input.relay) {
         const relay = this.cfg.relay;
         if (!relay) throw Object.assign(new Error("relay_unavailable"), { code: "open_failed" });
+        this.hashedBytes = 0;
         for (const t of input.relay.tools) this.visibleTools.add(t.name);
         // The per-turn socket exists (and accepts) BEFORE the unit starts. Identity is fixed here, from the session, never from a frame.
         this.relayOpening = relay.host.open({
@@ -861,7 +918,10 @@ class ClaudeSession implements ProviderSession {
 
 
 const MAX_STREAM_USES = 64;
-/** Key of a stream announcement too large to hash; it never equals a real digest (those are base64 of 32 bytes). */
-const OVERSIZE_KEY = "~oversize";
+/** At most this many content blocks of one assistant event are looked at, and a call whose frame is larger than this is never hashed. */
+const MAX_BLOCKS_PER_EVENT = 256;
+const MAX_HASHED_CALL_BYTES = 64 * 1024;
+/** Hard budget of bytes canonicalized and hashed per turn (like the backend dispatcher's announce budget). */
+const TURN_HASH_BUDGET_BYTES = 8 * 1024 * 1024;
 const MAX_MESSAGE_ID_CHARS = 128;
 const digest = (text: string): string => createHash("sha256").update(text).digest("base64");

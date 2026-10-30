@@ -23,7 +23,7 @@ const cfg = () =>
     uidMax: 410_000,
     socket: { dir: "/run/aw-login-host-test1", gid: 990 },
     egress: { allow: ["api.anthropic.com:443"] },
-    claude: { binaryPath: "/opt/aw-claude/2.1.294/claude", expectedSha256: "a".repeat(64), version: "2.1.294", systemPromptFile: "/opt/aw-login-host/system-prompt.txt", bridgeUrl: "http://127.0.0.1:3001/mcp" },
+    claude: { binaryPath: "/opt/aw-claude/2.1.294/claude", expectedSha256: "a".repeat(64), version: "2.1.294", systemPromptFile: "/opt/aw-login-host/system-prompt.txt", nodePath: "/opt/aw-node/v22.23.3/bin/node", bridgeUrl: "http://127.0.0.1:3001/mcp" },
   });
 const binary = (c: ReturnType<typeof cfg>): VerifiedBinary => ({ path: c.claude.binaryPath, version: "2.1.294", digest: "sha256:" + "a".repeat(64) });
 

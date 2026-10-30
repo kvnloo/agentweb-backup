@@ -15,6 +15,7 @@
  *  - Nothing in a frame is ever logged. Log lines carry fixed codes only.
  */
 import { randomBytes } from "crypto";
+import { performance } from "perf_hooks";
 import { chmodSync, chownSync, existsSync, mkdirSync, readdirSync, rmSync } from "fs";
 import { createServer, type Server, type Socket } from "net";
 import type { Logger } from "../ports";
@@ -52,6 +53,9 @@ export interface RelayLimits {
   /** Token bucket: burst size and refill per second. */
   burst: number;
   refillPerSec: number;
+  /** Byte budget next to the frame bucket: scanning and parsing a 1 MiB frame costs tens of ms of the shared host's event loop, so frames per second alone is not a limit. */
+  byteBurst: number;
+  bytesPerSec: number;
   /** Connections accepted over the life of one turn (a shim that restarts reconnects; a flood does not). */
   maxConnectionsPerTurn: number;
   shimToHostBytes: number;
@@ -62,6 +66,8 @@ export const DEFAULT_RELAY_LIMITS: RelayLimits = {
   idleMs: 15_000,
   burst: 30,
   refillPerSec: 10,
+  byteBurst: 4 * 1024 * 1024,
+  bytesPerSec: 2 * 1024 * 1024,
   maxConnectionsPerTurn: 16,
   shimToHostBytes: RELAY_FRAME_LIMITS.shimToHostBytes,
   hostToShimBytes: RELAY_FRAME_LIMITS.hostToShimBytes,
@@ -206,6 +212,7 @@ class Endpoint implements RelayEndpoint {
       } catch {
         this.violate("internal_error");
         s.destroy();
+        if (this.conn === s) this.conn = undefined; // its close handler was never registered: do not leave the one connection slot taken by a dead socket
       }
     });
     this.server.maxConnections = 8; // refused at the listener beyond this; the one-connection rule below is the real limit
@@ -226,13 +233,22 @@ class Endpoint implements RelayEndpoint {
     });
   }
 
+  /** The turn this endpoint belongs to, for a log line: host-chosen identity only (ids are validated by the protocol schema), never anything from a frame. */
+  private who(): Record<string, string> {
+    const id = this.o.identity;
+    const ok = (v: unknown): v is string => typeof v === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(v);
+    return { ...(ok(id.connectionId) ? { connectionId: id.connectionId } : {}), ...(ok(id.turnId) ? { turnId: id.turnId } : {}) };
+  }
+
   private violate(code: string): void {
     try {
+      // The host-wide quota is charged ONLY by a line this endpoint itself let through: endpoints that are already suppressed must not use it up and hide another turn's line.
       const mine = this.throttle.check(code);
-      const shared = this.sharedThrottle.check(code);
-      if (mine.log && shared.log) this.log?.warn("relay_violation", { code });
+      const shared = mine.log ? this.sharedThrottle.check(code) : { log: false, suppressedBefore: 0 };
+      const who = this.who();
+      if (mine.log && shared.log) this.log?.warn("relay_violation", { code, ...who });
       const before = Math.max(mine.suppressedBefore, shared.suppressedBefore);
-      if (before > 0) this.log?.warn("relay_violation_suppressed", { code, count: before });
+      if (before > 0) this.log?.warn("relay_violation_suppressed", { code, count: before, ...who });
     } catch {
       /* a failing logger must not become an uncaught exception either */
     }
@@ -250,7 +266,8 @@ class Endpoint implements RelayEndpoint {
     this.conn = s;
     const assembler = new LineAssembler(this.limits.shimToHostBytes);
     let tokens = this.limits.burst;
-    let lastRefill = Date.now();
+    let byteTokens = this.limits.byteBurst;
+    let lastRefill = performance.now(); // a MONOTONIC clock: a backwards step of the wall clock must not drop a healthy connection
     let idle = setTimeout(() => this.drop(s, "idle_timeout"), this.limits.idleMs);
     idle.unref?.();
     s.once("close", () => {
@@ -271,11 +288,15 @@ class Endpoint implements RelayEndpoint {
       const { lines, tooLarge } = assembler.push(chunk); // linear in the bytes received, however they are chunked (see LineAssembler)
       for (const line of lines) {
         // Token bucket, refilled by elapsed time. Every complete frame costs one token.
-        const now = Date.now();
-        tokens = Math.min(this.limits.burst, tokens + ((now - lastRefill) / 1000) * this.limits.refillPerSec);
+        const now = performance.now();
+        const dt = (now - lastRefill) / 1000;
+        tokens = Math.min(this.limits.burst, tokens + dt * this.limits.refillPerSec);
+        byteTokens = Math.min(this.limits.byteBurst, byteTokens + dt * this.limits.bytesPerSec);
         lastRefill = now;
-        if (tokens < 1) return this.drop(s, "rate_limited");
+        // frames per second AND bytes per second: a 1 MiB frame costs tens of ms to scan and parse, and the frame count alone would allow ten of them a second
+        if (tokens < 1 || byteTokens < line.length + 1) return this.drop(s, "rate_limited");
         tokens -= 1;
+        byteTokens -= line.length + 1;
         clearTimeout(idle);
         idle = setTimeout(() => this.drop(s, "idle_timeout"), this.limits.idleMs);
         idle.unref?.();
@@ -422,7 +443,7 @@ class Endpoint implements RelayEndpoint {
       this.conn?.destroy();
       this.conn = undefined;
       try {
-        for (const [code, count] of this.throttle.flush()) this.log?.warn("relay_violation_suppressed", { code, count });
+        for (const [code, count] of this.throttle.flush()) this.log?.warn("relay_violation_suppressed", { code, count, ...this.who() });
       } catch {
         /* logging is best effort */
       }

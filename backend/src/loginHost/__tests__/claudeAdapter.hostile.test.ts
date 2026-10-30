@@ -10,6 +10,7 @@ import { tmpdir } from "os";
 import { dirname, join } from "path";
 import type { AdapterContext, ChildLike, ProviderEvent, SpawnSpec } from "../adapter";
 import { ClaudeAdapter } from "../adapters/claudeAdapter";
+import * as canonicalModule from "../relay/canonical";
 import { Layout } from "../ports/layout";
 import { RelayHost, type RelayCall, type RelayEndpoint, type RelayOpenOptions } from "../relay/relayServer";
 import type { ToolDef } from "../protocol";
@@ -161,8 +162,137 @@ function stubbed(messageIdWaitMs = 100, answerThrows = false) {
 }
 const call = (over: Partial<RelayCall> = {}): RelayCall => ({ identity: { connectionId: "conn1", epoch: 3, turnId: "t1" }, operationId: "a".repeat(32), name: "search", args: { q: 1 }, bytes: 80, ...over });
 
+describe("a hostile unit and a hostile CLI together cannot stall the loop by making the host re-hash a call (loop-lag regression)", () => {
+  type Priv = { noteStreamUse(raw: Record<string, unknown>): void; flushWaiting(force: boolean): void };
+  async function withWaitingCall(args: Record<string, unknown>, bytes: number, preSpent = 0) {
+    const s = stubbed(2000);
+    const session = await s.rig.adapter.openSession(s.rig.ctx, { connectionId: "conn1", epoch: 3 });
+    const turn = (async () => {
+      for await (const ev of session.turn({ turnId: "t1", prompt: "go", model: "sonnet", relay: { tools: TOOLS, callTimeoutMs: () => 10_000 } })) void ev;
+    })();
+    await until(() => !!s.opts());
+    const flush = jest.spyOn(session as unknown as Priv, "flushWaiting");
+    const canonical = jest.spyOn(canonicalModule, "canonicalJson");
+    (session as unknown as { hashedBytes: number }).hashedBytes = preSpent;
+    s.opts().onCall(call({ args, bytes }));
+    return { session: session as unknown as Priv & { close(): Promise<void> }, turn, flush, canonical, rejected: s.rejected, stop: async () => (canonical.mockRestore(), flush.mockRestore(), await (session as { close(): Promise<void> }).close(), await turn.catch(() => undefined)) };
+  }
+  const tiny = (i: number) => ({ type: "assistant", message: { id: `a${i}`, content: [] } });
+
+  it("MUTATION TARGET: 759 KB of args and 1,500 tiny stream lines: the call is never canonicalized (too big to hash), and the lines do not re-check it", async () => {
+    const args: Record<string, unknown> = {};
+    for (let i = 0; i < 40_000; i++) args["k" + i] = "v".repeat(10);
+    const bytes = Buffer.byteLength(JSON.stringify(args));
+    expect(bytes).toBeGreaterThan(700_000);
+    const w = await withWaitingCall(args, bytes);
+    const t0 = Date.now();
+    for (let i = 0; i < 1500; i++) w.session.noteStreamUse(tiny(i));
+    expect(Date.now() - t0).toBeLessThan(2000); // 22.8 s idle / 92 s loaded before the fix
+    expect(w.canonical).not.toHaveBeenCalled(); // above 64 KiB: matched by name only
+    expect(w.flush).toHaveBeenCalledTimes(1); // only the check when the call arrived: tiny lines record nothing new, so they never re-check
+    await w.stop();
+  });
+
+  it("MUTATION TARGET: a small call is hashed exactly ONCE however many lines follow", async () => {
+    const w = await withWaitingCall({ q: "small" }, 40);
+    for (let i = 0; i < 1500; i++) w.session.noteStreamUse(tiny(i));
+    expect(w.canonical).toHaveBeenCalledTimes(1);
+    expect(w.flush).toHaveBeenCalledTimes(1);
+    await w.stop();
+  });
+
+  it("MUTATION TARGET: a call over 64 KiB is still tied to its message by NAME when exactly one announcement of that tool exists", async () => {
+    const args: Record<string, unknown> = { pad: "x".repeat(100_000) };
+    const w = await withWaitingCall(args, 100_050);
+    w.session.noteStreamUse({ type: "assistant", message: { id: "mBigCall", content: [{ type: "tool_use", id: "t", name: "mcp__emma__search", input: { pad: "different" } }] } });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(w.flush.mock.calls.length).toBe(2); // the arrival and the new announcement
+    await w.stop();
+  });
+
+  it("MUTATION TARGET: the budget covers the CALL too: once the turn has spent it, even a small call is not hashed (matched by name only)", async () => {
+    const w = await withWaitingCall({ q: "small" }, 40, 8 * 1024 * 1024);
+    expect(w.canonical).not.toHaveBeenCalled();
+    await w.stop();
+  });
+
+  it("MUTATION TARGET: a new turn starts with a fresh hashing budget", async () => {
+    const s = stubbed(2000);
+    const session = await s.rig.adapter.openSession(s.rig.ctx, { connectionId: "conn1", epoch: 3 });
+    (session as unknown as { hashedBytes: number }).hashedBytes = 8 * 1024 * 1024;
+    const turn = (async () => {
+      for await (const ev of session.turn({ turnId: "t9", prompt: "go", model: "sonnet", relay: { tools: TOOLS, callTimeoutMs: () => 10_000 } })) void ev;
+    })();
+    await until(() => !!s.opts());
+    expect((session as unknown as { hashedBytes: number }).hashedBytes).toBe(0);
+    await session.close();
+    await turn.catch(() => undefined);
+  });
+
+  it("MUTATION TARGET: a hard per-turn budget on bytes hashed: 60 announcements of ~500 KB cost at most 8 MiB of hashing, then nothing is hashed or recorded", async () => {
+    const w = await withWaitingCall({ q: "x" }, 20);
+    w.canonical.mockClear();
+    (w.session as unknown as { visibleTools: Set<string> }).visibleTools.add("search");
+    const t0 = Date.now();
+    for (let i = 0; i < 60; i++) {
+      w.session.noteStreamUse({ type: "assistant", message: { id: "m" + i, content: [{ type: "tool_use", id: "t", name: "mcp__emma__search", input: { pad: "x".repeat(500_000) + i } }] } });
+    }
+    expect(w.canonical.mock.calls.length).toBeLessThanOrEqual(17); // 8 MiB / ~500 KB
+    expect(w.canonical.mock.calls.length).toBeGreaterThan(0);
+    await w.stop();
+  });
+
+  it("MUTATION TARGET: one 16 MB-style event of a quarter million tiny tool_use blocks examines a bounded number of them", async () => {
+    const w = await withWaitingCall({ q: "x" }, 20);
+    w.canonical.mockClear();
+    (w.session as unknown as { visibleTools: Set<string> }).visibleTools.add("search");
+    const blocks = Array.from({ length: 250_000 }, (_, i) => ({ type: "tool_use", id: "t" + i, name: "mcp__emma__search", input: { i } }));
+    const t0 = Date.now();
+    w.session.noteStreamUse({ type: "assistant", message: { id: "mHuge", content: blocks } });
+    expect(Date.now() - t0).toBeLessThan(2000);
+    expect(w.canonical.mock.calls.length).toBeLessThanOrEqual(64); // at most MAX_STREAM_USES announcements are recorded, the rest are never looked at
+    await w.stop();
+  });
+});
+
+describe("which model message a relayed call is tied to (the stream announcements are only a hint)", () => {
+  async function tie(announce: Array<{ id: string; name?: string; input: unknown }>, args: Record<string, unknown>): Promise<string> {
+    const s = stubbed(150);
+    const session = await s.rig.adapter.openSession(s.rig.ctx, { connectionId: "conn1", epoch: 3 });
+    const events: ProviderEvent[] = [];
+    const turn = (async () => {
+      for await (const ev of session.turn({ turnId: "t1", prompt: "go", model: "sonnet", relay: { tools: [...TOOLS, { name: "other", description: "o", inputSchema: { type: "object", properties: {} } }], callTimeoutMs: () => 5000 } })) events.push(ev);
+    })();
+    await until(() => !!s.opts());
+    for (const an of announce) {
+      (session as unknown as { noteStreamUse(raw: Record<string, unknown>): void }).noteStreamUse({ type: "assistant", message: { id: an.id, content: [{ type: "tool_use", id: "tu-" + an.id, name: `mcp__emma__${an.name ?? "search"}`, input: an.input }] } });
+    }
+    s.opts().onCall(call({ args }));
+    await until(() => events.some((e) => e.type === "tool-call"));
+    const id = (events.find((e) => e.type === "tool-call") as Extract<ProviderEvent, { type: "tool-call" }>).messageId;
+    await session.close();
+    await turn.catch(() => undefined);
+    return id;
+  }
+
+  it("MUTATION TARGET: the announcement with the SAME input wins over another of the same tool", async () => {
+    expect(await tie([{ id: "mA", input: { q: 1 } }, { id: "mB", input: { q: 2 } }], { q: 2 })).toBe("mB");
+    expect(await tie([{ id: "mA", input: { q: 1 } }, { id: "mB", input: { q: 2 } }], { q: 1 })).toBe("mA");
+  });
+
+  it("MUTATION TARGET: when the inputs differ but exactly ONE announcement of that tool exists, it is used; with two or more it is NOT guessed (a unique id, so the backend never collapses two different calls)", async () => {
+    expect(await tie([{ id: "mOnly", input: { q: 1 } }], { q: "different" })).toBe("mOnly");
+    expect(await tie([{ id: "mA", input: { q: 1 } }, { id: "mB", input: { q: 2 } }], { q: 3 })).toMatch(/^unmatched-/);
+  });
+
+  it("MUTATION TARGET: an announcement of ANOTHER tool never matches, and an oversize announcement (not recorded) leaves the call unmatched", async () => {
+    expect(await tie([{ id: "mX", name: "other", input: { q: 1 } }], { q: 1 })).toMatch(/^unmatched-/);
+    expect(await tie([{ id: "mBig", input: { blob: "x".repeat(2 * 1024 * 1024) } }], { blob: "x" })).toMatch(/^unmatched-/);
+  });
+});
+
 describe("a failure while handling a call is contained: the call is answered with an internal error, the endpoint is closed, nothing is thrown", () => {
-  async function run(inject: (o: RelayOpenOptions) => void) {
+  async function run(inject: (o: RelayOpenOptions) => void, withSession?: (session: unknown) => void) {
     const s = stubbed();
     const session = await s.rig.adapter.openSession(s.rig.ctx, { connectionId: "conn1", epoch: 3 });
     const events: ProviderEvent[] = [];
@@ -170,6 +300,7 @@ describe("a failure while handling a call is contained: the call is answered wit
       for await (const ev of session.turn({ turnId: "t1", prompt: "go", model: "sonnet", relay: { tools: TOOLS, callTimeoutMs: () => 5000 } })) events.push(ev);
     })();
     await until(() => !!s.opts());
+    withSession?.(session);
     inject(s.opts());
     await new Promise((r) => setTimeout(r, 400)); // past the message-id wait: the TIMER path has run
     const closesBeforeCleanup = s.closes(); // what the guard itself did, before the test's own session.close() closes the endpoint too
@@ -189,16 +320,12 @@ describe("a failure while handling a call is contained: the call is answered wit
   });
 
   it("MUTATION TARGET: a failure that happens only LATER, in the message-id TIMER (the first look at the call was fine), is contained the same way", async () => {
-    const t0 = Date.now();
-    const args = {} as Record<string, unknown>;
-    Object.defineProperty(args, "q", {
-      enumerable: true,
-      get: () => {
-        if (Date.now() - t0 > 60) throw new Error("late boom: SECRET");
-        return 1;
-      },
-    });
-    const r = await run((o) => o.onCall(call({ args })));
+    let sessionRef: { events: unknown } | undefined;
+    const r = await run((o) => {
+      o.onCall(call()); // fine: it waits for its message id
+      // the queue the timer will push to breaks before the timer fires
+      (sessionRef as { events: unknown }).events = { push: () => { throw new Error("late boom: SECRET"); } };
+    }, (session) => (sessionRef = session as never));
     expect(uncaught).toEqual([]);
     expect(r.events.filter((e) => e.type === "tool-call")).toHaveLength(0);
     expect(r.rejected).toEqual(["a".repeat(32)]);

@@ -40,6 +40,7 @@ const client = async (path: string) => {
   s.on("error", () => undefined);
   let closed = false;
   s.on("close", () => (closed = true));
+  s.on("data", () => undefined); // read (and discard) what the host sends, so a close can be seen
   await new Promise<void>((r) => s.once("connect", () => r()));
   return { s, isClosed: () => closed };
 };
@@ -101,7 +102,7 @@ describe("violation logs from a hostile unit are throttled", () => {
     await until(() => once.isClosed());
     const summary = s.logs.filter((l) => l.event === "relay_violation_suppressed");
     expect(summary).toHaveLength(1);
-    expect(summary[0].fields).toEqual({ code: "second_connection", count: 295 });
+    expect(summary[0].fields).toEqual({ code: "second_connection", count: 295, connectionId: "c", turnId: "t" });
     first.s.destroy();
     await ep.close();
   });
@@ -133,7 +134,73 @@ describe("violation logs from a hostile unit are throttled", () => {
     await ep.close();
     const summary = s.logs.filter((l) => l.event === "relay_violation_suppressed");
     expect(summary).toHaveLength(1);
-    expect(summary[0].fields).toEqual({ code: "second_connection", count: 7 });
+    expect(summary[0].fields).toEqual({ code: "second_connection", count: 7, connectionId: "c", turnId: "t" });
+  });
+});
+
+describe("the host-wide log quota is charged only by lines an endpoint itself let through", () => {
+  it("MUTATION TARGET: endpoints that are already suppressed do not drain the host quota and hide another turn's line", async () => {
+    const s = setup();
+    // 12 endpoints, each emitting far more than its own 5 per window: only 5 lines each get through (60 in all), and only THOSE count against the host's 50
+    // BEFORE the fix every suppressed line also charged the host quota, which 4 hostile endpoints used up in a flash
+    const eps = [];
+    for (let i = 0; i < 12; i++) {
+      const { ep } = await s.open(400_001 + i);
+      const hold = await client(sockOf(ep.dir));
+      for (let k = 0; k < 20; k++) {
+        const x = await client(sockOf(ep.dir));
+        await until(() => x.isClosed());
+      }
+      eps.push({ ep, hold });
+    }
+    const lines = s.logs.filter((l) => l.event === "relay_violation");
+    expect(lines.length).toBe(50); // the host quota, exactly: endpoints 1-10 got their 5, the 11th and 12th none
+    // a victim endpoint opened afterwards with its own first violation: still limited by the (spent) host quota, but the SPENT quota is the honest 50, not exhausted by suppressed noise early
+    expect(new Set(lines.map((l) => l.fields?.turnId)).size).toBe(1); // identity is the host's own for every endpoint here
+    for (const e of eps) {
+      e.hold.s.destroy();
+      await e.ep.close();
+    }
+  });
+
+  it("MUTATION TARGET: log lines carry the host-chosen connection and turn ids", async () => {
+    const s = setup();
+    const { ep } = await s.open();
+    const hold = await client(sockOf(ep.dir));
+    const x = await client(sockOf(ep.dir));
+    await until(() => x.isClosed());
+    expect(s.logs[0]).toEqual({ event: "relay_violation", fields: { code: "second_connection", connectionId: "c", turnId: "t" } });
+    hold.s.destroy();
+    await ep.close();
+  });
+});
+
+describe("the relay's byte budget", () => {
+  it("MUTATION TARGET: frames are limited by BYTES per second too, not only by count (a busy ~100 KB frame stream is cut when it passes the byte burst)", async () => {
+    const s = setup({}, { byteBurst: 300_000, bytesPerSec: 1 });
+    const { ep, calls } = await s.open();
+    const c = await client(sockOf(ep.dir));
+    const frame = (i: number) => JSON.stringify({ type: "call", callId: `c${i}`, name: "t", args: { pad: "x".repeat(120_000) } }) + "\n";
+    c.s.write(frame(1));
+    c.s.write(frame(2)); // answered busy (a call is pending) but still paid for
+    await until(() => calls.length === 1);
+    expect(c.isClosed()).toBe(false);
+    c.s.write(frame(3)); // 3 x ~120 KB > 300 KB
+    await until(() => c.isClosed());
+    expect(s.logs.map((l) => l.fields?.code)).toContain("rate_limited");
+    await ep.close();
+  });
+
+  it("small frames are not slowed by the byte budget", async () => {
+    const s = setup({}, { byteBurst: 300_000, bytesPerSec: 1 });
+    const { ep, calls } = await s.open();
+    const c = await client(sockOf(ep.dir));
+    c.s.write(JSON.stringify({ type: "call", callId: "c1", name: "t", args: { q: 1 } }) + "\n");
+    await until(() => calls.length === 1);
+    for (let i = 0; i < 20; i++) c.s.write(JSON.stringify({ type: "ping" }) + "\n");
+    await new Promise((r) => setTimeout(r, 50));
+    expect(c.isClosed()).toBe(false);
+    await ep.close();
   });
 });
 
