@@ -33,6 +33,12 @@ jest.mock('../services/emailProviderService', () => ({
   withAccessGuard: (_u: any, _r: any, _o: any, read: () => any) => read(),
 }));
 
+const mockBlockedRecipients = jest.fn().mockResolvedValue([]);
+jest.mock('../services/contactGuard', () => ({
+  blockedRecipients: (...a: any[]) => mockBlockedRecipients(...a),
+  blockedMessage: (b: string[]) => `Not sent: ${b.join(', ')} is marked do-not-contact`,
+}));
+
 import emmaApiRoutes from '../routes/emmaApi';
 
 const SECRET = 'read-email-own-mailbox-secret';
@@ -54,6 +60,35 @@ afterAll(() => { delete process.env.JWT_SECRET; });
 beforeEach(() => {
   jest.clearAllMocks();
   mockListEmails.mockResolvedValue([{ id: 'm1' }]);
+});
+
+describe('POST /api/emma/email send and do-not-contact (ENG-673)', () => {
+  it('refuses with 409 and never calls the provider when a recipient is do-not-contact', async () => {
+    mockResolveEmailAccount.mockResolvedValue(accountOwnedBy('caller-1'));
+    mockBlockedRecipients.mockResolvedValueOnce(['blocked@example.com']);
+    const res = await post({ account_id: 'acct-1', action: 'send', to: 'blocked@example.com', subject: 's', body: 'b' });
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual(expect.objectContaining({ code: 'do_not_contact', blocked: ['blocked@example.com'] }));
+    expect(mockBlockedRecipients).toHaveBeenCalledWith(['caller-1', 'caller-1'], 'blocked@example.com', undefined, undefined);
+    expect(mockSendEmail).not.toHaveBeenCalled();
+  });
+
+  it('refuses with 503 and sends nothing when the do-not-contact check fails', async () => {
+    mockResolveEmailAccount.mockResolvedValue(accountOwnedBy('caller-1'));
+    mockBlockedRecipients.mockRejectedValueOnce(new Error('dynamo down'));
+    const res = await post({ account_id: 'acct-1', action: 'send', to: 'ok@example.com', subject: 's', body: 'b' });
+    expect(res.status).toBe(503);
+    expect(res.body.code).toBe('do_not_contact_unverified');
+    expect(mockSendEmail).not.toHaveBeenCalled();
+  });
+
+  it('still sends when nobody is blocked', async () => {
+    mockResolveEmailAccount.mockResolvedValue(accountOwnedBy('caller-1'));
+    mockSendEmail.mockResolvedValue({ messageId: 'm9', threadId: 't9' });
+    const res = await post({ account_id: 'acct-1', action: 'send', to: 'ok@example.com', subject: 's', body: 'b' });
+    expect(res.status).toBe(200);
+    expect(mockSendEmail).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('POST /api/emma/email own_mailbox_only', () => {

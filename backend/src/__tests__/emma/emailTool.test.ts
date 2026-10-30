@@ -15,6 +15,13 @@ const mockListEmails = jest.fn();
 const mockGetEmails = jest.fn();
 const mockSendEmail = jest.fn();
 
+const mockBlockedRecipients = jest.fn().mockResolvedValue([]);
+jest.mock('../../services/contactGuard', () => ({
+  blockedRecipients: (...a: any[]) => mockBlockedRecipients(...a),
+  blockedMessage: (b: string[]) => `Not sent: ${b.join(', ')} is marked do-not-contact`,
+  unverifiedContactError: 'Not sent: could not check do-not-contact',
+}));
+
 class MockEmailProviderError extends Error {}
 
 const mockAssertStillAccessible = jest.fn();
@@ -134,6 +141,29 @@ describe('email tool — org-shared mailbox resolution', () => {
       expect.objectContaining({ to: 'someone@example.com', subject: 'Hi', body: 'Hello' })
     );
     expect(result).toEqual({ success: true, messageId: 'msg-sent', threadId: 't-1' });
+  });
+
+  it('refuses to send to a do-not-contact address (to, cc or bcc), checking the caller and the mailbox owner (ENG-673)', async () => {
+    mockResolveEmailAccount.mockResolvedValue({ ...ORG_SHARED_ACCOUNT, ownerUserId: OWNER_USER_ID });
+    mockBlockedRecipients.mockResolvedValueOnce(['blocked@example.com']);
+
+    const result = await tool.execute(
+      { action: 'send', account_id: ACCOUNT_ID, to: 'someone@example.com', cc: 'x@example.com', bcc: 'blocked@example.com', subject: 'Hi', body: 'Hello' },
+      context
+    );
+
+    expect(result.error).toContain('blocked@example.com');
+    expect(result.blocked).toEqual(['blocked@example.com']);
+    expect(mockBlockedRecipients).toHaveBeenCalledWith([CALLER_USER_ID, OWNER_USER_ID], 'someone@example.com', 'x@example.com', 'blocked@example.com');
+    expect(mockSendEmail).not.toHaveBeenCalled();
+  });
+
+  it('refuses to send when the do-not-contact check itself fails (never sends unverified)', async () => {
+    mockResolveEmailAccount.mockResolvedValue({ ...ORG_SHARED_ACCOUNT, ownerUserId: CALLER_USER_ID });
+    mockBlockedRecipients.mockRejectedValueOnce(new Error('dynamo down'));
+    const result = await tool.execute({ action: 'send', account_id: ACCOUNT_ID, to: 'someone@example.com', subject: 'Hi', body: 'Hello' }, context);
+    expect(result.error).toContain('could not check');
+    expect(mockSendEmail).not.toHaveBeenCalled();
   });
 
   it('surfaces the send refusal on a teammate’s shared mailbox as an error', async () => {
