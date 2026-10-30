@@ -68,7 +68,7 @@ async function admit(client: LoginHostClient, req: RouteInput<"turn.run">, opts:
   for (;;) {
     if (opts.signal?.aborted) throw new LoginHostError("EBUSY", "aborted_while_waiting");
     try {
-      return await client.turnRun(req);
+      return await client.turnRun(req, { signal: opts.signal });
     } catch (err) {
       if (!(err instanceof LoginHostError)) throw err;
       // `busy`: the host is full or draining for a deploy. `notSent`: it is restarting (a deploy swaps the build in seconds). Neither admitted anything.

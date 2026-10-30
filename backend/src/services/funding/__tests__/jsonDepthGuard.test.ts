@@ -88,10 +88,9 @@ describe('the login host client drops deeply nested worker data unparsed', () =>
 
   const turnReq = { connectionId: 'c1', epoch: 1, idempotencyKey: 'k1', turnId: 't1', prompt: 'p', model: 'm', bridgeToken: 'x'.repeat(16) } as never;
   const accepted = JSON.stringify({ type: 'accepted', turnId: 't1', duplicate: false }) + '\n';
-  const parseLengths = () => (JSON.parse as unknown as jest.SpyInstance).mock.calls.map((c: unknown[]) => String(c[0]).length);
 
-  it.each([1_000_000, 8 * 1024 * 1024 - 10])('a %i-deep stream line is dropped without JSON.parse: the stream ends as BAD_RESPONSE too_deep, fast, logging the length only', async (n) => {
-    const line = '['.repeat(n);
+  it('a 1,000,000-deep tool event (it fits the tool line cap) is dropped without JSON.parse: the stream ends as BAD_RESPONSE too_deep, fast, logging the length only', async () => {
+    const line = '{"type":"tool-use","operationId":"a","name":"n","input":' + '['.repeat(1_000_000);
     routes['/v1/turn.run'] = (res) => {
       res.writeHead(200, { 'content-type': 'application/x-ndjson' });
       res.write(accepted);
@@ -108,7 +107,20 @@ describe('the login host client drops deeply nested worker data unparsed', () =>
     const logged = (console.error as jest.Mock).mock.calls.map((c) => JSON.stringify(c)).join('\n');
     expect(logged).toContain('json_too_deep');
     expect(logged).not.toContain('[[[[');
-    void parseLengths;
+  });
+
+  it('an 8 MiB-deep line is cut by the line cap before it is even read to the end (the depth guard is the second wall)', async () => {
+    routes['/v1/turn.run'] = (res) => {
+      res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+      res.write(accepted);
+      res.end(`${'['.repeat(8 * 1024 * 1024 - 10)}\n`);
+    };
+    const parse = jest.spyOn(JSON, 'parse');
+    const stream = await client.turnRun(turnReq);
+    const err: any = await (async () => { for await (const _e of stream.events) void _e; })().catch((e) => e);
+    expect(err).toMatchObject({ code: 'BAD_RESPONSE' });
+    expect(['too_deep', 'line_too_long']).toContain(err.detail);
+    expect(parse.mock.calls.every((c) => String(c[0]).length < 1_000)).toBe(true);
   });
 
   it('a legitimate event nested exactly at the limit still gets through', async () => {

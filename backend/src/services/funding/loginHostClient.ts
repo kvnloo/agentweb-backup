@@ -112,6 +112,28 @@ function timeoutError(phase: Phase): Error {
   return Object.assign(new Error("timeout"), { code: "ETIMEDOUT", awPhase: phase });
 }
 
+/**
+ * What one turn.run stream may carry. A legitimate turn is tens to hundreds of events (a few KB each; the final text and a tool call's input are the big ones);
+ * these are far above that and far below what stalls the API server (measured: 640k tiny events = 7.8 s of CPU; 700k-object `entitlement` line = ~5 s).
+ */
+export const MAX_STREAM_LINES = 20_000;
+export const MAX_STREAM_BYTES = 64 * 1024 * 1024;
+/** The longest line per event type, in bytes. `text` and `result` keep the reply cap; a tool event carries an input of up to 1 MiB; everything else is small. */
+export const LINE_CAPS = { tool: 1_536 * 1024, other: 64 * 1024 } as const;
+const TYPE_AT_START = /^\{"type":"([a-z-]{1,24})"/;
+/** The cap for a line, decided from its first bytes BEFORE the rest is read or parsed. A line whose type is not first is held to the small cap. */
+function lineCapFor(head: Buffer): number {
+  const m = TYPE_AT_START.exec(head.toString("latin1"));
+  const type = m?.[1];
+  if (type === "text" || type === "result") return Number.MAX_SAFE_INTEGER; // bounded by the stream's own maxLine
+  if (type === "tool-call" || type === "tool-use") return LINE_CAPS.tool;
+  return LINE_CAPS.other;
+}
+function limitHit(code: string): LoginHostError {
+  console.error("[login-host-client] stream_limit", { code });
+  return new LoginHostError("BAD_RESPONSE", code);
+}
+
 /** A reply nested deeper than MAX_JSON_DEPTH: logged by length only (a fixed code, never content), then a bad answer from the host. */
 function logTooDeep(bytes: number): void {
   console.error("[login-host-client] json_too_deep", { bytes });
@@ -249,16 +271,22 @@ class NodeTransport implements HostTransport {
             return;
           }
           const lines = (async function* (): AsyncGenerator<unknown> {
-            const splitter = new LineSplitter(maxLine, () => new LoginHostError("BAD_RESPONSE", "too_large"));
-            res.setEncoding("utf8");
+            // Bounded BEFORE anything is parsed: a per-type cap on each line (see lineCapFor), and per-turn caps on how many lines and how many bytes one stream
+            // may carry. A hostile worker's flood of tiny events, or one near-8 MiB event of a type that is never that big, costs a few bytes of scanning, not seconds.
+            const splitter = new LineSplitter(maxLine, () => limitHit("line_too_long"), lineCapFor);
+            let count = 0;
+            let bytes = 0;
             try {
-              for await (const chunk of res as AsyncIterable<string>) {
+              for await (const chunk of res as AsyncIterable<Buffer>) {
+                bytes += chunk.length;
+                if (bytes > MAX_STREAM_BYTES) throw limitHit("too_many_bytes");
                 for (const line of splitter.push(chunk)) {
+                  if (++count > MAX_STREAM_LINES) throw limitHit("too_many_events");
                   // A line nested deeper than anything legitimate is dropped unparsed (JSON.parse would stall the event loop) and ends the stream.
                   if (jsonTooDeep(line)) throw tooDeep(line.length);
                   let parsed: unknown;
                   try {
-                    parsed = JSON.parse(line);
+                    parsed = JSON.parse(line.toString("utf8"));
                   } catch {
                     throw new LoginHostError("BAD_RESPONSE", "line");
                   }
@@ -333,15 +361,15 @@ const count = z.number().finite().nonnegative().optional();
 /** Known events are checked field by field; unknown types are dropped. A known type with wrong fields is BAD_RESPONSE. */
 const EVENT_SHAPES: Record<string, z.ZodTypeAny> = {
   text: z.object({ delta: z.string() }),
-  "tool-use": z.object({ operationId: z.string(), name: z.string(), input: z.unknown() }),
+  "tool-use": z.object({ operationId: z.string().max(256), name: z.string().max(256), input: z.unknown() }),
   // ENG-2113 relay: a host-generated operation the backend must answer. `name` and `input` are NOT trusted here (the dispatcher re-validates them against the
   // run's tool list); only the envelope is checked. A bad envelope is a bad answer from the host, never something to execute.
   "tool-call": z.object({ operationId: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/), messageId: z.string().max(200), name: z.string().max(200), input: z.unknown() }),
-  "tool-result": z.object({ operationId: z.string(), ok: z.boolean() }),
+  "tool-result": z.object({ operationId: z.string().max(256), ok: z.boolean() }),
   usage: z.object({ inputTokens: count, outputTokens: count, cacheReadTokens: count, cacheWriteTokens: count }),
-  entitlement: z.object({ observation: z.object({ windows: z.array(z.object({ name: z.string(), utilization: z.number().optional(), resetsAtMs: z.number().optional() })) }) }),
+  entitlement: z.object({ observation: z.object({ windows: z.array(z.object({ name: z.string().max(64), utilization: z.number().optional(), resetsAtMs: z.number().optional() })).max(8) }) }),
   alarm: z.object({ hazard: z.unknown() }),
-  result: z.object({ ok: z.boolean(), text: z.string(), errorKind: z.string().optional(), aborted: z.string().optional() }),
+  result: z.object({ ok: z.boolean(), text: z.string(), errorKind: z.string().max(64).optional(), aborted: z.string().max(64).optional() }),
 };
 
 export interface TurnStream {
@@ -351,6 +379,63 @@ export interface TurnStream {
   status?: "running" | "finished" | "failed" | "aborted";
   events: AsyncIterable<ProviderEvent>;
   close(): void;
+}
+
+/** Resolves with `p`, or rejects as soon as the signal aborts; a value that arrives after an abort is handed to `discard` (it must be closed, nobody will use it). */
+function abortable<T>(p: Promise<T>, signal: AbortSignal | undefined, discard: (late: T) => void): Promise<T> {
+  if (!signal) return p;
+  return new Promise<T>((resolve, reject) => {
+    let aborted = false;
+    const onAbort = () => {
+      aborted = true;
+      reject(new LoginHostError("EBUSY", "aborted_while_waiting"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    p.then(
+      (v) => {
+        signal.removeEventListener("abort", onAbort);
+        if (aborted) discard(v);
+        else resolve(v);
+      },
+      (e) => {
+        signal.removeEventListener("abort", onAbort);
+        if (!aborted) reject(e);
+      },
+    );
+  });
+}
+
+/** The first stream read, bounded by `ms` and by the abort signal; on either the stream is closed. */
+function readFirst<T>(read: Promise<T>, ms: number, signal: AbortSignal | undefined, close: () => void): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let done = false;
+    const finish = (fn: () => void) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      fn();
+    };
+    const onAbort = () =>
+      finish(() => {
+        close();
+        reject(new LoginHostError("EBUSY", "aborted_while_waiting"));
+      });
+    const timer = setTimeout(
+      () =>
+        finish(() => {
+          close();
+          reject(new LoginHostError("TIMEOUT", "start"));
+        }),
+      ms,
+    );
+    timer.unref?.();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    read.then(
+      (v) => finish(() => resolve(v)),
+      (e) => finish(() => reject(e)),
+    );
+  });
 }
 
 export class LoginHostClient {
@@ -427,13 +512,17 @@ export class LoginHostClient {
    * Rejects with `EBUSY` when the host is full; with an ambiguous error when no usable answer arrived
    * (the turn may or may not exist: ask again with the SAME idempotency key, never a new one).
    */
-  async turnRun(input: RouteInput<"turn.run">): Promise<TurnStream> {
+  async turnRun(input: RouteInput<"turn.run">, opts: { signal?: AbortSignal; startTimeoutMs?: number } = {}): Promise<TurnStream> {
     const body = ROUTES["turn.run"].parse(input);
-    const reply = await this.transport.stream("turn.run", body);
+    if (opts.signal?.aborted) throw new LoginHostError("EBUSY", "aborted_while_waiting");
+    // The connection and the response headers are bounded by the transport's own timers; a Stop must not wait for them either.
+    const reply = await abortable(this.transport.stream("turn.run", body), opts.signal, (r) => r.close());
     const it = reply.lines[Symbol.asyncIterator]();
     let first: IteratorResult<unknown>;
     try {
-      first = await it.next();
+      // The first line (`accepted`) is raced against a time limit AND the Stop: a worker that answers with headers and then says nothing must not make the turn
+      // un-stoppable (and the session host_busy).
+      first = await readFirst(it.next(), opts.startTimeoutMs ?? 30_000, opts.signal, () => reply.close());
     } catch (err) {
       reply.close();
       throw err instanceof LoginHostError ? err : new LoginHostError("UNREACHABLE");
