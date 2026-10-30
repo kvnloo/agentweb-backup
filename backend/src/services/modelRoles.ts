@@ -57,12 +57,10 @@ export function modelCapabilities(id: string): ModelCapability[] {
   return !m ? [] : m.isLive ? ['live-audio'] : m.supportsVision ? ['text', 'vision'] : ['text'];
 }
 
-// enrichment ran on gpt-5-chat-2 (aliased to gpt-5.5) before model roles (ENG-2184). ENG-2720:
-// the per-field-group web-search calls made gpt-5.5 most of an enrichment run's LLM bill. On the
-// same 73 resolved leads gpt-5.6-luna filled ~99% of the fields and ~90% of the web values at
-// ~5% of the cost, with gpt-5.5 kept as critic and error fallback (enrichmentV3RealDeps). The
-// picker may hide a superseded model, so the default is honoured through the same runnable
-// check as a persisted default.
+// enrichment ran on gpt-5-chat-2 (aliased to gpt-5.5) before model roles (ENG-2184). ENG-2720 moved
+// it to gpt-5.6-luna for cost; the benchmark and its quality trade-offs are on that ticket. The picker
+// may hide a superseded model, so the default is honoured through the same runnable check as a
+// persisted default.
 const FALLBACKS: Record<ModelRole, string> = {
   chat: 'gemini-3.8-flash', enrichment: 'openrouter/openai/gpt-5.6-luna',
   image: 'gemini-3-pro-image-preview', embedding: 'openai/text-embedding-3-large',

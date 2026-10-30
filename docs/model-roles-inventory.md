@@ -66,7 +66,7 @@ Models section with eight pickers in the customer-portal follow-up, using this A
 
 - Enrichment V3: non-web extraction, identity candidate disambiguation, LinkedIn
   candidate selection, smart-field evaluation, the web-search tier and the critic
-  (ENG-2184), so one run uses one model. ENG-2720: web-search calls skip Azure (it errors on the
+  (ENG-2184), so one run uses one model. ENG-2720: OpenAI-model web-search calls skip Azure (it errors on the
   search tool), and calls on the default Luna model retry on `gpt-5.5` if OpenRouter reports a provider
   failure; that fallback does not cover a 200 response with an empty body. Smart-field attribution records the
   resolved model. The `CRM_ENRICH_V3_*` env overrides still take precedence.

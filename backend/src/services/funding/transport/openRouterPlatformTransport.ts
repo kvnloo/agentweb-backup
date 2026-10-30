@@ -12,13 +12,13 @@
  * was changed, only moved.
  */
 import type OpenAI from "openai";
-import { assertOpenRouterResponseHasChoices } from "../../agentMode/openRouterResponseValidation";
+import { assertOpenRouterResponseHasChoices, assertOpenRouterResponseHasContent } from "../../agentMode/openRouterResponseValidation";
 import { normalizeOpenRouterErrorMetadata } from "../../agentMode/openRouterMetadata";
 import type { LlmTransport, LlmTransportRetryOptions } from "./llmTransport";
 
 export class OpenRouterPlatformTransport implements LlmTransport {
   async send(client: OpenAI, model: string, params: any, options: LlmTransportRetryOptions): Promise<any> {
-    const { timeoutMs, maxAttempts, isRetryableError, computeBackoff, sleep, adjustParamsForRetry } = options;
+    const { timeoutMs, maxAttempts, requireContent, isRetryableError, computeBackoff, sleep, adjustParamsForRetry } = options;
 
     let lastError: unknown;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -28,6 +28,7 @@ export class OpenRouterPlatformTransport implements LlmTransport {
         // `choices` array into an explicit, retryable error before it ever reaches
         // the unguarded `response.choices[0].message` downstream.
         assertOpenRouterResponseHasChoices(res, model);
+        if (requireContent) assertOpenRouterResponseHasContent(res, model);
         return res;
       } catch (error) {
         lastError = error;

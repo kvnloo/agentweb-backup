@@ -36,6 +36,8 @@ export interface LLMServiceOptions {
   fallbackModels?: string[];
   /** Providers OpenRouter must skip on web-search calls (ENG-2720: Azure errors on the search tool). */
   providerIgnoreForWebSearch?: string[];
+  /** Retry a 200 with no answer instead of returning an empty string (ENG-2720). */
+  requireContent?: boolean;
 }
 
 type InvokeResponse = {
@@ -70,6 +72,7 @@ export class LLMService {
   private readonly taskClass: GatewayTaskClass;
   private readonly fallbackModels?: string[];
   private readonly providerIgnoreForWebSearch?: string[];
+  private readonly requireContent: boolean;
 
   constructor(
     modelName?: string,
@@ -89,6 +92,7 @@ export class LLMService {
     this.taskClass = options.taskClass || 'nonstandard_consumer';
     this.fallbackModels = options.fallbackModels;
     this.providerIgnoreForWebSearch = options.providerIgnoreForWebSearch;
+    this.requireContent = options.requireContent === true;
     this.gatewayAdapter = { invoke: (messages) => this.invokeGateway(messages) };
     this.chatModel = this.gatewayAdapter;
   }
@@ -114,6 +118,7 @@ export class LLMService {
       taskClass: this.taskClass,
       ...(this.fallbackModels?.length ? { fallbackModels: this.fallbackModels } : {}),
       ...(requestOptions.webSearch && this.providerIgnoreForWebSearch?.length ? { providerIgnore: this.providerIgnoreForWebSearch } : {}),
+      ...(this.requireContent ? { requireContent: true } : {}),
     });
     const usage: any = response?.usage;
     const hasUsage = !!usage && typeof usage === 'object';

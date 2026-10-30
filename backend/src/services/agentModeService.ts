@@ -1069,6 +1069,8 @@ interface LLMCallOptions {
   providerPolicy?: CompareProviderPolicy | null;
   /** Provider names OpenRouter must not route this request to; merged with any default ignore list. */
   providerIgnore?: string[];
+  /** Treat a 200 with no answer as a failed, retryable attempt. For callers that need text back. */
+  requireContent?: boolean;
 }
 
 function nonNegativeTokenCount(value: unknown): number {
@@ -2531,6 +2533,7 @@ export class AgentModeService {
       taskClass,
       providerPolicy,
       providerIgnore,
+      requireContent,
     } = options || {};
 
     // ENG-2108: the funding for THIS call. A run starts AgentWeb-funded; this call moves
@@ -2750,6 +2753,7 @@ export class AgentModeService {
     const res = await pickTransport(callFunding, model).send(client, model, params, {
       timeoutMs: timeoutMs ?? 5 * 60 * 1000,
       maxAttempts,
+      requireContent,
       isRetryableError: isRetryableLlmCallError,
       // Bound to the instance method, not a transport-local timer: this is the seam
       // agentModeService.openRouterClient.test.ts spies on to assert exact backoff

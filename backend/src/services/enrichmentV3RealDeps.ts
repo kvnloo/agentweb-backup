@@ -60,15 +60,18 @@ async function criticModel(userId: string | undefined): Promise<string> {
   return process.env.CRM_ENRICH_V3_CRITIC_MODEL || resolveModelForUser(userId, 'enrichment');
 }
 // ENG-2720: the default enrichment model is gpt-5.6-luna. If it fails at the provider level (HTTP error,
-// rate limit), OpenRouter retries the call on gpt-5.5; this does not cover a 200 response with an empty
-// body. The fallback is limited to Luna so an org on another model keeps its own temperature support
-// and lab. Azure is skipped on web-search calls: it returned finish_reason=error with an empty body on
-// about a quarter of them (40 parallel calls), and the fallback does not catch that.
+// rate limit, no usable endpoint), OpenRouter retries the call on gpt-5.5; the fallback is limited to
+// Luna so an org on another model keeps its own temperature support and lab. A 200 with no answer gets
+// no fallback, so requireContent retries it instead of the parse failure below reading as "not found".
+// OpenAI models skip Azure on web-search calls: it returned finish_reason=error with an empty body on
+// about a quarter of them. Other labs keep their hosts, or a skip could move lead data to a new one.
 const CHEAP_DEFAULT_MODEL = 'openrouter/openai/gpt-5.6-luna';
 const FALLBACK_MODEL = 'gpt-5.5';
+const isOpenAiModel = (model: string) => /^(gpt-|openai\/|openrouter\/openai\/)/.test(model);
 function makeEnrichLLM(model: string, temperature: number | null) {
   return createLLMService(model, temperature, undefined, {
-    providerIgnoreForWebSearch: ['Azure'],
+    requireContent: true,
+    ...(isOpenAiModel(model) ? { providerIgnoreForWebSearch: ['Azure'] } : {}),
     ...(model === CHEAP_DEFAULT_MODEL ? { fallbackModels: [FALLBACK_MODEL] } : {}),
   });
 }
