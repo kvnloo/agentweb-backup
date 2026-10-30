@@ -4,8 +4,10 @@ import { resolveSmartlead, reportSmartleadFailure } from "./smartleadConnection"
 import { SmartleadPushRunDb } from "./smartleadPushRunDb";
 import { SmartleadPushService } from "./smartleadPushService";
 import { smartleadMarkerKey } from "./smartleadMarkers";
-import { addLeadsToCampaign, findLeadIdByEmail, getCampaign, getCampaignEmailAccounts, getCampaignSequences, listCampaigns, unsubscribeLeadGlobally, updateLeadEmail } from "./smartleadService";
+import { addLeadsToCampaign, deleteCampaignWebhook, findLeadIdByEmail, getCampaign, getCampaignEmailAccounts, getCampaignSequences, listCampaigns, listCampaignWebhooks, saveCampaignWebhook, unsubscribeLeadGlobally, updateLeadEmail } from "./smartleadService";
 import { getJwtSecret } from "../config/jwt";
+import { ensureEventWebhook, publicBaseUrl, type WebhookApi } from "./smartleadEventRegistration";
+import { webhookSecret } from "./smartleadWebhookToken";
 import { cronJobRegistry } from "../utils/cronJobRegistry";
 
 /**
@@ -16,6 +18,13 @@ import { cronJobRegistry } from "../utils/cronJobRegistry";
  * so a running run pauses at its next batch when the value is changed in a process that picks the change up; changing a deployed
  * environment variable means a restart (a runtime toggle is a tracked temporary measure).
  */
+/** The real Smartlead webhook calls: one quick retry each (nothing here may hold a push up). */
+export const realWebhookApi: WebhookApi = {
+  list: (apiKey, campaignId) => listCampaignWebhooks(apiKey, campaignId, { maxRetries: 1 }),
+  save: (apiKey, campaignId, input) => saveCampaignWebhook(apiKey, campaignId, input, { maxRetries: 1 }),
+  del: (apiKey, campaignId, webhookId) => deleteCampaignWebhook(apiKey, campaignId, webhookId, { maxRetries: 1 }),
+};
+
 export const smartleadPushEnabled = (): boolean => process.env.SMARTLEAD_PUSH_ENABLED === "true";
 
 let service: SmartleadPushService | null = null;
@@ -50,6 +59,7 @@ export function getSmartleadPushService(): SmartleadPushService {
       updateLeadEmail: (apiKey, campaignId, leadId, email) => updateLeadEmail(apiKey, campaignId, leadId, email, { maxRetries: 1 }),
       findLeadId: (apiKey, email) => findLeadIdByEmail(apiKey, email, { maxRetries: 1 }),
     },
+    registerEvents: (apiKey, accountId, campaignId) => ensureEventWebhook(realWebhookApi, { apiKey, accountId, campaignId, baseUrl: publicBaseUrl(), secret: webhookSecret() }),
     secret: getJwtSecret(),
     enabled: smartleadPushEnabled,
     now: () => new Date(),
