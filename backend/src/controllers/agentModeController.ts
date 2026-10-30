@@ -17949,6 +17949,17 @@ export const agentModeController = {
           suggestion: 'wait_and_retry',
         });
       }
+      // ENG-2763: OpenRouter key-limit / credits exhaustion — same 503 + once-per-class
+      // alert as the other generate chains, not a 500 + per-run page.
+      if ((isQuotaExhaustedError(error) || classifyOpenRouterQuotaExhaustion(error)) && !res.headersSent) {
+        sendQuotaExhaustedAlert(error, req.body?.sessionId);
+        return res.status(503).json(sendRefusalBody({
+          error: 'AI service at capacity',
+          message: QUOTA_EXHAUSTED_USER_MESSAGE,
+          code: 'PROVIDER_QUOTA_EXHAUSTED',
+          suggestion: 'wait'
+        }, wasRaisedAfterUserMessageSaved(error)));
+      }
       console.error('AgentMode: Verified generate error:', error);
       const sessionId = req.body?.sessionId;
       const user = req.user as User;
