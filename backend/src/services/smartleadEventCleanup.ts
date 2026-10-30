@@ -1,5 +1,5 @@
 import { publicBaseUrl, removeEventWebhooks, type RemoveOutcome, type WebhookApi } from "./smartleadEventRegistration";
-import { getAccountByIdConsistent } from "./connectedAccountsDb";
+import { getAccountByIdConsistentOrThrow } from "./connectedAccountsDb";
 import { resolveSmartlead } from "./smartleadConnection";
 import { listCampaigns } from "./smartleadService";
 import { realWebhookApi } from "./smartleadPushRuntime";
@@ -38,46 +38,51 @@ const realDeps: CleanupDeps = {
   listCampaignIds: async apiKey => (await listCampaigns(apiKey, { maxRetries: 1 })).map(c => c.id),
   api: realWebhookApi,
   baseUrl: () => publicBaseUrl(),
-  reconnected: async (userId, accountId) => (await getAccountByIdConsistent(accountId, userId, "smartlead")) !== null,
+  reconnected: async (userId, accountId) => (await getAccountByIdConsistentOrThrow(accountId, userId, "smartlead")) !== null,
   log: line => console.log(line),
 };
 
 /**
- * Finds the key (the part the caller waits for) and returns the background job INSIDE an object (an async function that returned the promise
- * itself would make `await` wait for the whole job). The job never rejects; it resolves to null when there is nothing to do or it could not be done.
+ * Finds the key while the connection still exists, and returns the job to run once it is gone. The caller runs it AFTER deleting the connection:
+ * started earlier, the job could see the connection still there, read that as "added again", and stop. The job never rejects; it resolves to null
+ * when there is nothing to do or it could not be done.
  */
-export async function startSmartleadEventCleanup(userId: string, accountId: string, deps: CleanupDeps = realDeps): Promise<{ done: Promise<RemoveOutcome | null> }> {
+export async function prepareSmartleadEventCleanup(userId: string, accountId: string, deps: CleanupDeps = realDeps): Promise<{ run: () => Promise<RemoveOutcome | null> }> {
+  const nothing = { run: () => Promise.resolve(null) };
   let apiKey: string;
   try {
     const key = await deps.resolveKey(userId, accountId);
-    if (!key.ok) return { done: Promise.resolve(null) }; // no usable key (already revoked, or not theirs to use): nothing can be deleted
+    if (!key.ok) return nothing; // no usable key (already revoked, or not theirs to use): nothing can be deleted
     apiKey = key.apiKey;
   } catch (e) {
     deps.log(`[SmartleadEvents] disconnect cleanup could not start: ${e instanceof Error ? e.message : String(e)}`);
-    return { done: Promise.resolve(null) };
+    return nothing;
   }
   const baseUrl = deps.baseUrl();
-  if (!baseUrl) return { done: Promise.resolve(null) };
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  let stop = false;
-  const job = (async () => {
-    const all = await deps.listCampaignIds(apiKey);
-    if (all.length > MAX_CAMPAIGNS) deps.log(`[SmartleadEvents] disconnect cleanup: ${all.length} campaigns, only the first ${MAX_CAMPAIGNS} are checked`);
-    const ids = all.slice(0, MAX_CAMPAIGNS);
-    // Campaign by campaign, so the time budget can stop the work between campaigns (a promise race alone would leave it running).
-    const total: RemoveOutcome = { campaigns: 0, removed: 0, failed: 0 };
-    for (const id of ids) {
-      if (stop) { deps.log(`[SmartleadEvents] disconnect cleanup stopped at its time budget after ${total.campaigns} campaign(s)`); break; }
-      if (await deps.reconnected(userId, accountId)) { deps.log("[SmartleadEvents] disconnect cleanup stopped: the connection was added again"); break; }
-      const one = await removeEventWebhooks(deps.api, { apiKey, accountId, baseUrl, campaignIds: [id] }, deps.log);
-      total.campaigns += one.campaigns; total.removed += one.removed; total.failed += one.failed;
-    }
-    deps.log(`[SmartleadEvents] disconnect: looked at ${total.campaigns} campaign(s), removed ${total.removed} webhook(s), ${total.failed} failed`);
-    return total;
-  })().catch(e => {
-    deps.log(`[SmartleadEvents] disconnect cleanup failed: ${e instanceof Error ? e.message : String(e)}`);
-    return null;
-  }).finally(() => { if (timer) clearTimeout(timer); });
-  timer = setTimeout(() => { stop = true; }, deps.budgetMs ?? BUDGET_MS);
-  return { done: job };
+  if (!baseUrl) return nothing;
+  return {
+    run: () => {
+      let stop = false;
+      const timer = setTimeout(() => { stop = true; }, deps.budgetMs ?? BUDGET_MS);
+      return (async () => {
+        const all = await deps.listCampaignIds(apiKey);
+        if (all.length > MAX_CAMPAIGNS) deps.log(`[SmartleadEvents] disconnect cleanup: ${all.length} campaigns, only the first ${MAX_CAMPAIGNS} are checked`);
+        const ids = all.slice(0, MAX_CAMPAIGNS);
+        // Campaign by campaign, so the time budget can stop the work between campaigns (a promise race alone would leave it running).
+        const total: RemoveOutcome = { campaigns: 0, removed: 0, failed: 0 };
+        for (const id of ids) {
+          if (stop) { deps.log(`[SmartleadEvents] disconnect cleanup stopped at its time budget after ${total.campaigns} campaign(s)`); break; }
+          // A failed read throws and ends the job: not knowing means stop, because a leftover webhook is harmless and removing a new connection's is not.
+          if (await deps.reconnected(userId, accountId)) { deps.log("[SmartleadEvents] disconnect cleanup stopped: the connection was added again"); break; }
+          const one = await removeEventWebhooks(deps.api, { apiKey, accountId, baseUrl, campaignIds: [id] }, deps.log);
+          total.campaigns += one.campaigns; total.removed += one.removed; total.failed += one.failed;
+        }
+        deps.log(`[SmartleadEvents] disconnect: looked at ${total.campaigns} campaign(s), removed ${total.removed} webhook(s), ${total.failed} failed`);
+        return total;
+      })().catch(e => {
+        deps.log(`[SmartleadEvents] disconnect cleanup failed: ${e instanceof Error ? e.message : String(e)}`);
+        return null;
+      }).finally(() => clearTimeout(timer));
+    },
+  };
 }

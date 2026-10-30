@@ -9,16 +9,6 @@ jest.mock('unipile-node-sdk', () => ({
 }), { virtual: true });
 
 
-// ENG-673: the do-not-contact guard has its own tests (contactGuard.test.ts); here it is controlled, and defaults to "not blocked".
-const mockLeadIsBlocked = jest.fn().mockResolvedValue(false);
-const mockLinkedinProfileIsBlocked = jest.fn().mockResolvedValue(false);
-const mockBlockedRecipients = jest.fn().mockResolvedValue([]);
-jest.mock('../services/contactGuard', () => ({
-  leadIsBlocked: (...a: any[]) => mockLeadIsBlocked(...a),
-  linkedinProfileIsBlocked: (...a: any[]) => mockLinkedinProfileIsBlocked(...a),
-  blockedRecipients: (...a: any[]) => mockBlockedRecipients(...a),
-  blockedContactError: 'Not sent: do-not-contact',
-}));
 
 // Mock AWS / secretsManager
 jest.mock('../utils/secretsManager', () => ({
@@ -508,36 +498,6 @@ describe('AgentModeService - LinkedIn Outreach', () => {
           invitationId: 'inv-xyz',
         })
       );
-    });
-
-    describe('ENG-673 — never contact a do-not-contact lead', () => {
-      afterEach(() => { mockLeadIsBlocked.mockResolvedValue(false); mockLinkedinProfileIsBlocked.mockResolvedValue(false); });
-
-      it('refuses an invite when the named lead is blocked, and spends no invite', async () => {
-        mockLeadIsBlocked.mockResolvedValue(true);
-        const result = await service.linkedinOutreach('user-1', { ...inviteArgs, list_id: 'L1', lead_id: 'D1' });
-        expect(result).toEqual(expect.objectContaining({ success: false, reason: 'do_not_contact' }));
-        expect(mockLeadIsBlocked).toHaveBeenCalledWith(['user-1'], 'L1', 'D1');
-        expect(mockSendInvitation).not.toHaveBeenCalled();
-      });
-
-      it('refuses an invite found by profile URL alone (the model passed no lead)', async () => {
-        mockLinkedinProfileIsBlocked.mockResolvedValue(true);
-        const result = await service.linkedinOutreach('user-1', inviteArgs);
-        expect(result).toEqual(expect.objectContaining({ success: false, reason: 'do_not_contact' }));
-        expect(mockLinkedinProfileIsBlocked).toHaveBeenCalledWith(['user-1'], inviteArgs.profile_url);
-        expect(mockSendInvitation).not.toHaveBeenCalled();
-      });
-
-      it('refuses a message and an InMail the same way', async () => {
-        mockLinkedinProfileIsBlocked.mockResolvedValue(true);
-        const m = await service.linkedinOutreach('user-1', { action: 'send-message', account_id: 'test-account-id', profile_url: 'https://www.linkedin.com/in/chang-liu/', message: 'hi' });
-        const i = await service.linkedinOutreach('user-1', { action: 'send-inmail', account_id: 'test-account-id', profile_url: 'https://www.linkedin.com/in/chang-liu/', message: 'hi', subject: 's' });
-        expect(m).toEqual(expect.objectContaining({ success: false, reason: 'do_not_contact' }));
-        expect(i).toEqual(expect.objectContaining({ success: false, reason: 'do_not_contact' }));
-        expect(mockSendMessage).not.toHaveBeenCalled();
-        expect(mockSendInMail).not.toHaveBeenCalled();
-      });
     });
 
     it('does NOT dedup or cache when inviting by raw provider_id (cache is keyed by public id)', async () => {

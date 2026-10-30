@@ -67,7 +67,29 @@ export class SmartleadEventService {
     for (const address of event.candidateEmails) {
       const seen = new Set<string>();
       const matches: Array<{ lead: Lead; campaignName?: string }> = [];
-      for (const lead of await this.deps.findLeadsByEmail(address)) {
+      const found = await this.deps.findLeadsByEmail(address);
+      // The Smartlead lead behind a contact is ONE lead across all of the account's campaigns, and our withdrawal unsubscribes it account-wide
+      // (verified on a real account, 2026-10-30: unsubscribing it in one campaign shows it unsubscribed and blocked in the others too). So once
+      // ANY marker of ANY of these leads is withdrawn, the poll must not read that opt-out back as news in another campaign or list either.
+      // The index spans every customer, so a withdrawn marker counts only when its own run belongs to THIS Smartlead account: another customer's marker
+      // that happens to carry the same id text must never suppress ours.
+      const withdrawnSmartleadIds = new Set<string>();
+      if (event.polled && event.kind !== "reply") {
+        const runAccount = new Map<string, Promise<string | undefined>>();
+        const accountOf = (runId: string) => {
+          let p = runAccount.get(runId);
+          if (!p) { p = this.deps.getRun(runId).then(r => r?.smartleadAccountId); runAccount.set(runId, p); }
+          return p;
+        };
+        for (const l of found) {
+          for (const [key, value] of Object.entries((l?.system ?? {}) as Record<string, any>)) {
+            if (!key.startsWith("smartlead_") || !value || typeof value.smartleadLeadId !== "string" || typeof value.runId !== "string") continue;
+            if (!(value.state === "withdrawn" || !!value.withdrawnAt)) continue;
+            if ((await accountOf(value.runId)) === ctx.accountId) withdrawnSmartleadIds.add(value.smartleadLeadId);
+          }
+        }
+      }
+      for (const lead of found) {
         const id = `${lead?.listId}/${lead?.leadId}`;
         if (!lead?.listId || !lead?.leadId || seen.has(id)) continue;
         seen.add(id);
@@ -76,7 +98,7 @@ export class SmartleadEventService {
         // Once our own withdrawal has unsubscribed a blocked contact in Smartlead (`withdrawn`, or `released` afterwards, which keeps `withdrawnAt`),
         // Smartlead lists that contact as unsubscribed for good: reading it back would re-block a contact a user has since resubscribed in the CRM.
         // A reply has no such risk, and a contact released without a withdrawal is still live in Smartlead, so both are still read.
-        if (event.polled && event.kind !== "reply" && (marker.state === "withdrawn" || !!marker.withdrawnAt)) continue;
+        if (event.polled && event.kind !== "reply" && (marker.state === "withdrawn" || !!marker.withdrawnAt || (!!marker.smartleadLeadId && withdrawnSmartleadIds.has(marker.smartleadLeadId)))) continue;
         const r = await proven(marker.runId);
         if (r.ok) matches.push({ lead, campaignName: r.name });
       }
@@ -94,7 +116,9 @@ export class SmartleadEventService {
 
   private async apply(event: SmartleadEvent, lead: Lead, campaignName?: string): Promise<{ changed: number; duplicate: number }> {
     const now = this.deps.now().toISOString();
-    const at = event.occurredAt ?? now;
+    // Never later than our own clock: this time is compared with the stamp of a status change made here (a user's Resubscribe), and Smartlead's
+    // clock running ahead would otherwise make an old opt-out look newer than the Resubscribe that followed it.
+    const at = event.occurredAt && Date.parse(event.occurredAt) < Date.parse(now) ? event.occurredAt : now;
     const base = { source: "smartlead", smartleadEventKey: event.eventKey, campaignId: event.campaignId, ...(campaignName ? { campaign: campaignName } : {}) };
     let changed = 0;
     let duplicate = 0;
@@ -109,8 +133,9 @@ export class SmartleadEventService {
         // A SECOND reply missed by the webhook is not seen by the poll; a missed first one is.
         if (here.some(e => e?.eventType === "email.received")) return { changed: 0, duplicate: 1 };
       } else {
-        // A temporary bounce does not count as "already shown" for an opt-out: it never blocked the contact, and a later opt-out must still land.
-        const blocking = here.filter(e => e?.eventType === "email.unsubscribed" || (e?.eventType === "email.bounced" && e?.eventData?.soft !== true));
+        // Only the SAME kind of event counts as "already shown": a temporary bounce never blocked the contact, and after a bounce, a
+        // Resubscribe and a corrected address, a later opt-out (or the other way round) is a new event that must still land.
+        const blocking = here.filter(e => event.kind === "unsubscribe" ? e?.eventType === "email.unsubscribed" : e?.eventType === "email.bounced" && e?.eventData?.soft !== true);
         if (blocking.length > 0) {
           // On file: either the block landed and a user has since lifted it (the status was written at or after the event: leave a Resubscribe
           // alone), or the status write failed after the engagement was recorded (finish it). Read fresh: a stale read here would undo a Resubscribe.
