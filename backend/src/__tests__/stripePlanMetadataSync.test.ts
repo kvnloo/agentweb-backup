@@ -130,6 +130,19 @@ describe('resolveSubscriptionTypeForPrice', () => {
     await expect(resolveSubscriptionTypeForPrice({ id: 'price_c', product: 'prod_c' })).rejects.toThrow('stripe 500');
   });
 
+  it('rejects at a hard deadline when a product lookup hangs past the idle timeout', async () => {
+    jest.useFakeTimers();
+    try {
+      mockStripe.products.retrieve.mockReturnValueOnce(new Promise(() => {}));
+      const p = resolveSubscriptionTypeForPrice({ id: 'price_c', product: 'prod_c' });
+      const assertion = expect(p).rejects.toThrow('exceeded 6000ms');
+      await jest.advanceTimersByTimeAsync(6000);
+      await assertion;
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   it('never grants Free from metadata on a billed price', async () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
     await expect(

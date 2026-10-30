@@ -2242,6 +2242,9 @@ export function deriveSubscriptionTypeFromPriceId(priceId: string): string | nul
  * and Free (a billed subscription can never resolve to the unpaid tier). */
 const METADATA_PLAN_DENYLIST: ReadonlySet<string> = new Set(['Super Premium', 'Free']);
 
+// Hard wall-clock cap on the product lookup (ENG-2724), above Stripe's 5s idle timeout.
+const PRODUCT_LOOKUP_DEADLINE_MS = 6000;
+
 /**
  * ENG-2724: resolve the subscription tier for a Stripe price, falling back to
  * `plan` metadata for prices outside the Starter/Pro env mapping (Max, custom
@@ -2283,7 +2286,23 @@ export async function resolveSubscriptionTypeForPrice(
   if (!product && typeof price?.product === 'string') {
     // Let lookup errors propagate: swallowing them would answer the webhook 200
     // (no Stripe retry) and leave the tier stale after a transient Stripe error.
-    product = await getStripeOrThrow().products.retrieve(price.product, {}, { timeout: 5000, maxNetworkRetries: 0 });
+    // Stripe's `timeout` is a socket-idle timeout, so a slow-trickling response
+    // can exceed it. Enforce a hard wall-clock deadline as well; on expiry the
+    // error propagates (webhook 500 -> Stripe retry), same as any lookup error.
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    try {
+      product = await Promise.race([
+        getStripeOrThrow().products.retrieve(price.product, {}, { timeout: 5000, maxNetworkRetries: 0 }),
+        new Promise<never>((_, reject) => {
+          deadline = setTimeout(
+            () => reject(new Error(`[STRIPE] Product lookup ${price.product} exceeded ${PRODUCT_LOOKUP_DEADLINE_MS}ms`)),
+            PRODUCT_LOOKUP_DEADLINE_MS,
+          );
+        }),
+      ]);
+    } finally {
+      if (deadline) clearTimeout(deadline);
+    }
   }
   const fromProduct = await tryPlan(product?.metadata?.plan);
   if (fromProduct) return fromProduct;
