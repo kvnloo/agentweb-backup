@@ -61,7 +61,7 @@ import { CHAT_BRANCHING_ENABLED_SETTING, isChatBranchingSettingEnabled, healLega
 import { compareSaveAlternatives } from '../services/agentMode/compareSaveAlternativesInstance';
 import { LEGACY_MODEL_ALIASES } from '../services/agentMode/llmModelRegistry';
 import { resolveRunFunding } from '../services/funding/runFunding';
-import { isContextLimitError, isProviderNoEndpointsError, isSessionLimitError, isTransientLLMError, isProviderDeserializationError, PROVIDER_DESERIALIZATION_ERROR_CLASS, isWorkerShutdownError, isProviderUnavailableError } from '../utils/agentModeErrors';
+import { isContextLimitError, isProviderNoEndpointsError, isSessionLimitError, isTransientLLMError, isProviderDeserializationError, PROVIDER_DESERIALIZATION_ERROR_CLASS, isWorkerShutdownError, isDrainCeilingShutdownError, isProviderUnavailableError, isQuotaExhaustedError, QUOTA_EXHAUSTED_USER_MESSAGE } from '../utils/agentModeErrors';
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
@@ -161,6 +161,11 @@ import {
 import { collectLeadImportTotals, describeLeadImportTotals } from '../utils/leadImportLedger';
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
 import { fileAutoIssue } from '../services/intakeService';
+import {
+  classifyOpenRouterQuotaExhaustion,
+  resolveQuotaDeferral,
+  OPENROUTER_QUOTA_ALERT_CLASS,
+} from '../utils/openRouterKeyLimit';
 import { skillService } from '../services/skillService';
 import { validateWelcomeMessage } from '../utils/welcomeMessageValidation';
 import { validateOpeningAction } from '../utils/openingActionValidation';
@@ -726,6 +731,30 @@ function wasRaisedAfterUserMessageSaved(error: unknown): boolean {
  */
 function sendRefusalBody<T extends object>(body: T, userMessageSaved: boolean): T & { userMessageSaved: boolean } {
   return { ...body, userMessageSaved };
+}
+
+/**
+ * ENG-2763: one oncall alert per OpenRouter quota-exhaustion class (not per occurrence /
+ * per user). The key stays exhausted until a monthly reset or a limit raise, so a 6h
+ * window keeps it to one open page instead of an "Unknown Error" filing per message.
+ */
+export const QUOTA_EXHAUSTED_ALERT_WINDOW_MS = 6 * 60 * 60 * 1000;
+
+export function sendQuotaExhaustedAlert(error: unknown, sessionId?: string): void {
+  const originalMessage = (error as any)?.originalMessage || (error as any)?.message || 'Unknown error';
+  const quota = classifyOpenRouterQuotaExhaustion((error as any)?.originalError ?? { message: originalMessage });
+  sendAgentModeOncallAlert({
+    dedupeKey: `agent_mode:${OPENROUTER_QUOTA_ALERT_CLASS}`,
+    dedupeWindowMs: QUOTA_EXHAUSTED_ALERT_WINDOW_MS,
+    subject: 'Agent Mode: OpenRouter quota exhausted',
+    message: `Agent Mode generation is failing because the OpenRouter key/credits are exhausted.\n\nError: ${originalMessage}`,
+    sessionId,
+    context: {
+      'Alert Class': OPENROUTER_QUOTA_ALERT_CLASS,
+      ...(quota?.kind ? { 'Quota Kind': quota.kind } : {}),
+      ...(quota?.resetAt ? { 'Resets At': quota.resetAt } : {}),
+    },
+  }).catch(err => console.error('Failed to send quota-exhausted oncall alert:', err));
 }
 
 /**
@@ -8579,6 +8608,8 @@ export async function runScheduledChat(
     // resume (published + settled), pause (published + not resumable) and a fresh
     // requeue (nothing published) — never a blind restart over published work.
     const workerShutdownInterrupted = !zeroAssistantOutput && isWorkerShutdownError(error);
+    // ENG-2758: OpenRouter key-limit / credits exhaustion — defer, and alert once per class.
+    const quotaExhaustion = classifyOpenRouterQuotaExhaustion(error);
     let zeroAssistantRequeuedAt: string | undefined;
     if (zeroAssistantOutput || workerShutdownInterrupted) {
       // ENG-971: zero assistant output does NOT mean the run did nothing. A publish
@@ -8806,6 +8837,42 @@ export async function runScheduledChat(
             console.error('Failed to persist published-run job-incomplete message:', persistError);
           }
         }
+      } else if (!isTest && quotaExhaustion) {
+        // ENG-2758: the OpenRouter key/credits are exhausted until a reset, so a
+        // short-interval requeue is guaranteed to fail again. Defer to the stated
+        // reset (else the next natural slot); keep the schedule active and do not
+        // spend a zero-output retry on it.
+        // Anchor the natural-next fallback to the scheduled slot (as the normal
+        // dispatcher does) so the cadence's time-of-day is preserved.
+        const storedSlot = schedule.nextRunTime ? new Date(schedule.nextRunTime) : new Date(NaN);
+        const scheduledSlot = Number.isFinite(storedSlot.getTime()) ? storedSlot : new Date();
+        const deferredTo = resolveQuotaDeferral(
+          quotaExhaustion,
+          new Date(),
+          calculateNextRunTime(
+            schedule.frequency,
+            Number.isFinite(scheduledSlot.getTime()) ? scheduledSlot : new Date(),
+            schedule.frequencyIntervalDays,
+            schedule.scheduleId
+          )
+        );
+        try {
+          // Do not reactivate a schedule the owner paused/stopped while this run was in flight.
+          const current: any = await scheduleDb.getScheduleById(schedule.scheduleId);
+          if (current && current.status && current.status !== 'active') {
+            throw new Error(`schedule status is '${current.status}', not deferring`);
+          }
+          await scheduleDb.updateSchedule(schedule.scheduleId, {
+            status: 'active',
+            nextRunTime: deferredTo,
+            lastZeroAssistantOutputAt: new Date().toISOString(),
+            lastZeroAssistantOutputSessionId: sessionId || '',
+            updatedAt: new Date().toISOString(),
+          });
+          zeroAssistantRequeuedAt = deferredTo;
+        } catch (deferError) {
+          console.error(`Failed to defer quota-exhausted scheduled chat ${schedule.scheduleId}:`, deferError);
+        }
       } else if (!isTest) {
         const nextRetryCount = zeroOutputNextRetryCount;
         if (nextRetryCount <= ZERO_ASSISTANT_MAX_REQUEUES) {
@@ -8970,7 +9037,17 @@ export async function runScheduledChat(
     // event with automatic recovery, not a defect — don't file a Linear issue for
     // it (the deduped oncall alert below still records the occurrence). One that
     // could NOT be requeued (paused, cap exhausted, write failed) still files.
-    const skipAutoIssue = workerShutdownInterrupted && Boolean(zeroAssistantRequeuedAt);
+    // ENG-2750: the same holds when the drain hit BEFORE any assistant output
+    // (zero-output path) — but only for the FIRST requeue. A drain retry is
+    // bounded to one silent attempt; if the retried run fails too, it files.
+    // Only the drain-ceiling shutdown qualifies — a subprocess crash ("Worker
+    // process exited with code ...", OOM / instance replacement) is a real
+    // incident and must still file (CodeRabbit on PR #3844).
+    const drainRequeuedFirstAttempt = isDrainCeilingShutdownError(error)
+      && Boolean(zeroAssistantRequeuedAt)
+      && getZeroAssistantRetryCount(schedule) === 0;
+    const skipAutoIssue = (workerShutdownInterrupted && Boolean(zeroAssistantRequeuedAt))
+      || drainRequeuedFirstAttempt;
     void (skipAutoIssue ? Promise.resolve() : fileAutoIssue({
       title: zeroAssistantOutput
         ? `Scheduled Chat Zero Assistant Output: ${schedule.scheduleName}`
@@ -8990,6 +9067,8 @@ export async function runScheduledChat(
         ...(zeroAssistantRequeuedAt ? { 'Requeued At': zeroAssistantRequeuedAt } : {}),
         'Error Message': errorMessage,
         ...(originalMessage ? { 'Original Error (Bedrock/API)': originalMessage } : {}),
+        // ENG-2758: one canonical per (source x errorClass), not one per schedule.
+        ...(quotaExhaustion ? { 'Alert Class': OPENROUTER_QUOTA_ALERT_CLASS } : {}),
       }
     }))
       .catch(err => console.error('Failed to file scheduled-chat-error issue:', err))
@@ -9003,7 +9082,9 @@ export async function runScheduledChat(
         // One alert per (user, schedule, errorClass) per hour (ENG-145/146
         // class). Gated so flag off = today's exact behavior.
         ...(isRunStoreEnabled()
-          ? { dedupeKey: `scheduled_chat:${userId}:${schedule.scheduleId}:${zeroAssistantOutput ? 'zero_output' : 'run_error'}`, dedupeWindowMs: 60 * 60 * 1000 }
+          ? quotaExhaustion
+            ? { dedupeKey: `scheduled_chat:${OPENROUTER_QUOTA_ALERT_CLASS}`, dedupeWindowMs: 60 * 60 * 1000 }
+            : { dedupeKey: `scheduled_chat:${userId}:${schedule.scheduleId}:${zeroAssistantOutput ? 'zero_output' : 'run_error'}`, dedupeWindowMs: 60 * 60 * 1000 }
           : {}),
         sessionId: sessionId || undefined,
         context: {
@@ -12101,6 +12182,18 @@ export const agentModeController = {
               ),
               artifactUrls,
             );
+          } else if (isQuotaExhaustedError(error)) {
+            // ENG-2763: persist the quota message, not diagnosis/retry advice, so a
+            // reload agrees with the 503 PROVIDER_QUOTA_EXHAUSTED response.
+            publishLedger = (await loadPublishLedger(sessionId, turnStartCalledFunctions)) || [];
+            artifactUrls = await loadConfirmedArtifactUrls(sessionId, turnStartMsForDiagnosis);
+            diagnosticContent = appendConfirmedArtifactNotice(
+              appendConfirmedDataWriteNotice(
+                appendConfirmedPublishNotice(QUOTA_EXHAUSTED_USER_MESSAGE, publishLedger),
+                publishLedger,
+              ),
+              artifactUrls,
+            );
           } else {
             const userMessage = req.body?.userMessage || '';
             const diagnosis = await getDiagnosticErrorMessage(
@@ -12261,6 +12354,19 @@ export const agentModeController = {
             code: 'RATE_LIMIT',
             suggestion: 'wait_and_retry'
           });
+          return;
+        }
+
+        // ENG-2763: OpenRouter key-limit / credits exhaustion is a known class, not an
+        // unknown error: answer 503 and page once per class, not once per occurrence.
+        if (isQuotaExhaustedError(error)) {
+          sendQuotaExhaustedAlert(error, req.body?.sessionId);
+          res.status(503).json(sendRefusalBody({
+            error: 'AI service at capacity',
+            message: error.message,
+            code: 'PROVIDER_QUOTA_EXHAUSTED',
+            suggestion: 'wait'
+          }, wasRaisedAfterUserMessageSaved(error)));
           return;
         }
 
@@ -13322,6 +13428,17 @@ export const agentModeController = {
               ),
               artifactUrls,
             );
+          } else if (isQuotaExhaustedError(error)) {
+            // ENG-2763: see the matching branch in generateResponse.
+            publishLedger = (await loadPublishLedger(shareId, turnStartCalledFunctions)) || [];
+            artifactUrls = await loadConfirmedArtifactUrls(shareId, sharedTurnStartMs);
+            diagnosticContent = appendConfirmedArtifactNotice(
+              appendConfirmedDataWriteNotice(
+                appendConfirmedPublishNotice(QUOTA_EXHAUSTED_USER_MESSAGE, publishLedger),
+                publishLedger,
+              ),
+              artifactUrls,
+            );
           } else {
             const userMessage = req.body?.userMessage || '';
             const diagnosis = await getDiagnosticErrorMessage(error, shareId, userMessage, turnStartCalledFunctions, sharedTurnStartMs);
@@ -13458,6 +13575,19 @@ export const agentModeController = {
             code: 'RATE_LIMIT',
             suggestion: 'wait_and_retry'
           });
+          return;
+        }
+
+        // ENG-2763: OpenRouter key-limit / credits exhaustion is a known class, not an
+        // unknown error: answer 503 and page once per class, not once per occurrence.
+        if (isQuotaExhaustedError(error)) {
+          sendQuotaExhaustedAlert(error, req.params?.shareId);
+          res.status(503).json(sendRefusalBody({
+            error: 'AI service at capacity',
+            message: error.message,
+            code: 'PROVIDER_QUOTA_EXHAUSTED',
+            suggestion: 'wait'
+          }, wasRaisedAfterUserMessageSaved(error)));
           return;
         }
 
@@ -16336,7 +16466,10 @@ export const agentModeController = {
             && (prefilledWithoutRequest || (valuesProvidedAfterLatestRequest && valuesProvidedAfterLastRun));
 
           // Calculate next run based on the current nextRunTime to preserve the scheduled time
-          const currentNextRun = new Date(schedule.nextRunTime);
+          // An unreadable stored nextRunTime (legacy/operator-edited row) would make
+          // calculateNextRunTime throw 'Invalid time value' on every poll; treat it as due now.
+          const storedNextRun = new Date(schedule.nextRunTime);
+          const currentNextRun = Number.isFinite(storedNextRun.getTime()) ? storedNextRun : new Date();
           const nextRunTime = calculateNextRunTime(schedule.frequency, currentNextRun, schedule.frequencyIntervalDays, schedule.scheduleId);
 
           if (scheduleVariables.length > 0 && !isVariableRequestSatisfied) {
@@ -16821,6 +16954,19 @@ export const agentModeController = {
             code: 'RATE_LIMIT',
             suggestion: 'wait_and_retry'
           });
+          return;
+        }
+
+        // ENG-2763: OpenRouter key-limit / credits exhaustion is a known class, not an
+        // unknown error: answer 503 and page once per class, not once per occurrence.
+        if (isQuotaExhaustedError(error)) {
+          sendQuotaExhaustedAlert(error, (req as any).conversableSession?.sessionId);
+          res.status(503).json(sendRefusalBody({
+            error: 'AI service at capacity',
+            message: error.message,
+            code: 'PROVIDER_QUOTA_EXHAUSTED',
+            suggestion: 'wait'
+          }, wasRaisedAfterUserMessageSaved(error)));
           return;
         }
 
@@ -17802,6 +17948,17 @@ export const agentModeController = {
           code: 'PROVIDER_UNAVAILABLE',
           suggestion: 'wait_and_retry',
         });
+      }
+      // ENG-2763: OpenRouter key-limit / credits exhaustion — same 503 + once-per-class
+      // alert as the other generate chains, not a 500 + per-run page.
+      if ((isQuotaExhaustedError(error) || classifyOpenRouterQuotaExhaustion(error)) && !res.headersSent) {
+        sendQuotaExhaustedAlert(error, req.body?.sessionId);
+        return res.status(503).json(sendRefusalBody({
+          error: 'AI service at capacity',
+          message: QUOTA_EXHAUSTED_USER_MESSAGE,
+          code: 'PROVIDER_QUOTA_EXHAUSTED',
+          suggestion: 'wait'
+        }, wasRaisedAfterUserMessageSaved(error)));
       }
       console.error('AgentMode: Verified generate error:', error);
       const sessionId = req.body?.sessionId;

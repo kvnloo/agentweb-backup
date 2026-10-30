@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { PROVIDER_UNAVAILABLE_USER_MESSAGE } from '../utils/agentModeErrors';
+import { PROVIDER_UNAVAILABLE_USER_MESSAGE, QUOTA_EXHAUSTED_USER_MESSAGE } from '../utils/agentModeErrors';
 import { agentModeController } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
 import { emailService } from '../services/emailService';
@@ -332,6 +332,43 @@ describe('AgentModeController - Error Handling', () => {
       expect(mockEmailService.sendOncallAlert).not.toHaveBeenCalledWith(
         'Agent Mode: Unknown Error in Generate Response', expect.anything(), expect.anything(),
       );
+    });
+  });
+
+  describe('generateResponse - OpenRouter quota exhausted (ENG-2763)', () => {
+    const keyLimitMsg = '403 Key limit exceeded (monthly limit). Manage it using https://openrouter.ai/workspaces/default/keys/x $800.23 of $800.00 used; resets 2026-11-01T00:00:00.000Z.';
+    const makeReq = () => ({
+      user: { userId: mockUserId, email: 'test@example.com' },
+      body: { sessionId: mockSessionId, userMessage: 'Provided details for Target customer' },
+      method: 'POST', path: '/api/agent-mode/generate', ip: '127.0.0.1',
+      socket: { remoteAddress: '127.0.0.1' }, on: jest.fn(),
+    } as unknown as Request);
+
+    it('answers 503 PROVIDER_QUOTA_EXHAUSTED, no "try again", and pages once per class', async () => {
+      const raw: any = new Error(keyLimitMsg);
+      raw.status = 403;
+      const wrapped: any = new Error(QUOTA_EXHAUSTED_USER_MESSAGE);
+      wrapped.originalError = raw;
+      wrapped.originalMessage = keyLimitMsg;
+      wrapped.status = 403;
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(wrapped);
+
+      for (let i = 0; i < 3; i++) {
+        const res = { json: jest.fn(), status: jest.fn().mockReturnThis() } as unknown as Response;
+        await agentModeController.generateResponse(makeReq(), res);
+        await new Promise((resolve) => setImmediate(resolve));
+        expect(res.status).toHaveBeenCalledWith(503);
+        expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'PROVIDER_QUOTA_EXHAUSTED' }));
+        expect((res.json as jest.Mock).mock.calls[0][0].message).not.toMatch(/try again/i);
+      }
+
+      const calls = (mockEmailService.sendOncallAlert as jest.Mock).mock.calls;
+      expect(calls.filter((c: any[]) => c[0] === 'Agent Mode: Unknown Error in Generate Response')).toHaveLength(0);
+      const quotaCalls = calls.filter((c: any[]) => c[0] === 'Agent Mode: OpenRouter quota exhausted');
+      expect(quotaCalls).toHaveLength(1);
+      expect(quotaCalls[0][2]).toEqual(expect.objectContaining({
+        'Alert Class': 'openrouter-quota-exhausted', 'Quota Kind': 'key_limit', 'Resets At': '2026-11-01T00:00:00.000Z',
+      }));
     });
   });
 
