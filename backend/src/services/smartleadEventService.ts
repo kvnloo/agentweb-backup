@@ -67,7 +67,19 @@ export class SmartleadEventService {
     for (const address of event.candidateEmails) {
       const seen = new Set<string>();
       const matches: Array<{ lead: Lead; campaignName?: string }> = [];
-      for (const lead of await this.deps.findLeadsByEmail(address)) {
+      const found = await this.deps.findLeadsByEmail(address);
+      // The Smartlead lead behind a contact is ONE lead across all of the account's campaigns, and our withdrawal unsubscribes it account-wide
+      // (verified on a real account, 2026-10-30: unsubscribing it in one campaign shows it unsubscribed and blocked in the others too). So once
+      // ANY marker of ANY of these leads is withdrawn, the poll must not read that opt-out back as news in another campaign or list either.
+      const withdrawnSmartleadIds = new Set<string>();
+      if (event.polled && event.kind !== "reply") {
+        for (const l of found) {
+          for (const [key, value] of Object.entries((l?.system ?? {}) as Record<string, any>)) {
+            if (key.startsWith("smartlead_") && value && typeof value.smartleadLeadId === "string" && (value.state === "withdrawn" || !!value.withdrawnAt)) withdrawnSmartleadIds.add(value.smartleadLeadId);
+          }
+        }
+      }
+      for (const lead of found) {
         const id = `${lead?.listId}/${lead?.leadId}`;
         if (!lead?.listId || !lead?.leadId || seen.has(id)) continue;
         seen.add(id);
@@ -76,7 +88,7 @@ export class SmartleadEventService {
         // Once our own withdrawal has unsubscribed a blocked contact in Smartlead (`withdrawn`, or `released` afterwards, which keeps `withdrawnAt`),
         // Smartlead lists that contact as unsubscribed for good: reading it back would re-block a contact a user has since resubscribed in the CRM.
         // A reply has no such risk, and a contact released without a withdrawal is still live in Smartlead, so both are still read.
-        if (event.polled && event.kind !== "reply" && (marker.state === "withdrawn" || !!marker.withdrawnAt)) continue;
+        if (event.polled && event.kind !== "reply" && (marker.state === "withdrawn" || !!marker.withdrawnAt || (!!marker.smartleadLeadId && withdrawnSmartleadIds.has(marker.smartleadLeadId)))) continue;
         const r = await proven(marker.runId);
         if (r.ok) matches.push({ lead, campaignName: r.name });
       }
