@@ -30,22 +30,22 @@ export const STOPPED_MESSAGE = "This turn has ended; this call was not run.";
 export const NOT_IN_RUN_MESSAGE = "That tool is not available in this run.";
 export const BAD_INPUT_MESSAGE = "A tool call needs an object of arguments.";
 export const ARGS_TOO_LARGE_MESSAGE = "The arguments of this call are too large to be processed. The tool was not run; send a smaller request.";
-/** A write whose answer was lost and whose identical retry must not run again (the replay table may no longer hold its result). */
 /** The tool ran but the answer could not be prepared (an internal failure after the bridge returned). */
 export const RAN_NOT_PREPARED_MESSAGE = "The tool ran, but its result could not be prepared. Do not repeat it blindly; check its current state first or ask the user.";
+/** A write whose answer was lost and whose identical retry must not run again (the replay table may no longer hold its result). */
 export const ALREADY_RAN_MESSAGE = "This identical action already ran earlier in this turn, but its result could not be returned. It was NOT run again. Check its current state before doing it again.";
 export const BAD_ARGS_MESSAGE = "The arguments of this call could not be read (they are nested too deeply). The tool was not run.";
 export const DELIVERY_FAILED_MESSAGE = "The tool ran but its result could not be returned to you. Do not repeat it blindly; check its current state first or ask the user.";
 /** Written into the PERSISTED tool result of a call whose result the worker could no longer take (A1): the model reads it on the next turn. */
 export const RESULT_LOST_NOTE =
   "[Note: this action ran, but its result did not reach the assistant before the turn ended. It was not repeated. Check its current state before doing it again.]";
-/** Prefix of the answer to an identical retry of a call whose result was lost. */
 /** Appended to a result when a tool that became available could not be loaded for the worker: the model must not wait for it. */
 export const UNLOADABLE_NOTE = "[Note: a tool that just became available could not be loaded on your Claude plan, so it cannot be used in this turn.]";
+/** Prefix of the answer to an identical retry of a call whose result was lost. */
 export const REPLAY_NOTE = "This identical call already ran earlier in this turn, but its result could not be delivered then. It was NOT run again. Its original result follows.\n";
 
-/** Hard limits of what is sent to the worker for one result (the worker's own are in loginHost/protocol.ts; these stay inside them). */
-/** UTF-8 BYTES of the text (the worker's caps are bytes: a multi-byte text must not slip past a character count). */
+/** Hard limits of what is sent to the worker for one result (the worker's own are in loginHost/protocol.ts; these stay inside them). Documented in docs/plan-route-tool-limits.md.
+ * MAX_CONTENT_BYTES: UTF-8 BYTES of the text (the worker's caps are bytes: a multi-byte text must not slip past a character count). */
 const MAX_CONTENT_BYTES = 1_000_000;
 /** UTF-8 bytes of the whole serialized turn.toolResult body; the worker's cap for that route is 8 MiB. */
 const MAX_BODY_BYTES = 7.5 * 1024 * 1024;
@@ -113,7 +113,7 @@ export interface RelayDispatcherOptions {
   isHaltingCall: (operationId: string) => boolean;
   /** See DEFAULT_ANNOUNCE_WAIT_MS (tests shorten it). */
   announceWaitMs?: number;
-  /** Progress hooks (the chat's "executing" statuses). Must not throw. Never called after `close()`. */
+  /** Progress hooks (the chat's "executing" statuses). Must not throw. The caller drops them once its turn is over (`turnOver` in claudeCodeBackend.ts). */
   onCall?: (phase: "start" | "end", name: string) => void;
 }
 
@@ -205,7 +205,6 @@ export class RelayToolDispatcher {
   /** Operations whose answer the worker ACCEPTED (the model read it). Every other executed call of the turn is "result lost". */
   private readonly delivered = new Set<string>();
   private defsLock: Promise<void> = Promise.resolve();
-  private closed = false;
   private tripped = false;
   /**
    * The model messages, as the CLI's stream announced them (B1). A stream `tool-use` is informational and never executed; it is recorded here (name, a
@@ -242,11 +241,6 @@ export class RelayToolDispatcher {
   /** Ids of calls whose answer the worker accepted. A call that executed and is NOT in here never reached the model (S1). */
   deliveredCallIds(): ReadonlySet<string> {
     return this.delivered;
-  }
-
-  /** The turn is over for the caller: no progress callback fires after this (calls still running are answered as usual). */
-  close(): void {
-    this.closed = true;
   }
 
   /**
@@ -388,7 +382,7 @@ export class RelayToolDispatcher {
 
   private progress(phase: "start" | "end", name: string): void {
     // Only names of the manifest are ever shown to the user (a hostile worker must not be able to write arbitrary text into the progress status).
-    if (this.closed || !this.inManifest(name)) return;
+    if (!this.inManifest(name)) return;
     try {
       this.o.onCall?.(phase, name);
     } catch {

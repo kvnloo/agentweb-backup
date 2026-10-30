@@ -9,7 +9,7 @@ import { join } from 'path';
 import type { ProviderEvent } from '../../../loginHost/adapter';
 import { startHostServer, type HostServerHandle } from '../../../loginHost/server';
 import { makeRig, type Rig } from '../../../loginHost/__tests__/helpers';
-import { ClaudeCodeBackend, chooseToolTransport, legacyBridgeAllowed, relayAvailable, type ClaudeBackendDeps, type ClaudeTurnParams } from '../claudeCodeBackend';
+import { ClaudeCodeBackend, chooseToolTransport, legacyBridgeAllowed, refusedAsOldWorker, relayAvailable, type ClaudeBackendDeps, type ClaudeTurnParams } from '../claudeCodeBackend';
 import { turnRanNoTools } from '../claudeRouteErrors';
 import * as relayManifestModule from '../relayManifest';
 import { ClaudeRunRegistry } from '../claudeRunRegistry';
@@ -523,6 +523,53 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
       Object.assign(t.deps.relay!, { workerProtocol: () => 4, protocolStatus: () => 'match' });
       rig.script.turnEvents = [result('fine')];
       expect((await t.backend().run(t.params())).content).toBe('fine');
+    });
+
+    it.each([
+      ['what a protocol 3 worker answers to a `tools` field', 'bridgeToken:invalid_type,body:unrecognized_keys'],
+      ['unrecognized keys alone', 'body:unrecognized_keys'],
+      ['the missing bridge token alone', 'bridgeToken:invalid_type'],
+      ['a worker without a relay', 'relay_unsupported'],
+    ])('EINVALID that means "old worker" (%s) invalidates the cache', async (_l, detail) => {
+      expect(refusedAsOldWorker(detail)).toBe(true);
+      const t = setup();
+      const invalidate = jest.fn();
+      Object.assign(t.deps.relay!, { invalidateProtocol: invalidate });
+      jest.spyOn(client, 'turnRun').mockRejectedValueOnce(new LoginHostError('EINVALID', detail));
+      const err: any = await t.backend().run(t.params()).catch((e) => e);
+      expect(err.code).toBe('host_unavailable');
+      expect(invalidate).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      ['a manifest bug', 'tools:tool_duplicate'],
+      ['a manifest over the cap', 'tools:too_big'],
+      ['a body over the size cap', 'too_large'],
+      ['a bad field', 'model:invalid_value'],
+      ['no detail', undefined],
+      ['both transports', 'tools:bridge_and_tools_mixed'],
+    ])('other EINVALID (%s) is NOT an old worker: no invalidation (one bad manifest must not refuse every user), the generic failure', async (_l, detail) => {
+      expect(refusedAsOldWorker(detail)).toBe(false);
+      const t = setup();
+      const invalidate = jest.fn();
+      Object.assign(t.deps.relay!, { invalidateProtocol: invalidate });
+      jest.spyOn(client, 'turnRun').mockRejectedValueOnce(new LoginHostError('EINVALID', detail));
+      const err: any = await t.backend().run(t.params()).catch((e) => e);
+      expect(err.code).toBe('turn_failed');
+      expect(invalidate).not.toHaveBeenCalled();
+    });
+
+    it('an EINVALID raised AFTER the host started producing events does not invalidate anything', async () => {
+      const t = setup();
+      const invalidate = jest.fn();
+      Object.assign(t.deps.relay!, { invalidateProtocol: invalidate });
+      t.deps.runHostTurn = async (_c, _req, opts) => {
+        await opts.onEvent?.({ type: 'text', delta: 'hello' });
+        throw new LoginHostError('EINVALID', 'body:unrecognized_keys');
+      };
+      const err: any = await t.backend().run(t.params()).catch((e) => e);
+      expect(err.code).toBe('turn_failed');
+      expect(invalidate).not.toHaveBeenCalled();
     });
 
     it.each([

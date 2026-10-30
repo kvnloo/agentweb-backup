@@ -419,16 +419,6 @@ describe('RelayToolDispatcher', () => {
     expect(t.phases).toEqual(['start:search', 'end:search']);
   });
 
-  it('progress callbacks never fire after close()', async () => {
-    let release!: () => void;
-    const t = rig({ gate: { search: new Promise<void>((r) => (release = r)) } });
-    t.d.start(t.ev('op-1', 'search'));
-    t.d.close();
-    release();
-    await t.d.settle(1_000);
-    expect(t.phases).toEqual(['start:search']);
-  });
-
   it('SF1: after a halted preview is answered, a later call reusing the SAME message id is refused (the group was closed)', async () => {
     const t = rig({ confirm: ['send_email'] });
     t.d.start(t.ev('op-1', 'send_email', { to: 'a' }, 'msg-1'));

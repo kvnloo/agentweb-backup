@@ -181,6 +181,16 @@ export function chooseToolTransport(d: Pick<ClaudeBackendDeps, "relay" | "bridge
   return { kind: "relay" };
 }
 
+/**
+ * Whether an EINVALID answer to a relay `turn.run` means "this worker is older than the cached protocol says" (a rollback). What a protocol 3 worker answers to a
+ * `tools` field is its closed schema refusing the unknown key (`body:unrecognized_keys`) and the missing `bridgeToken` (`bridgeToken:invalid_type`); a worker
+ * that has no relay says `relay_unsupported`. Every other EINVALID (`tools:<reason>`, `too_large`, a bad field) is the manifest or the request being wrong on a
+ * worker that does speak the relay: invalidating the cache for that would make ONE bad manifest refuse every user's turn until the worker answers again.
+ */
+export function refusedAsOldWorker(detail: string | undefined): boolean {
+  return /unrecognized_keys|bridgeToken:invalid_type|relay_unsupported/.test(detail ?? "");
+}
+
 /** `CLAUDE_PLAN_ALLOW_LEGACY_BRIDGE`: only the exact string "true" allows the HTTP bridge for a worker older than protocol 4; unset or anything else is off. */
 export function legacyBridgeAllowed(env: Record<string, string | undefined> = process.env): boolean {
   return env.CLAUDE_PLAN_ALLOW_LEGACY_BRIDGE === "true";
@@ -443,7 +453,7 @@ export class ClaudeCodeBackend {
           // A relay turn refused as INVALID at admission: the worker may be older than the cached protocol says (a ROLLBACK to protocol 3 rejects `tools`
           // and the cached "match / 4" would otherwise stay for up to 10 minutes, failing every relay turn). Forget the cached protocol now and fail THIS turn
           // as the retryable "worker unavailable"; nothing ran. The next turn is decided on the fresh answer (unknown, then the real protocol).
-          if (dispatcher && err instanceof LoginHostError && err.code === "EINVALID" && !hostStarted) {
+          if (dispatcher && err instanceof LoginHostError && err.code === "EINVALID" && !hostStarted && refusedAsOldWorker(err.detail)) {
             console.error("[claude-backend] relay_rejected_by_worker", { detail: err.detail, session: p.sessionId });
             try {
               d.relay?.invalidateProtocol?.();
@@ -562,8 +572,7 @@ export class ClaudeCodeBackend {
           /* best effort */
         }
       }
-      turnOver = true;
-      dispatcher?.close();
+      turnOver = true; // the progress wrapper drops every status after this, including those of calls still running (the dispatcher has no flag of its own)
       registered?.release();
       if (opened) {
         try {

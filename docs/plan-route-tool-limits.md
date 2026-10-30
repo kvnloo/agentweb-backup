@@ -61,6 +61,15 @@ The log line is `relay_manifest_cut` (open set) or `new_tool_unloadable` / `new_
 
 A result over a limit is never an error: the text is cut, or the extra images are dropped, and the text says so. The tool has already run.
 
+## What the Claude CLI does on top of these limits
+
+The limits above are ours. The CLI that talks to the model has its own, and they apply to the tools it gets over MCP (which is how the relay hands it Emma's tools):
+
+- **Tool descriptions.** The CLI shortens an MCP tool description to about 4,096 characters by default, so the model may read less than the 48 KiB we allow. It can be raised with the environment variable `CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH`.
+- **Tool output.** The CLI truncates an MCP tool's output at about 25,000 tokens by default, whatever we send. It can be raised with `MAX_MCP_OUTPUT_TOKENS`.
+
+The login host is meant to set both variables for relay turns (a change on the host branch of ENG-2113). **Status: not verified.** When the host change is merged, check the values it sets in `backend/src/loginHost/adapters/claudeAdapter.ts` and update this section to match; mark the behaviour "verified live" only after the live test on the test worker has shown a long description and a long result arriving whole. Until then, write descriptions that carry the key rule in their first 4,000 characters, and results whose important part comes first.
+
 ## What checks this
 
 `backend/src/services/funding/__tests__/relayManifest.registry.test.ts` builds the manifest from the real registry and fails, naming the tool and the limit, if a tool does not fit. It covers two cases: the open set of a fresh chat, and every registered tool at once (the worst case, all skills installed in one turn).

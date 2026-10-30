@@ -63,8 +63,8 @@ const STOPS: Record<ClaudeStopCode, StopInfo> = {
   server_restarting: { httpStatus: 503, offerAgentWebCredits: false, retryable: true, message: "AgentWeb is restarting. Please send your message again in a moment." },
   extra_usage_needs_ack: { httpStatus: 409, offerAgentWebCredits: false, retryable: false, message: "This model can use your Claude plan's extra usage credits, which are billed to you by Anthropic. Confirm that you want this, or choose another model." },
   org_not_supported: { httpStatus: 403, offerAgentWebCredits: false, retryable: false, message: "Using your own Claude plan is not available for organisation accounts yet. Choose another model." },
-  // Offered: AgentWeb's own route can run those tools, and nothing ran on the plan (the turn is refused before the worker is asked). COPY PENDING MANAN'S OK.
-  // Nothing ran on the plan; AgentWeb can run the turn. COPY PENDING MANAN'S OK.
+  // The two tools stops: nothing ran on the plan (the turn is refused before the worker is asked) and AgentWeb's own route can run those tools, so both offer
+  // AgentWeb credits. The copy of both is PENDING MANAN'S OK.
   tools_unavailable_for_plan: { httpStatus: 503, offerAgentWebCredits: true, retryable: true, message: "We couldn't prepare your tools for your Claude plan. Please try again, or continue on AgentWeb credits." },
   tools_too_large_for_plan: { httpStatus: 422, offerAgentWebCredits: true, retryable: false, message: "A tool connected to your account can't be used with your Claude plan. Disconnect it in Settings, or continue on AgentWeb credits." },
   turn_failed: { httpStatus: 502, offerAgentWebCredits: true, retryable: true, message: "Your Claude plan could not complete this message. Please try again, or choose another model." },
