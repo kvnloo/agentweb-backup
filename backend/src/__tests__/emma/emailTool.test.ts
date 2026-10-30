@@ -19,6 +19,7 @@ const mockBlockedRecipients = jest.fn().mockResolvedValue([]);
 jest.mock('../../services/contactGuard', () => ({
   blockedRecipients: (...a: any[]) => mockBlockedRecipients(...a),
   blockedMessage: (b: string[]) => `Not sent: ${b.join(', ')} is marked do-not-contact`,
+  unverifiedContactError: 'Not sent: could not check do-not-contact',
 }));
 
 class MockEmailProviderError extends Error {}
@@ -154,6 +155,14 @@ describe('email tool — org-shared mailbox resolution', () => {
     expect(result.error).toContain('blocked@example.com');
     expect(result.blocked).toEqual(['blocked@example.com']);
     expect(mockBlockedRecipients).toHaveBeenCalledWith([CALLER_USER_ID, OWNER_USER_ID], 'someone@example.com', 'x@example.com', 'blocked@example.com');
+    expect(mockSendEmail).not.toHaveBeenCalled();
+  });
+
+  it('refuses to send when the do-not-contact check itself fails (never sends unverified)', async () => {
+    mockResolveEmailAccount.mockResolvedValue({ ...ORG_SHARED_ACCOUNT, ownerUserId: CALLER_USER_ID });
+    mockBlockedRecipients.mockRejectedValueOnce(new Error('dynamo down'));
+    const result = await tool.execute({ action: 'send', account_id: ACCOUNT_ID, to: 'someone@example.com', subject: 'Hi', body: 'Hello' }, context);
+    expect(result.error).toContain('could not check');
     expect(mockSendEmail).not.toHaveBeenCalled();
   });
 

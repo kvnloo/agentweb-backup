@@ -73,6 +73,15 @@ describe('POST /api/emma/email send and do-not-contact (ENG-673)', () => {
     expect(mockSendEmail).not.toHaveBeenCalled();
   });
 
+  it('refuses with 503 and sends nothing when the do-not-contact check fails', async () => {
+    mockResolveEmailAccount.mockResolvedValue(accountOwnedBy('caller-1'));
+    mockBlockedRecipients.mockRejectedValueOnce(new Error('dynamo down'));
+    const res = await post({ account_id: 'acct-1', action: 'send', to: 'ok@example.com', subject: 's', body: 'b' });
+    expect(res.status).toBe(503);
+    expect(res.body.code).toBe('do_not_contact_unverified');
+    expect(mockSendEmail).not.toHaveBeenCalled();
+  });
+
   it('still sends when nobody is blocked', async () => {
     mockResolveEmailAccount.mockResolvedValue(accountOwnedBy('caller-1'));
     mockSendEmail.mockResolvedValue({ messageId: 'm9', threadId: 't9' });
