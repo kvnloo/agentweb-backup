@@ -288,10 +288,78 @@ describe("relay: limits and abuse", () => {
     await b.ready();
     b.sock.destroy();
     await new Promise((res) => setTimeout(res, 50));
+    // the turn can accept no more: the LISTENER is closed, so the kernel refuses the connect (nothing is accepted just to be destroyed)
     const c = new Client(sockOf(ep));
-    await c.ready().catch(() => undefined);
+    await expect(c.ready()).rejects.toBeDefined();
+    await ep.close();
+  });
+
+  it("MUTATION TARGET: a connect flood is ended at the kernel: after maxRefusals refused connections the listener is closed and later connects fail outright; the held connection keeps working", async () => {
+    const r = rig({ maxRefusals: 5 });
+    const { ep, calls } = await r.open();
+    const holder = new Client(sockOf(ep));
+    await holder.ready();
+    for (let i = 0; i < 5; i++) {
+      const x = new Client(sockOf(ep));
+      await x.ready();
+      await until(() => x.closed);
+    }
+    const late = new Client(sockOf(ep));
+    await expect(late.ready()).rejects.toBeDefined();
+    holder.send(call("c1", "echo", {}));
+    await until(() => calls.length === 1); // the live connection is untouched
+    await ep.close();
+  });
+
+  it("MUTATION TARGET: refusals below the limit leave the listener open (an honest reconnect race is fine)", async () => {
+    const r = rig({ maxRefusals: 5 });
+    const { ep } = await r.open();
+    const holder = new Client(sockOf(ep));
+    await holder.ready();
+    for (let i = 0; i < 4; i++) {
+      const x = new Client(sockOf(ep));
+      await x.ready();
+      await until(() => x.closed);
+    }
+    holder.sock.destroy();
+    await new Promise((res) => setTimeout(res, 50));
+    const again = new Client(sockOf(ep));
+    await again.ready();
+    await ep.close();
+  });
+
+  it("MUTATION TARGET: at most maxCallsPerTurn calls are relayed; the next gets the fixed call_limit error, logged once", async () => {
+    const r = rig({ maxCallsPerTurn: 3 });
+    const { ep, calls } = await r.open();
+    const c = new Client(sockOf(ep));
+    await c.ready();
+    for (let i = 1; i <= 3; i++) {
+      c.send(call("c" + i, "echo", {}));
+      await until(() => calls.length === i);
+      ep.answer(calls[i - 1].operationId, { content: "ok" });
+      await until(() => c.lines.length === i);
+    }
+    c.send(call("c4", "echo", {}));
+    c.send(call("c5", "echo", {}));
+    await until(() => c.lines.length === 5);
+    expect(JSON.parse(c.lines[3])).toEqual({ type: "error", callId: "c4", code: "call_limit" });
+    expect(JSON.parse(c.lines[4])).toEqual({ type: "error", callId: "c5", code: "call_limit" });
+    expect(calls).toHaveLength(3);
+    expect(r.logs.filter((l) => l.fields?.code === "call_limit")).toHaveLength(1);
+    await ep.close();
+  });
+
+  it("MUTATION TARGET: a frame with an absurd number of keys is dropped as bad_frame (before the keys are sorted)", async () => {
+    const r = rig();
+    const { ep, calls } = await r.open();
+    const c = new Client(sockOf(ep));
+    await c.ready();
+    const o: Record<string, number> = { type: 0 };
+    for (let i = 0; i < 20_000; i++) o["k" + i] = i;
+    c.raw(JSON.stringify(o) + "\n");
     await until(() => c.closed);
-    expect(r.logs.map((l) => l.fields?.code)).toContain("connection_refused");
+    expect(calls).toHaveLength(0);
+    expect(r.logs.map((l) => l.fields?.code)).toContain("bad_frame");
     await ep.close();
   });
 

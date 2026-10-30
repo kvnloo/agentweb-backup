@@ -64,7 +64,6 @@ const textResult = (text, isError) => ({ content: [{ type: "text", text }], isEr
 // ── the relay connection ──
 let sock = null;
 let sockBuf = Buffer.alloc(0);
-let pingTimer = null;
 let waiter = null; // { callId, resolve }
 
 function onHostFrame(f) {
@@ -74,13 +73,17 @@ function onHostFrame(f) {
   w.resolve(f);
 }
 
+// ONE connection at a time, ONE attempt in flight: the host accepts a single connection per turn, so a second connect() racing the first (module-load connect
+// and the first tool call) would be refused and destroyed by the host while its socket replaced the live one here, and every later reconnect would be refused.
+let connecting = null;
 function connect() {
-  return new Promise((resolve, reject) => {
+  if (connecting) return connecting;
+  connecting = new Promise((resolve, reject) => {
     const s = net.createConnection(SOCKET);
     s.once("connect", () => {
       sock = s;
       sockBuf = Buffer.alloc(0);
-      pingTimer = setInterval(() => {
+      const ping = setInterval(() => {
         try {
           s.write(JSON.stringify({ type: "ping" }) + "\n");
         } catch {
@@ -88,6 +91,7 @@ function connect() {
         }
       }, PING_MS);
       s.on("data", (chunk) => {
+        if (sock !== s) return; // a stale socket
         sockBuf = sockBuf.length ? Buffer.concat([sockBuf, chunk]) : chunk;
         for (;;) {
           const nl = sockBuf.indexOf(10);
@@ -107,8 +111,9 @@ function connect() {
         }
       });
       s.on("close", () => {
-        clearInterval(pingTimer);
-        if (sock === s) sock = null;
+        clearInterval(ping);
+        if (sock !== s) return; // an older socket closing must not touch the newer one or its waiter
+        sock = null;
         if (waiter) {
           const w = waiter;
           waiter = null;
@@ -120,6 +125,11 @@ function connect() {
     s.once("error", (e) => reject(e));
     s.on("error", () => undefined);
   });
+  const done = () => {
+    connecting = null;
+  };
+  connecting.then(done, done);
+  return connecting;
 }
 
 async function ensureConnected() {
@@ -144,6 +154,7 @@ const ERROR_TEXT = {
   internal: "The tool call failed.",
   result_too_large: "The tool result was too large to deliver.",
   disconnected: "The tool relay connection was lost.",
+  call_limit: "The tool call limit for this turn was reached.",
 };
 
 let nextCall = 0;

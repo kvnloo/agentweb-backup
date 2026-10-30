@@ -53,6 +53,10 @@ export interface RelayLimits {
   /** Token bucket: burst size and refill per second. */
   burst: number;
   refillPerSec: number;
+  /** Refused connections after which the listener is closed. */
+  maxRefusals: number;
+  /** Calls relayed to the backend in one turn. */
+  maxCallsPerTurn: number;
   /** Byte budget next to the frame bucket: scanning and parsing a 1 MiB frame costs tens of ms of the shared host's event loop, so frames per second alone is not a limit. */
   byteBurst: number;
   bytesPerSec: number;
@@ -66,6 +70,8 @@ export const DEFAULT_RELAY_LIMITS: RelayLimits = {
   idleMs: 15_000,
   burst: 30,
   refillPerSec: 10,
+  maxRefusals: 32,
+  maxCallsPerTurn: 500,
   byteBurst: 4 * 1024 * 1024,
   bytesPerSec: 2 * 1024 * 1024,
   maxConnectionsPerTurn: 16,
@@ -219,6 +225,14 @@ class Endpoint implements RelayEndpoint {
     this.server.on("error", () => this.violate("server_error"));
   }
 
+  private refusals = 0;
+  private callsRelayed = 0;
+  private callCapLogged = false;
+  /** No more connections are accepted (the connected one, if any, stays). The kernel refuses further connects; close() still removes the directory. */
+  private stopListening(): void {
+    if (this.server.listening) this.server.close();
+  }
+
   get closed(): boolean {
     return this.isClosed;
   }
@@ -260,6 +274,9 @@ class Endpoint implements RelayEndpoint {
     if (this.isClosed || this.conn || this.accepted >= this.limits.maxConnectionsPerTurn) {
       this.violate(this.conn ? "second_connection" : "connection_refused");
       s.destroy();
+      // Accepting a connection only to destroy it still costs a syscall round trip each: a connect flood (73,000 attempts in 5 s measured = 94% of a core) is ended at the
+      // kernel by closing the listener once the turn can accept no more, or has been refused too often. An honest shim reconnects a handful of times, not dozens.
+      if (++this.refusals >= this.limits.maxRefusals || (!this.conn && this.accepted >= this.limits.maxConnectionsPerTurn)) this.stopListening();
       return;
     }
     this.accepted++;
@@ -273,6 +290,7 @@ class Endpoint implements RelayEndpoint {
     s.once("close", () => {
       clearTimeout(idle);
       if (this.conn === s) this.conn = undefined;
+      if (this.accepted >= this.limits.maxConnectionsPerTurn) this.stopListening(); // the last connection this turn may have is gone
       if (this.pending?.socket === s) this.endPending("disconnected");
     });
     s.on("data", (chunk: Buffer) => {
@@ -331,6 +349,13 @@ class Endpoint implements RelayEndpoint {
       return false;
     }
     const rec = f as Record<string, unknown>;
+    // An absurd key count is refused BEFORE the keys are sorted and joined (870 KB of 80,000 keys cost 62 ms there); a valid frame has at most four.
+    let keyCount = 0;
+    for (const _k in rec) if (++keyCount > 4) break;
+    if (keyCount > 4) {
+      this.drop(s, "bad_frame");
+      return false;
+    }
     const keys = Object.keys(rec).sort().join(",");
     if (rec.type === "ping") {
       if (keys !== "type") {
@@ -357,6 +382,16 @@ class Endpoint implements RelayEndpoint {
       this.send(s, { type: "error", callId, code: "unknown_tool" });
       return true;
     }
+    // A hard cap on calls relayed in one turn (the backend treats more than 400 as misbehaving): past it every call gets the fixed `call_limit` error, logged once.
+    if (this.callsRelayed >= this.limits.maxCallsPerTurn) {
+      if (!this.callCapLogged) {
+        this.callCapLogged = true;
+        this.violate("call_limit");
+      }
+      this.send(s, { type: "error", callId, code: "call_limit" });
+      return true;
+    }
+    this.callsRelayed++;
     const operationId = randomBytes(16).toString("hex");
     const ms = Math.max(0, Math.floor(this.o.callTimeoutMs()));
     const timer = setTimeout(() => {

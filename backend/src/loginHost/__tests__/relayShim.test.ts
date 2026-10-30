@@ -24,7 +24,8 @@ async function rig(env: Record<string, string> = {}, limits: { idleMs?: number }
   const root = mkdtempSync(join(tmpdir(), "relay-shim-"));
   roots.push(root);
   const layout = new Layout({ env: "t1", stateRoot: "/var/lib/aw-login-host/t1", sharedParent: "/var/lib/aw-login-host", uidMin: 400_000, uidMax: 400_100, relayRoot: join(root, "relay") });
-  const host = new RelayHost({ layout, ownByUid: false, limits });
+  const logs: Array<Record<string, unknown> | undefined> = [];
+  const host = new RelayHost({ layout, ownByUid: false, limits, log: { warn: (_e, f) => void logs.push(f) } });
   host.init();
   const calls: RelayCall[] = [];
   const visible = new Set(TOOLS.map((t) => t.name));
@@ -53,7 +54,7 @@ async function rig(env: Record<string, string> = {}, limits: { idleMs?: number }
     await until(() => out.some((o) => o.id === mine));
     return out.find((o) => o.id === mine)!;
   };
-  return { ep, calls, visible, child, out, rpc, stderr: () => err, host, layout, root };
+  return { logs, ep, calls, visible, child, out, rpc, stderr: () => err, host, layout, root };
 }
 async function until(cond: () => boolean, ms = 4000): Promise<void> {
   const t0 = Date.now();
@@ -156,6 +157,61 @@ describe("relay shim: MCP surface", () => {
     await until(() => r.child.exitCode !== null);
     expect(r.child.exitCode).toBe(1);
     expect(r.stderr().trim()).toBe("aw-relay: E_TOOLS");
+    await r.ep.close();
+  });
+});
+
+describe("relay shim: ONE connection, however calls race the connect", () => {
+  const accepted = (r: { ep: unknown }) => (r.ep as unknown as { accepted: number }).accepted;
+  const codes = (r: { logs: Array<Record<string, unknown> | undefined> }) => r.logs.map((l) => l?.code);
+  const drop = (r: { ep: unknown }) => (r.ep as unknown as { conn: { destroy(): void } }).conn.destroy();
+
+  it("MUTATION TARGET: a tool call racing the shim own initial connect uses a SINGLE connection (no second_connection, the call is served)", async () => {
+    const r = await rig();
+    const p = r.rpc("tools/call", { name: "echo", arguments: { q: "race" } });
+    await until(() => r.calls.length === 1);
+    r.ep.answer(r.calls[0].operationId, { content: "ok" });
+    expect((await p).result.content[0].text).toBe("ok");
+    expect(accepted(r)).toBe(1);
+    expect(codes(r)).not.toContain("second_connection");
+    await r.ep.close();
+  });
+
+  it("MUTATION TARGET: after the host drops the connection the next call reconnects, once, and works", async () => {
+    const r = await rig();
+    const first = r.rpc("tools/call", { name: "echo", arguments: { n: 1 } });
+    await until(() => r.calls.length === 1);
+    r.ep.answer(r.calls[0].operationId, { content: "one" });
+    await first;
+    drop(r);
+    await new Promise((res) => setTimeout(res, 100));
+    const again = r.rpc("tools/call", { name: "echo", arguments: { n: 2 } });
+    await until(() => r.calls.length === 2);
+    r.ep.answer(r.calls[1].operationId, { content: "two" });
+    expect((await again).result.content[0].text).toBe("two");
+    expect(accepted(r)).toBe(2);
+    expect(codes(r)).not.toContain("second_connection");
+    await r.ep.close();
+  });
+
+  it("MUTATION TARGET: two simultaneous calls while the shim is reconnecting open ONE new connection", async () => {
+    const r = await rig();
+    const first = r.rpc("tools/call", { name: "echo", arguments: { n: 1 } });
+    await until(() => r.calls.length === 1);
+    r.ep.answer(r.calls[0].operationId, { content: "one" });
+    await first;
+    drop(r);
+    await new Promise((res) => setTimeout(res, 100));
+    const a = r.rpc("tools/call", { name: "echo", arguments: { n: 2 } });
+    const b = r.rpc("tools/call", { name: "echo", arguments: { n: 3 } });
+    await until(() => r.calls.length === 2);
+    r.ep.answer(r.calls[1].operationId, { content: "two" });
+    await until(() => r.calls.length === 3);
+    r.ep.answer(r.calls[2].operationId, { content: "three" });
+    expect((await a).result.content[0].text).toBe("two");
+    expect((await b).result.content[0].text).toBe("three");
+    expect(accepted(r)).toBe(2);
+    expect(codes(r)).not.toContain("second_connection");
     await r.ep.close();
   });
 });
