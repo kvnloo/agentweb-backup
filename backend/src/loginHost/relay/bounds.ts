@@ -52,29 +52,44 @@ export function valueDepthExceeds(value: unknown, max: number): boolean {
 }
 
 /**
- * A cheap upper-bound-ish estimate of the JSON size of `value` for MEMORY ACCOUNTING (never for a protocol limit): strings count their length, numbers and
- * keys a few bytes. Iterative; stops and returns `limit` as soon as the estimate passes it, so the work is bounded too. Never throws.
+ * A cheap estimate of the JSON size of `value` (memory accounting, and the decision to forward or replace an informational value; never a protocol limit):
+ * strings count their length, a single-digit integer 2 bytes (digit and comma: 130,000 of them are ~260 KB of real JSON), other numbers 20, keys a few bytes. Iterative; stops and returns `limit` as soon as the estimate passes it, so the work is bounded too. Never throws.
  */
 export function approxJsonBytes(value: unknown, limit: number): number {
   let total = 0;
-  const stack: unknown[] = [value];
   let steps = 0;
-  while (stack.length) {
-    if (total >= limit || ++steps > 1_000_000) return limit;
-    const v = stack.pop();
+  /** Primitives are counted on the spot (nothing is pushed for them): a 6,000,000-element array costs a bounded number of steps, not 6,000,000 stack entries. */
+  const scalar = (v: unknown): void => {
     if (typeof v === "string") total += v.length + 2;
-    else if (v !== null && typeof v === "object") {
-      if (Array.isArray(v)) {
-        total += 2 + v.length;
-        for (const x of v) stack.push(x);
-      } else {
-        total += 2;
-        for (const [k, x] of Object.entries(v)) {
-          total += k.length + 4;
-          stack.push(x);
-        }
+    else if (typeof v === "number") total += Number.isInteger(v) && v >= 0 && v < 10 ? 2 : 20; // a single digit and its comma; any other number at its longest ordinary form
+    else total += 5; // true / false / null and the comma
+  };
+  if (value === null || typeof value !== "object") {
+    scalar(value);
+    return Math.min(total, limit);
+  }
+  const containers: object[] = [value];
+  while (containers.length) {
+    const c = containers.pop() as object;
+    total += 2;
+    const take = (x: unknown): void => {
+      if (x !== null && typeof x === "object") containers.push(x);
+      else scalar(x);
+    };
+    if (Array.isArray(c)) {
+      // an index loop: for...in on an array first builds all its keys as strings (seconds for millions of elements)
+      for (let i = 0; i < c.length; i++) {
+        if (total >= limit || ++steps > 1_000_000) return limit;
+        take(c[i]);
       }
-    } else total += 8;
+    } else {
+      for (const k in c) {
+        if (total >= limit || ++steps > 1_000_000) return limit;
+        if (!Object.prototype.hasOwnProperty.call(c, k)) continue;
+        total += k.length + 4;
+        take((c as Record<string, unknown>)[k]);
+      }
+    }
   }
   return Math.min(total, limit);
 }
@@ -121,5 +136,43 @@ export class LogThrottle {
     for (const [k, s] of this.state) if (s.suppressed > 0) out.push([k, s.suppressed]);
     this.state.clear();
     return out;
+  }
+}
+
+/**
+ * Splits a byte stream into newline-delimited lines with a hard cap on one line, in LINEAR time however the bytes are chunked. The newline is searched for ONLY in
+ * the new chunk; pending pieces are kept (copied, so a one-byte slice cannot pin a 64 KiB read buffer) in a list with a running length and joined ONCE, when
+ * their line is complete. The naive loop (concat the whole buffer and re-scan it on every chunk) costs about 1.5 s of event-loop time for ONE 1 MiB line fed in
+ * 64-byte chunks, which a hostile unit can repeat to keep the shared host busy.
+ */
+export class LineAssembler {
+  private pieces: Buffer[] = [];
+  private pending = 0;
+  constructor(private readonly maxLine: number) {}
+
+  /** `tooLarge`: a line passed `maxLine` bytes (without its newline) before ending; nothing after that point of this chunk is looked at. */
+  push(chunk: Buffer): { lines: Buffer[]; tooLarge: boolean } {
+    const lines: Buffer[] = [];
+    let pos = 0;
+    while (pos < chunk.length) {
+      const nl = chunk.indexOf(10, pos);
+      if (nl < 0) {
+        const rest = chunk.length - pos;
+        if (this.pending + rest > this.maxLine) return { lines, tooLarge: true };
+        this.pieces.push(Buffer.from(chunk.subarray(pos))); // a copy: it must not keep the whole read buffer alive
+        this.pending += rest;
+        break;
+      }
+      const tail = chunk.subarray(pos, nl);
+      if (this.pending + tail.length > this.maxLine) return { lines, tooLarge: true };
+      if (this.pieces.length === 0) lines.push(tail);
+      else {
+        lines.push(Buffer.concat([...this.pieces, tail], this.pending + tail.length));
+        this.pieces = [];
+        this.pending = 0;
+      }
+      pos = nl + 1;
+    }
+    return { lines, tooLarge: false };
   }
 }
