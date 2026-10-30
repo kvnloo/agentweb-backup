@@ -551,6 +551,27 @@ describe("relay: hostile frames cannot take the host down", () => {
     await ep.close();
   });
 
+  it("MUTATION TARGET: the token bucket runs on a MONOTONIC clock: the wall clock stepping back an hour (NTP, a VM resume) does not drop a healthy connection", async () => {
+    const r = rig();
+    const { ep, calls } = await r.open();
+    const c = new Client(sockOf(ep));
+    await c.ready();
+    c.send({ type: "ping" });
+    await new Promise((res) => setTimeout(res, 30));
+    const real = Date.now;
+    const spy = jest.spyOn(Date, "now").mockImplementation(() => real() - 3_600_000);
+    try {
+      for (let i = 0; i < 5; i++) c.send({ type: "ping" });
+      c.send(call("after-step"));
+      await until(() => calls.length === 1);
+      expect(c.closed).toBe(false);
+      expect(r.logs.map((l) => l.fields?.code)).not.toContain("rate_limited");
+    } finally {
+      spy.mockRestore();
+    }
+    await ep.close();
+  });
+
   it("MUTATION TARGET: reject() answers the pending call with a fixed internal error frame (once)", async () => {
     const r = rig();
     const { ep, calls } = await r.open();

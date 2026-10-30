@@ -617,11 +617,11 @@ class ClaudeSession implements ProviderSession {
       // Bounded memory whatever the CLI prints: a fixed-size digest of the input (not the input), a truncated id, and at most MAX_STREAM_USES entries (oldest dropped).
       // An over-long id is NOT recorded (never sliced: in V8 a slice keeps the whole original string alive). The call then gets a unique unmatched id.
       if (msg.id.length > MAX_MESSAGE_ID_CHARS) continue;
-      // An announcement whose input is larger than a forwarded value is recorded by NAME only: hashing a 16 MB hostile input would block the event loop for seconds. It can
-      // still be matched by name when it is the only one of that name (see flushWaiting).
+      // An announcement whose input is larger than a forwarded value is NOT recorded: hashing a 16 MB hostile input would block the event loop for seconds, and it
+      // could never match a real call anyway (a relay frame over 1 MiB is refused). The call then gets a unique unmatched id.
       const input = b.input ?? {};
-      const key = approxJsonBytes(input, MAX_FORWARDED_BYTES + 1) > MAX_FORWARDED_BYTES ? OVERSIZE_KEY : digest(canonicalJson(input));
-      this.streamUses.push({ messageId: msg.id, name, key });
+      if (approxJsonBytes(input, MAX_FORWARDED_BYTES + 1) > MAX_FORWARDED_BYTES) continue;
+      this.streamUses.push({ messageId: msg.id, name, key: digest(canonicalJson(input)) });
       if (this.streamUses.length > MAX_STREAM_USES) this.streamUses.splice(0, this.streamUses.length - MAX_STREAM_USES);
     }
     this.flushWaiting(false);
@@ -861,7 +861,5 @@ class ClaudeSession implements ProviderSession {
 
 
 const MAX_STREAM_USES = 64;
-/** Key of a stream announcement too large to hash; it never equals a real digest (those are base64 of 32 bytes). */
-const OVERSIZE_KEY = "~oversize";
 const MAX_MESSAGE_ID_CHARS = 128;
 const digest = (text: string): string => createHash("sha256").update(text).digest("base64");

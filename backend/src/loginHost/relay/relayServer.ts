@@ -15,6 +15,7 @@
  *  - Nothing in a frame is ever logged. Log lines carry fixed codes only.
  */
 import { randomBytes } from "crypto";
+import { performance } from "perf_hooks";
 import { chmodSync, chownSync, existsSync, mkdirSync, readdirSync, rmSync } from "fs";
 import { createServer, type Server, type Socket } from "net";
 import type { Logger } from "../ports";
@@ -250,7 +251,7 @@ class Endpoint implements RelayEndpoint {
     this.conn = s;
     const assembler = new LineAssembler(this.limits.shimToHostBytes);
     let tokens = this.limits.burst;
-    let lastRefill = Date.now();
+    let lastRefill = performance.now(); // a MONOTONIC clock: a backwards step of the wall clock must not drop a healthy connection
     let idle = setTimeout(() => this.drop(s, "idle_timeout"), this.limits.idleMs);
     idle.unref?.();
     s.once("close", () => {
@@ -271,7 +272,7 @@ class Endpoint implements RelayEndpoint {
       const { lines, tooLarge } = assembler.push(chunk); // linear in the bytes received, however they are chunked (see LineAssembler)
       for (const line of lines) {
         // Token bucket, refilled by elapsed time. Every complete frame costs one token.
-        const now = Date.now();
+        const now = performance.now();
         tokens = Math.min(this.limits.burst, tokens + ((now - lastRefill) / 1000) * this.limits.refillPerSec);
         lastRefill = now;
         if (tokens < 1) return this.drop(s, "rate_limited");

@@ -8,6 +8,7 @@ import { tmpdir } from "os";
 import { dirname, join } from "path";
 import { assertTrustedPath } from "../../host/binary";
 import { assertHostTrustedPaths, hostTrustedPaths } from "../../host/main";
+import { assertCustomerCanUse } from "../../host/trustedPaths";
 import { parseHostConfig } from "../../host/hostConfig";
 
 const PROD = join(__dirname, "..", "..", "deploy", "prod");
@@ -52,6 +53,40 @@ describe("the rendered prod config names a node path that cannot be a symlink", 
     expect(cfg.claude.nodePath).toMatch(/^\/opt\/aw-node\/v[0-9.]+\/bin\/node$/);
     // the path install.sh installs the real binary at is exactly the one the config names
     expect(install).toContain("NODE_DIR=/opt/aw-node/v$NODE_VERSION");
+  });
+});
+
+describe("assertCustomerCanUse: a customer uid (not root, not the owner) must be able to reach what its unit is given", () => {
+  const make = () => {
+    const root = mkdtempSync(join(tmpdir(), "cust-"));
+    roots.push(root);
+    const dir = join(root, "a", "b");
+    mkdirSync(dir, { recursive: true });
+    for (const d of [root, join(root, "a"), dir]) chmodSync(d, 0o755);
+    const file = join(dir, "node");
+    writeFileSync(file, "x", { mode: 0o755 });
+    chmodSync(file, 0o755);
+    return { root, dir, file };
+  };
+  it("MUTATION TARGET: an executable file under traversable directories passes; a file others cannot execute, or a directory others cannot traverse, is refused with a clear message", () => {
+    const t = make();
+    expect(() => assertCustomerCanUse(t.file, "execute", t.root)).not.toThrow();
+    chmodSync(t.file, 0o750);
+    expect(() => assertCustomerCanUse(t.file, "execute", t.root)).toThrow(/not executable by other users/);
+    chmodSync(t.file, 0o755);
+    chmodSync(t.dir, 0o750);
+    expect(() => assertCustomerCanUse(t.file, "execute", t.root)).toThrow(/not traversable by other users/);
+    chmodSync(t.dir, 0o755);
+    chmodSync(join(t.root, "a"), 0o700);
+    expect(() => assertCustomerCanUse(t.file, "execute", t.root)).toThrow(/not traversable/);
+  });
+  it("MUTATION TARGET: the shim only needs to be READABLE by others (node reads it), not executable", () => {
+    const t = make();
+    chmodSync(t.file, 0o644);
+    expect(() => assertCustomerCanUse(t.file, "read", t.root)).not.toThrow();
+    expect(() => assertCustomerCanUse(t.file, "execute", t.root)).toThrow();
+    chmodSync(t.file, 0o640);
+    expect(() => assertCustomerCanUse(t.file, "read", t.root)).toThrow(/not readable by other users/);
   });
 });
 

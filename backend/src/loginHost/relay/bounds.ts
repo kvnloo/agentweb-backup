@@ -60,9 +60,14 @@ export function approxJsonBytes(value: unknown, limit: number): number {
   let steps = 0;
   /** Primitives are counted on the spot (nothing is pushed for them): a 6,000,000-element array costs a bounded number of steps, not 6,000,000 stack entries. */
   const scalar = (v: unknown): void => {
-    if (typeof v === "string") total += v.length + 2;
-    else if (typeof v === "number") total += Number.isInteger(v) && v >= 0 && v < 10 ? 2 : 20; // a single digit and its comma; any other number at its longest ordinary form
-    else total += 5; // true / false / null and the comma
+    if (typeof v === "string") {
+      if (v.length > limit) total = limit; // longer than the cap in characters alone
+      else total += (NON_ASCII.test(v) ? Buffer.byteLength(v, "utf8") : v.length) + 3; // quotes and comma; UTF-8 length only for a string that has a non-ASCII character
+    } else if (typeof v === "number") {
+      const a = Math.abs(v);
+      if (Number.isInteger(v) && a < 1e6) total += (a < 10 ? 1 : a < 100 ? 2 : a < 1000 ? 3 : a < 1e4 ? 4 : a < 1e5 ? 5 : 6) + (v < 0 ? 1 : 0) + 1; // its digits, a sign, the comma
+      else total += 20; // a larger integer or a fraction, at its longest ordinary form
+    } else total += 5; // true / false / null and the comma
   };
   if (value === null || typeof value !== "object") {
     scalar(value);
@@ -93,6 +98,8 @@ export function approxJsonBytes(value: unknown, limit: number): number {
   }
   return Math.min(total, limit);
 }
+// eslint-disable-next-line no-control-regex
+const NON_ASCII = /[^\x00-\x7f]/;
 
 /**
  * A value that came from the CLI's stream or the shim, made safe to forward to the backend or store: nested deeper than MAX_FORWARDED_DEPTH or larger than
@@ -140,15 +147,32 @@ export class LogThrottle {
 }
 
 /**
- * Splits a byte stream into newline-delimited lines with a hard cap on one line, in LINEAR time however the bytes are chunked. The newline is searched for ONLY in
- * the new chunk; pending pieces are kept (copied, so a one-byte slice cannot pin a 64 KiB read buffer) in a list with a running length and joined ONCE, when
- * their line is complete. The naive loop (concat the whole buffer and re-scan it on every chunk) costs about 1.5 s of event-loop time for ONE 1 MiB line fed in
- * 64-byte chunks, which a hostile unit can repeat to keep the shared host busy.
+ * Splits a byte stream into newline-delimited lines with a hard cap on one line, in LINEAR time and BOUNDED memory however the bytes are chunked. The newline is
+ * searched for ONLY in the new chunk; the bytes of an unfinished line go into ONE growing buffer (allocated lazily, doubling up to the cap, so the copying is
+ * amortized linear and the memory is at most about twice the pending bytes, never one object per chunk); a finished line is copied out once. The naive loop (concat
+ * the whole buffer and re-scan it on every chunk) cost about 1.8 s of event-loop time for ONE 1 MiB line fed in 64-byte chunks, and keeping a Buffer per chunk
+ * cost ~157 MB for a 1-byte trickle of the same line; a hostile unit can repeat either to load the shared host. Never retains a read buffer.
  */
 export class LineAssembler {
-  private pieces: Buffer[] = [];
-  private pending = 0;
+  private buf: Buffer | undefined;
+  private len = 0;
   constructor(private readonly maxLine: number) {}
+
+  /** What is held for the unfinished line (tests: the capacity must stay within about twice the pending bytes, whatever the chunking). */
+  get retained(): { capacity: number; pending: number } {
+    return { capacity: this.buf?.length ?? 0, pending: this.len };
+  }
+
+  private append(src: Buffer): void {
+    const need = this.len + src.length;
+    if (!this.buf || this.buf.length < need) {
+      const next = Buffer.allocUnsafe(Math.min(this.maxLine, Math.max(need, (this.buf?.length ?? 0) * 2, 1024)));
+      if (this.buf) this.buf.copy(next, 0, 0, this.len);
+      this.buf = next;
+    }
+    src.copy(this.buf, this.len);
+    this.len = need;
+  }
 
   /** `tooLarge`: a line passed `maxLine` bytes (without its newline) before ending; nothing after that point of this chunk is looked at. */
   push(chunk: Buffer): { lines: Buffer[]; tooLarge: boolean } {
@@ -157,19 +181,19 @@ export class LineAssembler {
     while (pos < chunk.length) {
       const nl = chunk.indexOf(10, pos);
       if (nl < 0) {
-        const rest = chunk.length - pos;
-        if (this.pending + rest > this.maxLine) return { lines, tooLarge: true };
-        this.pieces.push(Buffer.from(chunk.subarray(pos))); // a copy: it must not keep the whole read buffer alive
-        this.pending += rest;
+        if (this.len + (chunk.length - pos) > this.maxLine) return { lines, tooLarge: true };
+        this.append(chunk.subarray(pos));
         break;
       }
       const tail = chunk.subarray(pos, nl);
-      if (this.pending + tail.length > this.maxLine) return { lines, tooLarge: true };
-      if (this.pieces.length === 0) lines.push(tail);
+      if (this.len + tail.length > this.maxLine) return { lines, tooLarge: true };
+      if (this.len === 0) lines.push(tail);
       else {
-        lines.push(Buffer.concat([...this.pieces, tail], this.pending + tail.length));
-        this.pieces = [];
-        this.pending = 0;
+        this.append(tail);
+        const buf = this.buf as Buffer;
+        lines.push(Buffer.from(buf.subarray(0, this.len))); // one copy out, so the buffer can be reused or released
+        this.len = 0;
+        if (buf.length > 64 * 1024) this.buf = undefined; // a big buffer is not kept for the next line
       }
       pos = nl + 1;
     }

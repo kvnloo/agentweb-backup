@@ -106,6 +106,18 @@ describe("check-config: the pre-switch trusted-path check", () => {
     expect(checkConfig(t.cfg, t.args)).toContain("aw-relay-shim.js is not trusted");
   });
 
+  it("MUTATION TARGET: the pinned node must be executable by a customer uid, and the shim readable (a root-only node would pass the owner check and still fail every customer unit)", () => {
+    const t = tree();
+    chmodSync(t.nodeFile, 0o750);
+    expect(checkConfig(t.cfg, t.args)).toMatch(/aw-node\/v[0-9.]+\/bin\/node: .* not executable by other users/);
+    chmodSync(t.nodeFile, 0o755);
+    chmodSync(join(dirname(t.nodeFile)), 0o750);
+    expect(checkConfig(t.cfg, t.args)).toMatch(/not traversable by other users/);
+    chmodSync(dirname(t.nodeFile), 0o755);
+    chmodSync(join(t.stageRel, "aw-relay-shim.js"), 0o700);
+    expect(checkConfig(t.cfg, t.args)).toMatch(/aw-relay-shim\.js: .* not readable by other users/);
+  });
+
   it("only paths under a --map are checked (system tools such as /usr/bin/systemd-run are the host's own start-up business)", () => {
     const t = tree();
     expect(checkConfig(t.cfg, ["--owner", String(uid), "--boundary", t.root])).toBeUndefined(); // no map: nothing to look at

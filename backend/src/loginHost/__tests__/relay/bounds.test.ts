@@ -85,6 +85,46 @@ describe("approxJsonBytes", () => {
     expect(approxJsonBytes(cyc, 1000)).toBe(1000);
     expect(approxJsonBytes({ s: "x".repeat(10_000) }, 100)).toBe(100);
   });
+  it.each([[7, 1], [42, 2], [123, 3], [4567, 4], [45678, 5], [456789, 6], [-5, 1], [12345678, 8]])("MUTATION TARGET: the number %p (%p digits) is counted by what it costs in JSON (never far under, at most about 3x over), so 55,000 two-digit numbers (~165 KB) are nowhere near 1 MiB", (n) => {
+    const arr = new Array(55_000).fill(n);
+    const real = Buffer.byteLength(JSON.stringify(arr));
+    const est = approxJsonBytes(arr, 100 * 1024 * 1024);
+    expect(est).toBeGreaterThanOrEqual(real * 0.95);
+    expect(est).toBeLessThanOrEqual(real * 3);
+  });
+  it("MUTATION TARGET: 55,000 two-digit numbers are not over a 1 MiB cap", () => {
+    expect(approxJsonBytes(new Array(55_000).fill(42), 1024 * 1024 + 1)).toBeLessThan(1024 * 1024);
+  });
+
+  it("MUTATION TARGET: strings count their quotes and comma, and their UTF-8 length when they are not ASCII (cheaply: only a string with a character above 0x7f is measured)", () => {
+    const ascii = new Array(100_000).fill("abc");
+    expect(approxJsonBytes(ascii, 1 << 30)).toBeGreaterThanOrEqual(Buffer.byteLength(JSON.stringify(ascii)) * 0.95);
+    const accents = new Array(100_000).fill("\u00e9\u00e9\u00e9"); // 3 chars, 6 bytes
+    expect(approxJsonBytes(accents, 1 << 30)).toBeGreaterThanOrEqual(Buffer.byteLength(JSON.stringify(accents)) * 0.95);
+    const cjk = new Array(50_000).fill("\u4e2d\u6587\u5b57"); // 3 chars, 9 bytes
+    expect(approxJsonBytes(cjk, 1 << 30)).toBeGreaterThanOrEqual(Buffer.byteLength(JSON.stringify(cjk)) * 0.95);
+    expect(approxJsonBytes("x".repeat(5000), 100)).toBe(100); // longer than the cap in characters alone: no scan needed
+  });
+
+  it("MUTATION TARGET: an array that has already passed the cap is not walked further (early exit)", () => {
+    let reads = 0;
+    const big = new Proxy(new Array(5_000_000).fill("x".repeat(1000)), {
+      get(t, k, r) {
+        if (typeof k === "string" && /^\d+$/.test(k)) reads++;
+        return Reflect.get(t, k, r);
+      },
+    });
+    expect(approxJsonBytes(big, 10_000)).toBe(10_000);
+    expect(reads).toBeLessThan(100);
+  });
+
+  it("MUTATION TARGET: only OWN properties count (an inherited enumerable one is not part of the JSON), and a key counts its length", () => {
+    const o = Object.create({ inherited: "x".repeat(5000) }) as Record<string, unknown>;
+    o.own = 1;
+    expect(approxJsonBytes(o, 1 << 20)).toBeLessThan(100);
+    expect(approxJsonBytes({ ["k".repeat(1000)]: 1 }, 1 << 20)).toBeGreaterThanOrEqual(1000);
+  });
+
   it("is in the right order of magnitude for ordinary data", () => {
     const v = { name: "search", args: { q: "hello world", n: [1, 2, 3] } };
     const real = Buffer.byteLength(JSON.stringify(v));

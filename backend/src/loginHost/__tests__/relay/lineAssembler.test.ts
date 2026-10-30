@@ -71,6 +71,51 @@ describe("LineAssembler: correctness", () => {
   });
 });
 
+describe("LineAssembler: memory", () => {
+  it.each([1, 3, 64])("MUTATION TARGET: one 1 MiB line trickled in %i-byte chunks is held in ONE buffer within twice its pending bytes (never one object per chunk)", (size) => {
+    const max = 1024 * 1024;
+    const a = new LineAssembler(max);
+    const chunk = Buffer.alloc(size, 0x61);
+    let fed = 0;
+    let worst = 0;
+    while (fed + size <= max) {
+      a.push(chunk);
+      fed += size;
+      const r = a.retained;
+      expect(r.pending).toBe(fed);
+      if (r.capacity > worst) worst = r.capacity;
+      expect(r.capacity).toBeLessThanOrEqual(Math.max(1024, 2 * r.pending));
+    }
+    expect(worst).toBeLessThanOrEqual(max);
+    // the line completes: one copy out, and a big buffer is not kept for the next line
+    const done = a.push(Buffer.from("\n"));
+    expect(done.lines).toHaveLength(1);
+    expect(done.lines[0].length).toBe(fed);
+    expect(a.retained).toEqual({ capacity: 0, pending: 0 });
+  });
+
+  it("MUTATION TARGET: a small buffer is reused for the next line, a big one released; the buffer never exceeds the cap", () => {
+    const a = new LineAssembler(100);
+    a.push(B("abc"));
+    a.push(B("def\n"));
+    expect(a.retained.capacity).toBeGreaterThan(0);
+    expect(a.retained.capacity).toBeLessThanOrEqual(100);
+    expect(a.retained.pending).toBe(0);
+    const r = a.push(B("x".repeat(99)));
+    expect(r.tooLarge).toBe(false);
+    expect(a.retained.capacity).toBeLessThanOrEqual(100);
+  });
+
+  it("returned lines are independent copies: later pushes cannot change them", () => {
+    const a = new LineAssembler(100);
+    a.push(B("one"));
+    const first = a.push(B("\n")).lines[0];
+    a.push(B("two"));
+    a.push(B("\n"));
+    expect(first.toString()).toBe("one");
+  });
+});
+
 describe("LineAssembler: cost", () => {
   it.each([7, 64, 100, 512])("MUTATION TARGET: one 1 MiB line with no newline fed in %i-byte chunks costs well under the 1.5 s the naive reader took", (size) => {
     const total = 1024 * 1024;

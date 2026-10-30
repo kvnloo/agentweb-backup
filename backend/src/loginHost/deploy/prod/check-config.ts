@@ -13,7 +13,7 @@
 import { readFileSync } from "fs";
 import { assertTrustedPath } from "../../host/binary";
 import { parseHostConfig } from "../../host/hostConfig";
-import { hostTrustedPaths } from "../../host/trustedPaths";
+import { assertCustomerCanUse, hostTrustedPaths } from "../../host/trustedPaths";
 
 /** Exported for tests. Returns the message of the first failure, or undefined. */
 export function checkConfig(configPath: string, args: string[]): string | undefined {
@@ -38,6 +38,17 @@ export function checkConfig(configPath: string, args: string[]): string | undefi
           assertTrustedPath(real, { expectedOwnerUid, ...(boundary ? { boundary } : {}) });
         } catch (e) {
           throw new Error(`${p} is not trusted: ${(e as Error).message.replace(real, p)}`);
+        }
+      }
+      // a customer uid must be able to run the node and read the shim it is given (what install-test-host.sh also checks for the test box)
+      for (const [p, need] of [[cfg.claude.nodePath, "execute"], [cfg.claude.relayShimPath, "read"]] as const) {
+        const map = maps.find(([from]) => p === from || p.startsWith(from + "/"));
+        if (!map) continue;
+        const real = map[1] + p.slice(map[0].length);
+        try {
+          assertCustomerCanUse(real, need, boundary || undefined);
+        } catch (e) {
+          throw new Error(`${p}: ${(e as Error).message.replace(real, p)}`);
         }
       }
     }

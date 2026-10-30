@@ -51,7 +51,8 @@ const schema = z
         leaseMs: z.number().int().min(1000).optional(),
         abortGraceMs: z.number().int().min(100).optional(),
         idleSessionMs: z.number().int().min(1000).optional(),
-        toolCallTimeoutMs: z.number().int().min(1000).optional(),
+        // at most 2^31-1 ms would overflow setTimeout; 1 h is the longest turn deadline anyway
+        toolCallTimeoutMs: z.number().int().min(1000).max(3_600_000).optional(),
         readyAttemptTtlMs: z.number().int().min(10_000).max(30 * 60 * 1000).optional(),
         adapterCallTimeoutMs: z.number().int().min(1000).optional(),
         portCallTimeoutMs: z.number().int().min(1000).optional(),
@@ -68,8 +69,8 @@ const schema = z
         turnWrapperPath: absPath.default("/opt/aw-login-host/claude-turn.sh"),
         /** ENG-2113 tool relay: the stdio MCP shim the CLI starts inside the unit, and the node binary that runs it (both root-controlled, trusted-path checked). */
         relayShimPath: absPath.default("/opt/aw-login-host/aw-relay-shim.js"),
-        /** MUST be a real path, not a symlink (assertTrustedPath refuses links): the prod template names /opt/aw-node/v<ver>/bin/node. The default only suits a host where /usr/bin/node is a real file. */
-        nodePath: absPath.default("/usr/bin/node"),
+        /** REQUIRED, and a REAL path, not a symlink (assertTrustedPath refuses links, so the host would not start and the unit would hit its start limit): the prod template names /opt/aw-node/v<ver>/bin/node. There is deliberately no default: /usr/bin/node is a symlink on the worker. */
+        nodePath: absPath,
         /** The Emma tool bridge's MCP endpoint as seen from a customer process. */
         bridgeUrl: z
           .string()

@@ -161,6 +161,42 @@ function stubbed(messageIdWaitMs = 100, answerThrows = false) {
 }
 const call = (over: Partial<RelayCall> = {}): RelayCall => ({ identity: { connectionId: "conn1", epoch: 3, turnId: "t1" }, operationId: "a".repeat(32), name: "search", args: { q: 1 }, bytes: 80, ...over });
 
+describe("which model message a relayed call is tied to (the stream announcements are only a hint)", () => {
+  async function tie(announce: Array<{ id: string; name?: string; input: unknown }>, args: Record<string, unknown>): Promise<string> {
+    const s = stubbed(150);
+    const session = await s.rig.adapter.openSession(s.rig.ctx, { connectionId: "conn1", epoch: 3 });
+    const events: ProviderEvent[] = [];
+    const turn = (async () => {
+      for await (const ev of session.turn({ turnId: "t1", prompt: "go", model: "sonnet", relay: { tools: [...TOOLS, { name: "other", description: "o", inputSchema: { type: "object", properties: {} } }], callTimeoutMs: () => 5000 } })) events.push(ev);
+    })();
+    await until(() => !!s.opts());
+    for (const an of announce) {
+      (session as unknown as { noteStreamUse(raw: Record<string, unknown>): void }).noteStreamUse({ type: "assistant", message: { id: an.id, content: [{ type: "tool_use", id: "tu-" + an.id, name: `mcp__emma__${an.name ?? "search"}`, input: an.input }] } });
+    }
+    s.opts().onCall(call({ args }));
+    await until(() => events.some((e) => e.type === "tool-call"));
+    const id = (events.find((e) => e.type === "tool-call") as Extract<ProviderEvent, { type: "tool-call" }>).messageId;
+    await session.close();
+    await turn.catch(() => undefined);
+    return id;
+  }
+
+  it("MUTATION TARGET: the announcement with the SAME input wins over another of the same tool", async () => {
+    expect(await tie([{ id: "mA", input: { q: 1 } }, { id: "mB", input: { q: 2 } }], { q: 2 })).toBe("mB");
+    expect(await tie([{ id: "mA", input: { q: 1 } }, { id: "mB", input: { q: 2 } }], { q: 1 })).toBe("mA");
+  });
+
+  it("MUTATION TARGET: when the inputs differ but exactly ONE announcement of that tool exists, it is used; with two or more it is NOT guessed (a unique id, so the backend never collapses two different calls)", async () => {
+    expect(await tie([{ id: "mOnly", input: { q: 1 } }], { q: "different" })).toBe("mOnly");
+    expect(await tie([{ id: "mA", input: { q: 1 } }, { id: "mB", input: { q: 2 } }], { q: 3 })).toMatch(/^unmatched-/);
+  });
+
+  it("MUTATION TARGET: an announcement of ANOTHER tool never matches, and an oversize announcement (not recorded) leaves the call unmatched", async () => {
+    expect(await tie([{ id: "mX", name: "other", input: { q: 1 } }], { q: 1 })).toMatch(/^unmatched-/);
+    expect(await tie([{ id: "mBig", input: { blob: "x".repeat(2 * 1024 * 1024) } }], { blob: "x" })).toMatch(/^unmatched-/);
+  });
+});
+
 describe("a failure while handling a call is contained: the call is answered with an internal error, the endpoint is closed, nothing is thrown", () => {
   async function run(inject: (o: RelayOpenOptions) => void) {
     const s = stubbed();
