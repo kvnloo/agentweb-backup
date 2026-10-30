@@ -201,7 +201,7 @@ async function processEnrollment(
   // A failed READ is not "no such lead": sending on with no lead would skip every per-lead check (do-not-contact, a Smartlead marker). It throws,
   // so the enrollment is neither sent nor advanced and is retried on the next pass. (A lead that is simply gone still reads as null.)
   let leadReadFailed = false;
-  const lead = await crmDb.getLeadById(enrollment.listId, enrollment.leadId).catch(() => { leadReadFailed = true; return null; });
+  const lead = await crmDb.getLeadById(enrollment.listId, enrollment.leadId, { consistentRead: true }).catch(() => { leadReadFailed = true; return null; });
   if (leadReadFailed) throw new Error(`Could not read lead ${enrollment.leadId} for enrollment ${enrollment.enrollmentId}; will retry`);
 
   // ENG-673: this send must not reach a contact that is gone or marked do-not-contact, whatever the sequence's exit settings say (a sequence saved
@@ -488,7 +488,7 @@ async function checkExitConditions(
     lead = await crmDb.getLeadById(enrollment.listId, enrollment.leadId).catch(() => null);
   }
 
-  // Check if lead has unsubscribed — always enforced (onUnsubscribe is always true)
+  // Check if lead has unsubscribed. (processEnrollment also checks right before the send, whatever this setting says.)
   if (exitConditions.onUnsubscribe && lead && isDoNotContact(lead)) {
     console.log(`[dripWorker] Enrollment ${enrollment.enrollmentId} exited: lead ${enrollment.leadEmail} has unsubscribed`);
     return 'unsubscribed';

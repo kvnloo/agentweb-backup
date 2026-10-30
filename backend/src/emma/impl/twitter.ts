@@ -480,8 +480,13 @@ async function _twitterOutreachImpl(userId: string, args: any): Promise<any> {
         // ENG-673: never DM a contact marked do-not-contact (the lead named by list_id/lead_id, or its address).
         {
           const guard = await import('../../services/contactGuard');
-          if ((await guard.leadIsBlocked([userId, ownerUserId], list_id, lead_id)) || (lead_email && (await guard.blockedRecipients([userId, ownerUserId], lead_email)).length > 0)) {
-            return { success: false, error: guard.blockedContactError, reason: 'do_not_contact' };
+          try {
+            if ((await guard.leadIsBlocked([userId, ownerUserId], list_id, lead_id)) || (lead_email && (await guard.blockedRecipients([userId, ownerUserId], lead_email)).length > 0)) {
+              return { success: false, error: guard.blockedContactError, reason: 'do_not_contact' };
+            }
+          } catch (e) {
+            console.error('[AgentMode] do-not-contact check failed, not sending:', e);
+            return { success: false, error: guard.unverifiedContactError, reason: 'do_not_contact_unverified' };
           }
         }
         const result = await twitterService.sendDm(ownerUserId, account_id, target, text);

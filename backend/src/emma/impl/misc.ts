@@ -1043,8 +1043,14 @@ export async function sendEmailFromConfiguredSender(
     const label = providerLabel(senderProvider);
 
     // ENG-673: this send names an address, not a lead, so a contact marked do-not-contact is looked up and refused here.
-    const { blockedRecipients, blockedMessage } = await import('../../services/contactGuard');
-    const blockedTo = await blockedRecipients([userId], to);
+    const { blockedRecipients, blockedMessage, unverifiedContactError } = await import('../../services/contactGuard');
+    let blockedTo: string[];
+    try {
+      blockedTo = await blockedRecipients([userId], to);
+    } catch (e) {
+      console.error('[Emma] do-not-contact check failed, not sending:', e);
+      return { success: false, reason: 'do_not_contact_unverified', code: 503, message: 'Could not check do-not-contact', error: unverifiedContactError };
+    }
     if (blockedTo.length > 0) {
       return { success: false, reason: 'do_not_contact', code: 409, message: 'Do not contact', error: blockedMessage(blockedTo) };
     }
