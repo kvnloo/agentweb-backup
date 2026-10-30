@@ -20,7 +20,7 @@
  */
 import { createHash } from "crypto";
 import { LogThrottle, approxJsonBytes } from "../../loginHost/relay/bounds";
-import { IMAGE_LIMITS, toolImage, type ToolDef, type ToolImage } from "../../loginHost/protocol";
+import { IMAGE_LIMITS, RELAY_RESULT_MAX_BYTES, toolImage, type ToolDef, type ToolImage } from "../../loginHost/protocol";
 import { toToolDef } from "./relayManifest";
 import { LoginHostError, ToolResultLostError, type LoginHostClient } from "./loginHostClient";
 import { ToolBridgeAuthError, stableStringify, type BridgeCallResult, type BridgeListedTool } from "./toolBridge";
@@ -47,8 +47,8 @@ export const UNLOADABLE_NOTE = "[Note: a tool that just became available could n
 export const REPLAY_NOTE = "This identical call already ran earlier in this turn, but its result could not be delivered then. It was NOT run again. Its original result follows.\n";
 
 /** Hard limits of what is sent to the worker for one result (the worker's own are in loginHost/protocol.ts; these stay inside them). Documented in docs/plan-route-tool-limits.md.
- * MAX_CONTENT_BYTES: UTF-8 BYTES of the text (the worker's caps are bytes: a multi-byte text must not slip past a character count). */
-const MAX_CONTENT_BYTES = 1_000_000;
+ * The text of a result is held to RELAY_RESULT_MAX_BYTES (loginHost/protocol.ts, prod parity with MAX_TOOL_CONTENT_SIZE = 300,000 characters in agentModeService.ts:375;
+ * here in UTF-8 BYTES, so a multi-byte text is cut earlier, never later). The CLI's own output limit is derived from the same constant (relayCliEnv). */
 /** UTF-8 bytes of the whole serialized turn.toolResult body; the worker's cap for that route is 8 MiB. */
 const MAX_BODY_BYTES = 7.5 * 1024 * 1024;
 const MAX_IN_FLIGHT = 16;
@@ -699,7 +699,8 @@ export class RelayToolDispatcher {
   /** The limits of what one answer may carry, in BYTES of the serialized body. The worker re-checks them; these keep a normal answer from being refused. */
   private bound(a: Answer): Answer {
     let content = a.content;
-    if (Buffer.byteLength(content, "utf8") > MAX_CONTENT_BYTES) content = `${truncateUtf8(content, MAX_CONTENT_BYTES)}${TRUNCATED_NOTE}`;
+    // The note is part of the budget: text + note never exceed RELAY_RESULT_MAX_BYTES (the CLI's limit is derived from it).
+    if (Buffer.byteLength(content, "utf8") > RELAY_RESULT_MAX_BYTES) content = `${truncateUtf8(content, RELAY_RESULT_MAX_BYTES - Buffer.byteLength(TRUNCATED_NOTE, "utf8"))}${TRUNCATED_NOTE}`;
     let images = a.images;
     let dropped = 0;
     const size = () => Buffer.byteLength(JSON.stringify({ content, images, tools: a.tools, operationId: "x".repeat(64), connectionId: "x".repeat(64), turnId: "x".repeat(64), epoch: 1e9, isError: true }), "utf8");

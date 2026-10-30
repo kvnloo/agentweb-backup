@@ -2,6 +2,7 @@
  * ENG-2113 tool relay, backend side: the out-of-band dispatcher against the REAL ToolBridge (only the executor and the worker client are fakes).
  * Each guard here has a mutation check recorded in dev/pending/eng-2113-relay-backend.md.
  */
+import { RELAY_RESULT_MAX_BYTES } from '../../../loginHost/protocol';
 import { IMAGE_LIMITS } from '../../../loginHost/protocol';
 import { LoginHostError, ToolResultLostError } from '../loginHostClient';
 import { HALTED_MESSAGE, ALREADY_RAN_MESSAGE, RAN_NOT_PREPARED_MESSAGE, RESULT_LOST_NOTE, ARGS_TOO_LARGE_MESSAGE, BAD_ARGS_MESSAGE, DELIVERY_FAILED_MESSAGE, NOT_IN_RUN_MESSAGE, REPLAY_NOTE, UNLOADABLE_NOTE, RelayToolDispatcher, SOFT_DEADLINE_MESSAGE, STOPPED_MESSAGE, type RelayCallEvent } from '../relayToolDispatcher';
@@ -1301,23 +1302,53 @@ describe('RelayToolDispatcher', () => {
       expect(t.posts.filter((p) => p.tools?.some((x: any) => x.name === 'shared_new'))).toHaveLength(1);
     });
 
-    it('limits are in BYTES: a multi-byte text is cut so the body never exceeds the worker cap', async () => {
-      const t = rig({ content: { search: 'é'.repeat(900_000) } }); // 900k characters, 1.8 MB
+    it('limits are in BYTES: a multi-byte text is cut at RELAY_RESULT_MAX_BYTES bytes (note included), whole characters only', async () => {
+      const t = rig({ content: { search: 'é'.repeat(400_000) } }); // 400k characters, 800 KB
       t.d.start(t.ev('op-1', 'search'));
       await t.d.settle(1_000);
-      expect(Buffer.byteLength(t.posts[0].content)).toBeLessThan(1_000_200);
+      expect(Buffer.byteLength(t.posts[0].content)).toBeLessThanOrEqual(RELAY_RESULT_MAX_BYTES);
       expect(t.posts[0].content).not.toContain('\ufffd');
-      const u = rig({ content: { search: '\u0001'.repeat(1_000_000) } }, ); // escapes to 6 bytes each in JSON
+      expect(t.posts[0].content).toMatch(/truncated/);
+      const u = rig({ content: { search: '\u0001'.repeat(1_000_000) } }); // escapes to 6 bytes each in JSON
       u.d.start(u.ev('op-1', 'search'));
       await u.d.settle(1_000);
       expect(Buffer.byteLength(JSON.stringify(u.posts[0]))).toBeLessThanOrEqual(7.5 * 1024 * 1024);
     });
 
+    it('the result cap IS the shared constant (prod parity: 300,000): a result of exactly that size is untouched, one byte more is cut with the note', async () => {
+      expect(RELAY_RESULT_MAX_BYTES).toBe(300_000);
+      const exact = rig({ content: { search: 'x'.repeat(RELAY_RESULT_MAX_BYTES) } });
+      exact.d.start(exact.ev('op-1', 'search'));
+      await exact.d.settle(1_000);
+      expect(exact.posts[0].content).toBe('x'.repeat(RELAY_RESULT_MAX_BYTES));
+      const over = rig({ content: { search: 'x'.repeat(RELAY_RESULT_MAX_BYTES + 1) } });
+      over.d.start(over.ev('op-1', 'search'));
+      await over.d.settle(1_000);
+      expect(Buffer.byteLength(over.posts[0].content)).toBe(RELAY_RESULT_MAX_BYTES);
+      expect(over.posts[0].content).toMatch(/\[truncated: the tool's output was longer than can be returned\]$/);
+    });
+
+    it.each([['CJK (3 bytes a character)', '漢'.repeat(300_000)], ['emoji (4 bytes, surrogate pairs)', '😀'.repeat(200_000)], ['mixed widths', 'a漢😀é'.repeat(100_000)]])(
+      'bytes, not characters: %s is cut at RELAY_RESULT_MAX_BYTES on a character boundary, the note kept',
+      async (_l, text) => {
+        const t = rig({ content: { search: text } });
+        t.d.start(t.ev('op-1', 'search'));
+        await t.d.settle(1_000);
+        const body: string = t.posts[0].content;
+        const bytes = Buffer.byteLength(body);
+        expect(bytes).toBeLessThanOrEqual(RELAY_RESULT_MAX_BYTES);
+        expect(bytes).toBeGreaterThan(RELAY_RESULT_MAX_BYTES - 8); // cut as late as a whole character allows
+        expect(body).not.toContain('\ufffd'); // no split code point
+        expect(Buffer.from(body, 'utf8').toString('utf8')).toBe(body); // valid UTF-8, no lone surrogate
+        expect(body).toMatch(/\[truncated: the tool's output was longer than can be returned\]$/);
+      },
+    );
+
     it('a very long result is truncated with a note; one the worker still finds too large is halved until it fits', async () => {
       const t = rig({ content: { search: 'x'.repeat(1_500_000) } });
       t.d.start(t.ev('op-1', 'search'));
       await t.d.settle(1_000);
-      expect(t.posts[0].content.length).toBeLessThan(1_000_200);
+      expect(t.posts[0].content.length).toBeLessThanOrEqual(RELAY_RESULT_MAX_BYTES);
       expect(t.posts[0].content).toMatch(/truncated/);
       const u = rig({ content: { search: 'y'.repeat(100_000) } });
       u.behaviour.next = [new LoginHostError('EINVALID', 'result_too_large')];

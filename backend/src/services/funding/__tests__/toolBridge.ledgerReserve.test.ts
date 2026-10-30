@@ -12,7 +12,7 @@ function rig(writeKb = 0) {
     isLive: async () => true,
     execute: async (_r: unknown, c: { name: string; args: Record<string, unknown> }): Promise<BridgeExecuteOutcome> => {
       executed.push(c.name);
-      return { content: c.name === 'send_email' && writeKb ? 'w'.repeat(writeKb * 1024) : `${c.name} ok`, isError: false, requiresConfirmation: false, toolsChanged: false };
+      return { content: c.name === 'send_email' && writeKb ? 'w'.repeat(writeKb * 1024) : `${c.name} ok`, isError: false, requiresConfirmation: false, toolsChanged: false, ...(c.name === 'read_it' ? { result: { rows: 'r'.repeat(6 * 1024) } } : {}) };
     },
   };
   const bridge = new ToolBridge(deps as unknown as ToolBridgeDeps);
@@ -118,5 +118,38 @@ describe('ledger: an executed write always leaves a record (SF4)', () => {
     const { records, truncated } = t.bridge.takeLedger('r1');
     expect(records.some((r) => r.toolCallId === 'w9999' && r.kind === 'executed')).toBe(true);
     expect(truncated).toBeGreaterThan(0);
+  });
+});
+
+describe('ledger: stubs, shrunk results and the bridge\'s own record of what ran', () => {
+  it('SF4: when even the overflow is spent (400 writes with 20 KB inputs) a later executed write keeps a STUB record: id, name, kind, marker input, short text', async () => {
+    const t = rig();
+    for (let i = 0; i < 390; i++) await t.writeWith(i, 20);
+    await t.writeWith(9999, 20);
+    const rec = t.bridge.takeLedger('r1').records.find((r) => r.toolCallId === 'w9999')!;
+    expect(rec).toMatchObject({ name: 'send_email', kind: 'executed', args: { _truncated: 'input not kept' } });
+    expect(rec.toolMessageContent.length).toBeLessThan(700);
+    expect(rec.result).toBeUndefined();
+  });
+
+  it('a read shrunk under pressure also loses its raw result (the size count includes it)', async () => {
+    const t = rig();
+    for (let i = 0; i < 300; i++) await t.read(i, 12); // 12 KB input + 6 KB raw result each: over the budget
+    const records = t.bridge.takeLedger('r1').records;
+    expect(records[0].args).toEqual({ _truncated: 'input not kept' });
+    expect(records[0].result).toBeUndefined();
+    expect(records[records.length - 1].result).toBeDefined(); // the newest stay whole
+  });
+
+  it('ranCall: true for a call that ran, false for one the bridge refused, and independent of the record being cut', async () => {
+    const t = rig();
+    await t.read(1, 1);
+    await t.bridge.callTool(t.token, { name: 'nope_not_a_tool', args: {}, callId: 'ref1' }).catch(() => undefined);
+    expect(t.bridge.ranCall('r1', 'r1')).toBe(true);
+    expect(t.bridge.ranCall('r1', 'ref1')).toBe(false);
+    expect(t.bridge.ranCall('r1', 'never-seen')).toBe(false);
+    for (let i = 0; i < 390; i++) await t.writeWith(i, 20);
+    await t.writeWith(9999, 20);
+    expect(t.bridge.ranCall('r1', 'w9999')).toBe(true);
   });
 });

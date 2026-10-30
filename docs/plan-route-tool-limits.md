@@ -55,11 +55,21 @@ The log line is `relay_manifest_cut` (open set) or `new_tool_unloadable` / `new_
 
 | Limit | Value | Constant and file |
 |---|---|---|
-| Text sent to the model | 1,000,000 bytes, then cut with a note | `MAX_CONTENT_BYTES`, `relayToolDispatcher.ts` |
+| Text sent to the model | 300,000 bytes (note included), then cut with a note. Same cap as in-process Emma (300,000 characters; bytes here, so non-ASCII text is cut earlier, never later) | `RELAY_RESULT_MAX_BYTES`, `backend/src/loginHost/protocol.ts`; applied in `bound()`, `relayToolDispatcher.ts` |
 | Images | 4 images of `image/png`, `jpeg`, `webp` or `gif`; 2,500,000 base64 characters each and 6,000,000 in all | `IMAGE_LIMITS`, `toolImage`, `protocol.ts` |
 | Text saved in the chat's tool record | 64 KiB | `MAX_RECORD_CONTENT_BYTES`, `backend/src/services/funding/toolBridge.ts` |
 
 A result over a limit is never an error: the text is cut, or the extra images are dropped, and the text says so. The tool has already run.
+
+**Parity with in-process Emma (verified in the code).** A relay call runs through the same `toolDispatch` as Emma's own loop (`emmaToolBridgeExecutor.ts` passes it the same two limits), so a result is cut by Emma's rules first and only then by the relay's:
+
+| Step | Limit | Where |
+|---|---|---|
+| A result over 8,000 characters is uploaded in full (the model can fetch it with `search_tool_response`) and the model gets a header plus the first 20,000 characters | `TOOL_RESPONSE_S3_THRESHOLD` = `CONTEXT_TRIM_TOOL_CONTENT_LIMIT` = 8,000 (`agentModeService.ts:379`, `:416`); the preview cap `S3_IN_MEMORY_CAP` = 20,000 (`agentMode/core/toolDispatch.ts:1532`); the check is at `toolDispatch.ts:1533` | in-process and relay |
+| If that upload fails twice, the whole text is kept for this turn, up to 300,000 characters, and cut with a "Content truncated for storage" notice beyond | `MAX_TOOL_CONTENT_SIZE` = 300,000 (`agentModeService.ts:375`), applied at `toolDispatch.ts:1583-1585` | in-process and relay |
+| The relay's own cap on what it posts to the worker | `RELAY_RESULT_MAX_BYTES` = 300,000 bytes | relay only; it can only bite on text that Emma's rules left whole (non-ASCII, or the upload-failed case) |
+
+The relay cap is deliberately NOT larger than Emma's: a result of 1,000,000 bytes is about 250,000 tokens and fails the whole turn when it does not fit the model's context.
 
 ## What the Claude CLI does on top of these limits
 
@@ -68,10 +78,10 @@ The limits above are ours. The CLI that talks to the model has its own, and they
 | CLI behaviour | CLI default | What the host sets for a relay turn | Value today |
 |---|---|---|---|
 | Shortens an MCP tool description (`CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH`) | 4,096 characters, with an ellipsis | `TOOL_LIMITS.maxDescriptionBytes`, the longest description the host accepts anyway | 49,152 |
-| Truncates an MCP tool's output (`MAX_MCP_OUTPUT_TOKENS`) | 25,000 tokens (about 100 KB) | half of `RELAY_FRAME_LIMITS.hostToShimBytes` (two bytes a token, the host's 8 MiB result frame) plus `IMAGE_LIMITS.maxImages` times 1,600 tokens for images | 4,200,704 |
+| Truncates an MCP tool's output (`MAX_MCP_OUTPUT_TOKENS`) | 25,000 tokens (about 100 KB) | half of `RELAY_RESULT_MAX_BYTES` (two bytes a token) plus `IMAGE_LIMITS.maxImages` times 1,600 tokens for images. Not the 8 MiB frame cap: that would remove the CLI's protection of the model's context | 156,400 (= 150,000 + 4 x 1,600) |
 | Ends a stdio tool call (`MCP_TOOL_TIMEOUT`, milliseconds) | the CLI's own | the turn's remaining deadline, at least 1,000 and at most 2^31-1, so the host's clock is the one that ends a call | per turn |
 
-A turn on the legacy HTTP bridge sets none of them and keeps the CLI's defaults. In practice the backend cuts a result's text at `MAX_CONTENT_BYTES` (1,000,000 bytes) long before the output limit, and refuses a description over 48 KiB at the manifest, so the CLI's own cuts should never be the ones that apply on the plan route.
+A turn on the legacy HTTP bridge sets none of them and keeps the CLI's defaults. The backend cuts a result's text at `RELAY_RESULT_MAX_BYTES` (300,000 bytes, about 150,000 tokens at two bytes a token), which is exactly what the CLI's output limit is derived from, so the CLI's own cut should never be the one that applies; and it refuses a description over 48 KiB at the manifest, so the CLI's own cuts should never be the ones that apply on the plan route.
 
 **Verified live: NO.** The values above are read from the code. The live cases that show a long description, a long result and a long tool call arriving whole through the real CLI on the test worker (C15, C16, C17) have not run yet. Change this line only when they have. Until then, write descriptions that carry the key rule in their first 4,000 characters, and results whose important part comes first.
 
@@ -94,3 +104,7 @@ These are only caught at run time, by the stops and notes above:
 - **Per-user MCP tools.** A user's own connected tool can have any name, schema or size, and a user can connect any number of them.
 - **Admin changes to the foundation set** (`PUT /api/agent-mode/foundation-tools`). The test uses the default set in the code, so an override that grows the open set is not checked. The whole-registry case still bounds it for tools in the registry.
 - **Call inputs and results.** Their size depends on the data, so no test of the registry can see them.
+
+## Security: what stays open
+
+**A confirmation can be replayed by a compromised worker (design residual R1).** A halt (a tool that needs the user's confirmation) is lifted by any new user turn, and the confirmation token sits in the persisted preview. A compromised login worker could confirm a previously previewed write on a later turn, whatever the user typed. Only approval cards that bind a confirmation to a user action close this. Until they ship, the plan route stays allow-listed to one internal user, and after the first confirmation-needed call the turn runs no further tools.

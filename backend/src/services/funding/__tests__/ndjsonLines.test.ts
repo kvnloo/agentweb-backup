@@ -90,4 +90,9 @@ describe('LineSplitter: discarding an over-cap line of a skippable type', () => 
     const sp = new LineSplitter(10_000, () => new Error('too long'), () => 100, () => true);
     expect(() => feed(sp, '{"type":"big","pad":"' + 'p'.repeat(50_000), 1_000)).toThrow('too long');
   });
+  it('the total of a discarded line is counted up to and including its last piece (the closing piece cannot take it past the hard cap unnoticed)', () => {
+    const sp = new LineSplitter(10_000, () => new Error('too long'), () => 100, () => true);
+    sp.push(Buffer.from('{"type":"big","pad":"' + 'p'.repeat(4_000))); // over the small cap: now being discarded, 4 KB so far
+    expect(() => sp.push(Buffer.from('q'.repeat(7_000) + '"}\n'))).toThrow('too long'); // the piece that ends the line brings it over 10 KB
+  });
 });
