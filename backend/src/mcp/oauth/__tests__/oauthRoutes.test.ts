@@ -123,7 +123,7 @@ describe('MCP OAuth Routes', () => {
       expect(res.body.response_types_supported).toEqual(['code']);
       expect(res.body.grant_types_supported).toEqual(['authorization_code', 'refresh_token']);
       expect(res.body.code_challenge_methods_supported).toEqual(['S256']);
-      expect(res.body.scopes_supported).toEqual(['mcp:tools']);
+      expect(res.body.scopes_supported).toEqual(['mcp:tools', 'email:read']);
       expect(res.headers['cache-control']).toBe('public, max-age=3600');
     });
 
@@ -148,7 +148,7 @@ describe('MCP OAuth Routes', () => {
 
       expect(res.body.resource).toBe('https://api.agentweb.pro/api/meta-toolkit/mcp');
       expect(res.body.authorization_servers).toEqual(['https://api.agentweb.pro']);
-      expect(res.body.scopes_supported).toEqual(['mcp:tools']);
+      expect(res.body.scopes_supported).toEqual(['mcp:tools', 'email:read']);
       expect(res.body.resource_documentation).toBe('https://api.agentweb.pro/api/meta-toolkit/skill.md');
     });
 
@@ -164,7 +164,7 @@ describe('MCP OAuth Routes', () => {
         resource: 'https://api.agentweb.pro/mcp',
         authorization_servers: ['https://api.agentweb.pro'],
         bearer_methods_supported: ['header'],
-        scopes_supported: ['mcp:tools'],
+        scopes_supported: ['mcp:tools', 'email:read'],
         resource_documentation: 'https://api.agentweb.pro/skill.md',
       });
       expect(res.headers['cache-control']).toBe('public, max-age=3600');
@@ -438,6 +438,34 @@ describe('MCP OAuth Routes', () => {
       expect(mockCreateAuthorizationCode).not.toHaveBeenCalledWith(
         expect.objectContaining({ userId: 'dev-user' })
       );
+    });
+
+    it('never skips consent for email:read, even with the skip-consent flag and an authenticated caller', async () => {
+      process.env.MCP_OAUTH_SKIP_CONSENT = 'true';
+      mockGetClient.mockResolvedValue({
+        clientId: 'client-123',
+        clientName: 'Test Client',
+        redirectUris: ['https://example.com/callback'],
+      });
+      mockGetUserFromToken.mockResolvedValue({
+        user: { userId: 'real-user-42', email: 'u@example.com', isAdmin: false },
+      });
+
+      const res = await request(app)
+        .get('/oauth/authorize')
+        .set('Authorization', 'Bearer valid-jwt')
+        .query({
+          response_type: 'code',
+          client_id: 'client-123',
+          redirect_uri: 'https://example.com/callback',
+          scope: 'mcp:tools email:read',
+          code_challenge: 'challenge',
+          code_challenge_method: 'S256',
+        })
+        .expect(302);
+
+      expect(res.headers.location).toContain('https://app.agentweb.pro/oauth/authorize');
+      expect(mockCreateAuthorizationCode).not.toHaveBeenCalled();
     });
   });
 

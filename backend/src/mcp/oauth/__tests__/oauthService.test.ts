@@ -191,7 +191,7 @@ describe('McpOAuthService', () => {
         clientId: 'client-123',
         userId: 'user-456',
         redirectUri: 'https://example.com/cb',
-        scope: 'mcp:tools',
+        scopes: ['mcp:tools'],
         codeChallenge: 'test-challenge',
         codeChallengeMethod: 'S256',
       });
@@ -283,7 +283,7 @@ describe('McpOAuthService', () => {
       const result = await service.createTokenPair({
         clientId: 'client-123',
         userId: 'user-456',
-        scope: 'mcp:tools',
+        scopes: ['mcp:tools'],
       });
 
       expect(result.accessToken).toBeDefined();

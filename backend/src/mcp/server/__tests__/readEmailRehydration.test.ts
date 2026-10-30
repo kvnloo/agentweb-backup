@@ -47,6 +47,7 @@ function factory(seen: McpSessionContext[]) {
           isInternal: sc.isInternal,
           authMethod: sc.authMethod,
           apiKeyId: sc.apiKeyId,
+          oauthScopes: sc.oauthScopes,
           externalMcp: sc.isInternal !== true,
         });
       } catch (e: any) {
@@ -98,14 +99,32 @@ it('rehydrated api_key session can call read_email (auth method from the current
   }));
 });
 
-it('rehydrated OAuth session is still refused read_email', async () => {
-  const req = { headers: { 'mcp-protocol-version': '2025-06-18' }, _mcpAuthMethod: 'oauth' } as any;
+it('rehydrated OAuth session without the email:read grant is refused read_email', async () => {
+  const req = { headers: { 'mcp-protocol-version': '2025-06-18' }, _mcpAuthMethod: 'oauth', _mcpOAuthScopes: ['mcp:tools'] } as any;
   const res = makeRes();
 
   await rehydrateAndServe(req, res as any, SID, record, callBody, factory([]) as any);
 
   const parsed = JSON.parse(res.body);
   expect(parsed.result.isError).toBe(true);
-  expect(parsed.result.content[0].text).toMatch(/only available to API keys/);
+  expect(parsed.result.content[0].text).toMatch(/only available to API keys or OAuth sign-ins granted 'email:read'/);
   expect(mockMcpFetch).not.toHaveBeenCalled();
+});
+
+it('rehydrated OAuth session granted email:read can call read_email (scopes from the current request)', async () => {
+  const seen: McpSessionContext[] = [];
+  const req = {
+    headers: { 'mcp-protocol-version': '2025-06-18' },
+    _mcpAuthMethod: 'oauth',
+    _mcpOAuthScopes: ['mcp:tools', 'email:read'],
+  } as any;
+  const res = makeRes();
+
+  await rehydrateAndServe(req, res as any, SID, record, callBody, factory(seen) as any);
+
+  expect(seen[0]).toMatchObject({ authMethod: 'oauth', oauthScopes: ['mcp:tools', 'email:read'] });
+  expect(JSON.parse(res.body).result.isError).toBeFalsy();
+  expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
+    body: expect.objectContaining({ own_mailbox_only: true }),
+  }));
 });

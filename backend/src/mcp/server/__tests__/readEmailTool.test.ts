@@ -13,14 +13,16 @@ jest.mock('../../../services/funding/runFunding', () => ({
 }));
 
 import { mcpToolRegistry } from '../registry';
-import { DEFAULT_API_KEY_SCOPES, findApiKeyOnlyToolCall, findScopeDenial } from '../apiKeyScopes';
+import { DEFAULT_API_KEY_SCOPES, findOptInScopeDenial, findScopeDenial } from '../apiKeyScopes';
 import { READ_EMAIL_RATE_LIMIT, resetReadEmailRateLimit } from '../readEmailTool';
 
 const lookup = (name: string) => mcpToolRegistry.getTool(name);
 const call = (name: string) => ({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: {} } });
 
 const API_KEY_CTX = { userId: 'user-1', externalMcp: true, isInternal: false, authMethod: 'api_key', apiKeyId: 'k1' };
-const OAUTH_CTX = { userId: 'user-1', externalMcp: true, isInternal: false, authMethod: 'oauth', oauthClientId: 'c1' };
+const OAUTH_CTX = { userId: 'user-1', externalMcp: true, isInternal: false, authMethod: 'oauth', oauthClientId: 'c1', oauthScopes: ['mcp:tools'] };
+const OAUTH_EMAIL_CTX = { ...OAUTH_CTX, oauthScopes: ['mcp:tools', 'email:read'] };
+const ANON_CTX = { userId: 'anon_x', externalMcp: true, isInternal: false, authMethod: 'anonymous' };
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -52,17 +54,62 @@ describe('read_email scope gate', () => {
     expect(findScopeDenial(call('send_email'), ['email:read'], lookup)).toMatchObject({ requiredScope: 'tools:execute' });
   });
 
-  it('flags read_email for non-API-key auth at the HTTP layer', () => {
-    expect(findApiKeyOnlyToolCall(call('read_email'), lookup)).toMatchObject({ tool: 'read_email' });
-    expect(findApiKeyOnlyToolCall(call('send_email'), lookup)).toBeNull();
+  it('HTTP layer: non-API-key callers need the opt-in scope granted (OAuth consent)', () => {
+    // Anonymous (no grant) and OAuth without email:read are refused.
+    expect(findOptInScopeDenial(call('read_email'), [], lookup)).toMatchObject({ tool: 'read_email', requiredScope: 'email:read' });
+    expect(findOptInScopeDenial(call('read_email'), ['mcp:tools'], lookup)).toMatchObject({ requiredScope: 'email:read' });
+    // OAuth with email:read passes; ordinary tools are never affected.
+    expect(findOptInScopeDenial(call('read_email'), ['mcp:tools', 'email:read'], lookup)).toBeNull();
+    expect(findOptInScopeDenial(call('send_email'), [], lookup)).toBeNull();
+    // A batch is refused if any entry needs a scope the caller lacks.
+    expect(findOptInScopeDenial([call('send_email'), call('read_email')], ['mcp:tools'], lookup)).toMatchObject({ tool: 'read_email' });
   });
 });
 
 describe('read_email execution', () => {
-  it('refuses OAuth external callers outright, before any fetch', async () => {
+  it('refuses an OAuth caller without the email:read grant, before any fetch', async () => {
     await expect(mcpToolRegistry.execute('read_email', { account_id: 'a', action: 'list' }, OAUTH_CTX))
-      .rejects.toThrow(/only available to API keys/);
+      .rejects.toThrow(/only available to API keys or OAuth sign-ins granted 'email:read'/);
     expect(mockMcpFetch).not.toHaveBeenCalled();
+  });
+
+  it('fails closed for an OAuth caller whose context carries no scopes at all', async () => {
+    const { oauthScopes: _omit, ...noScopes } = OAUTH_EMAIL_CTX;
+    await expect(mcpToolRegistry.execute('read_email', { account_id: 'a', action: 'list' }, noScopes))
+      .rejects.toThrow(/email:read/);
+    expect(mockMcpFetch).not.toHaveBeenCalled();
+  });
+
+  it('refuses anonymous callers, before any fetch', async () => {
+    await expect(mcpToolRegistry.execute('read_email', { account_id: 'a', action: 'list' }, { ...ANON_CTX, oauthScopes: ['email:read'] }))
+      .rejects.toThrow(/email:read/);
+    expect(mockMcpFetch).not.toHaveBeenCalled();
+  });
+
+  it('lets an OAuth caller granted email:read read its own mailbox, with every external limit applied', async () => {
+    const info = jest.spyOn(console, 'info').mockImplementation(() => {});
+    await mcpToolRegistry.execute('read_email', { account_id: 'a', action: 'list', to: 'x@y.com' }, OAUTH_EMAIL_CTX);
+    expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
+      path: '/api/emma/email',
+      body: { account_id: 'a', action: 'list', folder: undefined, own_mailbox_only: true },
+    }));
+    // Read actions only, for OAuth too.
+    await expect(mcpToolRegistry.execute('read_email', { account_id: 'a', action: 'send' }, OAUTH_EMAIL_CTX)).rejects.toThrow(/not allowed/);
+    // Audit records the auth method and OAuth client, never content.
+    const lines = info.mock.calls.map((c) => String(c[0])).filter((s) => s.includes('mcp_read_email')).map((s) => JSON.parse(s));
+    expect(lines[0]).toMatchObject({ outcome: 'ok', userId: 'user-1', authMethod: 'oauth', oauthClientId: 'c1', action: 'list' });
+    expect(lines[1]).toMatchObject({ outcome: 'refused', authMethod: 'oauth', action: 'send' });
+    expect(JSON.stringify(lines)).not.toContain('secret subject');
+    info.mockRestore();
+  });
+
+  it('rate-limits OAuth callers in the same per-user window as API keys', async () => {
+    jest.spyOn(console, 'info').mockImplementation(() => {});
+    for (let i = 0; i < READ_EMAIL_RATE_LIMIT; i++) {
+      await mcpToolRegistry.execute('read_email', { account_id: 'a', action: 'list' }, i % 2 ? OAUTH_EMAIL_CTX : API_KEY_CTX);
+    }
+    await expect(mcpToolRegistry.execute('read_email', { account_id: 'a', action: 'list' }, OAUTH_EMAIL_CTX))
+      .rejects.toThrow(/rate limit/);
   });
 
   it('refuses action send (and any non-read action) before fetching', async () => {
@@ -136,7 +183,7 @@ describe('read_email execution', () => {
 
     const lines = info.mock.calls.map((c) => String(c[0])).filter((s) => s.includes('mcp_read_email')).map((s) => JSON.parse(s));
     expect(lines).toEqual([
-      expect.objectContaining({ event: 'mcp_read_email', outcome: 'refused', userId: 'user-1', apiKeyId: 'k1', action: 'send' }),
+      expect.objectContaining({ event: 'mcp_read_email', outcome: 'refused', userId: 'user-1', authMethod: 'api_key', apiKeyId: 'k1', action: 'send' }),
       expect.objectContaining({ event: 'mcp_read_email', outcome: 'error', userId: 'user-1', apiKeyId: 'k1', action: 'list', error: 'upstream 500' }),
     ]);
     info.mockRestore();

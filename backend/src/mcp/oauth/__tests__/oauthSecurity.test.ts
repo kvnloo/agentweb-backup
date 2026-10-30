@@ -21,15 +21,15 @@ beforeEach(async () => {
   jest.clearAllMocks(); mockDb.rows.clear(); mockDb.beforeWrite = undefined; mockDb.queryItems = undefined;
   client = await service.registerClient({ clientName: 'native', redirectUris: [redirect] });
 });
-async function code() {
+async function code(scopes: string[] = ['mcp:tools']) {
   return (await service.createAuthorizationCode({ clientId: client.clientId, userId: 'user', redirectUri: redirect,
-    scope: 'mcp:tools', codeChallenge: crypto.createHash('sha256').update(verifier).digest('base64url'), codeChallengeMethod: 'S256' })).code;
+    scopes, codeChallenge: crypto.createHash('sha256').update(verifier).digest('base64url'), codeChallengeMethod: 'S256' })).code;
 }
 function exchange(c: string, extras: any = {}) {
   return request(app).post('/oauth/token').send({ grant_type: 'authorization_code', code: c,
     client_id: client.clientId, redirect_uri: redirect, code_verifier: verifier, ...extras });
 }
-async function pair() { return service.createTokenPair({ clientId: client.clientId, userId: 'user', scope: 'mcp:tools' }); }
+async function pair(scopes: string[] = ['mcp:tools']) { return service.createTokenPair({ clientId: client.clientId, userId: 'user', scopes }); }
 function refresh(token: string, extras: any = {}) {
   return request(app).post('/oauth/token').send({ grant_type: 'refresh_token', refresh_token: token, client_id: client.clientId, ...extras });
 }
