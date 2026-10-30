@@ -15,7 +15,7 @@ import { userDb, orgDb, crmDb } from '../services/db';
 import { can } from "../services/orgAuthz";
 import { assertOwnedMetaPixel } from '../services/metaAccountCredentials';
 import { DEFAULT_DAILY_INVITE_CAP } from '../services/linkedInWritePacer';
-import { startSmartleadEventCleanup } from '../services/smartleadEventCleanup';
+import { prepareSmartleadEventCleanup } from '../services/smartleadEventCleanup';
 import { cronJobRegistry } from '../utils/cronJobRegistry';
 
 /**
@@ -499,10 +499,11 @@ router.delete('/connected-accounts/:platform', authenticateToken, async (req: an
       await Promise.all(calendlyAccounts.map((acc) => cleanupCalendlyWebhook(userId, acc)));
     }
 
-    // ENG-673: take AgentWeb's event webhook off the customer's Smartlead campaigns while the key still works. Best effort, never blocks the removal.
-    if (platform === 'smartlead') void cronJobRegistry.track('SmartleadEventCleanup', (await startSmartleadEventCleanup(userId, `smartlead-${userId}`)).done);
+    // ENG-673: take AgentWeb's event webhook off the customer's Smartlead campaigns, with the key found while it is still stored. Best effort, never blocks the removal.
+    const smartleadCleanup = platform === 'smartlead' ? await prepareSmartleadEventCleanup(userId, `smartlead-${userId}`) : null;
 
     await deleteAccount(userId, platform);
+    if (smartleadCleanup) void cronJobRegistry.track('SmartleadEventCleanup', smartleadCleanup.run());
     res.json({ success: true, message: `${platform} account(s) disconnected` });
   } catch (error) {
     console.error('Delete Account Error:', error);
@@ -539,9 +540,10 @@ router.delete('/connected-accounts/:platform/:accountId', authenticateToken, asy
 
     // ENG-673: only the caller's OWN Smartlead connection (id smartlead-<userId>): an admin whose delete of a teammate's id removes nothing must not
     // strip that teammate's webhooks. Best effort, never blocks the removal.
-    if (platform === 'smartlead' && accountId === `smartlead-${userId}`) void cronJobRegistry.track('SmartleadEventCleanup', (await startSmartleadEventCleanup(userId, accountId)).done);
+    const smartleadCleanup = platform === 'smartlead' && accountId === `smartlead-${userId}` ? await prepareSmartleadEventCleanup(userId, accountId) : null;
 
     await deleteAccountById(userId, platform, accountId);
+    if (smartleadCleanup) void cronJobRegistry.track('SmartleadEventCleanup', smartleadCleanup.run());
     res.json({ success: true, message: `${platform} account ${accountId} disconnected` });
   } catch (error) {
     console.error('Delete Account By ID Error:', error);

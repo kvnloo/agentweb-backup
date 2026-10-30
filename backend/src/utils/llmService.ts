@@ -32,6 +32,12 @@ export interface LLMServiceOptions {
   streaming?: boolean;
   /** Product task class for independent gateway canary and rollback. */
   taskClass?: GatewayTaskClass;
+  /** Models OpenRouter tries, in order, if the primary model fails. */
+  fallbackModels?: string[];
+  /** Providers OpenRouter must skip on web-search calls (ENG-2720: Azure errors on the search tool). */
+  providerIgnoreForWebSearch?: string[];
+  /** Retry a 200 with no answer instead of returning an empty string (ENG-2720). */
+  requireContent?: boolean;
 }
 
 type InvokeResponse = {
@@ -64,6 +70,9 @@ export class LLMService {
   private readonly maxTokens?: number;
   private readonly longRunning: boolean;
   private readonly taskClass: GatewayTaskClass;
+  private readonly fallbackModels?: string[];
+  private readonly providerIgnoreForWebSearch?: string[];
+  private readonly requireContent: boolean;
 
   constructor(
     modelName?: string,
@@ -81,6 +90,9 @@ export class LLMService {
     this.maxTokens = maxTokens;
     this.longRunning = options.streaming === true;
     this.taskClass = options.taskClass || 'nonstandard_consumer';
+    this.fallbackModels = options.fallbackModels;
+    this.providerIgnoreForWebSearch = options.providerIgnoreForWebSearch;
+    this.requireContent = options.requireContent === true;
     this.gatewayAdapter = { invoke: (messages) => this.invokeGateway(messages) };
     this.chatModel = this.gatewayAdapter;
   }
@@ -104,6 +116,9 @@ export class LLMService {
       webSearch: requestOptions.webSearch,
       usageContext: usageContext || { feature: 'unknown' },
       taskClass: this.taskClass,
+      ...(this.fallbackModels?.length ? { fallbackModels: this.fallbackModels } : {}),
+      ...(requestOptions.webSearch && this.providerIgnoreForWebSearch?.length ? { providerIgnore: this.providerIgnoreForWebSearch } : {}),
+      ...(this.requireContent ? { requireContent: true } : {}),
     });
     const usage: any = response?.usage;
     const hasUsage = !!usage && typeof usage === 'object';
