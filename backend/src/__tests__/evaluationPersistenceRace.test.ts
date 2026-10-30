@@ -41,7 +41,7 @@ import { scheduleDb as chatScheduleDb, scheduleTemplateDb } from '../services/db
 import { recordMcpConnectionAttempt, recordMcpOAuthAuthorized, recordMcpOAuthTokenIssued } from '../services/mcpUsageEventsService';
 import { getSandboxOverlayStore } from '../services/sandbox/sandboxOverlayStore';
 
-const auth = { userId: USER, clientId: 'client', scope: 'mcp', redirectUri: 'https://example.invalid', codeChallenge: crypto.createHash('sha256').update('verifier').digest('base64url'), codeChallengeMethod: 'S256' };
+const auth = { userId: USER, clientId: 'client', scope: 'mcp:tools', scopes: ['mcp:tools'], redirectUri: 'https://example.invalid', codeChallenge: crypto.createHash('sha256').update('verifier').digest('base64url'), codeChallengeMethod: 'S256' };
 const schedule = { userId: USER, scheduleId: 'schedule', taskId: 'task', frequency: 'daily', status: 'active', nextRunTime: '2026-09-14', createdAt: '2026-09-13', updatedAt: '2026-09-13' };
 const paths: [string, () => Promise<unknown>][] = [
   ['API key', () => new AgentApiKeyService().generateKey(USER, 'race')],
