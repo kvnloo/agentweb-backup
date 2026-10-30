@@ -216,12 +216,17 @@ export class RelayToolDispatcher {
   /** Operations whose answer the worker ACCEPTED (the model read it). Every other executed call of the turn is "result lost". */
   private readonly delivered = new Set<string>();
   private defsLock: Promise<void> = Promise.resolve();
-  /** The id the BRIDGE (and so the persisted chat and the replay logic) knows a call by: made here, never the worker's operation id (a compromised worker picks that). */
+  /**
+   * The id the BRIDGE (and so the persisted chat and the replay logic) knows a call by: made here, never the worker's operation id (a compromised worker picks
+   * that). `tc_<12 hex of a hash of the run id>_<n>`: at most 24 characters, only [A-Za-z0-9_], unique across the turns of a session (every turn has its own run id).
+   */
   private readonly callIds = new Map<string, string>();
+  private idPrefix: string | undefined;
   private cid(op: string): string {
     let id = this.callIds.get(op);
     if (id === undefined) {
-      id = `${this.o.runId}:${this.callIds.size + 1}`;
+      this.idPrefix ??= `tc_${createHash("sha256").update(this.o.runId).digest("hex").slice(0, 12)}_`;
+      id = `${this.idPrefix}${this.callIds.size + 1}`;
       this.callIds.set(op, id);
     }
     return id;
@@ -511,11 +516,12 @@ export class RelayToolDispatcher {
     // ONLY if it matches an announcement of THAT message recorded BEFORE the halted answer went back: the batched confirmation AgentWeb gives (one deck
     // for "pause these 5 ad sets"). Anything else, whatever message id the worker sends, starts a new group and the bridge refuses it. A forged follow-up
     // cannot match: the stream announced the message before the answer existed (a confirm needs the approval token that only the answer carries).
-    // S9 (the default): after a halt NOTHING else runs, so no call shares a group with another (every call is `call-<op>`; there is no batch to join) and the
-    // calls are executed ONE AT A TIME, the halt check made again when a call's turn comes: calls that arrive in the same tick would otherwise all pass the
-    // check before the first one (the confirm-needed one) has halted. The shim already serializes parallel reads (S4), so this costs nothing real.
+    // S9 (the default): after a halt NOTHING else runs. The calls are executed ONE AT A TIME, the halt check made again when a call's turn comes: calls that
+    // arrive in the same tick would otherwise all pass the check before the first one (the confirm-needed one) has halted. The shim already serializes parallel
+    // reads (S4), so this costs nothing real. The stream announcement is still matched, but in this mode ONLY so the bridge can collapse an identical call of the
+    // same model message (as Emma does): after a halt no call is announced to the bridge at all, so a group can never be used to admit one.
     const strict = this.o.admitPostHaltSiblings !== true;
-    const ann = strict ? undefined : await this.claimOrWait(name, argsKey);
+    const ann = await this.claimOrWait(name, argsKey);
     if (this.o.isStopped()) return refuse(STOPPED_MESSAGE);
     const release = strict ? await this.acquireExec() : undefined;
     let result: BridgeCallResult;

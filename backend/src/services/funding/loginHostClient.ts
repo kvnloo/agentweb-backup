@@ -145,6 +145,38 @@ function hasSecondTypeKey(line: Buffer): boolean {
   const first = line.indexOf(TYPE_KEY);
   return first >= 0 && line.indexOf(TYPE_KEY, first + TYPE_KEY.length) >= 0;
 }
+/** The most strings (keys and string values) a flat text/result line has outside its payload: honest ones have 4 to 8. */
+const MAX_FLAT_STRINGS = 16;
+/**
+ * True when a big `text`/`result` line has any structure outside its strings: a nested `[` or `{`, or more than MAX_FLAT_STRINGS strings (a flat object of 400k keys).
+ * Those lines are allowed to be megabytes only because they are ONE string; anything else is a hostile worker making JSON.parse and zod do real work. A linear scan
+ * that jumps from quote to quote, so the payload string itself costs one indexOf.
+ */
+function hasStructureOutsideStrings(line: Buffer): boolean {
+  const n = line.length;
+  let strings = 0;
+  let i = 1; // the first byte is the object's own `{`
+  while (i < n) {
+    const c = line[i];
+    if (c === 0x22) {
+      if (++strings > MAX_FLAT_STRINGS) return true;
+      let j = i + 1;
+      for (;;) {
+        j = line.indexOf(0x22, j);
+        if (j < 0) return false; // unterminated: the parse refuses it
+        let backslashes = 0;
+        for (let k = j - 1; k > i && line[k] === 0x5c; k--) backslashes++;
+        if (backslashes % 2 === 0) break;
+        j++;
+      }
+      i = j + 1;
+      continue;
+    }
+    if (c === 0x7b || c === 0x5b) return true;
+    i++;
+  }
+  return false;
+}
 function limitHit(code: string): LoginHostError {
   console.error("[login-host-client] stream_limit", { code });
   return new LoginHostError("BAD_RESPONSE", code);
@@ -303,6 +335,7 @@ class NodeTransport implements HostTransport {
                   const headType = line.length > LINE_CAPS.other ? TYPE_AT_START.exec(line.subarray(0, 48).toString("latin1"))?.[1] : undefined;
                   // Only text/result/tool lines may be this big (see lineCapFor), and the cap was decided from the FIRST `type`: for the flat ones it must be the only one.
                   if ((headType === "text" || headType === "result") && hasSecondTypeKey(line)) throw limitHit("duplicate_type");
+                  if ((headType === "text" || headType === "result") && hasStructureOutsideStrings(line)) throw limitHit("not_flat");
                   let parsed: unknown;
                   try {
                     parsed = JSON.parse(line.toString("utf8"));

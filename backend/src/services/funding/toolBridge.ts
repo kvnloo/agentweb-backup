@@ -87,6 +87,8 @@ export interface BridgeExecuteOutcome {
   error?: string;
   /** Flags the halt handler needs (unattended, delegated, shared). */
   context?: Record<string, boolean>;
+  /** Text appended to what the MODEL is handed for a successful call, never to the persisted record (install_skills: the new skills' instructions, as Emma puts them in its next model call). */
+  answerSuffix?: string;
 }
 
 export interface BridgeCallResult {
@@ -428,6 +430,8 @@ const MAX_HALTS_PER_SESSION = 64;
 const MAX_ADMISSIONS_PER_LATCH = 64;
 const MAX_LEDGER_RECORDS = 512;
 const MAX_LEDGER_BYTES = 4 * 1024 * 1024;
+/** The hard ceiling on records: writes may go past MAX_LEDGER_RECORDS (a write is never dropped) but not past this. */
+const MAX_LEDGER_RECORDS_HARD = 4 * MAX_LEDGER_RECORDS;
 const MAX_RECORD_CONTENT_BYTES = 64 * 1024;
 /** A write that no longer fits the byte cap is cut to a short text and may still go over the cap by this much in all (a turn has at most 400 calls). */
 const LEDGER_WRITE_OVERFLOW_BYTES = 2 * 1024 * 1024;
@@ -449,7 +453,7 @@ export class ToolBridge {
   private readonly ledgers = new Map<string, Ledger>();
   private readonly lastGenerationByRun = new Map<string, string>();
   /** Size and write-ness of each ledger record (kept out of the record itself, which is persisted and compared in tests). */
-  private readonly recordMeta = new WeakMap<BridgeCallRecord, { size: number; write: boolean; shrunk: boolean }>();
+  private readonly recordMeta = new WeakMap<BridgeCallRecord, { size: number; write: boolean; shrunk: boolean; stub: boolean }>();
   /** Executor calls in progress per run id, across run generations. */
   private readonly execCount = new Map<string, number>();
   /** Run ids whose executor state is released when their last executing call finishes. */
@@ -1273,6 +1277,8 @@ export class ToolBridge {
       ...(outcome.images?.length ? { images: outcome.images } : {}),
     };
     const actual = result;
+    // The model-facing text may carry more than the record keeps (see `answerSuffix`); a refusal or an error never does.
+    if (outcome.answerSuffix && !result.isError && !outcome.requiresConfirmation) result = { ...result, content: result.content + outcome.answerSuffix };
     let shareable = !result.isError && !outcome.requiresConfirmation;
     let staleHalt = false;
 
@@ -1439,48 +1445,96 @@ export class ToolBridge {
   private keep(ledger: Ledger, entry: BridgeCallRecord, write: boolean): void {
     let size = Buffer.byteLength(JSON.stringify(entry));
     const fits = (records: number, bytes: number, extra = 0) => ledger.records.length < records && ledger.bytes + size <= bytes + extra;
-    const store = (shrunk: boolean) => {
+    const store = (stub: boolean, shrunk: boolean) => {
       ledger.records.push(entry);
       ledger.bytes += size;
-      this.recordMeta.set(entry, { size, write, shrunk });
+      this.recordMeta.set(entry, { size, write, shrunk, stub });
     };
-    const shrinkSelf = (contentBytes: number) => {
-      const before = size;
-      this.shrinkRecord(entry, contentBytes);
-      size = Buffer.byteLength(JSON.stringify(entry));
-      return size < before;
-    };
+    const room = () => fits(MAX_LEDGER_RECORDS, MAX_LEDGER_BYTES);
     if (!write) {
-      const room = () => fits(MAX_LEDGER_RECORDS, MAX_LEDGER_BYTES);
+      let counted = false; // `truncated` counts a record once, however many times it is cut
       if (!room()) this.shrinkOldestBig(ledger, () => room());
-      if (!room() && size > BIG_READ_RECORD_BYTES && shrinkSelf(SHRUNK_READ_CONTENT_BYTES)) ledger.truncated++;
+      if (!room() && size > BIG_READ_RECORD_BYTES) {
+        const before = size;
+        this.shrinkRecord(entry, SHRUNK_READ_CONTENT_BYTES);
+        size = Buffer.byteLength(JSON.stringify(entry));
+        if (size < before) {
+          ledger.truncated++;
+          counted = true;
+        }
+      }
       if (!room()) {
-        ledger.truncated++;
+        if (!counted) ledger.truncated++; // dropped
         return;
       }
-      store(false);
+      store(false, counted);
       return;
     }
-    const room = () => fits(MAX_LEDGER_RECORDS, MAX_LEDGER_BYTES);
     if (!room()) this.shrinkOldestBig(ledger, () => room());
-    while (!room() && this.dropOldestRead(ledger)) ledger.truncated++;
+    while (!room() && this.dropOldestRead(ledger)) {
+      /* older reads make room (counted inside) */
+    }
+    let stub = false;
     if (!room()) {
-      // a write keeps its input; only its text is cut first
+      // a write keeps its input; only its text is cut first (counted only if something was really cut)
+      const before = size;
       entry.toolMessageContent = capText(entry.toolMessageContent, SHRUNK_READ_CONTENT_BYTES);
       if (entry.answeredContent !== undefined) entry.answeredContent = capText(entry.answeredContent, SHRUNK_READ_CONTENT_BYTES);
       size = Buffer.byteLength(JSON.stringify(entry));
-      ledger.truncated++;
-      if (!fits(MAX_LEDGER_RECORDS, MAX_LEDGER_BYTES, LEDGER_WRITE_OVERFLOW_BYTES)) {
-        // the last resort: a stub. An executed write is never absent from the record (the cap of 400 calls per turn is below the record cap).
-        entry.args = { _truncated: 'input not kept' };
-        entry.toolMessageContent = capText(entry.toolMessageContent, STUB_CONTENT_BYTES);
-        delete entry.answeredContent;
-        delete entry.result;
-        if (entry.error) entry.error = capText(entry.error, STUB_CONTENT_BYTES);
+      if (size < before) ledger.truncated++;
+      if (ledger.bytes + size > MAX_LEDGER_BYTES + LEDGER_WRITE_OVERFLOW_BYTES) {
+        // the last resort: a stub. An executed write is never absent from the record.
+        this.stubify(entry);
         size = Buffer.byteLength(JSON.stringify(entry));
+        stub = true;
+        ledger.truncated++;
       }
     }
-    store(false);
+    // The hard ceiling (the HTTP path has no per-run call cap): beyond it the OLDEST writes are cut to stubs, then the oldest stubs are evicted. What ran is still
+    // known to `ledger.ran` (replay protection), so an evicted record is only a missing line in the chat, and it is counted.
+    while (ledger.records.length >= MAX_LEDGER_RECORDS_HARD || ledger.bytes + size > MAX_LEDGER_BYTES + LEDGER_WRITE_OVERFLOW_BYTES) {
+      if (this.stubifyOldestWrite(ledger)) continue;
+      if (!this.evictOldest(ledger)) break;
+    }
+    store(stub, false);
+  }
+
+  /** A write record cut to its identity: id, name, kind and a short text. */
+  private stubify(entry: BridgeCallRecord): void {
+    entry.args = { _truncated: 'input not kept' };
+    entry.toolMessageContent = capText(entry.toolMessageContent, STUB_CONTENT_BYTES);
+    delete entry.answeredContent;
+    delete entry.result;
+    if (entry.error) entry.error = capText(entry.error, STUB_CONTENT_BYTES);
+  }
+
+  /** At the hard ceiling: the oldest write that is not a stub yet becomes one. False when there is none. */
+  private stubifyOldestWrite(ledger: Ledger): boolean {
+    for (const r of ledger.records) {
+      const meta = this.recordMeta.get(r);
+      if (!meta || meta.stub || !meta.write) continue;
+      this.stubify(r);
+      const size = Buffer.byteLength(JSON.stringify(r));
+      if (size >= meta.size) {
+        this.recordMeta.set(r, { ...meta, stub: true }); // nothing to gain here: it was as small as a stub
+        continue;
+      }
+      ledger.bytes -= meta.size - size;
+      this.recordMeta.set(r, { ...meta, size, stub: true });
+      ledger.truncated++;
+      return true;
+    }
+    return false;
+  }
+
+  /** At the hard ceiling with nothing left to cut: the oldest record goes (a stub first). Counted. */
+  private evictOldest(ledger: Ledger): boolean {
+    if (!ledger.records.length) return false;
+    const i = Math.max(0, ledger.records.findIndex((r) => this.recordMeta.get(r)?.stub === true));
+    const [gone] = ledger.records.splice(i, 1);
+    ledger.bytes -= this.recordMeta.get(gone)?.size ?? 0;
+    ledger.truncated++;
+    return true;
   }
 
   /** Cuts a read record to a note and a marker: its input, its text, and its raw result (which the size count includes). */
@@ -1500,16 +1554,19 @@ export class ToolBridge {
       this.shrinkRecord(r, SHRUNK_READ_CONTENT_BYTES);
       const size = Buffer.byteLength(JSON.stringify(r));
       ledger.bytes -= meta.size - size;
-      this.recordMeta.set(r, { size, write: false, shrunk: true });
+      this.recordMeta.set(r, { size, write: false, shrunk: true, stub: false });
       ledger.truncated++;
     }
   }
 
+  /** Drops the oldest read. Counted unless it was already counted when it was shrunk. */
   private dropOldestRead(ledger: Ledger): boolean {
     const i = ledger.records.findIndex((r) => this.recordMeta.get(r)?.write !== true);
     if (i < 0) return false;
     const [gone] = ledger.records.splice(i, 1);
-    ledger.bytes -= this.recordMeta.get(gone)?.size ?? 0;
+    const meta = this.recordMeta.get(gone);
+    ledger.bytes -= meta?.size ?? 0;
+    if (!meta?.shrunk) ledger.truncated++;
     return true;
   }
 

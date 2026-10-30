@@ -58,6 +58,9 @@ The log line is `relay_manifest_cut` (open set) or `new_tool_unloadable` / `new_
 | Text sent to the model | 300,000 bytes (note included), then cut with a note. Same cap as in-process Emma (300,000 characters; bytes here, so non-ASCII text is cut earlier, never later) | `RELAY_RESULT_MAX_BYTES`, `backend/src/loginHost/protocol.ts`; applied in `bound()`, `relayToolDispatcher.ts` |
 | Images | 4 images of `image/png`, `jpeg`, `webp` or `gif`; 2,500,000 base64 characters each and 6,000,000 in all | `IMAGE_LIMITS`, `toolImage`, `protocol.ts` |
 | Text saved in the chat's tool record | 64 KiB | `MAX_RECORD_CONTENT_BYTES`, `backend/src/services/funding/toolBridge.ts` |
+| Records of one turn kept in the chat | 512 records / 4 MiB, exactly as before the relay; past that, old big reads are shrunk, then dropped, and writes always keep a record (a hard ceiling of 2,048 records / 6 MiB bounds it) | `MAX_LEDGER_RECORDS`, `MAX_LEDGER_BYTES`, `MAX_LEDGER_RECORDS_HARD`, `toolBridge.ts` |
+
+`install_skills` is special: its answer also carries the instructions of the skills it just installed (up to 60,000 characters), as Emma's next model call would see them. They are not part of the saved record.
 
 A result over a limit is never an error: the text is cut, or the extra images are dropped, and the text says so. The tool has already run.
 
@@ -106,5 +109,7 @@ These are only caught at run time, by the stops and notes above:
 - **Call inputs and results.** Their size depends on the data, so no test of the registry can see them.
 
 ## Security: what stays open
+
+**A compromised worker can mark customers' logins dead (bounded).** A worker can claim a login is dead, and the status it is asked about comes from the same worker, so it is a consistency check, not evidence. The backend marks a connection only when the claim and the status agree, or the claim repeats on two consecutive turns, at most once per 5 minutes per connection, and never for more than 5 different connections in 10 minutes (then it logs `mark_breaker_open` and only shows the stop). Per API instance.
 
 **A confirmation can be replayed by a compromised worker (design residual R1).** A halt (a tool that needs the user's confirmation) is lifted by any new user turn, and the confirmation token sits in the persisted preview. A compromised login worker could confirm a previously previewed write on a later turn, whatever the user typed. Only approval cards that bind a confirmation to a user action close this. Until they ship, the plan route stays allow-listed to one internal user, and after the first confirmation-needed call the turn runs no further tools.

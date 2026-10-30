@@ -209,6 +209,26 @@ describe('the turn stream is bounded before anything is parsed', () => {
     expect((await drain()).error).toMatchObject({ code: 'BAD_RESPONSE', detail: 'duplicate_type' });
   });
 
+  it.each([
+    ['an array outside the payload', '{"type":"text","delta":"x","a":[' + '0,'.repeat(3_000_000) + '0]}\n'],
+    ['a nested object outside the payload', '{"type":"result","ok":true,"text":"' + 'x'.repeat(100_000) + '","o":{"p":1}}\n'],
+    ['400k extra keys', '{"type":"text","delta":"x",' + Array.from({ length: 400_000 }, (_, i) => `"k${i}":0`).join(',') + '}\n'],
+  ])('SF3: a big text/result line with %s is refused before it is parsed, in milliseconds', async (_l, line) => {
+    serve(line);
+    const t0 = Date.now();
+    const r = await drain();
+    expect(r.error).toMatchObject({ code: 'BAD_RESPONSE', detail: 'not_flat' });
+    expect(Date.now() - t0).toBeLessThan(500);
+  });
+
+  it('SF3: honest big lines pass: a 5 MiB text with brackets, quotes and backslashes inside its string, and a result with all its fields', async () => {
+    const payload = '{"a":[1,2,{"b":"c"}]} "quoted" \\ back\\slash \n'.repeat(100_000);
+    serve(ev({ type: 'text', delta: payload }) + ev({ type: 'result', ok: false, text: payload, errorKind: 'e', aborted: 'a' }));
+    const r = await drain();
+    expect(r.error).toBeUndefined();
+    expect(r.events).toEqual(['text', 'result']);
+  });
+
   it('a big tool-call whose last type says something else is refused after the parse', async () => {
     serve('{"type":"tool-call","operationId":"op1","messageId":"m","name":"n","input":{"p":"' + 'x'.repeat(200_000) + '"},"type":"usage"}\n');
     expect((await drain()).error).toMatchObject({ code: 'BAD_RESPONSE', detail: 'type_mismatch' });

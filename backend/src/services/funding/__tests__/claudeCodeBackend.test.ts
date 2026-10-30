@@ -389,6 +389,18 @@ describe('ClaudeCodeBackend', () => {
       expect(h.reconnect).toEqual([['conn-1', 3, 'turn_auth_dead']]);
     });
 
+    it('production defaults (no bypass flags): one dead-login claim shows the stop but does not flag; the second consecutive turn does', async () => {
+      const h = harness();
+      delete (h.deps as any).reconnectSignalsRequired;
+      delete (h.deps as any).confirmDeadLogin;
+      h.setHost(async () => done('', { ok: false, errorKind: 'auth_dead' }));
+      const backend = new ClaudeCodeBackend(h.deps);
+      expect(await stopCode(backend.run(params()))).toBe('needs_reconnect');
+      expect(h.reconnect).toEqual([]); // one signal, the status does not say needs_reconnect
+      expect(await stopCode(backend.run(params()))).toBe('needs_reconnect');
+      expect(h.reconnect).toEqual([['conn-1', 3, 'turn_auth_dead']]); // the second consecutive turn
+    });
+
     it('the plan\'s own usage limit stops with usage_limit and does not flag the connection', async () => {
       const h = harness();
       h.setLedger([rec({ toolCallId: 'tc1', name: 'save_note' })]);

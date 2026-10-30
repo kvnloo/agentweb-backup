@@ -123,8 +123,8 @@ export interface ClaudeBackendDeps {
   /** Consecutive turns that must report a dead login before the connection record is marked (default 2; see reconnectGuard.ts). */
   reconnectSignalsRequired?: number;
   /**
-   * Asks the worker whether it agrees the login is dead. Default: "needs_reconnect" when `connection.status` says so (independent evidence: the record is marked at
-   * once), true when the worker has no such login (weaker: the signal must repeat on consecutive turns), false otherwise. Tests replace it.
+   * Asks the worker whether it agrees the login is dead (the same worker that made the claim: a consistency check, not independent evidence). Default: "needs_reconnect" when `connection.status` says so (independent evidence: the record is marked at
+   * once), anything else: the signal must repeat on consecutive turns. Tests replace it.
    */
   confirmDeadLogin?(client: LoginHostClient, connectionId: string): Promise<boolean | "needs_reconnect">;
   /** How long before the turn's deadline no further tool may start (the model is told to write its answer). Default 75 s, never more than half the deadline. */
@@ -494,7 +494,7 @@ export class ClaudeCodeBackend {
             if (stop) {
               // Fields the host guarantees safe to log (a code and a short detail chosen by the host; never a path, token or text).
               console.error("[claude-backend] host failure", { code: (err as { code?: string }).code, detail: (err as { detail?: string }).detail, stop: stop.code, session: p.sessionId });
-              if (stop.markNeedsReconnect) await this.markDeadLogin(client, connectionId, epoch, "host_denied");
+              if (stop.markNeedsReconnect) await withinMs(this.markDeadLogin(client, connectionId, epoch, "host_denied"), MARK_BOUND_MS);
               pendingStop = stop; // tool work that already ran is real: it is drained and persisted below, then this is thrown
             } else {
               rawError = err; // same: persist what ran, then fail (typed, by run())
@@ -554,7 +554,7 @@ export class ClaudeCodeBackend {
         const stop = fromResultErrorKind(result.errorKind, result.aborted);
         // errorKind and aborted come from the worker: only values of the fixed sets are logged, anything else as `other`.
         console.error("[claude-backend] turn ended not ok", { errorKind: safeToken(result.errorKind, RESULT_ERROR_KINDS), aborted: safeToken(result.aborted, RESULT_ABORT_REASONS), stop: stop.code, session: p.sessionId });
-        if (stop.markNeedsReconnect) await this.markDeadLogin(client, connectionId, epoch, "turn_auth_dead");
+        if (stop.markNeedsReconnect) await withinMs(this.markDeadLogin(client, connectionId, epoch, "turn_auth_dead"), MARK_BOUND_MS);
         throw stop;
       }
 
@@ -636,13 +636,10 @@ export class ClaudeCodeBackend {
       const confirm = this.deps.confirmDeadLogin ?? defaultConfirmDeadLogin;
       const evidence = await confirm(client, connectionId);
       if (evidence === "needs_reconnect") {
-        // the host's own status says so (a route independent of the turn stream): mark at once, only the cool-down applies
+        // the worker's own status agrees with its signal (a consistency check: it is the same worker): mark now, subject to the cool-down and the breaker
         if (!this.reconnectGuard.noteConfirmed(connectionId)) return;
-      } else if (evidence) {
-        // weaker evidence ("no such login"): the signal must repeat on consecutive turns
-        if (!this.reconnectGuard.note(connectionId)) return;
-      } else {
-        return;
+      } else if (!this.reconnectGuard.note(connectionId)) {
+        return; // the status disagrees or says nothing: only a signal that repeats on consecutive turns counts
       }
       await this.deps.markNeedsReconnect(connectionId, epoch, reason);
     } catch {
@@ -791,6 +788,17 @@ async function defaultConfirmDeadLogin(client: LoginHostClient, connectionId: st
     return (await client.connectionStatus({ connectionId })).state === "needs_reconnect" ? "needs_reconnect" : false;
   } catch (err) {
     return err instanceof LoginHostError && (err.code === "ENOTFOUND" || err.code === "ESTATE"); // the worker says again that it has no usable login (weaker)
+  }
+}
+
+/** The stop is not held back by a slow worker: marking the record gets this long, then goes on in the background (it never throws). */
+const MARK_BOUND_MS = 2_000;
+async function withinMs(p: Promise<void>, ms: number): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([p, new Promise<void>((resolve) => (timer = setTimeout(resolve, ms)))]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 

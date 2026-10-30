@@ -153,3 +153,73 @@ describe('ledger: stubs, shrunk results and the bridge\'s own record of what ran
     expect(t.bridge.ranCall('r1', 'w9999')).toBe(true);
   });
 });
+
+describe('ledger: a hard ceiling, and `truncated` counts only what was really lost', () => {
+  it('1200 tiny writes (the HTTP path has no per-run call cap): every one is kept and nothing is counted as lost', async () => {
+    const t = rig();
+    for (let i = 0; i < 1200; i++) await t.write(i);
+    const { records, truncated } = t.bridge.takeLedger('r1');
+    expect(records.filter((r) => r.name === 'send_email')).toHaveLength(1200);
+    expect(truncated).toBe(0);
+  });
+
+  it('1500 writes with 60 KB results: memory stays bounded (the oldest are cut to stubs, then evicted, counted) and every executed call is still known to ranCall', async () => {
+    const t = rig(60);
+    for (let i = 0; i < 1500; i++) await t.write(i);
+    for (const i of [0, 1, 700, 1499]) expect(t.bridge.ranCall('r1', `w${i}`)).toBe(true);
+    const { records, truncated } = t.bridge.takeLedger('r1');
+    const bytes = records.reduce((n, r) => n + Buffer.byteLength(JSON.stringify(r)), 0);
+    expect(bytes).toBeLessThanOrEqual(4 * 1024 * 1024 + 2 * 1024 * 1024 + 64 * 1024);
+    expect(records.length).toBeLessThanOrEqual(2048);
+    expect(records[records.length - 1].toolCallId).toBe('w1499'); // the newest write is whole enough to name itself
+    expect(truncated).toBeGreaterThan(0);
+  });
+
+  it('a read that was shrunk and then dropped under pressure is counted ONCE', async () => {
+    const t = rig();
+    for (let i = 0; i < 40; i++) await t.read(i, 200); // 200 KB inputs: 8 MB of reads: the oldest are shrunk, then dropped
+    const { records, truncated } = t.bridge.takeLedger('r1');
+    const gone = 40 - records.length;
+    const shrunk = records.filter((r) => r.args && (r.args as { _truncated?: string })._truncated).length;
+    expect(truncated).toBe(gone + shrunk); // each cut or dropped record exactly once
+  });
+
+  it('a big NEW read arriving under byte pressure shrinks itself instead of being dropped (M18)', async () => {
+    const t = rig();
+    for (let i = 0; i < 20; i++) await t.read(i, 7); // small enough to stay whole
+    // fill most of the budget with writes (never shrunk), then a big read must self-shrink to fit
+    const w = rig(60);
+    for (let i = 0; i < 60; i++) await w.write(i); // ~3.6 MiB of writes
+    await w.read(99, 600);
+    const rec = w.bridge.takeLedger('r1').records.find((r) => r.toolCallId === 'r99');
+    expect(rec).toBeDefined();
+    expect(rec!.args).toEqual({ _truncated: 'input not kept' });
+  });
+
+  it('at the record ceiling the OLDEST records are evicted (counted), the newest stay, and ranCall still knows every call that ran', async () => {
+    const t = rig();
+    for (let i = 0; i < 2200; i++) await t.write(i);
+    const { records, truncated } = t.bridge.takeLedger('r1');
+    expect(records).toHaveLength(2048);
+    expect(records[0].toolCallId).toBe('w152');
+    expect(records[records.length - 1].toolCallId).toBe('w2199');
+    expect(truncated).toBe(152);
+    for (const i of [0, 151, 152, 2199]) expect(t.bridge.ranCall('r1', `w${i}`)).toBe(true);
+  });
+
+  it('a read shrunk and later dropped is ONE lost record: truncated equals the reads that are not intact', async () => {
+    const t = rig();
+    for (let i = 0; i < 450; i++) await t.read(i, 12); // over the byte budget: the oldest big reads are shrunk
+    for (let i = 0; i < 150; i++) await t.write(i); // and the record count makes the oldest reads (shrunk ones) go
+    const { records, truncated } = t.bridge.takeLedger('r1');
+    const intactReads = records.filter((r) => r.name === 'read_it' && !(r.args as { _truncated?: string })._truncated).length;
+    expect(truncated).toBe(450 - intactReads);
+  });
+
+  it('a read that cannot fit even after shrinking itself is counted once (shrunk, then dropped)', async () => {
+    const t = rig();
+    for (let i = 0; i < 512; i++) await t.write(i); // the record count is spent by writes
+    await t.read(1, 20);
+    expect(t.bridge.takeLedger('r1').truncated).toBe(1);
+  });
+});

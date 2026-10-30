@@ -37,6 +37,7 @@ function gate() {
   return { wait, open };
 }
 
+const CID = (n: number, runId = 'claude-relay-1') => `tc_${require('crypto').createHash('sha256').update(runId).digest('hex').slice(0, 12)}_${n}`;
 describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
   let rig: Rig;
   let dir: string;
@@ -187,7 +188,7 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
     expect(t.executions).toEqual([{ name: 'save_note', args: { note: 'hello' } }]);
     expect(answers()).toEqual([{ operationId: 'op-a', answer: { kind: 'tool-result', ok: true, content: 'save_note receipt' } }]);
     expect(r.responseMessages.map((m) => m.role)).toEqual(['assistant', 'tool', 'assistant']);
-    expect(r.responseMessages[1]).toMatchObject({ tool_call_id: 'claude-relay-1:1', content: 'save_note receipt' });
+    expect(r.responseMessages[1]).toMatchObject({ tool_call_id: CID(1), content: 'save_note receipt' });
     expect(r.content).toBe('Saved it.');
     expect(t.registry.size).toBe(0);
   });
@@ -216,7 +217,7 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
     g.open();
     const r = await run;
     expect(t.executions.map((e) => e.name).sort()).toEqual(['search', 'slow_write']);
-    expect(r.responseMessages.filter((m) => m.role === 'tool').map((m) => m.tool_call_id).sort()).toEqual(['claude-relay-1:1', 'claude-relay-1:2']);
+    expect(r.responseMessages.filter((m) => m.role === 'tool').map((m) => m.tool_call_id).sort()).toEqual([CID(1), CID(2)]);
   });
 
   it('install_skills: the same answer carries the new tool definition to the real host, and the tool then runs in the same turn (Emma behaviour)', async () => {
@@ -291,7 +292,7 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
     g.open();
     const r = await run;
     expect(t.executions).toHaveLength(1);
-    expect(r.responseMessages[1]).toMatchObject({ role: 'tool', tool_call_id: 'claude-relay-1:1' });
+    expect(r.responseMessages[1]).toMatchObject({ role: 'tool', tool_call_id: CID(1) });
     expect(r.responseMessages[1].content).toBe(`save_note receipt\n${RESULT_LOST_NOTE}`);
     expect(markNeedsReconnect).not.toHaveBeenCalled();
     expect((await client.connectionStatus({ connectionId: 'conn-1' })).state).toBe('active'); // never treated as a wipe
@@ -537,26 +538,26 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
       expect(String(line?.[1])).toContain('boom [ALARM] forged line');
     });
 
-    it('S5: a forged auth_dead result shows the stop but does not mark the connection (the worker does not agree, and it was one signal)', async () => {
+    it('S5: a forged auth_dead result shows the stop but one signal does not mark the connection, whatever the status says', async () => {
       const t = setup();
       const marked = jest.spyOn(t.deps, 'markNeedsReconnect');
-      jest.spyOn(client, 'connectionStatus').mockResolvedValue({ state: 'active', epoch: 1, runningTurns: 0 } as any); // the worker's own record disagrees with the forged result
+      jest.spyOn(client, 'connectionStatus').mockResolvedValue({ state: 'active', epoch: 1, runningTurns: 0 } as any);
       const backend = t.backend();
-      for (let i = 0; i < 3; i++) {
-        rig.script.turnEvents = [{ type: 'result', ok: false, text: '', errorKind: 'auth_dead' }];
-        const err: any = await backend.run(t.params()).catch((e) => e);
-        expect(err.code).toBe('needs_reconnect'); // the user is told, as before
-      }
-      expect(marked).not.toHaveBeenCalled(); // the host's connection.status says the login is active
+      rig.script.turnEvents = [{ type: 'result', ok: false, text: '', errorKind: 'auth_dead' }];
+      const err: any = await backend.run(t.params()).catch((e) => e);
+      expect(err.code).toBe('needs_reconnect'); // the user is told, as before
+      expect(marked).not.toHaveBeenCalled();
     });
 
-    it('S5: a forged admission ENOTFOUND does not mark it either', async () => {
+    it('S5: a forged admission ENOTFOUND is one signal: it does not mark; a second consecutive one does (once)', async () => {
       const t = setup();
       const marked = jest.spyOn(t.deps, 'markNeedsReconnect');
       jest.spyOn(client, 'turnRun').mockRejectedValue(new (require('../loginHostClient').LoginHostError)('ENOTFOUND'));
       const backend = t.backend();
-      for (let i = 0; i < 3; i++) await backend.run(t.params()).catch(() => undefined);
+      await backend.run(t.params()).catch(() => undefined);
       expect(marked).not.toHaveBeenCalled();
+      for (let i = 0; i < 3; i++) await backend.run(t.params()).catch(() => undefined);
+      expect(marked).toHaveBeenCalledTimes(1); // the cool-down holds the rest
     });
 
     it('S5: a genuinely dead login is marked on the SECOND consecutive turn, once, and not again within the cool-down; a working turn in between resets the count', async () => {
@@ -632,17 +633,58 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
       expect(marked).toHaveBeenCalledTimes(2);
     });
 
-    it('S5: when the worker says the login is fine, repeated dead-login claims never mark it', async () => {
+    it('S5: when the status disagrees, one dead-login claim does not mark; the SECOND consecutive turn does', async () => {
       const t = setup();
       const marked = jest.spyOn(t.deps, 'markNeedsReconnect');
       jest.spyOn(client, 'connectionStatus').mockResolvedValue({ state: 'connected', epoch: 1, runningTurns: 0 } as any);
       const backend = t.backend();
-      for (let i = 0; i < 4; i++) {
+      const dead = async () => {
         rig.script.turnEvents = [{ type: 'result', ok: false, text: '', errorKind: 'auth_dead' }];
         await backend.run(t.params()).catch(() => undefined);
-      }
+      };
+      await dead();
       expect(marked).not.toHaveBeenCalled();
+      await dead();
+      expect(marked).toHaveBeenCalledTimes(1);
     });
+
+    it('S5 breaker: signals about more than 5 DIFFERENT connections within 10 minutes mark only the first 5; one fixed alert line; the stop is still shown for every one', async () => {
+      const t = setup();
+      let clock = 1_000_000;
+      t.deps.now = () => clock;
+      const marked = jest.spyOn(t.deps, 'markNeedsReconnect');
+      const backend = new ClaudeCodeBackend({ ...t.deps, confirmDeadLogin: async () => 'needs_reconnect' as const });
+      const codes: string[] = [];
+      for (let i = 0; i < 8; i++) {
+        // a connection the worker does not know: its own "no such login" answer is the claim
+        const err: any = await backend.run(t.params({ decision: { ...DECISION, connectionId: `conn-x${i}` } })).catch((e: any) => e);
+        codes.push(err?.code);
+        clock += 1_000;
+      }
+      expect(codes.every((c) => c === 'needs_reconnect')).toBe(true);
+      expect(marked).toHaveBeenCalledTimes(5);
+      expect((console.error as jest.Mock).mock.calls.filter((c) => c[0] === '[reconnect-guard] mark_breaker_open')).toHaveLength(1);
+      clock += 11 * 60_000; // the window passes: marking resumes
+      await backend.run(t.params({ decision: { ...DECISION, connectionId: 'conn-late' } })).catch(() => undefined);
+      expect(marked).toHaveBeenCalledTimes(6);
+    });
+
+    it('S5: a status call that hangs does not hold back the stop (about 2 s at most), and the record is still marked when it answers', async () => {
+      const t = setup();
+      const marked = jest.spyOn(t.deps, 'markNeedsReconnect');
+      let answer: (v: unknown) => void = () => undefined;
+      jest.spyOn(client, 'connectionStatus').mockImplementation(() => new Promise((r) => (answer = r)) as any);
+      const backend = t.backend();
+      rig.script.turnEvents = [{ type: 'result', ok: false, text: '', errorKind: 'auth_dead' }];
+      const t0 = Date.now();
+      const err: any = await backend.run(t.params()).catch((e: any) => e);
+      expect(err.code).toBe('needs_reconnect');
+      expect(Date.now() - t0).toBeLessThan(4_000);
+      expect(marked).not.toHaveBeenCalled();
+      answer({ state: 'needs_reconnect', epoch: 1, runningTurns: 0 });
+      await new Promise((r) => setTimeout(r, 20));
+      expect(marked).toHaveBeenCalledTimes(1);
+    }, 10_000);
 
     it('S6: usage counts of 1e308 are capped: the journal row and the persisted usage are finite', async () => {
       const t = setup();
@@ -681,7 +723,7 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
       expect(t.executions.map((e) => e.name)).toEqual(['send_email']);
       expect(answers()[1].answer).toMatchObject({ ok: false, content: HALTED_MESSAGE });
       expect(answers()[2].answer).toMatchObject({ ok: false, content: HALTED_MESSAGE });
-      expect(announced.mock.calls.map((c) => c[1])).toEqual(['claude-relay-1:1']); // the refused calls never reached the bridge
+      expect(announced.mock.calls.map((c) => c[1])).toEqual([CID(1)]); // the refused calls never reached the bridge
     });
   });
 
