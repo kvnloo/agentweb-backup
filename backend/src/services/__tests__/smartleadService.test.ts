@@ -18,6 +18,7 @@ import {
   getCampaignSequences,
   listCampaigns,
   getSmartLeadMetrics,
+  listCampaignLeadsByEmailStatus,
   listEmailAccounts,
   scrubSmartleadSecrets,
   SmartleadApiError,
@@ -323,6 +324,53 @@ describe("smartleadService slice 2 client (ENG-673)", () => {
     it("refuses a bad campaign id before any request", async () => {
       await expect(getCampaign(KEY, 0)).rejects.toBeInstanceOf(SmartleadApiError);
       await expect(getCampaignSequences(KEY, 1.5)).rejects.toBeInstanceOf(SmartleadApiError);
+      expect(mockedAxios.request).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("listCampaignLeadsByEmailStatus (live shape, 2026-10-30)", () => {
+    // the real reply: total_leads is a STRING, each row has the Smartlead lead inside `lead`
+    const realReply = { total_leads: "11", offset: 0, limit: 2, data: [
+      { campaign_lead_map_id: "2833805595", status: "COMPLETED", lead_category_id: null, lead: { id: 3475601405, email: "Ivan@Daytona.io", is_unsubscribed: false } },
+      { campaign_lead_map_id: "2833805617", status: "COMPLETED", lead_category_id: null, lead: { id: "3475601377", email: "annika@relay.app" } },
+    ] };
+
+    it("sends the status filter and paging, and reads total and rows (addresses lower-cased)", async () => {
+      mockedAxios.request.mockResolvedValueOnce({ data: realReply } as never);
+      const out = await listCampaignLeadsByEmailStatus(KEY, 9, "is_replied", { offset: 100, limit: 500 });
+      expect(out).toEqual({ total: 11, rows: [{ leadId: "3475601405", email: "ivan@daytona.io", unsubscribed: false }, { leadId: "3475601377", email: "annika@relay.app", unsubscribed: false }] });
+      const call = mockedAxios.request.mock.calls[0][0];
+      expect(call.url).toMatch(/\/campaigns\/9\/leads$/);
+      expect(call.params).toMatchObject({ emailStatus: "is_replied", offset: 100, limit: 100 }); // the page size is capped at 100
+    });
+
+    it("with no filter it sends none, and reads the lead's own unsubscribed flag (true only when exactly true)", async () => {
+      mockedAxios.request.mockResolvedValueOnce({ data: { total_leads: "3", data: [
+        { status: "BLOCKED", lead: { id: 1, email: "a@b.co", is_unsubscribed: true } },
+        { status: "STARTED", lead: { id: 2, email: "c@d.co", is_unsubscribed: false } },
+        { status: "STARTED", lead: { id: 3, email: "e@f.co", is_unsubscribed: "true" } },
+      ] } } as never);
+      const out = await listCampaignLeadsByEmailStatus(KEY, 9, null);
+      expect(out.rows.map(r => r.unsubscribed)).toEqual([true, false, false]);
+      expect(mockedAxios.request.mock.calls[0][0].params).not.toHaveProperty("emailStatus");
+    });
+
+    it("drops rows without a usable id or address, and reads an empty answer as nobody", async () => {
+      mockedAxios.request.mockResolvedValueOnce({ data: { total_leads: "2", data: [{ lead: { id: 1 } }, { lead: { email: "a@b.co" } }, null, {}] } } as never);
+      await expect(listCampaignLeadsByEmailStatus(KEY, 9, "is_bounced")).resolves.toEqual({ total: 2, rows: [] });
+      mockedAxios.request.mockResolvedValueOnce({ data: { total_leads: "0", data: [] } } as never);
+      await expect(listCampaignLeadsByEmailStatus(KEY, 9, "is_unsubscribed")).resolves.toEqual({ total: 0, rows: [] });
+    });
+
+    it("never reads an error object, a bare array or a reply without a total as nobody", async () => {
+      for (const data of [{ error: "nope" }, [], "", { data: [] }, { total_leads: "x", data: [] }]) {
+        mockedAxios.request.mockResolvedValueOnce({ data } as never);
+        await expect(listCampaignLeadsByEmailStatus(KEY, 9, "is_replied")).rejects.toBeInstanceOf(SmartleadUnexpectedResponseError);
+      }
+    });
+
+    it("refuses a bad campaign id before any request", async () => {
+      await expect(listCampaignLeadsByEmailStatus(KEY, 0, "is_replied")).rejects.toBeInstanceOf(SmartleadApiError);
       expect(mockedAxios.request).not.toHaveBeenCalled();
     });
   });
