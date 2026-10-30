@@ -37,7 +37,7 @@ import type {
   SpawnSpec,
   SubscriptionProviderAdapter,
 } from "../adapter";
-import { qualifiedToolPrefix, RELAY_MCP_SERVER_NAME } from "../protocol";
+import { qualifiedToolPrefix, RELAY_MCP_SERVER_NAME, relayCliEnv } from "../protocol";
 import { RELAY_SOCKET_IN_UNIT } from "../ports/unitArgs";
 import { approxJsonBytes, LogThrottle, MAX_CLI_LINE_DEPTH, MAX_FORWARDED_BYTES, MAX_FORWARDED_DEPTH, valueDepthExceeds } from "../relay/bounds";
 import { canonicalJson } from "../relay/canonical";
@@ -709,7 +709,7 @@ class ClaudeSession implements ProviderSession {
         },
         scratch: { create: () => join(cfg.unitTmp, "aw-home"), remove: () => undefined }, // created by the wrapper inside the unit's private tmp; it vanishes with the unit
         binaryPath: cfg.binary.path,
-        buildEnv: (configDir, home) => allowlistedEnv(cfg.basePath, configDir, home, { TMPDIR: cfg.unitTmp, ...(this.relayEp ? { AW_TURN_TOOLS: "1" } : {}) }), // the wrapper reads the tool manifest line and removes the variable
+        buildEnv: (configDir, home) => allowlistedEnv(cfg.basePath, configDir, home, { TMPDIR: cfg.unitTmp, ...(this.relayEp ? { AW_TURN_TOOLS: "1", ...relayCliEnv(this.relayCallTimeoutMs?.() ?? 1000) } : {}) }), // the wrapper reads the tool manifest line and removes the variable
       },
     });
   }
@@ -758,6 +758,8 @@ class ClaudeSession implements ProviderSession {
   private readonly visibleTools = new Set<string>();
   /** Bytes canonicalized and hashed for matching in the current turn (stream announcements and call inputs together): a hard budget, then name-only matching. */
   private hashedBytes = 0;
+  /** The turn's remaining call clock (relay turns only): the CLI's own tool timeout is set from it (see relayCliEnv). */
+  private relayCallTimeoutMs: (() => number) | undefined;
   private spendHash(bytes: number): boolean {
     if (this.hashedBytes + bytes > TURN_HASH_BUDGET_BYTES) return false;
     this.hashedBytes += bytes;
@@ -878,6 +880,7 @@ class ClaudeSession implements ProviderSession {
         const relay = this.cfg.relay;
         if (!relay) throw Object.assign(new Error("relay_unavailable"), { code: "open_failed" });
         this.hashedBytes = 0;
+        this.relayCallTimeoutMs = input.relay.callTimeoutMs;
         for (const t of input.relay.tools) this.visibleTools.add(t.name);
         // The per-turn socket exists (and accepts) BEFORE the unit starts. Identity is fixed here, from the session, never from a frame.
         this.relayOpening = relay.host.open({

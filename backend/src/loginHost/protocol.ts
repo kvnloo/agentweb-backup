@@ -189,6 +189,26 @@ export function admitNewTools(visible: VisibleTools, incoming: ToolDef[]): { ok:
 }
 
 export const IMAGE_LIMITS = { maxImages: 4, maxBase64Each: 2_500_000, maxBase64Total: 6_000_000 } as const;
+
+/**
+ * Environment variables of the CLI that RELAY turns set so the CLI itself never silently changes what the plan route offers (names confirmed in the strings of CLI
+ * 2.1.314; legacy turns set none of them). Every value is derived from a limit of this file, never a second copy of a number:
+ *  - CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH: the CLI shortens an MCP tool description (default 4096 characters, with an ellipsis); the host already refuses one over
+ *    TOOL_LIMITS.maxDescriptionBytes, so that is the limit here (a character is at most that many bytes);
+ *  - MAX_MCP_OUTPUT_TOKENS: the CLI truncates an MCP result above this many tokens (default 25,000, about 100 KB). A relayed result can be a frame of up to
+ *    RELAY_FRAME_LIMITS.hostToShimBytes: counted conservatively at two bytes a token, plus 1,600 tokens (the CLI's own figure) for each image;
+ *  - MCP_TOOL_TIMEOUT: the CLI's own limit on one stdio tool call (milliseconds, at least 1000): the turn's remaining deadline, so the host's clock is the one that ends a call.
+ * (MCP_TIMEOUT is the server start-up timeout in the CLI, not a call limit; CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT, default 30 minutes for stdio, is reset by the shim's
+ * progress notifications.)
+ */
+export function relayCliEnv(callTimeoutMs: number): Record<string, string> {
+  const ms = Math.min(2_147_483_647, Math.max(1000, Math.floor(Number.isFinite(callTimeoutMs) ? callTimeoutMs : 1000)));
+  return {
+    CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH: String(TOOL_LIMITS.maxDescriptionBytes),
+    MAX_MCP_OUTPUT_TOKENS: String(Math.ceil(RELAY_FRAME_LIMITS.hostToShimBytes / 2) + IMAGE_LIMITS.maxImages * 1600),
+    MCP_TOOL_TIMEOUT: String(ms),
+  };
+}
 export const toolImage = z
   .object({
     mimeType: z.enum(["image/png", "image/jpeg", "image/webp", "image/gif"]),

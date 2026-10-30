@@ -12,7 +12,8 @@ import { ClaudeAdapter } from "../adapters/claudeAdapter";
 import * as canonicalModule from "../relay/canonical";
 import { Layout } from "../ports/layout";
 import { RelayHost } from "../relay/relayServer";
-import type { ToolDef } from "../protocol";
+import { IMAGE_LIMITS, RELAY_FRAME_LIMITS, TOOL_LIMITS, relayCliEnv, type ToolDef } from "../protocol";
+import { assertEnvName, assertEnvValue } from "../ports/layout";
 
 const FAKE = join(__dirname, "fakeClaude.js");
 const WRAPPER = join(__dirname, "..", "deploy", "claude-turn.sh");
@@ -224,7 +225,7 @@ describe("claude adapter: tool relay end to end", () => {
     rig.scenario({ turn: [{ mcpCall: { name: "search", args: {} } }, RESULT_STEP] });
     const reads: number[] = [];
     await runTurn(rig, (ev, s) => void s.answer(ev.operationId, { kind: "tool-result", ok: true, content: "ok" }), { callTimeoutMs: () => (reads.push(1), 590_000) });
-    expect(reads).toHaveLength(1);
+    expect(reads).toHaveLength(2); // once when the unit starts (the CLI's own tool timeout is set from it), once for the call
   });
 
   it("abort mid-tool: interrupt tears down the socket, the pending operation and the CLI; no shim process and no relay directory remain", async () => {
@@ -469,6 +470,37 @@ describe("claude adapter: MCP server name vs the tool-name cap", () => {
     expect(mk("emma")).not.toThrow();
     expect(mk("em")).not.toThrow(); // shorter: the cap only gets safer
     expect(mk("emma2")).toThrow(/mcpServerName longer/);
+  });
+});
+
+describe("claude adapter: the CLI is told not to cut what the relay allows (relay turns only)", () => {
+  const CLI_VARS = ["CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH", "MAX_MCP_OUTPUT_TOKENS", "MCP_TOOL_TIMEOUT"];
+
+  it("MUTATION TARGET: a relay turn's environment carries exactly these three, with values derived from the protocol constants and the turn's remaining clock", async () => {
+    const rig = makeRig();
+    rig.scenario({ turn: [RESULT_STEP] });
+    await runTurn(rig, () => undefined, { callTimeoutMs: () => 123_456.9 });
+    const turn = rig.spawns.find((s) => s.relayDir)!;
+    expect(CLI_VARS.map((k) => turn.env[k])).toEqual([String(TOOL_LIMITS.maxDescriptionBytes), String(Math.ceil(RELAY_FRAME_LIMITS.hostToShimBytes / 2) + IMAGE_LIMITS.maxImages * 1600), "123456"]);
+    for (const k of CLI_VARS) {
+      assertEnvName(k);
+      assertEnvValue(turn.env[k]);
+    }
+  });
+
+  it("MUTATION TARGET: the call clock is clamped to the CLI's own range (at least 1000 ms, at most 2^31-1)", () => {
+    expect(relayCliEnv(5).MCP_TOOL_TIMEOUT).toBe("1000");
+    expect(relayCliEnv(Number.NaN).MCP_TOOL_TIMEOUT).toBe("1000");
+    expect(relayCliEnv(1e12).MCP_TOOL_TIMEOUT).toBe("2147483647");
+  });
+
+  it("MUTATION TARGET: a legacy turn's environment has none of them (byte-identical to before)", async () => {
+    const rig = makeRig();
+    rig.scenario({ turn: [RESULT_STEP] });
+    const session = await rig.adapter.openSession(rig.ctx, { connectionId: "conn1", epoch: 1 });
+    for await (const ev of session.turn({ turnId: "t1", prompt: "go", model: "sonnet", bridgeToken: "TOKEN-0123456789-abcdef" })) void ev;
+    await session.close();
+    for (const sp of rig.spawns) for (const k of [...CLI_VARS, "AW_TURN_TOOLS"]) expect(Object.keys(sp.env)).not.toContain(k);
   });
 });
 
