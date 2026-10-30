@@ -25,9 +25,14 @@ export function getRoleModelOptions(role: ModelRole): string[] {
   // Same dimensions alone do NOT make two embedding spaces compatible. Only the
   // existing OpenRouter model is selectable until a separate reindex migration exists.
   if (role === 'embedding') return ['openai/text-embedding-3-large'];
-  return Object.entries(LLM_MODEL_REGISTRY).filter(([id, m]) =>
+  const options = Object.entries(LLM_MODEL_REGISTRY).filter(([id, m]) =>
     !successors.has(id) && !m.legacy && llmCanRunRole(m, role),
   ).map(([id]) => id);
+  // The role's own default is always a valid choice, even when the picker would hide it as
+  // superseded. Otherwise an org cannot save the default (the PUT 400s) and an override of it
+  // resolves to its successor (ENG-2720: gpt-5.6-luna -> gpt-6-luna).
+  const roleDefault = FALLBACKS[role];
+  return options.includes(roleDefault) || !canRunPersistedDefault(role, roleDefault) ? options : [...options, roleDefault];
 }
 
 // A persisted admin default is honoured even when the picker hides it (a legacy

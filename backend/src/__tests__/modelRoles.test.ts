@@ -45,6 +45,18 @@ it('filters role capabilities and restricts embeddings to the existing 1536-dime
   expect(getRoleModelOptions('embedding')).toEqual(['openai/text-embedding-3-large']);
   expect(getRoleModelOptions('chat')).not.toContain('openrouter/perplexity/sonar-pro-search');
 });
+it('lets an org save the enrichment default even though the picker hides it as superseded (ENG-2720)', async () => {
+  const luna = 'openrouter/openai/gpt-5.6-luna';
+  expect(getRoleModelOptions('enrichment')).toContain(luna);
+  (orgDb.updateModelRoles as jest.Mock).mockResolvedValue('next');
+  expect((await request(app).put('/').send({ modelRoles: { enrichment: luna }, revision: 'rev' })).status).toBe(200);
+  expect(orgDb.updateModelRoles).toHaveBeenCalledWith('a', { enrichment: luna }, 'rev');
+  (orgDb.getOrgById as jest.Mock).mockResolvedValue({ modelRoles: { enrichment: luna } });
+  expect(await resolveModelForRole('a', 'enrichment')).toBe(luna);
+  const enrichment = (await request(app).get('/')).body.roles.find((r: any) => r.role === 'enrichment');
+  expect(enrichment.allowedModels).toContain(luna);
+  expect(enrichment.effectiveModel).toBe(luna);
+});
 it.each(['get', 'put'])('rejects non-admin %s before touching settings', async method => {
   (userDb.getUserById as jest.Mock).mockResolvedValue({ orgId: 'a', orgRole: 'member' });
   expect((await (request(app) as any)[method]('/').send({ modelRoles: {}, revision: 'rev' })).status).toBe(403);
