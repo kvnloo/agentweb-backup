@@ -203,8 +203,13 @@ export function refusedAsOldWorker(detail: string | undefined): boolean {
   return /unrecognized_keys|bridgeToken:invalid_type|relay_unsupported/.test(detail ?? "");
 }
 
-/** `CLAUDE_PLAN_ALLOW_LEGACY_BRIDGE`: only the exact string "true" allows the HTTP bridge for a worker older than protocol 4; unset or anything else is off. */
+/**
+ * `CLAUDE_PLAN_ALLOW_LEGACY_BRIDGE`: only the exact string "true" allows the HTTP bridge for a worker older than protocol 4; unset or anything else is off.
+ * NEVER in production: the flag is ignored there. On production the HTTP bridge is a zero-tool stub, and a compromised worker that reports "protocol 3" would
+ * otherwise be handed a bridge token and the bridge by a flag that leaked into the environment. (Dev and test boxes set it explicitly.)
+ */
 export function legacyBridgeAllowed(env: Record<string, string | undefined> = process.env): boolean {
+  if (env.NODE_ENV === "production") return false;
   return env.CLAUDE_PLAN_ALLOW_LEGACY_BRIDGE === "true";
 }
 

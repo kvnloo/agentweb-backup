@@ -669,6 +669,18 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
       expect(marked).toHaveBeenCalledTimes(6);
     });
 
+    it('S5 (M5b): the same 2 s bound holds on the ADMISSION path (the worker says "no such login" and then never answers the status call)', async () => {
+      const t = setup();
+      jest.spyOn(client, 'turnRun').mockRejectedValue(new (require('../loginHostClient').LoginHostError)('ENOTFOUND'));
+      jest.spyOn(client, 'connectionStatus').mockImplementation(() => new Promise(() => undefined) as any);
+      const backend = t.backend();
+      const t0 = Date.now();
+      const err: any = await backend.run(t.params()).catch((e: any) => e);
+      expect(err.code).toBe('needs_reconnect');
+      expect(Date.now() - t0).toBeLessThan(4_000);
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(1_800); // and it really did wait for the bound, not return before trying
+    }, 10_000);
+
     it('S5: a status call that hangs does not hold back the stop (about 2 s at most), and the record is still marked when it answers', async () => {
       const t = setup();
       const marked = jest.spyOn(t.deps, 'markNeedsReconnect');
@@ -834,6 +846,8 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
   it('CLAUDE_PLAN_ALLOW_LEGACY_BRIDGE: only the exact string "true" turns the legacy bridge on; unset, empty and every other value are off', () => {
     expect(legacyBridgeAllowed({})).toBe(false);
     expect(legacyBridgeAllowed({ CLAUDE_PLAN_ALLOW_LEGACY_BRIDGE: 'true' })).toBe(true);
+    expect(legacyBridgeAllowed({ CLAUDE_PLAN_ALLOW_LEGACY_BRIDGE: 'true', NODE_ENV: 'development' })).toBe(true);
+    expect(legacyBridgeAllowed({ CLAUDE_PLAN_ALLOW_LEGACY_BRIDGE: 'true', NODE_ENV: 'production' })).toBe(false); // ignored on production, whatever the flag says
     for (const v of ['', 'false', '1', 'yes', 'TRUE', 'True', ' true', 'true ', '0', 'on']) expect(legacyBridgeAllowed({ CLAUDE_PLAN_ALLOW_LEGACY_BRIDGE: v })).toBe(false);
     expect(legacyBridgeAllowed({ OTHER: 'true' })).toBe(false);
   });

@@ -319,6 +319,8 @@ interface Exec {
   result: BridgeCallResult;
   /** A successful, non-halt, non-collapsed outcome: safe to hand to a joiner or a repeat. */
   shareable: boolean;
+  /** What the MODEL is handed when it differs from `result` (the executor's `answerSuffix`). Never recorded, never shared with a joiner or a repeat. */
+  modelResult?: BridgeCallResult;
 }
 
 interface InFlight {
@@ -950,7 +952,8 @@ export class ToolBridge {
 
       const readOnly = this.isReadOnly(call.name);
       if (readOnly) {
-        return (await this.execute(ctx, admitted)).result;
+        const done = await this.execute(ctx, admitted);
+        return done.modelResult ?? done.result;
       }
 
       // Joining and repeats are decided here, synchronously after the checks above and
@@ -1015,7 +1018,7 @@ export class ToolBridge {
         heldResolve({ done: true, exec });
       }
       this.rememberCompleted(session, key, call, exec);
-      return exec.result;
+      return exec.modelResult ?? exec.result;
     } catch (err) {
       console.error(
         `[tool-bridge] ${call.name} failed for run ${state.claims.runId}:`,
@@ -1277,8 +1280,6 @@ export class ToolBridge {
       ...(outcome.images?.length ? { images: outcome.images } : {}),
     };
     const actual = result;
-    // The model-facing text may carry more than the record keeps (see `answerSuffix`); a refusal or an error never does.
-    if (outcome.answerSuffix && !result.isError && !outcome.requiresConfirmation) result = { ...result, content: result.content + outcome.answerSuffix };
     let shareable = !result.isError && !outcome.requiresConfirmation;
     let staleHalt = false;
 
@@ -1314,7 +1315,13 @@ export class ToolBridge {
       result = refusal(TURN_ENDED_MESSAGE);
       shareable = false;
     }
-    return this.exec(ctx, "executed", result, { outcome, staleHalt, shareable, recordAs: actual });
+    const done = this.exec(ctx, "executed", result, { outcome, staleHalt, shareable, recordAs: actual });
+    // The model-facing text may carry more than the record keeps (see `answerSuffix`). It is added AFTER the record is written and only to the copy the model is
+    // handed: not to the ledger (`answeredContent` is persisted), not to a joiner's or a repeat's copy. A refusal, an error or a preview never gets it.
+    if (outcome.answerSuffix && result === actual && !result.isError && !outcome.requiresConfirmation) {
+      done.modelResult = { ...result, content: result.content + outcome.answerSuffix };
+    }
+    return done;
   }
 
   /**
@@ -1427,7 +1434,11 @@ export class ToolBridge {
       ...(extra.staleHalt ? { staleHalt: true } : {}),
       ...(state.closed ? { late: true } : {}),
     };
-    if ((kind === "executed" || kind === "failed") && ctx.toolCallId && ledger.ran.size < MAX_RAN_IDS) ledger.ran.add(ctx.toolCallId);
+    if ((kind === "executed" || kind === "failed") && ctx.toolCallId) {
+      // the LATEST ids are kept (a late call must still be known to have run); at the cap the oldest goes (a Set iterates in insertion order)
+      if (ledger.ran.size >= MAX_RAN_IDS) ledger.ran.delete(ledger.ran.values().next().value as string);
+      ledger.ran.add(ctx.toolCallId);
+    }
     try {
       this.keep(ledger, entry, ctx.write);
     } catch {
@@ -1451,9 +1462,11 @@ export class ToolBridge {
       this.recordMeta.set(entry, { size, write, shrunk, stub });
     };
     const room = () => fits(MAX_LEDGER_RECORDS, MAX_LEDGER_BYTES);
+    // Which limit binds decides the remedy: cutting records down frees BYTES, never a slot, so it is done only while the bytes are over.
+    const bytesOver = () => ledger.bytes + size > MAX_LEDGER_BYTES;
     if (!write) {
       let counted = false; // `truncated` counts a record once, however many times it is cut
-      if (!room()) this.shrinkOldestBig(ledger, () => room());
+      if (bytesOver()) this.shrinkOldestBig(ledger, () => !bytesOver());
       if (!room() && size > BIG_READ_RECORD_BYTES) {
         const before = size;
         this.shrinkRecord(entry, SHRUNK_READ_CONTENT_BYTES);
@@ -1470,7 +1483,7 @@ export class ToolBridge {
       store(false, counted);
       return;
     }
-    if (!room()) this.shrinkOldestBig(ledger, () => room());
+    if (bytesOver()) this.shrinkOldestBig(ledger, () => !bytesOver());
     while (!room() && this.dropOldestRead(ledger)) {
       /* older reads make room (counted inside) */
     }
@@ -1493,7 +1506,8 @@ export class ToolBridge {
     // The hard ceiling (the HTTP path has no per-run call cap): beyond it the OLDEST writes are cut to stubs, then the oldest stubs are evicted. What ran is still
     // known to `ledger.ran` (replay protection), so an evicted record is only a missing line in the chat, and it is counted.
     while (ledger.records.length >= MAX_LEDGER_RECORDS_HARD || ledger.bytes + size > MAX_LEDGER_BYTES + LEDGER_WRITE_OVERFLOW_BYTES) {
-      if (this.stubifyOldestWrite(ledger)) continue;
+      // the record count binds: cutting writes down would free no slot (it would only damage every kept record), so the oldest record goes; the bytes bind: cut first
+      if (ledger.records.length < MAX_LEDGER_RECORDS_HARD && this.stubifyOldestWrite(ledger)) continue;
       if (!this.evictOldest(ledger)) break;
     }
     store(stub, false);

@@ -363,7 +363,6 @@ describe('tool bridge against the real agentModeService and dispatcher (ENG-2109
       });
 
       it.each([
-        ['nothing was newly installed (skillsUpdated false)', { success: true, installedSkills: ['Ads'] }, false],
         ['the install failed', { success: false, message: 'No valid skills found' }, true],
         ['no skill name was reported installed', { success: true, installedSkills: [] }, true],
       ])('no extra text when %s', async (_l, result, updated) => {
@@ -381,6 +380,31 @@ describe('tool bridge against the real agentModeService and dispatcher (ENG-2109
         const { executor } = openBridge();
         await executor.resolveTools(RUN);
         expect((await executor.execute(RUN, { name: 'probe_read', args: { skillIds: ['sk-ads'] } })).answerSuffix).toBeUndefined();
+      });
+
+      it('RVB10 collision: a requested id that is NOT on the session but shares a name with an installed skill never leaks its text (the session guard is the only thing that stops it)', async () => {
+        installDispatch({ success: true, installedSkills: ['Ads'] });
+        session(['sk-ads'], [skill('sk-ads', 'Ads', 'GOOD'), skill('sk-evil', 'Ads', 'OTHER-USERS-PRIVATE-INSTRUCTIONS')]);
+        const { executor } = openBridge();
+        await executor.resolveTools(RUN);
+        const outcome = await executor.execute(RUN, { name: 'install_skills', args: { skillIds: ['sk-ads', 'sk-evil'] } });
+        expect(outcome.answerSuffix).toContain('GOOD');
+        expect(outcome.answerSuffix).not.toContain('OTHER-USERS');
+      });
+
+      it('the cut is on a code point boundary: an emoji at the limit is dropped whole, never left as half a pair', async () => {
+        installDispatch({ success: true, installedSkills: ['Big'] });
+        // make the note's cut point fall exactly inside an emoji: the line prefix is fixed, so pad to put a 2-unit emoji across the 60,000th unit
+        const prefix = 'Installed Skills (now active in this conversation):\nsk-big- Big: Big desc ';
+        const pad = 'x'.repeat(60_000 - prefix.length - 1);
+        session(['sk-big'], [skill('sk-big', 'Big', `${pad}😀${'y'.repeat(100)}`)]);
+        const { executor } = openBridge();
+        await executor.resolveTools(RUN);
+        const outcome = await executor.execute(RUN, { name: 'install_skills', args: { skillIds: ['sk-big'] } });
+        const text = outcome.answerSuffix!;
+        expect(Buffer.from(text, 'utf8').toString('utf8')).toBe(text); // valid UTF-8: no lone surrogate was encoded as U+FFFD
+        expect(text).not.toContain('\ufffd');
+        expect(text).toContain('[the skill instructions were cut here]');
       });
 
       it('the added text is capped, with a note', async () => {

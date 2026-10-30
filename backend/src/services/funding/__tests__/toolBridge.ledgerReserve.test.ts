@@ -3,6 +3,7 @@
  * send_email that DID execute) was absent from the persisted record. Reads now give way to writes.
  */
 import { ToolBridge, type BridgeExecuteOutcome, type ToolBridgeDeps } from '../toolBridge';
+import { mapLedgerToResponseMessages } from '../claudeTurnMessages';
 
 function rig(writeKb = 0) {
   const executed: string[] = [];
@@ -223,3 +224,108 @@ describe('ledger: a hard ceiling, and `truncated` counts only what was really lo
     expect(t.bridge.takeLedger('r1').truncated).toBe(1);
   });
 });
+
+describe('answerSuffix reaches the model and is never persisted (parity: Emma does not persist the Installed Skills block)', () => {
+  it('the model answer has the suffix; the ledger record, answeredContent and the persisted tool message do not', async () => {
+    const deps = {
+      resolveTools: async () => [{ name: 'install_skills' }],
+      isReadOnly: () => false,
+      isLive: async () => true,
+      execute: async (): Promise<BridgeExecuteOutcome> => ({ content: 'Installed 1', isError: false, requiresConfirmation: false, toolsChanged: false, answerSuffix: '\n\nSUFFIX-TEXT' }),
+    };
+    const bridge = new ToolBridge(deps as unknown as ToolBridgeDeps);
+    const token = bridge.openRun({ runId: 'r1', userId: 'u1', sessionId: 's1', connectionId: 'c1', epoch: 1 });
+    bridge.beginTurn('u1', 's1');
+    const answer = await bridge.callTool(token, { name: 'install_skills', args: {}, callId: 'c1' });
+    expect(answer.content).toBe('Installed 1\n\nSUFFIX-TEXT');
+    const { records } = bridge.takeLedger('r1');
+    expect(records[0].toolMessageContent).toBe('Installed 1');
+    expect(records[0].answeredContent).toBeUndefined();
+    const mapped = mapLedgerToResponseMessages({ ledger: records, finalText: 'done', llm: 'm' });
+    const tool = mapped.responseMessages.find((m: any) => m.role === 'tool');
+    expect(tool.content).toBe('Installed 1');
+    expect(JSON.stringify(mapped.responseMessages)).not.toContain('SUFFIX-TEXT');
+  });
+
+  it('an identical repeat or a joiner is never handed the suffix either', async () => {
+    let n = 0;
+    const deps = {
+      resolveTools: async () => [{ name: 'install_skills' }],
+      isReadOnly: () => false,
+      isLive: async () => true,
+      isStrictEffect: () => true,
+      execute: async (): Promise<BridgeExecuteOutcome> => (n++, { content: 'Installed 1', isError: false, requiresConfirmation: false, toolsChanged: false, answerSuffix: '\n\nSUFFIX-TEXT' }),
+    };
+    const bridge = new ToolBridge(deps as unknown as ToolBridgeDeps);
+    const token = bridge.openRun({ runId: 'r1', userId: 'u1', sessionId: 's1', connectionId: 'c1', epoch: 1 });
+    bridge.beginTurn('u1', 's1');
+    const first = await bridge.callTool(token, { name: 'install_skills', args: { a: 1 }, callId: 'c1' });
+    const again = await bridge.callTool(token, { name: 'install_skills', args: { a: 1 }, callId: 'c2' });
+    expect(first.content).toContain('SUFFIX-TEXT');
+    expect(again.content).not.toContain('SUFFIX-TEXT');
+    expect(JSON.stringify(bridge.takeLedger('r1').records)).not.toContain('SUFFIX-TEXT');
+  });
+});
+
+describe('ledger: the binding limit decides the remedy (count: evict; bytes: cut), each record counted once', () => {
+  it('3,000 tiny writes: the 2,048 newest are kept WHOLE (no stub), 952 oldest evicted, truncated is exactly 952', async () => {
+    const t = rig();
+    for (let i = 0; i < 3000; i++) await t.write(i);
+    const { records, truncated } = t.bridge.takeLedger('r1');
+    expect(records).toHaveLength(2048);
+    expect(truncated).toBe(952);
+    expect(records.every((r) => (r.args as { _truncated?: string })._truncated === undefined)).toBe(true);
+    expect(records[0].toolCallId).toBe('w952');
+  });
+
+  it('a WRITE arriving when the record count binds drops the oldest read and shrinks nothing else', async () => {
+    const t = rig();
+    for (let i = 0; i < 60; i++) await t.read(i, 9);
+    for (let i = 0; i < 452; i++) await t.read(1000 + i, 0.1); // 512 records, bytes well inside the budget
+    await t.write(1);
+    const { records, truncated } = t.bridge.takeLedger('r1');
+    const bigIntact = records.filter((r) => r.name === 'read_it' && (r.args as { i: number }).i < 60 && (r.args as { _truncated?: string })._truncated === undefined).length;
+    expect(bigIntact).toBe(59); // only the oldest read went; the other big reads were not touched
+    expect(truncated).toBe(1);
+    expect(records.some((r) => r.toolCallId === 'w1')).toBe(true);
+  });
+
+  it('with the 512-record limit binding (tiny reads), big old reads are NOT shrunk: nothing is lost except the reads that do not fit', async () => {
+    const t = rig();
+    for (let i = 0; i < 60; i++) await t.read(i, 9); // 60 big reads (the rig adds a 6 KB raw result to each read): whole
+    for (let i = 0; i < 500; i++) await t.read(1000 + i, 0.1); // small reads fill the record count
+    const { records, truncated } = t.bridge.takeLedger('r1');
+    const bigIntact = records.filter((r) => r.name === 'read_it' && (r.args as { i: number }).i < 60 && (r.args as { _truncated?: string })._truncated === undefined).length;
+    expect(bigIntact).toBe(60);
+    expect(records).toHaveLength(512);
+    expect(truncated).toBe(560 - 512);
+  });
+});
+
+describe('ranCall keeps the LATEST ids', () => {
+  it('after 4,200 calls the newest are known to have run and the oldest have aged out (the cap is 4,096)', async () => {
+    const t = rig();
+    for (let i = 0; i < 4200; i++) await t.read(i, 0.01);
+    expect(t.bridge.ranCall('r1', 'r4199')).toBe(true);
+    expect(t.bridge.ranCall('r1', 'r4100')).toBe(true);
+    expect(t.bridge.ranCall('r1', 'r0')).toBe(false);
+  });
+});
+
+describe('answerSuffix is never given to a confirmation preview', () => {
+  it('a call that asks for the user\'s confirmation is answered with its own text only, whatever the executor offers', async () => {
+    const deps = {
+      resolveTools: async () => [{ name: 'send_email' }],
+      isReadOnly: () => false,
+      isLive: async () => true,
+      persistHalt: async () => undefined,
+      execute: async (): Promise<BridgeExecuteOutcome> => ({ content: 'preview TOKEN', isError: false, requiresConfirmation: true, toolsChanged: false, answerSuffix: '\n\nSUFFIX-TEXT', result: { awaitingUserConfirmation: true } }),
+    };
+    const bridge = new ToolBridge(deps as unknown as ToolBridgeDeps);
+    const token = bridge.openRun({ runId: 'r1', userId: 'u1', sessionId: 's1', connectionId: 'c1', epoch: 1 });
+    bridge.beginTurn('u1', 's1');
+    const answer = await bridge.callTool(token, { name: 'send_email', args: {}, callId: 'c1' });
+    expect(answer.content).toBe('preview TOKEN');
+  });
+});
+
