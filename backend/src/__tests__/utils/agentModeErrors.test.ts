@@ -137,6 +137,8 @@ describe('agentModeErrors utils', () => {
 
     it('should detect graceful worker shutdown errors', () => {
       expect(isWorkerShutdownError(new Error('Worker shutdown'))).toBe(true);
+      // ENG-2750: drain-ceiling shutdown is the same deploy-timing class
+      expect(isWorkerShutdownError(new Error('Worker shutdown — drain ceiling exceeded'))).toBe(true);
     });
 
     it('should detect worker process exit errors', () => {

@@ -707,7 +707,7 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
   // the same issue. Collapsing amounts also lets pre-ENG-358 open canonicals (no class marker in
   // their body yet) keep matching new classed occurrences instead of spawning a parallel canonical.
   const norm = (s: string) => (s || '').trim().toLowerCase().replace(/\$[\d,]+(?:\.\d+)?/g, '$').replace(/\s+/g, ' ');
-  const open = await listOpenIssuesByLabel('Auto', 50);
+  const open = await listOpenIssuesByLabel('Auto');
   // Dedup gate (ENG-240 / ENG-358). One failure event must never spawn 2-3 issues, and a recurring
   // alert must never file per occurrence, whichever filer reacts to it:
   //  1. Alert class — an open Auto issue whose body carries this alert's `Alert Class: <name>`
@@ -850,7 +850,7 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
   // any failure here returns the created issue exactly as before.
   try {
     const issueNumber = (identifier: string) => Number(String(identifier).split('-').pop()) || Number.MAX_SAFE_INTEGER;
-    const after = await listOpenIssuesByLabel('Auto', 50);
+    const after = await listOpenIssuesByLabel('Auto');
     const matches = after.filter(
       (i) =>
         i.identifier === li.identifier ||

@@ -284,6 +284,31 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
       await drain(f);
     });
 
+    it("puts the event webhook on the campaign once, BEFORE the first contact is added, and carries on if that fails", async () => {
+      const order: string[] = [];
+      const e = env();
+      const realAdd = e.deps.smartlead.addLeads;
+      e.deps.smartlead.addLeads = (k, c, x) => { order.push("add"); return realAdd(k, c, x); };
+      (e.deps as any).registerEvents = jest.fn(async (_k: string, accountId: string, campaignId: number) => { order.push(`register ${accountId} ${campaignId}`); return "created"; });
+      const p = await approve(e);
+      expect(await e.svc.start("owner", go(p.token))).toMatchObject({ ok: true, started: true });
+      await drain(e);
+      expect(order[0]).toBe(`register smartlead-owner ${CAMPAIGN}`);
+      expect(order.filter(x => x.startsWith("register"))).toHaveLength(1);
+      expect(order).toContain("add");
+      expect(e.logs.join("\n")).toContain("event webhook: created");
+
+      const f = env();
+      (f.deps as any).registerEvents = jest.fn(async () => { throw new Error("smartlead 500 with api_key=SECRETKEY"); });
+      const q = await approve(f);
+      const started = (await f.svc.start("owner", go(q.token))) as any;
+      expect(started).toMatchObject({ ok: true, started: true });
+      await drain(f);
+      expect((await db.getRun(started.run.runId))!.status).toBe("completed"); // the push was not stopped
+      expect(f.logs.join("\n")).toContain("event webhook not registered");
+      expect(f.logs.join("\n")).not.toContain("SECRETKEY"); // keys never reach the log
+    });
+
     it("lets exactly one of two simultaneous starts win; the other is told which run is live", async () => {
       const e = env({ maxConcurrentWorkers: 0 }); // no worker, so the run stays live
       const p = await approve(e);

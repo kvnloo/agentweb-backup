@@ -12,9 +12,16 @@
  * Grandfathering: keys have defaulted to both scopes since creation; a legacy
  * record with no `scopes` array is treated the same, so no live integration
  * loses access. No stored data is rewritten.
+ *
+ * Opt-in scopes (e.g. `email:read`) are different: a tool that declares one via
+ * its registry `requiredScope` is callable only by an `aw_` key that holds that
+ * exact scope. `tools:execute` does NOT imply it, and it is not in the default
+ * set, so no existing or default key gains the capability. Every other auth
+ * method (OAuth, anonymous) is refused such tools outright.
  */
 export const API_KEY_SCOPE_READ = 'tools:read';
 export const API_KEY_SCOPE_EXECUTE = 'tools:execute';
+export const API_KEY_SCOPE_EMAIL_READ = 'email:read';
 export const DEFAULT_API_KEY_SCOPES = [API_KEY_SCOPE_READ, API_KEY_SCOPE_EXECUTE];
 
 export function effectiveApiKeyScopes(scopes: unknown): string[] {
@@ -26,15 +33,40 @@ export interface ScopeDenial {
   requiredScope: string;
 }
 
-type ToolLookup = (name: string) => { readOnly?: boolean } | undefined;
+type ToolLookup = (name: string) => { readOnly?: boolean; requiredScope?: string } | undefined;
 
 export function requiredScopeForTool(name: string, lookup: ToolLookup): string {
-  return lookup(name)?.readOnly === true ? API_KEY_SCOPE_READ : API_KEY_SCOPE_EXECUTE;
+  const tool = lookup(name);
+  if (tool?.requiredScope) return tool.requiredScope;
+  return tool?.readOnly === true ? API_KEY_SCOPE_READ : API_KEY_SCOPE_EXECUTE;
+}
+
+function isOptInScope(scope: string): boolean {
+  return scope !== API_KEY_SCOPE_READ && scope !== API_KEY_SCOPE_EXECUTE;
 }
 
 function scopeSatisfies(granted: string[], required: string): boolean {
+  // An opt-in scope must be held explicitly — tools:execute never implies it.
+  if (isOptInScope(required)) return granted.includes(required);
   if (granted.includes(API_KEY_SCOPE_EXECUTE)) return true;
   return granted.includes(required);
+}
+
+/**
+ * For non-API-key external callers (OAuth, anonymous): returns the first
+ * tools/call that targets a tool gated on an opt-in scope. Those tools exist
+ * only for `aw_` keys explicitly granted the scope, so any other auth method is
+ * refused regardless of what else it may do.
+ */
+export function findApiKeyOnlyToolCall(body: unknown, lookup: ToolLookup): ScopeDenial | null {
+  const messages = Array.isArray(body) ? body : [body];
+  for (const message of messages) {
+    if ((message as any)?.method !== 'tools/call') continue;
+    const tool = String((message as any)?.params?.name ?? '');
+    const requiredScope = lookup(tool)?.requiredScope;
+    if (requiredScope && isOptInScope(requiredScope)) return { tool, requiredScope };
+  }
+  return null;
 }
 
 /** Returns the first tools/call in a (possibly batched) JSON-RPC body the key may not make. */
