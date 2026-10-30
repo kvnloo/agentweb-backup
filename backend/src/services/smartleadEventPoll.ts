@@ -155,12 +155,43 @@ export async function eventPoll(deps: PollDeps): Promise<PollResult> {
         logOnce(deps, `${campaignId}#size`, `[SmartleadPoll] campaign=${campaignId}: could not read the campaign's size (${scrubSmartleadSecrets(error instanceof Error ? error.message : String(error)).slice(0, 80)}); bounces and replies are not polled for it this pass`);
       }
       let flagUnset = 0;
+      // Smartlead's `is_bounced` list ALSO holds contacts whose bounce came from OUR side (the sending mailbox was refused or is broken), flagged
+      // `sender_bounce` on the email: on two real campaigns (2026-10-30) that was 41 of 57 and 2 of 9. Those say nothing about the contact's address,
+      // and blocking them would withdraw reachable contacts in Smartlead for good. Smartlead lists them separately (`is_sender_bounced`), so a
+      // contact counts as bounced only when it is in the first list and NOT in the second. Read once per pass, and only if a bounce needs it.
+      let senderSide: Set<string> | null | undefined; // undefined: not read yet; null: could not be read in full
+      const readSenderSide = async (): Promise<Set<string> | null> => {
+        const ids = new Set<string>();
+        const pages = deps.maxPages ?? POLL_MAX_PAGES;
+        for (let page = 0; page < pages; page++) {
+          const { total, rows: leads } = await deps.smartlead.listLeads(resolved!.apiKey, campaignId, "is_sender_bounced", page * PAGE, PAGE);
+          for (const l of leads) ids.add(l.leadId);
+          if ((page + 1) * PAGE >= total || leads.length === 0) return ids;
+        }
+        return null; // more than the pages read: the exclusion cannot be proven, so no bounce is acted on
+      };
 
       for (const { status: emailStatus, kind } of STATUSES) {
         // Without the campaign's size there is no defence against a filter that was ignored, and a bounce ends in an irreversible withdrawal: skip
         // the kinds that rest on the filter alone. Opt-outs carry Smartlead's own flag on each contact, so they are still read.
         if (campaignSize === undefined && kind !== "unsubscribe") continue;
         const maxPages = deps.maxPages ?? POLL_MAX_PAGES;
+        if (kind === "bounce") {
+          if (senderSide === undefined) {
+            try {
+              senderSide = await readSenderSide();
+            } catch (error) {
+              if (error instanceof SmartleadApiError && (error.status === 401 || error.status === 403)) throw error;
+              senderSide = null;
+              logOnce(deps, `${campaignId}#sender#read`, `[SmartleadPoll] campaign=${campaignId}: could not read Smartlead's sender-side bounces (${scrubSmartleadSecrets(error instanceof Error ? error.message : String(error)).slice(0, 80)})`);
+            }
+          }
+          if (senderSide === null) {
+            out.errors++;
+            logOnce(deps, `${campaignId}#sender#skip`, `[SmartleadPoll] campaign=${campaignId}: sender-side bounces are not known, so bounces are not acted on for it this pass`);
+            continue;
+          }
+        }
         // One read failing (a rate limit, a timeout) must not cost the other kinds of event, every hour, because the order is fixed. A key that
         // is refused is the exception: nothing else can work, so it goes to the campaign's handler below.
         try {
@@ -176,6 +207,8 @@ export async function eventPoll(deps: PollDeps): Promise<PollResult> {
             for (const lead of leads) {
               // An opt-out is believed only when Smartlead's own flag on the contact says so, however the row was found.
               if (kind === "unsubscribe" && !lead.unsubscribed) { if (emailStatus) flagUnset++; continue; }
+              // A bounce from our own sending side is not about this contact.
+              if (kind === "bounce" && senderSide!.has(lead.leadId)) continue;
               const memo = `${accountId}#${campaignId}#${kind}#${lead.leadId}`;
               const last = seen.get(memo);
               if (last !== undefined && deps.now().getTime() - last.at < last.for) continue;

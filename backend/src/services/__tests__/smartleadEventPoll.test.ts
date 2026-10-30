@@ -17,6 +17,8 @@ interface World {
   listFails?: number;
   failStatus?: number;
   campaignSize?: number;
+  /** Smartlead statuses whose read fails (a rate limit, a timeout). */
+  failOn?: string[];
   calls: string[];
 }
 const world = (over: Partial<World> = {}): World => ({ runs: [run("r1", 77)], campaigns: { 77: { status: "ACTIVE" } }, leads: {}, handled: [], logs: [], keyOk: true, calls: [], ...over });
@@ -33,6 +35,7 @@ function deps(w: World, extra: Partial<PollDeps> = {}): PollDeps {
       campaignStatus: async (_k, c) => w.campaigns[c]?.status ?? null,
       listLeads: async (_k, c, status, offset, limit) => {
         w.calls.push(`${c}:${status}:${offset}`);
+        if (w.failOn?.includes(String(status))) throw new SmartleadApiError("smartlead 429 api_key=SECRETKEY", 429);
         if (w.listFails && limit !== 1) { w.listFails--; throw new SmartleadApiError("smartlead 500 api_key=SECRETKEY", w.failStatus ?? 500); }
         // The campaign's own size (the plain listing) is bigger than any filtered answer unless a test says otherwise.
         if (status === null && !w.leads["null"]?.[c]) return { total: w.campaignSize ?? 1000, rows: [] };
@@ -63,7 +66,7 @@ describe("the hourly event poll (ENG-673)", () => {
   it("reads replies and bounces with a status filter, and opt-outs both filtered and from the plain listing", async () => {
     const w = world();
     await eventPoll(deps(w));
-    expect(w.calls.map(c => c.split(":")[1]).sort()).toEqual(["is_bounced", "is_replied", "is_unsubscribed", "null", "null"]); // the second null is the campaign's size
+    expect(w.calls.map(c => c.split(":")[1]).sort()).toEqual(["is_bounced", "is_replied", "is_sender_bounced", "is_unsubscribed", "null", "null"]); // the second null is the campaign's size; is_sender_bounced is subtracted from the bounces
   });
 
   it("recovers an opt-out Smartlead's own filter does not list: a plain-listing row flagged unsubscribed (live finding), and skips unflagged rows", async () => {
@@ -172,7 +175,7 @@ describe("the hourly event poll (ENG-673)", () => {
     expect(out.errors).toBe(1);
     expect(reported).toHaveLength(1);
     expect(w.calls.filter(c => c.startsWith("1:"))).toHaveLength(2); // the size read, then the refused one; nothing more was asked with that key
-    expect(w.calls.filter(c => c.startsWith("2:"))).toHaveLength(5);
+    expect(w.calls.filter(c => c.startsWith("2:"))).toHaveLength(6);
   });
 
   it("one failed read costs only that read: the other kinds of event are still asked for", async () => {
@@ -239,6 +242,35 @@ describe("the hourly event poll (ENG-673)", () => {
     expect(w.handled.map(h => h.event.kind)).toEqual(["reply", "reply"]); // no bounce was acted on; the believable reply answer (2 of 40) is still used
     expect(out.errors).toBe(1);
     expect(w.logs.join("\n")).toContain("treated as an ignored filter");
+  });
+
+  it("a bounce from OUR sending side is not the contact's: only contacts in the bounced list and NOT in the sender-side list are acted on", async () => {
+    const w = world({ campaignSize: 1000, leads: { is_bounced: { 77: rows(6, "b") }, is_sender_bounced: { 77: rows(4, "b") } } });
+    await eventPoll(deps(w));
+    expect(w.handled.filter(h => h.event.kind === "bounce").map(h => h.event.eventKey)).toEqual(["poll:bounce:77:b4", "poll:bounce:77:b5"]);
+  });
+
+  it("when every bounced contact is sender-side, nothing is blocked (the real shape: 41 of 57 on one campaign)", async () => {
+    const w = world({ campaignSize: 1000, leads: { is_bounced: { 77: rows(41, "b") }, is_sender_bounced: { 77: rows(41, "b") } } });
+    await eventPoll(deps(w));
+    expect(w.handled.filter(h => h.event.kind === "bounce")).toHaveLength(0);
+  });
+
+  it("if the sender-side list cannot be read, NO bounce is acted on that pass (opt-outs and replies still are), and it is said once", async () => {
+    const w = world({ campaignSize: 1000, failOn: ["is_sender_bounced"], leads: { is_bounced: { 77: rows(3, "b") }, is_replied: { 77: rows(1, "r") }, is_unsubscribed: { 77: rows(1, "u", true) } } });
+    const out = await eventPoll(deps(w));
+    await eventPoll(deps(w));
+    expect(w.handled.map(h => h.event.kind)).toEqual(["unsubscribe", "reply"]); // once each: the second pass repeats nothing
+    expect(out.errors).toBeGreaterThan(0);
+    expect(w.logs.filter(l => l.includes("sender-side bounces are not known"))).toHaveLength(1);
+    expect(w.logs.join("\n")).not.toContain("SECRETKEY");
+  });
+
+  it("if there are more sender-side bounces than are read, the exclusion cannot be proven, so no bounce is acted on", async () => {
+    // the sender-side list (150) is longer than the one page read; the first page of bounces (b0-b99) overlaps only part of what WAS read (b50-b149)
+    const w = world({ campaignSize: 1000, leads: { is_bounced: { 77: rows(200, "b") }, is_sender_bounced: { 77: rows(200, "b").slice(50) } } });
+    await eventPoll(deps(w, { maxPages: 1 }));
+    expect(w.handled.filter(h => h.event.kind === "bounce")).toHaveLength(0);
   });
 
   it("a small pilot campaign is protected too: a bounce filter that listed all 6 of 6 contacts is refused", async () => {
