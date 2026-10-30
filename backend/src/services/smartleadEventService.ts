@@ -71,11 +71,21 @@ export class SmartleadEventService {
       // The Smartlead lead behind a contact is ONE lead across all of the account's campaigns, and our withdrawal unsubscribes it account-wide
       // (verified on a real account, 2026-10-30: unsubscribing it in one campaign shows it unsubscribed and blocked in the others too). So once
       // ANY marker of ANY of these leads is withdrawn, the poll must not read that opt-out back as news in another campaign or list either.
+      // The index spans every customer, so a withdrawn marker counts only when its own run belongs to THIS Smartlead account: another customer's marker
+      // that happens to carry the same id text must never suppress ours.
       const withdrawnSmartleadIds = new Set<string>();
       if (event.polled && event.kind !== "reply") {
+        const runAccount = new Map<string, Promise<string | undefined>>();
+        const accountOf = (runId: string) => {
+          let p = runAccount.get(runId);
+          if (!p) { p = this.deps.getRun(runId).then(r => r?.smartleadAccountId); runAccount.set(runId, p); }
+          return p;
+        };
         for (const l of found) {
           for (const [key, value] of Object.entries((l?.system ?? {}) as Record<string, any>)) {
-            if (key.startsWith("smartlead_") && value && typeof value.smartleadLeadId === "string" && (value.state === "withdrawn" || !!value.withdrawnAt)) withdrawnSmartleadIds.add(value.smartleadLeadId);
+            if (!key.startsWith("smartlead_") || !value || typeof value.smartleadLeadId !== "string" || typeof value.runId !== "string") continue;
+            if (!(value.state === "withdrawn" || !!value.withdrawnAt)) continue;
+            if ((await accountOf(value.runId)) === ctx.accountId) withdrawnSmartleadIds.add(value.smartleadLeadId);
           }
         }
       }

@@ -26,10 +26,18 @@ const PAGE = 100;
 export const POLL_MAX_PAGES = 10;
 /** A contact handled this recently is not looked up again (kept in memory; a restart only costs some repeat lookups). */
 const SEEN_FOR_MS = 6 * 60 * 60 * 1000;
-/** A contact that matched nobody in the CRM (not pushed by us, or the email lookup lagging) is looked at again sooner. */
-const UNMATCHED_SEEN_FOR_MS = 30 * 60 * 1000;
-/** A filtered answer that lists at least this many contacts AND the whole campaign is taken to mean the filter was ignored. */
-const FILTER_IGNORED_MIN = 20;
+/**
+ * A contact that matched nobody in the CRM (the customer's own contacts, our withdrawn ones, or an email lookup that lagged) is looked at again
+ * after this. Longer than the hourly cadence, so a pass does not repeat the lookup for every such contact each time; short enough that a lookup
+ * that lagged is retried the same day.
+ */
+const UNMATCHED_SEEN_FOR_MS = 2 * 60 * 60 * 1000;
+/**
+ * A filtered answer that lists at least this many contacts AND the whole campaign is taken to mean the filter was ignored. Low, because a bounce is
+ * acted on without any per-contact evidence and ends in an irreversible withdrawal; a small campaign where everyone really did bounce or reply is
+ * refused too (logged, and the webhook still delivers those).
+ */
+const FILTER_IGNORED_MIN = 5;
 const LOG_EVERY_MS = 24 * 60 * 60 * 1000;
 
 /**
@@ -144,10 +152,14 @@ export async function eventPoll(deps: PollDeps): Promise<PollResult> {
         campaignSize = (await deps.smartlead.listLeads(resolved.apiKey, campaignId, null, 0, 1)).total;
       } catch (error) {
         if (error instanceof SmartleadApiError && (error.status === 401 || error.status === 403)) throw error;
-        // size unknown: the check below is skipped, nothing else depends on it
+        logOnce(deps, `${campaignId}#size`, `[SmartleadPoll] campaign=${campaignId}: could not read the campaign's size (${scrubSmartleadSecrets(error instanceof Error ? error.message : String(error)).slice(0, 80)}); bounces and replies are not polled for it this pass`);
       }
+      let flagUnset = 0;
 
       for (const { status: emailStatus, kind } of STATUSES) {
+        // Without the campaign's size there is no defence against a filter that was ignored, and a bounce ends in an irreversible withdrawal: skip
+        // the kinds that rest on the filter alone. Opt-outs carry Smartlead's own flag on each contact, so they are still read.
+        if (campaignSize === undefined && kind !== "unsubscribe") continue;
         const maxPages = deps.maxPages ?? POLL_MAX_PAGES;
         // One read failing (a rate limit, a timeout) must not cost the other kinds of event, every hour, because the order is fixed. A key that
         // is refused is the exception: nothing else can work, so it goes to the campaign's handler below.
@@ -163,7 +175,7 @@ export async function eventPoll(deps: PollDeps): Promise<PollResult> {
             }
             for (const lead of leads) {
               // An opt-out is believed only when Smartlead's own flag on the contact says so, however the row was found.
-              if (kind === "unsubscribe" && !lead.unsubscribed) continue;
+              if (kind === "unsubscribe" && !lead.unsubscribed) { if (emailStatus) flagUnset++; continue; }
               const memo = `${accountId}#${campaignId}#${kind}#${lead.leadId}`;
               const last = seen.get(memo);
               if (last !== undefined && deps.now().getTime() - last.at < last.for) continue;
@@ -195,6 +207,7 @@ export async function eventPoll(deps: PollDeps): Promise<PollResult> {
           logOnce(deps, `${campaignId}#read#${kind}#${emailStatus}`, `[SmartleadPoll] campaign=${campaignId}: could not read ${emailStatus ?? "the listing"}: ${text}`);
         }
       }
+      if (flagUnset > 0) logOnce(deps, `${campaignId}#flagunset`, `[SmartleadPoll] campaign=${campaignId}: ${flagUnset} contact(s) came back from Smartlead's unsubscribed filter without the unsubscribed flag set; not acted on (if this keeps appearing, link unsubscribes may not set the flag)`);
     } catch (error) {
       out.errors++;
       // A revoked or expired key is flagged on the connection (as the withdrawal sweep does), so the customer is told to reconnect.

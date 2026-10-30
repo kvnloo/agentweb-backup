@@ -359,25 +359,49 @@ describe("events found by the hourly poll (ENG-673)", () => {
     const withdrawn = { ...marker("run-other", "withdrawn"), smartleadLeadId: "SL-1", withdrawnAt: "2026-10-29T11:00:00.000Z" };
     const pushedHere = { ...marker("run-ok"), smartleadLeadId: "SL-1" };
     // the same lead pushed to two campaigns, withdrawn from the first, resubscribed in the CRM
-    const same = world({ leads: [lead("L1", "a", "ann@example.com", { contactStatus: "active", system: { smartlead_55: withdrawn, [`smartlead_${CAMPAIGN}`]: pushedHere } })] });
+    const runs = { "run-ok": { smartleadAccountId: ACCOUNT, campaignId: CAMPAIGN, campaignName: "Q4" }, "run-other": { smartleadAccountId: ACCOUNT, campaignId: 55 } };
+    const same = world({ runs, leads: [lead("L1", "a", "ann@example.com", { contactStatus: "active", system: { smartlead_55: withdrawn, [`smartlead_${CAMPAIGN}`]: pushedHere } })] });
     await make(same).handle(ctx, polled("unsubscribe"));
     expect(same.leads[0].contactStatus).toBe("active");
     expect(same.appended).toHaveLength(0);
     // another lead record of the same person, in another list, pushed to this campaign
-    const other = world({ leads: [
+    const other = world({ runs, leads: [
       lead("L1", "a", "ann@example.com", { system: { smartlead_55: withdrawn } }),
       lead("L2", "b", "ann@example.com", { system: { [`smartlead_${CAMPAIGN}`]: pushedHere } }),
     ] });
     await make(other).handle(ctx, polled("unsubscribe"));
     expect(other.leads[1].contactStatus).toBeUndefined();
     // a different Smartlead lead id is not affected
-    const unrelated = world({ leads: [lead("L1", "a", "ann@example.com", { system: { smartlead_55: withdrawn, [`smartlead_${CAMPAIGN}`]: { ...marker("run-ok"), smartleadLeadId: "SL-2" } } })] });
+    const unrelated = world({ runs, leads: [lead("L1", "a", "ann@example.com", { system: { smartlead_55: withdrawn, [`smartlead_${CAMPAIGN}`]: { ...marker("run-ok"), smartleadLeadId: "SL-2" } } })] });
     await make(unrelated).handle(ctx, polled("unsubscribe"));
     expect(unrelated.leads[0].contactStatus).toBe("unsubscribed");
     // the webhook is never held back by this
-    const hook = world({ leads: [lead("L1", "a", "ann@example.com", { system: { smartlead_55: withdrawn, [`smartlead_${CAMPAIGN}`]: pushedHere } })] });
+    const hook = world({ runs, leads: [lead("L1", "a", "ann@example.com", { system: { smartlead_55: withdrawn, [`smartlead_${CAMPAIGN}`]: pushedHere } })] });
     await make(hook).handle(ctx, unsub());
     expect(hook.leads[0].contactStatus).toBe("unsubscribed");
+  });
+
+  it("another customer's withdrawn marker with the same Smartlead id text does not suppress ours: only a marker whose run is THIS account's counts", async () => {
+    const theirs = { ...marker("run-theirs", "withdrawn"), smartleadLeadId: "SL-1", withdrawnAt: "2026-10-29T11:00:00.000Z" };
+    const w = world({
+      leads: [
+        lead("L1", "a", "ann@example.com", { userId: "someone-else", system: { smartlead_55: theirs } }),
+        lead("L2", "b", "ann@example.com", { system: { [`smartlead_${CAMPAIGN}`]: { ...marker("run-ok"), smartleadLeadId: "SL-1" } } }),
+      ],
+      runs: { "run-ok": { smartleadAccountId: ACCOUNT, campaignId: CAMPAIGN, campaignName: "Q4" }, "run-theirs": { smartleadAccountId: "smartlead-other-tenant", campaignId: 55 } },
+    });
+    await make(w).handle(ctx, polled("unsubscribe"));
+    expect(w.leads[1].contactStatus).toBe("unsubscribed");
+    // and ours, in the same account, still suppresses
+    const mine = world({
+      leads: [
+        lead("L1", "a", "ann@example.com", { system: { smartlead_55: { ...marker("run-mine", "withdrawn"), smartleadLeadId: "SL-1", withdrawnAt: "2026-10-29T11:00:00.000Z" } } }),
+        lead("L2", "b", "ann@example.com", { system: { [`smartlead_${CAMPAIGN}`]: { ...marker("run-ok"), smartleadLeadId: "SL-1" } } }),
+      ],
+      runs: { "run-ok": { smartleadAccountId: ACCOUNT, campaignId: CAMPAIGN }, "run-mine": { smartleadAccountId: ACCOUNT, campaignId: 55 } },
+    });
+    await make(mine).handle(ctx, polled("unsubscribe"));
+    expect(mine.leads[1].contactStatus).toBeUndefined();
   });
 
   it("the poll still reads a contact released without a withdrawal (still live in Smartlead), and a reply from a withdrawn one", async () => {

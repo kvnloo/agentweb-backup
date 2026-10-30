@@ -50,15 +50,16 @@ function cleanAddress(raw: string): string {
   return s.slice(start, end);
 }
 
-/** Plain addresses from a to/cc/bcc value: a string (comma or semicolon separated, "Name <a@b>" allowed) or an array of them. */
-export function addressesOf(value: unknown): string[] {
+/** Addresses from a to/cc/bcc value, and whether any piece was too long to look at (see MAX_PIECE). */
+function parseAddresses(value: unknown): { addresses: string[]; oversize: boolean } {
+  let oversize = false;
   const parts = Array.isArray(value) ? value.flat(Infinity) : typeof value === "string" ? [value] : [];
   const out = new Set<string>();
   for (const part of parts) {
     if (typeof part !== "string") continue;
     for (const piece of part.split(/[;,]/)) {
       // No address is longer than 254 characters: a longer piece is not matched (the regexes below are quadratic on long input with no address).
-      if (piece.length > MAX_PIECE) continue;
+      if (piece.length > MAX_PIECE) { oversize = true; continue; }
       const bracketed = [...piece.matchAll(/<(?:mailto:)?([^<>\s]+@[^<>\s]+)>/gi)];
       const found = bracketed.length > 0 ? bracketed : [...piece.matchAll(/(?:mailto:)?([^\s<>"';,:]+@[^\s<>"';,]+)/gi)];
       // Punctuation and a mailto query around an address are not part of it: `(a@x.com)`, `a@x.com.`, `a@x.com?subject=hi`. A lookup with them left on would miss.
@@ -68,12 +69,20 @@ export function addressesOf(value: unknown): string[] {
       }
     }
   }
-  return [...out];
+  return { addresses: [...out], oversize };
+}
+
+/** Plain addresses from a to/cc/bcc value: a string (comma or semicolon separated, "Name <a@b>" allowed) or an array of them. */
+export function addressesOf(value: unknown): string[] {
+  return parseAddresses(value).addresses;
 }
 
 /** The addresses among `recipients` that belong to a do-not-contact lead of ours (see above). Throws when it cannot be sure. */
 export async function blockedRecipients(userIds: Array<string | undefined>, ...recipients: unknown[]): Promise<string[]> {
-  const addresses = recipients.flatMap(addressesOf).filter((a, i, all) => all.indexOf(a) === i);
+  const parsed = recipients.map(parseAddresses);
+  // A piece too long to look at (a huge display name) could hide an address: not being able to check it means not sending, like a failed lookup.
+  if (parsed.some(p => p.oversize)) throw new Error("A recipient is too long to check against do-not-contact");
+  const addresses = parsed.flatMap(p => p.addresses).filter((a, i, all) => all.indexOf(a) === i);
   if (addresses.length === 0) return [];
   const owners = await ownerSet(userIds);
   const listOwners = new Map<string, string | undefined>();
