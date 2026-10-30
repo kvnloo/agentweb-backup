@@ -100,6 +100,13 @@ describe("blocking by address (agent email tools, the Emma API) (ENG-673)", () =
     expect(addressesOf(`${"a".repeat(5000)}, ok@x.com`)).toEqual(["ok@x.com"]);
   });
 
+  it("a recipient too long to look at REFUSES the send instead of being skipped, even next to a fine address", async () => {
+    db.findAllLeadsByEmail.mockResolvedValue([]);
+    await expect(blockedRecipients(["u1"], `"${"N".repeat(700)}" <hidden@x.com>`)).rejects.toThrow("too long to check");
+    await expect(blockedRecipients(["u1"], "ok@x.com", ["fine@x.com", "z".repeat(700)])).rejects.toThrow("too long to check");
+    expect(await blockedRecipients(["u1"], "ok@x.com")).toEqual([]);
+  });
+
   it("does no lookup at all for a send with no address", async () => {
     expect(await blockedRecipients(["u1"], undefined, "")).toEqual([]);
     expect(db.findAllLeadsByEmail).not.toHaveBeenCalled();

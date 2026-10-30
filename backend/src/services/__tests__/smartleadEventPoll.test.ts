@@ -217,14 +217,17 @@ describe("the hourly event poll (ENG-673)", () => {
     expect(w.handled).toHaveLength(1);
   });
 
-  it("a contact that matched nobody in the CRM is looked at again after thirty minutes, one that matched after six hours", async () => {
+  it("a contact that matched nobody in the CRM is looked at again after two hours (not every hourly pass), one that matched after six hours", async () => {
     const w = world({ leads: { is_bounced: { 77: rows(1, "b") }, is_replied: { 77: rows(1, "r") } } });
     const d = deps(w, { events: { handle: async (ctx, event) => { w.handled.push({ ctx, event }); return { matched: event.kind === "bounce" ? 1 : 0, changed: 0, duplicates: 0 }; } } });
     await eventPoll(d);
     expect(w.handled).toHaveLength(2);
-    clock += 31 * 60 * 1000;
+    clock += 61 * 60 * 1000; // the next hourly pass: nothing is repeated
     await eventPoll(d);
-    expect(w.handled.map(h => h.event.kind)).toEqual(["bounce", "reply", "reply"]); // only the unmatched one again
+    expect(w.handled).toHaveLength(2);
+    clock += 61 * 60 * 1000; // two hours on: only the unmatched one again
+    await eventPoll(d);
+    expect(w.handled.map(h => h.event.kind)).toEqual(["bounce", "reply", "reply"]);
     clock += 6 * 60 * 60 * 1000;
     await eventPoll(d);
     expect(w.handled).toHaveLength(5);
@@ -238,10 +241,38 @@ describe("the hourly event poll (ENG-673)", () => {
     expect(w.logs.join("\n")).toContain("treated as an ignored filter");
   });
 
-  it("a small campaign where everyone really did reply is not mistaken for an ignored filter", async () => {
-    const w = world({ campaignSize: 5, leads: { is_replied: { 77: rows(5, "r") } } });
+  it("a small pilot campaign is protected too: a bounce filter that listed all 6 of 6 contacts is refused", async () => {
+    const w = world({ campaignSize: 6, leads: { is_bounced: { 77: rows(6, "b") } } });
+    const out = await eventPoll(deps(w));
+    expect(w.handled).toHaveLength(0);
+    expect(out.errors).toBe(1);
+    expect(w.logs.join("\n")).toContain("treated as an ignored filter");
+  });
+
+  it("a few bounces in a campaign of 4 (under the guard's minimum) are still acted on", async () => {
+    const w = world({ campaignSize: 4, leads: { is_bounced: { 77: rows(2, "b") } } });
     await eventPoll(deps(w));
-    expect(w.handled.filter(h => h.event.kind === "reply")).toHaveLength(5);
+    expect(w.handled.filter(h => h.event.kind === "bounce")).toHaveLength(2);
+  });
+
+  it("without the campaign's size, bounces and replies are NOT polled (nothing guards a filter that was ignored), opt-outs still are, and it is said once a day", async () => {
+    const w = world({ leads: { is_bounced: { 77: rows(1, "b") }, is_replied: { 77: rows(1, "r") }, is_unsubscribed: { 77: rows(1, "u", true) } } });
+    const real = w.campaignSize;
+    const d = deps(w);
+    const failing = { ...d, smartlead: { ...d.smartlead, listLeads: async (k: string, c: number, status: any, o: number, l: number) => { if (status === null && l === 1) throw new SmartleadApiError("smartlead 500 api_key=SECRETKEY", 500); return d.smartlead.listLeads(k, c, status, o, l); } } };
+    await eventPoll(failing); await eventPoll(failing);
+    expect(real).toBeUndefined();
+    expect(w.handled.map(h => h.event.kind)).toEqual(["unsubscribe"]);
+    expect(w.logs.filter(l => l.includes("could not read the campaign's size"))).toHaveLength(1);
+    expect(w.logs.join("\n")).not.toContain("SECRETKEY");
+  });
+
+  it("says once a day when contacts come back from the unsubscribed filter without the flag (so a flag that link-unsubscribes do not set would show)", async () => {
+    const w = world({ leads: { is_unsubscribed: { 77: rows(3, "u", false) } } });
+    await eventPoll(deps(w));
+    await eventPoll(deps(w));
+    expect(w.logs.filter(l => l.includes("without the unsubscribed flag set"))).toHaveLength(1);
+    expect(w.handled).toHaveLength(0);
   });
 
   it("an opt-out is believed only when the contact's own flag is set, whichever read found it", async () => {
