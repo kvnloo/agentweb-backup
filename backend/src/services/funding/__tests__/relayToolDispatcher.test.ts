@@ -4,7 +4,7 @@
  */
 import { IMAGE_LIMITS } from '../../../loginHost/protocol';
 import { LoginHostError, ToolResultLostError } from '../loginHostClient';
-import { ALREADY_RAN_MESSAGE, RAN_NOT_PREPARED_MESSAGE, RESULT_LOST_NOTE, ARGS_TOO_LARGE_MESSAGE, BAD_ARGS_MESSAGE, DELIVERY_FAILED_MESSAGE, NOT_IN_RUN_MESSAGE, REPLAY_NOTE, UNLOADABLE_NOTE, RelayToolDispatcher, SOFT_DEADLINE_MESSAGE, STOPPED_MESSAGE, type RelayCallEvent } from '../relayToolDispatcher';
+import { HALTED_MESSAGE, ALREADY_RAN_MESSAGE, RAN_NOT_PREPARED_MESSAGE, RESULT_LOST_NOTE, ARGS_TOO_LARGE_MESSAGE, BAD_ARGS_MESSAGE, DELIVERY_FAILED_MESSAGE, NOT_IN_RUN_MESSAGE, REPLAY_NOTE, UNLOADABLE_NOTE, RelayToolDispatcher, SOFT_DEADLINE_MESSAGE, STOPPED_MESSAGE, type RelayCallEvent } from '../relayToolDispatcher';
 import { annotateLostResults } from '../claudeCodeBackend';
 import { ToolBridge, type BridgeExecuteOutcome, type ToolBridgeDeps } from '../toolBridge';
 
@@ -30,6 +30,8 @@ interface Opts {
   announceWaitMs?: number;
   /** Makes the bridge wait on this before a halt is recorded durably (the halting call is answered only after it). */
   persistGate?: Promise<void>;
+  /** Batched confirmations (default in this rig: on; production: off). */
+  admitSiblings?: boolean;
   /** Makes the dispatcher's own bookkeeping throw AFTER the bridge returned (an unforeseen failure). */
   throwAfterRun?: boolean;
   /** Runs after every bridge.listTools the dispatcher makes (with the call count). */
@@ -105,6 +107,7 @@ function rig(o: Opts = {}) {
       return bridge.takeHalts('u1', 's1').some((h) => h.callId === op);
     },
     announceWaitMs: o.announceWaitMs ?? 0,
+    admitPostHaltSiblings: o.admitSiblings ?? true, // the batching tests run in this mode; the production default (false) has its own describe below
     sleep: async () => undefined,
     onCall: (phase, name) => void phases.push(`${phase}:${name}`),
   });
@@ -830,6 +833,43 @@ describe('RelayToolDispatcher', () => {
       t.d.start(t.ev('op-1', 'send_email', { to: 'a' })); // unannounced: halts
       await t.d.settle(1_000);
       t.d.start(t.ev('op-2', 'save_note', { n: 1 }));
+      await t.d.settle(1_000);
+      expect(t.executed.map((e) => e.name)).toEqual(['send_email']);
+    });
+  });
+
+  describe('S9: until approval cards ship, the first confirmation ends the tool work of the turn (admitPostHaltSiblings off, the production setting)', () => {
+    it('every call after a halt is refused without being announced to the bridge: an announced sibling, a read, an unannounced call', async () => {
+      const t = rig({ confirm: ['send_email'], admitSiblings: false });
+      t.d.noteStreamUse('mcp__aw__send_email', { to: 'a' });
+      t.d.noteStreamUse('mcp__aw__send_email', { to: 'b' }); // a "sibling" the (possibly forged) stream announced
+      t.d.noteStreamUse('mcp__aw__search', { q: 's' });
+      t.d.start(t.ev('op-1', 'send_email', { to: 'a' }));
+      await t.d.settle(1_000);
+      const announced = jest.spyOn(t.bridge, 'noteToolUse');
+      t.d.start(t.ev('op-2', 'send_email', { to: 'b' }));
+      t.d.start(t.ev('op-3', 'search', { q: 's' }));
+      t.d.start(t.ev('op-4', 'save_note', { n: 1 }));
+      await t.d.settle(1_000);
+      expect(t.executed.map((e) => e.name)).toEqual(['send_email']);
+      expect(announced).not.toHaveBeenCalled();
+      for (const op of ['op-2', 'op-3', 'op-4']) expect(t.posts.find((p) => p.operationId === op)).toMatchObject({ isError: true, content: HALTED_MESSAGE });
+    });
+
+    it('before any halt everything runs as usual', async () => {
+      const t = rig({ confirm: ['send_email'], admitSiblings: false });
+      t.d.start(t.ev('op-1', 'search', { q: 'a' }));
+      t.d.start(t.ev('op-2', 'save_note', { n: 1 }));
+      await t.d.settle(1_000);
+      expect(t.executed).toHaveLength(2);
+    });
+
+    it('the option left out means off', async () => {
+      const t = rig({ confirm: ['send_email'] });
+      (t.d as any).o.admitPostHaltSiblings = undefined;
+      t.d.start(t.ev('op-1', 'send_email', { to: 'a' }));
+      await t.d.settle(1_000);
+      t.d.start(t.ev('op-2', 'search', { q: 'a' }));
       await t.d.settle(1_000);
       expect(t.executed.map((e) => e.name)).toEqual(['send_email']);
     });

@@ -29,6 +29,8 @@ export const SOFT_DEADLINE_MESSAGE = "The time limit for this turn is almost rea
 export const STOPPED_MESSAGE = "This turn has ended; this call was not run.";
 export const NOT_IN_RUN_MESSAGE = "That tool is not available in this run.";
 export const BAD_INPUT_MESSAGE = "A tool call needs an object of arguments.";
+/** What a call gets after a halt (the same words the bridge uses). */
+export const HALTED_MESSAGE = "This conversation is waiting for the user to confirm an earlier action. No tool can run until the user replies. Stop here and ask the user to confirm.";
 export const ARGS_TOO_LARGE_MESSAGE = "The arguments of this call are too large to be processed. The tool was not run; send a smaller request.";
 /** The tool ran but the answer could not be prepared (an internal failure after the bridge returned). */
 export const RAN_NOT_PREPARED_MESSAGE = "The tool ran, but its result could not be prepared. Do not repeat it blindly; check its current state first or ask the user.";
@@ -113,6 +115,13 @@ export interface RelayDispatcherOptions {
   isHaltingCall: (operationId: string) => boolean;
   /** See DEFAULT_ANNOUNCE_WAIT_MS (tests shorten it). */
   announceWaitMs?: number;
+  /**
+   * Batched confirmations (one deck for every preview of a model message). FALSE (the default, and the production setting): after a halt EVERY call is refused
+   * here, never announced to the bridge. Why: the announcements come from the worker's stream, so a compromised worker could announce its own "sibling" (a name and
+   * an input) and have it run after the halt, relying only on that tool's own approval token; and approval cards do not exist yet, so batching buys nothing
+   * (the first confirmation ends the turn's tool work either way). The code path stays for the approval-cards change, which sets this to true.
+   */
+  admitPostHaltSiblings?: boolean;
   /** Progress hooks (the chat's "executing" statuses). Must not throw. The caller drops them once its turn is over (`turnOver` in claudeCodeBackend.ts). */
   onCall?: (phase: "start" | "end", name: string) => void;
 }
@@ -448,6 +457,8 @@ export class RelayToolDispatcher {
     const refuse = (message: string): Answer => ({ content: message, isError: true });
     if (this.o.isStopped()) return refuse(STOPPED_MESSAGE);
     if (this.o.softDeadlineAt !== undefined && this.now() >= this.o.softDeadlineAt) return refuse(SOFT_DEADLINE_MESSAGE);
+    // After a halt nothing else runs (see `admitPostHaltSiblings`): refused here, without being announced to the bridge.
+    if (this.o.admitPostHaltSiblings !== true && this.o.isHalted()) return refuse(HALTED_MESSAGE);
     // The manifest is the worker's view; the bridge's current list (checked again inside callTool) is the authority. A name the worker was never sent
     // (not in the manifest, not in the definitions of an answer) never reaches the bridge.
     if (!this.inManifest(name)) return refuse(NOT_IN_RUN_MESSAGE);
