@@ -90,7 +90,8 @@ describe.each(["sh", "bash"] as const)("claude-turn.sh manifest block (%s)", (sh
 
   it.each([
     ["non-digits", ["12abc", "{}"]],
-    ["a sign", ["-5", "{}"]],
+    ["a minus sign", ["-5", "{}"]],
+    ["a plus sign (dd would accept it)", ["+2", "{}"]],
     ["a leading zero", ["07", "{}"]],
     ["empty length", ["", "{}"]],
     ["a huge length (8 digits)", ["99999999", "{}"]],
