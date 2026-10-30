@@ -6,6 +6,7 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, existsSync, readdirSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
+import * as net from "net";
 import { connect, type Socket } from "net";
 import { Layout } from "../../ports/layout";
 import { RelayHost, resultFrameBytes, type RelayCall, type RelayEndpoint, type RelayLimits, type RelayOpenOptions } from "../../relay/relayServer";
@@ -407,7 +408,9 @@ describe("relay: limits and abuse", () => {
     c2.raw("{\"password\":\"hunter2-SECRET\" garbage\n");
     await until(() => c2.closed);
     expect(JSON.stringify(r.logs)).not.toMatch(/SECRET|hunter2|echo/);
-    for (const l of r.logs) expect(Object.keys(l.fields ?? {})).toEqual(["code"]);
+    // only the fixed code and the HOST-chosen identity of the turn (validated ids), never anything from a frame
+    for (const l of r.logs) expect(Object.keys(l.fields ?? {}).sort()).toEqual(["code", "connectionId", "turnId"]);
+    expect(r.logs.every((l) => l.fields?.connectionId === "conn1" && l.fields?.turnId === "turn1")).toBe(true);
     await ep.close();
   });
 });
@@ -569,6 +572,36 @@ describe("relay: hostile frames cannot take the host down", () => {
     } finally {
       spy.mockRestore();
     }
+    await ep.close();
+  });
+
+  it("MUTATION TARGET: the connection handler itself is guarded: if accepting a socket throws, the socket is destroyed and the process does not die", async () => {
+    const r = rig();
+    const { ep, calls } = await r.open();
+    const realOnce = net.Socket.prototype.once;
+    let thrown = false;
+    // only the SERVER side registers once("close") while accepting: that is the call made to throw (the test's own client sockets are left alone)
+    const once = jest.spyOn(net.Socket.prototype, "once").mockImplementation(function (this: net.Socket, ev: string | symbol, fn: (...a: never[]) => void) {
+      if (ev === "close" && !thrown) {
+        thrown = true;
+        throw new Error("accept boom: SECRET");
+      }
+      return (realOnce as (...a: unknown[]) => net.Socket).call(this, ev, fn);
+    } as never);
+    try {
+      const c = new Client(sockOf(ep));
+      await c.ready();
+      await until(() => c.closed);
+    } finally {
+      once.mockRestore();
+    }
+    expect(uncaught).toEqual([]);
+    expect(r.logs.map((l) => l.fields?.code)).toContain("internal_error");
+    expect(JSON.stringify(r.logs)).not.toContain("SECRET");
+    const ok = new Client(sockOf(ep));
+    await ok.ready();
+    ok.send(call("after"));
+    await until(() => calls.length === 1); // the endpoint still serves
     await ep.close();
   });
 

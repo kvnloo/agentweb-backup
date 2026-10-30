@@ -153,6 +153,8 @@ export class LogThrottle {
  * the whole buffer and re-scan it on every chunk) cost about 1.8 s of event-loop time for ONE 1 MiB line fed in 64-byte chunks, and keeping a Buffer per chunk
  * cost ~157 MB for a 1-byte trickle of the same line; a hostile unit can repeat either to load the shared host. Never retains a read buffer.
  */
+/** More complete lines than this in ONE chunk is a flood (a legitimate shim sends one frame at a time). */
+export const MAX_LINES_PER_PUSH = 256;
 export class LineAssembler {
   private buf: Buffer | undefined;
   private len = 0;
@@ -179,6 +181,7 @@ export class LineAssembler {
     const lines: Buffer[] = [];
     let pos = 0;
     while (pos < chunk.length) {
+      if (lines.length >= MAX_LINES_PER_PUSH) return { lines, tooLarge: true }; // a flood of empty lines in one chunk: refuse before it becomes thousands of buffers
       const nl = chunk.indexOf(10, pos);
       if (nl < 0) {
         if (this.len + (chunk.length - pos) > this.maxLine) return { lines, tooLarge: true };

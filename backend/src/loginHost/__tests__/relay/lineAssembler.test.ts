@@ -2,7 +2,7 @@
  * ENG-2113 (review): the relay's line reader must be LINEAR in the bytes received however a hostile unit chunks them. The naive reader (concat the whole buffer and
  * re-scan it on every 'data' event) cost ~1.5 s of the shared host's event loop for one 1 MiB line fed in 64-byte chunks.
  */
-import { LineAssembler } from "../../relay/bounds";
+import { LineAssembler, MAX_LINES_PER_PUSH } from "../../relay/bounds";
 
 const B = (s: string) => Buffer.from(s, "utf8");
 const feed = (a: LineAssembler, chunks: Buffer[]) => {
@@ -113,6 +113,18 @@ describe("LineAssembler: memory", () => {
     a.push(B("two"));
     a.push(B("\n"));
     expect(first.toString()).toBe("one");
+  });
+});
+
+describe("LineAssembler: floods", () => {
+  it("MUTATION TARGET: a chunk of thousands of empty lines is refused before it becomes thousands of buffers", () => {
+    const a = new LineAssembler(1000);
+    const r = a.push(Buffer.alloc(64 * 1024, 10)); // 65,536 newlines
+    expect(r.tooLarge).toBe(true);
+    expect(r.lines.length).toBeLessThanOrEqual(MAX_LINES_PER_PUSH);
+    const ok = new LineAssembler(1000).push(Buffer.alloc(MAX_LINES_PER_PUSH, 10));
+    expect(ok.tooLarge).toBe(false);
+    expect(ok.lines).toHaveLength(MAX_LINES_PER_PUSH);
   });
 });
 

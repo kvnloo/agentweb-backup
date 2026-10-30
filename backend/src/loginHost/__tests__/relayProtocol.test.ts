@@ -233,6 +233,12 @@ describe("per-route body cap (through the socket)", () => {
     await it.return?.();
   });
 
+  it("MUTATION TARGET: nothing passes turn.run's 8 MiB cap, relay shape included (413)", async () => {
+    const big = JSON.stringify({ ...turnReq("c1", 1), bridgeToken: undefined, tools: [tool("search")], prompt: "x", junk: "y".repeat(8 * 1024 * 1024 + 10) });
+    expect(Buffer.byteLength(big)).toBeGreaterThan(8 * 1024 * 1024);
+    expect((await post(sock, "turn.run", big)).status).toBe(413);
+  });
+
   it("MUTATION TARGET: turn.run over 5 MiB is accepted ONLY in the relay shape (a legacy request keeps protocol 3's cap)", async () => {
     await signIn(rig, "c1", 1);
     const prompt = "€".repeat(2_000_000); // ~6 MB as UTF-8

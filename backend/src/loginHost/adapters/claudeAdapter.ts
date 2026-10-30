@@ -174,40 +174,45 @@ class LineLimit extends Transform {
   ) {
     super();
   }
+  private resetLine(): void {
+    this.run = 0;
+    this.depth = 0;
+    this.inString = false;
+    this.esc = false;
+    this.dropping = false;
+  }
   override _transform(chunk: Buffer, _enc: BufferEncoding, cb: (err?: Error | null, data?: Buffer) => void): void {
     if (this.tripped) return cb();
-    const first = chunk.indexOf(10);
-    const last = chunk.lastIndexOf(10);
-    const headRun = this.run + (first === -1 ? chunk.length : first);
-    this.run = last === -1 ? this.run + chunk.length : chunk.length - last - 1;
-    if (headRun > this.max || this.run > this.max) {
-      this.tripped = true;
-      this.onOverflow();
-      return cb();
-    }
     const out: Buffer[] = [];
     let start = 0; // start of the bytes still to be forwarded
+    // A "line" is what the runner's readline hands to JSON.parse: it ends at \n, at a LONE \r, or at \r\n (Node 22: /\r?\n|\r(?!\n)/; U+2028/2029 and the other
+    // Unicode separators do NOT split). The scanner must end its line at exactly the same places, or a hostile `"\r[[[[...` is one string-containing line here and a deep
+    // segment there.
     for (let i = 0; i < chunk.length; i++) {
       if (this.dropping) {
-        const nl = chunk.indexOf(10, i);
+        // skip to the next line terminator (\n or \r), counting the bytes against the line cap
+        const a = chunk.indexOf(10, i);
+        const b = chunk.indexOf(13, i);
+        const nl = a < 0 ? b : b < 0 ? a : Math.min(a, b);
+        const skipTo = nl < 0 ? chunk.length : nl;
+        this.run += skipTo - i;
+        if (this.run > this.max) return this.overflow(cb);
         if (nl < 0) {
           start = chunk.length;
           break;
         }
-        this.dropping = false;
-        this.depth = 0;
-        this.inString = false;
-        this.esc = false;
+        this.resetLine();
         start = nl + 1;
         i = nl;
         continue;
       }
       const c = chunk[i];
-      if (c === 10) {
-        this.depth = 0;
-        this.inString = false;
-        this.esc = false;
-      } else if (this.inString) {
+      if (c === 10 || c === 13) {
+        this.resetLine();
+        continue;
+      }
+      if (++this.run > this.max) return this.overflow(cb);
+      if (this.inString) {
         if (this.esc) this.esc = false;
         else if (c === 0x5c) this.esc = true;
         else if (c === 0x22) this.inString = false;
@@ -223,6 +228,11 @@ class LineLimit extends Transform {
     }
     if (start < chunk.length) out.push(chunk.subarray(start));
     cb(null, out.length === 1 ? out[0] : Buffer.concat(out));
+  }
+  private overflow(cb: (err?: Error | null, data?: Buffer) => void): void {
+    this.tripped = true;
+    this.onOverflow();
+    cb();
   }
 }
 
@@ -597,7 +607,8 @@ class ClaudeSession implements ProviderSession {
 
   /** Model message ids of tool_use blocks seen in the stream and not yet claimed by a relayed call: (bare name, canonical input) -> message id. */
   private readonly streamUses: Array<{ messageId: string; name: string; key: string }> = [];
-  private waiting: { call: RelayCall; timer: NodeJS.Timeout } | undefined;
+  /** The call waiting for its message id. `key` is its input's digest, computed ONCE when the call arrives (undefined: too large to hash, matched by name only). */
+  private waiting: { call: RelayCall; timer: NodeJS.Timeout; key: string | undefined } | undefined;
   private events: AsyncQueue<ProviderEvent> | undefined;
   private relayEp: RelayEndpoint | undefined;
   /** The in-flight relay.open(): a close that arrives meanwhile waits for it, so the endpoint it creates is never left behind. */
@@ -610,7 +621,11 @@ class ClaudeSession implements ProviderSession {
     const msg = raw.message as { id?: unknown; content?: unknown } | undefined;
     if (!msg || typeof msg.id !== "string" || !Array.isArray(msg.content)) return;
     const prefix = qualifiedToolPrefix(this.cfg.mcpServerName);
-    for (const b of msg.content as Array<Record<string, unknown>>) {
+    // A hostile CLI can print a 16 MB line of a quarter million tiny blocks: look at a bounded number of blocks per event, and record a bounded number of announcements.
+    const blocks = msg.content as Array<Record<string, unknown>>;
+    let recorded = 0;
+    for (let i = 0; i < blocks.length && i < MAX_BLOCKS_PER_EVENT && recorded < MAX_STREAM_USES; i++) {
+      const b = blocks[i];
       if (b?.type !== "tool_use" || typeof b.name !== "string" || !b.name.startsWith(prefix)) continue;
       const name = b.name.slice(prefix.length);
       if (!this.visibleTools.has(name)) continue; // the stream is hostile input: only tools the turn can call are ever remembered
@@ -622,19 +637,19 @@ class ClaudeSession implements ProviderSession {
       const input = b.input ?? {};
       if (approxJsonBytes(input, MAX_FORWARDED_BYTES + 1) > MAX_FORWARDED_BYTES) continue;
       this.streamUses.push({ messageId: msg.id, name, key: digest(canonicalJson(input)) });
+      recorded++;
       if (this.streamUses.length > MAX_STREAM_USES) this.streamUses.splice(0, this.streamUses.length - MAX_STREAM_USES);
     }
-    this.flushWaiting(false);
+    // Only a NEW announcement can change which message a waiting call belongs to: re-checking on every line a hostile CLI prints would let it multiply the work.
+    if (recorded > 0) this.flushWaiting(false);
   }
 
   /** Emits the waiting call once the stream has shown its model message (or, with `force`, without one after the wait). */
   private flushWaiting(force: boolean): void {
     const w = this.waiting;
     if (!w || !this.events) return;
-    // A call is EXECUTED by the backend: its input is forwarded exactly or not at all (never replaced by a marker). The relay already refused deeper frames; this is the check.
-    if (valueDepthExceeds(w.call.args, MAX_FORWARDED_DEPTH)) throw new Error("args_too_deep");
-    const key = digest(canonicalJson(w.call.args));
-    const exact = this.streamUses.find((u) => u.name === w.call.name && u.key === key);
+    const key = w.key;
+    const exact = key === undefined ? undefined : this.streamUses.find((u) => u.name === w.call.name && u.key === key);
     const byName = this.streamUses.filter((u) => u.name === w.call.name);
     const hit = exact ?? (byName.length === 1 ? byName[0] : undefined);
     if (!hit && !force) return;
@@ -670,9 +685,22 @@ class ClaudeSession implements ProviderSession {
 
   private onRelayCall(call: RelayCall): void {
     if (this.closing || this.interrupted || !this.events) return;
+    // A call is EXECUTED by the backend: its input is forwarded exactly or not at all (never replaced by a marker). The relay already refused deeper frames; this is the check.
+    // The digest used to find the call's message is computed ONCE, here, and only for a call small enough to be worth it: re-hashing a ~1 MiB input on every stream line
+    // let a hostile unit stall the event loop for tens of seconds. A larger call is matched by name only (see flushWaiting).
+    let key: string | undefined;
+    try {
+      if (valueDepthExceeds(call.args, MAX_FORWARDED_DEPTH)) throw new Error("args_too_deep");
+      if (call.bytes <= MAX_HASHED_CALL_BYTES) key = digest(canonicalJson(call.args));
+    } catch {
+      this.guarded(call.operationId, () => {
+        throw new Error("call_unusable");
+      });
+      return;
+    }
     const timer = setTimeout(() => this.guarded(call.operationId, () => this.flushWaiting(true)), this.cfg.messageIdWaitMs);
     timer.unref?.();
-    this.waiting = { call, timer };
+    this.waiting = { call, timer, key };
     this.guarded(call.operationId, () => this.flushWaiting(false));
   }
 
@@ -861,5 +889,8 @@ class ClaudeSession implements ProviderSession {
 
 
 const MAX_STREAM_USES = 64;
+/** At most this many content blocks of one assistant event are looked at, and a call whose frame is larger than this is never hashed. */
+const MAX_BLOCKS_PER_EVENT = 256;
+const MAX_HASHED_CALL_BYTES = 64 * 1024;
 const MAX_MESSAGE_ID_CHARS = 128;
 const digest = (text: string): string => createHash("sha256").update(text).digest("base64");

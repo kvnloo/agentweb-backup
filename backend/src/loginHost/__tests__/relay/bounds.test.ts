@@ -118,6 +118,12 @@ describe("approxJsonBytes", () => {
     expect(reads).toBeLessThan(100);
   });
 
+  it("MUTATION TARGET: the step cap: a 6,000,000-element array returns the limit at once instead of being walked to its (smaller) true size", () => {
+    const t0 = Date.now();
+    expect(approxJsonBytes(new Array(6_000_000).fill(1), 100 * 1024 * 1024)).toBe(100 * 1024 * 1024); // really ~12 MB: only the step cap makes this the limit
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
+
   it("MUTATION TARGET: only OWN properties count (an inherited enumerable one is not part of the JSON), and a key counts its length", () => {
     const o = Object.create({ inherited: "x".repeat(5000) }) as Record<string, unknown>;
     o.own = 1;
