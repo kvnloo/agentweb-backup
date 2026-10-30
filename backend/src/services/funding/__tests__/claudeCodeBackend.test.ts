@@ -94,7 +94,7 @@ function harness(): Harness {
     isCancelled: () => state.cancelled,
     persistMessages: async (_s, m) => void persisted.push(m),
     markNeedsReconnect: async (c, e, r) => void reconnect.push([c, e, r]),
-    reconnectSignalsRequired: 1, // the one-signal behaviour is what these tests pin; the consecutive-turns rule has its own tests (claudeCodeBackend.security.test.ts)
+    reconnectSignalsRequired: 1, // the one-signal behaviour is what these tests pin; the consecutive-turns rule has its own tests (claudeCodeBackend.relay.test.ts)
     confirmDeadLogin: async () => true,
     writeJournal: async (row) => void journal.push(row),
     emptyFallbackText: FALLBACK,

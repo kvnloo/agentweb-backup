@@ -159,6 +159,8 @@ export function defaultSecretName(): string {
 
 export class LoginHostProvider {
   private state: State | undefined;
+  /** Bumped by `invalidateProtocol`: the answer of a check that started before it is ignored. */
+  private protocolGeneration = 0;
   private material: { value: ClientMaterial; at: number } | undefined;
   private inflight: Promise<void> | undefined;
   private lastFailureAt = 0;
@@ -283,6 +285,9 @@ export class LoginHostProvider {
     this.lastInvalidatedAt = this.now();
     this.protocol = { status: "unknown", checkedAt: 0 };
     this.protocolUnknownLogged = false;
+    // A check already in flight started BEFORE this (it may be about to report the stale "match"): its answer is ignored, and a fresh check is started.
+    this.protocolGeneration++;
+    this.protocolChecking = false;
     this.maybeCheckProtocol();
   }
 
@@ -299,13 +304,16 @@ export class LoginHostProvider {
     if (this.protocol.status === "match" && this.now() - this.protocol.checkedAt < PROTOCOL_RECHECK_MS) return;
     this.protocolChecking = true;
     const client = this.state.client;
+    const generation = this.protocolGeneration;
     void (async () => {
       try {
         const info = await client.hostInfo();
+        if (generation !== this.protocolGeneration) return; // invalidated while this was in flight: a newer check decides
         const status: ProtocolStatus = ACCEPTED_WORKER_PROTOCOLS.has(info.protocol) ? "match" : "mismatch";
         if (status === "mismatch" && this.protocol.status !== "mismatch") console.error(`[loginHostProvider] login_host_protocol_mismatch worker=${info.protocol} backend=${PROTOCOL_VERSION} accepted=${[...ACCEPTED_WORKER_PROTOCOLS].join(",")}`);
         this.protocol = { status, worker: info.protocol, checkedAt: this.now() };
       } catch (e) {
+        if (generation !== this.protocolGeneration) return;
         // An older worker answers EINVALID/route (or, before that change, ENOTFOUND) to a route it does not have; anything else is just "cannot tell yet".
         const detail = e instanceof LoginHostError ? `${e.code}${e.detail ? `/${e.detail}` : ""}` : code(e);
         const changed = this.protocol.status !== "unknown";
@@ -313,7 +321,7 @@ export class LoginHostProvider {
         if (changed || !this.protocolUnknownLogged) console.error(`[loginHostProvider] login_host_protocol_unknown cause=${detail}`); // once per client, not once a minute
         this.protocolUnknownLogged = true;
       } finally {
-        this.protocolChecking = false;
+        if (generation === this.protocolGeneration) this.protocolChecking = false;
       }
     })();
   }

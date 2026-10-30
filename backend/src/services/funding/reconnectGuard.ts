@@ -30,6 +30,21 @@ export class ReconnectGuard {
     return true;
   }
 
+  /**
+   * Independent evidence (the host's own `connection.status` says needs_reconnect, a different route from the turn stream): no second turn is waited for, only
+   * the cool-down applies. True when the record should be marked now.
+   */
+  noteConfirmed(connectionId: string): boolean {
+    const t = this.now();
+    const e = this.seen.get(connectionId) ?? { count: 0, first: t, lastMarked: Number.NEGATIVE_INFINITY };
+    if (t - e.lastMarked < this.cooldownMs) return false;
+    e.lastMarked = t;
+    e.count = 0;
+    this.seen.set(connectionId, e);
+    while (this.seen.size > this.maxEntries) this.seen.delete(this.seen.keys().next().value as string);
+    return true;
+  }
+
   /** A turn on this connection worked: the signals were not consecutive. */
   reset(connectionId: string): void {
     const e = this.seen.get(connectionId);

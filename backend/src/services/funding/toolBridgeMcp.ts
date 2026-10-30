@@ -122,6 +122,9 @@ export class ToolBridgeMcpAdapter {
     return runIds;
   }
 
+  ranCall(runId: string, callId: string): boolean {
+    return this.bridge.ranCall(runId, callId);
+  }
   takeLedger(runId: string, opts?: { clear?: boolean }): { records: BridgeCallRecord[]; truncated: number } {
     return this.bridge.takeLedger(runId, opts);
   }

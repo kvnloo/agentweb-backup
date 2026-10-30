@@ -72,3 +72,22 @@ describe('LineSplitter', () => {
     expect(done[0].length).toBe(8 * 1024 * 1024 - 1);
   });
 });
+
+describe('LineSplitter: discarding an over-cap line of a skippable type', () => {
+  const mk = () => new LineSplitter(1_000_000, () => new Error('too long'), (h) => (h.toString('latin1').startsWith('{"type":"big"') ? 100 : 1_000_000), (h) => h.toString('latin1').startsWith('{"type":"big"'));
+  const bigLine = '{"type":"big","pad":"' + 'p'.repeat(5_000) + '"}\n';
+  const feed = (sp: LineSplitter, text: string, size: number) => {
+    const out: string[] = [];
+    const b = Buffer.from(text);
+    for (let i = 0; i < b.length; i += size) for (const l of sp.push(b.subarray(i, i + size))) out.push(l.toString());
+    return out;
+  };
+  it.each([1, 7, 100, 100_000])('drops the over-cap line and keeps its neighbours (chunks of %i bytes)', (size) => {
+    const out = feed(mk(), '{"type":"a"}\n' + bigLine + '{"type":"b"}\n', size);
+    expect(out).toEqual(['{"type":"a"}', '{"type":"b"}']);
+  });
+  it('a discarded line that never ends is still cut at the hard line cap', () => {
+    const sp = new LineSplitter(10_000, () => new Error('too long'), () => 100, () => true);
+    expect(() => feed(sp, '{"type":"big","pad":"' + 'p'.repeat(50_000), 1_000)).toThrow('too long');
+  });
+});

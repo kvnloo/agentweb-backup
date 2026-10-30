@@ -18,6 +18,7 @@ import type { ProviderEvent } from "../../loginHost/adapter";
 import type { LoginReady, LoginStartResult } from "../../loginHost/connectionManager";
 import { jsonTooDeep } from "./jsonDepthGuard";
 import { LineSplitter } from "./ndjsonLines";
+import { MAX_RATE_WINDOWS } from "../../loginHost/adapters/claudeParse";
 import { ROUTES, type HostErrorCode, type RouteInput, type RouteName } from "../../loginHost/protocol";
 
 const HOST_CODES: ReadonlySet<string> = new Set<HostErrorCode>(["EINVALID", "ENOTFOUND", "ESTALE", "ESTATE", "EBUSY", "EEXISTS", "EUNSUPPORTED", "EHAZARD", "EINTERNAL"]);
@@ -128,6 +129,21 @@ function lineCapFor(head: Buffer): number {
   if (type === "text" || type === "result") return Number.MAX_SAFE_INTEGER; // bounded by the stream's own maxLine
   if (type === "tool-call" || type === "tool-use") return LINE_CAPS.tool;
   return LINE_CAPS.other;
+}
+/** Event types this client knows (plus `accepted`); a line of any OTHER type that is over its cap is discarded instead of ending the stream (a future host may add events). */
+function skipsWhenTooLong(head: Buffer): boolean {
+  const type = TYPE_AT_START.exec(head.toString("latin1"))?.[1];
+  return type !== undefined && type !== "accepted" && !Object.prototype.hasOwnProperty.call(EVENT_SHAPES, type);
+}
+const TYPE_KEY = Buffer.from('"type"');
+/**
+ * `text` and `result` lines are flat (no nested objects) and are the only ones allowed to be big. JSON.parse takes the LAST of two `type` keys, while the cap above
+ * is decided from the FIRST: `{"type":"text",...,"type":"usage"}` would get the big cap and be processed as another type. A flat line has exactly one `"type"`
+ * (inside a string value every quote is escaped, so the text of a reply cannot add one). Scanned before parsing, linear time.
+ */
+function hasSecondTypeKey(line: Buffer): boolean {
+  const first = line.indexOf(TYPE_KEY);
+  return first >= 0 && line.indexOf(TYPE_KEY, first + TYPE_KEY.length) >= 0;
 }
 function limitHit(code: string): LoginHostError {
   console.error("[login-host-client] stream_limit", { code });
@@ -273,7 +289,7 @@ class NodeTransport implements HostTransport {
           const lines = (async function* (): AsyncGenerator<unknown> {
             // Bounded BEFORE anything is parsed: a per-type cap on each line (see lineCapFor), and per-turn caps on how many lines and how many bytes one stream
             // may carry. A hostile worker's flood of tiny events, or one near-8 MiB event of a type that is never that big, costs a few bytes of scanning, not seconds.
-            const splitter = new LineSplitter(maxLine, () => limitHit("line_too_long"), lineCapFor);
+            const splitter = new LineSplitter(maxLine, () => limitHit("line_too_long"), lineCapFor, skipsWhenTooLong);
             let count = 0;
             let bytes = 0;
             try {
@@ -284,12 +300,16 @@ class NodeTransport implements HostTransport {
                   if (++count > MAX_STREAM_LINES) throw limitHit("too_many_events");
                   // A line nested deeper than anything legitimate is dropped unparsed (JSON.parse would stall the event loop) and ends the stream.
                   if (jsonTooDeep(line)) throw tooDeep(line.length);
+                  const headType = line.length > LINE_CAPS.other ? TYPE_AT_START.exec(line.subarray(0, 48).toString("latin1"))?.[1] : undefined;
+                  // Only text/result/tool lines may be this big (see lineCapFor), and the cap was decided from the FIRST `type`: for the flat ones it must be the only one.
+                  if ((headType === "text" || headType === "result") && hasSecondTypeKey(line)) throw limitHit("duplicate_type");
                   let parsed: unknown;
                   try {
                     parsed = JSON.parse(line.toString("utf8"));
                   } catch {
                     throw new LoginHostError("BAD_RESPONSE", "line");
                   }
+                  if (headType !== undefined && (parsed as { type?: unknown } | null)?.type !== headType) throw limitHit("type_mismatch"); // JSON.parse took another `type`
                   yield parsed;
                 }
               }
@@ -367,7 +387,7 @@ const EVENT_SHAPES: Record<string, z.ZodTypeAny> = {
   "tool-call": z.object({ operationId: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/), messageId: z.string().max(200), name: z.string().max(200), input: z.unknown() }),
   "tool-result": z.object({ operationId: z.string().max(256), ok: z.boolean() }),
   usage: z.object({ inputTokens: count, outputTokens: count, cacheReadTokens: count, cacheWriteTokens: count }),
-  entitlement: z.object({ observation: z.object({ windows: z.array(z.object({ name: z.string().max(64), utilization: z.number().optional(), resetsAtMs: z.number().optional() })).max(8) }) }),
+  entitlement: z.object({ observation: z.object({ windows: z.array(z.object({ name: z.string().max(64), utilization: z.number().optional(), resetsAtMs: z.number().optional() })).max(MAX_RATE_WINDOWS) }) }),
   alarm: z.object({ hazard: z.unknown() }),
   result: z.object({ ok: z.boolean(), text: z.string(), errorKind: z.string().max(64).optional(), aborted: z.string().max(64).optional() }),
 };

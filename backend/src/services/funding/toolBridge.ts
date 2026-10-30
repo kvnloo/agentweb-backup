@@ -286,6 +286,8 @@ interface Ledger {
   lastRecordAtMs?: number;
   /** Calls of this run generation still in the bridge. */
   pending: number;
+  /** Ids of the calls that really ran (executed or failed), independent of the records: those may be shrunk or dropped under pressure. */
+  ran: Set<string>;
 }
 
 interface CallCtx {
@@ -427,17 +429,12 @@ const MAX_ADMISSIONS_PER_LATCH = 64;
 const MAX_LEDGER_RECORDS = 512;
 const MAX_LEDGER_BYTES = 4 * 1024 * 1024;
 const MAX_RECORD_CONTENT_BYTES = 64 * 1024;
-/**
- * Room the ledger keeps for calls that CHANGED something (writes, halts) when it fills up: reads may only use the ledger up to this far below its caps, a write may
- * use all of it, and when even that is full the oldest READ record makes room. A record of a write is never silently absent from the persisted chat (a later
- * `send_email` executed but missing from the record was the failure); the INPUT and the text of a big read are cut to a marker first.
- */
-const LEDGER_RESERVE_RECORDS = 64;
-const LEDGER_RESERVE_BYTES = 1024 * 1024;
 /** A write that no longer fits the byte cap is cut to a short text and may still go over the cap by this much in all (a turn has at most 400 calls). */
 const LEDGER_WRITE_OVERFLOW_BYTES = 2 * 1024 * 1024;
 const BIG_READ_RECORD_BYTES = 8 * 1024;
 const SHRUNK_READ_CONTENT_BYTES = 4 * 1024;
+const STUB_CONTENT_BYTES = 512;
+const MAX_RAN_IDS = 4096;
 const MAX_COMPLETED_ENTRIES = 32;
 const MAX_COMPLETED_BYTES = 512 * 1024;
 const MAX_SESSIONS_TRACKED = 2048;
@@ -452,7 +449,7 @@ export class ToolBridge {
   private readonly ledgers = new Map<string, Ledger>();
   private readonly lastGenerationByRun = new Map<string, string>();
   /** Size and write-ness of each ledger record (kept out of the record itself, which is persisted and compared in tests). */
-  private readonly recordMeta = new WeakMap<BridgeCallRecord, { size: number; write: boolean }>();
+  private readonly recordMeta = new WeakMap<BridgeCallRecord, { size: number; write: boolean; shrunk: boolean }>();
   /** Executor calls in progress per run id, across run generations. */
   private readonly execCount = new Map<string, number>();
   /** Run ids whose executor state is released when their last executing call finishes. */
@@ -500,7 +497,7 @@ export class ToolBridge {
       session.halt = { epoch: session.epoch, firstHaltAtMs: Date.now(), consumed: new Set(), refused: 0 };
     }
     const generation = randomUUID();
-    const ledger: Ledger = { generation, runId: claims.runId, records: [], bytes: 0, truncated: 0, pending: 0 };
+    const ledger: Ledger = { generation, runId: claims.runId, records: [], bytes: 0, truncated: 0, pending: 0, ran: new Set() };
     this.ledgers.set(generation, ledger);
     this.lastGenerationByRun.set(claims.runId, generation);
     session.runIds.add(claims.runId);
@@ -769,6 +766,12 @@ export class ToolBridge {
       this.ledgers.delete(generation);
     }
     return snapshot;
+  }
+
+  /** Whether the call with this id really ran in the run (executed or failed, not refused). Does not depend on the ledger's records, which may be cut. */
+  ranCall(runId: string, callId: string): boolean {
+    const generation = this.runs.get(runId)?.generation ?? this.lastGenerationByRun.get(runId);
+    return generation !== undefined && this.ledgers.get(generation)?.ran.has(callId) === true;
   }
 
   generationOf(runId: string): string | undefined {
@@ -1418,6 +1421,7 @@ export class ToolBridge {
       ...(extra.staleHalt ? { staleHalt: true } : {}),
       ...(state.closed ? { late: true } : {}),
     };
+    if ((kind === "executed" || kind === "failed") && ctx.toolCallId && ledger.ran.size < MAX_RAN_IDS) ledger.ran.add(ctx.toolCallId);
     try {
       this.keep(ledger, entry, ctx.write);
     } catch {
@@ -1426,42 +1430,79 @@ export class ToolBridge {
     return returned;
   }
 
-  /** Adds a record under the ledger's caps: reads give way to writes (see LEDGER_RESERVE_RECORDS). `ledger.truncated` counts everything cut or dropped. */
+  /**
+   * Adds a record. A turn that fits the budget (512 records / 4 MiB, origin/main's) is kept byte for byte as it was: nothing is shrunk while room remains.
+   * Only UNDER PRESSURE does the ledger give way, and only for the READS: when a read or a write does not fit, the OLDEST big reads are first shrunk to a note and
+   * a marker, then (for a write) the oldest reads are dropped. A write is never dropped:
+   * if it still does not fit it is cut, and as the last resort it keeps a stub (id, name, kind, short text). `ledger.truncated` counts only what was really lost.
+   */
   private keep(ledger: Ledger, entry: BridgeCallRecord, write: boolean): void {
     let size = Buffer.byteLength(JSON.stringify(entry));
-    if (size > BIG_READ_RECORD_BYTES && !write) {
-      // a big READ: its input and text are not worth the room they take from the writes that may follow
-      entry.args = { _truncated: "input not kept" };
+    const fits = (records: number, bytes: number, extra = 0) => ledger.records.length < records && ledger.bytes + size <= bytes + extra;
+    const store = (shrunk: boolean) => {
+      ledger.records.push(entry);
+      ledger.bytes += size;
+      this.recordMeta.set(entry, { size, write, shrunk });
+    };
+    const shrinkSelf = (contentBytes: number) => {
+      const before = size;
+      this.shrinkRecord(entry, contentBytes);
+      size = Buffer.byteLength(JSON.stringify(entry));
+      return size < before;
+    };
+    if (!write) {
+      const room = () => fits(MAX_LEDGER_RECORDS, MAX_LEDGER_BYTES);
+      if (!room()) this.shrinkOldestBig(ledger, () => room());
+      if (!room() && size > BIG_READ_RECORD_BYTES && shrinkSelf(SHRUNK_READ_CONTENT_BYTES)) ledger.truncated++;
+      if (!room()) {
+        ledger.truncated++;
+        return;
+      }
+      store(false);
+      return;
+    }
+    const room = () => fits(MAX_LEDGER_RECORDS, MAX_LEDGER_BYTES);
+    if (!room()) this.shrinkOldestBig(ledger, () => room());
+    while (!room() && this.dropOldestRead(ledger)) ledger.truncated++;
+    if (!room()) {
+      // a write keeps its input; only its text is cut first
       entry.toolMessageContent = capText(entry.toolMessageContent, SHRUNK_READ_CONTENT_BYTES);
       if (entry.answeredContent !== undefined) entry.answeredContent = capText(entry.answeredContent, SHRUNK_READ_CONTENT_BYTES);
       size = Buffer.byteLength(JSON.stringify(entry));
       ledger.truncated++;
-    }
-    const maxRecords = write ? MAX_LEDGER_RECORDS : MAX_LEDGER_RECORDS - LEDGER_RESERVE_RECORDS;
-    const maxBytes = write ? MAX_LEDGER_BYTES : MAX_LEDGER_BYTES - LEDGER_RESERVE_BYTES;
-    if (write) {
-      // a write is never dropped: older reads make room first
-      while ((ledger.records.length >= maxRecords || ledger.bytes + size > maxBytes) && this.dropOldestRead(ledger)) ledger.truncated++;
-      if (ledger.bytes + size > maxBytes) {
-        entry.toolMessageContent = capText(entry.toolMessageContent, SHRUNK_READ_CONTENT_BYTES);
-        if (entry.answeredContent !== undefined) entry.answeredContent = capText(entry.answeredContent, SHRUNK_READ_CONTENT_BYTES);
+      if (!fits(MAX_LEDGER_RECORDS, MAX_LEDGER_BYTES, LEDGER_WRITE_OVERFLOW_BYTES)) {
+        // the last resort: a stub. An executed write is never absent from the record (the cap of 400 calls per turn is below the record cap).
+        entry.args = { _truncated: 'input not kept' };
+        entry.toolMessageContent = capText(entry.toolMessageContent, STUB_CONTENT_BYTES);
+        delete entry.answeredContent;
+        delete entry.result;
+        if (entry.error) entry.error = capText(entry.error, STUB_CONTENT_BYTES);
         size = Buffer.byteLength(JSON.stringify(entry));
-        ledger.truncated++;
-        if (ledger.records.length < maxRecords && ledger.bytes + size <= maxBytes + LEDGER_WRITE_OVERFLOW_BYTES) {
-          ledger.records.push(entry);
-          ledger.bytes += size;
-          this.recordMeta.set(entry, { size, write });
-          return;
-        }
       }
     }
-    if (ledger.records.length >= maxRecords || ledger.bytes + size > maxBytes) {
+    store(false);
+  }
+
+  /** Cuts a read record to a note and a marker: its input, its text, and its raw result (which the size count includes). */
+  private shrinkRecord(entry: BridgeCallRecord, contentBytes: number): void {
+    entry.args = { _truncated: 'input not kept' };
+    entry.toolMessageContent = capText(entry.toolMessageContent, contentBytes);
+    if (entry.answeredContent !== undefined) entry.answeredContent = capText(entry.answeredContent, contentBytes);
+    delete entry.result;
+  }
+
+  /** Under pressure: shrinks the oldest big reads (never a write) until `done()`. */
+  private shrinkOldestBig(ledger: Ledger, done: () => boolean): void {
+    for (const r of ledger.records) {
+      if (done()) return;
+      const meta = this.recordMeta.get(r);
+      if (!meta || meta.write || meta.shrunk || meta.size <= BIG_READ_RECORD_BYTES) continue;
+      this.shrinkRecord(r, SHRUNK_READ_CONTENT_BYTES);
+      const size = Buffer.byteLength(JSON.stringify(r));
+      ledger.bytes -= meta.size - size;
+      this.recordMeta.set(r, { size, write: false, shrunk: true });
       ledger.truncated++;
-      return;
     }
-    ledger.records.push(entry);
-    ledger.bytes += size;
-    this.recordMeta.set(entry, { size, write });
   }
 
   private dropOldestRead(ledger: Ledger): boolean {

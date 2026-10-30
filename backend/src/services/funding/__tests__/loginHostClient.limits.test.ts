@@ -79,10 +79,10 @@ describe('the turn stream is bounded before anything is parsed', () => {
     expect(parse.mock.calls.every((c) => String(c[0]).length < 1_000)).toBe(true);
   });
 
-  it('a wide event of an UNKNOWN type (it would be dropped after parsing) is cut at the small cap too', async () => {
+  it('a wide event of an UNKNOWN type is discarded unparsed at the small cap, in milliseconds', async () => {
     serve('{"type":"zzz","a":[' + '1,'.repeat(2_500_000) + '1]}\n');
     const r = await drain();
-    expect(r.error).toMatchObject({ detail: 'line_too_long' });
+    expect(r.error).toBeUndefined(); // skipped unparsed (a future event type), not fatal
     expect(r.maxLag).toBeLessThan(250);
   });
 
@@ -105,8 +105,8 @@ describe('the turn stream is bounded before anything is parsed', () => {
     expect((await drain()).error).toMatchObject({ detail: 'too_many_bytes' });
   }, 30_000);
 
-  it('legitimate maxima pass: a 5 MiB text event, a 1.2 MiB tool call, 8 entitlement windows, a result', async () => {
-    const windows = Array.from({ length: 8 }, (_, i) => ({ name: `w${i}`, utilization: 0.5, resetsAtMs: 1 }));
+  it('legitimate maxima pass: a 5 MiB text event, a 1.2 MiB tool call, 16 entitlement windows, a result', async () => {
+    const windows = Array.from({ length: 16 }, (_, i) => ({ name: `w${i}`, utilization: 0.5, resetsAtMs: 1 }));
     serve(
       ev({ type: 'text', delta: 'z'.repeat(5 * 1024 * 1024) }) +
         ev({ type: 'tool-call', operationId: 'op1', messageId: 'm', name: 'search', input: { q: 'q'.repeat(1_200 * 1024) } }) +
@@ -119,7 +119,7 @@ describe('the turn stream is bounded before anything is parsed', () => {
   });
 
   it.each([
-    ['9 entitlement windows', { type: 'entitlement', observation: { windows: Array.from({ length: 9 }, () => ({ name: 'a' })) } }],
+    ['17 entitlement windows (the host sends at most 16)', { type: 'entitlement', observation: { windows: Array.from({ length: 17 }, () => ({ name: 'a' })) } }],
     ['an entitlement window name over 64 characters', { type: 'entitlement', observation: { windows: [{ name: 'n'.repeat(65) }] } }],
     ['a tool-use name of 257 characters', { type: 'tool-use', operationId: 'a', name: 'n'.repeat(257), input: {} }],
     ['a tool-use id of 257 characters', { type: 'tool-use', operationId: 'o'.repeat(257), name: 'n', input: {} }],
@@ -195,4 +195,46 @@ describe('the turn stream is bounded before anything is parsed', () => {
       expect(Date.now() - t0).toBeLessThan(2_000);
     });
   });
+
+  describe('the cap always matches the type that is processed (SF2)', () => {
+  const cases: Array<[string, string]> = [
+    ['text then usage', '{"type":"text","delta":"' + 'x'.repeat(200_000) + '","type":"usage","inputTokens":1}\n'],
+    ['text then entitlement', '{"type":"text","delta":"' + 'x'.repeat(200_000) + '","type":"entitlement","observation":{"windows":[]}}\n'],
+    ['result then usage', '{"type":"result","ok":true,"text":"' + 'x'.repeat(200_000) + '","type":"usage"}\n'],
+    ['result then text', '{"type":"result","ok":true,"text":"' + 'x'.repeat(200_000) + '","type":"text","delta":"d"}\n'],
+    ['text then text', '{"type":"text","delta":"' + 'x'.repeat(200_000) + '","type":"text"}\n'],
+  ];
+  it.each(cases)('%s is a bad answer before it is parsed', async (_l, line) => {
+    serve(line);
+    expect((await drain()).error).toMatchObject({ code: 'BAD_RESPONSE', detail: 'duplicate_type' });
+  });
+
+  it('a big tool-call whose last type says something else is refused after the parse', async () => {
+    serve('{"type":"tool-call","operationId":"op1","messageId":"m","name":"n","input":{"p":"' + 'x'.repeat(200_000) + '"},"type":"usage"}\n');
+    expect((await drain()).error).toMatchObject({ code: 'BAD_RESPONSE', detail: 'type_mismatch' });
+  });
+
+  it('a text delta that merely contains the word "type" in quotes is fine (inside a string every quote is escaped)', async () => {
+    serve(ev({ type: 'text', delta: 'say "type" and "type" again ' + 'x'.repeat(200_000) }));
+    expect((await drain()).error).toBeUndefined();
+  });
+});
+  describe('an oversize line of an unknown event type is skipped, not fatal', () => {
+  it('an unknown 100 KB event is dropped and the events around it arrive; a KNOWN small type over its cap still fails', async () => {
+    serve(ev({ type: 'text', delta: 'a' }) + ev({ type: 'future-thing', blob: 'b'.repeat(100_000) }) + ev({ type: 'result', ok: true, text: 'done' }));
+    const r = await drain();
+    expect(r.error).toBeUndefined();
+    expect(r.events).toEqual(['text', 'result']);
+  });
+  it('an oversize usage line still ends the stream', async () => {
+    serve(ev({ type: 'usage', inputTokens: 1, pad: 'p'.repeat(100_000) }));
+    expect((await drain()).error).toMatchObject({ detail: 'line_too_long' });
+  });
+  it('skipped bytes still count toward the turn byte budget', async () => {
+    const junk = ev({ type: 'future-thing', blob: 'b'.repeat(60_000) });
+    serve(junk.repeat(Math.ceil(MAX_STREAM_BYTES / junk.length) + 1));
+    expect((await drain()).error).toMatchObject({ detail: 'too_many_bytes' });
+  }, 30_000);
+});
+
 });

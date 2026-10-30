@@ -187,7 +187,7 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
     expect(t.executions).toEqual([{ name: 'save_note', args: { note: 'hello' } }]);
     expect(answers()).toEqual([{ operationId: 'op-a', answer: { kind: 'tool-result', ok: true, content: 'save_note receipt' } }]);
     expect(r.responseMessages.map((m) => m.role)).toEqual(['assistant', 'tool', 'assistant']);
-    expect(r.responseMessages[1]).toMatchObject({ tool_call_id: 'op-a', content: 'save_note receipt' });
+    expect(r.responseMessages[1]).toMatchObject({ tool_call_id: 'claude-relay-1:1', content: 'save_note receipt' });
     expect(r.content).toBe('Saved it.');
     expect(t.registry.size).toBe(0);
   });
@@ -216,7 +216,7 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
     g.open();
     const r = await run;
     expect(t.executions.map((e) => e.name).sort()).toEqual(['search', 'slow_write']);
-    expect(r.responseMessages.filter((m) => m.role === 'tool').map((m) => m.tool_call_id).sort()).toEqual(['op-1', 'op-2']);
+    expect(r.responseMessages.filter((m) => m.role === 'tool').map((m) => m.tool_call_id).sort()).toEqual(['claude-relay-1:1', 'claude-relay-1:2']);
   });
 
   it('install_skills: the same answer carries the new tool definition to the real host, and the tool then runs in the same turn (Emma behaviour)', async () => {
@@ -291,7 +291,7 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
     g.open();
     const r = await run;
     expect(t.executions).toHaveLength(1);
-    expect(r.responseMessages[1]).toMatchObject({ role: 'tool', tool_call_id: 'op-1' });
+    expect(r.responseMessages[1]).toMatchObject({ role: 'tool', tool_call_id: 'claude-relay-1:1' });
     expect(r.responseMessages[1].content).toBe(`save_note receipt\n${RESULT_LOST_NOTE}`);
     expect(markNeedsReconnect).not.toHaveBeenCalled();
     expect((await client.connectionStatus({ connectionId: 'conn-1' })).state).toBe('active'); // never treated as a wipe
@@ -612,16 +612,36 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
       expect(marked).toHaveBeenCalledTimes(1);
     });
 
-    it('S5: when the worker itself says the login needs reconnecting (connection.status), the second signal marks it (default confirmation)', async () => {
+    it('S5: when the worker itself says the login needs reconnecting (connection.status), the FIRST signal marks it; the cool-down still applies', async () => {
       const t = setup();
+      let clock = 1_000_000;
+      t.deps.now = () => clock;
       const marked = jest.spyOn(t.deps, 'markNeedsReconnect');
       jest.spyOn(client, 'connectionStatus').mockResolvedValue({ state: 'needs_reconnect', epoch: 1, runningTurns: 0 } as any);
-      const backend = t.backend(); // one process-wide instance: the consecutive-turns count lives in it
-      for (let i = 0; i < 2; i++) {
+      const backend = t.backend();
+      const dead = async () => {
+        rig.script.turnEvents = [{ type: 'result', ok: false, text: '', errorKind: 'auth_dead' }];
+        await backend.run(t.params()).catch(() => undefined);
+      };
+      await dead();
+      expect(marked).toHaveBeenCalledTimes(1);
+      await dead();
+      expect(marked).toHaveBeenCalledTimes(1); // cool-down
+      clock += 6 * 60_000;
+      await dead();
+      expect(marked).toHaveBeenCalledTimes(2);
+    });
+
+    it('S5: when the worker says the login is fine, repeated dead-login claims never mark it', async () => {
+      const t = setup();
+      const marked = jest.spyOn(t.deps, 'markNeedsReconnect');
+      jest.spyOn(client, 'connectionStatus').mockResolvedValue({ state: 'connected', epoch: 1, runningTurns: 0 } as any);
+      const backend = t.backend();
+      for (let i = 0; i < 4; i++) {
         rig.script.turnEvents = [{ type: 'result', ok: false, text: '', errorKind: 'auth_dead' }];
         await backend.run(t.params()).catch(() => undefined);
       }
-      expect(marked).toHaveBeenCalledTimes(1);
+      expect(marked).not.toHaveBeenCalled();
     });
 
     it('S6: usage counts of 1e308 are capped: the journal row and the persisted usage are finite', async () => {
@@ -661,7 +681,7 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
       expect(t.executions.map((e) => e.name)).toEqual(['send_email']);
       expect(answers()[1].answer).toMatchObject({ ok: false, content: HALTED_MESSAGE });
       expect(answers()[2].answer).toMatchObject({ ok: false, content: HALTED_MESSAGE });
-      expect(announced.mock.calls.map((c) => c[1])).toEqual(['op-0']); // the refused calls never reached the bridge
+      expect(announced.mock.calls.map((c) => c[1])).toEqual(['claude-relay-1:1']); // the refused calls never reached the bridge
     });
   });
 

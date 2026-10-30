@@ -335,6 +335,33 @@ describe("worker protocol check (host.info)", () => {
     expect([p.protocolStatus(), p.workerProtocol()]).toEqual(["match", 3]);
   });
 
+  it("a check that started BEFORE the invalidation cannot write its stale 'match / 4' back over the invalidation; the fresh check decides", async () => {
+    const waiting: Array<(v: { protocol: number; node: string; uptimeSec: number }) => void> = [];
+    let first = true;
+    const p = mk(async () => {
+      if (first) {
+        first = false;
+        return { protocol: 4, node: "v22", uptimeSec: 1 };
+      }
+      return new Promise((resolve) => waiting.push(resolve));
+    });
+    await settle(p);
+    now += 11 * 60_000; // past the recheck window: the next refresh starts a check (stale-able)
+    void p.refresh();
+    await new Promise((r) => setImmediate(r));
+    expect(waiting).toHaveLength(1); // the old check is in flight
+    p.invalidateProtocol();
+    expect(p.protocolStatus()).toBe("unknown");
+    await new Promise((r) => setImmediate(r));
+    expect(waiting).toHaveLength(2); // and a fresh one was started, not blocked behind it
+    waiting[0]({ protocol: 4, node: "v22", uptimeSec: 1 }); // the stale answer arrives first
+    await new Promise((r) => setImmediate(r));
+    expect(p.protocolStatus()).toBe("unknown"); // ignored
+    waiting[1]({ protocol: 3, node: "v22", uptimeSec: 1 });
+    await new Promise((r) => setImmediate(r));
+    expect([p.protocolStatus(), p.workerProtocol()]).toEqual(["match", 3]);
+  });
+
   it("S7: a flood of invalidations costs one host.info per cool-down (a compromised worker cannot flap the fleet or make the backend hammer it)", async () => {
     let asked = 0;
     const p = mk(async () => (asked++, { protocol: 4, node: "v22", uptimeSec: 1 }));

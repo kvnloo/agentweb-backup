@@ -97,6 +97,7 @@ export interface ClaudeBackendDeps {
     takeHalts(userId: string, sessionId: string): BridgeHalt[];
     /** The run's ledger, still readable after the run was closed (a Stop closes it before the drain). */
     takeLedger(runId: string): { records: BridgeCallRecord[]; truncated: number };
+    ranCall?(runId: string, callId: string): boolean;
     generationOf(runId: string): string | undefined;
     takeLedgerByGeneration(generation: string): { records: BridgeCallRecord[]; truncated: number };
     /** The tool relay (protocol 4) calls the bridge in process with the run's internal token: both are needed for it, and without them the HTTP bridge path is used. */
@@ -121,8 +122,11 @@ export interface ClaudeBackendDeps {
   relayAdmitPostHaltSiblings?: boolean;
   /** Consecutive turns that must report a dead login before the connection record is marked (default 2; see reconnectGuard.ts). */
   reconnectSignalsRequired?: number;
-  /** Asks the worker whether it agrees the login is dead (default: `connection.status` says needs_reconnect, or no such login). Tests replace it. */
-  confirmDeadLogin?(client: LoginHostClient, connectionId: string): Promise<boolean>;
+  /**
+   * Asks the worker whether it agrees the login is dead. Default: "needs_reconnect" when `connection.status` says so (independent evidence: the record is marked at
+   * once), true when the worker has no such login (weaker: the signal must repeat on consecutive turns), false otherwise. Tests replace it.
+   */
+  confirmDeadLogin?(client: LoginHostClient, connectionId: string): Promise<boolean | "needs_reconnect">;
   /** How long before the turn's deadline no further tool may start (the model is told to write its answer). Default 75 s, never more than half the deadline. */
   softDeadlineLeadMs?: number;
   /** How long a relayed call waits for the stream line that announces it (default 1.5 s; tests shorten it). */
@@ -401,7 +405,7 @@ export class ClaudeCodeBackend {
               ids: { connectionId, turnId: runId, epoch }, // this closure is the only source of identity; an event's fields are never read for it
               runId,
               token,
-              bridge: { callTool: (t, c, r, o) => d.bridge.callTool!(t, c, r, o), listTools: (t, r) => d.bridge.listTools!(t, r), noteToolUse: (r, c, n, i, m) => d.bridge.noteToolUse(r, c, n, i, m), takeLedger: (r) => d.bridge.takeLedger(r) },
+              bridge: { callTool: (t, c, r, o) => d.bridge.callTool!(t, c, r, o), listTools: (t, r) => d.bridge.listTools!(t, r), noteToolUse: (r, c, n, i, m) => d.bridge.noteToolUse(r, c, n, i, m), takeLedger: (r) => d.bridge.takeLedger(r), ...(d.bridge.ranCall ? { ranCall: (r, c) => d.bridge.ranCall!(r, c) } : {}) },
               manifest: { open: built.manifest.open },
               isStopped: () => seen.stopped || ac.signal.aborted,
               softDeadlineAt: d.now() + deadlineMs - lead,
@@ -629,9 +633,17 @@ export class ClaudeCodeBackend {
    */
   private async markDeadLogin(client: LoginHostClient, connectionId: string, epoch: number, reason: string): Promise<void> {
     try {
-      if (!this.reconnectGuard.note(connectionId)) return;
       const confirm = this.deps.confirmDeadLogin ?? defaultConfirmDeadLogin;
-      if (!(await confirm(client, connectionId))) return;
+      const evidence = await confirm(client, connectionId);
+      if (evidence === "needs_reconnect") {
+        // the host's own status says so (a route independent of the turn stream): mark at once, only the cool-down applies
+        if (!this.reconnectGuard.noteConfirmed(connectionId)) return;
+      } else if (evidence) {
+        // weaker evidence ("no such login"): the signal must repeat on consecutive turns
+        if (!this.reconnectGuard.note(connectionId)) return;
+      } else {
+        return;
+      }
       await this.deps.markNeedsReconnect(connectionId, epoch, reason);
     } catch {
       /* the 5-minute sweeper is the backstop */
@@ -774,11 +786,11 @@ function markLedgerTruncated(messages: any[], truncated: number): void {
   last.metadata = { ...(last.metadata ?? {}), ledgerTruncated: truncated };
 }
 
-async function defaultConfirmDeadLogin(client: LoginHostClient, connectionId: string): Promise<boolean> {
+async function defaultConfirmDeadLogin(client: LoginHostClient, connectionId: string): Promise<boolean | "needs_reconnect"> {
   try {
-    return (await client.connectionStatus({ connectionId })).state === "needs_reconnect";
+    return (await client.connectionStatus({ connectionId })).state === "needs_reconnect" ? "needs_reconnect" : false;
   } catch (err) {
-    return err instanceof LoginHostError && (err.code === "ENOTFOUND" || err.code === "ESTATE"); // the worker says again that it has no usable login
+    return err instanceof LoginHostError && (err.code === "ENOTFOUND" || err.code === "ESTATE"); // the worker says again that it has no usable login (weaker)
   }
 }
 

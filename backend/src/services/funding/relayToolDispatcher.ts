@@ -88,6 +88,8 @@ export interface RelayBridgePort {
   noteToolUse(runId: string, callId: string, name: string, input: unknown, messageId?: string): void;
   /** Non-clearing snapshot of the run's ledger (to learn whether a call really ran). */
   takeLedger(runId: string): { records: Array<{ toolCallId: string; kind: string }>; truncated: number };
+  /** Whether the call really ran (not refused), from the bridge's own bookkeeping, which does not depend on the persisted record surviving the ledger's caps. */
+  ranCall?(runId: string, callId: string): boolean;
 }
 
 export interface RelayDispatcherOptions {
@@ -214,6 +216,17 @@ export class RelayToolDispatcher {
   /** Operations whose answer the worker ACCEPTED (the model read it). Every other executed call of the turn is "result lost". */
   private readonly delivered = new Set<string>();
   private defsLock: Promise<void> = Promise.resolve();
+  /** The id the BRIDGE (and so the persisted chat and the replay logic) knows a call by: made here, never the worker's operation id (a compromised worker picks that). */
+  private readonly callIds = new Map<string, string>();
+  private cid(op: string): string {
+    let id = this.callIds.get(op);
+    if (id === undefined) {
+      id = `${this.o.runId}:${this.callIds.size + 1}`;
+      this.callIds.set(op, id);
+    }
+    return id;
+  }
+  private execTail: Promise<void> = Promise.resolve();
   private tripped = false;
   /**
    * The model messages, as the CLI's stream announced them (B1). A stream `tool-use` is informational and never executed; it is recorded here (name, a
@@ -242,7 +255,7 @@ export class RelayToolDispatcher {
     return this.inFlight.size;
   }
 
-  /** Ids (the operation ids, which are the bridge ledger's toolCallIds) of calls whose answer the worker could no longer take. */
+  /** Ids (the backend-made call ids, which are the bridge ledger's toolCallIds) of calls whose answer the worker could no longer take. */
   lostCallIds(): ReadonlySet<string> {
     return this.lost;
   }
@@ -438,7 +451,7 @@ export class RelayToolDispatcher {
           // AFTER the bridge returned: the tool ran. Never say "not run" (the model would repeat a write). Treat it like a lost result: the persisted result
           // is noted, the outcome is remembered so an identical retry is answered from it or refused, never run again.
           this.log("decide_failed_after_run");
-          this.lost.add(op);
+          this.lost.add(this.cid(op));
           if (st.key !== undefined) {
             this.lostWrites.add(st.key); // its kind is unknown here: treated as a write
             if (this.replays.size < MAX_REPLAYS && st.content !== undefined) this.replays.set(st.key, { content: truncateUtf8(st.content, MAX_REPLAY_BYTES), isError: st.isError === true });
@@ -498,30 +511,44 @@ export class RelayToolDispatcher {
     // ONLY if it matches an announcement of THAT message recorded BEFORE the halted answer went back: the batched confirmation AgentWeb gives (one deck
     // for "pause these 5 ad sets"). Anything else, whatever message id the worker sends, starts a new group and the bridge refuses it. A forged follow-up
     // cannot match: the stream announced the message before the answer existed (a confirm needs the approval token that only the answer carries).
-    const ann = await this.claimOrWait(name, argsKey);
+    // S9 (the default): after a halt NOTHING else runs, so no call shares a group with another (every call is `call-<op>`; there is no batch to join) and the
+    // calls are executed ONE AT A TIME, the halt check made again when a call's turn comes: calls that arrive in the same tick would otherwise all pass the
+    // check before the first one (the confirm-needed one) has halted. The shim already serializes parallel reads (S4), so this costs nothing real.
+    const strict = this.o.admitPostHaltSiblings !== true;
+    const ann = strict ? undefined : await this.claimOrWait(name, argsKey);
     if (this.o.isStopped()) return refuse(STOPPED_MESSAGE);
-    // After a halt a call that is not an announced sibling of the halted message is NOT announced to the bridge at all (neither `noteToolUse` nor a group
-    // close): the bridge admits only announced siblings, so it refuses this call, and the halted group's cursor is left alone, so the REAL siblings that follow
-    // (a call whose stream input was truncated falls in here) are still admitted: the batch stays usable.
-    const halted = this.o.isHalted();
-    const sibling = halted && ann !== undefined && this.halt !== undefined && ann.batch === this.halt.batch && ann.seq <= this.halt.cutoff;
-    const announce = !halted || sibling;
-    const messageId = sibling ? `msg-${ann!.batch}` : !halted && ann ? `msg-${ann.batch}` : `call-${op}`;
+    const release = strict ? await this.acquireExec() : undefined;
     let result: BridgeCallResult;
     try {
-      if (announce) this.o.bridge.noteToolUse(this.o.runId, op, name, ev.input, messageId);
-      result = await this.o.bridge.callTool(this.o.token, { name, args: ev.input, callId: op }, this.o.runId);
-    } catch (err) {
-      // A closed run (Stop, revoke, kill switch) rejects here: nothing executed.
-      this.log(err instanceof ToolBridgeAuthError ? "run_ended" : "bridge_failed");
-      return refuse(STOPPED_MESSAGE);
+      if (strict) {
+        if (this.o.isStopped()) return refuse(STOPPED_MESSAGE);
+        if (this.o.softDeadlineAt !== undefined && this.now() >= this.o.softDeadlineAt) return refuse(SOFT_DEADLINE_MESSAGE);
+        if (this.o.isHalted()) return refuse(HALTED_MESSAGE);
+      }
+      // After a halt a call that is not an announced sibling of the halted message is NOT announced to the bridge at all (neither `noteToolUse` nor a group
+      // close): the bridge admits only announced siblings, so it refuses this call, and the halted group's cursor is left alone, so the REAL siblings that follow
+      // (a call whose stream input was truncated falls in here) are still admitted: the batch stays usable.
+      const halted = this.o.isHalted();
+      const sibling = halted && ann !== undefined && this.halt !== undefined && ann.batch === this.halt.batch && ann.seq <= this.halt.cutoff;
+      const announce = !halted || sibling;
+      const messageId = sibling ? `msg-${ann!.batch}` : !halted && ann ? `msg-${ann.batch}` : `call-${this.cid(op)}`;
+      try {
+        if (announce) this.o.bridge.noteToolUse(this.o.runId, this.cid(op), name, ev.input, messageId);
+        result = await this.o.bridge.callTool(this.o.token, { name, args: ev.input, callId: this.cid(op) }, this.o.runId);
+      } catch (err) {
+        // A closed run (Stop, revoke, kill switch) rejects here: nothing executed.
+        this.log(err instanceof ToolBridgeAuthError ? "run_ended" : "bridge_failed");
+        return refuse(STOPPED_MESSAGE);
+      }
+      st.executed = true; // from here on the tool has run: an unforeseen throw must not be reported as "not run"
+      st.content = result.content;
+      st.isError = result.isError === true;
+      // The first halt of the turn fixes which message's siblings may still be admitted, and which announcements count (those recorded before this answer
+      // goes back). Set BEFORE the post, and before the next call's turn: the worker may hand the next call over before our post returns.
+      if (this.halt === undefined && this.o.isHaltingCall(this.cid(op))) this.halt = { batch: ann ? ann.batch : -1, cutoff: this.announceSeq };
+    } finally {
+      release?.();
     }
-    st.executed = true; // from here on the tool has run: an unforeseen throw must not be reported as "not run"
-    st.content = result.content;
-    st.isError = result.isError === true;
-    // The first halt of the turn fixes which message's siblings may still be admitted, and which announcements count (those recorded before this answer
-    // goes back). Set BEFORE the post: the worker may hand the next call over before our post returns.
-    if (this.halt === undefined && this.o.isHaltingCall(op)) this.halt = { batch: ann ? ann.batch : -1, cutoff: this.announceSeq };
     const answer: Answer = { content: result.content, isError: result.isError === true };
     if (result.images?.length) {
       const { images, dropped } = this.fitImages(result.images);
@@ -536,6 +563,15 @@ export class RelayToolDispatcher {
     // READ-ONLY tool is harmless and returns current data, a replay would hand the model stale data for the rest of the turn.
     if (fresh.readOnly.get(name) !== true) answer.replay = { key, content: result.content, isError: answer.isError };
     return answer;
+  }
+
+  /** Serializes the executing phase of calls (see `strict` in `decide`). */
+  private async acquireExec(): Promise<() => void> {
+    const prev = this.execTail;
+    let release: () => void = () => undefined;
+    this.execTail = new Promise<void>((resolve) => (release = resolve));
+    await prev;
+    return release;
   }
 
   private fitImages(images: Array<{ mimeType: string; data: string }>): { images: ToolImage[]; dropped: number } {
@@ -617,13 +653,13 @@ export class RelayToolDispatcher {
           ...(answer.tools?.length ? { tools: answer.tools } : {}),
         });
         // N2: an operation that was first reported lost and then answered with the plain "could not be returned" text did NOT deliver its real result.
-        if (!this.lost.has(op)) this.delivered.add(op);
+        if (!this.lost.has(this.cid(op))) this.delivered.add(this.cid(op));
         this.rememberReplay(op, answer);
         return;
       } catch (err) {
         if (err instanceof ToolResultLostError) {
           // The tool may have run. NEVER a wipe, never a retry: the outcome stays in the ledger and the persisted result gets the note.
-          this.lost.add(op);
+          this.lost.add(this.cid(op));
           this.rememberReplay(op, answer);
           this.log(`result_lost_${err.reason}`);
           return;
@@ -649,7 +685,7 @@ export class RelayToolDispatcher {
           continue;
         }
         // Not deliverable at all. The worker still holds the operation open, so the model gets a plain answer instead (once), and the persisted result is noted.
-        this.lost.add(op);
+        this.lost.add(this.cid(op));
         this.rememberReplay(op, answer);
         this.log(err instanceof LoginHostError ? `deliver_${err.code}` : "deliver_invalid");
         if (answer.content === DELIVERY_FAILED_MESSAGE) return;
@@ -693,9 +729,11 @@ export class RelayToolDispatcher {
   /** Remembers the original text of a call whose answer the worker could not take, so an identical retry gets it back instead of running again. */
   private rememberReplay(op: string, a: Answer): void {
     const p = a.replay;
-    if (!p || !this.lost.has(op)) return;
+    if (!p || !this.lost.has(this.cid(op))) return;
     // Only a call that really ran may be remembered: a refusal ("run ended", "too many") must not block a later honest retry.
-    const ran = this.o.bridge.takeLedger(this.o.runId).records.some((r) => r.toolCallId === op && (r.kind === "executed" || r.kind === "failed"));
+    const ran = this.o.bridge.ranCall
+      ? this.o.bridge.ranCall(this.o.runId, this.cid(op))
+      : this.o.bridge.takeLedger(this.o.runId).records.some((r) => r.toolCallId === this.cid(op) && (r.kind === "executed" || r.kind === "failed"));
     if (!ran) return;
     this.lostWrites.add(p.key); // a digest only: a write is never run twice, however many answers were lost
     if (this.replays.size < MAX_REPLAYS) this.replays.set(p.key, { content: truncateUtf8(p.content, MAX_REPLAY_BYTES), isError: p.isError });

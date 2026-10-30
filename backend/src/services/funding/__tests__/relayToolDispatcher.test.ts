@@ -94,6 +94,7 @@ function rig(o: Opts = {}) {
       },
       noteToolUse: (r, c, n, i, m) => bridge.noteToolUse(r, c, n, i, m),
       takeLedger: (r) => bridge.takeLedger(r),
+      ranCall: (r, c) => bridge.ranCall(r, c),
     },
     manifest: { open: new Set(['search', 'save_note', 'install_skills', 'send_email']) },
     isStopped: o.stopped ?? (() => false),
@@ -129,7 +130,7 @@ describe('RelayToolDispatcher', () => {
     await t.d.settle(1_000);
     expect(t.executed).toEqual([{ name: 'search', args: { q: 'x' } }]);
     expect(t.posts).toEqual([{ connectionId: 'conn-1', turnId: 'claude-run-1', epoch: 3, operationId: 'op-1', content: 'search done' }]);
-    expect(t.bridge.takeLedger('r1').records.map((r) => [r.toolCallId, r.kind])).toEqual([['op-1', 'executed']]);
+    expect(t.bridge.takeLedger('r1').records.map((r) => [r.toolCallId, r.kind])).toEqual([['r1:1', 'executed']]);
   });
 
   it('IDENTITY: an event that carries connection, turn and epoch fields changes nothing; the posted ids are the closure ids', async () => {
@@ -767,8 +768,8 @@ describe('RelayToolDispatcher', () => {
       expect(t.executed).toHaveLength(1);
       expect(t.posts[0]).toMatchObject({ operationId: 'op-1', isError: true, content: RAN_NOT_PREPARED_MESSAGE });
       expect(t.posts[0].content).not.toBe(STOPPED_MESSAGE);
-      expect(t.d.lostCallIds().has('op-1')).toBe(true);
-      expect(t.d.deliveredCallIds().has('op-1')).toBe(false); // so the persisted tool result carries the lost note
+      expect(t.d.lostCallIds().has('r1:1')).toBe(true);
+      expect(t.d.deliveredCallIds().has('r1:1')).toBe(false); // so the persisted tool result carries the lost note
       expect(errors.join('\n')).toContain('decide_failed_after_run');
       t.d.start(t.ev('op-2', 'save_note', { n: 1 }, 'later'));
       await t.d.settle(1_000);
@@ -856,6 +857,38 @@ describe('RelayToolDispatcher', () => {
       for (const op of ['op-2', 'op-3', 'op-4']) expect(t.posts.find((p) => p.operationId === op)).toMatchObject({ isError: true, content: HALTED_MESSAGE });
     });
 
+    it.each([['with the confirm-needed call slow (still executing when the others arrive)', true], ['with it instant', false]])(
+      'SF1: calls handed over in the SAME tick: the first halts, none of the others executes (%s)',
+      async (_l, slow) => {
+        let open: () => void = () => undefined;
+        const gate = slow ? new Promise<void>((r) => (open = r)) : undefined;
+        const t = rig({ confirm: ['send_email'], admitSiblings: false, ...(gate ? { gate: { send_email: gate } } : {}) });
+        // the stream announced all three in one message (a forged batch)
+        t.d.noteStreamUse('mcp__aw__send_email', { to: 'a' });
+        t.d.noteStreamUse('mcp__aw__send_email', { to: 'b' });
+        t.d.noteStreamUse('mcp__aw__save_note', { n: 1 });
+        const used = jest.spyOn(t.bridge, 'noteToolUse');
+        t.d.start(t.ev('op-1', 'send_email', { to: 'a' }));
+        t.d.start(t.ev('op-2', 'send_email', { to: 'b' }));
+        t.d.start(t.ev('op-3', 'save_note', { n: 1 }));
+        t.d.start(t.ev('op-4', 'search', { q: 'x' }));
+        await new Promise((r) => setImmediate(r));
+        open();
+        await t.d.settle(2_000);
+        expect(t.executed.map((e) => e.args)).toEqual([{ to: 'a' }]);
+        for (const op of ['op-2', 'op-3', 'op-4']) expect(t.posts.find((p) => p.operationId === op)).toMatchObject({ isError: true, content: HALTED_MESSAGE });
+        // no call ever shared a group with another
+        for (const c of used.mock.calls) expect(c[4]).toBe(`call-${c[1]}`);
+      },
+    );
+
+    it('SF1: 12 calls started together, the first halts: exactly one executes', async () => {
+      const t = rig({ confirm: ['send_email'], admitSiblings: false });
+      for (let i = 1; i <= 12; i++) t.d.start(t.ev(`op-${i}`, 'send_email', { to: `p${i}` }));
+      await t.d.settle(2_000);
+      expect(t.executed).toHaveLength(1);
+    });
+
     it('before any halt everything runs as usual', async () => {
       const t = rig({ confirm: ['send_email'], admitSiblings: false });
       t.d.start(t.ev('op-1', 'search', { q: 'a' }));
@@ -872,6 +905,18 @@ describe('RelayToolDispatcher', () => {
       t.d.start(t.ev('op-2', 'search', { q: 'a' }));
       await t.d.settle(1_000);
       expect(t.executed.map((e) => e.name)).toEqual(['send_email']);
+    });
+  });
+
+  describe('M40: stream announcements for names that are not in the manifest are not recorded', () => {
+    it('2000 announcements of an unknown tool do not use up the announcement cap: a real announcement afterwards still groups its call', async () => {
+      const t = rig();
+      for (let i = 0; i < 2000; i++) t.d.noteStreamUse('mcp__aw__not_a_tool', { i });
+      t.d.noteStreamUse('mcp__aw__search', { q: 'x' });
+      const used = jest.spyOn(t.bridge, 'noteToolUse');
+      t.d.start(t.ev('op-1', 'search', { q: 'x' }));
+      await t.d.settle(1_000);
+      expect(used.mock.calls[0][4]).toBe('msg-1');
     });
   });
 
@@ -1009,10 +1054,37 @@ describe('RelayToolDispatcher', () => {
       t.behaviour.next = [new ToolResultLostError(reason)];
       t.d.start(t.ev('op-1', 'save_note', { n: 1 }));
       await t.d.settle(1_000);
-      expect([...t.d.lostCallIds()]).toEqual(['op-1']);
+      expect([...t.d.lostCallIds()]).toEqual(['r1:1']);
       expect(t.posts).toHaveLength(1); // no retry of the post
       expect(t.executed).toHaveLength(1); // and no second execution
       expect(errors.join('\n')).toContain(`result_lost_${reason}`);
+    });
+
+    it('SF4: a full ledger (389 junk writes with ~15 KB inputs) does not hide a later real write: it is recorded, and its lost answer still blocks an identical retry', async () => {
+      const t = rig();
+      for (let i = 0; i < 389; i++) {
+        t.d.start(t.ev(`junk-${i}`, 'save_note', { n: i, pad: 'x'.repeat(15_000) }));
+        await t.d.settle(1_000);
+      }
+      t.behaviour.next = [new ToolResultLostError('result_lost')];
+      t.d.start(t.ev('real-1', 'send_email', { to: 'a' }));
+      await t.d.settle(1_000);
+      const { records } = t.bridge.takeLedger('r1');
+      expect(records.some((r) => r.name === 'send_email' && r.kind === 'executed')).toBe(true);
+      const before = t.executed.length;
+      t.d.start(t.ev('real-2', 'send_email', { to: 'a' }));
+      await t.d.settle(1_000);
+      expect(t.executed).toHaveLength(before); // the identical retry did not run again
+      expect(t.posts.at(-1)).toMatchObject({ operationId: 'real-2' });
+    });
+
+    it('nit: the worker operation id never reaches the bridge or the persisted chat; the backend makes the call id', async () => {
+      const t = rig();
+      const hostile = 'A'.repeat(64);
+      t.d.start(t.ev(hostile, 'save_note', { n: 1 }));
+      await t.d.settle(1_000);
+      expect(t.posts[0].operationId).toBe(hostile); // the worker is answered under its own id
+      expect(t.bridge.takeLedger('r1').records.map((r) => r.toolCallId)).toEqual(['r1:1']);
     });
 
     it('an identical retry of a call whose result was lost gets the original result back and does NOT run again', async () => {
@@ -1157,7 +1229,7 @@ describe('RelayToolDispatcher', () => {
       await t.d.settle(1_000);
       expect(t.posts).toHaveLength(2);
       expect(t.posts[1]).toMatchObject({ operationId: 'op-1', isError: true, content: DELIVERY_FAILED_MESSAGE });
-      expect([...t.d.lostCallIds()]).toEqual(['op-1']);
+      expect([...t.d.lostCallIds()]).toEqual(['r1:1']);
     });
 
     it('S2: a call to a newly available tool that arrives while the install answer is still being posted is accepted', async () => {
@@ -1185,7 +1257,7 @@ describe('RelayToolDispatcher', () => {
       await t.d.settle(1_000);
       expect(t.posts).toHaveLength(6); // first + 4 shrinks + the plain failure answer
       expect(t.posts[5].content).toBe(DELIVERY_FAILED_MESSAGE);
-      expect([...t.d.lostCallIds()]).toEqual(['op-1']);
+      expect([...t.d.lostCallIds()]).toEqual(['r1:1']);
     });
 
     it('S2: ambiguous failures are retried at most twice per answer (3 tries), then the plain failure answer gets its own 3 tries', async () => {
@@ -1195,7 +1267,7 @@ describe('RelayToolDispatcher', () => {
       await t.d.settle(1_000);
       expect(t.posts).toHaveLength(6); // 3 tries of the real answer + 3 of the plain one
       expect(t.posts[3].content).toBe(DELIVERY_FAILED_MESSAGE);
-      expect([...t.d.lostCallIds()]).toEqual(['op-1']);
+      expect([...t.d.lostCallIds()]).toEqual(['r1:1']);
     });
 
     it('N2: an answer reported lost and then replaced by the plain failure text is NOT counted as delivered (the persisted result keeps the note)', async () => {
@@ -1204,8 +1276,8 @@ describe('RelayToolDispatcher', () => {
       t.d.start(t.ev('op-1', 'save_note', { n: 1 }));
       await t.d.settle(1_000);
       expect(t.posts[1].content).toBe(DELIVERY_FAILED_MESSAGE); // accepted by the worker
-      expect(t.d.lostCallIds().has('op-1')).toBe(true);
-      expect(t.d.deliveredCallIds().has('op-1')).toBe(false);
+      expect(t.d.lostCallIds().has('r1:1')).toBe(true);
+      expect(t.d.deliveredCallIds().has('r1:1')).toBe(false);
     });
 
     it('N1: input that cannot be canonicalized is refused with its own message and nothing runs', async () => {
