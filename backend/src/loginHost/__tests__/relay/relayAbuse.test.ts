@@ -191,6 +191,29 @@ describe("the relay's byte budget", () => {
     await ep.close();
   });
 
+  it("MUTATION TARGET: the byte budget REFILLS at bytesPerSec (a third ~120 KB frame passes after 2 s of refill, and is cut without it)", async () => {
+    const now = jest.spyOn(performance, "now");
+    let t = 5000;
+    now.mockImplementation(() => t);
+    try {
+      const s = setup({}, { byteBurst: 300_000, bytesPerSec: 100_000 });
+      const { ep, calls } = await s.open();
+      const c = await client(sockOf(ep.dir));
+      const frame = (i: number) => JSON.stringify({ type: "call", callId: `c${i}`, name: "t", args: { pad: "x".repeat(120_000) } }) + "\n";
+      c.s.write(frame(1));
+      c.s.write(frame(2));
+      await until(() => calls.length === 1);
+      t += 2000; // +200,000 bytes of budget
+      c.s.write(frame(3));
+      await new Promise((r) => setTimeout(r, 150));
+      expect(c.isClosed()).toBe(false);
+      expect(s.logs.map((l) => l.fields?.code)).not.toContain("rate_limited");
+      await ep.close();
+    } finally {
+      now.mockRestore();
+    }
+  });
+
   it("small frames are not slowed by the byte budget", async () => {
     const s = setup({}, { byteBurst: 300_000, bytesPerSec: 1 });
     const { ep, calls } = await s.open();

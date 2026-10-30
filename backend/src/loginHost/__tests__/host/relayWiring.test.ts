@@ -28,6 +28,12 @@ const cfg = () =>
 const binary = (c: ReturnType<typeof cfg>): VerifiedBinary => ({ path: c.claude.binaryPath, version: "2.1.294", digest: "sha256:" + "a".repeat(64) });
 
 describe("relay wiring in the host", () => {
+  it("MUTATION TARGET: a host config without claude.nodePath does not parse (the relay needs the real node path)", () => {
+    const c = JSON.parse(JSON.stringify(cfg()));
+    delete c.claude.nodePath;
+    expect(() => parseHostConfig(c)).toThrow(/nodePath/);
+  });
+
   it("MUTATION TARGET: in production (no test override) the relay hands sockets and directories to the customer uid; only a test turns that off", () => {
     const dir = mkdtempSync(join(tmpdir(), "relay-wire-"));
     dirs.push(dir);

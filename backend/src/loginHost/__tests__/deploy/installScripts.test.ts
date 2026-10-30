@@ -1183,6 +1183,18 @@ case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${
     expect(stagingLeft(b)).toEqual([]);
   });
 
+  it("MUTATION TARGET: --dry-run on a worker WITHOUT the pinned node says so (the node is not installed yet) and succeeds; a real install without it still stops", () => {
+    const b = box({ node: "none" });
+    const dry = run(b, "--dry-run");
+    expect(dry.status).toBe(0);
+    expect(dry.stdout).toMatch(/dry run: the pinned node .* is not installed on this worker yet/);
+    expect(dry.stdout).not.toContain("would refuse to start");
+    const real = run(b);
+    expect(real.status).not.toBe(0);
+    expect(real.stdout + real.stderr).toContain("would refuse to start");
+    expect(releases(b)).toEqual([]);
+  });
+
   it("two installs at once cannot collide: while another process holds the install lock, the second refuses and changes nothing", async () => {
     const b = box();
     const holder = spawn("flock", ["-n", b.env.AW_LOCK, "sleep", "30"], { stdio: "ignore", detached: true });

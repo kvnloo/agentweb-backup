@@ -123,6 +123,20 @@ describe("CLI stdout: lines nested deeper than the cap are dropped before anythi
       }
     });
 
+    it("MUTATION TARGET: a deep line that ends in a lone \\r (while being discarded) does not swallow the event after it, in one chunk or many", async () => {
+      const text = nested(100) + "\r" + '{"ev":1}' + "\n" + nested(100) + "\r\n" + '{"ev":2}' + "\n";
+      const want = NEST64 + `\n${PLACEHOLDER}\n{"ev":1}\n` + NEST64 + `\n${PLACEHOLDER}\n{"ev":2}\n`;
+      const whole = rig();
+      await whole.feed(text);
+      expect(whole.out()).toBe(want);
+      const bytes = Buffer.from(text);
+      for (const size of [1, 7]) {
+        const r = rig();
+        await r.feed(...Array.from({ length: Math.ceil(bytes.length / size) }, (_, i) => bytes.subarray(i * size, (i + 1) * size)));
+        expect({ size, out: r.out() }).toEqual({ size, out: want });
+      }
+    });
+
     it("MUTATION TARGET: a lone \\r ends a line (depth and string state reset), so each segment is counted from zero", async () => {
       const r = rig();
       await r.feed(nested(40) + "\r" + nested(40) + "\r" + nested(40) + "\n"); // each segment is 40 deep: none passes 64

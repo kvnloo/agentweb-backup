@@ -435,9 +435,14 @@ ok "generated config accepted by the host's parser"
 # The host refuses to start when a path it hands to a customer unit has a symlink on it, a non-root owner or a group/other-writable component. Run that same check
 # NOW, on the staged files (the release and TLS set are not at their final paths yet) and the pinned node, so a config the host would refuse at start-up never gets
 # switched to: this is the step that catches a symlinked node path or a shim that is not root-owned.
-trust_out=$(check_config "$cfg_tmp" "$HERE/check-config.js" --owner "$TRUST_UID" ${TRUST_BOUNDARY:+--boundary "$TRUST_BOUNDARY"} --map "$REL_DIR=$STAGE_REL_DIR" --map "$TLS_DIR=$STAGE_TLS_DIR" --map "/opt/aw-node=$NODE_ROOT" 2>&1) \
-  || die "the host would refuse to start with this release (trusted-path check): ${trust_out:-no output}. Nothing was changed."
-ok "every release path the host will check is root-controlled (no symlink, owner, write bits)"
+if trust_out=$(check_config "$cfg_tmp" "$HERE/check-config.js" --owner "$TRUST_UID" ${TRUST_BOUNDARY:+--boundary "$TRUST_BOUNDARY"} --map "$REL_DIR=$STAGE_REL_DIR" --map "$TLS_DIR=$STAGE_TLS_DIR" --map "/opt/aw-node=$NODE_ROOT" 2>&1); then
+  ok "every release path the host will check is root-controlled (no symlink, owner, write bits)"
+elif [ "$DRY" = 1 ] && [ ! -e "$NODE_ROOT/v$NODE_VERSION/bin/node" ]; then
+  # A dry run on a worker that does not have the pinned node yet (a real install downloads it first): that is not a problem with this release.
+  skip "dry run: the pinned node $NODE_VERSION is not installed on this worker yet (a real install puts it in /opt/aw-node first), so the trusted-path check is not run. ${trust_out:-}"
+else
+  die "the host would refuse to start with this release (trusted-path check): ${trust_out:-no output}. Nothing was changed."
+fi
 
 # The slice that caps ALL customer units (values pinned in versions.env; CPU quota leaves ~20% of one vCPU for the host).
 CPU_QUOTA="$(( $(nproc) * 100 - 20 ))%"
