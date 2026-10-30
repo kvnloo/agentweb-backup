@@ -1350,6 +1350,38 @@ describe('RelayToolDispatcher', () => {
       expect([...t.d.lostCallIds()]).toEqual([CID(1)]);
     });
 
+    it('result_budget (the worker\'s per-turn answered-bytes budget is spent): marked lost, ONE smaller answer, then the plain failure text; bounded, never throws', async () => {
+      const t = rig({ content: { search: 'y'.repeat(100_000) } });
+      t.behaviour.next = [new LoginHostError('EINVALID', 'result_budget'), new LoginHostError('EINVALID', 'result_budget')];
+      t.d.start(t.ev('op-1', 'search'));
+      await t.d.settle(1_000);
+      expect(t.posts).toHaveLength(3); // the real answer, one smaller, the plain failure text
+      expect(t.posts[1].content.length).toBeLessThan(t.posts[0].content.length);
+      expect(t.posts[2].content).toBe(DELIVERY_FAILED_MESSAGE);
+      expect(t.d.lostCallIds().has(CID(1))).toBe(true);
+      expect(t.d.deliveredCallIds().has(CID(1))).toBe(false); // the persisted result keeps the note
+      expect(errors.join('\n')).toContain('deliver_result_budget');
+    });
+
+    it('result_budget on every post (a spent budget refuses even the plain text): stops after the plain text, no loop', async () => {
+      const t = rig();
+      t.behaviour.next = Array.from({ length: 20 }, () => new LoginHostError('EINVALID', 'result_budget'));
+      t.d.start(t.ev('op-1', 'search'));
+      await t.d.settle(1_000);
+      expect(t.posts.length).toBeLessThanOrEqual(3);
+      expect(t.d.lostCallIds().has(CID(1))).toBe(true);
+    });
+
+    it('result_budget: a smaller answer that fits is accepted, and the call stays lost (the model did not see the whole result)', async () => {
+      const t = rig({ content: { search: 'y'.repeat(100_000) } });
+      t.behaviour.next = [new LoginHostError('EINVALID', 'result_budget')];
+      t.d.start(t.ev('op-1', 'search'));
+      await t.d.settle(1_000);
+      expect(t.posts).toHaveLength(2);
+      expect(t.d.lostCallIds().has(CID(1))).toBe(true);
+      expect(t.d.deliveredCallIds().has(CID(1))).toBe(false);
+    });
+
     it('S2: ambiguous failures are retried at most twice per answer (3 tries), then the plain failure answer gets its own 3 tries', async () => {
       const t = rig();
       t.behaviour.next = Array.from({ length: 20 }, () => new LoginHostError('UNREACHABLE', 'ECONNRESET'));

@@ -646,6 +646,7 @@ export class RelayToolDispatcher {
     // CURRENT list on every call, so this grants nothing it does not.
     let attempts = 0;
     let shrinks = 0;
+    let budgetShrunk = false;
     for (;;) {
       try {
         await this.o.client.turnToolResult({
@@ -673,6 +674,23 @@ export class RelayToolDispatcher {
         if (err instanceof LoginHostError && err.code === "EINVALID" && err.detail === "result_too_large" && shrinks < 4) {
           shrinks++;
           answer = this.shrink(answer);
+          continue;
+        }
+        if (err instanceof LoginHostError && err.code === "EINVALID" && err.detail === "result_budget") {
+          // The worker's per-turn budget of answered bytes is spent: the operation is still pending. The tool ran, so the persisted result is noted (lost); one smaller
+          // answer is tried (it may fit what is left of the budget), then the plain failure text (a few bytes), which the generic path below sends and never repeats.
+          this.lost.add(this.cid(op));
+          this.rememberReplay(op, answer);
+          this.log("deliver_result_budget");
+          if (!budgetShrunk && answer.content !== DELIVERY_FAILED_MESSAGE) {
+            budgetShrunk = true;
+            answer = this.shrink(answer);
+            continue;
+          }
+          if (answer.content === DELIVERY_FAILED_MESSAGE) return;
+          for (const t of answer.tools ?? []) this.unmarkSent(t.name);
+          answer = { content: DELIVERY_FAILED_MESSAGE, isError: true };
+          attempts = 0;
           continue;
         }
         if (answer.tools && refusesTools(err)) {
