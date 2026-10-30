@@ -63,11 +63,13 @@ export const BOUNCE_CONFIRM_AFTER_MS = 45 * 60 * 1000;
  * re-add, a list that flapped), and an old first sighting must not stand in for the second one. Long enough that a campaign polled only every few
  * passes (more than 100 campaigns in the window, longest-waiting first) still completes its wait.
  */
-export const BOUNCE_WAIT_STALE_MS = 12 * 60 * 60 * 1000;
+export const BOUNCE_WAIT_STALE_MS = 12 * 60 * 60 * 1000; // up to 1000 runs / 100 campaigns per pass = a campaign polled about every 10 h: revisit this if either number changes
 const pendingBounce = new Map<string, { first: number; last: number }>();
 /** When each campaign was last polled, so that when there are more campaigns than one pass covers, the longest-waiting go first and none starve. */
 const lastPolled = new Map<number, number>();
 const loggedAt = new Map<string, number>();
+/** For tests: how many waiting records are held. */
+export const __pendingBounceCount = (): number => pendingBounce.size;
 export const __resetEventPoll = () => { seen.clear(); loggedAt.clear(); lastPolled.clear(); pendingBounce.clear(); };
 
 export interface PollDeps {
