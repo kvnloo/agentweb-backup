@@ -1033,6 +1033,8 @@ interface LLMCallOptions {
   tool_choice?: 'auto' | 'none' | any | null;
   /** Execute search through OpenRouter's provider-independent server tool. */
   webSearch?: boolean;
+  /** Parameters for the web-search server tool (engine, max_results, max_uses, ...); omitted means OpenRouter's defaults. */
+  webSearchParameters?: Record<string, string | number>;
   max_completion_tokens?: number | null;
   temperature?: number | null;
   response_format?: { type: 'text' | 'json_object' } | null;
@@ -2522,6 +2524,7 @@ export class AgentModeService {
       tools = null,
       tool_choice = null,
       webSearch = false,
+      webSearchParameters,
       max_completion_tokens = null,
       temperature = null,
       response_format = null,
@@ -2659,7 +2662,7 @@ export class AgentModeService {
         }) : tool)
       : boundedTools;
     const requestTools = webSearch
-      ? [...normalizedCallerTools, { type: 'openrouter:web_search' }]
+      ? [...normalizedCallerTools, { type: 'openrouter:web_search', ...(webSearchParameters && Object.keys(webSearchParameters).length ? { parameters: webSearchParameters } : {}) }]
       : normalizedCallerTools;
     // ENG-1831: every chain member receives the same parameter set, and
     // require_parameters makes one unsupported field unroutable (ENG-199 404).

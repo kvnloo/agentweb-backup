@@ -65,12 +65,37 @@ async function criticModel(userId: string | undefined): Promise<string> {
 // no fallback, so requireContent retries it instead of the parse failure below reading as "not found".
 // OpenAI models skip Azure on web-search calls: it returned finish_reason=error with an empty body on
 // about a quarter of them. Other labs keep their hosts, or a skip could move lead data to a new one.
+// ENG-2720: OpenRouter bills each web search ($0.007 on Exa, plus $0.001 per result past 10) on top of
+// tokens, and with no limits a call can run many searches. CRM_ENRICH_V3_WEB_SEARCH_PARAMS is a JSON
+// object of tool parameters (for example {"max_uses":2,"engine":"parallel","max_results":3}). Unset keeps
+// OpenRouter's defaults. Unknown keys and bad values are dropped.
+const WEB_SEARCH_PARAM_KEYS: Record<string, 'int' | 'engine' | 'size'> = {
+  max_uses: 'int', max_results: 'int', max_total_results: 'int', max_characters: 'int',
+  engine: 'engine', search_context_size: 'size',
+};
+export function parseWebSearchParams(raw: string | undefined): Record<string, string | number> | undefined {
+  if (!raw?.trim()) return undefined;
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { console.warn('[v3 deps] CRM_ENRICH_V3_WEB_SEARCH_PARAMS is not valid JSON; ignoring'); return undefined; }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+  const out: Record<string, string | number> = {};
+  for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+    const kind = WEB_SEARCH_PARAM_KEYS[key];
+    if (kind === 'int' && Number.isInteger(value) && (value as number) > 0 && (value as number) <= 100000) out[key] = value as number;
+    else if (kind === 'engine' && typeof value === 'string' && ['auto', 'native', 'exa', 'firecrawl', 'parallel', 'perplexity'].includes(value)) out[key] = value;
+    else if (kind === 'size' && typeof value === 'string' && ['low', 'medium', 'high'].includes(value)) out[key] = value;
+    else console.warn(`[v3 deps] CRM_ENRICH_V3_WEB_SEARCH_PARAMS: dropping "${key}"`);
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+const WEB_SEARCH_PARAMS = parseWebSearchParams(process.env.CRM_ENRICH_V3_WEB_SEARCH_PARAMS);
 const CHEAP_DEFAULT_MODEL = 'openrouter/openai/gpt-5.6-luna';
 const FALLBACK_MODEL = 'gpt-5.5';
 const isOpenAiModel = (model: string) => /^(gpt-|openai\/|openrouter\/openai\/)/.test(model);
 function makeEnrichLLM(model: string, temperature: number | null) {
   return createLLMService(model, temperature, undefined, {
     requireContent: true,
+    ...(WEB_SEARCH_PARAMS ? { webSearchParameters: WEB_SEARCH_PARAMS } : {}),
     ...(isOpenAiModel(model) ? { providerIgnoreForWebSearch: ['Azure'] } : {}),
     ...(model === CHEAP_DEFAULT_MODEL ? { fallbackModels: [FALLBACK_MODEL] } : {}),
   });
