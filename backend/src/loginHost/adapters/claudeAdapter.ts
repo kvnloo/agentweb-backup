@@ -209,7 +209,8 @@ const NEWLINE = Buffer.from("\n");
 
 /** The child's stderr, metered and bounded before the runner (which concatenates a tail per chunk) sees it. */
 export class StderrGuard extends Transform {
-  private tail: Buffer = Buffer.alloc(0);
+  private readonly tail: Buffer = Buffer.alloc(STDERR_FORWARD_CAP);
+  private tailLen = 0;
   private tripped = false;
   private readonly reads = new TokenBucket(READ_BURST, READS_PER_SEC);
   private readonly bytes = new TokenBucket(1024 * 1024, 64 * 1024);
@@ -229,13 +230,28 @@ export class StderrGuard extends Transform {
         return cb();
       }
       // keep the LAST few KiB (what a diagnostic wants), delivered when the stream ends
-      this.tail = chunk.length >= STDERR_FORWARD_CAP ? Buffer.from(chunk.subarray(chunk.length - STDERR_FORWARD_CAP)) : Buffer.concat([this.tail, chunk]).subarray(-STDERR_FORWARD_CAP);
+      this.keepTail(chunk);
       cb();
     });
   }
+  /** A fixed ring of the last STDERR_FORWARD_CAP bytes: no allocation per read (a trickle is thousands of reads). */
+  private keepTail(chunk: Buffer): void {
+    if (chunk.length >= STDERR_FORWARD_CAP) {
+      chunk.copy(this.tail, 0, chunk.length - STDERR_FORWARD_CAP);
+      this.tailLen = STDERR_FORWARD_CAP;
+      return;
+    }
+    const overflow = this.tailLen + chunk.length - STDERR_FORWARD_CAP;
+    if (overflow > 0) {
+      this.tail.copy(this.tail, 0, overflow, this.tailLen);
+      this.tailLen -= overflow;
+    }
+    chunk.copy(this.tail, this.tailLen);
+    this.tailLen += chunk.length;
+  }
   override _flush(cb: (err?: Error | null) => void): void {
-    if (this.tail.length > 0) this.push(this.tail);
-    this.tail = Buffer.alloc(0);
+    if (this.tailLen > 0) this.push(Buffer.from(this.tail.subarray(0, this.tailLen)));
+    this.tailLen = 0;
     cb();
   }
 }
