@@ -144,15 +144,18 @@ describe("a hostile CLI printing a deeply nested line", () => {
 });
 
 /** The relay replaced by a stub that hands the test its callbacks, so a call can be injected exactly as a bug in the relay would deliver it. */
-function stubbed() {
-  const rig = makeRig(100);
+function stubbed(messageIdWaitMs = 100, answerThrows = false) {
+  const rig = makeRig(messageIdWaitMs);
   rig.scenario({ turn: [{ wait: 1500 }, RESULT_STEP] });
   let opened!: RelayOpenOptions;
   const rejected: string[] = [];
   let closed = 0;
   rig.host.open = async (o: RelayOpenOptions): Promise<RelayEndpoint> => {
     opened = o;
-    return { dir: join(tmpdir(), "stub-relay-dir"), closed: false, answer: () => true, reject: (op) => (rejected.push(op), true), close: async () => void closed++ };
+    return { dir: join(tmpdir(), "stub-relay-dir"), closed: false, answer: () => {
+        if (answerThrows) throw new Error("boom: SECRET");
+        return true;
+      }, reject: (op) => (rejected.push(op), true), close: async () => void closed++ };
   };
   return { rig, opts: () => opened, rejected, closes: () => closed };
 }
@@ -169,9 +172,10 @@ describe("a failure while handling a call is contained: the call is answered wit
     await until(() => !!s.opts());
     inject(s.opts());
     await new Promise((r) => setTimeout(r, 400)); // past the message-id wait: the TIMER path has run
+    const closesBeforeCleanup = s.closes(); // what the guard itself did, before the test's own session.close() closes the endpoint too
     await session.close();
     await turn.catch(() => undefined);
-    return { ...s, events };
+    return { ...s, events, closesBeforeCleanup };
   }
 
   it("MUTATION TARGET: args nested too deeply for a call that reached the adapter (a relay bug): refused, never forwarded with a marker or executed", async () => {
@@ -181,7 +185,24 @@ describe("a failure while handling a call is contained: the call is answered wit
     expect(uncaught).toEqual([]);
     expect(r.events.filter((e) => e.type === "tool-call")).toHaveLength(0);
     expect(r.rejected).toEqual(["a".repeat(32)]);
-    expect(r.closes()).toBeGreaterThan(0);
+    expect(r.closesBeforeCleanup).toBeGreaterThan(0);
+  });
+
+  it("MUTATION TARGET: a failure that happens only LATER, in the message-id TIMER (the first look at the call was fine), is contained the same way", async () => {
+    const t0 = Date.now();
+    const args = {} as Record<string, unknown>;
+    Object.defineProperty(args, "q", {
+      enumerable: true,
+      get: () => {
+        if (Date.now() - t0 > 60) throw new Error("late boom: SECRET");
+        return 1;
+      },
+    });
+    const r = await run((o) => o.onCall(call({ args })));
+    expect(uncaught).toEqual([]);
+    expect(r.events.filter((e) => e.type === "tool-call")).toHaveLength(0);
+    expect(r.rejected).toEqual(["a".repeat(32)]);
+    expect(r.closesBeforeCleanup).toBeGreaterThan(0);
   });
 
   it("MUTATION TARGET: args whose very access throws (the timer path): contained the same way", async () => {
@@ -201,6 +222,38 @@ describe("a failure while handling a call is contained: the call is answered wit
     expect(r.events.filter((e) => e.type === "tool-call")).toHaveLength(1);
     expect(stringified).toBe(false);
     expect(uncaught).toEqual([]);
+  });
+
+  it("MUTATION TARGET: stream bookkeeping that fails while a call waits for its message id rejects that call and closes the endpoint (guarded in onEvent; the runner would otherwise swallow it silently)", async () => {
+    const s = stubbed(1500);
+    s.rig.scenario({ turn: [{ wait: 300 }, { type: "assistant", message: { id: "m1", content: [{ type: "tool_use", id: "tu1", name: "mcp__emma__search", input: { q: 1 } }] } }, RESULT_STEP] });
+    const session = await s.rig.adapter.openSession(s.rig.ctx, { connectionId: "conn1", epoch: 3 });
+    (session as unknown as { noteStreamUse(): void }).noteStreamUse = () => {
+      throw new Error("stream boom: SECRET");
+    };
+    const turn = (async () => {
+      for await (const ev of session.turn({ turnId: "t1", prompt: "go", model: "sonnet", relay: { tools: TOOLS, callTimeoutMs: () => 5000 } })) void ev;
+    })();
+    await until(() => !!s.opts());
+    s.opts().onCall(call()); // waiting for its message id (1.5 s)
+    await until(() => s.rejected.length === 1);
+    expect(s.rejected).toEqual(["a".repeat(32)]);
+    expect(s.closes()).toBeGreaterThan(0);
+    expect(uncaught).toEqual([]);
+    await session.close();
+    await turn.catch(() => undefined);
+  });
+
+  it("MUTATION TARGET: an endpoint whose answer() throws makes the session's answer() report the result lost, not throw", async () => {
+    const s = stubbed(100, true);
+    const session = await s.rig.adapter.openSession(s.rig.ctx, { connectionId: "conn1", epoch: 3 });
+    const turn = (async () => {
+      for await (const ev of session.turn({ turnId: "t1", prompt: "go", model: "sonnet", relay: { tools: TOOLS, callTimeoutMs: () => 5000 } })) void ev;
+    })();
+    await until(() => !!s.opts());
+    expect(session.answer("a".repeat(32), { kind: "tool-result", ok: true, content: "x" })).toBe(false);
+    await session.close();
+    await turn.catch(() => undefined);
   });
 
   it("MUTATION TARGET: a call that arrives after the turn was closed is dropped (no waiting timer, no event)", async () => {
