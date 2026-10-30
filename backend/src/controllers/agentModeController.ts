@@ -13581,7 +13581,7 @@ export const agentModeController = {
         // ENG-2763: OpenRouter key-limit / credits exhaustion is a known class, not an
         // unknown error: answer 503 and page once per class, not once per occurrence.
         if (isQuotaExhaustedError(error)) {
-          sendQuotaExhaustedAlert(error, shareId);
+          sendQuotaExhaustedAlert(error, req.params?.shareId);
           res.status(503).json(sendRefusalBody({
             error: 'AI service at capacity',
             message: error.message,
