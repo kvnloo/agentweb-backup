@@ -37,6 +37,25 @@ async function isOursAndBlocked(lead: any, owners: Set<string>, listOwners: Map<
 
 const MAX_PIECE = 600;
 
+const MAX_READINGS = 6;
+
+/**
+ * An apostrophe is legal in a local part (o'brien@x.com), so it is kept; but one can also be quoting around an address (`'a@x.com'`, `name='a@x.com'`,
+ * `{'a@x.com'}`), in which case everything up to it is not part of the address. Which is meant cannot be known, so the address is looked up as written and
+ * as each apostrophe-delimited tail of its local part. A missed block (a blocked contact emailed) is worse than a lookup too many; the cost of a wrong
+ * extra reading is refusing a send to a contact who is blocked under that other name, which is why it is capped and rare.
+ */
+function readings(cleaned: string): string[] {
+  if (!cleaned.includes("@")) return [];
+  const out = [cleaned];
+  const at = cleaned.indexOf("@");
+  for (let i = cleaned.indexOf("'"); i >= 0 && i < at && out.length < MAX_READINGS; i = cleaned.indexOf("'", i + 1)) {
+    const tail = cleaned.slice(i + 1);
+    if (tail.indexOf("@") > 0) out.push(tail); // something is left before the @
+  }
+  return out;
+}
+
 /** A matched address without the punctuation around it. A `?query` is cut only after the `@` (a local part may contain `?`); trimming is a loop, not a regex. */
 function cleanAddress(raw: string): string {
   let s = raw.trim().toLowerCase();
@@ -46,7 +65,7 @@ function cleanAddress(raw: string): string {
   let start = 0;
   let end = s.length;
   while (start < end && "([".includes(s[start])) start++;
-  while (end > start && ")].".includes(s[end - 1])) end--;
+  while (end > start && ")].'\"".includes(s[end - 1])) end--; // a domain never ends in a quote or a dot
   return s.slice(start, end);
 }
 
@@ -64,12 +83,7 @@ function parseAddresses(value: unknown): { addresses: string[]; oversize: boolea
       const found = bracketed.length > 0 ? bracketed : [...piece.matchAll(/(?:mailto:)?([^\s<>";,:]+@[^\s<>"';,]+)/gi)];
       // Punctuation and a mailto query around an address are not part of it: `(a@x.com)`, `a@x.com.`, `a@x.com?subject=hi`. A lookup with them left on would miss.
       for (const m of found) {
-        const cleaned = cleanAddress(m[1]);
-        if (cleaned.includes("@")) out.add(cleaned);
-        // An apostrophe is legal in a local part (o'brien@x.com), so it is kept; but a quoted address ('a@x.com') then carries a leading quote that is
-        // not part of it. Both readings are looked up: a missed block is worse than one extra lookup.
-        const unquoted = cleaned.replace(/^'+/, "");
-        if (unquoted !== cleaned && unquoted.includes("@")) out.add(unquoted);
+        for (const address of readings(cleanAddress(m[1]))) out.add(address);
       }
     }
   }

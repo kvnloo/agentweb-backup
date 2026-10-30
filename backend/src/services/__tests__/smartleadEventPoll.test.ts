@@ -1,4 +1,4 @@
-import { eventPoll, __resetEventPoll, type PollDeps } from "../smartleadEventPoll";
+import { eventPoll, __pendingBounceCount, __resetEventPoll, type PollDeps } from "../smartleadEventPoll";
 import type { SmartleadEvent } from "../smartleadEvents";
 import { SmartleadApiError } from "../smartleadService";
 
@@ -325,6 +325,31 @@ describe("the hourly event poll (ENG-673)", () => {
       expect(w.handled).toHaveLength(0); // a new first sighting, not an acted-on second
       clock += hour; await eventPoll(d);
       expect(w.handled.map(h => h.event.eventKey)).toEqual(["poll:bounce:77:b0"]); // the real second sighting
+    });
+
+    it("a contact seen every hour while its handling keeps failing is not made to start over: the 'last seen' time keeps moving", async () => {
+      const w = world({ campaignSize: 1000, leads: { is_bounced: { 77: rows(1, "b") } } });
+      let fail = true;
+      let attempts = 0;
+      const d = deps(w, { ...on, events: { handle: async (ctx, event) => { attempts++; if (fail) throw new Error("db down"); w.handled.push({ ctx, event }); return { matched: 1, changed: 1, duplicates: 0 }; } } });
+      await eventPoll(d); // first sighting
+      for (let i = 0; i < 13; i++) { clock += hour; await eventPoll(d); } // 13 hours of failures, seen every hour
+      expect(attempts).toBe(13); // tried on every one of those passes: the wait was never restarted as stale (it restarts silently, with no attempt, if 'last seen' does not move)
+      fail = false;
+      clock += hour; await eventPoll(d);
+      expect(w.handled).toHaveLength(1);
+    });
+
+    it("records of contacts not seen for a day are dropped (the map cannot fill with contacts that left the list); a recent one is kept", async () => {
+      const w = world({ campaignSize: 1000, leads: { is_bounced: { 77: rows(1, "b") } } });
+      const d = deps(w, on);
+      await eventPoll(d);
+      expect(__pendingBounceCount()).toBe(1);
+      w.leads.is_bounced = { 77: [] };
+      clock += 13 * hour; await eventPoll(d);
+      expect(__pendingBounceCount()).toBe(1); // 13 h unseen: stale for the wait, but not yet dropped
+      clock += 12 * hour; await eventPoll(d);
+      expect(__pendingBounceCount()).toBe(0); // 25 h unseen: gone
     });
 
     it("a campaign polled only every few passes still completes its wait (the wait is not restarted by a 3 h gap)", async () => {

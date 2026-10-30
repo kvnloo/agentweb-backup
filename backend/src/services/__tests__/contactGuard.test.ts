@@ -33,10 +33,17 @@ describe("addresses in a to/cc/bcc value", () => {
     expect(addressesOf("what?@x.com")).toEqual(["what?@x.com"]);
     expect(addressesOf("a@x.com?subject=hi&body=b")).toEqual(["a@x.com"]);
     // an apostrophe is legal in a local part: o'brien@x.com is looked up as written, not as brien@x.com
-    expect(addressesOf("o'brien@x.com")).toEqual(["o'brien@x.com"]);
-    expect(addressesOf("Pat O'Brien <o'brien@x.com>")).toEqual(["o'brien@x.com"]);
+    expect(addressesOf("o'brien@x.com")).toEqual(["o'brien@x.com", "brien@x.com"]); // as written, and as a quoted address
+    expect(addressesOf("Pat O'Brien <o'brien@x.com>")).toEqual(["o'brien@x.com", "brien@x.com"]);
     expect(addressesOf("'a@x.com'")).toEqual(expect.arrayContaining(["a@x.com"]));
-    expect(addressesOf("x@y.com, o'neil@z.com")).toEqual(["x@y.com", "o'neil@z.com"]);
+    // quoting that is not at the very start: the address is still found (the old parser found all of these)
+    for (const wrapped of ["name='a@x.com'", "{'a@x.com'}", "*'a@x.com'", "<'a@x.com'>", "to=\"'a@x.com'\"", "x:'a@x.com'", "[''a@x.com'']", "list=['a@x.com', 'b@y.com']"]) {
+      expect(addressesOf(wrapped)).toEqual(expect.arrayContaining(["a@x.com"]));
+    }
+    expect(addressesOf("list=['a@x.com', 'b@y.com']")).toEqual(expect.arrayContaining(["a@x.com", "b@y.com"]));
+    expect(addressesOf("o'brien@x.com")).toEqual(expect.arrayContaining(["o'brien@x.com"])); // and a real apostrophe is still looked up as written
+    expect(addressesOf("'".repeat(10) + "a@x.com").length).toBeLessThanOrEqual(6); // a hostile run of quotes cannot mean hundreds of lookups
+    expect(addressesOf("x@y.com, o'neil@z.com")).toEqual(["x@y.com", "o'neil@z.com", "neil@z.com"]);
     // `{` and `}` are legal in a local part and are not stripped
     expect(addressesOf("{a}@x.com")).toEqual(["{a}@x.com"]);
     expect(addressesOf(undefined)).toEqual([]);
