@@ -61,11 +61,15 @@ function parseAddresses(value: unknown): { addresses: string[]; oversize: boolea
       // No address is longer than 254 characters: a longer piece is not matched (the regexes below are quadratic on long input with no address).
       if (piece.length > MAX_PIECE) { oversize = true; continue; }
       const bracketed = [...piece.matchAll(/<(?:mailto:)?([^<>\s]+@[^<>\s]+)>/gi)];
-      const found = bracketed.length > 0 ? bracketed : [...piece.matchAll(/(?:mailto:)?([^\s<>"';,:]+@[^\s<>"';,]+)/gi)];
+      const found = bracketed.length > 0 ? bracketed : [...piece.matchAll(/(?:mailto:)?([^\s<>";,:]+@[^\s<>"';,]+)/gi)];
       // Punctuation and a mailto query around an address are not part of it: `(a@x.com)`, `a@x.com.`, `a@x.com?subject=hi`. A lookup with them left on would miss.
       for (const m of found) {
         const cleaned = cleanAddress(m[1]);
         if (cleaned.includes("@")) out.add(cleaned);
+        // An apostrophe is legal in a local part (o'brien@x.com), so it is kept; but a quoted address ('a@x.com') then carries a leading quote that is
+        // not part of it. Both readings are looked up: a missed block is worse than one extra lookup.
+        const unquoted = cleaned.replace(/^'+/, "");
+        if (unquoted !== cleaned && unquoted.includes("@")) out.add(unquoted);
       }
     }
   }

@@ -32,6 +32,11 @@ describe("addresses in a to/cc/bcc value", () => {
     // a `?` inside the local part is part of the address; only a query AFTER the domain is cut
     expect(addressesOf("what?@x.com")).toEqual(["what?@x.com"]);
     expect(addressesOf("a@x.com?subject=hi&body=b")).toEqual(["a@x.com"]);
+    // an apostrophe is legal in a local part: o'brien@x.com is looked up as written, not as brien@x.com
+    expect(addressesOf("o'brien@x.com")).toEqual(["o'brien@x.com"]);
+    expect(addressesOf("Pat O'Brien <o'brien@x.com>")).toEqual(["o'brien@x.com"]);
+    expect(addressesOf("'a@x.com'")).toEqual(expect.arrayContaining(["a@x.com"]));
+    expect(addressesOf("x@y.com, o'neil@z.com")).toEqual(["x@y.com", "o'neil@z.com"]);
     // `{` and `}` are legal in a local part and are not stripped
     expect(addressesOf("{a}@x.com")).toEqual(["{a}@x.com"]);
     expect(addressesOf(undefined)).toEqual([]);

@@ -370,10 +370,13 @@ describe("the hourly event poll (ENG-673)", () => {
     expect(w.logs.join("\n")).toContain("treated as an ignored filter");
   });
 
-  it("a few bounces in a campaign of 4 (under the guard's minimum) are still acted on", async () => {
-    const w = world({ campaignSize: 4, leads: { is_bounced: { 77: rows(2, "b") } } });
-    await eventPoll(deps(w));
-    expect(w.handled.filter(h => h.event.kind === "bounce")).toHaveLength(2);
+  it("the guard's minimum is exactly 5: all 4 of 4 are acted on, all 5 of 5 are refused", async () => {
+    const four = world({ campaignSize: 4, leads: { is_bounced: { 77: rows(4, "b") } } });
+    await eventPoll(deps(four));
+    expect(four.handled.filter(h => h.event.kind === "bounce")).toHaveLength(4);
+    const five = world({ campaignSize: 5, leads: { is_bounced: { 77: rows(5, "b") } } });
+    await eventPoll(deps(five));
+    expect(five.handled).toHaveLength(0);
   });
 
   it("without the campaign's size, bounces and replies are NOT polled (nothing guards a filter that was ignored), opt-outs still are, and it is said once a day", async () => {
