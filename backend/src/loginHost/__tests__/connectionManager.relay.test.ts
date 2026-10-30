@@ -317,6 +317,21 @@ describe("relay: tool-call operations and turn.toolResult", () => {
     await it.return?.();
   });
 
+  it("MUTATION TARGET: a turn's answered bytes are budgeted (64 MiB): the answer that would pass it is refused before its operation is consumed, and small answers still work", async () => {
+    const ops = Array.from({ length: 22 }, (_, i) => call("op" + (i + 1), "m" + (i + 1)));
+    const it = await start({}, [...ops, { wait: new Promise<void>(() => undefined) }, { type: "result", ok: true, text: "x" }]);
+    for (let i = 0; i < 22; i++) {
+      const r = await Promise.race([it.next(), new Promise<string>((res) => setTimeout(() => res("STUCK"), 300))]);
+      if (r === "STUCK") break; // (all the events there are have been consumed)
+    }
+    const big = "a".repeat(4_000_000); // a frame of about 4 MB
+    for (let i = 1; i <= 16; i++) expect(await code(answer(rig, "op" + i, { content: big }))).toBe("OK");
+        const c17 = await code(answer(rig, "op17", { content: big }));
+        expect(c17).toBe("EINVALID:result_budget"); // 17 x 4 MB > 64 MiB
+    const small = await code(answer(rig, "op17", { content: "small" }));
+        expect(small).toBe("OK"); // the operation was not consumed, and a small answer fits
+  });
+
   it("tool-call events after an abort are not registered", async () => {
     rig = makeRig({ adapter: { relay: true } });
     await signIn(rig, "c1", 1);

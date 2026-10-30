@@ -58,6 +58,10 @@ export class CpuMeter {
     this.tokens = burstMs;
     this.last = this.now();
   }
+  /** Milliseconds left (for tests and diagnostics). */
+  get remaining(): number {
+    return this.tokens;
+  }
   /** True once the budget has run out (stays true: a turn that spent it is over). */
   get exhausted(): boolean {
     return this.spent;

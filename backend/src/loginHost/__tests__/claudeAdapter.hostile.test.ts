@@ -156,6 +156,7 @@ describe("one line cannot fan out into a flood of events", () => {
     await session.close();
     expect(events.filter((e) => e.type === "text")).toHaveLength(32);
     expect(events[events.length - 1]).toMatchObject({ type: "result", ok: true });
+    expect(rig.logs.filter((l) => l.event === "event_blocks_dropped")).toHaveLength(1); // said once, with a fixed code
   });
 
   it("MUTATION TARGET: a flood of 32-block lines (3,200 events in a burst, over the 2,000 normalized-events bucket) ends the turn: event_flood is logged once and the events stop", async () => {

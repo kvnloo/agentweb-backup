@@ -44,7 +44,7 @@ import { approxJsonBytes, LogThrottle, MAX_CLI_LINE_DEPTH, MAX_FORWARDED_BYTES, 
 import { canonicalJson } from "../relay/canonical";
 import { createHash } from "crypto";
 import type { RelayCall, RelayEndpoint, RelayHost } from "../relay/relayServer";
-import { MAX_CLASSIFY_CHARS, classifyFailureText, failureClassToKind, normalizeClaudeEvent, parseAuthStatus, parseDoctorHazards, usageFromResult } from "./claudeParse";
+import { MAX_BLOCKS_NORMALIZED, MAX_CLASSIFY_CHARS, classifyFailureText, failureClassToKind, normalizeClaudeEvent, parseAuthStatus, parseDoctorHazards, usageFromResult } from "./claudeParse";
 
 export interface ClaudeAdapterConfig {
   /** Pinned binary: absolute path, `--version` output and content digest, verified by the host at startup (never recomputed per call). */
@@ -162,8 +162,40 @@ export class RunnerChildAdapter extends EventEmitter implements RunnerChild {
       this.emit("error", err);
     });
   }
+  private pipesClosed = false;
+  /**
+   * Stops reading the child's pipes FOR GOOD. In production the kill is `systemctl stop` (SIGTERM, up to 10 s of grace, then SIGKILL): a writer that survives it keeps
+   * filling the pipe, and every read would still cost ~70-90 us OUTSIDE any metered section (measured: utilisation 0.96-0.99 for stdout/stderr x one-byte/64 KiB writes).
+   * Idempotent. The line reader downstream tolerates it: it is fed by this adapter's own LineLimit/guard streams, not by the raw pipes, and the turn is resolved by
+   * the exit event.
+   */
+  private closePipes(): void {
+    if (this.pipesClosed) return;
+    this.pipesClosed = true;
+    for (const [raw, sink] of [[this.child.stdout, this.stdout], [this.child.stderr, this.stderr]] as const) {
+      try {
+        raw.unpipe(sink as Transform);
+      } catch {
+        /* already unpiped */
+      }
+      try {
+        raw.destroy();
+      } catch {
+        /* already destroyed */
+      }
+    }
+    // Our own streams END (nothing more will come): a destroyed raw pipe would otherwise never deliver the end that closes the line reader downstream.
+    for (const sink of [this.stdout, this.stderr as Transform]) {
+      try {
+        sink.end();
+      } catch {
+        /* already ended */
+      }
+    }
+  }
   /** A kill that throws (or fails) is not "gone": `exited` waits for `onExit` regardless. */
   kill(): boolean {
+    this.closePipes();
     try {
       this.child.kill();
       return true;
@@ -176,8 +208,9 @@ export class RunnerChildAdapter extends EventEmitter implements RunnerChild {
 const NEWLINE = Buffer.from("\n");
 
 /** The child's stderr, metered and bounded before the runner (which concatenates a tail per chunk) sees it. */
-class StderrGuard extends Transform {
-  private forwarded = 0;
+export class StderrGuard extends Transform {
+  private readonly tail: Buffer = Buffer.alloc(STDERR_FORWARD_CAP);
+  private tailLen = 0;
   private tripped = false;
   private readonly reads = new TokenBucket(READ_BURST, READS_PER_SEC);
   private readonly bytes = new TokenBucket(1024 * 1024, 64 * 1024);
@@ -189,18 +222,37 @@ class StderrGuard extends Transform {
   }
   override _transform(chunk: Buffer, _enc: BufferEncoding, cb: (err?: Error | null, data?: Buffer) => void): void {
     if (this.tripped || this.meter.exhausted) return cb();
+    this.meter.charge(READ_COST_MS);
     this.meter.time(() => {
       if (!this.reads.take() || !this.bytes.take(chunk.length)) {
         this.tripped = true;
         this.onFlood();
         return cb();
       }
-      const room = STDERR_FORWARD_CAP - this.forwarded;
-      if (room <= 0) return cb();
-      const part = chunk.length <= room ? chunk : chunk.subarray(0, room);
-      this.forwarded += part.length;
-      cb(null, part);
+      // keep the LAST few KiB (what a diagnostic wants), delivered when the stream ends
+      this.keepTail(chunk);
+      cb();
     });
+  }
+  /** A fixed ring of the last STDERR_FORWARD_CAP bytes: no allocation per read (a trickle is thousands of reads). */
+  private keepTail(chunk: Buffer): void {
+    if (chunk.length >= STDERR_FORWARD_CAP) {
+      chunk.copy(this.tail, 0, chunk.length - STDERR_FORWARD_CAP);
+      this.tailLen = STDERR_FORWARD_CAP;
+      return;
+    }
+    const overflow = this.tailLen + chunk.length - STDERR_FORWARD_CAP;
+    if (overflow > 0) {
+      this.tail.copy(this.tail, 0, overflow, this.tailLen);
+      this.tailLen -= overflow;
+    }
+    chunk.copy(this.tail, this.tailLen);
+    this.tailLen += chunk.length;
+  }
+  override _flush(cb: (err?: Error | null) => void): void {
+    if (this.tailLen > 0) this.push(Buffer.from(this.tail.subarray(0, this.tailLen)));
+    this.tailLen = 0;
+    cb();
   }
 }
 const DROPPED_LINE = Buffer.from("{\"type\":\"aw_line_dropped\"}\n");
@@ -328,6 +380,7 @@ export class LineLimit extends Transform {
    */
   override _transform(chunk: Buffer, _enc: BufferEncoding, cb: (err?: Error | null, data?: Buffer) => void): void {
     if (this.tripped || this.meter.exhausted) return cb();
+    this.meter.charge(READ_COST_MS);
     if (!this.reads.take()) return this.stop(cb, this.onFlood);
     this.meter.time(() => this.scan(chunk, cb));
   }
@@ -340,6 +393,8 @@ export class LineLimit extends Transform {
     let lineBeg = 0; // where the current line begins in this chunk (0: it began earlier, or begins here)
     let nextLF = -2; // cached positions of the next \n and \r at or after i (-1: none left)
     let nextCR = -2;
+    let nextQuote = -2; // (the same cache for the bytes that can end a string body)
+    let nextBackslash = -2;
     let jl = 0; // non-event lines seen in this chunk
     let jb = 0; // bytes of non-event lines
     let el = 0; // event-shaped lines seen in this chunk
@@ -362,6 +417,22 @@ export class LineLimit extends Transform {
         this.endLine();
         start = lineBeg = i = nl + 1; // the terminator itself is dropped (a placeholder line, if any, was sent complete)
         continue;
+      }
+      // The body of a string (an image, a tool result: megabytes of base64 or text) cannot change anything until a quote, a backslash or a line end: jump straight there
+      // (memchr speed, about 7x cheaper than a byte at a time) with the exact same state. The line cap is checked on the jump.
+      if (this.inString && !this.esc && this.lineStarted && this.skipping === 0) {
+        if (nextQuote !== -1 && nextQuote < i) nextQuote = chunk.indexOf(0x22, i);
+        if (nextBackslash !== -1 && nextBackslash < i) nextBackslash = chunk.indexOf(0x5c, i);
+        if (nextLF !== -1 && nextLF < i) nextLF = chunk.indexOf(10, i);
+        if (nextCR !== -1 && nextCR < i) nextCR = chunk.indexOf(13, i);
+        let target = n;
+        for (const p of [nextQuote, nextBackslash, nextLF, nextCR]) if (p >= 0 && p < target) target = p;
+        if (target > i) {
+          this.run += target - i;
+          if (this.run > this.max) return this.stop(cb, this.onOverflow);
+          i = target;
+          continue;
+        }
       }
       const c = chunk[i];
       if (c === 10 && this.afterCR) {
@@ -862,7 +933,7 @@ class ClaudeSession implements ProviderSession {
   private meter = new CpuMeter();
   private eventBucket = new TokenBucket(EVENT_BURST, EVENTS_PER_SEC);
   private readonly budgetLog = new LogThrottle(3, 60_000);
-  private noteBudget(code: "cpu_budget" | "event_flood"): void {
+  private noteBudget(code: "cpu_budget" | "event_flood" | "event_blocks_dropped"): void {
     try {
       if (this.budgetLog.check(code).log) this.cfg.log?.warn(code);
     } catch {
@@ -1037,6 +1108,8 @@ class ClaudeSession implements ProviderSession {
           onEvent: (raw) =>
             this.meter.time(() => {
               this.guarded(this.waiting?.call.operationId, () => this.noteStreamUse(raw));
+              const blocks = (raw as { message?: { content?: unknown } }).message?.content;
+              if (Array.isArray(blocks) && blocks.length > MAX_BLOCKS_NORMALIZED) this.noteBudget("event_blocks_dropped"); // blocks past the cap are not forwarded: said once, fixed code
               const evs = normalizeClaudeEvent(raw);
               // one line must not fan out into hundreds of thousands of events: normalized events per second are limited per turn
               if (!this.eventBucket.take(evs.length)) {
@@ -1174,8 +1247,15 @@ const MAX_STREAM_USES = 64;
 const EVENT_BURST = 2000;
 const EVENTS_PER_SEC = 200;
 const READ_BURST = 2000;
-const READS_PER_SEC = 1000;
-/** stderr is diagnostics only: at most this many bytes are ever forwarded to the runner. */
+/** Sustained reads per second per stream. The real CLI emits a handful of lines a second (and the wrapper and the relay shim ping every 5 s), so 200 is far above honest use. */
+const READS_PER_SEC = 200;
+/**
+ * Loop time of one read (socket -> pipe -> Transform -> readline) that happens OUTSIDE the timed section, in ms: measured at 0.07-0.09 ms through the real adapter with
+ * one-byte writes (a 950 B/s trickle cost 7-9% of the loop per stream while the section timing charged 0.4-1.3%). Charged to the meter on every chunk, in addition to the
+ * timed work, so a trickle is paid for what it costs.
+ */
+export const READ_COST_MS = 0.08;
+/** stderr is diagnostics only: at most this many bytes (the LAST ones) are ever forwarded to the runner, when the stream ends. */
 const STDERR_FORWARD_CAP = 8192;
 /** At most this many content blocks of one assistant event are looked at, and a call whose frame is larger than this is never hashed. */
 const MAX_BLOCKS_PER_EVENT = 32;
