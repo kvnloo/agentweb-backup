@@ -653,6 +653,7 @@ describe("claude-turn.sh wrapper", () => {
       new Promise<number | null>((resolve) => {
         const c = spawn(WRAPPER, ["/bin/echo", "STARTED"], { env: { PATH: "/usr/bin:/bin", ...env }, stdio: ["pipe", "ignore", "ignore"] });
         c.on("exit", (code) => resolve(code));
+        c.stdin.on("error", () => {}); // the wrapper may exit before the input is written (EPIPE): the exit code is what is checked
         c.stdin.end(input);
       });
     expect(await run({}, "{}\n")).not.toBe(0);
