@@ -164,7 +164,7 @@ const call = (over: Partial<RelayCall> = {}): RelayCall => ({ identity: { connec
 
 describe("a hostile unit and a hostile CLI together cannot stall the loop by making the host re-hash a call (loop-lag regression)", () => {
   type Priv = { noteStreamUse(raw: Record<string, unknown>): void; flushWaiting(force: boolean): void };
-  async function withWaitingCall(args: Record<string, unknown>, bytes: number) {
+  async function withWaitingCall(args: Record<string, unknown>, bytes: number, preSpent = 0) {
     const s = stubbed(2000);
     const session = await s.rig.adapter.openSession(s.rig.ctx, { connectionId: "conn1", epoch: 3 });
     const turn = (async () => {
@@ -173,6 +173,7 @@ describe("a hostile unit and a hostile CLI together cannot stall the loop by mak
     await until(() => !!s.opts());
     const flush = jest.spyOn(session as unknown as Priv, "flushWaiting");
     const canonical = jest.spyOn(canonicalModule, "canonicalJson");
+    (session as unknown as { hashedBytes: number }).hashedBytes = preSpent;
     s.opts().onCall(call({ args, bytes }));
     return { session: session as unknown as Priv & { close(): Promise<void> }, turn, flush, canonical, rejected: s.rejected, stop: async () => (canonical.mockRestore(), flush.mockRestore(), await (session as { close(): Promise<void> }).close(), await turn.catch(() => undefined)) };
   }
@@ -207,6 +208,25 @@ describe("a hostile unit and a hostile CLI together cannot stall the loop by mak
     await new Promise((r) => setTimeout(r, 50));
     expect(w.flush.mock.calls.length).toBe(2); // the arrival and the new announcement
     await w.stop();
+  });
+
+  it("MUTATION TARGET: the budget covers the CALL too: once the turn has spent it, even a small call is not hashed (matched by name only)", async () => {
+    const w = await withWaitingCall({ q: "small" }, 40, 8 * 1024 * 1024);
+    expect(w.canonical).not.toHaveBeenCalled();
+    await w.stop();
+  });
+
+  it("MUTATION TARGET: a new turn starts with a fresh hashing budget", async () => {
+    const s = stubbed(2000);
+    const session = await s.rig.adapter.openSession(s.rig.ctx, { connectionId: "conn1", epoch: 3 });
+    (session as unknown as { hashedBytes: number }).hashedBytes = 8 * 1024 * 1024;
+    const turn = (async () => {
+      for await (const ev of session.turn({ turnId: "t9", prompt: "go", model: "sonnet", relay: { tools: TOOLS, callTimeoutMs: () => 10_000 } })) void ev;
+    })();
+    await until(() => !!s.opts());
+    expect((session as unknown as { hashedBytes: number }).hashedBytes).toBe(0);
+    await session.close();
+    await turn.catch(() => undefined);
   });
 
   it("MUTATION TARGET: a hard per-turn budget on bytes hashed: 60 announcements of ~500 KB cost at most 8 MiB of hashing, then nothing is hashed or recorded", async () => {

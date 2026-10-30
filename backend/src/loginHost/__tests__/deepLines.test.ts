@@ -118,10 +118,10 @@ describe("CLI stdout: lines nested deeper than the cap are dropped before anythi
     it("DIFFERENTIAL: random and adversarial byte streams through LineLimit into the REAL readline: no delivered line is deeper than the cap, and no ordinary line is changed or lost", async () => {
       let seed = 12345;
       const rnd = (n: number) => ((seed = (Math.imul(seed, 1103515245) + 12345) >>> 0) % n);
-      const atoms = ["[", "[", "]", "{", "}", '"', "\\", "\r", "\n", "\r\n", "a", " ", "[".repeat(30), "]".repeat(30), '{"k":1}', "\u2028"];
+      const atoms = ["[", "[", "]", "{", "}", '"', "\\", "\r", "\n", "\r\n", "a", " ", "[".repeat(30), "]".repeat(30), "[".repeat(40), "[".repeat(40), "\r", "\r", '"', '{"k":1}', "\u2028"];
       for (let round = 0; round < 150; round++) {
         let text = "";
-        const n = 5 + rnd(200);
+        const n = 5 + rnd(60);
         for (let i = 0; i < n; i++) text += atoms[rnd(atoms.length)];
         const bytes = Buffer.from(text);
         const chunks: Buffer[] = [];
@@ -150,8 +150,9 @@ describe("CLI stdout: lines nested deeper than the cap are dropped before anythi
           const hit = delivered.indexOf(e, at);
           if (hit >= 0) at = hit + 1;
         }
-        // fully shallow input: the delivered lines ARE the input lines
-        if (!rawJsonDepthExceeds(Buffer.from(text.replace(/[\r\n]/g, "")), MAX_CLI_LINE_DEPTH) ) expect({ round, got: got.filter((l) => l.length > 0) }).toEqual({ round, got: expected });
+        // every segment shallow (what readline hands JSON.parse): nothing may be cut, altered or lost
+        const segs = text.split(/\r?\n|\r/);
+        if (segs.every((g) => !rawJsonDepthExceeds(Buffer.from(g), MAX_CLI_LINE_DEPTH))) expect({ round, got: got.filter((l) => l.length > 0) }).toEqual({ round, got: expected });
       }
     });
 
