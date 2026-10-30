@@ -1067,6 +1067,8 @@ interface LLMCallOptions {
    * `provider` next to the shared order/fallback preferences. Normal chat never sets it.
    */
   providerPolicy?: CompareProviderPolicy | null;
+  /** Provider names OpenRouter must not route this request to; merged with any default ignore list. */
+  providerIgnore?: string[];
 }
 
 function nonNegativeTokenCount(value: unknown): number {
@@ -2528,6 +2530,7 @@ export class AgentModeService {
       customerRoutable = false,
       taskClass,
       providerPolicy,
+      providerIgnore,
     } = options || {};
 
     // ENG-2108: the funding for THIS call. A run starts AgentWeb-funded; this call moves
@@ -2586,6 +2589,9 @@ export class AgentModeService {
       // proposed the slug form once already and was reverted for this reason
       // — verify empirically against live traffic before changing this line.
       params.provider.ignore = ignoredProviders;
+    }
+    if (providerIgnore?.length) {
+      params.provider.ignore = [...new Set([...(params.provider.ignore ?? []), ...providerIgnore])];
     }
     if (providerPolicy) {
       params.provider = applyProviderPolicy(params.provider, providerPolicy);
@@ -2804,6 +2810,9 @@ export class AgentModeService {
       (res as any)?.model,
       paramChain.map(m => ({ modelId: m.modelId, upstreamModel: m.upstreamModel })),
     ) ?? model;
+    if (meteredModel !== model) {
+      console.warn(`AgentMode: OpenRouter fallback served "${meteredModel}" instead of "${model}"`);
+    }
     // ENG-1816 F1: routed through recordLlmUsage, which decides funding ABOVE this
     // fire-and-forget funnel — see funding/recordLlmUsage.ts for why. Branch on
     // RunFunding.route, never on usage.is_byok below: that flag also fires for

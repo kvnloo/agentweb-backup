@@ -75,7 +75,11 @@ const SETTING_KEYS: Partial<Record<ModelRole, readonly string[]>> = {
 };
 
 export async function getRoleDefault(role: ModelRole): Promise<string> {
-  let candidate = role === 'embedding' ? getRoleModelOptions(role)[0] : FALLBACKS[role];
+  // CRM_ENRICH_V3_DEFAULT_MODEL is the enrichment rollback: set it on the environment to move every
+  // org without its own override back to e.g. gpt-5.5 without a code deploy. Unusable values fall
+  // through to FALLBACKS below.
+  const enrichmentOverride = role === 'enrichment' ? process.env.CRM_ENRICH_V3_DEFAULT_MODEL?.trim() : undefined;
+  let candidate = role === 'embedding' ? getRoleModelOptions(role)[0] : enrichmentOverride || FALLBACKS[role];
   const keys = SETTING_KEYS[role];
   if (keys) {
     try {

@@ -57,6 +57,19 @@ it('lets an org save the enrichment default even though the picker hides it as s
   expect(enrichment.allowedModels).toContain(luna);
   expect(enrichment.effectiveModel).toBe(luna);
 });
+it('CRM_ENRICH_V3_DEFAULT_MODEL rolls the enrichment default back without a deploy, and a bad value is ignored (ENG-2720)', async () => {
+  const luna = 'openrouter/openai/gpt-5.6-luna';
+  try {
+    delete process.env.CRM_ENRICH_V3_DEFAULT_MODEL;
+    expect(await getRoleDefault('enrichment')).toBe(luna);
+    process.env.CRM_ENRICH_V3_DEFAULT_MODEL = 'gpt-5.5';
+    expect(await getRoleDefault('enrichment')).toBe('gpt-5.5');
+    process.env.CRM_ENRICH_V3_DEFAULT_MODEL = 'not-a-model';
+    expect(await getRoleDefault('enrichment')).toBe(luna);
+    process.env.CRM_ENRICH_V3_DEFAULT_MODEL = 'gpt-5.5';
+    expect(await getRoleDefault('chat')).toBe('gemini-3.8-flash');
+  } finally { delete process.env.CRM_ENRICH_V3_DEFAULT_MODEL; }
+});
 it.each(['get', 'put'])('rejects non-admin %s before touching settings', async method => {
   (userDb.getUserById as jest.Mock).mockResolvedValue({ orgId: 'a', orgRole: 'member' });
   expect((await (request(app) as any)[method]('/').send({ modelRoles: {}, revision: 'rev' })).status).toBe(403);

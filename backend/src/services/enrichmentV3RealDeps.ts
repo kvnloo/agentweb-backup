@@ -1,4 +1,4 @@
-import { resolveModelForUser, getRoleDefault } from './modelRoles';
+import { resolveModelForUser } from './modelRoles';
 // Real-service adapters that satisfy the v3.1 orchestrator deps
 // (OrchestratorDeps + IdentityResolverDeps).
 //
@@ -56,21 +56,21 @@ async function webSearchModel(userId: string | undefined): Promise<string> {
   return process.env.CRM_ENRICH_V3_WEB_SEARCH_MODEL || process.env.CRM_ENRICH_V3_EXTRACT_MODEL ||
     resolveModelForUser(userId, 'enrichment');
 }
-// ENG-2720: the critic judges web-tier values, so it must not grade its own work. With the cheap
-// default extraction model it runs on gpt-5.5 (one short call per lead, ~3% of a gpt-5.5 run); an
-// org that picked its own enrichment model keeps one model end to end, as ENG-2184 intends.
-const CRITIC_DEFAULT_MODEL = 'gpt-5.5';
 async function criticModel(userId: string | undefined): Promise<string> {
-  if (process.env.CRM_ENRICH_V3_CRITIC_MODEL) return process.env.CRM_ENRICH_V3_CRITIC_MODEL;
-  const role = await resolveModelForUser(userId, 'enrichment');
-  return role === await getRoleDefault('enrichment') ? CRITIC_DEFAULT_MODEL : role;
+  return process.env.CRM_ENRICH_V3_CRITIC_MODEL || resolveModelForUser(userId, 'enrichment');
 }
-
-// ENG-2720: if the primary enrichment model fails (provider error, rate limit), OpenRouter retries
-// the call on gpt-5.5 instead of the web tier silently returning "missing".
+// ENG-2720: the default enrichment model is gpt-5.6-luna. If it fails at the provider level (HTTP error,
+// rate limit), OpenRouter retries the call on gpt-5.5; this does not cover a 200 response with an empty
+// body. The fallback is limited to Luna so an org on another model keeps its own temperature support
+// and lab. Azure is skipped on web-search calls: it returned finish_reason=error with an empty body on
+// about a quarter of them (40 parallel calls), and the fallback does not catch that.
+const CHEAP_DEFAULT_MODEL = 'openrouter/openai/gpt-5.6-luna';
 const FALLBACK_MODEL = 'gpt-5.5';
 function makeEnrichLLM(model: string, temperature: number | null) {
-  return createLLMService(model, temperature, undefined, model === FALLBACK_MODEL ? {} : { fallbackModels: [FALLBACK_MODEL] });
+  return createLLMService(model, temperature, undefined, {
+    providerIgnoreForWebSearch: ['Azure'],
+    ...(model === CHEAP_DEFAULT_MODEL ? { fallbackModels: [FALLBACK_MODEL] } : {}),
+  });
 }
 // GPT-5 chat models reject ANY non-default temperature with a 400
 // `unsupported_value` — "Only the default (1) value is supported" — and the

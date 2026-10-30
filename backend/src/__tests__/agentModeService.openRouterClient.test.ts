@@ -716,6 +716,17 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     });
   });
 
+  it('merges a per-call providerIgnore with the default ignore list (ENG-2720)', async () => {
+    const service = new AgentModeService();
+    const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({ chat: { completions: { create } } } as any);
+    await service.callLLM('gemini-3.7-flash', [{ role: 'user', content: 'Hello' }], { taskClass: 'interactive_chat', providerIgnore: ['Azure'] } as any);
+    expect(create.mock.calls[0][0].provider.ignore).toEqual(['Google', 'Azure']);
+    create.mockClear();
+    await service.callLLM('gpt-5.4', [{ role: 'user', content: 'Hello' }], { taskClass: 'interactive_chat' } as any);
+    expect(create.mock.calls[0][0].provider).not.toHaveProperty('ignore');
+  });
+
   describe('ENG-55 Compare data-collection policy', () => {
     async function providerFor(options: any, model = 'gemini-3.7-flash') {
       const service = new AgentModeService();
