@@ -97,6 +97,9 @@ interface HostSession {
   lastUsedMono: number;
 }
 
+/** Bytes of tool results the host will answer to one turn (honest turns answer a few MB). */
+export const RESULT_BYTES_PER_TURN = 64 * 1024 * 1024;
+
 interface RunningTurn {
   connectionId: string;
   epoch: number;
@@ -111,6 +114,8 @@ interface RunningTurn {
   operations: Map<string, number>;
   /** The operations that are `tool-call` events of the relay (their clock is the turn's deadline, not the host default). */
   relayOps: Set<string>;
+  /** Bytes of tool results answered to this turn so far (see RESULT_BYTES_PER_TURN). */
+  answeredBytes: number;
   /** The tools this relay turn can call right now: its open set at the start plus what accepted answers added (bounded by TOOL_LIMITS, cumulatively). Absent on a legacy turn. */
   visible?: VisibleTools;
   /** Ends the turn. Safe at any moment, including before the session has finished opening. */
@@ -505,6 +510,7 @@ export class ConnectionManager {
       priority,
       operations: new Map(),
       relayOps: new Set(),
+      answeredBytes: 0,
       ...(req.tools ? { visible: visibleFromManifest(req.tools) } : {}),
       abort: (reason: string) => {
         const first = running.aborted === undefined;
@@ -697,7 +703,11 @@ export class ConnectionManager {
       admitted = r;
     }
     const fresh = admitted?.fresh ?? [];
-    if (resultFrameBytes("x".repeat(64), { content: req.content, ...(req.images ? { images: req.images } : {}), ...(fresh.length ? { tools: fresh } : {}) }) > RELAY_FRAME_LIMITS.hostToShimBytes) throw new HostError("EINVALID", "result_too_large");
+    const frameBytes = resultFrameBytes("x".repeat(64), { content: req.content, ...(req.images ? { images: req.images } : {}), ...(fresh.length ? { tools: fresh } : {}) });
+    if (frameBytes > RELAY_FRAME_LIMITS.hostToShimBytes) throw new HostError("EINVALID", "result_too_large");
+    // A per-turn budget of answered bytes: every answer costs the host two stringifies and an HTTP body parse of up to 8 MiB (about 40 ms ASCII, 100 ms escape-heavy), and
+    // a unit can make the model call tools that return big results all turn long. Honest turns answer a few MB.
+    if (t.answeredBytes + frameBytes > RESULT_BYTES_PER_TURN) throw new HostError("EINVALID", "result_budget");
     t.operations.delete(req.operationId);
     t.relayOps.delete(req.operationId);
     const session = await t.hs.ready;
@@ -709,6 +719,7 @@ export class ConnectionManager {
       ...(fresh.length ? { tools: fresh } : {}),
     });
     if (accepted === false) throw new HostError("ESTALE", "result_lost"); // the provider no longer has that operation (its own timer fired first)
+    t.answeredBytes += frameBytes;
     if (admitted && t.visible) {
       for (const tool of admitted.fresh) {
         t.visible.names.add(tool.name);

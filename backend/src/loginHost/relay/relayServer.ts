@@ -22,6 +22,9 @@ import type { Logger } from "../ports";
 import type { Layout } from "../ports/layout";
 import { RELAY_FRAME_LIMITS, TOOL_NAME, type ToolDef } from "../protocol";
 import { CpuMeter, TokenBucket } from "./cpuMeter";
+
+/** Loop time of one socket read outside the timed section, in ms (measured; see READ_COST_MS in the Claude adapter, which carries the measurement). */
+const READ_COST_MS = 0.08;
 import { LineAssembler, LogThrottle, MAX_FRAME_DEPTH, rawJsonDepthExceeds } from "./bounds";
 
 export interface RelayIdentity {
@@ -231,7 +234,7 @@ class Endpoint implements RelayEndpoint {
 
   private refusals = 0;
   private readonly meter: CpuMeter;
-  private readonly reads = new TokenBucket(2000, 1000);
+  private readonly reads = new TokenBucket(2000, 200);
   private callsRelayed = 0;
   private callCapLogged = false;
   /** No more connections are accepted (the connected one, if any, stays). The kernel refuses further connects; close() still removes the directory. */
@@ -303,6 +306,7 @@ class Endpoint implements RelayEndpoint {
       try {
         // each read is metered: the whole synchronous handling (scan, parse, validate, the adapter's onCall) is charged to the turn's CPU meter
         if (this.meter.exhausted) return this.drop(s, "cpu_budget");
+        this.meter.charge(READ_COST_MS); // the per-read cost outside the timed section (see claudeAdapter READ_COST_MS)
         if (!this.reads.take()) return this.drop(s, "rate_limited");
         this.meter.time(() => onData(chunk));
       } catch {
@@ -452,7 +456,11 @@ class Endpoint implements RelayEndpoint {
     return true;
   }
 
+  /** The answer path (stringify twice, up to 8 MiB) is charged to the turn's CPU meter like every other path that handles a unit's data. */
   answer(operationId: string, r: RelayResult): boolean {
+    return this.meter.time(() => this.answerInner(operationId, r));
+  }
+  private answerInner(operationId: string, r: RelayResult): boolean {
     const p = this.pending;
     if (this.isClosed || !p || p.operationId !== operationId || p.socket.destroyed) return false;
     let frame = resultFrame(p.callId, r);

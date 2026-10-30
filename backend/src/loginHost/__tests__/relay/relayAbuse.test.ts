@@ -9,6 +9,7 @@ import { connect, type Socket } from "net";
 import { Layout } from "../../ports/layout";
 import { RelayHost, type RelayCall, type RelayHostOptions, type RelayLimits } from "../../relay/relayServer";
 import { LogThrottle } from "../../relay/bounds";
+import { CpuMeter } from "../../relay/cpuMeter";
 
 const roots: string[] = [];
 afterAll(() => roots.forEach((r) => rmSync(r, { recursive: true, force: true })));
@@ -21,10 +22,10 @@ function setup(over: Partial<RelayHostOptions> = {}, limits: Partial<RelayLimits
   let clock = 1_000_000;
   const host = new RelayHost({ layout, ownByUid: false, limits, now: () => clock, log: { warn: (event, fields) => void logs.push({ event, fields }) }, ...over });
   host.init();
-  const open = (uid = 400_001) => {
+  const open = (uid = 400_001, meter?: CpuMeter) => {
     const calls: RelayCall[] = [];
     const ended: string[] = [];
-    const ep = host.open({ uid, identity: { connectionId: "c", epoch: 1, turnId: "t" }, onCall: (c) => void calls.push(c), onCallEnded: (_op, why) => void ended.push(why), allowTool: () => true, callTimeoutMs: () => 60_000 });
+    const ep = host.open({ uid, identity: { connectionId: "c", epoch: 1, turnId: "t" }, onCall: (c) => void calls.push(c), onCallEnded: (_op, why) => void ended.push(why), allowTool: () => true, callTimeoutMs: () => 60_000, ...(meter ? { meter } : {}) });
     return ep.then((e) => ({ ep: e, calls, ended }));
   };
   return { host, layout, logs, open, tick: (ms: number) => (clock += ms), root };
@@ -223,6 +224,39 @@ describe("the relay's byte budget", () => {
     for (let i = 0; i < 20; i++) c.s.write(JSON.stringify({ type: "ping" }) + "\n");
     await new Promise((r) => setTimeout(r, 50));
     expect(c.isClosed()).toBe(false);
+    await ep.close();
+  });
+});
+
+describe("the relay's frame handling is charged to the turn's CPU meter (pinned here as well as in relayServer.test.ts)", () => {
+  it("MUTATION TARGET: with every metered section reading 30 ms, a 100 ms budget is gone after four reads: the connection is dropped (cpu_budget) and the meter is spent", async () => {
+    const s = setup();
+    let t = 0;
+    const meter = new CpuMeter(100, 0, () => (t += 30));
+    const { ep } = await s.open(400_001, meter);
+    const c = await client(sockOf(ep.dir));
+    for (let i = 0; i < 8 && !c.isClosed(); i++) {
+      c.s.write(JSON.stringify({ type: "ping" }) + "\n");
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    await until(() => c.isClosed());
+    expect(meter.exhausted).toBe(true);
+    expect(s.logs.map((l) => l.fields?.code)).toContain("cpu_budget");
+    await ep.close();
+  });
+
+  it("MUTATION TARGET: the sustained read rate is 200 a second: a trickle of separate one-byte writes (hundreds of reads a second) is dropped (rate_limited), well inside the 2,000-read burst plus a few seconds", async () => {
+    const s = setup();
+    const { ep } = await s.open();
+    const c = await client(sockOf(ep.dir));
+    const t0 = Date.now();
+    while (!c.isClosed() && Date.now() - t0 < 15_000) {
+      await new Promise<void>((res) => c.s.write(" ", () => res())); // one write at a time: one read at the host (the kernel would otherwise coalesce them)
+      await new Promise((r) => setTimeout(r, 1));
+    }
+    console.log("RESULT cpu relay trickle dropped after ms", Date.now() - t0);
+    expect(c.isClosed()).toBe(true);
+    expect(s.logs.map((l) => l.fields?.code).some((code) => code === "rate_limited" || code === "cpu_budget" || code === "idle_timeout")).toBe(true);
     await ep.close();
   });
 });

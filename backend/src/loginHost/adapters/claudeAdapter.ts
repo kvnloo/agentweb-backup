@@ -162,8 +162,32 @@ export class RunnerChildAdapter extends EventEmitter implements RunnerChild {
       this.emit("error", err);
     });
   }
+  private pipesClosed = false;
+  /**
+   * Stops reading the child's pipes FOR GOOD. In production the kill is `systemctl stop` (SIGTERM, up to 10 s of grace, then SIGKILL): a writer that survives it keeps
+   * filling the pipe, and every read would still cost ~70-90 us OUTSIDE any metered section (measured: utilisation 0.96-0.99 for stdout/stderr x one-byte/64 KiB writes).
+   * Idempotent. The line reader downstream tolerates it: it is fed by this adapter's own LineLimit/guard streams, not by the raw pipes, and the turn is resolved by
+   * the exit event.
+   */
+  private closePipes(): void {
+    if (this.pipesClosed) return;
+    this.pipesClosed = true;
+    for (const [raw, sink] of [[this.child.stdout, this.stdout], [this.child.stderr, this.stderr]] as const) {
+      try {
+        raw.unpipe(sink as Transform);
+      } catch {
+        /* already unpiped */
+      }
+      try {
+        raw.destroy();
+      } catch {
+        /* already destroyed */
+      }
+    }
+  }
   /** A kill that throws (or fails) is not "gone": `exited` waits for `onExit` regardless. */
   kill(): boolean {
+    this.closePipes();
     try {
       this.child.kill();
       return true;
@@ -189,6 +213,7 @@ class StderrGuard extends Transform {
   }
   override _transform(chunk: Buffer, _enc: BufferEncoding, cb: (err?: Error | null, data?: Buffer) => void): void {
     if (this.tripped || this.meter.exhausted) return cb();
+    this.meter.charge(READ_COST_MS);
     this.meter.time(() => {
       if (!this.reads.take() || !this.bytes.take(chunk.length)) {
         this.tripped = true;
@@ -328,6 +353,7 @@ export class LineLimit extends Transform {
    */
   override _transform(chunk: Buffer, _enc: BufferEncoding, cb: (err?: Error | null, data?: Buffer) => void): void {
     if (this.tripped || this.meter.exhausted) return cb();
+    this.meter.charge(READ_COST_MS);
     if (!this.reads.take()) return this.stop(cb, this.onFlood);
     this.meter.time(() => this.scan(chunk, cb));
   }
@@ -1174,7 +1200,14 @@ const MAX_STREAM_USES = 64;
 const EVENT_BURST = 2000;
 const EVENTS_PER_SEC = 200;
 const READ_BURST = 2000;
-const READS_PER_SEC = 1000;
+/** Sustained reads per second per stream. The real CLI emits a handful of lines a second (and the wrapper and the relay shim ping every 5 s), so 200 is far above honest use. */
+const READS_PER_SEC = 200;
+/**
+ * Loop time of one read (socket -> pipe -> Transform -> readline) that happens OUTSIDE the timed section, in ms: measured at 0.07-0.09 ms through the real adapter with
+ * one-byte writes (a 950 B/s trickle cost 7-9% of the loop per stream while the section timing charged 0.4-1.3%). Charged to the meter on every chunk, in addition to the
+ * timed work, so a trickle is paid for what it costs.
+ */
+export const READ_COST_MS = 0.08;
 /** stderr is diagnostics only: at most this many bytes are ever forwarded to the runner. */
 const STDERR_FORWARD_CAP = 8192;
 /** At most this many content blocks of one assistant event are looked at, and a call whose frame is larger than this is never hashed. */
