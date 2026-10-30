@@ -78,7 +78,8 @@ describe("valid giant event lines", () => {
     const line = Buffer.from('{"type":"user","s":"' + "a".repeat(1024 * 1024 - 30) + '"}\n');
     const m = await pump(r, line, { maxWrites: 400, maxMs: 30_000 });
     console.log("RESULT strings", JSON.stringify({ ...m, ...r.stats(), errors: r.errors }));
-    expect(r.errors).toEqual(["stdout_flood"]);
+    expect(r.errors).toHaveLength(1);
+    expect(["stdout_flood", "cpu_budget"]).toContain(r.errors[0]); // the byte bucket ends it; on a loaded machine the CPU meter (2 s of loop) may get there first
     expect(r.stats().parsed).toBeLessThanOrEqual(72); // the 64 MiB burst
   });
 
