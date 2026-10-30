@@ -1,4 +1,4 @@
-import { eventPoll, __resetEventPoll, type PollDeps } from "../smartleadEventPoll";
+import { eventPoll, __pendingBounceCount, __resetEventPoll, type PollDeps } from "../smartleadEventPoll";
 import type { SmartleadEvent } from "../smartleadEvents";
 import { SmartleadApiError } from "../smartleadService";
 
@@ -314,6 +314,86 @@ describe("the hourly event poll (ENG-673)", () => {
       expect(w.handled).toHaveLength(0);
     });
 
+    it("a contact that left the bounced list and came back much later starts its wait again: an old first sighting is not the second one", async () => {
+      const w = world({ campaignSize: 1000, leads: { is_bounced: { 77: rows(1, "b") } } });
+      const d = deps(w, on);
+      await eventPoll(d); // first sighting
+      w.leads.is_bounced = { 77: [] }; // it drops out of the list...
+      clock += 2 * hour; await eventPoll(d);
+      w.leads.is_bounced = { 77: rows(1, "b") }; // ...and is back 13 hours after it was last seen
+      clock += 13 * hour; await eventPoll(d);
+      expect(w.handled).toHaveLength(0); // a new first sighting, not an acted-on second
+      clock += hour; await eventPoll(d);
+      expect(w.handled.map(h => h.event.eventKey)).toEqual(["poll:bounce:77:b0"]); // the real second sighting
+    });
+
+    it("a contact seen every hour while its handling keeps failing is not made to start over: the 'last seen' time keeps moving", async () => {
+      const w = world({ campaignSize: 1000, leads: { is_bounced: { 77: rows(1, "b") } } });
+      let fail = true;
+      let attempts = 0;
+      const d = deps(w, { ...on, events: { handle: async (ctx, event) => { attempts++; if (fail) throw new Error("db down"); w.handled.push({ ctx, event }); return { matched: 1, changed: 1, duplicates: 0 }; } } });
+      await eventPoll(d); // first sighting
+      for (let i = 0; i < 13; i++) { clock += hour; await eventPoll(d); } // 13 hours of failures, seen every hour
+      expect(attempts).toBe(13); // tried on every one of those passes: the wait was never restarted as stale (it restarts silently, with no attempt, if 'last seen' does not move)
+      fail = false;
+      clock += hour; await eventPoll(d);
+      expect(w.handled).toHaveLength(1);
+    });
+
+    it("records of contacts not seen for a day are dropped (the map cannot fill with contacts that left the list); a recent one is kept", async () => {
+      const w = world({ campaignSize: 1000, leads: { is_bounced: { 77: rows(1, "b") } } });
+      const d = deps(w, on);
+      await eventPoll(d);
+      expect(__pendingBounceCount()).toBe(1);
+      w.leads.is_bounced = { 77: [] };
+      clock += 13 * hour; await eventPoll(d);
+      expect(__pendingBounceCount()).toBe(1); // 13 h unseen: stale for the wait, but not yet dropped
+      clock += 12 * hour; await eventPoll(d);
+      expect(__pendingBounceCount()).toBe(0); // 25 h unseen: gone
+    });
+
+    it("the sweep goes by when a contact was last SEEN, not first: one bounced and failing for 30 hours keeps its record", async () => {
+      const w = world({ campaignSize: 1000, leads: { is_bounced: { 77: rows(1, "b") } } });
+      let attempts = 0;
+      const d = deps(w, { ...on, events: { handle: async () => { attempts++; throw new Error("db down"); } } });
+      await eventPoll(d);
+      for (let i = 0; i < 30; i++) { clock += hour; await eventPoll(d); }
+      expect(__pendingBounceCount()).toBe(1);
+      expect(attempts).toBe(30); // tried on every pass after the first: a sweep by first-seen would have deleted the record at 25 h and restarted the wait (one pass without an attempt)
+    });
+
+    it("a campaign polled only every few passes still completes its wait (the wait is not restarted by a 3 h gap)", async () => {
+      const w = world({ campaignSize: 1000, leads: { is_bounced: { 77: rows(1, "b") } } });
+      const d = deps(w, on);
+      await eventPoll(d);
+      clock += 3 * hour; await eventPoll(d);
+      expect(w.handled).toHaveLength(1);
+    });
+
+    it("a contact whose handling failed keeps its wait, so the next pass retries at once", async () => {
+      const w = world({ campaignSize: 1000, leads: { is_bounced: { 77: rows(1, "b") } } });
+      let fail = true;
+      const d = deps(w, { ...on, events: { handle: async (ctx, event) => { if (fail) throw new Error("db down"); w.handled.push({ ctx, event }); return { matched: 1, changed: 1, duplicates: 0 }; } } });
+      await eventPoll(d);
+      clock += hour; expect((await eventPoll(d)).errors).toBe(1);
+      fail = false;
+      clock += 5 * 60 * 1000; await eventPoll(d); // five minutes later, not another hour
+      expect(w.handled).toHaveLength(1);
+    });
+
+    it("a sender-side list that cannot be read leaves the waits alone and acts on nothing", async () => {
+      const w = world({ campaignSize: 1000, leads: { is_bounced: { 77: rows(1, "b") } } });
+      const d = deps(w, on);
+      await eventPoll(d); // first sighting recorded
+      w.failOn = ["is_sender_bounced"];
+      clock += hour; const out = await eventPoll(d);
+      expect(w.handled).toHaveLength(0);
+      expect(out.errors).toBeGreaterThan(0);
+      w.failOn = [];
+      clock += 5 * 60 * 1000; await eventPoll(d); // the wait was not lost
+      expect(w.handled).toHaveLength(1);
+    });
+
     it("a restart (nothing remembered) starts the wait again", async () => {
       const w = world({ campaignSize: 1000, leads: { is_bounced: { 77: rows(1, "b") } } });
       const d = deps(w, on);
@@ -355,6 +435,23 @@ describe("the hourly event poll (ENG-673)", () => {
       expect(over.handled.filter(h => h.event.kind === "bounce")).toHaveLength(0); // 201 > 2 pages: cannot be proven, nothing acted on
     });
 
+    it("an empty page before the end of the sender-side list means it is incomplete: no bounce is acted on", async () => {
+      const w = world({ campaignSize: 1000, leads: { is_bounced: { 77: rows(2, "b") }, is_sender_bounced: { 77: rows(250, "s") } } });
+      const d = deps(w);
+      const real = d.smartlead.listLeads;
+      d.smartlead.listLeads = async (k, c, status, offset, limit) => { const r = await real(k, c, status, offset, limit); return status === "is_sender_bounced" && offset >= 100 ? { total: r.total, rows: [] } : r; };
+      await eventPoll(d);
+      expect(w.handled.filter(h => h.event.kind === "bounce")).toHaveLength(0);
+    });
+
+    it("a sender-side list that is null stops only the bounce kind: it is read once, not once per page, and replies still come through", async () => {
+      const w = world({ campaignSize: 1000, failOn: ["is_sender_bounced"], leads: { is_bounced: { 77: rows(250, "b") }, is_replied: { 77: rows(1, "r") } } });
+      await eventPoll(deps(w));
+      expect(w.calls.filter(c => c.includes("is_sender_bounced"))).toHaveLength(1);
+      expect(w.calls.filter(c => c.includes("is_bounced"))).toHaveLength(1);
+      expect(w.handled.map(h => h.event.kind)).toEqual(["reply"]);
+    });
+
     it("a sender-side contact that is not in the bounced list changes nothing", async () => {
       const w = world({ campaignSize: 1000, leads: { is_bounced: { 77: rows(2, "b") }, is_sender_bounced: { 77: rows(1, "x") } } });
       await eventPoll(deps(w));
@@ -370,10 +467,13 @@ describe("the hourly event poll (ENG-673)", () => {
     expect(w.logs.join("\n")).toContain("treated as an ignored filter");
   });
 
-  it("a few bounces in a campaign of 4 (under the guard's minimum) are still acted on", async () => {
-    const w = world({ campaignSize: 4, leads: { is_bounced: { 77: rows(2, "b") } } });
-    await eventPoll(deps(w));
-    expect(w.handled.filter(h => h.event.kind === "bounce")).toHaveLength(2);
+  it("the guard's minimum is exactly 5: all 4 of 4 are acted on, all 5 of 5 are refused", async () => {
+    const four = world({ campaignSize: 4, leads: { is_bounced: { 77: rows(4, "b") } } });
+    await eventPoll(deps(four));
+    expect(four.handled.filter(h => h.event.kind === "bounce")).toHaveLength(4);
+    const five = world({ campaignSize: 5, leads: { is_bounced: { 77: rows(5, "b") } } });
+    await eventPoll(deps(five));
+    expect(five.handled).toHaveLength(0);
   });
 
   it("without the campaign's size, bounces and replies are NOT polled (nothing guards a filter that was ignored), opt-outs still are, and it is said once a day", async () => {
