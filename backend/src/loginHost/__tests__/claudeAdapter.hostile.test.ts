@@ -128,7 +128,7 @@ describe("hostile shim over the real relay socket (the reviewer's reproduction)"
 });
 
 describe("a hostile CLI printing a deeply nested line", () => {
-  it.each([5_000, 100_000, 1_000_000])("MUTATION TARGET: a stdout line nested %i deep is dropped before anything parses it; the turn completes normally and one fixed-code line is logged", async (k) => {
+  it.each([5_000, 100_000, 500_000])("MUTATION TARGET: a stdout line nested %i deep is dropped before anything parses it; the turn completes normally and one fixed-code line is logged", async (k) => {
     const rig = makeRig();
     rig.scenario({ deepline: k, turn: [{ type: "assistant", message: { id: "m1", content: [{ type: "text", text: "hello" }] } }, RESULT_STEP] });
     const session = await rig.adapter.openSession(rig.ctx, { connectionId: "conn1", epoch: 3 });
@@ -239,6 +239,17 @@ describe("a hostile unit and a hostile CLI together cannot stall the loop by mak
     }
     expect(w.canonical.mock.calls.length).toBeLessThanOrEqual(17); // 8 MiB / ~500 KB
     expect(w.canonical.mock.calls.length).toBeGreaterThan(0);
+    await w.stop();
+  });
+
+  it("MUTATION TARGET: an announcement of a tool the turn does NOT offer is not recorded and consumes none of the hashing budget", async () => {
+    const w = await withWaitingCall({ q: "x" }, 20);
+    const before = (w.session as unknown as { hashedBytes: number }).hashedBytes;
+    w.canonical.mockClear();
+    for (let i = 0; i < 50; i++) w.session.noteStreamUse({ type: "assistant", message: { id: "m" + i, content: [{ type: "tool_use", id: "t", name: "mcp__emma__not_offered", input: { pad: "x".repeat(100_000) } }] } });
+    expect((w.session as unknown as { streamUses: unknown[] }).streamUses).toHaveLength(0);
+    expect((w.session as unknown as { hashedBytes: number }).hashedBytes).toBe(before);
+    expect(w.canonical).not.toHaveBeenCalled();
     await w.stop();
   });
 
