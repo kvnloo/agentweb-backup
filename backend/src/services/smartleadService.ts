@@ -478,6 +478,57 @@ export async function getCampaign(apiKey: string, campaignId: number, opts: { ma
   };
 }
 
+export interface SmartleadWebhook {
+  id: number;
+  name: string;
+  url: string;
+  eventTypes: string[];
+}
+
+/**
+ * The webhooks registered on one campaign. Verified live (2026-10-30): `GET /campaigns/{id}/webhooks` answers a bare array of
+ * `{id, name, webhook_url, event_types, categories, ...}` (an empty array when there are none). Anything else is an error, so an odd reply can
+ * never be read as "no webhooks" and trigger a duplicate registration.
+ */
+export async function listCampaignWebhooks(apiKey: string, campaignId: number, opts: { maxRetries?: number } = {}): Promise<SmartleadWebhook[]> {
+  assertCampaignId(campaignId);
+  const data = await smartleadRequest<unknown>(apiKey, "GET", `/campaigns/${encodeURIComponent(String(campaignId))}/webhooks`, { maxRetries: opts.maxRetries });
+  if (!Array.isArray(data)) throw new SmartleadUnexpectedResponseError("Smartlead GET /campaigns/{id}/webhooks returned an unexpected response");
+  const out: SmartleadWebhook[] = [];
+  for (const row of data) {
+    if (!row || typeof row !== "object") continue;
+    const r = row as Record<string, unknown>;
+    const id = asWholeNumber(r.id);
+    if (id === undefined) continue;
+    out.push({ id, name: String(r.name ?? ""), url: String(r.webhook_url ?? ""), eventTypes: Array.isArray(r.event_types) ? r.event_types.filter((e): e is string => typeof e === "string") : [] });
+  }
+  return out;
+}
+
+/** Creates a campaign webhook, or updates the one with `id` (the same POST; verified live 2026-10-30). Returns its id. */
+export async function saveCampaignWebhook(
+  apiKey: string,
+  campaignId: number,
+  input: { id?: number; name: string; url: string; eventTypes: string[] },
+  opts: { maxRetries?: number } = {},
+): Promise<number> {
+  assertCampaignId(campaignId);
+  const data = await smartleadRequest<unknown>(apiKey, "POST", `/campaigns/${encodeURIComponent(String(campaignId))}/webhooks`, {
+    data: { ...(input.id !== undefined ? { id: input.id } : {}), name: input.name, webhook_url: input.url, event_types: input.eventTypes },
+    maxRetries: opts.maxRetries,
+  });
+  const id = data && typeof data === "object" ? asWholeNumber((data as Record<string, unknown>).id) : undefined;
+  if (id === undefined) throw new SmartleadUnexpectedResponseError("Smartlead POST /campaigns/{id}/webhooks returned an unexpected response");
+  return id;
+}
+
+/** Deletes one campaign webhook: `DELETE /campaigns/{id}/webhooks` with `{id}` in the body (verified live 2026-10-30). */
+export async function deleteCampaignWebhook(apiKey: string, campaignId: number, webhookId: number, opts: { maxRetries?: number } = {}): Promise<void> {
+  assertCampaignId(campaignId);
+  const data = await smartleadRequest<unknown>(apiKey, "DELETE", `/campaigns/${encodeURIComponent(String(campaignId))}/webhooks`, { data: { id: webhookId }, maxRetries: opts.maxRetries });
+  if (!data || typeof data !== "object" || (data as Record<string, unknown>).ok !== true) throw new SmartleadUnexpectedResponseError("Smartlead DELETE /campaigns/{id}/webhooks did not confirm the delete");
+}
+
 /**
  * The raw sequence steps of a campaign, for `analyseSequence`. Verified live (2026-10-28): a real campaign gives a bare array (empty
  * for a campaign with no steps), and an id that does not exist gives an `{error: "Campaign not found..."}` object. Anything that is
