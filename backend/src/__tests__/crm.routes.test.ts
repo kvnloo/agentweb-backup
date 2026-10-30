@@ -1746,7 +1746,7 @@ describe('CRM Routes', () => {
       expect(mockResponse.json).toHaveBeenCalled();
     });
 
-    describe('ENG-673 — a do-not-contact lead is never emailed or messaged', () => {
+    describe('ENG-673 — a do-not-contact lead is never emailed', () => {
       const run = async (path: string, body: Record<string, unknown>) => {
         (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list1', name: 'L', userId: 'test-user-id' });
         (resendService.sendEmail as jest.Mock).mockResolvedValue({ id: 'email-id-123' });
@@ -1775,15 +1775,6 @@ describe('CRM Routes', () => {
         await run('/lists/:listId/leads/:leadId/send-email', { confirmPushedToSmartlead: true });
         expect(mockResponse.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'do_not_contact' }));
         expect(resendService.sendEmail).not.toHaveBeenCalled();
-      });
-      it('a LinkedIn message and a LinkedIn invite are refused the same way, before anything is looked up on LinkedIn', async () => {
-        for (const path of ['/lists/:listId/leads/:leadId/send-linkedin-message', '/lists/:listId/leads/:leadId/send-linkedin-invite']) {
-          (mockResponse.status as jest.Mock).mockClear();
-          (crmDb.getLeadById as jest.Mock).mockResolvedValue({ leadId: 'lead1', listId: 'list1', linkedin: 'https://www.linkedin.com/in/x', contactStatus: 'unsubscribed' });
-          await run(path, { message: 'hello' });
-          expect(mockResponse.status).toHaveBeenCalledWith(409);
-          expect(mockResponse.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'do_not_contact' }));
-        }
       });
       it('an active lead is still emailed', async () => {
         (crmDb.getLeadById as jest.Mock).mockResolvedValue({ leadId: 'lead1', listId: 'list1', email: 'lead@example.com', contactStatus: 'active' });

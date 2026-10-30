@@ -73,6 +73,10 @@ export class SmartleadEventService {
         seen.add(id);
         const marker = getSmartleadMarker(lead, ctx.campaignId);
         if (!marker || typeof marker.runId !== "string" || !marker.runId) continue;
+        // Once our own withdrawal has unsubscribed a blocked contact in Smartlead (`withdrawn`, or `released` afterwards, which keeps `withdrawnAt`),
+        // Smartlead lists that contact as unsubscribed for good: reading it back would re-block a contact a user has since resubscribed in the CRM.
+        // A reply has no such risk, and a contact released without a withdrawal is still live in Smartlead, so both are still read.
+        if (event.polled && event.kind !== "reply" && (marker.state === "withdrawn" || !!marker.withdrawnAt)) continue;
         const r = await proven(marker.runId);
         if (r.ok) matches.push({ lead, campaignName: r.name });
       }
@@ -95,6 +99,33 @@ export class SmartleadEventService {
     let changed = 0;
     let duplicate = 0;
 
+    // Set when the poll finds the opt-out or bounce already on the contact but the block never landed: only the status is left to write.
+    let engagementOnFile = false;
+    if (event.polled) {
+      // The poll cannot tell whether the webhook already delivered this event (it has no event id, and Smartlead keeps listing a contact for good),
+      // so it applies only what the contact does not already show.
+      const here: any[] = (Array.isArray(lead.engagements) ? lead.engagements : []).filter((e: any) => e?.eventData?.source === "smartlead" && Number(e?.eventData?.campaignId) === event.campaignId);
+      if (event.kind === "reply") {
+        // A SECOND reply missed by the webhook is not seen by the poll; a missed first one is.
+        if (here.some(e => e?.eventType === "email.received")) return { changed: 0, duplicate: 1 };
+      } else {
+        // A temporary bounce does not count as "already shown" for an opt-out: it never blocked the contact, and a later opt-out must still land.
+        const blocking = here.filter(e => e?.eventType === "email.unsubscribed" || (e?.eventType === "email.bounced" && e?.eventData?.soft !== true));
+        if (blocking.length > 0) {
+          // On file: either the block landed and a user has since lifted it (the status was written at or after the event: leave a Resubscribe
+          // alone), or the status write failed after the engagement was recorded (finish it). Read fresh: a stale read here would undo a Resubscribe.
+          const fresh = (await this.deps.readLeadConsistent(lead.listId, lead.leadId)) ?? lead;
+          const latest = Math.max(...blocking.map(e => Date.parse(e?.createdAt) || 0));
+          const stamped = Date.parse(fresh.contactStatusUpdatedAt) || 0;
+          if (isDoNotContact(fresh) || stamped >= latest) return { changed: 0, duplicate: 1 };
+          engagementOnFile = true;
+        } else if (isDoNotContact(lead) || (event.kind === "bounce" && here.some(e => e?.eventType === "email.bounced"))) {
+          // Already blocked by other means, or the bounce on file is the temporary one the poll is now listing (it cannot tell them apart).
+          return { changed: 0, duplicate: 1 };
+        }
+      }
+    }
+
     if (event.kind === "reply") {
       const data = { ...base, ...(event.subject ? { subject: event.subject } : {}), ...(event.from ? { from: event.from } : {}), ...(event.to ? { to: event.to } : {}) };
       const added = await this.record(lead, "email.received", data, at);
@@ -113,7 +144,7 @@ export class SmartleadEventService {
     const bounced = event.kind === "bounce";
     // No free text here (the campaign's name, Smartlead's reason): the CRM scans event data for words like "received" to decide a contact is
     // engaged, and a bounced or opted-out contact must never look engaged. The reason goes only into the status note below.
-    const added = await this.record(lead, bounced ? "email.bounced" : "email.unsubscribed", { source: "smartlead", smartleadEventKey: event.eventKey, campaignId: event.campaignId, ...(bounced && event.soft ? { soft: true } : {}) }, at);
+    const added = engagementOnFile ? { recorded: false, lead } : await this.record(lead, bounced ? "email.bounced" : "email.unsubscribed", { source: "smartlead", smartleadEventKey: event.eventKey, campaignId: event.campaignId, ...(bounced && event.soft ? { soft: true } : {}) }, at);
     if (added.recorded) changed++; else duplicate++;
     if (bounced && event.soft) return { changed, duplicate }; // a temporary bounce is recorded, the contact is not blocked
 

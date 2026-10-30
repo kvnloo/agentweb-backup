@@ -27,6 +27,12 @@ export interface SmartleadEvent {
   reason?: string;
   /** Same event delivered twice gives the same key (Smartlead retries and can duplicate). */
   eventKey: string;
+  /**
+   * Set when the event was found by the hourly poll instead of delivered. The poll only learns THAT a contact replied, bounced or unsubscribed,
+   * with no event id, so its key can never match the webhook's for the same event: to avoid recording the same thing twice, the service
+   * skips a polled event when the contact already shows it (see SmartleadEventService).
+   */
+  polled?: boolean;
 }
 
 export type ParseResult = { ok: true; event: SmartleadEvent } | { ok: false; reason: string };
