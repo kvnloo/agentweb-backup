@@ -478,6 +478,55 @@ export async function getCampaign(apiKey: string, campaignId: number, opts: { ma
   };
 }
 
+export type SmartleadEmailStatus = "is_replied" | "is_bounced" | "is_unsubscribed";
+
+export interface SmartleadLeadRow {
+  /** Smartlead's own lead id. */
+  leadId: string;
+  email: string;
+  /** Smartlead's own flag on the lead (`lead.is_unsubscribed`); true after an unsubscribe by link, by us through the API, or by the customer. */
+  unsubscribed: boolean;
+}
+
+/**
+ * One page of a campaign's contacts, optionally only those Smartlead says replied or bounced (`GET /campaigns/{id}/leads?emailStatus=...`; verified
+ * live 2026-10-30: `{total_leads (a string), data[{campaign_lead_map_id, status, lead{id, email, is_unsubscribed, ...}}], offset, limit}`, and an
+ * unknown emailStatus is a 400 that names the allowed values). It carries no timestamp and no message text, so it can only say THAT a contact did
+ * it. LIVE FINDING: the `is_unsubscribed` filter does NOT list a contact unsubscribed through the API (it stays empty although the contact is
+ * `BLOCKED` with `lead.is_unsubscribed: true`), and `status=BLOCKED` is not an allowed filter, so opt-outs are found by reading the pages with no
+ * filter and keeping the rows whose own flag is set. That listing lags behind a large add, which is harmless here: the poll only ever acts on a row
+ * that IS there, so a lagging page just means a contact is found on a later pass. A row without a usable id or address is dropped; a reply that
+ * is not this shape is an error, never "nobody".
+ */
+export async function listCampaignLeadsByEmailStatus(
+  apiKey: string,
+  campaignId: number,
+  emailStatus: SmartleadEmailStatus | null,
+  opts: { offset?: number; limit?: number; maxRetries?: number } = {},
+): Promise<{ total: number; rows: SmartleadLeadRow[] }> {
+  assertCampaignId(campaignId);
+  const limit = Math.min(Math.max(opts.limit ?? 100, 1), 100);
+  const offset = Math.max(opts.offset ?? 0, 0);
+  const data = await smartleadRequest<unknown>(apiKey, "GET", `/campaigns/${encodeURIComponent(String(campaignId))}/leads`, {
+    params: { ...(emailStatus ? { emailStatus } : {}), limit, offset },
+    maxRetries: opts.maxRetries,
+  });
+  if (!data || typeof data !== "object" || Array.isArray(data) || !Array.isArray((data as { data?: unknown }).data)) {
+    throw new SmartleadUnexpectedResponseError("Smartlead GET /campaigns/{id}/leads returned an unexpected response");
+  }
+  const body = data as { total_leads?: unknown; data: Array<Record<string, any> | null> };
+  const total = asWholeNumber(body.total_leads);
+  if (total === undefined || total < 0) throw new SmartleadUnexpectedResponseError("Smartlead GET /campaigns/{id}/leads returned no usable total");
+  const rows: SmartleadLeadRow[] = [];
+  for (const row of body.data) {
+    const lead = row?.lead;
+    const id = lead && typeof lead === "object" ? (typeof lead.id === "number" || typeof lead.id === "string" ? String(lead.id) : "") : "";
+    const address = lead && typeof lead.email === "string" ? lead.email.trim().toLowerCase() : "";
+    if (id && address.includes("@")) rows.push({ leadId: id, email: address, unsubscribed: lead.is_unsubscribed === true });
+  }
+  return { total, rows };
+}
+
 export interface SmartleadWebhook {
   id: number;
   name: string;
