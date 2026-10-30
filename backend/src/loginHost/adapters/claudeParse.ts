@@ -75,7 +75,7 @@ function statusWord(v: unknown): string | undefined {
   return typeof v === "string" && /^[a-z0-9_-]{1,40}$/i.test(v) ? v : undefined;
 }
 /** Content blocks of one message looked at: the CLI sends a handful, a hostile one may send a quarter million in one line. */
-export const MAX_BLOCKS_NORMALIZED = 256;
+export const MAX_BLOCKS_NORMALIZED = 32;
 
 /** One stream-json event => zero or more normalized events. Unknown fields stay unknown (never 0). The final `result` event is handled by the caller. */
 export function normalizeClaudeEvent(raw: Record<string, unknown>): ProviderEvent[] {

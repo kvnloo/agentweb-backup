@@ -38,6 +38,7 @@ import type {
   SubscriptionProviderAdapter,
 } from "../adapter";
 import { manifestLines, qualifiedToolPrefix, RELAY_MCP_SERVER_NAME, relayCliEnv } from "../protocol";
+import { CpuMeter, TokenBucket } from "../relay/cpuMeter";
 import { RELAY_SOCKET_IN_UNIT } from "../ports/unitArgs";
 import { approxJsonBytes, LogThrottle, MAX_CLI_LINE_DEPTH, MAX_FORWARDED_BYTES, MAX_FORWARDED_DEPTH, valueDepthExceeds } from "../relay/bounds";
 import { canonicalJson } from "../relay/canonical";
@@ -103,6 +104,7 @@ export class RunnerChildAdapter extends EventEmitter implements RunnerChild {
   readonly stdin: ChildLike["stdin"];
   readonly stdout: Transform;
   readonly stderr: ChildLike["stderr"];
+  readonly meter: CpuMeter;
   exitCode: number | null = null;
   signalCode: string | null = null;
   /** Resolves only when the process is really gone (`onExit`), or never existed (`onError`: it could not be started). */
@@ -112,10 +114,24 @@ export class RunnerChildAdapter extends EventEmitter implements RunnerChild {
     private readonly child: ChildLike,
     maxLineBytes: number,
     onDeepLine?: () => void,
+    /** The turn's CPU meter (see relay/cpuMeter.ts): everything this child makes the host process is charged to it. A turn builds one and shares it with its relay. */
+    meter: CpuMeter = new CpuMeter(),
   ) {
     super();
+    this.meter = meter;
     this.stdin = child.stdin;
-    this.stderr = child.stderr;
+    // stderr is the unit's data too: it goes through a guard (metered, read- and byte-limited, and at most a few KiB forwarded) BEFORE the runner's tail logic sees it
+    const errGuard = new StderrGuard(meter, () => {
+      this.kill();
+      this.emit("error", new Error("stderr_flood"));
+    });
+    child.stderr.on("error", () => undefined);
+    child.stderr.pipe(errGuard);
+    this.stderr = errGuard;
+    meter.onExhausted(() => {
+      this.kill();
+      this.emit("error", new Error("cpu_budget"));
+    });
     let done!: () => void;
     this.exited = new Promise<void>((r) => (done = r));
     // The runner's line reader buffers a whole line: a CLI that never prints a newline must not grow the host's memory without bound.
@@ -130,6 +146,7 @@ export class RunnerChildAdapter extends EventEmitter implements RunnerChild {
         this.kill();
         this.emit("error", new Error("stdout_flood"));
       },
+      meter,
     );
     child.stdout.on("error", () => undefined);
     child.stdout.pipe(this.stdout);
@@ -157,6 +174,35 @@ export class RunnerChildAdapter extends EventEmitter implements RunnerChild {
 }
 
 const NEWLINE = Buffer.from("\n");
+
+/** The child's stderr, metered and bounded before the runner (which concatenates a tail per chunk) sees it. */
+class StderrGuard extends Transform {
+  private forwarded = 0;
+  private tripped = false;
+  private readonly reads = new TokenBucket(READ_BURST, READS_PER_SEC);
+  private readonly bytes = new TokenBucket(1024 * 1024, 64 * 1024);
+  constructor(
+    private readonly meter: CpuMeter,
+    private readonly onFlood: () => void,
+  ) {
+    super();
+  }
+  override _transform(chunk: Buffer, _enc: BufferEncoding, cb: (err?: Error | null, data?: Buffer) => void): void {
+    if (this.tripped || this.meter.exhausted) return cb();
+    this.meter.time(() => {
+      if (!this.reads.take() || !this.bytes.take(chunk.length)) {
+        this.tripped = true;
+        this.onFlood();
+        return cb();
+      }
+      const room = STDERR_FORWARD_CAP - this.forwarded;
+      if (room <= 0) return cb();
+      const part = chunk.length <= room ? chunk : chunk.subarray(0, room);
+      this.forwarded += part.length;
+      cb(null, part);
+    });
+  }
+}
 const DROPPED_LINE = Buffer.from("{\"type\":\"aw_line_dropped\"}\n");
 
 /** Budgets for stdout lines that are NOT events (junk, blank, incomplete): a CLI printing them fast costs the host's event loop (the runner JSON.parses every non-empty line and throws on junk). */
@@ -225,9 +271,12 @@ export class LineLimit extends Transform {
     private readonly onOverflow: () => void,
     private readonly onDeep: () => void = () => undefined,
     private readonly onFlood: () => void = onOverflow,
+    private readonly meter: CpuMeter = new CpuMeter(),
   ) {
     super();
   }
+  /** Reads (chunks) per turn: a tiny read costs ~8 us through socket, pipe, Transform and readline, so one-byte writes are a flood by COUNT as well as by time. */
+  private readonly reads = new TokenBucket(READ_BURST, READS_PER_SEC);
   private endLine(): void {
     this.run = 0;
     this.depth = 0;
@@ -273,7 +322,16 @@ export class LineLimit extends Transform {
     if (!this.tripped && this.skipping === 0 && this.lineStarted && this.depth === 0 && !this.inString && this.lastSig === 0x7d && this.carryLen > 0) this.push(this.takeCarry());
     cb();
   }
+  /**
+   * Every chunk is metered: the WHOLE synchronous section is timed, including the downstream push (readline, the runner's JSON.parse and the session's callbacks all run
+   * inside it), so what the unit makes the host do is what is charged, however it made it expensive.
+   */
   override _transform(chunk: Buffer, _enc: BufferEncoding, cb: (err?: Error | null, data?: Buffer) => void): void {
+    if (this.tripped || this.meter.exhausted) return cb();
+    if (!this.reads.take()) return this.stop(cb, this.onFlood);
+    this.meter.time(() => this.scan(chunk, cb));
+  }
+  private scan(chunk: Buffer, cb: (err?: Error | null, data?: Buffer) => void): void {
     if (this.tripped) return cb();
     const n = chunk.length;
     const out: Buffer[] = [];
@@ -328,7 +386,7 @@ export class LineLimit extends Transform {
           start = i + 1;
         } else if (this.depth === 0 && !this.inString && this.lastSig === 0x7d) {
           el++; // a complete object: forwarded (the carried head of it first)
-          eb += this.run;
+          eb += this.run + 64 * this.values; // cost units: a byte, plus 64 for each value (a value costs far more than a byte to parse and normalize)
           if (this.carryLen > 0) out.push(this.takeCarry());
         } else {
           // event-shaped at the start, but not a complete object: it would only make the runner's JSON.parse throw
@@ -667,7 +725,7 @@ export class ClaudeAdapter implements SubscriptionProviderAdapter {
   mapError(raw: unknown): ErrorKind {
     if (raw instanceof ClaudeCliTurnError) return "transient";
     const message = (raw instanceof Error ? raw.message : typeof raw === "string" ? raw : "").slice(0, MAX_CLASSIFY_CHARS); // bounded: the patterns below must never scan CLI-controlled text of any length
-    if (/mcp server .* is not connected|stdout_line_too_long|stdout_flood/i.test(message)) return "transient";
+    if (/mcp server .* is not connected|stdout_line_too_long|stdout_flood|stderr_flood|cpu_budget|event_flood/i.test(message)) return "transient";
     if ((raw as { code?: string } | null)?.code === "open_failed") return "transient";
     return failureClassToKind(classifyFailureText(message)); // never auth_dead: host faults must not park a healthy login
   }
@@ -746,6 +804,7 @@ class ClaudeSession implements ProviderSession {
             ctx.spawnAs({ file: cfg.turnWrapperPath, args: [s.file, ...s.args], env: s.env as Record<string, string>, cwd: s.cwd, ...(this.relayEp ? { relayDir: this.relayEp.dir } : {}) }),
             cfg.maxLineBytes,
             () => this.noteDeepLine(),
+            this.meter,
           );
           this.exits.push(child.exited);
           return child;
@@ -799,6 +858,17 @@ class ClaudeSession implements ProviderSession {
   /** The in-flight relay.open(): a close that arrives meanwhile waits for it, so the endpoint it creates is never left behind. */
   private relayOpening: Promise<RelayEndpoint> | undefined;
   private readonly visibleTools = new Set<string>();
+  /** This turn's CPU meter and normalized-events bucket (replaced at the start of every turn). */
+  private meter = new CpuMeter();
+  private eventBucket = new TokenBucket(EVENT_BURST, EVENTS_PER_SEC);
+  private readonly budgetLog = new LogThrottle(3, 60_000);
+  private noteBudget(code: "cpu_budget" | "event_flood"): void {
+    try {
+      if (this.budgetLog.check(code).log) this.cfg.log?.warn(code);
+    } catch {
+      /* logging is best effort */
+    }
+  }
   /** Bytes canonicalized and hashed for matching in the current turn (stream announcements and call inputs together): a hard budget, then name-only matching. */
   private hashedBytes = 0;
   /** The turn's remaining call clock (relay turns only): the CLI's own tool timeout is set from it (see relayCliEnv). */
@@ -914,6 +984,10 @@ class ClaudeSession implements ProviderSession {
     this.events = events;
     const key = `${this.spec.connectionId}/${input.turnId}`;
     this.key = key;
+    // a fresh CPU meter and event bucket for this turn; running out of the meter ends the turn (the child adapter kills the CLI), logged once with a fixed code
+    this.meter = new CpuMeter();
+    this.eventBucket = new TokenBucket(EVENT_BURST, EVENTS_PER_SEC);
+    this.meter.onExhausted(() => this.noteBudget("cpu_budget"));
     let result: Awaited<ReturnType<ClaudeCliRunner["send"]>> | undefined;
     let failure: unknown;
     try {
@@ -933,6 +1007,7 @@ class ClaudeSession implements ProviderSession {
           onCallEnded: (op) => this.onRelayCallEnded(op),
           allowTool: (n) => this.visibleTools.has(n),
           callTimeoutMs: input.relay.callTimeoutMs,
+          meter: this.meter,
         });
         this.relayEp = await this.relayOpening;
         if (this.closing || this.interrupted) return; // close() is waiting for this very endpoint and closes it (doClose)
@@ -958,11 +1033,20 @@ class ClaudeSession implements ProviderSession {
       this.handle = { conversationId: key };
       this.runner
         .send(this.handle, input.prompt, {
-          onEvent: (raw) => {
-            this.guarded(this.waiting?.call.operationId, () => this.noteStreamUse(raw));
-            for (const ev of normalizeClaudeEvent(raw)) events.push(ev, approxSize(ev));
-            if (events.overflowed) void this.close(); // the consumer is not keeping up: end the process rather than buffer without bound
-          },
+          // charged to the turn's CPU meter (nested inside the stdout section that delivered the line, so charged once)
+          onEvent: (raw) =>
+            this.meter.time(() => {
+              this.guarded(this.waiting?.call.operationId, () => this.noteStreamUse(raw));
+              const evs = normalizeClaudeEvent(raw);
+              // one line must not fan out into hundreds of thousands of events: normalized events per second are limited per turn
+              if (!this.eventBucket.take(evs.length)) {
+                this.noteBudget("event_flood");
+                void this.close();
+                return;
+              }
+              for (const ev of evs) events.push(ev, approxSize(ev));
+              if (events.overflowed) void this.close(); // the consumer is not keeping up: end the process rather than buffer without bound
+            }),
         })
         .then(
           (r) => {
@@ -1087,8 +1171,14 @@ class ClaudeSession implements ProviderSession {
 
 
 const MAX_STREAM_USES = 64;
+const EVENT_BURST = 2000;
+const EVENTS_PER_SEC = 200;
+const READ_BURST = 2000;
+const READS_PER_SEC = 1000;
+/** stderr is diagnostics only: at most this many bytes are ever forwarded to the runner. */
+const STDERR_FORWARD_CAP = 8192;
 /** At most this many content blocks of one assistant event are looked at, and a call whose frame is larger than this is never hashed. */
-const MAX_BLOCKS_PER_EVENT = 256;
+const MAX_BLOCKS_PER_EVENT = 32;
 const MAX_HASHED_CALL_BYTES = 64 * 1024;
 /** Hard budget of bytes canonicalized and hashed per turn (like the backend dispatcher's announce budget). */
 const TURN_HASH_BUDGET_BYTES = 8 * 1024 * 1024;
