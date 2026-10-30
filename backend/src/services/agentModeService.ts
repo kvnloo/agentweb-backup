@@ -532,7 +532,8 @@ import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } fro
 import { assertPublicHostname } from '../utils/ssrfGuard';
 import { getJwtSecret } from '../config/jwt';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString } from '../utils/s3Utils';
-import { isTransientLLMError, isProviderDeserializationError, extractAffordableTokens, PROVIDER_UNAVAILABLE_USER_MESSAGE } from '../utils/agentModeErrors';
+import { isTransientLLMError, isProviderDeserializationError, extractAffordableTokens, PROVIDER_UNAVAILABLE_USER_MESSAGE, QUOTA_EXHAUSTED_USER_MESSAGE } from '../utils/agentModeErrors';
+import { classifyOpenRouterQuotaExhaustion } from '../utils/openRouterKeyLimit';
 import { isLLMProviderOutage } from './agentMode/providerOutage';
 import { getAgentRunRecorder } from '../loops/instances/agent-mode';
 import { computeRunVerdict, type RunTerminalInfo } from '../loops/instances/agent-mode/runRecorder';
@@ -1066,6 +1067,10 @@ interface LLMCallOptions {
    * `provider` next to the shared order/fallback preferences. Normal chat never sets it.
    */
   providerPolicy?: CompareProviderPolicy | null;
+  /** Provider names OpenRouter must not route this request to; merged with any default ignore list. */
+  providerIgnore?: string[];
+  /** Treat a 200 with no answer as a failed, retryable attempt. For callers that need text back. */
+  requireContent?: boolean;
 }
 
 function nonNegativeTokenCount(value: unknown): number {
@@ -2527,6 +2532,8 @@ export class AgentModeService {
       customerRoutable = false,
       taskClass,
       providerPolicy,
+      providerIgnore,
+      requireContent,
     } = options || {};
 
     // ENG-2108: the funding for THIS call. A run starts AgentWeb-funded; this call moves
@@ -2585,6 +2592,9 @@ export class AgentModeService {
       // proposed the slug form once already and was reverted for this reason
       // — verify empirically against live traffic before changing this line.
       params.provider.ignore = ignoredProviders;
+    }
+    if (providerIgnore?.length) {
+      params.provider.ignore = [...new Set([...(params.provider.ignore ?? []), ...providerIgnore])];
     }
     if (providerPolicy) {
       params.provider = applyProviderPolicy(params.provider, providerPolicy);
@@ -2743,6 +2753,7 @@ export class AgentModeService {
     const res = await pickTransport(callFunding, model).send(client, model, params, {
       timeoutMs: timeoutMs ?? 5 * 60 * 1000,
       maxAttempts,
+      requireContent,
       isRetryableError: isRetryableLlmCallError,
       // Bound to the instance method, not a transport-local timer: this is the seam
       // agentModeService.openRouterClient.test.ts spies on to assert exact backoff
@@ -2803,6 +2814,9 @@ export class AgentModeService {
       (res as any)?.model,
       paramChain.map(m => ({ modelId: m.modelId, upstreamModel: m.upstreamModel })),
     ) ?? model;
+    if (meteredModel !== model) {
+      console.warn(`AgentMode: OpenRouter fallback served "${meteredModel}" instead of "${model}"`);
+    }
     // ENG-1816 F1: routed through recordLlmUsage, which decides funding ABOVE this
     // fire-and-forget funnel — see funding/recordLlmUsage.ts for why. Branch on
     // RunFunding.route, never on usage.is_byok below: that flag also fires for
@@ -4173,7 +4187,9 @@ export class AgentModeService {
           // OpenRouter performs provider/model failover inside the one request. A
           // transient failure here is therefore final for AgentWeb; do not issue a
           // second full completion with altered model semantics.
-          if (forceFinalSynthesis && turnHardCapMs !== undefined && isTransientLLMError(callError)) {
+          // ENG-2763: quota/credits exhaustion must reach the rethrow + quota classifier
+          // below; its 402 text can match the transient /5xx/ digit patterns.
+          if (forceFinalSynthesis && turnHardCapMs !== undefined && !classifyOpenRouterQuotaExhaustion(callError) && isTransientLLMError(callError)) {
             recordSpanError(chatSpan, callError);
             synthesisRetryUnaffordable = true;
           } else if (
@@ -5627,7 +5643,13 @@ export class AgentModeService {
       const httpStatus = error?.status ?? error?.$metadata?.httpStatusCode;
       // Check for context-limit patterns in the raw error message before falling through to generic 400
       const isContextLimit = /input is too long|context length|context window|token limit|too many tokens|prompt is too long|exceeds.*context|exceeded.*tokens|maximum.*tokens|messages.*exceed|request too large/i.test(errorMsg);
-      if (error?.code === 'content_filter' || error?.error?.code === 'ResponsibleAIPolicyViolation') {
+      if (classifyOpenRouterQuotaExhaustion(error)) {
+        // ENG-2763: OpenRouter key-limit / credits exhaustion is a known class that a
+        // retry cannot fix; name it so the controller answers 503 and alerts once per class.
+        // Checked first: the credits 402 text ("fewer max_tokens ... can only afford N")
+        // otherwise trips the context-limit/400 patterns below and ends in a 500.
+        userMessage = QUOTA_EXHAUSTED_USER_MESSAGE;
+      } else if (error?.code === 'content_filter' || error?.error?.code === 'ResponsibleAIPolicyViolation') {
         userMessage = 'I apologize, but I cannot respond to that request as it may violate content policies. Please try rephrasing your question or asking about something else.';
       } else if (httpStatus === 429) {
         userMessage = 'I\'m currently experiencing high demand. Please wait a moment and try again.';

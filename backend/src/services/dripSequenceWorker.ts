@@ -201,8 +201,18 @@ async function processEnrollment(
   // A failed READ is not "no such lead": sending on with no lead would skip every per-lead check (do-not-contact, a Smartlead marker). It throws,
   // so the enrollment is neither sent nor advanced and is retried on the next pass. (A lead that is simply gone still reads as null.)
   let leadReadFailed = false;
-  const lead = await crmDb.getLeadById(enrollment.listId, enrollment.leadId).catch(() => { leadReadFailed = true; return null; });
+  const lead = await crmDb.getLeadById(enrollment.listId, enrollment.leadId, { consistentRead: true }).catch(() => { leadReadFailed = true; return null; });
   if (leadReadFailed) throw new Error(`Could not read lead ${enrollment.leadId} for enrollment ${enrollment.enrollmentId}; will retry`);
+
+  // ENG-673: this send must not reach a contact that is gone or marked do-not-contact, whatever the sequence's exit settings say (a sequence saved
+  // with onUnsubscribe off, or an older one without the field, used to skip the check in checkExitConditions). Checked on the lead just read,
+  // right before the send, so it cannot be skipped by a second read failing.
+  if (!lead || isDoNotContact(lead)) {
+    console.log(`[dripWorker] Enrollment ${enrollment.enrollmentId} exited: ${lead ? 'lead is marked do-not-contact' : 'lead no longer exists'}`);
+    await dripSequenceDb.exitEnrollment(enrollment.enrollmentId, lead ? 'unsubscribed' : 'manual');
+    stats.exited++;
+    return;
+  }
 
   // Check enrollment condition — exit (not just skip) if lead no longer meets it
   if (sequence.enrollmentCondition) {
@@ -478,7 +488,7 @@ async function checkExitConditions(
     lead = await crmDb.getLeadById(enrollment.listId, enrollment.leadId).catch(() => null);
   }
 
-  // Check if lead has unsubscribed — always enforced (onUnsubscribe is always true)
+  // Check if lead has unsubscribed. (processEnrollment also checks right before the send, whatever this setting says.)
   if (exitConditions.onUnsubscribe && lead && isDoNotContact(lead)) {
     console.log(`[dripWorker] Enrollment ${enrollment.enrollmentId} exited: lead ${enrollment.leadEmail} has unsubscribed`);
     return 'unsubscribed';

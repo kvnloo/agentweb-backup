@@ -33,6 +33,12 @@ jest.mock('../services/db', () => ({
   },
 }));
 
+const mockBlockedRecipients = jest.fn().mockResolvedValue([]);
+jest.mock('../services/contactGuard', () => ({
+  blockedRecipients: (...a: any[]) => mockBlockedRecipients(...a),
+  blockedMessage: (b: string[]) => `Not sent: ${b.join(', ')} is marked do-not-contact`,
+}));
+
 jest.mock('../services/resendService', () => ({
   resendService: {
     sendEmail: jest.fn(),

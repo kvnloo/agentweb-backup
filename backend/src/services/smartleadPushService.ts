@@ -57,6 +57,11 @@ export interface PushServiceDeps {
     writeMarker: EngineDeps["writeMarker"];
   };
   smartlead: SmartleadApi;
+  /**
+   * Puts AgentWeb's event webhook (replies, bounces, unsubscribes) on the campaign before a run starts adding contacts (ENG-673, slice 3). Optional
+   * and best effort: it never delays or stops a push, and the opt-out sweep and the hourly fallback cover a missed registration.
+   */
+  registerEvents?(apiKey: string, accountId: string, campaignId: number): Promise<unknown>;
   secret: string;
   /** The kill switch. When false nothing starts, resumes or runs; pausing and canceling stay possible. */
   enabled(): boolean;
@@ -373,8 +378,12 @@ export class SmartleadPushService {
       if (campaign.status === "ACTIVE" && body.acknowledgements?.activeConfirmed !== true) return fail(400, "active_confirmation_required", "This campaign is already sending. Confirm that leads should start receiving mail at once.");
       const analysis = analyseSequence(await this.smartleadCall(key.key, () => this.deps.smartlead.getSequences(apiKey, token.campaignId)));
       if (analysis.hash !== token.sequenceHash) return fail(409, "sequence_changed", "The campaign's sequence changed after you previewed. Preview again.");
-      const preflight = preflightSequence(analysis, { status: campaign.status, mapping: token.mapping, acknowledgedTags: token.acknowledgedTags, acknowledgeUnreadable: token.acknowledgeUnreadable, addUnsubscribeTag: campaign.addUnsubscribeTag });
+      const preflight = preflightSequence(analysis, { status: campaign.status, mapping: token.mapping, acknowledgedTags: token.acknowledgedTags, acknowledgeUnreadable: token.acknowledgeUnreadable, addUnsubscribeTag: campaign.addUnsubscribeTag, unsubscribeText: campaign.unsubscribeText });
       if (preflight.blocks.length > 0) return fail(409, "blocked", "The campaign cannot be pushed to as it stands.", preflight.blocks);
+      // A campaign that is already sending and whose emails carry no unsubscribe link: people would be emailed with no way to opt out, so the user accepts that in words.
+      if (decision === "needs_confirmation" && preflight.missingUnsubscribe && body.acknowledgements?.noUnsubscribeAccepted !== true) {
+        return fail(400, "unsubscribe_acknowledgement_required", "This campaign is already sending and its emails have no unsubscribe link. Confirm that contacts may receive them without one, or set the unsubscribe text in Smartlead first.");
+      }
       if (token.eligible < 1) return fail(400, "nothing_to_push", "There is nothing to push.");
 
       // The approval is single use: replaying it would push another cohort (earlier runs' markers do not count toward a new run's ceiling).
@@ -412,7 +421,7 @@ export class SmartleadPushService {
           options: {
             includeUnverified: token.includeUnverified, mapping: token.mapping, acknowledgedTags: token.acknowledgedTags, startStatus: token.startStatus, warnings: token.warnings,
             approvedAt: new Date(token.iat).toISOString(),
-            acknowledgements: { lawfulBasis: true, ...(campaign.status === "ACTIVE" ? { activeConfirmed: true } : {}) },
+            acknowledgements: { lawfulBasis: true, ...(campaign.status === "ACTIVE" ? { activeConfirmed: true } : {}), ...(decision === "needs_confirmation" && preflight.missingUnsubscribe ? { noUnsubscribeAccepted: true } : {}) },
           },
           sequenceHash: token.sequenceHash, previewEligible: token.eligible,
         },
@@ -575,6 +584,7 @@ export class SmartleadPushService {
         return;
       }
       const apiKey = resolved.apiKey;
+      await this.registerEvents(apiKey, run);
       const engineDeps: EngineDeps = {
         store: this.deps.db,
         readLeads: (l, a, n) => this.deps.crm.readLeads(l, a, n),
@@ -596,6 +606,23 @@ export class SmartleadPushService {
       this.deps.log(`[SmartleadPush] run=${run.runId} ${outcome.outcome}${"reason" in outcome ? ` (${outcome.reason})` : ""}`);
     } catch (error) {
       this.deps.log(`[SmartleadPush] run=${run.runId} worker error: ${scrubSmartleadSecrets(error instanceof Error ? error.message : String(error))}`);
+    }
+  }
+
+  /** Registers the event webhook for this run's campaign; every failure is logged and swallowed. */
+  private async registerEvents(apiKey: string, run: PushRun): Promise<void> {
+    if (!this.deps.registerEvents) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await Promise.race([
+        this.deps.registerEvents(apiKey, run.smartleadAccountId, run.campaignId),
+        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("timed out")), 15_000); }),
+      ]);
+      this.deps.log(`[SmartleadPush] run=${run.runId} event webhook: ${String(result)}`);
+    } catch (error) {
+      this.deps.log(`[SmartleadPush] run=${run.runId} event webhook not registered: ${scrubSmartleadSecrets(error instanceof Error ? error.message : String(error))}`);
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 

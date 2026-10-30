@@ -447,6 +447,12 @@ export async function findLeadIdByEmail(apiKey: string, email: string, opts: { m
 export interface SmartleadCampaignDetail extends SmartleadCampaignSummary {
   /** Whether Smartlead adds its own unsubscribe link to each email (the sequence check warns when it does not and the body has none). */
   addUnsubscribeTag?: boolean;
+  /**
+   * The campaign's unsubscribe footer text. Verified with received emails (2026-10-28): Smartlead adds the unsubscribe link (and the
+   * List-Unsubscribe header) only when `add_unsubscribe_tag` is on AND this text is set; with the setting on and the text empty it adds
+   * nothing. `null` here means the campaign has no text; absent means Smartlead did not say.
+   */
+  unsubscribeText?: string | null;
 }
 
 /**
@@ -468,7 +474,108 @@ export async function getCampaign(apiKey: string, campaignId: number, opts: { ma
     status: String(row.status ?? "").toUpperCase(),
     maxLeadsPerDay: asLimit(row.max_leads_per_day),
     ...(typeof row.add_unsubscribe_tag === "boolean" ? { addUnsubscribeTag: row.add_unsubscribe_tag } : {}),
+    ...("unsubscribe_text" in row ? { unsubscribeText: typeof row.unsubscribe_text === "string" ? row.unsubscribe_text : null } : {}),
   };
+}
+
+export type SmartleadEmailStatus = "is_replied" | "is_bounced" | "is_unsubscribed" | "is_sender_bounced";
+
+export interface SmartleadLeadRow {
+  /** Smartlead's own lead id. */
+  leadId: string;
+  email: string;
+  /** Smartlead's own flag on the lead (`lead.is_unsubscribed`); true after an unsubscribe by link, by us through the API, or by the customer. */
+  unsubscribed: boolean;
+}
+
+/**
+ * One page of a campaign's contacts, optionally only those Smartlead says replied or bounced (`GET /campaigns/{id}/leads?emailStatus=...`; verified
+ * live 2026-10-30: `{total_leads (a string), data[{campaign_lead_map_id, status, lead{id, email, is_unsubscribed, ...}}], offset, limit}`, and an
+ * unknown emailStatus is a 400 that names the allowed values). It carries no timestamp and no message text, so it can only say THAT a contact did
+ * it. LIVE FINDING: the `is_unsubscribed` filter does NOT list a contact unsubscribed through the API (it stays empty although the contact is
+ * `BLOCKED` with `lead.is_unsubscribed: true`), and `status=BLOCKED` is not an allowed filter, so opt-outs are found by reading the pages with no
+ * filter and keeping the rows whose own flag is set. That listing lags behind a large add, which is harmless here: the poll only ever acts on a row
+ * that IS there, so a lagging page just means a contact is found on a later pass. A row without a usable id or address is dropped; a reply that
+ * is not this shape is an error, never "nobody".
+ */
+export async function listCampaignLeadsByEmailStatus(
+  apiKey: string,
+  campaignId: number,
+  emailStatus: SmartleadEmailStatus | null,
+  opts: { offset?: number; limit?: number; maxRetries?: number } = {},
+): Promise<{ total: number; rows: SmartleadLeadRow[] }> {
+  assertCampaignId(campaignId);
+  const limit = Math.min(Math.max(opts.limit ?? 100, 1), 100);
+  const offset = Math.max(opts.offset ?? 0, 0);
+  const data = await smartleadRequest<unknown>(apiKey, "GET", `/campaigns/${encodeURIComponent(String(campaignId))}/leads`, {
+    params: { ...(emailStatus ? { emailStatus } : {}), limit, offset },
+    maxRetries: opts.maxRetries,
+  });
+  if (!data || typeof data !== "object" || Array.isArray(data) || !Array.isArray((data as { data?: unknown }).data)) {
+    throw new SmartleadUnexpectedResponseError("Smartlead GET /campaigns/{id}/leads returned an unexpected response");
+  }
+  const body = data as { total_leads?: unknown; data: Array<Record<string, any> | null> };
+  const total = asWholeNumber(body.total_leads);
+  if (total === undefined || total < 0) throw new SmartleadUnexpectedResponseError("Smartlead GET /campaigns/{id}/leads returned no usable total");
+  const rows: SmartleadLeadRow[] = [];
+  for (const row of body.data) {
+    const lead = row?.lead;
+    const id = lead && typeof lead === "object" ? (typeof lead.id === "number" || typeof lead.id === "string" ? String(lead.id) : "") : "";
+    const address = lead && typeof lead.email === "string" ? lead.email.trim().toLowerCase() : "";
+    if (id && address.includes("@")) rows.push({ leadId: id, email: address, unsubscribed: lead.is_unsubscribed === true });
+  }
+  return { total, rows };
+}
+
+export interface SmartleadWebhook {
+  id: number;
+  name: string;
+  url: string;
+  eventTypes: string[];
+}
+
+/**
+ * The webhooks registered on one campaign. Verified live (2026-10-30): `GET /campaigns/{id}/webhooks` answers a bare array of
+ * `{id, name, webhook_url, event_types, categories, ...}` (an empty array when there are none). Anything else is an error, so an odd reply can
+ * never be read as "no webhooks" and trigger a duplicate registration.
+ */
+export async function listCampaignWebhooks(apiKey: string, campaignId: number, opts: { maxRetries?: number } = {}): Promise<SmartleadWebhook[]> {
+  assertCampaignId(campaignId);
+  const data = await smartleadRequest<unknown>(apiKey, "GET", `/campaigns/${encodeURIComponent(String(campaignId))}/webhooks`, { maxRetries: opts.maxRetries });
+  if (!Array.isArray(data)) throw new SmartleadUnexpectedResponseError("Smartlead GET /campaigns/{id}/webhooks returned an unexpected response");
+  const out: SmartleadWebhook[] = [];
+  for (const row of data) {
+    if (!row || typeof row !== "object") continue;
+    const r = row as Record<string, unknown>;
+    const id = asWholeNumber(r.id);
+    if (id === undefined) continue;
+    out.push({ id, name: String(r.name ?? ""), url: String(r.webhook_url ?? ""), eventTypes: Array.isArray(r.event_types) ? r.event_types.filter((e): e is string => typeof e === "string") : [] });
+  }
+  return out;
+}
+
+/** Creates a campaign webhook, or updates the one with `id` (the same POST; verified live 2026-10-30). Returns its id. */
+export async function saveCampaignWebhook(
+  apiKey: string,
+  campaignId: number,
+  input: { id?: number; name: string; url: string; eventTypes: string[] },
+  opts: { maxRetries?: number } = {},
+): Promise<number> {
+  assertCampaignId(campaignId);
+  const data = await smartleadRequest<unknown>(apiKey, "POST", `/campaigns/${encodeURIComponent(String(campaignId))}/webhooks`, {
+    data: { ...(input.id !== undefined ? { id: input.id } : {}), name: input.name, webhook_url: input.url, event_types: input.eventTypes },
+    maxRetries: opts.maxRetries,
+  });
+  const id = data && typeof data === "object" ? asWholeNumber((data as Record<string, unknown>).id) : undefined;
+  if (id === undefined) throw new SmartleadUnexpectedResponseError("Smartlead POST /campaigns/{id}/webhooks returned an unexpected response");
+  return id;
+}
+
+/** Deletes one campaign webhook: `DELETE /campaigns/{id}/webhooks` with `{id}` in the body (verified live 2026-10-30). */
+export async function deleteCampaignWebhook(apiKey: string, campaignId: number, webhookId: number, opts: { maxRetries?: number } = {}): Promise<void> {
+  assertCampaignId(campaignId);
+  const data = await smartleadRequest<unknown>(apiKey, "DELETE", `/campaigns/${encodeURIComponent(String(campaignId))}/webhooks`, { data: { id: webhookId }, maxRetries: opts.maxRetries });
+  if (!data || typeof data !== "object" || (data as Record<string, unknown>).ok !== true) throw new SmartleadUnexpectedResponseError("Smartlead DELETE /campaigns/{id}/webhooks did not confirm the delete");
 }
 
 /**
@@ -547,7 +654,8 @@ export interface SmartleadAddLeadsResult {
   limitExhausted: boolean;
   /**
    * Per-lead truth from `return_lead_ids`: lower-cased email to Smartlead lead id, split into leads newly added, leads
-   * already in this campaign, and leads that already existed only in another campaign (those are added to this one too).
+   * already in this campaign, and leads that already exist in another campaign (with ignore_duplicate_leads_in_other_campaign on, those are
+   * skipped and NOT added here; verified live 2026-10-28).
    * Undefined if Smartlead sent no map.
    */
   leads?: {
@@ -576,14 +684,22 @@ const toStringList = (value: unknown): string[] =>
   Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : [];
 
 /**
- * Add up to 400 leads to a campaign the customer already made. The block-list/duplicate overrides are sent as
- * false on purpose (all four overrides in the reference): AgentWeb never asks Smartlead to bypass its own protection.
+ * Add up to 400 leads to a campaign the customer already made. The block-list, unsubscribe-list and bounce-list overrides are sent as
+ * false on purpose: AgentWeb never asks Smartlead to bypass its own protection. Leads already in another campaign are skipped
+ * (ignore_duplicate_leads_in_other_campaign: true), so nobody is emailed by two campaigns.
  * `return_lead_ids` is always on: it makes Smartlead say, per lead, whether it was newly added, was already in this
  * campaign, or already existed in another one, and gives the Smartlead lead id (needed to pause or unsubscribe a lead later).
  *
  * The reply shape here is the one a live Smartlead account returned on 2026-10-27, which differs from its docs:
  * `upload_count` is everything submitted, `total_leads` is what was newly added. A reply with no count we recognise
  * is an error, never "0 added" and never success. Retrying a 429 is safe: a rate-limited request added nothing.
+ *
+ * Do not verify an add by re-reading the campaign's lead listing right afterwards (GET /campaigns/{id}/leads, or Smartlead's MCP list): that
+ * listing can lag behind a large add. Seen once, on production on 2026-10-29: after a 450-lead add (one lead was already in the campaign, so 451
+ * in all) it showed 1 lead for several minutes, while the account-wide lead total and a status-filtered listing (`status=STARTED`) were right
+ * immediately. The cause, the size at which it starts, how long it lasts, and whether the status filter is always reliable are all unconfirmed.
+ * Treat THIS response (per-lead outcome and ids from `return_lead_ids`) as the source of truth; any check or test that counts a campaign's leads
+ * should wait for the listing to settle, or use the account total or a status filter, and say so if it is wrong.
  */
 export async function addLeadsToCampaign(
   apiKey: string,
@@ -612,7 +728,9 @@ export async function addLeadsToCampaign(
       settings: {
         ignore_global_block_list: false,
         ignore_unsubscribe_list: false,
-        ignore_duplicate_leads_in_other_campaign: false,
+        // TRUE skips a lead that is already in another of the account's campaigns (verified live 2026-10-28: skipped_in_other_campaign_count
+        // counts it and the map lists it under existingLeadsInOtherCampaigns); FALSE adds it anyway, so it would be emailed by both campaigns.
+        ignore_duplicate_leads_in_other_campaign: true,
         ignore_community_bounce_list: false,
         return_lead_ids: true,
       },

@@ -79,6 +79,13 @@ jest.mock('../services/asyncJobQueue', () => ({
     registerProcessor: jest.fn(),
 }));
 
+// ENG-673: the webhook cleanup for a removed Smartlead connection. The ORDER matters: find the key, delete the connection, THEN run the cleanup.
+const smartleadOrder: string[] = [];
+const mockPrepareSmartleadCleanup = jest.fn();
+jest.mock('../services/smartleadEventCleanup', () => ({
+    prepareSmartleadEventCleanup: (...a: any[]) => mockPrepareSmartleadCleanup(...a),
+}));
+
 const app = express();
 app.use(express.json());
 app.use('/api/oauth', connectedAccountsRouter);
@@ -608,6 +615,49 @@ describe('Connected Accounts Routes', () => {
             expect(response.status).toBe(200);
             expect(response.body.accounts).toHaveLength(1);
             expect(response.body.accounts[0].account_id).toBe('uni-own-001');
+        });
+    });
+
+    describe('removing a Smartlead connection takes AgentWeb\'s webhook off the campaigns, after the connection is gone (ENG-673)', () => {
+        beforeEach(() => {
+            smartleadOrder.length = 0;
+            mockPrepareSmartleadCleanup.mockImplementation(async () => { smartleadOrder.push('prepare'); return { run: async () => { smartleadOrder.push('run'); return null; } }; });
+            (connectedAccountsDb.deleteAccount as jest.Mock).mockImplementation(async () => { smartleadOrder.push('delete'); });
+            (connectedAccountsDb.deleteAccountById as jest.Mock).mockImplementation(async () => { smartleadOrder.push('delete'); });
+        });
+        const settle = () => new Promise(r => setImmediate(r));
+
+        it('finds the key first, deletes the connection, then runs the cleanup (platform route)', async () => {
+            const response = await request(app).delete('/api/oauth/connected-accounts/smartlead');
+            await settle();
+            expect(response.status).toBe(200);
+            expect(smartleadOrder).toEqual(['prepare', 'delete', 'run']);
+            expect(mockPrepareSmartleadCleanup).toHaveBeenCalledWith('test_user_id', 'smartlead-test_user_id');
+        });
+
+        it('the same on the per-account route, for the caller\'s OWN connection only', async () => {
+            await request(app).delete('/api/oauth/connected-accounts/smartlead/smartlead-test_user_id');
+            await settle();
+            expect(smartleadOrder).toEqual(['prepare', 'delete', 'run']);
+            smartleadOrder.length = 0;
+            mockPrepareSmartleadCleanup.mockClear();
+            await request(app).delete('/api/oauth/connected-accounts/smartlead/smartlead-someone_else');
+            await settle();
+            expect(smartleadOrder).toEqual(['delete']); // a teammate's connection: nothing of theirs is touched
+            expect(mockPrepareSmartleadCleanup).not.toHaveBeenCalled();
+        });
+
+        it('does not run the cleanup, and does not claim success, when the delete fails', async () => {
+            (connectedAccountsDb.deleteAccount as jest.Mock).mockImplementation(async () => { smartleadOrder.push('delete'); throw new Error('DB error'); });
+            const response = await request(app).delete('/api/oauth/connected-accounts/smartlead');
+            await settle();
+            expect(response.status).toBe(500);
+            expect(smartleadOrder).toEqual(['prepare', 'delete']);
+        });
+
+        it('other platforms do not touch it', async () => {
+            await request(app).delete('/api/oauth/connected-accounts/gmail');
+            expect(mockPrepareSmartleadCleanup).not.toHaveBeenCalled();
         });
     });
 

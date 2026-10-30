@@ -23,7 +23,7 @@ import AdmZip from 'adm-zip';
 import { emailEventsDb } from '../services/emailEventsDb';
 import { dynamodb } from '../config/aws';
 import { io } from '../server';
-import { isDoNotContact } from '../utils/leadContactStatus';
+import { isDoNotContact, getDoNotContactReason } from '../utils/leadContactStatus';
 import { isPushedToSmartlead } from '../services/smartleadMarkers';
 import { contactSuppressionAuditEnabled, contactSuppressionAuditEvent, guardLeadPutBody, leadWriteChannel, touchesContactSuppression } from '../utils/leadWriteGuard';
 import { suppressLeadSideEffects } from '../utils/sessionList';
@@ -34,6 +34,8 @@ import { isEligibleGroupEmailRecipient } from '../utils/groupEmailRecipientValid
 import { syncContact, SyncInput } from '../services/contactSyncService';
 import { isCardRevenueField } from '../services/enrichmentGroups';
 import { stripImplicitCardRevenueRouting } from '../services/enrichmentConfigService';
+import { estimateEnrichmentCost,
+  normalizeLeadSelection, checkEstimateConfirmation } from '../services/enrichmentCostEstimate';
 import { enrichContact, defaultEnrichmentCache, EnrichmentDeps } from '../services/internalEnrichmentService';
 import { dedupContactsForUser } from '../services/contactDedupService';
 import {
@@ -1821,6 +1823,46 @@ router.post('/lists/:listId/enrichment-config/suggest-types', async (req: Reques
   }
 });
 
+/** ENG-2716: count the leads an enrich-v3 run would touch (leadIds subset or whole list). */
+const countLeadsForEnrichment = async (listId: string, leadIds?: string[]): Promise<number> => {
+  if (leadIds) return leadIds.length;
+  let total = 0;
+  let lastKey: any = undefined;
+  do {
+    const batch = await crmDb.getLeadsByListId(listId, 200, lastKey);
+    total += batch.items.length;
+    lastKey = batch.lastEvaluatedKey;
+  } while (lastKey);
+  return total;
+};
+
+const parseLeadIds = (body: any): string[] | undefined => normalizeLeadSelection(body?.leadIds);
+
+/**
+ * @route POST /api/crm/lists/:listId/leads/enrich-v3/estimate
+ * @desc ENG-2716: pre-run cost estimate + confirmation token. Pure estimate,
+ *       no vendor calls. Client echoes `confirmationToken` as
+ *       `confirmEstimateToken` on the enrich-v3 POST.
+ * @access Private
+ */
+router.post('/lists/:listId/leads/enrich-v3/estimate', async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+    const { listId } = req.params;
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) return res.status(404).json({ message: 'Lead list not found' });
+    if (!(await canDestructiveCrmList(userId, list))) {
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
+    }
+    const count = await countLeadsForEnrichment(listId, parseLeadIds(req.body));
+    return res.json(estimateEnrichmentCost(listId, count));
+  } catch (error) {
+    console.error('[v3][route] enrich-v3 estimate failed:', error);
+    return res.status(500).json({ message: 'Enrichment estimate failed' });
+  }
+});
+
 /**
  * @route POST /api/crm/lists/:listId/leads/enrich-v3?mode=preview|enrich
  * @desc Run the v3.1 enrichment waterfall on all leads in the list using the
@@ -1891,9 +1933,26 @@ router.post('/lists/:listId/leads/enrich-v3', async (req: Request, res: Response
     }
 
     const refreshFields = Array.isArray(req.body?.refreshFields) ? req.body.refreshFields : undefined;
-    const leadIds = Array.isArray(req.body?.leadIds)
-      ? req.body.leadIds.filter((id: unknown): id is string => typeof id === 'string')
-      : undefined;
+    const leadIds = parseLeadIds(req.body);
+    if (mode === 'enrich') {
+      // ENG-2716: a supplied estimate token must match the current estimate;
+      // a missing one is rejected only once the portal confirm dialog ships.
+      const supplied = req.body?.confirmEstimateToken;
+      const required = process.env.ENRICH_V3_REQUIRE_COST_CONFIRMATION === 'true';
+      if (supplied !== undefined || required) {
+        const estimate = estimateEnrichmentCost(listId, await countLeadsForEnrichment(listId, leadIds));
+        const check = checkEstimateConfirmation(supplied, estimate, required);
+        if (!check.ok) {
+          return res.status(409).json({
+            message: check.reason === 'missing'
+              ? 'Confirm the enrichment cost estimate before starting.'
+              : 'The enrichment cost estimate changed. Review and confirm the new estimate.',
+            code: 'ENRICH_ESTIMATE_CONFIRMATION_REQUIRED',
+            estimate,
+          });
+        }
+      }
+    }
     // ENG-1388: user-initiated runs may use Enigma card revenue (flag/allowlist-gated).
     const deps = buildV3OrchestratorDeps(userId, { enigma: true });
     const socketId = typeof req.body?.socketId === 'string' ? req.body.socketId : undefined;
@@ -6552,6 +6611,11 @@ router.post('/lists/:listId/leads/:leadId/send-email', async (req: Request, res:
       return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
+    // ENG-673: a contact marked do-not-contact (unsubscribed, bounced, opted out, or reported by Smartlead) is never emailed from AgentWeb. No override.
+    if (isDoNotContact(lead)) {
+      return res.status(409).json({ code: 'do_not_contact', message: `Not sent: this contact is marked do-not-contact (${getDoNotContactReason(lead) ?? 'do-not-contact'}). Change their status first if that is wrong.` });
+    }
+
     // ENG-673: this contact is being emailed through the customer's Smartlead campaign. A person sending ONE email by hand may still want to, so
     // this is a confirmation (the portal asks), not a block; bulk and automated sends skip such leads outright.
     if (isPushedToSmartlead(lead) && req.body?.confirmPushedToSmartlead !== true) {
@@ -6638,6 +6702,11 @@ router.post('/lists/:listId/leads/:leadId/reply-email', async (req: Request, res
     const list = await crmDb.getLeadListById(listId);
     if (!list || !(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
+    }
+
+    // ENG-673: a contact marked do-not-contact (unsubscribed, bounced, opted out, or reported by Smartlead) is never emailed from AgentWeb. No override.
+    if (isDoNotContact(lead)) {
+      return res.status(409).json({ code: 'do_not_contact', message: `Not sent: this contact is marked do-not-contact (${getDoNotContactReason(lead) ?? 'do-not-contact'}). Change their status first if that is wrong.` });
     }
 
     // ENG-266 Part 3: route through the sender's real provider, same fallback as send-email.
