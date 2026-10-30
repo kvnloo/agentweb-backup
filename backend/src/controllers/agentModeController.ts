@@ -61,7 +61,7 @@ import { CHAT_BRANCHING_ENABLED_SETTING, isChatBranchingSettingEnabled, healLega
 import { compareSaveAlternatives } from '../services/agentMode/compareSaveAlternativesInstance';
 import { LEGACY_MODEL_ALIASES } from '../services/agentMode/llmModelRegistry';
 import { resolveRunFunding } from '../services/funding/runFunding';
-import { isContextLimitError, isProviderNoEndpointsError, isSessionLimitError, isTransientLLMError, isProviderDeserializationError, PROVIDER_DESERIALIZATION_ERROR_CLASS, isWorkerShutdownError, isDrainCeilingShutdownError, isProviderUnavailableError } from '../utils/agentModeErrors';
+import { isContextLimitError, isProviderNoEndpointsError, isSessionLimitError, isTransientLLMError, isProviderDeserializationError, PROVIDER_DESERIALIZATION_ERROR_CLASS, isWorkerShutdownError, isDrainCeilingShutdownError, isProviderUnavailableError, isQuotaExhaustedError, QUOTA_EXHAUSTED_USER_MESSAGE } from '../utils/agentModeErrors';
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
@@ -731,6 +731,30 @@ function wasRaisedAfterUserMessageSaved(error: unknown): boolean {
  */
 function sendRefusalBody<T extends object>(body: T, userMessageSaved: boolean): T & { userMessageSaved: boolean } {
   return { ...body, userMessageSaved };
+}
+
+/**
+ * ENG-2763: one oncall alert per OpenRouter quota-exhaustion class (not per occurrence /
+ * per user). The key stays exhausted until a monthly reset or a limit raise, so a 6h
+ * window keeps it to one open page instead of an "Unknown Error" filing per message.
+ */
+export const QUOTA_EXHAUSTED_ALERT_WINDOW_MS = 6 * 60 * 60 * 1000;
+
+export function sendQuotaExhaustedAlert(error: unknown, sessionId?: string): void {
+  const originalMessage = (error as any)?.originalMessage || (error as any)?.message || 'Unknown error';
+  const quota = classifyOpenRouterQuotaExhaustion((error as any)?.originalError ?? { message: originalMessage });
+  sendAgentModeOncallAlert({
+    dedupeKey: `agent_mode:${OPENROUTER_QUOTA_ALERT_CLASS}`,
+    dedupeWindowMs: QUOTA_EXHAUSTED_ALERT_WINDOW_MS,
+    subject: 'Agent Mode: OpenRouter quota exhausted',
+    message: `Agent Mode generation is failing because the OpenRouter key/credits are exhausted.\n\nError: ${originalMessage}`,
+    sessionId,
+    context: {
+      'Alert Class': OPENROUTER_QUOTA_ALERT_CLASS,
+      ...(quota?.kind ? { 'Quota Kind': quota.kind } : {}),
+      ...(quota?.resetAt ? { 'Resets At': quota.resetAt } : {}),
+    },
+  }).catch(err => console.error('Failed to send quota-exhausted oncall alert:', err));
 }
 
 /**
@@ -12158,6 +12182,18 @@ export const agentModeController = {
               ),
               artifactUrls,
             );
+          } else if (isQuotaExhaustedError(error)) {
+            // ENG-2763: persist the quota message, not diagnosis/retry advice, so a
+            // reload agrees with the 503 PROVIDER_QUOTA_EXHAUSTED response.
+            publishLedger = (await loadPublishLedger(sessionId, turnStartCalledFunctions)) || [];
+            artifactUrls = await loadConfirmedArtifactUrls(sessionId, turnStartMsForDiagnosis);
+            diagnosticContent = appendConfirmedArtifactNotice(
+              appendConfirmedDataWriteNotice(
+                appendConfirmedPublishNotice(QUOTA_EXHAUSTED_USER_MESSAGE, publishLedger),
+                publishLedger,
+              ),
+              artifactUrls,
+            );
           } else {
             const userMessage = req.body?.userMessage || '';
             const diagnosis = await getDiagnosticErrorMessage(
@@ -12318,6 +12354,19 @@ export const agentModeController = {
             code: 'RATE_LIMIT',
             suggestion: 'wait_and_retry'
           });
+          return;
+        }
+
+        // ENG-2763: OpenRouter key-limit / credits exhaustion is a known class, not an
+        // unknown error: answer 503 and page once per class, not once per occurrence.
+        if (isQuotaExhaustedError(error)) {
+          sendQuotaExhaustedAlert(error, req.body?.sessionId);
+          res.status(503).json(sendRefusalBody({
+            error: 'AI service at capacity',
+            message: error.message,
+            code: 'PROVIDER_QUOTA_EXHAUSTED',
+            suggestion: 'wait'
+          }, wasRaisedAfterUserMessageSaved(error)));
           return;
         }
 
@@ -13379,6 +13428,17 @@ export const agentModeController = {
               ),
               artifactUrls,
             );
+          } else if (isQuotaExhaustedError(error)) {
+            // ENG-2763: see the matching branch in generateResponse.
+            publishLedger = (await loadPublishLedger(shareId, turnStartCalledFunctions)) || [];
+            artifactUrls = await loadConfirmedArtifactUrls(shareId, sharedTurnStartMs);
+            diagnosticContent = appendConfirmedArtifactNotice(
+              appendConfirmedDataWriteNotice(
+                appendConfirmedPublishNotice(QUOTA_EXHAUSTED_USER_MESSAGE, publishLedger),
+                publishLedger,
+              ),
+              artifactUrls,
+            );
           } else {
             const userMessage = req.body?.userMessage || '';
             const diagnosis = await getDiagnosticErrorMessage(error, shareId, userMessage, turnStartCalledFunctions, sharedTurnStartMs);
@@ -13515,6 +13575,19 @@ export const agentModeController = {
             code: 'RATE_LIMIT',
             suggestion: 'wait_and_retry'
           });
+          return;
+        }
+
+        // ENG-2763: OpenRouter key-limit / credits exhaustion is a known class, not an
+        // unknown error: answer 503 and page once per class, not once per occurrence.
+        if (isQuotaExhaustedError(error)) {
+          sendQuotaExhaustedAlert(error, req.params?.shareId);
+          res.status(503).json(sendRefusalBody({
+            error: 'AI service at capacity',
+            message: error.message,
+            code: 'PROVIDER_QUOTA_EXHAUSTED',
+            suggestion: 'wait'
+          }, wasRaisedAfterUserMessageSaved(error)));
           return;
         }
 
@@ -16884,6 +16957,19 @@ export const agentModeController = {
           return;
         }
 
+        // ENG-2763: OpenRouter key-limit / credits exhaustion is a known class, not an
+        // unknown error: answer 503 and page once per class, not once per occurrence.
+        if (isQuotaExhaustedError(error)) {
+          sendQuotaExhaustedAlert(error, (req as any).conversableSession?.sessionId);
+          res.status(503).json(sendRefusalBody({
+            error: 'AI service at capacity',
+            message: error.message,
+            code: 'PROVIDER_QUOTA_EXHAUSTED',
+            suggestion: 'wait'
+          }, wasRaisedAfterUserMessageSaved(error)));
+          return;
+        }
+
         // ENG-2381: a final upstream provider 5xx is an outage, not an unknown error.
         if (isProviderUnavailableError(error)) {
           res.status(503).json(sendRefusalBody({
@@ -17862,6 +17948,17 @@ export const agentModeController = {
           code: 'PROVIDER_UNAVAILABLE',
           suggestion: 'wait_and_retry',
         });
+      }
+      // ENG-2763: OpenRouter key-limit / credits exhaustion — same 503 + once-per-class
+      // alert as the other generate chains, not a 500 + per-run page.
+      if ((isQuotaExhaustedError(error) || classifyOpenRouterQuotaExhaustion(error)) && !res.headersSent) {
+        sendQuotaExhaustedAlert(error, req.body?.sessionId);
+        return res.status(503).json(sendRefusalBody({
+          error: 'AI service at capacity',
+          message: QUOTA_EXHAUSTED_USER_MESSAGE,
+          code: 'PROVIDER_QUOTA_EXHAUSTED',
+          suggestion: 'wait'
+        }, wasRaisedAfterUserMessageSaved(error)));
       }
       console.error('AgentMode: Verified generate error:', error);
       const sessionId = req.body?.sessionId;
