@@ -154,6 +154,7 @@ describe("CpuMeter clamps and listeners", () => {
   it("MUTATION TARGET: a negative charge gives no credit", () => {
     const m = new CpuMeter(100, 0, () => 0);
     m.charge(-1000);
+    expect(m.remaining).toBeLessThanOrEqual(100); // never above the burst
     m.charge(150);
     expect(m.exhausted).toBe(true);
   });
