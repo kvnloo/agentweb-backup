@@ -23,7 +23,7 @@ import { buildMcpAuthChallenge } from '../oauth/authChallenge';
 export { buildMcpAuthChallenge };
 import { anonymousUserIdForSession, isAnonymousDiscoveryEnabled, isAnonymouslyPermitted } from "./anonymousTransport";
 import { isCronEnabled } from '../../utils/instanceState';
-import { effectiveApiKeyScopes, findScopeDenial } from './apiKeyScopes';
+import { effectiveApiKeyScopes, findApiKeyOnlyToolCall, findScopeDenial } from './apiKeyScopes';
 import { mcpToolRegistry } from './registry';
 
 // Rate limiter for MCP requests authenticated via aw_* API keys
@@ -315,6 +315,21 @@ export function setupMcpServer(
           error: {
             code: -32003,
             message: `Forbidden: API key lacks scope '${denial.requiredScope}' required for tool '${denial.tool}'. Create a key with that scope at https://agentweb.pro (Settings > API Keys).`,
+          },
+          id: Array.isArray(req.body) ? null : (req.body?.id ?? null),
+        });
+      }
+    }
+    // Opt-in-scope tools (e.g. read_email / email:read) are for explicitly scoped
+    // aw_ keys only — refuse every other external auth method per request.
+    if ((req as any)._mcpIsInternal !== true && (req as any)._mcpAuthMethod !== 'api_key') {
+      const denial = findApiKeyOnlyToolCall(req.body, (name) => mcpToolRegistry.getTool(name));
+      if (denial) {
+        return res.status(403).json({
+          jsonrpc: '2.0',
+          error: {
+            code: -32003,
+            message: `Forbidden: tool '${denial.tool}' is only available to API keys granted the '${denial.requiredScope}' scope.`,
           },
           id: Array.isArray(req.body) ? null : (req.body?.id ?? null),
         });
