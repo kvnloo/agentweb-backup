@@ -352,6 +352,16 @@ describe("the hourly event poll (ENG-673)", () => {
       expect(__pendingBounceCount()).toBe(0); // 25 h unseen: gone
     });
 
+    it("the sweep goes by when a contact was last SEEN, not first: one bounced and failing for 30 hours keeps its record", async () => {
+      const w = world({ campaignSize: 1000, leads: { is_bounced: { 77: rows(1, "b") } } });
+      let attempts = 0;
+      const d = deps(w, { ...on, events: { handle: async () => { attempts++; throw new Error("db down"); } } });
+      await eventPoll(d);
+      for (let i = 0; i < 30; i++) { clock += hour; await eventPoll(d); }
+      expect(__pendingBounceCount()).toBe(1);
+      expect(attempts).toBe(30); // tried on every pass after the first: a sweep by first-seen would have deleted the record at 25 h and restarted the wait (one pass without an attempt)
+    });
+
     it("a campaign polled only every few passes still completes its wait (the wait is not restarted by a 3 h gap)", async () => {
       const w = world({ campaignSize: 1000, leads: { is_bounced: { 77: rows(1, "b") } } });
       const d = deps(w, on);
