@@ -6703,6 +6703,10 @@ emmaToolRegistry.register({
           if (!args.to) return { error: 'send action requires a "to" parameter.' };
           if (!args.subject) return { error: 'send action requires a "subject" parameter.' };
           if (!args.body) return { error: 'send action requires a "body" parameter.' };
+          // ENG-673: an address-only send must not reach a contact marked do-not-contact (this path skips sendAsSender).
+          const { blockedRecipients, blockedMessage } = await import('../services/contactGuard');
+          const blocked = await blockedRecipients([userId, ownerUserId], args.to, args.cc, args.bcc);
+          if (blocked.length > 0) return { error: blockedMessage(blocked), blocked };
           const result = await provider.sendEmail(ownerUserId, args.account_id, {
             to: args.to,
             subject: args.subject,

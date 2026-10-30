@@ -348,6 +348,10 @@ router.post('/email', async (req: Request, res: Response) => {
         break;
       }
       case 'send': {
+        // ENG-673: an address-only send must not reach a contact marked do-not-contact.
+        const { blockedRecipients, blockedMessage } = await import('../services/contactGuard');
+        const blocked = await blockedRecipients([userId(req), ownerUserId], req.body.to, req.body.cc, req.body.bcc);
+        if (blocked.length > 0) return res.status(409).json({ code: 'do_not_contact', message: blockedMessage(blocked), blocked });
         const sendResult = await provider.sendEmail(ownerUserId, req.body.account_id, {
           to: req.body.to,
           subject: req.body.subject,
