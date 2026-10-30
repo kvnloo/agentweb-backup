@@ -26,20 +26,24 @@ const PAGE = 100;
 export const POLL_MAX_PAGES = 10;
 /** A contact handled this recently is not looked up again (kept in memory; a restart only costs some repeat lookups). */
 const SEEN_FOR_MS = 6 * 60 * 60 * 1000;
+/** A contact that matched nobody in the CRM (not pushed by us, or the email lookup lagging) is looked at again sooner. */
+const UNMATCHED_SEEN_FOR_MS = 30 * 60 * 1000;
+/** A filtered answer that lists at least this many contacts AND the whole campaign is taken to mean the filter was ignored. */
+const FILTER_IGNORED_MIN = 20;
 const LOG_EVERY_MS = 24 * 60 * 60 * 1000;
 
 /**
  * What to ask for. Opt-outs are read TWICE: with Smartlead's own `is_unsubscribed` filter, and from the unfiltered listing keeping rows whose
  * `lead.is_unsubscribed` flag is set, because the filter misses a contact unsubscribed through the API (live finding 2026-10-30).
  */
-const STATUSES: Array<{ status: SmartleadEmailStatus | null; kind: SmartleadEventKind; onlyFlagged?: boolean }> = [
+const STATUSES: Array<{ status: SmartleadEmailStatus | null; kind: SmartleadEventKind }> = [
   { status: "is_unsubscribed", kind: "unsubscribe" }, // the ones that stop sends first
-  { status: null, kind: "unsubscribe", onlyFlagged: true },
+  { status: null, kind: "unsubscribe" }, // rows kept only if the contact's own flag is set
   { status: "is_bounced", kind: "bounce" },
   { status: "is_replied", kind: "reply" },
 ];
 
-const seen = new Map<string, number>();
+const seen = new Map<string, { at: number; for: number }>();
 /** When each campaign was last polled, so that when there are more campaigns than one pass covers, the longest-waiting go first and none starve. */
 const lastPolled = new Map<number, number>();
 const loggedAt = new Map<string, number>();
@@ -134,33 +138,51 @@ export async function eventPoll(deps: PollDeps): Promise<PollResult> {
         continue;
       }
 
-      for (const { status: emailStatus, kind, onlyFlagged } of STATUSES) {
+      // The campaign's own size, for the check below. One cheap read (a page of one).
+      let campaignSize: number | undefined;
+      try {
+        campaignSize = (await deps.smartlead.listLeads(resolved.apiKey, campaignId, null, 0, 1)).total;
+      } catch (error) {
+        if (error instanceof SmartleadApiError && (error.status === 401 || error.status === 403)) throw error;
+        // size unknown: the check below is skipped, nothing else depends on it
+      }
+
+      for (const { status: emailStatus, kind } of STATUSES) {
         const maxPages = deps.maxPages ?? POLL_MAX_PAGES;
         // One read failing (a rate limit, a timeout) must not cost the other kinds of event, every hour, because the order is fixed. A key that
         // is refused is the exception: nothing else can work, so it goes to the campaign's handler below.
         try {
           for (let page = 0; page < maxPages; page++) {
             const { total, rows: leads } = await deps.smartlead.listLeads(resolved.apiKey, campaignId, emailStatus, page * PAGE, PAGE);
+            // A status filter that Smartlead ignored or renamed would answer with EVERY contact of the campaign, and every one would be treated as
+            // having bounced or unsubscribed (then withdrawn in Smartlead for good). So a filtered answer as big as the whole campaign is refused.
+            if (emailStatus && campaignSize !== undefined && total >= FILTER_IGNORED_MIN && total >= campaignSize) {
+              logOnce(deps, `${campaignId}#${emailStatus}#ignored`, `[SmartleadPoll] campaign=${campaignId}: Smartlead's ${emailStatus} answer lists the whole campaign (${total} of ${campaignSize}); treated as an ignored filter and not used`);
+              out.errors++;
+              break;
+            }
             for (const lead of leads) {
-              if (onlyFlagged && !lead.unsubscribed) continue;
+              // An opt-out is believed only when Smartlead's own flag on the contact says so, however the row was found.
+              if (kind === "unsubscribe" && !lead.unsubscribed) continue;
               const memo = `${accountId}#${campaignId}#${kind}#${lead.leadId}`;
               const last = seen.get(memo);
-              if (last !== undefined && deps.now().getTime() - last < SEEN_FOR_MS) continue;
+              if (last !== undefined && deps.now().getTime() - last.at < last.for) continue;
               out.checked++;
               // One contact that cannot be handled (a database error, a write race that never settles) must not stop the rest of the campaign, now
-              // or every hour after: it is counted, logged once a day, and tried again after the usual six hours.
+              // or every hour after: it is counted, logged once a day, and tried again on the next pass.
               try {
                 const outcome = await deps.events.handle({ accountId, campaignId }, {
                   kind, campaignId, candidateEmails: [lead.email], soft: false, polled: true,
                   eventKey: `poll:${kind}:${campaignId}:${lead.leadId}`,
                 });
                 out.changed += outcome.changed;
+                seen.set(memo, { at: deps.now().getTime(), for: outcome.matched > 0 ? SEEN_FOR_MS : UNMATCHED_SEEN_FOR_MS });
               } catch (error) {
                 out.errors++;
                 const text = scrubSmartleadSecrets(error instanceof Error ? error.message : String(error)).slice(0, 120);
                 logOnce(deps, `${campaignId}#contact#${lead.leadId}`, `[SmartleadPoll] campaign=${campaignId}: one contact could not be handled (${kind}): ${text}`);
               }
-              seen.set(memo, deps.now().getTime());
+              // Not remembered: a contact whose handling FAILED (a database error while blocking an opt-out) is tried again on the next pass.
             }
             if (seen.size > 100_000) seen.clear(); // never grows without bound
             if ((page + 1) * PAGE >= total || leads.length === 0) break;

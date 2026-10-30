@@ -364,6 +364,23 @@ describe("events found by the hourly poll (ENG-673)", () => {
     expect(withdrawn.appended.map(a => a.eventType)).toEqual(["email.received"]);
   });
 
+  it("a bounce on file, a Resubscribe and a corrected address do not hide a later opt-out from the poll; and the other way round", async () => {
+    const hardBounce = { eventType: "email.bounced", createdAt: "2026-10-29T10:30:00.000Z", eventData: { source: "smartlead", campaignId: CAMPAIGN, smartleadEventKey: "b1" } };
+    const w = world({ leads: [lead("L1", "a", "ann@example.com", { engagements: [hardBounce], contactStatus: "active", contactStatusUpdatedAt: "2026-10-29T11:00:00.000Z" })] });
+    await make(w).handle(ctx, polled("unsubscribe"));
+    expect(w.leads[0].contactStatus).toBe("unsubscribed");
+    const unsubbed = { eventType: "email.unsubscribed", createdAt: "2026-10-29T10:30:00.000Z", eventData: { source: "smartlead", campaignId: CAMPAIGN, smartleadEventKey: "u1" } };
+    const x = world({ leads: [lead("L1", "a", "ann@example.com", { engagements: [unsubbed], contactStatus: "active", contactStatusUpdatedAt: "2026-10-29T11:00:00.000Z" })] });
+    await make(x).handle(ctx, polled("bounce"));
+    expect(x.leads[0].contactStatus).toBe("do-not-contact");
+  });
+
+  it("an event time from Smartlead later than our own clock is recorded as now, so it cannot out-date a Resubscribe", async () => {
+    const w = pushed();
+    await make(w).handle(ctx, ev({ event_type: "LEAD_UNSUBSCRIBED", sl_lead_email: "ann@example.com", event_id: "future-1", event_timestamp: "2027-01-01T00:00:00.000Z" }));
+    expect(w.appended[0].createdAt <= "2026-10-29T12:00:00.000Z").toBe(true);
+  });
+
   it("a temporary bounce on file does not hide a later opt-out from the poll", async () => {
     const w = pushed();
     const svc = make(w);

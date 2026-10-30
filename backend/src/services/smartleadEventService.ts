@@ -94,7 +94,9 @@ export class SmartleadEventService {
 
   private async apply(event: SmartleadEvent, lead: Lead, campaignName?: string): Promise<{ changed: number; duplicate: number }> {
     const now = this.deps.now().toISOString();
-    const at = event.occurredAt ?? now;
+    // Never later than our own clock: this time is compared with the stamp of a status change made here (a user's Resubscribe), and Smartlead's
+    // clock running ahead would otherwise make an old opt-out look newer than the Resubscribe that followed it.
+    const at = event.occurredAt && Date.parse(event.occurredAt) < Date.parse(now) ? event.occurredAt : now;
     const base = { source: "smartlead", smartleadEventKey: event.eventKey, campaignId: event.campaignId, ...(campaignName ? { campaign: campaignName } : {}) };
     let changed = 0;
     let duplicate = 0;
@@ -109,8 +111,9 @@ export class SmartleadEventService {
         // A SECOND reply missed by the webhook is not seen by the poll; a missed first one is.
         if (here.some(e => e?.eventType === "email.received")) return { changed: 0, duplicate: 1 };
       } else {
-        // A temporary bounce does not count as "already shown" for an opt-out: it never blocked the contact, and a later opt-out must still land.
-        const blocking = here.filter(e => e?.eventType === "email.unsubscribed" || (e?.eventType === "email.bounced" && e?.eventData?.soft !== true));
+        // Only the SAME kind of event counts as "already shown": a temporary bounce never blocked the contact, and after a bounce, a
+        // Resubscribe and a corrected address, a later opt-out (or the other way round) is a new event that must still land.
+        const blocking = here.filter(e => event.kind === "unsubscribe" ? e?.eventType === "email.unsubscribed" : e?.eventType === "email.bounced" && e?.eventData?.soft !== true);
         if (blocking.length > 0) {
           // On file: either the block landed and a user has since lifted it (the status was written at or after the event: leave a Resubscribe
           // alone), or the status write failed after the engagement was recorded (finish it). Read fresh: a stale read here would undo a Resubscribe.
