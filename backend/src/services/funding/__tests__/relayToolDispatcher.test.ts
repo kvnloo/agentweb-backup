@@ -656,7 +656,7 @@ describe('RelayToolDispatcher', () => {
       expect(t.posts[0]).toMatchObject({ isError: true, content: ARGS_TOO_LARGE_MESSAGE });
     });
 
-    it('numeric arrays are estimated conservatively (host estimator: 20 bytes for a number of 2+ digits): 100,000 two-digit numbers (300 KB of JSON) are refused fast, 10,000 run', async () => {
+    it('numeric arrays are estimated by their digits (host estimator): 100,000 two-digit numbers (300 KB of JSON) are refused fast, 10,000 run', async () => {
       const t = rig();
       const t0 = Date.now();
       t.d.start(t.ev('op-1', 'save_note', { ids: Array.from({ length: 100_000 }, (_, i) => 10 + (i % 90)) }));
@@ -669,9 +669,9 @@ describe('RelayToolDispatcher', () => {
       expect(t.executed).toHaveLength(1);
     });
 
-    it('a numeric stream input over the announce threshold is recorded by name only (the estimate is conservative, which is the safe direction)', async () => {
+    it('a numeric stream input over the announce threshold (64 KB estimated) is recorded by name only; one under it is matched by content', async () => {
       const t = rig();
-      const ids = Array.from({ length: 8_000 }, (_, i) => 10 + (i % 90)); // 24 KB of JSON, estimated at 160 KB: over the announce threshold, under the call cap
+      const ids = Array.from({ length: 30_000 }, (_, i) => 10 + (i % 90)); // about 90 KB of JSON: over the announce threshold (64 KB), under the call cap (256 KiB)
       t.d.noteStreamUse('mcp__aw__save_note', { ids });
       t.d.noteStreamUse('mcp__aw__save_note', { ids });
       t.d.start(t.ev('op-1', 'save_note', { ids }));
@@ -679,6 +679,14 @@ describe('RelayToolDispatcher', () => {
       t.d.start(t.ev('op-2', 'save_note', { ids }));
       await t.d.settle(2_000);
       expect(t.executed).toHaveLength(2); // both ran: never matched by content, so never collapsed
+      const small = Array.from({ length: 10_000 }, (_, i) => 10 + (i % 90)); // about 30 KB: under the threshold, so matched by content as usual
+      t.d.noteStreamUse('mcp__aw__search', { small });
+      t.d.noteStreamUse('mcp__aw__search', { small });
+      t.d.start(t.ev('op-3', 'search', { small }));
+      await t.d.settle(2_000);
+      t.d.start(t.ev('op-4', 'search', { small }));
+      await t.d.settle(2_000);
+      expect(t.executed).toHaveLength(3); // the two identical small ones collapsed into one execution
     });
 
     it('arguments just under the cap run', async () => {
