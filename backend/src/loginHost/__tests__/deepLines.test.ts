@@ -132,6 +132,14 @@ describe("normalized stream events: informational values are bounded before they
     expect(normalizeClaudeEvent(toolUse({ q: "small" }))[0]).toMatchObject({ input: { q: "small" } });
   });
 
+  it("MUTATION TARGET: a legitimate input of 130,000 small integers (~260 KB of JSON) is forwarded as is, not replaced by a marker (the backend groups batched approvals by input)", () => {
+    const input = { ids: new Array(130_000).fill(7) };
+    expect(Buffer.byteLength(JSON.stringify(input))).toBeLessThan(1024 * 1024);
+    expect((normalizeClaudeEvent(toolUse(input))[0] as { input: unknown }).input).toBe(input);
+    const real = { ids: new Array(300_000).fill(123456) }; // ~2.1 MB of JSON
+    expect(normalizeClaudeEvent(toolUse(real))[0]).toMatchObject({ input: { _truncated: "size" } });
+  });
+
   it("MUTATION TARGET: events with an over-long id or name are dropped (a 16 MB id would be forwarded to the backend as is)", () => {
     expect(normalizeClaudeEvent(toolUse({}, "i".repeat(257)))).toEqual([]);
     expect(normalizeClaudeEvent(toolUse({}, "tu1", "n".repeat(257)))).toEqual([]);

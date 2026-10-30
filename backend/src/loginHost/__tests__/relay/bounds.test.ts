@@ -60,6 +60,21 @@ describe("valueDepthExceeds", () => {
 });
 
 describe("approxJsonBytes", () => {
+  it("MUTATION TARGET: small integers count about what they cost in JSON (130,000 of them are ~260 KB, nowhere near a 1 MiB cap), other numbers more, booleans and null a few bytes", () => {
+    const ints = { ids: new Array(130_000).fill(7) };
+    const real = Buffer.byteLength(JSON.stringify(ints));
+    expect(real).toBeLessThan(300_000);
+    const est = approxJsonBytes(ints, 1 << 20);
+    expect(est).toBeLessThan(1024 * 1024);
+    expect(est).toBeGreaterThan(real * 0.9);
+    expect(approxJsonBytes(new Array(1000).fill(1234567.891), 1 << 30)).toBeGreaterThanOrEqual(1000 * 18);
+    expect(approxJsonBytes([true, false, null], 1 << 20)).toBeGreaterThanOrEqual(15);
+  });
+  it("MUTATION TARGET: a value that is really over the cap still reaches it (strings, wide arrays of larger numbers)", () => {
+    expect(approxJsonBytes({ s: "x".repeat(2 * 1024 * 1024) }, 1024 * 1024 + 1)).toBe(1024 * 1024 + 1);
+    expect(approxJsonBytes({ n: new Array(200_000).fill(123456) }, 1024 * 1024 + 1)).toBe(1024 * 1024 + 1);
+    expect(approxJsonBytes(new Array(6_000_000).fill(1), 1024 * 1024 + 1)).toBe(1024 * 1024 + 1); // stops at the step cap, fast
+  });
   it("MUTATION TARGET: never throws on a value JSON.stringify cannot serialize, and stops at the limit", () => {
     let v: unknown = "leaf";
     for (let i = 0; i < 1_000_000; i++) v = [v];

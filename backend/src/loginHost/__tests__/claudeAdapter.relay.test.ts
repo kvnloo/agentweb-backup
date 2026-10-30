@@ -426,6 +426,23 @@ describe("claude adapter: lifecycle and memory bounds of the relay", () => {
     await session.close();
   });
 
+  it("MUTATION TARGET: a stream announcement with a huge input is recorded by NAME only, in bounded time (hashing a 16 MB hostile input blocked the loop for seconds)", async () => {
+    const rig = makeRig();
+    const session = await rig.adapter.openSession(rig.ctx, { connectionId: "conn1", epoch: 1 });
+    const s = session as unknown as { visibleTools: Set<string>; streamUses: Array<{ messageId: string; name: string; key: string }>; noteStreamUse(raw: Record<string, unknown>): void };
+    s.visibleTools.add("search");
+    const huge = new Array(6_000_000).fill(1);
+    const t0 = Date.now();
+    s.noteStreamUse({ type: "assistant", message: { id: "mBig", content: [{ type: "tool_use", id: "tu", name: "mcp__emma__search", input: { ids: huge } }] } });
+    expect(Date.now() - t0).toBeLessThan(300);
+    expect(s.streamUses).toEqual([{ messageId: "mBig", name: "search", key: "~oversize" }]);
+    // an ordinary one is still hashed (its key is a digest, never the sentinel)
+    s.noteStreamUse({ type: "assistant", message: { id: "mSmall", content: [{ type: "tool_use", id: "tu2", name: "mcp__emma__search", input: { q: 1 } }] } });
+    expect(s.streamUses[1].key).not.toBe("~oversize");
+    expect(s.streamUses[1].key.length).toBeGreaterThan(20);
+    await session.close();
+  });
+
   it("a claimed stream block is forgotten (each message is matched once), so repeated identical calls still pair with their own messages", async () => {
     const rig = makeRig();
     rig.scenario({ turn: [{ mcpCall: { name: "search", args: { q: "same" }, messageId: "mA" } }, { mcpCall: { name: "search", args: { q: "same" }, messageId: "mB" } }, RESULT_STEP] });
