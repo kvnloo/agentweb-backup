@@ -784,6 +784,19 @@ case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${
         expect(existsSync(join(b.opt, "current"))).toBe(false);
       });
 
+      it("MUTATION TARGET: the /usr/bin/node link is flipped only AFTER the trusted-path check (a refused release leaves the machine exactly as it was)", () => {
+        const flip = install.indexOf('mut ln -sfn "$NODE_LINK_TARGET" /usr/bin/node');
+        const check = install.indexOf("trust_out=$(check_config");
+        const staged = install.indexOf("Last pre-switch checks on the staged files");
+        expect(flip).toBeGreaterThan(0);
+        expect(check).toBeGreaterThan(0);
+        expect(flip).toBeGreaterThan(check);
+        expect(flip).toBeGreaterThan(staged);
+        // and it is the only place the link is made
+        expect([...install.matchAll(/ln -sfn "\$NODE_LINK_TARGET"/g)]).toHaveLength(1);
+        expect(install).not.toMatch(/ln -sfn "\$NODE_DIR\/bin\/node"/);
+      });
+
       it("--prepare does not run the release check (it stages nothing); the node link is not part of this", () => {
         const b = box({ node: "symlink" });
         expect(run(b, "--prepare").stdout).not.toContain("trusted-path check");
@@ -809,7 +822,8 @@ case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${
 
     it("the /usr/bin/node link is flipped only in the switch phase, never by --prepare, and the install lock is in a root-only directory", () => {
       const src = text(join(PROD, "install.sh"));
-      expect(src).toMatch(/if \[ "\$PREPARE" = 1 \]; then\n\s+skip "\/usr\/bin\/node link: left for the switch phase"\n\s+elif/);
+      expect(src).toMatch(/if \[ "\$PREPARE" = 1 \]; then skip "\/usr\/bin\/node link: left for the switch phase"; fi/);
+      expect(src).toMatch(/if \[ -n "\$\{NODE_LINK_TARGET:-\}" \] && \[ "\$PREPARE" != 1 \]; then/);
       expect(src).toContain("LOCK=/run/aw-deploy/install.lock");
       expect(src).toMatch(/chmod 0700 "\$\(dirname "\$LOCK"\)"/);
     });
