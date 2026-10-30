@@ -61,7 +61,7 @@ import { CHAT_BRANCHING_ENABLED_SETTING, isChatBranchingSettingEnabled, healLega
 import { compareSaveAlternatives } from '../services/agentMode/compareSaveAlternativesInstance';
 import { LEGACY_MODEL_ALIASES } from '../services/agentMode/llmModelRegistry';
 import { resolveRunFunding } from '../services/funding/runFunding';
-import { isContextLimitError, isProviderNoEndpointsError, isSessionLimitError, isTransientLLMError, isProviderDeserializationError, PROVIDER_DESERIALIZATION_ERROR_CLASS, isWorkerShutdownError, isDrainCeilingShutdownError, isProviderUnavailableError, isQuotaExhaustedError } from '../utils/agentModeErrors';
+import { isContextLimitError, isProviderNoEndpointsError, isSessionLimitError, isTransientLLMError, isProviderDeserializationError, PROVIDER_DESERIALIZATION_ERROR_CLASS, isWorkerShutdownError, isDrainCeilingShutdownError, isProviderUnavailableError, isQuotaExhaustedError, QUOTA_EXHAUSTED_USER_MESSAGE } from '../utils/agentModeErrors';
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
@@ -12182,6 +12182,18 @@ export const agentModeController = {
               ),
               artifactUrls,
             );
+          } else if (isQuotaExhaustedError(error)) {
+            // ENG-2763: persist the quota message, not diagnosis/retry advice, so a
+            // reload agrees with the 503 PROVIDER_QUOTA_EXHAUSTED response.
+            publishLedger = (await loadPublishLedger(sessionId, turnStartCalledFunctions)) || [];
+            artifactUrls = await loadConfirmedArtifactUrls(sessionId, turnStartMsForDiagnosis);
+            diagnosticContent = appendConfirmedArtifactNotice(
+              appendConfirmedDataWriteNotice(
+                appendConfirmedPublishNotice(QUOTA_EXHAUSTED_USER_MESSAGE, publishLedger),
+                publishLedger,
+              ),
+              artifactUrls,
+            );
           } else {
             const userMessage = req.body?.userMessage || '';
             const diagnosis = await getDiagnosticErrorMessage(
@@ -13416,6 +13428,17 @@ export const agentModeController = {
               ),
               artifactUrls,
             );
+          } else if (isQuotaExhaustedError(error)) {
+            // ENG-2763: see the matching branch in generateResponse.
+            publishLedger = (await loadPublishLedger(shareId, turnStartCalledFunctions)) || [];
+            artifactUrls = await loadConfirmedArtifactUrls(shareId, sharedTurnStartMs);
+            diagnosticContent = appendConfirmedArtifactNotice(
+              appendConfirmedDataWriteNotice(
+                appendConfirmedPublishNotice(QUOTA_EXHAUSTED_USER_MESSAGE, publishLedger),
+                publishLedger,
+              ),
+              artifactUrls,
+            );
           } else {
             const userMessage = req.body?.userMessage || '';
             const diagnosis = await getDiagnosticErrorMessage(error, shareId, userMessage, turnStartCalledFunctions, sharedTurnStartMs);
@@ -13558,7 +13581,7 @@ export const agentModeController = {
         // ENG-2763: OpenRouter key-limit / credits exhaustion is a known class, not an
         // unknown error: answer 503 and page once per class, not once per occurrence.
         if (isQuotaExhaustedError(error)) {
-          sendQuotaExhaustedAlert(error, req.body?.sessionId);
+          sendQuotaExhaustedAlert(error, shareId);
           res.status(503).json(sendRefusalBody({
             error: 'AI service at capacity',
             message: error.message,
@@ -16937,7 +16960,7 @@ export const agentModeController = {
         // ENG-2763: OpenRouter key-limit / credits exhaustion is a known class, not an
         // unknown error: answer 503 and page once per class, not once per occurrence.
         if (isQuotaExhaustedError(error)) {
-          sendQuotaExhaustedAlert(error, req.body?.sessionId);
+          sendQuotaExhaustedAlert(error, (req as any).conversableSession?.sessionId);
           res.status(503).json(sendRefusalBody({
             error: 'AI service at capacity',
             message: error.message,
