@@ -30,6 +30,7 @@ export const claudeCodeBackend = new ClaudeCodeBackend({
     protocolStatus: () => getLoginHostProvider().protocolStatus(),
     // Default refuse (production's HTTP bridge is a zero-tool stub). A dev or test box whose bridge serves real tools sets this to "true".
     allowLegacyBridge: () => legacyBridgeAllowed(),
+    invalidateProtocol: () => getLoginHostProvider().invalidateProtocol(),
   },
   executor: emmaToolBridgeExecutor,
   registry: claudeRunRegistry,

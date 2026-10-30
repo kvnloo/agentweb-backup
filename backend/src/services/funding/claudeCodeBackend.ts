@@ -18,7 +18,7 @@
  */
 import { randomUUID } from "crypto";
 import type { ProviderEvent } from "../../loginHost/adapter";
-import type { LoginHostClient } from "./loginHostClient";
+import { LoginHostError, type LoginHostClient } from "./loginHostClient";
 import type { HostTurnOptions, HostTurnOutcome } from "./loginHostTurn";
 import type { RouteInput } from "../../loginHost/protocol";
 import type { BridgeCallOptions, BridgeCallRecord, BridgeCallResult, BridgeHalt, BridgeListedTool, BridgeToolCall, CloseAndDrainResult } from "./toolBridge";
@@ -110,6 +110,8 @@ export interface ClaudeBackendDeps {
   relay?: {
     workerProtocol(): number | undefined;
     protocolStatus(): "match" | "mismatch" | "unknown";
+    /** Forget the cached worker protocol and ask the worker again (it contradicted the cache, e.g. refused `tools` after a rollback). */
+    invalidateProtocol?(): void;
     /** Whether a worker older than protocol 4 may run turns on the HTTP bridge. Absent or false (the production default) = refused. */
     allowLegacyBridge?(): boolean;
   };
@@ -438,15 +440,29 @@ export class ClaudeCodeBackend {
             },
           );
         } catch (err) {
-          const stop = fromHostFailure(err);
-          if (stop) {
-            // Fields the host guarantees safe to log (a code and a short detail chosen by the host; never a path, token or text).
-            console.error("[claude-backend] host failure", { code: (err as { code?: string }).code, detail: (err as { detail?: string }).detail, stop: stop.code, session: p.sessionId });
-            if (stop.markNeedsReconnect) await d.markNeedsReconnect(connectionId, epoch, "host_denied").catch(() => undefined);
-            pendingStop = stop; // tool work that already ran is real: it is drained and persisted below, then this is thrown
+          // A relay turn refused as INVALID at admission: the worker may be older than the cached protocol says (a ROLLBACK to protocol 3 rejects `tools`
+          // and the cached "match / 4" would otherwise stay for up to 10 minutes, failing every relay turn). Forget the cached protocol now and fail THIS turn
+          // as the retryable "worker unavailable"; nothing ran. The next turn is decided on the fresh answer (unknown, then the real protocol).
+          if (dispatcher && err instanceof LoginHostError && err.code === "EINVALID" && !hostStarted) {
+            console.error("[claude-backend] relay_rejected_by_worker", { detail: err.detail, session: p.sessionId });
+            try {
+              d.relay?.invalidateProtocol?.();
+            } catch {
+              /* best effort */
+            }
+            pendingStop = new ClaudeRouteStopError("host_unavailable");
+            markTurnToolsRan(pendingStop, false);
           } else {
-            rawError = err; // same: persist what ran, then fail (typed, by run())
-            ac.abort();
+            const stop = fromHostFailure(err);
+            if (stop) {
+              // Fields the host guarantees safe to log (a code and a short detail chosen by the host; never a path, token or text).
+              console.error("[claude-backend] host failure", { code: (err as { code?: string }).code, detail: (err as { detail?: string }).detail, stop: stop.code, session: p.sessionId });
+              if (stop.markNeedsReconnect) await d.markNeedsReconnect(connectionId, epoch, "host_denied").catch(() => undefined);
+              pendingStop = stop; // tool work that already ran is real: it is drained and persisted below, then this is thrown
+            } else {
+              rawError = err; // same: persist what ran, then fail (typed, by run())
+              ac.abort();
+            }
           }
         }
       }

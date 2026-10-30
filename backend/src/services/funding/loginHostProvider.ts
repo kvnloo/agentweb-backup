@@ -269,6 +269,17 @@ export class LoginHostProvider {
     else console.warn(`[loginHostProvider] login_host_client_cert_expires_soon daysLeft=${days}`);
   }
 
+  /**
+   * The worker did something that contradicts the cached protocol (an older worker refused a relay `turn.run` after a ROLLBACK): forget the cached answer now
+   * and ask `host.info` again, instead of trusting "match / 4" for up to PROTOCOL_RECHECK_MS. Until the answer arrives the status is "unknown", so the next
+   * turn is refused as retryable (fail closed), then decided on the fresh protocol.
+   */
+  invalidateProtocol(): void {
+    this.protocol = { status: "unknown", checkedAt: 0 };
+    this.protocolUnknownLogged = false;
+    this.maybeCheckProtocol();
+  }
+
   /** Whether the worker speaks the protocol version this build was written for (see PROTOCOL_VERSION). Unknown until `host.info` answered. */
   protocolStatus(): ProtocolStatus {
     return this.protocol.status;

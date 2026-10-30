@@ -316,6 +316,24 @@ describe("worker protocol check (host.info)", () => {
     expect(p.workerProtocol()).toBe(PROTOCOL_VERSION);
   });
 
+  it("invalidateProtocol (the worker contradicted the cache: a rollback) forgets 'match / 4' at once and asks host.info again", async () => {
+    let answer = 4;
+    let asked = 0;
+    const p = mk(async () => (asked++, { protocol: answer, node: "v22", uptimeSec: 1 }));
+    await settle(p);
+    expect([p.protocolStatus(), p.workerProtocol()]).toEqual(["match", 4]);
+    answer = 3; // the worker was rolled back
+    now += 1_000; // far inside the 10 minute recheck window: without the invalidation the cache would still say 4
+    await settle(p);
+    expect(p.workerProtocol()).toBe(4);
+    const before = asked;
+    p.invalidateProtocol();
+    expect(p.protocolStatus()).toBe("unknown"); // fail closed until the answer arrives
+    await new Promise((r) => setImmediate(r));
+    expect(asked).toBe(before + 1);
+    expect([p.protocolStatus(), p.workerProtocol()]).toEqual(["match", 3]);
+  });
+
   it("a version outside the accepted set is a logged 'mismatch' (never fatal: the client is still returned)", async () => {
     const p = mk(async () => ({ protocol: 5, node: "v22", uptimeSec: 1 }));
     await settle(p);

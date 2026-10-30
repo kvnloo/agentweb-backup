@@ -13,7 +13,7 @@ import { ClaudeCodeBackend, chooseToolTransport, legacyBridgeAllowed, relayAvail
 import { turnRanNoTools } from '../claudeRouteErrors';
 import * as relayManifestModule from '../relayManifest';
 import { ClaudeRunRegistry } from '../claudeRunRegistry';
-import { LoginHostClient, UnixSocketTransport } from '../loginHostClient';
+import { LoginHostClient, LoginHostError, UnixSocketTransport } from '../loginHostClient';
 import { runHostTurn } from '../loginHostTurn';
 import { RESULT_LOST_NOTE, SOFT_DEADLINE_MESSAGE, STOPPED_MESSAGE, UNLOADABLE_NOTE } from '../relayToolDispatcher';
 import { ToolBridge, type BridgeExecuteOutcome, type BridgeTool, type ToolBridgeDeps } from '../toolBridge';
@@ -493,6 +493,63 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
     await run;
     expect(t.executions).toHaveLength(1);
     expect(answers()[1].answer).toMatchObject({ ok: false, content: SOFT_DEADLINE_MESSAGE });
+  });
+
+  describe('worker ROLLBACK to protocol 3 while the cached protocol still says match/4', () => {
+    const rejected = () => new LoginHostError('EINVALID', 'body:unrecognized_keys'); // what an old worker answers to a `tools` field
+
+    it('the relay turn the old worker refuses fails as the retryable host_unavailable (nothing ran, AgentWeb offered), the cache is invalidated at once, and the next turn uses the fresh decision', async () => {
+      const t = setup();
+      let known = true;
+      const invalidate = jest.fn(() => void (known = false));
+      Object.assign(t.deps.relay!, { workerProtocol: () => (known ? 4 : undefined), protocolStatus: () => (known ? 'match' : 'unknown'), invalidateProtocol: invalidate });
+      const spy = jest.spyOn(client, 'turnRun').mockRejectedValueOnce(rejected());
+      const err: any = await t.backend().run(t.params()).catch((e) => e);
+      expect(err.code).toBe('host_unavailable');
+      expect(err.retryable).toBe(true);
+      expect(err.offerAgentWebCredits).toBe(true);
+      expect(turnRanNoTools(err)).toBe(true);
+      expect(invalidate).toHaveBeenCalledTimes(1);
+      expect(t.registry.size).toBe(0);
+      // next turn: the cache is unknown now, so it is refused up front (no worker call) ...
+      const err2: any = await t.backend().run(t.params()).catch((e) => e);
+      expect(err2.code).toBe('host_unavailable');
+      expect(spy).toHaveBeenCalledTimes(1);
+      // ... and once the fresh answer is in (here: protocol 3 again, i.e. refused as too old, or 4 again), the decision follows it
+      Object.assign(t.deps.relay!, { workerProtocol: () => 3, protocolStatus: () => 'match' });
+      const err3: any = await t.backend().run(t.params()).catch((e) => e);
+      expect(err3.code).toBe('host_unavailable');
+      expect(spy).toHaveBeenCalledTimes(1);
+      Object.assign(t.deps.relay!, { workerProtocol: () => 4, protocolStatus: () => 'match' });
+      rig.script.turnEvents = [result('fine')];
+      expect((await t.backend().run(t.params())).content).toBe('fine');
+    });
+
+    it.each([
+      ['ENOTFOUND', 'needs_reconnect'],
+      ['ESTATE', 'needs_reconnect'],
+      ['ESTALE', 'connection_changed'],
+      ['EHAZARD', 'policy_blocks'],
+      ['EINTERNAL', 'turn_failed'],
+    ] as const)('a %s refusal of a relay turn is classified as before and does not touch the cached protocol', async (code, stop) => {
+      const t = setup();
+      const invalidate = jest.fn();
+      Object.assign(t.deps.relay!, { invalidateProtocol: invalidate });
+      jest.spyOn(client, 'turnRun').mockRejectedValue(new LoginHostError(code));
+      const err: any = await t.backend().run(t.params()).catch((e) => e);
+      expect(err.code).toBe(stop);
+      expect(invalidate).not.toHaveBeenCalled();
+    });
+
+    it('a turn on the legacy path refused as invalid does not invalidate anything (the rule is for relay turns)', async () => {
+      const t = setup({ protocol: 3, status: 'match', allowLegacy: true });
+      const invalidate = jest.fn();
+      Object.assign(t.deps.relay!, { invalidateProtocol: invalidate });
+      jest.spyOn(client, 'turnRun').mockRejectedValueOnce(rejected());
+      const err: any = await t.backend().run(t.params()).catch((e) => e);
+      expect(err.code).toBe('turn_failed');
+      expect(invalidate).not.toHaveBeenCalled();
+    });
   });
 
   it('CLAUDE_PLAN_ALLOW_LEGACY_BRIDGE: only the exact string "true" turns the legacy bridge on; unset, empty and every other value are off', () => {
