@@ -101,6 +101,7 @@ export async function rehydrateAndServe(
     apiKeyId: (req as any)._mcpApiKeyId,
     oauthClientId: (req as any)._mcpOAuthClientId,
     oauthClientName: (req as any)._mcpOAuthClientName,
+    oauthScopes: (req as any)._mcpOAuthScopes,
     clientType: (req as any)._mcpClientType,
     userAgent: typeof req.get === "function" ? req.get("user-agent") : undefined,
     clientIp: req.ip,

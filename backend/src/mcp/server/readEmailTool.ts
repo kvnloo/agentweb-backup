@@ -6,9 +6,11 @@
  * callers, behind four controls:
  *
  *   1. Opt-in scope: `requiredScope: email:read`. Only an `aw_` key that
- *      explicitly holds `email:read` may call it — `tools:execute` does not
- *      imply it and default keys do not get it (apiKeyScopes.ts). OAuth and
- *      anonymous callers are refused (mcpServer.ts + registry.execute).
+ *      explicitly holds `email:read`, or an OAuth sign-in whose user consented
+ *      to `email:read`, may call it — `tools:execute`/`mcp:tools` do not imply
+ *      it and default keys/tokens do not get it (apiKeyScopes.ts,
+ *      oauth/oauthScopes.ts). Anonymous callers are refused (mcpServer.ts +
+ *      registry.execute). Controls 2-4 apply identically to both.
  *   2. Read actions only: anything other than search|list|get is refused here,
  *      before any request is made. No send/reply fields exist in the schema,
  *      and the body forwarded to the route is built field by field.
@@ -29,8 +31,9 @@ export const READ_EMAIL_MAX_RESULTS = 50;
 export const READ_EMAIL_RATE_LIMIT = 60;
 export const READ_EMAIL_RATE_WINDOW_MS = 10 * 60 * 1000;
 
-// Per-user sliding window. Entries are bounded by READ_EMAIL_RATE_LIMIT per
-// user, and only users holding an email:read key can add one.
+// Per-user sliding window, shared across API keys and OAuth sign-ins. Entries
+// are bounded by READ_EMAIL_RATE_LIMIT per user, and only users holding an
+// email:read key or OAuth grant can add one.
 const callLog = new Map<string, number[]>();
 
 export function resetReadEmailRateLimit(): void {
@@ -57,7 +60,7 @@ mcpToolRegistry.register({
     name: 'read_email',
     description:
       'Read-only access to your own connected email accounts (Gmail, Outlook): search, list a folder, or get messages by ID. ' +
-      "Requires an API key with the 'email:read' scope. Cannot send or reply, and cannot read mailboxes shared by teammates.",
+      "Requires an API key or OAuth sign-in granted the 'email:read' scope. Cannot send or reply, and cannot read mailboxes shared by teammates.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -79,7 +82,9 @@ mcpToolRegistry.register({
       console.info(JSON.stringify({
         event: 'mcp_read_email',
         userId,
+        authMethod: context?.authMethod,
         apiKeyId: context?.apiKeyId,
+        oauthClientId: context?.oauthClientId,
         accountId: args?.account_id,
         action,
         external,

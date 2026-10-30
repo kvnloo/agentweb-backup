@@ -16,8 +16,9 @@
  * Opt-in scopes (e.g. `email:read`) are different: a tool that declares one via
  * its registry `requiredScope` is callable only by an `aw_` key that holds that
  * exact scope. `tools:execute` does NOT imply it, and it is not in the default
- * set, so no existing or default key gains the capability. Every other auth
- * method (OAuth, anonymous) is refused such tools outright.
+ * set, so no existing or default key gains the capability. An OAuth sign-in may
+ * call such a tool only when the user consented to that exact OAuth scope
+ * (oauth/oauthScopes.ts); anonymous callers are refused outright.
  */
 export const API_KEY_SCOPE_READ = 'tools:read';
 export const API_KEY_SCOPE_EXECUTE = 'tools:execute';
@@ -54,19 +55,24 @@ function scopeSatisfies(granted: string[], required: string): boolean {
 
 /**
  * For non-API-key external callers (OAuth, anonymous): returns the first
- * tools/call that targets a tool gated on an opt-in scope. Those tools exist
- * only for `aw_` keys explicitly granted the scope, so any other auth method is
- * refused regardless of what else it may do.
+ * tools/call that targets a tool gated on an opt-in scope the caller was not
+ * explicitly granted. `granted` is the OAuth token's consented scopes; pass []
+ * for anonymous callers, which are therefore refused every such tool.
  */
-export function findApiKeyOnlyToolCall(body: unknown, lookup: ToolLookup): ScopeDenial | null {
+export function findOptInScopeDenial(body: unknown, granted: readonly string[], lookup: ToolLookup): ScopeDenial | null {
   const messages = Array.isArray(body) ? body : [body];
   for (const message of messages) {
     if ((message as any)?.method !== 'tools/call') continue;
     const tool = String((message as any)?.params?.name ?? '');
     const requiredScope = lookup(tool)?.requiredScope;
-    if (requiredScope && isOptInScope(requiredScope)) return { tool, requiredScope };
+    if (requiredScope && isOptInScope(requiredScope) && !granted.includes(requiredScope)) return { tool, requiredScope };
   }
   return null;
+}
+
+/** The user-facing refusal for an opt-in-scope tool, shared by the HTTP layer and the registry. */
+export function optInScopeRefusal(tool: string, requiredScope: string): string {
+  return `Tool '${tool}' requires the '${requiredScope}' scope: it is only available to API keys or OAuth sign-ins granted '${requiredScope}'.`;
 }
 
 /** Returns the first tools/call in a (possibly batched) JSON-RPC body the key may not make. */

@@ -19,6 +19,14 @@ import {
   recordMcpOAuthTokenIssued,
 } from '../../services/mcpUsageEventsService';
 import { getBackendUrl, MCP_RESOURCE_PATH, META_TOOLKIT_MCP_RESOURCE_PATH } from './authChallenge';
+import {
+  formatScopes,
+  grantedOAuthScopes,
+  InvalidScopeError,
+  OAUTH_SCOPE_EMAIL_READ,
+  parseRequestedScopes,
+  SUPPORTED_OAUTH_SCOPES,
+} from './oauthScopes';
 
 /**
  * Middleware: accept the user's JWT either from the Authorization header
@@ -69,7 +77,7 @@ export function setupMcpOAuth(app: express.Express) {
       grant_types_supported: ['authorization_code', 'refresh_token'],
       token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'none'],
       code_challenge_methods_supported: ['S256'],
-      scopes_supported: ['mcp:tools'],
+      scopes_supported: SUPPORTED_OAUTH_SCOPES,
       service_documentation: `${baseUrl}/docs/agent-api`,
     });
   });
@@ -84,7 +92,7 @@ export function setupMcpOAuth(app: express.Express) {
       resource: `${baseUrl}${resourcePath}`,
       authorization_servers: [baseUrl],
       bearer_methods_supported: ['header'],
-      scopes_supported: ['mcp:tools'],
+      scopes_supported: SUPPORTED_OAUTH_SCOPES,
       resource_documentation:
         resourcePath === META_TOOLKIT_MCP_RESOURCE_PATH ? `${baseUrl}/api/meta-toolkit/skill.md` : `${baseUrl}/skill.md`,
     });
@@ -179,12 +187,25 @@ export function setupMcpOAuth(app: express.Express) {
     }
 
     const actualRedirectUri = redirect_uri || client.redirectUris[0];
+
+    // RFC 6749 §4.1.2.1: the redirect URI is validated, so an unknown scope goes
+    // back to the client as invalid_scope rather than reaching the consent page.
+    const scopes = parseRequestedScopes(scope);
+    if (!scopes) {
+      const errorUrl = new URL(actualRedirectUri);
+      errorUrl.searchParams.set('error', 'invalid_scope');
+      errorUrl.searchParams.set('error_description', `Supported scopes: ${SUPPORTED_OAUTH_SCOPES.join(' ')}`);
+      if (state) errorUrl.searchParams.set('state', state);
+      return res.redirect(302, errorUrl.toString());
+    }
+    const scopeString = formatScopes(scopes);
+
     recordMcpOAuthStarted({
       clientId: client_id,
       clientName: client.clientName,
       clientType: classifyMcpClient({ clientName: client.clientName, userAgent: req.get('user-agent'), redirectUri: actualRedirectUri }),
       redirectUri: actualRedirectUri,
-      scope: scope || 'mcp:tools',
+      scope: scopeString,
       userAgent: req.get('user-agent'),
     }).catch((error) => console.error('[MCP-OAuth] Failed to record OAuth start:', error));
 
@@ -193,14 +214,15 @@ export function setupMcpOAuth(app: express.Express) {
     // env can never short-circuit consent. Also requires a real authenticated
     // user — we refuse to mint anonymous tokens tied to a fake "dev-user" ID,
     // which previously let any unauthenticated caller obtain mcp:tools tokens.
-    if (process.env.MCP_OAUTH_SKIP_CONSENT === 'true') {
+    // Never for email:read: mailbox access always goes through the consent page.
+    if (process.env.MCP_OAUTH_SKIP_CONSENT === 'true' && !scopes.includes(OAUTH_SCOPE_EMAIL_READ)) {
       const { user } = await getUserFromToken(req);
       if (user) {
         const { code } = await mcpOAuthService.createAuthorizationCode({
           clientId: client_id,
           userId: user.userId,
           redirectUri: actualRedirectUri,
-          scope: scope || 'mcp:tools',
+          scopes,
           codeChallenge: code_challenge,
           codeChallengeMethod: code_challenge_method || 'S256',
         });
@@ -218,7 +240,7 @@ export function setupMcpOAuth(app: express.Express) {
     consentUrl.searchParams.set('client_id', client_id);
     consentUrl.searchParams.set('client_name', client.clientName);
     consentUrl.searchParams.set('redirect_uri', actualRedirectUri);
-    consentUrl.searchParams.set('scope', scope || 'mcp:tools');
+    consentUrl.searchParams.set('scope', scopeString);
     if (state) consentUrl.searchParams.set('state', state);
     consentUrl.searchParams.set('code_challenge', code_challenge);
     consentUrl.searchParams.set('code_challenge_method', code_challenge_method || 'S256');
@@ -270,12 +292,26 @@ export function setupMcpOAuth(app: express.Express) {
       return res.status(400).json({ error: 'invalid_request' });
     }
 
+    const scopes = parseRequestedScopes(scope);
+    if (!scopes) {
+      return res.status(400).json({ error: 'invalid_scope' });
+    }
+    // Mailbox read is a personal grant (same rule as minting an email:read API
+    // key): an admin acting through delegated access may not consent to it.
+    if (scopes.includes(OAUTH_SCOPE_EMAIL_READ) && (req as any).delegateInfo?.isDelegated) {
+      return res.status(403).json({
+        error: 'access_denied',
+        error_description: `The '${OAUTH_SCOPE_EMAIL_READ}' scope cannot be granted from a delegated session.`,
+      });
+    }
+    const scopeString = formatScopes(scopes);
+
     const userId = (req as any).user.userId;
     const { code } = await mcpOAuthService.createAuthorizationCode({
       clientId: client_id,
       userId,
       redirectUri: redirect_uri,
-      scope: scope || 'mcp:tools',
+      scopes,
       codeChallenge: code_challenge,
       codeChallengeMethod: code_challenge_method || 'S256',
     });
@@ -285,7 +321,7 @@ export function setupMcpOAuth(app: express.Express) {
       clientName: client.clientName,
       clientType: classifyMcpClient({ clientName: client.clientName, redirectUri: redirect_uri }),
       redirectUri: redirect_uri,
-      scope: scope || 'mcp:tools',
+      scope: scopeString,
     }).catch((error) => console.error('[MCP-OAuth] Failed to record OAuth authorization:', error));
 
     const redirectUrl = new URL(redirect_uri);
@@ -301,7 +337,7 @@ export function setupMcpOAuth(app: express.Express) {
 
     res.setHeader('Cache-Control', 'no-store');
 
-    if (!hasOnlyStringParams(req.body, ['grant_type', 'code', 'redirect_uri', 'client_id', 'client_secret', 'code_verifier', 'refresh_token'])) {
+    if (!hasOnlyStringParams(req.body, ['grant_type', 'code', 'redirect_uri', 'client_id', 'client_secret', 'code_verifier', 'refresh_token', 'scope'])) {
       return res.status(400).json({ error: 'invalid_request' });
     }
 
@@ -340,7 +376,7 @@ async function handleAuthorizationCodeGrant(req: Request, res: Response) {
   const tokens = await mcpOAuthService.createTokenPair({
     clientId: codeRecord.clientId,
     userId: codeRecord.userId,
-    scope: codeRecord.scope,
+    scopes: grantedOAuthScopes(codeRecord),
   });
   recordMcpOAuthTokenIssued({
     userId: codeRecord.userId,
@@ -348,7 +384,7 @@ async function handleAuthorizationCodeGrant(req: Request, res: Response) {
     clientName: client?.clientName,
     clientType: classifyMcpClient({ clientName: client?.clientName, redirectUri: codeRecord.redirectUri }),
     redirectUri: codeRecord.redirectUri,
-    scope: codeRecord.scope,
+    scope: tokens.scope,
   }).catch((error) => console.error('[MCP-OAuth] Failed to record OAuth token issue:', error));
 
   return res.json({
@@ -370,7 +406,22 @@ async function handleRefreshTokenGrant(req: Request, res: Response) {
   const clientId = req.body.client_id || extractClientIdFromAuth(req);
   if (!clientId) return res.status(400).json({ error: 'invalid_request' });
   if (!await authenticateOAuthClient(req, res, clientId)) return;
-  const tokens = await mcpOAuthService.refreshTokens(refresh_token, clientId);
+  // RFC 6749 §6: a refresh may narrow the grant, never widen it.
+  let requestedScopes: string[] | undefined;
+  if (typeof req.body.scope === 'string' && req.body.scope.trim() !== '') {
+    const parsed = parseRequestedScopes(req.body.scope);
+    if (!parsed) return res.status(400).json({ error: 'invalid_scope' });
+    requestedScopes = parsed;
+  }
+  let tokens;
+  try {
+    tokens = await mcpOAuthService.refreshTokens(refresh_token, clientId, requestedScopes);
+  } catch (error) {
+    if (error instanceof InvalidScopeError) {
+      return res.status(400).json({ error: 'invalid_scope', error_description: 'Requested scope exceeds the original grant' });
+    }
+    throw error;
+  }
   if (!tokens) {
     return res.status(400).json({ error: 'invalid_grant', error_description: 'Invalid or expired refresh token' });
   }

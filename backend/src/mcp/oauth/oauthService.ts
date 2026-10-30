@@ -15,6 +15,7 @@ import { isEvaluationUser, requireActiveEvaluation } from '../../services/evalua
 import AWS from "aws-sdk";
 import crypto from "crypto";
 import { v4 as uuidv4 } from "uuid";
+import { formatScopes, grantedOAuthScopes, InvalidScopeError } from "./oauthScopes";
 
 const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 
@@ -46,6 +47,7 @@ export interface OAuthAuthorizationCode {
   userId: string;
   redirectUri: string;
   scope: string;
+  grantedScopes?: string[]; // Absent on codes minted before scopes were validated → mcp:tools only.
   codeChallenge: string;
   codeChallengeMethod: string;
   used: boolean;
@@ -59,6 +61,7 @@ export interface OAuthTokenRecord {
   userId: string;
   clientId: string;
   scope: string;
+  grantedScopes?: string[]; // Absent on tokens issued before scopes were validated → mcp:tools only.
   expiresAt: number; // epoch seconds (DynamoDB TTL)
   refreshExpiresAt: number;
   accessExpiresAt?: number; // Legacy records use expiresAt for access expiry.
@@ -101,7 +104,7 @@ export interface CreateAuthCodeParams {
   clientId: string;
   userId: string;
   redirectUri: string;
-  scope: string;
+  scopes: string[]; // Already validated against SUPPORTED_OAUTH_SCOPES.
   codeChallenge: string;
   codeChallengeMethod: string;
 }
@@ -109,7 +112,7 @@ export interface CreateAuthCodeParams {
 export interface CreateTokenPairParams {
   clientId: string;
   userId: string;
-  scope: string;
+  scopes: string[];
 }
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -283,7 +286,8 @@ export class McpOAuthService {
       clientId: params.clientId,
       userId: params.userId,
       redirectUri: params.redirectUri,
-      scope: params.scope,
+      scope: formatScopes(params.scopes),
+      grantedScopes: [...params.scopes],
       codeChallenge: params.codeChallenge,
       codeChallengeMethod: params.codeChallengeMethod,
       used: false,
@@ -375,7 +379,8 @@ export class McpOAuthService {
       refreshTokenHash,
       userId: params.userId,
       clientId: params.clientId,
-      scope: params.scope,
+      scope: formatScopes(params.scopes),
+      grantedScopes: [...params.scopes],
       // TTL must retain ancestors for replay detection, not just access validity.
       expiresAt: familyExpiresAt ?? nowSec + REFRESH_TOKEN_TTL_SEC,
       accessExpiresAt: Math.min(nowSec + ACCESS_TOKEN_TTL_SEC, familyExpiresAt ?? Infinity),
@@ -391,7 +396,7 @@ export class McpOAuthService {
       refreshToken,
       tokenType: 'Bearer',
       expiresIn: record.accessExpiresAt! - nowSec,
-      scope: params.scope,
+      scope: record.scope,
     } };
   }
 
@@ -453,7 +458,7 @@ export class McpOAuthService {
     }
   }
 
-  private async replayGraceSuccessor(record: OAuthTokenRecord, now: number): Promise<TokenPairResponse | null> {
+  private async replayGraceSuccessor(record: OAuthTokenRecord, now: number, scopes: string[]): Promise<TokenPairResponse | null> {
     // Benign duplicate delivery (multi-process refresh race, retried request after a
     // lost response): the consumed token re-presented within REFRESH_REPLAY_GRACE_SEC
     // of its consumption mints a fresh pair in the same family instead of revoking it.
@@ -464,7 +469,7 @@ export class McpOAuthService {
         !Number.isFinite(record.revokedAtSec) || now - record.revokedAtSec! > REFRESH_REPLAY_GRACE_SEC) return null;
     if (!await this.activeFamily(record)) return null;
     const familyId = record.familyId!;
-    const { record: sibling, response } = this.newTokenPair(record, familyId, record.refreshExpiresAt);
+    const { record: sibling, response } = this.newTokenPair({ clientId: record.clientId, userId: record.userId, scopes }, familyId, record.refreshExpiresAt);
     try {
       await dynamodb.put({
         TableName: this.tokensTable,
@@ -492,7 +497,12 @@ export class McpOAuthService {
     }
   }
 
-  async refreshTokens(rawRefreshToken: string, clientId?: string): Promise<TokenPairResponse | null> {
+  /**
+   * `requestedScopes` (optional, already parsed) may narrow the grant but never
+   * widen it: anything outside the refresh token's own grant throws
+   * InvalidScopeError before the token is consumed. Omitted = keep the grant.
+   */
+  async refreshTokens(rawRefreshToken: string, clientId?: string, requestedScopes?: string[]): Promise<TokenPairResponse | null> {
     if (!clientId) return null;
     const refreshTokenHash = crypto.createHash('sha256').update(rawRefreshToken).digest('hex');
     const result = await dynamodb.query({
@@ -513,8 +523,11 @@ export class McpOAuthService {
     if (isEvaluationUser(record.userId)) {
       try { await requireActiveEvaluation(record.userId); } catch { return null; }
     }
+    const granted = grantedOAuthScopes(record);
+    if (requestedScopes && requestedScopes.some(scope => !granted.includes(scope))) throw new InvalidScopeError();
+    const scopes = requestedScopes ?? granted;
     if (record.revoked) {
-      const graced = await this.replayGraceSuccessor(record, now);
+      const graced = await this.replayGraceSuccessor(record, now, scopes);
       if (graced) return graced;
       await this.revokeFamily(record);
       return null;
@@ -523,7 +536,7 @@ export class McpOAuthService {
     // require fresh authorization rather than accepting an untraceable refresh chain.
     if (!await this.activeFamily(record)) return null;
     const familyId = record.familyId!;
-    const { record: successor, response } = this.newTokenPair(record, familyId, record.refreshExpiresAt);
+    const { record: successor, response } = this.newTokenPair({ clientId: record.clientId, userId: record.userId, scopes }, familyId, record.refreshExpiresAt);
     const conditions = ['revoked = :unused', 'refreshExpiresAt > :now',
       'refreshTokenHash = :hash', 'clientId = :clientId'];
     const values: AWS.DynamoDB.DocumentClient.ExpressionAttributeValueMap = {
@@ -552,7 +565,7 @@ export class McpOAuthService {
       // Only authenticated, correctly bound replay revokes. Storage errors must not
       // masquerade as replay or silently revoke an otherwise usable grant.
       if (current?.revoked && current.clientId === clientId && current.refreshTokenHash === refreshTokenHash) {
-        const graced = await this.replayGraceSuccessor(current, now);
+        const graced = await this.replayGraceSuccessor(current, now, scopes);
         if (graced) return graced;
         await this.revokeFamily(current);
         return null;

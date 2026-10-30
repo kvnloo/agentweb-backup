@@ -2,6 +2,7 @@ import { enforceEvaluationTool } from '../../services/evaluationPolicy';
 import { currentRunFunding, resolveRunFunding, withRunFunding } from '../../services/funding/runFunding';
 import { isAnonymousUserId, buildAnonymousToolRefusal } from '../anonymousToolAccess';
 import { refuseUnauthorizedScheduledPublish, attachPublishRevalidation } from '../../utils/scheduledPublishConsentGuard';
+import { optInScopeRefusal } from './apiKeyScopes';
 
 export interface McpToolHandler {
   name: string;
@@ -70,11 +71,12 @@ export interface McpToolHandler {
    */
   readOnly?: boolean;
   /**
-   * Opt-in API-key scope (e.g. `email:read`) this tool requires. When set:
-   * the MCP HTTP layer lets an `aw_` key call it only if the key explicitly
-   * holds this scope (`tools:execute` does not imply it — see apiKeyScopes.ts),
-   * and `execute()` refuses every other external auth method (OAuth,
-   * anonymous) outright. In-process callers (externalMcp unset) are unaffected.
+   * Opt-in scope (e.g. `email:read`) this tool requires. When set: the MCP
+   * HTTP layer lets an `aw_` key call it only if the key explicitly holds this
+   * scope (`tools:execute` does not imply it — see apiKeyScopes.ts), and an
+   * OAuth sign-in only if the user consented to this scope. `execute()`
+   * refuses every other external caller (anonymous, OAuth without the scope).
+   * In-process callers (externalMcp unset) are unaffected.
    */
   requiredScope?: string;
 }
@@ -159,15 +161,14 @@ export class McpToolRegistry {
       );
     }
 
-    // Opt-in-scope tools are for explicitly scoped `aw_` keys only. The scope
-    // itself is checked per request in mcpServer.ts (the key is re-validated on
-    // every POST); this is the second line, keyed on the session's auth method,
-    // so an OAuth/anonymous external caller can never reach the handler even if
-    // the HTTP-layer check were bypassed or a session were reused.
-    if (handler.requiredScope && context?.externalMcp === true && context?.authMethod !== 'api_key') {
-      throw new Error(
-        `Tool ${name} is only available to API keys granted the '${handler.requiredScope}' scope.`
-      );
+    // Opt-in-scope tools need an explicitly scoped `aw_` key or an OAuth token
+    // the user consented to that scope on. The scope itself is checked per
+    // request in mcpServer.ts (the credential is re-validated on every POST);
+    // this is the second line, keyed on the session context, so an anonymous or
+    // unscoped OAuth caller can never reach the handler even if the HTTP-layer
+    // check were bypassed or a session were reused. Missing scopes fail closed.
+    if (handler.requiredScope && context?.externalMcp === true && !hasOptInScope(context, handler.requiredScope)) {
+      throw new Error(optInScopeRefusal(name, handler.requiredScope));
     }
 
     // ENG-822: refuse account-scoped tools in an anonymous session BEFORE the
@@ -221,6 +222,11 @@ export class McpToolRegistry {
     const runFunding = await resolveRunFunding({ userId: context.userId });
     return await withRunFunding(runFunding, () => handler.execute(args, publishContext));
   }
+}
+
+function hasOptInScope(context: any, requiredScope: string): boolean {
+  if (context?.authMethod === 'api_key') return true;
+  return context?.authMethod === 'oauth' && Array.isArray(context?.oauthScopes) && context.oauthScopes.includes(requiredScope);
 }
 
 export const mcpToolRegistry = new McpToolRegistry();

@@ -23,7 +23,8 @@ import { buildMcpAuthChallenge } from '../oauth/authChallenge';
 export { buildMcpAuthChallenge };
 import { anonymousUserIdForSession, isAnonymousDiscoveryEnabled, isAnonymouslyPermitted } from "./anonymousTransport";
 import { isCronEnabled } from '../../utils/instanceState';
-import { effectiveApiKeyScopes, findApiKeyOnlyToolCall, findScopeDenial } from './apiKeyScopes';
+import { effectiveApiKeyScopes, findOptInScopeDenial, findScopeDenial, optInScopeRefusal } from './apiKeyScopes';
+import { grantedOAuthScopes } from '../oauth/oauthScopes';
 import { mcpToolRegistry } from './registry';
 
 // Rate limiter for MCP requests authenticated via aw_* API keys
@@ -43,6 +44,7 @@ interface SessionEntry {
   apiKeyId?: string;
   oauthClientId?: string;
   oauthClientName?: string;
+  oauthScopes?: string[];
   clientType?: McpClientType;
   userAgent?: string;
 }
@@ -158,6 +160,9 @@ export async function validateMcpAccessToken(req: Request, res: Response, next: 
       (req as any)._mcpAuthMethod = 'oauth';
       (req as any)._mcpOAuthClientId = tokenRecord.clientId;
       (req as any)._mcpOAuthClientName = client?.clientName;
+      // Consented scopes, re-read from the token on every request. Tokens issued
+      // before scopes were validated carry none and resolve to mcp:tools only.
+      (req as any)._mcpOAuthScopes = grantedOAuthScopes(tokenRecord);
       (req as any)._mcpClientType = classifyMcpClient({ clientName: client?.clientName, userAgent: req.get('user-agent') });
       return next();
     }
@@ -272,6 +277,7 @@ export function setupMcpServer(
       apiKeyId: sessionEntry?.apiKeyId || (req as any)?._mcpApiKeyId,
       oauthClientId: sessionEntry?.oauthClientId || (req as any)?._mcpOAuthClientId,
       oauthClientName: sessionEntry?.oauthClientName || (req as any)?._mcpOAuthClientName,
+      oauthScopes: sessionEntry?.oauthScopes || (req as any)?._mcpOAuthScopes,
       clientType: sessionEntry?.clientType || (req as any)?._mcpClientType,
       userAgent: sessionEntry?.userAgent || req?.get('user-agent'),
       clientIp: req?.ip,
@@ -320,16 +326,18 @@ export function setupMcpServer(
         });
       }
     }
-    // Opt-in-scope tools (e.g. read_email / email:read) are for explicitly scoped
-    // aw_ keys only — refuse every other external auth method per request.
+    // Opt-in-scope tools (e.g. read_email / email:read) need that exact scope:
+    // an aw_ key holding it (checked above) or an OAuth token the user consented
+    // to it on. Anonymous and every other external auth method grant none.
     if ((req as any)._mcpIsInternal !== true && (req as any)._mcpAuthMethod !== 'api_key') {
-      const denial = findApiKeyOnlyToolCall(req.body, (name) => mcpToolRegistry.getTool(name));
+      const granted: string[] = (req as any)._mcpAuthMethod === 'oauth' ? ((req as any)._mcpOAuthScopes ?? []) : [];
+      const denial = findOptInScopeDenial(req.body, granted, (name) => mcpToolRegistry.getTool(name));
       if (denial) {
         return res.status(403).json({
           jsonrpc: '2.0',
           error: {
             code: -32003,
-            message: `Forbidden: tool '${denial.tool}' is only available to API keys granted the '${denial.requiredScope}' scope.`,
+            message: `Forbidden: ${optInScopeRefusal(denial.tool, denial.requiredScope)}`,
           },
           id: Array.isArray(req.body) ? null : (req.body?.id ?? null),
         });
@@ -363,6 +371,7 @@ export function setupMcpServer(
           apiKeyId: (req as any)._mcpApiKeyId,
           oauthClientId: (req as any)._mcpOAuthClientId,
           oauthClientName: (req as any)._mcpOAuthClientName,
+          oauthScopes: (req as any)._mcpOAuthScopes as string[] | undefined,
           clientType: (req as any)._mcpClientType as McpClientType | undefined,
           userAgent: req.get('user-agent'),
           sessionId: undefined as string | undefined,
@@ -382,6 +391,7 @@ export function setupMcpServer(
               apiKeyId: sharedState.apiKeyId,
               oauthClientId: sharedState.oauthClientId,
               oauthClientName: sharedState.oauthClientName,
+              oauthScopes: sharedState.oauthScopes,
               clientType: sharedState.clientType,
               userAgent: sharedState.userAgent,
             });

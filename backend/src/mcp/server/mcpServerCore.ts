@@ -47,6 +47,8 @@ export interface McpSessionContext {
   apiKeyId?: string;
   oauthClientId?: string;
   oauthClientName?: string;
+  /** OAuth scopes the user consented to (OAuth sessions only). Gates opt-in-scope tools. */
+  oauthScopes?: string[];
   clientType?: McpClientType;
   userAgent?: string;
   /** Caller address at session creation (req.ip, trust-proxy aware). Used only to rate-limit anonymous calls (ENG-1034). */
@@ -122,6 +124,7 @@ export function createMcpServer(serverName: string = "Emma - GTM Automation Spec
       apiKeyId: sessionContext?.apiKeyId,
       oauthClientId: sessionContext?.oauthClientId,
       oauthClientName: sessionContext?.oauthClientName,
+      oauthScopes: sessionContext?.oauthScopes,
       clientType: sessionContext?.clientType,
       userAgent: sessionContext?.userAgent,
       clientIp: sessionContext?.clientIp,
