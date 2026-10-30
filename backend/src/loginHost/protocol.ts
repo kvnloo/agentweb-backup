@@ -191,6 +191,24 @@ export function admitNewTools(visible: VisibleTools, incoming: ToolDef[]): { ok:
 export const IMAGE_LIMITS = { maxImages: 4, maxBase64Each: 2_500_000, maxBase64Total: 6_000_000 } as const;
 
 /**
+ * The tool manifest as the lines the wrapper reads from stdin (deploy/claude-turn.sh): the decimal BYTE length, then the JSON (the runner adds the newline after
+ * each line, so the block ends in the newline the wrapper expects). MANIFEST_WIRE_MAX_BYTES is the wrapper's own bound (TOOL_LIMITS.maxTotalBytes + 4096).
+ */
+export const MANIFEST_WIRE_MAX_BYTES = TOOL_LIMITS.maxTotalBytes + 4096;
+export function manifestLines(tools: unknown): string[] {
+  const json = JSON.stringify(tools);
+  return [String(Buffer.byteLength(json, "utf8")), json];
+}
+
+/**
+ * The largest tool RESULT the plan route hands to the model, in bytes: the same cap in-process Emma applies (MAX_TOOL_CONTENT_SIZE = 300,000 characters in
+ * agentModeService, the size a result may have when it is persisted and offered back to the model; larger results are cut with a note there). One shared constant:
+ * the backend applies it to the result it posts with turn.toolResult, and the CLI limit below is derived from it. The frame cap
+ * (RELAY_FRAME_LIMITS.hostToShimBytes, 8 MiB) stays far above it: it bounds what the socket carries, not what the model is shown.
+ */
+export const RELAY_RESULT_MAX_BYTES = 300_000;
+
+/**
  * Environment variables of the CLI that RELAY turns set so the CLI itself never silently changes what the plan route offers (names confirmed in the strings of CLI
  * 2.1.314; legacy turns set none of them). Every value is derived from a limit of this file, never a second copy of a number:
  *  - CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH: the CLI shortens an MCP tool description (default 4096 characters, with an ellipsis); the host already refuses one over
@@ -202,14 +220,6 @@ export const IMAGE_LIMITS = { maxImages: 4, maxBase64Each: 2_500_000, maxBase64T
  * (MCP_TIMEOUT is the server start-up timeout in the CLI, not a call limit; CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT, default 30 minutes for stdio, is reset by the shim's
  * progress notifications.)
  */
-/**
- * The largest tool RESULT the plan route hands to the model, in bytes: the same cap in-process Emma applies (MAX_TOOL_CONTENT_SIZE = 300,000 characters in
- * agentModeService, the size a result may have when it is persisted and offered back to the model; larger results are cut with a note there). One shared constant:
- * the backend applies it to the result it posts with turn.toolResult, and the CLI limit below is derived from it. The frame cap
- * (RELAY_FRAME_LIMITS.hostToShimBytes, 8 MiB) stays far above it: it bounds what the socket carries, not what the model is shown.
- */
-export const RELAY_RESULT_MAX_BYTES = 300_000;
-
 export function relayCliEnv(callTimeoutMs: number): Record<string, string> {
   const ms = Math.min(2_147_483_647, Math.max(1000, Math.floor(Number.isFinite(callTimeoutMs) ? callTimeoutMs : 1000)));
   return {

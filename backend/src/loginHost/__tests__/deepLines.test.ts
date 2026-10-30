@@ -367,7 +367,8 @@ describe("CLI stdout: lines nested deeper than the cap are dropped before anythi
       const errors: string[] = [];
       const adapter = new RunnerChildAdapter(child, 16 * 1024 * 1024, () => undefined);
       adapter.on("error", (e: Error) => errors.push(e.message));
-      adapter.stdout.resume();
+      let out = "";
+      adapter.stdout.on("data", (d: Buffer) => (out += d.toString("utf8")));
       const now = jest.spyOn(performance, "now");
       let t = 1000;
       now.mockImplementation(() => t);
@@ -380,8 +381,10 @@ describe("CLI stdout: lines nested deeper than the cap are dropped before anythi
       } finally {
         now.mockRestore();
       }
+      lastOut = out;
       return errors;
     }
+    let lastOut = ""; // what the last clocked() run let through
 
     it("MUTATION TARGET: the event LINE bucket REFILLS: 15,000 honest events over time (3,000 per 2 s, the burst is 5,000, 2,000 a second) never end the stream; 6,000 at once do", async () => {
       const chunk = Buffer.from("{}\n".repeat(3000));
@@ -389,11 +392,65 @@ describe("CLI stdout: lines nested deeper than the cap are dropped before anythi
       expect(await clocked([{ chunks: [Buffer.from("{}\n".repeat(3000)), Buffer.from("{}\n".repeat(3000))], advanceMs: 0 }])).toEqual(["stdout_flood"]);
     });
 
-    it("MUTATION TARGET: the event BYTE bucket REFILLS: 30 MiB of events every 8 s (burst 32 MiB, 4 MiB/s) never ends the stream; 40 MiB at once does", async () => {
+    it("MUTATION TARGET: the event BYTE bucket REFILLS: 60 MiB of events every 16 s (burst 64 MiB, 4 MiB/s) never ends the stream; 70 MiB at once does", async () => {
       const line = Buffer.from('{"s":"' + "a".repeat(1024 * 1024 - 10) + '"}\n'); // 1 MiB
-      const round = { chunks: Array.from({ length: 30 }, () => line), advanceMs: 8000 };
+      const round = { chunks: Array.from({ length: 60 }, () => line), advanceMs: 16_000 };
       expect(await clocked([round, round, round])).toEqual([]);
-      expect(await clocked([{ chunks: Array.from({ length: 40 }, () => line), advanceMs: 0 }])).toEqual(["stdout_flood"]);
+      expect(await clocked([{ chunks: Array.from({ length: 70 }, () => line), advanceMs: 0 }])).toEqual(["stdout_flood"]);
+    });
+
+    it("MUTATION TARGET: the value count RESETS at every line: 3,000 honest events of 100 values each (300,000 in all, twice the per-line cap) lose nothing", async () => {
+      const line = Buffer.from('{"a":[' + "0,".repeat(98) + "0]}\n"); // 100 values
+      expect(await clocked([{ chunks: [Buffer.concat(Array.from({ length: 3000 }, () => line))], advanceMs: 0 }])).toEqual([]);
+      expect(lastOut.split("\n").filter(Boolean)).toHaveLength(3000);
+    });
+
+    it("MUTATION TARGET: an idle turn does not bank credit: an hour of silence refills only up to the 64 MiB burst, so 70 MiB at once still ends the stream", async () => {
+      const line = Buffer.from('{"s":"' + "a".repeat(1024 * 1024 - 10) + '"}\n');
+      const errors = await clocked([
+        { chunks: ["{}\n"], advanceMs: 3_600_000 },
+        { chunks: Array.from({ length: 70 }, () => line), advanceMs: 0 },
+      ]);
+      expect(errors).toEqual(["stdout_flood"]);
+    });
+
+    it("MUTATION TARGET: the same for the junk LINE bucket (an hour idle, then 250 junk lines at once) and the event LINE bucket (6,000 events at once)", async () => {
+      expect(await clocked([{ chunks: ["j\n"], advanceMs: 3_600_000 }, { chunks: ["j\n".repeat(250)], advanceMs: 0 }])).toEqual(["stdout_flood"]);
+      expect(await clocked([{ chunks: ["{}\n"], advanceMs: 3_600_000 }, { chunks: ["{}\n".repeat(6000)], advanceMs: 0 }])).toEqual(["stdout_flood"]);
+    });
+
+    it("MUTATION TARGET: the junk BYTE bucket: burst 1 MiB (an idle hour does not raise it), refill 128 KiB a second", async () => {
+      const junk = (n: number) => "x".repeat(n - 1) + "\n";
+      // burst: 1.5 MiB of junk after an idle hour is still over the 1 MiB burst
+      expect(await clocked([{ chunks: ["j\n"], advanceMs: 3_600_000 }, { chunks: [junk(1_500_000)], advanceMs: 0 }])).toEqual(["stdout_flood"]);
+      // rate: 1,000,000 bytes leaves 48,576; 4 s refill 512 KiB; 500,000 fits; 500,000 more at once does not
+      expect(await clocked([{ chunks: [junk(1_000_000)], advanceMs: 4000 }, { chunks: [junk(500_000)], advanceMs: 0 }])).toEqual([]);
+      expect(await clocked([{ chunks: [junk(1_000_000)], advanceMs: 4000 }, { chunks: [junk(500_000), junk(500_000)], advanceMs: 0 }])).toEqual(["stdout_flood"]);
+    });
+
+    it("MUTATION TARGET: the value cap is exact at both ends (MAX_LINE_VALUES kept, MAX_LINE_VALUES + 1 dropped) and the dropped line is charged to the junk bucket", async () => {
+      const valuesLine = (v: number) => '{"a":[' + "0,".repeat(v - 2) + "0]}\n"; // {  [  and v-2 commas = v values
+      expect(await clocked([{ chunks: [Buffer.from(valuesLine(MAX_LINE_VALUES))], advanceMs: 0 }])).toEqual([]);
+      expect(lastOut).toBe(valuesLine(MAX_LINE_VALUES));
+      expect(await clocked([{ chunks: [Buffer.from(valuesLine(MAX_LINE_VALUES + 1))], advanceMs: 0 }])).toEqual([]);
+      expect(lastOut).toBe(`${PLACEHOLDER}\n`);
+      // charged: six dense lines of ~300 KB each pass the 1 MiB junk byte burst (the comma branch)
+      const dense = Buffer.from(valuesLine(MAX_LINE_VALUES + 1));
+      expect(await clocked([{ chunks: Array.from({ length: 6 }, () => dense), advanceMs: 0 }])).toEqual(["stdout_flood"]);
+    });
+
+    it("MUTATION TARGET: a dense line whose values are OPENERS (the other branch) is dropped and charged too", async () => {
+      const dense = Buffer.from('{"a":[' + "[]".repeat(MAX_LINE_VALUES + 1) + "]}\n");
+      expect(await clocked([{ chunks: [dense], advanceMs: 0 }])).toEqual([]);
+      expect(lastOut).toBe(`${PLACEHOLDER}\n`);
+      expect(await clocked([{ chunks: Array.from({ length: 6 }, () => dense), advanceMs: 0 }])).toEqual(["stdout_flood"]);
+    });
+
+    it("MUTATION TARGET: whitespace-only lines are charged to the junk bucket, by count and by bytes", async () => {
+      expect(await clocked([{ chunks: ["  \n".repeat(300)], advanceMs: 0 }])).toEqual(["stdout_flood"]); // lines
+      expect(await clocked([{ chunks: [" ".repeat(1_500_000) + "\n"], advanceMs: 0 }])).toEqual(["stdout_flood"]); // bytes
+      expect(await clocked([{ chunks: ["  \n".repeat(100)], advanceMs: 0 }])).toEqual([]); // a few are fine
+      expect(lastOut).toBe("");
     });
 
     it("MUTATION TARGET: the bytes of a deep line that never ends are counted against the cap while they are being discarded (overflow, not a free ride)", async () => {

@@ -37,7 +37,7 @@ import type {
   SpawnSpec,
   SubscriptionProviderAdapter,
 } from "../adapter";
-import { qualifiedToolPrefix, RELAY_MCP_SERVER_NAME, relayCliEnv } from "../protocol";
+import { manifestLines, qualifiedToolPrefix, RELAY_MCP_SERVER_NAME, relayCliEnv } from "../protocol";
 import { RELAY_SOCKET_IN_UNIT } from "../ports/unitArgs";
 import { approxJsonBytes, LogThrottle, MAX_CLI_LINE_DEPTH, MAX_FORWARDED_BYTES, MAX_FORWARDED_DEPTH, valueDepthExceeds } from "../relay/bounds";
 import { canonicalJson } from "../relay/canonical";
@@ -170,10 +170,11 @@ export const EVENT_LINES_PER_SEC = 2000;
 /**
  * Bytes of event lines. The runner JSON.parses every forwarded line (about 5 ms and 20 MB of heap per MB for an array of numbers), so bytes, not only lines, are
  * what a hostile CLI spends. Honest traffic: the CLI echoes each tool result once in a `user` event (up to the relay\'s 8 MiB frame) and the final result text, plus
- * small events; a turn with several big results is a burst of tens of MiB, then quiet. Burst 32 MiB (four maximum-size results), sustained 4 MiB/s (1 MiB lines
- * measured at 96 lines/s, event-loop utilization 0.98, never touched the line bucket).
+ * small events; a turn with several big results is a burst of tens of MiB, then quiet. Burst 64 MiB: a 6 MB image result (base64 in the echoed `user` event) echoed twice
+ * is 12 MB, and several of those in a few seconds must not be killed; sustained 4 MiB/s (1 MiB lines measured at 96 lines/s, event-loop utilization 0.98, never
+ * touched the line bucket, so the byte bucket is what ends that).
  */
-export const EVENT_BYTE_BURST = 32 * 1024 * 1024;
+export const EVENT_BYTE_BURST = 64 * 1024 * 1024;
 export const EVENT_BYTES_PER_SEC = 4 * 1024 * 1024;
 /**
  * Values (commas, objects and arrays outside strings) in ONE event line. A 16 MB array of `0` is 8 million values (488 ms and +357 MB of heap in JSON.parse), an
@@ -941,7 +942,7 @@ class ClaudeSession implements ProviderSession {
           bearerToken: "",
           stdio: { command: relay.nodePath, args: [relay.shimPath], env: { AW_RELAY_SOCKET: RELAY_SOCKET_IN_UNIT, AW_RELAY_TOOLS: join(this.cfg.unitTmp, "aw-cfg", "tools.json") } },
         };
-        extraLines = [JSON.stringify(input.relay.tools)];
+        extraLines = manifestLines(input.relay.tools);
       } else {
         if (input.bridgeToken === undefined) throw Object.assign(new Error("no_tool_transport"), { code: "open_failed" });
         mcpServer = { name: this.cfg.mcpServerName, url: this.cfg.bridgeUrl, bearerToken: input.bridgeToken };
