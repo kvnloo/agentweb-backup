@@ -7,6 +7,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, existsSync, rea
 import { tmpdir } from "os";
 import { join } from "path";
 import * as net from "net";
+import { CpuMeter } from "../../relay/cpuMeter";
 import { connect, type Socket } from "net";
 import { Layout } from "../../ports/layout";
 import { RelayHost, resultFrameBytes, type RelayCall, type RelayEndpoint, type RelayLimits, type RelayOpenOptions } from "../../relay/relayServer";
@@ -46,6 +47,7 @@ function rig(limits: Partial<RelayLimits> = {}): Rig {
         onCallEnded: (op, why) => void ended.push([op, why]),
         allowTool: over.allowTool ?? ((n) => n === "echo" || n === "slow"),
         callTimeoutMs: over.callTimeoutMs ?? (() => 5_000),
+        ...(over.meter ? { meter: over.meter } : {}),
       });
       return { ep, calls, ended };
     },
@@ -365,6 +367,23 @@ describe("relay: limits and abuse", () => {
     console.log("key-count frame refused in ms", ms.toFixed(1));
     expect(ms).toBeLessThan(2000);
     expect(r.logs.map((l) => l.fields?.code)).toContain("bad_frame");
+    await ep.close();
+  });
+
+  it("MUTATION TARGET: frame handling is charged to the turn's CPU meter: once it is spent the connection is dropped (cpu_budget) and the endpoint stays closed to a new one", async () => {
+    const r = rig();
+    let t = 0;
+    const meter = new CpuMeter(100, 0, () => (t += 30)); // every metered section reads as 30 ms
+    const { ep } = await r.open({ meter });
+    const c = new Client(sockOf(ep));
+    await c.ready();
+    for (let i = 0; i < 8 && !c.closed; i++) {
+      c.send({ type: "ping" });
+      await new Promise((res) => setTimeout(res, 20));
+    }
+    await until(() => c.closed);
+    expect(meter.exhausted).toBe(true);
+    expect(r.logs.map((l) => l.fields?.code)).toContain("cpu_budget");
     await ep.close();
   });
 

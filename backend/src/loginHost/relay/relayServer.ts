@@ -21,6 +21,7 @@ import { createServer, type Server, type Socket } from "net";
 import type { Logger } from "../ports";
 import type { Layout } from "../ports/layout";
 import { RELAY_FRAME_LIMITS, TOOL_NAME, type ToolDef } from "../protocol";
+import { CpuMeter, TokenBucket } from "./cpuMeter";
 import { LineAssembler, LogThrottle, MAX_FRAME_DEPTH, rawJsonDepthExceeds } from "./bounds";
 
 export interface RelayIdentity {
@@ -90,6 +91,8 @@ export interface RelayOpenOptions {
   allowTool(name: string): boolean;
   /** Milliseconds a call that starts now may take. */
   callTimeoutMs(): number;
+  /** The turn's CPU meter, shared with the adapter: frame handling is charged to it. A turn without one gets its own. */
+  meter?: CpuMeter;
 }
 
 export interface RelayEndpoint {
@@ -212,6 +215,7 @@ class Endpoint implements RelayEndpoint {
     private readonly sharedThrottle: LogThrottle,
     private readonly throttle: LogThrottle,
   ) {
+    this.meter = o.meter ?? new CpuMeter();
     this.server = createServer((s) => {
       try {
         this.onConnection(s);
@@ -226,6 +230,8 @@ class Endpoint implements RelayEndpoint {
   }
 
   private refusals = 0;
+  private readonly meter: CpuMeter;
+  private readonly reads = new TokenBucket(2000, 1000);
   private callsRelayed = 0;
   private callCapLogged = false;
   /** No more connections are accepted (the connected one, if any, stays). The kernel refuses further connects; close() still removes the directory. */
@@ -295,7 +301,10 @@ class Endpoint implements RelayEndpoint {
     });
     s.on("data", (chunk: Buffer) => {
       try {
-        onData(chunk);
+        // each read is metered: the whole synchronous handling (scan, parse, validate, the adapter's onCall) is charged to the turn's CPU meter
+        if (this.meter.exhausted) return this.drop(s, "cpu_budget");
+        if (!this.reads.take()) return this.drop(s, "rate_limited");
+        this.meter.time(() => onData(chunk));
       } catch {
         // Nothing a shim sends may throw out of an event handler: that would be an uncaught exception, which ends the whole host. Drop the connection, fixed code.
         this.drop(s, "internal_error");

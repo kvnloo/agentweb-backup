@@ -50,7 +50,7 @@ describe("content blocks of one message are bounded", () => {
     const content = Array.from({ length: 1000 }, (_, i) => ({ type: "text", text: "t" + i }));
     const evs = normalizeClaudeEvent({ type: "assistant", message: { content } });
     expect(evs).toHaveLength(MAX_BLOCKS_NORMALIZED);
-    expect(MAX_BLOCKS_NORMALIZED).toBe(256);
+    expect(MAX_BLOCKS_NORMALIZED).toBe(32);
   });
 
   it("MUTATION TARGET: the same for tool_result blocks of a user message", () => {

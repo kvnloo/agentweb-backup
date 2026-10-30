@@ -144,6 +144,35 @@ describe("a hostile CLI printing a deeply nested line", () => {
   });
 });
 
+describe("one line cannot fan out into a flood of events", () => {
+  const manyBlocks = (n: number, id: string) => ({ type: "assistant", message: { id, content: Array.from({ length: n }, (_, i) => ({ type: "text", text: "b" + i })) } });
+
+  it("MUTATION TARGET: a 5,000-block line yields at most the first 32 blocks as events (not 5,000)", async () => {
+    const rig = makeRig();
+    rig.scenario({ turn: [manyBlocks(5000, "m1"), RESULT_STEP] });
+    const session = await rig.adapter.openSession(rig.ctx, { connectionId: "conn1", epoch: 3 });
+    const events: ProviderEvent[] = [];
+    for await (const ev of session.turn({ turnId: "t1", prompt: "go", model: "sonnet", relay: { tools: TOOLS, callTimeoutMs: () => 5000 } })) events.push(ev);
+    await session.close();
+    expect(events.filter((e) => e.type === "text")).toHaveLength(32);
+    expect(events[events.length - 1]).toMatchObject({ type: "result", ok: true });
+  });
+
+  it("MUTATION TARGET: a flood of 32-block lines (3,200 events in a burst, over the 2,000 normalized-events bucket) ends the turn: event_flood is logged once and the events stop", async () => {
+    const rig = makeRig();
+    rig.scenario({ turn: [...Array.from({ length: 100 }, (_, i) => manyBlocks(32, "m" + i)), RESULT_STEP] });
+    const session = await rig.adapter.openSession(rig.ctx, { connectionId: "conn1", epoch: 3 });
+    const events: ProviderEvent[] = [];
+    const t0 = Date.now();
+    for await (const ev of session.turn({ turnId: "t1", prompt: "go", model: "sonnet", relay: { tools: TOOLS, callTimeoutMs: () => 5000 } })) events.push(ev);
+    await session.close();
+    console.log("RESULT cpu events flood", JSON.stringify({ ms: Date.now() - t0, events: events.length }));
+    expect(events.filter((e) => e.type === "text").length).toBeLessThanOrEqual(2000);
+    expect(rig.logs.filter((l) => l.event === "event_flood")).toHaveLength(1);
+    expect(events.some((e) => e.type === "result" && e.ok === true)).toBe(false);
+  });
+});
+
 /** The relay replaced by a stub that hands the test its callbacks, so a call can be injected exactly as a bug in the relay would deliver it. */
 function stubbed(messageIdWaitMs = 100, answerThrows = false) {
   const rig = makeRig(messageIdWaitMs);
@@ -253,14 +282,14 @@ describe("a hostile unit and a hostile CLI together cannot stall the loop by mak
     await w.stop();
   });
 
-  it("MUTATION TARGET: MAX_BLOCKS_PER_EVENT: of a 300-block event only the first 256 blocks are considered (a tool_use in block 255 is recorded, one in block 256+ is not)", async () => {
+  it("MUTATION TARGET: MAX_BLOCKS_PER_EVENT: of a 300-block event only the first 32 blocks are considered (a tool_use in block 31 is recorded, one in block 32+ is not)", async () => {
     const w = await withWaitingCall({ q: "x" }, 20);
     (w.session as unknown as { visibleTools: Set<string> }).visibleTools.add("other"); // (not the waiting call's tool, so an announcement is kept rather than claimed by it)
     const uses = () => (w.session as unknown as { streamUses: Array<{ messageId: string }> }).streamUses;
     const filler = (n: number) => Array.from({ length: n }, () => ({ type: "text", text: "t" }));
     const use = (id: string) => ({ type: "tool_use", id, name: "mcp__emma__other", input: { id } });
-    w.session.noteStreamUse({ type: "assistant", message: { id: "mIn", content: [...filler(255), use("in")] } }); // index 255: the 256th block
-    w.session.noteStreamUse({ type: "assistant", message: { id: "mOut", content: [...filler(256), use("out")] } }); // index 256: the 257th
+    w.session.noteStreamUse({ type: "assistant", message: { id: "mIn", content: [...filler(31), use("in")] } }); // index 31: the 32nd block
+    w.session.noteStreamUse({ type: "assistant", message: { id: "mOut", content: [...filler(32), use("out")] } }); // index 32: the 33rd
     const ids = uses().map((u) => u.messageId);
     expect(ids).toContain("mIn");
     expect(ids).not.toContain("mOut");
