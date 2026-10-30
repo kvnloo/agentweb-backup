@@ -52,10 +52,17 @@ const STATUSES: Array<{ status: SmartleadEmailStatus | null; kind: SmartleadEven
 ];
 
 const seen = new Map<string, { at: number; for: number }>();
+/**
+ * A contact that looks genuinely bounced (in Smartlead's bounced list, not in its sender-side list) is acted on only when it looks so on TWO passes at
+ * least this far apart. The two lists are separate reads and might not change at the same moment, and a block ends in an irreversible withdrawal; the
+ * poll is only a backstop (the webhook delivers a genuine bounce at once), so waiting one pass costs nothing. In memory: a restart starts the wait again.
+ */
+export const BOUNCE_CONFIRM_AFTER_MS = 45 * 60 * 1000;
+const pendingBounce = new Map<string, number>();
 /** When each campaign was last polled, so that when there are more campaigns than one pass covers, the longest-waiting go first and none starve. */
 const lastPolled = new Map<number, number>();
 const loggedAt = new Map<string, number>();
-export const __resetEventPoll = () => { seen.clear(); loggedAt.clear(); lastPolled.clear(); };
+export const __resetEventPoll = () => { seen.clear(); loggedAt.clear(); lastPolled.clear(); pendingBounce.clear(); };
 
 export interface PollDeps {
   db: {
@@ -75,6 +82,8 @@ export interface PollDeps {
   windowDays?: number;
   maxCampaigns?: number;
   maxPages?: number;
+  /** How long a genuine-looking bounce waits for a second sighting (tests set 0 to switch the wait off). */
+  bounceConfirmAfterMs?: number;
 }
 
 export interface PollResult {
@@ -166,7 +175,8 @@ export async function eventPoll(deps: PollDeps): Promise<PollResult> {
         for (let page = 0; page < pages; page++) {
           const { total, rows: leads } = await deps.smartlead.listLeads(resolved!.apiKey, campaignId, "is_sender_bounced", page * PAGE, PAGE);
           for (const l of leads) ids.add(l.leadId);
-          if ((page + 1) * PAGE >= total || leads.length === 0) return ids;
+          if ((page + 1) * PAGE >= total) return ids;
+          if (leads.length === 0) return null; // an empty page before the end: the list is not complete
         }
         return null; // more than the pages read: the exclusion cannot be proven, so no bounce is acted on
       };
@@ -176,22 +186,6 @@ export async function eventPoll(deps: PollDeps): Promise<PollResult> {
         // the kinds that rest on the filter alone. Opt-outs carry Smartlead's own flag on each contact, so they are still read.
         if (campaignSize === undefined && kind !== "unsubscribe") continue;
         const maxPages = deps.maxPages ?? POLL_MAX_PAGES;
-        if (kind === "bounce") {
-          if (senderSide === undefined) {
-            try {
-              senderSide = await readSenderSide();
-            } catch (error) {
-              if (error instanceof SmartleadApiError && (error.status === 401 || error.status === 403)) throw error;
-              senderSide = null;
-              logOnce(deps, `${campaignId}#sender#read`, `[SmartleadPoll] campaign=${campaignId}: could not read Smartlead's sender-side bounces (${scrubSmartleadSecrets(error instanceof Error ? error.message : String(error)).slice(0, 80)})`);
-            }
-          }
-          if (senderSide === null) {
-            out.errors++;
-            logOnce(deps, `${campaignId}#sender#skip`, `[SmartleadPoll] campaign=${campaignId}: sender-side bounces are not known, so bounces are not acted on for it this pass`);
-            continue;
-          }
-        }
         // One read failing (a rate limit, a timeout) must not cost the other kinds of event, every hour, because the order is fixed. A key that
         // is refused is the exception: nothing else can work, so it goes to the campaign's handler below.
         try {
@@ -204,11 +198,36 @@ export async function eventPoll(deps: PollDeps): Promise<PollResult> {
               out.errors++;
               break;
             }
+            // Smartlead's sender-side list is needed only when there IS something bounced, so it is read here, after the first bounced page has rows.
+            if (kind === "bounce" && leads.length > 0 && senderSide === undefined) {
+              try {
+                senderSide = await readSenderSide();
+              } catch (error) {
+                if (error instanceof SmartleadApiError && (error.status === 401 || error.status === 403)) throw error;
+                senderSide = null;
+                logOnce(deps, `${campaignId}#sender#read`, `[SmartleadPoll] campaign=${campaignId}: could not read Smartlead's sender-side bounces (${scrubSmartleadSecrets(error instanceof Error ? error.message : String(error)).slice(0, 80)})`);
+              }
+            }
+            if (kind === "bounce" && leads.length > 0 && senderSide === null) {
+              out.errors++;
+              logOnce(deps, `${campaignId}#sender#skip`, `[SmartleadPoll] campaign=${campaignId}: sender-side bounces are not known, so bounces are not acted on for it this pass`);
+              break;
+            }
             for (const lead of leads) {
               // An opt-out is believed only when Smartlead's own flag on the contact says so, however the row was found.
               if (kind === "unsubscribe" && !lead.unsubscribed) { if (emailStatus) flagUnset++; continue; }
               // A bounce from our own sending side is not about this contact.
-              if (kind === "bounce" && senderSide!.has(lead.leadId)) continue;
+              if (kind === "bounce") {
+                const waiting = `${accountId}#${campaignId}#bounce#${lead.leadId}`;
+                if (senderSide!.has(lead.leadId)) { pendingBounce.delete(waiting); continue; }
+                // Looks genuine: act only once it has looked so on an earlier pass too (see BOUNCE_CONFIRM_AFTER_MS).
+                const confirmAfter = deps.bounceConfirmAfterMs ?? BOUNCE_CONFIRM_AFTER_MS;
+                if (confirmAfter > 0) {
+                  const first = pendingBounce.get(waiting);
+                  if (first === undefined) { pendingBounce.set(waiting, deps.now().getTime()); if (pendingBounce.size > 100_000) pendingBounce.clear(); continue; }
+                  if (deps.now().getTime() - first < confirmAfter) continue;
+                }
+              }
               const memo = `${accountId}#${campaignId}#${kind}#${lead.leadId}`;
               const last = seen.get(memo);
               if (last !== undefined && deps.now().getTime() - last.at < last.for) continue;
