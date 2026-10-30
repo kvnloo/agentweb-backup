@@ -9,6 +9,7 @@
  * `claude-turn.sh` wrapper on stdin (never argv, env or a persistent file).
  */
 import { EventEmitter } from "events";
+import { performance } from "perf_hooks";
 import { Transform } from "stream";
 import { join } from "path";
 import {
@@ -125,6 +126,10 @@ export class RunnerChildAdapter extends EventEmitter implements RunnerChild {
         this.emit("error", new Error("stdout_line_too_long"));
       },
       onDeepLine,
+      () => {
+        this.kill();
+        this.emit("error", new Error("stdout_flood"));
+      },
     );
     child.stdout.on("error", () => undefined);
     child.stdout.pipe(this.stdout);
@@ -154,83 +159,188 @@ export class RunnerChildAdapter extends EventEmitter implements RunnerChild {
 const NEWLINE = Buffer.from("\n");
 const LINE_DROPPED = Buffer.from("\n{\"type\":\"aw_line_dropped\"}\n");
 
+/** Budgets for stdout lines that are NOT events (junk, blank, incomplete): a CLI printing them fast costs the host's event loop (the runner JSON.parses every non-empty line and throws on junk). */
+export const JUNK_LINE_BURST = 200;
+export const JUNK_LINES_PER_SEC = 50;
+export const JUNK_BYTE_BURST = 1024 * 1024;
+export const JUNK_BYTES_PER_SEC = 128 * 1024;
+/** Budget for lines that ARE event-shaped: honest streams are a few dozen events a second; a flood of tiny valid ones (`{}`) is as costly as junk. */
+export const EVENT_LINE_BURST = 5000;
+export const EVENT_LINES_PER_SEC = 2000;
+
 /**
- * Passes bytes through and calls `onOverflow` once if a single line (bytes since the last newline) exceeds `max`; nothing after that is forwarded.
- * It ALSO bounds the JSON nesting of every line BEFORE the runner parses it: a line nested deeper than MAX_CLI_LINE_DEPTH (real events are a handful of levels
- * deep) is cut where it passes the limit, the rest of it is discarded up to its newline and replaced by a fixed placeholder line, and `onDeep` is called. A
- * megabytes-deep line would otherwise cost the host seconds of event-loop time in JSON.parse. One pass over the bytes, no recursion; the scanner state
- * (depth, in-string, escape) survives chunk boundaries.
+ * THE single authority on what a line of the CLI's stdout is (the runner's readline reads what comes out of here). It
+ *  - calls `onOverflow` once if a single line exceeds `max` bytes, and forwards nothing after that;
+ *  - bounds the JSON nesting of every line BEFORE anything parses it: a line nested deeper than MAX_CLI_LINE_DEPTH is cut where it passes the limit, the rest
+ *    of it is discarded up to its end and replaced by a fixed placeholder line (`onDeep`); a megabytes-deep line would cost seconds in JSON.parse;
+ *  - rewrites every lone \r and every \r\n to ONE \n (the runner's readline ends a line at \n, \r\n and a lone \r; U+2028/2029 do not split), so the runner
+ *    sees exactly the lines counted here (state survives chunk edges; empty lines are ignored by the runner);
+ *  - forwards ONLY event-shaped lines: a real stream-json event is one complete JSON object, so the first non-space byte is `{` and the last is `}` with the
+ *    nesting back at zero outside a string. Everything else (`x`, `{`, `[1]`, an unterminated object) is dropped before the runner JSON.parses it and throws.
+ *    An event line is held (copied into one growing buffer, never more than `max`) until its end, so the decision does not depend on how the bytes were chunked;
+ *  - charges junk and blank lines (lines/s and bytes/s) and event-shaped lines (lines/s) to token buckets: past them the stream is treated like an overflow
+ *    (`onFlood`: the CLI is killed). Honest output is a few events per second and no junk.
+ * One pass over the bytes, no recursion, `indexOf` rather than a rescan per dropped line, and no extra buffer per \r (the chunk is copied once, on the first
+ * \r, and rewritten in place).
  */
-class LineLimit extends Transform {
+export class LineLimit extends Transform {
   private run = 0;
   private tripped = false;
   private depth = 0;
   private inString = false;
   private esc = false;
-  private dropping = false;
+  /** 0: forwarding; 1: the rest of a too-deep line is being discarded; 2: the rest of a junk line is being discarded. */
+  private skipping: 0 | 1 | 2 = 0;
+  private lineStarted = false;
+  private lastSig = 0;
   private afterCR = false;
+  /** The part of an unfinished event line seen in earlier chunks (one buffer, copied into: it never keeps a read buffer alive). */
+  private carry: Buffer | undefined;
+  private carryLen = 0;
+  /** Lines dropped because they were not events (a counter, for tests and diagnostics). */
+  junkLines = 0;
+  private lineTokens = JUNK_LINE_BURST;
+  private byteTokens = JUNK_BYTE_BURST;
+  private eventTokens = EVENT_LINE_BURST;
+  private lastRefill = performance.now();
   constructor(
     private readonly max: number,
     private readonly onOverflow: () => void,
     private readonly onDeep: () => void = () => undefined,
+    private readonly onFlood: () => void = onOverflow,
   ) {
     super();
   }
-  private resetLine(): void {
+  private endLine(): void {
     this.run = 0;
     this.depth = 0;
     this.inString = false;
     this.esc = false;
-    this.dropping = false;
+    this.skipping = 0;
+    this.lineStarted = false;
+    this.lastSig = 0;
   }
-  /**
-   * THE authority on what a line is. The runner's readline ends a line at \n, at \r\n and at a LONE \r (U+2028/2029 and the other Unicode separators do not
-   * split), so a scanner that knows only \n can be shown one string-containing line while readline hands JSON.parse a deep segment. Here every \r is
-   * rewritten to \n and the \n that follows a \r is swallowed (also across a chunk edge): what leaves this stream has \n as its ONLY separator, so the runner
-   * sees exactly the lines counted here. Empty lines are ignored by the runner.
-   */
+  private stop(cb: (err?: Error | null, data?: Buffer) => void, why: () => void): void {
+    this.tripped = true;
+    this.carry = undefined;
+    why();
+    cb();
+  }
+  private carryAppend(src: Buffer): void {
+    const need = this.carryLen + src.length;
+    if (!this.carry || need > this.carry.length) {
+      const next = Buffer.allocUnsafe(Math.max(need, Math.min(this.max, Math.max(this.carry?.length ?? 0, 4096) * 2)));
+      if (this.carry) this.carry.copy(next, 0, 0, this.carryLen);
+      this.carry = next;
+    }
+    src.copy(this.carry, this.carryLen);
+    this.carryLen = need;
+  }
+  /** The carried head of the line, as a buffer of its own; the carry is released (a large one is never kept for the next line). */
+  private takeCarry(): Buffer {
+    const head = Buffer.from(this.carry!.subarray(0, this.carryLen));
+    this.carryLen = 0;
+    if (this.carry!.length > 64 * 1024) this.carry = undefined;
+    return head;
+  }
+  private dropCarry(): void {
+    this.carryLen = 0;
+    if (this.carry && this.carry.length > 64 * 1024) this.carry = undefined;
+  }
+  get retained(): { capacity: number; pending: number } {
+    return { capacity: this.carry?.length ?? 0, pending: this.carryLen };
+  }
+  override _flush(cb: (err?: Error | null) => void): void {
+    // the stream ended in the middle of a line: readline delivers an unterminated last line, so a complete object is still forwarded
+    if (!this.tripped && this.skipping === 0 && this.lineStarted && this.depth === 0 && !this.inString && this.lastSig === 0x7d && this.carryLen > 0) this.push(this.takeCarry());
+    cb();
+  }
   override _transform(chunk: Buffer, _enc: BufferEncoding, cb: (err?: Error | null, data?: Buffer) => void): void {
     if (this.tripped) return cb();
+    const n = chunk.length;
     const out: Buffer[] = [];
+    let buf = chunk; // copied on the first \r (see above); scanning always reads `chunk`
     let start = 0; // start of the bytes still to be forwarded
-    for (let i = 0; i < chunk.length; i++) {
-      const c = chunk[i];
-      if (this.dropping) {
-        // skip to the next line terminator (\n or \r), counting the bytes against the line cap
-        const x = chunk.indexOf(10, i);
-        const y = chunk.indexOf(13, i);
-        const nl = x < 0 ? y : y < 0 ? x : Math.min(x, y);
-        const skipTo = nl < 0 ? chunk.length : nl;
-        this.run += skipTo - i;
-        if (this.run > this.max) return this.overflow(cb);
+    let lineBeg = 0; // where the current line begins in this chunk (0: it began earlier, or begins here)
+    let nextLF = -2; // cached positions of the next \n and \r at or after i (-1: none left)
+    let nextCR = -2;
+    let jl = 0; // non-event lines seen in this chunk
+    let jb = 0; // bytes of non-event lines
+    let el = 0; // event-shaped lines seen in this chunk
+    let i = 0;
+    while (i < n) {
+      if (this.skipping !== 0) {
+        if (nextLF !== -1 && nextLF < i) nextLF = chunk.indexOf(10, i);
+        if (nextCR !== -1 && nextCR < i) nextCR = chunk.indexOf(13, i);
+        const nl = nextLF < 0 ? nextCR : nextCR < 0 ? nextLF : Math.min(nextLF, nextCR);
+        const end = nl < 0 ? n : nl;
+        this.run += end - i;
+        if (this.skipping === 2) jb += end - i;
+        if (this.run > this.max) return this.stop(cb, this.onOverflow);
         if (nl < 0) {
-          start = chunk.length;
+          start = n;
           break;
         }
-        this.resetLine();
         this.afterCR = chunk[nl] === 13;
-        start = nl + 1; // the terminator itself is part of the placeholder line already sent
-        i = nl;
+        this.endLine();
+        start = lineBeg = i = nl + 1; // the terminator itself is dropped (a placeholder line, if any, was sent complete)
         continue;
       }
+      const c = chunk[i];
       if (c === 10 && this.afterCR) {
         // the \n of a \r\n: the \r was already turned into the line end
         this.afterCR = false;
-        out.push(chunk.subarray(start, i));
-        start = i + 1;
+        if (i > start) out.push(buf.subarray(start, i));
+        start = lineBeg = ++i;
         continue;
       }
       this.afterCR = false;
       if (c === 13 || c === 10) {
-        this.resetLine();
         if (c === 13) {
-          out.push(chunk.subarray(start, i), NEWLINE);
-          start = i + 1;
+          if (buf === chunk) buf = Buffer.from(chunk);
+          buf[i] = 10;
           this.afterCR = true;
         }
+        if (!this.lineStarted) {
+          jl++; // a blank line
+        } else if (this.depth === 0 && !this.inString && this.lastSig === 0x7d) {
+          el++; // a complete object: forwarded (the carried head of it first)
+          if (this.carryLen > 0) out.push(this.takeCarry());
+        } else {
+          // event-shaped at the start, but not a complete object: it would only make the runner's JSON.parse throw
+          jl++;
+          jb += this.run;
+          this.junkLines++;
+          this.dropCarry();
+          if (lineBeg > start) out.push(buf.subarray(start, lineBeg));
+          start = i + 1;
+        }
+        this.endLine();
+        lineBeg = ++i;
         continue;
       }
-      if (++this.run > this.max) return this.overflow(cb);
+      if (!this.lineStarted) {
+        if (c === 0x20 || c === 0x09) {
+          if (++this.run > this.max) return this.stop(cb, this.onOverflow);
+          i++;
+          continue;
+        }
+        if (c !== 0x7b) {
+          // not an event: forward what precedes this line, discard the rest of it
+          if (lineBeg > start) out.push(buf.subarray(start, lineBeg));
+          start = n;
+          this.skipping = 2;
+          this.junkLines++;
+          jl++;
+          jb++;
+          this.run++;
+          i++;
+          continue;
+        }
+        this.lineStarted = true;
+      }
+      if (++this.run > this.max) return this.stop(cb, this.onOverflow);
+      if (c !== 0x20 && c !== 0x09) this.lastSig = c;
       if (this.inString) {
         if (this.esc) this.esc = false;
         else if (c === 0x5c) this.esc = true;
@@ -238,20 +348,32 @@ class LineLimit extends Transform {
       } else if (c === 0x22) this.inString = true;
       else if (c === 0x7b || c === 0x5b) {
         if (++this.depth > MAX_CLI_LINE_DEPTH) {
-          out.push(chunk.subarray(start, i), LINE_DROPPED); // what came before this point, the line ended, a placeholder
-          this.dropping = true;
-          start = chunk.length;
+          if (this.carryLen > 0) out.push(this.takeCarry());
+          out.push(buf.subarray(start, i), LINE_DROPPED); // what came before this point, the line ended, a placeholder
+          this.skipping = 1;
+          start = n;
           this.onDeep();
         }
       } else if ((c === 0x7d || c === 0x5d) && this.depth > 0) this.depth--;
+      i++;
     }
-    if (start < chunk.length) out.push(chunk.subarray(start));
-    cb(null, out.length === 1 ? out[0] : Buffer.concat(out));
-  }
-  private overflow(cb: (err?: Error | null, data?: Buffer) => void): void {
-    this.tripped = true;
-    this.onOverflow();
-    cb();
+    // the chunk ended: an unfinished event line is held (copied) until its end, whitespace before a line's first byte is dropped
+    if (this.skipping === 0) {
+      if (lineBeg > start) out.push(buf.subarray(start, lineBeg));
+      if (this.lineStarted && lineBeg < n) this.carryAppend(buf.subarray(lineBeg));
+      start = n;
+    }
+    if (start < n) out.push(buf.subarray(start));
+    if (jl > 0 || jb > 0 || el > 0) {
+      const now = performance.now();
+      const dt = Math.max(0, now - this.lastRefill) / 1000;
+      this.lastRefill = now;
+      this.lineTokens = Math.min(JUNK_LINE_BURST, this.lineTokens + dt * JUNK_LINES_PER_SEC) - jl;
+      this.byteTokens = Math.min(JUNK_BYTE_BURST, this.byteTokens + dt * JUNK_BYTES_PER_SEC) - jb;
+      this.eventTokens = Math.min(EVENT_LINE_BURST, this.eventTokens + dt * EVENT_LINES_PER_SEC) - el;
+      if (this.lineTokens < 0 || this.byteTokens < 0 || this.eventTokens < 0) return this.stop(cb, this.onFlood);
+    }
+    cb(null, out.length === 0 ? undefined : out.length === 1 ? out[0] : Buffer.concat(out));
   }
 }
 
@@ -502,7 +624,7 @@ export class ClaudeAdapter implements SubscriptionProviderAdapter {
   mapError(raw: unknown): ErrorKind {
     if (raw instanceof ClaudeCliTurnError) return "transient";
     const message = (raw instanceof Error ? raw.message : typeof raw === "string" ? raw : "").slice(0, MAX_CLASSIFY_CHARS); // bounded: the patterns below must never scan CLI-controlled text of any length
-    if (/mcp server .* is not connected|stdout_line_too_long/i.test(message)) return "transient";
+    if (/mcp server .* is not connected|stdout_line_too_long|stdout_flood/i.test(message)) return "transient";
     if ((raw as { code?: string } | null)?.code === "open_failed") return "transient";
     return failureClassToKind(classifyFailureText(message)); // never auth_dead: host faults must not park a healthy login
   }
