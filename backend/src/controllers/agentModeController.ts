@@ -61,7 +61,7 @@ import { CHAT_BRANCHING_ENABLED_SETTING, isChatBranchingSettingEnabled, healLega
 import { compareSaveAlternatives } from '../services/agentMode/compareSaveAlternativesInstance';
 import { LEGACY_MODEL_ALIASES } from '../services/agentMode/llmModelRegistry';
 import { resolveRunFunding } from '../services/funding/runFunding';
-import { isContextLimitError, isProviderNoEndpointsError, isSessionLimitError, isTransientLLMError, isProviderDeserializationError, PROVIDER_DESERIALIZATION_ERROR_CLASS, isWorkerShutdownError, isProviderUnavailableError } from '../utils/agentModeErrors';
+import { isContextLimitError, isProviderNoEndpointsError, isSessionLimitError, isTransientLLMError, isProviderDeserializationError, PROVIDER_DESERIALIZATION_ERROR_CLASS, isWorkerShutdownError, isDrainCeilingShutdownError, isProviderUnavailableError } from '../utils/agentModeErrors';
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
@@ -9012,7 +9012,17 @@ export async function runScheduledChat(
     // event with automatic recovery, not a defect — don't file a Linear issue for
     // it (the deduped oncall alert below still records the occurrence). One that
     // could NOT be requeued (paused, cap exhausted, write failed) still files.
-    const skipAutoIssue = workerShutdownInterrupted && Boolean(zeroAssistantRequeuedAt);
+    // ENG-2750: the same holds when the drain hit BEFORE any assistant output
+    // (zero-output path) — but only for the FIRST requeue. A drain retry is
+    // bounded to one silent attempt; if the retried run fails too, it files.
+    // Only the drain-ceiling shutdown qualifies — a subprocess crash ("Worker
+    // process exited with code ...", OOM / instance replacement) is a real
+    // incident and must still file (CodeRabbit on PR #3844).
+    const drainRequeuedFirstAttempt = isDrainCeilingShutdownError(error)
+      && Boolean(zeroAssistantRequeuedAt)
+      && getZeroAssistantRetryCount(schedule) === 0;
+    const skipAutoIssue = (workerShutdownInterrupted && Boolean(zeroAssistantRequeuedAt))
+      || drainRequeuedFirstAttempt;
     void (skipAutoIssue ? Promise.resolve() : fileAutoIssue({
       title: zeroAssistantOutput
         ? `Scheduled Chat Zero Assistant Output: ${schedule.scheduleName}`
