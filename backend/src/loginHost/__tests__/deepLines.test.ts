@@ -361,6 +361,41 @@ describe("CLI stdout: lines nested deeper than the cap are dropped before anythi
       }
     });
 
+    async function clocked(rounds: Array<{ chunks: Array<string | Buffer>; advanceMs: number }>) {
+      const stdout = new PassThrough();
+      const child: ChildLike = { stdin: new PassThrough(), stdout, stderr: new PassThrough(), kill: () => undefined, onExit: () => undefined };
+      const errors: string[] = [];
+      const adapter = new RunnerChildAdapter(child, 16 * 1024 * 1024, () => undefined);
+      adapter.on("error", (e: Error) => errors.push(e.message));
+      adapter.stdout.resume();
+      const now = jest.spyOn(performance, "now");
+      let t = 1000;
+      now.mockImplementation(() => t);
+      try {
+        for (const r of rounds) {
+          for (const c of r.chunks) stdout.write(c);
+          await new Promise((res) => setImmediate(res));
+          t += r.advanceMs;
+        }
+      } finally {
+        now.mockRestore();
+      }
+      return errors;
+    }
+
+    it("MUTATION TARGET: the event LINE bucket REFILLS: 15,000 honest events over time (3,000 per 2 s, the burst is 5,000, 2,000 a second) never end the stream; 6,000 at once do", async () => {
+      const chunk = Buffer.from("{}\n".repeat(3000));
+      expect(await clocked(Array.from({ length: 5 }, () => ({ chunks: [chunk], advanceMs: 2000 })))).toEqual([]);
+      expect(await clocked([{ chunks: [Buffer.from("{}\n".repeat(3000)), Buffer.from("{}\n".repeat(3000))], advanceMs: 0 }])).toEqual(["stdout_flood"]);
+    });
+
+    it("MUTATION TARGET: the event BYTE bucket REFILLS: 30 MiB of events every 8 s (burst 32 MiB, 4 MiB/s) never ends the stream; 40 MiB at once does", async () => {
+      const line = Buffer.from('{"s":"' + "a".repeat(1024 * 1024 - 10) + '"}\n'); // 1 MiB
+      const round = { chunks: Array.from({ length: 30 }, () => line), advanceMs: 8000 };
+      expect(await clocked([round, round, round])).toEqual([]);
+      expect(await clocked([{ chunks: Array.from({ length: 40 }, () => line), advanceMs: 0 }])).toEqual(["stdout_flood"]);
+    });
+
     it("MUTATION TARGET: the bytes of a deep line that never ends are counted against the cap while they are being discarded (overflow, not a free ride)", async () => {
       const r = rig(10_000);
       await r.feed(nested(100));

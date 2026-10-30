@@ -195,17 +195,26 @@ export const IMAGE_LIMITS = { maxImages: 4, maxBase64Each: 2_500_000, maxBase64T
  * 2.1.314; legacy turns set none of them). Every value is derived from a limit of this file, never a second copy of a number:
  *  - CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH: the CLI shortens an MCP tool description (default 4096 characters, with an ellipsis); the host already refuses one over
  *    TOOL_LIMITS.maxDescriptionBytes, so that is the limit here (a character is at most that many bytes);
- *  - MAX_MCP_OUTPUT_TOKENS: the CLI truncates an MCP result above this many tokens (default 25,000, about 100 KB). A relayed result can be a frame of up to
- *    RELAY_FRAME_LIMITS.hostToShimBytes: counted conservatively at two bytes a token, plus 1,600 tokens (the CLI's own figure) for each image;
+ *  - MAX_MCP_OUTPUT_TOKENS: the CLI truncates an MCP result above this many tokens (default 25,000, about 100 KB). The largest result the plan route offers is
+ *    RELAY_RESULT_MAX_BYTES, counted conservatively at two bytes a token, plus 1,600 tokens (the CLI's own figure) for each image. It is deliberately NOT the 8 MiB
+ *    frame cap: raising the CLI's limit that far would remove its protection of the model's context window (a result of that size fails the turn);
  *  - MCP_TOOL_TIMEOUT: the CLI's own limit on one stdio tool call (milliseconds, at least 1000): the turn's remaining deadline, so the host's clock is the one that ends a call.
  * (MCP_TIMEOUT is the server start-up timeout in the CLI, not a call limit; CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT, default 30 minutes for stdio, is reset by the shim's
  * progress notifications.)
  */
+/**
+ * The largest tool RESULT the plan route hands to the model, in bytes: the same cap in-process Emma applies (MAX_TOOL_CONTENT_SIZE = 300,000 characters in
+ * agentModeService, the size a result may have when it is persisted and offered back to the model; larger results are cut with a note there). One shared constant:
+ * the backend applies it to the result it posts with turn.toolResult, and the CLI limit below is derived from it. The frame cap
+ * (RELAY_FRAME_LIMITS.hostToShimBytes, 8 MiB) stays far above it: it bounds what the socket carries, not what the model is shown.
+ */
+export const RELAY_RESULT_MAX_BYTES = 300_000;
+
 export function relayCliEnv(callTimeoutMs: number): Record<string, string> {
   const ms = Math.min(2_147_483_647, Math.max(1000, Math.floor(Number.isFinite(callTimeoutMs) ? callTimeoutMs : 1000)));
   return {
     CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH: String(TOOL_LIMITS.maxDescriptionBytes),
-    MAX_MCP_OUTPUT_TOKENS: String(Math.ceil(RELAY_FRAME_LIMITS.hostToShimBytes / 2) + IMAGE_LIMITS.maxImages * 1600),
+    MAX_MCP_OUTPUT_TOKENS: String(Math.ceil(RELAY_RESULT_MAX_BYTES / 2) + IMAGE_LIMITS.maxImages * 1600),
     MCP_TOOL_TIMEOUT: String(ms),
   };
 }

@@ -12,7 +12,7 @@ import { ClaudeAdapter } from "../adapters/claudeAdapter";
 import * as canonicalModule from "../relay/canonical";
 import { Layout } from "../ports/layout";
 import { RelayHost } from "../relay/relayServer";
-import { IMAGE_LIMITS, RELAY_FRAME_LIMITS, TOOL_LIMITS, relayCliEnv, type ToolDef } from "../protocol";
+import { IMAGE_LIMITS, RELAY_RESULT_MAX_BYTES, TOOL_LIMITS, relayCliEnv, type ToolDef } from "../protocol";
 import { assertEnvName, assertEnvValue } from "../ports/layout";
 
 const FAKE = join(__dirname, "fakeClaude.js");
@@ -481,11 +481,16 @@ describe("claude adapter: the CLI is told not to cut what the relay allows (rela
     rig.scenario({ turn: [RESULT_STEP] });
     await runTurn(rig, () => undefined, { callTimeoutMs: () => 123_456.9 });
     const turn = rig.spawns.find((s) => s.relayDir)!;
-    expect(CLI_VARS.map((k) => turn.env[k])).toEqual([String(TOOL_LIMITS.maxDescriptionBytes), String(Math.ceil(RELAY_FRAME_LIMITS.hostToShimBytes / 2) + IMAGE_LIMITS.maxImages * 1600), "123456"]);
+    expect(CLI_VARS.map((k) => turn.env[k])).toEqual([String(TOOL_LIMITS.maxDescriptionBytes), String(Math.ceil(RELAY_RESULT_MAX_BYTES / 2) + IMAGE_LIMITS.maxImages * 1600), "123456"]);
     for (const k of CLI_VARS) {
       assertEnvName(k);
       assertEnvValue(turn.env[k]);
     }
+  });
+
+  it("MUTATION TARGET: the result cap is the prod one (300,000) and the CLI output limit is far below the 8 MiB frame cap (the CLI keeps protecting the model context)", () => {
+    expect(RELAY_RESULT_MAX_BYTES).toBe(300_000);
+    expect(Number(relayCliEnv(5000).MAX_MCP_OUTPUT_TOKENS)).toBe(156_400);
   });
 
   it("MUTATION TARGET: the call clock is clamped to the CLI's own range (at least 1000 ms, at most 2^31-1)", () => {
