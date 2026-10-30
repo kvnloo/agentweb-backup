@@ -32,6 +32,8 @@ export interface LLMServiceOptions {
   streaming?: boolean;
   /** Product task class for independent gateway canary and rollback. */
   taskClass?: GatewayTaskClass;
+  /** Models OpenRouter tries, in order, if the primary model fails. */
+  fallbackModels?: string[];
 }
 
 type InvokeResponse = {
@@ -64,6 +66,7 @@ export class LLMService {
   private readonly maxTokens?: number;
   private readonly longRunning: boolean;
   private readonly taskClass: GatewayTaskClass;
+  private readonly fallbackModels?: string[];
 
   constructor(
     modelName?: string,
@@ -81,6 +84,7 @@ export class LLMService {
     this.maxTokens = maxTokens;
     this.longRunning = options.streaming === true;
     this.taskClass = options.taskClass || 'nonstandard_consumer';
+    this.fallbackModels = options.fallbackModels;
     this.gatewayAdapter = { invoke: (messages) => this.invokeGateway(messages) };
     this.chatModel = this.gatewayAdapter;
   }
@@ -104,6 +108,7 @@ export class LLMService {
       webSearch: requestOptions.webSearch,
       usageContext: usageContext || { feature: 'unknown' },
       taskClass: this.taskClass,
+      ...(this.fallbackModels?.length ? { fallbackModels: this.fallbackModels } : {}),
     });
     const usage: any = response?.usage;
     const hasUsage = !!usage && typeof usage === 'object';

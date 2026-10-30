@@ -5,13 +5,15 @@
 // Role resolution itself (org override, then default) is covered in modelRoles.test.ts.
 import type { LeadRecord } from '../services/crmEnrichmentService';
 import { buildIdentityDeps, buildOrchestratorDeps, extractFieldsViaLLMReal } from '../services/enrichmentV3RealDeps';
-import { resolveModelForUser } from '../services/modelRoles';
+import { getRoleDefault, resolveModelForUser } from '../services/modelRoles';
 import { createLLMService } from '../utils/llmService';
 
 jest.mock('../services/modelRoles');
 jest.mock('../utils/llmService', () => ({ createLLMService: jest.fn() }));
 
 const ROLE_MODEL = 'org-enrichment-model';
+const ROLE_DEFAULT = 'default-enrichment-model';
+const WITH_FALLBACK = { fallbackModels: ['gpt-5.5'] };
 const ENV_KEYS = ['CRM_ENRICH_V3_EXTRACT_MODEL', 'CRM_ENRICH_V3_CRITIC_MODEL', 'CRM_ENRICH_V3_WEB_SEARCH_MODEL'] as const;
 const savedEnv = Object.fromEntries(ENV_KEYS.map(key => [key, process.env[key]]));
 
@@ -65,6 +67,7 @@ async function loadWithEnv(env: Partial<Record<typeof ENV_KEYS[number], string>>
     const llm = await import('../utils/llmService');
     const roles = await import('../services/modelRoles');
     deps = { ...service, createLLMService: llm.createLLMService, resolveModelForUser: roles.resolveModelForUser };
+    jest.mocked(roles.getRoleDefault).mockResolvedValue(ROLE_DEFAULT);
   });
   if (!deps) throw new Error('module did not load');
   stubLLM(deps.createLLMService);
@@ -76,6 +79,7 @@ beforeEach(() => {
   jest.clearAllMocks();
   stubLLM(createLLMService);
   jest.mocked(resolveModelForUser).mockResolvedValue(ROLE_MODEL);
+  jest.mocked(getRoleDefault).mockResolvedValue(ROLE_DEFAULT);
 });
 
 afterEach(() => {
@@ -89,20 +93,35 @@ describe('enrichment web tier and critic follow the enrichment role (ENG-2184)',
   it('web-tier field extraction uses the role model for the caller', async () => {
     await extractFieldsViaLLMReal(webExtractInput, 'user-1');
     expect(resolveModelForUser).toHaveBeenCalledWith('user-1', 'enrichment');
-    expect(createLLMService).toHaveBeenCalledWith(ROLE_MODEL, 0.0);
+    expect(createLLMService).toHaveBeenCalledWith(ROLE_MODEL, 0.0, undefined, WITH_FALLBACK);
   });
 
   it('web-search company domain resolution uses the role model for the caller', async () => {
     await buildIdentityDeps('user-1').resolveCompanyDomainViaWebSearch(domainInput);
     expect(resolveModelForUser).toHaveBeenCalledWith('user-1', 'enrichment');
-    expect(createLLMService).toHaveBeenCalledWith(ROLE_MODEL, 0.2);
+    expect(createLLMService).toHaveBeenCalledWith(ROLE_MODEL, 0.2, undefined, WITH_FALLBACK);
   });
 
   it('the critic uses the role model for the caller', async () => {
     const result = await buildOrchestratorDeps('user-1').runCriticOverWebFills(criticInput);
     expect(result.verdicts).toEqual({ funding_stage: 'supported' });
     expect(resolveModelForUser).toHaveBeenCalledWith('user-1', 'enrichment');
-    expect(createLLMService).toHaveBeenCalledWith(ROLE_MODEL, null);
+    expect(createLLMService).toHaveBeenCalledWith(ROLE_MODEL, null, undefined, WITH_FALLBACK);
+  });
+
+  it('the critic runs on gpt-5.5 when the org has not picked its own enrichment model (ENG-2720)', async () => {
+    jest.mocked(resolveModelForUser).mockResolvedValue(ROLE_DEFAULT);
+    await buildOrchestratorDeps('user-1').runCriticOverWebFills(criticInput);
+    expect(createLLMService).toHaveBeenCalledWith('gpt-5.5', null, undefined, {});
+  });
+
+  it('extraction retries on gpt-5.5 if the primary model fails, and gpt-5.5 itself has no fallback (ENG-2720)', async () => {
+    jest.mocked(resolveModelForUser).mockResolvedValue(ROLE_DEFAULT);
+    await extractFieldsViaLLMReal(webExtractInput, 'user-1');
+    expect(createLLMService).toHaveBeenLastCalledWith(ROLE_DEFAULT, 0.0, undefined, WITH_FALLBACK);
+    jest.mocked(resolveModelForUser).mockResolvedValue('gpt-5.5');
+    await extractFieldsViaLLMReal(webExtractInput, 'user-1');
+    expect(createLLMService).toHaveBeenLastCalledWith('gpt-5.5', 0.0, undefined, {});
   });
 
   it('never calls an LLM with the retired gpt-5-chat-2 id', async () => {
@@ -125,12 +144,12 @@ describe('CRM_ENRICH_V3_* env overrides keep their precedence', () => {
   it('the web tier falls back to CRM_ENRICH_V3_EXTRACT_MODEL', async () => {
     const deps = await loadWithEnv({ CRM_ENRICH_V3_EXTRACT_MODEL: 'env-extract' });
     await deps.extractFieldsViaLLMReal(webExtractInput, 'user-1');
-    expect(deps.createLLMService).toHaveBeenCalledWith('env-extract', 0.0);
+    expect(deps.createLLMService).toHaveBeenCalledWith('env-extract', 0.0, undefined, WITH_FALLBACK);
   });
 
   it('CRM_ENRICH_V3_CRITIC_MODEL wins for the critic', async () => {
     const deps = await loadWithEnv({ CRM_ENRICH_V3_CRITIC_MODEL: 'env-critic' });
     await deps.buildOrchestratorDeps('user-1').runCriticOverWebFills(criticInput);
-    expect(deps.createLLMService).toHaveBeenCalledWith('env-critic', null);
+    expect(deps.createLLMService).toHaveBeenCalledWith('env-critic', null, undefined, WITH_FALLBACK);
   });
 });

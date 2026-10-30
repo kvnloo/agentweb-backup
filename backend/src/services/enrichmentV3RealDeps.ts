@@ -1,4 +1,4 @@
-import { resolveModelForUser } from './modelRoles';
+import { resolveModelForUser, getRoleDefault } from './modelRoles';
 // Real-service adapters that satisfy the v3.1 orchestrator deps
 // (OrchestratorDeps + IdentityResolverDeps).
 //
@@ -56,8 +56,21 @@ async function webSearchModel(userId: string | undefined): Promise<string> {
   return process.env.CRM_ENRICH_V3_WEB_SEARCH_MODEL || process.env.CRM_ENRICH_V3_EXTRACT_MODEL ||
     resolveModelForUser(userId, 'enrichment');
 }
+// ENG-2720: the critic judges web-tier values, so it must not grade its own work. With the cheap
+// default extraction model it runs on gpt-5.5 (one short call per lead, ~3% of a gpt-5.5 run); an
+// org that picked its own enrichment model keeps one model end to end, as ENG-2184 intends.
+const CRITIC_DEFAULT_MODEL = 'gpt-5.5';
 async function criticModel(userId: string | undefined): Promise<string> {
-  return process.env.CRM_ENRICH_V3_CRITIC_MODEL || resolveModelForUser(userId, 'enrichment');
+  if (process.env.CRM_ENRICH_V3_CRITIC_MODEL) return process.env.CRM_ENRICH_V3_CRITIC_MODEL;
+  const role = await resolveModelForUser(userId, 'enrichment');
+  return role === await getRoleDefault('enrichment') ? CRITIC_DEFAULT_MODEL : role;
+}
+
+// ENG-2720: if the primary enrichment model fails (provider error, rate limit), OpenRouter retries
+// the call on gpt-5.5 instead of the web tier silently returning "missing".
+const FALLBACK_MODEL = 'gpt-5.5';
+function makeEnrichLLM(model: string, temperature: number | null) {
+  return createLLMService(model, temperature, undefined, model === FALLBACK_MODEL ? {} : { fallbackModels: [FALLBACK_MODEL] });
 }
 // GPT-5 chat models reject ANY non-default temperature with a 400
 // `unsupported_value` — "Only the default (1) value is supported" — and the
@@ -206,7 +219,7 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
 
     resolveCompanyDomainViaWebSearch: async ({ company, domain, linkedin, title, firstName, lastName }) => {
       try {
-        const llm = createLLMService(await webSearchModel(userId), 0.2);
+        const llm = makeEnrichLLM(await webSearchModel(userId), 0.2);
         const systemPrompt =
           'You are a company researcher. Given information about a person or company, find the official company website and company name.\n\n' +
           'LOOKUP PRIORITY (follow in order):\n' +
@@ -775,10 +788,10 @@ export async function extractFieldsViaLLMReal(input: {
   try {
     let parsed: Record<string, any>;
     if (isWebTier) {
-      const llm = createLLMService(await webSearchModel(userId), 0.0);
+      const llm = makeEnrichLLM(await webSearchModel(userId), 0.0);
       parsed = await llm.generateJSONContentWithWebSearch<Record<string, any>>(systemPrompt, userPrompt, { userId, feature: 'enrichment' });
     } else {
-      const llm = createLLMService(await resolveModelForUser(userId, 'enrichment'), 0.0);
+      const llm = makeEnrichLLM(await resolveModelForUser(userId, 'enrichment'), 0.0);
       parsed = await llm.generateJSONContent<Record<string, any>>(systemPrompt, userPrompt, 'json', undefined, { userId, feature: 'enrichment' });
     }
     const filled: Record<string, LLMFilledValue> = {};
@@ -899,7 +912,7 @@ async function runCriticReal(input: {
   let model: string | undefined;
   try {
     model = await criticModel(userId);
-    const llm = createLLMService(model, CRITIC_TEMPERATURE);
+    const llm = makeEnrichLLM(model, CRITIC_TEMPERATURE);
     const parsed = await llm.generateJSONContent<Record<string, string>>(systemPrompt, userPrompt, 'json', undefined, { userId, feature: 'enrichment' });
     const verdicts: Record<string, any> = {};
     for (const claim of claims) {
@@ -1127,7 +1140,7 @@ export async function pickCandidateByContextLLM(
       `Candidates (index: profile):\n${profiles}\n\n` +
       `Is the context specific enough to disambiguate? Which index best matches? Quote the chosen profile's exact words as evidence. Use index -1 if the context is weak or none confidently match.`;
 
-    const llm = createLLMService(await resolveModelForUser(userId, 'enrichment'), 0.0);
+    const llm = makeEnrichLLM(await resolveModelForUser(userId, 'enrichment'), 0.0);
     const parsed = await llm.generateJSONContent<{ index?: number; confidence?: string; evidence?: string; context_strength?: string }>(
       systemPrompt, userPrompt, 'json', undefined, { userId, feature: 'enrichment' },
     );
@@ -1399,7 +1412,7 @@ export function buildOrchestratorDeps(
             if (candidates.length === 0) return null;
 
             // LLM picks the best candidate and extracts title + company from headline
-            const llm = createLLMService(await resolveModelForUser(userId, 'enrichment'), 0.1);
+            const llm = makeEnrichLLM(await resolveModelForUser(userId, 'enrichment'), 0.1);
             const systemPrompt =
               'You are a lead researcher. Given a lead and LinkedIn search candidates, pick the best match and extract their current title and company.\n\n' +
               'RULES:\n' +
@@ -1661,7 +1674,7 @@ export function buildOrchestratorDeps(
         );
         const mergedDepValues = { ...nativeValues, ...depValues };
         const model = await resolveModelForUser(userId, 'enrichment');
-        const llm = createLLMService(model, 0.0);
+        const llm = makeEnrichLLM(model, 0.0);
         const result = await llm.generateJSONContent<{ value: string | null; reasoning: string }>(
           buildSmartFieldEvalSystemPrompt(),
           buildSmartFieldEvalUserPrompt(fieldName, condition, mergedDepValues),

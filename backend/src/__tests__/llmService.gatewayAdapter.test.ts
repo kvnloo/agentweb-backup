@@ -56,6 +56,16 @@ describe('LLMService shared gateway adapter', () => {
     );
   });
 
+  it('passes fallback models to callLLM, and sends none when none are configured (ENG-2720)', async () => {
+    await new LLMService('openrouter/openai/gpt-5.6-luna', 0, undefined, { fallbackModels: ['gpt-5.5'] })
+      .generateRaw('system', 'user', undefined, { feature: 'enrichment' });
+    expect(mockCallLLM.mock.calls[0][2]).toEqual(expect.objectContaining({ fallbackModels: ['gpt-5.5'] }));
+
+    mockCallLLM.mockClear();
+    await new LLMService('gpt-5.5', 0).generateRaw('system', 'user', undefined, { feature: 'enrichment' });
+    expect(mockCallLLM.mock.calls[0][2]).not.toHaveProperty('fallbackModels');
+  });
+
   it('preserves null temperature so callLLM omits it from the wire request', async () => {
     await new LLMService('gpt-5.5', null).generateRaw('system', 'user');
     expect(mockCallLLM.mock.calls[0][2]).toEqual(expect.objectContaining({ temperature: null }));
