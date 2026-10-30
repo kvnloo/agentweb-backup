@@ -349,6 +349,25 @@ describe("relay: limits and abuse", () => {
     await ep.close();
   });
 
+  it("MUTATION TARGET: the key-count pre-check is cheap: a ~700 KB frame of 60,000 keys is refused in well under a second (it cost 62 ms to sort and join before; the bound is generous for a loaded machine)", async () => {
+    const r = rig();
+    const { ep } = await r.open();
+    const c = new Client(sockOf(ep));
+    await c.ready();
+    const o: Record<string, number> = { type: 0 };
+    for (let i = 0; i < 60_000; i++) o["k" + i] = i;
+    const frame = JSON.stringify(o) + "\n";
+    expect(frame.length).toBeGreaterThan(700_000);
+    const t0 = process.hrtime.bigint();
+    c.raw(frame);
+    await until(() => c.closed);
+    const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+    console.log("key-count frame refused in ms", ms.toFixed(1));
+    expect(ms).toBeLessThan(2000);
+    expect(r.logs.map((l) => l.fields?.code)).toContain("bad_frame");
+    await ep.close();
+  });
+
   it("MUTATION TARGET: a frame with an absurd number of keys is dropped as bad_frame (before the keys are sorted)", async () => {
     const r = rig();
     const { ep, calls } = await r.open();

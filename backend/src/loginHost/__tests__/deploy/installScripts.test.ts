@@ -544,7 +544,7 @@ describe("install.sh: stage -> validate -> switch, rollback, and 'a failure neve
   }
 
   /** A fresh fake machine: scratch OPT/CONF/UNIT_DIR, a fake `aws` serving the test certificates, a fake `systemctl` that logs, a bridge-url file. */
-  function box(opts: { bridge?: string | null; cert?: string; copyPkg?: string; node?: "file" | "symlink" | "none" } = {}): Box {
+  function box(opts: { bridge?: string | null; cert?: string; copyPkg?: string; node?: "file" | "symlink" | "none" | "wrapper" | "wrapper-symlink"; noSystemNode?: boolean } = {}): Box {
     const dir = mkdtempSync(join(root, "box-"));
     const p = join(dir, "pkg");
     spawnSync("cp", ["-a", opts.copyPkg ?? pkg, p]);
@@ -573,9 +573,16 @@ case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${
     // The pinned node the config names (/opt/aw-node/v<ver>/bin/node on the worker): a real file here, or a symlink to one (what /usr/bin/node is), or missing.
     const nodeRoot = join(dir, "aw-node");
     const nodeBin = join(nodeRoot, `v${versions.NODE_VERSION}`, "bin");
+    // the pinned node as a wrapper: it logs that it ran, then is the real node
+    const wrapperBody = "#!/bin/sh\necho used >> \"" + join(dir, "pinned-node-used") + "\"\nexec \"" + process.execPath + "\" \"$@\"\n";
     if (opts.node !== "none") {
-      mkdirSync(opts.node === "symlink" ? join(dir, "real-node") : nodeBin, { recursive: true });
-      if (opts.node === "symlink") {
+      mkdirSync(opts.node === "symlink" || opts.node === "wrapper-symlink" ? join(dir, "real-node") : nodeBin, { recursive: true });
+      if (opts.node === "wrapper-symlink") {
+        writeFileSync(join(dir, "real-node", "node"), wrapperBody, { mode: 0o755 });
+        mkdirSync(nodeBin, { recursive: true });
+        symlinkSync(join(dir, "real-node", "node"), join(nodeBin, "node"));
+      } else if (opts.node === "wrapper") writeFileSync(join(nodeBin, "node"), wrapperBody, { mode: 0o755 });
+      else if (opts.node === "symlink") {
         writeFileSync(join(dir, "real-node", "node"), "#!/bin/sh\n", { mode: 0o755 });
         mkdirSync(nodeBin, { recursive: true });
         symlinkSync(join(dir, "real-node", "node"), join(nodeBin, "node"));
@@ -586,6 +593,7 @@ case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${
     chmodSync(dir, 0o755);
     const env = {
       AW_NODE_ROOT: nodeRoot, AW_TRUST_BOUNDARY: dir,
+      ...(opts.noSystemNode ? { AW_NODE_BIN: join(dir, "no-such-node") } : {}), // (the worker has no /usr/bin/node yet)
       PATH: `${bin}:${process.env.PATH}`,
       AW_OPT: opt, AW_CONF: conf, AW_UNIT_DIR: units, AW_LOCK: join(dir, "lock"), AW_SYSTEMCTL: join(bin, "systemctl"),
       AW_SKIP_PREREQS: "1", AW_WORKER_IP: "172.31.30.50", AW_TMP: dir,
@@ -1181,6 +1189,30 @@ case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${
     expect(readdirSync(b.dir).filter((n) => n.startsWith("aw-dry"))).toEqual([]);
     expect(systemctlCalls(b)).toEqual([]);
     expect(stagingLeft(b)).toEqual([]);
+  });
+
+  it("MUTATION TARGET: a FIRST install on a worker with no /usr/bin/node checks the config with the PINNED node it just installed (not 'no node to check it with'), and that node is the one that ran", () => {
+    const b = box({ node: "wrapper", noSystemNode: true });
+    const r = run(b);
+    expect(r.stdout + r.stderr).not.toContain("no node to check it with");
+    expect(r.status).toBe(0);
+    expect(existsSync(join(b.dir, "pinned-node-used"))).toBe(true);
+    expect(releases(b)).toHaveLength(1);
+  });
+
+  it("MUTATION TARGET: ...and a pinned node that is a SYMLINK is still refused by the trusted-path check even though it ran the config check", () => {
+    const b = box({ node: "wrapper-symlink", noSystemNode: true });
+    const r = run(b);
+    expect(r.status).not.toBe(0);
+    expect(r.stdout + r.stderr).toMatch(/symlink/);
+    expect(releases(b)).toEqual([]);
+  });
+
+  it("MUTATION TARGET: the dry-run skip applies ONLY to a missing node: a present but symlinked node is still refused in a dry run", () => {
+    const b = box({ node: "symlink" });
+    const r = run(b, "--dry-run");
+    expect(r.status).not.toBe(0);
+    expect(r.stdout + r.stderr).toContain("would refuse to start");
   });
 
   it("MUTATION TARGET: --dry-run on a worker WITHOUT the pinned node says so (the node is not installed yet) and succeeds; a real install without it still stops", () => {

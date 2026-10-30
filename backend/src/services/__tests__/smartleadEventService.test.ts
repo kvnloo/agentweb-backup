@@ -355,6 +355,55 @@ describe("events found by the hourly poll (ENG-673)", () => {
     expect((await make(w2).handle(ctx, unsub())).matched).toBe(1);
   });
 
+  it("a withdrawal in one campaign is not read back as news in another campaign or list: the Smartlead lead is the same, and unsubscribed everywhere", async () => {
+    const withdrawn = { ...marker("run-other", "withdrawn"), smartleadLeadId: "SL-1", withdrawnAt: "2026-10-29T11:00:00.000Z" };
+    const pushedHere = { ...marker("run-ok"), smartleadLeadId: "SL-1" };
+    // the same lead pushed to two campaigns, withdrawn from the first, resubscribed in the CRM
+    const runs = { "run-ok": { smartleadAccountId: ACCOUNT, campaignId: CAMPAIGN, campaignName: "Q4" }, "run-other": { smartleadAccountId: ACCOUNT, campaignId: 55 } };
+    const same = world({ runs, leads: [lead("L1", "a", "ann@example.com", { contactStatus: "active", system: { smartlead_55: withdrawn, [`smartlead_${CAMPAIGN}`]: pushedHere } })] });
+    await make(same).handle(ctx, polled("unsubscribe"));
+    expect(same.leads[0].contactStatus).toBe("active");
+    expect(same.appended).toHaveLength(0);
+    // another lead record of the same person, in another list, pushed to this campaign
+    const other = world({ runs, leads: [
+      lead("L1", "a", "ann@example.com", { system: { smartlead_55: withdrawn } }),
+      lead("L2", "b", "ann@example.com", { system: { [`smartlead_${CAMPAIGN}`]: pushedHere } }),
+    ] });
+    await make(other).handle(ctx, polled("unsubscribe"));
+    expect(other.leads[1].contactStatus).toBeUndefined();
+    // a different Smartlead lead id is not affected
+    const unrelated = world({ runs, leads: [lead("L1", "a", "ann@example.com", { system: { smartlead_55: withdrawn, [`smartlead_${CAMPAIGN}`]: { ...marker("run-ok"), smartleadLeadId: "SL-2" } } })] });
+    await make(unrelated).handle(ctx, polled("unsubscribe"));
+    expect(unrelated.leads[0].contactStatus).toBe("unsubscribed");
+    // the webhook is never held back by this
+    const hook = world({ runs, leads: [lead("L1", "a", "ann@example.com", { system: { smartlead_55: withdrawn, [`smartlead_${CAMPAIGN}`]: pushedHere } })] });
+    await make(hook).handle(ctx, unsub());
+    expect(hook.leads[0].contactStatus).toBe("unsubscribed");
+  });
+
+  it("another customer's withdrawn marker with the same Smartlead id text does not suppress ours: only a marker whose run is THIS account's counts", async () => {
+    const theirs = { ...marker("run-theirs", "withdrawn"), smartleadLeadId: "SL-1", withdrawnAt: "2026-10-29T11:00:00.000Z" };
+    const w = world({
+      leads: [
+        lead("L1", "a", "ann@example.com", { userId: "someone-else", system: { smartlead_55: theirs } }),
+        lead("L2", "b", "ann@example.com", { system: { [`smartlead_${CAMPAIGN}`]: { ...marker("run-ok"), smartleadLeadId: "SL-1" } } }),
+      ],
+      runs: { "run-ok": { smartleadAccountId: ACCOUNT, campaignId: CAMPAIGN, campaignName: "Q4" }, "run-theirs": { smartleadAccountId: "smartlead-other-tenant", campaignId: 55 } },
+    });
+    await make(w).handle(ctx, polled("unsubscribe"));
+    expect(w.leads[1].contactStatus).toBe("unsubscribed");
+    // and ours, in the same account, still suppresses
+    const mine = world({
+      leads: [
+        lead("L1", "a", "ann@example.com", { system: { smartlead_55: { ...marker("run-mine", "withdrawn"), smartleadLeadId: "SL-1", withdrawnAt: "2026-10-29T11:00:00.000Z" } } }),
+        lead("L2", "b", "ann@example.com", { system: { [`smartlead_${CAMPAIGN}`]: { ...marker("run-ok"), smartleadLeadId: "SL-1" } } }),
+      ],
+      runs: { "run-ok": { smartleadAccountId: ACCOUNT, campaignId: CAMPAIGN }, "run-mine": { smartleadAccountId: ACCOUNT, campaignId: 55 } },
+    });
+    await make(mine).handle(ctx, polled("unsubscribe"));
+    expect(mine.leads[1].contactStatus).toBeUndefined();
+  });
+
   it("the poll still reads a contact released without a withdrawal (still live in Smartlead), and a reply from a withdrawn one", async () => {
     const released = world({ leads: [lead("L1", "a", "ann@example.com", { system: { [`smartlead_${CAMPAIGN}`]: marker("run-ok", "released") } })] });
     await make(released).handle(ctx, polled("unsubscribe"));
@@ -362,6 +411,23 @@ describe("events found by the hourly poll (ENG-673)", () => {
     const withdrawn = world({ leads: [lead("L1", "a", "ann@example.com", { system: { [`smartlead_${CAMPAIGN}`]: { ...marker("run-ok", "withdrawn"), withdrawnAt: "2026-10-29T11:00:00.000Z" } } })] });
     await make(withdrawn).handle(ctx, polled("reply"));
     expect(withdrawn.appended.map(a => a.eventType)).toEqual(["email.received"]);
+  });
+
+  it("a bounce on file, a Resubscribe and a corrected address do not hide a later opt-out from the poll; and the other way round", async () => {
+    const hardBounce = { eventType: "email.bounced", createdAt: "2026-10-29T10:30:00.000Z", eventData: { source: "smartlead", campaignId: CAMPAIGN, smartleadEventKey: "b1" } };
+    const w = world({ leads: [lead("L1", "a", "ann@example.com", { engagements: [hardBounce], contactStatus: "active", contactStatusUpdatedAt: "2026-10-29T11:00:00.000Z" })] });
+    await make(w).handle(ctx, polled("unsubscribe"));
+    expect(w.leads[0].contactStatus).toBe("unsubscribed");
+    const unsubbed = { eventType: "email.unsubscribed", createdAt: "2026-10-29T10:30:00.000Z", eventData: { source: "smartlead", campaignId: CAMPAIGN, smartleadEventKey: "u1" } };
+    const x = world({ leads: [lead("L1", "a", "ann@example.com", { engagements: [unsubbed], contactStatus: "active", contactStatusUpdatedAt: "2026-10-29T11:00:00.000Z" })] });
+    await make(x).handle(ctx, polled("bounce"));
+    expect(x.leads[0].contactStatus).toBe("do-not-contact");
+  });
+
+  it("an event time from Smartlead later than our own clock is recorded as now, so it cannot out-date a Resubscribe", async () => {
+    const w = pushed();
+    await make(w).handle(ctx, ev({ event_type: "LEAD_UNSUBSCRIBED", sl_lead_email: "ann@example.com", event_id: "future-1", event_timestamp: "2027-01-01T00:00:00.000Z" }));
+    expect(w.appended[0].createdAt <= "2026-10-29T12:00:00.000Z").toBe(true);
   });
 
   it("a temporary bounce on file does not hide a later opt-out from the poll", async () => {

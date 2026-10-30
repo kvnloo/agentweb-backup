@@ -137,10 +137,14 @@ fi
 # ───────────────────────────── helpers for the release machinery ─────────────────────────────
 
 NODE_BIN=/usr/bin/node
-[ "$TEST" != 1 ] || NODE_BIN=$(command -v node || echo /usr/bin/node)
+[ "$TEST" != 1 ] || NODE_BIN=${AW_NODE_BIN:-$(command -v node || echo /usr/bin/node)}
+# Runs the host's own config parser/trust check. The node is the one the worker already has; on a FIRST install (or a rebuilt worker) there is none yet and /usr/bin/node
+# is only linked at the switch, AFTER this check, so the pinned node this script has just installed under /opt/aw-node is used: it is root-owned, sha256-verified, and
+# itself checked as a trusted path by the very call that uses it.
 check_config() { # check_config <config.json> <check-config.js> [extra check-config.js arguments]
   local nb=$NODE_BIN cfg=$1 js=$2
   shift 2
+  [ -x "$nb" ] || nb=${NODE_ROOT:-/opt/aw-node}/v$NODE_VERSION/bin/node
   [ -x "$nb" ] || nb=$(command -v node || true)
   [ -n "$nb" ] && "$nb" "$js" "$cfg" "$@"
 }

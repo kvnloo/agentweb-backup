@@ -157,7 +157,7 @@ export class RunnerChildAdapter extends EventEmitter implements RunnerChild {
 }
 
 const NEWLINE = Buffer.from("\n");
-const LINE_DROPPED = Buffer.from("\n{\"type\":\"aw_line_dropped\"}\n");
+const DROPPED_LINE = Buffer.from("{\"type\":\"aw_line_dropped\"}\n");
 
 /** Budgets for stdout lines that are NOT events (junk, blank, incomplete): a CLI printing them fast costs the host's event loop (the runner JSON.parses every non-empty line and throws on junk). */
 export const JUNK_LINE_BURST = 200;
@@ -167,6 +167,20 @@ export const JUNK_BYTES_PER_SEC = 128 * 1024;
 /** Budget for lines that ARE event-shaped: honest streams are a few dozen events a second; a flood of tiny valid ones (`{}`) is as costly as junk. */
 export const EVENT_LINE_BURST = 5000;
 export const EVENT_LINES_PER_SEC = 2000;
+/**
+ * Bytes of event lines. The runner JSON.parses every forwarded line (about 5 ms and 20 MB of heap per MB for an array of numbers), so bytes, not only lines, are
+ * what a hostile CLI spends. Honest traffic: the CLI echoes each tool result once in a `user` event (up to the relay\'s 8 MiB frame) and the final result text, plus
+ * small events; a turn with several big results is a burst of tens of MiB, then quiet. Burst 32 MiB (four maximum-size results), sustained 4 MiB/s (1 MiB lines
+ * measured at 96 lines/s, event-loop utilization 0.98, never touched the line bucket).
+ */
+export const EVENT_BYTE_BURST = 32 * 1024 * 1024;
+export const EVENT_BYTES_PER_SEC = 4 * 1024 * 1024;
+/**
+ * Values (commas, objects and arrays outside strings) in ONE event line. A 16 MB array of `0` is 8 million values (488 ms and +357 MB of heap in JSON.parse), an
+ * array of `{}` 5 million (1.7 s, +1.3 GB). Honest events have far fewer: the init event lists the tools (~270 tools, a few thousand values each at most, well under
+ * 50,000 in all); text and tool results are strings (one value). 150,000 is three times the largest honest line and a 64x cut of the worst hostile one.
+ */
+export const MAX_LINE_VALUES = 150_000;
 
 /**
  * THE single authority on what a line of the CLI's stdout is (the runner's readline reads what comes out of here). It
@@ -189,8 +203,9 @@ export class LineLimit extends Transform {
   private depth = 0;
   private inString = false;
   private esc = false;
-  /** 0: forwarding; 1: the rest of a too-deep line is being discarded; 2: the rest of a junk line is being discarded. */
-  private skipping: 0 | 1 | 2 = 0;
+  /** 0: forwarding; 2: the rest of a junk, too-deep or too-dense line is being discarded (its bytes are charged to the junk bucket). */
+  private skipping: 0 | 2 = 0;
+  private values = 0;
   private lineStarted = false;
   private lastSig = 0;
   private afterCR = false;
@@ -202,6 +217,7 @@ export class LineLimit extends Transform {
   private lineTokens = JUNK_LINE_BURST;
   private byteTokens = JUNK_BYTE_BURST;
   private eventTokens = EVENT_LINE_BURST;
+  private eventByteTokens = EVENT_BYTE_BURST;
   private lastRefill = performance.now();
   constructor(
     private readonly max: number,
@@ -219,6 +235,7 @@ export class LineLimit extends Transform {
     this.skipping = 0;
     this.lineStarted = false;
     this.lastSig = 0;
+    this.values = 0;
   }
   private stop(cb: (err?: Error | null, data?: Buffer) => void, why: () => void): void {
     this.tripped = true;
@@ -267,6 +284,7 @@ export class LineLimit extends Transform {
     let jl = 0; // non-event lines seen in this chunk
     let jb = 0; // bytes of non-event lines
     let el = 0; // event-shaped lines seen in this chunk
+    let eb = 0; // bytes of those
     let i = 0;
     while (i < n) {
       if (this.skipping !== 0) {
@@ -302,9 +320,14 @@ export class LineLimit extends Transform {
           this.afterCR = true;
         }
         if (!this.lineStarted) {
-          jl++; // a blank line
+          // a blank (or whitespace-only) line: dropped, and its bytes are charged (30 lines of 8 MB of spaces used to pass unthrottled)
+          jl++;
+          jb += this.run;
+          if (lineBeg > start) out.push(buf.subarray(start, lineBeg));
+          start = i + 1;
         } else if (this.depth === 0 && !this.inString && this.lastSig === 0x7d) {
           el++; // a complete object: forwarded (the carried head of it first)
+          eb += this.run;
           if (this.carryLen > 0) out.push(this.takeCarry());
         } else {
           // event-shaped at the start, but not a complete object: it would only make the runner's JSON.parse throw
@@ -347,11 +370,29 @@ export class LineLimit extends Transform {
         else if (c === 0x22) this.inString = false;
       } else if (c === 0x22) this.inString = true;
       else if (c === 0x7b || c === 0x5b) {
-        if (++this.depth > MAX_CLI_LINE_DEPTH) {
-          if (this.carryLen > 0) out.push(this.takeCarry());
-          out.push(buf.subarray(start, i), LINE_DROPPED); // what came before this point, the line ended, a placeholder
-          this.skipping = 1;
+        if (++this.depth > MAX_CLI_LINE_DEPTH || ++this.values > MAX_LINE_VALUES) {
+          // Too deep or too dense: NOTHING of the line is forwarded (its head is junk), only the fixed placeholder; the rest is discarded and the line is charged
+          // (lines and bytes) to the junk bucket, so a stream of such lines ends in stdout_flood instead of costing a parse exception each.
+          this.dropCarry();
+          if (lineBeg > start) out.push(buf.subarray(start, lineBeg));
+          out.push(DROPPED_LINE);
           start = n;
+          this.skipping = 2;
+          this.junkLines++;
+          jl++;
+          jb += this.run;
+          this.onDeep();
+        }
+      } else if (c === 0x2c) {
+        if (++this.values > MAX_LINE_VALUES) {
+          this.dropCarry();
+          if (lineBeg > start) out.push(buf.subarray(start, lineBeg));
+          out.push(DROPPED_LINE);
+          start = n;
+          this.skipping = 2;
+          this.junkLines++;
+          jl++;
+          jb += this.run;
           this.onDeep();
         }
       } else if ((c === 0x7d || c === 0x5d) && this.depth > 0) this.depth--;
@@ -364,14 +405,15 @@ export class LineLimit extends Transform {
       start = n;
     }
     if (start < n) out.push(buf.subarray(start));
-    if (jl > 0 || jb > 0 || el > 0) {
+    if (jl > 0 || jb > 0 || el > 0 || eb > 0) {
       const now = performance.now();
       const dt = Math.max(0, now - this.lastRefill) / 1000;
       this.lastRefill = now;
       this.lineTokens = Math.min(JUNK_LINE_BURST, this.lineTokens + dt * JUNK_LINES_PER_SEC) - jl;
       this.byteTokens = Math.min(JUNK_BYTE_BURST, this.byteTokens + dt * JUNK_BYTES_PER_SEC) - jb;
       this.eventTokens = Math.min(EVENT_LINE_BURST, this.eventTokens + dt * EVENT_LINES_PER_SEC) - el;
-      if (this.lineTokens < 0 || this.byteTokens < 0 || this.eventTokens < 0) return this.stop(cb, this.onFlood);
+      this.eventByteTokens = Math.min(EVENT_BYTE_BURST, this.eventByteTokens + dt * EVENT_BYTES_PER_SEC) - eb;
+      if (this.lineTokens < 0 || this.byteTokens < 0 || this.eventTokens < 0 || this.eventByteTokens < 0) return this.stop(cb, this.onFlood);
     }
     cb(null, out.length === 0 ? undefined : out.length === 1 ? out[0] : Buffer.concat(out));
   }
