@@ -63,12 +63,17 @@ A result over a limit is never an error: the text is cut, or the extra images ar
 
 ## What the Claude CLI does on top of these limits
 
-The limits above are ours. The CLI that talks to the model has its own, and they apply to the tools it gets over MCP (which is how the relay hands it Emma's tools):
+The limits above are ours. The CLI that talks to the model has its own, and they apply to the tools it gets over MCP (which is how the relay hands it Emma's tools). Left alone, the CLI would quietly change what the plan route offers, so the login host sets three of its environment variables for RELAY turns. `relayCliEnv` in `backend/src/loginHost/protocol.ts` owns the values; each one is derived from a limit in that file, never a second copy of a number:
 
-- **Tool descriptions.** The CLI shortens an MCP tool description to about 4,096 characters by default, so the model may read less than the 48 KiB we allow. It can be raised with the environment variable `CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH`.
-- **Tool output.** The CLI truncates an MCP tool's output at about 25,000 tokens by default, whatever we send. It can be raised with `MAX_MCP_OUTPUT_TOKENS`.
+| CLI behaviour | CLI default | What the host sets for a relay turn | Value today |
+|---|---|---|---|
+| Shortens an MCP tool description (`CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH`) | 4,096 characters, with an ellipsis | `TOOL_LIMITS.maxDescriptionBytes`, the longest description the host accepts anyway | 49,152 |
+| Truncates an MCP tool's output (`MAX_MCP_OUTPUT_TOKENS`) | 25,000 tokens (about 100 KB) | half of `RELAY_FRAME_LIMITS.hostToShimBytes` (two bytes a token, the host's 8 MiB result frame) plus `IMAGE_LIMITS.maxImages` times 1,600 tokens for images | 4,200,704 |
+| Ends a stdio tool call (`MCP_TOOL_TIMEOUT`, milliseconds) | the CLI's own | the turn's remaining deadline, at least 1,000 and at most 2^31-1, so the host's clock is the one that ends a call | per turn |
 
-The login host is meant to set both variables for relay turns (a change on the host branch of ENG-2113). **Status: not verified.** When the host change is merged, check the values it sets in `backend/src/loginHost/adapters/claudeAdapter.ts` and update this section to match; mark the behaviour "verified live" only after the live test on the test worker has shown a long description and a long result arriving whole. Until then, write descriptions that carry the key rule in their first 4,000 characters, and results whose important part comes first.
+A turn on the legacy HTTP bridge sets none of them and keeps the CLI's defaults. In practice the backend cuts a result's text at `MAX_CONTENT_BYTES` (1,000,000 bytes) long before the output limit, and refuses a description over 48 KiB at the manifest, so the CLI's own cuts should never be the ones that apply on the plan route.
+
+**Verified live: NO.** The values above are read from the code. The live cases that show a long description, a long result and a long tool call arriving whole through the real CLI on the test worker (C15, C16, C17) have not run yet. Change this line only when they have. Until then, write descriptions that carry the key rule in their first 4,000 characters, and results whose important part comes first.
 
 ## What checks this
 
