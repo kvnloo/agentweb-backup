@@ -478,7 +478,7 @@ export async function getCampaign(apiKey: string, campaignId: number, opts: { ma
   };
 }
 
-export type SmartleadEmailStatus = "is_replied" | "is_bounced" | "is_unsubscribed";
+export type SmartleadEmailStatus = "is_replied" | "is_bounced" | "is_unsubscribed" | "is_sender_bounced";
 
 export interface SmartleadLeadRow {
   /** Smartlead's own lead id. */
