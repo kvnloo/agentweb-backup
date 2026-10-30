@@ -35,7 +35,9 @@ async function isOursAndBlocked(lead: any, owners: Set<string>, listOwners: Map<
   return !!owner && owners.has(owner);
 }
 
+
 const MAX_PIECE = 600;
+const MAX_READINGS = 6;
 
 /** A matched address without the punctuation around it. A `?query` is cut only after the `@` (a local part may contain `?`); trimming is a loop, not a regex. */
 function cleanAddress(raw: string): string {
@@ -48,6 +50,46 @@ function cleanAddress(raw: string): string {
   while (start < end && "([".includes(s[start])) start++;
   while (end > start && ")].".includes(s[end - 1])) end--;
   return s.slice(start, end);
+}
+
+/** The same, and also without quote marks at either end: for readings where an apostrophe may be quoting, not part of the address. */
+function cleanQuoted(raw: string): string {
+  let s = cleanAddress(raw);
+  let start = 0;
+  let end = s.length;
+  while (start < end && "'\"([".includes(s[start])) start++;
+  while (end > start && "'\")].".includes(s[end - 1])) end--;
+  s = s.slice(start, end);
+  return s;
+}
+
+/**
+ * Extra readings for a piece that contains an apostrophe, ADDED to the ones the main pass finds (never instead of them, so nothing the main pass
+ * catches can be lost). An apostrophe is legal in a local part (o'brien@x.com) but can also be quoting around an address (`'a@x.com'`,
+ * `name='a@x.com'`, `x'(a@x.com)`), in which case everything up to it is not part of the address. Which is meant cannot be known, so the address is also
+ * looked up as each apostrophe-delimited tail of its local part. The price
+ * of a wrong extra reading is refusing a send to someone blocked under that other name (`brien@x.com` for `o'brien@x.com`): it fails safe and is rare.
+ */
+function apostropheReadings(piece: string): string[] {
+  if (!piece.includes("'")) return [];
+  const matches = [
+    ...piece.matchAll(/<(?:mailto:)?([^<>\s]+@[^<>\s]+)>/gi),
+    ...piece.matchAll(/(?:mailto:)?([^\s<>";,:]+@[^\s<>"';,]+)/gi),
+  ];
+  const out: string[] = [];
+  for (const m of matches) {
+    const base = cleanQuoted(m[1]);
+    if (!base.includes("@")) continue;
+    const readings = [base];
+    const at = base.indexOf("@");
+    for (let i = base.indexOf("'"); i >= 0 && i < at; i = base.indexOf("'", i + 1)) {
+      const tail = cleanQuoted(base.slice(i + 1));
+      if (tail.indexOf("@") > 0) readings.push(tail); // something is left before the @
+    }
+    // The number of lookups is capped. The plain address after the LAST apostrophe needs no special care here: the main pass always finds it.
+    out.push(...readings.slice(0, MAX_READINGS));
+  }
+  return out;
 }
 
 /** Addresses from a to/cc/bcc value, and whether any piece was too long to look at (see MAX_PIECE). */
@@ -67,6 +109,8 @@ function parseAddresses(value: unknown): { addresses: string[]; oversize: boolea
         const cleaned = cleanAddress(m[1]);
         if (cleaned.includes("@")) out.add(cleaned);
       }
+      // Added on top, never instead: see apostropheReadings.
+      for (const a of apostropheReadings(piece)) out.add(a);
     }
   }
   return { addresses: [...out], oversize };
