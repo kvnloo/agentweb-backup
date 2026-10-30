@@ -405,9 +405,9 @@ export class LoginHostClient {
     return this.call("turn.interrupt", input, z.object({ interrupted: z.literal(true) }));
   }
   /**
-   * Answer to a `tool-call` event of a relay turn (protocol 4: `{operationId, content, isError?, images?, unlock?}`; the host replies `{ok:true}`).
+   * Answer to a `tool-call` event of a relay turn (protocol 4: `{operationId, content, isError?, images?, tools?}`; the host replies `{ok:true}`).
    * Resolves only when the host accepted the answer. Rejects with ToolResultLostError for the three "result lost" answers (see there), with a
-   * LoginHostError for anything else (EINVALID `result_too_large` / `unlock_unknown_tool` leave the operation pending, so the caller may retry with a valid answer).
+   * LoginHostError for anything else (EINVALID `result_too_large` / `tools_invalid` / `tools_limit` / `tools:<reason>` leave the operation pending, so the caller may retry with a valid answer).
    */
   async turnToolResult(input: RouteInput<"turn.toolResult">): Promise<{ ok: true }> {
     try {
