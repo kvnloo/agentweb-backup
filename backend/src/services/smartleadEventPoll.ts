@@ -58,7 +58,13 @@ const seen = new Map<string, { at: number; for: number }>();
  * poll is only a backstop (the webhook delivers a genuine bounce at once), so waiting one pass costs nothing. In memory: a restart starts the wait again.
  */
 export const BOUNCE_CONFIRM_AFTER_MS = 45 * 60 * 1000;
-const pendingBounce = new Map<string, number>();
+/**
+ * A waiting contact that was last SEEN longer ago than this starts its wait again: it dropped out of the bounced list and came back (a rotation, a
+ * re-add, a list that flapped), and an old first sighting must not stand in for the second one. Long enough that a campaign polled only every few
+ * passes (more than 100 campaigns in the window, longest-waiting first) still completes its wait.
+ */
+export const BOUNCE_WAIT_STALE_MS = 12 * 60 * 60 * 1000;
+const pendingBounce = new Map<string, { first: number; last: number }>();
 /** When each campaign was last polled, so that when there are more campaigns than one pass covers, the longest-waiting go first and none starve. */
 const lastPolled = new Map<number, number>();
 const loggedAt = new Map<string, number>();
@@ -124,6 +130,9 @@ export async function eventPoll(deps: PollDeps): Promise<PollResult> {
   // Newest first (the order of `rows`), but campaigns not polled for the longest go first, so a campaign past the cap is reached on a later pass.
   const all = [...targets.entries()].sort((a, b) => (lastPolled.get(a[0]) ?? 0) - (lastPolled.get(b[0]) ?? 0));
   if (all.length > cap) logOnce(deps, "campaign-limit", `[SmartleadPoll] ${all.length} campaigns in the window, only the ${cap} waiting longest are polled this pass`);
+
+  // Waiting records of contacts not seen for a day are dropped, so the map cannot fill with contacts that left the bounced list.
+  for (const [k, v] of pendingBounce) if (nowMs - v.last > 2 * BOUNCE_WAIT_STALE_MS) pendingBounce.delete(k);
 
   const keys = new Map<string, ResolvedSmartlead>();
   for (const [campaignId, runRows] of all.slice(0, cap)) {
@@ -223,9 +232,11 @@ export async function eventPoll(deps: PollDeps): Promise<PollResult> {
                 // Looks genuine: act only once it has looked so on an earlier pass too (see BOUNCE_CONFIRM_AFTER_MS).
                 const confirmAfter = deps.bounceConfirmAfterMs ?? BOUNCE_CONFIRM_AFTER_MS;
                 if (confirmAfter > 0) {
-                  const first = pendingBounce.get(waiting);
-                  if (first === undefined) { pendingBounce.set(waiting, deps.now().getTime()); if (pendingBounce.size > 100_000) pendingBounce.clear(); continue; }
-                  if (deps.now().getTime() - first < confirmAfter) continue;
+                  const nowMs = deps.now().getTime();
+                  const entry = pendingBounce.get(waiting);
+                  if (entry === undefined || nowMs - entry.last > BOUNCE_WAIT_STALE_MS) { pendingBounce.set(waiting, { first: nowMs, last: nowMs }); if (pendingBounce.size > 100_000) pendingBounce.clear(); continue; }
+                  entry.last = nowMs;
+                  if (nowMs - entry.first < confirmAfter) continue;
                 }
               }
               const memo = `${accountId}#${campaignId}#${kind}#${lead.leadId}`;
