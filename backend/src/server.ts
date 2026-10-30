@@ -820,6 +820,7 @@ createTestAccount().then(async () => {
       // left paused for a week. It does nothing unless SMARTLEAD_PUSH_ENABLED=true. In-flight work is drained at shutdown by the registry.
       try {
         const { getSmartleadPushService } = await import('./services/smartleadPushRuntime');
+        const { pollSmartleadEvents } = await import('./services/smartleadEventRuntime');
         setInterval(() => {
           // The tick itself does nothing but retry cancels of unsettled starts while the push is switched off.
           if (!isCronEnabled()) return;
@@ -843,6 +844,22 @@ createTestAccount().then(async () => {
           setInterval(sweep, 60 * 60 * 1000);
         }, 5 * 60 * 1000);
         console.log('[SmartleadWithdrawal] Sweep initialized — hourly, first pass in 5 minutes');
+
+        // The event poll: backs up the Smartlead event webhook, so a missed unsubscribe or bounce still blocks the contact. Hourly, offset from the
+        // withdrawal sweep, and like it NOT behind the kill switch.
+        setTimeout(() => {
+          let polling = false; // a pass over many campaigns can outlast the hour: never overlap two
+          const poll = () => {
+            if (!isCronEnabled() || polling) return;
+            polling = true;
+            cronJobRegistry.track('SmartleadEventPoll', pollSmartleadEvents())
+              .catch(e => console.error('[SmartleadPoll] Poll error:', e))
+              .finally(() => { polling = false; });
+          };
+          poll();
+          setInterval(poll, 60 * 60 * 1000);
+        }, 20 * 60 * 1000);
+        console.log('[SmartleadPoll] Event poll initialized — hourly, first pass in 20 minutes');
       } catch (error) {
         console.error('[SmartleadPush] Failed to initialize the resumer:', error);
       }

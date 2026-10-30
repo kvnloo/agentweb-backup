@@ -259,3 +259,169 @@ describe("applying a Smartlead event to the CRM (ENG-673)", () => {
     await expect(svc.handle(ctx, reply())).rejects.toThrow("dynamo down");
   });
 });
+
+describe("events found by the hourly poll (ENG-673)", () => {
+  const polled = (kind: "reply" | "bounce" | "unsubscribe", over: Partial<SmartleadEvent> = {}): SmartleadEvent => ({
+    kind, campaignId: CAMPAIGN, candidateEmails: ["ann@example.com"], soft: false, polled: true, eventKey: `poll:${kind}:${CAMPAIGN}:9`, ...over,
+  });
+  const ctx = { accountId: ACCOUNT, campaignId: CAMPAIGN };
+  const pushed = () => world({ leads: [lead("L1", "a", "ann@example.com", { system: { [`smartlead_${CAMPAIGN}`]: marker("run-ok") } })] });
+
+  it("recovers a missed unsubscribe: the contact is blocked and one engagement is recorded", async () => {
+    const w = pushed();
+    const out = await make(w).handle(ctx, polled("unsubscribe"));
+    expect(out.changed).toBeGreaterThan(0);
+    expect(w.leads[0].contactStatus).toBe("unsubscribed");
+    expect(w.appended.map(a => a.eventType)).toEqual(["email.unsubscribed"]);
+  });
+
+  it("recovers a missed bounce as do-not-contact", async () => {
+    const w = pushed();
+    await make(w).handle(ctx, polled("bounce"));
+    expect(w.leads[0].contactStatus).toBe("do-not-contact");
+  });
+
+  it("changes nothing for a contact the webhook already blocked (no second engagement, whatever the key), and polling again is a no-op", async () => {
+    const w = pushed();
+    const svc = make(w);
+    await svc.handle(ctx, ev({ event_type: "LEAD_UNSUBSCRIBED", sl_lead_email: "ann@example.com", event_id: "webhook-1" }));
+    const before = w.appended.length;
+    const out = await svc.handle(ctx, polled("unsubscribe"));
+    expect(out.changed).toBe(0);
+    expect(out.duplicates).toBe(1);
+    expect(w.appended).toHaveLength(before);
+  });
+
+  it("does not record again when our own withdrawal blocked the contact and Smartlead now lists it as unsubscribed", async () => {
+    const w = world({ leads: [lead("L1", "a", "ann@example.com", { contactStatus: "do-not-contact", system: { [`smartlead_${CAMPAIGN}`]: marker("run-ok") } })] });
+    const out = await make(w).handle(ctx, polled("unsubscribe"));
+    expect(out.changed).toBe(0);
+    expect(w.appended).toHaveLength(0);
+    expect(w.notified).toHaveLength(0);
+  });
+
+  it("records a missed first reply and alerts once; a webhook-recorded reply is not recorded or alerted again", async () => {
+    const w = pushed();
+    const svc = make(w);
+    await svc.handle(ctx, polled("reply"));
+    expect(w.appended.map(a => a.eventType)).toEqual(["email.received"]);
+    expect(w.notified).toHaveLength(1);
+    await svc.handle(ctx, polled("reply", { eventKey: `poll:reply:${CAMPAIGN}:10` }));
+    expect(w.appended).toHaveLength(1);
+    expect(w.notified).toHaveLength(1);
+
+    const x = pushed();
+    const s2 = make(x);
+    await s2.handle(ctx, ev({ event_type: "EMAIL_REPLY", sl_lead_email: "ann@example.com", event_id: "webhook-r1", subject: "Re: hi" }));
+    await s2.handle(ctx, polled("reply"));
+    expect(x.appended).toHaveLength(1);
+    expect(x.notified).toHaveLength(1);
+  });
+
+  it("a CRM user's Resubscribe sticks: Smartlead keeps listing the contact as unsubscribed, but the poll never applies the event again", async () => {
+    for (const how of ["webhook", "poll"] as const) {
+      const w = pushed();
+      const svc = make(w);
+      await svc.handle(ctx, how === "webhook" ? ev({ event_type: "LEAD_UNSUBSCRIBED", sl_lead_email: "ann@example.com", event_id: "w1" }) : polled("unsubscribe"));
+      expect(w.leads[0].contactStatus).toBe("unsubscribed");
+      // the user resubscribes the contact in the portal
+      Object.assign(w.leads[0], { contactStatus: "active", unsubscribedFromGroupEmail: false });
+      const appended = w.appended.length;
+      const out = await svc.handle(ctx, polled("unsubscribe"));
+      expect(out.changed).toBe(0);
+      expect(w.leads[0].contactStatus).toBe("active");
+      expect(w.appended).toHaveLength(appended);
+    }
+    // the same for a bounce
+    const b = pushed();
+    const sb = make(b);
+    await sb.handle(ctx, polled("bounce"));
+    Object.assign(b.leads[0], { contactStatus: "active", unsubscribedFromGroupEmail: false });
+    await sb.handle(ctx, polled("bounce", { eventKey: `poll:bounce:${CAMPAIGN}:10` }));
+    expect(b.leads[0].contactStatus).toBe("active");
+  });
+
+  it("the poll does not read back our own withdrawal: a withdrawn marker, or a released one that was withdrawn first, is left alone", async () => {
+    const withdrawnAt = "2026-10-29T11:00:00.000Z";
+    for (const m of [{ ...marker("run-ok", "withdrawn"), withdrawnAt }, { ...marker("run-ok", "released"), withdrawnAt }]) {
+      const w = world({ leads: [lead("L1", "a", "ann@example.com", { system: { [`smartlead_${CAMPAIGN}`]: m } })] });
+      const out = await make(w).handle(ctx, polled("unsubscribe"));
+      expect(out.matched).toBe(0);
+      expect(w.leads[0].contactStatus).toBeUndefined();
+      expect(w.appended).toHaveLength(0);
+    }
+    // while the webhook still acts on such a marker as before
+    const w2 = world({ leads: [lead("L1", "a", "ann@example.com", { system: { [`smartlead_${CAMPAIGN}`]: marker("run-ok", "withdrawn") } })] });
+    expect((await make(w2).handle(ctx, unsub())).matched).toBe(1);
+  });
+
+  it("the poll still reads a contact released without a withdrawal (still live in Smartlead), and a reply from a withdrawn one", async () => {
+    const released = world({ leads: [lead("L1", "a", "ann@example.com", { system: { [`smartlead_${CAMPAIGN}`]: marker("run-ok", "released") } })] });
+    await make(released).handle(ctx, polled("unsubscribe"));
+    expect(released.leads[0].contactStatus).toBe("unsubscribed");
+    const withdrawn = world({ leads: [lead("L1", "a", "ann@example.com", { system: { [`smartlead_${CAMPAIGN}`]: { ...marker("run-ok", "withdrawn"), withdrawnAt: "2026-10-29T11:00:00.000Z" } } })] });
+    await make(withdrawn).handle(ctx, polled("reply"));
+    expect(withdrawn.appended.map(a => a.eventType)).toEqual(["email.received"]);
+  });
+
+  it("a temporary bounce on file does not hide a later opt-out from the poll", async () => {
+    const w = pushed();
+    const svc = make(w);
+    await svc.handle(ctx, bounce({ event_id: "soft-1", bounce_message: { text: "452 mailbox full, try again later" } }));
+    expect(w.appended[0].eventData.soft).toBe(true);
+    expect(w.leads[0].contactStatus).toBeUndefined();
+    await svc.handle(ctx, polled("unsubscribe"));
+    expect(w.leads[0].contactStatus).toBe("unsubscribed");
+  });
+
+  it("the poll does not turn a temporary bounce already on file into a block", async () => {
+    const w = pushed();
+    const svc = make(w);
+    await svc.handle(ctx, bounce({ event_id: "soft-1", bounce_message: { text: "452 mailbox full, try again later" } }));
+    const out = await svc.handle(ctx, polled("bounce"));
+    expect(out.duplicates).toBe(1);
+    expect(w.leads[0].contactStatus).toBeUndefined();
+  });
+
+  it("the poll finishes a half-applied block: the engagement is on file, the status write never landed; no second engagement", async () => {
+    const onFile = { eventType: "email.unsubscribed", createdAt: "2026-10-29T11:00:00.000Z", eventData: { source: "smartlead", campaignId: CAMPAIGN, smartleadEventKey: "w1" } };
+    const w = world({ leads: [lead("L1", "a", "ann@example.com", { engagements: [onFile] })] });
+    const out = await make(w).handle(ctx, polled("unsubscribe"));
+    expect(w.leads[0].contactStatus).toBe("unsubscribed");
+    expect(out.changed).toBe(1);
+    expect(w.appended).toHaveLength(0);
+  });
+
+  it("a status write that fails on the poll's own pass is finished on its next", async () => {
+    const w = pushed();
+    const deps = (make(w) as any).deps as EventDeps;
+    const realSet = deps.setContactStatus;
+    deps.setContactStatus = async () => { throw new Error("dynamo down"); };
+    const svc = new SmartleadEventService(deps);
+    await expect(svc.handle(ctx, polled("unsubscribe"))).rejects.toThrow("dynamo down");
+    expect(w.leads[0].contactStatus).toBeUndefined();
+    deps.setContactStatus = realSet;
+    await svc.handle(ctx, polled("unsubscribe"));
+    expect(w.leads[0].contactStatus).toBe("unsubscribed");
+    expect(w.appended).toHaveLength(1);
+  });
+
+  it("decides a Resubscribe from a fresh read, not the possibly stale lookup row", async () => {
+    const onFile = { eventType: "email.unsubscribed", createdAt: "2026-10-29T11:00:00.000Z", eventData: { source: "smartlead", campaignId: CAMPAIGN, smartleadEventKey: "w1" } };
+    const w = world({ leads: [lead("L1", "a", "ann@example.com", { engagements: [onFile], contactStatus: "active", contactStatusUpdatedAt: "2026-10-29T11:30:00.000Z" })] });
+    const deps = (make(w) as any).deps as EventDeps;
+    deps.findLeadsByEmail = async () => [{ ...w.leads[0], contactStatusUpdatedAt: undefined }]; // the index has not caught up
+    await new SmartleadEventService(deps).handle(ctx, polled("unsubscribe"));
+    expect(w.leads[0].contactStatus).toBe("active");
+  });
+
+  it("still only acts on a contact that proves it was pushed to this campaign through this account", async () => {
+    const w = world({ leads: [lead("L1", "a", "ann@example.com", { system: {} })] }); // no marker
+    const out = await make(w).handle(ctx, polled("unsubscribe"));
+    expect(out.matched).toBe(0);
+    expect(w.leads[0].contactStatus).toBeUndefined();
+    const other = pushed();
+    const o2 = await make(other).handle({ accountId: "smartlead-someone-else", campaignId: CAMPAIGN }, polled("unsubscribe"));
+    expect(o2.matched).toBe(0);
+  });
+});
