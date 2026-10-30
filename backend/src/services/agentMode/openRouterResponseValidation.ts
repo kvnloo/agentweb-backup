@@ -41,6 +41,22 @@ export function assertOpenRouterResponseHasChoices(res: unknown, model: string):
 }
 
 /**
+ * ENG-2720: throws on a 200 that carries no answer (`finish_reason: "error"`, or no text and no
+ * tool calls). Opt-in via `requireContent`: for a caller that needs text, this is a failed call, but
+ * left alone it becomes an empty string that reads downstream as "nothing found".
+ */
+export function assertOpenRouterResponseHasContent(res: unknown, model: string): void {
+  const choice = (res as any)?.choices?.[0];
+  const hasToolCalls = Array.isArray(choice?.message?.tool_calls) && choice.message.tool_calls.length > 0;
+  if (choice?.finish_reason === 'error' || (!choice?.message?.content && !hasToolCalls)) {
+    throw new Error(
+      `${MALFORMED_OPENROUTER_RESPONSE_PREFIX}: model "${model}" returned no content `
+      + `(finish_reason: ${choice?.finish_reason ?? 'none'}, provider: ${(res as any)?.provider ?? 'unknown'}).`,
+    );
+  }
+}
+
+/**
  * Message-pattern check for the two malformed/empty-response failure classes above.
  *
  * Deliberately NOT folded into the shared `classifyToolErrorClass` taxonomy: that
