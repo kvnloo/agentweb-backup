@@ -8,6 +8,8 @@ jest.mock('unipile-node-sdk', () => ({
   UnipileClient: jest.fn().mockImplementation(() => ({})),
 }), { virtual: true });
 
+
+
 // Mock AWS / secretsManager
 jest.mock('../utils/secretsManager', () => ({
   getUnipileCredentials: jest.fn().mockResolvedValue({ dsn: 'https://api.unipile.com', apiKey: 'test-key' }),

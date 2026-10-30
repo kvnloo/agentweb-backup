@@ -57,6 +57,11 @@ export interface PushServiceDeps {
     writeMarker: EngineDeps["writeMarker"];
   };
   smartlead: SmartleadApi;
+  /**
+   * Puts AgentWeb's event webhook (replies, bounces, unsubscribes) on the campaign before a run starts adding contacts (ENG-673, slice 3). Optional
+   * and best effort: it never delays or stops a push, and the opt-out sweep and the hourly fallback cover a missed registration.
+   */
+  registerEvents?(apiKey: string, accountId: string, campaignId: number): Promise<unknown>;
   secret: string;
   /** The kill switch. When false nothing starts, resumes or runs; pausing and canceling stay possible. */
   enabled(): boolean;
@@ -579,6 +584,7 @@ export class SmartleadPushService {
         return;
       }
       const apiKey = resolved.apiKey;
+      await this.registerEvents(apiKey, run);
       const engineDeps: EngineDeps = {
         store: this.deps.db,
         readLeads: (l, a, n) => this.deps.crm.readLeads(l, a, n),
@@ -600,6 +606,23 @@ export class SmartleadPushService {
       this.deps.log(`[SmartleadPush] run=${run.runId} ${outcome.outcome}${"reason" in outcome ? ` (${outcome.reason})` : ""}`);
     } catch (error) {
       this.deps.log(`[SmartleadPush] run=${run.runId} worker error: ${scrubSmartleadSecrets(error instanceof Error ? error.message : String(error))}`);
+    }
+  }
+
+  /** Registers the event webhook for this run's campaign; every failure is logged and swallowed. */
+  private async registerEvents(apiKey: string, run: PushRun): Promise<void> {
+    if (!this.deps.registerEvents) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await Promise.race([
+        this.deps.registerEvents(apiKey, run.smartleadAccountId, run.campaignId),
+        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("timed out")), 15_000); }),
+      ]);
+      this.deps.log(`[SmartleadPush] run=${run.runId} event webhook: ${String(result)}`);
+    } catch (error) {
+      this.deps.log(`[SmartleadPush] run=${run.runId} event webhook not registered: ${scrubSmartleadSecrets(error instanceof Error ? error.message : String(error))}`);
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 
