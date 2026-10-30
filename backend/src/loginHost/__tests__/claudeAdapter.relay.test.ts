@@ -9,6 +9,7 @@ import { tmpdir } from "os";
 import { dirname, join } from "path";
 import type { AdapterContext, ChildLike, ProviderEvent, ProviderSession, SpawnSpec } from "../adapter";
 import { ClaudeAdapter } from "../adapters/claudeAdapter";
+import * as canonicalModule from "../relay/canonical";
 import { Layout } from "../ports/layout";
 import { RelayHost } from "../relay/relayServer";
 import type { ToolDef } from "../protocol";
@@ -423,6 +424,27 @@ describe("claude adapter: lifecycle and memory bounds of the relay", () => {
     feed(100, 3); // within the cap: kept, whole (never a slice of something longer)
     expect(s.streamUses.map((u) => u.messageId.length)).toEqual([101, 101, 101]);
     expect(s.streamUses.every((u) => u.messageId.length <= 128)).toBe(true);
+    await session.close();
+  });
+
+  it("MUTATION TARGET: a stream announcement with a huge input is recorded by NAME only, in bounded time (hashing a 16 MB hostile input blocked the loop for seconds)", async () => {
+    const rig = makeRig();
+    const session = await rig.adapter.openSession(rig.ctx, { connectionId: "conn1", epoch: 1 });
+    const s = session as unknown as { visibleTools: Set<string>; streamUses: Array<{ messageId: string; name: string; key: string }>; noteStreamUse(raw: Record<string, unknown>): void };
+    s.visibleTools.add("search");
+    const huge = new Array(6_000_000).fill(1);
+    const canonical = jest.spyOn(canonicalModule, "canonicalJson"); // deterministic: the point is that the hostile input is never walked/hashed, not how fast the machine is
+    const t0 = Date.now();
+    s.noteStreamUse({ type: "assistant", message: { id: "mBig", content: [{ type: "tool_use", id: "tu", name: "mcp__emma__search", input: { ids: huge } }] } });
+    expect(canonical).not.toHaveBeenCalled();
+    expect(Date.now() - t0).toBeLessThan(5000); // sanity only (the unguarded path took 1.7-3.1 s on an idle machine)
+    expect(s.streamUses).toEqual([{ messageId: "mBig", name: "search", key: "~oversize" }]);
+    // an ordinary one is still hashed (its key is a digest, never the sentinel)
+    s.noteStreamUse({ type: "assistant", message: { id: "mSmall", content: [{ type: "tool_use", id: "tu2", name: "mcp__emma__search", input: { q: 1 } }] } });
+    expect(canonical).toHaveBeenCalledTimes(1);
+    canonical.mockRestore();
+    expect(s.streamUses[1].key).not.toBe("~oversize");
+    expect(s.streamUses[1].key.length).toBeGreaterThan(20);
     await session.close();
   });
 

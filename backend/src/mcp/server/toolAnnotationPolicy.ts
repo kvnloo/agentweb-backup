@@ -101,6 +101,7 @@ export const MCP_TOOL_SIDE_EFFECTS: Readonly<Record<string, McpToolSideEffect>> 
   manage_user_notes: 'write',
   monitor_lead_volume: 'write',
   publish_landing_page_changes: 'write',
+  read_email: 'read',
   read_knowledge_base_files: 'write',
   read_landing_page_file: 'write',
   resolve_landing_page_by_url: 'write',

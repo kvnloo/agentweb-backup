@@ -88,11 +88,23 @@ export function extractAffordableTokens(error: unknown): number | null {
   return parseAffordableTokens(message) ?? parseAffordableTokens(originalMessage);
 }
 
+export const DRAIN_CEILING_SHUTDOWN_MESSAGE = 'Worker shutdown — drain ceiling exceeded';
+
+/** ENG-2750: true only for the deploy-timing drain-ceiling kill, never a crash. */
+export function isDrainCeilingShutdownError(error: unknown): boolean {
+  if (!error) return false;
+  const message = error instanceof Error ? error.message : String(error);
+  return message === DRAIN_CEILING_SHUTDOWN_MESSAGE;
+}
+
 export function isWorkerShutdownError(error: unknown): boolean {
   if (!error) return false;
   const message = error instanceof Error ? error.message : String(error);
   // Graceful shutdown (server stopping)
   if (message === 'Worker shutdown') return true;
+  // ENG-2750: drain ceiling hit during graceful shutdown — the worker was killed
+  // mid-run by deploy timing, the same class (generateMarketingResponseWorkerService).
+  if (message === 'Worker shutdown — drain ceiling exceeded') return true;
   // Unexpected worker subprocess crash (e.g. OOM kill, EB instance replacement)
   if (message.startsWith('Worker process exited with code')) return true;
   // Dispatch raced a graceful-shutdown drain window (deploy/restart) — same
@@ -225,4 +237,16 @@ export const PROVIDER_UNAVAILABLE_USER_MESSAGE =
 
 export function isProviderUnavailableError(error: unknown): boolean {
   return error instanceof Error && error.message === PROVIDER_UNAVAILABLE_USER_MESSAGE;
+}
+
+/**
+ * ENG-2763: user-facing message when the OpenRouter key/credits are exhausted until a
+ * reset (`403 Key limit exceeded (monthly limit)` / 402 credits). Retrying is guaranteed
+ * to fail, so this deliberately does NOT say "please try again".
+ */
+export const QUOTA_EXHAUSTED_USER_MESSAGE =
+  'Our AI service is temporarily at capacity. Our team has been notified and is restoring it — no need to resend your message right now.';
+
+export function isQuotaExhaustedError(error: unknown): boolean {
+  return error instanceof Error && error.message === QUOTA_EXHAUSTED_USER_MESSAGE;
 }

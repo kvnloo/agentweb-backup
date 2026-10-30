@@ -69,6 +69,14 @@ export interface McpToolHandler {
    * arguments only"; only set this when no possible call writes anything.
    */
   readOnly?: boolean;
+  /**
+   * Opt-in API-key scope (e.g. `email:read`) this tool requires. When set:
+   * the MCP HTTP layer lets an `aw_` key call it only if the key explicitly
+   * holds this scope (`tools:execute` does not imply it — see apiKeyScopes.ts),
+   * and `execute()` refuses every other external auth method (OAuth,
+   * anonymous) outright. In-process callers (externalMcp unset) are unaffected.
+   */
+  requiredScope?: string;
 }
 
 export { isAnonymousUserId } from '../anonymousToolAccess';
@@ -148,6 +156,17 @@ export class McpToolRegistry {
     if (handler.internalOnly && context?.externalMcp === true) {
       throw new Error(
         `Tool ${name} is not available to external clients. It is used by Emma internally.`
+      );
+    }
+
+    // Opt-in-scope tools are for explicitly scoped `aw_` keys only. The scope
+    // itself is checked per request in mcpServer.ts (the key is re-validated on
+    // every POST); this is the second line, keyed on the session's auth method,
+    // so an OAuth/anonymous external caller can never reach the handler even if
+    // the HTTP-layer check were bypassed or a session were reused.
+    if (handler.requiredScope && context?.externalMcp === true && context?.authMethod !== 'api_key') {
+      throw new Error(
+        `Tool ${name} is only available to API keys granted the '${handler.requiredScope}' scope.`
       );
     }
 

@@ -3189,6 +3189,62 @@
     }
   },
   {
+    "name": "read_email",
+    "listed": false,
+    "description": "Read-only access to your own connected email accounts (Gmail, Outlook): search, list a folder, or get messages by ID. Requires an API key with the 'email:read' scope. Cannot send or reply, and cannot read mailboxes shared by teammates.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "account_id": {
+          "type": "string",
+          "description": "Email account ID from list_connected_accounts"
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "search",
+            "list",
+            "get"
+          ],
+          "description": "Read action to perform"
+        },
+        "query": {
+          "type": "string",
+          "description": "Search query (search action)"
+        },
+        "folder": {
+          "type": "string",
+          "description": "Folder to list (list action)",
+          "default": "INBOX"
+        },
+        "message_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 50,
+          "description": "Message IDs (get action, at most 50)"
+        },
+        "max_results": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 50,
+          "description": "Max results (search/list, 1-50)",
+          "default": 10
+        }
+      },
+      "required": [
+        "account_id",
+        "action"
+      ]
+    },
+    "sideEffect": "read",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
     "name": "read_knowledge_base_files",
     "listed": false,
     "description": "Read specific files from the knowledge base.",

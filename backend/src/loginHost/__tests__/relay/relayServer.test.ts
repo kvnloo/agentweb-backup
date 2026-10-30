@@ -499,6 +499,58 @@ describe("relay: hostile frames cannot take the host down", () => {
     await ep.close();
   });
 
+  it("MUTATION TARGET: an onCall that throws answers the shim with a fixed internal error, ends the call, and the endpoint takes the next call", async () => {
+    const r = rig();
+    let first = true;
+    const calls: RelayCall[] = [];
+    const ep = await r.host.open({
+      uid: 400_001,
+      identity: { connectionId: "c", epoch: 1, turnId: "t" },
+      onCall: (c) => {
+        if (first) {
+          first = false;
+          throw new Error("onCall boom: SECRET");
+        }
+        calls.push(c);
+      },
+      allowTool: () => true,
+      callTimeoutMs: () => 5000,
+    });
+    const c = new Client(sockOf(ep));
+    await c.ready();
+    c.send(call("b1"));
+    await until(() => c.lines.length === 1);
+    expect(JSON.parse(c.lines[0])).toEqual({ type: "error", callId: "b1", code: "internal" });
+    c.send(call("b2")); // the pending slot was freed
+    await until(() => calls.length === 1);
+    expect(uncaught).toEqual([]);
+    expect(JSON.stringify(r.logs)).not.toContain("SECRET");
+    await ep.close();
+  });
+
+  it("MUTATION TARGET: the per-call timer is guarded: a callback that throws when the call times out cannot become an uncaught exception", async () => {
+    const r = rig();
+    const ep = await r.host.open({
+      uid: 400_001,
+      identity: { connectionId: "c", epoch: 1, turnId: "t" },
+      onCall: () => undefined,
+      onCallEnded: () => {
+        throw new Error("ended boom: SECRET");
+      },
+      allowTool: () => true,
+      callTimeoutMs: () => 40,
+    });
+    const c = new Client(sockOf(ep));
+    await c.ready();
+    c.send(call("tm"));
+    await until(() => c.closed); // the guard dropped the connection after the callback threw
+    await new Promise((res) => setTimeout(res, 100));
+    expect(uncaught).toEqual([]);
+    expect(r.logs.map((l) => l.fields?.code)).toContain("internal_error");
+    expect(JSON.stringify(r.logs)).not.toContain("SECRET");
+    await ep.close();
+  });
+
   it("MUTATION TARGET: reject() answers the pending call with a fixed internal error frame (once)", async () => {
     const r = rig();
     const { ep, calls } = await r.open();
@@ -512,6 +564,28 @@ describe("relay: hostile frames cannot take the host down", () => {
     expect(JSON.parse(c.lines[0])).toEqual({ type: "error", callId: "rj", code: "internal" });
     expect(ep.reject(calls[0].operationId, "internal")).toBe(false);
     expect(ep.answer(calls[0].operationId, { content: "late" })).toBe(false);
+    await ep.close();
+  });
+
+  it("MUTATION TARGET: a frame trickled in tiny writes (3 bytes at a time) is assembled and answered exactly like a whole one; a frame split exactly at the newline too", async () => {
+    const r = rig();
+    const { ep, calls } = await r.open();
+    const c = new Client(sockOf(ep));
+    await c.ready();
+    const wire = Buffer.from(JSON.stringify(call("tr1", "echo", { q: "trickle" })) + "\n");
+    for (let i = 0; i < wire.length; i += 3) {
+      c.raw(wire.subarray(i, i + 3));
+      await new Promise((res) => setTimeout(res, 2));
+    }
+    await until(() => calls.length === 1);
+    expect(calls[0].args).toEqual({ q: "trickle" });
+    ep.answer(calls[0].operationId, { content: "ok" });
+    await until(() => c.lines.length === 1);
+    const wire2 = Buffer.from(JSON.stringify(call("tr2")) + "\n");
+    c.raw(wire2.subarray(0, wire2.length - 1));
+    await new Promise((res) => setTimeout(res, 30));
+    c.raw(wire2.subarray(wire2.length - 1)); // just the newline
+    await until(() => calls.length === 2);
     await ep.close();
   });
 

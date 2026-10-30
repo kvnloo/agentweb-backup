@@ -42,14 +42,20 @@ it("MUTATION TARGET: runMain checks every configured path (node included) and re
   const lines: string[] = [];
   const write = jest.spyOn(process.stdout, "write").mockImplementation(((s: string) => (lines.push(String(s)), true)) as never);
   const exit = jest.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+  const on = jest.spyOn(process, "on").mockImplementation((() => process) as never); // the real process must not get an exit-on-error handler from a unit test
   let exitCalls: unknown[][];
+  let registered: unknown[] = [];
   try {
     await runMain(["node", "main.js", cfgPath]);
   } finally {
     exitCalls = [...exit.mock.calls];
+    registered = on.mock.calls.map((c) => c[0]);
     write.mockRestore();
     exit.mockRestore();
+    on.mockRestore();
   }
+  // the last-resort handlers are installed first thing, before any check can fail
+  expect([...registered].sort()).toEqual(["uncaughtException", "unhandledRejection"]);
   expect(exitCalls).toEqual([[1]]);
   const failed = lines.map((l) => JSON.parse(l)).find((l) => l.event === "host_start_failed");
   expect(failed?.reason).toBe(`${NODE} is a symlink`);

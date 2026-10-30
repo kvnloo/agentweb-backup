@@ -267,16 +267,11 @@ else
       ok "node $NODE_VERSION installed to $NODE_DIR"
     fi
   fi
-  # The /usr/bin/node link is what the unit starts and what deploy tooling runs: flipping it is part of the SWITCH (below), never of --prepare, so a host
-  # that keeps running (a deploy that finds it busy gives up) is not left with a different node under its next restart.
-  if [ "$PREPARE" = 1 ]; then
-    skip "/usr/bin/node link: left for the switch phase"
-  elif [ "$(readlink /usr/bin/node 2>/dev/null || true)" = "$NODE_DIR/bin/node" ]; then
-    skip "/usr/bin/node already points at node $NODE_VERSION"
-  else
-    doing "ln -sfn $NODE_DIR/bin/node /usr/bin/node"
-    mut ln -sfn "$NODE_DIR/bin/node" /usr/bin/node
-  fi
+  # The /usr/bin/node link is what the unit starts and what deploy tooling runs: flipping it is part of the SWITCH, never of --prepare, so a host
+  # that keeps running (a deploy that finds it busy gives up) is not left with a different node under its next restart. It happens AFTER the trusted-path check of
+  # the rendered config (below): a release the host would refuse to start with must leave the machine exactly as it was ("nothing was changed" is then true).
+  NODE_LINK_TARGET="$NODE_DIR/bin/node"
+  if [ "$PREPARE" = 1 ]; then skip "/usr/bin/node link: left for the switch phase"; fi
 
   # ───────────────────────────── c. the pinned claude binary ─────────────────────────────
 
@@ -456,6 +451,16 @@ ins -m 0644 "$HERE/files/aw-login-host-failed@.service" "$STAGE_REL_DIR/aw-login
 # Last pre-switch checks on the staged files.
 for f in claude-turn.sh aw-net.sh aw-write-file.sh aw-relay-shim.js; do [ -x "$STAGE_REL_DIR/$f" ] || die "staged $f is not executable"; done
 [ "$SKIP_PREREQS" = 1 ] || [ -x "/opt/aw-claude/$CLAUDE_VERSION/claude" ] || [ "$DRY" = 1 ] || die "the pinned claude binary is missing"
+
+# The node link (see the packages-and-node step): only now that every check on this release has passed.
+if [ -n "${NODE_LINK_TARGET:-}" ] && [ "$PREPARE" != 1 ]; then
+  if [ "$(readlink /usr/bin/node 2>/dev/null || true)" = "$NODE_LINK_TARGET" ]; then
+    skip "/usr/bin/node already points at node $NODE_VERSION"
+  else
+    doing "ln -sfn $NODE_LINK_TARGET /usr/bin/node"
+    mut ln -sfn "$NODE_LINK_TARGET" /usr/bin/node
+  fi
+fi
 
 if [ "$DRY" = 1 ]; then
   if [ "$FAILED" -gt 0 ]; then

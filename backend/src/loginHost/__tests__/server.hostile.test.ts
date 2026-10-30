@@ -71,6 +71,7 @@ describe("server callbacks", () => {
     expect(r.text).toContain('"type":"accepted"');
     expect(r.text).not.toContain("never reached");
     expect(uncaught).toEqual([]);
+    await until(() => rig.script.interruptedTurns.includes("t-ser")); // the turn was ABORTED (provider told to stop), not just left to end
     const status = await post(join(dir, "host.sock"), "connection.status", { connectionId: "c1" });
     expect(status.status).toBe(200);
     expect(JSON.parse(status.text)).toMatchObject({ runningTurns: 0 });

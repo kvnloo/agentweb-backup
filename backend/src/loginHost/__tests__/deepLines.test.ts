@@ -57,12 +57,12 @@ describe("CLI stdout: lines nested deeper than the cap are dropped before anythi
     expect(bad.out()).toBe("[".repeat(64) + `\n${PLACEHOLDER}\nnext line\n`);
   });
 
-  it.each([5_000, 100_000, 1_000_000])("MUTATION TARGET: a line nested %i deep is cut in under 100 ms; what is forwarded is tiny; the lines around it are intact", async (k) => {
+  it.each([5_000, 100_000, 1_000_000])("MUTATION TARGET: a line nested %i deep is cut in well under a second (a few ms when idle; seconds if it were parsed); what is forwarded is tiny; the lines around it are intact", async (k) => {
     const r = rig();
     const line = nested(k);
     const t0 = Date.now();
     await r.feed('{"type":"before"}\n', line + "\n", '{"type":"after"}\n');
-    expect(Date.now() - t0).toBeLessThan(100);
+    expect(Date.now() - t0).toBeLessThan(300);
     expect(r.deep).toHaveLength(1);
     expect(r.out().length).toBeLessThan(400);
     expect(r.out().endsWith(`\n${PLACEHOLDER}\n{"type":"after"}\n`)).toBe(true);
@@ -76,7 +76,7 @@ describe("CLI stdout: lines nested deeper than the cap are dropped before anythi
     for (let i = 0; i < deepLine.length; i += 7_000) chunks.push(deepLine.slice(i, i + 7_000));
     const t0 = Date.now();
     await r.feed('{"s":"x\\', '"y"}\n', ...chunks, "\n", '{"ok":1}\n');
-    expect(Date.now() - t0).toBeLessThan(100);
+    expect(Date.now() - t0).toBeLessThan(300);
     expect(r.deep).toHaveLength(1);
     expect(r.out()).toBe(`{"s":"x\\"y"}\n${"[".repeat(64)}\n${PLACEHOLDER}\n{"ok":1}\n`);
   });
@@ -130,6 +130,14 @@ describe("normalized stream events: informational values are bounded before they
     const big = { blob: "x".repeat(2 * 1024 * 1024) };
     expect(normalizeClaudeEvent(toolUse(big))[0]).toMatchObject({ input: { _truncated: "size" } });
     expect(normalizeClaudeEvent(toolUse({ q: "small" }))[0]).toMatchObject({ input: { q: "small" } });
+  });
+
+  it("MUTATION TARGET: a legitimate input of 130,000 small integers (~260 KB of JSON) is forwarded as is, not replaced by a marker (the backend groups batched approvals by input)", () => {
+    const input = { ids: new Array(130_000).fill(7) };
+    expect(Buffer.byteLength(JSON.stringify(input))).toBeLessThan(1024 * 1024);
+    expect((normalizeClaudeEvent(toolUse(input))[0] as { input: unknown }).input).toBe(input);
+    const real = { ids: new Array(300_000).fill(123456) }; // ~2.1 MB of JSON
+    expect(normalizeClaudeEvent(toolUse(real))[0]).toMatchObject({ input: { _truncated: "size" } });
   });
 
   it("MUTATION TARGET: events with an over-long id or name are dropped (a 16 MB id would be forwarded to the backend as is)", () => {

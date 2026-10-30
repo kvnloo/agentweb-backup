@@ -20,7 +20,7 @@ import { createServer, type Server, type Socket } from "net";
 import type { Logger } from "../ports";
 import type { Layout } from "../ports/layout";
 import { RELAY_FRAME_LIMITS, TOOL_NAME, type ToolDef } from "../protocol";
-import { LogThrottle, MAX_FRAME_DEPTH, rawJsonDepthExceeds } from "./bounds";
+import { LineAssembler, LogThrottle, MAX_FRAME_DEPTH, rawJsonDepthExceeds } from "./bounds";
 
 export interface RelayIdentity {
   connectionId: string;
@@ -248,7 +248,7 @@ class Endpoint implements RelayEndpoint {
     }
     this.accepted++;
     this.conn = s;
-    let buf = Buffer.alloc(0);
+    const assembler = new LineAssembler(this.limits.shimToHostBytes);
     let tokens = this.limits.burst;
     let lastRefill = Date.now();
     let idle = setTimeout(() => this.drop(s, "idle_timeout"), this.limits.idleMs);
@@ -268,16 +268,8 @@ class Endpoint implements RelayEndpoint {
     });
     const onData = (chunk: Buffer): void => {
       if (this.conn !== s) return;
-      buf = buf.length ? Buffer.concat([buf, chunk]) : chunk;
-      for (;;) {
-        const nl = buf.indexOf(10);
-        if (nl < 0) {
-          if (buf.length > this.limits.shimToHostBytes) return this.drop(s, "frame_too_large");
-          return;
-        }
-        if (nl > this.limits.shimToHostBytes) return this.drop(s, "frame_too_large");
-        const line = buf.subarray(0, nl);
-        buf = buf.subarray(nl + 1);
+      const { lines, tooLarge } = assembler.push(chunk); // linear in the bytes received, however they are chunked (see LineAssembler)
+      for (const line of lines) {
         // Token bucket, refilled by elapsed time. Every complete frame costs one token.
         const now = Date.now();
         tokens = Math.min(this.limits.burst, tokens + ((now - lastRefill) / 1000) * this.limits.refillPerSec);
@@ -289,6 +281,7 @@ class Endpoint implements RelayEndpoint {
         idle.unref?.();
         if (!this.frame(s, line)) return;
       }
+      if (tooLarge) this.drop(s, "frame_too_large");
     };
   }
 

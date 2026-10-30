@@ -6,8 +6,9 @@
  * timezone, so output is fully determined by the inputs.
  */
 import { SCHEDULED_POST_PLATFORMS, type ScheduledPostPlatform } from './validateScheduledPostRequest';
+import type { ScheduledPostStatus } from './scheduledPostLifecycle';
 
-export type ScheduledPostStatus = 'pending' | 'fired' | 'cancelled';
+export type { ScheduledPostStatus };
 
 /** Minimal structural record: ValidScheduledPost fields plus id + status. */
 export interface ScheduledPostListRecord {
@@ -17,13 +18,15 @@ export interface ScheduledPostListRecord {
   content: string;
   mediaUrls: string[];
   status: ScheduledPostStatus;
+  /** Last publish error, rendered as a preview on failed rows. */
+  lastError?: string;
 }
 
 export interface FormatScheduledPostListOptions {
   now: Date;
   /** IANA timezone, e.g. "America/Los_Angeles". */
   timeZone: string;
-  /** Include fired/cancelled records (default false). */
+  /** Include fired/cancelled records (default false). Failed posts are always shown. */
   includeInactive?: boolean;
 }
 
@@ -48,7 +51,8 @@ export interface ScheduledPostRow {
 }
 
 export interface ScheduledPostGroup {
-  platform: ScheduledPostPlatform;
+  /** Platform for platform groups; null for the trailing "Failed" group. */
+  platform: ScheduledPostPlatform | null;
   label: string;
   rows: ScheduledPostRow[];
 }
@@ -58,6 +62,7 @@ export type ScheduledPostListView =
   | { empty: false; text: string; groups: ScheduledPostGroup[] };
 
 export const NOTHING_SCHEDULED_TEXT = 'Nothing scheduled.';
+export const FAILED_GROUP_LABEL = 'Failed';
 
 export function truncatePreview(content: string, max = SCHEDULED_POST_PREVIEW_LENGTH): string {
   const flat = content.replace(/\s+/g, ' ').trim();
@@ -96,34 +101,43 @@ export function formatScheduledPostList(
   options: FormatScheduledPostListOptions,
 ): ScheduledPostListView {
   const { now, timeZone, includeInactive = false } = options;
-  const visible = records.filter((r) => includeInactive || r.status === 'pending');
+  const visible = records.filter((r) => includeInactive || r.status === 'pending' || r.status === 'failed');
 
   if (visible.length === 0) {
     return { empty: true, text: NOTHING_SCHEDULED_TEXT, groups: [] };
   }
 
+  const byTime = (a: ScheduledPostListRecord, b: ScheduledPostListRecord) =>
+    a.publishAt.getTime() - b.publishAt.getTime() || a.id.localeCompare(b.id);
+
+  const toRow = (r: ScheduledPostListRecord, withPlatform: boolean): ScheduledPostRow => {
+    const pastDue = r.status === 'pending' && r.publishAt.getTime() <= now.getTime();
+    const localTime = formatLocalTime(r.publishAt, timeZone);
+    const relativeTime = formatRelativeTime(r.publishAt, now);
+    const preview = truncatePreview(r.content);
+    const mediaCount = r.mediaUrls.length;
+    const flags = [pastDue ? 'PAST DUE' : null, r.status !== 'pending' ? r.status.toUpperCase() : null].filter(Boolean);
+    const media = mediaCount > 0 ? ` [${mediaCount} media]` : '';
+    const flagText = flags.length ? ` (${flags.join(', ')})` : '';
+    const prefix = withPlatform ? `${PLATFORM_LABELS[r.platform]} ` : '';
+    const error = r.status === 'failed' && r.lastError?.trim() ? ` — error: ${truncatePreview(r.lastError)}` : '';
+    const line = `- ${prefix}${localTime} (${relativeTime})${flagText}: "${preview}"${media} — id ${r.id}${error}`;
+    return { id: r.id, platform: r.platform, status: r.status, localTime, relativeTime, preview, mediaCount, pastDue, line };
+  };
+
   const groups: ScheduledPostGroup[] = [];
   for (const platform of SCHEDULED_POST_PLATFORMS) {
     const rows = visible
-      .filter((r) => r.platform === platform)
-      .sort((a, b) => a.publishAt.getTime() - b.publishAt.getTime() || a.id.localeCompare(b.id))
-      .map((r): ScheduledPostRow => {
-        const pastDue = r.status === 'pending' && r.publishAt.getTime() <= now.getTime();
-        const localTime = formatLocalTime(r.publishAt, timeZone);
-        const relativeTime = formatRelativeTime(r.publishAt, now);
-        const preview = truncatePreview(r.content);
-        const mediaCount = r.mediaUrls.length;
-        const flags = [
-          pastDue ? 'PAST DUE' : null,
-          r.status !== 'pending' ? r.status.toUpperCase() : null,
-        ].filter(Boolean);
-        const media = mediaCount > 0 ? ` [${mediaCount} media]` : '';
-        const flagText = flags.length ? ` (${flags.join(', ')})` : '';
-        const line = `- ${localTime} (${relativeTime})${flagText}: "${preview}"${media} — id ${r.id}`;
-        return { id: r.id, platform, status: r.status, localTime, relativeTime, preview, mediaCount, pastDue, line };
-      });
+      .filter((r) => r.platform === platform && r.status !== 'failed')
+      .sort(byTime)
+      .map((r) => toRow(r, false));
     if (rows.length > 0) groups.push({ platform, label: PLATFORM_LABELS[platform], rows });
   }
+  const failedRows = visible
+    .filter((r) => r.status === 'failed')
+    .sort(byTime)
+    .map((r) => toRow(r, true));
+  if (failedRows.length > 0) groups.push({ platform: null, label: FAILED_GROUP_LABEL, rows: failedRows });
 
   const text = groups.map((g) => [`${g.label}:`, ...g.rows.map((r) => r.line)].join('\n')).join('\n\n');
   return { empty: false, text, groups };
