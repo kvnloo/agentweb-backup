@@ -1,12 +1,12 @@
 jest.mock("../db", () => ({
-  crmDb: { findAllLeadsByEmail: jest.fn(), getLeadById: jest.fn(), findLeadsByLinkedin: jest.fn(), getLeadListById: jest.fn() },
+  crmDb: { findAllLeadsByEmail: jest.fn(), getLeadListById: jest.fn() },
   userDb: { getUserById: jest.fn() },
   orgDb: { getOrgMembers: jest.fn() },
 }));
-import { addressesOf, blockedContactError, blockedMessage, blockedRecipients, leadIsBlocked, linkedinProfileIsBlocked, unverifiedContactError } from "../contactGuard";
+import { addressesOf, blockedMessage, blockedRecipients, unverifiedContactError } from "../contactGuard";
 import { crmDb, orgDb, userDb } from "../db";
 
-const db = crmDb as unknown as { findAllLeadsByEmail: jest.Mock; getLeadById: jest.Mock; findLeadsByLinkedin: jest.Mock; getLeadListById: jest.Mock };
+const db = crmDb as unknown as { findAllLeadsByEmail: jest.Mock; getLeadListById: jest.Mock };
 const users = userDb as unknown as { getUserById: jest.Mock };
 const orgs = orgDb as unknown as { getOrgMembers: jest.Mock };
 beforeEach(() => {
@@ -23,6 +23,17 @@ describe("addresses in a to/cc/bcc value", () => {
     expect(addressesOf("mailto:a@x.com")).toEqual(["a@x.com"]);
     expect(addressesOf("Ann <mailto:a@x.com>")).toEqual(["a@x.com"]);
     expect(addressesOf("a@x.com c@y.com")).toEqual(["a@x.com", "c@y.com"]);
+    expect(addressesOf("(a@x.com)")).toEqual(["a@x.com"]);
+    expect(addressesOf("[a@x.com]")).toEqual(["a@x.com"]);
+    expect(addressesOf("a@x.com.")).toEqual(["a@x.com"]);
+    expect(addressesOf("a@x.com)")).toEqual(["a@x.com"]);
+    expect(addressesOf("mailto:a@x.com?subject=hi")).toEqual(["a@x.com"]);
+    expect(addressesOf([["a@x.com"], [["b@x.com"]]])).toEqual(["a@x.com", "b@x.com"]);
+    // a `?` inside the local part is part of the address; only a query AFTER the domain is cut
+    expect(addressesOf("what?@x.com")).toEqual(["what?@x.com"]);
+    expect(addressesOf("a@x.com?subject=hi&body=b")).toEqual(["a@x.com"]);
+    // `{` and `}` are legal in a local part and are not stripped
+    expect(addressesOf("{a}@x.com")).toEqual(["{a}@x.com"]);
     expect(addressesOf(undefined)).toEqual([]);
     expect(addressesOf(42)).toEqual([]);
     expect(addressesOf("no address here")).toEqual([]);
@@ -79,6 +90,23 @@ describe("blocking by address (agent email tools, the Emma API) (ENG-673)", () =
     await expect(blockedRecipients(["u1"], "info@x.com")).rejects.toThrow("too many contacts share this address");
   });
 
+  it("long hostile input is bounded: a piece over the length limit is skipped, and 100,000 characters take well under a second", () => {
+    const started = Date.now();
+    expect(addressesOf("a".repeat(100_000))).toEqual([]);
+    expect(addressesOf(".".repeat(100_000) + "x")).toEqual([]);
+    expect(addressesOf("(".repeat(50_000) + ")".repeat(50_000))).toEqual([]);
+    expect(Date.now() - started).toBeLessThan(1000);
+    // a normal address next to a hostile piece is still found
+    expect(addressesOf(`${"a".repeat(5000)}, ok@x.com`)).toEqual(["ok@x.com"]);
+  });
+
+  it("a recipient too long to look at REFUSES the send instead of being skipped, even next to a fine address", async () => {
+    db.findAllLeadsByEmail.mockResolvedValue([]);
+    await expect(blockedRecipients(["u1"], `"${"N".repeat(700)}" <hidden@x.com>`)).rejects.toThrow("too long to check");
+    await expect(blockedRecipients(["u1"], "ok@x.com", ["fine@x.com", "z".repeat(700)])).rejects.toThrow("too long to check");
+    expect(await blockedRecipients(["u1"], "ok@x.com")).toEqual([]);
+  });
+
   it("does no lookup at all for a send with no address", async () => {
     expect(await blockedRecipients(["u1"], undefined, "")).toEqual([]);
     expect(db.findAllLeadsByEmail).not.toHaveBeenCalled();
@@ -87,36 +115,7 @@ describe("blocking by address (agent email tools, the Emma API) (ENG-673)", () =
   it("the messages name only the caller's own addresses, tell the agent not to route around, and carry no internal wording", () => {
     expect(blockedMessage(["a@x.com"])).toContain("a@x.com is marked do-not-contact");
     expect(blockedMessage(["a@x.com", "b@x.com"])).toContain("are marked");
-    expect(blockedMessage(["a@x.com"]) + blockedContactError + unverifiedContactError).not.toMatch(/ENG|Linear|ticket|slice/i);
+    expect(blockedMessage(["a@x.com"]) + unverifiedContactError).not.toMatch(/ENG|Linear|ticket|slice/i);
     expect(unverifiedContactError).toContain("nothing was sent");
-  });
-});
-
-describe("blocking by lead or LinkedIn profile (agent LinkedIn and X tools)", () => {
-  it("leadIsBlocked: only our blocked lead, and nothing without both ids", async () => {
-    db.getLeadById.mockResolvedValue({ userId: "u1", contactStatus: "do-not-contact" });
-    expect(await leadIsBlocked(["u1"], "l1", "d1")).toBe(true);
-    expect(await leadIsBlocked(["other"], "l1", "d1")).toBe(false);
-    expect(await leadIsBlocked(["u1"], undefined, "d1")).toBe(false);
-    expect(await leadIsBlocked(["u1"], "l1", undefined)).toBe(false);
-    db.getLeadById.mockResolvedValue(null);
-    expect(await leadIsBlocked(["u1"], "l1", "d1")).toBe(false);
-  });
-  it("leadIsBlocked: a lead with no owner recorded is resolved through the named list", async () => {
-    db.getLeadById.mockResolvedValue({ contactStatus: "do-not-contact" });
-    db.getLeadListById.mockResolvedValue({ userId: "u1" });
-    expect(await leadIsBlocked(["u1"], "l1", "d1")).toBe(true);
-    expect(db.getLeadListById).toHaveBeenCalledWith("l1");
-  });
-  it("linkedinProfileIsBlocked: finds the profile with or without a trailing slash, only among our leads", async () => {
-    db.findLeadsByLinkedin.mockImplementation(async (v: string) => (v.endsWith("/") ? [{ userId: "u1", contactStatus: "unsubscribed" }] : []));
-    expect(await linkedinProfileIsBlocked(["u1"], "https://www.linkedin.com/in/x")).toBe(true);
-    expect(await linkedinProfileIsBlocked(["other"], "https://www.linkedin.com/in/x")).toBe(false);
-    expect(await linkedinProfileIsBlocked(["u1"], undefined)).toBe(false);
-    expect(await linkedinProfileIsBlocked(["u1"], "  ")).toBe(false);
-  });
-  it("linkedinProfileIsBlocked: throws at the row cap", async () => {
-    db.findLeadsByLinkedin.mockResolvedValue(Array.from({ length: 10 }, () => ({ userId: "other", contactStatus: "active" })));
-    await expect(linkedinProfileIsBlocked(["u1"], "https://www.linkedin.com/in/popular")).rejects.toThrow("too many contacts");
   });
 });

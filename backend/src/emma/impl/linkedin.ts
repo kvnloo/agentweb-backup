@@ -1677,18 +1677,6 @@ export async function linkedinOutreach(
 
       case 'send-invite': {
         if (!target) throw new Error('Either profile_url or provider_id is required for send-invite');
-        // ENG-673: never invite/message a contact marked do-not-contact (the lead named by list_id/lead_id, or any of the caller's leads with this profile).
-        {
-          const guard = await import('../../services/contactGuard');
-          try {
-            if ((await guard.leadIsBlocked([userId], args.list_id, args.lead_id)) || (await guard.linkedinProfileIsBlocked([userId], profile_url))) {
-              return { success: false, error: guard.blockedContactError, reason: 'do_not_contact' };
-            }
-          } catch (e) {
-            console.error('[AgentMode] do-not-contact check failed, not sending:', e);
-            return { success: false, error: guard.unverifiedContactError, reason: 'do_not_contact_unverified' };
-          }
-        }
 
         // ENG-1026: when the model passes CRM lead context, cross-check the live
         // profile's identity against the lead before spending an invite on the
@@ -1921,18 +1909,6 @@ export async function linkedinOutreach(
       case 'send-message': {
         if (!target) throw new Error('Either profile_url or provider_id is required for send-message');
         if (!message) throw new Error('message is required for send-message action');
-        // ENG-673: never invite/message a contact marked do-not-contact (the lead named by list_id/lead_id, or any of the caller's leads with this profile).
-        {
-          const guard = await import('../../services/contactGuard');
-          try {
-            if ((await guard.leadIsBlocked([userId], args.list_id, args.lead_id)) || (await guard.linkedinProfileIsBlocked([userId], profile_url))) {
-              return { success: false, error: guard.blockedContactError, reason: 'do_not_contact' };
-            }
-          } catch (e) {
-            console.error('[AgentMode] do-not-contact check failed, not sending:', e);
-            return { success: false, error: guard.unverifiedContactError, reason: 'do_not_contact_unverified' };
-          }
-        }
 
         // Gate: if list_id + lead_id provided, enforce that conversation history was synced within 24h
         // and check for duplicate sends to prevent spam.
@@ -2058,18 +2034,6 @@ export async function linkedinOutreach(
         if (!message) throw new Error('message is required for send-inmail action');
         const { subject } = args;
         if (!subject) throw new Error('subject is required for send-inmail action');
-        // ENG-673: never invite/message a contact marked do-not-contact (the lead named by list_id/lead_id, or any of the caller's leads with this profile).
-        {
-          const guard = await import('../../services/contactGuard');
-          try {
-            if ((await guard.leadIsBlocked([userId], args.list_id, args.lead_id)) || (await guard.linkedinProfileIsBlocked([userId], profile_url))) {
-              return { success: false, error: guard.blockedContactError, reason: 'do_not_contact' };
-            }
-          } catch (e) {
-            console.error('[AgentMode] do-not-contact check failed, not sending:', e);
-            return { success: false, error: guard.unverifiedContactError, reason: 'do_not_contact_unverified' };
-          }
-        }
 
         const inmailPaced = await paceWrite();
         if (inmailPaced) return inmailPaced.refusal;

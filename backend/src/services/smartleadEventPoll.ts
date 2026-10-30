@@ -26,24 +26,43 @@ const PAGE = 100;
 export const POLL_MAX_PAGES = 10;
 /** A contact handled this recently is not looked up again (kept in memory; a restart only costs some repeat lookups). */
 const SEEN_FOR_MS = 6 * 60 * 60 * 1000;
+/**
+ * A contact that matched nobody in the CRM (the customer's own contacts, our withdrawn ones, or an email lookup that lagged) is looked at again
+ * after this. Longer than the hourly cadence, so a pass does not repeat the lookup for every such contact each time; short enough that a lookup
+ * that lagged is retried the same day.
+ */
+const UNMATCHED_SEEN_FOR_MS = 2 * 60 * 60 * 1000;
+/**
+ * A filtered answer that lists at least this many contacts AND the whole campaign is taken to mean the filter was ignored. Low, because a bounce is
+ * acted on without any per-contact evidence and ends in an irreversible withdrawal; a small campaign where everyone really did bounce or reply is
+ * refused too (logged, and the webhook still delivers those).
+ */
+const FILTER_IGNORED_MIN = 5;
 const LOG_EVERY_MS = 24 * 60 * 60 * 1000;
 
 /**
  * What to ask for. Opt-outs are read TWICE: with Smartlead's own `is_unsubscribed` filter, and from the unfiltered listing keeping rows whose
  * `lead.is_unsubscribed` flag is set, because the filter misses a contact unsubscribed through the API (live finding 2026-10-30).
  */
-const STATUSES: Array<{ status: SmartleadEmailStatus | null; kind: SmartleadEventKind; onlyFlagged?: boolean }> = [
+const STATUSES: Array<{ status: SmartleadEmailStatus | null; kind: SmartleadEventKind }> = [
   { status: "is_unsubscribed", kind: "unsubscribe" }, // the ones that stop sends first
-  { status: null, kind: "unsubscribe", onlyFlagged: true },
+  { status: null, kind: "unsubscribe" }, // rows kept only if the contact's own flag is set
   { status: "is_bounced", kind: "bounce" },
   { status: "is_replied", kind: "reply" },
 ];
 
-const seen = new Map<string, number>();
+const seen = new Map<string, { at: number; for: number }>();
+/**
+ * A contact that looks genuinely bounced (in Smartlead's bounced list, not in its sender-side list) is acted on only when it looks so on TWO passes at
+ * least this far apart. The two lists are separate reads and might not change at the same moment, and a block ends in an irreversible withdrawal; the
+ * poll is only a backstop (the webhook delivers a genuine bounce at once), so waiting one pass costs nothing. In memory: a restart starts the wait again.
+ */
+export const BOUNCE_CONFIRM_AFTER_MS = 45 * 60 * 1000;
+const pendingBounce = new Map<string, number>();
 /** When each campaign was last polled, so that when there are more campaigns than one pass covers, the longest-waiting go first and none starve. */
 const lastPolled = new Map<number, number>();
 const loggedAt = new Map<string, number>();
-export const __resetEventPoll = () => { seen.clear(); loggedAt.clear(); lastPolled.clear(); };
+export const __resetEventPoll = () => { seen.clear(); loggedAt.clear(); lastPolled.clear(); pendingBounce.clear(); };
 
 export interface PollDeps {
   db: {
@@ -63,6 +82,8 @@ export interface PollDeps {
   windowDays?: number;
   maxCampaigns?: number;
   maxPages?: number;
+  /** How long a genuine-looking bounce waits for a second sighting (tests set 0 to switch the wait off). */
+  bounceConfirmAfterMs?: number;
 }
 
 export interface PollResult {
@@ -134,33 +155,98 @@ export async function eventPoll(deps: PollDeps): Promise<PollResult> {
         continue;
       }
 
-      for (const { status: emailStatus, kind, onlyFlagged } of STATUSES) {
+      // The campaign's own size, for the check below. One cheap read (a page of one).
+      let campaignSize: number | undefined;
+      try {
+        campaignSize = (await deps.smartlead.listLeads(resolved.apiKey, campaignId, null, 0, 1)).total;
+      } catch (error) {
+        if (error instanceof SmartleadApiError && (error.status === 401 || error.status === 403)) throw error;
+        logOnce(deps, `${campaignId}#size`, `[SmartleadPoll] campaign=${campaignId}: could not read the campaign's size (${scrubSmartleadSecrets(error instanceof Error ? error.message : String(error)).slice(0, 80)}); bounces and replies are not polled for it this pass`);
+      }
+      let flagUnset = 0;
+      // Smartlead's `is_bounced` list ALSO holds contacts whose bounce came from OUR side (the sending mailbox was refused or is broken), flagged
+      // `sender_bounce` on the email: on two real campaigns (2026-10-30) that was 41 of 57 and 2 of 9. Those say nothing about the contact's address,
+      // and blocking them would withdraw reachable contacts in Smartlead for good. Smartlead lists them separately (`is_sender_bounced`), so a
+      // contact counts as bounced only when it is in the first list and NOT in the second. Read once per pass, and only if a bounce needs it.
+      let senderSide: Set<string> | null | undefined; // undefined: not read yet; null: could not be read in full
+      const readSenderSide = async (): Promise<Set<string> | null> => {
+        const ids = new Set<string>();
+        const pages = deps.maxPages ?? POLL_MAX_PAGES;
+        for (let page = 0; page < pages; page++) {
+          const { total, rows: leads } = await deps.smartlead.listLeads(resolved!.apiKey, campaignId, "is_sender_bounced", page * PAGE, PAGE);
+          for (const l of leads) ids.add(l.leadId);
+          if ((page + 1) * PAGE >= total) return ids;
+          if (leads.length === 0) return null; // an empty page before the end: the list is not complete
+        }
+        return null; // more than the pages read: the exclusion cannot be proven, so no bounce is acted on
+      };
+
+      for (const { status: emailStatus, kind } of STATUSES) {
+        // Without the campaign's size there is no defence against a filter that was ignored, and a bounce ends in an irreversible withdrawal: skip
+        // the kinds that rest on the filter alone. Opt-outs carry Smartlead's own flag on each contact, so they are still read.
+        if (campaignSize === undefined && kind !== "unsubscribe") continue;
         const maxPages = deps.maxPages ?? POLL_MAX_PAGES;
         // One read failing (a rate limit, a timeout) must not cost the other kinds of event, every hour, because the order is fixed. A key that
         // is refused is the exception: nothing else can work, so it goes to the campaign's handler below.
         try {
           for (let page = 0; page < maxPages; page++) {
             const { total, rows: leads } = await deps.smartlead.listLeads(resolved.apiKey, campaignId, emailStatus, page * PAGE, PAGE);
+            // A status filter that Smartlead ignored or renamed would answer with EVERY contact of the campaign, and every one would be treated as
+            // having bounced or unsubscribed (then withdrawn in Smartlead for good). So a filtered answer as big as the whole campaign is refused.
+            if (emailStatus && campaignSize !== undefined && total >= FILTER_IGNORED_MIN && total >= campaignSize) {
+              logOnce(deps, `${campaignId}#${emailStatus}#ignored`, `[SmartleadPoll] campaign=${campaignId}: Smartlead's ${emailStatus} answer lists the whole campaign (${total} of ${campaignSize}); treated as an ignored filter and not used`);
+              out.errors++;
+              break;
+            }
+            // Smartlead's sender-side list is needed only when there IS something bounced, so it is read here, after the first bounced page has rows.
+            if (kind === "bounce" && leads.length > 0 && senderSide === undefined) {
+              try {
+                senderSide = await readSenderSide();
+              } catch (error) {
+                if (error instanceof SmartleadApiError && (error.status === 401 || error.status === 403)) throw error;
+                senderSide = null;
+                logOnce(deps, `${campaignId}#sender#read`, `[SmartleadPoll] campaign=${campaignId}: could not read Smartlead's sender-side bounces (${scrubSmartleadSecrets(error instanceof Error ? error.message : String(error)).slice(0, 80)})`);
+              }
+            }
+            if (kind === "bounce" && leads.length > 0 && senderSide === null) {
+              out.errors++;
+              logOnce(deps, `${campaignId}#sender#skip`, `[SmartleadPoll] campaign=${campaignId}: sender-side bounces are not known, so bounces are not acted on for it this pass`);
+              break;
+            }
             for (const lead of leads) {
-              if (onlyFlagged && !lead.unsubscribed) continue;
+              // An opt-out is believed only when Smartlead's own flag on the contact says so, however the row was found.
+              if (kind === "unsubscribe" && !lead.unsubscribed) { if (emailStatus) flagUnset++; continue; }
+              // A bounce from our own sending side is not about this contact.
+              if (kind === "bounce") {
+                const waiting = `${accountId}#${campaignId}#bounce#${lead.leadId}`;
+                if (senderSide!.has(lead.leadId)) { pendingBounce.delete(waiting); continue; }
+                // Looks genuine: act only once it has looked so on an earlier pass too (see BOUNCE_CONFIRM_AFTER_MS).
+                const confirmAfter = deps.bounceConfirmAfterMs ?? BOUNCE_CONFIRM_AFTER_MS;
+                if (confirmAfter > 0) {
+                  const first = pendingBounce.get(waiting);
+                  if (first === undefined) { pendingBounce.set(waiting, deps.now().getTime()); if (pendingBounce.size > 100_000) pendingBounce.clear(); continue; }
+                  if (deps.now().getTime() - first < confirmAfter) continue;
+                }
+              }
               const memo = `${accountId}#${campaignId}#${kind}#${lead.leadId}`;
               const last = seen.get(memo);
-              if (last !== undefined && deps.now().getTime() - last < SEEN_FOR_MS) continue;
+              if (last !== undefined && deps.now().getTime() - last.at < last.for) continue;
               out.checked++;
               // One contact that cannot be handled (a database error, a write race that never settles) must not stop the rest of the campaign, now
-              // or every hour after: it is counted, logged once a day, and tried again after the usual six hours.
+              // or every hour after: it is counted, logged once a day, and tried again on the next pass.
               try {
                 const outcome = await deps.events.handle({ accountId, campaignId }, {
                   kind, campaignId, candidateEmails: [lead.email], soft: false, polled: true,
                   eventKey: `poll:${kind}:${campaignId}:${lead.leadId}`,
                 });
                 out.changed += outcome.changed;
+                seen.set(memo, { at: deps.now().getTime(), for: outcome.matched > 0 ? SEEN_FOR_MS : UNMATCHED_SEEN_FOR_MS });
               } catch (error) {
                 out.errors++;
                 const text = scrubSmartleadSecrets(error instanceof Error ? error.message : String(error)).slice(0, 120);
                 logOnce(deps, `${campaignId}#contact#${lead.leadId}`, `[SmartleadPoll] campaign=${campaignId}: one contact could not be handled (${kind}): ${text}`);
               }
-              seen.set(memo, deps.now().getTime());
+              // Not remembered: a contact whose handling FAILED (a database error while blocking an opt-out) is tried again on the next pass.
             }
             if (seen.size > 100_000) seen.clear(); // never grows without bound
             if ((page + 1) * PAGE >= total || leads.length === 0) break;
@@ -173,6 +259,7 @@ export async function eventPoll(deps: PollDeps): Promise<PollResult> {
           logOnce(deps, `${campaignId}#read#${kind}#${emailStatus}`, `[SmartleadPoll] campaign=${campaignId}: could not read ${emailStatus ?? "the listing"}: ${text}`);
         }
       }
+      if (flagUnset > 0) logOnce(deps, `${campaignId}#flagunset`, `[SmartleadPoll] campaign=${campaignId}: ${flagUnset} contact(s) came back from Smartlead's unsubscribed filter without the unsubscribed flag set; not acted on (if this keeps appearing, link unsubscribes may not set the flag)`);
     } catch (error) {
       out.errors++;
       // A revoked or expired key is flagged on the connection (as the withdrawal sweep does), so the customer is told to reconnect.
