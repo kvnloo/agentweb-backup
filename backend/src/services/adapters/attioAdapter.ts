@@ -41,6 +41,8 @@ export const ATTIO_LIST_IDENTITY_MAPPING: FieldMapping[] = [
 export function toAttioPhone(raw: string): { original_phone_number: string; country_code?: string } {
     const s = String(raw).trim();
     if (s.startsWith('+')) return { original_phone_number: s };
+    // Never fold extension digits into the number ("253-2345 ext 678").
+    if (/(?:ext\.?|extension|x|#)\s*\d+\s*$/i.test(s)) return { original_phone_number: s, country_code: 'US' };
     const digits = s.replace(/\D/g, '');
     if (digits.length === 10) return { original_phone_number: `+1${digits}` };
     if (digits.length === 11 && digits.startsWith('1')) return { original_phone_number: `+${digits}` };
