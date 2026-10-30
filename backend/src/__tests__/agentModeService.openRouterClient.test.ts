@@ -716,6 +716,47 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     });
   });
 
+  describe('requireContent (ENG-2720)', () => {
+    const empty = { choices: [{ finish_reason: 'error', message: { content: '' } }], usage: {} };
+    const good = { choices: [{ finish_reason: 'stop', message: { content: '{"a":1}' } }], usage: {} };
+    async function callWith(create: jest.Mock, options: any) {
+      const service = new AgentModeService();
+      jest.spyOn(service as any, 'sleep').mockResolvedValue(undefined);
+      jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({ chat: { completions: { create } } } as any);
+      return service.callLLM('gpt-5.4', [{ role: 'user', content: 'Hello' }], { taskClass: 'interactive_chat', ...options } as any);
+    }
+
+    it('retries a 200 with finish_reason=error, then returns the good attempt', async () => {
+      const create = jest.fn().mockResolvedValueOnce(empty).mockResolvedValueOnce(good);
+      const res: any = await callWith(create, { requireContent: true });
+      expect(create).toHaveBeenCalledTimes(2);
+      expect(res.choices[0].message.content).toBe('{"a":1}');
+    });
+
+    it('throws once attempts run out, so the caller sees a failure rather than an empty answer', async () => {
+      const create = jest.fn().mockResolvedValue(empty);
+      await expect(callWith(create, { requireContent: true })).rejects.toThrow(/MALFORMED_OPENROUTER_RESPONSE/);
+      expect(create).toHaveBeenCalledTimes(2);
+    });
+
+    it('leaves other callers unchanged', async () => {
+      const create = jest.fn().mockResolvedValue(empty);
+      await callWith(create, {});
+      expect(create).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it('merges a per-call providerIgnore with the default ignore list (ENG-2720)', async () => {
+    const service = new AgentModeService();
+    const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({ chat: { completions: { create } } } as any);
+    await service.callLLM('gemini-3.7-flash', [{ role: 'user', content: 'Hello' }], { taskClass: 'interactive_chat', providerIgnore: ['Azure'] } as any);
+    expect(create.mock.calls[0][0].provider.ignore).toEqual(['Google', 'Azure']);
+    create.mockClear();
+    await service.callLLM('gpt-5.4', [{ role: 'user', content: 'Hello' }], { taskClass: 'interactive_chat' } as any);
+    expect(create.mock.calls[0][0].provider).not.toHaveProperty('ignore');
+  });
+
   describe('ENG-55 Compare data-collection policy', () => {
     async function providerFor(options: any, model = 'gemini-3.7-flash') {
       const service = new AgentModeService();

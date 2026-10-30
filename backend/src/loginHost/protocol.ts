@@ -64,6 +64,7 @@ export const MODEL_TOOL_NAME_MAX_CHARS = 64;
 export const qualifiedToolPrefix = (server: string): string => `mcp__${server}__`;
 /** The longest bare tool name that still fits the model's limit once the CLI qualifies it for `server`. */
 export const maxToolNameChars = (server: string): number => MODEL_TOOL_NAME_MAX_CHARS - qualifiedToolPrefix(server).length;
+// A new AgentWeb tool must fit these; see docs/plan-route-tool-limits.md (added by the backend PR). Changing a value: update that doc.
 /**
  * The longest tool name the host accepts (53 for "emma": "mcp__emma__" is 11 characters). Derived from the prefix, never a bare number: a longer name would
  * become a qualified name the model API refuses, which fails the WHOLE turn. The real registry's longest name is 38.
@@ -76,6 +77,7 @@ export const TOOL_NAME_MAX_CHARS = maxToolNameChars(RELAY_MCP_SERVER_NAME);
 export const TOOL_NAME = z.string().regex(new RegExp(`^[A-Za-z0-9_][A-Za-z0-9_-]{0,${TOOL_NAME_MAX_CHARS - 1}}$`), `tool name: A-Z a-z 0-9 _ - only, 1-${TOOL_NAME_MAX_CHARS} chars, no leading -`);
 /** Names the relay shim keeps for itself (the whole `aw_relay_` prefix): a manifest may not use them. */
 export const RELAY_RESERVED_PREFIX = "aw_relay_";
+// A new AgentWeb tool must fit these; see docs/plan-route-tool-limits.md (added by the backend PR). Changing a value: update that doc.
 /**
  * DoS guards, NOT a tool budget, and CUMULATIVE per turn (the open set plus every tool added by an answer): the plan route must be able to offer the same tools
  * as AgentWeb, so these sit at about 2x the whole registry (measured 2026-10-29: 271 tools, ~503 KB; largest description 24,232 bytes (call_meta_marketing_api),
@@ -187,6 +189,26 @@ export function admitNewTools(visible: VisibleTools, incoming: ToolDef[]): { ok:
 }
 
 export const IMAGE_LIMITS = { maxImages: 4, maxBase64Each: 2_500_000, maxBase64Total: 6_000_000 } as const;
+
+/**
+ * Environment variables of the CLI that RELAY turns set so the CLI itself never silently changes what the plan route offers (names confirmed in the strings of CLI
+ * 2.1.314; legacy turns set none of them). Every value is derived from a limit of this file, never a second copy of a number:
+ *  - CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH: the CLI shortens an MCP tool description (default 4096 characters, with an ellipsis); the host already refuses one over
+ *    TOOL_LIMITS.maxDescriptionBytes, so that is the limit here (a character is at most that many bytes);
+ *  - MAX_MCP_OUTPUT_TOKENS: the CLI truncates an MCP result above this many tokens (default 25,000, about 100 KB). A relayed result can be a frame of up to
+ *    RELAY_FRAME_LIMITS.hostToShimBytes: counted conservatively at two bytes a token, plus 1,600 tokens (the CLI's own figure) for each image;
+ *  - MCP_TOOL_TIMEOUT: the CLI's own limit on one stdio tool call (milliseconds, at least 1000): the turn's remaining deadline, so the host's clock is the one that ends a call.
+ * (MCP_TIMEOUT is the server start-up timeout in the CLI, not a call limit; CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT, default 30 minutes for stdio, is reset by the shim's
+ * progress notifications.)
+ */
+export function relayCliEnv(callTimeoutMs: number): Record<string, string> {
+  const ms = Math.min(2_147_483_647, Math.max(1000, Math.floor(Number.isFinite(callTimeoutMs) ? callTimeoutMs : 1000)));
+  return {
+    CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH: String(TOOL_LIMITS.maxDescriptionBytes),
+    MAX_MCP_OUTPUT_TOKENS: String(Math.ceil(RELAY_FRAME_LIMITS.hostToShimBytes / 2) + IMAGE_LIMITS.maxImages * 1600),
+    MCP_TOOL_TIMEOUT: String(ms),
+  };
+}
 export const toolImage = z
   .object({
     mimeType: z.enum(["image/png", "image/jpeg", "image/webp", "image/gif"]),

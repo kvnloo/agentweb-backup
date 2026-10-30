@@ -67,6 +67,16 @@ function resetMs(v: unknown): number | undefined {
   return n > 1e12 ? n : n * 1000;
 }
 
+/** The most unified windows kept from one rate-limit event, and the most keys looked at to find them. */
+export const MAX_RATE_WINDOWS = 16;
+const MAX_RATE_WINDOWS_SEEN = 64;
+/** Status words from the CLI ("allowed", "allowed_warning", "rejected"...) are short tokens: anything else is dropped, not forwarded. */
+function statusWord(v: unknown): string | undefined {
+  return typeof v === "string" && /^[a-z0-9_-]{1,40}$/i.test(v) ? v : undefined;
+}
+/** Content blocks of one message looked at: the CLI sends a handful, a hostile one may send a quarter million in one line. */
+export const MAX_BLOCKS_NORMALIZED = 256;
+
 /** One stream-json event => zero or more normalized events. Unknown fields stay unknown (never 0). The final `result` event is handled by the caller. */
 export function normalizeClaudeEvent(raw: Record<string, unknown>): ProviderEvent[] {
   switch (raw.type) {
@@ -74,8 +84,8 @@ export function normalizeClaudeEvent(raw: Record<string, unknown>): ProviderEven
       const content = asRecord(raw.message)?.content;
       if (!Array.isArray(content)) return [];
       const out: ProviderEvent[] = [];
-      for (const block of content) {
-        const b = asRecord(block);
+      for (let k = 0; k < content.length && k < MAX_BLOCKS_NORMALIZED; k++) {
+        const b = asRecord(content[k]);
         if (!b) continue;
         if (b.type === "text" && typeof b.text === "string" && b.text.length > 0) out.push({ type: "text", delta: b.text });
         else if (b.type === "tool_use" && typeof b.id === "string" && typeof b.name === "string" && b.id.length <= MAX_FIELD_CHARS && b.name.length <= MAX_FIELD_CHARS) out.push({ type: "tool-use", operationId: b.id, name: b.name, input: boundedValue(b.input) }); // informational only: a hostile CLI's deep or huge input becomes a fixed marker before it is forwarded to the backend
@@ -86,8 +96,8 @@ export function normalizeClaudeEvent(raw: Record<string, unknown>): ProviderEven
       const content = asRecord(raw.message)?.content;
       if (!Array.isArray(content)) return [];
       const out: ProviderEvent[] = [];
-      for (const block of content) {
-        const b = asRecord(block);
+      for (let k = 0; k < content.length && k < MAX_BLOCKS_NORMALIZED; k++) {
+        const b = asRecord(content[k]);
         if (b?.type === "tool_result" && typeof b.tool_use_id === "string" && b.tool_use_id.length <= MAX_FIELD_CHARS) out.push({ type: "tool-result", operationId: b.tool_use_id, ok: b.is_error !== true });
       }
       return out;
@@ -98,21 +108,25 @@ export function normalizeClaudeEvent(raw: Record<string, unknown>): ProviderEven
       const windows: Array<{ name: string; utilization?: number; resetsAtMs?: number }> = [];
       const unified = asRecord(info.unifiedWindows);
       if (unified) {
-        for (const [name, w] of Object.entries(unified)) {
-          const rec = asRecord(w);
+        // The CLI reports a handful of windows; a hostile one may print millions. Look at a bounded number of keys (for-in, not Object.entries: that builds them all).
+        let seen = 0;
+        for (const name in unified) {
+          if (++seen > MAX_RATE_WINDOWS_SEEN || windows.length >= MAX_RATE_WINDOWS) break;
+          if (!Object.prototype.hasOwnProperty.call(unified, name)) continue;
+          const rec = asRecord(unified[name]);
           if (!rec || !/^[a-z0-9_]{1,40}$/i.test(name)) continue;
           windows.push({ name, ...(num(rec.utilization) !== undefined ? { utilization: num(rec.utilization) } : {}), ...(resetMs(rec.resetsAt) !== undefined ? { resetsAtMs: resetMs(rec.resetsAt) } : {}) });
         }
       } else if (typeof info.rateLimitType === "string" && /^[a-z0-9_]{1,40}$/i.test(info.rateLimitType)) {
         windows.push({ name: info.rateLimitType, ...(num(info.utilization) !== undefined ? { utilization: num(info.utilization) } : {}), ...(resetMs(info.resetsAt) !== undefined ? { resetsAtMs: resetMs(info.resetsAt) } : {}) });
       }
-      const overageStatus = typeof info.overageStatus === "string" ? info.overageStatus : undefined;
+      const overageStatus = statusWord(info.overageStatus);
       return [
         {
           type: "entitlement",
           observation: {
             windows,
-            ...(typeof info.status === "string" ? { status: info.status } : {}),
+            ...(statusWord(info.status) !== undefined ? { status: statusWord(info.status) } : {}),
             ...(typeof info.isUsingOverage === "boolean" ? { overage: { using: info.isUsingOverage, ...(overageStatus ? { status: overageStatus } : {}) } } : {}),
           },
         },

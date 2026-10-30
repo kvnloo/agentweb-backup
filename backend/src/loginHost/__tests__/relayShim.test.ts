@@ -2,7 +2,9 @@
  * ENG-2113: the stdio shim as a process, driven as the CLI would drive it (JSON-RPC lines on stdin/stdout) against a real RelayHost socket.
  */
 import { spawn, type ChildProcessWithoutNullStreams } from "child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import { EventEmitter } from "events";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { PassThrough } from "stream";
 import { tmpdir } from "os";
 import { join } from "path";
 import { Layout } from "../ports/layout";
@@ -24,7 +26,8 @@ async function rig(env: Record<string, string> = {}, limits: { idleMs?: number }
   const root = mkdtempSync(join(tmpdir(), "relay-shim-"));
   roots.push(root);
   const layout = new Layout({ env: "t1", stateRoot: "/var/lib/aw-login-host/t1", sharedParent: "/var/lib/aw-login-host", uidMin: 400_000, uidMax: 400_100, relayRoot: join(root, "relay") });
-  const host = new RelayHost({ layout, ownByUid: false, limits });
+  const logs: Array<Record<string, unknown> | undefined> = [];
+  const host = new RelayHost({ layout, ownByUid: false, limits, log: { warn: (_e, f) => void logs.push(f) } });
   host.init();
   const calls: RelayCall[] = [];
   const visible = new Set(TOOLS.map((t) => t.name));
@@ -53,7 +56,7 @@ async function rig(env: Record<string, string> = {}, limits: { idleMs?: number }
     await until(() => out.some((o) => o.id === mine));
     return out.find((o) => o.id === mine)!;
   };
-  return { ep, calls, visible, child, out, rpc, stderr: () => err, host, layout, root };
+  return { logs, ep, calls, visible, child, out, rpc, stderr: () => err, host, layout, root };
 }
 async function until(cond: () => boolean, ms = 4000): Promise<void> {
   const t0 = Date.now();
@@ -157,6 +160,127 @@ describe("relay shim: MCP surface", () => {
     expect(r.child.exitCode).toBe(1);
     expect(r.stderr().trim()).toBe("aw-relay: E_TOOLS");
     await r.ep.close();
+  });
+});
+
+describe("relay shim: ONE connection, however calls race the connect", () => {
+  const accepted = (r: { ep: unknown }) => (r.ep as unknown as { accepted: number }).accepted;
+  const codes = (r: { logs: Array<Record<string, unknown> | undefined> }) => r.logs.map((l) => l?.code);
+  const drop = (r: { ep: unknown }) => (r.ep as unknown as { conn: { destroy(): void } }).conn.destroy();
+
+  it("MUTATION TARGET: a tool call racing the shim own initial connect uses a SINGLE connection (no second_connection, the call is served)", async () => {
+    const r = await rig();
+    const p = r.rpc("tools/call", { name: "echo", arguments: { q: "race" } });
+    await until(() => r.calls.length === 1);
+    r.ep.answer(r.calls[0].operationId, { content: "ok" });
+    expect((await p).result.content[0].text).toBe("ok");
+    expect(accepted(r)).toBe(1);
+    expect(codes(r)).not.toContain("second_connection");
+    await r.ep.close();
+  });
+
+  it("MUTATION TARGET: after the host drops the connection the next call reconnects, once, and works", async () => {
+    const r = await rig();
+    const first = r.rpc("tools/call", { name: "echo", arguments: { n: 1 } });
+    await until(() => r.calls.length === 1);
+    r.ep.answer(r.calls[0].operationId, { content: "one" });
+    await first;
+    drop(r);
+    await new Promise((res) => setTimeout(res, 100));
+    const again = r.rpc("tools/call", { name: "echo", arguments: { n: 2 } });
+    await until(() => r.calls.length === 2);
+    r.ep.answer(r.calls[1].operationId, { content: "two" });
+    expect((await again).result.content[0].text).toBe("two");
+    expect(accepted(r)).toBe(2);
+    expect(codes(r)).not.toContain("second_connection");
+    await r.ep.close();
+  });
+
+  it("MUTATION TARGET: two simultaneous calls while the shim is reconnecting open ONE new connection", async () => {
+    const r = await rig();
+    const first = r.rpc("tools/call", { name: "echo", arguments: { n: 1 } });
+    await until(() => r.calls.length === 1);
+    r.ep.answer(r.calls[0].operationId, { content: "one" });
+    await first;
+    drop(r);
+    await new Promise((res) => setTimeout(res, 100));
+    const a = r.rpc("tools/call", { name: "echo", arguments: { n: 2 } });
+    const b = r.rpc("tools/call", { name: "echo", arguments: { n: 3 } });
+    await until(() => r.calls.length === 2);
+    r.ep.answer(r.calls[1].operationId, { content: "two" });
+    await until(() => r.calls.length === 3);
+    r.ep.answer(r.calls[2].operationId, { content: "three" });
+    expect((await a).result.content[0].text).toBe("two");
+    expect((await b).result.content[0].text).toBe("three");
+    expect(accepted(r)).toBe(2);
+    expect(codes(r)).not.toContain("second_connection");
+    await r.ep.close();
+  });
+});
+
+describe("relay shim: connection bookkeeping (the shim source driven with a fake net, so the timing is exact)", () => {
+  class FakeSock extends EventEmitter {
+    writes: string[] = [];
+    write(d: string) {
+      this.writes.push(String(d));
+      return true;
+    }
+    destroy() {
+      this.emit("close");
+    }
+  }
+  function load() {
+    const root = mkdtempSync(join(tmpdir(), "relay-shim-fake-"));
+    roots.push(root);
+    const toolsFile = join(root, "tools.json");
+    writeFileSync(toolsFile, JSON.stringify(TOOLS));
+    const socks: FakeSock[] = [];
+    const fakeNet = { createConnection: () => (socks.push(new FakeSock()), socks[socks.length - 1]) };
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const proc = Object.assign(new EventEmitter(), { env: { AW_RELAY_SOCKET: "/nowhere/relay.sock", AW_RELAY_TOOLS: toolsFile }, stdin, stdout, stderr: new PassThrough(), exit: () => undefined });
+    const src = readFileSync(SHIM, "utf8").replace(/^#!.*\n/, "");
+    const req = (m: string) => (m === "net" ? fakeNet : require(m));
+    new Function("require", "process", "module", "exports", src)(req, proc, { exports: {} }, {});
+    let id = 0;
+    const call = () => stdin.write(JSON.stringify({ jsonrpc: "2.0", id: ++id, method: "tools/call", params: { name: "echo", arguments: {} } }) + "\n");
+    const tick = (ms = 30) => new Promise((r) => setTimeout(r, ms));
+    return { socks, call, tick, closeAll: () => socks.forEach((x) => x.emit("close")) };
+  }
+
+  it("MUTATION TARGET: a call arriving while the start-up connect is still IN FLIGHT does not open a second connection", async () => {
+    const t = load();
+    await t.tick();
+    expect(t.socks).toHaveLength(1); // the start-up connect, not yet completed
+    t.call();
+    t.call();
+    await t.tick();
+    expect(t.socks).toHaveLength(1); // both calls wait for it
+    t.socks[0].emit("connect");
+    await t.tick();
+    expect(t.socks[0].writes.filter((w) => w.includes("\"type\":\"call\""))).toHaveLength(1); // the first call; the second waits its turn
+    expect(t.socks).toHaveLength(1);
+    t.closeAll();
+  });
+
+  it("MUTATION TARGET: a LATE close event of an older socket does not clear the newer connection (or its waiter)", async () => {
+    const t = load();
+    await t.tick();
+    t.socks[0].emit("connect");
+    await t.tick();
+    t.socks[0].emit("close"); // a drop
+    await t.tick();
+    t.call(); // reconnects
+    await t.tick();
+    expect(t.socks).toHaveLength(2);
+    t.socks[1].emit("connect");
+    await t.tick();
+    t.socks[0].emit("close"); // the old socket reports closing AGAIN, late
+    await t.tick();
+    t.call();
+    await t.tick();
+    expect(t.socks).toHaveLength(2); // the live connection was not forgotten
+    t.closeAll();
   });
 });
 

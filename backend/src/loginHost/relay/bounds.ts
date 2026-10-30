@@ -9,6 +9,7 @@
 
 /** The deepest JSON nesting accepted in a shim frame: the frame is depth 1, its `args` object depth 2, so `args` nests at most MAX_FORWARDED_DEPTH (32) levels. Tool inputs are a few levels deep. */
 export const MAX_FRAME_DEPTH = 33;
+// A new AgentWeb tool must fit these; see docs/plan-route-tool-limits.md (added by the backend PR). Changing a value: update that doc.
 /** Nesting accepted in anything forwarded to the backend or stored: tool inputs from the shim and the CLI's stream. */
 export const MAX_FORWARDED_DEPTH = 32;
 export const MAX_FORWARDED_BYTES = 1024 * 1024;

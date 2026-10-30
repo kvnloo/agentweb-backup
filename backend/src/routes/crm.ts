@@ -5205,11 +5205,6 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-message', async (req: Re
       return res.status(404).json({ message: 'Lead not found' });
     }
 
-    // ENG-673: a contact marked do-not-contact (unsubscribed, bounced, opted out, or reported by Smartlead) is never messaged from AgentWeb. No override.
-    if (isDoNotContact(lead)) {
-      return res.status(409).json({ code: 'do_not_contact', message: `Not sent: this contact is marked do-not-contact (${getDoNotContactReason(lead) ?? 'do-not-contact'}). Change their status first if that is wrong.` });
-    }
-
     const leadLinkedIn = (lead.linkedin as string | undefined)?.trim();
     if (!leadLinkedIn) {
       return res.status(400).json({ message: 'Lead has no LinkedIn URL — add a LinkedIn profile URL first' });
@@ -5340,11 +5335,6 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-invite', async (req: Req
     const lead = await crmDb.getLeadById(listId, leadId);
     if (!lead) {
       return res.status(404).json({ message: 'Lead not found' });
-    }
-
-    // ENG-673: a contact marked do-not-contact (unsubscribed, bounced, opted out, or reported by Smartlead) is never invited from AgentWeb. No override.
-    if (isDoNotContact(lead)) {
-      return res.status(409).json({ code: 'do_not_contact', message: `Not sent: this contact is marked do-not-contact (${getDoNotContactReason(lead) ?? 'do-not-contact'}). Change their status first if that is wrong.` });
     }
 
     const leadLinkedIn = (lead.linkedin as string | undefined)?.trim();

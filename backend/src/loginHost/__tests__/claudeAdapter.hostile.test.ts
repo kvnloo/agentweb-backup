@@ -242,6 +242,20 @@ describe("a hostile unit and a hostile CLI together cannot stall the loop by mak
     await w.stop();
   });
 
+  it("MUTATION TARGET: MAX_BLOCKS_PER_EVENT: of a 300-block event only the first 256 blocks are considered (a tool_use in block 255 is recorded, one in block 256+ is not)", async () => {
+    const w = await withWaitingCall({ q: "x" }, 20);
+    (w.session as unknown as { visibleTools: Set<string> }).visibleTools.add("other"); // (not the waiting call's tool, so an announcement is kept rather than claimed by it)
+    const uses = () => (w.session as unknown as { streamUses: Array<{ messageId: string }> }).streamUses;
+    const filler = (n: number) => Array.from({ length: n }, () => ({ type: "text", text: "t" }));
+    const use = (id: string) => ({ type: "tool_use", id, name: "mcp__emma__other", input: { id } });
+    w.session.noteStreamUse({ type: "assistant", message: { id: "mIn", content: [...filler(255), use("in")] } }); // index 255: the 256th block
+    w.session.noteStreamUse({ type: "assistant", message: { id: "mOut", content: [...filler(256), use("out")] } }); // index 256: the 257th
+    const ids = uses().map((u) => u.messageId);
+    expect(ids).toContain("mIn");
+    expect(ids).not.toContain("mOut");
+    await w.stop();
+  });
+
   it("MUTATION TARGET: one 16 MB-style event of a quarter million tiny tool_use blocks examines a bounded number of them", async () => {
     const w = await withWaitingCall({ q: "x" }, 20);
     w.canonical.mockClear();

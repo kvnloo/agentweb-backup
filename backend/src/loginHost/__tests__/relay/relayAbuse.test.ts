@@ -85,7 +85,7 @@ describe("a peer that never reads cannot grow the host's memory", () => {
 
 describe("violation logs from a hostile unit are throttled", () => {
   it("MUTATION TARGET: a connect/destroy loop logs at most a handful of lines per window, every connection is still refused, and a summary follows in the next window", async () => {
-    const s = setup();
+    const s = setup({}, { maxRefusals: 100_000 }); // (the listener-closing rule has its own test)
     const { ep } = await s.open();
     const first = await client(sockOf(ep.dir)); // holds the one allowed connection
     let refused = 0;
@@ -191,6 +191,29 @@ describe("the relay's byte budget", () => {
     await ep.close();
   });
 
+  it("MUTATION TARGET: the byte budget REFILLS at bytesPerSec (a third ~120 KB frame passes after 2 s of refill, and is cut without it)", async () => {
+    const now = jest.spyOn(performance, "now");
+    let t = 5000;
+    now.mockImplementation(() => t);
+    try {
+      const s = setup({}, { byteBurst: 300_000, bytesPerSec: 100_000 });
+      const { ep, calls } = await s.open();
+      const c = await client(sockOf(ep.dir));
+      const frame = (i: number) => JSON.stringify({ type: "call", callId: `c${i}`, name: "t", args: { pad: "x".repeat(120_000) } }) + "\n";
+      c.s.write(frame(1));
+      c.s.write(frame(2));
+      await until(() => calls.length === 1);
+      t += 2000; // +200,000 bytes of budget
+      c.s.write(frame(3));
+      await new Promise((r) => setTimeout(r, 150));
+      expect(c.isClosed()).toBe(false);
+      expect(s.logs.map((l) => l.fields?.code)).not.toContain("rate_limited");
+      await ep.close();
+    } finally {
+      now.mockRestore();
+    }
+  });
+
   it("small frames are not slowed by the byte budget", async () => {
     const s = setup({}, { byteBurst: 300_000, bytesPerSec: 1 });
     const { ep, calls } = await s.open();
@@ -202,6 +225,36 @@ describe("the relay's byte budget", () => {
     expect(c.isClosed()).toBe(false);
     await ep.close();
   });
+});
+
+describe("a connect flood is ended at the kernel", () => {
+  it("MEASUREMENT: 3,000 connect attempts at a turn that already has its connection: how many the host accepts-then-destroys, and what it costs", async () => {
+    for (const [label, limits] of [["listener closes after 32 refusals (now)", {}], ["listener never closes (before)", { maxRefusals: 1e9 }]] as const) {
+      const s = setup({}, limits);
+      const { ep } = await s.open();
+      const holder = await client(sockOf(ep.dir));
+      let connected = 0;
+      let failed = 0;
+      const cpu0 = process.cpuUsage();
+      const t0 = process.hrtime.bigint();
+      const attempt = () =>
+        new Promise<void>((res) => {
+          const x = connect(sockOf(ep.dir));
+          x.on("error", () => (failed++, res()));
+          x.on("connect", () => (connected++, x.destroy(), res()));
+        });
+      for (let batch = 0; batch < 750; batch++) await Promise.all(Array.from({ length: 4 }, attempt));
+      const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+      const cpu = process.cpuUsage(cpu0);
+      console.log("CONNECT FLOOD", label, JSON.stringify({ connected, failed, wallMs: Math.round(ms), cpuMs: Math.round((cpu.user + cpu.system) / 1000) }));
+      if (label.includes("now")) {
+        expect(connected).toBeLessThan(200);
+        expect(failed).toBeGreaterThan(2800);
+      } else expect(connected).toBeGreaterThan(500);
+      holder.s.destroy();
+      await ep.close();
+    }
+  }, 60_000);
 });
 
 describe("LogThrottle", () => {

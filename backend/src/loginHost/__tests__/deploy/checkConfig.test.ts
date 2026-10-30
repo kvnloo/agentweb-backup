@@ -66,6 +66,12 @@ describe("check-config: schema only (no --owner)", () => {
     rmSync(t.nodeFile);
     expect(checkConfig(t.cfg, [])).toBeUndefined(); // a missing node is not a schema problem
   });
+  it("MUTATION TARGET: a config without claude.nodePath is a schema problem (no default: /usr/bin/node is a symlink and would crash-loop the worker)", () => {
+    const cfg = JSON.parse(readFileSync(tree().cfg, "utf8"));
+    delete cfg.claude.nodePath;
+    const t = tree({ cfgText: JSON.stringify(cfg) });
+    expect(checkConfig(t.cfg, [])).toMatch(/claude\.nodePath/);
+  });
   it("still reports a schema problem", () => {
     const t = tree({ cfgText: JSON.stringify({ env: "prod" }) });
     expect(checkConfig(t.cfg, [])).toMatch(/host config/);

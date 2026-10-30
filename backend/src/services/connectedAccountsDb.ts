@@ -1044,12 +1044,21 @@ export const getAccountByIdConsistent = async (
   platform?: PlatformType | PlatformType[]
 ): Promise<ConnectedAccountWithUser | null> => {
   try {
-    const user = await userDb.getUserByIdConsistent(userId);
-    return findAccountForUser(user as User | undefined, accountId, userId, platform);
+    return await getAccountByIdConsistentOrThrow(accountId, userId, platform);
   } catch (error) {
     console.error('Error in getAccountByIdConsistent:', error);
     return null;
   }
+};
+
+/** The same read for a caller that must tell "no such account" from "could not read": a failed read throws instead of returning null. */
+export const getAccountByIdConsistentOrThrow = async (
+  accountId: string,
+  userId: string,
+  platform?: PlatformType | PlatformType[]
+): Promise<ConnectedAccountWithUser | null> => {
+  const user = await userDb.getUserByIdConsistent(userId);
+  return findAccountForUser(user as User | undefined, accountId, userId, platform);
 };
 
 /**

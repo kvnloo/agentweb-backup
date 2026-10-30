@@ -78,14 +78,19 @@ describe("LineAssembler: memory", () => {
     const chunk = Buffer.alloc(size, 0x61);
     let fed = 0;
     let worst = 0;
+    // ~1M iterations: the checks inside the loop only RECORD (an expect() per push cost minutes); the assertions run once after it, with the same strength
+    let pendingWrongAt = -1;
+    let capacityOverAt = -1;
     while (fed + size <= max) {
       a.push(chunk);
       fed += size;
       const r = a.retained;
-      expect(r.pending).toBe(fed);
+      if (r.pending !== fed && pendingWrongAt < 0) pendingWrongAt = fed;
       if (r.capacity > worst) worst = r.capacity;
-      expect(r.capacity).toBeLessThanOrEqual(Math.max(1024, 2 * r.pending));
+      if (r.capacity > Math.max(1024, 2 * r.pending) && capacityOverAt < 0) capacityOverAt = fed;
     }
+    expect(pendingWrongAt).toBe(-1); // pending bytes were exact after every push
+    expect(capacityOverAt).toBe(-1); // the one buffer never exceeded twice the pending bytes (min 1 KiB): never one object per chunk
     expect(worst).toBeLessThanOrEqual(max);
     // the line completes: one copy out, and a big buffer is not kept for the next line
     const done = a.push(Buffer.from("\n"));

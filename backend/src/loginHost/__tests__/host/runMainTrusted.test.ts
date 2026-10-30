@@ -36,6 +36,27 @@ const config = {
   claude: { binaryPath: "/opt/aw-claude/2.1.294/claude", expectedSha256: "a".repeat(64), version: "2.1.294", systemPromptFile: "/opt/aw-login-host/system-prompt.txt", bridgeUrl: "http://127.0.0.1:3991/mcp", nodePath: NODE },
 };
 
+it("MUTATION TARGET: runMain refuses a config without claude.nodePath (required: no default) with a fixed start failure, before any path check", async () => {
+  const noNode = JSON.parse(JSON.stringify(config));
+  delete noNode.claude.nodePath;
+  const cfgPath = join(dir, "nonode.json");
+  writeFileSync(cfgPath, JSON.stringify(noNode));
+  const lines: string[] = [];
+  const write = jest.spyOn(process.stdout, "write").mockImplementation(((s: string) => (lines.push(String(s)), true)) as never);
+  const exit = jest.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+  const on = jest.spyOn(process, "on").mockImplementation((() => process) as never);
+  try {
+    await runMain(["node", "main.js", cfgPath]);
+  } finally {
+    write.mockRestore();
+    exit.mockRestore();
+    on.mockRestore();
+  }
+  expect(lines.map((l) => JSON.parse(l)).some((l) => l.event === "host_start_failed")).toBe(true);
+  expect(lines.join("")).toMatch(/nodePath/);
+  trusted.length = 0; // (the other test reads what was checked)
+});
+
 it("MUTATION TARGET: runMain checks every configured path (node included) and refuses to start on a failing one, before verifying the binary", async () => {
   const cfgPath = join(dir, "test1.json");
   writeFileSync(cfgPath, JSON.stringify(config));

@@ -26,13 +26,34 @@ function rig(maxLine = 16 * 1024 * 1024) {
   };
   return { feed, out: () => out, deep, errors };
 }
-const nested = (k: number) => "[".repeat(k) + "]".repeat(k);
+// an EVENT-shaped deep line: real stream-json lines start with `{` (anything else is dropped as junk before the depth scan matters); depth k
+const nested = (k: number) => "{" + "[".repeat(k - 1) + "]".repeat(k - 1) + "}";
+const NEST64 = "{" + "[".repeat(63); // what is kept of a line cut at the depth cap
 const PLACEHOLDER = '{"type":"aw_line_dropped"}';
+
+// reference implementation, written independently of LineLimit: one complete JSON object per line (first non-space `{`, last `}`, balanced outside strings)
+function eventShaped(seg: string): boolean {
+  const t = seg.replace(/^[ \t]+|[ \t]+$/g, ""); // only the JSON whitespace the scanner knows (not U+2028 etc.)
+  if (!t.startsWith("{") || !t.endsWith("}")) return false;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (const ch of t) {
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
+    } else if (ch === '"') inStr = true;
+    else if (ch === "{" || ch === "[") depth++;
+    else if ((ch === "}" || ch === "]") && depth > 0) depth--;
+  }
+  return depth === 0 && !inStr;
+}
 
 describe("CLI stdout: lines nested deeper than the cap are dropped before anything parses them", () => {
   it("ordinary lines pass through byte for byte, whatever the chunk boundaries (strings, escapes, brackets inside strings)", async () => {
     const r = rig();
-    const lines = ['{"type":"assistant","message":{"content":[{"type":"text","text":"a [[[[ \\" {{{{ \\\\"}]}}', '{"a":{"b":{"c":[1,2,{"d":null}]}}}', "plain noise", ""];
+    const lines = ['{"type":"assistant","message":{"content":[{"type":"text","text":"a [[[[ \\" {{{{ \\\\"}]}}', '{"a":{"b":{"c":[1,2,{"d":null}]}}}', '{"plain":"noise"}', ""];
     const text = lines.join("\n") + "\n";
     for (let size = 1; size <= 9; size += 4) {
       const r2 = rig();
@@ -52,10 +73,10 @@ describe("CLI stdout: lines nested deeper than the cap are dropped before anythi
     expect(ok.out()).toBe(nested(64) + "\n");
     expect(ok.deep).toHaveLength(0);
     const bad = rig();
-    await bad.feed(nested(65) + "\nnext line\n");
+    await bad.feed(nested(65) + "\n{\"next\":1}\n");
     expect(bad.deep).toHaveLength(1);
     expect(bad.out()).not.toContain("]]]]");
-    expect(bad.out()).toBe("[".repeat(64) + `\n${PLACEHOLDER}\nnext line\n`);
+    expect(bad.out()).toBe(NEST64 + `\n${PLACEHOLDER}\n{"next":1}\n`);
   });
 
   it.each([5_000, 100_000, 1_000_000])("MUTATION TARGET: a line nested %i deep is cut in well under a second (a few ms when idle; seconds if it were parsed); what is forwarded is tiny; the lines around it are intact", async (k) => {
@@ -79,26 +100,40 @@ describe("CLI stdout: lines nested deeper than the cap are dropped before anythi
     await r.feed('{"s":"x\\', '"y"}\n', ...chunks, "\n", '{"ok":1}\n');
     expect(Date.now() - t0).toBeLessThan(300);
     expect(r.deep).toHaveLength(1);
-    expect(r.out()).toBe(`{"s":"x\\"y"}\n${"[".repeat(64)}\n${PLACEHOLDER}\n{"ok":1}\n`);
+    expect(r.out()).toBe(`{"s":"x\\"y"}\n${NEST64}\n${PLACEHOLDER}\n{"ok":1}\n`);
   });
 
   describe("the runner's readline splits lines at a LONE \\r too (Node 22: \\n, \\r\\n and \\r; U+2028/2029 do NOT split): the scanner must end its lines at exactly the same places", () => {
     it("MUTATION TARGET: the bypass: a string-opening quote, a lone \\r, then a deep nesting is still cut", async () => {
       const r = rig();
-      await r.feed('"\r' + nested(100) + "\nafter\n");
+      await r.feed('{"x":"\r' + nested(100) + '\n{"after":1}\n');
       expect(r.deep).toHaveLength(1);
-      expect(r.out()).toBe('"\n' + "[".repeat(64) + `\n${PLACEHOLDER}\nafter\n`);
+      expect(r.out()).toBe(NEST64 + `\n${PLACEHOLDER}\n{"after":1}\n`); // the unterminated first line is not an event: dropped
     });
 
     it("MUTATION TARGET: the OUTPUT has only \\n as a separator: a lone \\r and \\r\\n become one \\n each (also across a chunk edge); lines are untouched", async () => {
-      const text = "one\rtwo\r\nthree\n\nfour\r\rfive\n";
-      const want = "one\ntwo\nthree\n\nfour\n\nfive\n";
+      const text = '{"o":1}\r{"t":2}\r\n{"h":3}\n\n{"f":4}\r\r{"v":5}\n';
+      const want = '{"o":1}\n{"t":2}\n{"h":3}\n\n{"f":4}\n\n{"v":5}\n';
       for (let size = 1; size <= 9; size += 4) {
         const r = rig();
         const bytes = Buffer.from(text);
         await r.feed(...Array.from({ length: Math.ceil(bytes.length / size) }, (_, i) => bytes.subarray(i * size, (i + 1) * size)));
         expect({ size, out: r.out() }).toEqual({ size, out: want });
         expect(r.out()).not.toContain("\r");
+      }
+    });
+
+    it("MUTATION TARGET: a deep line that ends in a lone \\r (while being discarded) does not swallow the event after it, in one chunk or many", async () => {
+      const text = nested(100) + "\r" + '{"ev":1}' + "\n" + nested(100) + "\r\n" + '{"ev":2}' + "\n";
+      const want = NEST64 + `\n${PLACEHOLDER}\n{"ev":1}\n` + NEST64 + `\n${PLACEHOLDER}\n{"ev":2}\n`;
+      const whole = rig();
+      await whole.feed(text);
+      expect(whole.out()).toBe(want);
+      const bytes = Buffer.from(text);
+      for (const size of [1, 7]) {
+        const r = rig();
+        await r.feed(...Array.from({ length: Math.ceil(bytes.length / size) }, (_, i) => bytes.subarray(i * size, (i + 1) * size)));
+        expect({ size, out: r.out() }).toEqual({ size, out: want });
       }
     });
 
@@ -111,8 +146,8 @@ describe("CLI stdout: lines nested deeper than the cap are dropped before anythi
 
     it("MUTATION TARGET: a \\r\\n split between two chunks is ONE line end, and a deep line after a \\r is still dropped", async () => {
       const r = rig();
-      await r.feed("a\r", "\nb\r", nested(100), "\n", "c\n");
-      expect(r.out()).toBe(`a\nb\n${"[".repeat(64)}\n${PLACEHOLDER}\nc\n`);
+      await r.feed('{"a":1}\r', '\n{"b":1}\r', nested(100), "\n", '{"c":1}\n');
+      expect(r.out()).toBe(`{"a":1}\n{"b":1}\n${NEST64}\n${PLACEHOLDER}\n{"c":1}\n`);
     });
 
     it("DIFFERENTIAL: random and adversarial byte streams through LineLimit into the REAL readline: no delivered line is deeper than the cap, and no ordinary line is changed or lost", async () => {
@@ -142,8 +177,8 @@ describe("CLI stdout: lines nested deeper than the cap are dropped before anythi
         for (const l of got) expect({ round, deep: rawJsonDepthExceeds(Buffer.from(l), MAX_CLI_LINE_DEPTH) }).toEqual({ round, deep: false });
         // every ordinary (shallow) line of the input, split the way readline splits it, is delivered unchanged and in order
         const expected: string[] = [];
-        for (const seg of text.split(/\r?\n|\r/)) if (!rawJsonDepthExceeds(Buffer.from(seg), MAX_CLI_LINE_DEPTH) && seg.length > 0) expected.push(seg);
-        const delivered = got.filter((l) => l.length > 0 && l !== PLACEHOLDER);
+        for (const seg of text.split(/\r?\n|\r/)) if (!rawJsonDepthExceeds(Buffer.from(seg), MAX_CLI_LINE_DEPTH) && eventShaped(seg)) expected.push(seg.trimStart()); // junk lines are dropped; whitespace-only lines are not compared (the runner ignores them)
+        const delivered = got.filter((l) => l.trim().length > 0 && l !== PLACEHOLDER).map((l) => l.trimStart());
         // a segment cut mid-line keeps its shallow head, so compare only segments the scanner would never cut: whole-line membership, in order
         let at = 0;
         for (const e of expected) {
@@ -152,7 +187,7 @@ describe("CLI stdout: lines nested deeper than the cap are dropped before anythi
         }
         // every segment shallow (what readline hands JSON.parse): nothing may be cut, altered or lost
         const segs = text.split(/\r?\n|\r/);
-        if (segs.every((g) => !rawJsonDepthExceeds(Buffer.from(g), MAX_CLI_LINE_DEPTH))) expect({ round, got: got.filter((l) => l.length > 0) }).toEqual({ round, got: expected });
+        if (segs.every((g) => !rawJsonDepthExceeds(Buffer.from(g), MAX_CLI_LINE_DEPTH))) expect({ round, got: got.filter((l) => l.trim().length > 0).map((l) => l.trimStart()) }).toEqual({ round, got: expected });
       }
     });
 
@@ -184,10 +219,10 @@ describe("CLI stdout: lines nested deeper than the cap are dropped before anythi
 
   it("two deep lines in a row are each dropped (the state resets at the newline)", async () => {
     const r = rig();
-    await r.feed(nested(100) + "\n" + nested(100) + "\nfine\n");
+    await r.feed(nested(100) + "\n" + nested(100) + "\n{\"fine\":1}\n");
     expect(r.deep).toHaveLength(2);
     expect(r.out().split("\n").filter((l) => l === PLACEHOLDER)).toHaveLength(2);
-    expect(r.out().endsWith("fine\n")).toBe(true);
+    expect(r.out().endsWith("{\"fine\":1}\n")).toBe(true);
   });
 
   it("brackets inside a string never count as nesting, however many", async () => {
@@ -198,12 +233,147 @@ describe("CLI stdout: lines nested deeper than the cap are dropped before anythi
     expect(r.deep).toHaveLength(0);
   });
 
+  describe("junk lines (not events) never reach the runner, and a flood of them ends the stream", () => {
+    // what the runner does with every non-empty line it is given: JSON.parse, and throw on junk
+    async function viaRunner(chunks: Array<string | Buffer>, maxLine = 16 * 1024 * 1024) {
+      const stdout = new PassThrough();
+      const child: ChildLike = { stdin: new PassThrough(), stdout, stderr: new PassThrough(), kill: () => undefined, onExit: () => undefined };
+      const adapter = new RunnerChildAdapter(child, maxLine, () => undefined);
+      const errors: string[] = [];
+      adapter.on("error", (e: Error) => errors.push(e.message));
+      let parsed = 0;
+      let threw = 0;
+      const rl = createInterface({ input: adapter.stdout });
+      rl.on("line", (l) => {
+        if (!l.trim()) return;
+        try {
+          JSON.parse(l);
+          parsed++;
+        } catch {
+          threw++;
+        }
+      });
+      const t0 = process.hrtime.bigint();
+      for (const c of chunks) stdout.write(c);
+      stdout.end();
+      await new Promise((r) => rl.on("close", r));
+      return { parsed, threw, errors, ms: Number(process.hrtime.bigint() - t0) / 1e6 };
+    }
+
+    it("MUTATION TARGET: a non-event line (first non-space byte is not {) is dropped before the runner sees it; events around it are untouched; the counter counts", async () => {
+      const r = rig();
+      await r.feed('{"a":1}\nx\n  [1,2]\n\tnull\n{"b":2}\nwarning: not json\n   {"c":3}\n');
+      expect(r.out()).toBe('{"a":1}\n{"b":2}\n   {"c":3}\n');
+    });
+
+    it("MUTATION TARGET: the same across chunk edges and \\r endings", async () => {
+      const text = '{"a":1}\rjunk\r\n  xx\r{"b":2}\n';
+      for (let size = 1; size <= 7; size += 3) {
+        const r = rig();
+        const bytes = Buffer.from(text);
+        await r.feed(...Array.from({ length: Math.ceil(bytes.length / size) }, (_, i) => bytes.subarray(i * size, (i + 1) * size)));
+        expect({ size, lines: r.out().split("\n").map((l) => l.trim()).filter(Boolean) }).toEqual({ size, lines: ['{"a":1}', '{"b":2}'] });
+      }
+    });
+
+    it("MUTATION TARGET: THE FLOOD: 64 KiB of \"x\\n\" (32k junk lines) never reaches JSON.parse, ends the stream with stdout_flood, and costs a few ms instead of ~0.8 s", async () => {
+      const r = await viaRunner([Buffer.from("x\n".repeat(32 * 1024))]);
+      console.log("FLOOD x\\n ms", r.ms.toFixed(1), JSON.stringify({ parsed: r.parsed, threw: r.threw }));
+      expect(r.threw).toBe(0);
+      expect(r.errors).toEqual(["stdout_flood"]);
+      expect(r.ms).toBeLessThan(500);
+    });
+
+    it("MUTATION TARGET: the same flood with '{\\n' lines (starts like an event, is not one) is parsed at most for the lines that fit the budget", async () => {
+      const r = await viaRunner([Buffer.from("{\n".repeat(32 * 1024))]);
+      console.log("FLOOD {\\n ms", r.ms.toFixed(1), JSON.stringify({ parsed: r.parsed, threw: r.threw }));
+      expect(r.ms).toBeLessThan(2000);
+    });
+
+    it("MUTATION TARGET: a flood of tiny VALID events ({} 21,000 times in one 64 KiB chunk) ends the stream too: each is cheap, but not 21,000 of them", async () => {
+      const r = await viaRunner([Buffer.from("{}\n".repeat(21 * 1024))]);
+      console.log("FLOOD {} ms", r.ms.toFixed(1), JSON.stringify({ parsed: r.parsed, threw: r.threw }));
+      expect(r.errors).toEqual(["stdout_flood"]);
+      expect(r.parsed).toBe(0); // nothing of the chunk is released once the budget is passed
+    });
+
+    it("MUTATION TARGET: a flood of BLANK lines ends the stream too", async () => {
+      const r = await viaRunner([Buffer.alloc(64 * 1024, 10)]);
+      expect(r.errors).toEqual(["stdout_flood"]);
+    });
+
+    it("MUTATION TARGET: the byte budget: a few huge junk lines end the stream even though the line count is tiny", async () => {
+      const r = await viaRunner(["x".repeat(600 * 1024) + "\n", "y".repeat(600 * 1024) + "\n"]);
+      expect(r.errors).toEqual(["stdout_flood"]);
+    });
+
+    it("an honest stream is untouched: 2,000 events with an occasional junk line (well inside the budget)", async () => {
+      const chunks: string[] = [];
+      for (let i = 0; i < 2000; i++) chunks.push(`{"type":"assistant","n":${i}}\n${i % 100 === 0 ? "note\n" : ""}`);
+      const r = await viaRunner(chunks);
+      expect(r.parsed).toBe(2000);
+      expect(r.threw).toBe(0);
+      expect(r.errors).toEqual([]);
+    });
+
+    it("MUTATION TARGET: the budget REFILLS with time (a slow trickle of junk never ends the stream)", async () => {
+      const stdout = new PassThrough();
+      const child: ChildLike = { stdin: new PassThrough(), stdout, stderr: new PassThrough(), kill: () => undefined, onExit: () => undefined };
+      const errors: string[] = [];
+      const adapter = new RunnerChildAdapter(child, 1 << 20, () => undefined);
+      adapter.on("error", (e: Error) => errors.push(e.message));
+      adapter.stdout.resume();
+      const now = jest.spyOn(performance, "now");
+      let t = 1000;
+      now.mockImplementation(() => t);
+      try {
+        for (let round = 0; round < 10; round++) {
+          stdout.write("j\n".repeat(150)); // 150 junk lines: fits the burst of 200 only when it has refilled
+          await new Promise((r) => setImmediate(r));
+          t += 4000; // 4 s at 50/s refills 200
+        }
+        expect(errors).toEqual([]);
+        stdout.write("j\n".repeat(150));
+        stdout.write("j\n".repeat(150)); // no time passes: 300 in a burst of 200
+        await new Promise((r) => setImmediate(r));
+        expect(errors).toEqual(["stdout_flood"]);
+      } finally {
+        now.mockRestore();
+      }
+    });
+
+    it("MUTATION TARGET: the bytes of a deep line that never ends are counted against the cap while they are being discarded (overflow, not a free ride)", async () => {
+      const r = rig(10_000);
+      await r.feed(nested(100));
+      await r.feed("[".repeat(4000), "[".repeat(4000), "[".repeat(4000));
+      expect(r.errors.map((e) => e.message)).toEqual(["stdout_line_too_long"]);
+    });
+
+    it("MUTATION TARGET: 64 KiB of lone \\r costs the same order as 64 KiB of \\n (no buffer per \\r), and scanning a dropped-line chunk is linear", async () => {
+      const cr = rig();
+      const lf = rig();
+      const t0 = process.hrtime.bigint();
+      await cr.feed(Buffer.from("{}\r".repeat(4000)));
+      const crMs = Number(process.hrtime.bigint() - t0) / 1e6;
+      const t1 = process.hrtime.bigint();
+      await lf.feed(Buffer.from("{}\n".repeat(4000)));
+      const lfMs = Number(process.hrtime.bigint() - t1) / 1e6;
+      console.log("CR vs LF ms", crMs.toFixed(1), lfMs.toFixed(1));
+      expect(cr.out()).toBe("{}\n".repeat(4000));
+      expect(crMs).toBeLessThan(500);
+      const jr = rig();
+      const t2 = process.hrtime.bigint();
+      await jr.feed(Buffer.from("junk\n".repeat(30)).toString().repeat(1)); // within the budget: many dropped lines in ONE chunk
+      expect(Number(process.hrtime.bigint() - t2) / 1e6).toBeLessThan(500);
+    });
+  });
+
   it("the byte cap on a line still applies (a line that never ends is cut off as before)", async () => {
     const r = rig(1000);
     // the adapter kills the child and emits an error; the stream stops forwarding
-    await r.feed("x".repeat(600), "y".repeat(600));
+    await r.feed("{" + "x".repeat(599), "y".repeat(600));
     expect(r.errors.map((e) => e.message)).toEqual(["stdout_line_too_long"]);
-    expect(r.out()).toBe("x".repeat(600));
+    expect(r.out()).toBe(""); // an unfinished event line is held until its end, and never released once the stream is cut
   });
 });
 
