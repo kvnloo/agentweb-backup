@@ -8820,7 +8820,8 @@ export async function runScheduledChat(
         // spend a zero-output retry on it.
         // Anchor the natural-next fallback to the scheduled slot (as the normal
         // dispatcher does) so the cadence's time-of-day is preserved.
-        const scheduledSlot = schedule.nextRunTime ? new Date(schedule.nextRunTime) : new Date();
+        const storedSlot = schedule.nextRunTime ? new Date(schedule.nextRunTime) : new Date(NaN);
+        const scheduledSlot = Number.isFinite(storedSlot.getTime()) ? storedSlot : new Date();
         const deferredTo = resolveQuotaDeferral(
           quotaExhaustion,
           new Date(),
@@ -16392,7 +16393,10 @@ export const agentModeController = {
             && (prefilledWithoutRequest || (valuesProvidedAfterLatestRequest && valuesProvidedAfterLastRun));
 
           // Calculate next run based on the current nextRunTime to preserve the scheduled time
-          const currentNextRun = new Date(schedule.nextRunTime);
+          // An unreadable stored nextRunTime (legacy/operator-edited row) would make
+          // calculateNextRunTime throw 'Invalid time value' on every poll; treat it as due now.
+          const storedNextRun = new Date(schedule.nextRunTime);
+          const currentNextRun = Number.isFinite(storedNextRun.getTime()) ? storedNextRun : new Date();
           const nextRunTime = calculateNextRunTime(schedule.frequency, currentNextRun, schedule.frequencyIntervalDays, schedule.scheduleId);
 
           if (scheduleVariables.length > 0 && !isVariableRequestSatisfied) {
