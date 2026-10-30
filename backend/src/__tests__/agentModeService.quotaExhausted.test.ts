@@ -45,4 +45,9 @@ describe('ENG-2763 Agent Mode quota-exhausted classification', () => {
     expect(contextIdx).toBeGreaterThan(0);
     expect(quotaIdx).toBeLessThan(contextIdx);
   });
+
+  it('forced-synthesis transient fallback excludes quota errors so they reach the classifier', () => {
+    const src = fs.readFileSync(path.join(__dirname, '../services/agentModeService.ts'), 'utf8');
+    expect(src).toContain('!classifyOpenRouterQuotaExhaustion(callError) && isTransientLLMError(callError)');
+  });
 });

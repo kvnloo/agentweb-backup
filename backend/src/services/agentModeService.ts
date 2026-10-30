@@ -4174,7 +4174,9 @@ export class AgentModeService {
           // OpenRouter performs provider/model failover inside the one request. A
           // transient failure here is therefore final for AgentWeb; do not issue a
           // second full completion with altered model semantics.
-          if (forceFinalSynthesis && turnHardCapMs !== undefined && isTransientLLMError(callError)) {
+          // ENG-2763: quota/credits exhaustion must reach the rethrow + quota classifier
+          // below; its 402 text can match the transient /5xx/ digit patterns.
+          if (forceFinalSynthesis && turnHardCapMs !== undefined && !classifyOpenRouterQuotaExhaustion(callError) && isTransientLLMError(callError)) {
             recordSpanError(chatSpan, callError);
             synthesisRetryUnaffordable = true;
           } else if (
