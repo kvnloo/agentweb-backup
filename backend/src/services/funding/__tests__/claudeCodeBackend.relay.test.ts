@@ -9,13 +9,13 @@ import { join } from 'path';
 import type { ProviderEvent } from '../../../loginHost/adapter';
 import { startHostServer, type HostServerHandle } from '../../../loginHost/server';
 import { makeRig, type Rig } from '../../../loginHost/__tests__/helpers';
-import { ClaudeCodeBackend, chooseToolTransport, legacyBridgeAllowed, refusedAsOldWorker, relayAvailable, type ClaudeBackendDeps, type ClaudeTurnParams } from '../claudeCodeBackend';
+import { ClaudeCodeBackend, MAX_TOKEN_COUNT, chooseToolTransport, clampCount, legacyBridgeAllowed, refusedAsOldWorker, relayAvailable, type ClaudeBackendDeps, type ClaudeTurnParams } from '../claudeCodeBackend';
 import { turnRanNoTools } from '../claudeRouteErrors';
 import * as relayManifestModule from '../relayManifest';
 import { ClaudeRunRegistry } from '../claudeRunRegistry';
 import { LoginHostClient, LoginHostError, UnixSocketTransport } from '../loginHostClient';
 import { runHostTurn } from '../loginHostTurn';
-import { RESULT_LOST_NOTE, SOFT_DEADLINE_MESSAGE, STOPPED_MESSAGE, UNLOADABLE_NOTE } from '../relayToolDispatcher';
+import { HALTED_MESSAGE, RESULT_LOST_NOTE, SOFT_DEADLINE_MESSAGE, STOPPED_MESSAGE, UNLOADABLE_NOTE } from '../relayToolDispatcher';
 import { ToolBridge, type BridgeExecuteOutcome, type BridgeTool, type ToolBridgeDeps } from '../toolBridge';
 import { ToolBridgeMcpAdapter } from '../toolBridgeMcp';
 
@@ -74,6 +74,8 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
       softLead?: number;
       confirm?: string[];
       allowLegacy?: boolean;
+      /** true (default in this rig) = batched confirmations on; 'default' = the production default (off). */
+      admitSiblings?: boolean | 'default';
     } = {},
   ) {
     const executions: Array<{ name: string; args: Record<string, unknown> }> = [];
@@ -120,6 +122,7 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
       newRunId: () => `claude-relay-${++n}`,
       drainTimeoutMs: 600,
       relayAnnounceWaitMs: 20,
+      ...(over.admitSiblings === 'default' ? {} : { relayAdmitPostHaltSiblings: over.admitSiblings ?? true }),
       lateWatchPollMs: 15,
       lateWatchMaxMs: 800,
       ...(over.softLead !== undefined ? { softDeadlineLeadMs: over.softLead } : {}),
@@ -493,6 +496,173 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
     await run;
     expect(t.executions).toHaveLength(1);
     expect(answers()[1].answer).toMatchObject({ ok: false, content: SOFT_DEADLINE_MESSAGE });
+  });
+
+  describe('a compromised worker: what it can make the API server log, mark, persist or stall on (security review)', () => {
+    const allLogs = () => (console.error as jest.Mock).mock.calls.map((c) => JSON.stringify(c)).join('\n');
+
+    it('S4: errorKind and aborted from a forged result are logged only from fixed sets, never raw (no newline, no forged line)', async () => {
+      const t = setup();
+      rig.script.turnEvents = [{ type: 'result', ok: false, text: '', errorKind: 'x\n[ALARM] forged log line', aborted: 'deadline\n[ALARM] forged' } as any];
+      await t.backend().run(t.params()).catch(() => undefined);
+      const line = (console.error as jest.Mock).mock.calls.find((c) => c[0] === '[claude-backend] turn ended not ok');
+      expect(line?.[1]).toMatchObject({ errorKind: 'other', aborted: 'other' });
+      expect(allLogs()).not.toContain('forged');
+    });
+
+    it('S4: known values are logged as themselves', async () => {
+      const t = setup();
+      rig.script.turnEvents = [{ type: 'result', ok: false, text: '', errorKind: 'usage_limit', aborted: 'deadline' }];
+      await t.backend().run(t.params()).catch(() => undefined);
+      const line = (console.error as jest.Mock).mock.calls.find((c) => c[0] === '[claude-backend] turn ended not ok');
+      expect(line?.[1]).toMatchObject({ errorKind: 'usage_limit', aborted: 'deadline' });
+    });
+
+    it('S4: an 8.5 MB errorKind line never reaches a log (the line cap ends the stream)', async () => {
+      const t = setup();
+      rig.script.turnEvents = [{ type: 'result', ok: false, text: '', errorKind: 'k'.repeat(8_500_000) } as any];
+      await t.backend().run(t.params()).catch(() => undefined);
+      expect(allLogs().length).toBeLessThan(20_000);
+    });
+
+    it('S4: an unexpected error message is logged without newlines or control characters, and cut', async () => {
+      const t = setup();
+      t.deps.runHostTurn = async () => {
+        throw new Error(`boom\n[ALARM] forged line\u0007${'z'.repeat(5_000)}`);
+      };
+      await t.backend().run(t.params()).catch(() => undefined);
+      const line = (console.error as jest.Mock).mock.calls.find((c) => c[0] === '[claude-backend] turn failed:');
+      expect(String(line?.[1])).not.toMatch(/[\u0000-\u001f]/);
+      expect(String(line?.[1]).length).toBeLessThan(260);
+      expect(String(line?.[1])).toContain('boom [ALARM] forged line');
+    });
+
+    it('S5: a forged auth_dead result shows the stop but does not mark the connection (the worker does not agree, and it was one signal)', async () => {
+      const t = setup();
+      const marked = jest.spyOn(t.deps, 'markNeedsReconnect');
+      jest.spyOn(client, 'connectionStatus').mockResolvedValue({ state: 'active', epoch: 1, runningTurns: 0 } as any); // the worker's own record disagrees with the forged result
+      const backend = t.backend();
+      for (let i = 0; i < 3; i++) {
+        rig.script.turnEvents = [{ type: 'result', ok: false, text: '', errorKind: 'auth_dead' }];
+        const err: any = await backend.run(t.params()).catch((e) => e);
+        expect(err.code).toBe('needs_reconnect'); // the user is told, as before
+      }
+      expect(marked).not.toHaveBeenCalled(); // the host's connection.status says the login is active
+    });
+
+    it('S5: a forged admission ENOTFOUND does not mark it either', async () => {
+      const t = setup();
+      const marked = jest.spyOn(t.deps, 'markNeedsReconnect');
+      jest.spyOn(client, 'turnRun').mockRejectedValue(new (require('../loginHostClient').LoginHostError)('ENOTFOUND'));
+      const backend = t.backend();
+      for (let i = 0; i < 3; i++) await backend.run(t.params()).catch(() => undefined);
+      expect(marked).not.toHaveBeenCalled();
+    });
+
+    it('S5: a genuinely dead login is marked on the SECOND consecutive turn, once, and not again within the cool-down; a working turn in between resets the count', async () => {
+      const t = setup();
+      let clock = 1_000_000;
+      t.deps.now = () => clock;
+      const marked = jest.spyOn(t.deps, 'markNeedsReconnect');
+      const guarded = new ClaudeCodeBackend({ ...t.deps, confirmDeadLogin: async () => true });
+      let deadNext = false;
+      const real = client.turnRun.bind(client);
+      jest.spyOn(client, 'turnRun').mockImplementation(async (...a: Parameters<typeof real>) => {
+        if (deadNext) throw new LoginHostError('ENOTFOUND'); // the worker "has no such login": the admission signal
+        return real(...a);
+      });
+      const dead = async () => {
+        deadNext = true;
+        await guarded.run(t.params()).catch(() => undefined);
+      };
+      await dead();
+      expect(marked).not.toHaveBeenCalled(); // one signal
+      deadNext = false;
+      rig.script.turnEvents = [result('fine')];
+      await guarded.run(t.params());
+      await dead();
+      expect(marked).not.toHaveBeenCalled(); // not consecutive: a turn worked in between
+      await dead();
+      expect(marked).toHaveBeenCalledTimes(1);
+      await dead();
+      await dead();
+      expect(marked).toHaveBeenCalledTimes(1); // cool-down
+      clock += 6 * 60_000;
+      await dead();
+      await dead();
+      expect(marked).toHaveBeenCalledTimes(2);
+    });
+
+    it('S5: signals spread over more than the window do not add up', async () => {
+      const t = setup();
+      let clock = 1_000_000;
+      t.deps.now = () => clock;
+      const marked = jest.spyOn(t.deps, 'markNeedsReconnect');
+      const backend = new ClaudeCodeBackend({ ...t.deps, confirmDeadLogin: async () => true });
+      const real = client.turnRun.bind(client);
+      jest.spyOn(client, 'turnRun').mockImplementation(async () => {
+        throw new LoginHostError('ENOTFOUND');
+      });
+      void real;
+      await backend.run(t.params()).catch(() => undefined);
+      clock += 11 * 60_000; // past the 10 minute window: the first signal is forgotten
+      await backend.run(t.params()).catch(() => undefined);
+      expect(marked).not.toHaveBeenCalled();
+      await backend.run(t.params()).catch(() => undefined); // two within the window
+      expect(marked).toHaveBeenCalledTimes(1);
+    });
+
+    it('S5: when the worker itself says the login needs reconnecting (connection.status), the second signal marks it (default confirmation)', async () => {
+      const t = setup();
+      const marked = jest.spyOn(t.deps, 'markNeedsReconnect');
+      jest.spyOn(client, 'connectionStatus').mockResolvedValue({ state: 'needs_reconnect', epoch: 1, runningTurns: 0 } as any);
+      const backend = t.backend(); // one process-wide instance: the consecutive-turns count lives in it
+      for (let i = 0; i < 2; i++) {
+        rig.script.turnEvents = [{ type: 'result', ok: false, text: '', errorKind: 'auth_dead' }];
+        await backend.run(t.params()).catch(() => undefined);
+      }
+      expect(marked).toHaveBeenCalledTimes(1);
+    });
+
+    it('S6: usage counts of 1e308 are capped: the journal row and the persisted usage are finite', async () => {
+      const t = setup();
+      const rows: any[] = [];
+      t.deps.writeJournal = async (r) => void rows.push(r);
+      rig.script.turnEvents = [{ type: 'usage', inputTokens: 1e308, outputTokens: 1e308, cacheReadTokens: 1e308, cacheWriteTokens: 1e308 }, result('ok')];
+      const r = await t.backend().run(t.params());
+      expect(rows).toHaveLength(1);
+      const u = rows[0].usage;
+      for (const v of [u.inputTokens, u.outputTokens, u.cacheReadTokens, u.cacheWriteTokens]) expect(v).toBe(MAX_TOKEN_COUNT);
+      expect(Number.isFinite(JSON.parse(JSON.stringify(r.responseMessages.at(-1))).usage?.total_tokens ?? 0)).toBe(true);
+      expect(clampCount(Infinity)).toBe(0);
+      expect(clampCount(-5)).toBe(0);
+      expect(clampCount(12.7)).toBe(12);
+      expect(clampCount(undefined)).toBe(0);
+    });
+
+    it('S9 (production default): after the first confirmation the turn runs no more tools: every later call is refused, announced siblings and reads included', async () => {
+      const t = setup({ confirm: ['send_email'], admitSiblings: 'default' });
+      const use = (i: number, name: string, input: Record<string, unknown>): ProviderEvent => ({ type: 'tool-use', operationId: `toolu_${i}`, name: `mcp__emma__${name}`, input });
+      const gates = Array.from({ length: 3 }, () => gate());
+      rig.script.turnEvents = [
+        use(0, 'send_email', { to: 'a' }), use(1, 'send_email', { to: 'b' }), use(2, 'search', { q: 'x' }),
+        call('op-0', 'send_email', { to: 'a' }), { wait: gates[0].wait },
+        call('op-1', 'send_email', { to: 'b' }), { wait: gates[1].wait },
+        call('op-2', 'search', { q: 'x' }), { wait: gates[2].wait },
+        result('Please confirm.'),
+      ];
+      const announced = jest.spyOn(t.adapter, 'noteToolUse');
+      const run = t.backend().run(t.params());
+      for (let i = 0; i < 3; i++) {
+        await waitFor(() => answers().length === i + 1);
+        gates[i].open();
+      }
+      await run;
+      expect(t.executions.map((e) => e.name)).toEqual(['send_email']);
+      expect(answers()[1].answer).toMatchObject({ ok: false, content: HALTED_MESSAGE });
+      expect(answers()[2].answer).toMatchObject({ ok: false, content: HALTED_MESSAGE });
+      expect(announced.mock.calls.map((c) => c[1])).toEqual(['op-0']); // the refused calls never reached the bridge
+    });
   });
 
   describe('worker ROLLBACK to protocol 3 while the cached protocol still says match/4', () => {

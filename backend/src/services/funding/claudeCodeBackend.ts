@@ -25,6 +25,8 @@ import type { BridgeCallOptions, BridgeCallRecord, BridgeCallResult, BridgeHalt,
 import { buildRelayManifest, manifestCut, manifestProblem, type RelayManifest } from "./relayManifest";
 import { RESULT_LOST_NOTE, RelayToolDispatcher } from "./relayToolDispatcher";
 import { ToolBridgeAuthError } from "./toolBridge";
+import { safeText, safeToken } from "./logSafe";
+import { ReconnectGuard } from "./reconnectGuard";
 import type { RunToolTokenClaims } from "./runToolToken";
 import type { PlanRoute } from "./claudeFunding";
 import type { ClaudeRunRegistry } from "./claudeRunRegistry";
@@ -115,6 +117,12 @@ export interface ClaudeBackendDeps {
     /** Whether a worker older than protocol 4 may run turns on the HTTP bridge. Absent or false (the production default) = refused. */
     allowLegacyBridge?(): boolean;
   };
+  /** Batched confirmations after a halt (see RelayDispatcherOptions.admitPostHaltSiblings). Default false: the first confirmation ends the turn's tool work. */
+  relayAdmitPostHaltSiblings?: boolean;
+  /** Consecutive turns that must report a dead login before the connection record is marked (default 2; see reconnectGuard.ts). */
+  reconnectSignalsRequired?: number;
+  /** Asks the worker whether it agrees the login is dead (default: `connection.status` says needs_reconnect, or no such login). Tests replace it. */
+  confirmDeadLogin?(client: LoginHostClient, connectionId: string): Promise<boolean>;
   /** How long before the turn's deadline no further tool may start (the model is told to write its answer). Default 75 s, never more than half the deadline. */
   softDeadlineLeadMs?: number;
   /** How long a relayed call waits for the stream line that announces it (default 1.5 s; tests shorten it). */
@@ -216,6 +224,15 @@ export function annotateLostResults(ledger: BridgeCallRecord[], isLost: (toolCal
   });
 }
 
+/** Most tokens one count may claim (a worker's `usage` event is hostile input: 1e308 values add up to Infinity). */
+export const MAX_TOKEN_COUNT = 1_000_000_000;
+export function clampCount(n: number | undefined): number {
+  return typeof n === "number" && Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), MAX_TOKEN_COUNT) : 0;
+}
+
+const RESULT_ERROR_KINDS = ["usage_limit", "auth_dead", "transient", "device_code_disabled", "refresh_reused", "policy_blocks", "unknown"] as const;
+const RESULT_ABORT_REASONS = ["deadline", "interrupted", "lease_lapsed"] as const;
+
 export const OUTCOME_UNKNOWN_NOTE =
   "I lost the connection to your Claude plan while working on this. It may or may not have finished. Please check the results before asking me to repeat anything.";
 export const LATE_RESULT_NOTE = "The action above finished after this turn was stopped. Please check the result before asking me to repeat it.";
@@ -225,7 +242,11 @@ export const CONFIRMATION_NOTE =
   "That action needs your confirmation before I can go on. Approval cards are not available on your Claude plan yet, so I have stopped here without doing it.";
 
 export class ClaudeCodeBackend {
-  constructor(private readonly deps: ClaudeBackendDeps) {}
+  constructor(private readonly deps: ClaudeBackendDeps) {
+    this.reconnectGuard = new ReconnectGuard(deps.now, deps.reconnectSignalsRequired ?? 2);
+  }
+
+  private readonly reconnectGuard: ReconnectGuard;
 
   private readonly watchers = new Set<Promise<void>>();
   private readonly wakers = new Set<() => void>();
@@ -253,7 +274,7 @@ export class ClaudeCodeBackend {
       return await this.runInner(p);
     } catch (err) {
       if (err instanceof ClaudeRouteStopError) throw err;
-      console.error("[claude-backend] turn failed:", err instanceof Error ? err.message : String(err));
+      console.error("[claude-backend] turn failed:", safeText(err));
       const stop = new ClaudeRouteStopError("turn_failed");
       markTurnToolsRan(stop, !turnRanNoTools(err)); // the raw error carries what the run knew; an unmarked one stays "may have run"
       throw stop;
@@ -388,6 +409,7 @@ export class ClaudeCodeBackend {
               // A16 / SF2: a worker past the call cap or the in-flight limit ends the turn (the host turn is interrupted; what ran is kept and persisted).
               onLimitTripped: () => ac.abort(),
               isHalted: () => d.bridge.isHalted(p.sessionId, p.userId),
+              admitPostHaltSiblings: d.relayAdmitPostHaltSiblings === true,
               isHaltingCall: (op) => d.bridge.takeHalts(p.userId, p.sessionId).some((h) => h.callId === op),
               ...(d.relayAnnounceWaitMs !== undefined ? { announceWaitMs: d.relayAnnounceWaitMs } : {}),
               onCall: (phase, name) => {
@@ -436,14 +458,15 @@ export class ClaudeCodeBackend {
                   d.bridge.noteToolResult(runId, e.operationId);
                   progress("tool_executed");
                 } else if (e.type === "usage") {
-                  const input = e.inputTokens ?? 0;
-                  const out = e.outputTokens ?? 0;
+                  // Worker-supplied counts: finite, but 1e308 + 1e308 is Infinity and would be persisted. Each count is capped.
+                  const input = clampCount(e.inputTokens);
+                  const out = clampCount(e.outputTokens);
                   seen.usage = {
                     prompt_tokens: input,
                     completion_tokens: out,
                     total_tokens: input + out,
-                    cache_read_input_tokens: e.cacheReadTokens ?? 0,
-                    cache_creation_input_tokens: e.cacheWriteTokens ?? 0,
+                    cache_read_input_tokens: clampCount(e.cacheReadTokens),
+                    cache_creation_input_tokens: clampCount(e.cacheWriteTokens),
                   };
                 }
               },
@@ -467,7 +490,7 @@ export class ClaudeCodeBackend {
             if (stop) {
               // Fields the host guarantees safe to log (a code and a short detail chosen by the host; never a path, token or text).
               console.error("[claude-backend] host failure", { code: (err as { code?: string }).code, detail: (err as { detail?: string }).detail, stop: stop.code, session: p.sessionId });
-              if (stop.markNeedsReconnect) await d.markNeedsReconnect(connectionId, epoch, "host_denied").catch(() => undefined);
+              if (stop.markNeedsReconnect) await this.markDeadLogin(client, connectionId, epoch, "host_denied");
               pendingStop = stop; // tool work that already ran is real: it is drained and persisted below, then this is thrown
             } else {
               rawError = err; // same: persist what ran, then fail (typed, by run())
@@ -484,7 +507,9 @@ export class ClaudeCodeBackend {
       const generation = d.bridge.generationOf(runId);
       const drained = await d.bridge.closeRunAndDrain(runId, d.drainTimeoutMs ?? 10_000);
       opened = false;
-      let ledger: BridgeCallRecord[] = drained ? drained.ledger : d.bridge.takeLedger(runId).records;
+      const taken = drained ? undefined : d.bridge.takeLedger(runId);
+      let ledger: BridgeCallRecord[] = drained ? drained.ledger : taken!.records;
+      const ledgerTruncated = drained ? drained.ledgerTruncated : taken!.truncated; // records cut or dropped to fit the ledger's caps
       // S1: on the relay path every executed call whose answer the worker did NOT accept never reached the model (a post that failed, one still in
       // flight when the drain window ended, or a call that finished after the turn): its persisted result says so.
       if (dispatcher) {
@@ -496,34 +521,36 @@ export class ClaudeCodeBackend {
 
       // 7. map
       if (seen.stopped || cancelledByUser || d.isCancelled(p.sessionId)) {
-        await this.persistSettled(p, ledger);
+        await this.persistSettled(p, ledger, ledgerTruncated);
         await this.journal(p, runId, startedAt, "aborted", seen.usage);
         return { content: "Generation was stopped.", toolCalls: [], knowledgeBaseQueries: [], sources: [], responseMessages: [], persistedResponseCount: 0, cancelled: true };
       }
       if (rawError !== undefined) {
-        await this.persistSettled(p, ledger);
+        await this.persistSettled(p, ledger, ledgerTruncated);
         await this.journal(p, runId, startedAt, "failed", seen.usage);
         throw rawError;
       }
       if (pendingStop) {
-        await this.persistSettled(p, ledger);
+        await this.persistSettled(p, ledger, ledgerTruncated);
         await this.journal(p, runId, startedAt, "failed", seen.usage);
         throw pendingStop;
       }
       if (!outcome || outcome.kind === "unknown_outcome") {
         // The turn may have run and its output is lost. What the bridge saw is real; say plainly that the rest is unknown. Never retried.
         const unknown = mapLedgerToResponseMessages({ ledger, finalText: OUTCOME_UNKNOWN_NOTE, llm: p.llmModel, stamps: p.stamps });
+        markLedgerTruncated(unknown.responseMessages, ledgerTruncated);
         await this.journal(p, runId, startedAt, "aborted", seen.usage);
         return { content: OUTCOME_UNKNOWN_NOTE, toolCalls: unknown.toolCalls, knowledgeBaseQueries: [], sources: [], responseMessages: unknown.responseMessages, persistedResponseCount: 0 };
       }
       const result = outcome.result;
       if (!result.ok) {
         // Anything the turn did before failing is real: keep it visible, then stop with the typed reason.
-        await this.persistSettled(p, ledger);
+        await this.persistSettled(p, ledger, ledgerTruncated);
         await this.journal(p, runId, startedAt, result.aborted ? "aborted" : "failed", seen.usage);
         const stop = fromResultErrorKind(result.errorKind, result.aborted);
-        console.error("[claude-backend] turn ended not ok", { errorKind: result.errorKind, aborted: result.aborted, stop: stop.code, session: p.sessionId });
-        if (stop.markNeedsReconnect) await d.markNeedsReconnect(connectionId, epoch, "turn_auth_dead").catch(() => undefined);
+        // errorKind and aborted come from the worker: only values of the fixed sets are logged, anything else as `other`.
+        console.error("[claude-backend] turn ended not ok", { errorKind: safeToken(result.errorKind, RESULT_ERROR_KINDS), aborted: safeToken(result.aborted, RESULT_ABORT_REASONS), stop: stop.code, session: p.sessionId });
+        if (stop.markNeedsReconnect) await this.markDeadLogin(client, connectionId, epoch, "turn_auth_dead");
         throw stop;
       }
 
@@ -537,6 +564,8 @@ export class ClaudeCodeBackend {
         stamps: p.stamps,
         usage: seen.usage,
       });
+      markLedgerTruncated(mapped.responseMessages, ledgerTruncated);
+      this.reconnectGuard.reset(connectionId); // a turn worked: "login is dead" signals are not consecutive
       await this.journal(p, runId, startedAt, "succeeded", seen.usage);
       const last = mapped.responseMessages[mapped.responseMessages.length - 1];
       return {
@@ -590,6 +619,22 @@ export class ClaudeCodeBackend {
           /* already released */
         }
       }
+    }
+  }
+
+  /**
+   * A worker said this connection's login is dead. The user already gets the stop; the RECORD is marked only if the signal repeated on consecutive turns, the
+   * worker confirms it on another route, and this connection was not marked in the last minutes (a forged result or admission answer must not take a
+   * customer's plan chats away). Never throws.
+   */
+  private async markDeadLogin(client: LoginHostClient, connectionId: string, epoch: number, reason: string): Promise<void> {
+    try {
+      if (!this.reconnectGuard.note(connectionId)) return;
+      const confirm = this.deps.confirmDeadLogin ?? defaultConfirmDeadLogin;
+      if (!(await confirm(client, connectionId))) return;
+      await this.deps.markNeedsReconnect(connectionId, epoch, reason);
+    } catch {
+      /* the 5-minute sweeper is the backstop */
     }
   }
 
@@ -670,17 +715,19 @@ export class ClaudeCodeBackend {
         if (expectedLate !== undefined && saved >= expectedLate) break; // everything that was still running has been shown
       }
     })()
-      .catch((err) => console.error("[claude-backend] late result watch failed:", err instanceof Error ? err.message : String(err)))
+      .catch((err) => console.error("[claude-backend] late result watch failed:", safeText(err)))
       .finally(() => void this.watchers.delete(task));
     this.watchers.add(task);
   }
 
   /** The settled tool work of a turn that has no answer to persist: the pairs, without a final message. */
-  private async persistSettled(p: ClaudeTurnParams, ledger: BridgeCallRecord[]): Promise<void> {
+  private async persistSettled(p: ClaudeTurnParams, ledger: BridgeCallRecord[], ledgerTruncated = 0): Promise<void> {
     if (ledger.length === 0) return;
     const mapped = mapLedgerToResponseMessages({ ledger, finalText: "x", llm: p.llmModel, stamps: p.stamps });
-    await this.deps.persistMessages(p.sessionId, mapped.responseMessages.slice(0, -1)).catch((err) =>
-      console.error("[claude-backend] could not persist settled tool work:", err instanceof Error ? err.message : String(err)),
+    const settled = mapped.responseMessages.slice(0, -1);
+    markLedgerTruncated(settled, ledgerTruncated);
+    await this.deps.persistMessages(p.sessionId, settled).catch((err) =>
+      console.error("[claude-backend] could not persist settled tool work:", safeText(err)),
     );
   }
 
@@ -714,12 +761,27 @@ export class ClaudeCodeBackend {
     try {
       await this.deps.writeJournal(row);
     } catch (err) {
-      console.error("[claude-backend] journal write failed (fail-open):", err instanceof Error ? err.message : String(err));
+      console.error("[claude-backend] journal write failed (fail-open):", safeText(err));
     }
   }
 }
 
 /** A stop raised before the run opened: nothing could have run. */
+/** Marks the persisted messages of a turn whose ledger had to cut or drop records (the chat then shows less than the turn did). Metadata only: no user-visible text. */
+function markLedgerTruncated(messages: any[], truncated: number): void {
+  if (truncated <= 0 || messages.length === 0) return;
+  const last = messages[messages.length - 1];
+  last.metadata = { ...(last.metadata ?? {}), ledgerTruncated: truncated };
+}
+
+async function defaultConfirmDeadLogin(client: LoginHostClient, connectionId: string): Promise<boolean> {
+  try {
+    return (await client.connectionStatus({ connectionId })).state === "needs_reconnect";
+  } catch (err) {
+    return err instanceof LoginHostError && (err.code === "ENOTFOUND" || err.code === "ESTATE"); // the worker says again that it has no usable login
+  }
+}
+
 function noToolsStop(code: ConstructorParameters<typeof ClaudeRouteStopError>[0]): ClaudeRouteStopError {
   const stop = new ClaudeRouteStopError(code);
   markTurnToolsRan(stop, false);

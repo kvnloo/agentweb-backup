@@ -17,6 +17,7 @@ import {
   CERT_WARN_DAYS, CERT_WARN_EVERY_MS, clientCertNotAfterMs, daysUntil, defaultBuild, defaultSecretName, isPrivateIPv4, LoginHostProvider, LOGIN_HOST_SETTING_NAME, parseClientMaterial, parseLoginHostSetting,
   parseLoginHostSettingDetailed, PROTOCOL_RECHECK_MS, REFRESH_INTERVAL_MS, RETRY_AFTER_FAILURE_MS, SECRET_TTL_MS,
   type LoginHostProviderDeps,
+  INVALIDATE_COOLDOWN_MS,
 } from "../loginHostProvider";
 
 const PEM = (kind: string, body: string) => `-----BEGIN ${kind}-----\n${body.padEnd(40, "A")}\n-----END ${kind}-----\n`;
@@ -332,6 +333,24 @@ describe("worker protocol check (host.info)", () => {
     await new Promise((r) => setImmediate(r));
     expect(asked).toBe(before + 1);
     expect([p.protocolStatus(), p.workerProtocol()]).toEqual(["match", 3]);
+  });
+
+  it("S7: a flood of invalidations costs one host.info per cool-down (a compromised worker cannot flap the fleet or make the backend hammer it)", async () => {
+    let asked = 0;
+    const p = mk(async () => (asked++, { protocol: 4, node: "v22", uptimeSec: 1 }));
+    await settle(p);
+    const base = asked;
+    for (let i = 0; i < 1000; i++) p.invalidateProtocol();
+    await new Promise((r) => setImmediate(r));
+    expect(asked - base).toBe(1);
+    expect(p.protocolStatus()).toBe("match"); // the one recheck answered 4: relaying goes on, no long unknown window
+    now += INVALIDATE_COOLDOWN_MS - 1;
+    for (let i = 0; i < 50; i++) p.invalidateProtocol();
+    expect(asked - base).toBe(1);
+    now += 2;
+    p.invalidateProtocol();
+    await new Promise((r) => setImmediate(r));
+    expect(asked - base).toBe(2);
   });
 
   it("a version outside the accepted set is a logged 'mismatch' (never fatal: the client is still returned)", async () => {

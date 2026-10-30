@@ -129,6 +129,8 @@ export const defaultBuild = (worker: { host: string; port: number }, m: ClientMa
 export { CERT_WARN_DAYS };
 /** The expiry warning is logged at most this often (the provider refreshes every minute). */
 export const CERT_WARN_EVERY_MS = 60 * 60 * 1000;
+/** `invalidateProtocol` acts at most this often. */
+export const INVALIDATE_COOLDOWN_MS = 30_000;
 /** The worker's protocol version is re-verified this often (a redeployed worker flips to "match" without a backend restart). */
 export const PROTOCOL_RECHECK_MS = 10 * 60 * 1000;
 /**
@@ -163,6 +165,7 @@ export class LoginHostProvider {
   private timer: unknown;
   private protocol: { status: ProtocolStatus; worker?: number; checkedAt: number } = { status: "unknown", checkedAt: 0 };
   private protocolChecking = false;
+  private lastInvalidatedAt = Number.NEGATIVE_INFINITY;
   private protocolUnknownLogged = false;
   private certNotAfterMs: number | undefined;
   private lastCertWarnAt = 0;
@@ -275,6 +278,9 @@ export class LoginHostProvider {
    * turn is refused as retryable (fail closed), then decided on the fresh protocol.
    */
   invalidateProtocol(): void {
+    // At most once per cool-down: a compromised worker that keeps refusing relay turns must not flap the whole fleet to "unknown" and flood host.info.
+    if (this.now() - this.lastInvalidatedAt < INVALIDATE_COOLDOWN_MS) return;
+    this.lastInvalidatedAt = this.now();
     this.protocol = { status: "unknown", checkedAt: 0 };
     this.protocolUnknownLogged = false;
     this.maybeCheckProtocol();
