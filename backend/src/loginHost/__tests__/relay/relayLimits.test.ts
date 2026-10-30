@@ -8,7 +8,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync }
 import { request } from "http";
 import { tmpdir } from "os";
 import { join } from "path";
-import { admitNewTools, MODEL_TOOL_NAME_MAX_CHARS, qualifiedToolPrefix, RELAY_MCP_SERVER_NAME, ROUTES, TOOL_LIMITS, TOOL_NAME_MAX_CHARS, toolEntryProblem, toolManifest, TURN_RUN_MAX_BODY_BYTES, visibleFromManifest, type ToolDef } from "../../protocol";
+import { admitNewTools, MODEL_TOOL_NAME_MAX_CHARS, qualifiedToolPrefix, RELAY_MCP_SERVER_NAME, ROUTES, TOOL_LIMITS, TOOL_NAME_MAX_CHARS, toolEntryProblem, toolManifest, TURN_RUN_MAX_BODY_BYTES, visibleFromManifest, type ToolDef, manifestLines } from "../../protocol";
 import { startHostServer } from "../../server";
 import { makeRig } from "../helpers";
 
@@ -169,11 +169,11 @@ describe("a manifest AT the limits", () => {
       c.stdout.on("data", (d) => (o += d.toString()));
       c.on("error", reject);
       c.on("exit", () => resolve(o));
-      c.stdin.end(`{"mcpServers":{}}\n${line}\nREST-OF-STDIN\n`);
+      c.stdin.end(`{"mcpServers":{}}\n${manifestLines(tools).map((l) => l + "\n").join("")}REST-OF-STDIN\n`);
     });
     const wrapMs = Date.now() - t0;
     expect(out).toBe("REST-OF-STDIN\n");
-    expect(readFileSync(join(unitTmp, "aw-cfg", "tools.json"), "utf8")).toBe(line + "\n");
+    expect(readFileSync(join(unitTmp, "aw-cfg", "tools.json"), "utf8")).toBe(line);
     // the wrapper's umask 077: the manifest and the MCP config are private to the unit's uid whatever the caller's umask
     expect(statSync(join(unitTmp, "aw-cfg", "tools.json")).mode & 0o777).toBe(0o600);
     expect(statSync(join(unitTmp, "aw-cfg", "mcp.json")).mode & 0o777).toBe(0o600);

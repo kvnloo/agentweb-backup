@@ -79,7 +79,7 @@ describe("valid giant event lines", () => {
     const m = await pump(r, line, { maxWrites: 400, maxMs: 30_000 });
     console.log("RESULT strings", JSON.stringify({ ...m, ...r.stats(), errors: r.errors }));
     expect(r.errors).toEqual(["stdout_flood"]);
-    expect(r.stats().parsed).toBeLessThanOrEqual(40); // the 32 MiB burst
+    expect(r.stats().parsed).toBeLessThanOrEqual(72); // the 64 MiB burst
   });
 
   it("an honest stream is untouched: a few big result lines and many small events in 3 s", async () => {
