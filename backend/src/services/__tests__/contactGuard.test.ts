@@ -29,6 +29,11 @@ describe("addresses in a to/cc/bcc value", () => {
     expect(addressesOf("a@x.com)")).toEqual(["a@x.com"]);
     expect(addressesOf("mailto:a@x.com?subject=hi")).toEqual(["a@x.com"]);
     expect(addressesOf([["a@x.com"], [["b@x.com"]]])).toEqual(["a@x.com", "b@x.com"]);
+    // a `?` inside the local part is part of the address; only a query AFTER the domain is cut
+    expect(addressesOf("what?@x.com")).toEqual(["what?@x.com"]);
+    expect(addressesOf("a@x.com?subject=hi&body=b")).toEqual(["a@x.com"]);
+    // `{` and `}` are legal in a local part and are not stripped
+    expect(addressesOf("{a}@x.com")).toEqual(["{a}@x.com"]);
     expect(addressesOf(undefined)).toEqual([]);
     expect(addressesOf(42)).toEqual([]);
     expect(addressesOf("no address here")).toEqual([]);
@@ -83,6 +88,16 @@ describe("blocking by address (agent email tools, the Emma API) (ENG-673)", () =
     await expect(blockedRecipients(["u1"], "a@x.com")).rejects.toThrow("dynamo down");
     db.findAllLeadsByEmail.mockResolvedValue(Array.from({ length: 200 }, () => ({ userId: "other", contactStatus: "active" })));
     await expect(blockedRecipients(["u1"], "info@x.com")).rejects.toThrow("too many contacts share this address");
+  });
+
+  it("long hostile input is bounded: a piece over the length limit is skipped, and 100,000 characters take well under a second", () => {
+    const started = Date.now();
+    expect(addressesOf("a".repeat(100_000))).toEqual([]);
+    expect(addressesOf(".".repeat(100_000) + "x")).toEqual([]);
+    expect(addressesOf("(".repeat(50_000) + ")".repeat(50_000))).toEqual([]);
+    expect(Date.now() - started).toBeLessThan(1000);
+    // a normal address next to a hostile piece is still found
+    expect(addressesOf(`${"a".repeat(5000)}, ok@x.com`)).toEqual(["ok@x.com"]);
   });
 
   it("does no lookup at all for a send with no address", async () => {

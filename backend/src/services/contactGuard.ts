@@ -35,6 +35,21 @@ async function isOursAndBlocked(lead: any, owners: Set<string>, listOwners: Map<
   return !!owner && owners.has(owner);
 }
 
+const MAX_PIECE = 600;
+
+/** A matched address without the punctuation around it. A `?query` is cut only after the `@` (a local part may contain `?`); trimming is a loop, not a regex. */
+function cleanAddress(raw: string): string {
+  let s = raw.trim().toLowerCase();
+  const at = s.indexOf("@");
+  const q = at >= 0 ? s.indexOf("?", at) : -1;
+  if (q >= 0) s = s.slice(0, q);
+  let start = 0;
+  let end = s.length;
+  while (start < end && "([".includes(s[start])) start++;
+  while (end > start && ")].".includes(s[end - 1])) end--;
+  return s.slice(start, end);
+}
+
 /** Plain addresses from a to/cc/bcc value: a string (comma or semicolon separated, "Name <a@b>" allowed) or an array of them. */
 export function addressesOf(value: unknown): string[] {
   const parts = Array.isArray(value) ? value.flat(Infinity) : typeof value === "string" ? [value] : [];
@@ -42,10 +57,15 @@ export function addressesOf(value: unknown): string[] {
   for (const part of parts) {
     if (typeof part !== "string") continue;
     for (const piece of part.split(/[;,]/)) {
+      // No address is longer than 254 characters: a longer piece is not matched (the regexes below are quadratic on long input with no address).
+      if (piece.length > MAX_PIECE) continue;
       const bracketed = [...piece.matchAll(/<(?:mailto:)?([^<>\s]+@[^<>\s]+)>/gi)];
       const found = bracketed.length > 0 ? bracketed : [...piece.matchAll(/(?:mailto:)?([^\s<>"';,:]+@[^\s<>"';,]+)/gi)];
       // Punctuation and a mailto query around an address are not part of it: `(a@x.com)`, `a@x.com.`, `a@x.com?subject=hi`. A lookup with them left on would miss.
-      for (const m of found) out.add(m[1].split("?")[0].trim().replace(/^[([{]+/, "").replace(/[)\]}.]+$/, "").toLowerCase());
+      for (const m of found) {
+        const cleaned = cleanAddress(m[1]);
+        if (cleaned.includes("@")) out.add(cleaned);
+      }
     }
   }
   return [...out];
