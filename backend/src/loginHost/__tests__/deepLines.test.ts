@@ -290,6 +290,13 @@ describe("CLI stdout: lines nested deeper than the cap are dropped before anythi
       expect(r.ms).toBeLessThan(2000);
     });
 
+    it("MUTATION TARGET: a flood of tiny VALID events ({} 21,000 times in one 64 KiB chunk) ends the stream too: each is cheap, but not 21,000 of them", async () => {
+      const r = await viaRunner([Buffer.from("{}\n".repeat(21 * 1024))]);
+      console.log("FLOOD {} ms", r.ms.toFixed(1), JSON.stringify({ parsed: r.parsed, threw: r.threw }));
+      expect(r.errors).toEqual(["stdout_flood"]);
+      expect(r.parsed).toBe(0); // nothing of the chunk is released once the budget is passed
+    });
+
     it("MUTATION TARGET: a flood of BLANK lines ends the stream too", async () => {
       const r = await viaRunner([Buffer.alloc(64 * 1024, 10)]);
       expect(r.errors).toEqual(["stdout_flood"]);
