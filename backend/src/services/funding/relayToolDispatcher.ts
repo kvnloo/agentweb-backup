@@ -73,6 +73,7 @@ const ANNOUNCE_BUDGET_BYTES = 8 * 1024 * 1024;
  * 256 KiB is about 60,000 words in one argument: far above any real tool call (the registry's largest SCHEMA is 15 KB and the host already caps a call
  * at 1 MiB and 32 levels); a measurement of real call sizes is not possible from the registry, so this is a judgment, flagged in the fragment.
  */
+// Documented for tool authors in docs/plan-route-tool-limits.md: change it there too.
 const CALL_INPUT_MAX_BYTES = 256 * 1024;
 const CALL_INPUT_BUDGET_BYTES = 2 * 1024 * 1024;
 const SMALL_INPUT_BYTES = 16 * 1024;

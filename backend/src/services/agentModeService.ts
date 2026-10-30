@@ -1729,6 +1729,7 @@ export class AgentModeService {
     console.log(`AgentMode: Refreshed ${mcpTools.length} MCP tools`);
   }
 
+  // Every tool registered here also reaches the Claude plan route and must fit its limits: docs/plan-route-tool-limits.md
   private async registerTools() {
     // 1. Ensure Emma's tools are loaded into the emmaToolRegistry (only needs to happen once)
     if (!AgentModeService.toolsRegistered) {
