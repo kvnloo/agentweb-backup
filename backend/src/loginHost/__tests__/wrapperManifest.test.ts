@@ -66,6 +66,7 @@ describe.each(["sh", "bash"] as const)("claude-turn.sh manifest block (%s)", (sh
     await new Promise<void>((res) => {
       const c = spawn(shell, [WRAPPER, "/bin/cat"], { env: { PATH: "/usr/bin:/bin", TMPDIR: tmp, AW_TURN_TOOLS: "1" }, stdio: ["pipe", "ignore", "ignore"] });
       c.on("exit", () => res());
+      c.stdin.on("error", () => {});
       c.stdin.end(stream(manifestLines([{ name: "t" }])));
     });
     expect(statSync(join(tmp, "aw-cfg", "tools.json")).mode & 0o777).toBe(0o600);

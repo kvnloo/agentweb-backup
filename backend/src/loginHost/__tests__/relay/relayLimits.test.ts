@@ -169,6 +169,7 @@ describe("a manifest AT the limits", () => {
       c.stdout.on("data", (d) => (o += d.toString()));
       c.on("error", reject);
       c.on("exit", () => resolve(o));
+      c.stdin.on("error", () => {});
       c.stdin.end(`{"mcpServers":{}}\n${manifestLines(tools).map((l) => l + "\n").join("")}REST-OF-STDIN\n`);
     });
     const wrapMs = Date.now() - t0;
