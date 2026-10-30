@@ -209,6 +209,19 @@ describe("a hostile unit and a hostile CLI together cannot stall the loop by mak
     await w.stop();
   });
 
+  it("MUTATION TARGET: a hard per-turn budget on bytes hashed: 60 announcements of ~500 KB cost at most 8 MiB of hashing, then nothing is hashed or recorded", async () => {
+    const w = await withWaitingCall({ q: "x" }, 20);
+    w.canonical.mockClear();
+    (w.session as unknown as { visibleTools: Set<string> }).visibleTools.add("search");
+    const t0 = Date.now();
+    for (let i = 0; i < 60; i++) {
+      w.session.noteStreamUse({ type: "assistant", message: { id: "m" + i, content: [{ type: "tool_use", id: "t", name: "mcp__emma__search", input: { pad: "x".repeat(500_000) + i } }] } });
+    }
+    expect(w.canonical.mock.calls.length).toBeLessThanOrEqual(17); // 8 MiB / ~500 KB
+    expect(w.canonical.mock.calls.length).toBeGreaterThan(0);
+    await w.stop();
+  });
+
   it("MUTATION TARGET: one 16 MB-style event of a quarter million tiny tool_use blocks examines a bounded number of them", async () => {
     const w = await withWaitingCall({ q: "x" }, 20);
     w.canonical.mockClear();

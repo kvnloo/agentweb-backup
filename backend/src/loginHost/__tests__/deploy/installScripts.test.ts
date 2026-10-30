@@ -581,7 +581,7 @@ case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${
         symlinkSync(join(dir, "real-node", "node"), join(nodeBin, "node"));
       } else writeFileSync(join(nodeBin, "node"), "#!/bin/sh\n", { mode: 0o755 });
       // the directories as root would have made them (the test process may run with a group-writable umask)
-      for (const d of [nodeRoot, join(nodeRoot, `v${versions.NODE_VERSION}`), nodeBin, join(dir, "real-node")]) if (existsSync(d)) chmodSync(d, 0o755);
+      for (const d of [nodeRoot, join(nodeRoot, `v${versions.NODE_VERSION}`), nodeBin, join(dir, "real-node"), join(dir, "real-node", "node"), join(nodeBin, "node")]) if (existsSync(d) && !lstatSync(d).isSymbolicLink()) chmodSync(d, 0o755);
     }
     chmodSync(dir, 0o755);
     const env = {
@@ -864,7 +864,7 @@ case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${
       mkdirSync(join(b.dir, "state"));
       // (a CI build carries the pipeline's run number; this one was made by hand)
       writeFileSync(join(b.pkg, "MANIFEST"), text(join(b.pkg, "MANIFEST")).replace(/^build_seq=.*$/m, "build_seq=7"));
-      const env = { ...b.env, AW_SOCK: join(b.dir, "host.sock"), AW_DEPLOY_LOCK: join(b.dir, "deploy.lock"), AW_NODE: join(b.bin, "ctlnode"), AW_STATE_DIR: join(b.dir, "state"), AW_HOLD: join(b.dir, "hold"), AW_HEALTH_TIMEOUT: "5" };
+      const env = { ...b.env, AW_SOCK: join(b.dir, "host.sock"), AW_DEPLOY_LOCK: join(b.dir, "dl", "deploy.lock"), AW_NODE: join(b.bin, "ctlnode"), AW_STATE_DIR: join(b.dir, "state"), AW_HOLD: join(b.dir, "hold"), AW_HEALTH_TIMEOUT: "5" };
       const deploy = (...args: string[]) => spawnSync("bash", [join(b.pkg, "deploy.sh"), ...args], { encoding: "utf8", env: { ...process.env, ...env }, timeout: 120_000 });
       return { b, S, deploy };
     }

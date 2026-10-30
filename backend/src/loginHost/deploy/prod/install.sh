@@ -331,6 +331,7 @@ TLS_DIR="$CONF/tls/$REL_ID"
 
 if [ "$DRY" = 1 ]; then
   DRY_TMP=$(mktemp -d "$DRY_BASE/aw-dry.XXXXXX")
+  chmod 755 "$DRY_TMP" # the pre-switch check asks whether a customer uid could traverse the path: a private 0700 stage would fail it
   STAGE_TLS_DIR="$DRY_TMP/tls"
   STAGE_REL_DIR="$DRY_TMP/release"
 else
