@@ -33,6 +33,20 @@ export const ATTIO_LIST_IDENTITY_MAPPING: FieldMapping[] = [
  * getSvc() uses the static factories — one DB read for OAuth, zero for token.
  * The resolved token is cached on the instance for the lifetime of the operation.
  */
+/**
+ * Attio rejects phone numbers without a country (e.g. a bare US "2532344511"
+ * from a landing-page form). Normalize to E.164 where the shape is
+ * unambiguous, otherwise pass a US country hint.
+ */
+export function toAttioPhone(raw: string): { original_phone_number: string; country_code?: string } {
+    const s = String(raw).trim();
+    if (s.startsWith('+')) return { original_phone_number: s };
+    const digits = s.replace(/\D/g, '');
+    if (digits.length === 10) return { original_phone_number: `+1${digits}` };
+    if (digits.length === 11 && digits.startsWith('1')) return { original_phone_number: `+${digits}` };
+    return { original_phone_number: s, country_code: 'US' };
+}
+
 export class AttioAdapter implements CrmAdapter {
 
     /** agentwebFields that carry only source-list identity, not lead content. */
@@ -744,7 +758,7 @@ export class AttioAdapter implements CrmAdapter {
                 if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(strValue)) continue;
                 values.email_addresses = [{ email_address: strValue }];
             } else if (slug === 'phone_numbers') {
-                values.phone_numbers = [{ original_phone_number: strValue }];
+                values.phone_numbers = [toAttioPhone(strValue)];
             } else if (slug === 'first_name' || slug === 'last_name') {
                 if (!values.name) values.name = [{}];
                 values.name[0][slug] = strValue;
@@ -819,7 +833,7 @@ export class AttioAdapter implements CrmAdapter {
                 return { first_name: firstName, last_name: lastName, full_name: [firstName, lastName].filter(Boolean).join(' ') };
             }
             case 'email_address': return { email_address: str };
-            case 'phone_number': return { original_phone_number: str };
+            case 'phone_number': return toAttioPhone(str);
             default: return { value: str };
         }
     }
