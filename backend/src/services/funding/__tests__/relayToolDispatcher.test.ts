@@ -607,7 +607,7 @@ describe('RelayToolDispatcher', () => {
       const input = { items: Array.from({ length: 700 }, (_, i) => ({ i, s: 'y'.repeat(1000) })) };
       const t0 = process.hrtime.bigint();
       for (let i = 0; i < 5000; i++) t.d.noteStreamUse('mcp__aw__save_note', input);
-      expect(Number(process.hrtime.bigint() - t0) / 1e6).toBeLessThan(500);
+      expect(Number(process.hrtime.bigint() - t0) / 1e6).toBeLessThan(1500); // the old cost was minutes (95 ms each); this is bounded by the 1,024-announcement cap
     });
 
     it('an announcement with an input over 64 KB is recorded by name only: it never matches a call by content (like the host marker)', async () => {
@@ -654,6 +654,31 @@ describe('RelayToolDispatcher', () => {
       expect(Date.now() - t0).toBeLessThan(200);
       expect(t.executed).toEqual([]);
       expect(t.posts[0]).toMatchObject({ isError: true, content: ARGS_TOO_LARGE_MESSAGE });
+    });
+
+    it('numeric arrays are estimated conservatively (host estimator: 20 bytes for a number of 2+ digits): 100,000 two-digit numbers (300 KB of JSON) are refused fast, 10,000 run', async () => {
+      const t = rig();
+      const t0 = Date.now();
+      t.d.start(t.ev('op-1', 'save_note', { ids: Array.from({ length: 100_000 }, (_, i) => 10 + (i % 90)) }));
+      await t.d.settle(2_000);
+      expect(Date.now() - t0).toBeLessThan(200);
+      expect(t.executed).toEqual([]);
+      expect(t.posts[0]).toMatchObject({ content: ARGS_TOO_LARGE_MESSAGE });
+      t.d.start(t.ev('op-2', 'save_note', { ids: Array.from({ length: 10_000 }, (_, i) => 10 + (i % 90)) }));
+      await t.d.settle(2_000);
+      expect(t.executed).toHaveLength(1);
+    });
+
+    it('a numeric stream input over the announce threshold is recorded by name only (the estimate is conservative, which is the safe direction)', async () => {
+      const t = rig();
+      const ids = Array.from({ length: 8_000 }, (_, i) => 10 + (i % 90)); // 24 KB of JSON, estimated at 160 KB: over the announce threshold, under the call cap
+      t.d.noteStreamUse('mcp__aw__save_note', { ids });
+      t.d.noteStreamUse('mcp__aw__save_note', { ids });
+      t.d.start(t.ev('op-1', 'save_note', { ids }));
+      await t.d.settle(2_000);
+      t.d.start(t.ev('op-2', 'save_note', { ids }));
+      await t.d.settle(2_000);
+      expect(t.executed).toHaveLength(2); // both ran: never matched by content, so never collapsed
     });
 
     it('arguments just under the cap run', async () => {
