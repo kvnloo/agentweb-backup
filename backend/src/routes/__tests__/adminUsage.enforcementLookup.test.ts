@@ -37,6 +37,7 @@ app.use('/api/admin', adminUsageRoutes);
 const mockCheck = checkTokenUsage as jest.Mock;
 const mockResolve = resolveBillingUserId as jest.Mock;
 const mockByEmail = (userDb as any).getUserByEmail as jest.Mock;
+const mockById = (userDb as any).getUserById as jest.Mock;
 
 const status = (over: Record<string, unknown> = {}) => ({
   month: '2026-10', allowed: true, used: 100, effectiveAllowance: 1000, percentUsed: 10,
@@ -49,6 +50,7 @@ describe('ENG-2771 GET /api/admin/usage/enforcement', () => {
     jest.clearAllMocks();
     asAdmin = true;
     mockResolve.mockResolvedValue('owner-1');
+    mockById.mockResolvedValue({ userId: 'u-9' });
   });
 
   it('reports a paused, cost-gated account via checkTokenUsage -> describeEnforcement on the billing owner', async () => {
@@ -87,6 +89,14 @@ describe('ENG-2771 GET /api/admin/usage/enforcement', () => {
     mockByEmail.mockResolvedValue(null);
     expect((await request(app).get('/api/admin/usage/enforcement?email=nobody@x.com')).status).toBe(404);
     expect((await request(app).get('/api/admin/usage/enforcement')).status).toBe(400);
+    expect(mockCheck).not.toHaveBeenCalled();
+  });
+
+  it('404s an unknown userId and 400s conflicting identifiers (CodeRabbit #3859)', async () => {
+    mockById.mockResolvedValue(null);
+    expect((await request(app).get('/api/admin/usage/enforcement?userId=ghost-1')).status).toBe(404);
+    expect((await request(app).get('/api/admin/usage/enforcement?userId=u-9&email=a@x.com')).status).toBe(400);
+    expect(mockResolve).not.toHaveBeenCalled();
     expect(mockCheck).not.toHaveBeenCalled();
   });
 

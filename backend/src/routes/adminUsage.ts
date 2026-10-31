@@ -548,7 +548,14 @@ router.get(
       const email = typeof req.query.email === "string" ? req.query.email.trim().toLowerCase() : "";
       let userId = typeof req.query.userId === "string" ? req.query.userId.trim() : "";
       if (!email && !userId) return res.status(400).json({ error: "email or userId is required" });
-      if (!userId) {
+      if (email && userId) return res.status(400).json({ error: "Pass email or userId, not both" });
+      if (userId) {
+        if (!BILLING_USER_ID_RE.test(userId)) {
+          return res.status(400).json({ error: "userId is not a valid identifier" });
+        }
+        const user: any = await userDb.getUserById(userId);
+        if (!user?.userId) return res.status(404).json({ error: "User not found", found: false });
+      } else {
         const user: any = await userDb.getUserByEmail(email);
         if (!user?.userId) return res.status(404).json({ error: "User not found", found: false });
         userId = user.userId;
