@@ -7652,8 +7652,14 @@ const adminToolNames = [
 // mcpGetAccountStatusExposure.test.ts). Same `execute`, self-only schema.
 const SELF_ONLY_BRIDGE_DEFINITIONS: Record<string, { description: string; inputSchema: any }> = {
   get_account_status: {
-    description: "Get the current user's account status, subscription plan, and usage.",
-    inputSchema: { type: 'object', properties: {}, required: [] },
+    description: "Get the current user's account status, subscription plan, and usage. Pass usage_month (YYYY-MM) to also get that month's LLM token/call totals by model and by day plus a session count (no dollar amounts).",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        usage_month: { type: 'string', description: 'Optional YYYY-MM month for the usage breakdown.' },
+      },
+      required: [],
+    },
   },
   list_scheduled_chats: {
     description: 'List scheduled chats (newest first) for the authenticated user. Paginated: returns { items, nextCursor }; pass nextCursor back as cursor for the next page (null = last page).',
