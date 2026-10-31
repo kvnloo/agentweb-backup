@@ -11,6 +11,7 @@ import { tierFromCostScore, tierFromQualityScore } from './agentMode/modelClassi
 import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 import { recordCreativeLearningReceipt } from './agentMode/adsLearning';
 import { enforceEvaluationTool, isEvaluationUser, shouldOfferEvaluationWorkspace } from './evaluationPolicy';
+import { applyEvaluationWorkspaceListing } from './agentMode/evaluationWorkspaceListing';
 import { sandboxAwarePollDelayMs } from './agentMode/sandboxPolling';
 import { markSandboxRun, forgetSandboxRun, isSandboxRun, releaseSandboxRun } from './agentMode/sandboxTelemetry';
 import axios from 'axios';
@@ -4073,8 +4074,9 @@ export class AgentModeService {
 
           // Exclude tools that are not applicable to the current context (e.g. get_visual_context on non-visual pages)
           // ENG-1948: never offer evaluation_workspace to a principal that can only be denied.
-          if (filteredToolsCache && !shouldOfferEvaluationWorkspace({ userId, isAdmin, isDelegatedAccess, isInteractiveShare, isUnattendedRun })) {
-            filteredToolsCache = filteredToolsCache.filter((t: any) => t.function?.name !== 'evaluation_workspace');
+          if (filteredToolsCache) {
+            filteredToolsCache = applyEvaluationWorkspaceListing(filteredToolsCache, allowedToolNames,
+              shouldOfferEvaluationWorkspace({ userId, isAdmin, isDelegatedAccess, isInteractiveShare, isUnattendedRun }));
           }
 
           if (excludeTools?.length && filteredToolsCache) {
@@ -7613,9 +7615,8 @@ export class AgentModeService {
     }
 
     // ENG-1948: mirror the main turn handler's evaluation_workspace listing filter.
-    if (!shouldOfferEvaluationWorkspace({ userId, isAdmin, isDelegatedAccess: input.isDelegatedAccess, isInteractiveShare: input.isInteractiveShare })) {
-      tools = tools.filter((t: any) => t.function?.name !== 'evaluation_workspace');
-    }
+    tools = applyEvaluationWorkspaceListing(tools, allowedToolNames,
+      shouldOfferEvaluationWorkspace({ userId, isAdmin, isDelegatedAccess: input.isDelegatedAccess, isInteractiveShare: input.isInteractiveShare }));
 
     if (input.excludeTools?.length) {
       const excludeSet = new Set(input.excludeTools);
