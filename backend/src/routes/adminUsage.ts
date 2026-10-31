@@ -530,4 +530,58 @@ router.get(
   }
 );
 
+/**
+ * ENG-2771: a named client's effective allowance for the CURRENT month, for
+ * Emma's admin-only `inspect_client_usage` tool.
+ *
+ * READ-ONLY. It resolves the billing owner and re-labels the enforcer's own
+ * `checkTokenUsage` result via `describeEnforcement` — the same path the spend
+ * breakdown's `enforcement` field uses — so there is no second computation.
+ * No tier, bonus or counter mutation lives here (those stay ENG-528/ENG-1482).
+ */
+router.get(
+  "/usage/enforcement",
+  authenticateToken,
+  isAdmin,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      for (const key of ["email", "userId"] as const) {
+        const raw = req.query[key];
+        if (raw !== undefined && typeof raw !== "string") {
+          return res.status(400).json({ error: `${key} must be a single string value` });
+        }
+      }
+      const email = typeof req.query.email === "string" ? req.query.email.trim().toLowerCase() : "";
+      let userId = typeof req.query.userId === "string" ? req.query.userId.trim() : "";
+      if (!email && !userId) return res.status(400).json({ error: "email or userId is required" });
+      if (email && userId) return res.status(400).json({ error: "Pass email or userId, not both" });
+      if (userId) {
+        if (!BILLING_USER_ID_RE.test(userId)) {
+          return res.status(400).json({ error: "userId is not a valid identifier" });
+        }
+        const user: any = await userDb.getUserById(userId);
+        if (!user?.userId) return res.status(404).json({ error: "User not found", found: false });
+      } else {
+        const user: any = await userDb.getUserByEmail(email);
+        if (!user?.userId) return res.status(404).json({ error: "User not found", found: false });
+        userId = user.userId;
+      }
+      if (!BILLING_USER_ID_RE.test(userId)) {
+        return res.status(400).json({ error: "userId is not a valid identifier" });
+      }
+      const billingUserId = await resolveBillingUserId(userId);
+      const enforcement = await checkTokenUsage(billingUserId)
+        .then((status) => describeEnforcement(status, status.month))
+        .catch((error: any) => {
+          console.error("[adminUsage] enforcement state read failed:", error?.message || error);
+          return { available: false as const, reason: "unreadable" as const, message: "Could not read the enforcer's state" };
+        });
+      return res.json({ requestedUserId: userId, email: email || null, billingUserId, enforcement });
+    } catch (error: any) {
+      console.error("[adminUsage] usage enforcement lookup failed:", error?.message || error);
+      return res.status(500).json({ error: "Failed to read usage enforcement state" });
+    }
+  },
+);
+
 export default router;
