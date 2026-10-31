@@ -57,7 +57,7 @@ mcpToolRegistry.register({
     name: 'read_email',
     description:
       'Read-only access to your own connected email accounts (Gmail, Outlook): search, list a folder, or get messages by ID. ' +
-      "Requires an API key with the 'email:read' scope. Cannot send or reply, and cannot read mailboxes shared by teammates.",
+      "Available when signed in to Emma (OAuth) or with an API key holding 'email:read'. Cannot send or reply, and cannot read mailboxes shared by teammates.",
     inputSchema: {
       type: 'object',
       properties: {

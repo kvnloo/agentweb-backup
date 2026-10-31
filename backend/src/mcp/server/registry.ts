@@ -164,9 +164,9 @@ export class McpToolRegistry {
     // every POST); this is the second line, keyed on the session's auth method,
     // so an OAuth/anonymous external caller can never reach the handler even if
     // the HTTP-layer check were bypassed or a session were reused.
-    if (handler.requiredScope && context?.externalMcp === true && context?.authMethod !== 'api_key') {
+    if (handler.requiredScope && context?.externalMcp === true && context?.authMethod !== 'api_key' && context?.authMethod !== 'oauth') {
       throw new Error(
-        `Tool ${name} is only available to API keys granted the '${handler.requiredScope}' scope.`
+        `Tool ${name} requires signing in to Emma (OAuth).`
       );
     }
 
