@@ -509,7 +509,18 @@ async function checkExitConditions(
   // 'opened' and 'clicked': a sequence set to stop when a lead REPLIED kept on sending.
   if (exitConditions.onEmailEngagement?.length) {
     const user = await userDb.getUserById(enrollment.userId).catch(() => null);
-    const emailDomain = (user as any)?.emailDomain;
+    // Opslane run 1268 P2: CRM sending domains live in emailDomains[] (ENG-265); the
+    // legacy single emailDomain may be empty for accounts set up after that. Read events
+    // for every domain the account sends from, deduped.
+    const domainSet = new Set<string>();
+    const legacyDomain = String((user as any)?.emailDomain ?? '').trim();
+    if (legacyDomain) domainSet.add(legacyDomain);
+    for (const d of ((user as any)?.emailDomains ?? []) as Array<{ domain?: string }>) {
+      const name = String(d?.domain ?? '').trim();
+      if (name) domainSet.add(name);
+    }
+    const emailDomains = [...domainSet];
+    const emailDomain = emailDomains[0];
 
     // A mailbox-only sender (Gmail/Outlook) has no Resend domain, and Resend webhooks are
     // the only source of these events — so there is nothing to find. Skip rather than
@@ -517,7 +528,7 @@ async function checkExitConditions(
     if (!emailDomain) {
       console.log(
         `[dripWorker] Skipping engagement exit check for enrollment ${enrollment.enrollmentId}: ` +
-        `user ${enrollment.userId} has no emailDomain, so no email events exist`,
+        `user ${enrollment.userId} has no sending domain, so no email events exist`,
       );
     } else {
       // Keyed on the address Resend actually saw, not on the enrollment identity. For a
@@ -525,9 +536,13 @@ async function checkExitConditions(
       // matched nothing and a sequence set to stop on 'replied' kept sending to someone
       // who had already replied. `lead` is loaded above for the unsubscribe check.
       const engagementKey = String((lead as any)?.email ?? '').trim() || enrollment.leadEmail;
-      const events = await emailEventsDb
-        .getEventsByEmailDomainAndLeadEmail(emailDomain, engagementKey)
-        .catch(() => []);
+      const events = (
+        await Promise.all(
+          emailDomains.map((d) =>
+            emailEventsDb.getEventsByEmailDomainAndLeadEmail(d, engagementKey).catch(() => []),
+          ),
+        )
+      ).flat();
 
       // Scope to engagement that happened AFTER this enrollment started.
       //
@@ -542,7 +557,9 @@ async function checkExitConditions(
       const wanted = exitConditions.onEmailEngagement;
       // ENG-2548: opens/clicks go through dripEngagementClassifier — link scanners and
       // image proxies no longer exit a lead. Replies always count.
-      const { trigger, suppressed } = selectEngagementExitTrigger(events, enrolledAt, wanted);
+      const { trigger, suppressed } = selectEngagementExitTrigger(events, enrolledAt, wanted, {
+        emailEverSent: !!(enrollment as any).lastEmailSentAt,
+      });
       for (const s of suppressed) {
         const detail = s.event?.data?.click || s.event?.data?.open || {};
         console.warn('[dripWorker] suspected_machine_engagement', JSON.stringify({
