@@ -10,7 +10,8 @@ import { tierFromCostScore, tierFromQualityScore } from './agentMode/modelClassi
 // only call site, generateImage, moved to emma/impl/mediaVideo.ts.
 import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 import { recordCreativeLearningReceipt } from './agentMode/adsLearning';
-import { enforceEvaluationTool, isEvaluationUser } from './evaluationPolicy';
+import { enforceEvaluationTool, isEvaluationUser, shouldOfferEvaluationWorkspace } from './evaluationPolicy';
+import { applyEvaluationWorkspaceListing } from './agentMode/evaluationWorkspaceListing';
 import { sandboxAwarePollDelayMs } from './agentMode/sandboxPolling';
 import { markSandboxRun, forgetSandboxRun, isSandboxRun, releaseSandboxRun } from './agentMode/sandboxTelemetry';
 import axios from 'axios';
@@ -4072,6 +4073,12 @@ export class AgentModeService {
           }
 
           // Exclude tools that are not applicable to the current context (e.g. get_visual_context on non-visual pages)
+          // ENG-1948: never offer evaluation_workspace to a principal that can only be denied.
+          if (filteredToolsCache) {
+            filteredToolsCache = applyEvaluationWorkspaceListing(filteredToolsCache, allowedToolNames,
+              shouldOfferEvaluationWorkspace({ userId, isAdmin, isDelegatedAccess, isInteractiveShare, isUnattendedRun }));
+          }
+
           if (excludeTools?.length && filteredToolsCache) {
             const excludeSet = new Set(excludeTools);
             filteredToolsCache = filteredToolsCache.filter((t: any) => !excludeSet.has(t.function?.name));
@@ -7606,6 +7613,10 @@ export class AgentModeService {
         console.warn('[AgentMode] H-VOICE publish tool augment skipped (non-fatal):', voiceToolErr);
       }
     }
+
+    // ENG-1948: mirror the main turn handler's evaluation_workspace listing filter.
+    tools = applyEvaluationWorkspaceListing(tools, allowedToolNames,
+      shouldOfferEvaluationWorkspace({ userId, isAdmin, isDelegatedAccess: input.isDelegatedAccess, isInteractiveShare: input.isInteractiveShare }));
 
     if (input.excludeTools?.length) {
       const excludeSet = new Set(input.excludeTools);

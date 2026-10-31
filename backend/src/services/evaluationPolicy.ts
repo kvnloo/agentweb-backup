@@ -96,6 +96,20 @@ export async function enforceEvaluationTool(userId: unknown, name: string, extra
   }
 }
 
+/**
+ * ENG-1948: whether `evaluation_workspace` should be offered in a tool list at all. Only a
+ * direct, attended admin can ever pass `requireEvaluationAdmin` (reviewers are assigned admins'
+ * peers reached the same way), so offering it to delegated, shared, unattended/scheduled,
+ * non-admin or sandbox principals only produces guaranteed `EvaluationDenied` turns. This is a
+ * listing filter only; the execute-time checks above/below stay authoritative.
+ */
+export function shouldOfferEvaluationWorkspace(input: {
+  userId: string; isAdmin: boolean; isDelegatedAccess?: boolean; isInteractiveShare?: boolean; isUnattendedRun?: boolean;
+}): boolean {
+  return input.isAdmin === true && !isEvaluationUser(input.userId) && input.isDelegatedAccess !== true &&
+    input.isInteractiveShare !== true && input.isUnattendedRun !== true;
+}
+
 /** Lifecycle mutations require a current app/Emma administrator, never ambient MCP authority. */
 export async function requireEvaluationAdmin(userId: string, context?: Record<string, unknown>) {
   if (isEvaluationUser(userId) || context?.externalMcp || context?.isInternal || context?.delegateInfo ||
