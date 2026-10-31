@@ -1923,6 +1923,95 @@ describe('apiTools', () => {
       });
     });
 
+    // ENG-758: optional month breakdown from the existing itemized ledger, never dollars.
+    it('returns a usage_breakdown (tokens/calls by model and day, sessions) without USD when usage_month is set', async () => {
+      mockMcpFetch.mockImplementation(async (opts: any) => {
+        if (opts.path === '/api/auth/me') return meResponse;
+        if (opts.path === '/api/v1/agent/api-keys') return { keys: [] };
+        if (opts.path === '/api/subscription/usage/itemized?month=2026-10') {
+          return {
+            month: '2026-10',
+            precision: 'per_charge',
+            items: [
+              { date: '2026-10-02', model: 'claude-sonnet', tokens: 1000, calls: 2, costMicroUsd: 987654, sessionId: 's1', source: 'charge_event' },
+              { date: '2026-10-02', model: 'gpt-mini', tokens: 300, calls: 1, costMicroUsd: 11, sessionId: 's2', source: 'charge_event' },
+              { date: '2026-10-01', model: 'claude-sonnet', tokens: 500, calls: 1, costMicroUsd: 22, sessionId: 's1', source: 'charge_event' },
+            ],
+          };
+        }
+        throw new Error(`Unexpected path: ${opts.path}`);
+      });
+
+      const result = await mcpToolRegistry.execute('get_account_status', { usage_month: '2026-10' }, context);
+      const text = (result as any).content[0].text;
+      const parsed = JSON.parse(text);
+
+      expect(parsed.usage_breakdown).toEqual({
+        month: '2026-10',
+        totals: { tokens: 1800, calls: 4 },
+        by_model: [
+          { model: 'claude-sonnet', tokens: 1500, calls: 3 },
+          { model: 'gpt-mini', tokens: 300, calls: 1 },
+        ],
+        by_day: [
+          { date: '2026-10-01', tokens: 500, calls: 1 },
+          { date: '2026-10-02', tokens: 1300, calls: 3 },
+        ],
+        sessions: { count: 2, exact: true },
+        precision: 'per_charge',
+      });
+      expect(text).not.toContain('costMicroUsd');
+      expect(text).not.toContain('987654');
+    });
+
+    it('reports the session count as a lower bound when daily aggregates lack session ids', async () => {
+      mockMcpFetch.mockImplementation(async (opts: any) => {
+        if (opts.path === '/api/auth/me') return meResponse;
+        if (opts.path === '/api/v1/agent/api-keys') return { keys: [] };
+        if (opts.path.startsWith('/api/subscription/usage/itemized')) {
+          return {
+            precision: 'mixed',
+            items: [
+              { date: '2026-09-03', model: 'm', tokens: 10, calls: 1, sessionId: 's1' },
+              { date: '2026-09-04', model: 'm', tokens: 90, calls: 5, source: 'daily_aggregate' },
+            ],
+          };
+        }
+        throw new Error(`Unexpected path: ${opts.path}`);
+      });
+
+      const parsed = JSON.parse((await mcpToolRegistry.execute('get_account_status', { usage_month: '2026-09' }, context) as any).content[0].text);
+      expect(parsed.usage_breakdown.sessions.count).toBe(1);
+      expect(parsed.usage_breakdown.sessions.exact).toBe(false);
+      expect(parsed.usage_breakdown.totals).toEqual({ tokens: 100, calls: 6 });
+    });
+
+    it('rejects a malformed usage_month in-band and does not read the ledger', async () => {
+      mockMcpFetch.mockImplementation(async (opts: any) => {
+        if (opts.path === '/api/auth/me') return meResponse;
+        if (opts.path === '/api/v1/agent/api-keys') return { keys: [] };
+        throw new Error(`Unexpected path: ${opts.path}`);
+      });
+
+      const parsed = JSON.parse((await mcpToolRegistry.execute('get_account_status', { usage_month: '2026-13' }, context) as any).content[0].text);
+      expect(parsed.usage_breakdown_error).toBe('usage_month must be YYYY-MM');
+      expect(parsed.subscription_plan).toBe('Pro');
+      expect(mockMcpFetch.mock.calls.some((c: any[]) => String(c[0].path).includes('itemized'))).toBe(false);
+    });
+
+    it('keeps the status read when the usage ledger read fails', async () => {
+      mockMcpFetch.mockImplementation(async (opts: any) => {
+        if (opts.path === '/api/auth/me') return meResponse;
+        if (opts.path === '/api/v1/agent/api-keys') return { keys: [] };
+        throw new Error('ledger down');
+      });
+
+      const parsed = JSON.parse((await mcpToolRegistry.execute('get_account_status', { usage_month: '2026-10' }, context) as any).content[0].text);
+      expect(parsed.subscription_plan).toBe('Pro');
+      expect(parsed.usage_breakdown).toBeUndefined();
+      expect(parsed.usage_breakdown_error).toBe('Usage data is temporarily unavailable');
+    });
+
     it('should never leak sensitive raw fields (password, stripe_customer_id) into the output', async () => {
       mockMcpFetch.mockImplementation(async (opts: any) => {
         if (opts.path === '/api/auth/me') return meResponse;
