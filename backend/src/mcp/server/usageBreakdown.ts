@@ -57,6 +57,7 @@ export function summarizeItemizedUsage(payload: ItemizedUsagePayload, month: str
   const byDay = new Map<string, UsageTotals>();
   const sessions = new Set<string>();
   let hasUnattributed = false;
+  let hasAggregate = false;
   const totals: UsageTotals = { tokens: 0, calls: 0 };
 
   for (const item of items) {
@@ -65,9 +66,14 @@ export function summarizeItemizedUsage(payload: ItemizedUsagePayload, month: str
     totals.tokens += tokens;
     totals.calls += calls;
     add(byModel, item?.model || 'unknown', tokens, calls);
-    add(byDay, item?.date || 'unknown', tokens, calls);
+    // Per-charge rows carry full ISO timestamps; bucket every row by calendar day.
+    const day = typeof item?.date === 'string' && /^\d{4}-\d{2}-\d{2}/.test(item.date) ? item.date.slice(0, 10) : 'unknown';
+    add(byDay, day, tokens, calls);
     if (item?.sessionId) sessions.add(item.sessionId);
-    else if (tokens > 0 || calls > 0) hasUnattributed = true;
+    else if (tokens > 0 || calls > 0) {
+      hasUnattributed = true;
+      if (item?.source === 'daily_aggregate') hasAggregate = true;
+    }
   }
 
   const exact = !hasUnattributed;
@@ -85,7 +91,9 @@ export function summarizeItemizedUsage(payload: ItemizedUsagePayload, month: str
       : {
           count: sessions.size,
           exact: false,
-          note: 'Lower bound: some usage is stored as daily aggregates without session ids.',
+          note: hasAggregate
+            ? 'Lower bound: some usage is stored as daily aggregates without session ids.'
+            : 'Lower bound: some usage records carry no session id.',
         },
     precision: payload?.precision ?? 'unknown',
   };

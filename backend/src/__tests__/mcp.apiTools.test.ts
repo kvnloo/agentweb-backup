@@ -1986,6 +1986,33 @@ describe('apiTools', () => {
       expect(parsed.usage_breakdown.totals).toEqual({ tokens: 100, calls: 6 });
     });
 
+    it('buckets per-charge timestamps into one row per calendar day and words the note neutrally without aggregates', async () => {
+      mockMcpFetch.mockImplementation(async (opts: any) => {
+        if (opts.path === '/api/auth/me') return meResponse;
+        if (opts.path === '/api/v1/agent/api-keys') return { keys: [] };
+        if (opts.path.startsWith('/api/subscription/usage/itemized')) {
+          return {
+            precision: 'per_charge',
+            items: [
+              { date: '2026-09-02T10:00:00.000Z', model: 'm', tokens: 1200, calls: 2, source: 'charge_event' },
+              { date: '2026-09-02T11:30:00.000Z', model: 'm', tokens: 300, calls: 1, source: 'charge_event' },
+              { date: '2026-09-02', model: 'm', tokens: 0, calls: 0, source: 'charge_event' },
+              { date: '2026-09-03T08:15:00.000Z', model: 'm', tokens: 500, calls: 1, source: 'charge_event' },
+            ],
+          };
+        }
+        throw new Error(`Unexpected path: ${opts.path}`);
+      });
+
+      const parsed = JSON.parse((await mcpToolRegistry.execute('get_account_status', { usage_month: '2026-09' }, context) as any).content[0].text);
+      expect(parsed.usage_breakdown.by_day).toEqual([
+        { date: '2026-09-02', tokens: 1500, calls: 3 },
+        { date: '2026-09-03', tokens: 500, calls: 1 },
+      ]);
+      expect(parsed.usage_breakdown.sessions.exact).toBe(false);
+      expect(parsed.usage_breakdown.sessions.note).not.toContain('daily aggregates');
+    });
+
     it('rejects a malformed usage_month in-band and does not read the ledger', async () => {
       mockMcpFetch.mockImplementation(async (opts: any) => {
         if (opts.path === '/api/auth/me') return meResponse;
