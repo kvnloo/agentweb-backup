@@ -545,6 +545,12 @@ router.get(
   isAdmin,
   async (req: AuthRequest, res: Response) => {
     try {
+      for (const key of ["email", "userId"] as const) {
+        const raw = req.query[key];
+        if (raw !== undefined && typeof raw !== "string") {
+          return res.status(400).json({ error: `${key} must be a single string value` });
+        }
+      }
       const email = typeof req.query.email === "string" ? req.query.email.trim().toLowerCase() : "";
       let userId = typeof req.query.userId === "string" ? req.query.userId.trim() : "";
       if (!email && !userId) return res.status(400).json({ error: "email or userId is required" });

@@ -96,6 +96,7 @@ describe('ENG-2771 GET /api/admin/usage/enforcement', () => {
     mockById.mockResolvedValue(null);
     expect((await request(app).get('/api/admin/usage/enforcement?userId=ghost-1')).status).toBe(404);
     expect((await request(app).get('/api/admin/usage/enforcement?userId=u-9&email=a@x.com')).status).toBe(400);
+    expect((await request(app).get('/api/admin/usage/enforcement?email=a@x.com&email=b@x.com&userId=u-9')).status).toBe(400);
     expect(mockResolve).not.toHaveBeenCalled();
     expect(mockCheck).not.toHaveBeenCalled();
   });
