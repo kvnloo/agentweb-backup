@@ -321,16 +321,17 @@ export function setupMcpServer(
         });
       }
     }
-    // Opt-in-scope tools (e.g. read_email / email:read) are for explicitly scoped
-    // aw_ keys only — refuse every other external auth method per request.
-    if ((req as any)._mcpIsInternal !== true && (req as any)._mcpAuthMethod !== 'api_key') {
+    // Opt-in-scope tools (e.g. read_email / email:read): aw_ keys need the scope
+    // explicitly (checked above); signed-in OAuth users get the same access as a
+    // fully scoped key (OAuth parity, 2026-10-31). Anonymous callers are refused.
+    if ((req as any)._mcpIsInternal !== true && !['api_key', 'oauth'].includes((req as any)._mcpAuthMethod)) {
       const denial = findApiKeyOnlyToolCall(req.body, (name) => mcpToolRegistry.getTool(name));
       if (denial) {
         return res.status(403).json({
           jsonrpc: '2.0',
           error: {
             code: -32003,
-            message: `Forbidden: tool '${denial.tool}' is only available to API keys granted the '${denial.requiredScope}' scope.`,
+            message: `Forbidden: tool '${denial.tool}' requires signing in to Emma (OAuth).`,
           },
           id: Array.isArray(req.body) ? null : (req.body?.id ?? null),
         });

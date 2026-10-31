@@ -37,6 +37,7 @@ import './reviewSiteTool';
 // ENG-983: progressive disclosure — tools/list returns the workflow layer plus
 // emma_search_tools; the granular catalogue stays callable and discoverable.
 import { getListedToolDefinitions } from './toolDiscovery';
+import { API_KEY_SCOPE_EMAIL_READ } from './apiKeyScopes';
 import { sanitizePublicToolResult, shouldSanitizePublicResponse } from './publicResponseSanitizer';
 
 export interface McpSessionContext {
@@ -93,7 +94,11 @@ export function createMcpServer(serverName: string = "Emma - GTM Automation Spec
    * Tool descriptions guide proper usage.
    */
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    return { tools: getListedToolDefinitions(sessionContext?.authMethod === 'api_key' ? sessionContext.apiKeyScopes : undefined) };
+    return { tools: getListedToolDefinitions(
+      sessionContext?.authMethod === 'api_key' ? sessionContext.apiKeyScopes
+        : sessionContext?.authMethod === 'oauth' ? [API_KEY_SCOPE_EMAIL_READ]
+        : undefined
+    ) };
   });
   /**
    * Handler for tool execution.
