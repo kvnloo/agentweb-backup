@@ -1526,16 +1526,24 @@ export class LinkedInOutreachService {
         if (!lookupId) {
           throw new Error(`Could not read a LinkedIn post id from "${postId}". Pass a post URL, a urn:li:activity:… URN, or a Unipile social id.`);
         }
-        const post = await client.users.getPost({ account_id: accountId, post_id: lookupId });
+        const post: any = await LinkedInOutreachService.withTimeout(
+          client.users.getPost({ account_id: accountId, post_id: lookupId }),
+          LinkedInOutreachService.PROFILE_LOOKUP_TIMEOUT_MS,
+          'getPost',
+        );
         socialId = post.social_id;
       }
       this.log(`Listing post comments: ${socialId}`, { accountId, cursor: opts.cursor });
-      const result = await client.users.getAllPostComments({
-        account_id: accountId,
-        post_id: socialId,
-        ...(opts.limit ? { limit: opts.limit } : {}),
-        ...(opts.cursor ? { cursor: opts.cursor } : {}),
-      });
+      const result: any = await LinkedInOutreachService.withTimeout(
+        client.users.getAllPostComments({
+          account_id: accountId,
+          post_id: socialId,
+          ...(opts.limit ? { limit: opts.limit } : {}),
+          ...(opts.cursor ? { cursor: opts.cursor } : {}),
+        }),
+        LinkedInOutreachService.PROFILE_LOOKUP_TIMEOUT_MS,
+        'getAllPostComments',
+      );
       return { socialId, items: Array.isArray(result?.items) ? result.items : [], cursor: result?.cursor ?? null };
     } catch (error: any) {
       return this.handleError(error, 'listPostComments');

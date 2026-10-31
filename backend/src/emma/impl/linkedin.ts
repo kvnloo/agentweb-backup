@@ -2150,7 +2150,7 @@ export async function linkedinOutreach(
         const postId = typeof args.post_id === 'string' ? args.post_id.trim() : '';
         if (!postId) throw new Error('post_id is required for list-post-engagers (a LinkedIn post URL, urn:li:activity:… URN, or Unipile social id)');
         const rawLimit = Number(args.limit);
-        const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.floor(rawLimit), 100) : undefined;
+        const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.max(Math.floor(rawLimit), 1), 100) : undefined;
         const comments = await linkedInOutreachService.listPostComments(postId, account_id, { cursor: args.cursor, limit });
         const seen = new Set<string>();
         const engagers: any[] = [];
