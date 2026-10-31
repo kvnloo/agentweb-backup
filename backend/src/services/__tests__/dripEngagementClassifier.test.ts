@@ -94,6 +94,16 @@ describe('classifyEngagementEvent (ENG-2538)', () => {
       classifyEngagementEvent({ type: 'click', occurredAt: at(601), sentAt: SENT, userAgent: CHROME, link: 'c', priorEvents: prior }).human,
     ).toBe(true);
   });
+
+  it('Google proxy clicks do not count toward a burst', () => {
+    const prior = [
+      { type: 'click' as const, occurredAt: at(600), link: 'a', userAgent: 'GoogleImageProxy' },
+      { type: 'click' as const, occurredAt: at(600.5), link: 'b', userAgent: 'via ggpht.com' },
+    ];
+    expect(
+      classifyEngagementEvent({ type: 'click', occurredAt: at(601), sentAt: SENT, userAgent: CHROME, link: 'c', priorEvents: prior }).human,
+    ).toBe(true);
+  });
 });
 
 describe('shouldExitSequence (ENG-2538)', () => {

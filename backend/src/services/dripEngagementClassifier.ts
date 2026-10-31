@@ -121,7 +121,12 @@ export function classifyEngagementEvent(
     const all: EngagementEvent[] = [...(input.priorEvents ?? []), input];
     for (const e of all) {
       if (e.type !== 'click' || !e.link) continue;
-      if (e !== input && matchesAny(e.userAgent, SCANNER_USER_AGENT_PATTERNS)) continue;
+      if (
+        e !== input &&
+        (matchesAny(e.userAgent, SCANNER_USER_AGENT_PATTERNS) ||
+          matchesAny(e.userAgent, CLICK_ONLY_SCANNER_USER_AGENT_PATTERNS))
+      )
+        continue;
       const t = toMs(e.occurredAt);
       if (Number.isFinite(t) && Math.abs(at - t) <= opts.burstWindowMs) links.add(e.link);
     }
