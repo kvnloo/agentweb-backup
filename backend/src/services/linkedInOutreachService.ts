@@ -1520,8 +1520,8 @@ export class LinkedInOutreachService {
   ): Promise<{ socialId: string; items: any[]; cursor: string | null }> {
     try {
       const client = await this.getClient();
-      let socialId = LinkedInOutreachService.extractPostUrn(postId);
-      if (!socialId) {
+      let resolvedId = LinkedInOutreachService.extractPostUrn(postId);
+      if (!resolvedId) {
         const lookupId = LinkedInOutreachService.extractPostLookupId(postId);
         if (!lookupId) {
           throw new Error(`Could not read a LinkedIn post id from "${postId}". Pass a post URL, a urn:li:activity:… URN, or a Unipile social id.`);
@@ -1531,8 +1531,12 @@ export class LinkedInOutreachService {
           LinkedInOutreachService.PROFILE_LOOKUP_TIMEOUT_MS,
           'getPost',
         );
-        socialId = post.social_id;
+        resolvedId = typeof post?.social_id === 'string' ? post.social_id : null;
       }
+      if (!resolvedId) {
+        throw new Error(`Unipile returned no social id for LinkedIn post "${postId}".`);
+      }
+      const socialId: string = resolvedId;
       this.log(`Listing post comments: ${socialId}`, { accountId, cursor: opts.cursor });
       const result: any = await LinkedInOutreachService.withTimeout(
         client.users.getAllPostComments({
