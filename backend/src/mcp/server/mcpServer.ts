@@ -275,6 +275,7 @@ export function setupMcpServer(
       clientType: sessionEntry?.clientType || (req as any)?._mcpClientType,
       userAgent: sessionEntry?.userAgent || req?.get('user-agent'),
       clientIp: req?.ip,
+      apiKeyScopes: (req as any)?._mcpApiKeyScopes,
     });
   };
 
@@ -365,6 +366,7 @@ export function setupMcpServer(
           oauthClientName: (req as any)._mcpOAuthClientName,
           clientType: (req as any)._mcpClientType as McpClientType | undefined,
           userAgent: req.get('user-agent'),
+          apiKeyScopes: (req as any)._mcpApiKeyScopes as string[] | undefined,
           sessionId: undefined as string | undefined,
         };
 
