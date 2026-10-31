@@ -43,9 +43,23 @@ export function listedToolNames(): string[] {
   ];
 }
 
-/** What an external client sees in `tools/list`. */
-export function getListedToolDefinitions(): any[] {
+/**
+ * Tools listed only for an aw_ key that explicitly holds their opt-in scope.
+ * Most MCP clients can only call tools that appear in tools/list, so a scope
+ * grant is useless unless the gated tool (and what it needs) is listed too.
+ * Listing is still not authorization: the scope gate in mcpServer.ts and
+ * registry.execute() decides every call.
+ */
+const SCOPE_LISTED_TOOL_NAMES: Record<string, string[]> = {
+  'email:read': ['read_email', 'list_connected_accounts'],
+};
+
+/** What an external client sees in `tools/list`. `grantedScopes` is set only for api_key sessions. */
+export function getListedToolDefinitions(grantedScopes?: string[]): any[] {
   const listed = new Set(listedToolNames());
+  for (const scope of grantedScopes ?? []) {
+    for (const name of SCOPE_LISTED_TOOL_NAMES[scope] ?? []) listed.add(name);
+  }
   return mcpToolRegistry.getToolDefinitions().filter((d: any) => listed.has(d.name));
 }
 

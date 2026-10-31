@@ -51,6 +51,8 @@ export interface McpSessionContext {
   userAgent?: string;
   /** Caller address at session creation (req.ip, trust-proxy aware). Used only to rate-limit anonymous calls (ENG-1034). */
   clientIp?: string;
+  /** Effective scopes of the authenticating aw_ key (api_key auth only). Drives which opt-in tools tools/list shows. */
+  apiKeyScopes?: string[];
 }
 
 /**
@@ -91,7 +93,7 @@ export function createMcpServer(serverName: string = "Emma - GTM Automation Spec
    * Tool descriptions guide proper usage.
    */
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    return { tools: getListedToolDefinitions() };
+    return { tools: getListedToolDefinitions(sessionContext?.authMethod === 'api_key' ? sessionContext.apiKeyScopes : undefined) };
   });
   /**
    * Handler for tool execution.
