@@ -1522,11 +1522,11 @@ export class LinkedInOutreachService {
       const client = await this.getClient();
       let socialId = LinkedInOutreachService.extractPostUrn(postId);
       if (!socialId) {
-        const numericId = LinkedInOutreachService.extractPostNumericId(postId);
-        if (!numericId) {
+        const lookupId = LinkedInOutreachService.extractPostLookupId(postId);
+        if (!lookupId) {
           throw new Error(`Could not read a LinkedIn post id from "${postId}". Pass a post URL, a urn:li:activity:… URN, or a Unipile social id.`);
         }
-        const post = await client.users.getPost({ account_id: accountId, post_id: numericId });
+        const post = await client.users.getPost({ account_id: accountId, post_id: lookupId });
         socialId = post.social_id;
       }
       this.log(`Listing post comments: ${socialId}`, { accountId, cursor: opts.cursor });
@@ -1548,9 +1548,15 @@ export class LinkedInOutreachService {
     return decoded.match(/urn:li:(?:activity|ugcPost|share):\d+/)?.[0] ?? null;
   }
 
-  private static extractPostNumericId(postId: string): string | null {
+  /**
+   * Id for Unipile `getPost`: numeric for `activity-<n>` URLs / bare numbers;
+   * `ugcPost-<n>` and `share-<n>` URLs need their documented URN form.
+   */
+  private static extractPostLookupId(postId: string): string | null {
     const trimmed = postId.trim();
     if (/^\d+$/.test(trimmed)) return trimmed;
+    const typed = trimmed.match(/(ugcPost|share)-(\d+)/);
+    if (typed) return `urn:li:${typed[1]}:${typed[2]}`;
     return trimmed.match(/activity-(\d+)/)?.[1] ?? null;
   }
 

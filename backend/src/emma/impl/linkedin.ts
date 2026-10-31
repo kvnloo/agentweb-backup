@@ -2169,7 +2169,12 @@ export async function linkedinOutreach(
           seen.add(providerId);
           const text = typeof comment.text === 'string' ? comment.text : '';
           engagers.push({
-            name: comment.author ?? null,
+            // `comment.author` can be a URN, not a display name — only surface a real name.
+            name: typeof details.name === 'string' && details.name.trim()
+              ? details.name.trim()
+              : typeof comment.author === 'string' && comment.author.trim() && !comment.author.startsWith('urn:')
+                ? comment.author.trim()
+                : null,
             headline: details.headline ?? null,
             profile_url: profileUrl,
             provider_id: providerId,
