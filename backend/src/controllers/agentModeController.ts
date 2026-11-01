@@ -90,6 +90,7 @@ import {
   isRunStoreEnabled,
   interactiveIdempotencyKey,
   createSessionIdempotencyKey,
+  planSessionIdempotencyKey,
   claimIdempotency,
   releaseIdempotency,
   recordIdempotencySessionId,
@@ -17269,9 +17270,10 @@ export const agentModeController = {
       // user). Anonymous callers get a fresh random userId per call, so a key could never replay:
       // they are excluded. Flag off / no key = today's exact behaviour.
       if (result.user && isRunStoreEnabled() && typeof idempotencyKey === 'string' && idempotencyKey.length > 0) {
-        const idemKey = createSessionIdempotencyKey(
+        const idemKey = planSessionIdempotencyKey(
           userId,
-          `plan|${normalizeWorkPlanTitleForMatch(planTitle)}|${idempotencyKey}`,
+          normalizeWorkPlanTitleForMatch(planTitle),
+          idempotencyKey,
         );
         const claim = await claimIdempotency(idemKey, uuidv4(), IDEM_TTL_INTERACTIVE_S);
         if (!claim.claimed) {
