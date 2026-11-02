@@ -111,7 +111,7 @@ export class ClusterIntakeTool implements MutationTools<Payload> {
     alertClass: string,
     payload: AgentFailureProposalPayload,
     context: Record<string, string>,
-  ): Promise<FiledAutoResult | null> {
+  ): Promise<(FiledAutoResult & { reopened?: boolean }) | null> {
     const matches = classMatcher(alertClass);
     let closed: CanonicalRef | null;
     try {
