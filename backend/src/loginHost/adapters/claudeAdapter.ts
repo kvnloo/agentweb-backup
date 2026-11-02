@@ -165,8 +165,9 @@ export class RunnerChildAdapter extends EventEmitter implements RunnerChild {
   private pipesClosed = false;
   /** After a plain kill: keep reading the child's output, discard it unparsed and uncharged. */
   private drain(): void {
-    (this.stdout as LineLimit).discard();
-    (this.stderr as StderrGuard).discard();
+    const trip = (): void => this.closePipes();
+    (this.stdout as LineLimit).discard(new DrainAccount(trip));
+    (this.stderr as StderrGuard).discard(new DrainAccount(trip));
   }
   /**
    * Stops reading the child's pipes FOR GOOD. In production the kill is `systemctl stop` (SIGTERM, up to 10 s of grace, then SIGKILL): a writer that survives it keeps
@@ -217,15 +218,40 @@ export class RunnerChildAdapter extends EventEmitter implements RunnerChild {
 
 const NEWLINE = Buffer.from("\n");
 
+/**
+ * Accounting for the output of a child that has been PLAIN-killed (normal close, idle retirement): it is still read and dropped, unparsed (so a CLI winding down
+ * never gets EPIPE), but a writer that ignores SIGTERM for the whole grace period (up to 10 s) must not be free. Cheap numbers only, far above anything a graceful
+ * shutdown writes (a few KiB in a handful of reads): 500 reads burst (refill 200/s), 4 MiB burst (refill 64 KiB/s), and a 300 ms meter charged the fixed per-read cost
+ * (refill 20 ms/s). Past any of them the pipes are closed, exactly as a guard trip does (the process is already being stopped: nothing is reported).
+ */
+export const DRAIN_READ_BURST = 500;
+export const DRAIN_BYTE_BURST = 4 * 1024 * 1024;
+export class DrainAccount {
+  private readonly reads = new TokenBucket(DRAIN_READ_BURST, READS_PER_SEC);
+  private readonly bytes = new TokenBucket(DRAIN_BYTE_BURST, 64 * 1024);
+  private readonly meter = new CpuMeter(300, 20);
+  private done = false;
+  constructor(private readonly trip: () => void) {}
+  /** Charges one read of `len` bytes. */
+  charge(len: number): void {
+    if (this.done) return;
+    this.meter.charge(READ_COST_MS);
+    if (this.meter.exhausted || !this.reads.take() || !this.bytes.take(len)) {
+      this.done = true;
+      this.trip();
+    }
+  }
+}
+
 /** The child's stderr, metered and bounded before the runner (which concatenates a tail per chunk) sees it. */
 export class StderrGuard extends Transform {
   private readonly tail: Buffer = Buffer.alloc(STDERR_FORWARD_CAP);
   private tailLen = 0;
   private tripped = false;
-  private discarding = false;
-  /** Stop recording and charging: whatever the child still writes is read and dropped (what was kept is still delivered at the end). */
-  discard(): void {
-    this.discarding = true;
+  private drain: DrainAccount | undefined;
+  /** Stop recording: whatever the child still writes is read, counted (see DrainAccount) and dropped (what was kept is still delivered at the end). */
+  discard(account: DrainAccount): void {
+    this.drain = account;
   }
   private readonly reads = new TokenBucket(READ_BURST, READS_PER_SEC);
   private readonly bytes = new TokenBucket(1024 * 1024, 64 * 1024);
@@ -236,7 +262,10 @@ export class StderrGuard extends Transform {
     super();
   }
   override _transform(chunk: Buffer, _enc: BufferEncoding, cb: (err?: Error | null, data?: Buffer) => void): void {
-    if (this.discarding) return cb();
+    if (this.drain) {
+      this.drain.charge(chunk.length);
+      return cb();
+    }
     if (this.tripped || this.meter.exhausted) return cb();
     this.meter.charge(READ_COST_MS);
     this.meter.time(() => {
@@ -394,13 +423,16 @@ export class LineLimit extends Transform {
    * Every chunk is metered: the WHOLE synchronous section is timed, including the downstream push (readline, the runner's JSON.parse and the session's callbacks all run
    * inside it), so what the unit makes the host do is what is charged, however it made it expensive.
    */
-  private discarding = false;
-  /** Stop parsing and charging: whatever the child still writes is read and dropped. */
-  discard(): void {
-    this.discarding = true;
+  private drain: DrainAccount | undefined;
+  /** Stop parsing: whatever the child still writes is read, counted (see DrainAccount) and dropped. */
+  discard(account: DrainAccount): void {
+    this.drain = account;
   }
   override _transform(chunk: Buffer, _enc: BufferEncoding, cb: (err?: Error | null, data?: Buffer) => void): void {
-    if (this.discarding) return cb();
+    if (this.drain) {
+      this.drain.charge(chunk.length);
+      return cb();
+    }
     if (this.tripped || this.meter.exhausted) return cb();
     this.meter.charge(READ_COST_MS);
     if (!this.reads.take()) return this.stop(cb, this.onFlood);
