@@ -21,6 +21,7 @@ import {
   interactiveIdempotencyKey,
   scheduledIdempotencyKey,
   createSessionIdempotencyKey,
+  planSessionIdempotencyKey,
   isRunStoreEnabled,
   IDEM_TTL_INTERACTIVE_S,
   IDEM_TTL_SCHEDULED_S,
@@ -330,6 +331,14 @@ describe('runStore', () => {
   });
 
   describe('session-creation idempotency (ENG-147 storm seam)', () => {
+    it('planSessionIdempotencyKey never collides with a createSession client key (ENG-2773)', () => {
+      const plan = planSessionIdempotencyKey('u1', 'my plan', 'k');
+      expect(plan).toBe(planSessionIdempotencyKey('u1', 'my plan', 'k'));
+      expect(plan).not.toBe(createSessionIdempotencyKey('u1', 'plan|my plan|k'));
+      expect(plan).not.toBe(createSessionIdempotencyKey('u1', 'my plan|k'));
+      expect(plan).not.toBe(planSessionIdempotencyKey('u2', 'my plan', 'k'));
+    });
+
     it('createSessionIdempotencyKey is a stable sha256 scoped by userId (no cross-user attach)', () => {
       const a = createSessionIdempotencyKey('u1', 'client-key-1');
       const b = createSessionIdempotencyKey('u1', 'client-key-1');

@@ -28,11 +28,19 @@ describe('classifyEngagementEvent (ENG-2538)', () => {
     ).toBe(true);
   });
 
-  it('image-proxy opens are proxy_open, even long after send', () => {
-    for (const ua of ['Mozilla/5.0 (via ggpht.com GoogleImageProxy)', 'AppleMailProxy/1.0']) {
-      expect(classifyEngagementEvent({ type: 'open', occurredAt: at(3600), sentAt: SENT, userAgent: ua }))
-        .toEqual({ human: false, reason: 'proxy_open' });
-    }
+  it('Apple MPP opens are proxy_open, even long after send', () => {
+    expect(classifyEngagementEvent({ type: 'open', occurredAt: at(3600), sentAt: SENT, userAgent: 'AppleMailProxy/1.0' }))
+      .toEqual({ human: false, reason: 'proxy_open' });
+  });
+
+  it('Gmail GoogleImageProxy opens are human when human-paced (ENG-325)', () => {
+    expect(classifyEngagementEvent({ type: 'open', occurredAt: at(3600), sentAt: SENT, userAgent: 'Mozilla/5.0 (via ggpht.com GoogleImageProxy)' }))
+      .toEqual({ human: true, reason: 'human' });
+  });
+
+  it('Gmail GoogleImageProxy opens inside the too-fast window are still non-human', () => {
+    expect(classifyEngagementEvent({ type: 'open', occurredAt: at(2), sentAt: SENT, userAgent: 'GoogleImageProxy' }))
+      .toEqual({ human: false, reason: 'too_fast' });
   });
 
   it.each(['Microsoft SafeLinks', 'Barracuda Sentinel', 'Proofpoint URL Defense', 'Mimecast-Scanner'])(
@@ -86,13 +94,23 @@ describe('classifyEngagementEvent (ENG-2538)', () => {
       classifyEngagementEvent({ type: 'click', occurredAt: at(601), sentAt: SENT, userAgent: CHROME, link: 'c', priorEvents: prior }).human,
     ).toBe(true);
   });
+
+  it('Google proxy clicks do not count toward a burst', () => {
+    const prior = [
+      { type: 'click' as const, occurredAt: at(600), link: 'a', userAgent: 'GoogleImageProxy' },
+      { type: 'click' as const, occurredAt: at(600.5), link: 'b', userAgent: 'via ggpht.com' },
+    ];
+    expect(
+      classifyEngagementEvent({ type: 'click', occurredAt: at(601), sentAt: SENT, userAgent: CHROME, link: 'c', priorEvents: prior }).human,
+    ).toBe(true);
+  });
 });
 
 describe('shouldExitSequence (ENG-2538)', () => {
   it('ignores bot events and exits on a human click', () => {
     const bots = [
       { type: 'open' as const, occurredAt: at(2), userAgent: CHROME },
-      { type: 'open' as const, occurredAt: at(400), userAgent: 'GoogleImageProxy' },
+      { type: 'open' as const, occurredAt: at(400), userAgent: 'AppleMailProxy/1.0' },
       { type: 'click' as const, occurredAt: at(500), userAgent: 'Proofpoint', link: 'a' },
     ];
     expect(shouldExitSequence(bots, SENT, { exitOnOpen: true, exitOnClick: true })).toBe(false);
