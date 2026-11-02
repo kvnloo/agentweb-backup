@@ -4,7 +4,7 @@ jest.mock('../services/tokenUsageService', () => ({
 }));
 import { checkTokenUsage } from '../services/tokenUsageService';
 import { resolveModelForUser } from '../services/modelRoles';
-import { buildEnrichmentBudgetCheck, estimateEnrichmentBatchMicroUsd, estimateEnrichmentRun, webFieldGuardUsd } from '../services/enrichmentBatchBudget';
+import { buildEnrichmentBudgetCheck, estimateEnrichmentBatchMicroUsd, projectAllowance, admissionEstimateMicroUsd, effectiveFieldCount, webFieldGuardUsd } from '../services/enrichmentBatchBudget';
 import type { EnrichmentConfig } from '../services/crmEnrichmentServiceV3';
 import { estimateEnrichmentCost } from '../services/enrichmentCostEstimate';
 const config: EnrichmentConfig = { fields: [], globalOverwriteDefault: 'fill_if_empty', schemaVersion: 1, updatedAt: '', updatedBy: '' };
@@ -35,33 +35,74 @@ it('fails closed if the month rolls between snapshot and forecast', async () => 
     .mockResolvedValueOnce({ allowed: true, month: '2026-11' });
   expect(await buildEnrichmentBudgetCheck('owner')({ config, leadCount: 20, phase: 'batch' })).toBe(false);
 });
-describe('estimateEnrichmentRun (ENG-2715)', () => {
-  const { estimateEnrichmentRun } = jest.requireActual('../services/enrichmentBatchBudget');
-  it('returns the cap-consistent estimate in dollars and never records admission', async () => {
-    check.mockReset().mockResolvedValue({ allowed: true, month: '2026-10' });
-    const out = await estimateEnrichmentRun('owner', config, 112);
-    const micro = estimateEnrichmentBatchMicroUsd(config, 112);
-    expect(out).toEqual({ leadCount: 112, estimatedCostUsd: Math.ceil(micro / 10_000) / 100, withinAllowance: true });
-    expect(out.estimatedCostUsd).toBeGreaterThan(0);
-    expect(check).toHaveBeenCalledTimes(1);
-    expect(check).toHaveBeenCalledWith('owner', { projectedCostMicroUsd: micro });
+describe('projectAllowance (ENG-2715/2720): a quote as percentage points of the allowance, never dollars', () => {
+  const status = (over: Record<string, unknown>) => ({ allowed: true, month: '2026-10', costAllowance: 100, costUsed: 10, costPercentUsed: 10, ...over });
+
+  it('reports the extra points the expected cost uses, and never records admission', async () => {
+    check.mockReset()
+      .mockResolvedValueOnce(status({ costUsed: 10 }))
+      .mockResolvedValueOnce(status({ costUsed: 12.34 }));
+    const out = await projectAllowance('owner', 2_340_000);
+    expect(out).toEqual({ percent: 2.3, withinAllowance: true });
+    expect(check).toHaveBeenCalledWith('owner');
+    expect(check).toHaveBeenCalledWith('owner', { projectedCostMicroUsd: 2_340_000 });
     expect(check.mock.calls.some(([, o]) => o?.recordAdmission)).toBe(false);
+    expect(JSON.stringify(out)).not.toMatch(/usd|cost/i);
   });
-  it('reports withinAllowance=false when the forecast exceeds the cap', async () => {
-    check.mockReset().mockResolvedValue({ allowed: false, month: '2026-10' });
-    expect((await estimateEnrichmentRun('owner', config, 20)).withinAllowance).toBe(false);
+
+  it('decides "within allowance" on the conservative reserve, not the expected cost', async () => {
+    check.mockReset().mockImplementation(async (_u: string, o?: { projectedCostMicroUsd?: number }) =>
+      status({ allowed: (o?.projectedCostMicroUsd ?? 0) < 5_000_000, costUsed: 10 + (o?.projectedCostMicroUsd ?? 0) / 1e6 }));
+    expect((await projectAllowance('owner', 1_000_000, 9_000_000)).withinAllowance).toBe(false);
+    expect((await projectAllowance('owner', 1_000_000, 2_000_000)).withinAllowance).toBe(true);
   });
-  it('zero leads costs nothing and skips the usage read', async () => {
+
+  it('keeps a small run visible instead of rounding it to a whole point (a $0.60 run on a $150 allowance)', async () => {
+    check.mockReset()
+      .mockResolvedValueOnce(status({ costAllowance: 150, costUsed: 20 }))
+      .mockResolvedValueOnce(status({ costAllowance: 150, costUsed: 20.6 }));
+    expect((await projectAllowance('owner', 600_000)).percent).toBe(0.4);
+    check.mockReset()
+      .mockResolvedValueOnce(status({ costAllowance: 1000, costUsed: 0 }))
+      .mockResolvedValueOnce(status({ costAllowance: 1000, costUsed: 0.6 }));
+    expect((await projectAllowance('owner', 600_000)).percent).toBe(0.06);
+  });
+
+  it('treats a zero-dollar allowance as fully used by any run', async () => {
+    check.mockReset()
+      .mockResolvedValueOnce(status({ costAllowance: 0, costUsed: 0 }))
+      .mockResolvedValueOnce(status({ costAllowance: 0, costUsed: 1 }));
+    expect((await projectAllowance('owner', 1_000_000)).percent).toBe(100);
+  });
+
+  it('returns null points for a plan with no dollar allowance', async () => {
+    check.mockReset().mockResolvedValue(status({ costAllowance: null, costUsed: 0, costPercentUsed: 0 }));
+    expect((await projectAllowance('owner', 1_000_000)).percent).toBeNull();
+  });
+
+  it('never goes negative and skips the usage read for a zero-cost quote', async () => {
+    check.mockReset().mockResolvedValueOnce(status({ costUsed: 50 })).mockResolvedValueOnce(status({ costUsed: 40 }));
+    expect((await projectAllowance('owner', 1_000_000)).percent).toBe(0);
     check.mockReset();
-    expect(await estimateEnrichmentRun('owner', config, 0)).toEqual({ leadCount: 0, estimatedCostUsd: 0, withinAllowance: true });
+    expect(await projectAllowance('owner', 0)).toEqual({ percent: 0, withinAllowance: true });
     expect(check).not.toHaveBeenCalled();
   });
-});
 
-// ENG-2720: admission used to reserve ~50x what a run books ($27.25 for 5 leads against a customer
-// estimate of $0.55): a phantom enrich.so phone_finder line, Enigma on every field, You.com four times
-// per field and a gpt-5.5-sized LLM band. These pin the two estimators to each other so a future
-// rate or model change cannot silently pull them apart again.
+  it('counts smart-field dependencies as fields, at least one', () => {
+    expect(effectiveFieldCount(config)).toBe(1);
+    const smart: EnrichmentConfig = { ...config, fields: [
+      { name: 'a', type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty', smartDependencies: ['x', 'y'] },
+      { name: 'b', type: 'string', instruction: '', include: false, overwritePolicy: 'fill_if_empty' },
+    ] };
+    expect(effectiveFieldCount(smart)).toBe(3);
+  });
+
+  it('admissionEstimateMicroUsd is zero for no leads and uses the resolved model otherwise', async () => {
+    expect(await admissionEstimateMicroUsd('owner', config, 0)).toBe(0);
+    (resolveModelForUser as jest.Mock).mockResolvedValue('gpt-5.5');
+    expect(await admissionEstimateMicroUsd('owner', config, 10)).toBe(estimateEnrichmentBatchMicroUsd(config, 10, 'gpt-5.5'));
+  });
+});
 describe('admission estimate tracks what a run books (ENG-2720)', () => {
   const withFields = (n: number, over: Record<string, unknown> = {}): EnrichmentConfig => ({
     ...config,
@@ -142,8 +183,7 @@ describe('admission estimate tracks what a run books (ENG-2720)', () => {
 
     it('stays conservative if the enrichment model cannot be resolved', async () => {
       (resolveModelForUser as jest.Mock).mockRejectedValue(new Error('db down'));
-      const out = await estimateEnrichmentRun('owner', withFields(10), 20);
-      expect(out.estimatedCostUsd).toBeGreaterThan(usd(withFields(10), 20));
+      expect(await admissionEstimateMicroUsd('owner', withFields(10), 20)).toBeGreaterThan(estimateEnrichmentBatchMicroUsd(withFields(10), 20));
     });
   });
 });

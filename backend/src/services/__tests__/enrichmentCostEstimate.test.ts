@@ -2,6 +2,7 @@ import {
   estimateEnrichmentCost,
   checkEstimateConfirmation,
   normalizeLeadSelection,
+  toCustomerEstimate,
   ENRICHMENT_COST_RATES_USD,
 } from '../enrichmentCostEstimate';
 import { getAllocatedRate } from '../../utils/vendorRateCard';
@@ -27,6 +28,37 @@ describe('estimateEnrichmentCost (ENG-2716)', () => {
     expect(rate).toBeCloseTo(0.099, 6);
     const e = estimateEnrichmentCost('l', 112);
     expect(e.breakdownUsd.apollo).toBeCloseTo(112 * rate * ENRICHMENT_COST_RATES_USD.apolloRevealRate, 2);
+  });
+
+  it('scales the LLM line with the config field count (Opslane: a 40-field config was under-quoted)', () => {
+    const ref = estimateEnrichmentCost('l', 6);
+    const wide = estimateEnrichmentCost('l', 6, { fieldCount: 40 });
+    expect(wide.breakdownUsd.llm).toBeCloseTo(6 * 40 * ENRICHMENT_COST_RATES_USD.llmPerFieldPerLead, 2);
+    expect(wide.breakdownUsd.llm).toBeCloseTo(ref.breakdownUsd.llm * 4, 2);
+    expect(estimateEnrichmentCost('l', 6, { fieldCount: ENRICHMENT_COST_RATES_USD.referenceFieldCount }).totalUsd).toBe(ref.totalUsd);
+    expect(estimateEnrichmentCost('l', 6, { fieldCount: 0 }).totalUsd).toBe(ref.totalUsd);
+    expect(estimateEnrichmentCost('l', 6, { fieldCount: NaN }).totalUsd).toBe(ref.totalUsd);
+  });
+
+  it('quotes no Apollo line when every lead already has an email (Opslane), and never more than before', () => {
+    const none = estimateEnrichmentCost('l', 6, { emaillessCount: 0 });
+    const all = estimateEnrichmentCost('l', 6, { emaillessCount: 6 });
+    const unknown = estimateEnrichmentCost('l', 6);
+    expect(none.breakdownUsd.apollo).toBe(0);
+    expect(all.breakdownUsd.apollo).toBe(unknown.breakdownUsd.apollo);
+    expect(estimateEnrichmentCost('l', 6, { emaillessCount: 3 }).breakdownUsd.apollo).toBeCloseTo(unknown.breakdownUsd.apollo / 2, 2);
+    // clamped: cannot exceed the lead count or go negative
+    expect(estimateEnrichmentCost('l', 6, { emaillessCount: 99 }).breakdownUsd.apollo).toBe(unknown.breakdownUsd.apollo);
+    expect(estimateEnrichmentCost('l', 6, { emaillessCount: -4 }).breakdownUsd.apollo).toBe(0);
+  });
+
+  it('the customer view carries a percent and the token, and no dollar figure or vendor breakdown (ENG-1212)', () => {
+    const est = estimateEnrichmentCost('list-1', 112);
+    const view = toCustomerEstimate(est, { percent: 2.3, withinAllowance: true });
+    expect(view).toEqual({ leadCount: 112, estimatedPercentOfAllowance: 2.3, withinAllowance: true, confirmationToken: est.confirmationToken });
+    expect(Object.keys(view).sort()).toEqual(['confirmationToken', 'estimatedPercentOfAllowance', 'leadCount', 'withinAllowance']);
+    expect(JSON.stringify(view)).not.toMatch(/usd|breakdown|apollo|perLead|total/i);
+    expect(toCustomerEstimate(est, { percent: null, withinAllowance: false }).estimatedPercentOfAllowance).toBeNull();
   });
 
   it('scales linearly and handles zero/invalid counts', () => {

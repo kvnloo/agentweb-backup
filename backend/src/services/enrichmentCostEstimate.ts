@@ -9,7 +9,9 @@
  * ENG-2720: the Apollo line is read from the vendor rate card (the same number
  * the ledger books) instead of a hardcoded price, and the LLM line is the
  * measured Luna cost, so this estimate tracks what the run will actually book.
- * With both applied the Opiner reference run estimates ~$13.6, down from $31.60.
+ * With both applied the Opiner reference run estimates ~$13.6, down from $31.60. The LLM line
+ * scales with the saved config's field count and the Apollo line with the leads that lack an
+ * email; customers see the result as a percent of their allowance, never as dollars.
  */
 import { createHash } from 'crypto';
 import { getAllocatedRate } from '../utils/vendorRateCard';
@@ -18,14 +20,16 @@ export const ENRICHMENT_COST_RATES_USD = {
   /** Share of leads that trigger the Apollo broker waterfall (Opiner: 34/112; prod-wide ~28%). */
   apolloRevealRate: 34 / 112,
   /**
-   * LLM extraction plus OpenRouter web-search cost per lead, booked. Enrichment moved from
-   * gpt-5.5 (Opiner: $8.47 / 112 = $0.076) to gpt-5.6-luna (ENG-2720). Measured on the real
-   * Opiner list: ~$0.0027 of tokens plus ~$0.015 of OpenRouter search fees (158 searches over
-   * 73 leads), ~$0.018 all-in; the ledger now books both (agentModeService BYOK cost).
-   * Rounded up to $0.02. Not model-aware: an org on another model, or the
-   * CRM_ENRICH_V3_DEFAULT_MODEL=gpt-5.5 rollback, books ~4x more per lead than this.
+   * LLM extraction plus OpenRouter web-search cost per web field per lead, booked. Enrichment moved
+   * from gpt-5.5 (Opiner: $8.47 / 112 leads) to gpt-5.6-luna (ENG-2720). Measured on the real Opiner
+   * list with 10 fields: ~$0.0027 of tokens plus ~$0.015 of OpenRouter search fees (158 searches over
+   * 73 leads), ~$0.018 per lead all-in, ~$0.0018 per field; rounded up to $0.002. Scaling with the
+   * saved config's field count keeps the quote honest for wide configs. Not model-aware: an org on
+   * another model, or the CRM_ENRICH_V3_DEFAULT_MODEL=gpt-5.5 rollback, books more than this.
    */
-  llmPerLead: 0.02,
+  llmPerFieldPerLead: 0.002,
+  /** Field count the reference run (and the measurement above) used; also the default when no config is saved yet. */
+  referenceFieldCount: 10,
   /** Match / lookup calls per lead, paid on hits and misses (Opiner: $3.61 / 112). */
   lookupPerLead: 3.61 / 112,
   /** Web search per lead (Opiner: $1.37 / 112). */
@@ -48,14 +52,28 @@ export interface EnrichmentCostEstimate {
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
 
-export function estimateEnrichmentCost(listId: string, leadCount: number): EnrichmentCostEstimate {
+export interface EstimateInputs {
+  /**
+   * Leads in the run that have no email. Only those can trigger the Apollo broker (the identity
+   * resolver skips it when an email is already known), so a list where every lead has an email is
+   * quoted no Apollo line. Defaults to every lead (the previous behaviour). The observed 34/112 broker
+   * share is applied to this count, so the line never exceeds what it was before.
+   */
+  emaillessCount?: number;
+  /** Included fields plus smart-field dependencies in the saved config. Defaults to the reference config. */
+  fieldCount?: number;
+}
+
+export function estimateEnrichmentCost(listId: string, leadCount: number, inputs: EstimateInputs = {}): EnrichmentCostEstimate {
   const n = Number.isFinite(leadCount) && leadCount > 0 ? Math.floor(leadCount) : 0;
   const r = ENRICHMENT_COST_RATES_USD;
+  const emailless = Number.isFinite(inputs.emaillessCount) ? Math.min(n, Math.max(0, Math.floor(inputs.emaillessCount as number))) : n;
+  const fields = Number.isFinite(inputs.fieldCount) && (inputs.fieldCount as number) > 0 ? Math.floor(inputs.fieldCount as number) : r.referenceFieldCount;
   // Fail loud rather than estimate $0 if the key is ever removed from the card.
   const apolloWaterfallUsd = getAllocatedRate('apollo', 'waterfall_email');
   if (apolloWaterfallUsd === null) throw new Error('Apollo waterfall_email rate unavailable');
-  const apollo = n * apolloWaterfallUsd * r.apolloRevealRate;
-  const llm = n * r.llmPerLead;
+  const apollo = emailless * apolloWaterfallUsd * r.apolloRevealRate;
+  const llm = n * fields * r.llmPerFieldPerLead;
   const lookups = n * r.lookupPerLead;
   const webSearch = n * r.webSearchPerLead;
   const other = n * r.otherPerLead;
@@ -73,6 +91,33 @@ export function estimateEnrichmentCost(listId: string, leadCount: number): Enric
       other: round2(other),
     },
     confirmationToken: confirmationTokenFor(listId, n, totalUsd),
+  };
+}
+
+/**
+ * What a customer may see of an estimate (ENG-1212: no dollar figures, no vendor breakdown, which
+ * would expose our allocated rates). The dollar total stays server-side: it feeds the confirmation
+ * token and the allowance projection only.
+ */
+export interface CustomerEnrichmentEstimate {
+  leadCount: number;
+  /** Share of the monthly usage allowance this run is expected to use, percent to 1 dp; null when the plan has no dollar allowance. */
+  estimatedPercentOfAllowance: number | null;
+  /** Whether the run is expected to be admitted against the remaining allowance (conservative check). */
+  withinAllowance: boolean;
+  /** Echo back as `confirmEstimateToken` on the enrich-v3 POST. */
+  confirmationToken: string;
+}
+
+export function toCustomerEstimate(
+  estimate: EnrichmentCostEstimate,
+  allowance: { percent: number | null; withinAllowance: boolean },
+): CustomerEnrichmentEstimate {
+  return {
+    leadCount: estimate.leadCount,
+    estimatedPercentOfAllowance: allowance.percent,
+    withinAllowance: allowance.withinAllowance,
+    confirmationToken: estimate.confirmationToken,
   };
 }
 

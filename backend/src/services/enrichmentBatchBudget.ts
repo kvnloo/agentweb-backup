@@ -34,6 +34,13 @@ export function webFieldGuardUsd(model?: string): number {
   );
 }
 
+/** Included fields plus smart-field dependencies, at least 1: what the per-field cost scales with. */
+export function effectiveFieldCount(config: EnrichmentConfig): number {
+  const fields = config.fields.filter(field => field.include);
+  const dependencyCount = fields.reduce((count, field) => count + (field.smartDependencies?.length ?? 0), 0);
+  return Math.max(1, fields.length + dependencyCount);
+}
+
 /** The model enrichment's field calls will run on, mirroring enrichmentV3RealDeps (env overrides first, then the role). */
 async function enrichmentModelFor(userId: string): Promise<string> {
   try {
@@ -61,7 +68,6 @@ async function enrichmentModelFor(userId: string): Promise<string> {
  */
 export function estimateEnrichmentBatchMicroUsd(config: EnrichmentConfig, leadCount: number, model?: string): number {
   const fields = config.fields.filter(field => field.include);
-  const dependencyCount = fields.reduce((count, field) => count + (field.smartDependencies?.length ?? 0), 0);
   const rate = (...args: Parameters<typeof getAllocatedRate>): number => {
     const value = getAllocatedRate(...args);
     if (value === null || !Number.isFinite(value) || value < 0) throw new Error('Enrichment rate unavailable');
@@ -81,7 +87,7 @@ export function estimateEnrichmentBatchMicroUsd(config: EnrichmentConfig, leadCo
     ? rate('enigma', 'card_revenue_12m') + rate('enigma', 'card_revenue_yoy_growth_12m') + 4 * rate('enigma', 'brand_attribute')
     : 0;
   const perLead = identity
-    + Math.max(1, fields.length + dependencyCount) * webFieldGuardUsd(model)
+    + effectiveFieldCount(config) * webFieldGuardUsd(model)
     + enigma;
   return Math.ceil(perLead * leadCount * 1_000_000);
 }
@@ -117,26 +123,42 @@ export function buildEnrichmentBudgetCheck(userId: string): NonNullable<Orchestr
   };
 }
 
-export interface EnrichmentRunEstimate {
-  leadCount: number;
-  estimatedCostUsd: number;
-  withinAllowance: boolean;
+/** Conservative admission reserve for a whole run, in micro-dollars, for the model this user's enrichment runs on. */
+export async function admissionEstimateMicroUsd(userId: string, config: EnrichmentConfig, leadCount: number): Promise<number> {
+  const count = Math.max(0, Math.floor(leadCount));
+  return count === 0 ? 0 : estimateEnrichmentBatchMicroUsd(config, count, await enrichmentModelFor(userId));
 }
 
-/** ENG-2715: pre-run estimate shown before the user confirms a CRM
- * enrichment. Strictly read-only: a forecast-only usage check, no admission
- * write, no enrichment. Uses the same conservative per-lead number the
- * per-batch cap enforces, so "within allowance" here predicts admission.
+/**
+ * ENG-2715/2720: read-only allowance projection for a pre-run quote. Strictly forecast-only (no
+ * admission write, no enrichment).
+ *  - `percent`: how many percentage points of the monthly dollar allowance the EXPECTED cost would
+ *    use (2 decimals under 1%, otherwise 1), from the same policy dollars the gate uses (credits and
+ *    pooling applied), so no dollar amount ever leaves the server. null when the plan has no dollar allowance.
+ *  - `withinAllowance`: whether the CONSERVATIVE reserve would be admitted, so it predicts admission.
  */
-export async function estimateEnrichmentRun(
+export async function projectAllowance(
   userId: string,
-  config: EnrichmentConfig,
-  leadCount: number,
-): Promise<EnrichmentRunEstimate> {
-  const count = Math.max(0, Math.floor(leadCount));
-  const microUsd = count === 0 ? 0 : estimateEnrichmentBatchMicroUsd(config, count, await enrichmentModelFor(userId));
-  const estimatedCostUsd = Math.ceil(microUsd / 10_000) / 100;
-  if (count === 0) return { leadCount: 0, estimatedCostUsd: 0, withinAllowance: true };
-  const projected = await checkTokenUsage(userId, { projectedCostMicroUsd: microUsd });
-  return { leadCount: count, estimatedCostUsd, withinAllowance: projected.allowed === true };
+  expectedMicroUsd: number,
+  admissionMicroUsd: number = expectedMicroUsd,
+): Promise<{ percent: number | null; withinAllowance: boolean }> {
+  if (expectedMicroUsd <= 0 && admissionMicroUsd <= 0) return { percent: 0, withinAllowance: true };
+  const [current, expected, reserve] = await Promise.all([
+    checkTokenUsage(userId),
+    checkTokenUsage(userId, { projectedCostMicroUsd: expectedMicroUsd }),
+    admissionMicroUsd === expectedMicroUsd
+      ? Promise.resolve(undefined)
+      : checkTokenUsage(userId, { projectedCostMicroUsd: admissionMicroUsd }),
+  ]);
+  // The gate's own costPercentUsed is a whole number (a small run would read 0%), so work from the same policy
+  // dollars it uses: what the projection adds to this month's spend, over the allowance in force (credits
+  // and pooling already applied). The dollars stay in here; only the ratio leaves.
+  const allowance = expected.costAllowance;
+  const points = typeof allowance === 'number' && allowance > 0
+    ? Math.max(0, ((expected.costUsed ?? 0) - (current.costUsed ?? 0)) / allowance * 100)
+    : allowance === null || allowance === undefined ? null : (expected.costUsed ?? 0) > (current.costUsed ?? 0) ? 100 : 0;
+  return {
+    percent: points === null ? null : points < 1 ? Math.round(points * 100) / 100 : Math.round(points * 10) / 10,
+    withinAllowance: (reserve ?? expected).allowed === true,
+  };
 }

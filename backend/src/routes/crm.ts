@@ -34,8 +34,9 @@ import { isEligibleGroupEmailRecipient } from '../utils/groupEmailRecipientValid
 import { syncContact, SyncInput } from '../services/contactSyncService';
 import { isCardRevenueField } from '../services/enrichmentGroups';
 import { stripImplicitCardRevenueRouting } from '../services/enrichmentConfigService';
-import { estimateEnrichmentCost,
+import { estimateEnrichmentCost, toCustomerEstimate,
   normalizeLeadSelection, checkEstimateConfirmation } from '../services/enrichmentCostEstimate';
+import { projectAllowance, admissionEstimateMicroUsd, effectiveFieldCount } from '../services/enrichmentBatchBudget';
 import { enrichContact, defaultEnrichmentCache, EnrichmentDeps } from '../services/internalEnrichmentService';
 import { dedupContactsForUser } from '../services/contactDedupService';
 import {
@@ -1823,17 +1824,48 @@ router.post('/lists/:listId/enrichment-config/suggest-types', async (req: Reques
   }
 });
 
-/** ENG-2716: count the leads an enrich-v3 run would touch (leadIds subset or whole list). */
-const countLeadsForEnrichment = async (listId: string, leadIds?: string[]): Promise<number> => {
-  if (leadIds) return leadIds.length;
+/**
+ * ENG-2716: count the leads an enrich-v3 run would touch (leadIds subset or whole list), and how many
+ * of them have no email (only those can trigger the Apollo broker). A selected subset is not loaded, so
+ * its emailless count is unknown and is treated as every selected lead (the conservative reading).
+ */
+const inspectLeadsForEnrichment = async (
+  listId: string,
+  leadIds?: string[],
+): Promise<{ count: number; emailless: number }> => {
+  if (leadIds) return { count: leadIds.length, emailless: leadIds.length };
   let total = 0;
+  let emailless = 0;
   let lastKey: any = undefined;
   do {
     const batch = await crmDb.getLeadsByListId(listId, 200, lastKey);
     total += batch.items.length;
+    emailless += batch.items.filter((lead: any) => !(typeof lead?.email === 'string' && lead.email.trim())).length;
     lastKey = batch.lastEvaluatedKey;
   } while (lastKey);
-  return total;
+  return { count: total, emailless };
+};
+
+/**
+ * ENG-2720: the one pre-run quote. The estimate (dollars) stays server-side: it feeds the confirmation
+ * token and the allowance projection. What the customer sees is a percent of their allowance
+ * (ENG-1212: no dollar figures or vendor breakdown). Used by POST .../estimate, ?mode=estimate and the
+ * enrich-v3 confirmation check so the three can never disagree. The LLM line scales with the saved
+ * config's fields, the Apollo line with the leads that lack an email, and "within allowance" is the
+ * conservative admission reserve for that same config.
+ */
+const quoteEnrichment = async (userId: string, listId: string, leadIds?: string[]) => {
+  const { count, emailless } = await inspectLeadsForEnrichment(listId, leadIds);
+  const stored = await svcGetEnrichmentConfig({ listId, userId }, enrichmentConfigDeps).catch(() => undefined);
+  const config = stored && !stored.isDefault ? stored.config : undefined;
+  const estimate = estimateEnrichmentCost(listId, count, {
+    emaillessCount: emailless,
+    fieldCount: config ? effectiveFieldCount(config) : undefined,
+  });
+  const expectedMicro = Math.round(estimate.totalUsd * 1_000_000);
+  const reserveMicro = config ? Math.max(expectedMicro, await admissionEstimateMicroUsd(userId, config, count)) : expectedMicro;
+  const allowance = await projectAllowance(userId, expectedMicro, reserveMicro);
+  return { estimate, customerView: toCustomerEstimate(estimate, allowance), hasConfig: !!config };
 };
 
 const parseLeadIds = (body: any): string[] | undefined => normalizeLeadSelection(body?.leadIds);
@@ -1855,8 +1887,8 @@ router.post('/lists/:listId/leads/enrich-v3/estimate', async (req: Request, res:
     if (!(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
-    const count = await countLeadsForEnrichment(listId, parseLeadIds(req.body));
-    return res.json(estimateEnrichmentCost(listId, count));
+    const quote = await quoteEnrichment(userId, listId, parseLeadIds(req.body));
+    return res.json(quote.customerView);
   } catch (error) {
     console.error('[v3][route] enrich-v3 estimate failed:', error);
     return res.status(500).json({ message: 'Enrichment estimate failed' });
@@ -1903,11 +1935,8 @@ router.post('/lists/:listId/leads/enrich-v3', async (req: Request, res: Response
       const estimateLeadIds = Array.isArray(req.body?.leadIds)
         ? req.body.leadIds.filter((id: unknown): id is string => typeof id === 'string')
         : [];
-      const leads = await buildV3OrchestratorDeps(userId).loadLeads({
-        listId, userId, leadIds: estimateLeadIds.length > 0 ? estimateLeadIds : undefined,
-      });
-      const { estimateEnrichmentRun } = await import('../services/enrichmentBatchBudget');
-      return res.json(await estimateEnrichmentRun(userId, stored.config, leads.length));
+      const quote = await quoteEnrichment(userId, listId, estimateLeadIds.length > 0 ? estimateLeadIds : undefined);
+      return res.json(quote.customerView);
     }
 
     const mode = (req.query.mode === 'preview' ? 'preview' : 'enrich') as 'preview' | 'enrich';
@@ -1940,15 +1969,15 @@ router.post('/lists/:listId/leads/enrich-v3', async (req: Request, res: Response
       const supplied = req.body?.confirmEstimateToken;
       const required = process.env.ENRICH_V3_REQUIRE_COST_CONFIRMATION === 'true';
       if (supplied !== undefined || required) {
-        const estimate = estimateEnrichmentCost(listId, await countLeadsForEnrichment(listId, leadIds));
-        const check = checkEstimateConfirmation(supplied, estimate, required);
+        const quote = await quoteEnrichment(userId, listId, leadIds);
+        const check = checkEstimateConfirmation(supplied, quote.estimate, required);
         if (!check.ok) {
           return res.status(409).json({
             message: check.reason === 'missing'
               ? 'Confirm the enrichment cost estimate before starting.'
               : 'The enrichment cost estimate changed. Review and confirm the new estimate.',
             code: 'ENRICH_ESTIMATE_CONFIRMATION_REQUIRED',
-            estimate,
+            estimate: quote.customerView,
           });
         }
       }
