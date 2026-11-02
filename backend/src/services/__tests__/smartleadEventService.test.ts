@@ -605,6 +605,15 @@ describe("counting a run's replied, bounced and unsubscribed contacts for the ru
     expect(kinds(w)).toEqual(["run-ok:unsubscribed"]); // ...so it is counted, once
   });
 
+  it("a broken logger and a failing counter cannot replace the error of a failed block (Smartlead must still see the original failure and retry)", async () => {
+    const w = pushed({ countThrows: true, statusFailsFor: "L2", leads: [
+      lead("L1", "a", "ann@example.com", { system: { [`smartlead_${CAMPAIGN}`]: marker("run-ok") } }),
+      lead("L2", "b", "ann@example.com", { system: { [`smartlead_${CAMPAIGN}`]: marker("run-ok") } }),
+    ] });
+    const svc = new SmartleadEventService({ ...(make(w) as any).deps, log: () => { throw new Error("logger broken"); } } as EventDeps);
+    await expect(svc.handle(ctx, unsub())).rejects.toThrow("db down for this list");
+  });
+
   it("a counter that never answers does not hold up the response for more than a couple of seconds", async () => {
     jest.useFakeTimers();
     try {
