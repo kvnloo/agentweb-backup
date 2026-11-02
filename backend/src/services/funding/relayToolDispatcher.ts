@@ -102,7 +102,11 @@ export interface RelayDispatcherOptions {
   bridge: RelayBridgePort;
   /** The manifest sent to the worker: the tools callable from the start. Later ones are added by `tools` in an answer (see `newTools`). */
   manifest: { open: ReadonlySet<string> };
-  /** True once a Stop, a revoke, a kill switch or a flag-off aborted the turn. */
+  /**
+   * True once a Stop, a revoke or a shutdown aborted the turn (the run's abort signal). A kill switch or a flag-off does NOT set it: `ClaudeRunRegistry.cancelOwner` has
+   * no caller today, and a flag turned off is seen by the bridge's liveness check instead: a WRITE is refused at once (the check is read fresh for writes), READS go on
+   * until the turn ends, for up to about 65 s (the flags are cached for 60 s and a positive read check for 5 s).
+   */
   isStopped(): boolean;
   /** Epoch ms after which no further tool may start. */
   softDeadlineAt?: number;
@@ -542,7 +546,7 @@ export class RelayToolDispatcher {
         if (announce) this.o.bridge.noteToolUse(this.o.runId, this.cid(op), name, ev.input, messageId);
         result = await this.o.bridge.callTool(this.o.token, { name, args: ev.input, callId: this.cid(op) }, this.o.runId);
       } catch (err) {
-        // A closed run (Stop, revoke, kill switch) rejects here: nothing executed.
+        // A closed run (Stop, revoke, shutdown) rejects here: nothing executed. A flag-off or kill switch does not close the run: the bridge's liveness check refuses the call.
         this.log(err instanceof ToolBridgeAuthError ? "run_ended" : "bridge_failed");
         return refuse(STOPPED_MESSAGE);
       }

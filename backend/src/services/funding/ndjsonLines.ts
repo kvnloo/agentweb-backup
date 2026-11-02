@@ -8,6 +8,12 @@
  *  - A line is never decoded here: callers get Buffers (views of the chunk when the line sits in one chunk, a copy otherwise) so they can bound them before parsing.
  *  - `capFor(head)` may give a line its own, smaller cap once its first bytes are known (a hostile 8 MiB `entitlement` line is cut at its type's cap, not buffered).
  */
+/**
+ * Empty lines carry no data and cost a call per newline, so they are bounded by COUNT, not only by bytes: 64 MiB of "\n" through the generic path cost ~27 s of
+ * event-loop time (a latin1 decode and a regex per empty line). The host never writes an empty line; a handful is tolerated, a flood fails the stream, and an empty
+ * line never reaches `check`/`capFor`.
+ */
+export const MAX_EMPTY_LINES = 256;
 const HEAD_BYTES = 48;
 const MIN_BUFFER = 16 * 1024;
 
@@ -18,6 +24,7 @@ export class LineSplitter {
   /** The current line passed its cap and is being thrown away up to its newline. */
   private discarding = false;
   private discardLen = 0;
+  private emptyLines = 0;
 
   /** `maxLine`: the longest line in BYTES; `onTooLong` is called (and its result thrown) when a line passes its cap. */
   constructor(
@@ -26,6 +33,8 @@ export class LineSplitter {
     private readonly capFor?: (head: Buffer) => number,
     /** True for a line that may be DISCARDED instead of failing the stream when it passes its cap (an event type nobody here knows). Its bytes are still counted by the caller. */
     private readonly skipFor?: (head: Buffer) => boolean,
+    /** Called (and its result thrown) when a stream has carried more than MAX_EMPTY_LINES empty lines. Default: `onTooLong`. */
+    private readonly onTooManyEmpty?: () => Error,
   ) {}
 
   /** The complete (non-empty) lines this chunk finishes, in order. */
@@ -45,6 +54,11 @@ export class LineSplitter {
         continue;
       }
       if (this.len === 0) {
+        if (seg.length === 0) {
+          // an empty line: counted, and never looked at (no cap, no head decode)
+          if (++this.emptyLines > MAX_EMPTY_LINES) throw (this.onTooManyEmpty ?? this.onTooLong)();
+          continue;
+        }
         const keep = this.check(seg.length, seg);
         this.discarding = false; // the line is complete either way
         this.cap = undefined; // this line is finished: the next one gets its own cap

@@ -94,12 +94,22 @@ export interface TransportOptions {
   requestTimeoutMs?: number;
   /** `turn.run` must start answering (`accepted`) within this. Default 30 s. */
   streamStartTimeoutMs?: number;
+  /** The longest NDJSON line of a turn stream (the final text of a turn is the big one). Default 8 MiB. */
   maxReplyBytes?: number;
+  /** The longest body of an ordinary JSON reply (and of an error body). Default 64 KiB: see JSON_REPLY_BYTES. */
+  maxJsonReplyBytes?: number;
 }
 /** @deprecated renamed: the options are shared by every transport. */
 export type UnixSocketOptions = TransportOptions;
 
 const DEFAULT_REPLY_BYTES = 8 * 1024 * 1024;
+/**
+ * The most a worker may answer on any non-stream route (host.info, connection.status, turn.renew, turn.interrupt, turn.toolResult, login.*, connection.revoke) and in an
+ * error body. Every honest reply is a few hundred bytes (loginRef, a state and an epoch, a plan label, an error code); the old 8 MiB cap let a worker answer every renew
+ * or the per-minute host.info check with a wide 8 MiB body that costs 0.5-0.7 s of JSON.parse and ~180 MB of heap in the main API process. No route needs more, so there
+ * is no per-route override.
+ */
+export const JSON_REPLY_BYTES = 64 * 1024;
 
 /**
  * The causes an operator needs to tell apart (an expired or mismatched certificate, a refused or reset connection, a TLS alert, a
@@ -257,7 +267,7 @@ class NodeTransport implements HostTransport {
   }
 
   private jsonInner(route: RouteName, body: unknown): Promise<JsonReply> {
-    const maxBytes = this.opts.maxReplyBytes ?? DEFAULT_REPLY_BYTES;
+    const maxBytes = this.opts.maxJsonReplyBytes ?? JSON_REPLY_BYTES;
     return new Promise((resolve, reject) => {
       const payload = JSON.stringify(body);
       const req = this.conn.request(
@@ -303,7 +313,18 @@ class NodeTransport implements HostTransport {
           clearTimeout(startTimer);
           if (res.statusCode !== 200) {
             const chunks: Buffer[] = [];
-            res.on("data", (c: Buffer) => chunks.length < 64 && chunks.push(c));
+            let errBytes = 0;
+            const errMax = this.opts.maxJsonReplyBytes ?? JSON_REPLY_BYTES;
+            res.on("data", (c: Buffer) => {
+              errBytes += c.length;
+              if (errBytes > errMax) {
+                // an error body is small: a bigger one is never read to the end nor parsed
+                req.destroy();
+                reject(hostErrorFrom(res.statusCode ?? 0, undefined));
+                return;
+              }
+              chunks.push(c);
+            });
             res.on("error", (e) => reject(mapSocketError(e)));
             res.on("end", () => {
               let json: unknown;
@@ -321,7 +342,7 @@ class NodeTransport implements HostTransport {
           const lines = (async function* (): AsyncGenerator<unknown> {
             // Bounded BEFORE anything is parsed: a per-type cap on each line (see lineCapFor), and per-turn caps on how many lines and how many bytes one stream
             // may carry. A hostile worker's flood of tiny events, or one near-8 MiB event of a type that is never that big, costs a few bytes of scanning, not seconds.
-            const splitter = new LineSplitter(maxLine, () => limitHit("line_too_long"), lineCapFor, skipsWhenTooLong);
+            const splitter = new LineSplitter(maxLine, () => limitHit("line_too_long"), lineCapFor, skipsWhenTooLong, () => limitHit("too_many_empty_lines"));
             let count = 0;
             let bytes = 0;
             try {
