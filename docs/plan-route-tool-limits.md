@@ -76,17 +76,18 @@ The relay cap is deliberately NOT larger than Emma's: a result of 1,000,000 byte
 
 ## What the Claude CLI does on top of these limits
 
-The limits above are ours. The CLI that talks to the model has its own, and they apply to the tools it gets over MCP (which is how the relay hands it Emma's tools). Left alone, the CLI would quietly change what the plan route offers, so the login host sets three of its environment variables for RELAY turns. `relayCliEnv` in `backend/src/loginHost/protocol.ts` owns the values; each one is derived from a limit in that file, never a second copy of a number:
+The limits above are ours. The CLI that talks to the model has its own, and they apply to the tools it gets over MCP (which is how the relay hands it Emma's tools). Left alone, the CLI would quietly change what the plan route offers, so the login host sets three of its environment variables for RELAY turns, and its tool shim declares a per-tool result size (the last row). `relayCliEnv` in `backend/src/loginHost/protocol.ts` owns the values; each one is derived from a limit in that file, never a second copy of a number:
 
 | CLI behaviour | CLI default | What the host sets for a relay turn | Value today |
 |---|---|---|---|
 | Shortens an MCP tool description (`CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH`) | 4,096 characters, with an ellipsis | `TOOL_LIMITS.maxDescriptionBytes`, the longest description the host accepts anyway | 49,152 |
 | Truncates an MCP tool's output (`MAX_MCP_OUTPUT_TOKENS`) | 25,000 tokens (about 100 KB) | half of `RELAY_RESULT_MAX_BYTES` (two bytes a token) plus `IMAGE_LIMITS.maxImages` times 1,600 tokens for images. Not the 8 MiB frame cap: that would remove the CLI's protection of the model's context | 156,400 (= 150,000 + 4 x 1,600) |
 | Ends a stdio tool call (`MCP_TOOL_TIMEOUT`, milliseconds) | the CLI's own | the turn's remaining deadline, at least 1,000 and at most 2^31-1, so the host's clock is the one that ends a call | per turn |
+| Saves a tool result above a PER-TOOL threshold to a file and gives the model only a ~2 KB preview ("Output too large ... Full output saved to: ...") | a few tens of KB (a 150 KB result was a preview, live, with `MAX_MCP_OUTPUT_TOKENS` = 156,400) | the relay shim lists EVERY tool with `_meta: {"anthropic/maxResultSizeChars": N}`, N = `RELAY_RESULT_MAX_BYTES` (`MAX_RESULT_CHARS` in `backend/src/loginHost/deploy/aw-relay-shim.js`; a host test keeps the two equal). `MAX_MCP_OUTPUT_TOKENS` alone is NOT enough: this is a second, separate limit | 300,000 |
 
 A turn on the legacy HTTP bridge sets none of them and keeps the CLI's defaults. The backend cuts a result's text at `RELAY_RESULT_MAX_BYTES` (300,000 bytes, about 150,000 tokens at two bytes a token), which is exactly what the CLI's output limit is derived from, so the CLI's own cut should never be the one that applies; and it refuses a description over 48 KiB at the manifest, so the CLI's own cuts should never be the ones that apply on the plan route.
 
-**Verified live: NO.** The values above are read from the code. The live cases that show a long description, a long result and a long tool call arriving whole through the real CLI on the test worker (C15, C16, C17) have not run yet. Change this line only when they have. Until then, write descriptions that carry the key rule in their first 4,000 characters, and results whose important part comes first.
+**Verified live: PARTLY.** The values above are read from the code, except the per-tool result size: C16 (a long result arriving whole through the real CLI on the test worker) failed on Haiku and Sonnet without the `_meta` (the model got a preview only) and passed on both with it (test-box experiment). The live cases for a long description and a long tool call (C15, C17) have not run yet. Change the rest of this line only when they have. Until then, write descriptions that carry the key rule in their first 4,000 characters.
 
 ## What checks this
 
