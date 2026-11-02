@@ -39,7 +39,7 @@ const GMAIL_ACCOUNT = {
 };
 
 /** A message summary as the email providers return it. */
-function summary(over: Partial<{ id: string; subject: string; from: string; date: string; receivedAt: string }> = {}) {
+function summary(over: Partial<{ id: string; subject: string; from: string; date: string; receivedAt: string; to: string; cc: string }> = {}) {
   // receivedAt (the provider's own receipt stamp) is what freshness is judged
   // on; `date` is the sender's header and is display-only. The default fixture
   // arrived AFTER the tool was invoked, which is the only thing a default call
@@ -54,6 +54,8 @@ function summary(over: Partial<{ id: string; subject: string; from: string; date
     date: over.date ?? arrived,
     receivedAt: arrived,
     snippet: '',
+    ...(over.to !== undefined ? { to: over.to } : {}),
+    ...(over.cc !== undefined ? { cc: over.cc } : {}),
   };
 }
 
@@ -698,6 +700,17 @@ describe('read_verification_code — role/alias address (delivered_to)', () => {
     ]);
     const result = await tool.execute({ delivered_to: ROLE, wait_seconds: 0 }, context);
     expect(result.code).toBe('123123');
+  });
+
+  it('filters by summary recipients before the body cap so newer codes for others cannot crowd it out', async () => {
+    const others = [1, 2, 3, 4, 5].map((n) => summary({ id: `other-${n}`, to: 'verify@agentweb.pro', cc: `other${n}@agentweb.pro` }));
+    mockListEmails.mockResolvedValue([...others, summary({ id: 'role', to: 'verify@agentweb.pro', cc: ROLE })]);
+    mockGetEmails.mockImplementation(async (_u: string, _a: string, ids: string[]) =>
+      ids.map((id) => (id === 'role' ? { id, to: 'verify@agentweb.pro', cc: ROLE, body: 'Your code is 111111' } : { id, to: 'verify@agentweb.pro', cc: 'x@agentweb.pro', body: 'Your code is 222222' }))
+    );
+    const result = await tool.execute({ delivered_to: ROLE, wait_seconds: 0 }, context);
+    expect(result.code).toBe('111111');
+    expect(mockGetEmails.mock.calls[0][2]).toEqual(['role']);
   });
 
   it('reads through a teammate mailbox only when it resolves for this caller (org-scoped)', async () => {

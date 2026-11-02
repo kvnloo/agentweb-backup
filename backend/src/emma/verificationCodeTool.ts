@@ -452,7 +452,16 @@ emmaToolRegistry.register({
       if (!hasExplicitSince && arrival.withinGrace.length > 0) sawPreCallMatch = true;
 
       if (fresh.length > 0) {
-        const ids = fresh.slice(0, MAX_BODIES_PER_PASS).map((email: any) => email.id);
+        // ENG-944: when the summary already carries recipients, drop mail for
+        // other addresses BEFORE the body cap, so newer codes for other people
+        // cannot crowd the role-addressed one out of the fetched set. A summary
+        // without recipient headers is kept; the detail check below decides.
+        const candidates = deliveredTo
+          ? fresh.filter(
+              (email: any) => (email?.to === undefined && email?.cc === undefined) || addressedTo(email, deliveredTo)
+            )
+          : fresh;
+        const ids = candidates.slice(0, MAX_BODIES_PER_PASS).map((email: any) => email.id);
         let details: any[] = [];
         try {
           details = await provider.getEmails(mailboxUserId, accountId, ids);
