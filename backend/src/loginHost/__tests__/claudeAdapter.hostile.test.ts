@@ -170,6 +170,8 @@ describe("one line cannot fan out into a flood of events", () => {
     console.log("RESULT cpu events flood", JSON.stringify({ ms: Date.now() - t0, events: events.length }));
     expect(events.filter((e) => e.type === "text").length).toBeLessThanOrEqual(2000);
     expect(rig.logs.filter((l) => l.event === "event_flood")).toHaveLength(1);
+    // event_flood is a guard trip: the raw pipes of the child were closed before the signal
+    expect((session as unknown as { childAdapter?: { child: { stdout: { destroyed: boolean } } } }).childAdapter?.child.stdout.destroyed).toBe(true);
     expect(events.some((e) => e.type === "result" && e.ok === true)).toBe(false);
   });
 });

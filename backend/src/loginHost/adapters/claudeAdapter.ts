@@ -122,14 +122,14 @@ export class RunnerChildAdapter extends EventEmitter implements RunnerChild {
     this.stdin = child.stdin;
     // stderr is the unit's data too: it goes through a guard (metered, read- and byte-limited, and at most a few KiB forwarded) BEFORE the runner's tail logic sees it
     const errGuard = new StderrGuard(meter, () => {
-      this.kill();
+      this.kill(true);
       this.emit("error", new Error("stderr_flood"));
     });
     child.stderr.on("error", () => undefined);
     child.stderr.pipe(errGuard);
     this.stderr = errGuard;
     meter.onExhausted(() => {
-      this.kill();
+      this.kill(true);
       this.emit("error", new Error("cpu_budget"));
     });
     let done!: () => void;
@@ -138,12 +138,12 @@ export class RunnerChildAdapter extends EventEmitter implements RunnerChild {
     this.stdout = new LineLimit(
       maxLineBytes,
       () => {
-        this.kill();
+        this.kill(true);
         this.emit("error", new Error("stdout_line_too_long"));
       },
       onDeepLine,
       () => {
-        this.kill();
+        this.kill(true);
         this.emit("error", new Error("stdout_flood"));
       },
       meter,
@@ -163,6 +163,11 @@ export class RunnerChildAdapter extends EventEmitter implements RunnerChild {
     });
   }
   private pipesClosed = false;
+  /** After a plain kill: keep reading the child's output, discard it unparsed and uncharged. */
+  private drain(): void {
+    (this.stdout as LineLimit).discard();
+    (this.stderr as StderrGuard).discard();
+  }
   /**
    * Stops reading the child's pipes FOR GOOD. In production the kill is `systemctl stop` (SIGTERM, up to 10 s of grace, then SIGKILL): a writer that survives it keeps
    * filling the pipe, and every read would still cost ~70-90 us OUTSIDE any metered section (measured: utilisation 0.96-0.99 for stdout/stderr x one-byte/64 KiB writes).
@@ -193,9 +198,14 @@ export class RunnerChildAdapter extends EventEmitter implements RunnerChild {
       }
     }
   }
-  /** A kill that throws (or fails) is not "gone": `exited` waits for `onExit` regardless. */
-  kill(): boolean {
-    this.closePipes();
+  /**
+   * `trip` = a guard tripped (cpu_budget, stdout_flood, stderr_flood, stdout_line_too_long, event_flood): the pipes are closed for good BEFORE the signal. A plain kill
+   * (normal session close, idle retirement, a graceful shutdown with its SIGTERM grace) leaves the pipes OPEN: a CLI that is shutting down must not get EPIPE on its last
+   * writes (a crash during a login refresh could damage a healthy login). Its output is still READ, and discarded without parsing or charging (a read costs ~0.08 ms).
+   */
+  kill(trip = false): boolean {
+    if (trip) this.closePipes();
+    else this.drain();
     try {
       this.child.kill();
       return true;
@@ -212,6 +222,11 @@ export class StderrGuard extends Transform {
   private readonly tail: Buffer = Buffer.alloc(STDERR_FORWARD_CAP);
   private tailLen = 0;
   private tripped = false;
+  private discarding = false;
+  /** Stop recording and charging: whatever the child still writes is read and dropped (what was kept is still delivered at the end). */
+  discard(): void {
+    this.discarding = true;
+  }
   private readonly reads = new TokenBucket(READ_BURST, READS_PER_SEC);
   private readonly bytes = new TokenBucket(1024 * 1024, 64 * 1024);
   constructor(
@@ -221,6 +236,7 @@ export class StderrGuard extends Transform {
     super();
   }
   override _transform(chunk: Buffer, _enc: BufferEncoding, cb: (err?: Error | null, data?: Buffer) => void): void {
+    if (this.discarding) return cb();
     if (this.tripped || this.meter.exhausted) return cb();
     this.meter.charge(READ_COST_MS);
     this.meter.time(() => {
@@ -378,7 +394,13 @@ export class LineLimit extends Transform {
    * Every chunk is metered: the WHOLE synchronous section is timed, including the downstream push (readline, the runner's JSON.parse and the session's callbacks all run
    * inside it), so what the unit makes the host do is what is charged, however it made it expensive.
    */
+  private discarding = false;
+  /** Stop parsing and charging: whatever the child still writes is read and dropped. */
+  discard(): void {
+    this.discarding = true;
+  }
   override _transform(chunk: Buffer, _enc: BufferEncoding, cb: (err?: Error | null, data?: Buffer) => void): void {
+    if (this.discarding) return cb();
     if (this.tripped || this.meter.exhausted) return cb();
     this.meter.charge(READ_COST_MS);
     if (!this.reads.take()) return this.stop(cb, this.onFlood);
@@ -878,6 +900,7 @@ class ClaudeSession implements ProviderSession {
             this.meter,
           );
           this.exits.push(child.exited);
+          this.childAdapter = child;
           return child;
         },
         scratch: { create: () => join(cfg.unitTmp, "aw-home"), remove: () => undefined }, // created by the wrapper inside the unit's private tmp; it vanishes with the unit
@@ -933,6 +956,8 @@ class ClaudeSession implements ProviderSession {
   private meter = new CpuMeter();
   private eventBucket = new TokenBucket(EVENT_BURST, EVENTS_PER_SEC);
   private readonly budgetLog = new LogThrottle(3, 60_000);
+  /** The current turn's child adapter (for a trip raised by the session itself). */
+  private childAdapter: RunnerChildAdapter | undefined;
   private noteBudget(code: "cpu_budget" | "event_flood" | "event_blocks_dropped"): void {
     try {
       if (this.budgetLog.check(code).log) this.cfg.log?.warn(code);
@@ -1114,6 +1139,7 @@ class ClaudeSession implements ProviderSession {
               // one line must not fan out into hundreds of thousands of events: normalized events per second are limited per turn
               if (!this.eventBucket.take(evs.length)) {
                 this.noteBudget("event_flood");
+                this.childAdapter?.kill(true); // a guard tripped: the pipes are closed before the signal
                 void this.close();
                 return;
               }

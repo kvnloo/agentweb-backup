@@ -236,6 +236,29 @@ const STUBBORN: Array<[string, string, string, () => CpuMeter]> = [
   ["valid events against a small CPU budget", "cpu_budget", KEEP + 'const b=Buffer.from(\'{"type":"x","a":[1,2,3]}\\n\'.repeat(2));for(;;){w(1,b)}', () => new CpuMeter(5, 0)],
 ];
 
+describe("a PLAIN kill (normal close) leaves the pipes open for a CLI that is winding down", () => {
+  it("MUTATION TARGET: a child that keeps writing during its SIGTERM grace never sees EPIPE (it exits with code 3 on any write error) and is still running when the grace ends; its output is discarded", async () => {
+    // exits with 3 the moment a write fails (a closed pipe): the crash a graceful shutdown must not be given
+    const script = 'const fs=require("fs");for(;;){try{fs.writeSync(1,"{\\"type\\":\\"x\\"}\\n");fs.writeSync(2,"bye\\n");Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10)}catch(e){if(e.code==="EAGAIN")continue;process.exit(3)}}';
+    const { child, alive } = stubbornChild(script, 5000);
+    const adapter = new RunnerChildAdapter(child, 16 * 1024 * 1024, undefined, new CpuMeter());
+    let lines = 0;
+    let errSeen = 0;
+    const errors: string[] = [];
+    adapter.on("error", (e: Error) => errors.push(e.message));
+    createInterface({ input: adapter.stdout }).on("line", () => lines++);
+    adapter.stderr.on("data", (d: Buffer) => (errSeen += d.length));
+    await new Promise((r) => setTimeout(r, 100));
+    adapter.kill(); // the runner's plain kill: the signal lands 5 s later (here)
+    const linesAtKill = lines;
+    await new Promise((r) => setTimeout(r, 1000));
+    expect(alive()).toBe(true); // it did not die of EPIPE during the grace period
+    expect(lines).toBe(linesAtKill); // and what it wrote after the kill is read and dropped, not parsed
+    expect(errSeen).toBeLessThanOrEqual(8192);
+    expect(errors).toEqual([]);
+  });
+});
+
 describe("a writer that survives the kill stops costing the host once a guard trips (the pipes are closed BEFORE the kill)", () => {
   it.each(STUBBORN)("MUTATION TARGET: %s -> %s", async (_name, code, script, mkMeter) => {
     const { child, alive } = stubbornChild(script);
