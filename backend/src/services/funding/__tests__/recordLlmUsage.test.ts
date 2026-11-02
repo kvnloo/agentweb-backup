@@ -6,6 +6,7 @@ import { meterWithResolvedBilling } from '../../agentMode/deferredBillingMeterin
 import {
   recordLlmUsage,
   customerUpstreamCost,
+  openRouterByokCostUsd,
   type RecordLlmUsageInput,
 } from '../recordLlmUsage';
 import {
@@ -243,5 +244,27 @@ describe('recordLlmUsage (ENG-1816 F1)', () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(record).toHaveBeenCalledTimes(1);
+  });
+
+  describe('openRouterByokCostUsd (ENG-2720: upstream tokens plus OpenRouter\'s own charge)', () => {
+    it('adds the router charge (web-search fee) to the upstream bill', () => {
+      expect(openRouterByokCostUsd({ cost: 0.007, cost_details: { upstream_inference_cost: 0.00049 } })).toBeCloseTo(0.00749, 8);
+    });
+    it('returns the upstream bill alone when OpenRouter charged nothing or an unusable amount', () => {
+      for (const cost of [0, -1, NaN, Infinity, undefined, '0.007' as unknown as number]) {
+        expect(openRouterByokCostUsd({ cost, cost_details: { upstream_inference_cost: 0.0119 } })).toBe(0.0119);
+      }
+    });
+    it('stays undefined with no upstream bill and no fee, so the price book prices the tokens as before', () => {
+      for (const upstream of [undefined, 0, -1, NaN, 'x' as unknown as number]) {
+        expect(openRouterByokCostUsd({ cost: 0, cost_details: { upstream_inference_cost: upstream } })).toBeUndefined();
+      }
+      expect(openRouterByokCostUsd({})).toBeUndefined();
+    });
+    it('books a fee with no upstream bill on top of the book token cost instead of dropping it', () => {
+      expect(openRouterByokCostUsd({ cost: 0.007 }, 0.0004)).toBeCloseTo(0.0074, 8);
+      expect(openRouterByokCostUsd({ cost: 0.007 })).toBe(0.007);
+      expect(openRouterByokCostUsd({ cost: 0.007 }, NaN)).toBe(0.007);
+    });
   });
 });

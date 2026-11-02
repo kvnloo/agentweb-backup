@@ -45,19 +45,32 @@ export function customerUpstreamCost(usage: {
  * Reading only the upstream figure left the web-search fee out of the ledger entirely: on a
  * real Luna enrichment run the fee was ~$1.1 against ~$0.2 of recorded tokens.
  *
- * `undefined` when no positive upstream cost is reported, so the caller falls back to the
- * price book exactly as before. An unusable OpenRouter charge counts as 0, never as a drop.
+ * `undefined` when neither bill is reported, so the caller falls back to the price book exactly as
+ * before. An unusable OpenRouter charge counts as 0, never as a drop; a fee with no upstream bill is
+ * booked on top of `tokenCostFallbackUsd` (the book's token cost) instead of being lost.
  * Callers use this for AgentWeb-paid calls only; customer-funded routes are stripped of the
  * override downstream and read `customerUpstreamCost` instead.
  */
-export function openRouterByokCostUsd(usage: {
-  cost?: unknown;
-  cost_details?: { upstream_inference_cost?: unknown } | null;
-}): number | undefined {
+export function openRouterByokCostUsd(
+  usage: {
+    cost?: unknown;
+    cost_details?: { upstream_inference_cost?: unknown } | null;
+  },
+  /** Token cost from the price book, used only when the response reports no upstream cost but does charge a fee. */
+  tokenCostFallbackUsd?: number,
+): number | undefined {
+  const routerCharge = typeof usage?.cost === 'number' && Number.isFinite(usage.cost) && usage.cost > 0 ? usage.cost : 0;
   const upstream = usage?.cost_details?.upstream_inference_cost;
-  if (typeof upstream !== 'number' || !Number.isFinite(upstream) || upstream <= 0) return undefined;
-  const routerCharge = typeof usage.cost === 'number' && Number.isFinite(usage.cost) && usage.cost > 0 ? usage.cost : 0;
-  return upstream + routerCharge;
+  if (typeof upstream === 'number' && Number.isFinite(upstream) && upstream > 0) return upstream + routerCharge;
+  // No usable upstream bill. With no fee either, stay undefined so the caller prices tokens from the book exactly
+  // as before. With a fee (a search ran), book it on top of the book's token cost rather than dropping it.
+  if (routerCharge > 0) {
+    const tokens = typeof tokenCostFallbackUsd === 'number' && Number.isFinite(tokenCostFallbackUsd) && tokenCostFallbackUsd > 0
+      ? tokenCostFallbackUsd
+      : 0;
+    return tokens + routerCharge;
+  }
+  return undefined;
 }
 
 /**

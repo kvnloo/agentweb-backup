@@ -75,8 +75,8 @@ export function parseTrialArgs(raw: string[]): TrialArgs {
 
 /**
  * What one OpenRouter call cost us. On our own provider key (BYOK) `usage.cost` is only OpenRouter's
- * fee and the provider bills the upstream inference cost directly, so both count (as in
- * codingAgentService). Undefined when the response reports no cost.
+ * fee and the provider bills the upstream inference cost directly, so both count (the same rule
+ * as openRouterByokCostUsd in funding/recordLlmUsage.ts, which books agentModeService calls). Undefined when the response reports no cost.
  */
 export function openRouterCallCostUsd(res: { usage?: unknown; openrouter_metadata?: { is_byok?: unknown } }): number | undefined {
   const usage = res.usage as { cost?: unknown; is_byok?: unknown; cost_details?: { upstream_inference_cost?: unknown } } | undefined;

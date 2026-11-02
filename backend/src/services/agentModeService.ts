@@ -2850,7 +2850,16 @@ export class AgentModeService {
           // ENG-2720: on BYOK, upstream tokens PLUS OpenRouter's own charge (web-search fee, BYOK fee).
           costUsdOverride:
             usage.is_byok === true
-              ? openRouterByokCostUsd(usage)
+              ? openRouterByokCostUsd(
+                  usage,
+                  this.estimateCost(
+                    meteredModel,
+                    normalizedUsage.inputTokens,
+                    normalizedUsage.outputTokens,
+                    normalizedUsage.cacheReadTokens,
+                    normalizedUsage.cacheWriteTokens,
+                  ),
+                )
               : typeof usage.cost === 'number'
                 ? usage.cost
                 : undefined,

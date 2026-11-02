@@ -257,6 +257,44 @@ describe('AgentModeService.callLLM — OpenRouter provider + cost (ENG-9)', () =
     expect(call.costUsdOverride).toBeCloseTo(0.00567525, 8);
   });
 
+  it('does not double count on a non-BYOK response: usage.cost is already the total', async () => {
+    create.mockResolvedValue({
+      id: 'gen-managed-search',
+      usage: {
+        prompt_tokens: 100,
+        completion_tokens: 10,
+        cost: 0.0075,
+        is_byok: false,
+        cost_details: { upstream_inference_cost: 0.0005 },
+      },
+      choices: [{ message: { content: 'ok' } }],
+    });
+    (svc as any).llmModels[OR_MODEL].client = { chat: { completions: { create } } };
+
+    await svc.callLLM(OR_MODEL, [{ role: 'user', content: 'hi' }], {
+      usageContext: { userId: 'u1', feature: 'enrichment' },
+    });
+
+    expect(mockMeterUser).toHaveBeenLastCalledWith(expect.objectContaining({ costUsdOverride: 0.0075 }));
+  });
+
+  it('books a BYOK search fee even when the response reports no upstream cost (price-book tokens + fee)', async () => {
+    create.mockResolvedValue({
+      id: 'gen-byok-fee-only',
+      usage: { prompt_tokens: 1000, completion_tokens: 100, cost: 0.007, is_byok: true },
+      choices: [{ message: { content: 'ok' } }],
+    });
+    (svc as any).llmModels[OR_MODEL].client = { chat: { completions: { create } } };
+
+    await svc.callLLM(OR_MODEL, [{ role: 'user', content: 'hi' }], {
+      usageContext: { userId: 'u1', feature: 'enrichment' },
+    });
+
+    const call = mockMeterUser.mock.calls[mockMeterUser.mock.calls.length - 1][0];
+    expect(call.costUsdOverride).toBeGreaterThanOrEqual(0.007);
+    expect(call.costUsdOverride).toBeLessThan(0.007 + 0.01); // fee plus a small token cost, nothing else
+  });
+
   it.each([
     ['zero (free BYOK tier, native search)', 0],
     ['NaN', Number.NaN],
