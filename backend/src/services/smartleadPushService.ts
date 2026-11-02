@@ -480,7 +480,18 @@ export class SmartleadPushService {
     return this.guard(async () => {
       const list = await this.ownList(userId, listId);
       if (!list.ok) return list;
-      return { ok: true, runs: await this.deps.db.listRunsForList(String(listId), 25) };
+      const runs = await this.deps.db.listRunsForList(String(listId), 25);
+      // The history indexes do not carry the event counters (a projection cannot change on a table that exists), so they are read from the
+      // runs themselves, one small read each. Display only: a run whose read fails is listed without them, never dropped.
+      const withEvents = await Promise.all(runs.map(async (r) => {
+        try {
+          const events = await this.deps.db.getRunEvents(r.runId);
+          return events ? { ...r, events } : r;
+        } catch {
+          return r;
+        }
+      }));
+      return { ok: true, runs: withEvents };
     });
   }
 

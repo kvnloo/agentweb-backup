@@ -47,7 +47,7 @@ const DAY_S = 86_400;
 
 /** Runs summaries carried by the three history indexes; `listId`, `ownerId`, `kind` and `createdAt` are those indexes' own keys. */
 // `ttl` is included so a run DynamoDB has not yet deleted (its TTL sweep lags by up to about two days) can be filtered out of a listing.
-const SUMMARY_ATTRIBUTES = ["status", "campaignId", "campaignName", "counts", "events", "startedAt", "finishedAt", "pushedBy", "channel", "ttl"];
+const SUMMARY_ATTRIBUTES = ["status", "campaignId", "campaignName", "counts", "startedAt", "finishedAt", "pushedBy", "channel", "ttl"];
 
 /**
  * The table definition ensureCriticalTables creates at boot. The copy in scripts/create-tables.ts must match it (that script
@@ -189,6 +189,7 @@ export interface PushRunSummary {
   campaignId?: number;
   campaignName?: string;
   counts?: PushRunCounts;
+  /** Not carried by the history indexes (a projection cannot be changed on a table that exists): the service fills it in from the base table. */
   events?: PushRunEvents;
   startedAt?: string;
   finishedAt?: string;
@@ -362,7 +363,6 @@ function toSummary(item: Item): PushRunSummary {
     ...(item.campaignId !== undefined ? { campaignId: num(item.campaignId) } : {}),
     ...(item.campaignName !== undefined ? { campaignName: String(item.campaignName) } : {}),
     ...(c && typeof c === "object" ? { counts: { examined: num(c.examined), added: num(c.added), alreadyInCampaign: num(c.alreadyInCampaign), unconfirmed: num(c.unconfirmed), withdrawn: num(c.withdrawn), skippedByReason: { ...(c.skippedByReason ?? {}) } } } : {}),
-    ...(readEvents(item.events) ? { events: readEvents(item.events)! } : {}),
     ...(item.startedAt ? { startedAt: String(item.startedAt) } : {}),
     ...(item.finishedAt ? { finishedAt: String(item.finishedAt) } : {}),
     ...(item.pushedBy ? { pushedBy: String(item.pushedBy) } : {}),
@@ -457,6 +457,13 @@ export class SmartleadPushRunDb {
     const r = await this.call(() => this.client.get({ TableName: this.table, Key: { pk: runId, sk: RUN_SK }, ConsistentRead: true }).promise());
     if (!r.ok || !r.value.Item) return null;
     return fromRunItem(r.value.Item);
+  }
+
+  /** Just the event counters of a run, from the base table. A failed read is an error for the caller to ignore: the counters are display only. */
+  async getRunEvents(runId: string): Promise<PushRunEvents | undefined> {
+    const r = await this.call(() => this.client.get({ TableName: this.table, Key: { pk: runId, sk: RUN_SK }, ProjectionExpression: "#e", ExpressionAttributeNames: { "#e": "events" } }).promise());
+    if (!r.ok || !r.value.Item) return undefined;
+    return readEvents(r.value.Item.events);
   }
 
   async getLock(listId: string, campaignId: number): Promise<{ runId: string } | null> {
