@@ -75,56 +75,59 @@ export class SmartleadEventService {
     };
 
     // One event is about one contact: the first candidate address that matches wins, the rest are not tried.
-    for (const address of event.candidateEmails) {
-      const seen = new Set<string>();
-      const matches: Array<{ lead: Lead; campaignName?: string; runId: string }> = [];
-      const found = await this.deps.findLeadsByEmail(address);
-      // The Smartlead lead behind a contact is ONE lead across all of the account's campaigns, and our withdrawal unsubscribes it account-wide
-      // (verified on a real account, 2026-10-30: unsubscribing it in one campaign shows it unsubscribed and blocked in the others too). So once
-      // ANY marker of ANY of these leads is withdrawn, the poll must not read that opt-out back as news in another campaign or list either.
-      // The index spans every customer, so a withdrawn marker counts only when its own run belongs to THIS Smartlead account: another customer's marker
-      // that happens to carry the same id text must never suppress ours.
-      const withdrawnSmartleadIds = new Set<string>();
-      if (event.polled && event.kind !== "reply") {
-        const runAccount = new Map<string, Promise<string | undefined>>();
-        const accountOf = (runId: string) => {
-          let p = runAccount.get(runId);
-          if (!p) { p = this.deps.getRun(runId).then(r => r?.smartleadAccountId); runAccount.set(runId, p); }
-          return p;
-        };
-        for (const l of found) {
-          for (const [key, value] of Object.entries((l?.system ?? {}) as Record<string, any>)) {
-            if (!key.startsWith("smartlead_") || !value || typeof value.smartleadLeadId !== "string" || typeof value.runId !== "string") continue;
-            if (!(value.state === "withdrawn" || !!value.withdrawnAt)) continue;
-            if ((await accountOf(value.runId)) === ctx.accountId) withdrawnSmartleadIds.add(value.smartleadLeadId);
+    try {
+      for (const address of event.candidateEmails) {
+        const seen = new Set<string>();
+        const matches: Array<{ lead: Lead; campaignName?: string; runId: string }> = [];
+        const found = await this.deps.findLeadsByEmail(address);
+        // The Smartlead lead behind a contact is ONE lead across all of the account's campaigns, and our withdrawal unsubscribes it account-wide
+        // (verified on a real account, 2026-10-30: unsubscribing it in one campaign shows it unsubscribed and blocked in the others too). So once
+        // ANY marker of ANY of these leads is withdrawn, the poll must not read that opt-out back as news in another campaign or list either.
+        // The index spans every customer, so a withdrawn marker counts only when its own run belongs to THIS Smartlead account: another customer's marker
+        // that happens to carry the same id text must never suppress ours.
+        const withdrawnSmartleadIds = new Set<string>();
+        if (event.polled && event.kind !== "reply") {
+          const runAccount = new Map<string, Promise<string | undefined>>();
+          const accountOf = (runId: string) => {
+            let p = runAccount.get(runId);
+            if (!p) { p = this.deps.getRun(runId).then(r => r?.smartleadAccountId); runAccount.set(runId, p); }
+            return p;
+          };
+          for (const l of found) {
+            for (const [key, value] of Object.entries((l?.system ?? {}) as Record<string, any>)) {
+              if (!key.startsWith("smartlead_") || !value || typeof value.smartleadLeadId !== "string" || typeof value.runId !== "string") continue;
+              if (!(value.state === "withdrawn" || !!value.withdrawnAt)) continue;
+              if ((await accountOf(value.runId)) === ctx.accountId) withdrawnSmartleadIds.add(value.smartleadLeadId);
+            }
           }
         }
+        for (const lead of found) {
+          const id = `${lead?.listId}/${lead?.leadId}`;
+          if (!lead?.listId || !lead?.leadId || seen.has(id)) continue;
+          seen.add(id);
+          const marker = getSmartleadMarker(lead, ctx.campaignId);
+          if (!marker || typeof marker.runId !== "string" || !marker.runId) continue;
+          // Once our own withdrawal has unsubscribed a blocked contact in Smartlead (`withdrawn`, or `released` afterwards, which keeps `withdrawnAt`),
+          // Smartlead lists that contact as unsubscribed for good: reading it back would re-block a contact a user has since resubscribed in the CRM.
+          // A reply has no such risk, and a contact released without a withdrawal is still live in Smartlead, so both are still read.
+          if (event.polled && event.kind !== "reply" && (marker.state === "withdrawn" || !!marker.withdrawnAt || (!!marker.smartleadLeadId && withdrawnSmartleadIds.has(marker.smartleadLeadId)))) continue;
+          const r = await proven(marker.runId);
+          if (r.ok) matches.push({ lead, campaignName: r.name, runId: marker.runId });
+        }
+        if (matches.length === 0) continue;
+        for (const m of matches) {
+          out.matched++;
+          const r = await this.apply(event, m.lead, m.campaignName, m.runId, pending);
+          out.changed += r.changed;
+          out.duplicates += r.duplicate;
+        }
+        break;
       }
-      for (const lead of found) {
-        const id = `${lead?.listId}/${lead?.leadId}`;
-        if (!lead?.listId || !lead?.leadId || seen.has(id)) continue;
-        seen.add(id);
-        const marker = getSmartleadMarker(lead, ctx.campaignId);
-        if (!marker || typeof marker.runId !== "string" || !marker.runId) continue;
-        // Once our own withdrawal has unsubscribed a blocked contact in Smartlead (`withdrawn`, or `released` afterwards, which keeps `withdrawnAt`),
-        // Smartlead lists that contact as unsubscribed for good: reading it back would re-block a contact a user has since resubscribed in the CRM.
-        // A reply has no such risk, and a contact released without a withdrawal is still live in Smartlead, so both are still read.
-        if (event.polled && event.kind !== "reply" && (marker.state === "withdrawn" || !!marker.withdrawnAt || (!!marker.smartleadLeadId && withdrawnSmartleadIds.has(marker.smartleadLeadId)))) continue;
-        const r = await proven(marker.runId);
-        if (r.ok) matches.push({ lead, campaignName: r.name, runId: marker.runId });
-      }
-      if (matches.length === 0) continue;
-      for (const m of matches) {
-        out.matched++;
-        const r = await this.apply(event, m.lead, m.campaignName, m.runId, pending);
-        out.changed += r.changed;
-        out.duplicates += r.duplicate;
-      }
-      break;
+    } finally {
+      // The run counters are for display and are written only now: after every contact's reply, alert and block is done, so no counter can
+      // come before or hold up another contact's opt-out (a contact in two lists is two blocks), and the wait itself is capped.
+      await this.flushCounts(pending);
     }
-    // The run counters are for display and are written only now: after every contact's reply, alert and block is done, so no counter can
-    // come before or hold up another contact's opt-out (a contact in two lists is two blocks), and the wait itself is capped.
-    await this.flushCounts(pending);
     return out;
   }
 
