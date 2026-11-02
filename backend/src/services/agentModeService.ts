@@ -57,6 +57,7 @@ import { isBookkeepingTool, reconcileFalseFailureReport } from '../utils/falseFa
 import { ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import { computeTermination } from './agentMode/core/agentStep';
 import { ANTI_LOOP_STOP_MESSAGE, EMPTY_FINAL_RESPONSE_FALLBACK } from './agentMode/core/termination';
+import { recordPagingCalls, PAGING_SPIRAL_STOP_MESSAGE } from './agentMode/core/pagingSpiral';
 import { sanitizeGeminiSchema } from './agentMode/core/geminiNativeClient';
 import {
   normalizeOpenRouterResponseMetadata,
@@ -3808,6 +3809,10 @@ export class AgentModeService {
       const toolSignatureHistory: string[] = [];
       const SIGNATURE_HISTORY_WINDOW = 10;
       const SIGNATURE_REPEAT_THRESHOLD = 3;
+      // ENG-2778: per-turn call counts keyed on tool + non-pagination args, so paging the
+      // same resource with varying offset/limit (which evades both signature checks) is seen.
+      const pagingCallCounts = new Map<string, number>();
+      let pagingSpiralNudged = false;
       // ENG-1635/1644 follow-up: cross-TURN retry-backstop TRANSPARENCY for a
       // Meta write that keeps failing the same way — see the annotation logic
       // below (and applyMetaWriteRetryBackstop's own header) for why this
@@ -5208,6 +5213,14 @@ export class AgentModeService {
               });
             }
           }
+        }
+
+        // ENG-2778: paging-spiral detection — same tool + same target, different page.
+        const pagingTripped = recordPagingCalls(pagingCallCounts, responseMessage.tool_calls);
+        if (pagingTripped.length > 0 && !pagingSpiralNudged) {
+          pagingSpiralNudged = true;
+          console.warn(`AgentMode: Detected paging spiral (${pagingTripped.join(', ')}) in session ${sessionId}, injecting paging-stop warning`);
+          (messages as any[]).push({ role: 'system', content: PAGING_SPIRAL_STOP_MESSAGE });
         }
 
         // Do not append an assistant message; tool messages above are sufficient for model continuation
