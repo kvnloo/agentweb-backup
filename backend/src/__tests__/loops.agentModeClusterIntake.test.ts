@@ -59,9 +59,9 @@ function windowEvents(invocations: number, failures: number): NormalizedEvent[] 
   ];
 }
 
-async function runTick(invocations: number, failures: number) {
+async function runTick(invocations: number, failures: number, isProduction = true) {
   const proposals = await new AgentFailureRuleSet().evaluate(windowEvents(invocations, failures), WINDOW);
-  const tool = new ClusterIntakeTool();
+  const tool = new ClusterIntakeTool({ isProduction: () => isProduction });
   return Promise.all(proposals.map((p) => tool.apply(p)));
 }
 
@@ -102,6 +102,16 @@ describe('ENG-589 failure-cluster → Linear intake', () => {
     expect(store.issues[0].state).toBe('open');
     expect(recur[0].artifact).toMatchObject({ intake: { deduped: true, reopened: true, pageId: store.issues[0].identifier } });
     expect(store.comments.some((c) => c.issueId === store.issues[0].id && c.body.startsWith('Reopened'))).toBe(true);
+  });
+
+  it('ENG-1099: outside production a closed canonical is NOT reopened or commented on', async () => {
+    await runTick(10, 5);
+    store.issues[0].state = 'closed';
+    const commentsBefore = store.comments.length;
+    const recur = await runTick(10, 5, false);
+    expect(store.issues[0].state).toBe('closed');
+    expect(store.comments).toHaveLength(commentsBefore);
+    expect(recur[0].artifact).toMatchObject({ intake: { suppressed: true } });
   });
 
   it('AC3: a closed issue of a DIFFERENT class is never reopened', async () => {

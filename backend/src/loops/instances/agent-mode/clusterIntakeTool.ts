@@ -34,6 +34,8 @@ export interface ClusterIntakePorts {
   findClosedAuto: (isMatch: (i: CanonicalRef) => boolean) => Promise<CanonicalRef | null>;
   reopen: (issueId: string) => Promise<void>;
   comment: (issueId: string, body: string) => Promise<void>;
+  /** ENG-1099: Linear is only mutated from production; elsewhere the reopen path is suppressed. */
+  isProduction: () => boolean;
 }
 
 const LINEAR_ISSUE_BASE = 'https://linear.app/emmabyaw/issue';
@@ -60,6 +62,7 @@ const defaultPorts = (): ClusterIntakePorts => ({
     (await import('../../../services/linearService')).findMostRecentClosedIssueByLabel('Auto', isMatch),
   reopen: async (id) => (await import('../../../services/linearService')).reopenIssue(id, 'Todo'),
   comment: async (id, body) => (await import('../../../services/linearService')).addIssueComment(id, body),
+  isProduction: () => process.env.NODE_ENV === 'production',
 });
 
 export class ClusterIntakeTool implements MutationTools<Payload> {
@@ -108,7 +111,7 @@ export class ClusterIntakeTool implements MutationTools<Payload> {
     alertClass: string,
     payload: AgentFailureProposalPayload,
     context: Record<string, string>,
-  ): Promise<(FiledAutoResult & { reopened: true }) | null> {
+  ): Promise<FiledAutoResult | null> {
     const matches = classMatcher(alertClass);
     let closed: CanonicalRef | null;
     try {
@@ -118,6 +121,8 @@ export class ClusterIntakeTool implements MutationTools<Payload> {
       return null; // lookup is best-effort; fall through to the normal intake rail
     }
     if (!closed) return null;
+    // ENG-1099: same NODE_ENV guard as createInternalLinearIssue — never reopen/comment outside prod.
+    if (!this.ports.isProduction()) return { pageId: '', deduped: false, tracker: 'Linear', suppressed: true };
     await this.ports.reopen(closed.issueId);
     await this.ports.comment(
       closed.issueId,
