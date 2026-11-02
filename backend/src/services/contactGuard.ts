@@ -35,25 +35,98 @@ async function isOursAndBlocked(lead: any, owners: Set<string>, listOwners: Map<
   return !!owner && owners.has(owner);
 }
 
-/** Plain addresses from a to/cc/bcc value: a string (comma or semicolon separated, "Name <a@b>" allowed) or an array of them. */
-export function addressesOf(value: unknown): string[] {
+
+const MAX_PIECE = 600;
+const MAX_READINGS = 6;
+
+/** A matched address without the punctuation around it. A `?query` is cut only after the `@` (a local part may contain `?`); trimming is a loop, not a regex. */
+function cleanAddress(raw: string): string {
+  let s = raw.trim().toLowerCase();
+  const at = s.indexOf("@");
+  const q = at >= 0 ? s.indexOf("?", at) : -1;
+  if (q >= 0) s = s.slice(0, q);
+  let start = 0;
+  let end = s.length;
+  while (start < end && "([".includes(s[start])) start++;
+  while (end > start && ")].".includes(s[end - 1])) end--;
+  return s.slice(start, end);
+}
+
+/** The same, and also without quote marks at either end: for readings where an apostrophe may be quoting, not part of the address. */
+function cleanQuoted(raw: string): string {
+  let s = cleanAddress(raw);
+  let start = 0;
+  let end = s.length;
+  while (start < end && "'\"([".includes(s[start])) start++;
+  while (end > start && "'\")].".includes(s[end - 1])) end--;
+  s = s.slice(start, end);
+  return s;
+}
+
+/**
+ * Extra readings for a piece that contains an apostrophe, ADDED to the ones the main pass finds (never instead of them, so nothing the main pass
+ * catches can be lost). An apostrophe is legal in a local part (o'brien@x.com) but can also be quoting around an address (`'a@x.com'`,
+ * `name='a@x.com'`, `x'(a@x.com)`), in which case everything up to it is not part of the address. Which is meant cannot be known, so the address is also
+ * looked up as each apostrophe-delimited tail of its local part. The price
+ * of a wrong extra reading is refusing a send to someone blocked under that other name (`brien@x.com` for `o'brien@x.com`): it fails safe and is rare.
+ */
+function apostropheReadings(piece: string): string[] {
+  if (!piece.includes("'")) return [];
+  const matches = [
+    ...piece.matchAll(/<(?:mailto:)?([^<>\s]+@[^<>\s]+)>/gi),
+    ...piece.matchAll(/(?:mailto:)?([^\s<>";,:]+@[^\s<>"';,]+)/gi),
+  ];
+  const out: string[] = [];
+  for (const m of matches) {
+    const base = cleanQuoted(m[1]);
+    if (!base.includes("@")) continue;
+    const readings = [base];
+    const at = base.indexOf("@");
+    for (let i = base.indexOf("'"); i >= 0 && i < at; i = base.indexOf("'", i + 1)) {
+      const tail = cleanQuoted(base.slice(i + 1));
+      if (tail.indexOf("@") > 0) readings.push(tail); // something is left before the @
+    }
+    // The number of lookups is capped. The plain address after the LAST apostrophe needs no special care here: the main pass always finds it.
+    out.push(...readings.slice(0, MAX_READINGS));
+  }
+  return out;
+}
+
+/** Addresses from a to/cc/bcc value, and whether any piece was too long to look at (see MAX_PIECE). */
+function parseAddresses(value: unknown): { addresses: string[]; oversize: boolean } {
+  let oversize = false;
   const parts = Array.isArray(value) ? value.flat(Infinity) : typeof value === "string" ? [value] : [];
   const out = new Set<string>();
   for (const part of parts) {
     if (typeof part !== "string") continue;
     for (const piece of part.split(/[;,]/)) {
+      // No address is longer than 254 characters: a longer piece is not matched (the regexes below are quadratic on long input with no address).
+      if (piece.length > MAX_PIECE) { oversize = true; continue; }
       const bracketed = [...piece.matchAll(/<(?:mailto:)?([^<>\s]+@[^<>\s]+)>/gi)];
       const found = bracketed.length > 0 ? bracketed : [...piece.matchAll(/(?:mailto:)?([^\s<>"';,:]+@[^\s<>"';,]+)/gi)];
       // Punctuation and a mailto query around an address are not part of it: `(a@x.com)`, `a@x.com.`, `a@x.com?subject=hi`. A lookup with them left on would miss.
-      for (const m of found) out.add(m[1].split("?")[0].trim().replace(/^[([{]+/, "").replace(/[)\]}.]+$/, "").toLowerCase());
+      for (const m of found) {
+        const cleaned = cleanAddress(m[1]);
+        if (cleaned.includes("@")) out.add(cleaned);
+      }
+      // Added on top, never instead: see apostropheReadings.
+      for (const a of apostropheReadings(piece)) out.add(a);
     }
   }
-  return [...out];
+  return { addresses: [...out], oversize };
+}
+
+/** Plain addresses from a to/cc/bcc value: a string (comma or semicolon separated, "Name <a@b>" allowed) or an array of them. */
+export function addressesOf(value: unknown): string[] {
+  return parseAddresses(value).addresses;
 }
 
 /** The addresses among `recipients` that belong to a do-not-contact lead of ours (see above). Throws when it cannot be sure. */
 export async function blockedRecipients(userIds: Array<string | undefined>, ...recipients: unknown[]): Promise<string[]> {
-  const addresses = recipients.flatMap(addressesOf).filter((a, i, all) => all.indexOf(a) === i);
+  const parsed = recipients.map(parseAddresses);
+  // A piece too long to look at (a huge display name) could hide an address: not being able to check it means not sending, like a failed lookup.
+  if (parsed.some(p => p.oversize)) throw new Error("A recipient is too long to check against do-not-contact");
+  const addresses = parsed.flatMap(p => p.addresses).filter((a, i, all) => all.indexOf(a) === i);
   if (addresses.length === 0) return [];
   const owners = await ownerSet(userIds);
   const listOwners = new Map<string, string | undefined>();

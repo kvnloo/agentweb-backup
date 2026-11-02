@@ -999,12 +999,13 @@ Actions:
 - get-company: Get a LinkedIn company profile by company_id (the company's LinkedIn identifier/slug).
 - cancel-invitation: Cancel a pending invitation by invitation_id (obtain from list-sent-invitations).
 - withdraw-stale-invitations: Bulk-withdraw the account's OLDEST pending connection requests to reclaim capacity. Requires older_than_days (minimum 1); optional max_withdrawals (default and hard maximum 40 per run) and list_id. Use this instead of looping cancel-invitation when a backlog of pending invitations is throttling sends. Withdraws oldest-first, paces every withdrawal, and does NOT consume the account's daily invite budget. It ALWAYS returns a "notice" you must relay rather than summarise away, plus "withdrawn" (each with the invitee and when the invite was originally sent), "failed", "remainingStale", "totalPending", and "stopReason". stopReason 'paced' means the account hit its write-pacing ceiling and the run stopped deliberately: this is NOT a failure and NOT a LinkedIn rejection — do NOT retry in the same run, report how far it got and leave the rest for the next one. IMPORTANT: withdrawing stale invitations does NOT lift the stricter throttle a NEWLY connected LinkedIn account is under — that is about the account's age, not its pending count — so do not offer it as a remedy for a brand-new connection being limited.
+- list-post-engagers: Read-only. List the people who COMMENTED on a LinkedIn post — warm prospects who already engaged with the topic. Requires post_id (the post URL, a urn:li:activity:… URN, or a Unipile social id); optional cursor and limit (max 100). Returns one row per distinct commenter (name, headline, profile_url, provider_id, comment_snippet) plus cursor for the next page. Out-of-network/anonymized commenters are dropped and counted as anonymizedSkipped. Reactors (likes) are NOT included. Sends nothing — pass a row's provider_id or profile_url to send-invite separately.
 - accept-invitation: (exact action string: "accept-invitation") Accept a received connection request. Requires invitation_id and shared_secret — both obtained from list-received-invitations. CRM ATTRIBUTION IS OPT-IN, ON YOU: accepting an inbound request does NOT automatically make someone a lead — unlike sending an invite (always a deliberate targeting choice), an inbound accept could be a genuine prospect or an unrelated personal connection, and nothing gets logged unless you decide it belongs somewhere. If — and only if — this person is actually relevant to a specific CRM campaign, pass list_id for that list; the connection's identity is looked up automatically from LinkedIn's own record of this invitation (not from anything else you pass), so list_id is the only extra thing needed. Omit list_id for a connection that isn't a lead — the accept still succeeds, nothing gets mirrored, no false attribution. If you judge someone a good potential lead but have no specific list to attach them to (the task didn't name one), do NOT let that pass silently — call it out explicitly in your final report (e.g. "N accepted connections look like good fits for X but I had no target list — let me know where to add them") so it's visible and actionable, not just accepted-and-forgotten.
 - update-conversation-history: Fetch the full message history with a LinkedIn contact from Unipile and persist it to the lead's CRM engagement activities. Also updates the lead's sync timestamp so send-message is unblocked for the next 24 hours. Requires list_id and lead_id in addition to profile_url or provider_id.
 - search-parameters: Resolve a free-text query (company name, location, industry, school, service) to LinkedIn entity IDs via Unipile's parameter search. Required: type (one of COMPANY, LOCATION, INDUSTRY, SCHOOL, SERVICE) and keywords. Optional limit. Returns ranked candidates with id/title/subtitle plus fromCache and source metadata. Use the returned id with the matching *_id field on search-people for precise structured filtering.
 - set-daily-invite-cap: Set this account's daily LinkedIn connection-request limit. Requires daily_invite_cap (a number, up to the system-wide maximum — a higher value you pass is clamped automatically, so 30 always works as "the Premium number" without needing to know the exact ceiling). SELF-REPORTED, NEVER DETECTED: call this ONLY after asking the user directly, in THIS conversation, whether their connected LinkedIn account has Premium — never guess, never infer it from anything else about the account. If they say yes, call this with daily_invite_cap=30 (or their stated preference, if lower); if no, call it with daily_invite_cap=10. Before running any LinkedIn outreach for an account you haven't confirmed this for, ask first — a live/interactive turn is the only place you CAN ask, since an unattended/scheduled run has no one to answer. If a scheduled run reaches this point with the cap still unconfirmed, do NOT call this action from that run — proceed at whatever cap is already configured (defaults to the conservative 10 until someone answers) and say so plainly in the completion ledger, rather than guessing Premium.
 
-SHARED-ACCOUNT FALLBACK: search-people, get-profile, get-company, and search-parameters still work even when the user has no connected LinkedIn account (or it's disconnected) — they silently borrow a platform-wide shared account so discovery doesn't stall. When that happens the response carries usedSharedAccount:true and sharedAccountId. Treat this as a real signal, not a footnote: network_distance and any "already connected/pending" status are relative to the SHARED account's network, not the user's, so they are omitted from the response entirely — do not claim or infer a connection degree from a shared-account result. Proactively tell the user their LinkedIn account appears disconnected (discovery still worked, but outreach — send-invite/send-message/etc. — will fail) rather than silently continuing as if everything is normal.
+SHARED-ACCOUNT FALLBACK: search-people, get-profile, get-company, search-parameters, and list-post-engagers still work even when the user has no connected LinkedIn account (or it's disconnected) — they silently borrow a platform-wide shared account so discovery doesn't stall. When that happens the response carries usedSharedAccount:true and sharedAccountId. Treat this as a real signal, not a footnote: network_distance and any "already connected/pending" status are relative to the SHARED account's network, not the user's, so they are omitted from the response entirely — do not claim or infer a connection degree from a shared-account result. Proactively tell the user their LinkedIn account appears disconnected (discovery still worked, but outreach — send-invite/send-message/etc. — will fail) rather than silently continuing as if everything is normal.
 
 ANONYMIZED RESULTS: LinkedIn hides out-of-network people behind a placeholder profile. Those are dropped from search-people results, and the count is reported as anonymizedFiltered. If items is empty but anonymizedFiltered is greater than zero, the search WORKED and the niche is NOT empty — everyone matching was simply out of reach of the account used. Do not report that as "no results found" and do not escalate it as a broken search; broaden the query or use an account whose network reaches these people. On get-profile the row cannot be dropped, so it comes back with anonymized:true and no profile URL.
 
@@ -1016,7 +1017,7 @@ For target person identification (send-invite, send-message, get-profile, update
       properties: {
         action: {
           type: 'string',
-          enum: ['search-people', 'get-profile', 'list-connections', 'list-sent-invitations', 'list-received-invitations', 'send-invite', 'send-message', 'send-inmail', 'get-company', 'cancel-invitation', 'accept-invitation', 'update-conversation-history', 'search-parameters', 'set-daily-invite-cap', 'withdraw-stale-invitations'],
+          enum: ['search-people', 'get-profile', 'list-connections', 'list-sent-invitations', 'list-received-invitations', 'send-invite', 'send-message', 'send-inmail', 'get-company', 'cancel-invitation', 'accept-invitation', 'update-conversation-history', 'search-parameters', 'set-daily-invite-cap', 'withdraw-stale-invitations', 'list-post-engagers'],
           description: 'The outreach action to perform.'
         },
         account_id: {
@@ -1131,7 +1132,7 @@ For target person identification (send-invite, send-message, get-profile, update
         },
         limit: {
           type: 'number',
-          description: 'Max number of candidates to return for search-parameters. Optional; the resolver picks a sensible default.'
+          description: 'Max number of candidates to return for search-parameters. Optional; the resolver picks a sensible default. For list-post-engagers: comments to read per page (max 100).'
         },
         invitation_id: {
           type: 'string',
@@ -1143,7 +1144,11 @@ For target person identification (send-invite, send-message, get-profile, update
         },
         cursor: {
           type: 'string',
-          description: 'Pagination cursor for search-people, list-connections, list-sent-invitations, list-received-invitations.'
+          description: 'Pagination cursor for search-people, list-connections, list-sent-invitations, list-received-invitations, list-post-engagers.'
+        },
+        post_id: {
+          type: 'string',
+          description: 'For list-post-engagers: the LinkedIn post URL, urn:li:activity:… URN, or Unipile social id.'
         },
         force_refresh: {
           type: 'boolean',
@@ -7620,6 +7625,7 @@ const adminToolNames = [
   'get_chat_history',
   'get_session_transcript',
   'get_user_by_id',
+  'inspect_client_usage',
   'list_all_clients',
   'assess_client_health',
   'monitor_lead_volume',
@@ -7647,8 +7653,14 @@ const adminToolNames = [
 // mcpGetAccountStatusExposure.test.ts). Same `execute`, self-only schema.
 const SELF_ONLY_BRIDGE_DEFINITIONS: Record<string, { description: string; inputSchema: any }> = {
   get_account_status: {
-    description: "Get the current user's account status, subscription plan, and usage.",
-    inputSchema: { type: 'object', properties: {}, required: [] },
+    description: "Get the current user's account status, subscription plan, and usage. Pass usage_month (YYYY-MM) to also get that month's LLM token/call totals by model and by day plus a session count (no dollar amounts).",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        usage_month: { type: 'string', description: 'Optional YYYY-MM month for the usage breakdown.' },
+      },
+      required: [],
+    },
   },
   list_scheduled_chats: {
     description: 'List scheduled chats (newest first) for the authenticated user. Paginated: returns { items, nextCursor }; pass nextCursor back as cursor for the next page (null = last page).',

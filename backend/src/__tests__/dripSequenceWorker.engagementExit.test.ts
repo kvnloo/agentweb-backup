@@ -62,6 +62,8 @@ const enrollment = {
   currentStep: 0,
   status: 'active',
   enrolledAt: ENROLLED_AT,
+  // Opens/clicks only count once the sequence has sent this lead something (Opslane run 1268 P1).
+  lastEmailSentAt: '2026-07-02T00:00:00.000Z',
 };
 
 const sequenceWith = (onEmailEngagement: string[]) => ({
@@ -159,6 +161,26 @@ describe('drip engagement exit — the query must use a REAL partition key (ENG-
 
     expect(mockEvents).not.toHaveBeenCalled();
     expect(dripSequenceDb.exitEnrollment).not.toHaveBeenCalledWith('e1', 'engagement');
+  });
+
+  // Opslane run 1268 P2: accounts set up after ENG-265 have only emailDomains[].
+  it('queries every domain in emailDomains[] when the legacy emailDomain is empty, and exits', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValue({
+      userId: USER_ID,
+      emailDomains: [
+        { id: 'd1', domain: 'one.example', status: 'verified', addedAt: '' },
+        { id: 'd2', domain: 'two.example', status: 'verified', addedAt: '' },
+      ],
+    });
+    (dripSequenceDb.getSequence as jest.Mock).mockResolvedValue(sequenceWith(['replied']));
+    mockEvents.mockImplementation(async (d: string) =>
+      d === 'two.example' ? [{ eventType: 'email.received', leadEmail: LEAD_EMAIL, createdAt: ENGAGED_AT }] : [],
+    );
+
+    await processDueEnrollments();
+
+    expect(mockEvents.mock.calls.map((c: any[]) => c[0]).sort()).toEqual(['one.example', 'two.example']);
+    expect(dripSequenceDb.exitEnrollment).toHaveBeenCalledWith('e1', 'engagement');
   });
 
   it('does not query at all when the sequence has no engagement exit configured', async () => {

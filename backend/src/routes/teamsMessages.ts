@@ -68,13 +68,25 @@ router.post('/messages', async (req: Request, res: Response) => {
     return;
   }
 
-  await adapter.process(req, res, async (context) => {
-    logActivity(context.activity);
+  try {
+    await adapter.process(req, res, async (context) => {
+      logActivity(context.activity);
 
-    if (context.activity.type === 'message') {
-      await context.sendActivity(ACK_TEXT);
+      if (context.activity.type === 'message') {
+        await context.sendActivity(ACK_TEXT);
+      }
+    });
+  } catch (error) {
+    // CloudAdapter validates the activity's shape BEFORE it authenticates, and a body it
+    // cannot parse (e.g. no `type`) rejects without writing a response. Left uncaught that is
+    // an unhandled rejection and the request hangs until the client gives up — reachable by
+    // anyone who can POST here, no token required. Authentication failures are different:
+    // the SDK writes its own 401 and resolves, so they never land here.
+    console.error('❌ [teams] rejected malformed activity:', error);
+    if (!res.headersSent) {
+      res.status(400).json({ error: 'Invalid activity' });
     }
-  });
+  }
 });
 
 export default router;

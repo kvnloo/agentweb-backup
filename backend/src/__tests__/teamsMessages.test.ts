@@ -169,6 +169,15 @@ describe('POST /api/teams/messages', () => {
     expect(logged).toContain('a:1conv');
   });
 
+  it('answers 400 instead of hanging when the SDK rejects a malformed activity', async () => {
+    // CloudAdapter rejects a body without `type` before authenticating and writes no response.
+    mockProcess.mockRejectedValue(new Error('missing activity type'));
+
+    const res = await request(makeApp()).post('/api/teams/messages').send({ text: 'no type' });
+
+    expect(res.status).toBe(400);
+  });
+
   it('stays inside its slice — no session machinery in this route yet', async () => {
     // Session creation and the Teams adapter over the conversation port are the next change.
     // If a future edit wires them in here, this test is the thing that objects.
