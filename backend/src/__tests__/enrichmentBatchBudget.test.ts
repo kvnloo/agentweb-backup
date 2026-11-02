@@ -1,10 +1,11 @@
+process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret';
 jest.mock('../services/modelRoles', () => ({ resolveModelForUser: jest.fn() }));
 jest.mock('../services/tokenUsageService', () => ({
   checkTokenUsage: jest.fn(), TURN_ADMISSION: { recordAdmission: true },
 }));
 import { checkTokenUsage } from '../services/tokenUsageService';
 import { resolveModelForUser } from '../services/modelRoles';
-import { buildEnrichmentBudgetCheck, estimateEnrichmentBatchMicroUsd, projectAllowance, admissionEstimateMicroUsd, effectiveFieldCount, wantsEnigma, enigmaFetchUsd, webFieldGuardUsd } from '../services/enrichmentBatchBudget';
+import { buildEnrichmentBudgetCheck, estimateEnrichmentBatchMicroUsd, projectAllowance, admissionEstimateMicroUsd, effectiveFieldCount, wantsEnigma, enigmaFetchUsd, enigmaApplies, webFieldGuardUsd, expectedFieldCostUsd } from '../services/enrichmentBatchBudget';
 import type { EnrichmentConfig } from '../services/crmEnrichmentServiceV3';
 import { estimateEnrichmentCost } from '../services/enrichmentCostEstimate';
 const config: EnrichmentConfig = { fields: [], globalOverwriteDefault: 'fill_if_empty', schemaVersion: 1, updatedAt: '', updatedBy: '' };
@@ -39,9 +40,7 @@ describe('projectAllowance (ENG-2715/2720): a quote as percentage points of the 
   const status = (over: Record<string, unknown>) => ({ allowed: true, month: '2026-10', costAllowance: 100, costUsed: 10, costPercentUsed: 10, ...over });
 
   it('reports the extra points the expected cost uses, and never records admission', async () => {
-    check.mockReset()
-      .mockResolvedValueOnce(status({ costUsed: 10 }))
-      .mockResolvedValueOnce(status({ costUsed: 12.34 }));
+    check.mockReset().mockResolvedValue(status({ costAllowance: 100 }));
     const out = await projectAllowance('owner', 2_340_000);
     expect(out).toEqual({ percent: 2.3, withinAllowance: true });
     expect(check).toHaveBeenCalledWith('owner');
@@ -58,20 +57,14 @@ describe('projectAllowance (ENG-2715/2720): a quote as percentage points of the 
   });
 
   it('keeps a small run visible instead of rounding it to a whole point (a $0.60 run on a $150 allowance)', async () => {
-    check.mockReset()
-      .mockResolvedValueOnce(status({ costAllowance: 150, costUsed: 20 }))
-      .mockResolvedValueOnce(status({ costAllowance: 150, costUsed: 20.6 }));
+    check.mockReset().mockResolvedValue(status({ costAllowance: 150 }));
     expect((await projectAllowance('owner', 600_000)).percent).toBe(0.4);
-    check.mockReset()
-      .mockResolvedValueOnce(status({ costAllowance: 1000, costUsed: 0 }))
-      .mockResolvedValueOnce(status({ costAllowance: 1000, costUsed: 0.6 }));
+    check.mockReset().mockResolvedValue(status({ costAllowance: 1000 }));
     expect((await projectAllowance('owner', 600_000)).percent).toBe(0.06);
   });
 
   it('treats a zero-dollar allowance as fully used by any run', async () => {
-    check.mockReset()
-      .mockResolvedValueOnce(status({ costAllowance: 0, costUsed: 0 }))
-      .mockResolvedValueOnce(status({ costAllowance: 0, costUsed: 1 }));
+    check.mockReset().mockResolvedValue(status({ costAllowance: 0 }));
     expect((await projectAllowance('owner', 1_000_000)).percent).toBe(100);
   });
 
@@ -80,9 +73,28 @@ describe('projectAllowance (ENG-2715/2720): a quote as percentage points of the 
     expect((await projectAllowance('owner', 1_000_000)).percent).toBeNull();
   });
 
-  it('never goes negative and skips the usage read for a zero-cost quote', async () => {
-    check.mockReset().mockResolvedValueOnce(status({ costUsed: 50 })).mockResolvedValueOnce(status({ costUsed: 40 }));
-    expect((await projectAllowance('owner', 1_000_000)).percent).toBe(0);
+  it('ignores the ledger spend entirely, so a racing or failed-open read cannot skew the percent', async () => {
+    // spend read as $10 on one call and $0 (a read failing open) on the other: the quote must not move
+    check.mockReset()
+      .mockResolvedValueOnce(status({ costAllowance: 150, costUsed: 10 }))
+      .mockResolvedValueOnce(status({ costAllowance: 150, costUsed: 0 }));
+    expect((await projectAllowance('owner', 600_000)).percent).toBe(0.4);
+    check.mockReset()
+      .mockResolvedValueOnce(status({ costAllowance: 150, costUsed: 0 }))
+      .mockResolvedValueOnce(status({ costAllowance: 150, costUsed: 140 }));
+    expect((await projectAllowance('owner', 600_000)).percent).toBe(0.4);
+  });
+
+  it('uses two read-only usage checks, not three, and never records admission', async () => {
+    check.mockReset().mockResolvedValue(status({}));
+    await projectAllowance('owner', 1_000_000, 9_000_000);
+    expect(check).toHaveBeenCalledTimes(2);
+    expect(check).toHaveBeenCalledWith('owner');
+    expect(check).toHaveBeenCalledWith('owner', { projectedCostMicroUsd: 9_000_000 });
+    expect(check.mock.calls.some(([, o]) => o?.recordAdmission)).toBe(false);
+  });
+
+  it('skips the usage read for a zero-cost quote', async () => {
     check.mockReset();
     expect(await projectAllowance('owner', 0)).toEqual({ percent: 0, withinAllowance: true });
     expect(check).not.toHaveBeenCalled();
@@ -124,8 +136,10 @@ describe('admission estimate tracks what a run books (ENG-2720)', () => {
     expect(usd(withFields(n), 1)).toBeGreaterThanOrEqual(measuredPerLead(n) * 1.5);
   });
 
-  it.each([3, 10, 20])('with %i fields it stays within 8x of the customer-facing estimate', (n) => {
-    expect(usd(withFields(n), 112)).toBeLessThanOrEqual(estimateEnrichmentCost('l', 112).totalUsd * 8);
+  it.each([3, 10, 20, 40])('with %i fields it stays within 8x of the field-matched customer estimate', (n) => {
+    const quote = estimateEnrichmentCost('l', 112, { fieldCount: n }).totalUsd;
+    expect(usd(withFields(n), 112)).toBeGreaterThanOrEqual(quote);
+    expect(usd(withFields(n), 112)).toBeLessThanOrEqual(quote * 8);
   });
 
   it('no longer asks for ~$27 of headroom for 5 leads with a 20-field config', () => {
@@ -133,27 +147,67 @@ describe('admission estimate tracks what a run books (ENG-2720)', () => {
   });
 
   it('reserves nothing for the unused enrich.so phone finder', () => {
-    expect(usd(withFields(1), 1)).toBeLessThan(0.35);
+    // identity ~$0.38 (the Apollo waterfall counted twice) + one field $0.02; the old $0.25 phone line alone is gone
+    expect(usd(withFields(1), 1)).toBeLessThan(0.45);
   });
 
-  it('reserves one Enigma fetch only when a card-revenue field is configured, by name (how real configs carry them)', () => {
+  it('reserves one WORST-CASE Enigma fetch only when a card-revenue field is configured, by name (how real configs carry them)', () => {
     const plain = usd(named('Industry', 'Employees'), 10);
     const withRevenue = usd(named('Industry', 'card_revenue_12m'), 10);
-    const perLeadEnigma = 0.1 + 0.1 + 4 * 0.02;
-    expect(withRevenue - plain).toBeCloseTo(perLeadEnigma * 10, 6);
+    const worstCase = 4 * 0.1 + 6 * 0.02; // 4 card rows at the 12m rate + a name and 5 websites (enigmaGraphql.ts ceiling: 52 credits)
+    expect(withRevenue - plain).toBeCloseTo(worstCase * 10, 4);
     // any card field triggers the same single fetch, and several of them do not stack
-    expect(usd(named('Industry', 'card_revenue_period_end'), 10) - plain).toBeCloseTo(perLeadEnigma * 10, 6);
+    expect(usd(named('Industry', 'card_revenue_period_end'), 10) - plain).toBeCloseTo(worstCase * 10, 4);
     const threePlain = usd(named('Industry', 'Employees', 'Founded'), 10);
-    expect(usd(named('Industry', 'card_revenue_12m', 'card_revenue_yoy_growth'), 10) - threePlain).toBeCloseTo(perLeadEnigma * 10, 6);
+    expect(usd(named('Industry', 'card_revenue_12m', 'card_revenue_yoy_growth'), 10) - threePlain).toBeCloseTo(worstCase * 10, 4);
   });
 
-  it('wantsEnigma ignores excluded card fields and enigmaFetchUsd matches the admission reserve', () => {
+  it('reserves no Enigma for a user who cannot buy it (not on the allowlist)', () => {
+    const cfg = named('Industry', 'card_revenue_12m');
+    expect(estimateEnrichmentBatchMicroUsd(cfg, 10, undefined, false)).toBe(estimateEnrichmentBatchMicroUsd(named('Industry', 'Employees'), 10));
+    expect(estimateEnrichmentBatchMicroUsd(cfg, 10, undefined, true)).toBeGreaterThan(estimateEnrichmentBatchMicroUsd(cfg, 10, undefined, false));
+  });
+
+  it('enigmaApplies needs both a card-revenue field and the user on the Enigma allowlist', () => {
+    const env = { ...process.env };
+    try {
+      process.env.ENIGMA_ENRICHMENT_ENABLED = 'true';
+      process.env.ENIGMA_ENRICHMENT_USER_ALLOWLIST = 'owner,other';
+      expect(enigmaApplies(named('card_revenue_12m'), 'owner')).toBe(true);
+      expect(enigmaApplies(named('card_revenue_12m'), 'stranger')).toBe(false);
+      expect(enigmaApplies(named('Industry'), 'owner')).toBe(false);
+      process.env.ENIGMA_ENRICHMENT_ENABLED = 'false';
+      expect(enigmaApplies(named('card_revenue_12m'), 'owner')).toBe(false);
+    } finally {
+      process.env.ENIGMA_ENRICHMENT_ENABLED = env.ENIGMA_ENRICHMENT_ENABLED;
+      process.env.ENIGMA_ENRICHMENT_USER_ALLOWLIST = env.ENIGMA_ENRICHMENT_USER_ALLOWLIST;
+      if (env.ENIGMA_ENRICHMENT_ENABLED === undefined) delete process.env.ENIGMA_ENRICHMENT_ENABLED;
+      if (env.ENIGMA_ENRICHMENT_USER_ALLOWLIST === undefined) delete process.env.ENIGMA_ENRICHMENT_USER_ALLOWLIST;
+    }
+  });
+
+  it('wantsEnigma ignores excluded card fields; the expected fetch sits between typical and worst case', () => {
     const off: EnrichmentConfig = { ...config, fields: [{ name: 'card_revenue_12m', type: 'string', instruction: '', include: false, overwritePolicy: 'fill_if_empty' }] };
     expect(wantsEnigma(off)).toBe(false);
     expect(wantsEnigma(named('Industry'))).toBe(false);
     expect(wantsEnigma(named('Industry', 'card_revenue_period_end'))).toBe(true);
-    expect(enigmaFetchUsd()).toBeCloseTo(0.1 + 0.1 + 4 * 0.02, 6);
-    expect(usd(named('card_revenue_12m'), 10) - usd(named('Industry'), 10)).toBeCloseTo(enigmaFetchUsd() * 10, 6);
+    expect(enigmaFetchUsd('expected')).toBeCloseTo(0.1 + 0.1 + 4 * 0.02, 6);
+    expect(enigmaFetchUsd('worstCase')).toBeCloseTo(0.52, 6);
+    expect(enigmaFetchUsd()).toBe(enigmaFetchUsd('expected'));
+    expect(enigmaFetchUsd('expected')).toBeGreaterThan(0.19); // ~19 credits typical (enigmaGraphql.ts)
+    expect(enigmaFetchUsd('expected')).toBeLessThan(enigmaFetchUsd('worstCase'));
+  });
+
+  it('the expected field cost is model-aware and never below the measured Luna figure', () => {
+    expect(expectedFieldCostUsd()).toBeCloseTo(0.002, 6);
+    expect(expectedFieldCostUsd('openrouter/openai/gpt-5.6-luna')).toBeCloseTo(0.002, 6);
+    expect(expectedFieldCostUsd('gpt-5.5')).toBeGreaterThan(0.008);
+    expect(expectedFieldCostUsd('no-such-model-xyz')).toBe(expectedFieldCostUsd('gpt-5.5'));
+  });
+
+  it('counts the Apollo email waterfall twice in the reserve (it can fire at two resolver tiers with no cache between)', () => {
+    const one = usd(withFields(1), 1);
+    expect(one).toBeGreaterThan(0.0495 + 0.099 + 0.0495 + 0.005 + 0.05 + 0.025 + 0.02);
   });
 
   it('routes by aliasFor || name like the orchestrator does', () => {

@@ -13,7 +13,8 @@
  * scales with the saved config's field count and the Apollo line with the leads that lack an
  * email; customers see the result as a percent of their allowance, never as dollars.
  */
-import { createHash } from 'crypto';
+import { createHmac } from 'crypto';
+import { getJwtSecret } from '../config/jwt';
 import { getAllocatedRate } from '../utils/vendorRateCard';
 
 export const ENRICHMENT_COST_RATES_USD = {
@@ -62,8 +63,12 @@ export interface EstimateInputs {
   emaillessCount?: number;
   /** Included fields plus smart-field dependencies in the saved config. Defaults to the reference config. */
   fieldCount?: number;
-  /** USD one Enigma card-revenue fetch books per lead; set only when the config asks for a card-revenue field. */
+  /** USD one Enigma card-revenue fetch books per lead; set only when the config asks for a card-revenue field the user may buy. */
   enigmaPerLeadUsd?: number;
+  /** Expected booked cost of one web field for one lead on the enrichment model (model-aware); defaults to the Luna figure. */
+  fieldCostUsd?: number;
+  /** Whose quote this is: bound into the confirmation token so one user's token cannot confirm another's run. */
+  userId?: string;
 }
 
 export function estimateEnrichmentCost(listId: string, leadCount: number, inputs: EstimateInputs = {}): EnrichmentCostEstimate {
@@ -75,7 +80,8 @@ export function estimateEnrichmentCost(listId: string, leadCount: number, inputs
   const apolloWaterfallUsd = getAllocatedRate('apollo', 'waterfall_email');
   if (apolloWaterfallUsd === null) throw new Error('Apollo waterfall_email rate unavailable');
   const apollo = emailless * apolloWaterfallUsd * r.apolloRevealRate;
-  const llm = n * fields * r.llmPerFieldPerLead;
+  const perField = Number.isFinite(inputs.fieldCostUsd) && (inputs.fieldCostUsd as number) > 0 ? (inputs.fieldCostUsd as number) : r.llmPerFieldPerLead;
+  const llm = n * fields * perField;
   const enigmaPerLead = Number.isFinite(inputs.enigmaPerLeadUsd) && (inputs.enigmaPerLeadUsd as number) > 0 ? (inputs.enigmaPerLeadUsd as number) : 0;
   const lookups = n * r.lookupPerLead;
   const webSearch = n * r.webSearchPerLead;
@@ -93,7 +99,7 @@ export function estimateEnrichmentCost(listId: string, leadCount: number, inputs
       webSearch: round2(webSearch),
       other: round2(other),
     },
-    confirmationToken: confirmationTokenFor(listId, n, totalUsd),
+    confirmationToken: confirmationTokenFor(inputs.userId ?? '', listId, n, totalUsd),
   };
 }
 
@@ -104,7 +110,7 @@ export function estimateEnrichmentCost(listId: string, leadCount: number, inputs
  */
 export interface CustomerEnrichmentEstimate {
   leadCount: number;
-  /** Share of the monthly usage allowance this run is expected to use, percent to 1 dp; null when the plan has no dollar allowance. */
+  /** Share of the monthly usage allowance this run is expected to use, percent (2 decimals under 1%, otherwise 1); null when the plan has no dollar allowance. */
   estimatedPercentOfAllowance: number | null;
   /** Whether the run is expected to be admitted against the remaining allowance (conservative check). */
   withinAllowance: boolean;
@@ -124,9 +130,15 @@ export function toCustomerEstimate(
   };
 }
 
-export function confirmationTokenFor(listId: string, leadCount: number, totalUsd: number): string {
-  return createHash('sha256')
-    .update(`enrich-v3-estimate:v1:${listId}:${leadCount}:${totalUsd.toFixed(2)}`)
+/**
+ * Opaque confirmation token for one quote. It is an HMAC under a server secret and bound to the user, so a
+ * customer cannot brute-force it back into the dollar total it commits to (an unkeyed hash of
+ * list id + lead count + total was recoverable in milliseconds, which would have leaked our allocated
+ * rates through the very quote that hides them). Stable across instances: the secret is the shared JWT secret.
+ */
+export function confirmationTokenFor(userId: string, listId: string, leadCount: number, totalUsd: number): string {
+  return createHmac('sha256', getJwtSecret())
+    .update(`enrich-v3-estimate:v2:${userId}:${listId}:${leadCount}:${totalUsd.toFixed(2)}`)
     .digest('hex')
     .slice(0, 32);
 }

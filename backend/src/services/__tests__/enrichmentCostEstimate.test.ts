@@ -1,3 +1,5 @@
+process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret';
+import { createHash } from 'crypto';
 import {
   estimateEnrichmentCost,
   checkEstimateConfirmation,
@@ -80,6 +82,48 @@ describe('estimateEnrichmentCost (ENG-2716)', () => {
     expect(estimateEnrichmentCost('l', 10).confirmationToken).toBe(a);
     expect(estimateEnrichmentCost('l', 11).confirmationToken).not.toBe(a);
     expect(estimateEnrichmentCost('m', 10).confirmationToken).not.toBe(a);
+  });
+
+  // Review finding: the token was sha256(listId:count:total) with no key, so a customer could brute-force it
+  // back into the dollar total (recovered in milliseconds), leaking our allocated rates through the quote that hides them.
+  describe('confirmation token does not leak the dollar total', () => {
+    it('is bound to the user, so one user\'s token cannot confirm another\'s run', () => {
+      const a = estimateEnrichmentCost('l', 10, { userId: 'u1' }).confirmationToken;
+      expect(estimateEnrichmentCost('l', 10, { userId: 'u1' }).confirmationToken).toBe(a);
+      expect(estimateEnrichmentCost('l', 10, { userId: 'u2' }).confirmationToken).not.toBe(a);
+    });
+
+    it('is not the old unkeyed hash, so it cannot be inverted by trying every cent total', () => {
+      const est = estimateEnrichmentCost('list-1', 112, { userId: 'u1' });
+      const unkeyed = (total: number) => createHash('sha256').update(`enrich-v3-estimate:v1:list-1:112:${total.toFixed(2)}`).digest('hex').slice(0, 32);
+      expect(est.confirmationToken).not.toBe(unkeyed(est.totalUsd));
+      let recovered: number | undefined;
+      for (let cents = 0; cents <= 100_000; cents++) {
+        if (unkeyed(cents / 100) === est.confirmationToken) { recovered = cents / 100; break; }
+      }
+      expect(recovered).toBeUndefined();
+    });
+
+    it('changes with the server secret (a different instance secret cannot validate it)', () => {
+      const before = estimateEnrichmentCost('l', 10, { userId: 'u1' }).confirmationToken;
+      const saved = process.env.JWT_SECRET;
+      process.env.JWT_SECRET = 'another-secret';
+      try {
+        expect(estimateEnrichmentCost('l', 10, { userId: 'u1' }).confirmationToken).not.toBe(before);
+      } finally { process.env.JWT_SECRET = saved; }
+    });
+
+    it('fails loud rather than minting a guessable token if the secret is missing', () => {
+      const saved = process.env.JWT_SECRET;
+      delete process.env.JWT_SECRET;
+      try { expect(() => estimateEnrichmentCost('l', 10)).toThrow(/JWT_SECRET/); } finally { process.env.JWT_SECRET = saved; }
+    });
+  });
+
+  it('a model-aware field cost lifts the LLM line, and a bad one falls back to the Luna figure', () => {
+    const base = estimateEnrichmentCost('l', 10);
+    expect(estimateEnrichmentCost('l', 10, { fieldCostUsd: 0.009 }).breakdownUsd.llm).toBeGreaterThan(base.breakdownUsd.llm * 4);
+    for (const bad of [0, -1, NaN]) expect(estimateEnrichmentCost('l', 10, { fieldCostUsd: bad }).totalUsd).toBe(base.totalUsd);
   });
 });
 
