@@ -1,4 +1,8 @@
-/** rvh13sec C-series: several hostile turns at once next to one honest turn, real child processes: host RSS peak, loop stalls, honest-event latency. */
+/**
+ * ENG-2113 measurement (not a gate; opt-in with AW_MEASURE_CONCURRENT=1, about 90 s): eight hostile turns at once next to one honest turn, with real child processes:
+ * host RSS peak, loop busy time, longest stall and the honest turn's event delay. Printed as RESULT C lines; there are no timing assertions (they would flake on a
+ * loaded machine). Ported from the final security review's C series.
+ */
 import { performance } from "perf_hooks";
 import { cleanup, drainTurn, makeRig } from "./rig";
 
@@ -64,7 +68,7 @@ async function scenario(label: string, hostileJs: string, honestEventsPerSec = 1
   return res;
 }
 
-describe("rvh13sec C: concurrent hostile turns", () => {
+(process.env.AW_MEASURE_CONCURRENT ? describe : describe.skip)("concurrent hostile turns (measurement)", () => {
   it("8 turns, each: 15.5 MB non-ASCII text line (valid event) x2", async () => {
     await scenario("8x 15.5MB lines", `const l=JSON.stringify({type:"assistant",message:{id:"m",content:[{type:"text",text:"é".repeat(7_000_000)}]}})+"\\n"; h.out(l); await h.sleep(200); h.out(l); await h.sleep(20000);`);
   });
