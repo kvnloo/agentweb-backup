@@ -498,6 +498,32 @@ describe("relay: limits and abuse", () => {
     await ep.close();
   });
 
+  it("MUTATION TARGET: a connection that sent ONE complete frame and then goes silent is still cut at idleMs (the idle timer is re-armed per frame, not just dropped)", async () => {
+    const r = rig({ idleMs: 300 });
+    const { ep } = await r.open();
+    const c = new Client(sockOf(ep));
+    await c.ready();
+    c.send({ type: "ping" });
+    await new Promise((res) => setTimeout(res, 120));
+    expect(c.closed).toBe(false); // not yet: the timer restarted at the frame
+    await until(() => c.closed, 3000);
+    expect(r.logs.map((l) => l.fields?.code)).toContain("idle_timeout");
+    await ep.close();
+  });
+
+  it("MUTATION TARGET: a slow-loris sender (one byte per 100 ms of a frame that never completes) is cut at idleMs even though bytes keep arriving", async () => {
+    const r = rig({ idleMs: 400 });
+    const { ep } = await r.open();
+    const c = new Client(sockOf(ep));
+    await c.ready();
+    for (let i = 0; i < 14 && !c.closed; i++) {
+      c.raw(i === 0 ? "{" : " ");
+      await new Promise((res) => setTimeout(res, 100));
+    }
+    expect(c.closed).toBe(true);
+    await ep.close();
+  });
+
   it("flood: frames beyond the token bucket drop the connection; nothing past the burst reaches onCall", async () => {
     const r = rig({ burst: 5, refillPerSec: 1 });
     const { ep, calls } = await r.open();
