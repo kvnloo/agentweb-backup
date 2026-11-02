@@ -9,7 +9,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { Layout } from "../ports/layout";
 import { RelayHost, type RelayCall, type RelayEndpoint } from "../relay/relayServer";
-import { RELAY_RESULT_MAX_BYTES, type ToolDef } from "../protocol";
+import { RELAY_FRAME_LIMITS, RELAY_RESULT_MAX_BYTES, TOOL_LIMITS, type ToolDef } from "../protocol";
 
 const SHIM = join(__dirname, "..", "deploy", "aw-relay-shim.js");
 const roots: string[] = [];
@@ -65,6 +65,25 @@ async function until(cond: () => boolean, ms = 4000): Promise<void> {
 }
 
 const META = { "anthropic/maxResultSizeChars": RELAY_RESULT_MAX_BYTES };
+
+describe("relay shim: the standalone constants equal the protocol's", () => {
+  const src = readFileSync(SHIM, "utf8");
+  const constant = (name: string): number => {
+    const m = src.match(new RegExp("^const " + name + " = ([0-9 *]+);", "m"));
+    expect(m).not.toBeNull();
+    return Function("return " + m![1])() as number;
+  };
+  it("MUTATION TARGET: HOST_TO_SHIM_MAX (the largest frame the shim accepts from the host) is RELAY_FRAME_LIMITS.hostToShimBytes: 8 MiB (a smaller one would drop a legitimate large result)", () => {
+    expect(constant("HOST_TO_SHIM_MAX")).toBe(RELAY_FRAME_LIMITS.hostToShimBytes);
+    expect(RELAY_FRAME_LIMITS.hostToShimBytes).toBe(8 * 1024 * 1024);
+  });
+  it("MUTATION TARGET: SHIM_TO_HOST_MAX is RELAY_FRAME_LIMITS.shimToHostBytes", () => {
+    expect(constant("SHIM_TO_HOST_MAX")).toBe(RELAY_FRAME_LIMITS.shimToHostBytes);
+  });
+  it("MUTATION TARGET: MAX_TOOLS is TOOL_LIMITS.maxTools", () => {
+    expect(constant("MAX_TOOLS")).toBe(TOOL_LIMITS.maxTools);
+  });
+});
 
 describe("relay shim: per-tool result threshold (_meta)", () => {
   it("MUTATION TARGET: the shim's constant equals RELAY_RESULT_MAX_BYTES (it is standalone, so a test keeps them equal)", () => {
