@@ -21,6 +21,8 @@ interface World {
   countHangs?: boolean;
   /** The first status write fails (a retry then finds the engagement already recorded). */
   statusFailsOnce?: boolean;
+  /** The status write for this list always fails. */
+  statusFailsFor?: string;
 }
 const lead = (listId: string, leadId: string, email: string, over: Record<string, any> = {}) => ({ listId, leadId, email, updatedAt: "2026-10-29T10:00:00.000Z", engagements: [], system: { [`smartlead_${CAMPAIGN}`]: marker("run-ok") }, ...over });
 
@@ -43,6 +45,7 @@ function make(w: World) {
       w.appended.push({ listId, leadId, ...engagement });
     },
     setContactStatus: async (listId, leadId, fields) => {
+      if (w.statusFailsFor === listId) throw new Error("db down for this list");
       if (w.statusFailsOnce && !(w as any).statusFailed) { (w as any).statusFailed = true; throw new Error("db blip"); }
       const l = w.leads.find(x => x.listId === listId && x.leadId === leadId)!;
       Object.assign(l, fields);
@@ -590,6 +593,16 @@ describe("counting a run's replied, bounced and unsubscribed contacts for the ru
     await make(w).handle(ctx, unsub());
     expect(w.statusWrites).toHaveLength(2);
     expect(w.counted!.map(c => c.statusWritesSoFar)).toEqual([2, 2]);
+  });
+
+  it("when a later list's block fails (Smartlead will retry), the first list's block is still counted", async () => {
+    const w = pushed({ statusFailsFor: "L2", leads: [
+      lead("L1", "a", "ann@example.com", { system: { [`smartlead_${CAMPAIGN}`]: marker("run-ok") } }),
+      lead("L2", "b", "ann@example.com", { system: { [`smartlead_${CAMPAIGN}`]: marker("run-ok") } }),
+    ] });
+    await expect(make(w).handle(ctx, unsub())).rejects.toThrow("db down");
+    expect(w.leads[0].contactStatus).toBe("unsubscribed"); // the first block was written...
+    expect(kinds(w)).toEqual(["run-ok:unsubscribed"]); // ...so it is counted, once
   });
 
   it("a counter that never answers does not hold up the response for more than a couple of seconds", async () => {
