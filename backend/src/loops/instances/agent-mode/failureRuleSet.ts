@@ -41,6 +41,11 @@ export interface AgentFailureProposalPayload {
    * policy, which is why 35% of dispatches were not handler bugs.
    */
   failureType: string;
+  /**
+   * ENG-589: up to 3 representative traces (`run <runId>` + session when known)
+   * for this failure class, so a filed issue links straight to evidence.
+   */
+  sampleTraces?: string[];
   directive: string;
 }
 
@@ -78,7 +83,11 @@ interface ToolStats {
   /** Representative message per (failure class, error class) pair. */
   messagesByType: Map<string, string>;
   errorClassesByType: Map<string, Map<string, number>>;
+  /** ENG-589: up to MAX_SAMPLE_TRACES distinct trace refs per failure class. */
+  tracesByType: Map<string, string[]>;
 }
+
+const MAX_SAMPLE_TRACES = 3;
 
 /**
  * Failure classes that are NOT a handler defect, so they must never be dispatched
@@ -171,6 +180,7 @@ export class AgentFailureRuleSet
         failureTypes: new Map<string, number>(),
         messagesByType: new Map<string, string>(),
         errorClassesByType: new Map<string, Map<string, number>>(),
+        tracesByType: new Map<string, string[]>(),
       };
       if (e.eventType === EVT_TOOL_INVOKED) {
         stats.invocations++;
@@ -187,6 +197,11 @@ export class AgentFailureRuleSet
         const perType = stats.errorClassesByType.get(ft) ?? new Map<string, number>();
         perType.set(ec, (perType.get(ec) ?? 0) + 1);
         stats.errorClassesByType.set(ft, perType);
+        const traces = stats.tracesByType.get(ft) ?? [];
+        const sid = strDim(e.dimensions?.sessionId);
+        const ref = `run ${String(e.subjectId)}${sid ? ` (session ${sid})` : ''}`;
+        if (traces.length < MAX_SAMPLE_TRACES && !traces.includes(ref)) traces.push(ref);
+        stats.tracesByType.set(ft, traces);
       }
       byTool.set(toolName, stats);
     }
@@ -262,6 +277,7 @@ export class AgentFailureRuleSet
             failureRate,
             topErrorClass,
             failureType,
+            sampleTraces: [...(stats.tracesByType.get(failureType) ?? [])],
             directive: directiveFor(
               failureType,
               stats.toolName,
