@@ -316,16 +316,33 @@ describe("worker protocol check (host.info)", () => {
     expect(p.workerProtocol()).toBe(PROTOCOL_VERSION);
   });
 
-  it("a different version is a logged 'mismatch' (never fatal: the client is still returned)", async () => {
-    const p = mk(async () => ({ protocol: PROTOCOL_VERSION + 1, node: "v22", uptimeSec: 1 }));
+  it("a version outside the accepted set is a logged 'mismatch' (never fatal: the client is still returned)", async () => {
+    const p = mk(async () => ({ protocol: 5, node: "v22", uptimeSec: 1 }));
     await settle(p);
     expect(p.protocolStatus()).toBe("mismatch");
-    expect(p.workerProtocol()).toBe(PROTOCOL_VERSION + 1);
+    expect(p.workerProtocol()).toBe(5);
     expect(p.client()).toBeInstanceOf(LoginHostClient);
     expect(logged.filter((l) => l.includes("login_host_protocol_mismatch"))).toHaveLength(1);
     await settle(p);
     await settle(p);
     expect(logged.filter((l) => l.includes("login_host_protocol_mismatch"))).toHaveLength(1); // once, not every minute
+  });
+
+  it("workers at protocol 2, 3 and 4 (the relay, deployed ahead of the backend that speaks it) are accepted, and workerProtocol() says which one it is", async () => {
+    for (const v of [2, 3, 4]) {
+      logged.length = 0;
+      const p = mk(async () => ({ protocol: v, node: "v22", uptimeSec: 1 }));
+      await settle(p);
+      expect(p.protocolStatus()).toBe("match");
+      expect(p.workerProtocol()).toBe(v);
+      expect(logged.filter((l) => l.includes("login_host_protocol_mismatch"))).toHaveLength(0);
+    }
+  });
+
+  it("an older worker (1) is a mismatch (it refuses fields this backend sends)", async () => {
+    const p = mk(async () => ({ protocol: 1, node: "v22", uptimeSec: 1 }));
+    await settle(p);
+    expect(p.protocolStatus()).toBe("mismatch");
   });
 
   it("an older worker (unknown route) stays 'unknown' with a logged cause, retried on each refresh until it answers, then flips to match without a restart", async () => {
@@ -350,7 +367,7 @@ describe("worker protocol check (host.info)", () => {
     const p = mk(async () => ({ protocol, node: "v22", uptimeSec: 1 }));
     await settle(p);
     expect(p.protocolStatus()).toBe("match");
-    protocol = PROTOCOL_VERSION + 1;
+    protocol = 5;
     now += PROTOCOL_RECHECK_MS - 1;
     await settle(p);
     expect(p.protocolStatus()).toBe("match"); // not yet

@@ -1,4 +1,5 @@
 import { mapManageBrandUpdate } from '../../utils/brandGuidelines';
+import { summarizeItemizedUsage, USAGE_MONTH_PATTERN } from './usageBreakdown';
 import { findAmbiguousMergeTargets, findConflictingMergeTargets, findStepContentLoss, mergeWorkPlanSteps, summarizeStepChange } from '../../services/workPlanSteps';
 import { carryStoredStepModels } from '../../services/agentMode/workPlanStepModels';
 /**
@@ -14,6 +15,7 @@ import { carryStoredStepModels } from '../../services/agentMode/workPlanStepMode
 import { mcpToolRegistry } from './registry';
 import { mcpFetch } from './httpClient';
 import './adminLookupTools';
+import './readEmailTool';
 import type { AgentRunStatus } from '../../services/agentMode/runStore';
 import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService';
 import { SCHEDULED_CHATS_DEFAULT_LIMIT, SCHEDULED_CHATS_MAX_LIMIT } from '../../utils/scheduledChatsPage';
@@ -23,6 +25,7 @@ import { SCHEDULED_CHATS_DEFAULT_LIMIT, SCHEDULED_CHATS_MAX_LIMIT } from '../../
 // ENG-982: `ctx` and `jsonResult` moved to ./toolHelpers so workflowTools.ts can
 // share them instead of keeping a second copy. Behaviour unchanged.
 import { omitBranchedFrom } from '../../utils/adminOnlyMessageFilter';
+import { branchOwnMessages } from '../../services/agentMode/chatBranching';
 import { omitActiveRun } from '../../services/agentMode/sessionActiveRunGuard';
 import { ctx, jsonResult, CLIENT_ID_SCHEMA_PROPERTY } from './toolHelpers';
 import { publishWithdrawnMidFlight } from '../../utils/scheduledPublishConsentGuard';
@@ -3405,7 +3408,9 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
       // spend from assistant turns timestamped inside [start_time, end_time).
       let inWindowCostMicro = 0;
       let timestampedAssistantTurns = 0;
-      for (const msg of messages) {
+      // ENG-2648: a branch's copied rows ran (with their models, waits and heap) in its SOURCE; attributing
+      // them to the branch would report models and turns that never ran here. Only its own rows count.
+      for (const msg of branchOwnMessages(messages)) {
         if (msg?.role !== 'assistant') continue;
         assistantTurnCount++;
         const turnCost = msg?.usage?.estimated_cost || 0;
@@ -3821,7 +3826,7 @@ mcpToolRegistry.register({
   name: 'monitor_lead_volume',
   definition: {
     name: 'monitor_lead_volume',
-    description: `Report spend and CRM-landed leads per Meta ad campaign per day for a specific client, and flag campaigns whose lead volume has collapsed relative to THAT CAMPAIGN'S OWN history. Admin-only tool.
+    description: `Report spend and CRM-landed leads per Meta ad campaign per day for a specific client, and flag campaigns whose lead volume has collapsed relative to THAT CAMPAIGN'S OWN history. Admin-only tool. Pass the client's name or email as client_name_or_email; client_id and client_email are accepted aliases.
 
 Trigger is distribution-aware, not a fixed day count: a campaign is flagged only when its trailing 7-day lead average falls below its OWN 5th-percentile historical floor. A campaign needs at least 14 days of baseline history (excluding the trailing window) before it can be flagged at all — with less, status is 'insufficient_history', not 'normal' or 'drought'.
 
@@ -4346,14 +4351,41 @@ mcpToolRegistry.register({
 
 // ─── Account ─────────────────────────────────────────────────────────────────
 
+const USAGE_MONTH_SCHEMA_PROPERTY = {
+  type: 'string',
+  description: 'Optional YYYY-MM. When set, include usage_breakdown (tokens and calls by model/day, session count) for that month.',
+};
+
+/**
+ * ENG-758: optional usage breakdown. Absent month = no extra read (status stays cheap).
+ * An invalid month or a failed ledger read is reported in-band, never fabricated and
+ * never allowed to fail the status read itself.
+ */
+async function readUsageBreakdown(month: unknown, context: any): Promise<Record<string, unknown>> {
+  if (month === undefined || month === null || month === '') return {};
+  if (typeof month !== 'string' || !USAGE_MONTH_PATTERN.test(month)) {
+    return { usage_breakdown_error: 'usage_month must be YYYY-MM' };
+  }
+  try {
+    const payload = await mcpFetch({
+      method: 'GET',
+      path: `/api/subscription/usage/itemized?month=${encodeURIComponent(month)}`,
+      context,
+    });
+    return { usage_breakdown: summarizeItemizedUsage(payload, month) };
+  } catch {
+    return { usage_breakdown_error: 'Usage data is temporarily unavailable' };
+  }
+}
+
 mcpToolRegistry.register({
   name: 'get_account_status',
   definition: {
     name: 'get_account_status',
-    description: "Get the current user's account status, subscription plan, and usage. Admin-only: pass client_id to check a specific client's status instead of the caller's own.",
+    description: "Get the current user's account status, subscription plan, and usage. Pass usage_month (YYYY-MM) to also get that month's LLM token/call totals by model and by day plus a session count. Admin-only: pass client_id to check a specific client's status instead of the caller's own.",
     inputSchema: {
       type: 'object',
-      properties: { client_id: CLIENT_ID_SCHEMA_PROPERTY },
+      properties: { client_id: CLIENT_ID_SCHEMA_PROPERTY, usage_month: USAGE_MONTH_SCHEMA_PROPERTY },
       required: []
     }
   },
@@ -4400,6 +4432,7 @@ mcpToolRegistry.register({
       current_period_end: me?.current_period_end ?? null,
       allowed_features: Array.isArray(me?.allowedPages) ? me.allowedPages : [],
       api_key_count: apiKeyCount,
+      ...(await readUsageBreakdown(args?.usage_month, c)),
     });
   }
 });

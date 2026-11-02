@@ -199,6 +199,7 @@ describe('CRM Group Email Endpoints', () => {
         eligibleLeads: 2,
         unsubscribedCount: 1,
         doNotContactCount: 1,
+        smartleadCount: 0,
         noEmailCount: 1,
         undeliverableCount: 0,
         riskyCount: 0,
@@ -232,6 +233,7 @@ describe('CRM Group Email Endpoints', () => {
         eligibleLeads: 2,
         unsubscribedCount: 0,
         doNotContactCount: 0,
+        smartleadCount: 0,
         noEmailCount: 0,
         undeliverableCount: 0,
         riskyCount: 0,
@@ -267,6 +269,106 @@ describe('CRM Group Email Endpoints', () => {
       expect(response.invalidEmails.sort()).toEqual(
         ['queue-verify@example.com', 'noTld@updates', 'harsha..v@agentweb.pro'].sort(),
       );
+    });
+  });
+
+  describe('ENG-673 — leads pushed to a customer\'s Smartlead campaign', () => {
+    it('preview leaves pushed (and withdrawn) leads out of the eligible count and reports them; a released marker is eligible again', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-1', userId: 'test-user-id' });
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: [
+          { leadId: '1', email: 'plain@agentweb.pro' },
+          { leadId: '2', email: 'pushed@agentweb.pro', system: { smartlead_77: { state: 'pushed', pushedAt: 'x', runId: 'r', payloadHash: 'h' } } },
+          { leadId: '3', email: 'withdrawn@agentweb.pro', system: { smartlead_77: { state: 'withdrawn', pushedAt: 'x', runId: 'r', payloadHash: 'h' } } },
+          { leadId: '4', email: 'released@agentweb.pro', system: { smartlead_77: { state: 'released', pushedAt: 'x', runId: 'r', payloadHash: 'h' } } },
+        ],
+        lastEvaluatedKey: undefined,
+      });
+      const handler = findHandler('/lists/:listId/group-email/preview', 'post');
+      await handler!(mockReq, mockRes);
+      const response = (mockRes.json as jest.Mock).mock.calls[0][0];
+      expect(response.totalLeads).toBe(4);
+      expect(response.smartleadCount).toBe(2);
+      expect(response.eligibleLeads).toBe(2);
+    });
+
+    it('a lead that is both do-not-contact and pushed is counted once (as do-not-contact), not twice', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-1', userId: 'test-user-id' });
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: [
+          { leadId: '1', email: 'both@agentweb.pro', contactStatus: 'unsubscribed', system: { smartlead_77: { state: 'pushed', pushedAt: 'x', runId: 'r', payloadHash: 'h' } } },
+          { leadId: '2', email: 'plain@agentweb.pro' },
+        ],
+        lastEvaluatedKey: undefined,
+      });
+      const handler = findHandler('/lists/:listId/group-email/preview', 'post');
+      await handler!(mockReq, mockRes);
+      const response = (mockRes.json as jest.Mock).mock.calls[0][0];
+      expect(response.doNotContactCount).toBe(1);
+      expect(response.smartleadCount).toBe(0);
+      expect(response.eligibleLeads).toBe(1);
+    });
+
+    it('send to an explicit selection still leaves a selected pushed lead out', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-1', userId: 'test-user-id' });
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: [
+          { leadId: '1', email: 'plain@agentweb.pro' },
+          { leadId: '2', email: 'pushed@agentweb.pro', system: { smartlead_77: { state: 'pushed', pushedAt: 'x', runId: 'r', payloadHash: 'h' } } },
+          { leadId: '3', email: 'other@agentweb.pro' },
+        ],
+        lastEvaluatedKey: undefined,
+      });
+      (resendService.sendEmail as jest.Mock).mockResolvedValue({ id: 'msg-1' });
+      mockReq.body = { senderEmail: 'me@test.com', senderName: 'Me', subject: 'Hi', htmlContent: '<p>Hello</p>', leadIds: ['1', '2'] };
+      const handler = findHandler('/lists/:listId/group-email/send', 'post');
+      await handler!(mockReq, mockRes);
+      expect((resendService.sendEmail as jest.Mock).mock.calls.map(c => c[0].to)).toEqual(['plain@agentweb.pro']);
+      const response = (mockRes.json as jest.Mock).mock.calls[0][0];
+      expect(response.total).toBe(1);
+      expect(response.skippedSmartlead).toBe(1);
+    });
+
+    it('prepare counts the same recipients as preview', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-1', userId: 'test-user-id' });
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: [
+          { leadId: '1', email: 'plain@agentweb.pro' },
+          { leadId: '2', email: 'pushed@agentweb.pro', system: { smartlead_77: { state: 'pushed', pushedAt: 'x', runId: 'r', payloadHash: 'h' } } },
+          { leadId: '3', email: 'withdrawn@agentweb.pro', system: { smartlead_77: { state: 'withdrawn', pushedAt: 'x', runId: 'r', payloadHash: 'h' } } },
+          { leadId: '4', email: 'released@agentweb.pro', system: { smartlead_77: { state: 'released', pushedAt: 'x', runId: 'r', payloadHash: 'h' } } },
+        ],
+        lastEvaluatedKey: undefined,
+      });
+      mockReq.body = { subject: 'Hello', htmlContent: '<p>No variables here</p>' };
+      const handler = findHandler('/lists/:listId/group-email/prepare', 'post');
+      await handler!(mockReq, mockRes);
+      const result = (mockRes.json as jest.Mock).mock.calls[0][0];
+      expect(result.eligibleCount).toBe(2);
+      expect(result.readyCount).toBe(2);
+    });
+
+    it('send never emails a pushed or withdrawn lead, and reports how many it left out', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-1', userId: 'test-user-id' });
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: [
+          { leadId: '1', email: 'plain@agentweb.pro' },
+          { leadId: '2', email: 'pushed@agentweb.pro', system: { smartlead_77: { state: 'pushed', pushedAt: 'x', runId: 'r', payloadHash: 'h' } } },
+          { leadId: '3', email: 'withdrawn@agentweb.pro', system: { smartlead_77: { state: 'withdrawn', pushedAt: 'x', runId: 'r', payloadHash: 'h' } } },
+          { leadId: '4', email: 'released@agentweb.pro', system: { smartlead_77: { state: 'released', pushedAt: 'x', runId: 'r', payloadHash: 'h' } } },
+        ],
+        lastEvaluatedKey: undefined,
+      });
+      (resendService.sendEmail as jest.Mock).mockResolvedValue({ id: 'msg-1' });
+      mockReq.body = { senderEmail: 'me@test.com', senderName: 'Me', subject: 'Hi', htmlContent: '<p>Hello</p>' };
+      const handler = findHandler('/lists/:listId/group-email/send', 'post');
+      await handler!(mockReq, mockRes);
+      const sentTo = (resendService.sendEmail as jest.Mock).mock.calls.map(c => c[0].to).sort();
+      expect(sentTo).toEqual(['plain@agentweb.pro', 'released@agentweb.pro']);
+      const response = (mockRes.json as jest.Mock).mock.calls[0][0];
+      expect(response.skippedSmartlead).toBe(2);
+      expect(response.sent).toBe(2);
+      expect(response.total).toBe(2);
     });
   });
 

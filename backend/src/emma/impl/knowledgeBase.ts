@@ -131,6 +131,7 @@
  * billingUserId and found zero matches, confirming Manan's own pre-check
  * before this round started.
  */
+import { truncateToolContent } from '../../utils/surrogateSafeCut';
 import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
 import {
@@ -1191,7 +1192,7 @@ export async function searchKnowledgeBase(query: string, maxResults: number = 5,
       // never capped, so a single oversized entry could exceed Node's max
       // string length once merged/serialized downstream and crash the process.
       content: result.content && result.content.length > 5000
-        ? result.content.substring(0, 5000) + '\n\n[Content truncated]'
+        ? truncateToolContent(result.content)
         : result.content,
       source: result.metadata?.source || 'unknown',
       ...(result.metadata?.fileName && { fileName: result.metadata.fileName })
@@ -1238,7 +1239,7 @@ export async function searchKnowledgeBase(query: string, maxResults: number = 5,
                 if (content) {
                   const parentFolder = folders.find(f => file.parents?.includes(f.folderId));
                   results.push({
-                    content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
+                    content: truncateToolContent(content),
                     source: `google-drive/${parentFolder?.name || 'shared'}/${file.name}`
                   });
                 }
@@ -1286,7 +1287,7 @@ export async function searchKnowledgeBase(query: string, maxResults: number = 5,
                   const contentMatch = content.toLowerCase().includes(queryLower);
                   if (nameMatch || contentMatch) {
                     results.push({
-                      content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
+                      content: truncateToolContent(content),
                       source: `clickup/${workspace.name}/${doc.name}`
                     });
                     clickUpResultCount++;
@@ -1324,7 +1325,7 @@ export async function searchKnowledgeBase(query: string, maxResults: number = 5,
                 if (nameMatch || descMatch) {
                   const summary = `# ${task.name}\n\n**Status:** ${task.status}${task.priority ? `\n**Priority:** ${task.priority}` : ''}${task.assignees.length > 0 ? `\n**Assignees:** ${task.assignees.join(', ')}` : ''}${task.description ? `\n\n${task.description}` : ''}`;
                   results.push({
-                    content: summary.length > 5000 ? summary.substring(0, 5000) + '\n\n[Content truncated]' : summary,
+                    content: truncateToolContent(summary),
                     source: `clickup-tasks/${workspace.name}/${task.name}`
                   });
                   clickUpTaskResultCount++;
@@ -1448,7 +1449,7 @@ export async function searchForeplayAds(query: string, maxResults: number = 5, u
         if (nameMatch || descMatch || headlineMatch || brandMatch) {
           const content = formatForeplayAdAsMarkdown(ad);
           results.push({
-            content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
+            content: truncateToolContent(content),
             source: `foreplay-swipefile/${ad.brandName || 'Unknown'}/${ad.name || ad.headline || ad.id}`
           });
           foreplayResultCount++;
@@ -1475,7 +1476,7 @@ export async function searchForeplayAds(query: string, maxResults: number = 5, u
             if (nameMatch || descMatch || headlineMatch || brandMatch) {
               const content = formatForeplayAdAsMarkdown(ad);
               results.push({
-                content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
+                content: truncateToolContent(content),
                 source: `foreplay-board/${board.name}/${ad.brandName || 'Unknown'}/${ad.name || ad.headline || ad.id}`
               });
               foreplayResultCount++;
@@ -1588,7 +1589,7 @@ export async function searchForeplayDiscovery(
     const results = ads.map(ad => ({
       content: (() => {
         const c = formatForeplayAdAsMarkdown(ad);
-        return c.length > 5000 ? c.substring(0, 5000) + '\n\n[Content truncated]' : c;
+        return truncateToolContent(c);
       })(),
       source: `foreplay-discovery/${ad.brandName || 'Unknown'}/${ad.name || ad.headline || ad.id}`
     }));
@@ -3020,18 +3021,32 @@ export async function writeClickUpDoc(
   content: string,
   userId: string,
   parentDocId?: string
-): Promise<{ success: boolean; message: string; docId?: string; code?: number }> {
+): Promise<{ success: boolean; message: string; docId?: string; code?: number; errorType?: ClickUpDocErrorType }> {
+  // ENG-1892: reject malformed arguments locally and name the bad parameter,
+  // instead of letting ClickUp answer with an unreadable 400.
+  const badParam = !isNonEmptyString(workspaceId) ? 'workspace_id'
+    : !isNonEmptyString(name) ? 'name'
+    : typeof content !== 'string' ? 'content'
+    : parentDocId !== undefined && parentDocId !== null && !isNonEmptyString(parentDocId) ? 'parent_doc_id'
+    : null;
+  if (badParam) {
+    return {
+      success: false,
+      errorType: 'invalid_parameter',
+      message: `Invalid parameter "${badParam}" for write_clickup_doc: ${badParam === 'content' ? 'must be a string' : 'must be a non-empty string'}.`,
+    };
+  }
   try {
     const clickUpToken = await getClickUpAccessToken(userId);
     if (!clickUpToken) {
-      return { success: false, message: 'ClickUp not connected' };
+      return { success: false, errorType: 'configuration', message: 'ClickUp not connected' };
     }
 
     // Verify user has access to this workspace
     const workspaces = await getClickUpWorkspaces(clickUpToken);
     const workspace = workspaces.find(w => w.id === workspaceId);
     if (!workspace) {
-      return { success: false, message: 'Not authorized to access this ClickUp workspace' };
+      return { success: false, errorType: 'configuration', message: 'Not authorized to access this ClickUp workspace' };
     }
 
     if (parentDocId) {
@@ -3085,13 +3100,49 @@ export async function writeClickUpDoc(
     // above. Deliberately NOT the ECODE extracted above, which is ClickUp's own
     // business code (e.g. "OAUTH_019"), not an HTTP status.
     const code = error?.response?.status;
+    const errorType = classifyClickUpDocError(code);
+    const bodySnippet = !clickUpError?.err && clickUpError !== undefined
+      ? ` ClickUp response: ${truncateForError(clickUpError)}`
+      : '';
+    const statusText = typeof code === 'number' ? ` (HTTP ${code})` : '';
+    const guidance = errorType === 'configuration'
+      ? ' Reconnect ClickUp in Settings > Integrations and make sure the AgentWeb app is allowed to create Docs in this workspace.'
+      : errorType === 'invalid_parameter'
+        ? ' Check workspace_id, name, content and parent_doc_id (parent_doc_id must be a docId from list_knowledge_base_files).'
+        : '';
 
     return {
       success: false,
-      message: `Failed to create ClickUp document "${name}": ${errorMessage}`,
+      errorType,
+      message: `Failed to create ClickUp document "${name}"${statusText}: ${errorMessage}.${bodySnippet}${guidance}`,
       code,
     };
   }
+}
+
+export type ClickUpDocErrorType = 'configuration' | 'invalid_parameter' | 'not_found' | 'runtime';
+
+// ENG-1892: one class per failure family so the agent (and reliability runs)
+// can tell auth/config from schema from runtime failures.
+export function classifyClickUpDocError(status: unknown): ClickUpDocErrorType {
+  if (status === 401 || status === 403) return 'configuration';
+  if (status === 400 || status === 422) return 'invalid_parameter';
+  if (status === 404) return 'not_found';
+  return 'runtime';
+}
+
+function isNonEmptyString(v: unknown): v is string {
+  return typeof v === 'string' && v.trim().length > 0;
+}
+
+function truncateForError(body: unknown): string {
+  let text: string;
+  try {
+    text = typeof body === 'string' ? body : JSON.stringify(body);
+  } catch {
+    text = String(body);
+  }
+  return text.length > 300 ? `${text.slice(0, 300)}...` : text;
 }
 
 // Helper: read a Foreplay ad from swipefile or a board

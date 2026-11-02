@@ -1525,7 +1525,7 @@ export async function generateLandingPage(
     // ── Add new page route to existing repo (no v0 call) ──
     // Legacy (DURABLE_LANDING_GENERATION off) also adds sub-pages, so the override has to
     // reach here too — otherwise the picker is silently ignored wherever the flag isn't on.
-    return addPageToExistingRepo(siteRecord, userId, prompt, name, brandContext, leadListId, templateHtml, undefined, bridgeOutUrl, metaPixelOverride);
+    return addPageToExistingRepo(siteRecord, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId, bridgeOutUrl, metaPixelOverride);
   }
 
   const existingPages = await listLandingPages(userId);
@@ -1543,7 +1543,7 @@ export async function generateLandingPage(
     await cleanupOrphanedFailedPages(userId, existingPages, recyclable.id);
   }
 
-  return generateFirstPage(userId, prompt, name, brandContext, leadListId, templateHtml, recyclable?.id, undefined, bridgeOutUrl, metaPixelOverride, googleAds);
+  return generateFirstPage(userId, prompt, name, brandContext, leadListId, templateHtml, recyclable?.id, originatingSessionId, bridgeOutUrl, metaPixelOverride, googleAds);
 }
 
 /**
@@ -5077,7 +5077,38 @@ export function assertNoDuplicateInjectedRoutes(files: Array<{ path: string; con
  *
  * It imports `./domainMap`, so every writer must also emit a `domainMap.ts`.
  */
-export function buildLandingPageMiddleware(): string {
+export type AttributionCookiesMode = 'on' | 'off' | 'consent';
+
+/** ENG-2666: first-party consent cookie the 'consent' mode reads (written by the LP consent banner, ENG-2667). */
+export const CONSENT_COOKIE_NAME = 'aw_consent';
+
+export interface LandingPageMiddlewareOptions {
+  /**
+   * ENG-2666. 'on' (default) = attribution cookies set as today, output byte-identical.
+   * 'off' = aw_first_touch / aw_last_touch are never set; aw_page is kept.
+   * 'consent' = they are set only when the `aw_consent` cookie equals "granted".
+   */
+  attributionCookies?: AttributionCookiesMode;
+}
+
+const ATTRIBUTION_ANCHOR = '  const sp = req.nextUrl.searchParams;\n';
+
+export function buildLandingPageMiddleware(options: LandingPageMiddlewareOptions = {}): string {
+  const mode: AttributionCookiesMode = options.attributionCookies ?? 'on';
+  const base = buildLandingPageMiddlewareOn();
+  if (mode === 'on') return base;
+  const gate =
+    mode === 'off'
+      ? '  // ENG-2666: attributionCookies "off" — this site never sets aw_first_touch/aw_last_touch.\n' +
+        '  const ATTRIBUTION_ENABLED = false as boolean;\n' +
+        '  if (!ATTRIBUTION_ENABLED) return res;\n'
+      : '  // ENG-2666: attributionCookies "consent" — attribution cookies only after the visitor accepts.\n' +
+        `  if (req.cookies.get("${CONSENT_COOKIE_NAME}")?.value !== "granted") return res;\n`;
+  if (!base.includes(ATTRIBUTION_ANCHOR)) throw new Error('buildLandingPageMiddleware: attribution anchor missing');
+  return base.replace(ATTRIBUTION_ANCHOR, gate + ATTRIBUTION_ANCHOR);
+}
+
+function buildLandingPageMiddlewareOn(): string {
   return `import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 import { DOMAIN_MAP } from "./domainMap";

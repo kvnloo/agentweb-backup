@@ -3,12 +3,13 @@ import { userDb, User } from './db';
 import { invalidateCachedPixels } from './metaPixelsCache';
 import { isEvaluationUser } from './evaluationPolicy';
 import type { DailyVolumeState } from './linkedInWritePacer';
+import { emitAppSignal } from './serverSignalEmitter';
 
 // ============================================
 // Type Definitions
 // ============================================
 
-export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'outlook' | 'youtube' | 'fathom' | 'linkedin_ads' | 'hubspot' | 'attio' | 'google_ads' | 'google_drive' | 'calendly' | 'slack' | 'luma';
+export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'outlook' | 'youtube' | 'fathom' | 'linkedin_ads' | 'hubspot' | 'attio' | 'google_ads' | 'google_drive' | 'calendly' | 'slack' | 'luma' | 'smartlead';
 
 /**
  * ENG-1616 — the subset of `PlatformType` that `postOnConnectedAccount` treats as
@@ -296,6 +297,18 @@ export interface LumaConfig extends BaseOAuthConfig {
   needs_reconnect?: boolean;
 }
 
+/**
+ * A customer's own Smartlead API key (ENG-673). Smartlead sends their cold email in their account;
+ * AgentWeb only holds the key. Like Luma the key itself lives in `access_token` (so the shared
+ * secret redaction covers it) and never expires; one connection per user.
+ */
+export interface SmartleadConfig extends BaseOAuthConfig {
+  account_type: 'api_key';
+  mailbox_count: number;
+  /** Set when Smartlead rejected the key on a probe (revoked, or the plan lapsed); cleared by a reconnect. See services/smartleadConnection.ts. */
+  needs_reconnect?: boolean;
+}
+
 export interface LinkedInAdsAdAccountConfig extends BaseOAuthConfig {
   account_type: 'ad_account';
   currency: string;
@@ -420,7 +433,7 @@ export interface SlackConfig extends BaseOAuthConfig {
   team_id: string;
 }
 
-export type PlatformConfig = SlackConfig | LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | OutlookConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig | GoogleDriveConfig | TwitterXConfig | CalendlyConfig | LumaConfig;
+export type PlatformConfig = SlackConfig | LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | OutlookConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig | GoogleDriveConfig | TwitterXConfig | CalendlyConfig | LumaConfig | SmartleadConfig;
 
 /**
  * Per-connection engagement memory: a persona profile generated from LinkedIn data
@@ -483,7 +496,12 @@ export interface CreateAccountInput {
 export const createAccount = async (
   userId: string,
   platform: PlatformType,
-  input: CreateAccountInput
+  input: CreateAccountInput,
+  // ENG-2686: false when the provider could not confirm the account (e.g. a Unipile
+  // ID that getAccount refused); the row is still saved but no integration_connected
+  // signal fires for an integration that never happened.
+  // ENG-673: resetSharing makes a reconnect private again (a replaced API key must not stay org-shared).
+  opts: { providerVerified?: boolean; resetSharing?: boolean } = {}
 ): Promise<ConnectedAccount> => {
   const user = await userDb.getUserById(userId);
   if (!user) {
@@ -508,6 +526,7 @@ export const createAccount = async (
     account_id: input.account_id,
     account_name: input.account_name,
     config: input.config,
+    ...(opts.resetSharing ? { sharedWithOrg: false } : {}),
     created_at: existingAccount?.created_at || now,
     updated_at: now,
   };
@@ -532,6 +551,9 @@ export const createAccount = async (
   // page. See services/metaPixelsCache.ts.
   invalidateCachedPixels(userId);
   if (platform === 'hubspot') clearHubSpotPortalCache();
+
+  // ENG-2686: first connection only (a re-OAuth of the same account is not a new integration).
+  if (existingIndex < 0 && opts.providerVerified !== false) void emitAppSignal(user as any, 'integration_connected', { platform });
 
   return accountConfig;
 };
@@ -1022,12 +1044,21 @@ export const getAccountByIdConsistent = async (
   platform?: PlatformType | PlatformType[]
 ): Promise<ConnectedAccountWithUser | null> => {
   try {
-    const user = await userDb.getUserByIdConsistent(userId);
-    return findAccountForUser(user as User | undefined, accountId, userId, platform);
+    return await getAccountByIdConsistentOrThrow(accountId, userId, platform);
   } catch (error) {
     console.error('Error in getAccountByIdConsistent:', error);
     return null;
   }
+};
+
+/** The same read for a caller that must tell "no such account" from "could not read": a failed read throws instead of returning null. */
+export const getAccountByIdConsistentOrThrow = async (
+  accountId: string,
+  userId: string,
+  platform?: PlatformType | PlatformType[]
+): Promise<ConnectedAccountWithUser | null> => {
+  const user = await userDb.getUserByIdConsistent(userId);
+  return findAccountForUser(user as User | undefined, accountId, userId, platform);
 };
 
 /**
@@ -1272,7 +1303,7 @@ export const getAccountsByAttioWorkspaceId = async (
  * Attio would be better served by its own key (e.g. `webhook_scope_missing`); until then
  * the exception is explicit rather than implied.
  */
-const RECONNECT_MEANS_DEAD_CREDENTIAL = new Set(['hubspot', 'twitter', 'luma']);
+const RECONNECT_MEANS_DEAD_CREDENTIAL = new Set(['hubspot', 'twitter', 'luma', 'smartlead']);
 
 export const isTokenValid = async (account: ConnectedAccount): Promise<boolean> => {
   const now = Date.now();

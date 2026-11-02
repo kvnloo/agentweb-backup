@@ -9,8 +9,17 @@ import {
 import { isEvaluationUser, EvaluationDenied } from '../services/evaluationPolicy';
 import { Request, Response } from 'express';
 import { AuthenticatedRequest, getUserFromToken, isRealAdmin } from '../middleware/auth';
-import { agentModeService, AgentModeService, normalizeWorkPlanTitleForMatch, ADMIN_SKILL_TOOL_NAMES } from '../services/agentModeService';
+import { agentModeService, AgentModeService, normalizeWorkPlanTitleForMatch, ADMIN_SKILL_TOOL_NAMES, ADMIN_SKILL_VIRTUAL_ID } from '../services/agentModeService';
 import { filterMessagesForClient as filterMessagesForClientPure } from '../utils/adminOnlyMessageFilter';
+import {
+  buildConversableShareSession,
+  buildReadOnlyShareSession,
+  FIRST_ATTEMPT_TELEMETRY_PREFIX,
+  narrowSkillsForShareViewer,
+  toConversableShareMessages,
+  toIShareFeedbackResponse,
+  toReadOnlyShareMessages,
+} from '../utils/shareViewerSerializers';
 import { ABOUT_AGENTWEB_TEAM, getUnattendedExecutionDirective } from '../docs/agentModeSystemPrompt';
 import { chatbotDb, updateTaskExecutionStatus, ChatMessage, getEmmaSystemContext } from '../services/chatbotService';
 import { shouldSuppressScheduledNotification } from '../services/linkScanNotificationPolicy';
@@ -35,6 +44,7 @@ import {
 } from '../services/scheduledReportAccess';
 import { settingsService } from '../services/settingsService';
 import { sessionActiveRunGuard } from '../services/agentMode/sessionActiveRunGuardInstance';
+import { getInteractiveShareExpiresAt } from '../utils/interactiveShare';
 import { workPlanService } from '../services/workPlanService';
 import { projectWorkPlanForCustomer } from '../services/workPlanCustomerProjection';
 import { v4 as uuidv4 } from 'uuid';
@@ -51,7 +61,7 @@ import { CHAT_BRANCHING_ENABLED_SETTING, isChatBranchingSettingEnabled, healLega
 import { compareSaveAlternatives } from '../services/agentMode/compareSaveAlternativesInstance';
 import { LEGACY_MODEL_ALIASES } from '../services/agentMode/llmModelRegistry';
 import { resolveRunFunding } from '../services/funding/runFunding';
-import { isContextLimitError, isProviderNoEndpointsError, isSessionLimitError, isTransientLLMError, isProviderDeserializationError, PROVIDER_DESERIALIZATION_ERROR_CLASS, isWorkerShutdownError, isProviderUnavailableError } from '../utils/agentModeErrors';
+import { isContextLimitError, isProviderNoEndpointsError, isSessionLimitError, isTransientLLMError, isProviderDeserializationError, PROVIDER_DESERIALIZATION_ERROR_CLASS, isWorkerShutdownError, isDrainCeilingShutdownError, isProviderUnavailableError, isQuotaExhaustedError, QUOTA_EXHAUSTED_USER_MESSAGE } from '../utils/agentModeErrors';
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
@@ -80,6 +90,7 @@ import {
   isRunStoreEnabled,
   interactiveIdempotencyKey,
   createSessionIdempotencyKey,
+  planSessionIdempotencyKey,
   claimIdempotency,
   releaseIdempotency,
   recordIdempotencySessionId,
@@ -89,6 +100,10 @@ import {
 } from '../services/agentMode/runStore';
 import { assertSequentialStepCounts } from '../services/workPlanSteps';
 import { validateModelPin, normalizeRequestedLlmModel, resolvePlanLaunchModel, canonicalPinId } from '../services/agentMode/modelPin';
+import { resolveTurnFunding, type PlanRoute } from '../services/funding/claudeFunding';
+import { ClaudeRouteStopError, claudeStopBody, turnRanNoTools } from '../services/funding/claudeRouteErrors';
+import { CONTINUE_MARKER_KIND, findResumableUserMessage, PLAN_STOP_NOTE_KIND, ResumeNotAvailableError } from '../services/funding/resumeSavedMessage';
+import type { claudeCodeBackend as ClaudeCodeBackendInstance } from '../services/funding/claudeCodeBackendInstance';
 import { workPlanStepModels } from '../services/agentMode/workPlanStepModelsInstance';
 import {
   assertModelInOwnerPlan, isSystemAuthoredPlan, legacyPlanPinSource, modelAccess, storedBindingSource, systemModelCheck,
@@ -147,6 +162,11 @@ import {
 import { collectLeadImportTotals, describeLeadImportTotals } from '../utils/leadImportLedger';
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
 import { fileAutoIssue } from '../services/intakeService';
+import {
+  classifyOpenRouterQuotaExhaustion,
+  resolveQuotaDeferral,
+  OPENROUTER_QUOTA_ALERT_CLASS,
+} from '../utils/openRouterKeyLimit';
 import { skillService } from '../services/skillService';
 import { validateWelcomeMessage } from '../utils/welcomeMessageValidation';
 import { validateOpeningAction } from '../utils/openingActionValidation';
@@ -661,6 +681,81 @@ export function modelUnavailableBody(err: ModelUnavailableError, audience: Model
     ? agentModeService.getModelDisplayName(err.requestedModel)
     : undefined;
   return buildModelUnavailableBody(err, displayName, 'selection', audience);
+}
+
+/**
+ * ENG-2641: errors raised AFTER the turn's user message was stored in the chat. A send is refused before anything is
+ * stored almost everywhere; the exceptions are generateSessionResponse's Work Plan step-model refusal (the message is
+ * saved first, then the step's model is resolved) and a /verified-generate refusal after an earlier attempt saved the
+ * starting message. generateSessionResponse marks every error it raises after its save; runVerifiedChatInner marks a
+ * refusal that follows a saved attempt. Read where the refusal is answered.
+ */
+const errorsAfterUserMessageSaved = new WeakSet<object>();
+
+/** ENG-2672: the turn state of each generateSessionResponse promise, so withGenerationTimeout can tell whether its turn had saved the user message when the cap fired. */
+const turnOfGeneration = new WeakMap<Promise<unknown>, SessionTurnState>();
+function markRaisedAfterUserMessageSaved(error: unknown): void {
+  if (typeof error === 'object' && error !== null) errorsAfterUserMessageSaved.add(error);
+}
+
+/**
+ * ENG-2113: the body of a plan stop. `canUseAgentWebCredits` is the old "resend this request on AgentWeb credits" offer and is true only while NOTHING is saved
+ * (a resend of a saved message would store it twice). A saved message is offered through `agentWebOffer`: 'continue' (known to have run no tool: send
+ * `continueSavedMessage: true`) or 'new_message' (a tool may have run: only a NEW message, and an action may repeat); `null` = no offer. A client must act on
+ * `agentWebOffer`, never on `canUseAgentWebCredits` alone.
+ */
+function planStopResponse(stop: ClaudeRouteStopError, saved: boolean, resumable: boolean) {
+  const body = claudeStopBody(stop);
+  const offered = body.canUseAgentWebCredits;
+  return {
+    ...body,
+    canUseAgentWebCredits: offered && !saved,
+    canContinueSavedMessage: saved && resumable && (offered || stop.retryable),
+    agentWebOffer: !offered ? null : !saved ? ('resend' as const) : resumable ? ('continue' as const) : ('new_message' as const),
+  };
+}
+
+/** ENG-2113: `userMessageKind` of a turn that answers a message already saved by a stopped plan turn (never stored on a message). */
+const RESUME_SAVED_MESSAGE_KIND = 'resume-saved';
+
+function wasRaisedAfterUserMessageSaved(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && errorsAfterUserMessageSaved.has(error);
+}
+
+/**
+ * ENG-2641: a refused send's body (422 `model_unavailable`, 409 `SESSION_BUSY`, 429 `TOO_MANY_CONCURRENT_RUNS` / usage
+ * paused) with `userMessageSaved`. ENG-2672: also a generation that failed after the save (503 `PROVIDER_UNAVAILABLE` /
+ * `SERVER_RESTARTING`, 413 `CONTEXT_LIMIT_EXCEEDED`, 504 `GENERATION_TIMEOUT`) on /generate and the share generate routes.
+ * `userMessageSaved`: true only when the user's message is already stored in the chat, so the client keeps
+ * it there instead of giving the draft back (a resend would store it twice). Older backends omit it, and a client must
+ * then keep its previous behaviour.
+ */
+function sendRefusalBody<T extends object>(body: T, userMessageSaved: boolean): T & { userMessageSaved: boolean } {
+  return { ...body, userMessageSaved };
+}
+
+/**
+ * ENG-2763: one oncall alert per OpenRouter quota-exhaustion class (not per occurrence /
+ * per user). The key stays exhausted until a monthly reset or a limit raise, so a 6h
+ * window keeps it to one open page instead of an "Unknown Error" filing per message.
+ */
+export const QUOTA_EXHAUSTED_ALERT_WINDOW_MS = 6 * 60 * 60 * 1000;
+
+export function sendQuotaExhaustedAlert(error: unknown, sessionId?: string): void {
+  const originalMessage = (error as any)?.originalMessage || (error as any)?.message || 'Unknown error';
+  const quota = classifyOpenRouterQuotaExhaustion((error as any)?.originalError ?? { message: originalMessage });
+  sendAgentModeOncallAlert({
+    dedupeKey: `agent_mode:${OPENROUTER_QUOTA_ALERT_CLASS}`,
+    dedupeWindowMs: QUOTA_EXHAUSTED_ALERT_WINDOW_MS,
+    subject: 'Agent Mode: OpenRouter quota exhausted',
+    message: `Agent Mode generation is failing because the OpenRouter key/credits are exhausted.\n\nError: ${originalMessage}`,
+    sessionId,
+    context: {
+      'Alert Class': OPENROUTER_QUOTA_ALERT_CLASS,
+      ...(quota?.kind ? { 'Quota Kind': quota.kind } : {}),
+      ...(quota?.resetAt ? { 'Resets At': quota.resetAt } : {}),
+    },
+  }).catch(err => console.error('Failed to send quota-exhausted oncall alert:', err));
 }
 
 /**
@@ -1748,6 +1843,8 @@ async function withGenerationTimeout<T>(
       // Tag so the durable-execution path can distinguish a run-timeout (where the
       // detached work may still finish) from a genuine generation error.
       err.isGenerationTimeout = true;
+      // ENG-2672: the user message is already in the chat if the turn had saved it by the time the cap fired.
+      if (turnOfGeneration.get(promise)?.userMessageSaved) markRaisedAfterUserMessageSaved(err);
       reject(err);
     }, timeoutMs);
   });
@@ -2788,19 +2885,11 @@ async function scheduleAutoWorkPlanContinuation(
     });
 }
 
-/**
- * Returns the effective expiration date for an interactive share.
- *
- * Only an explicit `expiresAt` causes expiry. Shares created without one —
- * every public plan/ishare link (createSessionWithPlan sets `sharedAt` only)
- * and all legacy shares — never expire on a timer; their availability is
- * governed solely by the `isActive` flag. (Previously, a missing `expiresAt`
- * was treated as "sharedAt + 7 days", which silently 410'd every such link a
- * week after creation and broke all ishare links.)
- */
-function getInteractiveShareExpiresAt(share: { expiresAt?: string; sharedAt?: string }): Date {
-  if (share.expiresAt) return new Date(share.expiresAt);
-  return new Date(8640000000000000); // No expiresAt — never expires
+/** Constant-time comparison of a presented conversable token with the stored one (ENG-2653). */
+function conversableTokenMatches(stored: string, presented: string): boolean {
+  const a = Buffer.from(stored, 'utf8');
+  const b = Buffer.from(presented, 'utf8');
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
 /**
@@ -5005,6 +5094,10 @@ async function runVerifiedChatInner(
   console.log('AgentMode runVerifiedChat: Received attachments:', attachmentsArray.length, attachmentsArray);
 
   let attempt = 0;
+  // ENG-2641: true once any attempt saved the starting message (its generateSessionResponse returned, or failed after
+  // the save, e.g. a transient worker error that is retried). A model refusal after that is answered as one whose
+  // message was already stored, even when the refusing attempt itself stopped before its own save.
+  let startingMessageSaved = false;
   // ENG-947: attempts spent specifically on the publish requirement — the first
   // attempt that ended with a publish tool as the ONLY outstanding requirement,
   // plus every press sent afterwards. Deliberately separate from `attempt`, which
@@ -5577,6 +5670,7 @@ async function runVerifiedChatInner(
         params.modelPolicyDecisionForAudit, // ENG-669 PR-C: routing provenance on the replies
         routerTaskType, // ENG-669 PR-C: the task's route for a stored AgentWeb Model selection
       );
+      startingMessageSaved = true;
 
       if (!hasAssistantOutput(response)) {
         throw new ZeroAssistantOutputError(
@@ -6080,10 +6174,12 @@ async function runVerifiedChatInner(
 
     } catch (error) {
       console.error(`Run verified chat attempt ${attempt} failed:`, error);
+      if (wasRaisedAfterUserMessageSaved(error)) startingMessageSaved = true;
       // ENG-669 PR-C: a refused model (the stored AgentWeb Model selection with the switch off or unavailable for the
       // owner, or a selection outside the plan) is never retried; it is saved to the chat (once per error) so the owner
       // sees why, and every caller (Slack, revisions, human-eval) gets it to present as a refusal, not an outage.
       if (isModelUnavailableError(error)) {
+        if (startingMessageSaved) markRaisedAfterUserMessageSaved(error);
         await recordModelRefusal(sessionId, error);
         throw error;
       }
@@ -8513,6 +8609,8 @@ export async function runScheduledChat(
     // resume (published + settled), pause (published + not resumable) and a fresh
     // requeue (nothing published) — never a blind restart over published work.
     const workerShutdownInterrupted = !zeroAssistantOutput && isWorkerShutdownError(error);
+    // ENG-2758: OpenRouter key-limit / credits exhaustion — defer, and alert once per class.
+    const quotaExhaustion = classifyOpenRouterQuotaExhaustion(error);
     let zeroAssistantRequeuedAt: string | undefined;
     if (zeroAssistantOutput || workerShutdownInterrupted) {
       // ENG-971: zero assistant output does NOT mean the run did nothing. A publish
@@ -8740,6 +8838,42 @@ export async function runScheduledChat(
             console.error('Failed to persist published-run job-incomplete message:', persistError);
           }
         }
+      } else if (!isTest && quotaExhaustion) {
+        // ENG-2758: the OpenRouter key/credits are exhausted until a reset, so a
+        // short-interval requeue is guaranteed to fail again. Defer to the stated
+        // reset (else the next natural slot); keep the schedule active and do not
+        // spend a zero-output retry on it.
+        // Anchor the natural-next fallback to the scheduled slot (as the normal
+        // dispatcher does) so the cadence's time-of-day is preserved.
+        const storedSlot = schedule.nextRunTime ? new Date(schedule.nextRunTime) : new Date(NaN);
+        const scheduledSlot = Number.isFinite(storedSlot.getTime()) ? storedSlot : new Date();
+        const deferredTo = resolveQuotaDeferral(
+          quotaExhaustion,
+          new Date(),
+          calculateNextRunTime(
+            schedule.frequency,
+            Number.isFinite(scheduledSlot.getTime()) ? scheduledSlot : new Date(),
+            schedule.frequencyIntervalDays,
+            schedule.scheduleId
+          )
+        );
+        try {
+          // Do not reactivate a schedule the owner paused/stopped while this run was in flight.
+          const current: any = await scheduleDb.getScheduleById(schedule.scheduleId);
+          if (current && current.status && current.status !== 'active') {
+            throw new Error(`schedule status is '${current.status}', not deferring`);
+          }
+          await scheduleDb.updateSchedule(schedule.scheduleId, {
+            status: 'active',
+            nextRunTime: deferredTo,
+            lastZeroAssistantOutputAt: new Date().toISOString(),
+            lastZeroAssistantOutputSessionId: sessionId || '',
+            updatedAt: new Date().toISOString(),
+          });
+          zeroAssistantRequeuedAt = deferredTo;
+        } catch (deferError) {
+          console.error(`Failed to defer quota-exhausted scheduled chat ${schedule.scheduleId}:`, deferError);
+        }
       } else if (!isTest) {
         const nextRetryCount = zeroOutputNextRetryCount;
         if (nextRetryCount <= ZERO_ASSISTANT_MAX_REQUEUES) {
@@ -8904,7 +9038,17 @@ export async function runScheduledChat(
     // event with automatic recovery, not a defect — don't file a Linear issue for
     // it (the deduped oncall alert below still records the occurrence). One that
     // could NOT be requeued (paused, cap exhausted, write failed) still files.
-    const skipAutoIssue = workerShutdownInterrupted && Boolean(zeroAssistantRequeuedAt);
+    // ENG-2750: the same holds when the drain hit BEFORE any assistant output
+    // (zero-output path) — but only for the FIRST requeue. A drain retry is
+    // bounded to one silent attempt; if the retried run fails too, it files.
+    // Only the drain-ceiling shutdown qualifies — a subprocess crash ("Worker
+    // process exited with code ...", OOM / instance replacement) is a real
+    // incident and must still file (CodeRabbit on PR #3844).
+    const drainRequeuedFirstAttempt = isDrainCeilingShutdownError(error)
+      && Boolean(zeroAssistantRequeuedAt)
+      && getZeroAssistantRetryCount(schedule) === 0;
+    const skipAutoIssue = (workerShutdownInterrupted && Boolean(zeroAssistantRequeuedAt))
+      || drainRequeuedFirstAttempt;
     void (skipAutoIssue ? Promise.resolve() : fileAutoIssue({
       title: zeroAssistantOutput
         ? `Scheduled Chat Zero Assistant Output: ${schedule.scheduleName}`
@@ -8924,6 +9068,8 @@ export async function runScheduledChat(
         ...(zeroAssistantRequeuedAt ? { 'Requeued At': zeroAssistantRequeuedAt } : {}),
         'Error Message': errorMessage,
         ...(originalMessage ? { 'Original Error (Bedrock/API)': originalMessage } : {}),
+        // ENG-2758: one canonical per (source x errorClass), not one per schedule.
+        ...(quotaExhaustion ? { 'Alert Class': OPENROUTER_QUOTA_ALERT_CLASS } : {}),
       }
     }))
       .catch(err => console.error('Failed to file scheduled-chat-error issue:', err))
@@ -8937,7 +9083,9 @@ export async function runScheduledChat(
         // One alert per (user, schedule, errorClass) per hour (ENG-145/146
         // class). Gated so flag off = today's exact behavior.
         ...(isRunStoreEnabled()
-          ? { dedupeKey: `scheduled_chat:${userId}:${schedule.scheduleId}:${zeroAssistantOutput ? 'zero_output' : 'run_error'}`, dedupeWindowMs: 60 * 60 * 1000 }
+          ? quotaExhaustion
+            ? { dedupeKey: `scheduled_chat:${OPENROUTER_QUOTA_ALERT_CLASS}`, dedupeWindowMs: 60 * 60 * 1000 }
+            : { dedupeKey: `scheduled_chat:${userId}:${schedule.scheduleId}:${zeroAssistantOutput ? 'zero_output' : 'run_error'}`, dedupeWindowMs: 60 * 60 * 1000 }
           : {}),
         sessionId: sessionId || undefined,
         context: {
@@ -9529,9 +9677,34 @@ function modelSourceAfter(
   return modelSourceAfterStamp(session, model, explicitPick, canonicalModelId);
 }
 
+/** ENG-2641: what one generateSessionResponse turn has done so far, for the errors it raises. */
+interface SessionTurnState {
+  /** The turn's user message is in the chat (saved by this turn, or an already-saved dangling directive reused). */
+  userMessageSaved: boolean;
+}
+type SessionTurnArgs = Parameters<typeof runSessionTurn> extends [SessionTurnState, ...infer Rest] ? Rest : never;
+
 // Common function to generate AI response for a session
 // Always uses worker process to prevent blocking the main event loop
-export async function generateSessionResponse(
+export function generateSessionResponse(...args: SessionTurnArgs): ReturnType<typeof runSessionTurn> {
+  const turn: SessionTurnState = { userMessageSaved: false };
+  const generation = (async () => {
+    try {
+      return await runSessionTurn(turn, ...args);
+    } catch (error) {
+      // ENG-2641: any error raised once the user message is in the chat (e.g. the Work Plan step-model refusal, or a
+      // worker failure a /verified-generate retry follows) is marked, so a refusal answered for it says it was stored.
+      if (turn.userMessageSaved) markRaisedAfterUserMessageSaved(error);
+      throw error;
+    }
+  })();
+  // ENG-2672: withGenerationTimeout raises its own error while this promise is still pending; it reads the turn from here.
+  turnOfGeneration.set(generation, turn);
+  return generation;
+}
+
+async function runSessionTurn(
+  turn: SessionTurnState,
   sessionId: string,
   userMessage: string,
   userId: string,
@@ -9609,6 +9782,8 @@ export async function generateSessionResponse(
   // ENG-669 PR-C: the task type an `agentweb-model` `llmModel` is routed on this turn. Default: the session's
   // (taskTypeForSession). runVerifiedChat passes its required functions' task (report / image / video).
   routerTaskType?: AgentWebTaskType,
+  // ENG-2113: set only by the owner's /generate when this turn runs on their own Claude plan. Every other caller leaves it undefined and is unchanged.
+  planRoute?: PlanRoute,
 ): Promise<{
   content: string;
   toolCalls: any[];
@@ -9659,7 +9834,7 @@ export async function generateSessionResponse(
   // system model, so it must be in the owner's plan; a model the caller chose itself (a configured default, the
   // brand-build model, a task-type default) is AgentWeb's choice and differs from the stored one. Thrown before
   // anything is persisted; callers surface it as the model_unavailable message.
-  if (session.llmModel && (await modelAccess.isEnabled()) && sameModelId(llmModel, session.llmModel)) {
+  if (!planRoute && session.llmModel && (await modelAccess.isEnabled()) && sameModelId(llmModel, session.llmModel)) {
     await assertModelInOwnerPlan({ ownerUserId: session.userId, model: llmModel, session });
   }
   // ENG-669 PR-C: which model a selection of the AgentWeb Model runs this turn, and why (stamped on the replies next
@@ -9668,8 +9843,9 @@ export async function generateSessionResponse(
   // (session.llmModel), approval-inbox resumes, the plan-launch first turn (createSessionWithPlan), runVerifiedChat
   // callers that pass no model (the session's stored model runs), and every auto continuation (media and work plan,
   // from /generate, the interactive share timeout and the getSession backstop), each continuation being a turn of its
-  // own (routed again, so the switch and availability are re-checked and the replies are stamped). Emma email, GTM and
-  // result-endpoint turns pass the configured default, never a selection. With the switch
+  // own (routed again, so the switch and availability are re-checked and the replies are stamped). GTM and result-endpoint
+  // turns pass the configured default, never a selection; Emma email passes the continued chat's stored model (the
+  // default for a new chat), which the gate above checks against the owner's plan. With the switch
   // off it is refused like an unknown explicit model (never run on another). A caller that resolved first passes the
   // routed model with its own decision (`turnModelDecision`).
   let turnRouting: MessageModelRouting | undefined;
@@ -9900,7 +10076,30 @@ export async function generateSessionResponse(
 
   // ENG-1495: messageIndex of the just-persisted user message, for the return value.
   let userMessageIndex: number | undefined;
-  if (!reusingDanglingDirective) {
+  // ENG-2113: "continue" answers the message a stopped plan turn already saved. Checked again here, right before the save is skipped, so a chat that changed in
+  // between (a second tab, a concurrent turn) can never skip the save of a message that is not already stored.
+  const resumingSavedMessage = userMessageKind === RESUME_SAVED_MESSAGE_KIND;
+  if (resumingSavedMessage) {
+    let found: ReturnType<typeof findResumableUserMessage> = { ok: false };
+    try {
+      const fresh = await chatbotDb.getChatSession(sessionId, true); // strongly consistent, see the request check
+      found = findResumableUserMessage(fresh?.messages);
+    } catch {
+      found = { ok: false };
+    }
+    if (!found.ok || found.content !== userMessage) throw new ResumeNotAvailableError();
+    // The marker goes in BEFORE anything runs: it ends the chat's "continuable" state, so a continue whose own verdict is never saved cannot be continued again,
+    // and a second continue that raced this one finds the marker last. Without it the continue does not start.
+    try {
+      const timestamp = new Date().toISOString();
+      await chatbotDb.addMessageToSession(sessionId, { role: 'assistant', content: 'Continuing your last message.', timestamp, metadata: { timestamp, isErrorMessage: true, kind: CONTINUE_MARKER_KIND } } as ChatMessage);
+    } catch {
+      throw new ResumeNotAvailableError();
+    }
+  }
+  if (resumingSavedMessage) {
+    console.log('AgentMode generateSessionResponse: continuing an already-saved user message (plan stop) — save skipped');
+  } else if (!reusingDanglingDirective) {
     // Add user message to session in database
     console.log('AgentMode generateSessionResponse: Saving user message with attachments:', {
       hasAttachments: !!(userMessageObj.metadata?.attachments && userMessageObj.metadata.attachments.length > 0),
@@ -9916,6 +10115,7 @@ export async function generateSessionResponse(
   } else {
     console.log('AgentMode generateSessionResponse: reusing an already-dangling auto-continuation directive — skipped a redundant duplicate');
   }
+  turn.userMessageSaved = true;
 
   // Get updated session with the new user message
   const updatedSession = await chatbotDb.getChatSession(sessionId);
@@ -9928,7 +10128,8 @@ export async function generateSessionResponse(
   // does). A step model that has become unavailable mid-plan PAUSES the plan, loudly: never a swap.
   let stepModelTurn: WorkPlanStepModelTurn;
   try {
-    stepModelTurn = await resolveWorkPlanStepModelForTurn(updatedSession, { explicitPick: explicitModelPick, viewerIsOwner: !isInteractiveShare });
+    // ENG-2113: a work-plan step's own model never replaces the plan pick (work plans on the plan route come in a later PR).
+    stepModelTurn = planRoute ? { kind: 'none' } : await resolveWorkPlanStepModelForTurn(updatedSession, { explicitPick: explicitModelPick, viewerIsOwner: !isInteractiveShare });
   } catch (stepModelError) {
     // ENG-669: the user's pick for a step whose own model is gone is outside the owner's plan. The user message is
     // already saved, so leave the refusal in the chat (as the generic error path does for other failures) before the
@@ -10018,6 +10219,15 @@ export async function generateSessionResponse(
   const sessionHistoryForWorker = (updatedSession.messages || []).filter(
     (m: any) => !isRunFailurePlaceholder(m)
   );
+  // ENG-2113: a continue answers the message already in the chat. The plan-stop notes under it are not part of the conversation, and while they sit last the
+  // context builder cannot recognise the saved message as THE current one (it would be sent twice): drop the trailing notes so it is.
+  if (resumingSavedMessage) {
+    while (sessionHistoryForWorker.length > 0) {
+      const last: any = sessionHistoryForWorker[sessionHistoryForWorker.length - 1];
+      if (last?.role === 'assistant' && (last?.metadata?.kind === PLAN_STOP_NOTE_KIND || last?.metadata?.kind === CONTINUE_MARKER_KIND)) sessionHistoryForWorker.pop();
+      else break;
+    }
+  }
 
   // If this session is linked to a GTM work item, update status to agent_in_progress
   if (updatedSession.gtmWorkItem) {
@@ -10085,11 +10295,34 @@ export async function generateSessionResponse(
   // wrapped immediately rather than added to this list. Found by manual review, not
   // by noteRunFundingUnset — see that function's own comment for why it can't be
   // trusted to surface gaps like this one.
-  const runFunding = await resolveRunFunding({ userId });
+  const runFunding = planRoute ? undefined : await resolveRunFunding({ userId });
 
   // Generate AI response using worker process to prevent blocking the main event loop
   // This allows health checks to continue working during long-running operations
-  const response = await generateMarketingResponseWorkerService.runInWorker(
+  // ENG-2113: the plan route runs in THIS process through the Claude backend and never reaches the worker below, so it can never end up on AgentWeb's
+  // models. Everything the backend cannot do yet is a typed stop or a documented limit, not a fallback.
+  let planResponse: Awaited<ReturnType<typeof ClaudeCodeBackendInstance.run>> | undefined;
+  if (planRoute) {
+    // Loaded here, not at module top: the instance pulls in the whole tool gateway, which a request that never takes the plan route has no use for.
+    const { claudeCodeBackend } = await import('../services/funding/claudeCodeBackendInstance');
+    planResponse = await claudeCodeBackend.run({
+      decision: planRoute,
+      sessionId,
+      userId,
+      messageContent,
+      sessionHistory: sessionHistoryForWorker,
+      llmModel,
+      isDelegatedAccess: effectiveIsDelegatedAccess,
+      screenshotUrl,
+      excludeTools,
+      turnStartMs,
+      stamps: turnRouting as Record<string, unknown> | undefined,
+      onProgress: (progress) => emitProgress(sessionId, progress),
+    });
+    // Fail closed: a plan request is never handed to the worker, whatever the backend returned.
+    if (!planResponse) throw new ClaudeRouteStopError('turn_failed');
+  }
+  const response = planRoute ? planResponse! : await generateMarketingResponseWorkerService.runInWorker(
     {
       messageContent,
       sessionHistory: sessionHistoryForWorker,
@@ -10328,6 +10561,14 @@ export const calculateNextRunTime = (
 
   return nextRun;
 };
+
+
+/** ENG-2644: owner-or-admin check for session-scoped mutations (same rule as emmaApi sessionAccessAllowed). */
+async function callerOwnsSession(sessionId: string, user: User | undefined): Promise<boolean> {
+  if (!user || !sessionId) return false;
+  const session = await chatbotDb.getChatSessionRecord(sessionId, true);
+  return !!session && (session.userId === user.userId || !!user.isAdmin);
+}
 
 export const agentModeController = {
   // Get user's agent chat sessions with infinite scroll support
@@ -10823,6 +11064,13 @@ export const agentModeController = {
     // just the generic "Superseded — not answered" a deck that was silently
     // replaced/abandoned some other way would show. Mirrors approvalDeckAnswerMeta.
     let approvalDeckCancelledMeta: { deckId: string } | undefined;
+    // ENG-2648: the concurrency slot of an answer/cancel turn, taken BEFORE its pending
+    // state is consumed. Hoisted so the outer `finally` releases it on the early returns
+    // that precede the inner try (release() is idempotent; the inner finally also runs it).
+    let pausedTurnSlot: { release: () => void } | undefined;
+    // ENG-2113: true once this request is a plan-route turn, so ANY failure after that (not only a typed stop) is answered with fixed copy and
+    // never reaches the diagnosis agent, which would spend AgentWeb money to guess at a turn that ran on the user's plan.
+    let planTurn = false;
     try {
       // A-019: do not admit a fresh interactive turn after shutdown drain starts.
       // This is intentionally before STT, idempotency/session claims, deck writes,
@@ -10874,6 +11122,55 @@ export const agentModeController = {
         return res.status(403).json({ error: 'Unauthorized access to session' });
       }
 
+      // ENG-2113: "continue" answers the message a stopped plan turn already saved, instead of storing it a second time. Only for a turn that is KNOWN to have
+      // run no tool (the stop note says so), and only for exactly that message: anything else is refused and the client sends a new message.
+      let resumeSavedMessage = false;
+      if (req.body.continueSavedMessage === true) {
+        const notContinuable = () => res.status(409).json({ error: 'That message can no longer be continued. Send it again as a new message.', code: 'CONTINUE_NOT_AVAILABLE' });
+        if ((Array.isArray(attachments) ? attachments.length > 0 : !!attachments) || questionAnswer || workPlanInputAnswer || deckAnswer || deckCancel || audioInput) return notContinuable();
+        // Strongly consistent: this read is the guard against skipping a save, so a just-written answer or message must be seen.
+        let found: ReturnType<typeof findResumableUserMessage> = { ok: false };
+        try {
+          found = findResumableUserMessage((await chatbotDb.getChatSession(sessionId, true))?.messages);
+        } catch (readError) {
+          console.error('AgentMode: continue check could not read the chat:', readError instanceof Error ? readError.message : String(readError));
+        }
+        if (!found.ok || found.content !== userMessage) return notContinuable();
+        resumeSavedMessage = true;
+      }
+
+      // ENG-2113: whose plan pays for THIS turn, decided once, before anything below mutates state (a stop consumes nothing).
+      // No `fundingChoice` in the body = AgentWeb, with no lookups, exactly as before. A stop is a typed answer, never an AgentWeb run.
+      let planRoute: PlanRoute | undefined;
+      try {
+        const funding = await resolveTurnFunding({
+          rawFundingChoice: req.body.fundingChoice,
+          initiatorUserId: user.userId,
+          sessionOwnerUserId: session.userId,
+          // Read from the stored user (strongly consistent: this is a gate), only after the allow-list has said yes. req.user never carries it.
+          lookupOrgId: async () => {
+            const stored = await userDb.getUserByIdConsistent(user.userId);
+            if (!stored) throw new Error('user record not found'); // a failed read is a typed lookup failure, never "no organisation"
+            return stored.orgId;
+          },
+          acknowledgedExtraUsage: req.body.acknowledgeExtraUsage === true,
+          requestIsDelegated: (req as any).delegateInfo?.isDelegated === true,
+          sessionIsDelegated: session.delegateInfo?.isDelegated === true,
+          // Only a plan request needs the pick resolved; everyone else skips the lookup (and its log line).
+          explicitModelId: llmModel && req.body.fundingChoice === 'claude_subscription' ? canonicalPinId(agentModeService, llmModel) : undefined,
+        });
+        if (funding.route === 'claude_subscription') {
+          planRoute = funding;
+          planTurn = true;
+        }
+      } catch (fundingError) {
+        // Nothing is saved yet. A lookup that failed for any reason other than a typed stop is still a stop (never an AgentWeb run, never a 500).
+        const fundingStop = fundingError instanceof ClaudeRouteStopError ? fundingError : new ClaudeRouteStopError('lookup_failed');
+        if (!(fundingError instanceof ClaudeRouteStopError)) console.error('AgentMode: plan funding lookup failed:', fundingError instanceof Error ? fundingError.message : String(fundingError));
+        // On a continue the message is already in the chat (and nothing ran): say so, so the client never resends it as new.
+        return res.status(fundingStop.httpStatus).json(sendRefusalBody(planStopResponse(fundingStop, resumeSavedMessage, resumeSavedMessage), resumeSavedMessage));
+      }
+
       // EXPLICIT = the REQUEST carries a model. A model merely STORED on the session is
       // never explicit: the system stamps the configured default into session.llmModel
       // (Slack, work-plan launch, GTM, onboarding...), no persisted flag can tell that
@@ -10892,7 +11189,8 @@ export const agentModeController = {
       const explicitModelSelection = Boolean(llmModel);
       let preflightDecision: EffectiveModelPolicyDecision | undefined;
       try {
-        preflightDecision = await resolveEffectiveModelForUser({
+        // ENG-2113: the plan route runs the explicit pick as is (the plan, not AgentWeb's allowance or tiers, pays for it): no AgentWeb policy swap.
+        if (!planRoute) preflightDecision = await resolveEffectiveModelForUser({
           userId: session.userId,
           requestedModel: llmModel || session.llmModel || null,
           backupModel: llmBackupModel,
@@ -10904,7 +11202,7 @@ export const agentModeController = {
         if (!isModelUnavailableError(modelError)) throw modelError;
         const preflightUsage = await checkTokenUsage(user.userId);
         if (preflightUsage.allowed) {
-          return res.status(422).json(modelUnavailableBody(modelError));
+          return res.status(422).json(sendRefusalBody(modelUnavailableBody(modelError), false));
         }
       }
 
@@ -10920,6 +11218,18 @@ export const agentModeController = {
       // deckCancel still populate them.
       let answerAck: string | undefined;
       let answeredQuestionMeta: { questionId: string; optionId: string; delegated: boolean } | undefined;
+
+      // ENG-110/ENG-2648: an answer/cancel turn is admitted above the per-user cap (refusing it
+      // after the deck / work-plan request below is consumed would lose the outcome), but only up
+      // to the hard ceiling (limit x2). Its slot is taken HERE, before anything is consumed, so a
+      // 429 at the ceiling leaves the pending deck / request intact for a retry.
+      if (deckAnswer || deckCancel || workPlanInputAnswer) {
+        const reserved = await acquireInteractiveGenerationSlot(session.userId, sessionId, { continuesPausedTurn: true });
+        if (!reserved.ok) {
+          return res.status(429).json(sendRefusalBody(buildTooManyRunsBody(reserved.current, reserved.limit), false));
+        }
+        pausedTurnSlot = reserved;
+      }
 
       // Work-plan details are validated and persisted as structured values before
       // Emma receives the continuation. This keeps chat and MCP answers identical
@@ -11081,12 +11391,20 @@ export const agentModeController = {
         const idemKey = interactiveIdempotencyKey(sessionId, userMessage, llmModel || '');
         const claim = await claimIdempotency(idemKey, runSurvivalRunId, IDEM_TTL_INTERACTIVE_S);
         if (!claim.claimed) {
-          return res.status(409).json({
+          // ENG-2672: a duplicate of a send whose first copy is still running (same client message id). The message is
+          // in the chat only if the first copy has already stored it, which the chat itself says; a stale claim or a
+          // first copy that has not reached its save yet leaves it false (nothing stored for this copy).
+          const firstCopySaved = typeof clientId === 'string' && clientId !== ''
+            ? await chatbotDb.getChatSession(sessionId, true) // strongly consistent: a just-saved message must be seen
+                .then((current) => !!current?.messages?.some((m) => m.role === 'user' && m.clientId === clientId))
+                .catch(() => false)
+            : false;
+          return res.status(409).json(sendRefusalBody({
             error: 'Session is busy',
             message: 'A response is already being generated for this session. Please wait.',
             code: 'SESSION_BUSY',
             ...(claim.inFlightRunId ? { runId: claim.inFlightRunId } : {}),
-          });
+          }, firstCopySaved));
         }
         idemKeyHeld = idemKey;
       }
@@ -11109,6 +11427,7 @@ export const agentModeController = {
           error: 'Session is busy',
           message: 'A response is already being generated for this session. Please wait.',
           code: 'SESSION_BUSY',
+          userMessageSaved: false,
         });
       }
 
@@ -11128,26 +11447,28 @@ export const agentModeController = {
           error: 'Session is busy',
           message: 'A response is already being generated for this session. Please wait.',
           code: 'SESSION_BUSY',
+          userMessageSaved: false,
         });
       }
 
       // ENG-110: per-user soft cap on concurrently generating interactive chats.
       // Taken AFTER the session claim, released in the finally below on every exit.
-      let generationSlot: { release: () => void } | undefined;
+      // An answer/cancel turn already holds its slot (taken before its pending state was
+      // consumed, see pausedTurnSlot above), so it is never refused here.
+      let generationSlot: { release: () => void } | undefined = pausedTurnSlot;
       try {
-      // Answer/cancel turns already consumed a paused deck / work-plan request above
-      // (writes dispatched, state cleared), so refusing them now would lose the
-      // outcome and make a retry 409. They are never refused, only counted.
-      const continuesPausedTurn = Boolean(deckAnswer || deckCancel || workPlanInputAnswer);
-      const slot = await acquireInteractiveGenerationSlot(session.userId, sessionId, { bypassLimit: continuesPausedTurn });
-      if (!slot.ok) {
-        return res.status(429).json(buildTooManyRunsBody(slot.current, slot.limit));
+      if (!generationSlot) {
+        const slot = await acquireInteractiveGenerationSlot(session.userId, sessionId);
+        if (!slot.ok) {
+          return res.status(429).json(sendRefusalBody(buildTooManyRunsBody(slot.current, slot.limit), false));
+        }
+        generationSlot = slot;
       }
-      generationSlot = slot;
 
       // Check token usage limits
-      const usageStatus = await checkTokenUsage(user.userId, TURN_ADMISSION);
-      if (!usageStatus.allowed) {
+      // ENG-2113: a turn on the user's own plan takes no AgentWeb allowance and records no PAYG admission.
+      const usageStatus = planRoute ? undefined : await checkTokenUsage(user.userId, TURN_ADMISSION);
+      if (usageStatus && !usageStatus.allowed) {
         // ENG-527: product-feedback filing is never token-limited. An over-quota user who
         // explicitly asks Emma to file a bug/feature request (portal `feedbackIntent`) gets it
         // filed DETERMINISTICALLY — zero LLM calls, zero token spend — through the same shared
@@ -11223,12 +11544,12 @@ export const agentModeController = {
             });
           }
         }
-        return res.status(429).json(await buildUsagePausedBody({
+        return res.status(429).json(sendRefusalBody(await buildUsagePausedBody({
           usageStatus,
           session,
           requestedModel: llmModel || session.llmModel || null,
           backupModel: llmBackupModel,
-        }));
+        }), false));
       }
 
       // (Session was fetched + ownership-checked above, before the locks.)
@@ -11269,52 +11590,62 @@ export const agentModeController = {
         }
       });
 
-      // A request/session model is a preference, not authority. Resolve it
-      // against the current cost state immediately before dispatch so an old
-      // MCP client or stored session cannot bypass optimized mode.
-      try {
-        // Same inputs as the pre-flight above (nothing in between changes the model
-        // or the request), so reuse its decision when it resolved cleanly.
-        modelPolicyDecision = preflightDecision ?? await resolveEffectiveModelForUser({
-          userId: session.userId,
-          requestedModel: llmModel || session.llmModel || null,
-          backupModel: llmBackupModel,
-          backupSource: llmBackupModel ? 'user' : null,
-          allowSilentSwap: !explicitModelSelection,
-          session,
-        });
-      } catch (modelError) {
-        if (!isModelUnavailableError(modelError)) throw modelError;
-        // FAIL-LOUD: nothing was sent to any model. No session write, no
-        // metering, user message not persisted. The inner finally releases the
-        // generation lock + idem claim; close the run record created above.
-        if (runSurvivalRunId) {
-          void markRunTerminal(runSurvivalRunId, 'failed', { finishReason: 'model_unavailable' });
+      // ENG-2113: on the plan route the model that runs is the explicit pick, and the session keeps whatever model it had (a later AgentWeb
+      // message must not inherit a plan pick it never asked for). Everything else in this branch is today's policy, unchanged.
+      let modelToUse: string;
+      let selectedModel: string;
+      if (planRoute) {
+        modelToUse = planRoute.modelId;
+        selectedModel = planRoute.modelId;
+      } else {
+        // A request/session model is a preference, not authority. Resolve it
+        // against the current cost state immediately before dispatch so an old
+        // MCP client or stored session cannot bypass optimized mode.
+        try {
+          // Same inputs as the pre-flight above (nothing in between changes the model
+          // or the request), so reuse its decision when it resolved cleanly.
+          modelPolicyDecision = preflightDecision ?? await resolveEffectiveModelForUser({
+            userId: session.userId,
+            requestedModel: llmModel || session.llmModel || null,
+            backupModel: llmBackupModel,
+            backupSource: llmBackupModel ? 'user' : null,
+            allowSilentSwap: !explicitModelSelection,
+            session,
+          });
+        } catch (modelError) {
+          if (!isModelUnavailableError(modelError)) throw modelError;
+          // FAIL-LOUD: nothing was sent to any model. No session write, no
+          // metering, user message not persisted. The inner finally releases the
+          // generation lock + idem claim; close the run record created above.
+          if (runSurvivalRunId) {
+            void markRunTerminal(runSurvivalRunId, 'failed', { finishReason: 'model_unavailable' });
+          }
+          return res.status(422).json(sendRefusalBody(modelUnavailableBody(modelError), false));
         }
-        return res.status(422).json(modelUnavailableBody(modelError));
+        if (!modelPolicyDecision.effectiveModel) {
+          // Paused: the one shared producer stamps the decision and builds the 429.
+          return res.status(429).json(sendRefusalBody(await buildUsagePausedBody({
+            usageStatus: usageStatus!,
+            session,
+            requestedModel: modelPolicyDecision.requestedModel,
+            decision: modelPolicyDecision,
+          }), false));
+        }
+        modelToUse = modelPolicyDecision.effectiveModel;
+        // ENG-669 PR-C: the session keeps the SELECTION (`agentweb-model` when routed); `modelToUse` is what runs. The
+        // auto continuations this turn may start are handed the selection too: each continuation is a turn of its own, so
+        // it is routed again (deterministic: the same table routes it to the same model), re-checks the switch and the
+        // router's availability (a rollback stops the chain with a visible refusal), and its replies carry the stamp.
+        selectedModel = storedModelFor(modelPolicyDecision, modelToUse);
+        await chatbotDb.updateSessionLlmModel(
+          sessionId,
+          selectedModel,
+          toStoredModelPolicyDecision(modelPolicyDecision),
+          // ENG-669: the portal echoes the stored stamp every turn; that is not a new choice.
+          modelSourceAfter(session, selectedModel, llmModel),
+        );
+
       }
-      if (!modelPolicyDecision.effectiveModel) {
-        // Paused: the one shared producer stamps the decision and builds the 429.
-        return res.status(429).json(await buildUsagePausedBody({
-          usageStatus,
-          session,
-          requestedModel: modelPolicyDecision.requestedModel,
-          decision: modelPolicyDecision,
-        }));
-      }
-      const modelToUse = modelPolicyDecision.effectiveModel;
-      // ENG-669 PR-C: the session keeps the SELECTION (`agentweb-model` when routed); `modelToUse` is what runs. The
-      // auto continuations this turn may start are handed the selection too: each continuation is a turn of its own, so
-      // it is routed again (deterministic: the same table routes it to the same model), re-checks the switch and the
-      // router's availability (a rollback stops the chain with a visible refusal), and its replies carry the stamp.
-      const selectedModel = storedModelFor(modelPolicyDecision, modelToUse);
-      await chatbotDb.updateSessionLlmModel(
-        sessionId,
-        selectedModel,
-        toStoredModelPolicyDecision(modelPolicyDecision),
-        // ENG-669: the portal echoes the stored stamp every turn; that is not a new choice.
-        modelSourceAfter(session, selectedModel, llmModel),
-      );
 
       // Build page context for emma-sidebar sessions
       const pageContext = session.portalType === 'emma-sidebar'
@@ -11378,7 +11709,7 @@ export const agentModeController = {
         turnStartMs, // ENG-907: the deadline withGenerationTimeout below enforces
         undefined, // publishAuthorizationOverride — interactive path resolves per turn
         undefined, // approvedRevisionImageSources
-        undefined, // userMessageKind
+        resumeSavedMessage ? RESUME_SAVED_MESSAGE_KIND : undefined, // userMessageKind
         Boolean(questionAnswer || workPlanInputAnswer),
         typeof clientId === 'string' ? clientId : undefined, // ENG-1495
         approvalDeckAnswerMeta, // ENG-1635/1644: structured deck answer stamped on the reply
@@ -11390,14 +11721,26 @@ export const agentModeController = {
         false,
         // ENG-2378: an explicit model pick = a request model that differs from the stored stamp (the portal echoes the stamp).
         // ENG-669 PR-C: the pick is the selection (the engine routes an AgentWeb Model pick itself).
-        explicitModelSelection && selectedModel !== session.llmModel ? selectedModel : undefined,
+        !planRoute && explicitModelSelection && selectedModel !== session.llmModel ? selectedModel : undefined,
         modelPolicyDecision, // ENG-669 PR-C: this turn's decision (routing provenance on the replies)
+        undefined, // routerTaskType
+        planRoute, // ENG-2113: set only when this turn runs on the user's own Claude plan
       );
 
       let response: Awaited<ReturnType<typeof generateSessionResponse>>;
       try {
         response = await withGenerationTimeout(genPromise, sessionId);
       } catch (genErr: any) {
+        // ENG-2113: a plan turn that hits the whole-turn cap is stopped (this reaches the Claude run registry) and reported as the timeout it is.
+        // None of the salvage below applies: it would schedule automatic continuations, which run on AgentWeb's models.
+        if (planRoute && genErr?.isGenerationTimeout) {
+          requestCancel(sessionId);
+          generateMarketingResponseWorkerService.cancelSession(sessionId);
+          // A typed stop with fixed copy (not the generic error path / diagnosis agent). The user message was saved long before the cap.
+          const timeoutStop = new ClaudeRouteStopError('turn_timeout');
+          markRaisedAfterUserMessageSaved(timeoutStop);
+          throw timeoutStop;
+        }
         // A long landing-page build outlived the run timeout but is still running.
         // Don't report a false failure — tell the user it's still building and post
         // the result back to this session when it finishes. Scoped to landing builds
@@ -11588,7 +11931,8 @@ export const agentModeController = {
       // finishes without the customer's involvement. setImmediate defers the kickoff
       // past this request's own `finally` below, so scheduleAutoMediaContinuation
       // claims the generation lock only after THIS request has released it.
-      if (hasDeferredMediaBudgetToolCall(response.toolCalls)) {
+      // ENG-2113: automatic follow-up turns would run on AgentWeb's models; on the plan route the user is asked to continue instead.
+      if (!planRoute && hasDeferredMediaBudgetToolCall(response.toolCalls)) {
         setImmediate(() => scheduleAutoMediaContinuation(sessionId, session.userId, selectedModel, 1, false).catch((err) =>
           console.error(`AgentMode: media auto-continuation (soft deferral) failed for session ${sessionId}:`, err),
         ));
@@ -11600,11 +11944,11 @@ export const agentModeController = {
       // "retry" instead of just continuing per the plan's own "never wait on the user"
       // contract, and the session then sat idle for 3+ hours. Auto-fire the continuation
       // ourselves, same setImmediate-after-release pattern as the media case above.
-      if (hasStalledAutocompleteWorkPlan(response.workPlan, response.toolCalls, response.calledFunctions)) {
+      if (!planRoute && hasStalledAutocompleteWorkPlan(response.workPlan, response.toolCalls, response.calledFunctions)) {
         setImmediate(() => scheduleAutoWorkPlanContinuation(sessionId, session.userId, selectedModel, 1, false).catch((err) =>
           console.error(`AgentMode: work-plan auto-continuation failed for session ${sessionId}:`, err),
         ));
-      } else if (response.workPlan?.autocomplete && hasNonRetryableWorkPlanStatusBlock(response.toolCalls)) {
+      } else if (!planRoute && response.workPlan?.autocomplete && hasNonRetryableWorkPlanStatusBlock(response.toolCalls)) {
         // ENG-2019: non-retryable gate block — hand back once instead of auto-continuing.
         setImmediate(() => postWorkPlanNeedsYouMessage(sessionId, session.userId).catch((err) =>
           console.error(`AgentMode: work-plan needs-you message failed for session ${sessionId}:`, err),
@@ -11724,12 +12068,56 @@ export const agentModeController = {
         }
       }
     } catch (error) {
-      // ENG-669: the final gate in generateSessionResponse refused the turn's model before anything was persisted
-      // (e.g. a race with a tier change): the same 422 the pre-flight answers, never a generic 500.
+      // ENG-2113: the chat changed (or could not be read) between the continue's request check and the turn: a typed refusal, never an AgentWeb error, a
+      // diagnosis run or a note in the chat. Nothing was saved or run by this request.
+      if (error instanceof ResumeNotAvailableError && !res.headersSent) {
+        if (runSurvivalRunId) void markRunTerminal(runSurvivalRunId, 'failed', { finishReason: 'continue_not_available' });
+        if (req.body?.sessionId) markProgressComplete(req.body.sessionId);
+        return res.status(409).json({ error: 'That message can no longer be continued. Send it again as a new message.', code: 'CONTINUE_NOT_AVAILABLE' });
+      }
+      // ENG-669: generateSessionResponse refused the turn's model (e.g. a race with a tier change): the same 422 the
+      // pre-flight answers, never a generic 500. Its final gate refuses before anything is persisted; its Work Plan
+      // step-model refusal comes after the user message was saved, which the body says (ENG-2641).
       if (isModelUnavailableError(error) && !res.headersSent) {
         if (runSurvivalRunId) void markRunTerminal(runSurvivalRunId, 'failed', { finishReason: 'model_unavailable' });
         if (req.body?.sessionId) markProgressComplete(req.body.sessionId);
-        return res.status(422).json(modelUnavailableBody(error));
+        return res.status(422).json(sendRefusalBody(modelUnavailableBody(error), wasRaisedAfterUserMessageSaved(error)));
+      }
+      // ENG-2113: the plan route stopped the turn after the user's message was saved (host busy, plan limit, login dead...). A fixed-copy
+      // note keeps the chat honest on reload; no diagnosis agent (it would spend AgentWeb money to guess at something already known).
+      const planStop =
+        error instanceof ClaudeRouteStopError
+          ? error
+          // A full session keeps its own answer (413, start a new chat): "try again" would never work. Everything else on a plan turn is a typed stop.
+          : planTurn && !res.headersSent && !(error instanceof Error && isSessionLimitError(error))
+            ? new ClaudeRouteStopError(error instanceof Error && isWorkerShutdownError(error) ? 'server_restarting' : 'turn_failed')
+            : undefined;
+      if (planStop && !res.headersSent) {
+        const planStopResumable = turnRanNoTools(planStop) || (planStop !== error && turnRanNoTools(error));
+        if (planStop !== error) {
+          console.error('AgentMode: plan turn failed outside the Claude backend:', error instanceof Error ? error.message : String(error));
+          if (wasRaisedAfterUserMessageSaved(error)) markRaisedAfterUserMessageSaved(planStop);
+        }
+        if (runSurvivalRunId) void markRunTerminal(runSurvivalRunId, 'failed', { finishReason: `claude_plan_${planStop.code}` });
+        const stoppedSessionId = req.body?.sessionId;
+        if (stoppedSessionId) {
+          markProgressComplete(stoppedSessionId);
+          // A note under a message that was never saved would be an answer to nothing.
+          if (wasRaisedAfterUserMessageSaved(planStop)) {
+            await chatbotDb.addMessageToSession(stoppedSessionId, {
+              role: 'assistant',
+              content: planStop.userMessage,
+              timestamp: new Date().toISOString(),
+              // `resumable`: the turn is KNOWN to have run no tool, so the saved message may be answered again without repeating an action.
+              metadata: { timestamp: new Date().toISOString(), isErrorMessage: true, kind: PLAN_STOP_NOTE_KIND, code: planStop.code, resumable: planStopResumable },
+            } as ChatMessage).catch((persistErr) => console.error('AgentMode: failed to persist plan stop note:', persistErr));
+          }
+        }
+        // `userMessageSaved` + `canContinueSavedMessage` tell the client which offer is safe: not saved = resend; saved and known to have run no tool =
+        // continue (the message is answered again with `continueSavedMessage: true`, never stored twice); saved and a tool may have run = only a new message,
+        // and the client says an action may repeat.
+        const planStopSaved = wasRaisedAfterUserMessageSaved(planStop);
+        return res.status(planStop.httpStatus).json(sendRefusalBody(planStopResponse(planStop, planStopSaved, planStopResumable), planStopSaved));
       }
       console.error('AgentMode: Generate response error:', error);
 
@@ -11791,6 +12179,18 @@ export const agentModeController = {
                   'The server restarted while processing your request. Please send your message again.',
                   publishLedger,
                 ),
+                publishLedger,
+              ),
+              artifactUrls,
+            );
+          } else if (isQuotaExhaustedError(error)) {
+            // ENG-2763: persist the quota message, not diagnosis/retry advice, so a
+            // reload agrees with the 503 PROVIDER_QUOTA_EXHAUSTED response.
+            publishLedger = (await loadPublishLedger(sessionId, turnStartCalledFunctions)) || [];
+            artifactUrls = await loadConfirmedArtifactUrls(sessionId, turnStartMsForDiagnosis);
+            diagnosticContent = appendConfirmedArtifactNotice(
+              appendConfirmedDataWriteNotice(
+                appendConfirmedPublishNotice(QUOTA_EXHAUSTED_USER_MESSAGE, publishLedger),
                 publishLedger,
               ),
               artifactUrls,
@@ -11862,22 +12262,22 @@ export const agentModeController = {
         }
 
         if (isWorkerShutdownError(error)) {
-          res.status(503).json({
+          res.status(503).json(sendRefusalBody({
             error: 'Server is restarting',
             message: 'The server is restarting. Please try again in a moment.',
             code: 'SERVER_RESTARTING',
             suggestion: 'wait_and_retry'
-          });
+          }, wasRaisedAfterUserMessageSaved(error)));
           return;
         }
 
         if (isProviderNoEndpointsError(error)) {
-          res.status(503).json({
+          res.status(503).json(sendRefusalBody({
             error: 'Model provider unavailable',
             message: 'The selected model has no available provider right now. Please try again, or pick a different model from the selector above.',
             code: 'PROVIDER_UNAVAILABLE',
             suggestion: 'wait_and_retry'
-          });
+          }, wasRaisedAfterUserMessageSaved(error)));
           return;
         }
 
@@ -11919,12 +12319,12 @@ export const agentModeController = {
           autoReportContextLimitToLinear(sessionId, user?.email, user?.userId, llmModel, session)
             .catch(err => console.error('autoReportContextLimitToLinear failed:', err));
 
-          res.status(413).json({
+          res.status(413).json(sendRefusalBody({
             error: 'Context limit exceeded',
             message: 'This conversation is too long for the current model context window. Please start a new session or shorten the request.',
             code: 'CONTEXT_LIMIT_EXCEEDED',
             suggestion: 'start_new_session'
-          });
+          }, wasRaisedAfterUserMessageSaved(error)));
           return;
         }
 
@@ -11958,24 +12358,37 @@ export const agentModeController = {
           return;
         }
 
+        // ENG-2763: OpenRouter key-limit / credits exhaustion is a known class, not an
+        // unknown error: answer 503 and page once per class, not once per occurrence.
+        if (isQuotaExhaustedError(error)) {
+          sendQuotaExhaustedAlert(error, req.body?.sessionId);
+          res.status(503).json(sendRefusalBody({
+            error: 'AI service at capacity',
+            message: error.message,
+            code: 'PROVIDER_QUOTA_EXHAUSTED',
+            suggestion: 'wait'
+          }, wasRaisedAfterUserMessageSaved(error)));
+          return;
+        }
+
         // ENG-2381: a final upstream provider 5xx is an outage, not an unknown error.
         if (isProviderUnavailableError(error)) {
-          res.status(503).json({
+          res.status(503).json(sendRefusalBody({
             error: 'AI provider unavailable',
             message: error.message,
             code: 'PROVIDER_UNAVAILABLE',
             suggestion: 'wait_and_retry'
-          });
+          }, wasRaisedAfterUserMessageSaved(error)));
           return;
         }
 
         if (error.message.includes('Generation timed out')) {
-          res.status(504).json({
+          res.status(504).json(sendRefusalBody({
             error: 'Generation timed out',
             message: 'The response took too long to generate. Please try again — your session is still active.',
             code: 'GENERATION_TIMEOUT',
             suggestion: 'wait_and_retry'
-          });
+          }, wasRaisedAfterUserMessageSaved(error)));
           return;
         }
 
@@ -12024,6 +12437,8 @@ export const agentModeController = {
         error: 'Failed to generate response',
         ...(diagnosticContent ? { diagnosticMessage: diagnosticContent } : {}),
       });
+    } finally {
+      pausedTurnSlot?.release();
     }
   },
 
@@ -12457,56 +12872,61 @@ export const agentModeController = {
         }
       }
 
-      // Use session's llmModel if available, otherwise use default
-      const defaultModel = await agentModeService.getDefaultModel();
-      const modelToUse = session.llmModel || defaultModel;
+      // ENG-2645: a share viewer is not the owner, so the response is an allowlist of what the viewer's page
+      // reads (utils/shareViewerSerializers.ts), never the session record. Both views start from the same
+      // non-owner filter (ENG-112: no branch provenance, ENG-113/669 owner-only metadata, ENG-2163 admin turns).
+      const viewerMessages = filterMessagesForClient(session.messages, { omitBranchOrigin: true });
+      const workPlan = redactWorkPlanForViewer(session.workPlan);
+      // Both views also get the live approval-deck slot (ENG-1635/1644): it lets a shared card show the real
+      // answered option instead of a bare "View only"; everything in it is already in the transcript's card.
 
-      // Get user's supportNote if available
-      let supportNote: string | undefined;
-      try {
-        const user = await userDb.getUserById(session.userId);
-        supportNote = user?.supportNote;
-      } catch (error) {
-        console.error('Failed to fetch user supportNote:', error);
-        // Continue without supportNote if fetch fails
-      }
+      if (!conversable) {
+        // Read-only link: the portal's ShareConversation page. No skills, no supportNote/Slack thread, no model,
+        // and no share metadata — `interactiveShareMetadata.token` is the conversable credential.
+        res.status(200).json({
+          session: buildReadOnlyShareSession({
+            sessionId: session.sessionId,
+            title: session.title,
+            messages: viewerMessages,
+            workPlan,
+            pendingApprovalDeck: session.pendingApprovalDeck,
+          }),
+        });
+      } else {
+        // Conversable link: the portal's AgentMode chat (and the landing-page status poll).
+        const defaultModel = await agentModeService.getDefaultModel();
+        const modelToUse = session.llmModel || defaultModel;
 
-      // Build skills list with installed status (includes virtual other_skills), filtered by subscription
-      let sharedSkills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[] = [];
-      try {
-        sharedSkills = await agentModeService.getSkillsForDisplay(session.associatedSkills || [], session.userId);
-      } catch (error) {
-        console.error('AgentMode getSharedConversation: Failed to fetch skills:', error);
-      }
-
-      res.status(200).json({
-        session: {
-          sessionId: session.sessionId,
-          title: session.title,
-          // ENG-112: a share viewer is not the owner: no branch provenance (source session id/title).
-          messages: filterMessagesForClient(session.messages, { omitBranchOrigin: true }),
-          createdAt: session.createdAt,
-          updatedAt: session.updatedAt,
-          shareMetadata: session.shareMetadata,
-          interactiveShareMetadata: session.interactiveShareMetadata,
-          workPlan: redactWorkPlanForViewer(session.workPlan),
-          llmModel: modelToUse,
-          isConversable: !!conversable,
-          hasActiveProgress: hasActiveProgress(session.sessionId),
-          supportNote: supportNote,
-          skills: sharedSkills,
-          slackThread: session.slackThread,
-          pendingWorkPlanInput: session.pendingWorkPlanInput,
-          // ENG-1635/1644: expose the live deck slot so a shared/read-only card can
-          // reflect the real answered option (highlight + "Answered") instead of a bare
-          // "View only" — used to distinguish "still the current awaiting deck" vs
-          // "superseded". Everything here is already visible in the transcript's
-          // card, so it leaks nothing new; the share stays read-only via the card's
-          // readOnly path. (PR2: the pendingUserQuestion sibling of this field is
-          // gone — ask_user_question/the objective gate always build a deck-of-one now.)
-          pendingApprovalDeck: session.pendingApprovalDeck
+        // No supportNote: it is the admin's internal note about the account, not something to show a viewer
+        // (the ishare header falls back to "You're chatting with Emma in a shared conversation").
+        // Skills popover: only this session's installed skills (never the owner's catalog or the admin bundle).
+        let sharedSkills: ReturnType<typeof narrowSkillsForShareViewer> = [];
+        try {
+          sharedSkills = narrowSkillsForShareViewer(
+            await agentModeService.getSkillsForDisplay(session.associatedSkills || [], session.userId),
+            ADMIN_SKILL_VIRTUAL_ID,
+          );
+        } catch (error) {
+          console.error('AgentMode getSharedConversation: Failed to fetch skills:', error);
         }
-      });
+
+        res.status(200).json({
+          session: buildConversableShareSession({
+            sessionId: session.sessionId,
+            title: session.title,
+            messages: viewerMessages,
+            createdAt: session.createdAt,
+            updatedAt: session.updatedAt,
+            workPlan,
+            llmModel: modelToUse,
+            hasActiveProgress: hasActiveProgress(session.sessionId),
+            slackThread: session.slackThread,
+            skills: sharedSkills,
+            pendingWorkPlanInput: session.pendingWorkPlanInput,
+            pendingApprovalDeck: session.pendingApprovalDeck,
+          }),
+        });
+      }
 
       // ai-eval-funnel loop telemetry — fire-once eval_completed / eval_failed
       // events server-side so the lander's loop sensor can see them
@@ -12549,6 +12969,11 @@ export const agentModeController = {
     // error path needs this turn's starting point to attribute successes correctly.
     let turnStartCalledFunctions: Record<string, number> | null = null;
     try {
+      // ENG-2113: a shared link always runs on AgentWeb's models. A client that asks for the plan here must hear no, not be answered by AgentWeb
+      // (the same rule as /generate and /verified-generate).
+      if (req.body?.fundingChoice !== undefined && req.body?.fundingChoice !== null && req.body?.fundingChoice !== 'agentweb') {
+        return res.status(400).json(sendRefusalBody(claudeStopBody(new ClaudeRouteStopError('invalid_funding_choice')), false));
+      }
       const { shareId } = req.params;
       const { conversable } = req.query;
       const { userMessage, llmModel, attachments = [], workPlanInputAnswer, deckAnswer, deckCancel, clientId } = req.body;
@@ -12608,6 +13033,7 @@ export const agentModeController = {
           error: 'Session is busy',
           message: 'A response is already being generated for this session. Please wait.',
           code: 'SESSION_BUSY',
+          userMessageSaved: false,
         });
       }
 
@@ -12624,7 +13050,7 @@ export const agentModeController = {
       } catch (modelError) {
         if (!isModelUnavailableError(modelError)) throw modelError;
         if ((await checkTokenUsage(session.userId)).allowed) {
-          return res.status(422).json(modelUnavailableBody(modelError, 'share_viewer'));
+          return res.status(422).json(sendRefusalBody(modelUnavailableBody(modelError, 'share_viewer'), false));
         }
       }
 
@@ -12762,6 +13188,7 @@ export const agentModeController = {
         // usage through the subscription-usage endpoint.
         return res.status(429).json({
           error: 'Monthly token limit reached for this shared session. Please contact the owner of this link.',
+          userMessageSaved: false,
         });
       }
 
@@ -12786,7 +13213,7 @@ export const agentModeController = {
         });
       } catch (modelError) {
         if (!isModelUnavailableError(modelError)) throw modelError;
-        return res.status(422).json(modelUnavailableBody(modelError, 'share_viewer'));
+        return res.status(422).json(sendRefusalBody(modelUnavailableBody(modelError, 'share_viewer'), false));
       }
       if (!modelPolicyDecision.effectiveModel) {
         // Runtime always exposes this method. The guard preserves older
@@ -12801,6 +13228,7 @@ export const agentModeController = {
         }
         return res.status(429).json({
           error: 'AI usage is paused for this shared session. Please contact the owner of this link.',
+          userMessageSaved: false,
         });
       }
       const modelToUse = modelPolicyDecision.effectiveModel;
@@ -12873,7 +13301,8 @@ export const agentModeController = {
         ...(typeof sharedAssistantMessageIndex === 'number' ? { messageIndex: sharedAssistantMessageIndex } : {}),
         ...(typeof response.userMessageIndex === 'number' ? { userMessageIndex: response.userMessageIndex } : {}),
         workPlan: redactWorkPlanForViewer(response.workPlan),
-        skills: response.skills,
+        // ENG-2645: the viewer's Skills popover gets this session's installed skills only, not the owner's catalog.
+        skills: narrowSkillsForShareViewer(response.skills, ADMIN_SKILL_VIRTUAL_ID),
         ...(response.workPlanTurnDisposition ? { workPlanTurnDisposition: response.workPlanTurnDisposition } : {}),
         // ENG-1635/1644: same immediate-sync fields as the authenticated path (see
         // generateResponse) — lets the optimistic ApprovalDeckCard on a shared link
@@ -12889,7 +13318,7 @@ export const agentModeController = {
       // ENG-669: a model refused by the final gate is a 422 (viewer body: no owner plan details), not a 500.
       if (isModelUnavailableError(error) && !res.headersSent) {
         if (req.params?.shareId) markProgressComplete(req.params.shareId);
-        return res.status(422).json(modelUnavailableBody(error, 'share_viewer'));
+        return res.status(422).json(sendRefusalBody(modelUnavailableBody(error, 'share_viewer'), wasRaisedAfterUserMessageSaved(error)));
       }
       console.error('AgentMode: Generate shared response error:', error);
 
@@ -13000,6 +13429,17 @@ export const agentModeController = {
               ),
               artifactUrls,
             );
+          } else if (isQuotaExhaustedError(error)) {
+            // ENG-2763: see the matching branch in generateResponse.
+            publishLedger = (await loadPublishLedger(shareId, turnStartCalledFunctions)) || [];
+            artifactUrls = await loadConfirmedArtifactUrls(shareId, sharedTurnStartMs);
+            diagnosticContent = appendConfirmedArtifactNotice(
+              appendConfirmedDataWriteNotice(
+                appendConfirmedPublishNotice(QUOTA_EXHAUSTED_USER_MESSAGE, publishLedger),
+                publishLedger,
+              ),
+              artifactUrls,
+            );
           } else {
             const userMessage = req.body?.userMessage || '';
             const diagnosis = await getDiagnosticErrorMessage(error, shareId, userMessage, turnStartCalledFunctions, sharedTurnStartMs);
@@ -13100,12 +13540,12 @@ export const agentModeController = {
           autoReportContextLimitToLinear(shareId, session?.userId, session?.userId, llmModel || session?.llmModel, session)
             .catch(err => console.error('autoReportContextLimitToLinear failed (shared):', err));
 
-          res.status(413).json({
+          res.status(413).json(sendRefusalBody({
             error: 'Context limit exceeded',
             message: 'This conversation is too long for the current model context window. Please start a new session or shorten the request.',
             code: 'CONTEXT_LIMIT_EXCEEDED',
             suggestion: 'start_new_session'
-          });
+          }, wasRaisedAfterUserMessageSaved(error)));
           return;
         }
 
@@ -13139,44 +13579,57 @@ export const agentModeController = {
           return;
         }
 
+        // ENG-2763: OpenRouter key-limit / credits exhaustion is a known class, not an
+        // unknown error: answer 503 and page once per class, not once per occurrence.
+        if (isQuotaExhaustedError(error)) {
+          sendQuotaExhaustedAlert(error, req.params?.shareId);
+          res.status(503).json(sendRefusalBody({
+            error: 'AI service at capacity',
+            message: error.message,
+            code: 'PROVIDER_QUOTA_EXHAUSTED',
+            suggestion: 'wait'
+          }, wasRaisedAfterUserMessageSaved(error)));
+          return;
+        }
+
         // ENG-2381: a final upstream provider 5xx is an outage, not an unknown error.
         if (isProviderUnavailableError(error)) {
-          res.status(503).json({
+          res.status(503).json(sendRefusalBody({
             error: 'AI provider unavailable',
             message: error.message,
             code: 'PROVIDER_UNAVAILABLE',
             suggestion: 'wait_and_retry'
-          });
+          }, wasRaisedAfterUserMessageSaved(error)));
           return;
         }
 
         if (isWorkerShutdownError(error)) {
-          res.status(503).json({
+          res.status(503).json(sendRefusalBody({
             error: 'Server is restarting',
             message: 'The server is restarting. Please try again in a moment.',
             code: 'SERVER_RESTARTING',
             suggestion: 'wait_and_retry'
-          });
+          }, wasRaisedAfterUserMessageSaved(error)));
           return;
         }
 
         if (isProviderNoEndpointsError(error)) {
-          res.status(503).json({
+          res.status(503).json(sendRefusalBody({
             error: 'Model provider unavailable',
             message: 'The selected model has no available provider right now. Please try again, or pick a different model from the selector above.',
             code: 'PROVIDER_UNAVAILABLE',
             suggestion: 'wait_and_retry'
-          });
+          }, wasRaisedAfterUserMessageSaved(error)));
           return;
         }
 
         if (error.message.includes('Generation timed out')) {
-          res.status(504).json({
+          res.status(504).json(sendRefusalBody({
             error: 'Generation timed out',
             message: 'The response took too long to generate. Please try again — your session is still active.',
             code: 'GENERATION_TIMEOUT',
             suggestion: 'wait_and_retry'
-          });
+          }, wasRaisedAfterUserMessageSaved(error)));
           return;
         }
 
@@ -13314,8 +13767,21 @@ export const agentModeController = {
 
       // Verify session exists and conversable token is valid
       const session = await chatbotDb.getChatSession(shareId);
-      if (!session || !session.interactiveShareMetadata?.isActive) {
+      if (!session || !session.interactiveShareMetadata) {
         return res.status(404).json({ error: 'Session not found' });
+      }
+
+      // ENG-2644: the token used to be required but never compared, so anyone who knew the id of an
+      // interactively shared chat could cancel its owner's run. The token is checked first so a retry on an
+      // expired or switched-off share answers the same 401/410 every time, never a 404.
+      const interactiveShare = session.interactiveShareMetadata;
+      if (!interactiveShare.token || interactiveShare.token !== conversable) {
+        return res.status(401).json({ error: 'Invalid or expired conversable token' });
+      }
+      // Intentionally NO write on expiry: stop only cancels a run. Deactivating from this stale read could
+      // overwrite a share the owner just re-created, and the other /ishare routes do the switching off.
+      if (!interactiveShare.isActive || new Date() > getInteractiveShareExpiresAt(interactiveShare)) {
+        return res.status(410).json({ error: 'Interactive share link has expired' });
       }
 
       // Signal cancellation
@@ -13336,11 +13802,17 @@ export const agentModeController = {
     try {
       const { sessionId } = req.params;
       const user = req.user as User;
-
-
+      // ENG-2644: only the owner (delegate tokens resolve to the target account) or an admin may
+      // archive. Missing and foreign sessions answer the same 404 so ids cannot be probed.
+      if (!(await callerOwnsSession(sessionId, user))) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
       await chatbotDb.archiveSession(sessionId);
       res.json({ message: 'Session archived successfully' });
     } catch (error) {
+      if ((error as { code?: string })?.code === 'ConditionalCheckFailedException') {
+        return res.status(404).json({ error: 'Session not found' });
+      }
       console.error('AgentMode: Archive session error:', error);
       res.status(500).json({ error: 'Failed to archive session' });
     }
@@ -13352,8 +13824,9 @@ export const agentModeController = {
       const { sessionId, taskId, executionId } = req.params;
       const { status } = req.body;
       const user = req.user as User;
-
-
+      if (!(await callerOwnsSession(sessionId, user))) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
       await updateTaskExecutionStatus(sessionId, taskId, executionId, status);
       res.json({ message: 'Task status updated successfully' });
     } catch (error) {
@@ -13491,9 +13964,11 @@ export const agentModeController = {
         console.warn('Failed to propagate message feedback to images:', propagateError);
       }
 
-      // Fire-and-forget: file an item so the team can review positive/negative feedback
-      fileAutoIssue({
-        title: `Agent Mode ${type === 'like' ? 'Like' : 'Dislike'} Feedback – ${session.title || sessionId}`,
+      // Fire-and-forget: file an item so the team can review negative feedback.
+      // ENG-2676: a like is sentiment, not a defect — likes are persisted and
+      // injected as context above but never filed as a Linear Bug.
+      if (type === 'dislike') fileAutoIssue({
+        title: `Agent Mode Dislike Feedback – ${session.title || sessionId}`,
         description: [
           `User ${user.email} voted ${type} on a message in session "${session.title || sessionId}".`,
           comment ? `Comment: "${comment}"` : '',
@@ -13893,9 +14368,9 @@ export const agentModeController = {
         console.warn('Failed to propagate ishare message feedback to images:', propagateError);
       }
 
-      // Fire-and-forget: file an item for anonymous ishare votes
-      fileAutoIssue({
-        title: `Agent Mode ${type === 'like' ? 'Like' : 'Dislike'} Feedback (iShare) – ${session.title || shareId}`,
+      // Fire-and-forget: file an item for anonymous ishare dislikes (ENG-2676: likes are not defects)
+      if (type === 'dislike') fileAutoIssue({
+        title: `Agent Mode Dislike Feedback (iShare) – ${session.title || shareId}`,
         description: [
           `Anonymous visitor voted ${type} on a message in shared session "${session.title || shareId}".`,
           comment ? `Comment: "${comment}"` : '',
@@ -13913,10 +14388,8 @@ export const agentModeController = {
         console.warn('Failed to file feedback item (ishare):', err.message);
       });
 
-      res.json({
-        success: true,
-        message: updatedMessage,
-      });
+      // ENG-2645: only the feedback the portal reads back, not the raw stored row (reasoning, usage, …).
+      res.json(toIShareFeedbackResponse(updatedMessage));
     } catch (error) {
       console.error('AgentMode: Submit ishare message feedback error:', error);
       res.status(500).json({ error: 'Failed to submit feedback' });
@@ -15669,6 +16142,7 @@ export const agentModeController = {
         updatedAt: new Date().toISOString()
       });
 
+      console.log(`[schedule-toggle] schedule=${scheduleId} ${schedule.status ?? 'none'} -> ${status} owner=${user.userId} ua=${JSON.stringify(String(req.get('user-agent') ?? '').slice(0, 60))}`);
       res.json({ message: `Scheduled chat ${status === 'active' ? 'enabled' : 'paused'} successfully` });
 
     } catch (error) {
@@ -15993,7 +16467,10 @@ export const agentModeController = {
             && (prefilledWithoutRequest || (valuesProvidedAfterLatestRequest && valuesProvidedAfterLastRun));
 
           // Calculate next run based on the current nextRunTime to preserve the scheduled time
-          const currentNextRun = new Date(schedule.nextRunTime);
+          // An unreadable stored nextRunTime (legacy/operator-edited row) would make
+          // calculateNextRunTime throw 'Invalid time value' on every poll; treat it as due now.
+          const storedNextRun = new Date(schedule.nextRunTime);
+          const currentNextRun = Number.isFinite(storedNextRun.getTime()) ? storedNextRun : new Date();
           const nextRunTime = calculateNextRunTime(schedule.frequency, currentNextRun, schedule.frequencyIntervalDays, schedule.scheduleId);
 
           if (scheduleVariables.length > 0 && !isVariableRequestSatisfied) {
@@ -16333,7 +16810,8 @@ export const agentModeController = {
       res.json({
         sessionId: session.sessionId,
         title: session.title,
-        messages: filterMessagesForClient(session.messages, { omitBranchOrigin: true }),
+        // ENG-2645: same row shaping as the conversable share view (no system prompt, no reasoning/usage).
+        messages: toConversableShareMessages(filterMessagesForClient(session.messages, { omitBranchOrigin: true })),
         createdAt: session.createdAt,
         updatedAt: session.updatedAt,
         workPlan: redactWorkPlanForViewer(session.workPlan),
@@ -16378,7 +16856,7 @@ export const agentModeController = {
         });
       } catch (modelError) {
         if (!isModelUnavailableError(modelError)) throw modelError;
-        return res.status(422).json(modelUnavailableBody(modelError, 'share_viewer'));
+        return res.status(422).json(sendRefusalBody(modelUnavailableBody(modelError, 'share_viewer'), false));
       }
       const modelToUse = conversablePolicy.effectiveModel || session.llmModel || defaultModel;
       // ENG-669 PR-C: a routed turn records its decision on the session (which model the AgentWeb Model ran and why;
@@ -16428,7 +16906,7 @@ export const agentModeController = {
       // ENG-669: a model refused by the final gate is a 422 (viewer body: no owner plan details), not a 500.
       if (isModelUnavailableError(error) && !res.headersSent) {
         if (req.params?.shareId) markProgressComplete(req.params.shareId);
-        return res.status(422).json(modelUnavailableBody(error, 'share_viewer'));
+        return res.status(422).json(sendRefusalBody(modelUnavailableBody(error, 'share_viewer'), wasRaisedAfterUserMessageSaved(error)));
       }
       console.error('AgentMode: Generate conversable response error:', error);
 
@@ -16480,44 +16958,57 @@ export const agentModeController = {
           return;
         }
 
+        // ENG-2763: OpenRouter key-limit / credits exhaustion is a known class, not an
+        // unknown error: answer 503 and page once per class, not once per occurrence.
+        if (isQuotaExhaustedError(error)) {
+          sendQuotaExhaustedAlert(error, (req as any).conversableSession?.sessionId);
+          res.status(503).json(sendRefusalBody({
+            error: 'AI service at capacity',
+            message: error.message,
+            code: 'PROVIDER_QUOTA_EXHAUSTED',
+            suggestion: 'wait'
+          }, wasRaisedAfterUserMessageSaved(error)));
+          return;
+        }
+
         // ENG-2381: a final upstream provider 5xx is an outage, not an unknown error.
         if (isProviderUnavailableError(error)) {
-          res.status(503).json({
+          res.status(503).json(sendRefusalBody({
             error: 'AI provider unavailable',
             message: error.message,
             code: 'PROVIDER_UNAVAILABLE',
             suggestion: 'wait_and_retry'
-          });
+          }, wasRaisedAfterUserMessageSaved(error)));
           return;
         }
 
         if (isWorkerShutdownError(error)) {
-          res.status(503).json({
+          res.status(503).json(sendRefusalBody({
             error: 'Server is restarting',
             message: 'The server is restarting. Please try again in a moment.',
             code: 'SERVER_RESTARTING',
             suggestion: 'wait_and_retry'
-          });
+          }, wasRaisedAfterUserMessageSaved(error)));
           return;
         }
 
         if (isProviderNoEndpointsError(error)) {
-          res.status(503).json({
+          res.status(503).json(sendRefusalBody({
             error: 'Model provider unavailable',
             message: 'The selected model has no available provider right now. Please try again, or pick a different model from the selector above.',
             code: 'PROVIDER_UNAVAILABLE',
             suggestion: 'wait_and_retry'
-          });
+          }, wasRaisedAfterUserMessageSaved(error)));
           return;
         }
 
         if (error.message.includes('Generation timed out')) {
-          res.status(504).json({
+          res.status(504).json(sendRefusalBody({
             error: 'Generation timed out',
             message: 'The response took too long to generate. Please try again — your session is still active.',
             code: 'GENERATION_TIMEOUT',
             suggestion: 'wait_and_retry'
-          });
+          }, wasRaisedAfterUserMessageSaved(error)));
           return;
         }
       }
@@ -16610,6 +17101,8 @@ export const agentModeController = {
       // Put user's private plans FIRST so they take priority over system/public plans with same title
       const result = await getUserFromToken(req);
       const allPlans: any[] = [];
+      // ENG-2655: the only private plans this caller may resolve — their own and their org members'.
+      const accessiblePrivatePlanIds = new Set<string>();
       if (result.user) {
         const user = await userDb.getUserById(result.user.userId);
         const [ownPlans, orgPlans] = await Promise.all([
@@ -16620,6 +17113,7 @@ export const agentModeController = {
         for (const p of [...ownPlans, ...orgPlans]) {
           if (p.visibility === 'private' && !seen.has(p.planId)) {
             seen.add(p.planId);
+            accessiblePrivatePlanIds.add(p.planId);
             allPlans.push(p);
           }
         }
@@ -16638,8 +17132,10 @@ export const agentModeController = {
         return res.status(404).json({ error: `Work plan "${planTitle}" not found` });
       }
 
-      // Enforce ownership/org-membership for private plans
-      if (workPlan.visibility === 'private' && !result.user) {
+      // Enforce ownership/org-membership for private plans (ENG-2655: the plan must be one of the caller's
+      // own / org members' plans loaded above, not merely "the caller is signed in"). Ownerless private
+      // plans (admin-created) are in nobody's set, so they never resolve here.
+      if (workPlan.visibility === 'private' && !accessiblePrivatePlanIds.has(workPlan.planId)) {
         return res.status(403).json({ error: 'Not authorized to view this private work plan' });
       }
 
@@ -16667,9 +17163,12 @@ export const agentModeController = {
 
   // Create session with predefined work plan (public) — reads from AW-WorkPlans table
   async createSessionWithPlan(req: Request, res: Response) {
+    // ENG-2773 (ENG-783 slice B): same ENG-147 submit-lock createSession uses. Hoisted so the
+    // catch block can give back a held claim after an error unwinds.
+    let planIdemKeyHeld: string | undefined;
     try {
       const { planTitle } = req.params;
-      const { startingMessage } = req.body || {};
+      const { startingMessage, idempotencyKey } = req.body || {};
 
       if (!planTitle) {
         return res.status(400).json({ error: 'Plan title is required' });
@@ -16686,6 +17185,8 @@ export const agentModeController = {
       ]);
       // Put user's private plans FIRST so they take priority over system/public plans with same title
       const allPlans: any[] = [];
+      // ENG-2655: the only private plans this caller may resolve — their own and their org members'.
+      const accessiblePrivatePlanIds = new Set<string>();
       if (result.user) {
         const user = await userDb.getUserById(result.user.userId);
         const [ownPlans, orgPlans] = await Promise.all([
@@ -16696,6 +17197,7 @@ export const agentModeController = {
         for (const p of [...ownPlans, ...orgPlans]) {
           if (p.visibility === 'private' && !seen.has(p.planId)) {
             seen.add(p.planId);
+            accessiblePrivatePlanIds.add(p.planId);
             allPlans.push(p);
           }
         }
@@ -16714,10 +17216,9 @@ export const agentModeController = {
         return res.status(404).json({ error: `Work plan "${planTitle}" not found` });
       }
 
-      // Enforce ownership/org-membership for private plans.
-      // allPlans already only includes private plans belonging to the user or their org,
-      // so a plan found in allPlans is already authorized. Only block unauthenticated users.
-      if (predefinedPlan.visibility === 'private' && !result.user) {
+      // Enforce ownership/org-membership for private plans (ENG-2655: membership in the caller's own / org
+      // members' plans loaded above, not merely "signed in"; anonymous callers have an empty set).
+      if (predefinedPlan.visibility === 'private' && !accessiblePrivatePlanIds.has(predefinedPlan.planId)) {
         return res.status(403).json({ error: 'Not authorized to use this private work plan' });
       }
 
@@ -16762,6 +17263,44 @@ export const agentModeController = {
       } catch (planErr) {
         console.error(`AgentMode: createSessionWithPlan "${predefinedPlan.title}" refused — invalid plan structure:`, (planErr as Error).message);
         return res.status(422).json({ error: 'This work plan is misconfigured and cannot be started right now.', code: 'workplan_invalid' });
+      }
+
+      // ENG-2773: cross-restart duplicate-submit lock for a signed-in launcher's client
+      // idempotencyKey (scoped to user + plan, so it never collides with createSession or another
+      // user). Anonymous callers get a fresh random userId per call, so a key could never replay:
+      // they are excluded. Flag off / no key = today's exact behaviour.
+      if (result.user && isRunStoreEnabled() && typeof idempotencyKey === 'string' && idempotencyKey.length > 0) {
+        const idemKey = planSessionIdempotencyKey(
+          userId,
+          normalizeWorkPlanTitleForMatch(planTitle),
+          idempotencyKey,
+        );
+        const claim = await claimIdempotency(idemKey, uuidv4(), IDEM_TTL_INTERACTIVE_S);
+        if (!claim.claimed) {
+          if (claim.sessionId) {
+            const existing: any = await chatbotDb.getChatSession(claim.sessionId);
+            const existingToken = existing?.interactiveShareMetadata?.token;
+            if (existing && existing.userId === userId && existing.workPlan && existingToken) {
+              // Duplicate of a completed launch: return the winner's session (no second session,
+              // no second starting-message run).
+              const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+              return res.json({
+                sessionId: existing.sessionId,
+                redirectUrl: `${customerFrontendUrl}/plan/${encodeURIComponent(planTitle)}/${existing.sessionId}?conversable=${existingToken}`,
+                workPlan: redactWorkPlanForViewer(existing.workPlan, { keepStepModels: true }),
+                conversableToken: existingToken,
+                userId: existing.userId,
+                idempotentReplay: true,
+              });
+            }
+          }
+          return res.status(409).json({
+            error: 'Duplicate submit',
+            message: 'This request was already submitted and is still being processed. Please retry in a moment.',
+            code: 'DUPLICATE_SUBMIT',
+          });
+        }
+        planIdemKeyHeld = idemKey;
       }
 
       // Create session with userId (authenticated or anonymous)
@@ -16902,8 +17441,17 @@ export const agentModeController = {
           sharedAt: new Date().toISOString()
         };
         await chatbotDb.updateSessionInteractiveShareMetadata(session.sessionId, interactiveShareMetadata);
+        // ENG-2773: stamp the winner only once the session is fully built, so a duplicate never
+        // attaches to a half-built one (best effort: on failure losers 409 until the TTL).
+        if (planIdemKeyHeld) {
+          await recordIdempotencySessionId(planIdemKeyHeld, session.sessionId);
+        }
       } catch (launchErr) {
         await deleteNewSessionBestEffort(session.sessionId);
+        if (planIdemKeyHeld) {
+          await releaseIdempotency(planIdemKeyHeld);
+          planIdemKeyHeld = undefined;
+        }
         if (modelSaveFailed) {
           return res.status(503).json({ error: MODEL_SAVE_FAILED_MESSAGE, code: 'model_save_failed' });
         }
@@ -16952,7 +17500,7 @@ export const agentModeController = {
             // the first-attempt failure with a successful response.
             //
             // Uses role='system' so the user doesn't see this in their chat UI
-            // (filterMessagesForClient strips system messages on read). The sensor
+            // (the portal renders no bubble for a system row; share views blank or drop it, ENG-2645). The sensor
             // path queries the raw messages array, so it still sees the tag.
             try {
               // Pack debug info (errorName/code/httpStatus) into the content
@@ -16966,7 +17514,7 @@ export const agentModeController = {
               });
               const firstAttemptErrorMessage: ChatMessage = {
                 role: 'system',
-                content: `[telemetry] First-attempt agent failure (retry will follow): ${(firstErr?.message ?? String(firstErr)).slice(0, 500)} | ctx: ${debugCtx}`,
+                content: `${FIRST_ATTEMPT_TELEMETRY_PREFIX} (retry will follow): ${(firstErr?.message ?? String(firstErr)).slice(0, 500)} | ctx: ${debugCtx}`,
                 timestamp: new Date().toISOString(),
                 metadata: {
                   timestamp: new Date().toISOString(),
@@ -17085,6 +17633,9 @@ export const agentModeController = {
       }
     } catch (error) {
       console.error('AgentMode: Create session with plan error:', error);
+      if (planIdemKeyHeld) {
+        await releaseIdempotency(planIdemKeyHeld);
+      }
       res.status(500).json({ error: 'Failed to create session with plan' });
     }
   },
@@ -17176,24 +17727,58 @@ export const agentModeController = {
 
 
   // Transfer session from anonymous user to authenticated user
+  /**
+   * Hand an anonymous plan session to the account that just signed in (the portal calls this after
+   * sign-up for each anon session in its `agentweb_plan_sessions` localStorage).
+   *
+   * ENG-2653: the caller must PROVE they are that anonymous visitor. The only secret the visitor's
+   * browser holds is the conversable token createSessionWithPlan issued with the session (returned
+   * as `conversableToken`, stored next to the session id in localStorage, and in the visitor's
+   * `?conversable=` URL). A session id alone is not proof: it appears in URLs, logs and shared links.
+   * Without a token that matches the session's active interactive share, the answer is the same 404
+   * as a missing session, so the endpoint confirms nothing about ids it is probed with.
+   *
+   * Only `predefined-work-plan` sessions transfer. The other anonymous kind, result-endpoint sessions
+   * (resultEndpointController), is never stored by the portal, and its conversable token is served by
+   * the unauthenticated GET /review/:sessionId to anyone holding the session id, so for those the
+   * token proves nothing.
+   */
   async transferSession(req: AuthenticatedRequest, res: Response) {
     try {
       const { sessionId } = req.params;
       const user = req.user;
+      const conversableToken = (req.body as { conversableToken?: unknown } | undefined)?.conversableToken;
 
-      // Get the session to verify it exists and check if it's anonymous
-      const session = await chatbotDb.getChatSession(sessionId);
-      if (!session) {
+      if (typeof conversableToken !== 'string' || conversableToken.length === 0) {
+        return res.status(400).json({ error: 'conversableToken is required' });
+      }
+
+      // Record only, strongly consistent: an unproven caller never triggers a transcript read. An id
+      // over 200 chars is not a session (real ids are uuids) and would make DynamoDB throw (a 500).
+      const session = typeof sessionId === 'string' && sessionId.length <= 200
+        ? await chatbotDb.getChatSessionRecord(sessionId, true)
+        : null;
+      const share = session?.interactiveShareMetadata;
+      const proven = !!session && !!share?.isActive && typeof share.token === 'string'
+        && new Date() <= getInteractiveShareExpiresAt(share)
+        && conversableTokenMatches(share.token, conversableToken);
+      if (!session || !proven) {
         return res.status(404).json({ error: 'Session not found' });
       }
 
       // Check if the session belongs to an anonymous user
-      if (!session.userId.startsWith('anon_')) {
+      if (typeof session.userId !== 'string' || !session.userId.startsWith('anon_')) {
         return res.status(400).json({ error: 'Session is not anonymous' });
       }
+      if (session.sessionType !== 'predefined-work-plan') {
+        return res.status(400).json({ error: 'Session cannot be transferred' });
+      }
 
-      // Update the session userId to the authenticated user's ID
-      await chatbotDb.updateSessionUserId(sessionId, user.userId);
+      // Conditional on the anonymous owner we just checked: a concurrent transfer cannot overwrite it.
+      const transferred = await chatbotDb.updateSessionUserId(sessionId, user.userId, session.userId);
+      if (!transferred) {
+        return res.status(400).json({ error: 'Session is not anonymous' });
+      }
 
       res.json({
         message: 'Session transferred successfully',
@@ -17209,6 +17794,11 @@ export const agentModeController = {
   // Verified generate - ensures required functions are called minimum number of times
   async verifiedGenerate(req: Request, res: Response) {
     try {
+      // ENG-2113: this endpoint always runs on AgentWeb's models. A client that asks for the user's own plan here must hear no, not be silently
+      // run on AgentWeb (the same rule as /generate: a plan request is never turned into an AgentWeb run).
+      if (req.body?.fundingChoice !== undefined && req.body?.fundingChoice !== null && req.body?.fundingChoice !== 'agentweb') {
+        return res.status(400).json(sendRefusalBody(claudeStopBody(new ClaudeRouteStopError('invalid_funding_choice')), false));
+      }
       const user = req.user as User;
       const { sessionId, startingMessage, requiredFunctions, keywords, attachments, maxAttempts: maxAttemptsParam } = req.body;
       
@@ -17255,11 +17845,11 @@ export const agentModeController = {
       // scheduled / Slack / email / result-endpoint callers of runVerifiedChat have their own.
       const usageStatus = await checkTokenUsage(user.userId, TURN_ADMISSION);
       if (!usageStatus.allowed) {
-        return res.status(429).json(await buildUsagePausedBody({
+        return res.status(429).json(sendRefusalBody(await buildUsagePausedBody({
           usageStatus,
           session,
           requestedModel: normalizeRequestedLlmModel(req.body?.llmModel) || session.llmModel || null,
-        }));
+        }), false));
       }
 
       // The model the user picked for this chat is used as-is for the whole turn:
@@ -17290,7 +17880,7 @@ export const agentModeController = {
           });
         } catch (modelError) {
           if (!isModelUnavailableError(modelError)) throw modelError;
-          return res.status(422).json(modelUnavailableBody(modelError));
+          return res.status(422).json(sendRefusalBody(modelUnavailableBody(modelError), false));
         }
         selectedModel = modelDecision.effectiveModel || session.llmModel || undefined;
         selectedModelDecision = modelDecision;
@@ -17377,9 +17967,10 @@ export const agentModeController = {
         sessionId: sessionId
       });
     } catch (error: any) {
-      // ENG-669: a model refused by the final gate is the same 422 as the pre-flight, never a 500.
+      // ENG-669: a model refused by the final gate is the same 422 as the pre-flight, never a 500. ENG-2641: a refusal
+      // on a later attempt (or a Work Plan step's) comes after the starting message was saved, which the body says.
       if (isModelUnavailableError(error) && !res.headersSent) {
-        return res.status(422).json(modelUnavailableBody(error));
+        return res.status(422).json(sendRefusalBody(modelUnavailableBody(error), wasRaisedAfterUserMessageSaved(error)));
       }
       // ENG-1696: a busy session is an expected, benign outcome (the other
       // side just needs to finish), not a real failure — return the same
@@ -17390,12 +17981,13 @@ export const agentModeController = {
           error: 'Session is busy',
           message: 'A response is already being generated for this session. Please wait.',
           code: 'SESSION_BUSY',
+          userMessageSaved: false,
         });
       }
 
       // ENG-110: per-user concurrent interactive generation cap.
       if (isTooManyConcurrentRunsError(error)) {
-        return res.status(429).json(buildTooManyRunsBody(error.current, error.limit));
+        return res.status(429).json(sendRefusalBody(buildTooManyRunsBody(error.current, error.limit), false));
       }
 
       // ENG-2293: same handled outcome as the other three generate-response
@@ -17410,6 +18002,17 @@ export const agentModeController = {
           code: 'PROVIDER_UNAVAILABLE',
           suggestion: 'wait_and_retry',
         });
+      }
+      // ENG-2763: OpenRouter key-limit / credits exhaustion — same 503 + once-per-class
+      // alert as the other generate chains, not a 500 + per-run page.
+      if ((isQuotaExhaustedError(error) || classifyOpenRouterQuotaExhaustion(error)) && !res.headersSent) {
+        sendQuotaExhaustedAlert(error, req.body?.sessionId);
+        return res.status(503).json(sendRefusalBody({
+          error: 'AI service at capacity',
+          message: QUOTA_EXHAUSTED_USER_MESSAGE,
+          code: 'PROVIDER_QUOTA_EXHAUSTED',
+          suggestion: 'wait'
+        }, wasRaisedAfterUserMessageSaved(error)));
       }
       console.error('AgentMode: Verified generate error:', error);
       const sessionId = req.body?.sessionId;
@@ -17641,6 +18244,8 @@ export const agentModeController = {
   async getShareOgMetadata(req: Request, res: Response) {
     try {
       const { shareId } = req.params;
+      // ENG-2654: an interactive (iShare) link is token-gated, so its preview is too.
+      const conversable = req.query?.conversable;
 
       const session = await chatbotDb.getChatSession(shareId);
       if (!session) {
@@ -17651,36 +18256,39 @@ export const agentModeController = {
         return res.status(403).json({ error: 'Sharing is not available in this sandbox workspace' });
       }
 
-      // Must have view-only or interactive sharing enabled
       const hasViewOnlyShare = session.shareMetadata?.isShared;
-      const hasInteractiveShare = session.interactiveShareMetadata?.isActive;
-      if (!hasViewOnlyShare && !hasInteractiveShare) {
-        return res.status(404).json({ error: 'This conversation is not shared' });
-      }
-
-      // Check if view-only share expired
-      if (hasViewOnlyShare && session.shareMetadata?.expiresAt && new Date() > new Date(session.shareMetadata.expiresAt)) {
-        return res.status(410).json({ error: 'Share link has expired' });
-      }
-
-      // Check if interactive share expired
-      if (!hasViewOnlyShare && hasInteractiveShare && session.interactiveShareMetadata &&
-          new Date() > getInteractiveShareExpiresAt(session.interactiveShareMetadata)) {
-        return res.status(410).json({ error: 'Interactive share link has expired' });
+      if (hasViewOnlyShare) {
+        if (session.shareMetadata?.expiresAt && new Date() > new Date(session.shareMetadata.expiresAt)) {
+          return res.status(410).json({ error: 'Share link has expired' });
+        }
+      } else {
+        // ENG-2654: no read-only share, so only the holder of the interactive token may see the title and
+        // first message — knowing the chat id is not enough. Same token + expiry rule as the /ishare routes,
+        // except this public reader never writes (no isActive flip on expiry).
+        const interactiveShare = session.interactiveShareMetadata;
+        if (!interactiveShare?.isActive || !conversable) {
+          return res.status(404).json({ error: 'This conversation is not shared' });
+        }
+        if (!interactiveShare.token || interactiveShare.token !== conversable) {
+          return res.status(401).json({ error: 'Invalid or expired conversable token' });
+        }
+        if (new Date() > getInteractiveShareExpiresAt(interactiveShare)) {
+          return res.status(410).json({ error: 'Interactive share link has expired' });
+        }
       }
 
       const title = session.title || 'AgentWeb Conversation';
 
-      // Extract first user message for description
+      // First user message the share viewer would see. ENG-2654: same filter as getSharedConversation, so a
+      // delegated admin's prompt (ENG-2163 admin-tainted turn) never becomes the preview text.
       let description = 'View this conversation on AgentWeb';
-      if (Array.isArray(session.messages)) {
-        const firstUserMessage = session.messages.find(
-          (m: any) => m && m.role === 'user' && typeof m.content === 'string'
-        );
-        if (firstUserMessage) {
-          const content = firstUserMessage.content.trim();
-          description = content.length > 160 ? content.substring(0, 157) + '...' : content;
-        }
+      // ENG-2645 serializers, picked by share type, so the preview is never richer than the share page.
+      const viewerMessages = filterMessagesForClient(session.messages, { omitBranchOrigin: true });
+      const firstUserMessage = (hasViewOnlyShare ? toReadOnlyShareMessages(viewerMessages) : toConversableShareMessages(viewerMessages))
+        .find((m: any) => m && m.role === 'user' && typeof m.content === 'string');
+      if (firstUserMessage) {
+        const content = String(firstUserMessage.content).trim();
+        description = content.length > 160 ? content.substring(0, 157) + '...' : content;
       }
 
       res.json({ title, description });

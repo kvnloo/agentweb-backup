@@ -19,6 +19,10 @@ export interface RunToolTokenClaims {
   runId: string;
   userId: string;
   sessionId: string;
+  /** The subscription connection this run is funded by, when it is. Lets a revoke find the runs it affects. */
+  connectionId?: string;
+  /** The connection's host epoch at open time. */
+  epoch?: number;
 }
 
 export type RunToolTokenRejection = "missing" | "unknown" | "expired" | "wrong_run";
@@ -50,7 +54,9 @@ export class RunToolTokenStore {
   mint(claims: RunToolTokenClaims): string {
     this.revokeRun(claims.runId);
     this.pruneExpired();
-    const raw = randomBytes(32).toString("base64url");
+    // The login host refuses a token that does not start with a letter or digit (its request schema), and base64url starts with "-" or "_" about 1 time in 32:
+    // an unprefixed token made roughly 3% of turns fail before they were sent. The prefix also makes a leaked token recognizable to secret scanners.
+    const raw = `awr_${randomBytes(32).toString("base64url")}`;
     const hash = hashToken(raw);
     this.recordsByHash.set(hash, { claims: { ...claims }, expiresAtMs: this.now() + this.ttlMs });
     this.hashByRunId.set(claims.runId, hash);

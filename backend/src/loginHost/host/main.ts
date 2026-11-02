@@ -96,8 +96,11 @@ export function portConfigFor(cfg: HostConfig, egressRef?: EgressRef): SystemdPo
     },
     limits: cfg.limits,
     paths: { ...cfg.tools, inaccessible: [cfg.socket.dir], net: { dir: cfg.egressDir, launcher: cfg.egress.launcherPath, socat: cfg.egress.socat } },
-    killTimeoutMs: 15_000,
+    // A graceful stop (stopGraceSec) happens inside every kill: the budget must cover it, or a normal stop would read as a stuck unit.
+    killTimeoutMs: 15_000 + cfg.limits.stopGraceSec * 1000,
     killPollMs: 100,
+    // One `systemctl stop` blocks for up to the grace (SIGTERM phase) plus the same again if the final SIGKILL phase is slow: the
+    // client timeout must outlast both, or the port would SIGKILL inside the grace period it is supposed to give.
     commandTimeoutMs: 30_000,
     ...(cfg.quota ? { quota: cfg.quota } : {}),
   };
@@ -118,6 +121,24 @@ export interface BuiltHost {
   egressRef: EgressRef;
 }
 
+/** How long the Claude adapter waits for a stopping turn process: the unit's stop grace plus a margin. */
+export function adapterKillWaitMs(cfg: HostConfig): number {
+  return cfg.limits.stopGraceSec * 1000 + 5_000;
+}
+
+/** The connection manager's config: defaults, then the host config's overrides, then the values derived from the unit stop grace. */
+export function managerConfigFor(cfg: HostConfig, overrides: Partial<ManagerConfig> = {}): ManagerConfig {
+  return {
+    ...DEFAULT_CONFIG,
+    ...cfg.manager,
+    // Whatever base is in effect (the default or a configured value), a stopping provider also gets the unit's stop grace.
+    abortGraceMs: (cfg.manager?.abortGraceMs ?? DEFAULT_CONFIG.abortGraceMs) + cfg.limits.stopGraceSec * 1000,
+    uidMin: cfg.uidMin,
+    uidMax: cfg.uidMax,
+    ...overrides,
+  };
+}
+
 export function buildHost(cfg: HostConfig, binary: VerifiedBinary, deps: HostDeps): BuiltHost {
   const layout = layoutFor(cfg);
   const egressRef: EgressRef = {};
@@ -135,6 +156,8 @@ export function buildHost(cfg: HostConfig, binary: VerifiedBinary, deps: HostDep
           bridgeUrl: cfg.claude.bridgeUrl,
           ...(cfg.claude.models ? { models: cfg.claude.models } : {}),
           ...(cfg.claude.basePath ? { basePath: cfg.claude.basePath } : {}),
+          // A stopping turn process gets the unit's grace period: waits for it (and the auth check that follows) must outlast it.
+          killWaitMs: adapterKillWaitMs(cfg),
         }),
       ],
     ]);
@@ -145,7 +168,7 @@ export function buildHost(cfg: HostConfig, binary: VerifiedBinary, deps: HostDep
     ids: deps.ids ?? realIds,
     adapters,
     log: deps.log,
-    config: { ...DEFAULT_CONFIG, ...cfg.manager, uidMin: cfg.uidMin, uidMax: cfg.uidMax, ...(deps.managerOverrides ?? {}) },
+    config: managerConfigFor(cfg, deps.managerOverrides),
   });
   return { layout, port, store, manager, egressRef };
 }
@@ -251,10 +274,11 @@ export async function startHost(cfg: HostConfig, binary: VerifiedBinary, deps: H
         down = true;
         await handle.close();
         built.egressRef.current = undefined; // from now on no unit can start (fail closed)
-        await egress?.close().catch(() => undefined);
         try {
+          // Units stop gracefully first and may still need the network while they finish (a refreshed login): the egress proxy outlives them.
           await stopEnvironment(deps.cmd, cfg, built.layout);
         } finally {
+          await egress?.close().catch(() => undefined);
           built.store.close(); // a failed stop is reported to the caller (non-zero exit); the next start repeats it
         }
         deps.log.info("host_stopped", { env: cfg.env });

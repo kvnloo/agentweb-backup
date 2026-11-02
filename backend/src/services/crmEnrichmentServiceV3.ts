@@ -142,6 +142,8 @@ interface TierCount {
 
 export interface RunEnrichmentResult {
   runId: string;
+  /** Response-only; no persistence model change. Completed leads remain saved. */
+  budgetStop?: { reason: 'usage_cap' | 'usage_unavailable'; remainingLeads: number; message: string };
   processed: number;
   failed: {
     identityResolutionFailed: number;
@@ -171,6 +173,8 @@ export interface CriticResult {
 }
 
 export interface OrchestratorDeps {
+  /** Real deps always supply this; injected to keep vendor-free unit tests isolated. */
+  checkBudget?(input: { leadCount: number; config: EnrichmentConfig; phase: 'preflight' | 'batch' }): Promise<boolean>;
   /** When `leadIds` is set and non-empty, the dep must return only those
    *  leads (real impl uses BatchGetItem). When undefined/empty the dep
    *  returns every lead in the list. The orchestrator does not re-filter. */
@@ -940,6 +944,23 @@ export async function runEnrichment(
   });
   console.log(`[v3] loadLeads → ${leads.length} lead(s) in ${Date.now() - loadStart}ms (leadIds filter: ${leadIdsFilter ? leadIdsFilter.length : 'none'})`);
 
+  let budgetStop: RunEnrichmentResult['budgetStop'];
+  const attemptedLeadIds: string[] = [];
+  const admit = async (leadCount: number, phase: 'preflight' | 'batch'): Promise<boolean> => {
+    if (!deps.checkBudget || leadCount === 0) return true;
+    try {
+      if (await deps.checkBudget({ leadCount, config: input.config, phase })) return true;
+      budgetStop = { reason: 'usage_cap', remainingLeads: leads.length - attemptedLeadIds.length,
+        message: 'Enrichment stopped: estimated cost exceeds remaining allowance and Extra Usage cap. Completed results are saved.' };
+    } catch (error) {
+      console.error('[v3] Budget check failed closed:', error);
+      budgetStop = { reason: 'usage_unavailable', remainingLeads: leads.length - attemptedLeadIds.length,
+        message: 'Enrichment stopped because remaining usage could not be verified. Completed results are saved.' };
+    }
+    return false;
+  };
+  await admit(leads.length, 'preflight');
+
   // ─── PRE: smart field analysis ────────────────────────────────────────────────
   // Separate smart fields (computed/derived) from normal fields (fetchable).
   // Smart fields are excluded from the regular enrichment routing; their
@@ -1010,7 +1031,7 @@ export async function runEnrichment(
   // Build sibling field mapping table once per run (one LLM call for unaliased
   // fields, canonical match is free). Passed to every processLead call. Skipped
   // entirely when there are no leads — no processLead would consume it.
-  const siblingMappingTable: SiblingFieldMappingTable = leads.length > 0
+  const siblingMappingTable: SiblingFieldMappingTable = leads.length > 0 && !budgetStop
     // ENG-1858: meter the mapping call to the run's user, not "system".
     ? await buildSiblingFieldMappingTable(workingConfig.fields, { userId: input.userId, feature: 'crm_enrichment_field_mapping' })
     : { canonical: new Map(), llm: new Map() };
@@ -1096,8 +1117,10 @@ export async function runEnrichment(
     smartEvalSemaphore: new Semaphore(SMART_EVAL_CONCURRENCY),
     excludePersistFields,
   };
-  for (let i = 0; i < leads.length; i += CONCURRENCY) {
+  for (let i = 0; i < leads.length && !budgetStop; i += CONCURRENCY) {
     const chunk = leads.slice(i, i + CONCURRENCY);
+    if (!(await admit(chunk.length, 'batch'))) break;
+    attemptedLeadIds.push(...chunk.map(lead => lead.leadId));
     const outcomes = await Promise.all(
       chunk.map(lead =>
         processLead(lead, leadCtx).then(outcome => {
@@ -1236,6 +1259,7 @@ export async function runEnrichment(
   );
 
   const result: RunEnrichmentResult = {
+    ...(budgetStop ? { budgetStop } : {}),
     runId,
     processed,
     failed: {
@@ -1276,10 +1300,10 @@ export async function runEnrichment(
     failureBreakdown: result.failed,
     tierFillBreakdown: result.tierFillBreakdown,
     durationMs: result.durationMs,
+    ...(result.budgetStop ? { budgetStop: result.budgetStop, message: result.budgetStop.message } : {}),
     ...(result.enigma ? { enigma: result.enigma } : {}),
   });
 
-  const attemptedLeadIds = leads.map((l: LeadRecord) => l.leadId);
 
   if (input.mode !== 'preview' && (processed > 0 || totalFailed > 0 || identityResolutionFailed > 0)) {
     crmDb.createEnrichmentJobMeta({

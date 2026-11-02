@@ -247,6 +247,7 @@ export interface User {
   emailNotificationsEnabled?: boolean; // Portal Settings > Preferences toggle (ENG-1316). Absent = enabled (default).
   emmaTipsEnabled?: boolean; // Portal Settings > Preferences toggle + tip-card "don't show again" (ENG-188). Absent = enabled (default).
   showModelCompare?: boolean; // Portal Settings > Preferences "Compare models" toggle (ENG-113). Display choice only — shows/hides the chat Compare button; entitlement and /compare enforcement are unaffected. Absent = shown (default).
+  showIntegrationAccess?: boolean; // Portal Settings > Preferences "Integration access panel" toggle (ENG-2118). Display choice only — shows/hides the Connected Accounts card; /api/oauth/*/access-inventory still enforces org:accounts:read. Absent = shown (default).
   stripe_customer_id?: string;
   adAccount?: string; // Meta ad account ID
   emailDomain?: string; // @deprecated legacy single sending domain — kept for the task/subscriber-notification fallback sender (emailService.ts, dripSequenceWorker.ts legacyDefaultSender); CRM sending domains live in emailDomains[] (ENG-265)
@@ -7591,6 +7592,37 @@ export const crmDb = {
     }
   },
 
+  /**
+   * Every lead with this address across all lists (ENG-673, Smartlead events), all pages, newest first. `findLeadsByEmail` stops at 10 rows,
+   * which is right for "the freshest match" but would miss a pushed contact who is in more than 10 lists. Capped so one address can never turn
+   * into an unbounded read. Same cross-tenant index: the caller must prove ownership of every row it acts on.
+   */
+  async findAllLeadsByEmail(email: string, maxItems = 200) {
+    const value = (email ?? '').trim().toLowerCase();
+    if (!value) return [];
+    try {
+      const items: any[] = [];
+      let startKey: any = undefined;
+      do {
+        const result: any = await dynamodb.query({
+          TableName: `${TABLE_PREFIX}AW-Leads`,
+          IndexName: 'EmailLookupIndex',
+          KeyConditionExpression: 'email = :email',
+          ExpressionAttributeValues: { ':email': value },
+          ScanIndexForward: false,
+          ...(startKey ? { ExclusiveStartKey: startKey } : {}),
+        }).promise();
+        items.push(...(result.Items || []));
+        startKey = result.LastEvaluatedKey;
+      } while (startKey && items.length < maxItems);
+      if (items.length >= maxItems) console.warn(`[crmDb.findAllLeadsByEmail] hit the ${maxItems}-row cap for one address: a matching lead may be missing from the result`);
+      return items.slice(0, maxItems);
+    } catch (error) {
+      handleDynamoDbError(error, 'findAllLeadsByEmail');
+      throw error;
+    }
+  },
+
   async findLeadsByLinkedin(linkedin: string) {
     const value = (linkedin ?? '').trim();
     if (!value) return [];
@@ -11754,6 +11786,19 @@ export const orgMemoryDb = {
         throw new MemoryNotFoundError(memoryId);
       }
       handleDynamoDbError(error, 'updateOrgMemory');
+      throw error;
+    }
+  },
+
+  async getMemory(orgId: string, memoryId: string) {
+    try {
+      const result = await dynamodb.get({
+        TableName: ORG_MEMORY_TABLE,
+        Key: { orgId, memoryId },
+      }).promise();
+      return result.Item || null;
+    } catch (error) {
+      handleDynamoDbError(error, 'getOrgMemory');
       throw error;
     }
   },

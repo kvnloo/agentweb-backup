@@ -23,7 +23,8 @@ import AdmZip from 'adm-zip';
 import { emailEventsDb } from '../services/emailEventsDb';
 import { dynamodb } from '../config/aws';
 import { io } from '../server';
-import { isDoNotContact } from '../utils/leadContactStatus';
+import { isDoNotContact, getDoNotContactReason } from '../utils/leadContactStatus';
+import { isPushedToSmartlead } from '../services/smartleadMarkers';
 import { contactSuppressionAuditEnabled, contactSuppressionAuditEvent, guardLeadPutBody, leadWriteChannel, touchesContactSuppression } from '../utils/leadWriteGuard';
 import { suppressLeadSideEffects } from '../utils/sessionList';
 import { isLinkedInInfraError, LINKEDIN_UNAVAILABLE_MESSAGE } from '../utils/linkedInInfraError';
@@ -33,6 +34,8 @@ import { isEligibleGroupEmailRecipient } from '../utils/groupEmailRecipientValid
 import { syncContact, SyncInput } from '../services/contactSyncService';
 import { isCardRevenueField } from '../services/enrichmentGroups';
 import { stripImplicitCardRevenueRouting } from '../services/enrichmentConfigService';
+import { estimateEnrichmentCost,
+  normalizeLeadSelection, checkEstimateConfirmation } from '../services/enrichmentCostEstimate';
 import { enrichContact, defaultEnrichmentCache, EnrichmentDeps } from '../services/internalEnrichmentService';
 import { dedupContactsForUser } from '../services/contactDedupService';
 import {
@@ -1820,6 +1823,46 @@ router.post('/lists/:listId/enrichment-config/suggest-types', async (req: Reques
   }
 });
 
+/** ENG-2716: count the leads an enrich-v3 run would touch (leadIds subset or whole list). */
+const countLeadsForEnrichment = async (listId: string, leadIds?: string[]): Promise<number> => {
+  if (leadIds) return leadIds.length;
+  let total = 0;
+  let lastKey: any = undefined;
+  do {
+    const batch = await crmDb.getLeadsByListId(listId, 200, lastKey);
+    total += batch.items.length;
+    lastKey = batch.lastEvaluatedKey;
+  } while (lastKey);
+  return total;
+};
+
+const parseLeadIds = (body: any): string[] | undefined => normalizeLeadSelection(body?.leadIds);
+
+/**
+ * @route POST /api/crm/lists/:listId/leads/enrich-v3/estimate
+ * @desc ENG-2716: pre-run cost estimate + confirmation token. Pure estimate,
+ *       no vendor calls. Client echoes `confirmationToken` as
+ *       `confirmEstimateToken` on the enrich-v3 POST.
+ * @access Private
+ */
+router.post('/lists/:listId/leads/enrich-v3/estimate', async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+    const { listId } = req.params;
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) return res.status(404).json({ message: 'Lead list not found' });
+    if (!(await canDestructiveCrmList(userId, list))) {
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
+    }
+    const count = await countLeadsForEnrichment(listId, parseLeadIds(req.body));
+    return res.json(estimateEnrichmentCost(listId, count));
+  } catch (error) {
+    console.error('[v3][route] enrich-v3 estimate failed:', error);
+    return res.status(500).json({ message: 'Enrichment estimate failed' });
+  }
+});
+
 /**
  * @route POST /api/crm/lists/:listId/leads/enrich-v3?mode=preview|enrich
  * @desc Run the v3.1 enrichment waterfall on all leads in the list using the
@@ -1845,6 +1888,28 @@ router.post('/lists/:listId/leads/enrich-v3', async (req: Request, res: Response
       return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
+    if (req.query.mode !== undefined && typeof req.query.mode !== 'string') {
+      return res.status(400).json({ message: 'mode must be a single value' });
+    }
+
+    if (req.query.mode === 'estimate') {
+      // ENG-2715: cost estimate before the user confirms a run. Read-only.
+      const stored = await svcGetEnrichmentConfig({ listId, userId }, enrichmentConfigDeps);
+      if (stored.isDefault) {
+        return res.status(400).json({
+          message: 'No enrichment config saved for this list. Open Enrichment Config and save one first.',
+        });
+      }
+      const estimateLeadIds = Array.isArray(req.body?.leadIds)
+        ? req.body.leadIds.filter((id: unknown): id is string => typeof id === 'string')
+        : [];
+      const leads = await buildV3OrchestratorDeps(userId).loadLeads({
+        listId, userId, leadIds: estimateLeadIds.length > 0 ? estimateLeadIds : undefined,
+      });
+      const { estimateEnrichmentRun } = await import('../services/enrichmentBatchBudget');
+      return res.json(await estimateEnrichmentRun(userId, stored.config, leads.length));
+    }
+
     const mode = (req.query.mode === 'preview' ? 'preview' : 'enrich') as 'preview' | 'enrich';
 
     // Preview accepts a full inline config in body.inlineConfig; enrich uses
@@ -1868,9 +1933,26 @@ router.post('/lists/:listId/leads/enrich-v3', async (req: Request, res: Response
     }
 
     const refreshFields = Array.isArray(req.body?.refreshFields) ? req.body.refreshFields : undefined;
-    const leadIds = Array.isArray(req.body?.leadIds)
-      ? req.body.leadIds.filter((id: unknown): id is string => typeof id === 'string')
-      : undefined;
+    const leadIds = parseLeadIds(req.body);
+    if (mode === 'enrich') {
+      // ENG-2716: a supplied estimate token must match the current estimate;
+      // a missing one is rejected only once the portal confirm dialog ships.
+      const supplied = req.body?.confirmEstimateToken;
+      const required = process.env.ENRICH_V3_REQUIRE_COST_CONFIRMATION === 'true';
+      if (supplied !== undefined || required) {
+        const estimate = estimateEnrichmentCost(listId, await countLeadsForEnrichment(listId, leadIds));
+        const check = checkEstimateConfirmation(supplied, estimate, required);
+        if (!check.ok) {
+          return res.status(409).json({
+            message: check.reason === 'missing'
+              ? 'Confirm the enrichment cost estimate before starting.'
+              : 'The enrichment cost estimate changed. Review and confirm the new estimate.',
+            code: 'ENRICH_ESTIMATE_CONFIRMATION_REQUIRED',
+            estimate,
+          });
+        }
+      }
+    }
     // ENG-1388: user-initiated runs may use Enigma card revenue (flag/allowlist-gated).
     const deps = buildV3OrchestratorDeps(userId, { enigma: true });
     const socketId = typeof req.body?.socketId === 'string' ? req.body.socketId : undefined;
@@ -1887,6 +1969,9 @@ router.post('/lists/:listId/leads/enrich-v3', async (req: Request, res: Response
       },
     );
     console.log(`[v3][route] enrich-v3 response listId=${listId} processed=${result.processed} durationMs=${result.durationMs}`);
+    if (result.budgetStop) {
+      return res.status(result.processed === 0 ? 402 : 200).json({ ...result, message: result.budgetStop.message });
+    }
     return res.json(result);
   } catch (error) {
     console.error('[v3][route] enrich-v3 failed:', error);
@@ -6526,6 +6611,20 @@ router.post('/lists/:listId/leads/:leadId/send-email', async (req: Request, res:
       return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
+    // ENG-673: a contact marked do-not-contact (unsubscribed, bounced, opted out, or reported by Smartlead) is never emailed from AgentWeb. No override.
+    if (isDoNotContact(lead)) {
+      return res.status(409).json({ code: 'do_not_contact', message: `Not sent: this contact is marked do-not-contact (${getDoNotContactReason(lead) ?? 'do-not-contact'}). Change their status first if that is wrong.` });
+    }
+
+    // ENG-673: this contact is being emailed through the customer's Smartlead campaign. A person sending ONE email by hand may still want to, so
+    // this is a confirmation (the portal asks), not a block; bulk and automated sends skip such leads outright.
+    if (isPushedToSmartlead(lead) && req.body?.confirmPushedToSmartlead !== true) {
+      return res.status(409).json({
+        code: 'pushed_to_smartlead',
+        message: "This contact is being emailed through your Smartlead campaign, so nothing was sent from AgentWeb (they would get email from two places). To send anyway, confirm it in the lead panel.",
+      });
+    }
+
     // ENG-266 Part 3: route through the sender's real provider. If senderId/senderEmail
     // don't resolve to a configured sender (an older client, or an ad-hoc address),
     // fall back to a synthesized resend sender from the raw fields — same as before.
@@ -6603,6 +6702,11 @@ router.post('/lists/:listId/leads/:leadId/reply-email', async (req: Request, res
     const list = await crmDb.getLeadListById(listId);
     if (!list || !(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
+    }
+
+    // ENG-673: a contact marked do-not-contact (unsubscribed, bounced, opted out, or reported by Smartlead) is never emailed from AgentWeb. No override.
+    if (isDoNotContact(lead)) {
+      return res.status(409).json({ code: 'do_not_contact', message: `Not sent: this contact is marked do-not-contact (${getDoNotContactReason(lead) ?? 'do-not-contact'}). Change their status first if that is wrong.` });
     }
 
     // ENG-266 Part 3: route through the sender's real provider, same fallback as send-email.
@@ -6928,8 +7032,11 @@ router.post('/lists/:listId/group-email/preview', async (req: Request, res: Resp
     // Eligibility = has email && not DNC && not undeliverable && not
     // malformed/test-domain. Single boolean filter (not arithmetic
     // subtraction) so overlapping categories don't produce negative counts.
+    // ENG-673: a lead pushed to a customer's Smartlead campaign is emailed from there, so AgentWeb's own group email leaves it out (send, preview
+    // and prepare all apply the same rule, or the preview would promise recipients the send does not make).
+    const smartlead = leads.filter((l: any) => l.email && !isDoNotContact(l) && isPushedToSmartlead(l)).length;
     const eligibleLeads = leads.filter((l: any) =>
-      l.email && !isDoNotContact(l) && validationStatus(l) !== 'undeliverable' && isEligibleGroupEmailRecipient(l.email),
+      l.email && !isDoNotContact(l) && !isPushedToSmartlead(l) && validationStatus(l) !== 'undeliverable' && isEligibleGroupEmailRecipient(l.email),
     ).length;
 
     // Return small samples (first 50) of email lists so the UI modals can show
@@ -6943,6 +7050,8 @@ router.post('/lists/:listId/group-email/preview', async (req: Request, res: Resp
       eligibleLeads,
       unsubscribedCount: doNotContactCount,
       doNotContactCount,
+      /** Left out because they are being emailed through the customer's Smartlead campaign (ENG-673). */
+      smartleadCount: smartlead,
       noEmailCount,
       undeliverableCount,
       riskyCount,
@@ -6992,7 +7101,7 @@ router.post('/lists/:listId/group-email/prepare', async (req: Request, res: Resp
 
     // Only consider eligible leads (have email, not do-not-contact/unsubscribed, valid syntax/domain)
     const eligibleLeads = leads.filter(
-      (l: any) => l.email && !isDoNotContact(l) && isEligibleGroupEmailRecipient(l.email),
+      (l: any) => l.email && !isDoNotContact(l) && !isPushedToSmartlead(l) && isEligibleGroupEmailRecipient(l.email),
     );
     const eligibleCount = eligibleLeads.length;
 
@@ -7102,6 +7211,11 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
     // endpoint catching up. ENG-2082 turns the gap from a rarity into a routine one.
     const skippedNoEmail = leads.filter((l: any) => !l.email && !isDoNotContact(l)).length;
     let eligibleLeads = leads.filter((l: any) => l.email && !isDoNotContact(l));
+
+    // ENG-673: leads being emailed through the customer's Smartlead campaign are left to it. Counted and reported, never silently dropped.
+    const beforeSmartleadCount = eligibleLeads.length;
+    eligibleLeads = eligibleLeads.filter((l: any) => !isPushedToSmartlead(l));
+    const skippedSmartlead = beforeSmartleadCount - eligibleLeads.length;
 
     // ENG-1194: malformed addresses and provider-disallowed test domains (e.g.
     // example.com) always fail at the provider — same validator preview uses,
@@ -7285,6 +7399,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
       failureReasons,
       skippedUnsubscribed: skippedDoNotContact,
       skippedDoNotContact,
+      skippedSmartlead,
       skippedMissingVars,
       skippedUndeliverable,
       skippedInvalid,

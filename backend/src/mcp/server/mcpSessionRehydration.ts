@@ -89,10 +89,22 @@ export async function rehydrateAndServe(
     sessionIdGenerator: () => sessionId,
     enableJsonResponse: true,
   });
+  // Auth method/key come from THIS request, which was re-authenticated before
+  // dispatch and bound to the record's principal by the caller. Without them a
+  // rehydrated api_key session could not reach opt-in-scope tools (read_email)
+  // and its audit context would lose the key id.
   const server = createServer({
     agentUserId: record.agentUserId,
     sessionId,
     isInternal: record.isInternal,
+    authMethod: (req as any)._mcpAuthMethod,
+    apiKeyId: (req as any)._mcpApiKeyId,
+    oauthClientId: (req as any)._mcpOAuthClientId,
+    oauthClientName: (req as any)._mcpOAuthClientName,
+    clientType: (req as any)._mcpClientType,
+    userAgent: typeof req.get === "function" ? req.get("user-agent") : undefined,
+    clientIp: req.ip,
+    apiKeyScopes: (req as any)._mcpApiKeyScopes,
   });
   await server.connect(transport);
 

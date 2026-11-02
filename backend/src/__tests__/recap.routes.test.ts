@@ -127,6 +127,23 @@ describe('scheduled activity (AC4)', () => {
     expect(mockGetRunResults).not.toHaveBeenCalled();
   });
 
+  it('ENG-2772: foreign schedule id returned by the index still 404s with no data in the body', async () => {
+    const foreign = {
+      scheduleId: 'sched-B',
+      userId: 'user-B',
+      name: 'Other tenant',
+      runResults: [{ status: 'success', completedAt: '2026-10-02T00:00:00Z', sessionId: 'sB', output: 'FOREIGN-SECRET' }],
+    };
+    mockGetSchedulesByUserId.mockResolvedValue([ownSchedule, foreign]);
+    const res = await request(app).get('/api/recap/schedules/sched-B/run-results');
+    expect(res.status).toBe(404);
+    expect(res.body).toEqual({ message: 'Schedule not found' });
+    const raw = JSON.stringify(res.body);
+    for (const leak of ['sched-B', 'user-B', 'Other tenant', 'sB', 'FOREIGN-SECRET']) expect(raw).not.toContain(leak);
+    expect(mockGetSchedulesByUserId).toHaveBeenCalledWith('user-A');
+    expect(mockGetRunResults).not.toHaveBeenCalled();
+  });
+
   it('own schedule run-results are served', async () => {
     const res = await request(app).get('/api/recap/schedules/sched-A/run-results');
     expect(res.status).toBe(200);

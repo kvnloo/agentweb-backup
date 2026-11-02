@@ -23,6 +23,8 @@ export interface BackoffDecision {
 
 export interface LlmTransportRetryOptions {
   timeoutMs: number;
+  /** Treat a 200 with no answer as a failed, retryable attempt (ENG-2720). */
+  requireContent?: boolean;
   maxAttempts: number;
   isRetryableError: (error: unknown) => boolean;
   /** `attempt` is 1-indexed, the attempt that just failed. */

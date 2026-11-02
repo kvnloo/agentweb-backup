@@ -2803,6 +2803,8 @@ export class ChatbotDB {
         sessionId,
       },
       UpdateExpression: "SET archived = :archived, adminListPartition = :adminListPartition",
+      // ENG-2644: never upsert a ghost row for an unknown id.
+      ConditionExpression: "attribute_exists(sessionId)",
       ExpressionAttributeValues: {
         ":archived": true,
         ":adminListPartition": "all",
@@ -3320,10 +3322,16 @@ export class ChatbotDB {
     }
   }
 
+  /**
+   * Reassign a session to `newUserId`. With `expectedUserId`, the write only lands while the session
+   * is still owned by that id (ENG-2653: an anonymous session moves to the account that proved it, and
+   * a concurrent transfer cannot overwrite the winner); null means that condition failed.
+   */
   async updateSessionUserId(
     sessionId: string,
-    newUserId: string
-  ): Promise<ChatSession> {
+    newUserId: string,
+    expectedUserId?: string
+  ): Promise<ChatSession | null> {
     // First, get the session to verify it exists
     const session = await this.getChatSession(sessionId);
     if (!session) {
@@ -3331,7 +3339,7 @@ export class ChatbotDB {
     }
 
     // Update the userId
-    const params = {
+    const params: AWS.DynamoDB.DocumentClient.UpdateItemInput = {
       TableName: this.tableName,
       Key: {
         sessionId,
@@ -3340,7 +3348,9 @@ export class ChatbotDB {
       ExpressionAttributeValues: {
         ":userId": newUserId,
         ":adminListPartition": "all",
+        ...(expectedUserId !== undefined ? { ":expectedUserId": expectedUserId } : {}),
       },
+      ...(expectedUserId !== undefined ? { ConditionExpression: "userId = :expectedUserId" } : {}),
       ReturnValues: "ALL_NEW",
     };
 
@@ -3348,6 +3358,7 @@ export class ChatbotDB {
       const result = await dynamodb.update(params).promise();
       return result.Attributes as ChatSession;
     } catch (error) {
+      if (expectedUserId !== undefined && this.isConditionalCheckFailure(error)) return null;
       console.error("Error updating session userId:", error);
       throw error;
     }
@@ -5844,7 +5855,7 @@ export async function generateChatResponse(
             'research-reports': ['perform_deep_research', 'you_search_web'],
             'tasks':            ['list_task_templates', 'create_task_from_template', 'create_task_from_prompt'],
             'newsletter':       ['create_social_media_posts', 'list_html_templates', 'create_html_from_template', 'update_html_file', 'get_visual_context'],
-            'seo':              ['get_seo_metrics', 'get_website_analytics', 'get_clarity_metrics'],
+            'seo':              ['get_seo_metrics', 'get_website_analytics', 'get_ga4_key_events', 'get_clarity_metrics'],
             'blog':             ['create_blog_article', 'publish_blog_article', 'list_cms_categories', 'repair_blog_article', 'get_visual_context'],
             'agent-mode?tab=scheduled': ['list_scheduled_chats', 'manage_scheduled_chat', 'test_scheduled_chat', 'get_scheduled_chat_test_history', 'submit_scheduled_chat_variables'],
           };

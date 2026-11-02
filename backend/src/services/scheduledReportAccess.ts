@@ -32,6 +32,7 @@ export const CROSS_ACCOUNT_USER_DATA_TOOLS = [
   'get_chat_history',
   'get_session_transcript',
   'get_user_by_id',
+  'inspect_client_usage',
   'list_all_clients',
   'assess_client_health',
   'monitor_lead_volume',

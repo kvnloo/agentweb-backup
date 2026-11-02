@@ -36,6 +36,8 @@ const schema = z
         tmpSize: size.default("128M"),
         shmSize: size.default("64M"),
         runtimeMaxSec: z.number().int().min(10).max(7 * 24 * 3600).default(2 * 3600),
+        /** Grace period a stopping customer unit gets to exit on SIGTERM before SIGKILL (keeps a login that is mid-refresh intact). */
+        stopGraceSec: z.number().int().min(2).max(12).default(10),
       })
       .strict()
       .default({}),
@@ -50,6 +52,7 @@ const schema = z
         abortGraceMs: z.number().int().min(100).optional(),
         idleSessionMs: z.number().int().min(1000).optional(),
         toolCallTimeoutMs: z.number().int().min(1000).optional(),
+        readyAttemptTtlMs: z.number().int().min(10_000).max(30 * 60 * 1000).optional(),
         adapterCallTimeoutMs: z.number().int().min(1000).optional(),
         portCallTimeoutMs: z.number().int().min(1000).optional(),
       })

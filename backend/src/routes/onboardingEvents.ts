@@ -26,6 +26,7 @@ import {
 } from "../utils/onboardingStage";
 import { onOnboardingStageChanged } from "../services/contactCaptureHooks";
 import { mirrorOnboardingEventToLead } from "../services/onboardingLeadSync";
+import { emitAppSignal, mapOnboardingEventToSignal } from "../services/serverSignalEmitter";
 
 const router = express.Router();
 
@@ -183,6 +184,10 @@ router.post("/events", authenticateToken, async (req, res) => {
         onboardingStage: newStage,
       }).catch(() => {});
     }
+
+    // ENG-2686: hireemma.ai funnel signal. Fire-and-forget; never throws.
+    const appSignal = mapOnboardingEventToSignal(event, LATERAL_ONBOARDING_EVENTS.has(event));
+    if (appSignal) void emitAppSignal(user as any, appSignal.name, appSignal.props);
 
     return res.status(200).json({
       onboardingStage: newStage,

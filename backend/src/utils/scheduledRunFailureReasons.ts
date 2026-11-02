@@ -31,7 +31,17 @@ export function describeScheduledRunFailureReasons(
   if (run.parkedUnnotifiable) {
     reasons.push('run stopped on a blocking question with no channel to reach a human');
   }
-  if (run.publishHeldForApproval) reasons.push('publish press budget exhausted with the publish tool uncalled');
+  if (run.publishHeldForApproval) {
+    // ENG-2662: name the withheld tool and say the model chose not to publish
+    // (approval/draft gate, ENG-947). Pressing more would not change that, so the
+    // fix is the schedule's publish authorization, not the press budget.
+    const held = (run.functionCallMisses ?? []).filter(Boolean);
+    reasons.push(
+      'publish press budget exhausted with the publish tool uncalled' +
+        ` — model withheld ${held.length ? held.join(', ') : 'the publish'}` +
+        ` after ${run.attempts ?? 'unknown'} attempt(s) (held for approval; check the schedule's unattended-publish authorization)`,
+    );
+  }
   if (run.publishRequirementMismatch) {
     reasons.push('published through a different tool than the schedule requires');
   }

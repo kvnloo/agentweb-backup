@@ -246,6 +246,29 @@ const scenarios = {
     return { sent: bodies(e) };
   },
 
+  superProps() {
+    const e = setup();
+    e.win.awSuper = { funnel_type: 'free_trial', is_login: false, session_intent_score: 3, bad: { x: 1 } };
+    e.load();
+    e.win.awRegister({ funnel_type: 'funnel_review' });
+    e.win.awTrack('cta_click', { cta_name: 'x' });
+    setVisibility(e.win, 'hidden');
+    const stored = e.win.sessionStorage.getItem('aw_s_' + LIST);
+    const second = setup({ sessionSeed: { ['aw_s_' + LIST]: stored } });
+    second.load();
+    second.win.awTrack('next_page');
+    return { sent: bodies(e), second: bodies(second) };
+  },
+
+  superNonAscii() {
+    // Opslane run 1360: 20 x 300 katakana registered values are ~7k characters but ~19k UTF-8 bytes.
+    const e = setup();
+    const sup = {}; for (let i = 0; i < 20; i++) sup['k' + i] = '\u30c6'.repeat(300);
+    e.win.awSuper = sup;
+    e.load();
+    return { sizes: e.sent.map(function (s) { return Buffer.byteLength(JSON.stringify(s.body), 'utf8'); }), sent: bodies(e) };
+  },
+
   dntDefault() { const e = setup({ dnt: true }); e.load(); return { sent: bodies(e) }; },
   dntOptIn() {
     const e = setup({ dnt: true, scriptAttrs: 'data-aw-respect-dnt' }); e.load();

@@ -18,6 +18,7 @@ import { resendService } from "../services/resendService";
 import { sendGTMPlanUpdateNotifications, sendPhaseStatusReport, sendPlanStatusReport } from "../services/gtmPlanNotificationService";
 import { notifySlackWorkItemCompleted } from "../services/gtmPlanService";
 import { chatbotDb, ChatSession } from "../services/chatbotService";
+import { branchOwnMessages } from "../services/agentMode/chatBranching";
 import { scoreSessionIfNeeded, scoreSessionWithJudgeIfNeeded, ScoringJudge } from "../services/sessionScoringService";
 import { backfillSessionScores } from "../services/scoreBackfill";
 import { DynamoDB } from "aws-sdk";
@@ -477,10 +478,12 @@ router.post("/unipile-accounts/:accountId/assign", async (req, res) => {
     // Fetch account details from Unipile to get the real name
     let accountName = 'LinkedIn Account';
     let username: string | undefined;
+    let providerVerified = false;
     try {
       const unipileAccount = await linkedInOutreachService.getAccount(accountId);
       if ((unipileAccount as any).name) accountName = (unipileAccount as any).name;
       username = (unipileAccount as any).connection_params?.im?.username;
+      providerVerified = true;
     } catch (unipileErr: any) {
       console.warn(`[Admin] Could not fetch Unipile account details for ${accountId}:`, unipileErr?.message);
     }
@@ -496,7 +499,7 @@ router.post("/unipile-accounts/:accountId/assign", async (req, res) => {
         token_expires_at: Number.MAX_SAFE_INTEGER,
         scopes: [],
       },
-    });
+    }, { providerVerified });
 
     linkedInOutreachService.clearStatusCache(accountId);
     console.log(`[Admin] Assigned orphan Unipile account ${accountId} to user ${normalizedEmail}`);
@@ -3323,11 +3326,20 @@ const REVIEW_ISHARE_EXPIRATION_DAYS = 45;
 // until it expires, then regenerated. These links are shared out to reviewers,
 // so the window must outlast the review cycle — but stays bounded because the
 // session may be internal, not customer-shared (see REVIEW_ISHARE_EXPIRATION_DAYS).
+/** ENG-2648: a branch whose every row is a copy of its source (no user turn of its own). */
+function isBranchCopyOnly(session: any): boolean {
+  const messages = Array.isArray(session?.messages) ? session.messages : [];
+  return messages.length > 0 && branchOwnMessages(messages).length === 0;
+}
+
 async function ensureIshareLinkForReview(sessions: any[]): Promise<void> {
   await Promise.all(
     sessions.map(async (session) => {
       const meta = session.interactiveShareMetadata;
       if (meta?.isActive && meta?.token) return;
+      // ENG-2648: never mint a review link for a branch with no turns of its own (a never-continued branch or
+      // the hidden leftover of a failed copy): its content is reviewed under its source.
+      if (isBranchCopyOnly(session)) return;
       try {
         const ishareUrl = await chatbotDb.createOrReuseInteractiveShare(
           session.sessionId,
@@ -3422,6 +3434,9 @@ router.get("/chat-sessions", async (req, res) => {
         })
       );
 
+      // ENG-2648: an owner's own list keeps a revealed branch they never continued (it is one of their chats;
+      // archived leftovers of a failed copy are already excluded by getSessionsWithoutMessages), but
+      // ensureIshareLinkForReview creates no review link for it.
       const nonEmptySessions = sessionsWithMessages.filter((session: any) =>
         Array.isArray(session.messages) &&
         session.messages.some((msg: any) => msg.role === "user")
@@ -3614,10 +3629,13 @@ router.get("/chat-sessions", async (req, res) => {
       ? Buffer.from(JSON.stringify(nextKey)).toString("base64")
       : null;
 
-    // Filter out sessions that have no user messages (not real sessions)
+    // Filter out sessions that have no user messages (not real sessions). ENG-2648: for a branch only its
+    // OWN user messages count, so a branch nobody continued and the hidden (archived) leftover of a failed
+    // branch copy — both nothing but a copy of turns already listed under their source — are left out too.
+    // (The ?sessionId= lookup above still finds any session by id, orphans included.)
     const nonEmptySessions = sessionsWithMessages.filter((session: any) =>
       Array.isArray(session.messages) &&
-      session.messages.some((msg: any) => msg.role === "user")
+      branchOwnMessages(session.messages).some((msg: any) => msg.role === "user")
     );
 
     await ensureIshareLinkForReview(nonEmptySessions);

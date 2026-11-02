@@ -2,6 +2,7 @@ import { randomUUID } from 'crypto';
 import { MODIFY_WORK_PLAN_INPUT_SCHEMA, validateModifyWorkPlanArgs } from './impl/modifyWorkPlanArgs';
 import { agentModeService } from '../services/agentModeService';
 import { APPROVAL_KIND_RESERVED_PREFIX } from '../services/voice/hotLeadCallApprovalGate';
+import { SMARTLEAD_APPROVAL_KIND_PREFIX } from '../services/smartleadPushApprovalGate';
 import { getAccessToken as getClickUpAccessToken, createTaskInList as createClickUpTaskInList, getListCustomFields as getClickUpListCustomFields, ClickUpTaskError } from '../services/clickupService';
 import { emmaToolRegistry } from './registry';
 import { auditCampaigns } from '../services/adUtmAuditService';
@@ -127,6 +128,7 @@ import './browserCookieTools';
 import './leadNotificationTools';
 import './hotLeadCallTools';
 import './hotLeadCallSetupTools';
+import './smartleadPushTools';
 
 // Register email lookup / find tool (provider-agnostic)
 import './emailLookupTool';
@@ -251,7 +253,7 @@ emmaToolRegistry.register({
 // only widens Emma's OWN judgment-based use of the card within Meta; it does
 // not add a new hard-enforced gate for other Meta entities — that requires its
 // own dedicated gate, built the same way ENG-400 was, per irreversible action.
-const RESERVED_QUESTION_KIND_PREFIXES = [APPROVAL_KIND_RESERVED_PREFIX];
+const RESERVED_QUESTION_KIND_PREFIXES = [APPROVAL_KIND_RESERVED_PREFIX, SMARTLEAD_APPROVAL_KIND_PREFIX];
 
 emmaToolRegistry.register({
   name: 'ask_user_question',
@@ -997,12 +999,13 @@ Actions:
 - get-company: Get a LinkedIn company profile by company_id (the company's LinkedIn identifier/slug).
 - cancel-invitation: Cancel a pending invitation by invitation_id (obtain from list-sent-invitations).
 - withdraw-stale-invitations: Bulk-withdraw the account's OLDEST pending connection requests to reclaim capacity. Requires older_than_days (minimum 1); optional max_withdrawals (default and hard maximum 40 per run) and list_id. Use this instead of looping cancel-invitation when a backlog of pending invitations is throttling sends. Withdraws oldest-first, paces every withdrawal, and does NOT consume the account's daily invite budget. It ALWAYS returns a "notice" you must relay rather than summarise away, plus "withdrawn" (each with the invitee and when the invite was originally sent), "failed", "remainingStale", "totalPending", and "stopReason". stopReason 'paced' means the account hit its write-pacing ceiling and the run stopped deliberately: this is NOT a failure and NOT a LinkedIn rejection — do NOT retry in the same run, report how far it got and leave the rest for the next one. IMPORTANT: withdrawing stale invitations does NOT lift the stricter throttle a NEWLY connected LinkedIn account is under — that is about the account's age, not its pending count — so do not offer it as a remedy for a brand-new connection being limited.
+- list-post-engagers: Read-only. List the people who COMMENTED on a LinkedIn post — warm prospects who already engaged with the topic. Requires post_id (the post URL, a urn:li:activity:… URN, or a Unipile social id); optional cursor and limit (max 100). Returns one row per distinct commenter (name, headline, profile_url, provider_id, comment_snippet) plus cursor for the next page. Out-of-network/anonymized commenters are dropped and counted as anonymizedSkipped. Reactors (likes) are NOT included. Sends nothing — pass a row's provider_id or profile_url to send-invite separately.
 - accept-invitation: (exact action string: "accept-invitation") Accept a received connection request. Requires invitation_id and shared_secret — both obtained from list-received-invitations. CRM ATTRIBUTION IS OPT-IN, ON YOU: accepting an inbound request does NOT automatically make someone a lead — unlike sending an invite (always a deliberate targeting choice), an inbound accept could be a genuine prospect or an unrelated personal connection, and nothing gets logged unless you decide it belongs somewhere. If — and only if — this person is actually relevant to a specific CRM campaign, pass list_id for that list; the connection's identity is looked up automatically from LinkedIn's own record of this invitation (not from anything else you pass), so list_id is the only extra thing needed. Omit list_id for a connection that isn't a lead — the accept still succeeds, nothing gets mirrored, no false attribution. If you judge someone a good potential lead but have no specific list to attach them to (the task didn't name one), do NOT let that pass silently — call it out explicitly in your final report (e.g. "N accepted connections look like good fits for X but I had no target list — let me know where to add them") so it's visible and actionable, not just accepted-and-forgotten.
 - update-conversation-history: Fetch the full message history with a LinkedIn contact from Unipile and persist it to the lead's CRM engagement activities. Also updates the lead's sync timestamp so send-message is unblocked for the next 24 hours. Requires list_id and lead_id in addition to profile_url or provider_id.
 - search-parameters: Resolve a free-text query (company name, location, industry, school, service) to LinkedIn entity IDs via Unipile's parameter search. Required: type (one of COMPANY, LOCATION, INDUSTRY, SCHOOL, SERVICE) and keywords. Optional limit. Returns ranked candidates with id/title/subtitle plus fromCache and source metadata. Use the returned id with the matching *_id field on search-people for precise structured filtering.
 - set-daily-invite-cap: Set this account's daily LinkedIn connection-request limit. Requires daily_invite_cap (a number, up to the system-wide maximum — a higher value you pass is clamped automatically, so 30 always works as "the Premium number" without needing to know the exact ceiling). SELF-REPORTED, NEVER DETECTED: call this ONLY after asking the user directly, in THIS conversation, whether their connected LinkedIn account has Premium — never guess, never infer it from anything else about the account. If they say yes, call this with daily_invite_cap=30 (or their stated preference, if lower); if no, call it with daily_invite_cap=10. Before running any LinkedIn outreach for an account you haven't confirmed this for, ask first — a live/interactive turn is the only place you CAN ask, since an unattended/scheduled run has no one to answer. If a scheduled run reaches this point with the cap still unconfirmed, do NOT call this action from that run — proceed at whatever cap is already configured (defaults to the conservative 10 until someone answers) and say so plainly in the completion ledger, rather than guessing Premium.
 
-SHARED-ACCOUNT FALLBACK: search-people, get-profile, get-company, and search-parameters still work even when the user has no connected LinkedIn account (or it's disconnected) — they silently borrow a platform-wide shared account so discovery doesn't stall. When that happens the response carries usedSharedAccount:true and sharedAccountId. Treat this as a real signal, not a footnote: network_distance and any "already connected/pending" status are relative to the SHARED account's network, not the user's, so they are omitted from the response entirely — do not claim or infer a connection degree from a shared-account result. Proactively tell the user their LinkedIn account appears disconnected (discovery still worked, but outreach — send-invite/send-message/etc. — will fail) rather than silently continuing as if everything is normal.
+SHARED-ACCOUNT FALLBACK: search-people, get-profile, get-company, search-parameters, and list-post-engagers still work even when the user has no connected LinkedIn account (or it's disconnected) — they silently borrow a platform-wide shared account so discovery doesn't stall. When that happens the response carries usedSharedAccount:true and sharedAccountId. Treat this as a real signal, not a footnote: network_distance and any "already connected/pending" status are relative to the SHARED account's network, not the user's, so they are omitted from the response entirely — do not claim or infer a connection degree from a shared-account result. Proactively tell the user their LinkedIn account appears disconnected (discovery still worked, but outreach — send-invite/send-message/etc. — will fail) rather than silently continuing as if everything is normal.
 
 ANONYMIZED RESULTS: LinkedIn hides out-of-network people behind a placeholder profile. Those are dropped from search-people results, and the count is reported as anonymizedFiltered. If items is empty but anonymizedFiltered is greater than zero, the search WORKED and the niche is NOT empty — everyone matching was simply out of reach of the account used. Do not report that as "no results found" and do not escalate it as a broken search; broaden the query or use an account whose network reaches these people. On get-profile the row cannot be dropped, so it comes back with anonymized:true and no profile URL.
 
@@ -1014,7 +1017,7 @@ For target person identification (send-invite, send-message, get-profile, update
       properties: {
         action: {
           type: 'string',
-          enum: ['search-people', 'get-profile', 'list-connections', 'list-sent-invitations', 'list-received-invitations', 'send-invite', 'send-message', 'send-inmail', 'get-company', 'cancel-invitation', 'accept-invitation', 'update-conversation-history', 'search-parameters', 'set-daily-invite-cap', 'withdraw-stale-invitations'],
+          enum: ['search-people', 'get-profile', 'list-connections', 'list-sent-invitations', 'list-received-invitations', 'send-invite', 'send-message', 'send-inmail', 'get-company', 'cancel-invitation', 'accept-invitation', 'update-conversation-history', 'search-parameters', 'set-daily-invite-cap', 'withdraw-stale-invitations', 'list-post-engagers'],
           description: 'The outreach action to perform.'
         },
         account_id: {
@@ -1129,7 +1132,7 @@ For target person identification (send-invite, send-message, get-profile, update
         },
         limit: {
           type: 'number',
-          description: 'Max number of candidates to return for search-parameters. Optional; the resolver picks a sensible default.'
+          description: 'Max number of candidates to return for search-parameters. Optional; the resolver picks a sensible default. For list-post-engagers: comments to read per page (max 100).'
         },
         invitation_id: {
           type: 'string',
@@ -1141,7 +1144,11 @@ For target person identification (send-invite, send-message, get-profile, update
         },
         cursor: {
           type: 'string',
-          description: 'Pagination cursor for search-people, list-connections, list-sent-invitations, list-received-invitations.'
+          description: 'Pagination cursor for search-people, list-connections, list-sent-invitations, list-received-invitations, list-post-engagers.'
+        },
+        post_id: {
+          type: 'string',
+          description: 'For list-post-engagers: the LinkedIn post URL, urn:li:activity:… URN, or Unipile social id.'
         },
         force_refresh: {
           type: 'boolean',
@@ -6028,7 +6035,7 @@ emmaToolRegistry.register({
   name: "read_file_content",
   definition: {
     name: "read_file_content",
-    description: 'Read and extract text content from a file URL. Supports text files, PDFs, HTML, Markdown, CSV, Excel/XLSX spreadsheets, Word documents (docx, doc), and other common formats. Do NOT use this for image files (jpg, jpeg, png, gif, webp) — use describe_image instead. For SVG source markup, text labels, or dimensions, use this tool; use describe_image for visual analysis of SVGs. Do NOT use this for video files (mp4, mov, avi, webm, mkv) — use describe_video instead.',
+    description: 'Read and extract text content from a file URL. Supports text files, PDFs, HTML, Markdown, CSV, Excel/XLSX spreadsheets, Word documents (docx, doc), and other common formats. Do NOT use this for image files (jpg, jpeg, png, gif, webp) — use describe_image instead. For SVG source markup, text labels, or dimensions, use this tool; use describe_image for visual analysis of SVGs. Do NOT use this for video files (mp4, mov, avi, webm, mkv) — use describe_video instead. Only pass a URL that appears verbatim in the conversation (an Attached Files link or a link the user pasted). NEVER guess or construct a file URL: if the user says a file is attached but the message has no Attached Files link, do not call this tool — reply "I do not see an attachment on that message — please re-attach the file."',
     inputSchema: {
       type: "object",
       properties: {
@@ -6701,6 +6708,16 @@ emmaToolRegistry.register({
           if (!args.to) return { error: 'send action requires a "to" parameter.' };
           if (!args.subject) return { error: 'send action requires a "subject" parameter.' };
           if (!args.body) return { error: 'send action requires a "body" parameter.' };
+          // ENG-673: an address-only send must not reach a contact marked do-not-contact (this path skips sendAsSender).
+          const { blockedRecipients, blockedMessage, unverifiedContactError } = await import('../services/contactGuard');
+          let blocked: string[];
+          try {
+            blocked = await blockedRecipients([userId, ownerUserId], args.to, args.cc, args.bcc);
+          } catch (e) {
+            console.error('[Emma] do-not-contact check failed, not sending:', e);
+            return { error: unverifiedContactError };
+          }
+          if (blocked.length > 0) return { error: blockedMessage(blocked), blocked };
           const result = await provider.sendEmail(ownerUserId, args.account_id, {
             to: args.to,
             subject: args.subject,
@@ -6983,7 +7000,7 @@ emmaToolRegistry.register({
   name: 'get_website_analytics',
   definition: {
     name: 'get_website_analytics',
-    description: 'Get Google Analytics (GA4) website analytics data. Returns sessions, users, page views, bounce rate, average session duration, traffic sources (with conversion counts per source/medium), a conversion breakdown by traffic source and event name (conversionsBySource), top pages by engagement (topPagesByEngagement), the same pages independently queried and sorted by session volume (topPagesBySessions), and daily trends. Use conversionsBySource for UTM-source-level attribution of form fills and other conversion events. For any "top/highest/most pages by sessions/volume" question, read it off topPagesBySessions — it is already sorted by sessions; do not re-sort topPagesByEngagement yourself, and do not answer a volume-ranking question from a field sorted by a different metric. If topPagesBySessions is missing and topPagesBySessionsError is present instead, that ranking could not be fetched this request — say so plainly; do not report zero pages, and do not substitute topPagesByEngagement ordering as if it answered the volume question. Its conversion counts are historical — they show which events were counted as conversions when they were collected, not which events are currently marked as key events (GA4 key-event changes are not retroactive); this tool cannot read key-event configuration, so never infer it from this data. If the user has multiple GA4 properties configured, returns analytics for all properties unless a specific property is requested.',
+    description: 'Get Google Analytics (GA4) website analytics data. Returns sessions, users, page views, bounce rate, average session duration, traffic sources (with conversion counts per source/medium), a conversion breakdown by traffic source and event name (conversionsBySource), top pages by engagement (topPagesByEngagement), the same pages independently queried and sorted by session volume (topPagesBySessions), and daily trends. Use conversionsBySource for UTM-source-level attribution of form fills and other conversion events. For any "top/highest/most pages by sessions/volume" question, read it off topPagesBySessions — it is already sorted by sessions; do not re-sort topPagesByEngagement yourself, and do not answer a volume-ranking question from a field sorted by a different metric. If topPagesBySessions is missing and topPagesBySessionsError is present instead, that ranking could not be fetched this request — say so plainly; do not report zero pages, and do not substitute topPagesByEngagement ordering as if it answered the volume question. Its conversion counts are historical — they show which events were counted as conversions when they were collected, not which events are currently marked as key events (GA4 key-event changes are not retroactive); this tool cannot read key-event configuration, so never infer it from this data — if get_ga4_key_events is among your available tools, call it for that; if it is not available (or is refused), say plainly that the current key-event configuration could not be checked in this session and give the manual check (GA4 Admin > Events / Key events) — never call install_skills for it. If a property result has noData=true, lead your reply with its noDataNote (property ID and date range). If the user has multiple GA4 properties configured, returns analytics for all properties unless a specific property is requested.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -7006,6 +7023,29 @@ emmaToolRegistry.register({
 
     const { fetchGoogleAnalyticsMetrics } = await import('../services/seoService');
     return await fetchGoogleAnalyticsMetrics(userId, args.timeframe || '30d', args.property_id);
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'get_ga4_key_events',
+  definition: {
+    name: 'get_ga4_key_events',
+    description: 'Read the CURRENT GA4 key-event (conversion) configuration for the user\'s configured GA4 properties via the GA4 Admin API. Read-only. Use this whenever the user asks which events are marked as Key Events / conversions, or whether a specific event (e.g. page_view, generate_lead) is a key event — pass event_name to get a direct isKeyEvent true/false. Returns keyEventNames per property. If a property returns an error (e.g. permission_denied), say so plainly in one line and give the included manual check path; never guess the configuration.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        property_id: { type: 'string', description: 'Specific GA4 property ID (e.g. "123456789"). If omitted, reads all configured properties.' },
+        event_name: { type: 'string', description: 'Optional event name to check, e.g. "page_view". The result includes isKeyEvent for it.' }
+      },
+      required: []
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+
+    const { fetchGa4KeyEvents } = await import('../services/seoService');
+    return await fetchGa4KeyEvents(userId, args.property_id, args.event_name);
   }
 });
 
@@ -7585,6 +7625,7 @@ const adminToolNames = [
   'get_chat_history',
   'get_session_transcript',
   'get_user_by_id',
+  'inspect_client_usage',
   'list_all_clients',
   'assess_client_health',
   'monitor_lead_volume',
@@ -7612,8 +7653,14 @@ const adminToolNames = [
 // mcpGetAccountStatusExposure.test.ts). Same `execute`, self-only schema.
 const SELF_ONLY_BRIDGE_DEFINITIONS: Record<string, { description: string; inputSchema: any }> = {
   get_account_status: {
-    description: "Get the current user's account status, subscription plan, and usage.",
-    inputSchema: { type: 'object', properties: {}, required: [] },
+    description: "Get the current user's account status, subscription plan, and usage. Pass usage_month (YYYY-MM) to also get that month's LLM token/call totals by model and by day plus a session count (no dollar amounts).",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        usage_month: { type: 'string', description: 'Optional YYYY-MM month for the usage breakdown.' },
+      },
+      required: [],
+    },
   },
   list_scheduled_chats: {
     description: 'List scheduled chats (newest first) for the authenticated user. Paginated: returns { items, nextCursor }; pass nextCursor back as cursor for the next page (null = last page).',
@@ -7707,10 +7754,13 @@ emmaToolRegistry.register({
   execute: async (args: any, context?: any) => {
     const { LANDING_PAGE_PREVIEW_BRANCH, runCodingAgent } = await import('../services/codingAgentService');
     const { classifyCodingAgentFailure } = await import('../services/codingAgentFailureClass');
+    // ENG-2648: the chat's model, else the configured system default (agent_mode_default_model) — never a
+    // hard-coded model id, which drifts from the registry and the plan allowlist.
+    const toolModel: string = context?.llmModel || await agentModeService.getDefaultModel();
     const executeMcpTool = context?.service
       ? async (toolName: string, toolArgs: any) => {
         return context.service.executeTool(
-          context.llmModel || 'anthropic.claude-sonnet-4-6',
+          toolModel,
           toolName,
           toolArgs,
           context.userId,
@@ -7730,7 +7780,7 @@ emmaToolRegistry.register({
         pageId: args.page_id,
         userId: context?.userId,
         sessionId,
-        llmModel: context?.llmModel || 'anthropic.claude-sonnet-4-6',
+        llmModel: toolModel,
         socketEmit: context?.socketEmit,
         executeMcpTool,
         draftBranch,
@@ -9559,6 +9609,7 @@ emmaToolRegistry.register({
     name: 'call_hubspot_api',
     description: `Manage HubSpot marketing assets and data via a single unified tool.
 Use entity_type to select the resource, action to select the operation.
+For CONTACT_LIST GET pass list_id as a top-level string (listId/id/guid and id-bearing query objects are accepted aliases). LIST with a list id reads that list; omit ids to enumerate lists. For CAMPAIGN GET/GET_METRICS pass top-level guid (id is accepted). Use CONTACTS + LIST to list contacts.
 
 ENTITY_TYPE + ACTION MATRIX:
 
@@ -9714,8 +9765,11 @@ emmaToolRegistry.register({
 reporting and list-membership workflows.
 
 Attio has no equivalent of HubSpot's marketing-asset concepts (campaigns,
-emails, landing pages, workflows, social broadcasts) — this tool covers only
-lists and list entries, mirroring call_hubspot_api's CONTACT_LIST actions.
+emails, landing pages, workflows, social broadcasts). Supported entity_type values
+are RECORDS, LISTS, LIST_ENTRIES (case-insensitive). Workspace lookup/get_workspace
+is not supported. Use {entity_type:"RECORDS",action:"SEARCH",query:"name or email"}
+or {entity_type:"RECORDS",action:"LIST",object_type:"people"}; PERSON/PEOPLE are
+aliases for RECORDS with object_type people. Pass fields at the top level.
 
 ENTITY_TYPE + ACTION MATRIX:
 

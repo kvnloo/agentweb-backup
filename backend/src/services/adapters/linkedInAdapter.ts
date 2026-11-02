@@ -1,7 +1,7 @@
 import { linkedInService } from '../linkedInService';
 import { ConnectedAccount, LinkedInConfig, updateAccountTokens } from '../connectedAccountsDb';
 import { SocialPlatformAdapter, PostResult, PostMetric, AccountMetrics, PostAnalytics, AssertStillAuthorized } from './socialPlatformTypes';
-import { isPublishConsentWithdrawn } from '../../utils/publishConsentWithdrawn';
+import { isPublishConsentWithdrawn, PublishConsentWithdrawn } from '../../utils/publishConsentWithdrawn';
 import { getLinkedInConfig } from '../../config/integrations';
 
 // ENG-1300: these rethrows replace LinkedIn's original axios error with a
@@ -21,6 +21,75 @@ function rethrowWithCode(message: string, code?: number): never {
  * LinkedIn Adapter Implementation
  * Handles differences between Personal and Company pages
  */
+// ENG-2663: LinkedIn can reject an access token with 401 "revoked by the user" when it is
+// used right after being minted by a refresh, then accept the same token later (prod:
+// 2026-10-13, 2026-10-25; a public report puts it at seconds to minutes). A 401 creates
+// nothing, so a retry is safe. The wait is kept short because an interactive user may be
+// blocked on it; if LinkedIn still refuses, callers get FreshTokenRejectedError (retryable,
+// NOT "reconnect") and the agent / executor spread the next attempt over time.
+export const FRESH_TOKEN_RETRY_DELAYS_MS = [10_000];
+
+// A token is "fresh" for a few minutes after it was minted, whichever call minted it: the refresh
+// is saved immediately, so a retry a minute later (or a parallel call) reads it as a stored token.
+// Age is derived from the stored expiry, so it holds across hosts with no new field.
+const LINKEDIN_ACCESS_TOKEN_LIFETIME_MS = 60 * 24 * 60 * 60 * 1000;
+const FRESH_TOKEN_WINDOW_MS = 5 * 60 * 1000;
+const CLOCK_SKEW_MS = 60 * 1000;
+export function isFreshlyMintedToken(tokenExpiresAt: number, now = Date.now()): boolean {
+  const ageMs = LINKEDIN_ACCESS_TOKEN_LIFETIME_MS - (tokenExpiresAt - now);
+  return ageMs >= -CLOCK_SKEW_MS && ageMs < FRESH_TOKEN_WINDOW_MS;
+}
+
+export class FreshTokenRejectedError extends Error {
+  readonly freshTokenRejected = true;
+  // Declared class (see KNOWN_TOOL_ERROR_CLASSES): "Retryable: yes, wait before ONE retry" guidance
+  // instead of the terminal "auth" verdict. rate_limit fits best: it is a temporary refusal, and
+  // for non-media tools it has no side effects (the gateway only special-cases it for media budgets).
+  readonly toolErrorClass = 'rate_limit';
+  constructor() {
+    super(
+      'LinkedIn temporarily rejected the access that was just renewed for this account, so nothing was sent. '
+      + 'This is a temporary LinkedIn-side issue, not a disconnected account - do not ask the user to reconnect. '
+      + 'Do not retry immediately: call wait_seconds with 60, then try this once more.'
+    );
+    this.name = 'FreshTokenRejectedError';
+  }
+}
+
+// A 401 surfaces either as an axios error or as linkedInService's rethrown plain Error.
+function isLinkedIn401(error: any): boolean {
+  return error?.response?.status === 401
+    || /LinkedIn access token expired or invalid/.test(error?.message || '');
+}
+
+export async function retryIfFreshToken401<T>(
+  isFresh: boolean,
+  call: () => Promise<T>,
+  delaysMs: number[] = FRESH_TOKEN_RETRY_DELAYS_MS,
+  beforeRetry?: () => Promise<void>,
+): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await call();
+    } catch (error: any) {
+      if (!isFresh || !isLinkedIn401(error)) throw error;
+      const delayMs = delaysMs[attempt];
+      if (delayMs === undefined) throw new FreshTokenRejectedError();
+      console.warn(`[LinkedInAdapter] ENG-2663: 401 on a just-refreshed token; retry ${attempt + 1}/${delaysMs.length} in ${delayMs}ms`);
+      await new Promise((r) => setTimeout(r, delayMs));
+      await beforeRetry?.();
+    }
+  }
+}
+
+// ENG-827: the retry fires after a wait, so consent is re-read right before the second write.
+function recheckConsentBeforeRetry(assertStillAuthorized: AssertStillAuthorized | undefined): () => Promise<void> {
+  return async () => {
+    const withdrawn = await assertStillAuthorized?.();
+    if (withdrawn) throw new PublishConsentWithdrawn(withdrawn.error);
+  };
+}
+
 export class LinkedInAdapter implements SocialPlatformAdapter {
 
   /**
@@ -30,7 +99,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
   private async getValidToken(
     account: ConnectedAccount,
     userId?: string
-  ): Promise<{ token: string; wasRefreshed: boolean }> {
+  ): Promise<{ token: string; wasRefreshed: boolean; isFresh: boolean }> {
     const config = account.config as LinkedInConfig;
     const now = Date.now();
 
@@ -40,7 +109,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     const timeUntilExpiry = expiresAt - now;
 
     if (expiresAt > now + bufferMs) {
-      return { token: config.access_token, wasRefreshed: false };
+      return { token: config.access_token, wasRefreshed: false, isFresh: isFreshlyMintedToken(expiresAt, now) };
     }
 
     // Token is expired or about to expire - try to refresh
@@ -69,7 +138,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
         }, account.account_id, account);
       }
 
-      return { token: newTokens.access_token, wasRefreshed: true };
+      return { token: newTokens.access_token, wasRefreshed: true, isFresh: true };
     } catch (error: any) {
       console.error('[LinkedInAdapter] Token refresh failed:', error);
 
@@ -105,7 +174,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
 
     try {
       // Get valid token (refreshes if expired)
-      const { token } = await this.getValidToken(account, userId);
+      const { token, isFresh } = await this.getValidToken(account, userId);
 
       // Upload images if provided - track failures for transparency
       let imageUrns: string[] = [];
@@ -114,9 +183,11 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       if (mediaUrls && mediaUrls.length > 0) {
         for (const url of mediaUrls) {
           try {
-            const imageUrn = await linkedInService.uploadImageFromUrl(token, authorUrn, url);
+            const imageUrn = await retryIfFreshToken401(isFresh, () => linkedInService.uploadImageFromUrl(token, authorUrn, url));
             imageUrns.push(imageUrn);
           } catch (uploadError: any) {
+            // The same token will be refused for the post itself; do not publish it without the image.
+            if (uploadError instanceof FreshTokenRejectedError) throw uploadError;
             const errorMsg = uploadError?.message || 'Unknown upload error';
             console.error(`[LinkedInAdapter] Failed to upload image ${url}:`, errorMsg);
             failedImageUploads.push({ url, error: errorMsg });
@@ -139,11 +210,11 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       // carries a URL and no image builds a link preview first — OG discovery, possibly
       // a headless browser, a thumbnail upload — so the check above is not the last
       // moment for that shape. linkedInService re-runs it at the request itself.
-      const postUrn = await linkedInService.createPost(
+      const postUrn = await retryIfFreshToken401(isFresh, () => linkedInService.createPost(
         token, authorUrn, content, imageUrns.length > 0 ? imageUrns : undefined,
         assertStillAuthorized,
         ...(draft ? [{ draft: true }] : [])
-      );
+      ));
 
       // ENG-428: a draft is not a published post — do not cache it as one (the
       // posts cache is served back as lifecycleState PUBLISHED) and do not claim a
@@ -195,7 +266,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       if (error.response?.status === 429) {
         rethrowWithCode('LinkedIn rate limit exceeded. Please try again later.', 429);
       }
-      if (error.response?.status === 401) {
+      if (isLinkedIn401(error)) {
         rethrowWithCode('LinkedIn access token expired. Please reconnect your account.', 401);
       }
       throw error;
@@ -208,7 +279,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
 
     try {
       // Get valid token (refreshes if expired)
-      const { token } = await this.getValidToken(account, userId);
+      const { token, isFresh } = await this.getValidToken(account, userId);
 
       // ENG-827: the token refresh above is a network round-trip taken on a consent
       // decision read before it. This is the last moment before the comment is public.
@@ -219,7 +290,12 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       }
 
       // Create comment
-      const commentUrn = await linkedInService.createComment(token, postUrn, actorUrn, commentText, parentCommentUrn);
+      const commentUrn = await retryIfFreshToken401(
+        isFresh,
+        () => linkedInService.createComment(token, postUrn, actorUrn, commentText, parentCommentUrn),
+        undefined,
+        recheckConsentBeforeRetry(assertStillAuthorized),
+      );
 
       return {
         success: true,
@@ -228,6 +304,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
         postUrl: `https://www.linkedin.com/feed/update/${postUrn}` // Link to the original post
       };
     } catch (error: any) {
+      if (isPublishConsentWithdrawn(error)) return { success: false, message: error.message };
       // Rate limit handling
       if (error.response?.status === 429) {
         rethrowWithCode('LinkedIn rate limit exceeded. Please try again later.', 429);
@@ -263,7 +340,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     const authorUrn = account.account_id;
 
     try {
-      const { token } = await this.getValidToken(account, userId);
+      const { token, isFresh } = await this.getValidToken(account, userId);
 
       // ENG-827: the token refresh above is a network round-trip taken on a consent
       // decision read before it. This is the last moment before the repost is public.
@@ -273,7 +350,12 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
         return { success: false, message: withdrawn.error };
       }
 
-      const repostUrn = await linkedInService.createRepost(token, authorUrn, originalPostUrn, commentary);
+      const repostUrn = await retryIfFreshToken401(
+        isFresh,
+        () => linkedInService.createRepost(token, authorUrn, originalPostUrn, commentary),
+        undefined,
+        recheckConsentBeforeRetry(assertStillAuthorized),
+      );
 
       return {
         success: true,
@@ -282,6 +364,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
         postUrl: `https://www.linkedin.com/feed/update/${repostUrn}`
       };
     } catch (error: any) {
+      if (isPublishConsentWithdrawn(error)) return { success: false, message: error.message };
       if (error.response?.status === 429) {
         rethrowWithCode('LinkedIn rate limit exceeded. Please try again later.', 429);
       }
@@ -301,7 +384,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
 
     try {
       // Get valid token (refreshes if expired)
-      const { token } = await this.getValidToken(account, userId);
+      const { token, isFresh } = await this.getValidToken(account, userId);
 
       // Validate reaction type
       const validReactionTypes = ['LIKE', 'PRAISE', 'EMPATHY', 'INTEREST', 'APPRECIATION', 'ENTERTAINMENT'];
@@ -311,12 +394,12 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       }
 
       // Create reaction
-      const reactionUrn = await linkedInService.createReaction(
+      const reactionUrn = await retryIfFreshToken401(isFresh, () => linkedInService.createReaction(
         token,
         postUrn,
         actorUrn,
         upperReactionType as any
-      );
+      ));
 
       return {
         success: true,
@@ -329,7 +412,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       if (error.response?.status === 429) {
         rethrowWithCode('LinkedIn rate limit exceeded. Please try again later.', 429);
       }
-      if (error.response?.status === 401) {
+      if (isLinkedIn401(error)) {
         rethrowWithCode('LinkedIn access token expired. Please reconnect your account.', 401);
       }
       if (error.response?.status === 403) {

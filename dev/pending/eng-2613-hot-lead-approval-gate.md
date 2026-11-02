@@ -1,5 +1,0 @@
-## ENG-2613: human approval for hot lead number purchase and release (2026-10-22)
-
-Emma can no longer buy or release the hot-lead caller phone number on her own. `provision_hot_lead_call_number` and `release_hot_lead_call_number` first stop with an approval card that states the monthly rent; the number is bought or released only when Emma calls the tool again after the person in the chat clicked approve. The approval is for that exact action (area code or number, rent, saved settings, chat session), lasts 15 minutes, works once, and a "Let Emma decide" or support-session answer never counts. Starting a verification and turning calling on are not gated. Logic: `backend/src/services/voice/hotLeadCallApprovalGate.ts`; details in `backend/docs/integrations/hot-lead-call.md`.
-
-Data-plane note: each use writes one `hotlead:<card kind>` entry into the EXISTING chat-session map `consumedMetaWriteManifestDigests` (the same conditional write the Meta approval path uses). No new attribute, table or index.

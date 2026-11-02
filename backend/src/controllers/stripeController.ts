@@ -25,6 +25,7 @@ import {
   PAYG_OVERAGE_PURCHASE_TYPE,
 } from '../services/stripeService';
 import { invoiceLinePriceId, invoiceSubscriptionId } from '../utils/stripeInvoiceFields';
+import { emitStripeSignals, emitAccountSignal } from '../services/serverSignalEmitter';
 
 const CUSTOMER_FRONTEND_URL =
   process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
@@ -68,6 +69,11 @@ export async function createCheckoutSession(req: Request, res: Response) {
       successUrl || `${CUSTOMER_FRONTEND_URL}/success?session_id={CHECKOUT_SESSION_ID}`,
       cancelUrl || `${CUSTOMER_FRONTEND_URL}/pricing`
     );
+
+    // ENG-2684: fire-and-forget hireemma.ai session-list signal; never affects the response.
+    void userDb.getUserById(userId)
+      .then((user: any) => emitAccountSignal(user, 'checkout_started', { checkoutSessionId: session.id || '', priceId: String(priceId).slice(0, 120) }))
+      .catch(() => undefined);
 
     res.json({ url: session.url, sessionId: session.id });
   } catch (error: any) {
@@ -198,6 +204,10 @@ export async function handleWebhook(req: Request, res: Response) {
       && !isPaygOverageInvoiceEvent(event)) {
       void sendStripeEventToCrm(event);
     }
+
+    // ENG-2684: billing signals into the hireemma.ai session list. Fire-and-forget; emitStripeSignals
+    // never throws, so the webhook ack is unaffected by any emission failure.
+    if (!isPaygOverageInvoiceEvent(event)) void emitStripeSignals(event);
 
     res.json({ received: true });
   } catch (error: any) {

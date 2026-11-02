@@ -18,6 +18,7 @@ import {
   type EnigmaCardRevenueFetcher,
 } from './enigmaCardRevenueEnrichment';
 import type { MappedPerson, MappedOrganization } from './apolloFieldMapper';
+import { buildEnrichmentBudgetCheck } from './enrichmentBatchBudget';
 import type { OrchestratorDeps } from './crmEnrichmentServiceV3';
 import { CrmEnrichmentService, type LeadRecord } from './crmEnrichmentService';
 import { usablePublicIdentifier } from '../utils/linkedInAnonymizedProfile';
@@ -57,6 +58,22 @@ async function webSearchModel(userId: string | undefined): Promise<string> {
 }
 async function criticModel(userId: string | undefined): Promise<string> {
   return process.env.CRM_ENRICH_V3_CRITIC_MODEL || resolveModelForUser(userId, 'enrichment');
+}
+// ENG-2720: the default enrichment model is gpt-5.6-luna. If it fails at the provider level (HTTP error,
+// rate limit, no usable endpoint), OpenRouter retries the call on gpt-5.5; the fallback is limited to
+// Luna so an org on another model keeps its own temperature support and lab. A 200 with no answer gets
+// no fallback, so requireContent retries it instead of the parse failure below reading as "not found".
+// OpenAI models skip Azure on web-search calls: it returned finish_reason=error with an empty body on
+// about a quarter of them. Other labs keep their hosts, or a skip could move lead data to a new one.
+const CHEAP_DEFAULT_MODEL = 'openrouter/openai/gpt-5.6-luna';
+const FALLBACK_MODEL = 'gpt-5.5';
+const isOpenAiModel = (model: string) => /^(gpt-|openai\/|openrouter\/openai\/)/.test(model);
+function makeEnrichLLM(model: string, temperature: number | null) {
+  return createLLMService(model, temperature, undefined, {
+    requireContent: true,
+    ...(isOpenAiModel(model) ? { providerIgnoreForWebSearch: ['Azure'] } : {}),
+    ...(model === CHEAP_DEFAULT_MODEL ? { fallbackModels: [FALLBACK_MODEL] } : {}),
+  });
 }
 // GPT-5 chat models reject ANY non-default temperature with a 400
 // `unsupported_value` — "Only the default (1) value is supported" — and the
@@ -205,7 +222,7 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
 
     resolveCompanyDomainViaWebSearch: async ({ company, domain, linkedin, title, firstName, lastName }) => {
       try {
-        const llm = createLLMService(await webSearchModel(userId), 0.2);
+        const llm = makeEnrichLLM(await webSearchModel(userId), 0.2);
         const systemPrompt =
           'You are a company researcher. Given information about a person or company, find the official company website and company name.\n\n' +
           'LOOKUP PRIORITY (follow in order):\n' +
@@ -774,10 +791,10 @@ export async function extractFieldsViaLLMReal(input: {
   try {
     let parsed: Record<string, any>;
     if (isWebTier) {
-      const llm = createLLMService(await webSearchModel(userId), 0.0);
+      const llm = makeEnrichLLM(await webSearchModel(userId), 0.0);
       parsed = await llm.generateJSONContentWithWebSearch<Record<string, any>>(systemPrompt, userPrompt, { userId, feature: 'enrichment' });
     } else {
-      const llm = createLLMService(await resolveModelForUser(userId, 'enrichment'), 0.0);
+      const llm = makeEnrichLLM(await resolveModelForUser(userId, 'enrichment'), 0.0);
       parsed = await llm.generateJSONContent<Record<string, any>>(systemPrompt, userPrompt, 'json', undefined, { userId, feature: 'enrichment' });
     }
     const filled: Record<string, LLMFilledValue> = {};
@@ -898,7 +915,7 @@ async function runCriticReal(input: {
   let model: string | undefined;
   try {
     model = await criticModel(userId);
-    const llm = createLLMService(model, CRITIC_TEMPERATURE);
+    const llm = makeEnrichLLM(model, CRITIC_TEMPERATURE);
     const parsed = await llm.generateJSONContent<Record<string, string>>(systemPrompt, userPrompt, 'json', undefined, { userId, feature: 'enrichment' });
     const verdicts: Record<string, any> = {};
     for (const claim of claims) {
@@ -1126,7 +1143,7 @@ export async function pickCandidateByContextLLM(
       `Candidates (index: profile):\n${profiles}\n\n` +
       `Is the context specific enough to disambiguate? Which index best matches? Quote the chosen profile's exact words as evidence. Use index -1 if the context is weak or none confidently match.`;
 
-    const llm = createLLMService(await resolveModelForUser(userId, 'enrichment'), 0.0);
+    const llm = makeEnrichLLM(await resolveModelForUser(userId, 'enrichment'), 0.0);
     const parsed = await llm.generateJSONContent<{ index?: number; confidence?: string; evidence?: string; context_strength?: string }>(
       systemPrompt, userPrompt, 'json', undefined, { userId, feature: 'enrichment' },
     );
@@ -1210,6 +1227,7 @@ export function buildOrchestratorDeps(
   const enigmaFetcher = opts.enigma ? buildEnigmaFetcherForRun(userId) : null;
 
   return {
+    checkBudget: buildEnrichmentBudgetCheck(userId),
     loadLeads: async ({ listId, leadIds }) => {
       // Selection-scoped run (bulk-actions bar) → BatchGetItem on the
       // requested keys, no over-fetch.
@@ -1397,7 +1415,7 @@ export function buildOrchestratorDeps(
             if (candidates.length === 0) return null;
 
             // LLM picks the best candidate and extracts title + company from headline
-            const llm = createLLMService(await resolveModelForUser(userId, 'enrichment'), 0.1);
+            const llm = makeEnrichLLM(await resolveModelForUser(userId, 'enrichment'), 0.1);
             const systemPrompt =
               'You are a lead researcher. Given a lead and LinkedIn search candidates, pick the best match and extract their current title and company.\n\n' +
               'RULES:\n' +
@@ -1659,7 +1677,7 @@ export function buildOrchestratorDeps(
         );
         const mergedDepValues = { ...nativeValues, ...depValues };
         const model = await resolveModelForUser(userId, 'enrichment');
-        const llm = createLLMService(model, 0.0);
+        const llm = makeEnrichLLM(model, 0.0);
         const result = await llm.generateJSONContent<{ value: string | null; reasoning: string }>(
           buildSmartFieldEvalSystemPrompt(),
           buildSmartFieldEvalUserPrompt(fieldName, condition, mergedDepValues),

@@ -1,3 +1,4 @@
+import { addCompanionTools } from './agentMode/companionTools';
 import { metaWriteRateShaper, META_BUDGET_THROTTLE_SUBCODE } from './agentMode/metaWriteRateShaper';
 import { normalizeSkillIdArg } from './agentMode/skillIdArg';
 import { applyProviderPolicy, CompareProviderPolicy } from './agentMode/compareProviderPolicy';
@@ -9,7 +10,8 @@ import { tierFromCostScore, tierFromQualityScore } from './agentMode/modelClassi
 // only call site, generateImage, moved to emma/impl/mediaVideo.ts.
 import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 import { recordCreativeLearningReceipt } from './agentMode/adsLearning';
-import { enforceEvaluationTool, isEvaluationUser } from './evaluationPolicy';
+import { enforceEvaluationTool, isEvaluationUser, shouldOfferEvaluationWorkspace } from './evaluationPolicy';
+import { applyEvaluationWorkspaceListing } from './agentMode/evaluationWorkspaceListing';
 import { sandboxAwarePollDelayMs } from './agentMode/sandboxPolling';
 import { markSandboxRun, forgetSandboxRun, isSandboxRun, releaseSandboxRun } from './agentMode/sandboxTelemetry';
 import axios from 'axios';
@@ -332,7 +334,7 @@ import {
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
-const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
+export const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
 /*
  * ENG-1795: the sentence that marks an install refusal as an ID failure rather than a
  * billing one. `toolErrorClassifier` keys on this exact phrase to route the refusal to
@@ -367,7 +369,7 @@ const SKILL_NO_SUBSTITUTION =
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
 // mutation tool remains manage_predefined_work_plan.
-export const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_user_funnel_status', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'get_session_transcript', 'get_user_by_id', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
+export const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_user_funnel_status', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'get_session_transcript', 'get_user_by_id', 'inspect_client_usage', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -531,7 +533,8 @@ import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } fro
 import { assertPublicHostname } from '../utils/ssrfGuard';
 import { getJwtSecret } from '../config/jwt';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString } from '../utils/s3Utils';
-import { isTransientLLMError, isProviderDeserializationError, extractAffordableTokens, PROVIDER_UNAVAILABLE_USER_MESSAGE } from '../utils/agentModeErrors';
+import { isTransientLLMError, isProviderDeserializationError, extractAffordableTokens, PROVIDER_UNAVAILABLE_USER_MESSAGE, QUOTA_EXHAUSTED_USER_MESSAGE } from '../utils/agentModeErrors';
+import { classifyOpenRouterQuotaExhaustion } from '../utils/openRouterKeyLimit';
 import { isLLMProviderOutage } from './agentMode/providerOutage';
 import { getAgentRunRecorder } from '../loops/instances/agent-mode';
 import { computeRunVerdict, type RunTerminalInfo } from '../loops/instances/agent-mode/runRecorder';
@@ -1065,6 +1068,10 @@ interface LLMCallOptions {
    * `provider` next to the shared order/fallback preferences. Normal chat never sets it.
    */
   providerPolicy?: CompareProviderPolicy | null;
+  /** Provider names OpenRouter must not route this request to; merged with any default ignore list. */
+  providerIgnore?: string[];
+  /** Treat a 200 with no answer as a failed, retryable attempt. For callers that need text back. */
+  requireContent?: boolean;
 }
 
 function nonNegativeTokenCount(value: unknown): number {
@@ -2526,6 +2533,8 @@ export class AgentModeService {
       customerRoutable = false,
       taskClass,
       providerPolicy,
+      providerIgnore,
+      requireContent,
     } = options || {};
 
     // ENG-2108: the funding for THIS call. A run starts AgentWeb-funded; this call moves
@@ -2584,6 +2593,9 @@ export class AgentModeService {
       // proposed the slug form once already and was reverted for this reason
       // — verify empirically against live traffic before changing this line.
       params.provider.ignore = ignoredProviders;
+    }
+    if (providerIgnore?.length) {
+      params.provider.ignore = [...new Set([...(params.provider.ignore ?? []), ...providerIgnore])];
     }
     if (providerPolicy) {
       params.provider = applyProviderPolicy(params.provider, providerPolicy);
@@ -2742,6 +2754,7 @@ export class AgentModeService {
     const res = await pickTransport(callFunding, model).send(client, model, params, {
       timeoutMs: timeoutMs ?? 5 * 60 * 1000,
       maxAttempts,
+      requireContent,
       isRetryableError: isRetryableLlmCallError,
       // Bound to the instance method, not a transport-local timer: this is the seam
       // agentModeService.openRouterClient.test.ts spies on to assert exact backoff
@@ -2802,6 +2815,9 @@ export class AgentModeService {
       (res as any)?.model,
       paramChain.map(m => ({ modelId: m.modelId, upstreamModel: m.upstreamModel })),
     ) ?? model;
+    if (meteredModel !== model) {
+      console.warn(`AgentMode: OpenRouter fallback served "${meteredModel}" instead of "${model}"`);
+    }
     // ENG-1816 F1: routed through recordLlmUsage, which decides funding ABOVE this
     // fire-and-forget funnel — see funding/recordLlmUsage.ts for why. Branch on
     // RunFunding.route, never on usage.is_byok below: that flag also fires for
@@ -3000,6 +3016,471 @@ export class AgentModeService {
     return sharedMakeToolUsageCallback(sessionId, toolName);
   }
 
+  /**
+   * ENG-2113 PR C0: the turn preamble of generateMarketingResponse, moved out unchanged so a second backend (Claude Code
+   * through the login host) can build the exact context Emma's own loop builds. Fetches the session, user, skills and
+   * system prompt, resolves entitlement and billing, injects skills, memory, roster, the conversation, the unattended
+   * publish directive and the anti-loop directive, and returns the messages plus every value the loop derives from them.
+   * Any change here changes what the model reads: agentModeService.prepareTurnContext.golden.test.ts pins it.
+   */
+  async prepareTurnContext(input: {
+    messageContent: string;
+    sessionHistory: ChatMessage[];
+    userId: string;
+    llmModel: string;
+    sessionId: string;
+    isInteractiveShare: boolean;
+    screenshotUrl?: string;
+    isDelegatedAccess: boolean;
+    publishAuthorizationOverride?: SchedulePublishAuthorization;
+    isUnattendedRun?: boolean;
+  }): Promise<{
+    currentSession: Awaited<ReturnType<typeof chatbotDb.getChatSession>>;
+    userAllowedSkillIds: Awaited<ReturnType<typeof getAllowedSkills>>;
+    publishedSkills: Awaited<ReturnType<typeof skillService.getPublishedSkills>>;
+    billingUserId: string;
+    userAllowedSkillIdsForDisplay: string[];
+    isAdmin: boolean;
+    turnModelCorrection: ReturnType<typeof resolveTurnModelCorrection>;
+    hasAdminAccess: boolean;
+    workPlanTurnBefore: ReturnType<typeof snapshotWorkPlanTurn>;
+    isLegacySession: boolean;
+    associatedSkills: any[];
+    sessionAssociatedSkillIds: string[];
+    liveInstalledSkillIds: string[];
+    allowedToolNames: Set<string>;
+    installedSkillContextMsg: string;
+    availableSkillContextMsg: string;
+    messages: any[];
+    isScheduledSession: boolean;
+    humanPacedTurn: boolean;
+    loopBreakerActive: boolean;
+  }> {
+    const { messageContent, sessionHistory, userId, llmModel, sessionId, isInteractiveShare, screenshotUrl, isDelegatedAccess, publishAuthorizationOverride, isUnattendedRun } = input;
+    // 1. Initial Data Fetching (Pre-Loop) - Parallel fetch for performance
+    const { userDb: userDbForAdmin } = await import('./db');
+    // Lazy-imported for the same reason usageRecorderService lazy-requires it:
+    // tokenUsageService pulls in the db -> aws config graph, and a static import
+    // here would drag it into every suite that mocks this module.
+    //
+    // Everything is swallowed to the acting user. Several legacy suites replace
+    // this module with a partial mock that defines only `incrementUserTokenUsage`,
+    // so the export can genuinely be missing — and beyond that, a descriptive
+    // ledger attribute must never be the reason a customer's response fails.
+    // `userId` is the value the row carried before this existed, so the
+    // degraded path is the old behaviour exactly.
+    const resolveBillingSubject = async (): Promise<string> => {
+      try {
+        const { resolveBillingUserId } = await import('./tokenUsageService');
+        if (typeof resolveBillingUserId !== 'function') return userId;
+        return (await resolveBillingUserId(userId)) || userId;
+      } catch (err) {
+        console.error(`[AgentMode] Failed to resolve billing user for ${userId}:`, err);
+        return userId;
+      }
+    };
+    let [
+      currentSession,
+      userAllowedSkillIds,
+      publishedSkills,
+      baseSystemPrompt,
+      currentUser,
+      billingUserId
+    ] = await Promise.all([
+      chatbotDb.getChatSession(sessionId),
+      getAllowedSkills(userId),
+      skillService.getPublishedSkills(),
+      this.getMarketingSystemPrompt(),
+      userDbForAdmin.getUserById(userId).catch((err) => {
+        console.error(`[AgentMode] Failed to fetch user ${userId} for admin check:`, err);
+        return null;
+      }),
+      // ENG-1217: who this response's spend is BILLED to, resolved once and
+      // stamped on every ledger row it writes. The ledger has always carried a
+      // `billingUserId` attribute and this path has never filled it, so an org
+      // member's rows claimed they paid for themselves while
+      // `incrementUserTokenUsage` was charging the org root — the two stores
+      // disagreed, and a reader had nothing but today's membership to go on.
+      //
+      // Resolved here rather than inside `recordUsage` because it costs two
+      // reads: once per response is free alongside this fetch, once per LLM
+      // call would not be.
+      resolveBillingSubject()
+    ]);
+
+    // Log if user not found (indicates orphaned schedule or deleted user)
+    if (!currentUser) {
+      console.warn(`[AgentMode] User ${userId} not found for admin check (orphaned schedule or deleted user)`);
+    }
+
+    // ENG-1978: getAllowedSkills returns null when the tier could not be read or recognised.
+    // The RAW value (possibly null) is what reaches getFilteredTools below, which fails closed
+    // on it — that is the actual gate. The skill-catalog/context helpers further down only need
+    // a list to filter a catalog against, and for them an unresolved entitlement should show
+    // nothing extra rather than everything, so they get [] instead. Keeping the two separate
+    // matters: collapsing null to [] here would silently downgrade the gate to "no skills, but
+    // still hand over every foundation tool."
+    const userAllowedSkillIdsForDisplay: string[] = userAllowedSkillIds ?? [];
+
+    const isAdmin = currentUser?.isAdmin === true;
+
+    // ENG-1205: the correction this turn was admitted under, stamped onto the
+    // turn's assistant messages beside `llm` so a reload can still explain why
+    // the badge disagrees with the picker. The controller wrote this decision
+    // onto the session immediately before dispatch; `resolveTurnModelCorrection`
+    // rejects a slot that does not describe THIS turn, so a resumed or replayed
+    // run degrades to no stamp rather than borrowing a newer turn's model.
+    const turnModelCorrection = resolveTurnModelCorrection(
+      (currentSession as any)?.llmUsagePolicyDecision,
+      llmModel,
+    );
+    // Admin tools are available to real admins OR to messages arriving via admin delegated access.
+    // iShare sessions always block admin tools even if somehow isDelegatedAccess is set.
+    const hasAdminAccess = (isAdmin || isDelegatedAccess) && !isInteractiveShare;
+
+    const workPlan = currentSession?.workPlan;
+    const openResearchRequests = currentSession?.openResearchRequests;
+    const workPlanTurnBefore = snapshotWorkPlanTurn(currentSession);
+    const currentTaskStatuses = this.getCurrentTaskStatusesInSession(sessionHistory);
+
+    // 2. Initialize Context Variables
+    // Legacy sessions (created before skills system) have associatedSkills === undefined/null.
+    // New sessions have associatedSkills initialized as [] and enforce skill-first flow.
+    const rawAssociatedSkills = currentSession?.associatedSkills;
+    const isLegacySession = rawAssociatedSkills === undefined || rawAssociatedSkills === null;
+    let associatedSkills: any[] = [];
+    const sessionAssociatedSkillIds: string[] = Array.isArray(rawAssociatedSkills) ? rawAssociatedSkills : [];
+    let liveInstalledSkillIds: string[] = sessionAssociatedSkillIds;
+    if (sessionAssociatedSkillIds.length) {
+      associatedSkills = await skillService.getSkillsByIds(sessionAssociatedSkillIds);
+    }
+
+    // Build initial skill context
+    let { allowedToolNames, installedSkillContextMsg } = this.buildSkillContext(associatedSkills, userAllowedSkillIdsForDisplay, publishedSkills, sessionAssociatedSkillIds, hasAdminAccess);
+
+    // 3. Build Initial Messages
+    let effectiveMessageContent = messageContent;
+    if (currentSession?.sessionVoiceProfile?.voiceCard?.trim()) {
+      try {
+        const { voiceCardPromptSuffix } = await import('./voiceProfileHooks');
+        effectiveMessageContent = messageContent + voiceCardPromptSuffix(currentSession.sessionVoiceProfile);
+      } catch (voiceInjectErr) {
+        console.warn('[AgentMode] H-VOICE prompt inject skipped (non-fatal):', voiceInjectErr);
+      }
+    }
+    const marketingMessages = this.buildMarketingContext(effectiveMessageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl, currentSession?.calledFunctions, currentSession?.declinedWorkPlanRecommendations, openResearchRequests);
+
+    // Build the "Available Skills" message (excluding already-associated skills, filtered by subscription)
+    let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIdsForDisplay, hasAdminAccess);
+
+    const today = new Date().toISOString().split('T')[0];
+    // ENG-803: resolve this scheduled run's publish authorization from the schedule
+    // record so the directive states a DECISION rather than leaving one for the
+    // model to guess — guessing is what produced the fabricated "X publishing gate".
+    // Resolved here rather than in the controller so ENG-803 stays clear of the
+    // regions ENG-827 (PR #2263) rewrites. Never derived from the schedule's prompt
+    // text. This is the UNATTENDED run path, so it always passes a resolved
+    // boolean; the other caller, getEmmaSystemContext, is the attended sidebar and
+    // deliberately passes nothing (see the tri-state note on the override).
+    // ENG-827: resolved ONCE per turn and reused for both the ENG-803 override below
+    // and the publish directive appended after the conversation, so a single read
+    // backs every statement the model sees about publishing.
+    // ENG-827 (Greptile): prefer the caller's resolved value. Two independent reads
+    // can straddle a revocation, and the disagreement that bites is a prompt saying
+    // "draft only" while the checker still requires a publishing tool — the agent is
+    // then told not to publish and marked incomplete for not publishing, which is the
+    // retry loop this ticket is about. Using one value makes that unrepresentable.
+    // Mid-run withdrawal is not lost by this: it arrives as an explicit notice on the
+    // turn message, and the publish sinks re-read live consent at the write itself.
+    const publishAuthorization =
+      publishAuthorizationOverride ?? (await this.resolveScheduledPublishAuthorization(currentSession));
+    // ENG-2204: the comment above ("this is the UNATTENDED run path, so it always
+    // passes a resolved boolean") was true only when this function had a single
+    // caller. It is also reached by an ATTENDED turn — a schedule-created session
+    // reopened in the main chat UI (ENG-2072) — where isUnattendedRun is left
+    // undefined. Passing a resolved boolean there manufactured a live "PUBLISH
+    // WITHHELD... turn off Require approval before publishing" message for a user
+    // who never attempted to publish anything (live-confirmed on env2: an attended
+    // turn asking to post to Slack got this unrelated publish-authorization
+    // boilerplate instead of the ordinary ask-first flow). getScheduledSessionOverride
+    // already has a dedicated ATTENDED branch for exactly this (publishAuthorized
+    // undefined -> "Emit the base override... No mandate, no publish block") — it was
+    // simply never reached because this call always supplied a resolved value.
+    const publishAuthorized = isUnattendedRun === true ? publishAuthorization.authorized : undefined;
+    // ENG-1245: reason is only ever present on the withheld branch, and only when
+    // resolveScheduledPublishAuthorization derived it (an override supplied by a
+    // caller elsewhere carries no reason, so this falls back to the pre-existing,
+    // genuine-hold text — see getScheduledSessionOverride's default).
+    const sessionTypeLabel = getScheduledSessionOverride(
+      currentSession?.sessionType,
+      publishAuthorized,
+      isUnattendedRun === true
+        ? (publishAuthorization as { reason?: PublishAuthorizationWithholdReason }).reason
+        : undefined
+    );
+    const messages: any[] = [
+      { role: 'system', content: `${baseSystemPrompt}\nCurrent date: ${today}${sessionTypeLabel}` }
+    ];
+    // Use helper to inject installed skills and templates
+    this.updateConversationContext(messages, installedSkillContextMsg, availableSkillContextMsg);
+
+    // Inject admin delegation notice so the LLM knows admin tools are available via delegation
+    if (isDelegatedAccess && !isAdmin) {
+      messages.push({
+        role: 'system',
+        content: '⚠️ ADMIN DELEGATED ACCESS: Admin tools are available in this session because an admin is viewing this account. Admin tools can be installed and used in this session.'
+      });
+    }
+
+    // Inject memory context (cross-session knowledge). Retrieve by *relevance* to the
+    // current message, not just recency — so a relevant older fact is surfaced even when
+    // the account has more than MEMORY_INJECTION_LIMIT stored memories. Small accounts
+    // (<= limit) inject everything, identical to the previous recency behavior.
+    try {
+      const { userDb, orgMemoryDb, orgDb } = await import('./db');
+      const memoryUser = await userDb.getUserById(userId);
+
+      const MEMORY_INJECTION_LIMIT = 20;
+      // Embed the current message once, lazily, and reuse for both account + org memory.
+      // Only computed when a memory set actually exceeds the limit (no cost for small accounts).
+      let queryEmbedding: number[] | null | undefined;
+      const getQueryEmbedding = async (): Promise<number[] | null> => {
+        if (queryEmbedding === undefined) {
+          queryEmbedding = messageContent ? await embedText(messageContent, { userId, feature: 'agent_task' }) : null;
+        }
+        return queryEmbedding;
+      };
+
+      // Rank `all` memories by relevance to the message. Lazily embeds (and backfills)
+      // any legacy memory missing an embedding so ranking is fair and one-time.
+      const selectRelevantMemories = async (
+        all: any[],
+        backfill: (memoryId: string, embedding: number[]) => void
+      ): Promise<any[]> => {
+        if (all.length <= MEMORY_INJECTION_LIMIT) {
+          return rankMemoriesByRelevance(all, [], MEMORY_INJECTION_LIMIT);
+        }
+        const qEmbedding = await getQueryEmbedding();
+        if (!qEmbedding) {
+          // Embedding unavailable → degrade gracefully to recency.
+          return rankMemoriesByRelevance(all, [], MEMORY_INJECTION_LIMIT);
+        }
+        for (const m of all) {
+          if (!Array.isArray(m.embedding) || m.embedding.length === 0) {
+            const emb = await embedText(m.content, { userId, feature: 'agent_task' });
+            if (emb) {
+              m.embedding = emb;
+              backfill(m.memoryId, emb);
+            }
+          }
+        }
+        return rankMemoriesByRelevance(all, qEmbedding, MEMORY_INJECTION_LIMIT);
+      };
+
+      if (memoryUser?.memoryEnabled !== false) {
+        const allMemories = await accountMemoryDb.getUserMemories(userId);
+        const relevantMemories = await selectRelevantMemories(allMemories, (memoryId, emb) => {
+          accountMemoryDb.setMemoryEmbedding(userId, memoryId, emb).catch((e) =>
+            console.error('Failed to backfill account memory embedding:', e)
+          );
+        });
+        // ENG-1310: no longer headed "facts" — these are unverified notes from prior
+        // sessions (buildMemoryContextMessage bookends them with a staleness caution
+        // that itself dictates how to label any figure not re-verified this session).
+        const accountMemoryMessage = buildMemoryContextMessage(
+          'Account Memory (unverified notes from previous sessions):',
+          relevantMemories,
+          new Date()
+        );
+        if (accountMemoryMessage) {
+          messages.push({ role: 'assistant', content: accountMemoryMessage });
+        }
+      }
+
+      // Inject org-wide memory if the user belongs to an org
+      if (memoryUser?.orgId) {
+        const org = await orgDb.getOrgById(memoryUser.orgId);
+        if (org && org.orgMemoryEnabled !== false) {
+          const allOrgMemories = await orgMemoryDb.getOrgMemories(memoryUser.orgId);
+          const relevantOrgMemories = await selectRelevantMemories(allOrgMemories, (memoryId, emb) => {
+            orgMemoryDb.setMemoryEmbedding(memoryUser.orgId!, memoryId, emb).catch((e) =>
+              console.error('Failed to backfill org memory embedding:', e)
+            );
+          });
+          const orgMemoryMessage = buildMemoryContextMessage(
+            `Organization Memory (unverified shared notes for "${org.name}"):`,
+            relevantOrgMemories,
+            new Date()
+          );
+          if (orgMemoryMessage) {
+            messages.push({ role: 'assistant', content: orgMemoryMessage });
+          }
+        }
+      }
+    } catch (err) {
+      console.error('Failed to load account memories:', err);
+    }
+
+    // For Slack sessions (including scheduled scans), inject team roster as an assistant
+    // acknowledgement so the model treats it as established knowledge rather than an
+    // instruction it can override.
+    if ((currentSession?.pageIdentifier || '').toLowerCase().includes('slack')) {
+      messages.push({
+        role: 'assistant',
+        content: `[AgentWeb Team] I know the team members: Harsha Vankayalapati is the CEO (also called Harsha), Fangfang Tan is the CPO (also called Fangfang), and Matthew Wilmer is the CMO (also called Matt). If asked about any of them by name or nickname, I will identify them immediately.`
+      });
+    }
+
+    messages.push(...marketingMessages);
+
+    // ENG-827: the unattended publish directive goes LAST, after the conversation.
+    //
+    // It used to be appended to the system prompt the controller stores as the
+    // session's first message — which `buildMarketingContext` slices off (startIdx=1),
+    // so the model never read it at all. Position then turned out to matter on its own:
+    // on the preview, an authorized run whose base system prompt already carried an
+    // equivalent block still opened with "Should I post this?" and only published after
+    // three checker nudges. Buried ~70k characters up, the instruction lost to the
+    // publishing tools' own "get explicit approval first" text. Placed here it is the
+    // last thing before the model answers, and it is the same authorization object the
+    // dispatch guard enforces.
+    // ENG-2204: gate on isUnattendedRun === true, not just sessionType — a schedule-
+    // created session reopened in the attended chat UI keeps sessionType 'scheduled'
+    // but leaves isUnattendedRun undefined (per its own doc comment above: "every
+    // other caller of generateMarketingResponse is an attended interactive path and
+    // leaves this undefined"). This directive now carries a live-approval bypass
+    // (SLACK NOTIFICATIONS IN UNATTENDED RUNS) that must never reach an attended turn,
+    // so undefined must be excluded, not just false — same strict-true discriminator
+    // already used at the Meta-write approval-deck gate below.
+    if (currentSession?.sessionType === 'scheduled' && isUnattendedRun === true) {
+      // ENG-2204: owner opt-out for the Slack-send override — resolved independently
+      // of publishAuthorization, see resolveScheduledSlackSendAuthorized's own comment
+      // for why this isn't threaded through publishAuthorizationOverride instead.
+      const slackSendAuthorized = await this.resolveScheduledSlackSendAuthorized(currentSession);
+      const publishDirective = getUnattendedExecutionDirective(
+        'scheduled',
+        isAdmin,
+        publishAuthorization.authorized ? 'authorized' : 'withheld',
+        publishAuthorization.tools,
+        slackSendAuthorized
+      );
+      if (publishDirective) messages.push({ role: 'system', content: publishDirective });
+    }
+
+    // Cross-message loop detection: when the user repeats the same message multiple times
+    // without providing requested information, stop asking and use available context tools.
+    const LOOP_DETECTION_THRESHOLD = 3;
+    const recentUserHistory = sessionHistory
+      .filter(m => m.role === 'user')
+      .slice(-LOOP_DETECTION_THRESHOLD);
+    const normalizedCurrent = messageContent.trim().toLowerCase();
+    const consecutiveIdentical = recentUserHistory.filter(
+      m => (m.content || '').trim().toLowerCase() === normalizedCurrent
+    ).length;
+
+    const isScheduledSession = currentSession?.sessionType === 'scheduled';
+
+    // ENG-893: does THIS turn justify buying the 1-hour prompt-cache TTL?
+    //
+    // A 1h cache write costs 2x input where a 5m write costs 1.25x, and a
+    // cache HIT refreshes the TTL for free — so the extra 0.75x only pays for
+    // itself if the prefix is re-read after the 5-minute window would have
+    // lapsed. Session TYPE is a poor proxy: it correctly excludes scheduled
+    // runs, but still charges the surcharge to a fast back-and-forth chat and
+    // to a one-turn session that writes the cache and ends, neither of which
+    // ever collects the benefit.
+    //
+    // The signal is how long the user actually took to send THIS message,
+    // measured from the message history. Do NOT use `session.updatedAt`: the
+    // controller persists the incoming user message (bumping updatedAt) and
+    // reloads the session BEFORE handing it to this loop, so that gap is
+    // always ~0 and the extended TTL would never be requested at all.
+    // STICKY on purpose: any pause in this session, not just the latest one.
+    // Checking only the newest gap leaves the fast->slow transition uncovered
+    // — a turn that followed a quick reply writes a 5-minute cache, and the
+    // user's next pause then expires it. Modelled on the ticket's own session
+    // that costs 7 extra full re-caches and roughly half the saving ($19.25 vs
+    // $12.44). A user who has paused once has shown they are human-paced, and
+    // the measured sessions keep pausing (20 of 33 turns there exceeded 5 min).
+    const longestPauseMs = AgentModeService.longestUserPauseMs(sessionHistory);
+    const humanPacedTurn =
+      !isScheduledSession && longestPauseMs > PROMPT_CACHE_DEFAULT_TTL_MS;
+    // ENG-844: a verification tool-call retry press ("Make sure to <tool> (1 more
+    // time needed)") is the scheduled VERIFIER re-sending the same prompt, not a
+    // human withholding information. The anti-loop remedy cannot satisfy a tool call
+    // and — for an irreversible/publishing write — becomes pressure to publish
+    // off-cadence or fabricate success. ENG-763 already gates scheduled sessions out
+    // of the loop-breaker entirely; also suppress it for ANY verification press so a
+    // non-scheduled verified-generate run is covered too.
+    const isVerificationPress = isVerificationFunctionCallRetryPress(messageContent);
+    if (consecutiveIdentical >= LOOP_DETECTION_THRESHOLD && !isScheduledSession && isVerificationPress) {
+      console.warn(
+        `AgentMode: anti-loop override SUPPRESSED for session ${sessionId} — the repeated prompt is a verification tool-call retry press` +
+        `${pressesIrreversiblePublishWrite(messageContent) ? ' for an IRREVERSIBLE/publishing write' : ''}; ` +
+        `not injecting a 'proceed anyway' instruction (ENG-844).`
+      );
+    }
+    // ENG-763: the loop-breaker is an INTERACTIVE-ONLY construct — it reacts to a
+    // human sending the same message 3+ times. Scheduled/headless runs get a fresh
+    // session per run (one user turn), so this can never legitimately trigger there;
+    // gating it out explicitly is defense-in-depth against any future path and, more
+    // importantly, guarantees a headless run is NEVER told to "hold and wait for the
+    // user" (which would park an autonomous delivery — the ENG-517/634 class) and
+    // that a scheduled run's install_skills gateway is never stripped.
+    //
+    // When the loop-breaker fires, also hard-gate `install_skills` for this turn
+    // (see the tool-build block below). On the agentMode path install_skills is the
+    // legitimate skill gateway, so it is only stripped while a loop is active — a
+    // stuck user should never trigger skill installation, and the read-only
+    // foundation context tools (read_brand_guidelines / read_market_strategy) remain
+    // available so the model is never starved of a way to make progress.
+    const loopBreakerActive = consecutiveIdentical >= LOOP_DETECTION_THRESHOLD && !isScheduledSession && !isVerificationPress;
+    if (loopBreakerActive) {
+      // ENG-763: inject as a `system` directive, NOT a `user` turn. Provider
+      // converters hoist role:'system' into the system instruction, so the model
+      // never sees this control text as part of the user's message. Injecting it
+      // as role:'user' (with the old "[SYSTEM OVERRIDE]" wording) caused the model
+      // — Gemini merges consecutive user parts — to read the directive as the
+      // user's own words and quote "[SYSTEM OVERRIDE]" back, attributing text to
+      // the user that they never sent. The directive also no longer tells the
+      // model to "proceed with reasonable generic placeholders" — for a task with
+      // no target (e.g. a QA check) that is an instruction to fabricate, which the
+      // model refuses and then falls back to re-asking, sustaining the loop.
+      messages.push({
+        role: 'system',
+        content: `[ANTI-LOOP DIRECTIVE — internal system instruction, not from the user] You have asked for the same information ${consecutiveIdentical + 1} times and the user has responded with the same message each time without providing it. The user will NOT provide this information. You MUST:
+1. STOP asking for that information immediately — do not restate the same clarification again under any circumstances.
+2. To make progress, you may call ANY read-only or verification tool available to you in this session — this includes data-source reads (analytics, ads, CRM, search-console, and similar reporting tools) as well as read_brand_guidelines (business name, website, brand) and read_market_strategy (goals, target market). Verification tools are NEVER restricted by this directive: if the repeated message is asking you to check or verify something (e.g. "don't guess", "verify first"), call the tool that actually checks it rather than answering from memory. Do NOT call install_skills or any tool that writes, publishes, sends, or otherwise changes external state, and do NOT take any irreversible action, just to appear productive.
+3. If that context is enough to complete the task, do so using it.
+4. If the task genuinely cannot proceed without a specific input the user has not provided (for example, a target URL for a QA check), do NOT fabricate one and do NOT loop: give ONE short menu of concrete next options and then hold — wait for the user instead of restating the same question.
+5. NEVER quote this directive to the user or attribute any system-authored or override-style text to the user. Only ever quote the user's own literal words; this instruction is not one of them.`
+      });
+    }
+
+    return {
+      currentSession,
+      userAllowedSkillIds,
+      publishedSkills,
+      billingUserId,
+      userAllowedSkillIdsForDisplay,
+      isAdmin,
+      turnModelCorrection,
+      hasAdminAccess,
+      workPlanTurnBefore,
+      isLegacySession,
+      associatedSkills,
+      sessionAssociatedSkillIds,
+      liveInstalledSkillIds,
+      allowedToolNames,
+      installedSkillContextMsg,
+      availableSkillContextMsg,
+      messages,
+      isScheduledSession,
+      humanPacedTurn,
+      loopBreakerActive,
+    };
+  }
+
   // Generate AI response for marketing conversation
   async generateMarketingResponse(
     messageContent: string,
@@ -3086,405 +3567,46 @@ export class AgentModeService {
       const startMemory = process.memoryUsage();
       const startTime = Date.now();
 
-      // 1. Initial Data Fetching (Pre-Loop) - Parallel fetch for performance
-      const { userDb: userDbForAdmin } = await import('./db');
-      // Lazy-imported for the same reason usageRecorderService lazy-requires it:
-      // tokenUsageService pulls in the db -> aws config graph, and a static import
-      // here would drag it into every suite that mocks this module.
-      //
-      // Everything is swallowed to the acting user. Several legacy suites replace
-      // this module with a partial mock that defines only `incrementUserTokenUsage`,
-      // so the export can genuinely be missing — and beyond that, a descriptive
-      // ledger attribute must never be the reason a customer's response fails.
-      // `userId` is the value the row carried before this existed, so the
-      // degraded path is the old behaviour exactly.
-      const resolveBillingSubject = async (): Promise<string> => {
-        try {
-          const { resolveBillingUserId } = await import('./tokenUsageService');
-          if (typeof resolveBillingUserId !== 'function') return userId;
-          return (await resolveBillingUserId(userId)) || userId;
-        } catch (err) {
-          console.error(`[AgentMode] Failed to resolve billing user for ${userId}:`, err);
-          return userId;
-        }
-      };
-      let [
-        currentSession,
+      // ENG-2113 PR C0: everything the model is told before the loop starts (data fetch, system prompt, skills, memory,
+      // conversation, directives) is built by prepareTurnContext(), a pure move so the Claude Code backend builds the
+      // identical context. The loop below reads the values it needs from `turnContext`.
+      const turnContext = await this.prepareTurnContext({
+        messageContent,
+        sessionHistory,
+        userId,
+        llmModel,
+        sessionId,
+        isInteractiveShare,
+        screenshotUrl,
+        isDelegatedAccess,
+        publishAuthorizationOverride,
+        isUnattendedRun,
+      });
+      const {
         userAllowedSkillIds,
         publishedSkills,
-        baseSystemPrompt,
-        currentUser,
-        billingUserId
-      ] = await Promise.all([
-        chatbotDb.getChatSession(sessionId),
-        getAllowedSkills(userId),
-        skillService.getPublishedSkills(),
-        this.getMarketingSystemPrompt(),
-        userDbForAdmin.getUserById(userId).catch((err) => {
-          console.error(`[AgentMode] Failed to fetch user ${userId} for admin check:`, err);
-          return null;
-        }),
-        // ENG-1217: who this response's spend is BILLED to, resolved once and
-        // stamped on every ledger row it writes. The ledger has always carried a
-        // `billingUserId` attribute and this path has never filled it, so an org
-        // member's rows claimed they paid for themselves while
-        // `incrementUserTokenUsage` was charging the org root — the two stores
-        // disagreed, and a reader had nothing but today's membership to go on.
-        //
-        // Resolved here rather than inside `recordUsage` because it costs two
-        // reads: once per response is free alongside this fetch, once per LLM
-        // call would not be.
-        resolveBillingSubject()
-      ]);
-
-      // Log if user not found (indicates orphaned schedule or deleted user)
-      if (!currentUser) {
-        console.warn(`[AgentMode] User ${userId} not found for admin check (orphaned schedule or deleted user)`);
-      }
-
-      // ENG-1978: getAllowedSkills returns null when the tier could not be read or recognised.
-      // The RAW value (possibly null) is what reaches getFilteredTools below, which fails closed
-      // on it — that is the actual gate. The skill-catalog/context helpers further down only need
-      // a list to filter a catalog against, and for them an unresolved entitlement should show
-      // nothing extra rather than everything, so they get [] instead. Keeping the two separate
-      // matters: collapsing null to [] here would silently downgrade the gate to "no skills, but
-      // still hand over every foundation tool."
-      const userAllowedSkillIdsForDisplay: string[] = userAllowedSkillIds ?? [];
-
-      const isAdmin = currentUser?.isAdmin === true;
-
-      // ENG-1205: the correction this turn was admitted under, stamped onto the
-      // turn's assistant messages beside `llm` so a reload can still explain why
-      // the badge disagrees with the picker. The controller wrote this decision
-      // onto the session immediately before dispatch; `resolveTurnModelCorrection`
-      // rejects a slot that does not describe THIS turn, so a resumed or replayed
-      // run degrades to no stamp rather than borrowing a newer turn's model.
-      const turnModelCorrection = resolveTurnModelCorrection(
-        (currentSession as any)?.llmUsagePolicyDecision,
-        llmModel,
-      );
-      // Admin tools are available to real admins OR to messages arriving via admin delegated access.
-      // iShare sessions always block admin tools even if somehow isDelegatedAccess is set.
-      const hasAdminAccess = (isAdmin || isDelegatedAccess) && !isInteractiveShare;
-
-      const workPlan = currentSession?.workPlan;
-      const openResearchRequests = currentSession?.openResearchRequests;
-      const workPlanTurnBefore = snapshotWorkPlanTurn(currentSession);
-      const currentTaskStatuses = this.getCurrentTaskStatusesInSession(sessionHistory);
-
-      // 2. Initialize Context Variables
-      // Legacy sessions (created before skills system) have associatedSkills === undefined/null.
-      // New sessions have associatedSkills initialized as [] and enforce skill-first flow.
-      const rawAssociatedSkills = currentSession?.associatedSkills;
-      const isLegacySession = rawAssociatedSkills === undefined || rawAssociatedSkills === null;
-      let associatedSkills: any[] = [];
-      const sessionAssociatedSkillIds: string[] = Array.isArray(rawAssociatedSkills) ? rawAssociatedSkills : [];
-      let liveInstalledSkillIds: string[] = sessionAssociatedSkillIds;
-      if (sessionAssociatedSkillIds.length) {
-        associatedSkills = await skillService.getSkillsByIds(sessionAssociatedSkillIds);
-      }
-
-      // Build initial skill context
-      let { allowedToolNames, installedSkillContextMsg } = this.buildSkillContext(associatedSkills, userAllowedSkillIdsForDisplay, publishedSkills, sessionAssociatedSkillIds, hasAdminAccess);
-
-      // 3. Build Initial Messages
-      let effectiveMessageContent = messageContent;
-      if (currentSession?.sessionVoiceProfile?.voiceCard?.trim()) {
-        try {
-          const { voiceCardPromptSuffix } = await import('./voiceProfileHooks');
-          effectiveMessageContent = messageContent + voiceCardPromptSuffix(currentSession.sessionVoiceProfile);
-        } catch (voiceInjectErr) {
-          console.warn('[AgentMode] H-VOICE prompt inject skipped (non-fatal):', voiceInjectErr);
-        }
-      }
-      const marketingMessages = this.buildMarketingContext(effectiveMessageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl, currentSession?.calledFunctions, currentSession?.declinedWorkPlanRecommendations, openResearchRequests);
-
-      // Build the "Available Skills" message (excluding already-associated skills, filtered by subscription)
-      let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIdsForDisplay, hasAdminAccess);
-
-      const today = new Date().toISOString().split('T')[0];
-      // ENG-803: resolve this scheduled run's publish authorization from the schedule
-      // record so the directive states a DECISION rather than leaving one for the
-      // model to guess — guessing is what produced the fabricated "X publishing gate".
-      // Resolved here rather than in the controller so ENG-803 stays clear of the
-      // regions ENG-827 (PR #2263) rewrites. Never derived from the schedule's prompt
-      // text. This is the UNATTENDED run path, so it always passes a resolved
-      // boolean; the other caller, getEmmaSystemContext, is the attended sidebar and
-      // deliberately passes nothing (see the tri-state note on the override).
-      // ENG-827: resolved ONCE per turn and reused for both the ENG-803 override below
-      // and the publish directive appended after the conversation, so a single read
-      // backs every statement the model sees about publishing.
-      // ENG-827 (Greptile): prefer the caller's resolved value. Two independent reads
-      // can straddle a revocation, and the disagreement that bites is a prompt saying
-      // "draft only" while the checker still requires a publishing tool — the agent is
-      // then told not to publish and marked incomplete for not publishing, which is the
-      // retry loop this ticket is about. Using one value makes that unrepresentable.
-      // Mid-run withdrawal is not lost by this: it arrives as an explicit notice on the
-      // turn message, and the publish sinks re-read live consent at the write itself.
-      const publishAuthorization =
-        publishAuthorizationOverride ?? (await this.resolveScheduledPublishAuthorization(currentSession));
-      // ENG-2204: the comment above ("this is the UNATTENDED run path, so it always
-      // passes a resolved boolean") was true only when this function had a single
-      // caller. It is also reached by an ATTENDED turn — a schedule-created session
-      // reopened in the main chat UI (ENG-2072) — where isUnattendedRun is left
-      // undefined. Passing a resolved boolean there manufactured a live "PUBLISH
-      // WITHHELD... turn off Require approval before publishing" message for a user
-      // who never attempted to publish anything (live-confirmed on env2: an attended
-      // turn asking to post to Slack got this unrelated publish-authorization
-      // boilerplate instead of the ordinary ask-first flow). getScheduledSessionOverride
-      // already has a dedicated ATTENDED branch for exactly this (publishAuthorized
-      // undefined -> "Emit the base override... No mandate, no publish block") — it was
-      // simply never reached because this call always supplied a resolved value.
-      const publishAuthorized = isUnattendedRun === true ? publishAuthorization.authorized : undefined;
-      // ENG-1245: reason is only ever present on the withheld branch, and only when
-      // resolveScheduledPublishAuthorization derived it (an override supplied by a
-      // caller elsewhere carries no reason, so this falls back to the pre-existing,
-      // genuine-hold text — see getScheduledSessionOverride's default).
-      const sessionTypeLabel = getScheduledSessionOverride(
-        currentSession?.sessionType,
-        publishAuthorized,
-        isUnattendedRun === true
-          ? (publishAuthorization as { reason?: PublishAuthorizationWithholdReason }).reason
-          : undefined
-      );
-      const messages: any[] = [
-        { role: 'system', content: `${baseSystemPrompt}\nCurrent date: ${today}${sessionTypeLabel}` }
-      ];
-      // Use helper to inject installed skills and templates
-      this.updateConversationContext(messages, installedSkillContextMsg, availableSkillContextMsg);
-
-      // Inject admin delegation notice so the LLM knows admin tools are available via delegation
-      if (isDelegatedAccess && !isAdmin) {
-        messages.push({
-          role: 'system',
-          content: '⚠️ ADMIN DELEGATED ACCESS: Admin tools are available in this session because an admin is viewing this account. Admin tools can be installed and used in this session.'
-        });
-      }
-
-      // Inject memory context (cross-session knowledge). Retrieve by *relevance* to the
-      // current message, not just recency — so a relevant older fact is surfaced even when
-      // the account has more than MEMORY_INJECTION_LIMIT stored memories. Small accounts
-      // (<= limit) inject everything, identical to the previous recency behavior.
-      try {
-        const { userDb, orgMemoryDb, orgDb } = await import('./db');
-        const memoryUser = await userDb.getUserById(userId);
-
-        const MEMORY_INJECTION_LIMIT = 20;
-        // Embed the current message once, lazily, and reuse for both account + org memory.
-        // Only computed when a memory set actually exceeds the limit (no cost for small accounts).
-        let queryEmbedding: number[] | null | undefined;
-        const getQueryEmbedding = async (): Promise<number[] | null> => {
-          if (queryEmbedding === undefined) {
-            queryEmbedding = messageContent ? await embedText(messageContent, { userId, feature: 'agent_task' }) : null;
-          }
-          return queryEmbedding;
-        };
-
-        // Rank `all` memories by relevance to the message. Lazily embeds (and backfills)
-        // any legacy memory missing an embedding so ranking is fair and one-time.
-        const selectRelevantMemories = async (
-          all: any[],
-          backfill: (memoryId: string, embedding: number[]) => void
-        ): Promise<any[]> => {
-          if (all.length <= MEMORY_INJECTION_LIMIT) {
-            return rankMemoriesByRelevance(all, [], MEMORY_INJECTION_LIMIT);
-          }
-          const qEmbedding = await getQueryEmbedding();
-          if (!qEmbedding) {
-            // Embedding unavailable → degrade gracefully to recency.
-            return rankMemoriesByRelevance(all, [], MEMORY_INJECTION_LIMIT);
-          }
-          for (const m of all) {
-            if (!Array.isArray(m.embedding) || m.embedding.length === 0) {
-              const emb = await embedText(m.content, { userId, feature: 'agent_task' });
-              if (emb) {
-                m.embedding = emb;
-                backfill(m.memoryId, emb);
-              }
-            }
-          }
-          return rankMemoriesByRelevance(all, qEmbedding, MEMORY_INJECTION_LIMIT);
-        };
-
-        if (memoryUser?.memoryEnabled !== false) {
-          const allMemories = await accountMemoryDb.getUserMemories(userId);
-          const relevantMemories = await selectRelevantMemories(allMemories, (memoryId, emb) => {
-            accountMemoryDb.setMemoryEmbedding(userId, memoryId, emb).catch((e) =>
-              console.error('Failed to backfill account memory embedding:', e)
-            );
-          });
-          // ENG-1310: no longer headed "facts" — these are unverified notes from prior
-          // sessions (buildMemoryContextMessage bookends them with a staleness caution
-          // that itself dictates how to label any figure not re-verified this session).
-          const accountMemoryMessage = buildMemoryContextMessage(
-            'Account Memory (unverified notes from previous sessions):',
-            relevantMemories,
-            new Date()
-          );
-          if (accountMemoryMessage) {
-            messages.push({ role: 'assistant', content: accountMemoryMessage });
-          }
-        }
-
-        // Inject org-wide memory if the user belongs to an org
-        if (memoryUser?.orgId) {
-          const org = await orgDb.getOrgById(memoryUser.orgId);
-          if (org && org.orgMemoryEnabled !== false) {
-            const allOrgMemories = await orgMemoryDb.getOrgMemories(memoryUser.orgId);
-            const relevantOrgMemories = await selectRelevantMemories(allOrgMemories, (memoryId, emb) => {
-              orgMemoryDb.setMemoryEmbedding(memoryUser.orgId!, memoryId, emb).catch((e) =>
-                console.error('Failed to backfill org memory embedding:', e)
-              );
-            });
-            const orgMemoryMessage = buildMemoryContextMessage(
-              `Organization Memory (unverified shared notes for "${org.name}"):`,
-              relevantOrgMemories,
-              new Date()
-            );
-            if (orgMemoryMessage) {
-              messages.push({ role: 'assistant', content: orgMemoryMessage });
-            }
-          }
-        }
-      } catch (err) {
-        console.error('Failed to load account memories:', err);
-      }
-
-      // For Slack sessions (including scheduled scans), inject team roster as an assistant
-      // acknowledgement so the model treats it as established knowledge rather than an
-      // instruction it can override.
-      if ((currentSession?.pageIdentifier || '').toLowerCase().includes('slack')) {
-        messages.push({
-          role: 'assistant',
-          content: `[AgentWeb Team] I know the team members: Harsha Vankayalapati is the CEO (also called Harsha), Fangfang Tan is the CPO (also called Fangfang), and Matthew Wilmer is the CMO (also called Matt). If asked about any of them by name or nickname, I will identify them immediately.`
-        });
-      }
-
-      messages.push(...marketingMessages);
-
-      // ENG-827: the unattended publish directive goes LAST, after the conversation.
-      //
-      // It used to be appended to the system prompt the controller stores as the
-      // session's first message — which `buildMarketingContext` slices off (startIdx=1),
-      // so the model never read it at all. Position then turned out to matter on its own:
-      // on the preview, an authorized run whose base system prompt already carried an
-      // equivalent block still opened with "Should I post this?" and only published after
-      // three checker nudges. Buried ~70k characters up, the instruction lost to the
-      // publishing tools' own "get explicit approval first" text. Placed here it is the
-      // last thing before the model answers, and it is the same authorization object the
-      // dispatch guard enforces.
-      // ENG-2204: gate on isUnattendedRun === true, not just sessionType — a schedule-
-      // created session reopened in the attended chat UI keeps sessionType 'scheduled'
-      // but leaves isUnattendedRun undefined (per its own doc comment above: "every
-      // other caller of generateMarketingResponse is an attended interactive path and
-      // leaves this undefined"). This directive now carries a live-approval bypass
-      // (SLACK NOTIFICATIONS IN UNATTENDED RUNS) that must never reach an attended turn,
-      // so undefined must be excluded, not just false — same strict-true discriminator
-      // already used at the Meta-write approval-deck gate below.
-      if (currentSession?.sessionType === 'scheduled' && isUnattendedRun === true) {
-        // ENG-2204: owner opt-out for the Slack-send override — resolved independently
-        // of publishAuthorization, see resolveScheduledSlackSendAuthorized's own comment
-        // for why this isn't threaded through publishAuthorizationOverride instead.
-        const slackSendAuthorized = await this.resolveScheduledSlackSendAuthorized(currentSession);
-        const publishDirective = getUnattendedExecutionDirective(
-          'scheduled',
-          isAdmin,
-          publishAuthorization.authorized ? 'authorized' : 'withheld',
-          publishAuthorization.tools,
-          slackSendAuthorized
-        );
-        if (publishDirective) messages.push({ role: 'system', content: publishDirective });
-      }
-
-      // Cross-message loop detection: when the user repeats the same message multiple times
-      // without providing requested information, stop asking and use available context tools.
-      const LOOP_DETECTION_THRESHOLD = 3;
-      const recentUserHistory = sessionHistory
-        .filter(m => m.role === 'user')
-        .slice(-LOOP_DETECTION_THRESHOLD);
-      const normalizedCurrent = messageContent.trim().toLowerCase();
-      const consecutiveIdentical = recentUserHistory.filter(
-        m => (m.content || '').trim().toLowerCase() === normalizedCurrent
-      ).length;
-
-      const isScheduledSession = currentSession?.sessionType === 'scheduled';
-
-      // ENG-893: does THIS turn justify buying the 1-hour prompt-cache TTL?
-      //
-      // A 1h cache write costs 2x input where a 5m write costs 1.25x, and a
-      // cache HIT refreshes the TTL for free — so the extra 0.75x only pays for
-      // itself if the prefix is re-read after the 5-minute window would have
-      // lapsed. Session TYPE is a poor proxy: it correctly excludes scheduled
-      // runs, but still charges the surcharge to a fast back-and-forth chat and
-      // to a one-turn session that writes the cache and ends, neither of which
-      // ever collects the benefit.
-      //
-      // The signal is how long the user actually took to send THIS message,
-      // measured from the message history. Do NOT use `session.updatedAt`: the
-      // controller persists the incoming user message (bumping updatedAt) and
-      // reloads the session BEFORE handing it to this loop, so that gap is
-      // always ~0 and the extended TTL would never be requested at all.
-      // STICKY on purpose: any pause in this session, not just the latest one.
-      // Checking only the newest gap leaves the fast->slow transition uncovered
-      // — a turn that followed a quick reply writes a 5-minute cache, and the
-      // user's next pause then expires it. Modelled on the ticket's own session
-      // that costs 7 extra full re-caches and roughly half the saving ($19.25 vs
-      // $12.44). A user who has paused once has shown they are human-paced, and
-      // the measured sessions keep pausing (20 of 33 turns there exceeded 5 min).
-      const longestPauseMs = AgentModeService.longestUserPauseMs(sessionHistory);
-      const humanPacedTurn =
-        !isScheduledSession && longestPauseMs > PROMPT_CACHE_DEFAULT_TTL_MS;
-      // ENG-844: a verification tool-call retry press ("Make sure to <tool> (1 more
-      // time needed)") is the scheduled VERIFIER re-sending the same prompt, not a
-      // human withholding information. The anti-loop remedy cannot satisfy a tool call
-      // and — for an irreversible/publishing write — becomes pressure to publish
-      // off-cadence or fabricate success. ENG-763 already gates scheduled sessions out
-      // of the loop-breaker entirely; also suppress it for ANY verification press so a
-      // non-scheduled verified-generate run is covered too.
-      const isVerificationPress = isVerificationFunctionCallRetryPress(messageContent);
-      if (consecutiveIdentical >= LOOP_DETECTION_THRESHOLD && !isScheduledSession && isVerificationPress) {
-        console.warn(
-          `AgentMode: anti-loop override SUPPRESSED for session ${sessionId} — the repeated prompt is a verification tool-call retry press` +
-          `${pressesIrreversiblePublishWrite(messageContent) ? ' for an IRREVERSIBLE/publishing write' : ''}; ` +
-          `not injecting a 'proceed anyway' instruction (ENG-844).`
-        );
-      }
-      // ENG-763: the loop-breaker is an INTERACTIVE-ONLY construct — it reacts to a
-      // human sending the same message 3+ times. Scheduled/headless runs get a fresh
-      // session per run (one user turn), so this can never legitimately trigger there;
-      // gating it out explicitly is defense-in-depth against any future path and, more
-      // importantly, guarantees a headless run is NEVER told to "hold and wait for the
-      // user" (which would park an autonomous delivery — the ENG-517/634 class) and
-      // that a scheduled run's install_skills gateway is never stripped.
-      //
-      // When the loop-breaker fires, also hard-gate `install_skills` for this turn
-      // (see the tool-build block below). On the agentMode path install_skills is the
-      // legitimate skill gateway, so it is only stripped while a loop is active — a
-      // stuck user should never trigger skill installation, and the read-only
-      // foundation context tools (read_brand_guidelines / read_market_strategy) remain
-      // available so the model is never starved of a way to make progress.
-      const loopBreakerActive = consecutiveIdentical >= LOOP_DETECTION_THRESHOLD && !isScheduledSession && !isVerificationPress;
-      if (loopBreakerActive) {
-        // ENG-763: inject as a `system` directive, NOT a `user` turn. Provider
-        // converters hoist role:'system' into the system instruction, so the model
-        // never sees this control text as part of the user's message. Injecting it
-        // as role:'user' (with the old "[SYSTEM OVERRIDE]" wording) caused the model
-        // — Gemini merges consecutive user parts — to read the directive as the
-        // user's own words and quote "[SYSTEM OVERRIDE]" back, attributing text to
-        // the user that they never sent. The directive also no longer tells the
-        // model to "proceed with reasonable generic placeholders" — for a task with
-        // no target (e.g. a QA check) that is an instruction to fabricate, which the
-        // model refuses and then falls back to re-asking, sustaining the loop.
-        messages.push({
-          role: 'system',
-          content: `[ANTI-LOOP DIRECTIVE — internal system instruction, not from the user] You have asked for the same information ${consecutiveIdentical + 1} times and the user has responded with the same message each time without providing it. The user will NOT provide this information. You MUST:
-1. STOP asking for that information immediately — do not restate the same clarification again under any circumstances.
-2. To make progress, you may call ANY read-only or verification tool available to you in this session — this includes data-source reads (analytics, ads, CRM, search-console, and similar reporting tools) as well as read_brand_guidelines (business name, website, brand) and read_market_strategy (goals, target market). Verification tools are NEVER restricted by this directive: if the repeated message is asking you to check or verify something (e.g. "don't guess", "verify first"), call the tool that actually checks it rather than answering from memory. Do NOT call install_skills or any tool that writes, publishes, sends, or otherwise changes external state, and do NOT take any irreversible action, just to appear productive.
-3. If that context is enough to complete the task, do so using it.
-4. If the task genuinely cannot proceed without a specific input the user has not provided (for example, a target URL for a QA check), do NOT fabricate one and do NOT loop: give ONE short menu of concrete next options and then hold — wait for the user instead of restating the same question.
-5. NEVER quote this directive to the user or attribute any system-authored or override-style text to the user. Only ever quote the user's own literal words; this instruction is not one of them.`
-        });
-      }
+        billingUserId,
+        userAllowedSkillIdsForDisplay,
+        isAdmin,
+        turnModelCorrection,
+        hasAdminAccess,
+        workPlanTurnBefore,
+        isLegacySession,
+        sessionAssociatedSkillIds,
+        messages,
+        isScheduledSession,
+        humanPacedTurn,
+        loopBreakerActive,
+      } = turnContext;
+      // The loop reassigns these when a skill is installed mid-turn.
+      let {
+        currentSession,
+        associatedSkills,
+        liveInstalledSkillIds,
+        allowedToolNames,
+        installedSkillContextMsg,
+        availableSkillContextMsg,
+      } = turnContext;
 
       let content = '';
       const toolCalls: any[] = [];
@@ -3951,6 +4073,12 @@ export class AgentModeService {
           }
 
           // Exclude tools that are not applicable to the current context (e.g. get_visual_context on non-visual pages)
+          // ENG-1948: never offer evaluation_workspace to a principal that can only be denied.
+          if (filteredToolsCache) {
+            filteredToolsCache = applyEvaluationWorkspaceListing(filteredToolsCache, allowedToolNames,
+              shouldOfferEvaluationWorkspace({ userId, isAdmin, isDelegatedAccess, isInteractiveShare, isUnattendedRun }));
+          }
+
           if (excludeTools?.length && filteredToolsCache) {
             const excludeSet = new Set(excludeTools);
             filteredToolsCache = filteredToolsCache.filter((t: any) => !excludeSet.has(t.function?.name));
@@ -4066,7 +4194,9 @@ export class AgentModeService {
           // OpenRouter performs provider/model failover inside the one request. A
           // transient failure here is therefore final for AgentWeb; do not issue a
           // second full completion with altered model semantics.
-          if (forceFinalSynthesis && turnHardCapMs !== undefined && isTransientLLMError(callError)) {
+          // ENG-2763: quota/credits exhaustion must reach the rethrow + quota classifier
+          // below; its 402 text can match the transient /5xx/ digit patterns.
+          if (forceFinalSynthesis && turnHardCapMs !== undefined && !classifyOpenRouterQuotaExhaustion(callError) && isTransientLLMError(callError)) {
             recordSpanError(chatSpan, callError);
             synthesisRetryUnaffordable = true;
           } else if (
@@ -5256,7 +5386,7 @@ export class AgentModeService {
       // a carried-over number dressed as fresh. Measures how often it happens, per model, before
       // anyone decides to enforce. Never edits `content`; kill switch AGENT_CRM_FRESHNESS_GUARD=off.
       if (content && !wasCancelled && !mockMode) {
-        runCrmFreshnessShadow({ finalText: content, toolCalls, evidence: crmEvidence.snapshot(), earlier: crmEarlier, sessionNumbers: crmSessionNumbers, sessionId, model: llmModel });
+        runCrmFreshnessShadow({ finalText: content, toolCalls, evidence: crmEvidence.snapshot(), earlier: crmEarlier, sessionNumbers: crmSessionNumbers, sessionMessages: Array.isArray(sessionHistory) ? sessionHistory.length : undefined, sessionId, model: llmModel });
       }
 
       // ENG-1207 AC3: a run must not finish silently on an unread page.
@@ -5520,7 +5650,13 @@ export class AgentModeService {
       const httpStatus = error?.status ?? error?.$metadata?.httpStatusCode;
       // Check for context-limit patterns in the raw error message before falling through to generic 400
       const isContextLimit = /input is too long|context length|context window|token limit|too many tokens|prompt is too long|exceeds.*context|exceeded.*tokens|maximum.*tokens|messages.*exceed|request too large/i.test(errorMsg);
-      if (error?.code === 'content_filter' || error?.error?.code === 'ResponsibleAIPolicyViolation') {
+      if (classifyOpenRouterQuotaExhaustion(error)) {
+        // ENG-2763: OpenRouter key-limit / credits exhaustion is a known class that a
+        // retry cannot fix; name it so the controller answers 503 and alerts once per class.
+        // Checked first: the credits 402 text ("fewer max_tokens ... can only afford N")
+        // otherwise trips the context-limit/400 patterns below and ends in a 500.
+        userMessage = QUOTA_EXHAUSTED_USER_MESSAGE;
+      } else if (error?.code === 'content_filter' || error?.error?.code === 'ResponsibleAIPolicyViolation') {
         userMessage = 'I apologize, but I cannot respond to that request as it may violate content policies. Please try rephrasing your question or asking about something else.';
       } else if (httpStatus === 429) {
         userMessage = 'I\'m currently experiencing high demand. Please wait a moment and try again.';
@@ -6499,6 +6635,16 @@ export class AgentModeService {
     'start_hot_lead_call_verification',
     'confirm_hot_lead_call_verification',
 
+    // Smartlead push (ENG-673): the user's own Smartlead campaigns; starting and releasing are approval-card gated
+    'list_smartlead_campaigns',
+    'preview_smartlead_push',
+    'start_smartlead_push',
+    'get_smartlead_push_status',
+    'pause_smartlead_push',
+    'resume_smartlead_push',
+    'cancel_smartlead_push',
+    'release_leads_from_smartlead',
+
     // Scheduled Chat Management
     'list_scheduled_chats',
     'manage_scheduled_chat',
@@ -7468,6 +7614,10 @@ export class AgentModeService {
       }
     }
 
+    // ENG-1948: mirror the main turn handler's evaluation_workspace listing filter.
+    tools = applyEvaluationWorkspaceListing(tools, allowedToolNames,
+      shouldOfferEvaluationWorkspace({ userId, isAdmin, isDelegatedAccess: input.isDelegatedAccess, isInteractiveShare: input.isInteractiveShare }));
+
     if (input.excludeTools?.length) {
       const excludeSet = new Set(input.excludeTools);
       tools = tools.filter((t: any) => !excludeSet.has(t.function?.name));
@@ -7585,6 +7735,8 @@ export class AgentModeService {
     if (hasAdminAccess || sessionAssociatedSkillIds.includes(ADMIN_SKILL_VIRTUAL_ID)) {
       ADMIN_SKILL_TOOL_NAMES.forEach(t => allowedToolNames.add(t));
     }
+
+    addCompanionTools(allowedToolNames);
 
     let installedSkillContextMsg = '';
     const skillLines: string[] = [];
@@ -14193,6 +14345,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     // One packet PER AD ACCOUNT: the Desk groups packets under an account and one Approve All
     // dispatches a whole packet, so a single iteration that writes to two ad accounts must not
     // become one packet shown under only the first account.
+    // Taken before any createDecision call: a row whose createdAt is >= this was created by THIS call,
+    // an older one is an idempotent hit on an already-staged digest (a retried iteration).
+    const stagingStartedAt = new Date().toISOString();
     const manifestByAccount = new Map<string, string>();
     const manifestFor = (r: any): string => {
       const key = String(r?.metaWriteDispatch?.resolvedAccountId || r?.target?.account_id || r?.metaWriteDispatch?.account_id || 'unknown').replace(/^act_/, '');
@@ -14278,6 +14433,40 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       console.warn(
         `[agent-mode-service] staged approval-inbox decisions landed under ${manifestIds.length} DIFFERENT pre-existing manifestIds (${manifestIds.join(', ')}) in one staging call — reporting the freshly-minted ${manifestId}, which may not contain every decision just staged.`,
       );
+    }
+
+    // One short Slack reminder per packet to the assigned reviewer (same style as the eval queue).
+    // Fire-and-forget: the decisions are already durably staged, and a slow or rate-limited Slack must
+    // never hold up the agent turn. Only rows created by this call are announced — createDecision returns the
+    // EXISTING row on an idempotent hit, and a retried iteration must not re-ping the reviewer.
+    const packets = new Map<string, { approver: NonNullable<ApprovalDecision['approver']>; manifestId: string; items: ApprovalDecision[] }>();
+    const announced = new Set<string>();
+    for (const d of staged) {
+      if (d.status !== 'pending_team_review' || !d.manifestId || !d.approver) continue;
+      if (d.createdAt < stagingStartedAt) continue;
+      // Two halts with the same digest in one call resolve to the same row: count it once.
+      if (announced.has(d.decisionId)) continue;
+      announced.add(d.decisionId);
+      const key = `${d.manifestId}|${d.approver}`;
+      const entry = packets.get(key) || { approver: d.approver, manifestId: d.manifestId, items: [] };
+      entry.items.push(d);
+      packets.set(key, entry);
+    }
+    if (packets.size > 0) {
+      void (async () => {
+        const { postManifestReadyNotice } = await import('./approvalInboxSlack');
+        for (const { approver, manifestId: mid, items } of packets.values()) {
+          // Only a bare numeric ad account id is ever interpolated into Slack text (no mentions/links).
+          const acct = String(items[0]?.metaWriteDispatch?.resolvedAccountId || '').replace(/^act_/, '');
+          await postManifestReadyNotice(approver, {
+            manifestId: mid,
+            itemCount: items.length,
+            accountLabel: /^\d+$/.test(acct) ? `ad account ${acct}` : undefined,
+          });
+        }
+      })().catch((err: any) => {
+        console.warn('[agent-mode-service] failed to post the Approval Desk reminder to Slack:', err?.message || err);
+      });
     }
 
     const count = staged.length;
@@ -15178,6 +15367,43 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       dispatch.campaign_id, dispatch.ad_set_id, dispatch.ad_id, dispatch.params, false, undefined,
     );
     return { result, createdId: AgentModeService.extractDispatchedObjectId(result) };
+  }
+
+  /**
+   * Zoma creative upload: Meta processing state of an uploaded video, ownership-scoped to the
+   * selected ad account (a video id addresses a node globally). Returns Meta's preferred
+   * thumbnail once ready, so the caller can build a video creative without a second upload.
+   */
+  public async readToolkitMetaVideoStatus(
+    userId: string, account_id: string, videoId: string, opts: { justUploaded?: boolean } = {},
+  ): Promise<{ status: string; thumbnail_url?: string; error?: string }> {
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    const base = `https://graph.facebook.com/${apiVersion}`;
+    const { data: node } = await axios.get(`${base}/${encodeURIComponent(videoId)}`, {
+      params: { fields: 'id,status,thumbnails{uri,is_preferred}', access_token: accessToken },
+    });
+    // AdVideo has no account_id field; confirm ownership through the account's own edge.
+    // A video we uploaded to this account a moment ago is owned by construction, and the
+    // advideos edge lags new uploads by a few seconds (it 404'd every fresh upload in prod),
+    // so the check only applies to caller-supplied ids.
+    if (!opts.justUploaded) {
+      const { data: owned } = await axios.get(`${base}/act_${accountId.replace(/^act_/, '')}/advideos`, {
+        params: { fields: 'id', filtering: JSON.stringify([{ field: 'id', operator: 'IN', value: [videoId] }]), access_token: accessToken },
+      });
+      if (!Array.isArray(owned?.data) || !owned.data.some((v: any) => String(v?.id) === String(videoId))) {
+        throw new Error('That video is not in the selected ad account (a video uploaded in the last few seconds may not be listed yet; retry shortly).');
+      }
+    }
+    const raw = String(node?.status?.video_status || 'processing').toLowerCase();
+    const status = raw === 'ready' ? 'ready' : raw === 'error' ? 'error' : 'processing';
+    const thumbs: any[] = node?.thumbnails?.data ?? [];
+    const thumb = thumbs.find((t) => t?.is_preferred) ?? thumbs[0];
+    return {
+      status,
+      ...(thumb?.uri ? { thumbnail_url: String(thumb.uri) } : {}),
+      ...(status === 'error' ? { error: String(node?.status?.processing_progress ?? 'processing failed') } : {}),
+    };
   }
 
   /** Read-back after a toolkit write: status + effective status + budgets, ownership-scoped. */

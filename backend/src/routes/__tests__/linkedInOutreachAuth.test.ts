@@ -100,7 +100,7 @@ describe('LinkedIn Outreach Auth Router', () => {
       expect(linkedInOutreachService.getAccount).toHaveBeenCalledTimes(3);
       expect(createAccount).toHaveBeenCalledWith('user-123', 'unipile', expect.objectContaining({
         account_name: 'LinkedIn Account',
-      }));
+      }), { providerVerified: false });
       jest.restoreAllMocks();
     }, 10000);
 
@@ -136,7 +136,7 @@ describe('LinkedIn Outreach Auth Router', () => {
           token_expires_at: Number.MAX_SAFE_INTEGER,
           scopes: [],
         }
-      });
+      }, { providerVerified: true });
     });
 
     it('should return 500 when createAccount throws after getAccount retries are exhausted', async () => {

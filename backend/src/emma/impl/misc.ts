@@ -295,7 +295,7 @@ const VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'avi', 'webm', 'mkv', 'flv', 'wm
 // — see this module's header comment ("ADMIN_SKILL_TOOL_NAMES is DUPLICATED
 // here, not imported back") for why this is a plain literal copy rather than
 // a shared import.
-const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_user_funnel_status', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'get_session_transcript', 'get_user_by_id', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
+const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_user_funnel_status', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'get_session_transcript', 'get_user_by_id', 'inspect_client_usage', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
 
 export function getAdminToolNames(): string[] {
   return [...ADMIN_SKILL_TOOL_NAMES];
@@ -542,6 +542,27 @@ export function isS3KeyOwnedByUser(key: string, userId: string | null | undefine
 const READ_FILE_MAX_REDIRECTS = 5;
 
 /**
+ * ENG-2656: true for any AWS S3 endpoint host (virtual-hosted or path style).
+ * readFileContent only reaches this check after extractS3KeyFromUrl declined
+ * the URL, so a match here is a bucket that is NOT AgentWeb's upload bucket.
+ * Real chat attachments always live in our bucket; a foreign S3 URL is almost
+ * always a model-guessed "attachment" location (FlatFeeCorp, Oct 22), so we
+ * refuse it without making any network request.
+ */
+export function isForeignS3Host(host: string): boolean {
+  const h = (host || '').toLowerCase();
+  return h === 's3.amazonaws.com'
+    || /^s3[.-][a-z0-9-]+\.amazonaws\.com$/.test(h)
+    || /\.s3\.amazonaws\.com$/.test(h)
+    || /\.s3[.-][a-z0-9-]+\.amazonaws\.com$/.test(h);
+}
+
+export const FOREIGN_STORAGE_REFUSAL_MESSAGE =
+  'This URL points to an S3 bucket that is not AgentWeb file storage, so it is not a chat attachment and was not fetched. ' +
+  'Never guess or construct attachment URLs. If the user said they attached a file but the message has no Attached Files link, ' +
+  'reply: "I don\'t see an attachment on that message — please re-attach the file." Only read URLs that appear verbatim in the conversation.';
+
+/**
  * ENG-2420: SSRF-safe external GET. Every hop is DNS-resolved and refused if any
  * answer is private/loopback/link-local, then the connection is pinned to the
  * validated address (no rebinding window) and redirects are followed manually so
@@ -666,6 +687,14 @@ export async function readFileContent(fileUrl: string, caller?: ReadFileCallerCo
       // Google Drive / Docs links require the user's OAuth token — unauthenticated
       // fetches return 401 for Workspace-restricted orgs. Tell the user to upload instead.
       const urlHost = new URL(normalizedFileUrl).hostname.toLowerCase();
+      if (isForeignS3Host(urlHost)) {
+        console.warn('AgentMode: read_file_content refused non-AgentWeb S3 host (ENG-2656)');
+        return {
+          success: false,
+          message: FOREIGN_STORAGE_REFUSAL_MESSAGE,
+          error: 'Not an AgentWeb storage URL'
+        };
+      }
       if (urlHost === 'drive.google.com' || urlHost === 'docs.google.com') {
         return {
           success: false,
@@ -1012,6 +1041,19 @@ export async function sendEmailFromConfiguredSender(
       };
     }
     const label = providerLabel(senderProvider);
+
+    // ENG-673: this send names an address, not a lead, so a contact marked do-not-contact is looked up and refused here.
+    const { blockedRecipients, blockedMessage, unverifiedContactError } = await import('../../services/contactGuard');
+    let blockedTo: string[];
+    try {
+      blockedTo = await blockedRecipients([userId], to);
+    } catch (e) {
+      console.error('[Emma] do-not-contact check failed, not sending:', e);
+      return { success: false, reason: 'do_not_contact_unverified', code: 503, message: 'Could not check do-not-contact', error: unverifiedContactError };
+    }
+    if (blockedTo.length > 0) {
+      return { success: false, reason: 'do_not_contact', code: 409, message: 'Do not contact', error: blockedMessage(blockedTo) };
+    }
 
     // ENG-265: route through sendAsSender so this chat-driven ad-hoc send is subject
     // to the same daily-cap/warmup enforcement as every other send path.

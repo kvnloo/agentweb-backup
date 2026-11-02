@@ -16,7 +16,7 @@
  * which carries no verdict and so can never be read as a pass. The public function never throws.
  */
 import { createHash } from 'crypto';
-import type { AgentRunTrace, AgentRunTraceCall } from './agentRunTrace';
+import { cutWithoutSplittingPair, type AgentRunTrace, type AgentRunTraceCall } from './agentRunTrace';
 import { LLM_MODEL_REGISTRY } from './agentMode/llmModelRegistry';
 import { readChatCompletion, type RubricJudgeLlm, type RubricJudgeLlmRequest, type RubricJudgeUsage } from './creativeRubricJudge';
 
@@ -103,12 +103,13 @@ export const gatewayTaskSuccessJudgeLlm: RubricJudgeLlm = {
 const clip = (text: string | undefined, max: number): string => {
   if (!text) return '';
   const flat = text.replace(/\s+/g, ' ').trim();
-  return flat.length > max ? `${flat.slice(0, max)}…` : flat;
+  return flat.length > max ? `${cutWithoutSplittingPair(flat, max)}…` : flat;
 };
 
 const plain = (html: string): string => html.replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&');
 
 const FINAL_REPLY_CHARS = 6_000;
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
 
 function callLine(c: AgentRunTraceCall, byId: Map<string, AgentRunTraceCall>): string {
   const outcome = c.error ? `error: ${clip(c.error, 240)}` : `result: ${clip(c.result, 300)}`;
@@ -171,7 +172,8 @@ export function renderTraceForJudge(trace: AgentRunTrace, title?: string): strin
     }
     middle = [...keepHead, `(… ${body.length - keepHead.length - keepTail.length} timeline entries cut for length …)`, ...keepTail];
   }
-  return [...head, '', 'TIMELINE:', ...middle, ...notes, '', tail].join('\n');
+  // Stored text can already hold half an emoji (cut before it was saved); providers' strict JSON parsers reject it.
+  return [...head, '', 'TIMELINE:', ...middle, ...notes, '', tail].join('\n').replace(LONE_SURROGATE, '\uFFFD');
 }
 
 /** Most '{' positions parseVerdict will try; a reply with more objects than this is not a verdict. */

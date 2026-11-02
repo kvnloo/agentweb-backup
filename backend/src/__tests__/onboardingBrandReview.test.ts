@@ -68,6 +68,7 @@ jest.mock("../middleware/auth", () => ({
 }));
 
 import onboardingStepsRoutes from "../routes/onboardingSteps";
+import { documentWriteFake } from "./helpers/icpDocumentWrites";
 const { userDb } = require("../services/db");
 
 const app = express();
@@ -149,11 +150,9 @@ describe("POST /api/onboarding/icp/edit-one", () => {
   });
 
   it("merges only allowed fields and writes the new icpResult", async () => {
-    userDb.getUserById.mockResolvedValue({
-      userId: "user-1",
-      icpResult: [personaA, personaB, personaC],
-    });
-    userDb.updateUser.mockResolvedValue({ userId: "user-1" });
+    const stored = { userId: "user-1", icpResult: [personaA, personaB, personaC] };
+    userDb.getUserById.mockResolvedValue(stored);
+    userDb.updateUser.mockImplementation(documentWriteFake(stored).updateUser);
     const res = await request(app)
       .post("/api/onboarding/icp/edit-one")
       .send({
@@ -168,14 +167,22 @@ describe("POST /api/onboarding/icp/edit-one", () => {
       });
     expect(res.status).toBe(200);
     expect(userDb.updateUser).toHaveBeenCalledTimes(1);
-    const [, patch] = userDb.updateUser.mock.calls[0];
-    expect(patch.icpResult).toHaveLength(3);
-    expect(patch.icpResult[1].pain).toBe("rewritten pain");
-    expect(patch.icpResult[1].objection).toBe("rewritten objection");
-    expect(patch.icpResult[1].name).toBe("Heads of growth"); // untouched
-    // Bogus fields must NOT leak through.
-    expect(patch.icpResult[1]).not.toHaveProperty("icpStatus");
-    expect(patch.icpResult[1]).not.toHaveProperty("arbitrary");
+    // One card is written, alone: only document paths under icpResult[1], never the whole list.
+    const [, whole, options] = userDb.updateUser.mock.calls[0];
+    expect(whole).toEqual({});
+    expect(options.pathSets.every((s: any) => s.path[0] === "icpResult" && s.path[1] === 1)).toBe(true);
+    const written = Object.fromEntries(options.pathSets.map((s: any) => [s.path.slice(2).join("."), s.value]));
+    expect(written).toMatchObject({ pain: "rewritten pain", objection: "rewritten objection" });
+    // Bogus fields must NOT be written.
+    expect(Object.keys(written).some((k) => /icpStatus|arbitrary/.test(k))).toBe(false);
+    // What the caller gets back is the updated list.
+    const list = res.body.icpResult;
+    expect(list).toHaveLength(3);
+    expect(list[1].pain).toBe("rewritten pain");
+    expect(list[1].objection).toBe("rewritten objection");
+    expect(list[1].name).toBe("Heads of growth"); // untouched
+    expect(list[1]).not.toHaveProperty("icpStatus");
+    expect(list[1]).not.toHaveProperty("arbitrary");
   });
 });
 
@@ -295,19 +302,21 @@ describe("POST /api/onboarding/icp/delete-one", () => {
   });
 
   it("removes the persona at the given index and writes the new array", async () => {
-    userDb.getUserById.mockResolvedValue({
-      userId: "user-1",
-      icpResult: [personaA, personaB, personaC],
-    });
-    userDb.updateUser.mockResolvedValue({ userId: "user-1" });
+    const stored = { userId: "user-1", icpResult: [personaA, personaB, personaC] };
+    userDb.getUserById.mockResolvedValue(stored);
+    userDb.updateUser.mockImplementation(documentWriteFake(stored).updateUser);
     const res = await request(app)
       .post("/api/onboarding/icp/delete-one")
       .send({ icpId: "icp-1" });
     expect(res.status).toBe(200);
-    const [, patch] = userDb.updateUser.mock.calls[0];
-    expect(patch.icpResult).toHaveLength(2);
-    expect(patch.icpResult[0].name).toBe("Founders");
-    expect(patch.icpResult[1].name).toBe("Agency owners");
+    // Exactly that one element is removed by path; the list is not rewritten.
+    const [, whole, options] = userDb.updateUser.mock.calls[0];
+    expect(whole).toEqual({});
+    expect(options.pathRemoves).toEqual([{ path: ["icpResult", 1] }]);
+    expect(options.pathSets ?? []).toEqual([]);
+    expect(res.body.icpResult).toHaveLength(2);
+    expect(res.body.icpResult[0].name).toBe("Founders");
+    expect(res.body.icpResult[1].name).toBe("Agency owners");
   });
 });
 

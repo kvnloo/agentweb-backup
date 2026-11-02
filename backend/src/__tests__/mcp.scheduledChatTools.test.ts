@@ -217,11 +217,13 @@ describe('Scheduled Chat MCP Tools', () => {
 
       const result = await mcpToolRegistry.execute('list_scheduled_chats', {}, context);
 
-      expect(mockMcpFetch).toHaveBeenCalledWith({
+      // ENG-1611: the tool always requests a bounded page (default limit 50).
+      expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
         method: 'GET',
         path: '/api/agent-mode/scheduled-chats',
-        context: { userId: 'user-123', agentUserId: 'user-123' },
-      });
+        queryParams: { limit: '50' },
+        context: expect.objectContaining({ userId: 'user-123', agentUserId: 'user-123' }),
+      }));
       expect(result.content[0].text).toContain('sc-1');
       expect(result.content[0].text).toContain('Daily Report');
     });

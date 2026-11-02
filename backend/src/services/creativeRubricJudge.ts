@@ -16,6 +16,7 @@
  * or an invalid verdict each return `status: 'error'` with a reason. Such a result carries no
  * verdicts, so it can never be read as a pass. The public functions never throw.
  */
+import { cutWithoutSplittingPair } from '../utils/surrogateSafeCut';
 import type { PairwiseChoice } from '../loops/eval/agreement';
 import { LLM_MODEL_REGISTRY } from './agentMode/llmModelRegistry';
 import type { CreativeGateResult } from './creativeGates';
@@ -305,7 +306,7 @@ export function assertJudgeModelAllowed(model: string): void {
 function clip(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
   const trimmed = value.trim();
-  return trimmed ? trimmed.slice(0, MAX_BRIEF_FIELD_CHARS) : undefined;
+  return trimmed ? cutWithoutSplittingPair(trimmed, MAX_BRIEF_FIELD_CHARS) : undefined;
 }
 
 function clipList(value: unknown): string[] | undefined {
@@ -661,7 +662,7 @@ export async function judgeLandingPage(
             `Landing page under review${page.url ? ` (live at ${page.url}; you are shown its source, not a render)` : ''}:`,
             cut ? `(source cut to its first ${MAX_LANDING_PAGE_SOURCE_CHARS} characters)` : '',
             '```tsx',
-            source.slice(0, MAX_LANDING_PAGE_SOURCE_CHARS),
+            cutWithoutSplittingPair(source, MAX_LANDING_PAGE_SOURCE_CHARS),
             '```',
           ]
             .filter(Boolean)

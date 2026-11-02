@@ -3,6 +3,7 @@ import express from 'express';
 import { IncomingMessage } from 'http';
 import { WebhookRequiredHeaders } from 'svix';
 import { webhookService, ResendWebhookEvent } from '../services/webhookService';
+import { emitResendEngagementSignal } from '../services/serverSignalEmitter';
 import { emailEventsDb } from '../services/emailEventsDb';
 import { leadListAlertService } from '../services/leadListAlertService';
 import { crmDb, userDb, tempEmailDb } from '../services/db';
@@ -22,6 +23,7 @@ import { sendRoadmapDeliveryEmail } from '../services/roadmapDelivery';
 import { emmaEmailService } from '../services/emmaEmailService';
 import { TEMP_EMAIL_PREFIX, TEMP_EMAIL_DOMAIN } from '../config';
 import { isDoNotContact } from '../utils/leadContactStatus';
+import { isPushedToSmartlead } from '../services/smartleadMarkers';
 import { pruneClickIds } from '../utils/leadSchema';
 import { resolveClientIdentityWithForwarded } from '../utils/clientIdentity';
 import { normalizeAttribution, promoteAttributionFromCustomFields } from '../types/attribution';
@@ -284,6 +286,10 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
     } else {
       console.log(`Skipping CRM event storage for Emma-related email: ${event.data.email_id}`);
     }
+
+    // ENG-2686: platform-email engagement → hireemma.ai session list. The mapper drops anything not
+    // sent by the AgentWeb system sender, so customer mail never reaches the funnel. Fire-and-forget.
+    void emitResendEngagementSignal(event);
 
     // Handle specific event types
     switch (event.type) {
@@ -1383,6 +1389,20 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
                         console.log(`Auto send skipped: email already sent today to lead ${lead.leadId} in list ${leadList.listId}`);
                         autoSendStatus = 'skipped_already_sent_today';
                       }
+                    }
+
+                    // ENG-673: this block also runs for an EXISTING lead that resubmits a form (isUpdated), and that lead keeps its Smartlead
+                    // marker. A lead being emailed through the customer's Smartlead campaign is not also auto-emailed from here.
+                    // An existing lead that opted out and then resubmits a form must not be auto-emailed either: the auto-draft step has no
+                    // do-not-contact check of its own, and neither did this one (found by a review of ENG-673; older than that work).
+                    if (!autoSendStatus && isDoNotContact(freshLead ?? lead)) {
+                      console.log(`Auto send skipped: lead ${lead.leadId} in list ${leadList.listId} is do-not-contact`);
+                      autoSendStatus = 'skipped_do_not_contact';
+                    }
+
+                    if (!autoSendStatus && isPushedToSmartlead(freshLead ?? lead)) {
+                      console.log(`Auto send skipped: lead ${lead.leadId} in list ${leadList.listId} is being emailed through Smartlead`);
+                      autoSendStatus = 'skipped_smartlead';
                     }
 
                     if (!autoSendStatus) {
