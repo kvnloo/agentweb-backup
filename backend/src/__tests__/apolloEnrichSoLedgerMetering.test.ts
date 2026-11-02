@@ -78,6 +78,7 @@ import { initApolloServiceFromEnv } from '../services/apolloServiceFactory';
 import { initEnrichSoServiceFromEnv } from '../services/enrichSoServiceFactory';
 import { getApolloService, __resetApolloServiceForTesting } from '../services/apolloService';
 import { getEnrichSoService } from '../services/enrichSoService';
+import { getAllocatedRate } from '../utils/vendorRateCard';
 
 const OWNER = 'user-1';
 
@@ -136,6 +137,41 @@ describe('Apollo $ ledger mirroring (ENG-696)', () => {
     await getApolloService().findEmail({ firstName: 'A', lastName: 'B', domain: 'y.com' }, { userId: OWNER });
 
     expect(mockRecordVendorUsage.mock.calls[0][0].operation).toBe('email_reveal');
+  });
+
+  it.each([404, 422])('a %i on a waterfall request still books waterfall_email, priced on the rate card (ENG-2720)', async (status) => {
+    mockAxiosPost.mockRejectedValue({ response: { status } });
+    process.env.BACKEND_URL = 'https://api.agentweb.pro';
+
+    await getApolloService().findEmail(
+      { firstName: 'A', lastName: 'B', domain: 'y.com' },
+      { userId: OWNER, runWaterfall: true }
+    );
+
+    expect(mockRecordVendorUsage).toHaveBeenCalledTimes(1);
+    const ctx = mockRecordVendorUsage.mock.calls[0][0];
+    expect(ctx.operation).toBe('waterfall_email');
+    expect(ctx.rateKey).toBe('waterfall_email');
+    // The key the factory emits must exist on the card, or the recorder books it `unpriced`.
+    expect(getAllocatedRate('apollo', ctx.rateKey)).toBeCloseTo(0.099, 6);
+    delete process.env.BACKEND_URL;
+  });
+
+  it('every Apollo ledger key the factory emits is priced on the rate card (ENG-2720)', async () => {
+    mockAxiosPost.mockResolvedValue({ data: { email: 'x@y.com' } });
+    mockAxiosGet.mockResolvedValue({ data: { organization: { id: 'o1' } } });
+    process.env.BACKEND_URL = 'https://api.agentweb.pro';
+    const apollo = getApolloService();
+
+    await apollo.findEmail({ firstName: 'A', lastName: 'B', domain: 'y.com' }, { userId: OWNER, runWaterfall: true });
+    await apollo.findEmail({ firstName: 'C', lastName: 'D', domain: 'z.com' }, { userId: OWNER });
+    await apollo.matchPerson({ email: 'a@y.com' }, { userId: OWNER });
+    await apollo.matchOrg('example.com', { userId: OWNER });
+
+    const keys = mockRecordVendorUsage.mock.calls.map((c: any[]) => c[0].rateKey);
+    expect(new Set(keys)).toEqual(new Set(['waterfall_email', 'email_reveal', 'person_match', 'org_enrichment']));
+    for (const key of keys) expect(getAllocatedRate('apollo', key)).not.toBeNull();
+    delete process.env.BACKEND_URL;
   });
 
   it('a 404 "not found" response still records — it reached and billed the vendor', async () => {

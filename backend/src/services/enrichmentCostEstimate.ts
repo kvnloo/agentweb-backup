@@ -23,6 +23,8 @@ export const ENRICHMENT_COST_RATES_USD = {
    * real Opiner list at ~$0.0027 per lead (about $0.2 per 73 leads). Rounded up
    * to $0.004 as a guard band: the OpenRouter web-search fee is not in the
    * ledger yet, so the booked figure understates the real LLM-plus-search cost.
+   * Not model-aware: an org on another model, or the CRM_ENRICH_V3_DEFAULT_MODEL=gpt-5.5
+   * rollback, books ~19x more per lead, so the estimate understates the LLM line there.
    */
   llmPerLead: 0.004,
   /** Match / lookup calls per lead, paid on hits and misses (Opiner: $3.61 / 112). */

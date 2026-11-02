@@ -68,11 +68,15 @@ async function criticModel(userId: string | undefined): Promise<string> {
 // ENG-2720: OpenRouter bills each web search ($0.007 on Exa, plus $0.001 per result past 10) on top of
 // tokens, and with no limits a call can run many searches. CRM_ENRICH_V3_WEB_SEARCH_PARAMS is a JSON
 // object of tool parameters (for example {"max_uses":2,"engine":"parallel","max_results":3}). Unset keeps
-// OpenRouter's defaults. Unknown keys and bad values are dropped.
+// OpenRouter's defaults. Unknown keys and bad values are dropped. Per OpenRouter's docs `max_uses` is only
+// honoured on Anthropic's native search, so on the default engine (OpenAI models search natively) it does
+// nothing: pair it with `engine` exa or parallel, which also changes the retrieval engine and its price.
+// `max_results` is capped at 25 (Perplexity 20); a larger value would be rejected on every web-tier call.
 const WEB_SEARCH_PARAM_KEYS: Record<string, 'int' | 'engine' | 'size'> = {
   max_uses: 'int', max_results: 'int', max_total_results: 'int', max_characters: 'int',
   engine: 'engine', search_context_size: 'size',
 };
+const WEB_SEARCH_INT_MAX: Record<string, number> = { max_results: 25 };
 export function parseWebSearchParams(raw: string | undefined): Record<string, string | number> | undefined {
   if (!raw?.trim()) return undefined;
   let parsed: unknown;
@@ -81,7 +85,7 @@ export function parseWebSearchParams(raw: string | undefined): Record<string, st
   const out: Record<string, string | number> = {};
   for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
     const kind = WEB_SEARCH_PARAM_KEYS[key];
-    if (kind === 'int' && Number.isInteger(value) && (value as number) > 0 && (value as number) <= 100000) out[key] = value as number;
+    if (kind === 'int' && Number.isInteger(value) && (value as number) > 0 && (value as number) <= (WEB_SEARCH_INT_MAX[key] ?? 100000)) out[key] = value as number;
     else if (kind === 'engine' && typeof value === 'string' && ['auto', 'native', 'exa', 'firecrawl', 'parallel', 'perplexity'].includes(value)) out[key] = value;
     else if (kind === 'size' && typeof value === 'string' && ['low', 'medium', 'high'].includes(value)) out[key] = value;
     else console.warn(`[v3 deps] CRM_ENRICH_V3_WEB_SEARCH_PARAMS: dropping "${key}"`);

@@ -20,6 +20,12 @@ describe('CRM_ENRICH_V3_WEB_SEARCH_PARAMS parsing (ENG-2720)', () => {
       .toEqual({ max_total_results: 5 });
   });
 
+  it('caps max_results at 25 so an out-of-range value is not sent on every web-tier call', () => {
+    expect(parseWebSearchParams('{"max_results":25}')).toEqual({ max_results: 25 });
+    expect(parseWebSearchParams('{"max_results":26}')).toBeUndefined();
+    expect(parseWebSearchParams('{"max_results":50,"engine":"parallel"}')).toEqual({ engine: 'parallel' });
+  });
+
   it('ignores invalid JSON and non-objects', () => {
     expect(parseWebSearchParams('{nope')).toBeUndefined();
     expect(parseWebSearchParams('[1,2]')).toBeUndefined();

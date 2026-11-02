@@ -77,7 +77,11 @@ export const APOLLO_USD_PER_CREDIT = 0.0495;
  *   found; Icypeas / Prospeo charge 2 each even on a miss; ZeroBounce adds 1. Observed
  *   usage rows are 1-2 credits per contact, ~0.5-0.6 on average, so 2 is the
  *   conservative booked count and keeps the booked margin at or above the 60% floor
- *   even if every request really consumed 2.
+ *   even if every request really consumed 2. The tail is not covered: a rare miss that
+ *   runs through both third-party sources plus validation (~5 credits, ~$0.099 real) books
+ *   $0.099, i.e. break-even (~0% margin), not 60%. On the observed ~0.55-credit average
+ *   ($0.0109 real) the booked margin is ~89%, so this is still a flat allocation with
+ *   headroom, not a per-request measurement.
  * - phone: 8 credits (Apollo phone reveal). NOT requested by any call today: the
  *   /people/match body has no phone parameter anywhere in the backend. It exists so
  *   adding phone numbers books one more component instead of reworking a bundled
@@ -110,6 +114,8 @@ const RATE_CARD: Record<VendorRateProvider, Record<string, VendorRateEntry>> = {
     // ENG-2720: broker waterfall booked per component (credits x APOLLO_USD_PER_CREDIT).
     // Email = $0.099 per request; phone = $0.396, booked only once a caller asks for one.
     waterfall_email: { recordingUnit: "enrichment", usdPerUnit: apolloCreditsUsd(APOLLO_WATERFALL_CREDITS.email) },
+    // PROVISIONAL and unused: no caller books this yet. The 8 credits is Apollo's plain phone reveal; verify the
+    // waterfall-phone charge (third-party vendors, misses) before the first caller ships.
     waterfall_phone: { recordingUnit: "enrichment", usdPerUnit: apolloCreditsUsd(APOLLO_WATERFALL_CREDITS.phone) },
     // ENG-696: basic /people/match with no email/phone reveal — Apollo's
     // cheapest person-match credit tier (same class as org enrichment below).
