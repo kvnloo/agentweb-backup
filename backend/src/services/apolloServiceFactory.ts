@@ -36,9 +36,11 @@ import { recordVendorUsage } from './usageRecorderService';
 // recordUsage/recordVendorUsage writes to, at the exact point the call
 // reaches api.apollo.io. A call with no resolvable userId still records,
 // attributed to the platform (recordVendorUsage defaults userId to "system").
-// Tier-3 (runWaterfall) findEmail calls are recorded under `full_enrichment`
+// Tier-3 (runWaterfall) findEmail calls are recorded under `waterfall_email`
 // — a materially higher-cost broker chain — rather than `email_reveal`, so a
-// future rate can price the two differently (AC5).
+// future rate can price the two differently (AC5). ENG-2720: this was the
+// bundled `full_enrichment` (9 credits = email + phone) before; phone is now its
+// own `waterfall_phone` component, booked only if a call ever requests one.
 function recordApolloLedger(rateKey: string, unit: string, userId: string | undefined): void {
   void recordVendorUsage({
     userId,
@@ -153,11 +155,11 @@ function buildHttpClient(apiKey: string): ApolloHttpClient {
         }
         const r = await client.post('/people/match', body);
         // ENG-696: distinguish the (higher-cost) broker waterfall reveal from
-        // a basic match/find — only recorded as `full_enrichment` when the
+        // a basic match/find — only recorded as `waterfall_email` when the
         // waterfall flag actually made it onto the request body (a webhook
         // fallback above silently downgrades to a basic match, AC5).
         recordApolloLedger(
-          body.run_waterfall_email ? 'full_enrichment' : 'email_reveal',
+          body.run_waterfall_email ? 'waterfall_email' : 'email_reveal',
           body.run_waterfall_email ? 'enrichment' : 'reveal',
           input.userId,
         );
@@ -166,7 +168,7 @@ function buildHttpClient(apiKey: string): ApolloHttpClient {
         const status = err?.response?.status;
         if (status === 404 || status === 422) {
           recordApolloLedger(
-            body.run_waterfall_email ? 'full_enrichment' : 'email_reveal',
+            body.run_waterfall_email ? 'waterfall_email' : 'email_reveal',
             body.run_waterfall_email ? 'enrichment' : 'reveal',
             input.userId,
           );

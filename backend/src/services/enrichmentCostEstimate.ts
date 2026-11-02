@@ -1,20 +1,30 @@
 /**
  * ENG-2716 (child of ENG-2715): pre-run cost estimate for CRM enrich-v3.
  *
- * Pure, vendor-free. Per-lead rates are calibrated from the Opiner run of
- * 2026-10-27 (112 leads -> $31.60 actual): Apollo full-contact $0.445 on ~30%
- * of leads, LLM extraction, match/lookup calls, and web search. Apollo misses
+ * Pure, vendor-free. Per-lead shares are calibrated from the Opiner run of
+ * 2026-10-27 (112 leads -> $31.60 actual at the time): Apollo broker waterfall on
+ * ~30% of leads, LLM extraction, match/lookup calls, and web search. Apollo misses
  * still incur the lookup/LLM/web cost, so they are priced into every lead.
+ *
+ * ENG-2720: the Apollo line is read from the vendor rate card (the same number
+ * the ledger books) instead of a hardcoded price, and the LLM line is the
+ * measured Luna cost, so this estimate tracks what the run will actually book.
+ * With both applied the Opiner reference run estimates ~$11.8, down from $31.60.
  */
 import { createHash } from 'crypto';
+import { getAllocatedRate } from '../utils/vendorRateCard';
 
 export const ENRICHMENT_COST_RATES_USD = {
-  /** Apollo full-contact reveal price. */
-  apolloFullContact: 0.445,
-  /** Share of leads that end up buying a full contact (Opiner: 34/112). */
+  /** Share of leads that trigger the Apollo broker waterfall (Opiner: 34/112; prod-wide ~28%). */
   apolloRevealRate: 34 / 112,
-  /** LLM extraction cost per lead (Opiner: $8.47 / 112). */
-  llmPerLead: 8.47 / 112,
+  /**
+   * LLM extraction cost per lead, booked. Enrichment moved from gpt-5.5
+   * (Opiner: $8.47 / 112 = $0.076) to gpt-5.6-luna (ENG-2720), measured on the
+   * real Opiner list at ~$0.0027 per lead (about $0.2 per 73 leads). Rounded up
+   * to $0.004 as a guard band: the OpenRouter web-search fee is not in the
+   * ledger yet, so the booked figure understates the real LLM-plus-search cost.
+   */
+  llmPerLead: 0.004,
   /** Match / lookup calls per lead, paid on hits and misses (Opiner: $3.61 / 112). */
   lookupPerLead: 3.61 / 112,
   /** Web search per lead (Opiner: $1.37 / 112). */
@@ -40,7 +50,10 @@ const round2 = (n: number) => Math.round(n * 100) / 100;
 export function estimateEnrichmentCost(listId: string, leadCount: number): EnrichmentCostEstimate {
   const n = Number.isFinite(leadCount) && leadCount > 0 ? Math.floor(leadCount) : 0;
   const r = ENRICHMENT_COST_RATES_USD;
-  const apollo = n * r.apolloFullContact * r.apolloRevealRate;
+  // Fail loud rather than estimate $0 if the key is ever removed from the card.
+  const apolloWaterfallUsd = getAllocatedRate('apollo', 'waterfall_email');
+  if (apolloWaterfallUsd === null) throw new Error('Apollo waterfall_email rate unavailable');
+  const apollo = n * apolloWaterfallUsd * r.apolloRevealRate;
   const llm = n * r.llmPerLead;
   const lookups = n * r.lookupPerLead;
   const webSearch = n * r.webSearchPerLead;

@@ -15,7 +15,7 @@ export function estimateEnrichmentBatchMicroUsd(config: EnrichmentConfig, leadCo
     if (value === null || !Number.isFinite(value) || value < 0) throw new Error('Enrichment rate unavailable');
     return value;
   };
-  const identity = rate('apollo', 'full_enrichment')
+  const identity = rate('apollo', 'waterfall_email')
     + rate('apollo', 'org_enrichment')
     + rate('enrich.so', 'phone_finder')
     + rate('enrich.so', 'reverse_lookup');

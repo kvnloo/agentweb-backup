@@ -15,7 +15,7 @@
  *  4. Cache hits never re-enter this file's HTTP client, so no test here
  *     can call the vendor a second time for the same input.
  *  5. Apollo's broker-waterfall email reveal records a distinguishable
- *     endpoint (full_enrichment) from a basic reveal (email_reveal).
+ *     endpoint (waterfall_email) from a basic reveal (email_reveal).
  */
 
 const mockAxiosPost = jest.fn();
@@ -113,7 +113,7 @@ describe('Apollo $ ledger mirroring (ENG-696)', () => {
     expect(mockRecordVendorUsage.mock.calls[0][0].userId).toBeUndefined();
   });
 
-  it('AC5: a waterfall email reveal records full_enrichment, distinct from a basic reveal', async () => {
+  it('AC5: a waterfall email reveal records waterfall_email, distinct from a basic reveal', async () => {
     mockAxiosPost.mockResolvedValue({ data: { email: 'x@y.com' } });
     process.env.BACKEND_URL = 'https://api.agentweb.pro';
 
@@ -123,7 +123,11 @@ describe('Apollo $ ledger mirroring (ENG-696)', () => {
     );
 
     const ctx = mockRecordVendorUsage.mock.calls[0][0];
-    expect(ctx.operation).toBe('full_enrichment');
+    expect(ctx.operation).toBe('waterfall_email');
+    // ENG-2720: no phone is requested, so no phone component is ever booked.
+    expect(mockRecordVendorUsage.mock.calls.map((c: any[]) => c[0].operation)).not.toContain('waterfall_phone');
+    expect(mockAxiosPost.mock.calls[0][1]).not.toHaveProperty('reveal_phone_number');
+    expect(mockAxiosPost.mock.calls[0][1]).not.toHaveProperty('run_waterfall_phone');
     delete process.env.BACKEND_URL;
   });
 
