@@ -976,7 +976,7 @@ class ClaudeSession implements ProviderSession {
   // ── tool relay (ENG-2113) ──
 
   /** Model message ids of tool_use blocks seen in the stream and not yet claimed by a relayed call: (bare name, canonical input) -> message id. */
-  private readonly streamUses: Array<{ messageId: string; name: string; key: string }> = [];
+  private readonly streamUses: Array<{ messageId: string; name: string; key: string | undefined }> = [];
   /** The call waiting for its message id. `key` is its input's digest, computed ONCE when the call arrives (undefined: too large to hash, matched by name only). */
   private waiting: { call: RelayCall; timer: NodeJS.Timeout; key: string | undefined } | undefined;
   private events: AsyncQueue<ProviderEvent> | undefined;
@@ -1024,13 +1024,18 @@ class ClaudeSession implements ProviderSession {
       // Bounded memory whatever the CLI prints: a fixed-size digest of the input (not the input), a truncated id, and at most MAX_STREAM_USES entries (oldest dropped).
       // An over-long id is NOT recorded (never sliced: in V8 a slice keeps the whole original string alive). The call then gets a unique unmatched id.
       if (msg.id.length > MAX_MESSAGE_ID_CHARS) continue;
-      // An announcement whose input is larger than a forwarded value is NOT recorded: hashing a 16 MB hostile input would block the event loop for seconds, and it
-      // could never match a real call anyway (a relay frame over 1 MiB is refused). The call then gets a unique unmatched id.
       const input = b.input ?? {};
-      const inputBytes = approxJsonBytes(input, MAX_FORWARDED_BYTES + 1);
-      if (inputBytes > MAX_FORWARDED_BYTES) continue;
-      if (!this.spendHash(inputBytes + 64)) continue; // the turn's hashing budget is spent: not recorded (the call then gets a unique unmatched id)
-      this.streamUses.push({ messageId: msg.id, name, key: digest(canonicalJson(input)) });
+      // (estimated only up to the hashing limit: walking a 1 MiB input to learn its exact size cost ~100 ms for nothing, and over the limit it is name-only anyway)
+      const inputBytes = approxJsonBytes(input, MAX_HASHED_CALL_BYTES + 1);
+      // An input over 64 KiB is NEVER canonicalised or hashed (the same rule as a call's arguments, MAX_HASHED_CALL_BYTES): canonicalising a 116k-key object takes ~0.6 s of
+      // loop, and eight turns doing it every 50 ms pinned the host for 26 s. It is announced by NAME only (key undefined): a call can still be tied to it when exactly one
+      // announcement of that tool exists. Under the limit, the hashing budget of the turn applies.
+      let key: string | undefined;
+      if (inputBytes <= MAX_HASHED_CALL_BYTES) {
+        if (!this.spendHash(inputBytes + 64)) continue; // the turn's hashing budget is spent: not recorded (the call then gets a unique unmatched id)
+        key = digest(canonicalJson(input));
+      }
+      this.streamUses.push({ messageId: msg.id, name, key });
       recorded++;
       if (this.streamUses.length > MAX_STREAM_USES) this.streamUses.splice(0, this.streamUses.length - MAX_STREAM_USES);
     }

@@ -428,30 +428,32 @@ describe("claude adapter: lifecycle and memory bounds of the relay", () => {
     await session.close();
   });
 
-  it("MUTATION TARGET: a stream announcement with a huge input is NOT recorded and never hashed (hashing a 16 MB hostile input blocked the loop for seconds; it could never match a real call)", async () => {
+  it("MUTATION TARGET: a stream announcement with a big input (over 64 KiB) is recorded by NAME only and NEVER canonicalised or hashed (116k keys cost ~0.6 s of loop; eight turns doing it pinned the host for 26 s)", async () => {
     const rig = makeRig();
     const session = await rig.adapter.openSession(rig.ctx, { connectionId: "conn1", epoch: 1 });
-    const s = session as unknown as { visibleTools: Set<string>; streamUses: Array<{ messageId: string; name: string; key: string }>; noteStreamUse(raw: Record<string, unknown>): void };
+    const s = session as unknown as { visibleTools: Set<string>; streamUses: Array<{ messageId: string; name: string; key: string | undefined }>; noteStreamUse(raw: Record<string, unknown>): void };
     s.visibleTools.add("search");
     const huge = new Array(6_000_000).fill(1);
-    const canonical = jest.spyOn(canonicalModule, "canonicalJson"); // deterministic: the point is that the hostile input is never walked/hashed, not how fast the machine is
+    const canonical = jest.spyOn(canonicalModule, "canonicalJson"); // deterministic: the point is that the hostile input is never hashed, not how fast the machine is
     const t0 = Date.now();
     s.noteStreamUse({ type: "assistant", message: { id: "mBig", content: [{ type: "tool_use", id: "tu", name: "mcp__emma__search", input: { ids: huge } }] } });
     expect(canonical).not.toHaveBeenCalled();
     expect(Date.now() - t0).toBeLessThan(5000); // sanity only (the unguarded path took 1.7-3.1 s on an idle machine)
-    expect(s.streamUses).toEqual([]);
-    // an ordinary one is recorded and hashed
+    expect(s.streamUses).toEqual([{ messageId: "mBig", name: "search", key: undefined }]);
+    // an ordinary one is recorded AND hashed
     s.noteStreamUse({ type: "assistant", message: { id: "mSmall", content: [{ type: "tool_use", id: "tu2", name: "mcp__emma__search", input: { q: 1 } }] } });
     expect(canonical).toHaveBeenCalledTimes(1);
+    canonical.mockClear();
+    expect(s.streamUses).toHaveLength(2);
+    expect(s.streamUses[1].key!.length).toBeGreaterThan(20);
+    // the threshold is 64 KiB of estimated JSON: 100 KB is name-only, 50 KB is hashed (not a tenfold-larger limit, not a tenfold-smaller one)
+    s.noteStreamUse({ type: "assistant", message: { id: "mOver", content: [{ type: "tool_use", id: "tu3", name: "mcp__emma__search", input: { blob: "x".repeat(100 * 1024) } }] } });
+    expect(canonical).not.toHaveBeenCalled();
+    expect(s.streamUses[2]).toEqual({ messageId: "mOver", name: "search", key: undefined });
+    s.noteStreamUse({ type: "assistant", message: { id: "mUnder", content: [{ type: "tool_use", id: "tu4", name: "mcp__emma__search", input: { blob: "x".repeat(50 * 1024) } }] } });
+    expect(canonical).toHaveBeenCalledTimes(1);
+    expect(s.streamUses[3].key).toBeDefined();
     canonical.mockRestore();
-    expect(s.streamUses).toHaveLength(1);
-    expect(s.streamUses[0].key.length).toBeGreaterThan(20);
-    // the threshold is 1 MiB of estimated JSON: 1.5 MiB is dropped, 0.9 MiB is kept (not a tenfold-larger limit, not a tenfold-smaller one)
-    const before = s.streamUses.length;
-    s.noteStreamUse({ type: "assistant", message: { id: "mOver", content: [{ type: "tool_use", id: "tu3", name: "mcp__emma__search", input: { blob: "x".repeat(1.5 * 1024 * 1024) } }] } });
-    expect(s.streamUses).toHaveLength(before);
-    s.noteStreamUse({ type: "assistant", message: { id: "mUnder", content: [{ type: "tool_use", id: "tu4", name: "mcp__emma__search", input: { blob: "x".repeat(0.9 * 1024 * 1024) } }] } });
-    expect(s.streamUses).toHaveLength(before + 1);
     await session.close();
   });
 
