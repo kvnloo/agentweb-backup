@@ -330,6 +330,35 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
     expect(t.persisted.flat().find((m) => m.role === 'tool')?.content).toContain(RESULT_LOST_NOTE);
   });
 
+  it('a Stop pressed while the tool list is being built ends as a cancelled turn, not as the "connection turned off" stop (nothing ran, no credits offer)', async () => {
+    const listing = gate();
+    const t = setup();
+    // the tool list lookup (resolveRunToolAccess: DB reads, per-user MCP discovery) is slow: it returns only after the Stop, when the run is already closed
+    const realList = t.adapter.listTools.bind(t.adapter);
+    jest.spyOn(t.adapter, 'listTools').mockImplementation(async (...a: Parameters<typeof realList>) => {
+      await listing.wait;
+      return realList(...a);
+    });
+    rig.script.turnEvents = [call('op-1', 'save_note'), result('never')];
+    const backend = t.backend();
+    const run = backend.run(t.params());
+    await waitFor(() => t.registry.size === 1); // registered, and now waiting on the tool list
+    t.registry.cancel('s1'); // what a Stop does: the bridge run is closed, so the list fails with the "run ended" error
+    listing.open();
+    const r: any = await run.catch((e) => ({ threw: e?.code ?? String(e) }));
+    expect(r).toMatchObject({ cancelled: true }); // it was {"threw":"revoked_or_disabled"}
+    expect(t.executions).toHaveLength(0);
+    expect(rig.script.interruptedTurns).toEqual([]); // the host turn was never started
+    expect(t.registry.size).toBe(0);
+  });
+
+  it('a tool list that fails for any OTHER reason (no Stop) is still the typed stop', async () => {
+    const t = setup();
+    jest.spyOn(t.adapter, 'listTools').mockRejectedValue(new Error('db down'));
+    const err: any = await t.backend().run(t.params()).catch((e) => e);
+    expect(err.code).toBe('lookup_failed');
+  });
+
   it('revoke / kill switch / flag-off mid-turn (the registry hook) interrupts the host turn and nothing more runs', async () => {
     const t = setup();
     const g = gate();

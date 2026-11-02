@@ -390,12 +390,20 @@ export class ClaudeCodeBackend {
 
       if (d.isCancelled(p.sessionId)) {
         cancelledByUser = true;
-      } else {
+      } else turn: {
         // 5. the turn. On the relay path the manifest is built first (inside the turn's time budget: the deadline is computed after it).
         let transport: { bridgeToken: string } | { tools: RelayManifest["tools"] } = { bridgeToken: token };
         let built: { manifest: RelayManifest } | undefined;
         if (transportChoice.kind === "relay") {
-          built = await this.buildRelay(p, runId, token);
+          try {
+            built = await this.buildRelay(p, runId, token);
+          } catch (err) {
+            // A Stop pressed while the tool list is being built closes the run, so the list fails ("turned off", "lookup failed"): that is the Stop, not a
+            // connection problem. It takes the same path as a Stop seen before the turn started (nothing ran, no AgentWeb-credits offer, no wrong note).
+            if (!(seen.stopped || ac.signal.aborted || d.isCancelled(p.sessionId))) throw err;
+            cancelledByUser = true;
+            break turn;
+          }
           transport = { tools: built.manifest.tools };
         }
         const cap = d.turnHardCapMs ?? 600_000;
