@@ -9,7 +9,7 @@
  * ENG-2720: the Apollo line is read from the vendor rate card (the same number
  * the ledger books) instead of a hardcoded price, and the LLM line is the
  * measured Luna cost, so this estimate tracks what the run will actually book.
- * With both applied the Opiner reference run estimates ~$11.8, down from $31.60.
+ * With both applied the Opiner reference run estimates ~$13.6, down from $31.60.
  */
 import { createHash } from 'crypto';
 import { getAllocatedRate } from '../utils/vendorRateCard';
@@ -18,15 +18,14 @@ export const ENRICHMENT_COST_RATES_USD = {
   /** Share of leads that trigger the Apollo broker waterfall (Opiner: 34/112; prod-wide ~28%). */
   apolloRevealRate: 34 / 112,
   /**
-   * LLM extraction cost per lead, booked. Enrichment moved from gpt-5.5
-   * (Opiner: $8.47 / 112 = $0.076) to gpt-5.6-luna (ENG-2720), measured on the
-   * real Opiner list at ~$0.0027 per lead (about $0.2 per 73 leads). Rounded up
-   * to $0.004 as a guard band: the OpenRouter web-search fee is not in the
-   * ledger yet, so the booked figure understates the real LLM-plus-search cost.
-   * Not model-aware: an org on another model, or the CRM_ENRICH_V3_DEFAULT_MODEL=gpt-5.5
-   * rollback, books ~19x more per lead, so the estimate understates the LLM line there.
+   * LLM extraction plus OpenRouter web-search cost per lead, booked. Enrichment moved from
+   * gpt-5.5 (Opiner: $8.47 / 112 = $0.076) to gpt-5.6-luna (ENG-2720). Measured on the real
+   * Opiner list: ~$0.0027 of tokens plus ~$0.015 of OpenRouter search fees (158 searches over
+   * 73 leads), ~$0.018 all-in; the ledger now books both (agentModeService BYOK cost).
+   * Rounded up to $0.02. Not model-aware: an org on another model, or the
+   * CRM_ENRICH_V3_DEFAULT_MODEL=gpt-5.5 rollback, books ~4x more per lead than this.
    */
-  llmPerLead: 0.004,
+  llmPerLead: 0.02,
   /** Match / lookup calls per lead, paid on hits and misses (Opiner: $3.61 / 112). */
   lookupPerLead: 3.61 / 112,
   /** Web search per lead (Opiner: $1.37 / 112). */

@@ -231,6 +231,58 @@ describe('AgentModeService.callLLM — OpenRouter provider + cost (ENG-9)', () =
     );
   });
 
+  // ENG-2720: on BYOK, usage.cost is OpenRouter's own charge (web-search fee on the Exa/Firecrawl/
+  // Parallel engines, any BYOK fee) and upstream_inference_cost is the provider's bill for the tokens.
+  // Both are AgentWeb expenses; recording only the upstream figure left the search fee out of the ledger.
+  it('meters a BYOK web-search call at upstream tokens PLUS OpenRouter\'s search fee', async () => {
+    create.mockResolvedValue({
+      id: 'gen-byok-search',
+      usage: {
+        prompt_tokens: 2532,
+        completion_tokens: 51,
+        cost: 0.005,
+        is_byok: true,
+        cost_details: { upstream_inference_cost: 0.00067525 },
+        server_tool_use_details: { web_search_requests: 1 },
+      },
+      choices: [{ message: { content: 'ok' } }],
+    });
+    (svc as any).llmModels[OR_MODEL].client = { chat: { completions: { create } } };
+
+    await svc.callLLM(OR_MODEL, [{ role: 'user', content: 'hi' }], {
+      usageContext: { userId: 'u1', feature: 'enrichment' },
+    });
+
+    const call = mockMeterUser.mock.calls[mockMeterUser.mock.calls.length - 1][0];
+    expect(call.costUsdOverride).toBeCloseTo(0.00567525, 8);
+  });
+
+  it.each([
+    ['zero (free BYOK tier, native search)', 0],
+    ['NaN', Number.NaN],
+    ['negative', -1],
+    ['missing', undefined],
+  ])('adds nothing for an unusable OpenRouter charge: %s', async (_label, routerCharge) => {
+    create.mockResolvedValue({
+      id: 'gen-byok-nocharge',
+      usage: {
+        prompt_tokens: 9,
+        completion_tokens: 3,
+        ...(routerCharge === undefined ? {} : { cost: routerCharge }),
+        is_byok: true,
+        cost_details: { upstream_inference_cost: 0.0119 },
+      },
+      choices: [{ message: { content: 'ok' } }],
+    });
+    (svc as any).llmModels[OR_MODEL].client = { chat: { completions: { create } } };
+
+    await svc.callLLM(OR_MODEL, [{ role: 'user', content: 'hi' }], {
+      usageContext: { userId: 'u1', feature: 'enrichment' },
+    });
+
+    expect(mockMeterUser).toHaveBeenCalledWith(expect.objectContaining({ costUsdOverride: 0.0119 }));
+  });
+
   it.each([
     ['missing', undefined],
     ['zero', 0],

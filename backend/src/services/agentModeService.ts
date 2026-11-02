@@ -176,7 +176,7 @@ import { meterUserUsage } from './usageRecorderService';
 import { meterUsageFromResponse } from '../utils/llmClients';
 import { pickTransport } from './funding/transport';
 import { currentRunFunding } from './funding/runFunding';
-import { recordLlmUsage, customerUpstreamCost } from './funding/recordLlmUsage';
+import { recordLlmUsage, customerUpstreamCost, openRouterByokCostUsd } from './funding/recordLlmUsage';
 import { resolveCallFunding, customerKeyBlocksTurn } from './funding/callFunding';
 import {
   getModelPrice,
@@ -2847,13 +2847,10 @@ export class AgentModeService {
           // recordLlmUsage (it strips this before any AgentWeb rail). Not costUsdOverride:
           // on a non-BYOK response that is AgentWeb's own cost.
           ...customerUpstreamCost(usage),
+          // ENG-2720: on BYOK, upstream tokens PLUS OpenRouter's own charge (web-search fee, BYOK fee).
           costUsdOverride:
             usage.is_byok === true
-              ? typeof usage.cost_details?.upstream_inference_cost === 'number' &&
-                Number.isFinite(usage.cost_details.upstream_inference_cost) &&
-                usage.cost_details.upstream_inference_cost > 0
-                ? usage.cost_details.upstream_inference_cost
-                : undefined
+              ? openRouterByokCostUsd(usage)
               : typeof usage.cost === 'number'
                 ? usage.cost
                 : undefined,

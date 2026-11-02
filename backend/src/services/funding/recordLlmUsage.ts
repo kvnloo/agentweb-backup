@@ -36,6 +36,31 @@ export function customerUpstreamCost(usage: {
 }
 
 /**
+ * AgentWeb's own total cost of one OpenRouter call served on a BYOK key, in USD (ENG-2720).
+ *
+ * A BYOK response carries two separate bills: `cost_details.upstream_inference_cost` is what
+ * the model provider charged the key (tokens, and native tool fees), and `usage.cost` is
+ * OpenRouter's own charge on top of it (server-tool fees such as web search on the Exa,
+ * Firecrawl and Parallel engines, plus any BYOK platform fee). Both are AgentWeb expenses.
+ * Reading only the upstream figure left the web-search fee out of the ledger entirely: on a
+ * real Luna enrichment run the fee was ~$1.1 against ~$0.2 of recorded tokens.
+ *
+ * `undefined` when no positive upstream cost is reported, so the caller falls back to the
+ * price book exactly as before. An unusable OpenRouter charge counts as 0, never as a drop.
+ * Callers use this for AgentWeb-paid calls only; customer-funded routes are stripped of the
+ * override downstream and read `customerUpstreamCost` instead.
+ */
+export function openRouterByokCostUsd(usage: {
+  cost?: unknown;
+  cost_details?: { upstream_inference_cost?: unknown } | null;
+}): number | undefined {
+  const upstream = usage?.cost_details?.upstream_inference_cost;
+  if (typeof upstream !== 'number' || !Number.isFinite(upstream) || upstream <= 0) return undefined;
+  const routerCharge = typeof usage.cost === 'number' && Number.isFinite(usage.cost) && usage.cost > 0 ? usage.cost : 0;
+  return upstream + routerCharge;
+}
+
+/**
  * `route === 'agentweb'` (and `undefined`, the pre-F1-wiring default): today's path,
  * byte-identical to before this ticket. The one field A3 added to the context
  * (`upstreamCostUsd`) is removed first, so no AgentWeb rail ever sees it.
