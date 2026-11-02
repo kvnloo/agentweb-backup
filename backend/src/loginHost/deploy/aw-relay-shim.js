@@ -6,6 +6,11 @@
 //
 // SECURITY: this file is customer-side, so it is only a courtesy. It sends {type, callId, name, args} and nothing else: it has no identity to send and the
 // host would drop a frame that carried one. It never logs a request, an argument or a result: stderr gets only the fixed codes below.
+// RESULT SIZE: the CLI has TWO separate limits on what an MCP tool result gives the model. MAX_MCP_OUTPUT_TOKENS (set in the unit's environment by the host) truncates
+// the output; a second, per-tool PERSISTENCE threshold saves a larger result to a file ("Output too large ... Full output saved to: ...") and gives the model only a short
+// preview. Measured live (CLI 2.1.294, Haiku and Sonnet): a 150 KB result reached the model as a ~2 KB preview even with MAX_MCP_OUTPUT_TOKENS = 156,400. A server raises the
+// per-tool threshold with _meta {"anthropic/maxResultSizeChars": N} on the tool in tools/list; every tool listed here carries it, set to the largest result the relay can
+// ever deliver (RELAY_RESULT_MAX_BYTES), so a result the host allows is never persisted. Results above N are still persisted by the CLI (the model gets the preview).
 // No dependencies (plain node, CommonJS). Shipped in the host build, covered by the trusted-path check and the build verification.
 "use strict";
 const fs = require("fs");
@@ -45,10 +50,12 @@ try {
 }
 // The tools the model can call right now: the turn's open set, plus whatever answers add (the host validated and bounded them; the shim only guards its own shape).
 const MAX_TOOLS = 600; // must match TOOL_LIMITS.maxTools
+const MAX_RESULT_CHARS = 300000; // must match RELAY_RESULT_MAX_BYTES (protocol.ts); a test keeps the two equal
 const tools = new Map();
 const addTool = (t) => {
   if (!t || typeof t.name !== "string" || tools.has(t.name) || tools.size >= MAX_TOOLS || !t.inputSchema || typeof t.inputSchema !== "object") return false;
-  tools.set(t.name, { name: t.name, description: String(t.description || ""), inputSchema: t.inputSchema });
+  // the single place a tool is added (the open set and tools that arrive with an answer): _meta raises the CLI's per-tool result persistence threshold (see the header)
+  tools.set(t.name, { name: t.name, description: String(t.description || ""), inputSchema: t.inputSchema, _meta: { "anthropic/maxResultSizeChars": MAX_RESULT_CHARS } });
   return true;
 };
 for (const t of manifest) addTool(t);

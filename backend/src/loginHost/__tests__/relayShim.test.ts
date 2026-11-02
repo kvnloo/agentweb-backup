@@ -9,7 +9,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { Layout } from "../ports/layout";
 import { RelayHost, type RelayCall, type RelayEndpoint } from "../relay/relayServer";
-import type { ToolDef } from "../protocol";
+import { RELAY_RESULT_MAX_BYTES, type ToolDef } from "../protocol";
 
 const SHIM = join(__dirname, "..", "deploy", "aw-relay-shim.js");
 const roots: string[] = [];
@@ -64,6 +64,26 @@ async function until(cond: () => boolean, ms = 4000): Promise<void> {
   if (!cond()) throw new Error("until: timed out");
 }
 
+const META = { "anthropic/maxResultSizeChars": RELAY_RESULT_MAX_BYTES };
+
+describe("relay shim: per-tool result threshold (_meta)", () => {
+  it("MUTATION TARGET: the shim's constant equals RELAY_RESULT_MAX_BYTES (it is standalone, so a test keeps them equal)", () => {
+    const m = readFileSync(SHIM, "utf8").match(/^const MAX_RESULT_CHARS = (\d+);/m);
+    expect(m).not.toBeNull();
+    expect(Number(m![1])).toBe(RELAY_RESULT_MAX_BYTES);
+    expect(RELAY_RESULT_MAX_BYTES).toBe(300_000);
+  });
+
+  it("MUTATION TARGET: EVERY listed tool carries _meta {anthropic/maxResultSizeChars: RELAY_RESULT_MAX_BYTES}, exactly (the open set; those added by answers are checked in the answer test below)", async () => {
+    const many: ToolDef[] = Array.from({ length: 25 }, (_, i) => ({ name: "t" + i, description: "d", inputSchema: { type: "object", properties: {} } }));
+    const r = await rig({}, {}, many);
+    const list = await r.rpc("tools/list");
+    expect(list.result.tools).toHaveLength(25);
+    for (const t of list.result.tools) expect(t._meta).toEqual(META);
+    await r.ep.close();
+  });
+});
+
 describe("relay shim: MCP surface", () => {
   it("initialize advertises listChanged; tools/list shows the open set; ping works; unknown methods are errors", async () => {
     const r = await rig();
@@ -71,7 +91,7 @@ describe("relay shim: MCP surface", () => {
     expect(init.result).toMatchObject({ protocolVersion: "2025-03-26", capabilities: { tools: { listChanged: true } } });
     const list = await r.rpc("tools/list");
     expect(list.result.tools.map((t: { name: string }) => t.name)).toEqual(["echo"]);
-    expect(list.result.tools[0]).toEqual({ name: "echo", description: "Echo", inputSchema: TOOLS[0].inputSchema });
+    expect(list.result.tools[0]).toEqual({ name: "echo", description: "Echo", inputSchema: TOOLS[0].inputSchema, _meta: { "anthropic/maxResultSizeChars": RELAY_RESULT_MAX_BYTES } });
     expect((await r.rpc("ping")).result).toEqual({});
     expect((await r.rpc("resources/list")).error).toMatchObject({ code: -32601 });
     await r.ep.close();
@@ -331,6 +351,8 @@ describe("relay shim: keepalive and tools that arrive with an answer", () => {
     expect(r.out.some((o) => o.id === 2)).toBe(false); // still waiting for the re-list
     const list = await r.rpc("tools/list");
     expect(list.result.tools.map((t: { name: string }) => t.name)).toEqual(["echo", "later"]);
+    // the tool added by an answer carries the same per-tool result threshold as the open set
+    expect(list.result.tools.map((t: { _meta?: unknown }) => t._meta)).toEqual([META, META]);
     expect((await p).result.content[0].text).toBe("installed");
     await r.ep.close();
   });
