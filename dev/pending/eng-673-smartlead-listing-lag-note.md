@@ -1,3 +1,0 @@
-## ENG-673: Document that Smartlead's per-campaign lead listing lags after a large add (2026-10-29)
-
-Comment only, no behaviour change. On production, after a 450-lead add into a campaign, Smartlead's unfiltered per-campaign lead listing showed 1 lead for several minutes (451 were present; the add call had returned 450 lead ids), while the account-wide lead total and a `status=STARTED` filtered listing were right immediately. The note on `addLeadsToCampaign` tells future code and tests to trust the add response, and to wait or use the account total or a status filter when they count a campaign's leads.
