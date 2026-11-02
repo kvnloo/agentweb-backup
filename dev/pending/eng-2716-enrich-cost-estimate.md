@@ -1,3 +1,5 @@
 ## ENG-2716: CRM enrich-v3 pre-run cost estimate + confirmation token (2026-10-28)
 
 Added pure `estimateEnrichmentCost` (calibrated to Opiner 112 leads -> $31.60), `POST /api/crm/lists/:listId/leads/enrich-v3/estimate`, and optional `confirmEstimateToken` check on enrich-v3 (409 on stale token; missing token rejected only when `ENRICH_V3_REQUIRE_COST_CONFIRMATION=true`). Dark until portal confirm dialog ships.
+
+**Recalibrated 2026-11-02 (ENG-2720, PR #3867):** the Opiner 112-lead reference run now estimates **$13.61** (was $31.60). The Apollo line reads `waterfall_email` from the vendor rate card ($0.099 per broker request, was a hardcoded $0.445) and the LLM line is $0.02/lead (Luna tokens plus the OpenRouter web-search fee, was gpt-5.5's $0.076). A confirmation token issued before this deploy goes stale (it hashes the total) and the client must re-fetch the estimate. The per-batch admission estimate (`enrichmentBatchBudget.ts`, also served by `?mode=estimate`) is separate and deliberately conservative; tests keep it above this estimate and within 8x of it.

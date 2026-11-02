@@ -65,8 +65,11 @@ export const VENDOR_RATE_CARD_VERSION = "2026-11-02";
  * Apollo allocated USD per credit (ENG-703, Harsha 2026-08-16): the 60% gross-margin
  * floor is real cost / 0.40 (x2.5). Real cost is $0.01975 per credit (Professional
  * Annual, $948 / 48,000 credits, confirmed from the account 2026-10-30), and
- * 2.5 x $0.01975 = $0.0494, booked as $0.0495. Every Apollo rate below that is a
- * credit count x this constant, so a pricing change is one edit here.
+ * 2.5 x $0.01975 = $0.0494, booked as $0.0495. Every Apollo rate below is a credit
+ * count x this constant (1 credit: email_reveal, person_match, org_enrichment; 2:
+ * waterfall_email; 8: waterfall_phone), so a pricing change is one edit here. The one
+ * exception is `phone_reveal` ($0.395), kept at its ENG-703 approved-table value; it is
+ * unused and $0.001 below 8 credits only because of rounding in that table.
  */
 export const APOLLO_USD_PER_CREDIT = 0.0495;
 
@@ -109,7 +112,7 @@ const RATE_CARD: Record<VendorRateProvider, Record<string, VendorRateEntry>> = {
     query: { recordingUnit: "query", usdPerUnit: 0.0125 },
   },
   apollo: {
-    email_reveal: { recordingUnit: "reveal", usdPerUnit: 0.0495 },
+    email_reveal: { recordingUnit: "reveal", usdPerUnit: apolloCreditsUsd(1) },
     phone_reveal: { recordingUnit: "reveal", usdPerUnit: 0.395 },
     // ENG-2720: broker waterfall booked per component (credits x APOLLO_USD_PER_CREDIT).
     // Email = $0.099 per request; phone = $0.396, booked only once a caller asks for one.
@@ -119,16 +122,17 @@ const RATE_CARD: Record<VendorRateProvider, Record<string, VendorRateEntry>> = {
     waterfall_phone: { recordingUnit: "enrichment", usdPerUnit: apolloCreditsUsd(APOLLO_WATERFALL_CREDITS.phone) },
     // ENG-696: basic /people/match with no email/phone reveal — Apollo's
     // cheapest person-match credit tier (same class as org enrichment below).
-    person_match: { recordingUnit: "match", usdPerUnit: 0.0495 },
+    person_match: { recordingUnit: "match", usdPerUnit: apolloCreditsUsd(1) },
     // ENG-696 — confirmed via Apollo's official API docs (docs.apollo.io
     // /reference/organization-enrichment, docs.apollo.io/docs/api-pricing,
     // checked 2026-09-02): /organizations/enrich costs 1 credit per call,
     // the same credit tier as person_match's /people/match. Priced at the
     // same $0.0495/credit rate used for person_match above.
-    org_enrichment: { recordingUnit: "enrichment", usdPerUnit: 0.0495 },
+    org_enrichment: { recordingUnit: "enrichment", usdPerUnit: apolloCreditsUsd(1) },
   },
   "enrich.so": {
     email_lookup: { recordingUnit: "lookup", usdPerUnit: 0.005 },
+    // ENG-703 approved rate. No caller books this today (audited ENG-2720); the admission estimate no longer reserves it.
     phone_finder: { recordingUnit: "lookup", usdPerUnit: 0.25 },
     email_validation: { recordingUnit: "validation", usdPerUnit: 0.0005 },
     // ENG-696 — confirmed via enrich.so's official docs (doc.enrich.so
