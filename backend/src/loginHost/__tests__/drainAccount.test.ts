@@ -8,7 +8,7 @@ import { PassThrough } from "stream";
 import { createInterface } from "readline";
 import { performance } from "perf_hooks";
 import type { ChildLike } from "../adapter";
-import { DRAIN_BYTE_BURST, DRAIN_READ_BURST, RunnerChildAdapter } from "../adapters/claudeAdapter";
+import { DRAIN_READ_BURST, RunnerChildAdapter } from "../adapters/claudeAdapter";
 import { CpuMeter } from "../relay/cpuMeter";
 
 jest.setTimeout(60_000);
@@ -110,11 +110,11 @@ describe("the drain accounting's limits (in-process, exact)", () => {
     const spy = jest.spyOn(performance, "now").mockImplementation(() => 5000);
     try {
       const inside = plain();
-      for (let i = 0; i < 8; i++) inside.stderr.write(Buffer.alloc(DRAIN_BYTE_BURST / 16));
+      for (let i = 0; i < 8; i++) inside.stderr.write(Buffer.alloc(256 * 1024));
       await tick();
       expect(inside.closed()).toBe(false);
       const past = plain();
-      for (let i = 0; i < 40; i++) past.stderr.write(Buffer.alloc(DRAIN_BYTE_BURST / 16)); // 2.5 x the burst in 40 reads
+      for (let i = 0; i < 40; i++) past.stderr.write(Buffer.alloc(256 * 1024)); // 10 MiB in 40 reads: 2.5 x the 4 MiB burst (a literal, so a changed constant is noticed)
       await tick();
       expect(past.closed()).toBe(true);
     } finally {
