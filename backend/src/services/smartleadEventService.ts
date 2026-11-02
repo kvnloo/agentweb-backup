@@ -47,6 +47,10 @@ export interface EventOutcome {
   duplicates: number;
 }
 
+interface PendingCount { runId: string; kind: ContactEventKind }
+/** The most a response waits for the run counters (see flushCounts). */
+const COUNT_WAIT_MS = 2000;
+
 const has = (lead: Lead, key: string): boolean =>
   Array.isArray(lead.engagements) && lead.engagements.some((e: any) => e?.eventData?.smartleadEventKey === key);
 
@@ -59,6 +63,7 @@ export class SmartleadEventService {
     const out: EventOutcome = { matched: 0, changed: 0, duplicates: 0 };
     if (event.campaignId !== ctx.campaignId) return out; // the body names another campaign than the URL: not ours to act on
 
+    const pending: PendingCount[] = [];
     const runOk = new Map<string, Promise<{ ok: boolean; name?: string }>>();
     const proven = (runId: string) => {
       let p = runOk.get(runId);
@@ -111,16 +116,19 @@ export class SmartleadEventService {
       if (matches.length === 0) continue;
       for (const m of matches) {
         out.matched++;
-        const r = await this.apply(event, m.lead, m.campaignName, m.runId);
+        const r = await this.apply(event, m.lead, m.campaignName, m.runId, pending);
         out.changed += r.changed;
         out.duplicates += r.duplicate;
       }
       break;
     }
+    // The run counters are for display and are written only now: after every contact's reply, alert and block is done, so no counter can
+    // come before or hold up another contact's opt-out (a contact in two lists is two blocks), and the wait itself is capped.
+    await this.flushCounts(pending);
     return out;
   }
 
-  private async apply(event: SmartleadEvent, lead: Lead, campaignName: string | undefined, runId: string): Promise<{ changed: number; duplicate: number }> {
+  private async apply(event: SmartleadEvent, lead: Lead, campaignName: string | undefined, runId: string, pending: PendingCount[]): Promise<{ changed: number; duplicate: number }> {
     const now = this.deps.now().toISOString();
     // Never later than our own clock: this time is compared with the stamp of a status change made here (a user's Resubscribe), and Smartlead's
     // clock running ahead would otherwise make an old opt-out look newer than the Resubscribe that followed it.
@@ -169,7 +177,7 @@ export class SmartleadEventService {
       } catch (e) {
         this.deps.log(`[SmartleadEvents] reply alert failed for list ${lead.listId}: ${e instanceof Error ? e.message : String(e)}`);
       }
-      await this.countOnce(runId, "replied", event, added.lead, "email.received");
+      this.wantCount(pending, runId, "replied", event, added.lead, "email.received");
       return { changed, duplicate };
     }
 
@@ -182,12 +190,9 @@ export class SmartleadEventService {
 
     // Re-read before writing the status: an admin may have blocked this contact with their own reason, and that must not be overwritten.
     const current = (await this.deps.readLeadConsistent(lead.listId, lead.leadId)) ?? added.lead;
-    const kind: ContactEventKind = bounced ? "bounced" : "unsubscribed";
-    const counted = added.recorded ? () => this.countOnce(runId, kind, event, added.lead, bounced ? "email.bounced" : "email.unsubscribed") : async () => undefined;
-    if (isDoNotContact(current)) {
-      await counted();
-      return { changed, duplicate };
-    }
+    // Already blocked (by an admin, an earlier bounce, or our own withdrawal that Smartlead reports back as an unsubscribe): nothing to write, and
+    // not a contact's own act, so it is not counted.
+    if (isDoNotContact(current)) return { changed, duplicate };
     await this.deps.setContactStatus(lead.listId, lead.leadId, {
       contactStatus: bounced ? "do-not-contact" : "unsubscribed",
       contactStatusReason: bounced ? "bounced" : "opted-out",
@@ -198,25 +203,44 @@ export class SmartleadEventService {
       unsubscribedFromGroupEmailAt: now,
     });
     changed++;
-    await counted(); // after the opt-out is saved: a counter must never come before, or hold up, the block itself
+    // Counted when THIS call wrote the block (so a retry after a failed write still counts, and an echo of our own withdrawal does not).
+    this.wantCount(pending, runId, bounced ? "bounced" : "unsubscribed", event, added.lead, bounced ? "email.bounced" : "email.unsubscribed");
     return { changed, duplicate };
   }
 
   /**
-   * Counts the contact once per kind for its run. `before` is the contact as it was just before this event was recorded (this event's own
-   * engagement is ignored, so it does not matter whether the snapshot has been updated): when it already showed an event of the same kind from this campaign (a second reply, or the poll finding what a webhook had delivered) the contact is already counted.
-   * A hard bounce only: a temporary one is not a contact lost. Never throws.
+   * Notes that this contact is to be counted once per kind for its run, unless `before` (the contact as it stood before this event was recorded)
+   * already showed an event of the same kind from this campaign: a second reply, or the poll finding what a webhook had delivered. This
+   * event's own engagement is ignored, so it does not matter whether the snapshot has been updated since. A hard bounce only: a temporary
+   * one is not a contact lost. Does no I/O.
    */
-  private async countOnce(runId: string, kind: ContactEventKind, event: SmartleadEvent, before: Lead, eventType: string): Promise<void> {
+  private wantCount(pending: PendingCount[], runId: string, kind: ContactEventKind, event: SmartleadEvent, before: Lead, eventType: string): void {
     if (!this.deps.countContactEvent) return;
     const seen = (Array.isArray(before.engagements) ? before.engagements : []).some(
       (e: any) => e?.eventData?.smartleadEventKey !== event.eventKey && e?.eventType === eventType && e?.eventData?.source === "smartlead" && Number(e?.eventData?.campaignId) === event.campaignId && !(kind === "bounced" && e?.eventData?.soft === true),
     );
-    if (seen) return;
+    if (!seen) pending.push({ runId, kind });
+  }
+
+  /** Writes the counters noted by wantCount. Never throws, and gives up waiting after COUNT_WAIT_MS: a slow run table must not hold the response. */
+  private async flushCounts(pending: PendingCount[]): Promise<void> {
+    if (pending.length === 0 || !this.deps.countContactEvent) return;
+    const count = this.deps.countContactEvent.bind(this.deps);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const work = (async () => {
+      for (const p of pending) {
+        try {
+          await count(p.runId, p.kind);
+        } catch (e) {
+          this.deps.log(`[SmartleadEvents] run counter (${p.kind}) failed for run ${p.runId}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+    })();
+    const gaveUp = new Promise<void>(resolve => { timer = setTimeout(() => { this.deps.log(`[SmartleadEvents] run counters still pending after ${COUNT_WAIT_MS} ms, not waiting`); resolve(); }, COUNT_WAIT_MS); });
     try {
-      await this.deps.countContactEvent(runId, kind);
-    } catch (e) {
-      this.deps.log(`[SmartleadEvents] run counter (${kind}) failed for run ${runId}: ${e instanceof Error ? e.message : String(e)}`);
+      await Promise.race([work, gaveUp]);
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 
