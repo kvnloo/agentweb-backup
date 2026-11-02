@@ -493,28 +493,42 @@ export async function findMostRecentArchivedIssueByLabel(
 export async function findMostRecentClosedIssueByLabel(
   labelName: string,
   isMatch: (issue: OpenIssue) => boolean,
-  limit = 50,
+  limit = OPEN_ISSUES_SCAN_CAP,
 ): Promise<OpenIssue | null> {
-  const data = await linearGraphQL(
-    `query($team: String!, $label: String!, $limit: Int!) {
-      issues(
-        first: $limit,
-        orderBy: updatedAt,
-        filter: {
-          team: { key: { eq: $team } },
-          state: { type: { eq: "completed" } },
-          labels: { name: { eq: $label } }
-        }
-      ) { nodes { id identifier title description archivedAt } }
-    }`,
-    { team: TEAM_KEY, label: labelName, limit },
-  );
-  const nodes: any[] = data?.issues?.nodes || [];
-  const candidate = nodes
-    .filter((n) => !n.archivedAt)
-    .map((n) => ({ identifier: n.identifier, issueId: n.id, title: n.title || '', description: n.description || '' }))
-    .find(isMatch);
-  return candidate || null;
+  // Page newest-updated first and stop at the first match: a single `first: 50` page dropped the
+  // class's closed canonical once >50 completed Auto issues were updated after it, filing a
+  // duplicate instead of reopening (same defect class as ENG-2766). `limit` is a runaway guard.
+  let scanned = 0;
+  let after: string | null = null;
+  while (scanned < limit) {
+    const pageSize = Math.min(OPEN_ISSUES_PAGE_SIZE, limit - scanned);
+    const data: any = await linearGraphQL(
+      `query($team: String!, $label: String!, $limit: Int!, $after: String) {
+        issues(
+          first: $limit,
+          after: $after,
+          orderBy: updatedAt,
+          filter: {
+            team: { key: { eq: $team } },
+            state: { type: { eq: "completed" } },
+            labels: { name: { eq: $label } }
+          }
+        ) { nodes { id identifier title description archivedAt } pageInfo { hasNextPage endCursor } }
+      }`,
+      { team: TEAM_KEY, label: labelName, limit: pageSize, after },
+    );
+    const nodes: any[] = data?.issues?.nodes || [];
+    scanned += nodes.length;
+    const candidate = nodes
+      .filter((n) => !n.archivedAt)
+      .map((n) => ({ identifier: n.identifier, issueId: n.id, title: n.title || '', description: n.description || '' }))
+      .find(isMatch);
+    if (candidate) return candidate;
+    const pageInfo = data?.issues?.pageInfo;
+    if (!pageInfo?.hasNextPage || !pageInfo?.endCursor || nodes.length === 0) break;
+    after = pageInfo.endCursor;
+  }
+  return null;
 }
 
 /**
