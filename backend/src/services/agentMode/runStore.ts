@@ -121,6 +121,17 @@ export function createSessionIdempotencyKey(userId: string, clientKey: string): 
 }
 
 /**
+ * ENG-2773: plan-launch lock key. Distinct `plan-session|` namespace so no client key sent to
+ * createSession (whose hash input is `create-session|...`) can ever collide with a plan launch.
+ */
+export function planSessionIdempotencyKey(userId: string, normalizedPlanTitle: string, clientKey: string): string {
+  return crypto
+    .createHash('sha256')
+    .update(`plan-session|${userId}|${normalizedPlanTitle}|${clientKey}`)
+    .digest('hex');
+}
+
+/**
  * Create the durable run record at intake. THROWS on failure — run-record
  * creation is core state (dedupe and interruption disclosure would lie
  * without it), so the caller must abort the request loudly.

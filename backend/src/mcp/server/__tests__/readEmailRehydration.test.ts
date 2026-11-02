@@ -98,14 +98,15 @@ it('rehydrated api_key session can call read_email (auth method from the current
   }));
 });
 
-it('rehydrated OAuth session is still refused read_email', async () => {
+it('rehydrated OAuth session can call read_email (OAuth parity)', async () => {
   const req = { headers: { 'mcp-protocol-version': '2025-06-18' }, _mcpAuthMethod: 'oauth' } as any;
   const res = makeRes();
 
   await rehydrateAndServe(req, res as any, SID, record, callBody, factory([]) as any);
 
   const parsed = JSON.parse(res.body);
-  expect(parsed.result.isError).toBe(true);
-  expect(parsed.result.content[0].text).toMatch(/only available to API keys/);
-  expect(mockMcpFetch).not.toHaveBeenCalled();
+  expect(parsed.result.isError).toBeFalsy();
+  expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
+    body: expect.objectContaining({ own_mailbox_only: true }),
+  }));
 });
