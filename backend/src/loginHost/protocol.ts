@@ -217,6 +217,9 @@ export const RELAY_RESULT_MAX_BYTES = 300_000;
  *    RELAY_RESULT_MAX_BYTES, counted conservatively at two bytes a token, plus 1,600 tokens (the CLI's own figure) for each image. It is deliberately NOT the 8 MiB
  *    frame cap: raising the CLI's limit that far would remove its protection of the model's context window (a result of that size fails the turn);
  *  - MCP_TOOL_TIMEOUT: the CLI's own limit on one stdio tool call (milliseconds, at least 1000): the turn's remaining deadline, so the host's clock is the one that ends a call.
+ * MAX_MCP_OUTPUT_TOKENS alone is NOT enough: the CLI has a SEPARATE per-tool persistence threshold that saves a result above it to a file and shows the model only a ~2 KB
+ * preview (measured live: a 150 KB result, with MAX_MCP_OUTPUT_TOKENS = 156,400). The relay shim raises that one per tool with _meta {"anthropic/maxResultSizeChars": N} in
+ * tools/list, N = RELAY_RESULT_MAX_BYTES (deploy/aw-relay-shim.js, MAX_RESULT_CHARS; a test keeps the two equal).
  * (MCP_TIMEOUT is the server start-up timeout in the CLI, not a call limit; CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT, default 30 minutes for stdio, is reset by the shim's
  * progress notifications.)
  */
