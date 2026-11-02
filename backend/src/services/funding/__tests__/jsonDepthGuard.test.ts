@@ -167,15 +167,25 @@ describe('the login host client drops deeply nested worker data unparsed', () =>
     expect(got).toEqual(['tool-call', 'tool-use', 'tool-use', 'tool-use', 'result']);
   });
 
-  it('a deep reply to an ordinary call is a bad answer, not parsed', async () => {
+  it('a deep reply to an ordinary call (within the 64 KiB reply cap) is a bad answer, not parsed', async () => {
     routes['/v1/connection.status'] = (res) => {
       res.writeHead(200);
-      res.end('{"state":' + '['.repeat(2_000_000));
+      res.end('{"state":' + '['.repeat(60_000));
     };
     const parse = jest.spyOn(JSON, 'parse');
     const t0 = Date.now();
     await expect(client.connectionStatus({ connectionId: 'c1' })).rejects.toMatchObject({ code: 'BAD_RESPONSE', detail: 'too_deep' });
     expect(Date.now() - t0).toBeLessThan(1_000);
+    expect(parse.mock.calls.every((c) => String(c[0]).length < 1_000)).toBe(true);
+  });
+
+  it('a 2,000,000-deep reply to an ordinary call is cut by the reply cap first (the depth guard is the second wall)', async () => {
+    routes['/v1/connection.status'] = (res) => {
+      res.writeHead(200);
+      res.end('{"state":' + '['.repeat(2_000_000));
+    };
+    const parse = jest.spyOn(JSON, 'parse');
+    await expect(client.connectionStatus({ connectionId: 'c1' })).rejects.toMatchObject({ code: 'BAD_RESPONSE', detail: 'too_large' });
     expect(parse.mock.calls.every((c) => String(c[0]).length < 1_000)).toBe(true);
   });
 
