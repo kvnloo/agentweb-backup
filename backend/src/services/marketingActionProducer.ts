@@ -99,7 +99,11 @@ export function candidatesFromRecommendations(
         priority: { ...candidate.priority },
       };
       try {
-        onRiskClassified(snapshot, classification);
+        // An async observer returns a promise; swallow its rejection too.
+        const ret: unknown = onRiskClassified(snapshot, classification);
+        if (ret && typeof (ret as Promise<unknown>).then === 'function') {
+          (ret as Promise<unknown>).then(undefined, () => undefined);
+        }
       } catch {
         // Observer failures are ignored: shadow-only, must not affect candidates.
       }

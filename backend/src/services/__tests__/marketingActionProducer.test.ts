@@ -46,6 +46,23 @@ describe('ENG-1094 marketing-action producer', () => {
     expect(got).toEqual(expected);
   });
 
+  it('ENG-2775 shadow: a rejecting async observer is handled (no unhandled rejection)', async () => {
+    const unhandled = jest.fn();
+    process.on('unhandledRejection', unhandled);
+    try {
+      const recs = [rec('a', 10)];
+      const expected = candidatesFromRecommendations(recs, SRC);
+      const got = candidatesFromRecommendations(recs, SRC, (async () => {
+        throw new Error('async boom');
+      }) as any);
+      expect(got).toEqual(expected);
+      await new Promise((r) => setImmediate(r));
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      process.off('unhandledRejection', unhandled);
+    }
+  });
+
   it('maps a structured ledger recommendation to a valid contract candidate (no prose parsing)', () => {
     const [c] = candidatesFromRecommendations([rec('ad1', 60)], SRC);
     expect(c.actionType).toBe(CREATIVE_REFRESH_ACTION);
