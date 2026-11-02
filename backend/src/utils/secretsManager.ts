@@ -1473,10 +1473,8 @@ async function fetchTeamsBotCredentialsFromSecretsManager(): Promise<TeamsBotCre
  * The env set is honoured ONLY when complete. A partial set falls through rather than being
  * merged, so the dev bot's appId can never be paired with the prod bot's secret.
  *
- * Note `prod/AgentWeb/Microsoft/TeamsBot` does not exist yet — the provisioning identity
- * lacked CreateSecret on prod/*, and the prod values are in 1Password. In production this
- * therefore throws until that secret is created. It deliberately does NOT fall back to the
- * dev secret: replying to a customer's tenant with the dev bot's identity would fail
+ * `prod/AgentWeb/Microsoft/TeamsBot` was created on 2026-09-29 (ENG-2207). If it is ever
+ * missing, this throws in production. It deliberately does NOT fall back to the dev secret: replying to a customer's tenant with the dev bot's identity would fail
  * authentication in a way that looks like a Teams outage rather than a missing secret.
  */
 export async function getTeamsBotCredentials(): Promise<TeamsBotCredentials> {
