@@ -47,7 +47,7 @@ const DAY_S = 86_400;
 
 /** Runs summaries carried by the three history indexes; `listId`, `ownerId`, `kind` and `createdAt` are those indexes' own keys. */
 // `ttl` is included so a run DynamoDB has not yet deleted (its TTL sweep lags by up to about two days) can be filtered out of a listing.
-const SUMMARY_ATTRIBUTES = ["status", "campaignId", "campaignName", "counts", "startedAt", "finishedAt", "pushedBy", "channel", "ttl"];
+const SUMMARY_ATTRIBUTES = ["status", "campaignId", "campaignName", "counts", "events", "startedAt", "finishedAt", "pushedBy", "channel", "ttl"];
 
 /**
  * The table definition ensureCriticalTables creates at boot. The copy in scripts/create-tables.ts must match it (that script
@@ -125,6 +125,15 @@ export interface PushRunCounts {
   skippedByReason: Record<string, number>;
 }
 
+/** What Smartlead later reported about the contacts of a run (ENG-673, slice 3). Contacts, not messages: a second reply from the same contact does not count again. */
+export type ContactEventKind = "replied" | "bounced" | "unsubscribed";
+export const CONTACT_EVENT_KINDS: readonly ContactEventKind[] = ["replied", "bounced", "unsubscribed"];
+export interface PushRunEvents {
+  replied: number;
+  bounced: number;
+  unsubscribed: number;
+}
+
 export interface LeadCursor {
   listId: string;
   leadId: string;
@@ -151,6 +160,8 @@ export interface PushRun {
   /** The count the user approved: a hard ceiling for the run. */
   previewEligible: number;
   counts: PushRunCounts;
+  /** Absent until Smartlead first reports an event for one of this run's contacts (and for every run made before this existed). */
+  events?: PushRunEvents;
   /** The key of the last lead examined; null at the start. */
   cursor: LeadCursor | null;
   /** True only when the walk reached the end of the list. A null cursor alone means both "start" and "finished". */
@@ -178,6 +189,7 @@ export interface PushRunSummary {
   campaignId?: number;
   campaignName?: string;
   counts?: PushRunCounts;
+  events?: PushRunEvents;
   startedAt?: string;
   finishedAt?: string;
   pushedBy?: string;
@@ -243,6 +255,13 @@ type Item = Record<string, any>;
 
 function num(value: unknown, fallback = 0): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+/** The stored event counters, or undefined when the run has none. Tolerant: a missing or odd value counts as zero, never as an error. */
+function readEvents(value: unknown): PushRunEvents | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const e = value as Record<string, unknown>;
+  return { replied: num(e.replied), bounced: num(e.bounced), unsubscribed: num(e.unsubscribed) };
 }
 
 /** Builds the stored Run item. `active` (the sparse resume index) is present only while the run is live. */
@@ -319,6 +338,7 @@ export function fromRunItem(item: Item): PushRun {
       withdrawn: num(c.withdrawn),
       skippedByReason: c.skippedByReason && typeof c.skippedByReason === "object" ? { ...c.skippedByReason } : {},
     },
+    ...(readEvents(item.events) ? { events: readEvents(item.events)! } : {}),
     cursor,
     listExhausted: item.listExhausted === true,
     batchAttempts: num(item.batchAttempts),
@@ -342,6 +362,7 @@ function toSummary(item: Item): PushRunSummary {
     ...(item.campaignId !== undefined ? { campaignId: num(item.campaignId) } : {}),
     ...(item.campaignName !== undefined ? { campaignName: String(item.campaignName) } : {}),
     ...(c && typeof c === "object" ? { counts: { examined: num(c.examined), added: num(c.added), alreadyInCampaign: num(c.alreadyInCampaign), unconfirmed: num(c.unconfirmed), withdrawn: num(c.withdrawn), skippedByReason: { ...(c.skippedByReason ?? {}) } } } : {}),
+    ...(readEvents(item.events) ? { events: readEvents(item.events)! } : {}),
     ...(item.startedAt ? { startedAt: String(item.startedAt) } : {}),
     ...(item.finishedAt ? { finishedAt: String(item.finishedAt) } : {}),
     ...(item.pushedBy ? { pushedBy: String(item.pushedBy) } : {}),
@@ -781,6 +802,42 @@ export class SmartleadPushRunDb {
         ExpressionAttributeValues: values,
       }).promise(),
     );
+    return r.ok;
+  }
+
+  /**
+   * Adds one to the run's `replied`, `bounced` or `unsubscribed` counter. Needs no lease and works on a finished run: replies and opt-outs
+   * arrive long after a push ends. Only ever adds to a counter; it never touches the run's status, cursor or lease. Returns false when the run
+   * is gone. The counter is for display, so a caller treats any failure here as non-fatal.
+   */
+  async countContactEvent(runId: string, kind: ContactEventKind): Promise<boolean> {
+    if (!CONTACT_EVENT_KINDS.includes(kind)) throw new SmartleadPushRunStoreError("invalid_input", `Bad event kind "${String(kind)}"`);
+    const key = { pk: runId, sk: RUN_SK };
+    const bump = () =>
+      this.call(() =>
+        this.client.update({
+          TableName: this.table,
+          Key: key,
+          UpdateExpression: "SET #e.#k = if_not_exists(#e.#k, :zero) + :one",
+          ConditionExpression: "attribute_exists(pk) AND attribute_exists(#e)",
+          ExpressionAttributeNames: { "#e": "events", "#k": kind },
+          ExpressionAttributeValues: { ":zero": 0, ":one": 1 },
+        }).promise(),
+      );
+    let r = await bump();
+    if (r.ok) return true;
+    // No `events` map yet (a run made before this, or its first event): create it once, never over an existing one, then count.
+    await this.call(() =>
+      this.client.update({
+        TableName: this.table,
+        Key: key,
+        UpdateExpression: "SET #e = :empty",
+        ConditionExpression: "attribute_exists(pk) AND attribute_not_exists(#e)",
+        ExpressionAttributeNames: { "#e": "events" },
+        ExpressionAttributeValues: { ":empty": { replied: 0, bounced: 0, unsubscribed: 0 } },
+      }).promise(),
+    );
+    r = await bump();
     return r.ok;
   }
 

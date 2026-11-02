@@ -100,6 +100,8 @@ export interface RunView {
   campaignId: number;
   campaignName: string;
   counts: PushRun["counts"];
+  /** What Smartlead later reported about this run's contacts; absent until something was reported. */
+  events?: PushRun["events"];
   approved: number;
   startedAt: string;
   finishedAt?: string;
@@ -111,7 +113,7 @@ export function toRunView(run: PushRun): RunView {
   const warnings = Array.isArray((run.options as any)?.warnings) ? ((run.options as any).warnings as unknown[]).filter((w): w is string => typeof w === "string") : [];
   return {
     runId: run.runId, status: run.status, ...(run.pauseReason ? { pauseReason: run.pauseReason } : {}), listId: run.listId, campaignId: run.campaignId, campaignName: run.campaignName,
-    counts: run.counts, approved: run.previewEligible, startedAt: run.startedAt, ...(run.finishedAt ? { finishedAt: run.finishedAt } : {}), ...(run.failure ? { failure: run.failure } : {}), warnings,
+    counts: run.counts, ...(run.events ? { events: run.events } : {}), approved: run.previewEligible, startedAt: run.startedAt, ...(run.finishedAt ? { finishedAt: run.finishedAt } : {}), ...(run.failure ? { failure: run.failure } : {}), warnings,
   };
 }
 
