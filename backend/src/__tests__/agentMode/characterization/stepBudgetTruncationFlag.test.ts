@@ -103,6 +103,56 @@ describe('ENG-244 — real loop sets truncatedByStepBudget at the step budget', 
     expect(result.content).toMatch(/reached the maximum number of processing steps/i);
   });
 
+  it('ENG-2778: forces a final synthesis on the last step instead of the canned apology', async () => {
+    // Repro of session 3d6be53d: the model pages transcripts with empty text every
+    // step. On the final step the loop must tell it to stop, discard any tool call
+    // it still makes, and deliver its own summary of the gathered work.
+    const executed: string[] = [];
+    let call = 0;
+    const synthesisCalls: number[] = [];
+    jest.spyOn(service as any, 'callLLM').mockImplementation(async (...args: any[]) => {
+      const messages = args[1] || [];
+      const isFinal = messages.some(
+        (m: any) => m?.role === 'system' && typeof m.content === 'string' && /Step budget exhausted/.test(m.content),
+      );
+      const n = call++;
+      if (isFinal) {
+        synthesisCalls.push(n);
+        return buildLLMResponse({
+          content: 'Recap so far: 22 baseline prospects, 9 new since Oct 24. Still missing: reply rates.',
+          tool_calls: [{ id: 'late', name: 'read_tool_response', arguments: '{"char_offset":999999}' }],
+        });
+      }
+      return buildLLMResponse({
+        content: '',
+        tool_calls: [{ id: `c${n}`, name: 'read_tool_response', arguments: `{"char_offset":${n * 1000}}` }],
+      });
+    });
+    jest.spyOn(service as any, 'executeTool').mockImplementation(async (...args: any[]) => {
+      executed.push(args[2]?.char_offset ?? JSON.stringify(args[2]));
+      return JSON.stringify({ success: true, data: 'mock' });
+    });
+    jest.spyOn(service as any, 'generateSuggestedReplies').mockResolvedValue([]);
+
+    const result = (await service.generateMarketingResponse(
+      'Give me a client-facing recap of the campaign since Oct 24.',
+      [] as any,
+      'test-user',
+      service.default_model,
+      'test-session',
+    )) as any;
+
+    expect(result.truncatedByStepBudget).toBe(true);
+    expect(result.content).toMatch(/Recap so far/);
+    expect(result.content).not.toMatch(/reached the maximum number of processing steps/i);
+    // Exactly one forced synthesis call, and it was the last LLM call; maxIterations not raised.
+    expect(synthesisCalls).toHaveLength(1);
+    expect(synthesisCalls[0]).toBe(call - 1);
+    expect(call).toBe(40);
+    // The tool call made during the synthesis was discarded, not executed.
+    expect(JSON.stringify(executed)).not.toContain('999999');
+  });
+
   it('does NOT set truncatedByStepBudget on a clean run that finishes within budget (no false positive)', async () => {
     // Turn 1 gathers, turn 2 emits the final report with no tool call → clean
     // termination well under the budget.

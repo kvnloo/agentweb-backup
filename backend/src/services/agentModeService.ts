@@ -56,7 +56,7 @@ import {
 import { isBookkeepingTool, reconcileFalseFailureReport } from '../utils/falseFailureReport';
 import { ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import { computeTermination } from './agentMode/core/agentStep';
-import { ANTI_LOOP_STOP_MESSAGE, EMPTY_FINAL_RESPONSE_FALLBACK } from './agentMode/core/termination';
+import { ANTI_LOOP_STOP_MESSAGE, EMPTY_FINAL_RESPONSE_FALLBACK, STEP_BUDGET_FINAL_SYNTHESIS_MESSAGE } from './agentMode/core/termination';
 import { recordPagingCalls, PAGING_SPIRAL_STOP_MESSAGE } from './agentMode/core/pagingSpiral';
 import { sanitizeGeminiSchema } from './agentMode/core/geminiNativeClient';
 import {
@@ -3779,6 +3779,8 @@ export class AgentModeService {
       // Sticky: once the loop switches to synthesis it never offers tools again this turn.
       let forceFinalSynthesis = false;
       let truncatedByTimeBudget = false;
+      // ENG-2778: the forced synthesis was triggered by the step budget, not the clock.
+      let stepBudgetSynthesis = false;
       // Set when the forced synthesis call failed with no room left to retry it — the loop
       // then stops instead of starting a second full call it cannot afford (see below).
       let synthesisRetryUnaffordable = false;
@@ -3897,6 +3899,23 @@ export class AgentModeService {
           // Opslane 2026-10-13: in-turn control text is role 'system' (as ENG-763 did for
           // the cross-turn loop-breaker) — as 'user' the model attributes it to the user.
           (messages as any[]).push({ role: 'system', content: urgency });
+        }
+
+        // ENG-2778: the last step-budget iteration is a forced synthesis, mirroring the
+        // ENG-907 wall-clock path. Before this, a model still paging at step 40 got its
+        // tool calls executed and the loop exited with empty content, so the user got only
+        // the canned "maximum number of processing steps" apology despite 39 steps of
+        // gathered work. Reusing forceFinalSynthesis drops any tool calls this turn makes
+        // and suppresses the continuation ladders, so the turn ends with the model's own
+        // summary. Does not raise maxIterations. Iteration 1 is exempt (nothing gathered).
+        if (remaining === 0 && iteration > 1 && !forceFinalSynthesis) {
+          forceFinalSynthesis = true;
+          stepBudgetSynthesis = true;
+          console.warn(
+            `AgentMode: step budget exhausted for session ${sessionId} (${iteration}/${maxIterations}) — ` +
+            'no longer honouring tool calls and forcing a final synthesis so the work so far is delivered'
+          );
+          (messages as any[]).push({ role: 'system', content: STEP_BUDGET_FINAL_SYNTHESIS_MESSAGE });
         }
 
         // ENG-907: same self-regulation for the wall-clock budget. The first iteration is
@@ -4584,7 +4603,7 @@ export class AgentModeService {
               }
             }
             if (responseMessage) responseMessage.content = content;
-          } else if (synthesisResidueGuardEnabled && !turnHadUsableText && toolCalls.length > 0 && !truncatedByTimeBudget) {
+          } else if (synthesisResidueGuardEnabled && !turnHadUsableText && toolCalls.length > 0 && !truncatedByTimeBudget && !stepBudgetSynthesis) {
             // Same failure family as the residue case above (a synthesis the run could
             // not produce), just without residue text to detect: the bounded
             // empty-synthesis nudge (MAX_EMPTY_SYNTHESIS_RETRIES) above already asked
@@ -4611,6 +4630,8 @@ export class AgentModeService {
             // message the user actually needs to see (found via ENG-426 verification:
             // turnTimeBudgetTruncation.test.ts pinned the time-limit message and this
             // branch was clobbering it before the post-loop check ever ran).
+            // ENG-2778: same exclusion for the step-budget forced synthesis, whose
+            // post-loop step-limit message is the specific fallback.
             console.warn(`AgentMode: Terminating turn stayed empty after ${emptySynthesisRetries} nudge retr${emptySynthesisRetries === 1 ? 'y' : 'ies'} in session ${sessionId} — falling back to the executed-action ledger (${toolCalls.length} tool call(s))`);
             content = buildExecutedActionsFallback(toolCalls);
             if (responseMessage) responseMessage.content = content;
