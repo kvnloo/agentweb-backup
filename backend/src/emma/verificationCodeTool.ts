@@ -274,7 +274,7 @@ emmaToolRegistry.register({
     const returnLink = args?.return_link === true;
     const waitSeconds = resolveWaitSeconds(args?.wait_seconds);
     const deliveredTo = normalizeDeliveredTo(args?.delivered_to);
-    if (args?.delivered_to && !deliveredTo) {
+    if (args?.delivered_to !== undefined && args?.delivered_to !== null && !deliveredTo) {
       return {
         success: false,
         reason: 'invalid_argument',

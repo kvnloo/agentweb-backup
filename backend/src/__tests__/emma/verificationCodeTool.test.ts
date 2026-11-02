@@ -746,6 +746,13 @@ describe('read_verification_code — role/alias address (delivered_to)', () => {
     expect(mockListEmails).not.toHaveBeenCalled();
   });
 
+  it('rejects an explicitly empty delivered_to instead of dropping the filter', async () => {
+    const result = await tool.execute({ delivered_to: '  ', wait_seconds: 0 }, context);
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe('invalid_argument');
+    expect(mockListEmails).not.toHaveBeenCalled();
+  });
+
   it('leaves the query unchanged without delivered_to', async () => {
     await tool.execute({ subject_contains: 'Login Code', wait_seconds: 0 }, context);
     expect(mockSearchEmails.mock.calls[0][2]).not.toContain('deliveredto');
