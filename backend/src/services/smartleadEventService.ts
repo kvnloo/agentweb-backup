@@ -225,6 +225,15 @@ export class SmartleadEventService {
     if (!seen) pending.push({ runId, kind });
   }
 
+  /** A log line that can never throw: the counters must not be able to replace the error of the loop they follow. */
+  private safeLog(line: string): void {
+    try {
+      this.deps.log(line);
+    } catch {
+      // nothing left to do with a broken logger
+    }
+  }
+
   /** Writes the counters noted by wantCount. Never throws, and gives up waiting after COUNT_WAIT_MS: a slow run table must not hold the response. */
   private async flushCounts(pending: PendingCount[]): Promise<void> {
     if (pending.length === 0 || !this.deps.countContactEvent) return;
@@ -235,11 +244,11 @@ export class SmartleadEventService {
         try {
           await count(p.runId, p.kind);
         } catch (e) {
-          this.deps.log(`[SmartleadEvents] run counter (${p.kind}) failed for run ${p.runId}: ${e instanceof Error ? e.message : String(e)}`);
+          this.safeLog(`[SmartleadEvents] run counter (${p.kind}) failed for run ${p.runId}: ${e instanceof Error ? e.message : String(e)}`);
         }
       }
     })();
-    const gaveUp = new Promise<void>(resolve => { timer = setTimeout(() => { this.deps.log(`[SmartleadEvents] run counters still pending after ${COUNT_WAIT_MS} ms, not waiting`); resolve(); }, COUNT_WAIT_MS); });
+    const gaveUp = new Promise<void>(resolve => { timer = setTimeout(() => { this.safeLog(`[SmartleadEvents] run counters still pending after ${COUNT_WAIT_MS} ms, not waiting`); resolve(); }, COUNT_WAIT_MS); });
     try {
       await Promise.race([work, gaveUp]);
     } finally {
