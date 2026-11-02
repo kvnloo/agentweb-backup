@@ -14,6 +14,9 @@ interface World {
   raceOnce?: boolean;
   raceAlways?: boolean;
   notifyThrows?: boolean;
+  /** When set, the run counter is wired and every call lands here (with how many status writes had been made at that moment). */
+  counted?: Array<{ runId: string; kind: string; statusWritesSoFar: number }>;
+  countThrows?: boolean;
 }
 const lead = (listId: string, leadId: string, email: string, over: Record<string, any> = {}) => ({ listId, leadId, email, updatedAt: "2026-10-29T10:00:00.000Z", engagements: [], system: { [`smartlead_${CAMPAIGN}`]: marker("run-ok") }, ...over });
 
@@ -44,10 +47,16 @@ function make(w: World) {
       if (w.notifyThrows) throw new Error("mail down");
       w.notified.push({ list: list.listId, lead: l.leadId, type, data, at });
     },
+    ...(w.counted ? {
+      countContactEvent: async (runId: string, kind: string) => {
+        if (w.countThrows) throw new Error("run table down");
+        w.counted!.push({ runId, kind, statusWritesSoFar: w.statusWrites.length });
+      },
+    } : {}),
     now: () => new Date("2026-10-29T12:00:00.000Z"),
     log: () => undefined,
   };
-  return new SmartleadEventService(deps);
+  return new SmartleadEventService(deps as EventDeps);
 }
 const world = (over: Partial<World> = {}): World => ({
   leads: [lead("L1", "a", "ann@example.com")],
@@ -489,5 +498,80 @@ describe("events found by the hourly poll (ENG-673)", () => {
     const other = pushed();
     const o2 = await make(other).handle({ accountId: "smartlead-someone-else", campaignId: CAMPAIGN }, polled("unsubscribe"));
     expect(o2.matched).toBe(0);
+  });
+});
+
+describe("counting a run's replied, bounced and unsubscribed contacts for the run view (ENG-673)", () => {
+  const pushed = (over: Partial<World> = {}) => world({ counted: [], leads: [lead("L1", "a", "ann@example.com", { system: { [`smartlead_${CAMPAIGN}`]: marker("run-ok") } })], ...over });
+  const polled = (kind: "reply" | "bounce" | "unsubscribe", over: Partial<SmartleadEvent> = {}): SmartleadEvent => ({
+    kind, campaignId: CAMPAIGN, candidateEmails: ["ann@example.com"], soft: false, polled: true, eventKey: `poll:${kind}:${CAMPAIGN}:9`, ...over,
+  });
+  const kinds = (w: World) => w.counted!.map(c => `${c.runId}:${c.kind}`);
+
+  it("counts a contact's reply once, and a second reply from the same contact does not count again", async () => {
+    const w = pushed();
+    const svc = make(w);
+    await svc.handle(ctx, reply());
+    await svc.handle(ctx, reply({ time_replied: "2026-10-29T11:30:00Z", subject: "Re: Hi again" }));
+    expect(w.appended.filter(a => a.eventType === "email.received")).toHaveLength(2); // both replies are on the contact
+    expect(kinds(w)).toEqual(["run-ok:replied"]); // the run counts contacts, not messages
+  });
+
+  it("a replayed delivery counts nothing the second time", async () => {
+    const w = pushed();
+    const svc = make(w);
+    await svc.handle(ctx, unsub());
+    await svc.handle(ctx, unsub());
+    expect(kinds(w)).toEqual(["run-ok:unsubscribed"]);
+  });
+
+  it("counts a hard bounce but not a temporary one; a hard bounce after a temporary one still counts", async () => {
+    const w = pushed();
+    const svc = make(w);
+    await svc.handle(ctx, bounce({ bounce_type: "soft", sl_email_lead_id: 1, time: "2026-10-29T10:30:00.000Z" } as any));
+    expect(w.counted).toHaveLength(0);
+    await svc.handle(ctx, bounce({ time: "2026-10-29T11:00:00.000Z" }));
+    expect(kinds(w)).toEqual(["run-ok:bounced"]);
+  });
+
+  it("a failing counter never changes what happens to the contact: the opt-out is still saved and the event still succeeds", async () => {
+    const w = pushed({ countThrows: true });
+    const out = await make(w).handle(ctx, unsub());
+    expect(out.changed).toBeGreaterThan(0);
+    expect(w.leads[0].contactStatus).toBe("unsubscribed");
+    expect(w.appended.map(a => a.eventType)).toEqual(["email.unsubscribed"]);
+    const r = pushed({ countThrows: true });
+    await expect(make(r).handle(ctx, reply())).resolves.toMatchObject({ changed: 1 });
+    expect(r.notified).toHaveLength(1); // and the reply alert still went out
+  });
+
+  it("the counter comes after the block is written, never before it", async () => {
+    const w = pushed();
+    await make(w).handle(ctx, unsub());
+    expect(w.statusWrites).toHaveLength(1);
+    expect(w.counted![0].statusWritesSoFar).toBe(1);
+  });
+
+  it("counts an opt-out even when the contact was already blocked by other means (the event itself is new)", async () => {
+    const w = pushed({ leads: [lead("L1", "a", "ann@example.com", { contactStatus: "do-not-contact", system: { [`smartlead_${CAMPAIGN}`]: marker("run-ok") } })] });
+    await make(w).handle(ctx, unsub());
+    expect(w.statusWrites).toHaveLength(0);
+    expect(kinds(w)).toEqual(["run-ok:unsubscribed"]);
+  });
+
+  it("the poll finding what the webhook already delivered counts nothing", async () => {
+    const w = pushed();
+    const svc = make(w);
+    await svc.handle(ctx, unsub());
+    await svc.handle(ctx, polled("unsubscribe"));
+    expect(kinds(w)).toEqual(["run-ok:unsubscribed"]);
+    const r = pushed();
+    await make(r).handle(ctx, polled("unsubscribe")); // a missed one the poll recovers is new
+    expect(kinds(r)).toEqual(["run-ok:unsubscribed"]);
+  });
+
+  it("works with no run store wired (nothing is counted, nothing breaks)", async () => {
+    const w = world({ leads: [lead("L1", "a", "ann@example.com", { system: { [`smartlead_${CAMPAIGN}`]: marker("run-ok") } })] });
+    await expect(make(w).handle(ctx, unsub())).resolves.toMatchObject({ matched: 1 });
   });
 });
