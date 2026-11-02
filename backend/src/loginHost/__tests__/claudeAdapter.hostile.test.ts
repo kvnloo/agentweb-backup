@@ -171,7 +171,7 @@ describe("one line cannot fan out into a flood of events", () => {
     expect(events.filter((e) => e.type === "text").length).toBeLessThanOrEqual(2000);
     expect(rig.logs.filter((l) => l.event === "event_flood")).toHaveLength(1);
     // event_flood is a guard trip: the raw pipes of the child were closed before the signal
-    expect((session as unknown as { childAdapter?: { child: { stdout: { destroyed: boolean } } } }).childAdapter?.child.stdout.destroyed).toBe(true);
+    expect((session as unknown as { childAdapter?: { pipesClosed: boolean } }).childAdapter?.pipesClosed).toBe(true); // (the raw stream is destroyed by node itself once the process is gone, so the adapter's own flag is what shows the trip)
     expect(events.some((e) => e.type === "result" && e.ok === true)).toBe(false);
   });
 });
