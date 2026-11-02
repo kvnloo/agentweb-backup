@@ -17,6 +17,10 @@ interface World {
   /** When set, the run counter is wired and every call lands here (with how many status writes had been made at that moment). */
   counted?: Array<{ runId: string; kind: string; statusWritesSoFar: number }>;
   countThrows?: boolean;
+  /** The counter never answers. */
+  countHangs?: boolean;
+  /** The first status write fails (a retry then finds the engagement already recorded). */
+  statusFailsOnce?: boolean;
 }
 const lead = (listId: string, leadId: string, email: string, over: Record<string, any> = {}) => ({ listId, leadId, email, updatedAt: "2026-10-29T10:00:00.000Z", engagements: [], system: { [`smartlead_${CAMPAIGN}`]: marker("run-ok") }, ...over });
 
@@ -39,6 +43,7 @@ function make(w: World) {
       w.appended.push({ listId, leadId, ...engagement });
     },
     setContactStatus: async (listId, leadId, fields) => {
+      if (w.statusFailsOnce && !(w as any).statusFailed) { (w as any).statusFailed = true; throw new Error("db blip"); }
       const l = w.leads.find(x => x.listId === listId && x.leadId === leadId)!;
       Object.assign(l, fields);
       w.statusWrites.push({ listId, leadId, ...fields });
@@ -49,6 +54,7 @@ function make(w: World) {
     },
     ...(w.counted ? {
       countContactEvent: async (runId: string, kind: string) => {
+        if (w.countHangs) await new Promise(() => undefined);
         if (w.countThrows) throw new Error("run table down");
         w.counted!.push({ runId, kind, statusWritesSoFar: w.statusWrites.length });
       },
@@ -552,11 +558,51 @@ describe("counting a run's replied, bounced and unsubscribed contacts for the ru
     expect(w.counted![0].statusWritesSoFar).toBe(1);
   });
 
-  it("counts an opt-out even when the contact was already blocked by other means (the event itself is new)", async () => {
-    const w = pushed({ leads: [lead("L1", "a", "ann@example.com", { contactStatus: "do-not-contact", system: { [`smartlead_${CAMPAIGN}`]: marker("run-ok") } })] });
-    await make(w).handle(ctx, unsub());
-    expect(w.statusWrites).toHaveLength(0);
+  it("does not count an opt-out for a contact that was already blocked: our own withdrawal echoed back by Smartlead is not a contact's act", async () => {
+    const w = pushed();
+    const svc = make(w);
+    await svc.handle(ctx, bounce({ time: "2026-10-29T11:00:00.000Z" })); // hard bounce: counted, blocked
+    await svc.handle(ctx, unsub()); // the sweep unsubscribes the blocked contact in Smartlead, which reports it back
+    expect(kinds(w)).toEqual(["run-ok:bounced"]);
+    const admin = pushed({ leads: [lead("L1", "a", "ann@example.com", { contactStatus: "do-not-contact", system: { [`smartlead_${CAMPAIGN}`]: marker("run-ok") } })] });
+    await make(admin).handle(ctx, unsub());
+    expect(admin.statusWrites).toHaveLength(0);
+    expect(admin.counted).toHaveLength(0);
+  });
+
+  it("a retry after a failed block write still counts, once", async () => {
+    const w = pushed({ statusFailsOnce: true });
+    const svc = make(w);
+    await expect(svc.handle(ctx, unsub())).rejects.toThrow("db blip"); // Smartlead would retry
+    expect(w.counted).toHaveLength(0);
+    await svc.handle(ctx, unsub());
+    expect(w.leads[0].contactStatus).toBe("unsubscribed");
     expect(kinds(w)).toEqual(["run-ok:unsubscribed"]);
+    await svc.handle(ctx, unsub()); // and a further replay does not count again
+    expect(kinds(w)).toEqual(["run-ok:unsubscribed"]);
+  });
+
+  it("a contact in two lists is blocked in both before any counter is written, so a counter can never hold up the second block", async () => {
+    const w = pushed({ leads: [
+      lead("L1", "a", "ann@example.com", { system: { [`smartlead_${CAMPAIGN}`]: marker("run-ok") } }),
+      lead("L2", "b", "ann@example.com", { system: { [`smartlead_${CAMPAIGN}`]: marker("run-ok") } }),
+    ] });
+    await make(w).handle(ctx, unsub());
+    expect(w.statusWrites).toHaveLength(2);
+    expect(w.counted!.map(c => c.statusWritesSoFar)).toEqual([2, 2]);
+  });
+
+  it("a counter that never answers does not hold up the response for more than a couple of seconds", async () => {
+    jest.useFakeTimers();
+    try {
+      const w = pushed({ countHangs: true });
+      const p = make(w).handle(ctx, unsub());
+      await jest.advanceTimersByTimeAsync(2100);
+      await expect(p).resolves.toMatchObject({ matched: 1 });
+      expect(w.leads[0].contactStatus).toBe("unsubscribed");
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   it("the poll finding what the webhook already delivered counts nothing", async () => {

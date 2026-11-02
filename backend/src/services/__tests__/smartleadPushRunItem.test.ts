@@ -109,6 +109,17 @@ describe('counting a contact event on a run (ENG-673)', () => {
     expect(f.state.hasEvents).toBe(false);
   });
 
+  it('reads only the counters of a run, and nothing for a run with none or a missing run', async () => {
+    const items: Record<string, any> = { a: { pk: 'a', sk: 'RUN', events: { replied: 2, unsubscribed: 1 } }, b: { pk: 'b', sk: 'RUN' } };
+    const seen: any[] = [];
+    const client: any = { get: (params: any) => ({ promise: async () => { seen.push(params); return { Item: items[params.Key.pk] }; } }) };
+    const db = new SmartleadPushRunDb(client, 'T', () => 0, async () => undefined);
+    expect(await db.getRunEvents('a')).toEqual({ replied: 2, bounced: 0, unsubscribed: 1 });
+    expect(await db.getRunEvents('b')).toBeUndefined();
+    expect(await db.getRunEvents('zzz')).toBeUndefined();
+    expect(seen[0]).toMatchObject({ ProjectionExpression: '#e', ExpressionAttributeNames: { '#e': 'events' } });
+  });
+
   it('refuses a kind it does not know before any write', async () => {
     const f = fake({ hasRun: true, hasEvents: true });
     await expect(f.db.countContactEvent('r1', 'deleted' as any)).rejects.toBeInstanceOf(SmartleadPushRunStoreError);

@@ -32,6 +32,14 @@ export class InMemoryPushRunDb {
   }
 
   async getRun(runId: string) { const r = this.runs.get(runId); return r ? this.clone(r) : null; }
+  async getRunEvents(runId: string) { const e = this.runs.get(runId)?.events; return e ? { ...e } : undefined; }
+  async countContactEvent(runId: string, kind: "replied" | "bounced" | "unsubscribed") {
+    const r = this.runs.get(runId);
+    if (!r) return false;
+    r.events = { replied: 0, bounced: 0, unsubscribed: 0, ...(r.events ?? {}) };
+    r.events[kind]++;
+    return true;
+  }
   async getLock(listId: string, campaignId: number) { const id = this.locks.get(this.lockKey(listId, campaignId)); return id ? { runId: id } : null; }
 
   async startRun(input: NewPushRun, workerId: string): Promise<StartResult> {
