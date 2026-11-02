@@ -297,6 +297,7 @@ export class GmailService implements IEmailService {
       subject: this.getHeader(headers, 'Subject') || '(no subject)',
       from: this.getHeader(headers, 'From'),
       to: this.getHeader(headers, 'To'),
+      cc: this.getHeader(headers, 'Cc'),
       date: this.getHeader(headers, 'Date'),
       receivedAt: this.receivedAtIso(detail.data.internalDate),
       snippet: detail.data.snippet || '',
@@ -409,7 +410,7 @@ export class GmailService implements IEmailService {
 
     const ids = messages.map(m => m.id);
     const boundary = `batch_gmail_meta_${Date.now()}`;
-    const requestBody = this.buildBatchRequestBody(ids, boundary, 'metadata', ['Subject', 'From', 'Date']);
+    const requestBody = this.buildBatchRequestBody(ids, boundary, 'metadata', ['Subject', 'From', 'Date', 'To', 'Cc']);
     const parts = await this.doBatchRequest(token, requestBody, boundary);
 
     const results: EmailSummary[] = [];
@@ -425,6 +426,8 @@ export class GmailService implements IEmailService {
         date: this.getHeader(headers, 'Date'),
         receivedAt: this.receivedAtIso(part.body.internalDate),
         snippet: part.body.snippet || '',
+        to: this.getHeader(headers, 'To'),
+        cc: this.getHeader(headers, 'Cc'),
       });
     }
     return results;
@@ -472,6 +475,7 @@ export class GmailService implements IEmailService {
             subject: this.getHeader(headers, 'Subject') || '(no subject)',
             from: this.getHeader(headers, 'From'),
             to: this.getHeader(headers, 'To'),
+            cc: this.getHeader(headers, 'Cc'),
             date: this.getHeader(headers, 'Date'),
             receivedAt: this.receivedAtIso(data.internalDate),
             snippet: data.snippet || '',
