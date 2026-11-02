@@ -91,7 +91,18 @@ export function candidatesFromRecommendations(
     if (onRiskClassified) {
       const objectLevel = c.metricScope === 'ad' ? 'ad' : 'campaign';
       // Ownership is not proven from ledger rows, so this never classifies as auto.
-      onRiskClassified(candidate, classifyMarketingActionRisk({ actionType: candidate.actionType, objectLevel }));
+      const classification = classifyMarketingActionRisk({ actionType: candidate.actionType, objectLevel });
+      // Shadow observer gets a snapshot and cannot mutate output or abort generation.
+      const snapshot: MarketingActionCandidate = {
+        ...candidate,
+        evidence: [...candidate.evidence],
+        priority: { ...candidate.priority },
+      };
+      try {
+        onRiskClassified(snapshot, classification);
+      } catch {
+        // Observer failures are ignored: shadow-only, must not affect candidates.
+      }
     }
   }
   return out;

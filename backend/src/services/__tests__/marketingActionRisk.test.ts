@@ -50,4 +50,16 @@ describe('classifyMarketingActionRisk (ENG-2775)', () => {
       expect(classifyMarketingActionRisk({ actionType, objectLevel, owned: true }).requiresApproval).toBe(true);
     }
   });
+
+  it('rejects a level-qualified verb whose objectLevel disagrees (no auto)', () => {
+    for (const [actionType, objectLevel] of [
+      ['pause_campaign', 'ad'], ['pause_campaign', 'adset'], ['pause_ad', 'adset'],
+      ['pause_adset', 'ad'], ['kill_ad', 'adset'], ['kill_adset', 'ad'],
+    ]) {
+      expect(classifyMarketingActionRisk({ actionType, objectLevel, owned: true })).toMatchObject({
+        riskClass: 'unknown', requiresApproval: true,
+      });
+    }
+    expect(classifyMarketingActionRisk({ actionType: 'pause_adset', objectLevel: 'adset', owned: true }).requiresApproval).toBe(false);
+  });
 });

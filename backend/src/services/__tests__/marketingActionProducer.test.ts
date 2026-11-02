@@ -34,6 +34,18 @@ describe('ENG-1094 marketing-action producer', () => {
     expect(seen[0].risk).toMatchObject({ riskClass: 'creative_change', requiresApproval: true });
   });
 
+  it('ENG-2775 shadow: a mutating or throwing observer cannot change candidates', () => {
+    const recs = [rec('a', 10), rec('b', 70)];
+    const expected = candidatesFromRecommendations(recs, SRC);
+    const got = candidatesFromRecommendations(recs, SRC, (c) => {
+      c.evidence.push('tampered');
+      c.priority.confidence = 'high';
+      (c as any).scopeId = 'x';
+      throw new Error('observer boom');
+    });
+    expect(got).toEqual(expected);
+  });
+
   it('maps a structured ledger recommendation to a valid contract candidate (no prose parsing)', () => {
     const [c] = candidatesFromRecommendations([rec('ad1', 60)], SRC);
     expect(c.actionType).toBe(CREATIVE_REFRESH_ACTION);

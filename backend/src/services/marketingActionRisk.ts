@@ -126,6 +126,12 @@ export function classifyMarketingActionRisk(
 
   // Pause/kill: auto only for an owned ad/adset.
   if (!level) return approval('unknown', `${actionType} has no recognized object level; fail closed`);
+  // A level-qualified verb (pause_campaign) must agree with objectLevel, so a
+  // campaign action labelled as an ad cannot reach the auto branch.
+  const verbLevel = /_(adset|ad|campaign)$/.exec(actionType)?.[1];
+  if (verbLevel && verbLevel !== level) {
+    return approval('unknown', `${actionType} names a ${verbLevel} but objectLevel is ${level}; fail closed`);
+  }
   if (!(LOW_RISK_LEVELS as readonly string[]).includes(level)) {
     return approval('reversible_low', `${actionType} on a ${level} exceeds ad/adset blast radius`);
   }
