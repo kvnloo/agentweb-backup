@@ -25,6 +25,15 @@ function rec(adId: string, magnitude: number, overrides: Partial<Recommendation>
 const SRC = { sourceKind: 'run' as const, sourceId: 'run_123' };
 
 describe('ENG-1094 marketing-action producer', () => {
+  it('ENG-2775 shadow: observer receives risk classification; output unchanged', () => {
+    const seen: Array<{ id: string; risk: unknown }> = [];
+    const recs = [rec('a', 10), rec('b', 70)];
+    const withObs = candidatesFromRecommendations(recs, SRC, (c, risk) => seen.push({ id: c.scopeId, risk }));
+    expect(withObs).toEqual(candidatesFromRecommendations(recs, SRC));
+    expect(seen).toHaveLength(2);
+    expect(seen[0].risk).toMatchObject({ riskClass: 'creative_change', requiresApproval: true });
+  });
+
   it('maps a structured ledger recommendation to a valid contract candidate (no prose parsing)', () => {
     const [c] = candidatesFromRecommendations([rec('ad1', 60)], SRC);
     expect(c.actionType).toBe(CREATIVE_REFRESH_ACTION);
