@@ -657,3 +657,84 @@ describe('read_verification_code — org-shared mailbox (ENG-943)', () => {
     expect(mockResolveEmailAccount).toHaveBeenCalledTimes(1);
   });
 });
+
+// ENG-944: a site mails the code to a role address (founders@) that is not a
+// connected account but is delivered into one (own or org-shared).
+describe('read_verification_code — role/alias address (delivered_to)', () => {
+  const ROLE = 'founders@agentweb.pro';
+
+  it('searches the connected mailbox for mail delivered to the role address and returns its code', async () => {
+    mockSearchEmails.mockResolvedValue([summary({ id: 'role-1' })]);
+    mockGetEmails.mockResolvedValue([{ id: 'role-1', to: `Founders <${ROLE}>`, body: 'Your code is 551177' }]);
+
+    const result = await tool.execute(
+      { delivered_to: 'Founders@AgentWeb.pro', subject_contains: 'Login Code', wait_seconds: 0 },
+      context
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.code).toBe('551177');
+    const query = mockSearchEmails.mock.calls[0][2];
+    expect(query).toContain(`deliveredto:"${ROLE}"`);
+  });
+
+  it('never returns a code addressed to a different recipient in the same mailbox', async () => {
+    mockListEmails.mockResolvedValue([summary({ id: 'other' })]);
+    mockGetEmails.mockResolvedValue([
+      { id: 'other', to: 'cofounders@agentweb.pro, harsha@agentweb.pro', body: 'Your code is 999999' },
+    ]);
+
+    const result = await tool.execute({ delivered_to: ROLE, wait_seconds: 0 }, context);
+
+    expect(result.success).toBe(false);
+    expect(result.code).toBeUndefined();
+    expect(result.reason).not.toBe('code_not_found');
+  });
+
+  it('accepts the role address in Cc', async () => {
+    mockListEmails.mockResolvedValue([summary({ id: 'cc' })]);
+    mockGetEmails.mockResolvedValue([
+      { id: 'cc', to: 'harsha@agentweb.pro', cc: ROLE, body: 'Your code is 123123' },
+    ]);
+    const result = await tool.execute({ delivered_to: ROLE, wait_seconds: 0 }, context);
+    expect(result.code).toBe('123123');
+  });
+
+  it('reads through a teammate mailbox only when it resolves for this caller (org-scoped)', async () => {
+    // Another org's / an unshared mailbox does not resolve — no read happens.
+    mockResolveEmailAccount.mockRejectedValue(new Error('Connected account "harsha@agentweb.pro" not found.'));
+
+    const result = await tool.execute(
+      { account_id: 'harsha@agentweb.pro', delivered_to: ROLE, wait_seconds: 0 },
+      { ...context, userId: 'other-org-user' }
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe('no_email_account');
+    expect(mockListEmails).not.toHaveBeenCalled();
+    expect(mockSearchEmails).not.toHaveBeenCalled();
+    expect(mockGetEmails).not.toHaveBeenCalled();
+  });
+
+  it('names the missing mapping when a role address is passed as account_id', async () => {
+    mockResolveEmailAccount.mockRejectedValue(new Error(`Connected account "${ROLE}" not found.`));
+
+    const result = await tool.execute({ account_id: ROLE, wait_seconds: 0 }, context);
+
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe('no_email_account');
+    expect(result.message).toContain(`delivered_to="${ROLE}"`);
+  });
+
+  it('rejects a delivered_to that is not a single address', async () => {
+    const result = await tool.execute({ delivered_to: 'founders', wait_seconds: 0 }, context);
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe('invalid_argument');
+    expect(mockListEmails).not.toHaveBeenCalled();
+  });
+
+  it('leaves the query unchanged without delivered_to', async () => {
+    await tool.execute({ subject_contains: 'Login Code', wait_seconds: 0 }, context);
+    expect(mockSearchEmails.mock.calls[0][2]).not.toContain('deliveredto');
+  });
+});
