@@ -34,6 +34,25 @@ export function webFieldGuardUsd(model?: string): number {
   );
 }
 
+/**
+ * Card-revenue fields are routed by `aliasFor || name` and are only bought when asked for by name
+ * (isCardRevenueField). Enigma bills per value returned, once per lead however many card fields were
+ * asked for: 12m revenue, yoy growth, and the brand name/website values that come back with them.
+ */
+export function wantsEnigma(config: EnrichmentConfig): boolean {
+  return config.fields.some(field => field.include && isCardRevenueField(field.aliasFor || field.name));
+}
+
+/** What one Enigma fetch books per lead, from the rate card (12m + yoy + 4 brand values). */
+export function enigmaFetchUsd(): number {
+  const rate = (key: string): number => {
+    const value = getAllocatedRate('enigma', key);
+    if (value === null || !Number.isFinite(value) || value < 0) throw new Error('Enrichment rate unavailable');
+    return value;
+  };
+  return rate('card_revenue_12m') + rate('card_revenue_yoy_growth_12m') + 4 * rate('brand_attribute');
+}
+
 /** Included fields plus smart-field dependencies, at least 1: what the per-field cost scales with. */
 export function effectiveFieldCount(config: EnrichmentConfig): number {
   const fields = config.fields.filter(field => field.include);
@@ -82,10 +101,7 @@ export function estimateEnrichmentBatchMicroUsd(config: EnrichmentConfig, leadCo
   // Card-revenue fields are routed by `aliasFor || name` and are only bought when asked for by name
   // (isCardRevenueField). Enigma bills per value returned, once per lead however many card fields were
   // asked for: 12m revenue, yoy growth, and the brand name/website values that come back with them.
-  const wantsEnigma = fields.some(field => isCardRevenueField(field.aliasFor || field.name));
-  const enigma = wantsEnigma
-    ? rate('enigma', 'card_revenue_12m') + rate('enigma', 'card_revenue_yoy_growth_12m') + 4 * rate('enigma', 'brand_attribute')
-    : 0;
+  const enigma = wantsEnigma(config) ? enigmaFetchUsd() : 0;
   const perLead = identity
     + effectiveFieldCount(config) * webFieldGuardUsd(model)
     + enigma;

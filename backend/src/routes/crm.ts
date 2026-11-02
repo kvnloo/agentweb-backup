@@ -36,7 +36,7 @@ import { isCardRevenueField } from '../services/enrichmentGroups';
 import { stripImplicitCardRevenueRouting } from '../services/enrichmentConfigService';
 import { estimateEnrichmentCost, toCustomerEstimate,
   normalizeLeadSelection, checkEstimateConfirmation } from '../services/enrichmentCostEstimate';
-import { projectAllowance, admissionEstimateMicroUsd, effectiveFieldCount } from '../services/enrichmentBatchBudget';
+import { projectAllowance, admissionEstimateMicroUsd, effectiveFieldCount, wantsEnigma, enigmaFetchUsd } from '../services/enrichmentBatchBudget';
 import { enrichContact, defaultEnrichmentCache, EnrichmentDeps } from '../services/internalEnrichmentService';
 import { dedupContactsForUser } from '../services/contactDedupService';
 import {
@@ -1861,6 +1861,7 @@ const quoteEnrichment = async (userId: string, listId: string, leadIds?: string[
   const estimate = estimateEnrichmentCost(listId, count, {
     emaillessCount: emailless,
     fieldCount: config ? effectiveFieldCount(config) : undefined,
+    enigmaPerLeadUsd: config && wantsEnigma(config) ? enigmaFetchUsd() : undefined,
   });
   const expectedMicro = Math.round(estimate.totalUsd * 1_000_000);
   const reserveMicro = config ? Math.max(expectedMicro, await admissionEstimateMicroUsd(userId, config, count)) : expectedMicro;

@@ -52,6 +52,14 @@ describe('estimateEnrichmentCost (ENG-2716)', () => {
     expect(estimateEnrichmentCost('l', 6, { emaillessCount: -4 }).breakdownUsd.apollo).toBe(0);
   });
 
+  it('adds one Enigma fetch per lead only when the config asks for a card-revenue field', () => {
+    const base = estimateEnrichmentCost('l', 10);
+    const withEnigma = estimateEnrichmentCost('l', 10, { enigmaPerLeadUsd: 0.28 });
+    expect(withEnigma.totalUsd - base.totalUsd).toBeCloseTo(2.8, 2);
+    expect(withEnigma.breakdownUsd.other - base.breakdownUsd.other).toBeCloseTo(2.8, 2);
+    for (const bad of [0, -1, NaN]) expect(estimateEnrichmentCost('l', 10, { enigmaPerLeadUsd: bad }).totalUsd).toBe(base.totalUsd);
+  });
+
   it('the customer view carries a percent and the token, and no dollar figure or vendor breakdown (ENG-1212)', () => {
     const est = estimateEnrichmentCost('list-1', 112);
     const view = toCustomerEstimate(est, { percent: 2.3, withinAllowance: true });

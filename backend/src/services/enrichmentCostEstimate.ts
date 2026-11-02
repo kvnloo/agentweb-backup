@@ -62,6 +62,8 @@ export interface EstimateInputs {
   emaillessCount?: number;
   /** Included fields plus smart-field dependencies in the saved config. Defaults to the reference config. */
   fieldCount?: number;
+  /** USD one Enigma card-revenue fetch books per lead; set only when the config asks for a card-revenue field. */
+  enigmaPerLeadUsd?: number;
 }
 
 export function estimateEnrichmentCost(listId: string, leadCount: number, inputs: EstimateInputs = {}): EnrichmentCostEstimate {
@@ -74,9 +76,10 @@ export function estimateEnrichmentCost(listId: string, leadCount: number, inputs
   if (apolloWaterfallUsd === null) throw new Error('Apollo waterfall_email rate unavailable');
   const apollo = emailless * apolloWaterfallUsd * r.apolloRevealRate;
   const llm = n * fields * r.llmPerFieldPerLead;
+  const enigmaPerLead = Number.isFinite(inputs.enigmaPerLeadUsd) && (inputs.enigmaPerLeadUsd as number) > 0 ? (inputs.enigmaPerLeadUsd as number) : 0;
   const lookups = n * r.lookupPerLead;
   const webSearch = n * r.webSearchPerLead;
-  const other = n * r.otherPerLead;
+  const other = n * r.otherPerLead + n * enigmaPerLead;
   const total = apollo + llm + lookups + webSearch + other;
   const totalUsd = round2(total);
   return {

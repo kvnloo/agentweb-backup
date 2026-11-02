@@ -4,7 +4,7 @@ jest.mock('../services/tokenUsageService', () => ({
 }));
 import { checkTokenUsage } from '../services/tokenUsageService';
 import { resolveModelForUser } from '../services/modelRoles';
-import { buildEnrichmentBudgetCheck, estimateEnrichmentBatchMicroUsd, projectAllowance, admissionEstimateMicroUsd, effectiveFieldCount, webFieldGuardUsd } from '../services/enrichmentBatchBudget';
+import { buildEnrichmentBudgetCheck, estimateEnrichmentBatchMicroUsd, projectAllowance, admissionEstimateMicroUsd, effectiveFieldCount, wantsEnigma, enigmaFetchUsd, webFieldGuardUsd } from '../services/enrichmentBatchBudget';
 import type { EnrichmentConfig } from '../services/crmEnrichmentServiceV3';
 import { estimateEnrichmentCost } from '../services/enrichmentCostEstimate';
 const config: EnrichmentConfig = { fields: [], globalOverwriteDefault: 'fill_if_empty', schemaVersion: 1, updatedAt: '', updatedBy: '' };
@@ -145,6 +145,15 @@ describe('admission estimate tracks what a run books (ENG-2720)', () => {
     expect(usd(named('Industry', 'card_revenue_period_end'), 10) - plain).toBeCloseTo(perLeadEnigma * 10, 6);
     const threePlain = usd(named('Industry', 'Employees', 'Founded'), 10);
     expect(usd(named('Industry', 'card_revenue_12m', 'card_revenue_yoy_growth'), 10) - threePlain).toBeCloseTo(perLeadEnigma * 10, 6);
+  });
+
+  it('wantsEnigma ignores excluded card fields and enigmaFetchUsd matches the admission reserve', () => {
+    const off: EnrichmentConfig = { ...config, fields: [{ name: 'card_revenue_12m', type: 'string', instruction: '', include: false, overwritePolicy: 'fill_if_empty' }] };
+    expect(wantsEnigma(off)).toBe(false);
+    expect(wantsEnigma(named('Industry'))).toBe(false);
+    expect(wantsEnigma(named('Industry', 'card_revenue_period_end'))).toBe(true);
+    expect(enigmaFetchUsd()).toBeCloseTo(0.1 + 0.1 + 4 * 0.02, 6);
+    expect(usd(named('card_revenue_12m'), 10) - usd(named('Industry'), 10)).toBeCloseTo(enigmaFetchUsd() * 10, 6);
   });
 
   it('routes by aliasFor || name like the orchestrator does', () => {
