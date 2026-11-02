@@ -114,6 +114,17 @@ describe('ENG-589 failure-cluster → Linear intake', () => {
     expect(recur[0].artifact).toMatchObject({ intake: { suppressed: true } });
   });
 
+  it('AC3: overlapping runs on one closed canonical reopen and comment exactly once', async () => {
+    await runTick(10, 5);
+    store.issues[0].state = 'closed';
+    const proposals = await new AgentFailureRuleSet().evaluate(windowEvents(10, 5), WINDOW);
+    const tool = new ClusterIntakeTool({ isProduction: () => true });
+    const [a, b] = await Promise.all([tool.apply(proposals[0]), tool.apply(proposals[0])]);
+    expect(store.issues).toHaveLength(1);
+    expect(store.comments.filter((c) => c.body.startsWith('Reopened'))).toHaveLength(1);
+    expect([a, b].filter((m: any) => m.artifact.intake.reopened === true)).toHaveLength(1);
+  });
+
   it('AC3: a closed issue of a DIFFERENT class is never reopened', async () => {
     store.issues.push({
       id: 'uuid-x', identifier: 'ENG-1', title: 'other', state: 'closed', labels: ['Auto'],

@@ -68,6 +68,8 @@ const defaultPorts = (): ClusterIntakePorts => ({
 export class ClusterIntakeTool implements MutationTools<Payload> {
   private readonly spec: SpecOutputTool<Payload>;
   private readonly ports: ClusterIntakePorts;
+  /** Per-alertClass in-flight reopen, so overlapping runs cannot double-reopen/comment one canonical. */
+  private readonly reopenInFlight = new Map<string, Promise<(FiledAutoResult & { reopened?: boolean }) | null>>();
 
   constructor(ports: Partial<ClusterIntakePorts> = {}, cloudDevTags?: readonly string[]) {
     this.spec = new SpecOutputTool<Payload>(AGENT_MODE_LOOP_ID, cloudDevTags);
@@ -88,7 +90,7 @@ export class ClusterIntakeTool implements MutationTools<Payload> {
       'Alert Class': alertClass,
     };
     try {
-      const intake = await this.reopenClosedCanonical(alertClass, payload, context)
+      const intake = await this.reopenOnce(alertClass, payload, context)
         ?? (await this.ports.fileIssue({
           title: this.title(payload),
           description: this.body(proposal, payload),
@@ -103,6 +105,26 @@ export class ClusterIntakeTool implements MutationTools<Payload> {
         artifact: { ...mutation.artifact, intake: { alertClass } },
         error: `intake failed: ${err instanceof Error ? err.message : String(err)}`,
       };
+    }
+  }
+
+  private async reopenOnce(
+    alertClass: string,
+    payload: AgentFailureProposalPayload,
+    context: Record<string, string>,
+  ): Promise<(FiledAutoResult & { reopened?: boolean }) | null> {
+    const pending = this.reopenInFlight.get(alertClass);
+    if (pending) {
+      const prior = await pending;
+      // The concurrent run already reopened (or suppressed) it; report as deduped, never re-comment.
+      return prior ? { ...prior, reopened: false } : null;
+    }
+    const run = this.reopenClosedCanonical(alertClass, payload, context);
+    this.reopenInFlight.set(alertClass, run);
+    try {
+      return await run;
+    } finally {
+      this.reopenInFlight.delete(alertClass);
     }
   }
 

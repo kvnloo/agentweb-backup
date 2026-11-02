@@ -484,9 +484,10 @@ export async function findMostRecentArchivedIssueByLabel(
 }
 
 /**
- * ENG-589: most-recently-updated CLOSED (completed/canceled), non-archived issue carrying
+ * ENG-589: most-recently-updated COMPLETED, non-archived issue carrying
  * `labelName` that matches `isMatch`. Lets a recurring failure cluster reopen its canonical
- * instead of filing a fresh issue after the first one was closed. Read-only; callers must treat
+ * instead of filing a fresh issue after the first one was closed. Canceled issues are excluded:
+ * a cancel is a human decision the loop must not override. Read-only; callers must treat
  * a lookup failure as "no closed canonical" and fall through to normal intake.
  */
 export async function findMostRecentClosedIssueByLabel(
@@ -501,7 +502,7 @@ export async function findMostRecentClosedIssueByLabel(
         orderBy: updatedAt,
         filter: {
           team: { key: { eq: $team } },
-          state: { type: { in: ["completed", "canceled"] } },
+          state: { type: { eq: "completed" } },
           labels: { name: { eq: $label } }
         }
       ) { nodes { id identifier title description archivedAt } }
