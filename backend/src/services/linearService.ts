@@ -484,6 +484,39 @@ export async function findMostRecentArchivedIssueByLabel(
 }
 
 /**
+ * ENG-589: most-recently-updated CLOSED (completed/canceled), non-archived issue carrying
+ * `labelName` that matches `isMatch`. Lets a recurring failure cluster reopen its canonical
+ * instead of filing a fresh issue after the first one was closed. Read-only; callers must treat
+ * a lookup failure as "no closed canonical" and fall through to normal intake.
+ */
+export async function findMostRecentClosedIssueByLabel(
+  labelName: string,
+  isMatch: (issue: OpenIssue) => boolean,
+  limit = 50,
+): Promise<OpenIssue | null> {
+  const data = await linearGraphQL(
+    `query($team: String!, $label: String!, $limit: Int!) {
+      issues(
+        first: $limit,
+        orderBy: updatedAt,
+        filter: {
+          team: { key: { eq: $team } },
+          state: { type: { in: ["completed", "canceled"] } },
+          labels: { name: { eq: $label } }
+        }
+      ) { nodes { id identifier title description archivedAt } }
+    }`,
+    { team: TEAM_KEY, label: labelName, limit },
+  );
+  const nodes: any[] = data?.issues?.nodes || [];
+  const candidate = nodes
+    .filter((n) => !n.archivedAt)
+    .map((n) => ({ identifier: n.identifier, issueId: n.id, title: n.title || '', description: n.description || '' }))
+    .find(isMatch);
+  return candidate || null;
+}
+
+/**
  * Thrown when a mutation attempts to move an issue into Linear's `Duplicate` state (or otherwise
  * create a duplicate relation) against a target that is archived. Linear hard-rejects this
  * server-side ("Issues can only be moved to a duplicate state when a duplicate issue relation
