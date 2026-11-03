@@ -37,6 +37,11 @@
  * added here). A record left in between_attempts heals: Twilio redelivers that leg's final callback, which asks for
  * the next attempt again. Metering and finishing live in services/voice/callFinalisation.ts.
  *
+ * Inbound callbacks (a lead dialling the org's number back) are separate, stateless endpoints (/inbound,
+ * /inbound-screen, /inbound-screen-result, /inbound-dial, /inbound-status) with their own guard: the same
+ * credentials + signature steps, but the org comes from the dialled number or from the signed orgId in the query
+ * instead of a lead record. See the "Inbound callbacks" section at the end of this file.
+ *
  * Decisions that do not change `state` (member declined, lead did not answer) are made once through marker
  * entries in `lastSequence`: see HotLeadCallRecord.lastSequence.
  */
@@ -44,9 +49,9 @@
 import { randomUUID } from 'crypto';
 import express from 'express';
 import type { Request, RequestHandler, Response } from 'express';
-import { crmDb } from '../services/db';
+import { crmDb, orgDb } from '../services/db';
 import { getVoiceProvider } from '../services/voice/voiceProvider';
-import { voiceWebhookBaseUrl, buildVoiceWebhookUrl, isWebhookSafeId } from '../services/voice/voiceUrls';
+import { voiceWebhookBaseUrl, buildVoiceWebhookUrl, buildInboundWebhookUrl, isWebhookSafeId } from '../services/voice/voiceUrls';
 import { isHotLeadCallEnabled } from '../services/voice/hotLeadCallMode';
 import { resolveHotLeadCallContext, type HotLeadCallContext } from '../services/voice/hotLeadCallContext';
 import { getLeadCallStore } from '../services/voice/leadCallStore';
@@ -55,8 +60,13 @@ import {
   decisionKey, errorName, finishIfComplete, meterLeg, nextAttemptOrFinish, type CallQuery, type LegCallback,
 } from '../services/voice/callFinalisation';
 import {
-  bridgeTwiml, connectTwiml, hangupTwiml, leadDeclinedTwiml, leadPhoneChangedTwiml, leadScreenTwiml, leadUnreachableTwiml, memberPromptTwiml,
+  bridgeTwiml, connectTwiml, hangupTwiml, inboundMemberScreenTwiml, inboundNobodyTwiml, inboundRingTwiml, inboundUnavailableTwiml,
+  leadDeclinedTwiml, leadPhoneChangedTwiml, leadScreenTwiml, leadUnreachableTwiml, memberPromptTwiml,
 } from '../services/voice/twiml';
+import { recordCallUsage } from '../services/voice/voiceUsage';
+import {
+  isAcceptingMember, nextInboundMember, resolveInboundContext, resolveInboundContextForOrg, triedMembersOf, type InboundContext,
+} from '../services/voice/inboundCallback';
 import { leadPhoneMacOf } from '../services/voice/leadPhoneMac';
 import { holdsClaim } from '../services/hotLeadCallPlacement';
 import { callableLeadPhone } from '../services/hotLeadCallConfig';
@@ -193,28 +203,38 @@ interface ErrorReplies {
 const CANNOT_VERIFY_LOG_WINDOW_MS = 5_000;
 let cannotVerifyLoggedAt = 0;
 
+/**
+ * The shared first half of every guard: credentials loaded (else 503) -> signature over the URL rebuilt from
+ * BACKEND_URL (else 401). Returns the verified form body, or null after answering the request itself.
+ */
+async function verifiedBody(req: Request, res: Response): Promise<FormParams | null> {
+  const provider = getVoiceProvider();
+  let url: string;
+  try {
+    await provider.ensureCredentials();
+    url = `${voiceWebhookBaseUrl()}${req.originalUrl}`;
+  } catch (err) {
+    // Cannot verify right now, so nothing is processed. Only /status carries a retry override.
+    if (Date.now() - cannotVerifyLoggedAt >= CANNOT_VERIFY_LOG_WINDOW_MS) {
+      cannotVerifyLoggedAt = Date.now();
+      console.error('[hotLeadCall] cannot verify callback:', errorName(err));
+    }
+    res.status(503).end();
+    return null;
+  }
+  const body = paramsOf(req);
+  const signature = req.header('X-Twilio-Signature');
+  if (!body || !provider.validateSignature({ url, params: body, signature })) {
+    res.status(401).end();
+    return null;
+  }
+  return body;
+}
+
 function guarded(handler: Handler, replies: ErrorReplies) {
   return async (req: Request, res: Response): Promise<void> => {
-    const provider = getVoiceProvider();
-    let url: string;
-    try {
-      await provider.ensureCredentials();
-      url = `${voiceWebhookBaseUrl()}${req.originalUrl}`;
-    } catch (err) {
-      // Cannot verify right now, so nothing is processed. Only /status carries a retry override.
-      if (Date.now() - cannotVerifyLoggedAt >= CANNOT_VERIFY_LOG_WINDOW_MS) {
-        cannotVerifyLoggedAt = Date.now();
-        console.error('[hotLeadCall] cannot verify callback:', errorName(err));
-      }
-      res.status(503).end();
-      return;
-    }
-    const body = paramsOf(req);
-    const signature = req.header('X-Twilio-Signature');
-    if (!body || !provider.validateSignature({ url, params: body, signature })) {
-      res.status(401).end();
-      return;
-    }
+    const body = await verifiedBody(req, res);
+    if (!body) return;
     const q = parseQuery(req);
     if (!q) {
       replies.invalid(res);
@@ -520,5 +540,128 @@ router.post('/status', guarded(async (_req, res, q, body) => {
   await finishIfComplete(q);
   ack(res);
 }, statusReplies));
+
+// ── Inbound callbacks: a lead dials the org's number back ─────────────────────
+//
+// Stateless: no lead call record is created (LeadCallStore is keyed by lead, and an inbound caller is not one).
+// The state is the signed query of each step URL: the org and the members already tried, so a Twilio retry of a
+// step repeats the same decision and every chain ends: each step adds one member, and the org's
+// maxAttemptsPerLead bounds the chain. Each step re-reads the live config, so switching the feature off, removing
+// a member or ending the plan stops the next step. Fail closed: anything that is not clearly allowed ends in a
+// spoken refusal and a hangup, never in a connection.
+//
+//   /inbound              the number was dialled (its Twilio voice URL): find the org, ring the first member
+//   /inbound-screen       on the member's leg after they answer: "a lead is calling back ... Press 1."
+//   /inbound-screen-result  a digit of 1 lets Twilio bridge; anything else hangs up the member's leg
+//   /inbound-dial         the <Dial> ended: bridged = done; otherwise ring the next member, or tell the caller
+//   /inbound-status       the member leg's final callback: the only metered leg (see below)
+//
+// Metering: only the member leg (an outbound call from our number) is metered, with the existing outbound rate and
+// the same idempotency key shape. The caller's own inbound leg is NOT metered: the rate card has no inbound voice
+// rate, and one is not invented here.
+
+interface InboundQuery { orgId: string; tried: string[] }
+
+function parseInboundQuery(req: Request): InboundQuery | null {
+  if (Object.keys(req.query).some((k) => k !== 'orgId' && k !== 'tried')) return null;
+  const { orgId } = req.query;
+  const tried = triedMembersOf(req.query.tried);
+  return typeof orgId === 'string' && isWebhookSafeId(orgId) && tried ? { orgId, tried } : null;
+}
+
+type InboundHandler = (res: Response, body: FormParams, q: InboundQuery) => Promise<void>;
+
+/** Every inbound step is answered with TwiML, so an unusable or failed request ends in the spoken refusal. */
+function guardedInbound(handler: InboundHandler, opts: { entry?: boolean; reply?: ErrorReplies } = {}) {
+  const replies: ErrorReplies = opts.reply ?? { invalid: (res) => sendXml(res, inboundUnavailableTwiml()), failed: (res) => sendXml(res, inboundUnavailableTwiml()) };
+  return async (req: Request, res: Response): Promise<void> => {
+    const body = await verifiedBody(req, res);
+    if (!body) return;
+    // The entry point is the number's voice URL and carries no query.
+    const q = opts.entry ? { orgId: '', tried: [] } : parseInboundQuery(req);
+    if (!q) {
+      replies.invalid(res);
+      return;
+    }
+    try {
+      await handler(res, body, q);
+    } catch (err) {
+      console.error('[hotLeadCall] inbound handler failed:', errorName(err));
+      if (!res.headersSent) replies.failed(res);
+    }
+  };
+}
+
+/** Rings the next member, or tells the caller nobody can take the call. `tried` are the members already rung. */
+function ringNextOrApologise(res: Response, ctx: InboundContext, tried: readonly string[]): void {
+  const member = nextInboundMember(ctx.config, tried, new Date());
+  if (!member || !ctx.config.twilioNumber) return sendXml(res, inboundNobodyTwiml());
+  const step = { orgId: ctx.orgId, tried: [...tried, member.id] };
+  sendXml(res, inboundRingTwiml({
+    memberE164: member.phone,
+    callerId: ctx.config.twilioNumber,
+    screenUrl: buildInboundWebhookUrl('inbound-screen', step),
+    dialUrl: buildInboundWebhookUrl('inbound-dial', step),
+    statusUrl: buildInboundWebhookUrl('inbound-status', step),
+  }));
+}
+
+router.post('/inbound', guardedInbound(async (res, body) => {
+  const ctx = await resolveInboundContext(body.To || body.Called);
+  if (!ctx) return sendXml(res, inboundUnavailableTwiml());
+  ringNextOrApologise(res, ctx, []);
+}, { entry: true }));
+
+router.post('/inbound-screen', guardedInbound(async (res, _body, q) => {
+  const ctx = await resolveInboundContextForOrg(q.orgId);
+  // The member being asked is the last one tried. Not accepting any more (removed, unverified) hangs up their leg, so the next one is tried.
+  if (!ctx || !isAcceptingMember(ctx.config, q.tried[q.tried.length - 1])) return sendHangup(res);
+  sendXml(res, inboundMemberScreenTwiml({
+    announcedName: ctx.config.announcedName,
+    resultUrl: buildInboundWebhookUrl('inbound-screen-result', q),
+  }));
+}, { reply: twimlReplies }));
+
+router.post('/inbound-screen-result', guardedInbound(async (res, body, q) => {
+  if (body.Digits !== '1') return sendHangup(res);
+  const ctx = await resolveInboundContextForOrg(q.orgId);
+  if (!ctx || !isAcceptingMember(ctx.config, q.tried[q.tried.length - 1])) return sendHangup(res);
+  // An empty response ends the member's screening leg normally, so Twilio bridges the two calls.
+  sendXml(res, bridgeTwiml());
+}, { reply: twimlReplies }));
+
+// The attempt ended without a conversation: the member did not answer, was busy, declined or let the prompt time out.
+const INBOUND_NOT_REACHED = new Set(['no-answer', 'busy', 'failed']);
+
+router.post('/inbound-dial', guardedInbound(async (res, body, q) => {
+  const status = body.DialCallStatus ?? '';
+  const answered = DIAL_ENDED_AFTER_ANSWER.has(status);
+  // Bridged: the conversation happened and is over. Cancelled: the caller hung up while it rang. Any other
+  // answer without an explicit DialBridged=false cannot be told from a finished conversation, so nobody else is rung.
+  const tryNext = INBOUND_NOT_REACHED.has(status) || (answered && body.DialBridged === 'false');
+  if (!tryNext) return sendHangup(res);
+  const ctx = await resolveInboundContextForOrg(q.orgId);
+  if (!ctx) return sendXml(res, inboundUnavailableTwiml());
+  ringNextOrApologise(res, ctx, q.tried);
+}));
+
+router.post('/inbound-status', guardedInbound(async (res, body, q) => {
+  const callSid = sidOf(body, 'CallSid');
+  // A member leg is always a child of the caller's call.
+  if (!callSid || !sidOf(body, 'ParentCallSid') || !TERMINAL_CALL_STATUSES.has(body.CallStatus ?? '')) return ack(res);
+  const org = await orgDb.getOrgById(q.orgId, undefined, true);
+  if (!org?.ownerUserId) {
+    console.error('[hotLeadCall] inbound member leg not metered: no owner to bill for org', q.orgId);
+    return ack(res);
+  }
+  await recordCallUsage({
+    userId: org.ownerUserId,
+    callSid,
+    leg: 'member',
+    // Absent or blank is NaN on purpose: recordCallUsage warns instead of billing 0.
+    durationSeconds: body.CallDuration?.trim() ? Number(body.CallDuration) : NaN,
+  });
+  ack(res);
+}, { reply: statusReplies }));
 
 export default router;

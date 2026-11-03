@@ -260,7 +260,8 @@ describe('provision_hot_lead_call_number', () => {
   it('buys a US number, stores it conditionally, meters the first month and reveals neither number nor sid', async () => {
     fake.queueBuyNumberResult({ numberSid: NEW_SID, phoneNumber: NEW_NUMBER });
     const result = await provision({ confirm: true, areaCode: '415' });
-    expect(fake.boughtNumbers).toEqual([{ countryCode: 'US', areaCode: '415' }]);
+    // A new number is pointed at the inbound-callback endpoint at purchase.
+    expect(fake.boughtNumbers).toEqual([{ countryCode: 'US', areaCode: '415', voiceUrl: 'http://localhost:3001/api/webhooks/twilio-voice/inbound' }]);
     expect(org.hotLeadCall).toMatchObject({ twilioNumber: NEW_NUMBER, twilioNumberSid: NEW_SID, enabled: false, team: [{ phone: '+14155550100' }] });
     expect(result).toMatchObject({ success: true, callerNumber: '***0123' });
     expect(JSON.stringify(result)).not.toMatch(/4155550123|\+1415|PN/);
@@ -292,7 +293,7 @@ describe('provision_hot_lead_call_number', () => {
   it('omits areaCode when none is given and treats null as omitted', async () => {
     fake.queueBuyNumberResult({ numberSid: NEW_SID, phoneNumber: NEW_NUMBER });
     await provision({ confirm: true, areaCode: null });
-    expect(fake.boughtNumbers).toEqual([{ countryCode: 'US' }]);
+    expect(fake.boughtNumbers).toEqual([{ countryCode: 'US', voiceUrl: 'http://localhost:3001/api/webhooks/twilio-voice/inbound' }]);
   });
   it('keeps verification and the enabled flag as they were', async () => {
     org.hotLeadCall = configured({ verified: true });

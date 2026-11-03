@@ -4,6 +4,7 @@ import { getAllocatedRate } from '../../utils/vendorRateCard';
 import { isRecord } from '../leadNotificationAttribution';
 import { meterNumberRent } from './numberRent';
 import { getVoiceProvider, VoiceCallError } from './voiceProvider';
+import { inboundVoiceUrl } from './voiceUrls';
 import { isConditionalFailure, unchangedSince } from './setupWrites';
 import { omit } from '../../utils/omit';
 import { DAY_MS } from '../hotLeadCallText';
@@ -105,11 +106,13 @@ export async function provisionNumber(p: { org: Organization; config: HotLeadCal
     throw new Error('This organization already has a caller number. Release it first if you need a different one.');
   }
 
+  // Built before anything is reserved or bought: a missing BACKEND_URL must fail with nothing spent.
+  const voiceUrl = inboundVoiceUrl();
   await reserve(org, 'purchases', MAX_PURCHASES_PER_DAY);
 
   let bought: { numberSid: string; phoneNumber: string };
   try {
-    bought = await getVoiceProvider().buyNumber({ countryCode: 'US', ...(p.areaCode ? { areaCode: p.areaCode } : {}) });
+    bought = await getVoiceProvider().buyNumber({ countryCode: 'US', voiceUrl, ...(p.areaCode ? { areaCode: p.areaCode } : {}) });
   } catch (err) {
     if (err instanceof VoiceCallError && err.placed === 'no') {
       throw new Error('The phone provider did not sell a number, so nothing was bought or charged. Try a different area code, or try again later.');
