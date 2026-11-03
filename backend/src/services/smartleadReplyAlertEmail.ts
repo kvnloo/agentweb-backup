@@ -18,6 +18,8 @@ export interface SmartleadReplyAlertInput {
   campaignName?: string;
   /** The subject of the reply. */
   replySubject?: string;
+  /** What the contact wrote (plain text, no quoted thread). Shown in a quoted block, shortened; omitted when absent. */
+  replyText?: string;
   /** When the reply arrived (an ISO time). */
   receivedAt?: string;
   /** Opens the contact in AgentWeb. No button when absent. */
@@ -53,19 +55,37 @@ export const formatUtcTime = (iso: string | undefined): string | undefined => {
 };
 
 const FOOTER = "You are getting this because this lead list sends an alert for new replies. You can turn it off in the lead list's settings in AgentWeb.";
-const NOTE = "Smartlead keeps the full reply. Open your Smartlead inbox to read it and answer.";
+const NOTE_WITH_REPLY = "Smartlead keeps the full thread. Open your Smartlead inbox to answer.";
+const NOTE_WITHOUT_REPLY = "Smartlead keeps the full reply. Open your Smartlead inbox to read it and answer.";
+/** The most of a reply the email shows. */
+const REPLY_SHOWN_MAX = 600;
+
+/** The reply text as it is shown: normalized line breaks, at most REPLY_SHOWN_MAX characters, cut at a word where there is one. */
+const shownReply = (value: unknown): string => {
+  const cleaned = String(value ?? "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\u2028\u2029]/g, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  if (cleaned.length <= REPLY_SHOWN_MAX) return cleaned;
+  const cut = cleaned.slice(0, REPLY_SHOWN_MAX - 1);
+  const space = cut.lastIndexOf(" ");
+  return `${(space > REPLY_SHOWN_MAX * 0.6 ? cut.slice(0, space) : cut).trimEnd()}\u2026`;
+};
 
 export function buildSmartleadReplyAlertEmail(input: SmartleadReplyAlertInput): AlertEmailContent {
   const email = oneLine(input.leadEmail, 200);
   const rawName = oneLine(input.leadName, 120);
   // A name that is just the address is shown once.
   const name = rawName && rawName.toLowerCase() !== email.toLowerCase() ? rawName : "";
-  const who = name || email || "A contact";
-  const whoWithAddress = name && email ? `${name} (${email})` : who;
+  const who = name || email;
 
-  const subject = `${oneLine(who, 55)} replied to your campaign`; // 80 characters at most
-  const heading = `${oneLine(who, 80)} replied`;
-  const intro = `${whoWithAddress} replied to an email sent from your Smartlead campaign.`;
+  // The contact's name sits in straight quotes: "A new lead "Manan Test" replied to your campaign". With neither a name nor an address there is nothing to quote.
+  const subject = who ? `A new lead "${oneLine(who, 40)}" replied to your campaign` : "A new lead replied to your campaign";
+  const heading = who ? `A new lead "${oneLine(who, 60)}" replied` : "A new lead replied";
+  const quotedWho = who ? `"${who}"` : "A contact";
+  const intro = name && email ? `"${name}" (${email}) replied to an email sent from your Smartlead campaign.` : `${quotedWho} replied to an email sent from your Smartlead campaign.`;
 
   const rows: Array<[string, string]> = [];
   const campaign = oneLine(input.campaignName, 160);
@@ -77,6 +97,8 @@ export function buildSmartleadReplyAlertEmail(input: SmartleadReplyAlertInput): 
   const received = formatUtcTime(input.receivedAt);
   if (received) rows.push(["Received", received]);
 
+  const reply = shownReply(input.replyText);
+  const note = reply ? NOTE_WITH_REPLY : NOTE_WITHOUT_REPLY;
   const url = input.contactUrl && /^https?:\/\//i.test(input.contactUrl) ? input.contactUrl : "";
 
   const text = [
@@ -85,9 +107,10 @@ export function buildSmartleadReplyAlertEmail(input: SmartleadReplyAlertInput): 
     intro,
     "",
     ...rows.map(([label, value]) => `${label}: ${value}`),
+    ...(reply ? ["", "Their reply:", ...reply.split("\n").map(line => `> ${line}`)] : []),
     ...(url ? ["", `View contact in AgentWeb: ${url}`] : []),
     "",
-    NOTE,
+    note,
     "",
     FOOTER,
   ].join("\n");
@@ -99,10 +122,14 @@ export function buildSmartleadReplyAlertEmail(input: SmartleadReplyAlertInput): 
         `<td style="padding:3px 0;font-size:14px;line-height:1.5;color:#1f2933;vertical-align:top;word-break:break-word;">${escapeHtml(value)}</td></tr>`,
     )
     .join("");
+  const replyHtml = reply
+    ? `<p style="margin:0 0 6px;font-size:13px;color:#52606d;">Their reply</p>` +
+      `<div style="margin:0 0 18px;padding:10px 14px;border-left:4px solid #1976d2;background-color:#f1f5f9;font-size:14px;line-height:1.55;color:#1f2933;white-space:pre-wrap;word-break:break-word;">${escapeHtml(reply)}</div>`
+    : "";
   const button = url
     ? `<p style="margin:0 0 18px;"><a href="${escapeHtml(url)}" style="display:inline-block;background-color:#1976d2;color:#ffffff;text-decoration:none;padding:12px 22px;border-radius:4px;font-size:15px;font-weight:bold;">View contact in AgentWeb</a></p>`
     : "";
-  const preheader = escapeHtml(replySubject || intro);
+  const preheader = escapeHtml(reply ? reply.replace(/\s+/g, " ").slice(0, 140) : replySubject || intro);
 
   const html =
     `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${escapeHtml(subject)}</title></head>` +
@@ -115,8 +142,9 @@ export function buildSmartleadReplyAlertEmail(input: SmartleadReplyAlertInput): 
     `<h1 style="margin:12px 0 8px;font-size:22px;line-height:1.3;color:#1f2933;">${escapeHtml(heading)}</h1>` +
     `<p style="margin:0 0 14px;font-size:15px;line-height:1.55;">${escapeHtml(intro)}</p>` +
     (rows.length ? `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#f8f9fa;border-radius:6px;margin:18px 0;"><tr><td style="padding:12px 16px;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">${rowsHtml}</table></td></tr></table>` : "") +
+    replyHtml +
     button +
-    `<p style="margin:0;font-size:15px;line-height:1.55;">${escapeHtml(NOTE)}</p>` +
+    `<p style="margin:0;font-size:15px;line-height:1.55;">${escapeHtml(note)}</p>` +
     `</td></tr>` +
     `<tr><td style="border-top:1px solid #e4e7eb;padding:16px 28px 22px;font-size:12px;line-height:1.5;color:#616e7c;">${escapeHtml(FOOTER)}</td></tr>` +
     `</table></td></tr></table></body></html>`;
