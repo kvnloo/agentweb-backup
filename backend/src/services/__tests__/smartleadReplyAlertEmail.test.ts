@@ -37,11 +37,12 @@ const base = {
 describe('the Smartlead reply alert email', () => {
   it('says who replied in plain words, never an internal event name or a raw id', () => {
     const e = buildSmartleadReplyAlertEmail(base);
-    expect(e.subject).toBe('Manan Test replied to your campaign');
+    expect(e.subject).toBe('A new lead "Manan Test" replied to your campaign');
     for (const part of [e.subject, e.text, e.html]) {
       expect(part).not.toMatch(/email\.received|list_|lead_/);
     }
-    expect(e.text).toContain('Manan Test (mvarma@argusoft.com) replied to an email sent from your Smartlead campaign.');
+    expect(e.text).toContain('A new lead "Manan Test" replied');
+    expect(e.text).toContain('"Manan Test" (mvarma@argusoft.com) replied to an email sent from your Smartlead campaign.');
     expect(e.text).toContain('Campaign: Q4 campaign');
     expect(e.text).toContain('Lead list: Q4 outreach');
     expect(e.text).toContain('Subject: Re: Quick question');
@@ -60,11 +61,12 @@ describe('the Smartlead reply alert email', () => {
 
   it('shows an address once when the name is the address, and falls back to "A contact"', () => {
     const same = buildSmartleadReplyAlertEmail({ ...base, leadName: 'mvarma@argusoft.com' });
-    expect(same.subject).toBe('mvarma@argusoft.com replied to your campaign');
-    expect(same.text).toContain('mvarma@argusoft.com replied to an email');
+    expect(same.subject).toBe('A new lead "mvarma@argusoft.com" replied to your campaign');
+    expect(same.text).toContain('"mvarma@argusoft.com" replied to an email');
     expect(same.text).not.toContain('(mvarma@argusoft.com)');
     const none = buildSmartleadReplyAlertEmail({ ...base, leadName: '', leadEmail: '' });
-    expect(none.subject).toBe('A contact replied to your campaign');
+    expect(none.subject).toBe('A new lead replied to your campaign');
+    expect(none.text).toContain('A contact replied to an email');
   });
 
   it('leaves out what is missing instead of printing a placeholder, and has no button without a link', () => {
@@ -92,7 +94,41 @@ describe('the Smartlead reply alert email', () => {
   it('keeps a very long name and subject short', () => {
     const e = buildSmartleadReplyAlertEmail({ ...base, leadName: 'N'.repeat(500), replySubject: 'S'.repeat(500) });
     expect(e.subject.length).toBeLessThanOrEqual(80);
+    expect(e.subject).toMatch(/^A new lead ".*" replied to your campaign$/);
     expect(e.text).not.toContain('S'.repeat(250));
+  });
+
+  it('shows what the contact wrote in a quoted block, with the thread note and the plain-text twin', () => {
+    const e = buildSmartleadReplyAlertEmail({ ...base, replyText: 'Thanks for reaching out.\nCan we talk Thursday?' });
+    expect(e.html).toContain('Their reply');
+    expect(e.html).toContain('Thanks for reaching out.\nCan we talk Thursday?');
+    expect(e.text).toContain('Their reply:\n> Thanks for reaching out.\n> Can we talk Thursday?');
+    expect(e.text).toContain('Smartlead keeps the full thread. Open your Smartlead inbox to answer.');
+    expect(e.html).toContain('white-space:pre-wrap');
+  });
+
+  it('has no reply block when there is no reply text (a reply found by the poll), and says where to read it', () => {
+    const e = buildSmartleadReplyAlertEmail({ ...base, replyText: '   ' });
+    expect(e.html).not.toContain('Their reply');
+    expect(e.text).not.toContain('Their reply');
+    expect(e.text).toContain('Smartlead keeps the full reply. Open your Smartlead inbox to read it and answer.');
+  });
+
+  it('escapes the reply text and cuts a long reply at a word, never mid-tag', () => {
+    const e = buildSmartleadReplyAlertEmail({ ...base, replyText: '<img src=x onerror=alert(1)> <a href="http://evil.example">click</a>' });
+    expect(e.html).not.toMatch(/<img|<a href="http:\/\/evil/);
+    expect(e.html).toContain('&lt;img src=x onerror=alert(1)&gt;');
+    const long = buildSmartleadReplyAlertEmail({ ...base, replyText: 'word '.repeat(400) });
+    const shown = /white-space:pre-wrap[^>]*>([^<]*)</.exec(long.html)![1];
+    expect(shown.length).toBeLessThanOrEqual(600);
+    expect(shown.endsWith('\u2026')).toBe(true);
+    expect(shown.endsWith(' \u2026')).toBe(false);
+  });
+
+  it('does not let reply text put a line or control character into the subject', () => {
+    const e = buildSmartleadReplyAlertEmail({ ...base, replyText: 'hi\r\nBcc: victim@example.com\u0000' });
+    expect(e.subject).not.toMatch(/[\r\n]/);
+    expect(e.html).not.toContain('\u0000');
   });
 
   it('tells a Smartlead reply from every other alert', () => {
@@ -115,11 +151,12 @@ describe('the lead list alert uses it only for a Smartlead reply', () => {
   });
 
   it('a Smartlead reply sends the new email, with the list CC addresses', async () => {
-    await leadListAlertService.notifyLeadListOwnerIfConfigured(list, lead, 'email.received', { source: 'smartlead', subject: 'Re: Hi', campaign: 'Q4 campaign' }, '2026-11-03T09:23:00.000Z');
+    await leadListAlertService.notifyLeadListOwnerIfConfigured(list, lead, 'email.received', { source: 'smartlead', subject: 'Re: Hi', campaign: 'Q4 campaign', replyText: 'Yes, interested.' }, '2026-11-03T09:23:00.000Z');
     expect(send).toHaveBeenCalledTimes(1);
     const [to, subject, text, html, cc] = send.mock.calls[0];
     expect(to).toBe('owner@mindd.example');
-    expect(subject).toBe('Manan Test replied to your campaign');
+    expect(subject).toBe('A new lead "Manan Test" replied to your campaign');
+    expect(text).toContain('> Yes, interested.');
     expect(text).toContain('Campaign: Q4 campaign');
     expect(html).toContain('View contact in AgentWeb');
     expect(cc).toEqual(['cc@example.com']);
