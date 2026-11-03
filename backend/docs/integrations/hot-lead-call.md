@@ -273,8 +273,10 @@ Rules (all verified against `routes/twilioVoiceWebhook.ts` and `services/voice/i
   moves on to the next member), and `/inbound-status` a 500 so Twilio redelivers.
 - **Who is rung.** `selectHotLeadCallCandidates` at the current instant: verified, inside their window and inside the
   calling hours, in team priority order, skipping members already tried. At most `maxAttemptsPerLead` members are rung per
-  callback. The roster is re-evaluated at every step, so a window that closes while the caller waits is respected, and
-  so is a member removed or un-verified meanwhile (their screen and their "1" are refused).
+  callback. Availability (windows, calling hours) is re-evaluated each time the next member is chosen, that is at `/inbound`
+  and at each `/inbound-dial` step. A member who has already picked up and presses 1 is connected even if their window closed
+  meanwhile (the outbound `/gather` does not re-check windows either). A member removed or un-verified meanwhile is still
+  refused: their screen and their "1" check the live team.
 - **Nobody available or accepting.** The caller hears "Sorry, nobody is available to take your call right now. Please try
   again later. Goodbye." and the call is hung up. That also applies outside the calling hours.
 - **Only a 1 connects.** Anything else (another key, silence, a hang-up, voicemail, no answer, busy, failed) moves on to the next member.

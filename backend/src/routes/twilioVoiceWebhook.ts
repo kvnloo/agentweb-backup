@@ -593,11 +593,13 @@ function guardedInbound(handler: (res: Response, body: FormParams, q: InboundQue
   };
 }
 
-/** The entry point is the number's voice URL: Twilio calls it with the caller's own request and no query of ours. */
+/** The entry point is the number's voice URL: Twilio calls it as configured, with the caller's own request and no query. */
 function guardedInboundEntry(handler: (res: Response, body: FormParams) => Promise<void>) {
   return async (req: Request, res: Response): Promise<void> => {
     const body = await verifiedBody(req, res);
     if (!body) return;
+    // The entry has no query state, so a signed request that carries one is not the number's voice URL.
+    if (Object.keys(req.query).length > 0) return inboundRefusal.invalid(res);
     await runInbound(res, inboundRefusal, () => handler(res, body));
   };
 }

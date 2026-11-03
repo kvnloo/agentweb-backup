@@ -291,6 +291,13 @@ describe('inbound callbacks fail closed', () => {  it.each([
     expect(world.crm.callsTo('listHotLeadCallNumbers')).toBe(0);
   });
 
+  it('a signed /inbound that carries a query string is refused and never dials; the plain URL still dials', async () => {
+    refused((await world.twilio.post(`${inboundVoiceUrl()}?orgId=org-a`, { ...callerLeg, CallStatus: 'ringing' })).body);
+    refused((await world.twilio.post(`${inboundVoiceUrl()}?x=`, { ...callerLeg, CallStatus: 'ringing' })).body);
+    expect(world.crm.callsTo('listHotLeadCallNumbers')).toBe(0);
+    expect((await dialled()).body).toContain('<Dial');
+  });
+
   it('rejects a signature made for another URL (a replay on a different step) and one whose params were altered', async () => {
     world.provider.signatureValid = true;
     const first = attempt((await dialled()).body);
