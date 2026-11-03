@@ -74,6 +74,17 @@ A result over a limit is never an error: the text is cut, or the extra images ar
 
 The relay cap is deliberately NOT larger than Emma's: a result of 1,000,000 bytes is about 250,000 tokens and fails the whole turn when it does not fit the model's context.
 
+### What the backend accepts back from the login worker
+
+These bound what a worker can send the API server (a compromised or buggy worker must not stall everyone else's requests). A tool author does not hit them with an honest tool: results are cut well below them (see "One call's result"). They are enforced in the backend, in `backend/src/services/funding/`:
+
+| Limit | Value | Constant and file |
+|---|---|---|
+| Ordinary JSON reply (host.info, connection.status, turn.renew, turn.interrupt, turn.toolResult, login.*) and an error body | 64 KiB (every honest reply is a few hundred bytes; no route has an override) | `JSON_REPLY_BYTES`, `loginHostClient.ts` |
+| One line of the turn event stream | 64 KB, except `text` and `result` (the reply cap, 8 MiB) and tool events (1.5 MiB); a big `text`/`result` line may carry no structure outside its strings | `LINE_CAPS`, `loginHostClient.ts` |
+| Events and bytes in one turn stream | 20,000 events and 64 MiB | `MAX_STREAM_LINES`, `MAX_STREAM_BYTES`, `loginHostClient.ts` |
+| Empty lines in one turn stream | 256 (the host never writes one); past that the stream fails as `too_many_empty_lines` | `MAX_EMPTY_LINES`, `ndjsonLines.ts` |
+
 ## What the Claude CLI does on top of these limits
 
 The limits above are ours. The CLI that talks to the model has its own, and they apply to the tools it gets over MCP (which is how the relay hands it Emma's tools). Left alone, the CLI would quietly change what the plan route offers, so the login host sets three of its environment variables for RELAY turns, and its tool shim declares a per-tool result size (the last row). `relayCliEnv` in `backend/src/loginHost/protocol.ts` owns the values; each one is derived from a limit in that file, never a second copy of a number:
