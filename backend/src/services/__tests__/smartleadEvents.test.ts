@@ -1,4 +1,4 @@
-import { kindOf, parseSmartleadEvent } from "../smartleadEvents";
+import { kindOf, parseSmartleadEvent, replyExcerpt, REPLY_TEXT_MAX } from "../smartleadEvents";
 
 const ok = (body: unknown) => {
   const r = parseSmartleadEvent(body);
@@ -32,13 +32,14 @@ describe("parsing a Smartlead event (ENG-673)", () => {
     event_type: "LEAD_UNSUBSCRIBED", event_id: "ad65b227-b71c-4256-a3d9-455623d720c2", sl_email_lead_map_id: "3930296647",
   };
 
-  it("reads the REAL reply payload: the contact is found (never the sending mailbox), the subject and time are kept, the reply text and secrets are not", () => {
+  it("reads the REAL reply payload: the contact is found (never the sending mailbox), the subject, time and the contact\'s own words are kept, the HTML copies and secrets are not", () => {
     const e = ok(REAL_REPLY);
     expect(e).toMatchObject({ kind: "reply", campaignId: 4270665, subject: "AgentWeb event test for Ann", from: "ann@example.com", to: "sender@example.org", occurredAt: "2026-10-29T14:57:20.000Z", soft: false });
     expect(e.candidateEmails[0]).toBe("ann@example.com");
     expect(e.candidateEmails[e.candidateEmails.length - 1]).toBe("sender@example.org"); // the mailbox is only a last resort
     const all = JSON.stringify(e);
-    for (const secret of ["PRIVATE REPLY", "I am replying", "S3CRET", "TOKEN"]) expect(all).not.toContain(secret);
+    expect(e.replyText).toBe("I am replying to this mail for testing."); // the plain text of reply_message (a real payload), for the owner's alert only
+    for (const secret of ["PRIVATE REPLY", "S3CRET", "TOKEN"]) expect(all).not.toContain(secret);
   });
 
   const REAL_BOUNCE = {
@@ -163,3 +164,54 @@ describe("parsing a Smartlead event (ENG-673)", () => {
     expect(many.candidateEmails.length).toBeLessThanOrEqual(6);
   });
 });
+
+describe("the reply text of a Smartlead reply (ENG-673)", () => {
+  const reply = (extra: Record<string, unknown>) => ok({ event_type: "EMAIL_REPLY", campaign_id: 5, sl_lead_email: "ann@example.com", ...extra });
+
+  it("takes the plain text of reply_message, else preview_text, and never the HTML", () => {
+    expect(reply({ reply_message: { text: "Sounds good.", html: "<p>HTML</p>" } }).replyText).toBe("Sounds good.");
+    expect(reply({ preview_text: "Short preview" }).replyText).toBe("Short preview");
+    expect(reply({ reply_message: { text: "   " }, preview_text: "Fallback" }).replyText).toBe("Fallback");
+    expect(reply({ reply_message: { html: "<p>Only html</p>" }, reply_body: "<p>Only html</p>" }).replyText).toBeUndefined();
+    expect(reply({}).replyText).toBeUndefined();
+  });
+
+  it("only a reply carries it", () => {
+    expect(ok({ event_type: "LEAD_UNSUBSCRIBED", campaign_id: 5, lead_email: "a@b.co", reply_message: { text: "x" } }).replyText).toBeUndefined();
+    expect(ok({ event_type: "EMAIL_BOUNCE", campaign_id: 5, lead_email: "a@b.co", preview_text: "x" }).replyText).toBeUndefined();
+  });
+
+  it("cuts the quoted thread at its first marker", () => {
+    const cases: Array<[string, string]> = [
+      ["Yes, Thursday works.\n\nOn Tue, Nov 3, 2026 at 9:23 AM Harsha <h@x.co> wrote:\n> Hi there\n> test", "Yes, Thursday works."],
+      ["Yes.\n\nOn Tue, Nov 3, 2026 at 9:23 AM Harsha Vankayalapati <h@x.co>\nwrote:\n> Hi", "Yes."],
+      ["Yes.\n> quoted only", "Yes."],
+      ["Yes.\n\n-----Original Message-----\nFrom: H\nSent: Tuesday", "Yes."],
+      ["Yes.\n\nFrom: Harsha <h@x.co>\nSent: Tuesday, November 3, 2026 9:23 AM\nTo: Ann\nSubject: Hi\n\nHi", "Yes."],
+      ["Line one\nLine two", "Line one\nLine two"],
+    ];
+    for (const [raw, want] of cases) expect(reply({ reply_message: { text: raw } }).replyText).toBe(want);
+  });
+
+  it("keeps an ordinary line that merely starts with On or From", () => {
+    expect(reply({ reply_message: { text: "On Thursday I am free.\nFrom my side that works." } }).replyText).toBe("On Thursday I am free.\nFrom my side that works.");
+  });
+
+  it("returns nothing for a reply that is only quoted text, and strips control characters", () => {
+    expect(reply({ reply_message: { text: "> only a quote\n> more" } }).replyText).toBeUndefined();
+    expect(reply({ reply_message: { text: "Hi\u0000\u0007 there\r\n\r\n\r\n\r\nBye" } }).replyText).toBe("Hi there\n\nBye");
+  });
+
+  it("caps the length", () => {
+    const long = replyExcerpt({ reply_message: { text: "x".repeat(5000) } })!;
+    expect(long.length).toBeLessThanOrEqual(REPLY_TEXT_MAX);
+    expect(long.endsWith("\u2026")).toBe(true);
+  });
+
+  it("does not change the event key (a retry of the same delivery must still be one event)", () => {
+    const base = { event_type: "EMAIL_REPLY", event_id: "e-1", campaign_id: 5, sl_lead_email: "ann@example.com" };
+    expect(reply({ event_id: "e-1" }).eventKey).toBe(reply({ event_id: "e-1", reply_message: { text: "hello" } }).eventKey);
+    expect(ok(base).eventKey).toBe(ok({ ...base, preview_text: "different" }).eventKey);
+  });
+});
+

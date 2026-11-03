@@ -510,6 +510,23 @@ describe("events found by the hourly poll (ENG-673)", () => {
   });
 });
 
+describe("the reply text goes to the owner's alert and nowhere else (ENG-673)", () => {
+  it("is passed to the alert but never stored on the contact", async () => {
+    const w = world();
+    await make(w).handle(ctx, { ...reply(), replyText: "Yes, interested. Call me." });
+    expect(w.notified).toHaveLength(1);
+    expect(w.notified[0].data.replyText).toBe("Yes, interested. Call me.");
+    expect(JSON.stringify(w.appended)).not.toContain("interested");
+    expect(w.appended[0].eventData).not.toHaveProperty("replyText");
+  });
+
+  it("an event without it alerts exactly as before", async () => {
+    const w = world();
+    await make(w).handle(ctx, reply());
+    expect(w.notified[0].data).not.toHaveProperty("replyText");
+  });
+});
+
 describe("counting a run's replied, bounced and unsubscribed contacts for the run view (ENG-673)", () => {
   const pushed = (over: Partial<World> = {}) => world({ counted: [], leads: [lead("L1", "a", "ann@example.com", { system: { [`smartlead_${CAMPAIGN}`]: marker("run-ok") } })], ...over });
   const polled = (kind: "reply" | "bounce" | "unsubscribe", over: Partial<SmartleadEvent> = {}): SmartleadEvent => ({
