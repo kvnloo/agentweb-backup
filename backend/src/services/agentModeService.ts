@@ -4296,7 +4296,9 @@ export class AgentModeService {
         // hazard). Say plainly that the time ran out and point at the work in the steps
         // above, which is what the user can actually act on.
         if (synthesisRetryUnaffordable) {
-          content = TURN_TIME_BUDGET_FALLBACK_CONTENT;
+          // ENG-2778 (CodeRabbit): a failed step-budget synthesis has no time-budget cause;
+          // clear stale narration so the post-loop step-limit fallback applies instead.
+          content = stepBudgetSynthesis ? '' : TURN_TIME_BUDGET_FALLBACK_CONTENT;
           break;
         }
         const llmDurationMs = Date.now() - llmStart;
@@ -4374,6 +4376,11 @@ export class AgentModeService {
         // Update content with LLM's response
         if (responseContent) {
           content = responseContent;
+        } else if (stepBudgetSynthesis) {
+          // ENG-2778 (CodeRabbit): an empty forced step-budget synthesis must not ship an
+          // earlier iteration's narration as the answer; clear it so the post-loop
+          // step-limit fallback applies.
+          content = '';
         }
 
         // Add LLM model to the response message
@@ -4759,7 +4766,7 @@ export class AgentModeService {
             });
 
             if (workPlanTurnDisposition.kind === 'invalid') {
-              if (workPlanDispositionRetries < 1 && !timeBudgetBlocksContinuation) {
+              if (workPlanDispositionRetries < 1 && !timeBudgetBlocksContinuation && !stepBudgetSynthesis) {
                 workPlanDispositionRetries += 1;
                 // The invalid assistant turn has not been checkpointed yet. Remove it
                 // before the next iteration so neither the model nor the customer sees

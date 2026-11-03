@@ -153,6 +153,36 @@ describe('ENG-244 — real loop sets truncatedByStepBudget at the step budget', 
     expect(JSON.stringify(executed)).not.toContain('999999');
   });
 
+  it('ENG-2778: an empty forced synthesis falls back to the step-limit message, not stale narration', async () => {
+    let call = 0;
+    jest.spyOn(service as any, 'callLLM').mockImplementation(async (...args: any[]) => {
+      const messages = args[1] || [];
+      const isFinal = messages.some(
+        (m: any) => m?.role === 'system' && typeof m.content === 'string' && /Step budget exhausted/.test(m.content),
+      );
+      const n = call++;
+      if (isFinal) return buildLLMResponse({ content: '', tool_calls: [] });
+      return buildLLMResponse({
+        content: `Scanned batch ${n}.`,
+        tool_calls: [{ id: `c${n}`, name: 'read_tool_response', arguments: `{"char_offset":${n * 1000}}` }],
+      });
+    });
+    jest.spyOn(service as any, 'executeTool').mockResolvedValue(JSON.stringify({ success: true, data: 'mock' }));
+    jest.spyOn(service as any, 'generateSuggestedReplies').mockResolvedValue([]);
+
+    const result = (await service.generateMarketingResponse(
+      'Give me a client-facing recap of the campaign since Oct 24.',
+      [] as any,
+      'test-user',
+      service.default_model,
+      'test-session',
+    )) as any;
+
+    expect(result.truncatedByStepBudget).toBe(true);
+    expect(result.content).not.toMatch(/^Scanned batch/);
+    expect(result.content).toMatch(/reached the maximum number of processing steps/i);
+  });
+
   it('does NOT set truncatedByStepBudget on a clean run that finishes within budget (no false positive)', async () => {
     // Turn 1 gathers, turn 2 emits the final report with no tool call → clean
     // termination well under the budget.
