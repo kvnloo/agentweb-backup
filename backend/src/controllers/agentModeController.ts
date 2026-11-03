@@ -6869,7 +6869,7 @@ export async function runScheduledChat(
     const preflightRecipients: string[] = Array.isArray(schedule.emailNotifications)
       ? schedule.emailNotifications.filter(Boolean)
       : [];
-    if (preflightRecipients.length > 0 && scheduleLikelySensitive(schedule)) {
+    if (preflightRecipients.length > 0 && scheduleLikelySensitive(schedule, { ownerIsAdmin: scheduleOwner ? (scheduleOwner as any).isAdmin === true : undefined })) {
       const authz = await resolveAuthorizedReportRecipients({
         recipients: preflightRecipients,
         ownerEmail: (scheduleOwner as any)?.email,
@@ -8411,7 +8411,7 @@ export async function runScheduledChat(
       await recordReportDeliveryState(
         schedule.scheduleId,
         { runId: finalResult.runId, state: 'generated' },
-        { lastKnownSensitive: reportContainsCrossAccountData(actualFunctionCalls) },
+        { lastKnownSensitive: reportContainsCrossAccountData(actualFunctionCalls, { ownerIsAdmin: scheduleOwner ? (scheduleOwner as any).isAdmin === true : undefined }) },
       );
     }
 
@@ -14929,6 +14929,7 @@ export const agentModeController = {
         scheduleId,
         recipients: scheduledChat.emailNotifications,
         ownerEmail: user.email,
+        ownerIsAdmin: typeof (user as any).isAdmin === 'boolean' ? (user as any).isAdmin : undefined,
         schedule: scheduledChat,
       });
       if (createRemediation) {
@@ -15325,6 +15326,7 @@ export const agentModeController = {
           scheduleId,
           recipients: effectiveEmailNotifications,
           ownerEmail: user.email,
+          ownerIsAdmin: typeof (user as any).isAdmin === 'boolean' ? (user as any).isAdmin : undefined,
           schedule: {
             // A changed tool list re-decides sensitivity from scratch; the
             // breadcrumb describes the previous tools.
@@ -16125,6 +16127,7 @@ export const agentModeController = {
           scheduleId,
           recipients: normalizeEmailList(schedule.emailNotifications || []),
           ownerEmail: user.email,
+          ownerIsAdmin: typeof (user as any).isAdmin === 'boolean' ? (user as any).isAdmin : undefined,
           schedule: schedule as any,
         });
         if (toggleRemediation) {
