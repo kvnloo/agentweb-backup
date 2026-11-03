@@ -1,7 +1,7 @@
 /**
  * ENG-2716 (child of ENG-2715): pre-run cost estimate for CRM enrich-v3.
  *
- * Pure, vendor-free. Per-lead shares are calibrated from the Opiner run of
+ * Pure arithmetic over the rate card (no vendor calls, no I/O; the confirmation token reads the server secret). Per-lead shares are calibrated from the Opiner run of
  * 2026-10-27 (112 leads -> $31.60 actual at the time): Apollo broker waterfall on
  * ~30% of leads, LLM extraction, match/lookup calls, and web search. Apollo misses
  * still incur the lookup/LLM/web cost, so they are priced into every lead.
@@ -13,7 +13,7 @@
  * scales with the saved config's field count and the Apollo line with the leads that lack an
  * email; customers see the result as a percent of their allowance, never as dollars.
  */
-import { createHmac } from 'crypto';
+import { createHmac, timingSafeEqual } from 'crypto';
 import { getJwtSecret } from '../config/jwt';
 import { getAllocatedRate } from '../utils/vendorRateCard';
 
@@ -137,7 +137,9 @@ export function toCustomerEstimate(
  * rates through the very quote that hides them). Stable across instances: the secret is the shared JWT secret.
  */
 export function confirmationTokenFor(userId: string, listId: string, leadCount: number, totalUsd: number): string {
-  return createHmac('sha256', getJwtSecret())
+  // A derived subkey keeps this use of the shared secret separate from JWT signing (domain separation).
+  const key = createHmac('sha256', getJwtSecret()).update('agentweb:enrich-v3-quote-token:key:v1').digest();
+  return createHmac('sha256', key)
     .update(`enrich-v3-estimate:v2:${userId}:${listId}:${leadCount}:${totalUsd.toFixed(2)}`)
     .digest('hex')
     .slice(0, 32);
@@ -159,7 +161,9 @@ export function checkEstimateConfirmation(
   if (typeof supplied !== 'string' || supplied.length === 0) {
     return required ? { ok: false, reason: 'missing' } : { ok: true };
   }
-  return supplied === estimate.confirmationToken ? { ok: true } : { ok: false, reason: 'stale' };
+  const a = Buffer.from(supplied);
+  const b = Buffer.from(estimate.confirmationToken);
+  return a.length === b.length && timingSafeEqual(a, b) ? { ok: true } : { ok: false, reason: 'stale' };
 }
 
 /**

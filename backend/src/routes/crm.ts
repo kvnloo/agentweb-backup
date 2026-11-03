@@ -35,7 +35,7 @@ import { syncContact, SyncInput } from '../services/contactSyncService';
 import { isCardRevenueField } from '../services/enrichmentGroups';
 import { stripImplicitCardRevenueRouting } from '../services/enrichmentConfigService';
 import { normalizeLeadSelection, checkEstimateConfirmation } from '../services/enrichmentCostEstimate';
-import { priceEnrichment, quoteEnrichment, type QuoteDeps } from '../services/enrichmentQuote';
+import { priceEnrichment, quoteEnrichment, quoteFromPriced, type QuoteDeps } from '../services/enrichmentQuote';
 import { enrichContact, defaultEnrichmentCache, EnrichmentDeps } from '../services/internalEnrichmentService';
 import { dedupContactsForUser } from '../services/contactDedupService';
 import {
@@ -1957,7 +1957,7 @@ router.post('/lists/:listId/leads/enrich-v3', async (req: Request, res: Response
               ? 'Confirm the enrichment cost estimate before starting.'
               : 'The enrichment cost estimate changed. Review and confirm the new estimate.',
             code: 'ENRICH_ESTIMATE_CONFIRMATION_REQUIRED',
-            estimate: (await quoteEnrichment(await getQuoteDeps(), { userId, listId, leadIds })).customerView,
+            estimate: (await quoteFromPriced(userId, priced)).customerView,
           });
         }
       }

@@ -30,7 +30,7 @@ export interface QuoteDeps {
     listId: string,
     limit: number,
     lastKey?: unknown,
-  ): Promise<{ items: Array<{ email?: unknown }>; lastEvaluatedKey?: unknown }>;
+  ): Promise<{ items: Array<{ leadId?: unknown; email?: unknown }>; lastEvaluatedKey?: unknown }>;
   /** The list's saved enrichment config, or undefined when none is saved or it cannot be read. */
   getSavedConfig(listId: string, userId: string): Promise<EnrichmentConfig | undefined>;
   /** Whether this is an email the resolver would use as one (not blank, not a placeholder/test domain). */
@@ -48,26 +48,27 @@ const PAGE_SIZE = 200;
 
 /**
  * The leads an enrich-v3 run would touch, and how many have no usable email (only those can trigger the
- * Apollo broker: the identity resolver skips it when an email is already known). A selected subset is not
- * loaded, so its emailless count is unknown and is taken as every selected lead (the conservative reading);
- * duplicate ids count once.
+ * Apollo broker: the identity resolver skips it when an email is already known). The list is always paged,
+ * and a selected subset is counted only for ids that actually belong to the list, as the run itself only
+ * processes real leads. Trusting the raw id count would let a caller multiply the quote with fake ids until
+ * the percent resolves the per-lead rate (100,000 fake ids read as 28,000%).
  */
 export async function inspectLeads(
   deps: QuoteDeps,
   listId: string,
   leadIds?: string[],
 ): Promise<{ count: number; emailless: number }> {
-  if (leadIds) {
-    const count = new Set(leadIds).size;
-    return { count, emailless: count };
-  }
+  const wanted = leadIds ? new Set(leadIds) : undefined;
   let count = 0;
   let emailless = 0;
   let lastKey: unknown = undefined;
   do {
     const page = await deps.getLeadsPage(listId, PAGE_SIZE, lastKey);
-    count += page.items.length;
-    emailless += page.items.filter(lead => !deps.hasUsableEmail(lead?.email)).length;
+    for (const lead of page.items) {
+      if (wanted && !(typeof lead?.leadId === 'string' && wanted.has(lead.leadId))) continue;
+      count++;
+      if (!deps.hasUsableEmail(lead?.email)) emailless++;
+    }
     lastKey = page.lastEvaluatedKey;
   } while (lastKey);
   return { count, emailless };
@@ -90,15 +91,25 @@ export async function priceEnrichment(
   return { estimate, config, leadCount: count };
 }
 
+export type PricedEnrichment = Awaited<ReturnType<typeof priceEnrichment>>;
+
+/** The customer view of an already-priced quote: lets the 409 path reuse the price it just computed instead of scanning the list again. */
+export async function quoteFromPriced(
+  userId: string,
+  priced: PricedEnrichment,
+): Promise<{ estimate: EnrichmentCostEstimate; customerView: CustomerEnrichmentEstimate }> {
+  const { estimate, config, leadCount } = priced;
+  const expectedMicro = Math.round(estimate.totalUsd * 1_000_000);
+  const reserveMicro = config
+    ? Math.max(expectedMicro, await admissionEstimateMicroUsd(userId, config, leadCount))
+    : expectedMicro;
+  const allowance = await projectAllowance(userId, expectedMicro, reserveMicro);
+  return { estimate, customerView: toCustomerEstimate(estimate, allowance) };
+}
+
 export async function quoteEnrichment(
   deps: QuoteDeps,
   params: QuoteParams,
 ): Promise<{ estimate: EnrichmentCostEstimate; customerView: CustomerEnrichmentEstimate }> {
-  const { estimate, config, leadCount } = await priceEnrichment(deps, params);
-  const expectedMicro = Math.round(estimate.totalUsd * 1_000_000);
-  const reserveMicro = config
-    ? Math.max(expectedMicro, await admissionEstimateMicroUsd(params.userId, config, leadCount))
-    : expectedMicro;
-  const allowance = await projectAllowance(params.userId, expectedMicro, reserveMicro);
-  return { estimate, customerView: toCustomerEstimate(estimate, allowance) };
+  return quoteFromPriced(params.userId, await priceEnrichment(deps, params));
 }

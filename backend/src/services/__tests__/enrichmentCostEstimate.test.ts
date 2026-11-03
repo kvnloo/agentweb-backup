@@ -113,6 +113,23 @@ describe('estimateEnrichmentCost (ENG-2716)', () => {
       } finally { process.env.JWT_SECRET = saved; }
     });
 
+    it('is not the plain HMAC of the message under the raw secret (a derived subkey separates it from JWT signing)', () => {
+      const { createHmac } = require('crypto');
+      const est = estimateEnrichmentCost('list-1', 112, { userId: 'u1' });
+      const direct = createHmac('sha256', process.env.JWT_SECRET as string)
+        .update(`enrich-v3-estimate:v2:u1:list-1:112:${est.totalUsd.toFixed(2)}`).digest('hex').slice(0, 32);
+      expect(est.confirmationToken).not.toBe(direct);
+    });
+
+    it('compares in constant time and treats any wrong-length or non-string token as stale or missing without throwing', () => {
+      const est = estimateEnrichmentCost('l', 10, { userId: 'u1' });
+      for (const bad of ['', 'x', 'x'.repeat(31), 'x'.repeat(33), 'é'.repeat(32), est.confirmationToken.slice(0, 31) + 'z']) {
+        expect(checkEstimateConfirmation(bad, est, true)).toEqual({ ok: false, reason: bad === '' ? 'missing' : 'stale' });
+      }
+      expect(checkEstimateConfirmation(est.confirmationToken, est, true)).toEqual({ ok: true });
+      expect(checkEstimateConfirmation(12345 as unknown, est, true)).toEqual({ ok: false, reason: 'missing' });
+    });
+
     it('fails loud rather than minting a guessable token if the secret is missing', () => {
       const saved = process.env.JWT_SECRET;
       delete process.env.JWT_SECRET;

@@ -7,7 +7,7 @@ jest.mock('../tokenUsageService', () => ({ checkTokenUsage: jest.fn(), TURN_ADMI
 
 import { checkTokenUsage } from '../tokenUsageService';
 import { resolveModelForUser } from '../modelRoles';
-import { inspectLeads, priceEnrichment, quoteEnrichment, type QuoteDeps } from '../enrichmentQuote';
+import { inspectLeads, priceEnrichment, quoteEnrichment, quoteFromPriced, type QuoteDeps } from '../enrichmentQuote';
 import type { EnrichmentConfig } from '../crmEnrichmentServiceV3';
 
 const check = checkTokenUsage as jest.Mock;
@@ -28,7 +28,7 @@ function deps(emails: Array<string | undefined>, config?: EnrichmentConfig, hasU
     getLeadsPage: async (_l: string, limit: number, lastKey?: unknown) => {
       state.pages++;
       const start = typeof lastKey === 'number' ? lastKey : 0;
-      const items = emails.slice(start, start + limit).map(email => ({ email }));
+      const items = emails.slice(start, start + limit).map((email, i) => ({ leadId: `l${start + i}`, email }));
       return { items, lastEvaluatedKey: start + limit < emails.length ? start + limit : undefined };
     },
     getSavedConfig: async () => config,
@@ -53,10 +53,22 @@ describe('inspectLeads', () => {
     expect(d.pages).toBe(3);
   });
 
-  it('treats a selected subset as all emailless (it is not loaded) and counts duplicate ids once', async () => {
-    const d = deps(['a@acme.com']);
-    expect(await inspectLeads(d, 'l', ['x', 'y', 'x'])).toEqual({ count: 2, emailless: 2 });
-    expect(d.pages).toBe(0);
+  it('counts a selected subset only for ids that belong to the list, with their real email state', async () => {
+    const d = deps(['a@acme.com', '', 'junk@example.com', 'b@acme.com']);
+    // l0 has an email, l1 none, l2 placeholder; l99 and "x" do not exist; l1 is repeated
+    expect(await inspectLeads(d, 'l', ['l0', 'l1', 'l2', 'l1', 'l99', 'x'])).toEqual({ count: 3, emailless: 2 });
+    expect(d.pages).toBe(1);
+  });
+
+  it('fake ids cannot amplify the count (they match nothing), so the quote cannot be scaled to resolve the rate', async () => {
+    const fake = Array.from({ length: 100_000 }, (_, i) => `fake-${i}`);
+    expect(await inspectLeads(deps(['a@acme.com', '']), 'l', fake)).toEqual({ count: 0, emailless: 0 });
+  });
+
+  it('ignores non-string lead ids on the page', async () => {
+    const d = deps(['']);
+    d.getLeadsPage = async () => ({ items: [{ leadId: 5 as unknown as string, email: '' }, { email: '' }] });
+    expect(await inspectLeads(d, 'l', ['5', 'undefined'])).toEqual({ count: 0, emailless: 0 });
   });
 
   it('handles an empty list', async () => {
@@ -167,5 +179,17 @@ describe('quoteEnrichment: the customer view', () => {
   it('never records admission', async () => {
     await quoteEnrichment(deps(Array(10).fill(''), sizedCfg(10)), { userId: 'u1', listId: 'l' });
     expect(check.mock.calls.some(([, o]) => o?.recordAdmission)).toBe(false);
+  });
+});
+
+describe('quoteFromPriced (the 409 path)', () => {
+  it('builds the customer view from an already-priced result without scanning the list again', async () => {
+    const d = deps(Array(30).fill(''), sizedCfg(12));
+    const priced = await priceEnrichment(d, { userId: 'u1', listId: 'l' });
+    const pagesAfterPricing = d.pages;
+    const view = await quoteFromPriced('u1', priced);
+    expect(d.pages).toBe(pagesAfterPricing);
+    expect(view.customerView.confirmationToken).toBe(priced.estimate.confirmationToken);
+    expect(Object.keys(view.customerView).sort()).toEqual(['confirmationToken', 'estimatedPercentOfAllowance', 'leadCount', 'withinAllowance']);
   });
 });

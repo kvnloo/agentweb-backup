@@ -186,6 +186,48 @@ describe('admission estimate tracks what a run books (ENG-2720)', () => {
     }
   });
 
+  describe('the Enigma allowlist reaches the admission reserve (review: a wiring mutation survived every test)', () => {
+    const cfgWithRevenue = named('Industry', 'card_revenue_12m');
+    const plainCfg = named('Industry', 'Employees');
+    const withEnv = async (allowlist: string | undefined, fn: () => Promise<void>) => {
+      const saved = { e: process.env.ENIGMA_ENRICHMENT_ENABLED, l: process.env.ENIGMA_ENRICHMENT_USER_ALLOWLIST };
+      process.env.ENIGMA_ENRICHMENT_ENABLED = 'true';
+      if (allowlist === undefined) delete process.env.ENIGMA_ENRICHMENT_USER_ALLOWLIST; else process.env.ENIGMA_ENRICHMENT_USER_ALLOWLIST = allowlist;
+      try { await fn(); } finally {
+        if (saved.e === undefined) delete process.env.ENIGMA_ENRICHMENT_ENABLED; else process.env.ENIGMA_ENRICHMENT_ENABLED = saved.e;
+        if (saved.l === undefined) delete process.env.ENIGMA_ENRICHMENT_USER_ALLOWLIST; else process.env.ENIGMA_ENRICHMENT_USER_ALLOWLIST = saved.l;
+      }
+    };
+    const projected = () => check.mock.calls.filter(([, o]) => o?.projectedCostMicroUsd).map(([, o]) => o.projectedCostMicroUsd as number);
+    const worst = Math.round(0.52 * 10 * 1_000_000);
+
+    it('buildEnrichmentBudgetCheck reserves the Enigma fetch for an allowlisted user and not for anyone else', async () => {
+      await withEnv('owner', async () => {
+        check.mockClear();
+        await buildEnrichmentBudgetCheck('owner')({ config: cfgWithRevenue, leadCount: 10, phase: 'preflight' });
+        const forOwner = projected()[0];
+        check.mockClear();
+        await buildEnrichmentBudgetCheck('stranger')({ config: cfgWithRevenue, leadCount: 10, phase: 'preflight' });
+        const forStranger = projected()[0];
+        expect(forOwner - forStranger).toBeGreaterThanOrEqual(worst - 10);
+        expect(forOwner - forStranger).toBeLessThanOrEqual(worst + 10);
+        expect(forStranger).toBe(estimateEnrichmentBatchMicroUsd(plainCfg, 10, undefined) + Math.round(0.02 * 0));
+      });
+    });
+
+    it('admissionEstimateMicroUsd applies the same allowlist gate', async () => {
+      await withEnv('owner', async () => {
+        const owner = await admissionEstimateMicroUsd('owner', cfgWithRevenue, 10);
+        const stranger = await admissionEstimateMicroUsd('stranger', cfgWithRevenue, 10);
+        expect(owner).toBeGreaterThan(stranger);
+        expect(stranger).toBe(await admissionEstimateMicroUsd('stranger', plainCfg, 10));
+      });
+      await withEnv(undefined, async () => {
+        expect(await admissionEstimateMicroUsd('owner', cfgWithRevenue, 10)).toBe(await admissionEstimateMicroUsd('owner', plainCfg, 10));
+      });
+    });
+  });
+
   it('wantsEnigma ignores excluded card fields; the expected fetch sits between typical and worst case', () => {
     const off: EnrichmentConfig = { ...config, fields: [{ name: 'card_revenue_12m', type: 'string', instruction: '', include: false, overwritePolicy: 'fill_if_empty' }] };
     expect(wantsEnigma(off)).toBe(false);
