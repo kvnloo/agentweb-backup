@@ -11530,17 +11530,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       clientScope?.toolName ?? 'meta_ads_tool'
     );
 
-    // ENG-1801 fix: a client_id-scoped (cross-tenant, admin) call never
-    // auto-selects an account and never falls back to the shared-token legacy
-    // adAccount field — both fallback branches below are only reachable via
-    // the `!accountId` path, so this one guard structurally disables both for
-    // the scoped path while leaving the unscoped path's fallback code untouched.
-    if (strict && !accountId) {
-      throw this.makeMetaAuthError(
-        `client_id-scoped calls require an explicit account_id — call assess_client_health with client_name_or_email="${clientScope?.clientId}" first; its ad_account_id field is this client's Meta ad account.`
-      );
-    }
-
+    // ENG-1801: the strict (client_id-scoped) no-account_id guard lives after
+    // the connected-account lookup below (ENG-2786), so it can list candidates.
     const { userDb } = await import('./db');
     const user = await userDb.getUserById(effectiveUserId);
     if (!user) throw this.makeMetaAuthError(strict ? 'Client account no longer exists.' : 'User not found');
@@ -11583,6 +11574,24 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           ? `Client "${user.email || effectiveUserId}" has no connected Meta ad account. Client-scoped calls never fall back to the legacy shared-token account.`
           : 'Meta Ads account is not connected. Use the search_user_guide tool to find setup instructions and share them with the user.'
       );
+    }
+
+    // ENG-1801 fix: a client_id-scoped (cross-tenant, admin) call never
+    // auto-selects an account and never falls back to the shared-token legacy
+    // adAccount field (the fbAccounts.length === 0 branch above already refuses
+    // the legacy fallback when strict). ENG-2786: this is a usage error, not a
+    // credential failure — classify it invalid_args and list the client's own
+    // candidate account_ids so the model can retry with one directly.
+    if (strict && !accountId) {
+      const candidates = fbAccounts
+        .map(acc => `act_${clean(acc.account_id || acc.config?.ad_account_id)}`)
+        .join(', ');
+      const err = this.makeMetaAuthError(
+        `client_id-scoped calls require an explicit account_id — call assess_client_health with client_name_or_email="${clientScope?.clientId}" first; its ad_account_id field is this client's Meta ad account. Candidate account_ids: [${candidates}].`
+      ) as any;
+      err.toolErrorClass = 'invalid_args';
+      err.candidateAccountIds = fbAccounts.map(acc => `act_${clean(acc.account_id || acc.config?.ad_account_id)}`);
+      throw err;
     }
 
     // 2. Handle specific account selection if accountId is provided

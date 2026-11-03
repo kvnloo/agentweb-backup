@@ -191,6 +191,19 @@ describe('ENG-1801 — admin client_id scoping (canonical, all 3 wrapper entry p
     expect(metaService.listCampaigns).not.toHaveBeenCalled();
   });
 
+  it('ENG-2786: missing account_id under client_id scope is invalid_args with candidate account_ids, still no auto-select', async () => {
+    let caught: any;
+    try {
+      await service.listMetaAdsCampaignsNew('admin-1', undefined, {}, { clientId: 'client@example.com', toolName: 'list_meta_ads_campaigns' });
+    } catch (e) { caught = e; }
+    expect(caught).toBeDefined();
+    expect(caught.toolErrorClass).toBe('invalid_args');
+    expect(caught.candidateAccountIds).toEqual(['act_target-account-id']);
+    expect(caught.message).toMatch(/Candidate account_ids: \[act_target-account-id\]/);
+    expect(metaService.listCampaigns).not.toHaveBeenCalled();
+    expect(getMetaAccessToken).not.toHaveBeenCalled();
+  });
+
   it('unscoped calls (no client_id) are completely unaffected — zero admin gate, zero audit', async () => {
     (metaService.listCampaigns as jest.Mock).mockResolvedValue({ campaigns: [], truncated: false, pagesFetched: 1 });
 
