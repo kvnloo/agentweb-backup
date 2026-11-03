@@ -1,3 +1,27 @@
+## ENG-673: how many contacts of a Smartlead push replied, bounced or unsubscribed (2026-11-02)
+
+The push run item (`AW-SmartleadPushRuns`, sk `RUN`) now carries an optional `events` map `{replied, bounced, unsubscribed}`, one count per CONTACT (a second reply from the same contact does not count again; a temporary bounce is not counted). It is added to by `SmartleadPushRunDb.countContactEvent` and shown in the push run view (`RunView.events`).
+
+- Written only by the Smartlead event handler (`smartleadEventService.ts`), AFTER every matched contact's reply, alert and block are done (a contact in two lists is two blocks), through a try/catch and a 2 s cap on the wait: a failing or slow counter is logged and never changes what happens to the contact or holds up the response.
+- A bounce or unsubscribe counts only when this call wrote the block, so our own withdrawal sweep (which unsubscribes every blocked contact in Smartlead, and Smartlead reports back as an unsubscribe) is not counted as the contact's act, and a retry after a failed block write still counts once.
+- No lease is needed: replies and opt-outs arrive long after a push has finished. The update only adds to the counter (`SET events.k = if_not_exists(events.k, 0) + 1`); the first event of a run (or of a run made before this) creates the map with a separate conditional write that never overwrites an existing one.
+- The history indexes (`ListRunsIndex` etc.) project a fixed attribute list that cannot be changed on a table that exists, so `history()` reads each run's `events` from the base table with a one-attribute `GetItem` (25 at most; `BatchGetItem` is not in the app role's grant). A failed read lists the run without counts.
+- Display only. The contact's own engagements remain the record. A crash between saving an event and counting it leaves the count one short; there is no recount, and a contact who replied before this shipped is treated as already counted.
+- Runs made before this have no `events` and the view shows nothing for them. No table, index or key change; the IAM grant (UpdateItem on the table) already covers it.
+- Known small inaccuracies, accepted because the counts are display only: (1) two simultaneous deliveries of the SAME unsubscribe (before either has written the block) can count it twice; a replay seconds apart counts once. (2) If a webhook records the event but its block write fails, and the hourly poll then finishes the block, the contact is not counted. (3) The counter update is not idempotent across the SDK's retry of an ambiguous network failure (could add twice). (4) `history()` adds up to 25 small reads with no time cap. (5) Pre-existing events on a run made before this are not counted, and the UI does not say so.
+- Tested against DynamoDB Local (`smartleadPushRunDb.dynamodbLocal.test.ts`, 63 tests, 4 new) as well as the in-memory store and the fakes.
+
+## ENG-2778: Force final synthesis at the Agent Mode step cap (2026-11-02)
+
+The 40th Agent Mode step is now a forced synthesis (like the ENG-907 wall-clock path): tool calls are discarded and the model writes its own partial answer instead of the canned step-limit apology. maxIterations unchanged.
+
+## ENG-1281: Retire Google Custom Search provider ahead of Jan 2027 sunset (2026-11-02)
+
+- Deleted `backend/src/search/googleSearchProvider.ts`; no code path calls `google.customsearch` anymore.
+- `google_search_web` stays registered as a legacy alias and is served by You.com web search (same result shape, `provider: 'you'`, `toolName` unchanged).
+- `google_cse` removed from `METERED_VENDOR_PROVIDERS` (no live adapter); rate-card entry kept so historical ledger rows still price.
+- Decommission after merge: `GOOGLE_SEARCH_API_KEY` / `GOOGLE_SEARCH_ENGINE_ID` secrets and the Google Cloud project's Custom Search API key.
+
 ## ENG-589: agent-mode failure clusters auto-file Linear issues via the ENG-240 rail (2026-11-02)
 
 - `ClusterIntakeTool` replaces the bare `SpecOutputTool` in the agent-mode loop: each major `toolName × failureType` cluster (existing count+rate thresholds) files one `Auto` issue through `fileAutoIssue` with `Alert Class: agent-mode:<tool>:<failureType>`, cluster stats, up to 3 sample traces, and an AC stub. Open canonical → occurrence comment; closed canonical → reopen (`findMostRecentClosedIssueByLabel`); always `human-triage`.
