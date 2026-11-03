@@ -34,3 +34,29 @@ describe('runHostTurn: an abort that lands just before the back-off sleep', () =
     expect(outcome).toBe('aborted_while_waiting');
   });
 });
+
+describe('runHostTurn hands its Stop signal to turnRun', () => {
+  it('a Stop while the worker has not yet answered turn.run ends the wait: the signal reaches turnRun (no timers: the client rejects as soon as it sees the signal)', async () => {
+    const ac = new AbortController();
+    let received: AbortSignal | undefined;
+    const turnRun = jest.fn(
+      (_req: unknown, opts?: { signal?: AbortSignal }) =>
+        new Promise<never>((_resolve, reject) => {
+          received = opts?.signal;
+          // a client that was NOT given the signal can never be stopped: fail the test right away instead of hanging it
+          if (!opts?.signal) return reject(new Error('SIGNAL_NOT_PASSED_TO_turnRun'));
+          opts.signal.addEventListener('abort', () => reject(new LoginHostError('EBUSY', 'aborted_while_waiting')), { once: true });
+        }),
+    );
+    const client = { turnRun } as unknown as LoginHostClient;
+    const p = runHostTurn(client, { connectionId: 'c', epoch: 1, idempotencyKey: 'k', turnId: 't', prompt: 'p', model: 'm', tools: [], deadlineMs: 60_000, priority: 'interactive' } as never, {
+      signal: ac.signal,
+      sleep: async () => undefined,
+    });
+    await Promise.resolve(); // let admission call turnRun
+    ac.abort();
+    await expect(p).rejects.toMatchObject({ code: 'EBUSY', detail: 'aborted_while_waiting' });
+    expect(received).toBe(ac.signal);
+    expect(turnRun).toHaveBeenCalledTimes(1);
+  });
+});

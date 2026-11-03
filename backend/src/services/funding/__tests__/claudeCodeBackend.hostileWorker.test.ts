@@ -14,6 +14,7 @@ import { LoginHostClient, UnixSocketTransport } from '../loginHostClient';
 import { runHostTurn } from '../loginHostTurn';
 import { ToolBridge, type BridgeExecuteOutcome, type BridgeTool, type ToolBridgeDeps } from '../toolBridge';
 import { ToolBridgeMcpAdapter } from '../toolBridgeMcp';
+import { RESULT_LOST_NOTE } from '../relayToolDispatcher';
 
 const SOCK = join(fs.mkdtempSync(join(tmpdir(), 'hw-')), 'hw.sock');
 const LLM = 'openrouter/anthropic/claude-sonnet-5.5';
@@ -32,9 +33,13 @@ describe('hostile worker vs the relay backend', () => {
   let live: { value: boolean };
   let executions: Array<{ name: string; args: any; claims: any }>;
   let toolHold: Record<string, Promise<void>>;
+  /** The worker takes every turn.toolResult post and never finishes the reply; `hung` counts them, `hungClosed` the ones whose connection the backend has closed. */
+  let hangToolResult = false;
+  let hung = 0;
+  let hungClosed = 0;
 
   beforeEach(async () => {
-    posts = []; interrupts = 0; executions = []; toolHold = {};
+    posts = []; interrupts = 0; executions = []; toolHold = {}; hangToolResult = false; hung = 0; hungClosed = 0;
     try { fs.unlinkSync(SOCK); } catch {}
     srv = http.createServer((req, res) => {
       const chunks: Buffer[] = [];
@@ -47,7 +52,16 @@ describe('hostile worker vs the relay backend', () => {
         if (route === 'turn.renew') return json({ leaseMs: 30000 });
         if (route === 'turn.interrupt') { interrupts++; return json({ interrupted: true }); }
         if (route === 'connection.status') return json({ state: 'active', epoch: 1, runningTurns: 1 });
-        if (route === 'turn.toolResult') { posts.push(body); return json({ ok: true }); }
+        if (route === 'turn.toolResult') {
+          posts.push(body);
+          if (hangToolResult) {
+            hung++;
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.on('close', () => void hungClosed++);
+            return; // never finishes the reply
+          }
+          return json({ ok: true });
+        }
         if (route === 'turn.run') {
           res.writeHead(200, { 'content-type': 'application/x-ndjson' });
           res.write('{"type":"accepted","turnId":"' + body.turnId + '","duplicate":false}\n');
@@ -275,6 +289,22 @@ describe('hostile worker vs the relay backend', () => {
     expect(executions).toEqual([]); // it was ["save_note"]
     expect(r.content).toBe('all done');
     expect(posts.find((p) => p.operationId === 'late1')).toMatchObject({ isError: true });
+  });
+
+  it('a post the worker never finishes is aborted when the turn is closed: the backend closes that connection, and the tool\'s persisted result says its answer was not delivered', async () => {
+    const t = setup();
+    hangToolResult = true;
+    script = async (c) => {
+      c.write(call('h1', 'save_note', { note: 'hello' }));
+      await waitFor(() => hung === 1);
+      c.write({ type: 'result', ok: true, text: 'done' });
+      c.end();
+    };
+    const r = await t.backend().run(t.params());
+    expect(r.content).toBe('done');
+    await waitFor(() => hungClosed === 1); // it was never closed (the reply stayed open until the 60 s request limit)
+    const tool = r.responseMessages.find((m: any) => m.role === 'tool');
+    expect(tool.content).toBe(`save_note receipt\n${RESULT_LOST_NOTE}`);
   });
 
   it('a fabricated result.errorKind / text with newlines does not reach the logs verbatim', async () => {

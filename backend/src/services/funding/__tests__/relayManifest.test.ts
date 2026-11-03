@@ -5,7 +5,7 @@ import { MAX_NAMES_PER_REASON, buildRelayManifest, manifestCut, manifestLogField
 const tool = (name: string, extra: Record<string, unknown> = {}) => ({ name, description: `${name} d`, inputSchema: { type: 'object', properties: {} }, ...extra });
 
 describe('relayName', () => {
-  // The host's widened pattern: letters of both cases, digits, _ and -, 1-64 chars, no leading '-'. Identity mapping, so these ARE the names the CLI calls.
+  // The host's widened pattern: letters of both cases, digits, _ and -, 1-53 chars (TOOL_NAME_MAX_CHARS), no leading '-'. Identity mapping, so these ARE the names the CLI calls.
   it.each(['search', 'get_crm_leads', 'a1_b2', 'Search', 'HubSpot-Contacts', 'call-meta', '_private', 'x'.repeat(TOOL_NAME_MAX_CHARS), 'aw-relay_x'])('accepts %s', (n) =>
     expect(relayName(n)).toBe(true));
   it.each(['', '-leading', 'x'.repeat(TOOL_NAME_MAX_CHARS + 1), 'aw_relay_x', 'AW_Relay_x', 'aw_relay_', 'a b', 'tool.name', 'a/b', 'ünïcode', 'a\nb', 5, undefined])('rejects %p', (n) =>

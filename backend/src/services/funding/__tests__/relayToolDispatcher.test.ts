@@ -1103,6 +1103,25 @@ describe('RelayToolDispatcher', () => {
       expect(t.d.deliveredCallIds().has(CID(1))).toBe(false);
     });
 
+    it('production mode: a call that is WAITING for its turn behind a running call is refused if the turn is stopped meanwhile (the check is made again when its turn comes)', async () => {
+      // `isStopped` can turn true while the bridge run is still open (a tripped limit aborts the turn, nothing closes the run), so only the dispatcher can stop the waiting call.
+      let open: () => void = () => undefined;
+      const gate = new Promise<void>((r) => (open = r));
+      const flag = { stopped: false };
+      const t = rig({ gate: { save_note: gate }, admitSiblings: false, stopped: () => flag.stopped });
+      t.d.start(t.ev('op-1', 'save_note', { n: 1 })); // runs, and holds the one-at-a-time lane
+      for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+      expect(t.executed).toHaveLength(1);
+      t.d.start(t.ev('op-2', 'search', { q: 'x' })); // passes the early checks, then waits for the lane
+      for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+      expect(t.d.pending).toBe(2);
+      flag.stopped = true;
+      open();
+      await t.d.settle(1_000);
+      expect(t.executed.map((e) => e.name)).toEqual(['save_note']); // the waiting call never ran
+      expect(t.posts.find((p) => p.operationId === 'op-2')).toMatchObject({ isError: true, content: STOPPED_MESSAGE });
+    });
+
     it('after close() no call starts and no post is attempted', async () => {
       const t = rig();
       t.d.close();

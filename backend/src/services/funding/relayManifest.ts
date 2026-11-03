@@ -1,12 +1,12 @@
 /**
  * ENG-2113 (tool relay, backend side): builds the bounded `tools` manifest of `turn.run` from the bridge's tool list.
  *
- * The relay's name pattern is protocol.ts `TOOL_NAME` (today `^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$`: letters of both cases, digits, `_` and `-`, no leading `-`)
- * and the `aw_relay_` prefix is the shim's own (case-sensitive, as the host checks it). Emma's tool names are snake_case, per-user MCP tools may use capitals
+ * The relay's name pattern is protocol.ts `TOOL_NAME` (today `^[A-Za-z0-9_][A-Za-z0-9_-]{0,52}$`: at most 53 characters in all, TOOL_NAME_MAX_CHARS = the model's limit of 64 minus the 11-character prefix `mcp__emma__`; letters of both cases, digits, `_` and `-`, no leading `-`)
+ * and the `aw_relay_` prefix is the shim's own (matched in any case, as the host does). Emma's tool names are snake_case, MCP-server tools may use capitals
  * and hyphens (the `mcp__emma__` prefix seen in the CLI's stream is added by the CLI, it is not part of the name the bridge lists), so the mapping is the
  * IDENTITY on every name that fits,
  * which is a bijection by construction and needs no table that could drift. A name that does not fit is SKIPPED (never rewritten: a rewrite could collide with
- * another tool), counted, and logged by reason only. The same predicate decides, on a `tool-call`, whether a name can be mapped back.
+ * another tool), counted per reason, and logged by name (made safe for a log line: see `toolNote`) with the sizes that mattered, never with its description or schema. The same predicate decides, on a `tool-call`, whether a name can be mapped back.
  *
  * Like Emma (which starts a chat with only the foundation tools plus `install_skills` and adds a skill's tools when the model installs it), the manifest is
  * the run's OPEN tool list at turn start, nothing else. Tools that become available later travel in the `tools` of the `turn.toolResult` of the call that made
