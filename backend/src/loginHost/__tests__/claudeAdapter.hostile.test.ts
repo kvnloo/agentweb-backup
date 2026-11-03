@@ -11,6 +11,7 @@ import { dirname, join } from "path";
 import type { AdapterContext, ChildLike, ProviderEvent, SpawnSpec } from "../adapter";
 import { ClaudeAdapter } from "../adapters/claudeAdapter";
 import * as canonicalModule from "../relay/canonical";
+import { TokenBucket } from "../relay/cpuMeter";
 import { Layout } from "../ports/layout";
 import { RelayHost, type RelayCall, type RelayEndpoint, type RelayOpenOptions } from "../relay/relayServer";
 import type { ToolDef } from "../protocol";
@@ -32,7 +33,7 @@ beforeEach(() => {
 });
 afterEach(() => void process.off("uncaughtException", onU));
 
-async function until(cond: () => boolean, ms = 5000): Promise<void> {
+async function until(cond: () => boolean, ms = 10_000): Promise<void> {
   const t0 = Date.now();
   while (!cond() && Date.now() - t0 < ms) await new Promise((r) => setTimeout(r, 15));
   if (!cond()) throw new Error("until: timed out");
@@ -146,6 +147,8 @@ describe("a hostile CLI printing a deeply nested line", () => {
 
 describe("one line cannot fan out into a flood of events", () => {
   const manyBlocks = (n: number, id: string) => ({ type: "assistant", message: { id, content: Array.from({ length: n }, (_, i) => ({ type: "text", text: "b" + i })) } });
+  let refill: jest.SpyInstance | undefined;
+  afterEach(() => refill?.mockRestore());
 
   it("MUTATION TARGET: a 5,000-block line yields at most the first 32 blocks as events (not 5,000)", async () => {
     const rig = makeRig();
@@ -160,6 +163,10 @@ describe("one line cannot fan out into a flood of events", () => {
   });
 
   it("MUTATION TARGET: a flood of 32-block lines (3,200 events in a burst, over the 2,000 normalized-events bucket) ends the turn: event_flood is logged once and the events stop", async () => {
+    // The bucket REFILLS on the wall clock (200 events/s): with a real clock the flood lets through 2,000 + 200 x (seconds it took to handle) events, 2,016 after 80 ms on a
+    // loaded runner, and a runner starved for 6 s would honestly absorb all 3,200 with no trip at all. So the refill is switched off for this test (the same bucket, the
+    // same burst, nothing else changes) and the burst is then the exact bound whatever the load: 62 lines of 32 events fit 2,000, the 63rd does not.
+    refill = jest.spyOn(TokenBucket.prototype as unknown as { refill(): void }, "refill").mockImplementation(() => undefined);
     const rig = makeRig();
     rig.scenario({ turn: [...Array.from({ length: 100 }, (_, i) => manyBlocks(32, "m" + i)), RESULT_STEP] });
     const session = await rig.adapter.openSession(rig.ctx, { connectionId: "conn1", epoch: 3 });
@@ -168,8 +175,11 @@ describe("one line cannot fan out into a flood of events", () => {
     for await (const ev of session.turn({ turnId: "t1", prompt: "go", model: "sonnet", relay: { tools: TOOLS, callTimeoutMs: () => 5000 } })) events.push(ev);
     await session.close();
     console.log("RESULT cpu events flood", JSON.stringify({ ms: Date.now() - t0, events: events.length }));
-    expect(events.filter((e) => e.type === "text").length).toBeLessThanOrEqual(2000);
+    expect(events.filter((e) => e.type === "text").length).toBe(Math.floor(2000 / 32) * 32); // 1,984: the burst, not 3,200
     expect(rig.logs.filter((l) => l.event === "event_flood")).toHaveLength(1);
+    // the numbers of the bucket itself: burst 2,000, refill 200 per second (a mutant that raises either, or removes the bucket, fails)
+    const bucket = (session as unknown as { eventBucket: { burst: number; perSec: number } }).eventBucket;
+    expect({ burst: bucket.burst, perSec: bucket.perSec }).toEqual({ burst: 2000, perSec: 200 });
     // event_flood is a guard trip: the raw pipes of the child were closed before the signal
     expect((session as unknown as { childAdapter?: { pipesClosed: boolean } }).childAdapter?.pipesClosed).toBe(true); // (the raw stream is destroyed by node itself once the process is gone, so the adapter's own flag is what shows the trip)
     expect(events.some((e) => e.type === "result" && e.ok === true)).toBe(false);

@@ -97,7 +97,7 @@ const isGone = (pid: number) => {
     return true;
   }
 };
-async function until(cond: () => boolean, ms = 3000): Promise<void> {
+async function until(cond: () => boolean, ms = 10_000): Promise<void> {
   const t0 = Date.now();
   while (!cond() && Date.now() - t0 < ms) await new Promise((r) => setTimeout(r, 20));
 }

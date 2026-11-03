@@ -85,7 +85,7 @@ class Client {
     this.sock.write(s);
   }
 }
-async function until(cond: () => boolean, ms = 2000): Promise<void> {
+async function until(cond: () => boolean, ms = 10_000): Promise<void> {
   const t0 = Date.now();
   while (!cond() && Date.now() - t0 < ms) await new Promise((r) => setTimeout(r, 10));
   if (!cond()) throw new Error("until: timed out");
@@ -498,36 +498,36 @@ describe("relay: limits and abuse", () => {
     const c = new Client(sockOf(ep));
     await c.ready();
     const t = setInterval(() => c.raw("{"), 30);
-    await until(() => c.closed, 3000);
+    await until(() => c.closed, 10_000);
     clearInterval(t);
     expect(r.logs.map((l) => l.fields?.code)).toContain("idle_timeout");
     await ep.close();
   });
 
   it("a silent connection is cut after the idle timeout; pings keep it alive", async () => {
-    const r = rig({ idleMs: 200 });
+    const r = rig({ idleMs: 1000 }); // (a ping every 100 ms against a 1 s idle timer: a 10x margin, so a starved runner cannot cut the live connection)
     const { ep } = await r.open();
     const quiet = new Client(sockOf(ep));
     await quiet.ready();
-    await until(() => quiet.closed, 3000);
+    await until(() => quiet.closed, 10_000);
     const live = new Client(sockOf(ep));
     await live.ready();
-    const t = setInterval(() => live.send({ type: "ping" }), 60);
-    await new Promise((res) => setTimeout(res, 500));
+    const t = setInterval(() => live.send({ type: "ping" }), 100);
+    await new Promise((res) => setTimeout(res, 1500));
     clearInterval(t);
     expect(live.closed).toBe(false);
     await ep.close();
   });
 
   it("MUTATION TARGET: a connection that sent ONE complete frame and then goes silent is still cut at idleMs (the idle timer is re-armed per frame, not just dropped)", async () => {
-    const r = rig({ idleMs: 300 });
+    const r = rig({ idleMs: 1000 });
     const { ep } = await r.open();
     const c = new Client(sockOf(ep));
     await c.ready();
     c.send({ type: "ping" });
     await new Promise((res) => setTimeout(res, 120));
-    expect(c.closed).toBe(false); // not yet: the timer restarted at the frame
-    await until(() => c.closed, 3000);
+    expect(c.closed).toBe(false); // not yet: the timer restarted at the frame (a 1 s timer against a 120 ms wait: a starved runner cannot make this flake)
+    await until(() => c.closed, 10_000);
     expect(r.logs.map((l) => l.fields?.code)).toContain("idle_timeout");
     await ep.close();
   });
