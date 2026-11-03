@@ -22,7 +22,7 @@ import { LoginHostError, type LoginHostClient } from "./loginHostClient";
 import type { HostTurnOptions, HostTurnOutcome } from "./loginHostTurn";
 import type { RouteInput } from "../../loginHost/protocol";
 import type { BridgeCallOptions, BridgeCallRecord, BridgeCallResult, BridgeHalt, BridgeListedTool, BridgeToolCall, CloseAndDrainResult } from "./toolBridge";
-import { buildRelayManifest, manifestCut, manifestProblem, type RelayManifest } from "./relayManifest";
+import { buildRelayManifest, manifestCut, manifestLogFields, manifestProblem, type RelayManifest } from "./relayManifest";
 import { RESULT_LOST_NOTE, RelayToolDispatcher } from "./relayToolDispatcher";
 import { ToolBridgeAuthError } from "./toolBridge";
 import { safeText, safeToken } from "./logSafe";
@@ -474,6 +474,8 @@ export class ClaudeCodeBackend {
                   }
                   d.bridge.noteToolResult(runId, e.operationId);
                   progress("tool_executed");
+                } else if (e.type === "result") {
+                  dispatcher?.noteResult(); // the turn is over: a tool-call that still arrives on the open stream is refused, not run
                 } else if (e.type === "usage") {
                   // Worker-supplied counts: finite, but 1e308 + 1e308 is Infinity and would be persisted. Each count is capped.
                   const input = clampCount(e.inputTokens);
@@ -494,7 +496,7 @@ export class ClaudeCodeBackend {
           // and the cached "match / 4" would otherwise stay for up to 10 minutes, failing every relay turn). Forget the cached protocol now and fail THIS turn
           // as the retryable "worker unavailable"; nothing ran. The next turn is decided on the fresh answer (unknown, then the real protocol).
           if (dispatcher && err instanceof LoginHostError && err.code === "EINVALID" && !hostStarted && refusedAsOldWorker(err.detail)) {
-            console.error("[claude-backend] relay_rejected_by_worker", { detail: err.detail, session: p.sessionId });
+            console.error("[claude-backend] relay_rejected_by_worker", { detail: safeText(err.detail, 120), session: p.sessionId, run: runId, offered: built?.manifest.tools.length, bytes: built?.manifest.bytes, open: built?.manifest.open.size, protocol: d.relay?.workerProtocol() });
             try {
               d.relay?.invalidateProtocol?.();
             } catch {
@@ -520,7 +522,10 @@ export class ClaudeCodeBackend {
       // 6. wait for in-flight calls, take the ledger. A Stop (or a revoke) closes the bridge run BEFORE this point, and the drain of a closed run
       // answers null: the ledger is then read from where the bridge keeps it, never treated as empty.
       // Relay calls run out of band: they are waited for first (their toolResult posts included), then the bridge run is drained and closed.
-      if (dispatcher) await dispatcher.settle(d.drainTimeoutMs ?? 10_000);
+      if (dispatcher) {
+        await dispatcher.settle(d.drainTimeoutMs ?? 10_000);
+        dispatcher.close(); // answer posts still in flight are aborted (their calls are recorded as lost)
+      }
       const generation = d.bridge.generationOf(runId);
       const drained = await d.bridge.closeRunAndDrain(runId, d.drainTimeoutMs ?? 10_000);
       opened = false;
@@ -666,30 +671,37 @@ export class ClaudeCodeBackend {
    */
   private async buildRelay(p: ClaudeTurnParams, runId: string, token: string): Promise<{ manifest: RelayManifest }> {
     const d = this.deps;
+    // Ids the other relay log lines already carry (the session; the run id is our own), so a refusal can be tied to its turn. Never a description, a schema or an input.
+    const ids = { session: p.sessionId, run: runId };
     let open: BridgeListedTool[];
     try {
       open = await d.bridge.listTools!(token, runId);
     } catch (err) {
-      throw noToolsStop(err instanceof ToolBridgeAuthError ? "revoked_or_disabled" : "lookup_failed");
+      const revoked = err instanceof ToolBridgeAuthError;
+      console.error(`[claude-backend] relay_refused cause=${revoked ? "revoked_or_disabled" : "lookup_failed"}`, { ...ids, error: safeToken(err instanceof Error ? err.name : typeof err, ["Error", "TypeError", "ToolBridgeAuthError", "RangeError"]) });
+      throw noToolsStop(revoked ? "revoked_or_disabled" : "lookup_failed");
     }
     const manifest = buildRelayManifest(open);
     // Never a degraded manifest (B1/B2): if any tool would be left out or any description cut (per-user MCP tools are unbounded in number and shape), the
     // turn is refused and the user told, rather than run with fewer tools than an AgentWeb turn would have. relayManifest.registry.test.ts keeps the
     // built-in registry inside the limits. `tools_too_large_for_plan`: not retryable, nothing has run, AgentWeb credits offered (AgentWeb can run them).
+    // The line names the tools that did not fit (sanitized, bounded) and the sizes that mattered, so an operator can fix an admin-configured MCP server.
     if (manifestCut(manifest)) {
-      console.error("[claude-backend] relay_manifest_cut", { ...manifest.skipped, truncatedDescriptions: manifest.truncated, offered: manifest.tools.length });
+      console.error("[claude-backend] relay_manifest_cut", { ...ids, ...manifestLogFields(manifest) });
       throw noToolsStop("tools_too_large_for_plan");
     }
     if (manifest.tools.length === 0 || manifest.open.size === 0) {
       // Fail closed (B3): never fall back to the HTTP bridge on a relay-capable worker. Nothing has run.
-      console.error("[claude-backend] relay_refused cause=manifest_empty");
+      console.error("[claude-backend] relay_refused cause=manifest_empty", { ...ids, ...manifestLogFields(manifest) });
       throw noToolsStop("tools_unavailable_for_plan"); // no tool was cut (that was refused above): the list itself came back empty, so asking again can work
     }
     const problem = manifestProblem(manifest.tools);
     if (problem) {
-      console.error("[claude-backend] relay_refused cause=manifest_schema", { problem });
+      console.error("[claude-backend] relay_refused cause=manifest_schema", { ...ids, problem: safeText(problem, 120), ...manifestLogFields(manifest) });
       throw noToolsStop("tools_unavailable_for_plan"); // no tool was cut (refused above): a bug-shaped refusal, retryable and offered like any host-side failure
     }
+    // Capacity trends are visible before anything is cut: how close the manifest is to the limits (600 tools, 1 MiB), on every relay turn.
+    console.info("[claude-backend] relay_turn_start", { ...ids, protocol: d.relay?.workerProtocol(), ...manifestLogFields(manifest) });
     return { manifest };
   }
 

@@ -281,6 +281,38 @@ describe('RelayToolDispatcher', () => {
       }
     });
 
+    it('when the worker refuses late definitions the line names them (sanitized) with the worker\'s reason; hostile names cannot forge or bloat it', async () => {
+      const t = rig({ appearAfter: { install_skills: [{ name: 'ok_tool', description: 'SECRET-DESC', inputSchema: { type: 'object' } }] } });
+      t.behaviour.next = [new LoginHostError('EINVALID', 'tools_limit')];
+      t.d.start(t.ev('op-1', 'install_skills'));
+      await t.d.settle(1_000);
+      const lines = errors.filter((e) => e.includes('new_tools_refused'));
+      expect(lines).toHaveLength(1);
+      const [msg, fields] = JSON.parse(lines[0]);
+      expect(msg).toBe('[relay-dispatch] new_tools_refused');
+      expect(fields).toMatchObject({ count: 1, reason: 'EINVALID/tools_limit', run: 'r1' });
+      expect(fields.tools).toEqual([{ name: 'ok_tool', nameChars: 7, schemaBytes: expect.any(Number), descriptionBytes: 11 }]);
+      expect(lines[0]).not.toContain('SECRET-DESC');
+    });
+
+    it('hostile late tool names (line break and forged prefix, ANSI, NUL, 10 kB) and 10,000 late tools: one bounded line, names sanitized', async () => {
+      const hostile = ['evil\n[relay-dispatch] forged', 'ansi\u001b[31mred', 'nul\u0000byte', 'x'.repeat(10_000)].map((name) => ({ name, description: 'd' }));
+      const many = Array.from({ length: 10_000 }, (_, i) => ({ name: `bad.${i}`, description: 'd' }));
+      const t = rig({ appearAfter: { install_skills: [...hostile, ...many] } });
+      t.d.start(t.ev('op-1', 'install_skills'));
+      await t.d.settle(5_000);
+      const lines = errors.filter((e) => e.includes('new_tool_unloadable'));
+      expect(lines).toHaveLength(1);
+      const [, fields] = JSON.parse(lines[0]);
+      expect(fields.count).toBe(10_004);
+      expect(fields.tools).toHaveLength(25);
+      for (const n of fields.tools) {
+        expect(n.name).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/);
+        expect(n.name.length).toBeLessThanOrEqual(67);
+      }
+      expect(lines[0].length).toBeLessThan(8_000);
+    });
+
     it('our own client-side schema check failing on `tools` (the same rules) is handled like a worker refusal; a failure elsewhere in the body is not', async () => {
       const zodOnTools = Object.assign(new Error('zod'), { name: 'ZodError', issues: [{ path: ['tools'] }] });
       const t = rig();
@@ -316,7 +348,12 @@ describe('RelayToolDispatcher', () => {
       const logged = errors.join('\n');
       expect(logged).toContain('new_tool_unloadable');
       expect(logged).toContain('"count":3');
-      expect(logged).not.toMatch(/huge|bad\.name|long_desc/);
+      // the tools that did not fit are NAMED with the reason and the sizes that mattered, never their descriptions or schemas
+      const line = JSON.parse(errors.find((e) => e.includes('new_tool_unloadable'))!);
+      expect(line[1].tools.map((x: any) => [x.name, x.why])).toEqual([['huge', 'schema_too_large'], ['bad.name', 'name'], ['long_desc', 'description_truncated']]);
+      expect(line[1].tools[2]).toMatchObject({ nameChars: 9, descriptionBytes: 60_000 });
+      expect(line[1].run).toBe('r1');
+      expect(logged).not.toMatch(/xxxxxxxx|ééé/);
       t.d.start(t.ev('op-2', 'huge'));
       await t.d.settle(1_000);
       expect(t.executed.map((e) => e.name)).toEqual(['install_skills']);
@@ -1007,6 +1044,72 @@ describe('RelayToolDispatcher', () => {
       }
       expect(ids[0]).toBe(CID(1));
       expect(CID(1, 'r2')).not.toBe(CID(1, 'r1'));
+    });
+  });
+
+  describe('the end of the turn (security review): a result closes the door, an oversize input is refused, the input is dropped, close() aborts hanging posts', () => {
+    it('a tool-call that arrives AFTER the final result is refused (nothing executes); a call that was already running still finishes and is answered', async () => {
+      const t = rig();
+      t.d.start(t.ev('op-run', 'save_note', { n: 1 }));
+      await t.d.settle(1_000);
+      t.d.noteResult();
+      t.d.start(t.ev('op-late', 'save_note', { n: 2 }));
+      await t.d.settle(1_000);
+      expect(t.executed.map((e) => e.args)).toEqual([{ n: 1 }]);
+      expect(t.posts.find((p) => p.operationId === 'op-late')).toMatchObject({ isError: true, content: STOPPED_MESSAGE });
+    });
+
+    it('a call that is running when the result arrives is not cut', async () => {
+      let open: () => void = () => undefined;
+      const gate = new Promise<void>((r) => (open = r));
+      const t = rig({ gate: { save_note: gate } });
+      t.d.start(t.ev('op-1', 'save_note', { n: 1 }));
+      await new Promise((r) => setImmediate(r));
+      t.d.noteResult();
+      open();
+      await t.d.settle(1_000);
+      expect(t.executed).toHaveLength(1);
+      expect(t.posts[0]).toMatchObject({ operationId: 'op-1', content: 'save_note done' });
+    });
+
+    it('a call flagged inputTooLarge (its input was too big to be read) is answered with the "arguments too large" text and never reaches the bridge', async () => {
+      const t = rig();
+      const used = jest.spyOn(t.bridge, 'callTool');
+      t.d.start({ ...t.ev('op-1', 'save_note'), input: null, inputTooLarge: true } as never);
+      await t.d.settle(1_000);
+      expect(t.posts[0]).toMatchObject({ isError: true, content: ARGS_TOO_LARGE_MESSAGE });
+      expect(used).not.toHaveBeenCalled();
+      expect(t.executed).toHaveLength(0);
+    });
+
+    it('the dispatcher takes the parsed input off the event: after start() the event no longer references it', async () => {
+      const t = rig();
+      const ev = t.ev('op-1', 'save_note', { n: 1, big: 'x'.repeat(1000) });
+      t.d.start(ev);
+      expect((ev as { input: unknown }).input).toBeUndefined();
+      await t.d.settle(1_000);
+      expect(t.executed[0].args).toMatchObject({ n: 1 }); // and the call still ran with it
+    });
+
+    it('close() aborts a post that never returns (even if the client ignores the signal): the call ends and its answer is recorded as not delivered', async () => {
+      const t = rig({ onPost: () => new Promise(() => undefined) });
+      t.d.start(t.ev('op-1', 'save_note', { n: 1 }));
+      await new Promise((r) => setTimeout(r, 50));
+      expect(t.d.pending).toBe(1);
+      t.d.close();
+      await t.d.settle(1_000);
+      expect(t.d.pending).toBe(0);
+      expect(t.d.lostCallIds().has(CID(1))).toBe(true);
+      expect(t.d.deliveredCallIds().has(CID(1))).toBe(false);
+    });
+
+    it('after close() no call starts and no post is attempted', async () => {
+      const t = rig();
+      t.d.close();
+      t.d.start(t.ev('op-1', 'save_note', { n: 1 }));
+      await t.d.settle(1_000);
+      expect(t.executed).toHaveLength(0);
+      expect(t.posts).toHaveLength(0);
     });
   });
 

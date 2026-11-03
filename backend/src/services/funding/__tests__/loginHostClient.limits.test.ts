@@ -105,7 +105,7 @@ describe('the turn stream is bounded before anything is parsed', () => {
     expect((await drain()).error).toMatchObject({ detail: 'too_many_bytes' });
   }, 30_000);
 
-  it('legitimate maxima pass: a 5 MiB text event, a 1.2 MiB tool call, 16 entitlement windows, a result', async () => {
+  it('legitimate maxima pass: a 1.2 MiB tool call (legacy turn), 16 entitlement windows, a result; a 5 MiB text event is dropped (nobody reads it)', async () => {
     const windows = Array.from({ length: 16 }, (_, i) => ({ name: `w${i}`, utilization: 0.5, resetsAtMs: 1 }));
     serve(
       ev({ type: 'text', delta: 'z'.repeat(5 * 1024 * 1024) }) +
@@ -115,7 +115,7 @@ describe('the turn stream is bounded before anything is parsed', () => {
     );
     const r = await drain();
     expect(r.error).toBeUndefined();
-    expect(r.events).toEqual(['text', 'tool-call', 'entitlement', 'result']);
+    expect(r.events).toEqual(['tool-call', 'entitlement', 'result']);
   });
 
   it.each([
@@ -198,11 +198,10 @@ describe('the turn stream is bounded before anything is parsed', () => {
 
   describe('the cap always matches the type that is processed (SF2)', () => {
   const cases: Array<[string, string]> = [
-    ['text then usage', '{"type":"text","delta":"' + 'x'.repeat(200_000) + '","type":"usage","inputTokens":1}\n'],
-    ['text then entitlement', '{"type":"text","delta":"' + 'x'.repeat(200_000) + '","type":"entitlement","observation":{"windows":[]}}\n'],
     ['result then usage', '{"type":"result","ok":true,"text":"' + 'x'.repeat(200_000) + '","type":"usage"}\n'],
+    ['result then entitlement', '{"type":"result","ok":true,"text":"' + 'x'.repeat(200_000) + '","type":"entitlement","observation":{"windows":[]}}\n'],
     ['result then text', '{"type":"result","ok":true,"text":"' + 'x'.repeat(200_000) + '","type":"text","delta":"d"}\n'],
-    ['text then text', '{"type":"text","delta":"' + 'x'.repeat(200_000) + '","type":"text"}\n'],
+    ['result then result', '{"type":"result","ok":true,"text":"' + 'x'.repeat(200_000) + '","type":"result"}\n'],
   ];
   it.each(cases)('%s is a bad answer before it is parsed', async (_l, line) => {
     serve(line);
@@ -210,10 +209,10 @@ describe('the turn stream is bounded before anything is parsed', () => {
   });
 
   it.each([
-    ['an array outside the payload', '{"type":"text","delta":"x","a":[' + '0,'.repeat(3_000_000) + '0]}\n'],
+    ['an array outside the payload', '{"type":"result","ok":true,"text":"x","a":[' + '0,'.repeat(300_000) + '0]}\n'],
     ['a nested object outside the payload', '{"type":"result","ok":true,"text":"' + 'x'.repeat(100_000) + '","o":{"p":1}}\n'],
-    ['400k extra keys', '{"type":"text","delta":"x",' + Array.from({ length: 400_000 }, (_, i) => `"k${i}":0`).join(',') + '}\n'],
-  ])('SF3: a big text/result line with %s is refused before it is parsed, in milliseconds', async (_l, line) => {
+    ['60k extra keys', '{"type":"result","ok":true,"text":"x",' + Array.from({ length: 60_000 }, (_, i) => `"k${i}":0`).join(',') + '}\n'],
+  ])('SF3: a big result line with %s is refused before it is parsed, in milliseconds', async (_l, line) => {
     serve(line);
     const t0 = Date.now();
     const r = await drain();
@@ -221,12 +220,23 @@ describe('the turn stream is bounded before anything is parsed', () => {
     expect(Date.now() - t0).toBeLessThan(500);
   });
 
-  it('SF3: honest big lines pass: a 5 MiB text with brackets, quotes and backslashes inside its string, and a result with all its fields', async () => {
-    const payload = '{"a":[1,2,{"b":"c"}]} "quoted" \\ back\\slash \n'.repeat(100_000);
-    serve(ev({ type: 'text', delta: payload }) + ev({ type: 'result', ok: false, text: payload, errorKind: 'e', aborted: 'a' }));
+  it('SF3: an honest big result passes: brackets, quotes and backslashes inside its string, all its fields', async () => {
+    const payload = '{"a":[1,2,{"b":"c"}]} "quoted" \\ back\\slash \n'.repeat(13_000); // ~600 KB
+    serve(ev({ type: 'result', ok: false, text: payload, errorKind: 'e', aborted: 'a' }));
     const r = await drain();
     expect(r.error).toBeUndefined();
-    expect(r.events).toEqual(['text', 'result']);
+    expect(r.events).toEqual(['result']);
+  });
+
+  it('a `text` line over 64 KiB is dropped unread, including one that tries to pass as another type: no event, no failure', async () => {
+    serve(
+      '{"type":"text","delta":"' + 'x'.repeat(200_000) + '","type":"usage","inputTokens":1}\n' +
+        '{"type":"text","delta":"x","a":[' + '0,'.repeat(300_000) + '0]}\n' +
+        ev({ type: 'result', ok: true, text: 'done' }),
+    );
+    const r = await drain();
+    expect(r.error).toBeUndefined();
+    expect(r.events).toEqual(['result']);
   });
 
   it('a big tool-call whose last type says something else is refused after the parse', async () => {
@@ -235,7 +245,7 @@ describe('the turn stream is bounded before anything is parsed', () => {
   });
 
   it('a text delta that merely contains the word "type" in quotes is fine (inside a string every quote is escaped)', async () => {
-    serve(ev({ type: 'text', delta: 'say "type" and "type" again ' + 'x'.repeat(200_000) }));
+    serve(ev({ type: 'result', ok: true, text: 'say "type" and "type" again ' + 'x'.repeat(200_000) }));
     expect((await drain()).error).toBeUndefined();
   });
 });

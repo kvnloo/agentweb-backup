@@ -490,8 +490,59 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
       const logged = (console.error as jest.Mock).mock.calls.map((c) => JSON.stringify(c)).join('\n');
       expect(logged).toContain('relay_manifest_cut');
       expect(logged).toContain(`"${key}":`);
-      expect(logged).not.toContain('SECRET-DESC');
-      expect(logged).not.toContain('my.tool');
+      expect(logged).not.toContain('SECRET-DESC'); // never a description
+      if (key === 'name') expect(logged).toContain('my.tool'); // the tool that did not fit is NAMED, so an operator can find it
+    });
+
+    it('the refusal line names the tools that did not fit with the sizes that mattered, and the run and session it belongs to; never a description or a schema', async () => {
+      const t = setup({ tools: [{ name: 'save_note' }, { name: 'my.tool', description: 'SECRET-DESC', inputSchema: { type: 'object', properties: { secret_prop: { type: 'string' } } } }, { name: 'big_desc', description: 'SECRET-BIG' + 'd'.repeat(60_000) }, { name: 'install_skills' }] } as any);
+      await t.backend().run(t.params()).catch(() => undefined);
+      const call = (console.error as jest.Mock).mock.calls.find((c) => c[0] === '[claude-backend] relay_manifest_cut');
+      expect(call).toBeDefined();
+      const f = call![1];
+      expect(f).toMatchObject({ session: 's1', run: 'claude-relay-1', name: 1, truncatedDescriptions: 1, offered: 3, listed: 4, open: 3 });
+      expect(f.skippedTools.name).toEqual([{ name: 'my.tool', nameChars: 7, schemaBytes: expect.any(Number), descriptionBytes: 11 }]);
+      expect(f.truncatedTools).toEqual([{ name: 'big_desc', nameChars: 8, schemaBytes: expect.any(Number), descriptionBytes: 60_010 }]);
+      expect(f.bytes).toBeGreaterThan(0);
+      const logged = JSON.stringify(call);
+      expect(logged).not.toMatch(/SECRET|secret_prop/);
+    });
+
+    it('hostile tool names (a line break and a forged log prefix, an ANSI escape, a NUL, 10 kB) in the refusal line stay inside their field: no forged line, no bloat', async () => {
+      const evil = ['evil\n[claude-backend] relay_manifest_cut forged', 'ansi\u001b[31mred', 'nul\u0000byte', 'x'.repeat(10_000)];
+      const t = setup({ tools: [{ name: 'save_note' }, ...evil.map((name) => ({ name, description: 'd' })), { name: 'install_skills' }] } as any);
+      await t.backend().run(t.params()).catch(() => undefined);
+      const calls = (console.error as jest.Mock).mock.calls;
+      const cut = calls.filter((c) => c[0] === '[claude-backend] relay_manifest_cut');
+      expect(cut).toHaveLength(1); // the forged prefix did not make a second line
+      const strings: string[] = [];
+      const walk = (v: unknown) => (typeof v === 'string' ? strings.push(v) : Array.isArray(v) ? v.forEach(walk) : v && typeof v === 'object' ? Object.values(v).forEach(walk) : undefined);
+      cut[0].slice(1).forEach(walk);
+      for (const x of strings) {
+        expect(x).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/);
+        expect(x.length).toBeLessThanOrEqual(67);
+      }
+      expect(JSON.stringify(cut[0]).length).toBeLessThan(2_000);
+    });
+
+    it('a tool list that cannot be read, and a Stop-independent lookup failure, are logged with a fixed code and the run and session, nothing from the error text', async () => {
+      const t = setup();
+      jest.spyOn(t.adapter, 'listTools').mockRejectedValue(new Error('connection to db-prod-1.internal:5432 refused SECRET-DETAIL'));
+      await t.backend().run(t.params()).catch(() => undefined);
+      const line = (console.error as jest.Mock).mock.calls.find((c) => c[0] === '[claude-backend] relay_refused cause=lookup_failed');
+      expect(line?.[1]).toMatchObject({ session: 's1', run: 'claude-relay-1', error: 'Error' });
+      expect(JSON.stringify(line)).not.toMatch(/SECRET-DETAIL|db-prod/);
+    });
+
+    it('every relay turn that starts logs one INFO line with the manifest size and the host protocol (capacity trends before anything is cut)', async () => {
+      const info = jest.spyOn(console, 'info').mockImplementation(() => {});
+      const t = setup();
+      rig.script.turnEvents = [result('fine')];
+      await t.backend().run(t.params());
+      const line = info.mock.calls.find((c) => c[0] === '[claude-backend] relay_turn_start');
+      expect(line?.[1]).toMatchObject({ session: 's1', run: 'claude-relay-1', protocol: 4, truncatedDescriptions: 0, offered: 5, listed: 5, open: 5 });
+      expect(line?.[1].bytes).toBeGreaterThan(0);
+      expect(line?.[1].skippedTools).toBeUndefined();
     });
 
     it('names with capitals and hyphens (the widened pattern) are offered by identity and called back by the same name', async () => {

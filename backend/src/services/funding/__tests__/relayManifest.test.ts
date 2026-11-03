@@ -1,6 +1,6 @@
 /** ENG-2113 tool relay: the manifest the backend sends in turn.run `tools`. */
 import { TOOL_LIMITS, TOOL_NAME_MAX_CHARS } from '../../../loginHost/protocol';
-import { buildRelayManifest, manifestCut, manifestProblem, relayName, toToolDef } from '../relayManifest';
+import { MAX_NAMES_PER_REASON, buildRelayManifest, manifestCut, manifestLogFields, manifestProblem, relayName, toToolDef, toolNote } from '../relayManifest';
 
 const tool = (name: string, extra: Record<string, unknown> = {}) => ({ name, description: `${name} d`, inputSchema: { type: 'object', properties: {} }, ...extra });
 
@@ -124,5 +124,76 @@ describe('toToolDef (the definition of one tool that became available mid-turn)'
   it('reports a cut description', () => {
     const made = toToolDef({ name: 'x', description: 'é'.repeat(30_000), inputSchema: { type: 'object' } }) as { truncated: boolean };
     expect(made.truncated).toBe(true);
+  });
+});
+
+describe('what a refused manifest tells the operator (names and sizes, never contents), and why it cannot be abused', () => {
+  /** Every string anywhere in the log fields: none may carry a line break, an ANSI escape or any control character, and none may be long. */
+  const strings = (v: unknown, out: string[] = []): string[] => {
+    if (typeof v === 'string') out.push(v);
+    else if (Array.isArray(v)) v.forEach((x) => strings(x, out));
+    else if (v && typeof v === 'object') Object.entries(v).forEach(([k, x]) => (out.push(k), strings(x, out)));
+    return out;
+  };
+  const hostile = ['evil\n[relay-dispatch] ALARM root compromised', 'ansi\u001b[31mred\u001b[0m', 'nul\u0000byte', 'x'.repeat(10_000), 'ünï\u202ecode\u2028line', 'tab\tand\rcr'];
+
+  it('a tool that did not fit is named with the sizes that mattered; a description and a schema are never in the fields', () => {
+    const m = buildRelayManifest([
+      tool('ok_tool'),
+      { name: 'my.tool', description: 'SECRET-DESC', inputSchema: { type: 'object', properties: { secret_prop: {} } } } as never,
+      tool('big_schema', { inputSchema: { type: 'object', properties: { a: { description: 'y'.repeat(TOOL_LIMITS.maxSchemaBytes) } } } }),
+      tool('long_desc', { description: 'SECRET-LONG' + 'd'.repeat(TOOL_LIMITS.maxDescriptionBytes) }),
+    ]);
+    const f = manifestLogFields(m) as any;
+    expect(f).toMatchObject({ name: 1, schema_too_large: 1, truncatedDescriptions: 1, offered: 2, listed: 4, open: 2 });
+    expect(f.skippedTools.name).toEqual([{ name: 'my.tool', nameChars: 7, schemaBytes: expect.any(Number), descriptionBytes: 11 }]);
+    expect(f.skippedTools.schema_too_large[0]).toMatchObject({ name: 'big_schema', schemaBytes: expect.any(Number) });
+    expect(f.skippedTools.schema_too_large[0].schemaBytes).toBeGreaterThan(TOOL_LIMITS.maxSchemaBytes);
+    expect(f.truncatedTools[0]).toMatchObject({ name: 'long_desc' });
+    expect(f.truncatedTools[0].descriptionBytes).toBeGreaterThan(TOOL_LIMITS.maxDescriptionBytes);
+    expect(f.bytes).toBe(Buffer.byteLength(JSON.stringify(m.tools)));
+    expect(JSON.stringify(f)).not.toMatch(/SECRET|secret_prop|yyyy/);
+  });
+
+  it.each(hostile.map((n) => [n.slice(0, 20).replace(/[^\x20-\x7e]/g, '?'), n]))('a hostile tool name (%s) cannot forge or bloat a log line: control characters stripped, at most 64 characters (+ an ellipsis)', (_l, name) => {
+    const m = buildRelayManifest([tool('ok_tool'), { name, description: 'd' } as never]);
+    const all = strings(manifestLogFields(m));
+    for (const s of all) {
+      expect(s).not.toMatch(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/);
+      expect(s.length).toBeLessThanOrEqual(64 + 3);
+    }
+    const note = (manifestLogFields(m) as any).skippedTools.name[0];
+    expect(note.nameChars).toBe(name.length); // the real length is kept, as a number
+  });
+
+  it('a non-string name (a number, null, an object) is noted by its type, not stringified', () => {
+    expect(toolNote({ name: 12345 }).name).toBe('<number>');
+    expect(toolNote({ name: null }).name).toBe('<object>');
+    expect(toolNote(null).name).toBe('<undefined>');
+    expect(toolNote({ name: 'a', inputSchema: (() => { const c: any = {}; c.self = c; return c; })() }).schemaBytes).toBe(-1); // a cyclic schema does not throw
+  });
+
+  it('10,000 hostile tools: at most MAX_NAMES_PER_REASON names per reason and for cut descriptions, so the fields stay small however long the list is', () => {
+    const bad = Array.from({ length: 10_000 }, (_, i) => ({ name: `bad.${i}.${'x'.repeat(200)}`, description: 'd'.repeat(100) })) as never[];
+    const dup = Array.from({ length: 10_000 }, () => tool('Same_Name')); // all duplicates of the first
+    const cut = Array.from({ length: 700 }, (_, i) => tool(`cut_${i}`, { description: 'd'.repeat(TOOL_LIMITS.maxDescriptionBytes + 10) }));
+    const m = buildRelayManifest([...bad, ...dup, ...cut]);
+    const f = manifestLogFields(m) as any;
+    expect(f.name).toBe(10_000); // the COUNT is exact
+    expect(f.duplicate).toBe(9_999);
+    expect(f.skippedTools.name).toHaveLength(MAX_NAMES_PER_REASON);
+    expect(f.skippedTools.duplicate).toHaveLength(MAX_NAMES_PER_REASON);
+    expect(f.truncatedTools).toHaveLength(MAX_NAMES_PER_REASON);
+    expect(f.skippedTools.manifest_full === undefined || f.skippedTools.manifest_full.length <= MAX_NAMES_PER_REASON).toBe(true);
+    expect(JSON.stringify(f).length).toBeLessThan(60_000);
+  });
+
+  it('an honest manifest (nothing cut) carries sizes only: the fields for the INFO line at turn start', () => {
+    const m = buildRelayManifest([tool('a_tool'), tool('b_tool')]);
+    const f = manifestLogFields(m) as any;
+    expect(f).toMatchObject({ offered: 2, listed: 2, open: 2, truncatedDescriptions: 0 });
+    expect(f.bytes).toBeGreaterThan(0);
+    expect(f.skippedTools).toBeUndefined();
+    expect(f.truncatedTools).toBeUndefined();
   });
 });

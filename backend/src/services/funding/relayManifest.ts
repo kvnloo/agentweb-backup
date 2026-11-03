@@ -15,10 +15,25 @@
  */
 import { RELAY_RESERVED_PREFIX, TOOL_LIMITS, TOOL_NAME, toolManifest, type ToolDef } from "../../loginHost/protocol";
 import type { BridgeTool } from "./toolBridge";
+import { safeText } from "./logSafe";
 
 export const EMPTY_TOOL_SCHEMA = { type: "object", properties: {} } as const;
 
 export type SkipReason = "name" | "reserved" | "duplicate" | "schema_not_object" | "schema_too_large" | "manifest_full" | "manifest_too_large";
+
+/**
+ * What an operator needs to find a tool that does not fit: its name (made safe for a log line: control characters stripped, at most 64 characters) and the sizes that
+ * matter. Never the description, the schema or anything else of the tool.
+ */
+export interface ToolNote {
+  name: string;
+  /** Length of the name as the tool gave it (the limit is TOOL_NAME_MAX_CHARS). */
+  nameChars: number;
+  schemaBytes: number;
+  descriptionBytes: number;
+}
+/** How many tools are named per skip reason (and for cut descriptions) in a log line: a hostile or huge tool list cannot make the line grow past this. */
+export const MAX_NAMES_PER_REASON = 25;
 
 export interface RelayManifest {
   tools: ToolDef[];
@@ -27,6 +42,11 @@ export interface RelayManifest {
   skipped: Partial<Record<SkipReason, number>>;
   /** Descriptions cut to the byte limit (the tool is offered, with less text than an AgentWeb turn shows). */
   truncated: number;
+  /** For the operator's log (all optional: a manifest built by hand in a test has none). */
+  listed?: number;
+  bytes?: number;
+  skippedTools?: Partial<Record<SkipReason, ToolNote[]>>;
+  truncatedTools?: ToolNote[];
 }
 
 const byteLen = (v: unknown): number => Buffer.byteLength(JSON.stringify(v), "utf8");
@@ -34,6 +54,26 @@ const byteLen = (v: unknown): number => Buffer.byteLength(JSON.stringify(v), "ut
 /** Whether a bridge tool name can be offered through the relay (and so mapped back). */
 export function relayName(name: unknown): name is string {
   return typeof name === "string" && TOOL_NAME.safeParse(name).success && !name.toLowerCase().startsWith(RELAY_RESERVED_PREFIX);
+}
+
+const jsonBytes = (v: unknown): number => {
+  try {
+    return v === undefined ? 0 : Buffer.byteLength(JSON.stringify(v) ?? "", "utf8");
+  } catch {
+    return -1; // cannot be serialized (a cycle): the size is unknown
+  }
+};
+
+/** The log note of one tool: safe to put in a log line whatever the tool contains. */
+export function toolNote(tool: unknown): ToolNote {
+  const t = (typeof tool === "object" && tool !== null ? tool : {}) as Record<string, unknown>;
+  const name = t.name;
+  return {
+    name: safeText(typeof name === "string" ? name : `<${typeof name}>`, 64),
+    nameChars: typeof name === "string" ? name.length : 0,
+    schemaBytes: jsonBytes(t.inputSchema),
+    descriptionBytes: typeof t.description === "string" ? Buffer.byteLength(t.description, "utf8") : 0,
+  };
 }
 
 function truncateUtf8(text: string, maxBytes: number): string {
@@ -67,34 +107,59 @@ export function toToolDef(tool: BridgeTool): { def: ToolDef; truncated: boolean 
  */
 export function buildRelayManifest(open: BridgeTool[]): RelayManifest {
   const skipped: Partial<Record<SkipReason, number>> = {};
-  const skip = (why: SkipReason) => void (skipped[why] = (skipped[why] ?? 0) + 1);
+  const skippedTools: Partial<Record<SkipReason, ToolNote[]>> = {};
+  const skip = (why: SkipReason, tool: unknown) => {
+    skipped[why] = (skipped[why] ?? 0) + 1;
+    const list = (skippedTools[why] ??= []);
+    if (list.length < MAX_NAMES_PER_REASON) list.push(toolNote(tool));
+  };
   const seen = new Set<string>();
   const out: ToolDef[] = [];
+  const truncatedTools: ToolNote[] = [];
   let truncated = 0;
   for (const tool of open) {
     const made = toToolDef(tool);
     if ("skip" in made) {
-      skip(made.skip);
+      skip(made.skip, tool);
       continue;
     }
     const folded = made.def.name.toLowerCase();
     if (seen.has(folded)) {
-      skip("duplicate");
+      skip("duplicate", tool);
       continue;
     }
     seen.add(folded);
-    if (made.truncated) truncated++;
+    if (made.truncated) {
+      truncated++;
+      if (truncatedTools.length < MAX_NAMES_PER_REASON) truncatedTools.push(toolNote(tool));
+    }
     out.push(made.def);
   }
   if (out.length > TOOL_LIMITS.maxTools) {
-    for (let i = 0; i < out.length - TOOL_LIMITS.maxTools; i++) skip("manifest_full");
+    for (let i = TOOL_LIMITS.maxTools; i < out.length; i++) skip("manifest_full", out[i]);
     out.length = TOOL_LIMITS.maxTools;
   }
   while (out.length > 1 && byteLen(out) > TOOL_LIMITS.maxTotalBytes) {
-    out.pop();
-    skip("manifest_too_large");
+    skip("manifest_too_large", out.pop());
   }
-  return { tools: out, open: new Set(out.map((t) => t.name)), skipped, truncated };
+  return { tools: out, open: new Set(out.map((t) => t.name)), skipped, truncated, listed: open.length, bytes: byteLen(out), skippedTools, truncatedTools };
+}
+
+/**
+ * The fields of a manifest worth logging when it is refused or when a turn starts. Counts per reason stay at the top level (`name`, `duplicate`, ...), as before; the tools
+ * that did not fit are named (at most MAX_NAMES_PER_REASON per reason) with the sizes that mattered. No description, schema or input is ever in here.
+ */
+export function manifestLogFields(m: RelayManifest): Record<string, unknown> {
+  return {
+    ...m.skipped,
+    truncatedDescriptions: m.truncated,
+    offered: m.tools.length,
+    ...(m.listed !== undefined ? { listed: m.listed } : {}),
+    open: m.open.size,
+    ...(m.bytes !== undefined ? { bytes: m.bytes } : {}),
+    ...(m.skippedTools && Object.keys(m.skippedTools).length ? { skippedTools: m.skippedTools } : {}),
+    ...(m.truncatedTools && m.truncatedTools.length ? { truncatedTools: m.truncatedTools } : {}),
+  };
 }
 
 /** True when the manifest offers less than the bridge listed: a tool left out (any reason) or a description cut. The backend refuses such a turn. */

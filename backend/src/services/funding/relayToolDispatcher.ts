@@ -21,7 +21,8 @@
 import { createHash } from "crypto";
 import { LogThrottle, approxJsonBytes } from "../../loginHost/relay/bounds";
 import { IMAGE_LIMITS, RELAY_RESULT_MAX_BYTES, toolImage, type ToolDef, type ToolImage } from "../../loginHost/protocol";
-import { toToolDef } from "./relayManifest";
+import { MAX_NAMES_PER_REASON, toToolDef, toolNote, type ToolNote } from "./relayManifest";
+import { safeText } from "./logSafe";
 import { LoginHostError, ToolResultLostError, type LoginHostClient } from "./loginHostClient";
 import { ToolBridgeAuthError, stableStringify, type BridgeCallResult, type BridgeListedTool } from "./toolBridge";
 
@@ -138,6 +139,14 @@ export interface RelayCallEvent {
   messageId: string;
   name: string;
   input: unknown;
+  /** Set by the stream reader when the call's input was too big to be read at all (`input` is then null): the call is answered with ARGS_TOO_LARGE_MESSAGE. */
+  inputTooLarge?: boolean;
+}
+
+/** The parsed input of one call, held ONLY while the call is being decided and cleared as soon as it has been used (see `start`). */
+interface CallInput {
+  input: unknown;
+  tooLarge: boolean;
 }
 
 interface Answer {
@@ -236,6 +245,11 @@ export class RelayToolDispatcher {
     return id;
   }
   private execTail: Promise<void> = Promise.resolve();
+  /** Aborts every answer post still in flight when `close()` ends the turn (after `settle` has given them their window: a Stop or a tripped limit also ends in `settle` then `close`), so a worker that never finishes a reply cannot pin a call. */
+  private readonly posts = new AbortController();
+  /** The worker's final `result` has arrived: no further call starts (calls already running finish). */
+  private resultSeen = false;
+  private closed = false;
   private tripped = false;
   /**
    * The model messages, as the CLI's stream announced them (B1). A stream `tool-use` is informational and never executed; it is recorded here (name, a
@@ -293,7 +307,15 @@ export class RelayToolDispatcher {
       if (this.inFlight.size >= MAX_IN_FLIGHT) return this.trip("in_flight_cap");
       this.seenOps.add(op);
       this.calls++;
-      const work = this.run(op, ev).catch(() => this.log("dispatch_failed"));
+      // The dispatcher takes ownership of the (possibly large) parsed input: it is moved off the event, used by `decide`, and dropped. A call whose answer is still
+      // being posted (a worker that never finishes the reply) must not keep megabytes of input alive: 16 such calls held ~500 MB.
+      const box: CallInput = { input: ev.input, tooLarge: ev.inputTooLarge === true };
+      try {
+        ev.input = undefined;
+      } catch {
+        /* a frozen event: nothing to drop */
+      }
+      const work = this.run(op, ev, box).catch(() => this.log("dispatch_failed"));
       this.inFlight.add(work);
       void work.finally(() => this.inFlight.delete(work));
       return true;
@@ -421,6 +443,20 @@ export class RelayToolDispatcher {
     }
   }
 
+  /** The `result` event arrived: the turn is over, so a tool-call that follows it (the stream stays open) is refused, not run. */
+  noteResult(): void {
+    this.resultSeen = true;
+  }
+
+  /**
+   * Ends the dispatcher: posts still in flight are aborted (their calls are recorded as lost), no further call starts, and the sets that only matter while calls run
+   * are released. Safe to call more than once. Call it after `settle`.
+   */
+  close(): void {
+    this.closed = true;
+    this.posts.abort();
+  }
+
   /** Waits (bounded) for every started call to be answered, so the run can be closed with their records in the ledger. */
   async settle(timeoutMs: number): Promise<{ settled: boolean; pending: number }> {
     const end = this.now() + Math.max(0, timeoutMs);
@@ -442,15 +478,17 @@ export class RelayToolDispatcher {
 
   // ───────────────────────────── one call ─────────────────────────────
 
-  private async run(op: string, ev: RelayCallEvent): Promise<void> {
+  private async run(op: string, ev: RelayCallEvent, box: CallInput): Promise<void> {
     const name = typeof ev.name === "string" ? ev.name : "";
     this.progress("start", name);
     try {
       let answer: Answer;
       const st: CallState = { executed: false };
       try {
-        answer = await this.decide(op, ev, name, st);
+        answer = await this.decide(op, box, name, st);
+        box.input = undefined;
       } catch {
+        box.input = undefined;
         // Something unforeseen. The operation must still be answered: an unanswered one holds the worker's single pending slot until the turn's deadline.
         if (!st.executed) {
           // Before the bridge was called nothing ran (a hostile input that cannot be serialized, say).
@@ -475,8 +513,10 @@ export class RelayToolDispatcher {
   }
 
   /** Runs the call (or refuses it) and returns the answer to send. */
-  private async decide(op: string, ev: RelayCallEvent, name: string, st: CallState): Promise<Answer> {
+  private async decide(op: string, box: CallInput, name: string, st: CallState): Promise<Answer> {
     const refuse = (message: string): Answer => ({ content: message, isError: true });
+    // The turn is over (a `result` has arrived, or the dispatcher was closed): no further call starts. Calls already running finish and are answered.
+    if (this.resultSeen || this.closed) return refuse(STOPPED_MESSAGE);
     if (this.o.isStopped()) return refuse(STOPPED_MESSAGE);
     if (this.o.softDeadlineAt !== undefined && this.now() >= this.o.softDeadlineAt) return refuse(SOFT_DEADLINE_MESSAGE);
     // After a halt nothing else runs (see `admitPostHaltSiblings`): refused here, without being announced to the bridge.
@@ -484,10 +524,12 @@ export class RelayToolDispatcher {
     // The manifest is the worker's view; the bridge's current list (checked again inside callTool) is the authority. A name the worker was never sent
     // (not in the manifest, not in the definitions of an answer) never reaches the bridge.
     if (!this.inManifest(name)) return refuse(NOT_IN_RUN_MESSAGE);
-    if (!isPlainObject(ev.input)) return refuse(BAD_INPUT_MESSAGE);
+    if (box.tooLarge) return refuse(ARGS_TOO_LARGE_MESSAGE);
+    if (!isPlainObject(box.input)) return refuse(BAD_INPUT_MESSAGE);
+    const input = box.input as Record<string, unknown>;
 
     // Work bound before anything is serialized: the size is estimated iteratively and capped.
-    const inputSize = approxJsonBytes(ev.input, CALL_INPUT_MAX_BYTES + 1);
+    const inputSize = approxJsonBytes(input, CALL_INPUT_MAX_BYTES + 1);
     if (inputSize > CALL_INPUT_MAX_BYTES) return refuse(ARGS_TOO_LARGE_MESSAGE);
     if (inputSize > SMALL_INPUT_BYTES) {
       if (inputSize > this.inputBudget) return refuse(ARGS_TOO_LARGE_MESSAGE);
@@ -496,7 +538,7 @@ export class RelayToolDispatcher {
     let key: string;
     let argsKey: string;
     try {
-      argsKey = digestOf(stableStringify(ev.input)); // one canonicalization serves the replay key and the announcement match
+      argsKey = digestOf(stableStringify(input)); // one canonicalization serves the replay key and the announcement match
       key = `${name}\u0000${argsKey}`;
     } catch {
       return refuse(BAD_ARGS_MESSAGE); // input that cannot be canonicalized (absurd nesting, say): nothing ran, and the model is told why
@@ -543,8 +585,8 @@ export class RelayToolDispatcher {
       const announce = !halted || sibling;
       const messageId = sibling ? `msg-${ann!.batch}` : !halted && ann ? `msg-${ann.batch}` : `call-${this.cid(op)}`;
       try {
-        if (announce) this.o.bridge.noteToolUse(this.o.runId, this.cid(op), name, ev.input, messageId);
-        result = await this.o.bridge.callTool(this.o.token, { name, args: ev.input, callId: this.cid(op) }, this.o.runId);
+        if (announce) this.o.bridge.noteToolUse(this.o.runId, this.cid(op), name, input, messageId);
+        result = await this.o.bridge.callTool(this.o.token, { name, args: input, callId: this.cid(op) }, this.o.runId);
       } catch (err) {
         // A closed run (Stop, revoke, shutdown) rejects here: nothing executed. A flag-off or kill switch does not close the run: the bridge's liveness check refuses the call.
         this.log(err instanceof ToolBridgeAuthError ? "run_ended" : "bridge_failed");
@@ -622,6 +664,7 @@ export class RelayToolDispatcher {
     }
     const defs: ToolDef[] = [];
     let problems = 0;
+    const named: Array<ToolNote & { why: string }> = [];
     for (const tool of list) {
       const name = tool?.name;
       if (typeof name !== "string") continue;
@@ -631,12 +674,14 @@ export class RelayToolDispatcher {
       if ("skip" in made || made.truncated || this.sent.has(name.toLowerCase())) {
         this.rejected.add(name);
         problems++;
+        if (named.length < MAX_NAMES_PER_REASON) named.push({ ...toolNote(tool), why: "skip" in made ? made.skip : made.truncated ? "description_truncated" : "duplicate" });
         continue;
       }
       this.markSent(name); // also makes a later case-only duplicate in this same list a "sent" duplicate
       defs.push(made.def);
     }
-    if (problems > 0) this.log("new_tool_unloadable", { count: problems });
+    // A tool that became available mid-turn (a skill install) and cannot be offered: named (sanitized, at most MAX_NAMES_PER_REASON) with the sizes that mattered.
+    if (problems > 0) this.log("new_tool_unloadable", { count: problems, tools: named });
     return { defs, notes: problems > 0 ? [UNLOADABLE_NOTE] : [], readOnly };
   }
 
@@ -652,22 +697,30 @@ export class RelayToolDispatcher {
     let shrinks = 0;
     let budgetShrunk = false;
     for (;;) {
+      // The turn is over (Stop, limit, settled, closed): no new post, and one in flight was aborted. The tool ran, so the persisted result says its answer was not delivered.
+      if (this.posts.signal.aborted) return this.abandon(op, answer);
       try {
-        await this.o.client.turnToolResult({
-          connectionId: ids.connectionId,
-          turnId: ids.turnId,
-          epoch: ids.epoch,
-          operationId: op,
-          content: answer.content,
-          ...(answer.isError ? { isError: true } : {}),
-          ...(answer.images?.length ? { images: answer.images } : {}),
-          ...(answer.tools?.length ? { tools: answer.tools } : {}),
-        });
+        await this.untilAborted(
+          this.o.client.turnToolResult(
+            {
+              connectionId: ids.connectionId,
+              turnId: ids.turnId,
+              epoch: ids.epoch,
+              operationId: op,
+              content: answer.content,
+              ...(answer.isError ? { isError: true } : {}),
+              ...(answer.images?.length ? { images: answer.images } : {}),
+              ...(answer.tools?.length ? { tools: answer.tools } : {}),
+            },
+            { signal: this.posts.signal },
+          ),
+        );
         // N2: an operation that was first reported lost and then answered with the plain "could not be returned" text did NOT deliver its real result.
         if (!this.lost.has(this.cid(op))) this.delivered.add(this.cid(op));
         this.rememberReplay(op, answer);
         return;
       } catch (err) {
+        if (this.posts.signal.aborted) return this.abandon(op, answer);
         if (err instanceof ToolResultLostError) {
           // The tool may have run. NEVER a wipe, never a retry: the outcome stays in the ledger and the persisted result gets the note.
           this.lost.add(this.cid(op));
@@ -704,7 +757,7 @@ export class RelayToolDispatcher {
             this.unmarkSent(t.name);
             this.rejected.add(t.name);
           }
-          this.log("new_tools_refused");
+          this.log("new_tools_refused", { count: answer.tools.length, reason: safeText(err instanceof LoginHostError ? `${err.code}/${err.detail ?? ""}` : "other", 120), tools: this.namedDefs(answer.tools) });
           answer = { ...answer, tools: undefined, content: `${answer.content}\n${UNLOADABLE_NOTE}` };
           continue;
         }
@@ -722,6 +775,36 @@ export class RelayToolDispatcher {
         attempts = 0;
       }
     }
+  }
+
+  /** Resolves with `p`, or rejects as soon as the posts are aborted (whether or not the client honours the signal: a hung post must not hold its call). */
+  private untilAborted<T>(p: Promise<T>): Promise<T> {
+    const signal = this.posts.signal;
+    if (signal.aborted) {
+      void p.catch(() => undefined);
+      return Promise.reject(new Error("aborted"));
+    }
+    return new Promise<T>((resolve, reject) => {
+      const onAbort = () => reject(new Error("aborted"));
+      signal.addEventListener("abort", onAbort, { once: true });
+      p.then(
+        (v) => {
+          signal.removeEventListener("abort", onAbort);
+          resolve(v);
+        },
+        (e) => {
+          signal.removeEventListener("abort", onAbort);
+          reject(e);
+        },
+      );
+    });
+  }
+
+  /** A post that was aborted with the turn: the answer did not reach the worker. */
+  private abandon(op: string, answer: Answer): void {
+    this.lost.add(this.cid(op));
+    this.rememberReplay(op, answer);
+    this.log("deliver_aborted");
   }
 
   /** The limits of what one answer may carry, in BYTES of the serialized body. The worker re-checks them; these keep a normal answer from being refused. */
@@ -746,6 +829,7 @@ export class RelayToolDispatcher {
   private shrink(a: Answer): Answer {
     if (a.images?.length) return { ...a, content: `${a.content}\n[the images could not be attached (too large).]`, images: undefined };
     if (a.tools?.length) {
+      this.log("new_tools_refused", { count: a.tools.length, reason: "result_too_large", tools: this.namedDefs(a.tools) });
       for (const t of a.tools) {
         this.unmarkSent(t.name);
         this.rejected.add(t.name);
@@ -769,9 +853,14 @@ export class RelayToolDispatcher {
   }
 
   /** A fixed code per line (`extra` carries only counts). Throttled per code: a worker can trigger most of these at will, one line per event would flood the log. */
-  private log(code: string, extra: Record<string, number> = {}): void {
+  private log(code: string, extra: Record<string, unknown> = {}): void {
     const t = this.throttle.check(code);
     if (!t.log) return;
-    console.error(`[relay-dispatch] ${code}`, { calls: this.calls, pending: this.inFlight.size, ...extra, ...(t.suppressedBefore > 0 ? { suppressedBefore: t.suppressedBefore } : {}) });
+    console.error(`[relay-dispatch] ${code}`, { calls: this.calls, pending: this.inFlight.size, run: this.o.runId, ...extra, ...(t.suppressedBefore > 0 ? { suppressedBefore: t.suppressedBefore } : {}) });
+  }
+
+  /** The definitions of an answer, as log notes (names made safe, sizes only; at most MAX_NAMES_PER_REASON). */
+  private namedDefs(defs: readonly ToolDef[]): ToolNote[] {
+    return defs.slice(0, MAX_NAMES_PER_REASON).map((d) => toolNote(d));
   }
 }

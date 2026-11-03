@@ -78,9 +78,10 @@ export interface StreamReply {
 }
 
 export interface HostTransport {
-  json(route: RouteName, body: unknown): Promise<JsonReply>;
-  /** Resolves when the host starts answering; a non-200 answer rejects with the host's error. */
-  stream(route: RouteName, body: unknown): Promise<StreamReply>;
+  /** `signal`: aborts the request (the whole request, including a reply that is still arriving). */
+  json(route: RouteName, body: unknown, opts?: { signal?: AbortSignal }): Promise<JsonReply>;
+  /** Resolves when the host starts answering; a non-200 answer rejects with the host's error. `relay`: the turn carries a tool manifest (see streamPolicy). */
+  stream(route: RouteName, body: unknown, opts?: { relay?: boolean }): Promise<StreamReply>;
 }
 
 export interface TransportOptions {
@@ -129,21 +130,76 @@ function timeoutError(phase: Phase): Error {
  */
 export const MAX_STREAM_LINES = 20_000;
 export const MAX_STREAM_BYTES = 64 * 1024 * 1024;
-/** The longest line per event type, in bytes. `text` and `result` keep the reply cap; a tool event carries an input of up to 1 MiB; everything else is small. */
-export const LINE_CAPS = { tool: 1_536 * 1024, other: 64 * 1024 } as const;
+/**
+ * The longest line per event type, in bytes, and what happens to a line over it. A legitimate event is far below all of these (measured on what the host can honestly
+ * emit); a hostile worker's line costs the SHARED API process about 0.3-0.7 s of JSON.parse at the old 1.5 MiB (a nested array) or 8 MiB (an escape-heavy `text`), so
+ * the caps sit just above the honest maximum and a line over one is thrown away unread where the backend does not need it, instead of ending the turn:
+ *  - `text`: 64 KiB. The backend never reads a `text` event (the answer is `result.text`); a longer line is discarded.
+ *  - `result`: 1 MiB. The final answer: the model's output is capped at 32,000 tokens (about 128-256 KB, AGENT_MODE_MAX_OUTPUT_TOKENS; the CLI allows up to 64,000), and the
+ *    chat persists at most 350,000 bytes of a message (MAX_PERSISTED_MESSAGE_BYTES). Over 1 MiB the stream ends as BAD_RESPONSE `line_too_long`: the turn's outcome is
+ *    unknown (what ran is kept) and nothing is silently truncated. At most one `result` line is read per stream.
+ *  - `tool-use` on a RELAY turn (the stream's announcement of a call): 128 KiB. The dispatcher hashes an announced input only up to 64 KB; over the cap the line becomes a
+ *    short "input too large" announcement of the same tool (the same thing the host sends for an input over 1 MiB), so grouping stays as it was for such a call.
+ *  - `tool-call` on a RELAY turn (the call to execute): 320 KiB. The dispatcher refuses an input over 256 KiB (CALL_INPUT_MAX_BYTES) and the escaped JSON of an honest 256 KiB
+ *    input can be somewhat larger; over the cap the line becomes a short call with `inputTooLarge`, which the dispatcher answers with ARGS_TOO_LARGE_MESSAGE.
+ *  - `tool-use` on a LEGACY (bridgeToken) turn: unchanged, 1.5 MiB: the HTTP bridge records the announced input in the ledger. Only used with CLAUDE_PLAN_ALLOW_LEGACY_BRIDGE
+ *    outside production.
+ *  - everything else: 64 KB.
+ */
+export const LINE_CAPS = {
+  tool: 1_536 * 1024,
+  other: 64 * 1024,
+  text: 64 * 1024,
+  result: 1024 * 1024,
+  relayToolUse: 128 * 1024,
+  relayToolCall: 320 * 1024,
+} as const;
+/** More structure than this (`[` and `{` outside strings) in a tool event of a relay turn is not an honest tool input: the line is replaced as if it were over its cap. */
+export const MAX_TOOL_STRUCTURES = 20_000;
+/** Lines shorter than this cannot hold MAX_TOOL_STRUCTURES structures: they are not scanned. */
+const STRUCTURE_SCAN_MIN_BYTES = 20_000;
+/** The stream is handed back to the event loop after this many lines (a chunk can carry thousands: 20,000 tiny events were one 128 ms block). */
+export const YIELD_EVERY_LINES = 64;
 const TYPE_AT_START = /^\{"type":"([a-z-]{1,24})"/;
-/** The cap for a line, decided from its first bytes BEFORE the rest is read or parsed. A line whose type is not first is held to the small cap. */
-function lineCapFor(head: Buffer): number {
-  const m = TYPE_AT_START.exec(head.toString("latin1"));
-  const type = m?.[1];
-  if (type === "text" || type === "result") return Number.MAX_SAFE_INTEGER; // bounded by the stream's own maxLine
-  if (type === "tool-call" || type === "tool-use") return LINE_CAPS.tool;
-  return LINE_CAPS.other;
+const typeOf = (head: Buffer): string | undefined => TYPE_AT_START.exec(head.toString("latin1"))?.[1];
+
+/** What to do with the lines of one stream. `relay`: the turn carries a tool manifest (tool-call events are executed; tool-use ones only announce). */
+function streamPolicy(relay: boolean) {
+  return {
+    /** The cap for a line, decided from its first bytes BEFORE the rest is read or parsed. A line whose type is not first is held to the small cap. */
+    capFor(head: Buffer): number {
+      const type = typeOf(head);
+      if (type === "text") return LINE_CAPS.text;
+      if (type === "result") return LINE_CAPS.result;
+      if (type === "tool-use") return relay ? LINE_CAPS.relayToolUse : LINE_CAPS.tool;
+      if (type === "tool-call") return relay ? LINE_CAPS.relayToolCall : LINE_CAPS.tool;
+      return LINE_CAPS.other;
+    },
+    /** A line of this kind over its cap is discarded (and maybe replaced) instead of ending the stream. */
+    skipsWhenTooLong(head: Buffer): boolean {
+      const type = typeOf(head);
+      if (type === "text") return true;
+      if (relay && (type === "tool-use" || type === "tool-call")) return true;
+      // Event types this client knows (plus `accepted`) end the stream; any OTHER type is discarded (a future host may add events).
+      return type !== undefined && type !== "accepted" && !Object.prototype.hasOwnProperty.call(EVENT_SHAPES, type);
+    },
+    /** The short stand-in for a thrown-away tool line of a relay turn (same fields the host would have sent, the input replaced), or nothing. */
+    replacement(head: Buffer): Buffer | undefined {
+      return relay ? tooBigToolEvent(head) : undefined;
+    },
+  };
 }
-/** Event types this client knows (plus `accepted`); a line of any OTHER type that is over its cap is discarded instead of ending the stream (a future host may add events). */
-function skipsWhenTooLong(head: Buffer): boolean {
-  const type = TYPE_AT_START.exec(head.toString("latin1"))?.[1];
-  return type !== undefined && type !== "accepted" && !Object.prototype.hasOwnProperty.call(EVENT_SHAPES, type);
+
+const TOOL_USE_HEAD = /^\{"type":"tool-use","operationId":"([^"\\]{1,256})","name":"([^"\\]{1,256})","input":/;
+const TOOL_CALL_HEAD = /^\{"type":"tool-call","operationId":"([A-Za-z0-9_-]{1,64})","messageId":"([^"\\]{0,200})","name":"([^"\\]{1,200})","input":/;
+/** The stand-in for a tool event whose input was too big to read, built from the fixed fields in front of it; nothing when the line is not in the host's own shape. */
+function tooBigToolEvent(head: Buffer): Buffer | undefined {
+  const text = head.toString("latin1");
+  const use = TOOL_USE_HEAD.exec(text);
+  if (use) return Buffer.from(JSON.stringify({ type: "tool-use", operationId: use[1], name: use[2], input: { _truncated: "size" } }));
+  const call = TOOL_CALL_HEAD.exec(text);
+  if (call) return Buffer.from(JSON.stringify({ type: "tool-call", operationId: call[1], messageId: call[2], name: call[3], input: null, inputTooLarge: true }));
+  return undefined;
 }
 const TYPE_KEY = Buffer.from('"type"');
 /**
@@ -186,6 +242,34 @@ function hasStructureOutsideStrings(line: Buffer): boolean {
     i++;
   }
   return false;
+}
+/**
+ * How many `[` and `{` a line has OUTSIDE its strings, counted up to `limit` (a linear scan that jumps from quote to quote, so a big string costs one indexOf and a
+ * bracket inside it is not counted). The cost of JSON.parse is in this structure, not in the bytes: `[[[0]]],` repeated to 1.5 MiB was a 330-680 ms stall.
+ */
+function structuresOutsideStrings(line: Buffer, limit: number): number {
+  const n = line.length;
+  let count = 0;
+  let i = 1;
+  while (i < n) {
+    const c = line[i];
+    if (c === 0x22) {
+      let j = i + 1;
+      for (;;) {
+        j = line.indexOf(0x22, j);
+        if (j < 0) return count; // unterminated: the parse refuses it
+        let backslashes = 0;
+        for (let k = j - 1; k > i && line[k] === 0x5c; k--) backslashes++;
+        if (backslashes % 2 === 0) break;
+        j++;
+      }
+      i = j + 1;
+      continue;
+    }
+    if ((c === 0x7b || c === 0x5b) && ++count > limit) return count;
+    i++;
+  }
+  return count;
 }
 function limitHit(code: string): LoginHostError {
   console.error("[login-host-client] stream_limit", { code });
@@ -254,21 +338,22 @@ class NodeTransport implements HostTransport {
    * malformed PEM after a bad rotation): inside the promise that would surface as a raw Error with OpenSSL text, which the callers' error
    * handling does not recognise. The cause code is kept, never the message.
    */
-  json(route: RouteName, body: unknown): Promise<JsonReply> {
-    return this.jsonInner(route, body).catch((e) => {
+  json(route: RouteName, body: unknown, opts: { signal?: AbortSignal } = {}): Promise<JsonReply> {
+    return this.jsonInner(route, body, opts.signal).catch((e) => {
       throw mapSocketError(e);
     });
   }
 
-  stream(route: RouteName, body: unknown): Promise<StreamReply> {
-    return this.streamInner(route, body).catch((e) => {
+  stream(route: RouteName, body: unknown, opts: { relay?: boolean } = {}): Promise<StreamReply> {
+    return this.streamInner(route, body, opts.relay === true).catch((e) => {
       throw mapSocketError(e);
     });
   }
 
-  private jsonInner(route: RouteName, body: unknown): Promise<JsonReply> {
+  private jsonInner(route: RouteName, body: unknown, signal?: AbortSignal): Promise<JsonReply> {
     const maxBytes = this.opts.maxJsonReplyBytes ?? JSON_REPLY_BYTES;
     return new Promise((resolve, reject) => {
+      if (signal?.aborted) return reject(new LoginHostError("EBUSY", "aborted_while_waiting"));
       const payload = JSON.stringify(body);
       const req = this.conn.request(
         { ...this.conn.base, method: "POST", path: `/v1/${route}`, headers: { "content-type": "application/json", "content-length": Buffer.byteLength(payload) } },
@@ -297,14 +382,28 @@ class NodeTransport implements HostTransport {
         },
       );
       failFastConnect(req, this.opts.connectTimeoutMs ?? 5_000, this.conn.secure === true);
-      req.setTimeout(this.opts.requestTimeoutMs ?? 60_000, () => req.destroy(timeoutError("request")));
+      // An ABSOLUTE limit for the whole request, the reply body included. `req.setTimeout` is an idle timer: a worker that drips one byte every few seconds never trips
+      // it, and with a 64 KiB reply cap one reply could last weeks (and pin the memory of whatever waits for it).
+      const absolute = setTimeout(() => req.destroy(timeoutError("request")), this.opts.requestTimeoutMs ?? 60_000);
+      absolute.unref?.();
+      const onAbort = () => {
+        req.destroy();
+        reject(new LoginHostError("EBUSY", "aborted_while_waiting"));
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      const done = () => {
+        clearTimeout(absolute);
+        signal?.removeEventListener("abort", onAbort);
+      };
+      req.once("close", done);
       req.on("error", (e) => reject(mapSocketError(e)));
       req.end(payload);
     });
   }
 
-  private streamInner(route: RouteName, body: unknown): Promise<StreamReply> {
+  private streamInner(route: RouteName, body: unknown, relay: boolean): Promise<StreamReply> {
     const maxLine = this.opts.maxReplyBytes ?? DEFAULT_REPLY_BYTES;
+    const policy = streamPolicy(relay);
     return new Promise((resolve, reject) => {
       const payload = JSON.stringify(body);
       const req = this.conn.request(
@@ -314,6 +413,10 @@ class NodeTransport implements HostTransport {
           if (res.statusCode !== 200) {
             const chunks: Buffer[] = [];
             let errBytes = 0;
+            // the error body is bounded in time as well as in size (a drip must not hold the call)
+            const errTimer = setTimeout(() => req.destroy(timeoutError("request")), this.opts.requestTimeoutMs ?? 60_000);
+            errTimer.unref?.();
+            req.once("close", () => clearTimeout(errTimer));
             const errMax = this.opts.maxJsonReplyBytes ?? JSON_REPLY_BYTES;
             res.on("data", (c: Buffer) => {
               errBytes += c.length;
@@ -342,28 +445,48 @@ class NodeTransport implements HostTransport {
           const lines = (async function* (): AsyncGenerator<unknown> {
             // Bounded BEFORE anything is parsed: a per-type cap on each line (see lineCapFor), and per-turn caps on how many lines and how many bytes one stream
             // may carry. A hostile worker's flood of tiny events, or one near-8 MiB event of a type that is never that big, costs a few bytes of scanning, not seconds.
-            const splitter = new LineSplitter(maxLine, () => limitHit("line_too_long"), lineCapFor, skipsWhenTooLong, () => limitHit("too_many_empty_lines"));
+            const splitter = new LineSplitter(maxLine, () => limitHit("line_too_long"), policy.capFor, policy.skipsWhenTooLong, () => limitHit("too_many_empty_lines"), policy.replacement);
             let count = 0;
             let bytes = 0;
+            let sinceYield = 0;
+            let resultSeen = false;
             try {
               for await (const chunk of res as AsyncIterable<Buffer>) {
                 bytes += chunk.length;
                 if (bytes > MAX_STREAM_BYTES) throw limitHit("too_many_bytes");
                 for (const line of splitter.push(chunk)) {
                   if (++count > MAX_STREAM_LINES) throw limitHit("too_many_events");
+                  // Hand the event loop back every few lines: a chunk can carry thousands, and the parse of each is work for the SHARED API process.
+                  if (++sinceYield >= YIELD_EVERY_LINES) {
+                    sinceYield = 0;
+                    await new Promise<void>((r) => setImmediate(r));
+                  }
+                  const headType = typeOf(line.subarray(0, 48));
+                  // A host sends exactly one `result`; a second one is never read (each is up to 1 MiB of parse for nothing).
+                  if (headType === "result") {
+                    if (resultSeen) continue;
+                    resultSeen = true;
+                  }
+                  let toParse = line;
+                  if (relay && line.length > STRUCTURE_SCAN_MIN_BYTES && (headType === "tool-use" || headType === "tool-call") && structuresOutsideStrings(line, MAX_TOOL_STRUCTURES) > MAX_TOOL_STRUCTURES) {
+                    // Far more nesting than any honest tool input has: the same stand-in as for a line over the cap (JSON.parse of it was a 300-700 ms stall).
+                    const stand = tooBigToolEvent(line.subarray(0, 1024));
+                    if (!stand) throw limitHit("too_complex");
+                    toParse = stand;
+                  }
                   // A line nested deeper than anything legitimate is dropped unparsed (JSON.parse would stall the event loop) and ends the stream.
-                  if (jsonTooDeep(line)) throw tooDeep(line.length);
-                  const headType = line.length > LINE_CAPS.other ? TYPE_AT_START.exec(line.subarray(0, 48).toString("latin1"))?.[1] : undefined;
-                  // Only text/result/tool lines may be this big (see lineCapFor), and the cap was decided from the FIRST `type`: for the flat ones it must be the only one.
-                  if ((headType === "text" || headType === "result") && hasSecondTypeKey(line)) throw limitHit("duplicate_type");
-                  if ((headType === "text" || headType === "result") && hasStructureOutsideStrings(line)) throw limitHit("not_flat");
+                  if (jsonTooDeep(toParse)) throw tooDeep(toParse.length);
+                  // Only text/result/tool lines may be this big (see LINE_CAPS), and the cap was decided from the FIRST `type`: for the flat ones it must be the only one.
+                  const big = toParse.length > LINE_CAPS.other;
+                  if (big && (headType === "text" || headType === "result") && hasSecondTypeKey(toParse)) throw limitHit("duplicate_type");
+                  if (big && (headType === "text" || headType === "result") && hasStructureOutsideStrings(toParse)) throw limitHit("not_flat");
                   let parsed: unknown;
                   try {
-                    parsed = JSON.parse(line.toString("utf8"));
+                    parsed = JSON.parse(toParse.toString("utf8"));
                   } catch {
                     throw new LoginHostError("BAD_RESPONSE", "line");
                   }
-                  if (headType !== undefined && (parsed as { type?: unknown } | null)?.type !== headType) throw limitHit("type_mismatch"); // JSON.parse took another `type`
+                  if (big && headType !== undefined && (parsed as { type?: unknown } | null)?.type !== headType) throw limitHit("type_mismatch"); // JSON.parse took another `type`
                   yield parsed;
                 }
               }
@@ -438,7 +561,7 @@ const EVENT_SHAPES: Record<string, z.ZodTypeAny> = {
   "tool-use": z.object({ operationId: z.string().max(256), name: z.string().max(256), input: z.unknown() }),
   // ENG-2113 relay: a host-generated operation the backend must answer. `name` and `input` are NOT trusted here (the dispatcher re-validates them against the
   // run's tool list); only the envelope is checked. A bad envelope is a bad answer from the host, never something to execute.
-  "tool-call": z.object({ operationId: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/), messageId: z.string().max(200), name: z.string().max(200), input: z.unknown() }),
+  "tool-call": z.object({ operationId: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/), messageId: z.string().max(200), name: z.string().max(200), input: z.unknown(), inputTooLarge: z.boolean().optional() }),
   "tool-result": z.object({ operationId: z.string().max(256), ok: z.boolean() }),
   usage: z.object({ inputTokens: count, outputTokens: count, cacheReadTokens: count, cacheWriteTokens: count }),
   entitlement: z.object({ observation: z.object({ windows: z.array(z.object({ name: z.string().max(64), utilization: z.number().optional(), resetsAtMs: z.number().optional() })).max(MAX_RATE_WINDOWS) }) }),
@@ -515,10 +638,10 @@ function readFirst<T>(read: Promise<T>, ms: number, signal: AbortSignal | undefi
 export class LoginHostClient {
   constructor(private readonly transport: HostTransport) {}
 
-  private async call<R extends RouteName, T>(route: R, input: RouteInput<R>, shape: z.ZodType<T>): Promise<T> {
+  private async call<R extends RouteName, T>(route: R, input: RouteInput<R>, shape: z.ZodType<T>, opts?: { signal?: AbortSignal }): Promise<T> {
     // Our own schema first: a caller bug (a field the host would refuse) fails here without a round trip.
     const body = ROUTES[route].parse(input);
-    const reply = await this.transport.json(route, body);
+    const reply = await (opts?.signal ? this.transport.json(route, body, { signal: opts.signal }) : this.transport.json(route, body));
     if (reply.status < 200 || reply.status >= 300) throw hostErrorFrom(reply.status, reply.json);
     const parsed = shape.safeParse(reply.json);
     if (!parsed.success) throw new LoginHostError("BAD_RESPONSE", route);
@@ -568,9 +691,9 @@ export class LoginHostClient {
    * Resolves only when the host accepted the answer. Rejects with ToolResultLostError for the three "result lost" answers (see there), with a
    * LoginHostError for anything else (EINVALID `result_too_large` / `tools_invalid` / `tools_limit` / `tools:<reason>` leave the operation pending, so the caller may retry with a valid answer).
    */
-  async turnToolResult(input: RouteInput<"turn.toolResult">): Promise<{ ok: true }> {
+  async turnToolResult(input: RouteInput<"turn.toolResult">, opts?: { signal?: AbortSignal }): Promise<{ ok: true }> {
     try {
-      return await this.call("turn.toolResult", input, z.object({ ok: z.literal(true) }));
+      return await this.call("turn.toolResult", input, z.object({ ok: z.literal(true) }), opts);
     } catch (err) {
       if (err instanceof LoginHostError) {
         // Any ESTALE or ENOTFOUND on THIS route is "the answer cannot be taken", whatever the detail (an older or newer host may word it differently).
@@ -590,7 +713,9 @@ export class LoginHostClient {
     const body = ROUTES["turn.run"].parse(input);
     if (opts.signal?.aborted) throw new LoginHostError("EBUSY", "aborted_while_waiting");
     // The connection and the response headers are bounded by the transport's own timers; a Stop must not wait for them either.
-    const reply = await abortable(this.transport.stream("turn.run", body), opts.signal, (r) => r.close());
+    // A turn that carries a tool manifest is a RELAY turn (its tool events are bounded for that: see streamPolicy); one with a bridgeToken is the legacy HTTP-bridge turn.
+    const relay = Array.isArray((body as { tools?: unknown }).tools);
+    const reply = await abortable(this.transport.stream("turn.run", body, { relay }), opts.signal, (r) => r.close());
     const it = reply.lines[Symbol.asyncIterator]();
     let first: IteratorResult<unknown>;
     try {

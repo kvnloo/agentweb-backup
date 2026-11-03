@@ -15,6 +15,8 @@
  */
 export const MAX_EMPTY_LINES = 256;
 const HEAD_BYTES = 48;
+/** How much of the start of a DISCARDED line is kept for `onSkipped` (enough for the fixed fields in front of a big `input`). */
+const SKIPPED_HEAD_BYTES = 1024;
 const MIN_BUFFER = 16 * 1024;
 
 export class LineSplitter {
@@ -25,6 +27,8 @@ export class LineSplitter {
   private discarding = false;
   private discardLen = 0;
   private emptyLines = 0;
+  /** The first bytes of the line being discarded, for `onSkipped`. */
+  private skippedHead: Buffer = Buffer.alloc(0);
 
   /** `maxLine`: the longest line in BYTES; `onTooLong` is called (and its result thrown) when a line passes its cap. */
   constructor(
@@ -35,6 +39,11 @@ export class LineSplitter {
     private readonly skipFor?: (head: Buffer) => boolean,
     /** Called (and its result thrown) when a stream has carried more than MAX_EMPTY_LINES empty lines. Default: `onTooLong`. */
     private readonly onTooManyEmpty?: () => Error,
+    /**
+     * Called when a skippable line has been thrown away completely (`head`: its first bytes, `length`: its size). It may return a SMALL replacement line that is emitted in
+     * its place, in order (a big tool event becomes a short "input too large" event), or nothing.
+     */
+    private readonly onSkipped?: (head: Buffer, length: number) => Buffer | undefined,
   ) {}
 
   /** The complete (non-empty) lines this chunk finishes, in order. */
@@ -51,6 +60,7 @@ export class LineSplitter {
         if (this.discardLen > this.maxLine) throw this.onTooLong();
         this.discarding = false; // the newline ends the thrown-away line
         this.cap = undefined;
+        this.replace(lines, this.skippedHead, this.discardLen);
         continue;
       }
       if (this.len === 0) {
@@ -63,6 +73,7 @@ export class LineSplitter {
         this.discarding = false; // the line is complete either way
         this.cap = undefined; // this line is finished: the next one gets its own cap
         if (keep && seg.length) lines.push(seg);
+        else if (!keep) this.replace(lines, this.skippedHead, seg.length);
       } else {
         this.append(seg);
         const line = Buffer.from(this.buf.subarray(0, this.len)); // a copy: the buffer is reused
@@ -71,6 +82,7 @@ export class LineSplitter {
         this.len = 0;
         this.cap = undefined;
         if (keep && line.length) lines.push(line);
+        else if (!keep) this.replace(lines, this.skippedHead, line.length);
       }
     }
     if (from < chunk.length) {
@@ -85,6 +97,12 @@ export class LineSplitter {
     return lines;
   }
 
+  private replace(lines: Buffer[], head: Buffer, length: number): void {
+    if (!this.onSkipped) return;
+    const r = this.onSkipped(head, length);
+    if (r && r.length) lines.push(r);
+  }
+
   /** False when the line must not be emitted (it was too long and is being discarded). Throws when it is too long and may not be discarded. */
   private check(length: number, head: Buffer): boolean {
     if (this.cap === undefined && (length >= HEAD_BYTES || head !== this.buf)) {
@@ -92,8 +110,9 @@ export class LineSplitter {
     }
     if (length > (this.cap ?? this.maxLine)) {
       if (this.skipFor && this.skipFor(head.subarray(0, HEAD_BYTES)) && length <= this.maxLine) {
-        this.discarding = true; // an unknown event type: thrown away, the rest of the line is not buffered
+        this.discarding = true; // a skippable line: thrown away, the rest of the line is not buffered
         this.discardLen = length;
+        this.skippedHead = this.onSkipped ? Buffer.from(head.subarray(0, SKIPPED_HEAD_BYTES)) : Buffer.alloc(0);
         this.len = 0;
         return false;
       }
