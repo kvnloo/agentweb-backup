@@ -16,6 +16,11 @@ export interface SmartleadEvent {
   /** Addresses that may be the contact, best guess first (lower case, deduplicated). */
   candidateEmails: string[];
   subject?: string;
+  /**
+   * What the contact wrote, without the thread quoted under it, for the owner's alert email only (never stored on the contact: the full reply
+   * stays in Smartlead). Plain text only, at most REPLY_TEXT_MAX characters. Absent when the payload has none (a polled reply never does).
+   */
+  replyText?: string;
   /** The reply's own address and the sending mailbox's, for the alert text. */
   from?: string;
   to?: string;
@@ -82,6 +87,42 @@ function canonicalJson(v: unknown): string {
   return JSON.stringify(v) ?? "null";
 }
 
+/** The most of a reply an event carries. The alert email shows less. */
+export const REPLY_TEXT_MAX = 1000;
+
+// Where the quoted thread under a reply starts: a quoted line, "On <date>, <name> wrote:" (which mail clients may wrap onto two lines), an
+// "Original Message" rule, or an Outlook "From: ... Sent: ..." header block.
+const QUOTED_LINE = /^\s*>/;
+const WROTE_HEADER = /^\s*On\s.{3,300}$/i;
+const WROTE_END = /\bwrote:\s*$/i;
+const ORIGINAL_RULE = /^\s*-{2,}\s*(original message|forwarded message)\s*-{2,}\s*$/i;
+const OUTLOOK_FROM = /^\s*From:\s.+/i;
+const OUTLOOK_SENT = /^\s*(Sent|Date):\s.+/i;
+
+/**
+ * What the contact wrote in a reply, from the payload's plain text (`reply_message.text`, else `preview_text`). The HTML copies are never
+ * used. The quoted thread is cut off at its first marker, control characters go, runs of blank lines shrink, and the result is capped.
+ * Undefined when nothing is left (a reply that is only quoted text, or a payload with no text).
+ */
+export function replyExcerpt(body: Record<string, unknown>): string | undefined {
+  const message = body.reply_message && typeof body.reply_message === "object" ? (body.reply_message as Record<string, unknown>).text : undefined;
+  const raw = typeof message === "string" && message.trim() ? message : typeof body.preview_text === "string" ? body.preview_text : "";
+  if (!raw.trim()) return undefined;
+  const lines = raw.replace(/\r\n?/g, "\n").split("\n");
+  const kept: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const next = lines[i + 1] ?? "";
+    if (QUOTED_LINE.test(line) || ORIGINAL_RULE.test(line)) break;
+    if (WROTE_HEADER.test(line) && (WROTE_END.test(line) || WROTE_END.test(`${line} ${next}`.trim()))) break;
+    if (OUTLOOK_FROM.test(line) && [lines[i + 1], lines[i + 2], lines[i + 3]].some(l => typeof l === "string" && OUTLOOK_SENT.test(l))) break;
+    kept.push(line);
+  }
+  const text = kept.join("\n").replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\u2028\u2029]/g, "").replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  if (!text) return undefined;
+  return text.length > REPLY_TEXT_MAX ? `${text.slice(0, REPLY_TEXT_MAX - 1).trimEnd()}\u2026` : text;
+}
+
 export function parseSmartleadEvent(body: unknown): ParseResult {
   if (!body || typeof body !== "object" || Array.isArray(body)) return { ok: false, reason: "not_an_object" };
   const b = body as Record<string, unknown>;
@@ -127,6 +168,7 @@ export function parseSmartleadEvent(body: unknown): ParseResult {
     event: {
       kind, campaignId, candidateEmails,
       ...(kind === "reply" ? { subject: short(b.subject ?? b.email_subject, 200), from: candidateEmails[0], to: email(b.sl_senders_mailbox) ?? email(b.from_email) } : {}),
+      ...(kind === "reply" && replyExcerpt(b) ? { replyText: replyExcerpt(b)! } : {}),
       ...(occurredAt ? { occurredAt } : {}),
       soft,
       ...(reasonText ? { reason: reasonText } : {}),
