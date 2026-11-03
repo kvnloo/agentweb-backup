@@ -176,7 +176,8 @@ export class SmartleadEventService {
       try {
         const list = await this.deps.getList(lead.listId);
         // The alert goes out only for a reply that was newly recorded, through the list's own alert setting (email.received is its default event).
-        if (list) await this.deps.notify(list, added.lead, "email.received", data, at);
+        // The reply's own words go to the owner's alert only: `data` above is what is stored on the contact, and the full reply stays in Smartlead.
+        if (list) await this.deps.notify(list, added.lead, "email.received", event.replyText ? { ...data, replyText: event.replyText } : data, at);
       } catch (e) {
         this.deps.log(`[SmartleadEvents] reply alert failed for list ${lead.listId}: ${e instanceof Error ? e.message : String(e)}`);
       }
