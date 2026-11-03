@@ -36,7 +36,7 @@ describe("rate_limit_event is bounded", () => {
     const ms = Number(process.hrtime.bigint() - t0) / 1e6;
     console.log("rate_limit normalize ms", ms.toFixed(1), "approxSize", approxSize(ev));
     expect(ms).toBeLessThan(400); // ~100 ms idle: V8 collects the keys of a dictionary-mode object before for-in starts, so the cost is linear in the line, which the line cap bounds
-    expect(approxSize(ev)).toBeLessThan(4096);
+    expect(approxSize(ev)).toBeLessThan(8192); // (16 windows, each also charged the per-object memory cost)
   });
 
   it("unknown fields are never forwarded", () => {
@@ -72,6 +72,13 @@ describe("approxSize counts the REAL payload of every event type", () => {
     expect(approxSize({ type: "tool-result", operationId: "o".repeat(256), ok: true })).toBeGreaterThanOrEqual(256 + 128);
     expect(approxSize({ type: "alarm", hazard: { kind: "other", detail: "d".repeat(500) } })).toBeGreaterThanOrEqual(500 + 128);
     expect(approxSize({ type: "usage", inputTokens: 1 })).toBeLessThan(512);
+  });
+  it("MUTATION TARGET: an event of 70,000 empty objects weighs what it occupies, not its JSON text (0.7 MB of JSON, ~27 MB of heap): over the 8 MB queue cap, so a stalled consumer is cut", () => {
+    const input = { a: Array.from({ length: 70_000 }, () => ({})) };
+    expect(JSON.stringify(input).length).toBeLessThan(1_000_000);
+    expect(approxSize({ type: "tool-use", operationId: "o", name: "n", input })).toBeGreaterThan(8 * 1024 * 1024);
+    // ordinary events are not inflated: a small tool input stays small
+    expect(approxSize({ type: "tool-use", operationId: "o", name: "n", input: { q: "x", opts: { a: 1 } } })).toBeLessThan(1000);
   });
   it("text is its length", () => {
     expect(approxSize({ type: "text", delta: "abc" })).toBe(67);

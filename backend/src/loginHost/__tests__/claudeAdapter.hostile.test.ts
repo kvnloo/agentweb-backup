@@ -274,6 +274,20 @@ describe("a hostile unit and a hostile CLI together cannot stall the loop by mak
     await w.stop();
   });
 
+  it("MUTATION TARGET: the relay endpoint is opened with the turn's OWN meter (one budget for stdout, stderr, events and relay frames, not two)", async () => {
+    const s = stubbed(2000);
+    const session = await s.rig.adapter.openSession(s.rig.ctx, { connectionId: "conn1", epoch: 3 });
+    const turn = (async () => {
+      for await (const ev of session.turn({ turnId: "t1", prompt: "go", model: "sonnet", relay: { tools: TOOLS, callTimeoutMs: () => 10_000 } })) void ev;
+    })();
+    await until(() => !!s.opts());
+    const turnMeter = (session as unknown as { meter: unknown }).meter;
+    expect(turnMeter).toBeDefined();
+    expect(s.opts().meter).toBe(turnMeter);
+    await session.close();
+    await turn.catch(() => undefined);
+  });
+
   it("MUTATION TARGET: an announcement of a tool the turn does NOT offer is not recorded and consumes none of the hashing budget", async () => {
     const w = await withWaitingCall({ q: "x" }, 20);
     const before = (w.session as unknown as { hashedBytes: number }).hashedBytes;

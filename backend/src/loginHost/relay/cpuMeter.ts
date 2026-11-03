@@ -4,13 +4,17 @@
  * measured in MILLISECONDS OF EVENT-LOOP CPU TIME, per turn. Everything that processes a hostile unit's bytes or events on the host runs inside `meter.time(...)`, and the
  * real elapsed time of that synchronous section is what is charged, whatever made it expensive.
  *
- * Numbers. Burst 500 ms (it was 2,000 ms: eight concurrent turns each spending a 2 s burst on expensive-but-valid lines pinned the loop for 26 s), refill 50 ms per
- * second (5% of the loop). The figures below were first worked out for the 2,000 ms burst; the honest-turn arguments hold at 500 ms (five 12 MB echoes in a row cost ~240 ms):
- *  - an honest turn is a few thousand tiny events (about 0.05-0.2 ms each) over minutes plus the odd big tool result echoed once (an 8-12 MB line costs roughly
- *    100-300 ms to scan, parse and normalize): a few of those fit the burst, and the refill covers the small events many times over;
- *  - a hostile turn can therefore take 2 s of loop once and 5% of it afterwards before it is killed (`cpu_budget`). CAPACITY: it takes 20 concurrent hostile turns,
- *    each running flat out at its allowance, to use the whole loop, and every one of them is killed once its burst is spent (about 2 s at full speed, longer when it
- *    paces itself at the refill). The per-vector buckets stay as cheap early filters in front of this; they are no longer the only line of defence.
+ * Numbers. Burst 1000 ms, refill 50 ms per second (5% of the loop). History: 2,000 ms until eight concurrent turns each spent their burst on expensive-but-valid lines and
+ * pinned the loop for 26 s; 500 ms after that, charged by WALL time, which a busy machine inflates (descheduling counts as time spent): under CPU contention honest
+ * 12 MB echoes were charged 2-3x their CPU time and 5 of them in a row were killed. Now a section is charged min(wall, the thread's CPU time) and the burst is 1000 ms.
+ * Measured with real child processes on a loaded 12-core machine (load average 3-22): a 12 MB echo is ~50-110 ms of CPU, five in a row ~300 ms (23-55% of the burst, the
+ * high end with a CPU-hungry process pinned to the same core), three 15 MB echoes ~250-370 ms, ten 6 MB echoes ~300-430 ms.
+ *  - an honest turn is a few thousand tiny events (about 0.05-0.2 ms each) over minutes plus the odd big tool result echoed once: a few of those fit the burst, and the
+ *    refill covers the small events many times over;
+ *  - a hostile turn can take 1 s of loop once and 5% of it afterwards before it is killed (`cpu_budget`). CAPACITY: it takes 20 concurrent hostile turns, each running
+ *    flat out at its allowance, to use the whole loop. The per-vector buckets stay as cheap early filters in front of this.
+ *  - cost of metering itself: ~1 us per empty section, plus ~3 us for the thread-CPU reading taken at the start of a section (the end reading is skipped for sections of
+ *    FAST_SECTION_MS or less), measured; at most a few hundred sections a second per stream are admitted by the read buckets.
  *
  * `time()` nests safely: only the OUTERMOST call charges, so a section measured around `push()` (which synchronously runs readline, the runner's JSON.parse and the
  * session's callbacks) is not charged again by the callbacks it contains.

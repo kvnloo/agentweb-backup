@@ -119,9 +119,24 @@ describe("approxJsonBytes", () => {
   });
 
   it("MUTATION TARGET: the step cap: a 6,000,000-element array returns the limit at once instead of being walked to its (smaller) true size", () => {
-    const t0 = Date.now();
-    expect(approxJsonBytes(new Array(6_000_000).fill(1), 100 * 1024 * 1024)).toBe(100 * 1024 * 1024); // really ~12 MB: only the step cap makes this the limit
-    expect(Date.now() - t0).toBeLessThan(1000);
+    let reads = 0;
+    const arr = new Proxy(new Array(6_000_000).fill(1), {
+      get(t, k, r) {
+        if (typeof k === "string" && /^\d+$/.test(k)) reads++;
+        return Reflect.get(t, k, r);
+      },
+    });
+    expect(approxJsonBytes(arr, 100 * 1024 * 1024)).toBe(100 * 1024 * 1024); // really ~12 MB: only the step cap makes this the limit
+    // counted, not timed (a wall-clock bound flaked under load): the walk stops at the 1,000,000-step cap, not at the 6,000,000th element
+    expect(reads).toBeLessThanOrEqual(1_000_001);
+    expect(reads).toBeGreaterThan(900_000);
+  });
+
+  it("MUTATION TARGET: nodeBytes charges every object and array on top of the JSON size (for memory accounting), and 0 is the plain JSON estimate", () => {
+    const v = { a: [{}, {}, {}] }; // 5 containers
+    expect(approxJsonBytes(v, 1e9, 100)).toBe(approxJsonBytes(v, 1e9) + 500);
+    expect(approxJsonBytes(v, 1e9, 0)).toBe(approxJsonBytes(v, 1e9));
+    expect(approxJsonBytes("a string has no container", 1e9, 100)).toBe(approxJsonBytes("a string has no container", 1e9));
   });
 
   it("MUTATION TARGET: only OWN properties count (an inherited enumerable one is not part of the JSON), and a key counts its length", () => {

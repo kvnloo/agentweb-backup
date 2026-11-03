@@ -55,8 +55,11 @@ export function valueDepthExceeds(value: unknown, max: number): boolean {
 /**
  * A cheap estimate of the JSON size of `value` (memory accounting, and the decision to forward or replace an informational value; never a protocol limit):
  * strings count their length, a single-digit integer 2 bytes (digit and comma: 130,000 of them are ~260 KB of real JSON), other numbers 20, keys a few bytes. Iterative; stops and returns `limit` as soon as the estimate passes it, so the work is bounded too. Never throws.
+ *
+ * `nodeBytes` (default 0: the JSON size) is an extra cost charged to every object and array: for MEMORY accounting (the event queue) where a JSON size understates what a
+ * parsed value occupies by tens of times when it is made of many tiny containers (70,000 empty objects are 0.7 MB of JSON and ~27 MB of heap).
  */
-export function approxJsonBytes(value: unknown, limit: number): number {
+export function approxJsonBytes(value: unknown, limit: number, nodeBytes = 0): number {
   let total = 0;
   let steps = 0;
   /** Primitives are counted on the spot (nothing is pushed for them): a 6,000,000-element array costs a bounded number of steps, not 6,000,000 stack entries. */
@@ -77,7 +80,7 @@ export function approxJsonBytes(value: unknown, limit: number): number {
   const containers: object[] = [value];
   while (containers.length) {
     const c = containers.pop() as object;
-    total += 2;
+    total += 2 + nodeBytes;
     const take = (x: unknown): void => {
       if (x !== null && typeof x === "object") containers.push(x);
       else scalar(x);

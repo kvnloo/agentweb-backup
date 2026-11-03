@@ -43,7 +43,7 @@ export async function runTurn(rig: Rig, script: string, opts: { tools?: ToolDef[
     for await (const ev of session.turn({ turnId: "t" + Math.floor(Math.random() * 1e9), prompt: "go", model: "sonnet", relay: { tools: opts.tools ?? TOOLS, callTimeoutMs: () => opts.callTimeoutMs ?? 20_000 } })) {
       events.push(ev);
       { const c0 = performance.now(); const line = JSON.stringify(ev) + "\n"; Buffer.from(line); consumerMs += performance.now() - c0; }
-      opts.onEvent?.(ev, (content, extra) => (ev.type === "tool-call" ? session.answer(ev.operationId, { kind: "tool-result", ok: true, content, ...(extra ?? {}) }) : false));
+      opts.onEvent?.(ev, (content, extra) => (ev.type === "tool-call" ? session.answer(ev.operationId, { kind: "tool-result", ok: true, content, ...(extra ?? {}) }) !== false : false));
     }
   } finally {
     clearTimeout(timer);
