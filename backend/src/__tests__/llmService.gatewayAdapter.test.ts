@@ -77,6 +77,17 @@ describe('LLMService shared gateway adapter', () => {
     expect(mockCallLLM.mock.calls[0][2]).not.toHaveProperty('providerIgnore');
   });
 
+  it('passes web-search tool parameters on web-search calls only (ENG-2720)', async () => {
+    const service = new LLMService('openrouter/openai/gpt-5.6-luna', 0, undefined, { webSearchParameters: { max_uses: 2 } });
+    mockCallLLM.mockResolvedValue(completion('{"value":"x"}'));
+    await service.generateJSONContentWithWebSearch('system', 'user', { feature: 'enrichment' });
+    expect(mockCallLLM.mock.calls[0][2]).toEqual(expect.objectContaining({ webSearch: true, webSearchParameters: { max_uses: 2 } }));
+
+    mockCallLLM.mockClear();
+    await service.generateRaw('system', 'user', undefined, { feature: 'enrichment' });
+    expect(mockCallLLM.mock.calls[0][2]).not.toHaveProperty('webSearchParameters');
+  });
+
   it('preserves null temperature so callLLM omits it from the wire request', async () => {
     await new LLMService('gpt-5.5', null).generateRaw('system', 'user');
     expect(mockCallLLM.mock.calls[0][2]).toEqual(expect.objectContaining({ temperature: null }));

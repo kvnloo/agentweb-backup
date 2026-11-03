@@ -34,8 +34,8 @@ import { isEligibleGroupEmailRecipient } from '../utils/groupEmailRecipientValid
 import { syncContact, SyncInput } from '../services/contactSyncService';
 import { isCardRevenueField } from '../services/enrichmentGroups';
 import { stripImplicitCardRevenueRouting } from '../services/enrichmentConfigService';
-import { estimateEnrichmentCost,
-  normalizeLeadSelection, checkEstimateConfirmation } from '../services/enrichmentCostEstimate';
+import { normalizeLeadSelection, checkEstimateConfirmation } from '../services/enrichmentCostEstimate';
+import { priceEnrichment, quoteEnrichment, quoteFromPriced, type QuoteDeps } from '../services/enrichmentQuote';
 import { enrichContact, defaultEnrichmentCache, EnrichmentDeps } from '../services/internalEnrichmentService';
 import { dedupContactsForUser } from '../services/contactDedupService';
 import {
@@ -1823,25 +1823,35 @@ router.post('/lists/:listId/enrichment-config/suggest-types', async (req: Reques
   }
 });
 
-/** ENG-2716: count the leads an enrich-v3 run would touch (leadIds subset or whole list). */
-const countLeadsForEnrichment = async (listId: string, leadIds?: string[]): Promise<number> => {
-  if (leadIds) return leadIds.length;
-  let total = 0;
-  let lastKey: any = undefined;
-  do {
-    const batch = await crmDb.getLeadsByListId(listId, 200, lastKey);
-    total += batch.items.length;
-    lastKey = batch.lastEvaluatedKey;
-  } while (lastKey);
-  return total;
+/**
+ * ENG-2716/2720: dependencies for the pre-run quote (services/enrichmentQuote.ts). The quote itself, which
+ * keeps dollars server-side and returns a percent of the allowance, lives there so it is testable.
+ */
+const getQuoteDeps = async (): Promise<QuoteDeps> => {
+  // Dynamic import, like the other CrmEnrichmentService uses in this file.
+  const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
+  return {
+    getLeadsPage: (listId, limit, lastKey) => crmDb.getLeadsByListId(listId, limit, lastKey as any),
+    // A list with no saved config is quoted on the reference config (as before). A saved config that cannot be
+    // READ must not be: the run would fail on it, so issuing a price and a confirmation token for it would be
+    // misleading. The error goes through; the route answers with a generic 500 and no token.
+    getSavedConfig: async (listId, userId) => {
+      const stored = await svcGetEnrichmentConfig({ listId, userId }, enrichmentConfigDeps);
+      return stored.isDefault ? undefined : stored.config;
+    },
+    // Mirrors the resolver (enrichmentIdentityResolver.ts): a blank or placeholder-domain email is not an identity signal.
+    hasUsableEmail: (email) =>
+      typeof email === 'string' && email.trim().length > 0 && !CrmEnrichmentService.isPlaceholderDomain(email.split('@')[1] || ''),
+  };
 };
 
 const parseLeadIds = (body: any): string[] | undefined => normalizeLeadSelection(body?.leadIds);
 
 /**
  * @route POST /api/crm/lists/:listId/leads/enrich-v3/estimate
- * @desc ENG-2716: pre-run cost estimate + confirmation token. Pure estimate,
- *       no vendor calls. Client echoes `confirmationToken` as
+ * @desc ENG-2716: pre-run cost estimate + confirmation token. Read-only: no
+ *       vendor calls and nothing is written, but it pages the list's leads and
+ *       reads the usage ledger to express the cost as a percent of the allowance. Client echoes `confirmationToken` as
  *       `confirmEstimateToken` on the enrich-v3 POST.
  * @access Private
  */
@@ -1855,8 +1865,8 @@ router.post('/lists/:listId/leads/enrich-v3/estimate', async (req: Request, res:
     if (!(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
-    const count = await countLeadsForEnrichment(listId, parseLeadIds(req.body));
-    return res.json(estimateEnrichmentCost(listId, count));
+    const quote = await quoteEnrichment(await getQuoteDeps(), { userId, listId, leadIds: parseLeadIds(req.body) });
+    return res.json(quote.customerView);
   } catch (error) {
     console.error('[v3][route] enrich-v3 estimate failed:', error);
     return res.status(500).json({ message: 'Enrichment estimate failed' });
@@ -1900,14 +1910,8 @@ router.post('/lists/:listId/leads/enrich-v3', async (req: Request, res: Response
           message: 'No enrichment config saved for this list. Open Enrichment Config and save one first.',
         });
       }
-      const estimateLeadIds = Array.isArray(req.body?.leadIds)
-        ? req.body.leadIds.filter((id: unknown): id is string => typeof id === 'string')
-        : [];
-      const leads = await buildV3OrchestratorDeps(userId).loadLeads({
-        listId, userId, leadIds: estimateLeadIds.length > 0 ? estimateLeadIds : undefined,
-      });
-      const { estimateEnrichmentRun } = await import('../services/enrichmentBatchBudget');
-      return res.json(await estimateEnrichmentRun(userId, stored.config, leads.length));
+      const quote = await quoteEnrichment(await getQuoteDeps(), { userId, listId, leadIds: parseLeadIds(req.body) });
+      return res.json(quote.customerView);
     }
 
     const mode = (req.query.mode === 'preview' ? 'preview' : 'enrich') as 'preview' | 'enrich';
@@ -1940,15 +1944,16 @@ router.post('/lists/:listId/leads/enrich-v3', async (req: Request, res: Response
       const supplied = req.body?.confirmEstimateToken;
       const required = process.env.ENRICH_V3_REQUIRE_COST_CONFIRMATION === 'true';
       if (supplied !== undefined || required) {
-        const estimate = estimateEnrichmentCost(listId, await countLeadsForEnrichment(listId, leadIds));
-        const check = checkEstimateConfirmation(supplied, estimate, required);
+        // Only the internal price is needed to compare tokens; the customer view (usage reads) is built for the 409 body alone.
+        const priced = await priceEnrichment(await getQuoteDeps(), { userId, listId, leadIds });
+        const check = checkEstimateConfirmation(supplied, priced.estimate, required);
         if (!check.ok) {
           return res.status(409).json({
             message: check.reason === 'missing'
               ? 'Confirm the enrichment cost estimate before starting.'
               : 'The enrichment cost estimate changed. Review and confirm the new estimate.',
             code: 'ENRICH_ESTIMATE_CONFIRMATION_REQUIRED',
-            estimate,
+            estimate: (await quoteFromPriced(userId, priced)).customerView,
           });
         }
       }

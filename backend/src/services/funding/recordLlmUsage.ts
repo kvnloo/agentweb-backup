@@ -35,6 +35,80 @@ export function customerUpstreamCost(usage: {
     : {};
 }
 
+/** Whether the response reports that OpenRouter executed a server tool (web search...) for this call. */
+function reportsServerToolUse(usage: { server_tool_use_details?: unknown }): boolean {
+  const details = usage?.server_tool_use_details;
+  if (!details || typeof details !== 'object') return false;
+  return Object.values(details as Record<string, unknown>).some(v => typeof v === 'number' && Number.isFinite(v) && v > 0);
+}
+
+const SHAPE_WARNING_INTERVAL_MS = 60_000;
+let lastShapeWarningAt = 0;
+
+/**
+ * AgentWeb's own total cost of one OpenRouter call served on a BYOK key, in USD (ENG-2720).
+ *
+ * A BYOK response carries two separate bills: `cost_details.upstream_inference_cost` is what
+ * the model provider charged the key (tokens, and native tool fees), and `usage.cost` is
+ * OpenRouter's own charge on top of it (server-tool fees such as web search on the Exa,
+ * Firecrawl and Parallel engines, plus any BYOK platform fee). Both are AgentWeb expenses.
+ * Reading only the upstream figure left the web-search fee out of the ledger entirely: on a
+ * real Luna enrichment run the fee was ~$1.1 against ~$0.2 of recorded tokens.
+ *
+ * Observed on real responses: a plain BYOK call reports `usage.cost` 0; a search call reports the fee
+ * ($0.007 Exa, $0.005 Parallel) with `server_tool_use_details.web_search_requests` and an upstream bill of
+ * ~$0.0005 to $0.0007, so the fee is often several times the token bill. That is why the router charge is
+ * NEVER dropped or capped by its size: a rule such as "ignore a charge at least as large as the upstream bill"
+ * would discard the real search fee on every default (Luna) search call the moment a response lacked the
+ * tool-use field, which is the under-booking this change exists to remove.
+ *
+ * Tripwire only: a router charge at least as large as the whole upstream bill with NO reported server-tool
+ * use is not a shape seen in real traffic. It could be a platform fee, or a response in which `usage.cost`
+ * already contains the upstream bill. Both bills are still booked (an over-count is bounded by the token bill,
+ * an under-count by the whole fee), and a warning naming the response's keys is logged at most once a minute
+ * so a change in OpenRouter's reporting shows up in the logs instead of silently skewing the ledger.
+ *
+ * `undefined` when neither bill is reported, so the caller falls back to the price book exactly as
+ * before. An unusable OpenRouter charge counts as 0, never as a drop; a fee with no upstream bill is
+ * booked on top of `tokenCostFallbackUsd` (the book's token cost) instead of being lost.
+ * Callers use this for AgentWeb-paid calls only; customer-funded routes are stripped of the
+ * override downstream and read `customerUpstreamCost` instead.
+ */
+export function openRouterByokCostUsd(
+  usage: {
+    cost?: unknown;
+    cost_details?: { upstream_inference_cost?: unknown } | null;
+    server_tool_use_details?: unknown;
+  },
+  /** Token cost from the price book, used only when the response reports no upstream cost but does charge a fee. */
+  tokenCostFallbackUsd?: number,
+): number | undefined {
+  const routerCharge = typeof usage?.cost === 'number' && Number.isFinite(usage.cost) && usage.cost > 0 ? usage.cost : 0;
+  const upstream = usage?.cost_details?.upstream_inference_cost;
+  if (typeof upstream === 'number' && Number.isFinite(upstream) && upstream > 0) {
+    if (routerCharge > 0 && routerCharge >= upstream && !reportsServerToolUse(usage)) {
+      const now = Date.now();
+      if (now - lastShapeWarningAt >= SHAPE_WARNING_INTERVAL_MS) {
+        lastShapeWarningAt = now;
+        console.warn(
+          '[openRouterByokCostUsd] BYOK router charge is at least the whole upstream bill and no server tool use is reported; booking both. OpenRouter usage shape change?',
+          { usageKeys: Object.keys(usage ?? {}), costDetailKeys: Object.keys(usage?.cost_details ?? {}) },
+        );
+      }
+    }
+    return upstream + routerCharge;
+  }
+  // No usable upstream bill. With no fee either, stay undefined so the caller prices tokens from the book exactly
+  // as before. With a fee (a search ran), book it on top of the book's token cost rather than dropping it.
+  if (routerCharge > 0) {
+    const tokens = typeof tokenCostFallbackUsd === 'number' && Number.isFinite(tokenCostFallbackUsd) && tokenCostFallbackUsd > 0
+      ? tokenCostFallbackUsd
+      : 0;
+    return tokens + routerCharge;
+  }
+  return undefined;
+}
+
 /**
  * `route === 'agentweb'` (and `undefined`, the pre-F1-wiring default): today's path,
  * byte-identical to before this ticket. The one field A3 added to the context

@@ -15,7 +15,7 @@ const ROLE_MODEL = 'org-enrichment-model';
 const BASE = { requireContent: true };
 const NO_AZURE = { requireContent: true, providerIgnoreForWebSearch: ['Azure'] };
 const LUNA = 'openrouter/openai/gpt-5.6-luna';
-const ENV_KEYS = ['CRM_ENRICH_V3_EXTRACT_MODEL', 'CRM_ENRICH_V3_CRITIC_MODEL', 'CRM_ENRICH_V3_WEB_SEARCH_MODEL'] as const;
+const ENV_KEYS = ['CRM_ENRICH_V3_EXTRACT_MODEL', 'CRM_ENRICH_V3_CRITIC_MODEL', 'CRM_ENRICH_V3_WEB_SEARCH_MODEL', 'CRM_ENRICH_V3_WEB_SEARCH_PARAMS'] as const;
 const savedEnv = Object.fromEntries(ENV_KEYS.map(key => [key, process.env[key]]));
 
 const lead = { leadId: 'l1', email: 'a@acme.com', company: 'Acme' } as LeadRecord;
@@ -86,6 +86,32 @@ afterEach(() => {
     if (savedEnv[key] === undefined) delete process.env[key];
     else process.env[key] = savedEnv[key];
   }
+});
+
+describe('CRM_ENRICH_V3_WEB_SEARCH_PARAMS reaches the enrichment LLM calls (ENG-2720)', () => {
+  it('passes the parsed parameters as webSearchParameters on web-tier and identity calls', async () => {
+    const deps = await loadWithEnv({ CRM_ENRICH_V3_WEB_SEARCH_PARAMS: '{"engine":"parallel","max_results":3,"bogus":1}' });
+    await deps.extractFieldsViaLLMReal(webExtractInput, 'user-1');
+    expect(deps.createLLMService).toHaveBeenLastCalledWith(ROLE_MODEL, 0.0, undefined, {
+      ...BASE, webSearchParameters: { engine: 'parallel', max_results: 3 },
+    });
+    await deps.buildIdentityDeps('user-1').resolveCompanyDomainViaWebSearch(domainInput);
+    expect(deps.createLLMService).toHaveBeenLastCalledWith(ROLE_MODEL, 0.2, undefined, {
+      ...BASE, webSearchParameters: { engine: 'parallel', max_results: 3 },
+    });
+  });
+
+  it('sends no webSearchParameters when the variable is unset or invalid (default unchanged)', async () => {
+    delete process.env.CRM_ENRICH_V3_WEB_SEARCH_PARAMS;
+    const unset = await loadWithEnv({});
+    await unset.extractFieldsViaLLMReal(webExtractInput, 'user-1');
+    expect(unset.createLLMService).toHaveBeenLastCalledWith(ROLE_MODEL, 0.0, undefined, BASE);
+
+    jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const bad = await loadWithEnv({ CRM_ENRICH_V3_WEB_SEARCH_PARAMS: '{not json' });
+    await bad.extractFieldsViaLLMReal(webExtractInput, 'user-1');
+    expect(bad.createLLMService).toHaveBeenLastCalledWith(ROLE_MODEL, 0.0, undefined, BASE);
+  });
 });
 
 describe('enrichment web tier and critic follow the enrichment role (ENG-2184)', () => {
