@@ -484,6 +484,54 @@ export async function findMostRecentArchivedIssueByLabel(
 }
 
 /**
+ * ENG-589: most-recently-updated COMPLETED, non-archived issue carrying
+ * `labelName` that matches `isMatch`. Lets a recurring failure cluster reopen its canonical
+ * instead of filing a fresh issue after the first one was closed. Canceled issues are excluded:
+ * a cancel is a human decision the loop must not override. Read-only; callers must treat
+ * a lookup failure as "no closed canonical" and fall through to normal intake.
+ */
+export async function findMostRecentClosedIssueByLabel(
+  labelName: string,
+  isMatch: (issue: OpenIssue) => boolean,
+  limit = OPEN_ISSUES_SCAN_CAP,
+): Promise<OpenIssue | null> {
+  // Page newest-updated first and stop at the first match: a single `first: 50` page dropped the
+  // class's closed canonical once >50 completed Auto issues were updated after it, filing a
+  // duplicate instead of reopening (same defect class as ENG-2766). `limit` is a runaway guard.
+  let scanned = 0;
+  let after: string | null = null;
+  while (scanned < limit) {
+    const pageSize = Math.min(OPEN_ISSUES_PAGE_SIZE, limit - scanned);
+    const data: any = await linearGraphQL(
+      `query($team: String!, $label: String!, $limit: Int!, $after: String) {
+        issues(
+          first: $limit,
+          after: $after,
+          orderBy: updatedAt,
+          filter: {
+            team: { key: { eq: $team } },
+            state: { type: { eq: "completed" } },
+            labels: { name: { eq: $label } }
+          }
+        ) { nodes { id identifier title description archivedAt } pageInfo { hasNextPage endCursor } }
+      }`,
+      { team: TEAM_KEY, label: labelName, limit: pageSize, after },
+    );
+    const nodes: any[] = data?.issues?.nodes || [];
+    scanned += nodes.length;
+    const candidate = nodes
+      .filter((n) => !n.archivedAt)
+      .map((n) => ({ identifier: n.identifier, issueId: n.id, title: n.title || '', description: n.description || '' }))
+      .find(isMatch);
+    if (candidate) return candidate;
+    const pageInfo = data?.issues?.pageInfo;
+    if (!pageInfo?.hasNextPage || !pageInfo?.endCursor || nodes.length === 0) break;
+    after = pageInfo.endCursor;
+  }
+  return null;
+}
+
+/**
  * Thrown when a mutation attempts to move an issue into Linear's `Duplicate` state (or otherwise
  * create a duplicate relation) against a target that is archived. Linear hard-rejects this
  * server-side ("Issues can only be moved to a duplicate state when a duplicate issue relation

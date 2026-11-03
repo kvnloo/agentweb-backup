@@ -108,7 +108,7 @@ export class GmailService implements IEmailService {
       throw new GmailTokenRevokedError('No refresh token available. Please reconnect your Gmail account.');
     }
 
-    // ENG-1277: lazy load — see googleSearchProvider.ts for why.
+    // ENG-1277: lazy load — `googleapis` pulls ~990 modules (~613ms cold) on require.
     const { google } = await import('googleapis');
     const gmailConfig = await getGmailConfig();
     const oauth2Client = new google.auth.OAuth2(
@@ -149,7 +149,7 @@ export class GmailService implements IEmailService {
   // ── Gmail client builder ──────────────────────────────────────────────────
 
   private async getGmailClient(userId: string, accountId: string) {
-    // ENG-1277: lazy load — see googleSearchProvider.ts for why.
+    // ENG-1277: lazy load — `googleapis` pulls ~990 modules (~613ms cold) on require.
     const { google } = await import('googleapis');
     const token = await this.getValidAccessToken(userId, accountId);
     const gmailConfig = await getGmailConfig();

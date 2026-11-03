@@ -118,7 +118,7 @@
  * precedent.
  *
  * Transitive-import notes for the search-provider dependencies
- * (`YouSearchProvider`, `GoogleSearchProvider`, `SearchPurpose`/
+ * (`YouSearchProvider`, `SearchPurpose`/
  * `SearchResultSource`, `inferSearchFreshness`, and the `csvProvenance`
  * helpers) — all STATIC imports here, exactly matching how
  * `agentModeService.ts` already imported every one of them: none of these
@@ -150,7 +150,6 @@ import {
   buildDataAnalysisCacheKey,
 } from '../../services/agentMode/csvProvenance';
 import { YouSearchProvider } from '../../search/youSearchProvider';
-import { GoogleSearchProvider } from '../../search/googleSearchProvider';
 import { SearchPurpose, SearchResultSource } from '../../search/searchProvider';
 import { inferSearchFreshness } from '../../search/searchFreshness';
 
@@ -1125,25 +1124,6 @@ async function performYouSearch(params: {
   };
 }
 
-async function performGoogleSearch(params: {
-  query: string;
-  maxResults: number;
-  userId?: string;
-  purpose?: SearchPurpose;
-}) {
-  const provider = new GoogleSearchProvider();
-  const response = await provider.search({
-    query: params.query,
-    count: params.maxResults,
-    resultSource: 'web',
-    purpose: params.purpose || 'agent_research',
-    userId: params.userId,
-  });
-
-  console.log(`Google Custom Search returned ${response.results.length} web results for query: "${params.query}"`);
-  return response;
-}
-
 async function searchWithYou(params: {
   toolName: 'you_search_web' | 'you_search_news';
   query: string;
@@ -1249,7 +1229,10 @@ async function searchWithYou(params: {
       provider: 'you',
       toolName,
       resultSource,
-      error: error instanceof Error ? error.message : 'Unknown error'
+      error: error instanceof Error ? error.message : 'Unknown error',
+      // ENG-1300/ENG-1281: surface the numeric HTTP status (axios .response.status,
+      // or .status/.code) so failures classify as auth/rate_limit, not unknown.
+      code: (error as any)?.status ?? (error as any)?.code ?? (error as any)?.response?.status,
     };
   }
 }
@@ -1286,55 +1269,24 @@ export async function youSearchNews(query: string, maxResults: number = 10, fres
   });
 }
 
+/**
+ * ENG-1281: Google's Custom Search JSON API is closed to new customers and
+ * sunsets in January 2027, so AgentWeb no longer calls it. `google_search_web`
+ * stays registered as a legacy alias (skills, saved prompts and tool budgets
+ * reference the name) and is served by the same You.com web search as
+ * `you_search_web`. Result shape is unchanged for callers; `provider` truthfully
+ * reports 'you' and `toolName` stays 'google_search_web'.
+ */
 export async function googleSearchWeb(query: string, maxResults: number = 10, userId?: string, purpose: SearchPurpose = 'agent_research'): Promise<any> {
-  const toolName = 'google_search_web';
-  const resultSource: SearchResultSource = 'web';
-  try {
-    console.log(`AgentMode: ${toolName} using Google Custom Search for query:`, query, 'maxResults:', maxResults);
-    const limitedMaxResults = Math.min(maxResults, 10);
-    const searchResponse = await performGoogleSearch({
-      query,
-      maxResults: limitedMaxResults,
-      userId,
-      purpose,
-    });
-    const normalizedResults = searchResponse.results || [];
-    const formattedContent = formatWebSearchResults({
-      query,
-      results: normalizedResults,
-      totalResults: normalizedResults.length,
-    });
-
-    return {
-      success: true,
-      message: `Found ${normalizedResults.length} Google web search results for "${query}"`,
-      query,
-      results: normalizedResults,
-      totalResults: normalizedResults.length,
-      provider: 'google',
-      toolName,
-      resultSource,
-      metadata: searchResponse.metadata,
-      formattedContent,
-    };
-  } catch (error) {
-    console.error(`AgentMode: Error in ${toolName}:`, error);
-    return {
-      success: false,
-      message: 'Failed to search Google Custom Search. Please try again.',
-      provider: 'google',
-      toolName,
-      resultSource,
-      error: error instanceof Error ? error.message : 'Unknown error',
-      // ENG-1300: googleapis' customsearch client throws a GaxiosError, whose
-      // .status/.code are genuinely the numeric HTTP status (unlike Meta's
-      // business-code .code) — same convention already established for
-      // Drive/Calendar. .status checked first since GaxiosError's own docs
-      // treat it as canonical; .code and .response?.status are fallbacks
-      // for other error shapes that can reach this catch.
-      code: (error as any)?.status ?? (error as any)?.code ?? (error as any)?.response?.status,
-    };
-  }
+  const result = await searchWithYou({
+    toolName: 'you_search_web',
+    query,
+    maxResults,
+    resultSource: 'web',
+    userId,
+    purpose,
+  });
+  return { ...result, toolName: 'google_search_web' };
 }
 
 export async function performDeepResearchTool(

@@ -2664,7 +2664,7 @@ mcpToolRegistry.register({
   internal: true,
   definition: {
     name: 'google_search_web',
-    description: 'Opt-in Google Custom Search web search. Not a default search tool. No hidden fallback provider is used.',
+    description: 'Legacy alias of you_search_web (Google Custom Search retired, ENG-1281). Returns You.com web results.',
     inputSchema: {
       type: 'object',
       properties: {

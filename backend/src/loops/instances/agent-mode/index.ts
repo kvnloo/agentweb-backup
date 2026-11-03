@@ -21,9 +21,9 @@ import { claimLoopDailyDigestPost } from '../../core/digest/dailyDigestClaim';
 import { createInstanceRunner } from '../../core/instanceRunner';
 import { DynamoLearningStore } from '../../core/learning/dynamoLearningStore';
 import { EventTableEventSource } from '../../core/sensors/eventTableEventSource';
-import { SpecOutputTool } from '../../core/tools/specOutputTool';
 import { productionLoopPorts } from '../../adapters/awsAdapters';
 import type { LoopRunResult } from '../../core/types';
+import { ClusterIntakeTool } from './clusterIntakeTool';
 import { AGENT_MODE_LOOP_ID } from './eventTypes';
 import { AgentFailureRuleSet } from './failureRuleSet';
 import { withLegacyToolCooldown } from './legacyToolCooldown';
@@ -46,7 +46,8 @@ const runner = createInstanceRunner({
     return {
       sensor: new EventTableEventSource(ports.dynamo, AGENT_MODE_LOOP_ID),
       ruleSet: withLegacyToolCooldown(new AgentFailureRuleSet(), learning),
-      tools: new SpecOutputTool(AGENT_MODE_LOOP_ID, ['cloud-dev', 'auto-loop', 'agent-mode']),
+      // ENG-589: fix spec + one canonical Linear issue per major cluster (ENG-240 rail).
+      tools: new ClusterIntakeTool({}, ['cloud-dev', 'auto-loop', 'agent-mode']),
       learning,
     };
   },
