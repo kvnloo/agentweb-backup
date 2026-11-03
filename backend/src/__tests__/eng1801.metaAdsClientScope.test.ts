@@ -204,6 +204,26 @@ describe('ENG-1801 — admin client_id scoping (canonical, all 3 wrapper entry p
     expect(getMetaAccessToken).not.toHaveBeenCalled();
   });
 
+  it('ENG-2786: the model-visible tool error (dispatch formatting) carries the candidate account_ids and an invalid_args verdict', async () => {
+    const { listMetaAdsCampaignsTool } = await import('../emma/metaTools');
+    const { appendRetryabilityGuidance } = await import('../services/agentMode/core/errorRetryability');
+    const { classifyToolErrorClass } = await import('../utils/toolErrorClassifier');
+    let caught: any;
+    try {
+      await listMetaAdsCampaignsTool.execute({ client_id: 'client@example.com' }, { userId: 'admin-1' } as any);
+    } catch (e) { caught = e; }
+    expect(caught).toBeDefined();
+    // Same assembly toolDispatch.ts uses for a thrown tool error.
+    const content = appendRetryabilityGuidance(
+      (service as any).formatToolError('list_meta_ads_campaigns', caught.message),
+      classifyToolErrorClass(caught),
+    );
+    expect(content).toContain('Candidate account_ids: [act_target-account-id]');
+    expect(classifyToolErrorClass(caught)).toBe('invalid_args');
+    expect(content).toMatch(/fix the arguments/);
+    expect(content).not.toMatch(/\(re\)connect the account/);
+  });
+
   it('unscoped calls (no client_id) are completely unaffected — zero admin gate, zero audit', async () => {
     (metaService.listCampaigns as jest.Mock).mockResolvedValue({ campaigns: [], truncated: false, pagesFetched: 1 });
 
