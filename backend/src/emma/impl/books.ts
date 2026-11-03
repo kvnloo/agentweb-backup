@@ -664,6 +664,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     if (imagineOverridden) {
       message += ` (imagine setting from ${chapterId ? 'chapter' : 'section'} record: ${finalImagine ? 'enabled' : 'disabled'})`;
     }
+    // ENG-2790: a chapter_id-less call is a section request. When the section has
+    // chapters, say so explicitly so the agent never reports section content as a
+    // chapter's content.
+    if (!chapterId && section.chapters && section.chapters.length > 0) {
+      message += `. Note: this wrote SECTION-level content, not any chapter. This section has ${section.chapters.length} chapter(s); to write a chapter, call again with its chapter_id.`;
+    }
 
     return {
       success: true,
