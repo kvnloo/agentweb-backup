@@ -32,7 +32,7 @@ describe("parsing a Smartlead event (ENG-673)", () => {
     event_type: "LEAD_UNSUBSCRIBED", event_id: "ad65b227-b71c-4256-a3d9-455623d720c2", sl_email_lead_map_id: "3930296647",
   };
 
-  it("reads the REAL reply payload: the contact is found (never the sending mailbox), the subject, time and the contact\'s own words are kept, the HTML copies and secrets are not", () => {
+  it("reads the REAL reply payload: the contact is found (never the sending mailbox), the subject, time and the contact's own words are kept, the HTML copies and secrets are not", () => {
     const e = ok(REAL_REPLY);
     expect(e).toMatchObject({ kind: "reply", campaignId: 4270665, subject: "AgentWeb event test for Ann", from: "ann@example.com", to: "sender@example.org", occurredAt: "2026-10-29T14:57:20.000Z", soft: false });
     expect(e.candidateEmails[0]).toBe("ann@example.com");
@@ -190,6 +190,12 @@ describe("the reply text of a Smartlead reply (ENG-673)", () => {
       ["Yes.\n> quoted only", "Yes."],
       ["Yes.\n\n-----Original Message-----\nFrom: H\nSent: Tuesday", "Yes."],
       ["Yes.\n\nFrom: Harsha <h@x.co>\nSent: Tuesday, November 3, 2026 9:23 AM\nTo: Ann\nSubject: Hi\n\nHi", "Yes."],
+      ["Ja, passt.\n\nAm 03.11.2026 um 09:23 schrieb Max Mustermann <max@x.de>:\n> Hallo", "Ja, passt."],
+      ["Ja, passt.\n\nAm 03.11.2026 um 09:23 schrieb Max Mustermann <max@x.de>:\nHallo, ohne Anf\u00fchrungszeichen", "Ja, passt."],
+      ["Ja.\n\nAm 03.11.2026 um 09:23 schrieb Max Mustermann <\nmax@x.de>:\nHallo", "Ja."],
+      ["Yes.\n\nOn Tue, Nov 3, 2026 at 9:23 AM Harsha Vankayalapati <\nharsha@example.com> wrote:\nHi", "Yes."],
+      ["Si.\n\nEl mar, 3 nov 2026 a las 9:23, Max <max@x.es> escribi\u00f3:\nHola", "Si."],
+      ["Si.\n\nIl giorno mar 3 nov 2026 alle ore 09:23 Max <max@x.it> ha scritto:\nCiao", "Si."],
       ["Line one\nLine two", "Line one\nLine two"],
     ];
     for (const [raw, want] of cases) expect(reply({ reply_message: { text: raw } }).replyText).toBe(want);
@@ -199,19 +205,32 @@ describe("the reply text of a Smartlead reply (ENG-673)", () => {
     expect(reply({ reply_message: { text: "On Thursday I am free.\nFrom my side that works." } }).replyText).toBe("On Thursday I am free.\nFrom my side that works.");
     expect(reply({ reply_message: { text: "On balance, yes.\nAs my colleague wrote:\nfine" } }).replyText).toBe("On balance, yes.\nAs my colleague wrote:\nfine");
     expect(reply({ reply_message: { text: "From: Dave\nDate: Friday\nbye" } }).replyText).toBe("From: Dave\nDate: Friday\nbye");
+    expect(reply({ reply_message: { text: "Am Montag bin ich frei.\nAm Dienstag auch." } }).replyText).toBe("Am Montag bin ich frei.\nAm Dienstag auch.");
   });
 
-  it("strips zero-width and direction-changing characters and shows nothing for a reply made only of them", () => {
-    expect(reply({ reply_message: { text: "\u200b\u200b\u202e \ufeff" } }).replyText).toBeUndefined();
-    expect(reply({ reply_message: { text: "Hi\u200b \u202ethere" } }).replyText).toBe("Hi there");
+  it("strips every kind of hidden character but keeps the joiners real text needs, and shows nothing for a reply that only looks blank", () => {
+    const hidden = "\u{e0049}\u{e0067}\u00ad\u061c\u2065\u206a\u3164\u2800\u200b\u202e\ufeff";
+    expect(reply({ reply_message: { text: "Hi" + hidden + " there" } }).replyText).toBe("Hi there");
+    expect(reply({ reply_message: { text: hidden + " " } }).replyText).toBeUndefined();
+    expect(reply({ reply_message: { text: "\u200d\u200c \u200d" } }).replyText).toBeUndefined();
+    const family = "\u{1F468}\u200d\u{1F469}\u200d\u{1F467}";
+    expect(reply({ reply_message: { text: family } }).replyText).toBe(family);
+    const persian = "\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645";
+    expect(reply({ reply_message: { text: persian } }).replyText).toBe(persian);
   });
 
-  it("never stalls on hostile input: long runs of spaces, tabs, newlines or header words", () => {
-    const hostile = [" ".repeat(250000) + "x", "\t".repeat(250000) + "x", "\n".repeat(250000), "On abc def\n".repeat(20000), "wrote: ".repeat(30000), "-".repeat(250000), "From: a\n".repeat(20000)];
+  it("never stalls on hostile input of the full size it reads (a quadratic pattern needs over 100 ms at 10,000 characters)", () => {
+    const hostile = [
+      " ".repeat(9999) + "x", "\t".repeat(9999) + "x", "\n".repeat(9999), "On abc def\n".repeat(900), "wrote: ".repeat(1400), "schrieb ".repeat(1200),
+      "-".repeat(9999), "From: a\n".repeat(1200), "\u200b".repeat(9999), "a\u{e0049}".repeat(4000), " ".repeat(250000) + "x", "On abc def\n".repeat(20000),
+    ];
     for (const text of hostile) {
-      const started = Date.now();
-      replyExcerpt({ reply_message: { text } });
-      expect(Date.now() - started).toBeLessThan(200);
+      const runs = [0, 1, 2].map(() => {
+        const started = process.hrtime.bigint();
+        replyExcerpt({ reply_message: { text } });
+        return Number(process.hrtime.bigint() - started) / 1e6;
+      });
+      expect(Math.min(...runs)).toBeLessThan(40);
     }
   });
 

@@ -146,6 +146,26 @@ describe('the Smartlead reply alert email', () => {
     expect(e.subject + e.html + e.text).not.toMatch(/[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/);
   });
 
+  it('strips every kind of invisible character (tag characters, soft hyphen, Arabic mark, fillers) but keeps the joiners real text needs', () => {
+    const hidden = '\u{e0049}\u{e0067}\u00ad\u061c\u180e\u2065\u206a\u3164\u115f\u2800';
+    const e = buildSmartleadReplyAlertEmail({ ...base, leadName: 'Bo' + hidden + 'b', replyText: 'Hi' + hidden + ' there' });
+    expect(e.subject).toBe('A new lead "Bob" replied to your campaign');
+    expect(e.text).toContain('> Hi there');
+    expect(e.subject + e.html + e.text).not.toMatch(/[\u{e0000}-\u{e007f}\u00ad\u061c\u180e\u2065\u206a\u3164\u115f\u2800]/u);
+    const family = '\u{1F468}\u200d\u{1F469}\u200d\u{1F467}';
+    expect(buildSmartleadReplyAlertEmail({ ...base, replyText: family + ' ok' }).text).toContain('> ' + family + ' ok');
+    expect(buildSmartleadReplyAlertEmail({ ...base, replyText: '\u200d\u200d \u200c' }).html).not.toContain('Their reply');
+    expect(buildSmartleadReplyAlertEmail({ ...base, replyText: '\u3164\u3164\u2800' }).html).not.toContain('Their reply');
+    expect(buildSmartleadReplyAlertEmail({ ...base, leadName: '\u200d', leadEmail: '' }).subject).toBe('A new lead replied to your campaign');
+  });
+
+  it('puts no line break or control character of any kind into the subject, whatever the name holds', () => {
+    const e = buildSmartleadReplyAlertEmail({ ...base, leadName: 'A\r\nB\u2028C\u2029D\u0085E\u000bF\u000cG\u001bH' });
+    // eslint-disable-next-line no-control-regex
+    expect(e.subject).not.toMatch(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/);
+    expect(e.subject).toBe('A new lead "A BCDEFGH" replied to your campaign');
+  });
+
   it('never leaves half an emoji at a cut', () => {
     const e = buildSmartleadReplyAlertEmail({ ...base, leadName: 'a'.repeat(38) + '\u{1F600}'.repeat(5), replyText: 'a'.repeat(598) + '\u{1F600}' + 'b'.repeat(50) });
     expect(e.subject + e.text + e.html).not.toMatch(/[\ud800-\udbff](?![\udc00-\udfff])/);
@@ -192,12 +212,60 @@ describe('the lead list alert uses it only for a Smartlead reply', () => {
     expect(cc).toEqual(['cc@example.com']);
   });
 
-  it('the same event from anywhere else, and every other event, keeps the generic email exactly as before', async () => {
-    await leadListAlertService.notifyLeadListOwnerIfConfigured(list, lead, 'email.received', { source: 'resend', subject: 'Re: Hi' }, '2026-11-03T09:23:00.000Z');
+  it('the same event from anywhere else keeps the generic email exactly as before: subject, text and html are pinned in full', async () => {
+    const at = '2026-11-03T09:23:00.000Z';
+    const time = new Date(at).toLocaleString();
+    const savedUrl = process.env.CUSTOMER_FRONTEND_URL;
+    delete process.env.CUSTOMER_FRONTEND_URL;
+    try {
+      await leadListAlertService.notifyLeadListOwnerIfConfigured(list, lead, 'email.received', { source: 'resend', subject: 'Re: Hi', from: 'a@b.co', to: 'c@d.co' }, at);
+    } finally {
+      if (savedUrl !== undefined) process.env.CUSTOMER_FRONTEND_URL = savedUrl;
+    }
+    expect(send).toHaveBeenCalledTimes(1);
+    const [to, subject, text, html, cc] = send.mock.calls[0];
+    expect(to).toBe('owner@mindd.example');
+    expect(subject).toBe('Lead list alert: email.received');
+    expect(text).toBe(
+      [
+      "A new email.received event was recorded.",
+      "Lead list: Q4 outreach (list_1)",
+      "Lead: Manan Test (mvarma@argusoft.com)",
+      `Time: ${time}`,
+      "Manage leads: http://localhost:5174/crm",
+      "Review lead engagement: http://localhost:5174/crm?listId=list_1&leadId=lead_1&openEngagement=1",
+      "Subject: Re: Hi",
+      "From: a@b.co",
+      "To: c@d.co",
+      ].join('\n'),
+    );
+    expect(html).toBe(`
+    <div style="font-family: Arial, sans-serif; max-width: 640px;">
+      <h2 style="margin-bottom: 12px;">Lead list alert</h2>
+      <p>A new <strong>email.received</strong> event was recorded.</p>
+      <div style="margin: 12px 0;">
+        <div><strong>Lead list:</strong> Q4 outreach (list_1)</div>
+        <div><strong>Lead:</strong> Manan Test (mvarma@argusoft.com)</div>
+        <div><strong>Time:</strong> ${time}</div>
+        <div><strong>Manage leads:</strong> <a href="http://localhost:5174/crm">http://localhost:5174/crm</a></div>
+        <div><strong>Review lead engagement:</strong> <a href="http://localhost:5174/crm?listId=list_1&amp;leadId=lead_1&amp;openEngagement=1">http://localhost:5174/crm?listId=list_1&amp;leadId=lead_1&amp;openEngagement=1</a></div>
+      </div>
+      <div><strong>Subject:</strong> Re: Hi</div><div><strong>From:</strong> a@b.co</div><div><strong>To:</strong> c@d.co</div>
+    </div>
+  `);
+    expect(cc).toEqual(['cc@example.com']);
+  });
+
+  it('every other event, even from Smartlead, keeps the generic subject', async () => {
     await leadListAlertService.notifyLeadListOwnerIfConfigured(list, lead, 'email.bounced', { source: 'smartlead' }, '2026-11-03T09:23:00.000Z');
-    expect(send).toHaveBeenCalledTimes(2);
-    expect(send.mock.calls[0][1]).toBe('Lead list alert: email.received');
-    expect(send.mock.calls[0][2]).toContain('A new email.received event was recorded.');
-    expect(send.mock.calls[1][1]).toBe('Lead list alert: email.bounced');
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0][1]).toBe('Lead list alert: email.bounced');
+    expect(send.mock.calls[0][2]).toContain('A new email.bounced event was recorded.');
+  });
+
+  it('a Smartlead reply on a list with no CC addresses is sent with exactly four arguments, as the generic email is', async () => {
+    await leadListAlertService.notifyLeadListOwnerIfConfigured({ ...list, alertCcEmails: undefined }, lead, 'email.received', { source: 'smartlead', subject: 'Re: Hi' }, '2026-11-03T09:23:00.000Z');
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0]).toHaveLength(4);
   });
 });
