@@ -26,7 +26,8 @@ export const ENRICHMENT_COST_RATES_USD = {
    * list with 10 fields: ~$0.0027 of tokens plus ~$0.015 of OpenRouter search fees (158 searches over
    * 73 leads), ~$0.018 per lead all-in, ~$0.0018 per field; rounded up to $0.002. Scaling with the
    * saved config's field count keeps the quote honest for wide configs. Not model-aware: an org on
-   * another model, or the CRM_ENRICH_V3_DEFAULT_MODEL=gpt-5.5 rollback, books more than this.
+   * another model, or the CRM_ENRICH_V3_DEFAULT_MODEL=gpt-5.5 rollback, books more than this default; the
+   * customer quote passes a model-aware figure (`fieldCostUsd`) and uses this one only as the Luna fallback.
    */
   llmPerFieldPerLead: 0.002,
   /** Field count the reference run (and the measurement above) used; also the default when no config is saved yet. */
@@ -173,6 +174,8 @@ export function checkEstimateConfirmation(
  */
 export function normalizeLeadSelection(raw: unknown): string[] | undefined {
   if (!Array.isArray(raw)) return undefined;
-  const ids = raw.filter((id: unknown): id is string => typeof id === 'string');
+  // De-duplicated: DynamoDB's batch read rejects duplicate keys, and a repeated id must neither inflate the
+  // quote nor be processed twice, so the quote and the run both see each id once.
+  const ids = Array.from(new Set(raw.filter((id: unknown): id is string => typeof id === 'string')));
   return ids.length > 0 ? ids : undefined;
 }

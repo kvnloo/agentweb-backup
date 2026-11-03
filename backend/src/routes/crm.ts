@@ -1851,8 +1851,9 @@ const parseLeadIds = (body: any): string[] | undefined => normalizeLeadSelection
 
 /**
  * @route POST /api/crm/lists/:listId/leads/enrich-v3/estimate
- * @desc ENG-2716: pre-run cost estimate + confirmation token. Pure estimate,
- *       no vendor calls. Client echoes `confirmationToken` as
+ * @desc ENG-2716: pre-run cost estimate + confirmation token. Read-only: no
+ *       vendor calls and nothing is written, but it pages the list's leads and
+ *       reads the usage ledger to express the cost as a percent of the allowance. Client echoes `confirmationToken` as
  *       `confirmEstimateToken` on the enrich-v3 POST.
  * @access Private
  */
@@ -1911,10 +1912,7 @@ router.post('/lists/:listId/leads/enrich-v3', async (req: Request, res: Response
           message: 'No enrichment config saved for this list. Open Enrichment Config and save one first.',
         });
       }
-      const estimateLeadIds = Array.isArray(req.body?.leadIds)
-        ? req.body.leadIds.filter((id: unknown): id is string => typeof id === 'string')
-        : [];
-      const quote = await quoteEnrichment(await getQuoteDeps(), { userId, listId, leadIds: estimateLeadIds.length > 0 ? estimateLeadIds : undefined });
+      const quote = await quoteEnrichment(await getQuoteDeps(), { userId, listId, leadIds: parseLeadIds(req.body) });
       return res.json(quote.customerView);
     }
 

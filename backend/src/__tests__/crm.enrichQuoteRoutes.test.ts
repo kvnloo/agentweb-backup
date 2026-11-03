@@ -209,6 +209,21 @@ describe('input handling', () => {
     expect(placeholder).toBe(blank);
     expect(missing).toBe(blank);
   });
+  it('duplicate leadIds are quoted once AND reach the run once (the run uses DynamoDB batch reads, which reject duplicate keys)', async () => {
+    const q = await request(app).post('/api/crm/lists/victim-list/leads/enrich-v3/estimate').send({ leadIds: ['a', 'a', 'a', 'b', 'a'] });
+    expect(q.body.leadCount).toBe(2);
+    const r = await request(app).post('/api/crm/lists/victim-list/leads/enrich-v3')
+      .send({ leadIds: ['a', 'a', 'a', 'b', 'a'], confirmEstimateToken: q.body.confirmationToken });
+    expect(r.status).toBe(200);
+    expect(mockRun).toHaveBeenCalledTimes(1);
+    expect(mockRun.mock.calls[0][0].leadIds).toEqual(['a', 'b']);
+  });
+  it('?mode=estimate de-duplicates the same way as the other surfaces', async () => {
+    const a = await request(app).post('/api/crm/lists/victim-list/leads/enrich-v3?mode=estimate').send({ leadIds: ['a', 'a', 'b'] });
+    const b = await request(app).post('/api/crm/lists/victim-list/leads/enrich-v3/estimate').send({ leadIds: ['a', 'b'] });
+    expect(a.body.leadCount).toBe(2);
+    expect(a.body.confirmationToken).toBe(b.body.confirmationToken);
+  });
   it('leadIds that is not an array = whole list', async () => {
     const r = await request(app).post('/api/crm/lists/victim-list/leads/enrich-v3/estimate').send({ leadIds: 'x' });
     expect(r.body.leadCount).toBe(2);

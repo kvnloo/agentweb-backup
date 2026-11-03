@@ -168,4 +168,8 @@ describe('normalizeLeadSelection (ENG-2716 Opslane P1)', () => {
   it('keeps string ids of a non-empty selection', () => {
     expect(normalizeLeadSelection(['a', 2, 'b'])).toEqual(['a', 'b']);
   });
+  it('de-duplicates, keeping first-seen order (a repeated id is neither quoted nor run twice)', () => {
+    expect(normalizeLeadSelection(['b', 'a', 'b', 'a', 'c', 'b'])).toEqual(['b', 'a', 'c']);
+    expect(normalizeLeadSelection(['x', 'x', 'x'])).toEqual(['x']);
+  });
 });

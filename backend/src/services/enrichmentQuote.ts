@@ -50,7 +50,8 @@ const PAGE_SIZE = 200;
  * The leads an enrich-v3 run would touch, and how many have no usable email (only those can trigger the
  * Apollo broker: the identity resolver skips it when an email is already known). The list is always paged,
  * and a selected subset is counted only for ids that actually belong to the list, as the run itself only
- * processes real leads. Trusting the raw id count would let a caller multiply the quote with fake ids until
+ * processes real leads. The scan stops as soon as every requested id has been found; ids that do not exist
+ * still cost one pass over the list (bounded by its size). Trusting the raw id count would let a caller multiply the quote with fake ids until
  * the percent resolves the per-lead rate (100,000 fake ids read as 28,000%).
  */
 export async function inspectLeads(
@@ -70,6 +71,8 @@ export async function inspectLeads(
       if (!deps.hasUsableEmail(lead?.email)) emailless++;
     }
     lastKey = page.lastEvaluatedKey;
+    // Every wanted id found: the rest of the list cannot add to the count (ids are unique within a list).
+    if (wanted && count >= wanted.size) break;
   } while (lastKey);
   return { count, emailless };
 }

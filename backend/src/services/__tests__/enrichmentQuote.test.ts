@@ -8,6 +8,7 @@ jest.mock('../tokenUsageService', () => ({ checkTokenUsage: jest.fn(), TURN_ADMI
 import { checkTokenUsage } from '../tokenUsageService';
 import { resolveModelForUser } from '../modelRoles';
 import { inspectLeads, priceEnrichment, quoteEnrichment, quoteFromPriced, type QuoteDeps } from '../enrichmentQuote';
+import { admissionEstimateMicroUsd } from '../enrichmentBatchBudget';
 import type { EnrichmentConfig } from '../crmEnrichmentServiceV3';
 
 const check = checkTokenUsage as jest.Mock;
@@ -63,6 +64,21 @@ describe('inspectLeads', () => {
   it('fake ids cannot amplify the count (they match nothing), so the quote cannot be scaled to resolve the rate', async () => {
     const fake = Array.from({ length: 100_000 }, (_, i) => `fake-${i}`);
     expect(await inspectLeads(deps(['a@acme.com', '']), 'l', fake)).toEqual({ count: 0, emailless: 0 });
+  });
+
+  it('stops scanning once every requested id has been found (a small subset does not read the whole list)', async () => {
+    const d = deps(Array(1000).fill(''));
+    expect(await inspectLeads(d, 'l', ['l0', 'l1'])).toEqual({ count: 2, emailless: 2 });
+    expect(d.pages).toBe(1); // 1000 leads = 5 pages, the ids are on the first
+    const far = deps(Array(1000).fill(''));
+    expect(await inspectLeads(far, 'l', ['l999'])).toEqual({ count: 1, emailless: 1 });
+    expect(far.pages).toBe(5);
+  });
+
+  it('still scans the whole list when a requested id does not exist (bounded by the list)', async () => {
+    const d = deps(Array(1000).fill(''));
+    expect(await inspectLeads(d, 'l', ['l0', 'nope'])).toEqual({ count: 1, emailless: 1 });
+    expect(d.pages).toBe(5);
   });
 
   it('ignores non-string lead ids on the page', async () => {
@@ -191,5 +207,23 @@ describe('quoteFromPriced (the 409 path)', () => {
     expect(d.pages).toBe(pagesAfterPricing);
     expect(view.customerView.confirmationToken).toBe(priced.estimate.confirmationToken);
     expect(Object.keys(view.customerView).sort()).toEqual(['confirmationToken', 'estimatedPercentOfAllowance', 'leadCount', 'withinAllowance']);
+  });
+
+  it('decides "within allowance" on the conservative admission reserve, not on the expected cost alone', async () => {
+    const config = sizedCfg(10);
+    const d = deps(Array(20).fill(''), config);
+    const priced = await priceEnrichment(d, { userId: 'u1', listId: 'l' });
+    const expectedMicro = Math.round(priced.estimate.totalUsd * 1_000_000);
+    const reserveMicro = await admissionEstimateMicroUsd('u1', config, priced.leadCount);
+    expect(reserveMicro).toBeGreaterThan(expectedMicro * 1.5); // the reserve really is the bigger number
+    const threshold = Math.round((expectedMicro + reserveMicro) / 2);
+    check.mockReset().mockImplementation(async (_u: string, o?: { projectedCostMicroUsd?: number }) =>
+      ({ allowed: (o?.projectedCostMicroUsd ?? 0) < threshold, month: '2026-11', costAllowance: 150, costUsed: 5 }));
+    // expected cost fits under the threshold, the reserve does not: only the reserve can make this false
+    expect((await quoteFromPriced('u1', priced)).customerView.withinAllowance).toBe(false);
+    // with no saved config there is no reserve to apply, so the expected cost alone decides
+    const noConfig = await priceEnrichment(deps(Array(20).fill(''), undefined), { userId: 'u1', listId: 'l' });
+    expect(Math.round(noConfig.estimate.totalUsd * 1_000_000)).toBeLessThan(threshold);
+    expect((await quoteFromPriced('u1', noConfig)).customerView.withinAllowance).toBe(true);
   });
 });
