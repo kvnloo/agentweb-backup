@@ -1,5 +1,5 @@
 import { createHash } from "crypto";
-import { sliceSafe, stripUnsafeChars } from "./smartleadSafeText";
+import { hasVisibleText, sliceSafe, stripUnsafeChars } from "./smartleadSafeText";
 
 /**
  * Turns a Smartlead webhook body into one small, checked event (ENG-673, slice 3). Pure: no network, no storage.
@@ -91,12 +91,15 @@ function canonicalJson(v: unknown): string {
 /** The most of a reply an event carries. The alert email shows less. */
 export const REPLY_TEXT_MAX = 1000;
 
-// Where the quoted thread under a reply starts: a quoted line, "On <date>, <name> wrote:" (which a mail client may wrap so that "wrote:" is alone on
-// the next line), the same in a few other languages, an "Original Message" or underscore rule, or an Outlook "From: ... Sent: ... To: ..." block.
+// Where the quoted thread under a reply starts: a quoted line, "On <date>, <name> wrote:" (which a mail client may wrap so that the name and address, or
+// just "wrote:", are alone on the next line), the same in English, French, Spanish, German and Italian, an "Original Message" or underscore rule, or an
+// Outlook "From: ... Sent: ... To: ..." block. Every pattern is bounded, so none can take long on a hostile line.
 const QUOTED_LINE = /^\s*>/;
 const WROTE_HEADER = /^\s*(On|Le|El|Am|Il)\s.{3,300}$/;
-const WROTE_END = /(wrote|a \u00e9crit|escribi\u00f3|schrieb|ha scritto)\s*:\s*$/i;
-const WROTE_ALONE = /^\s*(wrote|a \u00e9crit|escribi\u00f3|schrieb|ha scritto)\s*:\s*$/i;
+// German puts the name after the verb: "Am 03.11.2026 um 09:23 schrieb Max Mustermann <max@x.de>:".
+const WROTE_END = /(wrote|a \u00e9crit|escribi\u00f3|ha scritto)\s*:\s*$|schrieb\b[^:]{0,200}:\s*$/i;
+const WROTE_NEXT = /^\s*\S{0,120}\s*(wrote|a \u00e9crit|escribi\u00f3|schrieb|ha scritto)\s*:\s*$/i;
+const GERMAN_NEXT = /^\s*\S{0,120}:\s*$/;
 const ORIGINAL_RULE = /^\s*(-{2,}\s*(original message|forwarded message)\s*-{2,}|_{10,})\s*$/i;
 const OUTLOOK_FROM = /^\s*From:\s.+/i;
 const OUTLOOK_FIELD = /^\s*(Sent|Date|To|Cc|Subject):\s/i;
@@ -120,12 +123,15 @@ export function replyExcerpt(body: Record<string, unknown>): string | undefined 
   for (let i = 0; i < lines.length && kept.length < REPLY_LINES_MAX; i++) {
     const line = lines[i];
     if (QUOTED_LINE.test(line) || ORIGINAL_RULE.test(line)) break;
-    if (WROTE_HEADER.test(line) && (WROTE_END.test(line) || (line.trim().length >= 15 && WROTE_ALONE.test(lines[i + 1] ?? "")))) break;
+    if (WROTE_HEADER.test(line)) {
+      const next = lines[i + 1] ?? "";
+      if (WROTE_END.test(line) || (line.trim().length >= 15 && (WROTE_NEXT.test(next) || (/\bschrieb\b/i.test(line) && GERMAN_NEXT.test(next))))) break;
+    }
     if (OUTLOOK_FROM.test(line) && lines.slice(i + 1, i + 6).filter(l => OUTLOOK_FIELD.test(l)).length >= 2) break;
     kept.push(line.trimEnd());
   }
   const text = kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
-  if (!text) return undefined;
+  if (!text || !hasVisibleText(text)) return undefined;
   return text.length > REPLY_TEXT_MAX ? `${sliceSafe(text, REPLY_TEXT_MAX - 1).trimEnd()}\u2026` : text;
 }
 
