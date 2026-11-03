@@ -74,6 +74,18 @@ describe('resolveInboundContextForOrg', () => {
   });
 });
 
+describe('resolveInboundContextForOrg refusals', () => {
+  it.each([
+    ['an org without an owner', { orgId: 'org-a', ownerUserId: '', hotLeadCall: stored }],
+    ['an org record whose id differs from the signed one', { orgId: 'org-x', ownerUserId: 'owner-a', hotLeadCall: stored }],
+    ['a config without a caller number', { orgId: 'org-a', ownerUserId: 'owner-a', hotLeadCall: { ...stored, enabled: false, twilioNumber: undefined } }],
+    [ 'no org', undefined ],
+  ])('returns null for %s', async (_what, org) => {
+    mock(orgDb.getOrgById).mockResolvedValue(org);
+    await expect(resolveInboundContextForOrg('org-a')).resolves.toBeNull();
+  });
+});
+
 describe('triedMembersOf', () => {
   it.each([
     ['', []],

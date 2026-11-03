@@ -24,7 +24,7 @@ interface VoiceWebhookContext {
  * checked 2026-10-19): `rc` = retry count (0-5, default 1), `rp` = retry policy (default `ct`, i.e. only TCP connect /
  * TLS handshake failures, so a 5xx is NOT retried by default). `5xx,ct` retries a server error we answer, up to 3 times.
  * The fragment is never sent on the wire and Twilio omits it when signing, so req.originalUrl (what the webhook
- * validates against) has none. Only status callbacks get it: they carry the metering input and every handler is
+ * validates against) has none. Only status callbacks (and the inbound callback's member-leg status) get it: they carry the metering input and every handler is
  * idempotent on a redelivery. The TwiML fetches (/owner, /gather, /dial, /screen, /screen-result) happen while a person is on the line under
  * Twilio's 15 second cap for call requests, so a retry would not help them and they answer a hangup instead.
  */

@@ -97,6 +97,7 @@ const CALL_SID_SHAPE = /^CA[A-Za-z0-9]{8,40}$/;
 const QUERY_KEYS = new Set(['listId', 'leadId', 'jobKey', 'leg']);
 
 const TERMINAL_CALL_STATUSES = new Set(['completed', 'busy', 'no-answer', 'failed', 'canceled']);
+// The callee's leg never took the call (the lead on an outbound call; a member on an inbound callback).
 const LEAD_NOT_REACHED = new Set(['no-answer', 'busy', 'failed']);
 const DIAL_ENDED_AFTER_ANSWER = new Set(['completed', 'answered']);
 // Written together with leadCallSid by /screen: the first writer wins the right to name the lead leg.
@@ -569,26 +570,35 @@ function parseInboundQuery(req: Request): InboundQuery | null {
   return typeof orgId === 'string' && isWebhookSafeId(orgId) && tried ? { orgId, tried } : null;
 }
 
-type InboundHandler = (res: Response, body: FormParams, q: InboundQuery) => Promise<void>;
+const inboundRefusal: ErrorReplies = { invalid: (res) => sendXml(res, inboundUnavailableTwiml()), failed: (res) => sendXml(res, inboundUnavailableTwiml()) };
 
-/** Every inbound step is answered with TwiML, so an unusable or failed request ends in the spoken refusal. */
-function guardedInbound(handler: InboundHandler, opts: { entry?: boolean; reply?: ErrorReplies } = {}) {
-  const replies: ErrorReplies = opts.reply ?? { invalid: (res) => sendXml(res, inboundUnavailableTwiml()), failed: (res) => sendXml(res, inboundUnavailableTwiml()) };
+/** Runs one verified inbound step; an unexpected failure is answered with `replies.failed` (the error name is logged, never its message). */
+async function runInbound(res: Response, replies: ErrorReplies, step: () => Promise<void>): Promise<void> {
+  try {
+    await step();
+  } catch (err) {
+    console.error('[hotLeadCall] inbound handler failed:', errorName(err));
+    if (!res.headersSent) replies.failed(res);
+  }
+}
+
+/** A step that continues a callback: the signed query carries the org and the members tried. Every step is answered with TwiML. */
+function guardedInbound(handler: (res: Response, body: FormParams, q: InboundQuery) => Promise<void>, replies: ErrorReplies = inboundRefusal) {
   return async (req: Request, res: Response): Promise<void> => {
     const body = await verifiedBody(req, res);
     if (!body) return;
-    // The entry point is the number's voice URL and carries no query.
-    const q = opts.entry ? { orgId: '', tried: [] } : parseInboundQuery(req);
-    if (!q) {
-      replies.invalid(res);
-      return;
-    }
-    try {
-      await handler(res, body, q);
-    } catch (err) {
-      console.error('[hotLeadCall] inbound handler failed:', errorName(err));
-      if (!res.headersSent) replies.failed(res);
-    }
+    const q = parseInboundQuery(req);
+    if (!q) return replies.invalid(res);
+    await runInbound(res, replies, () => handler(res, body, q));
+  };
+}
+
+/** The entry point is the number's voice URL: Twilio calls it with the caller's own request and no query of ours. */
+function guardedInboundEntry(handler: (res: Response, body: FormParams) => Promise<void>) {
+  return async (req: Request, res: Response): Promise<void> => {
+    const body = await verifiedBody(req, res);
+    if (!body) return;
+    await runInbound(res, inboundRefusal, () => handler(res, body));
   };
 }
 
@@ -606,11 +616,11 @@ function ringNextOrApologise(res: Response, ctx: InboundContext, tried: readonly
   }));
 }
 
-router.post('/inbound', guardedInbound(async (res, body) => {
+router.post('/inbound', guardedInboundEntry(async (res, body) => {
   const ctx = await resolveInboundContext(body.To || body.Called);
   if (!ctx) return sendXml(res, inboundUnavailableTwiml());
   ringNextOrApologise(res, ctx, []);
-}, { entry: true }));
+}));
 
 router.post('/inbound-screen', guardedInbound(async (res, _body, q) => {
   const ctx = await resolveInboundContextForOrg(q.orgId);
@@ -620,7 +630,7 @@ router.post('/inbound-screen', guardedInbound(async (res, _body, q) => {
     announcedName: ctx.config.announcedName,
     resultUrl: buildInboundWebhookUrl('inbound-screen-result', q),
   }));
-}, { reply: twimlReplies }));
+}, twimlReplies));
 
 router.post('/inbound-screen-result', guardedInbound(async (res, body, q) => {
   if (body.Digits !== '1') return sendHangup(res);
@@ -628,23 +638,20 @@ router.post('/inbound-screen-result', guardedInbound(async (res, body, q) => {
   if (!ctx || !isAcceptingMember(ctx.config, q.tried[q.tried.length - 1])) return sendHangup(res);
   // An empty response ends the member's screening leg normally, so Twilio bridges the two calls.
   sendXml(res, bridgeTwiml());
-}, { reply: twimlReplies }));
-
-// The attempt ended without a conversation: the member did not answer, was busy, declined or let the prompt time out.
-const INBOUND_NOT_REACHED = new Set(['no-answer', 'busy', 'failed']);
+}, twimlReplies));
 
 router.post('/inbound-dial', guardedInbound(async (res, body, q) => {
   const status = body.DialCallStatus ?? '';
-  const answered = DIAL_ENDED_AFTER_ANSWER.has(status);
   // Bridged: the conversation happened and is over. Cancelled: the caller hung up while it rang. Any other
   // answer without an explicit DialBridged=false cannot be told from a finished conversation, so nobody else is rung.
-  const tryNext = INBOUND_NOT_REACHED.has(status) || (answered && body.DialBridged === 'false');
+  const tryNext = LEAD_NOT_REACHED.has(status) || (DIAL_ENDED_AFTER_ANSWER.has(status) && body.DialBridged === 'false');
   if (!tryNext) return sendHangup(res);
   const ctx = await resolveInboundContextForOrg(q.orgId);
   if (!ctx) return sendXml(res, inboundUnavailableTwiml());
   ringNextOrApologise(res, ctx, q.tried);
 }));
 
+// Deliberately not gated on the kill switch, config or plan: the leg already happened and must still be billed.
 router.post('/inbound-status', guardedInbound(async (res, body, q) => {
   const callSid = sidOf(body, 'CallSid');
   // A member leg is always a child of the caller's call.
@@ -662,6 +669,6 @@ router.post('/inbound-status', guardedInbound(async (res, body, q) => {
     durationSeconds: body.CallDuration?.trim() ? Number(body.CallDuration) : NaN,
   });
   ack(res);
-}, { reply: statusReplies }));
+}, statusReplies));
 
 export default router;

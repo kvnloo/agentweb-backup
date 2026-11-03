@@ -28,7 +28,10 @@ const LEAD_CALLER = '+12125550142';
 const SECOND_PHONE = '+14155550102';
 const THIRD_PHONE = '+14155550103';
 const FOURTH_PHONE = '+14155550104';
+const FIFTH_PHONE = '+14155550105';
+const SIXTH_PHONE = '+14155550106';
 const CALLER_SID = 'CA10000001';
+const HANGUP = '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>';
 const EMPTY_RESPONSE = '<?xml version="1.0" encoding="UTF-8"?><Response/>';
 
 const member = (phone: string, id: string, over = {}) => teamMember(phone, { id, ...over });
@@ -71,6 +74,11 @@ const dialEnds = (a: ReturnType<typeof attempt>, dialStatus: string, extra: Reco
   world.twilio.post(a.dialUrl, { ...callerLeg, CallStatus: 'in-progress', DialCallStatus: dialStatus, ...extra });
 const legEnds = (a: ReturnType<typeof attempt>, sid: string, status: string, duration: string) =>
   world.twilio.post(a.statusUrl, { ...memberLeg(sid, a.to!), ParentCallSid: CALLER_SID, CallStatus: status, CallDuration: duration });
+
+const refused = (body: string) => {
+  expect(body).toBe(`<?xml version="1.0" encoding="UTF-8"?><Response><Say>${INBOUND_UNAVAILABLE_COPY}</Say><Hangup/></Response>`);
+  expect(body).not.toContain('<Dial');
+};
 
 const PROMPT = 'Smith & Sons: a lead is calling back. Are you available to take the call? Press 1.';
 
@@ -115,6 +123,12 @@ describe('a lead calls the org number back', () => {
     // Stateless: no lead call record or timeline event exists for it.
     expect([...world.crm.leads.values()]).toEqual([]);
     expect(world.provider.placedCalls).toHaveLength(0);
+  });
+
+  it('uses Called when To is empty, but never falls back to it when To is present and unknown', async () => {
+    const viaCalled = await dialled({ To: '', Called: TWILIO_NUMBER });
+    expect(attempt(viaCalled.body).to).toBe(MEMBER_PHONE);
+    refused((await dialled({ To: '+14155559999', Called: TWILIO_NUMBER })).body);
   });
 
   it('a redelivered metering callback is billed once (same idempotency key)', async () => {
@@ -218,13 +232,7 @@ describe('a lead calls the org number back', () => {
   });
 });
 
-describe('inbound callbacks fail closed', () => {
-  const refused = (body: string) => {
-    expect(body).toBe(`<?xml version="1.0" encoding="UTF-8"?><Response><Say>${INBOUND_UNAVAILABLE_COPY}</Say><Hangup/></Response>`);
-    expect(body).not.toContain('<Dial');
-  };
-
-  it.each([
+describe('inbound callbacks fail closed', () => {  it.each([
     ['an unknown number', () => undefined, { To: '+14155559999' }],
     ['a missing To', () => undefined, { To: '' }],
     ['the kill switch off', () => setHotLeadCallEnabledOverride(false), {}],
@@ -240,7 +248,9 @@ describe('inbound callbacks fail closed', () => {
   it('a failing org lookup refuses the call (and logs only the error name)', async () => {
     world.crm.listFails = true;
     refused((await dialled()).body);
-    expect(JSON.stringify(world.consoleSpies.flatMap((s) => s.mock.calls))).toContain('inbound handler failed');
+    const logged = JSON.stringify(world.consoleSpies.flatMap((s) => s.mock.calls));
+    expect(logged).toContain('inbound handler failed');
+    expect(logged).not.toContain('scan failed');
   });
 
   it('a step after the feature is switched off ends the chain instead of ringing on', async () => {
@@ -325,5 +335,91 @@ describe('inbound callbacks fail closed', () => {
     await legEnds(a, 'CA20000001', 'no-answer', '0');
     await world.twilio.post(a.statusUrl, { ...memberLeg('CA20000002', a.to!), ParentCallSid: CALLER_SID, CallStatus: 'completed' });
     expect(mock(recordVendorUsage)).not.toHaveBeenCalled();
+  });
+
+  it('entitlement lost mid-chain: the next step tells the caller and rings nobody', async () => {
+    const first = attempt((await dialled()).body);
+    setHotLeadCallEntitledOverride(false);
+    refused((await dialEnds(first, 'no-answer')).body);
+  });
+
+  it('kill switch off: a 1 on the screening step is a bare hangup, not the bridging response', async () => {
+    const first = attempt((await dialled()).body);
+    const prompt = await answers(first, 'CA20000001');
+    setHotLeadCallEnabledOverride(false);
+    const res = await presses(attrOf(prompt.body, 'action'), 'CA20000001', first.to!, '1');
+    expect(res.body).toBe(HANGUP);
+    expect(res.body).not.toBe(EMPTY_RESPONSE);
+  });
+
+  it.each([[''], ['11'], ['2'], ['*']])('the digits %j do not bridge', async (digits) => {
+    const first = attempt((await dialled()).body);
+    const prompt = await answers(first, 'CA20000001');
+    expect((await presses(attrOf(prompt.body, 'action'), 'CA20000001', first.to!, digits)).body).toBe(HANGUP);
+  });
+
+  it.each([
+    ['a bad member id', 'orgId=org-a&tried=bad'],
+    ['a duplicate member id', 'orgId=org-a&tried=maaaaaaa,maaaaaaa'],
+    ['an extra key', 'orgId=org-a&tried=maaaaaaa&x=1'],
+    ['no orgId', 'tried=maaaaaaa'],
+  ])('the screening steps hang up on a query with %s', async (_what, query) => {
+    for (const step of ['inbound-screen', 'inbound-screen-result']) {
+      const res = await world.twilio.post(`${BASE}/api/webhooks/twilio-voice/${step}?${query}`, { ...memberLeg('CA20000001', MEMBER_PHONE), Digits: '1' });
+      expect(res.status).toBe(200);
+      expect(res.body).toBe(HANGUP);
+    }
+  });
+
+  it('a signed URL whose query was altered afterwards is rejected with 401 on every step', async () => {
+    const first = attempt((await dialled()).body);
+    for (const url of [first.screenUrl, first.dialUrl, first.statusUrl]) {
+      const altered = url.replace('tried=maaaaaaa', 'tried=mbbbbbbb');
+      expect(altered).not.toBe(url);
+      const res = await world.twilio.post(altered, { ...memberLeg('CA20000001', MEMBER_PHONE), Digits: '1', DialCallStatus: 'no-answer' }, { signedUrl: url });
+      expect(res.status).toBe(401);
+    }
+    expect(world.provider.signatureChecks.length).toBeGreaterThan(0);
+  });
+
+  it('a tried list of 6 ids is refused even though each id is valid', async () => {
+    const six = ['maaaaaaa', 'mbbbbbbb', 'mccccccc', 'mddddddd', 'meeeeeee', 'mfffffff'].join(',');
+    const res = await world.twilio.post(`${BASE}/api/webhooks/twilio-voice/inbound-dial?orgId=org-a&tried=${six}`, { ...callerLeg, DialCallStatus: 'no-answer' });
+    refused(res.body);
+  });
+
+  it('with maxAttemptsPerLead at its largest (5) five members are rung and the sixth is not', async () => {
+    configure({
+      maxAttemptsPerLead: 5,
+      team: [
+        member(MEMBER_PHONE, 'maaaaaaa'), member(SECOND_PHONE, 'mbbbbbbb'), member(THIRD_PHONE, 'mccccccc'),
+        member(FOURTH_PHONE, 'mddddddd'), member(FIFTH_PHONE, 'meeeeeee'), member(SIXTH_PHONE, 'mfffffff'),
+      ],
+    });
+    let reply = await dialled();
+    const rung: Array<string | undefined> = [];
+    for (let i = 0; i < 5; i++) {
+      const a = attempt(reply.body);
+      rung.push(a.to);
+      reply = await dialEnds(a, 'no-answer');
+    }
+    expect(rung).toEqual([MEMBER_PHONE, SECOND_PHONE, THIRD_PHONE, FOURTH_PHONE, FIFTH_PHONE]);
+    expect(sayText(reply.body)).toBe(INBOUND_NOBODY_COPY);
+  });
+
+  it('the metering callback is not gated: the leg is still billed after the kill switch is turned off', async () => {
+    const first = attempt((await dialled()).body);
+    setHotLeadCallEnabledOverride(false);
+    setHotLeadCallEntitledOverride(false);
+    expect((await legEnds(first, 'CA20000001', 'completed', '61')).status).toBe(200);
+    expect(usage()).toEqual([expect.objectContaining({ quantity: 2, idempotencyKey: 'twilio:voice:CA20000001:member' })]);
+  });
+
+  it('the metering callback for an org with no owner is acknowledged, bills nobody and says it was not metered', async () => {
+    const first = attempt((await dialled()).body);
+    configure({}, { ownerUserId: '' });
+    expect((await legEnds(first, 'CA20000001', 'completed', '61')).status).toBe(200);
+    expect(mock(recordVendorUsage)).not.toHaveBeenCalled();
+    expect(JSON.stringify(world.consoleSpies.flatMap((s) => s.mock.calls))).toContain('not metered');
   });
 });

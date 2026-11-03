@@ -256,6 +256,19 @@ describe('provision_hot_lead_call_number', () => {
     await expect(provision()).rejects.toThrow('already has a caller number');
     expect(fake.boughtNumbers).toEqual([]);
   });
+  it('with no BACKEND_URL in a deployed environment, fails before reserving or buying anything', async () => {
+    const saved = { url: process.env.BACKEND_URL, env: process.env.NODE_ENV };
+    delete process.env.BACKEND_URL;
+    Object.assign(process.env, { NODE_ENV: 'production' });
+    try {
+      await expect(provision({ confirm: true })).rejects.toThrow('BACKEND_URL');
+    } finally {
+      Object.assign(process.env, { NODE_ENV: saved.env });
+      if (saved.url !== undefined) process.env.BACKEND_URL = saved.url;
+    }
+    expect(fake.boughtNumbers).toEqual([]);
+    expect(writes).toEqual([]);
+  });
 
   it('buys a US number, stores it conditionally, meters the first month and reveals neither number nor sid', async () => {
     fake.queueBuyNumberResult({ numberSid: NEW_SID, phoneNumber: NEW_NUMBER });

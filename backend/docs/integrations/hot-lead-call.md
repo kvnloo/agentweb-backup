@@ -258,14 +258,19 @@ Rules (all verified against `routes/twilioVoiceWebhook.ts` and `services/voice/i
 
 - **Finding the org.** The dialled number is the signed request's `To` (`Called` if `To` is empty). AW-Organizations has no
   index on it, so `services/voice/inboundNumberIndex.ts` scans the orgs that hold a number (`orgDb.listHotLeadCallNumbers`,
-  projected to id and number) and keeps the result in memory for 60 seconds per backend instance. One snapshot serves every lookup,
-  so an unknown number costs no scan of its own (that is the negative cache), and concurrent calls share one scan. A number
-  bought or released in the last minute may not be seen yet. The snapshot only *locates* the org: the org is then
+  projected to id and number) and keeps the result in memory per backend instance. One snapshot serves every lookup,
+  so an unknown number costs no scan of its own (that is the negative cache). The snapshot is refreshed stale-while-revalidate:
+  after 60 seconds the next call is still answered from the old snapshot while one background scan runs (shared, retried no sooner
+  than every 5 seconds after a failure, failures logged by error name only), so the scan is never in the call path. Only the first
+  lookup after a start, with no snapshot, waits for the scan; if that fails the call is refused and the failure is not cached.
+  A number bought or released within the last 60 seconds (longer while refreshes fail) is therefore not served yet. The snapshot only *locates* the org: the org is then
   re-read (consistent read) and its live config decides, so a stale entry can only end in a refusal. A number stored on
-  two orgs is served to neither. A failed scan is not cached and refuses the call. No GSI and no data change was made.
+  two orgs is served to neither. No GSI and no data change was made.
 - **Fail closed.** Unknown number, kill switch off, config missing/invalid/disabled, the number no longer the org's, an
   org without an owner, or a plan without the `hot_lead_call` feature: the caller hears "Sorry, we are unable to take your
-  call right now. Goodbye." and the call is hung up. Nobody is rung. An exception anywhere in a step gives the same answer.
+  call right now. Goodbye." and the call is hung up. Nobody is rung. An unexpected failure in a step is answered per step: `/inbound`
+  and `/inbound-dial` give the same message and hangup, `/inbound-screen` and `/inbound-screen-result` a bare `<Hangup/>` (which
+  moves on to the next member), and `/inbound-status` a 500 so Twilio redelivers.
 - **Who is rung.** `selectHotLeadCallCandidates` at the current instant: verified, inside their window and inside the
   calling hours, in team priority order, skipping members already tried. At most `maxAttemptsPerLead` members are rung per
   callback. The roster is re-evaluated at every step, so a window that closes while the caller waits is respected, and
@@ -283,7 +288,8 @@ Rules (all verified against `routes/twilioVoiceWebhook.ts` and `services/voice/i
   record: the org comes from the dialled number (`/inbound`, no query) or from the signed `orgId` (the other steps).
   A bad signature is 401, unloadable credentials 503; a signed request with a malformed query, or whose handler fails,
   is answered with the spoken refusal (`/inbound`, `/inbound-dial`) or a hangup (the member's screening steps) with 200;
-  `/inbound-status` acknowledges with 200 and answers 500 only when billing fails (it carries the same retry override).
+  `/inbound-status` acknowledges with 200 and answers 500 when the org read or billing fails (it carries the same retry override).
+  It is deliberately not gated on the kill switch, config or plan: the leg already happened and must still be billed.
 
 Metering: only the **member leg** is metered, with the existing `voice_minute_outbound` rate (it is an outbound call from our
 number), by `/inbound-status` (`CallStatus` terminal, with a `ParentCallSid`), idempotency key
@@ -294,9 +300,11 @@ bridged conversation).
 
 Limits to know about:
 
-- The outbound abuse limits (calls per hour/day, per-member cooldown, lead-phone dedupe) do **not** apply: there is no
-  lead, and anyone with the number can dial it. Each call rings at most `maxAttemptsPerLead` members and is billed per
-  member-leg minute. Twilio's own geographic permissions and spend limits are the only ceiling on volume.
+- **No cap on volume.** The outbound abuse limits (calls per hour/day, per-member cooldown, lead-phone dedupe) do **not** apply,
+  and there is no per-caller, hourly or daily cap of any kind: there is no lead, and anyone with the number can dial it. Each call
+  rings at most `maxAttemptsPerLead` members. The exposure is the member-leg minutes, billed to the org owner through the usage
+  ledger (and the same minutes on AgentWeb's Twilio bill), bounded only by Twilio's own geographic permissions and spend limits.
+  A separate ticket covers a cap; it is a go-live decision (item 15).
 - Callers are not screened or limited (no per-caller cap, no blocklist) and are not recorded in the lead timeline.
 - The member prompt is the org's `announcedName` only; visitor-supplied text is never spoken.
 - A freshly provisioned number is pointed at `/inbound` by `buyNumber` (`voiceUrl`, POST). A number bought **before** this
@@ -1194,11 +1202,13 @@ on anywhere.
     Provision and release need a person's approval click, and number rent is
     metered every month by the daily sweep.
 15. Inbound callbacks: set the voice URL of every number bought before inbound callbacks existed
-    (the existing org number, sid `PN2d69...`) to
+    (the existing org number, `hotLeadCall.twilioNumberSid` on its AW-Organizations item) to
     `${BACKEND_URL}/api/webhooks/twilio-voice/inbound`, HTTP POST, in the Twilio console. Until then a
     lead calling it hears whatever the number was left with. Then call it once from a phone that
     is not a team member's: the member should hear the "a lead is calling back" prompt.
-    Decide whether the unmetered inbound leg (see [Metering and spend](#metering-and-spend)) is acceptable.
+    Decide whether the unmetered inbound leg (see [Metering and spend](#metering-and-spend)) is acceptable, and accept in writing that
+    inbound callbacks have no per-caller, hourly or daily cap: anyone who learns the number can make it ring the team, and the
+    member-leg minutes are billed to the org owner with only Twilio's spend limits as a ceiling.
 
 ## Not verified without a real Twilio account
 
@@ -1210,6 +1220,8 @@ Twilio's documentation and encoded in tests with synthetic payloads:
   (a hang-up there ends the Dial with `completed` and `DialBridged=false`, which is what moves on to the next member);
   that the member leg's `completed` status callback carries `ParentCallSid` and `CallDuration`; and that the
   callerId = the org's number is accepted on a `<Dial>` answering an inbound call.
+- Inbound callbacks: whether Twilio sends `DialBridged=false` when a `<Number url>` screening step hangs up. If it is absent,
+  `/inbound-dial` hangs up the caller instead of rolling to the next member (the outbound `/dial` relies on the same assumption).
 
 - `<Number>` status callbacks (`statusCallbackEvent="initiated ringing answered
   completed"`) for a lead that does not answer or is busy: that they arrive
@@ -1282,7 +1294,9 @@ Twilio's documentation and encoded in tests with synthetic payloads:
 ## Known follow-ups
 
 - **Inbound minutes.** The caller's inbound leg of a callback is not metered (no inbound rate on the card); add a
-  `voice_minute_inbound` rate and meter it from `/inbound-status`'s parent call. Inbound callbacks also have no
+  `voice_minute_inbound` rate. `/inbound-status` is the callback of the CHILD (member) leg; the caller's parent leg has no
+  `statusCallback`, so metering it needs one on that leg (set on the number or on the call), or the bridged member leg's duration
+  as a proxy. Inbound callbacks also have no
   per-caller or per-org rate limit; see [Inbound callbacks](#inbound-callbacks).
 - **Stuck-record cleanup.** A documented sweep for records live longer than a
   call can last (and reconciliation of their Twilio legs). No cron exists.

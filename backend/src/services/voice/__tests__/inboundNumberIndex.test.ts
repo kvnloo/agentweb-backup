@@ -33,14 +33,55 @@ describe('findOrgIdByCallerNumber', () => {
     expect(scan).toHaveBeenCalledTimes(1);
   });
 
-  it('rescans once the snapshot is older than 60 seconds and sees a number added meanwhile', async () => {
+  const settle = async () => { for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve)); };
+
+  it('serves the stale snapshot once it is older than 60 seconds and refreshes it in the background', async () => {
     await expect(findOrgIdByCallerNumber('+14155550113')).resolves.toBeNull();
     scan.mockResolvedValue([{ orgId: 'org-c', twilioNumber: '+14155550113' }]);
     now += 59_999;
     await expect(findOrgIdByCallerNumber('+14155550113')).resolves.toBeNull();
+    expect(scan).toHaveBeenCalledTimes(1);
     now += 1;
+    // Answered from the stale snapshot, not from the scan the call triggers.
+    await expect(findOrgIdByCallerNumber('+14155550113')).resolves.toBeNull();
+    await settle();
+    expect(scan).toHaveBeenCalledTimes(2);
     await expect(findOrgIdByCallerNumber('+14155550113')).resolves.toBe('org-c');
     expect(scan).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not wait for the refresh: the call is answered while the scan is still running', async () => {
+    await findOrgIdByCallerNumber(A);
+    let finish!: (rows: unknown[]) => void;
+    scan.mockReturnValue(new Promise((resolve) => { finish = resolve; }));
+    now += 60_000;
+    await expect(findOrgIdByCallerNumber(A)).resolves.toBe('org-a');
+    await expect(findOrgIdByCallerNumber(B)).resolves.toBe('org-b');
+    expect(scan).toHaveBeenCalledTimes(2); // one refresh in flight, shared
+    finish([{ orgId: 'org-c', twilioNumber: A }]);
+    await settle();
+    await expect(findOrgIdByCallerNumber(A)).resolves.toBe('org-c');
+  });
+
+  it('keeps serving the stale snapshot when a refresh fails, logs only the error name, and retries no more than every 5 seconds', async () => {
+    await findOrgIdByCallerNumber(A);
+    scan.mockRejectedValue(Object.assign(new Error('secret detail'), { name: 'ThrottlingException' }));
+    now += 60_000;
+    for (let i = 0; i < 10; i++) await expect(findOrgIdByCallerNumber(A)).resolves.toBe('org-a');
+    await settle();
+    expect(scan).toHaveBeenCalledTimes(2);
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(errorSpy.mock.calls)).toContain('ThrottlingException');
+    expect(JSON.stringify(errorSpy.mock.calls)).not.toContain('secret detail');
+    now += 4_999;
+    await findOrgIdByCallerNumber(A);
+    await settle();
+    expect(scan).toHaveBeenCalledTimes(2);
+    now += 1;
+    scan.mockResolvedValue([{ orgId: 'org-d', twilioNumber: A }]);
+    await findOrgIdByCallerNumber(A);
+    await settle();
+    await expect(findOrgIdByCallerNumber(A)).resolves.toBe('org-d');
   });
 
   it('shares one scan between concurrent lookups', async () => {
@@ -61,10 +102,17 @@ describe('findOrgIdByCallerNumber', () => {
     await expect(findOrgIdByCallerNumber('4155550111')).resolves.toBeNull();
   });
 
-  it('propagates a failed scan and does not cache the failure', async () => {
+  it('a failed first scan (no snapshot) throws, is not cached, and the next lookup scans again', async () => {
     scan.mockRejectedValueOnce(new Error('throttled'));
     await expect(findOrgIdByCallerNumber(A)).rejects.toThrow('throttled');
     await expect(findOrgIdByCallerNumber(A)).resolves.toBe('org-a');
     expect(scan).toHaveBeenCalledTimes(2);
+  });
+
+  it('concurrent first lookups share one scan, including when it fails', async () => {
+    scan.mockRejectedValueOnce(new Error('throttled'));
+    const results = await Promise.allSettled([findOrgIdByCallerNumber(A), findOrgIdByCallerNumber(B)]);
+    expect(results.map((r) => r.status)).toEqual(['rejected', 'rejected']);
+    expect(scan).toHaveBeenCalledTimes(1);
   });
 });
