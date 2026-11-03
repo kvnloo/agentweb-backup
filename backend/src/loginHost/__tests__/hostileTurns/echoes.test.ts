@@ -23,6 +23,15 @@ const echoScript = (mb: number, n: number, gapMs: number) => `module.exports = a
   h.out(${JSON.stringify(RESULT)});
 };`;
 
+/** A tool result whose wire form is mb MiB where EVERY OTHER character is a backslash (a body of quote characters: each is escaped as \\"). The worst honest-looking string for JSON.parse. */
+const escScript = (mb: number, n: number) => `module.exports = async (h) => {
+  const body = '"'.repeat(${mb} * 512 * 1024);
+  for (let i = 0; i < ${n}; i++) {
+    h.out(JSON.stringify({type:"user",message:{content:[{type:"tool_result",tool_use_id:"toolu_"+i,content:body}]}}) + "\\n");
+  }
+  h.out(${JSON.stringify(RESULT)});
+};`;
+
 (process.env.AW_MEASURE_ECHOES ? describe : describe.skip)("honest echoes against the CPU meter (measurement)", () => {
   it.each([
     [6, 10, 0],
@@ -35,5 +44,16 @@ const echoScript = (mb: number, n: number, gapMs: number) => `module.exports = a
     console.log(`RESULT ECHO ${mb}MB x${n}: wall ${r.wallMs.toFixed(0)}ms hostCpu ${r.cpuMs.toFixed(0)}ms charged ${charged.toFixed(0)}ms of ${CPU_BURST_MS} (${((100 * charged) / CPU_BURST_MS).toFixed(0)}%) exhausted=${r.meterExhausted} result=${JSON.stringify(r.result)} logs=${r.logs.map((l) => l.event).join(",")}`);
     expect(r.meterExhausted).toBe(false);
     expect(r.result).toMatchObject({ type: "result", ok: true });
+  });
+
+  it.each([
+    [12, 1],
+    [12, 2],
+    [12, 5],
+  ])("esc%i (every other character escaped) x %i back to back", async (mb, n) => {
+    const r = await runTurn(makeRig(), escScript(mb, n));
+    const charged = CPU_BURST_MS - r.meterRemaining;
+    console.log(`RESULT ECHO esc${mb} x${n}: wall ${r.wallMs.toFixed(0)}ms hostCpu ${r.cpuMs.toFixed(0)}ms charged ${charged.toFixed(0)}ms of ${CPU_BURST_MS} (${((100 * charged) / CPU_BURST_MS).toFixed(0)}%) exhausted ${r.meterExhausted}`);
+    expect(r.result).toBeDefined();
   });
 });

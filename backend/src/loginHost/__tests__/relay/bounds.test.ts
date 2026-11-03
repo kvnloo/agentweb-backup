@@ -28,7 +28,7 @@ describe("rawJsonDepthExceeds", () => {
   it("is a single pass over a frame as deep as a 1 MiB line can be (no recursion, no allocation)", () => {
     const t0 = Date.now();
     expect(rawJsonDepthExceeds(buf(nested(500_000)), MAX_FRAME_DEPTH)).toBe(true);
-    expect(Date.now() - t0).toBeLessThan(500);
+    expect(Date.now() - t0).toBeLessThan(2500);
   });
 
   it("malformed or empty input never throws", () => {

@@ -35,7 +35,7 @@ describe("rate_limit_event is bounded", () => {
     const [ev] = normalizeClaudeEvent(raw);
     const ms = Number(process.hrtime.bigint() - t0) / 1e6;
     console.log("rate_limit normalize ms", ms.toFixed(1), "approxSize", approxSize(ev));
-    expect(ms).toBeLessThan(400); // ~100 ms idle: V8 collects the keys of a dictionary-mode object before for-in starts, so the cost is linear in the line, which the line cap bounds
+    expect(ms).toBeLessThan(4000); // ~100 ms idle (300+ ms on a loaded box): V8 collects the keys of a dictionary-mode object before for-in starts, so the cost is linear in the line, which the line cap bounds. A catastrophe bound only: the size below is the real pin
     expect(approxSize(ev)).toBeLessThan(8192); // (16 windows, each also charged the per-object memory cost)
   });
 

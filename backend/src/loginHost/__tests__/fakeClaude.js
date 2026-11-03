@@ -136,7 +136,7 @@ if (args[0] === "auth" && args[1] === "login") {
       process.stdout.write(delayed);
       process.exit(st.loggedIn === false ? 1 : 0);
     }, scenario.statusDelayMs);
-  } else if (scenario.statusHang) setInterval(() => {}, 1000);
+  } else if (scenario.statusHang) setTimeout(() => process.exit(1), 20000); // hangs (a test that makes the host's kill fail would otherwise leave this process behind for ever); no test waits that long
   else if (scenario.statusRaw !== undefined) process.stdout.write(scenario.statusRaw);
   else process.stdout.write(JSON.stringify(st) + "\n");
   if (!scenario.statusHang && !scenario.statusDelayMs) process.exit(st.loggedIn === false ? 1 : 0);

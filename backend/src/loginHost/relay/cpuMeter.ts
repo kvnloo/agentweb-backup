@@ -9,6 +9,8 @@
  * 12 MB echoes were charged 2-3x their CPU time and 5 of them in a row were killed. Now a section is charged min(wall, the thread's CPU time) and the burst is 1000 ms.
  * Measured with real child processes on a loaded 12-core machine (load average 3-22): a 12 MB echo is ~50-110 ms of CPU, five in a row ~300 ms (23-55% of the burst, the
  * high end with a CPU-hungry process pinned to the same core), three 15 MB echoes ~250-370 ms, ten 6 MB echoes ~300-430 ms.
+ * The worst legal string, 12 MiB where every other character is escaped (a body of quote characters), is ~520 ms of CPU: one is survived (41-67% of the burst, idle or
+ * with 1-3 pinned competitors), two in a row are not (the old wall-clock 500 ms meter killed even one). The real CLI cannot produce it (`--tools ""`, MCP output cap).
  *  - an honest turn is a few thousand tiny events (about 0.05-0.2 ms each) over minutes plus the odd big tool result echoed once: a few of those fit the burst, and the
  *    refill covers the small events many times over;
  *  - a hostile turn can take 1 s of loop once and 5% of it afterwards before it is killed (`cpu_budget`). CAPACITY: it takes 20 concurrent hostile turns, each running
