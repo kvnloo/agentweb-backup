@@ -9,6 +9,8 @@
  * escaped or reduced to one line, because a contact controls those words.
  */
 
+import { sliceSafe, stripUnsafeChars } from "./smartleadSafeText";
+
 export interface SmartleadReplyAlertInput {
   /** What AgentWeb calls the contact (a name, else the address). */
   leadName: string;
@@ -39,10 +41,10 @@ export const isSmartleadReplyAlert = (eventType: string, eventData: unknown): bo
 const escapeHtml = (value: string): string =>
   value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 
-/** One line, no control characters (a name or subject must never be able to add a header line), trimmed and shortened. */
+/** One line: no control, zero-width or direction-changing characters (a name or subject must never add a header line or reorder the text), trimmed and shortened. */
 const oneLine = (value: unknown, max: number): string => {
-  const cleaned = String(value ?? "").replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, " ").replace(/\s+/g, " ").trim();
-  return cleaned.length > max ? `${cleaned.slice(0, max - 1).trimEnd()}\u2026` : cleaned;
+  const cleaned = stripUnsafeChars(String(value ?? "")).replace(/\s+/g, " ").trim();
+  return cleaned.length > max ? `${sliceSafe(cleaned, max - 1).trimEnd()}\u2026` : cleaned;
 };
 
 /** "Nov 3, 2026, 9:23 AM UTC". The zone is always shown: no timezone is stored for a user. Undefined when the time is missing or unreadable. */
@@ -59,19 +61,26 @@ const NOTE_WITH_REPLY = "Smartlead keeps the full thread. Open your Smartlead in
 const NOTE_WITHOUT_REPLY = "Smartlead keeps the full reply. Open your Smartlead inbox to read it and answer.";
 /** The most of a reply the email shows. */
 const REPLY_SHOWN_MAX = 600;
+const REPLY_SHOWN_LINES = 15;
+const CAPTION = "Written by the contact. AgentWeb has not checked it or any link in it.";
 
-/** The reply text as it is shown: normalized line breaks, at most REPLY_SHOWN_MAX characters, cut at a word where there is one. */
+/** The reply text as it is shown: safe characters, line breaks normalized, blank runs shrunk, at most REPLY_SHOWN_LINES lines and REPLY_SHOWN_MAX characters, cut at a word where there is one. */
 const shownReply = (value: unknown): string => {
-  const cleaned = String(value ?? "")
-    .replace(/\r\n?/g, "\n")
-    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\u2028\u2029]/g, "")
-    .replace(/[ \t]+\n/g, "\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-  if (cleaned.length <= REPLY_SHOWN_MAX) return cleaned;
-  const cut = cleaned.slice(0, REPLY_SHOWN_MAX - 1);
-  const space = cut.lastIndexOf(" ");
-  return `${(space > REPLY_SHOWN_MAX * 0.6 ? cut.slice(0, space) : cut).trimEnd()}\u2026`;
+  const lines = stripUnsafeChars(String(value ?? "")).replace(/\r\n?/g, "\n").split("\n").map(line => line.trimEnd());
+  let cleaned = lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  let cut = false;
+  const kept = cleaned.split("\n");
+  if (kept.length > REPLY_SHOWN_LINES) {
+    cleaned = kept.slice(0, REPLY_SHOWN_LINES).join("\n").trimEnd();
+    cut = true;
+  }
+  if (cleaned.length > REPLY_SHOWN_MAX) {
+    const head = sliceSafe(cleaned, REPLY_SHOWN_MAX - 1);
+    const space = head.lastIndexOf(" ");
+    cleaned = (space > REPLY_SHOWN_MAX * 0.6 ? head.slice(0, space) : head).trimEnd();
+    cut = true;
+  }
+  return cut ? `${cleaned}\u2026` : cleaned;
 };
 
 export function buildSmartleadReplyAlertEmail(input: SmartleadReplyAlertInput): AlertEmailContent {
@@ -107,7 +116,7 @@ export function buildSmartleadReplyAlertEmail(input: SmartleadReplyAlertInput): 
     intro,
     "",
     ...rows.map(([label, value]) => `${label}: ${value}`),
-    ...(reply ? ["", "Their reply:", ...reply.split("\n").map(line => `> ${line}`)] : []),
+    ...(reply ? ["", "Their reply:", ...reply.split("\n").map(line => `> ${line}`), `(${CAPTION})`] : []),
     ...(url ? ["", `View contact in AgentWeb: ${url}`] : []),
     "",
     note,
@@ -124,12 +133,14 @@ export function buildSmartleadReplyAlertEmail(input: SmartleadReplyAlertInput): 
     .join("");
   const replyHtml = reply
     ? `<p style="margin:0 0 6px;font-size:13px;color:#52606d;">Their reply</p>` +
-      `<div style="margin:0 0 18px;padding:10px 14px;border-left:4px solid #1976d2;background-color:#f1f5f9;font-size:14px;line-height:1.55;color:#1f2933;white-space:pre-wrap;word-break:break-word;">${escapeHtml(reply)}</div>`
+      `<div style="margin:0 0 4px;padding:10px 14px;border-left:4px solid #9aa5b1;background-color:#f1f5f9;font-size:14px;line-height:1.55;color:#1f2933;word-break:break-word;">${escapeHtml(reply).replace(/\n/g, "<br>")}</div>` +
+      `<p style="margin:0 0 18px;font-size:12px;line-height:1.4;color:#616e7c;">${escapeHtml(CAPTION)}</p>`
     : "";
   const button = url
     ? `<p style="margin:0 0 18px;"><a href="${escapeHtml(url)}" style="display:inline-block;background-color:#1976d2;color:#ffffff;text-decoration:none;padding:12px 22px;border-radius:4px;font-size:15px;font-weight:bold;">View contact in AgentWeb</a></p>`
     : "";
-  const preheader = escapeHtml(reply ? reply.replace(/\s+/g, " ").slice(0, 140) : replySubject || intro);
+  // The inbox preview line is fixed wording: the contact's own text must never be able to pose as AgentWeb there.
+  const preheader = escapeHtml(`${oneLine(who || "A contact", 60)} replied to your campaign`);
 
   const html =
     `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${escapeHtml(subject)}</title></head>` +
