@@ -98,7 +98,8 @@ const QUOTED_LINE = /^\s*>/;
 const WROTE_HEADER = /^\s*(On|Le|El|Am|Il)\s.{3,300}$/;
 // German puts the name after the verb: "Am 03.11.2026 um 09:23 schrieb Max Mustermann <max@x.de>:".
 const WROTE_END = /(wrote|a \u00e9crit|escribi\u00f3|ha scritto)\s*:\s*$|schrieb\b[^:]{0,200}:\s*$/i;
-const WROTE_NEXT = /^\s*\S{0,120}\s*(wrote|a \u00e9crit|escribi\u00f3|schrieb|ha scritto)\s*:\s*$/i;
+// The optional token group starts with a non-space, so the leading and the inner whitespace can never split the same run of spaces (that made an earlier form quadratic).
+const WROTE_NEXT = /^\s*(?:\S{1,120}\s*)?(wrote|a \u00e9crit|escribi\u00f3|schrieb|ha scritto)\s*:\s*$/i;
 const GERMAN_NEXT = /^\s*\S{0,120}:\s*$/;
 const ORIGINAL_RULE = /^\s*(-{2,}\s*(original message|forwarded message)\s*-{2,}|_{10,})\s*$/i;
 const OUTLOOK_FROM = /^\s*From:\s.+/i;
