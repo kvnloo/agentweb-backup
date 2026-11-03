@@ -2412,7 +2412,7 @@ emmaToolRegistry.register({
         },
         chapter_id: {
           type: 'string',
-          description: 'Optional: The unique identifier (chapterId) of the chapter. If provided, generates chapter content. If not provided, generates section content.'
+          description: 'The unique identifier (chapterId) of the chapter. REQUIRED whenever the user asks for a specific chapter: pass its chapterId from get_book_details, otherwise section-level content is written instead. Omit only for section-level content.'
         },
         content_description: {
           type: 'string',

@@ -187,6 +187,8 @@ export async function getBookContent(
   chapterId: string | undefined,
   userId: string
 ): Promise<any> {
+  // ENG-2790: treat empty/null chapter_id as absent so section content is stored and read under one key.
+  chapterId = chapterId || undefined;
   try {
     console.log('AgentMode: Getting book content for:', { bookId, sectionId, chapterId });
 
@@ -273,6 +275,8 @@ export async function updateBookContent(
   replacementInstructions: any[],
   userId: string
 ): Promise<any> {
+  // ENG-2790: treat empty/null chapter_id as absent so section content is stored and read under one key.
+  chapterId = chapterId || undefined;
   try {
     // Validate that replacementInstructions is an array
     if (!Array.isArray(replacementInstructions)) {
@@ -410,6 +414,8 @@ export async function generateBookContent(
   researchUrl?: string,
   sessionId?: string
 ): Promise<any> {
+  // ENG-2790: treat empty/null chapter_id as absent so section content is stored and read under one key.
+  chapterId = chapterId || undefined;
   try {
     console.log('AgentMode: Generating book content for:', { bookId, sectionId, chapterId, length, imagine, userId, researchUrl: researchUrl ? 'provided' : 'not provided' });
 
