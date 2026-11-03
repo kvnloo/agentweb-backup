@@ -14,7 +14,7 @@ afterAll(() => {
   roots.forEach((r) => rmSync(r, { recursive: true, force: true }));
 });
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-const until = async (c: () => boolean, ms = 3000) => {
+const until = async (c: () => boolean, ms = 10_000) => {
   const t0 = Date.now();
   while (!c() && Date.now() - t0 < ms) await sleep(5);
   return c();

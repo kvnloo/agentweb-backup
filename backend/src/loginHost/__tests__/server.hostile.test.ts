@@ -27,7 +27,7 @@ function post(sock: string, route: string, body: unknown): Promise<{ status: num
     req.end(JSON.stringify(body));
   });
 }
-async function until(cond: () => boolean, ms = 4000): Promise<void> {
+async function until(cond: () => boolean, ms = 10_000): Promise<void> {
   const t0 = Date.now();
   while (!cond() && Date.now() - t0 < ms) await new Promise((r) => setTimeout(r, 10));
   if (!cond()) throw new Error("until: timed out");

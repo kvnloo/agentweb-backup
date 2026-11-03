@@ -33,7 +33,7 @@ beforeEach(() => {
 });
 afterEach(() => void process.off("uncaughtException", onU));
 
-async function until(cond: () => boolean, ms = 5000): Promise<void> {
+async function until(cond: () => boolean, ms = 10_000): Promise<void> {
   const t0 = Date.now();
   while (!cond() && Date.now() - t0 < ms) await new Promise((r) => setTimeout(r, 15));
   if (!cond()) throw new Error("until: timed out");

@@ -80,7 +80,10 @@ describe("valid giant event lines", () => {
     console.log("RESULT strings", JSON.stringify({ ...m, ...r.stats(), errors: r.errors }));
     expect(r.errors).toHaveLength(1);
     expect(["stdout_flood", "cpu_budget"]).toContain(r.errors[0]); // the byte bucket ends it; on a loaded machine the CPU meter (2 s of loop) may get there first
-    expect(r.stats().parsed).toBeLessThanOrEqual(72); // the 64 MiB burst
+    // The byte bucket refills on the WALL clock (4 MiB/s), so the lines let through are the 64 MiB burst plus 4 per second the pump took (+2 for the line that was
+    // in flight): a fixed 72 holds only if the pump finishes within 2 s, which a starved runner does not. 400 lines is what a missing bucket would let through.
+    const allowed = Math.ceil(64 + (4 * m.ms) / 1000) + 2; // literals on purpose: a changed constant is noticed (burst 64 MiB, refill 4 MiB/s)
+    expect(r.stats().parsed).toBeLessThanOrEqual(allowed);
   });
 
   it("an honest stream is untouched: a few big result lines and many small events in 3 s", async () => {

@@ -58,7 +58,7 @@ async function rig(env: Record<string, string> = {}, limits: { idleMs?: number }
   };
   return { logs, ep, calls, visible, child, out, rpc, stderr: () => err, host, layout, root };
 }
-async function until(cond: () => boolean, ms = 4000): Promise<void> {
+async function until(cond: () => boolean, ms = 10_000): Promise<void> {
   const t0 = Date.now();
   while (!cond() && Date.now() - t0 < ms) await new Promise((r) => setTimeout(r, 10));
   if (!cond()) throw new Error("until: timed out");

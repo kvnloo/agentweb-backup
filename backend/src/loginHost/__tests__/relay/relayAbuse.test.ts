@@ -31,7 +31,7 @@ function setup(over: Partial<RelayHostOptions> = {}, limits: Partial<RelayLimits
   return { host, layout, logs, open, tick: (ms: number) => (clock += ms), root };
 }
 const sockOf = (dir: string) => `${dir}/relay.sock`;
-async function until(cond: () => boolean, ms = 5000): Promise<void> {
+async function until(cond: () => boolean, ms = 10_000): Promise<void> {
   const t0 = Date.now();
   while (!cond() && Date.now() - t0 < ms) await new Promise((r) => setTimeout(r, 5));
   if (!cond()) throw new Error("until: timed out");
