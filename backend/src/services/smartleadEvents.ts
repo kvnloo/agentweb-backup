@@ -91,8 +91,8 @@ function canonicalJson(v: unknown): string {
 /** The most of a reply an event carries. The alert email shows less. */
 export const REPLY_TEXT_MAX = 1000;
 
-// Where the quoted thread under a reply starts: a quoted line, "On <date>, <name> wrote:" (which a mail client may wrap so that the name and address, or
-// just "wrote:", are alone on the next line), the same in English, French, Spanish, German and Italian, an "Original Message" or underscore rule, or an
+// Where the quoted thread under a reply starts: a quoted line, "On <date>, <name> wrote:" (which a mail client may wrap so that a single word or address, or
+// just "wrote:", is alone on the next line), the same in English, French, Spanish, German and Italian, an "Original Message" or underscore rule, or an
 // Outlook "From: ... Sent: ... To: ..." block. Every pattern is bounded, so none can take long on a hostile line.
 const QUOTED_LINE = /^\s*>/;
 const WROTE_HEADER = /^\s*(On|Le|El|Am|Il)\s.{3,300}$/;
