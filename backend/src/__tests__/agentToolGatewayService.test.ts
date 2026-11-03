@@ -387,7 +387,7 @@ describe('agentToolGatewayService', () => {
             toolName: 'playwright_browser_fill_form',
             args: { elements: fieldList },
             inputSchema: fillFormSchema,
-            effect: 'write',
+            effect: 'internal_write',
           });
           expect(result.status).toBe('repaired');
           expect(result.args).toEqual({ fields: fieldList });
@@ -410,7 +410,7 @@ describe('agentToolGatewayService', () => {
             toolName: 'playwright_browser_fill_form',
             args: { fields: fieldList, bogus: 1 },
             inputSchema: fillFormSchema,
-            effect: 'write',
+            effect: 'internal_write',
           });
           expect(result.status).toBe('invalid');
         });
