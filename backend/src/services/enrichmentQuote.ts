@@ -81,8 +81,9 @@ export async function priceEnrichment(
   deps: QuoteDeps,
   { userId, listId, leadIds }: QuoteParams,
 ): Promise<{ estimate: EnrichmentCostEstimate; config: EnrichmentConfig | undefined; leadCount: number }> {
-  const { count, emailless } = await inspectLeads(deps, listId, leadIds);
+  // Config first: if it cannot be read there is nothing to quote, so fail before paying for a pass over the list.
   const config = await deps.getSavedConfig(listId, userId);
+  const { count, emailless } = await inspectLeads(deps, listId, leadIds);
   const model = await enrichmentModelFor(userId);
   const estimate = estimateEnrichmentCost(listId, count, {
     userId,

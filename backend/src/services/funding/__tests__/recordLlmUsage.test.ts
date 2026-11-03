@@ -247,8 +247,28 @@ describe('recordLlmUsage (ENG-1816 F1)', () => {
   });
 
   describe('openRouterByokCostUsd (ENG-2720: upstream tokens plus OpenRouter\'s own charge)', () => {
-    it('adds the router charge (web-search fee) to the upstream bill', () => {
-      expect(openRouterByokCostUsd({ cost: 0.007, cost_details: { upstream_inference_cost: 0.00049 } })).toBeCloseTo(0.00749, 8);
+    it('adds the router charge (web-search fee) to the upstream bill when the response reports the server tool use', () => {
+      // the shape of a real response: Exa search fee $0.007, token bill $0.0005, one search reported
+      expect(openRouterByokCostUsd({ cost: 0.007, cost_details: { upstream_inference_cost: 0.00049 }, server_tool_use_details: { web_search_requests: 1, tool_calls_executed: 1 } })).toBeCloseTo(0.00749, 8);
+      expect(openRouterByokCostUsd({ cost: 0.005, cost_details: { upstream_inference_cost: 0.0007 }, server_tool_use_details: { web_search_requests: 1 } })).toBeCloseTo(0.0057, 8);
+    });
+    it('adds a platform fee that is smaller than the token bill even without a server tool', () => {
+      expect(openRouterByokCostUsd({ cost: 0.0005, cost_details: { upstream_inference_cost: 0.01 } })).toBeCloseTo(0.0105, 8);
+    });
+    it('never books the same call twice: a router charge at least the whole upstream bill with no server tool use is taken as already containing it', () => {
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      // the shape an automated checker replayed: charge == upstream, no tool use
+      expect(openRouterByokCostUsd({ cost: 0.0068, cost_details: { upstream_inference_cost: 0.0068 } })).toBe(0.0068);
+      // a larger charge with nothing to explain it
+      expect(openRouterByokCostUsd({ cost: 0.02, cost_details: { upstream_inference_cost: 0.0068 } })).toBe(0.0068);
+      // server_tool_use_details present but empty / zero is not a tool use
+      expect(openRouterByokCostUsd({ cost: 0.0068, cost_details: { upstream_inference_cost: 0.0068 }, server_tool_use_details: {} })).toBe(0.0068);
+      expect(openRouterByokCostUsd({ cost: 0.0068, cost_details: { upstream_inference_cost: 0.0068 }, server_tool_use_details: { web_search_requests: 0 } })).toBe(0.0068);
+      expect(warn).toHaveBeenCalledTimes(1); // one-time warning, not one per call
+      warn.mockRestore();
+    });
+    it('still adds the charge when it equals the token bill but a server tool really ran', () => {
+      expect(openRouterByokCostUsd({ cost: 0.007, cost_details: { upstream_inference_cost: 0.007 }, server_tool_use_details: { web_search_requests: 1 } })).toBeCloseTo(0.014, 8);
     });
     it('returns the upstream bill alone when OpenRouter charged nothing or an unusable amount', () => {
       for (const cost of [0, -1, NaN, Infinity, undefined, '0.007' as unknown as number]) {

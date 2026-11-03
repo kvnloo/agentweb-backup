@@ -26,6 +26,13 @@ describe('CRM_ENRICH_V3_WEB_SEARCH_PARAMS parsing (ENG-2720)', () => {
     expect(parseWebSearchParams('{"max_results":50,"engine":"parallel"}')).toEqual({ engine: 'parallel' });
   });
 
+  it('drops prototype-pollution style and injection keys without touching Object.prototype', () => {
+    const hostile = '{"__proto__":{"polluted":1},"constructor":{"prototype":{"polluted":1}},"toString":"x","type":"evil","tools":[],"model":"x","parameters":{"engine":"exa"},"engine":"parallel"}';
+    expect(parseWebSearchParams(hostile)).toEqual({ engine: 'parallel' });
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+    expect(Object.prototype.hasOwnProperty.call(Object.prototype, 'polluted')).toBe(false);
+  });
+
   it('ignores invalid JSON and non-objects', () => {
     expect(parseWebSearchParams('{nope')).toBeUndefined();
     expect(parseWebSearchParams('[1,2]')).toBeUndefined();

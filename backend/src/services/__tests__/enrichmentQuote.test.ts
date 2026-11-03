@@ -153,6 +153,7 @@ describe('priceEnrichment', () => {
     await expect(priceEnrichment(d, { userId: 'u1', listId: 'l' })).rejects.toThrow(/filter/);
     await expect(quoteEnrichment(d, { userId: 'u1', listId: 'l' })).rejects.toThrow(/filter/);
     expect(check).not.toHaveBeenCalled();
+    expect(d.pages).toBe(0); // the config is read first, so a failure does not pay for a pass over the list
   });
 
   it('does not touch the usage ledger (the enrich-time token check must stay cheap)', async () => {

@@ -257,6 +257,30 @@ describe('AgentModeService.callLLM — OpenRouter provider + cost (ENG-9)', () =
     expect(call.costUsdOverride).toBeCloseTo(0.00567525, 8);
   });
 
+  it('books a BYOK call once when the router charge equals the token bill and no server tool ran (never twice)', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    create.mockResolvedValue({
+      id: 'gen-byok-same-figure',
+      usage: {
+        prompt_tokens: 1000,
+        completion_tokens: 100,
+        cost: 0.0068,
+        is_byok: true,
+        cost_details: { upstream_inference_cost: 0.0068 },
+      },
+      choices: [{ message: { content: 'ok' } }],
+    });
+    (svc as any).llmModels[OR_MODEL].client = { chat: { completions: { create } } };
+
+    await svc.callLLM(OR_MODEL, [{ role: 'user', content: 'hi' }], {
+      usageContext: { userId: 'u1', feature: 'agent_task' },
+    });
+
+    const call = mockMeterUser.mock.calls[mockMeterUser.mock.calls.length - 1][0];
+    expect(call.costUsdOverride).toBe(0.0068);
+    warn.mockRestore();
+  });
+
   it('does not double count on a non-BYOK response: usage.cost is already the total', async () => {
     create.mockResolvedValue({
       id: 'gen-managed-search',

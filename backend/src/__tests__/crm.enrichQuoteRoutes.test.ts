@@ -154,6 +154,25 @@ describe('no dollar or vendor leakage from customer-reachable bodies', () => {
     expect(ok.status).toBe(200);
     expect(mockRun).toHaveBeenCalledTimes(1);
   });
+  it('with ENRICH_V3_REQUIRE_COST_CONFIRMATION=true a missing or non-string token is refused with the four customer fields only', async () => {
+    const saved = process.env.ENRICH_V3_REQUIRE_COST_CONFIRMATION;
+    process.env.ENRICH_V3_REQUIRE_COST_CONFIRMATION = 'true';
+    try {
+      for (const body of [{}, { confirmEstimateToken: 12345 }, { confirmEstimateToken: ['x'] }, { confirmEstimateToken: '' }]) {
+        const r = await request(app).post('/api/crm/lists/victim-list/leads/enrich-v3').send(body);
+        expect(r.status).toBe(409);
+        expect(Object.keys(r.body.estimate).sort()).toEqual(['confirmationToken', 'estimatedPercentOfAllowance', 'leadCount', 'withinAllowance']);
+        expect(JSON.stringify(r.body)).not.toMatch(DOLLARISH);
+      }
+      expect(mockRun).not.toHaveBeenCalled();
+      const q = await request(app).post('/api/crm/lists/victim-list/leads/enrich-v3/estimate').send({});
+      const ok = await request(app).post('/api/crm/lists/victim-list/leads/enrich-v3').send({ confirmEstimateToken: q.body.confirmationToken });
+      expect(ok.status).toBe(200);
+      expect(mockRun).toHaveBeenCalledTimes(1);
+    } finally {
+      if (saved === undefined) delete process.env.ENRICH_V3_REQUIRE_COST_CONFIRMATION; else process.env.ENRICH_V3_REQUIRE_COST_CONFIRMATION = saved;
+    }
+  });
   it('another user\'s token is rejected (bound to the user)', async () => {
     const q = await request(app).post('/api/crm/lists/victim-list/leads/enrich-v3/estimate').send({});
     mockUser.userId = 'someone-else';

@@ -93,6 +93,12 @@ describe('estimateEnrichmentCost (ENG-2716)', () => {
       expect(estimateEnrichmentCost('l', 10, { userId: 'u2' }).confirmationToken).not.toBe(a);
     });
 
+    it('does not collide when a delimiter appears inside the user or list id', () => {
+      const a = estimateEnrichmentCost('c', 10, { userId: 'a:b' }).confirmationToken;
+      const b = estimateEnrichmentCost('b:c', 10, { userId: 'a' }).confirmationToken;
+      expect(a).not.toBe(b);
+    });
+
     it('is not the old unkeyed hash, so it cannot be inverted by trying every cent total', () => {
       const est = estimateEnrichmentCost('list-1', 112, { userId: 'u1' });
       const unkeyed = (total: number) => createHash('sha256').update(`enrich-v3-estimate:v1:list-1:112:${total.toFixed(2)}`).digest('hex').slice(0, 32);
@@ -117,7 +123,7 @@ describe('estimateEnrichmentCost (ENG-2716)', () => {
       const { createHmac } = require('crypto');
       const est = estimateEnrichmentCost('list-1', 112, { userId: 'u1' });
       const direct = createHmac('sha256', process.env.JWT_SECRET as string)
-        .update(`enrich-v3-estimate:v2:u1:list-1:112:${est.totalUsd.toFixed(2)}`).digest('hex').slice(0, 32);
+        .update(JSON.stringify(['enrich-v3-estimate:v3', 'u1', 'list-1', 112, est.totalUsd.toFixed(2)])).digest('hex').slice(0, 32);
       expect(est.confirmationToken).not.toBe(direct);
     });
 

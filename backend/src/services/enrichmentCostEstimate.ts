@@ -141,7 +141,8 @@ export function confirmationTokenFor(userId: string, listId: string, leadCount: 
   // A derived subkey keeps this use of the shared secret separate from JWT signing (domain separation).
   const key = createHmac('sha256', getJwtSecret()).update('agentweb:enrich-v3-quote-token:key:v1').digest();
   return createHmac('sha256', key)
-    .update(`enrich-v3-estimate:v2:${userId}:${listId}:${leadCount}:${totalUsd.toFixed(2)}`)
+    // JSON-encoded tuple, not a ':'-joined string: ('a:b','c') and ('a','b:c') must not produce the same token.
+    .update(JSON.stringify(['enrich-v3-estimate:v3', userId, listId, leadCount, totalUsd.toFixed(2)]))
     .digest('hex')
     .slice(0, 32);
 }

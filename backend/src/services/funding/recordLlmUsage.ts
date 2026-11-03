@@ -35,6 +35,15 @@ export function customerUpstreamCost(usage: {
     : {};
 }
 
+/** Whether the response reports that OpenRouter executed a server tool (web search...) for this call. */
+function reportsServerToolUse(usage: { server_tool_use_details?: unknown }): boolean {
+  const details = usage?.server_tool_use_details;
+  if (!details || typeof details !== 'object') return false;
+  return Object.values(details as Record<string, unknown>).some(v => typeof v === 'number' && Number.isFinite(v) && v > 0);
+}
+
+let warnedImplausibleRouterCharge = false;
+
 /**
  * AgentWeb's own total cost of one OpenRouter call served on a BYOK key, in USD (ENG-2720).
  *
@@ -44,6 +53,16 @@ export function customerUpstreamCost(usage: {
  * Firecrawl and Parallel engines, plus any BYOK platform fee). Both are AgentWeb expenses.
  * Reading only the upstream figure left the web-search fee out of the ledger entirely: on a
  * real Luna enrichment run the fee was ~$1.1 against ~$0.2 of recorded tokens.
+ *
+ * Guard against double counting: every real response observed has a router charge that is either 0,
+ * a search fee reported together with a server-tool use ($0.007 Exa, $0.005 Parallel, usually larger
+ * than the token bill), or a platform fee well below the token bill. A router charge that is AT LEAST the
+ * whole upstream bill and comes with NO reported server-tool use has nothing to explain it, and is most
+ * likely a figure that already contains the upstream bill (a response-shape change would look exactly
+ * like that). Booking the sum there would charge the customer's allowance, and any pay-as-you-go
+ * invoice, twice for the same call, which is the failure this ticket exists to remove. So in that shape
+ * only the upstream bill is booked, with a one-time warning so a change in OpenRouter's reporting shows
+ * up in the logs instead of silently skewing the ledger.
  *
  * `undefined` when neither bill is reported, so the caller falls back to the price book exactly as
  * before. An unusable OpenRouter charge counts as 0, never as a drop; a fee with no upstream bill is
@@ -55,13 +74,23 @@ export function openRouterByokCostUsd(
   usage: {
     cost?: unknown;
     cost_details?: { upstream_inference_cost?: unknown } | null;
+    server_tool_use_details?: unknown;
   },
   /** Token cost from the price book, used only when the response reports no upstream cost but does charge a fee. */
   tokenCostFallbackUsd?: number,
 ): number | undefined {
   const routerCharge = typeof usage?.cost === 'number' && Number.isFinite(usage.cost) && usage.cost > 0 ? usage.cost : 0;
   const upstream = usage?.cost_details?.upstream_inference_cost;
-  if (typeof upstream === 'number' && Number.isFinite(upstream) && upstream > 0) return upstream + routerCharge;
+  if (typeof upstream === 'number' && Number.isFinite(upstream) && upstream > 0) {
+    if (routerCharge > 0 && routerCharge >= upstream && !reportsServerToolUse(usage)) {
+      if (!warnedImplausibleRouterCharge) {
+        warnedImplausibleRouterCharge = true;
+        console.warn('[openRouterByokCostUsd] BYOK router charge is at least the whole upstream bill with no server tool use reported; booking the upstream bill only (OpenRouter usage shape change?)');
+      }
+      return upstream;
+    }
+    return upstream + routerCharge;
+  }
   // No usable upstream bill. With no fee either, stay undefined so the caller prices tokens from the book exactly
   // as before. With a fee (a search ran), book it on top of the book's token cost rather than dropping it.
   if (routerCharge > 0) {
