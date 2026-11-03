@@ -316,7 +316,7 @@ describe("the CPU meter in the CLI's stdout path (mocked clock)", () => {
   });
 
   it("MUTATION TARGET: the fixed per-read cost (0.08 ms) is charged even when the section is instant: 1,900 reads fit a 2000 ms budget, 1,500 do not fit a 100 ms one", async () => {
-    let t = 5000;
+    const t = 5000;
     const spy = jest.spyOn(performance, "now").mockImplementation(() => t);
     try {
       const errors: string[] = [];

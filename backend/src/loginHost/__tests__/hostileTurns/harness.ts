@@ -39,6 +39,7 @@ export async function runTurn(rig: Rig, script: string, opts: { tools?: ToolDef[
   const elu0 = performance.eventLoopUtilization();
   const cpu0 = process.cpuUsage();
   const t0 = performance.now();
+  let report: RunReport | undefined;
   try {
     for await (const ev of session.turn({ turnId: "t" + Math.floor(Math.random() * 1e9), prompt: "go", model: "sonnet", relay: { tools: opts.tools ?? TOOLS, callTimeoutMs: () => opts.callTimeoutMs ?? 20_000 } })) {
       events.push(ev);
@@ -53,7 +54,7 @@ export async function runTurn(rig: Rig, script: string, opts: { tools?: ToolDef[
     h.disable();
     clearInterval(hb);
     const meter = (session as unknown as { meter: { remaining: number; exhausted: boolean } }).meter;
-    var report: RunReport = {
+    report = {
       events,
       result: events.find((e) => e.type === "result"),
       wallMs,

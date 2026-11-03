@@ -354,7 +354,7 @@ describe("a slow trickle is paid for and killed", () => {
   });
 
   it("MUTATION TARGET: the fixed per-read cost is charged to the meter even when the section itself is instant (a mocked clock that never moves)", async () => {
-    let t = 5000;
+    const t = 5000;
     const spy = jest.spyOn(performance, "now").mockImplementation(() => t);
     try {
       const errors: string[] = [];

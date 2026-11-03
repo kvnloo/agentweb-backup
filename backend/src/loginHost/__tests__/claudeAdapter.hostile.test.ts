@@ -296,7 +296,6 @@ describe("a hostile unit and a hostile CLI together cannot stall the loop by mak
     const w = await withWaitingCall({ q: "x" }, 20);
     w.canonical.mockClear();
     (w.session as unknown as { visibleTools: Set<string> }).visibleTools.add("search");
-    const t0 = Date.now();
     for (let i = 0; i < 400; i++) {
       w.session.noteStreamUse({ type: "assistant", message: { id: "m" + i, content: [{ type: "tool_use", id: "t", name: "mcp__emma__search", input: { pad: "x".repeat(50_000) + i } }] } });
     }

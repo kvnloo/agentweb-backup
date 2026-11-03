@@ -63,7 +63,6 @@ async function scenario(label: string, hostileJs: string, honestEventsPerSec = 1
     honestLatencyMs: stats(lat),
     honestResult: JSON.stringify(honestEvents[honestEvents.length - 1]),
   };
-  // eslint-disable-next-line no-console
   console.log("RESULT C", JSON.stringify(res));
   return res;
 }

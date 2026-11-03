@@ -17,7 +17,6 @@ import { CpuMeter } from "../../relay/cpuMeter";
   };
   const a = timed(wallOnly);
   const b = timed(m);
-  // eslint-disable-next-line no-console
   console.log("RESULT OVERHEAD ns per empty section: wall clock only", Math.round(a), "| with the thread CPU reading", Math.round(b), "| bare performance.now()", Math.round(bare()));
   expect(m.exhausted).toBe(false);
 });

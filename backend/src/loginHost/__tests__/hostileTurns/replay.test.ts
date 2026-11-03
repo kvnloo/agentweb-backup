@@ -1,5 +1,5 @@
 /** ENG-2113 (security review): late/duplicate/replayed answers and dead calls, at relay level and end-to-end through the adapter with a hostile CLI that talks to the socket itself. */
-import { mkdtempSync, rmSync } from "fs";
+import { mkdtempSync, readFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { connect, type Socket } from "net";
@@ -155,7 +155,7 @@ describe("sec14 replay: end to end with a hostile CLI that opens the relay socke
       };`,
     );
     expect(r.events.filter((e) => e.type === "tool-call")).toEqual([]);
-    const notes = require("fs").readFileSync(join(rig.homeDir, ".hostile-notes"), "utf8");
+    const notes = readFileSync(join(rig.homeDir, ".hostile-notes"), "utf8");
     expect(notes).toContain("unknown_tool");
     expect(notes).not.toContain('"type\\":\\"result\\"');
   }, 30_000);

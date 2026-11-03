@@ -29,7 +29,6 @@ function rig(maxLine = 16 * 1024 * 1024) {
 }
 // an EVENT-shaped deep line: real stream-json lines start with `{` (anything else is dropped as junk before the depth scan matters); depth k
 const nested = (k: number) => "{" + "[".repeat(k - 1) + "]".repeat(k - 1) + "}";
-const NEST64 = "{" + "[".repeat(63); // what is kept of a line cut at the depth cap
 const PLACEHOLDER = '{"type":"aw_line_dropped"}';
 
 // reference implementation, written independently of LineLimit: one complete JSON object per line (first non-space `{`, last `}`, balanced outside strings)
@@ -292,7 +291,7 @@ describe("CLI stdout: lines nested deeper than the cap are dropped before anythi
       expect(r.ms).toBeLessThan(2000);
     });
 
-    it("MUTATION TARGET: 600 incomplete \`{\` lines are charged to the JUNK bucket (burst 200), not the event bucket (burst 5,000): the stream ends", async () => {
+    it("MUTATION TARGET: 600 incomplete `{` lines are charged to the JUNK bucket (burst 200), not the event bucket (burst 5,000): the stream ends", async () => {
       const r = await viaRunner([Buffer.from("{\n".repeat(600))]);
       expect(r.errors).toEqual(["stdout_flood"]);
       expect(r.threw).toBe(0);
