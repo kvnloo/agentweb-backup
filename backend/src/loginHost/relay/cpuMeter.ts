@@ -1,7 +1,7 @@
 /**
  * ENG-2113 (final security review): the login host is ONE event loop shared by every customer, and a hostile unit spends it through whatever it controls: bytes,
  * lines, values, reads, events, frames. Accounting per vector (one bucket each) kept leaving the next vector open. This is the unified accounting: a token bucket
- * measured in MILLISECONDS OF EVENT-LOOP TIME, per turn. Everything that processes a hostile unit's bytes or events on the host runs inside `meter.time(...)`, and the
+ * measured in MILLISECONDS OF EVENT-LOOP CPU TIME, per turn. Everything that processes a hostile unit's bytes or events on the host runs inside `meter.time(...)`, and the
  * real elapsed time of that synchronous section is what is charged, whatever made it expensive.
  *
  * Numbers. Burst 500 ms (it was 2,000 ms: eight concurrent turns each spending a 2 s burst on expensive-but-valid lines pinned the loop for 26 s), refill 50 ms per
@@ -42,8 +42,25 @@ export class TokenBucket {
   }
 }
 
-export const CPU_BURST_MS = 500;
+export const CPU_BURST_MS = 1000;
 export const CPU_REFILL_MS_PER_SEC = 50;
+/** A section shorter than this is charged its wall time without a CPU reading (a reading costs ~6.5 us; tiny events and one-byte reads are the hot path). */
+export const FAST_SECTION_MS = 1;
+
+const DEFAULT_NOW = (): number => performance.now();
+/**
+ * CPU time of the thread that runs the event loop, in ms. A section is charged min(wall, this): wall time includes the time the thread was not running (descheduled by a
+ * busy machine, preempted), which is not the unit's doing and used to double the charge of an honest 12 MB echo under CPU contention. (process.threadCpuUsage exists on
+ * Node 22.19+; before that, the whole process's CPU time, which can only be larger, so the charge is then never lower than the thread's.)
+ */
+const REAL_CPU_MS: () => number = (() => {
+  const p = process as unknown as { threadCpuUsage?: () => { user: number; system: number } };
+  const read = typeof p.threadCpuUsage === "function" ? () => p.threadCpuUsage!() : () => process.cpuUsage();
+  return () => {
+    const u = read();
+    return (u.user + u.system) / 1000;
+  };
+})();
 
 export class CpuMeter {
   private tokens: number;
@@ -54,11 +71,15 @@ export class CpuMeter {
   constructor(
     private readonly burstMs = CPU_BURST_MS,
     private readonly refillMsPerSec = CPU_REFILL_MS_PER_SEC,
-    readonly now: () => number = () => performance.now(),
+    readonly now: () => number = DEFAULT_NOW,
+    /** CPU time in ms. Default: the real thread CPU time with the real clock, and the clock itself (so wall = CPU, deterministic) when a custom clock is given. */
+    cpu?: () => number,
   ) {
     this.tokens = burstMs;
     this.last = this.now();
+    this.cpu = cpu ?? (now === DEFAULT_NOW ? REAL_CPU_MS : now);
   }
+  private readonly cpu: () => number;
   /** Milliseconds left (for tests and diagnostics). */
   get remaining(): number {
     return this.tokens;
@@ -88,16 +109,21 @@ export class CpuMeter {
       }
     }
   }
-  /** Runs `fn` and charges the real elapsed time of the OUTERMOST call. The result and any exception pass through. */
+  /**
+   * Runs `fn` and charges the OUTERMOST call: min(wall time, CPU time of the thread) of the section. The result and any exception pass through. Never more than the
+   * wall time (what it charged before), and no more than the CPU the section really used: a loop descheduled by a busy machine is not charged for the wait.
+   */
   time<T>(fn: () => T): T {
     if (this.depth > 0) return fn();
     this.depth++;
     const t0 = this.now();
+    const c0 = this.cpu();
     try {
       return fn();
     } finally {
       this.depth--;
-      this.charge(this.now() - t0);
+      const wall = this.now() - t0;
+      this.charge(wall <= FAST_SECTION_MS ? wall : Math.min(wall, Math.max(0, this.cpu() - c0)));
     }
   }
 }
