@@ -194,6 +194,7 @@ const sendAlertEmail = async ({
       listName,
       campaignName: typeof eventData?.campaign === 'string' ? eventData.campaign : undefined,
       replySubject: typeof eventData?.subject === 'string' ? eventData.subject : undefined,
+      replyText: typeof eventData?.replyText === 'string' ? eventData.replyText : undefined,
       receivedAt: createdAt || new Date().toISOString(),
       contactUrl: leadEngagementUrl || crmUrl,
     });
