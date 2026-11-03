@@ -364,6 +364,7 @@ class Endpoint implements RelayEndpoint {
     const rec = f as Record<string, unknown>;
     // An absurd key count is refused BEFORE the keys are sorted and joined (870 KB of 80,000 keys cost 62 ms there); a valid frame has at most four.
     let keyCount = 0;
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
     for (const _k in rec) if (++keyCount > 4) break;
     if (keyCount > 4) {
       this.drop(s, "bad_frame");

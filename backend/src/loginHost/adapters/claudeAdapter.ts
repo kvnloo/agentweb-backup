@@ -40,7 +40,7 @@ import type {
 import { manifestLines, qualifiedToolPrefix, RELAY_MCP_SERVER_NAME, relayCliEnv } from "../protocol";
 import { CpuMeter, TokenBucket } from "../relay/cpuMeter";
 import { RELAY_SOCKET_IN_UNIT } from "../ports/unitArgs";
-import { approxJsonBytes, LogThrottle, MAX_CLI_LINE_DEPTH, MAX_FORWARDED_BYTES, MAX_FORWARDED_DEPTH, valueDepthExceeds } from "../relay/bounds";
+import { approxJsonBytes, LogThrottle, MAX_CLI_LINE_DEPTH, MAX_FORWARDED_DEPTH, valueDepthExceeds } from "../relay/bounds";
 import { canonicalJson } from "../relay/canonical";
 import { createHash } from "crypto";
 import type { RelayCall, RelayEndpoint, RelayHost } from "../relay/relayServer";
@@ -215,8 +215,6 @@ export class RunnerChildAdapter extends EventEmitter implements RunnerChild {
     }
   }
 }
-
-const NEWLINE = Buffer.from("\n");
 
 /**
  * Accounting for the output of a child that has been PLAIN-killed (normal close, idle retirement): it is still read and dropped, unparsed (so a CLI winding down
@@ -888,12 +886,14 @@ export function approxSize(ev: ProviderEvent, measuredBytes?: number): number {
   if (ev.type === "text") return 64 + ev.delta.length;
   // NEVER JSON.stringify an input here: it is the shim's (tool-call) or the CLI's (tool-use) data, and a deeply nested value makes stringify throw a RangeError, which
   // from a timer or an event handler is an uncaught exception that ends the whole host. A tool-call uses the frame size the relay already measured.
-  if (ev.type === "tool-call") return 128 + (measuredBytes ?? approxJsonBytes(ev.input, MAX_EVENT_BYTES));
-  if (ev.type === "tool-use") return 128 + approxJsonBytes(ev.input, MAX_EVENT_BYTES);
+  if (ev.type === "tool-call") return 128 + (measuredBytes ?? approxJsonBytes(ev.input, MAX_EVENT_BYTES, QUEUE_NODE_BYTES));
+  if (ev.type === "tool-use") return 128 + approxJsonBytes(ev.input, MAX_EVENT_BYTES, QUEUE_NODE_BYTES);
   // every other event: its REAL payload (a result carries the whole answer text; an entitlement carries window names and status words). No fixed weight for a variable event.
-  return 128 + approxJsonBytes(ev, MAX_EVENT_BYTES);
+  return 128 + approxJsonBytes(ev, MAX_EVENT_BYTES, QUEUE_NODE_BYTES);
 }
 const MAX_EVENT_BYTES = 16 * 1024 * 1024;
+/** Memory a parsed object or array occupies beyond its JSON text, for the queue's size accounting (an event of 70,000 empty objects: 0.7 MB of JSON, ~27 MB of heap). */
+const QUEUE_NODE_BYTES = 128;
 
 function stripUndefined<T extends object>(o: T): Partial<T> {
   return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined)) as Partial<T>;
@@ -962,7 +962,8 @@ class ClaudeSession implements ProviderSession {
    * Returns false when that operation is no longer pending (the relay's own timer fired, the shim is gone, the turn ended): "result lost".
    */
   answer(operationId: string, answer: ServerRequestAnswer): boolean {
-    if (!this.relayEp || answer.kind !== "tool-result") return false;
+    // After an interrupt or a close the turn is over (the process may still be exiting): an answer is a lost result, never "delivered".
+    if (!this.relayEp || this.closing || this.interrupted || answer.kind !== "tool-result") return false;
     let sent: boolean;
     try {
       sent = this.relayEp.answer(operationId, { content: answer.content, isError: !answer.ok, ...(answer.images ? { images: answer.images } : {}), ...(answer.tools ? { tools: answer.tools } : {}) });
@@ -1142,7 +1143,12 @@ class ClaudeSession implements ProviderSession {
           callTimeoutMs: input.relay.callTimeoutMs,
           meter: this.meter,
         });
-        this.relayEp = await this.relayOpening;
+        try {
+          this.relayEp = await this.relayOpening;
+        } catch {
+          // (ENOSPC, EACCES, a leftover directory...) the host could not open the turn's socket: a host-side failure, retryable, not a failed turn. Fixed message: nothing of the error.
+          throw Object.assign(new Error("relay_open_failed"), { code: "open_failed" });
+        }
         if (this.closing || this.interrupted) return; // close() is waiting for this very endpoint and closes it (doClose)
         mcpServer = {
           name: this.cfg.mcpServerName,

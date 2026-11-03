@@ -75,7 +75,7 @@ describe("CpuMeter", () => {
   });
 
   it("the defaults are the documented numbers", () => {
-    expect(CPU_BURST_MS).toBe(500);
+    expect(CPU_BURST_MS).toBe(1000);
     expect(CPU_REFILL_MS_PER_SEC).toBe(50);
   });
 
@@ -354,7 +354,7 @@ describe("a slow trickle is paid for and killed", () => {
   });
 
   it("MUTATION TARGET: the fixed per-read cost is charged to the meter even when the section itself is instant (a mocked clock that never moves)", async () => {
-    let t = 5000;
+    const t = 5000;
     const spy = jest.spyOn(performance, "now").mockImplementation(() => t);
     try {
       const errors: string[] = [];
@@ -454,7 +454,7 @@ describe("honest image-heavy turns (REAL clock, real JSON.parse + normalize)", (
     const spy = jest.spyOn(performance, "now").mockImplementation(() => t);
     try {
       const errors: string[] = [];
-      const meter = new CpuMeter();
+      const meter = new CpuMeter(undefined, undefined, undefined, () => performance.now()); // CPU time = the mocked clock (wall = CPU), so the modelled cost is what is charged
       meter.onExhausted(() => errors.push("cpu_budget"));
       const ll = new LineLimit(16 * 1024 * 1024, () => errors.push("overflow"), undefined, () => errors.push("flood"), meter);
       const rl = createInterface({ input: ll });
@@ -484,7 +484,7 @@ describe("an HONEST long turn is never killed (mocked clock)", () => {
     const spy = jest.spyOn(performance, "now").mockImplementation(() => t);
     try {
       const errors: string[] = [];
-      const meter = new CpuMeter();
+      const meter = new CpuMeter(undefined, undefined, undefined, () => performance.now()); // CPU time = the mocked clock (wall = CPU), so the modelled cost is what is charged
       meter.onExhausted(() => errors.push("cpu_budget"));
       const ll = new LineLimit(16 * 1024 * 1024, () => errors.push("overflow"), undefined, () => errors.push("flood"), meter);
       const rl = createInterface({ input: ll });
@@ -525,7 +525,7 @@ describe("an HONEST long turn is never killed (mocked clock)", () => {
     const spy = jest.spyOn(performance, "now").mockImplementation(() => t);
     try {
       const errors: string[] = [];
-      const meter = new CpuMeter();
+      const meter = new CpuMeter(undefined, undefined, undefined, () => performance.now()); // CPU time = the mocked clock (wall = CPU), so the modelled cost is what is charged
       meter.onExhausted(() => errors.push("cpu_budget"));
       const ll = new LineLimit(16 * 1024 * 1024, () => errors.push("overflow"), undefined, () => errors.push("flood"), meter);
       const rl = createInterface({ input: ll });

@@ -5,7 +5,8 @@
 import { PassThrough } from "stream";
 import type { ChildLike } from "../adapter";
 import { ClaudeAdapter, LineLimit, RunnerChildAdapter, StderrGuard } from "../adapters/claudeAdapter";
-import { CpuMeter } from "../relay/cpuMeter";
+import { createInterface } from "readline";
+import { CPU_BURST_MS, CPU_REFILL_MS_PER_SEC, CpuMeter } from "../relay/cpuMeter";
 import { MAX_LINE_VALUES } from "../adapters/claudeAdapter";
 import { performance } from "perf_hooks";
 
@@ -168,5 +169,173 @@ describe("CpuMeter clamps and listeners", () => {
     m.onExhausted(() => called.push("second"));
     expect(() => m.charge(100)).not.toThrow();
     expect(called).toEqual(["second"]);
+  });
+});
+
+// ── the meter in the stream path, with a mocked clock (FAST: these sit inside the signed-deploy gate; the slow real-clock suite is cpuBudget.test.ts) ──
+describe("the CPU meter in the CLI's stdout path (mocked clock)", () => {
+  /** A meter whose clock AND cpu reading are the mocked performance.now (wall = CPU): the modelled cost of handling a line is what is charged. */
+  const mockedMeter = (errors: string[]) => {
+    const m = new CpuMeter(undefined, undefined, undefined, () => performance.now());
+    m.onExhausted(() => errors.push("cpu_budget"));
+    return m;
+  };
+
+  it("MUTATION TARGET: the burst and the refill are the documented numbers, so an honest turn has room and a hostile one does not", () => {
+    expect(CPU_BURST_MS).toBe(1000);
+    expect(CPU_REFILL_MS_PER_SEC).toBe(50);
+    const m = new CpuMeter();
+    expect(m.remaining).toBe(1000);
+  });
+
+  it("MUTATION TARGET: an HONEST long turn is never killed: 24,000 tiny events over ten minutes plus four 8-12 MB echoed results", async () => {
+    let t = 5000;
+    const spy = jest.spyOn(performance, "now").mockImplementation(() => t);
+    try {
+      const errors: string[] = [];
+      const meter = mockedMeter(errors);
+      const ll = new LineLimit(16 * 1024 * 1024, () => errors.push("overflow"), undefined, () => errors.push("flood"), meter);
+      const rl = createInterface({ input: ll });
+      let events = 0;
+      rl.on("line", (l) => {
+        if (!l.trim()) return;
+        events++;
+        JSON.parse(l);
+        t += l.length > 1_000_000 ? 250 : 0.2; // what handling the line costs: a big echo 250 ms (measured 50-110 ms of CPU, 250 is a loaded-machine allowance), a small event 0.2 ms
+      });
+      const small = Buffer.from('{"type":"assistant","message":{"id":"m","content":[{"type":"text","text":"hello"}]}}\n');
+      const big = (mb: number) => Buffer.from('{"type":"user","c":"' + "r".repeat(mb * 1024 * 1024) + '"}\n');
+      let smalls = 0;
+      for (let sec = 0; sec < 600; sec++) {
+        for (let i = 0; i < 40; i++) {
+          ll.write(small);
+          smalls++;
+        }
+        if (sec === 100 || sec === 101) ll.write(big(12)); // two 12 MB echoes back to back: 500 ms of the 1000 ms burst
+        if (sec === 300) ll.write(big(8));
+        if (sec === 450) ll.write(big(10));
+        await new Promise((r) => setImmediate(r));
+        t += 1000;
+      }
+      ll.end();
+      await new Promise((r) => rl.once("close", r));
+      expect(errors).toEqual([]);
+      expect(meter.exhausted).toBe(false);
+      expect(events).toBe(smalls + 4);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("MUTATION TARGET: ...and five echoes in a row at 150 ms each (750 of the 1000 ms) are survived, a sixth is not (the burst is real)", async () => {
+    let t = 5000;
+    const spy = jest.spyOn(performance, "now").mockImplementation(() => t);
+    try {
+      const run = async (n: number) => {
+        const errors: string[] = [];
+        const meter = mockedMeter(errors);
+        const ll = new LineLimit(16 * 1024 * 1024, () => errors.push("overflow"), undefined, () => errors.push("flood"), meter);
+        const rl = createInterface({ input: ll });
+        rl.on("line", () => void (t += 150));
+        for (let i = 0; i < n; i++) ll.write(Buffer.from('{"c":"' + "r".repeat(2 * 1024 * 1024) + '"}\n'));
+        await new Promise((r) => setTimeout(r, 30));
+        return errors;
+      };
+      expect(await run(5)).toEqual([]);
+      expect(await run(8)).toEqual(["cpu_budget"]);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("MUTATION TARGET: the stdout scan IS metered: a stream whose every event costs 100 ms of loop time is killed (cpu_budget)", async () => {
+    let t = 5000;
+    const spy = jest.spyOn(performance, "now").mockImplementation(() => t);
+    try {
+      const errors: string[] = [];
+      const meter = mockedMeter(errors);
+      const ll = new LineLimit(16 * 1024 * 1024, () => errors.push("overflow"), undefined, () => errors.push("flood"), meter);
+      const rl = createInterface({ input: ll });
+      rl.on("line", () => void (t += 100)); // the work downstream of the push, inside the metered section
+      for (let i = 0; i < 100; i++) ll.write(Buffer.from("{}\n"));
+      await new Promise((r) => setImmediate(r));
+      expect(errors).toEqual(["cpu_budget"]);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("MUTATION TARGET: ten 8 MB echoes spread over 60 s (each costs 40 ms) are never killed", async () => {
+    let t = 5000;
+    const spy = jest.spyOn(performance, "now").mockImplementation(() => t);
+    try {
+      const errors: string[] = [];
+      const meter = mockedMeter(errors);
+      const ll = new LineLimit(16 * 1024 * 1024, () => errors.push("overflow"), undefined, () => errors.push("flood"), meter);
+      const rl = createInterface({ input: ll });
+      let parsed = 0;
+      rl.on("line", () => {
+        parsed++;
+        t += 40;
+      });
+      const line = Buffer.from('{"type":"user","c":"' + "A".repeat(8 * 1024 * 1024) + '"}\n');
+      for (let i = 0; i < 10; i++) {
+        ll.write(line);
+        await new Promise((r) => setImmediate(r));
+        t += 6000;
+      }
+      expect(errors).toEqual([]);
+      expect(parsed).toBe(10);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("MUTATION TARGET: the per-read bucket: 2,500 one-byte reads at once end the stream (stdout_flood); 150 reads a second for 20 s do not", async () => {
+    let t = 5000;
+    const spy = jest.spyOn(performance, "now").mockImplementation(() => t);
+    try {
+      const flood: string[] = [];
+      const ll = new LineLimit(1 << 20, () => undefined, undefined, () => flood.push("flood"));
+      ll.resume();
+      for (let i = 0; i < 2500; i++) ll.write(Buffer.from(" "));
+      await new Promise((r) => setImmediate(r));
+      expect(flood).toEqual(["flood"]);
+      const calm: string[] = [];
+      const ll2 = new LineLimit(1 << 20, () => undefined, undefined, () => calm.push("flood"));
+      ll2.resume();
+      for (let sec = 0; sec < 20; sec++) {
+        for (let i = 0; i < 150; i++) ll2.write(Buffer.from(" "));
+        await new Promise((r) => setImmediate(r));
+        t += 1000;
+      }
+      expect(calm).toEqual([]);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("MUTATION TARGET: the fixed per-read cost (0.08 ms) is charged even when the section is instant: 1,900 reads fit a 2000 ms budget, 1,500 do not fit a 100 ms one", async () => {
+    const t = 5000;
+    const spy = jest.spyOn(performance, "now").mockImplementation(() => t);
+    try {
+      const errors: string[] = [];
+      const meter = new CpuMeter(2000, 0);
+      meter.onExhausted(() => errors.push("cpu_budget"));
+      const ll = new LineLimit(1 << 20, () => undefined, undefined, () => errors.push("flood"), meter);
+      ll.resume();
+      for (let i = 0; i < 1900; i++) ll.write(Buffer.from("{}\n"));
+      await new Promise((r) => setImmediate(r));
+      expect(errors).toEqual([]);
+      const meter2 = new CpuMeter(100, 0);
+      meter2.onExhausted(() => errors.push("cpu_budget"));
+      const ll2 = new LineLimit(1 << 20, () => undefined, undefined, () => errors.push("flood"), meter2);
+      ll2.resume();
+      for (let i = 0; i < 1500; i++) ll2.write(Buffer.from("{}\n"));
+      await new Promise((r) => setImmediate(r));
+      expect(errors).toEqual(["cpu_budget"]);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

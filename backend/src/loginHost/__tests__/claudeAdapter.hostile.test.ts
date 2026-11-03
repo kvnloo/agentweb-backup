@@ -194,6 +194,37 @@ function stubbed(messageIdWaitMs = 100, answerThrows = false) {
 }
 const call = (over: Partial<RelayCall> = {}): RelayCall => ({ identity: { connectionId: "conn1", epoch: 3, turnId: "t1" }, operationId: "a".repeat(32), name: "search", args: { q: 1 }, bytes: 80, ...over });
 
+describe("relay session edges", () => {
+  it("MUTATION TARGET: relay.open() failing (ENOSPC, EACCES...) is a retryable host-side failure (transient), not a failed turn (unknown), and nothing of the error is logged or kept", async () => {
+    const rig = makeRig();
+    rig.host.open = async () => {
+      throw Object.assign(new Error("ENOSPC: no space left on /secret/relay/dir"), { code: "ENOSPC" });
+    };
+    const session = await rig.adapter.openSession(rig.ctx, { connectionId: "conn1", epoch: 3 });
+    const events: ProviderEvent[] = [];
+    for await (const ev of session.turn({ turnId: "t1", prompt: "go", model: "sonnet", relay: { tools: TOOLS, callTimeoutMs: () => 5000 } })) events.push(ev);
+    await session.close();
+    expect(events[events.length - 1]).toMatchObject({ type: "result", ok: false, errorKind: "transient" });
+    expect(JSON.stringify(rig.logs)).not.toContain("secret");
+    expect(JSON.stringify(events)).not.toContain("secret");
+  });
+
+  it("MUTATION TARGET: an answer after interrupt() is a LOST result (false), not delivered, even though the process may still be exiting; before it, the same answer is accepted", async () => {
+    const s = stubbed(2000);
+    const session = await s.rig.adapter.openSession(s.rig.ctx, { connectionId: "conn1", epoch: 3 });
+    const turn = (async () => {
+      for await (const ev of session.turn({ turnId: "t1", prompt: "go", model: "sonnet", relay: { tools: TOOLS, callTimeoutMs: () => 10_000 } })) void ev;
+    })();
+    await until(() => !!s.opts());
+    const ans = { kind: "tool-result" as const, ok: true, content: "r" };
+    expect(session.answer("a".repeat(32), ans)).toBe(true);
+    await session.interrupt("t1");
+    expect(session.answer("a".repeat(32), ans)).toBe(false);
+    await session.close();
+    await turn.catch(() => undefined);
+  });
+});
+
 describe("a hostile unit and a hostile CLI together cannot stall the loop by making the host re-hash a call (loop-lag regression)", () => {
   type Priv = { noteStreamUse(raw: Record<string, unknown>): void; flushWaiting(force: boolean): void };
   async function withWaitingCall(args: Record<string, unknown>, bytes: number, preSpent = 0) {
@@ -265,13 +296,26 @@ describe("a hostile unit and a hostile CLI together cannot stall the loop by mak
     const w = await withWaitingCall({ q: "x" }, 20);
     w.canonical.mockClear();
     (w.session as unknown as { visibleTools: Set<string> }).visibleTools.add("search");
-    const t0 = Date.now();
     for (let i = 0; i < 400; i++) {
       w.session.noteStreamUse({ type: "assistant", message: { id: "m" + i, content: [{ type: "tool_use", id: "t", name: "mcp__emma__search", input: { pad: "x".repeat(50_000) + i } }] } });
     }
     expect(w.canonical.mock.calls.length).toBeLessThanOrEqual(170); // 8 MiB / ~50 KB
     expect(w.canonical.mock.calls.length).toBeGreaterThan(100);
     await w.stop();
+  });
+
+  it("MUTATION TARGET: the relay endpoint is opened with the turn's OWN meter (one budget for stdout, stderr, events and relay frames, not two)", async () => {
+    const s = stubbed(2000);
+    const session = await s.rig.adapter.openSession(s.rig.ctx, { connectionId: "conn1", epoch: 3 });
+    const turn = (async () => {
+      for await (const ev of session.turn({ turnId: "t1", prompt: "go", model: "sonnet", relay: { tools: TOOLS, callTimeoutMs: () => 10_000 } })) void ev;
+    })();
+    await until(() => !!s.opts());
+    const turnMeter = (session as unknown as { meter: unknown }).meter;
+    expect(turnMeter).toBeDefined();
+    expect(s.opts().meter).toBe(turnMeter);
+    await session.close();
+    await turn.catch(() => undefined);
   });
 
   it("MUTATION TARGET: an announcement of a tool the turn does NOT offer is not recorded and consumes none of the hashing budget", async () => {

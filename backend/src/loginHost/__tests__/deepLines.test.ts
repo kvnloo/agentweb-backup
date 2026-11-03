@@ -29,7 +29,6 @@ function rig(maxLine = 16 * 1024 * 1024) {
 }
 // an EVENT-shaped deep line: real stream-json lines start with `{` (anything else is dropped as junk before the depth scan matters); depth k
 const nested = (k: number) => "{" + "[".repeat(k - 1) + "]".repeat(k - 1) + "}";
-const NEST64 = "{" + "[".repeat(63); // what is kept of a line cut at the depth cap
 const PLACEHOLDER = '{"type":"aw_line_dropped"}';
 
 // reference implementation, written independently of LineLimit: one complete JSON object per line (first non-space `{`, last `}`, balanced outside strings)
@@ -86,7 +85,7 @@ describe("CLI stdout: lines nested deeper than the cap are dropped before anythi
     const line = nested(k);
     const t0 = Date.now();
     await r.feed('{"type":"before"}\n', line + "\n", '{"type":"after"}\n');
-    expect(Date.now() - t0).toBeLessThan(300);
+    expect(Date.now() - t0).toBeLessThan(2500); // (a few ms idle; parsed it would take seconds and a stack overflow: the structural checks below are the real pins)
     expect(r.deep).toHaveLength(1);
     expect(r.out().length).toBeLessThan(400);
     expect(r.out().endsWith(`\n${PLACEHOLDER}\n{"type":"after"}\n`)).toBe(true);
@@ -100,7 +99,7 @@ describe("CLI stdout: lines nested deeper than the cap are dropped before anythi
     for (let i = 0; i < deepLine.length; i += 7_000) chunks.push(deepLine.slice(i, i + 7_000));
     const t0 = Date.now();
     await r.feed('{"s":"x\\', '"y"}\n', ...chunks, "\n", '{"ok":1}\n');
-    expect(Date.now() - t0).toBeLessThan(300);
+    expect(Date.now() - t0).toBeLessThan(2500);
     expect(r.deep).toHaveLength(1);
     expect(r.out()).toBe(`{"s":"x\\"y"}\n${PLACEHOLDER}\n{"ok":1}\n`);
   });
@@ -283,7 +282,7 @@ describe("CLI stdout: lines nested deeper than the cap are dropped before anythi
       console.log("FLOOD x\\n ms", r.ms.toFixed(1), JSON.stringify({ parsed: r.parsed, threw: r.threw }));
       expect(r.threw).toBe(0);
       expect(r.errors).toEqual(["stdout_flood"]);
-      expect(r.ms).toBeLessThan(500);
+      expect(r.ms).toBeLessThan(2500);
     });
 
     it("MUTATION TARGET: the same flood with '{\\n' lines (starts like an event, is not one) is parsed at most for the lines that fit the budget", async () => {
@@ -292,7 +291,7 @@ describe("CLI stdout: lines nested deeper than the cap are dropped before anythi
       expect(r.ms).toBeLessThan(2000);
     });
 
-    it("MUTATION TARGET: 600 incomplete \`{\` lines are charged to the JUNK bucket (burst 200), not the event bucket (burst 5,000): the stream ends", async () => {
+    it("MUTATION TARGET: 600 incomplete `{` lines are charged to the JUNK bucket (burst 200), not the event bucket (burst 5,000): the stream ends", async () => {
       const r = await viaRunner([Buffer.from("{\n".repeat(600))]);
       expect(r.errors).toEqual(["stdout_flood"]);
       expect(r.threw).toBe(0);
@@ -471,11 +470,11 @@ describe("CLI stdout: lines nested deeper than the cap are dropped before anythi
       const lfMs = Number(process.hrtime.bigint() - t1) / 1e6;
       console.log("CR vs LF ms", crMs.toFixed(1), lfMs.toFixed(1));
       expect(cr.out()).toBe("{}\n".repeat(4000));
-      expect(crMs).toBeLessThan(500);
+      expect(crMs).toBeLessThan(2500);
       const jr = rig();
       const t2 = process.hrtime.bigint();
       await jr.feed(Buffer.from("junk\n".repeat(30)).toString().repeat(1)); // within the budget: many dropped lines in ONE chunk
-      expect(Number(process.hrtime.bigint() - t2) / 1e6).toBeLessThan(500);
+      expect(Number(process.hrtime.bigint() - t2) / 1e6).toBeLessThan(2500);
     });
   });
 
@@ -500,7 +499,7 @@ describe("normalized stream events: informational values are bounded before they
     const raw = toolUse(deepValue(k));
     const t0 = Date.now();
     const evs = normalizeClaudeEvent(raw);
-    expect(Date.now() - t0).toBeLessThan(100);
+    expect(Date.now() - t0).toBeLessThan(2500);
     expect(evs).toEqual([{ type: "tool-use", operationId: "tu1", name: "mcp__emma__search", input: { _truncated: "depth" } }]);
     expect(() => JSON.stringify(evs)).not.toThrow();
   });

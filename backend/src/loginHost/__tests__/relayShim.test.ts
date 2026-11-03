@@ -279,6 +279,7 @@ describe("relay shim: connection bookkeeping (the shim source driven with a fake
     const stdout = new PassThrough();
     const proc = Object.assign(new EventEmitter(), { env: { AW_RELAY_SOCKET: "/nowhere/relay.sock", AW_RELAY_TOOLS: toolsFile }, stdin, stdout, stderr: new PassThrough(), exit: () => undefined });
     const src = readFileSync(SHIM, "utf8").replace(/^#!.*\n/, "");
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
     const req = (m: string) => (m === "net" ? fakeNet : require(m));
     new Function("require", "process", "module", "exports", src)(req, proc, { exports: {} }, {});
     let id = 0;

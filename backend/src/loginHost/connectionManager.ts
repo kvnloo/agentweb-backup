@@ -577,16 +577,15 @@ export class ConnectionManager {
         yield { type: "result", ok: false, text: "", errorKind: pre.kind };
         return;
       }
-      iterator = providerSession
-        .turn({
-          turnId: req.turnId,
-          prompt: req.prompt,
-          model: req.model,
-          ...(req.bridgeToken !== undefined ? { bridgeToken: req.bridgeToken } : {}),
-          // The relay's clock for a call is the turn's remaining time (its deadline), read when the call arrives; without a deadline, the host default.
-          ...(req.tools ? { relay: { tools: req.tools, callTimeoutMs: () => this.relayCallTimeoutMs(running) } } : {}),
-        })
-        [Symbol.asyncIterator]();
+      const stream = providerSession.turn({
+        turnId: req.turnId,
+        prompt: req.prompt,
+        model: req.model,
+        ...(req.bridgeToken !== undefined ? { bridgeToken: req.bridgeToken } : {}),
+        // The relay's clock for a call is the turn's remaining time (its deadline), read when the call arrives; without a deadline, the host default.
+        ...(req.tools ? { relay: { tools: req.tools, callTimeoutMs: () => this.relayCallTimeoutMs(running) } } : {}),
+      });
+      iterator = stream[Symbol.asyncIterator]();
       for (;;) {
         const next = await gate.race(iterator.next());
         if (next === "hung") return yield* this.abandonHung(c, session, running, () => (status = "aborted"));
