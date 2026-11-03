@@ -394,6 +394,17 @@ describe('agentToolGatewayService', () => {
           expect(result.repairs).toEqual(expect.arrayContaining(['elements->fields']));
         });
 
+        it('does not apply the elements alias to other tools declaring fields', () => {
+          const result = validateAndRepairToolArgs({
+            toolName: 'get_meta_ads_insights',
+            args: { elements: ['spend'] },
+            inputSchema: { ...fillFormSchema, properties: { fields: { type: 'array', items: { type: 'string' } } } },
+            effect: 'read',
+          });
+          expect(result.status).toBe('invalid');
+          expect(result.repairs).not.toContain('elements->fields');
+        });
+
         it('still rejects genuinely unknown arguments', () => {
           const result = validateAndRepairToolArgs({
             toolName: 'playwright_browser_fill_form',

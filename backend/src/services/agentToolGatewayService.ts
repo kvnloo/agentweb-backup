@@ -747,8 +747,6 @@ const DEFAULT_ARG_ALIASES: Record<string, string[]> = {
   operations_json: ['replacement_json', 'operations', 'replacements', 'replacement_instructions'],
   // playwright_browser_evaluate requires `function`; models send `expression`/`script` (ENG-2473).
   function: ['expression', 'script', 'js', 'code'],
-  // playwright_browser_fill_form requires `fields`; models send `elements` (ENG-2791).
-  fields: ['elements'],
   // monitor_lead_volume / assess_client_health etc. require `client_name_or_email`;
   // scheduled report runs send `client_id: "<email>"` (ENG-2610).
   client_name_or_email: ['client_id', 'client_email', 'client'],
@@ -986,6 +984,20 @@ export function validateAndRepairToolArgs(
     const normalized = { ...args, ...(entityType ? { entity_type: entityType } : {}), action };
     if (JSON.stringify(normalized) !== JSON.stringify(repairedArgs)) repairs.push('attio:aliases');
     repairedArgs = normalized;
+  }
+  // ENG-2791: playwright_browser_fill_form requires `fields`; models send `elements`.
+  // Scoped to this tool so other tools declaring `fields` (e.g. Meta insights) keep
+  // rejecting an undeclared `elements` argument.
+  if (
+    input.toolName === 'playwright_browser_fill_form' &&
+    repairedArgs.fields === undefined &&
+    repairedArgs.elements !== undefined &&
+    properties.fields &&
+    !properties.elements
+  ) {
+    repairedArgs.fields = repairedArgs.elements;
+    delete repairedArgs.elements;
+    repairs.push('elements->fields');
   }
   const propertyNames = Object.keys(properties);
   const lowRiskRepairAllowed = (input.effect ?? classifyToolEffect(input.toolName, input.args)) === 'read';
