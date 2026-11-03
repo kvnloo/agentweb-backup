@@ -2434,7 +2434,7 @@ emmaToolRegistry.register({
           description: 'Optional S3 URL to deep research content (from perform_deep_research). For WHITEPAPERS: pass the research_url here instead of copying full content into content_description. The function will fetch the research and use it as context. When using this, content_description should focus on section-specific instructions (e.g., "Write the Executive Summary focusing on key strategic implications").'
         }
       },
-      required: ['book_id', 'section_id', 'chapter_id', 'content_description']
+      required: ['book_id', 'section_id', 'content_description']
     }
   },
   execute: async (args: any, context?: any) => {
