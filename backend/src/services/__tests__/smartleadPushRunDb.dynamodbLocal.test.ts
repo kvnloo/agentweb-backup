@@ -68,6 +68,47 @@ suite('SmartleadPushRunDb against DynamoDB Local (ENG-673)', () => {
     });
   });
 
+  describe('event counters (what Smartlead reported about the contacts of a run)', () => {
+    it('creates the counters on the first event, then adds, on a live run and on a finished one', async () => {
+      const run = await fresh();
+      expect(await db.getRunEvents(run.runId)).toBeUndefined();
+      expect(await db.countContactEvent(run.runId, 'replied')).toBe(true);
+      expect(await db.getRunEvents(run.runId)).toEqual({ replied: 1, bounced: 0, unsubscribed: 0 });
+      expect(await db.countContactEvent(run.runId, 'replied')).toBe(true);
+      expect(await db.countContactEvent(run.runId, 'unsubscribed')).toBe(true);
+      await db.advance(run.runId, 1, { cursor: { listId: 'l', leadId: 'x' }, counts: {}, listExhausted: true });
+      expect(await db.finishRun(run.runId, 1, 'completed')).toBe(true); // replies arrive after a push ends
+      expect(await db.countContactEvent(run.runId, 'bounced')).toBe(true);
+      expect(await db.getRunEvents(run.runId)).toEqual({ replied: 2, bounced: 1, unsubscribed: 1 });
+      expect((await db.getRun(run.runId))!).toMatchObject({ status: 'completed', events: { replied: 2, bounced: 1, unsubscribed: 1 }, counts: { examined: 0 } });
+    });
+
+    it('loses nothing when many first events race to create the counters', async () => {
+      const run = await fresh();
+      const kinds = ['replied', 'bounced', 'unsubscribed', 'replied', 'unsubscribed', 'replied'] as const;
+      const results = await Promise.all(kinds.map(k => db.countContactEvent(run.runId, k)));
+      expect(results.every(Boolean)).toBe(true);
+      expect(await db.getRunEvents(run.runId)).toEqual({ replied: 3, bounced: 1, unsubscribed: 2 });
+    });
+
+    it('counts nothing and creates nothing for a run that does not exist', async () => {
+      expect(await db.countContactEvent('01NOSUCHRUN', 'replied')).toBe(false);
+      expect((await doc.get({ TableName: table, Key: { pk: '01NOSUCHRUN', sk: 'RUN' } }).promise()).Item).toBeUndefined();
+      expect(await db.getRunEvents('01NOSUCHRUN')).toBeUndefined();
+    });
+
+    it('never disturbs the run state, lease, cursor or lock', async () => {
+      const run = await fresh();
+      const before = (await doc.get({ TableName: table, Key: { pk: run.runId, sk: 'RUN' } }).promise()).Item!;
+      await db.countContactEvent(run.runId, 'replied');
+      const after = (await doc.get({ TableName: table, Key: { pk: run.runId, sk: 'RUN' } }).promise()).Item!;
+      const { events, ...rest } = after;
+      expect(events).toEqual({ replied: 1, bounced: 0, unsubscribed: 0 });
+      expect(rest).toEqual(before);
+      expect(await db.getLock(run.listId, run.campaignId)).toEqual({ runId: run.runId });
+    });
+  });
+
   describe('start', () => {
     it('creates a run and its lock, with the full counts map and a numeric ttl', async () => {
       const run = await fresh();
