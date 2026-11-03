@@ -222,6 +222,7 @@ describe("the reply text of a Smartlead reply (ENG-673)", () => {
   it("never stalls on hostile input of the full size it reads (a quadratic pattern needs over 100 ms at 10,000 characters)", () => {
     const hostile = [
       " ".repeat(9999) + "x", "\t".repeat(9999) + "x", "\n".repeat(9999), "On abc def\n".repeat(900), "wrote: ".repeat(1400), "schrieb ".repeat(1200),
+      "On Tue, Nov 3, 2026 Harsha\n" + " ".repeat(9900) + "x", "On Tue, Nov 3, 2026 Harsha\n" + "\u2003".repeat(9900) + "x", "Am 03.11.2026 um 09:23 schrieb Max\n" + "\u2003".repeat(9900) + "x",
       "-".repeat(9999), "From: a\n".repeat(1200), "\u200b".repeat(9999), "a\u{e0049}".repeat(4000), " ".repeat(250000) + "x", "On abc def\n".repeat(20000),
     ];
     for (const text of hostile) {
