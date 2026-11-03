@@ -57,45 +57,43 @@ describe("getAllocatedRate", () => {
   it("prices Apollo email reveal, phone reveal, and the waterfall components distinctly", () => {
     expect(getAllocatedRate("apollo", "email_reveal")).toBeCloseTo(0.0495, 6);
     expect(getAllocatedRate("apollo", "phone_reveal")).toBeCloseTo(0.395, 6);
-    expect(getAllocatedRate("apollo", "waterfall_email")).toBeCloseTo(0.099, 6);
+    expect(getAllocatedRate("apollo", "waterfall_email")).toBeCloseTo(0.445, 6);
     expect(getAllocatedRate("apollo", "waterfall_phone")).toBeCloseTo(0.396, 6);
   });
 
-  // ENG-2720: the bundled 9-credit `full_enrichment` ($0.445) booked 8 phone credits on
-  // every email waterfall although no call requests a phone. It must stay retired so an
-  // unpriced stale caller fails loud instead of silently re-booking the old amount.
-  it("no longer prices the retired bundled Apollo full_enrichment line", () => {
+  // ENG-2720: the ledger key `full_enrichment` became `waterfall_email` (same $0.445). The old key must stay
+  // unpriced so a stale caller fails loud instead of silently booking under a name nothing reads.
+  it("no longer prices the old Apollo full_enrichment key (renamed to waterfall_email)", () => {
     expect(getAllocatedRate("apollo", "full_enrichment")).toBeNull();
   });
 
-  describe("Apollo waterfall credits (ENG-2720)", () => {
+  describe("Apollo waterfall booking (ENG-2720; owner decision 2026-11-02: keep the 9-credit amount)", () => {
     // Real cost per credit: Professional Annual $948 / 48,000 credits (confirmed 2026-10-30).
     const REAL_USD_PER_CREDIT = 948 / 48000;
 
-    it("books every component as credits x the per-credit constant", () => {
+    it("books the email waterfall at the approved table value $0.445, unchanged from the old full_enrichment line", () => {
+      expect(getAllocatedRate("apollo", "waterfall_email")).toBe(0.445);
+    });
+
+    it("keeps the per-credit constant and prices the unused phone component as credits x it", () => {
       expect(APOLLO_USD_PER_CREDIT).toBe(0.0495);
-      expect(getAllocatedRate("apollo", "waterfall_email")).toBeCloseTo(
-        APOLLO_WATERFALL_CREDITS.email * APOLLO_USD_PER_CREDIT,
-        6,
-      );
-      expect(getAllocatedRate("apollo", "waterfall_phone")).toBeCloseTo(
-        APOLLO_WATERFALL_CREDITS.phone * APOLLO_USD_PER_CREDIT,
-        6,
-      );
+      expect(getAllocatedRate("apollo", "waterfall_phone")).toBeCloseTo(APOLLO_WATERFALL_CREDITS.phone * APOLLO_USD_PER_CREDIT, 6);
+      expect(getAllocatedRate("apollo", "email_reveal")).toBeCloseTo(APOLLO_USD_PER_CREDIT, 6);
     });
 
-    it("keeps the 60% gross-margin floor (booked >= real / 0.40) for each component and for email + phone", () => {
-      const email = getAllocatedRate("apollo", "waterfall_email")!;
-      const phone = getAllocatedRate("apollo", "waterfall_phone")!;
+    it("waterfall_email is the email credit plus the 8-credit phone allowance (9 credits), so splitting later cannot change the total", () => {
+      const nineCredits = (APOLLO_WATERFALL_CREDITS.email + APOLLO_WATERFALL_CREDITS.phone) * APOLLO_USD_PER_CREDIT;
+      expect(APOLLO_WATERFALL_CREDITS.email + APOLLO_WATERFALL_CREDITS.phone).toBe(9);
+      expect(Math.abs(getAllocatedRate("apollo", "waterfall_email")! - nineCredits)).toBeLessThan(0.001);
+      // after the phone split: email (1 credit) + phone (8 credits) must still add up to the booked amount
+      const split = getAllocatedRate("apollo", "email_reveal")! + getAllocatedRate("apollo", "waterfall_phone")!;
+      expect(Math.abs(split - getAllocatedRate("apollo", "waterfall_email")!)).toBeLessThan(0.001);
+    });
+
+    it("clears the 60% gross-margin floor (booked >= real / 0.40) for the 9-credit amount", () => {
       const floor = (credits: number) => (credits * REAL_USD_PER_CREDIT) / 0.4;
-      expect(email).toBeGreaterThanOrEqual(floor(APOLLO_WATERFALL_CREDITS.email) - 1e-4);
-      expect(phone).toBeGreaterThanOrEqual(floor(APOLLO_WATERFALL_CREDITS.phone) - 1e-4);
-      const bothCredits = APOLLO_WATERFALL_CREDITS.email + APOLLO_WATERFALL_CREDITS.phone;
-      expect(email + phone).toBeGreaterThanOrEqual(floor(bothCredits) - 1e-4);
-    });
-
-    it("books an email waterfall far below the old 9-credit bundle", () => {
-      expect(getAllocatedRate("apollo", "waterfall_email")!).toBeLessThan(0.445 / 4);
+      expect(getAllocatedRate("apollo", "waterfall_email")!).toBeGreaterThanOrEqual(floor(9) - 1e-4);
+      expect(getAllocatedRate("apollo", "waterfall_phone")!).toBeGreaterThanOrEqual(floor(APOLLO_WATERFALL_CREDITS.phone) - 1e-4);
     });
   });
 

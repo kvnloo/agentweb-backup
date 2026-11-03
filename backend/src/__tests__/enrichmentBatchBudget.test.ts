@@ -129,11 +129,11 @@ describe('admission estimate tracks what a run books (ENG-2720)', () => {
   const usd = (cfg: EnrichmentConfig, leads: number, model?: string) => estimateEnrichmentBatchMicroUsd(cfg, leads, model) / 1e6;
 
   // What a lead actually books on the real Opiner list (prod/env1 ledger, ENG-2720): Apollo match $0.0495,
-  // waterfall $0.099, org $0.0495, one You.com query $0.0125, and ~$0.0018 per web field (tokens + search fee).
-  const measuredPerLead = (fields: number) => 0.0495 + 0.099 + 0.0495 + 0.0125 + fields * 0.0018;
+  // waterfall $0.445, org $0.0495, one You.com query $0.0125, and ~$0.0018 per web field (tokens + search fee).
+  const measuredPerLead = (fields: number) => 0.0495 + 0.445 + 0.0495 + 0.0125 + fields * 0.0018;
 
-  it.each([3, 10, 20])('with %i fields it reserves at least 1.5x what a lead measurably books', (n) => {
-    expect(usd(withFields(n), 1)).toBeGreaterThanOrEqual(measuredPerLead(n) * 1.5);
+  it.each([3, 10, 20])('with %i fields it reserves at least 1.1x what a lead that triggers the broker measurably books', (n) => {
+    expect(usd(withFields(n), 1)).toBeGreaterThanOrEqual(measuredPerLead(n) * 1.1);
   });
 
   it.each([3, 10, 20, 40])('with %i fields it stays within 8x of the field-matched customer estimate', (n) => {
@@ -142,13 +142,13 @@ describe('admission estimate tracks what a run books (ENG-2720)', () => {
     expect(usd(withFields(n), 112)).toBeLessThanOrEqual(quote * 8);
   });
 
-  it('no longer asks for ~$27 of headroom for 5 leads with a 20-field config', () => {
-    expect(usd(withFields(20), 5)).toBeLessThan(5);
+  it('no longer asks for ~$27 of headroom for 5 leads with a 20-field config (the old formula would ask ~$40 at the 9-credit rate)', () => {
+    expect(usd(withFields(20), 5)).toBeLessThan(8);
   });
 
   it('reserves nothing for the unused enrich.so phone finder', () => {
-    // identity ~$0.38 (the Apollo waterfall counted twice) + one field $0.02; the old $0.25 phone line alone is gone
-    expect(usd(withFields(1), 1)).toBeLessThan(0.45);
+    // identity ~$0.62 (Apollo match + waterfall + org, enrich.so, You.com) + one field $0.02; the old $0.25 phone-finder line is gone
+    expect(usd(withFields(1), 1)).toBeLessThan(0.70);
   });
 
   it('reserves one WORST-CASE Enigma fetch only when a card-revenue field is configured, by name (how real configs carry them)', () => {
@@ -205,9 +205,10 @@ describe('admission estimate tracks what a run books (ENG-2720)', () => {
     expect(expectedFieldCostUsd('no-such-model-xyz')).toBe(expectedFieldCostUsd('gpt-5.5'));
   });
 
-  it('counts the Apollo email waterfall twice in the reserve (it can fire at two resolver tiers with no cache between)', () => {
+  it('reserves the Apollo email waterfall once at the booked rate (prod shows ~one broker request per emailless lead)', () => {
     const one = usd(withFields(1), 1);
-    expect(one).toBeGreaterThan(0.0495 + 0.099 + 0.0495 + 0.005 + 0.05 + 0.025 + 0.02);
+    // person_match + waterfall $0.445 + org + enrich.so find + reverse + 2 You.com + one field guard
+    expect(one).toBeCloseTo(0.0495 + 0.445 + 0.0495 + 0.005 + 0.05 + 0.025 + 0.02, 3);
   });
 
   it('routes by aliasFor || name like the orchestrator does', () => {

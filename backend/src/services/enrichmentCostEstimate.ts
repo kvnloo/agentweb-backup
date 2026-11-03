@@ -9,7 +9,7 @@
  * ENG-2720: the Apollo line is read from the vendor rate card (the same number
  * the ledger books) instead of a hardcoded price, and the LLM line is the
  * measured Luna cost, so this estimate tracks what the run will actually book.
- * With both applied the Opiner reference run estimates ~$13.6, down from $31.60. The LLM line
+ * With the LLM line updated the Opiner reference run estimates ~$25.4, down from $31.60 (Apollo stays at the 9-credit $0.445 per the owner's 2026-11-02 decision). The LLM line
  * scales with the saved config's field count and the Apollo line with the leads that lack an
  * email; customers see the result as a percent of their allowance, never as dollars.
  */

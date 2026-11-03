@@ -10,24 +10,24 @@ import {
 import { getAllocatedRate } from '../../utils/vendorRateCard';
 
 describe('estimateEnrichmentCost (ENG-2716)', () => {
-  // ENG-2720: this used to pin the pre-fix $31.60 (Apollo at $0.445 per broker request,
-  // gpt-5.5 at $8.47 per 112 leads). Now: 34 broker requests x $0.099 = $3.37, 112 x
-  // $0.02 Luna tokens + OpenRouter web-search fee = $2.24, lookups $3.61, web $1.37,
-  // unattributed $3.02.
-  it('estimates the Opiner reference run (112 leads) at the corrected rates: ~$13.6, down from $31.60', () => {
+  // ENG-2720: this used to pin the pre-fix $31.60 (gpt-5.5 at $8.47 per 112 leads). Apollo stays at $0.445
+  // per broker request (owner decision 2026-11-02): 34 requests x $0.445 = $15.13, and the LLM line is the
+  // measured Luna cost, 112 x $0.02 (tokens + OpenRouter web-search fee) = $2.24, lookups $3.61, web
+  // $1.37, unattributed $3.02 => $25.37.
+  it('estimates the Opiner reference run (112 leads): ~$25.4, down from $31.60 (only the LLM line changed)', () => {
     const e = estimateEnrichmentCost('list-1', 112);
-    expect(e.breakdownUsd.apollo).toBe(3.37);
+    expect(e.breakdownUsd.apollo).toBe(15.13);
     expect(e.breakdownUsd.llm).toBe(2.24);
     expect(e.breakdownUsd.lookups).toBe(3.61);
     expect(e.breakdownUsd.webSearch).toBe(1.37);
-    expect(e.totalUsd).toBe(13.61);
-    expect(e.totalUsd).toBeLessThan(31.6 * 0.5);
+    expect(e.totalUsd).toBe(25.37);
+    expect(e.totalUsd).toBeLessThan(31.6);
     expect(e.leadCount).toBe(112);
   });
 
   it('prices the Apollo line from the vendor rate card, so a rate change cannot leave the estimate stale', () => {
     const rate = getAllocatedRate('apollo', 'waterfall_email')!;
-    expect(rate).toBeCloseTo(0.099, 6);
+    expect(rate).toBe(0.445);
     const e = estimateEnrichmentCost('l', 112);
     expect(e.breakdownUsd.apollo).toBeCloseTo(112 * rate * ENRICHMENT_COST_RATES_USD.apolloRevealRate, 2);
   });
@@ -72,7 +72,7 @@ describe('estimateEnrichmentCost (ENG-2716)', () => {
   });
 
   it('scales linearly and handles zero/invalid counts', () => {
-    expect(estimateEnrichmentCost('l', 224).totalUsd).toBe(27.21);
+    expect(estimateEnrichmentCost('l', 224).totalUsd).toBe(50.74);
     expect(estimateEnrichmentCost('l', 0).totalUsd).toBe(0);
     expect(estimateEnrichmentCost('l', NaN as any).leadCount).toBe(0);
   });

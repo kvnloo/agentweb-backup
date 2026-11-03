@@ -99,8 +99,8 @@ export async function enrichmentModelFor(userId: string): Promise<string> {
 
 /** Conservative admission estimate, not a price or a settlement calculation.
  * Per lead it reserves every vendor the identity chain can reach (Apollo match, the Apollo email
- * waterfall counted TWICE because it can fire at resolver tier 6.5 and again at group tier 3.5a with no
- * cache between them, Apollo org, enrich.so find and reverse lookups, two You.com searches), plus a
+ * waterfall (once: it could fire at resolver tier 6.5 and again at group tier 3.5a, uncached, but prod shows
+ * about one request per emailless lead and at $0.445 a second one is not worth reserving), Apollo org, enrich.so find and reverse lookups, two You.com searches), plus a
  * guard-banded web/LLM cost per field (scaled by the enrichment model's price; the 10x covers the
  * additional You.com queries made per field group) and, when the config asks for a card-revenue field
  * and the user may buy Enigma, one worst-case Enigma fetch.
@@ -125,7 +125,7 @@ export function estimateEnrichmentBatchMicroUsd(
     return value;
   };
   const identity = rate('apollo', 'person_match')
-    + 2 * rate('apollo', 'waterfall_email')
+    + rate('apollo', 'waterfall_email')
     + rate('apollo', 'org_enrichment')
     + rate('enrich.so', 'email_lookup')
     + rate('enrich.so', 'reverse_lookup')

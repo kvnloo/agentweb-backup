@@ -56,8 +56,8 @@ interface VendorRateEntry {
  * any rate edit**, otherwise two different prices share one version and a
  * historical event can no longer be re-derived from the card that produced it.
  *
- * 2026-11-02: Apollo waterfall booked by credits actually requested (ENG-2720);
- * previously 2026-10-19 (ENG-2271 Twilio placeholders).
+ * 2026-11-02: Apollo `full_enrichment` split into `waterfall_email` ($0.445, unchanged) and
+ * `waterfall_phone` (ENG-2720); previously 2026-10-19 (ENG-2271 Twilio placeholders).
  */
 export const VENDOR_RATE_CARD_VERSION = "2026-11-02";
 
@@ -65,38 +65,40 @@ export const VENDOR_RATE_CARD_VERSION = "2026-11-02";
  * Apollo allocated USD per credit (ENG-703, Harsha 2026-08-16): the 60% gross-margin
  * floor is real cost / 0.40 (x2.5). Real cost is $0.01975 per credit (Professional
  * Annual, $948 / 48,000 credits, confirmed from the account 2026-10-30), and
- * 2.5 x $0.01975 = $0.0494, booked as $0.0495. Every Apollo rate below is a credit
- * count x this constant (1 credit: email_reveal, person_match, org_enrichment; 2:
- * waterfall_email; 8: waterfall_phone), so a pricing change is one edit here. The one
- * exception is `phone_reveal` ($0.395), kept at its ENG-703 approved-table value; it is
- * unused and $0.001 below 8 credits only because of rounding in that table.
+ * 2.5 x $0.01975 = $0.0494, booked as $0.0495. The one-credit Apollo rates (email_reveal,
+ * person_match, org_enrichment) and waterfall_phone (8 credits) are this constant x a
+ * credit count, so a per-credit pricing change is one edit here. Two entries sit at their
+ * ENG-703 approved-table values instead: `waterfall_email` ($0.445) and the unused
+ * `phone_reveal` ($0.395, $0.001 below 8 credits only because of rounding in that table).
  */
 export const APOLLO_USD_PER_CREDIT = 0.0495;
 
 /**
- * Credits the broker waterfall can consume per component (ENG-2720).
+ * Apollo email-waterfall booking (ENG-703 "full enrichment" = $0.445 = "up to 9 credits":
+ * 1 email + 8 phone), per component so phone numbers can slot in later (ENG-2720).
  *
- * - email: 2 credits. Apollo's own lookup is 1 credit only when a verified email is
- *   found; Icypeas / Prospeo charge 2 each even on a miss; ZeroBounce adds 1. Observed
- *   usage rows are 1-2 credits per contact, ~0.5-0.6 on average, so 2 is the
- *   conservative booked count and keeps the booked margin at or above the 60% floor
- *   even if every request really consumed 2. The tail is not covered: a rare miss that
- *   runs through both third-party sources plus validation (~5 credits, ~$0.099 real) books
- *   $0.099, i.e. break-even (~0% margin), not 60%. On the observed ~0.55-credit average
- *   ($0.0109 real) the booked margin is ~89%, so this is still a flat allocation with
- *   headroom, not a per-request measurement.
- * - phone: 8 credits (Apollo phone reveal). NOT requested by any call today: the
- *   /people/match body has no phone parameter anywhere in the backend. It exists so
- *   adding phone numbers books one more component instead of reworking a bundled
- *   rate. Verify the waterfall-phone charge (third-party vendors, misses) on
- *   Apollo's "About credits" page before the first caller ships; if it exceeds 8
- *   credits the margin drops below the floor.
+ * DECISION (Harsha, Argusoft <> AgentWeb sync 2026-11-02): KEEP booking the 9-credit amount
+ * on every email waterfall although nothing requests a phone yet (the /people/match body has
+ * no phone parameter anywhere in the backend; the Apollo account shows 0 phone credits used;
+ * observed real usage is 1-2 credits per contact). Rationale: customers' wallets are ~40% of
+ * what they pay (Starter $80 of $199, Pro $200 of $499), so the margin is already there;
+ * revisit when phone fetching ships. The earlier proposal to book 2 credits ($0.099) was
+ * declined. Known consequence, recorded so it is a choice and not an accident: the booked
+ * amount is ~10-40x Apollo's real cost, so wallets drain faster than the work warrants and,
+ * on accounts with pay-as-you-go overage on (Opiner), the overage invoice carries it at the
+ * tier's markup.
  *
- * The retired bundled `full_enrichment` line was "up to 9 credits" (1 email + 8
- * phone) booked on every email-waterfall request, which charged for a phone that
- * was never requested (~97% booked margin on credits never consumed).
+ * - email: 1 credit (Apollo's own lookup; third-party sources charge more on a miss).
+ * - phone: 8 credits (Apollo phone reveal), NOT requested by any call today.
+ *
+ * `waterfall_email` is therefore booked at the full 9-credit table value ($0.445 = email + the
+ * 8-credit phone allowance). **When phone fetching ships, change `waterfall_email` to
+ * apolloCreditsUsd(1) and book `waterfall_phone` ($0.396) on requests that ask for a phone, or
+ * the phone credits are counted twice.** Verify the waterfall-phone charge (third-party
+ * vendors, misses) on Apollo's "About credits" page before the first caller ships; if it
+ * exceeds 8 credits the margin drops below the floor.
  */
-export const APOLLO_WATERFALL_CREDITS = { email: 2, phone: 8 } as const;
+export const APOLLO_WATERFALL_CREDITS = { email: 1, phone: 8 } as const;
 
 const apolloCreditsUsd = (credits: number): number =>
   Math.round(credits * APOLLO_USD_PER_CREDIT * 1_000_000) / 1_000_000;
@@ -114,11 +116,13 @@ const RATE_CARD: Record<VendorRateProvider, Record<string, VendorRateEntry>> = {
   apollo: {
     email_reveal: { recordingUnit: "reveal", usdPerUnit: apolloCreditsUsd(1) },
     phone_reveal: { recordingUnit: "reveal", usdPerUnit: 0.395 },
-    // ENG-2720: broker waterfall booked per component (credits x APOLLO_USD_PER_CREDIT).
-    // Email = $0.099 per request; phone = $0.396, booked only once a caller asks for one.
-    waterfall_email: { recordingUnit: "enrichment", usdPerUnit: apolloCreditsUsd(APOLLO_WATERFALL_CREDITS.email) },
+    // ENG-2720: broker waterfall, per component. waterfall_email is booked at the ENG-703 approved "full
+    // enrichment" table value $0.445 (= email 1 + the 8-credit phone allowance) per the owner's 2026-11-02
+    // decision to keep the 9-credit amount; see APOLLO_WATERFALL_CREDITS for the switch when phone ships.
+    waterfall_email: { recordingUnit: "enrichment", usdPerUnit: 0.445 },
     // PROVISIONAL and unused: no caller books this yet. The 8 credits is Apollo's plain phone reveal; verify the
-    // waterfall-phone charge (third-party vendors, misses) before the first caller ships.
+    // waterfall-phone charge (third-party vendors, misses) before the first caller ships. Do not book it together
+    // with waterfall_email at 9 credits (that already includes it).
     waterfall_phone: { recordingUnit: "enrichment", usdPerUnit: apolloCreditsUsd(APOLLO_WATERFALL_CREDITS.phone) },
     // ENG-696: basic /people/match with no email/phone reveal — Apollo's
     // cheapest person-match credit tier (same class as org enrichment below).

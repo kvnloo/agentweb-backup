@@ -36,11 +36,11 @@ import { recordVendorUsage } from './usageRecorderService';
 // recordUsage/recordVendorUsage writes to, at the exact point the call
 // reaches api.apollo.io. A call with no resolvable userId still records,
 // attributed to the platform (recordVendorUsage defaults userId to "system").
-// Tier-3 (runWaterfall) findEmail calls are recorded under `waterfall_email`
-// — a materially higher-cost broker chain — rather than `email_reveal`, so a
-// future rate can price the two differently (AC5). ENG-2720: this was the
-// bundled `full_enrichment` (9 credits = email + phone) before; phone is now its
-// own `waterfall_phone` component, booked only if a call ever requests one.
+// Tier-3 (runWaterfall) findEmail calls are recorded under `waterfall_email` (formerly
+// `full_enrichment`, same $0.445) — a materially higher-cost broker chain — rather than
+// `email_reveal`, so the two can be priced differently (AC5). ENG-2720: the amount is the 9-credit
+// table value on purpose (owner decision 2026-11-02); `waterfall_phone` exists for when a call
+// actually requests a phone, and nothing books it today (see vendorRateCard.ts).
 function recordApolloLedger(rateKey: string, unit: string, userId: string | undefined): void {
   void recordVendorUsage({
     userId,

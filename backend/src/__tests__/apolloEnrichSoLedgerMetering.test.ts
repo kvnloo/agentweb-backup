@@ -153,7 +153,7 @@ describe('Apollo $ ledger mirroring (ENG-696)', () => {
     expect(ctx.operation).toBe('waterfall_email');
     expect(ctx.rateKey).toBe('waterfall_email');
     // The key the factory emits must exist on the card, or the recorder books it `unpriced`.
-    expect(getAllocatedRate('apollo', ctx.rateKey)).toBeCloseTo(0.099, 6);
+    expect(getAllocatedRate('apollo', ctx.rateKey)).toBe(0.445);
     delete process.env.BACKEND_URL;
   });
 
