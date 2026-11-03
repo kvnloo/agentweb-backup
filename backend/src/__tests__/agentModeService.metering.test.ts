@@ -257,7 +257,7 @@ describe('AgentModeService.callLLM — OpenRouter provider + cost (ENG-9)', () =
     expect(call.costUsdOverride).toBeCloseTo(0.00567525, 8);
   });
 
-  it('books a BYOK call once when the router charge equals the token bill and no server tool ran (never twice)', async () => {
+  it('books both bills (and only warns) when the router charge equals the token bill and no server tool use is reported', async () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
     create.mockResolvedValue({
       id: 'gen-byok-same-figure',
@@ -277,7 +277,7 @@ describe('AgentModeService.callLLM — OpenRouter provider + cost (ENG-9)', () =
     });
 
     const call = mockMeterUser.mock.calls[mockMeterUser.mock.calls.length - 1][0];
-    expect(call.costUsdOverride).toBe(0.0068);
+    expect(call.costUsdOverride).toBeCloseTo(0.0136, 8);
     warn.mockRestore();
   });
 

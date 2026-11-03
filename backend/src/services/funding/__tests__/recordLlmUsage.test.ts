@@ -255,16 +255,42 @@ describe('recordLlmUsage (ENG-1816 F1)', () => {
     it('adds a platform fee that is smaller than the token bill even without a server tool', () => {
       expect(openRouterByokCostUsd({ cost: 0.0005, cost_details: { upstream_inference_cost: 0.01 } })).toBeCloseTo(0.0105, 8);
     });
-    it('never books the same call twice: a router charge at least the whole upstream bill with no server tool use is taken as already containing it', () => {
+    it('NEVER drops a real search fee, even when the response lacks the server-tool-use field (Luna: fee is several times the token bill)', () => {
       const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
-      // the shape an automated checker replayed: charge == upstream, no tool use
-      expect(openRouterByokCostUsd({ cost: 0.0068, cost_details: { upstream_inference_cost: 0.0068 } })).toBe(0.0068);
-      // a larger charge with nothing to explain it
-      expect(openRouterByokCostUsd({ cost: 0.02, cost_details: { upstream_inference_cost: 0.0068 } })).toBe(0.0068);
-      // server_tool_use_details present but empty / zero is not a tool use
-      expect(openRouterByokCostUsd({ cost: 0.0068, cost_details: { upstream_inference_cost: 0.0068 }, server_tool_use_details: {} })).toBe(0.0068);
-      expect(openRouterByokCostUsd({ cost: 0.0068, cost_details: { upstream_inference_cost: 0.0068 }, server_tool_use_details: { web_search_requests: 0 } })).toBe(0.0068);
-      expect(warn).toHaveBeenCalledTimes(1); // one-time warning, not one per call
+      for (const shape of [undefined, {}, { web_search_requests: 0 }, 'weird', ['x'], { nested: { web_search_requests: 1 } }]) {
+        const usage: any = { cost: 0.007, cost_details: { upstream_inference_cost: 0.0005 } };
+        if (shape !== undefined) usage.server_tool_use_details = shape;
+        expect(openRouterByokCostUsd(usage)).toBeCloseTo(0.0075, 8);
+      }
+      warn.mockRestore();
+    });
+    it('books both bills for a charge that equals the token bill with no tool use, and warns (tripwire only), at most once a minute', () => {
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      const now = jest.spyOn(Date, 'now');
+      const shape = { cost: 0.0068, cost_details: { upstream_inference_cost: 0.0068 } };
+      // a clock later than any warning an earlier test may have triggered, so the throttle starts open
+      const base = Date.now() + 24 * 3_600_000;
+      now.mockReturnValue(base);
+      expect(openRouterByokCostUsd(shape)).toBeCloseTo(0.0136, 8);
+      expect(openRouterByokCostUsd(shape)).toBeCloseTo(0.0136, 8);
+      expect(openRouterByokCostUsd({ cost: 0.02, cost_details: { upstream_inference_cost: 0.0068 } })).toBeCloseTo(0.0268, 8);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0][1]).toEqual({ usageKeys: ['cost', 'cost_details'], costDetailKeys: ['upstream_inference_cost'] });
+      now.mockReturnValue(base + 61_000);
+      openRouterByokCostUsd(shape);
+      expect(warn).toHaveBeenCalledTimes(2);
+      now.mockRestore();
+      warn.mockRestore();
+    });
+    it('does not warn for real shapes: search with its tool use, a platform fee below the token bill, no router charge', () => {
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      // a clock later than any earlier test's throttle timestamp, so a wrongly-fired warning would not be hidden by the throttle
+      const now = jest.spyOn(Date, 'now').mockReturnValue(Date.now() + 72 * 3_600_000);
+      openRouterByokCostUsd({ cost: 0.007, cost_details: { upstream_inference_cost: 0.0005 }, server_tool_use_details: { web_search_requests: 1 } });
+      openRouterByokCostUsd({ cost: 0.0005, cost_details: { upstream_inference_cost: 0.01 } });
+      openRouterByokCostUsd({ cost: 0, cost_details: { upstream_inference_cost: 0.00004 } });
+      expect(warn).not.toHaveBeenCalled();
+      now.mockRestore();
       warn.mockRestore();
     });
     it('still adds the charge when it equals the token bill but a server tool really ran', () => {

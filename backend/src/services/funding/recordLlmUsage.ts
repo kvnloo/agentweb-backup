@@ -42,7 +42,8 @@ function reportsServerToolUse(usage: { server_tool_use_details?: unknown }): boo
   return Object.values(details as Record<string, unknown>).some(v => typeof v === 'number' && Number.isFinite(v) && v > 0);
 }
 
-let warnedImplausibleRouterCharge = false;
+const SHAPE_WARNING_INTERVAL_MS = 60_000;
+let lastShapeWarningAt = 0;
 
 /**
  * AgentWeb's own total cost of one OpenRouter call served on a BYOK key, in USD (ENG-2720).
@@ -54,15 +55,18 @@ let warnedImplausibleRouterCharge = false;
  * Reading only the upstream figure left the web-search fee out of the ledger entirely: on a
  * real Luna enrichment run the fee was ~$1.1 against ~$0.2 of recorded tokens.
  *
- * Guard against double counting: every real response observed has a router charge that is either 0,
- * a search fee reported together with a server-tool use ($0.007 Exa, $0.005 Parallel, usually larger
- * than the token bill), or a platform fee well below the token bill. A router charge that is AT LEAST the
- * whole upstream bill and comes with NO reported server-tool use has nothing to explain it, and is most
- * likely a figure that already contains the upstream bill (a response-shape change would look exactly
- * like that). Booking the sum there would charge the customer's allowance, and any pay-as-you-go
- * invoice, twice for the same call, which is the failure this ticket exists to remove. So in that shape
- * only the upstream bill is booked, with a one-time warning so a change in OpenRouter's reporting shows
- * up in the logs instead of silently skewing the ledger.
+ * Observed on real responses: a plain BYOK call reports `usage.cost` 0; a search call reports the fee
+ * ($0.007 Exa, $0.005 Parallel) with `server_tool_use_details.web_search_requests` and an upstream bill of
+ * ~$0.0005 to $0.0007, so the fee is often several times the token bill. That is why the router charge is
+ * NEVER dropped or capped by its size: a rule such as "ignore a charge at least as large as the upstream bill"
+ * would discard the real search fee on every default (Luna) search call the moment a response lacked the
+ * tool-use field, which is the under-booking this change exists to remove.
+ *
+ * Tripwire only: a router charge at least as large as the whole upstream bill with NO reported server-tool
+ * use is not a shape seen in real traffic. It could be a platform fee, or a response in which `usage.cost`
+ * already contains the upstream bill. Both bills are still booked (an over-count is bounded by the token bill,
+ * an under-count by the whole fee), and a warning naming the response's keys is logged at most once a minute
+ * so a change in OpenRouter's reporting shows up in the logs instead of silently skewing the ledger.
  *
  * `undefined` when neither bill is reported, so the caller falls back to the price book exactly as
  * before. An unusable OpenRouter charge counts as 0, never as a drop; a fee with no upstream bill is
@@ -83,11 +87,14 @@ export function openRouterByokCostUsd(
   const upstream = usage?.cost_details?.upstream_inference_cost;
   if (typeof upstream === 'number' && Number.isFinite(upstream) && upstream > 0) {
     if (routerCharge > 0 && routerCharge >= upstream && !reportsServerToolUse(usage)) {
-      if (!warnedImplausibleRouterCharge) {
-        warnedImplausibleRouterCharge = true;
-        console.warn('[openRouterByokCostUsd] BYOK router charge is at least the whole upstream bill with no server tool use reported; booking the upstream bill only (OpenRouter usage shape change?)');
+      const now = Date.now();
+      if (now - lastShapeWarningAt >= SHAPE_WARNING_INTERVAL_MS) {
+        lastShapeWarningAt = now;
+        console.warn(
+          '[openRouterByokCostUsd] BYOK router charge is at least the whole upstream bill and no server tool use is reported; booking both. OpenRouter usage shape change?',
+          { usageKeys: Object.keys(usage ?? {}), costDetailKeys: Object.keys(usage?.cost_details ?? {}) },
+        );
       }
-      return upstream;
     }
     return upstream + routerCharge;
   }

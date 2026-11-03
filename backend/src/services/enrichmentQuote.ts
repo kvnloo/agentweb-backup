@@ -31,7 +31,7 @@ export interface QuoteDeps {
     limit: number,
     lastKey?: unknown,
   ): Promise<{ items: Array<{ leadId?: unknown; email?: unknown }>; lastEvaluatedKey?: unknown }>;
-  /** The list's saved enrichment config, or undefined when none is saved or it cannot be read. */
+  /** The list's saved enrichment config, or undefined when none is saved. Rejects when a saved config cannot be read: the quote must fail, not guess. */
   getSavedConfig(listId: string, userId: string): Promise<EnrichmentConfig | undefined>;
   /** Whether this is an email the resolver would use as one (not blank, not a placeholder/test domain). */
   hasUsableEmail(email: unknown): boolean;
