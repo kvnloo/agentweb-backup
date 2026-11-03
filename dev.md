@@ -1,3 +1,670 @@
+## ENG-589: agent-mode failure clusters auto-file Linear issues via the ENG-240 rail (2026-11-02)
+
+- `ClusterIntakeTool` replaces the bare `SpecOutputTool` in the agent-mode loop: each major `toolName × failureType` cluster (existing count+rate thresholds) files one `Auto` issue through `fileAutoIssue` with `Alert Class: agent-mode:<tool>:<failureType>`, cluster stats, up to 3 sample traces, and an AC stub. Open canonical → occurrence comment; closed canonical → reopen (`findMostRecentClosedIssueByLabel`); always `human-triage`.
+- Runs only when the 17:30 UTC loop runs (`AGENT_MODE_LOOP_ENABLED`); non-prod filing stays suppressed by ENG-1099.
+
+## ENG-2778: Paging-spiral detection for agent loop (2026-11-02)
+
+Agent loop now nudges once per turn when the same tool+target is paged >=5 times with varying offset/limit (evaded exact-signature anti-loop guards). Partial fix: fixes 1,2,4,5 from the issue remain open.
+
+## ENG-944: read_verification_code reads codes sent to a role/alias address (2026-11-01)
+
+- New `delivered_to` arg: searches the resolved own/org-shared mailbox with Gmail `deliveredto:` and only accepts a code email whose To/Cc names that address. No persistence; a stored admin alias mapping is a separate data-plane slice.
+
+## ENG-2773: createSessionWithPlan honours idempotencyKey (2026-11-01)
+
+`POST /api/agent-mode/public/plan/:planTitle/session` now accepts an optional body `idempotencyKey`, using the
+same ENG-147 `idem#` submit-lock as `createSession` (AW-AgentRuns, existing rows/attributes only, no schema change).
+Dark: active only with `AGENT_RUN_STORE=true` (unset in production), so behaviour is unchanged today.
+
+- Signed-in launchers only. Anonymous callers get a random `anon_` userId per call, so a key could never replay.
+- Key = `createSessionIdempotencyKey(userId, "plan|<normalized title>|<clientKey>")`: per user and per plan,
+  never colliding with `createSession` keys or another user.
+- The winner's sessionId is recorded only after the session is fully built (model, plan, share token). A duplicate
+  then gets the original `sessionId`/`redirectUrl`/`conversableToken`/`workPlan` plus `idempotentReplay: true`, and
+  the starting message is NOT re-fired. A duplicate during the in-flight window gets 409 `DUPLICATE_SUBMIT`. A
+  recorded session owned by another user is never returned.
+- Any launch failure releases the claim so a retry can create the session.
+
+## ENG-758: Usage breakdown on get_account_status (2026-10-31)
+
+- `get_account_status` takes optional `usage_month` (YYYY-MM). When set it reads the existing
+  `/api/subscription/usage/itemized` ledger and returns `usage_breakdown`: token/call totals,
+  per model, per day, and a session count (`exact: false` when daily aggregates lack session ids).
+- No dollars leave the tool (ENG-1212 AC4); no new table, index, or persisted field.
+- Pure aggregator: `backend/src/mcp/server/usageBreakdown.ts`.
+
+## ENG-1948: Hide evaluation_workspace from principals that can only be denied (2026-10-31)
+
+Agent Mode tool listing now omits `evaluation_workspace` for non-admin, delegated, interactive-share, unattended/scheduled and sandbox principals. Execute-time EvaluationDenied checks unchanged.
+
+## ENG-673: AgentWeb puts its event webhook on the customer's Smartlead campaign, and takes it off again (2026-10-30)
+
+Build 2 of slice 3. When a push run starts (before its first contact is added), the worker makes sure the campaign has ONE webhook named `AgentWeb: replies, bounces and unsubscribes` (events EMAIL_REPLY, EMAIL_BOUNCE, LEAD_UNSUBSCRIBED) pointing at `<BACKEND_URL>/api/webhooks/smartlead/<account>/<campaign>/<token>`. Idempotent (an existing correct one is left alone, a wrong one is updated in place, duplicates of ours are removed); it only ever touches webhooks with exactly that name AND this deployment's own address AND this account's path (so the test environment and production, which can share one Smartlead account, never rewrite or delete each other's), never the customer's own or another tool's; it is best effort with a 15 second limit and never delays or stops a push (a failure is only logged, with keys scrubbed). It needs a usable public address: `BACKEND_URL` over https in production (http allowed elsewhere), never localhost; without one nothing is registered. When a customer removes their own Smartlead connection (both removal routes, only for their own `smartlead-<userId>` connection), the key is found first and the connection is removed immediately; the webhook cleanup then runs in the background and stops if the connection is added again meanwhile (Smartlead allows about one call a second, so an account with many campaigns takes a while), up to 300 campaigns and 5 minutes, tracked by the shutdown drain. Verified live on the test environment against real Smartlead: the Smartlead REST calls (`GET`/`POST` on `/campaigns/{id}/webhooks`, update with the same POST plus `id`, delete with `DELETE` and `{id}` in the body), a first push creating the webhook, a second push finding it present, and a disconnect returning in under a second while the cleanup removed ours (and left the customer's own webhook) a few seconds later. No schema change. Known limits: after BACKEND_URL changes the old address's webhook is no longer recognised and stays; a connection removed by an org owner or admin for a teammate (a different route) does not clean up the teammate's webhooks, which then stay harmless; and a customer who renamed our webhook keeps it, and we add our own beside it (events are idempotent, so a duplicate delivery changes nothing).
+
+## ENG-673: an hourly poll backs up the Smartlead event webhook (2026-10-30)
+
+Build 4 of slice 3. Once an hour (first pass 20 minutes after start, not behind the push kill switch, like the withdrawal sweep), for every Smartlead campaign a push went into within the last 60 days (newest 100), the backend asks Smartlead which contacts replied, bounced or unsubscribed (`GET /campaigns/{id}/leads`: replies and bounces with `emailStatus=is_replied|is_bounced`; opt-outs both with `emailStatus=is_unsubscribed` and from the plain listing keeping rows whose own `lead.is_unsubscribed` flag is set, because the filter does not list a contact unsubscribed through the API, found in the live test; the plain listing lags behind a large add, which only delays a catch-up since the poll acts on rows that are there) and feeds each through the same handler the webhook uses, so a missed unsubscribe or bounce still blocks the contact. The poll only learns THAT a contact did it (no time, text or event id), so a polled event records only what the contact does not already show: a reply only when no Smartlead reply for that campaign is recorded yet (a missed SECOND reply is not recovered), a bounce or opt-out only when the contact is not already blocked (which also covers our own withdrawal unsubscribing a blocked contact in Smartlead and Smartlead then listing it). Contacts are only acted on if they prove they were pushed to that campaign through that account, as for the webhook. A contact handled in the last 6 hours is not looked up again (in memory). Only a campaign that no longer exists in Smartlead, or whose key is gone, is skipped (a drafted or archived one is still read: an opt-out the customer recorded in Smartlead must reach the CRM whatever the status); at most 1000 contacts per status per campaign per pass, and any limit hit is logged once a day, never silently. No schema change.
+
+How a CRM "Resubscribe" interacts: Smartlead keeps listing a contact as unsubscribed (or bounced) for good, so a polled opt-out or bounce is not applied when our own withdrawal caused it (marker `withdrawn`, or `released` with `withdrawnAt`), or when a Smartlead opt-out or hard bounce for that campaign is on file and the status was written at or after it (a Resubscribe stays). If it is on file but the status was never written (the write failed), the poll finishes the block without a second engagement. A temporary bounce on file does not hide a later opt-out. Known limits: every polled bounce is treated as hard, except when a temporary bounce is already on file (the poll has no bounce text; Smartlead does not document whether `is_bounced` includes temporary bounces; in a sample of 40 bounced contacts in two real campaigns on 2026-10-30, the bounce messages showed only 5xx codes and nothing temporary, which is evidence, not proof). A wrong block can be lifted in the CRM, but the withdrawal sweep will have unsubscribed the contact account-wide in Smartlead by then, which cannot be undone. A contact blocked by other means, resubscribed before the sweep's marker write landed, can be blocked once more, after which a Resubscribe stays. A re-pushed contact's new opt-out is not seen when an old one is on file (the webhook still is). A missed SECOND reply is not recovered, and a first pass after deploy records each reply in the window that has none on file, with an alert, dated then. API opt-outs are found in the first 1000 contacts of a campaign's plain listing. With more than 100 campaigns in the window, the longest-waiting go first.
+
+## ENG-673: the poll no longer treats a bounce from our own sending side as the contact's (2026-10-30)
+
+Found by checking the poll against two real Smartlead campaigns: Smartlead's `is_bounced` contact list also holds contacts whose bounce was `sender_bounce` (our sending mailbox was refused or is broken, which says nothing about the contact's address): 41 of 57 on one campaign and 2 of 9 on the other, every one of them also in Smartlead's separate `is_sender_bounced` list. Reading the bounce text cannot tell the two apart (the real messages are all `5xx`, and 37 of 60 carry `5.7.x` policy and reputation codes). Before this change the poll would have blocked those contacts as bounced and the withdrawal sweep would then have unsubscribed them in Smartlead for good. Now a contact counts as bounced only when it is in the bounced list and NOT in the sender-side list; the sender-side list is read once per pass, and only after the first bounced page has rows (so a campaign with no bounces costs no extra read and a failing read costs nothing); if it cannot be read in full (a failed read, or more contacts than the pages read), no bounce is acted on for that campaign that pass, and it is logged once a day. Opt-outs and replies are unaffected. On the two real campaigns the poll would now act on 7 of 9 and 16 of 57. The poll was live in production but could not have acted on a real contact: the only production runs are finished tests on deleted campaigns. A contact whose emails bounced from both sides is not blocked (the safe direction; the webhook still delivers a genuine bounce). Bounce text is not read at all, so no per-contact message reads were added; a temporary (`4xx`) bounce still cannot be told from a permanent one by the poll, but none was seen in 60 real messages and the webhook classifies by text.
+
+Hardening from the review of that fix: Smartlead's two lists are separate reads and might not change at the same moment (not known), and a block ends in an irreversible withdrawal, so a contact that looks genuinely bounced is acted on only when it looks so on two passes at least 45 minutes apart (held in memory, so a restart starts the wait again; a contact seen in the sender-side list loses its wait). The poll is only a backstop (the webhook delivers a genuine bounce at once), so the delay costs nothing. An empty page before the end of the sender-side list counts as incomplete, like a list longer than the pages read: no bounce is acted on that pass.
+
+From the review of that hardening: a waiting contact last seen more than 12 hours ago starts its wait again (it dropped out of the bounced list and came back, so the old first sighting must not stand in for the second; 12 hours so that a campaign polled only every few passes, when there are over 100 campaigns, still completes its wait), and records not seen for a day are dropped. The reviewer's other points are now covered by tests: an empty page before the end of the sender-side list, an unknown sender-side list stopping only the bounce kind and leaving the waits alone, and a failed handle keeping its wait so the next pass retries.
+
+## ENG-673: hardening of the Smartlead event poll after its final review (2026-10-30)
+
+Follow-up to the hourly poll (#3848). A contact whose handling failed (a database error while blocking an opt-out) is no longer remembered as handled, so it is retried on the next pass instead of after six hours; a contact that matched nobody in the CRM (the customer's own contacts, our withdrawn ones, or a lookup that lagged) is looked at again after two hours (longer than the hourly cadence, so a pass does not repeat every such lookup), one that matched after six hours. A status filter that Smartlead ignored or renamed would list the whole campaign as bounced or unsubscribed, so a filtered answer of 5 or more contacts that is as big as the campaign (its size read once per pass) is refused and logged; when the size cannot be read, bounces and replies are not polled for that campaign that pass (opt-outs still are, each carries Smartlead's own flag), and it is logged once a day; a small campaign where everyone really did bounce is refused too, and the webhook still delivers those. An opt-out is believed only when Smartlead's own flag on the contact is set, however it was found. A time from Smartlead later than our own clock is recorded as now, so it cannot out-date a CRM user's Resubscribe. A bounce already on file no longer hides a later opt-out from the poll (or the other way round): only an event of the same kind counts as already shown. Not changed: every polled bounce is still treated as hard (owner to decide whether to read the bounce text first) Verified on a real account (2026-10-30): Smartlead's lead is ONE lead across the account's campaigns, so unsubscribing it in one campaign (or account-wide, as our withdrawal sweep does) shows it unsubscribed and blocked in every other campaign too. The poll therefore skips an opt-out or bounce for any marker whose Smartlead lead id is withdrawn on any marker of any lead record with the same address, so a withdrawal in one campaign or list is never read back as news in another.
+
+Also from the review of #3849: the address parser used by the do-not-contact email guard no longer cuts an address at a `?` inside its local part (only a query after the domain), treats a piece over 600 characters as unverifiable, so `blockedRecipients` refuses the send (its regexes were quadratic on long input: 100,000 characters took seconds; `addressesOf` on its own still just skips such a piece), trims surrounding punctuation with a loop, and keeps `{` and `}` (legal in a local part). Tests now pin the order for removing a Smartlead connection (find the key, delete the connection, then run the cleanup; a teammate's connection is never touched) and that the strict connection read throws on a failed read.
+
+Also: the withdrawn-id set only counts a marker whose own run belongs to this Smartlead account (the email index spans every customer); a recipient piece over 600 characters now refuses the email send instead of being skipped; the poll logs once a day when contacts come back from Smartlead's unsubscribed filter without the flag set.
+
+Follow-up from the last review: an apostrophe is legal in the local part of an address (`o'brien@x.com`) and was dropped by the parser, so the guard looked up `brien@x.com` and a do-not-contact contact like that could be emailed. The parser now keeps it, and also tries the address without a leading quote for quoted forms. Confirmed on real Smartlead data (about 66 distinct bounced contacts in two real campaigns): `lead.is_unsubscribed` is never set on a bounce, so a bounce cannot be mistaken for an opt-out.
+
+Apostrophes in the address guard, final design: the main address pass is unchanged from before (so everything it found, it still finds), and apostrophe handling is a SEPARATE pass whose results are only ever added to it. For a piece containing an apostrophe, that pass also looks the address up as written (`o'brien@x.com`, which the main pass cuts to `brien@x.com`) and as each apostrophe-delimited tail of its local part (at most 6 extra readings), with quote marks and brackets trimmed from each, so quoting such as `name='a@x.com'` or `x'(a@x.com)` also finds `a@x.com` (the main pass already does). Two earlier versions that instead changed the main regex lost addresses the old parser caught (`'a@x.com'|'b@y.com'`, `'(a@x.com)'`, many quotes): found by a reviewer's differential test, 2,895 hand-built inputs and 300,000 random strings against the old parser, which is now 0 losses for both; the same check lives in the tests (an embedded copy of the old parser, a list of the forms that were lost, and 20,000 random strings). The price of the extra readings is refusing a send to someone blocked under the tail name (`brien@x.com` for `o'brien@x.com`): it fails safe and is rare. Confirmed on real Smartlead data: `lead.is_unsubscribed` is never set on a bounced contact (0 of 67 listed across two campaigns), so a bounce cannot be mistaken for an opt-out.
+
+## ENG-673: a contact marked do-not-contact is refused on every send path (2026-10-30)
+
+Build 3 of slice 3. Smartlead bounces and unsubscribes now set the do-not-contact status automatically, so every way AgentWeb itself can message a contact has to refuse one. An audit of all send paths found these open, now closed: the one-off `send-email` and `reply-email` routes (409 `do_not_contact`, no override, not even the Smartlead confirmation); Emma's generic `email` tool and `POST /api/emma/email` and `send_email_from_sender` (address-only sends: the address is looked up and any copy of the contact in any list counts when its owner is the sender, the mailbox owner or anyone in the sender's org, because an opt-out is the contact's and holds for the whole team; another customer's block never counts; a lead with no owner recorded is resolved through its list; a lookup that fails or hits its row cap refuses the send instead of letting it through); and the drip worker, which now checks the lead it just read before every send regardless of the sequence's exit settings (a sequence saved with `onUnsubscribe` off, or an older one, used to skip the check) and exits an enrollment whose lead no longer exists. New sequences always store `onUnsubscribe: true`. Already covered before: group email, forward-lead auto-send, Emma `send_email_to_lead`, the Smartlead push. No schema change.
+
+Known limits: the lead-based checks (CRM routes, drip, `send_email_to_lead`) look at the one lead record in front of them, so a person unsubscribed in one list but active in another is only stopped on the address-based paths; plus-addressing (`a+x@b.com`) is not matched to `a@b.com`; sends typed to an address with no lead behind it (test sends, the client-report recipient) are not checked on purpose; WhatsApp and voice calls were not traced.
+
+Follow-up (same day): the do-not-contact checks added to LinkedIn and X sends (CRM LinkedIn message and invite routes, Emma LinkedIn invite/message/InMail, Emma X DM) are removed. Neither ticket asks for them (both name email: Gmail, Outlook, Resend, drips); the owner decided against the extra machinery. A Smartlead opt-out or bounce therefore stops AgentWeb's email to that contact, not LinkedIn or X. Drip sequences keep their existing rule for every step, including LinkedIn steps. Also: address parsing drops punctuation and a mailto query around an address and flattens nested arrays. Webhook cleanup on disconnect now starts after the connection is deleted, and stops if it cannot read whether the connection came back.
+
+## ENG-2769: Usage-alert modal outcome events (2026-10-30)
+
+- `POST /api/subscription/usage-runway/alert-event` records `runway_alert_{shown,dismissed,see_options,book_call,upgrade,contact}` via `recordUsageTelemetry` (log sink), keyed on the billing subject. Durable store is ENG-2770.
+
+## ENG-673: Starting a push into a sending campaign with no unsubscribe link needs an explicit acceptance (2026-10-29)
+
+Owner decision 2026-10-29: a missing unsubscribe link only warns for a draft or paused campaign (nothing sends until the customer starts it in Smartlead), but for a campaign that is already sending it must be accepted in words. Preview now returns `requiresUnsubscribeAcknowledgement` (campaign ACTIVE and the preflight found no unsubscribe link: option off, or on with empty footer text). `start` refuses with 400 `unsubscribe_acknowledgement_required` unless `acknowledgements.noUnsubscribeAccepted` is true, and records it in the run's audit. Emma's approval card says in capitals that the emails have no unsubscribe link and the campaign is already sending; the flag is part of the approval digest (a change needs a new card), approving sends the acceptance, and the tool result tells the model (`sendingWithNoUnsubscribeLink`). No schema change.
+
+## ENG-673: Document that Smartlead's per-campaign lead listing lags after a large add (2026-10-29)
+
+Comment only, no behaviour change. On production, after a 450-lead add into a campaign, Smartlead's unfiltered per-campaign lead listing showed 1 lead for several minutes (451 were present; the add call had returned 450 lead ids), while the account-wide lead total and a `status=STARTED` filtered listing were right immediately. The note on `addLeadsToCampaign` tells future code and tests to trust the add response, and to wait or use the account total or a status filter when they count a campaign's leads.
+
+## ENG-673: Smartlead replies, bounces and unsubscribes reach the CRM: the event endpoint (2026-10-29)
+
+New public endpoint `POST /api/webhooks/smartlead/:accountId/:campaignId/:token` (build G1 of slice 3). The URL carries an HMAC token of the account and the campaign (no storage; Smartlead's own signature is not relied on). A reply is recorded on the contact as an `email.received` engagement and alerts the list owner through the list's own alert setting (that is already the default alert event); a hard bounce blocks the contact (`do-not-contact`, reason bounced); an unsubscribe marks them unsubscribed (opted out); a temporary bounce is only recorded. No new table, index or item: the contact is found with the existing global email lookup (`EmailLookupIndex`, via a new paginated `crmDb.findAllLeadsByEmail`, because `findLeadsByEmail` stops at 10 rows) and is acted on only if its `smartlead_<campaignId>` marker names a run recorded for this same Smartlead account and campaign (fails closed, as the Calendly webhook does for the same cross-tenant index). Every effect is idempotent by state (event key on the engagement, compare-and-swap on the lead's `updatedAt`, status only set when not already blocked), so Smartlead's retries and duplicates do nothing twice and our own opt-out sweep cannot loop. The endpoint is NOT behind the push kill switch (an opt-out must always get through). Logs carry ids, the event kind, counts and field names only, never message content; `SMARTLEAD_WEBHOOK_LOG_BODY=true` (test environments only) logs the raw body. Registration of the webhook in the customer's Smartlead account, the removal on disconnect and the hourly poll fallback are the next builds. Ops note: the URL token is part of the path, so it appears in access logs of anything in front of the backend, and rotating the JWT secret (or `SMARTLEAD_WEBHOOK_SECRET` when set) invalidates every registered URL: set the dedicated secret first, then plan a re-registration if it ever has to change.
+
+## ENG-381: Remove retired local-agent-relay package and its CI build (2026-10-29)
+
+- Deleted `local-agent-relay/` (the ngrok-hosted Codex relay, retired since 2026-07-17; tools deprecated under ENG-383) and its non-required `Local agent relay build` CI job/path filter.
+- Inventory: no backend code reads `*/AgentWeb/LocalAgentRelay`; `run_local_agent_task`/`check_local_agent_status` remain only as ENG-383 deprecation stubs that reject with redirect guidance.
+- Rollback: revert this commit.
+
+## ENG-2766: Auto-issue dedupe scans every open canonical, not just the newest 50 (2026-10-29)
+
+`fileAutoIssue` matched recurrences against `listOpenIssuesByLabel('Auto', 50)`, which returned only the newest 50 open Auto issues. With ~70 open, older canonicals (e.g. ENG-2374, a Meta "cannot be read — token invalid" issue from Oct 9) fell out of the candidate set, so each Meta connection handoff filed a parallel issue (ENG-2753/2755/2756/2762/2765). `listOpenIssuesByLabel` now pages through all open matches (100/page, 1000 cap); both intake call sites drop the 50 cap. No schema/data change.
+
+## ENG-2763: Agent Mode classifies OpenRouter quota exhaustion (2026-10-29)
+
+- generateMarketingResponse maps OpenRouter 403 key-limit / 402 credits to QUOTA_EXHAUSTED_USER_MESSAGE; /generate and share routes answer 503 PROVIDER_QUOTA_EXHAUSTED and send one oncall alert per class (6h dedupe) instead of per-occurrence "Unknown Error" pages. Stacked on ENG-2758 classifier.
+
+## ENG-2758: Scheduled chat defers OpenRouter key-limit/credits exhaustion to reset (2026-10-29)
+
+- New pure classifier `backend/src/utils/openRouterKeyLimit.ts` recognises OpenRouter 403 "Key limit exceeded" and 402 credits errors and parses `resets <ISO>`.
+- Zero-output scheduled runs hitting it are deferred to the reset (or next natural occurrence), schedule stays active, no zero-output retry spent.
+- Auto-issue filing carries `Alert Class: openrouter-quota-exhausted` (one canonical across schedules); oncall dedupe key is class-wide.
+
+## ENG-2750: Drain-ceiling shutdown requeues scheduled chats silently once (2026-10-29)
+
+- `isWorkerShutdownError` now recognises `Worker shutdown — drain ceiling exceeded`.
+- A scheduled chat killed by a drain before any assistant output is requeued once (existing ENG-971 ledger-guarded requeue) without filing a zero-output Linear issue; a failing retry files a single issue.
+
+## ENG-2748: DST-safe wall-clock + IANA zone -> zoned publishAt resolver (2026-10-29)
+
+Added `resolveScheduledPublishAt` (backend/src/services/scheduledPosts): converts a local time + IANA zone to the ISO-with-offset string `validateScheduledPostRequest` accepts. Spring-forward gaps -> LOCAL_TIME_NONEXISTENT; fall-back overlaps resolve to the earlier instant. Pure, Intl-only, not yet wired to any tool.
+
+## ENG-2746: Scheduled-post command service (create/list/edit/cancel) (2026-10-29)
+
+Pure owner-scoped command layer in `backend/src/services/scheduledPosts/scheduledPostCommands.ts` over an injected repository port. No table, scheduler, or tool registration; persistence and plan gating remain on ENG-2501.
+
+## ENG-2745: Scheduled post list renders failed posts (2026-10-29)
+
+formatScheduledPostList now imports the single ScheduledPostStatus from scheduledPostLifecycle and renders failed posts (always visible) in a trailing "Failed" group with platform and last-error preview. Pure formatter; no persistence/scheduler wiring.
+
+## ENG-2740: Drop unwired retargeting_audience_added engagement signal (2026-10-29)
+
+- Removed `retargeting_audience_added` from `EngagementSignalName` (backend/src/services/serverSignalEmitter.ts); no platform hook adds AgentWeb's own users to a retargeting audience. No call sites, no schema/data change.
+- Re-add with one fire-and-forget emit + mocked test when a platform-owned retargeting audience sync ships.
+
+## ENG-2739: linkedin_outreach list-post-engagers action (2026-10-29)
+
+Adds a read-only `list-post-engagers` action to `linkedin_outreach` (Unipile `getAllPostComments`) so the ENG-1609 template's engagement-mining channel has a tool path. Returns distinct commenters with profile URL/headline, drops anonymized authors. Parent ENG-1640.
+
+## ENG-2738: registration_completed server signal for hireemma.ai (2026-10-29)
+
+Emit `registration_completed` (method password|google) to the hireemma.ai session list from password register and new Google OAuth signups; fire-and-forget via serverSignalEmitter.
+
+## ENG-2686: emit logout lifecycle signal via POST /api/auth/logout (2026-10-29)
+
+Authenticated `POST /api/auth/logout` emits the `logout` app signal fire-and-forget (skipped for delegated sessions) and always returns 204. JWT remains client-discarded; portal wiring follows.
+
+## ENG-1277: pre-push uses CI's node major, or refuses with an instruction (2026-10-29)
+
+The pre-push hook ran whatever `node` was first on PATH. On Node 18 (the default on several dev boxes) jest fails with "You need to run with a version of node that supports ES Modules in the VM API" and unrelated test failures that say nothing about the code, so a good push was blocked with a misleading error. The shell shim now switches to an nvm-installed node 22 (CI's version, `tests.yml`) when the default node is older, and `ci-prepush.mjs` refuses to run tsc/jest on a node older than 22, printing the exact fix (`nvm use 22`) instead of a fake failure. The check sits after the "no backend changes" exit, so pushes that touch no backend code are unaffected. Rule and tests: `checkNodeVersion` in `backend/scripts/prepush/logic.mjs`, `logic.test.mjs`.
+
+## ENG-87: Managed-campaign health signal evaluator (2026-10-28)
+
+Pure `evaluateCampaignHealth`/`collectCampaignHealthSignals` in `backend/src/services/campaignHealthSignal.ts`: struggling (lead discrepancy, cost per lead, bad-lead rate) and win signals, deduped per campaign/window. Thresholds have no defaults; unset disables. Not yet wired to the eval-queue or alerts.
+
+## ENG-673: the withdrawal sweep and the release path — PR-D2 (2026-10-28)
+
+PR-D1 made AgentWeb's own senders skip leads pushed to Smartlead. This is the other direction, plus a way out.
+
+### Withdrawal sweep (`services/smartleadWithdrawal.ts`, hourly cron in `server.ts`, first pass 5 minutes after boot)
+Smartlead sends on its own schedule, so a lead that opts out in AgentWeb after it was pushed would keep receiving the customer's sequence. For every list and campaign a run touched in the last 400 days (the time-ordered run index; one target per pair, and every run's key is tried newest first), it reads the list, finds leads whose marker is still `pushed` and that are now do-not-contact here, unsubscribes them in Smartlead and sets the marker to `withdrawn` (with `withdrawnAt`).
+- The call is Smartlead's ACCOUNT-WIDE unsubscribe, `POST /leads/{id}/unsubscribe` (not the campaign-level one, which would leave the contact mailable from the customer's other campaigns). Verified live: `{ok:true}`, idempotent, 404 for a lead that is gone, and the docs say it cannot be undone through the API. A lead whose marker has no Smartlead id is looked up by email (`GET /leads/?email=`; an unknown email is an empty `{}`, read as "not in Smartlead", so the marker can stop saying `pushed`).
+- **Which leads:** marker `pushed` OR `released` and now do-not-contact. A release changes nothing in Smartlead, so a released lead that opted out must still be stopped there (a review found that releasing a pushed lead would otherwise switch its opt-out off). The decision is taken on a CONSISTENT re-read of the lead just before each call (the unsubscribe is permanent): a lead re-subscribed or already withdrawn since the page read is left alone.
+- **Which Smartlead lead:** the id stored in the marker, trusted only while the lead still has the address that was pushed (the marker records it); otherwise the lead is looked up by its CURRENT address. A 404 on a stored id looks the address up before calling the lead gone (a re-imported lead has a new id).
+- **Failure handling:** `{ok:false}`, a 5xx, a failed re-read or a 404 whose lookup finds the SAME id leave the lead as it was and count as a failure for THAT lead only. Leads that failed before are tried LAST for six hours (remembered in process memory, not on the marker: writing it to the marker would rewrite the whole marker from a possibly stale read and could undo a release), so a lead that always fails cannot block the ones behind it. A 429 or a rejected key stops that list for the pass (a rejected key is reported, flagged after a confirming probe). Ten failures in a row (an outage) stop a list. At most 200 attempts per list per pass.
+- **Order within a list: opt-outs first, then address edits.** A rate limit or a backlog of edits must never delay stopping somebody who said stop. An opted-out lead is never moved to a new address: it is stopped by its stored id (and by the lead at the new address if that is a different one).
+- **Address edited since the push, lead not opted out — pushed to Smartlead (Update Lead).** The marker records the address that was pushed. When a lead's address in the CRM no longer matches it (and the new address would be accepted), the pass replaces the address in Smartlead with `POST /campaigns/{id}/leads/{lead_id}/` and only `email` in the body (verified live 2026-10-28: the same lead id gets the new address, the old address is no longer in Smartlead, name, phone, website and custom fields are untouched, the campaign status is kept, an unsubscribed lead stays unsubscribed, updating a lead to the address it already has answers ok so a retry is safe), then records the new address on the marker. Smartlead refuses an address that already belongs to another lead (HTTP 500 "Validation error"): a quiet failure, logged once a day, marker untouched; ten failures in a row end the edits for the pass. A 404 on the stored id means the lead was deleted or re-imported: the pushed address is looked up; if it is still there under a new id, that lead gets the edit and the marker follows it, otherwise the marker just takes the new address.
+- **Accepted, not fixed (review 2026-10-28, low):** a lead that was unsubscribed inside Smartlead and then edited moves its opt-out to the new address (a wrong suppression, never a wrong send); one Smartlead lead id shared across campaigns changes address in both (unverified); the whole-marker write can revert a concurrent release (self-heals next pass); two leads in one list edited onto the same address both stay refused; non-Latin-combining-mark TLDs (such as .भारत) are not accepted.
+- **Isolation and keys:** a list that throws (a bad run row, an unreadable list) is logged and the pass goes on to the next. All runs for a list and campaign are considered newest first, so a newest run whose key is gone does not hide an older working one; if no key works the log says plainly that opt-outs on that list are NOT being sent.
+- **Policy, stated on purpose:** EVERY do-not-contact status triggers the account-wide unsubscribe, bounces and admin flags included. Smartlead's unsubscribe is permanent through its API, so a lead withdrawn here and later re-subscribed in AgentWeb stays blocked in Smartlead. A bounced address is undeliverable anyway, and the opposite mistake (a person who said stop keeps being emailed) is the worse one. Decide with the owner whether to gate on reason.
+- **It runs whether or not pushing is switched on** (`SMARTLEAD_PUSH_ENABLED`): stopping pushes must never stop opt-outs. If the run table is unavailable it logs and does nothing.
+- Known limits (tracker): it reads whole lists every hour (an event hook on contact-status changes should replace it); the same address in another list carries no marker there; a lead deleted in the CRM stays in Smartlead; a run older than 400 days is no longer swept, and lists of finished campaigns are still read every hour; an opt-out recorded between two passes is withdrawn up to an hour late (AgentWeb's own senders already skip the lead from the moment it is pushed).
+
+### Cron
+Hourly, first pass 5 minutes after boot, never overlapping (a pass over many lists can outlast the hour).
+
+### Release path (`POST /api/crm/smartlead-push/leads/release {listId, leadIds, campaignId?}`)
+A list editor (`canDestructiveCrmList`) clears the marker of up to 500 leads (state `released`, with `releasedAt` and `releasedBy`), so AgentWeb's own senders may email them again; a mistaken push must not block a contact for ever. It changes nothing in Smartlead: a lead still in an ACTIVE campaign is then emailed from two places, and the dialog (PR-E) must say so. Works while pushing is switched off. Rate limited (30 per 15 minutes per user). Releasing a lead while a run is still pushing its list can let the run push it again (its marker is no longer `pushed`).
+
+### Tests
+`smartleadWithdrawal.test.ts` (25: every case above, including head-of-line blocking and rotation, released leads, per-list isolation, key fallback, 404 then lookup, the consistent re-read and the changed-address case); `smartleadService.test.ts` (the two new calls on live shapes); `smartleadPushService.test.ts` (release and the sweep through the service, on both run stores); route test (release). Eight deliberate breakages of the sweep (and five of the release) each fail a test.
+
+## ENG-673: the Smartlead push engine — PR-C1 (2026-10-28)
+
+The worker loop of a push run: walks a CRM lead list and adds the eligible leads to the customer's own Smartlead campaign, in batches of up to 400, resumably. Nothing calls it yet (routes, the resumer cron and the kill switch are PR-C2), so there is no runtime change.
+
+- `smartleadPushEngine.ts`: `executeRun(run, deps)`. Everything it touches is injected (run store, lead reads, marker writes, Smartlead calls, clock), so it is tested without a network or a database.
+- Per batch: read the campaign and its sequence fresh (pause for a human if the campaign is gone, archived, started under a DRAFTED approval, or the sequence changed or became unreadable); build a batch from whole pages so the cursor is exactly the last lead examined; re-read the leads about to be sent with a consistent read (an opt-out recorded a moment ago is honoured); read the run strongly; POST; mark every lead (`system.smartlead_<campaignId>`) BEFORE the fenced cursor write; record the batch.
+- The markers, not the lock, stop a lead being pushed twice. After a crash the batch is rebuilt and resent; Smartlead answers per lead which already exist, so the run converges. After a resend `added` undercounts and `alreadyInCampaign` carries the leads (the total is right).
+- After a POST the leads are ALWAYS marked, even if the run was paused or the lease lost meanwhile: an unmarked lead would be invisible to the own-sender skip and the opt-out withdrawal. Only the cursor write is fenced. (Found by the real-store test.)
+- The approved count is a hard ceiling, and it counts leads THIS run already marked but never recorded (a crash, a lost lease, a failed batch): they are in Smartlead and the cursor has not passed them, so a rebuilt batch cannot fill the ceiling a second time. A batch that fails (error, or an outcome we cannot know) does not move the cursor; three in a row make the run `partial`. A 401 or 403 pauses with `key_rejected`. A reply with no per-lead map pauses (nothing can be marked). A store error propagates: fail closed.
+- `smartleadService.ts`: `getCampaign` and `getCampaignSequences`. Verified on a real account (2026-10-28): a campaign id that does not exist returns HTTP 200 with an EMPTY body (so `getCampaign` gives null), and its sequences return an `{error: ...}` object (so `getCampaignSequences` throws rather than reading it as an empty sequence).
+
+### Tests
+`smartleadPushEngine.test.ts` (30, runs everywhere): batching and exact cursors, every skip reason, the ceiling, the opt-out re-check, crash and retry, partial after three failures, the fence, every pause reason, and what Smartlead does not accept. `smartleadPushEngine.dynamodbLocal.test.ts` (opt-in, `DYNAMODB_LOCAL_ENDPOINT`) drives the engine through the real fenced store: completion, a crash with a second worker claiming the lapsed lease, a worker that lost its lease, and pause then resume without re-sending. Eleven deliberate breakages each fail a test.
+
+### Known limits (for the next PRs)
+- Not in this PR: preview and the signed token, routes, the resumer cron, the kill switch, rate limits, audit (PR-C2); own-sender skip and the withdrawal sweep (PR-D, before the first real push); the portal (PR-E).
+- Each execution first reads the WHOLE list once (about 40 reads for 8,000 leads) to collect every opted-out email, so a second record with the same address is never emailed, on either side of the cursor or of a restart. A list over 100,000 leads pauses with `list_too_large`.
+- A lead Smartlead does not name in its per-lead answer is accepted only when Smartlead's own tallies explain it (block list, bounce, duplicate, import stopped...); otherwise it may be in the campaign without a marker, so the batch is retried and, after three tries, the run stops as `partial`. A lead listed under "existing in other campaigns" is marked only up to the number Smartlead says it added or already had.
+- A lead Smartlead lists under "existing in other campaigns" and the engine could not mark is NEVER accepted as explained: the run pauses with `other_campaign_leads` for a human, because whether Smartlead added it is unverified and an added-but-unmarked lead would be invisible to the opt-out safeguards. (Verify `skipped_in_other_campaign_count` on a real started campaign, then this can be relaxed.)
+- Smartlead's account lead limit pauses the run WITHOUT moving the cursor, so a resume after the limit is raised rebuilds the batch, skips what is marked and sends the rest.
+- Just before each POST the whole eligibility check is run again on a consistent re-read of the leads (an opt-out, a bounce or an edited address recorded after the page read is honoured).
+
+- The run's counts include only batches that were recorded. A run that stops as `partial` can already have many leads in Smartlead (marked, and counted when a resume passes them): the markers, not the counts, are the truth, and the status page should say so.
+- A lead this run pushed that has since become do-not-contact is not counted toward the ceiling; PR-D's withdrawal (unsubscribing it in Smartlead) is what keeps the ceiling true.
+
+### For PR-C2
+- The resumer must not auto-resume a run paused for `smartlead_lead_limit` (each resume POSTs once); resume that one on user action only.
+- `readLeads` must page the list with no filter, newest first, with the hand-built `{listId, leadId}` as `ExclusiveStartKey`; the engine treats an empty page as the end of the list.
+- The bound `addLeads` should use a small `maxRetries` (a POST that backs off for minutes outlives the 90 s lease; the markers make a second worker's resend safe, but it wastes the run).
+
+## ENG-673: Smartlead push API — PR-C2 (2026-10-28)
+
+The routes, the signed approval, the service and the resumer that make the push engine (PR-C1) usable. OFF unless `SMARTLEAD_PUSH_ENABLED=true`; nothing in the portal calls it yet (PR-E).
+
+### Routes (`/api/crm/smartlead-push`, all authenticated)
+- `GET /campaigns`: the user's own Smartlead campaigns for a picker, each with `pushable` and `needsConfirmation` (ACTIVE).
+- `POST /preview {listId, campaignId, includeUnverified?, mapping?, acknowledgedTags?, cohort?}`: evaluates the WHOLE list with the run's own eligibility rules, reads the campaign and its sequence, shows what would be sent for three real leads, an advisory days-to-send estimate, and returns a signed 30-minute token. Nothing is stored. The first push into a campaign defaults to a 50-lead test cohort; every eligible lead is one choice away (`cohort`).
+- `POST /start {token, acknowledgements:{lawfulBasis, activeConfirmed?}}`: 202 when a run starts (a background worker takes it), 200 `started:false` with the live run when the list and campaign already have one. Re-checks the world against the approval: same sequence hash, a draft campaign not started under the approval, no new blocks, ACTIVE needs a separate confirmation.
+- `GET /runs/:id`, `GET /lists/:listId/runs`, `POST /runs/:id/pause|resume|cancel`. A stranger is told a run does not exist.
+- Limits: previews 30 and starts 10 per user per 15 minutes.
+
+### Rules
+- **An approval is single use.** Its id (`jti`) is consumed with one conditional put in the run table (a `TOKEN#<jti>` record, expiring after two hours). Replaying an approval for a 50-lead test cohort would otherwise push 50 more each time, because earlier runs' markers do not count toward a new run's ceiling. A second submit of a used approval is shown the run it started; an approval is given back if the start did not happen. Pushing more takes a fresh preview. The approval also binds the Smartlead connection and the "send even though my sequence could not be read" acknowledgement; the start ignores those fields in its own body.
+- **A start that fails ambiguously keeps its approval spent.** A store error can arrive after the run was written (the reply was lost), and handing the approval back would let it start a second run; losing an approval is the safe direction (preview again). The run store itself now recognises its own earlier write when a retry hits it, so a lost reply no longer leaves a committed run without a lock.
+- **An approval goes stale** if another run started on that list and campaign after the preview (for example two previews each approving the 50-lead test cohort): the start asks for a fresh preview.
+- **Orphan runs are cancelled, never worked.** A running run whose lock does not point at it (a crash between a start's two writes) is cancelled by the resumer; a lease claim never creates a missing lock. A USER resuming a paused run whose lock expired meanwhile still gets it re-created.
+- Runs the kill switch paused (`disabled_by_operator`) are NEVER cancelled by the resumer: the switch is an environment variable, so a long outage would otherwise wipe out every one the moment it came back. Their owner can cancel them at any time. Any other paused run is cancelled after a week.
+- **A start is only real once it is confirmed.** A run is written with `startUnconfirmed`; nothing may claim such a run (`claimLease` refuses it by a read check and a condition), and the resumer CANCELS it once its lease lapsed. The service clears the flag (`confirmStart`) only after the start succeeded. So a start that failed, crashed half way, or was reported to the user as failed can never be picked up and sent unannounced, whatever the store was doing at the time, including across a process restart. If the confirming write itself fails, the run is cancelled later and the user previews again (the safe direction). A user resuming a paused run clears the flag too.
+- `startRun` handles ANY error that arrives after one of its two writes: if the lock is ours the run is reported started (a run holding a lock but reported failed would be claimed and sent unannounced); otherwise the run it wrote is abandoned. The resumer only calls a lockless running run an orphan once its lease lapsed.
+- **Only the person whose Smartlead connection a run uses can resume it** (resuming sends with that connection). Other editors of the list can still pause and cancel.
+- A user with several of their own Smartlead connections must name one (`accountId`); the service never picks between them.
+- A run the kill switch paused (`disabled_by_operator`) is never cancelled as stale. Smartlead failures come back as a clear 422 (key rejected), 429 or 502, never a bare 500. At most 3 previews run at once per process (a preview holds a whole list in memory).
+- Needs edit access to the list (`canDestructiveCrmList`: owner, org owner or CRM editor). Uses ONLY the pusher's own Smartlead connection; a teammate's shared key is never used (`keyOwnerId` on the run is the seam).
+- Kill switch: `SMARTLEAD_PUSH_ENABLED` must be exactly `true`; otherwise preview, start, resume and campaigns return 503, the resumer idles, and a running run pauses at its next batch (`disabled_by_operator`). Pause and cancel always work.
+- Fails closed: if the run table is missing or access is denied, start returns 503 and nothing is sent.
+- The resumer runs every minute (`server.ts`, `cronJobRegistry`, active only when the flag is on): it claims runs whose worker is gone and cancels runs left paused for a week. At most 4 workers per process. A run paused for `smartlead_lead_limit` is only resumed by a user.
+- Audit: each run records who pushed, with which key, the options, the warnings shown and the acknowledgements; start, resume, cancel and the resumer log one line each (no lead data, no key).
+
+### Tests
+`smartleadPushToken.test.ts`, `smartleadPushPreview.test.ts`, `routes/__tests__/smartleadPush.test.ts` (supertest with the service mocked), and `smartleadPushService.test.ts` (33 tests, run twice: on an in-memory run store EVERYWHERE, so CI and the pre-push hook exercise the service's access, approval, start, control, worker and resumer logic, and again on the real run store when `DYNAMODB_LOCAL_ENDPOINT` is set; includes a two-starter race, approval replay and the resumer taking over a dead worker). The real conditional writes themselves are proven by `smartleadPushRunDb.dynamodbLocal.test.ts`, which is opt-in. Live on env1 (real HTTP, real Smartlead, real tables): preview, start, completion, a second preview showing everything already pushed, a replayed token sending nothing, and cleanup.
+
+### Known limits
+- The kill switch is an environment variable: changing it on a deployed environment needs a restart. A runtime toggle is a tracked follow-up.
+- Preview reads a whole list into memory (refused above 50,000 leads).
+- Paused/partial runs are cancelled after a week counted from the run's last lease.
+- Not yet: the Emma push tool, the portal dialog (PR-E), the opt-out safeguards for AgentWeb's own senders and the withdrawal sweep (PR-D, which must merge before the first real push).
+
+## ENG-673: AgentWeb's own senders skip leads pushed to Smartlead — PR-D1 (2026-10-28)
+
+A lead pushed to a customer's Smartlead campaign carries a marker (`system.smartlead_<campaignId>`, state `pushed`, or `withdrawn` after an opt-out). It is emailed from Smartlead, so AgentWeb's own senders must not also email it (two senders, and Smartlead's unsubscribe and bounce handling would not see AgentWeb's mail). A `released` marker (a list editor cleared it, PR-D2) counts as not pushed. The check is `isPushedToSmartlead(lead)` in `services/smartleadMarkers.ts`. It is deliberately NOT part of `isDoNotContact`: bounce recording (`routes/webhooks.ts`, `outlookBounceMonitorCron`) and the unsubscribe page (`routes/crmPublic.ts`) use that and must not change (a test pins it).
+
+### Where it applies
+- **Drip sequences** (`dripSequenceWorker.sendEmailStep`): checked at SEND time, not enrolment, because a lead can be pushed after it was enrolled. The step is skipped like any step the lead cannot receive (the enrollment advances); LinkedIn steps are unaffected.
+- **Group email**: `send` leaves pushed leads out and reports `skippedSmartlead`; `preview` reports `smartleadCount` and leaves them out of `eligibleLeads`; `prepare` leaves them out of `eligibleCount`. All three apply the same rule so the preview never promises recipients the send does not make. Resuming a pending batch re-posts to `send`, so it is covered.
+- **Emma `send_email_to_lead`** (`emma/impl/leads.ts`): refuses, with a message that says why and what the customer can do.
+- **Manual one-to-one send** (`POST /lists/:listId/leads/:leadId/send-email`): a confirmation, not a block. It answers 409 `{code: "pushed_to_smartlead", message}` unless the body has `confirmPushedToSmartlead: true`. The portal does not send that flag yet, so until PR-E a manual send to a pushed lead shows the message and sends nothing.
+
+- **Webhook auto-send** (`routes/webhooks.ts`): that block also runs for an EXISTING lead that resubmits a form (it is `isUpdated`), and that lead keeps its marker, so it skips with `autoSendStatus: "skipped_smartlead"` (a review caught that my first reading, "it only emails a brand-new lead", was wrong).
+- **Drip worker, read failure:** a failed read of the lead (not "no such lead") now throws, so the enrollment is neither sent nor advanced and is retried. Before, it carried on with no lead and skipped every per-lead check (do-not-contact included).
+
+### Deliberately not changed
+- **Manual reply** (`reply-email`): a reply to an inbound message is a conversation the person started; left alone.
+- **Emma `send_email_from_sender`, the `email` tool and `/email` in `emmaApi.ts`**, and any send to a raw address: no lead in hand, so they cannot be covered without a lookup (a documented limit, tracker row 35). Emma's refusal text tells the agent not to reach the person another way.
+- Test sends to caller-supplied addresses, `sendAsSender` itself (it only sees an address) and `dripSequenceDb` (storage only).
+- Enrolment: the worker check is the one that closes the gap (a lead can be pushed after it was enrolled).
+- **A drip step skipped while a lead is pushed is lost, not snoozed**: if the marker is released later the sequence continues with the next step (a follow-up to an email AgentWeb never sent). Chosen on purpose for v1; tracked.
+- The portal (separate repo) does not show `smartleadCount`/`skippedSmartlead` or offer the confirmation yet: PR-E.
+
+### Tests
+`dripSequenceWorker.senderRouting.test.ts` (pushed and withdrawn skipped, released and plain sent, a later step advances, a failed lead read does not send), `webhooks.leadForwarding.test.ts` (auto-send skipped), `crm.groupEmail.test.ts` (preview, prepare, send), `crm.routes.test.ts` (confirmation), `agentModeService.crmTools.test.ts` (Emma), `smartleadEligibility.test.ts` (a pushed lead is not do-not-contact). The RFC 8058 List-Unsubscribe test in `crm.groupEmail.test.ts` already fails on main (not from this change).
+
+## ENG-673: The Smartlead push skips contacts already in another campaign (2026-10-28)
+
+Verified on the real account with a started campaign: Smartlead's add-leads setting `ignore_duplicate_leads_in_other_campaign` means the opposite of what the push assumed. `false` (what the push sent since the first push PR) ADDS a lead that is already in another of the account's campaigns, so that person is emailed by both campaigns; `true` skips it, counts it in `skipped_in_other_campaign_count` and lists it under `existingLeadsInOtherCampaigns` with its existing lead id. The push now sends `true`, and the engine treats a contact Smartlead lists under "other campaigns" and does not put in this campaign as skipped ("smartlead_in_other_campaign", reported in the run's skip counts, not marked), as long as Smartlead's own tally covers every one of them and it did not add more leads than it named as newly added; otherwise the run still pauses (`other_campaign_leads`), because a lead in this campaign without a marker would be invisible to the opt-out safeguards. Contacts already pushed by earlier runs are unaffected (they are marked and were in this campaign).
+
+**Also from the same live test (received emails):** Smartlead adds its unsubscribe link (and the List-Unsubscribe header) only when the campaign's `add_unsubscribe_tag` is on AND its `unsubscribe_text` is set; with the setting on and the text empty the email has no link at all. The sequence check now reads `unsubscribe_text` (`getCampaign`) and warns (`no_unsubscribe`) in that case too, unless the sequence has its own unsubscribe tag. A tag or spintax inside a contact's value reaches the recipient literally, which confirms the push's refusal of template characters in values.
+
+## ENG-673: hardening after blind reviews of the push stack and the opt-out safeguards (2026-10-28)
+
+A fresh reviewer with no context went through the merged own-sender skip (#3806) and withdrawal sweep (#3807) and found these. All fixed here.
+
+- **Form-webhook auto-send had no do-not-contact check of its own (older than ENG-673).** (A live run on env1 showed the auto-DRAFT step already refuses a do-not-contact lead ("Cannot draft email for this lead: Do Not Contact"), so the gap was narrower than the review first said; the guard is kept as a second layer, for a draft that already exists on the lead.) `routes/webhooks.ts`: an existing lead that had unsubscribed and then resubmitted a form was auto-emailed, because the auto-draft step has no do-not-contact check and neither did the auto-send. It now skips with `autoSendStatus: "skipped_do_not_contact"`.
+- **The sweep could mark a lead `withdrawn` when nothing was stopped.** A user can replace a connection's key with a key from another Smartlead account; Smartlead then answers 404 to every lead, which the sweep read as "gone". The sweep now checks per list and campaign that the key can SEE the campaign (`getCampaign` is not empty); if not, the pair is skipped, counted as `keyUnavailable` and logged once a day ("the connected key cannot see this campaign (it was deleted in Smartlead, or the key belongs to another Smartlead account)"); a deleted campaign looks the same as another account's key, so such pairs are left untouched and cost one `getCampaign` call each per pass.
+- **Release no longer touches do-not-contact leads** (`skipped.doNotContact` in the reply). AgentWeb's own senders skip them anyway and the sweep must keep stopping them in Smartlead; releasing only churned the marker. Note: a `withdrawn` marker keeps AgentWeb's own senders off a lead even after it is re-subscribed, until a list editor releases it.
+- **Edited addresses are now pushed to Smartlead** (Update Lead; see the withdrawal dev note): the earlier "needs a human" case for an opted-out lead whose address changed is replaced by sync-then-unsubscribe, with a stop-both fallback when Smartlead refuses the change.
+- **Hourly log lines are deduplicated**: no usable key, an invisible campaign, a list that throws and the run-limit warning are each logged once a day, not every pass.
+- Dev note for the sweep corrected (400-day window; every run's key is tried).
+
+### From the blind review of the whole push stack (engine, run store, API)
+- **The cohort is pinned to the PREVIEW time.** The engine used the run's start as the cut-off for "created after the run started"; a lead imported between the preview and the start was therefore pushed in place of a previewed one. The service now records the approval token's issue time as `options.approvedAt` and the engine uses it (falling back to the run start for older runs). Still a count, not a list of ids: a lead that BECOMES eligible between preview and start (for example validated in the meantime) can take a slot; a hand-checked first cohort in a DRAFTED campaign covers that (tracker).
+- **Stricter email shape**: zero-width, bidi and control characters, `,` `;` `|` and backtick, a repeated dot, a leading or trailing dot in either part and a top-level domain that is not letters are refused (they only mattered with "include unverified").
+- **URL-type fields** (`website`, `company_url`, `linkedin_profile`) are left out when they contain quotes, backticks, spaces or a `javascript:`/`data:`/`vbscript:` scheme (they may land inside `href="..."` in the customer's template); ordinary values, and quotes in a company NAME, are unchanged.
+- **`confirmStart` only confirms a run that is still running** and now returns whether it did; a refused confirmation (the resumer cancelled it) is reported to the user as a failed start with no worker.
+- **A worker re-checks that the pusher still has edit access to the list** before working a run it picked up (a resume or a claim); otherwise the run pauses with `access_revoked`.
+- **Measured, no change needed:** a 400-lead POST with `return_lead_ids` takes about 1.5 s on the real account (a resend 1.7 s), far under the client's 15 s timeout.
+
+### From the fresh review of this change
+- A key rejected (401/403) during the new visibility check is now REPORTED (flagged after a confirming probe) and the pass goes on; the visibility check runs only when someone opted out (a quiet pass costs no Smartlead call); the once-a-day log keys include the reason so a different problem on the same list is not hidden; the pass summary is deduplicated.
+
+### Tests
+Sweep (invisible campaign, deduplicated logs), service (release skips do-not-contact, sweep through the service refuses an invisible campaign), webhook (do-not-contact). Six deliberate breakages each fail a test.
+
+## ENG-673: Smartlead pushes can use a connection a teammate shared with the org (2026-10-28)
+
+Owner decision: a Smartlead API key is stored per user and can be shared with the org, and anyone in the org may push, release and control pushes through the portal and Emma using it. Until now the push used only the pusher's own connection and refused a teammate's shared one. `SmartleadPushService` now resolves the connection like the rest of the Smartlead code (`resolveSmartlead`): the caller's own first, else the single one a teammate shared; several candidates and none the caller's are never guessed between: the answer is 409 `choose_connection` with the candidates (`details: [{accountId, accountName, shared}]`) and the caller picks one by `accountId`. The run records whose key it was (`keyOwnerId`), and the worker and the hourly withdrawal sweep keep using that owner's key. Resume is now allowed to the key owner and to anyone the connection is still shared with (it was the pusher only); once sharing is withdrawn a member can no longer resume (403 `resume_requires_connection`), but anyone with edit access can still pause and cancel. The campaigns and preview results carry `connection: {accountId, name, shared}` so the screen and the Emma approval card say whose Smartlead account the contacts go into ("a teammate's shared Smartlead account ..."), because the emails go out from that account's mailboxes. The Emma tools accept an optional `accountId`. List edit access is still checked per person. No schema change. Un-sharing a connection also stops the teammates' pushes that use it: the worker checks that the connection is still shared with the pusher when it starts and again before every batch (a new optional `stillPermitted` hook in the engine, next to the kill-switch check), and otherwise pauses the run with `connection_unshared`, keeping what was already added; an unreadable key pauses as `key_unavailable` and a rejected one is still reported as `key_rejected`. Such a run cannot be resumed by anyone until the connection is shared with the pusher again (409 `connection_unshared`), because the worker would only stop it again.
+
+## ENG-673: Emma can push a CRM list to the customer's Smartlead campaign (2026-10-28)
+
+Eight Emma tools over the same service as the CRM dialog's routes (`emma/smartleadPushTools.ts`): `list_smartlead_campaigns`, `preview_smartlead_push`, `start_smartlead_push`, `get_smartlead_push_status`, `pause_`/`resume_`/`cancel_smartlead_push`, `release_leads_from_smartlead`. They carry the same safeguards (the user's own Smartlead connection only, the whole list previewed and the push limited to what was previewed, the kill switch, the opt-out and own-sender rules). Two things differ because a model is calling: (1) starting a push and releasing contacts run only after the person in the chat clicked "approve" on a card whose wording the product builds from live values (`services/smartleadPushApprovalGate.ts`, modelled on the hot lead call number approval; the card kind prefix `smartlead_push_approval:` is reserved so a model cannot author one). The approval stands in for the portal's lawful-basis tick and its "already sending" confirmation, and is bound to a digest of everything the card showed (list, campaign, its status, the sequence hash, the number of contacts, the field choices), so a changed list, edited campaign emails or a started campaign asks again; it is single use, expires after 15 minutes, and only a person's "approve" counts (never a delegation or "Let Emma decide"). The model never sees or supplies the signed preview token: the tool previews itself on both calls. (2) Start and release refuse unattended runs, scheduled sessions and anyone acting on a customer's behalf; resume needs an attended chat; pause and cancel work anywhere because they only stop email. The tools are in the default foundation list and blocked for share-link visitors. The run records `channel: "agent"`; the service gained `start(..., { channel })` and `canUseList(userId, listId)` (edit access and the list's name, so no card is shown for a list the user cannot push). No schema change. After a blind security review: the push card also lists the CRM field chosen for each merge field (it ends up in what recipients read), the release card names a few of the contacts and counts the rest (the model picks the ids, so the user must see who), and the preview returns a `fingerprint` of which contacts (the first N eligible) would go to which Smartlead connection, which the approval binds, so the same counts with different contacts or another connection ask again. Accepted and recorded: resume needs no card (it only continues the approved cohort), a non-delegated admin can answer a card in another user's session (inherited from the hot lead approval gate), and a spent approval is not refunded when start fails afterwards.
+
+## ENG-590: Loop attribution comment adds How to verify from linked PR (2026-10-28)
+
+- `recordLoopAttributionOutcome` reads the issue's GitHub PR attachments (Linear API, no GitHub token) and appends a "How to verify" section inside the existing idempotent loop-attribution comment.
+- AC3 warn log for shipped mutations without a linked issue is now asserted.
+
+## ENG-2721: Log OpenRouter provider_name + raw upstream reason on provider errors (2026-10-28)
+
+`normalizeOpenRouterErrorMetadata` now reads the top-level `metadata.provider_name`
+and a bounded (500 char) `metadata.raw` as `upstream_error`. A "400 Provider returned
+error" mid-run (schedule 04b34124, gemini-3.8-flash) previously logged
+`provider: undefined` with no upstream reason, so the root cause was unrecoverable.
+
+## ENG-2717: Enforce Extra Usage cap per enrich-v3 batch (2026-10-28)
+
+- Reuse `checkTokenUsage` / `resolveLlmUsagePoolDecision` for read-only projected-cost admission, so allowance, credits, billing owner, opt-in, suspension, high-water pool and Extra Usage cap use the existing policy rather than a parallel billing formula.
+- Before sibling-mapping/vendor work, block a run whose conservative full-run estimate does not fit. Re-check immediately before each existing 20-lead batch (including preview). Unknown usage fails closed. A response-only `budgetStop` explains the stop; the HTTP route returns 402 when no results completed and returns partial results otherwise. Socket completion includes the same explanation.
+- Keep completed snapshots/writes and existing job metadata. Attempted lead IDs now include only started batches, so refused leads are not incorrectly deduplicated as attempted. No persistence model/schema or stored usage changes; `paygSettlement.ts` and settlement math are untouched.
+- A run-local estimated-spend floor prevents stale ledger reads from reusing this run's admitted budget. Preflight is not a reservation. Only real batch admission uses existing PAYG admission bookkeeping; projections cannot write it.
+
+### Validation
+
+- TDD reproduction: new cap tests failed 4/4 before the implementation (all 45 leads ran despite refusal); now pass.
+- Scoped Jest: `cd backend && npx jest src/__tests__/enrichmentBatchCap.test.ts src/__tests__/enrichmentBatchBudget.test.ts src/__tests__/crmEnrichmentServiceV3.test.ts src/__tests__/enrichmentV3RealDepsLoadLeads.test.ts src/__tests__/paygOverage.gates.test.ts src/__tests__/paygOverage.test.ts src/__tests__/paygSettlement.test.ts --runInBand --silent` — 7 suites, 262 tests passed.
+- Scoped TypeScript: `cd backend && node --max-old-space-size=5120 node_modules/typescript/bin/tsc --noEmit --skipLibCheck --strict --esModuleInterop --resolveJsonModule --target es2018 --module commonjs src/services/enrichmentBatchBudget.ts src/services/crmEnrichmentServiceV3.ts src/services/enrichmentV3RealDeps.ts src/services/tokenUsageService.ts src/services/llmUsagePoolDecision.ts src/routes/crm.ts src/__tests__/enrichmentBatchCap.test.ts src/__tests__/enrichmentBatchBudget.test.ts src/__tests__/paygOverage.gates.test.ts` — exit 0. A first 3072MB attempt exhausted the heap; sequential 5120MB run succeeded.
+- Negative tests: unaffordable full run starts no lead work; cap change after batch 1 stops batch 2, preserving 20 snapshots/writes and only 20 attempted IDs; usage lookup failure retains partial results; preview refusal; forecasts beyond PAYG cap/opt-out; stale-ledger floor; projection cannot write admission records; month rollover fails closed.
+
+### Risk / rollback / not tested
+
+- Admission estimates are intentionally conservative (current allocated vendor rates plus a documented LLM guard band), not invoices or guaranteed maximum provider prices. Cached runs may be refused earlier than actual spend requires. Variable-cost work already in flight can finish: exposure is one admitted 20-lead batch, not the remaining list. This is not a distributed reservation across concurrent runs/accounts; concurrent external spend can consume budget after a check.
+- Rollback: revert this PR; no data migration or usage repair is needed. Restores prior start-only/unbounded enrichment admission behavior.
+- Post-deploy smoke: with a controlled test account, refuse an unaffordable run with 402 and a message before vendor calls; then allow batch 1, exhaust allowance before batch 2, verify partial results and snapshots remain and no refused lead/vendor call starts. Check socket stop message and attempted IDs.
+- NOT tested: live vendors, production billing/settlement, cloud/browser smoke, concurrent distributed runs, production deploy, full monorepo build/suite. Draft only; not ready or merged.
+
+## ENG-2716: CRM enrich-v3 pre-run cost estimate + confirmation token (2026-10-28)
+
+Added pure `estimateEnrichmentCost` (calibrated to Opiner 112 leads -> $31.60), `POST /api/crm/lists/:listId/leads/enrich-v3/estimate`, and optional `confirmEstimateToken` check on enrich-v3 (409 on stale token; missing token rejected only when `ENRICH_V3_REQUIRE_COST_CONFIRMATION=true`). Dark until portal confirm dialog ships.
+
+## ENG-2712: Delete unmounted webAgent service + marketResearch/guide routes (2026-10-28)
+
+- Removed `backend/src/services/webAgent.ts`, `backend/src/routes/marketResearch.ts`, `backend/src/routes/guide.ts` (zero importers/mounts on main; guide.ts was a deprecation stub). Slice of ENG-1761. No data-plane changes.
+
+## ENG-2113: turn-preamble golden file updated for the Smartlead push tools (2026-10-28)
+
+The ENG-2113 PR C0 golden test (`agentModeService.prepareTurnContext.golden.test.ts`) pins the exact tool list the turn preamble offers. ENG-673 (c26c6e72f) added eight Smartlead push tools to the foundation set, so all 17 fixtures failed on main (CI runs no jest suites, so main stayed green). Regenerated with `UPDATE_GOLDEN=1`: the diff is exactly those eight names added to each fixture, nothing removed or reordered. Test-only change.
+
+## ENG-2113: continue a stopped plan turn on AgentWeb credits without storing the message twice (2026-10-28)
+
+When a Claude-plan turn stops after the user's message was saved, the stop response now says what is safe to offer:
+- `canUseAgentWebCredits` keeps its meaning ("resend this request on AgentWeb credits") and is true only while nothing is saved.
+- `userMessageSaved` (existing) and the new `canContinueSavedMessage`: `true` only when the stopped turn is KNOWN to have run no tool at all (no ledger record, no tool event, no call still running; an unmarked error counts as "may have run"). The stop note stored in the chat carries `resumable: true` in that case.
+- `POST /agent-mode/generate` accepts `continueSavedMessage: true` (literal `true` only) with the same `userMessage`: the saved message is answered again on the chosen funding (AgentWeb or the plan) and is NOT stored a second time. It is refused with 409 `CONTINUE_NOT_AVAILABLE` unless the chat ends with resumable plan-stop notes directly under that exact plain user message, and never together with attachments, audio, a question/work-plan answer or an approval deck. The turn re-checks this right before it skips the save.
+- `canUseAgentWebCredits` stays the old "resend this request" offer and is true only while nothing is saved. A saved message is offered through `agentWebOffer` only. It spells out what a client may offer: `resend` (nothing saved), `continue` (saved, known to have run no tool: send `continueSavedMessage: true`), `new_message` (saved, a tool may have run: only a new message, and an action may repeat), or `null` (no offer). A client acts on `agentWebOffer`, never on `canUseAgentWebCredits` alone.
+- A message saved with attachments is not continuable, and the continue reads the chat strongly consistent (it is the guard against skipping a save). The plan-stop notes are dropped from the history the model gets, so it sees the message once.
+
+No schema change; the only stored addition is `resumable` on the plan-stop note. Rollback: revert (old clients ignore the new fields).
+
+- A continue writes a `claude-plan-continue` marker (an `isErrorMessage` note kept out of the model's history; the portal should hide or quiet it by `kind`, like the plan-stop notes) BEFORE anything runs. The chat is continuable again only when a resumable stop note follows it, so a continue whose own verdict was never saved, or that raced another continue, cannot be continued twice. If the marker cannot be saved, or the chat changed or cannot be read, the continue is refused with 409 `CONTINUE_NOT_AVAILABLE` (no error note, no diagnosis run).
+
+## ENG-2113: accept a protocol-4 login worker ahead of the relay backend (2026-10-28)
+
+The backend now accepts login-host workers at protocol 4 (`ACCEPTED_WORKER_PROTOCOLS` = 2, 3, 4) so the relay worker can deploy before the backend that speaks it without every running backend logging `login_host_protocol_mismatch` and treating "no such connection" as unconfirmed. Backend-only; sign-in, revoke and plain turns are unchanged. Also fixes the stale comment above the set. Nothing sends protocol-4 fields yet (that needs `workerProtocol() >= 4`).
+
+## ENG-1892: Classify write_clickup_doc failures (2026-10-28)
+
+write_clickup_doc now returns errorType (configuration / invalid_parameter / not_found / runtime) with the HTTP status, a short ClickUp body, and next-step guidance; malformed arguments are rejected locally naming the parameter.
+
+## ENG-896: Read GA4 key-event configuration + zero-data preflight (2026-10-27)
+
+- New read-only Emma tool `get_ga4_key_events` (GA4 Admin API v1beta keyEvents.list, analytics.readonly via existing service account). Answers "is X a key event" in one call; permission errors return the manual GA4 Admin path.
+- `get_website_analytics` flags zero-row properties (`noData`, `noDataNote` with property ID + date range) and routes key-event config questions to the new tool.
+
+## ENG-673: DynamoDB table for Smartlead push runs — PR-B (2026-10-27)
+
+The state store for the background Smartlead push (PR-C builds the engine on it). Nothing calls it yet; the only runtime effect is that the backend creates the table at boot.
+
+- Table `AW-SmartleadPushRuns` (`Dev-` prefix in development), keys `pk`/`sk`, on-demand, point-in-time recovery, TTL attribute `ttl`. Registered in `ensureCriticalTables.ts` (created at boot) and copied into `scripts/create-tables.ts`; `smartleadPushRunsTable.test.ts` fails if the two differ. No deletion protection yet (add once proven; the boot reconcile does it for an existing table).
+- Two item kinds. Run (`pk` = run id, `sk` = `RUN`): status, who and what, cursor, counts, lease. Lock (`pk` = `LOCK#<listId>#<campaignId>`, `sk` = `LOCK`): the one live run for that list and campaign. Nothing sensitive is stored (no key, no lead content, no emails); free-form failure and pause text is redacted (`api_key=`, tokens, Bearer, emails) before it is written. Runs live 400 days, locks 15.
+- Every write is one conditional item write. No transactions (the app role was denied them, ENG-2321). `leaseEpoch` rises on each claim and the cursor-advancing write is conditioned on it and on `status = running`, so a worker that lost its lease, or whose run was paused or canceled, cannot move the run on.
+- Fails closed: a missing table or denied access throws `SmartleadPushRunStoreError`; callers must return 503 and push nothing.
+- Four sparse indexes with INCLUDE projections: by list, by owner, by time, and active-by-lease (the resumer). A run drops out of the resume index when it finishes.
+
+### Tests
+`smartleadPushRunDb.dynamodbLocal.test.ts` runs the real repository against DynamoDB Local when `DYNAMODB_LOCAL_ENDPOINT` is set (skipped otherwise, like `paygOverage.dynamodbLocal.test.ts`): start races (five and four simultaneous starters, exactly one wins), lease claim race, fence, pause/cancel stopping a worker, partial after 3 failed batches, lock takeover rules, index queries, tolerant readers, fail-closed. Six deliberate breakages of the conditions each make it fail. No CI job is added here (CI is infra's); gap: these tests do not run in CI. Snippet for infra: start `amazon/dynamodb-local` on 8000 and run jest with `DYNAMODB_LOCAL_ENDPOINT=http://localhost:8000`.
+`ensureCriticalTables.test.ts` now records only the attempt journal's TTL and recovery calls, because a second table has settings.
+
+### Known limits (for the engine PR)
+- Cancel releases the lock while a batch may still be in flight at Smartlead; the fence stops the cursor write, and the per-lead markers are what make a new run safe. The engine must treat markers as the truth.
+- History listings have no owner filter: routes must scope them by the caller.
+- GSIs use fixed partition values (`kind=RUN`, `active=Y/P`): fine at this volume, a hot-partition ceiling later.
+- The lock expires 15 days after its last claim or resume (heartbeats do not refresh it): a run that stays `running` for over 15 days could lose its lock. Runs are minutes to days; the engine caps run length.
+- Claim skew uses the caller's clock (`skewMs`, 30 s); the epoch fence limits the damage of a fast clock.
+
+### How to extend
+- New field on a run: add it to `PushRun`, `toRunItem`, `fromRunItem`. Readers ignore unknown attributes; bump `SCHEMA_VERSION` only if old readers must stop. An unknown `status` is refused on purpose.
+- New record kind (batch results, event log): a new `sk` prefix under the same run id; no key change.
+- New way to search runs: needs a new index. Boot only creates a missing table, so an index on an existing table is a one-off `UpdateTable` (add the GSI, then the spec and `create-tables.ts`). The four indexes were picked to make that rare.
+- Business rules (what to push, when to pause) belong in the engine, not in `smartleadPushRunDb.ts`.
+
+### Before this is used in production
+The app's IAM role must allow Get/Put/Update/DeleteItem and Query on the table and its indexes (infra). Until then boot logs the create failure and the push route must return 503.
+
+## ENG-673: pure functions for the Smartlead push — PR-A (2026-10-27)
+
+The first building blocks of pushing a CRM list into a customer's own Smartlead campaign. All pure: no route, no table, no network call, nothing calls them yet.
+
+- `smartleadSequence.ts`: reads a campaign's sequence (`GET /campaigns/{id}/sequences`): the merge tags it uses, whether it has content, whether it uses `{a|b}` spintax, and a hash that ignores ids and timestamps. Handles A/B variants, whose content sits in `sequence_variants` while the step's own subject and body are empty (seen on a live account); skips deleted variants.
+- `smartleadPayload.ts`: builds what is sent for one lead: the standard Smartlead fields from the CRM lead, plus a custom field for each non-standard tag the customer's own sequence uses (the customer writes the email in Smartlead; AgentWeb is the orchestrator). Values go as plain text with newlines stripped; a value containing `{{`, `}}` or `{a|b}` is refused. A lead missing a value for a tag the sequence uses is refused, because Smartlead renders a missing variable blank.
+- `smartleadEligibility.ts`: which leads of a batch may be sent and why the others may not (no or invalid email, do-not-contact, undeliverable, unverified, already pushed to this campaign, created after the run started, missing tag, template syntax, duplicate email in the run).
+- `smartleadPreflight.ts`: the campaign status rule (DRAFTED and PAUSED allowed, ACTIVE needs a second confirmation, everything else refused) and the sequence check: findings are warnings for a DRAFTED or PAUSED campaign and blocks for an ACTIVE one, except a tag that would render blank for every lead and a near-miss tag such as `{{First_Name}}`, which block for every status.
+- `smartleadMarkers.ts`: the per-lead record of a push (`system.smartlead_<campaignId>`, a flat key because `setLeadFields` sets whole top-level `system` keys) and `isPushedToSmartlead(lead)` for the later check in AgentWeb's own senders. Deliberately separate from `isDoNotContact`.
+- `smartleadEstimate.ts`: days to send for the preview (leads over the mailboxes' limits, capped by the campaign's daily maximum).
+- Tests use shapes recorded from a live Smartlead account; breaking the code on purpose (six ways) makes tests fail.
+
+Review fixes (independent review, same day):
+- The sequence reader's tag pattern backtracked badly on a stray `{{` followed by whitespace (measured 23 seconds at 6,000 spaces, which would freeze the shared backend on a customer's template). It is now linear; a text longer than 200,000 characters counts as unreadable; a regression test covers it.
+- Values containing `<` or `>` are refused (Smartlead puts values into the customer's HTML email, so a scraped company name could become a link), zero-width and bidirectional-override characters are removed, values over 500 characters are refused, `NaN`, `Infinity` and booleans count as empty.
+- `company_url` is a standard tag (read from the CRM website). Acknowledging a standard or mapped tag no longer switches off the missing-value guard.
+- `createdAt` is compared as a time (strings, numbers and Dates; a lead with none is allowed, one that cannot be read is skipped).
+- An opted-out address stops every record with that address in the batch and in later batches of the run.
+- A missing or odd campaign status is refused instead of throwing; a non-string mapping value or a `__proto__` path reads as blank; the hash now includes follow-up delays; `[null]` is an unreadable sequence.
+
+Second review fixes:
+- The spintax pattern was quadratic too (`{` followed by 100,000 `|` took 3.5 seconds): replaced by a linear scan (`smartleadText.ts`, 4 ms for a million characters). `sanitizeValue` refuses an enormous raw value before running anything on it. A sequence over 200 steps counts as unreadable; tag de-duplication uses a set.
+- The lead's email is checked like any other value: no quotes, angle brackets, braces or backslashes (it goes into the customer's HTML as `{{email}}`), at most 254 characters.
+- `runStartedAt` is a required input of the eligibility function (without it nothing would stop an unapproved lead). A numeric `createdAt` below 1e11 is read as epoch seconds; a text `createdAt` must look like an ISO date or the lead is skipped.
+- Acknowledging a near-miss tag (`{{First_Name}}`) no longer clears it: it still blocks.
+
+Third review fixes:
+- A sequence with hundreds of huge unique "tags" made the tag classifier take 4.5 seconds. A tag longer than 100 characters, more than 2,000,000 characters of text in all (steps and variants together), or more than 200 steps now makes the sequence unreadable (which blocks an ACTIVE campaign); `classifyTags` is linear (names normalised once, lookups in a map and a set). The reviewer's exact attack now ends in 59 ms; 18,000 tags just under the caps take 37 ms.
+- A `createdAt` with no time zone is read as UTC (the CRM writes UTC), not in the server's local zone; tested under three zones.
+- Known and accepted: an address with an apostrophe (`o'brien@acme.com`) is refused as invalid, because `{{email}}` goes into the customer's HTML; the run's counts show how many leads were skipped for it.
+
+## ENG-673: Smartlead push plumbing, slice 2a (2026-10-27)
+
+Backend groundwork for pushing a CRM list into a customer's own Smartlead campaign (slice 2b onward). Nothing user-visible changes yet and nothing calls these functions from a route.
+
+- **Per-key throttle.** `smartleadRequest` now keeps one rate-limit slot per API key (a hash, never the key), instead of one slot for the whole process. One customer's push no longer delays another's, or AgentWeb's own metrics key. In-process only: with several backend instances the effective rate is per instance.
+- **Dead-key flag.** `SmartleadConfig.needs_reconnect`, `smartlead` added to `RECONNECT_MEANS_DEAD_CREDENTIAL`, and a "Reconnect required" row in `GET /connected-accounts`. Set only by `services/smartleadConnection.ts` after an independent probe (`GET /email-accounts`) also returns 401 or 403; cleared by a reconnect or by a later successful probe. Nothing sets it yet.
+- **Finding the key.** `resolveSmartlead(userId, accountId?)` returns the caller's own connection, else the single one a teammate shared (write-backs go to the owner's record), else asks the caller to choose. `reportSmartleadFailure` classifies a failed call.
+- **Smartlead calls.** `listCampaigns`, `getCampaignEmailAccounts`, `addLeadsToCampaign` (max 400, all four block-list/duplicate overrides sent as false, a reply with no recognisable count is an error), and a mailbox `dailyLimit` on `listEmailAccounts` (reads `message_per_day` or `max_email_per_day`; the list reply carries SMTP/IMAP passwords, which are dropped).
+- **Unverified.** Every response shape above is from Smartlead's reference, which contradicts itself in places (campaign list bare vs wrapped, lead-import reply fields, campaign status `DRAFT` vs `DRAFTED`), so readers accept the variants. None has been checked against a live Smartlead account.
+- **Test env.** `test-env/smartlead-stub.js` now also answers campaigns, campaign mailboxes and lead import, plus a `flip-<n>` key that works n times then returns 401.
+
+## ENG-673: Smartlead key connection (2026-10-27)
+
+A customer connects their own Smartlead account by pasting an API key (Smartlead documents no OAuth). `POST /api/oauth/smartlead/connect` validates it by listing the key's mailboxes (`listEmailAccounts`, first page only on connect; paging by offset exists for later slices but is unverified against live Smartlead) and stores it as an `api_key` connected account, modelled on Luma: key encrypted in `config.access_token`, one connection per user (`account_id` is `smartlead-<userId>`, since Smartlead has no "who am I" call; replacing a key makes the connection private again via `createAccount`'s `resetSharing`), rate-limited to 10 tries per 15 minutes per user.
+
+- API and webhooks need Smartlead Pro ($94) or above; Base has no API. An expired plan and a wrong key may both return 401, so the 422 message names both. Not yet seen against a real account: the exact response shape of `GET /email-accounts` (`id`, `from_email` assumed from the docs) and what a Base key returns.
+- A valid key with no mailboxes connects, with a `warning` in the response.
+- Not done here: `needs_reconnect` (nothing sets it until the first call that uses the key), the per-key throttle (`nextSlotAt` in `smartleadService.ts` is one module-wide slot shared by every key; fix before the push slice), the webhook receiver.
+
+Test env only: `SMARTLEAD_API_BASE_URL` points Smartlead calls at `test-env/smartlead-stub.js` (compose profile `smartlead-stub`). It is honoured only when `NODE_ENV` is `development` or `test`, never when unset or `production`. The stub is our guess at Smartlead replies, so it proves our handling, not Smartlead behaviour.
+
+## ENG-673: read Smartlead's real add-leads reply (2026-10-27)
+
+A live Smartlead account showed that its add-leads reply is not the one its docs describe, and the merged reader (slice 2a) was wrong against it: it read `upload_count` as "leads added", but `upload_count` is everything submitted (invalid rows included); `total_leads` is what was newly added. Nothing calls `addLeadsToCampaign` yet, so no user was affected.
+
+- `addLeadsToCampaign` now reads the real reply (`total_leads`, `already_added_to_campaign`, `invalid_emails`, `skipped_in_other_campaign_count`, `block_count`, ...) and still accepts the documented `added_count`. It always sends `return_lead_ids: true`, so the result says per lead whether it was newly added, already in this campaign, or already in another one, with the Smartlead lead id (needed later to pause or unsubscribe a lead).
+- `skippedLeads` and `skippedKnown` are gone (the live reply has no per-lead reasons, only tallies and the id map).
+- Contract tests now run the readers against replies recorded from a live account (`__tests__/fixtures/smartleadRealReplies.ts`, every value invented, shapes real).
+- `test-env/smartlead-stub.js` returns the real shape.
+- Also recorded from the live account: the campaign mailbox list and the campaign list are bare arrays; the mailbox list does carry the per-day limit (`message_per_day`); an A/B-variant sequence has empty step-level subject and body.
+
+## ENG-2706: Stable OpenRouter key-budget alert subject (2026-10-27)
+
+The key-budget alert subject is now per threshold band (`past 80%` / `past 95%`) instead of embedding the live percentage, so the Linear oncall filer appends recurrences instead of filing a new issue per 1% step. Live % moved to message/context. Thresholds, spend, and limits unchanged.
+
+## ENG-2496: `AW-ZomaDeviceAuth` now has a `create-tables` definition (2026-10-27)
+
+- **What it is.** Zoma's device-flow login (`mcp/zomaDeviceStore.ts`) stores pending device codes, hashed Zoma API tokens and the setup timeline in `AW-ZomaDeviceAuth`. The table was created by hand in production and no script created it, so `createTablesDrift` failed on `main` and a fresh environment had no such table.
+- **What changes.** `create-tables.ts` gets `createZomaDeviceAuthTable`: primary key `pk` (S), no sort key, no GSI, pay-per-request, TTL on `ttl`. It only creates the table when it is missing; the existing production table is left as it is. A TTL failure is a warning and never stops later tables.
+- **Data-plane note.** Adds a definition only. Nothing runs until `create-tables` is run, and then only against environments that lack the table. It has no deletion protection or point-in-time recovery, unlike the attempt-usage table; add them if wanted.
+
+## ENG-2382: the CRM freshness shadow log can now tell a coincidence from a stale restatement (2026-10-27)
+
+**Why.** The detector (ENG-2263) is log-only and logs only the replies it flags. By 2026-10-27 production had 18 flagged replies from real accounts, 3 of them `echoesEarlier` (the claimed number is among the numbers earlier turns of the session returned), all tiny numbers (14, 0, 5). Two things made them unreadable: there was no denominator (how many CRM replies were checked), and `echoesEarlier` is coincidence-prone, because the session number set holds every array length of every CRM result (up to 64 per message, over the last 120 messages), so in a long session a small integer is in it by chance.
+
+**What changed (log-only; the reply is never touched; kill switch `AGENT_CRM_FRESHNESS_GUARD=off` covers all of it).**
+- The existing `[crm-freshness-shadow]` line gains three numbers: `sessionNumberCount` (size of the session number set), `sessionDensity20` (share of the integers 0..20 in it, so a hit on a crowded set reads as chance) and `sessionMessages` (history length at the start of the turn; omitted when unknown).
+- A new `[crm-freshness-checked]` line is written for every reply the detector had something to look at (a CRM tool succeeded, a `[verified: ...]` tag, or an inventory total claim), flagged or not: `model`, `flagged`, `findingCount`, `tagsSeen`, `claimsSeen`, `crmToolsSucceeded` (a count), `totalsAbstained`, plus the same `sessionNumberCount` / `sessionDensity20` / `sessionMessages` as the flagged line so the flag rate can be split by how crowded the session was. Counts and a model name only: no reply text, no session id. Replies with nothing CRM-related write nothing. It is the denominator for the flag rate per model.
+- `backend/scripts/summarize-crm-freshness-shadow.mjs` reads both, and the JSON that `aws logs filter-log-events --output json` prints as well as plain log text: a per-model "CRM replies checked / flagged (%)" line (one decimal below 10%, shown even for a model with no flagged replies), the flag rate split by how many of the integers 0..20 the session number set holds (empty set, 0-4, 5-10, 11-21) and by session length (under 50, 50-199, 200+ messages), and for the `echoesEarlier` lines the median and range of `sessionDensity20`. The density split only bears on echo lines; the rate counts every kind of flag.
+
+**Reading it.** Median density near 1 on the echo lines means the matches are expected by chance; a sparse set (say under 0.2) makes a match meaningful. Old lines without the new keys are skipped, not counted as zero.
+
+**Volume.** One short line per CRM-relevant reply. If it is too much, `AGENT_CRM_FRESHNESS_GUARD=off` (Beanstalk env var, needs a restart) stops everything; there is no separate switch for the new line.
+
+**Not done here.** Which tool and field produced a matched number is not logged: that needs extra data in each chat message's persisted metadata, a persistence-format change outside this PR.
+
+**Scope of "checked".** It is the detector's own scope, not proof a reply is about the CRM: the bare "N lists" pattern needs no CRM context, so a reply about "5 lists of ideas" counts as a claim. The flagged line has the same property, so the flag rate and its numerator stay consistent.
+
+**Pulling the data.** `aws logs filter-log-events --region <r> --log-group-name <the web.stdout.log group> --start-time <epoch ms> --filter-pattern '"crm-freshness"' --output json > pull.json`, then `node backend/scripts/summarize-crm-freshness-shadow.mjs pull.json`. Filter on `"crm-freshness"` (both markers), not on `crm-freshness-shadow`: that narrower filter, still in older notes and on the ENG-2382 card, leaves out the checked lines and so the denominator. The summarizer says so when it sees flagged lines but no checked lines, and notes a model whose flagged and checked counts differ. The checked line exists only from the deploy of this change, so a pull window that starts earlier holds flagged lines with no checked counterpart; compare rates only over the window after the deploy.
+
+## ENG-2113: a plan stop says whether the user may be offered AgentWeb credits (2026-10-27)
+
+- **What changed.** The typed stop body of a plan turn (`claudeStopBody`) gains `canUseAgentWebCredits`. It is true for problems with the user's connected plan or with reaching it (no connection, needs reconnect, expired, turned off, lookup failed, worker unavailable or busy, the plan's usage limit, a failure the plan reported, a model the plan cannot run) and false for everything else (Stop, disconnect, organisation, acknowledgement, bad funding choice, feature off, policy block, conversation too large, turn timeout, AgentWeb restart).
+- **When it is withheld.** Once the user's message is saved (`userMessageSaved: true`) the plan turn may already have run, tools included, so the controller sends `canUseAgentWebCredits: false` even for the offered codes: a resend on AgentWeb credits would store the message twice and could repeat a tool's side effects. In practice the offer is true for the stops that happen BEFORE the turn (no connection, reconnect needed, expired, turned off, lookup failed, a model the plan cannot run) and false for stops during or after it, until a 'continue' option exists. `turn_failed` is a catch-all that also covers AgentWeb-side errors, so client copy must not blame the plan.
+- **What it is for.** A client can ask the user "your connected plan could not run this; use AgentWeb credits for this message?" and, on a yes, send the message with `fundingChoice: "agentweb"` (the normal AgentWeb path with its usual quota checks). Nothing moves on its own: the backend never falls back silently. The flag is provider-neutral so Codex plans use the same offer.
+- **Network blips.** Already handled in the host call: a refused connection or a busy or restarting worker is retried for up to 40 s (`runHostTurn`). A failure after the request was sent is never retried (the turn may have run).
+- **Not in this PR.** The portal dialog, and a way to continue a message whose user text is already saved (`userMessageSaved: true`) without storing it twice. Scheduled runs (a per-schedule "run on AgentWeb credits if my plan fails" setting) come with scheduled runs on the plan.
+
+## ENG-2113: the backend accepts a login host one protocol version ahead (2026-10-27)
+
+- **What changed.** `loginHostProvider` reports the worker protocol as `match` for version 2 (this build's) and 3, instead of only 2. `workerProtocol()` still returns the exact version.
+- **Why.** The tool relay needs a new `turn.run` field, and an old worker refuses unknown fields, so the worker must deploy first. Until now a worker at a newer version made every running backend log a mismatch, and a mismatch makes `workerSpeaksOurProtocol` false: a "no such connection" answer then no longer counts as a confirmed wipe for revoke and the sweeper, so disconnects would sit in `revoking` until the backend catches up. Accepting one version ahead removes that window.
+- **Limits.** Version 1 and anything two or more ahead are still a mismatch. Code that needs a specific newer feature (the relay) must check `workerProtocol()` itself; `protocolStatus()` only means "compatible for sign-in, revoke and plain turns".
+
+## ENG-2110: remove the backend-local Claude sign-in routes (2026-10-27)
+
+- **What changed.** `/api/llm-connections/claude-subscription/*` (start, complete, cancel) is no longer mounted, and its router and test are deleted. Connecting a Claude plan goes only through `/api/llm-connections/subscriptions/claude/*`, where the sign-in runs on the login host.
+- **Why.** The old routes ran the sign-in on the backend and sealed the customer's token (KMS) onto the connection record. The program rule is that AgentWeb never holds a customer token; the hosted routes keep it on the worker. The old routes were still reachable for any user on the allow-list, which defeated that rule.
+- **Not touched.** `claudeSubscriptionService` stays: the expiry cron, boot-time orphan recovery and connection revoke still use it for records created earlier. No client calls the removed paths (the portal uses the hosted ones). Existing connections are unaffected.
+
+## ENG-2110: a Claude sign-in survives a backend deploy (2026-10-27)
+
+- **Problem.** A pending hosted sign-in lived only in the memory of the backend instance that started it. Production deploys many times a day (a new instance replaces the old one), so a user who opened the sign-in page and pasted the code after a deploy, or whose request reached a second instance, got `409 login_not_found` and had to start over.
+- **Change.** The `loginId` is now a sealed token (`services/funding/hostedSignInToken.ts`): AES-256-GCM over {owner, provider, connection id, the host's login reference, reconnect flag, expiry}, key derived (HKDF, purpose label) from the existing JWT secret, so no new secret and nothing stored. Any instance can complete or cancel the sign-in. The client cannot read or change the token. The in-memory list stays as a fast path (second start still cancels the first, the 20-pending cap and timers are unchanged); a token the instance has not seen is rebuilt from the token itself.
+- **What does not change.** The single-use code still goes to the login host in one request body and nowhere else. The host remains the arbiter of "used": a replayed token, or one whose attempt was cancelled or consumed, reaches the host and gets `login_not_found`. Using a token still needs the owner's own session and the per-user feature flag.
+- **Limits.** Rotating the JWT secret makes pending sign-ins answer `login_not_found` (start again). A second `start` on a different instance cannot cancel the first one's host attempt; the host expires it itself (a reconnect for the same connection answers `busy` until then).
+- **Guards (from review).** The double-submit guard and the in-memory list are keyed by the attempt (connection id + host login reference), not by the token string, and only the one spelling of a token that we issue is accepted. A cancel that arrives while a complete is in flight is ignored, so it cannot discard the host's ready login after the code was spent.
+- **Known limits (superseded in part by the protocol-3 paragraph below).** Two completes for the same sign-in that land on two different instances at the same moment are stopped by the login host, which refuses a second `login.complete` while the attempt is `ready` (the worker change in #3792, which must deploy first). A cancel the host could not receive leaves that sign-in completable until it expires; a second `start` on another instance does not cancel the first instance's attempt.
+- **Also (cross-instance).** If the loser of a double submit gets an ambiguous (timed-out) answer after the winner's complete already made the attempt `ready`, it reads the host status, then fails to create the record and cancels the attempt, which discards the winner's login: the user must sign in again (no leak, no wrong account). An instance killed after the host took the code but before the record exists leaves a `ready` attempt with no record; the host drops it when the attempt expires (at most the 10-minute attempt TTL), and a reconnect for that connection answers `busy` until then. A durable claim (a conditional write keyed by the attempt) would close both; it is a data-plane change and is not part of this PR.
+- **Routes.** `loginId` may be up to 1024 characters (was 64).
+- **More limits (from the second review).**
+  - A cancel that reaches a different instance while another instance is completing the same sign-in (a second tab, a user retry) discards the host's ready login. On a new connection the user sees `host_unavailable` and signs in again; on a reconnect the record has already moved to the next epoch, so the existing connection is marked needs-reconnect and the owner reconnects. The "cancel ignored while a complete runs" guard covers one instance only.
+  - A cancel that is ignored because a complete is running still answers 204; if that complete then ends in a bad code or a disabled flag, the sign-in is put back and stays completable until it expires.
+  - Rolling deploy: during the one rollout, a new-format `loginId` sent to an old instance gets `400 bad_request` (its 64-character cap), and an old-format id sent to a new instance gets `login_not_found`. Pending sign-ins only; the user starts again.
+  - Clocks: a token expires at the earlier of the host's expiry and the backend's now + 10 minutes, and every instance now enforces it with its own clock. A host clock that runs behind the backend's shortens sign-in windows by the difference (harmless with NTP).
+  - The pending cap (20) and "start again cancels the first" are per instance, so one user can hold one pending sign-in per instance for up to the 10-minute lifetime.
+- **Protocol 3 update (with the login-host hardening PR).** Against a worker that reports protocol 3 or more the backend now (1) sends a random `completionNonce` with each complete, so a loser of a double submit whose reply was lost reads the status, sees another request's nonce and stands down with `login_not_found` WITHOUT cancelling (it no longer discards the winner's login); (2) sends `onlyIfPending` on user and timer cancels, so a cancel arriving at another instance while a sign-in is being finished cannot discard the ready login (rollbacks still discard); and the worker discards a ready attempt that is never promoted after two minutes, which frees a reconnect left `busy` by a backend that died mid-complete. To an older worker (or while the version is unknown) none of the new fields are sent, so the two can deploy in either order. The token and the local timer now use the backend's clock only (the host enforces its own expiry), which removes the clock-skew limit; the host's time only shortens the expiry shown to the user. These replace the "cross-instance cancel", "lost-reply double submit" and "instance killed mid-complete" limits above; what remains is the per-instance pending cap and "start again", and the rolling-deploy 400/409.
+- **Found by an adversarial review of the protocol-3 update, fixed.** (1) A loser now stands down unless the host reports ITS OWN nonce: a ready attempt with no nonce was taken by an older backend instance (a rolling deploy), not by this request. (2) If neither the complete's reply nor the status read arrives, the final cancel is also `onlyIfPending`, so it cannot discard another request's ready login (if this request did take the code, the host's ready-attempt limit clears it).
+- **Graceful shutdown no longer cancels pending sign-ins (found by the final review).** A deploy sends SIGTERM to the old instance while the user is still on the sign-in page; the old shutdown cancelled every pending attempt on the host, so the user's paste to the new instance got `login_not_found`. `shutdown()` now only clears this instance's timers; the host expires an abandoned attempt itself. A test shuts the starting service down and finishes the sign-in afterwards.
+- **Worker rolled back from 3 to 2.** The backend caches the worker's protocol for up to 10 minutes; in that window it would still send the protocol-3 fields and a protocol-2 worker refuses them (`start_failed`, the attempt lingers until the host expires it). Rolling the worker back is rare; the cache refreshes on its own.
+
+## ENG-2110: the login host refuses a second `login.complete` for a ready attempt (2026-10-27)
+
+- **Problem.** `login.complete` only checked that the attempt existed. A second complete for an attempt that had already taken its code (a client retry, or, once a sign-in can be finished by any backend instance, the same sign-in reaching two instances) handed the spent code to the finished CLI process, which failed, so the host discarded the ready login. The first request's promote then found nothing and the user lost the sign-in after spending the code.
+- **Change.** `loginComplete` now answers `ESTATE login_not_pending` (the backend maps it to `login_not_found`) unless the attempt is still `pending`, and touches nothing. The host already serialises requests per connection, so this is atomic.
+- **Deploy.** This is a worker change: the signed pipeline deploys it when it merges (blocked while `/etc/aw-login-host/hold` exists). Protocol version unchanged; an older backend is unaffected.
+- **Limit.** A `login.cancel` from another instance while a complete is finishing can still discard the ready login; the backend ignores cancel only for completes it is running itself.
+
+## ENG-2110: the login host closes the cross-instance sign-in edge cases (protocol 3) (2026-10-27)
+
+- **Problem.** With the sealed sign-in token (#3790) any backend instance can finish a sign-in, so a double submit, a retry or a stray cancel can reach the login host from two instances. The host already refuses a second `login.complete` (#3792), but three edges were left: (1) a user cancel arriving while another instance finishes the sign-in discarded the ready login; (2) the loser of a double submit whose reply was lost read the host status, saw `ready`, treated it as its own, failed to create the record and cancelled, discarding the winner's login; (3) a backend that died between its complete and its promote left a `ready` attempt that kept a reconnect `busy` until the whole attempt expired (up to 10 minutes).
+- **Change (all optional and additive, protocol 3).**
+  - `login.complete` takes an optional `completionNonce` (random, not a secret). The host stores it on the attempt before using the code and returns it with the ready status, so a reader can tell whether its own complete took the code.
+  - `login.cancel` takes an optional `onlyIfPending`. A user-initiated cancel sets it; the host then leaves an attempt that already took its code alone. Rollback cancels leave it off and still discard.
+  - A `ready` attempt that is not promoted within `readyAttemptTtlMs` (default 2 minutes; `manager.readyAttemptTtlMs` in the host config, 10 s to 30 min) is discarded by the sweeper. A real sign-in promotes within seconds.
+- **Compatibility.** An older backend sends none of the new fields and sees the old behaviour; the ready reply gains an optional field that its reply schema ignores. The backend's accepted worker versions are now the explicit set {2, 3} (not derived from `PROTOCOL_VERSION`), so the worker can deploy first. A backend (the #3790 update) sends the new fields only to a worker that reports 3 or more, so the two can deploy in either order.
+- **Deploy.** Worker change: the signed pipeline deploys it on merge. While `/etc/aw-login-host/hold` exists the deploy is refused. Every install of a new release renders `prod.json` from the template and `/etc/aw-login-host/bridge-url`, so the zero-tool stub URL (applied by hand to `prod.json`) is reset by the deploy that finally runs and has to be re-applied afterwards; check the `bridge-url` file before lifting the hold. The host config template does not set `readyAttemptTtlMs`, so the 2-minute default applies.
+- **Limits.** The ready-attempt time limit is checked by the host's 60-second sweep and by `login.start` for that connection, so a blocked reconnect is freed at the limit the moment the user retries, and an idle one within about 3 minutes. A promote that arrives after the limit but before a sweep still works. Setting `readyAttemptTtlMs` very low (the floor is 10 s) could discard a slow legitimate promote; the default is far above the backend's promote retry budget. An attempt saved before this build has no ready timestamp and is not affected by the limit.
+
+## ENG-2690: Read-time visitor rollup with set/set_once/add user properties (2026-10-26)
+
+Pure `backend/src/utils/visitorRollup.ts` groups tracker session rows by visitorId; no persistence. Not yet wired to a route.
+
+## ENG-2689: super properties attached to every tracked event (2026-10-26)
+
+- `backend/src/utils/superProperties.ts`: fixed 40-property table from the hireemma.ai tracking plan
+  ("#super properties" tab) with typed, bounded parsing; stored as `super.<name>` fields.
+- Ingest stores them only for lists with an ENG-2688 allow-list; `#ip` is never accepted from the browser.
+- `aw.js`: presets (`#event_time`, `#lib`, `#device_id`, `#url`, `#referrer`, `#title`, `#ua`,
+  `#system_language`, screen, `#zone_offset`, `site_domain`, `session_page_num`) plus
+  `window.awSuper` / `awRegister({...})` registered values ride every event as `super`.
+
+## ENG-2688: per-list event/property allow-list in tracker ingest (2026-10-26)
+
+Custom events on lists registered in TRACKING_ALLOW_LISTS store allow-listed props as namespaced fields (`event.prop`); other lists keep the single lastCustomProps blob. Registry ships empty (no behaviour change until a list is registered).
+
+## ENG-2686: Engagement email + app lifecycle server signals (2026-10-26)
+
+Extends `backend/src/services/serverSignalEmitter.ts` (ENG-2684) with two signal families written to the
+hireemma.ai session list via the same `ingestTrackerEvent` path (`acct-<userId>` row; no schema change):
+
+- **Platform email engagement** — `emitResendEngagementSignal` in the Resend webhook maps
+  sent/suppressed/opened/clicked/bounced, and complained → `email_unsubscribed`. Only mail FROM
+  `RESEND_SYSTEM_EMAIL` (hi@updates.agentweb.pro) qualifies; customer/Emma mail is dropped in the pure
+  mapper. Recipient resolved by email to an AgentWeb account; no account → dropped.
+- **App lifecycle** — `login` (password + Google), onboarding (`onboarding_completed|skipped|abandoned`,
+  other lifecycle events → `onboarding_step_completed {step}`, lateral events skipped),
+  `integration_connected {platform}` on first `connectedAccountsDb.createAccount` per account,
+  `trial_activated` for a `trialing` `customer.subscription.created`.
+- Not wired (no server hook yet): `logout` (client-only), platform `email_unsubscribed` via a preference
+  link, `retargeting_audience_added`. Entry points exist (`emitAppSignal`, `emitEmailEngagementSignal`).
+
+All emission is fire-and-forget (`void`), never throws. Tests: `serverSignalEmitter.eng2686.test.ts`.
+
+## ENG-2684: Stripe billing signals to hireemma.ai session list (2026-10-26)
+
+Stripe webhook + checkout creation emit checkout_started, payment_completed/failed, refund_issued, subscription_started/renewed/plan_changed/cancelled as custom tracker events onto one `acct-<userId>` row in session list `HIREEMMA_SIGNAL_LIST_ID` (default list_1793037224311_9umtchng7) via the existing ingest path. Fire-and-forget; no schema change. Internal telemetry only.
+
+## ENG-2673: flag-off landing generation forwards the originating chat (2026-10-26)
+
+`generateLandingPage`'s legacy branch (`DURABLE_LANDING_GENERATION` != "true") passed a literal `undefined`
+where the originating session id belongs, for both the existing-site sub-page and the first-page build.
+Pages built with the flag off were therefore never tied to the chat: no completion / still-building
+message, `findInFlightJobForSession` could not reconnect to them, and the auto human-eval candidate had no
+session. The branch now forwards `opts.originatingSessionId`, as the flag-on branch always has. No new trust
+is introduced: the only caller that passes it, `POST /api/landing-pages/v0/generate`, already reduces the
+client-supplied `originating_session_id` through `resolveOriginatingSessionId` (session owner or admin;
+delegate tokens make `req.user` the target account) and drops anything else. Completion delivery stays
+exactly-once via `claimCompletion`.
+
+## ENG-2672: generation failures after the save now say `userMessageSaved` (2026-10-26)
+
+- `POST /api/agent-mode/generate`, `/share/:id/generate` / `/ishare/:id/generate` (and the conversable generate) answer 503 `PROVIDER_UNAVAILABLE` (both branches), 503 `SERVER_RESTARTING`, 413 `CONTEXT_LIMIT_EXCEEDED` and 504 `GENERATION_TIMEOUT` with an added `userMessageSaved` boolean. It is `true` only when the turn's user message was already stored in the chat (the ENG-2641 mark set by `generateSessionResponse`; `withGenerationTimeout` marks its own timeout error from the turn it races), else `false`. Status codes, codes and the other body fields are unchanged.
+- The duplicate-send 409 `SESSION_BUSY` (idempotency claim lost) is `true` only when the chat already holds a user message with this request's `clientId`; no `clientId`, a read failure, or a first copy that has not stored it yet stays `false`.
+- Portal: `GENERATION_TIMEOUT` and `SERVER_RESTARTING` honour the flag (companion portal PR).
+- `/verified-generate` is untouched (server-side callers, no composer draft).
+
+## ENG-2671: Stripe test-mode rehearsal script for Extra usage settlement (2026-10-26)
+
+`backend/src/scripts/paygStripeRehearsal.ts` runs the real settlement code, the real webhook controller and every PAYG handler against Stripe TEST mode and the Dev-* tables, using Stripe test clocks for the "hour after finalize", retry-schedule and 7-day-unconfirmed timing. Webhook events are pulled from Stripe (`events.list`) and replayed, signed with a local secret, into `handleWebhook`, so no public endpoint is needed. Our own emails are captured, never sent; the settlement switch is forced on in-process only.
+
+Run (needs a Stripe `sk_test_` key in `STRIPE_SECRET_KEY`, or read access to `dev/AgentWeb/Stripe`):
+
+    cd backend
+    NODE_ENV=development STRIPE_SECRET_KEY=sk_test_... npx ts-node --transpile-only src/scripts/paygStripeRehearsal.ts --out /tmp/payg-rehearsal.json
+
+Guards: refuses unless NODE_ENV=development, key is `sk_test_`/`rk_test_`, Stripe reports livemode false, and STRIPE_API_BASE is unset.
+
+Cases: happy path with receipt, re-delivery, idempotent re-run and refund; credit-paid invoice; decline sequence with `next_payment_attempt`; hosted-invoice payment; 3-D Secure action required and unconfirmed past grace; void; uncollectible then paid; dispute won and lost; concurrent settlement runs and a month record removed by hand.
+
+Not testable here (Dashboard only, per Stripe docs): retry policy (Revenue recovery > Retries), failed-payment emails, 3DS confirmation emails, successful-payment receipts. In test mode Stripe emails only the confirmed address of a team member (set `REHEARSAL_STRIPE_EMAIL`); test and live Dashboard settings are separate.
+
+AWS credentials: several services (approvalInboxService, approvalDb, batchReviewDb, unipileConnectionsDb, dripSequenceDb) set the AWS config from `AWS_ACCESS_KEY_ID` at load without checking it is set, which blanks a laptop's AWS profile and fails every scenario at setup with "Missing credentials". Run with the credentials in the environment, e.g. `eval "$(aws configure export-credentials --format env)"` first.
+
+First run (2026-10-27, run a541a0, test account, Dev tables): 39 of 40 checks passed. The one failure was the script's own lost-dispute check, which looked for a stored `dispute_lost`; the code stores `{reason:'dispute', lost:true}` and derives `dispute_lost` in `paygSuspendedReasonOf`. The check now reads it through that function. Not re-run since the fix (the month itself ended `written_off`/`dispute_lost` with the hold kept, as intended).
+
+## ENG-2113: a chat turn can run on the user's own Claude plan (PR C, dark) (2026-10-26)
+
+- **What it is.** `/generate` can run ONE interactive chat turn on the session owner's own Claude subscription instead of AgentWeb's models. It is opt-in per request (`fundingChoice: "claude_subscription"`), allow-listed per user (default deny, exact user ids, `*` ignored) and OFF in production (flag off, allow-list empty). Without `fundingChoice`, or with `"agentweb"`, nothing changes for anyone. Any other non-null value is a 400. Merging this does not expose it to any user.
+- **Where it runs.** In the MAIN process: `ClaudeCodeBackend` renders one prompt, opens a per-turn tool-bridge run, calls the login host (`turn.run`), maps the bridge ledger to Emma's persisted message shape and returns the same result the worker returns, so the controller persists and answers it as today. The turn never reaches the worker: a plan request that cannot be served is a typed stop (`ClaudeRouteStopError`, fixed copy, no diagnosis agent), never an AgentWeb run. This includes a whole-turn timeout (`turn_timeout`) and any unexpected error (`turn_failed`).
+- **Who may use it.** The session owner, in their own chat. Not delegated access, not an interactive share, and not organisation members (`org_not_supported`) until the data-governance question is decided (organisation-root context would go to a personal Anthropic account). Membership is read from the stored user (strongly consistent) after the allow-list has said yes; `req.user` never carries the organisation id. A failed read is a `lookup_failed` stop, never "no organisation". The Fable model additionally needs `acknowledgeExtraUsage: true` in the request (`extra_usage_needs_ack`): in non-interactive mode the CLI can bill the customer's extra usage credits without asking. This is a code rule, so a host configuration change alone cannot turn Fable on. The plan route does not apply AgentWeb's admin-only or tier model restrictions: those protect AgentWeb's quota, which this route does not use.
+- **What the plan route skips** (AgentWeb's allowance and policy protect AgentWeb's quota, which the plan route does not use): `checkTokenUsage(TURN_ADMISSION)`, the model-policy resolver, the stored-model rewrite, `assertModelInOwnerPlan`, the work-plan step-model swap, `resolveRunFunding`, and the automatic media / work-plan continuations (they would run on AgentWeb's models; the user is asked to continue instead).
+- **Attribution of tool-internal calls.** Titles, embeddings and tool APIs run under an explicit AgentWeb funding scope (`route: "agentweb"`, `runLabel: "claude_plan:<runId>"`), entered per tool call by `EmmaToolBridgeExecutor` (the bridge route is served from the HTTP handler, not from the controller's async context). They are AgentWeb-funded and metered to the owner (decision of 2026-10-23). Like a normal AgentWeb turn they follow the user's BYOK setting if one is on (BYOK is parked). The AgentWeb meter does not record the run label yet, so these costs are not separable from the owner's other AgentWeb usage in the usage tables; they are not billed to the plan.
+- **Stop and revoke.** Every cancel site already calls `generateMarketingResponseWorkerService.cancelSession`; it now also reaches `claudeRunRegistry`, which refuses new bridge calls then aborts the host turn. Disconnecting a connection (`revokeRecord`) stops the running turns of that connection in this process before the host is asked to wipe it. Shutdown waits for running plan turns, stops them, and saves a late-finishing tool call. A call still executing at Stop is saved into the chat when it finishes (looked for up to the bridge's 15-minute hold limit, executed or failed calls only).
+- **Ledger.** `BridgeCallRecord` gains `answeredContent` (what the model was actually handed, so a withheld approval token never enters history) and `duplicateOfId`. The run token is prefixed `awr_` (a bare base64url token starting with `-`/`_` was refused by the host schema ~1 turn in 32).
+- **Unfinished actions.** When a turn is stopped mid-write, the next turn tells the model so (a directive after the last block). If a turn ends before the model could read that directive (Stop before the host ran, a host refusal, a timeout before the first event), the warning is put back for the following turn.
+- **Known limits.**
+  - No approval decks: a tool that needs confirmation ends the turn with a plain note (Meta writes cannot be confirmed). Nothing is persisted mid-turn. No citations, no work-plan retry. Narration text between tool calls is dropped, and tool calls are not grouped per model message (the CLI stream carries no message id).
+  - `fundingChoice` is per request: a later message without it runs on AgentWeb. The picker must attach it to every message.
+  - Stop and revoke reach only runs in this process (multiple backend instances are not covered); the per-write liveness check catches a revoke handled elsewhere. The kill switch is read through a flag cache, so reads can pass for about 65 s after it is flipped, and it does not stop a running turn.
+  - The bridge route is loopback-only until the relay exists, and tools run in the main process. A tool call over about 60 s is cut by the HTTP MCP transport.
+  - The journal row has no `actualModel` or entitlement observation, and the result is not mapped for `refusal` / `max_tokens`. Usage on the message excludes cache tokens.
+  - The CLI can switch models itself (fallback, retired-model remap); the exact-model-name work is a separate PR.
+  - `/verified-generate` and the shared-link generate routes (`/share/:shareId/generate`, `/ishare/:shareId/generate`) always run on AgentWeb and answer 400 to a plan request.
+- **Verification.** Unit + mutation tests (every guard has a killed mutant, including the controller and revoke wiring), a real-`ToolBridge` backend test, and live scripts on the test instance with the kept login (Haiku only): the real backend, the real host and CLI, and Emma's 98 real tools, real 100k-char prompt and Dev data. Scripts: `loginHost/__tests__/live/claude{TurnPipeline,Backend,EmmaTools}Live.ts`.
+
+## ENG-270: Fathom onboarding admin discard/rollback actions (2026-10-07)
+
+- `POST /api/admin/fathom-onboarding/users/:userId/ingestions/:recordingId/discard` marks a needs_review item discarded and flags its draft account `fathomDraftStatus=discarded` (stays `isActive:false`); reviewed items return 409 until rolled back.
+- `.../rollback` returns a reviewed item to needs_review and deletes only the account/org memories recorded on that ledger entry.
+- Both idempotent. No schema/table change: operates on the existing `fathomOnboardingIngestions` user attribute.
+
 ## ENG-668: Stripe's own receipt for the overage invoice, and the extra test-mode cases (2026-10-26)
 
 Owner decision: customers also receive Stripe's successful-payment receipt for the month-end extra usage invoice. It cannot be suppressed per invoice, and turning receipts off account-wide was rejected. So the copy says so: "Stripe will also email you a receipt for the payment." appears in the "invoiced" email's "will charge" wording (`paygInvoiceCreatedEmailCopy`, not the paid, failed, action-required or unconfirmed emails) and in the portal's Extra usage card description. Percentages only: no dollar amounts.

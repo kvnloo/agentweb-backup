@@ -6,6 +6,7 @@ import {
   getIssueCommentsDetailed,
   listOpenBugCanonicals,
   listOpenIssuesByLabel,
+  findMostRecentClosedIssueByLabel,
   listRecentlyResolvedBugCanonicals,
   recordLoopAttributionOutcome,
   reopenIssue,
@@ -324,6 +325,34 @@ describe('linearService.listOpenIssuesByLabel — pagination (ENG-2766)', () => 
     (global.fetch as any) = jest.fn().mockImplementation(() => Promise.resolve(page(1, 100, true, 'c')));
     const res = await listOpenIssuesByLabel('Auto', 250);
     expect(res).toHaveLength(250);
+    expect((global.fetch as jest.Mock).mock.calls.length).toBe(3);
+  });
+});
+
+describe('linearService.findMostRecentClosedIssueByLabel — pagination (ENG-589)', () => {
+  afterEach(() => jest.clearAllMocks());
+  const page = (start: number, n: number, hasNextPage: boolean, endCursor: string | null) => ({
+    ok: true, status: 200, json: () => Promise.resolve({ data: { issues: {
+      nodes: Array.from({ length: n }, (_, i) => ({ id: `u${start + i}`, identifier: `ENG-${start + i}`, title: `t${start + i}`, description: '' })),
+      pageInfo: { hasNextPage, endCursor },
+    } } }),
+  });
+
+  it('finds a closed canonical beyond the first page instead of returning null', async () => {
+    (global.fetch as any) = jest.fn()
+      .mockResolvedValueOnce(page(1, 100, true, 'c1'))
+      .mockResolvedValueOnce(page(101, 100, true, 'c2'));
+    const res = await findMostRecentClosedIssueByLabel('Auto', (i) => i.title === 't150');
+    expect(res?.identifier).toBe('ENG-150');
+    const calls = (global.fetch as jest.Mock).mock.calls.map((c) => JSON.parse(c[1].body).variables);
+    expect(calls).toHaveLength(2);
+    expect(calls[1].after).toBe('c1');
+  });
+
+  it('returns null after the scan cap when nothing matches', async () => {
+    (global.fetch as any) = jest.fn().mockImplementation(() => Promise.resolve(page(1, 100, true, 'c')));
+    const res = await findMostRecentClosedIssueByLabel('Auto', () => false, 250);
+    expect(res).toBeNull();
     expect((global.fetch as jest.Mock).mock.calls.length).toBe(3);
   });
 });
