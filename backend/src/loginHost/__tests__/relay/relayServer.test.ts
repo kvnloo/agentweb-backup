@@ -121,7 +121,7 @@ describe("relay: layout and modes", () => {
     expect(statSync(root).mode & 0o022).toBe(0);
   });
 
-  it("MUTATION TARGET: with ownership on, init() hands the root to root (uid 0, gid 0) and nothing else, and every turn dir goes to the customer LAST", () => {
+  it("MUTATION TARGET: with ownership on, init() hands the root to root (uid 0, gid 0) and nothing else", () => {
     const { layout } = mkLayout();
     const calls: Array<[string, number, number]> = [];
     const host = new RelayHost({ layout, ownByUid: true, chown: (p, u, g) => void calls.push([p, u, g]), log: { warn: () => undefined } });
