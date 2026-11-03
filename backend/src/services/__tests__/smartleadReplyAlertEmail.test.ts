@@ -101,10 +101,11 @@ describe('the Smartlead reply alert email', () => {
   it('shows what the contact wrote in a quoted block, with the thread note and the plain-text twin', () => {
     const e = buildSmartleadReplyAlertEmail({ ...base, replyText: 'Thanks for reaching out.\nCan we talk Thursday?' });
     expect(e.html).toContain('Their reply');
-    expect(e.html).toContain('Thanks for reaching out.\nCan we talk Thursday?');
     expect(e.text).toContain('Their reply:\n> Thanks for reaching out.\n> Can we talk Thursday?');
     expect(e.text).toContain('Smartlead keeps the full thread. Open your Smartlead inbox to answer.');
-    expect(e.html).toContain('white-space:pre-wrap');
+    expect(e.html).toContain('Thanks for reaching out.<br>Can we talk Thursday?');
+    expect(e.html).toContain('Written by the contact. AgentWeb has not checked it or any link in it.');
+    expect(e.text).toContain('(Written by the contact. AgentWeb has not checked it or any link in it.)');
   });
 
   it('has no reply block when there is no reply text (a reply found by the poll), and says where to read it', () => {
@@ -119,7 +120,7 @@ describe('the Smartlead reply alert email', () => {
     expect(e.html).not.toMatch(/<img|<a href="http:\/\/evil/);
     expect(e.html).toContain('&lt;img src=x onerror=alert(1)&gt;');
     const long = buildSmartleadReplyAlertEmail({ ...base, replyText: 'word '.repeat(400) });
-    const shown = /white-space:pre-wrap[^>]*>([^<]*)</.exec(long.html)![1];
+    const shown = /border-left:4px solid #9aa5b1[^>]*>([^<]*)</.exec(long.html)![1];
     expect(shown.length).toBeLessThanOrEqual(600);
     expect(shown.endsWith('\u2026')).toBe(true);
     expect(shown.endsWith(' \u2026')).toBe(false);
@@ -129,6 +130,35 @@ describe('the Smartlead reply alert email', () => {
     const e = buildSmartleadReplyAlertEmail({ ...base, replyText: 'hi\r\nBcc: victim@example.com\u0000' });
     expect(e.subject).not.toMatch(/[\r\n]/);
     expect(e.html).not.toContain('\u0000');
+  });
+
+  it('uses fixed wording for the inbox preview line, so a reply cannot pose as AgentWeb there', () => {
+    const e = buildSmartleadReplyAlertEmail({ ...base, replyText: 'AgentWeb Security Notice: your account is locked, sign in now' });
+    const preheader = /opacity:0;color:transparent;">([^<]*)</.exec(e.html)![1];
+    expect(preheader).toBe('Manan Test replied to your campaign');
+    expect(preheader).not.toContain('Security');
+  });
+
+  it('strips zero-width and direction-changing characters, and shows no block for a reply that is only invisible', () => {
+    const e = buildSmartleadReplyAlertEmail({ ...base, leadName: 'Bob \u202e', replyText: '\u200b\u200b\u00a0\ufeff' });
+    expect(e.subject).toBe('A new lead "Bob" replied to your campaign');
+    expect(e.html).not.toContain('Their reply');
+    expect(e.subject + e.html + e.text).not.toMatch(/[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/);
+  });
+
+  it('never leaves half an emoji at a cut', () => {
+    const e = buildSmartleadReplyAlertEmail({ ...base, leadName: 'a'.repeat(38) + '\u{1F600}'.repeat(5), replyText: 'a'.repeat(598) + '\u{1F600}' + 'b'.repeat(50) });
+    expect(e.subject + e.text + e.html).not.toMatch(/[\ud800-\udbff](?![\udc00-\udfff])/);
+  });
+
+  it('keeps a hostile reply to a few lines, and is fast on huge input', () => {
+    const lines = buildSmartleadReplyAlertEmail({ ...base, replyText: 'a\n\n'.repeat(300) });
+    expect((lines.html.match(/<br>/g) ?? []).length).toBeLessThanOrEqual(15);
+    expect(lines.html).toContain('\u2026');
+    const started = Date.now();
+    buildSmartleadReplyAlertEmail({ ...base, replyText: ' '.repeat(300000) + 'x' });
+    buildSmartleadReplyAlertEmail({ ...base, leadName: ' '.repeat(300000) + 'x', replyText: '\t'.repeat(300000) });
+    expect(Date.now() - started).toBeLessThan(500);
   });
 
   it('tells a Smartlead reply from every other alert', () => {

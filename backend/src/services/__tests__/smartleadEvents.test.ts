@@ -185,6 +185,8 @@ describe("the reply text of a Smartlead reply (ENG-673)", () => {
     const cases: Array<[string, string]> = [
       ["Yes, Thursday works.\n\nOn Tue, Nov 3, 2026 at 9:23 AM Harsha <h@x.co> wrote:\n> Hi there\n> test", "Yes, Thursday works."],
       ["Yes.\n\nOn Tue, Nov 3, 2026 at 9:23 AM Harsha Vankayalapati <h@x.co>\nwrote:\n> Hi", "Yes."],
+      ["Oui.\n\nLe mar. 3 nov. 2026 \u00e0 09:23, Harsha <h@x.co> a \u00e9crit :\nBonjour", "Oui."],
+      ["Yes.\n__________________________________\nFrom: H\nSent: Tuesday", "Yes."],
       ["Yes.\n> quoted only", "Yes."],
       ["Yes.\n\n-----Original Message-----\nFrom: H\nSent: Tuesday", "Yes."],
       ["Yes.\n\nFrom: Harsha <h@x.co>\nSent: Tuesday, November 3, 2026 9:23 AM\nTo: Ann\nSubject: Hi\n\nHi", "Yes."],
@@ -193,8 +195,30 @@ describe("the reply text of a Smartlead reply (ENG-673)", () => {
     for (const [raw, want] of cases) expect(reply({ reply_message: { text: raw } }).replyText).toBe(want);
   });
 
-  it("keeps an ordinary line that merely starts with On or From", () => {
+  it("keeps an ordinary line that merely starts with On or From, and a short From/Date pair that is not a mail header", () => {
     expect(reply({ reply_message: { text: "On Thursday I am free.\nFrom my side that works." } }).replyText).toBe("On Thursday I am free.\nFrom my side that works.");
+    expect(reply({ reply_message: { text: "On balance, yes.\nAs my colleague wrote:\nfine" } }).replyText).toBe("On balance, yes.\nAs my colleague wrote:\nfine");
+    expect(reply({ reply_message: { text: "From: Dave\nDate: Friday\nbye" } }).replyText).toBe("From: Dave\nDate: Friday\nbye");
+  });
+
+  it("strips zero-width and direction-changing characters and shows nothing for a reply made only of them", () => {
+    expect(reply({ reply_message: { text: "\u200b\u200b\u202e \ufeff" } }).replyText).toBeUndefined();
+    expect(reply({ reply_message: { text: "Hi\u200b \u202ethere" } }).replyText).toBe("Hi there");
+  });
+
+  it("never stalls on hostile input: long runs of spaces, tabs, newlines or header words", () => {
+    const hostile = [" ".repeat(250000) + "x", "\t".repeat(250000) + "x", "\n".repeat(250000), "On abc def\n".repeat(20000), "wrote: ".repeat(30000), "-".repeat(250000), "From: a\n".repeat(20000)];
+    for (const text of hostile) {
+      const started = Date.now();
+      replyExcerpt({ reply_message: { text } });
+      expect(Date.now() - started).toBeLessThan(200);
+    }
+  });
+
+  it("never leaves half an emoji at the cap, and keeps at most 40 lines", () => {
+    const cut = replyExcerpt({ reply_message: { text: "a".repeat(REPLY_TEXT_MAX - 2) + "\u{1F600}" + "b".repeat(50) } })!;
+    expect(cut).not.toMatch(/[\ud800-\udbff](?![\udc00-\udfff])/);
+    expect(replyExcerpt({ reply_message: { text: Array.from({ length: 200 }, (_, i) => `line ${i}`).join("\n") } })!.split("\n").length).toBeLessThanOrEqual(40);
   });
 
   it("returns nothing for a reply that is only quoted text, and strips control characters", () => {
@@ -208,7 +232,9 @@ describe("the reply text of a Smartlead reply (ENG-673)", () => {
     expect(long.endsWith("\u2026")).toBe(true);
   });
 
-  it("does not change the event key (a retry of the same delivery must still be one event)", () => {
+  it("does not change the event key, with or without an event id (a retry of the same delivery must still be one event)", () => {
+    const noId = { event_type: "EMAIL_REPLY", campaign_id: 5, sl_lead_email: "ann@example.com", time_replied: "2026-11-03T09:23:00Z" };
+    expect(ok(noId).eventKey).toBe(ok({ ...noId, reply_message: { text: "hello" } }).eventKey);
     const base = { event_type: "EMAIL_REPLY", event_id: "e-1", campaign_id: 5, sl_lead_email: "ann@example.com" };
     expect(reply({ event_id: "e-1" }).eventKey).toBe(reply({ event_id: "e-1", reply_message: { text: "hello" } }).eventKey);
     expect(ok(base).eventKey).toBe(ok({ ...base, preview_text: "different" }).eventKey);
