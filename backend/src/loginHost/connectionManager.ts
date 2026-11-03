@@ -689,7 +689,9 @@ export class ConnectionManager {
     if (!t) throw new HostError("ENOTFOUND", "operation_unknown");
     this.requireEpochNumber(t.epoch, req.epoch);
     // "Result lost" answers: the backend persists the tool's outcome itself and tells the model so. ESTALE = the turn was ended by the host
-    // (abort, deadline, lease); ENOTFOUND = no such pending operation (never issued, already answered, timed out, or the turn is gone).
+    // (abort, deadline, lease); ENOTFOUND = no such pending operation (never issued, already answered, timed out, or the turn is gone). A RETRY of an answer
+    // that was delivered the first time lands here too: the backend records every one of these as LOST (ToolResultLostReason "operation_unknown", loginHostClient.ts
+    // on manan/eng-2113-relay-backend), never as delivered: the tool may have run and the answer may not have reached the CLI.
     if (t.aborted !== undefined) throw new HostError("ESTALE", "turn_aborted");
     if (!t.operations.has(req.operationId)) throw new HostError("ENOTFOUND", "operation_unknown");
     // Everything that can be refused is refused BEFORE the operation is consumed, so the backend can retry with a smaller/valid answer.

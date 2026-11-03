@@ -2,6 +2,7 @@
  * ENG-2113: the host core's side of the tool relay: the dual request shape, the `tool-call` operation, turn.toolResult's typed "result lost" answers,
  * the per-turn call clock and the double-execution conformance rule.
  */
+import { createHash } from "crypto";
 import { HostError, TOOL_LIMITS, type ToolDef } from "../protocol";
 import { drain, makeRig, signIn, turnReq, type Rig } from "./helpers";
 
@@ -70,6 +71,34 @@ describe("relay: dual request shape", () => {
     const legacy = turnReq("c1", 1, { idempotencyKey: "k2", turnId: "tr2" });
     await drain((await rig.mgr.runTurn(legacy)).events!);
     expect((await rig.mgr.runTurn({ ...legacy, bridgeToken: "another-token-0123456789" })).duplicate).toBe(true);
+  });
+});
+
+describe("relay: the LEGACY idempotency hash is exactly what the pre-relay host stored", () => {
+  let rig: Rig;
+  afterEach(() => rig?.cleanup());
+  /** The pre-relay formula, written out independently of the code under test: sha256 of JSON {c, e, t, p, m, pr} in this key order. */
+  const legacyHash = (o: { c: string; e: number; t: string; p: string; m: string; pr: string }) => createHash("sha256").update(JSON.stringify({ c: o.c, e: o.e, t: o.t, p: o.p, m: o.m, pr: o.pr })).digest("hex");
+
+  it("MUTATION TARGET: a turn recorded without tools stores sha256({c,e,t,p,m,pr}) (priority defaults to interactive): a hash that mentions tools, even as null, would make every persisted record EEXISTS after an upgrade", async () => {
+    rig = makeRig({ adapter: { relay: true } });
+    await signIn(rig, "c1", 1);
+    const a = turnReq("c1", 1, { idempotencyKey: "kh1", turnId: "trh1", prompt: "hi", model: "fast" });
+    await drain((await rig.mgr.runTurn(a)).events!);
+    expect(rig.store.get().idempotency["turn:c1:kh1"].requestHash).toBe(legacyHash({ c: "c1", e: 1, t: "trh1", p: "hi", m: "fast", pr: "interactive" }));
+    const b = turnReq("c1", 1, { idempotencyKey: "kh2", turnId: "trh2", prompt: "yo", model: "fast", priority: "background" });
+    await drain((await rig.mgr.runTurn(b)).events!);
+    expect(rig.store.get().idempotency["turn:c1:kh2"].requestHash).toBe(legacyHash({ c: "c1", e: 1, t: "trh2", p: "yo", m: "fast", pr: "background" }));
+  });
+
+  it("MUTATION TARGET: a relay turn's hash is NOT the legacy one (it covers the manifest), and the same request with other tools is a different hash", async () => {
+    rig = makeRig({ adapter: { relay: true } });
+    await signIn(rig, "c1", 1);
+    const req = relayReq("c1", { idempotencyKey: "kr1", turnId: "trr1" });
+    await drain((await rig.mgr.runTurn(req)).events!);
+    const stored = rig.store.get().idempotency["turn:c1:kr1"].requestHash;
+    expect(stored).not.toBe(legacyHash({ c: "c1", e: 1, t: "trr1", p: req.prompt, m: req.model, pr: "interactive" }));
+    expect(stored).toMatch(/^[0-9a-f]{64}$/);
   });
 });
 

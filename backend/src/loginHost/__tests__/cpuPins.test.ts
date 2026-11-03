@@ -172,6 +172,49 @@ describe("CpuMeter clamps and listeners", () => {
   });
 });
 
+// ── the meter's exhaustion kills the child (the trip raised from ANYWHERE: the stream, stderr, the relay socket all charge the one meter) ──
+describe("an exhausted meter kills the child", () => {
+  function childOf(meter: CpuMeter) {
+    const order: string[] = [];
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const child: ChildLike = { stdin: new PassThrough(), stdout, stderr, kill: () => void order.push(stdout.destroyed && stderr.destroyed ? "kill-after-destroy" : "kill-with-pipes-open"), onExit: () => undefined, onError: () => undefined } as unknown as ChildLike;
+    const adapter = new RunnerChildAdapter(child, 1 << 20, undefined, meter);
+    const errors: string[] = [];
+    adapter.on("error", (e: Error) => errors.push(e.message));
+    return { adapter, order, errors, stdout, stderr };
+  }
+
+  it("MUTATION TARGET: charging the shared meter past its burst, from outside the stream (as the relay does), signals the child ONCE with the pipes already closed and reports cpu_budget", () => {
+    const meter = new CpuMeter(50, 0);
+    const { order, errors, stdout, stderr } = childOf(meter);
+    meter.charge(40);
+    expect(order).toEqual([]); // within the burst: nothing happens
+    expect(errors).toEqual([]);
+    meter.charge(20); // 60 > 50
+    expect(order).toEqual(["kill-after-destroy"]); // killed, and the raw pipes were closed BEFORE the signal
+    expect(errors).toEqual(["cpu_budget"]);
+    expect(stdout.destroyed && stderr.destroyed).toBe(true);
+    meter.charge(500); // already exhausted: the listener does not fire again
+    expect(order).toEqual(["kill-after-destroy"]);
+    expect(errors).toEqual(["cpu_budget"]);
+  });
+
+  it("MUTATION TARGET: the same through the stream: a CLI whose events cost more than the budget is signalled (not merely reported)", async () => {
+    const spy = jest.spyOn(performance, "now").mockImplementation(() => 5000);
+    try {
+      const meter = new CpuMeter(5, 0);
+      const { order, errors, stdout } = childOf(meter);
+      for (let i = 0; i < 200; i++) stdout.write('{"a":1}\n'); // the fixed per-read cost (0.08 ms) alone is more than 5 ms
+      await new Promise((r) => setImmediate(r));
+      expect(errors).toContain("cpu_budget");
+      expect(order[0]).toBe("kill-after-destroy");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
 // ── the meter in the stream path, with a mocked clock (FAST: these sit inside the signed-deploy gate; the slow real-clock suite is cpuBudget.test.ts) ──
 describe("the CPU meter in the CLI's stdout path (mocked clock)", () => {
   /** A meter whose clock AND cpu reading are the mocked performance.now (wall = CPU): the modelled cost of handling a line is what is charged. */

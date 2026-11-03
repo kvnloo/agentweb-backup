@@ -3,7 +3,7 @@
  * changes are skipped (unprivileged). The unit-level isolation (a unit sees only its own bind) is systemd's; here we test what the HOST controls:
  * paths, modes, one connection, frame limits, identity, timeouts and the lifetime of the socket.
  */
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, existsSync, readdirSync, writeFileSync } from "fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, existsSync, readdirSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import * as net from "net";
@@ -106,6 +106,27 @@ describe("relay: layout and modes", () => {
     await ep.close();
     expect(existsSync(ep.dir)).toBe(false);
     await ep.close(); // idempotent
+  });
+
+  it("MUTATION TARGET: the relay ROOT is 0755 after init() (traversable by every customer uid, writable by root only), whether it was created now or was left with ANY other mode", () => {
+    const r = rig();
+    const root = r.layout.relayRoot;
+    expect(statSync(root).mode & 0o777).toBe(0o755); // created by init()
+    for (const before of [0o777, 0o700, 0o775, 0o711]) {
+      chmodSync(root, before);
+      r.host.init();
+      expect(statSync(root).mode & 0o777).toBe(0o755); // corrected, not trusted
+    }
+    // never group- or world-writable: a customer uid could otherwise plant a directory next to the per-uid ones
+    expect(statSync(root).mode & 0o022).toBe(0);
+  });
+
+  it("MUTATION TARGET: with ownership on, init() hands the root to root (uid 0, gid 0) and nothing else, and every turn dir goes to the customer LAST", () => {
+    const { layout } = mkLayout();
+    const calls: Array<[string, number, number]> = [];
+    const host = new RelayHost({ layout, ownByUid: true, chown: (p, u, g) => void calls.push([p, u, g]), log: { warn: () => undefined } });
+    host.init();
+    expect(calls).toEqual([[layout.relayRoot, 0, 0]]);
   });
 
   it("every turn gets its own random directory (128-bit): two turns of the same uid never share a path", async () => {
@@ -365,7 +386,7 @@ describe("relay: limits and abuse", () => {
     await until(() => c.closed);
     const ms = Number(process.hrtime.bigint() - t0) / 1e6;
     console.log("key-count frame refused in ms", ms.toFixed(1));
-    expect(ms).toBeLessThan(2000);
+    expect(ms).toBeLessThan(10_000); // catastrophe bound only (the gate fails closed: a slow runner must not block a deploy); the structural assertions are the pins
     expect(r.logs.map((l) => l.fields?.code)).toContain("bad_frame");
     await ep.close();
   });

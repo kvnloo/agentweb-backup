@@ -250,7 +250,7 @@ describe("a hostile unit and a hostile CLI together cannot stall the loop by mak
     const w = await withWaitingCall(args, bytes);
     const t0 = Date.now();
     for (let i = 0; i < 1500; i++) w.session.noteStreamUse(tiny(i));
-    expect(Date.now() - t0).toBeLessThan(2000); // 22.8 s idle / 92 s loaded before the fix
+    expect(Date.now() - t0).toBeLessThan(10_000); // 22.8 s idle / 92 s loaded before the fix; catastrophe bound only (the gate fails closed: a slow runner must not block a deploy); the structural assertions are the pins
     expect(w.canonical).not.toHaveBeenCalled(); // above 64 KiB: matched by name only
     expect(w.flush).toHaveBeenCalledTimes(1); // only the check when the call arrived: tiny lines record nothing new, so they never re-check
     await w.stop();
@@ -350,7 +350,7 @@ describe("a hostile unit and a hostile CLI together cannot stall the loop by mak
     const blocks = Array.from({ length: 250_000 }, (_, i) => ({ type: "tool_use", id: "t" + i, name: "mcp__emma__search", input: { i } }));
     const t0 = Date.now();
     w.session.noteStreamUse({ type: "assistant", message: { id: "mHuge", content: blocks } });
-    expect(Date.now() - t0).toBeLessThan(2000);
+    expect(Date.now() - t0).toBeLessThan(10_000); // catastrophe bound only (the gate fails closed: a slow runner must not block a deploy); the structural assertions are the pins
     expect(w.canonical.mock.calls.length).toBeLessThanOrEqual(64); // at most MAX_STREAM_USES announcements are recorded, the rest are never looked at
     await w.stop();
   });

@@ -64,7 +64,7 @@ export const MODEL_TOOL_NAME_MAX_CHARS = 64;
 export const qualifiedToolPrefix = (server: string): string => `mcp__${server}__`;
 /** The longest bare tool name that still fits the model's limit once the CLI qualifies it for `server`. */
 export const maxToolNameChars = (server: string): number => MODEL_TOOL_NAME_MAX_CHARS - qualifiedToolPrefix(server).length;
-// A new AgentWeb tool must fit these; see the plan-route tool-limits doc that comes with the backend PR (manan/eng-2113-relay-backend; it is not on this branch). Changing a value: update that doc.
+// A new AgentWeb tool must fit these; see docs/plan-route-tool-limits.md, which exists on the backend branch (manan/eng-2113-relay-backend), not on this one. Changing a value: update that doc.
 /**
  * The longest tool name the host accepts (53 for "emma": "mcp__emma__" is 11 characters). Derived from the prefix, never a bare number: a longer name would
  * become a qualified name the model API refuses, which fails the WHOLE turn. The real registry's longest name is 38.
@@ -77,7 +77,7 @@ export const TOOL_NAME_MAX_CHARS = maxToolNameChars(RELAY_MCP_SERVER_NAME);
 export const TOOL_NAME = z.string().regex(new RegExp(`^[A-Za-z0-9_][A-Za-z0-9_-]{0,${TOOL_NAME_MAX_CHARS - 1}}$`), `tool name: A-Z a-z 0-9 _ - only, 1-${TOOL_NAME_MAX_CHARS} chars, no leading -`);
 /** Names the relay shim keeps for itself (the whole `aw_relay_` prefix): a manifest may not use them. */
 export const RELAY_RESERVED_PREFIX = "aw_relay_";
-// A new AgentWeb tool must fit these; see the plan-route tool-limits doc that comes with the backend PR (manan/eng-2113-relay-backend; it is not on this branch). Changing a value: update that doc.
+// A new AgentWeb tool must fit these; see docs/plan-route-tool-limits.md, which exists on the backend branch (manan/eng-2113-relay-backend), not on this one. Changing a value: update that doc.
 /**
  * DoS guards, NOT a tool budget, and CUMULATIVE per turn (the open set plus every tool added by an answer): the plan route must be able to offer the same tools
  * as AgentWeb, so these sit at about 2x the whole registry (measured 2026-10-29: 271 tools, ~503 KB; largest description 24,232 bytes (call_meta_marketing_api),

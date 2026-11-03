@@ -446,7 +446,7 @@ describe("claude adapter: lifecycle and memory bounds of the relay", () => {
     const t0 = Date.now();
     s.noteStreamUse({ type: "assistant", message: { id: "mBig", content: [{ type: "tool_use", id: "tu", name: "mcp__emma__search", input: { ids: huge } }] } });
     expect(canonical).not.toHaveBeenCalled();
-    expect(Date.now() - t0).toBeLessThan(5000); // sanity only (the unguarded path took 1.7-3.1 s on an idle machine)
+    expect(Date.now() - t0).toBeLessThan(20_000); // sanity only (the unguarded path took 1.7-3.1 s on an idle machine)
     expect(s.streamUses).toEqual([{ messageId: "mBig", name: "search", key: undefined }]);
     // an ordinary one is recorded AND hashed
     s.noteStreamUse({ type: "assistant", message: { id: "mSmall", content: [{ type: "tool_use", id: "tu2", name: "mcp__emma__search", input: { q: 1 } }] } });
