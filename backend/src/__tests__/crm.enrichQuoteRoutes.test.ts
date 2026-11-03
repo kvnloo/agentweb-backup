@@ -224,17 +224,25 @@ describe('input handling', () => {
     expect(a.body.leadCount).toBe(2);
     expect(a.body.confirmationToken).toBe(b.body.confirmationToken);
   });
-  it('quotes the reference config when none is saved (isDefault) or the config read fails, not the default config it was handed', async () => {
+  it('quotes the reference config when none is saved (isDefault), not the default config it was handed', async () => {
     const wide = Array.from({ length: 40 }, (_, i) => ({ name: `w${i}`, type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' }));
     const pct = async () => (await request(app).post('/api/crm/lists/victim-list/leads/enrich-v3/estimate').send({})).body.estimatedPercentOfAllowance;
     mockGetCfg.mockResolvedValue({ isDefault: false, config: { fields: wide, globalOverwriteDefault: 'fill_if_empty', schemaVersion: 1 } });
     const saved40 = await pct();
     mockGetCfg.mockResolvedValue({ isDefault: true, config: { fields: wide, globalOverwriteDefault: 'fill_if_empty', schemaVersion: 1 } });
     const defaultConfig = await pct();
-    mockGetCfg.mockRejectedValue(new Error('dynamo down'));
-    const unreadable = await pct();
     expect(defaultConfig).toBeLessThan(saved40); // the unsaved default's 40 fields are ignored
-    expect(unreadable).toBe(defaultConfig); // and an unreadable config falls back to the same reference quote
+    expect(defaultConfig).toBeGreaterThan(0);
+  });
+  it('a saved config that cannot be read fails the quote with a generic 500 and NO token (the run would fail on it)', async () => {
+    mockGetCfg.mockRejectedValue(new Error("Cannot read properties of undefined (reading 'filter')"));
+    for (const [url, body] of [['/estimate', {}], ['?mode=estimate', {}]] as Array<[string, object]>) {
+      const r = await request(app).post(`/api/crm/lists/victim-list/leads/enrich-v3${url}`).send(body);
+      expect(r.status).toBe(500);
+      expect(r.body.confirmationToken).toBeUndefined();
+      expect(JSON.stringify(r.body)).not.toMatch(/filter|undefined|leadCount|Percent/);
+    }
+    expect(mockRun).not.toHaveBeenCalled();
   });
   it('leadIds that is not an array = whole list', async () => {
     const r = await request(app).post('/api/crm/lists/victim-list/leads/enrich-v3/estimate').send({ leadIds: 'x' });

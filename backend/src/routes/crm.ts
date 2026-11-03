@@ -1832,14 +1832,12 @@ const getQuoteDeps = async (): Promise<QuoteDeps> => {
   const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
   return {
     getLeadsPage: (listId, limit, lastKey) => crmDb.getLeadsByListId(listId, limit, lastKey as any),
+    // A list with no saved config is quoted on the reference config (as before). A saved config that cannot be
+    // READ must not be: the run would fail on it, so issuing a price and a confirmation token for it would be
+    // misleading. The error goes through; the route answers with a generic 500 and no token.
     getSavedConfig: async (listId, userId) => {
-      try {
-        const stored = await svcGetEnrichmentConfig({ listId, userId }, enrichmentConfigDeps);
-        return stored.isDefault ? undefined : stored.config;
-      } catch (error) {
-        console.warn(`[v3][route] quote: could not read the saved enrichment config for list ${listId}; quoting the reference config:`, (error as Error).message);
-        return undefined;
-      }
+      const stored = await svcGetEnrichmentConfig({ listId, userId }, enrichmentConfigDeps);
+      return stored.isDefault ? undefined : stored.config;
     },
     // Mirrors the resolver (enrichmentIdentityResolver.ts): a blank or placeholder-domain email is not an identity signal.
     hasUsableEmail: (email) =>

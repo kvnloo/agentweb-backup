@@ -141,10 +141,18 @@ describe('priceEnrichment', () => {
     expect((await priceEnrichment(deps(Array(6).fill(''), sizedCfg(10)), { userId: 'u1', listId: 'l' })).estimate.confirmationToken).not.toBe(a);
   });
 
-  it('falls back to the reference config when the saved config cannot be read', async () => {
+  it('uses the reference config when no config is saved', async () => {
     const d = deps(Array(5).fill(''));
     d.getSavedConfig = async () => undefined;
     expect((await price(d)).leadCount).toBe(5);
+  });
+
+  it('does NOT fall back when a saved config cannot be read: the error surfaces and no price or token is produced', async () => {
+    const d = deps(Array(5).fill(''), sizedCfg(10));
+    d.getSavedConfig = async () => { throw new Error("Cannot read properties of undefined (reading 'filter')"); };
+    await expect(priceEnrichment(d, { userId: 'u1', listId: 'l' })).rejects.toThrow(/filter/);
+    await expect(quoteEnrichment(d, { userId: 'u1', listId: 'l' })).rejects.toThrow(/filter/);
+    expect(check).not.toHaveBeenCalled();
   });
 
   it('does not touch the usage ledger (the enrich-time token check must stay cheap)', async () => {
