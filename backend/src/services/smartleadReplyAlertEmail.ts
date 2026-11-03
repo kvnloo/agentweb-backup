@@ -9,7 +9,7 @@
  * escaped or reduced to one line, because a contact controls those words.
  */
 
-import { sliceSafe, stripUnsafeChars } from "./smartleadSafeText";
+import { hasVisibleText, sliceSafe, stripUnsafeChars } from "./smartleadSafeText";
 
 export interface SmartleadReplyAlertInput {
   /** What AgentWeb calls the contact (a name, else the address). */
@@ -44,6 +44,7 @@ const escapeHtml = (value: string): string =>
 /** One line: no control, zero-width or direction-changing characters (a name or subject must never add a header line or reorder the text), trimmed and shortened. */
 const oneLine = (value: unknown, max: number): string => {
   const cleaned = stripUnsafeChars(String(value ?? "")).replace(/\s+/g, " ").trim();
+  if (!hasVisibleText(cleaned)) return "";
   return cleaned.length > max ? `${sliceSafe(cleaned, max - 1).trimEnd()}\u2026` : cleaned;
 };
 
@@ -68,6 +69,7 @@ const CAPTION = "Written by the contact. AgentWeb has not checked it or any link
 const shownReply = (value: unknown): string => {
   const lines = stripUnsafeChars(String(value ?? "")).replace(/\r\n?/g, "\n").split("\n").map(line => line.trimEnd());
   let cleaned = lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  if (!hasVisibleText(cleaned)) return "";
   let cut = false;
   const kept = cleaned.split("\n");
   if (kept.length > REPLY_SHOWN_LINES) {
