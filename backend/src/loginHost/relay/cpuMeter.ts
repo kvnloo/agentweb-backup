@@ -4,7 +4,8 @@
  * measured in MILLISECONDS OF EVENT-LOOP TIME, per turn. Everything that processes a hostile unit's bytes or events on the host runs inside `meter.time(...)`, and the
  * real elapsed time of that synchronous section is what is charged, whatever made it expensive.
  *
- * Numbers. Burst 2,000 ms, refill 50 ms per second (5% of the loop):
+ * Numbers. Burst 500 ms (it was 2,000 ms: eight concurrent turns each spending a 2 s burst on expensive-but-valid lines pinned the loop for 26 s), refill 50 ms per
+ * second (5% of the loop). The figures below were first worked out for the 2,000 ms burst; the honest-turn arguments hold at 500 ms (five 12 MB echoes in a row cost ~240 ms):
  *  - an honest turn is a few thousand tiny events (about 0.05-0.2 ms each) over minutes plus the odd big tool result echoed once (an 8-12 MB line costs roughly
  *    100-300 ms to scan, parse and normalize): a few of those fit the burst, and the refill covers the small events many times over;
  *  - a hostile turn can therefore take 2 s of loop once and 5% of it afterwards before it is killed (`cpu_budget`). CAPACITY: it takes 20 concurrent hostile turns,
@@ -41,7 +42,7 @@ export class TokenBucket {
   }
 }
 
-export const CPU_BURST_MS = 2000;
+export const CPU_BURST_MS = 500;
 export const CPU_REFILL_MS_PER_SEC = 50;
 
 export class CpuMeter {

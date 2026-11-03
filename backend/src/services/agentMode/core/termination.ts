@@ -163,3 +163,9 @@ export function decideTermination(input: TerminationInput): TerminationDecision 
     counterDelta: noDelta,
   };
 }
+
+/** ENG-2778: injected on the final step-budget iteration (forced synthesis). */
+export const STEP_BUDGET_FINAL_SYNTHESIS_MESSAGE =
+  '[SYSTEM WARNING] Step budget exhausted: this is your final step. Do NOT call any tools — ' +
+  'any tool call now will be discarded. Write your final response from the work already ' +
+  'gathered: deliver what was completed, then list clearly what is still missing.';

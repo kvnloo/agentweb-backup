@@ -150,7 +150,10 @@ describe("deploy scripts: static guards", () => {
   });
 
   it("the build script is the gate: tests, a clean tree over ALL of backend/, the lockfile check, and loud overrides recorded in the MANIFEST", () => {
-    expect(build).toMatch(/jest src\/loginHost\/__tests__\/deploy src\/loginHost\/__tests__\/host src\/services\/funding\/__tests__\/loginHostMutualTls\.test\.ts/);
+    expect(build).toMatch(/jest src\/loginHost\/__tests__\/deploy src\/loginHost\/__tests__\/host src\/loginHost\/__tests__\/relay /);
+    // the tool relay's tests are part of the gate too (a relay cleanup mutant used to pass it)
+    for (const part of ["claudeAdapter", "claudeParse", "wrapperManifest", "closePipes", "cpuPins", "drainAccount", "lineFuzz", "lineFlood", "deepLines", "connectionManager.relay"]) expect(build).toContain(`src/loginHost/__tests__/${part} `);
+    expect(build).toMatch(/src\/services\/funding\/__tests__\/loginHostMutualTls\.test\.ts --silent/);
     expect(build).toContain("status --porcelain -- backend)");
     expect(build).toContain("--skip-tests");
     expect(build).toContain("--allow-dirty");

@@ -83,7 +83,7 @@ jobs:
         working-directory: backend
         run: npm ci --ignore-scripts
 
-      - name: Gate tests (host, deploy scripts, mutual TLS)
+      - name: Gate tests (host, deploy scripts, tool relay, adapter, shim, wrapper, mutual TLS)
         working-directory: backend
         env:
           NODE_OPTIONS: --max-old-space-size=4096

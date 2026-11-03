@@ -77,6 +77,12 @@ describe("host config (a CLOSED schema)", () => {
     expect(c.relayRoot).toBe("/run/aw-relay-test1");
     expect(c.socket.mode).toBe(0o660);
   });
+  it("MUTATION TARGET: deploy/host-config.example.json parses once its one placeholder (the binary sha256) is filled in: it names the required claude.nodePath", () => {
+    const text = readFileSync(join(__dirname, "..", "..", "deploy", "host-config.example.json"), "utf8").replace("<sha256 of that exact binary: sha256sum>", "a".repeat(64));
+    const c = parseHostConfig(JSON.parse(text));
+    expect(c.claude.nodePath).toMatch(/^\/opt\/aw-node\/v[0-9.]+\/bin\/node$/);
+  });
+
   it("MUTATION TARGET: claude.nodePath is REQUIRED (the old default /usr/bin/node is a symlink on the worker: a hand-written config would pass parsing and then crash-loop at the trusted-path check)", () => {
     const c = base() as { claude: Record<string, unknown> };
     const noNode = { ...c, claude: { ...c.claude } };

@@ -261,16 +261,16 @@ describe("a hostile unit and a hostile CLI together cannot stall the loop by mak
     await turn.catch(() => undefined);
   });
 
-  it("MUTATION TARGET: a hard per-turn budget on bytes hashed: 60 announcements of ~500 KB cost at most 8 MiB of hashing, then nothing is hashed or recorded", async () => {
+  it("MUTATION TARGET: a hard per-turn budget on bytes hashed: 400 announcements of ~50 KB (each under the 64 KiB limit) cost at most 8 MiB of hashing, then nothing is hashed or recorded", async () => {
     const w = await withWaitingCall({ q: "x" }, 20);
     w.canonical.mockClear();
     (w.session as unknown as { visibleTools: Set<string> }).visibleTools.add("search");
     const t0 = Date.now();
-    for (let i = 0; i < 60; i++) {
-      w.session.noteStreamUse({ type: "assistant", message: { id: "m" + i, content: [{ type: "tool_use", id: "t", name: "mcp__emma__search", input: { pad: "x".repeat(500_000) + i } }] } });
+    for (let i = 0; i < 400; i++) {
+      w.session.noteStreamUse({ type: "assistant", message: { id: "m" + i, content: [{ type: "tool_use", id: "t", name: "mcp__emma__search", input: { pad: "x".repeat(50_000) + i } }] } });
     }
-    expect(w.canonical.mock.calls.length).toBeLessThanOrEqual(17); // 8 MiB / ~500 KB
-    expect(w.canonical.mock.calls.length).toBeGreaterThan(0);
+    expect(w.canonical.mock.calls.length).toBeLessThanOrEqual(170); // 8 MiB / ~50 KB
+    expect(w.canonical.mock.calls.length).toBeGreaterThan(100);
     await w.stop();
   });
 
@@ -342,9 +342,10 @@ describe("which model message a relayed call is tied to (the stream announcement
     expect(await tie([{ id: "mA", input: { q: 1 } }, { id: "mB", input: { q: 2 } }], { q: 3 })).toMatch(/^unmatched-/);
   });
 
-  it("MUTATION TARGET: an announcement of ANOTHER tool never matches, and an oversize announcement (not recorded) leaves the call unmatched", async () => {
+  it("MUTATION TARGET: an announcement of ANOTHER tool never matches; a big announcement (name only, never hashed) ties a call only when it is the ONLY announcement of that tool", async () => {
     expect(await tie([{ id: "mX", name: "other", input: { q: 1 } }], { q: 1 })).toMatch(/^unmatched-/);
-    expect(await tie([{ id: "mBig", input: { blob: "x".repeat(2 * 1024 * 1024) } }], { blob: "x" })).toMatch(/^unmatched-/);
+    expect(await tie([{ id: "mBig", input: { blob: "x".repeat(2 * 1024 * 1024) } }], { blob: "x" })).toBe("mBig");
+    expect(await tie([{ id: "mBig1", input: { blob: "x".repeat(200 * 1024) } }, { id: "mBig2", input: { blob: "y".repeat(200 * 1024) } }], { blob: "x" })).toMatch(/^unmatched-/);
   });
 });
 

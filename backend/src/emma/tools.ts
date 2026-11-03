@@ -5549,7 +5549,7 @@ emmaToolRegistry.register({
   name: "google_search_web",
   definition: {
     name: "google_search_web",
-    description: 'Opt-in Google Custom Search web search. This is not the default search tool and has no hidden provider fallback. Use only when the user explicitly asks for Google search, when a skill requires Google CSE, or when comparing provider output.',
+    description: 'Legacy alias of you_search_web (Google Custom Search was retired, ENG-1281). Prefer you_search_web; this returns the same You.com web results.',
     inputSchema: {
       type: "object",
       properties: {

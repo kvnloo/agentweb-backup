@@ -75,7 +75,7 @@ describe("CpuMeter", () => {
   });
 
   it("the defaults are the documented numbers", () => {
-    expect(CPU_BURST_MS).toBe(2000);
+    expect(CPU_BURST_MS).toBe(500);
     expect(CPU_REFILL_MS_PER_SEC).toBe(50);
   });
 
@@ -433,6 +433,13 @@ describe("honest image-heavy turns (REAL clock, real JSON.parse + normalize)", (
     const six = await echoes(Array.from({ length: 5 }, () => ({ mb: 12, gapMs: 0 })));
     console.log("RESULT cpu echo 5x12MB back to back", JSON.stringify(six));
     expect(six.errors).toEqual([]);
+  });
+
+  it("MUTATION TARGET: an honest 15 MB line, twice back to back (30 MiB), is not killed by the 500 ms burst", async () => {
+    const two = await echoes([{ mb: 15, gapMs: 0 }, { mb: 15, gapMs: 0 }]);
+    console.log("RESULT cpu echo 2x15MB", JSON.stringify(two));
+    expect(two.errors).toEqual([]);
+    expect(two.parsed).toBe(2);
   });
 
   it("MUTATION TARGET: six 8 MB image echoes 200 ms apart (48 MiB, inside the byte burst) are never killed", async () => {

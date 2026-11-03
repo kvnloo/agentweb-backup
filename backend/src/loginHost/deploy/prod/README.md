@@ -68,7 +68,11 @@ Exit codes: `0` ok; `1` failed (the running host is untouched); `3` NOT installe
 
 ## Memory ceiling
 `aw-prod.slice` caps ALL customer units: `MemoryMax=3G`, `MemoryHigh=2800M` (`versions.env` `SLICE_*`). t3.medium has 4 GiB and no swap. `maxTurnsPerHost` (8) x ~300 MB per Claude
-turn = ~2.4 GB, plus ~200 MB per sign-in process: it fits only just. If you raise `maxTurnsPerHost`, resize the instance AND the slice together.
+turn = ~2.4 GB, plus ~200 MB per sign-in process: it fits only just. A relay turn also runs the node shim (about 45-50 MiB resident each; 8 turns = about 400 MiB more, inside the same slice). If you raise `maxTurnsPerHost`, resize the instance AND the slice together.
+
+## Rolling back across the tool relay (protocol 4)
+Roll the BACKEND back (or switch its relay off) BEFORE rolling the worker back to a build that speaks protocol 3: a backend that still sends `tools` to a protocol-3 worker gets
+`EINVALID` on every relay turn until its protocol re-check (10 minutes) notices the downgrade. Deploy order is the other way round: the worker first, then the backend.
 
 ## RUNBOOK
 **Where to look first**: `journalctl -u aw-login-host@prod -u 'aw-login-host-failed@*' --since -1h` (shipped to CloudWatch log group `/agentweb/login-host/prod`).
