@@ -747,6 +747,8 @@ const DEFAULT_ARG_ALIASES: Record<string, string[]> = {
   operations_json: ['replacement_json', 'operations', 'replacements', 'replacement_instructions'],
   // playwright_browser_evaluate requires `function`; models send `expression`/`script` (ENG-2473).
   function: ['expression', 'script', 'js', 'code'],
+  // playwright_browser_fill_form requires `fields`; models send `elements` (ENG-2791).
+  fields: ['elements'],
   // monitor_lead_volume / assess_client_health etc. require `client_name_or_email`;
   // scheduled report runs send `client_id: "<email>"` (ENG-2610).
   client_name_or_email: ['client_id', 'client_email', 'client'],
