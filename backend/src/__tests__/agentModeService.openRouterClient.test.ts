@@ -757,6 +757,17 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     expect(create.mock.calls[0][0].provider).not.toHaveProperty('ignore');
   });
 
+  it('sends web-search tool parameters only when given, and keeps the bare tool otherwise (ENG-2720)', async () => {
+    const service = new AgentModeService();
+    const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({ chat: { completions: { create } } } as any);
+    await service.callLLM('gpt-5.4', [{ role: 'user', content: 'Hello' }], { taskClass: 'interactive_chat', webSearch: true } as any);
+    expect(create.mock.calls[0][0].tools).toContainEqual({ type: 'openrouter:web_search' });
+    create.mockClear();
+    await service.callLLM('gpt-5.4', [{ role: 'user', content: 'Hello' }], { taskClass: 'interactive_chat', webSearch: true, webSearchParameters: { max_uses: 2, engine: 'parallel' } } as any);
+    expect(create.mock.calls[0][0].tools).toContainEqual({ type: 'openrouter:web_search', parameters: { max_uses: 2, engine: 'parallel' } });
+  });
+
   describe('ENG-55 Compare data-collection policy', () => {
     async function providerFor(options: any, model = 'gemini-3.7-flash') {
       const service = new AgentModeService();
