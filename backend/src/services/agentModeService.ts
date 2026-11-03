@@ -4593,7 +4593,12 @@ export class AgentModeService {
             // the four nudges ENG-1188 exists to cover. The sibling branch below
             // (plain emptiness, no residue detected at all) has no such guarantee
             // attached to it and keeps its own truncatedByTimeBudget exclusion.
-            if (!turnHadUsableText) {
+            if (!turnHadUsableText && stepBudgetSynthesis) {
+              // ENG-2778 (Opslane): at the step cap the post-loop step-limit message is
+              // the specific fallback; the ledger would ask the user to request a summary.
+              console.warn(`AgentMode: Step-budget synthesis unusable in session ${sessionId} — deferring to the step-limit message`);
+              content = '';
+            } else if (!turnHadUsableText) {
               console.warn(`AgentMode: Synthesis unrecoverable after residue in session ${sessionId} — falling back to the executed-action ledger (${toolCalls.length} tool call(s))`);
               content = buildExecutedActionsFallback(toolCalls);
             } else {
@@ -4784,6 +4789,13 @@ export class AgentModeService {
                 continue;
               }
 
+              if (stepBudgetSynthesis) {
+                // ENG-2778 (Opslane): no iteration remains for the in-turn recovery retry at
+                // the step cap. Deliver the model's recap (or the post-loop step-limit
+                // message) instead of a decision-card error, and do not stamp a retryable
+                // failure the recovery never attempted.
+                console.warn(`AgentMode: workplan turn missing structured disposition at step budget in session ${sessionId}; delivering recap`);
+              } else {
               const retryMessage = 'I couldn’t create the decision card needed to continue this step. Please retry.';
               content = retryMessage;
               if (responseMessage) {
@@ -4797,6 +4809,7 @@ export class AgentModeService {
                 };
               }
               console.error(`AgentMode: workplan turn missing structured disposition after recovery in session ${sessionId}`);
+              }
             }
           }
 
