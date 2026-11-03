@@ -391,7 +391,7 @@ describe("relay: limits and abuse", () => {
     const r = rig();
     let t = 0;
     let step = 0;
-    const meter = new CpuMeter(100, 0, () => (t += step)); // the clock only moves while an answer is being handled
+    const meter = new CpuMeter(100, 0, () => (t += step), () => t); // the clock only moves while an answer is being handled; CPU time reads the same clock without moving it
     const { ep, calls } = await r.open({ meter });
     const c = new Client(sockOf(ep));
     await c.ready();

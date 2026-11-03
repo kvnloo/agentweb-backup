@@ -72,9 +72,9 @@ elif [ "$SKIP_TESTS" = 1 ]; then
 else
   echo "build-login-host: running the gate tests"
   # Besides the deploy scripts, the host and mutual TLS, the gate runs the tool relay's tests: the relay (socket, limits, abuse; "__tests__/relay" also matches the shim and
-  # protocol tests), the Claude adapter and its parser, the turn wrapper, the guards on the CLI's streams, and the manager's relay operations. Without them a mutant that
-  # leaves a relay directory behind, or drops a guard, passed this gate. (The slow real-process CPU suite, cpuBudget.test.ts, stays in the normal test run.)
-  npx --no-install jest src/loginHost/__tests__/deploy src/loginHost/__tests__/host src/loginHost/__tests__/relay src/loginHost/__tests__/claudeAdapter src/loginHost/__tests__/claudeParse src/loginHost/__tests__/wrapperManifest src/loginHost/__tests__/closePipes src/loginHost/__tests__/cpuPins src/loginHost/__tests__/drainAccount src/loginHost/__tests__/lineFuzz src/loginHost/__tests__/lineFlood src/loginHost/__tests__/deepLines src/loginHost/__tests__/connectionManager.relay src/services/funding/__tests__/loginHostMutualTls.test.ts --silent \
+  # protocol tests), the Claude adapter and its parser, the turn wrapper, the guards on the CLI's streams (with the fast, mocked-clock CPU meter pins), the connection manager and the HTTP server ("__tests__/connectionManager" and "__tests__/server"
+  # also match their split files). Without them a mutant that leaves a relay directory behind, drops a guard, un-meters the stdout scan or removes the manager tick's catch passed this gate. (The slow real-process CPU suite, cpuBudget.test.ts, stays in the normal test run.)
+  npx --no-install jest src/loginHost/__tests__/deploy src/loginHost/__tests__/host src/loginHost/__tests__/relay src/loginHost/__tests__/claudeAdapter src/loginHost/__tests__/claudeParse src/loginHost/__tests__/wrapperManifest src/loginHost/__tests__/closePipes src/loginHost/__tests__/cpuPins src/loginHost/__tests__/drainAccount src/loginHost/__tests__/lineFuzz src/loginHost/__tests__/lineFlood src/loginHost/__tests__/deepLines src/loginHost/__tests__/connectionManager src/loginHost/__tests__/server src/services/funding/__tests__/loginHostMutualTls.test.ts --silent \
     || { echo "build-login-host: ABORT: the gate tests failed; nothing was packaged" >&2; exit 1; }
 fi
 

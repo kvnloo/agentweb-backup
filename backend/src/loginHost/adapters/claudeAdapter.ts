@@ -40,7 +40,7 @@ import type {
 import { manifestLines, qualifiedToolPrefix, RELAY_MCP_SERVER_NAME, relayCliEnv } from "../protocol";
 import { CpuMeter, TokenBucket } from "../relay/cpuMeter";
 import { RELAY_SOCKET_IN_UNIT } from "../ports/unitArgs";
-import { approxJsonBytes, LogThrottle, MAX_CLI_LINE_DEPTH, MAX_FORWARDED_BYTES, MAX_FORWARDED_DEPTH, valueDepthExceeds } from "../relay/bounds";
+import { approxJsonBytes, LogThrottle, MAX_CLI_LINE_DEPTH, MAX_FORWARDED_DEPTH, valueDepthExceeds } from "../relay/bounds";
 import { canonicalJson } from "../relay/canonical";
 import { createHash } from "crypto";
 import type { RelayCall, RelayEndpoint, RelayHost } from "../relay/relayServer";
@@ -215,8 +215,6 @@ export class RunnerChildAdapter extends EventEmitter implements RunnerChild {
     }
   }
 }
-
-const NEWLINE = Buffer.from("\n");
 
 /**
  * Accounting for the output of a child that has been PLAIN-killed (normal close, idle retirement): it is still read and dropped, unparsed (so a CLI winding down
@@ -964,7 +962,8 @@ class ClaudeSession implements ProviderSession {
    * Returns false when that operation is no longer pending (the relay's own timer fired, the shim is gone, the turn ended): "result lost".
    */
   answer(operationId: string, answer: ServerRequestAnswer): boolean {
-    if (!this.relayEp || answer.kind !== "tool-result") return false;
+    // After an interrupt or a close the turn is over (the process may still be exiting): an answer is a lost result, never "delivered".
+    if (!this.relayEp || this.closing || this.interrupted || answer.kind !== "tool-result") return false;
     let sent: boolean;
     try {
       sent = this.relayEp.answer(operationId, { content: answer.content, isError: !answer.ok, ...(answer.images ? { images: answer.images } : {}), ...(answer.tools ? { tools: answer.tools } : {}) });
@@ -1144,7 +1143,12 @@ class ClaudeSession implements ProviderSession {
           callTimeoutMs: input.relay.callTimeoutMs,
           meter: this.meter,
         });
-        this.relayEp = await this.relayOpening;
+        try {
+          this.relayEp = await this.relayOpening;
+        } catch {
+          // (ENOSPC, EACCES, a leftover directory...) the host could not open the turn's socket: a host-side failure, retryable, not a failed turn. Fixed message: nothing of the error.
+          throw Object.assign(new Error("relay_open_failed"), { code: "open_failed" });
+        }
         if (this.closing || this.interrupted) return; // close() is waiting for this very endpoint and closes it (doClose)
         mcpServer = {
           name: this.cfg.mcpServerName,

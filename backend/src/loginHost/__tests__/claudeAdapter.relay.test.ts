@@ -328,9 +328,16 @@ describe("claude adapter: relay wiring (stubbed socket)", () => {
 
   it("an accepted answer carrying tools makes them callable; a refused answer (operation gone) does not", async () => {
     const { rig, opts, refuse } = stubbed();
-    rig.scenario({ turn: [RESULT_STEP] });
+    rig.scenario({ turn: [{ wait: 3000 }, RESULT_STEP] }); // the turn is still in flight while the answers arrive (after it ends, every answer is a lost result)
     const session = await rig.adapter.openSession(rig.ctx, { connectionId: "conn1", epoch: 1 });
-    for await (const ev of session.turn({ turnId: "t1", prompt: "go", model: "sonnet", relay: { tools: TOOLS, callTimeoutMs: () => 1000 } })) void ev;
+    const turn = (async () => {
+      for await (const ev of session.turn({ turnId: "t1", prompt: "go", model: "sonnet", relay: { tools: TOOLS, callTimeoutMs: () => 1000 } })) void ev;
+    })();
+    await new Promise<void>((resolve, reject) => {
+      const t0 = Date.now();
+      const poll = () => (opts() ? resolve() : Date.now() - t0 > 4000 ? reject(new Error("relay never opened")) : setTimeout(poll, 10));
+      poll();
+    });
     refuse.on = true;
     expect(session.answer("op", { kind: "tool-result", ok: true, content: "x", tools: [LATE] })).toBe(false);
     expect(opts().allowTool("late")).toBe(false); // the shim never received them
@@ -338,6 +345,7 @@ describe("claude adapter: relay wiring (stubbed socket)", () => {
     expect(session.answer("op", { kind: "tool-result", ok: true, content: "x", tools: [LATE] })).toBe(true);
     expect(opts().allowTool("late")).toBe(true);
     await session.close();
+    await turn.catch(() => undefined);
   });
 
   it("answer() before any relay exists, and a non-result answer, are refused", async () => {
