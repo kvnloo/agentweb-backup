@@ -1,4 +1,6 @@
-## ENG-2720: enrichment cost booking, search fee, admission estimate and customer-safe quotes (2026-11-03, PR #3867)
+## ENG-2720: enrichment cost booking, search fee, admission estimate and customer-safe quotes (2026-11-03)
+
+Shipped in PR #3867.
 
 **Apollo (owner decision, Argusoft <> AgentWeb sync 2026-11-02): the email waterfall stays booked at 9 credits ($0.445).** `full_enrichment` became `waterfall_email` (same amount) plus an unused `waterfall_phone` (8 credits) so phone numbers can slot in later; when a call starts requesting a phone, set `waterfall_email` to 1 credit and book `waterfall_phone` or the phone credits are counted twice. Known and accepted: the 9-credit line is ~10-40x Apollo's real cost (observed 1-2 credits per contact, no phone is requested anywhere), wallets are ~40% of price (Starter $80 of $199, Pro $200 of $499), and on accounts with pay-as-you-go overage on (Opiner, 2026-10) the overage is billed from booked cost at the tier markup.
 

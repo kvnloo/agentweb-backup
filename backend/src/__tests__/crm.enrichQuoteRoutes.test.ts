@@ -224,6 +224,18 @@ describe('input handling', () => {
     expect(a.body.leadCount).toBe(2);
     expect(a.body.confirmationToken).toBe(b.body.confirmationToken);
   });
+  it('quotes the reference config when none is saved (isDefault) or the config read fails, not the default config it was handed', async () => {
+    const wide = Array.from({ length: 40 }, (_, i) => ({ name: `w${i}`, type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' }));
+    const pct = async () => (await request(app).post('/api/crm/lists/victim-list/leads/enrich-v3/estimate').send({})).body.estimatedPercentOfAllowance;
+    mockGetCfg.mockResolvedValue({ isDefault: false, config: { fields: wide, globalOverwriteDefault: 'fill_if_empty', schemaVersion: 1 } });
+    const saved40 = await pct();
+    mockGetCfg.mockResolvedValue({ isDefault: true, config: { fields: wide, globalOverwriteDefault: 'fill_if_empty', schemaVersion: 1 } });
+    const defaultConfig = await pct();
+    mockGetCfg.mockRejectedValue(new Error('dynamo down'));
+    const unreadable = await pct();
+    expect(defaultConfig).toBeLessThan(saved40); // the unsaved default's 40 fields are ignored
+    expect(unreadable).toBe(defaultConfig); // and an unreadable config falls back to the same reference quote
+  });
   it('leadIds that is not an array = whole list', async () => {
     const r = await request(app).post('/api/crm/lists/victim-list/leads/enrich-v3/estimate').send({ leadIds: 'x' });
     expect(r.body.leadCount).toBe(2);
