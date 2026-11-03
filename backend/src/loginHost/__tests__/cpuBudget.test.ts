@@ -435,7 +435,7 @@ describe("honest image-heavy turns (REAL clock, real JSON.parse + normalize)", (
     expect(six.errors).toEqual([]);
   });
 
-  it("MUTATION TARGET: an honest 15 MB line, twice back to back (30 MiB), is not killed by the 500 ms burst", async () => {
+  it("MUTATION TARGET: an honest 15 MB line, twice back to back (30 MiB), is not killed by the 1000 ms burst", async () => {
     const two = await echoes([{ mb: 15, gapMs: 0 }, { mb: 15, gapMs: 0 }]);
     console.log("RESULT cpu echo 2x15MB", JSON.stringify(two));
     expect(two.errors).toEqual([]);
