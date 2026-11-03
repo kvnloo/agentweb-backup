@@ -2111,7 +2111,7 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
         try {
           const owner: any = await userDb.getUserById(ownerUserId);
           ownerEmail = owner?.email;
-          if (owner) ownerIsAdmin = owner.isAdmin === true;
+          if (typeof owner?.isAdmin === 'boolean') ownerIsAdmin = owner.isAdmin; // legacy records without isAdmin stay unknown → full classification
         } catch { /* owner unknown → full classification; resolver restricts to verified admins */ }
       };
       for (const sessionId of sessionIds) {

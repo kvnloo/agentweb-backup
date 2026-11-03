@@ -6869,7 +6869,7 @@ export async function runScheduledChat(
     const preflightRecipients: string[] = Array.isArray(schedule.emailNotifications)
       ? schedule.emailNotifications.filter(Boolean)
       : [];
-    if (preflightRecipients.length > 0 && scheduleLikelySensitive(schedule, { ownerIsAdmin: scheduleOwner ? (scheduleOwner as any).isAdmin === true : undefined })) {
+    if (preflightRecipients.length > 0 && scheduleLikelySensitive(schedule, { ownerIsAdmin: typeof (scheduleOwner as any)?.isAdmin === 'boolean' ? (scheduleOwner as any).isAdmin : undefined })) {
       const authz = await resolveAuthorizedReportRecipients({
         recipients: preflightRecipients,
         ownerEmail: (scheduleOwner as any)?.email,
@@ -8411,7 +8411,7 @@ export async function runScheduledChat(
       await recordReportDeliveryState(
         schedule.scheduleId,
         { runId: finalResult.runId, state: 'generated' },
-        { lastKnownSensitive: reportContainsCrossAccountData(actualFunctionCalls, { ownerIsAdmin: scheduleOwner ? (scheduleOwner as any).isAdmin === true : undefined }) },
+        { lastKnownSensitive: reportContainsCrossAccountData(actualFunctionCalls, { ownerIsAdmin: typeof (scheduleOwner as any)?.isAdmin === 'boolean' ? (scheduleOwner as any).isAdmin : undefined }) },
       );
     }
 
