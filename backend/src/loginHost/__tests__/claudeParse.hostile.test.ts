@@ -80,6 +80,9 @@ describe("approxSize counts the REAL payload of every event type", () => {
     // ordinary events are not inflated: a small tool input stays small
     expect(approxSize({ type: "tool-use", operationId: "o", name: "n", input: { q: "x", opts: { a: 1 } } })).toBeLessThan(1000);
   });
+  it("MUTATION TARGET: every other event type counts its containers too (an alarm event is two objects: at least 128 + 2 x the 128-byte node cost)", () => {
+    expect(approxSize({ type: "alarm", hazard: { kind: "other", detail: "d" } })).toBeGreaterThanOrEqual(128 + 2 * 128);
+  });
   it("text is its length", () => {
     expect(approxSize({ type: "text", delta: "abc" })).toBe(67);
   });
