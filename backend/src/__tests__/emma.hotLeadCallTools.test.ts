@@ -2,6 +2,7 @@ type Tool = { name: string; definition: { description: string; inputSchema: { pr
 const handlers = new Map<string, Tool>();
 jest.mock('../emma/registry', () => ({ emmaToolRegistry: { register: (tool: Tool) => handlers.set(tool.name, tool) } }));
 jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn() }, orgDb: { getOrgById: jest.fn(), updateOrg: jest.fn() } }));
+jest.mock('../services/chatbotService', () => ({ chatbotDb: { getChatSession: jest.fn(), claimMetaWriteManifestDigest: jest.fn() } }));
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { orgDb, userDb } from '../services/db';
@@ -146,9 +147,10 @@ describe('update_hot_lead_call_settings', () => {
     expect(await update({ enabled: false })).toMatchObject({ enabled: false });
   });
 
-  it('enables for an entitled org with a verified phone and a number', async () => {
+  it('does not enable for an entitled org with a verified phone and a number without an attended chat to approve it', async () => {
     cfg().enabled = false;
-    expect(await update({ enabled: true })).toMatchObject({ enabled: true });
+    await expect(update({ enabled: true })).rejects.toThrow('attended chat session');
+    expect(orgDb.updateOrg).not.toHaveBeenCalled();
   });
 
   it.each(['+15555550100 x12', '(415) 555-0100 ext. 5', '+14155550100;ext=7'])('rejects a phone with an extension instead of dropping it: %s', async memberPhone => {

@@ -612,6 +612,7 @@ import {
   META_WEBSITE_OPTIMIZATION_GOALS
 } from '../utils/metaConstants';
 import { resolveOptimisationEvent, pixelReceivedEvent } from './metaOptimisationCoverage';
+import { approvalCardIdentity } from './voice/hotLeadCallApprovalGate';
 
 
 /**
@@ -14581,8 +14582,16 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
    *  same-iteration halts" behavior the write-deck builder already has. */
   private buildQuestionApprovalDeckFromHalts(questionHalts: any[]): PendingApprovalDeck | null {
     const questions: QuestionDeckQuestionInput[] = [];
+    // The model can repeat a hot lead call approval in one reply, and each call mints its own card; one is enough.
+    const seenCards = new Set<string>();
     for (const r of questionHalts) {
-      if (Array.isArray(r.questionDeckPayload)) questions.push(...r.questionDeckPayload);
+      if (!Array.isArray(r.questionDeckPayload)) continue;
+      for (const q of r.questionDeckPayload) {
+        const identity = approvalCardIdentity(q.kind);
+        if (identity !== null && seenCards.has(identity)) continue;
+        if (identity !== null) seenCards.add(identity);
+        questions.push(q);
+      }
     }
     if (questions.length === 0) return null;
     try {
