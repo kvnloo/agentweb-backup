@@ -469,6 +469,17 @@ export async function generateBookContent(
           error: 'Chapter not found in this section'
         };
       }
+    } else if (section.chapters && section.chapters.length > 0) {
+      // ENG-2790 (Opslane P1): a chapter_id-less call on a section that has chapters
+      // is almost always a chapter request with the id dropped. Writing section
+      // content and reporting success misleads the user, so refuse and list the
+      // chapter ids for the model to retry with. Chapterless sections still work.
+      const candidates = section.chapters.map((c) => `${c.chapterId} ("${c.title}")`).join(', ');
+      return {
+        success: false,
+        message: `chapter_id is required: section "${section.title}" has ${section.chapters.length} chapter(s). Call generate_book_content again with one of these chapter_ids: ${candidates}`,
+        error: 'chapter_id required for a section with chapters'
+      };
     }
 
     // Get existing content if it exists
@@ -663,12 +674,6 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     let message = `${chapterId ? 'Chapter' : 'Section'} content generated successfully`;
     if (imagineOverridden) {
       message += ` (imagine setting from ${chapterId ? 'chapter' : 'section'} record: ${finalImagine ? 'enabled' : 'disabled'})`;
-    }
-    // ENG-2790: a chapter_id-less call is a section request. When the section has
-    // chapters, say so explicitly so the agent never reports section content as a
-    // chapter's content.
-    if (!chapterId && section.chapters && section.chapters.length > 0) {
-      message += `. Note: this wrote SECTION-level content, not any chapter. This section has ${section.chapters.length} chapter(s); to write a chapter, call again with its chapter_id.`;
     }
 
     return {
