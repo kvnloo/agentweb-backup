@@ -1738,6 +1738,7 @@ export class AgentModeService {
     console.log(`AgentMode: Refreshed ${mcpTools.length} MCP tools`);
   }
 
+  // Every tool registered here also reaches the Claude plan route and must fit its limits: docs/plan-route-tool-limits.md
   private async registerTools() {
     // 1. Ensure Emma's tools are loaded into the emmaToolRegistry (only needs to happen once)
     if (!AgentModeService.toolsRegistered) {
@@ -7753,6 +7754,34 @@ export class AgentModeService {
     };
   }
 
+  /** The one line the "Installed Skills:" block carries per skill: id, name, description and the skill's own instructions. */
+  public static formatInstalledSkillLine(s: { skillId: string; name: string; description?: string; systemPrompt?: string }): string {
+    return `${s.skillId}- ${s.name}: ${s.description} ${s.systemPrompt || ''}`;
+  }
+
+  /**
+   * ENG-2113 (tool relay): in-process Emma rebuilds the "Installed Skills:" block after install_skills so the NEXT model call of the same turn sees the new
+   * skills' instructions. A relayed turn has no such block to rebuild, so the same lines (formatInstalledSkillLine) are returned here to travel with the install_skills
+   * answer. Only the skills this call installed (by name, as the result lists them) and that are now on the session. '' when there are none. Never throws.
+   */
+  public async buildInstalledSkillsNote(sessionId: string, requestedSkillIds: unknown, installedNames: unknown): Promise<string> {
+    try {
+      if (!Array.isArray(requestedSkillIds) || !Array.isArray(installedNames)) return '';
+      const names = new Set(installedNames.filter((n): n is string => typeof n === 'string'));
+      const ids = [...new Set(requestedSkillIds.filter((i): i is string => typeof i === 'string').map(normalizeSkillIdArg))];
+      if (!ids.length || !names.size) return '';
+      const session = await chatbotDb.getChatSession(sessionId);
+      const associated = new Set<string>(session?.associatedSkills ?? []);
+      const present = ids.filter((id) => associated.has(id));
+      if (!present.length) return '';
+      const skills = (await skillService.getSkillsByIds(present)).filter((sk: any) => names.has(sk.name));
+      if (!skills.length) return '';
+      return `Installed Skills (now active in this conversation):\n${skills.map((sk: any) => AgentModeService.formatInstalledSkillLine(sk)).join('\n')}`;
+    } catch {
+      return '';
+    }
+  }
+
   /**
    * ENG-1222: the single source of truth for "which tools + skill-context text
    * does a session with these installed skills get". Was private to Agent Mode
@@ -7805,7 +7834,7 @@ export class AgentModeService {
     let installedSkillContextMsg = '';
     const skillLines: string[] = [];
     if (associatedSkills.length) {
-      associatedSkills.forEach(s => skillLines.push(`${s.skillId}- ${s.name}: ${s.description} ${s.systemPrompt || ''}`));
+      associatedSkills.forEach(s => skillLines.push(AgentModeService.formatInstalledSkillLine(s)));
     }
     if (hasAdminAccess) {
       skillLines.push(`${ADMIN_SKILL_VIRTUAL_ID}- Admin Tools (always active for admins): Use manage_user_notes to read/add/delete time-stamped notes on any user — lookup by email OR userId. Use list_all_clients, assess_client_health, freeze_user_account, manage_scoring_judges, and other admin tools for platform management. Tools: ${ADMIN_SKILL_TOOL_NAMES.join(', ')}`);

@@ -1,3 +1,4 @@
+// Adding or changing a tool? It also has to fit the Claude plan route's limits (name length, description and schema size, input size): docs/plan-route-tool-limits.md
 import { randomUUID } from 'crypto';
 import { MODIFY_WORK_PLAN_INPUT_SCHEMA, validateModifyWorkPlanArgs } from './impl/modifyWorkPlanArgs';
 import { agentModeService } from '../services/agentModeService';
