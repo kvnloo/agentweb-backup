@@ -1,4 +1,4 @@
-## ENG-2271: Inbound callbacks for the hot lead number (PR #3874, 2026-11-04)
+## ENG-2271: Inbound callbacks for the hot lead number (2026-11-04)
 
 A lead who calls the org's hot-lead number back now rings the team: Twilio posts to `/api/webhooks/twilio-voice/inbound`, the verified members available right now are tried in priority order (at most `maxAttemptsPerLead`), each hears "a lead is calling back, press 1", and the first 1 is bridged. Stateless: no call record and no timeline event; nobody is recorded or sent to voicemail. Steps are `/inbound`, `/inbound-screen`, `/inbound-screen-result`, `/inbound-dial` and `/inbound-status`, all behind the same signature check as the outbound endpoints (`routes/twilioVoiceWebhook.ts`, `services/voice/inboundCallback.ts`).
 
