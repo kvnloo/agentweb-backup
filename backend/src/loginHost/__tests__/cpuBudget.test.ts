@@ -5,7 +5,7 @@
  *
  * Every RESULT line prints the measured numbers (kill time, loop active ms, utilisation over the whole observation window and over the unit's lifetime).
  */
-import { spawn } from "child_process";
+import { spawn, type ChildProcess } from "child_process";
 import { createInterface } from "readline";
 import { PassThrough } from "stream";
 import { performance } from "perf_hooks";
@@ -93,8 +93,27 @@ describe("CpuMeter", () => {
   });
 });
 
+// Every process this file spawns is SIGKILLed when the file ends, whatever the tests did: a failed assertion, or a worker that ends before a delayed kill lands, used to
+// leave a SIGTERM-ignoring writer spinning at 95% of a core for hours (found on the test machine), which loads every later run.
+const spawned: ChildProcess[] = [];
+afterAll(() => {
+  for (const p of spawned) {
+    try {
+      p.kill("SIGKILL");
+    } catch {
+      /* already gone */
+    }
+  }
+});
+/** CPU time (ms, user + system, all threads) the test process used since `since`. Unlike event-loop utilisation (wall time spent outside the idle poll) it is NOT inflated when a busy machine takes the CPU away from the process mid-section. */
+const cpuMsSince = (since: NodeJS.CpuUsage): number => {
+  const u = process.cpuUsage(since);
+  return (u.user + u.system) / 1000;
+};
+
 function realChild(script: string): { child: ChildLike; pid: () => number | undefined } {
   const proc = spawn(process.execPath, ["-e", script], { stdio: ["pipe", "pipe", "pipe"] });
+  spawned.push(proc);
   proc.stdin.on("error", () => undefined);
   return {
     child: { stdin: proc.stdin, stdout: proc.stdout, stderr: proc.stderr, kill: () => void proc.kill("SIGKILL"), onExit: (cb) => void proc.on("exit", cb), onError: (cb) => void proc.on("error", cb) },
@@ -105,9 +124,14 @@ function realChild(script: string): { child: ChildLike; pid: () => number | unde
 interface Vector {
   killedMs: number | undefined;
   error: string | undefined;
+  /** The host process's CPU time (user + system) over the window, in ms: what the unit cost the host. NOT event-loop wall time: a busy runner inflates that. */
   activeMs: number;
+  /** CPU share of the process from the start to the moment the kill was seen (or the window's end). */
   lifetimeUtil: number;
+  /** CPU share of the process over the whole window. */
   windowUtil: number;
+  /** Event-loop utilisation over the window (wall based, for the log only: it is not asserted). */
+  eluWindow: number;
   lines: number;
 }
 const WINDOW_MS = 10_000;
@@ -135,16 +159,19 @@ async function drive(script: string, opts: { windowMs?: number } = {}): Promise<
   });
   adapter.stderr.on("data", () => undefined);
   const elu0 = performance.eventLoopUtilization();
+  const cpu0 = process.cpuUsage();
   const t0 = performance.now();
-  let eluAtKill: ReturnType<typeof performance.eventLoopUtilization> | undefined;
+  let lifeAt: { cpuMs: number; ms: number } | undefined;
   while (performance.now() - t0 < windowMs) {
     await new Promise((r) => setTimeout(r, 25));
-    if (killedAt !== undefined && !eluAtKill) eluAtKill = performance.eventLoopUtilization(elu0);
+    if (killedAt !== undefined && !lifeAt) lifeAt = { cpuMs: cpuMsSince(cpu0), ms: performance.now() - t0 };
   }
   const whole = performance.eventLoopUtilization(elu0);
+  const wholeCpuMs = cpuMsSince(cpu0);
+  const wholeMs = performance.now() - t0;
   adapter.kill();
-  const life = eluAtKill ?? whole;
-  return { killedMs: killedAt === undefined ? undefined : Math.round(killedAt - t0), error, activeMs: Math.round(whole.active), lifetimeUtil: Math.round(life.utilization * 100) / 100, windowUtil: Math.round(whole.utilization * 100) / 100, lines };
+  const life = lifeAt ?? { cpuMs: wholeCpuMs, ms: wholeMs };
+  return { killedMs: killedAt === undefined ? undefined : Math.round(killedAt - t0), error, activeMs: Math.round(wholeCpuMs), lifetimeUtil: Math.round((life.cpuMs / life.ms) * 100) / 100, windowUtil: Math.round((wholeCpuMs / wholeMs) * 100) / 100, eluWindow: Math.round(whole.utilization * 100) / 100, lines };
 }
 const report = (name: string, v: Vector) => console.log("RESULT cpu", name, JSON.stringify(v));
 
@@ -219,9 +246,10 @@ describe("hostile child processes are killed within a bounded time and a bounded
 // A writer that SURVIVES the kill (production: `systemctl stop` = SIGTERM, up to 10 s of grace, then SIGKILL): here the "kill" lands 4 s after the trip.
 function stubbornChild(script: string, killAfterMs = 4000): { child: ChildLike; alive: () => boolean } {
   const proc = spawn(process.execPath, ["-e", script], { stdio: ["pipe", "pipe", "pipe"] });
+  spawned.push(proc);
   proc.stdin.on("error", () => undefined);
   return {
-    child: { stdin: proc.stdin, stdout: proc.stdout, stderr: proc.stderr, kill: () => void setTimeout(() => proc.kill("SIGKILL"), killAfterMs), onExit: (cb) => void proc.on("exit", cb), onError: (cb) => void proc.on("error", cb) },
+    child: { stdin: proc.stdin, stdout: proc.stdout, stderr: proc.stderr, kill: () => void setTimeout(() => proc.kill("SIGKILL"), killAfterMs).unref(), onExit: (cb) => void proc.on("exit", cb), onError: (cb) => void proc.on("error", cb) },
     alive: () => proc.exitCode === null && proc.signalCode === null,
   };
 }
@@ -261,7 +289,7 @@ describe("a PLAIN kill (normal close) leaves the pipes open for a CLI that is wi
 
 describe("a writer that survives the kill stops costing the host once a guard trips (the pipes are closed BEFORE the kill)", () => {
   it.each(STUBBORN)("MUTATION TARGET: %s -> %s", async (_name, code, script, mkMeter) => {
-    const { child, alive } = stubbornChild(script);
+    const { child, alive } = stubbornChild(script, 12_000); // (the delayed SIGKILL lands long after the 2.8 s measurement, however starved the runner is; the afterAll kills it anyway)
     const adapter = new RunnerChildAdapter(child, 16 * 1024 * 1024, undefined, mkMeter());
     let error: string | undefined;
     adapter.on("error", (e: Error) => (error ??= e.message));
@@ -278,12 +306,15 @@ describe("a writer that survives the kill stops costing the host once a guard tr
     expect(error).toBe(code);
     await new Promise((r) => setTimeout(r, 300)); // let the trip settle
     const elu0 = performance.eventLoopUtilization();
+    const cpu0 = process.cpuUsage();
+    const m0 = performance.now();
     await new Promise((r) => setTimeout(r, 2500));
     const after = performance.eventLoopUtilization(elu0);
+    const cpuShare = cpuMsSince(cpu0) / (performance.now() - m0); // CPU time, not loop wall time: a busy runner takes the CPU away from the process mid-section and inflates the latter
     const stillWriting = alive();
-    console.log("RESULT cpu after-trip", _name, JSON.stringify({ trippedAtMs: Math.round(performance.now() - t0), error, utilAfterTrip: Math.round(after.utilization * 1000) / 1000, writerStillAlive: stillWriting }));
+    console.log("RESULT cpu after-trip", _name, JSON.stringify({ trippedAtMs: Math.round(performance.now() - t0), error, cpuShareAfterTrip: Math.round(cpuShare * 1000) / 1000, eluAfterTrip: Math.round(after.utilization * 1000) / 1000, writerStillAlive: stillWriting }));
     expect(stillWriting).toBe(true); // the SIGTERM-ignoring writer really is still running while we measure
-    expect(after.utilization).toBeLessThan(0.1);
+    expect(cpuShare).toBeLessThan(0.1);
     adapter.kill();
   });
 });
@@ -336,6 +367,7 @@ describe("a slow trickle is paid for and killed", () => {
     const killedAt: Array<number | undefined> = [];
     const t0 = performance.now();
     const elu0 = performance.eventLoopUtilization();
+    const cpu0 = process.cpuUsage();
     for (let i = 0; i < N; i++) {
       const { child } = realChild(TRICKLE_OUT);
       const a = new RunnerChildAdapter(child, 16 * 1024 * 1024, undefined, new CpuMeter());
@@ -347,10 +379,15 @@ describe("a slow trickle is paid for and killed", () => {
     while (performance.now() - t0 < 12_000 && killedAt.filter((x) => x !== undefined).length < N) await new Promise((r) => setTimeout(r, 25));
     const allKilledMs = Math.round(performance.now() - t0);
     const whole = performance.eventLoopUtilization(elu0);
-    console.log("RESULT cpu ten trickles", JSON.stringify({ killed: killedAt.filter((x) => x !== undefined).length, allKilledMs, utilWhileAlive: Math.round(whole.utilization * 100) / 100, activeMs: Math.round(whole.active) }));
+    const cpuMs = cpuMsSince(cpu0);
+    const cpuShare = cpuMs / allKilledMs;
+    console.log("RESULT cpu ten trickles", JSON.stringify({ killed: killedAt.filter((x) => x !== undefined).length, allKilledMs, cpuShare: Math.round(cpuShare * 100) / 100, eluWhileAlive: Math.round(whole.utilization * 100) / 100, cpuMs: Math.round(cpuMs) }));
     for (const a of adapters) a.kill();
     expect(killedAt.filter((x) => x !== undefined)).toHaveLength(N);
-    expect(whole.utilization).toBeLessThan(0.75); // 0.41 measured on an idle machine, 0.5-0.65 with other jobs running (they slow the loop, so each read costs more): the review asked for under 50%, this is that plus load noise
+    // CPU share of the host process over the window (the review asked for under 50%). Event-loop utilisation was asserted here before (0.41 idle, 0.59-0.63 with 16 busy loops, 0.774
+    // once on a loaded CI box): it is wall time outside the idle poll, which a busy machine inflates because descheduling counts as busy. CPU time is not, and 0.75 stays as the
+    // bound (the CPU share is measured at 0.3-0.5, so the margin for per-read cost inflation by cache and hyperthread sharing is still wide).
+    expect(cpuShare).toBeLessThan(0.75);
   });
 
   it("MUTATION TARGET: the fixed per-read cost is charged to the meter even when the section itself is instant (a mocked clock that never moves)", async () => {

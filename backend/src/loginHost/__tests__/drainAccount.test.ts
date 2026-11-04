@@ -3,7 +3,7 @@
  * EPIPE, but the accounting stays on: a writer that ignores SIGTERM for the whole grace period (up to 10 s) must not be free. Real child processes; the plain kill
  * sends SIGTERM and the forced SIGKILL lands 4 s later, as systemd does. Utilisation is measured from the kill itself (the accounting's burst is inside the window).
  */
-import { spawn } from "child_process";
+import { spawn, type ChildProcess } from "child_process";
 import { PassThrough } from "stream";
 import { createInterface } from "readline";
 import { performance } from "perf_hooks";
@@ -13,10 +13,23 @@ import { CpuMeter } from "../relay/cpuMeter";
 
 jest.setTimeout(60_000);
 
+// Every process this file spawns is SIGKILLed when the file ends, whatever the tests did (a failed assertion used to leave a SIGTERM-ignoring writer spinning for hours).
+const spawned: ChildProcess[] = [];
+afterAll(() => {
+  for (const p of spawned) {
+    try {
+      p.kill("SIGKILL");
+    } catch {
+      /* already gone */
+    }
+  }
+});
+
 // A SIGTERM-ignoring writer that starts flooding only once it is signalled (the plain kill sends SIGTERM here; SIGKILL lands 4 s later, as systemd does after its grace).
 function drainChild(flood: string): { child: ChildLike; alive: () => boolean } {
   const script = 'const fs=require("fs");const w=(fd,b)=>{try{fs.writeSync(fd,b)}catch(e){}};process.on("SIGTERM",()=>{' + flood + '});setInterval(()=>{},1000);';
   const proc = spawn(process.execPath, ["-e", script], { stdio: ["pipe", "pipe", "pipe"] });
+  spawned.push(proc);
   proc.stdin.on("error", () => undefined);
   return {
     child: {
