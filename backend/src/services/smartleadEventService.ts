@@ -1,6 +1,7 @@
 import { isDoNotContact } from "../utils/leadContactStatus";
 import { getSmartleadMarker } from "./smartleadMarkers";
 import type { SmartleadEvent } from "./smartleadEvents";
+import type { ContactEventKind } from "./smartleadPushRunDb";
 
 /**
  * Applies a Smartlead event (a reply, a bounce, an unsubscribe) to the CRM contact it is about (ENG-673, slice 3). All outside access is injected.
@@ -28,6 +29,11 @@ export interface EventDeps {
   setContactStatus(listId: string, leadId: string, fields: Record<string, unknown>): Promise<void>;
   /** The list owner's alert; best effort. */
   notify(list: Lead, lead: Lead, eventType: string, eventData: any, createdAt: string): Promise<void>;
+  /**
+   * Counts one contact of a push run as replied, bounced or unsubscribed, for the run view. Display only: a failure here is logged and never
+   * changes what happens to the contact. Optional so the handler works without a run store.
+   */
+  countContactEvent?(runId: string, kind: ContactEventKind): Promise<void>;
   now(): Date;
   log(line: string): void;
 }
@@ -41,6 +47,10 @@ export interface EventOutcome {
   duplicates: number;
 }
 
+interface PendingCount { runId: string; kind: ContactEventKind }
+/** The most a response waits for the run counters (see flushCounts). */
+const COUNT_WAIT_MS = 2000;
+
 const has = (lead: Lead, key: string): boolean =>
   Array.isArray(lead.engagements) && lead.engagements.some((e: any) => e?.eventData?.smartleadEventKey === key);
 
@@ -53,6 +63,7 @@ export class SmartleadEventService {
     const out: EventOutcome = { matched: 0, changed: 0, duplicates: 0 };
     if (event.campaignId !== ctx.campaignId) return out; // the body names another campaign than the URL: not ours to act on
 
+    const pending: PendingCount[] = [];
     const runOk = new Map<string, Promise<{ ok: boolean; name?: string }>>();
     const proven = (runId: string) => {
       let p = runOk.get(runId);
@@ -64,57 +75,63 @@ export class SmartleadEventService {
     };
 
     // One event is about one contact: the first candidate address that matches wins, the rest are not tried.
-    for (const address of event.candidateEmails) {
-      const seen = new Set<string>();
-      const matches: Array<{ lead: Lead; campaignName?: string }> = [];
-      const found = await this.deps.findLeadsByEmail(address);
-      // The Smartlead lead behind a contact is ONE lead across all of the account's campaigns, and our withdrawal unsubscribes it account-wide
-      // (verified on a real account, 2026-10-30: unsubscribing it in one campaign shows it unsubscribed and blocked in the others too). So once
-      // ANY marker of ANY of these leads is withdrawn, the poll must not read that opt-out back as news in another campaign or list either.
-      // The index spans every customer, so a withdrawn marker counts only when its own run belongs to THIS Smartlead account: another customer's marker
-      // that happens to carry the same id text must never suppress ours.
-      const withdrawnSmartleadIds = new Set<string>();
-      if (event.polled && event.kind !== "reply") {
-        const runAccount = new Map<string, Promise<string | undefined>>();
-        const accountOf = (runId: string) => {
-          let p = runAccount.get(runId);
-          if (!p) { p = this.deps.getRun(runId).then(r => r?.smartleadAccountId); runAccount.set(runId, p); }
-          return p;
-        };
-        for (const l of found) {
-          for (const [key, value] of Object.entries((l?.system ?? {}) as Record<string, any>)) {
-            if (!key.startsWith("smartlead_") || !value || typeof value.smartleadLeadId !== "string" || typeof value.runId !== "string") continue;
-            if (!(value.state === "withdrawn" || !!value.withdrawnAt)) continue;
-            if ((await accountOf(value.runId)) === ctx.accountId) withdrawnSmartleadIds.add(value.smartleadLeadId);
+    try {
+      for (const address of event.candidateEmails) {
+        const seen = new Set<string>();
+        const matches: Array<{ lead: Lead; campaignName?: string; runId: string }> = [];
+        const found = await this.deps.findLeadsByEmail(address);
+        // The Smartlead lead behind a contact is ONE lead across all of the account's campaigns, and our withdrawal unsubscribes it account-wide
+        // (verified on a real account, 2026-10-30: unsubscribing it in one campaign shows it unsubscribed and blocked in the others too). So once
+        // ANY marker of ANY of these leads is withdrawn, the poll must not read that opt-out back as news in another campaign or list either.
+        // The index spans every customer, so a withdrawn marker counts only when its own run belongs to THIS Smartlead account: another customer's marker
+        // that happens to carry the same id text must never suppress ours.
+        const withdrawnSmartleadIds = new Set<string>();
+        if (event.polled && event.kind !== "reply") {
+          const runAccount = new Map<string, Promise<string | undefined>>();
+          const accountOf = (runId: string) => {
+            let p = runAccount.get(runId);
+            if (!p) { p = this.deps.getRun(runId).then(r => r?.smartleadAccountId); runAccount.set(runId, p); }
+            return p;
+          };
+          for (const l of found) {
+            for (const [key, value] of Object.entries((l?.system ?? {}) as Record<string, any>)) {
+              if (!key.startsWith("smartlead_") || !value || typeof value.smartleadLeadId !== "string" || typeof value.runId !== "string") continue;
+              if (!(value.state === "withdrawn" || !!value.withdrawnAt)) continue;
+              if ((await accountOf(value.runId)) === ctx.accountId) withdrawnSmartleadIds.add(value.smartleadLeadId);
+            }
           }
         }
+        for (const lead of found) {
+          const id = `${lead?.listId}/${lead?.leadId}`;
+          if (!lead?.listId || !lead?.leadId || seen.has(id)) continue;
+          seen.add(id);
+          const marker = getSmartleadMarker(lead, ctx.campaignId);
+          if (!marker || typeof marker.runId !== "string" || !marker.runId) continue;
+          // Once our own withdrawal has unsubscribed a blocked contact in Smartlead (`withdrawn`, or `released` afterwards, which keeps `withdrawnAt`),
+          // Smartlead lists that contact as unsubscribed for good: reading it back would re-block a contact a user has since resubscribed in the CRM.
+          // A reply has no such risk, and a contact released without a withdrawal is still live in Smartlead, so both are still read.
+          if (event.polled && event.kind !== "reply" && (marker.state === "withdrawn" || !!marker.withdrawnAt || (!!marker.smartleadLeadId && withdrawnSmartleadIds.has(marker.smartleadLeadId)))) continue;
+          const r = await proven(marker.runId);
+          if (r.ok) matches.push({ lead, campaignName: r.name, runId: marker.runId });
+        }
+        if (matches.length === 0) continue;
+        for (const m of matches) {
+          out.matched++;
+          const r = await this.apply(event, m.lead, m.campaignName, m.runId, pending);
+          out.changed += r.changed;
+          out.duplicates += r.duplicate;
+        }
+        break;
       }
-      for (const lead of found) {
-        const id = `${lead?.listId}/${lead?.leadId}`;
-        if (!lead?.listId || !lead?.leadId || seen.has(id)) continue;
-        seen.add(id);
-        const marker = getSmartleadMarker(lead, ctx.campaignId);
-        if (!marker || typeof marker.runId !== "string" || !marker.runId) continue;
-        // Once our own withdrawal has unsubscribed a blocked contact in Smartlead (`withdrawn`, or `released` afterwards, which keeps `withdrawnAt`),
-        // Smartlead lists that contact as unsubscribed for good: reading it back would re-block a contact a user has since resubscribed in the CRM.
-        // A reply has no such risk, and a contact released without a withdrawal is still live in Smartlead, so both are still read.
-        if (event.polled && event.kind !== "reply" && (marker.state === "withdrawn" || !!marker.withdrawnAt || (!!marker.smartleadLeadId && withdrawnSmartleadIds.has(marker.smartleadLeadId)))) continue;
-        const r = await proven(marker.runId);
-        if (r.ok) matches.push({ lead, campaignName: r.name });
-      }
-      if (matches.length === 0) continue;
-      for (const m of matches) {
-        out.matched++;
-        const r = await this.apply(event, m.lead, m.campaignName);
-        out.changed += r.changed;
-        out.duplicates += r.duplicate;
-      }
-      break;
+    } finally {
+      // The run counters are for display and are written only now: after every contact's reply, alert and block is done, so no counter can
+      // come before or hold up another contact's opt-out (a contact in two lists is two blocks), and the wait itself is capped.
+      await this.flushCounts(pending);
     }
     return out;
   }
 
-  private async apply(event: SmartleadEvent, lead: Lead, campaignName?: string): Promise<{ changed: number; duplicate: number }> {
+  private async apply(event: SmartleadEvent, lead: Lead, campaignName: string | undefined, runId: string, pending: PendingCount[]): Promise<{ changed: number; duplicate: number }> {
     const now = this.deps.now().toISOString();
     // Never later than our own clock: this time is compared with the stamp of a status change made here (a user's Resubscribe), and Smartlead's
     // clock running ahead would otherwise make an old opt-out look newer than the Resubscribe that followed it.
@@ -159,10 +176,12 @@ export class SmartleadEventService {
       try {
         const list = await this.deps.getList(lead.listId);
         // The alert goes out only for a reply that was newly recorded, through the list's own alert setting (email.received is its default event).
-        if (list) await this.deps.notify(list, added.lead, "email.received", data, at);
+        // The reply's own words go to the owner's alert only: `data` above is what is stored on the contact, and the full reply stays in Smartlead.
+        if (list) await this.deps.notify(list, added.lead, "email.received", event.replyText ? { ...data, replyText: event.replyText } : data, at);
       } catch (e) {
         this.deps.log(`[SmartleadEvents] reply alert failed for list ${lead.listId}: ${e instanceof Error ? e.message : String(e)}`);
       }
+      this.wantCount(pending, runId, "replied", event, added.lead, "email.received");
       return { changed, duplicate };
     }
 
@@ -175,6 +194,8 @@ export class SmartleadEventService {
 
     // Re-read before writing the status: an admin may have blocked this contact with their own reason, and that must not be overwritten.
     const current = (await this.deps.readLeadConsistent(lead.listId, lead.leadId)) ?? added.lead;
+    // Already blocked (by an admin, an earlier bounce, or our own withdrawal that Smartlead reports back as an unsubscribe): nothing to write, and
+    // not a contact's own act, so it is not counted.
     if (isDoNotContact(current)) return { changed, duplicate };
     await this.deps.setContactStatus(lead.listId, lead.leadId, {
       contactStatus: bounced ? "do-not-contact" : "unsubscribed",
@@ -186,7 +207,54 @@ export class SmartleadEventService {
       unsubscribedFromGroupEmailAt: now,
     });
     changed++;
+    // Counted when THIS call wrote the block (so a retry after a failed write still counts, and an echo of our own withdrawal does not).
+    this.wantCount(pending, runId, bounced ? "bounced" : "unsubscribed", event, added.lead, bounced ? "email.bounced" : "email.unsubscribed");
     return { changed, duplicate };
+  }
+
+  /**
+   * Notes that this contact is to be counted once per kind for its run, unless `before` (the contact as it stood before this event was recorded)
+   * already showed an event of the same kind from this campaign: a second reply, or the poll finding what a webhook had delivered. This
+   * event's own engagement is ignored, so it does not matter whether the snapshot has been updated since. A hard bounce only: a temporary
+   * one is not a contact lost. Does no I/O.
+   */
+  private wantCount(pending: PendingCount[], runId: string, kind: ContactEventKind, event: SmartleadEvent, before: Lead, eventType: string): void {
+    if (!this.deps.countContactEvent) return;
+    const seen = (Array.isArray(before.engagements) ? before.engagements : []).some(
+      (e: any) => e?.eventData?.smartleadEventKey !== event.eventKey && e?.eventType === eventType && e?.eventData?.source === "smartlead" && Number(e?.eventData?.campaignId) === event.campaignId && !(kind === "bounced" && e?.eventData?.soft === true),
+    );
+    if (!seen) pending.push({ runId, kind });
+  }
+
+  /** A log line that can never throw: the counters must not be able to replace the error of the loop they follow. */
+  private safeLog(line: string): void {
+    try {
+      this.deps.log(line);
+    } catch {
+      // nothing left to do with a broken logger
+    }
+  }
+
+  /** Writes the counters noted by wantCount. Never throws, and gives up waiting after COUNT_WAIT_MS: a slow run table must not hold the response. */
+  private async flushCounts(pending: PendingCount[]): Promise<void> {
+    if (pending.length === 0 || !this.deps.countContactEvent) return;
+    const count = this.deps.countContactEvent.bind(this.deps);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const work = (async () => {
+      for (const p of pending) {
+        try {
+          await count(p.runId, p.kind);
+        } catch (e) {
+          this.safeLog(`[SmartleadEvents] run counter (${p.kind}) failed for run ${p.runId}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+    })();
+    const gaveUp = new Promise<void>(resolve => { timer = setTimeout(() => { this.safeLog(`[SmartleadEvents] run counters still pending after ${COUNT_WAIT_MS} ms, not waiting`); resolve(); }, COUNT_WAIT_MS); });
+    try {
+      await Promise.race([work, gaveUp]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   /** Appends the engagement unless this event is already on the contact; one re-read and retry when another write got in between. */

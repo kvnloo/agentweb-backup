@@ -602,6 +602,48 @@ describe('emailService.sendScheduledChatPausedForInputEmail (ENG-396)', () => {
     expect(recipients).toEqual(['a@example.com', 'b@example.com']);
     expect(userDb.getUserByEmail).not.toHaveBeenCalled();
   });
+
+  // ENG-2785: a customer (non-admin) owner's Meta Ads report only reads their own
+  // account, so it must reach their recipients instead of being withheld.
+  it('ENG-2785: delivers a non-admin owner Meta Ads report to configured recipients', async () => {
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+      sessionId: 'session-abc',
+      userId: 'owner-id',
+      calledFunctions: { list_meta_ads_campaigns: 1, get_meta_ads_metrics: 1, call_meta_ads_insights_api: 1 },
+    });
+    (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([
+      { role: 'tool', name: 'get_meta_ads_metrics', content: '...' },
+    ]);
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'owner-id', email: 'sary@customer.com', isAdmin: false });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValue({ isAdmin: false });
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+
+    await emailService.sendScheduledChatResultEmail(['sary@customer.com'], 'Social Monitor', GUARD_BASE_RESULT, 'schedule-123');
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    const [recipients, , textContent] = spy.mock.calls[0];
+    expect(recipients).toEqual(['sary@customer.com']);
+    expect(textContent).not.toContain('withheld');
+  });
+
+  it('ENG-2785 negative: an ADMIN owner Meta Ads report is still restricted to admins', async () => {
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+      sessionId: 'session-abc',
+      userId: 'owner-id',
+      calledFunctions: { get_meta_ads_metrics: 1 },
+    });
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'owner-id', email: 'owner@example.com', isAdmin: true });
+    (userDb.getUserByEmail as jest.Mock).mockImplementation(async (email: string) =>
+      email === 'owner@example.com' ? { email, isAdmin: true } : { email, isAdmin: false }
+    );
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+
+    await emailService.sendScheduledChatResultEmail(['client@customer.com'], 'Meta Report', GUARD_BASE_RESULT, 'schedule-123');
+
+    const [recipients] = spy.mock.calls[0];
+    expect(recipients).not.toContain('client@customer.com');
+    expect(recipients).toContain('owner@example.com');
+  });
 });
 
 

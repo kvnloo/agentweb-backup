@@ -14,6 +14,15 @@ interface World {
   raceOnce?: boolean;
   raceAlways?: boolean;
   notifyThrows?: boolean;
+  /** When set, the run counter is wired and every call lands here (with how many status writes had been made at that moment). */
+  counted?: Array<{ runId: string; kind: string; statusWritesSoFar: number }>;
+  countThrows?: boolean;
+  /** The counter never answers. */
+  countHangs?: boolean;
+  /** The first status write fails (a retry then finds the engagement already recorded). */
+  statusFailsOnce?: boolean;
+  /** The status write for this list always fails. */
+  statusFailsFor?: string;
 }
 const lead = (listId: string, leadId: string, email: string, over: Record<string, any> = {}) => ({ listId, leadId, email, updatedAt: "2026-10-29T10:00:00.000Z", engagements: [], system: { [`smartlead_${CAMPAIGN}`]: marker("run-ok") }, ...over });
 
@@ -36,6 +45,8 @@ function make(w: World) {
       w.appended.push({ listId, leadId, ...engagement });
     },
     setContactStatus: async (listId, leadId, fields) => {
+      if (w.statusFailsFor === listId) throw new Error("db down for this list");
+      if (w.statusFailsOnce && !(w as any).statusFailed) { (w as any).statusFailed = true; throw new Error("db blip"); }
       const l = w.leads.find(x => x.listId === listId && x.leadId === leadId)!;
       Object.assign(l, fields);
       w.statusWrites.push({ listId, leadId, ...fields });
@@ -44,10 +55,17 @@ function make(w: World) {
       if (w.notifyThrows) throw new Error("mail down");
       w.notified.push({ list: list.listId, lead: l.leadId, type, data, at });
     },
+    ...(w.counted ? {
+      countContactEvent: async (runId: string, kind: string) => {
+        if (w.countHangs) await new Promise(() => undefined);
+        if (w.countThrows) throw new Error("run table down");
+        w.counted!.push({ runId, kind, statusWritesSoFar: w.statusWrites.length });
+      },
+    } : {}),
     now: () => new Date("2026-10-29T12:00:00.000Z"),
     log: () => undefined,
   };
-  return new SmartleadEventService(deps);
+  return new SmartleadEventService(deps as EventDeps);
 }
 const world = (over: Partial<World> = {}): World => ({
   leads: [lead("L1", "a", "ann@example.com")],
@@ -489,5 +507,156 @@ describe("events found by the hourly poll (ENG-673)", () => {
     const other = pushed();
     const o2 = await make(other).handle({ accountId: "smartlead-someone-else", campaignId: CAMPAIGN }, polled("unsubscribe"));
     expect(o2.matched).toBe(0);
+  });
+});
+
+describe("the reply text goes to the owner's alert and nowhere else (ENG-673)", () => {
+  it("is passed to the alert but never stored on the contact", async () => {
+    const w = world();
+    await make(w).handle(ctx, { ...reply(), replyText: "Yes, interested. Call me." });
+    expect(w.notified).toHaveLength(1);
+    expect(w.notified[0].data.replyText).toBe("Yes, interested. Call me.");
+    expect(JSON.stringify(w.appended)).not.toContain("interested");
+    expect(w.appended[0].eventData).not.toHaveProperty("replyText");
+  });
+
+  it("an event without it alerts exactly as before", async () => {
+    const w = world();
+    await make(w).handle(ctx, reply());
+    expect(w.notified[0].data).not.toHaveProperty("replyText");
+  });
+});
+
+describe("counting a run's replied, bounced and unsubscribed contacts for the run view (ENG-673)", () => {
+  const pushed = (over: Partial<World> = {}) => world({ counted: [], leads: [lead("L1", "a", "ann@example.com", { system: { [`smartlead_${CAMPAIGN}`]: marker("run-ok") } })], ...over });
+  const polled = (kind: "reply" | "bounce" | "unsubscribe", over: Partial<SmartleadEvent> = {}): SmartleadEvent => ({
+    kind, campaignId: CAMPAIGN, candidateEmails: ["ann@example.com"], soft: false, polled: true, eventKey: `poll:${kind}:${CAMPAIGN}:9`, ...over,
+  });
+  const kinds = (w: World) => w.counted!.map(c => `${c.runId}:${c.kind}`);
+
+  it("counts a contact's reply once, and a second reply from the same contact does not count again", async () => {
+    const w = pushed();
+    const svc = make(w);
+    await svc.handle(ctx, reply());
+    await svc.handle(ctx, reply({ time_replied: "2026-10-29T11:30:00Z", subject: "Re: Hi again" }));
+    expect(w.appended.filter(a => a.eventType === "email.received")).toHaveLength(2); // both replies are on the contact
+    expect(kinds(w)).toEqual(["run-ok:replied"]); // the run counts contacts, not messages
+  });
+
+  it("a replayed delivery counts nothing the second time", async () => {
+    const w = pushed();
+    const svc = make(w);
+    await svc.handle(ctx, unsub());
+    await svc.handle(ctx, unsub());
+    expect(kinds(w)).toEqual(["run-ok:unsubscribed"]);
+  });
+
+  it("counts a hard bounce but not a temporary one; a hard bounce after a temporary one still counts", async () => {
+    const w = pushed();
+    const svc = make(w);
+    await svc.handle(ctx, bounce({ bounce_type: "soft", sl_email_lead_id: 1, time: "2026-10-29T10:30:00.000Z" } as any));
+    expect(w.counted).toHaveLength(0);
+    await svc.handle(ctx, bounce({ time: "2026-10-29T11:00:00.000Z" }));
+    expect(kinds(w)).toEqual(["run-ok:bounced"]);
+  });
+
+  it("a failing counter never changes what happens to the contact: the opt-out is still saved and the event still succeeds", async () => {
+    const w = pushed({ countThrows: true });
+    const out = await make(w).handle(ctx, unsub());
+    expect(out.changed).toBeGreaterThan(0);
+    expect(w.leads[0].contactStatus).toBe("unsubscribed");
+    expect(w.appended.map(a => a.eventType)).toEqual(["email.unsubscribed"]);
+    const r = pushed({ countThrows: true });
+    await expect(make(r).handle(ctx, reply())).resolves.toMatchObject({ changed: 1 });
+    expect(r.notified).toHaveLength(1); // and the reply alert still went out
+  });
+
+  it("the counter comes after the block is written, never before it", async () => {
+    const w = pushed();
+    await make(w).handle(ctx, unsub());
+    expect(w.statusWrites).toHaveLength(1);
+    expect(w.counted![0].statusWritesSoFar).toBe(1);
+  });
+
+  it("does not count an opt-out for a contact that was already blocked: our own withdrawal echoed back by Smartlead is not a contact's act", async () => {
+    const w = pushed();
+    const svc = make(w);
+    await svc.handle(ctx, bounce({ time: "2026-10-29T11:00:00.000Z" })); // hard bounce: counted, blocked
+    await svc.handle(ctx, unsub()); // the sweep unsubscribes the blocked contact in Smartlead, which reports it back
+    expect(kinds(w)).toEqual(["run-ok:bounced"]);
+    const admin = pushed({ leads: [lead("L1", "a", "ann@example.com", { contactStatus: "do-not-contact", system: { [`smartlead_${CAMPAIGN}`]: marker("run-ok") } })] });
+    await make(admin).handle(ctx, unsub());
+    expect(admin.statusWrites).toHaveLength(0);
+    expect(admin.counted).toHaveLength(0);
+  });
+
+  it("a retry after a failed block write still counts, once", async () => {
+    const w = pushed({ statusFailsOnce: true });
+    const svc = make(w);
+    await expect(svc.handle(ctx, unsub())).rejects.toThrow("db blip"); // Smartlead would retry
+    expect(w.counted).toHaveLength(0);
+    await svc.handle(ctx, unsub());
+    expect(w.leads[0].contactStatus).toBe("unsubscribed");
+    expect(kinds(w)).toEqual(["run-ok:unsubscribed"]);
+    await svc.handle(ctx, unsub()); // and a further replay does not count again
+    expect(kinds(w)).toEqual(["run-ok:unsubscribed"]);
+  });
+
+  it("a contact in two lists is blocked in both before any counter is written, so a counter can never hold up the second block", async () => {
+    const w = pushed({ leads: [
+      lead("L1", "a", "ann@example.com", { system: { [`smartlead_${CAMPAIGN}`]: marker("run-ok") } }),
+      lead("L2", "b", "ann@example.com", { system: { [`smartlead_${CAMPAIGN}`]: marker("run-ok") } }),
+    ] });
+    await make(w).handle(ctx, unsub());
+    expect(w.statusWrites).toHaveLength(2);
+    expect(w.counted!.map(c => c.statusWritesSoFar)).toEqual([2, 2]);
+  });
+
+  it("when a later list's block fails (Smartlead will retry), the first list's block is still counted", async () => {
+    const w = pushed({ statusFailsFor: "L2", leads: [
+      lead("L1", "a", "ann@example.com", { system: { [`smartlead_${CAMPAIGN}`]: marker("run-ok") } }),
+      lead("L2", "b", "ann@example.com", { system: { [`smartlead_${CAMPAIGN}`]: marker("run-ok") } }),
+    ] });
+    await expect(make(w).handle(ctx, unsub())).rejects.toThrow("db down");
+    expect(w.leads[0].contactStatus).toBe("unsubscribed"); // the first block was written...
+    expect(kinds(w)).toEqual(["run-ok:unsubscribed"]); // ...so it is counted, once
+  });
+
+  it("a broken logger and a failing counter cannot replace the error of a failed block (Smartlead must still see the original failure and retry)", async () => {
+    const w = pushed({ countThrows: true, statusFailsFor: "L2", leads: [
+      lead("L1", "a", "ann@example.com", { system: { [`smartlead_${CAMPAIGN}`]: marker("run-ok") } }),
+      lead("L2", "b", "ann@example.com", { system: { [`smartlead_${CAMPAIGN}`]: marker("run-ok") } }),
+    ] });
+    const svc = new SmartleadEventService({ ...(make(w) as any).deps, log: () => { throw new Error("logger broken"); } } as EventDeps);
+    await expect(svc.handle(ctx, unsub())).rejects.toThrow("db down for this list");
+  });
+
+  it("a counter that never answers does not hold up the response for more than a couple of seconds", async () => {
+    jest.useFakeTimers();
+    try {
+      const w = pushed({ countHangs: true });
+      const p = make(w).handle(ctx, unsub());
+      await jest.advanceTimersByTimeAsync(2100);
+      await expect(p).resolves.toMatchObject({ matched: 1 });
+      expect(w.leads[0].contactStatus).toBe("unsubscribed");
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it("the poll finding what the webhook already delivered counts nothing", async () => {
+    const w = pushed();
+    const svc = make(w);
+    await svc.handle(ctx, unsub());
+    await svc.handle(ctx, polled("unsubscribe"));
+    expect(kinds(w)).toEqual(["run-ok:unsubscribed"]);
+    const r = pushed();
+    await make(r).handle(ctx, polled("unsubscribe")); // a missed one the poll recovers is new
+    expect(kinds(r)).toEqual(["run-ok:unsubscribed"]);
+  });
+
+  it("works with no run store wired (nothing is counted, nothing breaks)", async () => {
+    const w = world({ leads: [lead("L1", "a", "ann@example.com", { system: { [`smartlead_${CAMPAIGN}`]: marker("run-ok") } })] });
+    await expect(make(w).handle(ctx, unsub())).resolves.toMatchObject({ matched: 1 });
   });
 });

@@ -970,6 +970,24 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
       expect((await e.svc.history("owner", e.listId)) as any).toMatchObject({ ok: true, runs: [{ runId: r.run.runId }] });
     });
 
+    it("the run history carries what Smartlead reported (read from the runs, not the history index), and a failing read lists the run without it", async () => {
+      const e = env({ maxConcurrentWorkers: 0 });
+      const r = (await e.svc.start("owner", go((await approve(e)).token))) as any;
+      const runId = r.run.runId as string;
+      expect(((await e.svc.history("owner", e.listId)) as any).runs[0]).not.toHaveProperty("events");
+      await db.countContactEvent(runId, "replied");
+      await db.countContactEvent(runId, "unsubscribed");
+      await db.countContactEvent(runId, "unsubscribed");
+      expect(((await e.svc.history("owner", e.listId)) as any).runs[0]).toMatchObject({ runId, events: { replied: 1, bounced: 0, unsubscribed: 2 } });
+      const real = db.getRunEvents.bind(db);
+      (db as any).getRunEvents = async () => { throw new Error("read failed"); };
+      try {
+        expect((await e.svc.history("owner", e.listId)) as any).toMatchObject({ ok: true, runs: [{ runId }] });
+      } finally {
+        (db as any).getRunEvents = real;
+      }
+    });
+
     it("pauses, resumes (the worker picks it up and finishes), and cancels", async () => {
       const e = env({ leads: Array.from({ length: 900 }, (_, i) => mkLead(i + 1)) });
       e.sl.onPost = async () => { if (e.sl.posts.length === 0) await e.svc.pause("owner", (await db.listRunsForList(e.listId))[0].runId); };
