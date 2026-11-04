@@ -478,7 +478,60 @@ export async function getCampaign(apiKey: string, campaignId: number, opts: { ma
   };
 }
 
-export type SmartleadEmailStatus = "is_replied" | "is_bounced" | "is_unsubscribed" | "is_sender_bounced";
+/**
+ * One campaign's counters as Smartlead reports them (ENG-2737). Opens and clicks are left out on purpose: connector campaigns do not turn
+ * tracking on, so those numbers would read zero and mislead.
+ */
+export interface SmartleadCampaignAnalytics {
+  campaignId: number;
+  name: string;
+  status: string;
+  /** Leads in the campaign, whatever their state (`campaign_lead_stats.total`); absent when Smartlead did not say. */
+  leadsInCampaign?: number;
+  /** Contacts emailed at least once (`unique_sent_count`). */
+  contactsEmailed: number;
+  /** Every email sent, follow-ups included (`sent_count`). */
+  emailsSent: number;
+  replies: number;
+  bounces: number;
+  unsubscribes: number;
+}
+
+/** A counter Smartlead sends as a string ("38"). Missing or not a whole number >= 0 is an unexpected reply, never a silent zero. */
+function analyticsCount(row: Record<string, unknown>, key: string): number {
+  const n = asWholeNumber(row[key]);
+  if (n === undefined || n < 0) throw new SmartleadUnexpectedResponseError(`Smartlead GET /campaigns/{id}/analytics returned no usable ${key}`);
+  return n;
+}
+
+/**
+ * Read-only counters for one campaign (`GET /campaigns/{id}/analytics`). Like `getCampaign`, an id that does not exist can come back as an
+ * EMPTY body, which gives null; a body that is not a campaign, or is a different campaign than asked for, is an error.
+ */
+export async function getCampaignAnalytics(apiKey: string, campaignId: number, opts: { maxRetries?: number } = {}): Promise<SmartleadCampaignAnalytics | null> {
+  assertCampaignId(campaignId);
+  const data = await smartleadRequest<unknown>(apiKey, "GET", `/campaigns/${encodeURIComponent(String(campaignId))}/analytics`, { maxRetries: opts.maxRetries });
+  if (data === "" || data === null || data === undefined) return null;
+  if (typeof data !== "object" || Array.isArray(data)) throw new SmartleadUnexpectedResponseError("Smartlead GET /campaigns/{id}/analytics returned an unexpected response");
+  const row = data as Record<string, unknown>;
+  const id = asWholeNumber(row.id);
+  if (id === undefined || id !== campaignId) throw new SmartleadUnexpectedResponseError("Smartlead GET /campaigns/{id}/analytics returned a different campaign than asked for");
+  const leadStats = row.campaign_lead_stats && typeof row.campaign_lead_stats === "object" ? (row.campaign_lead_stats as Record<string, unknown>) : undefined;
+  const leadsInCampaign = asWholeNumber(leadStats?.total);
+  return {
+    campaignId: id,
+    name: String(row.name ?? ""),
+    status: String(row.status ?? "").toUpperCase(),
+    ...(leadsInCampaign !== undefined && leadsInCampaign >= 0 ? { leadsInCampaign } : {}),
+    contactsEmailed: analyticsCount(row, "unique_sent_count"),
+    emailsSent: analyticsCount(row, "sent_count"),
+    replies: analyticsCount(row, "reply_count"),
+    bounces: analyticsCount(row, "bounce_count"),
+    unsubscribes: analyticsCount(row, "unsubscribed_count"),
+  };
+}
+
+export type SmartleadEmailStatus ="is_replied" | "is_bounced" | "is_unsubscribed" | "is_sender_bounced";
 
 export interface SmartleadLeadRow {
   /** Smartlead's own lead id. */

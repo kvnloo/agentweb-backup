@@ -6702,6 +6702,7 @@ export class AgentModeService {
 
     // Smartlead push (ENG-673): the user's own Smartlead campaigns; starting and releasing are approval-card gated
     'list_smartlead_campaigns',
+    'get_smartlead_campaign_stats',
     'preview_smartlead_push',
     'start_smartlead_push',
     'get_smartlead_push_status',

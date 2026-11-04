@@ -14,6 +14,7 @@ import {
   addLeadsToCampaign,
   findLeadIdByEmail,
   getCampaign,
+  getCampaignAnalytics,
   getCampaignEmailAccounts,
   getCampaignSequences,
   listCampaigns,
@@ -283,6 +284,53 @@ describe("smartleadService slice 2 client (ENG-673)", () => {
     it("rejects a reply that is not a list rather than showing no campaigns", async () => {
       mockedAxios.request.mockResolvedValue({ data: { message: "Plan expired!" } } as never);
       await expect(listCampaigns(KEY)).rejects.toBeInstanceOf(SmartleadUnexpectedResponseError);
+    });
+  });
+
+  describe("getCampaignAnalytics (live shape, 2026-11-04)", () => {
+    // Shape read from a real campaign in AgentWeb's own Smartlead account: every counter is a STRING.
+    const live = {
+      id: 3083885, name: "ICP2-Final", status: "COMPLETED", sent_count: "38", open_count: "26", click_count: "0", reply_count: "2", unique_sent_count: "13",
+      bounce_count: "1", unsubscribed_count: "3", campaign_lead_stats: { total: 13, completed: 12 }, client_email: "someone@example.com",
+    };
+
+    it("reads the counters, turning Smartlead's strings into numbers and leaving opens and clicks out", async () => {
+      mockedAxios.request.mockResolvedValueOnce({ data: live } as never);
+      await expect(getCampaignAnalytics(KEY, 3083885)).resolves.toEqual({
+        campaignId: 3083885, name: "ICP2-Final", status: "COMPLETED", leadsInCampaign: 13, contactsEmailed: 13, emailsSent: 38, replies: 2, bounces: 1, unsubscribes: 3,
+      });
+      expect(mockedAxios.request.mock.calls[0][0].url).toMatch(/\/campaigns\/3083885\/analytics$/);
+      expect(mockedAxios.request.mock.calls[0][0].method).toBe("GET");
+    });
+
+    it("omits the lead total when Smartlead does not say, and reports a real zero as zero", async () => {
+      mockedAxios.request.mockResolvedValueOnce({ data: { ...live, campaign_lead_stats: undefined, sent_count: "0", unique_sent_count: "0", reply_count: 0, bounce_count: "0", unsubscribed_count: "0" } } as never);
+      const r = await getCampaignAnalytics(KEY, 3083885);
+      expect(r).toMatchObject({ contactsEmailed: 0, emailsSent: 0, replies: 0 });
+      expect(r).not.toHaveProperty("leadsInCampaign");
+    });
+
+    it("gives null for the empty 200 of a missing campaign, and errors for anything that is not that campaign", async () => {
+      mockedAxios.request.mockResolvedValueOnce({ data: "" } as never);
+      await expect(getCampaignAnalytics(KEY, 9)).resolves.toBeNull();
+      mockedAxios.request.mockResolvedValueOnce({ data: { message: "Plan expired" } } as never);
+      await expect(getCampaignAnalytics(KEY, 9)).rejects.toBeInstanceOf(SmartleadUnexpectedResponseError);
+      mockedAxios.request.mockResolvedValueOnce({ data: [live] } as never);
+      await expect(getCampaignAnalytics(KEY, 9)).rejects.toBeInstanceOf(SmartleadUnexpectedResponseError);
+      mockedAxios.request.mockResolvedValueOnce({ data: live } as never);
+      await expect(getCampaignAnalytics(KEY, 9)).rejects.toBeInstanceOf(SmartleadUnexpectedResponseError);
+    });
+
+    it("never reports a missing or garbled counter as zero", async () => {
+      for (const bad of [{ ...live, reply_count: undefined }, { ...live, bounce_count: "lots" }, { ...live, sent_count: "-4" }]) {
+        mockedAxios.request.mockResolvedValueOnce({ data: bad } as never);
+        await expect(getCampaignAnalytics(KEY, 3083885)).rejects.toBeInstanceOf(SmartleadUnexpectedResponseError);
+      }
+    });
+
+    it("refuses a campaign id that is not a positive whole number without calling Smartlead", async () => {
+      await expect(getCampaignAnalytics(KEY, 0)).rejects.toBeInstanceOf(SmartleadApiError);
+      expect(mockedAxios.request).not.toHaveBeenCalled();
     });
   });
 

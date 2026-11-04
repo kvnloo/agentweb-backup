@@ -197,6 +197,36 @@ emmaToolRegistry.register({
   },
 });
 
+/** Smartlead updates its counters on its own schedule, so a recent send or push may not show yet. */
+const STATS_LAG_NOTE = "Smartlead's counts can lag a few minutes behind a recent push or send.";
+
+emmaToolRegistry.register({
+  name: 'get_smartlead_campaign_stats',
+  definition: {
+    name: 'get_smartlead_campaign_stats',
+    description: "How one of the user's Smartlead campaigns is doing, as Smartlead counts it: contacts emailed, emails sent (follow-ups included), replies, bounces and unsubscribes. Read only; nothing is changed. Use list_smartlead_campaigns to find the campaign id. Opens and clicks are not reported. " + STATS_LAG_NOTE + " Say so when the user has just pushed or sent.",
+    inputSchema: { type: 'object', properties: { campaignId: PUSH_PROPERTIES.campaignId, accountId: PUSH_PROPERTIES.accountId }, required: ['campaignId'], additionalProperties: false },
+  },
+  execute: async (args: unknown, context?: ToolContext) => {
+    const a = onlyKeys(args, ['campaignId', 'accountId']);
+    const { stats, connection } = unwrap(await getSmartleadPushService().campaignStats(userIdOf(context), campaignArg(a.campaignId), a.accountId === undefined ? undefined : idArg(a.accountId, 'accountId')));
+    return {
+      success: true,
+      smartleadAccount: connection,
+      campaign: { id: stats.campaignId, name: stats.name, status: stats.status },
+      stats: {
+        ...(stats.leadsInCampaign !== undefined ? { leadsInCampaign: stats.leadsInCampaign } : {}),
+        contactsEmailed: stats.contactsEmailed,
+        emailsSent: stats.emailsSent,
+        replies: stats.replies,
+        bounces: stats.bounces,
+        unsubscribes: stats.unsubscribes,
+      },
+      note: STATS_LAG_NOTE,
+    };
+  },
+});
+
 emmaToolRegistry.register({
   name: 'preview_smartlead_push',
   definition: {
