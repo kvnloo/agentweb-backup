@@ -23,7 +23,7 @@ import {
   resolveDestination,
 } from './messagingChannelService';
 import { TEMPLATES } from './whatsappService';
-import { buildSmartleadReplyAlertEmail, isSmartleadReplyAlert, smartleadReplyContactLabel, smartleadReplyHeadline } from './smartleadReplyAlertEmail';
+import { buildSmartleadReplyAlertEmail, isSmartleadReplyAlert, smartleadReplyHeadline } from './smartleadReplyAlertEmail';
 
 const normalizeEventType = (eventType: string) => eventType.trim().toLowerCase();
 
@@ -397,13 +397,14 @@ export const leadListAlertService = {
           lead.email ||
           'A lead';
         if (smartleadReply) {
-          // The contact's name is their own words: one safe line, so it can never add a line break to the message.
-          const who = smartleadReplyContactLabel(smartleadReplyName(lead), lead.email) || 'A lead';
-          const detail = `replied to your campaign on ${listName}. ${crmUrl}`;
+          // The same sentence the email subject and the Slack header use (the contact's name is their own words: it comes out as one safe
+          // line), then the list and the CRM link, which Slack shows in its fields and button.
+          const sentence = smartleadReplyHeadline(smartleadReplyName(lead), lead.email);
+          const detail = `List: ${listName}. ${crmUrl}`;
           await getMessagingChannel('whatsapp').sendMessage({
             destination: whatsappTo,
-            text: `${who} ${detail}`,
-            template: { name: TEMPLATES.LEAD_ALERT.name, variables: [who, detail] },
+            text: `${sentence}. ${detail}`,
+            template: { name: TEMPLATES.LEAD_ALERT.name, variables: [sentence, detail] },
           } as any);
         } else {
           await getMessagingChannel('whatsapp').sendMessage({
