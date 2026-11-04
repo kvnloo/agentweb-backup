@@ -166,9 +166,20 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
       expect(spy).toHaveBeenCalledWith("key-of-owner", CAMPAIGN);
     });
 
+    it("uses a teammate's shared connection when that is the only one, and says the account is shared", async () => {
+      const e = env();
+      e.deps.resolveKey = async () => ({ ok: true as const, apiKey: "key-of-boss", ownerUserId: "boss", accountId: "smartlead-boss", accountName: "Boss SL" });
+      const spy = jest.spyOn(e.deps.smartlead, "getCampaignAnalytics");
+      const r = (await e.svc.campaignStats("owner", CAMPAIGN)) as any;
+      expect(r).toMatchObject({ ok: true, connection: { accountId: "smartlead-boss", name: "Boss SL", shared: true } });
+      expect(spy).toHaveBeenCalledWith("key-of-boss", CAMPAIGN);
+    });
+
     it("changes nothing: no run, no marker, no write to Smartlead", async () => {
       const e = env();
+      const addLeads = jest.spyOn(e.sl, "addLeads");
       await e.svc.campaignStats("owner", CAMPAIGN);
+      expect(addLeads).not.toHaveBeenCalled();
       expect(e.unsub).not.toHaveBeenCalled();
       expect(e.upd).not.toHaveBeenCalled();
       expect(e.leads.every(l => !l.system || Object.keys(l.system).length === 0)).toBe(true);

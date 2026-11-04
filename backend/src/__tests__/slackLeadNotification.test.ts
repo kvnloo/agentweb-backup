@@ -135,6 +135,19 @@ describe('formatLeadNotificationPayload — a headline sentence (Smartlead reply
     expect(r.text).not.toContain('<');
   });
 
+  it('escapes the values it shows when a headline is set, and leaves them alone when it is not', () => {
+    const hostile: LeadNotificationPayload = { ...lead, firstName: '<!channel> & <https://x.example|Click>', lastName: '', email: 'a<b>@example.com', company: 'Acme <!here>', phone: '<tel>', listName: 'List <!channel>' };
+    const withLine = formatLeadNotificationPayload({ ...hostile, headline: 'A new lead replied to your campaign' });
+    const fieldText = withLine.blocks[1].fields.map((f: { text: string }) => f.text).join('\n');
+    expect(fieldText).toContain('&lt;!channel&gt; &amp; &lt;https://x.example|Click&gt;');
+    expect(fieldText).toContain('a&lt;b&gt;@example.com');
+    expect(fieldText).toContain('Acme &lt;!here&gt;');
+    expect(fieldText).toContain('List &lt;!channel&gt;');
+    expect(fieldText).not.toMatch(/<(?!https:\/\/linkedin)/);
+    const plain = formatLeadNotificationPayload(hostile);
+    expect(plain.blocks[1].fields.map((f: { text: string }) => f.text).join('\n')).toContain('<!channel> & <https://x.example|Click>');
+  });
+
   it('leaves every alert without a headline exactly as it was (the raw event name and the old fallback)', () => {
     const r = formatLeadNotificationPayload(lead);
     expect(r.blocks[0].text.text).toBe('email.received');
