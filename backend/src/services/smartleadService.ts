@@ -505,8 +505,9 @@ function analyticsCount(row: Record<string, unknown>, key: string): number {
 }
 
 /**
- * Read-only counters for one campaign (`GET /campaigns/{id}/analytics`). Like `getCampaign`, an id that does not exist can come back as an
- * EMPTY body, which gives null; a body that is not a campaign, or is a different campaign than asked for, is an error.
+ * Read-only counters for one campaign (`GET /campaigns/{id}/analytics`). An id that does not exist (or is not this key's) comes back as an
+ * empty object (or, as with `getCampaign`, an empty body), which gives null; a body that is not a campaign, or is a different campaign than
+ * asked for, is an error.
  */
 export async function getCampaignAnalytics(apiKey: string, campaignId: number, opts: { maxRetries?: number } = {}): Promise<SmartleadCampaignAnalytics | null> {
   assertCampaignId(campaignId);
@@ -514,6 +515,8 @@ export async function getCampaignAnalytics(apiKey: string, campaignId: number, o
   if (data === "" || data === null || data === undefined) return null;
   if (typeof data !== "object" || Array.isArray(data)) throw new SmartleadUnexpectedResponseError("Smartlead GET /campaigns/{id}/analytics returned an unexpected response");
   const row = data as Record<string, unknown>;
+  // Verified on a real account (2026-11-04): an id that does not exist, or is not this key's, returns HTTP 200 with an EMPTY object.
+  if (Object.keys(row).length === 0) return null;
   const id = asWholeNumber(row.id);
   if (id === undefined || id !== campaignId) throw new SmartleadUnexpectedResponseError("Smartlead GET /campaigns/{id}/analytics returned a different campaign than asked for");
   const leadStats = row.campaign_lead_stats && typeof row.campaign_lead_stats === "object" ? (row.campaign_lead_stats as Record<string, unknown>) : undefined;
