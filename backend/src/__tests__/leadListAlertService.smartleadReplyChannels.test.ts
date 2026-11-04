@@ -61,8 +61,9 @@ describe('Slack', () => {
     await notify(onSlack, SMARTLEAD, { leadId: 'l2', email: 'bo@example.com' });
     expect(slackSent().headline).toBe('A new lead "bo@example.com" replied to your campaign');
     sendLeadNotification.mockClear();
+    // neither a name nor an address: a plain sentence, never the lead's database id
     await notify(onSlack, SMARTLEAD, { leadId: 'l3', firstName: '', lastName: '' });
-    expect(slackSent().headline).not.toMatch(/email\.received/);
+    expect(slackSent().headline).toBe('A new lead replied to your campaign');
   });
 
   it('sends NO headline for an email.received that did not come through Smartlead, or for any other event', async () => {
@@ -97,7 +98,8 @@ describe('WhatsApp', () => {
     whatsapp.sendMessage.mockClear();
     await notify(onWhatsApp, SMARTLEAD, { leadId: 'l3' });
     expect(waSent().template.variables).toHaveLength(2);
-    expect(waSent().template.variables[0]).toBeTruthy();
+    expect(waSent().template.variables[0]).toBe('A lead');
+    expect(JSON.stringify(waSent())).not.toContain('l3');
   });
 
   it('is exactly as before for an email.received that did not come through Smartlead, and for any other event', async () => {
