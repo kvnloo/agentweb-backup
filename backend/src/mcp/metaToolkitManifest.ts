@@ -15,7 +15,7 @@
  */
 import { metaToolRegistry } from '../emma/metaTools';
 import type { McpToolRegistry } from './server/registry';
-import { isZomaTool, ZOMA_TOOL_DEFINITIONS } from './zomaToolDefinitions';
+import { getToolkitToolAnnotations, isZomaTool, ZOMA_TOOL_DEFINITIONS, type ToolkitToolAnnotations } from './zomaToolDefinitions';
 import { MetaToolkitRefusal } from './metaToolkitErrors';
 import { GUARDED_WRITE_ACTIONS } from './metaToolkitWriteSurface';
 
@@ -94,7 +94,20 @@ export function getMetaToolkitManifest(registry: McpToolRegistry = metaToolRegis
     return narrowDefinition(tool.definition);
   });
   // ENG-2303: toolkit-local Zoma onboarding tools (handled by the gateway, not the registry).
-  return [...metaTools, ...ZOMA_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d)))];
+  return [...metaTools, ...ZOMA_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d)))].map(withToolkitAnnotations);
+}
+
+/**
+ * ENG-2747: attach the MCP annotations (readOnlyHint / destructiveHint / idempotentHint /
+ * openWorldHint). Fails loudly for a tool with no entry, like a missing registry tool: an
+ * unlabelled tool must never reach a marketplace client.
+ */
+function withToolkitAnnotations<T extends { name: string }>(def: T): T & { annotations: ToolkitToolAnnotations } {
+  const annotations = getToolkitToolAnnotations(def.name);
+  if (!annotations) {
+    throw new Error(`Meta Toolkit manifest: tool ${def.name} has no annotation entry (ENG-2747)`);
+  }
+  return { ...def, annotations: { ...annotations } };
 }
 
 /** Throws MetaToolkitRefusal when the call is outside the v1 surface. */

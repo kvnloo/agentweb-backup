@@ -10,6 +10,46 @@ export function isZomaTool(name: string): name is ZomaToolName {
   return (ZOMA_TOOL_NAMES as readonly string[]).includes(name);
 }
 
+export interface ToolkitToolAnnotations {
+  readOnlyHint: boolean;
+  destructiveHint: boolean;
+  idempotentHint: boolean;
+  openWorldHint: boolean;
+}
+
+/**
+ * ENG-2747 — MCP tool annotations for every tool the Meta Toolkit (Zoma) advertises.
+ * Marketplaces and MCP gateways use these hints to decide what needs human approval, so a
+ * hint must never understate what a call can do.
+ *
+ * - call_meta_marketing_api is ONE tool carrying both reads and guarded writes (CREATE paused,
+ *   UPDATE status/budget), so it is labelled a destructive write. A client that honours the
+ *   hint will gate every call to it, reads included; splitting it into a read tool and a write
+ *   tool is the separate server-side approval work and is not done here.
+ * - call_meta_ads_insights_api is labelled read-only: it only fetches reporting rows. Meta-side
+ *   async report runs and the optional S3 spill of a large result are internal and change no
+ *   ad, budget or status.
+ * - zoma_status is NOT read-only: when payment is missing it mints a Stripe setup link
+ *   (getZomaReadiness with mintLinks), which can create a Stripe customer and Checkout session.
+ * - zoma_prepare_upload mints a one-time presigned upload URL under the caller's prefix.
+ * Explicit by name, no derivation: a new toolkit tool without an entry fails the manifest.
+ */
+export const TOOLKIT_TOOL_ANNOTATIONS: Readonly<Record<string, ToolkitToolAnnotations>> = Object.freeze({
+  list_meta_ads_campaigns: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  get_meta_ads_metrics: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  call_meta_ads_insights_api: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  call_meta_marketing_api: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+  zoma_status: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  zoma_usage: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  zoma_prepare_upload: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+});
+
+export function getToolkitToolAnnotations(name: string): ToolkitToolAnnotations | undefined {
+  return Object.prototype.hasOwnProperty.call(TOOLKIT_TOOL_ANNOTATIONS, name)
+    ? TOOLKIT_TOOL_ANNOTATIONS[name]
+    : undefined;
+}
+
 export const ZOMA_TOOL_DEFINITIONS = [
   {
     name: 'zoma_status',
