@@ -912,7 +912,7 @@ export function formatLeadNotificationPayload(lead: LeadNotificationPayload): {
 
   // A Smartlead reply alert (headline set) escapes the values it shows, since a contact's details are not ours to trust as Slack markup.
   // Every other alert keeps its values exactly as they were.
-  const val = (v: string): string => (lead.headline ? escapeSlackText(v) : v);
+  const val = (v: string): string => (lead.headline ? escapeSlackText(String(v)) : v);
 
   const fields: Array<{ type: string; text: string }> = [];
 
@@ -931,7 +931,11 @@ export function formatLeadNotificationPayload(lead: LeadNotificationPayload): {
   }
 
   if (lead.linkedin) {
-    fields.push({ type: 'mrkdwn', text: `*LinkedIn:*\n<${lead.linkedin}|Profile>` });
+    // The link target of a Smartlead reply alert can not carry markup: & < > | and spaces are escaped so it stays one link.
+    const linkTarget = lead.headline
+      ? escapeSlackText(String(lead.linkedin)).replace(/[|\s]/g, (c) => encodeURIComponent(c))
+      : lead.linkedin;
+    fields.push({ type: 'mrkdwn', text: `*LinkedIn:*\n<${linkTarget}|Profile>` });
   }
 
   fields.push({ type: 'mrkdwn', text: `*List:*\n${val(lead.listName)}` });

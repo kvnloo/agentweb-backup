@@ -148,6 +148,23 @@ describe('formatLeadNotificationPayload — a headline sentence (Smartlead reply
     expect(plain.blocks[1].fields.map((f: { text: string }) => f.text).join('\n')).toContain('<!channel> & <https://x.example|Click>');
   });
 
+  it('keeps a hostile LinkedIn value to one link and survives non-string values, when a headline is set', () => {
+    const hostile = formatLeadNotificationPayload({
+      ...lead, headline: 'A new lead replied to your campaign', linkedin: 'https://linkedin.com/in/x|y><!channel><https://evil.example|click',
+      phone: 5551234 as unknown as string, company: 42 as unknown as string,
+    });
+    const text = hostile.blocks[1].fields.map((f: { text: string }) => f.text).join('\n');
+    const linkedin = hostile.blocks[1].fields.find((f: { text: string }) => f.text.startsWith('*LinkedIn:*')).text;
+    expect(linkedin).toBe('*LinkedIn:*\n<https://linkedin.com/in/x%7Cy&gt;&lt;!channel&gt;&lt;https://evil.example%7Cclick|Profile>');
+    expect((linkedin.match(/\|/g) || []).length).toBe(1);
+    expect(linkedin).not.toContain('<!channel>');
+    expect(text).toContain('5551234');
+    expect(text).toContain('42');
+    // without a headline the link is exactly what it was
+    const plain = formatLeadNotificationPayload({ ...lead, linkedin: 'https://linkedin.com/in/janedoe' });
+    expect(plain.blocks[1].fields.find((f: { text: string }) => f.text.startsWith('*LinkedIn:*')).text).toBe('*LinkedIn:*\n<https://linkedin.com/in/janedoe|Profile>');
+  });
+
   it('leaves every alert without a headline exactly as it was (the raw event name and the old fallback)', () => {
     const r = formatLeadNotificationPayload(lead);
     expect(r.blocks[0].text.text).toBe('email.received');
