@@ -119,4 +119,21 @@ describe('getLeadConversationStatuses', () => {
     expect(r.success).toBe(false);
     expect(db.getLeadById).not.toHaveBeenCalled();
   });
+
+  it('reports failed signal reads as unknown, never as confirmed negatives', async () => {
+    (conns.getAllConnectionsByAccount as jest.Mock).mockRejectedValue(new Error('unipile down'));
+    (emailEventsDb.getEventsByEmailDomain as jest.Mock).mockRejectedValue(new Error('ddb throttled'));
+    db.getLeadById.mockResolvedValue(leadB);
+    const r = await getLeadConversationStatuses(listId, userId, { leadIds: ['b'] });
+    expect(r.success).toBe(true);
+    expect(r.unavailableSignals).toEqual(expect.arrayContaining(['linkedin_connections', 'linkedin_messages', 'email_messages']));
+    expect(r.leads[0]).toMatchObject({ connectionState: 'unknown', replyState: 'unknown' });
+  });
+
+  it('treats an explicit empty lead_ids as an empty selection, not whole-list mode', async () => {
+    const r = await getLeadConversationStatuses(listId, userId, { leadIds: [] });
+    expect(r.success).toBe(true);
+    expect(r.count).toBe(0);
+    expect(db.getLeadsByListId).not.toHaveBeenCalled();
+  });
 });

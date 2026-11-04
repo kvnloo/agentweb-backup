@@ -1434,7 +1434,8 @@ export async function getLeadConversationStatuses(listId: string, userId: string
         return { success: false, message: 'Access denied', error: 'You do not have permission to access this list' };
       }
 
-      const rawIds = Array.isArray(options.leadIds) ? options.leadIds : [];
+      const selectionMode = Array.isArray(options.leadIds);
+      const rawIds = selectionMode ? (options.leadIds as string[]) : [];
       const leadIds = Array.from(new Set(rawIds.map((id) => String(id || '').trim()).filter(Boolean)));
       if (leadIds.length > MAX_LEAD_IDS) {
         return {
@@ -1450,11 +1451,22 @@ export async function getLeadConversationStatuses(listId: string, userId: string
       const { getAllConnectionsByAccount, normalizeLinkedInUrl } = await import('../../services/unipileConnectionsDb');
       const user = await userDb.getUserById(userId);
       const emailDomain = user?.emailDomain?.trim();
+      // A failed signal read must never masquerade as a confirmed negative
+      // (not_connected / no_messages): record it and report those fields as unknown.
+      const unavailableSignals: string[] = [];
+      const guard = <T,>(name: string, p: Promise<T[]>): Promise<T[]> =>
+        p.catch((err) => {
+          console.warn(`AgentMode: lead status signal '${name}' unavailable:`, err);
+          unavailableSignals.push(name);
+          return [] as T[];
+        });
       const [connections, linkedInEvents, emailEvents] = await Promise.all([
-        accountId ? getAllConnectionsByAccount(accountId).catch(() => []) : Promise.resolve([]),
-        emailEventsDb.getEventsByEmailDomain(`linkedin-${listId}`).catch(() => []),
-        emailDomain ? emailEventsDb.getEventsByEmailDomain(emailDomain).catch(() => []) : Promise.resolve([]),
+        accountId ? guard('linkedin_connections', getAllConnectionsByAccount(accountId) as Promise<any[]>) : Promise.resolve([]),
+        guard('linkedin_messages', emailEventsDb.getEventsByEmailDomain(`linkedin-${listId}`) as Promise<any[]>),
+        emailDomain ? guard('email_messages', emailEventsDb.getEventsByEmailDomain(emailDomain) as Promise<any[]>) : Promise.resolve([]),
       ]);
+      const connectionsUnavailable = unavailableSignals.includes('linkedin_connections');
+      const messagesUnavailable = unavailableSignals.some((n) => n !== 'linkedin_connections');
 
       const connectedAtByUrl = new Map<string, number>();
       for (const c of connections as any[]) {
@@ -1485,7 +1497,7 @@ export async function getLeadConversationStatuses(listId: string, userId: string
         const liSig = url ? linkedInSignalByUrl.get(url) : undefined;
         const emSig = leadEmail ? emailSignalByEmail.get(leadEmail) : undefined;
         const last = [liSig, emSig].filter((x): x is Signal => !!x).sort((a, b) => b.at - a.at)[0];
-        const connectionState = !accountId || !url ? 'unknown' : connectedAt !== undefined ? 'connected' : 'not_connected';
+        const connectionState = !accountId || !url || connectionsUnavailable ? 'unknown' : connectedAt !== undefined ? 'connected' : 'not_connected';
         return {
           leadId: lead.leadId,
           status: 'ok',
@@ -1499,7 +1511,7 @@ export async function getLeadConversationStatuses(listId: string, userId: string
           lastMessageType: last?.type ?? null,
           lastMessageDirection: last?.direction ?? null,
           lastMessageAt: last ? new Date(last.at).toISOString() : null,
-          replyState: !last ? 'no_messages' : last.direction === 'inbound' ? 'replied_awaiting_us' : 'awaiting_their_reply',
+          replyState: messagesUnavailable ? 'unknown' : !last ? 'no_messages' : last.direction === 'inbound' ? 'replied_awaiting_us' : 'awaiting_their_reply',
         };
       };
 
@@ -1507,9 +1519,10 @@ export async function getLeadConversationStatuses(listId: string, userId: string
         listName: list.name,
         linkedInAccountAssigned: !!accountId,
         ...(accountId ? {} : { note: 'No LinkedIn account on this list, so connectionState is "unknown"; message history is still reported.' }),
+        ...(unavailableSignals.length ? { unavailableSignals, warning: `Signal read failed (${unavailableSignals.join(', ')}); affected fields are reported as "unknown", not as confirmed negatives.` } : {}),
       };
 
-      if (leadIds.length > 0) {
+      if (selectionMode) {
         const rows: any[] = [];
         const CONCURRENCY = 10;
         for (let i = 0; i < leadIds.length; i += CONCURRENCY) {
