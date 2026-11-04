@@ -865,8 +865,28 @@ export async function handleCallGoogleAdsApi(userId: string, args: {
         };
       }
       if (action === 'UPDATE') {
+        // ENG-2809: the model names the action the way LIST output and the Google UI
+        // do — a bare id, or under resource_name / conversion_action_id. Normalise
+        // those; a missing one is a model-facing error, not a thrown failure.
+        const raw = args.conversion_action_resource_name ?? args.resource_name ?? args.conversion_action_id;
+        const ident = raw === undefined || raw === null ? '' : String(raw).trim();
+        if (!ident) {
+          return {
+            success: false,
+            error: 'conversion_action_resource_name is required for CONVERSION_ACTION UPDATE '
+              + `(e.g. customers/${customer_id}/conversionActions/<id>). Get it from CONVERSION_ACTION LIST.`,
+          };
+        }
+        const resourceName = /^\d+$/.test(ident) ? `customers/${customer_id}/conversionActions/${ident}` : ident;
+        const owner = /^customers\/(\d+)\//.exec(resourceName)?.[1];
+        if (owner && owner !== String(customer_id)) {
+          return {
+            success: false,
+            error: `conversion_action_resource_name ${resourceName} belongs to customer ${owner}, not customer_id ${customer_id}.`,
+          };
+        }
         const updated = await googleAdsService.updateConversionAction(
-          userId, customer_id, args.conversion_action_resource_name, {
+          userId, customer_id, resourceName, {
             name: args.name,
             status: args.status,
             category: args.category,
