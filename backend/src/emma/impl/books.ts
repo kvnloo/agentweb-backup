@@ -187,6 +187,8 @@ export async function getBookContent(
   chapterId: string | undefined,
   userId: string
 ): Promise<any> {
+  // ENG-2790: treat empty/null chapter_id as absent so section content is stored and read under one key.
+  chapterId = chapterId || undefined;
   try {
     console.log('AgentMode: Getting book content for:', { bookId, sectionId, chapterId });
 
@@ -273,6 +275,8 @@ export async function updateBookContent(
   replacementInstructions: any[],
   userId: string
 ): Promise<any> {
+  // ENG-2790: treat empty/null chapter_id as absent so section content is stored and read under one key.
+  chapterId = chapterId || undefined;
   try {
     // Validate that replacementInstructions is an array
     if (!Array.isArray(replacementInstructions)) {
@@ -410,6 +414,8 @@ export async function generateBookContent(
   researchUrl?: string,
   sessionId?: string
 ): Promise<any> {
+  // ENG-2790: treat empty/null chapter_id as absent so section content is stored and read under one key.
+  chapterId = chapterId || undefined;
   try {
     console.log('AgentMode: Generating book content for:', { bookId, sectionId, chapterId, length, imagine, userId, researchUrl: researchUrl ? 'provided' : 'not provided' });
 
@@ -463,6 +469,17 @@ export async function generateBookContent(
           error: 'Chapter not found in this section'
         };
       }
+    } else if (section.chapters && section.chapters.length > 0) {
+      // ENG-2790 (Opslane P1): a chapter_id-less call on a section that has chapters
+      // is almost always a chapter request with the id dropped. Writing section
+      // content and reporting success misleads the user, so refuse and list the
+      // chapter ids for the model to retry with. Chapterless sections still work.
+      const candidates = section.chapters.map((c) => `${c.chapterId} ("${c.title}")`).join(', ');
+      return {
+        success: false,
+        message: `chapter_id is required: section "${section.title}" has ${section.chapters.length} chapter(s). Call generate_book_content again with one of these chapter_ids: ${candidates}`,
+        error: 'chapter_id required for a section with chapters'
+      };
     }
 
     // Get existing content if it exists

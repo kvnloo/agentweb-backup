@@ -39,7 +39,7 @@ const CANONICAL: Array<[string, boolean, string | null]> = [
 const hostCfg = (host: string) => ({
   env: "test1", uidMin: 400_000, uidMax: 410_000, socket: { dir: "/run/aw-login-host-test1", gid: 990 }, egress: { allow: ["api.anthropic.com:443"] },
   tls: { host, port: 8443, certPath: "/etc/a/server.crt", keyPath: "/etc/a/server.key", caPath: "/etc/a/ca.crt", clientCommonNames: ["agentweb-backend-prod"] },
-  claude: { binaryPath: "/opt/a/claude", expectedSha256: "a".repeat(64), version: "1", systemPromptFile: "/opt/p", bridgeUrl: "http://127.0.0.1:1/mcp" },
+  claude: { binaryPath: "/opt/a/claude", expectedSha256: "a".repeat(64), version: "1", systemPromptFile: "/opt/p", nodePath: "/opt/aw-node/v22.23.3/bin/node", bridgeUrl: "http://127.0.0.1:1/mcp" },
 });
 const hostAccepts = (host: string) => {
   try {

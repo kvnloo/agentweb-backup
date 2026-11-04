@@ -7,7 +7,7 @@ jest.mock('../services/chatbotService', () => ({
   chatbotDb: { getChatSession: jest.fn(), claimMetaWriteManifestDigest: jest.fn() },
 }));
 const svc = {
-  campaigns: jest.fn(), preview: jest.fn(), start: jest.fn(), status: jest.fn(), history: jest.fn(),
+  campaigns: jest.fn(), campaignStats: jest.fn(), preview: jest.fn(), start: jest.fn(), status: jest.fn(), history: jest.fn(),
   pause: jest.fn(), resume: jest.fn(), cancel: jest.fn(), release: jest.fn(), canUseList: jest.fn(), sampleLeads: jest.fn(),
 };
 jest.mock('../services/smartleadPushRuntime', () => ({ getSmartleadPushService: () => svc }));
@@ -19,7 +19,7 @@ import { SHARED_SESSION_BLOCKED_ORG_SETTINGS_TOOLS } from '../services/agentMode
 import { SMARTLEAD_APPROVAL_KIND_PREFIX, cardText, computePushDigest, computeReleaseDigest } from '../services/smartleadPushApprovalGate';
 
 const TOOLS = [
-  'list_smartlead_campaigns', 'preview_smartlead_push', 'start_smartlead_push', 'get_smartlead_push_status',
+  'list_smartlead_campaigns', 'get_smartlead_campaign_stats', 'preview_smartlead_push', 'start_smartlead_push', 'get_smartlead_push_status',
   'pause_smartlead_push', 'resume_smartlead_push', 'cancel_smartlead_push', 'release_leads_from_smartlead',
 ];
 const run = (name: string, args: unknown = {}, context: unknown = { userId: 'owner' }) => handlers.get(name)!.execute(args, context);
@@ -129,6 +129,35 @@ describe('read-only tools', () => {
     expect(r.smartleadAccount).toEqual({ accountId: 'smartlead-owner', name: 'Mindd Smartlead', shared: false });
     await run('list_smartlead_campaigns', { accountId: 'smartlead-other' }, { userId: 'owner' });
     expect(svc.campaigns).toHaveBeenLastCalledWith('owner', 'smartlead-other');
+  });
+
+  it('gives a campaign\'s counters, says they can lag, and leaves out opens and clicks', async () => {
+    svc.campaignStats.mockResolvedValue({
+      ok: true, connection: { accountId: 'smartlead-owner', name: 'Mindd Smartlead', shared: false },
+      stats: { campaignId: 77, name: 'Mindd outreach', status: 'ACTIVE', leadsInCampaign: 60, contactsEmailed: 50, emailsSent: 90, replies: 4, bounces: 2, unsubscribes: 1 },
+    });
+    const r = await run('get_smartlead_campaign_stats', { campaignId: 77 }, { userId: 'owner' });
+    expect(svc.campaignStats).toHaveBeenCalledWith('owner', 77, undefined);
+    expect(r).toEqual({
+      success: true,
+      smartleadAccount: { accountId: 'smartlead-owner', name: 'Mindd Smartlead', shared: false },
+      campaign: { id: 77, name: 'Mindd outreach', status: 'ACTIVE' },
+      stats: { leadsInCampaign: 60, contactsEmailed: 50, emailsSent: 90, replies: 4, bounces: 2, unsubscribes: 1 },
+      note: "Smartlead's counts can lag a few minutes behind a recent push or send.",
+    });
+    const def = handlers.get('get_smartlead_campaign_stats')!.definition;
+    expect(def.description).toMatch(/lag a few minutes/);
+    expect(Object.keys(def.inputSchema.properties).sort()).toEqual(['accountId', 'campaignId']);
+    await run('get_smartlead_campaign_stats', { campaignId: '77', accountId: 'smartlead-other' }, { userId: 'owner' });
+    expect(svc.campaignStats).toHaveBeenLastCalledWith('owner', 77, 'smartlead-other');
+  });
+
+  it('refuses a bad campaign id or an unknown argument, surfaces the service message, and needs a signed-in caller', async () => {
+    await expect(run('get_smartlead_campaign_stats', {}, { userId: 'owner' })).rejects.toThrow(/campaignId/);
+    await expect(run('get_smartlead_campaign_stats', { campaignId: 77, listId: 'x' }, { userId: 'owner' })).rejects.toThrow(/Invalid Smartlead push arguments/);
+    svc.campaignStats.mockResolvedValue({ ok: false, status: 404, code: 'campaign_not_found', message: 'That campaign was not found in the connected Smartlead account.' });
+    await expect(run('get_smartlead_campaign_stats', { campaignId: 77 }, { userId: 'owner' })).rejects.toThrow(/not found in the connected Smartlead account/);
+    await expect(run('get_smartlead_campaign_stats', { campaignId: 77 }, {})).rejects.toThrow(/Authentication required/);
   });
 
   it('passes a chosen Smartlead connection through to the preview and start, and tells the model which account was used', async () => {

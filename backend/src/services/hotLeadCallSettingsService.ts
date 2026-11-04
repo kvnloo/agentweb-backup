@@ -77,7 +77,8 @@ export const BLOCKER_NO_NUMBER = 'A phone number for calls has not been set up y
 
 // ---- revision ------------------------------------------------------------------------------------------------
 
-function canonicalJson(value: unknown): string {
+/** Key-order independent JSON: equal values give equal text. */
+export function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
   if (isRecord(value)) {
     const keys = Object.keys(value).filter(k => value[k] !== undefined).sort();
@@ -385,8 +386,14 @@ const summary = (errors: Errors) => `Some settings are not valid: ${Object.entri
  * phone left out keeps the stored one. A changed phone drops that person's verification and any code in
  * flight. Everything not sent keeps its stored value. The body must carry the revision of the copy it edited
  * (_revision); the write is also conditional on the stored value, so two racing saves cannot both land.
+ *
+ * `beforeTurningOn` is for a caller whose request is not a person's click (the Emma tool): it runs after every
+ * check above has passed, only for a change that turns calling on, and anything it throws stops the write.
+ * The REST route has no such hook, because its caller is the person clicking.
  */
-export async function applyHotLeadCallSettings(org: Organization, caller: HotLeadCallCaller, body: Record<string, unknown>): Promise<{ dto: HotLeadCallSettingsDto; config: HotLeadCallConfig }> {
+export async function applyHotLeadCallSettings(
+  org: Organization, caller: HotLeadCallCaller, body: Record<string, unknown>, beforeTurningOn?: (next: HotLeadCallConfig) => Promise<void>,
+): Promise<{ dto: HotLeadCallSettingsDto; config: HotLeadCallConfig }> {
   requireConfigure(org, caller);
   checkKeys(body);
   if (body._revision === undefined) throw new RevisionRequiredError();
@@ -433,6 +440,7 @@ export async function applyHotLeadCallSettings(org: Organization, caller: HotLea
     const reason = escalationOf(current, next);
     if (reason) throw new UnattendedRunError(`This needs a person to confirm in an interactive chat (${reason})`);
   }
+  if (next.enabled && !current?.enabled) await beforeTurningOn?.(next);
 
   const verification = verificationAfterTeamEdit(org.hotLeadCallVerification, next.team);
   try {

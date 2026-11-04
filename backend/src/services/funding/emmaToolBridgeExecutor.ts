@@ -65,6 +65,17 @@ export interface EmmaBridgeTurn {
   priorSearchCallCount?: number;
 }
 
+/** The most the instructions of newly installed skills may add to an install_skills answer (the relay's own result cap applies on top). */
+const SKILL_NOTE_MAX_CHARS = 60_000;
+
+/** `text` cut to at most `max` UTF-16 units without splitting a surrogate pair (an emoji must not end as half a character). */
+function cutOnCodePoint(text: string, max: number): string {
+  let end = max;
+  const last = text.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) end--; // a high surrogate whose low half would fall outside
+  return text.slice(0, end);
+}
+
 type ToolAccess = Awaited<ReturnType<typeof agentModeService.resolveRunToolAccess>>;
 
 interface EmmaRunState {
@@ -237,8 +248,16 @@ export class EmmaToolBridgeExecutor implements ToolBridgeDeps {
     if (!toolMessage || !entry) throw new Error("dispatcher produced no result for the call");
 
     const isError = entry.error !== undefined;
+    // install_skills: Emma's loop rebuilds the "Installed Skills:" block so the next model call of the turn has the new skills' instructions; a relayed turn
+    // has no such block, so the same lines travel with this answer (not with the persisted record: Emma does not persist them either).
+    let answerSuffix: string | undefined;
+    if (!isError && dispatched.skillsUpdated === true && call.name === "install_skills" && entry.result?.success === true) {
+      const note = await agentModeService.buildInstalledSkillsNote(run.sessionId, call.args?.skillIds, entry.result?.installedSkills);
+      if (note) answerSuffix = `\n\n${note.length > SKILL_NOTE_MAX_CHARS ? `${cutOnCodePoint(note, SKILL_NOTE_MAX_CHARS)}\n[the skill instructions were cut here]` : note}`;
+    }
     return {
       ...toBridgeContent(toolMessage.content),
+      ...(answerSuffix ? { answerSuffix } : {}),
       isError,
       // The loop's own rule (collectConfirmationPrompt): a successful result carrying
       // awaitingUserConfirmation. `requiresConfirmation` alone does not stop the turn.

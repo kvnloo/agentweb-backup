@@ -1034,6 +1034,73 @@ export class GoogleAdsService {
   }
 
   /**
+   * ENG-2804. Conversion GOALS (category~origin pairs) decide what smart bidding
+   * optimises. Codeless (WEBPAGE_CODELESS) and Universal Analytics actions refuse
+   * CONVERSION_ACTION UPDATE with MUTATE_NOT_ALLOWED, so the only API lever to stop
+   * them driving bidding is the goal's `biddable` flag — at the campaign level
+   * (CampaignConversionGoal) or the account default (CustomerConversionGoal).
+   * Update is the only mutate Google offers for either; nothing is created or removed.
+   */
+  async listConversionGoals(
+    userId: string, customerId: string, level: 'CAMPAIGN' | 'CUSTOMER', campaignId?: string,
+  ): Promise<Array<{ resourceName: string; campaign?: string; category: string; origin: string; biddable: boolean }>> {
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    const rows = await this.search(customerId, accessToken, this.conversionGoalQuery(level, campaignId), loginCustomerId);
+    return rows.map((r: any) => this.mapConversionGoal(level, r));
+  }
+
+  async updateConversionGoalBiddable(
+    userId: string, customerId: string, level: 'CAMPAIGN' | 'CUSTOMER', resourceName: string, biddable: boolean,
+  ): Promise<{ resourceName: string; stored: any; drift: ConversionActionDrift[] }> {
+    if (!resourceName) throw new Error('resource_name is required for conversion goal UPDATE.');
+    if (typeof biddable !== 'boolean') throw new Error('biddable (true/false) is required for conversion goal UPDATE.');
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    const resource = level === 'CAMPAIGN' ? 'campaignConversionGoals' : 'customerConversionGoals';
+    await this.mutate(customerId, accessToken, resource,
+      [{ update: { resourceName, biddable }, updateMask: 'biddable' }], loginCustomerId);
+
+    const field = level === 'CAMPAIGN' ? 'campaign_conversion_goal' : 'customer_conversion_goal';
+    const escaped = resourceName.replace(/'/g, "\\'");
+    const rows = await this.search(
+      customerId, accessToken,
+      `${this.conversionGoalQuery(level)} WHERE ${field}.resource_name = '${escaped}'`,
+      loginCustomerId,
+    );
+    const stored = rows.length > 0 ? this.mapConversionGoal(level, rows[0]) : null;
+    const drift: ConversionActionDrift[] = [];
+    if (!stored || stored.biddable !== biddable) {
+      drift.push({ field: 'biddable', requested: biddable, stored: stored ? stored.biddable : undefined } as ConversionActionDrift);
+    }
+    return { resourceName, stored, drift };
+  }
+
+  private conversionGoalQuery(level: 'CAMPAIGN' | 'CUSTOMER', campaignId?: string): string {
+    if (level === 'CAMPAIGN') {
+      const base = 'SELECT campaign_conversion_goal.resource_name, campaign_conversion_goal.campaign, '
+        + 'campaign_conversion_goal.category, campaign_conversion_goal.origin, campaign_conversion_goal.biddable '
+        + 'FROM campaign_conversion_goal';
+      if (campaignId !== undefined) {
+        if (!/^\d+$/.test(String(campaignId))) throw new Error(`campaign_id must be numeric, got ${campaignId}.`);
+        return `${base} WHERE campaign.id = ${campaignId}`;
+      }
+      return base;
+    }
+    return 'SELECT customer_conversion_goal.resource_name, customer_conversion_goal.category, '
+      + 'customer_conversion_goal.origin, customer_conversion_goal.biddable FROM customer_conversion_goal';
+  }
+
+  private mapConversionGoal(level: 'CAMPAIGN' | 'CUSTOMER', row: any) {
+    const g = (level === 'CAMPAIGN' ? row?.campaignConversionGoal : row?.customerConversionGoal) || {};
+    return {
+      resourceName: g.resourceName,
+      ...(level === 'CAMPAIGN' ? { campaign: g.campaign } : {}),
+      category: g.category,
+      origin: g.origin,
+      biddable: g.biddable === true,
+    };
+  }
+
+  /**
    * Retire a conversion action. Google models this as a soft state, not a delete: the
    * action stops recording, and conversions it already recorded stay in reporting — the
    * same way a REMOVED campaign still returns its historical metrics.

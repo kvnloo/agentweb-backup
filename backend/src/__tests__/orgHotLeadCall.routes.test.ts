@@ -5,7 +5,9 @@ import { join } from 'path';
 
 jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn() }, orgDb: { getOrgById: jest.fn(), updateOrg: jest.fn() } }));
 jest.mock('../services/usageRecorderService', () => ({ recordVendorUsage: jest.fn().mockResolvedValue(undefined) }));
+jest.mock('../services/chatbotService', () => ({ chatbotDb: { getChatSession: jest.fn(), claimMetaWriteManifestDigest: jest.fn() } }));
 import { orgDb, userDb } from '../services/db';
+import { chatbotDb } from '../services/chatbotService';
 import routes from '../routes/orgHotLeadCall';
 import { hotLeadCallRevisionOf } from '../services/hotLeadCallSettingsService';
 import { setHotLeadCallEntitledOverride } from '../services/voice/hotLeadCallEntitlement';
@@ -158,6 +160,9 @@ describe('PUT /', () => {
     const res = await api().put(BASE).send({ _revision: rev(), enabled: true });
     expect(res.status).toBe(200);
     expect(res.body.enabled).toBe(true);
+    // The person's click in the portal is the approval: no chat card is asked for or claimed.
+    expect(chatbotDb.getChatSession).not.toHaveBeenCalled();
+    expect(chatbotDb.claimMetaWriteManifestDigest).not.toHaveBeenCalled();
   });
   it('lets a brand-new org add people without calling hours', async () => {
     delete table.org.hotLeadCall;

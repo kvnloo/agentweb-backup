@@ -25,7 +25,7 @@ const base = () => ({
   uidMax: 410_000,
   socket: { dir: "/run/aw-login-host-test1", gid: 990 },
   egress: { allow: ["api.anthropic.com:443", "platform.claude.com:443", "claude.ai:443"] },
-  claude: { binaryPath: "/opt/aw-claude/2.1.294/claude", expectedSha256: "a".repeat(64), version: "2.1.294", systemPromptFile: "/opt/aw-login-host/system-prompt.txt", bridgeUrl: "http://127.0.0.1:3001/internal/tool-bridge/run/mcp" },
+  claude: { binaryPath: "/opt/aw-claude/2.1.294/claude", expectedSha256: "a".repeat(64), version: "2.1.294", systemPromptFile: "/opt/aw-login-host/system-prompt.txt", nodePath: "/opt/aw-node/v22.23.3/bin/node", bridgeUrl: "http://127.0.0.1:3001/internal/tool-bridge/run/mcp" },
 });
 const bad = (over: Record<string, unknown>) => () => parseHostConfig({ ...base(), ...over });
 
@@ -72,7 +72,31 @@ describe("host config (a CLOSED schema)", () => {
     expect(c.limits).toEqual({ memoryMax: "1G", tasksMax: 256, tmpSize: "128M", shmSize: "64M", runtimeMaxSec: 7200, stopGraceSec: 10 });
     expect(c.tools.systemRun).toBe("/usr/bin/systemd-run");
     expect(c.claude.turnWrapperPath).toBe("/opt/aw-login-host/claude-turn.sh");
+    expect(c.claude.relayShimPath).toBe("/opt/aw-login-host/aw-relay-shim.js");
+    expect(c.claude.nodePath).toBe("/opt/aw-node/v22.23.3/bin/node");
+    expect(c.relayRoot).toBe("/run/aw-relay-test1");
     expect(c.socket.mode).toBe(0o660);
+  });
+  it("MUTATION TARGET: deploy/host-config.example.json parses once its one placeholder (the binary sha256) is filled in: it names the required claude.nodePath", () => {
+    const text = readFileSync(join(__dirname, "..", "..", "deploy", "host-config.example.json"), "utf8").replace("<sha256 of that exact binary: sha256sum>", "a".repeat(64));
+    const c = parseHostConfig(JSON.parse(text));
+    expect(c.claude.nodePath).toMatch(/^\/opt\/aw-node\/v[0-9.]+\/bin\/node$/);
+  });
+
+  it("MUTATION TARGET: claude.nodePath is REQUIRED (the old default /usr/bin/node is a symlink on the worker: a hand-written config would pass parsing and then crash-loop at the trusted-path check)", () => {
+    const c = base() as { claude: Record<string, unknown> };
+    const noNode = { ...c, claude: { ...c.claude } };
+    delete noNode.claude.nodePath;
+    expect(() => parseHostConfig(noNode)).toThrow(/claude\.nodePath/);
+    expect(() => parseHostConfig({ ...c, claude: { ...c.claude, nodePath: "usr/bin/node" } })).toThrow(HostConfigError);
+    expect(parseHostConfig(c).claude.relayShimPath).toBe("/opt/aw-login-host/aw-relay-shim.js"); // the shim keeps its default (the installer renders it into the release)
+  });
+  it("MUTATION TARGET: toolCallTimeoutMs is bounded at 1 h (a larger value overflows setTimeout and fires at once)", () => {
+    const c = base() as { manager?: Record<string, unknown> };
+    expect(parseHostConfig({ ...c, manager: { toolCallTimeoutMs: 3_600_000 } }).manager.toolCallTimeoutMs).toBe(3_600_000);
+    expect(() => parseHostConfig({ ...c, manager: { toolCallTimeoutMs: 3_600_001 } })).toThrow(HostConfigError);
+    expect(() => parseHostConfig({ ...c, manager: { toolCallTimeoutMs: 2 ** 31 } })).toThrow(HostConfigError);
+    expect(() => parseHostConfig({ ...c, manager: { toolCallTimeoutMs: 999 } })).toThrow(HostConfigError);
   });
   it("requires an egress policy (a host with no allowlist does not start) and derives the proxy socket path", () => {
     const noEgress: Record<string, unknown> = { ...base() };

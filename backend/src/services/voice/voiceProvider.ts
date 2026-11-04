@@ -32,6 +32,11 @@ export interface BuyNumberParams {
   /** ISO 3166-1 alpha-2, e.g. 'US'. */
   countryCode: string;
   areaCode?: string;
+  /**
+   * Where Twilio fetches TwiML when someone calls the new number (POST). Without it the number rings a Twilio
+   * demo message, so provisioning always passes the inbound-callback URL (see inboundVoiceUrl).
+   */
+  voiceUrl?: string;
 }
 
 export interface ValidateSignatureParams {
@@ -39,6 +44,13 @@ export interface ValidateSignatureParams {
   url: string;
   params: Record<string, string>;
   signature: string | undefined;
+}
+
+/** What Twilio says about one call: its status ('completed', 'in-progress', 'no-answer', ...) and, once it ended, its length. */
+export interface FetchedCall {
+  status: string;
+  /** Absent while the call is live and for calls that never connected (Twilio leaves `duration` empty for those). */
+  durationSeconds?: number;
 }
 
 /**
@@ -66,6 +78,8 @@ export interface VoiceProvider {
    */
   ensureCredentials(): Promise<void>;
   placeCall(p: PlaceCallParams): Promise<{ callSid: string }>;
+  /** Read-only: the call's current status and duration. Throws VoiceCallError (404 when Twilio has no such call). */
+  fetchCall(callSid: string): Promise<FetchedCall>;
   buyNumber(p: BuyNumberParams): Promise<{ numberSid: string; phoneNumber: string }>;
   releaseNumber(numberSid: string): Promise<void>;
   validateSignature(p: ValidateSignatureParams): boolean;
@@ -214,6 +228,14 @@ class TwilioVoiceProvider implements VoiceProvider {
     });
   }
 
+  async fetchCall(callSid: string): Promise<FetchedCall> {
+    return this.run('fetchCall', ` ${callSid}`, async (client) => {
+      const call = await client.calls(callSid).fetch();
+      const seconds = call.duration === null || call.duration === '' ? NaN : Number(call.duration);
+      return { status: call.status, ...(Number.isFinite(seconds) && seconds >= 0 ? { durationSeconds: seconds } : {}) };
+    });
+  }
+
   async buyNumber(p: BuyNumberParams): Promise<{ numberSid: string; phoneNumber: string }> {
     // Reject before spending anything: Number('') or Number('1e3') would otherwise be searched as a real area code.
     if (p.areaCode !== undefined && !/^\d{3}$/.test(p.areaCode)) {
@@ -226,7 +248,10 @@ class TwilioVoiceProvider implements VoiceProvider {
         limit: 1,
       });
       if (!available) throw new VoiceCallError(`No voice-enabled number available for ${p.countryCode}${p.areaCode ? `/${p.areaCode}` : ''}`, 'no');
-      const bought = await client.incomingPhoneNumbers.create({ phoneNumber: available.phoneNumber });
+      const bought = await client.incomingPhoneNumbers.create({
+        phoneNumber: available.phoneNumber,
+        ...(p.voiceUrl ? { voiceUrl: p.voiceUrl, voiceMethod: 'POST' } : {}),
+      });
       // A 2xx without a sid still means the purchase may have happened: an orphan number.
       if (typeof bought.sid !== 'string' || !bought.sid) {
         throw new VoiceCallError('Twilio buyNumber response carried no number sid; a number may have been bought', 'unknown');

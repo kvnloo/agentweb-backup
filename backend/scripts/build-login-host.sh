@@ -11,7 +11,7 @@
 # material. Reproducible for a given commit (mtime = commit time, sorted names, no gzip timestamp).
 #
 # THE BUILD IS THE GATE. It refuses to package when
-#   - the repo's own gate tests fail (deploy scripts, host, mutual TLS, drain)                      override: --skip-tests   (recorded in the MANIFEST)
+#   - the repo's own gate tests fail (deploy scripts, host, tool relay, adapter, shim, wrapper, stream guards, mutual TLS, drain)                      override: --skip-tests   (recorded in the MANIFEST)
 #   - anything under backend/ is uncommitted                                                    override: --allow-dirty (recorded in the MANIFEST)
 #   - a package that ends up in the bundle is not the version package-lock.json pins            override: --allow-dirty (recorded in the MANIFEST)
 set -euo pipefail
@@ -71,7 +71,10 @@ elif [ "$SKIP_TESTS" = 1 ]; then
   echo "build-login-host: WARNING: the gate tests were SKIPPED (--skip-tests); this is recorded in the MANIFEST" >&2
 else
   echo "build-login-host: running the gate tests"
-  npx --no-install jest src/loginHost/__tests__/deploy src/loginHost/__tests__/host src/services/funding/__tests__/loginHostMutualTls.test.ts --silent \
+  # Besides the deploy scripts, the host and mutual TLS, the gate runs the tool relay's tests: the relay (socket, limits, abuse; "__tests__/relay" also matches the shim and
+  # protocol tests), the Claude adapter and its parser, the turn wrapper, the guards on the CLI's streams (with the fast, mocked-clock CPU meter pins), the connection manager and the HTTP server ("__tests__/connectionManager" and "__tests__/server"
+  # also match their split files), and the ports (the systemd unit arguments of a customer unit: a mutant that turned a read-only bind into a writable one passed this gate). Without them a mutant that leaves a relay directory behind, drops a guard, un-meters the stdout scan or removes the manager tick's catch passed this gate. (The slow real-process CPU suite, cpuBudget.test.ts, stays in the normal test run.)
+  npx --no-install jest src/loginHost/__tests__/deploy src/loginHost/__tests__/host src/loginHost/__tests__/relay src/loginHost/__tests__/claudeAdapter src/loginHost/__tests__/claudeParse src/loginHost/__tests__/wrapperManifest src/loginHost/__tests__/closePipes src/loginHost/__tests__/cpuPins src/loginHost/__tests__/drainAccount src/loginHost/__tests__/lineFuzz src/loginHost/__tests__/lineFlood src/loginHost/__tests__/deepLines src/loginHost/__tests__/connectionManager src/loginHost/__tests__/server src/loginHost/__tests__/ports src/services/funding/__tests__/loginHostMutualTls.test.ts --silent \
     || { echo "build-login-host: ABORT: the gate tests failed; nothing was packaged" >&2; exit 1; }
 fi
 
@@ -137,10 +140,10 @@ fi
 if [ "$STAGE" != "$WORK/$NAME" ]; then mv "$STAGE" "$WORK/$NAME"; STAGE="$WORK/$NAME"; fi
 
 cp "$PROD/install.sh" "$PROD/deploy.sh" "$PROD/lib.sh" "$PROD/versions.env" "$STAGE/"
-cp "$DEPLOY/claude-turn.sh" "$DEPLOY/aw-net.sh" "$DEPLOY/aw-write-file.sh" "$DEPLOY/aw-login-host@.service" "$DEPLOY/aw-login-host-failed@.service" \
+cp "$DEPLOY/claude-turn.sh" "$DEPLOY/aw-net.sh" "$DEPLOY/aw-write-file.sh" "$DEPLOY/aw-relay-shim.js" "$DEPLOY/aw-login-host@.service" "$DEPLOY/aw-login-host-failed@.service" \
   "$PROD/host-config.template.json" "$PROD/system-prompt.txt" "$STAGE/files/"
 cp "$DEPLOY/aw-env.slice.example" "$STAGE/files/aw-env.slice.template"
-chmod 0755 "$STAGE/install.sh" "$STAGE/deploy.sh" "$STAGE/files/claude-turn.sh" "$STAGE/files/aw-net.sh" "$STAGE/files/aw-write-file.sh"
+chmod 0755 "$STAGE/install.sh" "$STAGE/deploy.sh" "$STAGE/files/claude-turn.sh" "$STAGE/files/aw-net.sh" "$STAGE/files/aw-write-file.sh" "$STAGE/files/aw-relay-shim.js"
 chmod 0644 "$STAGE/lib.sh"
 
 # Never ship key material.

@@ -83,6 +83,10 @@ jobs:
       - name: Agent Mode wiring invariant
         working-directory: backend
         run: node --max-old-space-size=4096 node_modules/.bin/jest --runInBand --forceExit src/__tests__/loops.agentModeWiring.test.ts
+      # Mock-only (no secrets, no database). Every registered tool must fit the plan route's limits: docs/plan-route-tool-limits.md
+      - name: Plan route tool limits
+        working-directory: backend
+        run: node --max-old-space-size=4096 node_modules/.bin/jest --runInBand --forceExit src/services/funding/__tests__/relayManifest.registry.test.ts
 
   partner-build:
     name: Partner portal build

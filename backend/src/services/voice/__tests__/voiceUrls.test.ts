@@ -1,4 +1,4 @@
-import { buildVoiceWebhookUrl, isWebhookSafeId, voiceWebhookBaseUrl } from '../voiceUrls';
+import { buildInboundWebhookUrl, buildVoiceWebhookUrl, inboundVoiceUrl, isWebhookSafeId, voiceWebhookBaseUrl } from '../voiceUrls';
 
 const ctx = { listId: 'list 1', leadId: 'lead&id=2', jobKey: 'a/b?c#d' };
 
@@ -85,5 +85,29 @@ describe('isWebhookSafeId', () => {
   });
   it.each(['', 'a@b.com', 'a+b', 'a b', 'a/b', 'a?b', 'a&b', 'x'.repeat(201), 'é'])('rejects %j', (id) => {
     expect(isWebhookSafeId(id)).toBe(false);
+  });
+});
+
+describe('inbound callback URLs', () => {
+  const env = { ...process.env };
+  afterEach(() => { process.env = { ...env }; });
+
+  it('the number voice URL is the inbound entry point with no query', () => {
+    process.env.BACKEND_URL = 'https://api.example.com/';
+    expect(inboundVoiceUrl()).toBe('https://api.example.com/api/webhooks/twilio-voice/inbound');
+  });
+
+  it('throws when BACKEND_URL is missing in a deployed environment, so a purchase never starts without it', () => {
+    delete process.env.BACKEND_URL;
+    Object.assign(process.env, { NODE_ENV: 'production' });
+    expect(() => inboundVoiceUrl()).toThrow(/BACKEND_URL/);
+  });
+
+  it.each(['inbound-screen', 'inbound-screen-result', 'inbound-dial', 'inbound-status'] as const)('builds the %s URL with only the org and the members tried', (kind) => {
+    process.env.BACKEND_URL = 'https://api.example.com';
+    const url = new URL(buildInboundWebhookUrl(kind, { orgId: 'org-a', tried: ['maaaaaaa', 'mbbbbbbb'] }));
+    expect(url.origin + url.pathname).toBe(`https://api.example.com/api/webhooks/twilio-voice/${kind}`);
+    expect(Object.fromEntries(url.searchParams)).toEqual({ orgId: 'org-a', tried: 'maaaaaaa,mbbbbbbb' });
+    expect(url.hash).toBe(kind === 'inbound-status' ? '#rc=3&rp=5xx,ct' : '');
   });
 });

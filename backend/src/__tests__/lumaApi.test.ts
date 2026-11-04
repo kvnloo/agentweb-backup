@@ -400,6 +400,35 @@ describe('luma tools', () => {
     expect(r.message).toContain('cal-2');
   });
 
+  // ENG-2737: a Luma key can now be shared with the org. A teammate's shared calendar must not break the caller's own existing one.
+  it("uses the caller's single OWN calendar when a teammate's shared one is also visible, and still refuses to guess otherwise", async () => {
+    const own = lumaAccount({ account_id: 'cal-own', account_name: 'Mine', userId: 'user-1', config: { account_type: 'api_key', access_token: 'enc(owner):my-key', token_expires_at: Number.MAX_SAFE_INTEGER } });
+    const shared = lumaAccount({ account_id: 'cal-shared', account_name: 'Boss', userId: 'boss', sharedWithOrg: true, config: { account_type: 'api_key', access_token: 'enc(owner):boss-key', token_expires_at: Number.MAX_SAFE_INTEGER } });
+    fetchMock.mockResolvedValue(jsonResponse({ entries: [], has_more: false }));
+
+    mockGetAccounts.mockResolvedValue([shared, own]);
+    const r: any = await tool('luma_list_events')({}, { userId: 'user-1' });
+    expect(r.success).toBe(true);
+    expect(fetchMock.mock.calls[0][1].headers['x-luma-api-key']).toBe('my-key');
+
+    // an explicit calendar_id still reaches the shared one
+    fetchMock.mockClear();
+    await tool('luma_list_events')({ calendar_id: 'cal-shared' }, { userId: 'user-1' });
+    expect(fetchMock.mock.calls[0][1].headers['x-luma-api-key']).toBe('boss-key');
+
+    // two of the caller's own: ambiguous, asks
+    mockGetAccounts.mockResolvedValue([own, { ...own, account_id: 'cal-own-2' }, shared]);
+    const two: any = await tool('luma_list_events')({}, { userId: 'user-1' });
+    expect(two.success).toBe(false);
+    expect(two.message).toMatch(/calendar_id/);
+
+    // none of the caller's own, two shared: ambiguous, asks
+    mockGetAccounts.mockResolvedValue([shared, { ...shared, account_id: 'cal-shared-2' }]);
+    const none: any = await tool('luma_list_events')({}, { userId: 'user-1' });
+    expect(none.success).toBe(false);
+    expect(none.message).toMatch(/calendar_id/);
+  });
+
   it('flags a key as dead only after an independent call ALSO gets a 401, then reports it as a normal unavailable state', async () => {
     mockGetAccounts.mockResolvedValue([lumaAccount()]);
     fetchMock.mockResolvedValueOnce(jsonResponse({}, { status: 401 })).mockResolvedValueOnce(jsonResponse({}, { status: 401 }));
