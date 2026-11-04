@@ -104,6 +104,7 @@ export async function rehydrateAndServe(
     clientType: (req as any)._mcpClientType,
     userAgent: typeof req.get === "function" ? req.get("user-agent") : undefined,
     clientIp: req.ip,
+    apiKeyScopes: (req as any)._mcpApiKeyScopes,
   });
   await server.connect(transport);
 

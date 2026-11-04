@@ -8,7 +8,7 @@ import { stripImageDataForPersistence } from "../agentMode/incrementalPersist";
 import { seedSearchCallCountFromHistory } from "../agentMode/core/toolDispatch";
 import { EMPTY_FINAL_RESPONSE_FALLBACK } from "../agentMode/core/termination";
 import { isCancelled } from "../../utils/sseProgress";
-import { ClaudeCodeBackend, newClaudeRunId } from "./claudeCodeBackend";
+import { ClaudeCodeBackend, legacyBridgeAllowed, newClaudeRunId } from "./claudeCodeBackend";
 import { claudeRunRegistry } from "./claudeRunRegistry";
 import { emmaToolBridgeExecutor, toolBridgeMcp } from "./toolBridgeService";
 import { runHostTurn } from "./loginHostTurn";
@@ -24,6 +24,14 @@ export const claudeCodeBackend = new ClaudeCodeBackend({
   trimToolMessages: (messages) => agentModeService.trimToolMessagesForContext(messages),
   runHostTurn,
   bridge: toolBridgeMcp,
+  // The tool relay (worker protocol >= 4 and a matching version check); anything else runs on the HTTP bridge as before.
+  relay: {
+    workerProtocol: () => getLoginHostProvider().workerProtocol(),
+    protocolStatus: () => getLoginHostProvider().protocolStatus(),
+    // Default refuse (production's HTTP bridge is a zero-tool stub). A dev or test box whose bridge serves real tools sets this to "true".
+    allowLegacyBridge: () => legacyBridgeAllowed(),
+    invalidateProtocol: () => getLoginHostProvider().invalidateProtocol(),
+  },
   executor: emmaToolBridgeExecutor,
   registry: claudeRunRegistry,
   isCancelled,

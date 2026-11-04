@@ -1,4 +1,5 @@
 import { createHash } from "crypto";
+import { hasVisibleText, sliceSafe, stripUnsafeChars } from "./smartleadSafeText";
 
 /**
  * Turns a Smartlead webhook body into one small, checked event (ENG-673, slice 3). Pure: no network, no storage.
@@ -16,6 +17,11 @@ export interface SmartleadEvent {
   /** Addresses that may be the contact, best guess first (lower case, deduplicated). */
   candidateEmails: string[];
   subject?: string;
+  /**
+   * What the contact wrote, without the thread quoted under it, for the owner's alert email only (never stored on the contact: the full reply
+   * stays in Smartlead). Plain text only, at most REPLY_TEXT_MAX characters. Absent when the payload has none (a polled reply never does).
+   */
+  replyText?: string;
   /** The reply's own address and the sending mailbox's, for the alert text. */
   from?: string;
   to?: string;
@@ -82,6 +88,54 @@ function canonicalJson(v: unknown): string {
   return JSON.stringify(v) ?? "null";
 }
 
+/** The most of a reply an event carries. The alert email shows less. */
+export const REPLY_TEXT_MAX = 1000;
+
+// Where the quoted thread under a reply starts: a quoted line, "On <date>, <name> wrote:" (which a mail client may wrap so that a single word or address, or
+// just "wrote:", is alone on the next line), the same in English, French, Spanish, German and Italian, an "Original Message" or underscore rule, or an
+// Outlook "From: ... Sent: ... To: ..." block. Every pattern is bounded, so none can take long on a hostile line.
+const QUOTED_LINE = /^\s*>/;
+const WROTE_HEADER = /^\s*(On|Le|El|Am|Il)\s.{3,300}$/;
+// German puts the name after the verb: "Am 03.11.2026 um 09:23 schrieb Max Mustermann <max@x.de>:".
+const WROTE_END = /(wrote|a \u00e9crit|escribi\u00f3|ha scritto)\s*:\s*$|schrieb\b[^:]{0,200}:\s*$/i;
+// The optional token group starts with a non-space, so the leading and the inner whitespace can never split the same run of spaces (that made an earlier form quadratic).
+const WROTE_NEXT = /^\s*(?:\S{1,120}\s*)?(wrote|a \u00e9crit|escribi\u00f3|schrieb|ha scritto)\s*:\s*$/i;
+const GERMAN_NEXT = /^\s*\S{0,120}:\s*$/;
+const ORIGINAL_RULE = /^\s*(-{2,}\s*(original message|forwarded message)\s*-{2,}|_{10,})\s*$/i;
+const OUTLOOK_FROM = /^\s*From:\s.+/i;
+const OUTLOOK_FIELD = /^\s*(Sent|Date|To|Cc|Subject):\s/i;
+/** Only this much of a reply is read at all (the webhook body may be 256 KB, and a reply is a few paragraphs). */
+const REPLY_SCAN_MAX = 10_000;
+/** Most lines of a reply kept. */
+const REPLY_LINES_MAX = 40;
+
+/**
+ * What the contact wrote in a reply, from the payload's plain text (`reply_message.text`, else `preview_text`). The HTML copies are never
+ * used. Only the first REPLY_SCAN_MAX characters are read; the quoted thread is cut off at its first marker; control, zero-width and
+ * direction-changing characters go; blank runs shrink; the result is capped. Linear in its input. Undefined when nothing visible is left (a
+ * reply that is only quoted text or invisible characters, or a payload with no text).
+ */
+export function replyExcerpt(body: Record<string, unknown>): string | undefined {
+  const message = body.reply_message && typeof body.reply_message === "object" ? (body.reply_message as Record<string, unknown>).text : undefined;
+  const raw = typeof message === "string" && message.trim() ? message : typeof body.preview_text === "string" ? body.preview_text : "";
+  if (!raw.trim()) return undefined;
+  const lines = stripUnsafeChars(sliceSafe(raw, REPLY_SCAN_MAX)).replace(/\r\n?/g, "\n").split("\n");
+  const kept: string[] = [];
+  for (let i = 0; i < lines.length && kept.length < REPLY_LINES_MAX; i++) {
+    const line = lines[i];
+    if (QUOTED_LINE.test(line) || ORIGINAL_RULE.test(line)) break;
+    if (WROTE_HEADER.test(line)) {
+      const next = lines[i + 1] ?? "";
+      if (WROTE_END.test(line) || (line.trim().length >= 15 && (WROTE_NEXT.test(next) || (/\bschrieb\b/i.test(line) && GERMAN_NEXT.test(next))))) break;
+    }
+    if (OUTLOOK_FROM.test(line) && lines.slice(i + 1, i + 6).filter(l => OUTLOOK_FIELD.test(l)).length >= 2) break;
+    kept.push(line.trimEnd());
+  }
+  const text = kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  if (!text || !hasVisibleText(text)) return undefined;
+  return text.length > REPLY_TEXT_MAX ? `${sliceSafe(text, REPLY_TEXT_MAX - 1).trimEnd()}\u2026` : text;
+}
+
 export function parseSmartleadEvent(body: unknown): ParseResult {
   if (!body || typeof body !== "object" || Array.isArray(body)) return { ok: false, reason: "not_an_object" };
   const b = body as Record<string, unknown>;
@@ -112,6 +166,7 @@ export function parseSmartleadEvent(body: unknown): ParseResult {
   const notTheContacts = b.is_sender_originated_bounce === true || b.is_bounced === false;
   const soft = kind === "bounce" && (notTheContacts || /(soft|temporary|transient)/.test(bounceType ?? "") || (!/(hard|permanent)/.test(bounceType ?? "") && !!reasonText && SOFT.test(reasonText) && !HARD.test(reasonText)));
 
+  const replyText = kind === "reply" ? replyExcerpt(b) : undefined;
   const sequence = str(String(b.sequence_number ?? b.seq_number ?? "")) ?? "";
   // `event_id` is unique per event and the same on every retry of it (it is also the `webhook-id` header): the best identity there is.
   const messageId = str(b.event_id ?? b.message_id ?? b.messageId ?? b.stats_id ?? b.email_stats_id ?? b.sl_email_lead_id) ?? "";
@@ -127,6 +182,7 @@ export function parseSmartleadEvent(body: unknown): ParseResult {
     event: {
       kind, campaignId, candidateEmails,
       ...(kind === "reply" ? { subject: short(b.subject ?? b.email_subject, 200), from: candidateEmails[0], to: email(b.sl_senders_mailbox) ?? email(b.from_email) } : {}),
+      ...(replyText ? { replyText } : {}),
       ...(occurredAt ? { occurredAt } : {}),
       soft,
       ...(reasonText ? { reason: reasonText } : {}),

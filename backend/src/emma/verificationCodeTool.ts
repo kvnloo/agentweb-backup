@@ -62,11 +62,35 @@ function sanitizeQueryTerm(value: string): string {
  * precise freshness cut is applied locally against `since`, so a wide query
  * costs nothing in correctness.
  */
-function buildGmailQuery(subjectContains?: string, fromContains?: string): string {
+function buildGmailQuery(subjectContains?: string, fromContains?: string, deliveredTo?: string): string {
   const parts = ['newer_than:1d'];
   if (subjectContains) parts.push(`subject:"${sanitizeQueryTerm(subjectContains)}"`);
   if (fromContains) parts.push(`from:${sanitizeQueryTerm(fromContains)}`);
+  if (deliveredTo) parts.push(`deliveredto:"${sanitizeQueryTerm(deliveredTo)}"`);
   return parts.join(' ');
+}
+
+/**
+ * ENG-944: normalise a role/alias address (founders@, support@) the code was
+ * sent to. Only a bare address is accepted — anything else is ignored rather
+ * than turned into a loose substring filter.
+ */
+export function normalizeDeliveredTo(raw: unknown): string {
+  if (typeof raw !== 'string') return '';
+  const value = raw.trim().toLowerCase();
+  return /^[^\s@<>",]+@[^\s@<>",]+\.[^\s@<>",]+$/.test(value) ? value : '';
+}
+
+/**
+ * ENG-944: was this message addressed to the role address? Matched on whole
+ * addresses in To/Cc, so "founders@agentweb.pro" never matches
+ * "cofounders@agentweb.pro".
+ */
+export function addressedTo(detail: any, address: string): boolean {
+  if (!address) return true;
+  const recipients = `${detail?.to ?? ''},${detail?.cc ?? ''}`.toLowerCase();
+  const found = recipients.match(/[^\s@<>",;:]+@[^\s@<>",;]+/g) || [];
+  return found.some((candidate) => candidate.replace(/[.>]+$/, '') === address);
 }
 
 function parsedTime(value: unknown): number {
@@ -223,6 +247,13 @@ emmaToolRegistry.register({
             'It is not inferred from the email: the expected domain has to come from you, or a spoofed sender would ' +
             'choose where you get sent. A link pointing anywhere else is ignored, not returned.',
         },
+        delivered_to: {
+          type: 'string',
+          description:
+            'The role/alias address the site sent the code to (e.g. "founders@agentweb.pro") when it is not itself a ' +
+            'connected account but is delivered into one. The connected mailbox (account_id, or the default) is searched ' +
+            'for mail delivered to that address, and only an email addressed to it is accepted.',
+        },
         search_query: {
           type: 'string',
           description:
@@ -242,6 +273,14 @@ emmaToolRegistry.register({
     const alphanumeric = args?.alphanumeric === true;
     const returnLink = args?.return_link === true;
     const waitSeconds = resolveWaitSeconds(args?.wait_seconds);
+    const deliveredTo = normalizeDeliveredTo(args?.delivered_to);
+    if (args?.delivered_to !== undefined && args?.delivered_to !== null && !deliveredTo) {
+      return {
+        success: false,
+        reason: 'invalid_argument',
+        message: `delivered_to must be a single email address, got "${String(args.delivered_to)}". ${NO_FABRICATION_NOTE}`,
+      };
+    }
     const linkHost = typeof args?.link_host === 'string' ? args.link_host.trim().toLowerCase() : '';
     const invokedAt = Date.now();
     const hasExplicitSince = Boolean(args?.since) && !Number.isNaN(Date.parse(args?.since));
@@ -278,7 +317,14 @@ emmaToolRegistry.register({
         return {
           success: false,
           reason: 'no_email_account',
-          message: `${error?.message || 'Could not resolve that email account.'} ${NO_FABRICATION_NOTE}`,
+          message:
+            `${error?.message || 'Could not resolve that email account.'} ` +
+            (deliveredTo
+              ? ''
+              : `If "${String(args.account_id)}" is a role/alias address (e.g. founders@) that is delivered into a ` +
+                'connected mailbox, there is no mapping for it as an account: call again with ' +
+                `delivered_to="${String(args.account_id)}" and account_id set to the mailbox it is delivered into (or omitted). `) +
+            NO_FABRICATION_NOTE,
         };
       }
     } else {
@@ -358,7 +404,7 @@ emmaToolRegistry.register({
       const query = args?.search_query
         ? String(args.search_query)
         : platform === 'gmail'
-          ? buildGmailQuery(args?.subject_contains, args?.from_contains)
+          ? buildGmailQuery(args?.subject_contains, args?.from_contains, deliveredTo)
           : null;
 
       let searched: any[] = [];
@@ -406,7 +452,16 @@ emmaToolRegistry.register({
       if (!hasExplicitSince && arrival.withinGrace.length > 0) sawPreCallMatch = true;
 
       if (fresh.length > 0) {
-        const ids = fresh.slice(0, MAX_BODIES_PER_PASS).map((email: any) => email.id);
+        // ENG-944: when the summary already carries recipients, drop mail for
+        // other addresses BEFORE the body cap, so newer codes for other people
+        // cannot crowd the role-addressed one out of the fetched set. A summary
+        // without recipient headers is kept; the detail check below decides.
+        const candidates = deliveredTo
+          ? fresh.filter(
+              (email: any) => (email?.to === undefined && email?.cc === undefined) || addressedTo(email, deliveredTo)
+            )
+          : fresh;
+        const ids = candidates.slice(0, MAX_BODIES_PER_PASS).map((email: any) => email.id);
         let details: any[] = [];
         try {
           details = await provider.getEmails(mailboxUserId, accountId, ids);
@@ -418,8 +473,13 @@ emmaToolRegistry.register({
           };
         }
 
+        let sawAddressedDetail = false;
         for (const detail of details || []) {
           if (!detail || detail.error || !detail.body) continue;
+          // A code sent to a different address in the same mailbox belongs to
+          // a different login (ENG-944) — never hand it back for this one.
+          if (!addressedTo(detail, deliveredTo)) continue;
+          sawAddressedDetail = true;
           const summary = fresh.find((email: any) => email.id === detail.id);
           const code = extractVerificationCode(detail.body, { codeLength, alphanumeric });
 
@@ -477,7 +537,7 @@ emmaToolRegistry.register({
             account: { platform, account_id: accountId },
           };
         }
-        sawFreshMatchWithoutCode = true;
+        if (!deliveredTo || sawAddressedDetail) sawFreshMatchWithoutCode = true;
       }
 
       if (Date.now() + POLL_INTERVAL_MS > deadline) break;

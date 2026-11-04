@@ -17,6 +17,7 @@ import {
   CERT_WARN_DAYS, CERT_WARN_EVERY_MS, clientCertNotAfterMs, daysUntil, defaultBuild, defaultSecretName, isPrivateIPv4, LoginHostProvider, LOGIN_HOST_SETTING_NAME, parseClientMaterial, parseLoginHostSetting,
   parseLoginHostSettingDetailed, PROTOCOL_RECHECK_MS, REFRESH_INTERVAL_MS, RETRY_AFTER_FAILURE_MS, SECRET_TTL_MS,
   type LoginHostProviderDeps,
+  INVALIDATE_COOLDOWN_MS,
 } from "../loginHostProvider";
 
 const PEM = (kind: string, body: string) => `-----BEGIN ${kind}-----\n${body.padEnd(40, "A")}\n-----END ${kind}-----\n`;
@@ -314,6 +315,69 @@ describe("worker protocol check (host.info)", () => {
     await settle(p);
     expect(p.protocolStatus()).toBe("match");
     expect(p.workerProtocol()).toBe(PROTOCOL_VERSION);
+  });
+
+  it("invalidateProtocol (the worker contradicted the cache: a rollback) forgets 'match / 4' at once and asks host.info again", async () => {
+    let answer = 4;
+    let asked = 0;
+    const p = mk(async () => (asked++, { protocol: answer, node: "v22", uptimeSec: 1 }));
+    await settle(p);
+    expect([p.protocolStatus(), p.workerProtocol()]).toEqual(["match", 4]);
+    answer = 3; // the worker was rolled back
+    now += 1_000; // far inside the 10 minute recheck window: without the invalidation the cache would still say 4
+    await settle(p);
+    expect(p.workerProtocol()).toBe(4);
+    const before = asked;
+    p.invalidateProtocol();
+    expect(p.protocolStatus()).toBe("unknown"); // fail closed until the answer arrives
+    await new Promise((r) => setImmediate(r));
+    expect(asked).toBe(before + 1);
+    expect([p.protocolStatus(), p.workerProtocol()]).toEqual(["match", 3]);
+  });
+
+  it("a check that started BEFORE the invalidation cannot write its stale 'match / 4' back over the invalidation; the fresh check decides", async () => {
+    const waiting: Array<(v: { protocol: number; node: string; uptimeSec: number }) => void> = [];
+    let first = true;
+    const p = mk(async () => {
+      if (first) {
+        first = false;
+        return { protocol: 4, node: "v22", uptimeSec: 1 };
+      }
+      return new Promise((resolve) => waiting.push(resolve));
+    });
+    await settle(p);
+    now += 11 * 60_000; // past the recheck window: the next refresh starts a check (stale-able)
+    void p.refresh();
+    await new Promise((r) => setImmediate(r));
+    expect(waiting).toHaveLength(1); // the old check is in flight
+    p.invalidateProtocol();
+    expect(p.protocolStatus()).toBe("unknown");
+    await new Promise((r) => setImmediate(r));
+    expect(waiting).toHaveLength(2); // and a fresh one was started, not blocked behind it
+    waiting[0]({ protocol: 4, node: "v22", uptimeSec: 1 }); // the stale answer arrives first
+    await new Promise((r) => setImmediate(r));
+    expect(p.protocolStatus()).toBe("unknown"); // ignored
+    waiting[1]({ protocol: 3, node: "v22", uptimeSec: 1 });
+    await new Promise((r) => setImmediate(r));
+    expect([p.protocolStatus(), p.workerProtocol()]).toEqual(["match", 3]);
+  });
+
+  it("S7: a flood of invalidations costs one host.info per cool-down (a compromised worker cannot flap the fleet or make the backend hammer it)", async () => {
+    let asked = 0;
+    const p = mk(async () => (asked++, { protocol: 4, node: "v22", uptimeSec: 1 }));
+    await settle(p);
+    const base = asked;
+    for (let i = 0; i < 1000; i++) p.invalidateProtocol();
+    await new Promise((r) => setImmediate(r));
+    expect(asked - base).toBe(1);
+    expect(p.protocolStatus()).toBe("match"); // the one recheck answered 4: relaying goes on, no long unknown window
+    now += INVALIDATE_COOLDOWN_MS - 1;
+    for (let i = 0; i < 50; i++) p.invalidateProtocol();
+    expect(asked - base).toBe(1);
+    now += 2;
+    p.invalidateProtocol();
+    await new Promise((r) => setImmediate(r));
+    expect(asked - base).toBe(2);
   });
 
   it("a version outside the accepted set is a logged 'mismatch' (never fatal: the client is still returned)", async () => {

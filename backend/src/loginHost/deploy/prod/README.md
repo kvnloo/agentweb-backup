@@ -67,8 +67,18 @@ The newest `RELEASES_KEEP` (3) releases and their TLS sets are kept; the active 
 Exit codes: `0` ok; `1` failed (the running host is untouched); `3` NOT installed/updated because `/etc/aw-login-host/bridge-url` is missing or not an https URL.
 
 ## Memory ceiling
-`aw-prod.slice` caps ALL customer units: `MemoryMax=3G`, `MemoryHigh=2800M` (`versions.env` `SLICE_*`). t3.medium has 4 GiB and no swap. `maxTurnsPerHost` (8) x ~300 MB per Claude
-turn = ~2.4 GB, plus ~200 MB per sign-in process: it fits only just. If you raise `maxTurnsPerHost`, resize the instance AND the slice together.
+`aw-prod.slice` caps ALL customer units: `MemoryMax=3G`, `MemoryHigh=2800M` (`versions.env` `SLICE_*`). t3.medium has 4 GiB and no swap.
+
+- **Measured:** the node shim of a relay turn is about 45-50 MiB resident (manifests of 88 KiB to 1 MiB; the size hardly matters).
+- **Not measured:** the ~300 MB resident size of one Claude CLI per turn and the ~200 MB per sign-in process are estimates.
+- **What the arithmetic gives:** `maxTurnsPerHost` (8) x (300 + 50) MiB = 2800 MiB, which is exactly `MemoryHigh` (2800M) and leaves 272 MiB to `MemoryMax` (3G) (672 MiB without the shim). Two sign-ins at once (~200 MB each) would then exceed `MemoryMax` on a box with no swap. With the shim, 8 turns do NOT fit with headroom on these estimates.
+- **To do (live test):** measure the real resident size of a CLI turn; if 8 do not fit, lower `maxTurnsPerHost` (7?) or raise the instance. Neither is changed in this PR.
+
+If you raise `maxTurnsPerHost`, resize the instance AND the slice together.
+
+## Rolling back across the tool relay (protocol 4)
+Roll the BACKEND back (or switch its relay off) BEFORE rolling the worker back to a build that speaks protocol 3: a backend that still sends `tools` to a protocol-3 worker gets
+`EINVALID` on every relay turn until its protocol re-check (10 minutes) notices the downgrade. Deploy order is the other way round: the worker first, then the backend.
 
 ## RUNBOOK
 **Where to look first**: `journalctl -u aw-login-host@prod -u 'aw-login-host-failed@*' --since -1h` (shipped to CloudWatch log group `/agentweb/login-host/prod`).

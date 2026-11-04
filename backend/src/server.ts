@@ -1225,6 +1225,34 @@ createTestAccount().then(async () => {
         console.error('[numberRentCron] Failed to initialize:', error);
       }
 
+      // Hot-lead call stuck-record sweep (ENG-2271) — daily. Finds call records that stayed
+      // live longer than a call can last and settles them from Twilio's own record. Anchored to
+      // a fixed UTC hour like the rent sweep. REPORT-ONLY unless HOT_LEAD_CALL_STUCK_SWEEP=close;
+      // =off disables it.
+      try {
+        const { runStuckCallSweepCron } = await import('./cron/stuckCallSweepCron');
+        const { msUntilNextUtcHour } = await import('./utils/dailySchedule');
+        const STUCK_CALL_SWEEP_HOUR_UTC = 12;
+        const DAY_MS = 24 * 60 * 60 * 1000;
+        const msUntilFirstStuckCallSweepRun = msUntilNextUtcHour(STUCK_CALL_SWEEP_HOUR_UTC);
+        setTimeout(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('stuckCallSweepCron', runStuckCallSweepCron())
+            .catch(e => console.error('[stuckCallSweepCron] Error:', e));
+          setInterval(() => {
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('stuckCallSweepCron', runStuckCallSweepCron())
+              .catch(e => console.error('[stuckCallSweepCron] Error:', e));
+          }, DAY_MS);
+        }, msUntilFirstStuckCallSweepRun);
+        console.log(
+          `[stuckCallSweepCron] Initialized — first run at ${STUCK_CALL_SWEEP_HOUR_UTC}:00 UTC ` +
+          `(in ${Math.round(msUntilFirstStuckCallSweepRun / 60000)} min)`,
+        );
+      } catch (error) {
+        console.error('[stuckCallSweepCron] Failed to initialize:', error);
+      }
+
       // Pre-Renewal Ad-Integration Health Check (ENG-1270) — runs daily.
       // Charging a customer while their ad platform connection is silently dead
       // is a trust break (ThinkingAI, TransAmerica — Aug 2026 audit, both caught

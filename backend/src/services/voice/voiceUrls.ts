@@ -24,7 +24,7 @@ interface VoiceWebhookContext {
  * checked 2026-10-19): `rc` = retry count (0-5, default 1), `rp` = retry policy (default `ct`, i.e. only TCP connect /
  * TLS handshake failures, so a 5xx is NOT retried by default). `5xx,ct` retries a server error we answer, up to 3 times.
  * The fragment is never sent on the wire and Twilio omits it when signing, so req.originalUrl (what the webhook
- * validates against) has none. Only status callbacks get it: they carry the metering input and every handler is
+ * validates against) has none. Only status callbacks (and the inbound callback's member-leg status) get it: they carry the metering input and every handler is
  * idempotent on a redelivery. The TwiML fetches (/owner, /gather, /dial, /screen, /screen-result) happen while a person is on the line under
  * Twilio's 15 second cap for call requests, so a retry would not help them and they answer a hangup instead.
  */
@@ -60,4 +60,32 @@ function localhostFallbackOrThrow(): string {
     throw new Error('BACKEND_URL is not configured; cannot build a Twilio voice webhook URL');
   }
   return 'http://localhost:3001';
+}
+
+/** The inbound-callback steps, all served by the same router as the outbound ones (see routes/twilioVoiceWebhook.ts). */
+type InboundWebhookKind = 'inbound-screen' | 'inbound-screen-result' | 'inbound-dial' | 'inbound-status';
+
+interface InboundWebhookContext {
+  orgId: string;
+  /** Members already rung for this callback, in order; the last one is the member this step is about. */
+  tried: readonly string[];
+}
+
+/**
+ * The voice URL a caller number must point at so a callback reaches the inbound flow: the entry point, with no
+ * query (Twilio calls it with the caller's own request). A newly bought number is given this at purchase; one
+ * bought earlier has it set by hand in the Twilio console. Throws like buildVoiceWebhookUrl when BACKEND_URL is missing.
+ */
+export function inboundVoiceUrl(): string {
+  return `${voiceWebhookBaseUrl()}/api/webhooks/twilio-voice/inbound`;
+}
+
+/**
+ * URL for one step of an inbound callback. The call is stateless, so the signed query IS the state: the org and
+ * the members already tried. Only opaque ids travel in it, never a phone number. Like the outbound status URL,
+ * the metering callback carries the retry override.
+ */
+export function buildInboundWebhookUrl(kind: InboundWebhookKind, ctx: InboundWebhookContext): string {
+  const query = new URLSearchParams({ orgId: ctx.orgId, tried: ctx.tried.join(',') });
+  return `${voiceWebhookBaseUrl()}/api/webhooks/twilio-voice/${kind}?${query.toString()}${kind === 'inbound-status' ? STATUS_RETRY_FRAGMENT : ''}`;
 }

@@ -62,6 +62,7 @@ import { listDomains, CustomDomainRecord, SUBDOMAIN_BASE } from "../services/cus
 import { isExternalLandingPageRecord } from "../services/externalLandingPageCatalog";
 import { verifyLanderLiveMapping } from "../services/landerLiveMappingCheck";
 import { assertOwnedMetaPixel } from "../services/metaAccountCredentials";
+import { evaluateRequiredTestsGate } from "../services/publishGateVerifier";
 
 const router = Router();
 
@@ -2016,20 +2017,13 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
         `[LP GENERATION] ${owner}/${repoName} reported no check runs and no workflows, so no ` +
           `Tests check can exist — the required-Tests gate does not apply to this publish.`
       );
-    } else if (!testsCheck || testsCheck.status !== "completed" || testsCheck.conclusion === "cancelled") {
-      const message = !testsCheck
-        ? "Required Tests check has not started for this draft yet. Keep the draft and retry publish after GitHub starts it."
-        : testsCheck.conclusion === "cancelled"
-          ? "Required Tests check was cancelled for this draft. Keep the draft and retry publish after Tests runs again."
-        : "Required Tests check is still running for this draft. Keep the draft and retry publish when it completes."
-      return res.status(409).json({ error: "required_tests_pending", message });
-    } else if (testsCheck.conclusion !== "success") {
-      // Chained onto the branch above: when there is no CI, `testsCheck` is undefined and
-      // reading `.conclusion` here would throw.
-      return res.status(409).json({
-        error: "required_tests_failed",
-        message: "Required Tests check failed for this draft. Fix the draft and retry publish after Tests passes.",
-      });
+    } else {
+      // ENG-2794: decision lives in services/publishGateVerifier so the verifier harness
+      // exercises the exact same gate logic.
+      const gate = evaluateRequiredTestsGate(testsCheck, false);
+      if (!gate.allow) {
+        return res.status(gate.status).json({ error: gate.error, message: gate.message });
+      }
     }
 
     // A Tests result belongs only to the SHA inspected above. Pin every later

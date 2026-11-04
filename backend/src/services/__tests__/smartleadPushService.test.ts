@@ -75,6 +75,7 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
         listCampaigns: async () => [
           { id: 1, name: "Draft", status: "DRAFTED" }, { id: 2, name: "Live", status: "ACTIVE" }, { id: 3, name: "Old", status: "ARCHIVED" }, { id: 4, name: "Paused", status: "PAUSED" },
         ] as any,
+        getCampaignAnalytics: async (_k, id) => (sl.analyticsMissing ? null : ({ campaignId: id, name: "Q4", status: "ACTIVE", leadsInCampaign: 60, contactsEmailed: 50, emailsSent: 90, replies: 4, bounces: 2, unsubscribes: 1 })),
         getCampaign: async () => (sl.campaignMissing ? null : ({ id: CAMPAIGN, name: "Q4", status: sl.status, maxLeadsPerDay: 100, addUnsubscribeTag: sl.addUnsubscribeTag } as any)),
         getSequences: async () => { if (!sl.sequences) throw new SmartleadApiError("boom", 500); return sl.sequences; },
         getMailboxes: async () => [{ id: 1, email: "a@x.com", dailyLimit: 30 }],
@@ -153,6 +154,53 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
       expect(await e.svc.campaigns("nokey")).toMatchObject({ ok: false, status: 409, code: "not_connected" });
       e.flags.enabled = false;
       expect(await e.svc.campaigns("owner")).toMatchObject({ ok: false, status: 503 });
+    });
+  });
+
+  describe("campaignStats (ENG-2737)", () => {
+    it("reads one campaign's counters with the caller's own key and says which account answered", async () => {
+      const e = env();
+      const spy = jest.spyOn(e.deps.smartlead, "getCampaignAnalytics");
+      const r = (await e.svc.campaignStats("owner", CAMPAIGN)) as any;
+      expect(r).toMatchObject({ ok: true, connection: { accountId: "smartlead-owner", shared: false }, stats: { campaignId: CAMPAIGN, contactsEmailed: 50, emailsSent: 90, replies: 4, bounces: 2, unsubscribes: 1 } });
+      expect(spy).toHaveBeenCalledWith("key-of-owner", CAMPAIGN);
+    });
+
+    it("uses a teammate's shared connection when that is the only one, and says the account is shared", async () => {
+      const e = env();
+      e.deps.resolveKey = async () => ({ ok: true as const, apiKey: "key-of-boss", ownerUserId: "boss", accountId: "smartlead-boss", accountName: "Boss SL" });
+      const spy = jest.spyOn(e.deps.smartlead, "getCampaignAnalytics");
+      const r = (await e.svc.campaignStats("owner", CAMPAIGN)) as any;
+      expect(r).toMatchObject({ ok: true, connection: { accountId: "smartlead-boss", name: "Boss SL", shared: true } });
+      expect(spy).toHaveBeenCalledWith("key-of-boss", CAMPAIGN);
+    });
+
+    it("changes nothing: no run, no marker, no write to Smartlead", async () => {
+      const e = env();
+      const addLeads = jest.spyOn(e.sl, "addLeads");
+      await e.svc.campaignStats("owner", CAMPAIGN);
+      expect(addLeads).not.toHaveBeenCalled();
+      expect(e.unsub).not.toHaveBeenCalled();
+      expect(e.upd).not.toHaveBeenCalled();
+      expect(e.leads.every(l => !l.system || Object.keys(l.system).length === 0)).toBe(true);
+    });
+
+    it("refuses with no connection, for a campaign the account does not have, for a bad id, and while the switch is off", async () => {
+      const e = env();
+      expect(await e.svc.campaignStats("nokey", CAMPAIGN)).toMatchObject({ ok: false, status: 409, code: "not_connected" });
+      e.sl.analyticsMissing = true;
+      expect(await e.svc.campaignStats("owner", CAMPAIGN)).toMatchObject({ ok: false, status: 404, code: "campaign_not_found" });
+      e.sl.analyticsMissing = false;
+      expect(await e.svc.campaignStats("owner", 0)).toMatchObject({ ok: false, status: 400, code: "bad_request" });
+      expect(await e.svc.campaignStats("owner", 1.5)).toMatchObject({ ok: false, status: 400 });
+      e.flags.enabled = false;
+      expect(await e.svc.campaignStats("owner", CAMPAIGN)).toMatchObject({ ok: false, status: 503 });
+    });
+
+    it("turns a Smartlead refusal into a plain error, never counters", async () => {
+      const e = env();
+      e.deps.smartlead.getCampaignAnalytics = async () => { throw new SmartleadApiError("nope", 401); };
+      expect(await e.svc.campaignStats("owner", CAMPAIGN)).toMatchObject({ ok: false, status: 422, code: "key_rejected" });
     });
   });
 
@@ -968,6 +1016,24 @@ for (const [storeName, makeStore, enabled] of stores) (enabled ? describe : desc
       expect(await e.svc.status("owner", "no-such-run")).toMatchObject({ ok: false, status: 404 });
       expect(await e.svc.history("stranger", e.listId)).toMatchObject({ ok: false, status: 403 });
       expect((await e.svc.history("owner", e.listId)) as any).toMatchObject({ ok: true, runs: [{ runId: r.run.runId }] });
+    });
+
+    it("the run history carries what Smartlead reported (read from the runs, not the history index), and a failing read lists the run without it", async () => {
+      const e = env({ maxConcurrentWorkers: 0 });
+      const r = (await e.svc.start("owner", go((await approve(e)).token))) as any;
+      const runId = r.run.runId as string;
+      expect(((await e.svc.history("owner", e.listId)) as any).runs[0]).not.toHaveProperty("events");
+      await db.countContactEvent(runId, "replied");
+      await db.countContactEvent(runId, "unsubscribed");
+      await db.countContactEvent(runId, "unsubscribed");
+      expect(((await e.svc.history("owner", e.listId)) as any).runs[0]).toMatchObject({ runId, events: { replied: 1, bounced: 0, unsubscribed: 2 } });
+      const real = db.getRunEvents.bind(db);
+      (db as any).getRunEvents = async () => { throw new Error("read failed"); };
+      try {
+        expect((await e.svc.history("owner", e.listId)) as any).toMatchObject({ ok: true, runs: [{ runId }] });
+      } finally {
+        (db as any).getRunEvents = real;
+      }
     });
 
     it("pauses, resumes (the worker picks it up and finishes), and cancels", async () => {

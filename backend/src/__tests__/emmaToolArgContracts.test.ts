@@ -17,6 +17,30 @@ const schema = { type: 'object', additionalProperties: false, properties: {
 const run = (args: any, toolName = 'call_hubspot_api', inputSchema: any = schema) =>
   validateAndRepairToolArgs({ toolName, args, inputSchema, effect: 'read' });
 
+describe('call_hubspot_api observed shapes (ENG-2792)', () => {
+  const enumSchema = { ...schema, properties: { ...schema.properties, entity_type: { type: 'string',
+    enum: ['CAMPAIGN', 'EMAIL', 'FORM', 'LANDING_PAGE', 'BLOG_POST', 'WORKFLOW', 'SOCIAL', 'CONTACT_LIST', 'CONTACTS'] } } };
+  it.each([
+    [{action:'get',entity_type:'contacts'}, {entity_type:'CONTACTS',action:'LIST'}],
+    [{endpoint:'campaigns',action:'LIST'}, {entity_type:'CAMPAIGN',action:'LIST'}],
+    [{method:'GET',endpoint:'/crm/v3/objects/contacts?limit=5'}, {entity_type:'CONTACTS',action:'LIST'}],
+  ])('repairs %p', (raw, expected) => {
+    const result = run(raw, 'call_hubspot_api', enumSchema);
+    expect(result.status).not.toBe('invalid');
+    expect(result.args).toEqual(expected);
+  });
+  it('leaves unknown endpoints and non-GET raw calls for the actionable error', () => {
+    expect(run({endpoint:'/crm/v3/objects/deals'}, 'call_hubspot_api', enumSchema).status).toBe('invalid');
+    expect(run({method:'POST',endpoint:'/crm/v3/objects/contacts'}, 'call_hubspot_api', enumSchema).status).toBe('invalid');
+    expect(run({}, 'call_hubspot_api', enumSchema).status).toBe('invalid');
+  });
+  it('declared schema lists every entity the handler dispatches', () => {
+    const src = require('fs').readFileSync(require('path').join(__dirname, '../emma/tools.ts'), 'utf8');
+    const line = src.split('\n').find((l: string) => l.includes("'CONTACT_LIST'") && l.includes('entity_type:'));
+    expect(line).toContain("'CONTACTS'");
+  });
+});
+
 describe('production Emma argument contracts', () => {
   it('dispatches LIST_CONTACTS through the existing paginated contacts API', async () => {
     expect(await handleHubspotApi('user',{action:'LIST_CONTACTS',cursor:'prev'}))

@@ -59,9 +59,16 @@ describe('read_email scope gate', () => {
 });
 
 describe('read_email execution', () => {
-  it('refuses OAuth external callers outright, before any fetch', async () => {
-    await expect(mcpToolRegistry.execute('read_email', { account_id: 'a', action: 'list' }, OAUTH_CTX))
-      .rejects.toThrow(/only available to API keys/);
+  it('serves OAuth external callers (OAuth parity), own mailbox only', async () => {
+    await mcpToolRegistry.execute('read_email', { account_id: 'a', action: 'list' }, OAUTH_CTX);
+    expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
+      body: expect.objectContaining({ own_mailbox_only: true }),
+    }));
+  });
+
+  it('refuses anonymous external callers before any fetch', async () => {
+    await expect(mcpToolRegistry.execute('read_email', { account_id: 'a', action: 'list' }, { ...OAUTH_CTX, authMethod: 'anonymous' }))
+      .rejects.toThrow(/requires signing in/);
     expect(mockMcpFetch).not.toHaveBeenCalled();
   });
 

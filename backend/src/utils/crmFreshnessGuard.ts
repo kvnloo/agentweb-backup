@@ -19,6 +19,7 @@ export const CRM_FRESHNESS_TOOLS: readonly string[] = [
   'ask_crm',
   'get_lead_details',
   'get_leads_needing_followup',
+  'get_lead_conversation_statuses',
   'get_hot_leads',
 ];
 

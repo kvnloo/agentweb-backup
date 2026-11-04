@@ -25,6 +25,44 @@ function rec(adId: string, magnitude: number, overrides: Partial<Recommendation>
 const SRC = { sourceKind: 'run' as const, sourceId: 'run_123' };
 
 describe('ENG-1094 marketing-action producer', () => {
+  it('ENG-2775 shadow: observer receives risk classification; output unchanged', () => {
+    const seen: Array<{ id: string; risk: unknown }> = [];
+    const recs = [rec('a', 10), rec('b', 70)];
+    const withObs = candidatesFromRecommendations(recs, SRC, (c, risk) => seen.push({ id: c.scopeId, risk }));
+    expect(withObs).toEqual(candidatesFromRecommendations(recs, SRC));
+    expect(seen).toHaveLength(2);
+    expect(seen[0].risk).toMatchObject({ riskClass: 'creative_change', requiresApproval: true });
+  });
+
+  it('ENG-2775 shadow: a mutating or throwing observer cannot change candidates', () => {
+    const recs = [rec('a', 10), rec('b', 70)];
+    const expected = candidatesFromRecommendations(recs, SRC);
+    const got = candidatesFromRecommendations(recs, SRC, (c) => {
+      c.evidence.push('tampered');
+      c.priority.confidence = 'high';
+      (c as any).scopeId = 'x';
+      throw new Error('observer boom');
+    });
+    expect(got).toEqual(expected);
+  });
+
+  it('ENG-2775 shadow: a rejecting async observer is handled (no unhandled rejection)', async () => {
+    const unhandled = jest.fn();
+    process.on('unhandledRejection', unhandled);
+    try {
+      const recs = [rec('a', 10)];
+      const expected = candidatesFromRecommendations(recs, SRC);
+      const got = candidatesFromRecommendations(recs, SRC, (async () => {
+        throw new Error('async boom');
+      }) as any);
+      expect(got).toEqual(expected);
+      await new Promise((r) => setImmediate(r));
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      process.off('unhandledRejection', unhandled);
+    }
+  });
+
   it('maps a structured ledger recommendation to a valid contract candidate (no prose parsing)', () => {
     const [c] = candidatesFromRecommendations([rec('ad1', 60)], SRC);
     expect(c.actionType).toBe(CREATIVE_REFRESH_ACTION);

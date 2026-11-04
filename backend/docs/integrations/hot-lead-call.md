@@ -27,8 +27,8 @@ from Twilio's documentation.
   AW-Settings item directly. See [Turn it off](#turn-it-off).
 - **Turn off one org:** `update_hot_lead_call_settings({enabled: false})` (the org's
   owner/admin, through Emma), or set `hotLeadCall.enabled` to `false` on the org item.
-- **A call looks stuck or unbilled:** [Stuck records](#stuck-records) (how to
-  find them, what each state means, where the spend events live).
+- **A call looks stuck or unbilled:** [Stuck records](#stuck-records) (the daily
+  sweep and its `HOT_LEAD_CALL_STUCK_SWEEP` mode, what each state means, where the spend events live).
 - **A number may be billed but not recorded:** search the backend logs for
   `ORPHAN` (`ORPHAN number`, `ORPHAN RISK`), then [Orphan numbers](#orphan-numbers).
 - **Why no call happened:** the lead's timeline shows `call.skipped` with a
@@ -218,6 +218,101 @@ record, so each leg is metered while the record is still live and the LAST leg
 to be metered performs the terminal transition. A record therefore stays live
 until the final status callback of every dialed leg has arrived.
 
+## Inbound callbacks
+
+A lead who calls the org's number back (the number the member and lead calls were
+made from) is answered by the same feature, in the other direction: the team is
+rung and the caller is connected to the first member who accepts. It is
+stateless: no lead call record and no timeline event are created (the call store
+is keyed by lead, and an inbound caller is not necessarily one), and nothing is
+recorded or sent to voicemail.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant Caller as Lead calling back
+  participant Tw as Twilio
+  participant App as AgentWeb backend
+  participant M1 as Member 1
+  participant M2 as Member 2
+
+  Caller->>Tw: dials the org's number
+  Tw->>App: POST /inbound (the number's voice URL; signed; body To=org number)
+  Note over App: find org by number (60s cache), kill switch, config, plan; pick member 1 at this instant
+  App-->>Tw: Dial answerOnBridge callerId=org number, Number url=/inbound-screen (the caller hears ringing)
+  Tw->>M1: rings (25s)
+  M1-->>Tw: answers
+  Tw->>App: POST /inbound-screen (on the member's leg)
+  App-->>Tw: Gather: "<business>: a lead is calling back. Are you available to take the call? Press 1."
+  M1->>Tw: presses 2 (or nothing, or hangs up)
+  Tw->>App: POST /inbound-dial DialCallStatus=completed DialBridged=false
+  App-->>Tw: Dial to member 2 (priority order, availability re-evaluated now)
+  Tw->>M2: rings, M2 answers and presses 1
+  Tw->>App: POST /inbound-screen-result Digits=1
+  App-->>Tw: empty Response - Twilio bridges the caller and member 2
+  Tw->>App: POST /inbound-dial DialBridged=true (after the bridge ends) -> hangup
+  Tw->>App: POST /inbound-status (member 2's leg) completed + CallDuration -> metered once
+```
+
+Rules (all verified against `routes/twilioVoiceWebhook.ts` and `services/voice/inboundCallback.ts`):
+
+- **Finding the org.** The dialled number is the signed request's `To` (`Called` if `To` is empty). AW-Organizations has no
+  index on it, so `services/voice/inboundNumberIndex.ts` scans the orgs that hold a number (`orgDb.listHotLeadCallNumbers`,
+  projected to id and number) and keeps the result in memory per backend instance. One snapshot serves every lookup,
+  so an unknown number costs no scan of its own (that is the negative cache). The snapshot is refreshed stale-while-revalidate:
+  after 60 seconds the next call is still answered from the old snapshot while one background scan runs (shared, retried no sooner
+  than every 5 seconds after a failure, failures logged by error name only), so the scan is never in the call path. Only the first
+  lookup after a start, with no snapshot, waits for the scan; if that fails the call is refused and the failure is not cached.
+  A number bought or released within the last 60 seconds (longer while refreshes fail) is therefore not served yet. The snapshot only *locates* the org: the org is then
+  re-read (consistent read) and its live config decides, so a stale entry can only end in a refusal. A number stored on
+  two orgs is served to neither. No GSI and no data change was made.
+- **Fail closed.** Unknown number, kill switch off, config missing/invalid/disabled, the number no longer the org's, an
+  org without an owner, or a plan without the `hot_lead_call` feature: the caller hears "Sorry, we are unable to take your
+  call right now. Goodbye." and the call is hung up. Nobody is rung. An unexpected failure in a step is answered per step: `/inbound`
+  and `/inbound-dial` give the same message and hangup, `/inbound-screen` and `/inbound-screen-result` a bare `<Hangup/>` (which
+  moves on to the next member), and `/inbound-status` a 500 so Twilio redelivers.
+- **Who is rung.** `selectHotLeadCallCandidates` at the current instant: verified, inside their window and inside the
+  calling hours, in team priority order, skipping members already tried. At most `maxAttemptsPerLead` members are rung per
+  callback. Availability (windows, calling hours) is re-evaluated each time the next member is chosen, that is at `/inbound`
+  and at each `/inbound-dial` step. A member who has already picked up and presses 1 is connected even if their window closed
+  meanwhile (the outbound `/gather` does not re-check windows either). A member removed or un-verified meanwhile is still
+  refused: their screen and their "1" check the live team.
+- **Nobody available or accepting.** The caller hears "Sorry, nobody is available to take your call right now. Please try
+  again later. Goodbye." and the call is hung up. That also applies outside the calling hours.
+- **Only a 1 connects.** Anything else (another key, silence, a hang-up, voicemail, no answer, busy, failed) moves on to the next member.
+  A Dial that ends `completed` without `DialBridged=false` (unknown: might be a finished conversation) or `canceled` (the
+  caller hung up) rings nobody else.
+- **Stateless and bounded.** The state is the signed query of each step URL: `orgId` and `tried` (the member ids rung so far,
+  comma-separated, each `m` + 7 base-36 characters, unique, at most 5). Each step adds one member and the chain is
+  capped by `maxAttemptsPerLead`, so it always ends; a Twilio retry of a step repeats the same decision. The caller ID
+  of the member legs is the org's number (not the caller's, which can be withheld).
+- **Guard.** The same credentials -> signature steps as the outbound endpoints (`verifiedBody`), but with no lead
+  record: the org comes from the dialled number (`/inbound`, no query) or from the signed `orgId` (the other steps).
+  A bad signature is 401, unloadable credentials 503; a signed request with a malformed query, or whose handler fails,
+  is answered with the spoken refusal (`/inbound`, `/inbound-dial`) or a hangup (the member's screening steps) with 200;
+  `/inbound-status` acknowledges with 200 and answers 500 when the org read or billing fails (it carries the same retry override).
+  It is deliberately not gated on the kill switch, config or plan: the leg already happened and must still be billed.
+
+Metering: only the **member leg** is metered, with the existing `voice_minute_outbound` rate (it is an outbound call from our
+number), by `/inbound-status` (`CallStatus` terminal, with a `ParentCallSid`), idempotency key
+`twilio:voice:<member leg CallSid>:member`, billed to the org's owner. **The caller's own inbound leg is not metered yet**:
+the rate card has only `voice_minute_outbound`, and no inbound rate was agreed, so none was invented. Until Harsha
+allocates an `voice_minute_inbound` rate, inbound minutes are an unrecorded Twilio cost (the caller's leg lasts as long as the
+bridged conversation).
+
+Limits to know about:
+
+- **No cap on volume.** The outbound abuse limits (calls per hour/day, per-member cooldown, lead-phone dedupe) do **not** apply,
+  and there is no per-caller, hourly or daily cap of any kind: there is no lead, and anyone with the number can dial it. Each call
+  rings at most `maxAttemptsPerLead` members. The exposure is the member-leg minutes, billed to the org owner through the usage
+  ledger (and the same minutes on AgentWeb's Twilio bill), bounded only by Twilio's own geographic permissions and spend limits.
+  A separate ticket covers a cap; it is a go-live decision (item 15).
+- Callers are not screened or limited (no per-caller cap, no blocklist) and are not recorded in the lead timeline.
+- The member prompt is the org's `announcedName` only; visitor-supplied text is never spoken.
+- A freshly provisioned number is pointed at `/inbound` by `buyNumber` (`voiceUrl`, POST). A number bought **before** this
+  existed keeps its old voice URL until it is set by hand in the Twilio console (see [Go-live checklist](#go-live-checklist)).
+- Not verified against real Twilio (see [Not verified](#not-verified-without-a-real-twilio-account)).
+
 ## Components and file map
 
 All paths are under `backend/src/`.
@@ -237,11 +332,14 @@ All paths are under `backend/src/`.
 | Plan entitlement (the `hot_lead_call` subscription feature) | `services/voice/hotLeadCallEntitlement.ts` |
 | Abuse limits, per-member cooldown, slot reservation | `services/voice/hotLeadCallLimits.ts`, `services/voice/limitStore.ts` (DynamoDB), `__tests__/helpers/fakeLimitStore.ts` (tests) |
 | Call record (state machine storage) and timeline events | `services/voice/leadCallStore.ts`, `services/voice/leadCallStore.types.ts`, `__tests__/helpers/fakeLeadCallStore.ts` (tests) |
-| Twilio seam (`placeCall`, `buyNumber`, `releaseNumber`, `validateSignature`) | `services/voice/voiceProvider.ts` (the only file that imports `twilio`), `__tests__/helpers/fakeVoiceProvider.ts` (tests) |
-| Webhook URLs | `services/voice/voiceUrls.ts` |
+| Twilio seam (`placeCall`, read-only `fetchCall`, `buyNumber`, `releaseNumber`, `validateSignature`) | `services/voice/voiceProvider.ts` (the only file that imports `twilio`), `__tests__/helpers/fakeVoiceProvider.ts` (tests) |
+| Webhook URLs (outbound steps, the inbound steps and the number's voice URL `inboundVoiceUrl`) | `services/voice/voiceUrls.ts` |
 | TwiML builders (hand-built XML, XML-escaped) | `services/voice/twiml.ts` |
-| Webhook routes, mounted at `/api/webhooks/twilio-voice` | `routes/twilioVoiceWebhook.ts` (`/owner`, `/gather`, `/screen`, `/screen-result`, `/dial`, `/status`; `/owner` serves the prompt to the team member being rung, the name predates teams) |
+| Webhook routes, mounted at `/api/webhooks/twilio-voice` | `routes/twilioVoiceWebhook.ts` (`/owner`, `/gather`, `/screen`, `/screen-result`, `/dial`, `/status`; `/owner` serves the prompt to the team member being rung, the name predates teams; and the inbound-callback steps `/inbound`, `/inbound-screen`, `/inbound-screen-result`, `/inbound-dial`, `/inbound-status`) |
+| Inbound callbacks: context by dialled number, next member, query validation | `services/voice/inboundCallback.ts` |
+| Inbound callbacks: dialled number -> org (60 s in-process snapshot of a projected scan, `orgDb.listHotLeadCallNumbers`) | `services/voice/inboundNumberIndex.ts` |
 | Metering of a finished leg, the hand-over to the next member and the rule that finishes a call | `services/voice/callFinalisation.ts` |
+| Stuck-record sweep: finds live records older than a call can last and settles them from Twilio (daily; report-only unless `HOT_LEAD_CALL_STUCK_SWEEP=close`) | `services/voice/stuckCallSweep.ts`, `cron/stuckCallSweepCron.ts`, `crmDb.findLeadsBySystemRecord`; tests `__tests__/stuckCallSweep.test.ts`, `__tests__/hotLeadCall.e2e.stuckSweep.test.ts` |
 | Per-leg usage event | `services/voice/voiceUsage.ts` `recordCallUsage` -> `recordVendorUsage` |
 | Rate card and runtime rate overrides | `utils/vendorRateCard.ts`, `routes/adminVendorRates.ts` |
 | Twilio credentials | `utils/secretsManager.ts` `getTwilioCredentials` |
@@ -255,6 +353,7 @@ Tests worth knowing: `__tests__/hotLeadCall.e2e.test.ts` (the calls: real
 orchestrator + real webhooks + real store on an in-memory DB fake, signed with
 Twilio's own HMAC) and `__tests__/hotLeadCall.e2e.gates.test.ts` (gates, calling
 hours, dedupe, cooldown, caps and silent refusals) and
+`__tests__/hotLeadCall.e2e.inbound.test.ts` (inbound callbacks: priority, hand-over, caps, fail-closed gates, signatures, metering) and
 `__tests__/hotLeadCall.e2e.attempts.test.ts` (several members: the reference team,
 hand-over through the real next-attempt job, lead screening, replays across
 attempts, and the world changing between attempts), sharing
@@ -378,7 +477,7 @@ turns) with "This needs a person to confirm in an interactive chat".
   unchanged, BEFORE Twilio is called; a reservation whose purchase then fails
   still counts). A stored `hotLeadCallProvisioning` that is malformed makes both
   tools refuse ("Contact support"). A person must approve each purchase
-  ([Human approval](#human-approval-for-provision-and-release)); `confirm` is
+  ([Human approval](#human-approval-for-provision-release-and-turning-calling-on)); `confirm` is
   still accepted but ignored, because the model controls it. An ambiguous buy failure is
   logged as `ORPHAN RISK` and is not retried. The first month's rent is
   metered at purchase and later months by the daily rent sweep (see Metering).
@@ -400,36 +499,53 @@ Order of setup, which the tool text also teaches Emma:
 3. `start_hot_lead_call_verification`, then `confirm_hot_lead_call_verification`
    with the code the member heard.
 4. `update_hot_lead_call_settings({enabled: true})`. Refused unless a member's
-   phone is verified, a number is assigned and calling hours are set.
+   phone is verified, a number is assigned and calling hours are set; then the user
+   approves turning calling on on a card
+   ([Human approval](#human-approval-for-provision-release-and-turning-calling-on)).
 
 Cost bound through these tools: 2 purchases at the card's $1.15 plus 5
 verification calls at $0.014 is about $2.37 per org per day at the provisional
 rates. The first month's rent is metered at purchase; later months by the daily
 rent sweep.
 
-### Human approval for provision and release
+### Human approval for provision, release and turning calling on
 
-`provision_hot_lead_call_number` and `release_hot_lead_call_number` never act on the
-model's say-so. The first call halts the run with a one-question approval card
+`provision_hot_lead_call_number`, `release_hot_lead_call_number` and
+`update_hot_lead_call_settings` with `enabled: true` (only when it turns calling on)
+never act on the model's say-so. The first call halts the run with a one-question approval card
 (the same deck-of-one mechanism as `services/crmSequenceActivationGate.ts`; the
 logic is in `services/voice/hotLeadCallApprovalGate.ts`). The card states the
-monthly rent from the live rate card. After the person clicks approve, Emma
+monthly rent from the live rate card; for turning calling on it says that when a lead
+arrives from the landing page AgentWeb will phone the verified team member(s) (name and
+last 4 digits) from the org's number (last 4 digits) and then the lead, that calls are
+billed to the organization owner per minute at the live outbound rate (both the member's
+and the lead's call, each rounded up to a whole minute, as the metering does), the caps in
+force (`maxCallsPerHour`, `maxCallsPerDay`, `maxAttemptsPerLead`) and the calling hours with
+their timezone, taken from the settings about to be saved, and that calling can be turned
+off at any time. After the person clicks approve, Emma
 calls the tool again with the same arguments and it acts.
 
 - Order: the existing checks run first (unattended, arguments, owner/admin,
-  plan entitlement, saved settings, already has / has no number), so a caller who
+  plan entitlement, saved settings, already has / has no number; for turning calling
+  on, everything `applyHotLeadCallSettings` checks before its write: owner/admin,
+  revision, validation, plan, blockers and the unattended refusal), so a caller who
   is refused never sees a card. Then: a chat session must exist and be readable,
   must not be a scheduled session, and must not be a support/admin session acting
   as the customer (`isDelegatedAccess` / `isDelegatedAdmin`).
 - Binding: the approval is tied to a digest of the action, org, user, chat
-  session, the area code (or the number being released), the rent as quoted now
-  and the revision of the stored settings. A different area code, a rent change, a
-  settings change or another chat session (for example a branched one) needs a new
-  card. The card kind is `hot_lead_call_approval:<action>:<digest>:<nonce>`.
+  session, the area code (or the number being released, or the exact settings change
+  that turns calling on), the price as quoted now (rent, or the per-minute rate) and
+  the revision of the stored settings. A different area code, a different change, a
+  price change, a settings change between the card and the click or another chat
+  session (for example a branched one) needs a new card. The card kind is `hot_lead_call_approval:<action>:<digest>:<nonce>`.
 - Validity: the newest card for that digest must be answered "approve" by the
   user (never by "Let Emma decide", which the card does not offer), at most 15
   minutes ago, and not used yet. Declining, ignoring or letting it expire makes the
-  next call show a fresh card.
+  next call show a fresh card. An approval is spent when it is claimed, so a final
+  write that then loses a race or fails needs a new card (as for provision and release).
+- One card per identical change: if one reply repeats the same call (same digest), the deck
+  keeps a single card for it (`buildQuestionApprovalDeckFromHalts`), so answering it is
+  enough; two different changes still get a card each.
 - Single use: immediately before buying or releasing, the approval is claimed
   with `chatbotDb.claimMetaWriteManifestDigest(sessionId, "hotlead:" + kind)`
   (an entry in the session's existing `consumedMetaWriteManifestDigests` map; the
@@ -454,8 +570,13 @@ calls the tool again with the same arguments and it acts.
   - When another deck is already awaiting an answer, the card is not persisted:
     the model is told to stop and the user sees plain text. A typed "yes" then
     produces another halt, never an action.
+- Where it sits for turning calling on: the Emma tool passes a `beforeTurningOn` hook to
+  `applyHotLeadCallSettings`, which runs it after all checks and just before the write,
+  and only for a change from off to on. The REST route (the portal switch is the
+  person's click) passes none and is unchanged.
 - Not gated: `start_hot_lead_call_verification` (one capped call to a number the
-  admin saved) and turning calling on in `update_hot_lead_call_settings`.
+  admin saved), turning calling off, lowering limits, every other settings edit,
+  `enabled: true` on a setup that is already on, and the REST/portal route.
 
 Verification limits: it proves a phone answered and the code was heard. A
 voicemail that plays the message back can also pass it. The spoken code is
@@ -631,7 +752,8 @@ What the code requires (verified from code):
   voice-enabled, optionally by area code. The org's number is always a US local
   number, even for a Canadian member.
 - Outbound calls to US and Canadian numbers only (`allowedCountries`).
-- Public HTTPS reachability of `BACKEND_URL` for the six endpoints (`/owner`, `/gather`, `/screen`, `/screen-result`, `/dial`, `/status`).
+- Public HTTPS reachability of `BACKEND_URL` for the six outbound endpoints (`/owner`, `/gather`, `/screen`, `/screen-result`, `/dial`, `/status`) and the five inbound ones (`/inbound`, `/inbound-screen`, `/inbound-screen-result`, `/inbound-dial`, `/inbound-status`).
+- The number's **voice URL** must be `${BACKEND_URL}/api/webhooks/twilio-voice/inbound` (HTTP POST) for callbacks to work. `buyNumber` sets it on every number bought from now on; a number bought earlier must be set by hand in the Twilio console (Phone Numbers > Active numbers > the number > Voice Configuration > "A call comes in" = Webhook, that URL, HTTP POST). Signature validation uses the exact URL, so it must match `BACKEND_URL` exactly.
 
 To confirm with Twilio (not verifiable from this repo): Voice Geographic
 Permissions must allow outbound calls to the United States and Canada; whether a
@@ -652,6 +774,7 @@ No new table or index. The feature writes:
 | `hotLeadCallProvisioning` (purchase/release timestamps for the daily caps) | org attribute | provisioning tools |
 | `hot_lead_call_mode` | AW-Settings item | operators |
 | `HOT_LEAD_CALL_RENT_METERING` | environment variable of the backend (unset means on; `0`/`false`/`off` stops the rent sweep) | operators |
+| `HOT_LEAD_CALL_STUCK_SWEEP` | environment variable of the backend (unset or any other value: report only; `close`: the sweep settles stuck records; `off`: disabled) | operators |
 | `vendor_rate_overrides` | AW-Settings item | admin Vendor Rates tab |
 | `system.hot_lead_call` (call record: `state`, `jobKey`, `startedAt`, `updatedAt`, `attemptNo`, `memberId`, `triedMemberIds`, `leadPhoneMac` (keyed HMAC of the lead's phone, see Org config), `claimToken` (random id of the writer that took an exclusive step, see Writes that commit and then report an error), `memberCallSid`, `leadCallSid`, `outcome`, `meteredLegs` (`member:<attempt>` and `lead`), `lastSequence`) | on the lead row (AW-Leads), no phone number | orchestrator and webhooks |
 | Timeline events `call.*` | the lead's `engagements` list | `LeadCallStore.addEvent` |
@@ -682,7 +805,7 @@ Every Twilio call is billed to AgentWeb's account and recorded through
 
 | Rate key | Unit | Provisional default | Metered |
 | --- | --- | --- | --- |
-| `voice_minute_outbound` | minute | $0.014 | per leg, from the `/status` webhook |
+| `voice_minute_outbound` | minute | $0.014 | per leg, from the `/status` webhook; on an inbound callback only the member leg, from `/inbound-status` (the caller's inbound leg is not metered: there is no inbound rate on the card and none was invented) |
 | `number_monthly_rent` | number_month | $1.15 | at purchase (first month) and by the daily rent sweep (every later month), same key per number and month |
 
 The defaults are PROVISIONAL placeholders at Twilio's public US list price
@@ -814,16 +937,16 @@ Known limits, accepted:
 - A lead gets one call record ever. A member call Twilio rejected is not retried
   for the same member; the next member is tried instead, and a lead whose every
   placement was rejected is not called again.
-- `confirm` on the provisioning tool is ignored. Purchases and releases need a
+- `confirm` on the provisioning tool is ignored. Purchases, releases and turning calling on need a
   person's approval click; the per-org purchase and release caps remain as a second limit.
 - Two orgs configured with the same member phone can ring that person
   simultaneously: caps are per org and the cooldown is per member per org.
 - Prompt injection: the team phones and settings are changed through Emma
   tools, so text the model reads (a lead's form field, a web page) could try to
   steer `update_hot_lead_call_settings` or `confirm_hot_lead_call_verification`.
-  Purchases and releases need a person's approval click, but those two tools are
-  the only gated ones: enabling calling and starting a verification are not, so use
-  hand-picked orgs until the remaining go-live checks are done.
+  Purchases, releases and turning calling on need a person's approval click, but
+  starting a verification is not gated, so use hand-picked orgs until the remaining
+  go-live checks are done.
 - Verification brute force: a code is 6 digits with 5 attempts per code, 5 codes per
   person per day and 20 per organization per day, so a guesser has roughly a 5-in-a-million
   chance per code and about 25-in-a-million per person per day.
@@ -875,6 +998,8 @@ identified only by the signed query ids plus the record state (`bridging`), and
 the body CallSid is taken to be the lead leg's, because the request parameters
 of the screening leg are not documented.
 
+The inbound-callback steps (`/inbound`, `/inbound-screen`, `/inbound-screen-result`, `/inbound-dial`, `/inbound-status`) are stateless and described under [Inbound callbacks](#inbound-callbacks); their query keys are `orgId` and `tried` only, and `/inbound` has none.
+
 Webhook answers: a bad or missing signature is 401; credentials that cannot be
 loaded 503; a signed request that is not for a live call this job owns gets a
 bare `<Hangup/>` with 200 (TwiML endpoints) or an empty 200 (`/status`), and
@@ -906,11 +1031,94 @@ carry the Twilio retry override `#rc=3&rp=5xx,ct` so Twilio redelivers a 5xx.
 
 ### Stuck records
 
-A record can stay live if a final status callback never arrives (Twilio outage,
-5xx beyond the three retries, a `BACKEND_URL` problem) or the process crashed
-mid-call. No cron cleans these up and no operator tool lists them.
+A record can stay live if a final status callback never arrives (Twilio outage, 5xx beyond the three retries, a
+`BACKEND_URL` problem) or the process crashed mid-call. A daily sweep (ENG-2271, `services/voice/stuckCallSweep.ts`,
+`cron/stuckCallSweepCron.ts`, 12:00 UTC, armed in `server.ts` like the rent sweep) finds them and settles what can be
+settled safely. It replaces the old by-hand scan.
 
-**Finding them.** Start from what you know:
+**Modes.** Environment variable `HOT_LEAD_CALL_STUCK_SWEEP` of the backend, read on every run:
+
+| Value | Effect |
+| --- | --- |
+| unset, or anything but the two below | **Report only** (the default): finds and classifies records, reads Twilio, logs what it would do, writes nothing |
+| `close` | Settles records as in the table below |
+| `off` (also `0`, `false`) | The sweep does nothing; the cron logs `stuck call sweep skipped` |
+
+It is not gated on `hot_lead_call_mode`: a stuck record needs cleaning whether or not calling is on. It cannot dial: it
+never calls `placeCall`, never asks for a next member and never hangs up a call. Overlapping runs and repeats are harmless
+(every write is the store's conditional transition; a leg is billed only by the one writer that wins its `meteredLegs`
+entry, and the usage event's key is per call sid and leg).
+
+**How it finds records (no table, index or migration).** `orgDb.listHotLeadCallOrgIds` (a projected scan of AW-Organizations for
+orgs with ANY `hotLeadCall` attribute, ids only; releasing a number removes the number fields but keeps the config with
+calling off, so an org that released its number is still swept. It reads the same org items as the inbound index's
+number scan, `listHotLeadCallNumbers`, and the filter is looser by exactly the orgs that were configured but hold no number
+now; the read cost of an org scan is the org table either way, once a day here against every 60 s per instance there), then per org its members
+(`OrgIdIndex` query), their lead lists (`getLeadListsByUserId`: a query on the `userId-index` GSI of AW-LeadLists, which falls back to a filtered scan of that table if the index is missing; session lists are skipped) and, per list, the NEWEST leads
+of the list through `crmDb.findLeadsBySystemRecord`: a query on the list's own partition (newest `leadId` first) with a
+filter on `system.hot_lead_call.state` and `updatedAt`, so only ids come back. Bounds: at most 500 leads read per list and
+10,000 per run; at most 50 records WRITTEN per run (would close, in report mode) and at most 200 records handled per run
+(each costs up to two Twilio reads). Records left for a human or failing do not use up the 50, so they cannot starve the
+rest; whatever a cap leaves waits for the next run. The org scan order does not rotate, so a pathological first org can
+still use the whole read budget every day.
+
+`truncated: true` means a read bound stopped a list or the run, or a cap left records for the next run. It fires on ANY
+list with 500 or more leads (and falsely when a read stops exactly at the bound), so it is not a signal by itself.
+
+Known limits, stated plainly:
+
+- **A stuck record older than the newest 500 leads of its list is invisible, on every run.** Nothing indexes the call
+  state, so the sweep can only look at the newest leads. The real fix (a sparse GSI on the state, or a persisted cursor)
+  is a data-plane change that needs Harsha's approval and is tracked under Known follow-ups. Also not covered: a list of a
+  member who left the org.
+- **Read cost.** DynamoDB bills the full size of every lead item examined, up to 10,000 per run, per backend instance
+  (the filter runs after the read), plus a few small queries per org; the Twilio cost is at most two read-only fetches per
+  record handled. Production currently runs ONE backend instance (Elastic Beanstalk min=max=1, verified 2026-11-04); more
+  instances multiply the scan and the Twilio reads (close mode stays correct: conditional transitions, per-sid usage keys).
+- **Closing a `between_attempts` record** as `failed` / `next_attempt_failed` overwrites that attempt's own outcome and writes
+  a `call.failed` event: anything alerting on `call.failed` will see it.
+- **A stranded `member_answered` record** (the move to `bridging` was lost) can leave an unbilled lead leg: the sweep meters
+  only the member leg, same as the webhook does today.
+
+Each record found is re-read consistently and decided on that read, and read again just before the first write: if its call,
+attempt, state or call sids changed meanwhile (a late real callback), the sweep writes nothing and counts it as `moved`.
+
+**When a record counts as stuck.** Time since the record's last write (`updatedAt`; every transition refreshes it) against
+the longest a healthy record waits in that state, plus 10 minutes for callback retries, the queue's reclaim of a dead
+worker (5 minutes stale, polled every 30 s) and clock skew. All values come from the code (`STUCK_AFTER_MS`):
+
+| State | Longest healthy dwell | Stuck after |
+| --- | --- | --- |
+| `dialing` | one `placeCall` request | 10 min |
+| `member_ringing` | member ring 25 s | 10 min 25 s |
+| `member_answered` | keypress prompt 8 s | 10 min 8 s |
+| `bridging`, `connected` | `<Dial timeLimit>` 1800 s + lead ring 25 s + two 8 s prompts | 40 min 41 s |
+| `between_attempts` | no call live; a further attempt is refused once the lead is older than `maxAgeMinutes` (max 60) | 70 min |
+
+**What it does (`close` mode).** The sweep stands in for the missing final callbacks, from Twilio's own record of the call
+(`VoiceProvider.fetchCall`, read-only). Twilio is the authority on whether a call is live; the age only decides which
+records are worth asking about.
+
+| Record | Action | Why it is safe |
+| --- | --- | --- |
+| `dialing`, `member_ringing`, `member_answered`, `bridging`, `connected`, with the sid of every unmetered leg (a `dialing` record that has a `memberCallSid` is reconciled like the others) | Fetch each unmetered leg. All ended: meter each through `meterLeg` (lead first), then apply the normal finishing rule (`finishIfComplete`: `completed`, or `bridge_unconfirmed` while still `bridging`; a member attempt that ended without taking the lead is finished with that attempt's outcome through the same close the webhook uses, `call.completed` event) | A leg Twilio reports as live is never touched. Metering is the webhook's own conditional write, so a late real callback and the sweep cannot both bill. Every leg is read before anything is written, so a Twilio failure changes nothing. The sweep never asks for a next member, so nobody is dialed |
+| the same, but a leg is still live (`queued`, `ringing`, `in-progress`) | Nothing; counted as `stillLive` and logged | A call that may legitimately still be running |
+| the same, but Twilio has no record of a call (404) | Nothing; `needsHuman` (a warn line, not a failure, so the summary line does not stay an error every day) | Only a Twilio 404 is treated this way; every other Twilio error is a `failed` |
+| the same, but an ended `completed` leg has no duration | Nothing; `needsHuman` | A missing duration is reported, never defaulted to 0. (`busy`, `failed`, `no-answer`, `canceled` legs have no duration by Twilio's definition and bill 0.) |
+| every dialed leg already metered, only the finish lost | `finishIfComplete` | Same rule as the webhook |
+| `dialing` (no call sid, including `placement_unknown`), `member_ringing`/`member_answered` with no `memberCallSid`, or `bridging`/`connected` with no `leadCallSid` | Nothing; `needsHuman` | There is nothing to ask Twilio about, and a call may exist that was billed and never recorded. Closing it stays a data repair needing Harsha's approval (see Repairing). Check the Twilio call log by hand as before; the line repeats on every run until the record is repaired |
+| `between_attempts` older than 70 min | Close as `failed` / `next_attempt_failed` with a `call.failed` event (reason `next_attempt_failed`), guarded by the attempt number | No call is live in this state and no job can ring anyone any more; it is the close the next-attempt job makes when it breaks. If a job took the record first, the conditional write loses and nothing changes |
+
+**Reading the log.** One summary line per run: `[hotLeadCall] stuck call sweep completed` (info), `... completed with
+failures` (error, when `failed` is above 0), or `... skipped: HOT_LEAD_CALL_STUCK_SWEEP is off`. Fields: `mode`; `orgs`,
+`lists`, `leadsRead` (the read cost) and `truncated`; `found` (records the read returned, older than the youngest
+threshold; the cap counts only the ones written); `wouldClose` (report mode) and `closed`; `stillLive`; `needsHuman`; `notStuck` (found but not yet stuck for its
+state, or gone); `moved` (another writer got there: the record changed before the first write, or was written to but not closed); `failed` (a Twilio call, the store or an org
+read failed; nothing more was changed for that record). Before it, one `warn` line per record: `stuck call record: org <orgId> list <listId> lead <leadId> state <state>: <what>`, where
+`<what>` is `would close (...)`, `closing (...)`, `Twilio says the <leg> call is still live: left alone` or `needs a human: <reason>`.
+No phone number is ever logged. Failures log the error name only.
+
+**By hand** (the sweep is off, or a record it reports as `needs a human`). Start from what you know:
 
 - A report ("the member got a call but ...") or one lead: open the lead's timeline
   (`call.*` events) and its `system.hot_lead_call` record.
@@ -928,49 +1136,29 @@ mid-call. No cron cleans these up and no operator tool lists them.
   ```
 
   `updatedAt` is an ISO string, so the comparison is lexicographic and correct.
-  Anything live that long (a call lasts minutes) is stuck.
 
-**What each state means and what to do:**
+**What each state means when it is stuck** (the sweep's table above says what it does about each):
 
-- `dialing`, no `outcome`, no `memberCallSid`, and older than 10 minutes (a ring is 25 seconds; younger ones are being
-  placed): the process died between taking the record (the create, or the move from `between_attempts`) and recording
-  the call, or a deciding write may have landed and its re-reads failed (see Writes that commit and then report an
-  error). Always check the Twilio call log first for a call from the org's number to the member around `updatedAt`.
-  None: nothing was placed. The Slack alert already went out and by the once-per-lead rule the lead is simply never
-  called; leaving the record is safe (closing it as `failed`, outcome `store_error`, is a data repair that needs
+- `dialing`, no `outcome`, no `memberCallSid`: the process died between taking the record (the create, or the move from
+  `between_attempts`) and recording the call, or a deciding write may have landed and its re-reads failed (see Writes that
+  commit and then report an error). Always check the Twilio call log first for a call from the org's number to the member
+  around `updatedAt`. None: nothing was placed. The Slack alert already went out and by the once-per-lead rule the lead is
+  simply never called; leaving the record is safe (closing it as `failed`, outcome `store_error`, is a data repair that needs
   Harsha's approval). One exists: it was billed and the record never learned its sid. Its first signed callback normally
   adopts it and the call proceeds and is metered; if no callback ever arrived, meter it by hand as under Checking what
   was billed.
-- `dialing` with `outcome=placement_unknown`: the placement was ambiguous. Check
-  the Twilio call log for a call from the org's number to the member around
-  `startedAt`. If one exists and its callbacks never arrived, Twilio billed it
-  and we did not meter it.
+- `dialing` with `outcome=placement_unknown`: the placement was ambiguous. Check the Twilio call log for a call from the
+  org's number to the member around `startedAt`. If one exists and its callbacks never arrived, Twilio billed it and we did
+  not meter it.
 - `member_ringing` / `member_answered`: the member leg's final callback is missing.
-- `between_attempts`: the attempt's leg is metered but the record was neither
-  taken over by a next attempt nor finished. A next-attempt job that breaks closes
-  the record as `failed` / `next_attempt_failed`; if that close fails too, a REPLAY
-  of the leg's final callback re-drives the job (a failed queue row is cleared and
-  queued again). Twilio replays only after a 5xx, so otherwise it stays until someone
-  replays the callback or the record is repaired. A job whose process died is re-run by
-  the queue poller after 5 minutes (see What the queue poller does), which resumes a first-attempt job's own
-  waiting record and carries a next-attempt job on, including the case where the job's own lock was rejected and the
-  record now waits at a later attempt number with no call sid (a replayed callback cannot help that one: `/status`
-  acknowledges a callback for a record that has no call sid, so only the job's re-run recovers it). A re-run that fails before it could close
-  the record closes it on the way out, looking the record up again to guard the close with the attempt it really waits
-  after; if even that lookup fails, the record is the repair case below. A row that
-  FAILED is not re-run by the poller: its error path normally closed the record already, and if that close failed too
-  the record is repaired by hand when it has no call sid (Harsha's approval), or healed by replaying the final callback
-  when it waits right after an attempt that had a call (a failed row is then cleared and queued again). No call is in
-  flight; the lead is simply not called again until then.
-- `bridging` with no `leadCallSid`, and older than 10 minutes: the member pressed 1 and the move to `bridging` may have
-  landed with its re-reads failing, so the member was hung up on and no lead leg exists. To find either this or the
-  `dialing` case above, run the read-only scan above with `:cutoff` set to 10 minutes ago, keep the rows where
-  `attribute_not_exists(#s.#k.memberCallSid)` (state `dialing`) or `attribute_not_exists(#s.#k.leadCallSid)` (state
-  `bridging`). Check the Twilio call log that the member's call ended without a child call to the lead; meter the
-  member's leg by hand if it was not metered. The lead is not called again by itself; closing the record is a data repair
-  that needs Harsha's approval.
-- `bridging` / `connected`: the bridge ended but a leg callback is missing; the
-  call may be unmetered.
+- `between_attempts`: the attempt's leg is metered but the record was neither taken over by a next attempt nor finished (see
+  Records stranded between attempts heal for what normally moves it, and What the queue poller does). No call is in flight;
+  the lead is simply not called again.
+- `bridging` with no `leadCallSid`: the member pressed 1 and the move to `bridging` may have landed with its re-reads
+  failing, so the member was hung up on and no lead leg exists. Check the Twilio call log that the member's call ended
+  without a child call to the lead; meter the member's leg by hand if it was not metered. The lead is not called again by
+  itself; closing the record is a data repair that needs Harsha's approval.
+- `bridging` / `connected` with sids: the bridge ended but a leg callback is missing; the call may be unmetered.
 
 **Checking what was billed.** Spend events are in the immutable ledger table
 `AW-SpendEvents` (`Dev-AW-SpendEvents` in development), partition key
@@ -1097,16 +1285,43 @@ on anywhere.
     carry the new version string for ALL vendors. Amounts are identical (checked
     byte for byte for v0, Apollo, Placid and Remotion); a reconciliation that
     groups by rate-card version will see a new bucket.
-14. Known gap accepted at launch: enabling calling through
-    `update_hot_lead_call_settings` and the small verification call are not behind
-    an approval click (the verification call is capped per person and per org).
-    Provision and release need a person's approval click, and number rent is
-    metered every month by the daily sweep.
+14. Known gap accepted at launch: the small verification call is not behind an
+    approval click (it is capped per person and per org). Provision, release and
+    turning calling on through `update_hot_lead_call_settings` need a person's
+    approval click, and number rent is metered every month by the daily sweep.
+15. Inbound callbacks: set the voice URL of every number bought before inbound callbacks existed
+    (the existing org number, `hotLeadCall.twilioNumberSid` on its AW-Organizations item) to
+    `${BACKEND_URL}/api/webhooks/twilio-voice/inbound`, HTTP POST, in the Twilio console. Until then a
+    lead calling it hears whatever the number was left with. Then call it once from a phone that
+    is not a team member's: the member should hear the "a lead is calling back" prompt.
+    Decide whether the unmetered inbound leg (see [Metering and spend](#metering-and-spend)) is acceptable, and accept in writing that
+    inbound callbacks have no per-caller, hourly or daily cap: anyone who learns the number can make it ring the team, and the
+    member-leg minutes are billed to the org owner with only Twilio's spend limits as a ceiling.
+16. Stuck-record sweep (ENG-2271): it ships report-only. After the first real calls, read the daily
+    `[hotLeadCall] stuck call sweep completed` line and its `stuck call record: ...` warn lines (see
+    [Stuck records](#stuck-records)): `found` should be 0 or explainable, `failed` 0, and every `would close` line a record you
+    agree should be closed. Only then set `HOT_LEAD_CALL_STUCK_SWEEP=close` and restart. Confirm `fetchCall` works with the
+    production Twilio credentials: grep the log for `fetchCall CA... failed` (the provider's own error line); a `failed`
+    count above 0 with those lines means it does not. A call Twilio has no record of (404) shows as a `needs a human`
+    warning, not a failure.
 
 ## Not verified without a real Twilio account
 
 None of these has been observed against Twilio. They are assumptions taken from
 Twilio's documentation and encoded in tests with synthetic payloads:
+
+- Inbound callbacks: that `To` on the voice-URL request is the dialled number in E.164; that a `<Dial>` to a member
+  with `answerOnBridge` and a `<Number url>` screening step behaves as it does for the lead on an outbound call
+  (a hang-up there ends the Dial with `completed` and `DialBridged=false`, which is what moves on to the next member);
+  that the member leg's `completed` status callback carries `ParentCallSid` and `CallDuration`; and that the
+  callerId = the org's number is accepted on a `<Dial>` answering an inbound call.
+- Inbound callbacks: whether Twilio sends `DialBridged=false` when a `<Number url>` screening step hangs up. If it is absent,
+  `/inbound-dial` hangs up the caller instead of rolling to the next member (the outbound `/dial` relies on the same assumption).
+
+- Stuck-record sweep: that the Call resource's `duration` (REST fetch) equals the `CallDuration` of the final callback
+  for the same leg, that it is already populated when `status` is `completed`, and that it is empty for `busy`, `failed`,
+  `no-answer` and `canceled` (the Node SDK's own documentation says so for unanswered calls). A `completed` call without a
+  duration is left for a human, never billed as 0.
 
 - `<Number>` status callbacks (`statusCallbackEvent="initiated ringing answered
   completed"`) for a lead that does not answer or is busy: that they arrive
@@ -1178,10 +1393,15 @@ Twilio's documentation and encoded in tests with synthetic payloads:
 
 ## Known follow-ups
 
-- **Stuck-record cleanup.** A documented sweep for records live longer than a
-  call can last (and reconciliation of their Twilio legs). No cron exists.
-- **Approval for enabling calling.** Provision and release need a person's approval
-  click; turning calling on in `update_hot_lead_call_settings` does not yet.
+- **Stuck-record sweep visibility.** The sweep only sees the newest 500 leads of each list (nothing indexes the call
+  state). A sparse GSI on the state, or a persisted cursor, would make every stuck record visible; both are data-plane
+  changes that need Harsha's approval.
+
+- **Inbound minutes.** The caller's inbound leg of a callback is not metered (no inbound rate on the card); add a
+  `voice_minute_inbound` rate. `/inbound-status` is the callback of the CHILD (member) leg; the caller's parent leg has no
+  `statusCallback`, so metering it needs one on that leg (set on the number or on the call), or the bridged member leg's duration
+  as a proxy. Inbound callbacks also have no
+  per-caller or per-org rate limit; see [Inbound callbacks](#inbound-callbacks).
 - **Missed-call Slack line.** The Slack alert does not say whether the call was
   placed, answered or declined; deliberately deferred so the Slack path stays
   untouched.

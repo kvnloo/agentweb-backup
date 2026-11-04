@@ -57,6 +57,14 @@ describe('FakeVoiceProvider', () => {
     expect(f.releasedNumbers).toEqual(['PN00000001']);
   });
 
+  it('records the voice URL of a purchase and refuses a malformed one before recording', async () => {
+    const f = new FakeVoiceProvider();
+    await f.buyNumber({ countryCode: 'US', voiceUrl: 'https://api.example.test/api/webhooks/twilio-voice/inbound' });
+    expect(f.boughtNumbers).toEqual([{ countryCode: 'US', voiceUrl: 'https://api.example.test/api/webhooks/twilio-voice/inbound' }]);
+    await expect(f.buyNumber({ countryCode: 'US', voiceUrl: 'not a url' })).rejects.toThrow(/voiceUrl/);
+    expect(f.boughtNumbers).toHaveLength(1);
+  });
+
   it('can be injected through setVoiceProviderForTests', () => {
     const f = new FakeVoiceProvider();
     setVoiceProviderForTests(f);
