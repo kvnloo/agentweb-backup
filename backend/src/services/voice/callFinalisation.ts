@@ -37,7 +37,7 @@ const MAX_TRANSITION_ATTEMPTS = 3;
 // Marker entries in `lastSequence` that make a decision first-writer-wins: see HotLeadCallRecord.lastSequence.
 export const decisionKey = (callSid: string, step: 'gather' | 'dial' | 'screen'): string => `${callSid}#${step}`;
 /** `meteredLegs` entry of a leg: member legs are numbered by attempt ('member:1'), the lead leg is 'lead'. */
-const meteredLegOf = (leg: HotLeadCallLeg, record: HotLeadCallRecord): MeteredLeg =>
+export const meteredLegOf = (leg: HotLeadCallLeg, record: HotLeadCallRecord): MeteredLeg =>
   leg === 'lead' ? 'lead' : `member:${record.attemptNo}`;
 export const errorName = (err: unknown): string => (err instanceof Error ? err.name : 'unknown error');
 
@@ -52,7 +52,7 @@ async function meteringUserId(listId: string, ctx: HotLeadCallContext | null): P
  * Whether a lead leg was (or may be) dialed and so must be metered before the record can finish. After
  * /dial reported no-answer with no DialCallSid, no lead call was ever created, so none is awaited.
  */
-function leadLegExpected(record: HotLeadCallRecord): boolean {
+export function leadLegExpected(record: HotLeadCallRecord): boolean {
   if (record.state !== 'bridging' && record.state !== 'connected') return false;
   return !(record.leadCallSid === undefined && record.outcome === 'lead_no_answer');
 }
@@ -198,8 +198,18 @@ export async function nextAttemptOrFinish(q: CallQuery, attemptOutcome: string):
   } catch (err) {
     console.error('[hotLeadCall] next attempt request failed:', errorName(err));
   }
-  const outcome = record.attemptNo > 1 ? 'no_member_available' : attemptOutcome;
-  if (await store.transition(q.listId, q.leadId, ['between_attempts'], { state: 'finished', outcome, ifAttemptNo: record.attemptNo })) {
+  await finishWaitingAttempt(q, record.attemptNo, attemptOutcome);
+}
+
+/**
+ * Closes the record that waits after attempt `attemptNo` because nobody else will be rung. The finish is guarded with
+ * the attempt, so a record that has gone on to a later one is left alone. The caller has already chosen not to ask
+ * for another member (the stuck-record sweep never does).
+ */
+export async function finishWaitingAttempt(q: CallQuery, attemptNo: number, attemptOutcome: string): Promise<void> {
+  const store = getLeadCallStore();
+  const outcome = attemptNo > 1 ? 'no_member_available' : attemptOutcome;
+  if (await store.transition(q.listId, q.leadId, ['between_attempts'], { state: 'finished', outcome, ifAttemptNo: attemptNo })) {
     await store.addEvent(q.listId, q.leadId, 'call.completed', { outcome });
   }
 }
