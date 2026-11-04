@@ -871,7 +871,7 @@ export interface LeadNotificationPayload {
 }
 
 /** Slack reads &, < and > in message text as markup (a link, a mention): send them as the entities Slack documents. */
-const escapeSlackText = (value: string): string => value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const escapeSlackText = (value: string): string => String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
 function formatCompactLeadNotificationPayload(lead: LeadNotificationPayload): {
   text: string;
@@ -931,11 +931,19 @@ export function formatLeadNotificationPayload(lead: LeadNotificationPayload): {
   }
 
   if (lead.linkedin) {
-    // The link target of a Smartlead reply alert can not carry markup: & < > | and spaces are escaped so it stays one link.
-    const linkTarget = lead.headline
-      ? escapeSlackText(String(lead.linkedin)).replace(/[|\s]/g, (c) => encodeURIComponent(c))
-      : lead.linkedin;
-    fields.push({ type: 'mrkdwn', text: `*LinkedIn:*\n<${linkTarget}|Profile>` });
+    if (lead.headline) {
+      // A Smartlead reply alert only links an http(s) address, with & < > | and spaces escaped so it stays one link. Anything else (such as
+      // `!channel` or `@U123`, which Slack reads as a broadcast or a mention inside <...>) is shown as plain escaped text, never as a link.
+      const raw = String(lead.linkedin);
+      fields.push({
+        type: 'mrkdwn',
+        text: /^https?:\/\//i.test(raw)
+          ? `*LinkedIn:*\n<${escapeSlackText(raw).replace(/[|\s]/g, (c) => encodeURIComponent(c))}|Profile>`
+          : `*LinkedIn:*\n${escapeSlackText(raw)}`,
+      });
+    } else {
+      fields.push({ type: 'mrkdwn', text: `*LinkedIn:*\n<${lead.linkedin}|Profile>` });
+    }
   }
 
   fields.push({ type: 'mrkdwn', text: `*List:*\n${val(lead.listName)}` });
