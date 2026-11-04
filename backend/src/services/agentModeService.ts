@@ -17038,6 +17038,20 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     // the VM sandbox (only `page` is in scope). Guide the LLM to fix the code, not retry as-is.
     const isBrowserRunCode =
       toolName === 'browser_run_code' || toolName.endsWith('_browser_run_code');
+    // ENG-2807: a Playwright locator/action timeout inside browser_run_code means the
+    // selector never appeared (wrong selector, login redirect, iframe, or the user is
+    // already signed in). Re-running the same code just burns another 30s timeout, so
+    // steer the model to inspect the live page before choosing a new selector.
+    if (
+      isBrowserRunCode &&
+      /TimeoutError/.test(safeMessage) &&
+      /Timeout \d+ms exceeded/.test(safeMessage) &&
+      /waiting for (locator|selector|getBy)/i.test(safeMessage)
+    ) {
+      const selectorMatch = safeMessage.match(/waiting for (locator\([^\n]*?\)|getBy\w+\([^\n]*?\)|selector [^\n]+)/i);
+      const selectorNote = selectorMatch ? ` (${selectorMatch[1].trim()})` : '';
+      return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: The element your code waited for${selectorNote} never appeared on the page — this is a wrong/stale selector, not a slow page. Do NOT re-run the same code with the same selector. First call browser_snapshot to see the actual page: check whether you were redirected (login, consent, captcha), whether the field is inside an iframe, or whether the step is already complete (e.g. already signed in). Then pick a selector that exists in the snapshot (prefer role/label/placeholder locators) and retry once.`;
+    }
     if (isBrowserRunCode && safeMessage.includes('ReferenceError')) {
       return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: The browser_run_code sandbox only has \`page\` in scope. All variables must be declared inside the async function body. Do NOT reference external variables, imports, or closures. Rewrite the function to be fully self-contained:\n\`\`\`js\nasync (page) => {\n  // All logic here — no outside variables\n  const result = await page.evaluate(() => { ... });\n  return result;\n}\n\`\`\``;
     }
