@@ -1,6 +1,21 @@
 /** Shared by direct Emma handlers and the pre-schema gateway. Never mutates input. */
 export function normalizeHubSpotArgs(raw: any): any {
   const args = { ...(raw ?? {}) };
+  // ENG-2792: models send lowercase enums and raw-REST shapes ({endpoint, method}).
+  if (typeof args.entity_type === 'string') args.entity_type = args.entity_type.trim().toUpperCase();
+  if (typeof args.action === 'string') args.action = args.action.trim().toUpperCase();
+  if (!args.entity_type && typeof args.endpoint === 'string') {
+    const entity = hubSpotEntityFromEndpoint(args.endpoint);
+    const method = typeof args.method === 'string' ? args.method.trim().toUpperCase() : 'GET';
+    if (entity && (args.action || method === 'GET')) {
+      args.entity_type = entity;
+      if (!args.action) args.action = 'LIST';
+      delete args.endpoint;
+      delete args.method;
+    }
+  }
+  // CONTACTS supports LIST only; a bare GET with no id means "list contacts".
+  if (args.entity_type === 'CONTACTS' && args.action === 'GET' && args.id === undefined) args.action = 'LIST';
   if (String(args.action ?? '').toUpperCase() === 'LIST_CONTACTS' && !args.entity_type) {
     args.entity_type = 'CONTACTS';
     args.action = 'LIST';
@@ -43,4 +58,21 @@ export function normalizeHubSpotArgs(raw: any): any {
     if (id) { args.guid = id; delete args.id; }
   }
   return args;
+}
+
+const HUBSPOT_ENDPOINT_ENTITIES: Array<[RegExp, string]> = [
+  [/(^|\/)contacts?$/, 'CONTACTS'],
+  [/(^|\/)campaigns?$/, 'CAMPAIGN'],
+  [/(^|\/)(lists?|contact_lists?)$/, 'CONTACT_LIST'],
+  [/(^|\/)emails?$/, 'EMAIL'],
+  [/(^|\/)forms?$/, 'FORM'],
+  [/(^|\/)landing[-_]pages?$/, 'LANDING_PAGE'],
+  [/(^|\/)(blog[-_]?)?posts?$/, 'BLOG_POST'],
+  [/(^|\/)(workflows?|flows?)$/, 'WORKFLOW'],
+];
+
+/** Map a collection endpoint (e.g. "/crm/v3/objects/contacts?limit=5") to an entity_type. */
+function hubSpotEntityFromEndpoint(endpoint: string): string | undefined {
+  const path = endpoint.trim().toLowerCase().split(/[?#]/)[0].replace(/\/+$/, '');
+  return HUBSPOT_ENDPOINT_ENTITIES.find(([re]) => re.test(path))?.[1];
 }

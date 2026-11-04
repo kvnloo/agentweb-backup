@@ -2412,7 +2412,7 @@ emmaToolRegistry.register({
         },
         chapter_id: {
           type: 'string',
-          description: 'Optional: The unique identifier (chapterId) of the chapter. If provided, generates chapter content. If not provided, generates section content.'
+          description: 'The unique identifier (chapterId) of the chapter. REQUIRED whenever the user asks for a specific chapter: pass its chapterId from get_book_details, otherwise section-level content is written instead. Omit only for section-level content.'
         },
         content_description: {
           type: 'string',
@@ -2434,7 +2434,7 @@ emmaToolRegistry.register({
           description: 'Optional S3 URL to deep research content (from perform_deep_research). For WHITEPAPERS: pass the research_url here instead of copying full content into content_description. The function will fetch the research and use it as context. When using this, content_description should focus on section-specific instructions (e.g., "Write the Executive Summary focusing on key strategic implications").'
         }
       },
-      required: ['book_id', 'section_id', 'chapter_id', 'content_description']
+      required: ['book_id', 'section_id', 'content_description']
     }
   },
   execute: async (args: any, context?: any) => {
@@ -9687,7 +9687,7 @@ TYPICAL WORKFLOW:
     inputSchema: {
       type: 'object',
       properties: {
-        entity_type:      { type: 'string', enum: ['CAMPAIGN', 'EMAIL', 'FORM', 'LANDING_PAGE', 'BLOG_POST', 'WORKFLOW', 'SOCIAL', 'CONTACT_LIST'], description: 'HubSpot resource to operate on.' },
+        entity_type:      { type: 'string', enum: ['CAMPAIGN', 'EMAIL', 'FORM', 'LANDING_PAGE', 'BLOG_POST', 'WORKFLOW', 'SOCIAL', 'CONTACT_LIST', 'CONTACTS'], description: 'HubSpot resource to operate on (CONTACTS supports LIST).' },
         action:           { type: 'string', description: 'Action to perform. See ACTION MATRIX.' },
         // CAMPAIGN
         guid:             { type: 'string', description: 'Campaign guid. Required for CAMPAIGN GET/UPDATE/DELETE/GET_METRICS/LIST_ASSETS/ADD_ASSET/REMOVE_ASSET.' },

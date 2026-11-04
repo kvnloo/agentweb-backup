@@ -38,6 +38,8 @@ export interface LLMServiceOptions {
   providerIgnoreForWebSearch?: string[];
   /** Retry a 200 with no answer instead of returning an empty string (ENG-2720). */
   requireContent?: boolean;
+  /** Parameters for the web-search tool on this service's web-search calls (ENG-2720). */
+  webSearchParameters?: Record<string, string | number>;
 }
 
 type InvokeResponse = {
@@ -73,6 +75,7 @@ export class LLMService {
   private readonly fallbackModels?: string[];
   private readonly providerIgnoreForWebSearch?: string[];
   private readonly requireContent: boolean;
+  private readonly webSearchParameters?: Record<string, string | number>;
 
   constructor(
     modelName?: string,
@@ -93,6 +96,7 @@ export class LLMService {
     this.fallbackModels = options.fallbackModels;
     this.providerIgnoreForWebSearch = options.providerIgnoreForWebSearch;
     this.requireContent = options.requireContent === true;
+    this.webSearchParameters = options.webSearchParameters;
     this.gatewayAdapter = { invoke: (messages) => this.invokeGateway(messages) };
     this.chatModel = this.gatewayAdapter;
   }
@@ -114,6 +118,7 @@ export class LLMService {
       max_completion_tokens: this.maxTokens,
       timeoutMs: requestOptions.timeoutMs ?? (this.longRunning ? 30 * 60 * 1000 : undefined),
       webSearch: requestOptions.webSearch,
+      ...(requestOptions.webSearch && this.webSearchParameters ? { webSearchParameters: this.webSearchParameters } : {}),
       usageContext: usageContext || { feature: 'unknown' },
       taskClass: this.taskClass,
       ...(this.fallbackModels?.length ? { fallbackModels: this.fallbackModels } : {}),

@@ -10,6 +10,8 @@ import {
   reportContainsCrossAccountData,
   messagesReferenceCrossAccountTool,
   resolveAuthorizedReportRecipients,
+  scheduleLikelySensitive,
+  checkScheduleActivationRecipients,
 } from '../services/scheduledReportAccess';
 import { userDb } from '../services/db';
 
@@ -172,5 +174,53 @@ describe('resolveAuthorizedReportRecipients', () => {
     });
     expect(r.authorized.filter((e) => e === 'admin@x.com')).toHaveLength(1);
     expect(r.withheld).toEqual(['nonadmin@x.com']);
+  });
+});
+
+// ENG-2785: Meta Ads tools are customer-facing; only admin callers can reach
+// another account with them, so a verified non-admin owner's report is not
+// sensitive on their account alone.
+describe('ENG-2785 owner-scoped Meta Ads classification', () => {
+  const metaRun = { list_meta_ads_campaigns: 1, get_meta_ads_metrics: 2, call_meta_ads_insights_api: 1 };
+
+  it('does not flag Meta-only runs for a verified non-admin owner', () => {
+    expect(reportContainsCrossAccountData(metaRun, { ownerIsAdmin: false })).toBe(false);
+    expect(
+      messagesReferenceCrossAccountTool(
+        [{ role: 'assistant', tool_calls: [{ function: { name: 'get_meta_ads_metrics' } }] }, { role: 'tool', name: 'list_meta_ads_campaigns' }],
+        { ownerIsAdmin: false },
+      ),
+    ).toBe(false);
+  });
+
+  it('still flags Meta runs for an admin owner or an owner of unknown status', () => {
+    expect(reportContainsCrossAccountData(metaRun, { ownerIsAdmin: true })).toBe(true);
+    expect(reportContainsCrossAccountData(metaRun)).toBe(true);
+    expect(messagesReferenceCrossAccountTool([{ role: 'tool', name: 'get_meta_ads_metrics' }])).toBe(true);
+  });
+
+  it('negative: admin-only tools stay sensitive even for a non-admin owner', () => {
+    expect(reportContainsCrossAccountData({ ...metaRun, list_all_clients: 1 }, { ownerIsAdmin: false })).toBe(true);
+    expect(messagesReferenceCrossAccountTool([{ role: 'tool', name: 'get_chat_history' }], { ownerIsAdmin: false })).toBe(true);
+  });
+
+  it('schedule preflight: required Meta tools do not mark a non-admin owner schedule sensitive', () => {
+    const schedule = { requiredFunctionCalls: ['get_meta_ads_metrics'] };
+    expect(scheduleLikelySensitive(schedule, { ownerIsAdmin: false })).toBe(false);
+    expect(scheduleLikelySensitive(schedule)).toBe(true);
+    // the run-recorded breadcrumb is still honoured
+    expect(scheduleLikelySensitive({ ...schedule, lastKnownSensitive: true }, { ownerIsAdmin: false })).toBe(true);
+    expect(scheduleLikelySensitive({ requiredFunctionCalls: ['list_all_clients'] }, { ownerIsAdmin: false })).toBe(true);
+  });
+
+  it('activation gate passes a non-admin customer schedule using Meta tools', async () => {
+    const remediation = await checkScheduleActivationRecipients({
+      scheduleId: 's1',
+      recipients: ['sary@customer.com'],
+      ownerEmail: 'sary@customer.com',
+      schedule: { requiredFunctionCalls: ['get_meta_ads_metrics'] },
+      ownerIsAdmin: false,
+    });
+    expect(remediation).toBeNull();
   });
 });

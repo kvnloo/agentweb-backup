@@ -137,10 +137,21 @@ export class FakeCrm {
     },
   };
 
+  /** Makes the org-number scan throw, like a throttled DynamoDB. */
+  listFails = false;
+
   readonly orgDb = {
     getOrgById: async (orgId: string) => {
       this.calls.push('getOrgById');
       return clone(this.orgs.get(orgId));
+    },
+    listHotLeadCallNumbers: async () => {
+      this.calls.push('listHotLeadCallNumbers');
+      if (this.listFails) throw new Error('scan failed');
+      return [...this.orgs.entries()].flatMap(([orgId, org]) => {
+        const twilioNumber = (org.hotLeadCall as { twilioNumber?: unknown } | undefined)?.twilioNumber;
+        return typeof twilioNumber === 'string' ? [{ orgId, twilioNumber }] : [];
+      });
     },
   };
 }

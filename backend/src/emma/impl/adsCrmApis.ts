@@ -183,10 +183,7 @@ function makeGoogleAdsAuthError(message: string): Error {
  *
  * Deliberately read-only in effect: only wired into the two reporting/list surfaces
  * (handleCallGoogleAdsReportingApi, and LIST/SEARCH actions of handleCallGoogleAdsApi).
- * A client-scoped WRITE would let an admin session mutate a client's live campaign
- * without that client's own fresh authorization decision — the same risk ENG-1801
- * already ruled out for Meta's mutate tool — so callers must refuse client_id on any
- * non-read action rather than pass it here.
+ * Writes are allowed too (admin-only, audited per call); see handleCallGoogleAdsApi.
  */
 async function resolveGoogleAdsCredentialScope(
   callerUserId: string,
@@ -521,16 +518,13 @@ export async function handleCallGoogleAdsApi(userId: string, args: {
 }, opts?: { sessionId?: string; clientScope?: { clientId?: string; callerIsAdmin?: boolean; toolName: string } }): Promise<any> {
   try {
     const { customer_id, entity_type, action } = args;
-    // ENG-1944: client_id is admin-only and read-only-scoped here (see
-    // resolveGoogleAdsCredentialScope) — a client-scoped write would let an admin
-    // session mutate a client's live campaign without that client's own authorization.
+    // ENG-1944 originally limited client_id here to LIST/SEARCH. That restriction was
+    // removed by engineering-lead decision: managed-client operators (admins) need to
+    // make audited changes in a client's account. The scope stays admin-only, requires a
+    // real customer target, and every use is recorded via recordAdminAudit
+    // (resolveGoogleAdsCredentialScope). All normal write gates (tracking pre-flight,
+    // override tokens) still run against the client's credentials.
     if (opts?.clientScope?.clientId !== undefined && opts?.clientScope?.clientId !== null) {
-      if (action !== 'LIST' && action !== 'SEARCH') {
-        return {
-          success: false,
-          error: `client_id scoping only supports read actions (LIST/SEARCH) — refusing a client-scoped ${entity_type} ${action}. Have the client's own session make this change, or drop client_id to act as yourself.`,
-        };
-      }
       const scope = await resolveGoogleAdsCredentialScope(
         userId, opts.clientScope.clientId, opts.clientScope.callerIsAdmin, opts.clientScope.toolName ?? 'call_google_ads_api'
       );

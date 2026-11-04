@@ -48,7 +48,7 @@ const OWNER = 'owner-1';
 const vendor = (over: Record<string, unknown> = {}) => ({
   userId: MEMBER,
   provider: 'apollo',
-  operation: 'full_enrichment',
+  operation: 'waterfall_email',
   feature: 'crm_enrichment',
   unit: 'enrichment',
   quantity: 1,

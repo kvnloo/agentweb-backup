@@ -23,6 +23,7 @@ import {
   resolveDestination,
 } from './messagingChannelService';
 import { TEMPLATES } from './whatsappService';
+import { buildSmartleadReplyAlertEmail, isSmartleadReplyAlert } from './smartleadReplyAlertEmail';
 
 const normalizeEventType = (eventType: string) => eventType.trim().toLowerCase();
 
@@ -184,6 +185,26 @@ const sendAlertEmail = async ({
   const leadEngagementUrl = lead?.leadId
     ? `${crmUrl}?listId=${encodeURIComponent(listId)}&leadId=${encodeURIComponent(lead.leadId)}&openEngagement=1`
     : '';
+
+  // A reply that came back through Smartlead (ENG-673) gets its own plain-language email; every other alert keeps the generic one below.
+  if (isSmartleadReplyAlert(eventType, eventData)) {
+    const content = buildSmartleadReplyAlertEmail({
+      leadName,
+      leadEmail,
+      listName,
+      campaignName: typeof eventData?.campaign === 'string' ? eventData.campaign : undefined,
+      replySubject: typeof eventData?.subject === 'string' ? eventData.subject : undefined,
+      replyText: typeof eventData?.replyText === 'string' ? eventData.replyText : undefined,
+      receivedAt: createdAt || new Date().toISOString(),
+      contactUrl: leadEngagementUrl || crmUrl,
+    });
+    if (Array.isArray(ccEmails) && ccEmails.length > 0) {
+      await emailService.sendEmail(userEmail, content.subject, content.text, content.html, ccEmails);
+    } else {
+      await emailService.sendEmail(userEmail, content.subject, content.text, content.html);
+    }
+    return;
+  }
 
   const text = [
     `A new ${eventType} event was recorded.`,

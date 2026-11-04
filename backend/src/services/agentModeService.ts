@@ -177,7 +177,7 @@ import { meterUserUsage } from './usageRecorderService';
 import { meterUsageFromResponse } from '../utils/llmClients';
 import { pickTransport } from './funding/transport';
 import { currentRunFunding } from './funding/runFunding';
-import { recordLlmUsage, customerUpstreamCost } from './funding/recordLlmUsage';
+import { recordLlmUsage, customerUpstreamCost, openRouterByokCostUsd } from './funding/recordLlmUsage';
 import { resolveCallFunding, customerKeyBlocksTurn } from './funding/callFunding';
 import {
   getModelPrice,
@@ -612,6 +612,7 @@ import {
   META_WEBSITE_OPTIMIZATION_GOALS
 } from '../utils/metaConstants';
 import { resolveOptimisationEvent, pixelReceivedEvent } from './metaOptimisationCoverage';
+import { approvalCardIdentity } from './voice/hotLeadCallApprovalGate';
 
 
 /**
@@ -1035,6 +1036,8 @@ interface LLMCallOptions {
   tool_choice?: 'auto' | 'none' | any | null;
   /** Execute search through OpenRouter's provider-independent server tool. */
   webSearch?: boolean;
+  /** Parameters for the web-search server tool (engine, max_results, max_uses, ...); omitted means OpenRouter's defaults. */
+  webSearchParameters?: Record<string, string | number>;
   max_completion_tokens?: number | null;
   temperature?: number | null;
   response_format?: { type: 'text' | 'json_object' } | null;
@@ -2524,6 +2527,7 @@ export class AgentModeService {
       tools = null,
       tool_choice = null,
       webSearch = false,
+      webSearchParameters,
       max_completion_tokens = null,
       temperature = null,
       response_format = null,
@@ -2661,7 +2665,7 @@ export class AgentModeService {
         }) : tool)
       : boundedTools;
     const requestTools = webSearch
-      ? [...normalizedCallerTools, { type: 'openrouter:web_search' }]
+      ? [...normalizedCallerTools, { type: 'openrouter:web_search', ...(webSearchParameters && Object.keys(webSearchParameters).length ? { parameters: webSearchParameters } : {}) }]
       : normalizedCallerTools;
     // ENG-1831: every chain member receives the same parameter set, and
     // require_parameters makes one unsupported field unroutable (ENG-199 404).
@@ -2845,13 +2849,19 @@ export class AgentModeService {
           // recordLlmUsage (it strips this before any AgentWeb rail). Not costUsdOverride:
           // on a non-BYOK response that is AgentWeb's own cost.
           ...customerUpstreamCost(usage),
+          // ENG-2720: on BYOK, upstream tokens PLUS OpenRouter's own charge (web-search fee, BYOK fee).
           costUsdOverride:
             usage.is_byok === true
-              ? typeof usage.cost_details?.upstream_inference_cost === 'number' &&
-                Number.isFinite(usage.cost_details.upstream_inference_cost) &&
-                usage.cost_details.upstream_inference_cost > 0
-                ? usage.cost_details.upstream_inference_cost
-                : undefined
+              ? openRouterByokCostUsd(
+                  usage,
+                  this.estimateCost(
+                    meteredModel,
+                    normalizedUsage.inputTokens,
+                    normalizedUsage.outputTokens,
+                    normalizedUsage.cacheReadTokens,
+                    normalizedUsage.cacheWriteTokens,
+                  ),
+                )
               : typeof usage.cost === 'number'
                 ? usage.cost
                 : undefined,
@@ -14543,8 +14553,16 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
    *  same-iteration halts" behavior the write-deck builder already has. */
   private buildQuestionApprovalDeckFromHalts(questionHalts: any[]): PendingApprovalDeck | null {
     const questions: QuestionDeckQuestionInput[] = [];
+    // The model can repeat a hot lead call approval in one reply, and each call mints its own card; one is enough.
+    const seenCards = new Set<string>();
     for (const r of questionHalts) {
-      if (Array.isArray(r.questionDeckPayload)) questions.push(...r.questionDeckPayload);
+      if (!Array.isArray(r.questionDeckPayload)) continue;
+      for (const q of r.questionDeckPayload) {
+        const identity = approvalCardIdentity(q.kind);
+        if (identity !== null && seenCards.has(identity)) continue;
+        if (identity !== null) seenCards.add(identity);
+        questions.push(q);
+      }
     }
     if (questions.length === 0) return null;
     try {

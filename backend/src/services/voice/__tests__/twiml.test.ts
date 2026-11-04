@@ -9,6 +9,12 @@ import {
   connectTwiml,
   escapeXml,
   hangupTwiml,
+  INBOUND_NOBODY_COPY,
+  INBOUND_UNAVAILABLE_COPY,
+  inboundMemberScreenTwiml,
+  inboundNobodyTwiml,
+  inboundRingTwiml,
+  inboundUnavailableTwiml,
   leadDeclinedTwiml,
   leadPhoneChangedTwiml,
   leadScreenTwiml,
@@ -188,5 +194,35 @@ describe('verificationCodeTwiml', () => {
   });
   it.each(['12345', '1234567', '12&456', '<1234>', '12 456', '１２３４５６', ''])('refuses %j instead of interpolating it', bad => {
     expect(() => verificationCodeTwiml(bad)).toThrow('6 digits');
+  });
+});
+
+describe('inbound callback TwiML', () => {
+  const ring = { memberE164: '+14155550100', callerId: '+14155550111', screenUrl: 'https://x.test/s?orgId=o&tried=m', dialUrl: 'https://x.test/d?a=1&b=2', statusUrl: 'https://x.test/t' };
+
+  it('the refusals say their copy and hang up, nothing else', () => {
+    expect(inboundUnavailableTwiml()).toBe(`<?xml version="1.0" encoding="UTF-8"?><Response><Say>${INBOUND_UNAVAILABLE_COPY}</Say><Hangup/></Response>`);
+    expect(inboundNobodyTwiml()).toBe(`<?xml version="1.0" encoding="UTF-8"?><Response><Say>${INBOUND_NOBODY_COPY}</Say><Hangup/></Response>`);
+  });
+
+  it('rings one member with answerOnBridge, the screening url, an escaped action and the completed status callback', () => {
+    const xml = inboundRingTwiml(ring);
+    expect(xml).toContain('<Dial answerOnBridge="true" callerId="+14155550111"');
+    expect(xml).toContain('action="https://x.test/d?a=1&amp;b=2"');
+    expect(xml).toContain('<Number url="https://x.test/s?orgId=o&amp;tried=m" method="POST" statusCallback="https://x.test/t" statusCallbackEvent="completed"');
+    expect(xml).toContain('>+14155550100</Number>');
+    expect(xml.match(/<Number /g)).toHaveLength(1);
+  });
+
+  it.each([['member', { memberE164: '5550100' }], ['caller id', { callerId: 'abc' }]])('refuses a %s that is not E.164', (_what, over) => {
+    expect(() => inboundRingTwiml({ ...ring, ...over })).toThrow(/E\.164/);
+  });
+
+  it('asks the member to press 1, naming the business with XML escaping, and hangs up on no input', () => {
+    const xml = inboundMemberScreenTwiml({ announcedName: 'Smith & Sons', resultUrl: 'https://x.test/r?a=1&b=2' });
+    expect(xml).toContain('<Say>Smith &amp; Sons: a lead is calling back. Are you available to take the call? Press 1.</Say>');
+    expect(xml).toContain('<Gather input="dtmf" numDigits="1"');
+    expect(xml).toContain('action="https://x.test/r?a=1&amp;b=2"');
+    expect(xml.endsWith(`<Say>${NO_INPUT_COPY}</Say><Hangup/></Response>`)).toBe(true);
   });
 });
