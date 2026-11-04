@@ -10,9 +10,17 @@ try {
   scenario = JSON.parse(fs.readFileSync(cfgDir + "/.fake-scenario", "utf8"));
 } catch {}
 const out = (o) => process.stdout.write(JSON.stringify(o) + "\n");
+// The tests read these files from another process while this one may be killed at any moment (the lifecycle tests kill it at random): a plain writeFileSync leaves an
+// empty or half-written file for a reader that saw it exist ("Unexpected end of JSON input", seen under CPU contention). Written to a temporary name and renamed, a reader
+// sees the whole file or none.
+const writeAtomic = (path, data) => {
+  const tmp = path + "." + process.pid + ".tmp";
+  fs.writeFileSync(tmp, data);
+  fs.renameSync(tmp, path);
+};
 const record = (extra) => {
   try {
-    fs.writeFileSync(cfgDir + "/.fake-last-" + (extra.mode || "x") + ".json", JSON.stringify({ args, env: process.env, cwd: process.cwd(), pid: process.pid, ...extra }));
+    writeAtomic(cfgDir + "/.fake-last-" + (extra.mode || "x") + ".json", JSON.stringify({ args, env: process.env, cwd: process.cwd(), pid: process.pid, ...extra }));
   } catch {}
 };
 // ── stdio MCP client (ENG-2113): what the real CLI does with a {type:"stdio"} server in --mcp-config ──
@@ -24,7 +32,7 @@ const mcpPending = new Map();
 const mcpLog = { lists: [], calls: [], stderr: "", listChanged: 0 };
 const saveMcpLog = () => {
   try {
-    fs.writeFileSync(cfgDir + "/.fake-mcp-log.json", JSON.stringify(mcpLog));
+    writeAtomic(cfgDir + "/.fake-mcp-log.json", JSON.stringify(mcpLog));
   } catch {}
 };
 function mcpSend(o) {
@@ -127,7 +135,7 @@ if (args[0] === "auth" && args[1] === "login") {
     } catch {
       alive = false;
     }
-    fs.writeFileSync(cfgDir + "/.fake-status-saw-turn-alive", String(alive));
+    writeAtomic(cfgDir + "/.fake-status-saw-turn-alive", String(alive));
   } catch {}
   const st = scenario.status || { loggedIn: true, authMethod: "claude.ai", subscriptionType: "max", email: null, orgId: null, orgName: null };
   if (scenario.statusDelayMs) {
