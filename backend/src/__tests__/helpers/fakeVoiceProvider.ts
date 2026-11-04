@@ -71,6 +71,8 @@ export class FakeVoiceProvider implements VoiceProvider {
   }
 
   async buyNumber(p: BuyNumberParams): Promise<{ numberSid: string; phoneNumber: string }> {
+    // Like Twilio, which rejects a malformed voice URL at purchase: the real call would fail after the money is spent.
+    if (p.voiceUrl !== undefined && !/^https?:\/\/[^\s?#]+$/.test(p.voiceUrl)) throw new Error('FakeVoiceProvider: buyNumber voiceUrl must be an absolute http(s) URL without a query');
     this.boughtNumbers.push(p);
     const failure = this.buyNumberFailures.shift();
     if (failure) throw failure;

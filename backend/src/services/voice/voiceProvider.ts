@@ -32,6 +32,11 @@ export interface BuyNumberParams {
   /** ISO 3166-1 alpha-2, e.g. 'US'. */
   countryCode: string;
   areaCode?: string;
+  /**
+   * Where Twilio fetches TwiML when someone calls the new number (POST). Without it the number rings a Twilio
+   * demo message, so provisioning always passes the inbound-callback URL (see inboundVoiceUrl).
+   */
+  voiceUrl?: string;
 }
 
 export interface ValidateSignatureParams {
@@ -226,7 +231,10 @@ class TwilioVoiceProvider implements VoiceProvider {
         limit: 1,
       });
       if (!available) throw new VoiceCallError(`No voice-enabled number available for ${p.countryCode}${p.areaCode ? `/${p.areaCode}` : ''}`, 'no');
-      const bought = await client.incomingPhoneNumbers.create({ phoneNumber: available.phoneNumber });
+      const bought = await client.incomingPhoneNumbers.create({
+        phoneNumber: available.phoneNumber,
+        ...(p.voiceUrl ? { voiceUrl: p.voiceUrl, voiceMethod: 'POST' } : {}),
+      });
       // A 2xx without a sid still means the purchase may have happened: an orphan number.
       if (typeof bought.sid !== 'string' || !bought.sid) {
         throw new VoiceCallError('Twilio buyNumber response carried no number sid; a number may have been bought', 'unknown');

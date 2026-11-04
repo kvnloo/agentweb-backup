@@ -12145,6 +12145,21 @@ export const orgDb = {
     return organizations;
   },
 
+  /**
+   * Every org that holds a hot-lead caller number, as id and number only (projected). There is no index on the
+   * number, so this is a scan; its only caller keeps the result in a short in-process cache (voice/inboundNumberIndex.ts).
+   */
+  async listHotLeadCallNumbers(): Promise<Array<{ orgId: string; twilioNumber: string }>> {
+    const items = await paginatedScan<{ orgId?: unknown; hotLeadCall?: { twilioNumber?: unknown } }>(dynamodb, {
+      TableName: ORGS_TABLE,
+      FilterExpression: 'attribute_exists(#h.#n)',
+      ProjectionExpression: 'orgId, #h.#n',
+      ExpressionAttributeNames: { '#h': 'hotLeadCall', '#n': 'twilioNumber' },
+    });
+    return items.flatMap((i) =>
+      typeof i.orgId === 'string' && typeof i.hotLeadCall?.twilioNumber === 'string' ? [{ orgId: i.orgId, twilioNumber: i.hotLeadCall.twilioNumber }] : []);
+  },
+
   async createOrg(org: Organization): Promise<Organization> {
     const params = {
       TableName: ORGS_TABLE,
