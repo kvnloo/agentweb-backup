@@ -63,7 +63,7 @@ val() { awk -v k="$1" 'index($0, k "=") == 1 { print substr($0, length(k) + 2); 
 # The root-run scripts and templates, against this checkout.
 declare -A SRC=(
   [install.sh]="$P/install.sh" [deploy.sh]="$P/deploy.sh" [lib.sh]="$P/lib.sh" [versions.env]="$P/versions.env"
-  [files/claude-turn.sh]="$D/claude-turn.sh" [files/aw-net.sh]="$D/aw-net.sh" [files/aw-write-file.sh]="$D/aw-write-file.sh"
+  [files/claude-turn.sh]="$D/claude-turn.sh" [files/aw-net.sh]="$D/aw-net.sh" [files/aw-write-file.sh]="$D/aw-write-file.sh" [files/aw-relay-shim.js]="$D/aw-relay-shim.js"
   [files/aw-login-host@.service]="$D/aw-login-host@.service" [files/aw-login-host-failed@.service]="$D/aw-login-host-failed@.service"
   [files/aw-env.slice.template]="$D/aw-env.slice.example" [files/host-config.template.json]="$P/host-config.template.json" [files/system-prompt.txt]="$P/system-prompt.txt"
 )

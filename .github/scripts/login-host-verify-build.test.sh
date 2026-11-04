@@ -20,7 +20,7 @@ mkpkg() { # mkpkg <dir>: a good package laid out like the real build
   local d=$1
   rm -rf "$d"; mkdir -p "$d/$NAME/files" "$d/$NAME/dist/loginHost/host"
   cp "$P/install.sh" "$P/deploy.sh" "$P/lib.sh" "$P/versions.env" "$d/$NAME/"
-  cp "$D/claude-turn.sh" "$D/aw-net.sh" "$D/aw-write-file.sh" "$D/aw-login-host@.service" "$D/aw-login-host-failed@.service" "$d/$NAME/files/"
+  cp "$D/claude-turn.sh" "$D/aw-net.sh" "$D/aw-write-file.sh" "$D/aw-relay-shim.js" "$D/aw-login-host@.service" "$D/aw-login-host-failed@.service" "$d/$NAME/files/"
   cp "$D/aw-env.slice.example" "$d/$NAME/files/aw-env.slice.template"
   cp "$P/host-config.template.json" "$P/system-prompt.txt" "$d/$NAME/files/"
   echo "// bundle" >"$d/$NAME/dist/loginHost/host/start.js"; echo "// c" >"$d/$NAME/check-config.js"; echo "// d" >"$d/$NAME/deployctl.js"
@@ -35,7 +35,7 @@ expect_fail() { # expect_fail <description> <needle>
 mkpkg "$WORK/p"; pack "$WORK/p" "$WORK/$NAME.tar.gz"
 verify "$WORK/$NAME.tar.gz" && ok "a good build is accepted" || bad "good build rejected: $(tail -2 "$WORK/out")"
 
-for f in install.sh deploy.sh lib.sh versions.env files/aw-net.sh files/aw-login-host@.service files/host-config.template.json; do
+for f in install.sh deploy.sh lib.sh versions.env files/aw-net.sh files/aw-relay-shim.js files/aw-login-host@.service files/host-config.template.json; do
   mkpkg "$WORK/p"; echo "# tampered" >>"$WORK/p/$NAME/$f"; pack "$WORK/p" "$WORK/$NAME.tar.gz"
   expect_fail "a tampered $f is refused" "differs from the reviewed file"
 done
