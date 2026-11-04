@@ -19,7 +19,7 @@ jest.mock('../messagingChannelService', () => ({
 }));
 jest.mock('../whatsappService', () => ({ TEMPLATES: {} }));
 
-import { buildSmartleadReplyAlertEmail, formatUtcTime, isSmartleadReplyAlert } from '../smartleadReplyAlertEmail';
+import { buildSmartleadReplyAlertEmail, formatUtcTime, isSmartleadReplyAlert, smartleadReplyContactLabel, smartleadReplyHeadline } from '../smartleadReplyAlertEmail';
 import { leadListAlertService } from '../leadListAlertService';
 import { userDb } from '../db';
 import { emailService } from '../emailService';
@@ -104,8 +104,9 @@ describe('the Smartlead reply alert email', () => {
     expect(e.text).toContain('Their reply:\n> Thanks for reaching out.\n> Can we talk Thursday?');
     expect(e.text).toContain('Smartlead keeps the full thread. Open your Smartlead inbox to answer.');
     expect(e.html).toContain('Thanks for reaching out.<br>Can we talk Thursday?');
-    expect(e.html).toContain('Written by the contact. AgentWeb has not checked it or any link in it.');
-    expect(e.text).toContain('(Written by the contact. AgentWeb has not checked it or any link in it.)');
+    expect(e.html).toContain('The contact&#39;s own words, with the earlier thread left out. Check any link before you click it.');
+    expect(e.text).toContain("(The contact's own words, with the earlier thread left out. Check any link before you click it.)");
+    expect(e.text).not.toContain('has not checked');
   });
 
   it('has no reply block when there is no reply text (a reply found by the poll), and says where to read it', () => {
@@ -267,5 +268,29 @@ describe('the lead list alert uses it only for a Smartlead reply', () => {
     await leadListAlertService.notifyLeadListOwnerIfConfigured({ ...list, alertCcEmails: undefined }, lead, 'email.received', { source: 'smartlead', subject: 'Re: Hi' }, '2026-11-03T09:23:00.000Z');
     expect(send).toHaveBeenCalledTimes(1);
     expect(send.mock.calls[0]).toHaveLength(4);
+  });
+});
+
+describe('the one sentence every channel uses for a Smartlead reply', () => {
+  it('quotes the name, else the address, and says nothing to quote when there is neither', () => {
+    expect(smartleadReplyHeadline('Manan Test', 'm@example.com')).toBe('A new lead "Manan Test" replied to your campaign');
+    expect(smartleadReplyHeadline('m@example.com', 'm@example.com')).toBe('A new lead "m@example.com" replied to your campaign');
+    expect(smartleadReplyHeadline('', 'm@example.com')).toBe('A new lead "m@example.com" replied to your campaign');
+    expect(smartleadReplyHeadline('', '')).toBe('A new lead replied to your campaign');
+    expect(smartleadReplyHeadline(undefined, undefined)).toBe('A new lead replied to your campaign');
+  });
+
+  it('is exactly the email subject, so the channels never drift apart', () => {
+    for (const [name, mail] of [['Manan Test', 'm@example.com'], ['', 'm@example.com'], ['N'.repeat(500), ''], ['', '']] as const) {
+      const e = buildSmartleadReplyAlertEmail({ leadName: name, leadEmail: mail, listName: 'L' });
+      expect(e.subject).toBe(smartleadReplyHeadline(name, mail));
+    }
+  });
+
+  it('shortens a long name to 40 characters and keeps it on one safe line', () => {
+    expect(smartleadReplyContactLabel('N'.repeat(500), '').length).toBeLessThanOrEqual(40);
+    const label = smartleadReplyContactLabel('Ann\nB\u202eob\u200b', 'x@example.com');
+    expect(label).toBe('Ann Bob');
+    expect(label).not.toMatch(/[\n\r\u202e\u200b]/);
   });
 });
