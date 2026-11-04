@@ -910,27 +910,31 @@ export function formatLeadNotificationPayload(lead: LeadNotificationPayload): {
   const timestamp = lead.timestamp || new Date().toISOString();
   const eventLabel = lead.headline || lead.eventType || 'New lead added';
 
+  // A Smartlead reply alert (headline set) escapes the values it shows, since a contact's details are not ours to trust as Slack markup.
+  // Every other alert keeps its values exactly as they were.
+  const val = (v: string): string => (lead.headline ? escapeSlackText(v) : v);
+
   const fields: Array<{ type: string; text: string }> = [];
 
-  fields.push({ type: 'mrkdwn', text: `*Name:*\n${fullName}` });
+  fields.push({ type: 'mrkdwn', text: `*Name:*\n${val(fullName)}` });
 
   if (lead.email) {
-    fields.push({ type: 'mrkdwn', text: `*Email:*\n${lead.email}` });
+    fields.push({ type: 'mrkdwn', text: `*Email:*\n${val(lead.email)}` });
   }
 
   if (lead.company) {
-    fields.push({ type: 'mrkdwn', text: `*Company:*\n${lead.company}` });
+    fields.push({ type: 'mrkdwn', text: `*Company:*\n${val(lead.company)}` });
   }
 
   if (lead.phone) {
-    fields.push({ type: 'mrkdwn', text: `*Phone:*\n${lead.phone}` });
+    fields.push({ type: 'mrkdwn', text: `*Phone:*\n${val(lead.phone)}` });
   }
 
   if (lead.linkedin) {
     fields.push({ type: 'mrkdwn', text: `*LinkedIn:*\n<${lead.linkedin}|Profile>` });
   }
 
-  fields.push({ type: 'mrkdwn', text: `*List:*\n${lead.listName}` });
+  fields.push({ type: 'mrkdwn', text: `*List:*\n${val(lead.listName)}` });
 
   const blocks: any[] = [
     {

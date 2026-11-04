@@ -83,7 +83,7 @@ const NOTE_WITHOUT_REPLY = "Smartlead keeps the full reply. Open your Smartlead 
 /** The most of a reply the email shows. */
 const REPLY_SHOWN_MAX = 600;
 const REPLY_SHOWN_LINES = 15;
-const CAPTION = "The contact's own words, with the earlier thread left out. Check any link before you click it.";
+const CAPTION = "The contact's own words. Check any link before you click it.";
 
 /** The reply text as it is shown: safe characters, line breaks normalized, blank runs shrunk, at most REPLY_SHOWN_LINES lines and REPLY_SHOWN_MAX characters, cut at a word where there is one. */
 const shownReply = (value: unknown): string => {

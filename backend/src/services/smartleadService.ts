@@ -497,10 +497,14 @@ export interface SmartleadCampaignAnalytics {
   unsubscribes: number;
 }
 
-/** A counter Smartlead sends as a string ("38"). Missing or not a whole number >= 0 is an unexpected reply, never a silent zero. */
+/**
+ * A counter Smartlead sends as a string ("38"). Strict: plain digits (or a safe whole number), nothing else. Missing, negative, fractional,
+ * hex or exponent forms and absurd sizes are an unexpected reply, never a silent zero or a plausible-looking wrong number.
+ */
 function analyticsCount(row: Record<string, unknown>, key: string): number {
-  const n = asWholeNumber(row[key]);
-  if (n === undefined || n < 0) throw new SmartleadUnexpectedResponseError(`Smartlead GET /campaigns/{id}/analytics returned no usable ${key}`);
+  const raw = row[key];
+  const n = typeof raw === "number" ? raw : typeof raw === "string" && /^\d{1,15}$/.test(raw.trim()) ? Number(raw.trim()) : NaN;
+  if (!Number.isSafeInteger(n) || n < 0) throw new SmartleadUnexpectedResponseError(`Smartlead GET /campaigns/{id}/analytics returned no usable ${key}`);
   return n;
 }
 
@@ -534,7 +538,7 @@ export async function getCampaignAnalytics(apiKey: string, campaignId: number, o
   };
 }
 
-export type SmartleadEmailStatus ="is_replied" | "is_bounced" | "is_unsubscribed" | "is_sender_bounced";
+export type SmartleadEmailStatus = "is_replied" | "is_bounced" | "is_unsubscribed" | "is_sender_bounced";
 
 export interface SmartleadLeadRow {
   /** Smartlead's own lead id. */

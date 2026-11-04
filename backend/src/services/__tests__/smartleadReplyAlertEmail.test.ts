@@ -104,8 +104,8 @@ describe('the Smartlead reply alert email', () => {
     expect(e.text).toContain('Their reply:\n> Thanks for reaching out.\n> Can we talk Thursday?');
     expect(e.text).toContain('Smartlead keeps the full thread. Open your Smartlead inbox to answer.');
     expect(e.html).toContain('Thanks for reaching out.<br>Can we talk Thursday?');
-    expect(e.html).toContain('The contact&#39;s own words, with the earlier thread left out. Check any link before you click it.');
-    expect(e.text).toContain("(The contact's own words, with the earlier thread left out. Check any link before you click it.)");
+    expect(e.html).toContain('The contact&#39;s own words. Check any link before you click it.');
+    expect(e.text).toContain("(The contact's own words. Check any link before you click it.)");
     expect(e.text).not.toContain('has not checked');
   });
 

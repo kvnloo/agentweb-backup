@@ -291,13 +291,13 @@ describe("smartleadService slice 2 client (ENG-673)", () => {
     // Shape read from a real campaign in AgentWeb's own Smartlead account: every counter is a STRING.
     const live = {
       id: 3083885, name: "ICP2-Final", status: "COMPLETED", sent_count: "38", open_count: "26", click_count: "0", reply_count: "2", unique_sent_count: "13",
-      bounce_count: "1", unsubscribed_count: "3", campaign_lead_stats: { total: 13, completed: 12 }, client_email: "someone@example.com",
+      bounce_count: "1", unsubscribed_count: "3", campaign_lead_stats: { total: 15, completed: 12 }, client_email: "someone@example.com",
     };
 
     it("reads the counters, turning Smartlead's strings into numbers and leaving opens and clicks out", async () => {
       mockedAxios.request.mockResolvedValueOnce({ data: live } as never);
       await expect(getCampaignAnalytics(KEY, 3083885)).resolves.toEqual({
-        campaignId: 3083885, name: "ICP2-Final", status: "COMPLETED", leadsInCampaign: 13, contactsEmailed: 13, emailsSent: 38, replies: 2, bounces: 1, unsubscribes: 3,
+        campaignId: 3083885, name: "ICP2-Final", status: "COMPLETED", leadsInCampaign: 15, contactsEmailed: 13, emailsSent: 38, replies: 2, bounces: 1, unsubscribes: 3,
       });
       expect(mockedAxios.request.mock.calls[0][0].url).toMatch(/\/campaigns\/3083885\/analytics$/);
       expect(mockedAxios.request.mock.calls[0][0].method).toBe("GET");
@@ -323,11 +323,18 @@ describe("smartleadService slice 2 client (ENG-673)", () => {
       await expect(getCampaignAnalytics(KEY, 9)).rejects.toBeInstanceOf(SmartleadUnexpectedResponseError);
     });
 
-    it("never reports a missing or garbled counter as zero", async () => {
-      for (const bad of [{ ...live, reply_count: undefined }, { ...live, bounce_count: "lots" }, { ...live, sent_count: "-4" }]) {
-        mockedAxios.request.mockResolvedValueOnce({ data: bad } as never);
-        await expect(getCampaignAnalytics(KEY, 3083885)).rejects.toBeInstanceOf(SmartleadUnexpectedResponseError);
+    it("never reports a missing or garbled counter as zero, for each of the five counters", async () => {
+      for (const key of ["unique_sent_count", "sent_count", "reply_count", "bounce_count", "unsubscribed_count"]) {
+        for (const bad of [undefined, null, "", "lots", "-4", "3.9", "0x10", "1e3", "99999999999999999999", 2.5, -1, NaN]) {
+          mockedAxios.request.mockResolvedValueOnce({ data: { ...live, [key]: bad } } as never);
+          await expect(getCampaignAnalytics(KEY, 3083885)).rejects.toBeInstanceOf(SmartleadUnexpectedResponseError);
+        }
       }
+    });
+
+    it("accepts plain digit strings and whole numbers, with spaces trimmed", async () => {
+      mockedAxios.request.mockResolvedValueOnce({ data: { ...live, sent_count: " 7 ", reply_count: 3, bounce_count: "0" } } as never);
+      await expect(getCampaignAnalytics(KEY, 3083885)).resolves.toMatchObject({ emailsSent: 7, replies: 3, bounces: 0 });
     });
 
     it("refuses a campaign id that is not a positive whole number without calling Smartlead", async () => {
