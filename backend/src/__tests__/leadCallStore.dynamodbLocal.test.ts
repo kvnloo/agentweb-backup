@@ -193,4 +193,21 @@ suite('hot-lead call store against DynamoDB Local', () => {
     expect(await crmDb.claimLeadStepOnce(LIST, 'nope', 'step')).toBe(false);
     expect(await rowOf('nope')).toBeUndefined();
   });
+
+  it('findLeadsBySystemRecord returns the old live records only, newest first, and stops at its read bound', async () => {
+    const list = 'list-find';
+    const put = (leadId: string, state: string, updatedAt: string) => ddb.put({
+      TableName: 'AW-Leads', Item: { listId: list, leadId, system: { hot_lead_call: { ...baseRecord, state, updatedAt } } },
+    }).promise();
+    await put('lead-1', 'connected', '2026-10-19T10:00:00.000Z'); // stuck
+    await put('lead-2', 'finished', '2026-10-19T10:00:00.000Z'); // terminal
+    await put('lead-3', 'dialing', '2026-10-19T13:00:00.000Z'); // too young
+    await put('lead-4', 'between_attempts', '2026-10-19T09:00:00.000Z'); // stuck
+    await ddb.put({ TableName: 'AW-Leads', Item: { listId: list, leadId: 'lead-5' } }).promise(); // no record
+    const op = { states: ['dialing', 'connected', 'between_attempts'], updatedBefore: '2026-10-19T12:00:00.000Z' };
+
+    expect(await crmDb.findLeadsBySystemRecord(list, 'hot_lead_call', { ...op, maxRead: 100 })).toEqual({ leadIds: ['lead-4', 'lead-1'], read: 5, truncated: false });
+    // The two newest leads are lead-5 and lead-4: only lead-4 matches, and the list is reported as cut short.
+    expect(await crmDb.findLeadsBySystemRecord(list, 'hot_lead_call', { ...op, maxRead: 2 })).toEqual({ leadIds: ['lead-4'], read: 2, truncated: true });
+  });
 });
