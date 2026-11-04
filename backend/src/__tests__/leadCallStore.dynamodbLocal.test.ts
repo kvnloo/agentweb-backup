@@ -209,5 +209,7 @@ suite('hot-lead call store against DynamoDB Local', () => {
     expect(await crmDb.findLeadsBySystemRecord(list, 'hot_lead_call', { ...op, maxRead: 100 })).toEqual({ leadIds: ['lead-4', 'lead-1'], read: 5, truncated: false });
     // The two newest leads are lead-5 and lead-4: only lead-4 matches, and the list is reported as cut short.
     expect(await crmDb.findLeadsBySystemRecord(list, 'hot_lead_call', { ...op, maxRead: 2 })).toEqual({ leadIds: ['lead-4'], read: 2, truncated: true });
+    // Reading exactly the whole list: DynamoDB still answers with a continuation key, so `truncated` is a false positive here (documented).
+    expect(await crmDb.findLeadsBySystemRecord(list, 'hot_lead_call', { ...op, maxRead: 5 })).toEqual({ leadIds: ['lead-4', 'lead-1'], read: 5, truncated: true });
   });
 });

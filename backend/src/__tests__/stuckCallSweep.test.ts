@@ -1,29 +1,36 @@
 /** ENG-2271: the per-state decision table of the stuck-record sweep, on a fake clock, plus its mode switch and cron log levels. */
+import { HOT_LEAD_CALL_LIMITS } from '../services/hotLeadCallConfig';
+import { MEMBER_RING_TIMEOUT_SECONDS } from '../services/hotLeadCallPlacement';
 import { STUCK_AFTER_MS, decideStuck, stuckSweepMode } from '../services/voice/stuckCallSweep';
+import { BRIDGED_CALL_TIME_LIMIT_SECONDS, GATHER_TIMEOUT_SECONDS, LEAD_DIAL_TIMEOUT_SECONDS } from '../services/voice/twiml';
 import * as sweep from '../services/voice/stuckCallSweep';
 import { runStuckCallSweepCron } from '../cron/stuckCallSweepCron';
 import { callRecord } from './helpers/hotLeadCallFixtures';
 
 const T0 = Date.parse('2026-11-04T12:00:00.000Z');
 const minutes = (n: number) => n * 60_000;
-/** A record last written `agoMs` before T0 + 0. */
+/** The ISO time `agoMs` before T0. */
 const written = (agoMs: number) => new Date(T0 - agoMs).toISOString();
 
 describe('thresholds derived from the call flow', () => {
   it('are the longest healthy dwell of each state plus ten minutes of grace', () => {
+    const grace = minutes(10);
+    const bridged = (BRIDGED_CALL_TIME_LIMIT_SECONDS + LEAD_DIAL_TIMEOUT_SECONDS + 2 * GATHER_TIMEOUT_SECONDS) * 1000;
     expect(STUCK_AFTER_MS).toEqual({
-      dialing: minutes(10),
-      member_ringing: 25_000 + minutes(10),
-      member_answered: 8_000 + minutes(10),
-      bridging: (1800 + 25 + 16) * 1000 + minutes(10),
-      connected: (1800 + 25 + 16) * 1000 + minutes(10),
-      between_attempts: minutes(70),
+      dialing: grace,
+      member_ringing: MEMBER_RING_TIMEOUT_SECONDS * 1000 + grace,
+      member_answered: GATHER_TIMEOUT_SECONDS * 1000 + grace,
+      bridging: bridged + grace,
+      connected: bridged + grace,
+      // A further attempt is refused once the lead is older than maxAgeMinutes (at most 60): 60 + 10 minutes.
+      between_attempts: HOT_LEAD_CALL_LIMITS.maxAgeMinutes.max * 60_000 + grace,
     });
+    expect(STUCK_AFTER_MS.between_attempts).toBe(minutes(70));
   });
 });
 
 describe('decideStuck', () => {
-  const states = ['member_ringing', 'member_answered', 'bridging', 'connected'] as const;
+  const states = ['dialing', 'member_ringing', 'member_answered', 'bridging', 'connected'] as const;
 
   it.each(states)('%s: live one millisecond before its threshold, reconciled at it', (state) => {
     const r = callRecord({ state, memberCallSid: 'CA1', leadCallSid: 'CA2' });
@@ -32,12 +39,12 @@ describe('decideStuck', () => {
     expect(at(STUCK_AFTER_MS[state])).toMatchObject({ action: 'reconcile' });
   });
 
-  it('member states settle the member leg only; bridged states also the lead leg', () => {
+  it('member states settle the member leg only; bridged states the lead leg first, then the member', () => {
     const old = written(minutes(200));
     expect(decideStuck(callRecord({ state: 'member_ringing', memberCallSid: 'CA1', updatedAt: old }), T0))
       .toEqual({ action: 'reconcile', legs: [{ leg: 'member', callSid: 'CA1' }] });
     expect(decideStuck(callRecord({ state: 'connected', memberCallSid: 'CA1', leadCallSid: 'CA2', updatedAt: old }), T0))
-      .toEqual({ action: 'reconcile', legs: [{ leg: 'member', callSid: 'CA1' }, { leg: 'lead', callSid: 'CA2' }] });
+      .toEqual({ action: 'reconcile', legs: [{ leg: 'lead', callSid: 'CA2' }, { leg: 'member', callSid: 'CA1' }] });
   });
 
   it('skips a leg that is already metered, and finishes when none is left', () => {
@@ -58,6 +65,9 @@ describe('decideStuck', () => {
     expect(decideStuck(callRecord({ state: 'dialing', updatedAt: old }), T0)).toMatchObject({ action: 'needs_human' });
     expect(decideStuck(callRecord({ state: 'dialing', outcome: 'placement_unknown', updatedAt: old }), T0)).toMatchObject({ action: 'needs_human' });
     expect(decideStuck(callRecord({ state: 'bridging', memberCallSid: 'CA1', updatedAt: old }), T0)).toMatchObject({ action: 'needs_human' });
+    for (const state of ['member_ringing', 'member_answered'] as const) {
+      expect(decideStuck(callRecord({ state, updatedAt: old }), T0)).toMatchObject({ action: 'needs_human' });
+    }
   });
 
   it('between_attempts is closed only after the lead is too old for another attempt', () => {
