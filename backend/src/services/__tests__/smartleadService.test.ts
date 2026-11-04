@@ -310,8 +310,10 @@ describe("smartleadService slice 2 client (ENG-673)", () => {
       expect(r).not.toHaveProperty("leadsInCampaign");
     });
 
-    it("gives null for the empty 200 of a missing campaign, and errors for anything that is not that campaign", async () => {
+    it("gives null for the empty reply of a missing campaign (live: HTTP 200 with {}), and errors for anything that is not that campaign", async () => {
       mockedAxios.request.mockResolvedValueOnce({ data: "" } as never);
+      await expect(getCampaignAnalytics(KEY, 9)).resolves.toBeNull();
+      mockedAxios.request.mockResolvedValueOnce({ data: {} } as never);
       await expect(getCampaignAnalytics(KEY, 9)).resolves.toBeNull();
       mockedAxios.request.mockResolvedValueOnce({ data: { message: "Plan expired" } } as never);
       await expect(getCampaignAnalytics(KEY, 9)).rejects.toBeInstanceOf(SmartleadUnexpectedResponseError);
