@@ -1401,6 +1401,174 @@ export async function getLeadsNeedingFollowup(listId: string, userId: string, op
   }
 
   /**
+   * ENG-2811: batched, read-only conversation-status audit for a lead list.
+   *
+   * Audit-style asks ("what's the LinkedIn status of these 64 leads?") used to
+   * fan out one get_lead_details / linkedin_outreach call per lead; every turn
+   * resent the whole history, so one Opiner audit ran 549 turns. This returns a
+   * compact status row per lead in ONE call, loading the cross-lead signal with
+   * the same constant query set as getLeadsNeedingFollowup (connections table,
+   * LinkedIn events, email events) — no per-lead Unipile calls, no writes.
+   *
+   * Scoping: access is checked on the requested list exactly like
+   * getLeadDetails. Explicit lead_ids are looked up ONLY inside that list, so an
+   * id from another list/tenant comes back as {status:'not_found'} and never
+   * leaks data. Per-lead lookup failures are reported per item.
+   */
+export async function getLeadConversationStatuses(listId: string, userId: string, options: {
+    leadIds?: string[];
+    limit?: number;
+    cursor?: string;
+  } = {}): Promise<any> {
+    try {
+      const { crmDb, userDb } = await import('../../services/db');
+      const limit = Math.min(Math.max(Math.floor(options.limit || 100), 1), 200);
+      const MAX_LEAD_IDS = 200;
+
+      const list = await crmDb.getLeadListById(listId);
+      if (!list) {
+        return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
+      }
+      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccess) {
+        return { success: false, message: 'Access denied', error: 'You do not have permission to access this list' };
+      }
+
+      const rawIds = Array.isArray(options.leadIds) ? options.leadIds : [];
+      const leadIds = Array.from(new Set(rawIds.map((id) => String(id || '').trim()).filter(Boolean)));
+      if (leadIds.length > MAX_LEAD_IDS) {
+        return {
+          success: false,
+          message: `Too many lead_ids (${leadIds.length}); max ${MAX_LEAD_IDS} per call`,
+          error: `Split lead_ids into batches of at most ${MAX_LEAD_IDS}, or omit lead_ids and page the whole list with cursor.`,
+        };
+      }
+
+      // --- Constant-query signal loading (NO per-lead fan-out) ---
+      const accountId: string | null = (list as any).linkedInAccountId ?? null;
+      const { emailEventsDb } = await import('../../services/emailEventsDb');
+      const { getAllConnectionsByAccount, normalizeLinkedInUrl } = await import('../../services/unipileConnectionsDb');
+      const user = await userDb.getUserById(userId);
+      const emailDomain = user?.emailDomain?.trim();
+      const [connections, linkedInEvents, emailEvents] = await Promise.all([
+        accountId ? getAllConnectionsByAccount(accountId).catch(() => []) : Promise.resolve([]),
+        emailEventsDb.getEventsByEmailDomain(`linkedin-${listId}`).catch(() => []),
+        emailDomain ? emailEventsDb.getEventsByEmailDomain(emailDomain).catch(() => []) : Promise.resolve([]),
+      ]);
+
+      const connectedAtByUrl = new Map<string, number>();
+      for (const c of connections as any[]) {
+        const url = String(c?.publicProfileUrl || '').trim().toLowerCase();
+        if (!url) continue;
+        const ts = typeof c?.connectedAt === 'number' ? c.connectedAt : 0;
+        const existing = connectedAtByUrl.get(url);
+        if (existing === undefined || ts < existing) connectedAtByUrl.set(url, ts);
+      }
+      type Signal = { at: number; type: string; direction: 'inbound' | 'outbound' };
+      const directionOf = (eventType: string): 'inbound' | 'outbound' =>
+        /received|replied/i.test(eventType) ? 'inbound' : 'outbound';
+      const linkedInSignalByUrl = new Map<string, Signal>();
+      for (const e of linkedInEvents as any[]) {
+        const url = String(e?.leadEmail || '').trim().toLowerCase();
+        if (url) foldEngagementSignal(linkedInSignalByUrl, url, e, directionOf);
+      }
+      const emailSignalByEmail = new Map<string, Signal>();
+      for (const e of emailEvents as any[]) {
+        const email = String(e?.leadEmail || '').trim().toLowerCase();
+        if (email) foldEngagementSignal(emailSignalByEmail, email, e, directionOf);
+      }
+
+      const toRow = (lead: any) => {
+        const url = lead.linkedin ? normalizeLinkedInUrl(String(lead.linkedin)).toLowerCase() : '';
+        const connectedAt = url ? connectedAtByUrl.get(url) : undefined;
+        const leadEmail = String(lead.email || '').trim().toLowerCase();
+        const liSig = url ? linkedInSignalByUrl.get(url) : undefined;
+        const emSig = leadEmail ? emailSignalByEmail.get(leadEmail) : undefined;
+        const last = [liSig, emSig].filter((x): x is Signal => !!x).sort((a, b) => b.at - a.at)[0];
+        const connectionState = !accountId || !url ? 'unknown' : connectedAt !== undefined ? 'connected' : 'not_connected';
+        return {
+          leadId: lead.leadId,
+          status: 'ok',
+          name: [lead.firstName, lead.lastName].filter(Boolean).join(' '),
+          company: lead.company || '',
+          leadStatus: lead.status || null,
+          linkedin: lead.linkedin || '',
+          connectionState,
+          connectedAt: connectedAt !== undefined ? new Date(connectedAt).toISOString() : null,
+          lastMessageChannel: last ? (last === liSig ? 'linkedin' : 'email') : null,
+          lastMessageType: last?.type ?? null,
+          lastMessageDirection: last?.direction ?? null,
+          lastMessageAt: last ? new Date(last.at).toISOString() : null,
+          replyState: !last ? 'no_messages' : last.direction === 'inbound' ? 'replied_awaiting_us' : 'awaiting_their_reply',
+        };
+      };
+
+      const base = {
+        listName: list.name,
+        linkedInAccountAssigned: !!accountId,
+        ...(accountId ? {} : { note: 'No LinkedIn account on this list, so connectionState is "unknown"; message history is still reported.' }),
+      };
+
+      if (leadIds.length > 0) {
+        const rows: any[] = [];
+        const CONCURRENCY = 10;
+        for (let i = 0; i < leadIds.length; i += CONCURRENCY) {
+          const chunk = leadIds.slice(i, i + CONCURRENCY);
+          const settled = await Promise.allSettled(chunk.map((id) => crmDb.getLeadById(listId, id)));
+          settled.forEach((r, j) => {
+            const id = chunk[j];
+            if (r.status === 'rejected') {
+              rows.push({ leadId: id, status: 'error', error: r.reason instanceof Error ? r.reason.message : 'Lookup failed' });
+            } else if (!r.value || (r.value as any).listId && (r.value as any).listId !== listId) {
+              rows.push({ leadId: id, status: 'not_found' });
+            } else {
+              rows.push(toRow(r.value));
+            }
+          });
+        }
+        const ok = rows.filter((r) => r.status === 'ok').length;
+        return {
+          success: true,
+          message: `Status for ${ok}/${rows.length} requested lead(s)`,
+          ...base,
+          leads: rows,
+          count: rows.length,
+          notFound: rows.filter((r) => r.status === 'not_found').length,
+          errors: rows.filter((r) => r.status === 'error').length,
+          hasMore: false,
+          nextCursor: null,
+        };
+      }
+
+      // Whole-list mode: one page of up to `limit` leads, resumable via cursor.
+      let startKey: any = undefined;
+      if (options.cursor) {
+        try {
+          startKey = JSON.parse(Buffer.from(String(options.cursor), 'base64').toString('utf8'));
+        } catch {
+          return { success: false, message: 'Invalid cursor', error: 'Pass back nextCursor exactly as returned by the previous call.' };
+        }
+      }
+      const page = await crmDb.getLeadsByListId(listId, limit, startKey);
+      const items: any[] = page.items || [];
+      const rows = items.map(toRow);
+      const nextKey = page.lastEvaluatedKey;
+      return {
+        success: true,
+        message: `Status for ${rows.length} lead(s)${nextKey ? ' (more available — call again with nextCursor)' : ''}`,
+        ...base,
+        leads: rows,
+        count: rows.length,
+        hasMore: !!nextKey,
+        nextCursor: nextKey ? Buffer.from(JSON.stringify(nextKey), 'utf8').toString('base64') : null,
+      };
+    } catch (error) {
+      console.error('AgentMode: Error getting lead conversation statuses:', error);
+      return { success: false, message: 'Failed to get lead conversation statuses', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
    * Fold a single engagement event into a per-key "last engagement" signal map,
    * keeping only the most-recent engagement per key. Shared by the
    * LinkedIn-URL-keyed and email-keyed signal builders.

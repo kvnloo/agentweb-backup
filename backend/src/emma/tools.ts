@@ -3877,6 +3877,31 @@ emmaToolRegistry.register({
 });
 
 emmaToolRegistry.register({
+  name: 'get_lead_conversation_statuses',
+  definition: {
+    name: 'get_lead_conversation_statuses',
+    description: 'READ-ONLY batch audit: one compact conversation-status row per lead (name, company, leadStatus, LinkedIn connectionState, last message channel/direction/date, replyState) for a whole lead list or for up to 200 lead_ids in ONE call. Use this for any multi-lead status/audit question ("what is the LinkedIn status of these leads", "who replied", "lead list activity report") instead of calling get_lead_details or linkedin_outreach once per lead. Paginate the whole list with cursor/nextCursor. lead_ids outside the list come back as status "not_found". Never sends or changes anything.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_id: { type: 'string', description: 'The lead list to audit' },
+        lead_ids: { type: 'array', items: { type: 'string' }, description: 'Optional: specific lead IDs in this list (max 200). Omit to page through the whole list.' },
+        limit: { type: 'number', description: 'Whole-list mode page size (default 100, max 200)' },
+        cursor: { type: 'string', description: 'Whole-list mode: nextCursor from the previous call' },
+      },
+      required: ['list_id']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await leadsImpl.getLeadConversationStatuses(args.list_id, context?.userId, {
+      leadIds: args.lead_ids,
+      limit: args.limit,
+      cursor: args.cursor,
+    });
+  }
+});
+
+emmaToolRegistry.register({
   name: 'update_lead',
   definition: {
     name: 'update_lead',
