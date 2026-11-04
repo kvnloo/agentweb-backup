@@ -12205,6 +12205,21 @@ export const orgDb = {
       typeof i.orgId === 'string' && typeof i.hotLeadCall?.twilioNumber === 'string' ? [{ orgId: i.orgId, twilioNumber: i.hotLeadCall.twilioNumber }] : []);
   },
 
+  /**
+   * The id of every org that has ANY hot-lead config, as the id only (projected). Wider than listHotLeadCallNumbers:
+   * releasing a number removes the number fields but keeps the config (calling off), so an org that released its
+   * number still shows here. Same scan, same projected read; caller: the stuck-record sweep (voice/stuckCallSweep.ts).
+   */
+  async listHotLeadCallOrgIds(): Promise<string[]> {
+    const items = await paginatedScan<{ orgId?: unknown }>(dynamodb, {
+      TableName: ORGS_TABLE,
+      FilterExpression: 'attribute_exists(#h)',
+      ProjectionExpression: 'orgId',
+      ExpressionAttributeNames: { '#h': 'hotLeadCall' },
+    });
+    return items.flatMap((i) => (typeof i.orgId === 'string' ? [i.orgId] : []));
+  },
+
   async createOrg(org: Organization): Promise<Organization> {
     const params = {
       TableName: ORGS_TABLE,

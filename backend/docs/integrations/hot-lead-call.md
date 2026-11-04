@@ -1027,15 +1027,17 @@ never calls `placeCall`, never asks for a next member and never hangs up a call.
 (every write is the store's conditional transition; a leg is billed only by the one writer that wins its `meteredLegs`
 entry, and the usage event's key is per call sid and leg).
 
-**How it finds records (no table, index or migration).** `orgDb.listHotLeadCallNumbers` (the scan the inbound index
-already makes: orgs that hold a caller number, projected to id and number), then per org its members
+**How it finds records (no table, index or migration).** `orgDb.listHotLeadCallOrgIds` (a projected scan of AW-Organizations for
+orgs with ANY `hotLeadCall` attribute, ids only; releasing a number removes the number fields but keeps the config with
+calling off, so an org that released its number is still swept. It reads the same org items as the inbound index's
+number scan, `listHotLeadCallNumbers`, and the filter is looser by exactly the orgs that were configured but hold no number
+now; the read cost of an org scan is the org table either way, once a day here against every 60 s per instance there), then per org its members
 (`OrgIdIndex` query), their lead lists (`userId-index` query; session lists are skipped) and, per list, the NEWEST leads
 of the list through `crmDb.findLeadsBySystemRecord`: a query on the list's own partition (newest `leadId` first) with a
 filter on `system.hot_lead_call.state` and `updatedAt`, so only ids come back. Bounds: at most 500 leads read per list,
 10,000 per run, 50 records settled per run (the rest wait for the next run, `truncated: true` in the summary). The read cost
 is that count of lead items per run (DynamoDB charges the leads examined, not the ids returned) plus a few small queries
-per org; the Twilio cost is at most two read-only call fetches per record. Not covered: an org that released its number
-(the number fields are removed, so the org no longer shows in the scan), a list of a member who left the org, and a stuck
+per org; the Twilio cost is at most two read-only call fetches per record. Not covered: a list of a member who left the org, and a stuck
 record older than the newest 500 leads of its list. Each record found is re-read consistently and decided on that read.
 
 **When a record counts as stuck.** Time since the record's last write (`updatedAt`; every transition refreshes it) against

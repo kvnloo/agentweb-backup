@@ -189,6 +189,42 @@ describe('records with nothing to ask Twilio', () => {
   });
 });
 
+describe('which orgs are swept', () => {
+  /** A connected call whose final callbacks never came, seeded on a list of org `id`. */
+  function seedStuck(id: string, hotLeadCall?: Record<string, unknown>) {
+    world.crm.addOrg({ orgId: id, ...(hotLeadCall ? { hotLeadCall } : {}) }, [{ userId: `owner-${id}` }], [{ listId: `list-${id}`, userId: `owner-${id}` }]);
+    world.crm.addLead({ listId: `list-${id}`, leadId: 'lead-x' });
+    const old = new Date(Date.now() - 120 * 60_000).toISOString();
+    world.crm.lead(`list-${id}`, 'lead-x').system = {
+      hot_lead_call: callRecord({ state: 'connected', startedAt: old, updatedAt: old, memberCallSid: `CAM${id}`, leadCallSid: `CAL${id}`, meteredLegs: [], lastSequence: {} }),
+    };
+    world.provider.setCall(`CAM${id}`, { status: 'completed', durationSeconds: 60 });
+    world.provider.setCall(`CAL${id}`, { status: 'completed', durationSeconds: 60 });
+  }
+  // What releasing a number leaves behind: the config with calling off and the number fields removed.
+  const released = { enabled: false, team: [], announcedName: 'Acme' };
+
+  it('an org that released its number is reported in report-only mode and closed in close mode', async () => {
+    seedStuck('org-r', released);
+    process.env[ENV] = 'report';
+    const before = snapshot();
+    expect(await sweep()).toMatchObject({ found: 1, wouldClose: 1, closed: 0 });
+    expect(snapshot()).toBe(before);
+
+    process.env[ENV] = 'close';
+    expect(await sweep()).toMatchObject({ found: 1, closed: 1 });
+    expect(world.crm.lead('list-org-r', 'lead-x').system?.hot_lead_call).toMatchObject({ state: 'finished', outcome: 'completed' });
+  });
+
+  it('an org with no hot-lead attribute is not read or touched', async () => {
+    seedStuck('org-n');
+    const before = snapshot();
+    expect(await sweep()).toMatchObject({ found: 0, closed: 0 });
+    expect(snapshot()).toBe(before);
+    expect(world.provider.fetchedSids).toEqual([]);
+  });
+});
+
 describe('modes and safety', () => {
   it.each([undefined, 'report', 'yes'])('report-only (HOT_LEAD_CALL_STUCK_SWEEP=%s) writes nothing but still reads Twilio', async (value) => {
     if (value === undefined) delete process.env[ENV]; else process.env[ENV] = value;

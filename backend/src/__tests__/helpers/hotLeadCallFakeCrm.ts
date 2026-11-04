@@ -164,6 +164,10 @@ export class FakeCrm {
       this.calls.push('getOrgMembers');
       return [...this.users.values()].filter((u) => u.orgId === orgId).map(clone);
     },
+    listHotLeadCallOrgIds: async () => {
+      this.calls.push('listHotLeadCallOrgIds');
+      return [...this.orgs.entries()].filter(([, org]) => org.hotLeadCall !== undefined).map(([orgId]) => orgId);
+    },
     listHotLeadCallNumbers: async () => {
       this.calls.push('listHotLeadCallNumbers');
       if (this.listFails) throw new Error('scan failed');

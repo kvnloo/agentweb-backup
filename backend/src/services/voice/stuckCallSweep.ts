@@ -211,12 +211,12 @@ async function handle(c: Candidate, mode: StuckSweepMode, nowMs: number): Promis
   return after?.state === 'finished' || after?.state === 'failed' ? 'closed' : 'moved';
 }
 
-/** Records older than their state allows, from the orgs that hold a number: org -> members -> their lists -> newest leads. */
+/** Records older than their state allows, from the orgs that have a hot-lead config (a released number keeps it): org -> members -> their lists -> newest leads. */
 async function findCandidates(nowMs: number, summary: StuckSweepSummary): Promise<Candidate[]> {
   const found: Candidate[] = [];
   // The DB filter uses the youngest threshold (one query per list); decideStuck applies the exact one per state.
   const updatedBefore = new Date(nowMs - Math.min(...Object.values(STUCK_AFTER_MS))).toISOString();
-  for (const { orgId } of await orgDb.listHotLeadCallNumbers()) {
+  for (const orgId of await orgDb.listHotLeadCallOrgIds()) {
     summary.orgs++;
     try {
       const lists = new Map<string, { listId: string }>();

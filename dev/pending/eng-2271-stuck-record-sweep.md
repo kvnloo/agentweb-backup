@@ -4,10 +4,11 @@ A daily sweep (`services/voice/stuckCallSweep.ts`, `cron/stuckCallSweepCron.ts`,
 hot-lead call records that stayed live longer than a call can last and settles them from Twilio's own record of the
 call. It ships REPORT-ONLY: set `HOT_LEAD_CALL_STUCK_SWEEP=close` to let it write, `off` to disable it.
 
-- No table, index or migration. Candidates: orgs that hold a caller number (`orgDb.listHotLeadCallNumbers`) -> members
+- No table, index or migration. Candidates: orgs with any hot-lead config (`orgDb.listHotLeadCallOrgIds`, so an org that
+  released its number is still swept) -> members
   -> lead lists -> the newest 500 leads per list through `crmDb.findLeadsBySystemRecord` (a partition query with a
   state/updatedAt filter, so the read cost is leads examined: capped at 10,000 per run, 50 records settled per run).
-  Orgs that released their number, lists of departed members and records beyond the newest 500 leads of a list are not
+  Lists of departed members and records beyond the newest 500 leads of a list are not
   covered.
 - Thresholds are derived from the call flow (`STUCK_AFTER_MS`): ring 25 s, prompt 8 s, `<Dial timeLimit>` 1800 s, plus 10
   minutes of grace; `between_attempts` 70 minutes (a further attempt is refused after `maxAgeMinutes`, at most 60).
