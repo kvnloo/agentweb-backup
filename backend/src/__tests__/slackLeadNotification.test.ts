@@ -165,6 +165,31 @@ describe('formatLeadNotificationPayload — a headline sentence (Smartlead reply
     expect(plain.blocks[1].fields.find((f: { text: string }) => f.text.startsWith('*LinkedIn:*')).text).toBe('*LinkedIn:*\n<https://linkedin.com/in/janedoe|Profile>');
   });
 
+  it('shows a LinkedIn value that is not an http(s) address as plain text, never inside <...> where Slack reads !channel, @user and #channel as special links', () => {
+    for (const value of ['!channel', '!here', '@U012ABCDEF', '#C012ABCDEF', '!subteam^S0123', 'javascript:alert(1)', 'ftp://x.example', '<!channel>']) {
+      const r = formatLeadNotificationPayload({ ...lead, headline: 'A new lead replied to your campaign', linkedin: value });
+      const text = r.blocks[1].fields.find((f: { text: string }) => f.text.startsWith('*LinkedIn:*')).text;
+      expect(text).not.toContain('<');
+      expect(text).not.toContain('|Profile');
+    }
+    // an http(s) address is still a link, in any letter case
+    const ok = formatLeadNotificationPayload({ ...lead, headline: 'h', linkedin: 'HTTPS://linkedin.com/in/jane' });
+    expect(ok.blocks[1].fields.find((f: { text: string }) => f.text.startsWith('*LinkedIn:*')).text).toBe('*LinkedIn:*\n<HTTPS://linkedin.com/in/jane|Profile>');
+  });
+
+  it('keeps spaces, tabs, new lines and line separators in a LinkedIn link target from ending or splitting the link', () => {
+    const r = formatLeadNotificationPayload({ ...lead, headline: 'h', linkedin: 'https://linkedin.com/in/a b\tc\nd\u2028e' });
+    const text = r.blocks[1].fields.find((f: { text: string }) => f.text.startsWith('*LinkedIn:*')).text;
+    const link = text.slice(text.indexOf('<'));
+    expect(link).toBe('<https://linkedin.com/in/a%20b%09c%0Ad%E2%80%A8e|Profile>');
+    expect(/\s/.test(link)).toBe(false);
+  });
+
+  it('does not throw when the list name is not a string', () => {
+    expect(() => formatLeadNotificationPayload({ ...lead, headline: 'h', listName: 5 as unknown as string })).not.toThrow();
+    expect(() => formatLeadNotificationPayload({ ...lead, headline: 'h', listName: undefined as unknown as string })).not.toThrow();
+  });
+
   it('leaves every alert without a headline exactly as it was (the raw event name and the old fallback)', () => {
     const r = formatLeadNotificationPayload(lead);
     expect(r.blocks[0].text.text).toBe('email.received');
