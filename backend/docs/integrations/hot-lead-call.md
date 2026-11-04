@@ -542,6 +542,9 @@ calls the tool again with the same arguments and it acts.
   minutes ago, and not used yet. Declining, ignoring or letting it expire makes the
   next call show a fresh card. An approval is spent when it is claimed, so a final
   write that then loses a race or fails needs a new card (as for provision and release).
+- One card per identical change: if one reply repeats the same call (same digest), the deck
+  keeps a single card for it (`buildQuestionApprovalDeckFromHalts`), so answering it is
+  enough; two different changes still get a card each.
 - Single use: immediately before buying or releasing, the approval is claimed
   with `chatbotDb.claimMetaWriteManifestDigest(sessionId, "hotlead:" + kind)`
   (an entry in the session's existing `consumedMetaWriteManifestDigests` map; the

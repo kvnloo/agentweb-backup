@@ -694,6 +694,20 @@ describe('human approval for turning calling on', () => {
     expect(writes).toEqual([]);
     expect(chatbotDb.claimMetaWriteManifestDigest).not.toHaveBeenCalled();
   });
+  it('builds identical cards for identical calls in one reply (same kind but for the nonce), and another card for another change', async () => {
+    const [first, second, other] = [await call(), await call(), await call({ enabled: true, maxCallsPerHour: 3 })];
+    const prefixOf = (halt: Halt) => halt.questionDeckPayload![0].kind.replace(/:[0-9a-f]+$/, '');
+    expect(prefixOf(first)).toBe(prefixOf(second));
+    expect(prefixOf(other)).not.toBe(prefixOf(first));
+  });
+  it('a second identical call after the first one enabled succeeds without a card or another approval', async () => {
+    answerCard(recordHalt(await call()), 'approve');
+    await call();
+    const again = await call();
+    expect(again).toMatchObject({ success: true, enabled: true });
+    expect(again.awaitingUserConfirmation).toBeUndefined();
+    expect(chatbotDb.claimMetaWriteManifestDigest).toHaveBeenCalledTimes(1);
+  });
   it('names every verified member, also with an apostrophe, ampersand or accent in the name', async () => {
     org.hotLeadCall = withNumber({ team: [
       teamMember('+14155550100', { name: "Dana O'Neil & Sons" }),

@@ -77,6 +77,14 @@ export function newApprovalKind(action: HotLeadCallApprovalAction, digest: strin
   return approvalKindPrefix(action, digest) + randomBytes(8).toString('hex');
 }
 
+/**
+ * The card kind without its nonce, or null for a kind this module did not write. Two cards with the same identity
+ * ask the same question about the same change, so a reply that produced both needs to show only one.
+ */
+export function approvalCardIdentity(kind: unknown): string | null {
+  return typeof kind === 'string' && kind.startsWith(APPROVAL_KIND_RESERVED_PREFIX) ? kind.slice(0, kind.lastIndexOf(':') + 1) : null;
+}
+
 export function consumedKeyOf(kind: string): string {
   return `${CONSUMED_KEY_PREFIX}${kind}`;
 }
