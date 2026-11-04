@@ -130,3 +130,29 @@ describe('buildRollback (ENG-2797)', () => {
     expect(buildRollback(mut({ changes: {} }), prior)).toBeNull();
   });
 });
+
+describe('ENG-2797 CodeRabbit hardening', () => {
+  it('refuses a classification computed for a different mutation', () => {
+    const safe = { actionType: 'pause_ad', objectLevel: 'ad', objectId: 'a1', owned: true, changes: { status: 'PAUSED' } };
+    const other = { actionType: 'delete_campaign', objectLevel: 'campaign', objectId: 'c1', owned: true, changes: { status: 'DELETED' } };
+    expect(authorizeExecution(safe, classifyMarketingActionRisk(safe)).allowed).toBe(true);
+    const r = authorizeExecution(other, classifyMarketingActionRisk(safe));
+    expect(r.allowed).toBe(false);
+    expect(r.reason).toMatch(/does not match/);
+  });
+
+  it('hashes an own __proto__ field so it cannot be dropped from the approved payload', () => {
+    const base = { actionType: 'scale_budget', objectLevel: 'ad', objectId: 'a1', owned: true, changes: { daily_budget: 10 } };
+    const withProto = { ...base, changes: JSON.parse('{"daily_budget":10,"__proto__":{"x":1}}') };
+    expect(hashMarketingMutation(withProto)).not.toBe(hashMarketingMutation(base));
+  });
+
+  it('preserves an own __proto__ field in the rollback inverse', () => {
+    const m = { actionType: 'update_targeting', objectLevel: 'ad', objectId: 'a1', owned: true, changes: JSON.parse('{"__proto__":{"a":1}}') };
+    const prior = JSON.parse('{"__proto__":{"a":0}}');
+    const rb = buildRollback(m, prior);
+    expect(rb).not.toBeNull();
+    expect(Object.prototype.hasOwnProperty.call(rb!.changes, '__proto__')).toBe(true);
+  });
+});
+

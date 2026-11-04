@@ -12,6 +12,7 @@
  *   - Fail closed: anything not proven authorized AND reversible is refused.
  */
 import { createHash } from 'crypto';
+import { classifyMarketingActionRisk } from './marketingActionRisk';
 import type {
   MarketingActionObjectLevel,
   MarketingActionRiskClass,
@@ -52,7 +53,8 @@ const IRREVERSIBLE_CLASSES: ReadonlySet<MarketingActionRiskClass> = new Set<Mark
 function canonicalize(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalize);
   if (value && typeof value === 'object') {
-    const out: Record<string, unknown> = {};
+    // Null prototype: an own `__proto__` key stays an ordinary own property.
+    const out: Record<string, unknown> = Object.create(null);
     for (const key of Object.keys(value as Record<string, unknown>).sort()) {
       out[key] = canonicalize((value as Record<string, unknown>)[key]);
     }
@@ -77,6 +79,15 @@ export function authorizeExecution(
 ): ExecutionAuthorization {
   if (!proposedMutation || !classification) {
     return { allowed: false, reason: 'missing mutation or classification; fail closed' };
+  }
+  // Bind the classification to this exact mutation: a classification produced
+  // for a different (e.g. owned pause_ad) action must never authorize this one.
+  const derived = classifyMarketingActionRisk(proposedMutation);
+  if (
+    derived.riskClass !== classification.riskClass ||
+    derived.requiresApproval !== classification.requiresApproval
+  ) {
+    return { allowed: false, reason: 'classification does not match the proposed mutation; fail closed' };
   }
   if (!isReversibleRiskClass(classification.riskClass)) {
     return { allowed: false, reason: `${classification.riskClass} mutations are irreversible; never executed` };
@@ -142,7 +153,7 @@ export function buildRollback(
   if (level === 'account') return null;
   const keys = Object.keys(proposedMutation.changes ?? {});
   if (keys.length === 0) return null;
-  const changes: Record<string, unknown> = {};
+  const changes: Record<string, unknown> = Object.create(null);
   for (const key of keys) {
     if (!Object.prototype.hasOwnProperty.call(priorProviderState, key)) return null;
     changes[key] = priorProviderState[key];
