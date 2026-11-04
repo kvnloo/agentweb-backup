@@ -11178,6 +11178,52 @@ export const crmDb = {
     }
   },
 
+  /**
+   * The ids of the leads of one list whose `system[key]` record is in one of `states` and was last updated before
+   * `updatedBefore` (ISO strings compare correctly as text), newest lead first (leadIds are timestamp-prefixed).
+   * No index: it pages through the list's own partition, `Limit` counts the leads READ (the filter runs after the
+   * read, so that count is the read cost), and it stops after `maxRead` of them. `truncated` says the list had
+   * more (a false positive when the read stops exactly at `maxRead` and nothing follows: DynamoDB cannot tell without
+   * another read). Eventually consistent: a caller that acts on a hit re-reads the record. `paginatedQuery` is
+   * deliberately not used: it has no cap on the leads read, which is the bound this method exists to enforce.
+   */
+  async findLeadsBySystemRecord(
+    listId: string,
+    key: string,
+    op: { states: string[]; updatedBefore: string; maxRead: number },
+  ): Promise<{ leadIds: string[]; read: number; truncated: boolean }> {
+    if (op.states.length === 0 || op.maxRead <= 0) return { leadIds: [], read: 0, truncated: false };
+    const leadIds: string[] = [];
+    let read = 0;
+    let lastKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    try {
+      do {
+        const result = await dynamodb.query({
+          TableName: `${TABLE_PREFIX}AW-Leads`,
+          KeyConditionExpression: 'listId = :listId',
+          FilterExpression: `#system.#k.#state IN (${op.states.map((_, i) => `:s${i}`).join(', ')}) AND #system.#k.#updatedAt < :before`,
+          ProjectionExpression: 'leadId',
+          ExpressionAttributeNames: { '#system': 'system', '#k': key, '#state': 'state', '#updatedAt': 'updatedAt' },
+          ExpressionAttributeValues: {
+            ':listId': listId,
+            ':before': op.updatedBefore,
+            ...Object.fromEntries(op.states.map((state, i) => [`:s${i}`, state])),
+          },
+          ScanIndexForward: false,
+          Limit: Math.min(100, op.maxRead - read),
+          ...(lastKey ? { ExclusiveStartKey: lastKey } : {}),
+        }).promise();
+        read += result.ScannedCount ?? 0;
+        for (const item of result.Items ?? []) if (typeof item.leadId === 'string') leadIds.push(item.leadId);
+        lastKey = result.LastEvaluatedKey;
+      } while (lastKey && read < op.maxRead);
+    } catch (error) {
+      handleDynamoDbError(error, 'findLeadsBySystemRecord');
+      throw error;
+    }
+    return { leadIds, read, truncated: !!lastKey };
+  },
+
   async deleteEnrichmentCacheByEntityKey(entityKey: string): Promise<void> {
     try {
       const result = await dynamodb.query({
@@ -12147,7 +12193,8 @@ export const orgDb = {
 
   /**
    * Every org that holds a hot-lead caller number, as id and number only (projected). There is no index on the
-   * number, so this is a scan; its only caller keeps the result in a short in-process cache (voice/inboundNumberIndex.ts).
+   * number, so this is a scan. Callers: voice/inboundNumberIndex.ts (cached in process for 60 s) and the daily
+   * stuck-record sweep (voice/stuckCallSweep.ts).
    */
   async listHotLeadCallNumbers(): Promise<Array<{ orgId: string; twilioNumber: string }>> {
     const items = await paginatedScan<{ orgId?: unknown; hotLeadCall?: { twilioNumber?: unknown } }>(dynamodb, {
@@ -12158,6 +12205,21 @@ export const orgDb = {
     });
     return items.flatMap((i) =>
       typeof i.orgId === 'string' && typeof i.hotLeadCall?.twilioNumber === 'string' ? [{ orgId: i.orgId, twilioNumber: i.hotLeadCall.twilioNumber }] : []);
+  },
+
+  /**
+   * The id of every org that has ANY hot-lead config, as the id only (projected). Wider than listHotLeadCallNumbers:
+   * releasing a number removes the number fields but keeps the config (calling off), so an org that released its
+   * number still shows here. Same scan, same projected read; caller: the stuck-record sweep (voice/stuckCallSweep.ts).
+   */
+  async listHotLeadCallOrgIds(): Promise<string[]> {
+    const items = await paginatedScan<{ orgId?: unknown }>(dynamodb, {
+      TableName: ORGS_TABLE,
+      FilterExpression: 'attribute_exists(#h)',
+      ProjectionExpression: 'orgId',
+      ExpressionAttributeNames: { '#h': 'hotLeadCall' },
+    });
+    return items.flatMap((i) => (typeof i.orgId === 'string' ? [i.orgId] : []));
   },
 
   async createOrg(org: Organization): Promise<Organization> {

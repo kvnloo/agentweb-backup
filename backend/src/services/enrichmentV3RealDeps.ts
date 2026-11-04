@@ -118,6 +118,16 @@ const CRITIC_TEMPERATURE: number | null =
 
 // ─── Identity resolver deps ───────────────────────────────────────────────────
 
+/**
+ * How long the broker step waits for Apollo's async waterfall callback before moving on (ENG-2801).
+ * 0 (default) = do not wait: the placeholder is still written, so the webhook attributes a late result to the lead.
+ * APOLLO_BROKER_WAIT_MS opts in to waiting (capped at 120 s); unset, blank, non-numeric or non-positive means 0.
+ */
+export function brokerWaitMs(): number {
+  const n = Number(process.env.APOLLO_BROKER_WAIT_MS);
+  return Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), 120_000) : 0;
+}
+
 export function buildIdentityDeps(userId: string): IdentityResolverDeps {
   return {
     apolloPeopleMatch: async ({ email, linkedinUrl, firstName, lastName, domain, company }) => {
@@ -338,10 +348,11 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
               cacheType: 'apollo',
             });
           }
-          // Poll the placeholder row for the webhook result — shared logic
-          // with the Tier 3 waterfall path. 30s budget: the identity path
-          // waits less than the waterfall's configurable 90s default.
-          const polled = await waitForApolloAsyncResult(f.asyncRequestId, 30_000);
+          // Poll the placeholder row for the webhook result — shared logic with the Tier 3 waterfall path.
+          // Off by default (ENG-2801): a lead held here occupies a worker slot (bulk find-email runs 8 at a time,
+          // enrich-v3 20 per chunk), the callback commonly takes longer than a short wait, and the webhook's late write
+          // already attaches the email to a lead that still has none. APOLLO_BROKER_WAIT_MS opts in.
+          const polled = await waitForApolloAsyncResult(f.asyncRequestId, brokerWaitMs());
           if (polled?.email) {
             return { email: polled.email, emailStatus: polled.emailStatus };
           }

@@ -41,6 +41,8 @@ interface Harness {
     lateReads: number;
     socketEmitted: Array<[string, string]>;
     rearmed: Array<[string, string]>;
+    /** Records the bridge's ledger had to cut or drop (its caps). */
+    ledgerTruncated?: number;
   };
 }
 
@@ -74,10 +76,11 @@ function harness(): Harness {
       noteToolUse: (_r, id, name) => void calls.push(`use:${id}:${name}`),
       noteToolResult: (_r, id) => void calls.push(`result:${id}`),
       // Like the real bridge: closing a run (drain, close, Stop) hands the executor's per-run state back, after any call still executing has finished.
-      closeRunAndDrain: async (_r, timeoutMs) => (calls.push('drain'), (x.drainTimeoutMs = timeoutMs), deps.executor.releaseRun('x'), runClosedByCancel ? null : { settled: x.stillRunning === 0, stillRunning: x.stillRunning, ledger, ledgerTruncated: 0, halts, generation: 'g' }),
+      closeRunAndDrain: async (_r, timeoutMs) => (calls.push('drain'), (x.drainTimeoutMs = timeoutMs), deps.executor.releaseRun('x'), runClosedByCancel ? null : { settled: x.stillRunning === 0, stillRunning: x.stillRunning, ledger, ledgerTruncated: x.ledgerTruncated ?? 0, halts, generation: 'g' }),
       closeRun: () => (calls.push('closeRun'), void deps.executor.releaseRun('x')),
       cancelSession: () => ((runClosedByCancel = true), void calls.push('bridgeCancel')),
       takeHalts: () => halts,
+      isHalted: () => false,
       takeLedger: () => ({ records: ledger, truncated: 0 }),
       generationOf: () => 'g',
       takeLedgerByGeneration: () => (x.lateReads++, { records: [...ledger, ...lateRecords], truncated: 0 }),
@@ -91,6 +94,8 @@ function harness(): Harness {
     isCancelled: () => state.cancelled,
     persistMessages: async (_s, m) => void persisted.push(m),
     markNeedsReconnect: async (c, e, r) => void reconnect.push([c, e, r]),
+    reconnectSignalsRequired: 1, // the one-signal behaviour is what these tests pin; the consecutive-turns rule has its own tests (claudeCodeBackend.relay.test.ts)
+    confirmDeadLogin: async () => true,
     writeJournal: async (row) => void journal.push(row),
     emptyFallbackText: FALLBACK,
     now: () => 1_000_000,
@@ -341,6 +346,33 @@ describe('ClaudeCodeBackend', () => {
       expect(h.calls).toContain('exec:release');
     });
 
+    it('S8: a turn whose ledger had to cut or drop records says so in the persisted messages (metadata only), on every way out', async () => {
+      const h = harness();
+      h.setLedger([rec({ toolCallId: 'a', name: 'save_note' })]);
+      h.x.ledgerTruncated = 3;
+      h.setHost(async () => done('ok'));
+      const r = await new ClaudeCodeBackend(h.deps).run(params());
+      expect(r.responseMessages.at(-1).metadata.ledgerTruncated).toBe(3);
+
+      const u = harness();
+      u.setLedger([rec({ toolCallId: 'a', name: 'save_note' })]);
+      u.x.ledgerTruncated = 2;
+      u.setHost(async () => ({ kind: 'unknown_outcome', reason: 'stream_dropped' }) as HostTurnOutcome);
+      expect((await new ClaudeCodeBackend(u.deps).run(params())).responseMessages.at(-1).metadata.ledgerTruncated).toBe(2);
+
+      const f = harness();
+      f.setLedger([rec({ toolCallId: 'a', name: 'save_note' })]);
+      f.x.ledgerTruncated = 5;
+      f.setHost(async () => done('', { ok: false, errorKind: 'usage_limit' }));
+      await new ClaudeCodeBackend(f.deps).run(params()).catch(() => undefined);
+      expect(f.persisted[0].at(-1).metadata.ledgerTruncated).toBe(5);
+
+      const clean = harness();
+      clean.setLedger([rec({ toolCallId: 'a', name: 'save_note' })]);
+      clean.setHost(async () => done('ok'));
+      expect((await new ClaudeCodeBackend(clean.deps).run(params())).responseMessages.at(-1).metadata?.ledgerTruncated).toBeUndefined();
+    });
+
     it('a host that no longer knows the connection flags it for reconnect', async () => {
       const h = harness();
       h.setHost(async () => {
@@ -355,6 +387,18 @@ describe('ClaudeCodeBackend', () => {
       h.setHost(async () => done('', { ok: false, errorKind: 'auth_dead' }));
       expect(await stopCode(new ClaudeCodeBackend(h.deps).run(params()))).toBe('needs_reconnect');
       expect(h.reconnect).toEqual([['conn-1', 3, 'turn_auth_dead']]);
+    });
+
+    it('production defaults (no bypass flags): one dead-login claim shows the stop but does not flag; the second consecutive turn does', async () => {
+      const h = harness();
+      delete (h.deps as any).reconnectSignalsRequired;
+      delete (h.deps as any).confirmDeadLogin;
+      h.setHost(async () => done('', { ok: false, errorKind: 'auth_dead' }));
+      const backend = new ClaudeCodeBackend(h.deps);
+      expect(await stopCode(backend.run(params()))).toBe('needs_reconnect');
+      expect(h.reconnect).toEqual([]); // one signal, the status does not say needs_reconnect
+      expect(await stopCode(backend.run(params()))).toBe('needs_reconnect');
+      expect(h.reconnect).toEqual([['conn-1', 3, 'turn_auth_dead']]); // the second consecutive turn
     });
 
     it('the plan\'s own usage limit stops with usage_limit and does not flag the connection', async () => {

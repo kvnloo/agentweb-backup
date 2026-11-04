@@ -1,3 +1,4 @@
+// Adding or changing a tool? It also has to fit the Claude plan route's limits (name length, description and schema size, input size): docs/plan-route-tool-limits.md
 import { randomUUID } from 'crypto';
 import { MODIFY_WORK_PLAN_INPUT_SCHEMA, validateModifyWorkPlanArgs } from './impl/modifyWorkPlanArgs';
 import { agentModeService } from '../services/agentModeService';
@@ -3871,6 +3872,31 @@ emmaToolRegistry.register({
     return await leadsImpl.getLeadsNeedingFollowup(args.list_id, context?.userId, {
       limit: args.limit,
       scanLimit: args.scan_limit,
+    });
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'get_lead_conversation_statuses',
+  definition: {
+    name: 'get_lead_conversation_statuses',
+    description: 'READ-ONLY batch audit: one compact conversation-status row per lead (name, company, leadStatus, LinkedIn connectionState, last message channel/direction/date, replyState) for a whole lead list or for up to 200 lead_ids in ONE call. Use this for any multi-lead status/audit question ("what is the LinkedIn status of these leads", "who replied", "lead list activity report") instead of calling get_lead_details or linkedin_outreach once per lead. Paginate the whole list with cursor/nextCursor. lead_ids outside the list come back as status "not_found". Never sends or changes anything.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_id: { type: 'string', description: 'The lead list to audit' },
+        lead_ids: { type: 'array', items: { type: 'string' }, description: 'Optional: specific lead IDs in this list (max 200). Omit to page through the whole list.' },
+        limit: { type: 'number', description: 'Whole-list mode page size (default 100, max 200)' },
+        cursor: { type: 'string', description: 'Whole-list mode: nextCursor from the previous call' },
+      },
+      required: ['list_id']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await leadsImpl.getLeadConversationStatuses(args.list_id, context?.userId, {
+      leadIds: args.lead_ids,
+      limit: args.limit,
+      cursor: args.cursor,
     });
   }
 });
@@ -9410,6 +9436,7 @@ ACTION MATRIX:
     order_id should be the SAME eventId the browser sent as transaction_id — Google dedupes the pair, which is what stops one lead counting twice across the two channels.
     A conversion_value REQUIRES a currency_code; without one Google assumes the account currency and misstates revenue.
     validate_only=true asks Google to check the payload and write nothing. Use it to rehearse a batch before committing it.
+  CAMPAIGN_CONVERSION_GOAL → LIST (campaign_id?), UPDATE (biddable + resource_name, or campaign_id + category + origin). CUSTOMER_CONVERSION_GOAL → LIST, UPDATE (biddable + resource_name, or category + origin) — the account default. Use these to stop a goal driving smart bidding when CONVERSION_ACTION UPDATE returns MUTATE_NOT_ALLOWED (codeless / Universal Analytics actions).
   CONVERSION_ACTION → LIST, CREATE (name, category, counting_type; status?, primary_for_goal?, click_through_lookback_window_days?), UPDATE (conversion_action_resource_name; any of name/status/category/counting_type/primary_for_goal/click_through_lookback_window_days), REMOVE (conversion_action_resource_name, confirm_conversion_action_removal, conversion_action_removal_token)
     A CONVERSION_ACTION has NO PAUSED status — that is a campaign status and is rejected. It is always created ENABLED (omit status and it defaults there); Google deny-lists every other value on create.
     HIDDEN cannot be set through the API at all — Google assigns it, and sending it is rejected on both create and update. Do not suggest it.
@@ -9461,7 +9488,7 @@ ACTION MATRIX:
       type: 'object',
       properties: {
         customer_id: { type: 'string', description: 'Google Ads customer ID (numeric, no dashes). Call list_connected_accounts(platform="google_ads") and use the "customer_id" field from the result (NOT the "id" field).' },
-        entity_type: { type: 'string', enum: ['BUDGET', 'CAMPAIGN', 'CAMPAIGN_CRITERION', 'AD_GROUP', 'KEYWORD', 'AD', 'ASSET', 'CAMPAIGN_ASSET', 'ASSET_GROUP', 'LOCATION', 'BIDDING_STRATEGY', 'CONVERSION_ACTION', 'OFFLINE_CONVERSION'] },
+        entity_type: { type: 'string', enum: ['BUDGET', 'CAMPAIGN', 'CAMPAIGN_CRITERION', 'AD_GROUP', 'KEYWORD', 'AD', 'ASSET', 'CAMPAIGN_ASSET', 'ASSET_GROUP', 'LOCATION', 'BIDDING_STRATEGY', 'CONVERSION_ACTION', 'OFFLINE_CONVERSION', 'CAMPAIGN_CONVERSION_GOAL', 'CUSTOMER_CONVERSION_GOAL'] },
         action: { type: 'string', description: 'Action to perform. See ACTION MATRIX.' },
         name: { type: 'string' },
         type: { type: 'string', description: 'Campaign type (SEARCH|DISPLAY|PERFORMANCE_MAX), ad group type (SEARCH_STANDARD|DISPLAY_STANDARD), or ad type for AD CREATE (RESPONSIVE_SEARCH_AD|RESPONSIVE_DISPLAY_AD).' },
@@ -9475,6 +9502,10 @@ ACTION MATRIX:
         location_target_ids: { type: 'array', items: { type: 'number' }, description: 'From LOCATION SEARCH.' },
         category: { type: 'string', description: 'CONVERSION_ACTION CREATE/UPDATE: what the conversion represents, e.g. SUBMIT_LEAD_FORM, PURCHASE, SIGNUP, DOWNLOAD, BOOK_APPOINTMENT, CONTACT. Never inferred — it decides how Google reports and optimises the action.' },
         counting_type: { type: 'string', enum: ['ONE_PER_CLICK', 'MANY_PER_CLICK'], description: 'CONVERSION_ACTION CREATE (required) / UPDATE. ONE_PER_CLICK counts one conversion per ad click (lead forms, sign-ups); MANY_PER_CLICK counts every conversion (purchases). NEVER guess — choosing wrong inflates reported conversions and silently misdirects smart bidding. Ask the user.' },
+        biddable: { type: 'boolean', description: 'CAMPAIGN_CONVERSION_GOAL / CUSTOMER_CONVERSION_GOAL UPDATE: whether this category~origin goal drives bidding. false demotes it.' },
+        campaign_id: { type: 'string', description: 'CAMPAIGN_CONVERSION_GOAL LIST (filter) / UPDATE (with category + origin): numeric campaign id.' },
+        resource_name: { type: 'string', description: 'CAMPAIGN_CONVERSION_GOAL / CUSTOMER_CONVERSION_GOAL UPDATE: goal resource name from LIST, e.g. customers/<cid>/campaignConversionGoals/<campaignId>~CONTACT~WEBSITE.' },
+        origin: { type: 'string', description: 'CAMPAIGN_CONVERSION_GOAL / CUSTOMER_CONVERSION_GOAL UPDATE: goal origin, e.g. WEBSITE, CALL_FROM_ADS, APP, STORE.' },
         primary_for_goal: { type: 'boolean', description: 'CONVERSION_ACTION CREATE/UPDATE: whether this action is a primary goal (counts toward the Conversions column and drives smart bidding).' },
         click_through_lookback_window_days: { type: 'number', description: 'CONVERSION_ACTION CREATE/UPDATE: how many days after an ad click a conversion still attributes to it.' },
         confirm_conversion_action_removal: { type: 'boolean', description: 'Required true for CONVERSION_ACTION REMOVE. NOT sufficient on its own: setting it returns a disclosure and a conversion_action_removal_token, and the removal only happens when you replay the same call carrying that token. Removal is permanent and cannot be re-enabled. Conversions already recorded stay in reporting.' },
@@ -9486,7 +9517,7 @@ ACTION MATRIX:
         order_id: { type: 'string', description: 'OFFLINE_CONVERSION UPLOAD: the same eventId the browser sent as transaction_id, so Google dedupes the browser conversion against this upload.' },
         time_zone: { type: 'string', description: 'OFFLINE_CONVERSION UPLOAD: override the account time zone (IANA). Normally omit — it is read from the account.' },
         validate_only: { type: 'boolean', description: 'OFFLINE_CONVERSION UPLOAD: ask Google to validate the payload and write NOTHING. Use to rehearse before committing.' },
-        conversion_action_resource_name: { type: 'string', description: 'Required for CONVERSION_ACTION UPDATE. From CONVERSION_ACTION LIST or CREATE.' },
+        conversion_action_resource_name: { type: 'string', description: 'Required for CONVERSION_ACTION UPDATE: customers/<customer_id>/conversionActions/<id> (a bare numeric id is also accepted). From CONVERSION_ACTION LIST or CREATE.' },
         campaign_resource_name: { type: 'string', description: 'Required for CAMPAIGN PAUSE/RESUME/UPDATE/REMOVE/ADD_PROXIMITY, AD_GROUP LIST, and (as an alternative to ad_group_resource_name) KEYWORD ADD_NEGATIVE.' },
         radius: { type: 'number', description: 'Proximity radius for CAMPAIGN ADD_PROXIMITY, in radius_units (default MILES).' },
         radius_units: { type: 'string', enum: ['MILES', 'KILOMETERS'], description: 'Unit for radius on CAMPAIGN ADD_PROXIMITY. Defaults to MILES.' },

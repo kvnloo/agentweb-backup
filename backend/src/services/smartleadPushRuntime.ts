@@ -4,7 +4,7 @@ import { resolveSmartlead, reportSmartleadFailure } from "./smartleadConnection"
 import { SmartleadPushRunDb } from "./smartleadPushRunDb";
 import { SmartleadPushService } from "./smartleadPushService";
 import { smartleadMarkerKey } from "./smartleadMarkers";
-import { addLeadsToCampaign, deleteCampaignWebhook, findLeadIdByEmail, getCampaign, getCampaignEmailAccounts, getCampaignSequences, listCampaigns, listCampaignWebhooks, saveCampaignWebhook, unsubscribeLeadGlobally, updateLeadEmail } from "./smartleadService";
+import { addLeadsToCampaign, deleteCampaignWebhook, findLeadIdByEmail, getCampaign, getCampaignAnalytics, getCampaignEmailAccounts, getCampaignSequences, listCampaigns, listCampaignWebhooks, saveCampaignWebhook, unsubscribeLeadGlobally, updateLeadEmail } from "./smartleadService";
 import { getJwtSecret } from "../config/jwt";
 import { ensureEventWebhook, publicBaseUrl, type WebhookApi } from "./smartleadEventRegistration";
 import { webhookSecret } from "./smartleadWebhookToken";
@@ -51,6 +51,7 @@ export function getSmartleadPushService(): SmartleadPushService {
     smartlead: {
       listCampaigns: apiKey => listCampaigns(apiKey, { maxRetries: 1 }),
       getCampaign: (apiKey, id) => getCampaign(apiKey, id, { maxRetries: 1 }),
+      getCampaignAnalytics: (apiKey, id) => getCampaignAnalytics(apiKey, id, { maxRetries: 1 }),
       getSequences: (apiKey, id) => getCampaignSequences(apiKey, id, { maxRetries: 1 }),
       getMailboxes: (apiKey, id) => getCampaignEmailAccounts(apiKey, id, { maxRetries: 1 }),
       // One retry: a POST that backs off for minutes would outlive the run's 90-second lease, and the lead markers make a resend safe.

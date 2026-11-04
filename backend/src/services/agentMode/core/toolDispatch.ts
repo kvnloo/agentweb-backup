@@ -269,6 +269,7 @@ export const SHARED_SESSION_BLOCKED_ORG_SETTINGS_TOOLS: ReadonlySet<string> = ne
   'start_hot_lead_call_verification',
   'confirm_hot_lead_call_verification',
   'list_smartlead_campaigns',
+  'get_smartlead_campaign_stats',
   'preview_smartlead_push',
   'start_smartlead_push',
   'get_smartlead_push_status',
@@ -276,6 +277,10 @@ export const SHARED_SESSION_BLOCKED_ORG_SETTINGS_TOOLS: ReadonlySet<string> = ne
   'resume_smartlead_push',
   'cancel_smartlead_push',
   'release_leads_from_smartlead',
+  // A Luma key can be shared with the whole org (ENG-2737). A share-link visitor runs as the link's owner, so these would reach every
+  // org-shared key, guests' registration answers and phone numbers included.
+  'luma_list_events',
+  'luma_get_guests',
   'save_org_memory',
   'delete_org_memory',
   'save_memory',
