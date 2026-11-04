@@ -152,7 +152,7 @@ async function resolveLuma(userId: string, calendarId?: string): Promise<Resolve
   } else if (accounts.length > 1) {
     // A key shared with the org must not break a teammate who already has their own calendar (ENG-2737): the caller's single own
     // connection wins, as with Smartlead. Anything else is ambiguous and asks for calendar_id.
-    const own = accounts.filter((a) => (a as any).userId === userId);
+    const own = accounts.filter((a) => a.userId === userId);
     if (own.length === 1) {
       account = own[0];
     } else {
@@ -240,7 +240,8 @@ async function lumaFailure(error: unknown, resolved: Extract<ResolvedLuma, { cli
       errorClass: 'invalid_args',
       message:
         `Luma says the key for the calendar "${resolved.calendarName}" cannot access that event — it probably belongs to a different ` +
-        'calendar. The key itself is fine. Check the event id with luma_list_events, or ask the user for a key from the calendar that hosts it.',
+        'calendar. The key itself is fine. Check the event id with luma_list_events, pass the calendar_id of the calendar that hosts it if it is ' +
+        'connected or shared with the user, or ask the user for a key from that calendar.',
     };
   }
   if (error instanceof LumaApiError && error.status === 429) {
@@ -278,7 +279,7 @@ emmaToolRegistry.register({
         before: { type: 'string', description: 'ISO 8601 date or datetime (no offset = UTC) — only events starting before this.' },
         limit: { type: 'number', description: 'Max events to return (default 25, max 100).' },
         cursor: { type: 'string', description: 'next_cursor from a previous call, to get the next page.' },
-        calendar_id: { type: 'string', description: 'Only needed when several Luma calendars are connected.' },
+        calendar_id: { type: 'string', description: 'Needed when several Luma calendars are connected, or to use a calendar a teammate shared instead of your own.' },
       },
       required: [],
     },
@@ -367,7 +368,7 @@ emmaToolRegistry.register({
           description: `Soft cap per call (default ${DEFAULT_MAX_GUESTS}; max ${HARD_MAX_GUESTS}, or ${MAX_GUESTS_WITH_FILTERED_ANSWERS} with answer_labels, or ${MAX_GUESTS_WITH_ANSWERS} with all answers). Larger lists are read by calling again with next_cursor until has_more is false.`,
         },
         cursor: { type: 'string', description: 'next_cursor from a previous call, to continue.' },
-        calendar_id: { type: 'string', description: 'Only needed when several Luma calendars are connected.' },
+        calendar_id: { type: 'string', description: 'Needed when several Luma calendars are connected, or to use a calendar a teammate shared instead of your own.' },
       },
       required: ['event'],
     },
