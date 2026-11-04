@@ -288,7 +288,7 @@ describe("smartleadService slice 2 client (ENG-673)", () => {
   });
 
   describe("getCampaignAnalytics (live shape, 2026-11-04)", () => {
-    // The SHAPE (not these numbers) was read from real campaigns in AgentWeb's own Smartlead account: every counter is a STRING.
+    // The shape was read from real campaigns in AgentWeb's own Smartlead account (every counter is a STRING); some values here are changed.
     const live = {
       id: 3083885, name: "ICP2-Final", status: "COMPLETED", sent_count: "38", open_count: "26", click_count: "0", reply_count: "2", unique_sent_count: "13",
       bounce_count: "1", unsubscribed_count: "3", campaign_lead_stats: { total: 15, completed: 12 }, client_email: "someone@example.com",
