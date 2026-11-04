@@ -112,3 +112,35 @@ describe('WhatsApp', () => {
     expect(waSent().text).toBe(`Ada Lovelace — email.opened on Q3 Inbound. ${url}`);
   });
 });
+
+describe('Email (the same contact name as the other channels)', () => {
+  const { emailService } = require('../services/emailService');
+  const sent = () => emailService.sendEmail.mock.calls[0] as [string, string, string, string];
+
+  it('uses the name, else the address, else a plain sentence, and never a phone number or the lead id', async () => {
+    await notify(onSlack, SMARTLEAD);
+    expect(sent()[1]).toBe('A new lead "Ada Lovelace" replied to your campaign');
+
+    emailService.sendEmail.mockClear();
+    await notify(onSlack, SMARTLEAD, { leadId: 'lead_secret_id_9', email: 'bo@example.com' });
+    expect(sent()[1]).toBe('A new lead "bo@example.com" replied to your campaign');
+
+    emailService.sendEmail.mockClear();
+    await notify(onSlack, SMARTLEAD, { leadId: 'lead_secret_id_9', phone: '2125559876', firstName: '', lastName: '' });
+    const [, subject, text, html] = sent();
+    expect(subject).toBe('A new lead replied to your campaign');
+    // The button and the "View contact" line carry a link that legitimately contains the lead id; what must not appear is the id or the
+    // phone number as the contact's NAME, so links are removed before looking.
+    const visible = (body: string) => body.replace(/https?:\/\/[^\s"<]+/g, '');
+    for (const body of [subject, visible(text), visible(html)]) {
+      expect(body).not.toContain('lead_secret_id_9');
+      expect(body).not.toContain('2125559876');
+      expect(body).not.toContain('Unknown lead');
+    }
+  });
+
+  it('is still the generic alert email for an email.received that did not come through Smartlead', async () => {
+    await notify(onSlack, { subject: 'Hello' }, { leadId: 'lead_secret_id_9', phone: '2125559876', firstName: '', lastName: '' });
+    expect(sent()[1]).toBe('Lead list alert: email.received');
+  });
+});
