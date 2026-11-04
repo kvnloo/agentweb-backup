@@ -9411,6 +9411,7 @@ ACTION MATRIX:
     order_id should be the SAME eventId the browser sent as transaction_id — Google dedupes the pair, which is what stops one lead counting twice across the two channels.
     A conversion_value REQUIRES a currency_code; without one Google assumes the account currency and misstates revenue.
     validate_only=true asks Google to check the payload and write nothing. Use it to rehearse a batch before committing it.
+  CAMPAIGN_CONVERSION_GOAL → LIST (campaign_id?), UPDATE (biddable + resource_name, or campaign_id + category + origin). CUSTOMER_CONVERSION_GOAL → LIST, UPDATE (biddable + resource_name, or category + origin) — the account default. Use these to stop a goal driving smart bidding when CONVERSION_ACTION UPDATE returns MUTATE_NOT_ALLOWED (codeless / Universal Analytics actions).
   CONVERSION_ACTION → LIST, CREATE (name, category, counting_type; status?, primary_for_goal?, click_through_lookback_window_days?), UPDATE (conversion_action_resource_name; any of name/status/category/counting_type/primary_for_goal/click_through_lookback_window_days), REMOVE (conversion_action_resource_name, confirm_conversion_action_removal, conversion_action_removal_token)
     A CONVERSION_ACTION has NO PAUSED status — that is a campaign status and is rejected. It is always created ENABLED (omit status and it defaults there); Google deny-lists every other value on create.
     HIDDEN cannot be set through the API at all — Google assigns it, and sending it is rejected on both create and update. Do not suggest it.
@@ -9462,7 +9463,7 @@ ACTION MATRIX:
       type: 'object',
       properties: {
         customer_id: { type: 'string', description: 'Google Ads customer ID (numeric, no dashes). Call list_connected_accounts(platform="google_ads") and use the "customer_id" field from the result (NOT the "id" field).' },
-        entity_type: { type: 'string', enum: ['BUDGET', 'CAMPAIGN', 'CAMPAIGN_CRITERION', 'AD_GROUP', 'KEYWORD', 'AD', 'ASSET', 'CAMPAIGN_ASSET', 'ASSET_GROUP', 'LOCATION', 'BIDDING_STRATEGY', 'CONVERSION_ACTION', 'OFFLINE_CONVERSION'] },
+        entity_type: { type: 'string', enum: ['BUDGET', 'CAMPAIGN', 'CAMPAIGN_CRITERION', 'AD_GROUP', 'KEYWORD', 'AD', 'ASSET', 'CAMPAIGN_ASSET', 'ASSET_GROUP', 'LOCATION', 'BIDDING_STRATEGY', 'CONVERSION_ACTION', 'OFFLINE_CONVERSION', 'CAMPAIGN_CONVERSION_GOAL', 'CUSTOMER_CONVERSION_GOAL'] },
         action: { type: 'string', description: 'Action to perform. See ACTION MATRIX.' },
         name: { type: 'string' },
         type: { type: 'string', description: 'Campaign type (SEARCH|DISPLAY|PERFORMANCE_MAX), ad group type (SEARCH_STANDARD|DISPLAY_STANDARD), or ad type for AD CREATE (RESPONSIVE_SEARCH_AD|RESPONSIVE_DISPLAY_AD).' },
@@ -9476,6 +9477,10 @@ ACTION MATRIX:
         location_target_ids: { type: 'array', items: { type: 'number' }, description: 'From LOCATION SEARCH.' },
         category: { type: 'string', description: 'CONVERSION_ACTION CREATE/UPDATE: what the conversion represents, e.g. SUBMIT_LEAD_FORM, PURCHASE, SIGNUP, DOWNLOAD, BOOK_APPOINTMENT, CONTACT. Never inferred — it decides how Google reports and optimises the action.' },
         counting_type: { type: 'string', enum: ['ONE_PER_CLICK', 'MANY_PER_CLICK'], description: 'CONVERSION_ACTION CREATE (required) / UPDATE. ONE_PER_CLICK counts one conversion per ad click (lead forms, sign-ups); MANY_PER_CLICK counts every conversion (purchases). NEVER guess — choosing wrong inflates reported conversions and silently misdirects smart bidding. Ask the user.' },
+        biddable: { type: 'boolean', description: 'CAMPAIGN_CONVERSION_GOAL / CUSTOMER_CONVERSION_GOAL UPDATE: whether this category~origin goal drives bidding. false demotes it.' },
+        campaign_id: { type: 'string', description: 'CAMPAIGN_CONVERSION_GOAL LIST (filter) / UPDATE (with category + origin): numeric campaign id.' },
+        resource_name: { type: 'string', description: 'CAMPAIGN_CONVERSION_GOAL / CUSTOMER_CONVERSION_GOAL UPDATE: goal resource name from LIST, e.g. customers/<cid>/campaignConversionGoals/<campaignId>~CONTACT~WEBSITE.' },
+        origin: { type: 'string', description: 'CAMPAIGN_CONVERSION_GOAL / CUSTOMER_CONVERSION_GOAL UPDATE: goal origin, e.g. WEBSITE, CALL_FROM_ADS, APP, STORE.' },
         primary_for_goal: { type: 'boolean', description: 'CONVERSION_ACTION CREATE/UPDATE: whether this action is a primary goal (counts toward the Conversions column and drives smart bidding).' },
         click_through_lookback_window_days: { type: 'number', description: 'CONVERSION_ACTION CREATE/UPDATE: how many days after an ad click a conversion still attributes to it.' },
         confirm_conversion_action_removal: { type: 'boolean', description: 'Required true for CONVERSION_ACTION REMOVE. NOT sufficient on its own: setting it returns a disclosure and a conversion_action_removal_token, and the removal only happens when you replay the same call carrying that token. Removal is permanent and cannot be re-enabled. Conversions already recorded stay in reporting.' },
