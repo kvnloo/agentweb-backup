@@ -63,6 +63,8 @@ LOCK=/run/aw-deploy/install.lock # in a root-only directory (see deploy.sh): a f
 SKIP_PREREQS=0
 DRY_BASE=/run
 OWN=(-o root -g root)
+NODE_ROOT=/opt/aw-node # where install.sh puts the pinned node (the config names the real path under it: /usr/bin/node is a symlink)
+TRUST_UID=0 TRUST_BOUNDARY=
 # Test seam: a copy of these scripts in a scratch directory with a `.aw-test-mode` file next to them may redirect every path and fake the tools.
 # The marker is never part of a build tarball, so on the worker none of the AW_* variables below has any effect.
 TEST=0
@@ -70,6 +72,7 @@ if [ -e "$HERE/.aw-test-mode" ]; then
   TEST=1
   OPT=${AW_OPT:?AW_OPT}; CONF=${AW_CONF:?AW_CONF}; UNIT_DIR=${AW_UNIT_DIR:?AW_UNIT_DIR}; LOCK=${AW_LOCK:?AW_LOCK}
   SYSTEMCTL=${AW_SYSTEMCTL:-systemctl}; SKIP_PREREQS=${AW_SKIP_PREREQS:-0}
+  NODE_ROOT=${AW_NODE_ROOT:-/opt/aw-node}; TRUST_UID=$(id -u); TRUST_BOUNDARY=${AW_TRUST_BOUNDARY:-}
   DRY_BASE=${AW_TMP:-${TMPDIR:-/tmp}}
   [ "$(id -u)" = 0 ] || OWN=()
 fi
@@ -134,11 +137,16 @@ fi
 # ───────────────────────────── helpers for the release machinery ─────────────────────────────
 
 NODE_BIN=/usr/bin/node
-[ "$TEST" != 1 ] || NODE_BIN=$(command -v node || echo /usr/bin/node)
-check_config() { # check_config <config.json> <check-config.js>
-  local nb=$NODE_BIN
+[ "$TEST" != 1 ] || NODE_BIN=${AW_NODE_BIN:-$(command -v node || echo /usr/bin/node)}
+# Runs the host's own config parser/trust check. The node is the one the worker already has; on a FIRST install (or a rebuilt worker) there is none yet and /usr/bin/node
+# is only linked at the switch, AFTER this check, so the pinned node this script has just installed under /opt/aw-node is used: it is root-owned, sha256-verified, and
+# itself checked as a trusted path by the very call that uses it.
+check_config() { # check_config <config.json> <check-config.js> [extra check-config.js arguments]
+  local nb=$NODE_BIN cfg=$1 js=$2
+  shift 2
+  [ -x "$nb" ] || nb=${NODE_ROOT:-/opt/aw-node}/v$NODE_VERSION/bin/node
   [ -x "$nb" ] || nb=$(command -v node || true)
-  [ -n "$nb" ] && "$nb" "$2" "$1"
+  [ -n "$nb" ] && "$nb" "$js" "$cfg" "$@"
 }
 
 # A valid install = an active release whose files, config and TLS set are all there.
@@ -263,16 +271,11 @@ else
       ok "node $NODE_VERSION installed to $NODE_DIR"
     fi
   fi
-  # The /usr/bin/node link is what the unit starts and what deploy tooling runs: flipping it is part of the SWITCH (below), never of --prepare, so a host
-  # that keeps running (a deploy that finds it busy gives up) is not left with a different node under its next restart.
-  if [ "$PREPARE" = 1 ]; then
-    skip "/usr/bin/node link: left for the switch phase"
-  elif [ "$(readlink /usr/bin/node 2>/dev/null || true)" = "$NODE_DIR/bin/node" ]; then
-    skip "/usr/bin/node already points at node $NODE_VERSION"
-  else
-    doing "ln -sfn $NODE_DIR/bin/node /usr/bin/node"
-    mut ln -sfn "$NODE_DIR/bin/node" /usr/bin/node
-  fi
+  # The /usr/bin/node link is what the unit starts and what deploy tooling runs: flipping it is part of the SWITCH, never of --prepare, so a host
+  # that keeps running (a deploy that finds it busy gives up) is not left with a different node under its next restart. It happens AFTER the trusted-path check of
+  # the rendered config (below): a release the host would refuse to start with must leave the machine exactly as it was ("nothing was changed" is then true).
+  NODE_LINK_TARGET="$NODE_DIR/bin/node"
+  if [ "$PREPARE" = 1 ]; then skip "/usr/bin/node link: left for the switch phase"; fi
 
   # ───────────────────────────── c. the pinned claude binary ─────────────────────────────
 
@@ -332,6 +335,7 @@ TLS_DIR="$CONF/tls/$REL_ID"
 
 if [ "$DRY" = 1 ]; then
   DRY_TMP=$(mktemp -d "$DRY_BASE/aw-dry.XXXXXX")
+  chmod 755 "$DRY_TMP" # the pre-switch check asks whether a customer uid could traverse the path: a private 0700 stage would fail it
   STAGE_TLS_DIR="$DRY_TMP/tls"
   STAGE_REL_DIR="$DRY_TMP/release"
 else
@@ -407,6 +411,7 @@ ins -m 0644 "$HERE/dist/loginHost/host/start.js" "$STAGE_REL_DIR/dist/loginHost/
 ins -m 0755 "$HERE/files/claude-turn.sh" "$STAGE_REL_DIR/claude-turn.sh"
 ins -m 0755 "$HERE/files/aw-net.sh" "$STAGE_REL_DIR/aw-net.sh"
 ins -m 0755 "$HERE/files/aw-write-file.sh" "$STAGE_REL_DIR/aw-write-file.sh"
+ins -m 0755 "$HERE/files/aw-relay-shim.js" "$STAGE_REL_DIR/aw-relay-shim.js"
 ins -m 0644 "$HERE/files/system-prompt.txt" "$STAGE_REL_DIR/system-prompt.txt"
 ins -m 0644 "$HERE/check-config.js" "$STAGE_REL_DIR/check-config.js"
 ins -m 0644 "$HERE/MANIFEST" "$STAGE_REL_DIR/MANIFEST"
@@ -417,11 +422,11 @@ chmod 0644 "$STAGE_REL_DIR/FINGERPRINT" "$STAGE_REL_DIR/TLS_DIR" "$STAGE_REL_DIR
 
 # The config, with every path pointing into THIS release and ITS TLS set; accepted by the host's own parser before it is used.
 cfg_tmp="$STAGE_REL_DIR/prod.json"
-python3 - "$HERE/files/host-config.template.json" "$cfg_tmp" "$CLAUDE_BIN_SHA256" "$BRIDGE_URL" "$WORKER_IP" "$REL_DIR" "$TLS_DIR" "$CLAUDE_VERSION" <<'PY' || die "could not render the config"
+python3 - "$HERE/files/host-config.template.json" "$cfg_tmp" "$CLAUDE_BIN_SHA256" "$BRIDGE_URL" "$WORKER_IP" "$REL_DIR" "$TLS_DIR" "$CLAUDE_VERSION" "$NODE_VERSION" <<'PY' || die "could not render the config"
 import json, sys
-tpl, out, sha, bridge, ip, rel, tls, ver = sys.argv[1:9]
+tpl, out, sha, bridge, ip, rel, tls, ver, nodever = sys.argv[1:10]
 text = open(tpl).read()
-for k, v in (("@@CLAUDE_BIN_SHA256@@", sha), ("@@BRIDGE_URL@@", bridge), ("@@WORKER_IP@@", ip), ("@@RELEASE_DIR@@", rel), ("@@TLS_DIR@@", tls), ("@@CLAUDE_VERSION@@", ver)):
+for k, v in (("@@CLAUDE_BIN_SHA256@@", sha), ("@@BRIDGE_URL@@", bridge), ("@@WORKER_IP@@", ip), ("@@RELEASE_DIR@@", rel), ("@@TLS_DIR@@", tls), ("@@CLAUDE_VERSION@@", ver), ("@@NODE_VERSION@@", nodever)):
     text = text.replace(k, v)
 if "@@" in text:
     raise SystemExit("an unfilled placeholder is left in the config")
@@ -431,6 +436,17 @@ PY
 chmod 0600 "$cfg_tmp"
 check_config "$cfg_tmp" "$HERE/check-config.js" >/dev/null || die "the generated config is rejected by the host's own schema (or there is no node to check it with): nothing was changed"
 ok "generated config accepted by the host's parser"
+# The host refuses to start when a path it hands to a customer unit has a symlink on it, a non-root owner or a group/other-writable component. Run that same check
+# NOW, on the staged files (the release and TLS set are not at their final paths yet) and the pinned node, so a config the host would refuse at start-up never gets
+# switched to: this is the step that catches a symlinked node path or a shim that is not root-owned.
+if trust_out=$(check_config "$cfg_tmp" "$HERE/check-config.js" --owner "$TRUST_UID" ${TRUST_BOUNDARY:+--boundary "$TRUST_BOUNDARY"} --map "$REL_DIR=$STAGE_REL_DIR" --map "$TLS_DIR=$STAGE_TLS_DIR" --map "/opt/aw-node=$NODE_ROOT" 2>&1); then
+  ok "every release path the host will check is root-controlled (no symlink, owner, write bits)"
+elif [ "$DRY" = 1 ] && [ ! -e "$NODE_ROOT/v$NODE_VERSION/bin/node" ]; then
+  # A dry run on a worker that does not have the pinned node yet (a real install downloads it first): that is not a problem with this release.
+  skip "dry run: the pinned node $NODE_VERSION is not installed on this worker yet (a real install puts it in /opt/aw-node first), so the trusted-path check is not run. ${trust_out:-}"
+else
+  die "the host would refuse to start with this release (trusted-path check): ${trust_out:-no output}. Nothing was changed."
+fi
 
 # The slice that caps ALL customer units (values pinned in versions.env; CPU quota leaves ~20% of one vCPU for the host).
 CPU_QUOTA="$(( $(nproc) * 100 - 20 ))%"
@@ -443,8 +459,18 @@ ins -m 0644 "$HERE/files/aw-login-host@.service" "$STAGE_REL_DIR/aw-login-host@.
 ins -m 0644 "$HERE/files/aw-login-host-failed@.service" "$STAGE_REL_DIR/aw-login-host-failed@.service"
 
 # Last pre-switch checks on the staged files.
-for f in claude-turn.sh aw-net.sh aw-write-file.sh; do [ -x "$STAGE_REL_DIR/$f" ] || die "staged $f is not executable"; done
+for f in claude-turn.sh aw-net.sh aw-write-file.sh aw-relay-shim.js; do [ -x "$STAGE_REL_DIR/$f" ] || die "staged $f is not executable"; done
 [ "$SKIP_PREREQS" = 1 ] || [ -x "/opt/aw-claude/$CLAUDE_VERSION/claude" ] || [ "$DRY" = 1 ] || die "the pinned claude binary is missing"
+
+# The node link (see the packages-and-node step): only now that every check on this release has passed.
+if [ -n "${NODE_LINK_TARGET:-}" ] && [ "$PREPARE" != 1 ]; then
+  if [ "$(readlink /usr/bin/node 2>/dev/null || true)" = "$NODE_LINK_TARGET" ]; then
+    skip "/usr/bin/node already points at node $NODE_VERSION"
+  else
+    doing "ln -sfn $NODE_LINK_TARGET /usr/bin/node"
+    mut ln -sfn "$NODE_LINK_TARGET" /usr/bin/node
+  fi
+fi
 
 if [ "$DRY" = 1 ]; then
   if [ "$FAILED" -gt 0 ]; then
