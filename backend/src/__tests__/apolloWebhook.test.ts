@@ -144,6 +144,36 @@ describe('POST /api/crm/webhooks/apollo — payload handling', () => {
     expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
   });
 
+  it('treats a padded request_id as the same id: same placeholder lookup, trimmed stored id, idempotent replay', async () => {
+    mockCrmDb.getEnrichmentCacheItem.mockResolvedValue({
+      cacheType: 'apollo', rawData: { listId: 'L1', leadId: 'LD1', userId: 'u1' },
+    } as any);
+    mockCrmDb.getLeadById.mockResolvedValue({ leadId: 'LD1', email: '', enrichmentMetadata: {} } as any);
+    (mockCrmDb as any).setLeadEmailIfMissing.mockResolvedValue({ written: true });
+
+    await send({ request_id: 'r1', person: { email: 'apollo@b.com', email_status: 'verified' } });
+    const plainLookup = mockCrmDb.getEnrichmentCacheItem.mock.calls[0];
+    mockCrmDb.getEnrichmentCacheItem.mockClear();
+    (mockCrmDb as any).setLeadEmailIfMissing.mockClear();
+    await send({ request_id: ' r1\n ', person: { email: 'apollo@b.com', email_status: 'verified' } });
+    expect(mockCrmDb.getEnrichmentCacheItem.mock.calls[0]).toEqual(plainLookup);
+    expect((mockCrmDb as any).setLeadEmailIfMissing.mock.calls[0][3].apolloRequestId).toBe('r1');
+
+    // A replay of the same id with padding must hit the idempotency early-out, not rewrite.
+    (mockCrmDb as any).setLeadEmailIfMissing.mockClear();
+    mockCrmDb.getLeadById.mockResolvedValue({
+      leadId: 'LD1', email: 'apollo@b.com', enrichmentMetadata: { email: { apolloRequestId: 'r1' } },
+    } as any);
+    const replay = await send({ request_id: '  r1  ', person: { email: 'other@b.com' } });
+    expect(replay.body.alreadyProcessed).toBe(true);
+    expect((mockCrmDb as any).setLeadEmailIfMissing).not.toHaveBeenCalled();
+  });
+
+  it('rejects a whitespace-only request_id with 400', async () => {
+    const res = await send({ request_id: '   ', person: { email: 'a@b.com' } });
+    expect(res.status).toBe(400);
+  });
+
   it('skips when lead already has a different email', async () => {
     mockCrmDb.getEnrichmentCacheItem.mockResolvedValue({
       cacheType: 'apollo', rawData: { listId: 'L1', leadId: 'LD1', userId: 'u1' },
@@ -272,6 +302,25 @@ describe('POST /api/crm/webhooks/apollo — payload handling', () => {
       (mockCrmDb as any).setLeadEmailIfMissing.mockClear();
       await send({ request_id: 'r2', person: { email: 'ok@acme.com', email_status: '<b>Verified</b>\r\n' } });
       expect((mockCrmDb as any).setLeadEmailIfMissing.mock.calls[0][3].sourceQuote).toBe('Apollo waterfall (bverifiedb)');
+    });
+
+    it('a forged non-string verifier status cannot 500 the handler and never counts as validated', async () => {
+      const forged = (status: any) => ({ request_id: 'r1', people: [{ waterfall: { emails: [{ vendors: [
+        { name: 'f', status: 'GUESSED', emails: ['good@acme.com'] },
+        { name: 'v', status, usedForVerification: true },
+      ] }] } }] });
+      for (const status of [{ toString: 1 }, { a: 1 }, ['validated'], 123, null]) {
+        placeholderAndLead();
+        (mockCrmDb as any).setLeadEmailIfMissing.mockClear();
+        const res = await send(forged(status));
+        expect(res.status).toBe(200);
+        const meta = (mockCrmDb as any).setLeadEmailIfMissing.mock.calls[0][3];
+        expect(meta.sourceQuote).toBe('Apollo waterfall (guessed)'); // not upgraded to verified
+      }
+      placeholderAndLead();
+      (mockCrmDb as any).setLeadEmailIfMissing.mockClear();
+      await send(forged('Validated'));
+      expect((mockCrmDb as any).setLeadEmailIfMissing.mock.calls[0][3].sourceQuote).toBe('Apollo waterfall (verified)');
     });
 
     it('logs (without the value) when an email is rejected, and stays quiet when there is simply no email', async () => {

@@ -90,13 +90,6 @@ function cleanStatus(v: unknown): string | undefined {
 }
 
 /**
- * Pull the first finder-vendor email out of Apollo's nested waterfall payload.
- * Falls back to the flat `person.email` / `email` shape if `people[]` is absent
- * (sync match or older payload format). When a downstream verifier vendor
- * (ZeroBounce et al.) reports `validated`, the resulting status is upgraded
- * to `verified` regardless of the finder's self-claim.
- */
-/**
  * Shape gate for an email arriving in a callback body before it is stored on a customer lead (ENG-2801).
  * Only a string of at most 254 characters that is one plausible address: the local part is limited to the
  * RFC 5322 "atext" characters (letters, digits and !#$%&'*+/=?^_`{|}~- plus dots), which excludes whitespace,
@@ -113,6 +106,13 @@ export function cleanCallbackEmail(value: unknown): string | undefined {
   return e.length > 0 && e.length <= 254 && CALLBACK_EMAIL_SHAPE.test(e) ? e : undefined;
 }
 
+/**
+ * Pull the first finder-vendor email out of Apollo's nested waterfall payload.
+ * Falls back to the flat `person.email` / `email` shape if `people[]` is absent
+ * (sync match or older payload format). When a downstream verifier vendor
+ * (ZeroBounce et al.) reports `validated`, the resulting status is upgraded
+ * to `verified` regardless of the finder's self-claim.
+ */
 function extractApolloEmail(payload: ApolloWebhookPayload): { email?: string; emailStatus?: string; rejected: number } {
   let rejected = 0; // candidate email values that were present but failed the shape gate
   const person = Array.isArray(payload.people) ? payload.people[0] : null;
@@ -129,7 +129,7 @@ function extractApolloEmail(payload: ApolloWebhookPayload): { email?: string; em
         continue; // nothing in this group is a usable address; try the next group
       }
       const verified = vendors.some(
-        (v) => v?.usedForVerification && String(v?.status ?? '').toLowerCase() === 'validated',
+        (v) => v?.usedForVerification && typeof v?.status === 'string' && v.status.toLowerCase() === 'validated',
       );
       const finderStatus = cleanStatus(finder.status) ?? '';
       const emailStatus =
@@ -162,8 +162,10 @@ router.post('/:secret', async (req: Request, res: Response) => {
     }
 
     const payload: ApolloWebhookPayload = req.body ?? {};
-    const requestId = payload.request_id;
-    if (!requestId || typeof requestId !== 'string') {
+    // Trimmed once here (the cache key builder trims too), so the idempotency check, the stored apolloRequestId and the
+    // logs all see the same id as the placeholder lookup.
+    const requestId = typeof payload.request_id === 'string' ? payload.request_id.trim() : '';
+    if (!requestId) {
       return res.status(400).json({ message: 'missing request_id' });
     }
 
