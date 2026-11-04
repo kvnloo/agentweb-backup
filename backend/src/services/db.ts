@@ -11183,7 +11183,9 @@ export const crmDb = {
    * `updatedBefore` (ISO strings compare correctly as text), newest lead first (leadIds are timestamp-prefixed).
    * No index: it pages through the list's own partition, `Limit` counts the leads READ (the filter runs after the
    * read, so that count is the read cost), and it stops after `maxRead` of them. `truncated` says the list had
-   * more. Eventually consistent: a caller that acts on a hit re-reads the record.
+   * more (a false positive when the read stops exactly at `maxRead` and nothing follows: DynamoDB cannot tell without
+   * another read). Eventually consistent: a caller that acts on a hit re-reads the record. `paginatedQuery` is
+   * deliberately not used: it has no cap on the leads read, which is the bound this method exists to enforce.
    */
   async findLeadsBySystemRecord(
     listId: string,

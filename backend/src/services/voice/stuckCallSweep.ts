@@ -6,7 +6,7 @@ import { errorName, finishIfComplete, finishWaitingAttempt, leadLegExpected, met
 import { getLeadCallStore } from './leadCallStore';
 import type { HotLeadCallLeg, HotLeadCallRecord, HotLeadCallState } from './leadCallStore.types';
 import { BRIDGED_CALL_TIME_LIMIT_SECONDS, GATHER_TIMEOUT_SECONDS, LEAD_DIAL_TIMEOUT_SECONDS } from './twiml';
-import { getVoiceProvider, type FetchedCall } from './voiceProvider';
+import { VoiceCallError, getVoiceProvider, type FetchedCall } from './voiceProvider';
 
 /**
  * Stuck-record sweep (ENG-2271): finds hot-lead call records that stayed live longer than a call can last and
@@ -36,7 +36,7 @@ const SECOND_MS = 1000;
 const MINUTE_MS = 60 * SECOND_MS;
 /**
  * Added to every state's longest healthy dwell: Twilio's callback retries, the queue's reclaim of a dead worker
- * (5 minutes stale, polled every 30 seconds) and clock skew. It is also the runbook's old "older than 10 minutes".
+ * (5 minutes stale, polled every 30 seconds) and clock skew.
  */
 const GRACE_MS = 10 * MINUTE_MS;
 /** The longest a bridged call can run: the Dial's own limit, plus the lead's ring and the two keypress prompts before it. */
@@ -63,11 +63,15 @@ export const STUCK_AFTER_MS: Record<SweepableState, number> = {
   between_attempts: HOT_LEAD_CALL_LIMITS.maxAgeMinutes.max * MINUTE_MS + GRACE_MS,
 };
 const SWEEPABLE_STATES = Object.keys(STUCK_AFTER_MS) as SweepableState[];
+const isSweepable = (state: HotLeadCallState): state is SweepableState => state in STUCK_AFTER_MS;
 
 /** Hard bounds of one run (see "Stuck records" in docs/integrations/hot-lead-call.md). */
 const MAX_LEADS_READ_PER_LIST = 500;
 const MAX_LEADS_READ_PER_RUN = 10_000;
-const MAX_RECORDS_PER_RUN = 50;
+/** Records one run may write to (would close, in report mode). Records left for a human or failing do not use it up, so they cannot starve the rest. */
+const MAX_WRITES_PER_RUN = 50;
+/** Every record handled costs up to two Twilio reads, so those are bounded too. */
+const MAX_RECORDS_HANDLED_PER_RUN = 200;
 
 const SYSTEM_KEY = 'hot_lead_call';
 
@@ -90,20 +94,20 @@ export type StuckDecision =
 
 /** Pure: what to do with a record at `nowMs`. No I/O, so the whole table is testable with a fake clock. */
 export function decideStuck(record: HotLeadCallRecord, nowMs: number): StuckDecision {
-  const threshold = STUCK_AFTER_MS[record.state as SweepableState];
   // An unreadable updatedAt makes the age NaN, which is not "old": such a record is left alone.
-  if (threshold === undefined || !(nowMs - Date.parse(record.updatedAt) >= threshold)) return { action: 'leave' };
+  if (!isSweepable(record.state) || !(nowMs - Date.parse(record.updatedAt) >= STUCK_AFTER_MS[record.state])) return { action: 'leave' };
   if (record.state === 'between_attempts') return { action: 'close_stranded' };
 
   const metered = record.meteredLegs ?? [];
+  // The lead leg first: the member leg is the one that can end the attempt, so it is metered last.
   const legs: LegToSettle[] = [];
-  if (!metered.includes(meteredLegOf('member', record))) {
-    if (!record.memberCallSid) return { action: 'needs_human', reason: 'the member call has no sid: a call may exist that was never recorded' };
-    legs.push({ leg: 'member', callSid: record.memberCallSid });
-  }
   if (leadLegExpected(record) && !metered.includes('lead')) {
     if (!record.leadCallSid) return { action: 'needs_human', reason: 'the lead call has no sid: a leg may exist that was never recorded' };
     legs.push({ leg: 'lead', callSid: record.leadCallSid });
+  }
+  if (!metered.includes(meteredLegOf('member', record))) {
+    if (!record.memberCallSid) return { action: 'needs_human', reason: 'the member call has no sid: a call may exist that was never recorded' };
+    legs.push({ leg: 'member', callSid: record.memberCallSid });
   }
   return legs.length ? { action: 'reconcile', legs } : { action: 'finish' };
 }
@@ -130,7 +134,7 @@ export interface StuckSweepSummary {
   lists: number;
   /** Leads read to find the records (the read cost of the run). */
   leadsRead: number;
-  /** A list or the run hit its read bound, or records beyond MAX_RECORDS_PER_RUN were left for the next run. */
+  /** A read bound stopped a list or the run (it fires on any large list: not a signal by itself), or a write/handled cap left records for the next run. */
   truncated: boolean;
   /** Records the read found: live and older than the youngest state threshold (decideStuck then applies each state's own). */
   found: number;
@@ -158,13 +162,31 @@ interface Candidate {
 const logRecord = (c: Candidate, state: string, what: string) =>
   console.warn(`${TAG} stuck call record: org ${c.orgId} list ${c.listId} lead ${c.leadId} state ${state}: ${what}`);
 
+type Settled = keyof Pick<StuckSweepSummary, 'wouldClose' | 'closed' | 'stillLive' | 'needsHuman' | 'notStuck' | 'moved'>;
+
+/** Whether `fresh` is still the call `decided` was decided on: same call, attempt, state and call sids. */
+const sameCall = (decided: HotLeadCallRecord, fresh: HotLeadCallRecord | null): boolean =>
+  !!fresh && fresh.jobKey === decided.jobKey && fresh.attemptNo === decided.attemptNo && fresh.state === decided.state
+  && fresh.memberCallSid === decided.memberCallSid && fresh.leadCallSid === decided.leadCallSid;
+
+/** Twilio's answer for one leg; a call Twilio has no record of (404) is for a human, any other failure is thrown. */
+async function fetchLeg(leg: LegToSettle): Promise<FetchedCall | 'not_found'> {
+  try {
+    return await getVoiceProvider().fetchCall(leg.callSid);
+  } catch (err) {
+    if (err instanceof VoiceCallError && err.httpStatus === 404) return 'not_found';
+    throw err;
+  }
+}
+
 /** Settles one candidate and returns how it ended. Throws when Twilio or the store fails. */
-async function handle(c: Candidate, mode: StuckSweepMode, nowMs: number): Promise<keyof Pick<StuckSweepSummary, 'wouldClose' | 'closed' | 'stillLive' | 'needsHuman' | 'notStuck' | 'moved'>> {
+async function handle(c: Candidate, mode: StuckSweepMode, nowMs: number): Promise<Settled> {
   const store = getLeadCallStore();
   // The discovery read is eventually consistent: decide on a consistent one.
   const record = await store.get(c.listId, c.leadId);
-  const decision = record ? decideStuck(record, nowMs) : ({ action: 'leave' } as const);
-  if (!record || decision.action === 'leave') return 'notStuck';
+  if (!record) return 'notStuck';
+  const decision = decideStuck(record, nowMs);
+  if (decision.action === 'leave') return 'notStuck';
   const q: CallQuery = { listId: c.listId, leadId: c.leadId, jobKey: record.jobKey, leg: 'member' };
 
   if (decision.action === 'needs_human') {
@@ -175,9 +197,13 @@ async function handle(c: Candidate, mode: StuckSweepMode, nowMs: number): Promis
   const ended: Array<Extract<Reading, { kind: 'ended' }>> = [];
   if (decision.action === 'reconcile') {
     // Read every leg before writing any, so a Twilio failure leaves the record untouched.
-    const provider = getVoiceProvider();
     for (const leg of decision.legs) {
-      const reading = readCall(leg, await provider.fetchCall(leg.callSid));
+      const call = await fetchLeg(leg);
+      if (call === 'not_found') {
+        logRecord(c, record.state, `needs a human: Twilio has no record of the ${leg.leg} call`);
+        return 'needsHuman';
+      }
+      const reading = readCall(leg, call);
       if (reading.kind === 'live') {
         logRecord(c, record.state, `Twilio says the ${leg.leg} call is still live: left alone`);
         return 'stillLive';
@@ -192,14 +218,17 @@ async function handle(c: Candidate, mode: StuckSweepMode, nowMs: number): Promis
   logRecord(c, record.state, `${mode === 'close' ? 'closing' : 'would close'} (${decision.action})`);
   if (mode !== 'close') return 'wouldClose';
 
+  // Twilio was asked a while ago: a late genuine callback may have moved the record on (even to the next attempt).
+  // Write only while it is still the call that was decided on; meterLeg checks the sid again at each write.
+  if (!sameCall(record, await store.get(c.listId, c.leadId))) return 'moved';
+
   if (decision.action === 'close_stranded') {
     // The same close the next-attempt job makes when it breaks before ringing anyone.
     await closeBetweenAttempts(store, { listId: c.listId, leadId: c.leadId, attemptNo: record.attemptNo, outcome: 'next_attempt_failed', closing: 'errored' });
   } else {
     let attemptEnded: string | undefined;
-    // The lead leg first: the member leg is the one that can end the attempt, so it is metered last.
-    for (const leg of [...ended].sort((a, b) => Number(a.leg === 'member') - Number(b.leg === 'member'))) {
-      const metered = await meterLeg({ q: { ...q, leg: leg.leg }, callSid: leg.callSid, sequence: undefined, durationSeconds: leg.durationSeconds });
+    for (const leg of ended) {
+      const metered = await meterLeg({ q: { ...q, leg: leg.leg }, callSid: leg.callSid, sequence: undefined, durationSeconds: leg.durationSeconds, expectSid: leg.callSid });
       if (metered.status !== 'done') throw new Error(`metering the ${leg.leg} leg gave ${metered.status}`);
       attemptEnded ??= metered.attemptEnded;
     }
@@ -219,13 +248,13 @@ async function findCandidates(nowMs: number, summary: StuckSweepSummary): Promis
   for (const orgId of await orgDb.listHotLeadCallOrgIds()) {
     summary.orgs++;
     try {
-      const lists = new Map<string, { listId: string }>();
+      const listIds = new Set<string>();
       for (const member of await orgDb.getOrgMembers(orgId)) {
         for (const list of await crmDb.getLeadListsByUserId(member.userId)) {
-          if (!suppressLeadSideEffects(list)) lists.set(list.listId, list);
+          if (!suppressLeadSideEffects(list)) listIds.add(list.listId);
         }
       }
-      for (const listId of lists.keys()) {
+      for (const listId of listIds) {
         const budget = Math.min(MAX_LEADS_READ_PER_LIST, MAX_LEADS_READ_PER_RUN - summary.leadsRead);
         if (budget <= 0) { summary.truncated = true; break; }
         summary.lists++;
@@ -243,7 +272,7 @@ async function findCandidates(nowMs: number, summary: StuckSweepSummary): Promis
 }
 
 /**
- * Settles the stuck records of every org that holds a number. Reads are bounded (see the constants); one record's
+ * Settles the stuck records of every org that has a hot-lead config. Reads are bounded (see the constants); one record's
  * or org's failure never stops the rest; a second run, or an overlapping one, finds the work done or loses the
  * conditional write. Not gated on `hot_lead_call_mode`: a stuck record needs cleaning whether or not calling is on,
  * and nothing here can dial.
@@ -261,8 +290,13 @@ export async function runStuckCallSweep(now: Date = new Date()): Promise<StuckSw
     return [];
   });
   summary.found = candidates.length;
-  if (candidates.length > MAX_RECORDS_PER_RUN) summary.truncated = true;
-  for (const c of candidates.slice(0, MAX_RECORDS_PER_RUN)) {
+  let handled = 0;
+  for (const c of candidates) {
+    if (summary.wouldClose + summary.closed >= MAX_WRITES_PER_RUN || handled >= MAX_RECORDS_HANDLED_PER_RUN) {
+      summary.truncated = true;
+      break;
+    }
+    handled++;
     try {
       summary[await handle(c, summary.mode, now.getTime())]++;
     } catch (err) {

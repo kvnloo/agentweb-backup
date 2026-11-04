@@ -26,6 +26,12 @@ export interface LegCallback {
   callSid: string;
   sequence: number | undefined;
   durationSeconds: number;
+  /**
+   * Meter only while the record's call sid for this leg is still this one: a caller that decided on an earlier read
+   * (the stuck-record sweep) must not meter a record that has since moved on to another attempt. The webhooks pass
+   * nothing, so their behaviour is unchanged.
+   */
+  expectSid?: string;
 }
 
 /** States in which a leg can still be metered and the call finished: everything before a terminal state. */
@@ -138,6 +144,7 @@ export async function meterLeg(cb: LegCallback): Promise<Metered> {
   for (let attempt = 0; attempt < MAX_TRANSITION_ATTEMPTS; attempt++) {
     const current = await store.get(q.listId, q.leadId);
     if (!current || current.jobKey !== q.jobKey) return { status: 'done' };
+    if (cb.expectSid !== undefined && cb.expectSid !== (q.leg === 'member' ? current.memberCallSid : current.leadCallSid)) return { status: 'done' };
     // A redelivery of the callback that already metered this member leg and ended the attempt. Nothing is left to
     // write, but the hand-over after it may never have happened (a store error between the two, or a next-attempt
     // request that failed): the record is still waiting between attempts, so ask again. Asking is idempotent.
