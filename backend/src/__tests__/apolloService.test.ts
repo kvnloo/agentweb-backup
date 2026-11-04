@@ -420,6 +420,14 @@ describe('ApolloService — input validation', () => {
       expect((await run({ person: {}, request_id: -7694135129641490782, request_id_str: '-7694135129641490782' })).asyncRequestId).toBe('-7694135129641490782');
     });
 
+    it('passes a negative numeric id (exactly representable) through as a string', async () => {
+      expect((await run({ person: {}, request_id: -123456789 })).asyncRequestId).toBe('-123456789');
+    });
+
+    it('reads request_id_str from inside person as well', async () => {
+      expect((await run({ person: { request_id_str: EXACT }, request_id: ROUNDED })).asyncRequestId).toBe(EXACT);
+    });
+
     it('is not pending when the email came back synchronously', async () => {
       const r = await run({ person: { email: 'a@b.com' }, request_id: ROUNDED, request_id_str: EXACT });
       expect(r.found).toBe(true);

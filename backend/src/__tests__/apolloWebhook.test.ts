@@ -30,7 +30,7 @@ jest.mock('../services/db', () => ({
   },
 }));
 
-import apolloWebhookRouter from '../routes/apolloWebhook';
+import apolloWebhookRouter, { cleanCallbackEmail } from '../routes/apolloWebhook';
 import { crmDb } from '../services/db';
 
 const mockCrmDb = crmDb as jest.Mocked<typeof crmDb>;
@@ -180,6 +180,81 @@ describe('POST /api/crm/webhooks/apollo — payload handling', () => {
     expect(email).toBe('apollo@b.com');
     expect(meta.confidence).toBe('high');
     expect(meta.apolloRequestId).toBe('r1');
+  });
+
+  // ENG-2801: the matched path is now reachable in production, so what a callback may put on a customer lead is gated.
+  describe('callback email validation', () => {
+    function placeholderAndLead() {
+      mockCrmDb.getEnrichmentCacheItem.mockResolvedValue({
+        cacheType: 'apollo', rawData: { listId: 'L1', leadId: 'LD1', userId: 'u1' },
+      } as any);
+      mockCrmDb.getLeadById.mockResolvedValue({ leadId: 'LD1', email: '', enrichmentMetadata: {} } as any);
+      (mockCrmDb as any).setLeadEmailIfMissing.mockResolvedValue({ written: true });
+    }
+    const wf = (...emails: any[]) => ({ request_id: 'r1', people: [{ waterfall: { emails: [{ vendors: [{ name: 'p', status: 'VERIFIED', emails }] }] } }] });
+    const stamped = () => (mockCrmDb.putEnrichmentCacheItem as jest.Mock).mock.calls.map((c) => c[0].rawData?.status);
+
+    const REJECTED: Array<[string, any]> = [
+      ['not an address', 'not-an-email'],
+      ['no TLD', 'a@b'],
+      ['whitespace', 'a b@c.com'],
+      ['CRLF header injection', 'a@b.com\r\nBcc: victim@y.com'],
+      ['markup', '<script>alert(1)@x.com'],
+      ['two addresses', 'a@b.com,c@d.com'],
+      ['quoted display name', '"Bob" <bob@x.com>'],
+      ['300 characters', 'x'.repeat(300) + '@a.com'],
+      ['object', { email: 'a@b.com' }],
+      ['nested array that would stringify to a valid address', ['a@b.com']],
+      ['259 characters (fits the shape, exceeds 254)', 'a'.repeat(64) + '@' + 'b'.repeat(190) + '.com'],
+      ['null', null],
+      ['number', 12345],
+      ['empty', ''],
+    ];
+    it.each(REJECTED)('does not write a %s and treats the callback as no_email', async (_label, bad) => {
+      placeholderAndLead();
+      const res = await send(wf(bad));
+      expect(res.status).toBe(200);
+      expect(res.body.hadEmail).toBe(false);
+      expect((mockCrmDb as any).setLeadEmailIfMissing).not.toHaveBeenCalled();
+      expect(stamped()).toEqual(['no_email']); // the placeholder is never stamped completed with a junk value
+    });
+
+    it('falls through to the next group when the first holds nothing usable', async () => {
+      placeholderAndLead();
+      const body = { request_id: 'r1', people: [{ waterfall: { emails: [
+        { vendors: [{ name: 'a', status: 'VERIFIED', emails: ['garbage'] }] },
+        { vendors: [{ name: 'b', status: 'VERIFIED', emails: ['good@acme.com'] }] },
+      ] } }] };
+      const res = await send(body);
+      expect(res.status).toBe(200);
+      expect((mockCrmDb as any).setLeadEmailIfMissing.mock.calls[0][2]).toBe('good@acme.com');
+    });
+
+    it('takes the first usable address inside one vendor entry', async () => {
+      placeholderAndLead();
+      await send(wf('junk', 'second@acme.com'));
+      expect((mockCrmDb as any).setLeadEmailIfMissing.mock.calls[0][2]).toBe('second@acme.com');
+    });
+
+    it('a non-string flat email or status no longer 500s (flat shape)', async () => {
+      placeholderAndLead();
+      const a = await send({ request_id: 'r1', person: { email: { x: 1 } } });
+      expect(a.status).toBe(200);
+      expect(a.body.hadEmail).toBe(false);
+      placeholderAndLead();
+      const b = await send({ request_id: 'r2', person: { email: 'ok@acme.com', email_status: 5 } });
+      expect(b.status).toBe(200);
+      expect((mockCrmDb as any).setLeadEmailIfMissing.mock.calls.pop()[2]).toBe('ok@acme.com');
+    });
+
+    it('cleanCallbackEmail keeps ordinary and unusual-but-legal addresses', () => {
+      for (const ok of ['avery@example.com', 'first.last+tag@sub.example.co.uk', "o'brien@company.com", 'A@B.IO', '  padded@x.com  ']) {
+        expect(cleanCallbackEmail(ok)).toBe(ok.trim());
+      }
+      expect(cleanCallbackEmail(undefined)).toBeUndefined();
+      expect(cleanCallbackEmail('a'.repeat(64) + '@x.com')).toBe('a'.repeat(64) + '@x.com');
+      expect(cleanCallbackEmail('a'.repeat(65) + '@x.com')).toBeUndefined();
+    });
   });
 
   it('reports written:false when the conditional update silently lost the race', async () => {

@@ -89,6 +89,20 @@ interface ApolloWebhookPayload {
  * (ZeroBounce et al.) reports `validated`, the resulting status is upgraded
  * to `verified` regardless of the finder's self-claim.
  */
+/**
+ * Shape gate for an email arriving in a callback body before it is stored on a customer lead (ENG-2801).
+ * Only a string of at most 254 characters that looks like one address: no whitespace (so no CR/LF header
+ * injection), no angle brackets, quotes, commas, semicolons, colons, parentheses, brackets or backslashes
+ * (so no markup, no multi-address strings). Apostrophes and plus-tags stay legal (o'brien@x.com, a+b@x.co.uk).
+ * Anything else is treated as "no email" so a malformed or forged value is never written.
+ */
+const CALLBACK_EMAIL_SHAPE = /^[^\s@<>"\\,;:()[\]]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?\.[A-Za-z]{2,63}$/;
+export function cleanCallbackEmail(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const e = value.trim();
+  return e.length > 0 && e.length <= 254 && CALLBACK_EMAIL_SHAPE.test(e) ? e : undefined;
+}
+
 function extractApolloEmail(payload: ApolloWebhookPayload): { email?: string; emailStatus?: string } {
   const person = Array.isArray(payload.people) ? payload.people[0] : null;
   const groups = person?.waterfall?.emails;
@@ -97,6 +111,8 @@ function extractApolloEmail(payload: ApolloWebhookPayload): { email?: string; em
       const vendors = Array.isArray(grp?.vendors) ? grp.vendors : [];
       const finder = vendors.find((v) => Array.isArray(v?.emails) && v.emails.length > 0);
       if (!finder || !finder.emails || finder.emails.length === 0) continue;
+      const email = (finder.emails as unknown[]).map(cleanCallbackEmail).find((e): e is string => !!e);
+      if (!email) continue; // nothing in this group is a usable address; try the next group
       const verified = vendors.some(
         (v) => v?.usedForVerification && String(v?.status ?? '').toLowerCase() === 'validated',
       );
@@ -105,7 +121,7 @@ function extractApolloEmail(payload: ApolloWebhookPayload): { email?: string; em
         verified || finderStatus === 'verified' ? 'verified' :
         finderStatus === 'guessed' ? 'guessed' :
         finderStatus || undefined;
-      return { email: String(finder.emails[0]), emailStatus };
+      return { email, emailStatus };
     }
   }
   // Flat-shape fallback. Lowercase the status so downstream confidence
@@ -114,8 +130,8 @@ function extractApolloEmail(payload: ApolloWebhookPayload): { email?: string; em
   const flatEmail = payload.person?.email ?? payload.email;
   const flatStatus = payload.person?.email_status ?? payload.email_status;
   return {
-    email: flatEmail,
-    emailStatus: typeof flatStatus === 'string' ? flatStatus.toLowerCase() : flatStatus,
+    email: cleanCallbackEmail(flatEmail),
+    emailStatus: typeof flatStatus === 'string' ? flatStatus.toLowerCase() : undefined,
   };
 }
 
