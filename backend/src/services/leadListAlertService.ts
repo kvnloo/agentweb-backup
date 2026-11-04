@@ -23,7 +23,7 @@ import {
   resolveDestination,
 } from './messagingChannelService';
 import { TEMPLATES } from './whatsappService';
-import { buildSmartleadReplyAlertEmail, isSmartleadReplyAlert } from './smartleadReplyAlertEmail';
+import { buildSmartleadReplyAlertEmail, isSmartleadReplyAlert, smartleadReplyContactLabel, smartleadReplyHeadline } from './smartleadReplyAlertEmail';
 
 const normalizeEventType = (eventType: string) => eventType.trim().toLowerCase();
 
@@ -336,6 +336,8 @@ export const leadListAlertService = {
     const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
     const crmUrl = `${customerFrontendUrl}/crm?listId=${encodeURIComponent(list.listId)}`;
     const listName = list.name || 'Lead List';
+    // Same test the email uses: only a reply that came back through Smartlead gets the plain-language wording below.
+    const smartleadReply = isSmartleadReplyAlert(normalizedEventType, eventData);
 
     // Send Slack notification if the user has a slackChannel configured.
     // Deliberately still reading the deprecated singular `slackChannel` rather than
@@ -367,6 +369,8 @@ export const leadListAlertService = {
           eventType: normalizedEventType,
           timestamp: createdAt || new Date().toISOString(),
           compact: isCompactLeadNotificationUser(list.userId),
+          // A Smartlead reply reads as a sentence, not the raw event name. Every other event leaves this out.
+          ...(smartleadReply ? { headline: smartleadReplyHeadline(formatLeadName(lead), lead.email) } : {}),
         });
       } catch (slackError) {
         // Log but don't fail — email was already sent successfully
@@ -385,14 +389,25 @@ export const leadListAlertService = {
           [lead.firstName, lead.lastName].filter(Boolean).join(' ').trim() ||
           lead.email ||
           'A lead';
-        await getMessagingChannel('whatsapp').sendMessage({
-          destination: whatsappTo,
-          text: `${leadName} — ${normalizedEventType} on ${listName}. ${crmUrl}`,
-          template: {
-            name: TEMPLATES.LEAD_ALERT.name,
-            variables: [leadName, `${normalizedEventType} on ${listName}. ${crmUrl}`],
-          },
-        } as any);
+        if (smartleadReply) {
+          // The contact's name is their own words: one safe line, so it can never add a line break to the message.
+          const who = smartleadReplyContactLabel(formatLeadName(lead), lead.email) || 'A lead';
+          const detail = `replied to your campaign on ${listName}. ${crmUrl}`;
+          await getMessagingChannel('whatsapp').sendMessage({
+            destination: whatsappTo,
+            text: `${who} ${detail}`,
+            template: { name: TEMPLATES.LEAD_ALERT.name, variables: [who, detail] },
+          } as any);
+        } else {
+          await getMessagingChannel('whatsapp').sendMessage({
+            destination: whatsappTo,
+            text: `${leadName} — ${normalizedEventType} on ${listName}. ${crmUrl}`,
+            template: {
+              name: TEMPLATES.LEAD_ALERT.name,
+              variables: [leadName, `${normalizedEventType} on ${listName}. ${crmUrl}`],
+            },
+          } as any);
+        }
       }
     } catch (whatsappError) {
       // Same contract as the Slack path: email already landed, so a channel failure

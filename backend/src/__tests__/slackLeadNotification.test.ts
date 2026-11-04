@@ -114,6 +114,42 @@ describe('formatLeadNotificationPayload', () => {
   });
 });
 
+describe('formatLeadNotificationPayload — a headline sentence (Smartlead reply)', () => {
+  const lead: LeadNotificationPayload = {
+    firstName: 'Jane', lastName: 'Doe', email: 'jane@example.com', company: 'Acme Corp', listName: 'Inbound Leads', listId: 'list_123',
+    crmUrl: 'https://app.example.com/crm?listId=list_123', timestamp: '2026-03-16T12:00:00.000Z', eventType: 'email.received',
+  };
+
+  it('puts the sentence in the header and the fallback, and keeps the fields, the time and the button', () => {
+    const withLine = formatLeadNotificationPayload({ ...lead, headline: 'A new lead "Jane Doe" replied to your campaign' });
+    const without = formatLeadNotificationPayload(lead);
+    expect(withLine.blocks[0].text.text).toBe('A new lead "Jane Doe" replied to your campaign');
+    expect(withLine.text).toBe('A new lead "Jane Doe" replied to your campaign. List: Inbound Leads');
+    expect(JSON.stringify(withLine.text + withLine.blocks)).not.toContain('email.received');
+    expect(withLine.blocks.slice(1)).toEqual(without.blocks.slice(1));
+  });
+
+  it('escapes the fallback text for Slack, so a contact\'s name can not make a link or a mention', () => {
+    const r = formatLeadNotificationPayload({ ...lead, headline: 'A new lead "<!channel> & <https://x.example|Click>" replied to your campaign' });
+    expect(r.text).toContain('&lt;!channel&gt; &amp; &lt;https://x.example|Click&gt;');
+    expect(r.text).not.toContain('<');
+  });
+
+  it('leaves every alert without a headline exactly as it was (the raw event name and the old fallback)', () => {
+    const r = formatLeadNotificationPayload(lead);
+    expect(r.blocks[0].text.text).toBe('email.received');
+    expect(r.text).toBe('email.received: Jane Doe (jane@example.com) — Inbound Leads');
+    const none = formatLeadNotificationPayload({ ...lead, eventType: undefined });
+    expect(none.blocks[0].text.text).toBe('New lead added');
+  });
+
+  it('does not touch the compact format, which never showed an event name', () => {
+    const a = formatLeadNotificationPayload({ ...lead, compact: true });
+    const b = formatLeadNotificationPayload({ ...lead, compact: true, headline: 'A new lead "Jane Doe" replied to your campaign' });
+    expect(b).toEqual(a);
+  });
+});
+
 describe('sendLeadNotification', () => {
   beforeEach(() => {
     mockPostMessage.mockReset();

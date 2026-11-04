@@ -863,7 +863,15 @@ export interface LeadNotificationPayload {
   timestamp?: string;
   /** Compact format (ENG-2391): render only name, phone, email; missing values shown as "—". */
   compact?: boolean;
+  /**
+   * A finished plain-language sentence for the header, used instead of the raw event name (a Smartlead reply sets it). It carries a
+   * contact's own words, so the fallback text escapes it for Slack. Absent for every other alert, which keeps its output unchanged.
+   */
+  headline?: string;
 }
+
+/** Slack reads &, < and > in message text as markup (a link, a mention): send them as the entities Slack documents. */
+const escapeSlackText = (value: string): string => value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
 function formatCompactLeadNotificationPayload(lead: LeadNotificationPayload): {
   text: string;
@@ -900,7 +908,7 @@ export function formatLeadNotificationPayload(lead: LeadNotificationPayload): {
   }
   const fullName = [lead.firstName, lead.lastName].filter(Boolean).join(' ') || 'Unknown';
   const timestamp = lead.timestamp || new Date().toISOString();
-  const eventLabel = lead.eventType || 'New lead added';
+  const eventLabel = lead.headline || lead.eventType || 'New lead added';
 
   const fields: Array<{ type: string; text: string }> = [];
 
@@ -962,7 +970,9 @@ export function formatLeadNotificationPayload(lead: LeadNotificationPayload): {
     });
   }
 
-  const fallbackText = `${eventLabel}: ${fullName}${lead.email ? ` (${lead.email})` : ''} — ${lead.listName}`;
+  const fallbackText = lead.headline
+    ? `${escapeSlackText(lead.headline)}. List: ${escapeSlackText(lead.listName)}`
+    : `${eventLabel}: ${fullName}${lead.email ? ` (${lead.email})` : ''} — ${lead.listName}`;
 
   return { text: fallbackText, blocks };
 }
