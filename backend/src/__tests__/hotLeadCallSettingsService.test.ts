@@ -321,6 +321,50 @@ describe('applyHotLeadCallSettings', () => {
   });
 });
 
+describe('applyHotLeadCallSettings: beforeTurningOn', () => {
+  const apply = (body: Record<string, unknown>, hook: jest.Mock, caller: Record<string, unknown> = OWNER) =>
+    applyHotLeadCallSettings(org(), caller as never, { _revision: rev(), ...body }, hook);
+  beforeEach(() => { table.org.hotLeadCall = stored({ enabled: false }); });
+
+  it('runs once, with the config about to be written, when calling is turned on, and before the write', async () => {
+    const hook = jest.fn().mockImplementation(async () => { expect(table.writes).toEqual([]); });
+    await apply({ enabled: true }, hook);
+    expect(hook).toHaveBeenCalledTimes(1);
+    expect(hook.mock.calls[0][0]).toMatchObject({ enabled: true, twilioNumber: '+14155550111' });
+    expect(table.writes).toHaveLength(1);
+  });
+  it('stops the write when it throws', async () => {
+    const hook = jest.fn().mockRejectedValue(new Error('halt'));
+    await expect(apply({ enabled: true }, hook)).rejects.toThrow('halt');
+    expect(table.writes).toEqual([]);
+  });
+  it.each([
+    ['turning calling off', { enabled: false }, true],
+    ['another edit while off', { maxAttemptsPerLead: 2 }, false],
+    ['enabled:true while already on', { enabled: true }, true],
+    ['another edit while on', { maxAttemptsPerLead: 2 }, true],
+  ])('does not run for %s', async (_label, body, on) => {
+    table.org.hotLeadCall = stored({ enabled: on });
+    const hook = jest.fn();
+    await apply(body, hook);
+    expect(hook).not.toHaveBeenCalled();
+  });
+  it.each([
+    ['an unattended run', { ...OWNER, unattended: true }, UnattendedRunError, {}],
+    ['a plan without the feature', OWNER, NotEntitledError, { entitled: false }],
+    ['a setup that cannot be turned on', OWNER, ValidationError, { twilioNumber: undefined, twilioNumberSid: undefined }],
+  ])('runs after the refusals: not for %s', async (_label, caller, error, over) => {
+    if ('entitled' in over) setHotLeadCallEntitledOverride(false);
+    else table.org.hotLeadCall = stored({ enabled: false, ...over });
+    const hook = jest.fn();
+    await expect(apply({ enabled: true }, hook, caller)).rejects.toBeInstanceOf(error);
+    expect(hook).not.toHaveBeenCalled();
+  });
+  it('is optional: without it (the REST path) calling is turned on directly', async () => {
+    expect((await put({ enabled: true })).enabled).toBe(true);
+  });
+});
+
 describe('previewHotLeadCallSettings', () => {
   // Tuesday 2026-10-20 11:00 in Chicago (UTC-5 in October) is 16:00Z.
   const at = new Date('2026-10-20T16:00:00Z');

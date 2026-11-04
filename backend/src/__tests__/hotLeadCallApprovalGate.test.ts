@@ -7,7 +7,7 @@ import { deckHalt, deckReply, type DeckMessage } from './helpers/approvalDeckHis
 
 const NOW = Date.parse('2026-10-22T12:00:00.000Z');
 const base: ApprovalDigestInput = {
-  action: 'provision', orgId: 'org-a', userId: 'owner', sessionId: 's1', target: '415', rentText: '$1.15 per month', revision: 'rev1',
+  action: 'provision', orgId: 'org-a', userId: 'owner', sessionId: 's1', target: '415', priceText: '$1.15 per month', revision: 'rev1',
 };
 const digest = computeApprovalDigest(base);
 const prefix = approvalKindPrefix('provision', digest);
@@ -30,8 +30,9 @@ describe('computeApprovalDigest', () => {
     ['session', { sessionId: 's2' }],
     ['area code', { target: '212' }],
     ['no area code', { target: null }],
-    ['rent', { rentText: '$2.00 per month' }],
+    ['rent', { priceText: '$2.00 per month' }],
     ['settings revision', { revision: 'rev2' }],
+    ['price', { priceText: '$0.020 per minute' }],
   ])('changes with the %s', (_name, change) => expect(computeApprovalDigest({ ...base, ...change })).not.toBe(digest));
 });
 
@@ -43,18 +44,29 @@ describe('approval card', () => {
     expect(newApprovalKind('provision', digest)).not.toBe(kind);
   });
   it('lists the cautious option first, recommends only it, and cannot be delegated or auto-taken', () => {
-    const q = buildApprovalQuestion({ action: 'provision', kind, rentText: '$1.15 per month', areaCode: '415' });
+    const q = buildApprovalQuestion({ action: 'provision', kind, priceText: '$1.15 per month', areaCode: '415' });
     expect(q.options.map(o => o.id)).toEqual([DECLINE_OPTION_ID, APPROVE_OPTION_ID]);
     expect(q.options.filter(o => o.recommended).map(o => o.id)).toEqual([DECLINE_OPTION_ID]);
     expect(q).toMatchObject({ allowEmmaDecide: false, immutable: true, kind });
   });
   it('states the rent and the area code to buy', () => {
-    const q = buildApprovalQuestion({ action: 'provision', kind, rentText: '$1.15 per month', areaCode: '415' });
+    const q = buildApprovalQuestion({ action: 'provision', kind, priceText: '$1.15 per month', areaCode: '415' });
     expect(q.question).toContain('$1.15 per month');
     expect(q.question).toContain('area code 415');
   });
+  it('describes turning calling on: who is phoned, from which number, the rate and that it can be turned off', () => {
+    const q = buildApprovalQuestion({ action: 'enable', kind, priceText: '$0.014 per minute', number: '***0111', members: ['Dana Lee (***0100)', 'Sam Ortiz (***0122)'] });
+    expect(q.question).toContain('lead arrives from your landing page');
+    expect(q.question).toContain('Dana Lee (***0100), Sam Ortiz (***0122)');
+    expect(q.question).toContain('from your number ***0111');
+    expect(q.question).toContain('billed to the organization owner per minute at the current rate of $0.014 per minute');
+    expect(q.question).toContain('turn it off at any time');
+    expect(q.options.map(o => o.id)).toEqual([DECLINE_OPTION_ID, APPROVE_OPTION_ID]);
+    expect(q.options.filter(o => o.recommended).map(o => o.id)).toEqual([DECLINE_OPTION_ID]);
+    expect(q).toMatchObject({ allowEmmaDecide: false, immutable: true, kind });
+  });
   it('names the number being released', () => {
-    const q = buildApprovalQuestion({ action: 'release', kind, rentText: '$1.15 per month', number: '+1•••0111' });
+    const q = buildApprovalQuestion({ action: 'release', kind, priceText: '$1.15 per month', number: '+1•••0111' });
     expect(q.question).toContain('+1•••0111');
     expect(q.question).toMatch(/cannot be recovered/);
   });

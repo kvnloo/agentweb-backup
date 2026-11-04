@@ -1,8 +1,8 @@
 /**
- * Human approval for the paid hot-lead-call number tools (ENG-2613).
+ * Human approval for the hot-lead-call tools that spend money or end calling (ENG-2613, ENG-2271).
  *
- * Buying a number starts a monthly charge and releasing one ends calling, so neither runs on a model's say-so.
- * The tool first halts with a one-question approval card (the same deck-of-one mechanism the CRM sequence
+ * Buying a number starts a monthly charge, releasing one ends calling and turning calling on lets calls be billed
+ * per minute, so none of them runs on a model's say-so. The tool first halts with a one-question approval card (the same deck-of-one mechanism the CRM sequence
  * activation gate uses, see crmSequenceActivationGate.ts) and only acts when the person in the chat has
  * clicked "approve" on that exact card.
  *
@@ -29,7 +29,7 @@ import {
 import type { GateOutcome } from '../crmSequenceActivationGate';
 import type { AskUserQuestionOption } from '../agentMode/core/askUserQuestion';
 
-export type HotLeadCallApprovalAction = 'provision' | 'release';
+export type HotLeadCallApprovalAction = 'provision' | 'release' | 'enable';
 
 /** Card kinds starting with this are written only by this module; ask_user_question refuses them. */
 export const APPROVAL_KIND_RESERVED_PREFIX = 'hot_lead_call_approval:';
@@ -46,10 +46,10 @@ export interface ApprovalDigestInput {
   orgId: string;
   userId: string;
   sessionId: string;
-  /** Area code (provision, may be empty) or the sid of the number being released. */
+  /** Area code (provision, may be empty), the sid of the number being released, or the settings change that turns calling on. */
   target: string | null;
-  /** The monthly rent as quoted to the user now, for example "$1.15 per month". */
-  rentText: string;
+  /** The price as quoted to the user now: the monthly rent ("$1.15 per month") or the call rate ("$0.014 per minute"). */
+  priceText: string;
   /** hotLeadCallRevisionOf(org.hotLeadCall) */
   revision: string;
 }
@@ -62,7 +62,7 @@ export function computeApprovalDigest(input: ApprovalDigestInput): string {
     userId: input.userId,
     sessionId: input.sessionId,
     target: input.target,
-    rentText: input.rentText,
+    priceText: input.priceText,
     revision: input.revision,
   };
   return createHash('sha256').update(JSON.stringify(material)).digest('hex');
@@ -118,21 +118,37 @@ export function checkAttendedForApproval<S extends { sessionType?: string }>(
 export interface ApprovalQuestionInput {
   action: HotLeadCallApprovalAction;
   kind: string;
-  rentText: string;
+  priceText: string;
   areaCode?: string;
-  /** Number being released, for the card text. */
+  /** Caller number, for the card text: the one being released, or the one calls will be placed from. */
   number?: string;
+  /** Who will be phoned when calling is turned on, for example "Dana Lee (***0100)". */
+  members?: string[];
 }
+
+function questionText(input: ApprovalQuestionInput): string {
+  switch (input.action) {
+    case 'provision':
+      return `Buy a phone number${input.areaCode ? ` in area code ${input.areaCode}` : ''} for hot lead calls? It costs ${input.priceText}, charged now and every month until the number is released. Calls placed from it are also billed per minute.`;
+    case 'release':
+      return `Release the hot lead caller number${input.number ? ` ${input.number}` : ''}? Calling is turned off, the number goes back to the phone provider and cannot be recovered, and a new one may be a different number that costs ${input.priceText}.`;
+    case 'enable':
+      return `Turn on hot lead calling? When a lead arrives from your landing page, AgentWeb will phone ${input.members?.join(', ')} from your number${input.number ? ` ${input.number}` : ''}, and then the lead. Calls are billed to the organization owner per minute at the current rate of ${input.priceText}. You can turn it off at any time.`;
+  }
+}
+
+const APPROVE_OPTIONS: Record<HotLeadCallApprovalAction, { label: string; consequence: (priceText: string) => string }> = {
+  provision: { label: 'Buy the number', consequence: priceText => `Buys the number now and charges ${priceText} until it is released.` },
+  release: { label: 'Release the number', consequence: () => 'Releases the number and turns calling off.' },
+  enable: { label: 'Turn calling on', consequence: priceText => `Calls start for new leads now, billed at ${priceText}.` },
+};
 
 /**
  * The approval card. The wording is built here from live values, never from model text. "Decline" comes first
  * and is the recommended option, so any answer taken without a person choosing resolves to "do not spend".
  */
 export function buildApprovalQuestion(input: ApprovalQuestionInput): QuestionDeckQuestionInput {
-  const provision = input.action === 'provision';
-  const question = provision
-    ? `Buy a phone number${input.areaCode ? ` in area code ${input.areaCode}` : ''} for hot lead calls? It costs ${input.rentText}, charged now and every month until the number is released. Calls placed from it are also billed per minute.`
-    : `Release the hot lead caller number${input.number ? ` ${input.number}` : ''}? Calling is turned off, the number goes back to the phone provider and cannot be recovered, and a new one may be a different number that costs ${input.rentText}.`;
+  const approve = APPROVE_OPTIONS[input.action];
   const options: AskUserQuestionOption[] = [
     {
       id: DECLINE_OPTION_ID,
@@ -141,13 +157,9 @@ export function buildApprovalQuestion(input: ApprovalQuestionInput): QuestionDec
       recommended: true,
       why: 'Nothing is spent or changed unless you approve.',
     },
-    {
-      id: APPROVE_OPTION_ID,
-      label: provision ? 'Buy the number' : 'Release the number',
-      consequence: provision ? `Buys the number now and charges ${input.rentText} until it is released.` : 'Releases the number and turns calling off.',
-    },
+    { id: APPROVE_OPTION_ID, label: approve.label, consequence: approve.consequence(input.priceText) },
   ];
-  return { question, options, allowEmmaDecide: false, kind: input.kind, immutable: true };
+  return { question: questionText(input), options, allowEmmaDecide: false, kind: input.kind, immutable: true };
 }
 
 export type ApprovalLookup =

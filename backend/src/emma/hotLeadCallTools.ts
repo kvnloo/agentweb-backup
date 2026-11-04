@@ -1,15 +1,17 @@
 import { emmaToolRegistry } from './registry';
 import { callerIdentity, type ToolContext } from './orgCaller';
+import { requireApproval } from './hotLeadCallApproval';
 import { LEAD_ORIGINS, LEAD_ORIGIN_DESCRIPTIONS } from '../services/leadNotificationConfig';
 import { isRecord } from '../services/leadNotificationAttribution';
 import {
-  HHMM, MEMBER_ID, HOT_LEAD_CALL_ANNOUNCED_NAME_MAX, HOT_LEAD_CALL_COUNTRIES, HOT_LEAD_CALL_DEFAULT_CALLING_HOURS, HOT_LEAD_CALL_LIMITS, HOT_LEAD_CALL_LIMIT_FIELDS,
+  HHMM, MEMBER_ID, maskPhone, HOT_LEAD_CALL_ANNOUNCED_NAME_MAX, HOT_LEAD_CALL_COUNTRIES, HOT_LEAD_CALL_DEFAULT_CALLING_HOURS, HOT_LEAD_CALL_LIMITS, HOT_LEAD_CALL_LIMIT_FIELDS,
   HOT_LEAD_CALL_MAX_TEAM_SIZE, HOT_LEAD_CALL_MAX_WINDOWS_PER_MEMBER, HOT_LEAD_CALL_MEMBER_NAME_MAX, HOT_LEAD_CALL_SYSTEM_FIELDS,
   type HotLeadCallConfig, type HotLeadCallWindow,
 } from '../services/hotLeadCallConfig';
 import {
-  applyHotLeadCallSettings, getHotLeadCallSettings, hotLeadCallRevisionOf, storedHotLeadCallConfig, type HotLeadCallSettingsDto,
+  applyHotLeadCallSettings, canonicalJson, getHotLeadCallSettings, hotLeadCallRevisionOf, storedHotLeadCallConfig, type HotLeadCallSettingsDto,
 } from '../services/hotLeadCallSettingsService';
+import { callRateText } from '../services/voice/numberProvisioning';
 
 // A member created from chat with a bare phone has no schedule of their own, so they are available whenever the calling hours are open.
 const ALWAYS_AVAILABLE: HotLeadCallWindow = { days: [0, 1, 2, 3, 4, 5, 6], start: '00:00', end: '24:00' };
@@ -17,6 +19,13 @@ const DEFAULT_MEMBER_NAME = 'Team member';
 const WRITABLE = [
   'enabled', 'memberPhone', 'memberName', 'team', 'leadTypes', ...HOT_LEAD_CALL_LIMIT_FIELDS, 'announcedName', 'callingHours', 'allowedCountries',
 ];
+
+/** Carries the approval card out of the settings service's hook, which can only continue or throw. */
+class ApprovalHalt extends Error {
+  constructor(readonly halt: Record<string, unknown>) {
+    super('Turning hot lead calling on waits for the user to approve');
+  }
+}
 
 /** The settings as Emma reads them: the portal's view (phones masked) plus the scalar settings only chat edits. */
 function view(dto: HotLeadCallSettingsDto, config: HotLeadCallConfig | undefined) {
@@ -90,7 +99,7 @@ emmaToolRegistry.register({
   name: 'update_hot_lead_call_settings',
   definition: {
     name: 'update_hot_lead_call_settings',
-    description: `Change your organization’s hot lead auto-call settings (org owners/admins only). Only the fields you send change; everything else is kept. The first save needs a team (or memberPhone) and announcedName. With one team member, memberPhone and memberName edit that member (US or Canada only, no extension; Puerto Rico, Guam and other territories are not supported). For several people send team: the FULL list in priority order (first is called first); it replaces the stored team, people left out are removed, an entry with an id edits that person (their phone is kept when omitted), an entry without an id is a new person and needs a phone, and each person needs 1 to ${HOT_LEAD_CALL_MAX_WINDOWS_PER_MEMBER} availability windows read in the calling-hours timezone. At most ${HOT_LEAD_CALL_MAX_TEAM_SIZE} people. Changing a person’s phone clears their verification (and turns calling off if nobody verified is left) until the system re-verifies it. maxAttemptsPerLead (1-5, default 3) is how many people are tried for one lead. maxCallsPerHour and maxCallsPerDay count leads that get a call: a lead uses one slot however many people are tried for it. enabled:true is refused until a team member's phone is verified, a caller number is assigned and calling hours are set, and when the organization's plan does not include hot lead calls; verification and the caller number are managed by the system and cannot be set here. callingHours is the window in which calls ARE allowed (24h HH:MM in the given timezone, default 08:00-21:00; start later than end wraps past midnight). The lead’s own timezone is not considered. timezone must be an IANA Area/Location name such as America/Chicago (UTC, abbreviations and Etc/ zones are refused; letter case is normalised). leadTypes must contain at least one type (default form_fill). announcedName is read aloud on the call: letters, digits, spaces and . , & ' - only, max ${HOT_LEAD_CALL_ANNOUNCED_NAME_MAX} characters. In a scheduled or otherwise unattended run, anything that raises a limit, widens the calling hours, turns calling on or edits the team is refused; ask in an interactive chat.`,
+    description: `Change your organization’s hot lead auto-call settings (org owners/admins only). Only the fields you send change; everything else is kept. The first save needs a team (or memberPhone) and announcedName. With one team member, memberPhone and memberName edit that member (US or Canada only, no extension; Puerto Rico, Guam and other territories are not supported). For several people send team: the FULL list in priority order (first is called first); it replaces the stored team, people left out are removed, an entry with an id edits that person (their phone is kept when omitted), an entry without an id is a new person and needs a phone, and each person needs 1 to ${HOT_LEAD_CALL_MAX_WINDOWS_PER_MEMBER} availability windows read in the calling-hours timezone. At most ${HOT_LEAD_CALL_MAX_TEAM_SIZE} people. Changing a person’s phone clears their verification (and turns calling off if nobody verified is left) until the system re-verifies it. maxAttemptsPerLead (1-5, default 3) is how many people are tried for one lead. maxCallsPerHour and maxCallsPerDay count leads that get a call: a lead uses one slot however many people are tried for it. enabled:true is refused until a team member's phone is verified, a caller number is assigned and calling hours are set, and when the organization's plan does not include hot lead calls. Once it can work, the user must approve turning calling on: the first call stops with an approval card that says who will be phoned and what calls cost, and calling is turned on only when you call this tool again with the same arguments after they clicked approve (approval lasts 15 minutes and works once; do not ask for it in text). Turning calling off and every other change need no approval. Verification and the caller number are managed by the system and cannot be set here. callingHours is the window in which calls ARE allowed (24h HH:MM in the given timezone, default 08:00-21:00; start later than end wraps past midnight). The lead’s own timezone is not considered. timezone must be an IANA Area/Location name such as America/Chicago (UTC, abbreviations and Etc/ zones are refused; letter case is normalised). leadTypes must contain at least one type (default form_fill). announcedName is read aloud on the call: letters, digits, spaces and . , & ' - only, max ${HOT_LEAD_CALL_ANNOUNCED_NAME_MAX} characters. In a scheduled or otherwise unattended run, anything that raises a limit, widens the calling hours, turns calling on or edits the team is refused; ask in an interactive chat.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -146,7 +155,21 @@ emmaToolRegistry.register({
       body.callingHours = { ...HOT_LEAD_CALL_DEFAULT_CALLING_HOURS, ...current?.callingHours, ...callingHours };
     }
     // The tool edits the copy it just read; the service's conditional write is what catches a concurrent editor.
-    const { dto, config } = await applyHotLeadCallSettings(org, caller, { ...body, _revision: hotLeadCallRevisionOf(org.hotLeadCall) });
-    return { success: true, ...view(dto, config) };
+    // Turning calling on is the one change that waits for a person's approval; the portal's own click covers REST.
+    const requireEnableApproval = async (next: HotLeadCallConfig) => {
+      const halt = await requireApproval({
+        action: 'enable', org, context, priceText: callRateText(), target: canonicalJson(patch),
+        number: next.twilioNumber && maskPhone(next.twilioNumber),
+        members: next.team.filter(m => m.verifiedAt).map(m => `${m.name} (${maskPhone(m.phone)})`),
+      });
+      if (halt) throw new ApprovalHalt(halt);
+    };
+    try {
+      const { dto, config } = await applyHotLeadCallSettings(org, caller, { ...body, _revision: hotLeadCallRevisionOf(org.hotLeadCall) }, requireEnableApproval);
+      return { success: true, ...view(dto, config) };
+    } catch (err) {
+      if (err instanceof ApprovalHalt) return err.halt;
+      throw err;
+    }
   },
 });
