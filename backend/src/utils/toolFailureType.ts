@@ -79,8 +79,10 @@ const SCHEMA_RE =
 // share_landing_page_with_org non-member refusal is an org boundary (by_design).
 // ENG-2611: a Google Ads serving_chain report with state UNVERIFIED/BLOCKED_BY_*
 // is the verifier honestly reporting chain state, not a tool defect.
+// ENG-2810: hubspotMarketingPreflight's no-Marketing-Hub / CRM-only-grant refusals
+// are a portal-plan or OAuth-grant gap the customer fixes, not a handler bug.
 const CONFIG_RE =
-  /\b429\b|http\s*402|status(?:\s+code)?\s+402|out of credits|payment required|too many requests|rate.?limit|quota exceeded|insufficient_quota|exceeded your current quota|check your plan and billing details|unauthorized|forbidden|invalid api key|missing credentials|bad credentials|authentication failed|does not exist|not configured|not a member of channel|not authorized|no secrets configured|account connected|specified bucket|job timed out|insights job|unable to retrieve a summarizer|status code 404|operation was aborted|\bnot connected\b[\s\S]*connected accounts|\bno [\w ]{1,40} is configured\b/i;
+  /\b429\b|http\s*402|status(?:\s+code)?\s+402|out of credits|payment required|too many requests|rate.?limit|quota exceeded|insufficient_quota|exceeded your current quota|check your plan and billing details|unauthorized|forbidden|invalid api key|missing credentials|bad credentials|authentication failed|does not exist|not configured|not a member of channel|not authorized|no secrets configured|account connected|specified bucket|job timed out|insights job|unable to retrieve a summarizer|status code 404|operation was aborted|\bnot connected\b[\s\S]*connected accounts|\bno [\w ]{1,40} is configured\b|hubspot portal does not have marketing hub|hubspot connection was authori[sz]ed for crm access only/i;
 
 /**
  * @param errorClass  output of classifyToolErrorClass (may be '', undefined)

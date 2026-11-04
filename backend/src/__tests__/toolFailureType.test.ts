@@ -289,4 +289,14 @@ describe('ENG-2583 — unconnected integrations / unconfigured resources / CRM r
     expect(classifyToolFailureType('Error', 'Webhook configured successfully but delivery returned 500')).toBe('bug');
     expect(classifyToolFailureType('Error', 'Client disconnected unexpectedly')).toBe('bug');
   });
+
+  // ENG-2810: the hubspotMarketingPreflight refusals name a plan/grant gap the
+  // customer fixes in HubSpot or Connected Accounts — not a handler bug.
+  it('classifies HubSpot Marketing Hub capability refusals as config, not bug', () => {
+    expect(classifyToolFailureType('Error',
+      'This HubSpot portal does not have Marketing Hub, so it cannot read or write FORM (a Marketing Hub object). '
+      + 'Marketing access was requested when the account was connected and HubSpot did not grant it.')).toBe('config');
+    expect(classifyToolFailureType('Error',
+      'This HubSpot connection was authorised for CRM access only, so it cannot read or write EMAIL (a Marketing Hub object).')).toBe('config');
+  });
 });
