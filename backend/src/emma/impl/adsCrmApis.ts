@@ -183,10 +183,7 @@ function makeGoogleAdsAuthError(message: string): Error {
  *
  * Deliberately read-only in effect: only wired into the two reporting/list surfaces
  * (handleCallGoogleAdsReportingApi, and LIST/SEARCH actions of handleCallGoogleAdsApi).
- * A client-scoped WRITE would let an admin session mutate a client's live campaign
- * without that client's own fresh authorization decision — the same risk ENG-1801
- * already ruled out for Meta's mutate tool — so callers must refuse client_id on any
- * non-read action rather than pass it here.
+ * Writes are allowed too (admin-only, audited per call); see handleCallGoogleAdsApi.
  */
 async function resolveGoogleAdsCredentialScope(
   callerUserId: string,
@@ -515,22 +512,19 @@ async function runGoogleAdsTrackingGate(
 
 export async function handleCallGoogleAdsApi(userId: string, args: {
   customer_id: string;
-  entity_type: 'BUDGET' | 'CAMPAIGN' | 'CAMPAIGN_CRITERION' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY' | 'CONVERSION_ACTION' | 'OFFLINE_CONVERSION';
+  entity_type: 'BUDGET' | 'CAMPAIGN' | 'CAMPAIGN_CRITERION' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY' | 'CONVERSION_ACTION' | 'OFFLINE_CONVERSION' | 'CAMPAIGN_CONVERSION_GOAL' | 'CUSTOMER_CONVERSION_GOAL';
   action: string;
   [key: string]: any;
 }, opts?: { sessionId?: string; clientScope?: { clientId?: string; callerIsAdmin?: boolean; toolName: string } }): Promise<any> {
   try {
     const { customer_id, entity_type, action } = args;
-    // ENG-1944: client_id is admin-only and read-only-scoped here (see
-    // resolveGoogleAdsCredentialScope) — a client-scoped write would let an admin
-    // session mutate a client's live campaign without that client's own authorization.
+    // ENG-1944 originally limited client_id here to LIST/SEARCH. That restriction was
+    // removed by engineering-lead decision: managed-client operators (admins) need to
+    // make audited changes in a client's account. The scope stays admin-only, requires a
+    // real customer target, and every use is recorded via recordAdminAudit
+    // (resolveGoogleAdsCredentialScope). All normal write gates (tracking pre-flight,
+    // override tokens) still run against the client's credentials.
     if (opts?.clientScope?.clientId !== undefined && opts?.clientScope?.clientId !== null) {
-      if (action !== 'LIST' && action !== 'SEARCH') {
-        return {
-          success: false,
-          error: `client_id scoping only supports read actions (LIST/SEARCH) — refusing a client-scoped ${entity_type} ${action}. Have the client's own session make this change, or drop client_id to act as yourself.`,
-        };
-      }
       const scope = await resolveGoogleAdsCredentialScope(
         userId, opts.clientScope.clientId, opts.clientScope.callerIsAdmin, opts.clientScope.toolName ?? 'call_google_ads_api'
       );
@@ -839,6 +833,61 @@ export async function handleCallGoogleAdsApi(userId: string, args: {
       };
     }
 
+    // ENG-2804: conversion GOAL biddability. Codeless / UA actions refuse
+    // CONVERSION_ACTION UPDATE (MUTATE_NOT_ALLOWED); demoting their goal is the API path.
+    if (entity_type === 'CAMPAIGN_CONVERSION_GOAL' || entity_type === 'CUSTOMER_CONVERSION_GOAL') {
+      const level = entity_type === 'CAMPAIGN_CONVERSION_GOAL' ? 'CAMPAIGN' : 'CUSTOMER';
+      if (action === 'LIST') {
+        const goals = await googleAdsService.listConversionGoals(
+          userId, customer_id, level, level === 'CAMPAIGN' && args.campaign_id != null ? String(args.campaign_id) : undefined,
+        );
+        return { success: true, conversionGoals: goals };
+      }
+      if (action === 'UPDATE') {
+        if (typeof args.biddable !== 'boolean') {
+          return { success: false, error: `biddable (true/false) is required for ${entity_type} UPDATE.` };
+        }
+        let resourceName = args.resource_name ? String(args.resource_name).trim() : '';
+        if (!resourceName && args.category && args.origin) {
+          const cat = String(args.category).trim().toUpperCase();
+          const origin = String(args.origin).trim().toUpperCase();
+          if (level === 'CAMPAIGN') {
+            if (!args.campaign_id || !/^\d+$/.test(String(args.campaign_id))) {
+              return { success: false, error: 'campaign_id (numeric) is required with category + origin for CAMPAIGN_CONVERSION_GOAL UPDATE.' };
+            }
+            resourceName = `customers/${customer_id}/campaignConversionGoals/${args.campaign_id}~${cat}~${origin}`;
+          } else {
+            resourceName = `customers/${customer_id}/customerConversionGoals/${cat}~${origin}`;
+          }
+        }
+        if (!resourceName) {
+          return {
+            success: false,
+            error: `resource_name (or category + origin${level === 'CAMPAIGN' ? ' + campaign_id' : ''}) is required for ${entity_type} UPDATE. Get it from ${entity_type} LIST.`,
+          };
+        }
+        const expectedPath = level === 'CAMPAIGN' ? 'campaignConversionGoals' : 'customerConversionGoals';
+        const m = /^customers\/(\d+)\/([A-Za-z]+)\//.exec(resourceName);
+        if (!m || m[2] !== expectedPath) {
+          return { success: false, error: `resource_name ${resourceName} is not a ${expectedPath} resource name.` };
+        }
+        if (m[1] !== String(customer_id)) {
+          return { success: false, error: `resource_name ${resourceName} belongs to customer ${m[1]}, not customer_id ${customer_id}.` };
+        }
+        const updated = await googleAdsService.updateConversionGoalBiddable(userId, customer_id, level, resourceName, args.biddable);
+        return {
+          success: updated.drift.length === 0,
+          resourceName: updated.resourceName,
+          stored: updated.stored,
+          drift: updated.drift,
+          ...(updated.drift.length > 0
+            ? { error: `Google did not store biddable=${args.biddable} for ${resourceName} — see drift/stored.` }
+            : {}),
+        };
+      }
+      return { success: false, error: `${entity_type} supports LIST and UPDATE (biddable) only, not ${action}.` };
+    }
+
     if (entity_type === 'CONVERSION_ACTION') {
       if (action === 'LIST') {
         const conversionActions = await googleAdsService.listConversionActions(userId, customer_id);
@@ -871,8 +920,28 @@ export async function handleCallGoogleAdsApi(userId: string, args: {
         };
       }
       if (action === 'UPDATE') {
+        // ENG-2809: the model names the action the way LIST output and the Google UI
+        // do — a bare id, or under resource_name / conversion_action_id. Normalise
+        // those; a missing one is a model-facing error, not a thrown failure.
+        const raw = args.conversion_action_resource_name ?? args.resource_name ?? args.conversion_action_id;
+        const ident = raw === undefined || raw === null ? '' : String(raw).trim();
+        if (!ident) {
+          return {
+            success: false,
+            error: 'conversion_action_resource_name is required for CONVERSION_ACTION UPDATE '
+              + `(e.g. customers/${customer_id}/conversionActions/<id>). Get it from CONVERSION_ACTION LIST.`,
+          };
+        }
+        const resourceName = /^\d+$/.test(ident) ? `customers/${customer_id}/conversionActions/${ident}` : ident;
+        const owner = /^customers\/(\d+)\//.exec(resourceName)?.[1];
+        if (owner && owner !== String(customer_id)) {
+          return {
+            success: false,
+            error: `conversion_action_resource_name ${resourceName} belongs to customer ${owner}, not customer_id ${customer_id}.`,
+          };
+        }
         const updated = await googleAdsService.updateConversionAction(
-          userId, customer_id, args.conversion_action_resource_name, {
+          userId, customer_id, resourceName, {
             name: args.name,
             status: args.status,
             category: args.category,

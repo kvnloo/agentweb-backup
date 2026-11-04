@@ -9,7 +9,7 @@
 // The test-only TLS keys and certificates are generated on first use (they are not committed): this import must come first.
 import "../fixtures/tls/ensureFixtures";
 import { spawn, spawnSync, type SpawnSyncReturns } from "child_process";
-import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, statSync, writeFileSync } from "fs";
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { parseHostConfig } from "../../host/hostConfig";
@@ -150,7 +150,10 @@ describe("deploy scripts: static guards", () => {
   });
 
   it("the build script is the gate: tests, a clean tree over ALL of backend/, the lockfile check, and loud overrides recorded in the MANIFEST", () => {
-    expect(build).toMatch(/jest src\/loginHost\/__tests__\/deploy src\/loginHost\/__tests__\/host src\/services\/funding\/__tests__\/loginHostMutualTls\.test\.ts/);
+    expect(build).toMatch(/jest src\/loginHost\/__tests__\/deploy src\/loginHost\/__tests__\/host src\/loginHost\/__tests__\/relay /);
+    // the tool relay's tests are part of the gate too (a relay cleanup mutant used to pass it)
+    for (const part of ["claudeAdapter", "claudeParse", "wrapperManifest", "closePipes", "cpuPins", "drainAccount", "lineFuzz", "lineFlood", "deepLines", "connectionManager", "server", "ports"]) expect(build).toContain(`src/loginHost/__tests__/${part} `);
+    expect(build).toMatch(/src\/services\/funding\/__tests__\/loginHostMutualTls\.test\.ts --silent/);
     expect(build).toContain("status --porcelain -- backend)");
     expect(build).toContain("--skip-tests");
     expect(build).toContain("--allow-dirty");
@@ -192,7 +195,8 @@ describe("config template", () => {
       .replace(/@@WORKER_IP@@/g, over.ip ?? "172.31.30.50")
       .replace(/@@RELEASE_DIR@@/g, over.rel ?? "/opt/aw-login-host/releases/login-host-abc-20261021000000")
       .replace(/@@TLS_DIR@@/g, over.tls ?? "/etc/aw-login-host/tls/login-host-abc-20261021000000")
-      .replace(/@@CLAUDE_VERSION@@/g, over.ver ?? versions.CLAUDE_VERSION);
+      .replace(/@@CLAUDE_VERSION@@/g, over.ver ?? versions.CLAUDE_VERSION)
+      .replace(/@@NODE_VERSION@@/g, versions.NODE_VERSION);
 
   it("is accepted by the host's own schema once the placeholders are filled, and every path points into the release / its TLS set", () => {
     const cfg = parseHostConfig(JSON.parse(fill()));
@@ -205,6 +209,8 @@ describe("config template", () => {
     expect(cfg.claude.binaryPath).toBe(`/opt/aw-claude/${versions.CLAUDE_VERSION}/claude`);
     expect(cfg.claude.turnWrapperPath).toBe("/opt/aw-login-host/releases/login-host-abc-20261021000000/claude-turn.sh");
     expect(cfg.claude.systemPromptFile).toBe("/opt/aw-login-host/releases/login-host-abc-20261021000000/system-prompt.txt");
+    expect(cfg.claude.relayShimPath).toBe("/opt/aw-login-host/releases/login-host-abc-20261021000000/aw-relay-shim.js");
+    expect(cfg.claude.nodePath).toBe(`/opt/aw-node/v${versions.NODE_VERSION}/bin/node`);
     expect(cfg.egress.launcherPath).toBe("/opt/aw-login-host/releases/login-host-abc-20261021000000/aw-net.sh");
     expect(cfg.tools.writeFileHelper).toBe("/opt/aw-login-host/releases/login-host-abc-20261021000000/aw-write-file.sh");
     expect(cfg.egress.allow).toEqual(expect.arrayContaining(["api.anthropic.com:443", "platform.claude.com:443"]));
@@ -541,7 +547,7 @@ describe("install.sh: stage -> validate -> switch, rollback, and 'a failure neve
   }
 
   /** A fresh fake machine: scratch OPT/CONF/UNIT_DIR, a fake `aws` serving the test certificates, a fake `systemctl` that logs, a bridge-url file. */
-  function box(opts: { bridge?: string | null; cert?: string; copyPkg?: string } = {}): Box {
+  function box(opts: { bridge?: string | null; cert?: string; copyPkg?: string; node?: "file" | "symlink" | "none" | "wrapper" | "wrapper-symlink"; noSystemNode?: boolean } = {}): Box {
     const dir = mkdtempSync(join(root, "box-"));
     const p = join(dir, "pkg");
     spawnSync("cp", ["-a", opts.copyPkg ?? pkg, p]);
@@ -567,7 +573,30 @@ case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${
     const units = join(dir, "units");
     for (const d of [opt, conf, units]) mkdirSync(d);
     if (opts.bridge !== null) writeFileSync(join(conf, "bridge-url"), `${opts.bridge ?? "https://backend.example.test/internal/tool-bridge/run/mcp"}\n`);
+    // The pinned node the config names (/opt/aw-node/v<ver>/bin/node on the worker): a real file here, or a symlink to one (what /usr/bin/node is), or missing.
+    const nodeRoot = join(dir, "aw-node");
+    const nodeBin = join(nodeRoot, `v${versions.NODE_VERSION}`, "bin");
+    // the pinned node as a wrapper: it logs that it ran, then is the real node
+    const wrapperBody = "#!/bin/sh\necho used >> \"" + join(dir, "pinned-node-used") + "\"\nexec \"" + process.execPath + "\" \"$@\"\n";
+    if (opts.node !== "none") {
+      mkdirSync(opts.node === "symlink" || opts.node === "wrapper-symlink" ? join(dir, "real-node") : nodeBin, { recursive: true });
+      if (opts.node === "wrapper-symlink") {
+        writeFileSync(join(dir, "real-node", "node"), wrapperBody, { mode: 0o755 });
+        mkdirSync(nodeBin, { recursive: true });
+        symlinkSync(join(dir, "real-node", "node"), join(nodeBin, "node"));
+      } else if (opts.node === "wrapper") writeFileSync(join(nodeBin, "node"), wrapperBody, { mode: 0o755 });
+      else if (opts.node === "symlink") {
+        writeFileSync(join(dir, "real-node", "node"), "#!/bin/sh\n", { mode: 0o755 });
+        mkdirSync(nodeBin, { recursive: true });
+        symlinkSync(join(dir, "real-node", "node"), join(nodeBin, "node"));
+      } else writeFileSync(join(nodeBin, "node"), "#!/bin/sh\n", { mode: 0o755 });
+      // the directories as root would have made them (the test process may run with a group-writable umask)
+      for (const d of [nodeRoot, join(nodeRoot, `v${versions.NODE_VERSION}`), nodeBin, join(dir, "real-node"), join(dir, "real-node", "node"), join(nodeBin, "node")]) if (existsSync(d) && !lstatSync(d).isSymbolicLink()) chmodSync(d, 0o755);
+    }
+    chmodSync(dir, 0o755);
     const env = {
+      AW_NODE_ROOT: nodeRoot, AW_TRUST_BOUNDARY: dir,
+      ...(opts.noSystemNode ? { AW_NODE_BIN: join(dir, "no-such-node") } : {}), // (the worker has no /usr/bin/node yet)
       PATH: `${bin}:${process.env.PATH}`,
       AW_OPT: opt, AW_CONF: conf, AW_UNIT_DIR: units, AW_LOCK: join(dir, "lock"), AW_SYSTEMCTL: join(bin, "systemctl"),
       AW_SKIP_PREREQS: "1", AW_WORKER_IP: "172.31.30.50", AW_TMP: dir,
@@ -604,7 +633,7 @@ case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${
     expect(manifest).toMatch(/^package_lock_sha256=[a-f0-9]{64}$/m);
     expect(manifest).toMatch(/^lockfile_check=/m);
     expect(manifest).not.toContain("WORKER_PRIVATE_IP");
-    for (const f of ["install.sh", "deploy.sh", "deployctl.js", "lib.sh", "versions.env", "check-config.js", "dist/loginHost/host/start.js", "files/aw-login-host@.service", "files/aw-login-host-failed@.service", "files/aw-env.slice.template", "files/host-config.template.json", "files/claude-turn.sh", "files/aw-net.sh", "files/aw-write-file.sh", "files/system-prompt.txt"]) {
+    for (const f of ["install.sh", "deploy.sh", "deployctl.js", "lib.sh", "versions.env", "check-config.js", "dist/loginHost/host/start.js", "files/aw-login-host@.service", "files/aw-login-host-failed@.service", "files/aw-env.slice.template", "files/host-config.template.json", "files/claude-turn.sh", "files/aw-net.sh", "files/aw-write-file.sh", "files/aw-relay-shim.js", "files/system-prompt.txt"]) {
       expect(existsSync(join(pkg, f))).toBe(true);
     }
     expect(text(join(pkg, "files/host-config.template.json"))).toContain("@@WORKER_IP@@"); // filled at install time
@@ -729,6 +758,62 @@ case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${
       expect(systemctlCalls(b)).toContain("systemctl daemon-reload");
     });
 
+    describe("pre-switch trusted-path check of the rendered config (ENG-2113)", () => {
+      it("a normal install runs the check and reports it", () => {
+        const b = box();
+        const r = run(b);
+        expect(r.status).toBe(0);
+        expect(r.stdout).toContain("every release path the host will check is root-controlled");
+      });
+
+      it("MUTATION TARGET: a pinned node reached through a SYMLINK refuses the install BEFORE the switch, with a clear message, changing nothing", () => {
+        const b = box({ node: "symlink" });
+        const r = run(b);
+        expect(r.status).not.toBe(0);
+        expect(r.stdout + r.stderr).toMatch(/would refuse to start with this release \(trusted-path check\).*\/opt\/aw-node\/v[0-9.]+\/bin\/node is not trusted: .*is a symlink/s);
+        expect(existsSync(join(b.opt, "current"))).toBe(false);
+        expect(releases(b)).toEqual([]);
+        expect(tlsDirs(b)).toEqual([]);
+        expect(stagingLeft(b)).toEqual([]);
+        expect(systemctlCalls(b).filter((c) => c.includes("restart") || c.includes("enable"))).toEqual([]);
+      });
+
+      it("MUTATION TARGET: a missing pinned node refuses the install before the switch too", () => {
+        const b = box({ node: "none" });
+        const r = run(b);
+        expect(r.status).not.toBe(0);
+        expect(r.stdout + r.stderr).toContain("is not trusted");
+        expect(existsSync(join(b.opt, "current"))).toBe(false);
+      });
+
+      it("MUTATION TARGET: a pinned node whose directory is group-writable refuses the install before the switch", () => {
+        const b = box();
+        chmodSync(join(b.dir, "aw-node", `v${versions.NODE_VERSION}`, "bin"), 0o775);
+        const r = run(b);
+        expect(r.status).not.toBe(0);
+        expect(r.stdout + r.stderr).toContain("writable by group or others");
+        expect(existsSync(join(b.opt, "current"))).toBe(false);
+      });
+
+      it("MUTATION TARGET: the /usr/bin/node link is flipped only AFTER the trusted-path check (a refused release leaves the machine exactly as it was)", () => {
+        const flip = install.indexOf('mut ln -sfn "$NODE_LINK_TARGET" /usr/bin/node');
+        const check = install.indexOf("trust_out=$(check_config");
+        const staged = install.indexOf("Last pre-switch checks on the staged files");
+        expect(flip).toBeGreaterThan(0);
+        expect(check).toBeGreaterThan(0);
+        expect(flip).toBeGreaterThan(check);
+        expect(flip).toBeGreaterThan(staged);
+        // and it is the only place the link is made
+        expect([...install.matchAll(/ln -sfn "\$NODE_LINK_TARGET"/g)]).toHaveLength(1);
+        expect(install).not.toMatch(/ln -sfn "\$NODE_DIR\/bin\/node"/);
+      });
+
+      it("--prepare does not run the release check (it stages nothing); the node link is not part of this", () => {
+        const b = box({ node: "symlink" });
+        expect(run(b, "--prepare").stdout).not.toContain("trusted-path check");
+      });
+    });
+
     it("a failed --prepare never stops or disables anything (it only gets the machine ready)", () => {
       const b = box({ bridge: null });
       expect(run(b, "--prepare").status).toBe(3);
@@ -748,7 +833,8 @@ case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${
 
     it("the /usr/bin/node link is flipped only in the switch phase, never by --prepare, and the install lock is in a root-only directory", () => {
       const src = text(join(PROD, "install.sh"));
-      expect(src).toMatch(/if \[ "\$PREPARE" = 1 \]; then\n\s+skip "\/usr\/bin\/node link: left for the switch phase"\n\s+elif/);
+      expect(src).toMatch(/if \[ "\$PREPARE" = 1 \]; then skip "\/usr\/bin\/node link: left for the switch phase"; fi/);
+      expect(src).toMatch(/if \[ -n "\$\{NODE_LINK_TARGET:-\}" \] && \[ "\$PREPARE" != 1 \]; then/);
       expect(src).toContain("LOCK=/run/aw-deploy/install.lock");
       expect(src).toMatch(/chmod 0700 "\$\(dirname "\$LOCK"\)"/);
     });
@@ -789,7 +875,7 @@ case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${
       mkdirSync(join(b.dir, "state"));
       // (a CI build carries the pipeline's run number; this one was made by hand)
       writeFileSync(join(b.pkg, "MANIFEST"), text(join(b.pkg, "MANIFEST")).replace(/^build_seq=.*$/m, "build_seq=7"));
-      const env = { ...b.env, AW_SOCK: join(b.dir, "host.sock"), AW_DEPLOY_LOCK: join(b.dir, "deploy.lock"), AW_NODE: join(b.bin, "ctlnode"), AW_STATE_DIR: join(b.dir, "state"), AW_HOLD: join(b.dir, "hold"), AW_HEALTH_TIMEOUT: "5" };
+      const env = { ...b.env, AW_SOCK: join(b.dir, "host.sock"), AW_DEPLOY_LOCK: join(b.dir, "dl", "deploy.lock"), AW_NODE: join(b.bin, "ctlnode"), AW_STATE_DIR: join(b.dir, "state"), AW_HOLD: join(b.dir, "hold"), AW_HEALTH_TIMEOUT: "5" };
       const deploy = (...args: string[]) => spawnSync("bash", [join(b.pkg, "deploy.sh"), ...args], { encoding: "utf8", env: { ...process.env, ...env }, timeout: 120_000 });
       return { b, S, deploy };
     }
@@ -880,8 +966,10 @@ case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${
     expect(cfg.tls?.host).toBe("172.31.30.50");
     expect(cfg.claude.turnWrapperPath).toBe(join(b.opt, "releases", rels[0], "claude-turn.sh"));
     expect(cfg.egress.launcherPath).toBe(join(b.opt, "releases", rels[0], "aw-net.sh"));
+    expect(cfg.claude.relayShimPath).toBe(join(b.opt, "releases", rels[0], "aw-relay-shim.js"));
+    expect(cfg.claude.nodePath).toBe(`/opt/aw-node/v${versions.NODE_VERSION}/bin/node`); // the REAL path: /usr/bin/node is a symlink and assertTrustedPath refuses those
     expect(cfg.tls?.keyPath).toBe(join(b.conf, "tls", rels[0], "server.key"));
-    for (const p of [cfg.claude.turnWrapperPath, cfg.egress.launcherPath, cfg.tools.writeFileHelper, cfg.claude.systemPromptFile, cfg.tls!.certPath, cfg.tls!.keyPath, cfg.tls!.caPath]) {
+    for (const p of [cfg.claude.turnWrapperPath, cfg.claude.relayShimPath, cfg.egress.launcherPath, cfg.tools.writeFileHelper, cfg.claude.systemPromptFile, cfg.tls!.certPath, cfg.tls!.keyPath, cfg.tls!.caPath]) {
       expect(existsSync(p)).toBe(true);
       for (let q = p; q.startsWith(b.dir) && q !== b.dir; q = join(q, "..")) expect(lstatSync(q).isSymbolicLink()).toBe(false); // no symlink anywhere on a trusted path
     }
@@ -1104,6 +1192,42 @@ case "$*" in *"${versions.TLS_SECRET_SERVER}"*) cat "${dir}/server.json" ;; *"${
     expect(readdirSync(b.dir).filter((n) => n.startsWith("aw-dry"))).toEqual([]);
     expect(systemctlCalls(b)).toEqual([]);
     expect(stagingLeft(b)).toEqual([]);
+  });
+
+  it("MUTATION TARGET: a FIRST install on a worker with no /usr/bin/node checks the config with the PINNED node it just installed (not 'no node to check it with'), and that node is the one that ran", () => {
+    const b = box({ node: "wrapper", noSystemNode: true });
+    const r = run(b);
+    expect(r.stdout + r.stderr).not.toContain("no node to check it with");
+    expect(r.status).toBe(0);
+    expect(existsSync(join(b.dir, "pinned-node-used"))).toBe(true);
+    expect(releases(b)).toHaveLength(1);
+  });
+
+  it("MUTATION TARGET: ...and a pinned node that is a SYMLINK is still refused by the trusted-path check even though it ran the config check", () => {
+    const b = box({ node: "wrapper-symlink", noSystemNode: true });
+    const r = run(b);
+    expect(r.status).not.toBe(0);
+    expect(r.stdout + r.stderr).toMatch(/symlink/);
+    expect(releases(b)).toEqual([]);
+  });
+
+  it("MUTATION TARGET: the dry-run skip applies ONLY to a missing node: a present but symlinked node is still refused in a dry run", () => {
+    const b = box({ node: "symlink" });
+    const r = run(b, "--dry-run");
+    expect(r.status).not.toBe(0);
+    expect(r.stdout + r.stderr).toContain("would refuse to start");
+  });
+
+  it("MUTATION TARGET: --dry-run on a worker WITHOUT the pinned node says so (the node is not installed yet) and succeeds; a real install without it still stops", () => {
+    const b = box({ node: "none" });
+    const dry = run(b, "--dry-run");
+    expect(dry.status).toBe(0);
+    expect(dry.stdout).toMatch(/dry run: the pinned node .* is not installed on this worker yet/);
+    expect(dry.stdout).not.toContain("would refuse to start");
+    const real = run(b);
+    expect(real.status).not.toBe(0);
+    expect(real.stdout + real.stderr).toContain("would refuse to start");
+    expect(releases(b)).toEqual([]);
   });
 
   it("two installs at once cannot collide: while another process holds the install lock, the second refuses and changes nothing", async () => {

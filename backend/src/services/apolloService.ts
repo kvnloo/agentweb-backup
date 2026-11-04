@@ -296,6 +296,25 @@ export function __resetApolloServiceForTesting(): void {
 
 // ─── Service ──────────────────────────────────────────────────────────────────
 
+/**
+ * The id of an async waterfall request, as the EXACT string Apollo's webhook will send back (ENG-2801).
+ *
+ * Apollo's immediate `run_waterfall_email` response carries `request_id` as an unquoted 64-bit JSON integer
+ * (e.g. 8327452971617011608), which JSON.parse rounds to a double (8327452971617012000), and ALSO the exact
+ * string `request_id_str`. Only a string, or an integer small enough to be exact, can be matched against the
+ * webhook, so a rounded number is never used: it would key a placeholder the callback can never find. Reading
+ * only a string `request_id` (the previous code) meant no placeholder was ever written and every callback was
+ * discarded. Apollo documents ids as signed 64-bit integers that may be negative; they are passed through unchanged.
+ */
+export function extractApolloAsyncRequestId(d: any): string | undefined {
+  const candidates: unknown[] = [d?.request_id_str, d?.person?.request_id_str, d?.request_id, d?.person?.request_id, d?.requestId];
+  for (const c of candidates) {
+    if (typeof c === 'string' && c.trim()) return c.trim();
+    if (typeof c === 'number' && Number.isSafeInteger(c)) return String(c);
+  }
+  return undefined;
+}
+
 export class ApolloService {
   constructor(private deps: ApolloServiceDeps) {}
 
@@ -400,14 +419,14 @@ export class ApolloService {
       }
       const d = apiResp?.data ?? apiResp ?? {};
       const email = d.person?.email ?? d.email;
-      const requestId: string | undefined = d.request_id ?? d.person?.request_id ?? d.requestId;
+      const requestId = extractApolloAsyncRequestId(d);
       return {
         found: !!email,
         email: typeof email === 'string' ? email : undefined,
         emailStatus: typeof d.person?.email_status === 'string' ? d.person.email_status : undefined,
         fromCache: false,
         checkedAt: new Date().toISOString(),
-        asyncRequestId: typeof requestId === 'string' && requestId ? requestId : undefined,
+        asyncRequestId: requestId,
         asyncPending: !email && !!requestId,
       };
     }

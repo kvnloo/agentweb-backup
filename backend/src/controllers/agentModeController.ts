@@ -90,6 +90,7 @@ import {
   isRunStoreEnabled,
   interactiveIdempotencyKey,
   createSessionIdempotencyKey,
+  planSessionIdempotencyKey,
   claimIdempotency,
   releaseIdempotency,
   recordIdempotencySessionId,
@@ -6868,7 +6869,7 @@ export async function runScheduledChat(
     const preflightRecipients: string[] = Array.isArray(schedule.emailNotifications)
       ? schedule.emailNotifications.filter(Boolean)
       : [];
-    if (preflightRecipients.length > 0 && scheduleLikelySensitive(schedule)) {
+    if (preflightRecipients.length > 0 && scheduleLikelySensitive(schedule, { ownerIsAdmin: typeof (scheduleOwner as any)?.isAdmin === 'boolean' ? (scheduleOwner as any).isAdmin : undefined })) {
       const authz = await resolveAuthorizedReportRecipients({
         recipients: preflightRecipients,
         ownerEmail: (scheduleOwner as any)?.email,
@@ -8410,7 +8411,7 @@ export async function runScheduledChat(
       await recordReportDeliveryState(
         schedule.scheduleId,
         { runId: finalResult.runId, state: 'generated' },
-        { lastKnownSensitive: reportContainsCrossAccountData(actualFunctionCalls) },
+        { lastKnownSensitive: reportContainsCrossAccountData(actualFunctionCalls, { ownerIsAdmin: typeof (scheduleOwner as any)?.isAdmin === 'boolean' ? (scheduleOwner as any).isAdmin : undefined }) },
       );
     }
 
@@ -14928,6 +14929,7 @@ export const agentModeController = {
         scheduleId,
         recipients: scheduledChat.emailNotifications,
         ownerEmail: user.email,
+        ownerIsAdmin: typeof (user as any).isAdmin === 'boolean' ? (user as any).isAdmin : undefined,
         schedule: scheduledChat,
       });
       if (createRemediation) {
@@ -15324,6 +15326,7 @@ export const agentModeController = {
           scheduleId,
           recipients: effectiveEmailNotifications,
           ownerEmail: user.email,
+          ownerIsAdmin: typeof (user as any).isAdmin === 'boolean' ? (user as any).isAdmin : undefined,
           schedule: {
             // A changed tool list re-decides sensitivity from scratch; the
             // breadcrumb describes the previous tools.
@@ -16124,6 +16127,7 @@ export const agentModeController = {
           scheduleId,
           recipients: normalizeEmailList(schedule.emailNotifications || []),
           ownerEmail: user.email,
+          ownerIsAdmin: typeof (user as any).isAdmin === 'boolean' ? (user as any).isAdmin : undefined,
           schedule: schedule as any,
         });
         if (toggleRemediation) {
@@ -17162,9 +17166,12 @@ export const agentModeController = {
 
   // Create session with predefined work plan (public) — reads from AW-WorkPlans table
   async createSessionWithPlan(req: Request, res: Response) {
+    // ENG-2773 (ENG-783 slice B): same ENG-147 submit-lock createSession uses. Hoisted so the
+    // catch block can give back a held claim after an error unwinds.
+    let planIdemKeyHeld: string | undefined;
     try {
       const { planTitle } = req.params;
-      const { startingMessage } = req.body || {};
+      const { startingMessage, idempotencyKey } = req.body || {};
 
       if (!planTitle) {
         return res.status(400).json({ error: 'Plan title is required' });
@@ -17259,6 +17266,44 @@ export const agentModeController = {
       } catch (planErr) {
         console.error(`AgentMode: createSessionWithPlan "${predefinedPlan.title}" refused — invalid plan structure:`, (planErr as Error).message);
         return res.status(422).json({ error: 'This work plan is misconfigured and cannot be started right now.', code: 'workplan_invalid' });
+      }
+
+      // ENG-2773: cross-restart duplicate-submit lock for a signed-in launcher's client
+      // idempotencyKey (scoped to user + plan, so it never collides with createSession or another
+      // user). Anonymous callers get a fresh random userId per call, so a key could never replay:
+      // they are excluded. Flag off / no key = today's exact behaviour.
+      if (result.user && isRunStoreEnabled() && typeof idempotencyKey === 'string' && idempotencyKey.length > 0) {
+        const idemKey = planSessionIdempotencyKey(
+          userId,
+          normalizeWorkPlanTitleForMatch(planTitle),
+          idempotencyKey,
+        );
+        const claim = await claimIdempotency(idemKey, uuidv4(), IDEM_TTL_INTERACTIVE_S);
+        if (!claim.claimed) {
+          if (claim.sessionId) {
+            const existing: any = await chatbotDb.getChatSession(claim.sessionId);
+            const existingToken = existing?.interactiveShareMetadata?.token;
+            if (existing && existing.userId === userId && existing.workPlan && existingToken) {
+              // Duplicate of a completed launch: return the winner's session (no second session,
+              // no second starting-message run).
+              const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+              return res.json({
+                sessionId: existing.sessionId,
+                redirectUrl: `${customerFrontendUrl}/plan/${encodeURIComponent(planTitle)}/${existing.sessionId}?conversable=${existingToken}`,
+                workPlan: redactWorkPlanForViewer(existing.workPlan, { keepStepModels: true }),
+                conversableToken: existingToken,
+                userId: existing.userId,
+                idempotentReplay: true,
+              });
+            }
+          }
+          return res.status(409).json({
+            error: 'Duplicate submit',
+            message: 'This request was already submitted and is still being processed. Please retry in a moment.',
+            code: 'DUPLICATE_SUBMIT',
+          });
+        }
+        planIdemKeyHeld = idemKey;
       }
 
       // Create session with userId (authenticated or anonymous)
@@ -17399,8 +17444,17 @@ export const agentModeController = {
           sharedAt: new Date().toISOString()
         };
         await chatbotDb.updateSessionInteractiveShareMetadata(session.sessionId, interactiveShareMetadata);
+        // ENG-2773: stamp the winner only once the session is fully built, so a duplicate never
+        // attaches to a half-built one (best effort: on failure losers 409 until the TTL).
+        if (planIdemKeyHeld) {
+          await recordIdempotencySessionId(planIdemKeyHeld, session.sessionId);
+        }
       } catch (launchErr) {
         await deleteNewSessionBestEffort(session.sessionId);
+        if (planIdemKeyHeld) {
+          await releaseIdempotency(planIdemKeyHeld);
+          planIdemKeyHeld = undefined;
+        }
         if (modelSaveFailed) {
           return res.status(503).json({ error: MODEL_SAVE_FAILED_MESSAGE, code: 'model_save_failed' });
         }
@@ -17582,6 +17636,9 @@ export const agentModeController = {
       }
     } catch (error) {
       console.error('AgentMode: Create session with plan error:', error);
+      if (planIdemKeyHeld) {
+        await releaseIdempotency(planIdemKeyHeld);
+      }
       res.status(500).json({ error: 'Failed to create session with plan' });
     }
   },

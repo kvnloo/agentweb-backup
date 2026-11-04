@@ -129,6 +129,8 @@ export const defaultBuild = (worker: { host: string; port: number }, m: ClientMa
 export { CERT_WARN_DAYS };
 /** The expiry warning is logged at most this often (the provider refreshes every minute). */
 export const CERT_WARN_EVERY_MS = 60 * 60 * 1000;
+/** `invalidateProtocol` acts at most this often. */
+export const INVALIDATE_COOLDOWN_MS = 30_000;
 /** The worker's protocol version is re-verified this often (a redeployed worker flips to "match" without a backend restart). */
 export const PROTOCOL_RECHECK_MS = 10 * 60 * 1000;
 /**
@@ -157,12 +159,15 @@ export function defaultSecretName(): string {
 
 export class LoginHostProvider {
   private state: State | undefined;
+  /** Bumped by `invalidateProtocol`: the answer of a check that started before it is ignored. */
+  private protocolGeneration = 0;
   private material: { value: ClientMaterial; at: number } | undefined;
   private inflight: Promise<void> | undefined;
   private lastFailureAt = 0;
   private timer: unknown;
   private protocol: { status: ProtocolStatus; worker?: number; checkedAt: number } = { status: "unknown", checkedAt: 0 };
   private protocolChecking = false;
+  private lastInvalidatedAt = Number.NEGATIVE_INFINITY;
   private protocolUnknownLogged = false;
   private certNotAfterMs: number | undefined;
   private lastCertWarnAt = 0;
@@ -269,6 +274,23 @@ export class LoginHostProvider {
     else console.warn(`[loginHostProvider] login_host_client_cert_expires_soon daysLeft=${days}`);
   }
 
+  /**
+   * The worker did something that contradicts the cached protocol (an older worker refused a relay `turn.run` after a ROLLBACK): forget the cached answer now
+   * and ask `host.info` again, instead of trusting "match / 4" for up to PROTOCOL_RECHECK_MS. Until the answer arrives the status is "unknown", so the next
+   * turn is refused as retryable (fail closed), then decided on the fresh protocol.
+   */
+  invalidateProtocol(): void {
+    // At most once per cool-down: a compromised worker that keeps refusing relay turns must not flap the whole fleet to "unknown" and flood host.info.
+    if (this.now() - this.lastInvalidatedAt < INVALIDATE_COOLDOWN_MS) return;
+    this.lastInvalidatedAt = this.now();
+    this.protocol = { status: "unknown", checkedAt: 0 };
+    this.protocolUnknownLogged = false;
+    // A check already in flight started BEFORE this (it may be about to report the stale "match"): its answer is ignored, and a fresh check is started.
+    this.protocolGeneration++;
+    this.protocolChecking = false;
+    this.maybeCheckProtocol();
+  }
+
   /** Whether the worker speaks the protocol version this build was written for (see PROTOCOL_VERSION). Unknown until `host.info` answered. */
   protocolStatus(): ProtocolStatus {
     return this.protocol.status;
@@ -282,13 +304,16 @@ export class LoginHostProvider {
     if (this.protocol.status === "match" && this.now() - this.protocol.checkedAt < PROTOCOL_RECHECK_MS) return;
     this.protocolChecking = true;
     const client = this.state.client;
+    const generation = this.protocolGeneration;
     void (async () => {
       try {
         const info = await client.hostInfo();
+        if (generation !== this.protocolGeneration) return; // invalidated while this was in flight: a newer check decides
         const status: ProtocolStatus = ACCEPTED_WORKER_PROTOCOLS.has(info.protocol) ? "match" : "mismatch";
         if (status === "mismatch" && this.protocol.status !== "mismatch") console.error(`[loginHostProvider] login_host_protocol_mismatch worker=${info.protocol} backend=${PROTOCOL_VERSION} accepted=${[...ACCEPTED_WORKER_PROTOCOLS].join(",")}`);
         this.protocol = { status, worker: info.protocol, checkedAt: this.now() };
       } catch (e) {
+        if (generation !== this.protocolGeneration) return;
         // An older worker answers EINVALID/route (or, before that change, ENOTFOUND) to a route it does not have; anything else is just "cannot tell yet".
         const detail = e instanceof LoginHostError ? `${e.code}${e.detail ? `/${e.detail}` : ""}` : code(e);
         const changed = this.protocol.status !== "unknown";
@@ -296,7 +321,7 @@ export class LoginHostProvider {
         if (changed || !this.protocolUnknownLogged) console.error(`[loginHostProvider] login_host_protocol_unknown cause=${detail}`); // once per client, not once a minute
         this.protocolUnknownLogged = true;
       } finally {
-        this.protocolChecking = false;
+        if (generation === this.protocolGeneration) this.protocolChecking = false;
       }
     })();
   }

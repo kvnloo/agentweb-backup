@@ -29,6 +29,9 @@ export function getSmartleadEventService(): SmartleadEventService {
     notify: async (list, lead, eventType, eventData, createdAt) => {
       await leadListAlertService.notifyLeadListOwnerIfConfigured(list, lead, eventType, eventData, createdAt);
     },
+    countContactEvent: async (runId, kind) => {
+      await runs.countContactEvent(runId, kind);
+    },
     now: () => new Date(),
     log: line => console.log(line),
   });

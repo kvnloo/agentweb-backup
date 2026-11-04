@@ -234,3 +234,54 @@ describe("systemd-run argv", () => {
     expect(JSON.stringify(s)).toBe(copy);
   });
 });
+
+describe("tool relay bind (ENG-2113)", () => {
+  const rl = new Layout({ env: "test1", stateRoot: "/var/lib/aw-login-host/test1", sharedParent: "/var/lib/aw-login-host", uidMin: 400_000, uidMax: 460_000, relayRoot: "/run/aw-relay-test1" });
+  const net = { dir: "/run/aw-egress-test1", launcher: "/opt/aw-login-host/aw-net.sh", socat: "/usr/bin/socat" };
+  const relayDir = rl.relayTurnDir(400_123, "0123456789abcdef0123456789abcdef");
+  const BIND = "BindReadOnlyPaths=/run/aw-relay-test1/400123/0123456789abcdef0123456789abcdef:/run/aw-relay";
+  const rspec = (over: Partial<UnitSpec> = {}) => spec({ relayDir, ...over });
+
+  it("binds ONLY this turn's directory, read-only, at /run/aw-relay, after the empty /run and in the network-isolated shape", () => {
+    const p = unitProperties(rl, rspec(), limits, { ...paths, net });
+    expect(p).toContain("PrivateNetwork=yes");
+    expect(p).toContain(BIND);
+    expect(p.indexOf("TemporaryFileSystem=/run:ro")).toBeLessThan(p.indexOf(BIND));
+    // never the relay root or the uid directory
+    expect(p.filter((x) => x.startsWith("BindReadOnlyPaths=")).map((x) => x.split(":")[1])).toEqual(["/run/aw-egress", "/run/aw-relay"]);
+    expect(p.some((x) => x.includes("BindPaths=/run/aw-relay-test1"))).toBe(false);
+  });
+
+  it("MUTATION TARGET: a relay bind without the network-isolated (paths.net) shape is refused at unit build", () => {
+    expect(() => unitProperties(rl, rspec(), limits, paths)).toThrow("relay requires the network-isolated unit");
+    expect(() => systemRunArgs(rl, rspec(), limits, paths)).toThrow("relay requires the network-isolated unit");
+  });
+
+  it("MUTATION TARGET: only a relay directory of THIS uid is accepted (another uid's, the root, the uid dir, a traversal)", () => {
+    const bads = [rl.relayTurnDir(400_124, "0123456789abcdef0123456789abcdef"), "/run/aw-relay-test1", "/run/aw-relay-test1/400123", `${relayDir}/relay.sock`, "/run/aw-relay-test1/400123/../400124/0123456789abcdef0123456789abcdef", "/etc", "/run/aw-egress-test1"];
+    for (const bad of bads) expect(() => unitProperties(rl, rspec({ relayDir: bad }), limits, { ...paths, net })).toThrow();
+  });
+
+  it("a layout without a relay root refuses any relay bind", () => {
+    expect(() => unitProperties(layout, rspec(), limits, { ...paths, net })).toThrow();
+  });
+
+  it("no relay in the spec = no relay property (the legacy shape is unchanged)", () => {
+    const p = unitProperties(layout, spec(), limits, { ...paths, net });
+    expect(p.some((x) => x.includes("aw-relay"))).toBe(false);
+  });
+
+  it("the systemd-run argv carries the bind as a property (-p)", () => {
+    const argv = systemRunArgs(rl, rspec({ unitName: rl.unitName(400_123, "0123456789abcdef") }), limits, { ...paths, net });
+    const i = argv.indexOf(BIND);
+    expect(i).toBeGreaterThan(0);
+    expect(argv[i - 1]).toBe("-p");
+  });
+
+  it("layout: relay root validation", () => {
+    for (const relayRoot of ["relative", "/run", "/var/lib/aw-login-host/relay", "/var/lib/aw-login-host/test1", "/run/a b", "/run/x/"]) {
+      throwsLayout(() => new Layout({ env: "test1", stateRoot: "/var/lib/aw-login-host/test1", sharedParent: "/var/lib/aw-login-host", uidMin: 400_000, uidMax: 460_000, relayRoot }));
+    }
+    throwsLayout(() => layout.relayRoot);
+  });
+});

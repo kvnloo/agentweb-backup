@@ -12,7 +12,7 @@ import {
   type PushRunSummary,
   type SmartleadPushRunDb,
 } from "./smartleadPushRunDb";
-import type { SmartleadAddLeadsResult, SmartleadCampaignDetail, SmartleadCampaignSummary, SmartleadEmailAccount, SmartleadLeadInput } from "./smartleadService";
+import type { SmartleadAddLeadsResult, SmartleadCampaignAnalytics, SmartleadCampaignDetail, SmartleadCampaignSummary, SmartleadEmailAccount, SmartleadLeadInput } from "./smartleadService";
 import { SmartleadApiError, scrubSmartleadSecrets, type UnsubscribeOutcome, type UpdateLeadEmailOutcome } from "./smartleadService";
 import { listSmartleadMarkers } from "./smartleadMarkers";
 import { withdrawalSweep, type SweepResult } from "./smartleadWithdrawal";
@@ -37,6 +37,7 @@ const fail = (status: number, code: string, message: string, details?: unknown):
 export interface SmartleadApi {
   listCampaigns(apiKey: string): Promise<SmartleadCampaignSummary[]>;
   getCampaign(apiKey: string, campaignId: number): Promise<SmartleadCampaignDetail | null>;
+  getCampaignAnalytics(apiKey: string, campaignId: number): Promise<SmartleadCampaignAnalytics | null>;
   getSequences(apiKey: string, campaignId: number): Promise<unknown[]>;
   getMailboxes(apiKey: string, campaignId: number): Promise<SmartleadEmailAccount[]>;
   addLeads(apiKey: string, campaignId: number, leads: SmartleadLeadInput[]): Promise<SmartleadAddLeadsResult>;
@@ -100,6 +101,8 @@ export interface RunView {
   campaignId: number;
   campaignName: string;
   counts: PushRun["counts"];
+  /** What Smartlead later reported about this run's contacts; absent until something was reported. */
+  events?: PushRun["events"];
   approved: number;
   startedAt: string;
   finishedAt?: string;
@@ -111,7 +114,7 @@ export function toRunView(run: PushRun): RunView {
   const warnings = Array.isArray((run.options as any)?.warnings) ? ((run.options as any).warnings as unknown[]).filter((w): w is string => typeof w === "string") : [];
   return {
     runId: run.runId, status: run.status, ...(run.pauseReason ? { pauseReason: run.pauseReason } : {}), listId: run.listId, campaignId: run.campaignId, campaignName: run.campaignName,
-    counts: run.counts, approved: run.previewEligible, startedAt: run.startedAt, ...(run.finishedAt ? { finishedAt: run.finishedAt } : {}), ...(run.failure ? { failure: run.failure } : {}), warnings,
+    counts: run.counts, ...(run.events ? { events: run.events } : {}), approved: run.previewEligible, startedAt: run.startedAt, ...(run.finishedAt ? { finishedAt: run.finishedAt } : {}), ...(run.failure ? { failure: run.failure } : {}), warnings,
   };
 }
 
@@ -290,6 +293,19 @@ export class SmartleadPushService {
           return { id: c.id, name: c.name, status: c.status, pushable: decision !== "refused", needsConfirmation: decision === "needs_confirmation" };
         }),
       };
+    });
+  }
+
+  /** Read-only counters for one of the user's campaigns (ENG-2737). Nothing is changed in Smartlead or in the CRM. */
+  campaignStats(userId: string, campaignId: number, accountId?: string): Promise<Result<{ connection: ConnectionView; stats: SmartleadCampaignAnalytics }>> {
+    return this.guard(async () => {
+      if (!this.deps.enabled()) return this.disabled();
+      if (!Number.isInteger(campaignId) || campaignId <= 0) return fail(400, "bad_request", "A campaign is required.");
+      const key = await this.resolveConnection(userId, accountId);
+      if (!key.ok) return key;
+      const stats = await this.smartleadCall(key.key, () => this.deps.smartlead.getCampaignAnalytics(key.key.apiKey, campaignId));
+      if (!stats) return fail(404, "campaign_not_found", "That campaign was not found in the connected Smartlead account.");
+      return { ok: true, connection: this.connectionOf(userId, key.key), stats };
     });
   }
 
@@ -478,7 +494,18 @@ export class SmartleadPushService {
     return this.guard(async () => {
       const list = await this.ownList(userId, listId);
       if (!list.ok) return list;
-      return { ok: true, runs: await this.deps.db.listRunsForList(String(listId), 25) };
+      const runs = await this.deps.db.listRunsForList(String(listId), 25);
+      // The history indexes do not carry the event counters (a projection cannot change on a table that exists), so they are read from the
+      // runs themselves, one small read each. Display only: a run whose read fails is listed without them, never dropped.
+      const withEvents = await Promise.all(runs.map(async (r) => {
+        try {
+          const events = await this.deps.db.getRunEvents(r.runId);
+          return events ? { ...r, events } : r;
+        } catch {
+          return r;
+        }
+      }));
+      return { ok: true, runs: withEvents };
     });
   }
 

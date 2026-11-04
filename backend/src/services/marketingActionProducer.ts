@@ -19,7 +19,18 @@
  * `scheduleDb.addRunResult`) is a separate, data-plane-gated slice.
  */
 import type { MarketingActionCandidate, MarketingActionTier } from './marketingActionContract';
+import {
+  classifyMarketingActionRisk,
+  type MarketingActionRiskClassification,
+} from './marketingActionRisk';
 import { hasLearningContext, type Recommendation } from './outcomeLedger';
+
+/** ENG-2775 shadow observer: receives each candidate's risk classification.
+ *  Observation only — the returned candidates are identical with or without it. */
+export type MarketingActionRiskObserver = (
+  candidate: MarketingActionCandidate,
+  risk: MarketingActionRiskClassification,
+) => void;
 
 export const CREATIVE_REFRESH_ACTION = 'refresh_creative';
 
@@ -46,6 +57,7 @@ function scopeFor(rec: Recommendation & { context: NonNullable<Recommendation['c
 export function candidatesFromRecommendations(
   recommendations: readonly Recommendation[] | null | undefined,
   source: { sourceKind: 'report' | 'run'; sourceId: string },
+  onRiskClassified?: MarketingActionRiskObserver,
 ): MarketingActionCandidate[] {
   if (!Array.isArray(recommendations) || recommendations.length === 0) return [];
   if (typeof source?.sourceId !== 'string' || source.sourceId.trim() === '') {
@@ -56,7 +68,7 @@ export function candidatesFromRecommendations(
   for (const rec of recommendations) {
     if (!rec || rec.status !== 'pending' || !hasLearningContext(rec)) continue;
     const c = rec.context;
-    out.push({
+    const candidate: MarketingActionCandidate = {
       actionType: CREATIVE_REFRESH_ACTION,
       recommendation: rec.hypothesis,
       scopeId: scopeFor(rec),
@@ -74,7 +86,28 @@ export function candidatesFromRecommendations(
       },
       ctaType: 'review',
       deepLink: RECOMMENDATION_REVIEW_PATH,
-    });
+    };
+    out.push(candidate);
+    if (onRiskClassified) {
+      const objectLevel = c.metricScope === 'ad' ? 'ad' : 'campaign';
+      // Ownership is not proven from ledger rows, so this never classifies as auto.
+      const classification = classifyMarketingActionRisk({ actionType: candidate.actionType, objectLevel });
+      // Shadow observer gets a snapshot and cannot mutate output or abort generation.
+      const snapshot: MarketingActionCandidate = {
+        ...candidate,
+        evidence: [...candidate.evidence],
+        priority: { ...candidate.priority },
+      };
+      try {
+        // An async observer returns a promise; swallow its rejection too.
+        const ret: unknown = onRiskClassified(snapshot, classification);
+        if (ret && typeof (ret as Promise<unknown>).then === 'function') {
+          (ret as Promise<unknown>).then(undefined, () => undefined);
+        }
+      } catch {
+        // Observer failures are ignored: shadow-only, must not affect candidates.
+      }
+    }
   }
   return out;
 }

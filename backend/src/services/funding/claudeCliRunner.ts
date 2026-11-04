@@ -23,6 +23,8 @@ export interface ClaudeCliMcpServer {
   name: string;
   url: string;
   bearerToken: string;
+  /** ENG-2113: a stdio MCP server the CLI starts itself inside the unit (the login host's relay shim) instead of the HTTP bridge; `url`/`bearerToken` are then unused. */
+  stdio?: { command: string; args: string[]; env?: Record<string, string> };
 }
 
 /**
@@ -79,7 +81,7 @@ export interface ClaudeCliRunnerOptions {
    * the process wrapper (the login host's `claude-turn.sh`) must consume that line, write it to `path` inside
    * the process's private tmp and exec the CLI. The token is then in no argv, no environment and no persistent file.
    */
-  mcpDelivery?: { via: "stdin"; path: string };
+  mcpDelivery?: { via: "stdin"; path: string; /** ENG-2113: further single lines written right after the config line (the relay's tool manifest); the wrapper must be told to read them. */ extraLines?: string[] };
   /**
    * Called for every tool call the model emits, with the id of the model message it
    * came in. The tool bridge needs this to collapse an identical call repeated within
@@ -319,7 +321,7 @@ export class ClaudeCliRunner {
         if (opts.mcpServer) {
           if (opts.mcpDelivery?.via === "stdin") {
             mcpConfigFile = opts.mcpDelivery.path;
-            mcpPreamble = JSON.stringify(mcpConfigFor(opts.mcpServer)) + "\n";
+            mcpPreamble = JSON.stringify(mcpConfigFor(opts.mcpServer)) + "\n" + (opts.mcpDelivery.extraLines ?? []).map((l) => l + "\n").join("");
           } else {
             mcpConfigFile = writeMcpConfig(scratchHomeDir, opts.mcpServer);
           }
@@ -710,7 +712,9 @@ export function allowlistedEnv(path: string, configDir: string, scratchHomeDir: 
 function mcpConfigFor(server: ClaudeCliMcpServer): { mcpServers: Record<string, unknown> } {
   return {
     mcpServers: {
-      [server.name]: { type: "http", url: server.url, headers: { Authorization: `Bearer ${server.bearerToken}` } },
+      [server.name]: server.stdio
+        ? { type: "stdio", command: server.stdio.command, args: server.stdio.args, ...(server.stdio.env ? { env: server.stdio.env } : {}) }
+        : { type: "http", url: server.url, headers: { Authorization: `Bearer ${server.bearerToken}` } },
     },
   };
 }
@@ -722,7 +726,7 @@ function writeMcpConfig(scratchHomeDir: string, server: ClaudeCliMcpServer): str
 }
 
 function sameMcpServer(a: ClaudeCliMcpServer | undefined, b: ClaudeCliMcpServer): boolean {
-  return !!a && a.name === b.name && a.url === b.url && a.bearerToken === b.bearerToken;
+  return !!a && a.name === b.name && a.url === b.url && a.bearerToken === b.bearerToken && JSON.stringify(a.stdio) === JSON.stringify(b.stdio);
 }
 
 function emitEvent(sinks: Array<((event: ClaudeCliEvent) => void) | undefined>, event: ClaudeCliEvent): void {
