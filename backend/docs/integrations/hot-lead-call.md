@@ -1032,13 +1032,34 @@ orgs with ANY `hotLeadCall` attribute, ids only; releasing a number removes the 
 calling off, so an org that released its number is still swept. It reads the same org items as the inbound index's
 number scan, `listHotLeadCallNumbers`, and the filter is looser by exactly the orgs that were configured but hold no number
 now; the read cost of an org scan is the org table either way, once a day here against every 60 s per instance there), then per org its members
-(`OrgIdIndex` query), their lead lists (`userId-index` query; session lists are skipped) and, per list, the NEWEST leads
+(`OrgIdIndex` query), their lead lists (`getLeadListsByUserId`: a query on the `userId-index` GSI of AW-LeadLists, which falls back to a filtered scan of that table if the index is missing; session lists are skipped) and, per list, the NEWEST leads
 of the list through `crmDb.findLeadsBySystemRecord`: a query on the list's own partition (newest `leadId` first) with a
-filter on `system.hot_lead_call.state` and `updatedAt`, so only ids come back. Bounds: at most 500 leads read per list,
-10,000 per run, 50 records settled per run (the rest wait for the next run, `truncated: true` in the summary). The read cost
-is that count of lead items per run (DynamoDB charges the leads examined, not the ids returned) plus a few small queries
-per org; the Twilio cost is at most two read-only call fetches per record. Not covered: a list of a member who left the org, and a stuck
-record older than the newest 500 leads of its list. Each record found is re-read consistently and decided on that read.
+filter on `system.hot_lead_call.state` and `updatedAt`, so only ids come back. Bounds: at most 500 leads read per list and
+10,000 per run; at most 50 records WRITTEN per run (would close, in report mode) and at most 200 records handled per run
+(each costs up to two Twilio reads). Records left for a human or failing do not use up the 50, so they cannot starve the
+rest; whatever a cap leaves waits for the next run. The org scan order does not rotate, so a pathological first org can
+still use the whole read budget every day.
+
+`truncated: true` means a read bound stopped a list or the run, or a cap left records for the next run. It fires on ANY
+list with 500 or more leads (and falsely when a read stops exactly at the bound), so it is not a signal by itself.
+
+Known limits, stated plainly:
+
+- **A stuck record older than the newest 500 leads of its list is invisible, on every run.** Nothing indexes the call
+  state, so the sweep can only look at the newest leads. The real fix (a sparse GSI on the state, or a persisted cursor)
+  is a data-plane change that needs Harsha's approval and is tracked under Known follow-ups. Also not covered: a list of a
+  member who left the org.
+- **Read cost.** DynamoDB bills the full size of every lead item examined, up to 10,000 per run, per backend instance
+  (the filter runs after the read), plus a few small queries per org; the Twilio cost is at most two read-only fetches per
+  record handled. Production currently runs ONE backend instance (Elastic Beanstalk min=max=1, verified 2026-11-04); more
+  instances multiply the scan and the Twilio reads (close mode stays correct: conditional transitions, per-sid usage keys).
+- **Closing a `between_attempts` record** as `failed` / `next_attempt_failed` overwrites that attempt's own outcome and writes
+  a `call.failed` event: anything alerting on `call.failed` will see it.
+- **A stranded `member_answered` record** (the move to `bridging` was lost) can leave an unbilled lead leg: the sweep meters
+  only the member leg, same as the webhook does today.
+
+Each record found is re-read consistently and decided on that read, and read again just before the first write: if its call,
+attempt, state or call sids changed meanwhile (a late real callback), the sweep writes nothing and counts it as `moved`.
 
 **When a record counts as stuck.** Time since the record's last write (`updatedAt`; every transition refreshes it) against
 the longest a healthy record waits in that state, plus 10 minutes for callback retries, the queue's reclaim of a dead
@@ -1058,18 +1079,19 @@ records are worth asking about.
 
 | Record | Action | Why it is safe |
 | --- | --- | --- |
-| `member_ringing`, `member_answered`, `bridging`, `connected`, with the sid of every unmetered leg | Fetch each unmetered leg. All ended: meter each through `meterLeg` (lead first), then apply the normal finishing rule (`finishIfComplete`: `completed`, or `bridge_unconfirmed` while still `bridging`; a member attempt that ended without taking the lead is finished with that attempt's outcome through the same close the webhook uses, `call.completed` event) | A leg Twilio reports as live is never touched. Metering is the webhook's own conditional write, so a late real callback and the sweep cannot both bill. Every leg is read before anything is written, so a Twilio failure changes nothing. The sweep never asks for a next member, so nobody is dialed |
+| `dialing`, `member_ringing`, `member_answered`, `bridging`, `connected`, with the sid of every unmetered leg (a `dialing` record that has a `memberCallSid` is reconciled like the others) | Fetch each unmetered leg. All ended: meter each through `meterLeg` (lead first), then apply the normal finishing rule (`finishIfComplete`: `completed`, or `bridge_unconfirmed` while still `bridging`; a member attempt that ended without taking the lead is finished with that attempt's outcome through the same close the webhook uses, `call.completed` event) | A leg Twilio reports as live is never touched. Metering is the webhook's own conditional write, so a late real callback and the sweep cannot both bill. Every leg is read before anything is written, so a Twilio failure changes nothing. The sweep never asks for a next member, so nobody is dialed |
 | the same, but a leg is still live (`queued`, `ringing`, `in-progress`) | Nothing; counted as `stillLive` and logged | A call that may legitimately still be running |
+| the same, but Twilio has no record of a call (404) | Nothing; `needsHuman` (a warn line, not a failure, so the summary line does not stay an error every day) | Only a Twilio 404 is treated this way; every other Twilio error is a `failed` |
 | the same, but an ended `completed` leg has no duration | Nothing; `needsHuman` | A missing duration is reported, never defaulted to 0. (`busy`, `failed`, `no-answer`, `canceled` legs have no duration by Twilio's definition and bill 0.) |
 | every dialed leg already metered, only the finish lost | `finishIfComplete` | Same rule as the webhook |
-| `dialing` (no call sid, including `placement_unknown`) or `bridging`/`connected` with no `leadCallSid` | Nothing; `needsHuman` | There is nothing to ask Twilio about, and a call may exist that was billed and never recorded. Closing it stays a data repair needing Harsha's approval (see Repairing). Check the Twilio call log by hand as before; the line repeats on every run until the record is repaired |
+| `dialing` (no call sid, including `placement_unknown`), `member_ringing`/`member_answered` with no `memberCallSid`, or `bridging`/`connected` with no `leadCallSid` | Nothing; `needsHuman` | There is nothing to ask Twilio about, and a call may exist that was billed and never recorded. Closing it stays a data repair needing Harsha's approval (see Repairing). Check the Twilio call log by hand as before; the line repeats on every run until the record is repaired |
 | `between_attempts` older than 70 min | Close as `failed` / `next_attempt_failed` with a `call.failed` event (reason `next_attempt_failed`), guarded by the attempt number | No call is live in this state and no job can ring anyone any more; it is the close the next-attempt job makes when it breaks. If a job took the record first, the conditional write loses and nothing changes |
 
 **Reading the log.** One summary line per run: `[hotLeadCall] stuck call sweep completed` (info), `... completed with
 failures` (error, when `failed` is above 0), or `... skipped: HOT_LEAD_CALL_STUCK_SWEEP is off`. Fields: `mode`; `orgs`,
 `lists`, `leadsRead` (the read cost) and `truncated`; `found` (records the read returned, older than the youngest
-threshold); `wouldClose` (report mode) and `closed`; `stillLive`; `needsHuman`; `notStuck` (found but not yet stuck for its
-state, or gone); `moved` (written to but not closed: another writer got there); `failed` (a Twilio call, the store or an org
+threshold; the cap counts only the ones written); `wouldClose` (report mode) and `closed`; `stillLive`; `needsHuman`; `notStuck` (found but not yet stuck for its
+state, or gone); `moved` (another writer got there: the record changed before the first write, or was written to but not closed); `failed` (a Twilio call, the store or an org
 read failed; nothing more was changed for that record). Before it, one `warn` line per record: `stuck call record: org <orgId> list <listId> lead <leadId> state <state>: <what>`, where
 `<what>` is `would close (...)`, `closing (...)`, `Twilio says the <leg> call is still live: left alone` or `needs a human: <reason>`.
 No phone number is ever logged. Failures log the error name only.
@@ -1258,7 +1280,9 @@ on anywhere.
     `[hotLeadCall] stuck call sweep completed` line and its `stuck call record: ...` warn lines (see
     [Stuck records](#stuck-records)): `found` should be 0 or explainable, `failed` 0, and every `would close` line a record you
     agree should be closed. Only then set `HOT_LEAD_CALL_STUCK_SWEEP=close` and restart. Confirm `fetchCall` works with the
-    production Twilio credentials (a `failed` count above 0 with `Twilio fetchCall` errors in the log means it does not).
+    production Twilio credentials: grep the log for `fetchCall CA... failed` (the provider's own error line); a `failed`
+    count above 0 with those lines means it does not. A call Twilio has no record of (404) shows as a `needs a human`
+    warning, not a failure.
 
 ## Not verified without a real Twilio account
 
@@ -1347,6 +1371,10 @@ Twilio's documentation and encoded in tests with synthetic payloads:
   price.
 
 ## Known follow-ups
+
+- **Stuck-record sweep visibility.** The sweep only sees the newest 500 leads of each list (nothing indexes the call
+  state). A sparse GSI on the state, or a persisted cursor, would make every stuck record visible; both are data-plane
+  changes that need Harsha's approval.
 
 - **Inbound minutes.** The caller's inbound leg of a callback is not metered (no inbound rate on the card); add a
   `voice_minute_inbound` rate. `/inbound-status` is the callback of the CHILD (member) leg; the caller's parent leg has no
