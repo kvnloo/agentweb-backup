@@ -80,25 +80,32 @@ describe('Slack', () => {
 });
 
 describe('WhatsApp', () => {
-  it('words a Smartlead reply as a sentence in the message and in the template variables', async () => {
+  it('opens with the SAME sentence as the email subject and the Slack header, then the list and the CRM link', async () => {
+    const url = `${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/crm?listId=list-1`;
+    const sentence = 'A new lead "Ada Lovelace" replied to your campaign';
     await notify(onWhatsApp, SMARTLEAD);
-    expect(waSent().text).toBe(`Ada Lovelace replied to your campaign on Q3 Inbound. ${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/crm?listId=list-1`);
+    expect(waSent().text).toBe(`${sentence}. List: Q3 Inbound. ${url}`);
     expect(waSent().template.name).toBe('agentweb_lead_alert');
-    expect(waSent().template.variables).toEqual(['Ada Lovelace', `replied to your campaign on Q3 Inbound. ${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/crm?listId=list-1`]);
+    expect(waSent().template.variables).toEqual([sentence, `List: Q3 Inbound. ${url}`]);
     expect(JSON.stringify(waSent())).not.toContain('email.received');
+    // the same sentence on the other two channels, from the same input
+    const { emailService } = require('../services/emailService');
+    expect(emailService.sendEmail.mock.calls[0][1]).toBe(sentence);
+    await notify(onSlack, SMARTLEAD);
+    expect(slackSent().headline).toBe(sentence);
   });
 
-  it("keeps the contact's name to one safe line, and falls back to the address, then to 'A lead'", async () => {
+  it("keeps the contact's name to one safe line, and falls back to the address, then to a plain sentence", async () => {
     await notify(onWhatsApp, SMARTLEAD, { ...lead, firstName: 'Ann\nBob‮', lastName: '\t' });
-    expect(waSent().template.variables[0]).toBe('Ann Bob');
+    expect(waSent().template.variables[0]).toBe('A new lead "Ann Bob" replied to your campaign');
     expect(waSent().template.variables[0]).not.toMatch(/[\n\r\t‮]/);
     whatsapp.sendMessage.mockClear();
     await notify(onWhatsApp, SMARTLEAD, { leadId: 'l2', email: 'bo@example.com' });
-    expect(waSent().template.variables[0]).toBe('bo@example.com');
+    expect(waSent().template.variables[0]).toBe('A new lead "bo@example.com" replied to your campaign');
     whatsapp.sendMessage.mockClear();
     await notify(onWhatsApp, SMARTLEAD, { leadId: 'l3' });
     expect(waSent().template.variables).toHaveLength(2);
-    expect(waSent().template.variables[0]).toBe('A lead');
+    expect(waSent().template.variables[0]).toBe('A new lead replied to your campaign');
     expect(JSON.stringify(waSent())).not.toContain('l3');
   });
 
