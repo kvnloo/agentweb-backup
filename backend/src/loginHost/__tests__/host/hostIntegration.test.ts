@@ -68,14 +68,14 @@ async function boot(existing?: { sys: FakeSystem; dir: string }): Promise<Rig> {
     socket: { dir: "/run/aw-login-host-test1", gid: 990 },
     quota: { blocksKb: 204_800, inodes: 20_000 },
     egress: { allow: ["api.anthropic.com:443", "platform.claude.com:443", "claude.ai:443"] },
-    claude: { binaryPath: "/opt/aw-claude/2.1.294/claude", expectedSha256: "a".repeat(64), version: "2.1.294", systemPromptFile: "/opt/aw-login-host/system-prompt.txt", bridgeUrl: "http://127.0.0.1:3001/mcp" },
+    claude: { binaryPath: "/opt/aw-claude/2.1.294/claude", expectedSha256: "a".repeat(64), version: "2.1.294", systemPromptFile: "/opt/aw-login-host/system-prompt.txt", nodePath: "/opt/aw-node/v22.23.3/bin/node", bridgeUrl: "http://127.0.0.1:3001/mcp" },
   });
   const script = newScript();
   const adapter = createFakeAdapter(script, { singleUse: true });
   const binary: VerifiedBinary = { path: cfg.claude.binaryPath, version: "2.1.294", digest: "sha256:" + "a".repeat(64) };
   const stateDir = join(dir, "state");
   const log = noopLogger;
-  const host = await startHost(cfg, binary, { cmd: sys, root: sys, log, stateDir, adapters: new Map([["fake", adapter]]), chownSocket: false, socketDir: join(dir, "run"), egressDir: join(dir, "egress") });
+  const host = await startHost(cfg, binary, { cmd: sys, root: sys, log, stateDir, adapters: new Map([["fake", adapter]]), chownSocket: false, socketDir: join(dir, "run"), egressDir: join(dir, "egress"), relayRoot: join(dir, "relay") });
   const rig: Rig = {
     sys,
     cfg,
@@ -189,14 +189,14 @@ describe("the whole host over a real socket", () => {
         env: "test1", uidMin: 400_000, uidMax: 410_000, socket: { dir: "/run/aw-login-host-test1", gid: 990 },
         egress: { allow: ["api.anthropic.com:443"] },
         tls: { host: "172.31.30.50", port: 8443, certPath: join(dir, "server.crt"), keyPath: join(dir, "server.key"), caPath: join(dir, "ca.crt"), clientCommonNames: ["agentweb-backend-test"] },
-        claude: { binaryPath: "/opt/a/claude", expectedSha256: "a".repeat(64), version: "1", systemPromptFile: "/opt/p", bridgeUrl: "http://127.0.0.1:1/mcp" },
+        claude: { binaryPath: "/opt/a/claude", expectedSha256: "a".repeat(64), version: "1", systemPromptFile: "/opt/p", nodePath: "/opt/aw-node/v22.23.3/bin/node", bridgeUrl: "http://127.0.0.1:1/mcp" },
       });
       const adapter = createFakeAdapter(newScript(), { singleUse: true });
       const lines: Array<{ level: string; event: string; fields?: Record<string, unknown> }> = [];
       const recording = { info: (event: string, fields?: Record<string, unknown>) => void lines.push({ level: "info", event, fields }), warn: (event: string, fields?: Record<string, unknown>) => void lines.push({ level: "warn", event, fields }) };
       const host = await startHost(cfg, { path: cfg.claude.binaryPath, version: "1", digest: "sha256:" + "a".repeat(64) }, {
         cmd: sys, root: sys, log: recording as never, stateDir: join(dir, "state"), adapters: new Map([["fake", adapter]]), chownSocket: false,
-        socketDir: join(dir, "run"), egressDir: join(dir, "egress"), tlsHost: "127.0.0.1", tlsPort: 0,
+        socketDir: join(dir, "run"), egressDir: join(dir, "egress"), relayRoot: join(dir, "relay"), tlsHost: "127.0.0.1", tlsPort: 0,
       });
       try {
         expect(host.handle.tlsPort).toBeGreaterThan(0);
@@ -303,7 +303,7 @@ describe("the whole host over a real socket", () => {
     it("no unit can start before the proxy is up (fail closed)", async () => {
       const { buildHost } = await import("../../host/main");
       const sys = new FakeSystem();
-      const cfg = parseHostConfig({ env: "test1", uidMin: 400_000, uidMax: 410_000, socket: { dir: "/run/aw-login-host-test1", gid: 990 }, egress: { allow: ["api.anthropic.com:443"] }, claude: { binaryPath: "/opt/a/claude", expectedSha256: "a".repeat(64), version: "1", systemPromptFile: "/opt/p", bridgeUrl: "http://127.0.0.1:1/mcp" } });
+      const cfg = parseHostConfig({ env: "test1", uidMin: 400_000, uidMax: 410_000, socket: { dir: "/run/aw-login-host-test1", gid: 990 }, egress: { allow: ["api.anthropic.com:443"] }, claude: { binaryPath: "/opt/a/claude", expectedSha256: "a".repeat(64), version: "1", systemPromptFile: "/opt/p", nodePath: "/opt/aw-node/v22.23.3/bin/node", bridgeUrl: "http://127.0.0.1:1/mcp" } });
       const dir = mkdtempSync(join(tmpdir(), "host-int-nr-"));
       dirs.push(dir);
       const built = buildHost(cfg, { path: cfg.claude.binaryPath, version: "1", digest: "sha256:" + "a".repeat(64) }, { cmd: sys, root: sys, log: noopLogger, stateDir: join(dir, "state") });
@@ -325,7 +325,7 @@ describe("the whole host over a real socket", () => {
   it("stopEnvironment refuses to serve when a unit will not die, and waits for queued start jobs", async () => {
     const sys = new FakeSystem();
     sys.startLatencyMs = 40;
-    const cfg = parseHostConfig({ env: "test1", uidMin: 400_000, uidMax: 410_000, socket: { dir: "/run/aw-login-host-test1", gid: 990 }, egress: { allow: ["api.anthropic.com:443", "platform.claude.com:443", "claude.ai:443"] }, claude: { binaryPath: "/opt/a/claude", expectedSha256: "a".repeat(64), version: "1", systemPromptFile: "/opt/p", bridgeUrl: "http://127.0.0.1:1/mcp" } });
+    const cfg = parseHostConfig({ env: "test1", uidMin: 400_000, uidMax: 410_000, socket: { dir: "/run/aw-login-host-test1", gid: 990 }, egress: { allow: ["api.anthropic.com:443", "platform.claude.com:443", "claude.ai:443"] }, claude: { binaryPath: "/opt/a/claude", expectedSha256: "a".repeat(64), version: "1", systemPromptFile: "/opt/p", nodePath: "/opt/aw-node/v22.23.3/bin/node", bridgeUrl: "http://127.0.0.1:1/mcp" } });
     const { layoutFor } = await import("../../host/main");
     const layout = layoutFor(cfg);
     sys.start("/usr/bin/systemd-run", ["--unit=aw-test1-400123-00000000000000aa.service", "--", "/usr/bin/setpriv", "--reuid=400123", "--", "/bin/sleep", "1"]);

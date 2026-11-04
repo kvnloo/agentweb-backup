@@ -76,6 +76,21 @@ export class FakeCrm {
       this.calls.push('getLeadById');
       return clone(this.leadOf(listId, leadId));
     },
+    getLeadListsByUserId: async (userId: string) => {
+      this.calls.push('getLeadListsByUserId');
+      return [...this.lists.values()].filter((l) => l.userId === userId).map(clone);
+    },
+    /** Newest leadId first, like the real query; `read` counts the leads examined, as DynamoDB's ScannedCount does. */
+    findLeadsBySystemRecord: async (listId: string, key: string, op: { states: string[]; updatedBefore: string; maxRead: number }) => {
+      this.calls.push('findLeadsBySystemRecord');
+      const inList = [...this.leads.values()].filter((l) => l.listId === listId).sort((a, b) => b.leadId.localeCompare(a.leadId));
+      const examined = inList.slice(0, op.maxRead);
+      const leadIds = examined.filter((l) => {
+        const rec = l.system?.[key] as { state?: string; updatedAt?: string } | undefined;
+        return !!rec && op.states.includes(rec.state as string) && (rec.updatedAt as string) < op.updatedBefore;
+      }).map((l) => l.leadId);
+      return { leadIds, read: examined.length, truncated: inList.length > examined.length };
+    },
     claimLeadStepOnce: async (listId: string, leadId: string, step: string) => {
       this.calls.push('claimLeadStepOnce');
       const lead = this.leadOf(listId, leadId);
@@ -144,6 +159,14 @@ export class FakeCrm {
     getOrgById: async (orgId: string) => {
       this.calls.push('getOrgById');
       return clone(this.orgs.get(orgId));
+    },
+    getOrgMembers: async (orgId: string) => {
+      this.calls.push('getOrgMembers');
+      return [...this.users.values()].filter((u) => u.orgId === orgId).map(clone);
+    },
+    listHotLeadCallOrgIds: async () => {
+      this.calls.push('listHotLeadCallOrgIds');
+      return [...this.orgs.entries()].filter(([, org]) => org.hotLeadCall !== undefined).map(([orgId]) => orgId);
     },
     listHotLeadCallNumbers: async () => {
       this.calls.push('listHotLeadCallNumbers');

@@ -27,6 +27,8 @@
     "version": "@@CLAUDE_VERSION@@",
     "systemPromptFile": "@@RELEASE_DIR@@/system-prompt.txt",
     "turnWrapperPath": "@@RELEASE_DIR@@/claude-turn.sh",
+    "relayShimPath": "@@RELEASE_DIR@@/aw-relay-shim.js",
+    "nodePath": "/opt/aw-node/v@@NODE_VERSION@@/bin/node",
     "bridgeUrl": "@@BRIDGE_URL@@"
   }
 }

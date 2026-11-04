@@ -20,7 +20,9 @@ import type { RunToolTokenClaims } from "./runToolToken";
 import {
   ToolBridge,
   ToolBridgeAuthError,
+  type BridgeCallOptions,
   type BridgeCallRecord,
+  type BridgeToolCall,
   type BridgeHalt,
   type CloseAndDrainResult,
   type OpenRunOptions,
@@ -76,6 +78,15 @@ export class ToolBridgeMcpAdapter {
     this.bridge.noteToolResult(runId, callId);
   }
 
+  /** The relay path's face of the bridge: the same list and the same `callTool` (liveness, allow-list, halts, ledger) the HTTP route uses, with the run's internal token. */
+  listTools(token: string, runId: string) {
+    return this.bridge.listTools(token, runId);
+  }
+
+  callTool(token: string, call: BridgeToolCall, runId: string, opts?: BridgeCallOptions) {
+    return this.bridge.callTool(token, call, runId, opts);
+  }
+
   closeRun(runId: string): void {
     this.closeSessions(runId);
     this.bridge.closeRun(runId);
@@ -111,6 +122,9 @@ export class ToolBridgeMcpAdapter {
     return runIds;
   }
 
+  ranCall(runId: string, callId: string): boolean {
+    return this.bridge.ranCall(runId, callId);
+  }
   takeLedger(runId: string, opts?: { clear?: boolean }): { records: BridgeCallRecord[]; truncated: number } {
     return this.bridge.takeLedger(runId, opts);
   }

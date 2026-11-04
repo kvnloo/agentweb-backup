@@ -77,6 +77,12 @@ export function monthlyRentText(): string {
   return rent === null ? 'a monthly fee' : `$${rent.toFixed(2)} per month`;
 }
 
+/** Live per-minute price of a call for the enable card, from the same rate card the metering uses. */
+export function callRateText(): string {
+  const rate = getAllocatedRate('twilio', 'voice_minute_outbound');
+  return rate === null ? 'the per-minute rate of your phone provider' : `$${+rate.toFixed(4)} per minute`;
+}
+
 const orphanLog = (orgId: string, sid: string, why: string) =>
   console.error(`[hotLeadCall] ORPHAN number: org ${orgId} sid ${sid} (${why}); release it in the Twilio console`);
 

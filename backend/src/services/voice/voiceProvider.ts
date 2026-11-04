@@ -46,6 +46,13 @@ export interface ValidateSignatureParams {
   signature: string | undefined;
 }
 
+/** What Twilio says about one call: its status ('completed', 'in-progress', 'no-answer', ...) and, once it ended, its length. */
+export interface FetchedCall {
+  status: string;
+  /** Absent while the call is live and for calls that never connected (Twilio leaves `duration` empty for those). */
+  durationSeconds?: number;
+}
+
 /**
  * Telephony seam for the hot-lead auto-call (ENG-2271). Everything that touches Twilio goes
  * through this interface so the call flow is testable with the recording fake.
@@ -71,6 +78,8 @@ export interface VoiceProvider {
    */
   ensureCredentials(): Promise<void>;
   placeCall(p: PlaceCallParams): Promise<{ callSid: string }>;
+  /** Read-only: the call's current status and duration. Throws VoiceCallError (404 when Twilio has no such call). */
+  fetchCall(callSid: string): Promise<FetchedCall>;
   buyNumber(p: BuyNumberParams): Promise<{ numberSid: string; phoneNumber: string }>;
   releaseNumber(numberSid: string): Promise<void>;
   validateSignature(p: ValidateSignatureParams): boolean;
@@ -216,6 +225,14 @@ class TwilioVoiceProvider implements VoiceProvider {
         throw new VoiceCallError('Twilio placeCall response carried no call sid; a call may exist', 'unknown');
       }
       return { callSid: call.sid };
+    });
+  }
+
+  async fetchCall(callSid: string): Promise<FetchedCall> {
+    return this.run('fetchCall', ` ${callSid}`, async (client) => {
+      const call = await client.calls(callSid).fetch();
+      const seconds = call.duration === null || call.duration === '' ? NaN : Number(call.duration);
+      return { status: call.status, ...(Number.isFinite(seconds) && seconds >= 0 ? { durationSeconds: seconds } : {}) };
     });
   }
 

@@ -672,3 +672,43 @@ describe("asUser.writeFile", () => {
     expect(await rejects(port.asUser(UID, "att-1", "attempt").writeFile("x", "y"))).toBe("write_failed");
   });
 });
+
+describe("spawnAs with a relay directory (ENG-2113)", () => {
+  function relayRig(net: boolean) {
+    const sys = new FakeSystem();
+    const layout = new Layout({ env: "test1", stateRoot: "/var/lib/aw-login-host/test1", sharedParent: "/var/lib/aw-login-host", uidMin: 400_000, uidMax: 460_000, relayRoot: "/run/aw-relay-test1" });
+    const config: SystemdPortConfig = {
+      limits: { memoryMax: "1G", tasksMax: 256, tmpSize: "128M", shmSize: "64M", runtimeMaxSec: 7200 },
+      paths: { systemRun: "/usr/bin/systemd-run", setpriv: "/usr/bin/setpriv", env: "/usr/bin/env", inaccessible: [], systemctl: "/usr/bin/systemctl", rm: "/usr/bin/rm", find: "/usr/bin/find", setquota: "/usr/sbin/setquota", writeFileHelper: "/opt/aw-login-host/aw-write-file.sh", ...(net ? { net: { dir: "/run/aw-egress-test1", launcher: "/opt/aw-login-host/aw-net.sh", socat: "/usr/bin/socat" } } : {}) },
+      killTimeoutMs: 300,
+      killPollMs: 5,
+      commandTimeoutMs: 1000,
+    };
+    let n = 0;
+    return { sys, layout, port: new SystemdUserFs({ layout, cmd: sys, root: sys, config, randomHex: () => (++n).toString(16).padStart(16, "0") }) };
+  }
+  const dirOf = (layout: Layout, uid: number) => layout.relayTurnDir(uid, "0123456789abcdef0123456789abcdef");
+
+  it("the unit is started with exactly that directory bound read-only at /run/aw-relay (in the network-isolated shape)", () => {
+    const { sys, layout, port } = relayRig(true);
+    const ctx = port.contextFor("c", UID, "att-1", "attempt");
+    ctx.spawnAs({ file: "/bin/true", args: [], env: {}, cwd: ctx.workDir, relayDir: dirOf(layout, UID) });
+    const args = sys.calls[sys.calls.length - 1].args;
+    expect(args).toContain(`BindReadOnlyPaths=${dirOf(layout, UID)}:/run/aw-relay`);
+    expect(args).toContain("PrivateNetwork=yes");
+  });
+
+  it("MUTATION TARGET: without the network-isolated shape no unit is started at all", () => {
+    const { sys, layout, port } = relayRig(false);
+    const ctx = port.contextFor("c", UID, "att-1", "attempt");
+    expect(() => ctx.spawnAs({ file: "/bin/true", args: [], env: {}, cwd: ctx.workDir, relayDir: dirOf(layout, UID) })).toThrow("relay requires");
+    expect(sys.calls).toEqual([]);
+  });
+
+  it("MUTATION TARGET: a uid can only be handed its own relay directory (a different uid's, same turn id: refused)", () => {
+    const { sys, layout, port } = relayRig(true);
+    const ctx = port.contextFor("c", UID, "att-1", "attempt");
+    expect(() => ctx.spawnAs({ file: "/bin/true", args: [], env: {}, cwd: ctx.workDir, relayDir: dirOf(layout, UID2) })).toThrow("relay dir invalid");
+    expect(sys.calls).toEqual([]);
+  });
+});
