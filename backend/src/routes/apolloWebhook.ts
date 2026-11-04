@@ -82,6 +82,13 @@ interface ApolloWebhookPayload {
   email_status?: string;
 }
 
+/** A status label from a callback body (stored in sourceQuote / the placeholder): lower-case [a-z0-9 _.-], at most 40 characters. */
+function cleanStatus(v: unknown): string | undefined {
+  if (typeof v !== 'string') return undefined;
+  const t = v.toLowerCase().replace(/[^a-z0-9 _.-]/g, '').trim().slice(0, 40);
+  return t || undefined;
+}
+
 /**
  * Pull the first finder-vendor email out of Apollo's nested waterfall payload.
  * Falls back to the flat `person.email` / `email` shape if `people[]` is absent
@@ -91,19 +98,23 @@ interface ApolloWebhookPayload {
  */
 /**
  * Shape gate for an email arriving in a callback body before it is stored on a customer lead (ENG-2801).
- * Only a string of at most 254 characters that looks like one address: no whitespace (so no CR/LF header
- * injection), no angle brackets, quotes, commas, semicolons, colons, parentheses, brackets or backslashes
- * (so no markup, no multi-address strings). Apostrophes and plus-tags stay legal (o'brien@x.com, a+b@x.co.uk).
- * Anything else is treated as "no email" so a malformed or forged value is never written.
+ * Only a string of at most 254 characters that is one plausible address: the local part is limited to the
+ * RFC 5322 "atext" characters (letters, digits and !#$%&'*+/=?^_`{|}~- plus dots), which excludes whitespace,
+ * control characters, NUL, bidi/zero-width characters, angle brackets, quotes, commas, semicolons, colons,
+ * parentheses, brackets and backslashes (no header injection, markup or multi-address strings); the domain is
+ * ASCII labels ending in a 2-63 letter TLD (internationalised domains must arrive as punycode). Apostrophes
+ * and plus-tags stay legal (o'brien@x.com, a+b@x.co.uk). Anything else is treated as "no email" so a malformed
+ * or forged value is never written. The length cap runs before the regex, so the regex input is bounded.
  */
-const CALLBACK_EMAIL_SHAPE = /^[^\s@<>"\\,;:()[\]]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?\.[A-Za-z]{2,63}$/;
+const CALLBACK_EMAIL_SHAPE = /^[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?\.[A-Za-z]{2,63}$/;
 export function cleanCallbackEmail(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
   const e = value.trim();
   return e.length > 0 && e.length <= 254 && CALLBACK_EMAIL_SHAPE.test(e) ? e : undefined;
 }
 
-function extractApolloEmail(payload: ApolloWebhookPayload): { email?: string; emailStatus?: string } {
+function extractApolloEmail(payload: ApolloWebhookPayload): { email?: string; emailStatus?: string; rejected: number } {
+  let rejected = 0; // candidate email values that were present but failed the shape gate
   const person = Array.isArray(payload.people) ? payload.people[0] : null;
   const groups = person?.waterfall?.emails;
   if (Array.isArray(groups)) {
@@ -111,17 +122,21 @@ function extractApolloEmail(payload: ApolloWebhookPayload): { email?: string; em
       const vendors = Array.isArray(grp?.vendors) ? grp.vendors : [];
       const finder = vendors.find((v) => Array.isArray(v?.emails) && v.emails.length > 0);
       if (!finder || !finder.emails || finder.emails.length === 0) continue;
-      const email = (finder.emails as unknown[]).map(cleanCallbackEmail).find((e): e is string => !!e);
-      if (!email) continue; // nothing in this group is a usable address; try the next group
+      const candidates = finder.emails as unknown[];
+      const email = candidates.map(cleanCallbackEmail).find((e): e is string => !!e);
+      if (!email) {
+        rejected += candidates.filter((v) => v !== null && v !== undefined && v !== '').length;
+        continue; // nothing in this group is a usable address; try the next group
+      }
       const verified = vendors.some(
         (v) => v?.usedForVerification && String(v?.status ?? '').toLowerCase() === 'validated',
       );
-      const finderStatus = String(finder.status ?? '').toLowerCase();
+      const finderStatus = cleanStatus(finder.status) ?? '';
       const emailStatus =
         verified || finderStatus === 'verified' ? 'verified' :
         finderStatus === 'guessed' ? 'guessed' :
         finderStatus || undefined;
-      return { email, emailStatus };
+      return { email, emailStatus, rejected };
     }
   }
   // Flat-shape fallback. Lowercase the status so downstream confidence
@@ -129,10 +144,9 @@ function extractApolloEmail(payload: ApolloWebhookPayload): { email?: string; em
   // Apollo returns mixed case (e.g. "VERIFIED").
   const flatEmail = payload.person?.email ?? payload.email;
   const flatStatus = payload.person?.email_status ?? payload.email_status;
-  return {
-    email: cleanCallbackEmail(flatEmail),
-    emailStatus: typeof flatStatus === 'string' ? flatStatus.toLowerCase() : undefined,
-  };
+  const flat = cleanCallbackEmail(flatEmail);
+  if (!flat && flatEmail !== null && flatEmail !== undefined && flatEmail !== '') rejected += 1;
+  return { email: flat, emailStatus: cleanStatus(flatStatus), rejected };
 }
 
 router.post('/:secret', async (req: Request, res: Response) => {
@@ -170,7 +184,9 @@ router.post('/:secret', async (req: Request, res: Response) => {
       console.warn('[apollo webhook] placeholder missing userId — refusing to write', requestId);
       return res.status(202).json({ accepted: true, matched: false });
     }
-    const list: any = await crmDb.getLeadListById(listId).catch(() => null);
+    // No .catch here: a transient read error must surface as a 500 so Apollo retries the callback. A deleted list
+    // resolves to null/undefined (not a throw) and is answered 202 below.
+    const list: any = await crmDb.getLeadListById(listId);
     if (!list || list.userId !== placeholderUserId) {
       console.warn('[apollo webhook] list missing or owner changed since Tier 3 — refusing', requestId);
       return res.status(202).json({ accepted: true, matched: false });
@@ -189,7 +205,12 @@ router.post('/:secret', async (req: Request, res: Response) => {
       return res.status(200).json({ accepted: true, matched: true, alreadyProcessed: true });
     }
 
-    const { email, emailStatus } = extractApolloEmail(payload);
+    const { email, emailStatus, rejected } = extractApolloEmail(payload);
+    if (!email && rejected > 0) {
+      // Visible on purpose: a systematic false rejection would otherwise look exactly like "Apollo found nothing".
+      // Logs the count and request id only, never the rejected value.
+      console.warn('[apollo webhook] callback email value(s) failed validation; treating as no_email', requestId, 'rejected:', rejected);
+    }
 
     // Stamp the result onto the placeholder so the waterfall poller (running
     // in the original Tier 3 caller) can pick it up and skip Tier 4. Best-
