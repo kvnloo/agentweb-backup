@@ -45,6 +45,13 @@ const getAlertEvents = (list: any) => {
   return rawEvents.map(normalizeEventType);
 };
 
+/**
+ * What a Smartlead reply alert calls the contact on every channel: their name, else nothing (the shared headline then falls back to the
+ * address). Unlike formatLeadName it never falls back to a phone number or the lead's database id.
+ */
+const smartleadReplyName = (lead: any): string =>
+  [lead?.firstName, lead?.lastName].map((v) => (typeof v === 'string' ? v.trim() : '')).filter(Boolean).join(' ');
+
 const formatLeadName = (lead: any) => {
   const firstName = typeof lead.firstName === 'string' ? lead.firstName.trim() : '';
   const lastName = typeof lead.lastName === 'string' ? lead.lastName.trim() : '';
@@ -189,7 +196,7 @@ const sendAlertEmail = async ({
   // A reply that came back through Smartlead (ENG-673) gets its own plain-language email; every other alert keeps the generic one below.
   if (isSmartleadReplyAlert(eventType, eventData)) {
     const content = buildSmartleadReplyAlertEmail({
-      leadName,
+      leadName: smartleadReplyName(lead),
       leadEmail,
       listName,
       campaignName: typeof eventData?.campaign === 'string' ? eventData.campaign : undefined,
@@ -370,7 +377,7 @@ export const leadListAlertService = {
           timestamp: createdAt || new Date().toISOString(),
           compact: isCompactLeadNotificationUser(list.userId),
           // A Smartlead reply reads as a sentence, not the raw event name. Every other event leaves this out.
-          ...(smartleadReply ? { headline: smartleadReplyHeadline(formatLeadName(lead), lead.email) } : {}),
+          ...(smartleadReply ? { headline: smartleadReplyHeadline(smartleadReplyName(lead), lead.email) } : {}),
         });
       } catch (slackError) {
         // Log but don't fail — email was already sent successfully
@@ -391,7 +398,7 @@ export const leadListAlertService = {
           'A lead';
         if (smartleadReply) {
           // The contact's name is their own words: one safe line, so it can never add a line break to the message.
-          const who = smartleadReplyContactLabel(formatLeadName(lead), lead.email) || 'A lead';
+          const who = smartleadReplyContactLabel(smartleadReplyName(lead), lead.email) || 'A lead';
           const detail = `replied to your campaign on ${listName}. ${crmUrl}`;
           await getMessagingChannel('whatsapp').sendMessage({
             destination: whatsappTo,
