@@ -150,9 +150,16 @@ async function resolveLuma(userId: string, calendarId?: string): Promise<Resolve
     }
     account = match;
   } else if (accounts.length > 1) {
-    return {
-      error: `Several Luma calendars are connected — pass calendar_id. Connected: ${describe(accounts)}.`,
-    };
+    // A key shared with the org must not break a teammate who already has their own calendar (ENG-2737): the caller's single own
+    // connection wins, as with Smartlead. Anything else is ambiguous and asks for calendar_id.
+    const own = accounts.filter((a) => (a as any).userId === userId);
+    if (own.length === 1) {
+      account = own[0];
+    } else {
+      return {
+        error: `Several Luma calendars are connected — pass calendar_id. Connected: ${describe(accounts)}.`,
+      };
+    }
   }
 
   let apiKey: string;
