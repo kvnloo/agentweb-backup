@@ -517,14 +517,17 @@ logic is in `services/voice/hotLeadCallApprovalGate.ts`). The card states the
 monthly rent from the live rate card; for turning calling on it says that when a lead
 arrives from the landing page AgentWeb will phone the verified team member(s) (name and
 last 4 digits) from the org's number (last 4 digits) and then the lead, that calls are
-billed to the organization owner per minute at the live outbound rate, and that calling
-can be turned off at any time. After the person clicks approve, Emma
+billed to the organization owner per minute at the live outbound rate (both the member's
+and the lead's call, each rounded up to a whole minute, as the metering does), the caps in
+force (`maxCallsPerHour`, `maxCallsPerDay`, `maxAttemptsPerLead`) and the calling hours with
+their timezone, taken from the settings about to be saved, and that calling can be turned
+off at any time. After the person clicks approve, Emma
 calls the tool again with the same arguments and it acts.
 
 - Order: the existing checks run first (unattended, arguments, owner/admin,
   plan entitlement, saved settings, already has / has no number; for turning calling
-  on, everything `applyHotLeadCallSettings` checks: validation, plan, the blockers and
-  the unattended refusal), so a caller who
+  on, everything `applyHotLeadCallSettings` checks before its write: owner/admin,
+  revision, validation, plan, blockers and the unattended refusal), so a caller who
   is refused never sees a card. Then: a chat session must exist and be readable,
   must not be a scheduled session, and must not be a support/admin session acting
   as the customer (`isDelegatedAccess` / `isDelegatedAdmin`).
@@ -537,7 +540,8 @@ calls the tool again with the same arguments and it acts.
 - Validity: the newest card for that digest must be answered "approve" by the
   user (never by "Let Emma decide", which the card does not offer), at most 15
   minutes ago, and not used yet. Declining, ignoring or letting it expire makes the
-  next call show a fresh card.
+  next call show a fresh card. An approval is spent when it is claimed, so a final
+  write that then loses a race or fails needs a new card (as for provision and release).
 - Single use: immediately before buying or releasing, the approval is claimed
   with `chatbotDb.claimMetaWriteManifestDigest(sessionId, "hotlead:" + kind)`
   (an entry in the session's existing `consumedMetaWriteManifestDigests` map; the

@@ -158,9 +158,16 @@ emmaToolRegistry.register({
     // Turning calling on is the one change that waits for a person's approval; the portal's own click covers REST.
     const requireEnableApproval = async (next: HotLeadCallConfig) => {
       const halt = await requireApproval({
-        action: 'enable', org, context, priceText: callRateText(), target: canonicalJson(patch),
-        number: next.twilioNumber && maskPhone(next.twilioNumber),
-        members: next.team.filter(m => m.verifiedAt).map(m => `${m.name} (${maskPhone(m.phone)})`),
+        org,
+        context,
+        priceText: callRateText(),
+        target: canonicalJson(patch),
+        card: {
+          action: 'enable',
+          number: next.twilioNumber && maskPhone(next.twilioNumber),
+          members: next.team.filter(m => m.verifiedAt).map(m => `${m.name} (${maskPhone(m.phone)})`),
+          limits: next,
+        },
       });
       if (halt) throw new ApprovalHalt(halt);
     };

@@ -686,12 +686,42 @@ describe('human approval for turning calling on', () => {
     expect(card.question).toContain('lead arrives from your landing page');
     expect(card.question).toContain('Dana Lee (***0100)');
     expect(card.question).toContain('from your number ***0111');
-    expect(card.question).toContain('billed to the organization owner per minute at the current rate of $0.014 per minute');
+    expect(card.question).toContain('Both calls are billed to the organization owner per minute at the current rate of $0.014 per minute, each rounded up to a whole minute');
+    expect(card.question).toContain('6 leads per hour, 20 per day, at most 3 call attempts per lead, only 08:00-21:00 America/Chicago');
     expect(card.question).toContain('turn it off at any time');
     expect(card.question).not.toMatch(/4155550100|4155550111/);
     expect(isOn()).toBe(false);
     expect(writes).toEqual([]);
     expect(chatbotDb.claimMetaWriteManifestDigest).not.toHaveBeenCalled();
+  });
+  it('names every verified member, also with an apostrophe, ampersand or accent in the name', async () => {
+    org.hotLeadCall = withNumber({ team: [
+      teamMember('+14155550100', { name: "Dana O'Neil & Sons" }),
+      teamMember('+14155550122', { id: 'mzzzzzz2', name: 'José Núñez' }),
+    ] });
+    expect((await call()).questionDeckPayload![0].question).toContain("Dana O'Neil & Sons (***0100), José Núñez (***0122)");
+  });
+  it('shows the caps that will be in force, including the ones sent in the same call', async () => {
+    org.hotLeadCall = withNumber({ verified: true, maxCallsPerDay: 9, maxAttemptsPerLead: 2 });
+    expect((await call({ enabled: true, maxCallsPerHour: 3 })).questionDeckPayload![0].question).toContain('3 leads per hour, 9 per day, at most 2 call attempts per lead');
+  });
+  it('uses a different digest when a stored cap differs', async () => {
+    const digestOf = async () => String((await call()).questionDeckPayload![0].kind).split(':')[2];
+    const before = await digestOf();
+    org.hotLeadCall = withNumber({ verified: true, maxCallsPerDay: 9 });
+    expect(await digestOf()).not.toBe(before);
+  });
+  it('enables with exactly the approved patch when the same call also changes a cap', async () => {
+    const args = { enabled: true, maxCallsPerHour: 3 };
+    answerCard(recordHalt(await call(args)), 'approve');
+    await expect(call(args)).resolves.toMatchObject({ success: true, enabled: true, maxCallsPerHour: 3 });
+    expect(writes).toHaveLength(1);
+    expect(writes[0].updates.hotLeadCall).toEqual(withNumber({ verified: true, enabled: true, maxCallsPerHour: 3 }));
+  });
+  it('reuses the approval when the same patch comes with its keys in another order', async () => {
+    answerCard(recordHalt(await call({ enabled: true, maxCallsPerHour: 3 })), 'approve');
+    await expect(call({ maxCallsPerHour: 3, enabled: true })).resolves.toMatchObject({ enabled: true });
+    expect(isOn()).toBe(true);
   });
   it('names only the verified members, the ones that can be called', async () => {
     org.hotLeadCall = withNumber({ team: [teamMember('+14155550100'), teamMember('+14155550122', { id: 'mzzzzzz2', name: 'Sam Ortiz', verifiedAt: undefined })] });

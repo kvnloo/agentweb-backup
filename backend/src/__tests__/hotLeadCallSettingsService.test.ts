@@ -333,6 +333,11 @@ describe('applyHotLeadCallSettings: beforeTurningOn', () => {
     expect(hook.mock.calls[0][0]).toMatchObject({ enabled: true, twilioNumber: '+14155550111' });
     expect(table.writes).toHaveLength(1);
   });
+  it('sees the team as it will be after the edit, with the new names and verification', async () => {
+    const hook = jest.fn();
+    await apply({ enabled: true, team: [{ id: A, name: 'Dana L. Lee', windows: [EVERY_DAY] }] }, hook);
+    expect(hook.mock.calls[0][0].team).toMatchObject([{ id: A, name: 'Dana L. Lee', phone: PHONE_A, verifiedAt: expect.any(String) }]);
+  });
   it('stops the write when it throws', async () => {
     const hook = jest.fn().mockRejectedValue(new Error('halt'));
     await expect(apply({ enabled: true }, hook)).rejects.toThrow('halt');

@@ -16,8 +16,8 @@ import { provisionNumber, releaseNumber, monthlyRentText } from '../services/voi
  * A1 of services/crmSequenceActivationGate.ts (`=== true`: only an explicit unattended turn is refused).
  * Provision and release additionally need a human approval: the first call halts with a one-question card
  * and the purchase or release happens only on a later call, after the person in the chat clicked approve on
- * that card (services/voice/hotLeadCallApprovalGate.ts, emma/hotLeadCallApproval.ts). `confirm` on provision is ignored. The per-org
- * purchase/release caps in numberProvisioning.ts remain as a second, independent limit.
+ * that card (services/voice/hotLeadCallApprovalGate.ts, emma/hotLeadCallApproval.ts). `confirm` on provision
+ * is ignored. The per-org purchase/release caps in numberProvisioning.ts remain as a second, independent limit.
  */
 
 const UNATTENDED_MESSAGE = 'This needs a person to confirm in an interactive chat';
@@ -71,7 +71,13 @@ emmaToolRegistry.register({
     await assertHotLeadCallEntitled(org);
     const config = configuredOrThrow(storedConfig(org));
     if (config.twilioNumber || config.twilioNumberSid) throw new Error('This organization already has a caller number. Release it first if you need a different one.');
-    const halt = await requireApproval({ action: 'provision', org, context, priceText: monthlyRentText(), target: typeof areaCode === 'string' ? areaCode : null, areaCode: typeof areaCode === 'string' ? areaCode : undefined });
+    const halt = await requireApproval({
+      org,
+      context,
+      priceText: monthlyRentText(),
+      target: typeof areaCode === 'string' ? areaCode : null,
+      card: { action: 'provision', areaCode: typeof areaCode === 'string' ? areaCode : undefined },
+    });
     if (halt) return halt;
     const result = await provisionNumber({ org, config, userId: userIdOf(context), areaCode });
     return {
@@ -94,7 +100,13 @@ emmaToolRegistry.register({
     const org = await callerOrg(context, 'the hot lead caller number', true);
     const config = configuredOrThrow(storedConfig(org));
     if (!config.twilioNumber && !config.twilioNumberSid) throw new Error('This organization has no caller number to release.');
-    const halt = await requireApproval({ action: 'release', org, context, priceText: monthlyRentText(), target: config.twilioNumberSid ?? config.twilioNumber ?? null, number: config.twilioNumber });
+    const halt = await requireApproval({
+      org,
+      context,
+      priceText: monthlyRentText(),
+      target: config.twilioNumberSid ?? config.twilioNumber ?? null,
+      card: { action: 'release', number: config.twilioNumber },
+    });
     if (halt) return halt;
     return { success: true, ...(await releaseNumber({ org, config })) };
   },
