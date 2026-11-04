@@ -25,6 +25,11 @@ describe('apolloBrokerChain — async polling via shared waitForApolloAsyncResul
     jest.spyOn(crmDb, 'getEnrichmentCacheItem').mockResolvedValue({
       rawData: { status: 'completed', result: { email: 'jane@acme.com', emailStatus: 'verified' } },
     } as any);
+    // the placeholder must exist BEFORE we start waiting, or a callback that lands during the wait finds no row
+    const orderOfCalls = () => ({
+      put: (crmDb.putEnrichmentCacheItem as jest.Mock).mock.invocationCallOrder[0],
+      get: (crmDb.getEnrichmentCacheItem as jest.Mock).mock.invocationCallOrder[0],
+    });
 
     const deps = buildIdentityDeps('user-1');
     const result = await deps.apolloBrokerChain(
@@ -34,6 +39,9 @@ describe('apolloBrokerChain — async polling via shared waitForApolloAsyncResul
 
     expect(result).toEqual({ email: 'jane@acme.com', emailStatus: 'verified' });
     expect(crmDb.getEnrichmentCacheItem).toHaveBeenCalled();
+    const { put, get } = orderOfCalls();
+    expect(put).toBeDefined();
+    expect(put).toBeLessThan(get);
   });
 
   it('returns null when the placeholder row resolves to no_email', async () => {
