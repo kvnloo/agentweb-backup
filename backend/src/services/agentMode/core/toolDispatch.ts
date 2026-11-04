@@ -269,6 +269,7 @@ export const SHARED_SESSION_BLOCKED_ORG_SETTINGS_TOOLS: ReadonlySet<string> = ne
   'start_hot_lead_call_verification',
   'confirm_hot_lead_call_verification',
   'list_smartlead_campaigns',
+  'get_smartlead_campaign_stats',
   'preview_smartlead_push',
   'start_smartlead_push',
   'get_smartlead_push_status',
