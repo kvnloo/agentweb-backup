@@ -204,6 +204,21 @@ describe('ENG-1801 — admin client_id scoping (canonical, all 3 wrapper entry p
     expect(getMetaAccessToken).not.toHaveBeenCalled();
   });
 
+  it('ENG-2786: candidates include a connected Meta ad account that has no stored token', async () => {
+    mockUsers(adminCaller, { ...targetUser, connected_accounts: [{
+      platform: 'meta', account_id: 'act_3000000000000001', account_name: 'Seeded',
+      config: { account_type: 'ad_account' },
+    }] });
+    let caught: any;
+    try {
+      await service.listMetaAdsCampaignsNew('admin-1', undefined, {}, { clientId: 'client@example.com', toolName: 'list_meta_ads_campaigns' });
+    } catch (e) { caught = e; }
+    expect(caught?.toolErrorClass).toBe('invalid_args');
+    expect(caught.candidateAccountIds).toEqual(['act_3000000000000001']);
+    expect(metaService.listCampaigns).not.toHaveBeenCalled();
+    expect(getMetaAccessToken).not.toHaveBeenCalled();
+  });
+
   it('ENG-2786: the model-visible tool error (dispatch formatting) carries the candidate account_ids and an invalid_args verdict', async () => {
     const { listMetaAdsCampaignsTool } = await import('../emma/metaTools');
     const { appendRetryabilityGuidance } = await import('../services/agentMode/core/errorRetryability');

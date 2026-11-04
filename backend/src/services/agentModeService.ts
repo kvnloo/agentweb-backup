@@ -11554,6 +11554,34 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       acc.config?.access_token
     );
 
+    // ENG-1801 fix: a client_id-scoped (cross-tenant, admin) call never
+    // auto-selects an account and never falls back to the shared-token legacy
+    // adAccount field. ENG-2786: this is a usage error, not a credential
+    // failure — classify it invalid_args and list the client's candidate
+    // account_ids so the model can retry with one directly. Candidates come from
+    // every Meta ad account the client has connected (not only token-bearing
+    // ones), so a seeded/odd-typed account still surfaces as a choice.
+    if (strict && !accountId) {
+      const candidateIds = Array.from(new Set(
+        (connectedAccounts as any[])
+          .filter((acc: any) =>
+            (acc.platform === 'facebook' || acc.platform === 'meta') &&
+            (!acc.config?.account_type || acc.config.account_type === 'ad_account')
+          )
+          .map((acc: any) => clean(acc.account_id || acc.config?.ad_account_id || acc.accountId || ''))
+          .filter(Boolean)
+          .map((id: string) => `act_${id}`)
+      ));
+      if (candidateIds.length > 0) {
+        const err = this.makeMetaAuthError(
+          `client_id-scoped calls require an explicit account_id — call assess_client_health with client_name_or_email="${clientScope?.clientId}" first; its ad_account_id field is this client's Meta ad account. Candidate account_ids: [${candidateIds.join(', ')}].`
+        ) as any;
+        err.toolErrorClass = 'invalid_args';
+        err.candidateAccountIds = candidateIds;
+        throw err;
+      }
+    }
+
     if (fbAccounts.length === 0) {
       // Fall back to legacy adAccount field + centralized Secrets Manager token.
       // This covers users who had their Meta Marketing connected account removed but still
@@ -11576,22 +11604,13 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       );
     }
 
-    // ENG-1801 fix: a client_id-scoped (cross-tenant, admin) call never
-    // auto-selects an account and never falls back to the shared-token legacy
-    // adAccount field (the fbAccounts.length === 0 branch above already refuses
-    // the legacy fallback when strict). ENG-2786: this is a usage error, not a
-    // credential failure — classify it invalid_args and list the client's own
-    // candidate account_ids so the model can retry with one directly.
+
+    // ENG-1801: a strict call without account_id never auto-selects, even when
+    // no candidate id could be listed above.
     if (strict && !accountId) {
-      const candidates = fbAccounts
-        .map(acc => `act_${clean(acc.account_id || acc.config?.ad_account_id)}`)
-        .join(', ');
-      const err = this.makeMetaAuthError(
-        `client_id-scoped calls require an explicit account_id — call assess_client_health with client_name_or_email="${clientScope?.clientId}" first; its ad_account_id field is this client's Meta ad account. Candidate account_ids: [${candidates}].`
-      ) as any;
-      err.toolErrorClass = 'invalid_args';
-      err.candidateAccountIds = fbAccounts.map(acc => `act_${clean(acc.account_id || acc.config?.ad_account_id)}`);
-      throw err;
+      throw this.makeMetaAuthError(
+        `client_id-scoped calls require an explicit account_id — call assess_client_health with client_name_or_email="${clientScope?.clientId}" first; its ad_account_id field is this client's Meta ad account.`
+      );
     }
 
     // 2. Handle specific account selection if accountId is provided
