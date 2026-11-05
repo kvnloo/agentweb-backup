@@ -504,6 +504,34 @@ describe("claude adapter: a turn", () => {
     expect(isGone(pid)).toBe(true);
   });
 
+  it("a turn interrupted before the CLI's final result still reports the tokens of the model calls that ran (summed per message id), before the closing result", async () => {
+    const e = makeEnv();
+    const line = (id: string, input: number, output: number) => ({ type: "assistant", message: { id, content: [{ type: "text", text: "t" }], usage: { input_tokens: input, output_tokens: output, cache_read_input_tokens: 2 } } });
+    // msg_a is printed twice (one line per content block, repeating its counts): counted once; msg_b once
+    e.scenario({ turn: [line("msg_a", 10, 1), line("msg_a", 10, 7), line("msg_b", 20, 3), { hang: true }] });
+    const session = await makeAdapter(e.unitTmp).openSession(e.ctx, { connectionId: "conn1", epoch: 1 });
+    const done = collect(session);
+    await until(() => existsSync(join(e.ctx.homeDir, ".fake-last-turn-input.json")));
+    await new Promise((r) => setTimeout(r, 600)); // let the stream lines arrive
+    await session.interrupt("t1");
+    const events = await done;
+    await session.closed;
+    const usage = events.filter((x) => x.type === "usage");
+    expect(usage).toEqual([{ type: "usage", inputTokens: 30, outputTokens: 10, cacheReadTokens: 4 }]); // last counts per message id, added up
+    const types = events.map((x) => x.type);
+    expect(types.indexOf("usage")).toBeLessThan(types.indexOf("result")); // usage comes before the (failed) result, as for a normal turn
+    expect(events.filter((x) => x.type === "result").every((x) => (x as { ok: boolean }).ok === false)).toBe(true); // never a success the CLI did not report
+  });
+
+  it("a turn that finishes normally reports the CLI's own final counts only (the stream sums are not used)", async () => {
+    const e = makeEnv();
+    e.scenario({ turn: [{ type: "assistant", message: { id: "msg_a", content: [{ type: "text", text: "t" }], usage: { input_tokens: 999, output_tokens: 999 } } }, { type: "result", subtype: "success", is_error: false, result: "done", usage: { input_tokens: 7, output_tokens: 2 } }] });
+    const session = await makeAdapter(e.unitTmp).openSession(e.ctx, { connectionId: "conn1", epoch: 1 });
+    const events = await collect(session);
+    expect(events.filter((x) => x.type === "usage")).toEqual([{ type: "usage", inputTokens: 7, outputTokens: 2 }]);
+    await session.closed;
+  });
+
   it("close() before the turn starts means no process is ever started; close() is idempotent", async () => {
     const e = makeEnv();
     const session = await makeAdapter(e.unitTmp).openSession(e.ctx, { connectionId: "conn1", epoch: 1 });

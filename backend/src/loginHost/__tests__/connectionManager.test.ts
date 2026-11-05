@@ -364,6 +364,29 @@ describe("ConnectionManager", () => {
       expect(out[out.length - 1]).toMatchObject({ ok: false, aborted: "revoked" });
     });
 
+    it("after an abort only the token usage still comes through (the interrupted CLI's last count), then the aborted result; text, tool calls and a late result do not", async () => {
+      let release!: () => void;
+      rig.script.ignoreInterrupt = true;
+      rig.script.turnEvents = [
+        { wait: new Promise<void>((r) => (release = r)) },
+        { type: "text", delta: "LATE-TEXT" },
+        { type: "usage", inputTokens: 11, outputTokens: 5 },
+        { type: "tool-use", operationId: "late-op", name: "late_tool", input: {} },
+        { type: "result", ok: true, text: "LATE-RESULT" },
+      ];
+      const started = await rig.mgr.runTurn(turnReq("conn1", 1, { turnId: "tU" }));
+      const pending = drain(started.events!);
+      await flushTurns();
+      await rig.mgr.revoke({ connectionId: "conn1", epoch: 2 });
+      release();
+      const out = await pending;
+      expect(out.filter((e: any) => e.type === "usage")).toEqual([{ type: "usage", inputTokens: 11, outputTokens: 5 }]);
+      expect(JSON.stringify(out)).not.toContain("LATE-TEXT");
+      expect(JSON.stringify(out)).not.toContain("LATE-RESULT");
+      expect(JSON.stringify(out)).not.toContain("late_tool");
+      expect(out[out.length - 1]).toMatchObject({ ok: false, aborted: "revoked" });
+    });
+
     it("ends a turn at its deadline", async () => {
       rig.script.turnEvents = [{ wait: new Promise<void>(() => undefined) }, { type: "result", ok: true, text: "x" }];
       const started = await rig.mgr.runTurn(turnReq("conn1", 1, { turnId: "tD", deadlineMs: 5_000 }));

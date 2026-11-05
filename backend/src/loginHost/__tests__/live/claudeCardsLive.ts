@@ -134,6 +134,7 @@ let hostText = "";
 let n = 0;
 let history: any[] = [];
 const staged: Array<{ sessionId: string; results: unknown[] }> = [];
+const journal: Array<Record<string, unknown>> = [];
 const recordingRunHostTurn: ClaudeBackendDeps["runHostTurn"] = async (c, req, opts) => {
   const o: HostTurnOutcome = await runHostTurn(c, req, opts);
   hostText = o.kind === "completed" && "text" in o.result ? String((o.result as { text?: string }).text ?? "") : "";
@@ -157,7 +158,7 @@ const backend = new ClaudeCodeBackend({
   isCancelled: () => false,
   persistMessages: async () => undefined,
   markNeedsReconnect: async () => undefined,
-  writeJournal: async () => undefined,
+  writeJournal: async (row) => void journal.push(row as unknown as Record<string, unknown>),
   emptyFallbackText: EMPTY_FINAL_RESPONSE_FALLBACK,
   now: () => Date.now(),
   newRunId: () => `cards-live-${++n}-${Date.now().toString(36)}`,
@@ -247,6 +248,9 @@ async function k1() {
   const last: any = r.responseMessages[r.responseMessages.length - 1];
   check("K1", "the halt message carries the card metadata exactly as Emma's chat does (deck id + items + awaiting flag) and the plan stamp", last?.metadata?.pendingApprovalDeckId === r.pendingApprovalDeck?.deckId && Array.isArray(last?.metadata?.approvalDeckItems) && last?.metadata?.awaitingUserConfirmation === true && last?.metadata?.funding === "subscription", Object.keys(last?.metadata ?? {}));
   check("K1", "nothing is left registered or running", registry.size === 0);
+  const row = journal[journal.length - 1];
+  out("K1.usage", { finalMessageUsage: last?.usage ?? null, journalOutcome: row?.outcome ?? row?.status, journalTokens: row ? { input: row.inputTokens, output: row.outputTokens } : null });
+  check("K1", "the halted turn still records its token usage (on the halt message and in the attempt journal), as every AgentWeb turn does", !!last?.usage && last.usage.total_tokens > 0, { usage: last?.usage ?? null });
 }
 async function k2() {
   const { session, run, ok } = await until("K2", `In the SAME MESSAGE call ${q("live_read")} with q='one', ${q("live_ad_change")} with name='kappa' and ${q("live_ad_change")} with name='lambda'. Then say one short sentence.`, () => exec.calls.some((c) => c.name === "live_read") && names().length >= 1);

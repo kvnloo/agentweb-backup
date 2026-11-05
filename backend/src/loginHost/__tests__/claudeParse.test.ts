@@ -1,4 +1,4 @@
-import { classifyFailureText, normalizeClaudeEvent, parseAuthStatus, parseDoctorHazards, usageFromResult } from "../adapters/claudeParse";
+import { classifyFailureText, messageUsageOf, normalizeClaudeEvent, parseAuthStatus, parseDoctorHazards, usageFromResult } from "../adapters/claudeParse";
 
 const OK_DOCTOR = [
   "Diagnostics",
@@ -105,3 +105,21 @@ describe("usage and failure classification", () => {
     ["", "unknown"],
   ])("%j => %s", (text, cls) => expect(classifyFailureText(text)).toBe(cls));
 });
+
+describe("messageUsageOf (per-message counts for a turn that ends without the CLI's final result)", () => {
+  it("reads the message id and counts of an assistant line", () => {
+    expect(messageUsageOf({ type: "assistant", message: { id: "msg_1", content: [], usage: { input_tokens: 3, output_tokens: 4, cache_read_input_tokens: 5, cache_creation_input_tokens: 6 } } })).toEqual({
+      id: "msg_1",
+      usage: { type: "usage", inputTokens: 3, outputTokens: 4, cacheReadTokens: 5, cacheWriteTokens: 6 },
+    });
+  });
+  it("ignores everything else: other line types, no id, an over-long id, no usage, junk counts", () => {
+    expect(messageUsageOf({ type: "user", message: { id: "m", usage: { input_tokens: 1 } } })).toBeUndefined();
+    expect(messageUsageOf({ type: "assistant", message: { usage: { input_tokens: 1 } } })).toBeUndefined();
+    expect(messageUsageOf({ type: "assistant", message: { id: "x".repeat(5000), usage: { input_tokens: 1 } } })).toBeUndefined();
+    expect(messageUsageOf({ type: "assistant", message: { id: "m" } })).toBeUndefined();
+    expect(messageUsageOf({ type: "assistant", message: { id: "m", usage: { input_tokens: "9", output_tokens: Infinity } } })).toBeUndefined();
+    expect(messageUsageOf({ type: "assistant" })).toBeUndefined();
+  });
+});
+
