@@ -14,14 +14,14 @@ import { getUserFromToken } from '../middleware/auth';
  * Every other case is false, and false means "treat as a visitor", exactly as before: a missing, malformed, expired,
  * revoked or someone else's login never produces an error here and never loosens anything. It can only
  * recognise the owner, never restrict one further.
+ *
+ * Takes the request itself (not just the header) so the verifier sees exactly what it sees on every other route.
  */
-export async function isSessionOwnerAuthorization(
-  authorization: string | undefined,
-  ownerUserId: string,
-): Promise<boolean> {
+export async function isSessionOwnerRequest(req: Pick<Request, 'headers'>, ownerUserId: string): Promise<boolean> {
+  const authorization = req.headers?.authorization;
   if (typeof authorization !== 'string' || !authorization || !ownerUserId) return false;
   try {
-    const { user, decoded } = await getUserFromToken({ headers: { authorization } } as unknown as Request);
+    const { user, decoded } = await getUserFromToken(req as Request);
     if (!user || !decoded) return false;
     if (decoded.delegateAccess || decoded._svc) return false;
     return user.userId === ownerUserId;

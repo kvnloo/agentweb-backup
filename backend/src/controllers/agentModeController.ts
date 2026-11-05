@@ -9,7 +9,7 @@ import {
 import { isEvaluationUser, EvaluationDenied } from '../services/evaluationPolicy';
 import { Request, Response } from 'express';
 import { AuthenticatedRequest, getUserFromToken, isRealAdmin } from '../middleware/auth';
-import { isSessionOwnerAuthorization } from '../services/shareViewerIdentity';
+import { isSessionOwnerRequest } from '../services/shareViewerIdentity';
 import { agentModeService, AgentModeService, normalizeWorkPlanTitleForMatch, ADMIN_SKILL_TOOL_NAMES, ADMIN_SKILL_VIRTUAL_ID } from '../services/agentModeService';
 import { filterMessagesForClient as filterMessagesForClientPure } from '../utils/adminOnlyMessageFilter';
 import {
@@ -13024,12 +13024,6 @@ export const agentModeController = {
         return res.status(401).json({ error: 'Invalid or expired conversable token' });
       }
 
-      // ENG-2816: the link runs under the owner's userId, so a logged-in owner opening their own link used to
-      // count as a visitor. When the portal sends their login and it is the owner's own, this turn is an owner
-      // turn: the same tools and no anonymous-sender stamp as in their normal view. Anyone else (no login, a
-      // colleague, a delegate or service token, a bad token) stays a visitor, as before.
-      const viewerIsOwner = await isSessionOwnerAuthorization(req.headers?.authorization, session.userId);
-
       // Reject concurrent requests for the same session. Atomic check-and-set
       // (see tryClaimSessionGeneration) — two near-simultaneous requests can
       // never both proceed; exactly one wins, the other gets 409 SESSION_BUSY.
@@ -13249,6 +13243,17 @@ export const agentModeController = {
           // The visitor selects nothing: the stored model keeps its source; a default standing in is AgentWeb's.
           modelSourceAfter(session, selectedModel, null),
         );
+      }
+
+      // ENG-2816: the link runs under the owner's userId, so a logged-in owner opening their own link used to
+      // count as a visitor. When the portal sends their login and it is the owner's own, this turn is an owner
+      // turn: the same tools and no anonymous-sender stamp as in their normal view. Anyone else (no login, a
+      // colleague, a delegate or service token, a bad token) stays a visitor, as before. Decided last, after every
+      // link, lock, usage and model check, so it can never stand in for any of them.
+      const viewerIsOwner = await isSessionOwnerRequest(req, session.userId);
+      if (viewerIsOwner) {
+        // Telemetry then reads `regular` rather than `interactive_share`, so leave a trace of this decision (no token).
+        console.log(`[ENG-2816] share link ${session.sessionId}: the viewer is the session owner; running an owner turn`);
       }
 
       // Use the same generateSessionResponse logic as the regular generateResponse,
