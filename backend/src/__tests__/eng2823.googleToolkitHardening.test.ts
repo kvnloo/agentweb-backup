@@ -73,6 +73,12 @@ describe('ENG-2823 hardening: ambiguous dispatch failures are never reported as 
     expect(r).toMatchObject({ verification: 'UNCONFIRMED', id: BUDGET, amount_micros: 200_000_000 });
   });
 
+  it.each([[undefined], [{}], [{ message: 'ok?' }]])('a dispatch result with no success verdict (%p) is UNCONFIRMED, not FAILED', async (shape) => {
+    const d = deps({ dispatch: jest.fn().mockResolvedValue(shape) });
+    const r = await previewThenConfirm(d, budgetCreate);
+    expect(r).toMatchObject({ success: false, verification: 'UNCONFIRMED' });
+  });
+
   it('a definite Google rejection (4xx) is still FAILED with no verification (nothing applied)', async () => {
     const d = deps({ dispatch: jest.fn().mockResolvedValue({ success: false, error: 'RANGE_ERROR: too low', code: 400 }) });
     const r = await previewThenConfirm(d, budgetCreate);
@@ -125,6 +131,13 @@ describe('ENG-2823 hardening: money inputs', () => {
 
 describe('ENG-2823 hardening: spend ceiling on enable', () => {
   const ceiling = (raw: string) => () => googleSpendCeilingPolicyFromEnv(raw);
+
+  it.each(['[]', '[1]', '"100"', 'null', '7'])('a malformed ceiling (%s) refuses budget writes and enabling (fail closed)', async (raw) => {
+    const d = deps({ spendCeilingPolicy: ceiling(raw) });
+    await expect(executeGoogleToolkitWrite('u1', budgetUpdate, 'USD', d)).rejects.toThrow(/could not be evaluated/);
+    await expect(executeGoogleToolkitWrite('u1', enable, 'USD', d)).rejects.toThrow(/could not be evaluated/);
+    expect(d.dispatch).not.toHaveBeenCalled();
+  });
 
   it('enabling a campaign whose budget is above maxDailyBudget is refused, nothing sent', async () => {
     const d = deps({ spendCeilingPolicy: ceiling('{"maxDailyBudget":100000000}') }); // budget is 200 USD/day
