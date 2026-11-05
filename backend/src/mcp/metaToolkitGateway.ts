@@ -20,7 +20,8 @@ import {
 } from '../services/connectedAccountsDb';
 import { isMetaAdAccount } from '../services/metaTokenRefresh';
 import { recordMcpToolUse, recordMcpWriteExecuted, type McpAuthMethod } from '../services/mcpUsageEventsService';
-import { executeMetaToolkitCall, getMetaToolkitManifest, MetaToolkitRefusal } from './metaToolkitManifest';
+import { executeMetaToolkitCall, MetaToolkitRefusal } from './metaToolkitManifest';
+import { zomaProviderRegistry } from './zomaProviderRegistry';
 import { RateLimiter } from '../middleware/rateLimiter';
 import { isZomaTool } from './zomaToolDefinitions';
 import { executeMetaToolkitWrite, isGuardedWriteRequest } from './metaToolkitWrites';
@@ -177,7 +178,7 @@ export async function resolveMetaToolkitAdAccount(
 // Fail closed: if the manifest cannot be read, let the error propagate so the call is
 // refused (and not metered) rather than executing without the resolved account binding.
 function toolAcceptsAccountId(name: string): boolean {
-  const def = getMetaToolkitManifest().find((d: any) => d.name === name);
+  const def = zomaProviderRegistry.listTools().find((d: any) => d.name === name);
   return !!def?.inputSchema?.properties?.account_id;
 }
 

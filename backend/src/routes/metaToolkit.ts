@@ -15,7 +15,8 @@ import {
   handleMetaToolkitCall,
   MetaToolkitAuthError,
 } from '../mcp/metaToolkitGateway';
-import { getMetaToolkitManifest, MetaToolkitRefusal } from '../mcp/metaToolkitManifest';
+import { MetaToolkitRefusal } from '../mcp/metaToolkitManifest';
+import { zomaProviderRegistry } from '../mcp/zomaProviderRegistry';
 import { rateLimiter } from '../middleware/rateLimiter';
 import { buildMcpAuthChallenge, getBackendUrl, META_TOOLKIT_MCP_RESOURCE_PATH } from '../mcp/oauth/authChallenge';
 
@@ -57,7 +58,7 @@ router.get('/skill.md', (_req: Request, res: Response) => {
 router.get('/tools', async (req: Request, res: Response) => {
   try {
     await authenticateMetaToolkitCaller(req.headers.authorization);
-    return res.json({ tools: getMetaToolkitManifest() });
+    return res.json({ tools: zomaProviderRegistry.listTools() });
   } catch (error) {
     return sendMetaToolkitError(res, error);
   }
@@ -146,7 +147,7 @@ router.post('/mcp', async (req: Request, res: Response) => {
         return rpcResult(res, id, {});
       case 'tools/list':
         await authenticateMetaToolkitCaller(req.headers.authorization);
-        return rpcResult(res, id, { tools: getMetaToolkitManifest() });
+        return rpcResult(res, id, { tools: zomaProviderRegistry.listTools() });
       case 'tools/call': {
         if (typeof params.name !== 'string' || !params.name) {
           return rpcError(res, id, -32602, 'Invalid params: tools/call requires a tool name.');
