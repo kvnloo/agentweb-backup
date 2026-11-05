@@ -7,9 +7,6 @@
  * no oncall email, dedup intact, enrichment + title prefix preserved.
  */
 
-jest.mock('../../services/notionService', () => ({
-  createOncallItem: jest.fn(),
-}));
 jest.mock('../../services/emailService', () => ({
   emailService: {
     sendOncallAlert: jest.fn(),
@@ -22,11 +19,9 @@ jest.mock('../../services/db', () => ({
 }));
 
 import { reportUIError, __clearDedupCacheForTests } from '../../utils/errorReporter';
-import { createOncallItem } from '../../services/notionService';
 import { emailService } from '../../services/emailService';
 const { userDb } = require('../../services/db');
 
-const mockCreateOncallItem = createOncallItem as jest.MockedFunction<typeof createOncallItem>;
 const mockSendOncallAlert = emailService.sendOncallAlert as jest.MockedFunction<typeof emailService.sendOncallAlert>;
 
 function lastLogPayload(spy: jest.SpyInstance): { subject: string; errorMessage: string; context: Record<string, any> } {
@@ -51,11 +46,6 @@ describe('reportUIError', () => {
   });
 
   describe('no external side-effects', () => {
-    it('never calls notionService.createOncallItem', async () => {
-      await reportUIError({ operation: 'op', errorMessage: 'err', userId: 'u' });
-      expect(mockCreateOncallItem).not.toHaveBeenCalled();
-    });
-
     it('never calls emailService.sendOncallAlert', async () => {
       await reportUIError({ operation: 'op', errorMessage: 'err', userId: 'u' });
       expect(mockSendOncallAlert).not.toHaveBeenCalled();

@@ -8466,8 +8466,7 @@ emmaToolRegistry.register({
 
         // Route user-filed intake through the shared intake service: dedup -> stack onto an
         // existing public canonical, else create a new one (Featurebase-imported public post).
-        // The FEATUREBASE_INTAKE flag selects Linear vs Notion (migration switch, not a
-        // fallback). A hard failure here propagates to this loop's per-issue catch below,
+        // A hard failure here propagates to this loop's per-issue catch below,
         // which records the issue as failed — we do NOT silently reroute to another tracker.
         const itemType: 'feature_request' | 'bug' = issue.type === 'feature_request' ? 'feature_request' : 'bug';
         const { fileUserIssue } = await import('../services/intakeService');
@@ -8499,7 +8498,7 @@ emmaToolRegistry.register({
             // Linear-side triage enrichment (ENG-187): stage labels + priority/state/assignee defaults.
             funnelStatus: affectedUser ? affectedUser.funnelStatus : user.funnelStatus,
             // External MCP clients (Claude Code etc.) are tagged distinctly so benchmark
-            // filters on Customer Reported stay clean (used on the flag-off Notion path).
+            // filters on Customer Reported stay clean.
             notionTags: [
               context?.externalMcp === true ? 'MCP Reported' : 'Customer Reported',
               ...issueFunnelStatusTags,
