@@ -26,8 +26,8 @@ on a share link: the server refuses those on every share route, and such a viewe
 session): no share block list, admin tools for an admin owner, no anonymous-sender stamp, owner step-model handling,
 `regular` session type. Delegated (admin-support) access is NOT granted by this.
 
-**What did not change.** Nothing else: no header, no behaviour change (the portal does not send the header yet, so
-this is inert until the portal PR lands). The link token, expiry, `isActive`, usage gate, session lock and model
+**What did not change.** Nothing else: with no Authorization header the route behaves exactly as before (the portal
+PR is what starts sending it, so this change alone is inert). The link token, expiry, `isActive`, usage gate, session lock and model
 policy checks all run before and independently of this. A login never replaces the link check (a wrong share token
 is still a 401), and a bad login never produces an error (it falls back to a visitor turn). No table, index, IAM,
 or environment change. CORS already allows the `Authorization` header.
