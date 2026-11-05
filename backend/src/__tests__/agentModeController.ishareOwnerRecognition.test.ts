@@ -144,6 +144,37 @@ describe('generateSharedResponse: the link owner, logged in, is not a visitor (E
     expect(userMessageMetadata()).not.toHaveProperty('ishareSender');
   });
 
+  it('recognising the owner does not also grant delegated (admin-support) access', async () => {
+    // A bug that fed "is the owner" into the delegated-access argument would hand every owner admin tools on their own link.
+    mockGetUserFromToken.mockResolvedValue({ user: { userId: OWNER_ID }, decoded: { userId: OWNER_ID } });
+    await agentModeController.generateSharedResponse(shareRequest({ authorization: 'Bearer owner.jwt' }), fakeRes());
+    expect(workerShareFlag()).toBe(false);
+    expect((mockWorkerService.runInWorker.mock.calls[0][0] as any).isDelegatedAccess).toBeFalsy();
+  });
+
+  it('leaves a trace when it runs an owner turn (telemetry then says regular, not interactive_share), and none for a visitor', async () => {
+    const log = jest.spyOn(console, 'log');
+    try {
+      mockGetUserFromToken.mockResolvedValue({ user: { userId: OWNER_ID }, decoded: { userId: OWNER_ID } });
+      await agentModeController.generateSharedResponse(shareRequest({ authorization: 'Bearer owner.jwt' }), fakeRes());
+      const traces = () => log.mock.calls.map(c => String(c[0])).filter(m => m.includes('[ENG-2816]'));
+      expect(traces()).toHaveLength(1);
+      expect(traces()[0]).toContain(SESSION_ID);
+      expect(traces()[0]).not.toContain('owner.jwt');
+
+      log.mockClear();
+      mockWorkerService.runInWorker.mockClear();
+      (mockChatbotDb.getChatSession as jest.Mock).mockReset()
+        .mockResolvedValueOnce(baseSession)
+        .mockResolvedValue({ ...baseSession, messages: [{ role: 'user', content: 'hi', metadata: { timestamp: new Date().toISOString() } }] });
+      mockGetUserFromToken.mockResolvedValue({ user: null });
+      await agentModeController.generateSharedResponse(shareRequest({ authorization: 'Bearer stale.jwt' }), fakeRes());
+      expect(traces()).toHaveLength(0);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
   it("a logged-in colleague (someone else's login) stays a visitor", async () => {
     mockGetUserFromToken.mockResolvedValue({ user: { userId: 'colleague-id' }, decoded: { userId: 'colleague-id' } });
     await agentModeController.generateSharedResponse(shareRequest({ authorization: 'Bearer colleague.jwt' }), fakeRes());
