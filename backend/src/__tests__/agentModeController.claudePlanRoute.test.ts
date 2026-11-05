@@ -476,6 +476,15 @@ describe('/generate on the Claude plan route', () => {
         expect(submitDeck).not.toHaveBeenCalled();
       });
 
+      it('a stored outcome is handed back at most 20,000 characters long', async () => {
+        const directive = `[Approval deck outcome: ${'x'.repeat(30_000)}]`;
+        const stopped = { role: 'assistant', content: 'stopped', metadata: { kind: 'claude-plan-stop', isErrorMessage: true, resumable: true } };
+        db.getChatSession.mockResolvedValue({ ...SESSION, messages: [{ role: 'user', content: 'Approved', metadata: { deckOutcomeDirective: directive } }, stopped] } as any);
+        backend.mockResolvedValueOnce(planResult());
+        await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription', userMessage: 'Approved', continueSavedMessage: true }), makeRes());
+        expect(backend.mock.calls[0][0].messageContent).toBe(`Approved\n\n${directive.slice(0, 20_000)}`);
+      });
+
       it('a continue of an ordinary message (no outcome kept) is unchanged', async () => {
         const stopped = { role: 'assistant', content: 'stopped', metadata: { kind: 'claude-plan-stop', isErrorMessage: true, resumable: true } };
         db.getChatSession.mockResolvedValue({ ...SESSION, messages: [{ role: 'user', content: 'Hello' }, stopped] } as any);

@@ -177,6 +177,7 @@ import { meterUserUsage } from './usageRecorderService';
 import { meterUsageFromResponse } from '../utils/llmClients';
 import { pickTransport } from './funding/transport';
 import type { PlanDeckStage } from './funding/planApprovalDeck';
+import { safeText } from './funding/logSafe';
 import { currentRunFunding } from './funding/runFunding';
 import { recordLlmUsage, customerUpstreamCost, openRouterByokCostUsd } from './funding/recordLlmUsage';
 import { resolveCallFunding, customerKeyBlocksTurn } from './funding/callFunding';
@@ -14379,7 +14380,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       // Should be unreachable (every item built above is well-formed), but a
       // malformed deck must fall back to the old per-item prompt, never throw and
       // silently drop the halt.
-      console.error('AgentMode: buildMetaWriteApprovalDeckFromHalts failed, falling back to plain prompt:', err);
+      // safeText: the error text can carry tool-supplied values (on the plan route, chosen by the worker); one bounded line, no control characters.
+      console.error('AgentMode: buildMetaWriteApprovalDeckFromHalts failed, falling back to plain prompt:', safeText(err));
       return null;
     }
   }
@@ -14605,7 +14607,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       // Same fallback contract as the write-deck builder above — a malformed
       // deck (e.g. a bad recommended-option count) falls back to the old
       // plain-text prompt rather than throwing and dropping the halt.
-      console.error('AgentMode: buildQuestionApprovalDeckFromHalts failed, falling back to plain prompt:', err);
+      console.error('AgentMode: buildQuestionApprovalDeckFromHalts failed, falling back to plain prompt:', safeText(err));
       return null;
     }
   }
