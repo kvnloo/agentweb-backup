@@ -8,6 +8,7 @@ jest.mock('../utils/llmService', () => ({
 jest.mock('../services/modelRoles', () => ({ resolveModelForUser: jest.fn() }));
 jest.mock('../services/db', () => ({ crmDb: {} }));
 jest.mock('../services/enrichmentPrompts', () => ({
+  ...jest.requireActual('../services/enrichmentPrompts'),
   buildSmartFieldClassificationSystemPrompt: jest.fn().mockReturnValue('sys'),
   buildSmartFieldClassificationUserPrompt: jest.fn().mockReturnValue('usr'),
 }));

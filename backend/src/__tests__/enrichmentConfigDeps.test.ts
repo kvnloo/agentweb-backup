@@ -20,6 +20,7 @@ jest.mock('../utils/llmService', () => ({
 // enrichmentGroups is imported lazily too — use the real module (it's pure data).
 // enrichmentPrompts is lazy-imported inside llmClassifySmartFields.
 jest.mock('../services/enrichmentPrompts', () => ({
+  ...jest.requireActual('../services/enrichmentPrompts'),
   buildSmartFieldClassificationSystemPrompt: jest.fn().mockReturnValue('sys'),
   buildSmartFieldClassificationUserPrompt: jest.fn().mockReturnValue('usr'),
 }));
