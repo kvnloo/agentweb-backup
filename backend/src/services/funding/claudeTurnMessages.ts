@@ -36,6 +36,8 @@ export interface MapLedgerInput {
   stamps?: Record<string, unknown>;
   usage?: ClaudeTurnUsage;
   now?: () => string;
+  /** Extra metadata on the last assistant message (the approval deck's id and items: the portal renders the card from them). */
+  finalMetadata?: Record<string, unknown>;
 }
 
 /** A ledger entry shaped like the ones Emma keeps in `metadata.toolCalls`. */
@@ -142,6 +144,7 @@ export function mapLedgerToResponseMessages(input: MapLedgerInput): MappedTurn {
       timestamp: now(),
       funding: "subscription",
       ...(toolCalls.length > 0 ? { toolCalls } : {}),
+      ...(input.finalMetadata ?? {}),
     },
   });
 

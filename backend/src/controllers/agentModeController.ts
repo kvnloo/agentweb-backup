@@ -9915,6 +9915,9 @@ async function runSessionTurn(
       // ENG-1635/1644: same rationale, for the cancel path — see
       // approvalDeckCancelledMeta's own comment above.
       ...(approvalDeckCancelledMeta ? { approvalDeckCancelled: approvalDeckCancelledMeta } : {}),
+      // ENG-2113: on the plan route the answer's writes have already run when this turn starts, and the turn itself can still fail (the connection
+      // dropped, a plan limit). A "continue" answers this saved message again, so the model-visible outcome is kept with it and handed over again.
+      ...(planRoute && answerAck ? { deckOutcomeDirective: answerAck } : {}),
       // ENG-1239: marks server-authored turns (e.g. the media auto-continuation
       // directive) so the frontend can hide them instead of rendering them as a
       // customer-typed chat bubble.
@@ -10088,6 +10091,8 @@ async function runSessionTurn(
       found = { ok: false };
     }
     if (!found.ok || found.content !== userMessage) throw new ResumeNotAvailableError();
+    // ENG-2113: a continue of an approval-deck answer: the writes ran in the first request, so the model must hear the outcome again (never run them again).
+    if (found.deckOutcomeDirective) messageContent += `\n\n${found.deckOutcomeDirective.slice(0, 20_000)}`;
     // The marker goes in BEFORE anything runs: it ends the chat's "continuable" state, so a continue whose own verdict is never saved cannot be continued again,
     // and a second continue that raced this one finds the marker last. Without it the continue does not start.
     try {
@@ -11223,6 +11228,17 @@ export const agentModeController = {
       // after the deck / work-plan request below is consumed would lose the outcome), but only up
       // to the hard ceiling (limit x2). Its slot is taken HERE, before anything is consumed, so a
       // 429 at the ceiling leaves the pending deck / request intact for a retry.
+      // ENG-2113: an answer on the plan route runs its writes in THIS request and then continues on the user's plan. If the plan connection is down right now,
+      // the answer is refused with the deck still waiting (typed stop, nothing consumed), the same way a funding stop refuses it above.
+      if (planRoute && (deckAnswer || deckCancel)) {
+        try {
+          const { claudeCodeBackend } = await import('../services/funding/claudeCodeBackendInstance');
+          claudeCodeBackend.assertCanStartTurn();
+        } catch (preflightError) {
+          const preflightStop = preflightError instanceof ClaudeRouteStopError ? preflightError : new ClaudeRouteStopError('host_unavailable');
+          return res.status(preflightStop.httpStatus).json(sendRefusalBody(planStopResponse(preflightStop, false, false), false));
+        }
+      }
       if (deckAnswer || deckCancel || workPlanInputAnswer) {
         const reserved = await acquireInteractiveGenerationSlot(session.userId, sessionId, { continuesPausedTurn: true });
         if (!reserved.ok) {

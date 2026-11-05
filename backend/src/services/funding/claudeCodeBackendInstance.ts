@@ -32,6 +32,10 @@ export const claudeCodeBackend = new ClaudeCodeBackend({
     allowLegacyBridge: () => legacyBridgeAllowed(),
     invalidateProtocol: () => getLoginHostProvider().invalidateProtocol(),
   },
+  // Approval cards (ENG-2113): a message's confirmation requests become ONE deck, as in Emma's loop, so the post-halt calls of that SAME model message
+  // (announced by the stream before the halt) are admitted and their previews join the deck. Everything else after a halt is still refused.
+  relayAdmitPostHaltSiblings: true,
+  stageApprovalDeck: (sessionId, haltResults) => agentModeService.stageApprovalDeckForPlanTurn(sessionId, haltResults as any[]),
   executor: emmaToolBridgeExecutor,
   registry: claudeRunRegistry,
   isCancelled,

@@ -165,6 +165,8 @@ export interface ChatMessage {
     pendingApprovalDeckId?: string;
     approvalDeckItems?: ApprovalDeckItem[];
     approvalDeckAnswer?: { deckId: string; answers: ApprovalDeckAnswer[] };
+    /** ENG-2113: on a Claude-plan reply to a deck answer, the model-visible outcome of the writes the answer ran, kept so "continue" can hand it to the model again. */
+    deckOutcomeDirective?: string;
     mediaBudgetDeferred?: boolean;      // ENG-1239: set on the tool-role deferral marker AND on the whole-turn-timeout partial-delivery message that reports it, so an unresolved media-batch pause is detectable from the tail of session history alone
   };
 }

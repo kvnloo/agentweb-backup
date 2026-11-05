@@ -12,9 +12,10 @@
  *   7. map: completed -> Emma's message shape; cancelled -> persist the settled tool work, return `cancelled`; unknown outcome -> persist the tool
  *      work and tell the user plainly; a failed result -> typed stop (a dead login also flags the connection for reconnect)
  *
- * Scope of this PR (plain chat): a tool that asks for confirmation ends the turn with a plain "confirm" note (no approval deck, so a Meta write
- * cannot be confirmed yet), nothing is persisted mid-turn (a crash loses the turn's tool messages), no citations, no work-plan retry, no
- * auto-continuations. Those are the next PRs. NEVER falls back to AgentWeb's models: every failure is a typed stop.
+ * Scope of this PR (plain chat): a tool that asks for confirmation ends the turn with the same approval deck Emma's own chat builds (ENG-2113 approval
+ * cards: the turn's halts become one deck at the end of the turn, see `stageApprovalDeck`), nothing else is persisted mid-turn (a crash loses the turn's
+ * tool messages), no citations, no work-plan retry, no auto-continuations. Those are the next PRs. NEVER falls back to AgentWeb's models: every failure is
+ * a typed stop.
  */
 import { randomUUID } from "crypto";
 import type { ProviderEvent } from "../../loginHost/adapter";
@@ -33,6 +34,8 @@ import type { ClaudeRunRegistry } from "./claudeRunRegistry";
 import { ClaudeRunConflictError } from "./claudeRunRegistry";
 import { PromptTooLargeError, appendDirective, renderPromptForCli } from "./claudePromptRenderer";
 import { mapLedgerToResponseMessages, type ClaudeTurnUsage } from "./claudeTurnMessages";
+import { deckMessageMetadata, type PlanDeckStage } from "./planApprovalDeck";
+import type { PendingApprovalDeck } from "../agentMode/core/approvalDeck";
 import { ClaudeRouteStopError, fromHostFailure, fromResultErrorKind, markTurnToolsRan, turnRanNoTools } from "./claudeRouteErrors";
 import type { AttemptUsage } from "./attemptUsageJournal";
 import type { RunFunding } from "./runFunding";
@@ -66,6 +69,8 @@ export interface ClaudeTurnResult {
   responseMessages: any[];
   persistedResponseCount: number;
   cancelled?: boolean;
+  /** The approval deck this turn's confirmation requests became (already written to the session). The controller returns it to the browser as it does for Emma's loop. */
+  pendingApprovalDeck?: PendingApprovalDeck;
 }
 
 export interface ClaudeBackendDeps {
@@ -120,6 +125,11 @@ export interface ClaudeBackendDeps {
   };
   /** Batched confirmations after a halt (see RelayDispatcherOptions.admitPostHaltSiblings). Default false: the first confirmation ends the turn's tool work. */
   relayAdmitPostHaltSiblings?: boolean;
+  /**
+   * Turns the minimal results of the tools that asked for confirmation in one turn into the session's approval deck (Emma's iteration-end seam, shared code).
+   * Absent = no approval cards: the turn ends with CONFIRMATION_NOTE, as before cards existed (tests, tools).
+   */
+  stageApprovalDeck?(sessionId: string, haltResults: unknown[]): Promise<PlanDeckStage>;
   /** Consecutive turns that must report a dead login before the connection record is marked (default 2; see reconnectGuard.ts). */
   reconnectSignalsRequired?: number;
   /**
@@ -248,7 +258,7 @@ export const LATE_RESULT_NOTE = "The action above finished after this turn was s
 export const PREVIOUS_UNKNOWN_DIRECTIVE =
   "An action in the previous turn may have run without its result reaching you. Before repeating any action that changes something, check its current state with a read-only tool, or ask the user.";
 export const CONFIRMATION_NOTE =
-  "That action needs your confirmation before I can go on. Approval cards are not available on your Claude plan yet, so I have stopped here without doing it.";
+  "That action needs your confirmation before I can go on, but I could not show you the approval card this time, so I have stopped here without doing it. Please ask me again.";
 
 export class ClaudeCodeBackend {
   constructor(private readonly deps: ClaudeBackendDeps) {
@@ -288,6 +298,17 @@ export class ClaudeCodeBackend {
       markTurnToolsRan(stop, !turnRanNoTools(err)); // the raw error carries what the run knew; an unmarked one stays "may have run"
       throw stop;
     }
+  }
+
+  /**
+   * Whether a turn could start right now, by the same checks `run` makes before it opens anything (a host client, a usable tool transport). Throws the typed stop
+   * `run` would. Used before an approval-deck answer is consumed: its writes run in the answer request, so a plan connection that is down must refuse the answer
+   * with the deck still waiting, not after the writes. Local knowledge only (no network call): a worker that dies after this check is covered by the stored
+   * deck outcome a "continue" hands to the model again.
+   */
+  assertCanStartTurn(): void {
+    if (!this.deps.hostClient()) throw noToolsStop("host_unavailable");
+    if (chooseToolTransport(this.deps).kind === "refuse") throw noToolsStop("host_unavailable");
   }
 
   private async runInner(p: ClaudeTurnParams): Promise<ClaudeTurnResult> {
@@ -578,13 +599,29 @@ export class ClaudeCodeBackend {
 
       const halts = d.bridge.takeHalts(p.userId, p.sessionId);
       let finalText = result.text;
-      if (halts.length > 0 || seen.confirmationFallback) finalText = finalText && finalText.trim() ? `${finalText}\n\n${CONFIRMATION_NOTE}` : CONFIRMATION_NOTE;
+      let finalMetadata: Record<string, unknown> | undefined;
+      let pendingApprovalDeck: PendingApprovalDeck | undefined;
+      // Approval cards: what Emma's loop does when a message's tools asked for the user's confirmation. The halts become ONE deck (written to the session with
+      // the loop's own conditional write), and the turn's visible answer is the deck prompt: the model's text after the halt is not shown, as in the loop.
+      // Never throws: a deck that cannot be staged ends the turn with the fixed note below (nothing ran, nothing is approvable).
+      const staged = halts.length > 0 && d.stageApprovalDeck ? await this.stageHalts(p, halts) : undefined;
+      if (staged?.kind === "deck") {
+        finalText = staged.prompt;
+        finalMetadata = deckMessageMetadata(staged.deck);
+        pendingApprovalDeck = staged.deck;
+      } else if (staged?.kind === "text") {
+        finalText = staged.prompt;
+        finalMetadata = { awaitingUserConfirmation: true };
+      } else if (halts.length > 0 || seen.confirmationFallback) {
+        finalText = finalText && finalText.trim() ? `${finalText}\n\n${CONFIRMATION_NOTE}` : CONFIRMATION_NOTE;
+      }
       const mapped = mapLedgerToResponseMessages({
         ledger,
         finalText: finalText && finalText.trim() ? finalText : d.emptyFallbackText,
         llm: p.llmModel,
         stamps: p.stamps,
         usage: seen.usage,
+        ...(finalMetadata ? { finalMetadata } : {}),
       });
       markLedgerTruncated(mapped.responseMessages, ledgerTruncated);
       this.reconnectGuard.reset(connectionId); // a turn worked: "login is dead" signals are not consecutive
@@ -597,6 +634,7 @@ export class ClaudeCodeBackend {
         sources: [],
         responseMessages: mapped.responseMessages,
         persistedResponseCount: 0,
+        ...(pendingApprovalDeck ? { pendingApprovalDeck } : {}),
       };
     } catch (err) {
       // Whether this failed turn may have run a tool, kept for the "continue on AgentWeb credits" offer: only a turn that is KNOWN to have run none is
@@ -641,6 +679,21 @@ export class ClaudeCodeBackend {
           /* already released */
         }
       }
+    }
+  }
+
+  /**
+   * The turn's halts, in the model's call order, become the session's approval deck. The results are the executor's own minimal results (copies taken from
+   * the bridge): nothing the worker sent. A failure (a database error, a bug) is logged and answered `undefined`: the caller ends the turn with the fixed note,
+   * which shows no card and approves nothing. Never throws.
+   */
+  private async stageHalts(p: ClaudeTurnParams, halts: BridgeHalt[]): Promise<PlanDeckStage | undefined> {
+    try {
+      const ordered = [...halts].sort((a, b) => (a.groupIndex ?? Number.MAX_SAFE_INTEGER) - (b.groupIndex ?? Number.MAX_SAFE_INTEGER));
+      return await this.deps.stageApprovalDeck!(p.sessionId, ordered.map((h) => h.result));
+    } catch (err) {
+      console.error("[claude-backend] approval deck could not be staged", { session: p.sessionId, error: safeText(err) });
+      return undefined;
     }
   }
 

@@ -176,6 +176,7 @@ import type { LLMUsageData, LLMUsageContext } from '../utils/llmService';
 import { meterUserUsage } from './usageRecorderService';
 import { meterUsageFromResponse } from '../utils/llmClients';
 import { pickTransport } from './funding/transport';
+import type { PlanDeckStage } from './funding/planApprovalDeck';
 import { currentRunFunding } from './funding/runFunding';
 import { recordLlmUsage, customerUpstreamCost, openRouterByokCostUsd } from './funding/recordLlmUsage';
 import { resolveCallFunding, customerKeyBlocksTurn } from './funding/callFunding';
@@ -1248,6 +1249,16 @@ export function titleFromUserMessage(message: string): string {
   const lastSpace = cut.lastIndexOf(' ');
   return (lastSpace > 24 ? cut.slice(0, lastSpace) : cut).trim();
 }
+
+// ENG-1635/1644 follow-up: cross-TURN retry-backstop TRANSPARENCY for a
+// Meta write that keeps failing the same way — see annotateMetaWriteRetryBackstop
+// (and applyMetaWriteRetryBackstop's own header) for why this
+// never blocks a real attempt, only guarantees the approval card itself
+// carries the failure history once a target has failed this many times
+// in a row. 2 = one automatic retry is trusted with no extra noise on the
+// card (a real chance to self-correct); the card for a 3rd consecutive
+// attempt at the same target gets the warning annotation.
+const META_WRITE_RETRY_BACKSTOP_THRESHOLD = 2;
 
 export class AgentModeService {
   private fileContentCache: Map<string, { file_url: string; file_name: string; file_size: number; timestamp: number }> = new Map();
@@ -3826,15 +3837,6 @@ export class AgentModeService {
       // same resource with varying offset/limit (which evades both signature checks) is seen.
       const pagingCallCounts = new Map<string, number>();
       let pagingSpiralNudged = false;
-      // ENG-1635/1644 follow-up: cross-TURN retry-backstop TRANSPARENCY for a
-      // Meta write that keeps failing the same way — see the annotation logic
-      // below (and applyMetaWriteRetryBackstop's own header) for why this
-      // never blocks a real attempt, only guarantees the approval card itself
-      // carries the failure history once a target has failed this many times
-      // in a row. 2 = one automatic retry is trusted with no extra noise on the
-      // card (a real chance to self-correct); the card for a 3rd consecutive
-      // attempt at the same target gets the warning annotation.
-      const META_WRITE_RETRY_BACKSTOP_THRESHOLD = 2;
 
       // Track max_tokens continuations to prevent infinite continuation loops
       let maxTokensContinuations = 0;
@@ -5092,20 +5094,7 @@ export class AgentModeService {
         // not a silent loop — and if it fails again, the next card carries the
         // same warning, so nothing is ever hidden.
         if (writeHalts.length > 0 && sessionId) {
-          const sessionForBackstop = await chatbotDb.getChatSession(sessionId);
-          const priorFailure = sessionForBackstop?.lastFailedMetaWrite;
-          if (priorFailure && priorFailure.count >= META_WRITE_RETRY_BACKSTOP_THRESHOLD) {
-            for (const h of writeHalts as any[]) {
-              const dispatch = h?.metaWriteDispatch;
-              if (!dispatch || this.computeMetaWriteTargetSignature(dispatch) !== priorFailure.signature) continue;
-              const warning =
-                `⚠️ This exact target has already failed ${priorFailure.count} time(s) in a row with: ` +
-                `"${priorFailure.error}" — review before approving again.\n\n`;
-              if (typeof h.confirmationDetail === 'string') h.confirmationDetail = warning + h.confirmationDetail;
-              if (typeof h.confirmationPrompt === 'string') h.confirmationPrompt = warning + h.confirmationPrompt;
-              if (typeof h.summary === 'string') h.summary = warning + h.summary;
-            }
-          }
+          await this.annotateMetaWriteRetryBackstop(sessionId, writeHalts);
         }
 
         // ENG-1853: the real fix for 1635/1644's gap. A PendingApprovalDeck
@@ -14649,6 +14638,51 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       return this.buildQuestionApprovalDeckFromHalts(questionDeckHalts);
     }
     return null;
+  }
+
+  /**
+   * The retry-backstop transparency step of the iteration-end seam (see META_WRITE_RETRY_BACKSTOP_THRESHOLD): a Meta write that already failed the same way
+   * the threshold number of times in a row gets the failure history written onto its own card text. Never blocks. Shared by the loop and the plan route.
+   */
+  private async annotateMetaWriteRetryBackstop(sessionId: string, writeHalts: any[]): Promise<void> {
+    const sessionForBackstop = await chatbotDb.getChatSession(sessionId);
+    const priorFailure = sessionForBackstop?.lastFailedMetaWrite;
+    if (priorFailure && priorFailure.count >= META_WRITE_RETRY_BACKSTOP_THRESHOLD) {
+      for (const h of writeHalts) {
+        const dispatch = h?.metaWriteDispatch;
+        if (!dispatch || this.computeMetaWriteTargetSignature(dispatch) !== priorFailure.signature) continue;
+        const warning =
+          `⚠️ This exact target has already failed ${priorFailure.count} time(s) in a row with: ` +
+          `"${priorFailure.error}" — review before approving again.\n\n`;
+        if (typeof h.confirmationDetail === 'string') h.confirmationDetail = warning + h.confirmationDetail;
+        if (typeof h.confirmationPrompt === 'string') h.confirmationPrompt = warning + h.confirmationPrompt;
+        if (typeof h.summary === 'string') h.summary = warning + h.summary;
+      }
+    }
+  }
+
+  /**
+   * ENG-2113 approval cards on the Claude plan route: the turn-end twin of the iteration-end seam in the chat loop. `haltResults` are the minimal results of the
+   * tools that asked for the user's confirmation in ONE model message (the bridge's halts), in call order. The steps are the loop's, with the same builders and
+   * the same conditional write: partition, retry-backstop note, build ONE deck (writes win a mixed message; any other halt kind has no deck and falls back to
+   * the plain confirmation prompt), resume a stuck earlier deck before it is overwritten, write with `failIfAwaitingExists`. A lost slot race or a deck that
+   * could not be built falls back to the plain prompt, exactly as in the loop. Throws what the loop would throw (a database failure): the caller decides.
+   * Not used by an unattended run (the plan route is the interactive owner chat only).
+   */
+  async stageApprovalDeckForPlanTurn(sessionId: string, haltResults: any[]): Promise<PlanDeckStage> {
+    const iterationResults = haltResults.map((result) => ({ status: 'success' as const, result }));
+    const { writeHalts, questionDeckHalts, otherHalts } = this.partitionApprovalHalts(iterationResults);
+    if (writeHalts.length > 0) await this.annotateMetaWriteRetryBackstop(sessionId, writeHalts);
+    const approvalDeck = otherHalts.length === 0 ? this.buildApprovalDeckForIteration(writeHalts, questionDeckHalts) : null;
+    if (approvalDeck) {
+      // Same as the loop: this is the last moment an older, answered deck whose workflow run is stuck from a crash can still be resumed from the slot.
+      const sessionForResume = await chatbotDb.getChatSession(sessionId);
+      if (sessionForResume) await this.resumeStuckApprovalDeckWorkflowRun(sessionId, sessionForResume);
+      const posted = await chatbotDb.updateSessionApprovalDeck(sessionId, approvalDeck, { failIfAwaitingExists: true });
+      if (posted) return { kind: 'deck', deck: approvalDeck, prompt: renderApprovalDeckPrompt(approvalDeck) };
+    }
+    const prompt = this.collectConfirmationPrompt(iterationResults);
+    return prompt ? { kind: 'text', prompt } : { kind: 'none' };
   }
 
   /**

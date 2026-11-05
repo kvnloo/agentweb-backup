@@ -27,10 +27,11 @@ export class ResumeNotAvailableError extends Error {
 interface StoredMessage {
   role?: string;
   content?: unknown;
-  metadata?: { kind?: unknown; resumable?: unknown; attachments?: unknown } | null;
+  metadata?: { kind?: unknown; resumable?: unknown; attachments?: unknown; deckOutcomeDirective?: unknown } | null;
 }
 
-export type ResumableMessage = { ok: true; content: string } | { ok: false };
+/** `deckOutcomeDirective`: the model-visible outcome of an approval-deck answer the saved message carried (its writes already ran in that request). */
+export type ResumableMessage = { ok: true; content: string; deckOutcomeDirective?: string } | { ok: false };
 
 /**
  * The saved user message that can be answered again, or `{ ok: false }`. Requires: the chat ends with one or more plan-stop notes that are ALL marked
@@ -62,5 +63,6 @@ export function findResumableUserMessage(messages: readonly StoredMessage[] | un
   // Attachments reach the model only through the message being sent again with its files; a continue sends none, so it would answer without them.
   const attachments = user.metadata?.attachments;
   if (Array.isArray(attachments) ? attachments.length > 0 : attachments !== undefined && attachments !== null) return { ok: false };
-  return { ok: true, content: user.content };
+  const directive = user.metadata?.deckOutcomeDirective;
+  return { ok: true, content: user.content, ...(typeof directive === "string" && directive.length > 0 ? { deckOutcomeDirective: directive } : {}) };
 }
