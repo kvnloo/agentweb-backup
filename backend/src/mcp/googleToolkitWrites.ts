@@ -56,7 +56,7 @@ export function googleSpendCeilingPolicyFromEnv(raw = process.env.GOOGLE_TOOLKIT
   if (!raw) return null;
   try {
     const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === 'object') return { maxDailyBudget: parsed.maxDailyBudget, maxChangeRatio: parsed.maxChangeRatio };
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return { maxDailyBudget: parsed.maxDailyBudget, maxChangeRatio: parsed.maxChangeRatio };
   } catch {
     /* fall through */
   }
@@ -276,11 +276,12 @@ function verify(validated: ValidatedWrite, entity: string, readBack: any | null)
 }
 
 /**
- * True when a failed dispatch may still have been applied: no HTTP status (timeout, network
- * error) or a 5xx. A 4xx, an auth failure, a gate block or a confirmation halt happened
+ * True when a dispatch may have been applied without a definite answer: no success verdict at
+ * all, or a failure with no HTTP status (timeout, network error) or a 5xx. A 4xx, an auth failure, a gate block or a confirmation halt happened
  * before or instead of the mutate, so nothing was applied.
  */
 function outcomeUnknown(result: any): boolean {
+  if (result?.success !== false && result?.success !== undefined && result?.success !== null) return false;
   if (result?.blocked || result?.awaitingUserConfirmation || result?.authError) return false;
   const code = Number(result?.code);
   return !Number.isInteger(code) || code >= 500;
@@ -419,7 +420,7 @@ export async function executeGoogleToolkitWrite(
       message: String(result.error ?? 'Google accepted the change but read-back shows it did not apply.'),
     };
   }
-  if (result?.success === false && outcomeUnknown(result)) {
+  if (result?.success !== true && outcomeUnknown(result)) {
     // The request may have reached Google and been applied (e.g. a timeout after Google
     // committed). "Did not apply" here invites a retry that double-applies a CREATE, so this
     // is UNCONFIRMED, metered as a write, with the current state read back when we can.
@@ -430,7 +431,7 @@ export async function executeGoogleToolkitWrite(
       id: validated.target?.resourceName ?? null,
       status: readBack?.status ?? null,
       ...(readBack?.amountMicros !== undefined ? { amount_micros: readBack.amountMicros, amount: formatMicros(readBack.amountMicros, currency) } : {}),
-      message: `UNCONFIRMED: the ${action} ${entity} request failed without a definite answer from Google Ads (${String(result.error ?? 'unknown error')}), so it may or may not have been applied. `
+      message: `UNCONFIRMED: the ${action} ${entity} request failed without a definite answer from Google Ads (${String(result?.error ?? 'unknown error')}), so it may or may not have been applied. `
         + (action === 'CREATE'
           ? `Do not retry blindly — list the ${entity === 'AD_GROUP' ? 'ad groups' : `${entity.toLowerCase()}s`} first to check whether "${String(args.name)}" was created.`
           : `Do not retry blindly — check the current ${entity} state first${readBack ? ' (read back above)' : ''}.`),
