@@ -489,6 +489,18 @@ describe('/generate on the Claude plan route', () => {
         expect(submitDeck).not.toHaveBeenCalled();
       });
 
+      it('the outcome kept on the saved message is bounded (the user\'s free text in it is not), while the turn that answered sees it whole', async () => {
+        const huge = 'x'.repeat(60_000);
+        db.getChatSession.mockResolvedValue(deckSession() as any);
+        submitDeck.mockResolvedValue({ outcome: 'submitted', run: null, summary: null, answeredDeck: { ...ANSWERED, answers: [{ itemId: 'question-1', verdict: 'a' }] } });
+        backend.mockResolvedValueOnce(planResult());
+        await agentModeController.generateResponse(makeReq({ ...answerBody, deckAnswer: { deckId: 'd1', answers: [{ itemId: 'question-1', verdict: 'comment', freeText: huge }] } }), makeRes());
+        const savedUser = db.addMessageToSession.mock.calls.map((c) => c[1] as any).find((m) => m?.role === 'user');
+        expect(savedUser.metadata.deckOutcomeDirective.length).toBeLessThanOrEqual(20_000);
+        expect(savedUser.metadata.deckOutcomeDirective).toContain('outcome shortened');
+        expect(backend.mock.calls[0][0].messageContent.length).toBeGreaterThan(60_000); // the answering turn is handed the full text
+      });
+
       it('a stored outcome is handed back at most 20,000 characters long', async () => {
         const directive = `[Approval deck outcome: ${'x'.repeat(30_000)}]`;
         const stopped = { role: 'assistant', content: 'stopped', metadata: { kind: 'claude-plan-stop', isErrorMessage: true, resumable: true } };
