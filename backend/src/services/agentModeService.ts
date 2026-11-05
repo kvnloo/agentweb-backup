@@ -11,6 +11,7 @@ import { tierFromCostScore, tierFromQualityScore } from './agentMode/modelClassi
 import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 import { recordCreativeLearningReceipt } from './agentMode/adsLearning';
 import { enforceEvaluationTool, isEvaluationUser, shouldOfferEvaluationWorkspace } from './evaluationPolicy';
+import { restrictionRefusal, ToolRestrictionDenied, type RestrictionProfileId } from './toolRestrictionProfiles';
 import { applyEvaluationWorkspaceListing } from './agentMode/evaluationWorkspaceListing';
 import { sandboxAwarePollDelayMs } from './agentMode/sandboxPolling';
 import { markSandboxRun, forgetSandboxRun, isSandboxRun, releaseSandboxRun } from './agentMode/sandboxTelemetry';
@@ -9805,8 +9806,11 @@ export class AgentModeService {
     // an explicit `false` (attended) must survive distinctly from `undefined`
     // (caller has not resolved a value, fall back to session.sessionType).
     isUnattendedRun?: boolean;
+    // ENG-2816: the restriction the calling principal runs under (a share-link visitor), enforced again in executeTool.
+    restrictionProfile?: RestrictionProfileId;
   }): Promise<any> {
     const toolOptions: Record<string, any> = {};
+    if (input.restrictionProfile) toolOptions.restrictionProfile = input.restrictionProfile;
     if (input.socketEmit) toolOptions.socketEmit = input.socketEmit;
     if (input.screenshotUrl) toolOptions.screenshotUrl = input.screenshotUrl;
     if (input.isDelegatedAccess) toolOptions.isDelegatedAccess = true;
@@ -9976,6 +9980,11 @@ export class AgentModeService {
 
   public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
     await enforceEvaluationTool(userId, toolName, extraContext);
+    // ENG-2816: every path that runs a tool ends here (typed chat, live voice, nested calls), so the restriction a caller runs
+    // under is enforced here and not only in the typed-chat preflight. A share-link visitor acts under the owner's userId, so
+    // nothing downstream can tell them apart from the owner; the context says so, and this is the check that listens.
+    const restricted = restrictionRefusal(extraContext?.restrictionProfile, toolName, ADMIN_SKILL_TOOL_NAMES);
+    if (restricted) throw new ToolRestrictionDenied(restricted);
     const toolDefinition = this.toolRegistry.getTool(toolName)?.definition;
     const inputSchema = toolDefinition?.function?.parameters || toolDefinition?.parameters || toolDefinition?.inputSchema;
     const initialPolicyDecision = evaluateAgentToolPolicy({
