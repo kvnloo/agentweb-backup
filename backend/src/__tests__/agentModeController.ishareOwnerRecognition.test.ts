@@ -161,6 +161,8 @@ describe('generateSharedResponse: the link owner, logged in, is not a visitor (E
       expect(traces()).toHaveLength(1);
       expect(traces()[0]).toContain(SESSION_ID);
       expect(traces()[0]).not.toContain('owner.jwt');
+      expect(traces()[0]).not.toContain(OWNER_ID);
+      expect(traces()[0]).not.toContain('o@x.com');
 
       log.mockClear();
       mockWorkerService.runInWorker.mockClear();
