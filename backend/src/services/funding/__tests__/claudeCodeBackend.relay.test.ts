@@ -10,7 +10,7 @@ import type { ProviderEvent } from '../../../loginHost/adapter';
 import { startHostServer, type HostServerHandle } from '../../../loginHost/server';
 import { makeRig, type Rig } from '../../../loginHost/__tests__/helpers';
 import { ClaudeCodeBackend, MAX_TOKEN_COUNT, chooseToolTransport, clampCount, legacyBridgeAllowed, refusedAsOldWorker, relayAvailable, type ClaudeBackendDeps, type ClaudeTurnParams } from '../claudeCodeBackend';
-import { turnRanNoTools } from '../claudeRouteErrors';
+import { ClaudeRouteStopError, turnRanNoTools } from '../claudeRouteErrors';
 import * as relayManifestModule from '../relayManifest';
 import { ClaudeRunRegistry } from '../claudeRunRegistry';
 import { LoginHostClient, LoginHostError, UnixSocketTransport } from '../loginHostClient';
@@ -125,6 +125,7 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
       newRunId: () => `claude-relay-${++n}`,
       drainTimeoutMs: 600,
       relayAnnounceWaitMs: 20,
+      relayHaltSiblingWaitMs: 20,
       ...(over.admitSiblings === 'default' ? {} : { relayAdmitPostHaltSiblings: over.admitSiblings ?? true }),
       lateWatchPollMs: 15,
       lateWatchMaxMs: 800,
@@ -1124,6 +1125,122 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
         expect(r.cancelled).toBeUndefined();
         expect(Date.now() - t0).toBeLessThan(15_000);
         expect(t.registry.size).toBe(0);
+      });
+
+      it('an announced sibling that arrives later than the announcement wait still runs and is in the deck (the halt waits for it)', async () => {
+        const t = setup({ confirm: ['send_email'], haltResult: mailHalt });
+        t.deps.relayHaltSiblingWaitMs = 3_000;
+        const staged: unknown[][] = [];
+        t.deps.stageApprovalDeck = async (_s, r) => (staged.push(r), { kind: 'deck', deck, prompt: 'P' });
+        const late = gate();
+        rig.script.turnEvents = [use(0, 'send_email', { to: 'p0' }), use(1, 'send_email', { to: 'p1' }), call('op-0', 'send_email', { to: 'p0' }), { wait: late.wait }, call('op-1', 'send_email', { to: 'p1' }), { wait: gate().wait }, result('x')];
+        const run = t.backend().run(t.params());
+        await waitFor(() => answers().length === 1);
+        await sleep(150); // longer than the announcement wait (20 ms)
+        late.open();
+        await run;
+        expect(t.executions.map((e) => e.args.to)).toEqual(['p0', 'p1']);
+        expect(staged[0]).toHaveLength(2);
+      });
+
+      it('a sibling that was announced but never arrives does not hold the deck back for ever: after the sibling wait the deck is built without it', async () => {
+        const t = setup({ confirm: ['send_email'], haltResult: mailHalt });
+        const staged: unknown[][] = [];
+        t.deps.stageApprovalDeck = async (_s, r) => (staged.push(r), { kind: 'deck', deck, prompt: 'P' });
+        rig.script.turnEvents = [use(0, 'send_email', { to: 'p0' }), use(1, 'send_email', { to: 'p1' }), call('op-0', 'send_email', { to: 'p0' }), { wait: gate().wait }, result('x')];
+        const t0 = Date.now();
+        const r = await t.backend().run(t.params());
+        expect(staged[0]).toHaveLength(1);
+        expect(r.pendingApprovalDeck).toBe(deck);
+        expect(Date.now() - t0).toBeLessThan(15_000);
+      });
+
+      it('the turn is NOT interrupted while a sibling call is still executing; once it is answered the deck holds both', async () => {
+        const t = setup({ confirm: ['send_email'], haltResult: mailHalt });
+        const staged: unknown[][] = [];
+        t.deps.stageApprovalDeck = async (_s, r) => (staged.push(r), { kind: 'deck', deck, prompt: 'P' });
+        const hold = gate();
+        const origExec = (t.deps.executor as any).execute;
+        (t.deps.executor as any).execute = async (run: unknown, c: any) => {
+          if (c.name === 'send_email' && c.args.to === 'p1') await hold.wait;
+          return origExec(run, c);
+        };
+        rig.script.turnEvents = [use(0, 'send_email', { to: 'p0' }), use(1, 'send_email', { to: 'p1' }), call('op-0', 'send_email', { to: 'p0' }), call('op-1', 'send_email', { to: 'p1' }), { wait: gate().wait }, result('x')];
+        const run = t.backend().run(t.params());
+        await waitFor(() => t.executions.some((e) => e.args.to === 'p0'));
+        await sleep(300); // well past both waits: p1 is still executing
+        expect(rig.script.interrupts).toBe(0);
+        hold.open();
+        await run;
+        expect(rig.script.interrupts).toBe(1);
+        expect(staged[0]).toHaveLength(2);
+      });
+
+      it('the sibling wait is spent once: when it runs out while another sibling is still executing, the deck is built as soon as that one is answered (no second wait)', async () => {
+        const t = setup({ confirm: ['send_email'], haltResult: mailHalt });
+        t.deps.relayHaltSiblingWaitMs = 400;
+        const staged: unknown[][] = [];
+        t.deps.stageApprovalDeck = async (_s, r) => (staged.push(r), { kind: 'deck', deck, prompt: 'P' });
+        const hold = gate();
+        const origExec = (t.deps.executor as any).execute;
+        (t.deps.executor as any).execute = async (run: unknown, c: any) => {
+          if (c.name === 'send_email' && c.args.to === 'slow') await hold.wait;
+          return origExec(run, c);
+        };
+        // p0 halts and the 400 ms wait starts ('ghost' is announced but never arrives); 'slow' arrives 100 ms later and is still executing when the wait runs out
+        rig.script.turnEvents = [use(0, 'send_email', { to: 'p0' }), use(1, 'send_email', { to: 'ghost' }), use(2, 'send_email', { to: 'slow' }), call('op-0', 'send_email', { to: 'p0' }), { wait: sleep(100) }, call('op-2', 'send_email', { to: 'slow' }), { wait: gate().wait }, result('x')];
+        const run = t.backend().run(t.params());
+        await waitFor(() => t.executions.some((e) => e.args.to === 'p0'));
+        await sleep(700); // the 400 ms wait ran out while 'slow' is still executing
+        expect(rig.script.interrupts).toBe(0);
+        const released = Date.now();
+        hold.open();
+        await run;
+        expect(Date.now() - released).toBeLessThan(300); // not another 400 ms wait
+        expect(staged[0]).toHaveLength(2);
+      });
+
+      it('a Stop that arrives AFTER the halt already fired still ends as a Stop (cancelled, no deck)', async () => {
+        const t = setup({ confirm: ['send_email'], haltResult: mailHalt });
+        let asked = 0;
+        t.deps.stageApprovalDeck = async () => (asked++, { kind: 'deck', deck, prompt: 'P' });
+        const orig = t.deps.runHostTurn;
+        t.deps.runHostTurn = async (...a: Parameters<typeof orig>) => {
+          const o = await orig(...a);
+          t.registry.cancel('s1'); // the user's Stop lands after the halt interrupt, before the result is mapped
+          return o;
+        };
+        rig.script.turnEvents = [use(0, 'send_email', { to: 'p0' }), call('op-0', 'send_email', { to: 'p0' }), { wait: gate().wait }, result('x')];
+        const r = await t.backend().run(t.params());
+        expect(r.cancelled).toBe(true);
+        expect(asked).toBe(0);
+      });
+
+      it('a host turn that already FAILED on its own is not turned into a deck by a halt that settles late (the real failure stands)', async () => {
+        const t = setup({ confirm: ['send_email', 'slow_write'], haltResult: mailHalt });
+        let asked = 0;
+        t.deps.stageApprovalDeck = async () => (asked++, { kind: 'deck', deck, prompt: 'P' });
+        const hold = gate();
+        const origExec = (t.deps.executor as any).execute;
+        (t.deps.executor as any).execute = async (run: unknown, c: any) => {
+          if (c.name === 'slow_write') await hold.wait;
+          return origExec(run, c);
+        };
+        rig.script.turnEvents = [use(0, 'send_email', { to: 'p0' }), use(1, 'slow_write', { n: 1 }), call('op-0', 'send_email', { to: 'p0' }), call('op-1', 'slow_write', { n: 1 }), { wait: sleep(150) }, { type: 'result', ok: false, text: '', errorKind: 'transient' } as any];
+        const run = t.backend().run(t.params()).catch((e) => e);
+        setTimeout(() => hold.open(), 400);
+        const out: any = await run;
+        expect(out).toBeInstanceOf(ClaudeRouteStopError);
+        expect(asked).toBe(0);
+      });
+
+      it('deck order: announced calls by stream position first, then calls the stream never announced in arrival order', async () => {
+        const t = setup({ confirm: ['send_email'], haltResult: mailHalt });
+        const staged: unknown[][] = [];
+        t.deps.stageApprovalDeck = async (_s, r) => (staged.push(r), { kind: 'deck', deck, prompt: 'P' });
+        rig.script.turnEvents = [use(0, 'send_email', { to: 'announced-b' }), use(1, 'send_email', { to: 'announced-a' }), call('op-0', 'send_email', { to: 'announced-a' }), call('op-1', 'send_email', { to: 'announced-b' }), { wait: gate().wait }, result('x')];
+        await t.backend().run(t.params());
+        expect((staged[0] as any[]).map((x) => x.summary)).toEqual(['mail announced-b', 'mail announced-a']);
       });
 
       it('a call of a later model message never runs: the turn was interrupted at the halt', async () => {

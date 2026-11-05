@@ -387,6 +387,39 @@ describe("ConnectionManager", () => {
       expect(out[out.length - 1]).toMatchObject({ ok: false, aborted: "revoked" });
     });
 
+    it("a late alarm after an abort does NOT park the connection (the process is already being closed)", async () => {
+      let release!: () => void;
+      rig.script.ignoreInterrupt = true;
+      rig.script.turnEvents = [{ wait: new Promise<void>((r) => (release = r)) }, { type: "alarm", hazard: { kind: "hook_event" } } as any, { type: "result", ok: true, text: "x" }];
+      const started = await rig.mgr.runTurn(turnReq("conn1", 1, { turnId: "tAl" }));
+      const pending = drain(started.events!);
+      await flushTurns();
+      await rig.mgr.interruptTurn({ connectionId: "conn1", epoch: 1, turnId: "tAl" } as any);
+      release();
+      const out = await pending;
+      expect(out.some((e: any) => e.type === "alarm")).toBe(false);
+      expect(rig.mgr.status({ connectionId: "conn1" })).not.toMatchObject({ state: "needs_attention" });
+    });
+
+    it("after an abort at most ONE usage event is forwarded, rebuilt from validated counts only (no extra fields, no negative or non-finite numbers)", async () => {
+      let release!: () => void;
+      rig.script.ignoreInterrupt = true;
+      rig.script.turnEvents = [
+        { wait: new Promise<void>((r) => (release = r)) },
+        { type: "usage", inputTokens: 7, outputTokens: -5, cacheReadTokens: Infinity, extra: "LEAK-FIELD" } as any,
+        { type: "usage", inputTokens: 999 },
+        { type: "result", ok: true, text: "x" },
+      ];
+      const started = await rig.mgr.runTurn(turnReq("conn1", 1, { turnId: "tU2" }));
+      const pending = drain(started.events!);
+      await flushTurns();
+      await rig.mgr.revoke({ connectionId: "conn1", epoch: 2 });
+      release();
+      const out = await pending;
+      expect(out.filter((e: any) => e.type === "usage")).toEqual([{ type: "usage", inputTokens: 7 }]);
+      expect(JSON.stringify(out)).not.toContain("LEAK-FIELD");
+    });
+
     it("ends a turn at its deadline", async () => {
       rig.script.turnEvents = [{ wait: new Promise<void>(() => undefined) }, { type: "result", ok: true, text: "x" }];
       const started = await rig.mgr.runTurn(turnReq("conn1", 1, { turnId: "tD", deadlineMs: 5_000 }));

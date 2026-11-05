@@ -478,6 +478,17 @@ describe('/generate on the Claude plan route', () => {
         expect(submitDeck).not.toHaveBeenCalled();
       });
 
+      it('a continue after a deck CANCEL whose plan turn stopped hands the model the cancellation again, and runs nothing twice', async () => {
+        const directive = '[Approval deck cancelled by the user — no item in it was approved, rejected, or executed. Do not treat any pending write as granted; ask what they would like to do instead.]';
+        const stopped = { role: 'assistant', content: 'stopped', metadata: { kind: 'claude-plan-stop', isErrorMessage: true, resumable: true } };
+        db.getChatSession.mockResolvedValue({ ...SESSION, messages: [{ role: 'user', content: 'Cancelled the review.', metadata: { deckOutcomeDirective: directive } }, stopped] } as any);
+        backend.mockResolvedValueOnce(planResult());
+        await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription', userMessage: 'Cancelled the review.', continueSavedMessage: true }), makeRes());
+        expect(backend.mock.calls[0][0].messageContent).toBe(`Cancelled the review.\n\n${directive}`);
+        expect(db.updateSessionApprovalDeck).not.toHaveBeenCalled();
+        expect(submitDeck).not.toHaveBeenCalled();
+      });
+
       it('a stored outcome is handed back at most 20,000 characters long', async () => {
         const directive = `[Approval deck outcome: ${'x'.repeat(30_000)}]`;
         const stopped = { role: 'assistant', content: 'stopped', metadata: { kind: 'claude-plan-stop', isErrorMessage: true, resumable: true } };
