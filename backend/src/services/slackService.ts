@@ -863,7 +863,15 @@ export interface LeadNotificationPayload {
   timestamp?: string;
   /** Compact format (ENG-2391): render only name, phone, email; missing values shown as "—". */
   compact?: boolean;
+  /**
+   * A finished plain-language sentence for the header, used instead of the raw event name (a Smartlead reply sets it). It carries a
+   * contact's own words, so the fallback text escapes it for Slack. Absent for every other alert, which keeps its output unchanged.
+   */
+  headline?: string;
 }
+
+/** Slack reads &, < and > in message text as markup (a link, a mention): send them as the entities Slack documents. */
+const escapeSlackText = (value: string): string => String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
 function formatCompactLeadNotificationPayload(lead: LeadNotificationPayload): {
   text: string;
@@ -900,29 +908,45 @@ export function formatLeadNotificationPayload(lead: LeadNotificationPayload): {
   }
   const fullName = [lead.firstName, lead.lastName].filter(Boolean).join(' ') || 'Unknown';
   const timestamp = lead.timestamp || new Date().toISOString();
-  const eventLabel = lead.eventType || 'New lead added';
+  const eventLabel = lead.headline || lead.eventType || 'New lead added';
+
+  // A Smartlead reply alert (headline set) escapes the values it shows, since a contact's details are not ours to trust as Slack markup.
+  // Every other alert keeps its values exactly as they were.
+  const val = (v: string): string => (lead.headline ? escapeSlackText(String(v)) : v);
 
   const fields: Array<{ type: string; text: string }> = [];
 
-  fields.push({ type: 'mrkdwn', text: `*Name:*\n${fullName}` });
+  fields.push({ type: 'mrkdwn', text: `*Name:*\n${val(fullName)}` });
 
   if (lead.email) {
-    fields.push({ type: 'mrkdwn', text: `*Email:*\n${lead.email}` });
+    fields.push({ type: 'mrkdwn', text: `*Email:*\n${val(lead.email)}` });
   }
 
   if (lead.company) {
-    fields.push({ type: 'mrkdwn', text: `*Company:*\n${lead.company}` });
+    fields.push({ type: 'mrkdwn', text: `*Company:*\n${val(lead.company)}` });
   }
 
   if (lead.phone) {
-    fields.push({ type: 'mrkdwn', text: `*Phone:*\n${lead.phone}` });
+    fields.push({ type: 'mrkdwn', text: `*Phone:*\n${val(lead.phone)}` });
   }
 
   if (lead.linkedin) {
-    fields.push({ type: 'mrkdwn', text: `*LinkedIn:*\n<${lead.linkedin}|Profile>` });
+    if (lead.headline) {
+      // A Smartlead reply alert only links an http(s) address, with & < > | and spaces escaped so it stays one link. Anything else (such as
+      // `!channel` or `@U123`, which Slack reads as a broadcast or a mention inside <...>) is shown as plain escaped text, never as a link.
+      const raw = String(lead.linkedin);
+      fields.push({
+        type: 'mrkdwn',
+        text: /^https?:\/\//i.test(raw)
+          ? `*LinkedIn:*\n<${escapeSlackText(raw).replace(/[|\s]/g, (c) => encodeURIComponent(c))}|Profile>`
+          : `*LinkedIn:*\n${escapeSlackText(raw)}`,
+      });
+    } else {
+      fields.push({ type: 'mrkdwn', text: `*LinkedIn:*\n<${lead.linkedin}|Profile>` });
+    }
   }
 
-  fields.push({ type: 'mrkdwn', text: `*List:*\n${lead.listName}` });
+  fields.push({ type: 'mrkdwn', text: `*List:*\n${val(lead.listName)}` });
 
   const blocks: any[] = [
     {
@@ -962,7 +986,9 @@ export function formatLeadNotificationPayload(lead: LeadNotificationPayload): {
     });
   }
 
-  const fallbackText = `${eventLabel}: ${fullName}${lead.email ? ` (${lead.email})` : ''} — ${lead.listName}`;
+  const fallbackText = lead.headline
+    ? `${escapeSlackText(lead.headline)}. List: ${escapeSlackText(lead.listName)}`
+    : `${eventLabel}: ${fullName}${lead.email ? ` (${lead.email})` : ''} — ${lead.listName}`;
 
   return { text: fallbackText, blocks };
 }

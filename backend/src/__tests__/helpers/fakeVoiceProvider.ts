@@ -1,4 +1,4 @@
-import { VoiceCallError, type BuyNumberParams, type PlaceCallParams, type ValidateSignatureParams, type VoiceProvider } from '../../services/voice/voiceProvider';
+import { VoiceCallError, type BuyNumberParams, type FetchedCall, type PlaceCallParams, type ValidateSignatureParams, type VoiceProvider } from '../../services/voice/voiceProvider';
 
 /**
  * Recording VoiceProvider for tests: no network, deterministic sids (CA00000001, ...), and
@@ -11,6 +11,8 @@ export class FakeVoiceProvider implements VoiceProvider {
   readonly boughtNumbers: BuyNumberParams[] = [];
   readonly releasedNumbers: string[] = [];
   readonly signatureChecks: ValidateSignatureParams[] = [];
+  /** Every sid fetchCall was asked about, in order. */
+  readonly fetchedSids: string[] = [];
   /** Result once credentials are ensured; flip to false to simulate a forged request. */
   signatureValid = true;
   ensureCredentialsCalls = 0;
@@ -21,6 +23,8 @@ export class FakeVoiceProvider implements VoiceProvider {
   private ensureCredentialsFailures: VoiceCallError[] = [];
   private buyNumberFailures: VoiceCallError[] = [];
   private releaseNumberFailures: VoiceCallError[] = [];
+  private calls = new Map<string, FetchedCall>();
+  private fetchCallFailures: VoiceCallError[] = [];
   private buyNumberResults: { numberSid: string; phoneNumber: string }[] = [];
 
   /** 'no' = Twilio rejected it; 'unknown' = ambiguous timeout (the fake still records the attempt). */
@@ -40,6 +44,15 @@ export class FakeVoiceProvider implements VoiceProvider {
   /** The next buyNumber returns this instead of a generated number (e.g. one that passes the production validators). */
   queueBuyNumberResult(result: { numberSid: string; phoneNumber: string }): void {
     this.buyNumberResults.push(result);
+  }
+
+  /** What Twilio will say about `callSid`. A sid that was never set is unknown to Twilio (fetchCall answers 404). */
+  setCall(callSid: string, call: FetchedCall): void {
+    this.calls.set(callSid, call);
+  }
+
+  failNextFetchCall(placed: 'no' | 'unknown', message = 'scripted failure', httpStatus?: number): void {
+    this.fetchCallFailures.push(new VoiceCallError(message, placed, httpStatus));
   }
 
   /** The next ensureCredentials rejects like the real provider when the Twilio secret cannot be loaded. */
@@ -68,6 +81,15 @@ export class FakeVoiceProvider implements VoiceProvider {
     const callSid = `CA${String(++this.callSeq).padStart(8, '0')}`;
     this.placedSids.push(callSid);
     return { callSid };
+  }
+
+  async fetchCall(callSid: string): Promise<FetchedCall> {
+    this.fetchedSids.push(callSid);
+    const failure = this.fetchCallFailures.shift();
+    if (failure) throw failure;
+    const call = this.calls.get(callSid);
+    if (!call) throw new VoiceCallError('The requested resource was not found', 'no', 404);
+    return { ...call };
   }
 
   async buyNumber(p: BuyNumberParams): Promise<{ numberSid: string; phoneNumber: string }> {

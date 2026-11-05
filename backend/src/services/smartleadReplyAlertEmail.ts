@@ -48,6 +48,26 @@ const oneLine = (value: unknown, max: number): string => {
   return cleaned.length > max ? `${sliceSafe(cleaned, max - 1).trimEnd()}\u2026` : cleaned;
 };
 
+/**
+ * What a short alert (Slack, WhatsApp, the email subject) calls the contact: their name, else their address, as one safe line of at most
+ * `max` characters. Empty when there is neither. A name that is just the address counts as the address, so it is shown once.
+ */
+export function smartleadReplyContactLabel(leadName: unknown, leadEmail: unknown, max = 40): string {
+  const email = oneLine(leadEmail, 200);
+  const rawName = oneLine(leadName, 120);
+  const name = rawName && rawName.toLowerCase() !== email.toLowerCase() ? rawName : "";
+  return oneLine(name || email, max);
+}
+
+/**
+ * The one sentence every channel uses for a Smartlead reply: A new lead "Manan Test" replied to your campaign. With neither a name nor an
+ * address there is nothing to quote.
+ */
+export function smartleadReplyHeadline(leadName: unknown, leadEmail: unknown): string {
+  const who = smartleadReplyContactLabel(leadName, leadEmail);
+  return who ? `A new lead "${who}" replied to your campaign` : "A new lead replied to your campaign";
+}
+
 /** "Nov 3, 2026, 9:23 AM UTC". The zone is always shown: no timezone is stored for a user. Undefined when the time is missing or unreadable. */
 export const formatUtcTime = (iso: string | undefined): string | undefined => {
   if (!iso) return undefined;
@@ -63,7 +83,7 @@ const NOTE_WITHOUT_REPLY = "Smartlead keeps the full reply. Open your Smartlead 
 /** The most of a reply the email shows. */
 const REPLY_SHOWN_MAX = 600;
 const REPLY_SHOWN_LINES = 15;
-const CAPTION = "Written by the contact. AgentWeb has not checked it or any link in it.";
+const CAPTION = "The contact's own words. Check any link before you click it.";
 
 /** The reply text as it is shown: safe characters, line breaks normalized, blank runs shrunk, at most REPLY_SHOWN_LINES lines and REPLY_SHOWN_MAX characters, cut at a word where there is one. */
 const shownReply = (value: unknown): string => {
@@ -93,7 +113,7 @@ export function buildSmartleadReplyAlertEmail(input: SmartleadReplyAlertInput): 
   const who = name || email;
 
   // The contact's name sits in straight quotes: "A new lead "Manan Test" replied to your campaign". With neither a name nor an address there is nothing to quote.
-  const subject = who ? `A new lead "${oneLine(who, 40)}" replied to your campaign` : "A new lead replied to your campaign";
+  const subject = smartleadReplyHeadline(input.leadName, input.leadEmail);
   const heading = who ? `A new lead "${oneLine(who, 60)}" replied` : "A new lead replied";
   const quotedWho = who ? `"${who}"` : "A contact";
   const intro = name && email ? `"${name}" (${email}) replied to an email sent from your Smartlead campaign.` : `${quotedWho} replied to an email sent from your Smartlead campaign.`;

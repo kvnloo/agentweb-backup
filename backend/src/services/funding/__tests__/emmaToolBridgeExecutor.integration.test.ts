@@ -334,5 +334,98 @@ describe('tool bridge against the real agentModeService and dispatcher (ENG-2109
       expect(outcome.content).toBe('Screenshot captured.');
       expect(outcome.images).toEqual([{ mimeType: 'image/png', data: 'QUJDRA==' }]);
     });
+
+    describe('install_skills: the new skills\' instructions travel with the answer (Emma rebuilds the Installed Skills block for the next model call)', () => {
+      function installDispatch(result: Record<string, unknown>, skillsUpdated = true) {
+        jest.spyOn(toolDispatch, 'executePreparedTools').mockImplementation(async (input: any) => {
+          const id = input.toolCalls[0].id;
+          input.messages.push({ role: 'tool', tool_call_id: id, content: JSON.stringify(result) });
+          input.toolCallsLedger.push({ id, result });
+          return { mediaAssetsProduced: 0, searchCallsThisIteration: 0, failedCounterUpdates: {}, pendingCounterUpdates: {}, skillsUpdated } as any;
+        });
+      }
+      const skill = (id: string, name: string, systemPrompt: string) => ({ skillId: id, name, description: `${name} desc`, systemPrompt });
+      function session(associated: string[], published: any[]) {
+        require('../../chatbotService').chatbotDb.getChatSession = jest.fn().mockResolvedValue({ associatedSkills: associated });
+        require('../../skillService').skillService.getSkillsByIds = jest.fn(async (ids: string[]) => published.filter((p) => ids.includes(p.skillId)));
+      }
+
+      it('after install_skills the answer carries the instruction text of the skills this call installed, in the Installed Skills line format', async () => {
+        installDispatch({ success: true, message: 'Successfully installed 1 skill(s).', installedSkills: ['Ads'] });
+        session(['sk-ads', 'sk-old'], [skill('sk-ads', 'Ads', 'ALWAYS CHECK THE ACCOUNT FIRST.'), skill('sk-old', 'Old', 'OLD RULES')]);
+        const { executor } = openBridge();
+        await executor.resolveTools(RUN);
+        const outcome = await executor.execute(RUN, { name: 'install_skills', args: { skillIds: ['sk-ads', 'sk-old'] } }); // sk-old was asked for but not reported installed by this call
+        expect(outcome.answerSuffix).toContain('Installed Skills (now active in this conversation):');
+        expect(outcome.answerSuffix).toContain('sk-ads- Ads: Ads desc ALWAYS CHECK THE ACCOUNT FIRST.');
+        expect(outcome.answerSuffix).not.toContain('OLD RULES'); // only what this call installed
+        expect(outcome.content).not.toContain('ALWAYS CHECK'); // the persisted record is the tool result alone, as in Emma
+      });
+
+      it.each([
+        ['the install failed', { success: false, message: 'No valid skills found' }, true],
+        ['no skill name was reported installed', { success: true, installedSkills: [] }, true],
+      ])('no extra text when %s', async (_l, result, updated) => {
+        installDispatch(result, updated);
+        session(['sk-ads'], [skill('sk-ads', 'Ads', 'RULES')]);
+        const { executor } = openBridge();
+        await executor.resolveTools(RUN);
+        const outcome = await executor.execute(RUN, { name: 'install_skills', args: { skillIds: ['sk-ads'] } });
+        expect(outcome.answerSuffix).toBeUndefined();
+      });
+
+      it('another tool never gets the text, even if the dispatcher reports skillsUpdated', async () => {
+        installDispatch({ success: true, installedSkills: ['Ads'] });
+        session(['sk-ads'], [skill('sk-ads', 'Ads', 'RULES')]);
+        const { executor } = openBridge();
+        await executor.resolveTools(RUN);
+        expect((await executor.execute(RUN, { name: 'probe_read', args: { skillIds: ['sk-ads'] } })).answerSuffix).toBeUndefined();
+      });
+
+      it('RVB10 collision: a requested id that is NOT on the session but shares a name with an installed skill never leaks its text (the session guard is the only thing that stops it)', async () => {
+        installDispatch({ success: true, installedSkills: ['Ads'] });
+        session(['sk-ads'], [skill('sk-ads', 'Ads', 'GOOD'), skill('sk-evil', 'Ads', 'OTHER-USERS-PRIVATE-INSTRUCTIONS')]);
+        const { executor } = openBridge();
+        await executor.resolveTools(RUN);
+        const outcome = await executor.execute(RUN, { name: 'install_skills', args: { skillIds: ['sk-ads', 'sk-evil'] } });
+        expect(outcome.answerSuffix).toContain('GOOD');
+        expect(outcome.answerSuffix).not.toContain('OTHER-USERS');
+      });
+
+      it('the cut is on a code point boundary: an emoji at the limit is dropped whole, never left as half a pair', async () => {
+        installDispatch({ success: true, installedSkills: ['Big'] });
+        // make the note's cut point fall exactly inside an emoji: the line prefix is fixed, so pad to put a 2-unit emoji across the 60,000th unit
+        const prefix = 'Installed Skills (now active in this conversation):\nsk-big- Big: Big desc ';
+        const pad = 'x'.repeat(60_000 - prefix.length - 1);
+        session(['sk-big'], [skill('sk-big', 'Big', `${pad}😀${'y'.repeat(100)}`)]);
+        const { executor } = openBridge();
+        await executor.resolveTools(RUN);
+        const outcome = await executor.execute(RUN, { name: 'install_skills', args: { skillIds: ['sk-big'] } });
+        const text = outcome.answerSuffix!;
+        expect(Buffer.from(text, 'utf8').toString('utf8')).toBe(text); // valid UTF-8: no lone surrogate was encoded as U+FFFD
+        expect(text).not.toContain('\ufffd');
+        expect(text).toContain('[the skill instructions were cut here]');
+      });
+
+      it('the added text is capped, with a note', async () => {
+        installDispatch({ success: true, installedSkills: ['Big'] });
+        session(['sk-big'], [skill('sk-big', 'Big', 'x'.repeat(200_000))]);
+        const { executor } = openBridge();
+        await executor.resolveTools(RUN);
+        const outcome = await executor.execute(RUN, { name: 'install_skills', args: { skillIds: ['sk-big'] } });
+        expect(outcome.answerSuffix!.length).toBeLessThan(60_200);
+        expect(outcome.answerSuffix).toContain('[the skill instructions were cut here]');
+      });
+
+      it('a lookup that fails adds nothing and never fails the install', async () => {
+        installDispatch({ success: true, installedSkills: ['Ads'] });
+        const { executor } = openBridge();
+        await executor.resolveTools(RUN);
+        require('../../chatbotService').chatbotDb.getChatSession = jest.fn().mockRejectedValue(new Error('db down')); // only the note's own lookup fails
+        const outcome = await executor.execute(RUN, { name: 'install_skills', args: { skillIds: ['sk-ads'] } });
+        expect(outcome.answerSuffix).toBeUndefined();
+        expect(outcome.isError).toBe(false);
+      });
+    });
   });
 });

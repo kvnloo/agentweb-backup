@@ -8,7 +8,7 @@ import { claimMemberCooldown } from './voice/hotLeadCallLimits';
 import { getLeadCallStore } from './voice/leadCallStore';
 import type { HotLeadCallEventType, HotLeadCallPatch, HotLeadCallRecord, LeadCallStore } from './voice/leadCallStore.types';
 
-const MEMBER_RING_TIMEOUT_SECONDS = 25;
+export const MEMBER_RING_TIMEOUT_SECONDS = 25;
 // The re-read that decides whether a write that reported a problem still landed: a read that fails is tried again.
 const CLAIM_READ_ATTEMPTS = 3;
 // Tries at recording a rejected placement before the record is closed where it stands.

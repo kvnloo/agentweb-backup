@@ -29,11 +29,11 @@ export const INBOUND_UNAVAILABLE_COPY = 'Sorry, we are unable to take your call 
 /** The caller is told this when the number is live but no member accepted or none was available. */
 export const INBOUND_NOBODY_COPY = 'Sorry, nobody is available to take your call right now. Please try again later. Goodbye.';
 
-const GATHER_TIMEOUT_SECONDS = 8;
+export const GATHER_TIMEOUT_SECONDS = 8;
 /** Ring time for the lead or, on a callback, for each member; Twilio may add a few seconds of buffer. */
-const LEAD_DIAL_TIMEOUT_SECONDS = 25;
+export const LEAD_DIAL_TIMEOUT_SECONDS = 25;
 /** Maximum length of the bridged call, in seconds (Twilio <Dial timeLimit>; its default is 4 hours). */
-const BRIDGED_CALL_TIME_LIMIT_SECONDS = 1800;
+export const BRIDGED_CALL_TIME_LIMIT_SECONDS = 1800;
 
 const E164 = /^\+[1-9]\d{6,14}$/;
 // XML 1.0 forbids most control characters even when escaped; drop them rather than emit a document Twilio rejects.

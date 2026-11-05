@@ -20,6 +20,7 @@ export class FakeSmartlead {
   addUnsubscribeTag = true;
   sequences: unknown[] | null = SEQUENCE;
   campaignMissing = false;
+  analyticsMissing = false;
   failNext: unknown[] = [];
   dropFromMap = new Set<string>();
   invalid = new Set<string>();

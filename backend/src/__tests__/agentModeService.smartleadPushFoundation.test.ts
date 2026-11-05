@@ -5,7 +5,7 @@ import { SHARED_SESSION_BLOCKED_ORG_SETTINGS_TOOLS } from '../services/agentMode
 // reachable from a share-link visitor (who runs as the owner's userId).
 describe('Smartlead push tools: foundation access (ENG-673)', () => {
   const tools = [
-    'list_smartlead_campaigns', 'preview_smartlead_push', 'start_smartlead_push', 'get_smartlead_push_status',
+    'list_smartlead_campaigns', 'get_smartlead_campaign_stats', 'preview_smartlead_push', 'start_smartlead_push', 'get_smartlead_push_status',
     'pause_smartlead_push', 'resume_smartlead_push', 'cancel_smartlead_push', 'release_leads_from_smartlead',
   ];
 

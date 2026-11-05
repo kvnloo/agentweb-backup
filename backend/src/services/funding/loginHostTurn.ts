@@ -45,6 +45,20 @@ const BUSY_MAX_MS = 2_000;
 
 const realSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms).unref?.());
 
+/** Resolves when `p` does or when the signal aborts, whichever is first (the loser is left to finish by itself). */
+function abortable(p: Promise<void>, signal: AbortSignal | undefined): Promise<void> {
+  if (!signal) return p;
+  if (signal.aborted) return Promise.resolve(); // an abort that already happened never fires its event again
+  return new Promise<void>((resolve) => {
+    const done = () => {
+      signal.removeEventListener("abort", done);
+      resolve();
+    };
+    signal.addEventListener("abort", done, { once: true });
+    void p.then(done, done);
+  });
+}
+
 async function admit(client: LoginHostClient, req: RouteInput<"turn.run">, opts: HostTurnOptions): Promise<TurnStream> {
   const sleep = opts.sleep ?? realSleep;
   const random = opts.random ?? Math.random;
@@ -54,13 +68,13 @@ async function admit(client: LoginHostClient, req: RouteInput<"turn.run">, opts:
   for (;;) {
     if (opts.signal?.aborted) throw new LoginHostError("EBUSY", "aborted_while_waiting");
     try {
-      return await client.turnRun(req);
+      return await client.turnRun(req, { signal: opts.signal });
     } catch (err) {
       if (!(err instanceof LoginHostError)) throw err;
       // `busy`: the host is full or draining for a deploy. `notSent`: it is restarting (a deploy swaps the build in seconds). Neither admitted anything.
       if (err.busy || err.notSent) {
         if (Date.now() + delay > deadline) throw err;
-        await sleep(delay * (0.5 + random() / 2));
+        await abortable(sleep(delay * (0.5 + random() / 2)), opts.signal); // A3: a Stop during the wait for a free slot ends it now, not when the sleep does
         delay = Math.min(delay * 2, BUSY_MAX_MS);
         continue;
       }
