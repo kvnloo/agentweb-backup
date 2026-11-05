@@ -809,4 +809,116 @@ describe('ClaudeCodeBackend', () => {
       });
     });
   });
+  describe('approval cards (ENG-2113)', () => {
+    it('assertCanStartTurn makes the checks run() makes before it opens anything: a host client, and a usable tool transport', () => {
+      const h = harness();
+      const backend = new ClaudeCodeBackend(h.deps);
+      expect(() => backend.assertCanStartTurn()).not.toThrow();
+      h.state.client = false;
+      expect(() => backend.assertCanStartTurn()).toThrow(expect.objectContaining({ code: 'host_unavailable' }));
+      h.state.client = true;
+      h.deps.relay = { workerProtocol: () => undefined, protocolStatus: () => 'unknown' } as any;
+      expect(() => backend.assertCanStartTurn()).toThrow(expect.objectContaining({ code: 'host_unavailable' }));
+      expect(h.calls).toEqual([]); // nothing was opened: the check is local
+    });
+
+    const haltOf = (callId: string, result: unknown, groupIndex?: number): BridgeHalt => ({ callId, name: 'meta_preview', args: {}, result, toolMessageContent: 'preview', context: {}, epoch: 1, haltedAt: 1, ...(groupIndex !== undefined ? { groupIndex } : {}) } as BridgeHalt);
+    const deck = { deckId: 'deck-1', status: 'awaiting', items: [{ itemId: 'write-1', kind: 'meta_write', question: 'Rename the campaign?' }] } as any;
+
+    it('the turn\'s halts become the session\'s deck: the visible answer is the deck prompt, the model\'s text is dropped, the halt message carries the card metadata', async () => {
+      const h = harness();
+      const seen: Array<[string, unknown[]]> = [];
+      h.deps.stageApprovalDeck = async (sessionId, results) => (seen.push([sessionId, results]), { kind: 'deck', deck, prompt: 'DECK PROMPT' });
+      h.setLedger([rec({ toolCallId: 'tc1', name: 'meta_preview' })], [haltOf('tc1', { awaitingUserConfirmation: true, summary: 'one' })]);
+      h.setHost(async () => done('I staged it for approval, open the card below.'));
+      const r = await new ClaudeCodeBackend(h.deps).run(params());
+      expect(seen).toEqual([['s1', [{ awaitingUserConfirmation: true, summary: 'one' }]]]);
+      expect(r.content).toBe('DECK PROMPT');
+      expect(r.content).not.toContain('staged it');
+      expect(r.pendingApprovalDeck).toBe(deck);
+      const last = r.responseMessages[r.responseMessages.length - 1];
+      expect(last.content).toBe('DECK PROMPT');
+      expect(last.metadata).toMatchObject({ funding: 'subscription', awaitingUserConfirmation: true, pendingApprovalDeckId: 'deck-1', approvalDeckItems: deck.items });
+    });
+
+    it('several halts of one message reach the stager in the model\'s call order, not in the order they finished', async () => {
+      const h = harness();
+      let got: unknown[] = [];
+      h.deps.stageApprovalDeck = async (_s, results) => ((got = results), { kind: 'deck', deck, prompt: 'P' });
+      h.setLedger([rec({ toolCallId: 'a', name: 'meta_preview' })], [haltOf('c', { n: 3 }, 2), haltOf('a', { n: 1 }, 0), haltOf('b', { n: 2 }, 1)]);
+      await new ClaudeCodeBackend(h.deps).run(params());
+      expect(got).toEqual([{ n: 1 }, { n: 2 }, { n: 3 }]);
+    });
+
+    it('a halt kind that has no deck (or a lost slot) ends with the plain confirmation prompt and no card', async () => {
+      const h = harness();
+      h.deps.stageApprovalDeck = async () => ({ kind: 'text', prompt: 'Please confirm the image edit.' });
+      h.setLedger([rec({ toolCallId: 'tc1', name: 'edit_image' })], [haltOf('tc1', { awaitingUserConfirmation: true })]);
+      h.setHost(async () => done('model text'));
+      const r = await new ClaudeCodeBackend(h.deps).run(params());
+      expect(r.content).toBe('Please confirm the image edit.');
+      expect(r.pendingApprovalDeck).toBeUndefined();
+      const last = r.responseMessages[r.responseMessages.length - 1];
+      expect(last.metadata).toMatchObject({ awaitingUserConfirmation: true });
+      expect(last.metadata.pendingApprovalDeckId).toBeUndefined();
+    });
+
+    it('a stager that has nothing to show leaves the fixed note', async () => {
+      const h = harness();
+      h.deps.stageApprovalDeck = async () => ({ kind: 'none' });
+      h.setLedger([rec({ toolCallId: 'tc1', name: 'meta_preview' })], [haltOf('tc1', {})]);
+      h.setHost(async () => done('I prepared it.'));
+      const r = await new ClaudeCodeBackend(h.deps).run(params());
+      expect(r.content).toBe(`I prepared it.\n\n${CONFIRMATION_NOTE}`);
+      expect(r.pendingApprovalDeck).toBeUndefined();
+    });
+
+    it('a stager that throws never fails the turn: the fixed note, no card, and the tool work is still persisted', async () => {
+      const h = harness();
+      h.deps.stageApprovalDeck = async () => {
+        throw new Error('dynamo down');
+      };
+      h.setLedger([rec({ toolCallId: 'tc1', name: 'meta_preview' })], [haltOf('tc1', {})]);
+      h.setHost(async () => done('I prepared it.'));
+      const r = await new ClaudeCodeBackend(h.deps).run(params());
+      expect(r.content).toBe(`I prepared it.\n\n${CONFIRMATION_NOTE}`);
+      expect(r.pendingApprovalDeck).toBeUndefined();
+      expect(r.responseMessages.some((m: any) => m.role === 'tool' && m.tool_call_id === 'tc1')).toBe(true);
+      expect(r.responseMessages[r.responseMessages.length - 1].metadata.pendingApprovalDeckId).toBeUndefined();
+    });
+
+    it('the stager is not asked when nothing halted', async () => {
+      const h = harness();
+      let asked = 0;
+      h.deps.stageApprovalDeck = async () => (asked++, { kind: 'none' });
+      h.setLedger([rec({ toolCallId: 'tc1', name: 'read' })], []);
+      const r = await new ClaudeCodeBackend(h.deps).run(params());
+      expect(asked).toBe(0);
+      expect(r.content).toBe('answer');
+      expect(r.pendingApprovalDeck).toBeUndefined();
+    });
+
+    it('a turn that failed or was stopped writes no deck', async () => {
+      const failed = harness();
+      let asked = 0;
+      failed.deps.stageApprovalDeck = async () => (asked++, { kind: 'deck', deck, prompt: 'P' });
+      failed.setLedger([rec({ toolCallId: 'tc1', name: 'meta_preview' })], [haltOf('tc1', {})]);
+      failed.setHost(async () => ({ kind: 'completed', result: { type: 'result', ok: false, errorKind: 'transient' } as any }));
+      await expect(new ClaudeCodeBackend(failed.deps).run(params())).rejects.toBeInstanceOf(ClaudeRouteStopError);
+      const stopped = harness();
+      stopped.deps.stageApprovalDeck = async () => (asked++, { kind: 'deck', deck, prompt: 'P' });
+      stopped.setLedger([rec({ toolCallId: 'tc1', name: 'meta_preview' })], [haltOf('tc1', {})]);
+      stopped.setHost(async () => ((stopped.state.cancelled = true), done('late')));
+      const r = await new ClaudeCodeBackend(stopped.deps).run(params());
+      expect(r.cancelled).toBe(true);
+      expect(asked).toBe(0);
+    });
+
+    it('a bridge that could not preview (fallback) with no stager keeps the fixed note', async () => {
+      const h = harness();
+      h.setHost(async () => (h.x.openOpts.onHalted({ fallbackNeeded: true }), done('Done.')));
+      const r = await new ClaudeCodeBackend(h.deps).run(params());
+      expect(r.content).toContain(CONFIRMATION_NOTE);
+    });
+  });
 });

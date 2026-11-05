@@ -50,4 +50,9 @@ describe("findResumableUserMessage", () => {
     expect(findResumableUserMessage([{ role: "user", content: 5 }, note()] as never)).toEqual({ ok: false });
     expect(findResumableUserMessage([user("hi", { timestamp: "t" }), note()])).toEqual({ ok: true, content: "hi" }); // ordinary metadata is fine
   });
+  it("hands back the outcome of an approval-deck answer the saved message carried (its writes already ran), and ignores anything that is not text", () => {
+    expect(findResumableUserMessage([user("Approved", { deckOutcomeDirective: "[Approval deck outcome: {}]" }), note()])).toEqual({ ok: true, content: "Approved", deckOutcomeDirective: "[Approval deck outcome: {}]" });
+    expect(findResumableUserMessage([user("Approved", { deckOutcomeDirective: "" }), note()])).toEqual({ ok: true, content: "Approved" });
+    expect(findResumableUserMessage([user("Approved", { deckOutcomeDirective: 5 }), note()])).toEqual({ ok: true, content: "Approved" });
+  });
 });

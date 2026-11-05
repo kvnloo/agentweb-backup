@@ -14,7 +14,8 @@ const prepareTurnContext = jest.fn(async () => {
 });
 
 jest.mock('../loginHostProvider', () => ({ getLoginHostProvider: () => mockProvider }));
-jest.mock('../../agentModeService', () => ({ agentModeService: { prepareTurnContext: (...a: unknown[]) => (prepareTurnContext as any)(...a), trimToolMessagesForContext: (m: unknown) => m } }));
+const stageApprovalDeckForPlanTurn = jest.fn(async () => ({ kind: 'none' }));
+jest.mock('../../agentModeService', () => ({ agentModeService: { prepareTurnContext: (...a: unknown[]) => (prepareTurnContext as any)(...a), trimToolMessagesForContext: (m: unknown) => m, stageApprovalDeckForPlanTurn: (...a: unknown[]) => (stageApprovalDeckForPlanTurn as any)(...a) } }));
 jest.mock('../../chatbotService', () => ({ chatbotDb: { addMessagesToSession: jest.fn() } }));
 jest.mock('../../agentMode/incrementalPersist', () => ({ stripImageDataForPersistence: (m: unknown) => m }));
 jest.mock('../../agentMode/core/toolDispatch', () => ({ seedSearchCallCountFromHistory: () => 0 }));
@@ -93,5 +94,31 @@ describe('the process-wide Claude backend is wired to the real provider and the 
     expect((await outcome()).reached).toBe(true);
     expect(mockProvider.workerProtocol).toHaveBeenCalled();
     expect(mockProvider.protocolStatus).toHaveBeenCalled();
+  });
+  describe('approval cards (ENG-2113)', () => {
+    const deps = () => (claudeCodeBackend as any).deps;
+
+    it('the instance stages decks with Emma\'s own seam and admits the siblings of a halted message (one deck per message)', async () => {
+      expect(deps().relayAdmitPostHaltSiblings).toBe(true);
+      await deps().stageApprovalDeck('s1', [{ a: 1 }]);
+      expect(stageApprovalDeckForPlanTurn).toHaveBeenCalledWith('s1', [{ a: 1 }]);
+    });
+
+    it('assertCanStartTurn follows the provider: a known matching protocol-4 worker may start, an unknown or mismatched one may not, a missing client may not', () => {
+      process.env.NODE_ENV = 'production';
+      mockProvider.workerProtocol.mockReturnValue(4);
+      mockProvider.protocolStatus.mockReturnValue('match');
+      expect(() => claudeCodeBackend.assertCanStartTurn()).not.toThrow();
+      mockProvider.protocolStatus.mockReturnValue('unknown');
+      expect(() => claudeCodeBackend.assertCanStartTurn()).toThrow(expect.objectContaining({ code: 'host_unavailable' }));
+      mockProvider.protocolStatus.mockReturnValue('mismatch');
+      expect(() => claudeCodeBackend.assertCanStartTurn()).toThrow(expect.objectContaining({ code: 'host_unavailable' }));
+      mockProvider.protocolStatus.mockReturnValue('match');
+      mockProvider.workerProtocol.mockReturnValue(3); // production: the legacy bridge is a zero-tool stub, so an older worker is refused
+      expect(() => claudeCodeBackend.assertCanStartTurn()).toThrow(expect.objectContaining({ code: 'host_unavailable' }));
+      mockProvider.workerProtocol.mockReturnValue(4);
+      mockProvider.client.mockReturnValueOnce(undefined as never);
+      expect(() => claudeCodeBackend.assertCanStartTurn()).toThrow(expect.objectContaining({ code: 'host_unavailable' }));
+    });
   });
 });

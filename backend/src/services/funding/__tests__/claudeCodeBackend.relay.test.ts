@@ -74,6 +74,8 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
       now?: () => number;
       softLead?: number;
       confirm?: string[];
+      /** The minimal result a tool in `confirm` leaves in the ledger (what the approval deck is built from). */
+      haltResult?: (c: { name: string; args: Record<string, unknown> }) => unknown;
       allowLegacy?: boolean;
       /** true (default in this rig) = batched confirmations on; 'default' = the production default (off). */
       admitSiblings?: boolean | 'default';
@@ -92,7 +94,7 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
         executions.push({ name: c.name, args: c.args });
         if (over.holdMs?.[c.name]) await over.holdMs[c.name];
         for (const x of (over.appearAfter ?? { install_skills: [{ name: 'late_tool', description: 'after install', inputSchema: { type: 'object', properties: {} } }] })[c.name] ?? []) extra.push(x);
-        return { content: `${c.name} receipt`, isError: false, requiresConfirmation: over.confirm?.includes(c.name) === true, toolsChanged: (over.appearAfter ?? { install_skills: [] })[c.name] !== undefined, ...(over.images?.[c.name] ? { images: over.images[c.name] } : {}) };
+        return { content: `${c.name} receipt`, isError: false, requiresConfirmation: over.confirm?.includes(c.name) === true, ...(over.haltResult && over.confirm?.includes(c.name) ? { result: over.haltResult(c) } : {}), toolsChanged: (over.appearAfter ?? { install_skills: [] })[c.name] !== undefined, ...(over.images?.[c.name] ? { images: over.images[c.name] } : {}) };
       },
       registerRun: () => undefined,
       beginTurn: () => undefined,
@@ -1059,6 +1061,48 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
       expect(t.executions.map((e) => e.args.to)).toEqual(['p0', 'p1', 'p2', 'p3', 'p4']);
       expect(halts.mock.results[halts.mock.results.length - 1].value).toHaveLength(5); // the last read: the dispatcher also reads the halts to learn which call halted
       expect(r.content).toContain('confirm');
+    });
+
+    it('approval cards: three sibling previews of one message are staged ONCE as one deck, in call order, and the visible answer is the deck prompt', async () => {
+      const t = setup({ confirm: ['send_email'], haltResult: (c) => ({ awaitingUserConfirmation: true, summary: `mail ${String(c.args.to)}` }) });
+      const staged: unknown[][] = [];
+      const deck = { deckId: 'deck-1', status: 'awaiting', items: [{ itemId: 'write-1' }] } as any;
+      t.deps.stageApprovalDeck = async (_s, results) => (staged.push(results), { kind: 'deck', deck, prompt: 'DECK PROMPT' });
+      const gates = Array.from({ length: 3 }, () => gate());
+      rig.script.turnEvents = [
+        ...Array.from({ length: 3 }, (_, i) => use(i, 'send_email', { to: `p${i}` })),
+        ...gates.flatMap((g, i) => [call(`op-${i}`, 'send_email', { to: `p${i}` }), { wait: g.wait }]),
+        result('I staged all three in the approval deck.'),
+      ];
+      const run = t.backend().run(t.params());
+      for (let i = 0; i < 3; i++) {
+        await waitFor(() => answers().length === i + 1);
+        gates[i].open();
+      }
+      const r = await run;
+      expect(t.executions.map((e) => e.args.to)).toEqual(['p0', 'p1', 'p2']);
+      expect(staged).toEqual([[{ awaitingUserConfirmation: true, summary: 'mail p0' }, { awaitingUserConfirmation: true, summary: 'mail p1' }, { awaitingUserConfirmation: true, summary: 'mail p2' }]]);
+      expect(r.content).toBe('DECK PROMPT');
+      expect(r.pendingApprovalDeck).toBe(deck);
+      expect(r.responseMessages[r.responseMessages.length - 1].metadata).toMatchObject({ pendingApprovalDeckId: 'deck-1', awaitingUserConfirmation: true });
+    });
+
+    it('approval cards: a worker that announces its own extra "sibling" after the halt gets no more than the announced message (the deck holds only what the stream announced)', async () => {
+      const t = setup({ confirm: ['send_email'], haltResult: (c) => ({ awaitingUserConfirmation: true, summary: `mail ${String(c.args.to)}` }) });
+      const staged: unknown[][] = [];
+      t.deps.stageApprovalDeck = async (_s, results) => (staged.push(results), { kind: 'text', prompt: 'P' });
+      const g1 = gate();
+      const g2 = gate();
+      // only p0 is announced by the stream; the worker then sends a second call (a forged sibling) in the same message id
+      rig.script.turnEvents = [use(0, 'send_email', { to: 'p0' }), call('op-0', 'send_email', { to: 'p0' }), { wait: g1.wait }, call('op-1', 'send_email', { to: 'forged' }), { wait: g2.wait }, result('x')];
+      const run = t.backend().run(t.params());
+      await waitFor(() => answers().length === 1);
+      g1.open();
+      await waitFor(() => answers().length === 2);
+      g2.open();
+      await run;
+      expect(t.executions.map((e) => e.args.to)).toEqual(['p0']);
+      expect(staged[0]).toHaveLength(1);
     });
 
     it('the host\'s final behaviour: a preview whose stream input was truncated ({"_truncated":"depth"}) falls back to its own group; the rest of the batch still builds one confirmation', async () => {

@@ -37,6 +37,7 @@ jest.mock('../services/chatbotService', () => ({
     updateSessionTitle: jest.fn(),
     updateSessionLlmModel: jest.fn(),
     getMessagesFromMessagesTable: jest.fn(),
+    updateSessionApprovalDeck: jest.fn(),
   },
   updateTaskExecutionStatus: jest.fn(),
 }));
@@ -52,6 +53,7 @@ jest.mock('../services/agentModeService', () => ({
     generateSessionTitle: jest.fn().mockResolvedValue('Test Title'),
     getMarketingSystemPrompt: jest.fn().mockResolvedValue('System prompt'),
     generateDiagnosticMessage: jest.fn().mockResolvedValue(null),
+    submitApprovalDeckAnswers: jest.fn(),
   },
   AgentModeService: jest.fn(),
 }));
@@ -93,12 +95,14 @@ jest.mock('../services/funding/runFunding', () => {
   const actual = jest.requireActual('../services/funding/runFunding');
   return { ...actual, resolveRunFunding: jest.fn(actual.resolveRunFunding) };
 });
-jest.mock('../services/funding/claudeCodeBackendInstance', () => ({ claudeCodeBackend: { run: jest.fn() } }));
+jest.mock('../services/funding/claudeCodeBackendInstance', () => ({ claudeCodeBackend: { run: jest.fn(), assertCanStartTurn: jest.fn() } }));
 
 const db = chatbotDb as jest.Mocked<typeof chatbotDb> & Record<string, jest.Mock>;
 const worker = generateMarketingResponseWorkerService as jest.Mocked<typeof generateMarketingResponseWorkerService>;
 const funding = resolveTurnFunding as jest.Mock;
 const backend = claudeCodeBackend.run as jest.Mock;
+const preflight = claudeCodeBackend.assertCanStartTurn as jest.Mock;
+const submitDeck = agentModeService.submitApprovalDeckAnswers as jest.Mock;
 const usage = checkTokenUsage as jest.Mock;
 
 const PLAN_MODEL = 'openrouter/anthropic/claude-sonnet-5.5';
@@ -383,6 +387,102 @@ describe('/generate on the Claude plan route', () => {
       expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ userMessageSaved: true, canContinueSavedMessage: false, agentWebOffer: 'new_message' }));
       const note = db.addMessageToSession.mock.calls.map((c) => c[1] as any).find((m) => m?.metadata?.kind === 'claude-plan-stop');
       expect(note.metadata.resumable).toBe(false);
+    });
+
+    describe('approval deck answers on the plan (ENG-2113 approval cards)', () => {
+      const DECK = {
+        deckId: 'd1', status: 'awaiting', createdAt: 'x',
+        items: [{ itemId: 'question-1', kind: 'plan_choice', question: 'Which audience?', options: [{ id: 'a', label: 'Leads', consequence: 'c', recommended: true }, { id: 'b', label: 'Sales', consequence: 'c' }] }],
+      };
+      const ANSWERED = { ...DECK, status: 'answered', answers: [{ itemId: 'question-1', verdict: 'a' }] };
+      const deckSession = () => ({ ...SESSION, pendingApprovalDeck: DECK, messages: [{ role: 'user', content: 'plan it' }] });
+      const answerBody = { fundingChoice: 'claude_subscription', userMessage: 'Approved', deckAnswer: { deckId: 'd1', answers: [{ itemId: 'question-1', verdict: 'a' }] } };
+
+      beforeEach(() => {
+        db.getChatSession.mockResolvedValue(deckSession() as any);
+        submitDeck.mockResolvedValue({ outcome: 'submitted', run: null, summary: null, answeredDeck: ANSWERED });
+        preflight.mockReset();
+      });
+
+      it('refuses the answer BEFORE it is consumed when the plan connection is down: typed stop, deck untouched, nothing run, nothing saved', async () => {
+        preflight.mockImplementation(() => {
+          throw new ClaudeRouteStopError('host_unavailable');
+        });
+        const res = makeRes();
+        await agentModeController.generateResponse(makeReq(answerBody), res);
+        expect(res.status).toHaveBeenCalledWith(503);
+        expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'host_unavailable', userMessageSaved: false }));
+        expect(submitDeck).not.toHaveBeenCalled();
+        expect(db.updateSessionApprovalDeck).not.toHaveBeenCalled();
+        expect(db.addMessageToSession).not.toHaveBeenCalled();
+        expect(backend).not.toHaveBeenCalled();
+        expect(activeSessionGenerations.has('s1')).toBe(false);
+      });
+
+      it('refuses a CANCEL the same way when the connection is down (the deck stays, nothing is cleared)', async () => {
+        preflight.mockImplementation(() => {
+          throw new ClaudeRouteStopError('host_unavailable');
+        });
+        const res = makeRes();
+        await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription', userMessage: 'Cancelled the review.', deckCancel: { deckId: 'd1' } }), res);
+        expect(res.status).toHaveBeenCalledWith(503);
+        expect(db.updateSessionApprovalDeck).not.toHaveBeenCalled();
+        expect(backend).not.toHaveBeenCalled();
+      });
+
+      it('a preflight that fails in an unexpected way is also a typed stop, never a 500 and never an answer that ran', async () => {
+        preflight.mockImplementation(() => {
+          throw new Error('boom');
+        });
+        const res = makeRes();
+        await agentModeController.generateResponse(makeReq(answerBody), res);
+        expect(res.status).toHaveBeenCalledWith(503);
+        expect(submitDeck).not.toHaveBeenCalled();
+      });
+
+      it('with the connection up: the answer is consumed once, the turn runs on the plan with the outcome, and the saved reply keeps the outcome for a continue', async () => {
+        backend.mockResolvedValueOnce(planResult());
+        const res = makeRes();
+        await agentModeController.generateResponse(makeReq(answerBody), res);
+        expect(preflight).toHaveBeenCalledTimes(1);
+        expect(submitDeck).toHaveBeenCalledTimes(1);
+        expect(backend).toHaveBeenCalledTimes(1);
+        expect(backend.mock.calls[0][0].messageContent).toContain('[Approval deck outcome:');
+        const savedUser = db.addMessageToSession.mock.calls.map((c) => c[1] as any).find((m) => m?.role === 'user');
+        expect(savedUser.content).toBe('Approved'); // the displayed message never carries the outcome text
+        expect(savedUser.metadata.approvalDeckAnswer).toMatchObject({ deckId: 'd1' });
+        expect(savedUser.metadata.deckOutcomeDirective).toContain('[Approval deck outcome:');
+      });
+
+      it('the same answer on AgentWeb is unchanged: no preflight, and no outcome kept on the saved message', async () => {
+        funding.mockResolvedValue({ route: 'agentweb' });
+        worker.runInWorker.mockResolvedValueOnce({ content: 'OK', toolCalls: [], knowledgeBaseQueries: [], sources: [], responseMessages: [] } as any);
+        await agentModeController.generateResponse(makeReq({ ...answerBody, fundingChoice: undefined, llmModel: 'gpt-5-chat-2' }), makeRes());
+        expect(preflight).not.toHaveBeenCalled();
+        expect(submitDeck).toHaveBeenCalledTimes(1);
+        const savedUser = db.addMessageToSession.mock.calls.map((c) => c[1] as any).find((m) => m?.role === 'user');
+        expect(savedUser.metadata.deckOutcomeDirective).toBeUndefined();
+      });
+
+      it('a continue after a deck answer whose plan turn stopped hands the model the outcome again, and stores nothing twice', async () => {
+        const directive = '[Approval deck outcome: {"status":"answered","selections":[{"itemId":"question-1","selected":"Leads"}]}]';
+        const stopped = { role: 'assistant', content: 'stopped', metadata: { kind: 'claude-plan-stop', isErrorMessage: true, resumable: true } };
+        db.getChatSession.mockResolvedValue({ ...SESSION, messages: [{ role: 'user', content: 'Approved', metadata: { deckOutcomeDirective: directive } }, stopped] } as any);
+        backend.mockResolvedValueOnce(planResult());
+        await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription', userMessage: 'Approved', continueSavedMessage: true }), makeRes());
+        expect(backend).toHaveBeenCalledTimes(1);
+        expect(backend.mock.calls[0][0].messageContent).toBe(`Approved\n\n${directive}`);
+        expect(db.addMessageToSession.mock.calls.map((c) => c[1] as any).filter((m) => m?.role === 'user')).toHaveLength(0);
+        expect(submitDeck).not.toHaveBeenCalled();
+      });
+
+      it('a continue of an ordinary message (no outcome kept) is unchanged', async () => {
+        const stopped = { role: 'assistant', content: 'stopped', metadata: { kind: 'claude-plan-stop', isErrorMessage: true, resumable: true } };
+        db.getChatSession.mockResolvedValue({ ...SESSION, messages: [{ role: 'user', content: 'Hello' }, stopped] } as any);
+        backend.mockResolvedValueOnce(planResult());
+        await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription', userMessage: 'Hello', continueSavedMessage: true }), makeRes());
+        expect(backend.mock.calls[0][0].messageContent).toBe('Hello');
+      });
     });
 
     describe('continueSavedMessage', () => {
