@@ -19,3 +19,14 @@
 - Usage events now carry `dimensions.platform` (`meta` | `google_ads`). This is a new key in the
   existing dimensions map. No table, key or index changed.
 - Same residual as Meta: preview tokens are single-use per process (no durable claim store).
+- Hardening: a confirmed write that fails without a definite answer from Google (timeout,
+  network error, 5xx, or a thrown dispatch) is `UNCONFIRMED` and metered as a write, with a
+  check-before-retry instruction — never "did not apply", which invited a duplicate CREATE.
+  Budget/bid amounts must convert to positive safe-integer micros. With a ceiling set, enabling a
+  campaign is checked at its current budget (fails closed if the budget cannot be read), and the
+  preview names that budget.
+- Live read-only check (2026-11-05, guarded so no mutate URL or DynamoDB write could leave the
+  process): curated reads, the write-path read helper and all write previews ran against a real
+  standalone account and a manager-linked (login-customer-id) INR account. Note: the stored
+  OAuth token is written back to the user row on every refresh, so a "read-only" live run through
+  `googleAdsService` is not DynamoDB-read-only unless `updateAccountTokens` is stubbed.
