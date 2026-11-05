@@ -31,6 +31,8 @@ beforeEach(() => {
 afterAll(() => { for (const k of ENV) delete process.env[k]; });
 
 const modelOfLastCall = () => mkLLM.mock.calls[mkLLM.mock.calls.length - 1][0];
+const optionsOfLastCall = () => mkLLM.mock.calls[mkLLM.mock.calls.length - 1][3];
+const HELPER_OPTIONS = { requireContent: true, fallbackModels: [FALLBACK_MODEL] };
 
 describe('createEnrichmentHelperLLM', () => {
   it('uses the user\'s enrichment role, retries empty answers and falls back to gpt-5.5 for the cheap default', async () => {
@@ -60,12 +62,14 @@ describe('call sites never name the retired gpt-5-chat-2', () => {
     await buildConfigServiceDeps().llmInferAliases([{ name: 'stage', instruction: 'funding stage' }], 'user-2');
     expect(resolve).toHaveBeenCalledWith('user-2', 'enrichment');
     expect(modelOfLastCall()).toBe(CHEAP_DEFAULT_MODEL);
+    expect(optionsOfLastCall()).toEqual(HELPER_OPTIONS);
   });
 
   it('smart-field classification resolves the saving user\'s enrichment role', async () => {
     await buildConfigServiceDeps().llmClassifySmartFields([{ name: 'is_hiring', instruction: 'hiring engineers' }], 'user-3');
     expect(resolve).toHaveBeenCalledWith('user-3', 'enrichment');
     expect(modelOfLastCall()).toBe(CHEAP_DEFAULT_MODEL);
+    expect(optionsOfLastCall()).toEqual(HELPER_OPTIONS);
   });
 
   it('sibling field mapping resolves the run user\'s enrichment role', async () => {
@@ -75,9 +79,14 @@ describe('call sites never name the retired gpt-5-chat-2', () => {
     );
     expect(resolve).toHaveBeenCalledWith('user-4', 'enrichment');
     expect(modelOfLastCall()).toBe(CHEAP_DEFAULT_MODEL);
+    expect(optionsOfLastCall()).toEqual(HELPER_OPTIONS);
   });
 
   it('the CRM_ENRICH_V3_* env overrides keep their precedence', async () => {
+    process.env.CRM_ENRICH_V3_CLASSIFY_MODEL = 'classify-only-env';
+    await buildConfigServiceDeps().llmInferAliases([{ name: 'a', instruction: '' }], 'u'); // alias never reads the classify env
+    expect(modelOfLastCall()).toBe(CHEAP_DEFAULT_MODEL);
+    delete process.env.CRM_ENRICH_V3_CLASSIFY_MODEL;
     process.env.CRM_ENRICH_V3_ALIAS_MODEL = 'alias-env';
     await buildConfigServiceDeps().llmInferAliases([{ name: 'a', instruction: '' }], 'u');
     expect(modelOfLastCall()).toBe('alias-env');
@@ -89,5 +98,26 @@ describe('call sites never name the retired gpt-5-chat-2', () => {
     process.env.CRM_ENRICH_V3_EXTRACT_MODEL = 'extract-env';
     await buildLLMFieldMapping([{ name: 'a', type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' }]);
     expect(modelOfLastCall()).toBe('extract-env');
+  });
+});
+
+describe('fail soft', () => {
+  const sibling = [{ name: 'stage', type: 'string' as const, instruction: '', include: true, overwritePolicy: 'fill_if_empty' as const }];
+
+  it('a role lookup that rejects degrades exactly like an LLM failure at every site', async () => {
+    resolve.mockRejectedValue(new Error('role lookup down'));
+    expect(await buildConfigServiceDeps().llmInferAliases([{ name: 'a', instruction: '' }], 'u')).toEqual({});
+    expect(await buildConfigServiceDeps().llmClassifySmartFields([{ name: 'a', instruction: 'x' }], 'u')).toEqual({});
+    const mapping = await buildLLMFieldMapping(sibling, { userId: 'u', feature: 'crm_enrichment_field_mapping' });
+    expect(mapping.get('stage')).toEqual(['stage']);
+    expect(mockGenerate).not.toHaveBeenCalled();
+  });
+});
+
+describe('constants stay in step with the role default', () => {
+  it('CHEAP_DEFAULT_MODEL is the enrichment role default, so the gpt-5.5 fallback keeps applying to it', async () => {
+    delete process.env.CRM_ENRICH_V3_DEFAULT_MODEL;
+    const { getRoleDefault } = jest.requireActual('../services/modelRoles');
+    expect(await getRoleDefault('enrichment')).toBe(CHEAP_DEFAULT_MODEL);
   });
 });

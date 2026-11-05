@@ -1,6 +1,6 @@
 // ENG-2720: the small LLM calls around an enrichment run (field alias inference, smart-field
 // classification, sibling field mapping) used to default to "gpt-5-chat-2", a retired id that callLLM
-// rewrites to gpt-5.5, so they ran on the dearest model while the extraction itself ran on the cheap
+// rewrites to gpt-5.5 (about 25x Luna's token price), while the extraction itself ran on the cheap
 // default. They now resolve the same "enrichment" role as every other enrichment call, so one default
 // (and an org's own override) covers the whole pipeline.
 import { createLLMService } from '../utils/llmService';
