@@ -129,6 +129,12 @@ export interface RelayDispatcherOptions {
    * (the first confirmation ends the turn's tool work either way). The code path stays for the approval-cards change, which sets this to true.
    */
   admitPostHaltSiblings?: boolean;
+  /**
+   * Approval cards (ENG-2113): called ONCE when the turn's halted model message is complete: every call the stream announced in that message before the halted
+   * answer went back has been answered (or did not arrive within the announcement wait), and nothing is still running. Emma's chat loop stops at exactly this
+   * point (it builds the deck and never asks the model again), so the caller interrupts the turn here. Must not throw.
+   */
+  onHaltSettled?: () => void;
   /** Progress hooks (the chat's "executing" statuses). Must not throw. The caller drops them once its turn is over (`turnOver` in claudeCodeBackend.ts). */
   onCall?: (phase: "start" | "end", name: string) => void;
 }
@@ -263,6 +269,10 @@ export class RelayToolDispatcher {
   private readonly announceWaiters = new Set<() => void>();
   /** The model message of the call that latched this turn's halt, and the last announcement recorded before its answer went back. */
   private halt: { batch: number; cutoff: number } | undefined;
+  private haltSettledFired = false;
+  private haltSettleTimer: NodeJS.Timeout | undefined;
+  /** Backend call id -> the stream position of the announcement it matched: the model's own order of the calls (Emma's deck follows the model's call order). */
+  private readonly streamSeq = new Map<string, number>();
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
   private calls = 0;
@@ -281,6 +291,11 @@ export class RelayToolDispatcher {
   /** Ids (the backend-made call ids, which are the bridge ledger's toolCallIds) of calls whose answer the worker could no longer take. */
   lostCallIds(): ReadonlySet<string> {
     return this.lost;
+  }
+
+  /** Where the model put this call in its message (the matched announcement's stream position), or undefined for a call the stream never announced. */
+  streamOrderOf(callId: string): number | undefined {
+    return this.streamSeq.get(callId);
   }
 
   /** Ids of calls whose answer the worker accepted. A call that executed and is NOT in here never reached the model (S1). */
@@ -317,7 +332,10 @@ export class RelayToolDispatcher {
       }
       const work = this.run(op, ev, box).catch(() => this.log("dispatch_failed"));
       this.inFlight.add(work);
-      void work.finally(() => this.inFlight.delete(work));
+      void work.finally(() => {
+        this.inFlight.delete(work);
+        this.checkHaltSettled();
+      });
       return true;
     } catch {
       this.log("start_failed");
@@ -454,6 +472,7 @@ export class RelayToolDispatcher {
    */
   close(): void {
     this.closed = true;
+    if (this.haltSettleTimer) clearTimeout(this.haltSettleTimer);
     this.posts.abort();
   }
 
@@ -568,6 +587,7 @@ export class RelayToolDispatcher {
     // same model message (as Emma does): after a halt no call is announced to the bridge at all, so a group can never be used to admit one.
     const strict = this.o.admitPostHaltSiblings !== true;
     const ann = await this.claimOrWait(name, argsKey);
+    if (ann) this.streamSeq.set(this.cid(op), ann.seq);
     if (this.o.isStopped()) return refuse(STOPPED_MESSAGE);
     const release = strict ? await this.acquireExec() : undefined;
     let result: BridgeCallResult;
@@ -615,6 +635,43 @@ export class RelayToolDispatcher {
     // READ-ONLY tool is harmless and returns current data, a replay would hand the model stale data for the rest of the turn.
     if (fresh.readOnly.get(name) !== true) answer.replay = { key, content: result.content, isError: answer.isError };
     return answer;
+  }
+
+  /**
+   * Fires `onHaltSettled` once the halted message is complete (see the option). An announced sibling that has not arrived yet is waited for, at most the
+   * announcement wait (the same bound a call waits for its own announcement); then the message counts as complete without it. Never throws.
+   */
+  private checkHaltSettled(): void {
+    try {
+      if (this.halt === undefined || this.haltSettledFired || this.closed || !this.o.onHaltSettled) return;
+      if (this.inFlight.size > 0) return;
+      const halt = this.halt;
+      const missing = halt.batch >= 0 && this.announced.some((a) => a.batch === halt.batch && a.seq <= halt.cutoff && !a.claimed);
+      if (missing && this.haltSettleTimer === undefined) {
+        const t = setTimeout(() => {
+          this.haltSettleTimer = undefined;
+          if (this.inFlight.size === 0) this.fireHaltSettled();
+        }, Math.max(0, this.o.announceWaitMs ?? DEFAULT_ANNOUNCE_WAIT_MS));
+        t.unref?.();
+        this.haltSettleTimer = t;
+        return;
+      }
+      if (!missing) this.fireHaltSettled();
+    } catch {
+      /* best effort: without the signal the turn ends when the CLI does, as before */
+    }
+  }
+
+  private fireHaltSettled(): void {
+    if (this.haltSettledFired || this.closed) return;
+    this.haltSettledFired = true;
+    if (this.haltSettleTimer) clearTimeout(this.haltSettleTimer);
+    this.haltSettleTimer = undefined;
+    try {
+      this.o.onHaltSettled?.();
+    } catch {
+      /* the caller's hook must not break the dispatcher */
+    }
   }
 
   /** Serializes the executing phase of calls (see `strict` in `decide`). */

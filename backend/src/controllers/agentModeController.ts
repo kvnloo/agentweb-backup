@@ -11229,8 +11229,9 @@ export const agentModeController = {
       // to the hard ceiling (limit x2). Its slot is taken HERE, before anything is consumed, so a
       // 429 at the ceiling leaves the pending deck / request intact for a retry.
       // ENG-2113: an answer on the plan route runs its writes in THIS request and then continues on the user's plan. If the plan connection is down right now,
-      // the answer is refused with the deck still waiting (typed stop, nothing consumed), the same way a funding stop refuses it above.
-      if (planRoute && (deckAnswer || deckCancel)) {
+      // the answer is refused with the deck still waiting (typed stop, nothing consumed), the same way a funding stop refuses it above. A CANCEL runs nothing
+      // and always goes through, as on AgentWeb (its outcome note is kept for a "continue" like an answer's).
+      if (planRoute && deckAnswer) {
         try {
           const { claudeCodeBackend } = await import('../services/funding/claudeCodeBackendInstance');
           claudeCodeBackend.assertCanStartTurn();

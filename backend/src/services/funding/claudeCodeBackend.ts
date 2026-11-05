@@ -350,7 +350,7 @@ export class ClaudeCodeBackend {
     const startedAt = d.now();
     const ac = new AbortController();
     const uses: Array<{ id: string; name: string }> = [];
-    const seen: { usage?: ClaudeTurnUsage; confirmationFallback: boolean; stopped: boolean } = { confirmationFallback: false, stopped: false };
+    const seen: { usage?: ClaudeTurnUsage; confirmationFallback: boolean; stopped: boolean; haltSettled: boolean } = { confirmationFallback: false, stopped: false, haltSettled: false };
     let pendingStop: ClaudeRouteStopError | undefined;
     let rawError: unknown;
     let registered: { release(): void } | undefined;
@@ -446,6 +446,17 @@ export class ClaudeCodeBackend {
               now: d.now,
               // A16 / SF2: a worker past the call cap or the in-flight limit ends the turn (the host turn is interrupted; what ran is kept and persisted).
               onLimitTripped: () => ac.abort(),
+              // Approval cards: Emma's chat loop stops at the halted iteration (it builds the deck and never asks the model again). The relay does the same:
+              // once the halted message's calls are all answered, the turn is interrupted (the same graceful interrupt a Stop uses) and the deck is built.
+              ...(d.stageApprovalDeck
+                ? {
+                    onHaltSettled: () => {
+                      if (seen.stopped || ac.signal.aborted) return;
+                      seen.haltSettled = true;
+                      ac.abort();
+                    },
+                  }
+                : {}),
               isHalted: () => d.bridge.isHalted(p.sessionId, p.userId),
               admitPostHaltSiblings: d.relayAdmitPostHaltSiblings === true,
               isHaltingCall: (op) => d.bridge.takeHalts(p.userId, p.sessionId).some((h) => h.callId === op),
@@ -530,7 +541,8 @@ export class ClaudeCodeBackend {
             if (stop) {
               // Fields the host guarantees safe to log (a code and a short detail chosen by the host; never a path, token or text).
               console.error("[claude-backend] host failure", { code: (err as { code?: string }).code, detail: (err as { detail?: string }).detail, stop: stop.code, session: p.sessionId });
-              if (stop.markNeedsReconnect) await withinMs(this.markDeadLogin(client, connectionId, epoch, "host_denied"), MARK_BOUND_MS);
+              // Not after OUR interrupt at the halt: whatever the interrupted turn reports then is not evidence about the login.
+              if (stop.markNeedsReconnect && !seen.haltSettled) await withinMs(this.markDeadLogin(client, connectionId, epoch, "host_denied"), MARK_BOUND_MS);
               pendingStop = stop; // tool work that already ran is real: it is drained and persisted below, then this is thrown
             } else {
               rawError = err; // same: persist what ran, then fail (typed, by run())
@@ -568,43 +580,50 @@ export class ClaudeCodeBackend {
         await this.journal(p, runId, startedAt, "aborted", seen.usage);
         return { content: "Generation was stopped.", toolCalls: [], knowledgeBaseQueries: [], sources: [], responseMessages: [], persistedResponseCount: 0, cancelled: true };
       }
-      if (rawError !== undefined) {
-        await this.persistSettled(p, ledger, ledgerTruncated);
-        await this.journal(p, runId, startedAt, "failed", seen.usage);
-        throw rawError;
-      }
-      if (pendingStop) {
-        await this.persistSettled(p, ledger, ledgerTruncated);
-        await this.journal(p, runId, startedAt, "failed", seen.usage);
-        throw pendingStop;
-      }
-      if (!outcome || outcome.kind === "unknown_outcome") {
-        // The turn may have run and its output is lost. What the bridge saw is real; say plainly that the rest is unknown. Never retried.
-        const unknown = mapLedgerToResponseMessages({ ledger, finalText: OUTCOME_UNKNOWN_NOTE, llm: p.llmModel, stamps: p.stamps });
-        markLedgerTruncated(unknown.responseMessages, ledgerTruncated);
-        await this.journal(p, runId, startedAt, "aborted", seen.usage);
-        return { content: OUTCOME_UNKNOWN_NOTE, toolCalls: unknown.toolCalls, knowledgeBaseQueries: [], sources: [], responseMessages: unknown.responseMessages, persistedResponseCount: 0 };
-      }
-      const result = outcome.result;
-      if (!result.ok) {
-        // Anything the turn did before failing is real: keep it visible, then stop with the typed reason.
-        await this.persistSettled(p, ledger, ledgerTruncated);
-        await this.journal(p, runId, startedAt, result.aborted ? "aborted" : "failed", seen.usage);
-        const stop = fromResultErrorKind(result.errorKind, result.aborted);
-        // errorKind and aborted come from the worker: only values of the fixed sets are logged, anything else as `other`.
-        console.error("[claude-backend] turn ended not ok", { errorKind: safeToken(result.errorKind, RESULT_ERROR_KINDS), aborted: safeToken(result.aborted, RESULT_ABORT_REASONS), stop: stop.code, session: p.sessionId });
-        if (stop.markNeedsReconnect) await withinMs(this.markDeadLogin(client, connectionId, epoch, "turn_auth_dead"), MARK_BOUND_MS);
-        throw stop;
+      // Approval cards: the turn was interrupted BY US at the halt (see onHaltSettled). Whatever the interrupted CLI then reported (an aborted result, a
+      // dropped stream, an error) is that interrupt, not a failure of the turn: the halts become the deck, as in Emma's loop. A Stop still wins (above).
+      const haltEnded = seen.haltSettled;
+      let modelText = "";
+      if (!haltEnded) {
+        if (rawError !== undefined) {
+          await this.persistSettled(p, ledger, ledgerTruncated);
+          await this.journal(p, runId, startedAt, "failed", seen.usage);
+          throw rawError;
+        }
+        if (pendingStop) {
+          await this.persistSettled(p, ledger, ledgerTruncated);
+          await this.journal(p, runId, startedAt, "failed", seen.usage);
+          throw pendingStop;
+        }
+        if (!outcome || outcome.kind === "unknown_outcome") {
+          // The turn may have run and its output is lost. What the bridge saw is real; say plainly that the rest is unknown. Never retried.
+          const unknown = mapLedgerToResponseMessages({ ledger, finalText: OUTCOME_UNKNOWN_NOTE, llm: p.llmModel, stamps: p.stamps });
+          markLedgerTruncated(unknown.responseMessages, ledgerTruncated);
+          await this.journal(p, runId, startedAt, "aborted", seen.usage);
+          return { content: OUTCOME_UNKNOWN_NOTE, toolCalls: unknown.toolCalls, knowledgeBaseQueries: [], sources: [], responseMessages: unknown.responseMessages, persistedResponseCount: 0 };
+        }
+        const result = outcome.result;
+        modelText = result.text;
+        if (!result.ok) {
+          // Anything the turn did before failing is real: keep it visible, then stop with the typed reason.
+          await this.persistSettled(p, ledger, ledgerTruncated);
+          await this.journal(p, runId, startedAt, result.aborted ? "aborted" : "failed", seen.usage);
+          const stop = fromResultErrorKind(result.errorKind, result.aborted);
+          // errorKind and aborted come from the worker: only values of the fixed sets are logged, anything else as `other`.
+          console.error("[claude-backend] turn ended not ok", { errorKind: safeToken(result.errorKind, RESULT_ERROR_KINDS), aborted: safeToken(result.aborted, RESULT_ABORT_REASONS), stop: stop.code, session: p.sessionId });
+          if (stop.markNeedsReconnect) await withinMs(this.markDeadLogin(client, connectionId, epoch, "turn_auth_dead"), MARK_BOUND_MS);
+          throw stop;
+        }
       }
 
       const halts = d.bridge.takeHalts(p.userId, p.sessionId);
-      let finalText = result.text;
+      let finalText = modelText;
       let finalMetadata: Record<string, unknown> | undefined;
       let pendingApprovalDeck: PendingApprovalDeck | undefined;
       // Approval cards: what Emma's loop does when a message's tools asked for the user's confirmation. The halts become ONE deck (written to the session with
       // the loop's own conditional write), and the turn's visible answer is the deck prompt: the model's text after the halt is not shown, as in the loop.
       // Never throws: a deck that cannot be staged ends the turn with the fixed note below (nothing ran, nothing is approvable).
-      const staged = halts.length > 0 && d.stageApprovalDeck ? await this.stageHalts(p, halts) : undefined;
+      const staged = halts.length > 0 && d.stageApprovalDeck ? await this.stageHalts(p, halts, (id) => dispatcher?.streamOrderOf(id)) : undefined;
       if (staged?.kind === "deck") {
         finalText = staged.prompt;
         finalMetadata = deckMessageMetadata(staged.deck);
@@ -626,6 +645,7 @@ export class ClaudeCodeBackend {
       markLedgerTruncated(mapped.responseMessages, ledgerTruncated);
       this.reconnectGuard.reset(connectionId); // a turn worked: "login is dead" signals are not consecutive
       await this.journal(p, runId, startedAt, "succeeded", seen.usage);
+      if (haltEnded) console.info("[claude-backend] turn ended at the halt", { session: p.sessionId, run: runId, halts: halts.length, deck: staged?.kind ?? "none" });
       const last = mapped.responseMessages[mapped.responseMessages.length - 1];
       return {
         content: last.content,
@@ -687,9 +707,12 @@ export class ClaudeCodeBackend {
    * the bridge): nothing the worker sent. A failure (a database error, a bug) is logged and answered `undefined`: the caller ends the turn with the fixed note,
    * which shows no card and approves nothing. Never throws.
    */
-  private async stageHalts(p: ClaudeTurnParams, halts: BridgeHalt[]): Promise<PlanDeckStage | undefined> {
+  private async stageHalts(p: ClaudeTurnParams, halts: BridgeHalt[], streamOrder: (callId: string) => number | undefined): Promise<PlanDeckStage | undefined> {
     try {
-      const ordered = [...halts].sort((a, b) => (a.groupIndex ?? Number.MAX_SAFE_INTEGER) - (b.groupIndex ?? Number.MAX_SAFE_INTEGER));
+      // The model's own order of the calls (the stream position of each call's announcement), as Emma's deck follows the order of the model's tool_calls; the
+      // bridge's group position (arrival order) for a call the stream did not announce.
+      const key = (h: BridgeHalt) => streamOrder(h.callId) ?? h.groupIndex ?? Number.MAX_SAFE_INTEGER;
+      const ordered = [...halts].sort((a, b) => key(a) - key(b));
       return await this.deps.stageApprovalDeck!(p.sessionId, ordered.map((h) => h.result));
     } catch (err) {
       console.error("[claude-backend] approval deck could not be staged", { session: p.sessionId, error: safeText(err) });
