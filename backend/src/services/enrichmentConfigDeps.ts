@@ -86,8 +86,8 @@ const normalizedSet = (values: unknown): string[] =>
 
 /**
  * Keeps, per field, only a classification both samples agree on: the same smart flag, the same type and,
- * for an enum, the same set of options. A smart field keeps the dependencies from both samples (a missing
- * input is worse than an extra one) and is dropped when neither names any (it would be evaluated blind).
+ * for an enum, the same set of options. A smart field keeps the dependencies named by either sample (a
+ * missing input is worse than an extra one); none is fine, the evaluator also gets the lead's own columns.
  * Fields missing from either sample are dropped.
  */
 export function agreeingClassifications(
@@ -101,11 +101,7 @@ export function agreeingClassifications(
     if (!!x.isSmartField !== !!y.isSmartField || (x.fieldType ?? null) !== (y.fieldType ?? null)) continue;
     if (x.fieldType === 'enum' && normalizedSet(x.enumOptions).join('\u0000') !== normalizedSet(y.enumOptions).join('\u0000')) continue;
     if (!x.isSmartField) { out[name] = x; continue; }
-    const seen = new Set<string>();
-    const dependencies = [...(Array.isArray(x.dependencies) ? x.dependencies : []), ...(Array.isArray(y.dependencies) ? y.dependencies : [])]
-      .filter((d): d is string => typeof d === 'string' && !!d.trim())
-      .filter(d => { const key = d.trim().toLowerCase(); if (seen.has(key)) return false; seen.add(key); return true; });
-    if (dependencies.length > 0) out[name] = { ...x, dependencies };
+    out[name] = { ...x, dependencies: [...new Set([...normalizedSet(x.dependencies), ...normalizedSet(y.dependencies)])] };
   }
   return out;
 }
@@ -146,7 +142,8 @@ async function llmClassifySmartFields(
       throw failed instanceof Error ? failed : new Error(String(failed));
     }
     const agreed = agreeingClassifications(first.value ?? {}, second.value ?? {});
-    const dropped = Object.keys(first.value ?? {}).filter(name => !(name in agreed)).length;
+    const answered = first.value && typeof first.value === 'object' ? Object.keys(first.value) : [];
+    const dropped = answered.filter(name => !(name in agreed)).length;
     if (dropped > 0) console.warn(`[enrichmentConfigDeps] smart-field classification: ${dropped} field(s) not saved, the two samples disagreed`);
     return agreed;
   } catch (err) {

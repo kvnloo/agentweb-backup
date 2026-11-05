@@ -33,10 +33,19 @@ describe('agreeingClassifications', () => {
     expect(agreeingClassifications(a, { t: plain({ fieldType: 'enum', enumOptions: ['A', 'B'] }) })).toEqual({});
   });
 
-  it('keeps the dependencies from both samples, without duplicates, and drops a smart field that names none', () => {
-    const merged = agreeingClassifications({ q: smart(['employee_count', 'industry']) }, { q: smart(['Employee_Count', 'funding_stage']) });
+  it('keeps the dependencies from both samples, normalized and without duplicates', () => {
+    const merged = agreeingClassifications({ q: smart(['employee_count', 'industry']) }, { q: smart(['Employee_Count ', 'funding_stage']) });
     expect(merged.q.dependencies).toEqual(['employee_count', 'industry', 'funding_stage']);
-    expect(agreeingClassifications({ q: smart([]) }, { q: smart([]) })).toEqual({});
+  });
+
+  it('keeps a smart field that names no dependencies (the evaluator also gets the lead\'s own columns)', () => {
+    expect(agreeingClassifications({ q: smart([]) }, { q: smart([]) })).toEqual({ q: smart([]) });
+  });
+
+  it('drops a field when only one sample names a type', () => {
+    expect(agreeingClassifications({ f: { isSmartField: false, dependencies: [] } }, { f: plain() })).toEqual({});
+    const both = { f: { isSmartField: false, dependencies: [] } };
+    expect(agreeingClassifications(both, both)).toEqual(both);
   });
 
   it('ignores spurious dependencies on a field that is not smart', () => {
@@ -80,6 +89,9 @@ describe('alias inference prompt', () => {
     expect(p).toMatch(/THE LEAD THEMSELVES/);
     expect(p).toMatch(/THE LEAD'S CURRENT EMPLOYER/);
     expect(p).toMatch(/"email of the CEO" is NOT email/);
+    expect(p).toMatch(/A person-level attribute with no stated owner .* belongs to the lead/);
+    expect(p).toMatch(/email is the lead's own work email/);
+    expect(p).toMatch(/Facts about the employer itself stay with the employer .* its investors \(investors\), its customers \(customer_logos\)/);
     expect(p).toMatch(/return null/);
     expect(p).toMatch(/"contact number", "mobile", "cell"/); // synonyms still matched by meaning
   });

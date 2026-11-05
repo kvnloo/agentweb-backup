@@ -569,6 +569,18 @@ export async function processEnrichmentConfig(
     ),
   );
   if (classificationCandidates.length > 0) {
+    // A candidate's stored tags (restored in 3a) were made for an OLDER instruction: if the answer below is
+    // missing (the call failed, or the two samples disagreed, ENG-2720) the field must not keep computing
+    // the old condition on every run. Clear them; a later save classifies the field again.
+    const staleNames = new Set(classificationCandidates.map(f => f.name));
+    enriched = {
+      ...enriched,
+      fields: enriched.fields.map(f => {
+        if (!staleNames.has(f.name)) return f;
+        const { smartCondition: _sc, smartDependencies: _sd, notSmartInstruction: _nsi, ...rest } = f;
+        return rest;
+      }),
+    };
     try {
       const classifications = await deps.llmClassifySmartFields(
         classificationCandidates.map(f => ({ name: f.name, instruction: f.instruction })),
@@ -578,7 +590,7 @@ export async function processEnrichmentConfig(
         ...enriched,
         fields: enriched.fields.map(f => {
           const cls = classifications[f.name];
-          if (!cls) return f;  // not in classification batch — leave unchanged
+          if (!cls) return f;  // not classified (not in the batch, or undecided): candidates were cleared above
 
           const VALID_INFERRED_TYPES = new Set(['string', 'number', 'boolean', 'date', 'enum']);
           const inferredType = cls.fieldType && VALID_INFERRED_TYPES.has(cls.fieldType)
