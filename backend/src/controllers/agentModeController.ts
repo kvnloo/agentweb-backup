@@ -9,6 +9,7 @@ import {
 import { isEvaluationUser, EvaluationDenied } from '../services/evaluationPolicy';
 import { Request, Response } from 'express';
 import { AuthenticatedRequest, getUserFromToken, isRealAdmin } from '../middleware/auth';
+import { isSessionOwnerRequest } from '../services/shareViewerIdentity';
 import { agentModeService, AgentModeService, normalizeWorkPlanTitleForMatch, ADMIN_SKILL_TOOL_NAMES, ADMIN_SKILL_VIRTUAL_ID } from '../services/agentModeService';
 import { filterMessagesForClient as filterMessagesForClientPure } from '../utils/adminOnlyMessageFilter';
 import {
@@ -13270,6 +13271,17 @@ export const agentModeController = {
         );
       }
 
+      // ENG-2816: the link runs under the owner's userId, so a logged-in owner opening their own link used to
+      // count as a visitor. When the portal sends their login and it is the owner's own, this turn is an owner
+      // turn: the same tools and no anonymous-sender stamp as in their normal view. Anyone else (no login, a
+      // colleague, a delegate or service token, a bad token) stays a visitor, as before. Decided last, after every
+      // link, lock, usage and model check, so it can never stand in for any of them.
+      const viewerIsOwner = await isSessionOwnerRequest(req, session.userId);
+      if (viewerIsOwner) {
+        // Telemetry then reads `regular` rather than `interactive_share`, so leave a trace of this decision (no token).
+        console.log(`[ENG-2816] share link ${session.sessionId}: the viewer is the session owner; running an owner turn`);
+      }
+
       // Use the same generateSessionResponse logic as the regular generateResponse,
       // wrapped in wall-clock timeout to guarantee lock release on hung generation.
       const ishareSenderInfo = {
@@ -13286,7 +13298,7 @@ export const agentModeController = {
           session.userId,
           modelToUse,
           attachments,
-          true, // isInteractiveShare - block admin tools for security
+          !viewerIsOwner, // isInteractiveShare - block admin tools for security (ENG-2816: not for the link's own logged-in owner)
           undefined, // pageContext
           undefined, // isDelegatedAccess
           ishareSenderInfo,
