@@ -9,13 +9,15 @@
  *   1. Shape validation — pure, before any credential or Google call (ENG-2036).
  *   2. Payment method + usable Google Ads connection (assertZomaWriteReady 'google_ads').
  *   3. Read the current state the preview describes (target, budget, shared-budget usage).
- *   4. GOOGLE_TOOLKIT_SPEND_CEILING (mirrors META_TOOLKIT_SPEND_CEILING, micros).
+ *   4. GOOGLE_TOOLKIT_SPEND_CEILING (mirrors META_TOOLKIT_SPEND_CEILING, micros) — on budget
+ *      amounts, and on enabling a campaign at its current budget.
  *   5. No confirm → PREVIEW + single-use preview_token bound to the user, the exact arguments
  *      AND the state read in step 3. Nothing is sent to Google.
  *   6. confirm=true + matching token → dispatched ONCE through the same call_google_ads_api
  *      handler Emma uses (tracking pre-flight on enable, PAUSED defaults, ENG-592 read-back)
  *      → independent read-back. Only CONFIRMED is success; ENG-592's "accepted but unchanged"
- *      is MISMATCH, never success.
+ *      is MISMATCH, never success. A failure without a definite answer (timeout, network,
+ *      5xx) may have applied, so it is UNCONFIRMED (metered), never "did not apply".
  *
  * Money: callers send MAJOR currency units (amount: 50 = $50.00); converted to micros using
  * the account currency's minor-unit precision (more precision than the currency has is
@@ -125,8 +127,17 @@ export function majorToMicros(amount: unknown, currency: string, field: string):
   if (Math.abs(minor / 10 ** digits - amount) > 1e-9) {
     throw new MetaToolkitRefusal(`${field} ${amount} has more decimals than ${currency} allows (${digits}). Nothing was sent.`);
   }
-  return minor * 10 ** (6 - digits);
+  const micros = minor * 10 ** (6 - digits);
+  // A huge amount must not reach Google as an imprecise float / "1e+21" (Hardening, ENG-2823).
+  if (!Number.isSafeInteger(micros)) throw new MetaToolkitRefusal(`${field} ${amount} is too large. Nothing was sent.`);
+  return micros;
 }
+
+const positiveMicros = (amount: unknown, currency: string, field: string): number => {
+  const micros = majorToMicros(amount, currency, field);
+  if (micros <= 0) throw new MetaToolkitRefusal(`${field} must be greater than 0.`);
+  return micros;
+};
 
 export function formatMicros(micros: number, currency: string): string {
   const digits = currencyDigits(currency);
@@ -194,8 +205,7 @@ export function validateGoogleWriteShape(args: any, currency: string): Validated
     case 'BUDGET CREATE': {
       need(nonBlank(args.name), 'BUDGET CREATE requires name.');
       need(args.explicitly_shared === undefined || typeof args.explicitly_shared === 'boolean', 'explicitly_shared must be true or false.');
-      const micros = majorToMicros(args.amount, currency, 'amount');
-      need(micros > 0, 'amount must be greater than 0.');
+      const micros = positiveMicros(args.amount, currency, 'amount');
       return {
         dispatchArgs: { ...base, name: args.name, amount_micros: micros, explicitly_shared: args.explicitly_shared === true },
         budgetMicros: micros,
@@ -203,8 +213,7 @@ export function validateGoogleWriteShape(args: any, currency: string): Validated
     }
     case 'BUDGET UPDATE': {
       const rn = resource('budget', 'budget_resource_name');
-      const micros = majorToMicros(args.amount, currency, 'amount');
-      need(micros > 0, 'amount must be greater than 0.');
+      const micros = positiveMicros(args.amount, currency, 'amount');
       return { dispatchArgs: { ...base, budget_resource_name: rn, amount_micros: micros }, target: { kind: 'budget', resourceName: rn }, budgetMicros: micros };
     }
     case 'CAMPAIGN CREATE': {
@@ -224,7 +233,7 @@ export function validateGoogleWriteShape(args: any, currency: string): Validated
           ...base, name: args.name, type: args.type, budget_resource_name: budget,
           bidding_strategy: args.bidding_strategy, bidding_strategy_resource_name: args.bidding_strategy_resource_name,
           bidding_strategy_target: args.bidding_strategy_target,
-          cpc_bid_ceiling_micros: args.cpc_bid_ceiling === undefined ? undefined : majorToMicros(args.cpc_bid_ceiling, currency, 'cpc_bid_ceiling'),
+          cpc_bid_ceiling_micros: args.cpc_bid_ceiling === undefined ? undefined : positiveMicros(args.cpc_bid_ceiling, currency, 'cpc_bid_ceiling'),
           location_target_ids: args.location_target_ids, status: 'PAUSED',
         },
         expectedStatus: 'PAUSED',
@@ -240,7 +249,7 @@ export function validateGoogleWriteShape(args: any, currency: string): Validated
       return {
         dispatchArgs: {
           ...base, name: args.name, campaign_resource_name: campaign, type: args.type,
-          cpc_bid_micros: args.cpc_bid === undefined ? undefined : majorToMicros(args.cpc_bid, currency, 'cpc_bid'), status: 'PAUSED',
+          cpc_bid_micros: args.cpc_bid === undefined ? undefined : positiveMicros(args.cpc_bid, currency, 'cpc_bid'), status: 'PAUSED',
         },
         expectedStatus: 'PAUSED',
       };
@@ -264,6 +273,17 @@ function verify(validated: ValidatedWrite, entity: string, readBack: any | null)
     return 'CONFIRMED';
   }
   return readBack.status === validated.expectedStatus ? 'CONFIRMED' : 'MISMATCH';
+}
+
+/**
+ * True when a failed dispatch may still have been applied: no HTTP status (timeout, network
+ * error) or a 5xx. A 4xx, an auth failure, a gate block or a confirmation halt happened
+ * before or instead of the mutate, so nothing was applied.
+ */
+function outcomeUnknown(result: any): boolean {
+  if (result?.blocked || result?.awaitingUserConfirmation || result?.authError) return false;
+  const code = Number(result?.code);
+  return !Number.isInteger(code) || code >= 500;
 }
 
 const refuseNotFound = (what: string, rn: string) => {
@@ -302,6 +322,7 @@ export async function executeGoogleToolkitWrite(
     ? `This is a SHARED budget: it caps the combined spend of all ${b.referenceCount} campaign(s) attached to it.`
     : '');
   const op = `${entity} ${action}`;
+  let enableBudgetMicros: number | undefined;
 
   if (op === 'BUDGET CREATE') {
     lines.push(`Create budget "${args.name}": ${money(validated.budgetMicros!)}${validated.dispatchArgs.explicitly_shared ? ', SHARED (can be attached to several campaigns; it caps their combined spend)' : ''}.`);
@@ -335,6 +356,20 @@ export async function executeGoogleToolkitWrite(
     if (!prior) refuseNotFound(kind === 'campaign' ? 'Campaign' : 'Ad group', validated.target!.resourceName);
     state = { prior };
     lines.push(`${kind === 'campaign' ? 'Campaign' : 'Ad group'} "${prior!.name ?? prior!.resourceName}": ${prior!.status} → ${validated.expectedStatus}.`);
+    // Enabling a campaign starts spend at its budget, so the preview names that budget and
+    // the ceiling applies to it — otherwise a budget set above the ceiling outside Zoma
+    // (or before the ceiling existed) could be switched on here (Hardening, ENG-2823).
+    const budgetName = (prior as GoogleCampaignState).budget;
+    if (kind === 'campaign' && validated.expectedStatus === 'ENABLED' && isCustomerResource(cid, 'budget', budgetName)) {
+      const budget: GoogleBudgetState | null = await deps.read(userId, cid, 'budget', budgetName);
+      if (budget) {
+        state = { prior, budget };
+        enableBudgetMicros = budget.amountMicros;
+        lines.push(`Budget "${budget.name ?? budget.resourceName}": ${money(budget.amountMicros)}.`);
+        const note = sharedNote(budget);
+        if (note) lines.push(note);
+      }
+    }
   }
   lines.push(action === 'CREATE'
     ? 'Status: PAUSED — new campaigns and ad groups are always created paused; enabling is a separate preview and approval.'
@@ -347,6 +382,13 @@ export async function executeGoogleToolkitWrite(
     const prior = (state.prior as GoogleBudgetState | undefined)?.amountMicros;
     const verdict = evaluateMetaSpendCeiling(policy, { field: 'daily_budget', proposed: validated.budgetMicros, prior });
     if (!verdict.allowed) throw new MetaToolkitRefusal(verdict.message.replace('(minor units)', '(micros)'));
+  }
+  if (policy && op === 'CAMPAIGN UPDATE' && validated.expectedStatus === 'ENABLED') {
+    // Fail closed: a ceiling that cannot see the campaign's budget never allows enabling it.
+    const verdict = evaluateMetaSpendCeiling(policy, { field: 'daily_budget', proposed: enableBudgetMicros });
+    if (!verdict.allowed) {
+      throw new MetaToolkitRefusal(`Enabling this campaign would start spend at its budget. ${verdict.message.replace('(minor units)', '(micros)')}`);
+    }
   }
 
   const fingerprint = previewFingerprint({ platform: 'google_ads', userId, args: validated.dispatchArgs, state, currency });
@@ -367,12 +409,31 @@ export async function executeGoogleToolkitWrite(
     throw new MetaToolkitRefusal('This preview_token was already used. Run a new preview for another change.');
   }
 
-  const result = await deps.dispatch(userId, validated.dispatchArgs);
+  // A throw after the token was consumed is treated like a transport failure: outcome unknown.
+  const result = await deps.dispatch(userId, validated.dispatchArgs)
+    .catch((error: unknown) => ({ success: false, error: error instanceof Error ? error.message : String(error) }));
   if (result?.success === false && result?.errorType === 'unsupported_field') {
     // ENG-592: Google accepted the mutate but read-back shows it unchanged. Never success.
     return {
       success: false, verification: 'MISMATCH' as WriteVerification, id: validated.target?.resourceName ?? null,
       message: String(result.error ?? 'Google accepted the change but read-back shows it did not apply.'),
+    };
+  }
+  if (result?.success === false && outcomeUnknown(result)) {
+    // The request may have reached Google and been applied (e.g. a timeout after Google
+    // committed). "Did not apply" here invites a retry that double-applies a CREATE, so this
+    // is UNCONFIRMED, metered as a write, with the current state read back when we can.
+    const readBack = validated.target ? await deps.read(userId, cid, validated.target.kind, validated.target.resourceName).catch(() => null) : null;
+    return {
+      success: false,
+      verification: 'UNCONFIRMED' as WriteVerification,
+      id: validated.target?.resourceName ?? null,
+      status: readBack?.status ?? null,
+      ...(readBack?.amountMicros !== undefined ? { amount_micros: readBack.amountMicros, amount: formatMicros(readBack.amountMicros, currency) } : {}),
+      message: `UNCONFIRMED: the ${action} ${entity} request failed without a definite answer from Google Ads (${String(result.error ?? 'unknown error')}), so it may or may not have been applied. `
+        + (action === 'CREATE'
+          ? `Do not retry blindly — list the ${entity === 'AD_GROUP' ? 'ad groups' : `${entity.toLowerCase()}s`} first to check whether "${String(args.name)}" was created.`
+          : `Do not retry blindly — check the current ${entity} state first${readBack ? ' (read back above)' : ''}.`),
     };
   }
   if (!result?.success || result?.blocked || result?.awaitingUserConfirmation) {
