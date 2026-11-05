@@ -158,6 +158,19 @@ export function usageFromResult(raw: Record<string, unknown>): Extract<ProviderE
   return ev.inputTokens === undefined && ev.outputTokens === undefined && ev.cacheReadTokens === undefined && ev.cacheWriteTokens === undefined ? undefined : ev;
 }
 
+/**
+ * Token counts of ONE model call, from a stream `assistant` line (`message.id` + `message.usage`). The CLI can print one line per content block of the same
+ * message, each repeating the message's counts: the caller keeps the LAST counts per message id and adds the messages up. Used only when the turn ends
+ * without a final `result` (an interrupt, a close, a failure), so a turn that ran still reports what it used. Anything malformed is ignored.
+ */
+export function messageUsageOf(raw: Record<string, unknown>): { id: string; usage: Extract<ProviderEvent, { type: "usage" }> } | undefined {
+  if (raw.type !== "assistant") return undefined;
+  const m = asRecord(raw.message);
+  if (!m || typeof m.id !== "string" || m.id.length === 0 || m.id.length > MAX_FIELD_CHARS) return undefined;
+  const usage = usageFromResult({ usage: m.usage });
+  return usage ? { id: m.id, usage } : undefined;
+}
+
 export type FailureClass = "auth_like" | "usage_limit" | "transient" | "unknown";
 
 /**

@@ -44,7 +44,7 @@ import { approxJsonBytes, LogThrottle, MAX_CLI_LINE_DEPTH, MAX_FORWARDED_DEPTH, 
 import { canonicalJson } from "../relay/canonical";
 import { createHash } from "crypto";
 import type { RelayCall, RelayEndpoint, RelayHost } from "../relay/relayServer";
-import { MAX_BLOCKS_NORMALIZED, MAX_CLASSIFY_CHARS, classifyFailureText, failureClassToKind, normalizeClaudeEvent, parseAuthStatus, parseDoctorHazards, usageFromResult } from "./claudeParse";
+import { MAX_BLOCKS_NORMALIZED, MAX_CLASSIFY_CHARS, classifyFailureText, failureClassToKind, messageUsageOf, normalizeClaudeEvent, parseAuthStatus, parseDoctorHazards, usageFromResult } from "./claudeParse";
 
 export interface ClaudeAdapterConfig {
   /** Pinned binary: absolute path, `--version` output and content digest, verified by the host at startup (never recomputed per call). */
@@ -100,6 +100,9 @@ const DEFAULTS = {
 
 /** The host's ChildLike as the structural child the runner expects, plus an `exited` promise that resolves when the process is really gone. */
 /** Exported for tests only. */
+/** Model calls per turn whose token counts are remembered for a turn that ends without the CLI's `result` (a real turn has a few dozen at most). */
+const MAX_USAGE_MESSAGES = 2_000;
+
 export class RunnerChildAdapter extends EventEmitter implements RunnerChild {
   readonly stdin: ChildLike["stdin"];
   readonly stdout: Transform;
@@ -908,6 +911,8 @@ class ClaudeSession implements ProviderSession {
   private handle: ClaudeCliSessionHandle | undefined;
   private used = false;
   private interrupted = false;
+  /** Per model message (id -> last counts seen), for a turn that ends without the CLI's final `result` (see messageUsageOf). Bounded. */
+  private readonly messageUsage = new Map<string, Extract<ProviderEvent, { type: "usage" }>>();
   private closing = false;
   private closePromise: Promise<void> | undefined;
   private spawning: Promise<unknown> | undefined;
@@ -1009,6 +1014,34 @@ class ClaudeSession implements ProviderSession {
   }
 
   /** A tool_use block from the stream (informational ONLY: it is never executed or registered, it just tells us which model message a relayed call belongs to). */
+  private noteMessageUsage(raw: Record<string, unknown>): void {
+    try {
+      const mu = messageUsageOf(raw);
+      if (!mu) return;
+      if (!this.messageUsage.has(mu.id) && this.messageUsage.size >= MAX_USAGE_MESSAGES) return; // a turn has far fewer model calls; a flood is not counted
+      this.messageUsage.set(mu.id, mu.usage);
+    } catch {
+      /* usage is best effort */
+    }
+  }
+
+  /** The stream's per-message counts added up, or undefined when the stream reported none. Each sum is capped (the backend clamps again). */
+  private streamUsage(): Extract<ProviderEvent, { type: "usage" }> | undefined {
+    if (this.messageUsage.size === 0) return undefined;
+    const sum: Extract<ProviderEvent, { type: "usage" }> = { type: "usage" };
+    const add = (k: "inputTokens" | "outputTokens" | "cacheReadTokens" | "cacheWriteTokens", v: number | undefined) => {
+      if (v === undefined || !Number.isFinite(v) || v < 0) return;
+      sum[k] = Math.min((sum[k] ?? 0) + v, Number.MAX_SAFE_INTEGER);
+    };
+    for (const u of this.messageUsage.values()) {
+      add("inputTokens", u.inputTokens);
+      add("outputTokens", u.outputTokens);
+      add("cacheReadTokens", u.cacheReadTokens);
+      add("cacheWriteTokens", u.cacheWriteTokens);
+    }
+    return sum.inputTokens === undefined && sum.outputTokens === undefined && sum.cacheReadTokens === undefined && sum.cacheWriteTokens === undefined ? undefined : sum;
+  }
+
   private noteStreamUse(raw: Record<string, unknown>): void {
     if (raw.type !== "assistant") return;
     const msg = raw.message as { id?: unknown; content?: unknown } | undefined;
@@ -1176,6 +1209,7 @@ class ClaudeSession implements ProviderSession {
           onEvent: (raw) =>
             this.meter.time(() => {
               this.guarded(this.waiting?.call.operationId, () => this.noteStreamUse(raw));
+              this.noteMessageUsage(raw);
               const blocks = (raw as { message?: { content?: unknown } }).message?.content;
               if (Array.isArray(blocks) && blocks.length > MAX_BLOCKS_NORMALIZED) this.noteBudget("event_blocks_dropped"); // blocks past the cap are not forwarded: said once, fixed code
               const evs = normalizeClaudeEvent(raw);
@@ -1201,15 +1235,22 @@ class ClaudeSession implements ProviderSession {
           },
         );
       for await (const ev of events) yield ev;
+      // No final `result` from the CLI (an interrupt, a close, a failure): the model calls that did run still report their tokens, added up from the stream.
+      const streamUsage = this.streamUsage();
       if (events.overflowed) {
+        if (streamUsage) yield streamUsage;
         yield { type: "result", ok: false, text: "", errorKind: "transient" };
         return;
       }
       if (failure !== undefined) {
+        if (streamUsage) yield streamUsage;
         yield { type: "result", ok: false, text: "", errorKind: this.adapter.mapError(failure) };
         return;
       }
-      if (!result) return;
+      if (!result) {
+        if (streamUsage) yield streamUsage;
+        return;
+      }
       const usage = usageFromResult(result.raw as Record<string, unknown>);
       if (usage) yield usage;
       if (!result.isError) {

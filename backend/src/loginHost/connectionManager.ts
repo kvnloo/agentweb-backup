@@ -591,7 +591,13 @@ export class ConnectionManager {
         if (next === "hung") return yield* this.abandonHung(c, session, running, () => (status = "aborted"));
         if (next.done) break;
         const ev = next.value;
-        if (running.aborted) break;
+        if (running.aborted && ev.type !== "alarm") {
+          // A turn the backend interrupted (a Stop, or the end at an approval halt) still reports the tokens it used: the adapter adds up the stream's
+          // per-message counts when the CLI ends without its final result, as its LAST event. So after the abort the stream is drained (bounded: the
+          // gate fires after abortGraceMs) and only that usage is forwarded; an alarm is still handled below.
+          if (ev.type === "usage") yield ev;
+          continue;
+        }
         if (ev.type === "alarm") {
           // Defense in depth: an epoch change always aborts the turn first (checked above), so a stale alarm should not get here.
           // The alarm event must reach the consumer even when the kills inside raiseAlarm fail: it is reported first, the failure after.
