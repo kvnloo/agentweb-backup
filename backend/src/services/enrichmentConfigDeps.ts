@@ -46,7 +46,6 @@ async function llmInferAliases(
   // Lazy import — avoids circular deps + keeps the LLM service out of the
   // hot path for callers that never hit alias inference.
   const { FIELD_GROUPS, CARD_REVENUE_GROUP } = await import('./enrichmentGroups');
-  const { createLLMService } = await import('../utils/llmService');
 
   // Build the canonical-field cheat sheet for the system prompt. Grouping
   // by FIELD_GROUPS gives the LLM more context (it understands "Series A"
@@ -77,10 +76,8 @@ async function llmInferAliases(
     `\n\nReturn JSON: {"<userFieldName>": "<canonical_name>" | null} for each input.`;
 
   try {
-    const llm = createLLMService(
-      process.env.CRM_ENRICH_V3_ALIAS_MODEL || 'gpt-5-chat-2',
-      0.0,
-    );
+    const { createEnrichmentHelperLLM } = await import('./enrichmentMappingLlm');
+    const llm = await createEnrichmentHelperLLM(userId, process.env.CRM_ENRICH_V3_ALIAS_MODEL);
     const result = await llm.generateJSONContent<Record<string, string | null>>(
       systemPrompt,
       userPrompt,
@@ -101,7 +98,6 @@ async function llmClassifySmartFields(
 ): Promise<Record<string, SmartFieldClassification>> {
   if (fields.length === 0) return {};
   const { FIELD_GROUPS, CARD_REVENUE_GROUP } = await import('./enrichmentGroups');
-  const { createLLMService: mkLLM } = await import('../utils/llmService');
   const {
     buildSmartFieldClassificationSystemPrompt,
     buildSmartFieldClassificationUserPrompt,
@@ -114,7 +110,8 @@ async function llmClassifySmartFields(
     .join('\n');
 
   try {
-    const llm = mkLLM(process.env.CRM_ENRICH_V3_CLASSIFY_MODEL || process.env.CRM_ENRICH_V3_ALIAS_MODEL || 'gpt-5-chat-2', 0.0);
+    const { createEnrichmentHelperLLM } = await import('./enrichmentMappingLlm');
+    const llm = await createEnrichmentHelperLLM(userId, process.env.CRM_ENRICH_V3_CLASSIFY_MODEL || process.env.CRM_ENRICH_V3_ALIAS_MODEL);
     const result = await llm.generateJSONContent<
       Record<string, SmartFieldClassification>
     >(
