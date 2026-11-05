@@ -201,4 +201,32 @@ describe('GET /connected-accounts — Meta Ads capability (ENG-1158)', () => {
     expect(account.expiry_message).toContain('100335622083559');
     expect(account.expiry_message).not.toMatch(/permission not granted/i);
   });
+
+  it('ENG-2822: a Page-gapped account with an expired token still reports expired', async () => {
+    (connectedAccountsDb.getAccountsWithOwnerIncludingOrgShared as jest.Mock).mockResolvedValue([
+      metaAdAccount({
+        granted_scopes: ['ads_read', 'ads_management'],
+        has_meta_pages: false,
+        token_expires_at: Date.now() - 24 * 60 * 60 * 1000,
+      }),
+    ]);
+    const { getTokenStatus } = jest.requireMock('../utils/tokenUtils');
+    (getTokenStatus as jest.Mock).mockReturnValueOnce('expired').mockReturnValueOnce('expired');
+
+    const account = await listAccounts();
+
+    expect(account.status).toBe('expired');
+  });
+
+  it('ENG-2822: unknown ads scope with no Page stays disconnected', async () => {
+    (connectedAccountsDb.getAccountsWithOwnerIncludingOrgShared as jest.Mock).mockResolvedValue([
+      metaAdAccount({ has_meta_pages: false }),
+    ]);
+
+    const account = await listAccounts();
+
+    expect(account.status).toBe('disconnected');
+    expect(account.ads_capable).toBe(false);
+    expect(account.expiry_message).toBe('Reconnect required — Meta Ads permission not granted');
+  });
 });

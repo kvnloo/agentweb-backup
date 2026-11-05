@@ -547,7 +547,7 @@ describe('describeMetaAdsCapability — Page access (ENG-2232)', () => {
     // No granted_scopes on record at all, but the Page probe still ran and found none.
     expect(
       describeMetaAdsCapability(adAccount({ has_meta_pages: false }))
-    ).toEqual({ can_create_ads: false, capability_warning: META_ADS_NO_PAGES_MESSAGE });
+    ).toEqual({ ads_capable: false, can_create_ads: false, capability_warning: META_ADS_NO_PAGES_MESSAGE });
   });
 
   it('stays capable when ads_read is granted and Pages are confirmed accessible', () => {

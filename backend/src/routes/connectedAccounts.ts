@@ -355,11 +355,14 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
         // multi-day zero-data reporting outage go unnoticed (ENG-1158) — surface it
         // as needing reconnection so the row shows the Reconnect action.
         status = 'disconnected';
-        // ENG-2822: use the specific reason; the generic label misdescribed other causes.
-        expiryMessage = adsCapability.capability_warning || 'Reconnect required — Meta Ads permission not granted';
-      } else if (adsCapability.can_create_ads === false) {
+        expiryMessage = 'Reconnect required — Meta Ads permission not granted';
+      } else if (
+        adsCapability.can_create_ads === false &&
+        ((acc.config as any).refresh_token || getTokenStatus(acc.config.token_expires_at) !== 'expired')
+      ) {
         // ENG-2822: Page access is missing, which blocks only ad CREATION. Reads and
-        // reporting still work, so the account stays connected but carries the reason.
+        // reporting still work, so a live token stays connected but carries the reason.
+        // An expired token falls through so it still reports as expired.
         status = 'active';
         expiryMessage = adsCapability.capability_warning || 'Connected — Facebook Page access needed to create ads';
       } else {

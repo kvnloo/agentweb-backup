@@ -395,7 +395,9 @@ export const describeMetaAdsCapability = (
   // missing Page is reported as can_create_ads:false plus the warning.
   if (getMetaPagesAccessState(account?.config) === 'missing') {
     return {
-      ...(state === 'granted' ? { ads_capable: true } : {}),
+      // Unknown ads scope stays fail-closed (pre-ENG-2822 reading): without a
+      // confirmed grant there is no evidence that reads work either.
+      ads_capable: state === 'granted',
       can_create_ads: false,
       capability_warning: getMetaAdsNoPagesMessage(account?.config),
     };
