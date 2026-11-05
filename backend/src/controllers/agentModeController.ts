@@ -141,7 +141,7 @@ import {
   buildTimeoutPartialWorkMessage,
   hasDeferredMediaBudgetToolCall,
   hasPersistedMediaBudgetDeferral,
-  hasUnresolvedMediaDeferral,
+  hasUnresolvedMediaDeferral, lastUserTurnWasShareVisitor,
 } from '../utils/timeoutContinuation';
 import { MEDIA_GEN_TOOLS, mediaGenProducedAsset } from '../services/agentMode/core/toolDispatch';
 import {
@@ -1979,6 +1979,9 @@ async function scheduleAutoMediaContinuation(
   // carried through every round (never re-derived from the session's kind): an owner who reopened a scheduled chat is
   // attended; a headless starter passes true.
   isUnattendedRun: boolean,
+  // ENG-2816: whether the request being continued came from a share-link visitor. Carried through every round like
+  // isUnattendedRun: dropping it would run the follow-up with the owner's full tool set over a visitor's request.
+  isInteractiveShare: boolean = false,
 ): Promise<void> {
   if (round > AUTO_MEDIA_CONTINUATION_MAX_ROUNDS) {
     console.error(
@@ -2075,7 +2078,7 @@ async function scheduleAutoMediaContinuation(
       userId,
       llmModel,
       undefined, // attachments
-      undefined, // isInteractiveShare
+      isInteractiveShare || undefined, // isInteractiveShare (ENG-2816: kept for a visitor's request, see the parameter)
       undefined, // pageContext
       undefined, // isDelegatedAccess
       undefined, // ishareSenderInfo
@@ -2184,7 +2187,7 @@ async function scheduleAutoMediaContinuation(
         // (the try/catch above now guards its one known throw point), but every
         // fire-and-forget call site catches defensively anyway, so a future,
         // unanticipated throw logs instead of becoming an unhandled rejection.
-        scheduleAutoMediaContinuation(sessionId, userId, llmModel, round + 1, isUnattendedRun).catch((chainErr) =>
+        scheduleAutoMediaContinuation(sessionId, userId, llmModel, round + 1, isUnattendedRun, isInteractiveShare).catch((chainErr) =>
           console.error(`AgentMode: media auto-continuation chain failed for session ${sessionId}:`, chainErr),
         );
       }
@@ -10954,6 +10957,8 @@ export const agentModeController = {
           session.llmModel || agentModeService.default_model,
           1,
           false, // the genuine owner is viewing the chat (genuineOwnerView): attended
+          // ENG-2816: the owner opening the chat must not turn a visitor's deferred request into an owner-powered one.
+          lastUserTurnWasShareVisitor(session.messages),
         ).catch((err) =>
           console.error(`AgentMode: media auto-continuation (durability backstop) failed for session ${session.sessionId}:`, err),
         ));
@@ -13006,6 +13011,9 @@ export const agentModeController = {
   async generateSharedResponse(req: Request, res: Response) {
     // ENG-510: declared before the try so the catch's partial-timeout branch can read it.
     let sharedTurnStartMs = Date.now();
+    // ENG-2816: whether this turn is a visitor's (the default until the owner is recognised), declared out here so the catch's
+    // timeout auto-continuation, which cannot see the try's locals, carries the same answer.
+    let sharedTurnIsVisitor = true;
     // ENG-971: see generateResponse — calledFunctions is session-cumulative, so the
     // error path needs this turn's starting point to attribute successes correctly.
     let turnStartCalledFunctions: Record<string, number> | null = null;
@@ -13291,6 +13299,7 @@ export const agentModeController = {
       // colleague, a delegate or service token, a bad token) stays a visitor, as before. Decided last, after every
       // link, lock, usage and model check, so it can never stand in for any of them.
       const viewerIsOwner = await isSessionOwnerRequest(req, session.userId);
+      sharedTurnIsVisitor = !viewerIsOwner;
       if (viewerIsOwner) {
         // Telemetry then reads `regular` rather than `interactive_share`, so leave a trace of this decision (no token).
         console.log(`[ENG-2816] share link ${session.sessionId}: the viewer is the session owner; running an owner turn`);
@@ -13428,7 +13437,7 @@ export const agentModeController = {
             if (hasPersistedMediaBudgetDeferral(timedOutSession?.messages, sharedTurnStartMs)) {
               const continuationUserId = timedOutSession!.userId;
               const continuationModel = timedOutSession!.llmModel || agentModeService.default_model;
-              setImmediate(() => scheduleAutoMediaContinuation(shareId, continuationUserId, continuationModel, 1, false).catch((err) =>
+              setImmediate(() => scheduleAutoMediaContinuation(shareId, continuationUserId, continuationModel, 1, false, sharedTurnIsVisitor).catch((err) =>
                 console.error(`AgentMode: media auto-continuation (ishare whole-turn timeout) failed for session ${shareId}:`, err),
               ));
             }
