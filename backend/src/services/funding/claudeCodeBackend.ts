@@ -141,6 +141,8 @@ export interface ClaudeBackendDeps {
   softDeadlineLeadMs?: number;
   /** How long a relayed call waits for the stream line that announces it (default 1.5 s; tests shorten it). */
   relayAnnounceWaitMs?: number;
+  /** How long a halted message waits for an announced sibling that has not arrived (default 15 s, never beyond the soft deadline; tests shorten it). */
+  relayHaltSiblingWaitMs?: number;
   executor: {
     registerRun(runId: string, ctx: { llmModel: string; isDelegatedAccess?: boolean; excludeTools?: string[]; screenshotUrl?: string; socketEmit?: (room: string, event: string, payload: any) => void; fundingScope?: RunFunding }): void;
     beginTurn(runId: string, turn: { agentRuntimeRunId?: string; priorSearchCallCount?: number }): void;
@@ -351,6 +353,7 @@ export class ClaudeCodeBackend {
     const ac = new AbortController();
     const uses: Array<{ id: string; name: string }> = [];
     const seen: { usage?: ClaudeTurnUsage; confirmationFallback: boolean; stopped: boolean; haltSettled: boolean } = { confirmationFallback: false, stopped: false, haltSettled: false };
+    let hostTurnEnded = false; // the host turn already returned or failed on its own: a halt that settles after that is not our interrupt
     let pendingStop: ClaudeRouteStopError | undefined;
     let rawError: unknown;
     let registered: { release(): void } | undefined;
@@ -451,7 +454,7 @@ export class ClaudeCodeBackend {
               ...(d.stageApprovalDeck
                 ? {
                     onHaltSettled: () => {
-                      if (seen.stopped || ac.signal.aborted) return;
+                      if (seen.stopped || ac.signal.aborted || hostTurnEnded) return;
                       seen.haltSettled = true;
                       ac.abort();
                     },
@@ -461,6 +464,7 @@ export class ClaudeCodeBackend {
               admitPostHaltSiblings: d.relayAdmitPostHaltSiblings === true,
               isHaltingCall: (op) => d.bridge.takeHalts(p.userId, p.sessionId).some((h) => h.callId === op),
               ...(d.relayAnnounceWaitMs !== undefined ? { announceWaitMs: d.relayAnnounceWaitMs } : {}),
+              ...(d.relayHaltSiblingWaitMs !== undefined ? { haltSiblingWaitMs: d.relayHaltSiblingWaitMs } : {}),
               onCall: (phase, name) => {
                 if (phase === "start") progress("executing_tools", { pendingTools: [name] });
                 else progress("tool_executed");
@@ -523,7 +527,9 @@ export class ClaudeCodeBackend {
               },
             },
           );
+          hostTurnEnded = true;
         } catch (err) {
+          hostTurnEnded = true;
           // A relay turn refused as INVALID at admission: the worker may be older than the cached protocol says (a ROLLBACK to protocol 3 rejects `tools`
           // and the cached "match / 4" would otherwise stay for up to 10 minutes, failing every relay turn). Forget the cached protocol now and fail THIS turn
           // as the retryable "worker unavailable"; nothing ran. The next turn is decided on the fresh answer (unknown, then the real protocol).
@@ -546,6 +552,7 @@ export class ClaudeCodeBackend {
               pendingStop = stop; // tool work that already ran is real: it is drained and persisted below, then this is thrown
             } else {
               rawError = err; // same: persist what ran, then fail (typed, by run())
+              console.error("[claude-backend] host turn failed", { session: p.sessionId, error: safeText(err), afterHalt: seen.haltSettled });
               ac.abort();
             }
           }
@@ -711,8 +718,16 @@ export class ClaudeCodeBackend {
     try {
       // The model's own order of the calls (the stream position of each call's announcement), as Emma's deck follows the order of the model's tool_calls; the
       // bridge's group position (arrival order) for a call the stream did not announce.
-      const key = (h: BridgeHalt) => streamOrder(h.callId) ?? h.groupIndex ?? Number.MAX_SAFE_INTEGER;
-      const ordered = [...halts].sort((a, b) => key(a) - key(b));
+      // Two numbering scales, kept apart: announced calls first by stream position, then unannounced ones in the bridge's arrival order.
+      const rank = (h: BridgeHalt): [number, number] => {
+        const s = streamOrder(h.callId);
+        return s !== undefined ? [0, s] : [1, h.groupIndex ?? Number.MAX_SAFE_INTEGER];
+      };
+      const ordered = [...halts].sort((a, b) => {
+        const [ga, ka] = rank(a);
+        const [gb, kb] = rank(b);
+        return ga - gb || ka - kb;
+      });
       return await this.deps.stageApprovalDeck!(p.sessionId, ordered.map((h) => h.result));
     } catch (err) {
       console.error("[claude-backend] approval deck could not be staged", { session: p.sessionId, error: safeText(err) });

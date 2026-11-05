@@ -161,6 +161,16 @@ function bounded<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   return Promise.race([p, limit]).finally(() => timer && clearTimeout(timer));
 }
 
+/** A usage event rebuilt from its four counts: each finite and >= 0, anything else left out; undefined when no count survives. */
+function sanitizedUsage(ev: Extract<ProviderEvent, { type: "usage" }>): Extract<ProviderEvent, { type: "usage" }> | undefined {
+  const out: Extract<ProviderEvent, { type: "usage" }> = { type: "usage" };
+  for (const k of ["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens"] as const) {
+    const v = ev[k];
+    if (typeof v === "number" && Number.isFinite(v) && v >= 0) out[k] = Math.min(Math.floor(v), Number.MAX_SAFE_INTEGER);
+  }
+  return out.inputTokens === undefined && out.outputTokens === undefined && out.cacheReadTokens === undefined && out.cacheWriteTokens === undefined ? undefined : out;
+}
+
 /** Resolves racing waits to "hung" once fired; listeners are removed as each wait settles (no handler pile-up on long turns). */
 class AbortGate {
   fired = false;
@@ -591,11 +601,17 @@ export class ConnectionManager {
         if (next === "hung") return yield* this.abandonHung(c, session, running, () => (status = "aborted"));
         if (next.done) break;
         const ev = next.value;
-        if (running.aborted && ev.type !== "alarm") {
+        if (running.aborted) {
           // A turn the backend interrupted (a Stop, or the end at an approval halt) still reports the tokens it used: the adapter adds up the stream's
-          // per-message counts when the CLI ends without its final result, as its LAST event. So after the abort the stream is drained (bounded: the
-          // gate fires after abortGraceMs) and only that usage is forwarded; an alarm is still handled below.
-          if (ev.type === "usage") yield ev;
+          // per-message counts when the CLI ends without its final result, as its LAST event before the closing result. So after the abort the stream is read
+          // (bounded: the gate fires after abortGraceMs) until that ONE usage event, which is rebuilt from four validated numbers (nothing else of the event
+          // is forwarded) and sent; then the loop ends. Everything else after an abort is dropped as before, an alarm included (a late alarm must not park
+          // the connection: the process is already being closed).
+          if (ev.type === "usage") {
+            const u = sanitizedUsage(ev);
+            if (u) yield u;
+            break;
+          }
           continue;
         }
         if (ev.type === "alarm") {

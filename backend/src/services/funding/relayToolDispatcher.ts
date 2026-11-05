@@ -82,6 +82,11 @@ const CALL_INPUT_BUDGET_BYTES = 2 * 1024 * 1024;
 const SMALL_INPUT_BYTES = 16 * 1024;
 /** How long a call waits for the stream line that announces it (the worker can hand the call over a moment before that line). */
 const DEFAULT_ANNOUNCE_WAIT_MS = 1_500;
+/**
+ * How long the halted message may wait for a sibling the stream announced before the halt but whose call has not reached the backend yet. The CLI starts the next
+ * call only after the previous answer reached it, so a slow model/CLI step is normal; this is longer than the announcement wait, and never beyond the soft deadline.
+ */
+const DEFAULT_HALT_SIBLING_WAIT_MS = 15_000;
 
 export interface RelayBridgePort {
   callTool(token: string, call: { name: string; args: Record<string, unknown>; callId?: string }, runId: string, opts?: { signal?: AbortSignal }): Promise<BridgeCallResult>;
@@ -120,6 +125,8 @@ export interface RelayDispatcherOptions {
   isHalted: () => boolean;
   /** Whether THIS call is the one whose result carries the confirmation request (the bridge recorded a halt for it). */
   isHaltingCall: (operationId: string) => boolean;
+  /** See DEFAULT_HALT_SIBLING_WAIT_MS (tests shorten it). */
+  haltSiblingWaitMs?: number;
   /** See DEFAULT_ANNOUNCE_WAIT_MS (tests shorten it). */
   announceWaitMs?: number;
   /**
@@ -270,6 +277,8 @@ export class RelayToolDispatcher {
   /** The model message of the call that latched this turn's halt, and the last announcement recorded before its answer went back. */
   private halt: { batch: number; cutoff: number } | undefined;
   private haltSettledFired = false;
+  /** The wait for announced-but-unarrived siblings ran out: the halted message counts as complete without them (never waited for twice). */
+  private siblingWaitExpired = false;
   private haltSettleTimer: NodeJS.Timeout | undefined;
   /** Backend call id -> the stream position of the announcement it matched: the model's own order of the calls (Emma's deck follows the model's call order). */
   private readonly streamSeq = new Map<string, number>();
@@ -639,19 +648,22 @@ export class RelayToolDispatcher {
 
   /**
    * Fires `onHaltSettled` once the halted message is complete (see the option). An announced sibling that has not arrived yet is waited for, at most the
-   * announcement wait (the same bound a call waits for its own announcement); then the message counts as complete without it. Never throws.
+   * halt sibling wait (never beyond the soft deadline); then the message counts as complete without it. Never throws.
    */
   private checkHaltSettled(): void {
     try {
       if (this.halt === undefined || this.haltSettledFired || this.closed || !this.o.onHaltSettled) return;
       if (this.inFlight.size > 0) return;
       const halt = this.halt;
-      const missing = halt.batch >= 0 && this.announced.some((a) => a.batch === halt.batch && a.seq <= halt.cutoff && !a.claimed);
+      const missing = !this.siblingWaitExpired && halt.batch >= 0 && this.announced.some((a) => a.batch === halt.batch && a.seq <= halt.cutoff && !a.claimed);
       if (missing && this.haltSettleTimer === undefined) {
+        const left = this.o.softDeadlineAt !== undefined ? Math.max(0, this.o.softDeadlineAt - this.now()) : Infinity;
+        const waitMs = Math.min(Math.max(0, this.o.haltSiblingWaitMs ?? DEFAULT_HALT_SIBLING_WAIT_MS), left);
         const t = setTimeout(() => {
           this.haltSettleTimer = undefined;
+          this.siblingWaitExpired = true;
           if (this.inFlight.size === 0) this.fireHaltSettled();
-        }, Math.max(0, this.o.announceWaitMs ?? DEFAULT_ANNOUNCE_WAIT_MS));
+        }, waitMs);
         t.unref?.();
         this.haltSettleTimer = t;
         return;
