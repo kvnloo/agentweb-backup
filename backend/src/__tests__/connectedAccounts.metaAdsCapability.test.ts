@@ -180,4 +180,25 @@ describe('GET /connected-accounts — Meta Ads capability (ENG-1158)', () => {
     expect(account.ads_capable).toBeUndefined();
     expect(account.capability_warning).toBeUndefined();
   });
+
+  it('ENG-2822: wrong-Page access keeps a read-capable account connected with the Page-specific reason', async () => {
+    // FlatFee 462458168257715: ads scopes granted, nothing declined, but the user
+    // cannot access the Page its ads already use. Reads work; only creates need the Page.
+    (connectedAccountsDb.getAccountsWithOwnerIncludingOrgShared as jest.Mock).mockResolvedValue([
+      metaAdAccount({
+        granted_scopes: ['ads_read', 'ads_management', 'pages_show_list'],
+        declined_required_permissions: [],
+        has_meta_pages: false,
+        existing_ads_page_id: '100335622083559',
+      }),
+    ]);
+
+    const account = await listAccounts();
+
+    expect(account.status).toBe('active');
+    expect(account.ads_capable).toBe(true);
+    expect(account.can_create_ads).toBe(false);
+    expect(account.expiry_message).toContain('100335622083559');
+    expect(account.expiry_message).not.toMatch(/permission not granted/i);
+  });
 });

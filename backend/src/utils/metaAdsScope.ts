@@ -330,6 +330,12 @@ export interface MetaAdsAccountLike {
  */
 export interface MetaAdsCapabilityAnnotation {
   ads_capable?: boolean;
+  /**
+   * ENG-2822: false only when Page access is confirmed missing. Page access
+   * gates CREATE (ads need a Page identity), never reads/reporting, so it must
+   * not flip `ads_capable` — that is what dropped a spending account from reports.
+   */
+  can_create_ads?: boolean;
   capability_warning?: string;
 }
 
@@ -383,8 +389,16 @@ export const describeMetaAdsCapability = (
   // blocker — checked even when the OAuth ads scope is granted (or unproven),
   // because Page access is a second Meta grant that scopes say nothing about.
   // This is the exact gap ENG-2232 reported: ads_capable:true with 0 Pages.
+  //
+  // ENG-2822: Page access gates CREATE only. Reads (campaign lists, insights)
+  // work without it, so ads_capable keeps reflecting the ads scope and the
+  // missing Page is reported as can_create_ads:false plus the warning.
   if (getMetaPagesAccessState(account?.config) === 'missing') {
-    return { ads_capable: false, capability_warning: getMetaAdsNoPagesMessage(account?.config) };
+    return {
+      ...(state === 'granted' ? { ads_capable: true } : {}),
+      can_create_ads: false,
+      capability_warning: getMetaAdsNoPagesMessage(account?.config),
+    };
   }
 
   if (state === 'granted') return { ads_capable: true };
