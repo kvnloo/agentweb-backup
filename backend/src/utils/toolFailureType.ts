@@ -52,8 +52,10 @@ const UNINSTALLED_RE = /not available\b[\s\S]*install the required skill/i;
 // 'config' merely because the marker text contains the word "Forbidden".
 // ENG-2619: "does not appear to belong to this lead" = linkedInIdentityCheck's
 // linkedin_identity_mismatch guard correctly refusing a send to the wrong person.
+// ENG-2819: "there is nothing to draft" / "remove the do-not-contact flag first" =
+// update_email_draft_for_lead's no-contact-channel skip (ENG-2082) and DNC guard.
 const BY_DESIGN_RE =
-  /task rejected|matched forbidden pattern|may only be used for|local_agent_deprecated|should delay new invitation|already connected|required function calls have not been made|cannot mark steps as completed|cannot resend|recipient cannot be reached|no (?:search )?results found|corrupted or password-protected|failed to parse pdf|the publisher refused this fetch|only the list owner, the org owner, or a listed crm editor|is not a member of the page owner's organization|"state":"(?:unverified|blocked_by_[a-z_]+)"|refused to send: the linkedin profile at \S+ does not appear to belong to this lead|net::err_(?:empty_response|connection_refused|connection_reset|connection_closed)/i;
+  /task rejected|matched forbidden pattern|may only be used for|local_agent_deprecated|should delay new invitation|already connected|required function calls have not been made|cannot mark steps as completed|cannot resend|recipient cannot be reached|no (?:search )?results found|corrupted or password-protected|failed to parse pdf|the publisher refused this fetch|only the list owner, the org owner, or a listed crm editor|is not a member of the page owner's organization|"state":"(?:unverified|blocked_by_[a-z_]+)"|refused to send: the linkedin profile at \S+ does not appear to belong to this lead|there is nothing to draft|remove the do-not-contact flag first|net::err_(?:empty_response|connection_refused|connection_reset|connection_closed)/i;
 
 // "too long (N chars)" = an argument-length constraint (e.g. the LinkedIn 200/300
 // invite-note limit) — an arg validation, not a tool defect.
