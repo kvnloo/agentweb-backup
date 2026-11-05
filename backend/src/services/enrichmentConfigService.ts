@@ -568,19 +568,28 @@ export async function processEnrichmentConfig(
       f.notSmartInstruction?.trim() !== f.instruction.trim()
     ),
   );
-  if (classificationCandidates.length > 0) {
-    // A candidate's stored tags (restored in 3a) were made for an OLDER instruction: if the answer below is
-    // missing (the call failed, or the two samples disagreed, ENG-2720) the field must not keep computing
-    // the old condition on every run. Clear them; a later save classifies the field again.
-    const staleNames = new Set(classificationCandidates.map(f => f.name));
+  // A field's stored tags (restored in 3a) were made for an OLDER instruction. A candidate is about to be
+  // classified again; if that answer is missing (the call failed, or the two samples disagreed, ENG-2720) it
+  // must not keep computing the old condition on every run. A field whose instruction was emptied has no
+  // condition at all. Clear the tags of both; a later save classifies the field again.
+  const staleNames = new Set([
+    ...classificationCandidates.map(f => f.name),
+    ...enriched.fields.filter(f => !f.instruction?.trim()).map(f => f.name),
+  ]);
+  if (staleNames.size > 0) {
     enriched = {
       ...enriched,
       fields: enriched.fields.map(f => {
         if (!staleNames.has(f.name)) return f;
-        const { smartCondition: _sc, smartDependencies: _sd, notSmartInstruction: _nsi, ...rest } = f;
-        return rest;
+        const cleared = { ...f };
+        delete cleared.smartCondition;
+        delete cleared.smartDependencies;
+        delete cleared.notSmartInstruction;
+        return cleared;
       }),
     };
+  }
+  if (classificationCandidates.length > 0) {
     try {
       const classifications = await deps.llmClassifySmartFields(
         classificationCandidates.map(f => ({ name: f.name, instruction: f.instruction })),

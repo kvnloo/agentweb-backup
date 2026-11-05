@@ -72,4 +72,13 @@ describe('stale smart tags after an instruction edit', () => {
     expect(byName.r.smartCondition).toBe(R);
     expect(byName.r.smartDependencies).toEqual(['employee_count']);
   });
+
+  it('clears the tags of a field whose instruction was emptied, without asking the model', async () => {
+    const classify = jest.fn();
+    const f = await run('', classify);
+    expect(classify).not.toHaveBeenCalled();
+    expect(f.smartCondition).toBeUndefined();
+    expect(f.smartDependencies).toBeUndefined();
+    expect(f.notSmartInstruction).toBeUndefined();
+  });
 });

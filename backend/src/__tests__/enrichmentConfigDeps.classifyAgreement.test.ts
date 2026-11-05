@@ -94,6 +94,12 @@ describe('alias inference prompt', () => {
     expect(p).toMatch(/Facts about the employer itself stay with the employer .* its investors \(investors\), its customers \(customer_logos\)/);
     expect(p).toMatch(/return null/);
     expect(p).toMatch(/"contact number", "mobile", "cell"/); // synonyms still matched by meaning
+    expect(p).toMatch(/A "lead" is one person/);
+    expect(p).toMatch(/custom concept with no canonical match/);
+    expect(p).toMatch(/Use the instruction text to disambiguate/);
+    expect(p).toMatch(/Pick at most ONE canonical name/);
+    expect(p).toMatch(/A personal, home or alternate email, or a home phone, is a different attribute: return null/);
+    expect(p).toMatch(/A mobile or cell number is still phone/);
   });
 
   it('llmInferAliases sends that prompt', async () => {

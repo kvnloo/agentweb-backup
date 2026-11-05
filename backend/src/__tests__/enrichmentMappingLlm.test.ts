@@ -122,3 +122,10 @@ describe('constants stay in step with the role default', () => {
     expect(await getRoleDefault('enrichment')).toBe(CHEAP_DEFAULT_MODEL);
   });
 });
+
+describe('sibling mapping metering', () => {
+  it('records the call under feature "enrichment" when the caller passes no usage context', async () => {
+    await buildLLMFieldMapping([{ name: 'a', type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' }]);
+    expect(mockGenerate.mock.calls[0][4]).toEqual({ feature: 'enrichment' });
+  });
+});
