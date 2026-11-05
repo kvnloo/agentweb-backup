@@ -419,15 +419,17 @@ describe('/generate on the Claude plan route', () => {
         expect(activeSessionGenerations.has('s1')).toBe(false);
       });
 
-      it('refuses a CANCEL the same way when the connection is down (the deck stays, nothing is cleared)', async () => {
+      it('a CANCEL always goes through, as on AgentWeb (it runs nothing): no preflight, the deck is cleared, and its outcome note is kept for a continue', async () => {
         preflight.mockImplementation(() => {
           throw new ClaudeRouteStopError('host_unavailable');
         });
-        const res = makeRes();
-        await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription', userMessage: 'Cancelled the review.', deckCancel: { deckId: 'd1' } }), res);
-        expect(res.status).toHaveBeenCalledWith(503);
-        expect(db.updateSessionApprovalDeck).not.toHaveBeenCalled();
-        expect(backend).not.toHaveBeenCalled();
+        db.updateSessionApprovalDeck.mockResolvedValue({} as any);
+        backend.mockResolvedValueOnce(planResult());
+        await agentModeController.generateResponse(makeReq({ fundingChoice: 'claude_subscription', userMessage: 'Cancelled the review.', deckCancel: { deckId: 'd1' } }), makeRes());
+        expect(preflight).not.toHaveBeenCalled();
+        expect(db.updateSessionApprovalDeck).toHaveBeenCalledWith('s1', null, { requireStillAwaiting: 'd1' });
+        const savedUser = db.addMessageToSession.mock.calls.map((c) => c[1] as any).find((m) => m?.role === 'user');
+        expect(savedUser.metadata.deckOutcomeDirective).toContain('Approval deck cancelled');
       });
 
       it('a preflight that fails in an unexpected way is also a typed stop, never a 500 and never an answer that ran', async () => {

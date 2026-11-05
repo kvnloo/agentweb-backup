@@ -1098,11 +1098,78 @@ describe('ClaudeCodeBackend on the tool relay (real host core)', () => {
       const run = t.backend().run(t.params());
       await waitFor(() => answers().length === 1);
       g1.open();
-      await waitFor(() => answers().length === 2);
       g2.open();
       await run;
+      // the halted message (only p0 announced) is complete once p0 is answered: the turn is interrupted there, as Emma's loop stops; the forged call never runs
       expect(t.executions.map((e) => e.args.to)).toEqual(['p0']);
+      expect(staged).toHaveLength(1);
       expect(staged[0]).toHaveLength(1);
+    });
+
+    describe('approval cards: the turn ends AT the halt, as Emma\'s loop does (it never asks the model again)', () => {
+      const mailHalt = (c: { args: Record<string, unknown> }) => ({ awaitingUserConfirmation: true, summary: `mail ${String(c.args.to)}` });
+      const deck = { deckId: 'deck-1', status: 'awaiting', items: [] } as any;
+
+      it('a CLI that never sends its result after the halted message is interrupted once the message is complete: the deck is staged, no stop, no timeout', async () => {
+        const t = setup({ confirm: ['send_email'], haltResult: mailHalt });
+        const staged: unknown[][] = [];
+        t.deps.stageApprovalDeck = async (_s, results) => (staged.push(results), { kind: 'deck', deck, prompt: 'DECK PROMPT' });
+        rig.script.turnEvents = [use(0, 'send_email', { to: 'p0' }), use(1, 'send_email', { to: 'p1' }), call('op-0', 'send_email', { to: 'p0' }), call('op-1', 'send_email', { to: 'p1' }), { wait: gate().wait }, result('never')];
+        const t0 = Date.now();
+        const r = await t.backend().run(t.params());
+        expect(t.executions.map((e) => e.args.to)).toEqual(['p0', 'p1']);
+        expect(staged).toEqual([[{ awaitingUserConfirmation: true, summary: 'mail p0' }, { awaitingUserConfirmation: true, summary: 'mail p1' }]]);
+        expect(r.content).toBe('DECK PROMPT');
+        expect(r.pendingApprovalDeck).toBe(deck);
+        expect(r.cancelled).toBeUndefined();
+        expect(Date.now() - t0).toBeLessThan(15_000);
+        expect(t.registry.size).toBe(0);
+      });
+
+      it('a call of a later model message never runs: the turn was interrupted at the halt', async () => {
+        const t = setup({ confirm: ['send_email'], haltResult: mailHalt });
+        t.deps.stageApprovalDeck = async () => ({ kind: 'deck', deck, prompt: 'P' });
+        rig.script.turnEvents = [use(0, 'send_email', { to: 'p0' }), call('op-0', 'send_email', { to: 'p0' }), { wait: sleep(300) }, { type: 'tool-result', operationId: 'toolu_0', ok: true }, use(1, 'save_note', { note: 'later' }), call('op-1', 'save_note', { note: 'later' }), { wait: gate().wait }, result('x')];
+        const r = await t.backend().run(t.params());
+        expect(t.executions.map((e) => e.name)).toEqual(['send_email']);
+        expect(r.content).toBe('P');
+      });
+
+      it('the deck follows the model\'s order of the calls (the stream), not the order they reached the backend', async () => {
+        const t = setup({ confirm: ['send_email'], haltResult: mailHalt });
+        const staged: unknown[][] = [];
+        t.deps.stageApprovalDeck = async (_s, results) => (staged.push(results), { kind: 'deck', deck, prompt: 'P' });
+        rig.script.turnEvents = [use(0, 'send_email', { to: 'first' }), use(1, 'send_email', { to: 'second' }), call('op-1', 'send_email', { to: 'second' }), call('op-0', 'send_email', { to: 'first' }), { wait: gate().wait }, result('x')];
+        await t.backend().run(t.params());
+        expect((staged[0] as any[]).map((x) => x.summary)).toEqual(['mail first', 'mail second']);
+      });
+
+      it('a Stop before the halted message is complete is a Stop (cancelled, no deck), as in Emma\'s loop', async () => {
+        const t = setup({ confirm: ['send_email'], haltResult: mailHalt, holdMs: {} });
+        let asked = 0;
+        t.deps.stageApprovalDeck = async () => (asked++, { kind: 'deck', deck, prompt: 'P' });
+        const slow = gate();
+        rig.script.turnEvents = [use(0, 'send_email', { to: 'p0' }), use(1, 'slow_write', { n: 1 }), call('op-0', 'send_email', { to: 'p0' }), call('op-1', 'slow_write', { n: 1 }), { wait: gate().wait }, result('x')];
+        (t.deps.executor as any).execute = ((orig) => async (run: unknown, c: any) => {
+          if (c.name === 'slow_write') await slow.wait;
+          return orig(run, c);
+        })((t.deps.executor as any).execute);
+        const run = t.backend().run(t.params());
+        await waitFor(() => t.executions.some((e) => e.name === 'send_email'));
+        await sleep(100);
+        t.registry.cancel('s1');
+        slow.open();
+        const r = await run;
+        expect(r.cancelled).toBe(true);
+        expect(asked).toBe(0);
+      });
+
+      it('without the deck stager (no approval cards) the turn is NOT interrupted at the halt: it runs to the CLI\'s own result, as before', async () => {
+        const t = setup({ confirm: ['send_email'] });
+        rig.script.turnEvents = [use(0, 'send_email', { to: 'p0' }), call('op-0', 'send_email', { to: 'p0' }), { wait: sleep(400) }, result('Model finished.')];
+        const r = await t.backend().run(t.params());
+        expect(r.content).toContain('Model finished.');
+      });
     });
 
     it('the host\'s final behaviour: a preview whose stream input was truncated ({"_truncated":"depth"}) falls back to its own group; the rest of the batch still builds one confirmation', async () => {
