@@ -715,6 +715,15 @@ function planStopResponse(stop: ClaudeRouteStopError, saved: boolean, resumable:
   };
 }
 
+/**
+ * ENG-2113: the stored copy of a deck outcome is bounded (the user's free text in it is unbounded and the saved message must stay far below DynamoDB's item limit);
+ * the turn that answered the deck sees the full text, a later "continue" sees this one.
+ */
+const DECK_OUTCOME_STORED_MAX = 20_000;
+function boundedDirective(text: string): string {
+  return text.length <= DECK_OUTCOME_STORED_MAX ? text : `${text.slice(0, DECK_OUTCOME_STORED_MAX - 60)} ...[outcome shortened]]`;
+}
+
 /** ENG-2113: `userMessageKind` of a turn that answers a message already saved by a stopped plan turn (never stored on a message). */
 const RESUME_SAVED_MESSAGE_KIND = 'resume-saved';
 
@@ -9917,7 +9926,7 @@ async function runSessionTurn(
       ...(approvalDeckCancelledMeta ? { approvalDeckCancelled: approvalDeckCancelledMeta } : {}),
       // ENG-2113: on the plan route the answer's writes have already run when this turn starts, and the turn itself can still fail (the connection
       // dropped, a plan limit). A "continue" answers this saved message again, so the model-visible outcome is kept with it and handed over again.
-      ...(planRoute && answerAck ? { deckOutcomeDirective: answerAck } : {}),
+      ...(planRoute && answerAck ? { deckOutcomeDirective: boundedDirective(answerAck) } : {}),
       // ENG-1239: marks server-authored turns (e.g. the media auto-continuation
       // directive) so the frontend can hide them instead of rendering them as a
       // customer-typed chat bubble.

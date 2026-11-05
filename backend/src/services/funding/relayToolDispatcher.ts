@@ -277,7 +277,7 @@ export class RelayToolDispatcher {
   /** The model message of the call that latched this turn's halt, and the last announcement recorded before its answer went back. */
   private halt: { batch: number; cutoff: number } | undefined;
   private haltSettledFired = false;
-  /** The wait for announced-but-unarrived siblings ran out: the halted message counts as complete without them (never waited for twice). */
+  /** The wait for announced-but-unarrived siblings ran out WITHOUT any sibling arriving: the halted message counts as complete without them. */
   private siblingWaitExpired = false;
   private haltSettleTimer: NodeJS.Timeout | undefined;
   /** Backend call id -> the stream position of the announcement it matched: the model's own order of the calls (Emma's deck follows the model's call order). */
@@ -655,13 +655,22 @@ export class RelayToolDispatcher {
       if (this.halt === undefined || this.haltSettledFired || this.closed || !this.o.onHaltSettled) return;
       if (this.inFlight.size > 0) return;
       const halt = this.halt;
-      const missing = !this.siblingWaitExpired && halt.batch >= 0 && this.announced.some((a) => a.batch === halt.batch && a.seq <= halt.cutoff && !a.claimed);
+      const inHaltMessage = (a: { batch: number; seq: number }) => a.batch === halt.batch && a.seq <= halt.cutoff;
+      const missing = !this.siblingWaitExpired && halt.batch >= 0 && this.announced.some((a) => inHaltMessage(a) && !a.claimed);
       if (missing && this.haltSettleTimer === undefined) {
         const left = this.o.softDeadlineAt !== undefined ? Math.max(0, this.o.softDeadlineAt - this.now()) : Infinity;
         const waitMs = Math.min(Math.max(0, this.o.haltSiblingWaitMs ?? DEFAULT_HALT_SIBLING_WAIT_MS), left);
+        const claimedWhenArmed = this.announced.filter((a) => inHaltMessage(a) && a.claimed).length;
         const t = setTimeout(() => {
           this.haltSettleTimer = undefined;
+          // A sibling that ARRIVED while we waited is progress: the wait is not spent, it starts again once nothing is executing (bounded by the soft deadline
+          // and by the announcements, which are capped). Only a wait that ended with nothing arriving counts as spent.
+          if (this.announced.filter((a) => inHaltMessage(a) && a.claimed).length > claimedWhenArmed) {
+            this.checkHaltSettled();
+            return;
+          }
           this.siblingWaitExpired = true;
+          this.log("halt_siblings_missing", { announcedUnarrived: this.announced.filter((a) => inHaltMessage(a) && !a.claimed).length });
           if (this.inFlight.size === 0) this.fireHaltSettled();
         }, waitMs);
         t.unref?.();
