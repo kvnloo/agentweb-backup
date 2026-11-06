@@ -68,6 +68,29 @@ describe('nothing is dialed when a gate says no', () => {
     expect(world.provider.placedCalls).toHaveLength(1);
   });
 
+  it('the org window alone closes at its exact minute while the lead window is still open (real lead check)', async () => {
+    world.crm.orgs.set('org-a', { ...world.crm.orgs.get('org-a'), hotLeadCall: { ...callConfig, callingHours: { start: '08:00', end: '16:30', timezone: 'America/Chicago' } } });
+    setClock('2026-10-19T21:29:00.000Z'); // 16:29 CDT = 17:29 EDT: both windows open
+    await submitLead('lead-a');
+    expect(world.provider.placedCalls).toHaveLength(1);
+
+    setClock('2026-10-19T21:30:00.000Z'); // 16:30 CDT = 17:30 EDT: the org window has closed, the lead window has not
+    await submitLead('lead-b', { phone: leadPhone(2) });
+    expect(skipReason('lead-b')).toEqual({ reason: 'outside_calling_hours' });
+    expect(world.provider.placedCalls).toHaveLength(1);
+  });
+
+  it('a Canadian lead is refused as country_not_allowed even though the stored config allows CA: no record, no slot, Slack still alerts', async () => {
+    world.crm.orgs.set('org-a', { ...world.crm.orgs.get('org-a'), hotLeadCall: { ...callConfig, allowedCountries: ['US', 'CA'] } });
+    await submitLead('lead-ca', { phone: '+14165550142' });
+
+    expect(skipReason('lead-ca')).toEqual({ reason: 'country_not_allowed' });
+    expect(world.provider.placedCalls).toEqual([]);
+    expect(recordOf('lead-ca')).toBeUndefined();
+    expect(world.limits.keysTouched).toEqual([]);
+    expect(world.postMessage).toHaveBeenCalledTimes(1);
+  });
+
   describe('lead-local hours (outside_lead_hours)', () => {
     // The org window is open all day here, so only the lead's own window (Eastern AND Pacific, 13:00-18:00 Eastern) decides.
     const allDay = { ...callConfig, callingHours: { start: '00:00', end: '23:59', timezone: 'America/Chicago' } };

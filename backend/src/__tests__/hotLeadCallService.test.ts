@@ -533,8 +533,9 @@ describe('lead-local hours gate (ENG-2783)', () => {
     jest.setSystemTime(new Date(CLOSED_FOR_LEAD));
     lead.createdAt = CLOSED_FOR_LEAD;
     await dispatchHotLeadCall('list-a', 'lead-a', 'form_fill');
-    await processHotLeadCallJob(jobOf());
     expect(enqueueCalls()).toHaveLength(0);
+    expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'outside_lead_hours' } }]);
+    await processHotLeadCallJob(jobOf());
     expect(store.events).toEqual([
       { type: 'call.skipped', detail: { reason: 'outside_lead_hours' } },
       { type: 'call.skipped', detail: { reason: 'outside_lead_hours' } },

@@ -55,11 +55,13 @@ async function noAnswer(n: number): Promise<void> {
 beforeEach(() => configure());
 
 describe('the roster decides who is rung first', () => {
-  it('12:30: B is rung (A is off at 12:00 and the lead window only opens at 12:00 Chicago), B presses 1, the lead presses 1 and the call is connected and metered', async () => {
+  it('12:30: A (first in priority) is rung although B is also on duty, A presses 1, the lead presses 1 and the call is connected and metered', async () => {
+    // A's usual 09:00-12:00 shift is widened so A is on duty inside the lead window (12:00-17:00 Chicago); B (12:15-15:00) is on duty too.
+    configure({ team: [referenceMember('a', '09:00', '16:00'), ...TEAM.slice(1)] });
     setClock(chicago('12:30'));
     await submitLead('lead-a');
-    expect(rungPhones()).toEqual([PHONE.b]);
-    expect(record()).toMatchObject({ state: 'member_ringing', attemptNo: 1, memberId: ID.b, triedMemberIds: [ID.b], memberCallSid: 'CA00000001' });
+    expect(rungPhones()).toEqual([PHONE.a]);
+    expect(record()).toMatchObject({ state: 'member_ringing', attemptNo: 1, memberId: ID.a, triedMemberIds: [ID.a], memberCallSid: 'CA00000001' });
     // What the orchestrator stored is what /gather recomputes from the lead row: the lead phone check passes.
     expect(record().leadPhoneMac).toBe(leadPhoneMacOf('org-a', LEAD_E164));
 
@@ -71,9 +73,16 @@ describe('the roster decides who is rung first', () => {
 
     expect(record()).toMatchObject({ state: 'finished', outcome: 'completed', attemptNo: 1 });
     expect(eventsOf('lead-a')).toEqual(['call.initiated', 'call.member_answered', 'call.connected', 'call.completed']);
-    expect(rungPhones()).toEqual([PHONE.b]);
+    expect(rungPhones()).toEqual([PHONE.a]);
     expect(nextJobs()).toHaveLength(0);
     expect(usageSummary()).toEqual([['twilio:voice:CA00000001:member', 2], ['twilio:voice:CAL0000001:lead', 1]]);
+  });
+
+  it('12:30: A is off duty (shift ended 12:00), so B is the one rung', async () => {
+    setClock(chicago('12:30'));
+    await submitLead('lead-a');
+    expect(rungPhones()).toEqual([PHONE.b]);
+    expect(record()).toMatchObject({ state: 'member_ringing', attemptNo: 1, memberId: ID.b, triedMemberIds: [ID.b] });
   });
 
   it('12:05, a gap in the roster: skipped as no_one_available, no call and no record, and the Slack alert still fires', async () => {
@@ -320,12 +329,13 @@ describe('the world changes between two attempts', () => {
     expect(record()).toMatchObject({ state: 'finished', outcome: 'member_no_answer' });
   });
 
-  it('the calling hours end in between: the record is closed as no_member_available and no second call is placed', async () => {
-    configure({ callingHours: { start: '09:00', end: '17:00', timezone: 'America/Chicago' } }); // 17:00 Chicago = 18:00 Eastern, where the lead window closes too
-    setClock(chicago('16:58'));
+  // 17:00 Chicago is 18:00 Eastern, where the lead window closes too; 16:30 Chicago closes the org window alone (lead window still open).
+  it.each([['17:00', '16:58', '17:01'], ['16:30', '16:28', '16:31']])('the calling hours (end %s) end in between: the record is closed as no_member_available and no second call is placed', async (end, before, after) => {
+    configure({ callingHours: { start: '09:00', end, timezone: 'America/Chicago' } });
+    setClock(chicago(before));
     await submitLead('lead-a');
     expect(rungPhones()).toEqual([PHONE.c]);
-    betweenRequestAndJob(() => setClock(chicago('17:01')));
+    betweenRequestAndJob(() => setClock(chicago(after)));
     await noAnswer(1);
 
     expect(rungPhones()).toEqual([PHONE.c]); // D is on duty until 19:00, but the business is closed
@@ -333,11 +343,11 @@ describe('the world changes between two attempts', () => {
     expect(eventsOf('lead-a')).toEqual(['call.initiated', 'call.member_no_answer', 'call.completed']);
   });
 
-  it('the calling hours have ended by the time the first attempt ends: finished with the attempt\'s own outcome', async () => {
-    configure({ callingHours: { start: '09:00', end: '17:00', timezone: 'America/Chicago' } });
-    setClock(chicago('16:58'));
+  it.each([['17:00', '16:58', '17:01'], ['16:30', '16:28', '16:31']])('the calling hours (end %s) have ended by the time the first attempt ends: finished with the attempt\'s own outcome', async (end, before, after) => {
+    configure({ callingHours: { start: '09:00', end, timezone: 'America/Chicago' } });
+    setClock(chicago(before));
     await submitLead('lead-a');
-    setClock(chicago('17:01'));
+    setClock(chicago(after));
     await noAnswer(1);
 
     expect(nextJobs()).toHaveLength(0);

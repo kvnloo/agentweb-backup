@@ -23,7 +23,7 @@ import { leadPhoneMacOf } from '../services/voice/leadPhoneMac';
 import { attrOf, sayText, MOUNT } from './helpers/hotLeadCallTwilioSim';
 import {
   BASE, LEAD_E164, advanceMinutes, LEAD_PHONE_AS_TYPED, LIST, MEMBER_PHONE, TWILIO_NUMBER, eventsOf, installWorld, mock, placedCall, recordOf, submitLead,
-  twilioCall, usage, usageSummary, world, bridgedCall,
+  twilioCall, usage, usageSummary, world, bridgedCall, setClock,
 } from './helpers/hotLeadCallE2eWorld';
 
 installWorld();
@@ -175,6 +175,25 @@ describe('a hot lead rings the member and, on 1, bridges the lead', () => {
 
     expect(recordOf('lead-a')).toMatchObject({ state: 'finished', outcome: 'lead_declined' });
     expect(eventsOf('lead-a')).toEqual(['call.initiated', 'call.member_answered', 'call.lead_declined', 'call.completed']);
+  });
+
+  it('the lead window closed while the member was answering (real clock check, not mocked): nobody is dialed, lead_outside_hours', async () => {
+    setClock('2026-10-19T21:55:00.000Z'); // 17:55 EDT: the lead window (13:00-18:00 Eastern for a 212 number) is open
+    await submitLead('lead-a');
+    const call = twilioCall(placedCall());
+    await call.memberAnswers();
+    setClock('2026-10-19T22:00:00.000Z'); // 18:00 EDT: closed before the member presses 1
+    const reply = await call.memberPresses('1');
+    expect(reply.body).not.toContain('<Dial');
+    expect(reply.body).not.toContain(LEAD_E164.slice(2));
+    expect(sayText(reply.body)).toBe(LEAD_UNREACHABLE_COPY);
+    await call.memberLegEnds('completed', '20');
+
+    expect(recordOf('lead-a')).toMatchObject({ state: 'finished', outcome: 'lead_outside_hours' });
+    expect(eventsOf('lead-a')).toEqual(['call.initiated', 'call.member_answered', 'call.failed', 'call.completed']);
+    expect(world.provider.placedCalls).toHaveLength(1);
+    expect(mock(queue.enqueueJob).mock.calls.filter(([source]) => source === 'hot_lead_call_next')).toHaveLength(0);
+    expect(usageSummary()).toEqual([['twilio:voice:CA00000001:member', 1]]); // no lead leg
   });
 
   it('the lead phone was overwritten between dispatch and the member pressing 1: nobody is dialed, lead_phone_changed', async () => {
