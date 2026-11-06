@@ -5,8 +5,8 @@ member of the business's team from a Twilio number the org owns and says "New
 lead from <business name>. Are you available to take the call now? Press 1." On
 `1` it dials the lead, who hears "This is an automated call from <business name>
 about the enquiry you sent us. To reach a person at <business name>, call <the org's number>.
-Press 1 to be connected now, or press 3 to stop these calls." and must press 1 as well; only then
-are the two calls bridged. The number is spoken digit by digit in 3-3-4 groups; calling it rings the team through the
+Press 1 to be connected now, press 2 if you are not available and we will call you again later, or press 3 to stop these calls." and must press 1 as well; only then
+are the two calls bridged. A 2 schedules one [retry](#press-2-and-the-retry) about an hour later. The number is spoken digit by digit in 3-3-4 groups; calling it rings the team through the
 [inbound callback](#inbound-callbacks) path. Pressing 3 puts the number on the org's [do-not-call list](#do-not-call-list). Which member is rung depends on the
 team's priority order and weekly availability windows (see [Who is rung](#who-is-rung)). The outcome and every step are written to the lead's timeline.
 
@@ -69,7 +69,7 @@ sequenceDiagram
   LeadPhone-->>Tw: answers
   Tw->>App: POST /status leg=lead CallStatus=in-progress (remembers the lead sid, no state change)
   Tw->>App: POST /screen (runs on the lead's leg, before the bridge)
-  App-->>Tw: Gather 1 digit: "This is an automated call from <business> ... call <number>. Press 1 to be connected now, or press 3 to stop"
+  App-->>Tw: Gather 1 digit: "This is an automated call from <business> ... call <number>. Press 1 ... press 2 if you are not available ... or press 3 to stop"
   LeadPhone->>Tw: presses 1
   Tw->>App: POST /screen-result Digits=1
   App-->>Tw: empty Response - Twilio bridges the two calls
@@ -86,7 +86,8 @@ Branches (all end in `finished` once every leg that was dialed is metered):
 | --- | --- | --- | --- |
 | Member presses 1, lead answers and presses 1 | `/gather`, `/screen`, `/screen-result` | `completed` | `call.member_answered`, `call.connected`, `call.completed` |
 | Lead answers and presses 3 | `/screen-result` | `lead_opted_out`; the lead hears "Understood. <business> will not call this number again. Goodbye."; the member hears "The lead asked not to be called again. Their details are in your lead alert."; no other member is tried; the stop is written first (see [Do-not-call list](#do-not-call-list)) | `call.member_answered`, `call.lead_declined` (`reason: opted_out`), `call.completed` |
-| Lead answers but presses another key (2 included), says nothing or hangs up | `/screen-result` (a key) or `/dial` (`completed` with `DialBridged=false`) | `lead_declined`; the member hears "The lead did not confirm. Their details are in your lead alert." and no other member is tried | `call.member_answered`, `call.lead_declined`, `call.completed` |
+| Lead answers and presses 2 (not available now) | `/screen-result` | `lead_deferred`; the lead hears "Okay. <business> will call you again later. Goodbye."; the member hears "The lead is not available right now. We will try again later."; no other member is tried; one retry is scheduled (see [Press 2 and the retry](#press-2-and-the-retry)). On the retry call itself, or when no retry can be scheduled, a 2 is `lead_declined` and the lead hears "Okay. <business> will not call again today. Goodbye." | `call.member_answered`, `call.lead_declined` (`reason: not_available_now`, or `not_available_no_retry` for the plain decline), `call.completed` |
+| Lead answers but presses another key, says nothing or hangs up | `/screen-result` (a key) or `/dial` (`completed` with `DialBridged=false`) | `lead_declined`; the member hears "The lead did not confirm. Their details are in your lead alert." and no other member is tried | `call.member_answered`, `call.lead_declined`, `call.completed` |
 | Member presses another digit, hangs up on or ignores the prompt, or never picks up (no-answer, busy, failed, canceled) | member `/status` terminal | `member_declined` / `member_no_answer` for the attempt; the record moves to `between_attempts` and the next-attempt request runs (see [Who is rung](#who-is-rung)) | `call.member_declined` or `call.member_no_answer`, then `call.completed` only when no further attempt is queued |
 | Member presses 1, lead does not answer | `/dial` with `no-answer`, `busy` or `failed` | `lead_no_answer` | `call.member_answered`, `call.lead_no_answer`, `call.completed` |
 | Lead's local calling window closed while the member was answering (member pressed 1) | `/gather` | `lead_outside_hours` (record stays `member_answered` until the member leg ends); same apology as `lead_phone_invalid`; the lead is not dialled | `call.member_answered`, `call.failed` (reason `lead_outside_hours`), `call.completed` |
@@ -843,9 +844,10 @@ No new table or index. The feature writes:
 | `hotLeadCallProvisioning` (purchase/release timestamps for the daily caps) | org attribute | provisioning tools |
 | `hot_lead_call_mode` | AW-Settings item | operators |
 | `HOT_LEAD_CALL_RENT_METERING` | environment variable of the backend (unset means on; `0`/`false`/`off` stops the rent sweep) | operators |
+| `HOT_LEAD_CALL_RETRY` | environment variable of the backend (unset: the due-retries cron is armed; `off`, `0` or `false`: not armed and a run does nothing) | operators |
 | `HOT_LEAD_CALL_STUCK_SWEEP` | environment variable of the backend (unset or any other value: report only; `close`: the sweep settles stuck records; `off`: disabled) | operators |
 | `vendor_rate_overrides` | AW-Settings item | admin Vendor Rates tab |
-| `system.hot_lead_call` (call record: `state`, `jobKey`, `startedAt`, `updatedAt`, `attemptNo`, `memberId`, `triedMemberIds`, `leadPhoneMac` (keyed HMAC of the lead's phone, see Org config), `claimToken` (random id of the writer that took an exclusive step, see Writes that commit and then report an error), `memberCallSid`, `leadCallSid`, `outcome`, `meteredLegs` (`member:<attempt>` and `lead`), `lastSequence`) | on the lead row (AW-Leads), no phone number | orchestrator and webhooks |
+| `system.hot_lead_call` (call record: `state`, `jobKey`, `startedAt`, `updatedAt`, `attemptNo`, `memberId`, `triedMemberIds`, `leadPhoneMac` (keyed HMAC of the lead's phone, see Org config), `claimToken` (random id of the writer that took an exclusive step, see Writes that commit and then report an error), `memberCallSid`, `leadCallSid`, `outcome`, `meteredLegs` (`member:<attempt>` and `lead`), `lastSequence`; ENG-2783: `deferral` `{dueAt, count}`, `retryClaimToken`, `retryClaimedAt`, see [Press 2 and the retry](#press-2-and-the-retry)) | on the lead row (AW-Leads), no phone number | orchestrator and webhooks |
 | Lead contact status (`contactStatus: do-not-contact`, `contactStatusReason: opted-out`, `contactStatusNote`, `unsubscribedFromGroupEmail`) | existing fields on the lead row (AW-Leads), written by `/screen-result` when the lead presses 3 (a new writer of an existing mechanism) | webhooks (`crmDb.updateLead`) |
 | Timeline events `call.*` | the lead's `engagements` list | `LeadCallStore.addEvent` |
 | `hlc#phone#<hmac>`, `hlc#cool#<orgId>#<memberId>`, `hlc#cap#h#<orgId>#<UTC hour>`, `hlc#cap#d#<orgId>#<local date>`, inbound: `hlc#cap#ih#<orgId>#<UTC hour>`, `hlc#cap#id#<orgId>#<local date>`, `hlc#in#p#h#<hmac>#<UTC hour>`, `hlc#in#p#d#<hmac>#<local date>`, `hlc#in#c#<CallSid>`, do-not-call: `hlc#dnc#<hmac of org and number>` (ENG-2783, about 10 years) | existing table `AW-MCPSessions` (partition key `sessionId`, attribute `ttl`) | limit store |
@@ -1062,19 +1064,19 @@ Event types written to the lead timeline (`eventType`, with a scalar `eventData`
 | `call.member_answered` | member picked up (`/owner`), once | - |
 | `call.member_declined` | member pressed a key other than 1, or hung up on the prompt | - |
 | `call.member_no_answer` | member leg ended before pickup | - |
-| `call.lead_declined` | the lead answered but did not press 1 at the screening prompt (`/screen-result`, or `/dial` with `DialBridged=false`), once | `reason: opted_out` when the lead pressed 3, else none |
+| `call.lead_declined` | the lead answered but did not press 1 at the screening prompt (`/screen-result`, or `/dial` with `DialBridged=false`), once | `reason: opted_out` when the lead pressed 3, `not_available_now` when the lead pressed 2 and a retry was scheduled, `not_available_no_retry` for a 2 that is a plain decline, else none |
 | `call.connected` | the lead pressed 1 at the screening prompt (`/screen-result`), or `/dial` reported `DialBridged=true`; an answered lead leg alone is not a connection | - |
 | `call.lead_no_answer` | `/dial` reported no-answer, busy or failed | `dialStatus` |
 | `call.completed` | last dialed leg metered; the record is `finished` | `outcome` |
 | `call.failed` | `reason`: `place_rejected`, `placement_unknown` (both also carry `attempt`, `memberId`), `lead_phone_invalid`, `lead_outside_hours`, `lead_do_not_call` (`/gather` found the number or lead on the do-not-call list), `lead_phone_changed`, `aborted`, `next_attempt_failed` | `reason` |
-| `call.skipped` | a gate or limit refused (no Twilio call made) | `reason` (list above) |
+| `call.skipped` | a gate or limit refused (no Twilio call made), or a press-2 retry was refused (`retry_expired`, `lead_phone_changed` or the gate's reason) | `reason` (list above) |
 
 Record `state`: `dialing`, `member_ringing`, `member_answered`, `between_attempts`
 (an attempt ended without a bridge and its leg is metered; waiting for the next
 attempt or the finish), `bridging`, `connected` (live) and `finished`, `failed`, `skipped` (terminal; `skipped` is in
 the type but the orchestrator records skips as events only). `outcome` values:
 `completed`, `member_declined`, `member_no_answer`, `no_member_available`,
-`lead_declined`, `lead_opted_out`, `lead_no_answer`, `lead_phone_invalid`, `lead_do_not_call`, `lead_phone_changed`,
+`lead_declined`, `lead_deferred` (pressed 2, one retry pending), `lead_opted_out`, `lead_no_answer`, `lead_phone_invalid`, `lead_do_not_call`, `lead_phone_changed`,
 `bridge_unconfirmed`, `aborted`, `disabled` (the next-attempt job found the kill
 switch, the org config or the plan off), `place_rejected`, `next_attempt_failed`
 (the next-attempt job broke before it rang anyone),
@@ -1082,7 +1084,7 @@ switch, the org config or the plan off), `place_rejected`, `next_attempt_failed`
 starts with no `outcome` and no `memberCallSid`: the transition removes both. Markers in
 `lastSequence`: `<memberCallSid>#gather`, `<memberCallSid>#dial`,
 `<memberCallSid>#ended` (the member leg ended without taking the lead),
-`<leadCallSid>#screen`, `lead#adopt`.
+`<leadCallSid>#screen`, `lead#adopt`. The retry's restart (see [Press 2 and the retry](#press-2-and-the-retry)) empties `lastSequence` and `meteredLegs`.
 
 Webhook endpoints (all under `/api/webhooks/twilio-voice`, query keys `listId`, `leadId`, `jobKey`, plus `leg=lead` on the lead's status callback only): `/owner` (member prompt), `/gather`
 (member's key; dials the lead), `/screen` (lead's leg after answering: adopts the
@@ -1153,6 +1155,11 @@ retried at the next crossing; a failed 100% send is not retried and logs
 notice by hand, delete the claim `hlc#notify#80#<orgId>#<YYYY-MM>` / `hlc#notify#100#...` (table `AW-MCPSessions`).
 
 ### Stuck records
+
+A record waiting for its press-2 retry is `finished` (outcome `lead_deferred`), so the sweep never reports or closes it; a retry in flight is an
+ordinary live record (`dialing` onwards, with `startedAt` and `updatedAt` set when the retry started) and is swept by the same thresholds. A first call
+that gets stuck and is closed by the sweep keeps `lead_deferred` (it is the decided outcome), so its retry then runs on schedule, or expires if the close
+came more than six hours after the due time.
 
 `lead_opted_out` (ENG-2783) leaves the record in `bridging` with the dial marker set, exactly like `lead_declined`: the leg metering finishes it, and
 the sweep settles it from the same state with the same thresholds. No state was added.
@@ -1348,7 +1355,7 @@ Mitigations to decide before general availability (none of them is built):
 - CAPTCHA or honeypot enforcement on the lander endpoint.
 - A spoken disclosure to the lead (for example about recording) before the
   bridge. The screening prompt (`/screen`) is the place for it; today it names the business, gives the org's
-  number to call back, and offers press 1 (connect) or press 3 (stop).
+  number to call back, and offers press 1 (connect), press 2 (call again later) or press 3 (stop).
 - Requiring a name or an email besides the phone number.
 - Consent text on the landers.
 
@@ -1538,23 +1545,63 @@ Twilio's documentation and encoded in tests with synthetic payloads:
 - **Missed-call Slack line.** The Slack alert does not say whether the call was
   placed, answered or declined; deliberately deferred so the Slack path stays
   untouched.
-- **"Press 2: call me again later" is not built.** The approved design is one deferred retry about 60 minutes later,
-  only inside the lead window (otherwise at the next opening), re-running every gate, taking a fresh slot against the caps,
-  calling the team from the start, at most one retry per lead, with the deferral kept as a few fields in the existing
-  `system.hot_lead_call` sidecar (a deferral count and a `retryAfter`) and the stuck sweep taught to leave a waiting
-  record alone. It needs a run-after, and there is none: `asyncJobQueue.ts` claims every `pending` row on the next
-  30-second poll (`enqueueJob` has no delay option) and nothing else schedules per-lead work. So the prompt does NOT offer 2
-  and a 2 is an ordinary decline (`lead_declined`). When it exists the prompt reads: "Press 1 to be connected now, press 2 if
-  you are not available and we will call you again later, or press 3 to stop these calls." Options:
-  1. A "due retries" cron that scans for deferred records the way the stuck sweep does (`findLeadsBySystemRecord` by state and
-     `updatedBefore`; it only sees the newest 500 leads per list, see the first follow-up above).
-  2. A timer table keyed by due time (a new table or index: a data-plane change needing approval).
-  3. A pending queue job whose processor throws "not due yet" until its time: rejected, it writes a failure and an error log
-     on every 30-second poll for up to about 19 hours per lead.
+- **Press-2 retry visibility.** The due-retries cron reads the newest 500 leads of each list (like the stuck sweep), which is enough
+  because a deferred lead is recent; a list that receives more than 500 leads inside the retry's life could miss one. A retry that is
+  claimed and then fails is lost (one retry, ever), logged as `retry lost after claim`.
 - **Retry after `place_rejected`.** Every lead gets one call record ever, so
   a definitively rejected placement is never retried. A deliberate retry needs a
   new store operation.
 - Voicemail detection and a post-call outcome summary in Emma.
+
+## Press 2 and the retry
+
+ENG-2783. A lead who answers and presses 2 ("not available now") gets ONE more call, about an hour later, at most once per lead ever.
+
+**Recording the press.** `/screen-result` with `Digits=2` writes, in the same conditional transition as the first-writer-wins `<leadCallSid>#screen` and
+`<memberCallSid>#dial` markers, `outcome: lead_deferred` and `deferral: {dueAt, count: 1}` on the `system.hot_lead_call` record, plus the timeline event
+`call.lead_declined` (`reason: not_available_now`). A replay, a later 1 or a later different key finds the markers and changes nothing (a 1 after a 2 hangs up
+and never connects). A 3 after a 2 on the same screening wins: the markers are raised from 1 to 2, the do-not-call marker and contact status are written (see
+[Do-not-call list](#do-not-call-list)), the outcome becomes `lead_opted_out` and `deferral` is removed. The record finishes through the normal leg metering with
+`outcome: lead_deferred`; no other member is tried.
+
+**When.** `dueAt` is 60 minutes after the press if both the lead window (10:00-18:00 lead-local, see [Lead-local hours](#lead-local-hours)) and the org's calling hours
+are open then; otherwise the first minute after that when both are open, searched minute by minute for 36 hours (`services/voice/hotLeadCallRetry.ts`, a DST day included).
+Including the org's hours in the search is deliberate: a retry must not be scheduled for a minute the gates would refuse. If no minute qualifies, or the lead's phone is no
+longer the one approved for the call, or the call is itself the retry, the 2 is an ordinary decline: `lead_declined`, event reason `not_available_no_retry`, and the
+lead hears "Okay. <business> will not call again today. Goodbye.".
+
+**Max one retry.** The retry keeps the record's `deferral`. `/screen-result` defers only a record that has none, so a 2 on the retry call is the plain decline above.
+The prompt text is the same on the retry (all three options); the second 2 is simply not honoured.
+
+**The due-retries cron.** The job queue has no run-after, so `cron/hotLeadCallRetryCron.ts` (armed in `server.ts`, every 5 minutes) calls
+`services/voice/hotLeadCallRetrySweep.ts`. Switch: `HOT_LEAD_CALL_RETRY` (unset = on; `off`, `0`, `false` = not armed and every run returns at once). It does nothing
+and reads nothing while the global kill switch `hot_lead_call_mode` is off (the pending retries stay and run once it is on, or expire after six hours). Discovery is the stuck
+sweep's (orgs with a `hotLeadCall` attribute whose config is enabled -> members -> lists -> `crmDb.findLeadsBySystemRecord` on state `finished` with a `deferral` and no
+`retryClaimToken`; no index), capped at 500 leads per list, 2000 per run, 100 records handled and 20 retries started per run. Each run logs one counts-only line:
+`[hotLeadCall] retry sweep orgs=.. lists=.. leadsRead=.. truncated=.. found=.. notDue=.. attempted=.. refused=.. expired=.. lost=.. failed=..` (`attempted` means the
+claim was won and the reservation and placement ran; a cap or cooldown refusal inside it shows as `call.skipped` on the lead).
+
+**The retry run** (`processHotLeadCallRetry` in `hotLeadCallService.ts`), in order:
+1. Kill switch; the record is `finished`, outcome `lead_deferred`, has a due `deferral` and no `retryClaimToken`.
+2. Claim: a conditional write of `retryClaimToken`/`retryClaimedAt` only while none is there (`LeadCallStore.claimRetry`). Exactly one run or instance wins, however many overlap.
+   After the claim nothing is retried: a failure is logged (`retry lost after claim`), a refusal is a `call.skipped`.
+3. More than 6 hours after `dueAt` (the server was down): `call.skipped` `retry_expired`, stop.
+4. Every gate of a new lead through the same `review()`/`SKIP_GATES` with the retry flag: ids, phone, org calling hours, lead window, `no_one_available`, entitlement, `do_not_call`;
+   each refusal is a `call.skipped` with its reason. The `too_old` gate and the "lead already has a call record" short-circuit are the only things ignored (age is counted from the
+   deferral and the expiry above). The lead's phone must still match the record's `leadPhoneMac`, else `lead_phone_changed`.
+5. A FRESH slot (`reserveCallSlot` with `retry`): the hourly, daily and monthly counters are taken afresh (the cap notices apply as usual). The 24h phone marker the lead's own first call took is
+   accepted when it is held by this same lead (nothing taken, nothing released); a marker held by another lead refuses as `duplicate_phone`. Fresh candidate selection with the member cooldown
+   (`member_cooldown` when everyone is in it).
+6. `LeadCallStore.restartForRetry`: the one place a terminal record is revived. Conditional on state `finished`, the first call's `jobKey` and the claim token, it sets `state: dialing`, `attemptNo: 1`, a new `jobKey`,
+   `startedAt`, `memberId`, `triedMemberIds: [member]`, `claimToken`, `leadPhoneMac`, empties `meteredLegs` and `lastSequence`, and removes `memberCallSid`, `leadCallSid` and `outcome`. The new `jobKey` makes the first
+   call's late Twilio callbacks stop matching. From there it is an ordinary call (member prompt "New lead from ...", then the lead screen); the first call's events stay on the timeline, followed by the retry's own
+   `call.initiated`. If no record is created the slot is released.
+
+**Operator runbook.**
+- *Is a retry pending?* The record is `finished`, `outcome: lead_deferred`, with `deferral.dueAt` and no `retryClaimToken`.
+- *Cancel a pending retry:* an operator data write on the lead row: set `system.hot_lead_call.retryClaimToken` to any string (the claim is then taken and no run can fire it), or remove `system.hot_lead_call.deferral`.
+- *Stop all retries now:* `HOT_LEAD_CALL_RETRY=off` and redeploy/restart (the cron is armed at start), or turn off `hot_lead_call_mode`.
+- *Why did a retry not happen?* The lead's timeline: `call.skipped` with `retry_expired`, a gate reason, or a cap (`org_hourly_cap`, ...); the retry is spent either way. No skip and no second `call.initiated` means the claim was lost after it was won (look for `retry lost after claim` in the logs).
 
 ## Do-not-call list
 
