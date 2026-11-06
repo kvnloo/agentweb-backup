@@ -21,6 +21,7 @@ jest.mock('../services/voice/hotLeadCallContext', () => ({
     return ctx && callerless.on ? { ...ctx, config: { ...ctx.config, twilioNumber: undefined } } : ctx;
   },
 }));
+import * as leadLocalHours from '../services/voice/leadLocalHours';
 import { crmDb, userDb, orgDb } from '../services/db';
 import * as queue from '../services/asyncJobQueue';
 import { getSubscriptionTypeConfig, getUserSubscriptionResolution } from '../services/subscriptionService';
@@ -155,10 +156,12 @@ describe('dispatchHotLeadCall gates', () => {
     expect(provider.placedCalls).toHaveLength(1);
   });
 
-  it('accepts a Canadian number when CA is allowed', async () => {
+  it('refuses a Canadian number as country_not_allowed even when CA is allowed (Canada is off in code, ENG-2783)', async () => {
+    org.hotLeadCall = { ...config, allowedCountries: ['US', 'CA'] };
     lead.phone = '+14165550142';
     await dispatchHotLeadCall('list-a', 'lead-a', 'form_fill');
-    expect(provider.placedCalls).toHaveLength(1);
+    expect(provider.placedCalls).toHaveLength(0);
+    expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'country_not_allowed' } }]);
   });
 
   it('measures a repeat submission by its own submittedAt, not by the old lead row', async () => {
@@ -454,6 +457,12 @@ describe('registerHotLeadCallProcessor', () => {
 });
 
 describe('calling hours gate', () => {
+  // This block tests the ORG's window in isolation (many instants are night time in the lead's zone), so the
+  // lead-local window (leadLocalHours, covered by its own tests and the e2e gates) is held open here.
+  let leadWindow: jest.SpyInstance;
+  beforeEach(() => { leadWindow = jest.spyOn(leadLocalHours, 'isInsideLeadCallWindow').mockReturnValue(true); });
+  afterEach(() => leadWindow.mockRestore());
+
   // America/Chicago, window 08:00-21:00: CDT is UTC-5, CST is UTC-6.
   const at = async (iso: string) => {
     jest.setSystemTime(new Date(iso));
@@ -516,6 +525,26 @@ describe('calling hours gate', () => {
   });
 });
 
+describe('lead-local hours gate (ENG-2783)', () => {
+  // The org window (Chicago 08:00-21:00) is open; the lead (212, Eastern/Pacific) is not: 14:00Z is 10:00 Eastern, before the 13:00 start.
+  const CLOSED_FOR_LEAD = '2026-10-19T14:00:00Z';
+
+  it('skips at dispatch (before queueing) and again in the job, with no limit store I/O', async () => {
+    jest.setSystemTime(new Date(CLOSED_FOR_LEAD));
+    lead.createdAt = CLOSED_FOR_LEAD;
+    await dispatchHotLeadCall('list-a', 'lead-a', 'form_fill');
+    await processHotLeadCallJob(jobOf());
+    expect(enqueueCalls()).toHaveLength(0);
+    expect(store.events).toEqual([
+      { type: 'call.skipped', detail: { reason: 'outside_lead_hours' } },
+      { type: 'call.skipped', detail: { reason: 'outside_lead_hours' } },
+    ]);
+    expect(limits.keysTouched).toEqual([]);
+    expect(store.record).toBeNull();
+    expect(provider.placedCalls).toHaveLength(0);
+  });
+});
+
 describe('abuse limits (reservation)', () => {
   const FIRST = '(212) 555-0142';
   // A new lead row, same list: the record store is per lead, so reset it.
@@ -536,12 +565,15 @@ describe('abuse limits (reservation)', () => {
   });
 
   it('refuses the same phone for 24h on a different lead row, then allows it again', async () => {
+    // Start at 15:00 Eastern: the 24h boundary must fall inside the lead-local window (13:00-18:00 Eastern, ENG-2783).
+    const T0 = 120;
+    later(T0);
     expect(await submit('l1', FIRST)).toBe('called');
-    later(3);
+    later(T0 + 3);
     expect(await submit('l2', '+12125550142')).toBe('duplicate_phone'); // same number, different spelling
-    later(24 * 60 - 1);
+    later(T0 + 24 * 60 - 1);
     expect(await submit('l3', FIRST)).toBe('duplicate_phone');
-    later(24 * 60);
+    later(T0 + 24 * 60);
     expect(await submit('l4', FIRST)).toBe('called');
   });
 
@@ -579,8 +611,9 @@ describe('abuse limits (reservation)', () => {
     expect(await submit('l2', '+12125550142')).toBe('called');
     later(4);
     expect(await submit('l3', '+12125550143')).toBe('org_daily_cap');
-    // Chicago midnight (05:00Z) starts a new local day, but the window is closed overnight; use the next morning.
-    later(60 * 20);
+    // Chicago midnight (05:00Z) starts a new local day, but the windows are closed overnight; use the next midday
+    // (the lead-local window is 13:00-18:00 Eastern, so the next morning is too early).
+    later(60 * 24);
     expect(await submit('l4', '+12125550144')).toBe('called');
   });
 

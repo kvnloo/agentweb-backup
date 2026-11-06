@@ -309,6 +309,9 @@ describe('callableLeadPhone', () => {
   it.each([undefined, null, 5, '', 'not a number', '+442071838750', '+18005550123'])('refuses %j as invalid_phone', (raw) => {
     expect(callableLeadPhone(raw, both)).toEqual({ reason: 'invalid_phone' });
   });
+  it.each(['+14165550123', '+16475550123'])('refuses Canadian %s as country_not_allowed even when allowedCountries includes CA (ENG-2783)', (raw) => {
+    expect(callableLeadPhone(raw, both)).toEqual({ reason: 'country_not_allowed' });
+  });
   it('refuses a country outside the org allowedCountries', () => {
     expect(callableLeadPhone('+14155550123', { allowedCountries: ['CA'] })).toEqual({ reason: 'country_not_allowed' });
   });

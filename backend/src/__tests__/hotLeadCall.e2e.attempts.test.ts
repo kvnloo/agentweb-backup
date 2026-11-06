@@ -55,11 +55,11 @@ async function noAnswer(n: number): Promise<void> {
 beforeEach(() => configure());
 
 describe('the roster decides who is rung first', () => {
-  it('11:00: A is rung, A presses 1, the lead presses 1 and the call is connected and metered', async () => {
-    setClock(chicago('11:00'));
+  it('12:30: B is rung (A is off at 12:00 and the lead window only opens at 12:00 Chicago), B presses 1, the lead presses 1 and the call is connected and metered', async () => {
+    setClock(chicago('12:30'));
     await submitLead('lead-a');
-    expect(rungPhones()).toEqual([PHONE.a]);
-    expect(record()).toMatchObject({ state: 'member_ringing', attemptNo: 1, memberId: ID.a, triedMemberIds: [ID.a], memberCallSid: 'CA00000001' });
+    expect(rungPhones()).toEqual([PHONE.b]);
+    expect(record()).toMatchObject({ state: 'member_ringing', attemptNo: 1, memberId: ID.b, triedMemberIds: [ID.b], memberCallSid: 'CA00000001' });
     // What the orchestrator stored is what /gather recomputes from the lead row: the lead phone check passes.
     expect(record().leadPhoneMac).toBe(leadPhoneMacOf('org-a', LEAD_E164));
 
@@ -71,7 +71,7 @@ describe('the roster decides who is rung first', () => {
 
     expect(record()).toMatchObject({ state: 'finished', outcome: 'completed', attemptNo: 1 });
     expect(eventsOf('lead-a')).toEqual(['call.initiated', 'call.member_answered', 'call.connected', 'call.completed']);
-    expect(rungPhones()).toEqual([PHONE.a]);
+    expect(rungPhones()).toEqual([PHONE.b]);
     expect(nextJobs()).toHaveLength(0);
     expect(usageSummary()).toEqual([['twilio:voice:CA00000001:member', 2], ['twilio:voice:CAL0000001:lead', 1]]);
   });
@@ -321,10 +321,11 @@ describe('the world changes between two attempts', () => {
   });
 
   it('the calling hours end in between: the record is closed as no_member_available and no second call is placed', async () => {
-    setClock(chicago('17:58'));
+    configure({ callingHours: { start: '09:00', end: '17:00', timezone: 'America/Chicago' } }); // 17:00 Chicago = 18:00 Eastern, where the lead window closes too
+    setClock(chicago('16:58'));
     await submitLead('lead-a');
     expect(rungPhones()).toEqual([PHONE.c]);
-    betweenRequestAndJob(() => setClock(chicago('18:01')));
+    betweenRequestAndJob(() => setClock(chicago('17:01')));
     await noAnswer(1);
 
     expect(rungPhones()).toEqual([PHONE.c]); // D is on duty until 19:00, but the business is closed
@@ -333,9 +334,10 @@ describe('the world changes between two attempts', () => {
   });
 
   it('the calling hours have ended by the time the first attempt ends: finished with the attempt\'s own outcome', async () => {
-    setClock(chicago('17:58'));
+    configure({ callingHours: { start: '09:00', end: '17:00', timezone: 'America/Chicago' } });
+    setClock(chicago('16:58'));
     await submitLead('lead-a');
-    setClock(chicago('18:01'));
+    setClock(chicago('17:01'));
     await noAnswer(1);
 
     expect(nextJobs()).toHaveLength(0);
