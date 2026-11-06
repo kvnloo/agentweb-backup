@@ -173,6 +173,26 @@ describe('twiml builders', () => {
     expect(spokenPhoneNumber('+442071838750')).toBe('4 4 2 0 7 1 8 3 8 7 5 0');
   });
 
+  it.each([
+    ['+1 with too few digits', '+141555501', '1 4 1 5 5 5 5 0 1'],
+    ['+1 with too many digits', '+1415555011199', '1 4 1 5 5 5 5 0 1 1 1 9 9'],
+    ['a bare plus', '+', ''],
+    ['empty input', '', ''],
+    ['a Canadian number (formatting only: the prompt itself is US-only, Canada is refused upstream)', '+14165550142', '4 1 6, 5 5 5, 0 1 4 2'],
+    ['a non-US number, read digit by digit', '+33142685300', '3 3 1 4 2 6 8 5 3 0 0'],
+  ])('speaks %s', (_name, input, spoken) => {
+    expect(spokenPhoneNumber(input)).toBe(spoken);
+  });
+
+  it.each([['a bare plus', '+'], ['empty', ''], ['a number with a letter', '+1415555011x']])('refuses %s as the callback number', (_name, number) => {
+    expect(() => leadScreenTwiml({ announcedName: 'X', callbackNumber: number, resultUrl: URLS.resultUrl })).toThrow('not E.164');
+  });
+
+  it('reads a non-US E.164 callback number digit by digit in the prompt', () => {
+    const xml = leadScreenTwiml({ announcedName: 'X', callbackNumber: '+442071838750', resultUrl: URLS.resultUrl });
+    expect(parseXml(xml).children[0].children[0].text).toContain('call 4 4 2 0 7 1 8 3 8 7 5 0. Press 1');
+  });
+
   it('builds the stop messages: the lead hears the goodbye naming the business, the member is told in the fixed copy', () => {
     const lead = parseXml(leadOptedOutTwiml('Smith & Sons'));
     expect(lead.children.map((c) => c.name)).toEqual(['Say', 'Hangup']);

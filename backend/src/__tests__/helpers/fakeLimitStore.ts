@@ -10,9 +10,12 @@ export class FakeLimitStore implements LimitStore {
   readonly claims = new Map<string, { token: string; expiresAtS: number }>();
   readonly keysTouched: string[] = [];
   failNext: Error | null = null;
+  /** When set, every operation on a key starting with this prefix throws it (the other keys work), e.g. `hlc#phone#` to fail only the reservation. */
+  failKeyPrefix: { prefix: string; error: Error } | null = null;
 
   private touch(key: string): void {
     this.keysTouched.push(key);
+    if (this.failKeyPrefix && key.startsWith(this.failKeyPrefix.prefix)) throw this.failKeyPrefix.error;
     if (this.failNext) { const err = this.failNext; this.failNext = null; throw err; }
   }
 

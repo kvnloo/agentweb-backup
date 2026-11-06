@@ -667,9 +667,11 @@ describe('abuse limits (reservation)', () => {
 
   it('fails the job closed, dialing nothing and creating no record, and shows limits_unavailable on the lead', async () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
-    limits.failNext = new Error('ddb down');
+    // Only the reservation fails: the do-not-call read before it works, so this proves the reservation's own fail-closed path.
+    limits.failKeyPrefix = { prefix: 'hlc#phone#', error: new Error('ddb down') };
     await expect(processHotLeadCallJob(jobOf())).rejects.toThrow('ddb down');
     warn.mockRestore();
+    expect(limits.keysTouched.some((k) => k.startsWith('hlc#phone#'))).toBe(true);
     expect(provider.placedCalls).toHaveLength(0);
     expect(store.record).toBeNull();
     expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'limits_unavailable' } }]);
@@ -677,11 +679,23 @@ describe('abuse limits (reservation)', () => {
 
   it('fails the job with the original error when the limits_unavailable event cannot be written', async () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
-    limits.failNext = new Error('ddb down');
+    limits.failKeyPrefix = { prefix: 'hlc#phone#', error: new Error('ddb down') };
     store.addEvent = async () => { throw new Error('events down'); };
     await expect(processHotLeadCallJob(jobOf())).rejects.toThrow('ddb down');
     warn.mockRestore();
     expect(provider.placedCalls).toHaveLength(0);
+  });
+
+  it('fails the job closed, dialing nothing and creating no record, when the do-not-call read fails (before any slot)', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    limits.failKeyPrefix = { prefix: 'hlc#dnc#', error: new Error('ddb down') };
+    await expect(processHotLeadCallJob(jobOf())).rejects.toThrow('ddb down');
+    warn.mockRestore();
+    expect(provider.placedCalls).toHaveLength(0);
+    expect(store.record).toBeNull();
+    expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'limits_unavailable' } }]);
+    expect(limits.keysTouched.every((k) => k.startsWith('hlc#dnc#'))).toBe(true);
+    expect(limits.counters.size).toBe(0);
   });
 
   it('fails the job closed when JWT_SECRET (the phone-hash key) is missing', async () => {
@@ -731,6 +745,7 @@ describe('do-not-call (a lead pressed 3, ENG-2783)', () => {
     expect(provider.placedCalls).toHaveLength(0);
     expect(store.record).toBeNull();
     expect([...limits.counters.keys()]).toEqual([]);
+    expect([...limits.claims.keys()]).toEqual([dncKey('org-a', '+12125550142')]);
   });
 
   it('keys the marker by org and a keyed digest of the number: another org is not affected, and the key holds no number', async () => {
@@ -743,11 +758,24 @@ describe('do-not-call (a lead pressed 3, ENG-2783)', () => {
     expect(await isNumberDoNotCall('org-b', '+12125550142')).toBe(false);
   });
 
-  it.each([['do-not-contact'], ['unsubscribed']])('skips with do_not_call when the lead itself is %s', async (status) => {
-    lead.contactStatus = status;
+  it('skips with do_not_call when the lead itself is do-not-contact, taking no slot and no record', async () => {
+    lead.contactStatus = 'do-not-contact';
     await dispatchHotLeadCall('list-a', 'lead-a', 'form_fill');
     expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'do_not_call' } }]);
     expect(provider.placedCalls).toHaveLength(0);
+    expect(store.record).toBeNull();
+    expect([...limits.counters.keys()]).toEqual([]);
+    expect([...limits.claims.keys()].every((k) => k.startsWith('hlc#dnc#'))).toBe(true);
+  });
+
+  it.each([
+    ['an email unsubscribe', { contactStatus: 'unsubscribed' }],
+    ['the legacy group-email flag', { unsubscribedFromGroupEmail: true }],
+    ['a bounce reason without do-not-contact', { contactStatus: 'active', contactStatusReason: 'bounced' }],
+  ])('still calls a lead with %s (only do-not-contact and the org marker block)', async (_name, fields) => {
+    Object.assign(lead, fields);
+    await dispatchHotLeadCall('list-a', 'lead-a', 'form_fill');
+    expect(provider.placedCalls).toHaveLength(1);
   });
 
   it('re-checks in the job, so a stop that landed after dispatch is honoured', async () => {

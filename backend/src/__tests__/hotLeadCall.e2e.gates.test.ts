@@ -13,8 +13,9 @@ jest.mock('@slack/web-api', () => ({ WebClient: jest.fn() }));
 
 import * as queue from '../services/asyncJobQueue';
 import { setHotLeadCallEnabledOverride } from '../services/voice/hotLeadCallMode';
+import { dncKey, markNumberDoNotCall } from '../services/voice/hotLeadCallDnc';
 import {
-  callConfig, advanceMinutes, eventsOf, installWorld, leadPhone, recordOf, setClock, skipReason, submitLead, world,
+  callConfig, advanceMinutes, eventsOf, LEAD_E164, installWorld, leadPhone, recordOf, setClock, skipReason, submitLead, world,
 } from './helpers/hotLeadCallE2eWorld';
 
 installWorld();
@@ -89,6 +90,37 @@ describe('nothing is dialed when a gate says no', () => {
     expect(recordOf('lead-ca')).toBeUndefined();
     expect(world.limits.keysTouched).toEqual([]);
     expect(world.postMessage).toHaveBeenCalledTimes(1);
+  });
+
+  describe('do-not-call (ENG-2783)', () => {
+    const expectRefused = () => {
+      expect(eventsOf('lead-a')).toEqual(['call.skipped']);
+      expect(skipReason('lead-a')).toEqual({ reason: 'do_not_call' });
+      expect(world.provider.placedCalls).toEqual([]);
+      expect(recordOf('lead-a')).toBeUndefined();
+      // No slot: no counter, and the only claim ever taken is the marker itself.
+      expect([...world.limits.counters.keys()]).toEqual([]);
+      expect([...world.limits.claims.keys()].every((k) => k.startsWith('hlc#dnc#'))).toBe(true);
+      expect(world.limits.keysTouched.filter((k) => !k.startsWith('hlc#dnc#'))).toEqual([]);
+      expect(world.postMessage).toHaveBeenCalledTimes(1);
+    };
+
+    it('the org marker holds the number (a lead pressed 3 before): call.skipped, no record, no slot, Slack still alerts', async () => {
+      await markNumberDoNotCall('org-a', LEAD_E164);
+      await submitLead('lead-a');
+      expectRefused();
+      expect([...world.limits.claims.keys()]).toEqual([dncKey('org-a', LEAD_E164)]);
+    });
+
+    it('the lead is do-not-contact: call.skipped, no record, no slot, Slack still alerts', async () => {
+      await submitLead('lead-a', { lead: { contactStatus: 'do-not-contact' } });
+      expectRefused();
+    });
+
+    it('a lead who only unsubscribed from email is called', async () => {
+      await submitLead('lead-a', { lead: { contactStatus: 'unsubscribed', unsubscribedFromGroupEmail: true } });
+      expect(world.provider.placedCalls).toHaveLength(1);
+    });
   });
 
   describe('lead-local hours (outside_lead_hours)', () => {
