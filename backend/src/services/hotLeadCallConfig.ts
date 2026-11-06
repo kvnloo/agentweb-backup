@@ -8,8 +8,10 @@ export const HOT_LEAD_CALL_COUNTRIES = ['US', 'CA'] as const;
 
 /**
  * Canada is refused in code (callableLeadPhone -> country_not_allowed) whatever allowedCountries stores. CRTC ADAD rules
- * need an identification message with an email/postal address and a local or toll-free number, and lead-local hours;
- * we implement neither yet. The stored config, default and validation are unchanged.
+ * need an identification message with an email/postal address and a local or toll-free number, which we do not
+ * implement. Re-enabling Canada needs (a) flipping this constant, (b) that identification message in the lead
+ * prompt, and (c) a Canada branch in leadLocalHours.ts (it returns false for Canada today). The stored config,
+ * default and validation are unchanged.
  */
 export const HOT_LEAD_CALL_CA_ENABLED = false;
 
@@ -50,7 +52,7 @@ export const HOT_LEAD_CALL_SYSTEM_FIELDS = ['twilioNumber', 'twilioNumberSid'] a
 interface HotLeadCallCallingHours {
   /**
    * The window in which calls ARE allowed (24h HH:MM, local to `timezone`); outside it the system stays quiet.
-   * start > end wraps past midnight, so consumers must handle both orders. The lead's own local hours (leadLocalHours.ts) are a separate gate, see leadLocalHours.ts.
+   * start > end wraps past midnight, so consumers must handle both orders. The lead's own local hours are a separate gate (leadLocalHours.ts).
    */
   start: string;
   end: string;

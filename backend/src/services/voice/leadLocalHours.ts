@@ -6,14 +6,17 @@ import { localDayAndMinutes } from './hotLeadCallLimits';
 // every day of the week. The window is a business decision, deliberately stricter than the law's 08:00-21:00 outer
 // bound; change it here only.
 // A US number's zone is unknown (area codes cross zones and mobile numbers move), so the window must hold in
-// every zone the number could be in. Eastern is the earliest clock and Pacific the latest in the contiguous US
-// (Central and Mountain fall between), so requiring both gives an effective window of START+3h to END in Eastern.
-// Hawaii (808) and Alaska (907) are single-zone area codes with their own, wider, offsets.
+// every zone the number could be in. Eastern is the furthest AHEAD and Pacific the furthest BEHIND of the
+// contiguous US zones (Central and Mountain fall between), so the window holds in all of them only when it holds
+// in both: the effective window is START+3h to END in Eastern.
+// Hawaii (808) and Alaska (907) numbers get the same rule PLUS their home zone, since a mobile number can be
+// anywhere: that is a narrow band (Hawaii 16:00-18:00 Eastern in summer, Alaska 14:00-18:00).
 export const LEAD_CALL_START_MINUTES = 10 * 60;
 export const LEAD_CALL_END_MINUTES = 18 * 60;
 
 const HAWAII = 'Pacific/Honolulu';
 const ALASKA = 'America/Anchorage';
+// The furthest-ahead and furthest-behind contiguous US zones.
 const CONTIGUOUS_BOUNDS = ['America/New_York', 'America/Los_Angeles'] as const;
 
 const NANP_US_E164 = /^\+1(\d{3})\d{7}$/;
@@ -34,7 +37,6 @@ export function isInsideLeadCallWindow(e164: string, at: Date): boolean {
   if (!match || !Number.isFinite(at.getTime())) return false;
   if (!isUsNumber(e164)) return false;
   const area = match[1];
-  if (area === '808') return insideWindow(HAWAII, at);
-  if (area === '907') return insideWindow(ALASKA, at);
-  return CONTIGUOUS_BOUNDS.every(zone => insideWindow(zone, at));
+  const home = area === '808' ? HAWAII : area === '907' ? ALASKA : null;
+  return [...CONTIGUOUS_BOUNDS, ...(home ? [home] : [])].every(zone => insideWindow(zone, at));
 }
