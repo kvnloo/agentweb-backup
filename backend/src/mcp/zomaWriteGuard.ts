@@ -1,0 +1,70 @@
+/**
+ * ENG-2823 — the provider-neutral half of the Zoma guarded-write flow, extracted unchanged
+ * from metaToolkitWrites.ts (ENG-2303 P3) so every ad platform uses one guard:
+ *
+ *   preview (nothing sent) → single-use preview_token bound to the user, the exact
+ *   arguments and what the preview showed → confirm=true + that token → apply once → read-back.
+ *
+ * Pure: no I/O. Each provider computes its own fingerprint object (Meta's is byte-for-byte
+ * what it was before the extraction, so tokens and tests are unchanged); this module signs,
+ * verifies and consumes tokens only.
+ */
+import crypto from 'crypto';
+
+export const PREVIEW_TOKEN_TTL_MS = 15 * 60 * 1000;
+
+/** Read-back verdict of a dispatched write. Only CONFIRMED is ever reported as success. */
+export type WriteVerification = 'CONFIRMED' | 'MISMATCH' | 'UNCONFIRMED';
+
+/** Key-order-independent serialization; undefined members are dropped. */
+export function stableStringify(value: any): string {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().filter((k) => value[k] !== undefined).map((k) => `${JSON.stringify(k)}:${stableStringify(value[k])}`).join(',')}}`;
+  }
+  return JSON.stringify(value ?? null);
+}
+
+export function previewFingerprint(value: unknown): string {
+  return crypto.createHash('sha256').update(stableStringify(value)).digest('hex');
+}
+
+export function signPreviewToken(secret: string, userId: string, exp: number, fingerprint: string): string {
+  const mac = crypto.createHmac('sha256', secret).update(`zoma-preview:v1:${userId}:${exp}:${fingerprint}`).digest('base64url');
+  return `v1.${exp}.${mac}`;
+}
+
+export function previewTokenMatches(token: unknown, secret: string, userId: string, fingerprint: string, now: number): boolean {
+  if (typeof token !== 'string') return false;
+  const [version, expRaw] = token.split('.');
+  const exp = Number(expRaw);
+  if (version !== 'v1' || !Number.isSafeInteger(exp) || exp <= now) return false;
+  const expected = Buffer.from(signPreviewToken(secret, userId, exp, fingerprint));
+  const given = Buffer.from(token);
+  return expected.length === given.length && crypto.timingSafeEqual(expected, given);
+}
+
+/**
+ * Mark a verified token used. Returns false when it was already consumed. Single-use per
+ * process: there is no durable claim store (that would be new persistence — data-plane
+ * gate), so a cross-instance replay inside the TTL is the documented residual.
+ */
+export function consumePreviewToken(consumed: Map<string, number>, token: string, now: number): boolean {
+  for (const [t, exp] of consumed) if (exp <= now) consumed.delete(t);
+  if (consumed.has(token)) return false;
+  consumed.set(token, Number(token.split('.')[1]));
+  return true;
+}
+
+/** The PREVIEW response every provider returns for an unconfirmed call. */
+export function previewResponse(params: { secret: string; userId: string; now: number; fingerprint: string; preview: string }) {
+  const exp = params.now + PREVIEW_TOKEN_TTL_MS;
+  return {
+    status: 'PREVIEW',
+    success: false,
+    preview: params.preview,
+    preview_token: signPreviewToken(params.secret, params.userId, exp, params.fingerprint),
+    expires_at: new Date(exp).toISOString(),
+    next_step: 'Show this preview to the user. Only after they explicitly approve it, repeat this exact call with confirm=true and this preview_token (single use, 15 minutes).',
+  };
+}

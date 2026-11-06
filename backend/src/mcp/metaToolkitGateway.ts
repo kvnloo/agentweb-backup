@@ -18,13 +18,13 @@ import {
   getAccountsByUserIdIncludingOrgShared,
   type ConnectedAccount,
 } from '../services/connectedAccountsDb';
-import { isMetaAdAccount } from '../services/metaTokenRefresh';
 import { recordMcpToolUse, recordMcpWriteExecuted, type McpAuthMethod } from '../services/mcpUsageEventsService';
 import { executeMetaToolkitCall, getMetaToolkitManifest, MetaToolkitRefusal } from './metaToolkitManifest';
 import { RateLimiter } from '../middleware/rateLimiter';
 import { isZomaTool } from './zomaToolDefinitions';
 import { executeMetaToolkitWrite, isGuardedWriteRequest } from './metaToolkitWrites';
-import { metaConnectionIsUsable, runZomaTool, ZomaNotReadyError } from './zomaOnboarding';
+import { runZomaTool, ZomaNotReadyError } from './zomaOnboarding';
+import { googleToolkitEnabled, META_PROVIDER, resolveProviderAccount } from './zomaProviders';
 import { validateZomaToken, ZOMA_TOKEN_PREFIX } from './zomaDeviceFlow';
 import { executeMetaToolkitCreative, isCreativeAssetRequest, prepareZomaUpload } from './metaToolkitCreatives';
 
@@ -132,46 +132,20 @@ export async function authenticateMetaToolkitCaller(
   return { userId: oauth.userId, authMethod: 'oauth', clientId: oauth.clientId };
 }
 
-function normalizeAdAccountId(id: unknown): string {
-  return String(id ?? '').trim().replace(/^act_/, '');
-}
-
-const connectionIsUsable = metaConnectionIsUsable;
-
 /**
  * Resolve the Meta ad account this call runs against. A requested account must be one the
  * caller can see; without a request, exactly one usable connection must exist.
+ * ENG-2823: the rule itself is the provider-neutral resolveProviderAccount (Meta = provider #1).
  */
 export async function resolveMetaToolkitAdAccount(
   userId: string,
   requestedAccountId: unknown,
   deps: MetaToolkitGatewayDeps = defaultDeps,
 ): Promise<string> {
-  const metaAccounts = (await deps.listAccounts(userId)).filter(isMetaAdAccount);
-  const requested = normalizeAdAccountId(requestedAccountId);
-  const now = deps.now();
-
-  if (requested) {
-    const match = metaAccounts.find((a) => {
-      const cfg: any = a.config;
-      return normalizeAdAccountId(cfg?.ad_account_id) === requested || normalizeAdAccountId(a.account_id) === requested;
-    });
-    if (!match) throw new MetaToolkitAuthError('That Meta ad account is not connected to this account.', 403);
-    if (!connectionIsUsable(match, now)) {
-      throw new MetaToolkitAuthError('The Meta connection for this ad account was revoked or expired. Reconnect Meta.', 403);
-    }
-    return requested;
-  }
-
-  const usable = metaAccounts.filter((a) => connectionIsUsable(a, now));
-  if (usable.length === 0) {
-    throw new MetaToolkitAuthError('No usable Meta ad account is connected. Connect or reconnect Meta.', 403);
-  }
-  if (usable.length > 1) {
-    throw new MetaToolkitRefusal('Multiple Meta ad accounts are connected; pass account_id.');
-  }
-  const cfg: any = usable[0].config;
-  return normalizeAdAccountId(cfg?.ad_account_id || usable[0].account_id);
+  const resolved = resolveProviderAccount(META_PROVIDER, await deps.listAccounts(userId), requestedAccountId, deps.now());
+  if (resolved.ok) return resolved.accountId;
+  if (resolved.kind === 'ambiguous') throw new MetaToolkitRefusal(resolved.message);
+  throw new MetaToolkitAuthError(resolved.message, 403);
 }
 
 // Fail closed: if the manifest cannot be read, let the error propagate so the call is
@@ -208,10 +182,11 @@ export async function handleMetaToolkitCall(
   deps: MetaToolkitGatewayDeps = defaultDeps,
 ) {
   const caller = await authenticateMetaToolkitCaller(request.authorization, deps);
-  const meter = () =>
+  const meter = (platform?: string) =>
     deps.recordUsage({
       userId: caller.userId,
       toolName: request.toolName,
+      ...(platform ? { platform } : {}),
       authMethod: caller.authMethod,
       apiKeyId: caller.apiKeyId,
       clientId: caller.clientId,
@@ -237,6 +212,21 @@ export async function handleMetaToolkitCall(
     }
     await meter();
     return result;
+  }
+
+  // ENG-2823: Google Ads provider (dark until ZOMA_GOOGLE_ADS_ENABLED=true). Loaded lazily so
+  // the Meta path never imports the Google stack.
+  if (googleToolkitEnabled()) {
+    const google = await import('./googleToolkitGateway');
+    if (google.isGoogleToolkitTool(request.toolName)) {
+      return stripCredentials(await google.handleGoogleToolkitCall(caller, request, {
+        listAccounts: deps.listAccounts,
+        now: deps.now,
+        meter: () => meter('google_ads'),
+        recordWrite: deps.recordWrite ?? recordMcpWriteExecuted,
+        accessError: (message) => new MetaToolkitAuthError(message, 403),
+      }));
+    }
   }
 
   const args = { ...(request.args ?? {}) };
@@ -269,6 +259,7 @@ export async function handleMetaToolkitCall(
       clientId: caller.clientId,
       sessionId: request.sessionId,
       userAgent: request.userAgent,
+      platform: 'meta',
       entityType: String(args.entity_type),
       action: String(args.action),
       verification: (result as any).verification,
@@ -279,6 +270,6 @@ export async function handleMetaToolkitCall(
     });
   }
 
-  await meter();
+  await meter('meta');
   return stripCredentials(result);
 }

@@ -3,6 +3,15 @@
  * zomaOnboarding.ts so the Meta Toolkit manifest can advertise them without importing
  * services. Handlers live in zomaOnboarding.ts and are dispatched by the toolkit gateway.
  */
+/**
+ * ENG-2823 dark-launch switch for the Google Ads provider. Off: the toolkit advertises,
+ * accepts and reports exactly what it did before (Meta only). On: Google tools are listed,
+ * routed, and shown in zoma_status.
+ */
+export function googleToolkitEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.ZOMA_GOOGLE_ADS_ENABLED === 'true';
+}
+
 export const ZOMA_TOOL_NAMES = ['zoma_status', 'zoma_usage', 'zoma_prepare_upload'] as const;
 export type ZomaToolName = (typeof ZOMA_TOOL_NAMES)[number];
 
