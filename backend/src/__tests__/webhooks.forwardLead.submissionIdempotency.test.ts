@@ -244,18 +244,103 @@ describe('ENG-2837 forward-lead submission idempotency', () => {
     expect(sideEffectCounts()).toMatchObject({ createLead: 1, capi: 1, crmSync: 2, alerts: 1 });
   });
 
-  it('a failed attempt releases its claim, so the retry is processed (no stuck claim)', async () => {
-    (crmDb.createLead as jest.Mock).mockRejectedValueOnce(new Error('ProvisionedThroughputExceeded'));
+  it('a failure BEFORE any lead write releases the claim, so the retry is processed', async () => {
+    (crmDb.getLeadByEmail as jest.Mock).mockRejectedValueOnce(new Error('ProvisionedThroughputExceeded'));
     const failed = await request(app).post('/api/webhooks/forward-lead').send(flatfee());
     await flush();
     expect(failed.status).toBe(500);
-    expect(sideEffectCounts()).toMatchObject({ capi: 0, crmSync: 0 });
+    expect(sideEffectCounts()).toMatchObject({ createLead: 0, dispatch: 0, capi: 0, crmSync: 0 });
+    expect(claimItems()).toHaveLength(0);
 
     const retry = await request(app).post('/api/webhooks/forward-lead').send(flatfee());
     await flush();
     expect(retry.status).toBe(201);
     expect(retry.body).toMatchObject({ success: true, leadId: 'lead_1' });
-    expect(sideEffectCounts()).toMatchObject({ createLead: 2, capi: 1, crmSync: 2 });
+    expect(sideEffectCounts()).toMatchObject({ createLead: 1, capi: 1, crmSync: 2 });
+  });
+
+  it('a failure AFTER a lead write may have started never releases the claim: retries get 409, no second write', async () => {
+    // createLead can throw after its put landed; we cannot tell, so the key must stay taken.
+    (crmDb.createLead as jest.Mock).mockRejectedValueOnce(new Error('timeout after write'));
+    const failed = await request(app).post('/api/webhooks/forward-lead').send(flatfee());
+    await flush();
+    expect(failed.status).toBe(500);
+
+    const retry = await request(app).post('/api/webhooks/forward-lead').send(flatfee());
+    await flush();
+    expect(retry.status).toBe(409);
+    expect(retry.body).toMatchObject({ success: false, retryable: true });
+    expect(sideEffectCounts()).toMatchObject({ createLead: 1, dispatch: 0, capi: 0, crmSync: 0 });
+    expect(claimItems()).toEqual([expect.objectContaining({ status: 'in_progress' })]);
+  });
+
+  it('claim-store outage fails CLOSED: 503 retryable, no lead write, no side effect', async () => {
+    const outage = {
+      put: () => ({ promise: () => Promise.reject(Object.assign(new Error('ServiceUnavailable'), { code: 'ServiceUnavailable' })) }),
+      get: () => ({ promise: () => Promise.reject(new Error('ServiceUnavailable')) }),
+      delete: () => ({ promise: () => Promise.reject(new Error('ServiceUnavailable')) }),
+    };
+    __configureLeadSubmissionIdempotencyForTests({ client: outage as any });
+    const res = await request(app).post('/api/webhooks/forward-lead').send(flatfee());
+    await flush();
+    expect(res.status).toBe(503);
+    expect(res.headers['retry-after']).toBe('2');
+    expect(res.body).toMatchObject({ success: false, retryable: true });
+    expect(sideEffectCounts()).toEqual({ createLead: 0, updateLead: 0, dispatch: 0, capi: 0, crmSync: 0, alerts: 0 });
+
+    // store recovers: the same key is processed normally, exactly once
+    __configureLeadSubmissionIdempotencyForTests({ client: new (dynamo.documentClient as any)() });
+    const retry = await request(app).post('/api/webhooks/forward-lead').send(flatfee());
+    await flush();
+    expect(retry.status).toBe(201);
+    expect(sideEffectCounts()).toMatchObject({ createLead: 1, capi: 1 });
+  });
+
+  it.each([
+    ['throws', () => Promise.reject(new Error('ServiceUnavailable'))],
+    ['is rejected by its condition', () => Promise.reject(Object.assign(new Error('cond'), { code: 'ConditionalCheckFailedException' }))],
+  ])('completion persistence that %s: 503 retryable, NO side effects, claim kept, retries never repeat the write', async (_label, failCompletion) => {
+    const real = new (dynamo.documentClient as any)();
+    const flaky = {
+      get: (p: any) => real.get(p),
+      delete: (p: any) => real.delete(p),
+      put: (p: any) => (p.Item?.status === 'completed' ? { promise: failCompletion } : real.put(p)),
+    };
+    __configureLeadSubmissionIdempotencyForTests({ client: flaky as any });
+
+    const res = await request(app).post('/api/webhooks/forward-lead').send(flatfee());
+    await flush();
+    expect(res.status).toBe(503);
+    expect(res.body).toMatchObject({ success: false, retryable: true });
+    expect(sideEffectCounts()).toEqual({ createLead: 1, updateLead: 0, dispatch: 0, capi: 0, crmSync: 0, alerts: 0 });
+    // createLead was told not to notify at the write
+    expect((crmDb.createLead as jest.Mock).mock.calls[0][1].deferCreatedNotification).toBe(true);
+
+    __configureLeadSubmissionIdempotencyForTests({ client: real });
+    const retry = await request(app).post('/api/webhooks/forward-lead').send(flatfee());
+    await flush();
+    expect(retry.status).toBe(409);
+    expect(sideEffectCounts()).toEqual({ createLead: 1, updateLead: 0, dispatch: 0, capi: 0, crmSync: 0, alerts: 0 });
+  });
+
+  it('every side effect fires only after the completed record is durable', async () => {
+    const statusAtEffect: string[] = [];
+    const snap = () => { statusAtEffect.push(claimItems().map((i) => i.status).join(',')); };
+    (dispatchLeadCreated as jest.Mock).mockImplementation(async () => { snap(); });
+    (metaService.sendCapiLeadEvent as jest.Mock).mockImplementation(async () => { snap(); return { success: true }; });
+    (externalCrmSyncService.autoSyncLead as jest.Mock).mockImplementation(async () => { snap(); });
+
+    const res = await request(app).post('/api/webhooks/forward-lead').send(flatfee());
+    await flush();
+    expect(res.status).toBe(201);
+    expect(sideEffectCounts()).toMatchObject({ dispatch: 1, capi: 1, crmSync: 2 });
+    expect(statusAtEffect.length).toBeGreaterThanOrEqual(4);
+    expect(statusAtEffect.every((s) => s === 'completed')).toBe(true);
+  });
+
+  it('unkeyed creates still notify at the write (createLead not told to defer)', async () => {
+    await request(app).post('/api/webhooks/forward-lead').send(flatfee({ submissionId: undefined }));
+    expect((crmDb.createLead as jest.Mock).mock.calls[0][1].deferCreatedNotification).toBeUndefined();
   });
 
   it('a duplicate arriving while the original is still in flight gets a retryable non-success, never a second write', async () => {
@@ -281,10 +366,10 @@ describe('ENG-2837 forward-lead submission idempotency', () => {
     expect(later.body).toEqual(r1.body);
   });
 
-  it('a stale in-flight claim (owner died) is reclaimed instead of wedging the key forever', async () => {
+  it('an OLD in-progress claim (owner died or stalled) is never taken over: 409, no write', async () => {
     const first = await request(app).post('/api/webhooks/forward-lead').send(flatfee());
     expect(first.status).toBe(201);
-    // Rewind the stored claim to an abandoned in-flight state, as if the owner crashed.
+    // Rewind the stored claim to an hour-old in-flight state, as if the owner crashed or stalled.
     for (const item of claimItems()) {
       const table = dynamo.items(CONFIGS).includes(item) ? CONFIGS : DEV_CONFIGS;
       dynamo.seed(table, {
@@ -292,9 +377,11 @@ describe('ENG-2837 forward-lead submission idempotency', () => {
         ownerToken: 'dead-owner', claimedAtMs: Date.now() - 60 * 60 * 1000,
       });
     }
+    const before = sideEffectCounts();
     const retry = await request(app).post('/api/webhooks/forward-lead').send(flatfee());
     await flush();
-    expect(retry.body).toMatchObject({ success: true });
-    expect(sideEffectCounts().createLead).toBe(2);
+    expect(retry.status).toBe(409);
+    expect(retry.body).toMatchObject({ success: false, retryable: true });
+    expect(sideEffectCounts()).toEqual(before);
   });
 });
