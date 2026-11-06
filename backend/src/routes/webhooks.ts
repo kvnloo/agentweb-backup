@@ -42,6 +42,7 @@ import { getPhoneDedupeMode } from '../utils/phoneLeadDedupeMode';
 import { fillBlankCustomFields, phoneDedupeKey, phoneNamesConflict, phoneNameSeed } from '../utils/phoneLeadDedupe';
 import { findPhoneMatch } from '../services/phoneLeadMatch';
 import { upsertSessionLead } from '../services/sessionUpsertService';
+import { claimLeadSubmission, completeLeadSubmission, releaseLeadSubmission, resolveSubmissionKey } from '../services/leadSubmissionIdempotency';
 
 // ─── HubSpot signature helpers ────────────────────────────────────────────────
 
@@ -530,6 +531,10 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     });
   }
 
+  // ENG-2837: the (listId, submission key) claim this request holds, if any. Declared outside
+  // the try so the catch can give it back when the capture fails before a lead is written.
+  let submissionClaim: { key: string; ownerToken: string } | null = null;
+
   try {
 
     // ENG-2311: read from the list row the DATABASE returned, never from the body. One
@@ -607,6 +612,41 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
         success: false,
         message: 'Email or phone is required'
       });
+    }
+
+    // ENG-2837: server-side idempotency per (listId, submission key). A lander that lost the
+    // response to a successful capture retries with the same key; the repeat must get the
+    // ORIGINAL response back and must not write the lead or fire any side effect again.
+    // Claimed only after every 4xx above, so a rejected request never holds a key. No key →
+    // nothing here runs and the handler behaves exactly as before.
+    const submissionKey = resolveSubmissionKey(req.body);
+    if (submissionKey) {
+      let claim: Awaited<ReturnType<typeof claimLeadSubmission>> | null = null;
+      try {
+        claim = await claimLeadSubmission(leadList.listId, submissionKey);
+      } catch (claimErr: any) {
+        // Fail OPEN: an idempotency-store outage must not cost the lead. A duplicate that slips
+        // through here is still bounded by the email dedupe below and by the deterministic
+        // notification id (see the repeat-submission dispatch).
+        console.error(`[forward-lead] ENG-2837 submission claim failed for list ${leadList.listId}, processing without it: ${claimErr?.message || claimErr}`);
+      }
+      if (claim?.outcome === 'completed') {
+        res.setHeader('Idempotent-Replayed', 'true');
+        return res.status(claim.record.responseStatus).json(claim.record.responseBody);
+      }
+      if (claim?.outcome === 'in_progress') {
+        // The original is still being processed. Not a success (we cannot yet name its
+        // leadId) and not a failure: the same key retried shortly gets the original response.
+        res.setHeader('Retry-After', '2');
+        return res.status(409).json({
+          success: false,
+          retryable: true,
+          message: 'This submission is already being processed. Retry with the same submissionId.',
+        });
+      }
+      if (claim?.outcome === 'claimed') {
+        submissionClaim = { key: submissionKey, ownerToken: claim.ownerToken };
+      }
     }
 
     // Prepare lead data
@@ -1176,38 +1216,43 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     // resubmission notified a real human about a fake lead. The gate's own comment claims
     // it skips "the whole cascade"; this is the part that escaped it.
     if (!suppressSideEffects && !isNew && !isSmokeTestLead(lead) && !isSmokeTestLead(leadData)) {
-      const submission = { submissionId: crypto.randomUUID(), submittedAt: new Date().toISOString() };
+      // ENG-2837: a caller-supplied key makes the notification id deterministic, so even a repeat
+      // that got past the claim (store outage, stale reclaim) dedupes in the notifier itself.
+      const submission = {
+        submissionId: submissionKey ? `client:${submissionKey}` : crypto.randomUUID(),
+        submittedAt: new Date().toISOString(),
+      };
       void import('../services/orgLeadNotificationService')
         .then(({ dispatchLeadCreated }) => dispatchLeadCreated(leadList.listId, lead.leadId, 'form_fill', submission))
         .catch(() => console.warn('[leadNotifications] submission hook failed', { listId: leadList.listId, leadId: lead.leadId }));
     }
 
     // Send API response immediately so caller is not blocked
-    if (isNew) {
-      res.status(201).json({
-        success: true,
-        message: 'Lead forwarded successfully',
-        event: 'lead.created',
-        leadId: lead.leadId,
-        listId: leadList.listId
-      });
-    } else if (isUpdated) {
-      res.status(200).json({
-        success: true,
-        message: 'Lead updated successfully',
-        event: 'lead.updated',
-        leadId: lead.leadId,
-        listId: leadList.listId
-      });
-    } else {
-      res.status(200).json({
-        success: true,
-        message: 'Lead already exists with no changes',
-        event: 'lead.unchanged',
-        leadId: lead.leadId,
-        listId: leadList.listId
-      });
+    const responseStatus = isNew ? 201 : 200;
+    const responseBody = isNew
+      ? { success: true, message: 'Lead forwarded successfully', event: 'lead.created', leadId: lead.leadId, listId: leadList.listId }
+      : isUpdated
+        ? { success: true, message: 'Lead updated successfully', event: 'lead.updated', leadId: lead.leadId, listId: leadList.listId }
+        : { success: true, message: 'Lead already exists with no changes', event: 'lead.unchanged', leadId: lead.leadId, listId: leadList.listId };
+
+    // ENG-2837: record the response for replay BEFORE answering and before any side effect
+    // below, so a retry that arrives after this response can only ever see "completed". The
+    // lead is written by now, so from here the claim is never released: if recording fails,
+    // the claim ages out (CLAIM_STALE_MS) and a later retry merges into the same lead with a
+    // deterministic notification id, rather than being processed as brand new right away.
+    if (submissionClaim) {
+      const claim = submissionClaim;
+      submissionClaim = null;
+      try {
+        const recorded = await completeLeadSubmission(leadList.listId, claim.key, claim.ownerToken, {
+          leadId: lead.leadId, responseStatus, responseBody,
+        });
+        if (!recorded) console.warn(`[forward-lead] ENG-2837 claim for list ${leadList.listId} was taken over before completion; lead ${lead.leadId} saved`);
+      } catch (completeErr: any) {
+        console.error(`[forward-lead] ENG-2837 failed to record completed submission for lead ${lead.leadId}: ${completeErr?.message || completeErr}`);
+      }
     }
+    res.status(responseStatus).json(responseBody);
 
     // Server-side Meta Conversions API send. Fire-and-forget (same pattern as the
     // roadmap-delivery email below) — this must never delay or affect the lead-save response
@@ -1498,6 +1543,15 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
 
   } catch (error: any) {
     console.error('Lead forwarding error:', error);
+
+    // ENG-2837: the capture failed before its response was recorded — give the key back so the
+    // caller's retry is processed rather than told "in progress" until the claim goes stale.
+    if (submissionClaim) {
+      const claim = submissionClaim;
+      submissionClaim = null;
+      await releaseLeadSubmission(leadList.listId, claim.key, claim.ownerToken).catch((releaseErr: any) =>
+        console.error(`[forward-lead] ENG-2837 failed to release submission claim (frees itself after CLAIM_STALE_MS): ${releaseErr?.message || releaseErr}`));
+    }
 
     // Trigger api.lead_failed alert if configured
     try {
