@@ -1,15 +1,17 @@
 import { randomUUID } from 'crypto';
 import { localParts } from '../dripSendWindow';
-import { hhmmToMinutes, minutesOfDay, type HotLeadCallConfig } from '../hotLeadCallConfig';
+import { hhmmToMinutes, HOT_LEAD_CALL_LIMITS, minutesOfDay, type HotLeadCallConfig } from '../hotLeadCallConfig';
 import { getLimitStore } from './limitStore';
 import { keyedDigest } from './keyedDigest';
 
 // 'in_progress': this same lead already holds the phone marker, so another dispatch of it is placing the call.
-type LimitDenial = 'duplicate_phone' | 'in_progress' | 'org_hourly_cap' | 'org_daily_cap';
+type LimitDenial = 'duplicate_phone' | 'in_progress' | 'org_hourly_cap' | 'org_daily_cap' | 'org_monthly_cap';
 
 const MINUTE_S = 60;
 export const HOUR_S = 3600;
 export const DAY_S = 24 * HOUR_S;
+// A calendar month is at most 31 days; the counter key is bucketed by month, so the TTL only has to outlive it.
+export const MONTH_TTL_S = 40 * DAY_S;
 const PHONE_WINDOW_S = DAY_S;
 
 // ---- calling hours -----------------------------------------------------------------------------------------
@@ -50,6 +52,9 @@ export const hourlyCapKey = (orgId: string, at: Date): string => `hlc#cap#h#${or
 /** The zone the org's daily windows follow: its calling-hours zone, UTC when none is set. */
 export const limitTimeZone = (config: Pick<HotLeadCallConfig, 'callingHours'>): string => config.callingHours?.timezone ?? 'UTC';
 export const dailyCapKey = (orgId: string, timeZone: string, at: Date): string => `hlc#cap#d#${orgId}#${localDayAndMinutes(timeZone, at).date}`;
+/** The org-local calendar month (YYYY-MM) that the monthly cap and its customer notices are bucketed by. */
+export const localMonth = (timeZone: string, at: Date): string => localDayAndMinutes(timeZone, at).date.slice(0, 7);
+export const monthlyCapKey = (orgId: string, timeZone: string, at: Date): string => `hlc#cap#m#${orgId}#${localMonth(timeZone, at)}`;
 
 // ---- reservation -----------------------------------------------------------------------------------------
 
@@ -78,7 +83,10 @@ export function slotTaker(nowS: number) {
   };
 }
 
-export type Reservation = { ok: true; release: () => Promise<void> } | { ok: false; reason: LimitDenial };
+export type Reservation =
+  // monthlyUsed: this org's count for the month right after this lead was counted; absent when the read failed (notices only).
+  | { ok: true; release: () => Promise<void>; monthlyUsed?: number }
+  | { ok: false; reason: LimitDenial };
 
 /**
  * Takes this lead's slot against the per-lead abuse limits, or says which one refused. Taken once, at the lead's
@@ -93,7 +101,10 @@ export type Reservation = { ok: true; release: () => Promise<void> } | { ok: fal
  * submit) finds 'in_progress' instead of a duplicate: nothing is lost, the first dispatch is placing the call.
  * Store failures throw (the job fails and nothing is dialed): fail closed.
  *
- * The hourly and daily caps count LEADS, one per lead at its first attempt: a lead that goes on to ring several
+ * The monthly cap (org-local calendar month, ENG-2783) is taken after the hourly and daily ones and counts the same unit.
+ * Inbound callbacks are not counted.
+ *
+ * The hourly, daily and monthly caps count LEADS, one per lead at its first attempt: a lead that goes on to ring several
  * members (up to maxAttemptsPerLead) plus the lead's own leg still costs one slot.
  *
  * Known limits (accepted):
@@ -122,6 +133,7 @@ export async function reserveCallSlot(input: {
     const counters: Array<[LimitDenial, () => Promise<boolean>]> = [
       ['org_hourly_cap', () => count(hourlyCapKey(orgId, now), config.maxCallsPerHour, 2 * HOUR_S)],
       ['org_daily_cap', () => count(dailyCapKey(orgId, limitTimeZone(config), now), config.maxCallsPerDay, 2 * DAY_S)],
+      ['org_monthly_cap', () => count(monthlyCapKey(orgId, limitTimeZone(config), now), config.maxCallsPerMonth ?? HOT_LEAD_CALL_LIMITS.maxCallsPerMonth.default, MONTH_TTL_S)],
     ];
     for (const [reason, take] of counters) {
       if (!await take()) {
@@ -133,7 +145,16 @@ export async function reserveCallSlot(input: {
     await releaseAll();
     throw err;
   }
-  return { ok: true, release: releaseAll };
+  return { ok: true, release: releaseAll, monthlyUsed: await readMonthlyUsed(monthlyCapKey(orgId, limitTimeZone(config), now)) };
+}
+
+// For the 80% notice only: a failed read must never fail or refuse the call.
+async function readMonthlyUsed(key: string): Promise<number | undefined> {
+  try {
+    return await getLimitStore().read(key);
+  } catch {
+    return undefined;
+  }
 }
 
 /**

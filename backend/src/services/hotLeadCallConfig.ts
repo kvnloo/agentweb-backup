@@ -32,10 +32,15 @@ export const HOT_LEAD_CALL_LIMITS = {
   // members and then the lead's own leg, and still uses one slot.
   maxCallsPerHour: { default: 6, min: 1, max: 30 },
   maxCallsPerDay: { default: 20, min: 1, max: 100 },
+  // Leads that get a call in one org-local calendar month (ENG-2783). Stored values up to `max` are valid (an operator
+  // raises a customer's limit by a data write); owner-level routes may only set up to HOT_LEAD_CALL_OWNER_MAX_CALLS_PER_MONTH.
+  maxCallsPerMonth: { default: 200, min: 1, max: 2000 },
   memberCooldownMinutes: { default: 2, min: 1, max: 60 },
   /** Calls placed for one lead (each to a different team member) before giving up. */
   maxAttemptsPerLead: { default: 3, min: 1, max: 5 },
 } as const;
+/** The highest maxCallsPerMonth an owner (Emma tool, REST PUT) may set: the default. Higher values are an operator's data write. */
+export const HOT_LEAD_CALL_OWNER_MAX_CALLS_PER_MONTH = HOT_LEAD_CALL_LIMITS.maxCallsPerMonth.default;
 type HotLeadCallLimitField = keyof typeof HOT_LEAD_CALL_LIMITS;
 export const HOT_LEAD_CALL_LIMIT_FIELDS = Object.keys(HOT_LEAD_CALL_LIMITS) as HotLeadCallLimitField[];
 
@@ -95,6 +100,8 @@ export interface HotLeadCallConfig {
   maxAgeMinutes: number;
   maxCallsPerHour: number;
   maxCallsPerDay: number;
+  /** Leads that get a call per org-local calendar month; absent in stored configs from before ENG-2783, which read as the default. */
+  maxCallsPerMonth: number;
   memberCooldownMinutes: number;
   maxAttemptsPerLead: number;
   /** Spoken aloud inside TwiML, hence the restricted charset. */
