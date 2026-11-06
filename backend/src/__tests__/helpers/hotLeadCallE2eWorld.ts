@@ -47,6 +47,8 @@ interface World {
   twilio: TwilioCaller;
   postMessage: jest.Mock;
   consoleSpies: jest.SpyInstance[];
+  /** The console.warn spy (one of consoleSpies). */
+  warnSpy: jest.SpyInstance;
 }
 export const world = {} as World;
 let submissionSeq = 0;
@@ -96,6 +98,7 @@ export function installWorld(): void {
     mock(WebClient).mockImplementation(() => ({ auth: { test: jest.fn().mockResolvedValue({ ok: true, team_id: 'T123', bot_id: 'B123' }) }, chat: { postMessage: world.postMessage } }));
     mock(recordVendorUsage).mockResolvedValue(undefined);
     world.consoleSpies = (['log', 'warn', 'error', 'info'] as const).map((m) => jest.spyOn(console, m).mockImplementation(() => undefined));
+    world.warnSpy = world.consoleSpies[1];
   });
 
   afterEach(() => {

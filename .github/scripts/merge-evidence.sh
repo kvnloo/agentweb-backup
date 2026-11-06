@@ -589,6 +589,39 @@ if [ "${opslane_noop}" -gt 0 ]; then
   log "ignored ${opslane_noop} Opslane (neutral) check-run(s) with an abstention title: an abstention, not a verdict"
 fi
 
+# Pass 5 — DROP A HUNG OPSLANE RUN (ENG-2833).
+# Opslane is not a required check, and its check-runs regularly hang
+# `in_progress` for hours (#3907: >1h on four successive heads, rerequest 404
+# because the run is app-owned). Counted as pending, one hung advisory run held
+# a PR with every required check green forever. The match is narrow: app slug
+# AND name AND a non-completed status AND started_at older than the threshold.
+# A fresh Opslane run still holds as PENDING; a completed Opslane failure still
+# blocks; no other app's run is touched. A dropped run is not evidence.
+# MERGE_EVIDENCE_NOW (epoch seconds) exists only so the test suite can pin time.
+OPSLANE_STALE_MINUTES="${MERGE_EVIDENCE_OPSLANE_STALE_MINUTES:-30}"
+if ! grep -qE '^[0-9]+$' <<<"${OPSLANE_STALE_MINUTES}"; then
+  hard_fail "MERGE_EVIDENCE_OPSLANE_STALE_MINUTES must be a whole number of minutes, got '${OPSLANE_STALE_MINUTES}'"
+fi
+now_epoch="${MERGE_EVIDENCE_NOW:-$(date -u +%s)}"
+# shellcheck disable=SC2016 # $now/$max are jq variables
+opslane_hung_filter='select((.app.slug // "") == "opslane" and .name == "Opslane"
+  and (.status // "") != "completed" and (.started_at // "") != ""
+  and ($now - (.started_at | fromdateiso8601)) > ($max * 60))'
+if ! opslane_hung="$(printf '%s' "${runs_json}" | jq -r --argjson now "${now_epoch}" \
+  --argjson max "${OPSLANE_STALE_MINUTES}" "[ .check_runs[] | ${opslane_hung_filter} ] | length" 2>/dev/null)" \
+  || ! grep -qE '^[0-9]+$' <<<"${opslane_hung}"; then
+  hard_fail "failed to identify hung Opslane check-runs at ${head_sha}"
+fi
+if [ "${opslane_hung}" -gt 0 ]; then
+  if ! runs_json="$(printf '%s' "${runs_json}" | jq -c --argjson now "${now_epoch}" \
+    --argjson max "${OPSLANE_STALE_MINUTES}" \
+    ".check_runs |= map(select(. as \$c | [\$c | ${opslane_hung_filter}] | length == 0))" 2>/dev/null)" \
+    || [ -z "${runs_json}" ]; then
+    hard_fail "failed to exclude hung Opslane check-runs at ${head_sha}"
+  fi
+  log "ignored ${opslane_hung} Opslane check-run(s) still running after ${OPSLANE_STALE_MINUTES}m: Opslane is not required, and a hung advisory run is not a verdict"
+fi
+
 effective_count="$(printf '%s' "${runs_json}" | jq -r '.check_runs | length' 2>/dev/null)"
 if ! grep -qE '^[0-9]+$' <<<"${effective_count}"; then
   hard_fail "check-runs payload became unreadable after narrowing to effective runs at ${head_sha}"

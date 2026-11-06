@@ -40,6 +40,12 @@ describe('classifyToolErrorClass', () => {
     expect(classifyToolErrorClass(err('Unauthorized: missing credentials'))).toBe('auth');
   });
 
+  it('ENG-2786: client_id-scoped missing account_id is invalid_args, not auth; real token failure stays auth', () => {
+    expect(classifyToolErrorClass(new Error('client_id-scoped calls require an explicit account_id — call assess_client_health with client_name_or_email="x@y.com" first; its ad_account_id field is this client\'s Meta ad account.'))).toBe('invalid_args');
+    expect(classifyToolErrorClass(Object.assign(new Error('client_id-scoped calls require an explicit account_id'), { toolErrorClass: 'invalid_args' }))).toBe('invalid_args');
+    expect(classifyToolErrorClass(Object.assign(new Error('Request failed'), { status: 401 }))).toBe('auth');
+  });
+
   it('classifies rate limits', () => {
     expect(classifyToolErrorClass(err('Request failed with status code 429'))).toBe('rate_limit');
     expect(classifyToolErrorClass(err('Too Many Requests'))).toBe('rate_limit');

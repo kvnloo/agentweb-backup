@@ -13,6 +13,7 @@ jest.mock('../services/asyncJobQueue', () => ({
   enqueueJob: jest.fn(), markJobComplete: jest.fn(), markJobFailed: jest.fn(),
   startHeartbeat: jest.fn(), registerProcessor: jest.fn(), clearFailedJob: jest.fn(),
 }));
+jest.mock('../services/emailService', () => ({ emailService: { sendEmail: jest.fn(), escapeHtml: (t: string) => t } }));
 const callerless = { on: false };
 jest.mock('../services/voice/hotLeadCallContext', () => ({
   resolveHotLeadCallContext: async (listId: string) => {
@@ -21,8 +22,11 @@ jest.mock('../services/voice/hotLeadCallContext', () => ({
     return ctx && callerless.on ? { ...ctx, config: { ...ctx.config, twilioNumber: undefined } } : ctx;
   },
 }));
+import * as leadLocalHours from '../services/voice/leadLocalHours';
+import * as capNotices from '../services/voice/hotLeadCallCapNotices';
 import { crmDb, userDb, orgDb } from '../services/db';
 import * as queue from '../services/asyncJobQueue';
+import { emailService } from '../services/emailService';
 import { getSubscriptionTypeConfig, getUserSubscriptionResolution } from '../services/subscriptionService';
 import { dispatchHotLeadCall, processHotLeadCallJob, registerHotLeadCallProcessor } from '../services/hotLeadCallService';
 import { setHotLeadCallEnabledOverride } from '../services/voice/hotLeadCallMode';
@@ -34,6 +38,7 @@ import { setLimitStoreForTests } from '../services/voice/limitStore';
 import { setHotLeadCallEntitledOverride } from '../services/voice/hotLeadCallEntitlement';
 import { FakeLeadCallStore } from './helpers/fakeLeadCallStore';
 import { leadPhoneMacOf } from '../services/voice/leadPhoneMac';
+import { dncKey, isNumberDoNotCall, markNumberDoNotCall } from '../services/voice/hotLeadCallDnc';
 import { teamMember, callRecord, MEMBER_ID } from './helpers/hotLeadCallFixtures';
 
 const mock = (fn: unknown) => fn as jest.Mock;
@@ -155,10 +160,12 @@ describe('dispatchHotLeadCall gates', () => {
     expect(provider.placedCalls).toHaveLength(1);
   });
 
-  it('accepts a Canadian number when CA is allowed', async () => {
+  it('refuses a Canadian number as country_not_allowed even when CA is allowed (Canada is off in code, ENG-2783)', async () => {
+    org.hotLeadCall = { ...config, allowedCountries: ['US', 'CA'] };
     lead.phone = '+14165550142';
     await dispatchHotLeadCall('list-a', 'lead-a', 'form_fill');
-    expect(provider.placedCalls).toHaveLength(1);
+    expect(provider.placedCalls).toHaveLength(0);
+    expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'country_not_allowed' } }]);
   });
 
   it('measures a repeat submission by its own submittedAt, not by the old lead row', async () => {
@@ -348,7 +355,7 @@ describe('processHotLeadCallJob', () => {
     store.record = callRecord({ state: 'dialing', jobKey: 'other-dispatch', claimToken: 'someone-elses' });
     await processHotLeadCallJob(jobOf());
     expect(provider.placedCalls).toHaveLength(0);
-    expect({ counters: [...limits.counters.values()], claims: limits.claims.size }).toEqual({ counters: [0, 0], claims: 0 });
+    expect({ counters: [...limits.counters.values()], claims: limits.claims.size }).toEqual({ counters: [0, 0, 0], claims: 0 });
   });
 
   it('goes on when a create that answers false actually committed this dispatch\'s own record (an SDK retry lost its response)', async () => {
@@ -360,7 +367,7 @@ describe('processHotLeadCallJob', () => {
     await processHotLeadCallJob(jobOf());
     expect(provider.placedCalls).toHaveLength(1);
     expect(store.record).toMatchObject({ state: 'member_ringing', attemptNo: 1 });
-    expect([...limits.counters.values()]).toEqual([1, 1]);
+    expect([...limits.counters.values()]).toEqual([1, 1, 1]);
   });
 
   it.each([
@@ -454,6 +461,12 @@ describe('registerHotLeadCallProcessor', () => {
 });
 
 describe('calling hours gate', () => {
+  // This block tests the ORG's window in isolation (many instants are night time in the lead's zone), so the
+  // lead-local window (leadLocalHours, covered by its own tests and the e2e gates) is held open here.
+  let leadWindow: jest.SpyInstance;
+  beforeEach(() => { leadWindow = jest.spyOn(leadLocalHours, 'isInsideLeadCallWindow').mockReturnValue(true); });
+  afterEach(() => leadWindow.mockRestore());
+
   // America/Chicago, window 08:00-21:00: CDT is UTC-5, CST is UTC-6.
   const at = async (iso: string) => {
     jest.setSystemTime(new Date(iso));
@@ -516,6 +529,27 @@ describe('calling hours gate', () => {
   });
 });
 
+describe('lead-local hours gate (ENG-2783)', () => {
+  // The org window (Chicago 08:00-21:00) is open; the lead (212, Eastern/Pacific) is not: 14:00Z is 10:00 Eastern, before the 13:00 start.
+  const CLOSED_FOR_LEAD = '2026-10-19T14:00:00Z';
+
+  it('skips at dispatch (before queueing) and again in the job, with no limit store I/O', async () => {
+    jest.setSystemTime(new Date(CLOSED_FOR_LEAD));
+    lead.createdAt = CLOSED_FOR_LEAD;
+    await dispatchHotLeadCall('list-a', 'lead-a', 'form_fill');
+    expect(enqueueCalls()).toHaveLength(0);
+    expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'outside_lead_hours' } }]);
+    await processHotLeadCallJob(jobOf());
+    expect(store.events).toEqual([
+      { type: 'call.skipped', detail: { reason: 'outside_lead_hours' } },
+      { type: 'call.skipped', detail: { reason: 'outside_lead_hours' } },
+    ]);
+    expect(limits.keysTouched).toEqual([]);
+    expect(store.record).toBeNull();
+    expect(provider.placedCalls).toHaveLength(0);
+  });
+});
+
 describe('abuse limits (reservation)', () => {
   const FIRST = '(212) 555-0142';
   // A new lead row, same list: the record store is per lead, so reset it.
@@ -532,16 +566,19 @@ describe('abuse limits (reservation)', () => {
 
   it('records a successful call against the phone marker, the cooldown and both counters', async () => {
     expect(await submit('l1', FIRST)).toBe('called');
-    expect(slots()).toEqual({ counters: [1, 1], claims: 2 });
+    expect(slots()).toEqual({ counters: [1, 1, 1], claims: 2 });
   });
 
   it('refuses the same phone for 24h on a different lead row, then allows it again', async () => {
+    // Start at 15:00 Eastern: the 24h boundary must fall inside the lead-local window (13:00-18:00 Eastern, ENG-2783).
+    const T0 = 120;
+    later(T0);
     expect(await submit('l1', FIRST)).toBe('called');
-    later(3);
+    later(T0 + 3);
     expect(await submit('l2', '+12125550142')).toBe('duplicate_phone'); // same number, different spelling
-    later(24 * 60 - 1);
+    later(T0 + 24 * 60 - 1);
     expect(await submit('l3', FIRST)).toBe('duplicate_phone');
-    later(24 * 60);
+    later(T0 + 24 * 60);
     expect(await submit('l4', FIRST)).toBe('called');
   });
 
@@ -579,8 +616,9 @@ describe('abuse limits (reservation)', () => {
     expect(await submit('l2', '+12125550142')).toBe('called');
     later(4);
     expect(await submit('l3', '+12125550143')).toBe('org_daily_cap');
-    // Chicago midnight (05:00Z) starts a new local day, but the window is closed overnight; use the next morning.
-    later(60 * 20);
+    // Chicago midnight (05:00Z) starts a new local day, but the windows are closed overnight; use the next midday
+    // (the lead-local window is 13:00-18:00 Eastern, so the next morning is too early).
+    later(60 * 24);
     expect(await submit('l4', '+12125550144')).toBe('called');
   });
 
@@ -607,7 +645,7 @@ describe('abuse limits (reservation)', () => {
     later(2);
     expect(await submit('l2', '+12125550142')).toBe('org_hourly_cap');
     // l2's phone marker and cooldown claim were released; only l1's phone marker remains, and the counters did not move.
-    expect(slots().counters).toEqual([1, 1]);
+    expect(slots().counters).toEqual([1, 1, 1]);
     expect([...limits.claims.keys()].filter(k => k.startsWith('hlc#phone#'))).toHaveLength(1);
   });
 
@@ -615,26 +653,28 @@ describe('abuse limits (reservation)', () => {
     store.record = callRecord({ state: 'member_ringing', jobKey: 'old', startedAt: NOW, updatedAt: NOW });
     await processHotLeadCallJob(jobOf());
     expect(provider.placedCalls).toHaveLength(0);
-    expect(slots()).toEqual({ counters: [0, 0], claims: 0 });
+    expect(slots()).toEqual({ counters: [0, 0, 0], claims: 0 });
   });
 
   it('gives every slot back when store.create throws', async () => {
     store.create = async () => { throw new Error('ddb down'); };
     await expect(processHotLeadCallJob(jobOf())).rejects.toThrow('ddb down');
-    expect(slots()).toEqual({ counters: [0, 0], claims: 0 });
+    expect(slots()).toEqual({ counters: [0, 0, 0], claims: 0 });
   });
 
   it('keeps the slots when the call is placed and then rejected (the lead\'s call is spent)', async () => {
     provider.failNextPlaceCall('no');
     await processHotLeadCallJob(jobOf());
-    expect(slots()).toEqual({ counters: [1, 1], claims: 2 });
+    expect(slots()).toEqual({ counters: [1, 1, 1], claims: 2 });
   });
 
   it('fails the job closed, dialing nothing and creating no record, and shows limits_unavailable on the lead', async () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
-    limits.failNext = new Error('ddb down');
+    // Only the reservation fails: the do-not-call read before it works, so this proves the reservation's own fail-closed path.
+    limits.failKeyPrefix = { prefix: 'hlc#phone#', error: new Error('ddb down') };
     await expect(processHotLeadCallJob(jobOf())).rejects.toThrow('ddb down');
     warn.mockRestore();
+    expect(limits.keysTouched.some((k) => k.startsWith('hlc#phone#'))).toBe(true);
     expect(provider.placedCalls).toHaveLength(0);
     expect(store.record).toBeNull();
     expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'limits_unavailable' } }]);
@@ -642,11 +682,23 @@ describe('abuse limits (reservation)', () => {
 
   it('fails the job with the original error when the limits_unavailable event cannot be written', async () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
-    limits.failNext = new Error('ddb down');
+    limits.failKeyPrefix = { prefix: 'hlc#phone#', error: new Error('ddb down') };
     store.addEvent = async () => { throw new Error('events down'); };
     await expect(processHotLeadCallJob(jobOf())).rejects.toThrow('ddb down');
     warn.mockRestore();
     expect(provider.placedCalls).toHaveLength(0);
+  });
+
+  it('fails the job closed, dialing nothing and creating no record, when the do-not-call read fails (before any slot)', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    limits.failKeyPrefix = { prefix: 'hlc#dnc#', error: new Error('ddb down') };
+    await expect(processHotLeadCallJob(jobOf())).rejects.toThrow('ddb down');
+    warn.mockRestore();
+    expect(provider.placedCalls).toHaveLength(0);
+    expect(store.record).toBeNull();
+    expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'limits_unavailable' } }]);
+    expect(limits.keysTouched.every((k) => k.startsWith('hlc#dnc#'))).toBe(true);
+    expect(limits.counters.size).toBe(0);
   });
 
   it('fails the job closed when JWT_SECRET (the phone-hash key) is missing', async () => {
@@ -666,6 +718,10 @@ describe('abuse limits (reservation)', () => {
       get: async () => null,
       create: async (_l, id) => { if (created.has(id)) return false; created.add(id); return true; },
       transition: async () => true,
+      claimRetry: async () => false,
+      rescheduleRetry: async () => false,
+      releaseRetryClaim: async () => false,
+      restartForRetry: async () => false,
       addEvent: async () => undefined,
     });
     await Promise.all(Array.from({ length: 100 }, (_v, i) => processHotLeadCallJob(jobOf({ leadId: `l${i}` }))));
@@ -680,6 +736,75 @@ describe('abuse limits (reservation)', () => {
     const keys = JSON.stringify([...limits.keysTouched, store.events]);
     for (const spelling of ['2125550142', '+12125550142', '(212) 555-0142', '212-555-0142', '555-0142']) expect(keys).not.toContain(spelling);
     expect(keys).toMatch(/hlc#phone#[0-9a-f]{64}/);
+  });
+});
+
+describe('do-not-call (a lead pressed 3, ENG-2783)', () => {
+  const nowS = () => Math.floor(Date.now() / 1000);
+  const listed = () => markNumberDoNotCall('org-a', '+12125550142');
+
+  it('skips with do_not_call, before any slot or record, when the org marker holds the number (another lead, same number)', async () => {
+    await listed();
+    lead.leadId = 'lead-new';
+    await dispatchHotLeadCall('list-a', 'lead-new', 'form_fill');
+    expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'do_not_call' } }]);
+    expect(enqueueCalls()).toHaveLength(0);
+    expect(provider.placedCalls).toHaveLength(0);
+    expect(store.record).toBeNull();
+    expect([...limits.counters.keys()]).toEqual([]);
+    expect([...limits.claims.keys()]).toEqual([dncKey('org-a', '+12125550142')]);
+  });
+
+  it('keys the marker by org and a keyed digest of the number: another org is not affected, and the key holds no number', async () => {
+    await listed();
+    const [key] = [...limits.claims.keys()];
+    expect(key).toMatch(/^hlc#dnc#[0-9a-f]{64}$/);
+    expect(key).not.toContain('2125550142');
+    expect(limits.claims.get(key)!.expiresAtS - nowS()).toBeGreaterThan(9 * 365 * 86400);
+    expect(key).not.toBe(dncKey('org-b', '+12125550142'));
+    expect(await isNumberDoNotCall('org-b', '+12125550142')).toBe(false);
+  });
+
+  it('skips with do_not_call when the lead itself is do-not-contact, taking no slot and no record', async () => {
+    lead.contactStatus = 'do-not-contact';
+    await dispatchHotLeadCall('list-a', 'lead-a', 'form_fill');
+    expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'do_not_call' } }]);
+    expect(provider.placedCalls).toHaveLength(0);
+    expect(store.record).toBeNull();
+    expect([...limits.counters.keys()]).toEqual([]);
+    expect([...limits.claims.keys()].every((k) => k.startsWith('hlc#dnc#'))).toBe(true);
+  });
+
+  it.each([
+    ['an email unsubscribe', { contactStatus: 'unsubscribed' }],
+    ['the legacy group-email flag', { unsubscribedFromGroupEmail: true }],
+    ['a bounce reason without do-not-contact', { contactStatus: 'active', contactStatusReason: 'bounced' }],
+  ])('still calls a lead with %s (only do-not-contact and the org marker block)', async (_name, fields) => {
+    Object.assign(lead, fields);
+    await dispatchHotLeadCall('list-a', 'lead-a', 'form_fill');
+    expect(provider.placedCalls).toHaveLength(1);
+  });
+
+  it('re-checks in the job, so a stop that landed after dispatch is honoured', async () => {
+    await listed();
+    await processHotLeadCallJob(jobOf());
+    expect(provider.placedCalls).toHaveLength(0);
+    expect(store.record).toBeNull();
+    expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'do_not_call' } }]);
+  });
+
+  it('is checked after the stateless gates and the plan: a lead outside the lead window does not read the store', async () => {
+    jest.setSystemTime(new Date('2026-10-19T23:30:00.000Z'));
+    await listed();
+    limits.keysTouched.length = 0;
+    await processHotLeadCallJob(jobOf());
+    expect(limits.keysTouched).toEqual([]);
+  });
+
+  it('a lapsed marker no longer blocks (the store tests the expiry itself)', async () => {
+    await listed();
+    jest.setSystemTime(new Date(Date.now() + 11 * 365 * 86400 * 1000));
+    expect(await isNumberDoNotCall('org-a', '+12125550142')).toBe(false);
   });
 });
 
@@ -822,7 +947,8 @@ describe('credentials that cannot be loaded', () => {
     await processHotLeadCallJob(jobOf());
     expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'credentials_unavailable' } }]);
     expect(store.record).toBeNull();
-    expect(limits.keysTouched).toEqual([]);
+    // Only the read-only do-not-call check touched the store: no slot, no counter.
+    expect(limits.keysTouched.filter((k) => !k.startsWith('hlc#dnc#'))).toEqual([]);
     expect(provider.placedCalls).toHaveLength(0);
     // The next submission of the same lead is dialed normally.
     await processHotLeadCallJob(jobOf({ submissionId: 'sub-2', submittedAt: NOW }));
@@ -836,5 +962,182 @@ describe('the call record of the first attempt', () => {
     await processHotLeadCallJob(jobOf());
     expect(store.record!.leadPhoneMac).toBe(leadPhoneMacOf('org-a', '+12125550142'));
     expect(JSON.stringify(store.record)).not.toMatch(/2125550142/);
+  });
+});
+
+
+describe('monthly cap and its owner notices (ENG-2783)', () => {
+  const submit = async (n: number) => {
+    lead = { ...lead, leadId: `m${n}`, phone: `+1212555${String(1000 + n)}`, createdAt: new Date().toISOString() };
+    store.record = null;
+    store.events = [];
+    const before = provider.placedCalls.length;
+    await processHotLeadCallJob(jobOf({ leadId: `m${n}` }));
+    return provider.placedCalls.length > before ? 'called' : store.events.map(e => e.detail?.reason).join();
+  };
+  const later = (minutes: number) => jest.setSystemTime(new Date(Date.parse(NOW) + minutes * 60_000));
+  // The notices are fire-and-forget; the spy passes through to the real function and keeps each returned promise (which
+  // never rejects), so flush() awaits the actual notice work instead of guessing how many ticks it needs.
+  let pending: Array<Promise<void>>;
+  const flush = async () => { await Promise.all(pending.splice(0)); };
+  const send = () => mock(emailService.sendEmail);
+  const markers = (warn: jest.SpyInstance) => warn.mock.calls.map(c => String(c[0])).filter(m => m.includes('monthly cap'));
+  let warn: jest.SpyInstance;
+
+  const arrange = (cap: number) => {
+    org = { orgId: 'org-a', ownerUserId: 'owner-a', hotLeadCall: { ...config, maxCallsPerMonth: cap, maxCallsPerHour: 30, maxCallsPerDay: 100, memberCooldownMinutes: 1 } };
+    mock(userDb.getUserById).mockResolvedValue({ userId: 'owner-a', orgId: 'org-a', email: 'owner@example.com' });
+    send().mockResolvedValue('sent');
+  };
+  // Submits leads 1..n two minutes apart (past the member cooldown), all expected to be called.
+  const callLeads = async (n: number, from = 1) => {
+    for (let i = from; i < from + n; i++) { later(i * 2); expect(await submit(i)).toBe('called'); await flush(); }
+  };
+  beforeEach(() => {
+    warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    pending = [];
+    const real = capNotices.notifyMonthlyCap;
+    jest.spyOn(capNotices, 'notifyMonthlyCap').mockImplementation(input => { const p = real(input); pending.push(p); return p; });
+  });
+  afterEach(() => { warn.mockRestore(); jest.restoreAllMocks(); });
+
+  it('calls up to the cap, then skips as org_monthly_cap with a timeline event and no record; the other counters are given back', async () => {
+    arrange(2);
+    await callLeads(2);
+    later(4);
+    expect(await submit(3)).toBe('org_monthly_cap');
+    expect(store.record).toBeNull();
+    expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'org_monthly_cap' } }]);
+    expect([...limits.counters.entries()].map(([k, v]) => [k.split('#')[2], v]).sort()).toEqual([['d', 2], ['h', 2], ['m', 2]]);
+  });
+
+  it('sends the 80% notice once at ceil(0.8 * cap) and the 100% notice once at the first refusal, with the approved copy', async () => {
+    arrange(5);
+    await callLeads(3);
+    expect(send()).not.toHaveBeenCalled();
+    await callLeads(1, 4);
+    expect(send()).toHaveBeenCalledTimes(1);
+    expect(send().mock.calls[0].slice(0, 3)).toEqual([
+      'owner@example.com',
+      'Your hot-lead calling is at 80% of this month\'s limit',
+      'Hot-lead calling has used 4 of your 5 automatic calls this month. Calls pause at 5 and resume on the 1st. Leads are still captured and you still get the usual alerts.',
+    ]);
+    await callLeads(1, 5);
+    expect(send()).toHaveBeenCalledTimes(1); // the second crossing does not resend
+    later(12); expect(await submit(6)).toBe('org_monthly_cap'); await flush();
+    expect(send()).toHaveBeenCalledTimes(2);
+    expect(send().mock.calls[1].slice(0, 3)).toEqual([
+      'owner@example.com',
+      'Automatic hot-lead calls are paused until the 1st',
+      'Your organization reached its 5 automatic hot-lead calls for this month, so automatic calls are paused until the 1st. New leads are still captured and you will still get the alert, so you can call them yourself. Contact AgentWeb support if you need a higher limit.',
+    ]);
+    later(14); expect(await submit(7)).toBe('org_monthly_cap'); await flush();
+    expect(send()).toHaveBeenCalledTimes(2);
+    expect(markers(warn)).toEqual(['[hotLeadCall] org monthly cap 80% org-a', '[hotLeadCall] org monthly cap 100% org-a']);
+    expect([...limits.claims.keys()].filter(k => k.startsWith('hlc#notify#')).sort()).toEqual(['hlc#notify#100#org-a#2026-10', 'hlc#notify#80#org-a#2026-10']);
+  });
+
+  it('a cap of 1 sends no 80% email (it would be the cap itself): the first refusal sends the 100% email only', async () => {
+    arrange(1);
+    await callLeads(1);
+    expect(send()).not.toHaveBeenCalled();
+    later(4); expect(await submit(2)).toBe('org_monthly_cap'); await flush();
+    expect(send()).toHaveBeenCalledTimes(1);
+    expect(send().mock.calls[0][1]).toBe('Automatic hot-lead calls are paused until the 1st');
+    expect(markers(warn)).toEqual(['[hotLeadCall] org monthly cap 100% org-a']);
+  });
+
+  it('sends the notices again in the next month', async () => {
+    arrange(5);
+    await callLeads(4);
+    later(12); expect(await submit(5)).toBe('called'); await flush();
+    later(14); expect(await submit(6)).toBe('org_monthly_cap'); await flush();
+    expect(send()).toHaveBeenCalledTimes(2);
+    for (const [i, at] of ['2026-11-02T18:00:00.000Z', '2026-11-02T18:02:00.000Z', '2026-11-02T18:04:00.000Z', '2026-11-02T18:06:00.000Z'].entries()) {
+      jest.setSystemTime(new Date(at)); expect(await submit(10 + i)).toBe('called'); await flush();
+    }
+    expect(send()).toHaveBeenCalledTimes(3); // the new month's 80% (4 of 5)
+  });
+
+  it('a failing 80% email does not fail the call and is retried at the next crossing', async () => {
+    arrange(5);
+    send().mockRejectedValue(new Error('smtp exploded for owner@example.com'));
+    await callLeads(4);
+    expect(provider.placedCalls).toHaveLength(4);
+    expect(send()).toHaveBeenCalledTimes(1);
+    expect(limits.claims.has('hlc#notify#80#org-a#2026-10')).toBe(false); // given back, so a later crossing retries
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('owner@example.com');
+    send().mockResolvedValue('sent');
+    await callLeads(1, 5);
+    expect(send()).toHaveBeenCalledTimes(2);
+    expect(markers(warn).filter(m => m === '[hotLeadCall] org monthly cap 80% org-a')).toHaveLength(2); // marker repeats with the retry
+  });
+
+  it('a failed send reported by the email service (not thrown) also gives the 80% claim back', async () => {
+    arrange(5);
+    send().mockResolvedValue('failed');
+    await callLeads(4);
+    expect(limits.claims.has('hlc#notify#80#org-a#2026-10')).toBe(false);
+  });
+
+  it.each([
+    ['thrown', () => send().mockRejectedValue(new Error('smtp exploded for owner@example.com'))],
+    ['reported as failed', () => send().mockResolvedValue('failed')],
+  ])('a 100%% send that fails (%s) keeps the claim, logs the fallback alarm and is not retried on the next refusal', async (_n, fail) => {
+    arrange(2);
+    await callLeads(2);
+    fail();
+    later(8); expect(await submit(3)).toBe('org_monthly_cap'); await flush();
+    expect(limits.claims.has('hlc#notify#100#org-a#2026-10')).toBe(true);
+    expect(markers(warn)).toContain('[hotLeadCall] monthly cap 100% notice failed org-a');
+    later(10); expect(await submit(4)).toBe('org_monthly_cap'); await flush();
+    expect(send()).toHaveBeenCalledTimes(1); // only the first refusal tried to send
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('owner@example.com');
+  });
+
+  it('an email that never completes does not delay the call', async () => {
+    arrange(5);
+    send().mockReturnValue(new Promise(() => undefined));
+    for (let i = 1; i <= 4; i++) { later(i * 2); expect(await submit(i)).toBe('called'); }
+    expect(provider.placedCalls).toHaveLength(4);
+    for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
+    expect(send()).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['80%', 5, 4, 1, '80%'],
+    ['100%', 2, 2, 1, '100%'],
+  ])('sends no %s email and still logs the marker when the owner has no email', async (_n, cap, calls, refusals, pct) => {
+    arrange(cap);
+    mock(userDb.getUserById).mockResolvedValue({ userId: 'owner-a', orgId: 'org-a' });
+    await callLeads(calls);
+    if (pct === '100%') { later(20); expect(await submit(99)).toBe('org_monthly_cap'); await flush(); }
+    expect(refusals).toBe(1);
+    expect(send()).not.toHaveBeenCalled();
+    expect(markers(warn)).toContain(`[hotLeadCall] org monthly cap ${pct} org-a`);
+  });
+
+  it('sends no email and still logs the marker when the org has no owner', async () => {
+    arrange(5);
+    delete org.ownerUserId;
+    await callLeads(4);
+    expect(send()).not.toHaveBeenCalled();
+    expect(markers(warn)).toContain('[hotLeadCall] org monthly cap 80% org-a');
+  });
+
+  it('logs the 100% marker after a monthly refusal', async () => {
+    arrange(2);
+    await callLeads(2);
+    later(8); expect(await submit(3)).toBe('org_monthly_cap'); await flush();
+    expect(markers(warn)).toContain('[hotLeadCall] org monthly cap 100% org-a');
+  });
+
+  it('sends nothing for a refusal by another limit', async () => {
+    arrange(50);
+    org.hotLeadCall = { ...(org.hotLeadCall as object), maxCallsPerHour: 1 };
+    expect(await submit(1)).toBe('called');
+    later(2);
+    expect(await submit(2)).toBe('org_hourly_cap'); await flush();
+    expect(send()).not.toHaveBeenCalled();
   });
 });

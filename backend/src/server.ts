@@ -1253,6 +1253,16 @@ createTestAccount().then(async () => {
         console.error('[stuckCallSweepCron] Failed to initialize:', error);
       }
 
+      // Hot-lead call due-retries (ENG-2783): every 5 minutes, places the one retry of a lead who pressed 2 ("not available
+      // now") once it is due; the job queue cannot run a job later. Does nothing while the global hot_lead_call_mode kill
+      // switch is off. HOT_LEAD_CALL_RETRY=off|0|false does not arm it.
+      try {
+        const { startHotLeadCallRetryCron } = await import('./cron/hotLeadCallRetryCron');
+        startHotLeadCallRetryCron({ enabled: isCronEnabled, track: (name, run) => cronJobRegistry.track(name, run) });
+      } catch (error) {
+        console.error('[hotLeadCallRetryCron] Failed to initialize:', error);
+      }
+
       // Pre-Renewal Ad-Integration Health Check (ENG-1270) — runs daily.
       // Charging a customer while their ad platform connection is silently dead
       // is a trust break (ThinkingAI, TransAmerica — Aug 2026 audit, both caught
