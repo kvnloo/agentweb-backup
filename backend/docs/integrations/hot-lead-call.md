@@ -449,7 +449,7 @@ call, Slack only"). Validation applies to every read, including the webhooks.
 | `memberCooldownMinutes` | integer 1-60, default 2. Per team member: a member who was just rung is passed over for the next available one. |
 | `maxAttemptsPerLead` | integer 1-5, default 3. How many member calls may be made for one lead; a member who was already tried is never rung again. |
 | `announcedName` | required, trimmed, 1-60 chars of letters, digits, space and `. , & ' -`. Spoken in `<Say>`; XML-escaped by the TwiML builder. |
-| `callingHours` | `{ start, end, timezone }`, `HH:MM` 24h, `start != end`, defaults 08:00 / 21:00. It is the window in which calls ARE allowed, in the org's IANA `Area/Location` timezone (UTC, abbreviations and `Etc/` refused). `start > end` wraps past midnight. Start inclusive, end exclusive, minute granularity. This is the ORG's clock; the lead's own local hours are a separate, fixed gate (see [Lead-local hours](#lead-local-hours)). Required to enable. Member windows are read on this same clock. |
+| `callingHours` | `{ start, end, timezone }`, `HH:MM` 24h, `start != end`, defaults 08:00 / 21:00. It is the window in which calls ARE allowed, in the org's IANA `Area/Location` timezone (UTC, abbreviations and `Etc/` refused). `start > end` wraps past midnight. Start inclusive, end exclusive, minute granularity. This is the ORG's clock and its default 08:00-21:00 is not what a lead experiences: the lead's own local hours are a separate, fixed gate (10:00-18:00 lead-local, in practice about 13:00-18:00 Eastern for most US numbers; see [Lead-local hours](#lead-local-hours)), so a call needs both windows open. Required to enable. Member windows are read on this same clock. |
 | `allowedCountries` | non-empty subset of `["US","CA"]` (default both); the lead's number must resolve to one of them. |
 
 The lead's number is read from the lead row at dispatch AND again at bridge time;
@@ -487,7 +487,7 @@ Settings (merged). Both tools call the same service as the REST API
   - `memberPhone` / `memberName` edit a team of ONE (the first save creates the member, available whenever
     the calling hours are open); on a larger team the tool refuses them and asks for `team`.
   - `callingHours` may be partial in chat: missing parts are filled from the stored hours, then the
-    08:00-21:00 defaults.
+    08:00-21:00 defaults (the lead-local window, 10:00-18:00, applies on top and is not configurable).
   - The tool edits the copy it just read; the write is conditional on the stored attribute being
     unchanged, so a concurrent edit fails ("changed by someone else") instead of clobbering.
   - Unattended runs (`context.isUnattendedRun === true`) are refused for any change that turns calling on,
@@ -789,7 +789,8 @@ What the code requires (verified from code):
 - Outbound calls to US numbers only. `allowedCountries` still stores `US`/`CA`, but Canada is refused in code
   (`HOT_LEAD_CALL_CA_ENABLED = false` in `hotLeadCallConfig.ts`; skip reason `country_not_allowed`) until the CRTC
   ADAD requirements are built: an identification message with an email or postal address and a local or toll-free
-  number, plus lead-local hours. Neither is implemented. Re-enabling Canada needs both, then flipping the constant.
+  number, which is not implemented. Re-enabling Canada needs (a) flipping the constant, (b) that identification
+  message in the lead prompt, and (c) a Canada branch in `leadLocalHours.ts` (it returns false for Canada today).
 - Lead-local calling hours are enforced (see [Lead-local hours](#lead-local-hours)). State laws with stricter hours
   or days (some states restrict evenings, weekends or holidays) are NOT modelled and have not been verified.
 - Public HTTPS reachability of `BACKEND_URL` for the six outbound endpoints (`/owner`, `/gather`, `/screen`, `/screen-result`, `/dial`, `/status`) and the five inbound ones (`/inbound`, `/inbound-screen`, `/inbound-screen-result`, `/inbound-dial`, `/inbound-status`).
@@ -1237,7 +1238,7 @@ delete. A 404 from Twilio counts as already released. Reconcile any such log lin
 | Symptom | Likely cause |
 | --- | --- |
 | Member is called but hears "application error" | The `/owner` fetch failed: `BACKEND_URL` wrong or unreachable (check scheme and host), or credentials could not be loaded (503), or the signature failed (401). Twilio's call log shows the webhook response. |
-| Calls never placed, timeline shows `call.skipped` | The `reason` names the gate. `outside_calling_hours`, `outside_lead_hours`, `no_one_available`, `duplicate_phone` and `member_cooldown` are expected behavior. An `outside_lead_hours` lead is not retried or deferred (the job runs once). |
+| Calls never placed, timeline shows `call.skipped` | The `reason` names the gate. `outside_calling_hours`, `outside_lead_hours`, `no_one_available`, `duplicate_phone` and `member_cooldown` are expected behavior. An `outside_lead_hours` lead is not retried or deferred (the job runs once); the lead window is 10:00-18:00 lead-local, about 13:00-18:00 Eastern for most US numbers, so a lead that arrives in the evening or morning is simply not called. |
 | No event and no call | Kill switch off, org disabled or config invalid, lead not `form_fill`, smoke-test lead, draft lead, or no phone: all silent by design. |
 | `call.skipped` `limits_unavailable` | `AW-MCPSessions` missing, IAM denied, or throttled. Fails closed. |
 | `no owner to bill for list` in logs | The list owner could not be resolved; the leg was not metered and `/status` answers 500. |
@@ -1467,11 +1468,13 @@ deliberately not used.
 
 There is no area-code timezone table. The lead's zone is unknown, so the window must hold in every zone it could be in:
 
-- Area code 808 (Hawaii): `Pacific/Honolulu` only (`America/Honolulu` is not an IANA zone and throws in Intl). Area code 907 (Alaska): `America/Anchorage` only.
-- Every other US number: inside the window in BOTH `America/New_York` and `America/Los_Angeles`. Eastern is the earliest
-  clock and Pacific the latest of the contiguous US, so Central and Mountain are covered by the intersection, and so is any
-  area code whose zone we do not know. With 10:00-18:00 the effective window is **13:00-18:00 Eastern** (10:00-15:00
+- Every US number: inside the window in BOTH `America/New_York` and `America/Los_Angeles`. Eastern is the furthest ahead
+  and Pacific the furthest behind of the contiguous US zones, so the window holds in all of them only when it holds in
+  both; Central and Mountain are covered by the intersection, and so is any area code whose zone we do not know. With 10:00-18:00 the effective window is **13:00-18:00 Eastern** (10:00-15:00
   Pacific). Zones use IANA names, so DST is correct.
+- Area codes 808 (Hawaii, `Pacific/Honolulu`; `America/Honolulu` is not an IANA zone and throws in Intl) and 907 (Alaska,
+  `America/Anchorage`) must satisfy the rule above AND their home zone, because a mobile number can be anywhere. That is a
+  deliberately narrow band: Hawaii 16:00-18:00 Eastern in summer (15:00-18:00 in winter), Alaska 14:00-18:00 Eastern.
 - Non-US numbers (Canada, +1 territories) return false. Canada is also refused earlier, see the compliance text above.
 
 Accepted limits: a mobile number can be in a different zone than its area code (the rule is conservative for any
