@@ -1,7 +1,7 @@
-import type { HotLeadCallEventType, HotLeadCallPatch, HotLeadCallRecord, HotLeadCallState, LeadCallStore } from '../../services/voice/leadCallStore.types';
+import type { HotLeadCallEventType, HotLeadCallPatch, HotLeadCallRecord, HotLeadCallState, LeadCallStore, RetryRestart } from '../../services/voice/leadCallStore.types';
 
 const TERMINAL: HotLeadCallState[] = ['finished', 'failed', 'skipped'];
-const SCALAR_FIELDS = ['state', 'jobKey', 'startedAt', 'updatedAt', 'memberCallSid', 'leadCallSid', 'outcome', 'attemptNo', 'memberId', 'claimToken'] as const;
+const SCALAR_FIELDS = ['state', 'jobKey', 'startedAt', 'updatedAt', 'memberCallSid', 'leadCallSid', 'outcome', 'attemptNo', 'memberId', 'claimToken', 'deferral'] as const;
 
 /**
  * In-memory LeadCallStore with the same conditional semantics as the DynamoDB one: create-if-absent,
@@ -53,6 +53,21 @@ export class FakeLeadCallStore implements LeadCallStore {
     r.meteredLegs = [...(r.meteredLegs ?? []), ...legs];
     r.triedMemberIds = [...(r.triedMemberIds ?? []), ...tried];
     this.transitions++;
+    return true;
+  }
+
+  async claimRetry(_listId: string, _leadId: string, jobKey: string, token: string): Promise<boolean> {
+    const r = this.record;
+    if (!r || r.state !== 'finished' || r.jobKey !== jobKey || r.outcome !== 'lead_deferred' || r.retryClaimToken !== undefined) return false;
+    r.retryClaimToken = token;
+    return true;
+  }
+
+  async restartForRetry(_listId: string, _leadId: string, from: { jobKey: string; token: string }, fresh: RetryRestart): Promise<boolean> {
+    const r = this.record;
+    if (!r || r.state !== 'finished' || r.jobKey !== from.jobKey || r.retryClaimToken !== from.token) return false;
+    for (const field of ['memberCallSid', 'leadCallSid', 'outcome'] as const) delete r[field];
+    Object.assign(r, { ...fresh, state: 'dialing', attemptNo: 1, triedMemberIds: [fresh.memberId], meteredLegs: [], lastSequence: {} });
     return true;
   }
 

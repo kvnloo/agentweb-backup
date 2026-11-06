@@ -718,6 +718,8 @@ describe('abuse limits (reservation)', () => {
       get: async () => null,
       create: async (_l, id) => { if (created.has(id)) return false; created.add(id); return true; },
       transition: async () => true,
+      claimRetry: async () => false,
+      restartForRetry: async () => false,
       addEvent: async () => undefined,
     });
     await Promise.all(Array.from({ length: 100 }, (_v, i) => processHotLeadCallJob(jobOf({ leadId: `l${i}` }))));

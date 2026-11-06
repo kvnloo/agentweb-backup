@@ -201,7 +201,7 @@ describe('the lead decides, and the lead is never chased through the team', () =
     await call.memberPresses('1');
     await call.leadStatus('in-progress', 2);
     await call.leadAnswers();
-    expect((await call.leadPresses('2')).body).toContain('<Hangup/>');
+    expect((await call.leadPresses('4')).body).toContain('<Hangup/>');
     expect(sayText((await call.dialEnds('completed', { DialBridged: 'false' })).body)).toBe('The lead did not confirm. Their details are in your lead alert.');
     await call.leadStatus('completed', 3, { CallDuration: '8' });
     await call.memberLegEnds('completed', '40');

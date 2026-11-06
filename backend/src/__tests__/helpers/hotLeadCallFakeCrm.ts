@@ -23,6 +23,7 @@ interface UpdateOp {
   set?: Json;
   remove?: string[];
   whenEquals?: Record<string, string | number>;
+  whenAbsent?: string[];
   maxIn?: Record<string, Record<string, number>>;
   appendNew?: Record<string, string[]>;
 }
@@ -88,13 +89,16 @@ export class FakeCrm {
       return [...this.lists.values()].filter((l) => l.userId === userId).map(clone);
     },
     /** Newest leadId first, like the real query; `read` counts the leads examined, as DynamoDB's ScannedCount does. */
-    findLeadsBySystemRecord: async (listId: string, key: string, op: { states: string[]; updatedBefore: string; maxRead: number }) => {
+    findLeadsBySystemRecord: async (
+      listId: string, key: string, op: { states: string[]; updatedBefore: string; maxRead: number; has?: string[]; lacks?: string[] },
+    ) => {
       this.calls.push('findLeadsBySystemRecord');
       const inList = [...this.leads.values()].filter((l) => l.listId === listId).sort((a, b) => b.leadId.localeCompare(a.leadId));
       const examined = inList.slice(0, op.maxRead);
       const leadIds = examined.filter((l) => {
-        const rec = l.system?.[key] as { state?: string; updatedAt?: string } | undefined;
-        return !!rec && op.states.includes(rec.state as string) && (rec.updatedAt as string) < op.updatedBefore;
+        const rec = l.system?.[key] as Json | undefined;
+        return !!rec && op.states.includes(rec.state as string) && (rec.updatedAt as string) < op.updatedBefore
+          && (op.has ?? []).every((f) => rec[f] !== undefined) && (op.lacks ?? []).every((f) => rec[f] === undefined);
       }).map((l) => l.leadId);
       return { leadIds, read: examined.length, truncated: inList.length > examined.length };
     },
@@ -133,6 +137,7 @@ export class FakeCrm {
       if (!rec || op.stateIn.length === 0 || !op.stateIn.includes(rec.state as string)) return false;
       // Check every condition before writing anything, like one conditional UpdateItem.
       for (const [field, expected] of Object.entries(op.whenEquals ?? {})) if (rec[field] !== expected) return false;
+      for (const field of op.whenAbsent ?? []) if (rec[field] !== undefined) return false;
       for (const [field, entries] of Object.entries(op.maxIn ?? {})) {
         if (Object.keys(entries).length && (typeof rec[field] !== 'object' || rec[field] === null)) throw new Error(`maxIn map ${field} was not initialised`);
         for (const [entry, n] of Object.entries(entries)) {

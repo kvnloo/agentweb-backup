@@ -16,6 +16,9 @@ import {
   inboundRingTwiml,
   inboundUnavailableTwiml,
   leadDeclinedTwiml,
+  leadDeferredMemberTwiml,
+  leadDeferredTwiml,
+  leadNoRetryTwiml,
   leadOptedOutMemberTwiml,
   leadOptedOutTwiml,
   leadPhoneChangedTwiml,
@@ -146,7 +149,7 @@ describe('twiml builders', () => {
   });
 
   const promptFor = (name: string, number = '+14155550111'): string =>
-    `This is an automated call from ${name} about the enquiry you sent us. To reach a person at ${name}, call ${number}. Press 1 to be connected now, or press 3 to stop these calls.`;
+    `This is an automated call from ${name} about the enquiry you sent us. To reach a person at ${name}, call ${number}. Press 1 to be connected now, press 2 if you are not available and we will call you again later, or press 3 to stop these calls.`;
 
   it('builds the lead screening prompt: a one-digit Gather with the escaped name and the spoken callback number, then a goodbye and hangup', () => {
     const xml = leadScreenTwiml({ announcedName: 'Smith & Sons', callbackNumber: '+14155550111', resultUrl: URLS.resultUrl });
@@ -270,5 +273,15 @@ describe('inbound callback TwiML', () => {
     expect(xml).toContain('<Gather input="dtmf" numDigits="1"');
     expect(xml).toContain('action="https://x.test/r?a=1&amp;b=2"');
     expect(xml.endsWith(`<Say>${NO_INPUT_COPY}</Say><Hangup/></Response>`)).toBe(true);
+  });
+});
+
+describe('press 2 copies (ENG-2783)', () => {
+  it('says the three fixed lines, escaping the name', () => {
+    const say = (xml: string): string => parseXml(xml).children[0].text;
+    expect(say(leadDeferredTwiml('Smith & Sons'))).toBe('Okay. Smith & Sons will call you again later. Goodbye.');
+    expect(say(leadNoRetryTwiml('Smith & Sons'))).toBe('Okay. Smith & Sons will not call again today. Goodbye.');
+    expect(say(leadDeferredMemberTwiml())).toBe('The lead is not available right now. We will try again later.');
+    expect(leadDeferredTwiml('A <b>')).toContain('A &lt;b&gt;');
   });
 });

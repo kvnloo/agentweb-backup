@@ -638,11 +638,11 @@ describe('POST /gather: the lead phone must still be the one that passed the gat
 describe('POST /screen', () => {
   beforeEach(() => seed('bridging'));
 
-  it('adopts the body CallSid as the lead leg and asks the lead to press 1 or 3, with the announced name escaped and the org number spoken', async () => {
+  it('adopts the body CallSid as the lead leg and asks the lead to press 1, 2 or 3, with the announced name escaped and the org number spoken', async () => {
     const res = await screen();
     expect(res.status).toBe(200);
     expect(res.headers['content-type']).toMatch(/text\/xml/);
-    expect(res.text).toContain('This is an automated call from Smith &amp; Sons about the enquiry you sent us. To reach a person at Smith &amp; Sons, call 4 1 5, 5 5 5, 0 1 1 1. Press 1 to be connected now, or press 3 to stop these calls.');
+    expect(res.text).toContain('This is an automated call from Smith &amp; Sons about the enquiry you sent us. To reach a person at Smith &amp; Sons, call 4 1 5, 5 5 5, 0 1 1 1. Press 1 to be connected now, press 2 if you are not available and we will call you again later, or press 3 to stop these calls.');
     expect(res.text).toContain('<Gather input="dtmf" numDigits="1" timeout="8"');
     expect(res.text).toContain(`action="${BASE}${MOUNT}/screen-result?${QUERY.replace(/&/g, '&amp;')}"`);
     expect(res.text).toContain('We did not get your answer. Goodbye.');
@@ -745,7 +745,7 @@ describe('POST /screen-result', () => {
     expect(store.eventTypes()).toEqual(['call.connected']);
   });
 
-  it.each([['2'], ['11'], ['#'], [''], [undefined]])('Digits=%j: hangs the lead up, outcome lead_declined, call.lead_declined once', async (digits) => {
+  it.each([['4'], ['11'], ['#'], [''], [undefined]])('Digits=%j: hangs the lead up, outcome lead_declined, call.lead_declined once', async (digits) => {
     const res = await screenResult(digits);
     expect(res.text).toBe('<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>');
     expect(store.record).toMatchObject({ state: 'bridging', outcome: 'lead_declined' });
@@ -761,7 +761,7 @@ describe('POST /screen-result', () => {
 
     seed('bridging', { leadCallSid: LEAD_SID });
     store.events = [];
-    await screenResult('2');
+    await screenResult('4');
     expect((await screenResult('1')).text).toContain('<Hangup/>');
     expect((await screenResult('1')).text).not.toContain('<Response/>');
     expect(store.eventTypes()).toEqual(['call.lead_declined']);
@@ -808,7 +808,7 @@ describe('POST /screen-result', () => {
   });
 
   it('a lead who declined still gets both legs metered and the record finishes lead_declined, without trying another member', async () => {
-    await screenResult('2');
+    await screenResult('4');
     await dial('completed', { DialCallSid: LEAD_SID, DialBridged: 'false' });
     await leadStatus('completed', { CallDuration: '9', SequenceNumber: '3' });
     expect(store.record?.state).toBe('bridging');
@@ -1223,7 +1223,7 @@ describe('POST /dial', () => {
 
   it('does not repeat call.lead_declined when /screen-result already recorded the decline', async () => {
     seed('bridging', { leadCallSid: LEAD_SID });
-    await screenResult('2');
+    await screenResult('4');
     const res = await dial('completed', { DialCallSid: LEAD_SID, DialBridged: 'false' });
     expect(res.text).toContain('did not confirm');
     expect(store.eventTypes()).toEqual(['call.lead_declined']);
@@ -1995,8 +1995,8 @@ describe('lead presses 3: do not call again', () => {
     expect(mock(requestNextHotLeadCallAttempt)).not.toHaveBeenCalled();
   });
 
-  it('a 2, a 5 and no input still decline exactly as before (no stop is recorded)', async () => {
-    for (const digits of ['2', '5', undefined]) {
+  it('a 4, a 5 and no input still decline exactly as before (no stop is recorded)', async () => {
+    for (const digits of ['4', '5', undefined]) {
       seed('bridging', { leadCallSid: LEAD_SID });
       store.events = [];
       const res = await screenResult(digits);
@@ -2041,5 +2041,87 @@ describe('lead presses 3: do not call again', () => {
     it('dials as before when the number is not on the list', async () => {
       expect((await gather('1')).text).toContain('<Dial');
     });
+  });
+});
+
+describe('lead presses 2: not available now (one retry, ENG-2783)', () => {
+  const HOUR = 3_600_000;
+  const GOODBYE = 'Okay. Smith &amp; Sons will call you again later. Goodbye.';
+  const NO_RETRY = 'Okay. Smith &amp; Sons will not call again today. Goodbye.';
+  beforeEach(() => seed('bridging', { leadCallSid: LEAD_SID }));
+
+  it('defers once: outcome lead_deferred, a deferral at least an hour away, one call.lead_declined, the lead hears the goodbye', async () => {
+    const before = Date.now();
+    const res = await screenResult('2');
+    expect(res.text).toBe(`<?xml version="1.0" encoding="UTF-8"?><Response><Say>${GOODBYE}</Say><Hangup/></Response>`);
+    expect(store.record).toMatchObject({ state: 'bridging', outcome: 'lead_deferred', deferral: { count: 1 } });
+    const dueAt = Date.parse(store.record?.deferral?.dueAt ?? '');
+    expect(dueAt).toBeGreaterThanOrEqual(before + HOUR);
+    expect(dueAt).toBeLessThanOrEqual(Date.now() + 37 * HOUR);
+    expect(store.events).toEqual([{ type: 'call.lead_declined', detail: { reason: 'not_available_now' } }]);
+  });
+
+  it('tells the member the lead is not available and that we will try again, and does not repeat the event', async () => {
+    await screenResult('2');
+    const res = await dial('completed', { DialCallSid: LEAD_SID, DialBridged: 'false' });
+    expect(res.text).toContain(twiml.LEAD_DEFERRED_MEMBER_COPY);
+    expect(store.eventTypes()).toEqual(['call.lead_declined']);
+    expect(store.record?.outcome).toBe('lead_deferred');
+  });
+
+  it('a replay of the 2 repeats the goodbye and keeps the first deferral (no second one, no second event)', async () => {
+    await screenResult('2');
+    const first = store.record?.deferral;
+    await new Promise((r) => setTimeout(r, 5));
+    const replay = await screenResult('2');
+    expect(replay.text).toContain(GOODBYE);
+    expect(store.record?.deferral).toEqual(first);
+    expect(store.eventTypes()).toEqual(['call.lead_declined']);
+  });
+
+  it('a 1 after the 2 does not connect: the lead is hung up on and the record stays deferred', async () => {
+    await screenResult('2');
+    const res = await screenResult('1');
+    expect(res.text).toBe('<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>');
+    expect(store.record).toMatchObject({ state: 'bridging', outcome: 'lead_deferred' });
+    expect(store.eventTypes()).toEqual(['call.lead_declined']);
+  });
+
+  it('a 3 after the 2 still stops: do-not-call marker and contact status written, the deferral removed, the stop goodbye', async () => {
+    await screenResult('2');
+    const res = await screenResult('3');
+    expect(res.text).toContain('will not call this number again');
+    expect(store.record).toMatchObject({ state: 'bridging', outcome: 'lead_opted_out' });
+    expect(store.record?.deferral).toBeUndefined();
+    expect([...limits.claims.keys()]).toEqual([dncKey('org-a', LEAD_PHONE)]);
+    expect(mock(crmDb.updateLead)).toHaveBeenCalledWith(LIST, LEAD, expect.objectContaining({ contactStatus: 'do-not-contact' }));
+    // The member is told the stop, not the deferral; a replay of the 3 writes nothing more.
+    expect((await dial('completed', { DialCallSid: LEAD_SID, DialBridged: 'false' })).text).toContain('asked not to be called again');
+    const writes = mock(crmDb.updateLead).mock.calls.length;
+    await screenResult('3');
+    expect(mock(crmDb.updateLead).mock.calls.length).toBe(writes);
+  });
+
+  it('on the retry call (the record keeps its deferral) a second 2 is an ordinary decline with its own goodbye', async () => {
+    seed('bridging', { leadCallSid: LEAD_SID, deferral: { dueAt: '2026-10-19T12:00:00.000Z', count: 1 }, retryClaimToken: 'tok' });
+    const res = await screenResult('2');
+    expect(res.text).toContain(NO_RETRY);
+    expect(store.record).toMatchObject({ outcome: 'lead_declined', deferral: { count: 1 } });
+    expect(store.events).toEqual([{ type: 'call.lead_declined', detail: { reason: 'not_available_no_retry' } }]);
+    expect((await dial('completed', { DialCallSid: LEAD_SID, DialBridged: 'false' })).text).toContain('did not confirm');
+  });
+
+  it('with no minute inside the lead window within 36 hours the 2 is an ordinary decline and nothing is scheduled', async () => {
+    mock(isInsideLeadCallWindow).mockReturnValue(false);
+    const res = await screenResult('2');
+    expect(res.text).toContain(NO_RETRY);
+    expect(store.record?.outcome).toBe('lead_declined');
+    expect(store.record?.deferral).toBeUndefined();
+  });
+
+  it('a lead whose phone changed since the call was approved gets no retry', async () => {
+    seed('bridging', { leadCallSid: LEAD_SID, leadPhoneMac: leadPhoneMacOf('org-a', '+14155550999') });
+    expect((await screenResult('2')).text).toContain(NO_RETRY);
+    expect(store.record?.deferral).toBeUndefined();
   });
 });
