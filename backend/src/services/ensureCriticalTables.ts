@@ -28,6 +28,7 @@ import { SPEND_PROJECTION_TABLE } from './spendProjectionDb';
 import { LLM_CONNECTIONS_TABLE_SPEC } from './funding/llmConnectionDb';
 import { ATTEMPT_USAGE_TABLE_SPEC, ATTEMPT_USAGE_TABLE, ATTEMPT_USAGE_TTL_ATTRIBUTE } from './funding/dynamoAttemptUsageJournal';
 import { SMARTLEAD_PUSH_RUNS_TABLE_SPEC, SMARTLEAD_PUSH_RUNS_TABLE, SMARTLEAD_PUSH_RUNS_TTL_ATTRIBUTE } from './smartleadPushRunDb';
+import { SLACK_START_TABLE_SPEC, SLACK_START_TABLE, SLACK_START_TTL_ATTRIBUTE } from './slackStart/slackStartStore';
 
 export const CRITICAL_TABLE_SPECS: AWS.DynamoDB.CreateTableInput[] = [
   {
@@ -110,6 +111,8 @@ export const CRITICAL_TABLE_SPECS: AWS.DynamoDB.CreateTableInput[] = [
   ATTEMPT_USAGE_TABLE_SPEC,
   // ENG-673 -- Smartlead push runs (a run item and a lock item per list and campaign; no deletion protection until proven).
   SMARTLEAD_PUSH_RUNS_TABLE_SPEC,
+  // ENG-2782 -- public Slack-start intakes, their domain-dedupe locks and rate-limit counters.
+  SLACK_START_TABLE_SPEC,
   {
     TableName: LOOP_EVENTS_TABLE,
     AttributeDefinitions: [
@@ -194,6 +197,7 @@ export const CRITICAL_TABLE_SPECS: AWS.DynamoDB.CreateTableInput[] = [
 export const CRITICAL_TABLE_SETTINGS: Record<string, { ttlAttribute?: string; pointInTimeRecovery?: boolean }> = {
   [ATTEMPT_USAGE_TABLE]: { ttlAttribute: ATTEMPT_USAGE_TTL_ATTRIBUTE, pointInTimeRecovery: true },
   [SMARTLEAD_PUSH_RUNS_TABLE]: { ttlAttribute: SMARTLEAD_PUSH_RUNS_TTL_ATTRIBUTE, pointInTimeRecovery: true },
+  [SLACK_START_TABLE]: { ttlAttribute: SLACK_START_TTL_ATTRIBUTE, pointInTimeRecovery: true },
 };
 
 const ACTIVE_POLL_MS = 3_000;
