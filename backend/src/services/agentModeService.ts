@@ -94,6 +94,7 @@ import { reconcileModelMentionAck, buildModelMentionIndex, type ModelMentionInde
 import { resolveTurnModelCorrection } from '../utils/modelCorrectionStamp';
 import type { MessageModelRouting } from './agentMode/agentWebModelRouter';
 import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
+import { boundToolsForModel } from '../utils/boundToolsForModel';
 // ENG-2103 (F2, Pattern A): resolveOrgProfileField's only 5 callers
 // (readBrandGuidelines/readMarketStrategy and friends) moved to
 // emma/impl/brandMarketStrategy.ts, which imports it lazily itself
@@ -1033,6 +1034,8 @@ interface LLMCallOptions {
   /** ENG-2108: set only by the agent's own working loop; lets this call use a customer key. */
   customerRoutable?: boolean;
   tools?: any[] | null;
+  /** ENG-2824: tool names that must survive maxTools truncation (e.g. a schedule's required calls). */
+  priorityToolNames?: string[];
   tool_choice?: 'auto' | 'none' | any | null;
   /** Execute search through OpenRouter's provider-independent server tool. */
   webSearch?: boolean;
@@ -2541,6 +2544,7 @@ export class AgentModeService {
       providerPolicy,
       providerIgnore,
       requireContent,
+      priorityToolNames,
     } = options || {};
 
     // ENG-2108: the funding for THIS call. A run starts AgentWeb-funded; this call moves
@@ -2645,9 +2649,11 @@ export class AgentModeService {
       if (callerToolLimit !== undefined && callerTools.length > callerToolLimit) {
         console.warn(
           `AgentMode: callLLM truncating tools for model "${model}": ${callerTools.length} caller tools exceeds limit of ${callerToolLimit}` +
-          `${webSearch ? ' after reserving one web-search slot' : ''}. Keeping first ${callerToolLimit}.`,
+          `${webSearch ? ' after reserving one web-search slot' : ''}. Keeping ${callerToolLimit}` +
+          `${priorityToolNames?.length ? ` (required tools first: ${priorityToolNames.join(', ')})` : ''}.`,
         );
-        boundedTools = callerTools.slice(0, callerToolLimit);
+        // ENG-2824: a plain slice silently undeclared any required tool past the cap.
+        boundedTools = boundToolsForModel(callerTools, callerToolLimit, priorityToolNames);
       }
     }
     // OpenRouter normalizes the transport, but the selected provider still
@@ -2938,6 +2944,25 @@ export class AgentModeService {
    * ordinary state of every draft-only run, and also the state of a run whose stamp
    * could not be written (which the runner downgrades to draft-only for this reason).
    */
+  /**
+   * ENG-2824: the schedule's requiredFunctionCalls for a scheduled session, so callLLM
+   * keeps them declared when it truncates the tool list. Empty for any other session or
+   * when the schedule cannot be read.
+   */
+  private async resolveScheduledRequiredToolNames(currentSession: any): Promise<string[]> {
+    if (currentSession?.sessionType !== 'scheduled') return [];
+    const scheduleId = extractScheduleId(currentSession?.pageIdentifier);
+    if (!scheduleId) return [];
+    try {
+      const schedule: any = await scheduleDb.getScheduleById(scheduleId);
+      const required = schedule?.requiredFunctionCalls;
+      return Array.isArray(required) ? required.filter((n: unknown): n is string => typeof n === 'string') : [];
+    } catch (error) {
+      console.warn(`AgentMode: could not read schedule ${scheduleId} for required-tool prioritisation:`, error);
+      return [];
+    }
+  }
+
   private async resolveScheduledPublishAuthorization(
     currentSession: any
   ): Promise<SchedulePublishAuthorization & { reason?: PublishAuthorizationWithholdReason }> {
@@ -3620,6 +3645,11 @@ export class AgentModeService {
         availableSkillContextMsg,
       } = turnContext;
 
+      // ENG-2824: a scheduled run's required calls must stay declared when callLLM
+      // truncates the tool list to the model's maxTools. Read once per turn; a failed
+      // read only loses the prioritisation, never the turn.
+      const requiredToolNamesForTurn = await this.resolveScheduledRequiredToolNames(currentSession);
+
       let content = '';
       const toolCalls: any[] = [];
       _toolCallsForTelemetry = toolCalls;
@@ -4206,6 +4236,7 @@ export class AgentModeService {
             // any tool calls this turn returns (see the forceFinalSynthesis drop below), so
             // no further work can start either way and the model is told as much.
             tools: filteredToolsCache,
+            priorityToolNames: requiredToolNamesForTurn,
             tool_choice: 'auto',
             max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
             temperature: 0.1,
