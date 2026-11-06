@@ -67,9 +67,10 @@ export interface HotLeadCallRecord {
   /**
    * Set when the lead pressed 2 ("not available now", outcome `lead_deferred`) on the first call: the one later call is due
    * at `dueAt` (ISO, inside the lead-local window). Kept on the record after the retry starts, which is how the retry call
-   * knows it is the retry (a second 2 is then an ordinary decline: one retry per lead, ever). `count` is always 1.
+   * knows it is the retry (a second 2 is then an ordinary decline: one retry per lead, ever). `count` is always 1. `firstDueAt` is written the first time a claimed retry is put back (a transient refusal) and never changes: the six hours of
+   * `retry_expired` are counted from it, so repeated reschedules cannot extend them.
    */
-  deferral?: { dueAt: string; count: number };
+  deferral?: { dueAt: string; count: number; firstDueAt?: string };
   /** Written once by the due-retries cron when it takes the deferral (absent = still pending); the retry's restart needs it. */
   retryClaimToken?: string;
   retryClaimedAt?: string;
@@ -129,9 +130,15 @@ export interface LeadCallStore {
   claimRetry(listId: string, leadId: string, jobKey: string, token: string): Promise<boolean>;
   /**
    * Moves the pending deferral of a finished `lead_deferred` record (call `jobKey`) to a new `dueAt` while no claim is there
-   * (the retry stays unclaimed). False when the record is not that one or the retry has been claimed.
+   * (the retry stays unclaimed); `firstDueAt` is kept when given. False when the record is not that one or the retry has been claimed.
    */
-  rescheduleRetry(listId: string, leadId: string, jobKey: string, dueAt: string): Promise<boolean>;
+  rescheduleRetry(listId: string, leadId: string, jobKey: string, deferral: { dueAt: string; firstDueAt?: string }): Promise<boolean>;
+  /**
+   * Gives a claim back after a transient refusal: only while the record is the finished `lead_deferred` one whose
+   * `retryClaimToken` is `token` (a stale holder cannot release a newer claim). Removes `retryClaimToken` and `retryClaimedAt` and sets
+   * the deferral to the new `dueAt` with `firstDueAt`. False when the claim is not this token's.
+   */
+  releaseRetryClaim(listId: string, leadId: string, token: string, deferral: { dueAt: string; firstDueAt: string }): Promise<boolean>;
   /**
    * Starts the retry's call cycle on the finished record that holds this claim: back to `dialing` as attempt 1 with a new
    * jobKey (so the first call's late callbacks no longer match), and the first cycle's sids, outcome, metered legs and

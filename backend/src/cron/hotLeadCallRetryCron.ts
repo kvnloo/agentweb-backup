@@ -10,6 +10,8 @@ import { retrySweepEnabled } from '../services/voice/hotLeadCallRetry';
 
 const TAG = '[hotLeadCall]';
 export const HOT_LEAD_CALL_RETRY_INTERVAL_MS = 5 * 60 * 1000;
+/** One extra run this long after arming, so a fresh deploy does not leave a due retry waiting a whole interval. */
+export const HOT_LEAD_CALL_RETRY_BOOT_DELAY_MS = 30 * 1000;
 /** A run in which nothing happened is logged at most this often. */
 const IDLE_LOG_EVERY_MS = 60 * 60 * 1000;
 
@@ -44,7 +46,7 @@ export async function runHotLeadCallRetryCron(): Promise<RetrySweepSummary | nul
 }
 
 /**
- * Arms the every-5-minutes interval; returns the timer, or null (nothing armed) when HOT_LEAD_CALL_RETRY is off. `enabled` is
+ * Arms the every-5-minutes interval (plus one run 30 seconds after arming); returns the timer, or null (nothing armed) when HOT_LEAD_CALL_RETRY is off. `enabled` is
  * the host's own gate (server.ts passes isCronEnabled), `track` its job registry wrapper.
  */
 export function startHotLeadCallRetryCron(host: {
@@ -55,10 +57,12 @@ export function startHotLeadCallRetryCron(host: {
     console.log('[hotLeadCallRetryCron] Disabled: HOT_LEAD_CALL_RETRY is off');
     return null;
   }
-  const timer = setInterval(() => {
+  const tick = (): void => {
     if (!host.enabled()) return;
     host.track('hotLeadCallRetryCron', runHotLeadCallRetryCron()).catch((e) => console.error('[hotLeadCallRetryCron] Error:', e));
-  }, HOT_LEAD_CALL_RETRY_INTERVAL_MS);
-  console.log('[hotLeadCallRetryCron] Initialized — every 5 minutes');
+  };
+  setTimeout(tick, HOT_LEAD_CALL_RETRY_BOOT_DELAY_MS).unref();
+  const timer = setInterval(tick, HOT_LEAD_CALL_RETRY_INTERVAL_MS);
+  console.log('[hotLeadCallRetryCron] Initialized — every 5 minutes, first run in 30 seconds');
   return timer;
 }

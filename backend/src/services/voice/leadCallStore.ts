@@ -114,12 +114,21 @@ class DynamoLeadCallStore implements LeadCallStore {
     });
   }
 
-  async rescheduleRetry(listId: string, leadId: string, jobKey: string, dueAt: string): Promise<boolean> {
+  async rescheduleRetry(listId: string, leadId: string, jobKey: string, deferral: { dueAt: string; firstDueAt?: string }): Promise<boolean> {
     return crmDb.updateLeadSystemRecordIf(listId, leadId, SYSTEM_KEY, {
       stateIn: ['finished'],
-      set: { deferral: { dueAt, count: 1 } },
+      set: { deferral: { dueAt: deferral.dueAt, count: 1, ...(deferral.firstDueAt ? { firstDueAt: deferral.firstDueAt } : {}) } },
       whenEquals: { jobKey, outcome: 'lead_deferred' },
       whenAbsent: ['retryClaimToken'],
+    });
+  }
+
+  async releaseRetryClaim(listId: string, leadId: string, token: string, deferral: { dueAt: string; firstDueAt: string }): Promise<boolean> {
+    return crmDb.updateLeadSystemRecordIf(listId, leadId, SYSTEM_KEY, {
+      stateIn: ['finished'],
+      set: { deferral: { dueAt: deferral.dueAt, count: 1, firstDueAt: deferral.firstDueAt } },
+      remove: ['retryClaimToken', 'retryClaimedAt'],
+      whenEquals: { retryClaimToken: token, outcome: 'lead_deferred' },
     });
   }
 

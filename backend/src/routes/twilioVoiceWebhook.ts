@@ -425,8 +425,9 @@ router.post('/screen', guarded(async (_req, res, q, body) => {
     return sendHangup(res);
   }
   sendXml(res, leadScreenTwiml({ announcedName: ctx.config.announcedName, callbackNumber: ctx.config.twilioNumber, resultUrl: buildVoiceWebhookUrl('screen-result', q),
-    // Option 2 is offered only when the retry can happen: this is the lead's first call and retries are not switched off.
-    canDefer: !current.deferral && retrySweepEnabled(),
+    // Option 2 is offered only when the retry can really happen: the same eligibility /screen-result applies to a 2 (first call,
+    // retries and kill switch on, live config, the approved phone, an open window within 36 hours). It is checked again at the 2.
+    canDefer: await deferralDueAt(q, current) !== null,
   }));
 }, twimlReplies));
 

@@ -22,18 +22,28 @@ export const RETRY_EXPIRES_AFTER_MS = 6 * 60 * MINUTE_MS;
  * The org's hours are part of the search so that a retry is not scheduled for a minute the gates would refuse anyway.
  */
 export function retryDueAt(phoneE164: string, config: Pick<HotLeadCallConfig, 'callingHours'>, now: Date): Date | null {
+  return openAtOrAfter(phoneE164, config, now.getTime() + RETRY_DELAY_MS);
+}
+
+/**
+ * The first instant at or after `fromMs` (searched minute by minute, for 36 hours) at which the lead window and the org's
+ * calling hours are both open; `fromMs` itself when it is, else the next whole minute. Null when there is none.
+ */
+export function openAtOrAfter(phoneE164: string, config: Pick<HotLeadCallConfig, 'callingHours'>, fromMs: number): Date | null {
   const open = (ms: number): boolean => {
     const at = new Date(ms);
     return isInsideLeadCallWindow(phoneE164, at) && isWithinCallWindow(config.callingHours, at);
   };
-  const first = now.getTime() + RETRY_DELAY_MS;
-  if (open(first)) return new Date(first);
-  const last = first + RETRY_SEARCH_MS;
-  for (let ms = Math.ceil(first / MINUTE_MS) * MINUTE_MS; ms <= last; ms += MINUTE_MS) {
+  if (open(fromMs)) return new Date(fromMs);
+  const last = fromMs + RETRY_SEARCH_MS;
+  for (let ms = Math.ceil(fromMs / MINUTE_MS) * MINUTE_MS; ms <= last; ms += MINUTE_MS) {
     if (open(ms)) return new Date(ms);
   }
   return null;
 }
+
+/** A transient refusal after the claim puts the retry back this far ahead (or at the next open minute). */
+export const RETRY_REQUEUE_MS = 15 * MINUTE_MS;
 
 /** `HOT_LEAD_CALL_RETRY`: `off`, `0` or `false` (any case) disables press-2 retries; anything else, or unset, leaves them on. */
 export function retrySweepEnabled(): boolean {
