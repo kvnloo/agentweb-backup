@@ -335,6 +335,11 @@ Limits to know about:
     ring someone, not calls that were answered, so a real lead who calls back 4 times in an hour while nobody picks up hears
     the "nobody is available" message on the 4th. Rows for new callers are created only after a member would be rung and
     expire by TTL (counters 2 hours / 2 days, marker 1 hour).
+    Two simultaneous deliveries of the same `CallSid` at the exact moment a cap is reached can end with one admitted and the
+    other answered with the "nobody is available" message (the second sees the last slot taken before the first has claimed
+    its marker). Which response Twilio uses is not verified. This is accepted: it can only refuse a call, never exceed a cap,
+    it needs a webhook redelivery that overlaps the first delivery, and closing it needs a two-state (pending/done) marker with
+    waiting, which is not worth the machinery here.
 - Callers are not recorded in the lead timeline.
 - The member prompt is the org's `announcedName` only; visitor-supplied text is never spoken.
 - A freshly provisioned number is pointed at `/inbound` by `buyNumber` (`voiceUrl`, POST). A number bought **before** this
