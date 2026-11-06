@@ -350,8 +350,11 @@ export async function processHotLeadCallRetry(listId: string, leadId: string, no
   // Contract: the retry is placed within six hours of its FIRST due time or it is given up, never moved to another day. Records written
   // before `firstDueAt` existed fall back to their current dueAt. The give-up comes before "not due yet": a deferral whose dueAt lies in
   // the future but whose firstDueAt is older than the limit (an operator-written or older-shape record) must be given up, not left waiting.
-  const firstDueAt = record.deferral?.firstDueAt ?? new Date(dueAt).toISOString();
-  const giveUpAt = Date.parse(firstDueAt) + RETRY_EXPIRES_AFTER_MS;
+  // An unparseable firstDueAt would make the limit NaN and silently disable the expiry: it falls back to dueAt too, and one value is used everywhere.
+  const parsedFirst = Date.parse(record.deferral?.firstDueAt ?? '');
+  const firstMs = Number.isFinite(parsedFirst) ? parsedFirst : dueAt;
+  const firstDueAt = new Date(firstMs).toISOString();
+  const giveUpAt = firstMs + RETRY_EXPIRES_AFTER_MS;
   const token = randomUUID();
   const claim = (): Promise<boolean> => store.claimRetry(listId, leadId, record.jobKey, token);
   const giveUp = async (known?: LeadRow | null): Promise<RetryOutcome> => {
@@ -388,7 +391,7 @@ export async function processHotLeadCallRetry(listId: string, leadId: string, no
     // the window search only pushes it later when 15 minutes on is closed.
     const earliest = now.getTime() + RETRY_REQUEUE_MS;
     const next = phone && ctx ? openAtOrAfter(phone, ctx.config, earliest) : new Date(earliest);
-    if (!next || next.getTime() > Date.parse(firstDueAt) + RETRY_EXPIRES_AFTER_MS) {
+    if (!next || next.getTime() > giveUpAt) {
       if (lead) await recordRetryExpired(lead);
       retryLog('dropped', 'retry_expired', orgId);
       return 'expired';

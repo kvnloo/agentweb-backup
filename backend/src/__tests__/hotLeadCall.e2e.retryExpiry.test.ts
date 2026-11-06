@@ -70,8 +70,26 @@ describe('a retry past six hours from its first due time is given up by the real
   it('control: inside its six hours with the same closed window the same record is moved, not given up', async () => {
     seed({ dueAt: ago(11 * 60_000), count: 1, firstDueAt: ago(2 * HOUR) });
     expect(await runHotLeadCallRetryCron()).toMatchObject({ expired: 0, rescheduled: 1 });
+    // Exactly the lead window's opening (13:00 EDT = 17:00Z): from now, with no extra 60 minutes (that would be 18:00Z).
+    expect(sidecar().deferral).toEqual({ dueAt: '2026-10-19T17:00:00.000Z', count: 1, firstDueAt: ago(2 * HOUR) });
     expect(sidecar().retryClaimToken).toBeUndefined();
     expect(expiryNotes()).toHaveLength(0);
+  });
+
+  it('a garbage firstDueAt falls back to dueAt: dueAt 6.5h ago is given up (claimed, one retry_expired note)', async () => {
+    seed({ dueAt: ago(6.5 * HOUR), count: 1, firstDueAt: 'not-a-date' });
+    expect(await runHotLeadCallRetryCron()).toMatchObject({ found: 1, expired: 1, rescheduled: 0, attempted: 0, failed: 0 });
+    expect(sidecar().retryClaimToken).toEqual(expect.any(String));
+    expect(expiryNotes()).toHaveLength(1);
+    expect(world.provider.placedCalls).toHaveLength(0);
+  });
+
+  it('a garbage firstDueAt with dueAt 2h ago inside the lead window is retried normally (no early expiry)', async () => {
+    setClock('2026-10-19T19:00:00.000Z'); // 15:00 EDT: both windows open
+    seed({ dueAt: new Date(Date.parse('2026-10-19T19:00:00.000Z') - 2 * HOUR).toISOString(), count: 1, firstDueAt: 'not-a-date' });
+    expect(await runHotLeadCallRetryCron()).toMatchObject({ attempted: 1, expired: 0 });
+    expect(expiryNotes()).toHaveLength(0);
+    expect(world.provider.placedCalls).toHaveLength(1);
   });
 
   it('control: a future-dated deferral that is still inside its six hours is simply not due', async () => {

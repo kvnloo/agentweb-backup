@@ -12,3 +12,4 @@ Follow-up to the press-2 retry (PR #3920); no new persisted fields.
   `call.skipped` `retry_expired` instead of waiting. The other two reported fixtures (dueAt moved recently with an old `firstDueAt`; no
   `firstDueAt` and `dueAt` 6.5h ago) were already given up correctly; all three are now regression tests driving `runHotLeadCallRetryCron()`
   over the real store.
+- Guard: an unparseable `deferral.firstDueAt` falls back to `dueAt` (it would otherwise make the 6 hour limit NaN and silently disable the expiry).
