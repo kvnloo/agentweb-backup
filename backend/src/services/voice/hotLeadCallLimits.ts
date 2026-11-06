@@ -116,6 +116,12 @@ export type Reservation =
  */
 export async function reserveCallSlot(input: {
   orgId: string; listId: string; leadId: string; phoneE164: string; config: HotLeadCallConfig; now?: Date;
+  /**
+   * The lead's one retry (press 2, ENG-2783): the 24h phone marker the lead's own first call took may still be held, and a
+   * marker held by THIS lead is accepted as it stands (nothing taken, nothing given back). A marker held by another lead
+   * still refuses, and the hourly, daily and monthly counters are taken afresh like any call.
+   */
+  retry?: boolean;
 }): Promise<Reservation> {
   const { orgId, phoneE164, config } = input;
   const now = input.now ?? new Date();
@@ -128,7 +134,8 @@ export async function reserveCallSlot(input: {
     const phoneKey = phoneMarkerKey(orgId, phoneE164);
     if (!await claim(phoneKey, PHONE_WINDOW_S, leadPrefix)) {
       const holder = await getLimitStore().holder(phoneKey, nowS);
-      return { ok: false, reason: holder?.startsWith(leadPrefix) ? 'in_progress' : 'duplicate_phone' };
+      const own = !!holder?.startsWith(leadPrefix);
+      if (!(own && input.retry)) return { ok: false, reason: own ? 'in_progress' : 'duplicate_phone' };
     }
     const counters: Array<[LimitDenial, () => Promise<boolean>]> = [
       ['org_hourly_cap', () => count(hourlyCapKey(orgId, now), config.maxCallsPerHour, 2 * HOUR_S)],

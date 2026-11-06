@@ -135,6 +135,46 @@ describe('reserveCallSlot', () => {
   });
 });
 
+describe('reserveCallSlot for a press-2 retry (retry: true, ENG-2783)', () => {
+  const reserve = (over: Partial<Parameters<typeof reserveCallSlot>[0]> = {}) =>
+    reserveCallSlot({ orgId: 'o', listId: 'list-a', leadId: 'lead-a', phoneE164: PHONE, config, now: NOW, ...over });
+  // Computed per use: the key is an HMAC under JWT_SECRET, which the suite sets in beforeEach.
+  const markerKey = (): string => phoneMarkerKey('o', PHONE);
+
+  it('accepts the marker this same lead took for its first call (in_progress is bypassed), takes fresh counters and keeps the marker', async () => {
+    await reserve();
+    const holder = limits.claims.get(markerKey())?.token;
+    expect(holder).toMatch(/^list-a#lead-a#/);
+    expect(await reserve()).toEqual({ ok: false, reason: 'in_progress' }); // without the flag
+    const slot = await reserve({ retry: true });
+    expect(slot.ok).toBe(true);
+    expect(limits.counters.get(hourlyCapKey('o', NOW))).toBe(2); // the first call's slot and the retry's
+    expect(limits.claims.get(markerKey())?.token).toBe(holder);
+    if (slot.ok) await slot.release();
+    expect(limits.counters.get(hourlyCapKey('o', NOW))).toBe(1); // only what the retry took is given back
+    expect(limits.claims.get(markerKey())?.token).toBe(holder);
+  });
+
+  it('still refuses a marker held by ANOTHER lead as duplicate_phone', async () => {
+    await reserve({ leadId: 'lead-b' });
+    expect(await reserve({ retry: true })).toEqual({ ok: false, reason: 'duplicate_phone' });
+    expect(await reserve({ retry: true, listId: 'list-b', leadId: 'lead-a' })).toEqual({ ok: false, reason: 'duplicate_phone' });
+  });
+
+  it('takes the marker itself when the first call\'s has expired', async () => {
+    await reserve();
+    const later = new Date(NOW.getTime() + 25 * 3600_000);
+    expect((await reserve({ retry: true, now: later })).ok).toBe(true);
+    expect(limits.claims.get(markerKey())?.token).toMatch(/^list-a#lead-a#/);
+  });
+
+  it('still obeys the counters: a full hourly cap refuses the retry', async () => {
+    await reserve();
+    const tight = { ...config, maxCallsPerHour: 1 } as HotLeadCallConfig;
+    expect(await reserve({ retry: true, config: tight })).toEqual({ ok: false, reason: 'org_hourly_cap' });
+  });
+});
+
 describe('claimMemberCooldown', () => {
   const claim = (memberId: string, now = NOW) => claimMemberCooldown({ orgId: 'o', memberId, config, now });
 

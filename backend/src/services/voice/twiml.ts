@@ -19,7 +19,9 @@ export const LEAD_PHONE_CHANGED_COPY = 'We could not reach the lead. Their detai
 export const LEAD_DECLINED_COPY = 'The lead did not confirm. Their details are in your lead alert.';
 export const SCREEN_NO_INPUT_COPY = 'We did not get your answer. Goodbye.';
 export const LEAD_OPTED_OUT_MEMBER_COPY = 'The lead asked not to be called again. Their details are in your lead alert.';
+export const LEAD_DEFERRED_MEMBER_COPY = 'The lead is not available right now. We will try again later.';
 const leadOptedOutCopy = (announcedName: string): string => `Understood. ${announcedName} will not call this number again. Goodbye.`;
+const leadDeferredCopy = (announcedName: string): string => `Okay. ${announcedName} will call you again later. Goodbye.`;
 
 /**
  * A US number as it is read aloud: national 3-3-4 groups, each digit on its own (spaced, so text-to-speech does not
@@ -33,12 +35,13 @@ export function spokenPhoneNumber(e164: string): string {
 }
 
 // The lead can always call the org's own number back: it rings the team through the inbound callback path (inboundCallback.ts).
-// Pressing 2 ("call me again later") is deliberately NOT offered: nothing can schedule that second call (see "Known follow-ups"
-// in docs/integrations/hot-lead-call.md).
+// Pressing 2 ("not available now") schedules ONE later call through the due-retries cron (cron/hotLeadCallRetryCron.ts), so
+// option 2 is spoken only when a retry can really happen (`canDefer`: the lead's first call, retries not switched off); see
+// "Press 2 and the retry" in docs/integrations/hot-lead-call.md.
 // The prompt is US-only (a Canadian number is refused upstream, HOT_LEAD_CALL_CA_ENABLED=false); any other E.164 number is
 // simply read digit by digit.
-const screenPromptCopy = (announcedName: string, callbackNumber: string): string =>
-  `This is an automated call from ${announcedName} about the enquiry you sent us. To reach a person at ${announcedName}, call ${spokenPhoneNumber(callbackNumber)}. Press 1 to be connected now, or press 3 to stop these calls.`;
+const screenPromptCopy = (announcedName: string, callbackNumber: string, canDefer: boolean): string =>
+  `This is an automated call from ${announcedName} about the enquiry you sent us. To reach a person at ${announcedName}, call ${spokenPhoneNumber(callbackNumber)}. ${canDefer ? 'Press 1 to be connected now, press 2 if you are not available and we will call you again later, or press 3 to stop these calls.' : 'Press 1 to be connected now, or press 3 to stop these calls.'}`;
 export const NO_INPUT_COPY = 'We did not get a response. Goodbye.';
 export const LEAD_UNREACHABLE_COPY = 'Sorry, we could not reach them. Goodbye.';
 const memberPromptCopy = (announcedName: string): string => `New lead from ${announcedName}. Are you available to take the call now? Press 1.`;
@@ -126,18 +129,28 @@ export function leadOptedOutMemberTwiml(): string {
   return response(say(LEAD_OPTED_OUT_MEMBER_COPY), '<Hangup/>');
 }
 
+/** The member's side of a lead who pressed 2 (not available now): a retry is scheduled. */
+export function leadDeferredMemberTwiml(): string {
+  return response(say(LEAD_DEFERRED_MEMBER_COPY), '<Hangup/>');
+}
+
+/** Said to the lead who pressed 2, on their own leg, before it hangs up: one later call is scheduled. */
+export function leadDeferredTwiml(announcedName: string): string {
+  return response(say(leadDeferredCopy(announcedName)), '<Hangup/>');
+}
+
 /** Said to the lead who pressed 3, on their own leg, before it hangs up. */
 export function leadOptedOutTwiml(announcedName: string): string {
   return response(say(leadOptedOutCopy(announcedName)), '<Hangup/>');
 }
 
 /**
- * What the lead hears on answering: press 1 or nothing is connected, press 3 to be struck off. `callbackNumber` is the
+ * What the lead hears on answering: press 1 or nothing is connected, press 2 (only when `canDefer`) for one later call, press 3 to be struck off. `callbackNumber` is the
  * org's own number (E.164). No input falls through to the goodbye and hangup.
  */
-export function leadScreenTwiml(p: { announcedName: string; callbackNumber: string; resultUrl: string }): string {
+export function leadScreenTwiml(p: { announcedName: string; callbackNumber: string; resultUrl: string; canDefer: boolean }): string {
   return response(
-    pressOneGather(screenPromptCopy(p.announcedName, requireE164(p.callbackNumber, 'callback number')), p.resultUrl),
+    pressOneGather(screenPromptCopy(p.announcedName, requireE164(p.callbackNumber, 'callback number'), p.canDefer), p.resultUrl),
     say(SCREEN_NO_INPUT_COPY),
     '<Hangup/>',
   );
