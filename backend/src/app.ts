@@ -155,6 +155,9 @@ import brandBuildRoutes from "./routes/brandBuild";
 import designSystemBuildRoutes from "./routes/designSystemBuild";
 import adGenRoutes from "./routes/adGen";
 import onboardingStepsRoutes from "./routes/onboardingSteps";
+import { createSlackStartRouter } from "./routes/slackStart";
+import { createSlackStartService } from "./services/slackStart/slackStartService";
+import { buildProductionSlackStartDeps } from "./services/slackStart/slackStartWiring";
 import outreachOnboardingRoutes from "./routes/outreachOnboarding";
 import usersRoutes from "./routes/users";
 import charactersRoutes from "./routes/characters";
@@ -362,6 +365,9 @@ app.use((req, res, next) => {
     // Skip the main CORS middleware for this endpoint
     return next();
   }
+  // ENG-2782: the public Slack-start intake is embedded on marketing sites and applies
+  // its own non-credentialed origin allowlist (routes/slackStart.ts, SLACK_START_ALLOWED_ORIGINS).
+  if (req.path.startsWith('/api/onboarding/slack-start')) return next();
   // Apply CORS middleware for all other routes
   cors(corsOptions)(req, res, next);
 });
@@ -610,6 +616,9 @@ app.use("/api/v1/agent", agentApiRoutes);
 app.use("/api/emma", emmaApiRoutes);
 app.use("/api/memory", memoryRoutes);
 app.use("/api/test-accounts", testAccountsRoutes);
+// ENG-2782: public "Get started in Slack" intake (unauthenticated; per-intake bearer capability).
+const slackStartDeps = buildProductionSlackStartDeps();
+app.use("/api/onboarding/slack-start", createSlackStartRouter(createSlackStartService(slackStartDeps), slackStartDeps));
 app.use("/api/onboarding", onboardingEventsRoutes);
 app.use("/api/onboarding", onboardingVariantsRoutes);
 app.use("/api/loop-events", loopEventsRoutes);

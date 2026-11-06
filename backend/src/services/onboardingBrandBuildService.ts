@@ -125,6 +125,12 @@ export interface BrandBuildDeps {
    * current one (see `brandBuildSessionPageIdentifier`).
    */
   expectedStartedAt?: string;
+  /**
+   * ENG-2782: skip the WS3 Slack Connect side effect below. Set by callers that
+   * provision Slack Connect themselves at a later point (the public Slack-start
+   * intake does it on completion), so the two never race into a double invite.
+   */
+  skipSlackConnect?: boolean;
 }
 
 function buildBrandPrompt(input: {
@@ -438,6 +444,7 @@ export async function triggerBrandBuildForUser(
   // never blocks the brand build, and inert until the flag + a bot token with
   // the conversations.connect scope are configured. See slackConnectService.
   void (async () => {
+    if (deps.skipSlackConnect) return;
     try {
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const { provisionOnboardingSlackConnect } = require("./slackConnectService");
