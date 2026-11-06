@@ -3,9 +3,11 @@
 When a landing-page form lead arrives with a phone number, AgentWeb phones a
 member of the business's team from a Twilio number the org owns and says "New
 lead from <business name>. Are you available to take the call now? Press 1." On
-`1` it dials the lead, who hears "<business name> would like to talk to you about
-your enquiry. Press 1 to be connected now." and must press 1 as well; only then
-are the two calls bridged. Which member is rung depends on the
+`1` it dials the lead, who hears "This is an automated call from <business name>
+about the enquiry you sent us. To reach a person at <business name>, call <the org's number>.
+Press 1 to be connected now, or press 3 to stop these calls." and must press 1 as well; only then
+are the two calls bridged. The number is spoken digit by digit in 3-3-4 groups; calling it rings the team through the
+[inbound callback](#inbound-callbacks) path. Pressing 3 puts the number on the org's [do-not-call list](#do-not-call-list). Which member is rung depends on the
 team's priority order and weekly availability windows (see [Who is rung](#who-is-rung)). The outcome and every step are written to the lead's timeline.
 
 It is a second subscriber to the same moment as the Slack lead alert
@@ -67,7 +69,7 @@ sequenceDiagram
   LeadPhone-->>Tw: answers
   Tw->>App: POST /status leg=lead CallStatus=in-progress (remembers the lead sid, no state change)
   Tw->>App: POST /screen (runs on the lead's leg, before the bridge)
-  App-->>Tw: Gather 1 digit: "<business> would like to talk to you ... Press 1"
+  App-->>Tw: Gather 1 digit: "This is an automated call from <business> ... call <number>. Press 1 to be connected now, or press 3 to stop"
   LeadPhone->>Tw: presses 1
   Tw->>App: POST /screen-result Digits=1
   App-->>Tw: empty Response - Twilio bridges the two calls
@@ -83,7 +85,8 @@ Branches (all end in `finished` once every leg that was dialed is metered):
 | Situation | Webhook that decides | Outcome | Timeline events after `call.initiated` |
 | --- | --- | --- | --- |
 | Member presses 1, lead answers and presses 1 | `/gather`, `/screen`, `/screen-result` | `completed` | `call.member_answered`, `call.connected`, `call.completed` |
-| Lead answers but presses another key, says nothing or hangs up | `/screen-result` (a key) or `/dial` (`completed` with `DialBridged=false`) | `lead_declined`; the member hears "The lead did not confirm. Their details are in your lead alert." and no other member is tried | `call.member_answered`, `call.lead_declined`, `call.completed` |
+| Lead answers and presses 3 | `/screen-result` | `lead_opted_out`; the lead hears "Understood. <business> will not call this number again. Goodbye."; the member hears "The lead asked not to be called again. Their details are in your lead alert."; no other member is tried; the stop is written first (see [Do-not-call list](#do-not-call-list)) | `call.member_answered`, `call.lead_declined` (`reason: opted_out`), `call.completed` |
+| Lead answers but presses another key (2 included), says nothing or hangs up | `/screen-result` (a key) or `/dial` (`completed` with `DialBridged=false`) | `lead_declined`; the member hears "The lead did not confirm. Their details are in your lead alert." and no other member is tried | `call.member_answered`, `call.lead_declined`, `call.completed` |
 | Member presses another digit, hangs up on or ignores the prompt, or never picks up (no-answer, busy, failed, canceled) | member `/status` terminal | `member_declined` / `member_no_answer` for the attempt; the record moves to `between_attempts` and the next-attempt request runs (see [Who is rung](#who-is-rung)) | `call.member_declined` or `call.member_no_answer`, then `call.completed` only when no further attempt is queued |
 | Member presses 1, lead does not answer | `/dial` with `no-answer`, `busy` or `failed` | `lead_no_answer` | `call.member_answered`, `call.lead_no_answer`, `call.completed` |
 | Lead's local calling window closed while the member was answering (member pressed 1) | `/gather` | `lead_outside_hours` (record stays `member_answered` until the member leg ends); same apology as `lead_phone_invalid`; the lead is not dialled | `call.member_answered`, `call.failed` (reason `lead_outside_hours`), `call.completed` |
@@ -818,8 +821,9 @@ No new table or index. The feature writes:
 | `HOT_LEAD_CALL_STUCK_SWEEP` | environment variable of the backend (unset or any other value: report only; `close`: the sweep settles stuck records; `off`: disabled) | operators |
 | `vendor_rate_overrides` | AW-Settings item | admin Vendor Rates tab |
 | `system.hot_lead_call` (call record: `state`, `jobKey`, `startedAt`, `updatedAt`, `attemptNo`, `memberId`, `triedMemberIds`, `leadPhoneMac` (keyed HMAC of the lead's phone, see Org config), `claimToken` (random id of the writer that took an exclusive step, see Writes that commit and then report an error), `memberCallSid`, `leadCallSid`, `outcome`, `meteredLegs` (`member:<attempt>` and `lead`), `lastSequence`) | on the lead row (AW-Leads), no phone number | orchestrator and webhooks |
+| Lead contact status (`contactStatus: do-not-contact`, `contactStatusReason: opted-out`, `contactStatusNote`, `unsubscribedFromGroupEmail`) | existing fields on the lead row (AW-Leads), written by `/screen-result` when the lead presses 3 (a new writer of an existing mechanism) | webhooks (`crmDb.updateLead`) |
 | Timeline events `call.*` | the lead's `engagements` list | `LeadCallStore.addEvent` |
-| `hlc#phone#<hmac>`, `hlc#cool#<orgId>#<memberId>`, `hlc#cap#h#<orgId>#<UTC hour>`, `hlc#cap#d#<orgId>#<local date>`, inbound: `hlc#cap#ih#<orgId>#<UTC hour>`, `hlc#cap#id#<orgId>#<local date>`, `hlc#in#p#h#<hmac>#<UTC hour>`, `hlc#in#p#d#<hmac>#<local date>`, `hlc#in#c#<CallSid>` | existing table `AW-MCPSessions` (partition key `sessionId`, attribute `ttl`) | limit store |
+| `hlc#phone#<hmac>`, `hlc#cool#<orgId>#<memberId>`, `hlc#cap#h#<orgId>#<UTC hour>`, `hlc#cap#d#<orgId>#<local date>`, inbound: `hlc#cap#ih#<orgId>#<UTC hour>`, `hlc#cap#id#<orgId>#<local date>`, `hlc#in#p#h#<hmac>#<UTC hour>`, `hlc#in#p#d#<hmac>#<local date>`, `hlc#in#c#<CallSid>`, do-not-call: `hlc#dnc#<hmac of org and number>` (ENG-2783, about 10 years) | existing table `AW-MCPSessions` (partition key `sessionId`, attribute `ttl`) | limit store |
 
 Notes:
 
@@ -932,7 +936,10 @@ back if the record is not created:
    `outside_lead_hours` (the lead's own local time is outside the lead window, 10:00-18:00, see [Lead-local hours](#lead-local-hours)),
    `no_one_available` (inside the calling hours, but no verified member has an
    open window), `too_old`, then `not_entitled` (the org owner's subscription tier does not
-   include the `hot_lead_call` feature; see [Plan entitlement](#plan-entitlement)).
+   include the `hot_lead_call` feature; see [Plan entitlement](#plan-entitlement)),
+   then `do_not_call` (async, so after the stateless gates and the plan check: the lead's own contact status is
+   `do-not-contact` or `unsubscribed` for ANY reason, or the org's marker holds the number, see
+   [Do-not-call list](#do-not-call-list); a failing limit store records `limits_unavailable` and fails the job).
    Just before a slot is taken the job also loads the Twilio credentials and skips
    with `credentials_unavailable` when it cannot: no slot or record is used, so a
    later submission can try again.
@@ -1009,11 +1016,11 @@ Event types written to the lead timeline (`eventType`, with a scalar `eventData`
 | `call.member_answered` | member picked up (`/owner`), once | - |
 | `call.member_declined` | member pressed a key other than 1, or hung up on the prompt | - |
 | `call.member_no_answer` | member leg ended before pickup | - |
-| `call.lead_declined` | the lead answered but did not press 1 at the screening prompt (`/screen-result`, or `/dial` with `DialBridged=false`), once | - |
+| `call.lead_declined` | the lead answered but did not press 1 at the screening prompt (`/screen-result`, or `/dial` with `DialBridged=false`), once | `reason: opted_out` when the lead pressed 3, else none |
 | `call.connected` | the lead pressed 1 at the screening prompt (`/screen-result`), or `/dial` reported `DialBridged=true`; an answered lead leg alone is not a connection | - |
 | `call.lead_no_answer` | `/dial` reported no-answer, busy or failed | `dialStatus` |
 | `call.completed` | last dialed leg metered; the record is `finished` | `outcome` |
-| `call.failed` | `reason`: `place_rejected`, `placement_unknown` (both also carry `attempt`, `memberId`), `lead_phone_invalid`, `lead_outside_hours`, `lead_phone_changed`, `aborted`, `next_attempt_failed` | `reason` |
+| `call.failed` | `reason`: `place_rejected`, `placement_unknown` (both also carry `attempt`, `memberId`), `lead_phone_invalid`, `lead_outside_hours`, `lead_do_not_call` (`/gather` found the number or lead on the do-not-call list), `lead_phone_changed`, `aborted`, `next_attempt_failed` | `reason` |
 | `call.skipped` | a gate or limit refused (no Twilio call made) | `reason` (list above) |
 
 Record `state`: `dialing`, `member_ringing`, `member_answered`, `between_attempts`
@@ -1021,7 +1028,7 @@ Record `state`: `dialing`, `member_ringing`, `member_answered`, `between_attempt
 attempt or the finish), `bridging`, `connected` (live) and `finished`, `failed`, `skipped` (terminal; `skipped` is in
 the type but the orchestrator records skips as events only). `outcome` values:
 `completed`, `member_declined`, `member_no_answer`, `no_member_available`,
-`lead_declined`, `lead_no_answer`, `lead_phone_invalid`, `lead_phone_changed`,
+`lead_declined`, `lead_opted_out`, `lead_no_answer`, `lead_phone_invalid`, `lead_do_not_call`, `lead_phone_changed`,
 `bridge_unconfirmed`, `aborted`, `disabled` (the next-attempt job found the kill
 switch, the org config or the plan off), `place_rejected`, `next_attempt_failed`
 (the next-attempt job broke before it rang anyone),
@@ -1072,6 +1079,9 @@ carry the Twilio retry override `#rc=3&rp=5xx,ct` so Twilio redelivers a 5xx.
   code.
 
 ### Stuck records
+
+`lead_opted_out` (ENG-2783) leaves the record in `bridging` with the dial marker set, exactly like `lead_declined`: the leg metering finishes it, and
+the sweep settles it from the same state with the same thresholds. No state was added.
 
 A record can stay live if a final status callback never arrives (Twilio outage, 5xx beyond the three retries, a
 `BACKEND_URL` problem) or the process crashed mid-call. A daily sweep (ENG-2271, `services/voice/stuckCallSweep.ts`,
@@ -1238,7 +1248,7 @@ delete. A 404 from Twilio counts as already released. Reconcile any such log lin
 | Symptom | Likely cause |
 | --- | --- |
 | Member is called but hears "application error" | The `/owner` fetch failed: `BACKEND_URL` wrong or unreachable (check scheme and host), or credentials could not be loaded (503), or the signature failed (401). Twilio's call log shows the webhook response. |
-| Calls never placed, timeline shows `call.skipped` | The `reason` names the gate. `outside_calling_hours`, `outside_lead_hours`, `no_one_available`, `duplicate_phone` and `member_cooldown` are expected behavior. An `outside_lead_hours` lead is not retried or deferred (the job runs once); the lead window is 10:00-18:00 lead-local, about 13:00-18:00 Eastern for most US numbers, so a lead that arrives in the evening or morning is simply not called. |
+| Calls never placed, timeline shows `call.skipped` | The `reason` names the gate. `outside_calling_hours`, `outside_lead_hours`, `no_one_available`, `duplicate_phone`, `do_not_call` (the lead or the number pressed 3 or is do-not-contact; see [Do-not-call list](#do-not-call-list)) and `member_cooldown` are expected behavior. An `outside_lead_hours` lead is not retried or deferred (the job runs once); the lead window is 10:00-18:00 lead-local, about 13:00-18:00 Eastern for most US numbers, so a lead that arrives in the evening or morning is simply not called. |
 | No event and no call | Kill switch off, org disabled or config invalid, lead not `form_fill`, smoke-test lead, draft lead, or no phone: all silent by design. |
 | `call.skipped` `limits_unavailable` | `AW-MCPSessions` missing, IAM denied, or throttled. Fails closed. |
 | `no owner to bill for list` in logs | The list owner could not be resolved; the leg was not metered and `/status` answers 500. |
@@ -1263,8 +1273,8 @@ Mitigations to decide before general availability (none of them is built):
 
 - CAPTCHA or honeypot enforcement on the lander endpoint.
 - A spoken disclosure to the lead (for example about recording) before the
-  bridge. The screening prompt (`/screen`) is the place for it; today it only
-  names the business and asks the lead to press 1.
+  bridge. The screening prompt (`/screen`) is the place for it; today it names the business, gives the org's
+  number to call back, and offers press 1 (connect) or press 3 (stop).
 - Requiring a name or an email besides the phone number.
 - Consent text on the landers.
 
@@ -1352,6 +1362,10 @@ on anywhere.
 
 None of these has been observed against Twilio. They are assumptions taken from
 Twilio's documentation and encoded in tests with synthetic payloads:
+
+- The lead prompt (ENG-2783): that a key press interrupts the nested `<Say>` of the `<Gather>` (so a lead can press 1 or 3 while
+  the number is still being read), that the default Twilio voice reads "4 1 5, 5 5 5, 0 1 1 1" as separate digits with a pause at
+  each comma, and that a `<Say>` followed by `<Hangup/>` in the `/screen-result` response is played to the lead before the leg ends.
 
 - What `From` holds on `/inbound` for a withheld or unknown caller (ENG-2784). The code treats anything that is not exactly E.164 as
   "no caller" and applies only the org caps; the exact value Twilio sends was not observed.
@@ -1450,10 +1464,41 @@ Twilio's documentation and encoded in tests with synthetic payloads:
 - **Missed-call Slack line.** The Slack alert does not say whether the call was
   placed, answered or declined; deliberately deferred so the Slack path stays
   untouched.
+- **"Press 2: call me again later" is not built.** The approved design (one deferred retry about 60 minutes later,
+  inside the lead window, re-running every gate and taking a fresh slot) needs a run-after: the job queue
+  (`asyncJobQueue.ts`) has none (a `pending` row is claimed by the next 30-second poll) and nothing else schedules per-lead
+  work. So the prompt does NOT offer 2 and a 2 is an ordinary decline (`lead_declined`). Options are in the ENG-2783 notes
+  (`dev/pending/eng-2783-lead-prompt.md`); the full prompt wording for when it exists is kept there.
 - **Retry after `place_rejected`.** Every lead gets one call record ever, so
   a definitively rejected placement is never retried. A deliberate retry needs a
   new store operation.
 - Voicemail detection and a post-call outcome summary in Emma.
+
+## Do-not-call list
+
+A lead who presses 3 at the screening prompt (ENG-2783) is stopped in two places, written in this order BEFORE the
+call's outcome is recorded (so an outcome that is seen is backed by the stop):
+
+1. **Org marker** `hlc#dnc#<keyedDigest('hot_lead_call.dnc', orgId, phoneE164)>` in the limit store (`AW-MCPSessions`,
+   no raw number, TTL about 10 years). It is written for the number the call was approved for (the record's `leadPhoneMac`
+   must match the lead's current phone; if a repeat submission changed it, nothing is marked and a warning is logged), so
+   the same person submitting again, as a new lead or on another list of the org, is not called.
+2. **The lead's contact status**: `do-not-contact`, reason `opted-out`, note "Pressed 3 on a hot-lead call", plus the legacy
+   `unsubscribedFromGroupEmail` flag, through `crmDb.updateLead` (the same fields the CRM bulk action and the Smartlead
+   opt-out use). A lead that is already blocked keeps its existing status and reason.
+
+Both writes are best-effort and independent: a failure of either is logged without any number and does not stop the goodbye or the
+decline; the key press never connects, and the other record still enforces the stop (fail closed). The digit cannot be
+reversed: a later 1 on the same screening finds the decision marker, writes nothing, and hears the goodbye again.
+
+Enforcement: the `do_not_call` skip gate (dispatch and job, see the gate order above) and a re-check in `/gather` just before
+the lead is dialled (`call.failed` reason `lead_do_not_call`, outcome `lead_do_not_call`, the member hears the unreachable
+apology). Both fail closed when the limit store cannot be read. NOTE: the gate also honours a contact status set by anything
+else (an email unsubscribe, a Smartlead bounce, an admin): such a lead is no longer phoned.
+
+**Removing an entry is an operator data write**: delete the item `sessionId = hlc#dnc#<digest>` from `AW-MCPSessions` (the
+digest needs `JWT_SECRET`, so compute it with `keyedDigest('hot_lead_call.dnc', orgId, phoneE164)` from a backend shell) and
+set the lead's contact status back to active in the CRM. Do this only on the person's own request. There is no API for it.
 
 ## Lead-local hours
 
