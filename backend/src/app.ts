@@ -38,6 +38,7 @@ import agentModeRoutes from "./routes/agentMode";
 import settingsRoutes from "./routes/settings";
 import imageModelsRoutes from "./routes/image-models";
 import webhookRoutes from "./routes/webhooks";
+import { PUBLIC_LEAD_ALIAS_PATH, publicLeadAlias } from "./routes/publicLeadAlias";
 import twilioVoiceWebhookRoutes, { twilioVoiceBodyParser } from "./routes/twilioVoiceWebhook";
 import benchmarkRoutes from "./routes/benchmark";
 import seoRoutes from "./routes/seo";
@@ -397,16 +398,8 @@ app.use("/api/webhooks/twilio-voice", twilioVoiceBodyParser);
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
-// ENG-2657: customer sites embedding /emma-forms.js POST to /api/leads/public/:listId.
-// Alias it onto /api/webhooks/forward-lead (same per-list publicAccessEnabled gate) by
-// moving the path param into body.listId; the path param wins over any body value.
-app.post(/^\/api\/leads\/public\/([^\/]+)\/?$/, (req, _res, next) => {
-  const listId = (req.params as Record<string, string>)[0];
-  const body = req.body && typeof req.body === "object" ? req.body : {};
-  req.body = { ...body, listId };
-  req.url = "/api/webhooks/forward-lead";
-  next();
-});
+// ENG-2657: /api/leads/public/:listId is an alias of /api/webhooks/forward-lead.
+app.post(PUBLIC_LEAD_ALIAS_PATH, publicLeadAlias);
 app.use(passport.initialize());
 app.use(evaluationHttpBoundary);
 app.use("/api/admin/evaluations", evaluationAdminRoutes);
