@@ -120,17 +120,25 @@ async function review(input: JobInput, expectedOrgId?: string): Promise<{ job: H
       return null;
     }
   }
-  const callable = callableLeadPhone(lead.phone, ctx.config);
-  if (!('phone' in callable)) return null; // always set: the phone gate refused otherwise
-  // Reads the org's do-not-call marker for this number (a lead who pressed 3 once) and the lead's own contact status.
-  // A store failure throws: nothing is dialed.
-  if (await isLeadDoNotCall({ orgId: ctx.orgId, lead, phoneE164: callable.phone })) {
-    await recordSkip(lead, 'do_not_call');
-    return null;
-  }
   // After the stateless gates: it reads the org owner's plan. An org that lost its plan stops dialing here.
   if (!await isHotLeadCallEntitled({ ownerUserId: ctx.orgOwnerUserId })) {
     await recordSkip(lead, 'not_entitled');
+    return null;
+  }
+  const callable = callableLeadPhone(lead.phone, ctx.config);
+  if (!('phone' in callable)) return null; // always set: the phone gate refused otherwise
+  // Reads the org's do-not-call marker for this number (a lead who pressed 3 once) and the lead's own contact status.
+  // The marker sits in the limit store: when that fails nothing is dialed, and the lead shows the same limits_unavailable as a failed reservation.
+  let blocked: boolean;
+  try {
+    blocked = await isLeadDoNotCall({ orgId: ctx.orgId, lead, phoneE164: callable.phone });
+  } catch (err) {
+    console.warn('[hotLeadCall] do-not-call check unavailable', { listId, leadId, error: errorText(err) });
+    await recordSkip(lead, 'limits_unavailable').catch(() => undefined);
+    throw err;
+  }
+  if (blocked) {
+    await recordSkip(lead, 'do_not_call');
     return null;
   }
   return { job, ctx, phone: callable.phone, callerNumber, lead };
