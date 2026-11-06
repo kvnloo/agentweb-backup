@@ -320,10 +320,21 @@ Limits to know about:
     or non-E.164 `From` (for example a withheld number) skips the caller counters, so a withheld caller is limited only by the
     org caps. What Twilio sends in `From` for a withheld caller is not verified here (see
     [Not verified](#not-verified-without-a-real-twilio-account)).
+  - **Order and redelivery.** The order is: a read of the retry marker, the caller's counters, the org's counters, then the
+    marker (claimed last, with the `CallSid` as its token, 1 hour). A capped caller therefore never touches the org counters.
+    A redelivery (same `CallSid`) of an **admitted** call finds its marker and is admitted without being counted again (also
+    at the cap boundary); two deliveries racing both count, and the one that loses the marker claim gives its counts back. A
+    redelivery of a **refused** call never claimed a marker, so it is evaluated again (and refused again until room exists).
+    A marker held by anything but this `CallSid` fails closed.
   - **Accepted limits.** Fixed windows can admit up to 2x a cap across a boundary. A caller who rotates numbers or withholds
     theirs, or many callers, can consume the org's inbound caps (denying real callbacks) but cannot exceed them; the cost
     ceiling is the member-leg minutes of 2 x the outbound caps. A crash after the slot is taken keeps it. There is still no
     blocklist, and the per-member cooldown and the lead-phone dedupe do not apply (there is no lead).
+    A caller who spoofs another person's caller ID can use that person's per-caller allowance for the hour or day (Twilio's
+    signature covers the request, not the caller ID presented on the PSTN); this is accepted. The caps count calls that would
+    ring someone, not calls that were answered, so a real lead who calls back 4 times in an hour while nobody picks up hears
+    the "nobody is available" message on the 4th. Rows for new callers are created only after a member would be rung and
+    expire by TTL (counters 2 hours / 2 days, marker 1 hour).
 - Callers are not recorded in the lead timeline.
 - The member prompt is the org's `announcedName` only; visitor-supplied text is never spoken.
 - A freshly provisioned number is pointed at `/inbound` by `buyNumber` (`voiceUrl`, POST). A number bought **before** this
@@ -371,6 +382,7 @@ orchestrator + real webhooks + real store on an in-memory DB fake, signed with
 Twilio's own HMAC) and `__tests__/hotLeadCall.e2e.gates.test.ts` (gates, calling
 hours, dedupe, cooldown, caps and silent refusals) and
 `__tests__/hotLeadCall.e2e.inbound.test.ts` (inbound callbacks: priority, hand-over, caps, fail-closed gates, signatures, metering) and
+`__tests__/hotLeadCall.e2e.inboundCaps.test.ts` (inbound abuse limits: org and per-caller caps, release on refusal, redelivery and the retry marker, fail-closed) and
 `__tests__/hotLeadCall.e2e.attempts.test.ts` (several members: the reference team,
 hand-over through the real next-attempt job, lead screening, replays across
 attempts, and the world changing between attempts), sharing

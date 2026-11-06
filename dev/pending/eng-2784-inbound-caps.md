@@ -7,3 +7,5 @@ rung: org hourly/daily at 2 x `maxCallsPerHour`/`maxCallsPerDay`, per caller 3 a
 (`[hotLeadCall] inbound capped <reason> <orgId>`); a store failure fails closed with the unavailable message
 (`[hotLeadCall] inbound limits unavailable`). A missing or withheld `From` skips only the caller counters. See
 `backend/docs/integrations/hot-lead-call.md` (Inbound callbacks).
+
+This supersedes the "no cap" sentence about inbound callbacks in `dev.md`: inbound callbacks are now capped (above).
