@@ -71,7 +71,7 @@ describe('LeadCallStore.claimRetry', () => {
 
 describe('LeadCallStore.rescheduleRetry', () => {
   it('replaces the deferral only while the retry is unclaimed', async () => {
-    await getLeadCallStore().rescheduleRetry('list-a', 'lead-a', 'job-1', '2026-10-20T17:00:00.000Z');
+    await getLeadCallStore().rescheduleRetry('list-a', 'lead-a', 'job-1', { dueAt: '2026-10-20T17:00:00.000Z' });
     const call = lastUpdate();
     expect(call.UpdateExpression).toBe('SET updatedAt = :ts, #system.#k.#f0 = :v0');
     expect(call.ConditionExpression).toBe(
@@ -79,6 +79,24 @@ describe('LeadCallStore.rescheduleRetry', () => {
     );
     expect(call.ExpressionAttributeNames).toMatchObject({ '#f0': 'deferral', '#f3': 'retryClaimToken' });
     expect(call.ExpressionAttributeValues[':v0']).toEqual({ dueAt: '2026-10-20T17:00:00.000Z', count: 1 });
+    placeholdersMatch(call);
+    mockDocumentClientMethods.update.mockClear();
+    await getLeadCallStore().rescheduleRetry('list-a', 'lead-a', 'job-1', { dueAt: '2026-10-20T17:00:00.000Z', firstDueAt: '2026-10-19T18:00:00.000Z' });
+    expect(lastUpdate().ExpressionAttributeValues[':v0']).toEqual({ dueAt: '2026-10-20T17:00:00.000Z', count: 1, firstDueAt: '2026-10-19T18:00:00.000Z' });
+  });
+});
+
+describe('LeadCallStore.releaseRetryClaim', () => {
+  it('gives the claim back only to the token that holds it: REMOVE the two claim fields, SET the deferral whole, never one path twice', async () => {
+    await getLeadCallStore().releaseRetryClaim('list-a', 'lead-a', 'tok', { dueAt: '2026-10-19T18:15:00.000Z', firstDueAt: '2026-10-19T18:00:00.000Z' });
+    const call = lastUpdate();
+    expect(call.UpdateExpression).toBe('SET updatedAt = :ts, #system.#k.#f0 = :v0 REMOVE #system.#k.#f1, #system.#k.#f2');
+    expect(call.ConditionExpression).toBe('#system.#k.#state IN (:from0) AND #system.#k.#f3 = :v3 AND #system.#k.#f4 = :v4');
+    expect(call.ExpressionAttributeNames).toMatchObject({ '#f0': 'deferral', '#f1': 'retryClaimToken', '#f2': 'retryClaimedAt', '#f3': 'retryClaimToken', '#f4': 'outcome' });
+    expect(call.ExpressionAttributeValues).toMatchObject({ ':from0': 'finished', ':v3': 'tok', ':v4': 'lead_deferred' });
+    expect(call.ExpressionAttributeValues[':v0']).toEqual({ dueAt: '2026-10-19T18:15:00.000Z', count: 1, firstDueAt: '2026-10-19T18:00:00.000Z' });
+    const paths = touchedPaths(call);
+    expect(new Set(paths).size).toBe(paths.length);
     placeholdersMatch(call);
   });
 });

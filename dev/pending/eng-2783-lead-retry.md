@@ -16,10 +16,10 @@ window and the org's calling hours; with none, the 2 is a plain decline. A new c
 `hot_lead_call_mode` kill switch is off), finds due deferrals the way the stuck sweep finds records, claims each with a conditional
 write (exactly once under overlapping runs or instances; a window closed at run time moves the due time instead of spending the retry) and re-runs the normal dispatch pipeline: every gate again (the existing-record
 short-circuit and `too_old` are ignored), a fresh slot against the hourly, daily and monthly caps, fresh member selection with the
-cooldown, then the normal member and lead screens. More than 6 hours late: `call.skipped` `retry_expired`. A refused or failed retry is
-spent (one retry). The stuck sweep leaves a waiting deferral alone (it is a finished record).
+cooldown, then the normal member and lead screens. More than 6 hours late: `call.skipped` `retry_expired`. Only a permanent refusal (do-not-call, plan lost, another lead holds the number, phone changed, ...) spends the retry; a transient one
+(no one on duty, cooldown, caps, a down store, an error) gives the claim back and tries again 15 minutes later until six hours after the first claim. The stuck sweep leaves a waiting deferral alone (it is a finished record).
 
 Owner-approved data-plane additions (Anurag): new schemaless fields on the existing `system.hot_lead_call` sidecar map of the lead row
-(`deferral {dueAt, count}`, `retryClaimToken`, `retryClaimedAt`); NO new table, index or GSI. The retry's restart revives a finished
+(`deferral {dueAt, count, firstDueAt}`, `retryClaimToken`, `retryClaimedAt`); NO new table, index or GSI. The retry's restart revives a finished
 record (new `jobKey`, attempt 1, emptied `meteredLegs`/`lastSequence`), and `findLeadsBySystemRecord` gained optional attribute filters.
 Operators cancel a pending retry with a data write (see `backend/docs/integrations/hot-lead-call.md`, "Press 2 and the retry").

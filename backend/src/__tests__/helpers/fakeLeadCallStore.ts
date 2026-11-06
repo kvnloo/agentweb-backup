@@ -63,10 +63,19 @@ export class FakeLeadCallStore implements LeadCallStore {
     return true;
   }
 
-  async rescheduleRetry(_listId: string, _leadId: string, jobKey: string, dueAt: string): Promise<boolean> {
+  async rescheduleRetry(_listId: string, _leadId: string, jobKey: string, deferral: { dueAt: string; firstDueAt?: string }): Promise<boolean> {
     const r = this.record;
     if (!r || r.state !== 'finished' || r.jobKey !== jobKey || r.outcome !== 'lead_deferred' || r.retryClaimToken !== undefined) return false;
-    r.deferral = { dueAt, count: 1 };
+    r.deferral = { dueAt: deferral.dueAt, count: 1, ...(deferral.firstDueAt ? { firstDueAt: deferral.firstDueAt } : {}) };
+    return true;
+  }
+
+  async releaseRetryClaim(_listId: string, _leadId: string, token: string, deferral: { dueAt: string; firstDueAt: string }): Promise<boolean> {
+    const r = this.record;
+    if (!r || r.state !== 'finished' || r.outcome !== 'lead_deferred' || r.retryClaimToken !== token) return false;
+    delete r.retryClaimToken;
+    delete r.retryClaimedAt;
+    r.deferral = { dueAt: deferral.dueAt, count: 1, firstDueAt: deferral.firstDueAt };
     return true;
   }
 

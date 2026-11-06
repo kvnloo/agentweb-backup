@@ -2158,6 +2158,24 @@ describe('lead presses 2: not available now (one retry, ENG-2783)', () => {
       expect(text).not.toContain('press 2');
     });
 
+    it('when no retry window can exist (the lead window never open within 36 hours): only 1 and 3, the same eligibility as the 2 itself', async () => {
+      mock(isInsideLeadCallWindow).mockReturnValue(false);
+      const text = await prompt();
+      expect(text).toContain('Press 1 to be connected now, or press 3 to stop these calls.');
+      expect(text).not.toContain('press 2');
+    });
+
+    it('when the org\'s calling hours leave no minute in 36 hours against the real lead window: only 1 and 3', async () => {
+      mock(isInsideLeadCallWindow).mockImplementation(jest.requireActual('../services/voice/leadLocalHours').isInsideLeadCallWindow);
+      mock(orgDb.getOrgById).mockResolvedValue({ orgId: 'org-a', hotLeadCall: { ...orgConfig, callingHours: { start: '01:00', end: '02:00', timezone: 'America/New_York' } } });
+      expect(await prompt()).not.toContain('press 2');
+    });
+
+    it('when the lead\'s phone is no longer the one approved: only 1 and 3', async () => {
+      seed('bridging', { leadPhoneMac: leadPhoneMacOf('org-a', '+14155550999') });
+      expect(await prompt()).not.toContain('press 2');
+    });
+
     it('with retries switched off: only 1 and 3', async () => {
       process.env.HOT_LEAD_CALL_RETRY = '0';
       try {

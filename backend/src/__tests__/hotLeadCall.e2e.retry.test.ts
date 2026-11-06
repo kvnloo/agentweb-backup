@@ -19,6 +19,7 @@ import { runStuckCallSweep } from '../services/voice/stuckCallSweep';
 import { cooldownKey, dailyCapKey, hourlyCapKey, monthlyCapKey, phoneMarkerKey } from '../services/voice/hotLeadCallLimits';
 import * as capNotices from '../services/voice/hotLeadCallCapNotices';
 import { processHotLeadCallRetry } from '../services/hotLeadCallService';
+import { getLeadCallStore } from '../services/voice/leadCallStore';
 import { leadPhoneMacOf } from '../services/voice/leadPhoneMac';
 import { dncKey, markNumberDoNotCall } from '../services/voice/hotLeadCallDnc';
 import { sayText } from './helpers/hotLeadCallTwilioSim';
@@ -254,33 +255,150 @@ describe('the due-retries sweep', () => {
     expect(await sweep()).toMatchObject({ found: 0 });
   });
 
+  const dropLines = () => world.warnSpy.mock.calls.map((c) => String(c[0])).filter((l) => /^\[hotLeadCall\] retry (dropped|rescheduled) after claim/.test(l));
+
   describe.each([
-    // [reason, what was arranged, arrange, whether the retry got as far as the reservation/placement ("attempted")]
-    ['do_not_call', 'the lead\'s contact status', () => { world.crm.lead(LIST, 'lead-a').contactStatus = 'do-not-contact'; }, false],
-    ['do_not_call', 'the org marker (a 3 on another lead with the same number)', async () => { await markNumberDoNotCall('org-a', LEAD_E164); }, false],
-    ['not_entitled', 'a plan that lapsed', () => setHotLeadCallEntitledOverride(false), false],
-    ['no_one_available', 'nobody on duty at that hour', () => setOrg({ team: [{ ...callConfig.team[0], windows: [{ days: [0, 1, 2, 3, 4, 5, 6], start: '00:00', end: '01:00' }] }] }), false],
-    ['org_hourly_cap', 'a full hourly cap', () => world.limits.counters.set(hourlyCapKey('org-a', new Date(Date.now() + 60 * 60_000)), 1000), true],
-    ['org_daily_cap', 'a full daily cap', () => world.limits.counters.set(dailyCapKey('org-a', 'America/Chicago', new Date(Date.now() + 60 * 60_000)), 1000), true],
-    ['org_monthly_cap', 'a full monthly cap', () => world.limits.counters.set(monthlyCapKey('org-a', 'America/Chicago', new Date(Date.now() + 60 * 60_000)), 100000), true],
-    ['member_cooldown', 'the member in cooldown', () => world.limits.claims.set(cooldownKey('org-a', MEMBER_ID), { token: 'x', expiresAtS: FAR }), true],
-    ['duplicate_phone', 'another lead holding the number', () => world.limits.claims.set(phoneMarkerKey('org-a', LEAD_E164), { token: 'list-a#other#z', expiresAtS: FAR }), true],
-    ['lead_phone_changed', 'the lead\'s phone replaced by a repeat submission', () => { world.crm.lead(LIST, 'lead-a').phone = '(212) 555-0199'; }, false],
-  ] as Array<[string, string, () => unknown, boolean]>)('gate %s', (reason, label, arrange, attempted) => {
-    it(`${label}: records call.skipped ${reason}, places nothing, leaves a drop line, and the retry is spent`, async () => {
+    // [reason, what was arranged, arrange]: the lead cannot or must not be called however long we wait, so the retry is spent.
+    ['do_not_call', 'the lead\'s contact status', () => { world.crm.lead(LIST, 'lead-a').contactStatus = 'do-not-contact'; }],
+    ['do_not_call', 'the org marker (a 3 on another lead with the same number)', async () => { await markNumberDoNotCall('org-a', LEAD_E164); }],
+    ['not_entitled', 'a plan that lapsed', () => setHotLeadCallEntitledOverride(false)],
+    ['duplicate_phone', 'another lead holding the number', () => world.limits.claims.set(phoneMarkerKey('org-a', LEAD_E164), { token: 'list-a#other#z', expiresAtS: FAR })],
+    ['lead_phone_changed', 'the lead\'s phone replaced by a repeat submission', () => { world.crm.lead(LIST, 'lead-a').phone = '(212) 555-0199'; }],
+  ] as Array<[string, string, () => unknown]>)('permanent refusal %s', (reason, label, arrange) => {
+    it(`${label}: call.skipped ${reason}, nothing placed, the claim is kept and the retry is spent`, async () => {
       await deferred();
       await arrange();
       advanceMinutes(60);
       world.warnSpy.mockClear();
-      expect(await sweep()).toMatchObject({ found: 1, attempted: attempted ? 1 : 0, failed: 0 });
+      expect(await sweep()).toMatchObject({ found: 1, refused: 1, rescheduled: 0, failed: 0 });
       expect(skips()).toEqual([reason]);
       expect(world.provider.placedCalls).toHaveLength(1);
       expect(record()).toMatchObject({ state: 'finished', outcome: 'lead_deferred' });
-      expect(world.warnSpy.mock.calls.map((c) => String(c[0])).filter((l) => l.startsWith('[hotLeadCall] retry dropped after claim'))).toEqual([
-        `[hotLeadCall] retry dropped after claim ${attempted ? reason : reason === 'lead_phone_changed' ? reason : 'gate_refused'} org-a`,
-      ]);
+      expect(record().retryClaimToken).toEqual(expect.any(String));
+      expect(dropLines()).toEqual([`[hotLeadCall] retry dropped after claim ${reason} org-a`]);
+      advanceMinutes(60);
       expect(await sweep()).toMatchObject({ found: 0 });
       expect(world.provider.placedCalls).toHaveLength(1);
+    });
+  });
+
+  describe.each([
+    // [reason, what was arranged, arrange, undo]: a refusal that passes with time, so the claim is given back and a later run calls.
+    ['no_one_available', 'nobody on duty at that hour', () => setOrg({ team: [{ ...callConfig.team[0], windows: [{ days: [0, 1, 2, 3, 4, 5, 6], start: '00:00', end: '01:00' }] }] }), () => setOrg({})],
+    ['member_cooldown', 'the member in cooldown', () => world.limits.claims.set(cooldownKey('org-a', MEMBER_ID), { token: 'x', expiresAtS: FAR }), () => world.limits.claims.delete(cooldownKey('org-a', MEMBER_ID))],
+    ['org_hourly_cap', 'a full hourly cap', () => world.limits.counters.set(hourlyCapKey('org-a', new Date(Date.now() + 60 * 60_000)), 1000), () => world.limits.counters.delete(hourlyCapKey('org-a', new Date()))],
+    ['org_daily_cap', 'a full daily cap', () => world.limits.counters.set(dailyCapKey('org-a', 'America/Chicago', new Date(Date.now() + 60 * 60_000)), 1000), () => world.limits.counters.delete(dailyCapKey('org-a', 'America/Chicago', new Date()))],
+    ['org_monthly_cap', 'a full monthly cap', () => world.limits.counters.set(monthlyCapKey('org-a', 'America/Chicago', new Date(Date.now() + 60 * 60_000)), 100000), () => world.limits.counters.set(monthlyCapKey('org-a', 'America/Chicago', new Date()), 1)],
+  ] as Array<[string, string, () => unknown, () => unknown]>)('transient refusal %s', (reason, label, arrange, undo) => {
+    it(`${label}: call.skipped ${reason}, the claim is given back with a new due time 15 minutes on, and the next run places the call`, async () => {
+      await deferred();
+      await arrange();
+      advanceMinutes(60);
+      const firstDue = String(record().deferral && (record().deferral as { dueAt: string }).dueAt);
+      world.warnSpy.mockClear();
+      expect(await sweep()).toMatchObject({ found: 1, rescheduled: 1, attempted: 0, refused: 0, failed: 0 });
+      expect(skips()).toEqual([reason]);
+      expect(world.provider.placedCalls).toHaveLength(1);
+      expect(record().retryClaimToken).toBeUndefined();
+      expect(record().retryClaimedAt).toBeUndefined();
+      expect(record().deferral).toEqual({ dueAt: new Date(Date.now() + 15 * 60_000).toISOString(), count: 1, firstDueAt: firstDue });
+      expect(dropLines()).toEqual([`[hotLeadCall] retry rescheduled after claim ${reason} org-a`]);
+
+      await undo();
+      expect(await sweep()).toMatchObject({ found: 1, notDue: 1, attempted: 0 }); // not before the new due time
+      advanceMinutes(15);
+      expect(await sweep()).toMatchObject({ found: 1, attempted: 1, rescheduled: 0 });
+      expect(world.provider.placedCalls).toHaveLength(2);
+      expect(record()).toMatchObject({ state: 'member_ringing', deferral: { firstDueAt: firstDue } });
+    });
+  });
+
+  it('a thrown error (the limit store down) gives the claim back first, rethrows to the sweep (failed), and a later run places the call', async () => {
+    await deferred();
+    advanceMinutes(60);
+    world.limits.failKeyPrefix = { prefix: 'hlc#cap#', error: new Error('store down') };
+    world.warnSpy.mockClear();
+    expect(await sweep()).toMatchObject({ found: 1, failed: 1, attempted: 0 });
+    expect(dropLines()).toEqual(['[hotLeadCall] retry rescheduled after claim error org-a']);
+    expect(record().retryClaimToken).toBeUndefined();
+    expect(record().deferral).toMatchObject({ count: 1, firstDueAt: expect.any(String) });
+    world.limits.failKeyPrefix = null;
+    advanceMinutes(15);
+    expect(await sweep()).toMatchObject({ attempted: 1, failed: 0 });
+    expect(world.provider.placedCalls).toHaveLength(2);
+  });
+
+  it('a limits store that is down for the whole claim leaves a limits_unavailable note and still reschedules', async () => {
+    await deferred();
+    advanceMinutes(60);
+    world.limits.failKeyPrefix = { prefix: 'hlc#phone#', error: new Error('store down') };
+    expect(await sweep()).toMatchObject({ failed: 1 });
+    expect(skips()).toEqual(['limits_unavailable']);
+    expect(record().retryClaimToken).toBeUndefined();
+  });
+
+  it('repeated transient refusals stop at firstDueAt + 6 hours: call.skipped retry_expired, the retry is spent, firstDueAt never moves', async () => {
+    await deferred();
+    world.limits.claims.set(cooldownKey('org-a', MEMBER_ID), { token: 'x', expiresAtS: FAR });
+    advanceMinutes(60);
+    const firstDue = (record().deferral as { dueAt: string }).dueAt;
+    let last = { expired: 0, rescheduled: 0 };
+    for (let i = 0; i < 40 && !last.expired; i++) {
+      last = await sweep();
+      if ((record().deferral as { firstDueAt?: string }).firstDueAt) expect((record().deferral as { firstDueAt?: string }).firstDueAt).toBe(firstDue);
+      expect(Date.parse((record().deferral as { dueAt: string }).dueAt)).toBeLessThanOrEqual(Date.parse(firstDue) + 6 * 3_600_000 + 60_000);
+      advanceMinutes(15);
+    }
+    expect(last.expired).toBe(1);
+    expect(eventsOf('lead-a').filter((e) => e === 'call.skipped')).toHaveLength(2); // member_cooldown, then the expiry note
+    expect(skips()).toEqual(['member_cooldown', 'retry_expired']);
+    expect(record().retryClaimToken).toEqual(expect.any(String));
+    expect(world.provider.placedCalls).toHaveLength(1);
+    expect(await sweep()).toMatchObject({ found: 0 });
+  });
+
+  it('a stale token cannot release a newer claim (token guard), and the holder\'s own token can', async () => {
+    await deferred();
+    const store = getLeadCallStore();
+    const jobKey = String(record().jobKey);
+    expect(await store.claimRetry(LIST, 'lead-a', jobKey, 'token-new')).toBe(true);
+    expect(await store.releaseRetryClaim(LIST, 'lead-a', 'token-stale', { dueAt: new Date().toISOString(), firstDueAt: new Date().toISOString() })).toBe(false);
+    expect(record().retryClaimToken).toBe('token-new');
+    expect(await store.releaseRetryClaim(LIST, 'lead-a', 'token-new', { dueAt: '2026-10-19T19:00:00.000Z', firstDueAt: '2026-10-19T18:00:00.000Z' })).toBe(true);
+    expect(record().retryClaimToken).toBeUndefined();
+    expect(record().deferral).toEqual({ dueAt: '2026-10-19T19:00:00.000Z', count: 1, firstDueAt: '2026-10-19T18:00:00.000Z' });
+    // A claimed-then-restarted record is not released by anyone: the retry started a real call.
+    expect(await store.claimRetry(LIST, 'lead-a', jobKey, 'token-2')).toBe(true);
+    expect(await store.restartForRetry(LIST, 'lead-a', { jobKey, token: 'token-2' }, { jobKey: 'j2', startedAt: new Date().toISOString(), memberId: MEMBER_ID, claimToken: 'c', leadPhoneMac: 'm' })).toBe(true);
+    expect(await store.releaseRetryClaim(LIST, 'lead-a', 'token-2', { dueAt: new Date().toISOString(), firstDueAt: new Date().toISOString() })).toBe(false);
+  });
+
+  describe('more than six hours late', () => {
+    const note = () => (world.crm.lead(LIST, 'lead-a').engagements ?? []).filter((e) => e.eventType === 'call.skipped' && (e.eventData as { reason: string }).reason === 'retry_expired');
+
+    it('with the windows open at run time: expired with a call.skipped retry_expired note and no call', async () => {
+      await deferred();
+      setClock('2026-10-20T18:00:00.000Z'); // a day later, 13:00 CT: both windows open
+      expect(await sweep()).toMatchObject({ expired: 1, rescheduled: 0, attempted: 0 });
+      expect(note()).toHaveLength(1);
+      expect(world.provider.placedCalls).toHaveLength(1);
+    });
+
+    it('with the windows CLOSED at run time: the expiry wins over the reschedule', async () => {
+      await deferred();
+      setClock('2026-10-20T04:00:00.000Z'); // 23:00 CT the same evening: 10 hours late, lead window closed
+      expect(await sweep()).toMatchObject({ expired: 1, rescheduled: 0 });
+      expect(note()).toHaveLength(1);
+      expect((record().deferral as { dueAt: string }).dueAt).toBe('2026-10-19T18:00:00.000Z'); // not moved
+    });
+
+    it('with five other skip events already on the lead (the per-lead cap) the note is still written', async () => {
+      await deferred();
+      const lead = world.crm.lead(LIST, 'lead-a');
+      lead.engagements = [...(lead.engagements ?? []), ...['a', 'b', 'c', 'd', 'e'].map((r, i) => ({ eventType: 'call.skipped', eventData: { reason: `old_${r}` }, createdAt: '2026-10-19T00:00:00.000Z', eventId: `x${i}` }))];
+      setClock('2026-10-20T18:00:00.000Z');
+      expect(await sweep()).toMatchObject({ expired: 1 });
+      expect(note()).toHaveLength(1);
     });
   });
 
@@ -488,14 +606,6 @@ const dueAgo = (minutes: number) => new Date(Date.now() - minutes * 60_000).toIS
 beforeEach(() => { seeded = 0; });
 
 describe('bounds of one run', () => {
-  it('starts at most 20 retries per run and says it stopped short', async () => {
-    for (let i = 0; i < 25; i++) seedDeferred(LIST, dueAgo(5));
-    const run = await sweep();
-    expect(run).toMatchObject({ found: 25, attempted: 20, truncated: true });
-    // The other five are still pending (unclaimed) for the next run.
-    expect(await sweep()).toMatchObject({ found: 5 });
-  });
-
   it('handles at most 100 due records per run (refused ones count), while not-due records do not use that up', async () => {
     for (let i = 0; i < 120; i++) seedDeferred(LIST, dueAgo(5), false);
     expect(await sweep()).toMatchObject({ found: 120, refused: 100, attempted: 0, truncated: true });
@@ -557,16 +667,6 @@ describe('processHotLeadCallRetry called directly', () => {
     world.warnSpy.mockClear();
     expect(await processHotLeadCallRetry(LIST, 'lead-a')).toBe('refused');
     expect(world.warnSpy.mock.calls.map((c) => String(c[0]))).toContain('[hotLeadCall] retry dropped after claim ctx_missing unknown_org');
-  });
-
-  it('a failing limit store after the claim leaves an error line, rethrows, and the sweep counts it as failed', async () => {
-    await deferred();
-    advanceMinutes(60);
-    world.limits.failKeyPrefix = { prefix: 'hlc#cap#', error: new Error('store down') };
-    world.warnSpy.mockClear();
-    expect(await sweep()).toMatchObject({ found: 1, failed: 1, attempted: 0 });
-    expect(world.warnSpy.mock.calls.map((c) => String(c[0]))).toContain('[hotLeadCall] retry dropped after claim error org-a');
-    expect(record().retryClaimToken).toEqual(expect.any(String));
   });
 
   it('counts the retry in the monthly notice (a retry is a real call)', async () => {

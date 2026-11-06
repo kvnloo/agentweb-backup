@@ -720,6 +720,7 @@ describe('abuse limits (reservation)', () => {
       transition: async () => true,
       claimRetry: async () => false,
       rescheduleRetry: async () => false,
+      releaseRetryClaim: async () => false,
       restartForRetry: async () => false,
       addEvent: async () => undefined,
     });
