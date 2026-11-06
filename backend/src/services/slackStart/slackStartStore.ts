@@ -6,7 +6,7 @@
  *   intake#<intakeId>          the intake: email, website, answers, step progress,
  *                              provisioning stamps, completion state
  *   domain#<company domain>    the dedupe lock: which intake owns this domain and the
- *                              hash of the Idempotency-Key that created it
+ *                              hash of the Idempotency-Key that created it (30-day TTL)
  *   rate#<scope>#<hash>#<win>  fixed-window rate-limit counter (expires via TTL)
  *
  * Everything that must hold across backend instances is a DynamoDB condition:
@@ -22,6 +22,12 @@ import type { AnswerField, AnswerValue } from './slackStartConfig';
 
 export const SLACK_START_TABLE = `${TABLE_PREFIX}AW-SlackStartIntakes`;
 export const SLACK_START_TTL_ATTRIBUTE = 'expiresAt';
+/**
+ * A domain lock lives 30 days. Long enough to dedupe a company's real signup burst;
+ * short enough that one abandoned intake cannot lock a company out for good.
+ * Intakes themselves carry no TTL: they are the durable record behind the user + lead.
+ */
+const DOMAIN_LOCK_TTL_SEC = 30 * 24 * 3600;
 
 export const SLACK_START_TABLE_SPEC: AWS.DynamoDB.CreateTableInput = {
   TableName: SLACK_START_TABLE,
@@ -96,7 +102,7 @@ const isTransactionConditionFailure = (err: any) =>
 
 function stripKey<T>(item: Record<string, unknown> | undefined): T | null {
   if (!item) return null;
-  const { pk: _pk, kind: _kind, ...rest } = item;
+  const { pk: _pk, kind: _kind, [SLACK_START_TTL_ATTRIBUTE]: _ttl, ...rest } = item;
   return rest as T;
 }
 
@@ -108,6 +114,7 @@ export function createDynamoSlackStartStore(client: DocClient = new AWS.DynamoDB
 
   return {
     async createIntake(intake, lock) {
+      const lockCreatedSec = Math.floor(Date.parse(lock.createdAt) / 1000);
       try {
         await client
           .transactWrite({
@@ -122,8 +129,11 @@ export function createDynamoSlackStartStore(client: DocClient = new AWS.DynamoDB
               {
                 Put: {
                   TableName: SLACK_START_TABLE,
-                  Item: { pk: `domain#${lock.domain}`, kind: 'domain', ...lock },
-                  ConditionExpression: 'attribute_not_exists(pk)',
+                  Item: { pk: `domain#${lock.domain}`, kind: 'domain', ...lock, [SLACK_START_TTL_ATTRIBUTE]: lockCreatedSec + DOMAIN_LOCK_TTL_SEC },
+                  // TTL deletion is lazy (up to ~48h), so an expired lock already counts as free.
+                  ConditionExpression: 'attribute_not_exists(pk) OR #expiresAt < :nowSec',
+                  ExpressionAttributeNames: { '#expiresAt': SLACK_START_TTL_ATTRIBUTE },
+                  ExpressionAttributeValues: { ':nowSec': lockCreatedSec },
                 },
               },
             ],

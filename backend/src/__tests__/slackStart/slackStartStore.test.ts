@@ -34,10 +34,22 @@ describe('DynamoDB slack-start store', () => {
     const items = calls.transactWrite[0].TransactItems;
     expect(items).toHaveLength(2);
     expect(items.map((i: any) => i.Put.Item.pk)).toEqual(['intake#i-1', 'domain#acme.co']);
-    for (const i of items) {
-      expect(i.Put.TableName).toBe(SLACK_START_TABLE);
-      expect(i.Put.ConditionExpression).toBe('attribute_not_exists(pk)');
-    }
+    for (const i of items) expect(i.Put.TableName).toBe(SLACK_START_TABLE);
+    expect(items[0].Put.ConditionExpression).toBe('attribute_not_exists(pk)');
+    // The intake is the durable record behind the user + lead: no TTL.
+    expect(items[0].Put.Item.expiresAt).toBeUndefined();
+  });
+
+  it('expires the domain lock after 30 days so an abandoned intake cannot block a company forever', async () => {
+    const { client, calls } = fakeClient();
+    await createDynamoSlackStartStore(client as any).createIntake(intake, lock);
+    const put = calls.transactWrite[0].TransactItems[1].Put;
+    const createdSec = Math.floor(Date.parse(lock.createdAt) / 1000);
+    expect(put.Item.expiresAt).toBe(createdSec + 30 * 24 * 3600);
+    // DynamoDB deletes expired items lazily (up to ~48h), so an expired lock must already count as free.
+    expect(put.ConditionExpression).toBe('attribute_not_exists(pk) OR #expiresAt < :nowSec');
+    expect(put.ExpressionAttributeNames).toEqual({ '#expiresAt': 'expiresAt' });
+    expect(put.ExpressionAttributeValues).toEqual({ ':nowSec': createdSec });
   });
 
   it('reports the existing lock (read consistently) when the domain is already taken', async () => {
@@ -117,7 +129,7 @@ describe('DynamoDB slack-start store', () => {
 
   it('reads a domain lock consistently by domain', async () => {
     const { client, calls, responses } = fakeClient();
-    responses.get.push(() => ({ Item: { pk: 'domain#acme.co', kind: 'domain', ...lock } }));
+    responses.get.push(() => ({ Item: { pk: 'domain#acme.co', kind: 'domain', expiresAt: 1, ...lock } }));
     await expect(createDynamoSlackStartStore(client as any).getDomainLock('acme.co')).resolves.toEqual(lock);
     expect(calls.get[0]).toEqual({ TableName: SLACK_START_TABLE, Key: { pk: 'domain#acme.co' }, ConsistentRead: true });
   });
