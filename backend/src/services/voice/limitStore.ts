@@ -11,6 +11,8 @@ import { errorCode, isConditionalFailure } from './setupWrites';
 export interface LimitStore {
   /** Adds one to the counter at `key` unless it already holds `cap`. False = at the cap, nothing written. */
   incrementBelow(key: string, cap: number, expiresAtS: number): Promise<boolean>;
+  /** The counter at `key` (0 when absent). A consistent read; used for customer notices only, never to decide a limit. */
+  read(key: string): Promise<number>;
   /** Gives a slot back (never below zero). Best-effort: a failure only burns the slot, which errs safe. */
   decrement(key: string): Promise<void>;
   /** Claims `key` for `token` unless a claim that has not yet expired exists (live while nowS < expiresAtS). */
@@ -24,7 +26,7 @@ export interface LimitStore {
 // An existing table with a native `ttl` attribute. Its only scan is the eval credential-cleanup inventory
 // (evaluationStore prepareCredentialCleanup), which filters on agentUserId, so `hlc#` rows are read by that scan
 // but never matched or touched. Not a new table or index: new key prefixes only (hlc#phone#, hlc#cool#, hlc#cap#h#,
-// hlc#cap#d#, hlc#dnc#, and the inbound hlc#cap#ih#, hlc#cap#id#, hlc#in#p#, hlc#in#c#).
+// hlc#cap#d#, hlc#cap#m#, hlc#notify#, hlc#dnc#, and the inbound hlc#cap#ih#, hlc#cap#id#, hlc#in#p#, hlc#in#c#).
 const LIMITS_TABLE = tableName('AW-MCPSessions');
 const PK = 'sessionId';
 
@@ -45,6 +47,11 @@ class DynamoLimitStore implements LimitStore {
       if (isConditionalFailure(err)) return false;
       throw err;
     }
+  }
+
+  async read(key: string): Promise<number> {
+    const { Item } = await dynamodb.get({ TableName: LIMITS_TABLE, Key: { [PK]: key }, ConsistentRead: true }).promise();
+    return Item && typeof Item.calls === 'number' ? Item.calls : 0;
   }
 
   async decrement(key: string): Promise<void> {

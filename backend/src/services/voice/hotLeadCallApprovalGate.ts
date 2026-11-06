@@ -128,6 +128,7 @@ export function checkAttendedForApproval<S extends { sessionType?: string }>(
 export interface EnableLimits {
   maxCallsPerHour: number;
   maxCallsPerDay: number;
+  maxCallsPerMonth: number;
   maxAttemptsPerLead: number;
   callingHours?: { start: string; end: string; timezone: string };
 }
@@ -155,7 +156,7 @@ function questionText(input: ApprovalQuestionInput): string {
       if (input.members.length === 0) throw new Error('The enable card needs the people who will be phoned');
       const { limits } = input;
       const hours = limits.callingHours ? `, only ${limits.callingHours.start}-${limits.callingHours.end} ${limits.callingHours.timezone}` : '';
-      return `Turn on hot lead calling? When a lead arrives from your landing page, AgentWeb will phone ${input.members.join(', ')} from your number${input.number ? ` ${input.number}` : ''}, and then the lead. Both calls are billed to the organization owner per minute at the current rate of ${input.priceText}, each rounded up to a whole minute. Limits: ${limits.maxCallsPerHour} leads per hour, ${limits.maxCallsPerDay} per day, at most ${limits.maxAttemptsPerLead} call attempts per lead${hours}. You can turn it off at any time.`;
+      return `Turn on hot lead calling? When a lead arrives from your landing page, AgentWeb will phone ${input.members.join(', ')} from your number${input.number ? ` ${input.number}` : ''}, and then the lead. Both calls are billed to the organization owner per minute at the current rate of ${input.priceText}, each rounded up to a whole minute. Limits: ${limits.maxCallsPerHour} leads per hour, ${limits.maxCallsPerDay} per day, ${limits.maxCallsPerMonth} per month, at most ${limits.maxAttemptsPerLead} call attempts per lead${hours}. You can turn it off at any time.`;
     }
   }
 }
