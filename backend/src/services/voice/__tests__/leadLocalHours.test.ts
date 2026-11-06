@@ -1,4 +1,4 @@
-import { isInsideLeadCallWindow } from '../leadLocalHours';
+import { callingHoursReachLeadWindow, isInsideLeadCallWindow } from '../leadLocalHours';
 
 const NY = '+12125550142';
 const HI = '+18085550142';
@@ -102,5 +102,41 @@ describe('fails closed', () => {
   });
   it('an invalid date is false', () => {
     expect(isInsideLeadCallWindow(NY, new Date('nope'))).toBe(false);
+  });
+});
+
+// Exact at minute resolution (a calling window shorter than the old 15-minute sampling step was reported as never reaching).
+// A window that exists only on a DST changeover day cannot occur: the hours are clock times that repeat every day.
+describe('callingHoursReachLeadWindow', () => {
+  const FROM = new Date('2026-10-19T12:00:07Z'); // a Monday, mid-minute on purpose
+  const reaches = (start: string, end: string, timezone: string) => callingHoursReachLeadWindow({ start, end, timezone }, FROM);
+
+  it('a 2-minute window inside the lead window reaches (12:04-12:06 Chicago = 13:04 Eastern)', () => {
+    expect(reaches('12:04', '12:06', 'America/Chicago')).toBe(true);
+  });
+  it.each([
+    ['the first minute of the lead window (13:00 Eastern)', '13:00', '13:01', true],
+    ['the last minute of the lead window (17:59 Eastern)', '17:59', '18:00', true],
+    ['the minute before the lead window (12:59 Eastern)', '12:59', '13:00', false],
+    ['the minute after the lead window (18:00 Eastern)', '18:00', '18:01', false],
+  ])('a one-minute window at %s: %s', (_n, start, end, expected) => {
+    expect(reaches(start, end, 'America/New_York')).toBe(expected);
+  });
+  it('a window that wraps past midnight and includes 14:00 Eastern reaches', () => {
+    expect(reaches('14:00', '02:00', 'America/New_York')).toBe(true);
+    expect(reaches('19:00', '12:59', 'America/New_York')).toBe(false); // wraps, but never inside 13:00-18:00
+  });
+  it('other zones: Asia/Kolkata 08:00-21:00 never reaches; Europe/London 18:00-23:00 does; Pacific/Auckland 20:00-23:00 (03:00-06:00 Eastern) does not; 06:00-09:00 (13:00-16:00 Eastern in NZDT) does', () => {
+    expect(reaches('08:00', '21:00', 'Asia/Kolkata')).toBe(false);
+    expect(reaches('18:00', '23:00', 'Europe/London')).toBe(true);
+    expect(reaches('20:00', '23:00', 'Pacific/Auckland')).toBe(false);
+    expect(reaches('06:00', '09:00', 'Pacific/Auckland')).toBe(true);
+  });
+  it('a 24-hour window reaches (start equal to end, and 00:00-23:59)', () => {
+    expect(reaches('00:00', '00:00', 'America/Chicago')).toBe(true);
+    expect(reaches('00:00', '23:59', 'Asia/Kolkata')).toBe(true);
+  });
+  it('no hours means no reach', () => {
+    expect(callingHoursReachLeadWindow(undefined as never, FROM)).toBe(false);
   });
 });

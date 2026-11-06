@@ -21,3 +21,8 @@ Owner-approved data-plane additions (Anurag): (1) new key family `hlc#dnc#<keyed
 
 NOT built: press 2 "call me again later" (one deferred retry). The job queue has no run-after, so no new infrastructure was
 invented and the prompt does not offer 2. Wording and options: `backend/docs/integrations/hot-lead-call.md`, Known follow-ups.
+
+### Fix: calling-hours/lead-window overlap check is exact (QA P1 on #3918)
+`callingHoursReachLeadWindow` no longer samples every 15 minutes (a calling window shorter than 15 minutes could fall between samples and block
+enabling). It now decides at minute resolution over eight days: the lead window is asked once per UTC hour (its edges are whole hours), and the
+org window is read twice per open hour with the minutes in between computed. Worst case (no overlap) about 75 ms cold.
