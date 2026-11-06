@@ -17,8 +17,12 @@ jest.mock('../services/db', () => ({
 }));
 jest.mock('../services/voice/voiceUsage', () => ({ recordCallUsage: jest.fn() }));
 jest.mock('../services/hotLeadCallAttempts', () => ({ requestNextHotLeadCallAttempt: jest.fn() }));
+// The lead-local window depends on the wall clock; held open by default, closed per test (the window itself is
+// covered by leadLocalHours.test.ts).
+jest.mock('../services/voice/leadLocalHours', () => ({ isInsideLeadCallWindow: jest.fn() }));
 
 import { crmDb, orgDb, userDb } from '../services/db';
+import { isInsideLeadCallWindow } from '../services/voice/leadLocalHours';
 import { recordCallUsage } from '../services/voice/voiceUsage';
 import { requestNextHotLeadCallAttempt } from '../services/hotLeadCallAttempts';
 import { nextAttemptOrFinish } from '../services/voice/callFinalisation';
@@ -109,6 +113,7 @@ const usage = () => mock(recordCallUsage).mock.calls.map((c) => c[0]);
 
 beforeEach(() => {
   jest.resetAllMocks();
+  mock(isInsideLeadCallWindow).mockReturnValue(true);
   process.env.BACKEND_URL = `${BASE}/`;
   process.env.JWT_SECRET = 'test-secret';
   mock(requestNextHotLeadCallAttempt).mockResolvedValue({ enqueued: false, reason: 'no_candidates' });
@@ -440,6 +445,17 @@ describe('records still in dialing (orchestrator has not stored the member CallS
 
 describe('POST /gather', () => {
   beforeEach(() => seed('member_answered'));
+
+  it('does not dial and tells the member when the lead window closed while the member was answering (lead_outside_hours)', async () => {
+    mock(isInsideLeadCallWindow).mockReturnValue(false);
+    const res = await gather('1');
+    expect(res.text).toContain('could not reach them');
+    expect(res.text).not.toContain('<Dial');
+    expect(res.text).not.toContain(LEAD_PHONE);
+    expect(isInsideLeadCallWindow).toHaveBeenCalledWith(LEAD_PHONE, expect.any(Date));
+    expect(store.record).toMatchObject({ state: 'member_answered', outcome: 'lead_outside_hours' });
+    expect(store.events).toEqual([{ type: 'call.failed', detail: { reason: 'lead_outside_hours' } }]);
+  });
 
   it('bridges on Digits=1: state bridging, Dial with the lead number from the lead row, status callback with leg=lead', async () => {
     const res = await gather('1');

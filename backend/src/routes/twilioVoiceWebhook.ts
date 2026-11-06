@@ -71,6 +71,7 @@ import { inboundCallerE164, reserveInboundSlot } from '../services/voice/inbound
 import { leadPhoneMacOf } from '../services/voice/leadPhoneMac';
 import { holdsClaim } from '../services/hotLeadCallPlacement';
 import { callableLeadPhone } from '../services/hotLeadCallConfig';
+import { isInsideLeadCallWindow } from '../services/voice/leadLocalHours';
 
 // type: () => true so a JSON or other content type is limited and parsed here too, instead of falling
 // through to the global 50mb express.json (the same trick as the unipile and tracker parsers).
@@ -339,6 +340,12 @@ router.post('/gather', guarded(async (_req, res, q, body) => {
   const leadE164 = await leadPhoneFor(q, ctx);
   if (!leadE164 || !ctx.config.twilioNumber) {
     await decide(q, ['member_answered'], answered('lead_phone_invalid'), 'call.failed', { reason: 'lead_phone_invalid' });
+    return sendXml(res, leadUnreachableTwiml());
+  }
+
+  // The member may have taken a while to answer: the lead's local window can have closed since the gates ran.
+  if (!isInsideLeadCallWindow(leadE164, new Date())) {
+    await decide(q, ['member_answered'], answered('lead_outside_hours'), 'call.failed', { reason: 'lead_outside_hours' });
     return sendXml(res, leadUnreachableTwiml());
   }
 
