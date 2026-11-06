@@ -643,13 +643,18 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
         return res.status(claim.record.responseStatus).json(claim.record.responseBody);
       }
       if (claim.outcome === 'in_progress') {
-        // The original is still being processed. Not a success (we cannot yet name its
-        // leadId) and not a failure: the same key retried shortly gets the original response.
+        // Usually the original is still being processed: not a success (we cannot yet name its
+        // leadId) and not a failure, and the same key retried shortly gets the original
+        // response. But a claim is never taken over, so one left in_progress by a crashed
+        // owner or a failure after a lead write may have started 409s forever for THIS
+        // submission (other keys are unaffected) until an operator checks the lead and clears
+        // the claim. Say so, so a client that keeps getting 409 escalates instead of looping.
         res.setHeader('Retry-After', '2');
         return res.status(409).json({
           success: false,
           retryable: true,
-          message: 'This submission is already being processed. Retry with the same submissionId.',
+          message: 'This submission is already being processed. Retry with the same submissionId. '
+            + 'If 409 persists for this submission, it needs operator reconciliation: contact support with the submissionId.',
         });
       }
       submissionClaim = { key: submissionKey, ownerToken: claim.ownerToken };
