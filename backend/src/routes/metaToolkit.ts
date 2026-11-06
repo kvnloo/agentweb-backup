@@ -16,6 +16,7 @@ import {
   MetaToolkitAuthError,
 } from '../mcp/metaToolkitGateway';
 import { getMetaToolkitManifest, MetaToolkitRefusal } from '../mcp/metaToolkitManifest';
+import { googleToolkitEnabled } from '../mcp/zomaToolDefinitions';
 import { rateLimiter } from '../middleware/rateLimiter';
 import { buildMcpAuthChallenge, getBackendUrl, META_TOOLKIT_MCP_RESOURCE_PATH } from '../mcp/oauth/authChallenge';
 
@@ -32,6 +33,17 @@ export function sendMetaToolkitError(res: Response, error: unknown) {
   }
   console.error('[meta-toolkit] call failed:', error instanceof Error ? error.message : error);
   return res.status(500).json({ error: 'Meta Toolkit call failed.' });
+}
+
+/**
+ * ENG-2823: Meta tools + Zoma tools, plus the Google Ads provider's tools while it is enabled.
+ * The Google manifest is loaded lazily so the Meta-only path never imports it.
+ */
+function toolkitManifest() {
+  if (!googleToolkitEnabled()) return getMetaToolkitManifest();
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { getGoogleToolkitManifest } = require('../mcp/googleToolkitManifest') as typeof import('../mcp/googleToolkitManifest');
+  return [...getMetaToolkitManifest(), ...getGoogleToolkitManifest()];
 }
 
 const router = Router();
@@ -57,7 +69,7 @@ router.get('/skill.md', (_req: Request, res: Response) => {
 router.get('/tools', async (req: Request, res: Response) => {
   try {
     await authenticateMetaToolkitCaller(req.headers.authorization);
-    return res.json({ tools: getMetaToolkitManifest() });
+    return res.json({ tools: toolkitManifest() });
   } catch (error) {
     return sendMetaToolkitError(res, error);
   }
@@ -146,7 +158,7 @@ router.post('/mcp', async (req: Request, res: Response) => {
         return rpcResult(res, id, {});
       case 'tools/list':
         await authenticateMetaToolkitCaller(req.headers.authorization);
-        return rpcResult(res, id, { tools: getMetaToolkitManifest() });
+        return rpcResult(res, id, { tools: toolkitManifest() });
       case 'tools/call': {
         if (typeof params.name !== 'string' || !params.name) {
           return rpcError(res, id, -32602, 'Invalid params: tools/call requires a tool name.');
