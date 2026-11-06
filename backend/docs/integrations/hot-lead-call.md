@@ -302,12 +302,29 @@ bridged conversation).
 
 Limits to know about:
 
-- **No cap on volume.** The outbound abuse limits (calls per hour/day, per-member cooldown, lead-phone dedupe) do **not** apply,
-  and there is no per-caller, hourly or daily cap of any kind: there is no lead, and anyone with the number can dial it. Each call
-  rings at most `maxAttemptsPerLead` members. The exposure is the member-leg minutes, billed to the org owner through the usage
-  ledger (and the same minutes on AgentWeb's Twilio bill), bounded only by Twilio's own geographic permissions and spend limits.
-  A separate ticket covers a cap; it is a go-live decision (item 15).
-- Callers are not screened or limited (no per-caller cap, no blocklist) and are not recorded in the lead timeline.
+- **Caps (ENG-2784).** `/inbound` takes one slot per call (`services/voice/inboundLimits.ts`, on the same limit store as
+  the outbound limits) once a member would really be rung (a call nobody can take costs nothing), before the ringing TwiML is
+  returned. In order: a retry marker keyed by the call's `CallSid`, the org's inbound hourly counter (2 x
+  `maxCallsPerHour`, UTC clock hour), the org's inbound daily counter (2 x `maxCallsPerDay`, org-local calendar day), then the
+  caller's hourly counter (3) and daily counter (6). Defaults with the config defaults (6 an hour, 20 a day): 12 an hour and 40
+  a day per org. The caller counters are keyed by an HMAC of the org and the caller's number (label `hot_lead_call.inbound_caller`),
+  never the number. A refused call hears the "nobody is available" message and is hung up; whatever was taken before the refusal
+  is given back, so a refused call costs nobody a slot. A Twilio redelivery of the same `/inbound` request (same `CallSid`) finds
+  its own marker and is admitted without counting again. The later steps (`/inbound-screen`, `/inbound-dial`,
+  `/inbound-status`) take no slot: a call costs one slot however many members it rings.
+  - **Fail closed.** If the limit store fails (or the request has no valid `CallSid`) the caller hears the unavailable message
+    and nobody is rung; one line `[hotLeadCall] inbound limits unavailable <error name>` is logged. A refusal logs one line
+    `[hotLeadCall] inbound capped <org_hourly|org_daily|caller_hourly|caller_daily> <orgId>`, suitable for a metric filter. No
+    number is logged.
+  - **Withheld callers.** The caller is read from the signed `From`, accepted only when it is exactly an E.164 number. A missing
+    or non-E.164 `From` (for example a withheld number) skips the caller counters, so a withheld caller is limited only by the
+    org caps. What Twilio sends in `From` for a withheld caller is not verified here (see
+    [Not verified](#not-verified-without-a-real-twilio-account)).
+  - **Accepted limits.** Fixed windows can admit up to 2x a cap across a boundary. A caller who rotates numbers or withholds
+    theirs, or many callers, can consume the org's inbound caps (denying real callbacks) but cannot exceed them; the cost
+    ceiling is the member-leg minutes of 2 x the outbound caps. A crash after the slot is taken keeps it. There is still no
+    blocklist, and the per-member cooldown and the lead-phone dedupe do not apply (there is no lead).
+- Callers are not recorded in the lead timeline.
 - The member prompt is the org's `announcedName` only; visitor-supplied text is never spoken.
 - A freshly provisioned number is pointed at `/inbound` by `buyNumber` (`voiceUrl`, POST). A number bought **before** this
   existed keeps its old voice URL until it is set by hand in the Twilio console (see [Go-live checklist](#go-live-checklist)).
@@ -778,7 +795,7 @@ No new table or index. The feature writes:
 | `vendor_rate_overrides` | AW-Settings item | admin Vendor Rates tab |
 | `system.hot_lead_call` (call record: `state`, `jobKey`, `startedAt`, `updatedAt`, `attemptNo`, `memberId`, `triedMemberIds`, `leadPhoneMac` (keyed HMAC of the lead's phone, see Org config), `claimToken` (random id of the writer that took an exclusive step, see Writes that commit and then report an error), `memberCallSid`, `leadCallSid`, `outcome`, `meteredLegs` (`member:<attempt>` and `lead`), `lastSequence`) | on the lead row (AW-Leads), no phone number | orchestrator and webhooks |
 | Timeline events `call.*` | the lead's `engagements` list | `LeadCallStore.addEvent` |
-| `hlc#phone#<hmac>`, `hlc#cool#<orgId>#<memberId>`, `hlc#cap#h#<orgId>#<UTC hour>`, `hlc#cap#d#<orgId>#<local date>` | existing table `AW-MCPSessions` (partition key `sessionId`, attribute `ttl`) | limit store |
+| `hlc#phone#<hmac>`, `hlc#cool#<orgId>#<memberId>`, `hlc#cap#h#<orgId>#<UTC hour>`, `hlc#cap#d#<orgId>#<local date>`, inbound: `hlc#cap#ih#<orgId>#<UTC hour>`, `hlc#cap#id#<orgId>#<local date>`, `hlc#in#p#h#<hmac>#<UTC hour>`, `hlc#in#p#d#<hmac>#<local date>`, `hlc#in#c#<CallSid>` | existing table `AW-MCPSessions` (partition key `sessionId`, attribute `ttl`) | limit store |
 
 Notes:
 
@@ -1294,9 +1311,10 @@ on anywhere.
     `${BACKEND_URL}/api/webhooks/twilio-voice/inbound`, HTTP POST, in the Twilio console. Until then a
     lead calling it hears whatever the number was left with. Then call it once from a phone that
     is not a team member's: the member should hear the "a lead is calling back" prompt.
-    Decide whether the unmetered inbound leg (see [Metering and spend](#metering-and-spend)) is acceptable, and accept in writing that
-    inbound callbacks have no per-caller, hourly or daily cap: anyone who learns the number can make it ring the team, and the
-    member-leg minutes are billed to the org owner with only Twilio's spend limits as a ceiling.
+    Decide whether the unmetered inbound leg (see [Metering and spend](#metering-and-spend)) is acceptable, and accept the inbound
+    caps (per org 2 x the outbound hourly/daily caps, per caller 3 an hour and 6 a day; see
+    [Inbound callbacks](#inbound-callbacks)): a caller who withholds their number is limited only by the org caps, which
+    bound the member-leg minutes billed to the org owner.
 16. Stuck-record sweep (ENG-2271): it ships report-only. After the first real calls, read the daily
     `[hotLeadCall] stuck call sweep completed` line and its `stuck call record: ...` warn lines (see
     [Stuck records](#stuck-records)): `found` should be 0 or explainable, `failed` 0, and every `would close` line a record you
@@ -1310,6 +1328,8 @@ on anywhere.
 None of these has been observed against Twilio. They are assumptions taken from
 Twilio's documentation and encoded in tests with synthetic payloads:
 
+- What `From` holds on `/inbound` for a withheld or unknown caller (ENG-2784). The code treats anything that is not exactly E.164 as
+  "no caller" and applies only the org caps; the exact value Twilio sends was not observed.
 - Inbound callbacks: that `To` on the voice-URL request is the dialled number in E.164; that a `<Dial>` to a member
   with `answerOnBridge` and a `<Number url>` screening step behaves as it does for the lead on an outbound call
   (a hang-up there ends the Dial with `completed` and `DialBridged=false`, which is what moves on to the next member);
@@ -1400,8 +1420,8 @@ Twilio's documentation and encoded in tests with synthetic payloads:
 - **Inbound minutes.** The caller's inbound leg of a callback is not metered (no inbound rate on the card); add a
   `voice_minute_inbound` rate. `/inbound-status` is the callback of the CHILD (member) leg; the caller's parent leg has no
   `statusCallback`, so metering it needs one on that leg (set on the number or on the call), or the bridged member leg's duration
-  as a proxy. Inbound callbacks also have no
-  per-caller or per-org rate limit; see [Inbound callbacks](#inbound-callbacks).
+  as a proxy. Inbound callbacks are capped per org and per caller
+  (ENG-2784); the caps are fixed constants (per caller) and multiples of the outbound caps (per org), not separately configurable.
 - **Missed-call Slack line.** The Slack alert does not say whether the call was
   placed, answered or declined; deliberately deferred so the Slack path stays
   untouched.
