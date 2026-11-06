@@ -410,8 +410,10 @@ describe('maxCallsPerMonth on the owner routes', () => {
   it.each([201, 1500, 2000])('refuses %i with the support message, and writes nothing', async value => {
     const errors = await fieldErrorsOf(put({ maxCallsPerMonth: value }));
     expect(errors.maxCallsPerMonth).toBe(OWNER_MONTHLY_LIMIT_REFUSAL);
-    expect(OWNER_MONTHLY_LIMIT_REFUSAL).toBe('Higher monthly limits are set by AgentWeb support');
     expect(table.writes).toEqual([]);
+  });
+  it('words the refusal for the owner', () => {
+    expect(OWNER_MONTHLY_LIMIT_REFUSAL).toBe('Higher monthly limits are set by AgentWeb support');
   });
   it.each([0, 2001, 1.5, '50', null])('refuses the invalid value %j', async value => {
     expect(Object.keys(await fieldErrorsOf(put({ maxCallsPerMonth: value })))).toContain('maxCallsPerMonth');
@@ -486,6 +488,9 @@ describe('read-out: Canada while Canadian calling is off', () => {
 });
 
 describe('read-out: calling hours that never meet the lead window', () => {
+  it('words the blocker with the Eastern hours the owner must include', () => {
+    expect(BLOCKER_NO_LEAD_OVERLAP).toContain('13:00 and 18:00 Eastern');
+  });
   const hours = (start: string, end: string, timezone = 'America/Chicago') => ({ callingHours: { start, end, timezone } });
   it('the default 08:00-21:00 hours and the fixture hours pass', async () => {
     for (const tz of ['America/Chicago', 'America/New_York', 'America/Los_Angeles']) {
@@ -504,7 +509,6 @@ describe('read-out: calling hours that never meet the lead window', () => {
     table.org.hotLeadCall = stored({ enabled: false, ...hours(start, end, tz) });
     const dto = await getHotLeadCallSettings(org(), OWNER);
     expect(dto).toMatchObject({ canEnable: false, blockers: [BLOCKER_NO_LEAD_OVERLAP] });
-    expect(BLOCKER_NO_LEAD_OVERLAP).toContain('13:00 and 18:00 Eastern');
     expect((await fieldErrorsOf(put({ enabled: true }))).enabled).toContain(BLOCKER_NO_LEAD_OVERLAP);
     expect(table.writes).toEqual([]);
   });

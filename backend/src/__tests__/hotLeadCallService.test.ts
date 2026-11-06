@@ -23,6 +23,7 @@ jest.mock('../services/voice/hotLeadCallContext', () => ({
   },
 }));
 import * as leadLocalHours from '../services/voice/leadLocalHours';
+import * as capNotices from '../services/voice/hotLeadCallCapNotices';
 import { crmDb, userDb, orgDb } from '../services/db';
 import * as queue from '../services/asyncJobQueue';
 import { emailService } from '../services/emailService';
@@ -886,10 +887,12 @@ describe('monthly cap and its owner notices (ENG-2783)', () => {
     return provider.placedCalls.length > before ? 'called' : store.events.map(e => e.detail?.reason).join();
   };
   const later = (minutes: number) => jest.setSystemTime(new Date(Date.parse(NOW) + minutes * 60_000));
-  // The notices are fire-and-forget: let their promise chains settle.
-  const flush = async () => { for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve)); };
+  // The notices are fire-and-forget; the spy passes through to the real function and keeps each returned promise (which
+  // never rejects), so flush() awaits the actual notice work instead of guessing how many ticks it needs.
+  let pending: Array<Promise<void>>;
+  const flush = async () => { await Promise.all(pending.splice(0)); };
   const send = () => mock(emailService.sendEmail);
-  const markers = (warn: jest.SpyInstance) => warn.mock.calls.map(c => String(c[0])).filter(m => m.includes('org monthly cap'));
+  const markers = (warn: jest.SpyInstance) => warn.mock.calls.map(c => String(c[0])).filter(m => m.includes('monthly cap'));
   let warn: jest.SpyInstance;
 
   const arrange = (cap: number) => {
@@ -897,14 +900,21 @@ describe('monthly cap and its owner notices (ENG-2783)', () => {
     mock(userDb.getUserById).mockResolvedValue({ userId: 'owner-a', orgId: 'org-a', email: 'owner@example.com' });
     send().mockResolvedValue('sent');
   };
-  beforeEach(() => { warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined); });
-  afterEach(() => warn.mockRestore());
+  // Submits leads 1..n two minutes apart (past the member cooldown), all expected to be called.
+  const callLeads = async (n: number, from = 1) => {
+    for (let i = from; i < from + n; i++) { later(i * 2); expect(await submit(i)).toBe('called'); await flush(); }
+  };
+  beforeEach(() => {
+    warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    pending = [];
+    const real = capNotices.notifyMonthlyCap;
+    jest.spyOn(capNotices, 'notifyMonthlyCap').mockImplementation(input => { const p = real(input); pending.push(p); return p; });
+  });
+  afterEach(() => { warn.mockRestore(); jest.restoreAllMocks(); });
 
   it('calls up to the cap, then skips as org_monthly_cap with a timeline event and no record; the other counters are given back', async () => {
     arrange(2);
-    expect(await submit(1)).toBe('called');
-    later(2);
-    expect(await submit(2)).toBe('called');
+    await callLeads(2);
     later(4);
     expect(await submit(3)).toBe('org_monthly_cap');
     expect(store.record).toBeNull();
@@ -914,16 +924,16 @@ describe('monthly cap and its owner notices (ENG-2783)', () => {
 
   it('sends the 80% notice once at ceil(0.8 * cap) and the 100% notice once at the first refusal, with the approved copy', async () => {
     arrange(5);
-    for (let i = 1; i <= 3; i++) { later(i * 2); expect(await submit(i)).toBe('called'); await flush(); }
+    await callLeads(3);
     expect(send()).not.toHaveBeenCalled();
-    later(8); expect(await submit(4)).toBe('called'); await flush();
+    await callLeads(1, 4);
     expect(send()).toHaveBeenCalledTimes(1);
     expect(send().mock.calls[0].slice(0, 3)).toEqual([
       'owner@example.com',
       'Your hot-lead calling is at 80% of this month\'s limit',
       'Hot-lead calling has used 4 of your 5 automatic calls this month. Calls pause at 5 and resume on the 1st. Leads are still captured and you still get the usual alerts.',
     ]);
-    later(10); expect(await submit(5)).toBe('called'); await flush();
+    await callLeads(1, 5);
     expect(send()).toHaveBeenCalledTimes(1); // the second crossing does not resend
     later(12); expect(await submit(6)).toBe('org_monthly_cap'); await flush();
     expect(send()).toHaveBeenCalledTimes(2);
@@ -938,57 +948,99 @@ describe('monthly cap and its owner notices (ENG-2783)', () => {
     expect([...limits.claims.keys()].filter(k => k.startsWith('hlc#notify#')).sort()).toEqual(['hlc#notify#100#org-a#2026-10', 'hlc#notify#80#org-a#2026-10']);
   });
 
-  it('sends the notices again in the next month', async () => {
+  it('a cap of 1 sends no 80% email (it would be the cap itself): the first refusal sends the 100% email only', async () => {
     arrange(1);
-    expect(await submit(1)).toBe('called'); await flush(); // cap 1: 80% is 1, so the first call crosses it
-    later(2); expect(await submit(2)).toBe('org_monthly_cap'); await flush();
-    expect(send()).toHaveBeenCalledTimes(2);
-    jest.setSystemTime(new Date('2026-11-02T18:00:00.000Z')); // 13:00 Eastern, next month
-    expect(await submit(3)).toBe('called'); await flush();
-    jest.setSystemTime(new Date('2026-11-02T18:05:00.000Z'));
-    expect(await submit(4)).toBe('org_monthly_cap'); await flush();
-    expect(send()).toHaveBeenCalledTimes(4);
+    await callLeads(1);
+    expect(send()).not.toHaveBeenCalled();
+    later(4); expect(await submit(2)).toBe('org_monthly_cap'); await flush();
+    expect(send()).toHaveBeenCalledTimes(1);
+    expect(send().mock.calls[0][1]).toBe('Automatic hot-lead calls are paused until the 1st');
+    expect(markers(warn)).toEqual(['[hotLeadCall] org monthly cap 100% org-a']);
   });
 
-  it('a failing email does not fail the call and is retried at the next crossing', async () => {
+  it('sends the notices again in the next month', async () => {
+    arrange(5);
+    await callLeads(4);
+    later(12); expect(await submit(5)).toBe('called'); await flush();
+    later(14); expect(await submit(6)).toBe('org_monthly_cap'); await flush();
+    expect(send()).toHaveBeenCalledTimes(2);
+    for (const [i, at] of ['2026-11-02T18:00:00.000Z', '2026-11-02T18:02:00.000Z', '2026-11-02T18:04:00.000Z', '2026-11-02T18:06:00.000Z'].entries()) {
+      jest.setSystemTime(new Date(at)); expect(await submit(10 + i)).toBe('called'); await flush();
+    }
+    expect(send()).toHaveBeenCalledTimes(3); // the new month's 80% (4 of 5)
+  });
+
+  it('a failing 80% email does not fail the call and is retried at the next crossing', async () => {
     arrange(5);
     send().mockRejectedValue(new Error('smtp exploded for owner@example.com'));
-    for (let i = 1; i <= 4; i++) { later(i * 2); expect(await submit(i)).toBe('called'); }
-    await flush();
+    await callLeads(4);
     expect(provider.placedCalls).toHaveLength(4);
     expect(send()).toHaveBeenCalledTimes(1);
     expect(limits.claims.has('hlc#notify#80#org-a#2026-10')).toBe(false); // given back, so a later crossing retries
     expect(JSON.stringify(warn.mock.calls)).not.toContain('owner@example.com');
     send().mockResolvedValue('sent');
-    later(10); expect(await submit(5)).toBe('called'); await flush();
+    await callLeads(1, 5);
     expect(send()).toHaveBeenCalledTimes(2);
+    expect(markers(warn).filter(m => m === '[hotLeadCall] org monthly cap 80% org-a')).toHaveLength(2); // marker repeats with the retry
   });
 
-  it('a failed send reported by the email service (not thrown) also keeps the call and gives the claim back', async () => {
-    arrange(1);
+  it('a failed send reported by the email service (not thrown) also gives the 80% claim back', async () => {
+    arrange(5);
     send().mockResolvedValue('failed');
-    expect(await submit(1)).toBe('called'); await flush();
+    await callLeads(4);
     expect(limits.claims.has('hlc#notify#80#org-a#2026-10')).toBe(false);
   });
 
+  it.each([
+    ['thrown', () => send().mockRejectedValue(new Error('smtp exploded for owner@example.com'))],
+    ['reported as failed', () => send().mockResolvedValue('failed')],
+  ])('a 100%% send that fails (%s) keeps the claim, logs the fallback alarm and is not retried on the next refusal', async (_n, fail) => {
+    arrange(2);
+    await callLeads(2);
+    fail();
+    later(8); expect(await submit(3)).toBe('org_monthly_cap'); await flush();
+    expect(limits.claims.has('hlc#notify#100#org-a#2026-10')).toBe(true);
+    expect(markers(warn)).toContain('[hotLeadCall] monthly cap 100% notice failed org-a');
+    later(10); expect(await submit(4)).toBe('org_monthly_cap'); await flush();
+    expect(send()).toHaveBeenCalledTimes(1); // only the first refusal tried to send
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('owner@example.com');
+  });
+
   it('an email that never completes does not delay the call', async () => {
-    arrange(1);
+    arrange(5);
     send().mockReturnValue(new Promise(() => undefined));
-    expect(await submit(1)).toBe('called');
-    expect(provider.placedCalls).toHaveLength(1);
-    await flush();
+    for (let i = 1; i <= 4; i++) { later(i * 2); expect(await submit(i)).toBe('called'); }
+    expect(provider.placedCalls).toHaveLength(4);
+    for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
     expect(send()).toHaveBeenCalledTimes(1);
   });
 
   it.each([
-    ['the owner has no email', () => mock(userDb.getUserById).mockResolvedValue({ userId: 'owner-a', orgId: 'org-a' })],
-    ['the org has no owner', () => { delete org.ownerUserId; }],
-  ])('sends no email and still logs the marker when %s', async (_n, change) => {
-    arrange(1);
-    change();
-    expect(await submit(1)).toBe('called'); await flush();
+    ['80%', 5, 4, 1, '80%'],
+    ['100%', 2, 2, 1, '100%'],
+  ])('sends no %s email and still logs the marker when the owner has no email', async (_n, cap, calls, refusals, pct) => {
+    arrange(cap);
+    mock(userDb.getUserById).mockResolvedValue({ userId: 'owner-a', orgId: 'org-a' });
+    await callLeads(calls);
+    if (pct === '100%') { later(20); expect(await submit(99)).toBe('org_monthly_cap'); await flush(); }
+    expect(refusals).toBe(1);
     expect(send()).not.toHaveBeenCalled();
-    expect(markers(warn)).toEqual(['[hotLeadCall] org monthly cap 80% org-a']);
+    expect(markers(warn)).toContain(`[hotLeadCall] org monthly cap ${pct} org-a`);
+  });
+
+  it('sends no email and still logs the marker when the org has no owner', async () => {
+    arrange(5);
+    delete org.ownerUserId;
+    await callLeads(4);
+    expect(send()).not.toHaveBeenCalled();
+    expect(markers(warn)).toContain('[hotLeadCall] org monthly cap 80% org-a');
+  });
+
+  it('logs the 100% marker after a monthly refusal', async () => {
+    arrange(2);
+    await callLeads(2);
+    later(8); expect(await submit(3)).toBe('org_monthly_cap'); await flush();
+    expect(markers(warn)).toContain('[hotLeadCall] org monthly cap 100% org-a');
   });
 
   it('sends nothing for a refusal by another limit', async () => {

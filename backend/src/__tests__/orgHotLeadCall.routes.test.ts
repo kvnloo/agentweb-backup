@@ -336,11 +336,11 @@ describe('POST members/:memberId/verification/confirm', () => {
 describe('GET /preview', () => {
   it('lists who would be called at the given instant, in call order', async () => {
     (table.org.hotLeadCall as { team: Array<Record<string, unknown>> }).team[1].verifiedAt = '2026-01-01T00:00:00.000Z';
-    // Tuesday 2026-10-20 11:00 Chicago time.
-    const res = await api().get(`${BASE}/preview`).query({ at: '2026-10-20T16:00:00Z' });
+    // Tuesday 2026-10-20 13:00 Chicago time (14:00 Eastern: inside the lead window).
+    const res = await api().get(`${BASE}/preview`).query({ at: '2026-10-20T18:00:00Z' });
     expect(res.status).toBe(200);
     expect(res.body).toEqual({
-      at: '2026-10-20T16:00:00.000Z', timezone: 'America/Chicago', outsideCallingHours: false, outsideLeadHours: true, skipReason: 'outside_lead_hours',
+      at: '2026-10-20T18:00:00.000Z', timezone: 'America/Chicago', outsideCallingHours: false, outsideLeadHours: false, skipReason: null,
       warnings: ['Canadian numbers are not called yet; leads with a Canadian number are skipped even though Canada is allowed here'],
       candidates: [{ id: A, name: 'Dana Lee' }, { id: B, name: 'Sam Ortiz' }], excluded: [],
     });
