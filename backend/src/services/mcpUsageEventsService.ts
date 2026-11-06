@@ -77,6 +77,8 @@ export interface McpToolUseInput {
   sessionId?: string;
   llmModel?: string;
   userAgent?: string;
+  /** ENG-2823: ad platform a Zoma toolkit call ran against ('meta' | 'google_ads'). */
+  platform?: string;
   now?: Date;
 }
 
@@ -93,7 +95,7 @@ export interface McpUserUsage {
   end: string;
   toolCalls: number;
   writes: { total: number; confirmed: number; mismatch: number; unconfirmed: number };
-  recentWrites: Array<{ ts: string; entityType?: string; action?: string; verification?: string; objectId?: string }>;
+  recentWrites: Array<{ ts: string; platform?: string; entityType?: string; action?: string; verification?: string; objectId?: string }>;
 }
 
 export interface McpUsageReport {
@@ -292,6 +294,7 @@ export async function recordMcpToolUse(
       llmModel: cleanString(input.llmModel),
       toolName: input.toolName,
       userAgent: cleanString(input.userAgent),
+      platform: cleanString(input.platform),
     },
   });
 
@@ -323,6 +326,7 @@ export async function recordMcpWriteExecuted(
       sessionId: cleanString(input.sessionId),
       toolName: input.toolName,
       userAgent: cleanString(input.userAgent),
+      platform: cleanString(input.platform),
       entityType: input.entityType,
       action: input.action,
       verification: input.verification,
@@ -356,6 +360,7 @@ export async function getMcpUserUsage(
     writes: { total: writes.length, confirmed: count('CONFIRMED'), mismatch: count('MISMATCH'), unconfirmed: count('UNCONFIRMED') },
     recentWrites: writes.slice(-5).map((w) => ({
       ts: w.tsIso,
+      ...(w.dimensions.platform ? { platform: w.dimensions.platform } : {}),
       entityType: w.dimensions.entityType,
       action: w.dimensions.action,
       verification: w.dimensions.verification,

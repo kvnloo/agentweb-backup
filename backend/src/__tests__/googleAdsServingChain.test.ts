@@ -129,7 +129,8 @@ test.each(['campaign', 'adGroup'])('paused %s blocks', async level => {
   expect((await state()).state).toBe(level === 'campaign' ? 'BLOCKED_BY_CAMPAIGN' : 'BLOCKED_BY_AD_GROUP');
 });
 test('agent contract refuses unsupported live/spending claims and requires verifier evidence', () => {
-  for (const file of ['emma/tools.ts', 'docs/agentModeSystemPrompt.ts']) {
+  // ENG-2823: the call_google_ads_reporting_api description moved with its handler to emma/googleAdsTools.ts.
+  for (const file of ['emma/googleAdsTools.ts', 'docs/agentModeSystemPrompt.ts']) {
     const prompt = readFileSync(join(__dirname, '..', file), 'utf8');
     expect(prompt).toContain('mode="serving_chain"');
     expect(prompt).toContain('Never claim ads are live, serving, or spending from campaign or keyword status alone');
