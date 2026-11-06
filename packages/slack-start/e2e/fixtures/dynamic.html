@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Dynamic embed</title></head>
+<body>
+  <h1>Single-page app</h1>
+  <div id="app"></div>
+  <script src="/dist/slack-start.js" data-api-base="https://api.mock.test"></script>
+  <script>
+    // A framework renders the trigger well after the widget script ran.
+    setTimeout(function () {
+      var a = document.createElement('a');
+      a.href = '#';
+      a.textContent = 'Start in Slack (late)';
+      a.setAttribute('data-agentweb-slack-start', '');
+      document.getElementById('app').appendChild(a);
+    }, 400);
+  </script>
+</body></html>
