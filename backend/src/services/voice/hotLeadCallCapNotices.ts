@@ -2,9 +2,6 @@ import { getLimitStore } from './limitStore';
 import { localMonth, limitTimeZone, MONTH_TTL_S } from './hotLeadCallLimits';
 import type { HotLeadCallConfig } from '../hotLeadCallConfig';
 
-// The error's name only: a send error's message can carry the recipient's address.
-const errorName = (err: unknown): string => (err instanceof Error ? err.name : 'error');
-
 /**
  * Customer and alarm notices of the monthly cap (ENG-2783). The org owner gets ONE email at 80% and ONE at 100% of the
  * cap per org-local month, de-duplicated by a claim in the limit store (hlc#notify#80# / hlc#notify#100#). Best-effort
@@ -12,6 +9,10 @@ const errorName = (err: unknown): string => (err instanceof Error ? err.name : '
  */
 
 type NoticePercent = 80 | 100;
+
+// The error's name only: a send error's message can carry the recipient's address. Kept local rather than imported from
+// callFinalisation.ts, whose imports (db, attempts, usage metering) this lazily loaded path must not pull in.
+const errorName = (err: unknown): string => (err instanceof Error ? err.name : 'error');
 
 export const noticeKey = (percent: NoticePercent, orgId: string, month: string): string => `hlc#notify#${percent}#${orgId}#${month}`;
 /** The count at which the 80% notice is due: ceil(0.8 * cap), written in integers so 0.8 * 5 never lands on 4.000000001. */
@@ -58,13 +59,21 @@ async function notifyOnce(percent: NoticePercent, input: { orgId: string; ownerU
     outcome = 'failed';
   }
   if (outcome === 'skipped') console.warn(`[hotLeadCall] monthly cap ${percent}% notice not sent: no owner email`, { orgId });
-  // A failed send gives the claim back so the next crossing retries; a skip (no owner or email) has nothing to retry yet.
-  if (outcome === 'failed') await store.release(key, token);
+  if (outcome !== 'failed') return;
+  if (percent === 80) {
+    // Retried at the next crossing: bounded, because each lead that counts is itself bounded by the hourly cap.
+    await store.release(key, token);
+  } else {
+    // Kept: every refused lead after the cap would otherwise redo lookup + send + release during a provider outage.
+    // The alarm fallback is this line (no address).
+    console.warn(`[hotLeadCall] monthly cap 100% notice failed ${orgId}`);
+  }
 }
 
 /**
  * Fire-and-forget: sends the 80% notice once the month's count has reached ceil(0.8 * cap) (`used` >= the threshold,
- * not ==, because two racing leads can both read past it) and the 100% notice when the cap refused a lead.
+ * not ==, because two racing leads can both read past it) and the 100% notice when the cap refused a lead. A cap of 1 to 4
+ * has no separate 80% notice (ceil(0.8 * cap) would be the cap itself): only the 100% notice is sent.
  * The returned promise never rejects; the caller must not await it on the call path.
  */
 export function notifyMonthlyCap(input: {
@@ -76,7 +85,10 @@ export function notifyMonthlyCap(input: {
   const run = async (): Promise<void> => {
     if (event.kind === 'refused') {
       await notifyOnce(100, { ...input, used: config.maxCallsPerMonth, now });
-    } else if (event.used !== undefined && event.used >= eightyPercentOf(config.maxCallsPerMonth)) {
+      return;
+    }
+    const threshold = eightyPercentOf(config.maxCallsPerMonth);
+    if (event.used !== undefined && threshold < config.maxCallsPerMonth && event.used >= threshold) {
       await notifyOnce(80, { ...input, used: event.used, now });
     }
   };

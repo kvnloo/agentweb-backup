@@ -233,12 +233,20 @@ describe('monthly cap (ENG-2783)', () => {
       ['Chicago, UTC is already November but local is not', 'America/Chicago', '2026-11-01T03:00:00Z', '2026-10'],
       ['Los Angeles, the instant the DST-end day starts (PDT)', 'America/Los_Angeles', '2026-11-01T06:59:59Z', '2026-10'],
       ['Los Angeles, the same month after it starts', 'America/Los_Angeles', '2026-11-01T07:00:00Z', '2026-11'],
-      ['Chicago, end of March, before spring-forward month effects', 'America/Chicago', '2026-04-01T04:59:59Z', '2026-03'],
-      ['Chicago, start of April', 'America/Chicago', '2026-04-01T05:00:00Z', '2026-04'],
+      ['Chicago, last second of March (CDT, after the 8 March spring-forward)', 'America/Chicago', '2026-04-01T04:59:59Z', '2026-03'],
+      ['Chicago, first second of April', 'America/Chicago', '2026-04-01T05:00:00Z', '2026-04'],
+      ['Chicago, 1 March in standard time (CST), just before the first instant', 'America/Chicago', '2026-03-01T05:59:59Z', '2026-02'],
+      ['Chicago, 1 March in standard time (CST), first instant', 'America/Chicago', '2026-03-01T06:00:00Z', '2026-03'],
+      ['Auckland (NZDT, UTC+13), last second of October local', 'Pacific/Auckland', '2026-10-31T10:59:59Z', '2026-10'],
+      ['Auckland, first instant of November local (UTC is still 31 October)', 'Pacific/Auckland', '2026-10-31T11:00:00Z', '2026-11'],
+      ['Kolkata (UTC+5:30), already the 1st locally', 'Asia/Kolkata', '2026-10-31T18:30:00Z', '2026-11'],
+      ['Kolkata, one second before the local 1st', 'Asia/Kolkata', '2026-10-31T18:29:59Z', '2026-10'],
       ['Chicago, 31 Dec to 1 Jan (CST)', 'America/Chicago', '2027-01-01T06:00:00Z', '2027-01'],
     ])('%s', (_n, tz, iso, month) => {
       expect(localMonth(tz, new Date(iso))).toBe(month);
-      expect(monthlyCapKey('o', tz, new Date(iso))).toBe(`hlc#cap#m#o#${month}`);
+    });
+    it('builds the key from orgId and the local month', () => {
+      expect(monthlyCapKey('org-x', 'America/Chicago', new Date('2026-11-01T05:00:00Z'))).toBe('hlc#cap#m#org-x#2026-11');
     });
 
     it('starts a fresh count on the 1st in the org zone, not at UTC midnight', async () => {
@@ -250,8 +258,12 @@ describe('monthly cap (ENG-2783)', () => {
       expect((await reserve(cfg, firstOfNov)).ok).toBe(true);
     });
 
-    it('uses UTC when the org has no calling hours', () => {
-      expect(monthlyCapKey('o', 'UTC', new Date('2026-11-01T00:00:00Z'))).toBe('hlc#cap#m#o#2026-11');
+    it('uses the UTC month when the org has no calling hours', async () => {
+      const noHours = { ...capped(5) } as Partial<HotLeadCallConfig>;
+      delete noHours.callingHours;
+      expect((await reserve(noHours as HotLeadCallConfig, new Date('2026-10-31T23:30:00Z'))).ok).toBe(true);
+      expect((await reserve(noHours as HotLeadCallConfig, new Date('2026-11-01T00:30:00Z'))).ok).toBe(true);
+      expect([...limits.counters.keys()].filter(k => k.startsWith('hlc#cap#m#')).sort()).toEqual(['hlc#cap#m#o#2026-10', 'hlc#cap#m#o#2026-11']);
     });
   });
 
