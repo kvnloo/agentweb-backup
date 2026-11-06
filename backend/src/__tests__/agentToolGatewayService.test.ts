@@ -358,6 +358,64 @@ describe('agentToolGatewayService', () => {
         expect(result.repairs).toEqual([]);
       });
 
+      describe('fill_form elements alias -> fields (ENG-2791)', () => {
+        // Repro from live telemetry: playwright_browser_fill_form {"elements": [...]} rejected with
+        // 'Unknown argument "elements". Allowed arguments: fields. Missing required argument "fields".'
+        const fillFormSchema = {
+          type: 'object',
+          properties: {
+            fields: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  name: { type: 'string' },
+                  type: { type: 'string' },
+                  ref: { type: 'string' },
+                  value: { type: 'string' },
+                },
+              },
+            },
+          },
+          required: ['fields'],
+          additionalProperties: false,
+        };
+        const fieldList = [{ name: 'Email', type: 'textbox', ref: 'e12', value: 'a@b.co' }];
+
+        it('maps elements to fields with the same field list', () => {
+          const result = validateAndRepairToolArgs({
+            toolName: 'playwright_browser_fill_form',
+            args: { elements: fieldList },
+            inputSchema: fillFormSchema,
+            effect: 'internal_write',
+          });
+          expect(result.status).toBe('repaired');
+          expect(result.args).toEqual({ fields: fieldList });
+          expect(result.repairs).toEqual(expect.arrayContaining(['elements->fields']));
+        });
+
+        it('does not apply the elements alias to other tools declaring fields', () => {
+          const result = validateAndRepairToolArgs({
+            toolName: 'get_meta_ads_insights',
+            args: { elements: ['spend'] },
+            inputSchema: { ...fillFormSchema, properties: { fields: { type: 'array', items: { type: 'string' } } } },
+            effect: 'read',
+          });
+          expect(result.status).toBe('invalid');
+          expect(result.repairs).not.toContain('elements->fields');
+        });
+
+        it('still rejects genuinely unknown arguments', () => {
+          const result = validateAndRepairToolArgs({
+            toolName: 'playwright_browser_fill_form',
+            args: { fields: fieldList, bogus: 1 },
+            inputSchema: fillFormSchema,
+            effect: 'internal_write',
+          });
+          expect(result.status).toBe('invalid');
+        });
+      });
+
       describe('evaluate source alias -> function (ENG-2473)', () => {
         // Repro from live telemetry: playwright_browser_evaluate {"expression": "..."} rejected with
         // 'Unknown argument "expression". ... Missing required argument "function".'
