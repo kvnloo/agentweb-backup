@@ -193,6 +193,31 @@ describe('ENG-2837 forward-lead submission idempotency', () => {
     expect(sideEffectCounts()).toMatchObject({ createLead: 1, capi: 1 });
   });
 
+  it('a malformed higher-priority key does not mask a valid submissionId: still dedupes', async () => {
+    for (const bad of [12345, '   ', 'has spaces!', { nested: true }]) {
+      jest.clearAllMocks();
+      const body = flatfee({ idempotencyKey: bad, submissionId: `valid-under-${typeof bad}-${String(bad).length}` });
+      const first = await request(app).post('/api/webhooks/forward-lead').send(body);
+      await flush();
+      const second = await request(app).post('/api/webhooks/forward-lead').send(body);
+      await flush();
+      expect(second.headers['idempotent-replayed']).toBe('true');
+      expect(second.body).toEqual(first.body);
+      expect(sideEffectCounts()).toMatchObject({ createLead: 1, capi: 1 });
+    }
+  });
+
+  it('malformed top-level keys fall through to a valid customFields.submissionId', async () => {
+    const body = flatfee({ idempotencyKey: '', submissionId: 987654321, customFields: { submissionId: 'nested-after-bad-0001' } });
+    const first = await request(app).post('/api/webhooks/forward-lead').send(body);
+    await flush();
+    const second = await request(app).post('/api/webhooks/forward-lead').send(body);
+    await flush();
+    expect(second.headers['idempotent-replayed']).toBe('true');
+    expect(second.body).toEqual(first.body);
+    expect(sideEffectCounts()).toMatchObject({ createLead: 1, capi: 1 });
+  });
+
   it('the /api/leads/public/:listId alias is idempotent too', async () => {
     const body = flatfee({ listId: undefined });
     const first = await request(app).post('/api/leads/public/list_1').send(body);
@@ -270,6 +295,10 @@ describe('ENG-2837 forward-lead submission idempotency', () => {
     await flush();
     expect(retry.status).toBe(409);
     expect(retry.body).toMatchObject({ success: false, retryable: true });
+    // A claim stuck after a possible write never clears by itself: the 409 must say a
+    // persistent 409 for this one submission needs operator reconciliation.
+    expect(retry.body.message).toMatch(/persist/i);
+    expect(retry.body.message).toMatch(/reconcil/i);
     expect(sideEffectCounts()).toMatchObject({ createLead: 1, dispatch: 0, capi: 0, crmSync: 0 });
     expect(claimItems()).toEqual([expect.objectContaining({ status: 'in_progress' })]);
   });
