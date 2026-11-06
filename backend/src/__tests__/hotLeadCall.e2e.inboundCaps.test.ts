@@ -10,21 +10,23 @@ jest.mock('../services/usageRecorderService', () => ({ ...jest.requireActual('..
 jest.mock('../services/leadNotificationLookup', () => ({ notificationLookup: { pages: jest.fn(), campaigns: jest.fn() } }));
 jest.mock('@slack/web-api', () => ({ WebClient: jest.fn() }));
 
-import { setHotLeadCallEnabledOverride } from '../services/voice/hotLeadCallMode';
-import { setHotLeadCallEntitledOverride } from '../services/voice/hotLeadCallEntitlement';
 import { resetInboundNumberIndexForTests } from '../services/voice/inboundNumberIndex';
 import { inboundVoiceUrl } from '../services/voice/voiceUrls';
 import { INBOUND_NOBODY_COPY, INBOUND_UNAVAILABLE_COPY } from '../services/voice/twiml';
-import { inboundCallerE164, inboundCallMarkerKey } from '../services/voice/inboundLimits';
-import { sayText } from './helpers/hotLeadCallTwilioSim';
+import { CALLER_MAX_PER_DAY, CALLER_MAX_PER_HOUR, inboundCallerE164, inboundCallMarkerKey, reserveInboundSlot } from '../services/voice/inboundLimits';
+import type { HotLeadCallConfig } from '../services/hotLeadCallConfig';
+import { attrOf, sayText } from './helpers/hotLeadCallTwilioSim';
 import { teamMember } from './helpers/hotLeadCallFixtures';
-import { MEMBER_PHONE, TWILIO_NUMBER, callConfig, chicago, installWorld, setClock, world } from './helpers/hotLeadCallE2eWorld';
+import { MEMBER_PHONE, TWILIO_NUMBER, advanceMinutes, callConfig, installWorld, world } from './helpers/hotLeadCallE2eWorld';
 
 installWorld();
 
 const CALLER = '+12125550142';
 const OTHER_CALLER = '+12125550143';
+const THIRD_CALLER = '+12125550144';
 const SECOND_PHONE = '+14155550102';
+const CALLER_DIGITS = '2125550142';
+const MARKER_TTL_S = 3600;
 
 function configure(over: Record<string, unknown> = {}) {
   const org = world.crm.orgs.get('org-a')!;
@@ -42,35 +44,43 @@ beforeEach(() => {
 
 let sidSeq = 0;
 const nextSid = () => `CA3${String(++sidSeq).padStart(7, '0')}`;
+const callParams = (callSid: string | undefined, from: string | undefined): Record<string, string> => ({
+  AccountSid: 'AC00000000000000000000000000000000', Direction: 'inbound', To: TWILIO_NUMBER, CallStatus: 'ringing',
+  ...(callSid === undefined ? {} : { CallSid: callSid }),
+  ...(from === undefined ? {} : { From: from }),
+});
 /** One inbound call from `from` (a fresh CallSid unless given). */
-const callFrom = (from: string | undefined, callSid = nextSid()) =>
-  world.twilio.post(inboundVoiceUrl(), {
-    AccountSid: 'AC00000000000000000000000000000000', Direction: 'inbound', To: TWILIO_NUMBER, CallSid: callSid, CallStatus: 'ringing',
-    ...(from === undefined ? {} : { From: from }),
-  });
+const callFrom = (from: string | undefined, callSid: string | undefined = nextSid()) => world.twilio.post(inboundVoiceUrl(), callParams(callSid, from));
 const rings = (body: string) => body.includes('<Dial answerOnBridge="true"');
 const capped = (body: string) => expect(sayText(body)).toBe(INBOUND_NOBODY_COPY);
-const warns = () => world.consoleSpies[1].mock.calls.map((c) => c.join(' '));
+const unavailable = (body: string) => {
+  expect(sayText(body)).toBe(INBOUND_UNAVAILABLE_COPY);
+  expect(body).not.toContain('<Dial');
+};
+const warns = () => world.warnSpy.mock.calls.map((c) => c.join(' '));
 const counter = (prefix: string) => [...world.limits.counters].filter(([k]) => k.startsWith(prefix));
+const held = () => [...world.limits.counters].filter(([, n]) => n > 0);
+const nowS = () => Math.floor(Date.now() / 1000);
+const reserveConfig = (over: Partial<HotLeadCallConfig> = {}) => ({ maxCallsPerHour: 6, maxCallsPerDay: 20, ...over }) as HotLeadCallConfig;
 
 describe('per-caller caps', () => {
-  it('allows 3 calls an hour from one caller and refuses the 4th with the nobody copy', async () => {
-    for (let i = 0; i < 3; i++) expect(rings((await callFrom(CALLER)).body)).toBe(true);
-    const fourth = await callFrom(CALLER);
-    capped(fourth.body);
-    expect(fourth.body).not.toContain('<Dial');
+  it('allows 3 calls an hour from one caller and refuses the next with the nobody copy', async () => {
+    for (let i = 0; i < CALLER_MAX_PER_HOUR; i++) expect(rings((await callFrom(CALLER)).body)).toBe(true);
+    const refused = await callFrom(CALLER);
+    capped(refused.body);
+    expect(refused.body).not.toContain('<Dial');
     expect(warns()).toContain('[hotLeadCall] inbound capped caller_hourly org-a');
   });
 
-  it('allows 6 calls a local day from one caller (spread over hours) and refuses the 7th', async () => {
-    for (let h = 12; h < 18; h++) {
-      setClock(chicago(`${h}:00`));
+  it('allows 6 calls a local day (spread over hours), refuses the next, and the next local day starts over', async () => {
+    advanceMinutes(0);
+    for (let h = 0; h < CALLER_MAX_PER_DAY; h++) {
       expect(rings((await callFrom(CALLER)).body)).toBe(true);
+      advanceMinutes(60);
     }
-    setClock(chicago('18:00'));
     capped((await callFrom(CALLER)).body);
     expect(warns()).toContain('[hotLeadCall] inbound capped caller_daily org-a');
-    setClock(chicago('12:00').replace('-19T', '-20T')); // the next local day starts over
+    advanceMinutes(24 * 60);
     expect(rings((await callFrom(CALLER)).body)).toBe(true);
   });
 
@@ -79,15 +89,24 @@ describe('per-caller caps', () => {
     expect(rings((await callFrom(OTHER_CALLER)).body)).toBe(true);
   });
 
-  it('a caller-cap refusal gives back the org slots and takes no retry marker', async () => {
-    for (let i = 0; i < 3; i++) await callFrom(CALLER);
+  it('a caller_hourly refusal never touches the org counters', async () => {
+    for (let i = 0; i < CALLER_MAX_PER_HOUR; i++) await callFrom(CALLER);
     const before = [...world.limits.counters];
     const sid = nextSid();
     capped((await callFrom(CALLER, sid)).body);
     expect([...world.limits.counters]).toEqual(before);
     expect(world.limits.claims.has(inboundCallMarkerKey(sid))).toBe(false);
-    expect(counter('hlc#cap#ih#').map(([, n]) => n)).toEqual([3]);
-    expect(counter('hlc#cap#id#').map(([, n]) => n)).toEqual([3]);
+    expect(counter('hlc#cap#ih#').map(([, n]) => n)).toEqual([CALLER_MAX_PER_HOUR]);
+  });
+
+  it('a caller_daily refusal releases the caller hourly slot it had taken', async () => {
+    for (let h = 0; h < CALLER_MAX_PER_DAY; h++) {
+      await callFrom(CALLER);
+      advanceMinutes(60);
+    }
+    const before = held();
+    capped((await callFrom(CALLER)).body);
+    expect(held()).toEqual(before);
   });
 });
 
@@ -96,7 +115,7 @@ describe('org caps (twice the outbound caps)', () => {
     configure({ maxCallsPerHour: 1 });
     expect(rings((await callFrom(CALLER)).body)).toBe(true);
     expect(rings((await callFrom(OTHER_CALLER)).body)).toBe(true);
-    capped((await callFrom('+12125550144')).body);
+    capped((await callFrom(THIRD_CALLER)).body);
     expect(warns()).toContain('[hotLeadCall] inbound capped org_hourly org-a');
   });
 
@@ -104,17 +123,33 @@ describe('org caps (twice the outbound caps)', () => {
     configure({ maxCallsPerDay: 1 });
     expect(rings((await callFrom(CALLER)).body)).toBe(true);
     expect(rings((await callFrom(OTHER_CALLER)).body)).toBe(true);
-    capped((await callFrom('+12125550144')).body);
+    capped((await callFrom(THIRD_CALLER)).body);
     expect(warns()).toContain('[hotLeadCall] inbound capped org_daily org-a');
   });
 
-  it('an org-daily refusal gives back the hourly slot it took first', async () => {
+  it('an org_daily refusal gives back the caller and org-hourly slots taken before it', async () => {
     configure({ maxCallsPerDay: 1 });
     await callFrom(CALLER);
     await callFrom(OTHER_CALLER);
-    await callFrom('+12125550144');
+    const before = held();
+    capped((await callFrom(THIRD_CALLER)).body);
+    expect(held()).toEqual(before);
     expect(counter('hlc#cap#ih#').map(([, n]) => n)).toEqual([2]);
-    expect(counter('hlc#in#p#')).toHaveLength(4); // two callers x hourly+daily; the refused caller never got that far
+  });
+
+  it('a new UTC hour starts a fresh hourly count for the org and for the caller', async () => {
+    configure({ maxCallsPerHour: 1 });
+    await callFrom(CALLER);
+    await callFrom(OTHER_CALLER);
+    capped((await callFrom(THIRD_CALLER)).body);
+    advanceMinutes(60);
+    expect(rings((await callFrom(THIRD_CALLER)).body)).toBe(true);
+
+    configure();
+    for (let i = 0; i < CALLER_MAX_PER_HOUR; i++) await callFrom(CALLER);
+    capped((await callFrom(CALLER)).body);
+    advanceMinutes(60);
+    expect(rings((await callFrom(CALLER)).body)).toBe(true);
   });
 });
 
@@ -127,16 +162,18 @@ describe('callers without a usable number', () => {
     expect(warns()).toContain('[hotLeadCall] inbound capped org_hourly org-a');
   });
 
-  it('normalises only an exact E.164 number', () => {
+  it('accepts only an exact E.164 number, of any country', () => {
     expect(inboundCallerE164(CALLER)).toBe(CALLER);
+    expect(inboundCallerE164('+447911123456')).toBe('+447911123456');
+    expect(inboundCallerE164(CALLER_DIGITS.padStart(11, '1'))).toBeNull(); // digits without '+'
     expect(inboundCallerE164('(212) 555-0142')).toBeNull();
     expect(inboundCallerE164('anonymous')).toBeNull();
     expect(inboundCallerE164(undefined)).toBeNull();
   });
 });
 
-describe('retries, keys and failure', () => {
-  it('a Twilio retry of the same CallSid is admitted and counted once', async () => {
+describe('redelivery and the retry marker', () => {
+  it('a redelivery of an admitted call is admitted and counted once', async () => {
     const sid = nextSid();
     expect(rings((await callFrom(CALLER, sid)).body)).toBe(true);
     for (let i = 0; i < 5; i++) expect(rings((await callFrom(CALLER, sid)).body)).toBe(true);
@@ -145,27 +182,85 @@ describe('retries, keys and failure', () => {
     expect(world.limits.claims.get(inboundCallMarkerKey(sid))?.token).toBe(sid);
   });
 
-  it('never puts the caller number in a key, and keeps the key prefixes and TTLs', async () => {
-    await callFrom(CALLER);
+  it('a redelivery of the call admitted at the cap boundary is still admitted and not counted twice', async () => {
+    for (let i = 0; i < CALLER_MAX_PER_HOUR - 1; i++) await callFrom(CALLER);
+    const last = nextSid();
+    expect(rings((await callFrom(CALLER, last)).body)).toBe(true); // the 3rd: exactly at the cap
+    expect(rings((await callFrom(CALLER, last)).body)).toBe(true);
+    expect(counter('hlc#in#p#h#').map(([, n]) => n)).toEqual([CALLER_MAX_PER_HOUR]);
+    capped((await callFrom(CALLER)).body); // a new call is still refused
+  });
+
+  it('a redelivery of a refused call is evaluated again: refused again, then admitted once room exists', async () => {
+    for (let i = 0; i < CALLER_MAX_PER_HOUR; i++) await callFrom(CALLER);
+    const refusedSid = nextSid();
+    capped((await callFrom(CALLER, refusedSid)).body);
+    capped((await callFrom(CALLER, refusedSid)).body);
+    expect(world.limits.claims.has(inboundCallMarkerKey(refusedSid))).toBe(false);
+    advanceMinutes(60);
+    expect(rings((await callFrom(CALLER, refusedSid)).body)).toBe(true);
+  });
+
+  it('two deliveries racing: the one that loses the marker claim gives its counts back and is admitted', async () => {
+    const sid = nextSid();
+    const realClaim = world.limits.claim.bind(world.limits);
+    world.limits.claim = async (key, token, expiresAtS, now) => {
+      if (key === inboundCallMarkerKey(sid)) await realClaim(key, sid, expiresAtS, now); // the other delivery wins first
+      return realClaim(key, token, expiresAtS, now);
+    };
+    expect(rings((await callFrom(CALLER, sid)).body)).toBe(true);
+    expect(held()).toEqual([]); // the winner's counts are not simulated; the loser kept none
+    expect(world.limits.claims.get(inboundCallMarkerKey(sid))?.token).toBe(sid);
+  });
+
+  it('a marker held by a different token fails closed and keeps no counts', async () => {
+    const sid = nextSid();
+    world.limits.claims.set(inboundCallMarkerKey(sid), { token: 'someone-else', expiresAtS: nowS() + 600 });
+    unavailable((await callFrom(CALLER, sid)).body);
+    expect(held()).toEqual([]);
+    expect(warns()).toContain('[hotLeadCall] inbound limits unavailable Error');
+  });
+
+  it.each([[undefined], [''], ['not-a-sid'], ['CA1']])('CallSid %p fails closed with the unavailable copy and touches no limit', async (sid) => {
+    unavailable((await world.twilio.post(inboundVoiceUrl(), callParams(sid, CALLER))).body);
+    expect(world.limits.keysTouched).toEqual([]);
+  });
+});
+
+describe('keys, TTLs and failure', () => {
+  it('never puts the caller number in a key, and uses the specified prefixes and clock-derived windows', async () => {
+    const sid = nextSid();
+    await callFrom(CALLER, sid);
     const keys = world.limits.keysTouched;
     expect(keys.length).toBeGreaterThan(0);
     for (const k of keys) {
-      expect(k).not.toContain('2125550142');
+      expect(k).not.toContain(CALLER_DIGITS);
       expect(k).toMatch(/^hlc#(cap#ih#|cap#id#|in#p#h#|in#p#d#|in#c#)/);
     }
-    expect(counter('hlc#cap#id#')[0][0]).toBe('hlc#cap#id#org-a#2026-10-19');
-    const ttl = (prefix: string) => [...world.limits.counterExpiresAtS].find(([k]) => k.startsWith(prefix))![1] - Date.now() / 1000;
-    expect(Math.round(ttl('hlc#cap#ih#'))).toBe(2 * 3600);
-    expect(Math.round(ttl('hlc#in#p#d#'))).toBe(2 * 86400);
+    const hour = new Date().toISOString().slice(0, 13);
+    const localDate = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Chicago' });
+    expect(counter('hlc#cap#ih#').map(([k]) => k)).toEqual([`hlc#cap#ih#org-a#${hour}`]);
+    expect(counter('hlc#cap#id#').map(([k]) => k)).toEqual([`hlc#cap#id#org-a#${localDate}`]);
+    expect(counter('hlc#in#p#h#')[0][0]).toMatch(new RegExp(`^hlc#in#p#h#[0-9a-f]{64}#${hour}$`));
+    expect(counter('hlc#in#p#d#')[0][0]).toMatch(new RegExp(`^hlc#in#p#d#[0-9a-f]{64}#${localDate}$`));
+  });
+
+  it('expires hourly counters after 2h, daily counters after 2 days and the retry marker after 1h', async () => {
+    const sid = nextSid();
+    await callFrom(CALLER, sid);
+    const ttlOf = (prefix: string) => [...world.limits.counterExpiresAtS].find(([k]) => k.startsWith(prefix))![1] - nowS();
+    expect(ttlOf('hlc#cap#ih#')).toBe(2 * 3600);
+    expect(ttlOf('hlc#in#p#h#')).toBe(2 * 3600);
+    expect(ttlOf('hlc#cap#id#')).toBe(2 * 86400);
+    expect(ttlOf('hlc#in#p#d#')).toBe(2 * 86400);
+    expect(world.limits.claims.get(inboundCallMarkerKey(sid))!.expiresAtS - nowS()).toBe(MARKER_TTL_S);
   });
 
   it('fails closed with the unavailable copy when the store throws, and logs no number', async () => {
-    world.limits.failNext = new Error('boom CA-secret +12125550142');
+    world.limits.failNext = new Error(`boom CA-secret +1${CALLER_DIGITS}`);
     const res = await callFrom(CALLER);
-    expect(sayText(res.body)).toBe(INBOUND_UNAVAILABLE_COPY);
-    expect(res.body).not.toContain('<Dial');
-    const line = warns().find((w) => w.includes('inbound limits unavailable'))!;
-    expect(line).toBe('[hotLeadCall] inbound limits unavailable Error');
+    unavailable(res.body);
+    expect(warns().find((w) => w.includes('inbound limits unavailable'))).toBe('[hotLeadCall] inbound limits unavailable Error');
     expect(world.limits.counters.size).toBe(0);
   });
 
@@ -173,9 +268,26 @@ describe('retries, keys and failure', () => {
     const real = world.limits.incrementBelow.bind(world.limits);
     let n = 0;
     world.limits.incrementBelow = async (...a) => { if (++n === 3) throw new Error('late'); return real(...a); };
-    expect(sayText((await callFrom(CALLER)).body)).toBe(INBOUND_UNAVAILABLE_COPY);
-    expect([...world.limits.counters.values()].every((v) => v === 0)).toBe(true);
+    unavailable((await callFrom(CALLER)).body);
+    expect(held()).toEqual([]);
     expect(world.limits.claims.size).toBe(0);
+  });
+});
+
+describe('reserveInboundSlot directly', () => {
+  it('two orgs keep independent counters for the same caller number', async () => {
+    const now = new Date();
+    for (let i = 0; i < CALLER_MAX_PER_HOUR; i++) expect(await reserveInboundSlot({ orgId: 'org-x', callSid: nextSid(), callerE164: CALLER, config: reserveConfig(), now })).toEqual({ ok: true });
+    expect(await reserveInboundSlot({ orgId: 'org-x', callSid: nextSid(), callerE164: CALLER, config: reserveConfig(), now })).toEqual({ ok: false, reason: 'caller_hourly' });
+    expect(await reserveInboundSlot({ orgId: 'org-y', callSid: nextSid(), callerE164: CALLER, config: reserveConfig(), now })).toEqual({ ok: true });
+  });
+
+  it('follows UTC when the config has no calling hours', async () => {
+    const now = new Date('2026-10-20T02:00:00Z'); // still 19 Oct in Chicago
+    await reserveInboundSlot({ orgId: 'org-a', callSid: nextSid(), callerE164: null, config: reserveConfig(), now });
+    expect(counter('hlc#cap#id#').map(([k]) => k)).toEqual(['hlc#cap#id#org-a#2026-10-20']);
+    await reserveInboundSlot({ orgId: 'org-b', callSid: nextSid(), callerE164: null, config: reserveConfig({ callingHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' } }), now });
+    expect(counter('hlc#cap#id#org-b').map(([k]) => k)).toEqual(['hlc#cap#id#org-b#2026-10-19']);
   });
 });
 
@@ -186,11 +298,17 @@ describe('placement', () => {
     expect(world.limits.keysTouched).toEqual([]);
   });
 
+  it('handing over to the second member takes no further slot', async () => {
+    const first = await callFrom(CALLER);
+    const before = [...world.limits.counters];
+    const next = await world.twilio.post(attrOf(first.body, 'action'), { ...callParams(nextSid(), CALLER), CallStatus: 'in-progress', DialCallStatus: 'no-answer' });
+    expect(next.body).toContain(SECOND_PHONE);
+    expect([...world.limits.counters]).toEqual(before);
+  });
+
   it('a signed /inbound with a query string is still refused and touches no limit', async () => {
-    const res = await world.twilio.post(`${inboundVoiceUrl()}?x=`, {
-      AccountSid: 'AC00000000000000000000000000000000', Direction: 'inbound', From: CALLER, To: TWILIO_NUMBER, CallSid: nextSid(), CallStatus: 'ringing',
-    });
-    expect(sayText(res.body)).toBe(INBOUND_UNAVAILABLE_COPY);
+    const res = await world.twilio.post(`${inboundVoiceUrl()}?x=`, callParams(nextSid(), CALLER));
+    unavailable(res.body);
     expect(world.limits.keysTouched).toEqual([]);
   });
 });
