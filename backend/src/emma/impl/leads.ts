@@ -2408,7 +2408,13 @@ export async function addLeadEngagement(
 
       const lead = await crmDb.getLeadById(listId, leadId);
       if (!lead) {
-        return { success: false, message: 'Lead not found', error: 'The specified lead does not exist in this list' };
+        // ENG-2808: tell the model how to recover instead of retrying the same pair.
+        return {
+          success: false,
+          message: 'Lead not found',
+          error: 'The specified lead does not exist in this list',
+          hint: 'Do not retry with the same lead_id/list_id. Look the lead up with search_leads (by name or email) to get its current lead_id and list_id, then call add_lead_engagement again.',
+        };
       }
 
       await crmDb.addLeadEngagement(listId, leadId, {
