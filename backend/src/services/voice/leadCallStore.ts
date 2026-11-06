@@ -8,6 +8,7 @@ import type {
   HotLeadCallState,
   LeadCallStore,
   MeteredLeg,
+  RetryRestart,
 } from './leadCallStore.types';
 
 /** Key under `lead.system` that holds the record. No table or index: the call state rides on the lead row. */
@@ -46,7 +47,7 @@ function isCallRecord(value: unknown): value is HotLeadCallRecord {
 
 // The scalar fields a patch may set. An explicit list (not a spread) so a caller can never smuggle
 // other keys, phone numbers included, into the lead row.
-const SCALAR_FIELDS = ['state', 'jobKey', 'startedAt', 'updatedAt', 'memberCallSid', 'leadCallSid', 'outcome', 'attemptNo', 'memberId', 'leadPhoneMac', 'claimToken'] as const;
+const SCALAR_FIELDS = ['state', 'jobKey', 'startedAt', 'updatedAt', 'memberCallSid', 'leadCallSid', 'outcome', 'attemptNo', 'memberId', 'leadPhoneMac', 'claimToken', 'deferral'] as const;
 
 function scalarFields(record: Partial<HotLeadCallRecord>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
@@ -101,6 +102,27 @@ class DynamoLeadCallStore implements LeadCallStore {
       whenEquals: patch.ifAttemptNo === undefined ? undefined : { attemptNo: patch.ifAttemptNo },
       maxIn: patch.lastSequence ? { lastSequence: patch.lastSequence } : undefined,
       appendNew: { meteredLegs: legs, triedMemberIds: [...new Set(patch.triedMemberIds ?? [])] },
+    });
+  }
+
+  async claimRetry(listId: string, leadId: string, jobKey: string, token: string): Promise<boolean> {
+    return crmDb.updateLeadSystemRecordIf(listId, leadId, SYSTEM_KEY, {
+      stateIn: ['finished'],
+      set: { retryClaimToken: token, retryClaimedAt: new Date().toISOString() },
+      whenEquals: { jobKey, outcome: 'lead_deferred' },
+      whenAbsent: ['retryClaimToken'],
+    });
+  }
+
+  async restartForRetry(listId: string, leadId: string, from: { jobKey: string; token: string }, fresh: RetryRestart): Promise<boolean> {
+    return crmDb.updateLeadSystemRecordIf(listId, leadId, SYSTEM_KEY, {
+      stateIn: ['finished'],
+      whenEquals: { jobKey: from.jobKey, retryClaimToken: from.token },
+      set: {
+        state: 'dialing', attemptNo: 1, jobKey: fresh.jobKey, startedAt: fresh.startedAt, updatedAt: fresh.startedAt, memberId: fresh.memberId,
+        claimToken: fresh.claimToken, leadPhoneMac: fresh.leadPhoneMac, triedMemberIds: [fresh.memberId], meteredLegs: [], lastSequence: {},
+      },
+      remove: ['memberCallSid', 'leadCallSid', 'outcome'],
     });
   }
 

@@ -4,7 +4,7 @@
  *
  * Call shape: Twilio rings a team member (placed by the orchestrator) -> /owner prompts "press 1" ->
  * /gather dials the lead with <Dial><Number url=/screen> -> the lead answers and /screen asks them to press 1
- * -> /screen-result (a digit of 1 lets Twilio bridge the two calls) -> /dial reports how the bridge ended
+ * -> /screen-result (a digit of 1 lets Twilio bridge the two calls; 2 defers one retry, 3 stops the calls) -> /dial reports how the bridge ended
  * (DialBridged tells a conversation from a lead who screened themselves out). /status receives the per-leg
  * call-progress callbacks and is the ONLY place usage is metered.
  *
@@ -61,7 +61,7 @@ import {
 } from '../services/voice/callFinalisation';
 import {
   bridgeTwiml, connectTwiml, hangupTwiml, inboundMemberScreenTwiml, inboundNobodyTwiml, inboundRingTwiml, inboundUnavailableTwiml,
-  isE164, leadDeclinedTwiml, leadOptedOutMemberTwiml, leadOptedOutTwiml, leadPhoneChangedTwiml, leadScreenTwiml, leadUnreachableTwiml, memberPromptTwiml,
+  isE164, leadDeclinedTwiml, leadDeferredMemberTwiml, leadDeferredTwiml, leadNoRetryTwiml, leadOptedOutMemberTwiml, leadOptedOutTwiml, leadPhoneChangedTwiml, leadScreenTwiml, leadUnreachableTwiml, memberPromptTwiml,
 } from '../services/voice/twiml';
 import { recordCallUsage } from '../services/voice/voiceUsage';
 import {
@@ -73,6 +73,7 @@ import { holdsClaim } from '../services/hotLeadCallPlacement';
 import { callableLeadPhone } from '../services/hotLeadCallConfig';
 import { isInsideLeadCallWindow } from '../services/voice/leadLocalHours';
 import { isLeadDoNotCall, markNumberDoNotCallWithRetry } from '../services/voice/hotLeadCallDnc';
+import { retryDueAt } from '../services/voice/hotLeadCallRetry';
 
 // type: () => true so a JSON or other content type is limited and parsed here too, instead of falling
 // through to the global 50mb express.json (the same trick as the unipile and tracker parsers).
@@ -474,7 +475,20 @@ async function recordLeadOptOut(q: CallQuery, record: HotLeadCallRecord, ctx: Ho
   }
 }
 
-const LEAD_REFUSALS = new Set(['lead_declined', 'lead_opted_out']);
+const LEAD_REFUSALS = new Set(['lead_declined', 'lead_opted_out', 'lead_deferred']);
+
+/**
+ * When the one retry for a lead who pressed 2 is due, or null when this 2 is an ordinary decline: the call is itself the
+ * retry (the record keeps its deferral), there is no live config, the lead's phone is no longer the one approved for this
+ * call, or no minute within 36 hours is inside both the lead window and the org's calling hours.
+ */
+async function deferralDueAt(q: CallQuery, record: HotLeadCallRecord): Promise<Date | null> {
+  if (record.deferral) return null;
+  const ctx = await resolveHotLeadCallContext(q.listId);
+  const leadNow = ctx ? await leadPhoneFor(q, ctx) : null;
+  if (!ctx || !leadNow || record.leadPhoneMac !== leadPhoneMacOf(ctx.orgId, leadNow.phone)) return null;
+  return retryDueAt(leadNow.phone, ctx.config, new Date());
+}
 
 router.post('/screen-result', guarded(async (_req, res, q, body) => {
   const record = await loadRecord(q);
@@ -490,12 +504,25 @@ router.post('/screen-result', guarded(async (_req, res, q, body) => {
       await decide(q, ['bridging'], { state: 'connected', lastSequence: { [marker]: 1 } }, 'call.connected');
     } else if (body.Digits === '3') {
       // The stop is written BEFORE the decision, so a decision that is seen is always backed by it. A replay finds the marker.
-      if (record.lastSequence?.[marker] === undefined) await recordLeadOptOut(q, record, await resolveHotLeadCallContext(q.listId));
+      // A 3 that follows a 2 on the same screening wins over the pending retry: the markers are raised (2 > 1), the deferral removed.
+      const afterDeferral = record.outcome === 'lead_deferred';
+      if (record.lastSequence?.[marker] === undefined || afterDeferral) await recordLeadOptOut(q, record, await resolveHotLeadCallContext(q.listId));
+      const level = afterDeferral ? 2 : 1;
       await decide(q, ['bridging'], {
         state: 'bridging',
         outcome: 'lead_opted_out',
-        lastSequence: { [marker]: 1, [decisionKey(record.memberCallSid, 'dial')]: 1 },
+        lastSequence: { [marker]: level, [decisionKey(record.memberCallSid, 'dial')]: level },
+        ...(afterDeferral ? { clear: ['deferral' as const] } : {}),
       }, 'call.lead_declined', { reason: 'opted_out' });
+    } else if (body.Digits === '2') {
+      // Not available now: one later call, once. An ordinary decline (nothing scheduled) when deferralDueAt says so.
+      const due = await deferralDueAt(q, record);
+      await decide(q, ['bridging'], {
+        state: 'bridging',
+        outcome: due ? 'lead_deferred' : 'lead_declined',
+        ...(due ? { deferral: { dueAt: due.toISOString(), count: 1 } } : {}),
+        lastSequence: { [marker]: 1, [decisionKey(record.memberCallSid, 'dial')]: 1 },
+      }, 'call.lead_declined', { reason: due ? 'not_available_now' : 'not_available_no_retry' });
     } else {
       await decide(q, ['bridging'], {
         state: 'bridging',
@@ -511,6 +538,11 @@ router.post('/screen-result', guarded(async (_req, res, q, body) => {
     // The goodbye names the business: without a live config there is nothing to name, so the leg just ends.
     const ctx = await resolveHotLeadCallContext(q.listId);
     return sendXml(res, ctx ? leadOptedOutTwiml(ctx.config.announcedName) : hangupTwiml());
+  }
+  if (body.Digits === '2' && (decided?.outcome === 'lead_deferred' || decided?.outcome === 'lead_declined')) {
+    const ctx = await resolveHotLeadCallContext(q.listId);
+    if (!ctx) return sendHangup(res);
+    return sendXml(res, decided.outcome === 'lead_deferred' ? leadDeferredTwiml(ctx.config.announcedName) : leadNoRetryTwiml(ctx.config.announcedName));
   }
   // An empty response ends the screening leg normally, so Twilio bridges the calls.
   sendXml(res, accepted ? bridgeTwiml() : hangupTwiml());
@@ -543,9 +575,10 @@ router.post('/dial', guarded(async (_req, res, q, body) => {
       leadCallSid,
       lastSequence: { [decisionKey(memberSid, 'dial')]: 1 },
     }, 'call.lead_declined');
-    // The lead pressed 3 (/screen-result wrote that, and the marker above makes this write a no-op): say so to the member.
+    // The lead pressed 3 or 2 (/screen-result wrote that, and the marker above makes this write a no-op): say so to the member.
     const decided = await getLeadCallStore().get(q.listId, q.leadId);
-    return sendXml(res, decided?.outcome === 'lead_opted_out' ? leadOptedOutMemberTwiml() : leadDeclinedTwiml());
+    const told = decided?.outcome === 'lead_opted_out' ? leadOptedOutMemberTwiml : decided?.outcome === 'lead_deferred' ? leadDeferredMemberTwiml : leadDeclinedTwiml;
+    return sendXml(res, told());
   }
   if (status === 'canceled') {
     // The dial was cancelled while the lead was still ringing, which is the member hanging up: nobody was told the

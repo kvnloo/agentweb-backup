@@ -64,6 +64,15 @@ export interface HotLeadCallRecord {
    * - `lead#adopt`: the first writer that names the lead leg.
    */
   lastSequence?: Record<string, number>;
+  /**
+   * Set when the lead pressed 2 ("not available now", outcome `lead_deferred`) on the first call: the one later call is due
+   * at `dueAt` (ISO, inside the lead-local window). Kept on the record after the retry starts, which is how the retry call
+   * knows it is the retry (a second 2 is then an ordinary decline: one retry per lead, ever). `count` is always 1.
+   */
+  deferral?: { dueAt: string; count: number };
+  /** Written once by the due-retries cron when it takes the deferral (absent = still pending); the retry's restart needs it. */
+  retryClaimToken?: string;
+  retryClaimedAt?: string;
 }
 
 /** Engagement event types written to the lead timeline (via addLeadEngagement). */
@@ -80,7 +89,7 @@ export type HotLeadCallEventType =
   | 'call.skipped';
 
 /** Record fields a transition can remove (not just overwrite): the ones a next attempt starts without. */
-type ClearableField = 'memberCallSid' | 'outcome';
+type ClearableField = 'memberCallSid' | 'outcome' | 'deferral';
 
 /** What a transition changes. `clear` removes fields; a field cannot be both set and cleared in one patch. */
 export type HotLeadCallPatch = Partial<HotLeadCallRecord> & {
@@ -89,6 +98,15 @@ export type HotLeadCallPatch = Partial<HotLeadCallRecord> & {
   /** Applies only while the record is on this attempt, so a stale writer cannot move a record that has gone on. */
   ifAttemptNo?: number;
 };
+
+/** What the retry's restart puts on the finished record: a new call cycle (the old cycle stays on the lead's timeline). */
+export interface RetryRestart {
+  jobKey: string;
+  startedAt: string;
+  memberId: string;
+  claimToken: string;
+  leadPhoneMac: string;
+}
 
 export interface LeadCallStore {
   get(listId: string, leadId: string): Promise<HotLeadCallRecord | null>;
@@ -104,6 +122,17 @@ export interface LeadCallStore {
     from: HotLeadCallState[],
     patch: HotLeadCallPatch,
   ): Promise<boolean>;
+  /**
+   * Takes the pending deferral of a FINISHED record whose outcome is `lead_deferred` and whose call is `jobKey`: writes
+   * `token` as retryClaimToken only while none is there. True for exactly one caller; later callers and replays get false.
+   */
+  claimRetry(listId: string, leadId: string, jobKey: string, token: string): Promise<boolean>;
+  /**
+   * Starts the retry's call cycle on the finished record that holds this claim: back to `dialing` as attempt 1 with a new
+   * jobKey (so the first call's late callbacks no longer match), and the first cycle's sids, outcome, metered legs and
+   * decision markers dropped. The only way a terminal record is revived. False when the record is not that one.
+   */
+  restartForRetry(listId: string, leadId: string, from: { jobKey: string; token: string }, fresh: RetryRestart): Promise<boolean>;
   addEvent(
     listId: string,
     leadId: string,
