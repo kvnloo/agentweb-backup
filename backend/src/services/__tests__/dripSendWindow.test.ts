@@ -134,8 +134,8 @@ describe('localParts formatter cache', () => {
     for (const start of [Date.UTC(2026, 10, 1, 3), Date.UTC(2026, 2, 8, 3)]) {
       for (let i = 0; i < 12; i++) {
         const ms = start + i * 30 * 60_000;
-        const { weekday: _weekday, ...cached } = localParts(ms, tz);
-        expect(cached).toEqual(uncached(ms, tz));
+        const { year, month, day, hour, minute, second } = localParts(ms, tz);
+        expect({ year, month, day, hour, minute, second }).toEqual(uncached(ms, tz));
       }
     }
     // 05:30Z is 01:30 EDT and 06:30Z is 01:30 EST on 2026-11-01: the repeated hour stays distinguishable by its instant.
