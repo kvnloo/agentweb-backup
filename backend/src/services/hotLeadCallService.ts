@@ -353,22 +353,22 @@ export async function processHotLeadCallRetry(listId: string, leadId: string, no
   const token = randomUUID();
   const claim = (): Promise<boolean> => store.claimRetry(listId, leadId, record.jobKey, token);
   const orgId = ctx?.orgId ?? 'unknown_org';
-  const firstDueAt = record.deferral?.firstDueAt ?? record.deferral?.dueAt ?? new Date(dueAt).toISOString();
-  if (now.getTime() - dueAt > RETRY_EXPIRES_AFTER_MS) {
+  // Contract: the retry is placed within six hours of its FIRST due time or it is given up, never moved to another day. Records written
+  // before `firstDueAt` existed fall back to their current dueAt.
+  const firstDueAt = record.deferral?.firstDueAt ?? new Date(dueAt).toISOString();
+  const giveUpAt = Date.parse(firstDueAt) + RETRY_EXPIRES_AFTER_MS;
+  const giveUp = async (): Promise<RetryOutcome> => {
     if (!await claim()) return 'lost';
     if (lead) await recordRetryExpired(lead);
     return 'expired';
-  }
+  };
+  if (now.getTime() > giveUpAt) return giveUp();
   const callable = ctx && lead ? callableLeadPhone(lead.phone, ctx.config) : null;
   if (ctx && callable && 'phone' in callable && !(isInsideLeadCallWindow(callable.phone, now) && isWithinCallWindow(ctx.config.callingHours, now))) {
     const next = retryDueAt(callable.phone, ctx.config, now);
-    if (next) {
-      const moved = await store.rescheduleRetry(listId, leadId, record.jobKey, { dueAt: next.toISOString(), firstDueAt: record.deferral?.firstDueAt });
-      return moved ? 'rescheduled' : 'lost';
-    }
-    if (!await claim()) return 'lost';
-    if (lead) await recordRetryExpired(lead);
-    return 'expired';
+    if (!next || next.getTime() > giveUpAt) return giveUp();
+    const moved = await store.rescheduleRetry(listId, leadId, record.jobKey, { dueAt: next.toISOString(), firstDueAt });
+    return moved ? 'rescheduled' : 'lost';
   }
 
   if (!await claim()) return 'lost';

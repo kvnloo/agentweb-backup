@@ -525,7 +525,8 @@ router.post('/screen-result', guarded(async (_req, res, q, body) => {
       await decide(q, ['bridging'], {
         state: 'bridging',
         outcome: due ? 'lead_deferred' : 'lead_declined',
-        ...(due ? { deferral: { dueAt: due.toISOString(), count: 1 } } : {}),
+        // firstDueAt never changes: the retry must be placed within six hours of it or it is given up (retry_expired).
+        ...(due ? { deferral: { dueAt: due.toISOString(), count: 1, firstDueAt: due.toISOString() } } : {}),
         lastSequence: { [marker]: 1, [decisionKey(record.memberCallSid, 'dial')]: 1 },
       }, 'call.lead_declined', { reason: due ? 'not_available_now' : 'not_available_no_retry' });
     } else {

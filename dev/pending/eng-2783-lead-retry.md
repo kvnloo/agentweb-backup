@@ -14,10 +14,10 @@ The retry is due 60 minutes after the press, moved forward minute by minute (up 
 window and the org's calling hours; with none, the 2 is a plain decline. A new cron, `cron/hotLeadCallRetryCron.ts`, armed in
 `server.ts` every 5 minutes (env `HOT_LEAD_CALL_RETRY`: unset = on, `off`/`0`/`false` = off; it does nothing while the global
 `hot_lead_call_mode` kill switch is off), finds due deferrals the way the stuck sweep finds records, claims each with a conditional
-write (exactly once under overlapping runs or instances; a window closed at run time moves the due time instead of spending the retry) and re-runs the normal dispatch pipeline: every gate again (the existing-record
+write (exactly once under overlapping runs or instances; a window closed at run time moves the due time, but only inside the 6 hours below) and re-runs the normal dispatch pipeline: every gate again (the existing-record
 short-circuit and `too_old` are ignored), a fresh slot against the hourly, daily and monthly caps, fresh member selection with the
-cooldown, then the normal member and lead screens. More than 6 hours late: `call.skipped` `retry_expired`. Only a permanent refusal (do-not-call, plan lost, another lead holds the number, phone changed, ...) spends the retry; a transient one
-(no one on duty, cooldown, caps, a down store, an error) gives the claim back and tries again 15 minutes later until six hours after the first claim. The stuck sweep leaves a waiting deferral alone (it is a finished record).
+cooldown, then the normal member and lead screens. Contract: a retry is placed within 6 hours of its FIRST due time (`deferral.firstDueAt`, written at press time) or it is given up with a `call.skipped` `retry_expired` note; it is never moved to another day. Only a permanent refusal (do-not-call, plan lost, another lead holds the number, phone changed, ...) spends the retry; a transient one
+(no one on duty, cooldown, caps, a down store, an error) gives the claim back and tries again 15 minutes later, still inside those 6 hours. The stuck sweep leaves a waiting deferral alone (it is a finished record).
 
 Owner-approved data-plane additions (Anurag): new schemaless fields on the existing `system.hot_lead_call` sidecar map of the lead row
 (`deferral {dueAt, count, firstDueAt}`, `retryClaimToken`, `retryClaimedAt`); NO new table, index or GSI. The retry's restart revives a finished

@@ -2055,6 +2055,8 @@ describe('lead presses 2: not available now (one retry, ENG-2783)', () => {
     const res = await screenResult('2');
     expect(res.text).toBe(`<?xml version="1.0" encoding="UTF-8"?><Response><Say>${GOODBYE}</Say><Hangup/></Response>`);
     expect(store.record).toMatchObject({ state: 'bridging', outcome: 'lead_deferred', deferral: { count: 1 } });
+    // firstDueAt is written with the deferral, equal to the initial dueAt, and never changes afterwards.
+    expect(store.record?.deferral?.firstDueAt).toBe(store.record?.deferral?.dueAt);
     const dueAt = Date.parse(store.record?.deferral?.dueAt ?? '');
     expect(dueAt).toBeGreaterThanOrEqual(before + HOUR);
     expect(dueAt).toBeLessThanOrEqual(Date.now() + 37 * HOUR);

@@ -1159,7 +1159,7 @@ notice by hand, delete the claim `hlc#notify#80#<orgId>#<YYYY-MM>` / `hlc#notify
 A record waiting for its press-2 retry is `finished` (outcome `lead_deferred`), so the sweep never reports or closes it; a retry in flight is an
 ordinary live record (`dialing` onwards, with `startedAt` and `updatedAt` set when the retry started) and is swept by the same thresholds. A first call
 that gets stuck and is closed by the sweep keeps `lead_deferred` (it is the decided outcome), so its retry then runs on schedule, or expires if the close
-came more than six hours after the due time.
+came more than six hours after the retry's FIRST due time.
 
 `lead_opted_out` (ENG-2783) leaves the record in `bridging` with the dial marker set, exactly like `lead_declined`: the leg metering finishes it, and
 the sweep settles it from the same state with the same thresholds. No state was added.
@@ -1558,7 +1558,7 @@ Twilio's documentation and encoded in tests with synthetic payloads:
 ENG-2783. A lead who answers and presses 2 ("not available now") gets ONE more call, about an hour later, at most once per lead ever.
 
 **Recording the press.** `/screen-result` with `Digits=2` writes, in the same conditional transition as the first-writer-wins `<leadCallSid>#screen` and
-`<memberCallSid>#dial` markers, `outcome: lead_deferred` and `deferral: {dueAt, count: 1}` on the `system.hot_lead_call` record, plus the timeline event
+`<memberCallSid>#dial` markers, `outcome: lead_deferred` and `deferral: {dueAt, count: 1, firstDueAt}` (`firstDueAt` = the initial `dueAt`, written once here, never changed) on the `system.hot_lead_call` record, plus the timeline event
 `call.lead_declined` (`reason: not_available_now`). A replay, a later 1 or a later different key finds the markers and changes nothing (a 1 after a 2 hangs up
 and never connects). A 3 after a 2 on the same screening wins: the markers are raised from 1 to 2, the do-not-call marker and contact status are written (see
 [Do-not-call list](#do-not-call-list)), the outcome becomes `lead_opted_out` and `deferral` is removed. The record finishes through the normal leg metering with
@@ -1578,7 +1578,7 @@ press 3 to stop these calls.") only on the lead's first call with retries on. On
 
 **The due-retries cron.** The job queue has no run-after, so `cron/hotLeadCallRetryCron.ts` (armed in `server.ts`, every 5 minutes) calls
 `services/voice/hotLeadCallRetrySweep.ts` (plus one run 30 seconds after the cron is armed, so a fresh deploy does not wait a whole interval). Switch: `HOT_LEAD_CALL_RETRY` (unset = on; `off`, `0`, `false` = not armed and every run returns at once). It does nothing
-and reads nothing while the global kill switch `hot_lead_call_mode` is off (the pending retries stay and run once it is on, or expire after six hours). Discovery is the stuck
+and reads nothing while the global kill switch `hot_lead_call_mode` is off (the pending retries stay and run once it is on, or are given up six hours after their first due time). Discovery is the stuck
 sweep's (orgs with a `hotLeadCall` attribute whose config is enabled -> members -> lists -> `crmDb.findLeadsBySystemRecord` on state `finished` with a `deferral` and no
 `retryClaimToken`; no index), bounded per run: a 2000-lead read budget shared out evenly (each list reads `min(500, max(50, floor(2000 / lists)))` of its newest leads; the starting list rotates every
 run, so with more lists than the budget covers no list is starved for good, and a `[hotLeadCall] retry sweep skipped lists for budget <count>` warning says how many were skipped), 100 DUE records handled (a record that is not due yet costs one read but
@@ -1587,13 +1587,16 @@ Each run logs one counts-only line, only when something was found, attempted, ex
 `[hotLeadCall] retry sweep orgs=.. lists=.. skippedLists=.. leadsRead=.. truncated=.. found=.. notDue=.. rescheduled=.. attempted=.. refused=.. expired=.. lost=.. failed=..` (`attempted` means the
 claim was won and the reservation and placement ran; a cap or cooldown refusal inside it shows as `call.skipped` on the lead).
 
+**The contract.** A retry is placed within 6 hours of its FIRST due time (`deferral.firstDueAt`) or it is given up with a `call.skipped` `retry_expired` note. It is never moved to another day: a press at 17:55 ET gets
+the next day's 13:00 ET as its first due time (the press-time schedule, above), and from then on 6 hours are all it has. Records written before `firstDueAt` existed fall back to their `dueAt`.
+
 **The retry run** (`processHotLeadCallRetry` in `hotLeadCallService.ts`), in order:
 1. Kill switch; the record is `finished`, outcome `lead_deferred`, has a due `deferral` and no `retryClaimToken`.
-2. Windows: if the lead window or the org's calling hours are closed AT THIS MOMENT (a late cron tick, hours edited since), the retry is not claimed: `deferral.dueAt` is moved to
-   `retryDueAt(now)` with a conditional write (`LeadCallStore.rescheduleRetry`, only while no claim is there) and the run stops (`rescheduled`). If no open minute exists within 36 hours it is spent as `retry_expired`.
+2. Expiry, first: more than 6 hours after `firstDueAt` (whether or not the windows are open) is claimed and given up with the `retry_expired` note. Then windows: if the lead window or the org's calling hours are closed AT THIS MOMENT
+   (a late cron tick, hours edited since), `retryDueAt(now)` is looked up; if it is later than `firstDueAt` + 6 hours (or there is none within 36 hours) the retry is claimed and given up with the note, otherwise
+   `deferral.dueAt` is moved to it with a conditional write (`LeadCallStore.rescheduleRetry`, only while no claim is there, `firstDueAt` kept) and the run stops (`rescheduled`).
 3. Claim: a conditional write of `retryClaimToken`/`retryClaimedAt` only while none is there (`LeadCallStore.claimRetry`). Exactly one run or instance wins, however many overlap.
-   After the claim only a PERMANENT refusal spends the retry; a transient one gives the claim back (see the table below). More than 6 hours after `dueAt` (the server was down), checked
-   before the window step and whether the windows are open or closed: a `call.skipped` `retry_expired` note written as its own event (the per-lead 5-skip cap and the one-per-reason dedupe cannot swallow it), and stop.
+   After the claim only a PERMANENT refusal spends the retry; a transient one gives the claim back (see the table below). The `retry_expired` note is always written as its own event (the per-lead 5-skip cap and the one-per-reason dedupe cannot swallow it).
 4. Every gate of a new lead through the same `review()`/`SKIP_GATES` with the retry flag: ids, phone, org calling hours, lead window, `no_one_available`, entitlement, `do_not_call`;
    each refusal is a `call.skipped` with its reason. The `too_old` gate and the "lead already has a call record" short-circuit are the only things ignored (age is counted from the
    deferral and the expiry above). The lead's phone must still match the record's `leadPhoneMac`, else `lead_phone_changed`.
@@ -1613,8 +1616,7 @@ claim was won and the reservation and placement ran; a cap or cooldown refusal i
 | Transient (everything else) | `no_one_available`, `member_cooldown`, `org_hourly_cap`, `org_daily_cap`, `org_monthly_cap`, `outside_calling_hours`, `outside_lead_hours`, `limits_unavailable`, `credentials_unavailable`, `disabled`, `no_caller_number`, a thrown error (`error`), any reason not listed above | the claim is given back with `LeadCallStore.releaseRetryClaim` (conditional on `retryClaimToken` being THIS run's token and the record still `finished`; a stale token cannot release a newer claim): `retryClaimToken` and `retryClaimedAt` are removed and `deferral.dueAt` becomes now + 15 minutes, or the next minute both windows are open if later; log `[hotLeadCall] retry rescheduled after claim <reason> <orgId>`; the run returns `rescheduled`. For a thrown error the claim is given back first and the error then goes on to the sweep (`failed`) |
 | Expiry | a transient refusal when the new due time would pass `deferral.firstDueAt` + 6 hours | `call.skipped` `retry_expired`, the retry is spent |
 
-`deferral.firstDueAt` is written the first time a claim is given back (the due time at that first claim) and never changes, so repeated reschedules cannot stretch the six hours. A window-closed reschedule
-before any claim (step 2) keeps it as it is. Once `restartForRetry` has succeeded the retry is spent: a real call began, whatever happens to it later.
+`deferral.firstDueAt` is written at press time and never changes, so no reschedule (a closed window at run time, or a transient refusal) can stretch the six hours; `releaseRetryClaim` writes it only as a fallback for legacy records without it. Once `restartForRetry` has succeeded the retry is spent: a real call began, whatever happens to it later.
 
 **Operator runbook.**
 - *Is a retry pending?* The record is `finished`, `outcome: lead_deferred`, with `deferral.dueAt` and no `retryClaimToken`.
@@ -1622,7 +1624,7 @@ before any claim (step 2) keeps it as it is. Once `restartForRetry` has succeede
 - *Stop all retries now:* `HOT_LEAD_CALL_RETRY=off` and redeploy/restart (the cron is armed at start), or turn off `hot_lead_call_mode`.
 - *A pending retry that keeps rescheduling:* a `deferral.dueAt` that moves 15 minutes at a time, no `retryClaimToken`, and `retry rescheduled after claim <reason>` lines name the transient reason (a cap, no one on duty, a cooldown, a down store). It stops by itself at
   `firstDueAt` + 6 hours with `retry_expired`. To cancel earlier, write `retryClaimToken` (any string) on the record, or remove `deferral`.
-- *Why did a retry not happen?* First check whether it is still waiting: no `retryClaimToken` and a `dueAt` in the future means the cron has not reached it, or it was moved to the next open minute because the window was closed when the cron ran (nothing is wrong, nothing is spent).
+- *Why did a retry not happen?* First check whether it is still waiting: no `retryClaimToken` and a `dueAt` in the future means the cron has not reached it, or it was moved to a later minute inside its 6 hours because a window was closed when the cron ran (nothing is wrong, nothing is spent).
   Otherwise the lead's timeline: `call.skipped` with `retry_expired`, a gate reason, or a cap (`org_hourly_cap`, ...); the retry is spent either way. No skip and no second `call.initiated` means the retry was dropped after the claim:
   search the logs for `[hotLeadCall] retry dropped after claim <reason> <orgId>` (permanent) or `retry rescheduled after claim` (transient, tried again) and `retry lost after claim` for the reason.
 

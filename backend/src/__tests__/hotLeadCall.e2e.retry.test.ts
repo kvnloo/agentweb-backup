@@ -65,7 +65,7 @@ describe('press 2 on the first call', () => {
     const { pressed, told } = await deferred();
     expect(sayText(pressed.body)).toBe('Okay. Smith & Sons will call you again later. Goodbye.');
     expect(sayText(told.body)).toBe('The lead is not available right now. We will try again later.');
-    expect(record()).toMatchObject({ state: 'finished', outcome: 'lead_deferred', deferral: { dueAt: '2026-10-19T18:00:00.000Z', count: 1 } });
+    expect(record()).toMatchObject({ state: 'finished', outcome: 'lead_deferred', deferral: { dueAt: '2026-10-19T18:00:00.000Z', count: 1, firstDueAt: '2026-10-19T18:00:00.000Z' } });
     expect(eventsOf('lead-a')).toEqual(['call.initiated', 'call.member_answered', 'call.lead_declined', 'call.completed']);
     expect(world.crm.lead(LIST, 'lead-a').engagements?.[2].eventData).toEqual({ reason: 'not_available_now' });
     expect(world.provider.placedCalls).toHaveLength(1);
@@ -110,7 +110,7 @@ describe('press 2 on the first call', () => {
   it('pushes the due time to the next lead window when 60 minutes later is too late (16:30 Chicago -> next day 12:00 Chicago)', async () => {
     setClock(chicago('16:30'));
     await deferred();
-    expect(record().deferral).toEqual({ dueAt: '2026-10-20T17:00:00.000Z', count: 1 });
+    expect(record().deferral).toEqual({ dueAt: '2026-10-20T17:00:00.000Z', count: 1, firstDueAt: '2026-10-20T17:00:00.000Z' });
   });
 
   it('a replay of the 2 and a later 1 do not create a second deferral or connect', async () => {
@@ -402,51 +402,100 @@ describe('the due-retries sweep', () => {
     });
   });
 
-  describe('a window that is closed at the moment the cron runs does not spend the retry', () => {
-    it('lead window closed (cron ticks at 17:01 CT = 18:01 ET after a 16:30 CT due time): moved to the next open minute, unclaimed, no call, then runs the next day', async () => {
-      setClock(chicago('15:30'));
-      await deferred();
-      expect(record().deferral).toEqual({ dueAt: chicago('16:30'), count: 1 });
-      setClock(chicago('17:01'));
-      expect(await sweep()).toMatchObject({ found: 1, rescheduled: 1, attempted: 0, expired: 0 });
-      expect(record().deferral).toEqual({ dueAt: '2026-10-20T17:00:00.000Z', count: 1 }); // next day 12:00 CT = 13:00 ET
-      expect(record().retryClaimToken).toBeUndefined();
-      expect(skips()).toEqual([]);
-      expect(world.provider.placedCalls).toHaveLength(1);
+  // Contract (owner): the retry is placed within 6 hours of its FIRST due time (deferral.firstDueAt) or it is given up with a
+  // retry_expired note. It is never moved to another day; a window that is closed when the cron runs only moves it inside those 6 hours.
+  describe('the 6 hours are counted from the FIRST due time', () => {
+    const note = () => (world.crm.lead(LIST, 'lead-a').engagements ?? []).filter((e) => e.eventType === 'call.skipped' && (e.eventData as { reason: string }).reason === 'retry_expired');
+    const setDeferral = (d: Record<string, unknown>) => { sidecar().deferral = d; };
 
-      setClock('2026-10-20T16:59:00.000Z');
-      expect(await sweep()).toMatchObject({ notDue: 1, attempted: 0 });
-      setClock('2026-10-20T17:00:00.000Z');
-      expect(await sweep()).toMatchObject({ attempted: 1, rescheduled: 0 });
+    it('press 13:00 ET (the window\'s first minute, due 14:00 ET) and a cron that only runs at 17:59 ET (window open until 18:00): still placed, within 6 hours', async () => {
+      await deferred();
+      expect(record().deferral).toEqual({ dueAt: chicago('13:00'), count: 1, firstDueAt: chicago('13:00') });
+      setClock(chicago('16:59')); // 17:59 ET
+      expect(await sweep()).toMatchObject({ attempted: 1, rescheduled: 0, expired: 0 });
       expect(world.provider.placedCalls).toHaveLength(2);
-      expect(record().retryClaimToken).toEqual(expect.any(String));
     });
 
-    it('org calling hours that closed meanwhile move it the same way', async () => {
+    it('press 17:55 ET: the press-time schedule is the next day\'s opening (13:00 ET); a cron that only gets there 6 hours later with the window closed gives up, it does not move again', async () => {
+      setClock(chicago('16:55')); // 17:55 ET
       await deferred();
-      setOrg({ callingHours: { start: '08:00', end: '13:00', timezone: 'America/Chicago' } });
-      advanceMinutes(60); // 13:00 CT: the org window is over
-      expect(await sweep()).toMatchObject({ rescheduled: 1, attempted: 0 });
-      expect(record().deferral).toEqual({ dueAt: '2026-10-20T17:00:00.000Z', count: 1 });
-      expect(record().retryClaimToken).toBeUndefined();
-    });
-
-    it('with no open minute in the next 36 hours the retry is spent: call.skipped retry_expired', async () => {
-      await deferred();
-      setOrg({ callingHours: { start: '01:00', end: '02:00', timezone: 'America/Chicago' } }); // never overlaps the lead window
-      advanceMinutes(60);
+      expect(record().deferral).toEqual({ dueAt: '2026-10-20T17:00:00.000Z', count: 1, firstDueAt: '2026-10-20T17:00:00.000Z' });
+      setClock('2026-10-20T23:01:00.000Z'); // 19:01 ET next day: 6h01 after the first due time, lead window closed
       expect(await sweep()).toMatchObject({ expired: 1, rescheduled: 0, attempted: 0 });
-      expect(skips()).toEqual(['retry_expired']);
+      expect(note()).toHaveLength(1);
+      expect((record().deferral as { dueAt: string }).dueAt).toBe('2026-10-20T17:00:00.000Z'); // not moved
+      expect(record().retryClaimToken).toEqual(expect.any(String));
+      expect(world.provider.placedCalls).toHaveLength(1);
+    });
+
+    it('a window closed at run time is only moved inside the 6 hours: org hours that reopen later the same day', async () => {
+      await deferred(); // due 13:00 CT
+      setOrg({ callingHours: { start: '14:30', end: '21:00', timezone: 'America/Chicago' } });
+      advanceMinutes(60);
+      expect(await sweep()).toMatchObject({ rescheduled: 1, attempted: 0 });
+      expect(record().deferral).toEqual({ dueAt: chicago('14:30'), count: 1, firstDueAt: '2026-10-19T18:00:00.000Z' });
+      expect(record().retryClaimToken).toBeUndefined();
+      setClock(chicago('14:30'));
+      expect(await sweep()).toMatchObject({ attempted: 1 });
+    });
+
+    it('a window closed at run time whose next opening is past first due + 6h is given up (no move to the next day), with the note', async () => {
+      await deferred(); // due 13:00 CT; 6h limit 19:00 CT
+      setClock(chicago('17:01')); // lead window closed (18:01 ET); next opening is tomorrow 12:00 CT
+      expect(await sweep()).toMatchObject({ expired: 1, rescheduled: 0, attempted: 0 });
+      expect(note()).toHaveLength(1);
+      expect((record().deferral as { dueAt: string }).dueAt).toBe('2026-10-19T18:00:00.000Z');
       expect(record().retryClaimToken).toEqual(expect.any(String));
       expect(await sweep()).toMatchObject({ found: 0 });
     });
 
-    it('two runs moving the same deferral cannot both win, and a claim by another run beats the reschedule', async () => {
+    it('with no open minute in 36 hours it is given up with the note', async () => {
       await deferred();
-      setClock(chicago('17:01'));
+      setOrg({ callingHours: { start: '01:00', end: '02:00', timezone: 'America/Chicago' } }); // never overlaps the lead window
+      advanceMinutes(60);
+      expect(await sweep()).toMatchObject({ expired: 1, rescheduled: 0, attempted: 0 });
+      expect(note()).toHaveLength(1);
+    });
+
+    it('first due 7h ago but dueAt moved 11 minutes ago and the window closed: claimed and given up, not moved again', async () => {
+      await deferred();
+      setClock('2026-10-20T01:00:00.000Z'); // 20:00 CT, 7h after the first due time (18:00Z)
+      setDeferral({ dueAt: new Date(Date.now() - 11 * 60_000).toISOString(), count: 1, firstDueAt: '2026-10-19T18:00:00.000Z' });
+      expect(await sweep()).toMatchObject({ expired: 1, rescheduled: 0 });
+      expect(note()).toHaveLength(1);
+    });
+
+    it('first due 8h ago is expired whether the windows are open or closed', async () => {
+      await deferred();
+      setClock('2026-10-20T02:00:00.000Z'); // 21:00 CT: closed
+      expect(await sweep()).toMatchObject({ expired: 1 });
+      expect(note()).toHaveLength(1);
+    });
+
+    it('a legacy record without firstDueAt falls back to its dueAt', async () => {
+      await deferred();
+      setDeferral({ dueAt: '2026-10-19T18:00:00.000Z', count: 1 });
+      setClock(chicago('17:01')); // closed; the next opening is past dueAt + 6h
+      expect(await sweep()).toMatchObject({ expired: 1, rescheduled: 0 });
+      expect(note()).toHaveLength(1);
+    });
+
+    it('a legacy record within its 6 hours is rescheduled and the move records firstDueAt = the old dueAt', async () => {
+      await deferred();
+      setDeferral({ dueAt: '2026-10-19T18:00:00.000Z', count: 1 });
+      setOrg({ callingHours: { start: '14:30', end: '21:00', timezone: 'America/Chicago' } });
+      advanceMinutes(60);
+      expect(await sweep()).toMatchObject({ rescheduled: 1 });
+      expect(record().deferral).toEqual({ dueAt: chicago('14:30'), count: 1, firstDueAt: '2026-10-19T18:00:00.000Z' });
+    });
+
+    it('two runs moving the same deferral cannot both win', async () => {
+      await deferred();
+      setOrg({ callingHours: { start: '14:30', end: '21:00', timezone: 'America/Chicago' } });
+      advanceMinutes(60);
       const runs = await Promise.all([sweep(), sweep()]);
       expect(runs.reduce((n, r) => n + r.rescheduled, 0)).toBeGreaterThanOrEqual(1);
-      expect(record().deferral).toEqual({ dueAt: '2026-10-20T17:00:00.000Z', count: 1 });
+      expect((record().deferral as { dueAt: string }).dueAt).toBe(chicago('14:30'));
       expect(world.provider.placedCalls).toHaveLength(1);
     });
   });
