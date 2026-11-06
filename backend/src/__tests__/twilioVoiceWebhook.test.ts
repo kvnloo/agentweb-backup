@@ -113,6 +113,9 @@ const screenResult = (digits?: string, extra: Record<string, string> = {}, sid =
 const leadStatus = (callStatus: string, extra: Record<string, string> = {}) =>
   post('status', { CallSid: LEAD_SID, ParentCallSid: MEMBER_SID, CallStatus: callStatus, ...extra }, { query: `${QUERY}&leg=lead` });
 
+/** The console.warn spy (logSpy is log, warn, error, info in that order). */
+const warnSpy = (): jest.SpyInstance => logSpy[1];
+
 const usage = () => mock(recordCallUsage).mock.calls.map((c) => c[0]);
 
 beforeEach(() => {
@@ -2176,6 +2179,17 @@ describe('lead presses 2: not available now (one retry, ENG-2783)', () => {
     it('when the lead\'s phone is no longer the one approved: only 1 and 3', async () => {
       seed('bridging', { leadPhoneMac: leadPhoneMacOf('org-a', '+14155550999') });
       expect(await prompt()).not.toContain('press 2');
+    });
+
+    it('a failing eligibility read still serves the prompt, without option 2, and logs one warning without the error text', async () => {
+      mock(crmDb.getLeadById).mockRejectedValue(new Error('read failed for +14155550123'));
+      const res = await screen();
+      expect(res.status).toBe(200);
+      expect(res.text).toContain('Press 1 to be connected now, or press 3 to stop these calls.');
+      expect(res.text).not.toContain('press 2');
+      expect(res.text).toContain('<Gather');
+      const warns = warnSpy().mock.calls.map((c) => c.join(' ')).filter((l) => l.includes('retry eligibility unavailable'));
+      expect(warns).toEqual(['[hotLeadCall] retry eligibility unavailable, option 2 not offered: Error']);
     });
 
     it('with retries switched off: only 1 and 3', async () => {

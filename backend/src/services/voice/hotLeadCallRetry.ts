@@ -19,10 +19,11 @@ export const RETRY_EXPIRES_AFTER_MS = 6 * 60 * MINUTE_MS;
  * When the retry for a lead who pressed 2 at `now` is due: 60 minutes later if the lead window (leadLocalHours.ts, for
  * this number) and the org's calling hours are both open then, else the first minute at or after that which they are
  * both open. Null when no such minute exists within 36 hours: the 2 is then an ordinary decline (no retry is scheduled).
+ * `delayMs` is the 60 minutes of the INITIAL deferral at press time; a due retry whose window turned out closed at run time passes 0.
  * The org's hours are part of the search so that a retry is not scheduled for a minute the gates would refuse anyway.
  */
-export function retryDueAt(phoneE164: string, config: Pick<HotLeadCallConfig, 'callingHours'>, now: Date): Date | null {
-  return openAtOrAfter(phoneE164, config, now.getTime() + RETRY_DELAY_MS);
+export function retryDueAt(phoneE164: string, config: Pick<HotLeadCallConfig, 'callingHours'>, now: Date, delayMs: number = RETRY_DELAY_MS): Date | null {
+  return openAtOrAfter(phoneE164, config, now.getTime() + delayMs);
 }
 
 /**

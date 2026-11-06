@@ -427,7 +427,7 @@ router.post('/screen', guarded(async (_req, res, q, body) => {
   sendXml(res, leadScreenTwiml({ announcedName: ctx.config.announcedName, callbackNumber: ctx.config.twilioNumber, resultUrl: buildVoiceWebhookUrl('screen-result', q),
     // Option 2 is offered only when the retry can really happen: the same eligibility /screen-result applies to a 2 (first call,
     // retries and kill switch on, live config, the approved phone, an open window within 36 hours). It is checked again at the 2.
-    canDefer: await deferralDueAt(q, current) !== null,
+    canDefer: await canOfferDeferral(q, current),
   }));
 }, twimlReplies));
 
@@ -493,6 +493,19 @@ async function deferralDueAt(q: CallQuery, record: HotLeadCallRecord): Promise<D
   const leadNow = ctx ? await leadPhoneFor(q, ctx) : null;
   if (!ctx || !leadNow || record.leadPhoneMac !== leadPhoneMacOf(ctx.orgId, leadNow.phone)) return null;
   return retryDueAt(leadNow.phone, ctx.config, new Date());
+}
+
+/**
+ * Whether /screen speaks option 2. The check reads the lead and the org, and a failing read must never hang the lead up: it is logged
+ * once (error name only, no ids of people, no numbers) and the lead hears the two-option prompt, which promises nothing.
+ */
+async function canOfferDeferral(q: CallQuery, record: HotLeadCallRecord): Promise<boolean> {
+  try {
+    return await deferralDueAt(q, record) !== null;
+  } catch (err) {
+    console.warn('[hotLeadCall] retry eligibility unavailable, option 2 not offered:', errorName(err));
+    return false;
+  }
 }
 
 router.post('/screen-result', guarded(async (_req, res, q, body) => {

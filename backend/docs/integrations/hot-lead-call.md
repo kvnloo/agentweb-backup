@@ -1329,7 +1329,7 @@ delete. A 404 from Twilio counts as already released. Reconcile any such log lin
 | Symptom | Likely cause |
 | --- | --- |
 | Member is called but hears "application error" | The `/owner` fetch failed: `BACKEND_URL` wrong or unreachable (check scheme and host), or credentials could not be loaded (503), or the signature failed (401). Twilio's call log shows the webhook response. |
-| Calls never placed, timeline shows `call.skipped` | The `reason` names the gate. `outside_calling_hours`, `outside_lead_hours`, `no_one_available`, `duplicate_phone`, `do_not_call` (the lead or the number pressed 3 or is do-not-contact; see [Do-not-call list](#do-not-call-list)), `member_cooldown` and `org_monthly_cap` are expected behavior (`org_monthly_cap`: the org used its monthly allowance; calls resume on the 1st, the owner was emailed, the Slack alert went out). An `outside_lead_hours` lead is not retried or deferred (the job runs once) EXCEPT a press-2 retry, which can itself skip with that reason when it is refused at run time; a `retry_expired` skip means a press-2 retry could not run within six hours of its due time (or no open minute was left); the lead window is 10:00-18:00 lead-local, about 13:00-18:00 Eastern for most US numbers, so a lead that arrives in the evening or morning is simply not called. |
+| Calls never placed, timeline shows `call.skipped` | The `reason` names the gate. `outside_calling_hours`, `outside_lead_hours`, `no_one_available`, `duplicate_phone`, `do_not_call` (the lead or the number pressed 3 or is do-not-contact; see [Do-not-call list](#do-not-call-list)), `member_cooldown` and `org_monthly_cap` are expected behavior (`org_monthly_cap`: the org used its monthly allowance; calls resume on the 1st, the owner was emailed, the Slack alert went out). An `outside_lead_hours` lead is not retried or deferred (the job runs once) EXCEPT a press-2 retry, which can itself skip with that reason when it is refused at run time; a `retry_expired` skip means a press-2 retry could not run within six hours of its FIRST due time (`deferral.firstDueAt`, or no open minute was left); the lead window is 10:00-18:00 lead-local, about 13:00-18:00 Eastern for most US numbers, so a lead that arrives in the evening or morning is simply not called. |
 | No event and no call | Kill switch off, org disabled or config invalid, lead not `form_fill`, smoke-test lead, draft lead, or no phone: all silent by design. |
 | `call.skipped` `limits_unavailable` | `AW-MCPSessions` missing, IAM denied, or throttled. Fails closed. |
 | `no owner to bill for list` in logs | The list owner could not be resolved; the leg was not metered and `/status` answers 500. |
@@ -1574,7 +1574,7 @@ Nothing is promised that cannot happen.
 **Max one retry.** The retry keeps the record's `deferral`. `/screen-result` defers only a record that has none, so a 2 on the retry call is the plain decline above.
 **Prompt variants.** `/screen` speaks the three-option prompt ("Press 1 to be connected now, press 2 if you are not available and we will call you again later, or
 press 3 to stop these calls.") only on the lead's first call with retries on. On the retry call, and whenever `HOT_LEAD_CALL_RETRY` is off, it is "Press 1 to be connected now, or press 3 to stop these calls."
-(`canDefer` in `leadScreenTwiml`).
+(`canDefer` in `leadScreenTwiml`). If the eligibility check itself throws (a failed lead or org read), `/screen` logs one warning (`retry eligibility unavailable, option 2 not offered: <error name>`) and serves the two-option prompt rather than hanging up on the lead.
 
 **The due-retries cron.** The job queue has no run-after, so `cron/hotLeadCallRetryCron.ts` (armed in `server.ts`, every 5 minutes) calls
 `services/voice/hotLeadCallRetrySweep.ts` (plus one run 30 seconds after the cron is armed, so a fresh deploy does not wait a whole interval). Switch: `HOT_LEAD_CALL_RETRY` (unset = on; `off`, `0`, `false` = not armed and every run returns at once). It does nothing
@@ -1588,12 +1588,12 @@ Each run logs one counts-only line, only when something was found, attempted, ex
 claim was won and the reservation and placement ran; a cap or cooldown refusal inside it shows as `call.skipped` on the lead).
 
 **The contract.** A retry is placed within 6 hours of its FIRST due time (`deferral.firstDueAt`) or it is given up with a `call.skipped` `retry_expired` note. It is never moved to another day: a press at 17:55 ET gets
-the next day's 13:00 ET as its first due time (the press-time schedule, above), and from then on 6 hours are all it has. Records written before `firstDueAt` existed fall back to their `dueAt`.
+the next day's 13:00 ET as its first due time (the press-time schedule, above), and from then on 6 hours are all it has. Records written before `firstDueAt` existed, or with an unparseable one, fall back to their `dueAt` (a garbage value never disables the expiry).
 
 **The retry run** (`processHotLeadCallRetry` in `hotLeadCallService.ts`), in order:
-1. Kill switch; the record is `finished`, outcome `lead_deferred`, has a due `deferral` and no `retryClaimToken`.
-2. Expiry, first: more than 6 hours after `firstDueAt` (whether or not the windows are open) is claimed and given up with the `retry_expired` note. Then windows: if the lead window or the org's calling hours are closed AT THIS MOMENT
-   (a late cron tick, hours edited since), `retryDueAt(now)` is looked up; if it is later than `firstDueAt` + 6 hours (or there is none within 36 hours) the retry is claimed and given up with the note, otherwise
+1. Kill switch; the record is `finished`, outcome `lead_deferred`, has a pending `deferral` and no `retryClaimToken`.
+2. Expiry, first, before anything else including "not due yet": more than 6 hours after `firstDueAt` (whether or not the windows are open, and whatever the stored `dueAt` says, a FUTURE one included: an operator-written or older-shape record) is claimed and given up with the `retry_expired` note. A deferral that is merely not due yet is left alone. Then windows: if the lead window or the org's calling hours are closed AT THIS MOMENT
+   (a late cron tick, hours edited since), the next open minute COUNTED FROM NOW is looked up (`retryDueAt(..., now, 0)`: the 60 minute delay belongs to the press-time schedule only, so an opening 10 minutes from now is found); if it is later than `firstDueAt` + 6 hours (or there is none within 36 hours) the retry is claimed and given up with the note, otherwise
    `deferral.dueAt` is moved to it with a conditional write (`LeadCallStore.rescheduleRetry`, only while no claim is there, `firstDueAt` kept) and the run stops (`rescheduled`).
 3. Claim: a conditional write of `retryClaimToken`/`retryClaimedAt` only while none is there (`LeadCallStore.claimRetry`). Exactly one run or instance wins, however many overlap.
    After the claim only a PERMANENT refusal spends the retry; a transient one gives the claim back (see the table below). The `retry_expired` note is always written as its own event (the per-lead 5-skip cap and the one-per-reason dedupe cannot swallow it).
@@ -1607,6 +1607,8 @@ the next day's 13:00 ET as its first due time (the press-time schedule, above), 
    `startedAt`, `memberId`, `triedMemberIds: [member]`, `claimToken`, `leadPhoneMac`, empties `meteredLegs` and `lastSequence`, and removes `memberCallSid`, `leadCallSid` and `outcome`. The new `jobKey` makes the first
    call's late Twilio callbacks stop matching. From there it is an ordinary call (member prompt "New lead from ...", then the lead screen); the first call's events stay on the timeline, followed by the retry's own
    `call.initiated`. If no record is created the slot is released.
+
+The transient-refusal release keeps its +15 minute floor (a refused cap or a busy team is not a window problem, and retrying every cron tick would only hammer it); the window search then pushes it later only if 15 minutes on is closed.
 
 **Permanent vs transient refusals after the claim.** `review()`/`preflight` report WHY they stopped (the dispatch path still just gets "do nothing").
 

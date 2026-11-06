@@ -329,9 +329,10 @@ async function recordRetryExpired(lead: LeadRow): Promise<void> {
 
 /**
  * The lead's one retry (press 2, ENG-2783), run by the due-retries cron for a lead whose record is finished with outcome
- * `lead_deferred`. In order: the kill switch; the record is the pending deferral and due; more than six hours late is
- * `retry_expired`; a lead or org window that is closed AT THIS MOMENT moves the deferral to the next open minute without
- * claiming it (a late cron tick must not spend the retry); the CLAIM (the conditional write that makes the retry happen at
+ * `lead_deferred`. In order: the kill switch; the record is a pending deferral; more than six hours past its FIRST due time
+ * (whatever its current dueAt says, a future one included) is claimed and given up as `retry_expired`; not yet due is left alone;
+ * a lead or org window that is closed AT THIS MOMENT moves the deferral to the next open minute counted from now, inside those six
+ * hours, without claiming it (a late cron tick must not spend the retry); the CLAIM (the conditional write that makes the retry happen at
  * most once, whoever else is running); every gate of a new lead except the age and the existing-record checks; the lead's
  * phone still being the one approved; a fresh slot against the hourly, daily and monthly caps; a fresh pass over the team.
  *
@@ -346,27 +347,33 @@ export async function processHotLeadCallRetry(listId: string, leadId: string, no
   const record = await store.get(listId, leadId);
   const dueAt = Date.parse(record?.deferral?.dueAt ?? '');
   if (!record || record.state !== 'finished' || record.outcome !== 'lead_deferred' || record.retryClaimToken !== undefined || !Number.isFinite(dueAt)) return 'not_pending';
-  if (now.getTime() < dueAt) return 'not_due';
-
-  const ctx = await resolveHotLeadCallContext(listId);
-  const lead = await crmDb.getLeadById(listId, leadId, { consistentRead: true });
+  // Contract: the retry is placed within six hours of its FIRST due time or it is given up, never moved to another day. Records written
+  // before `firstDueAt` existed fall back to their current dueAt. The give-up comes before "not due yet": a deferral whose dueAt lies in
+  // the future but whose firstDueAt is older than the limit (an operator-written or older-shape record) must be given up, not left waiting.
+  // An unparseable firstDueAt would make the limit NaN and silently disable the expiry: it falls back to dueAt too, and one value is used everywhere.
+  const parsedFirst = Date.parse(record.deferral?.firstDueAt ?? '');
+  const firstMs = Number.isFinite(parsedFirst) ? parsedFirst : dueAt;
+  const firstDueAt = new Date(firstMs).toISOString();
+  const giveUpAt = firstMs + RETRY_EXPIRES_AFTER_MS;
   const token = randomUUID();
   const claim = (): Promise<boolean> => store.claimRetry(listId, leadId, record.jobKey, token);
-  const orgId = ctx?.orgId ?? 'unknown_org';
-  // Contract: the retry is placed within six hours of its FIRST due time or it is given up, never moved to another day. Records written
-  // before `firstDueAt` existed fall back to their current dueAt.
-  const firstDueAt = record.deferral?.firstDueAt ?? new Date(dueAt).toISOString();
-  const giveUpAt = Date.parse(firstDueAt) + RETRY_EXPIRES_AFTER_MS;
-  const giveUp = async (): Promise<RetryOutcome> => {
+  const giveUp = async (known?: LeadRow | null): Promise<RetryOutcome> => {
     if (!await claim()) return 'lost';
+    const lead = known === undefined ? await crmDb.getLeadById(listId, leadId, { consistentRead: true }) : known;
     if (lead) await recordRetryExpired(lead);
     return 'expired';
   };
   if (now.getTime() > giveUpAt) return giveUp();
+  if (now.getTime() < dueAt) return 'not_due';
+
+  const ctx = await resolveHotLeadCallContext(listId);
+  const lead = await crmDb.getLeadById(listId, leadId, { consistentRead: true });
+  const orgId = ctx?.orgId ?? 'unknown_org';
   const callable = ctx && lead ? callableLeadPhone(lead.phone, ctx.config) : null;
   if (ctx && callable && 'phone' in callable && !(isInsideLeadCallWindow(callable.phone, now) && isWithinCallWindow(ctx.config.callingHours, now))) {
-    const next = retryDueAt(callable.phone, ctx.config, now);
-    if (!next || next.getTime() > giveUpAt) return giveUp();
+    // A due retry whose window is closed: the next open minute counted from NOW (the 60 minute delay belongs to the press, not here).
+    const next = retryDueAt(callable.phone, ctx.config, now, 0);
+    if (!next || next.getTime() > giveUpAt) return giveUp(lead);
     const moved = await store.rescheduleRetry(listId, leadId, record.jobKey, { dueAt: next.toISOString(), firstDueAt });
     return moved ? 'rescheduled' : 'lost';
   }
@@ -380,9 +387,11 @@ export async function processHotLeadCallRetry(listId: string, leadId: string, no
       return 'refused';
     }
     const phone = callable && 'phone' in callable ? callable.phone : null;
+    // A refusal is not a window problem, so the +15 minute floor stays (hammering a full cap or a busy team every cron tick helps no one);
+    // the window search only pushes it later when 15 minutes on is closed.
     const earliest = now.getTime() + RETRY_REQUEUE_MS;
     const next = phone && ctx ? openAtOrAfter(phone, ctx.config, earliest) : new Date(earliest);
-    if (!next || next.getTime() > Date.parse(firstDueAt) + RETRY_EXPIRES_AFTER_MS) {
+    if (!next || next.getTime() > giveUpAt) {
       if (lead) await recordRetryExpired(lead);
       retryLog('dropped', 'retry_expired', orgId);
       return 'expired';

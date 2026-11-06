@@ -58,3 +58,28 @@ describe('retrySweepEnabled (HOT_LEAD_CALL_RETRY)', () => {
     },
   );
 });
+
+describe('retryDueAt delayMs (a due retry whose window is closed searches from now, not from now + 60 minutes)', () => {
+  const NOW = new Date('2026-10-19T19:30:00Z'); // 15:30 EDT
+  const evening = { callingHours: { start: '15:40', end: '16:00', timezone: 'America/New_York' } };
+
+  it('the example: at 15:30 a 15:40-16:00 opening is found with no delay, and missed by the press-time 60 minutes', () => {
+    expect(iso(retryDueAt(LEAD, evening, NOW, 0))).toBe('2026-10-19T19:40:00.000Z');
+    expect(iso(retryDueAt(LEAD, evening, NOW))).toBe('2026-10-20T19:40:00.000Z'); // 16:30 is closed: tomorrow's 15:40
+  });
+
+  it('with no delay and both windows open it is now itself (not rounded)', () => {
+    expect(iso(retryDueAt(LEAD, wide, new Date('2026-10-19T17:00:30.500Z'), 0))).toBe('2026-10-19T17:00:30.500Z');
+  });
+
+  it('the press-time schedule is unchanged: the default delay is 60 minutes', () => {
+    expect(iso(retryDueAt(LEAD, wide, new Date('2026-10-19T17:00:00Z')))).toBe('2026-10-19T18:00:00.000Z');
+    expect(iso(retryDueAt(LEAD, wide, new Date('2026-10-19T17:00:00Z'), 60 * 60_000))).toBe('2026-10-19T18:00:00.000Z');
+    expect(iso(retryDueAt(LEAD, wide, new Date('2026-10-19T21:30:00Z')))).toBe('2026-10-20T17:00:00.000Z');
+  });
+
+  it('across a DST day: with no delay, Saturday 18:30 EDT finds Sunday 13:00 EST; Sunday 12:59 EST finds 13:00 EST', () => {
+    expect(iso(retryDueAt(LEAD, wide, new Date('2026-10-31T22:30:00Z'), 0))).toBe('2026-11-01T18:00:00.000Z');
+    expect(iso(retryDueAt(LEAD, wide, new Date('2026-11-01T17:59:00Z'), 0))).toBe('2026-11-01T18:00:00.000Z');
+  });
+});
