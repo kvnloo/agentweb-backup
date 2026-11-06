@@ -558,7 +558,7 @@ arrives from the landing page AgentWeb will phone the verified team member(s) (n
 last 4 digits) from the org's number (last 4 digits) and then the lead, that calls are
 billed to the organization owner per minute at the live outbound rate (both the member's
 and the lead's call, each rounded up to a whole minute, as the metering does), the caps in
-force (`maxCallsPerHour`, `maxCallsPerDay`, `maxAttemptsPerLead`) and the calling hours with
+force (`maxCallsPerHour`, `maxCallsPerDay`, `maxCallsPerMonth`, `maxAttemptsPerLead`) and the calling hours with
 their timezone, taken from the settings about to be saved, and that calling can be turned
 off at any time. After the person clicks approve, Emma
 calls the tool again with the same arguments and it acts.
@@ -570,6 +570,8 @@ calls the tool again with the same arguments and it acts.
   is refused never sees a card. Then: a chat session must exist and be readable,
   must not be a scheduled session, and must not be a support/admin session acting
   as the customer (`isDelegatedAccess` / `isDelegatedAdmin`).
+- The card's wording is not part of the digest (only the inputs listed next are), so adding the monthly limit to the card text
+  did not change any digest; a card issued before that change still shows the old text and is still approvable.
 - Binding: the approval is tied to a digest of the action, org, user, chat
   session, the area code (or the number being released, or the exact settings change
   that turns calling on), the price as quoted now (rent, or the per-minute rate) and
@@ -978,13 +980,15 @@ back if the record is not created:
    Everything taken is given back when a later limit refuses (a monthly refusal returns the phone marker and the
    hourly and daily slots). Inbound callbacks are not counted against the monthly cap. A refusal records `call.skipped`
    `org_monthly_cap` and the Slack alert still goes out.
-   **Owner notices:** when the month's count reaches `ceil(0.8 * cap)` and at the first `org_monthly_cap` refusal, the org
+   **Owner notices:** when the month's count reaches `ceil(0.8 * cap)` (only for a cap of 5 or more: below that the 80% point
+   is the cap itself, so only the 100% email is sent) and at the first `org_monthly_cap` refusal, the org
    owner (`Organization.ownerUserId`'s user email) gets ONE email each per org per month through `emailService.sendEmail`
    (non-production sends are suppressed by the guard in `resendService`): "Your hot-lead calling is at 80% of this month's
    limit" and "Automatic hot-lead calls are paused until the 1st". De-duplicated by claims `hlc#notify#80#<orgId>#<YYYY-MM>`
    and `hlc#notify#100#<orgId>#<YYYY-MM>` (TTL 40 days) in the limit store. Best-effort and fire-and-forget
-   (`services/voice/hotLeadCallCapNotices.ts`): a failure never fails or delays the call; a send that fails gives the claim
-   back so the next crossing retries; no owner email means a logged skip. Log lines for alarms:
+   (`services/voice/hotLeadCallCapNotices.ts`): a failure never fails or delays the call; a failed 80% send gives the claim
+   back so the next crossing retries (bounded by the hourly cap), a failed 100% send KEEPS it (otherwise every refused lead
+   would redo the lookup and send during a provider outage); no owner email means a logged skip. Log lines for alarms:
    `[hotLeadCall] org monthly cap 80% <orgId>` and `[hotLeadCall] org monthly cap 100% <orgId>`, once per org per month.
 4. `limits_unavailable`: the limit store failed; nothing is dialed, the job
    fails (not retried), an event is written best-effort.
@@ -996,6 +1000,13 @@ window a repeat still cannot dial: the record is permanent.
 Known limits, accepted:
 
 - Fixed windows can admit up to 2x a cap across an hour or day boundary.
+- The monthly bucket follows the calling-hours time zone (UTC when none is set), so changing the zone mid-month starts a
+  fresh bucket, as for the hourly and daily counters.
+- Raising `maxCallsPerMonth` after the 100% notice was sent does not re-notify that month: the claim key does not include
+  the cap.
+- The 80% notice can fire for a count that is then given back when the call record is not created (rare); the email said
+  "used N" for a moment when N was reached.
+- Rollout: every org starts at 200 leads per month on deploy, because stored configs without the field read as the default.
 - Phone-rotating bots can consume the org's hourly and daily caps; the Slack
   alert still fires.
 - Whoever submits a number first suppresses calls for that number for 24h.
@@ -1115,7 +1126,22 @@ settings service). The next call is checked against the new value. The customer 
 other settings, and can still lower it. Values above 2000 make the whole config invalid (hot-lead calls stop, Slack only),
 so do not write them.
 
-Alarm markers (logs, once per org per month): `[hotLeadCall] org monthly cap 80% <orgId>` and
+Example (operator write, to raise org `org-123` to 600; read the item first and condition on what you read):
+
+```
+UpdateItem  TableName=AW-Organizations  Key={orgId: "org-123"}
+  UpdateExpression:    SET hotLeadCall.maxCallsPerMonth = :v
+  ConditionExpression: hotLeadCall = :prev      (the whole hotLeadCall map exactly as read; this also pins its revision)
+  :v = 600  (a number from 201 to 2000)
+```
+
+Afterwards verify: `GET /api/orgs/me/hot-lead-call` as that org (or Emma `get_hot_lead_call_settings`) shows
+`maxCallsPerMonth: 600`, and the config still validates (a read that answers "could not be read" means the write broke
+it). Nothing else needs a restart: the next lead is checked against the new value.
+
+Alarm markers (logs, each logged once per successful claim: the 80% marker can repeat only when its email failed and was
+retried at the next crossing; a failed 100% send is not retried and logs
+`[hotLeadCall] monthly cap 100% notice failed <orgId>` instead, without an address): `[hotLeadCall] org monthly cap 80% <orgId>` and
 `[hotLeadCall] org monthly cap 100% <orgId>`. The 100% marker means leads are being skipped as `org_monthly_cap`. To resend a
 notice by hand, delete the claim `hlc#notify#80#<orgId>#<YYYY-MM>` / `hlc#notify#100#...` (table `AW-MCPSessions`).
 

@@ -13,7 +13,7 @@ timeline; the Slack alert still goes out. New `LimitStore.read` (consistent coun
 Customer notices. The org owner gets one email at ceil(80%) of the cap and one at the first refusal, per org per month,
 via `emailService.sendEmail` (non-production suppressed by the resendService guard), de-duplicated by new key prefix
 `hlc#notify#80#` / `hlc#notify#100#<orgId>#<YYYY-MM>` (TTL 40 days). Fire-and-forget, never blocks or fails a call. Log
-markers `[hotLeadCall] org monthly cap 80% <orgId>` and `... 100% <orgId>` for alarms.
+a cap of 1-4 sends only the 100% email; a failed 100% send keeps its claim (logged `monthly cap 100% notice failed`), a failed 80% send is retried at the next crossing. The Emma enable approval card now also lists the monthly limit ("N per month"; the digest does not hash card text, so it is unchanged). Log markers `[hotLeadCall] org monthly cap 80% <orgId>` and `... 100% <orgId>` for alarms.
 
 Honest read-out (two P1 findings from the QA tool on the previous PR). The settings read and preview now carry additive
 `warnings` (Canada stored but not called yet); a Canada-only country list and calling hours that never meet the lead window
