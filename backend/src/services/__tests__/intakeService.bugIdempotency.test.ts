@@ -59,16 +59,6 @@ const baseParams = {
 };
 
 describe('ENG-529 AC5 — bug filing is idempotent at the destination', () => {
-  // `fileUserIssue` short-circuits to the pre-migration Notion path unless FEATUREBASE_INTAKE is
-  // on. Without this the whole suite goes red for the wrong reason — createTicket is simply never
-  // reached — which reads identically to a genuine failure.
-  const previousIntakeFlag = process.env.FEATUREBASE_INTAKE;
-  beforeAll(() => { process.env.FEATUREBASE_INTAKE = 'true'; });
-  afterAll(() => {
-    if (previousIntakeFlag === undefined) delete process.env.FEATUREBASE_INTAKE;
-    else process.env.FEATUREBASE_INTAKE = previousIntakeFlag;
-  });
-
   beforeEach(() => {
     jest.clearAllMocks();
     createTicket.mockResolvedValue({ id: 't1', number: 169, url: 'https://fb/t/169' });

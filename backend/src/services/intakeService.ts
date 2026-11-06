@@ -1,10 +1,9 @@
 /**
  * Issue intake orchestration — one place that decides where a filing goes.
  *
- * The FEATUREBASE_INTAKE flag is an EXPLICIT migration switch (Linear when on, Notion
- * when off — the off branch is deleted once the migration completes). It is NOT an
- * on-error fallback: we do not silently reroute a failed Linear write to Notion.
- * Instead we fail well —
+ * User-filed issues always go to Linear/Featurebase (the pre-migration Notion branch was
+ * removed in ENG-2817). There is no on-error fallback to another tracker. Instead we
+ * fail well —
  *   - non-critical sub-steps (dedup search, upvote, comment) are best-effort and degrade
  *     in place (dedup fails -> treat as new; upvote/comment fails -> still filed),
  *   - a core create failure propagates so the caller surfaces it (user-filed -> the user
@@ -94,10 +93,6 @@ async function findExactCanonicalMatch(
     }
   }
   return null;
-}
-
-function intakeEnabled(): boolean {
-  return process.env.FEATUREBASE_INTAKE === 'true';
 }
 
 /**
@@ -243,8 +238,8 @@ export interface FileUserIssueParams {
 const LINEAR_PRIORITY: Record<string, number> = { urgent: 1, high: 2, medium: 3, low: 4 };
 
 export interface FiledUserResult {
-  pageId: string;       // Featurebase post id (or Notion pageId when the flag is off)
-  trackerUrl: string;   // internal tracker link (Featurebase post / Notion page)
+  pageId: string;       // Featurebase post id
+  trackerUrl: string;   // internal tracker link (Featurebase post)
   userUrl?: string;     // public, user-facing Featurebase post link
   /**
    * Internal Linear canonical issue link (bugs only) — the single ticket eng works, whether this
@@ -258,18 +253,6 @@ export interface FiledUserResult {
 }
 
 export async function fileUserIssue(p: FileUserIssueParams): Promise<FiledUserResult> {
-  // Migration switch (NOT a fallback): off -> Notion, the pre-migration default.
-  if (!intakeEnabled()) {
-    const { createOncallItem } = await import('./notionService');
-    const o = await createOncallItem({
-      title: p.title,
-      description: p.description,
-      additionalTags: p.notionTags || ['Customer Reported'],
-      context: p.notionContext,
-    });
-    return { pageId: o.pageId, trackerUrl: o.notionUrl, deduped: false, tracker: 'Notion' };
-  }
-
   // Featurebase-first. Bugs -> a private per-reporter TICKET (their own card) grouped onto a
   // Linear canonical (the resolve-bridge notifies every reporter on fix). Feature requests ->
   // a public, votable POST. This split matches Featurebase's own guidance (public requests on
@@ -678,8 +661,7 @@ export interface FiledAutoResult {
  * File an auto-identified issue in Linear. Callers should treat this as best-effort and wrap it
  * (a failed self-report must not break the user's real request) — it throws on a hard failure.
  *
- * Auto issues deliberately ignore FEATUREBASE_INTAKE: that flag controls the customer-facing
- * Featurebase migration, while Linear is the sole source of truth for system-generated work.
+ * Auto issues are private: Linear is the sole source of truth for system-generated work.
  */
 export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoResult> {
   const {
