@@ -56,7 +56,7 @@ export function googleSpendCeilingPolicyFromEnv(raw = process.env.GOOGLE_TOOLKIT
   if (!raw) return null;
   try {
     const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return { maxDailyBudget: parsed.maxDailyBudget, maxChangeRatio: parsed.maxChangeRatio };
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && (parsed.maxDailyBudget !== undefined || parsed.maxChangeRatio !== undefined)) return { maxDailyBudget: parsed.maxDailyBudget, maxChangeRatio: parsed.maxChangeRatio };
   } catch {
     /* fall through */
   }

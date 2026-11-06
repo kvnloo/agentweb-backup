@@ -132,7 +132,7 @@ describe('ENG-2823 hardening: money inputs', () => {
 describe('ENG-2823 hardening: spend ceiling on enable', () => {
   const ceiling = (raw: string) => () => googleSpendCeilingPolicyFromEnv(raw);
 
-  it.each(['[]', '[1]', '"100"', 'null', '7'])('a malformed ceiling (%s) refuses budget writes and enabling (fail closed)', async (raw) => {
+  it.each(['[]', '[1]', '"100"', 'null', '7', '{}', '{"maxDailyBudgett":1}'])('a malformed ceiling (%s) refuses budget writes and enabling (fail closed)', async (raw) => {
     const d = deps({ spendCeilingPolicy: ceiling(raw) });
     await expect(executeGoogleToolkitWrite('u1', budgetUpdate, 'USD', d)).rejects.toThrow(/could not be evaluated/);
     await expect(executeGoogleToolkitWrite('u1', enable, 'USD', d)).rejects.toThrow(/could not be evaluated/);
