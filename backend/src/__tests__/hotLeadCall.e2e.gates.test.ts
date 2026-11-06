@@ -68,7 +68,7 @@ describe('nothing is dialed when a gate says no', () => {
     expect(world.provider.placedCalls).toHaveLength(1);
   });
 
-  it('the org window alone closes at its exact minute while the lead window is still open (real lead check)', async () => {
+  it('control: the org gate reports outside_calling_hours at its exact minute when the lead window is open at both instants', async () => {
     world.crm.orgs.set('org-a', { ...world.crm.orgs.get('org-a'), hotLeadCall: { ...callConfig, callingHours: { start: '08:00', end: '16:30', timezone: 'America/Chicago' } } });
     setClock('2026-10-19T21:29:00.000Z'); // 16:29 CDT = 17:29 EDT: both windows open
     await submitLead('lead-a');

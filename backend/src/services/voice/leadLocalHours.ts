@@ -10,7 +10,7 @@ import { localDayAndMinutes } from './hotLeadCallLimits';
 // contiguous US zones (Central and Mountain fall between), so the window holds in all of them only when it holds
 // in both: the effective window is START+3h to END in Eastern.
 // Hawaii (808) and Alaska (907) numbers get the same rule PLUS their home zone, since a mobile number can be
-// anywhere: that is a narrow band (Hawaii 16:00-18:00 Eastern in summer, Alaska 14:00-18:00).
+// anywhere: that is a narrow band (Hawaii 16:00-18:00 Eastern in summer and 15:00-18:00 in winter, Alaska 14:00-18:00).
 export const LEAD_CALL_START_MINUTES = 10 * 60;
 export const LEAD_CALL_END_MINUTES = 18 * 60;
 

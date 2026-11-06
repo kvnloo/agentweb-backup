@@ -343,6 +343,25 @@ describe('the world changes between two attempts', () => {
     expect(eventsOf('lead-a')).toEqual(['call.initiated', 'call.member_no_answer', 'call.completed']);
   });
 
+  // The next-attempt pass checks only the org's hours and the roster (hotLeadCallAttempts.ts), not the lead window, so with a wide
+  // org window the next member IS rung after 18:00 Eastern; the lead window then stops the call at /gather (lead_outside_hours).
+  it('the lead window closes alone (org open until 21:00): the next member is rung but /gather refuses to dial the lead', async () => {
+    configure({ callingHours: { start: '09:00', end: '21:00', timezone: 'America/Chicago' } });
+    setClock(chicago('16:58')); // 17:58 Eastern
+    await submitLead('lead-a');
+    expect(rungPhones()).toEqual([PHONE.c]);
+    betweenRequestAndJob(() => setClock(chicago('17:01'))); // 18:01 Eastern
+    await noAnswer(1);
+    expect(rungPhones()).toEqual([PHONE.c, PHONE.d]);
+
+    const call = nthCall(2);
+    await call.memberAnswers();
+    const reply = await call.memberPresses('1');
+    expect(reply.body).not.toContain('<Dial');
+    expect(record()).toMatchObject({ outcome: 'lead_outside_hours' });
+    expect(eventsOf('lead-a')).toContain('call.failed');
+  });
+
   it.each([['17:00', '16:58', '17:01'], ['16:30', '16:28', '16:31']])('the calling hours (end %s) have ended by the time the first attempt ends: finished with the attempt\'s own outcome', async (end, before, after) => {
     configure({ callingHours: { start: '09:00', end, timezone: 'America/Chicago' } });
     setClock(chicago(before));
