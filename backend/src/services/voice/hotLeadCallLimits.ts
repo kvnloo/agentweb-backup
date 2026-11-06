@@ -8,15 +8,15 @@ import { keyedDigest } from './keyedDigest';
 type LimitDenial = 'duplicate_phone' | 'in_progress' | 'org_hourly_cap' | 'org_daily_cap';
 
 const MINUTE_S = 60;
-const HOUR_S = 3600;
-const DAY_S = 24 * HOUR_S;
+export const HOUR_S = 3600;
+export const DAY_S = 24 * HOUR_S;
 const PHONE_WINDOW_S = DAY_S;
 
 // ---- calling hours -----------------------------------------------------------------------------------------
 
 const two = (n: number): string => String(n).padStart(2, '0');
 
-function localDayAndMinutes(timeZone: string, at: Date): { date: string; minutes: number } {
+export function localDayAndMinutes(timeZone: string, at: Date): { date: string; minutes: number } {
   const l = localParts(at.getTime(), timeZone);
   return { date: `${l.year}-${two(l.month)}-${two(l.day)}`, minutes: minutesOfDay(l) };
 }
@@ -47,9 +47,36 @@ export const cooldownKey = (orgId: string, memberId: string): string => `hlc#coo
 // Fixed windows (not sliding): up to twice the cap can dial across an hour or day boundary, which is
 // bounded and keeps each check a single write. Hours are UTC clock hours; days are the org's local calendar day.
 export const hourlyCapKey = (orgId: string, at: Date): string => `hlc#cap#h#${orgId}#${at.toISOString().slice(0, 13)}`;
+/** The zone the org's daily windows follow: its calling-hours zone, UTC when none is set. */
+export const limitTimeZone = (config: Pick<HotLeadCallConfig, 'callingHours'>): string => config.callingHours?.timezone ?? 'UTC';
 export const dailyCapKey = (orgId: string, timeZone: string, at: Date): string => `hlc#cap#d#${orgId}#${localDayAndMinutes(timeZone, at).date}`;
 
 // ---- reservation -----------------------------------------------------------------------------------------
+
+/**
+ * One reservation's limit-store writes, each remembered so `releaseAll()` can give back everything taken so far
+ * (in reverse order). `claim` takes an expiring claim for `token`; `count` adds one below `cap`. Both return false on
+ * a refusal (nothing taken) and throw on a store failure (the caller releases and rethrows).
+ */
+export function slotTaker(nowS: number) {
+  const store = getLimitStore();
+  const undo: Array<() => Promise<void>> = [];
+  return {
+    async claim(key: string, ttlS: number, token: string): Promise<boolean> {
+      if (!await store.claim(key, token, nowS + ttlS, nowS)) return false;
+      undo.push(() => store.release(key, token));
+      return true;
+    },
+    async count(key: string, cap: number, ttlS: number): Promise<boolean> {
+      if (!await store.incrementBelow(key, cap, nowS + ttlS)) return false;
+      undo.push(() => store.decrement(key));
+      return true;
+    },
+    async releaseAll(): Promise<void> {
+      for (const step of undo.splice(0).reverse()) await step();
+    },
+  };
+}
 
 export type Reservation = { ok: true; release: () => Promise<void> } | { ok: false; reason: LimitDenial };
 
@@ -82,34 +109,19 @@ export async function reserveCallSlot(input: {
   const { orgId, phoneE164, config } = input;
   const now = input.now ?? new Date();
   const nowS = Math.floor(now.getTime() / 1000);
-  const store = getLimitStore();
-  const undo: Array<() => Promise<void>> = [];
-  const releaseAll = async (): Promise<void> => {
-    for (const step of undo.splice(0).reverse()) await step();
-  };
+  const { claim: takeClaim, count, releaseAll } = slotTaker(nowS);
 
   const leadPrefix = `${input.listId}#${input.leadId}#`;
-  const claim = async (key: string, ttlS: number, tokenPrefix = ''): Promise<boolean> => {
-    const token = `${tokenPrefix}${randomUUID()}`;
-    if (!await store.claim(key, token, nowS + ttlS, nowS)) return false;
-    undo.push(() => store.release(key, token));
-    return true;
-  };
-  const count = async (key: string, cap: number, ttlS: number): Promise<boolean> => {
-    if (!await store.incrementBelow(key, cap, nowS + ttlS)) return false;
-    undo.push(() => store.decrement(key));
-    return true;
-  };
-
+  const claim = (key: string, ttlS: number, tokenPrefix: string): Promise<boolean> => takeClaim(key, ttlS, `${tokenPrefix}${randomUUID()}`);
   try {
     const phoneKey = phoneMarkerKey(orgId, phoneE164);
     if (!await claim(phoneKey, PHONE_WINDOW_S, leadPrefix)) {
-      const holder = await store.holder(phoneKey, nowS);
+      const holder = await getLimitStore().holder(phoneKey, nowS);
       return { ok: false, reason: holder?.startsWith(leadPrefix) ? 'in_progress' : 'duplicate_phone' };
     }
     const counters: Array<[LimitDenial, () => Promise<boolean>]> = [
       ['org_hourly_cap', () => count(hourlyCapKey(orgId, now), config.maxCallsPerHour, 2 * HOUR_S)],
-      ['org_daily_cap', () => count(dailyCapKey(orgId, config.callingHours?.timezone ?? 'UTC', now), config.maxCallsPerDay, 2 * DAY_S)],
+      ['org_daily_cap', () => count(dailyCapKey(orgId, limitTimeZone(config), now), config.maxCallsPerDay, 2 * DAY_S)],
     ];
     for (const [reason, take] of counters) {
       if (!await take()) {

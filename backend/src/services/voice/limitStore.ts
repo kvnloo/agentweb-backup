@@ -23,7 +23,8 @@ export interface LimitStore {
 
 // An existing table with a native `ttl` attribute. Its only scan is the eval credential-cleanup inventory
 // (evaluationStore prepareCredentialCleanup), which filters on agentUserId, so `hlc#` rows are read by that scan
-// but never matched or touched. Not a new table or index: new key prefixes only (hlc#phone#, hlc#cool#, hlc#cap#h#, hlc#cap#d#).
+// but never matched or touched. Not a new table or index: new key prefixes only (hlc#phone#, hlc#cool#, hlc#cap#h#,
+// hlc#cap#d#, and the inbound hlc#cap#ih#, hlc#cap#id#, hlc#in#p#, hlc#in#c#).
 const LIMITS_TABLE = tableName('AW-MCPSessions');
 const PK = 'sessionId';
 

@@ -67,6 +67,7 @@ import { recordCallUsage } from '../services/voice/voiceUsage';
 import {
   isAcceptingMember, nextInboundMember, resolveInboundContext, resolveInboundContextForOrg, triedMembersOf, type InboundContext,
 } from '../services/voice/inboundCallback';
+import { inboundCallerE164, reserveInboundSlot } from '../services/voice/inboundLimits';
 import { leadPhoneMacOf } from '../services/voice/leadPhoneMac';
 import { holdsClaim } from '../services/hotLeadCallPlacement';
 import { callableLeadPhone } from '../services/hotLeadCallConfig';
@@ -604,10 +605,18 @@ function guardedInboundEntry(handler: (res: Response, body: FormParams) => Promi
   };
 }
 
-/** Rings the next member, or tells the caller nobody can take the call. `tried` are the members already rung. */
-function ringNextOrApologise(res: Response, ctx: InboundContext, tried: readonly string[]): void {
+/**
+ * Rings the next member, or tells the caller nobody can take the call. `tried` are the members already rung.
+ * `admit` (the entry point only) runs once a member would really be rung; when it returns false it has already
+ * answered the caller, and nobody is rung.
+ */
+async function ringNextOrApologise(
+  res: Response, ctx: InboundContext, tried: readonly string[], admit?: () => Promise<boolean>,
+): Promise<void> {
   const member = nextInboundMember(ctx.config, tried, new Date());
   if (!member || !ctx.config.twilioNumber) return sendXml(res, inboundNobodyTwiml());
+  // `admit` runs only once a member would really be rung, so a call nobody can take never costs a slot.
+  if (admit && !await admit()) return;
   const step = { orgId: ctx.orgId, tried: [...tried, member.id] };
   sendXml(res, inboundRingTwiml({
     memberE164: member.phone,
@@ -618,10 +627,31 @@ function ringNextOrApologise(res: Response, ctx: InboundContext, tried: readonly
   }));
 }
 
+/**
+ * Takes the call's slot against the inbound abuse limits (ENG-2784). When refused or the store fails, answers the
+ * caller itself (the nobody copy / the unavailable copy: fail closed) and returns false. Only org, reason and the
+ * outcome are logged, never the caller's number.
+ */
+async function admitInboundCall(res: Response, ctx: InboundContext, body: FormParams): Promise<boolean> {
+  try {
+    // A signed Twilio call always has a CallSid; without one the retry marker cannot work, so the call is not admitted.
+    const callSid = sidOf(body, 'CallSid');
+    if (!callSid) throw new Error('missing CallSid');
+    const slot = await reserveInboundSlot({ orgId: ctx.orgId, callSid, callerE164: inboundCallerE164(body.From), config: ctx.config });
+    if (slot.ok) return true;
+    console.warn('[hotLeadCall] inbound capped', slot.reason, ctx.orgId);
+    sendXml(res, inboundNobodyTwiml());
+  } catch (err) {
+    console.warn('[hotLeadCall] inbound limits unavailable', errorName(err));
+    sendXml(res, inboundUnavailableTwiml());
+  }
+  return false;
+}
+
 router.post('/inbound', guardedInboundEntry(async (res, body) => {
   const ctx = await resolveInboundContext(body.To || body.Called);
   if (!ctx) return sendXml(res, inboundUnavailableTwiml());
-  ringNextOrApologise(res, ctx, []);
+  await ringNextOrApologise(res, ctx, [], () => admitInboundCall(res, ctx, body));
 }));
 
 router.post('/inbound-screen', guardedInbound(async (res, _body, q) => {
@@ -650,7 +680,7 @@ router.post('/inbound-dial', guardedInbound(async (res, body, q) => {
   if (!tryNext) return sendHangup(res);
   const ctx = await resolveInboundContextForOrg(q.orgId);
   if (!ctx) return sendXml(res, inboundUnavailableTwiml());
-  ringNextOrApologise(res, ctx, q.tried);
+  await ringNextOrApologise(res, ctx, q.tried);
 }));
 
 // Deliberately not gated on the kill switch, config or plan: the leg already happened and must still be billed.
