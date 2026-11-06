@@ -1,6 +1,6 @@
 import { FakeLimitStore } from '../../../__tests__/helpers/fakeLimitStore';
 import { setLimitStoreForTests } from '../limitStore';
-import { claimMemberCooldown, cooldownKey, dailyCapKey, hourlyCapKey, isWithinCallWindow, phoneMarkerKey, reserveCallSlot } from '../hotLeadCallLimits';
+import { claimMemberCooldown, cooldownKey, dailyCapKey, hourlyCapKey, isWithinCallWindow, localMonth, monthlyCapKey, phoneMarkerKey, reserveCallSlot } from '../hotLeadCallLimits';
 import type { HotLeadCallConfig } from '../../hotLeadCallConfig';
 import { teamMember } from '../../../__tests__/helpers/hotLeadCallFixtures';
 
@@ -113,7 +113,7 @@ describe('reserveCallSlot', () => {
     const r = await reserve();
     if (!r.ok) throw new Error('expected a reservation');
     await r.release();
-    expect([...limits.counters.values()]).toEqual([0, 0]);
+    expect([...limits.counters.values()]).toEqual([0, 0, 0]);
     expect(limits.claims.size).toBe(0);
   });
 
@@ -162,5 +162,115 @@ describe('claimMemberCooldown', () => {
     await claim(A.id, later);
     await stale!();
     expect(limits.claims.has(cooldownKey('o', A.id))).toBe(true);
+  });
+});
+
+describe('monthly cap (ENG-2783)', () => {
+  const capped = (cap: number, over: Partial<HotLeadCallConfig> = {}) => ({ ...config, maxCallsPerHour: 30, maxCallsPerDay: 100, maxCallsPerMonth: cap, ...over }) as HotLeadCallConfig;
+  let n = 0;
+  // A fresh number per lead: the phone marker would otherwise refuse the repeat first.
+  const reserve = (cfg: HotLeadCallConfig, now: Date = NOW) =>
+    reserveCallSlot({ orgId: 'o', listId: 'list-a', leadId: `lead-${n}`, phoneE164: `+1555555${String(1000 + n++).padStart(4, '0')}`, config: cfg, now });
+  beforeEach(() => { n = 0; });
+
+  it('admits cap - 1 and cap leads, refuses the next, and names org_monthly_cap', async () => {
+    const cfg = capped(3);
+    for (let i = 0; i < 3; i++) expect((await reserve(cfg)).ok).toBe(true);
+    expect(await reserve(cfg)).toEqual({ ok: false, reason: 'org_monthly_cap' });
+    expect(limits.counters.get(monthlyCapKey('o', 'America/Chicago', NOW))).toBe(3);
+  });
+
+  it('reports the month\'s count after this lead was counted', async () => {
+    const cfg = capped(5);
+    expect(await reserve(cfg)).toMatchObject({ ok: true, monthlyUsed: 1 });
+    expect(await reserve(cfg)).toMatchObject({ ok: true, monthlyUsed: 2 });
+  });
+
+  it('gives the hourly, daily and phone slots back when the monthly cap refuses, and its own counter does not move', async () => {
+    const cfg = capped(1);
+    await reserve(cfg);
+    const hour = hourlyCapKey('o', NOW);
+    const day = dailyCapKey('o', 'America/Chicago', NOW);
+    const claimsBefore = limits.claims.size;
+    expect(await reserve(cfg)).toEqual({ ok: false, reason: 'org_monthly_cap' });
+    expect(limits.counters.get(hour)).toBe(1);
+    expect(limits.counters.get(day)).toBe(1);
+    expect(limits.counters.get(monthlyCapKey('o', 'America/Chicago', NOW))).toBe(1);
+    expect(limits.claims.size).toBe(claimsBefore);
+  });
+
+  it('does not take the monthly counter when the hourly or daily cap refused first', async () => {
+    const cfg = capped(5, { maxCallsPerHour: 1 });
+    await reserve(cfg);
+    expect(await reserve(cfg)).toEqual({ ok: false, reason: 'org_hourly_cap' });
+    expect(limits.counters.get(monthlyCapKey('o', 'America/Chicago', NOW))).toBe(1);
+  });
+
+  it('release() gives the monthly slot back', async () => {
+    const r = await reserve(capped(1));
+    if (!r.ok) throw new Error('expected a reservation');
+    await r.release();
+    expect(limits.counters.get(monthlyCapKey('o', 'America/Chicago', NOW))).toBe(0);
+    expect((await reserve(capped(1))).ok).toBe(true);
+  });
+
+  it('treats a config without the field as the default of 200', async () => {
+    const noField = { ...capped(1), maxCallsPerHour: 1000, maxCallsPerDay: 1000 } as Partial<HotLeadCallConfig>;
+    delete noField.maxCallsPerMonth;
+    for (let i = 0; i < 200; i++) expect((await reserve(noField as HotLeadCallConfig)).ok).toBe(true);
+    expect(await reserve(noField as HotLeadCallConfig)).toEqual({ ok: false, reason: 'org_monthly_cap' });
+  });
+
+  it('expires the counter about 40 days out', async () => {
+    await reserve(capped(5));
+    expect(limits.counterExpiresAtS.get(monthlyCapKey('o', 'America/Chicago', NOW))).toBe(Math.floor(NOW.getTime() / 1000) + 40 * 86400);
+  });
+
+  describe('the month is the org-local calendar month', () => {
+    it.each([
+      ['Chicago, last second of October local (CDT)', 'America/Chicago', '2026-11-01T04:59:59Z', '2026-10'],
+      ['Chicago, first second of November local (CDT)', 'America/Chicago', '2026-11-01T05:00:00Z', '2026-11'],
+      ['Chicago, UTC is already November but local is not', 'America/Chicago', '2026-11-01T03:00:00Z', '2026-10'],
+      ['Los Angeles, the instant the DST-end day starts (PDT)', 'America/Los_Angeles', '2026-11-01T06:59:59Z', '2026-10'],
+      ['Los Angeles, the same month after it starts', 'America/Los_Angeles', '2026-11-01T07:00:00Z', '2026-11'],
+      ['Chicago, end of March, before spring-forward month effects', 'America/Chicago', '2026-04-01T04:59:59Z', '2026-03'],
+      ['Chicago, start of April', 'America/Chicago', '2026-04-01T05:00:00Z', '2026-04'],
+      ['Chicago, 31 Dec to 1 Jan (CST)', 'America/Chicago', '2027-01-01T06:00:00Z', '2027-01'],
+    ])('%s', (_n, tz, iso, month) => {
+      expect(localMonth(tz, new Date(iso))).toBe(month);
+      expect(monthlyCapKey('o', tz, new Date(iso))).toBe(`hlc#cap#m#o#${month}`);
+    });
+
+    it('starts a fresh count on the 1st in the org zone, not at UTC midnight', async () => {
+      const cfg = capped(1);
+      const lastOfOct = new Date('2026-11-01T03:00:00Z'); // 22:00 on 31 October in Chicago
+      const firstOfNov = new Date('2026-11-01T05:00:00Z'); // 00:00 on 1 November in Chicago
+      expect((await reserve(cfg, lastOfOct)).ok).toBe(true);
+      expect(await reserve(cfg, new Date('2026-11-01T04:30:00Z'))).toEqual({ ok: false, reason: 'org_monthly_cap' });
+      expect((await reserve(cfg, firstOfNov)).ok).toBe(true);
+    });
+
+    it('uses UTC when the org has no calling hours', () => {
+      expect(monthlyCapKey('o', 'UTC', new Date('2026-11-01T00:00:00Z'))).toBe('hlc#cap#m#o#2026-11');
+    });
+  });
+
+  it('a store failure on the monthly counter releases everything taken and throws', async () => {
+    const cfg = capped(5);
+    const real = limits.incrementBelow.bind(limits);
+    limits.incrementBelow = async (key, cap, exp) => {
+      if (key.startsWith('hlc#cap#m#')) throw new Error('ddb down');
+      return real(key, cap, exp);
+    };
+    await expect(reserve(cfg)).rejects.toThrow('ddb down');
+    expect([...limits.counters.values()]).toEqual([0, 0]);
+    expect(limits.claims.size).toBe(0);
+  });
+
+  it('a failing count read for the notice never fails the reservation', async () => {
+    limits.read = async () => { throw new Error('read down'); };
+    const r = await reserve(capped(5));
+    expect(r.ok).toBe(true);
+    expect(r).not.toHaveProperty('monthlyUsed', expect.any(Number));
   });
 });

@@ -180,6 +180,7 @@ describe('limits and silent refusals', () => {
   it.each([
     ['maxCallsPerHour', 'org_hourly_cap'],
     ['maxCallsPerDay', 'org_daily_cap'],
+    ['maxCallsPerMonth', 'org_monthly_cap'],
   ])('%s reached: the next lead (after the cooldown) is skipped as %s with no record', async (field, reason) => {
     configWith({ [field]: 1 });
     await submitLead('lead-a', { phone: leadPhone(1) });
@@ -190,6 +191,8 @@ describe('limits and silent refusals', () => {
     expect(skipReason('lead-b')).toEqual({ reason });
     expect(recordOf('lead-b')).toBeUndefined();
     expect(eventsOf('lead-b')).toEqual(['call.skipped']);
+    // The Slack alert goes out for every lead, called or skipped.
+    expect(world.postMessage).toHaveBeenCalledTimes(2);
   });
 
   it('a lead older than maxAgeMinutes by the time it is processed is skipped as too_old', async () => {
