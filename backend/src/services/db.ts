@@ -5474,6 +5474,8 @@ interface LeadRecordUpdateOp {
   remove?: string[];
   /** Fields that must currently hold exactly these values. */
   whenEquals?: Record<string, string | number>;
+  /** Fields that must currently be absent (a write-once marker). */
+  whenAbsent?: string[];
   maxIn?: Record<string, Record<string, number>>;
   appendNew?: Record<string, string[]>;
 }
@@ -5506,6 +5508,14 @@ const addEqualsConditions = (p: ExpressionParts, whenEquals: Record<string, stri
     p.names[`#f${p.n}`] = field;
     p.values[`:v${p.n}`] = expected;
     p.conditions.push(`#system.#k.#f${p.n} = :v${p.n}`);
+    p.n++;
+  }
+};
+
+const addAbsentConditions = (p: ExpressionParts, whenAbsent: string[]): void => {
+  for (const field of new Set(whenAbsent)) {
+    p.names[`#f${p.n}`] = field;
+    p.conditions.push(`attribute_not_exists(#system.#k.#f${p.n})`);
     p.n++;
   }
 };
@@ -5570,6 +5580,7 @@ function leadRecordUpdateExpression(key: string, op: LeadRecordUpdateOp) {
   addSetClauses(p, op.set ?? {});
   addRemoveClauses(p, op.remove ?? []);
   addEqualsConditions(p, op.whenEquals ?? {});
+  addAbsentConditions(p, op.whenAbsent ?? []);
   addMaxInClauses(p, op.maxIn ?? {});
   addAppendClauses(p, op.appendNew ?? {});
   return {
@@ -11190,9 +11201,15 @@ export const crmDb = {
   async findLeadsBySystemRecord(
     listId: string,
     key: string,
-    op: { states: string[]; updatedBefore: string; maxRead: number },
+    op: { states: string[]; updatedBefore: string; maxRead: number; has?: string[]; lacks?: string[] },
   ): Promise<{ leadIds: string[]; read: number; truncated: boolean }> {
     if (op.states.length === 0 || op.maxRead <= 0) return { leadIds: [], read: 0, truncated: false };
+    // Optional field filters (the retry sweep looks for records with a deferral and no claim): same read cost, fewer hits.
+    const fieldNames: Record<string, string> = {};
+    const fieldFilters = [
+      ...(op.has ?? []).map((f, i) => { fieldNames[`#h${i}`] = f; return `attribute_exists(#system.#k.#h${i})`; }),
+      ...(op.lacks ?? []).map((f, i) => { fieldNames[`#l${i}`] = f; return `attribute_not_exists(#system.#k.#l${i})`; }),
+    ];
     const leadIds: string[] = [];
     let read = 0;
     let lastKey: AWS.DynamoDB.DocumentClient.Key | undefined;
@@ -11201,9 +11218,9 @@ export const crmDb = {
         const result = await dynamodb.query({
           TableName: `${TABLE_PREFIX}AW-Leads`,
           KeyConditionExpression: 'listId = :listId',
-          FilterExpression: `#system.#k.#state IN (${op.states.map((_, i) => `:s${i}`).join(', ')}) AND #system.#k.#updatedAt < :before`,
+          FilterExpression: `#system.#k.#state IN (${op.states.map((_, i) => `:s${i}`).join(', ')}) AND #system.#k.#updatedAt < :before${fieldFilters.map((f) => ` AND ${f}`).join('')}`,
           ProjectionExpression: 'leadId',
-          ExpressionAttributeNames: { '#system': 'system', '#k': key, '#state': 'state', '#updatedAt': 'updatedAt' },
+          ExpressionAttributeNames: { '#system': 'system', '#k': key, '#state': 'state', '#updatedAt': 'updatedAt', ...fieldNames },
           ExpressionAttributeValues: {
             ':listId': listId,
             ':before': op.updatedBefore,

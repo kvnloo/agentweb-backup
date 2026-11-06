@@ -40,10 +40,6 @@ jest.mock('../services/chatbotService', () => ({
   updateTaskExecutionStatus: jest.fn(),
 }));
 
-jest.mock('../services/notionService', () => ({
-  createOncallItem: jest.fn().mockResolvedValue({ pageId: 'p', notionUrl: 'https://notion.so/p' }),
-}));
-
 jest.mock('../services/emailService', () => ({
   emailService: { sendOncallAlert: jest.fn().mockResolvedValue(undefined) },
 }));

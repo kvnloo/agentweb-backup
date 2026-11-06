@@ -4,7 +4,7 @@
  *
  * Call shape: Twilio rings a team member (placed by the orchestrator) -> /owner prompts "press 1" ->
  * /gather dials the lead with <Dial><Number url=/screen> -> the lead answers and /screen asks them to press 1
- * -> /screen-result (a digit of 1 lets Twilio bridge the two calls) -> /dial reports how the bridge ended
+ * -> /screen-result (a digit of 1 lets Twilio bridge the two calls; 2 defers one retry, 3 stops the calls) -> /dial reports how the bridge ended
  * (DialBridged tells a conversation from a lead who screened themselves out). /status receives the per-leg
  * call-progress callbacks and is the ONLY place usage is metered.
  *
@@ -61,15 +61,19 @@ import {
 } from '../services/voice/callFinalisation';
 import {
   bridgeTwiml, connectTwiml, hangupTwiml, inboundMemberScreenTwiml, inboundNobodyTwiml, inboundRingTwiml, inboundUnavailableTwiml,
-  leadDeclinedTwiml, leadPhoneChangedTwiml, leadScreenTwiml, leadUnreachableTwiml, memberPromptTwiml,
+  isE164, leadDeclinedTwiml, leadDeferredMemberTwiml, leadDeferredTwiml, leadOptedOutMemberTwiml, leadOptedOutTwiml, leadPhoneChangedTwiml, leadScreenTwiml, leadUnreachableTwiml, memberPromptTwiml,
 } from '../services/voice/twiml';
 import { recordCallUsage } from '../services/voice/voiceUsage';
 import {
   isAcceptingMember, nextInboundMember, resolveInboundContext, resolveInboundContextForOrg, triedMembersOf, type InboundContext,
 } from '../services/voice/inboundCallback';
+import { inboundCallerE164, reserveInboundSlot } from '../services/voice/inboundLimits';
 import { leadPhoneMacOf } from '../services/voice/leadPhoneMac';
 import { holdsClaim } from '../services/hotLeadCallPlacement';
 import { callableLeadPhone } from '../services/hotLeadCallConfig';
+import { isInsideLeadCallWindow } from '../services/voice/leadLocalHours';
+import { isLeadDoNotCall, markNumberDoNotCallWithRetry } from '../services/voice/hotLeadCallDnc';
+import { retryDueAt, retrySweepEnabled } from '../services/voice/hotLeadCallRetry';
 
 // type: () => true so a JSON or other content type is limited and parsed here too, instead of falling
 // through to the global 50mb express.json (the same trick as the unipile and tracker parsers).
@@ -310,11 +314,11 @@ router.post('/owner', guarded(async (_req, res, q, body) => {
 
 // ── /gather: the member pressed a key ────────────────────────────────────────
 
-/** The lead's number from the lead row, re-validated now. Never from the URL or the request body. */
-async function leadPhoneFor(q: CallQuery, ctx: HotLeadCallContext): Promise<string | null> {
+/** The lead row and its number, re-validated now. Never from the URL or the request body. */
+async function leadPhoneFor(q: CallQuery, ctx: HotLeadCallContext): Promise<{ phone: string; lead: unknown } | null> {
   const lead = await crmDb.getLeadById(q.listId, q.leadId, { consistentRead: true });
   const callable = callableLeadPhone(lead?.phone, ctx.config);
-  return 'phone' in callable ? callable.phone : null;
+  return 'phone' in callable ? { phone: callable.phone, lead } : null;
 }
 
 router.post('/gather', guarded(async (_req, res, q, body) => {
@@ -335,9 +339,23 @@ router.post('/gather', guarded(async (_req, res, q, body) => {
     return sendHangup(res);
   }
 
-  const leadE164 = await leadPhoneFor(q, ctx);
-  if (!leadE164 || !ctx.config.twilioNumber) {
+  const leadNow = await leadPhoneFor(q, ctx);
+  if (!leadNow || !ctx.config.twilioNumber) {
     await decide(q, ['member_answered'], answered('lead_phone_invalid'), 'call.failed', { reason: 'lead_phone_invalid' });
+    return sendXml(res, leadUnreachableTwiml());
+  }
+
+  const leadE164 = leadNow.phone;
+  // The lead (or the same number on another lead of the org) may have pressed 3 since the gates ran. A store failure
+  // throws: the lead is not dialled.
+  if (await isLeadDoNotCall({ orgId: ctx.orgId, lead: leadNow.lead, phoneE164: leadE164 })) {
+    await decide(q, ['member_answered'], answered('lead_do_not_call'), 'call.failed', { reason: 'lead_do_not_call' });
+    return sendXml(res, leadUnreachableTwiml());
+  }
+
+  // The member may have taken a while to answer: the lead's local window can have closed since the gates ran.
+  if (!isInsideLeadCallWindow(leadE164, new Date())) {
+    await decide(q, ['member_answered'], answered('lead_outside_hours'), 'call.failed', { reason: 'lead_outside_hours' });
     return sendXml(res, leadUnreachableTwiml());
   }
 
@@ -398,15 +416,97 @@ router.post('/screen', guarded(async (_req, res, q, body) => {
   if (current.leadCallSid !== sid || current.state !== 'bridging') return sendHangup(res);
 
   const ctx = await liveContext(q, current);
-  if (!ctx) {
+  // The prompt speaks the org's number: one that is missing or not E.164 cannot be read out, so the call is aborted like any other.
+  if (!ctx || !isE164(ctx.config.twilioNumber)) {
     // Shares the dial marker, so /dial's own outcome cannot relabel an abort as a decline.
     await decide(q, ['bridging'], {
       state: 'bridging', outcome: 'aborted', lastSequence: { [decisionKey(record.memberCallSid, 'dial')]: 1 },
     }, 'call.failed', { reason: 'aborted' });
     return sendHangup(res);
   }
-  sendXml(res, leadScreenTwiml({ announcedName: ctx.config.announcedName, resultUrl: buildVoiceWebhookUrl('screen-result', q) }));
+  sendXml(res, leadScreenTwiml({ announcedName: ctx.config.announcedName, callbackNumber: ctx.config.twilioNumber, resultUrl: buildVoiceWebhookUrl('screen-result', q),
+    // Option 2 is offered only when the retry can really happen: the same eligibility /screen-result applies to a 2 (first call,
+    // retries and kill switch on, live config, the approved phone, an open window within 36 hours). It is checked again at the 2.
+    canDefer: await canOfferDeferral(q, current),
+  }));
 }, twimlReplies));
+
+/**
+ * The lead pressed 3: stop calling this person. Two records, each written on its own so that neither can stop the other
+ * or the goodbye: the org's do-not-call marker for the number (what a new lead with the same number is checked against;
+ * claimed up to three times in-process) and the lead's own do-not-contact status. This digit never connects. If the marker
+ * cannot be written the stop is only as strong as the contact status on THIS lead: a new lead with the same number would
+ * not be caught by the marker, so that case is logged at error level with the stable alarm text
+ * `[hotLeadCall] do-not-call write failed <orgId>` (never a number) for a human to act on.
+ *
+ * The org id is not in the signed call state (the query carries listId, leadId, jobKey and leg; the record holds no org id and
+ * the jobKey is a hash), so it comes from the list's owner through resolveHotLeadCallContext: without a live context, or when
+ * the lead's phone is no longer the one approved (the record keeps only a one-way MAC), no marker can be written.
+ */
+async function recordLeadOptOut(q: CallQuery, record: HotLeadCallRecord, ctx: HotLeadCallContext | null): Promise<void> {
+  let lead: Awaited<ReturnType<typeof crmDb.getLeadById>> | null = null;
+  try {
+    lead = await crmDb.getLeadById(q.listId, q.leadId, { consistentRead: true });
+  } catch (err) {
+    console.warn('[hotLeadCall] opt-out: lead not read', errorName(err));
+  }
+  const callable = ctx && lead ? callableLeadPhone(lead.phone, ctx.config) : null;
+  // The marker names the number that was approved for this call, not whatever a later submission put on the lead.
+  if (ctx && callable && 'phone' in callable && record.leadPhoneMac === leadPhoneMacOf(ctx.orgId, callable.phone)) {
+    if (!await markNumberDoNotCallWithRetry(ctx.orgId, callable.phone)) console.error(`[hotLeadCall] do-not-call write failed ${ctx.orgId}`);
+  } else if (!ctx) {
+    console.error('[hotLeadCall] do-not-call write failed: no live org context for the list, so the org marker could not be keyed');
+  } else {
+    console.error(`[hotLeadCall] do-not-call write failed ${ctx.orgId}: the lead's current phone is unreadable or not the one approved for this call`);
+  }
+  try {
+    // An existing do-not-contact (an admin's, a bounce's) keeps its reason; 'unsubscribed' (an email opt-out) becomes do-not-contact.
+    if (lead && lead.contactStatus !== 'do-not-contact') {
+      const now = new Date().toISOString();
+      await crmDb.updateLead(q.listId, q.leadId, {
+        contactStatus: 'do-not-contact',
+        contactStatusReason: 'opted-out',
+        contactStatusNote: 'Pressed 3 on a hot-lead call',
+        contactStatusUpdatedAt: now,
+        contactStatusUpdatedBy: 'system',
+        // Same side effect as the CRM's own do-not-contact action: the lead also leaves group email.
+        unsubscribedFromGroupEmail: true,
+        unsubscribedFromGroupEmailAt: now,
+      });
+    }
+  } catch (err) {
+    console.warn('[hotLeadCall] opt-out: contact status not written', errorName(err));
+  }
+}
+
+const LEAD_REFUSALS = new Set(['lead_declined', 'lead_opted_out', 'lead_deferred']);
+
+/**
+ * When the one retry for a lead who pressed 2 is due, or null when this 2 is an ordinary decline: the call is itself the
+ * retry (the record keeps its deferral), retries or the kill switch are off, there is no live config, the lead's phone is no longer the one approved for this
+ * call, or no minute within 36 hours is inside both the lead window and the org's calling hours.
+ */
+async function deferralDueAt(q: CallQuery, record: HotLeadCallRecord): Promise<Date | null> {
+  // No promise without a retry: with retries switched off, or the kill switch off (the cron would never run it), a 2 is a decline.
+  if (record.deferral || !retrySweepEnabled() || !await isHotLeadCallEnabled()) return null;
+  const ctx = await resolveHotLeadCallContext(q.listId);
+  const leadNow = ctx ? await leadPhoneFor(q, ctx) : null;
+  if (!ctx || !leadNow || record.leadPhoneMac !== leadPhoneMacOf(ctx.orgId, leadNow.phone)) return null;
+  return retryDueAt(leadNow.phone, ctx.config, new Date());
+}
+
+/**
+ * Whether /screen speaks option 2. The check reads the lead and the org, and a failing read must never hang the lead up: it is logged
+ * once (error name only, no ids of people, no numbers) and the lead hears the two-option prompt, which promises nothing.
+ */
+async function canOfferDeferral(q: CallQuery, record: HotLeadCallRecord): Promise<boolean> {
+  try {
+    return await deferralDueAt(q, record) !== null;
+  } catch (err) {
+    console.warn('[hotLeadCall] retry eligibility unavailable, option 2 not offered:', errorName(err));
+    return false;
+  }
+}
 
 router.post('/screen-result', guarded(async (_req, res, q, body) => {
   const record = await loadRecord(q);
@@ -416,10 +516,32 @@ router.post('/screen-result', guarded(async (_req, res, q, body) => {
   const store = getLeadCallStore();
   const marker = decisionKey(sid, 'screen');
   const pressed = body.Digits === '1';
-  // One decision per screening, whatever the key: a replay or a later different digit cannot reverse it.
+  // One decision per screening, whatever the key: a replay or a later different digit (a 1 after a 3) cannot reverse it.
   if (record.state === 'bridging') {
     if (pressed) {
       await decide(q, ['bridging'], { state: 'connected', lastSequence: { [marker]: 1 } }, 'call.connected');
+    } else if (body.Digits === '3') {
+      // The stop is written BEFORE the decision, so a decision that is seen is always backed by it. A replay finds the marker.
+      // A 3 that follows a 2 on the same screening wins over the pending retry: the markers are raised (2 > 1), the deferral removed.
+      const afterDeferral = record.outcome === 'lead_deferred';
+      if (record.lastSequence?.[marker] === undefined || afterDeferral) await recordLeadOptOut(q, record, await resolveHotLeadCallContext(q.listId));
+      const level = afterDeferral ? 2 : 1;
+      await decide(q, ['bridging'], {
+        state: 'bridging',
+        outcome: 'lead_opted_out',
+        lastSequence: { [marker]: level, [decisionKey(record.memberCallSid, 'dial')]: level },
+        ...(afterDeferral ? { clear: ['deferral' as const] } : {}),
+      }, 'call.lead_declined', { reason: 'opted_out' });
+    } else if (body.Digits === '2') {
+      // Not available now: one later call, once. An ordinary decline (nothing scheduled) when deferralDueAt says so.
+      const due = await deferralDueAt(q, record);
+      await decide(q, ['bridging'], {
+        state: 'bridging',
+        outcome: due ? 'lead_deferred' : 'lead_declined',
+        // firstDueAt never changes: the retry must be placed within six hours of it or it is given up (retry_expired).
+        ...(due ? { deferral: { dueAt: due.toISOString(), count: 1, firstDueAt: due.toISOString() } } : {}),
+        lastSequence: { [marker]: 1, [decisionKey(record.memberCallSid, 'dial')]: 1 },
+      }, 'call.lead_declined', { reason: due ? 'not_available_now' : 'not_available_no_retry' });
     } else {
       await decide(q, ['bridging'], {
         state: 'bridging',
@@ -430,7 +552,16 @@ router.post('/screen-result', guarded(async (_req, res, q, body) => {
     }
   }
   const decided = await store.get(q.listId, q.leadId);
-  const accepted = decided?.lastSequence?.[marker] !== undefined && decided.outcome !== 'lead_declined';
+  const accepted = decided?.lastSequence?.[marker] !== undefined && !LEAD_REFUSALS.has(decided.outcome ?? '');
+  if (decided?.outcome === 'lead_opted_out') {
+    // The goodbye names the business: without a live config there is nothing to name, so the leg just ends.
+    const ctx = await resolveHotLeadCallContext(q.listId);
+    return sendXml(res, ctx ? leadOptedOutTwiml(ctx.config.announcedName) : hangupTwiml());
+  }
+  if (body.Digits === '2' && decided?.outcome === 'lead_deferred') {
+    const ctx = await resolveHotLeadCallContext(q.listId);
+    return sendXml(res, ctx ? leadDeferredTwiml(ctx.config.announcedName) : hangupTwiml());
+  }
   // An empty response ends the screening leg normally, so Twilio bridges the calls.
   sendXml(res, accepted ? bridgeTwiml() : hangupTwiml());
 }, twimlReplies));
@@ -462,7 +593,10 @@ router.post('/dial', guarded(async (_req, res, q, body) => {
       leadCallSid,
       lastSequence: { [decisionKey(memberSid, 'dial')]: 1 },
     }, 'call.lead_declined');
-    return sendXml(res, leadDeclinedTwiml());
+    // The lead pressed 3 or 2 (/screen-result wrote that, and the marker above makes this write a no-op): say so to the member.
+    const decided = await getLeadCallStore().get(q.listId, q.leadId);
+    const told = decided?.outcome === 'lead_opted_out' ? leadOptedOutMemberTwiml : decided?.outcome === 'lead_deferred' ? leadDeferredMemberTwiml : leadDeclinedTwiml;
+    return sendXml(res, told());
   }
   if (status === 'canceled') {
     // The dial was cancelled while the lead was still ringing, which is the member hanging up: nobody was told the
@@ -604,10 +738,18 @@ function guardedInboundEntry(handler: (res: Response, body: FormParams) => Promi
   };
 }
 
-/** Rings the next member, or tells the caller nobody can take the call. `tried` are the members already rung. */
-function ringNextOrApologise(res: Response, ctx: InboundContext, tried: readonly string[]): void {
+/**
+ * Rings the next member, or tells the caller nobody can take the call. `tried` are the members already rung.
+ * `admit` (the entry point only) runs once a member would really be rung; when it returns false it has already
+ * answered the caller, and nobody is rung.
+ */
+async function ringNextOrApologise(
+  res: Response, ctx: InboundContext, tried: readonly string[], admit?: () => Promise<boolean>,
+): Promise<void> {
   const member = nextInboundMember(ctx.config, tried, new Date());
   if (!member || !ctx.config.twilioNumber) return sendXml(res, inboundNobodyTwiml());
+  // `admit` runs only once a member would really be rung, so a call nobody can take never costs a slot.
+  if (admit && !await admit()) return;
   const step = { orgId: ctx.orgId, tried: [...tried, member.id] };
   sendXml(res, inboundRingTwiml({
     memberE164: member.phone,
@@ -618,10 +760,31 @@ function ringNextOrApologise(res: Response, ctx: InboundContext, tried: readonly
   }));
 }
 
+/**
+ * Takes the call's slot against the inbound abuse limits (ENG-2784). When refused or the store fails, answers the
+ * caller itself (the nobody copy / the unavailable copy: fail closed) and returns false. Only org, reason and the
+ * outcome are logged, never the caller's number.
+ */
+async function admitInboundCall(res: Response, ctx: InboundContext, body: FormParams): Promise<boolean> {
+  try {
+    // A signed Twilio call always has a CallSid; without one the retry marker cannot work, so the call is not admitted.
+    const callSid = sidOf(body, 'CallSid');
+    if (!callSid) throw new Error('missing CallSid');
+    const slot = await reserveInboundSlot({ orgId: ctx.orgId, callSid, callerE164: inboundCallerE164(body.From), config: ctx.config });
+    if (slot.ok) return true;
+    console.warn('[hotLeadCall] inbound capped', slot.reason, ctx.orgId);
+    sendXml(res, inboundNobodyTwiml());
+  } catch (err) {
+    console.warn('[hotLeadCall] inbound limits unavailable', errorName(err));
+    sendXml(res, inboundUnavailableTwiml());
+  }
+  return false;
+}
+
 router.post('/inbound', guardedInboundEntry(async (res, body) => {
   const ctx = await resolveInboundContext(body.To || body.Called);
   if (!ctx) return sendXml(res, inboundUnavailableTwiml());
-  ringNextOrApologise(res, ctx, []);
+  await ringNextOrApologise(res, ctx, [], () => admitInboundCall(res, ctx, body));
 }));
 
 router.post('/inbound-screen', guardedInbound(async (res, _body, q) => {
@@ -650,7 +813,7 @@ router.post('/inbound-dial', guardedInbound(async (res, body, q) => {
   if (!tryNext) return sendHangup(res);
   const ctx = await resolveInboundContextForOrg(q.orgId);
   if (!ctx) return sendXml(res, inboundUnavailableTwiml());
-  ringNextOrApologise(res, ctx, q.tried);
+  await ringNextOrApologise(res, ctx, q.tried);
 }));
 
 // Deliberately not gated on the kill switch, config or plan: the leg already happened and must still be billed.

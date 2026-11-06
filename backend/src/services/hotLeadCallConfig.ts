@@ -5,6 +5,16 @@ import { isLeadTypes, type LeadOrigin } from './leadNotificationConfig';
 import { isRecord } from './leadNotificationAttribution';
 
 export const HOT_LEAD_CALL_COUNTRIES = ['US', 'CA'] as const;
+
+/**
+ * Canada is refused in code (callableLeadPhone -> country_not_allowed) whatever allowedCountries stores. CRTC ADAD rules
+ * need an identification message with an email/postal address and a local or toll-free number, which we do not
+ * implement. Re-enabling Canada needs (a) flipping this constant, (b) that identification message in the lead
+ * prompt, and (c) a Canada branch in leadLocalHours.ts (it returns false for Canada today). The stored config,
+ * default and validation are unchanged.
+ */
+export const HOT_LEAD_CALL_CA_ENABLED = false;
+
 type HotLeadCallCountry = typeof HOT_LEAD_CALL_COUNTRIES[number];
 
 const HOT_LEAD_CALL_DEFAULT_LEAD_TYPES: readonly LeadOrigin[] = ['form_fill'];
@@ -22,10 +32,15 @@ export const HOT_LEAD_CALL_LIMITS = {
   // members and then the lead's own leg, and still uses one slot.
   maxCallsPerHour: { default: 6, min: 1, max: 30 },
   maxCallsPerDay: { default: 20, min: 1, max: 100 },
+  // Leads that get a call in one org-local calendar month (ENG-2783). Stored values up to `max` are valid (an operator
+  // raises a customer's limit by a data write); owner-level routes may only set up to HOT_LEAD_CALL_OWNER_MAX_CALLS_PER_MONTH.
+  maxCallsPerMonth: { default: 200, min: 1, max: 2000 },
   memberCooldownMinutes: { default: 2, min: 1, max: 60 },
   /** Calls placed for one lead (each to a different team member) before giving up. */
   maxAttemptsPerLead: { default: 3, min: 1, max: 5 },
 } as const;
+/** The highest maxCallsPerMonth an owner (Emma tool, REST PUT) may set: the default. Higher values are an operator's data write. */
+export const HOT_LEAD_CALL_OWNER_MAX_CALLS_PER_MONTH = HOT_LEAD_CALL_LIMITS.maxCallsPerMonth.default;
 type HotLeadCallLimitField = keyof typeof HOT_LEAD_CALL_LIMITS;
 export const HOT_LEAD_CALL_LIMIT_FIELDS = Object.keys(HOT_LEAD_CALL_LIMITS) as HotLeadCallLimitField[];
 
@@ -42,7 +57,7 @@ export const HOT_LEAD_CALL_SYSTEM_FIELDS = ['twilioNumber', 'twilioNumberSid'] a
 interface HotLeadCallCallingHours {
   /**
    * The window in which calls ARE allowed (24h HH:MM, local to `timezone`); outside it the system stays quiet.
-   * start > end wraps past midnight, so consumers must handle both orders. The lead's own timezone is not considered.
+   * start > end wraps past midnight, so consumers must handle both orders. The lead's own local hours are a separate gate (leadLocalHours.ts).
    */
   start: string;
   end: string;
@@ -85,6 +100,8 @@ export interface HotLeadCallConfig {
   maxAgeMinutes: number;
   maxCallsPerHour: number;
   maxCallsPerDay: number;
+  /** Leads that get a call per org-local calendar month; absent in stored configs from before ENG-2783, which read as the default. */
+  maxCallsPerMonth: number;
   memberCooldownMinutes: number;
   maxAttemptsPerLead: number;
   /** Spoken aloud inside TwiML, hence the restricted charset. */
@@ -149,7 +166,8 @@ export function allowlistedE164(raw: unknown): string | null {
 /**
  * The number to ring for a lead, from the lead row's raw phone. National-format numbers are parsed as US
  * (forms for US/CA carry no '+1'); anything that resolves to another country or a blocked number type is
- * refused, as is a country outside this org's allowedCountries (a strict subset of the global US/CA list).
+ * refused, as is a country outside this org's allowedCountries (a strict subset of the global US/CA list) and Canada
+ * while HOT_LEAD_CALL_CA_ENABLED is false.
  * Shared by the call orchestrator's gates and the voice webhooks, which re-check at bridge time.
  */
 export function callableLeadPhone(
@@ -161,6 +179,7 @@ export function callableLeadPhone(
   if (!phone) return { reason: 'invalid_phone' };
   let country: string | undefined;
   try { country = parsePhoneNumberWithError(phone).country; } catch { country = undefined; }
+  if (country === 'CA' && !HOT_LEAD_CALL_CA_ENABLED) return { reason: 'country_not_allowed' };
   return country && config.allowedCountries.some(c => c === country) ? { phone } : { reason: 'country_not_allowed' };
 }
 

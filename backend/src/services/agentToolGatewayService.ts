@@ -985,6 +985,20 @@ export function validateAndRepairToolArgs(
     if (JSON.stringify(normalized) !== JSON.stringify(repairedArgs)) repairs.push('attio:aliases');
     repairedArgs = normalized;
   }
+  // ENG-2791: playwright_browser_fill_form requires `fields`; models send `elements`.
+  // Scoped to this tool so other tools declaring `fields` (e.g. Meta insights) keep
+  // rejecting an undeclared `elements` argument.
+  if (
+    input.toolName === 'playwright_browser_fill_form' &&
+    repairedArgs.fields === undefined &&
+    repairedArgs.elements !== undefined &&
+    properties.fields &&
+    !properties.elements
+  ) {
+    repairedArgs.fields = repairedArgs.elements;
+    delete repairedArgs.elements;
+    repairs.push('elements->fields');
+  }
   const propertyNames = Object.keys(properties);
   const lowRiskRepairAllowed = (input.effect ?? classifyToolEffect(input.toolName, input.args)) === 'read';
 

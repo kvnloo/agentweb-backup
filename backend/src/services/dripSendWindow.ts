@@ -55,19 +55,32 @@ interface LocalParts {
 
 const WEEKDAYS: Record<string, number> = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
 
+// One formatter per zone: building an Intl.DateTimeFormat is far costlier than using one, and the hot-lead retry's
+// minute-by-minute window search calls localParts thousands of times. The options never vary, so the zone is the key.
+// A zone Intl rejects throws from the constructor and is not cached.
+const formatters = new Map<string, Intl.DateTimeFormat>();
+function formatterFor(tz: string): Intl.DateTimeFormat {
+  let fmt = formatters.get(tz);
+  if (!fmt) {
+    fmt = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz,
+      hourCycle: 'h23',
+      year: 'numeric',
+      month: 'numeric',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: 'numeric',
+      second: 'numeric',
+      weekday: 'short',
+    });
+    formatters.set(tz, fmt);
+  }
+  return fmt;
+}
+
 /** Wall-clock fields of an instant in an IANA zone; Intl applies that zone's DST rules for that very instant. */
 export function localParts(ms: number, tz: string): LocalParts {
-  const fmt = new Intl.DateTimeFormat('en-US', {
-    timeZone: tz,
-    hourCycle: 'h23',
-    year: 'numeric',
-    month: 'numeric',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: 'numeric',
-    second: 'numeric',
-    weekday: 'short',
-  });
+  const fmt = formatterFor(tz);
   const p: Record<string, string> = {};
   for (const part of fmt.formatToParts(new Date(ms))) p[part.type] = part.value;
   return {

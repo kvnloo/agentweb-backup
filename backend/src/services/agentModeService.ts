@@ -94,6 +94,7 @@ import { reconcileModelMentionAck, buildModelMentionIndex, type ModelMentionInde
 import { resolveTurnModelCorrection } from '../utils/modelCorrectionStamp';
 import type { MessageModelRouting } from './agentMode/agentWebModelRouter';
 import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
+import { boundToolsForModel } from '../utils/boundToolsForModel';
 // ENG-2103 (F2, Pattern A): resolveOrgProfileField's only 5 callers
 // (readBrandGuidelines/readMarketStrategy and friends) moved to
 // emma/impl/brandMarketStrategy.ts, which imports it lazily itself
@@ -1033,6 +1034,8 @@ interface LLMCallOptions {
   /** ENG-2108: set only by the agent's own working loop; lets this call use a customer key. */
   customerRoutable?: boolean;
   tools?: any[] | null;
+  /** ENG-2824: tool names that must survive maxTools truncation (e.g. a schedule's required calls). */
+  priorityToolNames?: string[];
   tool_choice?: 'auto' | 'none' | any | null;
   /** Execute search through OpenRouter's provider-independent server tool. */
   webSearch?: boolean;
@@ -2541,6 +2544,7 @@ export class AgentModeService {
       providerPolicy,
       providerIgnore,
       requireContent,
+      priorityToolNames,
     } = options || {};
 
     // ENG-2108: the funding for THIS call. A run starts AgentWeb-funded; this call moves
@@ -2645,9 +2649,11 @@ export class AgentModeService {
       if (callerToolLimit !== undefined && callerTools.length > callerToolLimit) {
         console.warn(
           `AgentMode: callLLM truncating tools for model "${model}": ${callerTools.length} caller tools exceeds limit of ${callerToolLimit}` +
-          `${webSearch ? ' after reserving one web-search slot' : ''}. Keeping first ${callerToolLimit}.`,
+          `${webSearch ? ' after reserving one web-search slot' : ''}. Keeping ${callerToolLimit}` +
+          `${priorityToolNames?.length ? ` (required tools first: ${priorityToolNames.join(', ')})` : ''}.`,
         );
-        boundedTools = callerTools.slice(0, callerToolLimit);
+        // ENG-2824: a plain slice silently undeclared any required tool past the cap.
+        boundedTools = boundToolsForModel(callerTools, callerToolLimit, priorityToolNames);
       }
     }
     // OpenRouter normalizes the transport, but the selected provider still
@@ -2938,6 +2944,25 @@ export class AgentModeService {
    * ordinary state of every draft-only run, and also the state of a run whose stamp
    * could not be written (which the runner downgrades to draft-only for this reason).
    */
+  /**
+   * ENG-2824: the schedule's requiredFunctionCalls for a scheduled session, so callLLM
+   * keeps them declared when it truncates the tool list. Empty for any other session or
+   * when the schedule cannot be read.
+   */
+  private async resolveScheduledRequiredToolNames(currentSession: any): Promise<string[]> {
+    if (currentSession?.sessionType !== 'scheduled') return [];
+    const scheduleId = extractScheduleId(currentSession?.pageIdentifier);
+    if (!scheduleId) return [];
+    try {
+      const schedule: any = await scheduleDb.getScheduleById(scheduleId);
+      const required = schedule?.requiredFunctionCalls;
+      return Array.isArray(required) ? required.filter((n: unknown): n is string => typeof n === 'string') : [];
+    } catch (error) {
+      console.warn(`AgentMode: could not read schedule ${scheduleId} for required-tool prioritisation:`, error);
+      return [];
+    }
+  }
+
   private async resolveScheduledPublishAuthorization(
     currentSession: any
   ): Promise<SchedulePublishAuthorization & { reason?: PublishAuthorizationWithholdReason }> {
@@ -3620,6 +3645,11 @@ export class AgentModeService {
         availableSkillContextMsg,
       } = turnContext;
 
+      // ENG-2824: a scheduled run's required calls must stay declared when callLLM
+      // truncates the tool list to the model's maxTools. Read once per turn; a failed
+      // read only loses the prioritisation, never the turn.
+      const requiredToolNamesForTurn = await this.resolveScheduledRequiredToolNames(currentSession);
+
       let content = '';
       const toolCalls: any[] = [];
       _toolCallsForTelemetry = toolCalls;
@@ -4206,6 +4236,7 @@ export class AgentModeService {
             // any tool calls this turn returns (see the forceFinalSynthesis drop below), so
             // no further work can start either way and the model is told as much.
             tools: filteredToolsCache,
+            priorityToolNames: requiredToolNamesForTurn,
             tool_choice: 'auto',
             max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
             temperature: 0.1,
@@ -11561,17 +11592,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       clientScope?.toolName ?? 'meta_ads_tool'
     );
 
-    // ENG-1801 fix: a client_id-scoped (cross-tenant, admin) call never
-    // auto-selects an account and never falls back to the shared-token legacy
-    // adAccount field — both fallback branches below are only reachable via
-    // the `!accountId` path, so this one guard structurally disables both for
-    // the scoped path while leaving the unscoped path's fallback code untouched.
-    if (strict && !accountId) {
-      throw this.makeMetaAuthError(
-        `client_id-scoped calls require an explicit account_id — call assess_client_health with client_name_or_email="${clientScope?.clientId}" first; its ad_account_id field is this client's Meta ad account.`
-      );
-    }
-
+    // ENG-1801: the strict (client_id-scoped) no-account_id guard lives after
+    // the connected-account lookup below (ENG-2786), so it can list candidates.
     const { userDb } = await import('./db');
     const user = await userDb.getUserById(effectiveUserId);
     if (!user) throw this.makeMetaAuthError(strict ? 'Client account no longer exists.' : 'User not found');
@@ -11594,6 +11616,34 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       acc.config?.access_token
     );
 
+    // ENG-1801 fix: a client_id-scoped (cross-tenant, admin) call never
+    // auto-selects an account and never falls back to the shared-token legacy
+    // adAccount field. ENG-2786: this is a usage error, not a credential
+    // failure — classify it invalid_args and list the client's candidate
+    // account_ids so the model can retry with one directly. Candidates come from
+    // every Meta ad account the client has connected (not only token-bearing
+    // ones), so a seeded/odd-typed account still surfaces as a choice.
+    if (strict && !accountId) {
+      const candidateIds = Array.from(new Set(
+        (connectedAccounts as any[])
+          .filter((acc: any) =>
+            (acc.platform === 'facebook' || acc.platform === 'meta') &&
+            (!acc.config?.account_type || acc.config.account_type === 'ad_account')
+          )
+          .map((acc: any) => clean(acc.account_id || acc.config?.ad_account_id || acc.accountId || ''))
+          .filter(Boolean)
+          .map((id: string) => `act_${id}`)
+      ));
+      if (candidateIds.length > 0) {
+        const err = this.makeMetaAuthError(
+          `client_id-scoped calls require an explicit account_id — call assess_client_health with client_name_or_email="${clientScope?.clientId}" first; its ad_account_id field is this client's Meta ad account. Candidate account_ids: [${candidateIds.join(', ')}].`
+        ) as any;
+        err.toolErrorClass = 'invalid_args';
+        err.candidateAccountIds = candidateIds;
+        throw err;
+      }
+    }
+
     if (fbAccounts.length === 0) {
       // Fall back to legacy adAccount field + centralized Secrets Manager token.
       // This covers users who had their Meta Marketing connected account removed but still
@@ -11613,6 +11663,15 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         strict
           ? `Client "${user.email || effectiveUserId}" has no connected Meta ad account. Client-scoped calls never fall back to the legacy shared-token account.`
           : 'Meta Ads account is not connected. Use the search_user_guide tool to find setup instructions and share them with the user.'
+      );
+    }
+
+
+    // ENG-1801: a strict call without account_id never auto-selects, even when
+    // no candidate id could be listed above.
+    if (strict && !accountId) {
+      throw this.makeMetaAuthError(
+        `client_id-scoped calls require an explicit account_id — call assess_client_health with client_name_or_email="${clientScope?.clientId}" first; its ad_account_id field is this client's Meta ad account.`
       );
     }
 
