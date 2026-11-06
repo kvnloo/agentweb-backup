@@ -128,6 +128,11 @@ export interface LeadCallStore {
    */
   claimRetry(listId: string, leadId: string, jobKey: string, token: string): Promise<boolean>;
   /**
+   * Moves the pending deferral of a finished `lead_deferred` record (call `jobKey`) to a new `dueAt` while no claim is there
+   * (the retry stays unclaimed). False when the record is not that one or the retry has been claimed.
+   */
+  rescheduleRetry(listId: string, leadId: string, jobKey: string, dueAt: string): Promise<boolean>;
+  /**
    * Starts the retry's call cycle on the finished record that holds this claim: back to `dialing` as attempt 1 with a new
    * jobKey (so the first call's late callbacks no longer match), and the first cycle's sids, outcome, metered legs and
    * decision markers dropped. The only way a terminal record is revived. False when the record is not that one.

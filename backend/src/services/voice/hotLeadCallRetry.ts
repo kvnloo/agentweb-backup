@@ -1,4 +1,5 @@
 import type { HotLeadCallConfig } from '../hotLeadCallConfig';
+import { MINUTE_MS } from '../hotLeadCallText';
 import { isWithinCallWindow } from './hotLeadCallLimits';
 import { isInsideLeadCallWindow } from './leadLocalHours';
 
@@ -7,11 +8,10 @@ import { isInsideLeadCallWindow } from './leadLocalHours';
  * (cron/hotLeadCallRetryCron.ts); this file only decides WHEN it is due and when it is too late.
  */
 
-const MINUTE_MS = 60_000;
 /** A retry is due this long after the press ... */
-export const RETRY_DELAY_MS = 60 * MINUTE_MS;
+const RETRY_DELAY_MS = 60 * MINUTE_MS;
 /** ... pushed forward, minute by minute, to the first minute inside the lead window and the org's calling hours, for at most this long. */
-export const RETRY_SEARCH_MS = 36 * 60 * MINUTE_MS;
+const RETRY_SEARCH_MS = 36 * 60 * MINUTE_MS;
 /** A retry that is picked up later than this after it was due (the server was down) is not placed: `call.skipped` retry_expired. */
 export const RETRY_EXPIRES_AFTER_MS = 6 * 60 * MINUTE_MS;
 
@@ -33,4 +33,10 @@ export function retryDueAt(phoneE164: string, config: Pick<HotLeadCallConfig, 'c
     if (open(ms)) return new Date(ms);
   }
   return null;
+}
+
+/** `HOT_LEAD_CALL_RETRY`: `off`, `0` or `false` (any case) disables press-2 retries; anything else, or unset, leaves them on. */
+export function retrySweepEnabled(): boolean {
+  const raw = process.env.HOT_LEAD_CALL_RETRY?.trim().toLowerCase();
+  return !(raw === 'off' || raw === '0' || raw === 'false');
 }

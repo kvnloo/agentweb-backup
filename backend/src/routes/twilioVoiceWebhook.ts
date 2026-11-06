@@ -61,7 +61,7 @@ import {
 } from '../services/voice/callFinalisation';
 import {
   bridgeTwiml, connectTwiml, hangupTwiml, inboundMemberScreenTwiml, inboundNobodyTwiml, inboundRingTwiml, inboundUnavailableTwiml,
-  isE164, leadDeclinedTwiml, leadDeferredMemberTwiml, leadDeferredTwiml, leadNoRetryTwiml, leadOptedOutMemberTwiml, leadOptedOutTwiml, leadPhoneChangedTwiml, leadScreenTwiml, leadUnreachableTwiml, memberPromptTwiml,
+  isE164, leadDeclinedTwiml, leadDeferredMemberTwiml, leadDeferredTwiml, leadOptedOutMemberTwiml, leadOptedOutTwiml, leadPhoneChangedTwiml, leadScreenTwiml, leadUnreachableTwiml, memberPromptTwiml,
 } from '../services/voice/twiml';
 import { recordCallUsage } from '../services/voice/voiceUsage';
 import {
@@ -73,7 +73,7 @@ import { holdsClaim } from '../services/hotLeadCallPlacement';
 import { callableLeadPhone } from '../services/hotLeadCallConfig';
 import { isInsideLeadCallWindow } from '../services/voice/leadLocalHours';
 import { isLeadDoNotCall, markNumberDoNotCallWithRetry } from '../services/voice/hotLeadCallDnc';
-import { retryDueAt } from '../services/voice/hotLeadCallRetry';
+import { retryDueAt, retrySweepEnabled } from '../services/voice/hotLeadCallRetry';
 
 // type: () => true so a JSON or other content type is limited and parsed here too, instead of falling
 // through to the global 50mb express.json (the same trick as the unipile and tracker parsers).
@@ -424,7 +424,10 @@ router.post('/screen', guarded(async (_req, res, q, body) => {
     }, 'call.failed', { reason: 'aborted' });
     return sendHangup(res);
   }
-  sendXml(res, leadScreenTwiml({ announcedName: ctx.config.announcedName, callbackNumber: ctx.config.twilioNumber, resultUrl: buildVoiceWebhookUrl('screen-result', q) }));
+  sendXml(res, leadScreenTwiml({ announcedName: ctx.config.announcedName, callbackNumber: ctx.config.twilioNumber, resultUrl: buildVoiceWebhookUrl('screen-result', q),
+    // Option 2 is offered only when the retry can happen: this is the lead's first call and retries are not switched off.
+    canDefer: !current.deferral && retrySweepEnabled(),
+  }));
 }, twimlReplies));
 
 /**
@@ -479,11 +482,12 @@ const LEAD_REFUSALS = new Set(['lead_declined', 'lead_opted_out', 'lead_deferred
 
 /**
  * When the one retry for a lead who pressed 2 is due, or null when this 2 is an ordinary decline: the call is itself the
- * retry (the record keeps its deferral), there is no live config, the lead's phone is no longer the one approved for this
+ * retry (the record keeps its deferral), retries or the kill switch are off, there is no live config, the lead's phone is no longer the one approved for this
  * call, or no minute within 36 hours is inside both the lead window and the org's calling hours.
  */
 async function deferralDueAt(q: CallQuery, record: HotLeadCallRecord): Promise<Date | null> {
-  if (record.deferral) return null;
+  // No promise without a retry: with retries switched off, or the kill switch off (the cron would never run it), a 2 is a decline.
+  if (record.deferral || !retrySweepEnabled() || !await isHotLeadCallEnabled()) return null;
   const ctx = await resolveHotLeadCallContext(q.listId);
   const leadNow = ctx ? await leadPhoneFor(q, ctx) : null;
   if (!ctx || !leadNow || record.leadPhoneMac !== leadPhoneMacOf(ctx.orgId, leadNow.phone)) return null;
@@ -539,10 +543,9 @@ router.post('/screen-result', guarded(async (_req, res, q, body) => {
     const ctx = await resolveHotLeadCallContext(q.listId);
     return sendXml(res, ctx ? leadOptedOutTwiml(ctx.config.announcedName) : hangupTwiml());
   }
-  if (body.Digits === '2' && (decided?.outcome === 'lead_deferred' || decided?.outcome === 'lead_declined')) {
+  if (body.Digits === '2' && decided?.outcome === 'lead_deferred') {
     const ctx = await resolveHotLeadCallContext(q.listId);
-    if (!ctx) return sendHangup(res);
-    return sendXml(res, decided.outcome === 'lead_deferred' ? leadDeferredTwiml(ctx.config.announcedName) : leadNoRetryTwiml(ctx.config.announcedName));
+    return sendXml(res, ctx ? leadDeferredTwiml(ctx.config.announcedName) : hangupTwiml());
   }
   // An empty response ends the screening leg normally, so Twilio bridges the calls.
   sendXml(res, accepted ? bridgeTwiml() : hangupTwiml());

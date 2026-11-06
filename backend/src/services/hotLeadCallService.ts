@@ -22,7 +22,7 @@ import { holdsClaim, placeMemberCall, type PlacementResult } from './hotLeadCall
 import { runQueuedHotLeadJob } from './hotLeadCallQueue';
 import { nextAttemptOrFinish } from './voice/callFinalisation';
 import { errorText, isNonEmpty, MINUTE_MS } from './hotLeadCallText';
-import { RETRY_EXPIRES_AFTER_MS } from './voice/hotLeadCallRetry';
+import { RETRY_EXPIRES_AFTER_MS, retryDueAt } from './voice/hotLeadCallRetry';
 // This file must not import orgLeadNotificationService: that module calls dispatchHotLeadCall.
 
 interface HotLeadCallJob {
@@ -35,9 +35,10 @@ interface HotLeadCallJob {
   /**
    * Set only for the lead's one retry (press 2, ENG-2783), which runs the same gates and placement on the lead's finished
    * record: it ignores the "lead already has a call record" short-circuit and the age gate (age is counted from the
-   * deferral) and may use the phone marker its own first call took. `token` is the claim the due-retries cron won.
+   * deferral) and may use the phone marker its own first call took. `token` is the claim the due-retries cron won and
+   * `fromJobKey` the first call's job key, which the restart of the finished record is conditional on.
    */
-  retry?: { token: string };
+  retry?: { token: string; fromJobKey: string };
 }
 type JobInput = Omit<HotLeadCallJob, 'orgId'>;
 type Submission = { submissionId: string; submittedAt: string };
@@ -188,9 +189,8 @@ async function preflight(job: HotLeadCallJob): Promise<(Reviewed & { candidates:
  * created and given back if it is not: a lead that never dials costs no slot, and a lead refused by a limit
  * leaves no record, so its single call slot stays unused (a repeat submission can retry).
  */
-async function reserveAndPlace(
-  job: HotLeadCallJob, reviewed: Reviewed & { candidates: HotLeadCallMember[] }, retry?: { token: string; fromJobKey: string },
-): Promise<void> {
+async function reserveAndPlace(job: HotLeadCallJob, reviewed: Reviewed & { candidates: HotLeadCallMember[] }): Promise<string | null> {
+  const { retry } = job;
   const { config } = reviewed.ctx;
   const { listId, leadId } = job;
   let slot: Reservation;
@@ -209,7 +209,7 @@ async function reserveAndPlace(
     if (slot.reason !== 'in_progress') await recordSkip(reviewed.lead, slot.reason);
     // Fire-and-forget (never awaited, never throws): the owner's one-per-month "paused until the 1st" email.
     if (slot.reason === 'org_monthly_cap') void notifyMonthlyCap({ orgId: job.orgId, ownerUserId: reviewed.ctx.orgOwnerUserId, config, event: { kind: 'refused' } });
-    return;
+    return slot.reason;
   }
   void notifyMonthlyCap({ orgId: job.orgId, ownerUserId: reviewed.ctx.orgOwnerUserId, config, event: { kind: 'counted', used: slot.monthlyUsed } });
 
@@ -247,6 +247,8 @@ async function reserveAndPlace(
     if (!created) await slot.release();
   }
   if (result === 'none') await recordSkip(reviewed.lead, 'member_cooldown');
+  // Why nothing was dialed, for the retry's drop log; null when a call was placed or another worker owns the record.
+  return result === 'none' ? 'member_cooldown' : null;
 }
 
 /**
@@ -275,10 +277,12 @@ export async function processHotLeadCallJob(job: HotLeadCallJob): Promise<void> 
   if (ready) await reserveAndPlace(job, ready);
 }
 
-export type RetryOutcome =
+type RetryOutcome =
   /** Nothing to do for this record (no pending deferral, a claimed one, or the hot-lead call is off). */
   | 'not_pending'
   | 'not_due'
+  /** The lead window or the org's calling hours are closed right now: the deferral moved to the next open minute, unclaimed. */
+  | 'rescheduled'
   /** Another run or instance holds the claim. */
   | 'lost'
   | 'expired'
@@ -287,13 +291,17 @@ export type RetryOutcome =
   /** The claim was won and the reservation and placement ran (a cap, a cooldown or a lost create is recorded as a skip). */
   | 'attempted';
 
+const dropped = (reason: string, orgId: string): void => console.warn(`[hotLeadCall] retry dropped after claim ${reason} ${orgId}`);
+
 /**
  * The lead's one retry (press 2, ENG-2783), run by the due-retries cron for a lead whose record is finished with outcome
- * `lead_deferred`. In order: the kill switch; the record is the pending deferral and due; the CLAIM (the conditional
- * write that makes the retry happen at most once, whoever else is running); then expiry (more than six hours late), every
- * gate of a new lead except the age and the existing-record checks, the lead's phone still being the one approved, a fresh
- * slot against the hourly, daily and monthly caps, and a fresh pass over the team. After the claim nothing is retried: a
- * failure or refusal loses the retry (one retry, ever) and says why on the lead's timeline or in the log.
+ * `lead_deferred`. In order: the kill switch; the record is the pending deferral and due; more than six hours late is
+ * `retry_expired`; a lead or org window that is closed AT THIS MOMENT moves the deferral to the next open minute without
+ * claiming it (a late cron tick must not spend the retry); the CLAIM (the conditional write that makes the retry happen at
+ * most once, whoever else is running); every gate of a new lead except the age and the existing-record checks; the lead's
+ * phone still being the one approved; a fresh slot against the hourly, daily and monthly caps; a fresh pass over the team.
+ * After the claim nothing is retried: a refusal is a `call.skipped` and every drop leaves the warn line
+ * `[hotLeadCall] retry dropped after claim <reason> <orgId>` (one retry, ever).
  */
 export async function processHotLeadCallRetry(listId: string, leadId: string, now: Date = new Date()): Promise<RetryOutcome> {
   if (!await isHotLeadCallEnabled()) return 'not_pending';
@@ -303,28 +311,50 @@ export async function processHotLeadCallRetry(listId: string, leadId: string, no
   if (!record || record.state !== 'finished' || record.outcome !== 'lead_deferred' || record.retryClaimToken !== undefined || !Number.isFinite(dueAt)) return 'not_pending';
   if (now.getTime() < dueAt) return 'not_due';
 
-  const token = randomUUID();
-  if (!await store.claimRetry(listId, leadId, record.jobKey, token)) return 'lost';
   const ctx = await resolveHotLeadCallContext(listId);
   const lead = await crmDb.getLeadById(listId, leadId, { consistentRead: true });
+  const token = randomUUID();
+  const claim = (): Promise<boolean> => store.claimRetry(listId, leadId, record.jobKey, token);
+  const orgId = ctx?.orgId ?? 'unknown_org';
   if (now.getTime() - dueAt > RETRY_EXPIRES_AFTER_MS) {
+    if (!await claim()) return 'lost';
     if (lead) await recordSkip(lead, 'retry_expired');
     return 'expired';
   }
-  if (!ctx || !lead) {
-    console.warn('[hotLeadCall] retry dropped: no live config or lead', { listId, leadId });
-    return 'refused';
+  const callable = ctx && lead ? callableLeadPhone(lead.phone, ctx.config) : null;
+  if (ctx && callable && 'phone' in callable && !(isInsideLeadCallWindow(callable.phone, now) && isWithinCallWindow(ctx.config.callingHours, now))) {
+    const next = retryDueAt(callable.phone, ctx.config, now);
+    if (next) return await store.rescheduleRetry(listId, leadId, record.jobKey, next.toISOString()) ? 'rescheduled' : 'lost';
+    if (!await claim()) return 'lost';
+    if (lead) await recordSkip(lead, 'retry_expired');
+    return 'expired';
   }
-  const job: HotLeadCallJob = { orgId: ctx.orgId, listId, leadId, origin: 'form_fill', retry: { token } };
-  const ready = await preflight(job);
-  if (!ready) return 'refused';
-  // The person pressed 2 on the number that was approved for the first call; a later submission may have replaced it.
-  if (record.leadPhoneMac !== leadPhoneMacOf(ctx.orgId, ready.phone)) {
-    await recordSkip(ready.lead, 'lead_phone_changed');
-    return 'refused';
+
+  if (!await claim()) return 'lost';
+  try {
+    if (!ctx || !lead) {
+      dropped(!ctx ? 'ctx_missing' : 'lead_missing', orgId);
+      return 'refused';
+    }
+    const job: HotLeadCallJob = { orgId: ctx.orgId, listId, leadId, origin: 'form_fill', retry: { token, fromJobKey: record.jobKey } };
+    const ready = await preflight(job);
+    if (!ready) {
+      dropped('gate_refused', orgId);
+      return 'refused';
+    }
+    // The person pressed 2 on the number that was approved for the first call; a later submission may have replaced it.
+    if (record.leadPhoneMac !== leadPhoneMacOf(ctx.orgId, ready.phone)) {
+      await recordSkip(ready.lead, 'lead_phone_changed');
+      dropped('lead_phone_changed', orgId);
+      return 'refused';
+    }
+    const reason = await reserveAndPlace(job, ready);
+    if (reason) dropped(reason, orgId);
+    return 'attempted';
+  } catch (err) {
+    dropped('error', orgId);
+    throw err;
   }
-  await reserveAndPlace(job, ready, { token, fromJobKey: record.jobKey });
-  return 'attempted';
 }
 
 /** Never rejects to a lead saver. Fire-and-forget right after a successful lead write. */

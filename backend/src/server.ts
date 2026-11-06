@@ -1257,18 +1257,8 @@ createTestAccount().then(async () => {
       // now") once it is due; the job queue cannot run a job later. Does nothing while the global hot_lead_call_mode kill
       // switch is off. HOT_LEAD_CALL_RETRY=off|0|false does not arm it.
       try {
-        const { retrySweepEnabled } = await import('./services/voice/hotLeadCallRetrySweep');
-        if (retrySweepEnabled()) {
-          const { runHotLeadCallRetryCron, HOT_LEAD_CALL_RETRY_INTERVAL_MS } = await import('./cron/hotLeadCallRetryCron');
-          setInterval(() => {
-            if (!isCronEnabled()) return;
-            cronJobRegistry.track('hotLeadCallRetryCron', runHotLeadCallRetryCron())
-              .catch(e => console.error('[hotLeadCallRetryCron] Error:', e));
-          }, HOT_LEAD_CALL_RETRY_INTERVAL_MS);
-          console.log('[hotLeadCallRetryCron] Initialized — every 5 minutes');
-        } else {
-          console.log('[hotLeadCallRetryCron] Disabled: HOT_LEAD_CALL_RETRY is off');
-        }
+        const { startHotLeadCallRetryCron } = await import('./cron/hotLeadCallRetryCron');
+        startHotLeadCallRetryCron({ enabled: isCronEnabled, track: (name, run) => cronJobRegistry.track(name, run) });
       } catch (error) {
         console.error('[hotLeadCallRetryCron] Failed to initialize:', error);
       }
