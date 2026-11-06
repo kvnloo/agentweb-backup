@@ -55,4 +55,6 @@ export interface SlackStartOptions {
   fetch?: typeof fetch;
   /** URL query parameter that mirrors the current step (browser back + analytics). */
   stepParam?: string;
+  /** CSP nonce applied to the injected <style> and the Turnstile <script> (strict-CSP hosts). */
+  nonce?: string;
 }

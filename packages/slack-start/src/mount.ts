@@ -21,7 +21,7 @@ export function resolveApiBase(el: Element, fallback: string): string {
 
 /** Open the wizard now. Returns a function that closes it. */
 export function openSlackStart(options: SlackStartOptions, returnFocusTo?: HTMLElement | null): () => void {
-  injectStyles();
+  injectStyles(document, options.nonce);
   const host = document.createElement('div');
   host.setAttribute('data-agentweb-slack-start-root', '');
   document.body.appendChild(host);

@@ -48,7 +48,12 @@ Scoped CSS under `.aw-ss-root`; override variables anywhere above it, e.g.
 ```
 
 Variables: `--aw-ss-accent --aw-ss-text --aw-ss-muted --aw-ss-border --aw-ss-bg --aw-ss-track
---aw-ss-button --aw-ss-button-text --aw-ss-error --aw-ss-radius --aw-ss-font`.
+--aw-ss-button --aw-ss-button-text --aw-ss-error --aw-ss-radius --aw-ss-font`. The wizard root never
+declares them (defaults are `var()` fallbacks), so values set by the host page always win.
+
+Strict CSP: the stylesheet and the Turnstile script reuse the embedding `<script nonce="…">`
+(or `data-nonce`); with the module/React APIs pass `nonce`. Allow `script-src`/`connect-src` for the
+API origin and `https://challenges.cloudflare.com` (+ `frame-src` for Turnstile).
 
 ## Behavior
 
