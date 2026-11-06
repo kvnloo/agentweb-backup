@@ -11,7 +11,7 @@ import { getExpectedTwilioSignature } from 'twilio';
 const mockGetCreds = jest.fn();
 jest.mock('../utils/secretsManager', () => ({ getTwilioCredentials: (...a: unknown[]) => mockGetCreds(...a) }));
 jest.mock('../services/db', () => ({
-  crmDb: { getLeadListById: jest.fn(), getLeadById: jest.fn() },
+  crmDb: { getLeadListById: jest.fn(), getLeadById: jest.fn(), updateLead: jest.fn() },
   userDb: { getUserById: jest.fn() },
   orgDb: { getOrgById: jest.fn() },
 }));
@@ -32,6 +32,9 @@ import { setLeadCallStoreForTests } from '../services/voice/leadCallStore';
 import { setVoiceProviderForTests } from '../services/voice/voiceProvider';
 import { FakeVoiceProvider } from './helpers/fakeVoiceProvider';
 import { FakeLeadCallStore } from './helpers/fakeLeadCallStore';
+import { FakeLimitStore } from './helpers/fakeLimitStore';
+import { setLimitStoreForTests } from '../services/voice/limitStore';
+import { dncKey, setDncRetryDelayForTests } from '../services/voice/hotLeadCallDnc';
 import type { HotLeadCallRecord, HotLeadCallState } from '../services/voice/leadCallStore.types';
 import * as twiml from '../services/voice/twiml';
 import { buildVoiceWebhookUrl } from '../services/voice/voiceUrls';
@@ -62,6 +65,7 @@ const orgConfig = {
 
 let store: FakeLeadCallStore;
 let fake: FakeVoiceProvider;
+let limits: FakeLimitStore;
 let logSpy: jest.SpyInstance[];
 
 function seed(state: HotLeadCallState, extra: Partial<HotLeadCallRecord> = {}) {
@@ -119,6 +123,8 @@ beforeEach(() => {
   mock(requestNextHotLeadCallAttempt).mockResolvedValue({ enqueued: false, reason: 'no_candidates' });
   store = new FakeLeadCallStore();
   setLeadCallStoreForTests(store);
+  limits = new FakeLimitStore();
+  setLimitStoreForTests(limits);
   fake = new FakeVoiceProvider();
   setVoiceProviderForTests(fake);
   setHotLeadCallEnabledOverride(true);
@@ -133,6 +139,7 @@ beforeEach(() => {
 afterEach(() => {
   setVoiceProviderForTests(null);
   setLeadCallStoreForTests(null);
+  setLimitStoreForTests(null);
   setHotLeadCallEnabledOverride(null);
   logSpy.forEach((s) => s.mockRestore());
   delete process.env.BACKEND_URL;
@@ -631,17 +638,19 @@ describe('POST /gather: the lead phone must still be the one that passed the gat
 describe('POST /screen', () => {
   beforeEach(() => seed('bridging'));
 
-  it('adopts the body CallSid as the lead leg and asks the lead to press 1, with the announced name escaped', async () => {
+  it('adopts the body CallSid as the lead leg and asks the lead to press 1 or 3, with the announced name escaped and the org number spoken', async () => {
     const res = await screen();
     expect(res.status).toBe(200);
     expect(res.headers['content-type']).toMatch(/text\/xml/);
-    expect(res.text).toContain('Smith &amp; Sons would like to talk to you about your enquiry. Press 1 to be connected now.');
+    expect(res.text).toContain('This is an automated call from Smith &amp; Sons about the enquiry you sent us. To reach a person at Smith &amp; Sons, call 4 1 5, 5 5 5, 0 1 1 1. Press 1 to be connected now, or press 3 to stop these calls.');
     expect(res.text).toContain('<Gather input="dtmf" numDigits="1" timeout="8"');
     expect(res.text).toContain(`action="${BASE}${MOUNT}/screen-result?${QUERY.replace(/&/g, '&amp;')}"`);
     expect(res.text).toContain('We did not get your answer. Goodbye.');
     expect(store.record).toMatchObject({ state: 'bridging', leadCallSid: LEAD_SID });
     expect(store.events).toHaveLength(0);
-    noPhoneIn(res.text);
+    // The org's own number is spoken on purpose (spaced digits, never as +1...); the member's and the lead's are not.
+    expect(res.text).not.toContain(TWILIO_NUMBER);
+    for (const p of [MEMBER_PHONE, LEAD_PHONE]) expect(digitsOf(res.text)).not.toContain(digitsOf(p));
   });
 
   it('serves the same prompt on a Twilio retry without writing again', async () => {
@@ -698,6 +707,16 @@ describe('POST /screen', () => {
     expect((await post('screen', { CallSid: LEAD_SID }, { query: `listId=${LIST}&leadId=${LEAD}&jobKey=old` })).text).not.toContain('<Gather');
     store.record = null;
     expect((await screen()).text).not.toContain('<Gather');
+  });
+
+  it.each([['missing', undefined], ['not E.164', '4155550111']])('aborts, never as a decline, when the org number is %s (it cannot be read out)', async (_name, number) => {
+    mock(orgDb.getOrgById).mockResolvedValue({ orgId: 'org-a', hotLeadCall: { ...orgConfig, twilioNumber: number } });
+    const res = await screen();
+    expect(res.status).toBe(200);
+    expect(res.text).not.toContain('<Gather');
+    await screen();
+    expect(store.record).toMatchObject({ state: 'bridging', outcome: 'aborted' });
+    expect(store.eventTypes()).toEqual(['call.failed']);
   });
 
   it('aborts when the kill switch is off or the config is disabled: no prompt, outcome aborted once, never relabelled as a decline', async () => {
@@ -1825,5 +1844,202 @@ describe('privacy', () => {
     const logs = JSON.stringify(logSpy.flatMap((s) => s.mock.calls));
     expect(logs).toContain('handler failed');
     noPhoneIn(logs);
+  });
+});
+
+// ── press 3 at the screening prompt: stop calling this person (ENG-2783) ─────────────────────────────
+
+describe('lead presses 3: do not call again', () => {
+  const GOODBYE = 'Understood. Smith &amp; Sons will not call this number again. Goodbye.';
+  const MEMBER_COPY = 'The lead asked not to be called again. Their details are in your lead alert.';
+  // Computed per use: the digest key (JWT_SECRET) only exists inside each test.
+  const dnc = () => dncKey('org-a', LEAD_PHONE);
+  const warnings = () => JSON.stringify(logSpy.flatMap((s) => s.mock.calls));
+  beforeEach(() => {
+    seed('bridging', { leadCallSid: LEAD_SID });
+    setDncRetryDelayForTests(async () => undefined);
+  });
+  afterEach(() => setDncRetryDelayForTests(null));
+
+  it('writes the org marker (about ten years, no raw number), the lead contact status, the outcome and the event, and says goodbye', async () => {
+    const nowS = Math.floor(Date.now() / 1000);
+    const res = await screenResult('3');
+    expect(res.text).toContain(`<Say>${GOODBYE}</Say><Hangup/>`);
+    expect(res.text).not.toContain('<Response/>');
+    expect(limits.claims.get(dnc())).toBeDefined();
+    expect(limits.claims.get(dnc())!.expiresAtS - nowS).toBeGreaterThan(9 * 365 * 86400);
+    expect(dnc()).toMatch(/^hlc#dnc#[0-9a-f]{64}$/);
+    expect(JSON.stringify(limits.keysTouched)).not.toContain('4155550123');
+    expect(mock(crmDb.updateLead)).toHaveBeenCalledTimes(1);
+    expect(mock(crmDb.updateLead).mock.calls[0].slice(0, 2)).toEqual([LIST, LEAD]);
+    expect(mock(crmDb.updateLead).mock.calls[0][2]).toMatchObject({
+      contactStatus: 'do-not-contact', contactStatusReason: 'opted-out', contactStatusUpdatedBy: 'system', unsubscribedFromGroupEmail: true,
+    });
+    expect(store.record).toMatchObject({ state: 'bridging', outcome: 'lead_opted_out' });
+    expect(store.events).toEqual([{ type: 'call.lead_declined', detail: { reason: 'opted_out' } }]);
+    expect(store.record?.lastSequence).toMatchObject({ [`${LEAD_SID}#screen`]: 1, [`${MEMBER_SID}#dial`]: 1 });
+  });
+
+  it('a later 1 cannot reverse the stop: nothing connects, the lead hears the goodbye again, and the stop is not written twice', async () => {
+    await screenResult('3');
+    const again = await screenResult('1');
+    expect(again.text).toContain('will not call this number again');
+    expect(again.text).not.toContain('<Response/>');
+    expect((await screenResult('3')).text).toContain('will not call this number again');
+    expect(store.record).toMatchObject({ state: 'bridging', outcome: 'lead_opted_out' });
+    expect(store.eventTypes()).toEqual(['call.lead_declined']);
+    expect(mock(crmDb.updateLead)).toHaveBeenCalledTimes(1);
+    expect(limits.keysTouched.filter((k) => k === dnc())).toHaveLength(1);
+  });
+
+  it('retries the marker: two failures then a success still writes it, with nothing alarming logged', async () => {
+    const claim = jest.spyOn(limits, 'claim').mockRejectedValueOnce(new Error('ddb down')).mockRejectedValueOnce(new Error('ddb down'));
+    const res = await screenResult('3');
+    expect(res.text).toContain(GOODBYE);
+    expect(claim).toHaveBeenCalledTimes(3);
+    expect(limits.claims.has(dnc())).toBe(true);
+    expect(warnings()).not.toContain('do-not-call write failed');
+  });
+
+  it('waits 50 ms and then 150 ms between the three attempts', async () => {
+    const waits: number[] = [];
+    setDncRetryDelayForTests(async (ms) => { waits.push(ms); });
+    limits.failKeyPrefix = { prefix: 'hlc#dnc#', error: new Error('ddb down') };
+    await screenResult('3');
+    expect(waits).toEqual([50, 150]);
+  });
+
+  it('fails all three attempts: nothing connects, the lead still hears the goodbye, the contact status is still written, an error with the stable marker (org id, no number) is logged', async () => {
+    limits.failKeyPrefix = { prefix: 'hlc#dnc#', error: new Error(`ddb down for ${LEAD_PHONE}`) };
+    const claim = jest.spyOn(limits, 'claim');
+    const res = await screenResult('3');
+    expect(res.text).toContain(GOODBYE);
+    expect(res.text).not.toContain('<Response/>');
+    expect(claim).toHaveBeenCalledTimes(3);
+    expect(limits.claims.has(dnc())).toBe(false);
+    expect(mock(crmDb.updateLead)).toHaveBeenCalledTimes(1);
+    expect(store.record).toMatchObject({ state: 'bridging', outcome: 'lead_opted_out' });
+    const errors = logSpy[2].mock.calls.map((c) => String(c[0]));
+    expect(errors).toContain('[hotLeadCall] do-not-call write failed org-a');
+    expect(warnings()).not.toContain('4155550123');
+    expect((await screenResult('1')).text).not.toContain('<Response/>');
+  });
+
+  it('with no live org context (config gone): the leg ends without a goodbye (no name to say), the outcome and contact status are still recorded, an error is logged', async () => {
+    mock(orgDb.getOrgById).mockResolvedValue({ orgId: 'org-a' });
+    const res = await screenResult('3');
+    expect(res.text).toBe('<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>');
+    expect(limits.claims.size).toBe(0);
+    expect(mock(crmDb.updateLead)).toHaveBeenCalledTimes(1);
+    expect(store.record).toMatchObject({ state: 'bridging', outcome: 'lead_opted_out' });
+    expect(logSpy[2].mock.calls.map((c) => String(c[0])).some((l) => l.includes('do-not-call write failed'))).toBe(true);
+  });
+
+  it('when the lead row cannot be read: goodbye, outcome recorded, no marker (the approved number is unknown), no status write, an error logged', async () => {
+    mock(crmDb.getLeadById).mockRejectedValue(new Error('ddb down'));
+    const res = await screenResult('3');
+    expect(res.text).toContain(GOODBYE);
+    expect(store.record?.outcome).toBe('lead_opted_out');
+    expect(limits.claims.size).toBe(0);
+    expect(mock(crmDb.updateLead)).not.toHaveBeenCalled();
+    expect(warnings()).toContain('lead not read');
+    expect(logSpy[2].mock.calls.map((c) => String(c[0])).some((l) => l.includes('do-not-call write failed'))).toBe(true);
+  });
+
+  it('an email-unsubscribed lead who presses 3 becomes do-not-contact (opted-out)', async () => {
+    mock(crmDb.getLeadById).mockResolvedValue({ listId: LIST, leadId: LEAD, phone: LEAD_PHONE, contactStatus: 'unsubscribed' });
+    await screenResult('3');
+    expect(mock(crmDb.updateLead).mock.calls[0][2]).toMatchObject({ contactStatus: 'do-not-contact', contactStatusReason: 'opted-out' });
+  });
+
+  it('still says goodbye and records the outcome when the contact status write fails as well', async () => {
+    mock(crmDb.updateLead).mockRejectedValue(new Error('ddb down'));
+    const res = await screenResult('3');
+    expect(res.text).toContain(GOODBYE);
+    expect(limits.claims.has(dnc())).toBe(true);
+    expect(store.record?.outcome).toBe('lead_opted_out');
+  });
+
+  it('keeps the status of a lead that is already do-not-contact (an admin\'s reason is not overwritten)', async () => {
+    mock(crmDb.getLeadById).mockResolvedValue({ listId: LIST, leadId: LEAD, phone: LEAD_PHONE, contactStatus: 'do-not-contact', contactStatusReason: 'admin-flagged' });
+    await screenResult('3');
+    expect(mock(crmDb.updateLead)).not.toHaveBeenCalled();
+    expect(limits.claims.has(dnc())).toBe(true);
+  });
+
+  it('does not mark a number the call was not approved for (the lead\'s phone changed since the gates)', async () => {
+    seed('bridging', { leadCallSid: LEAD_SID, leadPhoneMac: leadPhoneMacOf('org-a', '+14155550199') });
+    const res = await screenResult('3');
+    expect(res.text).toContain(GOODBYE);
+    expect(limits.claims.size).toBe(0);
+    expect(mock(crmDb.updateLead)).toHaveBeenCalledTimes(1);
+    expect(logSpy[2].mock.calls.map((c) => String(c[0]))).toContain("[hotLeadCall] do-not-call write failed org-a: the lead's current phone is unreadable or not the one approved for this call");
+  });
+
+  it('/dial after a stop tells the member the lead asked not to be called again, and writes nothing more', async () => {
+    await screenResult('3');
+    const transitions = store.transitions;
+    const res = await dial('completed', { DialCallSid: LEAD_SID, DialBridged: 'false' });
+    expect(res.text).toContain(MEMBER_COPY);
+    expect(store.transitions).toBe(transitions);
+    expect(store.eventTypes()).toEqual(['call.lead_declined']);
+  });
+
+  it('both legs are metered and the record finishes lead_opted_out without trying another member', async () => {
+    await screenResult('3');
+    await dial('completed', { DialCallSid: LEAD_SID, DialBridged: 'false' });
+    await leadStatus('completed', { CallDuration: '12' });
+    await memberStatus('completed', { CallDuration: '30' });
+    expect(store.record).toMatchObject({ state: 'finished', outcome: 'lead_opted_out', meteredLegs: ['lead', 'member:1'] });
+    expect(store.eventTypes()).toEqual(['call.lead_declined', 'call.completed']);
+    expect(mock(requestNextHotLeadCallAttempt)).not.toHaveBeenCalled();
+  });
+
+  it('a 2, a 5 and no input still decline exactly as before (no stop is recorded)', async () => {
+    for (const digits of ['2', '5', undefined]) {
+      seed('bridging', { leadCallSid: LEAD_SID });
+      store.events = [];
+      const res = await screenResult(digits);
+      expect(res.text).toBe('<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>');
+      expect(store.record?.outcome).toBe('lead_declined');
+    }
+    expect(limits.claims.size).toBe(0);
+    expect(mock(crmDb.updateLead)).not.toHaveBeenCalled();
+  });
+
+  describe('/gather re-checks the list before dialling the lead', () => {
+    beforeEach(() => seed('member_answered'));
+
+    it('refuses on the org marker (the same number pressed 3 on another lead): call.failed lead_do_not_call, unreachable copy, no Dial', async () => {
+      limits.claims.set(dnc(), { token: 'dnc', expiresAtS: Math.floor(Date.now() / 1000) + 1000 });
+      const res = await gather('1');
+      expect(res.text).toContain('Sorry, we could not reach them. Goodbye.');
+      expect(res.text).not.toContain('<Dial');
+      expect(store.record).toMatchObject({ state: 'member_answered', outcome: 'lead_do_not_call' });
+      expect(store.events).toEqual([{ type: 'call.failed', detail: { reason: 'lead_do_not_call' } }]);
+    });
+
+    it('refuses on the lead\'s own do-not-contact status', async () => {
+      mock(crmDb.getLeadById).mockResolvedValue({ listId: LIST, leadId: LEAD, phone: LEAD_PHONE, contactStatus: 'do-not-contact' });
+      const res = await gather('1');
+      expect(res.text).not.toContain('<Dial');
+      expect(store.record?.outcome).toBe('lead_do_not_call');
+    });
+
+    it('still dials a lead who only unsubscribed from email', async () => {
+      mock(crmDb.getLeadById).mockResolvedValue({ listId: LIST, leadId: LEAD, phone: LEAD_PHONE, contactStatus: 'unsubscribed', unsubscribedFromGroupEmail: true });
+      expect((await gather('1')).text).toContain('<Dial');
+    });
+
+    it('fails closed when the marker cannot be read: no Dial, nothing connects', async () => {
+      limits.failNext = new Error('ddb down');
+      const res = await gather('1');
+      expect(res.text).not.toContain('<Dial');
+      expect(store.record?.state).toBe('member_answered');
+    });
+
+    it('dials as before when the number is not on the list', async () => {
+      expect((await gather('1')).text).toContain('<Dial');
+    });
   });
 });

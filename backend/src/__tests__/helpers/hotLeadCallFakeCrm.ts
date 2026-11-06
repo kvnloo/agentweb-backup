@@ -76,6 +76,13 @@ export class FakeCrm {
       this.calls.push('getLeadById');
       return clone(this.leadOf(listId, leadId));
     },
+    /** The top-level fields of the lead row are merged, like UpdateItem SET (only what the hot-lead call writes: contact status). */
+    updateLead: async (listId: string, leadId: string, updates: Record<string, unknown>) => {
+      this.calls.push('updateLead');
+      const lead = this.leadOf(listId, leadId);
+      if (!lead) throw new Error('no such lead');
+      Object.assign(lead, clone(updates));
+    },
     getLeadListsByUserId: async (userId: string) => {
       this.calls.push('getLeadListsByUserId');
       return [...this.lists.values()].filter((l) => l.userId === userId).map(clone);

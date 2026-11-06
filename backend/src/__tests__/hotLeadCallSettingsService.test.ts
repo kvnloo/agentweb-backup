@@ -516,6 +516,8 @@ describe('read-out: calling hours that never meet the lead window', () => {
     ['a wide valid window (00:00-23:59)', '00:00', '23:59', 'America/Chicago'],
     ['a wrapping window that covers the afternoon (14:00-02:00)', '14:00', '02:00', 'America/Chicago'],
     ['one 15-minute slot inside the lead window (Chicago 12:00-12:15 = 13:00 Eastern)', '12:00', '12:15', 'America/Chicago'],
+    ['a 2-minute window inside the lead window (Chicago 12:04-12:06)', '12:04', '12:06', 'America/Chicago'],
+    ['a 1-minute window at the last minute of the lead window (New York 17:59-18:00)', '17:59', '18:00', 'America/New_York'],
     ['the last minute before the lead window closes (Chicago 16:45-17:00)', '16:45', '17:00', 'America/Chicago'],
     ['Pacific afternoon (10:00-15:00)', '10:00', '15:00', 'America/Los_Angeles'],
     ['a zone far from the US (Europe/London 18:00-23:00 = 13:00-18:00 Eastern in winter)', '18:00', '23:00', 'Europe/London'],

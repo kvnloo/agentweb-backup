@@ -21,8 +21,9 @@ import { setHotLeadCallEnabledOverride } from '../services/voice/hotLeadCallMode
 import { LEAD_UNREACHABLE_COPY } from '../services/voice/twiml';
 import { leadPhoneMacOf } from '../services/voice/leadPhoneMac';
 import { attrOf, sayText, MOUNT } from './helpers/hotLeadCallTwilioSim';
+import { dncKey } from '../services/voice/hotLeadCallDnc';
 import {
-  BASE, LEAD_E164, advanceMinutes, LEAD_PHONE_AS_TYPED, LIST, MEMBER_PHONE, TWILIO_NUMBER, eventsOf, installWorld, mock, placedCall, recordOf, submitLead,
+  BASE, LEAD_E164, callConfig, advanceMinutes, LEAD_PHONE_AS_TYPED, LIST, MEMBER_PHONE, TWILIO_NUMBER, eventsOf, installWorld, mock, placedCall, recordOf, submitLead,
   twilioCall, usage, usageSummary, world, bridgedCall, setClock,
 } from './helpers/hotLeadCallE2eWorld';
 
@@ -71,7 +72,7 @@ describe('a hot lead rings the member and, on 1, bridges the lead', () => {
     await call.leadStatus('in-progress', 2);
     expect(recordOf('lead-a')).toMatchObject({ state: 'bridging', leadCallSid: 'CA00000002' });
     const screening = await call.leadAnswers();
-    expect(sayText(screening.body)).toBe('Smith & Sons would like to talk to you about your enquiry. Press 1 to be connected now.');
+    expect(sayText(screening.body)).toBe('This is an automated call from Smith & Sons about the enquiry you sent us. To reach a person at Smith & Sons, call 4 1 5, 5 5 5, 0 1 1 1. Press 1 to be connected now, or press 3 to stop these calls.');
     expect((await call.leadPresses('1')).body).toBe('<?xml version="1.0" encoding="UTF-8"?><Response/>');
     expect(recordOf('lead-a')).toMatchObject({ state: 'connected', leadCallSid: 'CA00000002' });
     expect((await call.dialEnds('completed', { DialCallDuration: '125' })).body).toContain('<Hangup/>');
@@ -159,6 +160,42 @@ describe('a hot lead rings the member and, on 1, bridges the lead', () => {
     expect(eventsOf('lead-a')).toEqual(['call.initiated', 'call.member_answered', 'call.lead_declined', 'call.completed']);
     expect(world.provider.placedCalls).toHaveLength(1);
     expect(usageSummary()).toEqual([['twilio:voice:CA00000001:member', 1], ['twilio:voice:CA00000002:lead', 1]]);
+  });
+
+  it('the lead presses 3: the stop is recorded everywhere, the member is told, and a new lead with that number in the same org is skipped while another org\'s is called', async () => {
+    await submitLead('lead-a');
+    const call = twilioCall(placedCall());
+    await call.memberAnswers();
+    await call.memberPresses('1');
+    await call.leadStatus('in-progress', 2);
+    await call.leadAnswers();
+    const goodbye = await call.leadPresses('3');
+    expect(sayText(goodbye.body)).toBe('Understood. Smith & Sons will not call this number again. Goodbye.');
+    expect(goodbye.body).not.toContain('<Response/>');
+    const told = await call.dialEnds('completed', { DialBridged: 'false' });
+    expect(sayText(told.body)).toBe('The lead asked not to be called again. Their details are in your lead alert.');
+    await call.leadStatus('completed', 3, { CallDuration: '12' });
+    await call.memberLegEnds('completed', '40');
+
+    expect(recordOf('lead-a')).toMatchObject({ state: 'finished', outcome: 'lead_opted_out', meteredLegs: expect.arrayContaining(['lead', 'member:1']) });
+    expect(eventsOf('lead-a')).toEqual(['call.initiated', 'call.member_answered', 'call.lead_declined', 'call.completed']);
+    expect(usageSummary()).toEqual([['twilio:voice:CA00000001:member', 1], ['twilio:voice:CA00000002:lead', 1]]); // each leg once
+    expect(world.crm.lead(LIST, 'lead-a')).toMatchObject({ contactStatus: 'do-not-contact', contactStatusReason: 'opted-out' });
+    expect([...world.limits.claims.keys()].filter((k) => k.startsWith('hlc#dnc#'))).toEqual([dncKey('org-a', LEAD_E164)]);
+
+    // The same person fills the form again as a NEW lead of the same org: no call, no slot beyond the first lead's.
+    advanceMinutes(5);
+    const counters = JSON.stringify([...world.limits.counters]);
+    await submitLead('lead-new');
+    expect(world.provider.placedCalls).toHaveLength(1);
+    expect(recordOf('lead-new')).toBeUndefined();
+    expect(world.crm.lead(LIST, 'lead-new').engagements?.find((e) => e.eventType === 'call.skipped')?.eventData).toEqual({ reason: 'do_not_call' });
+    expect(JSON.stringify([...world.limits.counters])).toBe(counters);
+
+    // Another org with the same number is unaffected (the marker is keyed by org).
+    world.crm.addOrg({ orgId: 'org-b', hotLeadCall: callConfig }, [{ userId: 'owner-b' }], [{ listId: 'list-b', userId: 'owner-b' }]);
+    await submitLead('lead-b', { listId: 'list-b' });
+    expect(world.provider.placedCalls).toHaveLength(2);
   });
 
   it('the lead answers but never presses anything (voicemail, hang-up): /dial reports DialBridged=false and the lead counts as declined', async () => {

@@ -38,6 +38,7 @@ import { setLimitStoreForTests } from '../services/voice/limitStore';
 import { setHotLeadCallEntitledOverride } from '../services/voice/hotLeadCallEntitlement';
 import { FakeLeadCallStore } from './helpers/fakeLeadCallStore';
 import { leadPhoneMacOf } from '../services/voice/leadPhoneMac';
+import { dncKey, isNumberDoNotCall, markNumberDoNotCall } from '../services/voice/hotLeadCallDnc';
 import { teamMember, callRecord, MEMBER_ID } from './helpers/hotLeadCallFixtures';
 
 const mock = (fn: unknown) => fn as jest.Mock;
@@ -669,9 +670,11 @@ describe('abuse limits (reservation)', () => {
 
   it('fails the job closed, dialing nothing and creating no record, and shows limits_unavailable on the lead', async () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
-    limits.failNext = new Error('ddb down');
+    // Only the reservation fails: the do-not-call read before it works, so this proves the reservation's own fail-closed path.
+    limits.failKeyPrefix = { prefix: 'hlc#phone#', error: new Error('ddb down') };
     await expect(processHotLeadCallJob(jobOf())).rejects.toThrow('ddb down');
     warn.mockRestore();
+    expect(limits.keysTouched.some((k) => k.startsWith('hlc#phone#'))).toBe(true);
     expect(provider.placedCalls).toHaveLength(0);
     expect(store.record).toBeNull();
     expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'limits_unavailable' } }]);
@@ -679,11 +682,23 @@ describe('abuse limits (reservation)', () => {
 
   it('fails the job with the original error when the limits_unavailable event cannot be written', async () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
-    limits.failNext = new Error('ddb down');
+    limits.failKeyPrefix = { prefix: 'hlc#phone#', error: new Error('ddb down') };
     store.addEvent = async () => { throw new Error('events down'); };
     await expect(processHotLeadCallJob(jobOf())).rejects.toThrow('ddb down');
     warn.mockRestore();
     expect(provider.placedCalls).toHaveLength(0);
+  });
+
+  it('fails the job closed, dialing nothing and creating no record, when the do-not-call read fails (before any slot)', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    limits.failKeyPrefix = { prefix: 'hlc#dnc#', error: new Error('ddb down') };
+    await expect(processHotLeadCallJob(jobOf())).rejects.toThrow('ddb down');
+    warn.mockRestore();
+    expect(provider.placedCalls).toHaveLength(0);
+    expect(store.record).toBeNull();
+    expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'limits_unavailable' } }]);
+    expect(limits.keysTouched.every((k) => k.startsWith('hlc#dnc#'))).toBe(true);
+    expect(limits.counters.size).toBe(0);
   });
 
   it('fails the job closed when JWT_SECRET (the phone-hash key) is missing', async () => {
@@ -717,6 +732,75 @@ describe('abuse limits (reservation)', () => {
     const keys = JSON.stringify([...limits.keysTouched, store.events]);
     for (const spelling of ['2125550142', '+12125550142', '(212) 555-0142', '212-555-0142', '555-0142']) expect(keys).not.toContain(spelling);
     expect(keys).toMatch(/hlc#phone#[0-9a-f]{64}/);
+  });
+});
+
+describe('do-not-call (a lead pressed 3, ENG-2783)', () => {
+  const nowS = () => Math.floor(Date.now() / 1000);
+  const listed = () => markNumberDoNotCall('org-a', '+12125550142');
+
+  it('skips with do_not_call, before any slot or record, when the org marker holds the number (another lead, same number)', async () => {
+    await listed();
+    lead.leadId = 'lead-new';
+    await dispatchHotLeadCall('list-a', 'lead-new', 'form_fill');
+    expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'do_not_call' } }]);
+    expect(enqueueCalls()).toHaveLength(0);
+    expect(provider.placedCalls).toHaveLength(0);
+    expect(store.record).toBeNull();
+    expect([...limits.counters.keys()]).toEqual([]);
+    expect([...limits.claims.keys()]).toEqual([dncKey('org-a', '+12125550142')]);
+  });
+
+  it('keys the marker by org and a keyed digest of the number: another org is not affected, and the key holds no number', async () => {
+    await listed();
+    const [key] = [...limits.claims.keys()];
+    expect(key).toMatch(/^hlc#dnc#[0-9a-f]{64}$/);
+    expect(key).not.toContain('2125550142');
+    expect(limits.claims.get(key)!.expiresAtS - nowS()).toBeGreaterThan(9 * 365 * 86400);
+    expect(key).not.toBe(dncKey('org-b', '+12125550142'));
+    expect(await isNumberDoNotCall('org-b', '+12125550142')).toBe(false);
+  });
+
+  it('skips with do_not_call when the lead itself is do-not-contact, taking no slot and no record', async () => {
+    lead.contactStatus = 'do-not-contact';
+    await dispatchHotLeadCall('list-a', 'lead-a', 'form_fill');
+    expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'do_not_call' } }]);
+    expect(provider.placedCalls).toHaveLength(0);
+    expect(store.record).toBeNull();
+    expect([...limits.counters.keys()]).toEqual([]);
+    expect([...limits.claims.keys()].every((k) => k.startsWith('hlc#dnc#'))).toBe(true);
+  });
+
+  it.each([
+    ['an email unsubscribe', { contactStatus: 'unsubscribed' }],
+    ['the legacy group-email flag', { unsubscribedFromGroupEmail: true }],
+    ['a bounce reason without do-not-contact', { contactStatus: 'active', contactStatusReason: 'bounced' }],
+  ])('still calls a lead with %s (only do-not-contact and the org marker block)', async (_name, fields) => {
+    Object.assign(lead, fields);
+    await dispatchHotLeadCall('list-a', 'lead-a', 'form_fill');
+    expect(provider.placedCalls).toHaveLength(1);
+  });
+
+  it('re-checks in the job, so a stop that landed after dispatch is honoured', async () => {
+    await listed();
+    await processHotLeadCallJob(jobOf());
+    expect(provider.placedCalls).toHaveLength(0);
+    expect(store.record).toBeNull();
+    expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'do_not_call' } }]);
+  });
+
+  it('is checked after the stateless gates and the plan: a lead outside the lead window does not read the store', async () => {
+    jest.setSystemTime(new Date('2026-10-19T23:30:00.000Z'));
+    await listed();
+    limits.keysTouched.length = 0;
+    await processHotLeadCallJob(jobOf());
+    expect(limits.keysTouched).toEqual([]);
+  });
+
+  it('a lapsed marker no longer blocks (the store tests the expiry itself)', async () => {
+    await listed();
+    jest.setSystemTime(new Date(Date.now() + 11 * 365 * 86400 * 1000));
+    expect(await isNumberDoNotCall('org-a', '+12125550142')).toBe(false);
   });
 });
 
@@ -859,7 +943,8 @@ describe('credentials that cannot be loaded', () => {
     await processHotLeadCallJob(jobOf());
     expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'credentials_unavailable' } }]);
     expect(store.record).toBeNull();
-    expect(limits.keysTouched).toEqual([]);
+    // Only the read-only do-not-call check touched the store: no slot, no counter.
+    expect(limits.keysTouched.filter((k) => !k.startsWith('hlc#dnc#'))).toEqual([]);
     expect(provider.placedCalls).toHaveLength(0);
     // The next submission of the same lead is dialed normally.
     await processHotLeadCallJob(jobOf({ submissionId: 'sub-2', submittedAt: NOW }));
