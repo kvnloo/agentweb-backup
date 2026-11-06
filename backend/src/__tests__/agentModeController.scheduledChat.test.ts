@@ -131,10 +131,6 @@ jest.mock('../utils/agentModeAlerts', () => ({
   sendAgentModeOncallAlert: jest.fn().mockResolvedValue(undefined),
 }));
 
-jest.mock('../services/notionService', () => ({
-  createOncallItem: jest.fn().mockResolvedValue(undefined),
-}));
-
 // ENG-1719: previously unmocked — real calls silently failed and were swallowed by the
 // caller's own .catch(), which is why no existing test needed this. Mocking it is a strict
 // improvement (a resolved no-op instead of a failing real network call) and lets the new

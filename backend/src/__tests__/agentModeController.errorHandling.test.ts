@@ -1312,7 +1312,7 @@ describe('AgentModeController - Error Handling', () => {
       expect(mockChatbotDb.updateSessionContextLimitReported).not.toHaveBeenCalled();
     });
 
-    it('should NOT call createOncallItem when there is no sessionId', async () => {
+    it('should NOT file an auto issue when there is no sessionId', async () => {
       await agentModeController.generateResponse(
         { ...makeReq(), body: { userMessage: 'hi', llmModel: 'gpt-5-chat-2', attachments: [] } } as unknown as Request,
         makeRes()
