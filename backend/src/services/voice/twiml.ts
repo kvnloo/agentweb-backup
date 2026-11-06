@@ -33,7 +33,10 @@ export function spokenPhoneNumber(e164: string): string {
 }
 
 // The lead can always call the org's own number back: it rings the team through the inbound callback path (inboundCallback.ts).
-// Pressing 2 ("call me again later") is deliberately NOT offered: nothing can schedule that second call (ENG-2783 notes).
+// Pressing 2 ("call me again later") is deliberately NOT offered: nothing can schedule that second call (see "Known follow-ups"
+// in docs/integrations/hot-lead-call.md).
+// The prompt is US-only (a Canadian number is refused upstream, HOT_LEAD_CALL_CA_ENABLED=false); any other E.164 number is
+// simply read digit by digit.
 const screenPromptCopy = (announcedName: string, callbackNumber: string): string =>
   `This is an automated call from ${announcedName} about the enquiry you sent us. To reach a person at ${announcedName}, call ${spokenPhoneNumber(callbackNumber)}. Press 1 to be connected now, or press 3 to stop these calls.`;
 export const NO_INPUT_COPY = 'We did not get a response. Goodbye.';
@@ -53,6 +56,7 @@ export const LEAD_DIAL_TIMEOUT_SECONDS = 25;
 export const BRIDGED_CALL_TIME_LIMIT_SECONDS = 1800;
 
 const E164 = /^\+[1-9]\d{6,14}$/;
+export const isE164 = (value: unknown): value is string => typeof value === 'string' && E164.test(value);
 // XML 1.0 forbids most control characters even when escaped; drop them rather than emit a document Twilio rejects.
 // eslint-disable-next-line no-control-regex -- the control characters are exactly what this pattern removes
 const XML_FORBIDDEN = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/g;

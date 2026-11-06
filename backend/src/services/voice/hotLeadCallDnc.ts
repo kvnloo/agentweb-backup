@@ -1,4 +1,3 @@
-import { isDoNotContact } from '../../utils/leadContactStatus';
 import { keyedDigest } from './keyedDigest';
 import { getLimitStore } from './limitStore';
 
@@ -27,7 +26,32 @@ export async function isNumberDoNotCall(orgId: string, phoneE164: string, now: D
   return (await getLimitStore().holder(dncKey(orgId, phoneE164), Math.floor(now.getTime() / 1000))) !== null;
 }
 
-/** The lead row's own contact status (any channel's unsubscribe or do-not-contact) or the org's marker for its number. */
+/**
+ * The org's marker for the number, or the lead's contact status being exactly 'do-not-contact' (set by a person, a sales
+ * rep or a press of 3). An email unsubscribe ('unsubscribed'), a bounce or the legacy group-email flag does NOT block: a
+ * person who left a newsletter and then asks for a call must be called.
+ */
 export async function isLeadDoNotCall(input: { orgId: string; lead: unknown; phoneE164: string }): Promise<boolean> {
-  return isDoNotContact(input.lead) || await isNumberDoNotCall(input.orgId, input.phoneE164);
+  const status = (input.lead as { contactStatus?: unknown } | null | undefined)?.contactStatus;
+  return status === 'do-not-contact' || await isNumberDoNotCall(input.orgId, input.phoneE164);
+}
+
+const RETRY_BACKOFF_MS = [50, 150];
+let sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+/** Test-only: replace the backoff sleep; null restores it. */
+export function setDncRetryDelayForTests(replacement: ((ms: number) => Promise<void>) | null): void {
+  sleep = replacement ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+}
+
+/** `markNumberDoNotCall` tried up to three times in-process (50 ms, then 150 ms apart). True once it landed. Never throws. */
+export async function markNumberDoNotCallWithRetry(orgId: string, phoneE164: string): Promise<boolean> {
+  for (let attempt = 0; attempt <= RETRY_BACKOFF_MS.length; attempt++) {
+    try {
+      await markNumberDoNotCall(orgId, phoneE164);
+      return true;
+    } catch {
+      if (attempt < RETRY_BACKOFF_MS.length) await sleep(RETRY_BACKOFF_MS[attempt]);
+    }
+  }
+  return false;
 }

@@ -61,7 +61,7 @@ import {
 } from '../services/voice/callFinalisation';
 import {
   bridgeTwiml, connectTwiml, hangupTwiml, inboundMemberScreenTwiml, inboundNobodyTwiml, inboundRingTwiml, inboundUnavailableTwiml,
-  leadDeclinedTwiml, leadOptedOutMemberTwiml, leadOptedOutTwiml, leadPhoneChangedTwiml, leadScreenTwiml, leadUnreachableTwiml, memberPromptTwiml,
+  isE164, leadDeclinedTwiml, leadOptedOutMemberTwiml, leadOptedOutTwiml, leadPhoneChangedTwiml, leadScreenTwiml, leadUnreachableTwiml, memberPromptTwiml,
 } from '../services/voice/twiml';
 import { recordCallUsage } from '../services/voice/voiceUsage';
 import {
@@ -72,8 +72,7 @@ import { leadPhoneMacOf } from '../services/voice/leadPhoneMac';
 import { holdsClaim } from '../services/hotLeadCallPlacement';
 import { callableLeadPhone } from '../services/hotLeadCallConfig';
 import { isInsideLeadCallWindow } from '../services/voice/leadLocalHours';
-import { isLeadDoNotCall, markNumberDoNotCall } from '../services/voice/hotLeadCallDnc';
-import { isDoNotContact } from '../utils/leadContactStatus';
+import { isLeadDoNotCall, markNumberDoNotCallWithRetry } from '../services/voice/hotLeadCallDnc';
 
 // type: () => true so a JSON or other content type is limited and parsed here too, instead of falling
 // through to the global 50mb express.json (the same trick as the unipile and tracker parsers).
@@ -340,12 +339,12 @@ router.post('/gather', guarded(async (_req, res, q, body) => {
   }
 
   const leadNow = await leadPhoneFor(q, ctx);
-  const leadE164 = leadNow?.phone;
-  if (!leadNow || !leadE164 || !ctx.config.twilioNumber) {
+  if (!leadNow || !ctx.config.twilioNumber) {
     await decide(q, ['member_answered'], answered('lead_phone_invalid'), 'call.failed', { reason: 'lead_phone_invalid' });
     return sendXml(res, leadUnreachableTwiml());
   }
 
+  const leadE164 = leadNow.phone;
   // The lead (or the same number on another lead of the org) may have pressed 3 since the gates ran. A store failure
   // throws: the lead is not dialled.
   if (await isLeadDoNotCall({ orgId: ctx.orgId, lead: leadNow.lead, phoneE164: leadE164 })) {
@@ -416,7 +415,8 @@ router.post('/screen', guarded(async (_req, res, q, body) => {
   if (current.leadCallSid !== sid || current.state !== 'bridging') return sendHangup(res);
 
   const ctx = await liveContext(q, current);
-  if (!ctx || !ctx.config.twilioNumber) {
+  // The prompt speaks the org's number: one that is missing or not E.164 cannot be read out, so the call is aborted like any other.
+  if (!ctx || !isE164(ctx.config.twilioNumber)) {
     // Shares the dial marker, so /dial's own outcome cannot relabel an abort as a decline.
     await decide(q, ['bridging'], {
       state: 'bridging', outcome: 'aborted', lastSequence: { [decisionKey(record.memberCallSid, 'dial')]: 1 },
@@ -427,10 +427,16 @@ router.post('/screen', guarded(async (_req, res, q, body) => {
 }, twimlReplies));
 
 /**
- * The lead pressed 3: stop calling this person. Two records, each best-effort on its own and neither able to stop the
- * other or the goodbye: the org's do-not-call marker for the number (what a new lead with the same number is checked
- * against) and the lead's own do-not-contact status. A failure is logged without any number; the call is not connected
- * either way (this digit never connects), and a half-written stop is still enforced by the other record.
+ * The lead pressed 3: stop calling this person. Two records, each written on its own so that neither can stop the other
+ * or the goodbye: the org's do-not-call marker for the number (what a new lead with the same number is checked against;
+ * claimed up to three times in-process) and the lead's own do-not-contact status. This digit never connects. If the marker
+ * cannot be written the stop is only as strong as the contact status on THIS lead: a new lead with the same number would
+ * not be caught by the marker, so that case is logged at error level with the stable alarm text
+ * `[hotLeadCall] do-not-call write failed <orgId>` (never a number) for a human to act on.
+ *
+ * The org id is not in the signed call state (the query carries listId, leadId, jobKey and leg; the record holds no org id and
+ * the jobKey is a hash), so it comes from the list's owner through resolveHotLeadCallContext: without a live context, or when
+ * the lead's phone is no longer the one approved (the record keeps only a one-way MAC), no marker can be written.
  */
 async function recordLeadOptOut(q: CallQuery, record: HotLeadCallRecord, ctx: HotLeadCallContext | null): Promise<void> {
   let lead: Awaited<ReturnType<typeof crmDb.getLeadById>> | null = null;
@@ -439,20 +445,18 @@ async function recordLeadOptOut(q: CallQuery, record: HotLeadCallRecord, ctx: Ho
   } catch (err) {
     console.warn('[hotLeadCall] opt-out: lead not read', errorName(err));
   }
-  try {
-    const callable = ctx && lead ? callableLeadPhone(lead.phone, ctx.config) : null;
-    // The marker names the number that was approved for this call, not whatever a later submission put on the lead.
-    if (!ctx || !callable || !('phone' in callable) || record.leadPhoneMac !== leadPhoneMacOf(ctx.orgId, callable.phone)) {
-      console.warn('[hotLeadCall] opt-out: do-not-call marker not written, the approved number is unknown');
-    } else {
-      await markNumberDoNotCall(ctx.orgId, callable.phone);
-    }
-  } catch (err) {
-    console.warn('[hotLeadCall] opt-out: do-not-call marker not written', errorName(err));
+  const callable = ctx && lead ? callableLeadPhone(lead.phone, ctx.config) : null;
+  // The marker names the number that was approved for this call, not whatever a later submission put on the lead.
+  if (ctx && callable && 'phone' in callable && record.leadPhoneMac === leadPhoneMacOf(ctx.orgId, callable.phone)) {
+    if (!await markNumberDoNotCallWithRetry(ctx.orgId, callable.phone)) console.error(`[hotLeadCall] do-not-call write failed ${ctx.orgId}`);
+  } else if (!ctx) {
+    console.error('[hotLeadCall] do-not-call write failed: no live org context for the list, so the org marker could not be keyed');
+  } else {
+    console.error(`[hotLeadCall] do-not-call write failed ${ctx.orgId}: the lead's current phone is unreadable or not the one approved for this call`);
   }
   try {
-    // An admin's or an earlier unsubscribe's status (and its reason) is kept as it is.
-    if (lead && !isDoNotContact(lead)) {
+    // An existing do-not-contact (an admin's, a bounce's) keeps its reason; 'unsubscribed' (an email opt-out) becomes do-not-contact.
+    if (lead && lead.contactStatus !== 'do-not-contact') {
       const now = new Date().toISOString();
       await crmDb.updateLead(q.listId, q.leadId, {
         contactStatus: 'do-not-contact',
@@ -460,6 +464,7 @@ async function recordLeadOptOut(q: CallQuery, record: HotLeadCallRecord, ctx: Ho
         contactStatusNote: 'Pressed 3 on a hot-lead call',
         contactStatusUpdatedAt: now,
         contactStatusUpdatedBy: 'system',
+        // Same side effect as the CRM's own do-not-contact action: the lead also leaves group email.
         unsubscribedFromGroupEmail: true,
         unsubscribedFromGroupEmailAt: now,
       });
