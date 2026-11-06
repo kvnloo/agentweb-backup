@@ -86,6 +86,7 @@ Branches (all end in `finished` once every leg that was dialed is metered):
 | Lead answers but presses another key, says nothing or hangs up | `/screen-result` (a key) or `/dial` (`completed` with `DialBridged=false`) | `lead_declined`; the member hears "The lead did not confirm. Their details are in your lead alert." and no other member is tried | `call.member_answered`, `call.lead_declined`, `call.completed` |
 | Member presses another digit, hangs up on or ignores the prompt, or never picks up (no-answer, busy, failed, canceled) | member `/status` terminal | `member_declined` / `member_no_answer` for the attempt; the record moves to `between_attempts` and the next-attempt request runs (see [Who is rung](#who-is-rung)) | `call.member_declined` or `call.member_no_answer`, then `call.completed` only when no further attempt is queued |
 | Member presses 1, lead does not answer | `/dial` with `no-answer`, `busy` or `failed` | `lead_no_answer` | `call.member_answered`, `call.lead_no_answer`, `call.completed` |
+| Lead's local calling window closed while the member was answering (member pressed 1) | `/gather` | `lead_outside_hours` (record stays `member_answered` until the member leg ends); same apology as `lead_phone_invalid`; the lead is not dialled | `call.member_answered`, `call.failed` (reason `lead_outside_hours`), `call.completed` |
 | Lead number changed since the call passed the gates (repeat submission overwrote the phone) | `/gather` | `lead_phone_changed` (record stays `member_answered` until the member leg ends); the member hears "We could not reach the lead. Their details are in your lead alert."; no other member is tried | `call.member_answered`, `call.failed` (reason `lead_phone_changed`), `call.completed` |
 | Lead number no longer valid at bridge time | `/gather` | `lead_phone_invalid` (record stays `member_answered` until the member leg ends) | `call.member_answered`, `call.failed` (reason `lead_phone_invalid`), `call.completed` |
 | Kill switch or config turned off while the member is on the line | `/owner`, `/gather` or `/screen` | `aborted` | at `/owner` (still ringing): `call.failed` (reason `aborted`), `call.completed`; at `/gather` (member was on the prompt): `call.member_answered`, `call.failed` (reason `aborted`), `call.completed`; at `/screen` (lead answered): `call.failed` (reason `aborted`), `call.completed` |
@@ -448,7 +449,7 @@ call, Slack only"). Validation applies to every read, including the webhooks.
 | `memberCooldownMinutes` | integer 1-60, default 2. Per team member: a member who was just rung is passed over for the next available one. |
 | `maxAttemptsPerLead` | integer 1-5, default 3. How many member calls may be made for one lead; a member who was already tried is never rung again. |
 | `announcedName` | required, trimmed, 1-60 chars of letters, digits, space and `. , & ' -`. Spoken in `<Say>`; XML-escaped by the TwiML builder. |
-| `callingHours` | `{ start, end, timezone }`, `HH:MM` 24h, `start != end`, defaults 08:00 / 21:00. It is the window in which calls ARE allowed, in the org's IANA `Area/Location` timezone (UTC, abbreviations and `Etc/` refused). `start > end` wraps past midnight. Start inclusive, end exclusive, minute granularity. The lead's own timezone is not considered. Required to enable. Member windows are read on this same clock. |
+| `callingHours` | `{ start, end, timezone }`, `HH:MM` 24h, `start != end`, defaults 08:00 / 21:00. It is the window in which calls ARE allowed, in the org's IANA `Area/Location` timezone (UTC, abbreviations and `Etc/` refused). `start > end` wraps past midnight. Start inclusive, end exclusive, minute granularity. This is the ORG's clock; the lead's own local hours are a separate, fixed gate (see [Lead-local hours](#lead-local-hours)). Required to enable. Member windows are read on this same clock. |
 | `allowedCountries` | non-empty subset of `["US","CA"]` (default both); the lead's number must resolve to one of them. |
 
 The lead's number is read from the lead row at dispatch AND again at bridge time;
@@ -785,7 +786,12 @@ What the code requires (verified from code):
   and the REST `from`). The provisioning tool buys it: `availablePhoneNumbers('US').local`,
   voice-enabled, optionally by area code. The org's number is always a US local
   number, even for a Canadian member.
-- Outbound calls to US and Canadian numbers only (`allowedCountries`).
+- Outbound calls to US numbers only. `allowedCountries` still stores `US`/`CA`, but Canada is refused in code
+  (`HOT_LEAD_CALL_CA_ENABLED = false` in `hotLeadCallConfig.ts`; skip reason `country_not_allowed`) until the CRTC
+  ADAD requirements are built: an identification message with an email or postal address and a local or toll-free
+  number, plus lead-local hours. Neither is implemented. Re-enabling Canada needs both, then flipping the constant.
+- Lead-local calling hours are enforced (see [Lead-local hours](#lead-local-hours)). State laws with stricter hours
+  or days (some states restrict evenings, weekends or holidays) are NOT modelled and have not been verified.
 - Public HTTPS reachability of `BACKEND_URL` for the six outbound endpoints (`/owner`, `/gather`, `/screen`, `/screen-result`, `/dial`, `/status`) and the five inbound ones (`/inbound`, `/inbound-screen`, `/inbound-screen-result`, `/inbound-dial`, `/inbound-status`).
 - The number's **voice URL** must be `${BACKEND_URL}/api/webhooks/twilio-voice/inbound` (HTTP POST) for callbacks to work. `buyNumber` sets it on every number bought from now on; a number bought earlier must be set by hand in the Twilio console (Phone Numbers > Active numbers > the number > Voice Configuration > "A call comes in" = Webhook, that URL, HTTP POST). Signature validation uses the exact URL, so it must match `BACKEND_URL` exactly.
 
@@ -913,7 +919,7 @@ Rules the code enforces:
 
 ## Abuse limits and their known limits
 
-Gates run cheapest first. Stateless gates run at dispatch and again in the job;
+Gates run cheapest first (ids, phone, org calling hours, lead-local hours, team availability, age). Stateless gates run at dispatch and again in the job;
 the limits that count run once, just before the record is created, and are given
 back if the record is not created:
 
@@ -921,7 +927,8 @@ back if the record is not created:
    not a smoke-test lead, not a progressive-capture draft, has a phone.
 2. Skip gates with a `call.skipped` event: `no_caller_number`, `unsafe_id` (list
    or lead id outside `[A-Za-z0-9_.:-]{1,200}`, which the webhooks would
-   reject), `invalid_phone`, `country_not_allowed`, `outside_calling_hours`,
+   reject), `invalid_phone`, `country_not_allowed` (also every Canadian number), `outside_calling_hours`,
+   `outside_lead_hours` (the lead's own local time is outside the lead window, 10:00-18:00, see [Lead-local hours](#lead-local-hours)),
    `no_one_available` (inside the calling hours, but no verified member has an
    open window), `too_old`, then `not_entitled` (the org owner's subscription tier does not
    include the `hot_lead_call` feature; see [Plan entitlement](#plan-entitlement)).
@@ -1005,7 +1012,7 @@ Event types written to the lead timeline (`eventType`, with a scalar `eventData`
 | `call.connected` | the lead pressed 1 at the screening prompt (`/screen-result`), or `/dial` reported `DialBridged=true`; an answered lead leg alone is not a connection | - |
 | `call.lead_no_answer` | `/dial` reported no-answer, busy or failed | `dialStatus` |
 | `call.completed` | last dialed leg metered; the record is `finished` | `outcome` |
-| `call.failed` | `reason`: `place_rejected`, `placement_unknown` (both also carry `attempt`, `memberId`), `lead_phone_invalid`, `lead_phone_changed`, `aborted`, `next_attempt_failed` | `reason` |
+| `call.failed` | `reason`: `place_rejected`, `placement_unknown` (both also carry `attempt`, `memberId`), `lead_phone_invalid`, `lead_outside_hours`, `lead_phone_changed`, `aborted`, `next_attempt_failed` | `reason` |
 | `call.skipped` | a gate or limit refused (no Twilio call made) | `reason` (list above) |
 
 Record `state`: `dialing`, `member_ringing`, `member_answered`, `between_attempts`
@@ -1230,7 +1237,7 @@ delete. A 404 from Twilio counts as already released. Reconcile any such log lin
 | Symptom | Likely cause |
 | --- | --- |
 | Member is called but hears "application error" | The `/owner` fetch failed: `BACKEND_URL` wrong or unreachable (check scheme and host), or credentials could not be loaded (503), or the signature failed (401). Twilio's call log shows the webhook response. |
-| Calls never placed, timeline shows `call.skipped` | The `reason` names the gate. `outside_calling_hours`, `no_one_available`, `duplicate_phone` and `member_cooldown` are expected behavior. |
+| Calls never placed, timeline shows `call.skipped` | The `reason` names the gate. `outside_calling_hours`, `outside_lead_hours`, `no_one_available`, `duplicate_phone` and `member_cooldown` are expected behavior. An `outside_lead_hours` lead is not retried or deferred (the job runs once). |
 | No event and no call | Kill switch off, org disabled or config invalid, lead not `form_fill`, smoke-test lead, draft lead, or no phone: all silent by design. |
 | `call.skipped` `limits_unavailable` | `AW-MCPSessions` missing, IAM denied, or throttled. Fails closed. |
 | `no owner to bill for list` in logs | The list owner could not be resolved; the leg was not metered and `/status` answers 500. |
@@ -1446,3 +1453,27 @@ Twilio's documentation and encoded in tests with synthetic payloads:
   a definitively rejected placement is never retried. A deliberate retry needs a
   new store operation.
 - Voicemail detection and a post-call outcome summary in Emma.
+
+## Lead-local hours
+
+Added in ENG-2783. Besides the org's `callingHours`, a lead is only called when its own local time is inside the lead
+window: `LEAD_CALL_START_MINUTES` (10:00) inclusive to `LEAD_CALL_END_MINUTES` (18:00) exclusive, every day of the week.
+Both constants live in `services/voice/leadLocalHours.ts` (`isInsideLeadCallWindow`) and are the only place the window is
+set. It is used by the `outside_lead_hours` skip gate (dispatch and job pass, stateless) and re-checked in `/gather` just
+before the lead is dialled.
+
+The window is a **business decision, stricter than the law**: the legal outer bound (08:00-21:00 lead-local) is
+deliberately not used.
+
+There is no area-code timezone table. The lead's zone is unknown, so the window must hold in every zone it could be in:
+
+- Area code 808 (Hawaii): `Pacific/Honolulu` only (`America/Honolulu` is not an IANA zone and throws in Intl). Area code 907 (Alaska): `America/Anchorage` only.
+- Every other US number: inside the window in BOTH `America/New_York` and `America/Los_Angeles`. Eastern is the earliest
+  clock and Pacific the latest of the contiguous US, so Central and Mountain are covered by the intersection, and so is any
+  area code whose zone we do not know. With 10:00-18:00 the effective window is **13:00-18:00 Eastern** (10:00-15:00
+  Pacific). Zones use IANA names, so DST is correct.
+- Non-US numbers (Canada, +1 territories) return false. Canada is also refused earlier, see the compliance text above.
+
+Accepted limits: a mobile number can be in a different zone than its area code (the rule is conservative for any
+contiguous-US location, but not for a lead who travelled to Hawaii or Alaska on a non-808/907 number); state laws with
+stricter hours are not modelled (unverified).
