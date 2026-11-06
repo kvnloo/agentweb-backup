@@ -37,6 +37,7 @@ jobs:
       workflows: ${{ steps.filter.outputs.workflows }}
       ebconfig: ${{ steps.filter.outputs.ebconfig }}
       remotion: ${{ steps.filter.outputs.remotion }}
+      slackstart: ${{ steps.filter.outputs.slackstart }}
     steps:
       - name: Refuse a dispatch off the consolidation branch
         if: github.event_name == 'workflow_dispatch' && github.ref_name != 'automation/dev-md-consolidate'
@@ -66,6 +67,11 @@ jobs:
             # remotion-build below). ENG-381 removed local-agent-relay.
             remotion:
               - 'remotion-lambda/**'
+              - '.github/workflows/tests.yml'
+            # ENG-2782: the embeddable widget and the copy of it the backend serves.
+            slackstart:
+              - 'packages/slack-start/**'
+              - 'backend/src/embed/**'
               - '.github/workflows/tests.yml'
             ebconfig:
               - '**/.ebextensions/**'
@@ -173,6 +179,46 @@ jobs:
           bash .github/scripts/dev-md-fragments.test.sh
 
   # ENG-1377 / ENG-1463: build check only, not a product test suite.
+  # ENG-2782: build check for packages/slack-start. Deploy-control integrity, not a
+  # product suite: the bundle the backend serves (backend/src/embed/*.generated.ts)
+  # must equal a fresh build of the package source, and every artifact must stay
+  # within the 40 KB gzip budget. Vitest/Playwright suites run on Atem.
+  slack-start-build:
+    name: Slack-start widget build
+    needs: detect-changes
+    if: needs.detect-changes.outputs.slackstart == 'true' && github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: ${{ github.workflow }}-slack-start-build-${{ github.ref }}-${{ github.event.pull_request.draft }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: packages/slack-start/package-lock.json
+      - name: Install dependencies
+        working-directory: packages/slack-start
+        run: npm ci
+      - name: Typecheck
+        working-directory: packages/slack-start
+        run: npm run typecheck
+      # Before `build`, which rewrites the generated file: compare the COMMITTED copy.
+      - name: Served bundle matches source
+        working-directory: packages/slack-start
+        run: npm run check:embed
+      - name: Build
+        working-directory: packages/slack-start
+        run: npm run build
+      - name: 40 KB gzip budget
+        working-directory: packages/slack-start
+        run: npm run check:size
+
   remotion-build:
     name: Remotion lambda build
     needs: detect-changes
