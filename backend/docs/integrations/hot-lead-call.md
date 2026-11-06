@@ -938,7 +938,7 @@ back if the record is not created:
    open window), `too_old`, then `not_entitled` (the org owner's subscription tier does not
    include the `hot_lead_call` feature; see [Plan entitlement](#plan-entitlement)),
    then `do_not_call` (async, so after the stateless gates and the plan check: the lead's own contact status is
-   `do-not-contact` or `unsubscribed` for ANY reason, or the org's marker holds the number, see
+   exactly `do-not-contact`, or the org's marker holds the number; an email `unsubscribed`, a bounce or the legacy group-email flag does NOT block, see
    [Do-not-call list](#do-not-call-list); a failing limit store records `limits_unavailable` and fails the job).
    Just before a slot is taken the job also loads the Twilio credentials and skips
    with `credentials_unavailable` when it cannot: no slot or record is used, so a
@@ -1464,11 +1464,19 @@ Twilio's documentation and encoded in tests with synthetic payloads:
 - **Missed-call Slack line.** The Slack alert does not say whether the call was
   placed, answered or declined; deliberately deferred so the Slack path stays
   untouched.
-- **"Press 2: call me again later" is not built.** The approved design (one deferred retry about 60 minutes later,
-  inside the lead window, re-running every gate and taking a fresh slot) needs a run-after: the job queue
-  (`asyncJobQueue.ts`) has none (a `pending` row is claimed by the next 30-second poll) and nothing else schedules per-lead
-  work. So the prompt does NOT offer 2 and a 2 is an ordinary decline (`lead_declined`). Options are in the ENG-2783 notes
-  (`dev/pending/eng-2783-lead-prompt.md`); the full prompt wording for when it exists is kept there.
+- **"Press 2: call me again later" is not built.** The approved design is one deferred retry about 60 minutes later,
+  only inside the lead window (otherwise at the next opening), re-running every gate, taking a fresh slot against the caps,
+  calling the team from the start, at most one retry per lead, with the deferral kept as a few fields in the existing
+  `system.hot_lead_call` sidecar (a deferral count and a `retryAfter`) and the stuck sweep taught to leave a waiting
+  record alone. It needs a run-after, and there is none: `asyncJobQueue.ts` claims every `pending` row on the next
+  30-second poll (`enqueueJob` has no delay option) and nothing else schedules per-lead work. So the prompt does NOT offer 2
+  and a 2 is an ordinary decline (`lead_declined`). When it exists the prompt reads: "Press 1 to be connected now, press 2 if
+  you are not available and we will call you again later, or press 3 to stop these calls." Options:
+  1. A "due retries" cron that scans for deferred records the way the stuck sweep does (`findLeadsBySystemRecord` by state and
+     `updatedBefore`; it only sees the newest 500 leads per list, see the first follow-up above).
+  2. A timer table keyed by due time (a new table or index: a data-plane change needing approval).
+  3. A pending queue job whose processor throws "not due yet" until its time: rejected, it writes a failure and an error log
+     on every 30-second poll for up to about 19 hours per lead.
 - **Retry after `place_rejected`.** Every lead gets one call record ever, so
   a definitively rejected placement is never retried. A deliberate retry needs a
   new store operation.
@@ -1481,20 +1489,33 @@ call's outcome is recorded (so an outcome that is seen is backed by the stop):
 
 1. **Org marker** `hlc#dnc#<keyedDigest('hot_lead_call.dnc', orgId, phoneE164)>` in the limit store (`AW-MCPSessions`,
    no raw number, TTL about 10 years). It is written for the number the call was approved for (the record's `leadPhoneMac`
-   must match the lead's current phone; if a repeat submission changed it, nothing is marked and a warning is logged), so
+   must match the lead's current phone; if a repeat submission changed it, nothing is marked and an error is logged), so
    the same person submitting again, as a new lead or on another list of the org, is not called.
 2. **The lead's contact status**: `do-not-contact`, reason `opted-out`, note "Pressed 3 on a hot-lead call", plus the legacy
    `unsubscribedFromGroupEmail` flag, through `crmDb.updateLead` (the same fields the CRM bulk action and the Smartlead
    opt-out use). A lead that is already blocked keeps its existing status and reason.
 
-Both writes are best-effort and independent: a failure of either is logged without any number and does not stop the goodbye or the
-decline; the key press never connects, and the other record still enforces the stop (fail closed). The digit cannot be
+The writes are independent: neither can stop the other or the goodbye, and the key press never connects. The marker claim is
+tried up to three times in-process (50 ms, then 150 ms apart) BEFORE the outcome is recorded. If all three fail, this is NOT
+fail-closed for future leads: the stop then rests on the contact status of THIS lead alone, so a new lead with the same number
+would be called. That case logs at error level the stable text `[hotLeadCall] do-not-call write failed <orgId>` (never a
+number; alert on it and add the marker by hand). The same error is logged when the org context is gone or the lead's phone is
+no longer the one approved (the signed call state holds no org id: the org comes from the list's owner). The digit cannot be
 reversed: a later 1 on the same screening finds the decision marker, writes nothing, and hears the goodbye again.
 
 Enforcement: the `do_not_call` skip gate (dispatch and job, see the gate order above) and a re-check in `/gather` just before
 the lead is dialled (`call.failed` reason `lead_do_not_call`, outcome `lead_do_not_call`, the member hears the unreachable
-apology). Both fail closed when the limit store cannot be read. NOTE: the gate also honours a contact status set by anything
-else (an email unsubscribe, a Smartlead bounce, an admin): such a lead is no longer phoned.
+apology). Both fail closed when the limit store cannot be read. They block only on the org marker or a lead status of exactly
+`do-not-contact` (set by a person, a sales rep, or a press of 3): a person who left a newsletter (`unsubscribed`, a bounce, the
+legacy group-email flag) and then submits a "call me" form IS called. Pressing 3 sets `do-not-contact` (an existing
+`unsubscribed` is upgraded; an existing `do-not-contact` keeps its reason) and, as the CRM's own do-not-contact action does, also
+the legacy `unsubscribedFromGroupEmail` flag, so the person also leaves group email.
+
+**Compliance warning: rotating `JWT_SECRET` silently empties the org do-not-call list.** The marker digest is keyed by
+`JWT_SECRET`, so after a rotation every `hlc#dnc#` entry is unreachable and a person who pressed 3 can be phoned again when
+they submit a new lead. Only the lead-level contact status survives, and only for the SAME lead. The rotation runbook must
+re-key (compute each old digest with the old secret and rewrite it under the new one) or the owner must accept the loss
+explicitly.
 
 **Removing an entry is an operator data write**: delete the item `sessionId = hlc#dnc#<digest>` from `AW-MCPSessions` (the
 digest needs `JWT_SECRET`, so compute it with `keyedDigest('hot_lead_call.dnc', orgId, phoneE164)` from a backend shell) and
