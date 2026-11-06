@@ -7,7 +7,7 @@ import { keyedDigest } from './keyedDigest';
 // 'in_progress': this same lead already holds the phone marker, so another dispatch of it is placing the call.
 type LimitDenial = 'duplicate_phone' | 'in_progress' | 'org_hourly_cap' | 'org_daily_cap';
 
-export const MINUTE_S = 60;
+const MINUTE_S = 60;
 export const HOUR_S = 3600;
 export const DAY_S = 24 * HOUR_S;
 const PHONE_WINDOW_S = DAY_S;
@@ -47,6 +47,8 @@ export const cooldownKey = (orgId: string, memberId: string): string => `hlc#coo
 // Fixed windows (not sliding): up to twice the cap can dial across an hour or day boundary, which is
 // bounded and keeps each check a single write. Hours are UTC clock hours; days are the org's local calendar day.
 export const hourlyCapKey = (orgId: string, at: Date): string => `hlc#cap#h#${orgId}#${at.toISOString().slice(0, 13)}`;
+/** The zone the org's daily windows follow: its calling-hours zone, UTC when none is set. */
+export const limitTimeZone = (config: Pick<HotLeadCallConfig, 'callingHours'>): string => config.callingHours?.timezone ?? 'UTC';
 export const dailyCapKey = (orgId: string, timeZone: string, at: Date): string => `hlc#cap#d#${orgId}#${localDayAndMinutes(timeZone, at).date}`;
 
 // ---- reservation -----------------------------------------------------------------------------------------
@@ -119,7 +121,7 @@ export async function reserveCallSlot(input: {
     }
     const counters: Array<[LimitDenial, () => Promise<boolean>]> = [
       ['org_hourly_cap', () => count(hourlyCapKey(orgId, now), config.maxCallsPerHour, 2 * HOUR_S)],
-      ['org_daily_cap', () => count(dailyCapKey(orgId, config.callingHours?.timezone ?? 'UTC', now), config.maxCallsPerDay, 2 * DAY_S)],
+      ['org_daily_cap', () => count(dailyCapKey(orgId, limitTimeZone(config), now), config.maxCallsPerDay, 2 * DAY_S)],
     ];
     for (const [reason, take] of counters) {
       if (!await take()) {

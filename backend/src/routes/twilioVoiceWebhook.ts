@@ -605,8 +605,14 @@ function guardedInboundEntry(handler: (res: Response, body: FormParams) => Promi
   };
 }
 
-/** Rings the next member, or tells the caller nobody can take the call. `tried` are the members already rung. */
-async function ringNextOrApologise(res: Response, ctx: InboundContext, tried: readonly string[], admit?: () => Promise<boolean>): Promise<void> {
+/**
+ * Rings the next member, or tells the caller nobody can take the call. `tried` are the members already rung.
+ * `admit` (the entry point only) runs once a member would really be rung; when it returns false it has already
+ * answered the caller, and nobody is rung.
+ */
+async function ringNextOrApologise(
+  res: Response, ctx: InboundContext, tried: readonly string[], admit?: () => Promise<boolean>,
+): Promise<void> {
   const member = nextInboundMember(ctx.config, tried, new Date());
   if (!member || !ctx.config.twilioNumber) return sendXml(res, inboundNobodyTwiml());
   // `admit` runs only once a member would really be rung, so a call nobody can take never costs a slot.
