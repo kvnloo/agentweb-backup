@@ -2178,6 +2178,17 @@ describe('lead presses 2: not available now (one retry, ENG-2783)', () => {
       expect(await prompt()).not.toContain('press 2');
     });
 
+    it('a failing eligibility read still serves the prompt, without option 2, and logs one warning without the error text', async () => {
+      mock(crmDb.getLeadById).mockRejectedValue(new Error('read failed for +14155550123'));
+      const res = await screen();
+      expect(res.status).toBe(200);
+      expect(res.text).toContain('Press 1 to be connected now, or press 3 to stop these calls.');
+      expect(res.text).not.toContain('press 2');
+      expect(res.text).toContain('<Gather');
+      const warns = logSpy[1].mock.calls.map((c) => c.join(' ')).filter((l) => l.includes('retry eligibility unavailable'));
+      expect(warns).toEqual(['[hotLeadCall] retry eligibility unavailable, option 2 not offered: Error']);
+    });
+
     it('with retries switched off: only 1 and 3', async () => {
       process.env.HOT_LEAD_CALL_RETRY = '0';
       try {
