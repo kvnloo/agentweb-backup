@@ -1,5 +1,6 @@
 import { parsePhoneNumberWithError } from 'libphonenumber-js';
-import { localDayAndMinutes } from './hotLeadCallLimits';
+import type { HotLeadCallConfig } from '../hotLeadCallConfig';
+import { isWithinCallWindow, localDayAndMinutes } from './hotLeadCallLimits';
 
 // Lead-local calling hours without an area-code timezone table. Calls are allowed only when the lead's local
 // time is START inclusive to END exclusive (local minutes >= LEAD_CALL_START_MINUTES and < LEAD_CALL_END_MINUTES),
@@ -39,4 +40,36 @@ export function isInsideLeadCallWindow(e164: string, at: Date): boolean {
   const area = match[1];
   const home = area === '808' ? HAWAII : area === '907' ? ALASKA : null;
   return [...CONTIGUOUS_BOUNDS, ...(home ? [home] : [])].every(zone => insideWindow(zone, at));
+}
+
+// A representative number for settings read-outs: an ordinary US number (no 808/907 narrowing), so the answer is
+// the window most leads get. Real leads are checked with their own number at dial time.
+const REPRESENTATIVE_US_NUMBER = '+12125550123';
+const SAMPLE_STEP_MS = 15 * 60 * 1000;
+const WEEK_SAMPLES = 7 * 24 * 4;
+
+/** True when the lead window is open at `at` for an ordinary US number (the read-out's `outsideLeadHours` is the negation). */
+export const isLeadWindowOpenNow = (at: Date): boolean => isInsideLeadCallWindow(REPRESENTATIVE_US_NUMBER, at);
+
+const overlapMemo = new Map<string, boolean>();
+
+/**
+ * Whether the org's calling hours ever coincide with the lead window for an ordinary US number: samples every 15
+ * minutes across a full week from `from`, in the org's own zone, so a day-of-week or DST shift cannot hide an overlap.
+ * False means no lead could ever be called under these hours. Memoised per (hours, start day) because it is evaluated
+ * on every settings read and each sample formats several clocks.
+ */
+export function callingHoursReachLeadWindow(callingHours: HotLeadCallConfig['callingHours'], from: Date = new Date()): boolean {
+  if (!callingHours) return false;
+  const memoKey = `${callingHours.timezone}|${callingHours.start}|${callingHours.end}|${from.toISOString().slice(0, 10)}`;
+  const known = overlapMemo.get(memoKey);
+  if (known !== undefined) return known;
+  let overlaps = false;
+  for (let i = 0; i < WEEK_SAMPLES && !overlaps; i++) {
+    const t = new Date(from.getTime() + i * SAMPLE_STEP_MS);
+    overlaps = isWithinCallWindow(callingHours, t) && isLeadWindowOpenNow(t);
+  }
+  if (overlapMemo.size >= 200) overlapMemo.clear();
+  overlapMemo.set(memoKey, overlaps);
+  return overlaps;
 }

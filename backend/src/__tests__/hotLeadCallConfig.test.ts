@@ -24,7 +24,7 @@ describe('hotLeadCallConfigOf', () => {
   it('fills defaults for a minimal disabled config', () => {
     expect(hotLeadCallConfigOf(base())).toEqual({
       enabled: false, team: [member()], announcedName: 'Acme Plumbing', leadTypes: ['form_fill'],
-      maxAgeMinutes: 10, maxCallsPerHour: 6, maxCallsPerDay: 20, memberCooldownMinutes: 2, maxAttemptsPerLead: 3,
+      maxAgeMinutes: 10, maxCallsPerHour: 6, maxCallsPerDay: 20, maxCallsPerMonth: 200, memberCooldownMinutes: 2, maxAttemptsPerLead: 3,
       allowedCountries: ['US', 'CA'],
     });
   });
@@ -249,6 +249,13 @@ describe('hotLeadCallConfigOf', () => {
     it.each([min - 1, max + 1, 1.5, '5', null, NaN])('rejects %j', value => {
       expect(hotLeadCallConfigOf(base({ [field]: value }))).toBeNull();
     });
+  });
+  it('bounds maxCallsPerMonth to 1..2000 with a default of 200, and a config without it reads as 200', () => {
+    expect(HOT_LEAD_CALL_LIMITS.maxCallsPerMonth).toEqual({ default: 200, min: 1, max: 2000 });
+    expect(hotLeadCallConfigOf(base())?.maxCallsPerMonth).toBe(200);
+    expect(hotLeadCallConfigOf(base({ maxCallsPerMonth: 2000 }))?.maxCallsPerMonth).toBe(2000);
+    expect(hotLeadCallConfigOf(base({ maxCallsPerMonth: 1500 }))?.maxCallsPerMonth).toBe(1500);
+    for (const bad of [0, 2001, 1.5, '200', null, NaN]) expect(hotLeadCallConfigOf(base({ maxCallsPerMonth: bad }))).toBeNull();
   });
   it('bounds maxAttemptsPerLead to 1..5 with a default of 3', () => {
     expect(HOT_LEAD_CALL_LIMITS.maxAttemptsPerLead).toEqual({ default: 3, min: 1, max: 5 });
