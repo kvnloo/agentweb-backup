@@ -35,6 +35,7 @@ import { setLimitStoreForTests } from '../services/voice/limitStore';
 import { setHotLeadCallEntitledOverride } from '../services/voice/hotLeadCallEntitlement';
 import { FakeLeadCallStore } from './helpers/fakeLeadCallStore';
 import { leadPhoneMacOf } from '../services/voice/leadPhoneMac';
+import { dncKey, isNumberDoNotCall, markNumberDoNotCall } from '../services/voice/hotLeadCallDnc';
 import { teamMember, callRecord, MEMBER_ID } from './helpers/hotLeadCallFixtures';
 
 const mock = (fn: unknown) => fn as jest.Mock;
@@ -717,6 +718,61 @@ describe('abuse limits (reservation)', () => {
   });
 });
 
+describe('do-not-call (a lead pressed 3, ENG-2783)', () => {
+  const nowS = () => Math.floor(Date.now() / 1000);
+  const listed = () => markNumberDoNotCall('org-a', '+12125550142');
+
+  it('skips with do_not_call, before any slot or record, when the org marker holds the number (another lead, same number)', async () => {
+    await listed();
+    lead.leadId = 'lead-new';
+    await dispatchHotLeadCall('list-a', 'lead-new', 'form_fill');
+    expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'do_not_call' } }]);
+    expect(enqueueCalls()).toHaveLength(0);
+    expect(provider.placedCalls).toHaveLength(0);
+    expect(store.record).toBeNull();
+    expect([...limits.counters.keys()]).toEqual([]);
+  });
+
+  it('keys the marker by org and a keyed digest of the number: another org is not affected, and the key holds no number', async () => {
+    await listed();
+    const [key] = [...limits.claims.keys()];
+    expect(key).toMatch(/^hlc#dnc#[0-9a-f]{64}$/);
+    expect(key).not.toContain('2125550142');
+    expect(limits.claims.get(key)!.expiresAtS - nowS()).toBeGreaterThan(9 * 365 * 86400);
+    expect(key).not.toBe(dncKey('org-b', '+12125550142'));
+    expect(await isNumberDoNotCall('org-b', '+12125550142')).toBe(false);
+  });
+
+  it.each([['do-not-contact'], ['unsubscribed']])('skips with do_not_call when the lead itself is %s', async (status) => {
+    lead.contactStatus = status;
+    await dispatchHotLeadCall('list-a', 'lead-a', 'form_fill');
+    expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'do_not_call' } }]);
+    expect(provider.placedCalls).toHaveLength(0);
+  });
+
+  it('re-checks in the job, so a stop that landed after dispatch is honoured', async () => {
+    await listed();
+    await processHotLeadCallJob(jobOf());
+    expect(provider.placedCalls).toHaveLength(0);
+    expect(store.record).toBeNull();
+    expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'do_not_call' } }]);
+  });
+
+  it('is checked after the stateless gates and the plan: a lead outside the lead window does not read the store', async () => {
+    jest.setSystemTime(new Date('2026-10-19T23:30:00.000Z'));
+    await listed();
+    limits.keysTouched.length = 0;
+    await processHotLeadCallJob(jobOf());
+    expect(limits.keysTouched).toEqual([]);
+  });
+
+  it('a lapsed marker no longer blocks (the store tests the expiry itself)', async () => {
+    await listed();
+    jest.setSystemTime(new Date(Date.now() + 11 * 365 * 86400 * 1000));
+    expect(await isNumberDoNotCall('org-a', '+12125550142')).toBe(false);
+  });
+});
+
 describe('plan entitlement', () => {
   it('skips with not_entitled, before any limit or record, when the org’s plan no longer includes calls', async () => {
     setHotLeadCallEntitledOverride(false);
@@ -856,7 +912,8 @@ describe('credentials that cannot be loaded', () => {
     await processHotLeadCallJob(jobOf());
     expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'credentials_unavailable' } }]);
     expect(store.record).toBeNull();
-    expect(limits.keysTouched).toEqual([]);
+    // Only the read-only do-not-call check touched the store: no slot, no counter.
+    expect(limits.keysTouched.filter((k) => !k.startsWith('hlc#dnc#'))).toEqual([]);
     expect(provider.placedCalls).toHaveLength(0);
     // The next submission of the same lead is dialed normally.
     await processHotLeadCallJob(jobOf({ submissionId: 'sub-2', submittedAt: NOW }));
