@@ -6703,6 +6703,9 @@ export const crmDb = {
      *  such a caller it can only add a false "already exists" or a missed one — never safety.
      *  Default (omitted) behaviour is unchanged. */
     skipEmailDuplicateCheck?: boolean;
+    /** ENG-2837: do not dispatch the new-lead notification at the write. For a caller that must
+     *  make its own idempotency record durable first and then dispatches it itself. */
+    deferCreatedNotification?: boolean;
     /** ENG-2321: opt in to the exactly-once email-keyed create (utils/emailLeadId.ts): a time-bucketed
      *  deterministic leadId written in a transaction that also condition-checks the adjacent buckets,
      *  so concurrent same-email submissions resolve to ONE row. A loser throws the same typed
@@ -6912,9 +6915,11 @@ export const crmDb = {
         await dynamodb.put(params).promise();
       }
       // Covers landing-page form capture and every single CRM insert. Never await Slack.
-      void import('./orgLeadNotificationService')
-        .then(({ dispatchLeadCreated }) => dispatchLeadCreated(listId, leadId, origin))
-        .catch(() => console.warn('[leadNotifications] hook failed', { listId, leadId }));
+      if (!leadData.deferCreatedNotification) {
+        void import('./orgLeadNotificationService')
+          .then(({ dispatchLeadCreated }) => dispatchLeadCreated(listId, leadId, origin))
+          .catch(() => console.warn('[leadNotifications] hook failed', { listId, leadId }));
+      }
 
       // Extract field names from lead data
       const fieldNames: string[] = [];

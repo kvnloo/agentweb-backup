@@ -16,11 +16,15 @@
  *   in_progress  { ownerToken, claimedAtMs }   — someone is processing it right now
  *   completed    { leadId, responseStatus, responseBody, completedAt } — replay this
  *
- * The claim is a conditional put (attribute_not_exists, or an in_progress claim older than
- * CLAIM_STALE_MS), so two concurrent requests cannot both win. A completed record has no
- * `claimedAtMs`, and a comparison against a missing attribute is false, so a completed key can
- * never be reclaimed. A failed attempt deletes its own claim (owner-token conditioned) so the
- * retry is processed; if even that delete fails, the staleness window frees it.
+ * The claim is a conditional put on attribute_not_exists, so two concurrent requests cannot
+ * both win. There is deliberately NO stale-claim takeover: without fencing, a paused-but-alive
+ * owner could still write the lead and fire side effects after another request took its key
+ * over, which is exactly the duplicate this exists to prevent. An in_progress claim is
+ * therefore released only by its owner, and only when the owner failed before any lead write
+ * was attempted. A claim whose owner crashed, or whose completion record could not be written
+ * after the lead was saved, stays in_progress: every retry of that key gets a retryable 409
+ * and nothing is written twice. Recovery is operational (delete the claim item after checking
+ * the lead) — a deliberate safety-over-liveness trade.
  */
 
 import AWS from 'aws-sdk';
@@ -30,13 +34,6 @@ import { createHash, randomUUID } from 'crypto';
 const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
 const CONFIGS_TABLE = `${TABLE_PREFIX}AW-Configs`;
 const CLAIM_PARTITION = '__system__:leadSubmissionClaims';
-
-/**
- * An in_progress claim older than this is presumed abandoned (the owner crashed between claim
- * and completion) and may be taken over. A capture normally completes in well under a second;
- * two minutes is long enough that a slow-but-alive owner is never reclaimed out from under itself.
- */
-export const CLAIM_STALE_MS = 2 * 60 * 1000;
 
 /** Bound on what we accept as a key: UUIDs and similar opaque tokens, never free text. */
 const KEY_PATTERN = /^[A-Za-z0-9._:-]{1,200}$/;
@@ -115,7 +112,8 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /**
  * Claim (listId, key). A loser that finds the key completed gets the stored response; one that
  * finds it in flight waits a bounded time for it to complete (a double-click resolves to the
- * original's response) and otherwise reports in_progress. Throws only on a DynamoDB error.
+ * original's response) and otherwise reports in_progress. Throws on any store error: the caller
+ * must fail closed (no lead, no side effect), because it cannot know whether the key is taken.
  */
 export async function claimLeadSubmission(listId: string, key: string): Promise<ClaimResult> {
   const ownerToken = randomUUID();
@@ -128,8 +126,7 @@ export async function claimLeadSubmission(listId: string, key: string): Promise<
           userId: CLAIM_PARTITION, configId, status: 'in_progress',
           ownerToken, claimedAtMs: Date.now(), listId,
         },
-        ConditionExpression: 'attribute_not_exists(configId) OR claimedAtMs < :staleBefore',
-        ExpressionAttributeValues: { ':staleBefore': Date.now() - CLAIM_STALE_MS },
+        ConditionExpression: 'attribute_not_exists(configId)',
       })
       .promise();
     return { outcome: 'claimed', ownerToken };
@@ -146,10 +143,10 @@ export async function claimLeadSubmission(listId: string, key: string): Promise<
 }
 
 /**
- * Record the response for a claim this caller owns. Replaces the in_progress item with the
- * completed one (dropping claimedAtMs, so it can never be reclaimed). Returns false when the
- * claim is no longer ours (reclaimed as stale) — the work is done either way; only the replay
- * record was not written by us.
+ * Record the response for a claim this caller owns, replacing the in_progress item. Returns
+ * false when the item is not our in_progress claim (it should always be — nothing else
+ * removes or replaces it); throws on a store error. Either non-true outcome means the replay
+ * record is NOT durable, so the caller must not fire side effects or report success.
  */
 export async function completeLeadSubmission(
   listId: string,
@@ -166,8 +163,9 @@ export async function completeLeadSubmission(
           leadId: record.leadId, responseStatus: record.responseStatus, responseBody: record.responseBody,
           completedAt: new Date().toISOString(),
         },
-        ConditionExpression: 'ownerToken = :ownerToken',
-        ExpressionAttributeValues: { ':ownerToken': ownerToken },
+        ConditionExpression: 'ownerToken = :ownerToken AND #status = :inProgress',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: { ':ownerToken': ownerToken, ':inProgress': 'in_progress' },
       })
       .promise();
     return true;
@@ -177,7 +175,10 @@ export async function completeLeadSubmission(
   }
 }
 
-/** Give back a claim whose work failed before any lead was written, so the retry is processed. */
+/**
+ * Give back a claim whose work failed before any lead write was ATTEMPTED, so the retry is
+ * processed. Never call this once a write may have happened: a retry would then repeat it.
+ */
 export async function releaseLeadSubmission(listId: string, key: string, ownerToken: string): Promise<void> {
   try {
     await client()
