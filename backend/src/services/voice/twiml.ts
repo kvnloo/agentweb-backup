@@ -18,7 +18,24 @@ export const CONNECTING_COPY = 'Calling the lead now, please hold.';
 export const LEAD_PHONE_CHANGED_COPY = 'We could not reach the lead. Their details are in your lead alert.';
 export const LEAD_DECLINED_COPY = 'The lead did not confirm. Their details are in your lead alert.';
 export const SCREEN_NO_INPUT_COPY = 'We did not get your answer. Goodbye.';
-const screenPromptCopy = (announcedName: string): string => `${announcedName} would like to talk to you about your enquiry. Press 1 to be connected now.`;
+export const LEAD_OPTED_OUT_MEMBER_COPY = 'The lead asked not to be called again. Their details are in your lead alert.';
+const leadOptedOutCopy = (announcedName: string): string => `Understood. ${announcedName} will not call this number again. Goodbye.`;
+
+/**
+ * A US number as it is read aloud: national 3-3-4 groups, each digit on its own (spaced, so text-to-speech does not
+ * say "four hundred"), the groups apart by commas for a pause. Anything that is not +1 and ten digits is read digit by digit.
+ */
+export function spokenPhoneNumber(e164: string): string {
+  const digits = e164.replace(/\D/g, '');
+  const us = /^1(\d{3})(\d{3})(\d{4})$/.exec(digits);
+  const groups = us ? [us[1], us[2], us[3]] : [digits];
+  return groups.map((g) => g.split('').join(' ')).join(', ');
+}
+
+// The lead can always call the org's own number back: it rings the team through the inbound callback path (inboundCallback.ts).
+// Pressing 2 ("call me again later") is deliberately NOT offered: nothing can schedule that second call (ENG-2783 notes).
+const screenPromptCopy = (announcedName: string, callbackNumber: string): string =>
+  `This is an automated call from ${announcedName} about the enquiry you sent us. To reach a person at ${announcedName}, call ${spokenPhoneNumber(callbackNumber)}. Press 1 to be connected now, or press 3 to stop these calls.`;
 export const NO_INPUT_COPY = 'We did not get a response. Goodbye.';
 export const LEAD_UNREACHABLE_COPY = 'Sorry, we could not reach them. Goodbye.';
 const memberPromptCopy = (announcedName: string): string => `New lead from ${announcedName}. Are you available to take the call now? Press 1.`;
@@ -100,10 +117,23 @@ export function leadDeclinedTwiml(): string {
   return response(say(LEAD_DECLINED_COPY), '<Hangup/>');
 }
 
-/** What the lead hears on answering: press 1 or nothing is connected. No input falls through to the goodbye and hangup. */
-export function leadScreenTwiml(p: { announcedName: string; resultUrl: string }): string {
+/** The member's side of a lead who pressed 3 at the screening prompt. */
+export function leadOptedOutMemberTwiml(): string {
+  return response(say(LEAD_OPTED_OUT_MEMBER_COPY), '<Hangup/>');
+}
+
+/** Said to the lead who pressed 3, on their own leg, before it hangs up. */
+export function leadOptedOutTwiml(announcedName: string): string {
+  return response(say(leadOptedOutCopy(announcedName)), '<Hangup/>');
+}
+
+/**
+ * What the lead hears on answering: press 1 or nothing is connected, press 3 to be struck off. `callbackNumber` is the
+ * org's own number (E.164). No input falls through to the goodbye and hangup.
+ */
+export function leadScreenTwiml(p: { announcedName: string; callbackNumber: string; resultUrl: string }): string {
   return response(
-    pressOneGather(screenPromptCopy(p.announcedName), p.resultUrl),
+    pressOneGather(screenPromptCopy(p.announcedName, requireE164(p.callbackNumber, 'callback number')), p.resultUrl),
     say(SCREEN_NO_INPUT_COPY),
     '<Hangup/>',
   );

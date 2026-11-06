@@ -61,7 +61,7 @@ import {
 } from '../services/voice/callFinalisation';
 import {
   bridgeTwiml, connectTwiml, hangupTwiml, inboundMemberScreenTwiml, inboundNobodyTwiml, inboundRingTwiml, inboundUnavailableTwiml,
-  leadDeclinedTwiml, leadPhoneChangedTwiml, leadScreenTwiml, leadUnreachableTwiml, memberPromptTwiml,
+  leadDeclinedTwiml, leadOptedOutMemberTwiml, leadOptedOutTwiml, leadPhoneChangedTwiml, leadScreenTwiml, leadUnreachableTwiml, memberPromptTwiml,
 } from '../services/voice/twiml';
 import { recordCallUsage } from '../services/voice/voiceUsage';
 import {
@@ -72,6 +72,8 @@ import { leadPhoneMacOf } from '../services/voice/leadPhoneMac';
 import { holdsClaim } from '../services/hotLeadCallPlacement';
 import { callableLeadPhone } from '../services/hotLeadCallConfig';
 import { isInsideLeadCallWindow } from '../services/voice/leadLocalHours';
+import { isLeadDoNotCall, markNumberDoNotCall } from '../services/voice/hotLeadCallDnc';
+import { isDoNotContact } from '../utils/leadContactStatus';
 
 // type: () => true so a JSON or other content type is limited and parsed here too, instead of falling
 // through to the global 50mb express.json (the same trick as the unipile and tracker parsers).
@@ -312,11 +314,11 @@ router.post('/owner', guarded(async (_req, res, q, body) => {
 
 // ── /gather: the member pressed a key ────────────────────────────────────────
 
-/** The lead's number from the lead row, re-validated now. Never from the URL or the request body. */
-async function leadPhoneFor(q: CallQuery, ctx: HotLeadCallContext): Promise<string | null> {
+/** The lead row and its number, re-validated now. Never from the URL or the request body. */
+async function leadPhoneFor(q: CallQuery, ctx: HotLeadCallContext): Promise<{ phone: string; lead: unknown } | null> {
   const lead = await crmDb.getLeadById(q.listId, q.leadId, { consistentRead: true });
   const callable = callableLeadPhone(lead?.phone, ctx.config);
-  return 'phone' in callable ? callable.phone : null;
+  return 'phone' in callable ? { phone: callable.phone, lead } : null;
 }
 
 router.post('/gather', guarded(async (_req, res, q, body) => {
@@ -337,9 +339,17 @@ router.post('/gather', guarded(async (_req, res, q, body) => {
     return sendHangup(res);
   }
 
-  const leadE164 = await leadPhoneFor(q, ctx);
-  if (!leadE164 || !ctx.config.twilioNumber) {
+  const leadNow = await leadPhoneFor(q, ctx);
+  const leadE164 = leadNow?.phone;
+  if (!leadNow || !leadE164 || !ctx.config.twilioNumber) {
     await decide(q, ['member_answered'], answered('lead_phone_invalid'), 'call.failed', { reason: 'lead_phone_invalid' });
+    return sendXml(res, leadUnreachableTwiml());
+  }
+
+  // The lead (or the same number on another lead of the org) may have pressed 3 since the gates ran. A store failure
+  // throws: the lead is not dialled.
+  if (await isLeadDoNotCall({ orgId: ctx.orgId, lead: leadNow.lead, phoneE164: leadE164 })) {
+    await decide(q, ['member_answered'], answered('lead_do_not_call'), 'call.failed', { reason: 'lead_do_not_call' });
     return sendXml(res, leadUnreachableTwiml());
   }
 
@@ -406,15 +416,60 @@ router.post('/screen', guarded(async (_req, res, q, body) => {
   if (current.leadCallSid !== sid || current.state !== 'bridging') return sendHangup(res);
 
   const ctx = await liveContext(q, current);
-  if (!ctx) {
+  if (!ctx || !ctx.config.twilioNumber) {
     // Shares the dial marker, so /dial's own outcome cannot relabel an abort as a decline.
     await decide(q, ['bridging'], {
       state: 'bridging', outcome: 'aborted', lastSequence: { [decisionKey(record.memberCallSid, 'dial')]: 1 },
     }, 'call.failed', { reason: 'aborted' });
     return sendHangup(res);
   }
-  sendXml(res, leadScreenTwiml({ announcedName: ctx.config.announcedName, resultUrl: buildVoiceWebhookUrl('screen-result', q) }));
+  sendXml(res, leadScreenTwiml({ announcedName: ctx.config.announcedName, callbackNumber: ctx.config.twilioNumber, resultUrl: buildVoiceWebhookUrl('screen-result', q) }));
 }, twimlReplies));
+
+/**
+ * The lead pressed 3: stop calling this person. Two records, each best-effort on its own and neither able to stop the
+ * other or the goodbye: the org's do-not-call marker for the number (what a new lead with the same number is checked
+ * against) and the lead's own do-not-contact status. A failure is logged without any number; the call is not connected
+ * either way (this digit never connects), and a half-written stop is still enforced by the other record.
+ */
+async function recordLeadOptOut(q: CallQuery, record: HotLeadCallRecord, ctx: HotLeadCallContext | null): Promise<void> {
+  let lead: Awaited<ReturnType<typeof crmDb.getLeadById>> | null = null;
+  try {
+    lead = await crmDb.getLeadById(q.listId, q.leadId, { consistentRead: true });
+  } catch (err) {
+    console.warn('[hotLeadCall] opt-out: lead not read', errorName(err));
+  }
+  try {
+    const callable = ctx && lead ? callableLeadPhone(lead.phone, ctx.config) : null;
+    // The marker names the number that was approved for this call, not whatever a later submission put on the lead.
+    if (!ctx || !callable || !('phone' in callable) || record.leadPhoneMac !== leadPhoneMacOf(ctx.orgId, callable.phone)) {
+      console.warn('[hotLeadCall] opt-out: do-not-call marker not written, the approved number is unknown');
+    } else {
+      await markNumberDoNotCall(ctx.orgId, callable.phone);
+    }
+  } catch (err) {
+    console.warn('[hotLeadCall] opt-out: do-not-call marker not written', errorName(err));
+  }
+  try {
+    // An admin's or an earlier unsubscribe's status (and its reason) is kept as it is.
+    if (lead && !isDoNotContact(lead)) {
+      const now = new Date().toISOString();
+      await crmDb.updateLead(q.listId, q.leadId, {
+        contactStatus: 'do-not-contact',
+        contactStatusReason: 'opted-out',
+        contactStatusNote: 'Pressed 3 on a hot-lead call',
+        contactStatusUpdatedAt: now,
+        contactStatusUpdatedBy: 'system',
+        unsubscribedFromGroupEmail: true,
+        unsubscribedFromGroupEmailAt: now,
+      });
+    }
+  } catch (err) {
+    console.warn('[hotLeadCall] opt-out: contact status not written', errorName(err));
+  }
+}
+
+const LEAD_REFUSALS = new Set(['lead_declined', 'lead_opted_out']);
 
 router.post('/screen-result', guarded(async (_req, res, q, body) => {
   const record = await loadRecord(q);
@@ -424,10 +479,18 @@ router.post('/screen-result', guarded(async (_req, res, q, body) => {
   const store = getLeadCallStore();
   const marker = decisionKey(sid, 'screen');
   const pressed = body.Digits === '1';
-  // One decision per screening, whatever the key: a replay or a later different digit cannot reverse it.
+  // One decision per screening, whatever the key: a replay or a later different digit (a 1 after a 3) cannot reverse it.
   if (record.state === 'bridging') {
     if (pressed) {
       await decide(q, ['bridging'], { state: 'connected', lastSequence: { [marker]: 1 } }, 'call.connected');
+    } else if (body.Digits === '3') {
+      // The stop is written BEFORE the decision, so a decision that is seen is always backed by it. A replay finds the marker.
+      if (record.lastSequence?.[marker] === undefined) await recordLeadOptOut(q, record, await resolveHotLeadCallContext(q.listId));
+      await decide(q, ['bridging'], {
+        state: 'bridging',
+        outcome: 'lead_opted_out',
+        lastSequence: { [marker]: 1, [decisionKey(record.memberCallSid, 'dial')]: 1 },
+      }, 'call.lead_declined', { reason: 'opted_out' });
     } else {
       await decide(q, ['bridging'], {
         state: 'bridging',
@@ -438,7 +501,12 @@ router.post('/screen-result', guarded(async (_req, res, q, body) => {
     }
   }
   const decided = await store.get(q.listId, q.leadId);
-  const accepted = decided?.lastSequence?.[marker] !== undefined && decided.outcome !== 'lead_declined';
+  const accepted = decided?.lastSequence?.[marker] !== undefined && !LEAD_REFUSALS.has(decided.outcome ?? '');
+  if (decided?.outcome === 'lead_opted_out') {
+    // The goodbye names the business: without a live config there is nothing to name, so the leg just ends.
+    const ctx = await resolveHotLeadCallContext(q.listId);
+    return sendXml(res, ctx ? leadOptedOutTwiml(ctx.config.announcedName) : hangupTwiml());
+  }
   // An empty response ends the screening leg normally, so Twilio bridges the calls.
   sendXml(res, accepted ? bridgeTwiml() : hangupTwiml());
 }, twimlReplies));
@@ -470,7 +538,9 @@ router.post('/dial', guarded(async (_req, res, q, body) => {
       leadCallSid,
       lastSequence: { [decisionKey(memberSid, 'dial')]: 1 },
     }, 'call.lead_declined');
-    return sendXml(res, leadDeclinedTwiml());
+    // The lead pressed 3 (/screen-result wrote that, and the marker above makes this write a no-op): say so to the member.
+    const decided = await getLeadCallStore().get(q.listId, q.leadId);
+    return sendXml(res, decided?.outcome === 'lead_opted_out' ? leadOptedOutMemberTwiml() : leadDeclinedTwiml());
   }
   if (status === 'canceled') {
     // The dial was cancelled while the lead was still ringing, which is the member hanging up: nobody was told the

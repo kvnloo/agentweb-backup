@@ -16,10 +16,13 @@ import {
   inboundRingTwiml,
   inboundUnavailableTwiml,
   leadDeclinedTwiml,
+  leadOptedOutMemberTwiml,
+  leadOptedOutTwiml,
   leadPhoneChangedTwiml,
   leadScreenTwiml,
   leadUnreachableTwiml,
   memberPromptTwiml,
+  spokenPhoneNumber,
   verificationCodeTwiml,
 } from '../twiml';
 
@@ -142,19 +145,42 @@ describe('twiml builders', () => {
     expect(hangupTwiml()).toBe('<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>');
   });
 
-  it('builds the lead screening prompt: a one-digit Gather with the escaped name, then a goodbye and hangup', () => {
-    const xml = leadScreenTwiml({ announcedName: 'Smith & Sons', resultUrl: URLS.resultUrl });
+  const promptFor = (name: string, number = '+14155550111'): string =>
+    `This is an automated call from ${name} about the enquiry you sent us. To reach a person at ${name}, call ${number}. Press 1 to be connected now, or press 3 to stop these calls.`;
+
+  it('builds the lead screening prompt: a one-digit Gather with the escaped name and the spoken callback number, then a goodbye and hangup', () => {
+    const xml = leadScreenTwiml({ announcedName: 'Smith & Sons', callbackNumber: '+14155550111', resultUrl: URLS.resultUrl });
     const root = parseXml(xml);
     expect(root.children.map((c) => c.name)).toEqual(['Gather', 'Say', 'Hangup']);
     expect(root.children[0].attrs).toEqual({ input: 'dtmf', numDigits: '1', timeout: '8', action: URLS.resultUrl, method: 'POST' });
-    expect(root.children[0].children[0].text).toBe('Smith & Sons would like to talk to you about your enquiry. Press 1 to be connected now.');
-    expect(xml).toContain('Smith &amp; Sons would like');
+    expect(root.children[0].children[0].text).toBe(promptFor('Smith & Sons', '4 1 5, 5 5 5, 0 1 1 1'));
+    expect(xml).toContain('automated call from Smith &amp; Sons about');
+    expect(xml).not.toContain('+14155550111');
     expect(root.children[1].text).toBe(SCREEN_NO_INPUT_COPY);
   });
 
   it('keeps the screening prompt well-formed for quotes, angle brackets and entity look-alikes in the name', () => {
-    const xml = leadScreenTwiml({ announcedName: NASTY, resultUrl: URLS.resultUrl });
-    expect(parseXml(xml).children[0].children[0].text).toBe(`${NASTY} would like to talk to you about your enquiry. Press 1 to be connected now.`);
+    const xml = leadScreenTwiml({ announcedName: NASTY, callbackNumber: '+14155550111', resultUrl: URLS.resultUrl });
+    expect(parseXml(xml).children[0].children[0].text).toBe(promptFor(NASTY, '4 1 5, 5 5 5, 0 1 1 1'));
+  });
+
+  it('refuses a callback number that is not E.164 rather than speaking it', () => {
+    expect(() => leadScreenTwiml({ announcedName: 'X', callbackNumber: '4155550111', resultUrl: URLS.resultUrl })).toThrow('not E.164');
+  });
+
+  it('speaks a US number in 3-3-4 groups, digit by digit, and any other number digit by digit', () => {
+    expect(spokenPhoneNumber('+12125550198')).toBe('2 1 2, 5 5 5, 0 1 9 8');
+    expect(spokenPhoneNumber('+442071838750')).toBe('4 4 2 0 7 1 8 3 8 7 5 0');
+  });
+
+  it('builds the stop messages: the lead hears the goodbye naming the business, the member is told in the fixed copy', () => {
+    const lead = parseXml(leadOptedOutTwiml('Smith & Sons'));
+    expect(lead.children.map((c) => c.name)).toEqual(['Say', 'Hangup']);
+    expect(lead.children[0].text).toBe('Understood. Smith & Sons will not call this number again. Goodbye.');
+    const member = parseXml(leadOptedOutMemberTwiml());
+    expect(member.children.map((c) => c.name)).toEqual(['Say', 'Hangup']);
+    expect(member.children[0].text).toBe('The lead asked not to be called again. Their details are in your lead alert.');
+    expect(parseXml(leadOptedOutTwiml(NASTY)).children[0].text).toBe(`Understood. ${NASTY} will not call this number again. Goodbye.`);
   });
 
   it('answers the screening with an empty response so Twilio bridges the calls', () => {

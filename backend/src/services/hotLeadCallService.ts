@@ -9,6 +9,7 @@ import { isInsideLeadCallWindow } from './voice/leadLocalHours';
 import { getVoiceProvider } from './voice/voiceProvider';
 import { isWebhookSafeId } from './voice/voiceUrls';
 import { isHotLeadCallEnabled } from './voice/hotLeadCallMode';
+import { isLeadDoNotCall } from './voice/hotLeadCallDnc';
 import { isHotLeadCallEntitled } from './voice/hotLeadCallEntitlement';
 import { resolveHotLeadCallContext, type HotLeadCallContext } from './voice/hotLeadCallContext';
 import { getLeadCallStore } from './voice/leadCallStore';
@@ -44,7 +45,7 @@ type LeadRow = NonNullable<Awaited<ReturnType<typeof crmDb.getLeadById>>>;
 interface GateInput { config: HotLeadCallConfig; lead: LeadRow; job: HotLeadCallJob }
 
 // Gates that record `call.skipped` when they refuse, cheapest first. Each returns a skip reason or null.
-// Order: ids, phone, org calling hours, lead-local hours, team availability, age.
+// Order: ids, phone, org calling hours, lead-local hours, team availability, age. The async gates (do_not_call, plan) follow in review().
 const SKIP_GATES: Array<(g: GateInput) => string | null> = [
   // The webhooks reject ids outside their strict shape; Twilio would ring the member and every callback would fail.
   ({ job }) => (isWebhookSafeId(job.listId) && isWebhookSafeId(job.leadId) ? null : 'unsafe_id'),
@@ -119,13 +120,20 @@ async function review(input: JobInput, expectedOrgId?: string): Promise<{ job: H
       return null;
     }
   }
+  const callable = callableLeadPhone(lead.phone, ctx.config);
+  if (!('phone' in callable)) return null; // always set: the phone gate refused otherwise
+  // Reads the org's do-not-call marker for this number (a lead who pressed 3 once) and the lead's own contact status.
+  // A store failure throws: nothing is dialed.
+  if (await isLeadDoNotCall({ orgId: ctx.orgId, lead, phoneE164: callable.phone })) {
+    await recordSkip(lead, 'do_not_call');
+    return null;
+  }
   // After the stateless gates: it reads the org owner's plan. An org that lost its plan stops dialing here.
   if (!await isHotLeadCallEntitled({ ownerUserId: ctx.orgOwnerUserId })) {
     await recordSkip(lead, 'not_entitled');
     return null;
   }
-  const callable = callableLeadPhone(lead.phone, ctx.config);
-  return 'phone' in callable ? { job, ctx, phone: callable.phone, callerNumber, lead } : null; // always set: the phone gate refused otherwise
+  return { job, ctx, phone: callable.phone, callerNumber, lead };
 }
 
 type Reviewed = NonNullable<Awaited<ReturnType<typeof review>>>;
