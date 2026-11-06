@@ -23,7 +23,7 @@ export function localDayAndMinutes(timeZone: string, at: Date): { date: string; 
 
 /**
  * True when calls are allowed at `at`: start inclusive, end exclusive, minute granularity (20:59:59 is in a
- * window ending 21:00). start > end wraps past midnight. The zone is the org's; the lead's own is not considered.
+ * window ending 21:00). start > end wraps past midnight. The zone is the org's; the lead's own local hours are checked separately (leadLocalHours.ts).
  * Fails closed when no window is configured (a validated enabled config always has one).
  */
 export function isWithinCallWindow(callingHours: HotLeadCallConfig['callingHours'], at: Date): boolean {

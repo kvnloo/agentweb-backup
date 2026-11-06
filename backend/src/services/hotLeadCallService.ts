@@ -5,6 +5,7 @@ import { registerProcessor } from './asyncJobQueue';
 import type { HotLeadCallConfig, HotLeadCallMember } from './hotLeadCallConfig';
 import { callableLeadPhone } from './hotLeadCallConfig';
 import type { LeadOrigin } from './leadNotificationConfig';
+import { isInsideLeadCallWindow } from './voice/leadLocalHours';
 import { getVoiceProvider } from './voice/voiceProvider';
 import { isWebhookSafeId } from './voice/voiceUrls';
 import { isHotLeadCallEnabled } from './voice/hotLeadCallMode';
@@ -43,6 +44,7 @@ type LeadRow = NonNullable<Awaited<ReturnType<typeof crmDb.getLeadById>>>;
 interface GateInput { config: HotLeadCallConfig; lead: LeadRow; job: HotLeadCallJob }
 
 // Gates that record `call.skipped` when they refuse, cheapest first. Each returns a skip reason or null.
+// Order: ids, phone, org calling hours, lead-local hours, team availability, age.
 const SKIP_GATES: Array<(g: GateInput) => string | null> = [
   // The webhooks reject ids outside their strict shape; Twilio would ring the member and every callback would fail.
   ({ job }) => (isWebhookSafeId(job.listId) && isWebhookSafeId(job.leadId) ? null : 'unsafe_id'),
@@ -53,6 +55,11 @@ const SKIP_GATES: Array<(g: GateInput) => string | null> = [
   // Stateless, so it runs in every pass; the limits that count calls run once, just before create. A skip leaves
   // the lead's call slot unused, and the Slack alert goes out regardless.
   ({ config }) => (isWithinCallWindow(config.callingHours, new Date()) ? null : 'outside_calling_hours'),
+  // The lead's own local time (leadLocalHours.ts, conservative across US zones); stateless like the org window.
+  ({ lead, config }) => {
+    const callable = callableLeadPhone(lead.phone, config);
+    return 'phone' in callable && !isInsideLeadCallWindow(callable.phone, new Date()) ? 'outside_lead_hours' : null;
+  },
   // Inside the calling hours but nobody on the team has a window open (or none is verified).
   ({ config }) => (selectHotLeadCallCandidates(config, new Date()).length > 0 ? null : 'no_one_available'),
   // Protects against queue-reclaim delays: a lead that waited too long is no longer "hot". A missing or

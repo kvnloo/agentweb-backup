@@ -5,6 +5,14 @@ import { isLeadTypes, type LeadOrigin } from './leadNotificationConfig';
 import { isRecord } from './leadNotificationAttribution';
 
 export const HOT_LEAD_CALL_COUNTRIES = ['US', 'CA'] as const;
+
+/**
+ * Canada is refused in code (callableLeadPhone -> country_not_allowed) whatever allowedCountries stores. CRTC ADAD rules
+ * need an identification message with an email/postal address and a local or toll-free number, and lead-local hours;
+ * we implement neither yet. The stored config, default and validation are unchanged.
+ */
+export const HOT_LEAD_CALL_CA_ENABLED = false;
+
 type HotLeadCallCountry = typeof HOT_LEAD_CALL_COUNTRIES[number];
 
 const HOT_LEAD_CALL_DEFAULT_LEAD_TYPES: readonly LeadOrigin[] = ['form_fill'];
@@ -42,7 +50,7 @@ export const HOT_LEAD_CALL_SYSTEM_FIELDS = ['twilioNumber', 'twilioNumberSid'] a
 interface HotLeadCallCallingHours {
   /**
    * The window in which calls ARE allowed (24h HH:MM, local to `timezone`); outside it the system stays quiet.
-   * start > end wraps past midnight, so consumers must handle both orders. The lead's own timezone is not considered.
+   * start > end wraps past midnight, so consumers must handle both orders. The lead's own local hours (leadLocalHours.ts) are a separate gate, see leadLocalHours.ts.
    */
   start: string;
   end: string;
@@ -149,7 +157,8 @@ export function allowlistedE164(raw: unknown): string | null {
 /**
  * The number to ring for a lead, from the lead row's raw phone. National-format numbers are parsed as US
  * (forms for US/CA carry no '+1'); anything that resolves to another country or a blocked number type is
- * refused, as is a country outside this org's allowedCountries (a strict subset of the global US/CA list).
+ * refused, as is a country outside this org's allowedCountries (a strict subset of the global US/CA list) and Canada
+ * while HOT_LEAD_CALL_CA_ENABLED is false.
  * Shared by the call orchestrator's gates and the voice webhooks, which re-check at bridge time.
  */
 export function callableLeadPhone(
@@ -161,6 +170,7 @@ export function callableLeadPhone(
   if (!phone) return { reason: 'invalid_phone' };
   let country: string | undefined;
   try { country = parsePhoneNumberWithError(phone).country; } catch { country = undefined; }
+  if (country === 'CA' && !HOT_LEAD_CALL_CA_ENABLED) return { reason: 'country_not_allowed' };
   return country && config.allowedCountries.some(c => c === country) ? { phone } : { reason: 'country_not_allowed' };
 }
 
