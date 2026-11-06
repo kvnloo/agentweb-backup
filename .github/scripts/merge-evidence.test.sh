@@ -1048,6 +1048,49 @@ checkruns "${d}" '[
 run_gate "${d}"
 check 'ENG-2506: Opslane neutral with any other title still blocks' 1 'Opslane (neutral)'
 
+# ---------------------------------------------------------------------------
+# ENG-2833 — a hung in_progress Opslane run is not a verdict
+# ---------------------------------------------------------------------------
+# NOW = 2026-11-06T03:42:57Z; real shape from agentweb#3907.
+eng2833_now=1793936577
+opslane_live() { # $1 started_at, $2 name, $3 slug
+  printf '{"name":"%s","app":{"slug":"%s"},"status":"in_progress","conclusion":null,"started_at":"%s"}' "${2:-Opslane}" "${3:-opslane}" "$1"
+}
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  '"$(opslane_live '2026-11-06T03:12:22Z')"'
+]'
+MERGE_EVIDENCE_NOW="${eng2833_now}" run_gate "${d}"
+check 'ENG-2833: Opslane in_progress past the threshold does not block' 0 'VERDICT: PASS'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  '"$(opslane_live '2026-11-06T03:30:00Z')"'
+]'
+MERGE_EVIDENCE_NOW="${eng2833_now}" run_gate "${d}"
+check 'ENG-2833: a fresh Opslane run still holds' 2 'PENDING'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  '"$(opslane_live '2026-11-06T01:00:00Z' 'Backend build' 'github-actions')"'
+]'
+MERGE_EVIDENCE_NOW="${eng2833_now}" run_gate "${d}"
+check 'ENG-2833: an old non-Opslane run still holds' 2 'PENDING'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  '"$(opslane_live '2026-11-06T01:00:00Z')"'
+]'
+MERGE_EVIDENCE_NOW="${eng2833_now}" run_gate "${d}"
+check 'ENG-2833: a dropped hung Opslane run is not evidence' 3 'NO_EVIDENCE'
+
 d="$(new_fixture_dir)"
 pr_view "${d}" 'MERGEABLE'
 checkruns "${d}" '[
