@@ -17,5 +17,5 @@ a cap of 1-4 sends only the 100% email; a failed 100% send keeps its claim (logg
 
 Honest read-out (two P1 findings from the QA tool on the previous PR). The settings read and preview now carry additive
 `warnings` (Canada stored but not called yet); a Canada-only country list and calling hours that never meet the lead window
-(sampled every 15 minutes across a week) are blockers (`blockers`/`canEnable`, refuse turning calling on). Preview gains
+(checked at minute resolution across eight days) are blockers (`blockers`/`canEnable`, refuse turning calling on). Preview gains
 `outsideLeadHours` and `skipReason` (`outside_lead_hours`). Docs: `backend/docs/integrations/hot-lead-call.md`.

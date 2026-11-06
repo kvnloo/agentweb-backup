@@ -725,8 +725,8 @@ The settings read (GET, Emma `get_hot_lead_call_settings`) and the preview say w
   false, it says "Canadian numbers are not called yet ...". Stored data is unchanged.
 - Blocker (in `blockers`, so `canEnable` is false): none of the stored countries can currently be called (for example only
   `["CA"]`).
-- Blocker: the calling hours never overlap the lead window for a US number. Checked by sampling every 15 minutes across a
-  week in the org's time zone with `isWithinCallWindow` AND `isInsideLeadCallWindow` (a representative ordinary US number;
+- Blocker: the calling hours never overlap the lead window for a US number. Checked exactly, at minute resolution (so a
+  one-minute window counts), across the next eight days in the org's time zone with `isWithinCallWindow` AND `isInsideLeadCallWindow` (a representative ordinary US number;
   `callingHoursReachLeadWindow` in `services/voice/leadLocalHours.ts`). The message says the hours must include some time
   between about 13:00 and 18:00 Eastern.
 
