@@ -29,8 +29,10 @@ declare global {
   if (fromAttr) apiBase = fromAttr;
   else if (script?.src) apiBase = new URL(script.src, window.location.href).origin;
   apiBase = apiBase.replace(/\/+$/, '');
+  // Strict-CSP hosts: <script nonce="…"> (or data-nonce) is reused for the injected stylesheet.
+  const nonce = script?.nonce || script?.getAttribute('data-nonce') || undefined;
   window.AgentWebSlackStart = { open: openSlackStart, mount: mountSlackStart, autoBind, closeAll: closeAllSlackStart, apiBase };
-  const start = () => autoBind({ apiBase });
+  const start = () => autoBind({ apiBase, nonce });
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, { once: true });
   else start();
 })();

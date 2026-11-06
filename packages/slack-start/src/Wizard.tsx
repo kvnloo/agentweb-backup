@@ -59,7 +59,7 @@ function urlWithStep(param: string, step: number | null): string {
   return url.pathname + url.search + url.hash;
 }
 
-export function Wizard({ apiBase, fetch: fetchImpl, stepParam = DEFAULT_STEP_PARAM, onClose }: WizardProps) {
+export function Wizard({ apiBase, fetch: fetchImpl, stepParam = DEFAULT_STEP_PARAM, nonce, onClose }: WizardProps) {
   const api = useMemo(() => createApiClient(apiBase, fetchImpl ?? window.fetch.bind(window)), [apiBase, fetchImpl]);
   const [phase, setPhase] = useState<Phase>('loading');
   const [config, setConfig] = useState<SlackStartConfig | null>(null);
@@ -195,8 +195,8 @@ export function Wizard({ apiBase, fetch: fetchImpl, stepParam = DEFAULT_STEP_PAR
   const needsCaptcha = !!config?.captcha && !session.intakeId;
   useEffect(() => {
     if (!needsCaptcha || phase !== 'step' || stepIndex !== 0 || !captchaRef.current || !config?.captcha) return;
-    return mountTurnstile(captchaRef.current, config.captcha.siteKey, setCaptchaToken, () => setError(config.errors.captcha));
-  }, [needsCaptcha, phase, stepIndex, config]);
+    return mountTurnstile(captchaRef.current, config.captcha.siteKey, setCaptchaToken, () => setError(config.errors.captcha), nonce);
+  }, [needsCaptcha, phase, stepIndex, config, nonce]);
 
   const messageFor = (err: unknown, fallback: string): string => {
     if (err instanceof ApiError) {

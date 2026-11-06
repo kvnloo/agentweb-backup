@@ -51,13 +51,20 @@ export function createApiClient(apiBase: string, fetchImpl: typeof fetch) {
     } catch {
       throw new ApiError(0, 'network_error');
     }
+    const text = await res.text().catch(() => '');
     let data: any = null;
-    try {
-      data = await res.json();
-    } catch {
-      /* non-JSON error page */
+    let parsed = !text;
+    if (text) {
+      try {
+        data = JSON.parse(text);
+        parsed = true;
+      } catch {
+        /* non-JSON body (proxy/error page) */
+      }
     }
     if (!res.ok) throw new ApiError(res.status, data?.code ?? 'http_error', data?.message);
+    // A 2xx we cannot read is not a success: the caller would act on data it never received.
+    if (!parsed) throw new ApiError(res.status, 'invalid_response');
     return { status: res.status, data: data as T };
   }
 

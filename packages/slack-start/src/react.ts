@@ -13,11 +13,11 @@ export type SlackStartButtonProps = Partial<SlackStartOptions> &
 
 export const DEFAULT_API_BASE = 'https://api.agentweb.pro';
 
-export function SlackStartButton({ apiBase = DEFAULT_API_BASE, fetch, stepParam, children, ...rest }: SlackStartButtonProps) {
+export function SlackStartButton({ apiBase = DEFAULT_API_BASE, fetch, stepParam, nonce, children, ...rest }: SlackStartButtonProps) {
   const ref = useRef<HTMLButtonElement>(null);
   useEffect(() => {
     if (!ref.current) return;
-    return mountSlackStart(ref.current, { apiBase, fetch, stepParam });
-  }, [apiBase, fetch, stepParam]);
+    return mountSlackStart(ref.current, { apiBase, fetch, stepParam, nonce });
+  }, [apiBase, fetch, stepParam, nonce]);
   return createElement('button', { type: 'button', ...rest, ref }, children);
 }

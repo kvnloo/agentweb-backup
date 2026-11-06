@@ -12,13 +12,14 @@ declare global {
 const SCRIPT_SRC = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
 let loading: Promise<void> | null = null;
 
-function loadTurnstile(): Promise<void> {
+function loadTurnstile(nonce?: string): Promise<void> {
   if (window.turnstile) return Promise.resolve();
   if (loading) return loading;
   loading = new Promise<void>((resolve, reject) => {
     const s = document.createElement('script');
     s.src = SCRIPT_SRC;
     s.async = true;
+    if (nonce) s.setAttribute('nonce', nonce);
     s.onload = () => resolve();
     s.onerror = () => {
       loading = null;
@@ -35,12 +36,14 @@ export function mountTurnstile(
   siteKey: string,
   onToken: (token: string | null) => void,
   onError: () => void,
+  nonce?: string,
 ): () => void {
   let id: string | undefined;
   let cancelled = false;
-  loadTurnstile()
+  loadTurnstile(nonce)
     .then(() => {
-      if (cancelled || !window.turnstile) return;
+      if (cancelled) return;
+      if (!window.turnstile) return onError();
       id = window.turnstile.render(el, {
         sitekey: siteKey,
         callback: (t: string) => onToken(t),
