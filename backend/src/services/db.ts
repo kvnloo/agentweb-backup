@@ -28,6 +28,7 @@ import { isSmokeTestPhone } from '../utils/smokeTestLead';
 import { normalizeLinkedInUrl } from "./enrichmentGroups";
 import { isLinkedInPlaceholderName } from "../utils/anonymizedLinkedInLead";
 import { isConditionalFailure } from "./voice/setupWrites";
+import { LEAD_SUBMISSION_CLAIM_PARTITION } from "./leadSubmissionIdempotency";
 import { MAX_ATOMIC_RUN_RESULT_REMOVALS, isDynamoItemSizeError, trimListToItemBudget } from "../utils/dynamoItemBudget";
 
 // Load environment variables from .env file
@@ -3119,7 +3120,12 @@ export const taskDb = {
         this.scanAllItems(`${TABLE_PREFIX}AW-TaskExecutions`),
         this.scanAllItems(`${TABLE_PREFIX}AW-TaskSchedules`),
         this.scanAllItems(`${TABLE_PREFIX}AW-TaskTemplates`),
-        this.scanAllItems(`${TABLE_PREFIX}AW-Configs`),
+        // ENG-2837: exclude the lead-submission claim partition server-side — claims are not
+        // configs, and an unbounded set of them must not be loaded into analytics memory.
+        this.scanAllItems(`${TABLE_PREFIX}AW-Configs`, {
+          FilterExpression: "userId <> :leadSubmissionClaimPartition",
+          ExpressionAttributeValues: { ":leadSubmissionClaimPartition": LEAD_SUBMISSION_CLAIM_PARTITION },
+        }),
         this.scanAllItems(`${TABLE_PREFIX}AW-Workflows`),
         this.scanAllItems(`${TABLE_PREFIX}AW-WorkflowExecutions`),
       ]);
@@ -3196,14 +3202,19 @@ export const taskDb = {
     }
   },
 
-  // Helper function to scan all items with pagination
-  async scanAllItems(tableName: string) {
+  // Helper function to scan all items with pagination. `filter` is applied server-side
+  // (Scan FilterExpression) so excluded items never reach this process.
+  async scanAllItems(
+    tableName: string,
+    filter?: { FilterExpression: string; ExpressionAttributeValues: Record<string, unknown> },
+  ) {
     const items: any[] = [];
     let lastEvaluatedKey: any = undefined;
 
     do {
       const params: any = {
         TableName: tableName,
+        ...filter,
       };
 
       if (lastEvaluatedKey) {
