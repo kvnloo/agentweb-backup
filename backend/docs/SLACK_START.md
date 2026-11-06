@@ -12,8 +12,8 @@ validation and side effects; clients only render config and send answers.
 | GET | `/config` | none | All wizard copy, the six steps and their option ids, public Turnstile site key |
 | POST | `/` | `Idempotency-Key` header | `{email, website, utm?, captchaToken}` → `202 {intakeId, intakeToken, status}`; creates the intake, a user, a CRM lead and starts the brand build immediately |
 | GET | `/:intakeId` | `Authorization: Bearer <intakeToken>` | Resume: saved answers, furthest step |
-| PATCH | `/:intakeId` | bearer | `{answers: {source|role|sector|tools|adSpend: …}, step}` — per-step idempotent save onto intake, user (`onboarding*` fields) and lead (`slackStart*` custom fields) |
-| POST | `/:intakeId/complete` | bearer | Requires every answer; calls `provisionOnboardingSlackConnect` (inert while `SLACK_CONNECT_ENABLED` is off) → `{status: pending|invited|processing, slackConnectStatus}` |
+| PATCH | `/:intakeId` | bearer | `{answers: {source\|role\|sector\|tools\|adSpend: …}, step}` — per-step idempotent save onto intake, user (`onboarding*` fields) and lead (`slackStart*` custom fields) |
+| POST | `/:intakeId/complete` | bearer | Requires every answer; calls `provisionOnboardingSlackConnect` (inert while `SLACK_CONNECT_ENABLED` is off) → `{status: pending\|invited\|processing, slackConnectStatus}` |
 
 Error codes: `invalid_email`, `personal_email`, `invalid_website`, `invalid_utm`,
 `idempotency_key_required`, `captcha_failed` (403), `captcha_unavailable` (503),
@@ -27,7 +27,8 @@ Error codes: `invalid_email`, `personal_email`, `invalid_website`, `invalid_utm`
   Not stored, sent only as a bearer header (never in a URL), compared in constant time.
   Wrong/missing token and unknown intake both return the same 404. No secret → 503 (fail closed).
 - **Domain dedupe:** intake + `domain#<email domain>` lock are one DynamoDB TransactWrite
-  (`attribute_not_exists`), atomic across instances. A second start for a taken domain gets
+  (`attribute_not_exists`), atomic across instances. The lock expires after 30 days (an expired lock
+  counts as free before DynamoDB's lazy TTL delete), so an abandoned intake cannot block a company forever. A second start for a taken domain gets
   `409 domain_in_progress` with no id/token. Only a retry presenting the same Idempotency-Key
   *and* the same email gets the original response back (captcha is not re-spent on that replay).
 - **No account takeover:** an email that already has an account → `409 account_exists`; the
