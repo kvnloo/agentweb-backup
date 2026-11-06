@@ -26,6 +26,11 @@ export class FakeLimitStore implements LimitStore {
     return true;
   }
 
+  async read(key: string): Promise<number> {
+    this.touch(key);
+    return this.counters.get(key) ?? 0;
+  }
+
   async decrement(key: string): Promise<void> {
     this.touch(key);
     const n = this.counters.get(key) ?? 0;

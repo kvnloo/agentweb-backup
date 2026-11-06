@@ -1,5 +1,6 @@
 const update = jest.fn();
-jest.mock('../../../config/aws', () => ({ dynamodb: { update: (...a: unknown[]) => ({ promise: () => update(...a) }) } }));
+const get = jest.fn();
+jest.mock('../../../config/aws', () => ({ dynamodb: { update: (...a: unknown[]) => ({ promise: () => update(...a) }), get: (...a: unknown[]) => ({ promise: () => get(...a) }) } }));
 import { getLimitStore } from '../limitStore';
 
 beforeEach(() => update.mockReset().mockResolvedValue({}));
@@ -25,5 +26,14 @@ describe('DynamoDB limit store: incrementBelow', () => {
   it('propagates other DynamoDB errors so the job fails closed', async () => {
     update.mockRejectedValue(Object.assign(new Error('missing table'), { code: 'ResourceNotFoundException' }));
     await expect(getLimitStore().incrementBelow('k', 1, 1)).rejects.toThrow('missing table');
+  });
+});
+
+describe('DynamoDB limit store: read', () => {
+  it('reads the counter consistently, 0 when absent', async () => {
+    get.mockResolvedValueOnce({ Item: { calls: 7 } }).mockResolvedValueOnce({});
+    expect(await getLimitStore().read('k')).toBe(7);
+    expect(get).toHaveBeenCalledWith(expect.objectContaining({ ConsistentRead: true, Key: { sessionId: 'k' } }));
+    expect(await getLimitStore().read('k')).toBe(0);
   });
 });

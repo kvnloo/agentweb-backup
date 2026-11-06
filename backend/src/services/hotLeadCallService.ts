@@ -14,6 +14,7 @@ import { resolveHotLeadCallContext, type HotLeadCallContext } from './voice/hotL
 import { getLeadCallStore } from './voice/leadCallStore';
 import { leadPhoneMacOf } from './voice/leadPhoneMac';
 import { isWithinCallWindow, reserveCallSlot, type Reservation } from './voice/hotLeadCallLimits';
+import { notifyMonthlyCap } from './voice/hotLeadCallCapNotices';
 import { selectHotLeadCallCandidates } from './hotLeadCallRoster';
 import { NEXT_ATTEMPT_SOURCE, processHotLeadCallNextAttempt } from './hotLeadCallAttempts';
 import { holdsClaim, placeMemberCall, type PlacementResult } from './hotLeadCallPlacement';
@@ -180,8 +181,11 @@ async function reserveAndPlace(job: HotLeadCallJob, reviewed: Reviewed & { candi
     // The same lead is being dialed by a racing dispatch (it holds the phone marker): nothing to add to the timeline.
     // A different lead on the same number, or a cap, is worth showing.
     if (slot.reason !== 'in_progress') await recordSkip(reviewed.lead, slot.reason);
+    // Fire-and-forget (never awaited, never throws): the owner's one-per-month "paused until the 1st" email.
+    if (slot.reason === 'org_monthly_cap') void notifyMonthlyCap({ orgId: job.orgId, ownerUserId: reviewed.ctx.orgOwnerUserId, config, event: { kind: 'refused' } });
     return;
   }
+  void notifyMonthlyCap({ orgId: job.orgId, ownerUserId: reviewed.ctx.orgOwnerUserId, config, event: { kind: 'counted', used: slot.monthlyUsed } });
 
   const store = getLeadCallStore();
   const jobKey = keyOf(job);

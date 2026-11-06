@@ -446,6 +446,7 @@ call, Slack only"). Validation applies to every read, including the webhooks.
 | `maxAgeMinutes` | integer 1-60, default 10. A lead older than this when the first job runs (`submittedAt`, else lead `createdAt`; a missing or unparseable time fails closed) is skipped as `too_old`. Further attempts must start within this long of the call record's `startedAt`. |
 | `maxCallsPerHour` | integer 1-30, default 6. Counts LEADS that get a call, one per lead at its first attempt: a lead can ring up to `maxAttemptsPerLead` members and then the lead's own leg and still uses one slot. |
 | `maxCallsPerDay` | integer 1-100, default 20. Counts leads the same way. |
+| `maxCallsPerMonth` | integer 1-2000, default 200 (ENG-2783; a config stored without it reads as 200, no data migration). Counts leads the same way, per org-local calendar month. The owner routes (Emma `update_hot_lead_call_settings`, REST `PUT`) may set only 1-200 and refuse anything higher with "Higher monthly limits are set by AgentWeb support"; 201-2000 is written only by an operator (see [Raise a customer's monthly limit](#raise-a-customers-monthly-limit)). A stored value above 200 is shown in the read-out and kept when the owner edits other fields (sending the same value back is accepted). |
 | `memberCooldownMinutes` | integer 1-60, default 2. Per team member: a member who was just rung is passed over for the next available one. |
 | `maxAttemptsPerLead` | integer 1-5, default 3. How many member calls may be made for one lead; a member who was already tried is never rung again. |
 | `announcedName` | required, trimmed, 1-60 chars of letters, digits, space and `. , & ' -`. Spoken in `<Say>`; XML-escaped by the TwiML builder. |
@@ -472,7 +473,7 @@ Settings (merged). Both tools call the same service as the REST API
 
 - `get_hot_lead_call_settings({})` needs `org:configure`. It returns the portal view
   (`entitled`, `enabled`, `canEnable`, plain-English `blockers`, `callingHours`,
-  `maxAttemptsPerLead`, `announcedName`, `twilioNumberMasked`, the `team` in priority order with
+  `maxAttemptsPerLead`, `maxCallsPerMonth`, `warnings`, `announcedName`, `twilioNumberMasked`, the `team` in priority order with
   each person's `id`, `name`, `phoneMasked`, `verified` and `windows`, and `limits`) plus
   `configured`, `callerNumberAssigned`, `leadTypes`, `allowedCountries`, the other limit fields
   and the lead types that exist. No SIDs or full numbers, and no revision token.
@@ -488,10 +489,12 @@ Settings (merged). Both tools call the same service as the REST API
     the calling hours are open); on a larger team the tool refuses them and asks for `team`.
   - `callingHours` may be partial in chat: missing parts are filled from the stored hours, then the
     08:00-21:00 defaults (the lead-local window, 10:00-18:00, applies on top and is not configurable).
+  - `maxCallsPerMonth` is 1-200 in the tool schema and the service; a higher value is refused ("Higher monthly limits are
+    set by AgentWeb support").
   - The tool edits the copy it just read; the write is conditional on the stored attribute being
     unchanged, so a concurrent edit fails ("changed by someone else") instead of clobbering.
   - Unattended runs (`context.isUnattendedRun === true`) are refused for any change that turns calling on,
-    raises a cap (`maxAgeMinutes`, `maxCallsPerHour`, `maxCallsPerDay`, `maxAttemptsPerLead`), shortens
+    raises a cap (`maxAgeMinutes`, `maxCallsPerHour`, `maxCallsPerDay`, `maxCallsPerMonth`, `maxAttemptsPerLead`), shortens
     the pause between calls to one person, changes the business name that is read aloud, adds a lead type or country, widens the calling hours (or moves
     them to another zone), first-saves the settings, or edits the team. Turning calling off and lowering a limit
     stay allowed. Confirming a verification code has no such refusal (it needs the code).
@@ -555,7 +558,7 @@ arrives from the landing page AgentWeb will phone the verified team member(s) (n
 last 4 digits) from the org's number (last 4 digits) and then the lead, that calls are
 billed to the organization owner per minute at the live outbound rate (both the member's
 and the lead's call, each rounded up to a whole minute, as the metering does), the caps in
-force (`maxCallsPerHour`, `maxCallsPerDay`, `maxAttemptsPerLead`) and the calling hours with
+force (`maxCallsPerHour`, `maxCallsPerDay`, `maxCallsPerMonth`, `maxAttemptsPerLead`) and the calling hours with
 their timezone, taken from the settings about to be saved, and that calling can be turned
 off at any time. After the person clicks approve, Emma
 calls the tool again with the same arguments and it acts.
@@ -567,6 +570,8 @@ calls the tool again with the same arguments and it acts.
   is refused never sees a card. Then: a chat session must exist and be readable,
   must not be a scheduled session, and must not be a support/admin session acting
   as the customer (`isDelegatedAccess` / `isDelegatedAdmin`).
+- The card's wording is not part of the digest (only the inputs listed next are), so adding the monthly limit to the card text
+  did not change any digest; a card issued before that change still shows the old text and is still approvable.
 - Binding: the approval is tied to a digest of the action, org, user, chat
   session, the area code (or the number being released, or the exact settings change
   that turns calling on), the price as quoted now (rent, or the per-minute rate) and
@@ -653,7 +658,7 @@ digits). Error bodies are `{ error: string }` plus the fields below.
 | `PUT /` | 200 the updated settings, fresh `_revision` | 400 `{error, fieldErrors}`, 403, 403 `{error, code:'not_entitled'}` when enabling without the plan feature, 409 stale or raced, 428 `_revision` missing |
 | `POST /members/:memberId/verification/start` | 200 `{expiresInSeconds, nextStartAllowedInSeconds, startsLeftToday}` | 403 (no plan feature with `code:'not_entitled'`, or no caller number), 404 unknown member, 409 raced, 429 `{error, retryAfterSeconds}` (also a `Retry-After` header), 502 phone provider failed |
 | `POST /members/:memberId/verification/confirm` body `{code}` | 200 `{verified:true}` | 400 `{error, attemptsLeft}`, 404, 409, 429 `{error, retryAfterSeconds}` (a confirm racing another) |
-| `GET /preview?at=<ISO instant>` | 200 `{at, timezone, outsideCallingHours, candidates:[{id,name}], excluded:[{id,name,reason}]}` | 400 `{error, fieldErrors:{at}}` |
+| `GET /preview?at=<ISO instant>` | 200 `{at, timezone, outsideCallingHours, outsideLeadHours, skipReason, warnings, candidates:[{id,name}], excluded:[{id,name,reason}]}` | 400 `{error, fieldErrors:{at}}` |
 
 `_revision` is the SHA-256 of the canonical JSON (sorted keys) of the stored `hotLeadCall`, so ANY change to it
 (another editor, a verification landing, a number purchase) makes an old copy stale: re-GET after confirming a
@@ -673,7 +678,7 @@ rather than assume what it sent. REST error texts are plain English; the Emma to
 names of the tools that fix them.
 
 `fieldErrors` are keyed by position in the submitted body: `team.N.name`, `team.N.phone`, `team.N.id`, `team.N.windows`,
-`team.N.windows.M.days|start|end`, `callingHours.start|end|timezone`, `maxAttemptsPerLead`, `announcedName`, `enabled`.
+`team.N.windows.M.days|start|end`, `callingHours.start|end|timezone`, `maxAttemptsPerLead`, `maxCallsPerMonth`, `announcedName`, `enabled`.
 
 Example (fake numbers):
 
@@ -682,7 +687,7 @@ GET /api/orgs/me/hot-lead-call
 200 { "_revision": "9f2c...e1", "entitled": true, "enabled": false, "canEnable": false,
       "blockers": ["Verify the phone of at least one person"],
       "callingHours": { "start": "09:00", "end": "18:00", "timezone": "America/Chicago" },
-      "maxAttemptsPerLead": 3, "announcedName": "Acme Plumbing", "twilioNumberMasked": "***0111",
+      "maxAttemptsPerLead": 3, "maxCallsPerMonth": 200, "warnings": [], "announcedName": "Acme Plumbing", "twilioNumberMasked": "***0111",
       "team": [ { "id": "mk3f9a2b", "name": "Dana Lee", "phoneMasked": "***0100", "verified": false,
                   "windows": [ { "days": [1,2,3,4,5], "start": "09:00", "end": "17:00" } ] } ],
       "limits": { "maxTeamSize": 10, "maxWindowsPerMember": 7, "minAttempts": 1, "maxAttempts": 5, "nameMaxLength": 40 } }
@@ -704,7 +709,27 @@ POST /api/orgs/me/hot-lead-call/members/mk3f9a2b/verification/start
 
 The preview lists, in call order, who would be rung at `at` (default now). `excluded[].reason` is `unverified` or
 `outside_window`; outside the calling hours (or with none set) `outsideCallingHours` is true, `candidates` is empty and
-the verified people are reported as `outside_window`.
+the verified people are reported as `outside_window`. `outsideLeadHours` is true when the lead window (10:00-18:00 lead-local,
+judged for an ordinary US number, so 808/907 numbers can be narrower) is closed at `at`, and `skipReason` names the first
+hours gate that would stop a call at `at`: `outside_calling_hours`, then `outside_lead_hours`, else `null`. `warnings`
+carries the same notes as the settings read.
+
+### Honest read-out (ENG-2783)
+
+The settings read (GET, Emma `get_hot_lead_call_settings`) and the preview say what the calling will really do:
+
+- `warnings` (additive `string[]`): when the stored `allowedCountries` includes Canada while `HOT_LEAD_CALL_CA_ENABLED` is
+  false, it says "Canadian numbers are not called yet ...". Stored data is unchanged.
+- Blocker (in `blockers`, so `canEnable` is false): none of the stored countries can currently be called (for example only
+  `["CA"]`).
+- Blocker: the calling hours never overlap the lead window for a US number. Checked by sampling every 15 minutes across a
+  week in the org's time zone with `isWithinCallWindow` AND `isInsideLeadCallWindow` (a representative ordinary US number;
+  `callingHoursReachLeadWindow` in `services/voice/leadLocalHours.ts`). The message says the hours must include some time
+  between about 13:00 and 18:00 Eastern.
+
+Both blockers refuse turning calling ON (a 400 naming the blocker, the Emma approval card is never reached). An org that is
+already on keeps running through an unrelated edit and sees the blocker in every read-out, because it is silently skipping
+every lead (`country_not_allowed` / `outside_lead_hours`).
 
 ## Plan entitlement
 
@@ -944,13 +969,27 @@ back if the record is not created:
    `in_progress` in the code) writes nothing: it is the same lead racing itself.
 3. Limits, taken once per lead at its first attempt, in this order: `duplicate_phone`
    (same org and number within 24h), `org_hourly_cap` (UTC clock hour),
-   `org_daily_cap` (org's local calendar day). Both caps count LEADS, not member
+   `org_daily_cap` (org's local calendar day), `org_monthly_cap` (org's local calendar month, key
+   `hlc#cap#m#<orgId>#<YYYY-MM>`, TTL 40 days, default 200, see `maxCallsPerMonth`). The three caps count LEADS, not member
    calls (a lead rings up to `maxAttemptsPerLead` members and the lead's leg for one
    slot). Each is one conditional write. Then, for every attempt, first and next, the
    chosen member's cooldown: a member in cooldown is a per-attempt skip, the next
    candidate is used instead. Only when every candidate of a lead's first attempt is
    in cooldown is the lead skipped as `member_cooldown` (its slots are given back);
    on a later attempt, when none is left the record closes as `no_member_available`.
+   Everything taken is given back when a later limit refuses (a monthly refusal returns the phone marker and the
+   hourly and daily slots). Inbound callbacks are not counted against the monthly cap. A refusal records `call.skipped`
+   `org_monthly_cap` and the Slack alert still goes out.
+   **Owner notices:** when the month's count reaches `ceil(0.8 * cap)` (only for a cap of 5 or more: below that the 80% point
+   is the cap itself, so only the 100% email is sent) and at the first `org_monthly_cap` refusal, the org
+   owner (`Organization.ownerUserId`'s user email) gets ONE email each per org per month through `emailService.sendEmail`
+   (non-production sends are suppressed by the guard in `resendService`): "Your hot-lead calling is at 80% of this month's
+   limit" and "Automatic hot-lead calls are paused until the 1st". De-duplicated by claims `hlc#notify#80#<orgId>#<YYYY-MM>`
+   and `hlc#notify#100#<orgId>#<YYYY-MM>` (TTL 40 days) in the limit store. Best-effort and fire-and-forget
+   (`services/voice/hotLeadCallCapNotices.ts`): a failure never fails or delays the call; a failed 80% send gives the claim
+   back so the next crossing retries (bounded by the hourly cap), a failed 100% send KEEPS it (otherwise every refused lead
+   would redo the lookup and send during a provider outage); no owner email means a logged skip. Log lines for alarms:
+   `[hotLeadCall] org monthly cap 80% <orgId>` and `[hotLeadCall] org monthly cap 100% <orgId>`, once per org per month.
 4. `limits_unavailable`: the limit store failed; nothing is dialed, the job
    fails (not retried), an event is written best-effort.
 
@@ -961,6 +1000,13 @@ window a repeat still cannot dial: the record is permanent.
 Known limits, accepted:
 
 - Fixed windows can admit up to 2x a cap across an hour or day boundary.
+- The monthly bucket follows the calling-hours time zone (UTC when none is set), so changing the zone mid-month starts a
+  fresh bucket, as for the hourly and daily counters.
+- Raising `maxCallsPerMonth` after the 100% notice was sent does not re-notify that month: the claim key does not include
+  the cap.
+- The 80% notice can fire for a count that is then given back when the call record is not created (rare); the email said
+  "used N" for a moment when N was reached.
+- Rollout: every org starts at 200 leads per month on deploy, because stored configs without the field read as the default.
 - Phone-rotating bots can consume the org's hourly and daily caps; the Slack
   alert still fires.
 - Whoever submits a number first suppresses calls for that number for 24h.
@@ -1070,6 +1116,34 @@ carry the Twilio retry override `#rc=3&rp=5xx,ct` so Twilio redelivers a 5xx.
 - **Rollback of the code:** revert the merge. With `hot_lead_call_mode` off the
   feature is inert; existing org attributes and lead records are ignored by older
   code.
+
+### Raise a customer's monthly limit
+
+The default is 200 automatic calls per org-local calendar month and the customer can only lower it. To raise it for a
+customer, an operator writes `hotLeadCall.maxCallsPerMonth` (integer 201-2000) on the org item in AW-Organizations
+(a data write, no route; keep the rest of `hotLeadCall` unchanged, and write conditionally on the previous value like the
+settings service). The next call is checked against the new value. The customer keeps seeing and keeping it when they edit
+other settings, and can still lower it. Values above 2000 make the whole config invalid (hot-lead calls stop, Slack only),
+so do not write them.
+
+Example (operator write, to raise org `org-123` to 600; read the item first and condition on what you read):
+
+```
+UpdateItem  TableName=AW-Organizations  Key={orgId: "org-123"}
+  UpdateExpression:    SET hotLeadCall.maxCallsPerMonth = :v
+  ConditionExpression: hotLeadCall = :prev      (the whole hotLeadCall map exactly as read; this also pins its revision)
+  :v = 600  (a number from 201 to 2000)
+```
+
+Afterwards verify: `GET /api/orgs/me/hot-lead-call` as that org (or Emma `get_hot_lead_call_settings`) shows
+`maxCallsPerMonth: 600`, and the config still validates (a read that answers "could not be read" means the write broke
+it). Nothing else needs a restart: the next lead is checked against the new value.
+
+Alarm markers (logs, each logged once per successful claim: the 80% marker can repeat only when its email failed and was
+retried at the next crossing; a failed 100% send is not retried and logs
+`[hotLeadCall] monthly cap 100% notice failed <orgId>` instead, without an address): `[hotLeadCall] org monthly cap 80% <orgId>` and
+`[hotLeadCall] org monthly cap 100% <orgId>`. The 100% marker means leads are being skipped as `org_monthly_cap`. To resend a
+notice by hand, delete the claim `hlc#notify#80#<orgId>#<YYYY-MM>` / `hlc#notify#100#...` (table `AW-MCPSessions`).
 
 ### Stuck records
 
@@ -1238,7 +1312,7 @@ delete. A 404 from Twilio counts as already released. Reconcile any such log lin
 | Symptom | Likely cause |
 | --- | --- |
 | Member is called but hears "application error" | The `/owner` fetch failed: `BACKEND_URL` wrong or unreachable (check scheme and host), or credentials could not be loaded (503), or the signature failed (401). Twilio's call log shows the webhook response. |
-| Calls never placed, timeline shows `call.skipped` | The `reason` names the gate. `outside_calling_hours`, `outside_lead_hours`, `no_one_available`, `duplicate_phone` and `member_cooldown` are expected behavior. An `outside_lead_hours` lead is not retried or deferred (the job runs once); the lead window is 10:00-18:00 lead-local, about 13:00-18:00 Eastern for most US numbers, so a lead that arrives in the evening or morning is simply not called. |
+| Calls never placed, timeline shows `call.skipped` | The `reason` names the gate. `outside_calling_hours`, `outside_lead_hours`, `no_one_available`, `duplicate_phone`, `member_cooldown` and `org_monthly_cap` are expected behavior (`org_monthly_cap`: the org used its monthly allowance; calls resume on the 1st, the owner was emailed, the Slack alert went out). An `outside_lead_hours` lead is not retried or deferred (the job runs once); the lead window is 10:00-18:00 lead-local, about 13:00-18:00 Eastern for most US numbers, so a lead that arrives in the evening or morning is simply not called. |
 | No event and no call | Kill switch off, org disabled or config invalid, lead not `form_fill`, smoke-test lead, draft lead, or no phone: all silent by design. |
 | `call.skipped` `limits_unavailable` | `AW-MCPSessions` missing, IAM denied, or throttled. Fails closed. |
 | `no owner to bill for list` in logs | The list owner could not be resolved; the leg was not metered and `/status` answers 500. |
@@ -1256,7 +1330,7 @@ availability:
    several orgs, so each org can connect once.
 2. **A number-rotating bot can starve genuine leads.** A script that submits a
    different number each time uses up an org's daily and hourly caps; real leads
-   after that are skipped (`org_hourly_cap` / `org_daily_cap`). The Slack alert
+   after that are skipped (`org_hourly_cap` / `org_daily_cap` / `org_monthly_cap`). The Slack alert
    still fires for every lead.
 
 Mitigations to decide before general availability (none of them is built):
