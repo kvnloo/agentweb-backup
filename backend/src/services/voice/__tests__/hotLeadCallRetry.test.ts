@@ -1,4 +1,4 @@
-import { retryDueAt } from '../hotLeadCallRetry';
+import { retryDueAt, retrySweepEnabled } from '../hotLeadCallRetry';
 
 const wide = { callingHours: { start: '00:00', end: '23:59', timezone: 'America/New_York' } };
 // An ordinary US number: the lead window is 13:00-18:00 Eastern (10:00 Pacific to 18:00 Eastern).
@@ -15,7 +15,7 @@ describe('retryDueAt', () => {
   });
 
   it('moves to the first minute of the window when 60 minutes later is too late in the day', () => {
-    // Press at 16:30 EDT: +60 = 17:30 EDT is still open, but a press at 17:30 EDT lands at 18:30 -> next day 13:00 EDT.
+    // Press at 17:30 EDT: +60 = 18:30 EDT is after the window closes (18:00), so the next day's 13:00 EDT.
     expect(iso(retryDueAt(LEAD, wide, new Date('2026-10-19T21:30:00Z')))).toBe('2026-10-20T17:00:00.000Z');
   });
 
@@ -47,4 +47,14 @@ describe('retryDueAt', () => {
     expect(retryDueAt('+14165550123', wide, new Date('2026-10-19T17:00:00Z'))).toBeNull();
     expect(retryDueAt('nope', wide, new Date('2026-10-19T17:00:00Z'))).toBeNull();
   });
+});
+
+describe('retrySweepEnabled (HOT_LEAD_CALL_RETRY)', () => {
+  afterEach(() => { delete process.env.HOT_LEAD_CALL_RETRY; });
+  it.each([[undefined, true], ['', true], ['on', true], ['1', true], ['true', true], ['junk', true], ['off', false], ['OFF', false], [' Off ', false], ['0', false], ['false', false], ['FALSE', false]])(
+    'HOT_LEAD_CALL_RETRY=%j -> %s', (value, expected) => {
+      if (value === undefined) delete process.env.HOT_LEAD_CALL_RETRY; else process.env.HOT_LEAD_CALL_RETRY = value;
+      expect(retrySweepEnabled()).toBe(expected);
+    },
+  );
 });

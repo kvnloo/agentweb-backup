@@ -2047,7 +2047,7 @@ describe('lead presses 3: do not call again', () => {
 describe('lead presses 2: not available now (one retry, ENG-2783)', () => {
   const HOUR = 3_600_000;
   const GOODBYE = 'Okay. Smith &amp; Sons will call you again later. Goodbye.';
-  const NO_RETRY = 'Okay. Smith &amp; Sons will not call again today. Goodbye.';
+  const BARE_HANGUP = '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>';
   beforeEach(() => seed('bridging', { leadCallSid: LEAD_SID }));
 
   it('defers once: outcome lead_deferred, a deferral at least an hour away, one call.lead_declined, the lead hears the goodbye', async () => {
@@ -2072,7 +2072,6 @@ describe('lead presses 2: not available now (one retry, ENG-2783)', () => {
   it('a replay of the 2 repeats the goodbye and keeps the first deferral (no second one, no second event)', async () => {
     await screenResult('2');
     const first = store.record?.deferral;
-    await new Promise((r) => setTimeout(r, 5));
     const replay = await screenResult('2');
     expect(replay.text).toContain(GOODBYE);
     expect(store.record?.deferral).toEqual(first);
@@ -2102,10 +2101,10 @@ describe('lead presses 2: not available now (one retry, ENG-2783)', () => {
     expect(mock(crmDb.updateLead).mock.calls.length).toBe(writes);
   });
 
-  it('on the retry call (the record keeps its deferral) a second 2 is an ordinary decline with its own goodbye', async () => {
+  it('on the retry call (the record keeps its deferral) a second 2 is an ordinary decline: the bare hangup and the ordinary member copy', async () => {
     seed('bridging', { leadCallSid: LEAD_SID, deferral: { dueAt: '2026-10-19T12:00:00.000Z', count: 1 }, retryClaimToken: 'tok' });
     const res = await screenResult('2');
-    expect(res.text).toContain(NO_RETRY);
+    expect(res.text).toBe(BARE_HANGUP);
     expect(store.record).toMatchObject({ outcome: 'lead_declined', deferral: { count: 1 } });
     expect(store.events).toEqual([{ type: 'call.lead_declined', detail: { reason: 'not_available_no_retry' } }]);
     expect((await dial('completed', { DialCallSid: LEAD_SID, DialBridged: 'false' })).text).toContain('did not confirm');
@@ -2114,14 +2113,64 @@ describe('lead presses 2: not available now (one retry, ENG-2783)', () => {
   it('with no minute inside the lead window within 36 hours the 2 is an ordinary decline and nothing is scheduled', async () => {
     mock(isInsideLeadCallWindow).mockReturnValue(false);
     const res = await screenResult('2');
-    expect(res.text).toContain(NO_RETRY);
+    expect(res.text).toBe(BARE_HANGUP);
     expect(store.record?.outcome).toBe('lead_declined');
     expect(store.record?.deferral).toBeUndefined();
   });
 
+  it('with the org\'s calling hours leaving no minute in 36 hours (the real lead window, not a mock) the 2 is an ordinary decline', async () => {
+    mock(isInsideLeadCallWindow).mockImplementation(jest.requireActual('../services/voice/leadLocalHours').isInsideLeadCallWindow);
+    mock(orgDb.getOrgById).mockResolvedValue({ orgId: 'org-a', hotLeadCall: { ...orgConfig, callingHours: { start: '01:00', end: '02:00', timezone: 'America/New_York' } } });
+    expect((await screenResult('2')).text).toBe(BARE_HANGUP);
+    expect(store.record).toMatchObject({ outcome: 'lead_declined' });
+    expect(store.record?.deferral).toBeUndefined();
+  });
+
+  it('with retries switched off (HOT_LEAD_CALL_RETRY=off) a 2 promises nothing: an ordinary decline', async () => {
+    process.env.HOT_LEAD_CALL_RETRY = 'off';
+    try {
+      expect((await screenResult('2')).text).toBe(BARE_HANGUP);
+    } finally {
+      delete process.env.HOT_LEAD_CALL_RETRY;
+    }
+    expect(store.record).toMatchObject({ outcome: 'lead_declined' });
+    expect(store.record?.deferral).toBeUndefined();
+  });
+
+  it('with the global kill switch off a 2 promises nothing either', async () => {
+    setHotLeadCallEnabledOverride(false);
+    expect((await screenResult('2')).text).toBe(BARE_HANGUP);
+    expect(store.record?.deferral).toBeUndefined();
+  });
+
+  describe('/screen offers option 2 only when a retry can happen', () => {
+    const prompt = async (): Promise<string> => (await screen()).text;
+    beforeEach(() => seed('bridging'));
+
+    it('on the first call, with retries on: all three options', async () => {
+      expect(await prompt()).toContain('Press 1 to be connected now, press 2 if you are not available and we will call you again later, or press 3 to stop these calls.');
+    });
+
+    it('on the retry call (the record keeps its deferral): only 1 and 3', async () => {
+      seed('bridging', { deferral: { dueAt: '2026-10-19T12:00:00.000Z', count: 1 }, retryClaimToken: 'tok' });
+      const text = await prompt();
+      expect(text).toContain('Press 1 to be connected now, or press 3 to stop these calls.');
+      expect(text).not.toContain('press 2');
+    });
+
+    it('with retries switched off: only 1 and 3', async () => {
+      process.env.HOT_LEAD_CALL_RETRY = '0';
+      try {
+        expect(await prompt()).not.toContain('press 2');
+      } finally {
+        delete process.env.HOT_LEAD_CALL_RETRY;
+      }
+    });
+  });
+
   it('a lead whose phone changed since the call was approved gets no retry', async () => {
     seed('bridging', { leadCallSid: LEAD_SID, leadPhoneMac: leadPhoneMacOf('org-a', '+14155550999') });
-    expect((await screenResult('2')).text).toContain(NO_RETRY);
+    expect((await screenResult('2')).text).toBe(BARE_HANGUP);
     expect(store.record?.deferral).toBeUndefined();
   });
 });

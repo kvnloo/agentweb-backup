@@ -719,6 +719,7 @@ describe('abuse limits (reservation)', () => {
       create: async (_l, id) => { if (created.has(id)) return false; created.add(id); return true; },
       transition: async () => true,
       claimRetry: async () => false,
+      rescheduleRetry: async () => false,
       restartForRetry: async () => false,
       addEvent: async () => undefined,
     });

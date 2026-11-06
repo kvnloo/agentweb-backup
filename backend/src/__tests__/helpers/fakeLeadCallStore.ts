@@ -63,6 +63,13 @@ export class FakeLeadCallStore implements LeadCallStore {
     return true;
   }
 
+  async rescheduleRetry(_listId: string, _leadId: string, jobKey: string, dueAt: string): Promise<boolean> {
+    const r = this.record;
+    if (!r || r.state !== 'finished' || r.jobKey !== jobKey || r.outcome !== 'lead_deferred' || r.retryClaimToken !== undefined) return false;
+    r.deferral = { dueAt, count: 1 };
+    return true;
+  }
+
   async restartForRetry(_listId: string, _leadId: string, from: { jobKey: string; token: string }, fresh: RetryRestart): Promise<boolean> {
     const r = this.record;
     if (!r || r.state !== 'finished' || r.jobKey !== from.jobKey || r.retryClaimToken !== from.token) return false;
