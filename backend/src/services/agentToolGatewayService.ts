@@ -340,6 +340,18 @@ function chatHistoryFailureScope(args: unknown): string {
 // the ENG-182/ENG-313 LinkedIn per-recipient scoping above) so a miss on one
 // lead doesn't block a call for a different lead; a genuine repeat on the
 // SAME lead still trips.
+// ENG-2808: the same per-(list_id, lead_id) outcome applies to every lead-targeted
+// tool that returns the structured "lead does not exist in this list" miss.
+// add_lead_engagement failed 10/33 in one window on exactly this miss; a tool-wide
+// bucket let three wrong ids block the corrected call for the rest of the run.
+const LEAD_SCOPED_TOOLS = new Set([
+  'get_lead_details',
+  'add_lead_engagement',
+  'get_lead_engagements',
+  'update_lead',
+  'send_email_to_lead',
+]);
+
 function leadDetailsFailureScope(args: unknown): string {
   if (!args || typeof args !== 'object' || Array.isArray(args)) return '';
   const record = args as Record<string, unknown>;
@@ -409,7 +421,7 @@ function googleAdsFailureScope(args: unknown): string {
 
 function failureScope(toolName: string, args: unknown): string {
   if (toolName === 'get_chat_history') return chatHistoryFailureScope(args);
-  if (toolName === 'get_lead_details') return leadDetailsFailureScope(args);
+  if (LEAD_SCOPED_TOOLS.has(toolName)) return leadDetailsFailureScope(args);
   if (toolName === 'call_meta_marketing_api') return metaMarketingFailureScope(args);
   if (toolName === 'call_google_ads_api') return googleAdsFailureScope(args);
   if (toolName !== 'linkedin_outreach') return '';

@@ -2380,6 +2380,56 @@ describe('agentToolGatewayService', () => {
       expect(execute).toHaveBeenCalledTimes(1);
     });
 
+    it.each(['add_lead_engagement', 'get_lead_engagements', 'update_lead', 'send_email_to_lead'])(
+      'ENG-2808: three not-found %s for different leads do not block a corrected, valid call',
+      async (toolName) => {
+        const runId = `run-eng2808-${toolName}`;
+        for (let i = 0; i < 3; i += 1) {
+          const outcome = await executeAgentToolThroughGateway({
+            toolName,
+            args: { list_id: `wrong-list-${i}`, lead_id: `lead-${i}`, event_type: 'custom.call' },
+            runId,
+            execute: () => Promise.resolve({
+              success: false,
+              message: 'Lead not found',
+              error: 'The specified lead does not exist in this list',
+            }),
+          });
+          expect(outcome.status).toBe('success');
+        }
+        const execute = jest.fn().mockResolvedValue({ success: true });
+        const outcome = await executeAgentToolThroughGateway({
+          toolName,
+          args: { list_id: 'correct-list', lead_id: 'lead-real', event_type: 'custom.call' },
+          runId,
+          execute,
+        });
+        expect(outcome.status).toBe('success');
+        expect(execute).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    it('ENG-2808: add_lead_engagement still trips when the SAME lead fails repeatedly', async () => {
+      const runId = 'run-eng2808-same';
+      const args = { list_id: 'list-a', lead_id: 'lead-a', event_type: 'custom.call' };
+      for (let i = 0; i < 3; i += 1) {
+        await executeAgentToolThroughGateway({
+          toolName: 'add_lead_engagement',
+          args,
+          runId,
+          execute: () => Promise.resolve({
+            success: false,
+            message: 'Lead not found',
+            error: 'The specified lead does not exist in this list',
+          }),
+        });
+      }
+      const execute = jest.fn().mockResolvedValue({ success: true });
+      const outcome = await executeAgentToolThroughGateway({ toolName: 'add_lead_engagement', args, runId, execute });
+      expect(outcome.status).toBe('error');
+      expect(execute).not.toHaveBeenCalled();
+    });
+
     it('ENG-969: still trips when the SAME get_lead_details lead fails repeatedly', async () => {
       const runId = 'run-eng969-same';
       const args = { list_id: 'list-a', lead_id: 'lead-a' };
