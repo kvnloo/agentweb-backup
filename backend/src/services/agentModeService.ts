@@ -39,6 +39,7 @@ import { shouldForceScheduledAutocomplete } from './agentMode/core/scheduledAuto
 import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/memoryRanking';
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
+import { buildIterationLimitReport } from './agentMode/core/iterationLimitReport';
 import { resolveMetaActivationCampaignId } from './agentMode/metaCampaignResolution';
 import {
   buildImageSwapNotReflected, judgeImageSwap, readCreativeImage, selectSwapImageHash,
@@ -5612,6 +5613,10 @@ export class AgentModeService {
         }
       }
 
+      if (truncatedByStepBudget && !wasCancelled) {
+        content = buildIterationLimitReport(content, toolCalls);
+      }
+
       // Opslane 2026-10-13: persist exactly what is returned. The step-cap,
       // content-filter and time-budget texts are assigned to `content` after the
       // model's own (often empty) message was already appended, so the transcript
@@ -5670,6 +5675,7 @@ export class AgentModeService {
             iterationTimings,
             memoryUsage,
             ...(toolCalls.length > 0 ? { toolCalls } : {}),
+            ...(truncatedByStepBudget && !wasCancelled ? { iterationLimitReached: true } : {}),
             ...(citations.length > 0 ? { citations } : {}),
             // ENG-2263: the numbers (never text) this invocation's CRM tools returned, so a continuation of this task can check
             // its totals against them. Additive and optional; bounded to 64 numbers + tool names. Off with the guard's kill switch.
