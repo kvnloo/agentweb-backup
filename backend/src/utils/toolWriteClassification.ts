@@ -34,7 +34,25 @@ export function isReadOnlyToolName(name: string): boolean {
   if (READ_ONLY_TOOL_EXACT.has(name) || READ_ONLY_TOOL.test(name)) return true;
   return emmaToolRegistry.getTool(name)?.readOnly === true;
 }
+// ENG-2863: linkedin_outreach multiplexes reads and sends behind one name. Its
+// discovery actions never contact anyone or change account state, so a run that
+// only searched/read profiles must not be reported as having "completed writes".
+// Action-scoped and fail-safe: an unknown, missing or unparseable action stays a write.
+// Spelling is folded the same way the dispatcher does (`_` -> `-`).
+const LINKEDIN_OUTREACH_READ_ACTIONS = new Set([
+  'search-people', 'get-profile', 'get-company', 'search-parameters',
+  'list-connections', 'list-sent-invitations', 'list-received-invitations', 'list-post-engagers',
+]);
+function isReadOnlyLinkedInOutreachCall(toolCall: any): boolean {
+  let args = toolCall?.arguments;
+  if (typeof args === 'string') {
+    try { args = JSON.parse(args); } catch { return false; }
+  }
+  const action = args && typeof args === 'object' ? (args as any).action : undefined;
+  return typeof action === 'string' && LINKEDIN_OUTREACH_READ_ACTIONS.has(action.trim().toLowerCase().replace(/_/g, '-'));
+}
 export function isWriteToolCall(toolCall: any): boolean {
   const name = typeof toolCall?.name === 'string' ? toolCall.name : '';
+  if (name === 'linkedin_outreach' && isReadOnlyLinkedInOutreachCall(toolCall)) return false;
   return name.length > 0 && !isReadOnlyToolName(name);
 }
