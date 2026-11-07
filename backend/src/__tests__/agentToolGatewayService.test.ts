@@ -431,6 +431,22 @@ describe('agentToolGatewayService', () => {
           ]);
         });
 
+        it('fills missing field name when fields is a JSON string or wrapped', () => {
+          const raw = [{ element: 'Email', type: 'textbox', ref: 'e12', value: 'a@b.co' }];
+          const expected = [{ name: 'Email', type: 'textbox', ref: 'e12', value: 'a@b.co' }];
+          for (const args of [{ fields: JSON.stringify(raw) }, { params: { fields: raw } }]) {
+            const result = validateAndRepairToolArgs({
+              toolName: 'playwright_browser_fill_form',
+              args,
+              inputSchema: fillFormSchema,
+              effect: 'internal_write',
+            });
+            expect(result.status).toBe('repaired');
+            expect(result.repairs).toContain('fill_form:field.name');
+            expect((result.args as any).fields).toEqual(expected);
+          }
+        });
+
         it('leaves already-named fields untouched', () => {
           const result = validateAndRepairToolArgs({
             toolName: 'playwright_browser_fill_form',
