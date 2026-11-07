@@ -30,4 +30,14 @@ describe('iteration-limit receipt', () => {
     expect(text).toContain('target not returned');
     expect(text).toContain('How to resume');
   });
+  it('names saved files and landing-page ids, but not arbitrary tool ids (ENG-2854 review)', () => {
+    const text = buildIterationLimitReport('', [
+      { name: 'save_file', arguments: {}, result: { success: true, file_name: 'report.pdf' } },
+      { name: 'create_landing_page', arguments: {}, result: { success: true, id: 'lp-123' } },
+      { name: 'send_email', arguments: {}, result: { success: true, id: 'msg-999' } },
+    ]);
+    expect(text).toContain('file_name: "report.pdf"');
+    expect(text).toContain('id: "lp-123"');
+    expect(text).not.toContain('msg-999');
+  });
 });

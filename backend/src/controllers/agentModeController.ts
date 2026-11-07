@@ -4837,6 +4837,8 @@ type RunVerifiedChatResult = {
   }>;
   attempts: number;
   workPlanCompleted: boolean;
+  // ENG-2854: why a failed run stopped when it was not a requirements miss.
+  terminationReason?: 'iteration_limit';
   // ENG-396: set when a headless turn left an unanswered blocking question. The
   // run stopped without proceeding on a guess; a human must answer it. The
   // scheduled caller maps this to a `pending_user_input` outcome and notifies.
@@ -5299,10 +5301,12 @@ async function runVerifiedChatInner(
   // or null when no question is awaiting.
   const iterationLimitStopResult = (): RunVerifiedChatResult => ({
     success: false,
+    terminationReason: 'iteration_limit',
     content: allContent,
     toolCalls: allToolCalls,
-    keywordMatches: keywords.filter(k => !remainingKeywords.includes(k)),
-    keywordMisses: remainingKeywords,
+    // Score against the truncated turn's content: remainingKeywords is only pruned later.
+    keywordMatches: keywords.filter(k => allContent.toLowerCase().includes(k.toLowerCase())),
+    keywordMisses: keywords.filter(k => !allContent.toLowerCase().includes(k.toLowerCase())),
     functionCallMatches: requiredFunctions.filter(f =>
       countCallsForRequirement(f.functionName, allActualFunctionCallsForReporting) >= f.minCount).map(f => f.functionName),
     functionCallMisses: requiredFunctions.filter(f =>
@@ -8440,7 +8444,8 @@ export async function runScheduledChat(
     // Self-improve: when enabled, run a reflection turn in the same session that may
     // rewrite the schedule's prompt so future runs do better. Runs on test runs too so
     // it's easy to try out. Best-effort — never fails the run.
-    if (schedule.selfImprove === true) {
+    // ENG-2854: an iteration-limit report is the terminal turn; no further model turn.
+    if (schedule.selfImprove === true && result.terminationReason !== 'iteration_limit') {
       try {
         await runScheduleSelfImprovement({
           schedule,
@@ -17990,6 +17995,8 @@ export const agentModeController = {
         success: result.success,
         message: result.success
           ? `All required functions were called successfully.`
+          : result.terminationReason === 'iteration_limit'
+          ? `Stopped at the iteration limit after ${result.attempts} attempt${result.attempts !== 1 ? 's' : ''}; see the resumable report in content.`
           : `Some required functions were not called enough times after ${result.attempts} attempt${result.attempts !== 1 ? 's' : ''}.`,
         content: result.content,
         toolCalls: result.toolCalls,
