@@ -19,6 +19,7 @@ import { TABLE_PREFIX } from '../config/constants';
 import { ChatbotDB, ChatSession } from '../services/chatbotService';
 import { scanMessagesForAssets } from '../utils/scanMessagesForAssets';
 import { parseWithImagesQuery, applyWithImagesQuery } from '../utils/withImagesQuery';
+import { getOrgVisibleAssets } from '../utils/orgCreativesFanout';
 import { approvalDb } from '../services/approvalDb';
 import { MAX_FILE_SIZE } from '../config';
 import { isSupportedFileType, getContentType } from '../utils/fileProcessor';
@@ -2629,6 +2630,21 @@ function addCachedHtmlReportsToResult(
   }
 }
 
+// ENG-2834: Creatives are shared org-wide when the org's `creatives` share
+// feature is on (default on); otherwise caller-only.
+function getOrgVisibleExecutionsWithAssets(
+  userId: string,
+  assetType: 'images' | 'videos' | 'html-reports',
+  errorMessage: string,
+): Promise<Record<string, any>> {
+  return getOrgVisibleAssets(userId, {
+    getUser: (uid) => userDb.getUserById(uid),
+    getOrg: (orgId) => orgDb.getOrgById(orgId),
+    getOrgMemberIds: async (orgId) => (await orgDb.getOrgMembers(orgId)).map((m: any) => m.userId),
+    getAssetsForUser: (uid) => getExecutionsWithAssets(uid, assetType, errorMessage),
+  });
+}
+
 // Get all executions with images for the current user
 router.get('/executions/with-images', authenticateToken, async (req: Request, res: Response) => {
   try {
@@ -2644,7 +2660,7 @@ router.get('/executions/with-images', authenticateToken, async (req: Request, re
       return res.status(400).json({ message: parsed.error });
     }
 
-    const result = await getExecutionsWithAssets(userId, 'images', 'Error getting executions with images');
+    const result = await getOrgVisibleExecutionsWithAssets(userId, 'images', 'Error getting executions with images');
     if (!parsed) {
       return res.json(result);
     }
@@ -2674,7 +2690,7 @@ router.get('/executions/with-videos', authenticateToken, async (req: Request, re
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const result = await getExecutionsWithAssets(userId, 'videos', 'Error getting executions with videos');
+    const result = await getOrgVisibleExecutionsWithAssets(userId, 'videos', 'Error getting executions with videos');
     res.json(result);
   } catch (error) {
     console.error('Error getting executions with videos:', error);
@@ -2691,7 +2707,7 @@ router.get('/executions/with-html-reports', authenticateToken, async (req: Reque
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const result = await getExecutionsWithAssets(userId, 'html-reports', 'Error getting executions with HTML reports');
+    const result = await getOrgVisibleExecutionsWithAssets(userId, 'html-reports', 'Error getting executions with HTML reports');
     res.json(buildHtmlReportsResponsePayload(result));
   } catch (error) {
     console.error('Error getting executions with HTML reports:', error);
