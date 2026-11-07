@@ -29,7 +29,12 @@ export function mergeAssetGroups(
   for (const { ownerUserId, groups } of others) {
     for (const [key, group] of Object.entries(groups || {})) {
       if (key in merged) continue;
-      merged[key] = { ...group, ownerUserId, sharedFromOrg: true };
+      // Favorites are per-owner (the toggle is owner-scoped), so a teammate's
+      // stars must not appear as the caller's favorites.
+      const result_files = Array.isArray(group?.result_files)
+        ? group.result_files.map((f: any) => ({ ...f, is_favorited: false }))
+        : group?.result_files;
+      merged[key] = { ...group, ...(result_files !== undefined ? { result_files } : {}), ownerUserId, sharedFromOrg: true };
     }
   }
   return merged;

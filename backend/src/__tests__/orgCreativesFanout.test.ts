@@ -61,6 +61,16 @@ describe('Creatives org fan-out (ENG-2834)', () => {
     expect(Object.keys(await getOrgVisibleAssets('userB', d))).toEqual(['taskB']);
   });
 
+  it('teammate stars never show as the caller\'s favorites', () => {
+    const m = mergeAssetGroups(
+      { mine: { result_files: [{ url: 'a', is_favorited: true }] } },
+      [{ ownerUserId: 'o', groups: { theirs: { result_files: [{ url: 'b', is_favorited: true }] } } }],
+    );
+    expect(m.mine.result_files[0].is_favorited).toBe(true);
+    expect(m.theirs.result_files[0].is_favorited).toBe(false);
+    expect(m.theirs.sharedFromOrg).toBe(true);
+  });
+
   it('own entry wins on key collision', () => {
     const m = mergeAssetGroups({ k: { mine: true } }, [{ ownerUserId: 'o', groups: { k: { mine: false } } }]);
     expect(m.k).toEqual({ mine: true });
