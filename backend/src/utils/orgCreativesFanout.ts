@@ -9,6 +9,21 @@ import { isFeatureEffectivelyEnabled, MEMBER_FANOUT_CAP } from '../services/orgS
 
 export type AssetGroups = Record<string, any>;
 
+/**
+ * Max groups taken from each teammate, most recent first. Bounds the response
+ * size by member count instead of by a busy teammate's whole history.
+ */
+export const SHARED_GROUPS_PER_MEMBER_CAP = 50;
+
+function recentGroupEntries(groups: AssetGroups): Array<[string, any]> {
+  const entries = Object.entries(groups || {});
+  if (entries.length <= SHARED_GROUPS_PER_MEMBER_CAP) return entries;
+  const ts = (g: any) => String(g?.latestExecutionTime || g?.updatedAt || g?.createdAt || '');
+  return entries
+    .sort(([, a], [, b]) => ts(b).localeCompare(ts(a)))
+    .slice(0, SHARED_GROUPS_PER_MEMBER_CAP);
+}
+
 export interface CreativesFanoutDeps {
   getUser: (userId: string) => Promise<{ orgId?: string; orgRole?: string } | null | undefined>;
   getOrg: (orgId: string) => Promise<any>;
@@ -27,7 +42,7 @@ export function mergeAssetGroups(
 ): AssetGroups {
   const merged: AssetGroups = { ...own };
   for (const { ownerUserId, groups } of others) {
-    for (const [key, group] of Object.entries(groups || {})) {
+    for (const [key, group] of recentGroupEntries(groups)) {
       if (key in merged) continue;
       // Favorites are per-owner (the toggle is owner-scoped), so a teammate's
       // stars must not appear as the caller's favorites.

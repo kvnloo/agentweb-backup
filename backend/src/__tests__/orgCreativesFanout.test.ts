@@ -1,5 +1,5 @@
 // ENG-2834: org members see each other's Creatives when `creatives` sharing is on.
-import { getOrgVisibleAssets, mergeAssetGroups, CreativesFanoutDeps } from '../utils/orgCreativesFanout';
+import { getOrgVisibleAssets, mergeAssetGroups, SHARED_GROUPS_PER_MEMBER_CAP, CreativesFanoutDeps } from '../utils/orgCreativesFanout';
 import { defaultShareSettings, OWNED_FEATURES, TOGGLEABLE_FEATURES } from '../services/orgShareService';
 
 const assets: Record<string, Record<string, any>> = {
@@ -80,5 +80,17 @@ describe('Creatives org fan-out (ENG-2834)', () => {
     expect(TOGGLEABLE_FEATURES).toContain('creatives');
     expect(OWNED_FEATURES).not.toContain('creatives' as any);
     expect(defaultShareSettings().creatives.enabled).toBe(true);
+  });
+
+  it('caps each teammate to their most recent groups so a busy history cannot grow the response', () => {
+    const groups: Record<string, any> = {};
+    for (let i = 0; i < SHARED_GROUPS_PER_MEMBER_CAP + 30; i++) {
+      groups[`g${i}`] = { latestExecutionTime: new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString() };
+    }
+    const merged = mergeAssetGroups({ mine: { latestExecutionTime: '2020-01-01' } }, [{ ownerUserId: 'busy', groups }]);
+    expect(Object.keys(merged)).toHaveLength(SHARED_GROUPS_PER_MEMBER_CAP + 1);
+    expect(merged.mine).toBeDefined();
+    expect(merged[`g${SHARED_GROUPS_PER_MEMBER_CAP + 29}`]).toBeDefined();
+    expect(merged.g0).toBeUndefined();
   });
 });

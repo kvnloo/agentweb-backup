@@ -2071,7 +2071,11 @@ router.put("/:taskId/lead-list", authenticateToken, async (req: AuthRequest, res
 export async function getExecutionsWithAssets(
   userId: string,
   assetType: 'images' | 'videos' | 'html-reports',
-  errorMessage: string
+  errorMessage: string,
+  // ENG-2834: false when loading a teammate's assets for org fan-out — the
+  // background classifier must not bill the caller's view to, or relabel, a
+  // teammate's stored reports.
+  backgroundEnrich: boolean = true,
 ): Promise<Record<string, any>> {
   // Get all task executions for the user
   const allExecutions = await taskDb.getAllTaskExecutionsByUserId(userId) || [];
@@ -2312,7 +2316,7 @@ export async function getExecutionsWithAssets(
   // Enrich HTML report result files with searchable text content (fire-and-forget —
   // the result object is mutated in-place, but we don't block the response on it;
   // cached values are already populated so this only runs for brand-new reports).
-  if (assetType === 'html-reports') {
+  if (assetType === 'html-reports' && backgroundEnrich) {
     // Run searchableText enrichment first (populates content used by classifier), then classify.
     enrichHtmlReportsWithSearchableText(result, chatbotDbForEnrich)
       .then(() => classifyUnlabeledReports(result, chatbotDbForEnrich, userId))
@@ -2641,7 +2645,7 @@ function getOrgVisibleExecutionsWithAssets(
     getUser: (uid) => userDb.getUserById(uid),
     getOrg: (orgId) => orgDb.getOrgById(orgId),
     getOrgMemberIds: async (orgId) => (await orgDb.getOrgMembers(orgId)).map((m: any) => m.userId),
-    getAssetsForUser: (uid) => getExecutionsWithAssets(uid, assetType, errorMessage),
+    getAssetsForUser: (uid) => getExecutionsWithAssets(uid, assetType, errorMessage, uid === userId),
   });
 }
 
