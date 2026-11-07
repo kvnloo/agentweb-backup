@@ -59,6 +59,7 @@ import { ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import { computeTermination } from './agentMode/core/agentStep';
 import { ANTI_LOOP_STOP_MESSAGE, EMPTY_FINAL_RESPONSE_FALLBACK, STEP_BUDGET_FINAL_SYNTHESIS_MESSAGE } from './agentMode/core/termination';
 import { recordPagingCalls, PAGING_SPIRAL_STOP_MESSAGE } from './agentMode/core/pagingSpiral';
+import { createSerialReadState, recordSerialReadStep, SERIAL_READ_BATCH_MESSAGE } from './agentMode/core/serialReadSpiral';
 import { sanitizeGeminiSchema } from './agentMode/core/geminiNativeClient';
 import {
   normalizeOpenRouterResponseMetadata,
@@ -3857,6 +3858,8 @@ export class AgentModeService {
       // same resource with varying offset/limit (which evades both signature checks) is seen.
       const pagingCallCounts = new Map<string, number>();
       let pagingSpiralNudged = false;
+      // ENG-2863: consecutive one-read-per-step streak; nudges the model to batch lookups.
+      const serialReadState = createSerialReadState();
       // ENG-1635/1644 follow-up: cross-TURN retry-backstop TRANSPARENCY for a
       // Meta write that keeps failing the same way — see the annotation logic
       // below (and applyMetaWriteRetryBackstop's own header) for why this
@@ -5305,6 +5308,12 @@ export class AgentModeService {
           pagingSpiralNudged = true;
           console.warn(`AgentMode: Detected paging spiral (${pagingTripped.join(', ')}) in session ${sessionId}, injecting paging-stop warning`);
           (messages as any[]).push({ role: 'system', content: PAGING_SPIRAL_STOP_MESSAGE });
+        }
+
+        // ENG-2863: serial-read spiral — one independent read per step burns the step cap.
+        if (recordSerialReadStep(serialReadState, responseMessage.tool_calls)) {
+          console.warn(`AgentMode: Detected serial single-read steps in session ${sessionId}, injecting batch-lookups nudge`);
+          (messages as any[]).push({ role: 'system', content: SERIAL_READ_BATCH_MESSAGE });
         }
 
         // Do not append an assistant message; tool messages above are sufficient for model continuation
