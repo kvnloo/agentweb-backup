@@ -405,6 +405,59 @@ describe('agentToolGatewayService', () => {
           expect(result.repairs).not.toContain('elements->fields');
         });
 
+        // ENG-2858: Playwright MCP zod error at fields[0].name (expected string) when the
+        // model labels the field with `element` instead of `name`.
+        it('fills missing field name from element, label, or ref', () => {
+          const result = validateAndRepairToolArgs({
+            toolName: 'playwright_browser_fill_form',
+            args: {
+              fields: [
+                { element: 'Email', type: 'textbox', ref: 'e12', value: 'a@b.co' },
+                { label: 'Name', type: 'textbox', ref: 'e13', value: 'Al' },
+                { type: 'checkbox', ref: 'e14', value: 'true' },
+                { name: 'Keep', element: 'ignored', type: 'textbox', ref: 'e15', value: 'x' },
+              ],
+            },
+            inputSchema: fillFormSchema,
+            effect: 'internal_write',
+          });
+          expect(result.status).toBe('repaired');
+          expect(result.repairs).toContain('fill_form:field.name');
+          expect((result.args as any).fields).toEqual([
+            { name: 'Email', type: 'textbox', ref: 'e12', value: 'a@b.co' },
+            { name: 'Name', type: 'textbox', ref: 'e13', value: 'Al' },
+            { name: 'e14', type: 'checkbox', ref: 'e14', value: 'true' },
+            { name: 'Keep', element: 'ignored', type: 'textbox', ref: 'e15', value: 'x' },
+          ]);
+        });
+
+        it('fills missing field name when fields is a JSON string or wrapped', () => {
+          const raw = [{ element: 'Email', type: 'textbox', ref: 'e12', value: 'a@b.co' }];
+          const expected = [{ name: 'Email', type: 'textbox', ref: 'e12', value: 'a@b.co' }];
+          for (const args of [{ fields: JSON.stringify(raw) }, { params: { fields: raw } }]) {
+            const result = validateAndRepairToolArgs({
+              toolName: 'playwright_browser_fill_form',
+              args,
+              inputSchema: fillFormSchema,
+              effect: 'internal_write',
+            });
+            expect(result.status).toBe('repaired');
+            expect(result.repairs).toContain('fill_form:field.name');
+            expect((result.args as any).fields).toEqual(expected);
+          }
+        });
+
+        it('leaves already-named fields untouched', () => {
+          const result = validateAndRepairToolArgs({
+            toolName: 'playwright_browser_fill_form',
+            args: { fields: fieldList },
+            inputSchema: fillFormSchema,
+            effect: 'internal_write',
+          });
+          expect(result.repairs).not.toContain('fill_form:field.name');
+          expect(result.args).toEqual({ fields: fieldList });
+        });
+
         it('still rejects genuinely unknown arguments', () => {
           const result = validateAndRepairToolArgs({
             toolName: 'playwright_browser_fill_form',

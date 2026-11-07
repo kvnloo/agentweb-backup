@@ -1173,6 +1173,34 @@ export function validateAndRepairToolArgs(
     }
   }
 
+  // ENG-2858: Playwright MCP rejects fill_form fields without a string `name`
+  // (zod invalid_type at fields[i].name). Models describe the field under the
+  // browser_click-style `element` key (or label/description) instead. Fill the
+  // missing name from those, falling back to `ref`; never overwrite a name.
+  // Runs after wrapper hoisting and JSON-string parsing so `fields` sent as a
+  // JSON string or nested in a wrapper object is repaired too.
+  if (input.toolName === 'playwright_browser_fill_form' && Array.isArray(repairedArgs.fields)) {
+    let filled = false;
+    const fields = (repairedArgs.fields as unknown[]).map((field) => {
+      if (!field || typeof field !== 'object' || Array.isArray(field)) return field;
+      const f = field as Record<string, unknown>;
+      if (typeof f.name === 'string' && f.name.trim()) return field;
+      const aliasKey = ['element', 'label', 'description', 'field'].find(
+        (k) => typeof f[k] === 'string' && (f[k] as string).trim(),
+      );
+      const name = aliasKey ? (f[aliasKey] as string) : typeof f.ref === 'string' && f.ref.trim() ? f.ref : undefined;
+      if (!name) return field;
+      const next: Record<string, unknown> = { ...f, name };
+      if (aliasKey) delete next[aliasKey];
+      filled = true;
+      return next;
+    });
+    if (filled) {
+      repairedArgs.fields = fields;
+      repairs.push('fill_form:field.name');
+    }
+  }
+
   for (const [name, propSchema] of Object.entries(properties)) {
     if (repairedArgs[name] === undefined || repairedArgs[name] === null) continue;
     const typeIssue = validateJsonSchemaType(name, repairedArgs[name], propSchema);
