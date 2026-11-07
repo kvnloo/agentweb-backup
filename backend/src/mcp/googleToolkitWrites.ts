@@ -360,11 +360,19 @@ export async function executeGoogleToolkitWrite(
     // Enabling a campaign starts spend at its budget, so the preview names that budget and
     // the ceiling applies to it — otherwise a budget set above the ceiling outside Zoma
     // (or before the ceiling existed) could be switched on here (Hardening, ENG-2823).
-    const budgetName = (prior as GoogleCampaignState).budget;
-    if (kind === 'campaign' && validated.expectedStatus === 'ENABLED' && isCustomerResource(cid, 'budget', budgetName)) {
+    let campaign = kind === 'campaign' ? prior as GoogleCampaignState : null;
+    if (kind === 'ad_group' && validated.expectedStatus === 'ENABLED') {
+      const campaignName = (prior as GoogleAdGroupState).campaign;
+      if (isCustomerResource(cid, 'campaign', campaignName)) {
+        campaign = await deps.read(userId, cid, 'campaign', campaignName);
+        state = { ...state, campaign };
+      }
+    }
+    const budgetName = campaign?.budget;
+    if (validated.expectedStatus === 'ENABLED' && isCustomerResource(cid, 'budget', budgetName)) {
       const budget: GoogleBudgetState | null = await deps.read(userId, cid, 'budget', budgetName);
       if (budget) {
-        state = { prior, budget };
+        state = { ...state, budget };
         enableBudgetMicros = budget.amountMicros;
         lines.push(`Budget "${budget.name ?? budget.resourceName}": ${money(budget.amountMicros)}.`);
         const note = sharedNote(budget);
@@ -384,11 +392,11 @@ export async function executeGoogleToolkitWrite(
     const verdict = evaluateMetaSpendCeiling(policy, { field: 'daily_budget', proposed: validated.budgetMicros, prior });
     if (!verdict.allowed) throw new MetaToolkitRefusal(verdict.message.replace('(minor units)', '(micros)'));
   }
-  if (policy && op === 'CAMPAIGN UPDATE' && validated.expectedStatus === 'ENABLED') {
+  if (policy && (op === 'CAMPAIGN UPDATE' || op === 'AD_GROUP UPDATE') && validated.expectedStatus === 'ENABLED') {
     // Fail closed: a ceiling that cannot see the campaign's budget never allows enabling it.
     const verdict = evaluateMetaSpendCeiling(policy, { field: 'daily_budget', proposed: enableBudgetMicros });
     if (!verdict.allowed) {
-      throw new MetaToolkitRefusal(`Enabling this campaign would start spend at its budget. ${verdict.message.replace('(minor units)', '(micros)')}`);
+      throw new MetaToolkitRefusal(`Enabling this ${entity === 'AD_GROUP' ? 'ad group' : 'campaign'} would start spend at its budget. ${verdict.message.replace('(minor units)', '(micros)')}`);
     }
   }
 

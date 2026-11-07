@@ -34,7 +34,7 @@ export async function readBackMetaNode(
   if (entityType === 'CAMPAIGN') {
     node = (await reader.listCampaigns(accountId, accessToken, { campaignId: id, fields: READ_BACK_FIELDS })).campaigns?.[0];
   } else if (entityType === 'AD_SET') {
-    node = (await reader.listAdSets(accountId, accessToken, undefined, { adSetId: id, fields: READ_BACK_FIELDS })).adSets?.[0];
+    node = (await reader.listAdSets(accountId, accessToken, undefined, { adSetId: id, fields: [...READ_BACK_FIELDS, 'campaign_id'] })).adSets?.[0];
   } else if (entityType === 'AD') {
     node = await reader.getAd(accessToken, id, accountId);
   } else {
@@ -47,5 +47,6 @@ export async function readBackMetaNode(
     effective_status: node.effective_status,
     daily_budget: node.daily_budget,
     lifetime_budget: node.lifetime_budget,
+    ...(entityType === 'AD_SET' ? { campaign_id: node.campaign_id } : {}),
   };
 }
