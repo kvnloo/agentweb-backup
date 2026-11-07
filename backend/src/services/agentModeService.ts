@@ -39,6 +39,7 @@ import { shouldForceScheduledAutocomplete } from './agentMode/core/scheduledAuto
 import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/memoryRanking';
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
+import { buildIterationLimitReport } from './agentMode/core/iterationLimitReport';
 import { resolveMetaActivationCampaignId } from './agentMode/metaCampaignResolution';
 import {
   buildImageSwapNotReflected, judgeImageSwap, readCreativeImage, selectSwapImageHash,
@@ -5610,6 +5611,10 @@ export class AgentModeService {
           // delivery of a reply the user is waiting on over this note.
           console.warn('AgentMode: model-reassess acknowledgement failed', modelReassessError);
         }
+      }
+
+      if (truncatedByStepBudget && !wasCancelled) {
+        content = buildIterationLimitReport(content, toolCalls);
       }
 
       // Opslane 2026-10-13: persist exactly what is returned. The step-cap,
