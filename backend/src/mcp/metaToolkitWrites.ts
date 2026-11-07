@@ -197,6 +197,20 @@ export async function executeMetaToolkitWrite(userId: string, rawArgs: any, deps
   }
 
   const policy = deps.spendCeilingPolicy();
+  let enableBudgetState: Record<string, any> | undefined;
+  if (entity === 'AD_SET' && action === 'UPDATE' && params.status === 'ACTIVE' && policy) {
+    const adSet = await deps.readBack(userId, accountId, entity, targetId(entity, args)!).catch(() => null);
+    // Campaign-budgeted ad sets have no positive daily budget of their own. Resolve
+    // their parent from provider state, never from a caller-supplied campaign_id.
+    const budget = adSet?.daily_budget != null && Number(adSet.daily_budget) !== 0
+      ? adSet
+      : adSet?.campaign_id
+        ? await deps.readBack(userId, accountId, 'CAMPAIGN', String(adSet.campaign_id)).catch(() => null)
+        : null;
+    enableBudgetState = { adSet, budget };
+    const verdict = evaluateMetaSpendCeiling(policy, { field: 'daily_budget', proposed: budget?.daily_budget });
+    if (!verdict.allowed) throw new MetaToolkitRefusal(`Enabling this ad set would start spend at its budget. ${verdict.message}`);
+  }
   if (policy) {
     const id = targetId(entity, args);
     const prior = action === 'UPDATE' && id ? await deps.readBack(userId, accountId, entity, id).catch(() => null) : null;
@@ -220,6 +234,7 @@ export async function executeMetaToolkitWrite(userId: string, rawArgs: any, deps
     userId, entity, action, accountId,
     campaign_id: args.campaign_id, ad_set_id: args.ad_set_id, ad_id: args.ad_id, params,
     summary: preview.summary, budgetAnomaly: preview.budgetAnomaly ?? null, money: money.confirmation,
+    ...(enableBudgetState ? { enableBudgetState } : {}),
   });
   const now = deps.now();
   const secret = deps.secret();
