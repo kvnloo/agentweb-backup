@@ -2043,6 +2043,21 @@
     }
   },
   {
+    "name": "list_sender_settings",
+    "listed": false,
+    "description": "List your own CRM sender settings: configured email senders (with today's send usage and effective daily cap), the default email sender, the default LinkedIn sender account, and connected mailboxes that can be used as senders. Read-only; use before drafting or activating sequences.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    },
+    "sideEffect": "read",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
     "name": "list_skills",
     "listed": false,
     "description": "List all skill definitions. Returns each skill's ID, name, description, toolNames, systemPrompt, isPublished status, and extended fields. Admin-only.",
