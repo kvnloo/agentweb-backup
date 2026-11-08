@@ -2979,6 +2979,14 @@ View Session: ${sessionUrl}`;
         }
       }
 
+      // The tracked issue is the canonical record. Founders asked (2026-11-07) to stop the
+      // redundant "Oncall Alert" emails (e.g. "Meta connection: … token expired"): they were
+      // noise, not actionable. Email only when filing failed, so nothing is silently lost.
+      if (resolvedTrackerUrl) {
+        console.log(`Oncall alert tracked, email skipped: ${resolvedTrackerUrl}`);
+        return;
+      }
+
       let html: string;
       let text: string;
 
