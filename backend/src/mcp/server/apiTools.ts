@@ -2411,14 +2411,15 @@ mcpToolRegistry.register({
     inputSchema: {
       type: 'object',
       properties: {
-        page_id: { type: 'string', description: 'The landing page ID' }
+        page_id: { type: 'string', description: 'The landing page ID' },
+        branch: { type: 'string', description: 'Branch to read from (e.g. "draft/agentweb-preview" to read back staged edits). Omit for "main". Never selects a different repo.' }
       },
       required: ['page_id']
     }
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'GET', path: `/api/landing-pages/v0/generated/${args.page_id}/files`, context: ctx(context)
+      method: 'GET', path: `/api/landing-pages/v0/generated/${args.page_id}/files${args.branch ? `?branch=${encodeURIComponent(args.branch)}` : ''}`, context: ctx(context)
     });
     return jsonResult(data);
   }
@@ -2433,14 +2434,15 @@ mcpToolRegistry.register({
       type: 'object',
       properties: {
         page_id: { type: 'string', description: 'The landing page ID' },
-        file_path: { type: 'string', description: 'Path to the file in the repo (e.g., "src/app/page.tsx")' }
+        file_path: { type: 'string', description: 'Path to the file in the repo (e.g., "src/app/page.tsx")' },
+        branch: { type: 'string', description: 'Branch to read from (e.g. "draft/agentweb-preview" to read back staged edits). Omit for "main". Never selects a different repo.' }
       },
       required: ['page_id', 'file_path']
     }
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'GET', path: `/api/landing-pages/v0/generated/${args.page_id}/file-content?path=${encodeURIComponent(args.file_path)}`, context: ctx(context)
+      method: 'GET', path: `/api/landing-pages/v0/generated/${args.page_id}/file-content?path=${encodeURIComponent(args.file_path)}${args.branch ? `&branch=${encodeURIComponent(args.branch)}` : ''}`, context: ctx(context)
     });
     return jsonResult(data);
   }

@@ -146,6 +146,31 @@ describe('apiTools', () => {
 
   // ─── SUCCESS tests ────────────────────────────────────────────────────
 
+  describe('landing page file tools branch (ENG-2864)', () => {
+    beforeEach(() => mockMcpFetch.mockResolvedValue({ ok: true }));
+    const path = () => (mockMcpFetch.mock.calls[0][0] as any).path as string;
+
+    it('list_landing_page_files forwards branch when given', async () => {
+      await mcpToolRegistry.execute('list_landing_page_files', { page_id: 'p1', branch: 'draft/agentweb-preview' }, context);
+      expect(path()).toBe('/api/landing-pages/v0/generated/p1/files?branch=draft%2Fagentweb-preview');
+    });
+
+    it('list_landing_page_files omits branch when absent', async () => {
+      await mcpToolRegistry.execute('list_landing_page_files', { page_id: 'p1' }, context);
+      expect(path()).toBe('/api/landing-pages/v0/generated/p1/files');
+    });
+
+    it('read_landing_page_file forwards branch when given', async () => {
+      await mcpToolRegistry.execute('read_landing_page_file', { page_id: 'p1', file_path: 'src/app/page.tsx', branch: 'draft/agentweb-preview' }, context);
+      expect(path()).toBe('/api/landing-pages/v0/generated/p1/file-content?path=src%2Fapp%2Fpage.tsx&branch=draft%2Fagentweb-preview');
+    });
+
+    it('read_landing_page_file omits branch when absent', async () => {
+      await mcpToolRegistry.execute('read_landing_page_file', { page_id: 'p1', file_path: 'src/app/page.tsx' }, context);
+      expect(path()).toBe('/api/landing-pages/v0/generated/p1/file-content?path=src%2Fapp%2Fpage.tsx');
+    });
+  });
+
   describe('list_tasks', () => {
     it('should call GET /api/tasks', async () => {
       mockMcpFetch.mockResolvedValue([{ taskId: 't1', name: 'Test' }]);
