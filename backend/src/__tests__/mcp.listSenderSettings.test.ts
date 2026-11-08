@@ -44,6 +44,15 @@ describe('ENG-2868 list_sender_settings', () => {
     expect(out.senders[0]).toMatchObject({ id: 's1', email: 'a@acme.com', effective_daily_limit: 20, sent_today: 3 });
   });
 
+  it('reports unknown usage as null, not zero (uncapped or failed usage read)', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ...routePayload,
+      senders: [{ ...routePayload.senders[0], effectiveDailyLimit: null, sentToday: 0, sentTodayKnown: false }],
+    } as any);
+    const out = parse(await mcpToolRegistry.execute('list_sender_settings', {}, { userId: 'u-1', agentUserId: 'u-1' }));
+    expect(out.senders[0].sent_today).toBeNull();
+  });
+
   it('ignores account-selecting args (no cross-account access)', async () => {
     mockFetch.mockResolvedValueOnce(routePayload as any);
     await mcpToolRegistry.execute('list_sender_settings', { client_id: 'victim', user_id: 'victim', userId: 'victim' }, { userId: 'u-1', agentUserId: 'u-1' });

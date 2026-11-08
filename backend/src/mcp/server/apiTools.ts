@@ -2036,7 +2036,8 @@ mcpToolRegistry.register({
         connected_account_id: s?.connectedAccountId ?? null,
         daily_limit: s?.dailyLimit ?? null,
         effective_daily_limit: s?.effectiveDailyLimit ?? null,
-        sent_today: s?.sentToday ?? 0,
+        // null = unknown (uncapped sender, or the usage read failed) — never a fake zero.
+        sent_today: s?.sentTodayKnown === false || typeof s?.sentToday !== 'number' ? null : s.sentToday,
         warmup_started_at: s?.warmupStartedAt ?? null,
       })),
       default_sender_id: data?.defaultSenderId ?? null,

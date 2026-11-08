@@ -5847,6 +5847,9 @@ router.get('/sender-emails', async (req: Request, res: Response) => {
         connectedAccountId: s.connectedAccountId,
         effectiveDailyLimit: limit,
         sentToday: usage?.sentCount ?? 0,
+        // ENG-2868: false when usage is untracked (uncapped) or the read failed, so
+        // callers can tell "unknown" from a real zero without changing sentToday's type.
+        sentTodayKnown: usage != null,
       };
     }));
 
