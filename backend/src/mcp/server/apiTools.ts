@@ -1135,6 +1135,59 @@ mcpToolRegistry.register({
   }
 });
 
+// ─── CRM lead-list CSV export, own account only (ENG-2867) ──────────────────
+//
+// Thin wrappers over POST /api/crm/lists/:listId/leads/export and
+// GET /api/crm/lists/:listId/export-history. The route owns everything that
+// matters: list ownership/sharing checks (canDestructiveCrmList /
+// canAccessCrmList), Enigma card-revenue stripping, export-history record.
+// The tool deliberately takes no client_id/user override — identity is always
+// the calling key's runtime identity via ctx(context).
+
+function requireListId(raw: unknown): string | null {
+  const id = typeof raw === 'string' ? raw.trim() : '';
+  return id ? encodeURIComponent(id) : null;
+}
+
+mcpToolRegistry.register({
+  name: 'export_lead_list',
+  definition: {
+    name: 'export_lead_list',
+    description: 'Export every lead in one of your own CRM lead lists to a CSV file. Returns the export record (exportId, recordCount, filename, fileUrl). Requires editor access to the list; works only on lists your account can edit.',
+    inputSchema: {
+      type: 'object',
+      properties: { list_id: { type: 'string', description: 'Lead list ID to export' } },
+      required: ['list_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const listId = requireListId(args?.list_id);
+    if (!listId) return jsonResult({ error: 'list_id is required' });
+    const data = await mcpFetch({ method: 'POST', path: `/api/crm/lists/${listId}/leads/export`, context: ctx(context) });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'list_lead_list_exports',
+  readOnly: true,
+  definition: {
+    name: 'list_lead_list_exports',
+    description: 'List past CSV exports (newest first, up to 50) for one of your own CRM lead lists.',
+    inputSchema: {
+      type: 'object',
+      properties: { list_id: { type: 'string', description: 'Lead list ID' } },
+      required: ['list_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const listId = requireListId(args?.list_id);
+    if (!listId) return jsonResult({ error: 'list_id is required' });
+    const data = await mcpFetch({ method: 'GET', path: `/api/crm/lists/${listId}/export-history`, context: ctx(context) });
+    return jsonResult(data);
+  }
+});
+
 // ─── CRM drip / nurture sequences, read-only (ENG-962) ──────────────────────
 //
 // `get_leads_by_crm_criteria` scopes WHO a campaign targets; this tool inspects
