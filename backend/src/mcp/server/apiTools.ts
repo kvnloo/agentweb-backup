@@ -2059,6 +2059,52 @@ mcpToolRegistry.register({
   }
 });
 
+// ─── Sender Settings (ENG-2868) ─────────────────────────────────────────────
+
+/**
+ * ENG-2868 (ENG-2847.4 read half): read-only view of the caller's own CRM
+ * sender settings. Identity comes only from the runtime context — the tool
+ * accepts no arguments, so no account can be selected via args. The response
+ * is an explicit allow-list projection of GET /api/crm/sender-emails so a
+ * future field added to that route can never leak through here.
+ */
+mcpToolRegistry.register({
+  name: 'list_sender_settings',
+  readOnly: true,
+  definition: {
+    name: 'list_sender_settings',
+    description: "List your own CRM sender settings: configured email senders (with today's send usage and effective daily cap), the default email sender, the default LinkedIn sender account, and connected mailboxes that can be used as senders. Read-only; use before drafting or activating sequences.",
+    inputSchema: { type: 'object', properties: {}, required: [] }
+  },
+  execute: async (_args: any, context: any) => {
+    const data = await mcpFetch({ method: 'GET', path: '/api/crm/sender-emails', context: ctx(context) });
+    const senders = Array.isArray(data?.senders) ? data.senders : [];
+    const mailboxes = Array.isArray(data?.connectedEmailAccounts) ? data.connectedEmailAccounts : [];
+    return jsonResult({
+      senders: senders.map((s: any) => ({
+        id: s?.id ?? null,
+        email: s?.email ?? null,
+        from_name: s?.fromName ?? null,
+        sender_provider: s?.senderProvider ?? null,
+        connected_account_id: s?.connectedAccountId ?? null,
+        daily_limit: s?.dailyLimit ?? null,
+        effective_daily_limit: s?.effectiveDailyLimit ?? null,
+        // null = unknown (uncapped sender, or the usage read failed) — never a fake zero.
+        sent_today: s?.sentTodayKnown === false || typeof s?.sentToday !== 'number' ? null : s.sentToday,
+        warmup_started_at: s?.warmupStartedAt ?? null,
+      })),
+      default_sender_id: data?.defaultSenderId ?? null,
+      default_linkedin_account_id: data?.defaultLinkedInAccountId ?? null,
+      connected_email_accounts: mailboxes.map((a: any) => ({
+        account_id: a?.account_id ?? null,
+        account_name: a?.account_name ?? null,
+        email: a?.email ?? null,
+        platform: a?.platform ?? null,
+      })),
+    });
+  }
+});
+
 // ─── Connected Accounts ─────────────────────────────────────────────────────
 
 mcpToolRegistry.register({
