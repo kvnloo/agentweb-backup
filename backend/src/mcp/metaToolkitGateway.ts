@@ -21,6 +21,7 @@ import {
 import { recordMcpToolUse, recordMcpWriteExecuted, type McpAuthMethod } from '../services/mcpUsageEventsService';
 import { executeMetaToolkitCall, getMetaToolkitManifest, MetaToolkitRefusal } from './metaToolkitManifest';
 import { RateLimiter } from '../middleware/rateLimiter';
+import { effectiveApiKeyScopes, findScopeDenial } from './server/apiKeyScopes';
 import { isZomaTool } from './zomaToolDefinitions';
 import { executeMetaToolkitWrite, isGuardedWriteRequest } from './metaToolkitWrites';
 import { runZomaTool, ZomaNotReadyError } from './zomaOnboarding';
@@ -47,13 +48,15 @@ export interface MetaToolkitCaller {
   userId: string;
   authMethod: McpAuthMethod;
   apiKeyId?: string;
+  /** ENG-2865: effective scopes of the aw_ key (api_key callers only). */
+  apiKeyScopes?: string[];
   clientId?: string;
   /** ENG-2496 device-flow Zoma token id (never the token). */
   zomaTokenId?: string;
 }
 
 export interface MetaToolkitGatewayDeps {
-  validateApiKey: (raw: string) => Promise<{ userId: string; keyId: string; expiresAt?: string; rateLimitPerMin?: number } | null>;
+  validateApiKey: (raw: string) => Promise<{ userId: string; keyId: string; expiresAt?: string; rateLimitPerMin?: number; scopes?: string[] } | null>;
   validateOAuthToken: (raw: string) => Promise<{ userId: string; clientId: string } | null>;
   /** ENG-2496 per-user Zoma token from device-flow onboarding; defaults to validateZomaToken. */
   validateZomaToken?: (raw: string) => Promise<{ userId: string; tokenId: string } | null>;
@@ -116,7 +119,7 @@ export async function authenticateMetaToolkitCaller(
       throw new MetaToolkitAuthError('API key has expired.', 401);
     }
     enforceCredentialLimit(deps, `key:${key.keyId}`, key.rateLimitPerMin ?? META_TOOLKIT_OAUTH_MAX_PER_MINUTE);
-    return { userId: key.userId, authMethod: 'api_key', apiKeyId: key.keyId };
+    return { userId: key.userId, authMethod: 'api_key', apiKeyId: key.keyId, apiKeyScopes: effectiveApiKeyScopes(key.scopes) };
   }
 
   if (token.startsWith(ZOMA_TOKEN_PREFIX)) {
@@ -130,6 +133,27 @@ export async function authenticateMetaToolkitCaller(
   if (!oauth?.userId) throw new MetaToolkitAuthError('Invalid access token.', 401);
   enforceCredentialLimit(deps, `oauth:${oauth.userId}`, META_TOOLKIT_OAUTH_MAX_PER_MINUTE);
   return { userId: oauth.userId, authMethod: 'oauth', clientId: oauth.clientId };
+}
+
+/**
+ * ENG-2865: aw_ keys carry the same tools:read / tools:execute boundary here as on the main
+ * MCP server (ENG-1083), via the same scope helper. A write-classified call needs
+ * tools:execute; a read needs tools:read. Checked before any upstream platform call.
+ * OAuth and Zoma-token callers are unchanged.
+ */
+export function assertMetaToolkitScope(caller: MetaToolkitCaller, toolName: string, write: boolean): void {
+  if (caller.authMethod !== 'api_key') return;
+  const denial = findScopeDenial(
+    { method: 'tools/call', params: { name: toolName } },
+    caller.apiKeyScopes ?? effectiveApiKeyScopes(undefined),
+    () => ({ readOnly: !write }),
+  );
+  if (denial) {
+    throw new MetaToolkitAuthError(
+      `This API key lacks the ${denial.requiredScope} scope required for ${write ? 'write' : 'read'} call ${toolName}.`,
+      403,
+    );
+  }
 }
 
 /**
@@ -196,6 +220,7 @@ export async function handleMetaToolkitCall(
 
   // Creative upload staging needs no Meta account (it only mints an S3 PUT for the caller's own prefix).
   if (request.toolName === 'zoma_prepare_upload') {
+    assertMetaToolkitScope(caller, request.toolName, true);
     const result = await (deps.prepareUpload ?? prepareZomaUpload)(caller.userId, request.args ?? {});
     await meter();
     return result;
@@ -203,6 +228,7 @@ export async function handleMetaToolkitCall(
 
   // ENG-2303: onboarding tools must work before Meta is connected, so they skip account resolution.
   if (isZomaTool(request.toolName)) {
+    assertMetaToolkitScope(caller, request.toolName, false);
     let result;
     try {
       result = await (deps.runZomaTool ?? runZomaTool)(request.toolName, request.args ?? {}, { userId: caller.userId });
@@ -219,6 +245,7 @@ export async function handleMetaToolkitCall(
   if (googleToolkitEnabled()) {
     const google = await import('./googleToolkitGateway');
     if (google.isGoogleToolkitTool(request.toolName)) {
+      assertMetaToolkitScope(caller, request.toolName, google.isGoogleGuardedWrite(request.toolName, request.args ?? {}));
       return stripCredentials(await google.handleGoogleToolkitCall(caller, request, {
         listAccounts: deps.listAccounts,
         now: deps.now,
@@ -230,6 +257,11 @@ export async function handleMetaToolkitCall(
   }
 
   const args = { ...(request.args ?? {}) };
+  assertMetaToolkitScope(
+    caller,
+    request.toolName,
+    isCreativeAssetRequest(request.toolName, args) || isGuardedWriteRequest(request.toolName, args),
+  );
   const accountId = await resolveMetaToolkitAdAccount(caller.userId, args.account_id, deps);
   if (toolAcceptsAccountId(request.toolName)) args.account_id = accountId;
 
