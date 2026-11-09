@@ -2636,7 +2636,8 @@ async function workspaceCallerFor(userId: string): Promise<WorkspaceCaller> {
   try {
     const user = await userDb.getUserById(userId);
     return { userId, orgId: user?.orgId || undefined };
-  } catch {
+  } catch (err) {
+    console.error('[ENG-2874] getUserById failed; falling back to own assets:', err);
     return { userId };
   }
 }

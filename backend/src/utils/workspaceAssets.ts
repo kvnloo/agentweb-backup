@@ -114,6 +114,27 @@ export function mergeWorkspaceAssets(
   return merged;
 }
 
+/** Max teammate asset fetches in flight per request (bounds DynamoDB burst). */
+export const MEMBER_FETCH_CONCURRENCY = 5;
+
+/** Order-preserving map with at most `limit` promises in flight. */
+export async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const out: R[] = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i]);
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
 /** Fetch and merge assets for every workspace member of the caller. */
 export async function getWorkspaceAssets(
   caller: WorkspaceCaller,
@@ -122,8 +143,10 @@ export async function getWorkspaceAssets(
   },
 ): Promise<Record<string, any>> {
   const members = await resolveWorkspaceMembers(caller, deps);
-  const perMember = await Promise.all(
-    members.map(async (member) => {
+  const perMember = await mapWithConcurrency(
+    members,
+    MEMBER_FETCH_CONCURRENCY,
+    async (member) => {
       if (member.userId === caller.userId) {
         // The caller's own fetch must not be swallowed: preserve existing error behaviour.
         return { member, result: await deps.fetchForUser(member.userId) };
@@ -134,7 +157,7 @@ export async function getWorkspaceAssets(
         console.error(`[ENG-2874] asset fetch failed for member ${member.userId}:`, err);
         return { member, result: {} };
       }
-    }),
+    },
   );
   return mergeWorkspaceAssets(perMember, caller.userId);
 }
@@ -145,7 +168,12 @@ export async function getWorkspaceApprovalStatusByUrl(
   getApprovalsByUserId: (userId: string) => Promise<Array<{ assetUrl: string; status?: string }>>,
 ): Promise<Record<string, string | undefined>> {
   const lists = await Promise.all(
-    members.map((m) => getApprovalsByUserId(m.userId).catch(() => [])),
+    members.map((m) =>
+      getApprovalsByUserId(m.userId).catch((err) => {
+        console.error(`[ENG-2874] approval lookup failed for member ${m.userId}:`, err);
+        return [];
+      }),
+    ),
   );
   const out: Record<string, string | undefined> = {};
   for (const list of lists) {
