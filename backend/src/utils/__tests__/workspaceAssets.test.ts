@@ -87,6 +87,25 @@ describe('ENG-2874 workspace creative sharing', () => {
     expect(out.k.v).toBe(1);
   });
 
+  it('favorites view only reflects the caller\'s own favorites (Opslane P1 regression)', async () => {
+    const favAssets: Record<string, Record<string, any>> = {
+      alice: { t1: { executions: [{ executionId: 'e1', result_files: [{ url: 'u/a.png', is_favorited: true }] }] } },
+      bob: { t2: { executions: [{ executionId: 'e2', result_files: [{ url: 'u/b.png', is_favorited: true }] }] } },
+    };
+    const out = await getWorkspaceAssets({ userId: 'alice', orgId: ORG_A }, {
+      getOrgMembers: async () => membersA,
+      fetchForUser: async (id) => favAssets[id] || {},
+    });
+    const own = out.t1.executions[0].result_files[0];
+    const mate = out.t2.executions[0].result_files[0];
+    expect(own.is_favorited).toBe(true);
+    expect(own.canModify).toBe(true);
+    expect(mate.is_favorited).toBe(false);
+    expect(mate.canModify).toBe(false);
+    expect(out.t2.canModify).toBe(false);
+    expect(mate.createdBy.userId).toBe('bob');
+  });
+
   it('approval statuses merge across members', async () => {
     const map = await getWorkspaceApprovalStatusByUrl(membersA, async (id) =>
       id === 'alice' ? [{ assetUrl: 'u/alice.png', status: 'approved' }] : [{ assetUrl: 'u/bob.png', status: 'draft' }]);

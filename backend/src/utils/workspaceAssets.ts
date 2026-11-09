@@ -74,21 +74,36 @@ export function creatorFor(member: WorkspaceMember): CreatorAttribution {
  * Merge per-member asset records (Record<taskId|sessionId, entry>) into one,
  * stamping `createdBy` on each entry and each of its files. On a key
  * collision the earlier member (the caller comes first) wins.
+ *
+ * Favorite/archive/report-type state is stored on the owner's record and the
+ * mutation routes are owner-only. So a teammate's entry is surfaced with
+ * `canModify: false` and `is_favorited: false` on every file: the caller's
+ * Favorites view only ever reflects the caller's own favorites, and a
+ * teammate toggling their favorite cannot change the caller's list.
  */
 export function mergeWorkspaceAssets(
   perMember: Array<{ member: WorkspaceMember; result: Record<string, any> }>,
+  callerUserId?: string,
 ): Record<string, any> {
   const merged: Record<string, any> = {};
+  const ownerId = callerUserId ?? perMember[0]?.member.userId;
   for (const { member, result } of perMember) {
     const createdBy = creatorFor(member);
+    const isOwn = member.userId === ownerId;
+    const stampFile = (f: any) =>
+      f && typeof f === 'object'
+        ? isOwn
+          ? { ...f, createdBy, canModify: true }
+          : { ...f, createdBy, canModify: false, is_favorited: false }
+        : f;
     for (const [key, entry] of Object.entries(result || {})) {
       if (key in merged || !entry || typeof entry !== 'object') continue;
-      const stamped: any = { ...entry, createdBy };
+      const stamped: any = { ...entry, createdBy, canModify: isOwn };
       if (Array.isArray(entry.executions)) {
         stamped.executions = entry.executions.map((ex: any) => ({
           ...ex,
           result_files: Array.isArray(ex?.result_files)
-            ? ex.result_files.map((f: any) => ({ ...f, createdBy }))
+            ? ex.result_files.map(stampFile)
             : ex?.result_files,
         }));
       }
@@ -120,7 +135,7 @@ export async function getWorkspaceAssets(
       }
     }),
   );
-  return mergeWorkspaceAssets(perMember);
+  return mergeWorkspaceAssets(perMember, caller.userId);
 }
 
 /** Merge approval status maps across members (caller first wins). */
