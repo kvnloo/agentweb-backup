@@ -32,4 +32,15 @@ describe('mergeFounders (ENG-2875)', () => {
     expect(mergeFounders(existing, [])).toEqual([]);
     expect(mergeFounders(undefined, [{ name: 'A' }, { name: 'a' }, { jobTitle: 'x' }])).toEqual([{ name: 'A' }]);
   });
+
+  it('additive mode (onboarding brand build) never removes stored founders', () => {
+    expect(
+      mergeFounders(existing, [{ name: 'yuan li', voiceExamples: 'post B' }, { name: 'Sam Ortiz' }], { additive: true }),
+    ).toEqual([
+      { name: 'yuan li', jobTitle: 'CEO', voiceExamples: 'post B' },
+      { name: 'Naveed Ahmed', jobTitle: 'CTO' },
+      { name: 'Sam Ortiz' },
+    ]);
+    expect(mergeFounders(existing, [], { additive: true })).toEqual(existing);
+  });
 });

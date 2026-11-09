@@ -616,8 +616,16 @@ async function guardBrandBuildSession(
  * removed, order follows the incoming list); each incoming founder is
  * shallow-merged onto the existing founder with the same normalized name so a
  * partial update (e.g. only voiceExamples) keeps the untouched fields.
+ *
+ * With `additive: true` (the automated onboarding brand build, which only sees
+ * what a site scrape found) no stored founder is removed: matches are merged,
+ * new founders appended, and founders the incoming list omits are kept.
  */
-export function mergeFounders(existing: unknown, incoming: unknown): any[] {
+export function mergeFounders(
+  existing: unknown,
+  incoming: unknown,
+  opts: { additive?: boolean } = {},
+): any[] {
   const normalize = (name: any) => (typeof name === 'string' ? name.trim().toLowerCase() : '');
   const existingFounders: any[] = Array.isArray(existing) ? existing : [];
   const incomingFounders: any[] = Array.isArray(incoming) ? incoming : [];
@@ -637,7 +645,17 @@ export function mergeFounders(existing: unknown, incoming: unknown): any[] {
     const match = existingByName.get(key);
     merged.push(match ? { ...match, ...founder } : founder);
   }
-  return merged;
+  if (!opts.additive) return merged;
+  // Additive: stored order kept, matched founders updated in place, omitted
+  // founders kept, new founders appended.
+  const mergedByName = new Map(merged.map(m => [normalize(m.name), m] as [string, any]));
+  const out = existingFounders.map(f => {
+    const k = f ? normalize(f.name) : '';
+    const m = k ? mergedByName.get(k) : undefined;
+    if (m) mergedByName.delete(k);
+    return m ?? f;
+  });
+  return [...out, ...merged.filter(m => !existingByName.has(normalize(m.name)))];
 }
 
 export async function updateBrandGuidelines(
@@ -738,10 +756,13 @@ export async function updateBrandGuidelines(
 
       // ENG-2875: a provided founders array is authoritative for membership;
       // fields are merged onto matching existing founders by normalized name.
+      // The current onboarding brand-build session (sessionClaim set) is a
+      // site scrape, not a user edit, so it never removes stored founders.
       if (brandData && Array.isArray((brandData as any).founders)) {
         updatedBrandData.founders = mergeFounders(
           (existingBrand.brandData as any)?.founders,
           (brandData as any).founders,
+          { additive: Boolean(sessionClaim) },
         );
       }
 
