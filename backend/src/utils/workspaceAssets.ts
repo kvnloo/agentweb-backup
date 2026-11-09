@@ -12,6 +12,7 @@ export interface WorkspaceMember {
   userId: string;
   orgId?: string;
   name?: string;
+  displayName?: string;
   email?: string;
 }
 
@@ -66,7 +67,7 @@ export async function resolveWorkspaceMembers(
 }
 
 export function creatorFor(member: WorkspaceMember): CreatorAttribution {
-  const name = (member.name && member.name.trim()) || (member.email && member.email.trim()) || null;
+  const name = (member.displayName && member.displayName.trim()) || (member.name && member.name.trim()) || (member.email && member.email.trim()) || null;
   return { userId: member.userId, name };
 }
 

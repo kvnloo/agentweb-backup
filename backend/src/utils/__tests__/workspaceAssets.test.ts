@@ -106,6 +106,13 @@ describe('ENG-2874 workspace creative sharing', () => {
     expect(mate.createdBy.userId).toBe('bob');
   });
 
+  it('credits a teammate by displayName before email (Opslane P2 regression)', () => {
+    const out = mergeWorkspaceAssets([
+      { member: { userId: 'bob', displayName: 'Bob B', email: 'bob@a.test' }, result: { k: { v: 1 } } },
+    ], 'alice');
+    expect(out.k.createdBy).toEqual({ userId: 'bob', name: 'Bob B' });
+  });
+
   it('approval statuses merge across members', async () => {
     const map = await getWorkspaceApprovalStatusByUrl(membersA, async (id) =>
       id === 'alice' ? [{ assetUrl: 'u/alice.png', status: 'approved' }] : [{ assetUrl: 'u/bob.png', status: 'draft' }]);
