@@ -2071,8 +2071,14 @@ router.put("/:taskId/lead-list", authenticateToken, async (req: AuthRequest, res
 export async function getExecutionsWithAssets(
   userId: string,
   assetType: 'images' | 'videos' | 'html-reports',
-  errorMessage: string
+  errorMessage: string,
+  // ENG-2874: the html-reports read lazily backfills searchableText/reportType and
+  // writes it back to the owner's records (and bills the classifier call). Only the
+  // owner's own read may do that; teammate reads in the shared workspace must be
+  // read-only so they never rewrite another member's result_files or incur their LLM cost.
+  options: { backfill?: boolean } = {},
 ): Promise<Record<string, any>> {
+  const backfill = options.backfill !== false;
   // Get all task executions for the user
   const allExecutions = await taskDb.getAllTaskExecutionsByUserId(userId) || [];
 
@@ -2312,7 +2318,7 @@ export async function getExecutionsWithAssets(
   // Enrich HTML report result files with searchable text content (fire-and-forget —
   // the result object is mutated in-place, but we don't block the response on it;
   // cached values are already populated so this only runs for brand-new reports).
-  if (assetType === 'html-reports') {
+  if (assetType === 'html-reports' && backfill) {
     // Run searchableText enrichment first (populates content used by classifier), then classify.
     enrichHtmlReportsWithSearchableText(result, chatbotDbForEnrich)
       .then(() => classifyUnlabeledReports(result, chatbotDbForEnrich, userId))
@@ -2650,7 +2656,8 @@ async function getWorkspaceExecutionsWithAssets(
   const caller = await workspaceCallerFor(userId);
   return getWorkspaceAssets(caller, {
     getOrgMembers: (orgId) => orgDb.getOrgMembers(orgId),
-    fetchForUser: (memberId) => getExecutionsWithAssets(memberId, assetType, errorMessage),
+    fetchForUser: (memberId) =>
+      getExecutionsWithAssets(memberId, assetType, errorMessage, { backfill: memberId === userId }),
   });
 }
 
