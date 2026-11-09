@@ -621,6 +621,12 @@ export function mergeFounders(existing: unknown, incoming: unknown): any[] {
   const normalize = (name: any) => (typeof name === 'string' ? name.trim().toLowerCase() : '');
   const existingFounders: any[] = Array.isArray(existing) ? existing : [];
   const incomingFounders: any[] = Array.isArray(incoming) ? incoming : [];
+  // Index existing founders by normalized name once (first match wins).
+  const existingByName = new Map<string, any>();
+  for (const f of existingFounders) {
+    const k = f ? normalize(f.name) : '';
+    if (k && !existingByName.has(k)) existingByName.set(k, f);
+  }
   const merged: any[] = [];
   const seen = new Set<string>();
   for (const founder of incomingFounders) {
@@ -628,7 +634,7 @@ export function mergeFounders(existing: unknown, incoming: unknown): any[] {
     const key = normalize(founder.name);
     if (!key || seen.has(key)) continue;
     seen.add(key);
-    const match = existingFounders.find(f => f && normalize(f.name) === key);
+    const match = existingByName.get(key);
     merged.push(match ? { ...match, ...founder } : founder);
   }
   return merged;
