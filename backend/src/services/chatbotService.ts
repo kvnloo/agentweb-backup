@@ -5855,7 +5855,7 @@ export async function generateChatResponse(
             'research-reports': ['perform_deep_research', 'you_search_web'],
             'tasks':            ['list_task_templates', 'create_task_from_template', 'create_task_from_prompt'],
             'newsletter':       ['create_social_media_posts', 'list_html_templates', 'create_html_from_template', 'update_html_file', 'get_visual_context'],
-            'seo':              ['get_seo_metrics', 'get_website_analytics', 'get_clarity_metrics'],
+            'seo':              ['get_seo_metrics', 'get_website_analytics', 'get_ga4_key_events', 'get_clarity_metrics'],
             'blog':             ['create_blog_article', 'publish_blog_article', 'list_cms_categories', 'repair_blog_article', 'get_visual_context'],
             'agent-mode?tab=scheduled': ['list_scheduled_chats', 'manage_scheduled_chat', 'test_scheduled_chat', 'get_scheduled_chat_test_history', 'submit_scheduled_chat_variables'],
           };

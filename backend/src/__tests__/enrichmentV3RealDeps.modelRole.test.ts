@@ -12,7 +12,10 @@ jest.mock('../services/modelRoles');
 jest.mock('../utils/llmService', () => ({ createLLMService: jest.fn() }));
 
 const ROLE_MODEL = 'org-enrichment-model';
-const ENV_KEYS = ['CRM_ENRICH_V3_EXTRACT_MODEL', 'CRM_ENRICH_V3_CRITIC_MODEL', 'CRM_ENRICH_V3_WEB_SEARCH_MODEL'] as const;
+const BASE = { requireContent: true };
+const NO_AZURE = { requireContent: true, providerIgnoreForWebSearch: ['Azure'] };
+const LUNA = 'openrouter/openai/gpt-5.6-luna';
+const ENV_KEYS = ['CRM_ENRICH_V3_EXTRACT_MODEL', 'CRM_ENRICH_V3_CRITIC_MODEL', 'CRM_ENRICH_V3_WEB_SEARCH_MODEL', 'CRM_ENRICH_V3_WEB_SEARCH_PARAMS'] as const;
 const savedEnv = Object.fromEntries(ENV_KEYS.map(key => [key, process.env[key]]));
 
 const lead = { leadId: 'l1', email: 'a@acme.com', company: 'Acme' } as LeadRecord;
@@ -85,24 +88,74 @@ afterEach(() => {
   }
 });
 
+describe('CRM_ENRICH_V3_WEB_SEARCH_PARAMS reaches the enrichment LLM calls (ENG-2720)', () => {
+  it('passes the parsed parameters as webSearchParameters on web-tier and identity calls', async () => {
+    const deps = await loadWithEnv({ CRM_ENRICH_V3_WEB_SEARCH_PARAMS: '{"engine":"parallel","max_results":3,"bogus":1}' });
+    await deps.extractFieldsViaLLMReal(webExtractInput, 'user-1');
+    expect(deps.createLLMService).toHaveBeenLastCalledWith(ROLE_MODEL, 0.0, undefined, {
+      ...BASE, webSearchParameters: { engine: 'parallel', max_results: 3 },
+    });
+    await deps.buildIdentityDeps('user-1').resolveCompanyDomainViaWebSearch(domainInput);
+    expect(deps.createLLMService).toHaveBeenLastCalledWith(ROLE_MODEL, 0.2, undefined, {
+      ...BASE, webSearchParameters: { engine: 'parallel', max_results: 3 },
+    });
+  });
+
+  it('sends no webSearchParameters when the variable is unset or invalid (default unchanged)', async () => {
+    delete process.env.CRM_ENRICH_V3_WEB_SEARCH_PARAMS;
+    const unset = await loadWithEnv({});
+    await unset.extractFieldsViaLLMReal(webExtractInput, 'user-1');
+    expect(unset.createLLMService).toHaveBeenLastCalledWith(ROLE_MODEL, 0.0, undefined, BASE);
+
+    jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const bad = await loadWithEnv({ CRM_ENRICH_V3_WEB_SEARCH_PARAMS: '{not json' });
+    await bad.extractFieldsViaLLMReal(webExtractInput, 'user-1');
+    expect(bad.createLLMService).toHaveBeenLastCalledWith(ROLE_MODEL, 0.0, undefined, BASE);
+  });
+});
+
 describe('enrichment web tier and critic follow the enrichment role (ENG-2184)', () => {
   it('web-tier field extraction uses the role model for the caller', async () => {
     await extractFieldsViaLLMReal(webExtractInput, 'user-1');
     expect(resolveModelForUser).toHaveBeenCalledWith('user-1', 'enrichment');
-    expect(createLLMService).toHaveBeenCalledWith(ROLE_MODEL, 0.0);
+    expect(createLLMService).toHaveBeenCalledWith(ROLE_MODEL, 0.0, undefined, BASE);
   });
 
   it('web-search company domain resolution uses the role model for the caller', async () => {
     await buildIdentityDeps('user-1').resolveCompanyDomainViaWebSearch(domainInput);
     expect(resolveModelForUser).toHaveBeenCalledWith('user-1', 'enrichment');
-    expect(createLLMService).toHaveBeenCalledWith(ROLE_MODEL, 0.2);
+    expect(createLLMService).toHaveBeenCalledWith(ROLE_MODEL, 0.2, undefined, BASE);
   });
 
   it('the critic uses the role model for the caller', async () => {
     const result = await buildOrchestratorDeps('user-1').runCriticOverWebFills(criticInput);
     expect(result.verdicts).toEqual({ funding_stage: 'supported' });
     expect(resolveModelForUser).toHaveBeenCalledWith('user-1', 'enrichment');
-    expect(createLLMService).toHaveBeenCalledWith(ROLE_MODEL, null);
+    expect(createLLMService).toHaveBeenCalledWith(ROLE_MODEL, null, undefined, BASE);
+  });
+
+  it('only the default Luna model gets the gpt-5.5 fallback; other models do not (ENG-2720)', async () => {
+    jest.mocked(resolveModelForUser).mockResolvedValue(LUNA);
+    await extractFieldsViaLLMReal(webExtractInput, 'user-1');
+    expect(createLLMService).toHaveBeenLastCalledWith(LUNA, 0.0, undefined, { ...NO_AZURE, fallbackModels: ['gpt-5.5'] });
+    jest.mocked(resolveModelForUser).mockResolvedValue('gemini-3.8-flash');
+    await extractFieldsViaLLMReal(webExtractInput, 'user-1');
+    expect(createLLMService).toHaveBeenLastCalledWith('gemini-3.8-flash', 0.0, undefined, BASE);
+  });
+
+  it('skips Azure for OpenAI models only, and does not give gpt-5.5 a fallback to itself (ENG-2720)', async () => {
+    jest.mocked(resolveModelForUser).mockResolvedValue('gpt-5.5');
+    await extractFieldsViaLLMReal(webExtractInput, 'user-1');
+    expect(createLLMService).toHaveBeenLastCalledWith('gpt-5.5', 0.0, undefined, NO_AZURE);
+    jest.mocked(resolveModelForUser).mockResolvedValue('openrouter/deepseek/deepseek-v4-flash');
+    await extractFieldsViaLLMReal(webExtractInput, 'user-1');
+    expect(createLLMService).toHaveBeenLastCalledWith('openrouter/deepseek/deepseek-v4-flash', 0.0, undefined, BASE);
+  });
+
+  it('keeps the critic on the same model as the extraction role', async () => {
+    jest.mocked(resolveModelForUser).mockResolvedValue(LUNA);
+    await buildOrchestratorDeps('user-1').runCriticOverWebFills(criticInput);
+    expect(createLLMService).toHaveBeenLastCalledWith(LUNA, null, undefined, { ...NO_AZURE, fallbackModels: ['gpt-5.5'] });
   });
 
   it('never calls an LLM with the retired gpt-5-chat-2 id', async () => {
@@ -125,12 +178,12 @@ describe('CRM_ENRICH_V3_* env overrides keep their precedence', () => {
   it('the web tier falls back to CRM_ENRICH_V3_EXTRACT_MODEL', async () => {
     const deps = await loadWithEnv({ CRM_ENRICH_V3_EXTRACT_MODEL: 'env-extract' });
     await deps.extractFieldsViaLLMReal(webExtractInput, 'user-1');
-    expect(deps.createLLMService).toHaveBeenCalledWith('env-extract', 0.0);
+    expect(deps.createLLMService).toHaveBeenCalledWith('env-extract', 0.0, undefined, BASE);
   });
 
   it('CRM_ENRICH_V3_CRITIC_MODEL wins for the critic', async () => {
     const deps = await loadWithEnv({ CRM_ENRICH_V3_CRITIC_MODEL: 'env-critic' });
     await deps.buildOrchestratorDeps('user-1').runCriticOverWebFills(criticInput);
-    expect(deps.createLLMService).toHaveBeenCalledWith('env-critic', null);
+    expect(deps.createLLMService).toHaveBeenCalledWith('env-critic', null, undefined, BASE);
   });
 });

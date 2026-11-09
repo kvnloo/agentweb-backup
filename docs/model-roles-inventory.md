@@ -12,12 +12,14 @@ organization override when it is selectable, otherwise the validated default.
 Options come from the text and extracted image registries, excluding restricted,
 static-legacy and dominance-derived legacy models. Text roles exclude Live models;
 chat/research require tools; voice requires the existing Live transport capability.
-The image preview alias is excluded from new selections.
+The image preview alias is excluded from new selections. A role's own default is always
+selectable, even when dominance would hide it as superseded (ENG-2720: `gpt-5.6-luna`), so an
+org can save it and an override of it does not resolve to its successor.
 
 | Role | Default source, then validated fallback |
 | --- | --- |
 | chat | `agent_mode_default_model`, then `gemini-3.8-flash` |
-| enrichment | `gpt-5.5`, what enrichment ran before model roles (`gpt-5-chat-2`, aliased). ENG-2184: the flash-lite default silently moved prod enrichment to a model at 1/20 the price and quality index 16 vs 38; move cheaper only on ENG-2137 grader evidence |
+| enrichment | `openrouter/openai/gpt-5.6-luna` (ENG-2720; was `gpt-5.5`, itself what enrichment ran before model roles). `CRM_ENRICH_V3_DEFAULT_MODEL` overrides it on the environment, so a rollback needs no code deploy. ENG-2184: the flash-lite default silently moved prod enrichment to a model at 1/20 the price and quality index 16 vs 38; Luna was benchmarked on a real 112-lead list at about 99% of the fields filled and about 5% of the LLM cost, with somewhat weaker web-value sourcing (ENG-2720). |
 | image | `agent_mode_image_api_default_model`, then older `default_image_model` when absent, then `gemini-3-pro-image-preview` |
 | embedding | `openai/text-embedding-3-large` via the shared OpenRouter embeddings helper; 1536 output dimensions |
 | scoring_judge | `default-scoring-model`, then `gemini-3.1-flash-lite` |
@@ -64,7 +66,9 @@ Models section with eight pickers in the customer-portal follow-up, using this A
 
 - Enrichment V3: non-web extraction, identity candidate disambiguation, LinkedIn
   candidate selection, smart-field evaluation, the web-search tier and the critic
-  (ENG-2184), so one run uses one model. Smart-field attribution records the
+  (ENG-2184), so one run uses one model. ENG-2720: OpenAI-model web-search calls skip Azure (it errors on the
+  search tool), and calls on the default Luna model retry on `gpt-5.5` if OpenRouter reports a provider
+  failure; that fallback does not cover a 200 response with an empty body. Smart-field attribution records the
   resolved model. The `CRM_ENRICH_V3_*` env overrides still take precedence.
 - Image: both agent-mode's upstream default and the shared image generator.
   Explicit request models and existing retry/fallback semantics are preserved.

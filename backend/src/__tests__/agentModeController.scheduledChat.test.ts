@@ -131,10 +131,6 @@ jest.mock('../utils/agentModeAlerts', () => ({
   sendAgentModeOncallAlert: jest.fn().mockResolvedValue(undefined),
 }));
 
-jest.mock('../services/notionService', () => ({
-  createOncallItem: jest.fn().mockResolvedValue(undefined),
-}));
-
 // ENG-1719: previously unmocked — real calls silently failed and were swallowed by the
 // caller's own .catch(), which is why no existing test needed this. Mocking it is a strict
 // improvement (a resolved no-op instead of a failing real network call) and lets the new
@@ -1821,6 +1817,67 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
         const requeue = mockScheduleDb.updateSchedule.mock.calls.find((c: any[]) => c[1]?.zeroAssistantRetryCount === 1);
         expect(requeue).toBeUndefined();
+      });
+    });
+
+    // ENG-2750: drain ceiling exceeded BEFORE any assistant output -> one silent
+    // requeue; if the retried run also fails, a single incident is filed.
+    describe('drain ceiling before any assistant output (ENG-2750)', () => {
+      const drainCeiling = () => new Error('Worker shutdown — drain ceiling exceeded');
+
+      it('requeues the run and does not file an auto-issue on the first drain', async () => {
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(drainCeiling());
+        (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([
+          { role: 'user', content: 'Distribute the issue.' },
+        ]);
+
+        const result: any = await runScheduledChat(
+          { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 0 } as any,
+          mockUserId,
+          false
+        );
+
+        expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
+          baseSchedule.scheduleId,
+          expect.objectContaining({ status: 'active', zeroAssistantRetryCount: 1, nextRunTime: expect.any(String) })
+        );
+        expect(result.requeuedAt).toEqual(expect.any(String));
+        await new Promise((r) => setImmediate(r));
+        expect(mockFileAutoIssue).not.toHaveBeenCalled();
+      });
+
+      it('files exactly one auto-issue when the retried run also fails', async () => {
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(drainCeiling());
+        (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([
+          { role: 'user', content: 'Distribute the issue.' },
+        ]);
+
+        await runScheduledChat(
+          { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 1 } as any,
+          mockUserId,
+          false
+        );
+
+        await new Promise((r) => setImmediate(r));
+        expect(mockFileAutoIssue).toHaveBeenCalledTimes(1);
+      });
+
+      it('still files an auto-issue on a first-attempt worker crash (not a drain)', async () => {
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(
+          new Error('Worker process exited with code 137')
+        );
+        (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([
+          { role: 'user', content: 'Distribute the issue.' },
+        ]);
+
+        await runScheduledChat(
+          { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 0 } as any,
+          mockUserId,
+          false
+        );
+
+        await new Promise((r) => setImmediate(r));
+        expect(mockFileAutoIssue).toHaveBeenCalledTimes(1);
       });
     });
 

@@ -106,6 +106,30 @@ export function sanitizeValue(raw: unknown): SanitizeResult {
 // `a<b>@x.com` or `x{{y}}@z.com` must not reach it. Real addresses do not need them.
 const EMAIL = /^[^\s@<>{}"'\\]+@[^\s@<>{}"'\\]+\.[^\s@<>{}"'\\]{2,}$/;
 const MAX_EMAIL_CHARS = 254;
+// What the pattern above lets through but a real address never contains: zero-width, bidi and control characters, list separators and pipes,
+// a repeated dot, a leading or trailing dot in either part, and a top-level domain that is not letters.
+const EMAIL_HIDDEN_OR_CONTROL = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/;
+const EMAIL_SEPARATORS = /[,;|`]/;
+function emailShapeOk(email: string): boolean {
+  if (EMAIL_HIDDEN_OR_CONTROL.test(email) || EMAIL_SEPARATORS.test(email) || email.includes("..")) return false;
+  const at = email.lastIndexOf("@");
+  const local = email.slice(0, at);
+  const domain = email.slice(at + 1);
+  if (local.startsWith(".") || local.endsWith(".") || domain.startsWith(".") || domain.endsWith(".") || domain.startsWith("-")) return false;
+  // The top-level domain is letters in any script (internationalised domains such as .中国 or .рф), or punycode (xn--...); never digits.
+  return /\.\p{L}{2,}$/u.test(domain) || /\.xn--[a-z0-9-]{2,}$/i.test(domain);
+}
+
+// URL-type fields end up in the customer's template, possibly inside href="...": no quotes, backticks or spaces, and no script-style scheme.
+const URL_FIELDS = new Set(["website", "company_url", "linkedin_profile"]);
+// An HTML character reference (&#106; or &colon;) can spell a script scheme once a browser decodes it inside href="...", so none is allowed.
+const UNSAFE_URL = /["'`\s]|&#|&[a-z]+;|^\s*(javascript|data|vbscript):/i;
+
+/** True when the address would be accepted for a push (the same checks buildLeadPayload applies). */
+export function isAcceptableEmail(raw: unknown): boolean {
+  const email = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  return !!email && email.length <= MAX_EMAIL_CHARS && EMAIL.test(email) && emailShapeOk(email);
+}
 
 export type PayloadResult =
   | { ok: true; input: SmartleadLeadInput; payloadHash: string }
@@ -128,13 +152,14 @@ function canonical(value: unknown): string {
 export function buildLeadPayload(lead: Lead, opts: { tagsUsed: string[]; mapping: TagMapping }): PayloadResult {
   const rawEmail = typeof lead.email === "string" ? lead.email.trim().toLowerCase() : "";
   if (!rawEmail) return { ok: false, reason: "no_email" };
-  if (rawEmail.length > MAX_EMAIL_CHARS || !EMAIL.test(rawEmail)) return { ok: false, reason: "invalid_email" };
+  if (rawEmail.length > MAX_EMAIL_CHARS || !EMAIL.test(rawEmail) || !emailShapeOk(rawEmail)) return { ok: false, reason: "invalid_email" };
 
   const values: Record<string, SanitizeResult> = {};
   for (const [tag, paths] of Object.entries(STANDARD_TAG_SOURCES)) {
     let result: SanitizeResult = { ok: true, value: "" };
     for (const path of paths) {
-      const candidate = tag === "email" ? { ok: true as const, value: rawEmail } : sanitizeValue(readLeadValue(lead, path));
+      let candidate: SanitizeResult = tag === "email" ? { ok: true as const, value: rawEmail } : sanitizeValue(readLeadValue(lead, path));
+      if (candidate.ok && URL_FIELDS.has(tag) && UNSAFE_URL.test(candidate.value)) candidate = { ok: false, reason: "unsafe_text" };
       if (candidate.ok && candidate.value !== "") { result = candidate; break; }
       if (!candidate.ok) result = candidate;
     }

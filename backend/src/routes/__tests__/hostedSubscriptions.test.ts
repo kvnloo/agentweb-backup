@@ -84,8 +84,16 @@ describe(BASE, () => {
     expect((await request(app).post(`${BASE}/start`).send({ reconnectConnectionId: 5 })).status).toBe(400);
     expect((await request(app).post(`${BASE}/complete`).send({ loginId: 'a' })).status).toBe(400);
     expect((await request(app).post(`${BASE}/complete`).send({ loginId: 'a', code: 'x'.repeat(513) })).status).toBe(400);
+    expect((await request(app).post(`${BASE}/complete`).send({ loginId: 'a'.repeat(1025), code: CODE })).status).toBe(400); // longer than any sealed token
     expect(service.startLogin).not.toHaveBeenCalled();
     expect(service.completeLogin).not.toHaveBeenCalled();
+  });
+
+  it('accepts a sealed-token-sized loginId (up to 1024 characters)', async () => {
+    const { app, service } = makeApp();
+    const res = await request(app).post(`${BASE}/complete`).send({ loginId: 'a'.repeat(1024), code: CODE });
+    expect(res.status).toBe(201);
+    expect(service.completeLogin).toHaveBeenCalledWith({ userId: 'user-1' }, 'a'.repeat(1024), CODE);
   });
 
   it('completes with the code in the body only, and the code is in no response and no log line', async () => {

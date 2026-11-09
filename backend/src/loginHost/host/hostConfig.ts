@@ -51,7 +51,8 @@ const schema = z
         leaseMs: z.number().int().min(1000).optional(),
         abortGraceMs: z.number().int().min(100).optional(),
         idleSessionMs: z.number().int().min(1000).optional(),
-        toolCallTimeoutMs: z.number().int().min(1000).optional(),
+        // at most 2^31-1 ms would overflow setTimeout; 1 h is the longest turn deadline anyway
+        toolCallTimeoutMs: z.number().int().min(1000).max(3_600_000).optional(),
         readyAttemptTtlMs: z.number().int().min(10_000).max(30 * 60 * 1000).optional(),
         adapterCallTimeoutMs: z.number().int().min(1000).optional(),
         portCallTimeoutMs: z.number().int().min(1000).optional(),
@@ -66,6 +67,10 @@ const schema = z
         version: z.string().regex(/^[0-9][0-9A-Za-z.+-]{0,30}$/),
         systemPromptFile: absPath,
         turnWrapperPath: absPath.default("/opt/aw-login-host/claude-turn.sh"),
+        /** ENG-2113 tool relay: the stdio MCP shim the CLI starts inside the unit, and the node binary that runs it (both root-controlled, trusted-path checked). */
+        relayShimPath: absPath.default("/opt/aw-login-host/aw-relay-shim.js"),
+        /** REQUIRED, and a REAL path, not a symlink (assertTrustedPath refuses links, so the host would not start and the unit would hit its start limit): the prod template names /opt/aw-node/v<ver>/bin/node. There is deliberately no default: /usr/bin/node is a symlink on the worker. */
+        nodePath: absPath,
         /** The Emma tool bridge's MCP endpoint as seen from a customer process. */
         bridgeUrl: z
           .string()
@@ -122,7 +127,7 @@ const schema = z
   })
   .strict();
 
-export type HostConfig = z.infer<typeof schema> & { stateRoot: string; socketPath: string; egressDir: string; egressSocketPath: string };
+export type HostConfig = z.infer<typeof schema> & { stateRoot: string; socketPath: string; egressDir: string; egressSocketPath: string; relayRoot: string };
 
 export class HostConfigError extends Error {
   constructor(readonly reason: string) {
@@ -154,7 +159,7 @@ export function parseHostConfig(raw: unknown): HostConfig {
   const unusable = c.tls ? unusableAddressReason(c.tls.host) : null;
   if (unusable) throw new HostConfigError(`tls.host must be the machine's own network address (${unusable} addresses are refused)`);
   const egressDir = `/run/aw-egress-${c.env}`;
-  return { ...c, stateRoot, socketPath: `${c.socket.dir}/host.sock`, egressDir, egressSocketPath: `${egressDir}/proxy.sock` };
+  return { ...c, stateRoot, socketPath: `${c.socket.dir}/host.sock`, egressDir, egressSocketPath: `${egressDir}/proxy.sock`, relayRoot: `/run/aw-relay-${c.env}` };
 }
 
 /** Parses /etc/subuid ("name:start:count" lines): the host's uid range must not overlap any of them. */

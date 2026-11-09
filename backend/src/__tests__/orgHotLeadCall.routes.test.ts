@@ -5,7 +5,9 @@ import { join } from 'path';
 
 jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn() }, orgDb: { getOrgById: jest.fn(), updateOrg: jest.fn() } }));
 jest.mock('../services/usageRecorderService', () => ({ recordVendorUsage: jest.fn().mockResolvedValue(undefined) }));
+jest.mock('../services/chatbotService', () => ({ chatbotDb: { getChatSession: jest.fn(), claimMetaWriteManifestDigest: jest.fn() } }));
 import { orgDb, userDb } from '../services/db';
+import { chatbotDb } from '../services/chatbotService';
 import routes from '../routes/orgHotLeadCall';
 import { hotLeadCallRevisionOf } from '../services/hotLeadCallSettingsService';
 import { setHotLeadCallEntitledOverride } from '../services/voice/hotLeadCallEntitlement';
@@ -101,7 +103,7 @@ describe('GET /', () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual({
       _revision: rev(), entitled: true, enabled: false, canEnable: true, blockers: [],
-      callingHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' }, maxAttemptsPerLead: 3, announcedName: 'Acme Plumbing', twilioNumberMasked: '***0111',
+      callingHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' }, maxAttemptsPerLead: 3, maxCallsPerMonth: 200, warnings: ['Canadian numbers are not called yet; leads with a Canadian number are skipped even though Canada is allowed here'], announcedName: 'Acme Plumbing', twilioNumberMasked: '***0111',
       team: [
         { id: A, name: 'Dana Lee', phoneMasked: '***0100', verified: true, windows: [EVERY_DAY] },
         { id: B, name: 'Sam Ortiz', phoneMasked: '***0122', verified: false, windows: [WEEKDAYS] },
@@ -158,6 +160,9 @@ describe('PUT /', () => {
     const res = await api().put(BASE).send({ _revision: rev(), enabled: true });
     expect(res.status).toBe(200);
     expect(res.body.enabled).toBe(true);
+    // The person's click in the portal is the approval: no chat card is asked for or claimed.
+    expect(chatbotDb.getChatSession).not.toHaveBeenCalled();
+    expect(chatbotDb.claimMetaWriteManifestDigest).not.toHaveBeenCalled();
   });
   it('lets a brand-new org add people without calling hours', async () => {
     delete table.org.hotLeadCall;
@@ -201,6 +206,23 @@ describe('PUT /', () => {
     expect(res.status).toBe(400);
     expect(res.body.fieldErrors).toBeDefined();
     expect(table.writes).toEqual([]);
+  });
+  it('PUT accepts maxCallsPerMonth 1..200, refuses 201+ with the support message, and preserves a stored 1500', async () => {
+    expect((await api().put(BASE).send({ _revision: rev(), maxCallsPerMonth: 120 })).body.maxCallsPerMonth).toBe(120);
+    const refused = await api().put(BASE).send({ _revision: rev(), maxCallsPerMonth: 201 });
+    expect(refused.status).toBe(400);
+    expect(refused.body.fieldErrors.maxCallsPerMonth).toBe('Higher monthly limits are set by AgentWeb support');
+    (table.org.hotLeadCall as Record<string, unknown>).maxCallsPerMonth = 1500;
+    expect((await api().get(BASE)).body.maxCallsPerMonth).toBe(1500);
+    const edited = await api().put(BASE).send({ _revision: rev(), announcedName: 'Edited Co' });
+    expect(edited.status).toBe(200);
+    expect(edited.body.maxCallsPerMonth).toBe(1500);
+    expect((table.org.hotLeadCall as Record<string, unknown>).maxCallsPerMonth).toBe(1500);
+  });
+  it('GET reports a Canada-only org as blocked', async () => {
+    (table.org.hotLeadCall as Record<string, unknown>).allowedCountries = ['CA'];
+    const res = await api().get(BASE);
+    expect(res.body).toMatchObject({ canEnable: false, blockers: [expect.stringContaining('None of the allowed countries')], warnings: [expect.stringContaining('Canadian')] });
   });
   it.each([[[]], ['text'], [null]])('rejects a body that is not an object (%j)', async body => {
     const res = await api().put(BASE).set('Content-Type', 'application/json').send(JSON.stringify(body));
@@ -314,11 +336,12 @@ describe('POST members/:memberId/verification/confirm', () => {
 describe('GET /preview', () => {
   it('lists who would be called at the given instant, in call order', async () => {
     (table.org.hotLeadCall as { team: Array<Record<string, unknown>> }).team[1].verifiedAt = '2026-01-01T00:00:00.000Z';
-    // Tuesday 2026-10-20 11:00 Chicago time.
-    const res = await api().get(`${BASE}/preview`).query({ at: '2026-10-20T16:00:00Z' });
+    // Tuesday 2026-10-20 13:00 Chicago time (14:00 Eastern: inside the lead window).
+    const res = await api().get(`${BASE}/preview`).query({ at: '2026-10-20T18:00:00Z' });
     expect(res.status).toBe(200);
     expect(res.body).toEqual({
-      at: '2026-10-20T16:00:00.000Z', timezone: 'America/Chicago', outsideCallingHours: false,
+      at: '2026-10-20T18:00:00.000Z', timezone: 'America/Chicago', outsideCallingHours: false, outsideLeadHours: false, skipReason: null,
+      warnings: ['Canadian numbers are not called yet; leads with a Canadian number are skipped even though Canada is allowed here'],
       candidates: [{ id: A, name: 'Dana Lee' }, { id: B, name: 'Sam Ortiz' }], excluded: [],
     });
   });

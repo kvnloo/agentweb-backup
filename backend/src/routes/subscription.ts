@@ -20,6 +20,7 @@ import {
   ModelChangeForbiddenError,
   ModelNotAvailableError,
 } from '../services/llmModelChangeService';
+import { recordUsageAlertEvent, InvalidAlertEventError } from '../services/llmUsageAlertEventService';
 import { resolveBillingUserId, toCustomerTokenUsage } from '../services/tokenUsageService';
 import { readBilledLedgerRows } from '../services/llmUsageLedgerReader';
 import { readItemizationChargeEvents } from '../services/ledgerItemizationReader';
@@ -243,6 +244,26 @@ router.post('/usage-runway/decline', authenticateToken, async (req, res) => {
     }
     console.error('Error recording a declined recommendation:', error);
     return res.status(500).json({ error: 'Failed to record the decline' });
+  }
+});
+
+/**
+ * ENG-2769 — record an outcome of the usage-alert modal (shown / dismissed /
+ * see_options / book_call / upgrade / contact). Writes nothing but a telemetry line.
+ */
+router.post('/usage-runway/alert-event', authenticateToken, async (req, res) => {
+  try {
+    const userId = (req as any).user?.userId;
+    if (!userId) return res.status(401).json({ error: 'Not authenticated' });
+    const { action, reason, estimatedDaysRemaining, percentUsed } = req.body || {};
+    const result = await recordUsageAlertEvent(userId, { action, reason, estimatedDaysRemaining, percentUsed });
+    return res.json(result);
+  } catch (error) {
+    if (error instanceof InvalidAlertEventError) {
+      return res.status(400).json({ error: error.message });
+    }
+    console.error('Error recording a usage alert event:', error);
+    return res.status(500).json({ error: 'Failed to record the alert event' });
   }
 });
 

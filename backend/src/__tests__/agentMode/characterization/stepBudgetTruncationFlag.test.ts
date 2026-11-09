@@ -103,6 +103,149 @@ describe('ENG-244 — real loop sets truncatedByStepBudget at the step budget', 
     expect(result.content).toMatch(/reached the maximum number of processing steps/i);
   });
 
+  it('ENG-2778: forces a final synthesis on the last step instead of the canned apology', async () => {
+    // Repro of session 3d6be53d: the model pages transcripts with empty text every
+    // step. On the final step the loop must tell it to stop, discard any tool call
+    // it still makes, and deliver its own summary of the gathered work.
+    const executed: string[] = [];
+    let call = 0;
+    const synthesisCalls: number[] = [];
+    jest.spyOn(service as any, 'callLLM').mockImplementation(async (...args: any[]) => {
+      const messages = args[1] || [];
+      const isFinal = messages.some(
+        (m: any) => m?.role === 'system' && typeof m.content === 'string' && /Step budget exhausted/.test(m.content),
+      );
+      const n = call++;
+      if (isFinal) {
+        synthesisCalls.push(n);
+        return buildLLMResponse({
+          content: 'Recap so far: 22 baseline prospects, 9 new since Oct 24. Still missing: reply rates.',
+          tool_calls: [{ id: 'late', name: 'read_tool_response', arguments: '{"char_offset":999999}' }],
+        });
+      }
+      return buildLLMResponse({
+        content: '',
+        tool_calls: [{ id: `c${n}`, name: 'read_tool_response', arguments: `{"char_offset":${n * 1000}}` }],
+      });
+    });
+    jest.spyOn(service as any, 'executeTool').mockImplementation(async (...args: any[]) => {
+      executed.push(args[2]?.char_offset ?? JSON.stringify(args[2]));
+      return JSON.stringify({ success: true, data: 'mock' });
+    });
+    jest.spyOn(service as any, 'generateSuggestedReplies').mockResolvedValue([]);
+
+    const result = (await service.generateMarketingResponse(
+      'Give me a client-facing recap of the campaign since Oct 24.',
+      [] as any,
+      'test-user',
+      service.default_model,
+      'test-session',
+    )) as any;
+
+    expect(result.truncatedByStepBudget).toBe(true);
+    expect(result.content).toMatch(/Recap so far/);
+    expect(result.content).not.toMatch(/reached the maximum number of processing steps/i);
+    // Exactly one forced synthesis call, and it was the last LLM call; maxIterations not raised.
+    expect(synthesisCalls).toHaveLength(1);
+    expect(synthesisCalls[0]).toBe(call - 1);
+    expect(call).toBe(40);
+    // The tool call made during the synthesis was discarded, not executed.
+    expect(JSON.stringify(executed)).not.toContain('999999');
+  });
+
+  it('ENG-2778: an empty forced synthesis falls back to the step-limit message, not stale narration', async () => {
+    let call = 0;
+    jest.spyOn(service as any, 'callLLM').mockImplementation(async (...args: any[]) => {
+      const messages = args[1] || [];
+      const isFinal = messages.some(
+        (m: any) => m?.role === 'system' && typeof m.content === 'string' && /Step budget exhausted/.test(m.content),
+      );
+      const n = call++;
+      if (isFinal) return buildLLMResponse({ content: '', tool_calls: [] });
+      return buildLLMResponse({
+        content: `Scanned batch ${n}.`,
+        tool_calls: [{ id: `c${n}`, name: 'read_tool_response', arguments: `{"char_offset":${n * 1000}}` }],
+      });
+    });
+    jest.spyOn(service as any, 'executeTool').mockResolvedValue(JSON.stringify({ success: true, data: 'mock' }));
+    jest.spyOn(service as any, 'generateSuggestedReplies').mockResolvedValue([]);
+
+    const result = (await service.generateMarketingResponse(
+      'Give me a client-facing recap of the campaign since Oct 24.',
+      [] as any,
+      'test-user',
+      service.default_model,
+      'test-session',
+    )) as any;
+
+    expect(result.truncatedByStepBudget).toBe(true);
+    expect(result.content).not.toMatch(/^Scanned batch/);
+    expect(result.content).toMatch(/reached the maximum number of processing steps/i);
+  });
+
+  it.each([
+    ['the step-cap warning', () => require('../../../services/agentMode/core/termination').STEP_BUDGET_FINAL_SYNTHESIS_MESSAGE],
+    ['an earlier anti-loop warning', () => require('../../../services/agentMode/core/termination').ANTI_LOOP_STOP_MESSAGE],
+  ])('ENG-2778 (Opslane): a forced synthesis echoing %s ships the step-limit message, not the echo or a ledger', async (_label, getEcho) => {
+    const echo: string = (getEcho as () => string)();
+    let call = 0;
+    jest.spyOn(service as any, 'callLLM').mockImplementation(async (...args: any[]) => {
+      const messages = args[1] || [];
+      const isFinal = messages.some(
+        (m: any) => m?.role === 'system' && typeof m.content === 'string' && /Step budget exhausted/.test(m.content),
+      );
+      const n = call++;
+      if (isFinal) return buildLLMResponse({ content: echo, tool_calls: [] });
+      return buildLLMResponse({
+        content: '',
+        tool_calls: [{ id: `c${n}`, name: 'read_tool_response', arguments: `{"char_offset":${n * 1000}}` }],
+      });
+    });
+    jest.spyOn(service as any, 'executeTool').mockResolvedValue(JSON.stringify({ success: true, data: 'mock' }));
+    jest.spyOn(service as any, 'generateSuggestedReplies').mockResolvedValue([]);
+
+    const result = (await service.generateMarketingResponse(
+      'Research the lead lists thoroughly and produce a full report.',
+      [] as any,
+      'test-user',
+      service.default_model,
+      'test-session',
+    )) as any;
+
+    expect(result.truncatedByStepBudget).toBe(true);
+    expect(result.content).not.toContain('[SYSTEM');
+    expect(result.content).not.toMatch(/summary below is built directly from the actions/i);
+    expect(result.content).toMatch(/reached the maximum number of processing steps/i);
+  });
+
+  it('ENG-2854: reports completed LP writes and resumable state without another loop', async () => {
+    let call = 0;
+    jest.spyOn(service as any, 'callLLM').mockImplementation(async () => buildLLMResponse({
+      content: '',
+      tool_calls: [{ id: `write-${call}`, name: 'coding_agent', arguments: JSON.stringify({
+        page_id: 'lp-flatfee', task_description: `Edit section ${call++}`,
+      }) }],
+    }));
+    jest.spyOn(service as any, 'executeTool').mockResolvedValue({ content: JSON.stringify({
+      success: true, branch: 'draft/flatfee', previewUrl: 'https://preview.example/lp-flatfee',
+    }) });
+    jest.spyOn(service as any, 'generateSuggestedReplies').mockResolvedValue([]);
+    const result = await service.generateMarketingResponse(
+      'Edit my landing page sections, then verify the preview.', [], 'test-user', service.default_model, 'test-session',
+    );
+    expect(call).toBe(40);
+    expect((service as any).executeTool.mock.calls).toHaveLength(39);
+    expect(result.content).toContain('lp-flatfee');
+    expect(result.content).toContain('draft/flatfee');
+    expect(result.content).toContain('https://preview.example/lp-flatfee');
+    expect(result.content).toMatch(/What changed/);
+    expect(result.content).toMatch(/What remains/);
+    expect(result.content).toMatch(/How to resume/);
+    expect(result.content).toMatch(/Yugo.*engineering/i);
+    expect(result.content).toMatch(/not.*automatically retr/i);
+    expect(result.responseMessages.filter((m: any) => m.role === 'assistant').at(-1)?.content).toBe(result.content);
+  });
+
   it('does NOT set truncatedByStepBudget on a clean run that finishes within budget (no false positive)', async () => {
     // Turn 1 gathers, turn 2 emits the final report with no tool call → clean
     // termination well under the budget.
@@ -115,5 +258,16 @@ describe('ENG-244 — real loop sets truncatedByStepBudget at the step budget', 
     expect(result.truncatedByStepBudget).toBeFalsy();
     expect((service as any).callLLM.mock.calls.length).toBeLessThan(40);
     expect(result.content).toMatch(/Daily User Activity Report/);
+  });
+});
+
+describe('ENG-2778 step-cap warning echo', () => {
+  it('treats a verbatim echo of STEP_BUDGET_FINAL_SYNTHESIS_MESSAGE as unusable synthesis', () => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { isUnusableSynthesis } = require('../../../services/agentMode/core/synthesisResidue');
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { STEP_BUDGET_FINAL_SYNTHESIS_MESSAGE } = require('../../../services/agentMode/core/termination');
+    expect(isUnusableSynthesis(STEP_BUDGET_FINAL_SYNTHESIS_MESSAGE)).toBe(true);
+    expect(isUnusableSynthesis(`  ${STEP_BUDGET_FINAL_SYNTHESIS_MESSAGE}\n`)).toBe(true);
   });
 });

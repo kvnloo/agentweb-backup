@@ -287,6 +287,10 @@ Tables are prefixed with `Dev-` in development, no prefix in production.
 - `services/linkedInService.ts` - LinkedIn integration (personal and company profiles)
 - `services/gtmPlanNotificationService.ts` - GTM plan approval workflow with Slack integration
 
+### Adding or Changing a Tool
+
+A tool in the normal registry also runs on the Claude plan route, which has its own limits (name length 53, description and schema size, input size). See `docs/plan-route-tool-limits.md`; CI fails a registry tool that does not fit.
+
 ### Route Organization
 
 Routes are in `backend/src/routes/` organized by feature area:
@@ -477,6 +481,8 @@ Uses browser-use library with Playwright:
   - `backend/**` runs **Backend build**; `partner-portal/**` runs **Partner
     portal build**; `.github/**` runs the short **CI script tests** control
     checks. Changes to `tests.yml` and `eb-deploy.sh` also require Backend build.
+  - **Backend build** also runs two mock-only invariant tests: the Agent Mode
+    wiring test and the plan route tool limits test.
 - `.github/workflows/deploy.yml` - Deploys path-filtered changes to production
   on every push to `main`
   - **Manual trigger:** Use GitHub Actions UI to manually trigger deployment (Actions tab → Deploy → Run workflow)

@@ -323,7 +323,6 @@ export const METERED_VENDOR_PROVIDERS = [
   "twitter",
   "v0",
   "you.com",
-  "google_cse",
   "apollo",
   "enrich.so",
   "enigma",

@@ -23,6 +23,7 @@ import { sendRoadmapDeliveryEmail } from '../services/roadmapDelivery';
 import { emmaEmailService } from '../services/emmaEmailService';
 import { TEMP_EMAIL_PREFIX, TEMP_EMAIL_DOMAIN } from '../config';
 import { isDoNotContact } from '../utils/leadContactStatus';
+import { isPushedToSmartlead } from '../services/smartleadMarkers';
 import { pruneClickIds } from '../utils/leadSchema';
 import { resolveClientIdentityWithForwarded } from '../utils/clientIdentity';
 import { normalizeAttribution, promoteAttributionFromCustomFields } from '../types/attribution';
@@ -41,6 +42,7 @@ import { getPhoneDedupeMode } from '../utils/phoneLeadDedupeMode';
 import { fillBlankCustomFields, phoneDedupeKey, phoneNamesConflict, phoneNameSeed } from '../utils/phoneLeadDedupe';
 import { findPhoneMatch } from '../services/phoneLeadMatch';
 import { upsertSessionLead } from '../services/sessionUpsertService';
+import { claimLeadSubmission, completeLeadSubmission, releaseLeadSubmission, resolveSubmissionKey } from '../services/leadSubmissionIdempotency';
 
 // ─── HubSpot signature helpers ────────────────────────────────────────────────
 
@@ -529,6 +531,12 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     });
   }
 
+  // ENG-2837: the (listId, submission key) claim this request holds, if any, and whether a lead
+  // write may have started under it. Declared outside the try so the catch can give the claim
+  // back — but ONLY when no write was attempted; otherwise a retry could repeat the write.
+  let submissionClaim: { key: string; ownerToken: string } | null = null;
+  let leadWriteStarted = false;
+
   try {
 
     // ENG-2311: read from the list row the DATABASE returned, never from the body. One
@@ -606,6 +614,50 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
         success: false,
         message: 'Email or phone is required'
       });
+    }
+
+    // ENG-2837: server-side idempotency per (listId, submission key). A lander that lost the
+    // response to a successful capture retries with the same key; the repeat must get the
+    // ORIGINAL response back and must not write the lead or fire any side effect again.
+    // Claimed only after every 4xx above, so a rejected request never holds a key. No key →
+    // nothing here runs and the handler behaves exactly as before.
+    const submissionKey = resolveSubmissionKey(req.body);
+    if (submissionKey) {
+      let claim: Awaited<ReturnType<typeof claimLeadSubmission>>;
+      try {
+        claim = await claimLeadSubmission(leadList.listId, submissionKey);
+      } catch (claimErr: any) {
+        // Fail CLOSED: the caller asked for exactly-once and we cannot tell whether this key is
+        // already taken, so write nothing and fire nothing. The lander keeps the same key and
+        // retries; nothing has happened that a retry could repeat.
+        console.error(`[forward-lead] ENG-2837 submission claim store unavailable for list ${leadList.listId}; rejecting retryably: ${claimErr?.message || claimErr}`);
+        res.setHeader('Retry-After', '2');
+        return res.status(503).json({
+          success: false,
+          retryable: true,
+          message: 'Lead capture is temporarily unavailable. Retry with the same submissionId.',
+        });
+      }
+      if (claim.outcome === 'completed') {
+        res.setHeader('Idempotent-Replayed', 'true');
+        return res.status(claim.record.responseStatus).json(claim.record.responseBody);
+      }
+      if (claim.outcome === 'in_progress') {
+        // Usually the original is still being processed: not a success (we cannot yet name its
+        // leadId) and not a failure, and the same key retried shortly gets the original
+        // response. But a claim is never taken over, so one left in_progress by a crashed
+        // owner or a failure after a lead write may have started 409s forever for THIS
+        // submission (other keys are unaffected) until an operator checks the lead and clears
+        // the claim. Say so, so a client that keeps getting 409 escalates instead of looping.
+        res.setHeader('Retry-After', '2');
+        return res.status(409).json({
+          success: false,
+          retryable: true,
+          message: 'This submission is already being processed. Retry with the same submissionId. '
+            + 'If 409 persists for this submission, it needs operator reconciliation: contact support with the submissionId.',
+        });
+      }
+      submissionClaim = { key: submissionKey, ownerToken: claim.ownerToken };
     }
 
     // Prepare lead data
@@ -945,6 +997,10 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       lead = { ...existingLead, ...updates };
     };
 
+    // ENG-2837: everything above is a read; from here on a lead write may happen (and may
+    // succeed even if its call then throws), so a claimed key can no longer be given back.
+    leadWriteStarted = true;
+
     if (sessionIdentity) {
       // ENG-2312. Exactly-once create + atomic merge for one (list, session): the shared
       // implementation (also used by the tracker ingest) lives in sessionUpsertService.
@@ -999,6 +1055,9 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
         ...(normalizedEmail && !isSessionList(leadList) ? { emailUniqueCreate: true } : {}),
         // ENG-2123: the phone twin, when the rollout mode is not 'off' and the number is specific enough.
         ...(phoneKey && !phoneSharedLine ? { phoneUniqueCreate: true } : {}),
+        // ENG-2837: a keyed capture fires the new-lead notification itself, AFTER its replay
+        // record is durable, instead of createLead firing it at the write.
+        ...(submissionClaim ? { deferCreatedNotification: true } : {}),
       };
       try {
         lead = await crmDb.createLead(leadList.listId, createInput, 'form_fill');
@@ -1174,39 +1233,64 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     // numbers at random, so collisions are routine by construction and every colliding
     // resubmission notified a real human about a fake lead. The gate's own comment claims
     // it skips "the whole cascade"; this is the part that escaped it.
-    if (!suppressSideEffects && !isNew && !isSmokeTestLead(lead) && !isSmokeTestLead(leadData)) {
-      const submission = { submissionId: crypto.randomUUID(), submittedAt: new Date().toISOString() };
+    // ENG-2837: dispatched below, after the replay record (if any) is durable.
+    const notifyRepeatSubmission = !suppressSideEffects && !isNew && !isSmokeTestLead(lead) && !isSmokeTestLead(leadData);
+
+    // Send API response immediately so caller is not blocked
+    const responseStatus = isNew ? 201 : 200;
+    const responseBody = isNew
+      ? { success: true, message: 'Lead forwarded successfully', event: 'lead.created', leadId: lead.leadId, listId: leadList.listId }
+      : isUpdated
+        ? { success: true, message: 'Lead updated successfully', event: 'lead.updated', leadId: lead.leadId, listId: leadList.listId }
+        : { success: true, message: 'Lead already exists with no changes', event: 'lead.unchanged', leadId: lead.leadId, listId: leadList.listId };
+
+    // ENG-2837: make the replay record durable BEFORE answering and before ANY side effect
+    // (the notifications just below, CAPI / CRM sync / email further down), so a retry can
+    // only ever see "completed" and replay. If it cannot be recorded, the lead is saved but
+    // the claim stays in_progress for good: we fire nothing and answer retryably. Retries
+    // then get 409 instead of a second write or a second round of side effects. Safety over
+    // liveness — the owner is not notified about this lead until the claim is cleared by hand.
+    if (submissionClaim) {
+      const claim = submissionClaim;
+      submissionClaim = null;
+      let recorded = false;
+      try {
+        recorded = await completeLeadSubmission(leadList.listId, claim.key, claim.ownerToken, {
+          leadId: lead.leadId, responseStatus, responseBody,
+        });
+      } catch (completeErr: any) {
+        console.error(`[forward-lead] ENG-2837 completion store error for lead ${lead.leadId}: ${completeErr?.message || completeErr}`);
+      }
+      if (!recorded) {
+        console.error(`[forward-lead] ENG-2837 lead ${lead.leadId} saved on list ${leadList.listId} but its submission record was not written; claim left in_progress, side effects withheld`);
+        res.setHeader('Retry-After', '2');
+        return res.status(503).json({
+          success: false,
+          retryable: true,
+          message: 'This submission could not be confirmed. Retry with the same submissionId.',
+        });
+      }
+    }
+
+    if (isNew && submissionKey && !sessionIdentity) {
+      // The keyed create deferred this out of createLead (deferCreatedNotification); same call
+      // createLead would have made, so the notifier's own gates (session lists etc.) still apply.
+      void import('../services/orgLeadNotificationService')
+        .then(({ dispatchLeadCreated }) => dispatchLeadCreated(leadList.listId, lead.leadId, 'form_fill'))
+        .catch(() => console.warn('[leadNotifications] hook failed', { listId: leadList.listId, leadId: lead.leadId }));
+    }
+    if (notifyRepeatSubmission) {
+      // A caller-supplied key makes the notification id deterministic, so the notifier dedupes
+      // it too. Otherwise a server-generated id keeps distinct submissions separate on recovery.
+      const submission = {
+        submissionId: submissionKey ? `client:${submissionKey}` : crypto.randomUUID(),
+        submittedAt: new Date().toISOString(),
+      };
       void import('../services/orgLeadNotificationService')
         .then(({ dispatchLeadCreated }) => dispatchLeadCreated(leadList.listId, lead.leadId, 'form_fill', submission))
         .catch(() => console.warn('[leadNotifications] submission hook failed', { listId: leadList.listId, leadId: lead.leadId }));
     }
-
-    // Send API response immediately so caller is not blocked
-    if (isNew) {
-      res.status(201).json({
-        success: true,
-        message: 'Lead forwarded successfully',
-        event: 'lead.created',
-        leadId: lead.leadId,
-        listId: leadList.listId
-      });
-    } else if (isUpdated) {
-      res.status(200).json({
-        success: true,
-        message: 'Lead updated successfully',
-        event: 'lead.updated',
-        leadId: lead.leadId,
-        listId: leadList.listId
-      });
-    } else {
-      res.status(200).json({
-        success: true,
-        message: 'Lead already exists with no changes',
-        event: 'lead.unchanged',
-        leadId: lead.leadId,
-        listId: leadList.listId
-      });
-    }
+    res.status(responseStatus).json(responseBody);
 
     // Server-side Meta Conversions API send. Fire-and-forget (same pattern as the
     // roadmap-delivery email below) — this must never delay or affect the lead-save response
@@ -1390,6 +1474,20 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
                       }
                     }
 
+                    // ENG-673: this block also runs for an EXISTING lead that resubmits a form (isUpdated), and that lead keeps its Smartlead
+                    // marker. A lead being emailed through the customer's Smartlead campaign is not also auto-emailed from here.
+                    // An existing lead that opted out and then resubmits a form must not be auto-emailed either: the auto-draft step has no
+                    // do-not-contact check of its own, and neither did this one (found by a review of ENG-673; older than that work).
+                    if (!autoSendStatus && isDoNotContact(freshLead ?? lead)) {
+                      console.log(`Auto send skipped: lead ${lead.leadId} in list ${leadList.listId} is do-not-contact`);
+                      autoSendStatus = 'skipped_do_not_contact';
+                    }
+
+                    if (!autoSendStatus && isPushedToSmartlead(freshLead ?? lead)) {
+                      console.log(`Auto send skipped: lead ${lead.leadId} in list ${leadList.listId} is being emailed through Smartlead`);
+                      autoSendStatus = 'skipped_smartlead';
+                    }
+
                     if (!autoSendStatus) {
                       // Resolve sender
                       const sendersResult = await agentModeService.getCrmSenders(leadList.userId);
@@ -1483,6 +1581,21 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
 
   } catch (error: any) {
     console.error('Lead forwarding error:', error);
+
+    // ENG-2837: the capture failed before its response was recorded. Give the key back ONLY
+    // if no lead write was attempted — then nothing happened and the retry is processed fresh.
+    // Once a write may have happened, the claim stays in_progress (retries get 409) so a retry
+    // can never repeat the write or its side effects.
+    if (submissionClaim) {
+      const claim = submissionClaim;
+      submissionClaim = null;
+      if (!leadWriteStarted) {
+        await releaseLeadSubmission(leadList.listId, claim.key, claim.ownerToken).catch((releaseErr: any) =>
+          console.error(`[forward-lead] ENG-2837 failed to release submission claim (key stays in_progress): ${releaseErr?.message || releaseErr}`));
+      } else {
+        console.error(`[forward-lead] ENG-2837 capture failed after a lead write may have started on list ${leadList.listId}; claim left in_progress`);
+      }
+    }
 
     // Trigger api.lead_failed alert if configured
     try {

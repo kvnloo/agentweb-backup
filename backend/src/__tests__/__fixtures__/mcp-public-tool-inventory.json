@@ -1354,13 +1354,17 @@
   {
     "name": "get_account_status",
     "listed": false,
-    "description": "Get the current user's account status, subscription plan, and usage. Admin-only: pass client_id to check a specific client's status instead of the caller's own.",
+    "description": "Get the current user's account status, subscription plan, and usage. Pass usage_month (YYYY-MM) to also get that month's LLM token/call totals by model and by day plus a session count. Admin-only: pass client_id to check a specific client's status instead of the caller's own.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "client_id": {
           "type": "string",
           "description": "Admin-only. Scope this call to a specific client's account instead of the caller's own — accepts the client's email or userId. Non-admin callers are rejected."
+        },
+        "usage_month": {
+          "type": "string",
+          "description": "Optional YYYY-MM. When set, include usage_breakdown (tokens and calls by model/day, session count) for that month."
         }
       },
       "required": []
@@ -1724,6 +1728,29 @@
     }
   },
   {
+    "name": "inspect_client_usage",
+    "listed": false,
+    "description": "ENG-2771: a named client's effective usage allowance for the CURRENT month — billing owner, paused, gatedBy, used, limit, percentUsed, resetsOn, usagePolicyVersion — exactly as the usage enforcer decided it. Admin-only, read-only, internal: never relay the raw output to a customer-facing channel. Cannot change tiers, bonuses, or counters. Pass email or user_id.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "email": {
+          "type": "string",
+          "description": "Account email of the client."
+        },
+        "user_id": {
+          "type": "string",
+          "description": "Internal userId of the client (or an org member; resolved to the billing owner)."
+        }
+      }
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
     "name": "inspect_orphaned_org_join_requests",
     "listed": false,
     "description": "Inspect pending organization join requests whose user record no longer exists. Admin-only, read-only; repair is not supported by this tool.",
@@ -1875,6 +1902,10 @@
         "page_id": {
           "type": "string",
           "description": "The landing page ID"
+        },
+        "branch": {
+          "type": "string",
+          "description": "Branch to read from (e.g. \"draft/agentweb-preview\" to read back staged edits). Omit for \"main\". Never selects a different repo."
         }
       },
       "required": [
@@ -2006,6 +2037,21 @@
       ]
     },
     "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "list_sender_settings",
+    "listed": false,
+    "description": "List your own CRM sender settings: configured email senders (with today's send usage and effective daily cap), the default email sender, the default LinkedIn sender account, and connected mailboxes that can be used as senders. Read-only; use before drafting or activating sequences.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    },
+    "sideEffect": "read",
     "gating": {
       "internalOnly": false,
       "requiresUserAccount": false
@@ -3189,6 +3235,62 @@
     }
   },
   {
+    "name": "read_email",
+    "listed": false,
+    "description": "Read-only access to your own connected email accounts (Gmail, Outlook): search, list a folder, or get messages by ID. Available when signed in to Emma (OAuth) or with an API key holding 'email:read'. Cannot send or reply, and cannot read mailboxes shared by teammates.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "account_id": {
+          "type": "string",
+          "description": "Email account ID from list_connected_accounts"
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "search",
+            "list",
+            "get"
+          ],
+          "description": "Read action to perform"
+        },
+        "query": {
+          "type": "string",
+          "description": "Search query (search action)"
+        },
+        "folder": {
+          "type": "string",
+          "description": "Folder to list (list action)",
+          "default": "INBOX"
+        },
+        "message_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 50,
+          "description": "Message IDs (get action, at most 50)"
+        },
+        "max_results": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 50,
+          "description": "Max results (search/list, 1-50)",
+          "default": 10
+        }
+      },
+      "required": [
+        "account_id",
+        "action"
+      ]
+    },
+    "sideEffect": "read",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
     "name": "read_knowledge_base_files",
     "listed": false,
     "description": "Read specific files from the knowledge base.",
@@ -3240,6 +3342,10 @@
         "file_path": {
           "type": "string",
           "description": "Path to the file in the repo (e.g., \"src/app/page.tsx\")"
+        },
+        "branch": {
+          "type": "string",
+          "description": "Branch to read from (e.g. \"draft/agentweb-preview\" to read back staged edits). Omit for \"main\". Never selects a different repo."
         }
       },
       "required": [

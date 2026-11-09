@@ -256,11 +256,25 @@ describe('provision_hot_lead_call_number', () => {
     await expect(provision()).rejects.toThrow('already has a caller number');
     expect(fake.boughtNumbers).toEqual([]);
   });
+  it('with no BACKEND_URL in a deployed environment, fails before reserving or buying anything', async () => {
+    const saved = { url: process.env.BACKEND_URL, env: process.env.NODE_ENV };
+    delete process.env.BACKEND_URL;
+    Object.assign(process.env, { NODE_ENV: 'production' });
+    try {
+      await expect(provision({ confirm: true })).rejects.toThrow('BACKEND_URL');
+    } finally {
+      Object.assign(process.env, { NODE_ENV: saved.env });
+      if (saved.url !== undefined) process.env.BACKEND_URL = saved.url;
+    }
+    expect(fake.boughtNumbers).toEqual([]);
+    expect(writes).toEqual([]);
+  });
 
   it('buys a US number, stores it conditionally, meters the first month and reveals neither number nor sid', async () => {
     fake.queueBuyNumberResult({ numberSid: NEW_SID, phoneNumber: NEW_NUMBER });
     const result = await provision({ confirm: true, areaCode: '415' });
-    expect(fake.boughtNumbers).toEqual([{ countryCode: 'US', areaCode: '415' }]);
+    // A new number is pointed at the inbound-callback endpoint at purchase.
+    expect(fake.boughtNumbers).toEqual([{ countryCode: 'US', areaCode: '415', voiceUrl: 'http://localhost:3001/api/webhooks/twilio-voice/inbound' }]);
     expect(org.hotLeadCall).toMatchObject({ twilioNumber: NEW_NUMBER, twilioNumberSid: NEW_SID, enabled: false, team: [{ phone: '+14155550100' }] });
     expect(result).toMatchObject({ success: true, callerNumber: '***0123' });
     expect(JSON.stringify(result)).not.toMatch(/4155550123|\+1415|PN/);
@@ -292,7 +306,7 @@ describe('provision_hot_lead_call_number', () => {
   it('omits areaCode when none is given and treats null as omitted', async () => {
     fake.queueBuyNumberResult({ numberSid: NEW_SID, phoneNumber: NEW_NUMBER });
     await provision({ confirm: true, areaCode: null });
-    expect(fake.boughtNumbers).toEqual([{ countryCode: 'US' }]);
+    expect(fake.boughtNumbers).toEqual([{ countryCode: 'US', voiceUrl: 'http://localhost:3001/api/webhooks/twilio-voice/inbound' }]);
   });
   it('keeps verification and the enabled flag as they were', async () => {
     org.hotLeadCall = configured({ verified: true });
@@ -655,6 +669,170 @@ describe('human approval for provision and release', () => {
   });
 });
 
+describe('human approval for turning calling on', () => {
+  const UPDATE = 'update_hot_lead_call_settings';
+  const ENABLE = { enabled: true };
+  const call = (args: unknown = ENABLE, ctx: Record<string, unknown> = attended()) => run(UPDATE, args, ctx) as Promise<Halt & Record<string, unknown>>;
+  const isOn = () => (org.hotLeadCall as { enabled: boolean }).enabled;
+  beforeEach(() => { org.hotLeadCall = withNumber({ verified: true }); });
+
+  it('halts with an approval card that says what turning calling on does, and does not enable', async () => {
+    const result = await call();
+    expect(result).toMatchObject({ success: true, awaitingUserConfirmation: true, type: 'ask_user_question', sessionId: SESSION });
+    const [card] = result.questionDeckPayload as Array<{ kind: string; question: string; options: Array<{ id: string }>; allowEmmaDecide: boolean; immutable: boolean }>;
+    expect(card).toMatchObject({ allowEmmaDecide: false, immutable: true });
+    expect(card.kind).toMatch(/^hot_lead_call_approval:enable:[0-9a-f]{64}:[0-9a-f]+$/);
+    expect(card.options.map(o => o.id)).toEqual(['decline', 'approve']);
+    expect(card.question).toContain('lead arrives from your landing page');
+    expect(card.question).toContain('Dana Lee (***0100)');
+    expect(card.question).toContain('from your number ***0111');
+    expect(card.question).toContain('Both calls are billed to the organization owner per minute at the current rate of $0.014 per minute, each rounded up to a whole minute');
+    expect(card.question).toContain('6 leads per hour, 20 per day, 200 per month, at most 3 call attempts per lead, only 08:00-21:00 America/Chicago');
+    expect(card.question).toContain('turn it off at any time');
+    expect(card.question).not.toMatch(/4155550100|4155550111/);
+    expect(isOn()).toBe(false);
+    expect(writes).toEqual([]);
+    expect(chatbotDb.claimMetaWriteManifestDigest).not.toHaveBeenCalled();
+  });
+  it('builds identical cards for identical calls in one reply (same kind but for the nonce), and another card for another change', async () => {
+    const [first, second, other] = [await call(), await call(), await call({ enabled: true, maxCallsPerHour: 3 })];
+    const prefixOf = (halt: Halt) => halt.questionDeckPayload![0].kind.replace(/:[0-9a-f]+$/, '');
+    expect(prefixOf(first)).toBe(prefixOf(second));
+    expect(prefixOf(other)).not.toBe(prefixOf(first));
+  });
+  it('a second identical call after the first one enabled succeeds without a card or another approval', async () => {
+    answerCard(recordHalt(await call()), 'approve');
+    await call();
+    const again = await call();
+    expect(again).toMatchObject({ success: true, enabled: true });
+    expect(again.awaitingUserConfirmation).toBeUndefined();
+    expect(chatbotDb.claimMetaWriteManifestDigest).toHaveBeenCalledTimes(1);
+  });
+  it('names every verified member, also with an apostrophe, ampersand or accent in the name', async () => {
+    org.hotLeadCall = withNumber({ team: [
+      teamMember('+14155550100', { name: "Dana O'Neil & Sons" }),
+      teamMember('+14155550122', { id: 'mzzzzzz2', name: 'José Núñez' }),
+    ] });
+    expect((await call()).questionDeckPayload![0].question).toContain("Dana O'Neil & Sons (***0100), José Núñez (***0122)");
+  });
+  it('shows the caps that will be in force, including the ones sent in the same call', async () => {
+    org.hotLeadCall = withNumber({ verified: true, maxCallsPerDay: 9, maxAttemptsPerLead: 2 });
+    expect((await call({ enabled: true, maxCallsPerHour: 3 })).questionDeckPayload![0].question).toContain('3 leads per hour, 9 per day, 200 per month, at most 2 call attempts per lead');
+  });
+  it('uses a different digest when a stored cap differs', async () => {
+    const digestOf = async () => String((await call()).questionDeckPayload![0].kind).split(':')[2];
+    const before = await digestOf();
+    org.hotLeadCall = withNumber({ verified: true, maxCallsPerDay: 9 });
+    expect(await digestOf()).not.toBe(before);
+  });
+  it('enables with exactly the approved patch when the same call also changes a cap', async () => {
+    const args = { enabled: true, maxCallsPerHour: 3 };
+    answerCard(recordHalt(await call(args)), 'approve');
+    await expect(call(args)).resolves.toMatchObject({ success: true, enabled: true, maxCallsPerHour: 3 });
+    expect(writes).toHaveLength(1);
+    expect(writes[0].updates.hotLeadCall).toEqual(withNumber({ verified: true, enabled: true, maxCallsPerHour: 3 }));
+  });
+  it('reuses the approval when the same patch comes with its keys in another order', async () => {
+    answerCard(recordHalt(await call({ enabled: true, maxCallsPerHour: 3 })), 'approve');
+    await expect(call({ maxCallsPerHour: 3, enabled: true })).resolves.toMatchObject({ enabled: true });
+    expect(isOn()).toBe(true);
+  });
+  it('names only the verified members, the ones that can be called', async () => {
+    org.hotLeadCall = withNumber({ team: [teamMember('+14155550100'), teamMember('+14155550122', { id: 'mzzzzzz2', name: 'Sam Ortiz', verifiedAt: undefined })] });
+    const question = (await call()).questionDeckPayload![0].question;
+    expect(question).toContain('Dana Lee (***0100)');
+    expect(question).not.toContain('Sam Ortiz');
+  });
+  it('enables only on the call after the user approved, claiming the approval first under the namespaced key', async () => {
+    const halt = await call();
+    answerCard(recordHalt(halt), 'approve');
+    await expect(call()).resolves.toMatchObject({ success: true, enabled: true });
+    expect(isOn()).toBe(true);
+    expect(writes).toHaveLength(1);
+    expect((chatbotDb.claimMetaWriteManifestDigest as jest.Mock).mock.calls).toEqual([[SESSION, `hotlead:${halt.questionDeckPayload![0].kind}`]]);
+  });
+  it('is single use: after calling was switched off again, enabling needs a new card', async () => {
+    answerCard(recordHalt(await call()), 'approve');
+    await call();
+    await expect(call({ enabled: false })).resolves.toMatchObject({ enabled: false });
+    expect((await call()).awaitingUserConfirmation).toBe(true);
+    expect(isOn()).toBe(false);
+  });
+  it('refuses and does not enable when the claim is lost', async () => {
+    answerCard(recordHalt(await call()), 'approve');
+    (chatbotDb.claimMetaWriteManifestDigest as jest.Mock).mockResolvedValueOnce(false);
+    await expect(call()).rejects.toThrow('already used');
+    expect(isOn()).toBe(false);
+    expect(writes).toEqual([]);
+  });
+  it('does not enable on a decline, a delegated answer, an unanswered card or an expired approval', async () => {
+    answerCard(recordHalt(await call()), 'decline');
+    expect((await call()).awaitingUserConfirmation).toBe(true);
+    sessions.clear();
+    answerCard(recordHalt(await call()), 'approve', SESSION, { answeredBy: 'delegation' });
+    expect((await call()).awaitingUserConfirmation).toBe(true);
+    sessions.clear();
+    recordHalt(await call());
+    expect((await call()).awaitingUserConfirmation).toBe(true);
+    sessions.clear();
+    answerCard(recordHalt(await call()), 'approve', SESSION, { at: new Date(T0 - 16 * MIN).toISOString() });
+    expect((await call()).awaitingUserConfirmation).toBe(true);
+    expect(isOn()).toBe(false);
+    expect(writes).toEqual([]);
+  });
+  it('does not accept an approval given in another chat session', async () => {
+    answerCard(recordHalt(await call(ENABLE, attended({ sessionId: 'sess-old' })), 'sess-old'), 'approve', 'sess-old');
+    expect((await call(ENABLE, attended({ sessionId: 'sess-new' }))).awaitingUserConfirmation).toBe(true);
+    expect(isOn()).toBe(false);
+  });
+  it('needs a new card when the stored settings changed between the card and the click', async () => {
+    answerCard(recordHalt(await call()), 'approve');
+    org.hotLeadCall = withNumber({ verified: true, maxCallsPerHour: 3 });
+    expect((await call()).awaitingUserConfirmation).toBe(true);
+    expect(isOn()).toBe(false);
+  });
+  it('needs a new card when the same call carries other settings than the approved one', async () => {
+    answerCard(recordHalt(await call()), 'approve');
+    expect((await call({ enabled: true, maxCallsPerHour: 3 })).awaitingUserConfirmation).toBe(true);
+    expect(isOn()).toBe(false);
+  });
+  it('does not accept an approval for another action', async () => {
+    org.hotLeadCall = withNumber({ verified: true });
+    answerCard(recordHalt(await run('release_hot_lead_call_number', {}, attended())), 'approve');
+    expect((await call()).awaitingUserConfirmation).toBe(true);
+  });
+  it.each([
+    ['an unattended run', { isUnattendedRun: true }, 'interactive chat'],
+    ['a delegated (support) session', { isDelegatedAccess: true }, 'customer in their own chat'],
+    ['a call without a chat session', { sessionId: undefined }, 'attended chat session'],
+  ])('refuses %s without showing a card', async (_label, extra, message) => {
+    await expect(call(ENABLE, attended(extra))).rejects.toThrow(message);
+    expect(isOn()).toBe(false);
+  });
+  it('refuses an unattended run before the session is even read', async () => {
+    await call(ENABLE, attended({ isUnattendedRun: true })).catch(() => undefined);
+    expect(chatbotDb.getChatSession).not.toHaveBeenCalled();
+  });
+  it.each([
+    ['plan does not include hot lead calls', () => setHotLeadCallEntitledOverride(false), 'not included'],
+    ['no verified member', () => { org.hotLeadCall = withNumber(); }, 'Verify the phone'],
+    ['no caller number', () => { org.hotLeadCall = configured({ verified: true }); }, 'phone number for calls'],
+  ])('refuses, before any card, when %s', async (_label, arrange, message) => {
+    arrange();
+    await expect(call()).rejects.toThrow(message);
+    expect(chatbotDb.getChatSession).not.toHaveBeenCalled();
+  });
+  it('does not gate turning calling off, other edits, lowering limits, or enabled:true on a setup that is already on', async () => {
+    org.hotLeadCall = withNumber({ verified: true, enabled: true });
+    await expect(call({ maxCallsPerHour: 3 })).resolves.toMatchObject({ maxCallsPerHour: 3, enabled: true });
+    await expect(call(ENABLE)).resolves.toMatchObject({ enabled: true });
+    await expect(call({ enabled: false })).resolves.toMatchObject({ enabled: false });
+    await expect(call({ maxCallsPerHour: 2, announcedName: 'Other Co' })).resolves.toMatchObject({ enabled: false, maxCallsPerHour: 2 });
+    expect(writes).toHaveLength(4);
+    expect(chatbotDb.getChatSession).not.toHaveBeenCalled();
+  });
+});
+
 describe('start_hot_lead_call_verification', () => {
   beforeEach(() => { org.hotLeadCall = withNumber(); });
 
@@ -821,7 +999,7 @@ describe('confirm_hot_lead_call_verification', () => {
   it('lets the org admin enable calling afterwards through the existing settings tool', async () => {
     await start();
     await confirm(codeFromCall());
-    await expect(run('update_hot_lead_call_settings', { enabled: true })).resolves.toMatchObject({ enabled: true, team: [{ verified: true }] });
+    await expect(withApproval('update_hot_lead_call_settings', { enabled: true })).resolves.toMatchObject({ enabled: true, team: [{ verified: true }] });
   });
   it('a confirm does not reset the start history: alternating phones cannot dodge the gap or the daily cap', async () => {
     await start();

@@ -396,6 +396,14 @@ describe('real voice provider', () => {
       await expect(getVoiceProvider().buyNumber({ countryCode: 'US', areaCode: '555' })).resolves.toEqual({ numberSid: 'PN1', phoneNumber: '+15555550123' });
       expect(mockLocalList).toHaveBeenCalledWith(expect.objectContaining({ areaCode: 555, voiceEnabled: true, limit: 1 }));
     });
+    it('points the new number at the given voice URL (POST), and sets no voice URL when none is given', async () => {
+      mockLocalList.mockResolvedValue([{ phoneNumber: '+15555550123' }]);
+      mockIncomingCreate.mockResolvedValue({ sid: 'PN1', phoneNumber: '+15555550123' });
+      await getVoiceProvider().buyNumber({ countryCode: 'US', voiceUrl: 'https://api.example.test/api/webhooks/twilio-voice/inbound' });
+      expect(mockIncomingCreate).toHaveBeenLastCalledWith({ phoneNumber: '+15555550123', voiceUrl: 'https://api.example.test/api/webhooks/twilio-voice/inbound', voiceMethod: 'POST' });
+      await getVoiceProvider().buyNumber({ countryCode: 'US' });
+      expect(mockIncomingCreate).toHaveBeenLastCalledWith({ phoneNumber: '+15555550123' });
+    });
     it.each([[{}], [{ sid: 7 }], [{ sid: '' }], [undefined]])('throws placed=unknown when the purchase response has no sid (%j)', async (resp) => {
       mockLocalList.mockResolvedValue([{ phoneNumber: '+15555550123' }]);
       mockIncomingCreate.mockResolvedValue(resp);

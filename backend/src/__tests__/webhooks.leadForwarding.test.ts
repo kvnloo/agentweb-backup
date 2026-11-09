@@ -1096,6 +1096,42 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
         expect(resendService.sendEmail).not.toHaveBeenCalled();
       });
 
+      it('ENG-673: skips auto-send for a lead that is being emailed through Smartlead (an existing lead resubmitting a form keeps its marker)', async () => {
+        (crmDb.getLeadListById as jest.Mock).mockResolvedValue(autoSendLeadList);
+        (crmDb.createLead as jest.Mock).mockResolvedValue({ leadId: 'lead_pushed', listId: 'list_123', email: 'pushed@example.com' });
+        (crmDb.getLeadById as jest.Mock).mockResolvedValue({
+          leadId: 'lead_pushed',
+          email: 'pushed@example.com',
+          system: { smartlead_77: { state: 'pushed', pushedAt: 'x', runId: 'r', payloadHash: 'h' } },
+        });
+
+        await request(app).post('/api/webhooks/forward-lead').send({ listId: 'list_123', email: 'pushed@example.com', firstName: 'Pushed' });
+        await new Promise((r) => setTimeout(r, 200));
+
+        expect(resendService.sendEmail).not.toHaveBeenCalled();
+        expect(leadListAlertService.notifyLeadListOwnerIfConfigured).toHaveBeenCalledWith(
+          expect.anything(), expect.anything(), 'api.lead_added',
+          expect.objectContaining({ autoSendStatus: 'skipped_smartlead' }),
+          expect.any(String),
+        );
+      });
+
+      it('skips auto-send for a lead that is do-not-contact (an unsubscribed lead resubmitting a form must not be emailed)', async () => {
+        (crmDb.getLeadListById as jest.Mock).mockResolvedValue(autoSendLeadList);
+        (crmDb.createLead as jest.Mock).mockResolvedValue({ leadId: 'lead_dnc', listId: 'list_123', email: 'dnc@example.com' });
+        (crmDb.getLeadById as jest.Mock).mockResolvedValue({ leadId: 'lead_dnc', email: 'dnc@example.com', contactStatus: 'unsubscribed' });
+
+        await request(app).post('/api/webhooks/forward-lead').send({ listId: 'list_123', email: 'dnc@example.com', firstName: 'Dnc' });
+        await new Promise((r) => setTimeout(r, 200));
+
+        expect(resendService.sendEmail).not.toHaveBeenCalled();
+        expect(leadListAlertService.notifyLeadListOwnerIfConfigured).toHaveBeenCalledWith(
+          expect.anything(), expect.anything(), 'api.lead_added',
+          expect.objectContaining({ autoSendStatus: 'skipped_do_not_contact' }),
+          expect.any(String),
+        );
+      });
+
       it('should skip auto-send when no sender is configured', async () => {
         (crmDb.getLeadListById as jest.Mock).mockResolvedValue(autoSendLeadList);
         (crmDb.createLead as jest.Mock).mockResolvedValue({

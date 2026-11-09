@@ -13,6 +13,7 @@
 
 import { dripSequenceDb, DripSequence, SequenceEnrollment, StepCondition, SequenceChannel } from './dripSequenceDb';
 import { isReachableEmail, canonicalLinkedInProfile } from '../utils/leadReachability';
+import { isPushedToSmartlead } from './smartleadMarkers';
 import { sendAsSender, SenderDailyLimitExceededError } from './sendAsSender';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import { crmDb, userDb } from './db';
@@ -197,7 +198,21 @@ async function processEnrollment(
     (String(step.channel ?? 'email').trim().toLowerCase() as SequenceChannel);
 
   // Build variable context for substitution (shared by both channels)
-  const lead = await crmDb.getLeadById(enrollment.listId, enrollment.leadId).catch(() => null);
+  // A failed READ is not "no such lead": sending on with no lead would skip every per-lead check (do-not-contact, a Smartlead marker). It throws,
+  // so the enrollment is neither sent nor advanced and is retried on the next pass. (A lead that is simply gone still reads as null.)
+  let leadReadFailed = false;
+  const lead = await crmDb.getLeadById(enrollment.listId, enrollment.leadId, { consistentRead: true }).catch(() => { leadReadFailed = true; return null; });
+  if (leadReadFailed) throw new Error(`Could not read lead ${enrollment.leadId} for enrollment ${enrollment.enrollmentId}; will retry`);
+
+  // ENG-673: this send must not reach a contact that is gone or marked do-not-contact, whatever the sequence's exit settings say (a sequence saved
+  // with onUnsubscribe off, or an older one without the field, used to skip the check in checkExitConditions). Checked on the lead just read,
+  // right before the send, so it cannot be skipped by a second read failing.
+  if (!lead || isDoNotContact(lead)) {
+    console.log(`[dripWorker] Enrollment ${enrollment.enrollmentId} exited: ${lead ? 'lead is marked do-not-contact' : 'lead no longer exists'}`);
+    await dripSequenceDb.exitEnrollment(enrollment.enrollmentId, lead ? 'unsubscribed' : 'manual');
+    stats.exited++;
+    return;
+  }
 
   // Check enrollment condition — exit (not just skip) if lead no longer meets it
   if (sequence.enrollmentCondition) {
@@ -291,6 +306,15 @@ async function sendEmailStep(
   const recipient = String(lead?.email ?? enrollment.leadEmail ?? '').trim();
   if (!isReachableEmail(recipient)) {
     console.log(`[dripWorker] Email step ${step.stepNumber} skipped for enrollment ${enrollment.enrollmentId}: lead has no email address`);
+    return false;
+  }
+
+  // ENG-673: a lead pushed to a customer's Smartlead campaign is being emailed from there. AgentWeb's own sequence must not also write to
+  // them (two senders, and Smartlead's unsubscribe and bounce handling would not see these emails). Checked HERE, at send time, not at
+  // enrolment, because a lead can be pushed after it was enrolled. The step is skipped like any step the lead cannot receive; LinkedIn
+  // steps are unaffected.
+  if (isPushedToSmartlead(lead)) {
+    console.log(`[dripWorker] Email step ${step.stepNumber} skipped for enrollment ${enrollment.enrollmentId}: lead is being emailed through Smartlead`);
     return false;
   }
 
@@ -464,7 +488,7 @@ async function checkExitConditions(
     lead = await crmDb.getLeadById(enrollment.listId, enrollment.leadId).catch(() => null);
   }
 
-  // Check if lead has unsubscribed — always enforced (onUnsubscribe is always true)
+  // Check if lead has unsubscribed. (processEnrollment also checks right before the send, whatever this setting says.)
   if (exitConditions.onUnsubscribe && lead && isDoNotContact(lead)) {
     console.log(`[dripWorker] Enrollment ${enrollment.enrollmentId} exited: lead ${enrollment.leadEmail} has unsubscribed`);
     return 'unsubscribed';
@@ -485,7 +509,18 @@ async function checkExitConditions(
   // 'opened' and 'clicked': a sequence set to stop when a lead REPLIED kept on sending.
   if (exitConditions.onEmailEngagement?.length) {
     const user = await userDb.getUserById(enrollment.userId).catch(() => null);
-    const emailDomain = (user as any)?.emailDomain;
+    // Opslane run 1268 P2: CRM sending domains live in emailDomains[] (ENG-265); the
+    // legacy single emailDomain may be empty for accounts set up after that. Read events
+    // for every domain the account sends from, deduped.
+    const domainSet = new Set<string>();
+    const legacyDomain = String((user as any)?.emailDomain ?? '').trim();
+    if (legacyDomain) domainSet.add(legacyDomain);
+    for (const d of ((user as any)?.emailDomains ?? []) as Array<{ domain?: string }>) {
+      const name = String(d?.domain ?? '').trim();
+      if (name) domainSet.add(name);
+    }
+    const emailDomains = [...domainSet];
+    const emailDomain = emailDomains[0];
 
     // A mailbox-only sender (Gmail/Outlook) has no Resend domain, and Resend webhooks are
     // the only source of these events — so there is nothing to find. Skip rather than
@@ -493,7 +528,7 @@ async function checkExitConditions(
     if (!emailDomain) {
       console.log(
         `[dripWorker] Skipping engagement exit check for enrollment ${enrollment.enrollmentId}: ` +
-        `user ${enrollment.userId} has no emailDomain, so no email events exist`,
+        `user ${enrollment.userId} has no sending domain, so no email events exist`,
       );
     } else {
       // Keyed on the address Resend actually saw, not on the enrollment identity. For a
@@ -501,9 +536,13 @@ async function checkExitConditions(
       // matched nothing and a sequence set to stop on 'replied' kept sending to someone
       // who had already replied. `lead` is loaded above for the unsubscribe check.
       const engagementKey = String((lead as any)?.email ?? '').trim() || enrollment.leadEmail;
-      const events = await emailEventsDb
-        .getEventsByEmailDomainAndLeadEmail(emailDomain, engagementKey)
-        .catch(() => []);
+      const events = (
+        await Promise.all(
+          emailDomains.map((d) =>
+            emailEventsDb.getEventsByEmailDomainAndLeadEmail(d, engagementKey).catch(() => []),
+          ),
+        )
+      ).flat();
 
       // Scope to engagement that happened AFTER this enrollment started.
       //
@@ -518,7 +557,9 @@ async function checkExitConditions(
       const wanted = exitConditions.onEmailEngagement;
       // ENG-2548: opens/clicks go through dripEngagementClassifier — link scanners and
       // image proxies no longer exit a lead. Replies always count.
-      const { trigger, suppressed } = selectEngagementExitTrigger(events, enrolledAt, wanted);
+      const { trigger, suppressed } = selectEngagementExitTrigger(events, enrolledAt, wanted, {
+        emailEverSent: !!(enrollment as any).lastEmailSentAt,
+      });
       for (const s of suppressed) {
         const detail = s.event?.data?.click || s.event?.data?.open || {};
         console.warn('[dripWorker] suspected_machine_engagement', JSON.stringify({

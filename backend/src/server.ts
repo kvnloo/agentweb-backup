@@ -441,7 +441,7 @@ const runDrain = async (reason: string): Promise<void> => {
   await import('./services/funding/claudeSubscriptionService')
     .then((m) => m.shutdownClaudeSubscriptionService())
     .catch(() => undefined);
-  // ENG-2110 1c: pending hosted sign-ins are cancelled on the login host (it also expires them itself).
+  // ENG-2110 1c: stops the hosted sign-in timers. Pending sign-ins are NOT cancelled on the login host: any instance can finish them, and the host expires abandoned ones itself.
   await import('./services/funding/hostedSubscriptionService')
     .then((m) => m.shutdownHostedSubscriptionService())
     .catch(() => undefined);
@@ -816,6 +816,54 @@ createTestAccount().then(async () => {
         console.error('[DomainReachability] Failed to initialize:', error);
       }
 
+      // ENG-673: the Smartlead push resumer. Every minute it claims push runs whose worker is gone (a crash or a deploy) and cancels runs
+      // left paused for a week. It does nothing unless SMARTLEAD_PUSH_ENABLED=true. In-flight work is drained at shutdown by the registry.
+      try {
+        const { getSmartleadPushService } = await import('./services/smartleadPushRuntime');
+        const { pollSmartleadEvents } = await import('./services/smartleadEventRuntime');
+        setInterval(() => {
+          // The tick itself does nothing but retry cancels of unsettled starts while the push is switched off.
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('SmartleadPushResumer', getSmartleadPushService().resumerTick())
+            .catch(e => console.error('[SmartleadPush] Resumer error:', e));
+        }, 60 * 1000);
+        console.log('[SmartleadPush] Resumer initialized — every minute (active only when SMARTLEAD_PUSH_ENABLED=true)');
+
+        // The withdrawal sweep: an opt-out recorded here must reach Smartlead. Hourly, and deliberately NOT behind the kill switch (stopping
+        // pushes must never stop opt-outs); it only has work when a push has ever run.
+        setTimeout(() => {
+          let sweeping = false; // a pass over many lists can outlast the hour: never overlap two
+          const sweep = () => {
+            if (!isCronEnabled() || sweeping) return;
+            sweeping = true;
+            cronJobRegistry.track('SmartleadWithdrawalSweep', getSmartleadPushService().sweepWithdrawals())
+              .catch(e => console.error('[SmartleadWithdrawal] Sweep error:', e))
+              .finally(() => { sweeping = false; });
+          };
+          sweep();
+          setInterval(sweep, 60 * 60 * 1000);
+        }, 5 * 60 * 1000);
+        console.log('[SmartleadWithdrawal] Sweep initialized — hourly, first pass in 5 minutes');
+
+        // The event poll: backs up the Smartlead event webhook, so a missed unsubscribe or bounce still blocks the contact. Hourly, offset from the
+        // withdrawal sweep, and like it NOT behind the kill switch.
+        setTimeout(() => {
+          let polling = false; // a pass over many campaigns can outlast the hour: never overlap two
+          const poll = () => {
+            if (!isCronEnabled() || polling) return;
+            polling = true;
+            cronJobRegistry.track('SmartleadEventPoll', pollSmartleadEvents())
+              .catch(e => console.error('[SmartleadPoll] Poll error:', e))
+              .finally(() => { polling = false; });
+          };
+          poll();
+          setInterval(poll, 60 * 60 * 1000);
+        }, 20 * 60 * 1000);
+        console.log('[SmartleadPoll] Event poll initialized — hourly, first pass in 20 minutes');
+      } catch (error) {
+        console.error('[SmartleadPush] Failed to initialize the resumer:', error);
+      }
+
       // ENG-2156: warn oncall at 80%/95% of the OpenRouter key's own monthly limit, before
       // the cap starts 402'ing every Agent Mode call. Read-only; hourly from boot.
       try {
@@ -1175,6 +1223,44 @@ createTestAccount().then(async () => {
         );
       } catch (error) {
         console.error('[numberRentCron] Failed to initialize:', error);
+      }
+
+      // Hot-lead call stuck-record sweep (ENG-2271) — daily. Finds call records that stayed
+      // live longer than a call can last and settles them from Twilio's own record. Anchored to
+      // a fixed UTC hour like the rent sweep. REPORT-ONLY unless HOT_LEAD_CALL_STUCK_SWEEP=close;
+      // =off disables it.
+      try {
+        const { runStuckCallSweepCron } = await import('./cron/stuckCallSweepCron');
+        const { msUntilNextUtcHour } = await import('./utils/dailySchedule');
+        const STUCK_CALL_SWEEP_HOUR_UTC = 12;
+        const DAY_MS = 24 * 60 * 60 * 1000;
+        const msUntilFirstStuckCallSweepRun = msUntilNextUtcHour(STUCK_CALL_SWEEP_HOUR_UTC);
+        setTimeout(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('stuckCallSweepCron', runStuckCallSweepCron())
+            .catch(e => console.error('[stuckCallSweepCron] Error:', e));
+          setInterval(() => {
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('stuckCallSweepCron', runStuckCallSweepCron())
+              .catch(e => console.error('[stuckCallSweepCron] Error:', e));
+          }, DAY_MS);
+        }, msUntilFirstStuckCallSweepRun);
+        console.log(
+          `[stuckCallSweepCron] Initialized — first run at ${STUCK_CALL_SWEEP_HOUR_UTC}:00 UTC ` +
+          `(in ${Math.round(msUntilFirstStuckCallSweepRun / 60000)} min)`,
+        );
+      } catch (error) {
+        console.error('[stuckCallSweepCron] Failed to initialize:', error);
+      }
+
+      // Hot-lead call due-retries (ENG-2783): every 5 minutes, places the one retry of a lead who pressed 2 ("not available
+      // now") once it is due; the job queue cannot run a job later. Does nothing while the global hot_lead_call_mode kill
+      // switch is off. HOT_LEAD_CALL_RETRY=off|0|false does not arm it.
+      try {
+        const { startHotLeadCallRetryCron } = await import('./cron/hotLeadCallRetryCron');
+        startHotLeadCallRetryCron({ enabled: isCronEnabled, track: (name, run) => cronJobRegistry.track(name, run) });
+      } catch (error) {
+        console.error('[hotLeadCallRetryCron] Failed to initialize:', error);
       }
 
       // Pre-Renewal Ad-Integration Health Check (ENG-1270) — runs daily.

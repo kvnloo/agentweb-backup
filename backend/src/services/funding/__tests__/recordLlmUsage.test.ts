@@ -6,6 +6,7 @@ import { meterWithResolvedBilling } from '../../agentMode/deferredBillingMeterin
 import {
   recordLlmUsage,
   customerUpstreamCost,
+  openRouterByokCostUsd,
   type RecordLlmUsageInput,
 } from '../recordLlmUsage';
 import {
@@ -243,5 +244,73 @@ describe('recordLlmUsage (ENG-1816 F1)', () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(record).toHaveBeenCalledTimes(1);
+  });
+
+  describe('openRouterByokCostUsd (ENG-2720: upstream tokens plus OpenRouter\'s own charge)', () => {
+    it('adds the router charge (web-search fee) to the upstream bill when the response reports the server tool use', () => {
+      // the shape of a real response: Exa search fee $0.007, token bill $0.0005, one search reported
+      expect(openRouterByokCostUsd({ cost: 0.007, cost_details: { upstream_inference_cost: 0.00049 }, server_tool_use_details: { web_search_requests: 1, tool_calls_executed: 1 } })).toBeCloseTo(0.00749, 8);
+      expect(openRouterByokCostUsd({ cost: 0.005, cost_details: { upstream_inference_cost: 0.0007 }, server_tool_use_details: { web_search_requests: 1 } })).toBeCloseTo(0.0057, 8);
+    });
+    it('adds a platform fee that is smaller than the token bill even without a server tool', () => {
+      expect(openRouterByokCostUsd({ cost: 0.0005, cost_details: { upstream_inference_cost: 0.01 } })).toBeCloseTo(0.0105, 8);
+    });
+    it('NEVER drops a real search fee, even when the response lacks the server-tool-use field (Luna: fee is several times the token bill)', () => {
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      for (const shape of [undefined, {}, { web_search_requests: 0 }, 'weird', ['x'], { nested: { web_search_requests: 1 } }]) {
+        const usage: any = { cost: 0.007, cost_details: { upstream_inference_cost: 0.0005 } };
+        if (shape !== undefined) usage.server_tool_use_details = shape;
+        expect(openRouterByokCostUsd(usage)).toBeCloseTo(0.0075, 8);
+      }
+      warn.mockRestore();
+    });
+    it('books both bills for a charge that equals the token bill with no tool use, and warns (tripwire only), at most once a minute', () => {
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      const now = jest.spyOn(Date, 'now');
+      const shape = { cost: 0.0068, cost_details: { upstream_inference_cost: 0.0068 } };
+      // a clock later than any warning an earlier test may have triggered, so the throttle starts open
+      const base = Date.now() + 24 * 3_600_000;
+      now.mockReturnValue(base);
+      expect(openRouterByokCostUsd(shape)).toBeCloseTo(0.0136, 8);
+      expect(openRouterByokCostUsd(shape)).toBeCloseTo(0.0136, 8);
+      expect(openRouterByokCostUsd({ cost: 0.02, cost_details: { upstream_inference_cost: 0.0068 } })).toBeCloseTo(0.0268, 8);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0][1]).toEqual({ usageKeys: ['cost', 'cost_details'], costDetailKeys: ['upstream_inference_cost'] });
+      now.mockReturnValue(base + 61_000);
+      openRouterByokCostUsd(shape);
+      expect(warn).toHaveBeenCalledTimes(2);
+      now.mockRestore();
+      warn.mockRestore();
+    });
+    it('does not warn for real shapes: search with its tool use, a platform fee below the token bill, no router charge', () => {
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      // a clock later than any earlier test's throttle timestamp, so a wrongly-fired warning would not be hidden by the throttle
+      const now = jest.spyOn(Date, 'now').mockReturnValue(Date.now() + 72 * 3_600_000);
+      openRouterByokCostUsd({ cost: 0.007, cost_details: { upstream_inference_cost: 0.0005 }, server_tool_use_details: { web_search_requests: 1 } });
+      openRouterByokCostUsd({ cost: 0.0005, cost_details: { upstream_inference_cost: 0.01 } });
+      openRouterByokCostUsd({ cost: 0, cost_details: { upstream_inference_cost: 0.00004 } });
+      expect(warn).not.toHaveBeenCalled();
+      now.mockRestore();
+      warn.mockRestore();
+    });
+    it('still adds the charge when it equals the token bill but a server tool really ran', () => {
+      expect(openRouterByokCostUsd({ cost: 0.007, cost_details: { upstream_inference_cost: 0.007 }, server_tool_use_details: { web_search_requests: 1 } })).toBeCloseTo(0.014, 8);
+    });
+    it('returns the upstream bill alone when OpenRouter charged nothing or an unusable amount', () => {
+      for (const cost of [0, -1, NaN, Infinity, undefined, '0.007' as unknown as number]) {
+        expect(openRouterByokCostUsd({ cost, cost_details: { upstream_inference_cost: 0.0119 } })).toBe(0.0119);
+      }
+    });
+    it('stays undefined with no upstream bill and no fee, so the price book prices the tokens as before', () => {
+      for (const upstream of [undefined, 0, -1, NaN, 'x' as unknown as number]) {
+        expect(openRouterByokCostUsd({ cost: 0, cost_details: { upstream_inference_cost: upstream } })).toBeUndefined();
+      }
+      expect(openRouterByokCostUsd({})).toBeUndefined();
+    });
+    it('books a fee with no upstream bill on top of the book token cost instead of dropping it', () => {
+      expect(openRouterByokCostUsd({ cost: 0.007 }, 0.0004)).toBeCloseTo(0.0074, 8);
+      expect(openRouterByokCostUsd({ cost: 0.007 })).toBe(0.007);
+      expect(openRouterByokCostUsd({ cost: 0.007 }, NaN)).toBe(0.007);
+    });
   });
 });

@@ -6,17 +6,16 @@
 jest.mock('../services/metaService', () => ({
   metaService: { getAdAccountCurrency: jest.fn() },
 }));
-jest.mock('../utils/agentModeAlerts', () => ({
-  sendAgentModeOncallAlert: jest.fn(),
+jest.mock('../services/metaConnectionExpiredAlert', () => ({
+  sendMetaConnectionExpiredAlert: jest.fn(),
 }));
 
 import { metaService } from '../services/metaService';
-import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
+import { sendMetaConnectionExpiredAlert } from '../services/metaConnectionExpiredAlert';
 import {
   decideMetaHandoff,
   raiseMetaConnectionHandoff,
   verifyMetaAdAccountReadBack,
-  META_HANDOFF_DEDUPE_WINDOW_MS,
 } from '../services/metaConnectionHandoff';
 
 const NOW = Date.parse('2026-10-13T00:00:00Z');
@@ -48,29 +47,38 @@ describe('decideMetaHandoff', () => {
 describe('raiseMetaConnectionHandoff', () => {
   beforeEach(() => jest.clearAllMocks());
 
-  it('sends one alert naming customer, account, and the single next actor, deduped per account', async () => {
-    (sendAgentModeOncallAlert as jest.Mock).mockResolvedValue(true);
+  it('alerts once, facts only, when an existing connection expired', async () => {
+    (sendMetaConnectionExpiredAlert as jest.Mock).mockResolvedValue(true);
     const ok = await raiseMetaConnectionHandoff({
       reason: 'refresh_failed', userId: 'u1', customerEmail: 'a@haven.com', account: account(NOW - 1), error: 'expired', now: NOW,
     });
     expect(ok).toBe(true);
-    expect(sendAgentModeOncallAlert).toHaveBeenCalledTimes(1);
-    const p = (sendAgentModeOncallAlert as jest.Mock).mock.calls[0][0];
-    expect(p.subject).toContain('a@haven.com');
-    expect(p.subject).toContain('Haven Ads (123)');
-    expect(p.message).toMatch(/Next actor: Customer — /);
-    expect(p.message.match(/Next actor:/g)).toHaveLength(1);
-    expect(p.dedupeKey).toBe('meta-connection:u1:123:refresh_failed');
-    expect(p.dedupeWindowMs).toBe(META_HANDOFF_DEDUPE_WINDOW_MS);
-    expect(p.context['Alert Class']).toBe('meta-token-invalid');
-    expect(p.context['Alert Scope']).toBe('meta-ad-account:123');
-    expect(p.userId).toBe('u1');
+    expect(sendMetaConnectionExpiredAlert).toHaveBeenCalledWith({
+      accountId: '123', accountName: 'Haven Ads', customerEmail: 'a@haven.com', userId: 'u1',
+      expiredAt: NOW - 1, error: 'expired', now: NOW,
+    });
+  });
+
+  it('does not alert when the token is still in date and the error is not a dead token', async () => {
+    const ok = await raiseMetaConnectionHandoff({
+      reason: 'refresh_failed', userId: 'u1', account: account(NOW + 86400000), error: '(#4) rate limited', now: NOW,
+    });
+    expect(ok).toBe(false);
+    expect(sendMetaConnectionExpiredAlert).not.toHaveBeenCalled();
+  });
+
+  it('does not alert on a reconnect read-back failure (the connection was not lost)', async () => {
+    const ok = await raiseMetaConnectionHandoff({
+      reason: 'reconnect_readback_failed', userId: 'u1', account: account(NOW + 86400000), error: '(#200) no permission', now: NOW,
+    });
+    expect(ok).toBe(false);
+    expect(sendMetaConnectionExpiredAlert).not.toHaveBeenCalled();
   });
 
   it('never throws when the alert send fails', async () => {
-    (sendAgentModeOncallAlert as jest.Mock).mockRejectedValue(new Error('smtp down'));
+    (sendMetaConnectionExpiredAlert as jest.Mock).mockRejectedValue(new Error('smtp down'));
     await expect(
-      raiseMetaConnectionHandoff({ reason: 'refresh_failed', userId: 'u', account: account(), error: 'x' })
+      raiseMetaConnectionHandoff({ reason: 'refresh_failed', userId: 'u', account: account(NOW - 1), error: 'expired', now: NOW })
     ).resolves.toBe(false);
   });
 });

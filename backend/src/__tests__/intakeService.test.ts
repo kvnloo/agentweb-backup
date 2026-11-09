@@ -1,8 +1,5 @@
 import { fileUserIssue, fileAutoIssue } from '../services/intakeService';
 
-jest.mock('../services/notionService', () => ({
-  createOncallItem: jest.fn().mockResolvedValue({ pageId: 'notion-1', notionUrl: 'https://notion.so/notion-1' }),
-}));
 jest.mock('../services/dedupService', () => ({ findDuplicate: jest.fn(), MAX_CANDIDATES: 30 }));
 jest.mock('../services/featurebaseService', () => ({
   listOpenPosts: jest.fn().mockResolvedValue([]),
@@ -31,30 +28,15 @@ jest.mock('../services/linearService', () => ({
 jest.mock('../services/resendService', () => ({ resendService: { sendSystemEmail: jest.fn() } }));
 jest.mock('../services/shipNotifyService', () => ({ notifyReporterShipped: jest.fn().mockResolvedValue('sent') }));
 
-const notion = require('../services/notionService');
 const dedup = require('../services/dedupService');
 const fb = require('../services/featurebaseService');
 const linear = require('../services/linearService');
 const resend = require('../services/resendService').resendService;
 const shipNotify = require('../services/shipNotifyService');
 
-describe('fileUserIssue — flag off', () => {
-  const realFlag = process.env.FEATUREBASE_INTAKE;
-  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
-
-  it('files to Notion (migration default, not a fallback)', async () => {
-    process.env.FEATUREBASE_INTAKE = 'false';
-    const r = await fileUserIssue({ type: 'bug', title: 't', description: 'd', userEmail: 'u@e.com' });
-    expect(notion.createOncallItem).toHaveBeenCalled();
-    expect(r.tracker).toBe('Notion');
-    expect(dedup.findDuplicate).not.toHaveBeenCalled();
-  });
-});
-
 describe('fileUserIssue — feature_request (public post)', () => {
-  const realFlag = process.env.FEATUREBASE_INTAKE;
-  beforeEach(() => { process.env.FEATUREBASE_INTAKE = 'true'; fb.listOpenPosts.mockResolvedValue([]); });
-  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
+  beforeEach(() => { fb.listOpenPosts.mockResolvedValue([]); });
+  afterEach(() => { jest.clearAllMocks(); });
 
   it('no match -> creates a public post authored by the filer + a private eng note', async () => {
     dedup.findDuplicate.mockResolvedValue(null);
@@ -78,9 +60,8 @@ describe('fileUserIssue — feature_request (public post)', () => {
 });
 
 describe('fileUserIssue — bug (private own-card + one canonical listing affected users)', () => {
-  const realFlag = process.env.FEATUREBASE_INTAKE;
-  beforeEach(() => { process.env.FEATUREBASE_INTAKE = 'true'; linear.listOpenBugCanonicals.mockResolvedValue([]); });
-  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
+  beforeEach(() => { linear.listOpenBugCanonicals.mockResolvedValue([]); });
+  afterEach(() => { jest.clearAllMocks(); });
 
   it('no canonical -> creates the card + ONE canonical Linear ticket (lists affected user) + a reporter-ticket comment', async () => {
     dedup.findDuplicate.mockResolvedValue(null);
@@ -118,7 +99,7 @@ describe('fileUserIssue — bug (private own-card + one canonical listing affect
   it('createTicket throws -> PROPAGATES (no Notion fallback)', async () => {
     fb.createTicket.mockRejectedValue(new Error('FB tickets down'));
     await expect(fileUserIssue({ type: 'bug', title: 'x', description: 'd', userEmail: 'u@e.com' })).rejects.toThrow('FB tickets down');
-    expect(notion.createOncallItem).not.toHaveBeenCalled();
+
   });
 
   it('canonical comment failure is best-effort -> the card is still returned', async () => {
@@ -132,13 +113,11 @@ describe('fileUserIssue — bug (private own-card + one canonical listing affect
 });
 
 describe('fileUserIssue — bug, noResolvableReporter (ENG-939 AC4: unresolved telemetry-affected user, never default to the surfacing reviewer)', () => {
-  const realFlag = process.env.FEATUREBASE_INTAKE;
   beforeEach(() => {
-    process.env.FEATUREBASE_INTAKE = 'true';
     linear.listOpenBugCanonicals.mockResolvedValue([]);
     dedup.findDuplicate.mockResolvedValue(null);
   });
-  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
+  afterEach(() => { jest.clearAllMocks(); });
 
   it('never mints a personal Featurebase card for the surfacing reviewer', async () => {
     linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9', url: 'lin', id: 'uuid-9' });
@@ -185,16 +164,13 @@ describe('fileUserIssue — bug, noResolvableReporter (ENG-939 AC4: unresolved t
 });
 
 describe('fileUserIssue — bug priority mapping (ENG-231: stated priority becomes the Linear field, blended with the funnel tier)', () => {
-  const realFlag = process.env.FEATUREBASE_INTAKE;
   beforeEach(() => {
-    process.env.FEATUREBASE_INTAKE = 'true';
     linear.listOpenBugCanonicals.mockResolvedValue([]);
     dedup.findDuplicate.mockResolvedValue(null);
     linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9', url: 'lin', id: 'uuid-9' });
     fb.createTicket.mockResolvedValue({ id: 'tk', number: 7, url: 'https://fb/t/7' });
   });
   afterEach(() => {
-    process.env.FEATUREBASE_INTAKE = realFlag;
     jest.clearAllMocks();
   });
 
@@ -561,15 +537,13 @@ describe('intakeService.notifyCanonicalResolved — @Emma comment parrot (ENG-31
 });
 
 describe('intakeService.fileAutoIssue', () => {
-  const realFlag = process.env.FEATUREBASE_INTAKE;
-  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
+  afterEach(() => { jest.clearAllMocks(); });
 
-  it('auto issues always use Linear even when the customer-intake migration flag is off', async () => {
-    process.env.FEATUREBASE_INTAKE = 'false';
+  it('auto issues file to Linear', async () => {
     linear.listOpenIssuesByLabel.mockResolvedValue([]);
     linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-6', url: 'u' });
     const r = await fileAutoIssue({ title: 't', description: 'd', source: 'Context limit' });
-    expect(notion.createOncallItem).not.toHaveBeenCalled();
+
     expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(
       expect.objectContaining({
         labelNames: ['Auto', 'Bug', 'Needs PM'],
@@ -581,7 +555,6 @@ describe('intakeService.fileAutoIssue', () => {
   });
 
   it('maps the autofix execution route to an executable Todo owned by Manan', async () => {
-    process.env.FEATUREBASE_INTAKE = 'true';
     linear.listOpenIssuesByLabel.mockResolvedValue([]);
     linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-8', url: 'u' });
 
@@ -602,7 +575,6 @@ describe('intakeService.fileAutoIssue', () => {
   });
 
   it('maps the human-triage route to Needs PM and Harsha without autofix', async () => {
-    process.env.FEATUREBASE_INTAKE = 'true';
     linear.listOpenIssuesByLabel.mockResolvedValue([]);
     linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9', url: 'u' });
 
@@ -701,7 +673,6 @@ describe('intakeService.fileAutoIssue', () => {
   });
 
   it('flag ON + open Auto issue with same title -> groups (comment), no new issue', async () => {
-    process.env.FEATUREBASE_INTAKE = 'true';
     linear.listOpenIssuesByLabel.mockResolvedValue([{ identifier: 'ENG-7', issueId: 'uuid-7', title: 'Context limit reached' }]);
     const r = await fileAutoIssue({ title: '  Context Limit Reached ', description: 'd', source: 'Context limit' });
     expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-7', expect.stringContaining('Recurred on'));
@@ -743,7 +714,6 @@ describe('intakeService.fileAutoIssue', () => {
   });
 
   it('flag ON + no match -> creates a private internal issue with the Auto label', async () => {
-    process.env.FEATUREBASE_INTAKE = 'true';
     linear.listOpenIssuesByLabel.mockResolvedValue([]);
     linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-8', url: 'u' });
     const r = await fileAutoIssue({ title: 'new auto', description: 'd', source: 'Scheduled chat', extraLabels: ['Scheduled Chat'] });
@@ -755,9 +725,7 @@ describe('intakeService.fileAutoIssue', () => {
 });
 
 describe('intakeService.fileAutoIssue — archived canonical (ENG-730)', () => {
-  const realFlag = process.env.FEATUREBASE_INTAKE;
-  beforeEach(() => { process.env.FEATUREBASE_INTAKE = 'true'; });
-  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
+  afterEach(() => { jest.clearAllMocks(); });
 
   // AC1/AC2: the only matching canonical for this class was archived. listOpenIssuesByLabel never
   // returns archived rows (linearService contract), so `open` is empty here — exactly as it would
@@ -839,9 +807,7 @@ describe('intakeService.fileAutoIssue — archived canonical (ENG-730)', () => {
 });
 
 describe('intakeService.fileAutoIssue — idempotency-key dedup (ENG-240)', () => {
-  const realFlag = process.env.FEATUREBASE_INTAKE;
-  beforeEach(() => { process.env.FEATUREBASE_INTAKE = 'true'; });
-  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
+  afterEach(() => { jest.clearAllMocks(); });
 
   // AC #1: a zero-output run trips BOTH the scheduled-chat filer and the oncall alert. They carry the
   // same Schedule ID; the second (oncall) must land on the first's issue, not create a twin — even
@@ -945,14 +911,12 @@ describe('intakeService.fileAutoIssue — idempotency-key dedup (ENG-240)', () =
 });
 
 describe('intakeService.fileBugReport — reopen, not refile (ENG-240 contract #3)', () => {
-  const realFlag = process.env.FEATUREBASE_INTAKE;
   beforeEach(() => {
-    process.env.FEATUREBASE_INTAKE = 'true';
     linear.listOpenBugCanonicals.mockResolvedValue([]);
     linear.listRecentlyResolvedBugCanonicals.mockResolvedValue([]);
     fb.createTicket.mockResolvedValue({ id: 'tk', number: 58, url: 'https://fb/t/58' });
   });
-  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
+  afterEach(() => { jest.clearAllMocks(); });
 
   it('a regression report referencing a resolved canonical REOPENS it instead of filing a new one', async () => {
     // No OPEN canonical, but the report names AGW-58 and a recently-RESOLVED canonical matches.
@@ -1021,15 +985,13 @@ describe('intakeService.fileBugReport — reopen, not refile (ENG-240 contract #
 });
 
 describe('intakeService.fileBugReport — exact-reference short-circuit (fix for AGW false-new-duplicate, ENG-329 incident)', () => {
-  const realFlag = process.env.FEATUREBASE_INTAKE;
   // The exact-ref scan reads comments through the same detailed helper as the resolve bridge.
   const c = (body: string) => ({ body, createdAt: '2026-07-01T00:00:00.000Z' });
   beforeEach(() => {
-    process.env.FEATUREBASE_INTAKE = 'true';
     fb.createTicket.mockResolvedValue({ id: 'tk', number: 121, url: 'https://fb/t/121' });
     linear.getIssueCommentsDetailed.mockResolvedValue([]);
   });
-  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
+  afterEach(() => { jest.clearAllMocks(); });
 
   it('no ticket reference in text -> fuzzy dedup runs exactly as before, the comment scan never fires', async () => {
     linear.listOpenBugCanonicals.mockResolvedValue([
@@ -1178,9 +1140,7 @@ describe('intakeService.fileBugReport — exact-reference short-circuit (fix for
 });
 
 describe('intakeService.fileAutoIssue — alert-class clustering (ENG-358)', () => {
-  const realFlag = process.env.FEATUREBASE_INTAKE;
-  beforeEach(() => { process.env.FEATUREBASE_INTAKE = 'true'; });
-  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
+  afterEach(() => { jest.clearAllMocks(); });
 
   const V0_CONTEXT = {
     'Plan': 'v0-team',
@@ -1382,11 +1342,8 @@ describe('fileUserIssue — bug, ENG-1335 occurrence ladder + semantic grouping'
     description: 'REPEAT REQUEST — sixth window. When the user simply has not replied, judges dock goalCompletion; score it neutral instead.',
     userEmail: 'rep@e.com',
   };
-  const realFlag = process.env.FEATUREBASE_INTAKE;
-  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; });
   beforeEach(() => {
     jest.clearAllMocks();
-    process.env.FEATUREBASE_INTAKE = 'true';
     linear.listOpenBugCanonicals.mockResolvedValue([ENG_1165]);
     fb.createTicket.mockResolvedValue({ id: 'tk', number: 42, url: 'https://fb/t/42' });
     fb.findTicketByMarker = jest.fn().mockResolvedValue(null);
@@ -1683,6 +1640,56 @@ describe('intakeService.fileAutoIssue — legacy canonical fold (ENG-2492)', () 
     });
     expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(1);
     expect(linear.createInternalLinearIssue.mock.calls[0][0].description).toContain(`Alert Class: unipile-disconnected:${ACCT}`);
+    expect(r).toMatchObject({ deduped: false });
+  });
+});
+
+// ENG-2766: a Meta connection handoff for an account whose tracking-monitor canonical
+// ("Meta ad account X cannot be read — token invalid") is open must recur on THAT issue.
+// Prod regression: the candidate scan was capped at the newest 50 open Auto issues, so an
+// older canonical fell out of view and every handoff filed a parallel issue.
+describe('fileAutoIssue — Meta handoff converges on the tracking-monitor canonical (ENG-2766)', () => {
+  afterEach(() => jest.clearAllMocks());
+  const canonical = (acct: string, id: string) => ({
+    identifier: id,
+    issueId: `uuid-${id}`,
+    title: `Meta ad account ${acct} cannot be read — token invalid`,
+    description:
+      `Meta rejected our stored credentials for ad account ${acct}.\n\n---\n\nSource: Oncall alert — auto-identified by the system.\n\n` +
+      `* Alert Class: meta-token-invalid\n* Alert Scope: meta-ad-account:${acct}\n* Alert Priority: high\n* Ad Account: ${acct}`,
+  });
+  const handoff = (acct: string) => ({
+    title: `Meta connection: order@kraftersland.com — krafter's Land Cabinetry (${acct}) token expired`,
+    description: 'Next actor: Customer',
+    source: 'Oncall alert',
+    executionRoute: 'human-triage' as const,
+    extraLabels: ['Oncall'],
+    notionContext: {
+      'Alert Class': 'meta-token-invalid',
+      'Alert Scope': `meta-ad-account:${acct}`,
+      userId: 'u-1',
+      accountId: acct,
+      reason: 'refresh_failed',
+    },
+  });
+  const noise = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({ identifier: `ENG-${3000 + i}`, issueId: `uuid-n${i}`, title: `noise ${i}`, description: 'x' }));
+
+  it('recurs on the open canonical even when it is older than 50 other open Auto issues', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([...noise(80), canonical('4220433474834949', 'ENG-2374')]);
+    const r = await fileAutoIssue(handoff('4220433474834949'));
+    expect(linear.listOpenIssuesByLabel).toHaveBeenCalledWith('Auto');
+    expect(linear.createInternalLinearIssue).not.toHaveBeenCalled();
+    expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-ENG-2374', expect.stringContaining('Recurred on'));
+    expect(r).toMatchObject({ pageId: 'ENG-2374', deduped: true });
+  });
+
+  it('a different account still files its own issue', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([...noise(80), canonical('4220433474834949', 'ENG-2374')]);
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9100', id: 'uuid-9100', url: 'u' });
+    const r = await fileAutoIssue(handoff('1430365244346362'));
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(1);
+    expect(linear.addIssueComment).not.toHaveBeenCalled();
     expect(r).toMatchObject({ deduped: false });
   });
 });

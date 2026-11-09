@@ -28,6 +28,7 @@ import { isSmokeTestPhone } from '../utils/smokeTestLead';
 import { normalizeLinkedInUrl } from "./enrichmentGroups";
 import { isLinkedInPlaceholderName } from "../utils/anonymizedLinkedInLead";
 import { isConditionalFailure } from "./voice/setupWrites";
+import { LEAD_SUBMISSION_CLAIM_PARTITION } from "./leadSubmissionIdempotency";
 import { MAX_ATOMIC_RUN_RESULT_REMOVALS, isDynamoItemSizeError, trimListToItemBudget } from "../utils/dynamoItemBudget";
 
 // Load environment variables from .env file
@@ -3119,7 +3120,12 @@ export const taskDb = {
         this.scanAllItems(`${TABLE_PREFIX}AW-TaskExecutions`),
         this.scanAllItems(`${TABLE_PREFIX}AW-TaskSchedules`),
         this.scanAllItems(`${TABLE_PREFIX}AW-TaskTemplates`),
-        this.scanAllItems(`${TABLE_PREFIX}AW-Configs`),
+        // ENG-2837: exclude the lead-submission claim partition server-side — claims are not
+        // configs, and an unbounded set of them must not be loaded into analytics memory.
+        this.scanAllItems(`${TABLE_PREFIX}AW-Configs`, {
+          FilterExpression: "userId <> :leadSubmissionClaimPartition",
+          ExpressionAttributeValues: { ":leadSubmissionClaimPartition": LEAD_SUBMISSION_CLAIM_PARTITION },
+        }),
         this.scanAllItems(`${TABLE_PREFIX}AW-Workflows`),
         this.scanAllItems(`${TABLE_PREFIX}AW-WorkflowExecutions`),
       ]);
@@ -3196,14 +3202,19 @@ export const taskDb = {
     }
   },
 
-  // Helper function to scan all items with pagination
-  async scanAllItems(tableName: string) {
+  // Helper function to scan all items with pagination. `filter` is applied server-side
+  // (Scan FilterExpression) so excluded items never reach this process.
+  async scanAllItems(
+    tableName: string,
+    filter?: { FilterExpression: string; ExpressionAttributeValues: Record<string, unknown> },
+  ) {
     const items: any[] = [];
     let lastEvaluatedKey: any = undefined;
 
     do {
       const params: any = {
         TableName: tableName,
+        ...filter,
       };
 
       if (lastEvaluatedKey) {
@@ -5474,6 +5485,8 @@ interface LeadRecordUpdateOp {
   remove?: string[];
   /** Fields that must currently hold exactly these values. */
   whenEquals?: Record<string, string | number>;
+  /** Fields that must currently be absent (a write-once marker). */
+  whenAbsent?: string[];
   maxIn?: Record<string, Record<string, number>>;
   appendNew?: Record<string, string[]>;
 }
@@ -5506,6 +5519,14 @@ const addEqualsConditions = (p: ExpressionParts, whenEquals: Record<string, stri
     p.names[`#f${p.n}`] = field;
     p.values[`:v${p.n}`] = expected;
     p.conditions.push(`#system.#k.#f${p.n} = :v${p.n}`);
+    p.n++;
+  }
+};
+
+const addAbsentConditions = (p: ExpressionParts, whenAbsent: string[]): void => {
+  for (const field of new Set(whenAbsent)) {
+    p.names[`#f${p.n}`] = field;
+    p.conditions.push(`attribute_not_exists(#system.#k.#f${p.n})`);
     p.n++;
   }
 };
@@ -5570,6 +5591,7 @@ function leadRecordUpdateExpression(key: string, op: LeadRecordUpdateOp) {
   addSetClauses(p, op.set ?? {});
   addRemoveClauses(p, op.remove ?? []);
   addEqualsConditions(p, op.whenEquals ?? {});
+  addAbsentConditions(p, op.whenAbsent ?? []);
   addMaxInClauses(p, op.maxIn ?? {});
   addAppendClauses(p, op.appendNew ?? {});
   return {
@@ -6692,6 +6714,9 @@ export const crmDb = {
      *  such a caller it can only add a false "already exists" or a missed one — never safety.
      *  Default (omitted) behaviour is unchanged. */
     skipEmailDuplicateCheck?: boolean;
+    /** ENG-2837: do not dispatch the new-lead notification at the write. For a caller that must
+     *  make its own idempotency record durable first and then dispatches it itself. */
+    deferCreatedNotification?: boolean;
     /** ENG-2321: opt in to the exactly-once email-keyed create (utils/emailLeadId.ts): a time-bucketed
      *  deterministic leadId written in a transaction that also condition-checks the adjacent buckets,
      *  so concurrent same-email submissions resolve to ONE row. A loser throws the same typed
@@ -6901,9 +6926,11 @@ export const crmDb = {
         await dynamodb.put(params).promise();
       }
       // Covers landing-page form capture and every single CRM insert. Never await Slack.
-      void import('./orgLeadNotificationService')
-        .then(({ dispatchLeadCreated }) => dispatchLeadCreated(listId, leadId, origin))
-        .catch(() => console.warn('[leadNotifications] hook failed', { listId, leadId }));
+      if (!leadData.deferCreatedNotification) {
+        void import('./orgLeadNotificationService')
+          .then(({ dispatchLeadCreated }) => dispatchLeadCreated(listId, leadId, origin))
+          .catch(() => console.warn('[leadNotifications] hook failed', { listId, leadId }));
+      }
 
       // Extract field names from lead data
       const fieldNames: string[] = [];
@@ -7588,6 +7615,37 @@ export const crmDb = {
       return result.Items || [];
     } catch (error) {
       handleDynamoDbError(error, 'findLeadsByEmail');
+      throw error;
+    }
+  },
+
+  /**
+   * Every lead with this address across all lists (ENG-673, Smartlead events), all pages, newest first. `findLeadsByEmail` stops at 10 rows,
+   * which is right for "the freshest match" but would miss a pushed contact who is in more than 10 lists. Capped so one address can never turn
+   * into an unbounded read. Same cross-tenant index: the caller must prove ownership of every row it acts on.
+   */
+  async findAllLeadsByEmail(email: string, maxItems = 200) {
+    const value = (email ?? '').trim().toLowerCase();
+    if (!value) return [];
+    try {
+      const items: any[] = [];
+      let startKey: any = undefined;
+      do {
+        const result: any = await dynamodb.query({
+          TableName: `${TABLE_PREFIX}AW-Leads`,
+          IndexName: 'EmailLookupIndex',
+          KeyConditionExpression: 'email = :email',
+          ExpressionAttributeValues: { ':email': value },
+          ScanIndexForward: false,
+          ...(startKey ? { ExclusiveStartKey: startKey } : {}),
+        }).promise();
+        items.push(...(result.Items || []));
+        startKey = result.LastEvaluatedKey;
+      } while (startKey && items.length < maxItems);
+      if (items.length >= maxItems) console.warn(`[crmDb.findAllLeadsByEmail] hit the ${maxItems}-row cap for one address: a matching lead may be missing from the result`);
+      return items.slice(0, maxItems);
+    } catch (error) {
+      handleDynamoDbError(error, 'findAllLeadsByEmail');
       throw error;
     }
   },
@@ -11147,6 +11205,58 @@ export const crmDb = {
     }
   },
 
+  /**
+   * The ids of the leads of one list whose `system[key]` record is in one of `states` and was last updated before
+   * `updatedBefore` (ISO strings compare correctly as text), newest lead first (leadIds are timestamp-prefixed).
+   * No index: it pages through the list's own partition, `Limit` counts the leads READ (the filter runs after the
+   * read, so that count is the read cost), and it stops after `maxRead` of them. `truncated` says the list had
+   * more (a false positive when the read stops exactly at `maxRead` and nothing follows: DynamoDB cannot tell without
+   * another read). Eventually consistent: a caller that acts on a hit re-reads the record. `paginatedQuery` is
+   * deliberately not used: it has no cap on the leads read, which is the bound this method exists to enforce.
+   */
+  async findLeadsBySystemRecord(
+    listId: string,
+    key: string,
+    op: { states: string[]; updatedBefore: string; maxRead: number; has?: string[]; lacks?: string[] },
+  ): Promise<{ leadIds: string[]; read: number; truncated: boolean }> {
+    if (op.states.length === 0 || op.maxRead <= 0) return { leadIds: [], read: 0, truncated: false };
+    // Optional field filters (the retry sweep looks for records with a deferral and no claim): same read cost, fewer hits.
+    const fieldNames: Record<string, string> = {};
+    const fieldFilters = [
+      ...(op.has ?? []).map((f, i) => { fieldNames[`#h${i}`] = f; return `attribute_exists(#system.#k.#h${i})`; }),
+      ...(op.lacks ?? []).map((f, i) => { fieldNames[`#l${i}`] = f; return `attribute_not_exists(#system.#k.#l${i})`; }),
+    ];
+    const leadIds: string[] = [];
+    let read = 0;
+    let lastKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    try {
+      do {
+        const result = await dynamodb.query({
+          TableName: `${TABLE_PREFIX}AW-Leads`,
+          KeyConditionExpression: 'listId = :listId',
+          FilterExpression: `#system.#k.#state IN (${op.states.map((_, i) => `:s${i}`).join(', ')}) AND #system.#k.#updatedAt < :before${fieldFilters.map((f) => ` AND ${f}`).join('')}`,
+          ProjectionExpression: 'leadId',
+          ExpressionAttributeNames: { '#system': 'system', '#k': key, '#state': 'state', '#updatedAt': 'updatedAt', ...fieldNames },
+          ExpressionAttributeValues: {
+            ':listId': listId,
+            ':before': op.updatedBefore,
+            ...Object.fromEntries(op.states.map((state, i) => [`:s${i}`, state])),
+          },
+          ScanIndexForward: false,
+          Limit: Math.min(100, op.maxRead - read),
+          ...(lastKey ? { ExclusiveStartKey: lastKey } : {}),
+        }).promise();
+        read += result.ScannedCount ?? 0;
+        for (const item of result.Items ?? []) if (typeof item.leadId === 'string') leadIds.push(item.leadId);
+        lastKey = result.LastEvaluatedKey;
+      } while (lastKey && read < op.maxRead);
+    } catch (error) {
+      handleDynamoDbError(error, 'findLeadsBySystemRecord');
+      throw error;
+    }
+    return { leadIds, read, truncated: !!lastKey };
+  },
+
   async deleteEnrichmentCacheByEntityKey(entityKey: string): Promise<void> {
     try {
       const result = await dynamodb.query({
@@ -11759,6 +11869,19 @@ export const orgMemoryDb = {
     }
   },
 
+  async getMemory(orgId: string, memoryId: string) {
+    try {
+      const result = await dynamodb.get({
+        TableName: ORG_MEMORY_TABLE,
+        Key: { orgId, memoryId },
+      }).promise();
+      return result.Item || null;
+    } catch (error) {
+      handleDynamoDbError(error, 'getOrgMemory');
+      throw error;
+    }
+  },
+
   async deleteMemory(orgId: string, memoryId: string) {
     try {
       await dynamodb.delete({
@@ -12099,6 +12222,37 @@ export const orgDb = {
       lastEvaluatedKey = result.LastEvaluatedKey;
     } while (lastEvaluatedKey && organizations.length < maxItems);
     return organizations;
+  },
+
+  /**
+   * Every org that holds a hot-lead caller number, as id and number only (projected). There is no index on the
+   * number, so this is a scan. Callers: voice/inboundNumberIndex.ts (cached in process for 60 s) and the daily
+   * stuck-record sweep (voice/stuckCallSweep.ts).
+   */
+  async listHotLeadCallNumbers(): Promise<Array<{ orgId: string; twilioNumber: string }>> {
+    const items = await paginatedScan<{ orgId?: unknown; hotLeadCall?: { twilioNumber?: unknown } }>(dynamodb, {
+      TableName: ORGS_TABLE,
+      FilterExpression: 'attribute_exists(#h.#n)',
+      ProjectionExpression: 'orgId, #h.#n',
+      ExpressionAttributeNames: { '#h': 'hotLeadCall', '#n': 'twilioNumber' },
+    });
+    return items.flatMap((i) =>
+      typeof i.orgId === 'string' && typeof i.hotLeadCall?.twilioNumber === 'string' ? [{ orgId: i.orgId, twilioNumber: i.hotLeadCall.twilioNumber }] : []);
+  },
+
+  /**
+   * The id of every org that has ANY hot-lead config, as the id only (projected). Wider than listHotLeadCallNumbers:
+   * releasing a number removes the number fields but keeps the config (calling off), so an org that released its
+   * number still shows here. Same scan, same projected read; caller: the stuck-record sweep (voice/stuckCallSweep.ts).
+   */
+  async listHotLeadCallOrgIds(): Promise<string[]> {
+    const items = await paginatedScan<{ orgId?: unknown }>(dynamodb, {
+      TableName: ORGS_TABLE,
+      FilterExpression: 'attribute_exists(#h)',
+      ProjectionExpression: 'orgId',
+      ExpressionAttributeNames: { '#h': 'hotLeadCall' },
+    });
+    return items.flatMap((i) => (typeof i.orgId === 'string' ? [i.orgId] : []));
   },
 
   async createOrg(org: Organization): Promise<Organization> {

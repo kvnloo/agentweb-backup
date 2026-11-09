@@ -1,4 +1,5 @@
 import { mapManageBrandUpdate } from '../../utils/brandGuidelines';
+import { summarizeItemizedUsage, USAGE_MONTH_PATTERN } from './usageBreakdown';
 import { findAmbiguousMergeTargets, findConflictingMergeTargets, findStepContentLoss, mergeWorkPlanSteps, summarizeStepChange } from '../../services/workPlanSteps';
 import { carryStoredStepModels } from '../../services/agentMode/workPlanStepModels';
 /**
@@ -14,6 +15,7 @@ import { carryStoredStepModels } from '../../services/agentMode/workPlanStepMode
 import { mcpToolRegistry } from './registry';
 import { mcpFetch } from './httpClient';
 import './adminLookupTools';
+import './readEmailTool';
 import type { AgentRunStatus } from '../../services/agentMode/runStore';
 import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService';
 import { SCHEDULED_CHATS_DEFAULT_LIMIT, SCHEDULED_CHATS_MAX_LIMIT } from '../../utils/scheduledChatsPage';
@@ -1133,6 +1135,59 @@ mcpToolRegistry.register({
   }
 });
 
+// ─── CRM lead-list CSV export, own account only (ENG-2867) ──────────────────
+//
+// Thin wrappers over POST /api/crm/lists/:listId/leads/export and
+// GET /api/crm/lists/:listId/export-history. The route owns everything that
+// matters: list ownership/sharing checks (canDestructiveCrmList /
+// canAccessCrmList), Enigma card-revenue stripping, export-history record.
+// The tool deliberately takes no client_id/user override — identity is always
+// the calling key's runtime identity via ctx(context).
+
+function requireListId(raw: unknown): string | null {
+  const id = typeof raw === 'string' ? raw.trim() : '';
+  return id ? encodeURIComponent(id) : null;
+}
+
+mcpToolRegistry.register({
+  name: 'export_lead_list',
+  definition: {
+    name: 'export_lead_list',
+    description: 'Export every lead in one of your own CRM lead lists to a CSV file. Returns the export record (exportId, recordCount, filename, fileUrl). Requires editor access to the list; works only on lists your account can edit.',
+    inputSchema: {
+      type: 'object',
+      properties: { list_id: { type: 'string', description: 'Lead list ID to export' } },
+      required: ['list_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const listId = requireListId(args?.list_id);
+    if (!listId) return jsonResult({ error: 'list_id is required' });
+    const data = await mcpFetch({ method: 'POST', path: `/api/crm/lists/${listId}/leads/export`, context: ctx(context) });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'list_lead_list_exports',
+  readOnly: true,
+  definition: {
+    name: 'list_lead_list_exports',
+    description: 'List past CSV exports (newest first, up to 50) for one of your own CRM lead lists.',
+    inputSchema: {
+      type: 'object',
+      properties: { list_id: { type: 'string', description: 'Lead list ID' } },
+      required: ['list_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const listId = requireListId(args?.list_id);
+    if (!listId) return jsonResult({ error: 'list_id is required' });
+    const data = await mcpFetch({ method: 'GET', path: `/api/crm/lists/${listId}/export-history`, context: ctx(context) });
+    return jsonResult(data);
+  }
+});
+
 // ─── CRM drip / nurture sequences, read-only (ENG-962) ──────────────────────
 //
 // `get_leads_by_crm_criteria` scopes WHO a campaign targets; this tool inspects
@@ -2004,6 +2059,52 @@ mcpToolRegistry.register({
   }
 });
 
+// ─── Sender Settings (ENG-2868) ─────────────────────────────────────────────
+
+/**
+ * ENG-2868 (ENG-2847.4 read half): read-only view of the caller's own CRM
+ * sender settings. Identity comes only from the runtime context — the tool
+ * accepts no arguments, so no account can be selected via args. The response
+ * is an explicit allow-list projection of GET /api/crm/sender-emails so a
+ * future field added to that route can never leak through here.
+ */
+mcpToolRegistry.register({
+  name: 'list_sender_settings',
+  readOnly: true,
+  definition: {
+    name: 'list_sender_settings',
+    description: "List your own CRM sender settings: configured email senders (with today's send usage and effective daily cap), the default email sender, the default LinkedIn sender account, and connected mailboxes that can be used as senders. Read-only; use before drafting or activating sequences.",
+    inputSchema: { type: 'object', properties: {}, required: [] }
+  },
+  execute: async (_args: any, context: any) => {
+    const data = await mcpFetch({ method: 'GET', path: '/api/crm/sender-emails', context: ctx(context) });
+    const senders = Array.isArray(data?.senders) ? data.senders : [];
+    const mailboxes = Array.isArray(data?.connectedEmailAccounts) ? data.connectedEmailAccounts : [];
+    return jsonResult({
+      senders: senders.map((s: any) => ({
+        id: s?.id ?? null,
+        email: s?.email ?? null,
+        from_name: s?.fromName ?? null,
+        sender_provider: s?.senderProvider ?? null,
+        connected_account_id: s?.connectedAccountId ?? null,
+        daily_limit: s?.dailyLimit ?? null,
+        effective_daily_limit: s?.effectiveDailyLimit ?? null,
+        // null = unknown (uncapped sender, or the usage read failed) — never a fake zero.
+        sent_today: s?.sentTodayKnown === false || typeof s?.sentToday !== 'number' ? null : s.sentToday,
+        warmup_started_at: s?.warmupStartedAt ?? null,
+      })),
+      default_sender_id: data?.defaultSenderId ?? null,
+      default_linkedin_account_id: data?.defaultLinkedInAccountId ?? null,
+      connected_email_accounts: mailboxes.map((a: any) => ({
+        account_id: a?.account_id ?? null,
+        account_name: a?.account_name ?? null,
+        email: a?.email ?? null,
+        platform: a?.platform ?? null,
+      })),
+    });
+  }
+});
+
 // ─── Connected Accounts ─────────────────────────────────────────────────────
 
 mcpToolRegistry.register({
@@ -2409,14 +2510,15 @@ mcpToolRegistry.register({
     inputSchema: {
       type: 'object',
       properties: {
-        page_id: { type: 'string', description: 'The landing page ID' }
+        page_id: { type: 'string', description: 'The landing page ID' },
+        branch: { type: 'string', description: 'Branch to read from (e.g. "draft/agentweb-preview" to read back staged edits). Omit for "main". Never selects a different repo.' }
       },
       required: ['page_id']
     }
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'GET', path: `/api/landing-pages/v0/generated/${args.page_id}/files`, context: ctx(context)
+      method: 'GET', path: `/api/landing-pages/v0/generated/${args.page_id}/files${args.branch ? `?branch=${encodeURIComponent(args.branch)}` : ''}`, context: ctx(context)
     });
     return jsonResult(data);
   }
@@ -2431,14 +2533,15 @@ mcpToolRegistry.register({
       type: 'object',
       properties: {
         page_id: { type: 'string', description: 'The landing page ID' },
-        file_path: { type: 'string', description: 'Path to the file in the repo (e.g., "src/app/page.tsx")' }
+        file_path: { type: 'string', description: 'Path to the file in the repo (e.g., "src/app/page.tsx")' },
+        branch: { type: 'string', description: 'Branch to read from (e.g. "draft/agentweb-preview" to read back staged edits). Omit for "main". Never selects a different repo.' }
       },
       required: ['page_id', 'file_path']
     }
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'GET', path: `/api/landing-pages/v0/generated/${args.page_id}/file-content?path=${encodeURIComponent(args.file_path)}`, context: ctx(context)
+      method: 'GET', path: `/api/landing-pages/v0/generated/${args.page_id}/file-content?path=${encodeURIComponent(args.file_path)}${args.branch ? `&branch=${encodeURIComponent(args.branch)}` : ''}`, context: ctx(context)
     });
     return jsonResult(data);
   }
@@ -2662,7 +2765,7 @@ mcpToolRegistry.register({
   internal: true,
   definition: {
     name: 'google_search_web',
-    description: 'Opt-in Google Custom Search web search. Not a default search tool. No hidden fallback provider is used.',
+    description: 'Legacy alias of you_search_web (Google Custom Search retired, ENG-1281). Returns You.com web results.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -4349,14 +4452,41 @@ mcpToolRegistry.register({
 
 // ─── Account ─────────────────────────────────────────────────────────────────
 
+const USAGE_MONTH_SCHEMA_PROPERTY = {
+  type: 'string',
+  description: 'Optional YYYY-MM. When set, include usage_breakdown (tokens and calls by model/day, session count) for that month.',
+};
+
+/**
+ * ENG-758: optional usage breakdown. Absent month = no extra read (status stays cheap).
+ * An invalid month or a failed ledger read is reported in-band, never fabricated and
+ * never allowed to fail the status read itself.
+ */
+async function readUsageBreakdown(month: unknown, context: any): Promise<Record<string, unknown>> {
+  if (month === undefined || month === null || month === '') return {};
+  if (typeof month !== 'string' || !USAGE_MONTH_PATTERN.test(month)) {
+    return { usage_breakdown_error: 'usage_month must be YYYY-MM' };
+  }
+  try {
+    const payload = await mcpFetch({
+      method: 'GET',
+      path: `/api/subscription/usage/itemized?month=${encodeURIComponent(month)}`,
+      context,
+    });
+    return { usage_breakdown: summarizeItemizedUsage(payload, month) };
+  } catch {
+    return { usage_breakdown_error: 'Usage data is temporarily unavailable' };
+  }
+}
+
 mcpToolRegistry.register({
   name: 'get_account_status',
   definition: {
     name: 'get_account_status',
-    description: "Get the current user's account status, subscription plan, and usage. Admin-only: pass client_id to check a specific client's status instead of the caller's own.",
+    description: "Get the current user's account status, subscription plan, and usage. Pass usage_month (YYYY-MM) to also get that month's LLM token/call totals by model and by day plus a session count. Admin-only: pass client_id to check a specific client's status instead of the caller's own.",
     inputSchema: {
       type: 'object',
-      properties: { client_id: CLIENT_ID_SCHEMA_PROPERTY },
+      properties: { client_id: CLIENT_ID_SCHEMA_PROPERTY, usage_month: USAGE_MONTH_SCHEMA_PROPERTY },
       required: []
     }
   },
@@ -4403,6 +4533,7 @@ mcpToolRegistry.register({
       current_period_end: me?.current_period_end ?? null,
       allowed_features: Array.isArray(me?.allowedPages) ? me.allowedPages : [],
       api_key_count: apiKeyCount,
+      ...(await readUsageBreakdown(args?.usage_month, c)),
     });
   }
 });

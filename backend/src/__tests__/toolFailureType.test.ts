@@ -101,6 +101,20 @@ describe('classifyToolFailureType', () => {
     it('classifies the Slack bot not being in the channel', () => {
       expect(classifyToolFailureType('Error', 'The Slack bot is not a member of channel C09JU')).toBe('config');
     });
+    // ENG-2819: update_email_draft_for_lead's no-contact-channel skip (ENG-2082) and
+    // do-not-contact refusal are deliberate guards, not handler bugs.
+    it('classifies the email-draft no-contact-channel skip as by_design (ENG-2819)', () => {
+      expect(
+        classifyToolFailureType('Error', 'This lead has neither an email address nor a LinkedIn profile — there is nothing to draft.'),
+      ).toBe('by_design');
+    });
+
+    it('classifies the email-draft do-not-contact refusal as by_design (ENG-2819)', () => {
+      expect(
+        classifyToolFailureType('Error', 'Cannot draft email for this lead: Unsubscribed. Remove the do-not-contact flag first if you want to contact them.'),
+      ).toBe('by_design');
+    });
+
     it('classifies the landing-page share non-member refusal as by_design (ENG-2585)', () => {
       expect(
         classifyToolFailureType('Error', "API error (400): 'x@y.com' is not a member of the page owner's organization"),
@@ -288,5 +302,15 @@ describe('ENG-2583 — unconnected integrations / unconfigured resources / CRM r
     expect(classifyToolFailureType('Error', 'socket hang up: connection reset by peer')).toBe('bug');
     expect(classifyToolFailureType('Error', 'Webhook configured successfully but delivery returned 500')).toBe('bug');
     expect(classifyToolFailureType('Error', 'Client disconnected unexpectedly')).toBe('bug');
+  });
+
+  // ENG-2810: the hubspotMarketingPreflight refusals name a plan/grant gap the
+  // customer fixes in HubSpot or Connected Accounts — not a handler bug.
+  it('classifies HubSpot Marketing Hub capability refusals as config, not bug', () => {
+    expect(classifyToolFailureType('Error',
+      'This HubSpot portal does not have Marketing Hub, so it cannot read or write FORM (a Marketing Hub object). '
+      + 'Marketing access was requested when the account was connected and HubSpot did not grant it.')).toBe('config');
+    expect(classifyToolFailureType('Error',
+      'This HubSpot connection was authorised for CRM access only, so it cannot read or write EMAIL (a Marketing Hub object).')).toBe('config');
   });
 });

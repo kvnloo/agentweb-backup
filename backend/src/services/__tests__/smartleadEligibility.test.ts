@@ -12,6 +12,15 @@ const lead = (id: string, over: Record<string, any> = {}) => ({
 // runStartedAt is required; this default is later than every lead the tests create, so the created-after-start rule stays out of the way.
 const ctx = (over: Record<string, any> = {}) => ({ campaignId: 77, tags: ["first_name", "company_name"], mapping: {}, runStartedAt: "2030-01-01T00:00:00Z", ...over });
 
+describe("pushed leads and do-not-contact (ENG-673)", () => {
+  it("a lead pushed to Smartlead is NOT do-not-contact: bounce recording and the unsubscribe page rely on isDoNotContact staying as it was", () => {
+    const { isDoNotContact } = require("../../utils/leadContactStatus");
+    const marker = { state: "pushed", pushedAt: "x", runId: "r", payloadHash: "h" };
+    expect(isDoNotContact({ email: "a@b.com", system: { smartlead_77: marker } })).toBe(false);
+    expect(isPushedToSmartlead({ system: { smartlead_77: marker } })).toBe(true);
+  });
+});
+
 describe("selectSmartleadLeads (ENG-673)", () => {
   it("keeps a good lead and builds its payload", () => {
     const r = selectSmartleadLeads([lead("a")], ctx());
@@ -139,6 +148,31 @@ describe("selectSmartleadLeads (ENG-673)", () => {
 
   it("reports markup and over-long values with their own reason", () => {
     expect(selectSmartleadLeads([lead("a", { company: "<b>x</b>" })], ctx()).skipped[0]).toMatchObject({ reason: "unsafe_text", tag: "company_name" });
+  });
+});
+
+describe("the unsubscribe-link warning (verified with received emails, 2026-10-28)", () => {
+  const seq = (body: string) => analyseSequence([{ seq_number: 1, subject: "Hi {{first_name}}", email_body: body }]);
+  const warned = (body: string, opts: Record<string, unknown>) => preflightSequence(seq(body), { status: "DRAFTED", mapping: {}, ...opts }).warnings.some(w => w.code === "no_unsubscribe");
+
+  it("warns when the setting is on but the footer text is empty: Smartlead then adds no link", () => {
+    expect(warned("<p>Hi</p>", { addUnsubscribeTag: true, unsubscribeText: null })).toBe(true);
+    expect(warned("<p>Hi</p>", { addUnsubscribeTag: true, unsubscribeText: "   " })).toBe(true);
+  });
+
+  it("does not warn when the setting is on and the footer text is set", () => {
+    expect(warned("<p>Hi</p>", { addUnsubscribeTag: true, unsubscribeText: "Unsubscribe here" })).toBe(false);
+  });
+
+  it("still warns when the setting is off, and does not guess when Smartlead did not say", () => {
+    expect(warned("<p>Hi</p>", { addUnsubscribeTag: false })).toBe(true);
+    expect(warned("<p>Hi</p>", { addUnsubscribeTag: true })).toBe(false); // text unknown: no claim either way
+    expect(warned("<p>Hi</p>", {})).toBe(false);
+  });
+
+  it("an unsubscribe-like tag silences the 'setting off' warning, but NOT the 'empty footer text' one (that it renders a link is unverified)", () => {
+    expect(warned("<p>Hi {{unsubscribe_link}}</p>", { addUnsubscribeTag: false })).toBe(false);
+    expect(warned("<p>Hi {{unsubscribe_link}}</p>", { addUnsubscribeTag: true, unsubscribeText: null })).toBe(true);
   });
 });
 

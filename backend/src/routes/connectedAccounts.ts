@@ -15,6 +15,8 @@ import { userDb, orgDb, crmDb } from '../services/db';
 import { can } from "../services/orgAuthz";
 import { assertOwnedMetaPixel } from '../services/metaAccountCredentials';
 import { DEFAULT_DAILY_INVITE_CAP } from '../services/linkedInWritePacer';
+import { prepareSmartleadEventCleanup } from '../services/smartleadEventCleanup';
+import { cronJobRegistry } from '../utils/cronJobRegistry';
 
 /**
  * ENG-1574: bounds for the user-editable LinkedIn daily invite cap. 30 matches the
@@ -354,6 +356,15 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
         // as needing reconnection so the row shows the Reconnect action.
         status = 'disconnected';
         expiryMessage = 'Reconnect required — Meta Ads permission not granted';
+      } else if (
+        adsCapability.can_create_ads === false &&
+        ((acc.config as any).refresh_token || getTokenStatus(acc.config.token_expires_at) !== 'expired')
+      ) {
+        // ENG-2822: Page access is missing, which blocks only ad CREATION. Reads and
+        // reporting still work, so a live token stays connected but carries the reason.
+        // An expired token falls through so it still reports as expired.
+        status = 'active';
+        expiryMessage = adsCapability.capability_warning || 'Connected — Facebook Page access needed to create ads';
       } else {
         // Accounts with a refresh token (e.g. Gmail) auto-renew — don't show the
         // short-lived access token expiry; just show them as permanently connected.
@@ -497,7 +508,11 @@ router.delete('/connected-accounts/:platform', authenticateToken, async (req: an
       await Promise.all(calendlyAccounts.map((acc) => cleanupCalendlyWebhook(userId, acc)));
     }
 
+    // ENG-673: take AgentWeb's event webhook off the customer's Smartlead campaigns, with the key found while it is still stored. Best effort, never blocks the removal.
+    const smartleadCleanup = platform === 'smartlead' ? await prepareSmartleadEventCleanup(userId, `smartlead-${userId}`) : null;
+
     await deleteAccount(userId, platform);
+    if (smartleadCleanup) void cronJobRegistry.track('SmartleadEventCleanup', smartleadCleanup.run());
     res.json({ success: true, message: `${platform} account(s) disconnected` });
   } catch (error) {
     console.error('Delete Account Error:', error);
@@ -532,7 +547,12 @@ router.delete('/connected-accounts/:platform/:accountId', authenticateToken, asy
       await cleanupCalendlyWebhook(userId, await getAccountById(accountId, userId, 'calendly'));
     }
 
+    // ENG-673: only the caller's OWN Smartlead connection (id smartlead-<userId>): an admin whose delete of a teammate's id removes nothing must not
+    // strip that teammate's webhooks. Best effort, never blocks the removal.
+    const smartleadCleanup = platform === 'smartlead' && accountId === `smartlead-${userId}` ? await prepareSmartleadEventCleanup(userId, accountId) : null;
+
     await deleteAccountById(userId, platform, accountId);
+    if (smartleadCleanup) void cronJobRegistry.track('SmartleadEventCleanup', smartleadCleanup.run());
     res.json({ success: true, message: `${platform} account ${accountId} disconnected` });
   } catch (error) {
     console.error('Delete Account By ID Error:', error);

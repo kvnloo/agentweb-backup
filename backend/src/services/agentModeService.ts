@@ -1,3 +1,4 @@
+import { addCompanionTools } from './agentMode/companionTools';
 import { metaWriteRateShaper, META_BUDGET_THROTTLE_SUBCODE } from './agentMode/metaWriteRateShaper';
 import { normalizeSkillIdArg } from './agentMode/skillIdArg';
 import { applyProviderPolicy, CompareProviderPolicy } from './agentMode/compareProviderPolicy';
@@ -9,7 +10,8 @@ import { tierFromCostScore, tierFromQualityScore } from './agentMode/modelClassi
 // only call site, generateImage, moved to emma/impl/mediaVideo.ts.
 import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 import { recordCreativeLearningReceipt } from './agentMode/adsLearning';
-import { enforceEvaluationTool, isEvaluationUser } from './evaluationPolicy';
+import { enforceEvaluationTool, isEvaluationUser, shouldOfferEvaluationWorkspace } from './evaluationPolicy';
+import { applyEvaluationWorkspaceListing } from './agentMode/evaluationWorkspaceListing';
 import { sandboxAwarePollDelayMs } from './agentMode/sandboxPolling';
 import { markSandboxRun, forgetSandboxRun, isSandboxRun, releaseSandboxRun } from './agentMode/sandboxTelemetry';
 import axios from 'axios';
@@ -37,6 +39,7 @@ import { shouldForceScheduledAutocomplete } from './agentMode/core/scheduledAuto
 import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/memoryRanking';
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
+import { buildIterationLimitReport } from './agentMode/core/iterationLimitReport';
 import { resolveMetaActivationCampaignId } from './agentMode/metaCampaignResolution';
 import {
   buildImageSwapNotReflected, judgeImageSwap, readCreativeImage, selectSwapImageHash,
@@ -54,7 +57,9 @@ import {
 import { isBookkeepingTool, reconcileFalseFailureReport } from '../utils/falseFailureReport';
 import { ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import { computeTermination } from './agentMode/core/agentStep';
-import { ANTI_LOOP_STOP_MESSAGE, EMPTY_FINAL_RESPONSE_FALLBACK } from './agentMode/core/termination';
+import { ANTI_LOOP_STOP_MESSAGE, EMPTY_FINAL_RESPONSE_FALLBACK, STEP_BUDGET_FINAL_SYNTHESIS_MESSAGE } from './agentMode/core/termination';
+import { recordPagingCalls, PAGING_SPIRAL_STOP_MESSAGE } from './agentMode/core/pagingSpiral';
+import { createSerialReadState, recordSerialReadStep, SERIAL_READ_BATCH_MESSAGE } from './agentMode/core/serialReadSpiral';
 import { sanitizeGeminiSchema } from './agentMode/core/geminiNativeClient';
 import {
   normalizeOpenRouterResponseMetadata,
@@ -91,6 +96,7 @@ import { reconcileModelMentionAck, buildModelMentionIndex, type ModelMentionInde
 import { resolveTurnModelCorrection } from '../utils/modelCorrectionStamp';
 import type { MessageModelRouting } from './agentMode/agentWebModelRouter';
 import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
+import { boundToolsForModel } from '../utils/boundToolsForModel';
 // ENG-2103 (F2, Pattern A): resolveOrgProfileField's only 5 callers
 // (readBrandGuidelines/readMarketStrategy and friends) moved to
 // emma/impl/brandMarketStrategy.ts, which imports it lazily itself
@@ -174,7 +180,7 @@ import { meterUserUsage } from './usageRecorderService';
 import { meterUsageFromResponse } from '../utils/llmClients';
 import { pickTransport } from './funding/transport';
 import { currentRunFunding } from './funding/runFunding';
-import { recordLlmUsage, customerUpstreamCost } from './funding/recordLlmUsage';
+import { recordLlmUsage, customerUpstreamCost, openRouterByokCostUsd } from './funding/recordLlmUsage';
 import { resolveCallFunding, customerKeyBlocksTurn } from './funding/callFunding';
 import {
   getModelPrice,
@@ -367,7 +373,7 @@ const SKILL_NO_SUBSTITUTION =
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
 // mutation tool remains manage_predefined_work_plan.
-export const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_user_funnel_status', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'get_session_transcript', 'get_user_by_id', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
+export const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_user_funnel_status', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'get_session_transcript', 'get_user_by_id', 'inspect_client_usage', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -531,7 +537,8 @@ import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } fro
 import { assertPublicHostname } from '../utils/ssrfGuard';
 import { getJwtSecret } from '../config/jwt';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString } from '../utils/s3Utils';
-import { isTransientLLMError, isProviderDeserializationError, extractAffordableTokens, PROVIDER_UNAVAILABLE_USER_MESSAGE } from '../utils/agentModeErrors';
+import { isTransientLLMError, isProviderDeserializationError, extractAffordableTokens, PROVIDER_UNAVAILABLE_USER_MESSAGE, QUOTA_EXHAUSTED_USER_MESSAGE } from '../utils/agentModeErrors';
+import { classifyOpenRouterQuotaExhaustion } from '../utils/openRouterKeyLimit';
 import { isLLMProviderOutage } from './agentMode/providerOutage';
 import { getAgentRunRecorder } from '../loops/instances/agent-mode';
 import { computeRunVerdict, type RunTerminalInfo } from '../loops/instances/agent-mode/runRecorder';
@@ -608,6 +615,7 @@ import {
   META_WEBSITE_OPTIMIZATION_GOALS
 } from '../utils/metaConstants';
 import { resolveOptimisationEvent, pixelReceivedEvent } from './metaOptimisationCoverage';
+import { approvalCardIdentity } from './voice/hotLeadCallApprovalGate';
 
 
 /**
@@ -1028,9 +1036,13 @@ interface LLMCallOptions {
   /** ENG-2108: set only by the agent's own working loop; lets this call use a customer key. */
   customerRoutable?: boolean;
   tools?: any[] | null;
+  /** ENG-2824: tool names that must survive maxTools truncation (e.g. a schedule's required calls). */
+  priorityToolNames?: string[];
   tool_choice?: 'auto' | 'none' | any | null;
   /** Execute search through OpenRouter's provider-independent server tool. */
   webSearch?: boolean;
+  /** Parameters for the web-search server tool (engine, max_results, max_uses, ...); omitted means OpenRouter's defaults. */
+  webSearchParameters?: Record<string, string | number>;
   max_completion_tokens?: number | null;
   temperature?: number | null;
   response_format?: { type: 'text' | 'json_object' } | null;
@@ -1065,6 +1077,10 @@ interface LLMCallOptions {
    * `provider` next to the shared order/fallback preferences. Normal chat never sets it.
    */
   providerPolicy?: CompareProviderPolicy | null;
+  /** Provider names OpenRouter must not route this request to; merged with any default ignore list. */
+  providerIgnore?: string[];
+  /** Treat a 200 with no answer as a failed, retryable attempt. For callers that need text back. */
+  requireContent?: boolean;
 }
 
 function nonNegativeTokenCount(value: unknown): number {
@@ -1727,6 +1743,7 @@ export class AgentModeService {
     console.log(`AgentMode: Refreshed ${mcpTools.length} MCP tools`);
   }
 
+  // Every tool registered here also reaches the Claude plan route and must fit its limits: docs/plan-route-tool-limits.md
   private async registerTools() {
     // 1. Ensure Emma's tools are loaded into the emmaToolRegistry (only needs to happen once)
     if (!AgentModeService.toolsRegistered) {
@@ -2516,6 +2533,7 @@ export class AgentModeService {
       tools = null,
       tool_choice = null,
       webSearch = false,
+      webSearchParameters,
       max_completion_tokens = null,
       temperature = null,
       response_format = null,
@@ -2526,6 +2544,9 @@ export class AgentModeService {
       customerRoutable = false,
       taskClass,
       providerPolicy,
+      providerIgnore,
+      requireContent,
+      priorityToolNames,
     } = options || {};
 
     // ENG-2108: the funding for THIS call. A run starts AgentWeb-funded; this call moves
@@ -2585,6 +2606,9 @@ export class AgentModeService {
       // — verify empirically against live traffic before changing this line.
       params.provider.ignore = ignoredProviders;
     }
+    if (providerIgnore?.length) {
+      params.provider.ignore = [...new Set([...(params.provider.ignore ?? []), ...providerIgnore])];
+    }
     if (providerPolicy) {
       params.provider = applyProviderPolicy(params.provider, providerPolicy);
     }
@@ -2627,9 +2651,11 @@ export class AgentModeService {
       if (callerToolLimit !== undefined && callerTools.length > callerToolLimit) {
         console.warn(
           `AgentMode: callLLM truncating tools for model "${model}": ${callerTools.length} caller tools exceeds limit of ${callerToolLimit}` +
-          `${webSearch ? ' after reserving one web-search slot' : ''}. Keeping first ${callerToolLimit}.`,
+          `${webSearch ? ' after reserving one web-search slot' : ''}. Keeping ${callerToolLimit}` +
+          `${priorityToolNames?.length ? ` (required tools first: ${priorityToolNames.join(', ')})` : ''}.`,
         );
-        boundedTools = callerTools.slice(0, callerToolLimit);
+        // ENG-2824: a plain slice silently undeclared any required tool past the cap.
+        boundedTools = boundToolsForModel(callerTools, callerToolLimit, priorityToolNames);
       }
     }
     // OpenRouter normalizes the transport, but the selected provider still
@@ -2648,7 +2674,7 @@ export class AgentModeService {
         }) : tool)
       : boundedTools;
     const requestTools = webSearch
-      ? [...normalizedCallerTools, { type: 'openrouter:web_search' }]
+      ? [...normalizedCallerTools, { type: 'openrouter:web_search', ...(webSearchParameters && Object.keys(webSearchParameters).length ? { parameters: webSearchParameters } : {}) }]
       : normalizedCallerTools;
     // ENG-1831: every chain member receives the same parameter set, and
     // require_parameters makes one unsupported field unroutable (ENG-199 404).
@@ -2742,6 +2768,7 @@ export class AgentModeService {
     const res = await pickTransport(callFunding, model).send(client, model, params, {
       timeoutMs: timeoutMs ?? 5 * 60 * 1000,
       maxAttempts,
+      requireContent,
       isRetryableError: isRetryableLlmCallError,
       // Bound to the instance method, not a transport-local timer: this is the seam
       // agentModeService.openRouterClient.test.ts spies on to assert exact backoff
@@ -2802,6 +2829,9 @@ export class AgentModeService {
       (res as any)?.model,
       paramChain.map(m => ({ modelId: m.modelId, upstreamModel: m.upstreamModel })),
     ) ?? model;
+    if (meteredModel !== model) {
+      console.warn(`AgentMode: OpenRouter fallback served "${meteredModel}" instead of "${model}"`);
+    }
     // ENG-1816 F1: routed through recordLlmUsage, which decides funding ABOVE this
     // fire-and-forget funnel — see funding/recordLlmUsage.ts for why. Branch on
     // RunFunding.route, never on usage.is_byok below: that flag also fires for
@@ -2828,13 +2858,19 @@ export class AgentModeService {
           // recordLlmUsage (it strips this before any AgentWeb rail). Not costUsdOverride:
           // on a non-BYOK response that is AgentWeb's own cost.
           ...customerUpstreamCost(usage),
+          // ENG-2720: on BYOK, upstream tokens PLUS OpenRouter's own charge (web-search fee, BYOK fee).
           costUsdOverride:
             usage.is_byok === true
-              ? typeof usage.cost_details?.upstream_inference_cost === 'number' &&
-                Number.isFinite(usage.cost_details.upstream_inference_cost) &&
-                usage.cost_details.upstream_inference_cost > 0
-                ? usage.cost_details.upstream_inference_cost
-                : undefined
+              ? openRouterByokCostUsd(
+                  usage,
+                  this.estimateCost(
+                    meteredModel,
+                    normalizedUsage.inputTokens,
+                    normalizedUsage.outputTokens,
+                    normalizedUsage.cacheReadTokens,
+                    normalizedUsage.cacheWriteTokens,
+                  ),
+                )
               : typeof usage.cost === 'number'
                 ? usage.cost
                 : undefined,
@@ -2910,6 +2946,25 @@ export class AgentModeService {
    * ordinary state of every draft-only run, and also the state of a run whose stamp
    * could not be written (which the runner downgrades to draft-only for this reason).
    */
+  /**
+   * ENG-2824: the schedule's requiredFunctionCalls for a scheduled session, so callLLM
+   * keeps them declared when it truncates the tool list. Empty for any other session or
+   * when the schedule cannot be read.
+   */
+  private async resolveScheduledRequiredToolNames(currentSession: any): Promise<string[]> {
+    if (currentSession?.sessionType !== 'scheduled') return [];
+    const scheduleId = extractScheduleId(currentSession?.pageIdentifier);
+    if (!scheduleId) return [];
+    try {
+      const schedule: any = await scheduleDb.getScheduleById(scheduleId);
+      const required = schedule?.requiredFunctionCalls;
+      return Array.isArray(required) ? required.filter((n: unknown): n is string => typeof n === 'string') : [];
+    } catch (error) {
+      console.warn(`AgentMode: could not read schedule ${scheduleId} for required-tool prioritisation:`, error);
+      return [];
+    }
+  }
+
   private async resolveScheduledPublishAuthorization(
     currentSession: any
   ): Promise<SchedulePublishAuthorization & { reason?: PublishAuthorizationWithholdReason }> {
@@ -3592,6 +3647,11 @@ export class AgentModeService {
         availableSkillContextMsg,
       } = turnContext;
 
+      // ENG-2824: a scheduled run's required calls must stay declared when callLLM
+      // truncates the tool list to the model's maxTools. Read once per turn; a failed
+      // read only loses the prioritisation, never the turn.
+      const requiredToolNamesForTurn = await this.resolveScheduledRequiredToolNames(currentSession);
+
       let content = '';
       const toolCalls: any[] = [];
       _toolCallsForTelemetry = toolCalls;
@@ -3762,6 +3822,8 @@ export class AgentModeService {
       // Sticky: once the loop switches to synthesis it never offers tools again this turn.
       let forceFinalSynthesis = false;
       let truncatedByTimeBudget = false;
+      // ENG-2778: the forced synthesis was triggered by the step budget, not the clock.
+      let stepBudgetSynthesis = false;
       // Set when the forced synthesis call failed with no room left to retry it — the loop
       // then stops instead of starting a second full call it cannot afford (see below).
       let synthesisRetryUnaffordable = false;
@@ -3792,6 +3854,12 @@ export class AgentModeService {
       const toolSignatureHistory: string[] = [];
       const SIGNATURE_HISTORY_WINDOW = 10;
       const SIGNATURE_REPEAT_THRESHOLD = 3;
+      // ENG-2778: per-turn call counts keyed on tool + non-pagination args, so paging the
+      // same resource with varying offset/limit (which evades both signature checks) is seen.
+      const pagingCallCounts = new Map<string, number>();
+      let pagingSpiralNudged = false;
+      // ENG-2863: consecutive one-read-per-step streak; nudges the model to batch lookups.
+      const serialReadState = createSerialReadState();
       // ENG-1635/1644 follow-up: cross-TURN retry-backstop TRANSPARENCY for a
       // Meta write that keeps failing the same way — see the annotation logic
       // below (and applyMetaWriteRetryBackstop's own header) for why this
@@ -3876,6 +3944,23 @@ export class AgentModeService {
           // Opslane 2026-10-13: in-turn control text is role 'system' (as ENG-763 did for
           // the cross-turn loop-breaker) — as 'user' the model attributes it to the user.
           (messages as any[]).push({ role: 'system', content: urgency });
+        }
+
+        // ENG-2778: the last step-budget iteration is a forced synthesis, mirroring the
+        // ENG-907 wall-clock path. Before this, a model still paging at step 40 got its
+        // tool calls executed and the loop exited with empty content, so the user got only
+        // the canned "maximum number of processing steps" apology despite 39 steps of
+        // gathered work. Reusing forceFinalSynthesis drops any tool calls this turn makes
+        // and suppresses the continuation ladders, so the turn ends with the model's own
+        // summary. Does not raise maxIterations. Iteration 1 is exempt (nothing gathered).
+        if (remaining === 0 && iteration > 1 && !forceFinalSynthesis) {
+          forceFinalSynthesis = true;
+          stepBudgetSynthesis = true;
+          console.warn(
+            `AgentMode: step budget exhausted for session ${sessionId} (${iteration}/${maxIterations}) — ` +
+            'no longer honouring tool calls and forcing a final synthesis so the work so far is delivered'
+          );
+          (messages as any[]).push({ role: 'system', content: STEP_BUDGET_FINAL_SYNTHESIS_MESSAGE });
         }
 
         // ENG-907: same self-regulation for the wall-clock budget. The first iteration is
@@ -4057,6 +4142,12 @@ export class AgentModeService {
           }
 
           // Exclude tools that are not applicable to the current context (e.g. get_visual_context on non-visual pages)
+          // ENG-1948: never offer evaluation_workspace to a principal that can only be denied.
+          if (filteredToolsCache) {
+            filteredToolsCache = applyEvaluationWorkspaceListing(filteredToolsCache, allowedToolNames,
+              shouldOfferEvaluationWorkspace({ userId, isAdmin, isDelegatedAccess, isInteractiveShare, isUnattendedRun }));
+          }
+
           if (excludeTools?.length && filteredToolsCache) {
             const excludeSet = new Set(excludeTools);
             filteredToolsCache = filteredToolsCache.filter((t: any) => !excludeSet.has(t.function?.name));
@@ -4149,6 +4240,7 @@ export class AgentModeService {
             // any tool calls this turn returns (see the forceFinalSynthesis drop below), so
             // no further work can start either way and the model is told as much.
             tools: filteredToolsCache,
+            priorityToolNames: requiredToolNamesForTurn,
             tool_choice: 'auto',
             max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
             temperature: 0.1,
@@ -4172,7 +4264,9 @@ export class AgentModeService {
           // OpenRouter performs provider/model failover inside the one request. A
           // transient failure here is therefore final for AgentWeb; do not issue a
           // second full completion with altered model semantics.
-          if (forceFinalSynthesis && turnHardCapMs !== undefined && isTransientLLMError(callError)) {
+          // ENG-2763: quota/credits exhaustion must reach the rethrow + quota classifier
+          // below; its 402 text can match the transient /5xx/ digit patterns.
+          if (forceFinalSynthesis && turnHardCapMs !== undefined && !classifyOpenRouterQuotaExhaustion(callError) && isTransientLLMError(callError)) {
             recordSpanError(chatSpan, callError);
             synthesisRetryUnaffordable = true;
           } else if (
@@ -4248,7 +4342,9 @@ export class AgentModeService {
         // hazard). Say plainly that the time ran out and point at the work in the steps
         // above, which is what the user can actually act on.
         if (synthesisRetryUnaffordable) {
-          content = TURN_TIME_BUDGET_FALLBACK_CONTENT;
+          // ENG-2778 (CodeRabbit): a failed step-budget synthesis has no time-budget cause;
+          // clear stale narration so the post-loop step-limit fallback applies instead.
+          content = stepBudgetSynthesis ? '' : TURN_TIME_BUDGET_FALLBACK_CONTENT;
           break;
         }
         const llmDurationMs = Date.now() - llmStart;
@@ -4326,6 +4422,11 @@ export class AgentModeService {
         // Update content with LLM's response
         if (responseContent) {
           content = responseContent;
+        } else if (stepBudgetSynthesis) {
+          // ENG-2778 (CodeRabbit): an empty forced step-budget synthesis must not ship an
+          // earlier iteration's narration as the answer; clear it so the post-loop
+          // step-limit fallback applies.
+          content = '';
         }
 
         // Add LLM model to the response message
@@ -4538,7 +4639,12 @@ export class AgentModeService {
             // the four nudges ENG-1188 exists to cover. The sibling branch below
             // (plain emptiness, no residue detected at all) has no such guarantee
             // attached to it and keeps its own truncatedByTimeBudget exclusion.
-            if (!turnHadUsableText) {
+            if (!turnHadUsableText && stepBudgetSynthesis) {
+              // ENG-2778 (Opslane): at the step cap the post-loop step-limit message is
+              // the specific fallback; the ledger would ask the user to request a summary.
+              console.warn(`AgentMode: Step-budget synthesis unusable in session ${sessionId} — deferring to the step-limit message`);
+              content = '';
+            } else if (!turnHadUsableText) {
               console.warn(`AgentMode: Synthesis unrecoverable after residue in session ${sessionId} — falling back to the executed-action ledger (${toolCalls.length} tool call(s))`);
               content = buildExecutedActionsFallback(toolCalls);
             } else {
@@ -4555,7 +4661,7 @@ export class AgentModeService {
               }
             }
             if (responseMessage) responseMessage.content = content;
-          } else if (synthesisResidueGuardEnabled && !turnHadUsableText && toolCalls.length > 0 && !truncatedByTimeBudget) {
+          } else if (synthesisResidueGuardEnabled && !turnHadUsableText && toolCalls.length > 0 && !truncatedByTimeBudget && !stepBudgetSynthesis) {
             // Same failure family as the residue case above (a synthesis the run could
             // not produce), just without residue text to detect: the bounded
             // empty-synthesis nudge (MAX_EMPTY_SYNTHESIS_RETRIES) above already asked
@@ -4582,6 +4688,8 @@ export class AgentModeService {
             // message the user actually needs to see (found via ENG-426 verification:
             // turnTimeBudgetTruncation.test.ts pinned the time-limit message and this
             // branch was clobbering it before the post-loop check ever ran).
+            // ENG-2778: same exclusion for the step-budget forced synthesis, whose
+            // post-loop step-limit message is the specific fallback.
             console.warn(`AgentMode: Terminating turn stayed empty after ${emptySynthesisRetries} nudge retr${emptySynthesisRetries === 1 ? 'y' : 'ies'} in session ${sessionId} — falling back to the executed-action ledger (${toolCalls.length} tool call(s))`);
             content = buildExecutedActionsFallback(toolCalls);
             if (responseMessage) responseMessage.content = content;
@@ -4709,7 +4817,7 @@ export class AgentModeService {
             });
 
             if (workPlanTurnDisposition.kind === 'invalid') {
-              if (workPlanDispositionRetries < 1 && !timeBudgetBlocksContinuation) {
+              if (workPlanDispositionRetries < 1 && !timeBudgetBlocksContinuation && !stepBudgetSynthesis) {
                 workPlanDispositionRetries += 1;
                 // The invalid assistant turn has not been checkpointed yet. Remove it
                 // before the next iteration so neither the model nor the customer sees
@@ -4727,6 +4835,13 @@ export class AgentModeService {
                 continue;
               }
 
+              if (stepBudgetSynthesis) {
+                // ENG-2778 (Opslane): no iteration remains for the in-turn recovery retry at
+                // the step cap. Deliver the model's recap (or the post-loop step-limit
+                // message) instead of a decision-card error, and do not stamp a retryable
+                // failure the recovery never attempted.
+                console.warn(`AgentMode: workplan turn missing structured disposition at step budget in session ${sessionId}; delivering recap`);
+              } else {
               const retryMessage = 'I couldn’t create the decision card needed to continue this step. Please retry.';
               content = retryMessage;
               if (responseMessage) {
@@ -4740,6 +4855,7 @@ export class AgentModeService {
                 };
               }
               console.error(`AgentMode: workplan turn missing structured disposition after recovery in session ${sessionId}`);
+              }
             }
           }
 
@@ -5186,6 +5302,20 @@ export class AgentModeService {
           }
         }
 
+        // ENG-2778: paging-spiral detection — same tool + same target, different page.
+        const pagingTripped = recordPagingCalls(pagingCallCounts, responseMessage.tool_calls);
+        if (pagingTripped.length > 0 && !pagingSpiralNudged) {
+          pagingSpiralNudged = true;
+          console.warn(`AgentMode: Detected paging spiral (${pagingTripped.join(', ')}) in session ${sessionId}, injecting paging-stop warning`);
+          (messages as any[]).push({ role: 'system', content: PAGING_SPIRAL_STOP_MESSAGE });
+        }
+
+        // ENG-2863: serial-read spiral — one independent read per step burns the step cap.
+        if (recordSerialReadStep(serialReadState, responseMessage.tool_calls)) {
+          console.warn(`AgentMode: Detected serial single-read steps in session ${sessionId}, injecting batch-lookups nudge`);
+          (messages as any[]).push({ role: 'system', content: SERIAL_READ_BATCH_MESSAGE });
+        }
+
         // Do not append an assistant message; tool messages above are sufficient for model continuation
       }
 
@@ -5362,7 +5492,7 @@ export class AgentModeService {
       // a carried-over number dressed as fresh. Measures how often it happens, per model, before
       // anyone decides to enforce. Never edits `content`; kill switch AGENT_CRM_FRESHNESS_GUARD=off.
       if (content && !wasCancelled && !mockMode) {
-        runCrmFreshnessShadow({ finalText: content, toolCalls, evidence: crmEvidence.snapshot(), earlier: crmEarlier, sessionNumbers: crmSessionNumbers, sessionId, model: llmModel });
+        runCrmFreshnessShadow({ finalText: content, toolCalls, evidence: crmEvidence.snapshot(), earlier: crmEarlier, sessionNumbers: crmSessionNumbers, sessionMessages: Array.isArray(sessionHistory) ? sessionHistory.length : undefined, sessionId, model: llmModel });
       }
 
       // ENG-1207 AC3: a run must not finish silently on an unread page.
@@ -5492,6 +5622,10 @@ export class AgentModeService {
         }
       }
 
+      if (truncatedByStepBudget && !wasCancelled) {
+        content = buildIterationLimitReport(content, toolCalls);
+      }
+
       // Opslane 2026-10-13: persist exactly what is returned. The step-cap,
       // content-filter and time-budget texts are assigned to `content` after the
       // model's own (often empty) message was already appended, so the transcript
@@ -5550,6 +5684,7 @@ export class AgentModeService {
             iterationTimings,
             memoryUsage,
             ...(toolCalls.length > 0 ? { toolCalls } : {}),
+            ...(truncatedByStepBudget && !wasCancelled ? { iterationLimitReached: true } : {}),
             ...(citations.length > 0 ? { citations } : {}),
             // ENG-2263: the numbers (never text) this invocation's CRM tools returned, so a continuation of this task can check
             // its totals against them. Additive and optional; bounded to 64 numbers + tool names. Off with the guard's kill switch.
@@ -5626,7 +5761,13 @@ export class AgentModeService {
       const httpStatus = error?.status ?? error?.$metadata?.httpStatusCode;
       // Check for context-limit patterns in the raw error message before falling through to generic 400
       const isContextLimit = /input is too long|context length|context window|token limit|too many tokens|prompt is too long|exceeds.*context|exceeded.*tokens|maximum.*tokens|messages.*exceed|request too large/i.test(errorMsg);
-      if (error?.code === 'content_filter' || error?.error?.code === 'ResponsibleAIPolicyViolation') {
+      if (classifyOpenRouterQuotaExhaustion(error)) {
+        // ENG-2763: OpenRouter key-limit / credits exhaustion is a known class that a
+        // retry cannot fix; name it so the controller answers 503 and alerts once per class.
+        // Checked first: the credits 402 text ("fewer max_tokens ... can only afford N")
+        // otherwise trips the context-limit/400 patterns below and ends in a 500.
+        userMessage = QUOTA_EXHAUSTED_USER_MESSAGE;
+      } else if (error?.code === 'content_filter' || error?.error?.code === 'ResponsibleAIPolicyViolation') {
         userMessage = 'I apologize, but I cannot respond to that request as it may violate content policies. Please try rephrasing your question or asking about something else.';
       } else if (httpStatus === 429) {
         userMessage = 'I\'m currently experiencing high demand. Please wait a moment and try again.';
@@ -6605,6 +6746,17 @@ export class AgentModeService {
     'start_hot_lead_call_verification',
     'confirm_hot_lead_call_verification',
 
+    // Smartlead push (ENG-673): the user's own Smartlead campaigns; starting and releasing are approval-card gated
+    'list_smartlead_campaigns',
+    'get_smartlead_campaign_stats',
+    'preview_smartlead_push',
+    'start_smartlead_push',
+    'get_smartlead_push_status',
+    'pause_smartlead_push',
+    'resume_smartlead_push',
+    'cancel_smartlead_push',
+    'release_leads_from_smartlead',
+
     // Scheduled Chat Management
     'list_scheduled_chats',
     'manage_scheduled_chat',
@@ -7574,6 +7726,10 @@ export class AgentModeService {
       }
     }
 
+    // ENG-1948: mirror the main turn handler's evaluation_workspace listing filter.
+    tools = applyEvaluationWorkspaceListing(tools, allowedToolNames,
+      shouldOfferEvaluationWorkspace({ userId, isAdmin, isDelegatedAccess: input.isDelegatedAccess, isInteractiveShare: input.isInteractiveShare }));
+
     if (input.excludeTools?.length) {
       const excludeSet = new Set(input.excludeTools);
       tools = tools.filter((t: any) => !excludeSet.has(t.function?.name));
@@ -7645,6 +7801,34 @@ export class AgentModeService {
     };
   }
 
+  /** The one line the "Installed Skills:" block carries per skill: id, name, description and the skill's own instructions. */
+  public static formatInstalledSkillLine(s: { skillId: string; name: string; description?: string; systemPrompt?: string }): string {
+    return `${s.skillId}- ${s.name}: ${s.description} ${s.systemPrompt || ''}`;
+  }
+
+  /**
+   * ENG-2113 (tool relay): in-process Emma rebuilds the "Installed Skills:" block after install_skills so the NEXT model call of the same turn sees the new
+   * skills' instructions. A relayed turn has no such block to rebuild, so the same lines (formatInstalledSkillLine) are returned here to travel with the install_skills
+   * answer. Only the skills this call installed (by name, as the result lists them) and that are now on the session. '' when there are none. Never throws.
+   */
+  public async buildInstalledSkillsNote(sessionId: string, requestedSkillIds: unknown, installedNames: unknown): Promise<string> {
+    try {
+      if (!Array.isArray(requestedSkillIds) || !Array.isArray(installedNames)) return '';
+      const names = new Set(installedNames.filter((n): n is string => typeof n === 'string'));
+      const ids = [...new Set(requestedSkillIds.filter((i): i is string => typeof i === 'string').map(normalizeSkillIdArg))];
+      if (!ids.length || !names.size) return '';
+      const session = await chatbotDb.getChatSession(sessionId);
+      const associated = new Set<string>(session?.associatedSkills ?? []);
+      const present = ids.filter((id) => associated.has(id));
+      if (!present.length) return '';
+      const skills = (await skillService.getSkillsByIds(present)).filter((sk: any) => names.has(sk.name));
+      if (!skills.length) return '';
+      return `Installed Skills (now active in this conversation):\n${skills.map((sk: any) => AgentModeService.formatInstalledSkillLine(sk)).join('\n')}`;
+    } catch {
+      return '';
+    }
+  }
+
   /**
    * ENG-1222: the single source of truth for "which tools + skill-context text
    * does a session with these installed skills get". Was private to Agent Mode
@@ -7692,10 +7876,12 @@ export class AgentModeService {
       ADMIN_SKILL_TOOL_NAMES.forEach(t => allowedToolNames.add(t));
     }
 
+    addCompanionTools(allowedToolNames);
+
     let installedSkillContextMsg = '';
     const skillLines: string[] = [];
     if (associatedSkills.length) {
-      associatedSkills.forEach(s => skillLines.push(`${s.skillId}- ${s.name}: ${s.description} ${s.systemPrompt || ''}`));
+      associatedSkills.forEach(s => skillLines.push(AgentModeService.formatInstalledSkillLine(s)));
     }
     if (hasAdminAccess) {
       skillLines.push(`${ADMIN_SKILL_VIRTUAL_ID}- Admin Tools (always active for admins): Use manage_user_notes to read/add/delete time-stamped notes on any user — lookup by email OR userId. Use list_all_clients, assess_client_health, freeze_user_account, manage_scoring_judges, and other admin tools for platform management. Tools: ${ADMIN_SKILL_TOOL_NAMES.join(', ')}`);
@@ -11421,17 +11607,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       clientScope?.toolName ?? 'meta_ads_tool'
     );
 
-    // ENG-1801 fix: a client_id-scoped (cross-tenant, admin) call never
-    // auto-selects an account and never falls back to the shared-token legacy
-    // adAccount field — both fallback branches below are only reachable via
-    // the `!accountId` path, so this one guard structurally disables both for
-    // the scoped path while leaving the unscoped path's fallback code untouched.
-    if (strict && !accountId) {
-      throw this.makeMetaAuthError(
-        `client_id-scoped calls require an explicit account_id — call assess_client_health with client_name_or_email="${clientScope?.clientId}" first; its ad_account_id field is this client's Meta ad account.`
-      );
-    }
-
+    // ENG-1801: the strict (client_id-scoped) no-account_id guard lives after
+    // the connected-account lookup below (ENG-2786), so it can list candidates.
     const { userDb } = await import('./db');
     const user = await userDb.getUserById(effectiveUserId);
     if (!user) throw this.makeMetaAuthError(strict ? 'Client account no longer exists.' : 'User not found');
@@ -11454,6 +11631,34 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       acc.config?.access_token
     );
 
+    // ENG-1801 fix: a client_id-scoped (cross-tenant, admin) call never
+    // auto-selects an account and never falls back to the shared-token legacy
+    // adAccount field. ENG-2786: this is a usage error, not a credential
+    // failure — classify it invalid_args and list the client's candidate
+    // account_ids so the model can retry with one directly. Candidates come from
+    // every Meta ad account the client has connected (not only token-bearing
+    // ones), so a seeded/odd-typed account still surfaces as a choice.
+    if (strict && !accountId) {
+      const candidateIds = Array.from(new Set(
+        (connectedAccounts as any[])
+          .filter((acc: any) =>
+            (acc.platform === 'facebook' || acc.platform === 'meta') &&
+            (!acc.config?.account_type || acc.config.account_type === 'ad_account')
+          )
+          .map((acc: any) => clean(acc.account_id || acc.config?.ad_account_id || acc.accountId || ''))
+          .filter(Boolean)
+          .map((id: string) => `act_${id}`)
+      ));
+      if (candidateIds.length > 0) {
+        const err = this.makeMetaAuthError(
+          `client_id-scoped calls require an explicit account_id — call assess_client_health with client_name_or_email="${clientScope?.clientId}" first; its ad_account_id field is this client's Meta ad account. Candidate account_ids: [${candidateIds.join(', ')}].`
+        ) as any;
+        err.toolErrorClass = 'invalid_args';
+        err.candidateAccountIds = candidateIds;
+        throw err;
+      }
+    }
+
     if (fbAccounts.length === 0) {
       // Fall back to legacy adAccount field + centralized Secrets Manager token.
       // This covers users who had their Meta Marketing connected account removed but still
@@ -11473,6 +11678,15 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         strict
           ? `Client "${user.email || effectiveUserId}" has no connected Meta ad account. Client-scoped calls never fall back to the legacy shared-token account.`
           : 'Meta Ads account is not connected. Use the search_user_guide tool to find setup instructions and share them with the user.'
+      );
+    }
+
+
+    // ENG-1801: a strict call without account_id never auto-selects, even when
+    // no candidate id could be listed above.
+    if (strict && !accountId) {
+      throw this.makeMetaAuthError(
+        `client_id-scoped calls require an explicit account_id — call assess_client_health with client_name_or_email="${clientScope?.clientId}" first; its ad_account_id field is this client's Meta ad account.`
       );
     }
 
@@ -14443,8 +14657,16 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
    *  same-iteration halts" behavior the write-deck builder already has. */
   private buildQuestionApprovalDeckFromHalts(questionHalts: any[]): PendingApprovalDeck | null {
     const questions: QuestionDeckQuestionInput[] = [];
+    // The model can repeat a hot lead call approval in one reply, and each call mints its own card; one is enough.
+    const seenCards = new Set<string>();
     for (const r of questionHalts) {
-      if (Array.isArray(r.questionDeckPayload)) questions.push(...r.questionDeckPayload);
+      if (!Array.isArray(r.questionDeckPayload)) continue;
+      for (const q of r.questionDeckPayload) {
+        const identity = approvalCardIdentity(q.kind);
+        if (identity !== null && seenCards.has(identity)) continue;
+        if (identity !== null) seenCards.add(identity);
+        questions.push(q);
+      }
     }
     if (questions.length === 0) return null;
     try {
@@ -16890,6 +17112,20 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     // the VM sandbox (only `page` is in scope). Guide the LLM to fix the code, not retry as-is.
     const isBrowserRunCode =
       toolName === 'browser_run_code' || toolName.endsWith('_browser_run_code');
+    // ENG-2807: a Playwright locator/action timeout inside browser_run_code means the
+    // selector never appeared (wrong selector, login redirect, iframe, or the user is
+    // already signed in). Re-running the same code just burns another 30s timeout, so
+    // steer the model to inspect the live page before choosing a new selector.
+    if (
+      isBrowserRunCode &&
+      /TimeoutError/.test(safeMessage) &&
+      /Timeout \d+ms exceeded/.test(safeMessage) &&
+      /waiting for (locator|selector|getBy)/i.test(safeMessage)
+    ) {
+      const selectorMatch = safeMessage.match(/waiting for (locator\([^\n]*?\)|getBy\w+\([^\n]*?\)|selector [^\n]+)/i);
+      const selectorNote = selectorMatch ? ` (${selectorMatch[1].trim()})` : '';
+      return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: The element your code waited for${selectorNote} never appeared on the page — this is a wrong/stale selector, not a slow page. Do NOT re-run the same code with the same selector. First call browser_snapshot to see the actual page: check whether you were redirected (login, consent, captcha), whether the field is inside an iframe, or whether the step is already complete (e.g. already signed in). Then pick a selector that exists in the snapshot (prefer role/label/placeholder locators) and retry once.`;
+    }
     if (isBrowserRunCode && safeMessage.includes('ReferenceError')) {
       return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: The browser_run_code sandbox only has \`page\` in scope. All variables must be declared inside the async function body. Do NOT reference external variables, imports, or closures. Rewrite the function to be fully self-contained:\n\`\`\`js\nasync (page) => {\n  // All logic here — no outside variables\n  const result = await page.evaluate(() => { ... });\n  return result;\n}\n\`\`\``;
     }

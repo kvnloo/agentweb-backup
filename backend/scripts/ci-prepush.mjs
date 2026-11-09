@@ -27,7 +27,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, realpathSync, rmdirSync,
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
-import { parsePushLine, isBackendPath, resolveBaseSha, classifyChangedFiles, selectJestSuites, evaluateListTestsResult, parseDiffRaw, mergeStatusByPathAcrossRefs, findForeignBackendRefs, basesForDeletedPaths, distinctBasesForDeletedPaths, pathsForBase } from './prepush/logic.mjs';
+import { checkNodeVersion, parsePushLine, isBackendPath, resolveBaseSha, classifyChangedFiles, selectJestSuites, evaluateListTestsResult, parseDiffRaw, mergeStatusByPathAcrossRefs, findForeignBackendRefs, basesForDeletedPaths, distinctBasesForDeletedPaths, pathsForBase } from './prepush/logic.mjs';
 
 const TSC_BUDGET_MS = Number(process.env.AGENTWEB_PREPUSH_TSC_BUDGET_MS || 4 * 60 * 1000);
 const JEST_BUDGET_MS = Number(process.env.AGENTWEB_PREPUSH_JEST_BUDGET_MS || 6 * 60 * 1000);
@@ -298,6 +298,9 @@ const missingButNotDeleted = backendFiles.filter((f) => statusByPath[f] !== 'D' 
 if (missingButNotDeleted.length) {
   fail(`these paths are Added/Modified per the pushed commit(s) but missing from the working tree — cannot verify against a tree that doesn't match what you're about to push: ${missingButNotDeleted.join(', ')}`);
 }
+
+const nodeCheck = checkNodeVersion(process.versions.node);
+if (!nodeCheck.ok) fail(nodeCheck.message);
 
 const bin = (name) => path.join(backend, 'node_modules', '.bin', name);
 if (!existsSync(bin('tsc')) || !existsSync(bin('jest'))) {

@@ -828,7 +828,7 @@ describe('runCrmFreshnessShadow (ENG-2263)', () => {
     try {
       // Inventory finding FIRST and a tag finding after, with PII in the surrounding reply.
       const reply = 'Hi Jane Doe (jane.doe@acme.com), you have 18 lead lists and 47 leads in total, deal value $98,500 [verified: get_lead_lists]';
-      runCrmFreshnessShadow({ finalText: reply, toolCalls: [], sessionId: 's9', model: 'm1' });
+      runCrmFreshnessShadow({ finalText: reply, toolCalls: [], sessionId: 's9', model: 'm1', sessionMessages: 12 });
       expect(warn).toHaveBeenCalledTimes(1);
       const line = String(warn.mock.calls[0][0]);
       expect(line.includes('\n')).toBe(false);
@@ -837,7 +837,7 @@ describe('runCrmFreshnessShadow (ENG-2263)', () => {
       expect(json.kinds).toEqual(expect.arrayContaining(['cited_tool_not_run', 'inventory_total_not_in_tool_results']));
       expect(json.claimed).toEqual(expect.arrayContaining([18, 47]));
       expect(json.cited).toEqual(['get_lead_lists']);
-      expect(Object.keys(json).sort()).toEqual(['cited', 'claimed', 'continuation', 'crmToolsSucceeded', 'drift', 'echoesEarlier', 'findingCount', 'kinds', 'model', 'sessionId', 'tagsSeen']);
+      expect(Object.keys(json).sort()).toEqual(['cited', 'claimed', 'continuation', 'crmToolsSucceeded', 'drift', 'echoesEarlier', 'findingCount', 'kinds', 'model', 'sessionDensity20', 'sessionId', 'sessionMessages', 'sessionNumberCount', 'tagsSeen']);
       for (const secret of ['Jane', 'Doe', 'jane.doe', 'acme', '98,500', 'deal value', 'lead lists and']) expect(line).not.toContain(secret);
     } finally { warn.mockRestore(); }
   });
@@ -1095,5 +1095,182 @@ describe('a REAL time-limit partial persists no evidence, so a "continue" after 
   it('an unrelated assistant message with no marker does not trigger it', () => {
     const h = [{ role: 'user', content: 'hi' }, { role: 'assistant', content: 'hello' }, { role: 'user', content: 'continue' }];
     expect(crmEvidenceFromEarlierInvocations(h).complete).toBe(true);
+  });
+});
+
+
+// ENG-2382: the 10-27 read could not tell a coincidence from a stale restatement. `echoesEarlier` means "the claimed number is among
+// the numbers earlier turns returned", and that set holds every array length of every CRM result, so in a long session a small
+// number is in it by chance. These lines make the chance measurable (numbers only) and give the flag rate a denominator.
+describe('shadow log: how crowded the session number set is (ENG-2382)', () => {
+  const flaggedLine = (extra: any) => {
+    const log = jest.fn();
+    runCrmFreshnessShadow({ finalText: '47 leads [verified: get_lead_lists]', toolCalls: [], sessionId: 's', model: 'm', log, ...extra });
+    return log.mock.calls[0][1];
+  };
+
+  it('logs the set size and the share of the integers 0..20 it contains', () => {
+    const d = flaggedLine({ sessionNumbers: new Set([0, 1, 2, 3, 18, 47]), sessionMessages: 647 });
+    expect(d).toMatchObject({ sessionNumberCount: 6, sessionDensity20: 0.24, sessionMessages: 647 });
+  });
+
+  it('density counts only integers 0..20 (47 and 293 do not crowd the small range)', () => {
+    expect(flaggedLine({ sessionNumbers: new Set([47, 293, 1000]) })).toMatchObject({ sessionNumberCount: 3, sessionDensity20: 0 });
+  });
+
+  it('a full small range reads as 1', () => {
+    expect(flaggedLine({ sessionNumbers: new Set(Array.from({ length: 21 }, (_, i) => i)) }).sessionDensity20).toBe(1);
+  });
+
+  it('no session numbers: count 0, density 0, and the message count is simply absent when unknown', () => {
+    const d = flaggedLine({});
+    expect(d).toMatchObject({ sessionNumberCount: 0, sessionDensity20: 0 });
+    expect(d.sessionMessages).toBeUndefined();
+  });
+
+  it('ignores a message count that is not a non-negative integer', () => {
+    for (const bad of [-1, 1.5, NaN, Infinity, '12', null]) expect(flaggedLine({ sessionMessages: bad }).sessionMessages).toBeUndefined();
+  });
+});
+
+describe('checked line: the denominator for the flag rate (ENG-2382)', () => {
+  const OLD = process.env.AGENT_CRM_FRESHNESS_GUARD;
+  afterEach(() => { if (OLD === undefined) delete process.env.AGENT_CRM_FRESHNESS_GUARD; else process.env.AGENT_CRM_FRESHNESS_GUARD = OLD; });
+  const run = (text: string, calls: any[] = [], extra: any = {}) => {
+    const logChecked = jest.fn();
+    const log = jest.fn();
+    runCrmFreshnessShadow({ finalText: text, toolCalls: calls, model: 'gemini-3.8-flash', log, logChecked, ...extra });
+    return { logChecked, log };
+  };
+  const listsOk = [ok('get_lead_lists', { success: true, lists: [{ leadCount: 5 }], totalLists: 17 })];
+
+  it('a CLEAN reply with a CRM tool call is counted, not flagged', () => {
+    const { logChecked, log } = run('17 lists [verified: get_lead_lists]', listsOk);
+    expect(log).not.toHaveBeenCalled();
+    expect(logChecked).toHaveBeenCalledTimes(1);
+    expect(logChecked.mock.calls[0][0]).toContain('[crm-freshness-checked]');
+    expect(logChecked.mock.calls[0][1]).toMatchObject({ model: 'gemini-3.8-flash', flagged: false, findingCount: 0, tagsSeen: 1, crmToolsSucceeded: 1 });
+  });
+
+  it('a flagged reply is counted too, with flagged: true, so the line count is the denominator', () => {
+    const { logChecked, log } = run('47 leads [verified: get_lead_lists]');
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(logChecked).toHaveBeenCalledTimes(1);
+    expect(logChecked.mock.calls[0][1]).toMatchObject({ flagged: true, findingCount: 1, crmToolsSucceeded: 0 });
+  });
+
+  it('a reply with an inventory claim and no tag or tool is counted (claimsSeen)', () => {
+    const { logChecked } = run('You have 18 lead lists and 47 leads in total.');
+    expect(logChecked.mock.calls[0][1]).toMatchObject({ claimsSeen: 2, tagsSeen: 0, flagged: true });
+  });
+
+  it('a reply with no CRM tool, no tag and no inventory claim is NOT counted (no log volume for unrelated chat)', () => {
+    const { logChecked, log } = run('Here is the landing page copy you asked for.');
+    expect(logChecked).not.toHaveBeenCalled();
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  it('says when the total check abstained instead of evaluating the claim', () => {
+    // a CRM write in the turn makes the totals unknowable, so the check abstains
+    const abstained = run('You have 18 lead lists.', [ok('add_leads_to_list'), ok('get_lead_lists')]);
+    expect(abstained.logChecked.mock.calls[0][1]).toMatchObject({ claimsSeen: 1, totalsAbstained: true, flagged: false });
+    // control: the same claim with no write is evaluated, not abstained, and (unbacked) is flagged
+    const c = createCrmEvidenceCollector();
+    c.record('get_lead_lists', { success: true, totalLists: 17, lists: Array.from({ length: 17 }, (_, i) => ({ listId: 'l' + i, leadCount: 1 })) });
+    const evaluated = run('You have 18 lead lists.', [ok('get_lead_lists')], { evidence: c.snapshot() });
+    expect(evaluated.logChecked.mock.calls[0][1]).toMatchObject({ claimsSeen: 1, totalsAbstained: false, flagged: true });
+  });
+
+  it('a continuation whose earlier evidence is incomplete abstains on totals, and says so', () => {
+    // earlier invocations ran a CRM tool but their numbers were never persisted: the total check cannot judge a claim
+    const { logChecked, log } = run('You have 18 lead lists.', [], { earlier: ['get_lead_lists'] });
+    expect(log).not.toHaveBeenCalled();
+    expect(logChecked.mock.calls[0][1]).toMatchObject({ claimsSeen: 1, totalsAbstained: true, flagged: false });
+  });
+
+  it('every flagged reply also writes a checked line (flagged lines can never exceed checked lines)', () => {
+    const texts = ['47 leads [verified: get_lead_lists]', 'You have 18 lead lists and 47 leads in total.', '17 lists [verified: get_lead_lists]', 'unrelated'];
+    let flaggedLines = 0; let checkedLines = 0;
+    for (const t of texts) runCrmFreshnessShadow({ finalText: t, toolCalls: [], model: 'm', log: () => { flaggedLines++; }, logChecked: () => { checkedLines++; } });
+    expect(flaggedLines).toBeGreaterThan(0);
+    expect(checkedLines).toBeGreaterThanOrEqual(flaggedLines);
+  });
+
+  it('the checked line carries the session size, number-set size and small-number density, so the flag rate can be split by how crowded the session was', () => {
+    const { logChecked } = run('17 lists [verified: get_lead_lists]', listsOk, { sessionNumbers: new Set([0, 1, 2, 3, 18, 47]), sessionMessages: 647 });
+    expect(logChecked.mock.calls[0][1]).toMatchObject({ sessionNumberCount: 6, sessionDensity20: 0.24, sessionMessages: 647 });
+  });
+
+  it('the density on the checked line is the same number the flagged line reports for the same reply', () => {
+    const log = jest.fn(); const logChecked = jest.fn();
+    runCrmFreshnessShadow({ finalText: '47 leads [verified: get_lead_lists]', toolCalls: [], sessionNumbers: new Set([0, 1, 2, 3, 4]), sessionMessages: 30, log, logChecked });
+    for (const k of ['sessionNumberCount', 'sessionDensity20', 'sessionMessages']) expect(logChecked.mock.calls[0][1][k]).toEqual(log.mock.calls[0][1][k]);
+  });
+
+  it('a flagged sink that throws still returns the findings (the caller ignores them, but tests and future callers rely on them)', () => {
+    const logChecked = jest.fn();
+    const findings = runCrmFreshnessShadow({ finalText: '47 leads [verified: get_lead_lists]', toolCalls: [], log: () => { throw new Error('down'); }, logChecked });
+    expect(findings).toHaveLength(1);
+  });
+
+  it('a checked sink that throws still returns the findings', () => {
+    const log = jest.fn();
+    const findings = runCrmFreshnessShadow({ finalText: '47 leads [verified: get_lead_lists]', toolCalls: [], log, logChecked: () => { throw new Error('down'); } });
+    expect(findings).toHaveLength(1);
+    expect(log).toHaveBeenCalledTimes(1);
+  });
+
+  it('a failing flagged sink does not stop the checked line', () => {
+    const logChecked = jest.fn();
+    expect(() => runCrmFreshnessShadow({ finalText: '47 leads [verified: get_lead_lists]', toolCalls: [], log: () => { throw new Error('flagged sink down'); }, logChecked })).not.toThrow();
+    expect(logChecked).toHaveBeenCalledTimes(1);
+  });
+
+  it('carries numbers and a model name only: never reply text, session or user ids', () => {
+    const logChecked = jest.fn();
+    runCrmFreshnessShadow({ finalText: 'Hi Jane Doe (jane.doe@acme.com), 18 lead lists, deal value $98,500 [verified: get_lead_lists]', toolCalls: [], sessionId: 's-secret', model: 'm1', sessionMessages: 12, sessionNumbers: new Set([1, 2, 3]), log: jest.fn(), logChecked });
+    const d = logChecked.mock.calls[0][1];
+    expect(Object.keys(d).sort()).toEqual(['claimsSeen', 'crmToolsSucceeded', 'findingCount', 'flagged', 'model', 'sessionDensity20', 'sessionMessages', 'sessionNumberCount', 'tagsSeen', 'totalsAbstained']);
+    const line = JSON.stringify(d);
+    for (const secret of ['Jane', 'jane.doe', 'acme', '98,500', 's-secret']) expect(line).not.toContain(secret);
+  });
+
+  it('the default sink writes ONE line of valid JSON', () => {
+    const spy = jest.spyOn(console, 'log').mockImplementation(() => undefined);
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      runCrmFreshnessShadow({ finalText: '17 lists [verified: get_lead_lists]', toolCalls: listsOk, model: 'm1' });
+      const lines = spy.mock.calls.map((c) => String(c[0])).filter((l) => l.includes('[crm-freshness-checked]'));
+      expect(lines).toHaveLength(1);
+      expect(lines[0].includes('\n')).toBe(false);
+      expect(JSON.parse(lines[0].slice(lines[0].indexOf('{')))).toMatchObject({ model: 'm1', flagged: false });
+    } finally { spy.mockRestore(); warn.mockRestore(); }
+  });
+
+  it('is disabled by AGENT_CRM_FRESHNESS_GUARD=off', () => {
+    process.env.AGENT_CRM_FRESHNESS_GUARD = 'off';
+    const { logChecked } = run('17 lists [verified: get_lead_lists]', listsOk);
+    expect(logChecked).not.toHaveBeenCalled();
+  });
+
+  it('never throws, even if the checked sink does, and the flagged line still goes out', () => {
+    const log = jest.fn();
+    const logChecked = jest.fn(() => { throw new Error('sink down'); });
+    expect(() => runCrmFreshnessShadow({ finalText: '47 leads [verified: get_lead_lists]', toolCalls: [], log, logChecked })).not.toThrow();
+    expect(log).toHaveBeenCalledTimes(1);
+  });
+
+  it('the checked line is written AFTER the flagged line is out, so a failure there cannot lose a finding', () => {
+    const order: string[] = [];
+    runCrmFreshnessShadow({ finalText: '47 leads [verified: get_lead_lists]', toolCalls: [], log: () => order.push('flagged'), logChecked: () => order.push('checked') });
+    expect(order).toEqual(['flagged', 'checked']);
+  });
+
+  it('hostile input does not throw or blow the time budget through the real entry point', () => {
+    const t0 = process.hrtime.bigint();
+    for (const text of ['[verified '.repeat(500_000), '1 '.repeat(500_000), 'total lists '.repeat(100_000)]) {
+      expect(() => runCrmFreshnessShadow({ finalText: text, toolCalls: [], model: 'm', log: jest.fn(), logChecked: jest.fn() })).not.toThrow();
+    }
+    expect(Number(process.hrtime.bigint() - t0) / 1e6).toBeLessThan(1500);
   });
 });

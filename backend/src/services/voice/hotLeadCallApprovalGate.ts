@@ -1,14 +1,15 @@
 /**
- * Human approval for the paid hot-lead-call number tools (ENG-2613).
+ * Human approval for the hot-lead-call tools that spend money or end calling (ENG-2613, ENG-2271).
  *
- * Buying a number starts a monthly charge and releasing one ends calling, so neither runs on a model's say-so.
- * The tool first halts with a one-question approval card (the same deck-of-one mechanism the CRM sequence
- * activation gate uses, see crmSequenceActivationGate.ts) and only acts when the person in the chat has
- * clicked "approve" on that exact card.
+ * Buying a number starts a monthly charge, releasing one ends calling and turning calling on lets calls be
+ * billed per minute, so none of them runs on a model's say-so. The tool first halts with a one-question approval
+ * card (the same deck-of-one mechanism the CRM sequence activation gate uses, see crmSequenceActivationGate.ts)
+ * and only acts when the person in the chat has clicked "approve" on that exact card.
  *
- * What an approval is bound to: a digest over the action, organization, user, chat session, the parameters
- * (area code, or the number being released), the monthly rent as it is quoted now, and the revision of the
- * stored hot lead call settings. A change to any of them makes an earlier approval stop matching.
+ * What an approval is bound to: a digest over the action, organization, user, chat session, the parameters (area
+ * code, the number being released, or the settings change that turns calling on), the price as it is quoted now
+ * (monthly rent or per-minute rate), and the revision of the stored hot lead call settings. A change to any of
+ * them makes an earlier approval stop matching.
  *
  * An approval is valid only when it
  *   - was given by the user ('user'; "Let Emma decide" is not offered and a delegation never counts),
@@ -29,7 +30,7 @@ import {
 import type { GateOutcome } from '../crmSequenceActivationGate';
 import type { AskUserQuestionOption } from '../agentMode/core/askUserQuestion';
 
-export type HotLeadCallApprovalAction = 'provision' | 'release';
+export type HotLeadCallApprovalAction = 'provision' | 'release' | 'enable';
 
 /** Card kinds starting with this are written only by this module; ask_user_question refuses them. */
 export const APPROVAL_KIND_RESERVED_PREFIX = 'hot_lead_call_approval:';
@@ -46,10 +47,10 @@ export interface ApprovalDigestInput {
   orgId: string;
   userId: string;
   sessionId: string;
-  /** Area code (provision, may be empty) or the sid of the number being released. */
+  /** Area code (provision, may be empty), the sid of the number being released, or the settings change that turns calling on. */
   target: string | null;
-  /** The monthly rent as quoted to the user now, for example "$1.15 per month". */
-  rentText: string;
+  /** The price as quoted to the user now: the monthly rent ("$1.15 per month") or the call rate ("$0.014 per minute"). */
+  priceText: string;
   /** hotLeadCallRevisionOf(org.hotLeadCall) */
   revision: string;
 }
@@ -62,7 +63,7 @@ export function computeApprovalDigest(input: ApprovalDigestInput): string {
     userId: input.userId,
     sessionId: input.sessionId,
     target: input.target,
-    rentText: input.rentText,
+    priceText: input.priceText,
     revision: input.revision,
   };
   return createHash('sha256').update(JSON.stringify(material)).digest('hex');
@@ -74,6 +75,14 @@ export function approvalKindPrefix(action: HotLeadCallApprovalAction, digest: st
 
 export function newApprovalKind(action: HotLeadCallApprovalAction, digest: string): string {
   return approvalKindPrefix(action, digest) + randomBytes(8).toString('hex');
+}
+
+/**
+ * The card kind without its nonce, or null for a kind this module did not write. Two cards with the same identity
+ * ask the same question about the same change, so a reply that produced both needs to show only one.
+ */
+export function approvalCardIdentity(kind: unknown): string | null {
+  return typeof kind === 'string' && kind.startsWith(APPROVAL_KIND_RESERVED_PREFIX) ? kind.slice(0, kind.lastIndexOf(':') + 1) : null;
 }
 
 export function consumedKeyOf(kind: string): string {
@@ -115,24 +124,55 @@ export function checkAttendedForApproval<S extends { sessionType?: string }>(
   return { allowed: true, sessionId: facts.sessionId, session: facts.session };
 }
 
-export interface ApprovalQuestionInput {
-  action: HotLeadCallApprovalAction;
-  kind: string;
-  rentText: string;
-  areaCode?: string;
-  /** Number being released, for the card text. */
-  number?: string;
+/** What the enable card tells the person about the limits that bound the spend, from the settings about to be saved. */
+export interface EnableLimits {
+  maxCallsPerHour: number;
+  maxCallsPerDay: number;
+  maxCallsPerMonth: number;
+  maxAttemptsPerLead: number;
+  callingHours?: { start: string; end: string; timezone: string };
 }
+
+export type ApprovalQuestionInput = { kind: string; priceText: string } & (
+  | { action: 'provision'; areaCode?: string }
+  | { action: 'release'; number?: string }
+  | {
+    action: 'enable';
+    /** Caller number calls are placed from, as shown to the person. */
+    number?: string;
+    /** Who will be phoned, for example "Dana Lee (***0100)"; at least one. */
+    members: string[];
+    limits: EnableLimits;
+  }
+);
+
+function questionText(input: ApprovalQuestionInput): string {
+  switch (input.action) {
+    case 'provision':
+      return `Buy a phone number${input.areaCode ? ` in area code ${input.areaCode}` : ''} for hot lead calls? It costs ${input.priceText}, charged now and every month until the number is released. Calls placed from it are also billed per minute.`;
+    case 'release':
+      return `Release the hot lead caller number${input.number ? ` ${input.number}` : ''}? Calling is turned off, the number goes back to the phone provider and cannot be recovered, and a new one may be a different number that costs ${input.priceText}.`;
+    case 'enable': {
+      if (input.members.length === 0) throw new Error('The enable card needs the people who will be phoned');
+      const { limits } = input;
+      const hours = limits.callingHours ? `, only ${limits.callingHours.start}-${limits.callingHours.end} ${limits.callingHours.timezone}` : '';
+      return `Turn on hot lead calling? When a lead arrives from your landing page, AgentWeb will phone ${input.members.join(', ')} from your number${input.number ? ` ${input.number}` : ''}, and then the lead. Both calls are billed to the organization owner per minute at the current rate of ${input.priceText}, each rounded up to a whole minute. Limits: ${limits.maxCallsPerHour} leads per hour, ${limits.maxCallsPerDay} per day, ${limits.maxCallsPerMonth} per month, at most ${limits.maxAttemptsPerLead} call attempts per lead${hours}. You can turn it off at any time.`;
+    }
+  }
+}
+
+const APPROVE_OPTIONS: Record<HotLeadCallApprovalAction, { label: string; consequence: (priceText: string) => string }> = {
+  provision: { label: 'Buy the number', consequence: priceText => `Buys the number now and charges ${priceText} until it is released.` },
+  release: { label: 'Release the number', consequence: () => 'Releases the number and turns calling off.' },
+  enable: { label: 'Turn calling on', consequence: priceText => `Calls start for new leads now, billed at ${priceText}.` },
+};
 
 /**
  * The approval card. The wording is built here from live values, never from model text. "Decline" comes first
  * and is the recommended option, so any answer taken without a person choosing resolves to "do not spend".
  */
 export function buildApprovalQuestion(input: ApprovalQuestionInput): QuestionDeckQuestionInput {
-  const provision = input.action === 'provision';
-  const question = provision
-    ? `Buy a phone number${input.areaCode ? ` in area code ${input.areaCode}` : ''} for hot lead calls? It costs ${input.rentText}, charged now and every month until the number is released. Calls placed from it are also billed per minute.`
-    : `Release the hot lead caller number${input.number ? ` ${input.number}` : ''}? Calling is turned off, the number goes back to the phone provider and cannot be recovered, and a new one may be a different number that costs ${input.rentText}.`;
+  const approve = APPROVE_OPTIONS[input.action];
   const options: AskUserQuestionOption[] = [
     {
       id: DECLINE_OPTION_ID,
@@ -141,13 +181,9 @@ export function buildApprovalQuestion(input: ApprovalQuestionInput): QuestionDec
       recommended: true,
       why: 'Nothing is spent or changed unless you approve.',
     },
-    {
-      id: APPROVE_OPTION_ID,
-      label: provision ? 'Buy the number' : 'Release the number',
-      consequence: provision ? `Buys the number now and charges ${input.rentText} until it is released.` : 'Releases the number and turns calling off.',
-    },
+    { id: APPROVE_OPTION_ID, label: approve.label, consequence: approve.consequence(input.priceText) },
   ];
-  return { question, options, allowEmmaDecide: false, kind: input.kind, immutable: true };
+  return { question: questionText(input), options, allowEmmaDecide: false, kind: input.kind, immutable: true };
 }
 
 export type ApprovalLookup =

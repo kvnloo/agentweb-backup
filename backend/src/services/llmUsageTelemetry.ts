@@ -63,6 +63,18 @@ export const USAGE_TELEMETRY_EVENTS = {
    * since that inference needs the queryable store described above.
    */
   recommendationDeclined: "runway_recommendation_declined",
+  /** ENG-2769: the usage-alert modal was displayed to a customer. */
+  alertShown: "runway_alert_shown",
+  /** ENG-2769: the customer acknowledged the alert ("Got it"). */
+  alertDismissed: "runway_alert_dismissed",
+  /** ENG-2769: the customer opened "See what's using it". */
+  alertSeeOptions: "runway_alert_see_options",
+  /** ENG-2769: the customer clicked the managed-plan "Book a call" CTA. */
+  alertBookCall: "runway_alert_book_call",
+  /** ENG-2769: the customer clicked the self-serve upgrade CTA. */
+  alertUpgrade: "runway_alert_upgrade",
+  /** ENG-2769: the customer clicked the top-tier "Contact us" CTA. */
+  alertContact: "runway_alert_contact",
 } as const;
 
 export type UsageTelemetryEvent =

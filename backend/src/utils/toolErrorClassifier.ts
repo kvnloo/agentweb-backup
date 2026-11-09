@@ -118,6 +118,9 @@ function classFromMessage(message: string): string | null {
    * failure type drops the bucket out of the investigate set.
    */
   if (/could not resolve these skill ids to any known skill/.test(m)) return 'invalid_args';
+  // ENG-2786: a client_id-scoped Meta call that omitted account_id is a tool-contract
+  // (usage) error the model fixes by passing account_id — not a credential failure.
+  if (/client_id-scoped calls require an explicit account_id/.test(m)) return 'invalid_args';
   if (/these skills are currently unavailable to install/.test(m)) return 'skill_install_refused';
   /*
    * ENG-1627 — create_html_file's remaining generic `Error` cluster. Matched

@@ -12,7 +12,7 @@
  * `deepResearchService.ts` or `agentModeService.ts` — the lazy import means
  * neither is pulled in until `performDeepResearchTool` actually runs.
  *
- * Everything else this module imports (YouSearchProvider, GoogleSearchProvider,
+ * Everything else this module imports (YouSearchProvider,
  * csvProvenance, searchFreshness/searchProvider, secretsManager, s3Utils,
  * llmClients) is a static import, exactly matching how `agentModeService.ts`
  * already imported every one of them, and none of those modules reaches

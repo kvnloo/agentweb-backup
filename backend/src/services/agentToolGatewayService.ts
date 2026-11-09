@@ -340,6 +340,18 @@ function chatHistoryFailureScope(args: unknown): string {
 // the ENG-182/ENG-313 LinkedIn per-recipient scoping above) so a miss on one
 // lead doesn't block a call for a different lead; a genuine repeat on the
 // SAME lead still trips.
+// ENG-2808: the same per-(list_id, lead_id) outcome applies to every lead-targeted
+// tool that returns the structured "lead does not exist in this list" miss.
+// add_lead_engagement failed 10/33 in one window on exactly this miss; a tool-wide
+// bucket let three wrong ids block the corrected call for the rest of the run.
+const LEAD_SCOPED_TOOLS = new Set([
+  'get_lead_details',
+  'add_lead_engagement',
+  'get_lead_engagements',
+  'update_lead',
+  'send_email_to_lead',
+]);
+
 function leadDetailsFailureScope(args: unknown): string {
   if (!args || typeof args !== 'object' || Array.isArray(args)) return '';
   const record = args as Record<string, unknown>;
@@ -409,7 +421,7 @@ function googleAdsFailureScope(args: unknown): string {
 
 function failureScope(toolName: string, args: unknown): string {
   if (toolName === 'get_chat_history') return chatHistoryFailureScope(args);
-  if (toolName === 'get_lead_details') return leadDetailsFailureScope(args);
+  if (LEAD_SCOPED_TOOLS.has(toolName)) return leadDetailsFailureScope(args);
   if (toolName === 'call_meta_marketing_api') return metaMarketingFailureScope(args);
   if (toolName === 'call_google_ads_api') return googleAdsFailureScope(args);
   if (toolName !== 'linkedin_outreach') return '';
@@ -985,6 +997,20 @@ export function validateAndRepairToolArgs(
     if (JSON.stringify(normalized) !== JSON.stringify(repairedArgs)) repairs.push('attio:aliases');
     repairedArgs = normalized;
   }
+  // ENG-2791: playwright_browser_fill_form requires `fields`; models send `elements`.
+  // Scoped to this tool so other tools declaring `fields` (e.g. Meta insights) keep
+  // rejecting an undeclared `elements` argument.
+  if (
+    input.toolName === 'playwright_browser_fill_form' &&
+    repairedArgs.fields === undefined &&
+    repairedArgs.elements !== undefined &&
+    properties.fields &&
+    !properties.elements
+  ) {
+    repairedArgs.fields = repairedArgs.elements;
+    delete repairedArgs.elements;
+    repairs.push('elements->fields');
+  }
   const propertyNames = Object.keys(properties);
   const lowRiskRepairAllowed = (input.effect ?? classifyToolEffect(input.toolName, input.args)) === 'read';
 
@@ -1144,6 +1170,34 @@ export function validateAndRepairToolArgs(
     if (container.changed) {
       repairedArgs[name] = container.value;
       repairs.push(`${name}:json_parse`);
+    }
+  }
+
+  // ENG-2858: Playwright MCP rejects fill_form fields without a string `name`
+  // (zod invalid_type at fields[i].name). Models describe the field under the
+  // browser_click-style `element` key (or label/description) instead. Fill the
+  // missing name from those, falling back to `ref`; never overwrite a name.
+  // Runs after wrapper hoisting and JSON-string parsing so `fields` sent as a
+  // JSON string or nested in a wrapper object is repaired too.
+  if (input.toolName === 'playwright_browser_fill_form' && Array.isArray(repairedArgs.fields)) {
+    let filled = false;
+    const fields = (repairedArgs.fields as unknown[]).map((field) => {
+      if (!field || typeof field !== 'object' || Array.isArray(field)) return field;
+      const f = field as Record<string, unknown>;
+      if (typeof f.name === 'string' && f.name.trim()) return field;
+      const aliasKey = ['element', 'label', 'description', 'field'].find(
+        (k) => typeof f[k] === 'string' && (f[k] as string).trim(),
+      );
+      const name = aliasKey ? (f[aliasKey] as string) : typeof f.ref === 'string' && f.ref.trim() ? f.ref : undefined;
+      if (!name) return field;
+      const next: Record<string, unknown> = { ...f, name };
+      if (aliasKey) delete next[aliasKey];
+      filled = true;
+      return next;
+    });
+    if (filled) {
+      repairedArgs.fields = fields;
+      repairs.push('fill_form:field.name');
     }
   }
 

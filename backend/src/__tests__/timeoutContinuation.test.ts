@@ -493,3 +493,12 @@ describe('hasUnresolvedMediaDeferral', () => {
     expect(hasUnresolvedMediaDeferral(msgs)).toBe(true);
   });
 });
+
+describe('ENG-2854: iteration-limit report is terminal for the media backstop', () => {
+  it('does not treat a step-limit report as an unresolved media deferral', () => {
+    const { hasUnresolvedMediaDeferral } = require('../utils/timeoutContinuation');
+    const msg = { role: 'assistant', metadata: { mediaBudgetDeferred: true } };
+    expect(hasUnresolvedMediaDeferral([msg])).toBe(true);
+    expect(hasUnresolvedMediaDeferral([{ ...msg, metadata: { ...msg.metadata, iterationLimitReached: true } }])).toBe(false);
+  });
+});

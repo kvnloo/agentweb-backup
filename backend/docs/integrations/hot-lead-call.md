@@ -3,9 +3,11 @@
 When a landing-page form lead arrives with a phone number, AgentWeb phones a
 member of the business's team from a Twilio number the org owns and says "New
 lead from <business name>. Are you available to take the call now? Press 1." On
-`1` it dials the lead, who hears "<business name> would like to talk to you about
-your enquiry. Press 1 to be connected now." and must press 1 as well; only then
-are the two calls bridged. Which member is rung depends on the
+`1` it dials the lead, who hears "This is an automated call from <business name>
+about the enquiry you sent us. To reach a person at <business name>, call <the org's number>.
+Press 1 to be connected now, press 2 if you are not available and we will call you again later, or press 3 to stop these calls." and must press 1 as well; only then
+are the two calls bridged. A 2 schedules one [retry](#press-2-and-the-retry) about an hour later. The number is spoken digit by digit in 3-3-4 groups; calling it rings the team through the
+[inbound callback](#inbound-callbacks) path. Pressing 3 puts the number on the org's [do-not-call list](#do-not-call-list). Which member is rung depends on the
 team's priority order and weekly availability windows (see [Who is rung](#who-is-rung)). The outcome and every step are written to the lead's timeline.
 
 It is a second subscriber to the same moment as the Slack lead alert
@@ -27,8 +29,8 @@ from Twilio's documentation.
   AW-Settings item directly. See [Turn it off](#turn-it-off).
 - **Turn off one org:** `update_hot_lead_call_settings({enabled: false})` (the org's
   owner/admin, through Emma), or set `hotLeadCall.enabled` to `false` on the org item.
-- **A call looks stuck or unbilled:** [Stuck records](#stuck-records) (how to
-  find them, what each state means, where the spend events live).
+- **A call looks stuck or unbilled:** [Stuck records](#stuck-records) (the daily
+  sweep and its `HOT_LEAD_CALL_STUCK_SWEEP` mode, what each state means, where the spend events live).
 - **A number may be billed but not recorded:** search the backend logs for
   `ORPHAN` (`ORPHAN number`, `ORPHAN RISK`), then [Orphan numbers](#orphan-numbers).
 - **Why no call happened:** the lead's timeline shows `call.skipped` with a
@@ -67,7 +69,7 @@ sequenceDiagram
   LeadPhone-->>Tw: answers
   Tw->>App: POST /status leg=lead CallStatus=in-progress (remembers the lead sid, no state change)
   Tw->>App: POST /screen (runs on the lead's leg, before the bridge)
-  App-->>Tw: Gather 1 digit: "<business> would like to talk to you ... Press 1"
+  App-->>Tw: Gather 1 digit: "This is an automated call from <business> ... call <number>. Press 1 ... press 2 if you are not available ... or press 3 to stop"
   LeadPhone->>Tw: presses 1
   Tw->>App: POST /screen-result Digits=1
   App-->>Tw: empty Response - Twilio bridges the two calls
@@ -83,9 +85,12 @@ Branches (all end in `finished` once every leg that was dialed is metered):
 | Situation | Webhook that decides | Outcome | Timeline events after `call.initiated` |
 | --- | --- | --- | --- |
 | Member presses 1, lead answers and presses 1 | `/gather`, `/screen`, `/screen-result` | `completed` | `call.member_answered`, `call.connected`, `call.completed` |
+| Lead answers and presses 3 | `/screen-result` | `lead_opted_out`; the lead hears "Understood. <business> will not call this number again. Goodbye."; the member hears "The lead asked not to be called again. Their details are in your lead alert."; no other member is tried; the stop is written first (see [Do-not-call list](#do-not-call-list)) | `call.member_answered`, `call.lead_declined` (`reason: opted_out`), `call.completed` |
+| Lead answers and presses 2 (not available now) | `/screen-result` | `lead_deferred`; the lead hears "Okay. <business> will call you again later. Goodbye."; the member hears "The lead is not available right now. We will try again later."; no other member is tried; one retry is scheduled (see [Press 2 and the retry](#press-2-and-the-retry)). Option 2 is only spoken when a retry can happen (the lead's first call, retries on); on the retry call, with retries switched off or the kill switch off, or when no retry can be scheduled, a 2 is an ordinary `lead_declined` (bare hangup for the lead, the usual "did not confirm" for the member) | `call.member_answered`, `call.lead_declined` (`reason: not_available_now`, or `not_available_no_retry` for the plain decline), `call.completed` |
 | Lead answers but presses another key, says nothing or hangs up | `/screen-result` (a key) or `/dial` (`completed` with `DialBridged=false`) | `lead_declined`; the member hears "The lead did not confirm. Their details are in your lead alert." and no other member is tried | `call.member_answered`, `call.lead_declined`, `call.completed` |
 | Member presses another digit, hangs up on or ignores the prompt, or never picks up (no-answer, busy, failed, canceled) | member `/status` terminal | `member_declined` / `member_no_answer` for the attempt; the record moves to `between_attempts` and the next-attempt request runs (see [Who is rung](#who-is-rung)) | `call.member_declined` or `call.member_no_answer`, then `call.completed` only when no further attempt is queued |
 | Member presses 1, lead does not answer | `/dial` with `no-answer`, `busy` or `failed` | `lead_no_answer` | `call.member_answered`, `call.lead_no_answer`, `call.completed` |
+| Lead's local calling window closed while the member was answering (member pressed 1) | `/gather` | `lead_outside_hours` (record stays `member_answered` until the member leg ends); same apology as `lead_phone_invalid`; the lead is not dialled | `call.member_answered`, `call.failed` (reason `lead_outside_hours`), `call.completed` |
 | Lead number changed since the call passed the gates (repeat submission overwrote the phone) | `/gather` | `lead_phone_changed` (record stays `member_answered` until the member leg ends); the member hears "We could not reach the lead. Their details are in your lead alert."; no other member is tried | `call.member_answered`, `call.failed` (reason `lead_phone_changed`), `call.completed` |
 | Lead number no longer valid at bridge time | `/gather` | `lead_phone_invalid` (record stays `member_answered` until the member leg ends) | `call.member_answered`, `call.failed` (reason `lead_phone_invalid`), `call.completed` |
 | Kill switch or config turned off while the member is on the line | `/owner`, `/gather` or `/screen` | `aborted` | at `/owner` (still ringing): `call.failed` (reason `aborted`), `call.completed`; at `/gather` (member was on the prompt): `call.member_answered`, `call.failed` (reason `aborted`), `call.completed`; at `/screen` (lead answered): `call.failed` (reason `aborted`), `call.completed` |
@@ -218,6 +223,134 @@ record, so each leg is metered while the record is still live and the LAST leg
 to be metered performs the terminal transition. A record therefore stays live
 until the final status callback of every dialed leg has arrived.
 
+## Inbound callbacks
+
+A lead who calls the org's number back (the number the member and lead calls were
+made from) is answered by the same feature, in the other direction: the team is
+rung and the caller is connected to the first member who accepts. It is
+stateless: no lead call record and no timeline event are created (the call store
+is keyed by lead, and an inbound caller is not necessarily one), and nothing is
+recorded or sent to voicemail.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant Caller as Lead calling back
+  participant Tw as Twilio
+  participant App as AgentWeb backend
+  participant M1 as Member 1
+  participant M2 as Member 2
+
+  Caller->>Tw: dials the org's number
+  Tw->>App: POST /inbound (the number's voice URL; signed; body To=org number)
+  Note over App: find org by number (60s cache), kill switch, config, plan; pick member 1 at this instant
+  App-->>Tw: Dial answerOnBridge callerId=org number, Number url=/inbound-screen (the caller hears ringing)
+  Tw->>M1: rings (25s)
+  M1-->>Tw: answers
+  Tw->>App: POST /inbound-screen (on the member's leg)
+  App-->>Tw: Gather: "<business>: a lead is calling back. Are you available to take the call? Press 1."
+  M1->>Tw: presses 2 (or nothing, or hangs up)
+  Tw->>App: POST /inbound-dial DialCallStatus=completed DialBridged=false
+  App-->>Tw: Dial to member 2 (priority order, availability re-evaluated now)
+  Tw->>M2: rings, M2 answers and presses 1
+  Tw->>App: POST /inbound-screen-result Digits=1
+  App-->>Tw: empty Response - Twilio bridges the caller and member 2
+  Tw->>App: POST /inbound-dial DialBridged=true (after the bridge ends) -> hangup
+  Tw->>App: POST /inbound-status (member 2's leg) completed + CallDuration -> metered once
+```
+
+Rules (all verified against `routes/twilioVoiceWebhook.ts` and `services/voice/inboundCallback.ts`):
+
+- **Finding the org.** The dialled number is the signed request's `To` (`Called` if `To` is empty). AW-Organizations has no
+  index on it, so `services/voice/inboundNumberIndex.ts` scans the orgs that hold a number (`orgDb.listHotLeadCallNumbers`,
+  projected to id and number) and keeps the result in memory per backend instance. One snapshot serves every lookup,
+  so an unknown number costs no scan of its own (that is the negative cache). The snapshot is refreshed stale-while-revalidate:
+  after 60 seconds the next call is still answered from the old snapshot while one background scan runs (shared, retried no sooner
+  than every 5 seconds after a failure, failures logged by error name only), so the scan is never in the call path. Only the first
+  lookup after a start, with no snapshot, waits for the scan; if that fails the call is refused and the failure is not cached.
+  A number bought or released within the last 60 seconds (longer while refreshes fail) is therefore not served yet. The snapshot only *locates* the org: the org is then
+  re-read (consistent read) and its live config decides, so a stale entry can only end in a refusal. A number stored on
+  two orgs is served to neither. No GSI and no data change was made.
+- **Fail closed.** Unknown number, kill switch off, config missing/invalid/disabled, the number no longer the org's, an
+  org without an owner, or a plan without the `hot_lead_call` feature: the caller hears "Sorry, we are unable to take your
+  call right now. Goodbye." and the call is hung up. Nobody is rung. An unexpected failure in a step is answered per step: `/inbound`
+  and `/inbound-dial` give the same message and hangup, `/inbound-screen` and `/inbound-screen-result` a bare `<Hangup/>` (which
+  moves on to the next member), and `/inbound-status` a 500 so Twilio redelivers.
+- **Who is rung.** `selectHotLeadCallCandidates` at the current instant: verified, inside their window and inside the
+  calling hours, in team priority order, skipping members already tried. At most `maxAttemptsPerLead` members are rung per
+  callback. Availability (windows, calling hours) is re-evaluated each time the next member is chosen, that is at `/inbound`
+  and at each `/inbound-dial` step. A member who has already picked up and presses 1 is connected even if their window closed
+  meanwhile (the outbound `/gather` does not re-check windows either). A member removed or un-verified meanwhile is still
+  refused: their screen and their "1" check the live team.
+- **Nobody available or accepting.** The caller hears "Sorry, nobody is available to take your call right now. Please try
+  again later. Goodbye." and the call is hung up. That also applies outside the calling hours.
+- **Only a 1 connects.** Anything else (another key, silence, a hang-up, voicemail, no answer, busy, failed) moves on to the next member.
+  A Dial that ends `completed` without `DialBridged=false` (unknown: might be a finished conversation) or `canceled` (the
+  caller hung up) rings nobody else.
+- **Stateless and bounded.** The state is the signed query of each step URL: `orgId` and `tried` (the member ids rung so far,
+  comma-separated, each `m` + 7 base-36 characters, unique, at most 5). Each step adds one member and the chain is
+  capped by `maxAttemptsPerLead`, so it always ends; a Twilio retry of a step repeats the same decision. The caller ID
+  of the member legs is the org's number (not the caller's, which can be withheld).
+- **Guard.** The same credentials -> signature steps as the outbound endpoints (`verifiedBody`), but with no lead
+  record: the org comes from the dialled number (`/inbound`, no query) or from the signed `orgId` (the other steps).
+  A bad signature is 401, unloadable credentials 503; a signed request with a malformed query, or whose handler fails,
+  is answered with the spoken refusal (`/inbound`, `/inbound-dial`) or a hangup (the member's screening steps) with 200;
+  `/inbound-status` acknowledges with 200 and answers 500 when the org read or billing fails (it carries the same retry override).
+  It is deliberately not gated on the kill switch, config or plan: the leg already happened and must still be billed.
+
+Metering: only the **member leg** is metered, with the existing `voice_minute_outbound` rate (it is an outbound call from our
+number), by `/inbound-status` (`CallStatus` terminal, with a `ParentCallSid`), idempotency key
+`twilio:voice:<member leg CallSid>:member`, billed to the org's owner. **The caller's own inbound leg is not metered yet**:
+the rate card has only `voice_minute_outbound`, and no inbound rate was agreed, so none was invented. Until Harsha
+allocates an `voice_minute_inbound` rate, inbound minutes are an unrecorded Twilio cost (the caller's leg lasts as long as the
+bridged conversation).
+
+Limits to know about:
+
+- **Caps (ENG-2784).** `/inbound` takes one slot per call (`services/voice/inboundLimits.ts`, on the same limit store as
+  the outbound limits) once a member would really be rung (a call nobody can take costs nothing), before the ringing TwiML is
+  returned. In order: a retry marker keyed by the call's `CallSid`, the org's inbound hourly counter (2 x
+  `maxCallsPerHour`, UTC clock hour), the org's inbound daily counter (2 x `maxCallsPerDay`, org-local calendar day), then the
+  caller's hourly counter (3) and daily counter (6). Defaults with the config defaults (6 an hour, 20 a day): 12 an hour and 40
+  a day per org. The caller counters are keyed by an HMAC of the org and the caller's number (label `hot_lead_call.inbound_caller`),
+  never the number. A refused call hears the "nobody is available" message and is hung up; whatever was taken before the refusal
+  is given back, so a refused call costs nobody a slot. A Twilio redelivery of the same `/inbound` request (same `CallSid`) finds
+  its own marker and is admitted without counting again. The later steps (`/inbound-screen`, `/inbound-dial`,
+  `/inbound-status`) take no slot: a call costs one slot however many members it rings.
+  - **Fail closed.** If the limit store fails (or the request has no valid `CallSid`) the caller hears the unavailable message
+    and nobody is rung; one line `[hotLeadCall] inbound limits unavailable <error name>` is logged. A refusal logs one line
+    `[hotLeadCall] inbound capped <org_hourly|org_daily|caller_hourly|caller_daily> <orgId>`, suitable for a metric filter. No
+    number is logged.
+  - **Withheld callers.** The caller is read from the signed `From`, accepted only when it is exactly an E.164 number. A missing
+    or non-E.164 `From` (for example a withheld number) skips the caller counters, so a withheld caller is limited only by the
+    org caps. What Twilio sends in `From` for a withheld caller is not verified here (see
+    [Not verified](#not-verified-without-a-real-twilio-account)).
+  - **Order and redelivery.** The order is: a read of the retry marker, the caller's counters, the org's counters, then the
+    marker (claimed last, with the `CallSid` as its token, 1 hour). A capped caller therefore never touches the org counters.
+    A redelivery (same `CallSid`) of an **admitted** call finds its marker and is admitted without being counted again (also
+    at the cap boundary); two deliveries racing both count, and the one that loses the marker claim gives its counts back. A
+    redelivery of a **refused** call never claimed a marker, so it is evaluated again (and refused again until room exists).
+    A marker held by anything but this `CallSid` fails closed.
+  - **Accepted limits.** Fixed windows can admit up to 2x a cap across a boundary. A caller who rotates numbers or withholds
+    theirs, or many callers, can consume the org's inbound caps (denying real callbacks) but cannot exceed them; the cost
+    ceiling is the member-leg minutes of 2 x the outbound caps. A crash after the slot is taken keeps it. There is still no
+    blocklist, and the per-member cooldown and the lead-phone dedupe do not apply (there is no lead).
+    A caller who spoofs another person's caller ID can use that person's per-caller allowance for the hour or day (Twilio's
+    signature covers the request, not the caller ID presented on the PSTN); this is accepted. The caps count calls that would
+    ring someone, not calls that were answered, so a real lead who calls back 4 times in an hour while nobody picks up hears
+    the "nobody is available" message on the 4th. Rows for new callers are created only after a member would be rung and
+    expire by TTL (counters 2 hours / 2 days, marker 1 hour).
+    Two simultaneous deliveries of the same `CallSid` at the exact moment a cap is reached can end with one admitted and the
+    other answered with the "nobody is available" message (the second sees the last slot taken before the first has claimed
+    its marker). Which response Twilio uses is not verified. This is accepted: it can only refuse a call, never exceed a cap,
+    it needs a webhook redelivery that overlaps the first delivery, and closing it needs a two-state (pending/done) marker with
+    waiting, which is not worth the machinery here.
+- Callers are not recorded in the lead timeline.
+- The member prompt is the org's `announcedName` only; visitor-supplied text is never spoken.
+- A freshly provisioned number is pointed at `/inbound` by `buyNumber` (`voiceUrl`, POST). A number bought **before** this
+  existed keeps its old voice URL until it is set by hand in the Twilio console (see [Go-live checklist](#go-live-checklist)).
+- Not verified against real Twilio (see [Not verified](#not-verified-without-a-real-twilio-account)).
+
 ## Components and file map
 
 All paths are under `backend/src/`.
@@ -237,11 +370,14 @@ All paths are under `backend/src/`.
 | Plan entitlement (the `hot_lead_call` subscription feature) | `services/voice/hotLeadCallEntitlement.ts` |
 | Abuse limits, per-member cooldown, slot reservation | `services/voice/hotLeadCallLimits.ts`, `services/voice/limitStore.ts` (DynamoDB), `__tests__/helpers/fakeLimitStore.ts` (tests) |
 | Call record (state machine storage) and timeline events | `services/voice/leadCallStore.ts`, `services/voice/leadCallStore.types.ts`, `__tests__/helpers/fakeLeadCallStore.ts` (tests) |
-| Twilio seam (`placeCall`, `buyNumber`, `releaseNumber`, `validateSignature`) | `services/voice/voiceProvider.ts` (the only file that imports `twilio`), `__tests__/helpers/fakeVoiceProvider.ts` (tests) |
-| Webhook URLs | `services/voice/voiceUrls.ts` |
+| Twilio seam (`placeCall`, read-only `fetchCall`, `buyNumber`, `releaseNumber`, `validateSignature`) | `services/voice/voiceProvider.ts` (the only file that imports `twilio`), `__tests__/helpers/fakeVoiceProvider.ts` (tests) |
+| Webhook URLs (outbound steps, the inbound steps and the number's voice URL `inboundVoiceUrl`) | `services/voice/voiceUrls.ts` |
 | TwiML builders (hand-built XML, XML-escaped) | `services/voice/twiml.ts` |
-| Webhook routes, mounted at `/api/webhooks/twilio-voice` | `routes/twilioVoiceWebhook.ts` (`/owner`, `/gather`, `/screen`, `/screen-result`, `/dial`, `/status`; `/owner` serves the prompt to the team member being rung, the name predates teams) |
+| Webhook routes, mounted at `/api/webhooks/twilio-voice` | `routes/twilioVoiceWebhook.ts` (`/owner`, `/gather`, `/screen`, `/screen-result`, `/dial`, `/status`; `/owner` serves the prompt to the team member being rung, the name predates teams; and the inbound-callback steps `/inbound`, `/inbound-screen`, `/inbound-screen-result`, `/inbound-dial`, `/inbound-status`) |
+| Inbound callbacks: context by dialled number, next member, query validation | `services/voice/inboundCallback.ts` |
+| Inbound callbacks: dialled number -> org (60 s in-process snapshot of a projected scan, `orgDb.listHotLeadCallNumbers`) | `services/voice/inboundNumberIndex.ts` |
 | Metering of a finished leg, the hand-over to the next member and the rule that finishes a call | `services/voice/callFinalisation.ts` |
+| Stuck-record sweep: finds live records older than a call can last and settles them from Twilio (daily; report-only unless `HOT_LEAD_CALL_STUCK_SWEEP=close`) | `services/voice/stuckCallSweep.ts`, `cron/stuckCallSweepCron.ts`, `crmDb.findLeadsBySystemRecord`; tests `__tests__/stuckCallSweep.test.ts`, `__tests__/hotLeadCall.e2e.stuckSweep.test.ts` |
 | Per-leg usage event | `services/voice/voiceUsage.ts` `recordCallUsage` -> `recordVendorUsage` |
 | Rate card and runtime rate overrides | `utils/vendorRateCard.ts`, `routes/adminVendorRates.ts` |
 | Twilio credentials | `utils/secretsManager.ts` `getTwilioCredentials` |
@@ -255,6 +391,8 @@ Tests worth knowing: `__tests__/hotLeadCall.e2e.test.ts` (the calls: real
 orchestrator + real webhooks + real store on an in-memory DB fake, signed with
 Twilio's own HMAC) and `__tests__/hotLeadCall.e2e.gates.test.ts` (gates, calling
 hours, dedupe, cooldown, caps and silent refusals) and
+`__tests__/hotLeadCall.e2e.inbound.test.ts` (inbound callbacks: priority, hand-over, caps, fail-closed gates, signatures, metering) and
+`__tests__/hotLeadCall.e2e.inboundCaps.test.ts` (inbound abuse limits: org and per-caller caps, release on refusal, redelivery and the retry marker, fail-closed) and
 `__tests__/hotLeadCall.e2e.attempts.test.ts` (several members: the reference team,
 hand-over through the real next-attempt job, lead screening, replays across
 attempts, and the world changing between attempts), sharing
@@ -272,7 +410,7 @@ the lock:
 1. All gates pass and a limit slot is reserved.
 2. `LeadCallStore.create` writes `lead.system.hot_lead_call` with `state=dialing`
    using a create-if-absent conditional write. `false` means a record already
-   exists: do not dial. A lead gets at most one call record, ever.
+   exists: do not dial. A lead gets at most one call record, ever (the press-2 retry revives that same record, see [Press 2 and the retry](#press-2-and-the-retry)).
 3. `placeCall`. Success: `member_ringing` + `call.initiated`. Twilio rejected it
    (HTTP 4xx other than 408, `placed: 'no'`): `call.failed` (reason
    `place_rejected`) and the pass goes on to the next member; when none is left the
@@ -312,10 +450,11 @@ call, Slack only"). Validation applies to every read, including the webhooks.
 | `maxAgeMinutes` | integer 1-60, default 10. A lead older than this when the first job runs (`submittedAt`, else lead `createdAt`; a missing or unparseable time fails closed) is skipped as `too_old`. Further attempts must start within this long of the call record's `startedAt`. |
 | `maxCallsPerHour` | integer 1-30, default 6. Counts LEADS that get a call, one per lead at its first attempt: a lead can ring up to `maxAttemptsPerLead` members and then the lead's own leg and still uses one slot. |
 | `maxCallsPerDay` | integer 1-100, default 20. Counts leads the same way. |
+| `maxCallsPerMonth` | integer 1-2000, default 200 (ENG-2783; a config stored without it reads as 200, no data migration). Counts leads the same way, per org-local calendar month. The owner routes (Emma `update_hot_lead_call_settings`, REST `PUT`) may set only 1-200 and refuse anything higher with "Higher monthly limits are set by AgentWeb support"; 201-2000 is written only by an operator (see [Raise a customer's monthly limit](#raise-a-customers-monthly-limit)). A stored value above 200 is shown in the read-out and kept when the owner edits other fields (sending the same value back is accepted). |
 | `memberCooldownMinutes` | integer 1-60, default 2. Per team member: a member who was just rung is passed over for the next available one. |
 | `maxAttemptsPerLead` | integer 1-5, default 3. How many member calls may be made for one lead; a member who was already tried is never rung again. |
 | `announcedName` | required, trimmed, 1-60 chars of letters, digits, space and `. , & ' -`. Spoken in `<Say>`; XML-escaped by the TwiML builder. |
-| `callingHours` | `{ start, end, timezone }`, `HH:MM` 24h, `start != end`, defaults 08:00 / 21:00. It is the window in which calls ARE allowed, in the org's IANA `Area/Location` timezone (UTC, abbreviations and `Etc/` refused). `start > end` wraps past midnight. Start inclusive, end exclusive, minute granularity. The lead's own timezone is not considered. Required to enable. Member windows are read on this same clock. |
+| `callingHours` | `{ start, end, timezone }`, `HH:MM` 24h, `start != end`, defaults 08:00 / 21:00. It is the window in which calls ARE allowed, in the org's IANA `Area/Location` timezone (UTC, abbreviations and `Etc/` refused). `start > end` wraps past midnight. Start inclusive, end exclusive, minute granularity. This is the ORG's clock and its default 08:00-21:00 is not what a lead experiences: the lead's own local hours are a separate, fixed gate (10:00-18:00 lead-local, in practice about 13:00-18:00 Eastern for most US numbers; see [Lead-local hours](#lead-local-hours)), so a call needs both windows open. Required to enable. Member windows are read on this same clock. |
 | `allowedCountries` | non-empty subset of `["US","CA"]` (default both); the lead's number must resolve to one of them. |
 
 The lead's number is read from the lead row at dispatch AND again at bridge time;
@@ -338,7 +477,7 @@ Settings (merged). Both tools call the same service as the REST API
 
 - `get_hot_lead_call_settings({})` needs `org:configure`. It returns the portal view
   (`entitled`, `enabled`, `canEnable`, plain-English `blockers`, `callingHours`,
-  `maxAttemptsPerLead`, `announcedName`, `twilioNumberMasked`, the `team` in priority order with
+  `maxAttemptsPerLead`, `maxCallsPerMonth`, `warnings`, `announcedName`, `twilioNumberMasked`, the `team` in priority order with
   each person's `id`, `name`, `phoneMasked`, `verified` and `windows`, and `limits`) plus
   `configured`, `callerNumberAssigned`, `leadTypes`, `allowedCountries`, the other limit fields
   and the lead types that exist. No SIDs or full numbers, and no revision token.
@@ -353,11 +492,13 @@ Settings (merged). Both tools call the same service as the REST API
   - `memberPhone` / `memberName` edit a team of ONE (the first save creates the member, available whenever
     the calling hours are open); on a larger team the tool refuses them and asks for `team`.
   - `callingHours` may be partial in chat: missing parts are filled from the stored hours, then the
-    08:00-21:00 defaults.
+    08:00-21:00 defaults (the lead-local window, 10:00-18:00, applies on top and is not configurable).
+  - `maxCallsPerMonth` is 1-200 in the tool schema and the service; a higher value is refused ("Higher monthly limits are
+    set by AgentWeb support").
   - The tool edits the copy it just read; the write is conditional on the stored attribute being
     unchanged, so a concurrent edit fails ("changed by someone else") instead of clobbering.
   - Unattended runs (`context.isUnattendedRun === true`) are refused for any change that turns calling on,
-    raises a cap (`maxAgeMinutes`, `maxCallsPerHour`, `maxCallsPerDay`, `maxAttemptsPerLead`), shortens
+    raises a cap (`maxAgeMinutes`, `maxCallsPerHour`, `maxCallsPerDay`, `maxCallsPerMonth`, `maxAttemptsPerLead`), shortens
     the pause between calls to one person, changes the business name that is read aloud, adds a lead type or country, widens the calling hours (or moves
     them to another zone), first-saves the settings, or edits the team. Turning calling off and lowering a limit
     stay allowed. Confirming a verification code has no such refusal (it needs the code).
@@ -378,7 +519,7 @@ turns) with "This needs a person to confirm in an interactive chat".
   unchanged, BEFORE Twilio is called; a reservation whose purchase then fails
   still counts). A stored `hotLeadCallProvisioning` that is malformed makes both
   tools refuse ("Contact support"). A person must approve each purchase
-  ([Human approval](#human-approval-for-provision-and-release)); `confirm` is
+  ([Human approval](#human-approval-for-provision-release-and-turning-calling-on)); `confirm` is
   still accepted but ignored, because the model controls it. An ambiguous buy failure is
   logged as `ORPHAN RISK` and is not retried. The first month's rent is
   metered at purchase and later months by the daily rent sweep (see Metering).
@@ -400,36 +541,55 @@ Order of setup, which the tool text also teaches Emma:
 3. `start_hot_lead_call_verification`, then `confirm_hot_lead_call_verification`
    with the code the member heard.
 4. `update_hot_lead_call_settings({enabled: true})`. Refused unless a member's
-   phone is verified, a number is assigned and calling hours are set.
+   phone is verified, a number is assigned and calling hours are set; then the user
+   approves turning calling on on a card
+   ([Human approval](#human-approval-for-provision-release-and-turning-calling-on)).
 
 Cost bound through these tools: 2 purchases at the card's $1.15 plus 5
 verification calls at $0.014 is about $2.37 per org per day at the provisional
 rates. The first month's rent is metered at purchase; later months by the daily
 rent sweep.
 
-### Human approval for provision and release
+### Human approval for provision, release and turning calling on
 
-`provision_hot_lead_call_number` and `release_hot_lead_call_number` never act on the
-model's say-so. The first call halts the run with a one-question approval card
+`provision_hot_lead_call_number`, `release_hot_lead_call_number` and
+`update_hot_lead_call_settings` with `enabled: true` (only when it turns calling on)
+never act on the model's say-so. The first call halts the run with a one-question approval card
 (the same deck-of-one mechanism as `services/crmSequenceActivationGate.ts`; the
 logic is in `services/voice/hotLeadCallApprovalGate.ts`). The card states the
-monthly rent from the live rate card. After the person clicks approve, Emma
+monthly rent from the live rate card; for turning calling on it says that when a lead
+arrives from the landing page AgentWeb will phone the verified team member(s) (name and
+last 4 digits) from the org's number (last 4 digits) and then the lead, that calls are
+billed to the organization owner per minute at the live outbound rate (both the member's
+and the lead's call, each rounded up to a whole minute, as the metering does), the caps in
+force (`maxCallsPerHour`, `maxCallsPerDay`, `maxCallsPerMonth`, `maxAttemptsPerLead`) and the calling hours with
+their timezone, taken from the settings about to be saved, and that calling can be turned
+off at any time. After the person clicks approve, Emma
 calls the tool again with the same arguments and it acts.
 
 - Order: the existing checks run first (unattended, arguments, owner/admin,
-  plan entitlement, saved settings, already has / has no number), so a caller who
+  plan entitlement, saved settings, already has / has no number; for turning calling
+  on, everything `applyHotLeadCallSettings` checks before its write: owner/admin,
+  revision, validation, plan, blockers and the unattended refusal), so a caller who
   is refused never sees a card. Then: a chat session must exist and be readable,
   must not be a scheduled session, and must not be a support/admin session acting
   as the customer (`isDelegatedAccess` / `isDelegatedAdmin`).
+- The card's wording is not part of the digest (only the inputs listed next are), so adding the monthly limit to the card text
+  did not change any digest; a card issued before that change still shows the old text and is still approvable.
 - Binding: the approval is tied to a digest of the action, org, user, chat
-  session, the area code (or the number being released), the rent as quoted now
-  and the revision of the stored settings. A different area code, a rent change, a
-  settings change or another chat session (for example a branched one) needs a new
-  card. The card kind is `hot_lead_call_approval:<action>:<digest>:<nonce>`.
+  session, the area code (or the number being released, or the exact settings change
+  that turns calling on), the price as quoted now (rent, or the per-minute rate) and
+  the revision of the stored settings. A different area code, a different change, a
+  price change, a settings change between the card and the click or another chat
+  session (for example a branched one) needs a new card. The card kind is `hot_lead_call_approval:<action>:<digest>:<nonce>`.
 - Validity: the newest card for that digest must be answered "approve" by the
   user (never by "Let Emma decide", which the card does not offer), at most 15
   minutes ago, and not used yet. Declining, ignoring or letting it expire makes the
-  next call show a fresh card.
+  next call show a fresh card. An approval is spent when it is claimed, so a final
+  write that then loses a race or fails needs a new card (as for provision and release).
+- One card per identical change: if one reply repeats the same call (same digest), the deck
+  keeps a single card for it (`buildQuestionApprovalDeckFromHalts`), so answering it is
+  enough; two different changes still get a card each.
 - Single use: immediately before buying or releasing, the approval is claimed
   with `chatbotDb.claimMetaWriteManifestDigest(sessionId, "hotlead:" + kind)`
   (an entry in the session's existing `consumedMetaWriteManifestDigests` map; the
@@ -454,8 +614,13 @@ calls the tool again with the same arguments and it acts.
   - When another deck is already awaiting an answer, the card is not persisted:
     the model is told to stop and the user sees plain text. A typed "yes" then
     produces another halt, never an action.
+- Where it sits for turning calling on: the Emma tool passes a `beforeTurningOn` hook to
+  `applyHotLeadCallSettings`, which runs it after all checks and just before the write,
+  and only for a change from off to on. The REST route (the portal switch is the
+  person's click) passes none and is unchanged.
 - Not gated: `start_hot_lead_call_verification` (one capped call to a number the
-  admin saved) and turning calling on in `update_hot_lead_call_settings`.
+  admin saved), turning calling off, lowering limits, every other settings edit,
+  `enabled: true` on a setup that is already on, and the REST/portal route.
 
 Verification limits: it proves a phone answered and the code was heard. A
 voicemail that plays the message back can also pass it. The spoken code is
@@ -497,7 +662,7 @@ digits). Error bodies are `{ error: string }` plus the fields below.
 | `PUT /` | 200 the updated settings, fresh `_revision` | 400 `{error, fieldErrors}`, 403, 403 `{error, code:'not_entitled'}` when enabling without the plan feature, 409 stale or raced, 428 `_revision` missing |
 | `POST /members/:memberId/verification/start` | 200 `{expiresInSeconds, nextStartAllowedInSeconds, startsLeftToday}` | 403 (no plan feature with `code:'not_entitled'`, or no caller number), 404 unknown member, 409 raced, 429 `{error, retryAfterSeconds}` (also a `Retry-After` header), 502 phone provider failed |
 | `POST /members/:memberId/verification/confirm` body `{code}` | 200 `{verified:true}` | 400 `{error, attemptsLeft}`, 404, 409, 429 `{error, retryAfterSeconds}` (a confirm racing another) |
-| `GET /preview?at=<ISO instant>` | 200 `{at, timezone, outsideCallingHours, candidates:[{id,name}], excluded:[{id,name,reason}]}` | 400 `{error, fieldErrors:{at}}` |
+| `GET /preview?at=<ISO instant>` | 200 `{at, timezone, outsideCallingHours, outsideLeadHours, skipReason, warnings, candidates:[{id,name}], excluded:[{id,name,reason}]}` | 400 `{error, fieldErrors:{at}}` |
 
 `_revision` is the SHA-256 of the canonical JSON (sorted keys) of the stored `hotLeadCall`, so ANY change to it
 (another editor, a verification landing, a number purchase) makes an old copy stale: re-GET after confirming a
@@ -517,7 +682,7 @@ rather than assume what it sent. REST error texts are plain English; the Emma to
 names of the tools that fix them.
 
 `fieldErrors` are keyed by position in the submitted body: `team.N.name`, `team.N.phone`, `team.N.id`, `team.N.windows`,
-`team.N.windows.M.days|start|end`, `callingHours.start|end|timezone`, `maxAttemptsPerLead`, `announcedName`, `enabled`.
+`team.N.windows.M.days|start|end`, `callingHours.start|end|timezone`, `maxAttemptsPerLead`, `maxCallsPerMonth`, `announcedName`, `enabled`.
 
 Example (fake numbers):
 
@@ -526,7 +691,7 @@ GET /api/orgs/me/hot-lead-call
 200 { "_revision": "9f2c...e1", "entitled": true, "enabled": false, "canEnable": false,
       "blockers": ["Verify the phone of at least one person"],
       "callingHours": { "start": "09:00", "end": "18:00", "timezone": "America/Chicago" },
-      "maxAttemptsPerLead": 3, "announcedName": "Acme Plumbing", "twilioNumberMasked": "***0111",
+      "maxAttemptsPerLead": 3, "maxCallsPerMonth": 200, "warnings": [], "announcedName": "Acme Plumbing", "twilioNumberMasked": "***0111",
       "team": [ { "id": "mk3f9a2b", "name": "Dana Lee", "phoneMasked": "***0100", "verified": false,
                   "windows": [ { "days": [1,2,3,4,5], "start": "09:00", "end": "17:00" } ] } ],
       "limits": { "maxTeamSize": 10, "maxWindowsPerMember": 7, "minAttempts": 1, "maxAttempts": 5, "nameMaxLength": 40 } }
@@ -548,7 +713,27 @@ POST /api/orgs/me/hot-lead-call/members/mk3f9a2b/verification/start
 
 The preview lists, in call order, who would be rung at `at` (default now). `excluded[].reason` is `unverified` or
 `outside_window`; outside the calling hours (or with none set) `outsideCallingHours` is true, `candidates` is empty and
-the verified people are reported as `outside_window`.
+the verified people are reported as `outside_window`. `outsideLeadHours` is true when the lead window (10:00-18:00 lead-local,
+judged for an ordinary US number, so 808/907 numbers can be narrower) is closed at `at`, and `skipReason` names the first
+hours gate that would stop a call at `at`: `outside_calling_hours`, then `outside_lead_hours`, else `null`. `warnings`
+carries the same notes as the settings read.
+
+### Honest read-out (ENG-2783)
+
+The settings read (GET, Emma `get_hot_lead_call_settings`) and the preview say what the calling will really do:
+
+- `warnings` (additive `string[]`): when the stored `allowedCountries` includes Canada while `HOT_LEAD_CALL_CA_ENABLED` is
+  false, it says "Canadian numbers are not called yet ...". Stored data is unchanged.
+- Blocker (in `blockers`, so `canEnable` is false): none of the stored countries can currently be called (for example only
+  `["CA"]`).
+- Blocker: the calling hours never overlap the lead window for a US number. Checked exactly, at minute resolution (so a
+  one-minute window counts), across the next eight days in the org's time zone with `isWithinCallWindow` AND `isInsideLeadCallWindow` (a representative ordinary US number;
+  `callingHoursReachLeadWindow` in `services/voice/leadLocalHours.ts`). The message says the hours must include some time
+  between about 13:00 and 18:00 Eastern.
+
+Both blockers refuse turning calling ON (a 400 naming the blocker, the Emma approval card is never reached). An org that is
+already on keeps running through an unrelated edit and sees the blocker in every read-out, because it is silently skipping
+every lead (`country_not_allowed` / `outside_lead_hours`).
 
 ## Plan entitlement
 
@@ -630,8 +815,15 @@ What the code requires (verified from code):
   and the REST `from`). The provisioning tool buys it: `availablePhoneNumbers('US').local`,
   voice-enabled, optionally by area code. The org's number is always a US local
   number, even for a Canadian member.
-- Outbound calls to US and Canadian numbers only (`allowedCountries`).
-- Public HTTPS reachability of `BACKEND_URL` for the six endpoints (`/owner`, `/gather`, `/screen`, `/screen-result`, `/dial`, `/status`).
+- Outbound calls to US numbers only. `allowedCountries` still stores `US`/`CA`, but Canada is refused in code
+  (`HOT_LEAD_CALL_CA_ENABLED = false` in `hotLeadCallConfig.ts`; skip reason `country_not_allowed`) until the CRTC
+  ADAD requirements are built: an identification message with an email or postal address and a local or toll-free
+  number, which is not implemented. Re-enabling Canada needs (a) flipping the constant, (b) that identification
+  message in the lead prompt, and (c) a Canada branch in `leadLocalHours.ts` (it returns false for Canada today).
+- Lead-local calling hours are enforced (see [Lead-local hours](#lead-local-hours)). State laws with stricter hours
+  or days (some states restrict evenings, weekends or holidays) are NOT modelled and have not been verified.
+- Public HTTPS reachability of `BACKEND_URL` for the six outbound endpoints (`/owner`, `/gather`, `/screen`, `/screen-result`, `/dial`, `/status`) and the five inbound ones (`/inbound`, `/inbound-screen`, `/inbound-screen-result`, `/inbound-dial`, `/inbound-status`).
+- The number's **voice URL** must be `${BACKEND_URL}/api/webhooks/twilio-voice/inbound` (HTTP POST) for callbacks to work. `buyNumber` sets it on every number bought from now on; a number bought earlier must be set by hand in the Twilio console (Phone Numbers > Active numbers > the number > Voice Configuration > "A call comes in" = Webhook, that URL, HTTP POST). Signature validation uses the exact URL, so it must match `BACKEND_URL` exactly.
 
 To confirm with Twilio (not verifiable from this repo): Voice Geographic
 Permissions must allow outbound calls to the United States and Canada; whether a
@@ -652,10 +844,13 @@ No new table or index. The feature writes:
 | `hotLeadCallProvisioning` (purchase/release timestamps for the daily caps) | org attribute | provisioning tools |
 | `hot_lead_call_mode` | AW-Settings item | operators |
 | `HOT_LEAD_CALL_RENT_METERING` | environment variable of the backend (unset means on; `0`/`false`/`off` stops the rent sweep) | operators |
+| `HOT_LEAD_CALL_RETRY` | environment variable of the backend (unset: the due-retries cron is armed; `off`, `0` or `false`: not armed and a run does nothing) | operators |
+| `HOT_LEAD_CALL_STUCK_SWEEP` | environment variable of the backend (unset or any other value: report only; `close`: the sweep settles stuck records; `off`: disabled) | operators |
 | `vendor_rate_overrides` | AW-Settings item | admin Vendor Rates tab |
-| `system.hot_lead_call` (call record: `state`, `jobKey`, `startedAt`, `updatedAt`, `attemptNo`, `memberId`, `triedMemberIds`, `leadPhoneMac` (keyed HMAC of the lead's phone, see Org config), `claimToken` (random id of the writer that took an exclusive step, see Writes that commit and then report an error), `memberCallSid`, `leadCallSid`, `outcome`, `meteredLegs` (`member:<attempt>` and `lead`), `lastSequence`) | on the lead row (AW-Leads), no phone number | orchestrator and webhooks |
+| `system.hot_lead_call` (call record: `state`, `jobKey`, `startedAt`, `updatedAt`, `attemptNo`, `memberId`, `triedMemberIds`, `leadPhoneMac` (keyed HMAC of the lead's phone, see Org config), `claimToken` (random id of the writer that took an exclusive step, see Writes that commit and then report an error), `memberCallSid`, `leadCallSid`, `outcome`, `meteredLegs` (`member:<attempt>` and `lead`), `lastSequence`; ENG-2783: `deferral` `{dueAt, count}`, `retryClaimToken`, `retryClaimedAt`, see [Press 2 and the retry](#press-2-and-the-retry)) | on the lead row (AW-Leads), no phone number | orchestrator and webhooks |
+| Lead contact status (`contactStatus: do-not-contact`, `contactStatusReason: opted-out`, `contactStatusNote`, `unsubscribedFromGroupEmail`) | existing fields on the lead row (AW-Leads), written by `/screen-result` when the lead presses 3 (a new writer of an existing mechanism) | webhooks (`crmDb.updateLead`) |
 | Timeline events `call.*` | the lead's `engagements` list | `LeadCallStore.addEvent` |
-| `hlc#phone#<hmac>`, `hlc#cool#<orgId>#<memberId>`, `hlc#cap#h#<orgId>#<UTC hour>`, `hlc#cap#d#<orgId>#<local date>` | existing table `AW-MCPSessions` (partition key `sessionId`, attribute `ttl`) | limit store |
+| `hlc#phone#<hmac>`, `hlc#cool#<orgId>#<memberId>`, `hlc#cap#h#<orgId>#<UTC hour>`, `hlc#cap#d#<orgId>#<local date>`, inbound: `hlc#cap#ih#<orgId>#<UTC hour>`, `hlc#cap#id#<orgId>#<local date>`, `hlc#in#p#h#<hmac>#<UTC hour>`, `hlc#in#p#d#<hmac>#<local date>`, `hlc#in#c#<CallSid>`, do-not-call: `hlc#dnc#<hmac of org and number>` (ENG-2783, about 10 years) | existing table `AW-MCPSessions` (partition key `sessionId`, attribute `ttl`) | limit store |
 
 Notes:
 
@@ -682,7 +877,7 @@ Every Twilio call is billed to AgentWeb's account and recorded through
 
 | Rate key | Unit | Provisional default | Metered |
 | --- | --- | --- | --- |
-| `voice_minute_outbound` | minute | $0.014 | per leg, from the `/status` webhook |
+| `voice_minute_outbound` | minute | $0.014 | per leg, from the `/status` webhook; on an inbound callback only the member leg, from `/inbound-status` (the caller's inbound leg is not metered: there is no inbound rate on the card and none was invented) |
 | `number_monthly_rent` | number_month | $1.15 | at purchase (first month) and by the daily rent sweep (every later month), same key per number and month |
 
 The defaults are PROVISIONAL placeholders at Twilio's public US list price
@@ -756,18 +951,22 @@ Rules the code enforces:
 
 ## Abuse limits and their known limits
 
-Gates run cheapest first. Stateless gates run at dispatch and again in the job;
+Gates run cheapest first (ids, phone, org calling hours, lead-local hours, team availability, age). Stateless gates run at dispatch and again in the job;
 the limits that count run once, just before the record is created, and are given
 back if the record is not created:
 
 1. Kill switch, origin `form_fill`, org config valid and enabled, lead exists,
    not a smoke-test lead, not a progressive-capture draft, has a phone.
-2. Skip gates with a `call.skipped` event: `no_caller_number`, `unsafe_id` (list
+2. Skip gates with a `call.skipped` event (a press-2 [retry](#press-2-and-the-retry) runs the same gates, bypassing only `too_old` and the "lead already has a call record" short-circuit, and can additionally skip with `retry_expired` or `lead_phone_changed`): `no_caller_number`, `unsafe_id` (list
    or lead id outside `[A-Za-z0-9_.:-]{1,200}`, which the webhooks would
-   reject), `invalid_phone`, `country_not_allowed`, `outside_calling_hours`,
+   reject), `invalid_phone`, `country_not_allowed` (also every Canadian number), `outside_calling_hours`,
+   `outside_lead_hours` (the lead's own local time is outside the lead window, 10:00-18:00, see [Lead-local hours](#lead-local-hours)),
    `no_one_available` (inside the calling hours, but no verified member has an
    open window), `too_old`, then `not_entitled` (the org owner's subscription tier does not
-   include the `hot_lead_call` feature; see [Plan entitlement](#plan-entitlement)).
+   include the `hot_lead_call` feature; see [Plan entitlement](#plan-entitlement)),
+   then `do_not_call` (async, so after the stateless gates and the plan check: the lead's own contact status is
+   exactly `do-not-contact`, or the org's marker holds the number; an email `unsubscribed`, a bounce or the legacy group-email flag does NOT block, see
+   [Do-not-call list](#do-not-call-list); a failing limit store records `limits_unavailable` and fails the job).
    Just before a slot is taken the job also loads the Twilio credentials and skips
    with `credentials_unavailable` when it cannot: no slot or record is used, so a
    later submission can try again.
@@ -779,13 +978,27 @@ back if the record is not created:
    `in_progress` in the code) writes nothing: it is the same lead racing itself.
 3. Limits, taken once per lead at its first attempt, in this order: `duplicate_phone`
    (same org and number within 24h), `org_hourly_cap` (UTC clock hour),
-   `org_daily_cap` (org's local calendar day). Both caps count LEADS, not member
+   `org_daily_cap` (org's local calendar day), `org_monthly_cap` (org's local calendar month, key
+   `hlc#cap#m#<orgId>#<YYYY-MM>`, TTL 40 days, default 200, see `maxCallsPerMonth`). The three caps count LEADS, not member
    calls (a lead rings up to `maxAttemptsPerLead` members and the lead's leg for one
    slot). Each is one conditional write. Then, for every attempt, first and next, the
    chosen member's cooldown: a member in cooldown is a per-attempt skip, the next
    candidate is used instead. Only when every candidate of a lead's first attempt is
    in cooldown is the lead skipped as `member_cooldown` (its slots are given back);
    on a later attempt, when none is left the record closes as `no_member_available`.
+   Everything taken is given back when a later limit refuses (a monthly refusal returns the phone marker and the
+   hourly and daily slots). Inbound callbacks are not counted against the monthly cap. A refusal records `call.skipped`
+   `org_monthly_cap` and the Slack alert still goes out.
+   **Owner notices:** when the month's count reaches `ceil(0.8 * cap)` (only for a cap of 5 or more: below that the 80% point
+   is the cap itself, so only the 100% email is sent) and at the first `org_monthly_cap` refusal, the org
+   owner (`Organization.ownerUserId`'s user email) gets ONE email each per org per month through `emailService.sendEmail`
+   (non-production sends are suppressed by the guard in `resendService`): "Your hot-lead calling is at 80% of this month's
+   limit" and "Automatic hot-lead calls are paused until the 1st". De-duplicated by claims `hlc#notify#80#<orgId>#<YYYY-MM>`
+   and `hlc#notify#100#<orgId>#<YYYY-MM>` (TTL 40 days) in the limit store. Best-effort and fire-and-forget
+   (`services/voice/hotLeadCallCapNotices.ts`): a failure never fails or delays the call; a failed 80% send gives the claim
+   back so the next crossing retries (bounded by the hourly cap), a failed 100% send KEEPS it (otherwise every refused lead
+   would redo the lookup and send during a provider outage); no owner email means a logged skip. Log lines for alarms:
+   `[hotLeadCall] org monthly cap 80% <orgId>` and `[hotLeadCall] org monthly cap 100% <orgId>`, once per org per month.
 4. `limits_unavailable`: the limit store failed; nothing is dialed, the job
    fails (not retried), an event is written best-effort.
 
@@ -796,6 +1009,13 @@ window a repeat still cannot dial: the record is permanent.
 Known limits, accepted:
 
 - Fixed windows can admit up to 2x a cap across an hour or day boundary.
+- The monthly bucket follows the calling-hours time zone (UTC when none is set), so changing the zone mid-month starts a
+  fresh bucket, as for the hourly and daily counters.
+- Raising `maxCallsPerMonth` after the 100% notice was sent does not re-notify that month: the claim key does not include
+  the cap.
+- The 80% notice can fire for a count that is then given back when the call record is not created (rare); the email said
+  "used N" for a moment when N was reached.
+- Rollout: every org starts at 200 leads per month on deploy, because stored configs without the field read as the default.
 - Phone-rotating bots can consume the org's hourly and daily caps; the Slack
   alert still fires.
 - Whoever submits a number first suppresses calls for that number for 24h.
@@ -811,19 +1031,19 @@ Known limits, accepted:
   attempt is requested, not again at `/gather`. A member who answers late can still
   have the lead dialed after the window closed: up to about 40 seconds of ring time
   can run past it. Accepted.
-- A lead gets one call record ever. A member call Twilio rejected is not retried
+- A lead gets one call record ever (the press-2 retry revives the same record). A member call Twilio rejected is not retried
   for the same member; the next member is tried instead, and a lead whose every
   placement was rejected is not called again.
-- `confirm` on the provisioning tool is ignored. Purchases and releases need a
+- `confirm` on the provisioning tool is ignored. Purchases, releases and turning calling on need a
   person's approval click; the per-org purchase and release caps remain as a second limit.
 - Two orgs configured with the same member phone can ring that person
   simultaneously: caps are per org and the cooldown is per member per org.
 - Prompt injection: the team phones and settings are changed through Emma
   tools, so text the model reads (a lead's form field, a web page) could try to
   steer `update_hot_lead_call_settings` or `confirm_hot_lead_call_verification`.
-  Purchases and releases need a person's approval click, but those two tools are
-  the only gated ones: enabling calling and starting a verification are not, so use
-  hand-picked orgs until the remaining go-live checks are done.
+  Purchases, releases and turning calling on need a person's approval click, but
+  starting a verification is not gated, so use hand-picked orgs until the remaining
+  go-live checks are done.
 - Verification brute force: a code is 6 digits with 5 attempts per code, 5 codes per
   person per day and 20 per organization per day, so a guesser has roughly a 5-in-a-million
   chance per code and about 25-in-a-million per person per day.
@@ -844,19 +1064,19 @@ Event types written to the lead timeline (`eventType`, with a scalar `eventData`
 | `call.member_answered` | member picked up (`/owner`), once | - |
 | `call.member_declined` | member pressed a key other than 1, or hung up on the prompt | - |
 | `call.member_no_answer` | member leg ended before pickup | - |
-| `call.lead_declined` | the lead answered but did not press 1 at the screening prompt (`/screen-result`, or `/dial` with `DialBridged=false`), once | - |
+| `call.lead_declined` | the lead answered but did not press 1 at the screening prompt (`/screen-result`, or `/dial` with `DialBridged=false`), once | `reason: opted_out` when the lead pressed 3, `not_available_now` when the lead pressed 2 and a retry was scheduled, `not_available_no_retry` for a 2 that is a plain decline, else none |
 | `call.connected` | the lead pressed 1 at the screening prompt (`/screen-result`), or `/dial` reported `DialBridged=true`; an answered lead leg alone is not a connection | - |
 | `call.lead_no_answer` | `/dial` reported no-answer, busy or failed | `dialStatus` |
 | `call.completed` | last dialed leg metered; the record is `finished` | `outcome` |
-| `call.failed` | `reason`: `place_rejected`, `placement_unknown` (both also carry `attempt`, `memberId`), `lead_phone_invalid`, `lead_phone_changed`, `aborted`, `next_attempt_failed` | `reason` |
-| `call.skipped` | a gate or limit refused (no Twilio call made) | `reason` (list above) |
+| `call.failed` | `reason`: `place_rejected`, `placement_unknown` (both also carry `attempt`, `memberId`), `lead_phone_invalid`, `lead_outside_hours`, `lead_do_not_call` (`/gather` found the number or lead on the do-not-call list), `lead_phone_changed`, `aborted`, `next_attempt_failed` | `reason` |
+| `call.skipped` | a gate or limit refused (no Twilio call made), or a press-2 retry was refused (`retry_expired`, `lead_phone_changed` or the gate's reason) | `reason` (list above) |
 
 Record `state`: `dialing`, `member_ringing`, `member_answered`, `between_attempts`
 (an attempt ended without a bridge and its leg is metered; waiting for the next
 attempt or the finish), `bridging`, `connected` (live) and `finished`, `failed`, `skipped` (terminal; `skipped` is in
 the type but the orchestrator records skips as events only). `outcome` values:
 `completed`, `member_declined`, `member_no_answer`, `no_member_available`,
-`lead_declined`, `lead_no_answer`, `lead_phone_invalid`, `lead_phone_changed`,
+`lead_declined`, `lead_deferred` (pressed 2, one retry pending), `lead_opted_out`, `lead_no_answer`, `lead_phone_invalid`, `lead_do_not_call`, `lead_phone_changed`,
 `bridge_unconfirmed`, `aborted`, `disabled` (the next-attempt job found the kill
 switch, the org config or the plan off), `place_rejected`, `next_attempt_failed`
 (the next-attempt job broke before it rang anyone),
@@ -864,7 +1084,7 @@ switch, the org config or the plan off), `place_rejected`, `next_attempt_failed`
 starts with no `outcome` and no `memberCallSid`: the transition removes both. Markers in
 `lastSequence`: `<memberCallSid>#gather`, `<memberCallSid>#dial`,
 `<memberCallSid>#ended` (the member leg ended without taking the lead),
-`<leadCallSid>#screen`, `lead#adopt`.
+`<leadCallSid>#screen`, `lead#adopt`. The retry's restart (see [Press 2 and the retry](#press-2-and-the-retry)) empties `lastSequence` and `meteredLegs`.
 
 Webhook endpoints (all under `/api/webhooks/twilio-voice`, query keys `listId`, `leadId`, `jobKey`, plus `leg=lead` on the lead's status callback only): `/owner` (member prompt), `/gather`
 (member's key; dials the lead), `/screen` (lead's leg after answering: adopts the
@@ -874,6 +1094,8 @@ screened themselves out), `/status` (per-leg progress and metering). `/screen` a
 identified only by the signed query ids plus the record state (`bridging`), and
 the body CallSid is taken to be the lead leg's, because the request parameters
 of the screening leg are not documented.
+
+The inbound-callback steps (`/inbound`, `/inbound-screen`, `/inbound-screen-result`, `/inbound-dial`, `/inbound-status`) are stateless and described under [Inbound callbacks](#inbound-callbacks); their query keys are `orgId` and `tried` only, and `/inbound` has none.
 
 Webhook answers: a bad or missing signature is 401; credentials that cannot be
 loaded 503; a signed request that is not for a live call this job owns gets a
@@ -904,13 +1126,132 @@ carry the Twilio retry override `#rc=3&rp=5xx,ct` so Twilio redelivers a 5xx.
   feature is inert; existing org attributes and lead records are ignored by older
   code.
 
+### Raise a customer's monthly limit
+
+The default is 200 automatic calls per org-local calendar month and the customer can only lower it. To raise it for a
+customer, an operator writes `hotLeadCall.maxCallsPerMonth` (integer 201-2000) on the org item in AW-Organizations
+(a data write, no route; keep the rest of `hotLeadCall` unchanged, and write conditionally on the previous value like the
+settings service). The next call is checked against the new value. The customer keeps seeing and keeping it when they edit
+other settings, and can still lower it. Values above 2000 make the whole config invalid (hot-lead calls stop, Slack only),
+so do not write them.
+
+Example (operator write, to raise org `org-123` to 600; read the item first and condition on what you read):
+
+```
+UpdateItem  TableName=AW-Organizations  Key={orgId: "org-123"}
+  UpdateExpression:    SET hotLeadCall.maxCallsPerMonth = :v
+  ConditionExpression: hotLeadCall = :prev      (the whole hotLeadCall map exactly as read; this also pins its revision)
+  :v = 600  (a number from 201 to 2000)
+```
+
+Afterwards verify: `GET /api/orgs/me/hot-lead-call` as that org (or Emma `get_hot_lead_call_settings`) shows
+`maxCallsPerMonth: 600`, and the config still validates (a read that answers "could not be read" means the write broke
+it). Nothing else needs a restart: the next lead is checked against the new value.
+
+Alarm markers (logs, each logged once per successful claim: the 80% marker can repeat only when its email failed and was
+retried at the next crossing; a failed 100% send is not retried and logs
+`[hotLeadCall] monthly cap 100% notice failed <orgId>` instead, without an address): `[hotLeadCall] org monthly cap 80% <orgId>` and
+`[hotLeadCall] org monthly cap 100% <orgId>`. The 100% marker means leads are being skipped as `org_monthly_cap`. To resend a
+notice by hand, delete the claim `hlc#notify#80#<orgId>#<YYYY-MM>` / `hlc#notify#100#...` (table `AW-MCPSessions`).
+
 ### Stuck records
 
-A record can stay live if a final status callback never arrives (Twilio outage,
-5xx beyond the three retries, a `BACKEND_URL` problem) or the process crashed
-mid-call. No cron cleans these up and no operator tool lists them.
+A record waiting for its press-2 retry is `finished` (outcome `lead_deferred`), so the sweep never reports or closes it; a retry in flight is an
+ordinary live record (`dialing` onwards, with `startedAt` and `updatedAt` set when the retry started) and is swept by the same thresholds. A first call
+that gets stuck and is closed by the sweep keeps `lead_deferred` (it is the decided outcome), so its retry then runs on schedule, or expires if the close
+came more than six hours after the retry's FIRST due time.
 
-**Finding them.** Start from what you know:
+`lead_opted_out` (ENG-2783) leaves the record in `bridging` with the dial marker set, exactly like `lead_declined`: the leg metering finishes it, and
+the sweep settles it from the same state with the same thresholds. No state was added.
+
+A record can stay live if a final status callback never arrives (Twilio outage, 5xx beyond the three retries, a
+`BACKEND_URL` problem) or the process crashed mid-call. A daily sweep (ENG-2271, `services/voice/stuckCallSweep.ts`,
+`cron/stuckCallSweepCron.ts`, 12:00 UTC, armed in `server.ts` like the rent sweep) finds them and settles what can be
+settled safely. It replaces the old by-hand scan.
+
+**Modes.** Environment variable `HOT_LEAD_CALL_STUCK_SWEEP` of the backend, read on every run:
+
+| Value | Effect |
+| --- | --- |
+| unset, or anything but the two below | **Report only** (the default): finds and classifies records, reads Twilio, logs what it would do, writes nothing |
+| `close` | Settles records as in the table below |
+| `off` (also `0`, `false`) | The sweep does nothing; the cron logs `stuck call sweep skipped` |
+
+It is not gated on `hot_lead_call_mode`: a stuck record needs cleaning whether or not calling is on. It cannot dial: it
+never calls `placeCall`, never asks for a next member and never hangs up a call. Overlapping runs and repeats are harmless
+(every write is the store's conditional transition; a leg is billed only by the one writer that wins its `meteredLegs`
+entry, and the usage event's key is per call sid and leg).
+
+**How it finds records (no table, index or migration).** `orgDb.listHotLeadCallOrgIds` (a projected scan of AW-Organizations for
+orgs with ANY `hotLeadCall` attribute, ids only; releasing a number removes the number fields but keeps the config with
+calling off, so an org that released its number is still swept. It reads the same org items as the inbound index's
+number scan, `listHotLeadCallNumbers`, and the filter is looser by exactly the orgs that were configured but hold no number
+now; the read cost of an org scan is the org table either way, once a day here against every 60 s per instance there), then per org its members
+(`OrgIdIndex` query), their lead lists (`getLeadListsByUserId`: a query on the `userId-index` GSI of AW-LeadLists, which falls back to a filtered scan of that table if the index is missing; session lists are skipped) and, per list, the NEWEST leads
+of the list through `crmDb.findLeadsBySystemRecord`: a query on the list's own partition (newest `leadId` first) with a
+filter on `system.hot_lead_call.state` and `updatedAt`, so only ids come back. Bounds: at most 500 leads read per list and
+10,000 per run; at most 50 records WRITTEN per run (would close, in report mode) and at most 200 records handled per run
+(each costs up to two Twilio reads). Records left for a human or failing do not use up the 50, so they cannot starve the
+rest; whatever a cap leaves waits for the next run. The org scan order does not rotate, so a pathological first org can
+still use the whole read budget every day.
+
+`truncated: true` means a read bound stopped a list or the run, or a cap left records for the next run. It fires on ANY
+list with 500 or more leads (and falsely when a read stops exactly at the bound), so it is not a signal by itself.
+
+Known limits, stated plainly:
+
+- **A stuck record older than the newest 500 leads of its list is invisible, on every run.** Nothing indexes the call
+  state, so the sweep can only look at the newest leads. The real fix (a sparse GSI on the state, or a persisted cursor)
+  is a data-plane change that needs Harsha's approval and is tracked under Known follow-ups. Also not covered: a list of a
+  member who left the org.
+- **Read cost.** DynamoDB bills the full size of every lead item examined, up to 10,000 per run, per backend instance
+  (the filter runs after the read), plus a few small queries per org; the Twilio cost is at most two read-only fetches per
+  record handled. Production currently runs ONE backend instance (Elastic Beanstalk min=max=1, verified 2026-11-04); more
+  instances multiply the scan and the Twilio reads (close mode stays correct: conditional transitions, per-sid usage keys).
+- **Closing a `between_attempts` record** as `failed` / `next_attempt_failed` overwrites that attempt's own outcome and writes
+  a `call.failed` event: anything alerting on `call.failed` will see it.
+- **A stranded `member_answered` record** (the move to `bridging` was lost) can leave an unbilled lead leg: the sweep meters
+  only the member leg, same as the webhook does today.
+
+Each record found is re-read consistently and decided on that read, and read again just before the first write: if its call,
+attempt, state or call sids changed meanwhile (a late real callback), the sweep writes nothing and counts it as `moved`.
+
+**When a record counts as stuck.** Time since the record's last write (`updatedAt`; every transition refreshes it) against
+the longest a healthy record waits in that state, plus 10 minutes for callback retries, the queue's reclaim of a dead
+worker (5 minutes stale, polled every 30 s) and clock skew. All values come from the code (`STUCK_AFTER_MS`):
+
+| State | Longest healthy dwell | Stuck after |
+| --- | --- | --- |
+| `dialing` | one `placeCall` request | 10 min |
+| `member_ringing` | member ring 25 s | 10 min 25 s |
+| `member_answered` | keypress prompt 8 s | 10 min 8 s |
+| `bridging`, `connected` | `<Dial timeLimit>` 1800 s + lead ring 25 s + two 8 s prompts | 40 min 41 s |
+| `between_attempts` | no call live; a further attempt is refused once the lead is older than `maxAgeMinutes` (max 60) | 70 min |
+
+**What it does (`close` mode).** The sweep stands in for the missing final callbacks, from Twilio's own record of the call
+(`VoiceProvider.fetchCall`, read-only). Twilio is the authority on whether a call is live; the age only decides which
+records are worth asking about.
+
+| Record | Action | Why it is safe |
+| --- | --- | --- |
+| `dialing`, `member_ringing`, `member_answered`, `bridging`, `connected`, with the sid of every unmetered leg (a `dialing` record that has a `memberCallSid` is reconciled like the others) | Fetch each unmetered leg. All ended: meter each through `meterLeg` (lead first), then apply the normal finishing rule (`finishIfComplete`: `completed`, or `bridge_unconfirmed` while still `bridging`; a member attempt that ended without taking the lead is finished with that attempt's outcome through the same close the webhook uses, `call.completed` event) | A leg Twilio reports as live is never touched. Metering is the webhook's own conditional write, so a late real callback and the sweep cannot both bill. Every leg is read before anything is written, so a Twilio failure changes nothing. The sweep never asks for a next member, so nobody is dialed |
+| the same, but a leg is still live (`queued`, `ringing`, `in-progress`) | Nothing; counted as `stillLive` and logged | A call that may legitimately still be running |
+| the same, but Twilio has no record of a call (404) | Nothing; `needsHuman` (a warn line, not a failure, so the summary line does not stay an error every day) | Only a Twilio 404 is treated this way; every other Twilio error is a `failed` |
+| the same, but an ended `completed` leg has no duration | Nothing; `needsHuman` | A missing duration is reported, never defaulted to 0. (`busy`, `failed`, `no-answer`, `canceled` legs have no duration by Twilio's definition and bill 0.) |
+| every dialed leg already metered, only the finish lost | `finishIfComplete` | Same rule as the webhook |
+| `dialing` (no call sid, including `placement_unknown`), `member_ringing`/`member_answered` with no `memberCallSid`, or `bridging`/`connected` with no `leadCallSid` | Nothing; `needsHuman` | There is nothing to ask Twilio about, and a call may exist that was billed and never recorded. Closing it stays a data repair needing Harsha's approval (see Repairing). Check the Twilio call log by hand as before; the line repeats on every run until the record is repaired |
+| `between_attempts` older than 70 min | Close as `failed` / `next_attempt_failed` with a `call.failed` event (reason `next_attempt_failed`), guarded by the attempt number | No call is live in this state and no job can ring anyone any more; it is the close the next-attempt job makes when it breaks. If a job took the record first, the conditional write loses and nothing changes |
+
+**Reading the log.** One summary line per run: `[hotLeadCall] stuck call sweep completed` (info), `... completed with
+failures` (error, when `failed` is above 0), or `... skipped: HOT_LEAD_CALL_STUCK_SWEEP is off`. Fields: `mode`; `orgs`,
+`lists`, `leadsRead` (the read cost) and `truncated`; `found` (records the read returned, older than the youngest
+threshold; the cap counts only the ones written); `wouldClose` (report mode) and `closed`; `stillLive`; `needsHuman`; `notStuck` (found but not yet stuck for its
+state, or gone); `moved` (another writer got there: the record changed before the first write, or was written to but not closed); `failed` (a Twilio call, the store or an org
+read failed; nothing more was changed for that record). Before it, one `warn` line per record: `stuck call record: org <orgId> list <listId> lead <leadId> state <state>: <what>`, where
+`<what>` is `would close (...)`, `closing (...)`, `Twilio says the <leg> call is still live: left alone` or `needs a human: <reason>`.
+No phone number is ever logged. Failures log the error name only.
+
+**By hand** (the sweep is off, or a record it reports as `needs a human`). Start from what you know:
 
 - A report ("the member got a call but ...") or one lead: open the lead's timeline
   (`call.*` events) and its `system.hot_lead_call` record.
@@ -928,49 +1269,29 @@ mid-call. No cron cleans these up and no operator tool lists them.
   ```
 
   `updatedAt` is an ISO string, so the comparison is lexicographic and correct.
-  Anything live that long (a call lasts minutes) is stuck.
 
-**What each state means and what to do:**
+**What each state means when it is stuck** (the sweep's table above says what it does about each):
 
-- `dialing`, no `outcome`, no `memberCallSid`, and older than 10 minutes (a ring is 25 seconds; younger ones are being
-  placed): the process died between taking the record (the create, or the move from `between_attempts`) and recording
-  the call, or a deciding write may have landed and its re-reads failed (see Writes that commit and then report an
-  error). Always check the Twilio call log first for a call from the org's number to the member around `updatedAt`.
-  None: nothing was placed. The Slack alert already went out and by the once-per-lead rule the lead is simply never
-  called; leaving the record is safe (closing it as `failed`, outcome `store_error`, is a data repair that needs
+- `dialing`, no `outcome`, no `memberCallSid`: the process died between taking the record (the create, or the move from
+  `between_attempts`) and recording the call, or a deciding write may have landed and its re-reads failed (see Writes that
+  commit and then report an error). Always check the Twilio call log first for a call from the org's number to the member
+  around `updatedAt`. None: nothing was placed. The Slack alert already went out and by the once-per-lead rule the lead is
+  simply never called; leaving the record is safe (closing it as `failed`, outcome `store_error`, is a data repair that needs
   Harsha's approval). One exists: it was billed and the record never learned its sid. Its first signed callback normally
   adopts it and the call proceeds and is metered; if no callback ever arrived, meter it by hand as under Checking what
   was billed.
-- `dialing` with `outcome=placement_unknown`: the placement was ambiguous. Check
-  the Twilio call log for a call from the org's number to the member around
-  `startedAt`. If one exists and its callbacks never arrived, Twilio billed it
-  and we did not meter it.
+- `dialing` with `outcome=placement_unknown`: the placement was ambiguous. Check the Twilio call log for a call from the
+  org's number to the member around `startedAt`. If one exists and its callbacks never arrived, Twilio billed it and we did
+  not meter it.
 - `member_ringing` / `member_answered`: the member leg's final callback is missing.
-- `between_attempts`: the attempt's leg is metered but the record was neither
-  taken over by a next attempt nor finished. A next-attempt job that breaks closes
-  the record as `failed` / `next_attempt_failed`; if that close fails too, a REPLAY
-  of the leg's final callback re-drives the job (a failed queue row is cleared and
-  queued again). Twilio replays only after a 5xx, so otherwise it stays until someone
-  replays the callback or the record is repaired. A job whose process died is re-run by
-  the queue poller after 5 minutes (see What the queue poller does), which resumes a first-attempt job's own
-  waiting record and carries a next-attempt job on, including the case where the job's own lock was rejected and the
-  record now waits at a later attempt number with no call sid (a replayed callback cannot help that one: `/status`
-  acknowledges a callback for a record that has no call sid, so only the job's re-run recovers it). A re-run that fails before it could close
-  the record closes it on the way out, looking the record up again to guard the close with the attempt it really waits
-  after; if even that lookup fails, the record is the repair case below. A row that
-  FAILED is not re-run by the poller: its error path normally closed the record already, and if that close failed too
-  the record is repaired by hand when it has no call sid (Harsha's approval), or healed by replaying the final callback
-  when it waits right after an attempt that had a call (a failed row is then cleared and queued again). No call is in
-  flight; the lead is simply not called again until then.
-- `bridging` with no `leadCallSid`, and older than 10 minutes: the member pressed 1 and the move to `bridging` may have
-  landed with its re-reads failing, so the member was hung up on and no lead leg exists. To find either this or the
-  `dialing` case above, run the read-only scan above with `:cutoff` set to 10 minutes ago, keep the rows where
-  `attribute_not_exists(#s.#k.memberCallSid)` (state `dialing`) or `attribute_not_exists(#s.#k.leadCallSid)` (state
-  `bridging`). Check the Twilio call log that the member's call ended without a child call to the lead; meter the
-  member's leg by hand if it was not metered. The lead is not called again by itself; closing the record is a data repair
-  that needs Harsha's approval.
-- `bridging` / `connected`: the bridge ended but a leg callback is missing; the
-  call may be unmetered.
+- `between_attempts`: the attempt's leg is metered but the record was neither taken over by a next attempt nor finished (see
+  Records stranded between attempts heal for what normally moves it, and What the queue poller does). No call is in flight;
+  the lead is simply not called again.
+- `bridging` with no `leadCallSid`: the member pressed 1 and the move to `bridging` may have landed with its re-reads
+  failing, so the member was hung up on and no lead leg exists. Check the Twilio call log that the member's call ended
+  without a child call to the lead; meter the member's leg by hand if it was not metered. The lead is not called again by
+  itself; closing the record is a data repair that needs Harsha's approval.
+- `bridging` / `connected` with sids: the bridge ended but a leg callback is missing; the call may be unmetered.
 
 **Checking what was billed.** Spend events are in the immutable ledger table
 `AW-SpendEvents` (`Dev-AW-SpendEvents` in development), partition key
@@ -1008,7 +1329,7 @@ delete. A 404 from Twilio counts as already released. Reconcile any such log lin
 | Symptom | Likely cause |
 | --- | --- |
 | Member is called but hears "application error" | The `/owner` fetch failed: `BACKEND_URL` wrong or unreachable (check scheme and host), or credentials could not be loaded (503), or the signature failed (401). Twilio's call log shows the webhook response. |
-| Calls never placed, timeline shows `call.skipped` | The `reason` names the gate. `outside_calling_hours`, `no_one_available`, `duplicate_phone` and `member_cooldown` are expected behavior. |
+| Calls never placed, timeline shows `call.skipped` | The `reason` names the gate. `outside_calling_hours`, `outside_lead_hours`, `no_one_available`, `duplicate_phone`, `do_not_call` (the lead or the number pressed 3 or is do-not-contact; see [Do-not-call list](#do-not-call-list)), `member_cooldown` and `org_monthly_cap` are expected behavior (`org_monthly_cap`: the org used its monthly allowance; calls resume on the 1st, the owner was emailed, the Slack alert went out). An `outside_lead_hours` lead is not retried or deferred (the job runs once) EXCEPT a press-2 retry, which can itself skip with that reason when it is refused at run time; a `retry_expired` skip means a press-2 retry could not run within six hours of its FIRST due time (`deferral.firstDueAt`, or no open minute was left); the lead window is 10:00-18:00 lead-local, about 13:00-18:00 Eastern for most US numbers, so a lead that arrives in the evening or morning is simply not called. |
 | No event and no call | Kill switch off, org disabled or config invalid, lead not `form_fill`, smoke-test lead, draft lead, or no phone: all silent by design. |
 | `call.skipped` `limits_unavailable` | `AW-MCPSessions` missing, IAM denied, or throttled. Fails closed. |
 | `no owner to bill for list` in logs | The list owner could not be resolved; the leg was not metered and `/status` answers 500. |
@@ -1026,15 +1347,15 @@ availability:
    several orgs, so each org can connect once.
 2. **A number-rotating bot can starve genuine leads.** A script that submits a
    different number each time uses up an org's daily and hourly caps; real leads
-   after that are skipped (`org_hourly_cap` / `org_daily_cap`). The Slack alert
+   after that are skipped (`org_hourly_cap` / `org_daily_cap` / `org_monthly_cap`). The Slack alert
    still fires for every lead.
 
 Mitigations to decide before general availability (none of them is built):
 
 - CAPTCHA or honeypot enforcement on the lander endpoint.
 - A spoken disclosure to the lead (for example about recording) before the
-  bridge. The screening prompt (`/screen`) is the place for it; today it only
-  names the business and asks the lead to press 1.
+  bridge. The screening prompt (`/screen`) is the place for it; today it names the business, gives the org's
+  number to call back, and offers press 1 (connect), press 2 (call again later) or press 3 (stop).
 - Requiring a name or an email besides the phone number.
 - Consent text on the landers.
 
@@ -1097,16 +1418,50 @@ on anywhere.
     carry the new version string for ALL vendors. Amounts are identical (checked
     byte for byte for v0, Apollo, Placid and Remotion); a reconciliation that
     groups by rate-card version will see a new bucket.
-14. Known gap accepted at launch: enabling calling through
-    `update_hot_lead_call_settings` and the small verification call are not behind
-    an approval click (the verification call is capped per person and per org).
-    Provision and release need a person's approval click, and number rent is
-    metered every month by the daily sweep.
+14. Known gap accepted at launch: the small verification call is not behind an
+    approval click (it is capped per person and per org). Provision, release and
+    turning calling on through `update_hot_lead_call_settings` need a person's
+    approval click, and number rent is metered every month by the daily sweep.
+15. Inbound callbacks: set the voice URL of every number bought before inbound callbacks existed
+    (the existing org number, `hotLeadCall.twilioNumberSid` on its AW-Organizations item) to
+    `${BACKEND_URL}/api/webhooks/twilio-voice/inbound`, HTTP POST, in the Twilio console. Until then a
+    lead calling it hears whatever the number was left with. Then call it once from a phone that
+    is not a team member's: the member should hear the "a lead is calling back" prompt.
+    Decide whether the unmetered inbound leg (see [Metering and spend](#metering-and-spend)) is acceptable, and accept the inbound
+    caps (per org 2 x the outbound hourly/daily caps, per caller 3 an hour and 6 a day; see
+    [Inbound callbacks](#inbound-callbacks)): a caller who withholds their number is limited only by the org caps, which
+    bound the member-leg minutes billed to the org owner.
+16. Stuck-record sweep (ENG-2271): it ships report-only. After the first real calls, read the daily
+    `[hotLeadCall] stuck call sweep completed` line and its `stuck call record: ...` warn lines (see
+    [Stuck records](#stuck-records)): `found` should be 0 or explainable, `failed` 0, and every `would close` line a record you
+    agree should be closed. Only then set `HOT_LEAD_CALL_STUCK_SWEEP=close` and restart. Confirm `fetchCall` works with the
+    production Twilio credentials: grep the log for `fetchCall CA... failed` (the provider's own error line); a `failed`
+    count above 0 with those lines means it does not. A call Twilio has no record of (404) shows as a `needs a human`
+    warning, not a failure.
 
 ## Not verified without a real Twilio account
 
 None of these has been observed against Twilio. They are assumptions taken from
 Twilio's documentation and encoded in tests with synthetic payloads:
+
+- The lead prompt (ENG-2783): that a key press interrupts the nested `<Say>` of the `<Gather>` (so a lead can press 1 or 3 while
+  the number is still being read), that the default Twilio voice reads "4 1 5, 5 5 5, 0 1 1 1" as separate digits with a pause at
+  each comma, and that a `<Say>` followed by `<Hangup/>` in the `/screen-result` response is played to the lead before the leg ends.
+
+- What `From` holds on `/inbound` for a withheld or unknown caller (ENG-2784). The code treats anything that is not exactly E.164 as
+  "no caller" and applies only the org caps; the exact value Twilio sends was not observed.
+- Inbound callbacks: that `To` on the voice-URL request is the dialled number in E.164; that a `<Dial>` to a member
+  with `answerOnBridge` and a `<Number url>` screening step behaves as it does for the lead on an outbound call
+  (a hang-up there ends the Dial with `completed` and `DialBridged=false`, which is what moves on to the next member);
+  that the member leg's `completed` status callback carries `ParentCallSid` and `CallDuration`; and that the
+  callerId = the org's number is accepted on a `<Dial>` answering an inbound call.
+- Inbound callbacks: whether Twilio sends `DialBridged=false` when a `<Number url>` screening step hangs up. If it is absent,
+  `/inbound-dial` hangs up the caller instead of rolling to the next member (the outbound `/dial` relies on the same assumption).
+
+- Stuck-record sweep: that the Call resource's `duration` (REST fetch) equals the `CallDuration` of the final callback
+  for the same leg, that it is already populated when `status` is `completed`, and that it is empty for `busy`, `failed`,
+  `no-answer` and `canceled` (the Node SDK's own documentation says so for unanswered calls). A `completed` call without a
+  duration is left for a human, never billed as 0.
 
 - `<Number>` status callbacks (`statusCallbackEvent="initiated ringing answered
   completed"`) for a lead that does not answer or is busy: that they arrive
@@ -1178,14 +1533,164 @@ Twilio's documentation and encoded in tests with synthetic payloads:
 
 ## Known follow-ups
 
-- **Stuck-record cleanup.** A documented sweep for records live longer than a
-  call can last (and reconciliation of their Twilio legs). No cron exists.
-- **Approval for enabling calling.** Provision and release need a person's approval
-  click; turning calling on in `update_hot_lead_call_settings` does not yet.
+- **Stuck-record sweep visibility.** The sweep only sees the newest 500 leads of each list (nothing indexes the call
+  state). A sparse GSI on the state, or a persisted cursor, would make every stuck record visible; both are data-plane
+  changes that need Harsha's approval.
+
+- **Inbound minutes.** The caller's inbound leg of a callback is not metered (no inbound rate on the card); add a
+  `voice_minute_inbound` rate. `/inbound-status` is the callback of the CHILD (member) leg; the caller's parent leg has no
+  `statusCallback`, so metering it needs one on that leg (set on the number or on the call), or the bridged member leg's duration
+  as a proxy. Inbound callbacks are capped per org and per caller
+  (ENG-2784); the caps are fixed constants (per caller) and multiples of the outbound caps (per org), not separately configurable.
 - **Missed-call Slack line.** The Slack alert does not say whether the call was
   placed, answered or declined; deliberately deferred so the Slack path stays
   untouched.
-- **Retry after `place_rejected`.** Every lead gets one call record ever, so
+- **Press-2 retry visibility.** The due-retries cron reads the newest 500 leads of each list (like the stuck sweep), which is enough
+  because a deferred lead is recent; a list that receives more than 500 leads inside the retry's life could miss one. A retry that is
+  claimed and then fails permanently is lost (one retry, ever); a transient failure is given back and tried again.
+- **Retry after `place_rejected`.** Every lead gets one call record ever (the press-2 retry revives it only after a `lead_deferred` outcome), so
   a definitively rejected placement is never retried. A deliberate retry needs a
   new store operation.
 - Voicemail detection and a post-call outcome summary in Emma.
+
+## Press 2 and the retry
+
+ENG-2783. A lead who answers and presses 2 ("not available now") gets ONE more call, about an hour later, at most once per lead ever.
+
+**Recording the press.** `/screen-result` with `Digits=2` writes, in the same conditional transition as the first-writer-wins `<leadCallSid>#screen` and
+`<memberCallSid>#dial` markers, `outcome: lead_deferred` and `deferral: {dueAt, count: 1, firstDueAt}` (`firstDueAt` = the initial `dueAt`, written once here, never changed) on the `system.hot_lead_call` record, plus the timeline event
+`call.lead_declined` (`reason: not_available_now`). A replay, a later 1 or a later different key finds the markers and changes nothing (a 1 after a 2 hangs up
+and never connects). A 3 after a 2 on the same screening wins: the markers are raised from 1 to 2, the do-not-call marker and contact status are written (see
+[Do-not-call list](#do-not-call-list)), the outcome becomes `lead_opted_out` and `deferral` is removed. The record finishes through the normal leg metering with
+`outcome: lead_deferred`; no other member is tried.
+
+**When.** `dueAt` is 60 minutes after the press if both the lead window (10:00-18:00 lead-local, see [Lead-local hours](#lead-local-hours)) and the org's calling hours
+are open then; otherwise the first minute after that when both are open, searched minute by minute for 36 hours (`services/voice/hotLeadCallRetry.ts`, a DST day included).
+Including the org's hours in the search is deliberate: a retry must not be scheduled for a minute the gates would refuse. If no minute qualifies, or the lead's phone is no
+longer the one approved for the call, or retries are switched off (`HOT_LEAD_CALL_RETRY`) or the kill switch is off (the cron would never run it), or the call is itself the retry,
+the 2 is an ordinary decline: `lead_declined`, event reason `not_available_no_retry`, the lead hears the bare hangup and the member the usual "did not confirm" line.
+Nothing is promised that cannot happen.
+
+**Max one retry.** The retry keeps the record's `deferral`. `/screen-result` defers only a record that has none, so a 2 on the retry call is the plain decline above.
+**Prompt variants.** `/screen` speaks the three-option prompt ("Press 1 to be connected now, press 2 if you are not available and we will call you again later, or
+press 3 to stop these calls.") only on the lead's first call with retries on. On the retry call, and whenever `HOT_LEAD_CALL_RETRY` is off, it is "Press 1 to be connected now, or press 3 to stop these calls."
+(`canDefer` in `leadScreenTwiml`). If the eligibility check itself throws (a failed lead or org read), `/screen` logs one warning (`retry eligibility unavailable, option 2 not offered: <error name>`) and serves the two-option prompt rather than hanging up on the lead.
+
+**The due-retries cron.** The job queue has no run-after, so `cron/hotLeadCallRetryCron.ts` (armed in `server.ts`, every 5 minutes) calls
+`services/voice/hotLeadCallRetrySweep.ts` (plus one run 30 seconds after the cron is armed, so a fresh deploy does not wait a whole interval). Switch: `HOT_LEAD_CALL_RETRY` (unset = on; `off`, `0`, `false` = not armed and every run returns at once). It does nothing
+and reads nothing while the global kill switch `hot_lead_call_mode` is off (the pending retries stay and run once it is on, or are given up six hours after their first due time). Discovery is the stuck
+sweep's (orgs with a `hotLeadCall` attribute whose config is enabled -> members -> lists -> `crmDb.findLeadsBySystemRecord` on state `finished` with a `deferral` and no
+`retryClaimToken`; no index), bounded per run: a 2000-lead read budget shared out evenly (each list reads `min(500, max(50, floor(2000 / lists)))` of its newest leads; the starting list rotates every
+run, so with more lists than the budget covers no list is starved for good, and a `[hotLeadCall] retry sweep skipped lists for budget <count>` warning says how many were skipped), 100 DUE records handled (a record that is not due yet costs one read but
+does not count) and 20 retries started. The newest-500 window is a known limit; the real fix is a sparse index of pending deferrals, a data-plane change (needs Harsha's approval) that is NOT built.
+Each run logs one counts-only line, only when something was found, attempted, expired, skipped or failed (an idle run at most once an hour):
+`[hotLeadCall] retry sweep orgs=.. lists=.. skippedLists=.. leadsRead=.. truncated=.. found=.. notDue=.. rescheduled=.. attempted=.. refused=.. expired=.. lost=.. failed=..` (`attempted` means the
+claim was won and the reservation and placement ran; a cap or cooldown refusal inside it shows as `call.skipped` on the lead).
+
+**The contract.** A retry is placed within 6 hours of its FIRST due time (`deferral.firstDueAt`) or it is given up with a `call.skipped` `retry_expired` note. It is never moved to another day: a press at 17:55 ET gets
+the next day's 13:00 ET as its first due time (the press-time schedule, above), and from then on 6 hours are all it has. Records written before `firstDueAt` existed, or with an unparseable one, fall back to their `dueAt` (a garbage value never disables the expiry).
+
+**The retry run** (`processHotLeadCallRetry` in `hotLeadCallService.ts`), in order:
+1. Kill switch; the record is `finished`, outcome `lead_deferred`, has a pending `deferral` and no `retryClaimToken`.
+2. Expiry, first, before anything else including "not due yet": more than 6 hours after `firstDueAt` (whether or not the windows are open, and whatever the stored `dueAt` says, a FUTURE one included: an operator-written or older-shape record) is claimed and given up with the `retry_expired` note. A deferral that is merely not due yet is left alone. Then windows: if the lead window or the org's calling hours are closed AT THIS MOMENT
+   (a late cron tick, hours edited since), the next open minute COUNTED FROM NOW is looked up (`retryDueAt(..., now, 0)`: the 60 minute delay belongs to the press-time schedule only, so an opening 10 minutes from now is found); if it is later than `firstDueAt` + 6 hours (or there is none within 36 hours) the retry is claimed and given up with the note, otherwise
+   `deferral.dueAt` is moved to it with a conditional write (`LeadCallStore.rescheduleRetry`, only while no claim is there, `firstDueAt` kept) and the run stops (`rescheduled`).
+3. Claim: a conditional write of `retryClaimToken`/`retryClaimedAt` only while none is there (`LeadCallStore.claimRetry`). Exactly one run or instance wins, however many overlap.
+   After the claim only a PERMANENT refusal spends the retry; a transient one gives the claim back (see the table below). The `retry_expired` note is always written as its own event (the per-lead 5-skip cap and the one-per-reason dedupe cannot swallow it).
+4. Every gate of a new lead through the same `review()`/`SKIP_GATES` with the retry flag: ids, phone, org calling hours, lead window, `no_one_available`, entitlement, `do_not_call`;
+   each refusal is a `call.skipped` with its reason. The `too_old` gate and the "lead already has a call record" short-circuit are the only things ignored (age is counted from the
+   deferral and the expiry above). The lead's phone must still match the record's `leadPhoneMac`, else `lead_phone_changed`.
+5. A FRESH slot (`reserveCallSlot` with `retry`): the hourly, daily and monthly counters are taken afresh (the cap notices apply as usual). The 24h phone marker the lead's own first call took is
+   accepted when it is held by this same lead (nothing taken, nothing released); a marker held by another lead refuses as `duplicate_phone`. Fresh candidate selection with the member cooldown
+   (`member_cooldown` when everyone is in it).
+6. `LeadCallStore.restartForRetry`: the one place a terminal record is revived. Conditional on state `finished`, the first call's `jobKey` and the claim token, it sets `state: dialing`, `attemptNo: 1`, a new `jobKey`,
+   `startedAt`, `memberId`, `triedMemberIds: [member]`, `claimToken`, `leadPhoneMac`, empties `meteredLegs` and `lastSequence`, and removes `memberCallSid`, `leadCallSid` and `outcome`. The new `jobKey` makes the first
+   call's late Twilio callbacks stop matching. From there it is an ordinary call (member prompt "New lead from ...", then the lead screen); the first call's events stay on the timeline, followed by the retry's own
+   `call.initiated`. If no record is created the slot is released.
+
+The transient-refusal release keeps its +15 minute floor (a refused cap or a busy team is not a window problem, and retrying every cron tick would only hammer it); the window search then pushes it later only if 15 minutes on is closed.
+
+**Permanent vs transient refusals after the claim.** `review()`/`preflight` report WHY they stopped (the dispatch path still just gets "do nothing").
+
+| Class | Reasons | What happens |
+| --- | --- | --- |
+| Permanent (spends the retry) | `lead_missing`, `ctx_missing`, `lead_phone_changed`, `do_not_call`, `not_entitled`, `duplicate_phone` (another lead holds the number), `smoke_test`, `draft_lead`, `invalid_phone`, `country_not_allowed`, `unsafe_id`, `not_form_fill`, `has_record`, `retry_expired` | `call.skipped` where one applies; the claim stays; log `[hotLeadCall] retry dropped after claim <reason> <orgId>` |
+| Transient (everything else) | `no_one_available`, `member_cooldown`, `org_hourly_cap`, `org_daily_cap`, `org_monthly_cap`, `outside_calling_hours`, `outside_lead_hours`, `limits_unavailable`, `credentials_unavailable`, `disabled`, `no_caller_number`, a thrown error (`error`), any reason not listed above | the claim is given back with `LeadCallStore.releaseRetryClaim` (conditional on `retryClaimToken` being THIS run's token and the record still `finished`; a stale token cannot release a newer claim): `retryClaimToken` and `retryClaimedAt` are removed and `deferral.dueAt` becomes now + 15 minutes, or the next minute both windows are open if later; log `[hotLeadCall] retry rescheduled after claim <reason> <orgId>`; the run returns `rescheduled`. For a thrown error the claim is given back first and the error then goes on to the sweep (`failed`) |
+| Expiry | a transient refusal when the new due time would pass `deferral.firstDueAt` + 6 hours | `call.skipped` `retry_expired`, the retry is spent |
+
+`deferral.firstDueAt` is written at press time and never changes, so no reschedule (a closed window at run time, or a transient refusal) can stretch the six hours; `releaseRetryClaim` writes it only as a fallback for legacy records without it. Once `restartForRetry` has succeeded the retry is spent: a real call began, whatever happens to it later.
+
+**Operator runbook.**
+- *Is a retry pending?* The record is `finished`, `outcome: lead_deferred`, with `deferral.dueAt` and no `retryClaimToken`.
+- *Cancel a pending retry:* an operator data write on the lead row: set `system.hot_lead_call.retryClaimToken` to any string (the claim is then taken and no run can fire it), or remove `system.hot_lead_call.deferral`.
+- *Stop all retries now:* `HOT_LEAD_CALL_RETRY=off` and redeploy/restart (the cron is armed at start), or turn off `hot_lead_call_mode`.
+- *A pending retry that keeps rescheduling:* a `deferral.dueAt` that moves 15 minutes at a time, no `retryClaimToken`, and `retry rescheduled after claim <reason>` lines name the transient reason (a cap, no one on duty, a cooldown, a down store). It stops by itself at
+  `firstDueAt` + 6 hours with `retry_expired`. To cancel earlier, write `retryClaimToken` (any string) on the record, or remove `deferral`.
+- *Why did a retry not happen?* First check whether it is still waiting: no `retryClaimToken` and a `dueAt` in the future means the cron has not reached it, or it was moved to a later minute inside its 6 hours because a window was closed when the cron ran (nothing is wrong, nothing is spent).
+  Otherwise the lead's timeline: `call.skipped` with `retry_expired`, a gate reason, or a cap (`org_hourly_cap`, ...); the retry is spent either way. No skip and no second `call.initiated` means the retry was dropped after the claim:
+  search the logs for `[hotLeadCall] retry dropped after claim <reason> <orgId>` (permanent) or `retry rescheduled after claim` (transient, tried again) and `retry lost after claim` for the reason.
+
+## Do-not-call list
+
+A lead who presses 3 at the screening prompt (ENG-2783) is stopped in two places, written in this order BEFORE the
+call's outcome is recorded (so an outcome that is seen is backed by the stop):
+
+1. **Org marker** `hlc#dnc#<keyedDigest('hot_lead_call.dnc', orgId, phoneE164)>` in the limit store (`AW-MCPSessions`,
+   no raw number, TTL about 10 years). It is written for the number the call was approved for (the record's `leadPhoneMac`
+   must match the lead's current phone; if a repeat submission changed it, nothing is marked and an error is logged), so
+   the same person submitting again, as a new lead or on another list of the org, is not called.
+2. **The lead's contact status**: `do-not-contact`, reason `opted-out`, note "Pressed 3 on a hot-lead call", plus the legacy
+   `unsubscribedFromGroupEmail` flag, through `crmDb.updateLead` (the same fields the CRM bulk action and the Smartlead
+   opt-out use). A lead that is already blocked keeps its existing status and reason.
+
+The writes are independent: neither can stop the other or the goodbye, and the key press never connects. The marker claim is
+tried up to three times in-process (50 ms, then 150 ms apart) BEFORE the outcome is recorded. If all three fail, this is NOT
+fail-closed for future leads: the stop then rests on the contact status of THIS lead alone, so a new lead with the same number
+would be called. That case logs at error level the stable text `[hotLeadCall] do-not-call write failed <orgId>` (never a
+number; alert on it and add the marker by hand). The same error is logged when the org context is gone or the lead's phone is
+no longer the one approved (the signed call state holds no org id: the org comes from the list's owner). The digit cannot be
+reversed: a later 1 on the same screening finds the decision marker, writes nothing, and hears the goodbye again.
+
+Enforcement: the `do_not_call` skip gate (dispatch and job, see the gate order above) and a re-check in `/gather` just before
+the lead is dialled (`call.failed` reason `lead_do_not_call`, outcome `lead_do_not_call`, the member hears the unreachable
+apology). Both fail closed when the limit store cannot be read. They block only on the org marker or a lead status of exactly
+`do-not-contact` (set by a person, a sales rep, or a press of 3): a person who left a newsletter (`unsubscribed`, a bounce, the
+legacy group-email flag) and then submits a "call me" form IS called. Pressing 3 sets `do-not-contact` (an existing
+`unsubscribed` is upgraded; an existing `do-not-contact` keeps its reason) and, as the CRM's own do-not-contact action does, also
+the legacy `unsubscribedFromGroupEmail` flag, so the person also leaves group email.
+
+**Compliance warning: rotating `JWT_SECRET` silently empties the org do-not-call list.** The marker digest is keyed by
+`JWT_SECRET`, so after a rotation every `hlc#dnc#` entry is unreachable and a person who pressed 3 can be phoned again when
+they submit a new lead. Only the lead-level contact status survives, and only for the SAME lead. The rotation runbook must
+re-key (compute each old digest with the old secret and rewrite it under the new one) or the owner must accept the loss
+explicitly.
+
+**Removing an entry is an operator data write**: delete the item `sessionId = hlc#dnc#<digest>` from `AW-MCPSessions` (the
+digest needs `JWT_SECRET`, so compute it with `keyedDigest('hot_lead_call.dnc', orgId, phoneE164)` from a backend shell) and
+set the lead's contact status back to active in the CRM. Do this only on the person's own request. There is no API for it.
+
+## Lead-local hours
+
+Added in ENG-2783. Besides the org's `callingHours`, a lead is only called when its own local time is inside the lead
+window: `LEAD_CALL_START_MINUTES` (10:00) inclusive to `LEAD_CALL_END_MINUTES` (18:00) exclusive, every day of the week.
+Both constants live in `services/voice/leadLocalHours.ts` (`isInsideLeadCallWindow`) and are the only place the window is
+set. It is used by the `outside_lead_hours` skip gate (dispatch and job pass, stateless) and re-checked in `/gather` just
+before the lead is dialled.
+
+The window is a **business decision, stricter than the law**: the legal outer bound (08:00-21:00 lead-local) is
+deliberately not used.
+
+There is no area-code timezone table. The lead's zone is unknown, so the window must hold in every zone it could be in:
+
+- Every US number: inside the window in BOTH `America/New_York` and `America/Los_Angeles`. Eastern is the furthest ahead
+  and Pacific the furthest behind of the contiguous US zones, so the window holds in all of them only when it holds in
+  both; Central and Mountain are covered by the intersection, and so is any area code whose zone we do not know. With 10:00-18:00 the effective window is **13:00-18:00 Eastern** (10:00-15:00
+  Pacific). Zones use IANA names, so DST is correct.
+- Area codes 808 (Hawaii, `Pacific/Honolulu`; `America/Honolulu` is not an IANA zone and throws in Intl) and 907 (Alaska,
+  `America/Anchorage`) must satisfy the rule above AND their home zone, because a mobile number can be anywhere. That is a
+  deliberately narrow band: Hawaii 16:00-18:00 Eastern in summer (15:00-18:00 in winter), Alaska 14:00-18:00 Eastern.
+- Non-US numbers (Canada, +1 territories) return false. Canada is also refused earlier, see the compliance text above.
+
+Accepted limits: a mobile number can be in a different zone than its area code (the rule is conservative for any
+contiguous-US location, but not for a lead who travelled to Hawaii or Alaska on a non-808/907 number); state laws with
+stricter hours are not modelled (unverified).

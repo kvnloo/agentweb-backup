@@ -4179,11 +4179,6 @@
       "count": 6
     }
   },
-  "src/__tests__/growthGeniusService.usage.test.ts": {
-    "@typescript-eslint/no-explicit-any": {
-      "count": 1
-    }
-  },
   "src/__tests__/gtmPlan.commonItems.test.ts": {
     "@typescript-eslint/no-explicit-any": {
       "count": 4
@@ -8105,20 +8100,6 @@
       "count": 1
     }
   },
-  "src/controllers/growthGeniusController.ts": {
-    "@typescript-eslint/no-explicit-any": {
-      "count": 3
-    },
-    "@typescript-eslint/no-require-imports": {
-      "count": 5
-    },
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    },
-    "prefer-const": {
-      "count": 1
-    }
-  },
   "src/controllers/htmlTemplatesController.ts": {
     "@typescript-eslint/no-explicit-any": {
       "count": 3
@@ -10693,17 +10674,6 @@
       "count": 1
     },
     "@typescript-eslint/no-unused-vars": {
-      "count": 2
-    }
-  },
-  "src/services/growthGeniusService.ts": {
-    "@typescript-eslint/no-explicit-any": {
-      "count": 4
-    },
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    },
-    "prefer-const": {
       "count": 2
     }
   },

@@ -9,7 +9,6 @@
 
 // --- Mocks BEFORE any imports ---------------------------------------------
 
-jest.mock('../../services/notionService', () => ({ createOncallItem: jest.fn() }));
 jest.mock('../../services/resendService', () => ({
   resendService: { sendEmail: jest.fn().mockResolvedValue(undefined) },
 }));

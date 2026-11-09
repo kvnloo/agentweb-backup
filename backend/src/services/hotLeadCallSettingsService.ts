@@ -7,7 +7,7 @@ import { isLeadTypes } from './leadNotificationConfig';
 import { isRecord } from './leadNotificationAttribution';
 import {
   allowlistedE164, announcedNameOf, generateMemberId, hhmmToMinutes, hotLeadCallConfigOf, maskPhone, memberNameOf, normalizeTimezone,
-  checkWindow, isHhmm, HOT_LEAD_CALL_COUNTRIES, HOT_LEAD_CALL_LIMITS, HOT_LEAD_CALL_LIMIT_FIELDS, HOT_LEAD_CALL_MAX_TEAM_SIZE,
+  checkWindow, isHhmm, HOT_LEAD_CALL_CA_ENABLED, HOT_LEAD_CALL_COUNTRIES, HOT_LEAD_CALL_LIMITS, HOT_LEAD_CALL_OWNER_MAX_CALLS_PER_MONTH, HOT_LEAD_CALL_LIMIT_FIELDS, HOT_LEAD_CALL_MAX_TEAM_SIZE,
   HOT_LEAD_CALL_MAX_WINDOWS_PER_MEMBER, HOT_LEAD_CALL_MEMBER_NAME_MAX, HOT_LEAD_CALL_ANNOUNCED_NAME_MAX, HOT_LEAD_CALL_SYSTEM_FIELDS,
   type HotLeadCallConfig, type HotLeadCallMember,
 } from './hotLeadCallConfig';
@@ -22,6 +22,7 @@ import {
   confirmVerification, startVerification, verificationAfterTeamEdit, verificationStateOf, VERIFICATION_MAX_ATTEMPTS,
 } from './voice/memberVerification';
 import { isWithinCallWindow } from './voice/hotLeadCallLimits';
+import { callingHoursReachLeadWindow, isLeadWindowOpenNow } from './voice/leadLocalHours';
 
 /**
  * The one implementation of "read and change a business's hot-lead-call settings", shared by the REST routes
@@ -47,6 +48,10 @@ export interface HotLeadCallSettingsDto {
   blockers: string[];
   callingHours: { start: string; end: string; timezone: string } | null;
   maxAttemptsPerLead: number;
+  /** Automatic calls allowed per calendar month; a value above the owner maximum is shown as stored (an operator set it). */
+  maxCallsPerMonth: number;
+  /** Plain-language notes that do not block enabling, e.g. a stored country that is not called yet. */
+  warnings: string[];
   announcedName: string;
   twilioNumberMasked: string | null;
   team: Array<{ id: string; name: string; phoneMasked: string; verified: boolean; windows: Array<{ days: number[]; start: string; end: string }> }>;
@@ -57,12 +62,17 @@ interface HotLeadCallPreviewDto {
   at: string;
   timezone: string | null;
   outsideCallingHours: boolean;
+  /** True when the lead's own window (10:00-18:00 local, judged for an ordinary US number) is closed at `at`. */
+  outsideLeadHours: boolean;
+  /** The first gate that would stop a call at `at`, named like the lead timeline's skip reason; null when neither hours gate does. */
+  skipReason: 'outside_calling_hours' | 'outside_lead_hours' | null;
+  warnings: string[];
   candidates: Array<{ id: string; name: string }>;
   excluded: Array<{ id: string; name: string; reason: 'unverified' | 'outside_window' }>;
 }
 
 /** Keys the REST body may carry. */
-export const REST_SETTINGS_KEYS = ['_revision', 'enabled', 'callingHours', 'maxAttemptsPerLead', 'announcedName', 'team'] as const;
+export const REST_SETTINGS_KEYS = ['_revision', 'enabled', 'callingHours', 'maxAttemptsPerLead', 'maxCallsPerMonth', 'announcedName', 'team'] as const;
 /** Further scalar settings that only the Emma tool edits (the portal has no control for them). */
 const TOOL_ONLY_SETTINGS_KEYS = ['leadTypes', 'maxAgeMinutes', 'maxCallsPerHour', 'maxCallsPerDay', 'memberCooldownMinutes', 'allowedCountries'] as const;
 // Keys applied by their own logic rather than copied over the stored config.
@@ -74,10 +84,36 @@ export const BLOCKER_NO_VERIFIED_PERSON = 'Add at least one person and verify th
 export const BLOCKER_UNVERIFIED = 'Verify the phone of at least one person';
 export const BLOCKER_NO_HOURS = 'Set calling hours';
 export const BLOCKER_NO_NUMBER = 'A phone number for calls has not been set up yet (ask Emma)';
+export const BLOCKER_NO_CALLABLE_COUNTRY = 'None of the allowed countries can be called yet (Canadian numbers are not called yet); allow the United States';
+export const BLOCKER_NO_LEAD_OVERLAP = 'Calling hours must include some time between about 13:00 and 18:00 Eastern, the hours when leads can be called; as set, no lead could ever be called';
+export const WARNING_CANADA_NOT_CALLED = 'Canadian numbers are not called yet; leads with a Canadian number are skipped even though Canada is allowed here';
+export const OWNER_MONTHLY_LIMIT_REFUSAL = 'Higher monthly limits are set by AgentWeb support';
+
+/** The stored countries that can be dialled today: Canada is refused in code while HOT_LEAD_CALL_CA_ENABLED is false. */
+const callableCountries = (config: Pick<HotLeadCallConfig, 'allowedCountries'>): string[] =>
+  config.allowedCountries.filter(c => c !== 'CA' || HOT_LEAD_CALL_CA_ENABLED);
+
+function warningsOf(config: HotLeadCallConfig | undefined): string[] {
+  return config && !HOT_LEAD_CALL_CA_ENABLED && config.allowedCountries.includes('CA') ? [WARNING_CANADA_NOT_CALLED] : [];
+}
+
+/**
+ * Reasons a config that is otherwise complete could never place a call. Shown in the read-out for every org (an enabled org
+ * that is silently skipping every lead must see why) but only an explicit turn-on is refused for them: a benign edit of an
+ * already-enabled org is not turned off by them.
+ */
+function effectiveBlockersOf(config: HotLeadCallConfig | undefined): string[] {
+  if (!config) return [];
+  const blockers: string[] = [];
+  if (callableCountries(config).length === 0) blockers.push(BLOCKER_NO_CALLABLE_COUNTRY);
+  if (config.callingHours && !callingHoursReachLeadWindow(config.callingHours)) blockers.push(BLOCKER_NO_LEAD_OVERLAP);
+  return blockers;
+}
 
 // ---- revision ------------------------------------------------------------------------------------------------
 
-function canonicalJson(value: unknown): string {
+/** Key-order independent JSON: equal values give equal text. */
+export function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
   if (isRecord(value)) {
     const keys = Object.keys(value).filter(k => value[k] !== undefined).sort();
@@ -123,7 +159,7 @@ function blockersOf(config: HotLeadCallConfig | undefined, entitled: boolean): s
 }
 
 function toDto(org: Pick<Organization, 'hotLeadCall'>, config: HotLeadCallConfig | undefined, entitled: boolean): HotLeadCallSettingsDto {
-  const blockers = blockersOf(config, entitled);
+  const blockers = [...blockersOf(config, entitled), ...effectiveBlockersOf(config)];
   return {
     _revision: hotLeadCallRevisionOf(org.hotLeadCall),
     entitled,
@@ -132,6 +168,8 @@ function toDto(org: Pick<Organization, 'hotLeadCall'>, config: HotLeadCallConfig
     blockers,
     callingHours: config?.callingHours ? { ...config.callingHours } : null,
     maxAttemptsPerLead: config?.maxAttemptsPerLead ?? HOT_LEAD_CALL_LIMITS.maxAttemptsPerLead.default,
+    maxCallsPerMonth: config?.maxCallsPerMonth ?? HOT_LEAD_CALL_LIMITS.maxCallsPerMonth.default,
+    warnings: warningsOf(config),
     announcedName: config?.announcedName ?? '',
     twilioNumberMasked: config?.twilioNumber ? maskPhone(config.twilioNumber) : null,
     team: (config?.team ?? []).map(m => ({
@@ -156,13 +194,20 @@ export async function getHotLeadCallSettings(org: Organization, caller: HotLeadC
 export async function previewHotLeadCallSettings(org: Organization, caller: HotLeadCallCaller, at: Date): Promise<HotLeadCallPreviewDto> {
   requireConfigure(org, caller);
   const config = storedHotLeadCallConfig(org);
-  if (!config) return { at: at.toISOString(), timezone: null, outsideCallingHours: true, candidates: [], excluded: [] };
+  const outsideLeadHours = !isLeadWindowOpenNow(at);
+  if (!config) {
+    return { at: at.toISOString(), timezone: null, outsideCallingHours: true, outsideLeadHours, skipReason: 'outside_calling_hours', warnings: [], candidates: [], excluded: [] };
+  }
   const entries = previewHotLeadCallCandidates(config, at);
+  // With no calling hours nobody is rung, so the portal is told the same as for a closed business.
+  const outsideCallingHours = !isWithinCallWindow(config.callingHours, at);
   return {
     at: at.toISOString(),
     timezone: config.callingHours?.timezone ?? null,
-    // With no calling hours nobody is rung, so the portal is told the same as for a closed business.
-    outsideCallingHours: !isWithinCallWindow(config.callingHours, at),
+    outsideCallingHours,
+    outsideLeadHours,
+    skipReason: outsideCallingHours ? 'outside_calling_hours' : outsideLeadHours ? 'outside_lead_hours' : null,
+    warnings: warningsOf(config),
     candidates: entries.filter(e => !e.reason).map(e => ({ id: e.member.id, name: e.member.name })),
     excluded: entries.filter(e => e.reason).map(e => ({
       id: e.member.id, name: e.member.name, reason: e.reason === 'unverified' ? 'unverified' : 'outside_window',
@@ -321,6 +366,8 @@ function scalarProblems(body: Record<string, unknown>, errors: Errors): void {
   for (const field of HOT_LEAD_CALL_LIMIT_FIELDS) {
     const value = body[field];
     const { min, max } = HOT_LEAD_CALL_LIMITS[field];
+    // An operator may store up to the table maximum; the owner routes stop at the default (see the check in applyHotLeadCallSettings).
+    if (field === 'maxCallsPerMonth' && typeof value === 'number' && Number.isInteger(value) && value > HOT_LEAD_CALL_OWNER_MAX_CALLS_PER_MONTH && value <= max) continue;
     if (value !== undefined && !(typeof value === 'number' && Number.isInteger(value) && value >= min && value <= max)) {
       errors[field] = `${field} must be a whole number from ${min} to ${max}`;
     }
@@ -350,7 +397,7 @@ const teamKey = (team: readonly HotLeadCallMember[]) => JSON.stringify(team.map(
 function escalationOf(current: HotLeadCallConfig | undefined, next: HotLeadCallConfig): string | null {
   if (!current) return 'setting up hot lead calls';
   if (next.enabled && !current.enabled) return 'turning hot lead calls on';
-  const raised = (['maxAgeMinutes', 'maxCallsPerHour', 'maxCallsPerDay', 'maxAttemptsPerLead'] as const).find(f => next[f] > current[f]);
+  const raised = (['maxAgeMinutes', 'maxCallsPerHour', 'maxCallsPerDay', 'maxCallsPerMonth', 'maxAttemptsPerLead'] as const).find(f => next[f] > current[f]);
   if (raised) return `raising ${raised}`;
   if (next.memberCooldownMinutes < current.memberCooldownMinutes) return 'shortening the pause between calls to one person';
   if (next.leadTypes.some(t => !current.leadTypes.includes(t)) || next.allowedCountries.some(c => !current.allowedCountries.includes(c))) {
@@ -385,8 +432,14 @@ const summary = (errors: Errors) => `Some settings are not valid: ${Object.entri
  * phone left out keeps the stored one. A changed phone drops that person's verification and any code in
  * flight. Everything not sent keeps its stored value. The body must carry the revision of the copy it edited
  * (_revision); the write is also conditional on the stored value, so two racing saves cannot both land.
+ *
+ * `beforeTurningOn` is for a caller whose request is not a person's click (the Emma tool): it runs after every
+ * check above has passed, only for a change that turns calling on, and anything it throws stops the write.
+ * The REST route has no such hook, because its caller is the person clicking.
  */
-export async function applyHotLeadCallSettings(org: Organization, caller: HotLeadCallCaller, body: Record<string, unknown>): Promise<{ dto: HotLeadCallSettingsDto; config: HotLeadCallConfig }> {
+export async function applyHotLeadCallSettings(
+  org: Organization, caller: HotLeadCallCaller, body: Record<string, unknown>, beforeTurningOn?: (next: HotLeadCallConfig) => Promise<void>,
+): Promise<{ dto: HotLeadCallSettingsDto; config: HotLeadCallConfig }> {
   requireConfigure(org, caller);
   checkKeys(body);
   if (body._revision === undefined) throw new RevisionRequiredError();
@@ -403,6 +456,11 @@ export async function applyHotLeadCallSettings(org: Organization, caller: HotLea
   if (!current) {
     if (body.team === undefined) errors.team = 'Add at least one person';
     if (body.announcedName === undefined) errors.announcedName = 'Enter the business name callers will hear';
+  }
+  // A value above the owner maximum is refused unless it is the very value already stored (a round trip of the read-out).
+  const month = body.maxCallsPerMonth;
+  if (typeof month === 'number' && month > HOT_LEAD_CALL_OWNER_MAX_CALLS_PER_MONTH && month !== current?.maxCallsPerMonth) {
+    errors.maxCallsPerMonth = OWNER_MONTHLY_LIMIT_REFUSAL;
   }
   if (Object.keys(errors).length || !team) throw new ValidationError(summary(errors), errors);
 
@@ -421,10 +479,15 @@ export async function applyHotLeadCallSettings(org: Organization, caller: HotLea
   const draft = hotLeadCallConfigOf(candidate);
   if (!draft) throw new ValidationError('These settings are not valid');
   const blockers = blockersOf(draft, true);
-  if (wantsEnabled && blockers.length) {
+  // Turning on is also refused when the settings could never place a call (no callable country, hours that never meet the
+  // lead window); an org that is already on keeps its setting through an unrelated edit and sees the problem in the read-out.
+  const turningOn = wantsEnabled && !current?.enabled;
+  const effectiveBlockers = turningOn ? effectiveBlockersOf(draft) : [];
+  const allBlockers = [...blockers, ...effectiveBlockers];
+  if (wantsEnabled && allBlockers.length) {
     // An explicit "turn on" that cannot work is an error; an edit that merely made a running setup incomplete
     // (the only verified phone changed or was removed) turns calling off instead of leaving it on and broken.
-    if (body.enabled === true) throw new ValidationError(`Calling cannot be turned on yet: ${blockers[0]}`, { enabled: blockers.join('. ') });
+    if (body.enabled === true) throw new ValidationError(`Calling cannot be turned on yet: ${allBlockers[0]}`, { enabled: allBlockers.join('. ') });
   }
   const next = hotLeadCallConfigOf({ ...candidate, enabled: wantsEnabled && blockers.length === 0 });
   if (!next) throw new ValidationError('These settings are not valid');
@@ -433,6 +496,7 @@ export async function applyHotLeadCallSettings(org: Organization, caller: HotLea
     const reason = escalationOf(current, next);
     if (reason) throw new UnattendedRunError(`This needs a person to confirm in an interactive chat (${reason})`);
   }
+  if (next.enabled && !current?.enabled) await beforeTurningOn?.(next);
 
   const verification = verificationAfterTeamEdit(org.hotLeadCallVerification, next.team);
   try {

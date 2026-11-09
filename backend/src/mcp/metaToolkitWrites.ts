@@ -26,7 +26,6 @@
  * be new persistence — data-plane gate); a cross-instance replay inside the TTL could at
  * worst repeat an identical PAUSED create or an idempotent status/budget update.
  */
-import crypto from 'crypto';
 import { getJwtSecret } from '../config/jwt';
 import { getAccountsByUserIdIncludingOrgShared, type ConnectedAccount } from '../services/connectedAccountsDb';
 import { isMetaAdAccount } from '../services/metaTokenRefresh';
@@ -34,9 +33,13 @@ import { evaluateMetaSpendCeiling, type MetaSpendCeilingPolicy } from '../servic
 import { MetaToolkitRefusal } from './metaToolkitErrors';
 import { GUARDED_WRITE_ACTIONS, GUARDED_WRITE_ENTITIES, isGuardedWriteRequest } from './metaToolkitWriteSurface';
 import { adsManagementScopeState, assertZomaWriteReady, ZomaNotReadyError } from './zomaOnboarding';
+import {
+  consumePreviewToken, previewFingerprint, previewResponse, previewTokenMatches,
+  PREVIEW_TOKEN_TTL_MS, type WriteVerification,
+} from './zomaWriteGuard';
 
-export { GUARDED_WRITE_ENTITIES, GUARDED_WRITE_ACTIONS, isGuardedWriteRequest };
-export const PREVIEW_TOKEN_TTL_MS = 15 * 60 * 1000;
+export { GUARDED_WRITE_ENTITIES, GUARDED_WRITE_ACTIONS, isGuardedWriteRequest, PREVIEW_TOKEN_TTL_MS };
+export type { WriteVerification };
 
 const UPDATE_FIELDS: Record<string, string[]> = {
   CAMPAIGN: ['status', 'daily_budget', 'lifetime_budget', 'budget_amount'],
@@ -47,8 +50,6 @@ const MONEY_FIELDS = ['budget_amount', 'daily_budget', 'lifetime_budget', 'bid_a
 const CEILING_FIELDS = ['daily_budget', 'lifetime_budget', 'spend_cap', 'bid_amount'] as const;
 // Gate-only flags of the internal path; an external caller never supplies these.
 const FORBIDDEN_PARAMS = ['confirm', 'override_tracking_check', 'tracking_override_token', 'budget_confirmation_token'];
-
-export type WriteVerification = 'CONFIRMED' | 'MISMATCH' | 'UNCONFIRMED';
 
 export interface MetaToolkitWriteDeps {
   assertReady: (userId: string) => Promise<void>;
@@ -98,33 +99,6 @@ const defaultDeps: MetaToolkitWriteDeps = {
   now: () => Date.now(),
   consumedTokens: new Map(),
 };
-
-function stable(value: any): string {
-  if (Array.isArray(value)) return `[${value.map(stable).join(',')}]`;
-  if (value && typeof value === 'object') {
-    return `{${Object.keys(value).sort().filter((k) => value[k] !== undefined).map((k) => `${JSON.stringify(k)}:${stable(value[k])}`).join(',')}}`;
-  }
-  return JSON.stringify(value ?? null);
-}
-
-function sign(secret: string, userId: string, exp: number, fingerprint: string): string {
-  const mac = crypto.createHmac('sha256', secret).update(`zoma-preview:v1:${userId}:${exp}:${fingerprint}`).digest('base64url');
-  return `v1.${exp}.${mac}`;
-}
-
-function tokenMatches(token: unknown, secret: string, userId: string, fingerprint: string, now: number): boolean {
-  if (typeof token !== 'string') return false;
-  const [version, expRaw] = token.split('.');
-  const exp = Number(expRaw);
-  if (version !== 'v1' || !Number.isSafeInteger(exp) || exp <= now) return false;
-  const expected = Buffer.from(sign(secret, userId, exp, fingerprint));
-  const given = Buffer.from(token);
-  return expected.length === given.length && crypto.timingSafeEqual(expected, given);
-}
-
-function pruneConsumed(consumed: Map<string, number>, now: number) {
-  for (const [token, exp] of consumed) if (exp <= now) consumed.delete(token);
-}
 
 function targetId(entity: string, args: any): string | undefined {
   return entity === 'CAMPAIGN' ? args.campaign_id : entity === 'AD_SET' ? args.ad_set_id : args.ad_id;
@@ -223,6 +197,20 @@ export async function executeMetaToolkitWrite(userId: string, rawArgs: any, deps
   }
 
   const policy = deps.spendCeilingPolicy();
+  let enableBudgetState: Record<string, any> | undefined;
+  if (entity === 'AD_SET' && action === 'UPDATE' && params.status === 'ACTIVE' && policy) {
+    const adSet = await deps.readBack(userId, accountId, entity, targetId(entity, args)!).catch(() => null);
+    // Campaign-budgeted ad sets have no positive daily budget of their own. Resolve
+    // their parent from provider state, never from a caller-supplied campaign_id.
+    const budget = adSet?.daily_budget != null && Number(adSet.daily_budget) !== 0
+      ? adSet
+      : adSet?.campaign_id
+        ? await deps.readBack(userId, accountId, 'CAMPAIGN', String(adSet.campaign_id)).catch(() => null)
+        : null;
+    enableBudgetState = { adSet, budget };
+    const verdict = evaluateMetaSpendCeiling(policy, { field: 'daily_budget', proposed: budget?.daily_budget });
+    if (!verdict.allowed) throw new MetaToolkitRefusal(`Enabling this ad set would start spend at its budget. ${verdict.message}`);
+  }
   if (policy) {
     const id = targetId(entity, args);
     const prior = action === 'UPDATE' && id ? await deps.readBack(userId, accountId, entity, id).catch(() => null) : null;
@@ -242,11 +230,12 @@ export async function executeMetaToolkitWrite(userId: string, rawArgs: any, deps
     throw new MetaToolkitRefusal(`Not prepared, nothing was sent to Meta: ${errorText(preview)}`);
   }
 
-  const fingerprint = crypto.createHash('sha256').update(stable({
+  const fingerprint = previewFingerprint({
     userId, entity, action, accountId,
     campaign_id: args.campaign_id, ad_set_id: args.ad_set_id, ad_id: args.ad_id, params,
     summary: preview.summary, budgetAnomaly: preview.budgetAnomaly ?? null, money: money.confirmation,
-  })).digest('hex');
+    ...(enableBudgetState ? { enableBudgetState } : {}),
+  });
   const now = deps.now();
   const secret = deps.secret();
   const previewText = [
@@ -256,32 +245,20 @@ export async function executeMetaToolkitWrite(userId: string, rawArgs: any, deps
     money.confirmation ? `Money${money.confirmation}` : '',
     statusLine(action, params),
   ].filter(Boolean).join('\n');
-  const freshPreview = () => {
-    const exp = now + PREVIEW_TOKEN_TTL_MS;
-    return {
-      status: 'PREVIEW',
-      success: false,
-      preview: previewText,
-      preview_token: sign(secret, userId, exp, fingerprint),
-      expires_at: new Date(exp).toISOString(),
-      next_step: 'Show this preview to the user. Only after they explicitly approve it, repeat this exact call with confirm=true and this preview_token (single use, 15 minutes).',
-    };
-  };
+  const freshPreview = () => previewResponse({ secret, userId, now, fingerprint, preview: previewText });
 
   if (confirm !== true) return freshPreview();
 
-  pruneConsumed(deps.consumedTokens, now);
-  if (!tokenMatches(previewToken, secret, userId, fingerprint, now)) {
+  if (!previewTokenMatches(previewToken, secret, userId, fingerprint, now)) {
     return {
       ...freshPreview(),
       status: 'PREVIEW_MISMATCH',
       note: 'The confirmation did not match a current preview (missing, expired, or the arguments or Meta state changed). Nothing was sent. Show this new preview and get approval again.',
     };
   }
-  if (deps.consumedTokens.has(previewToken)) {
+  if (!consumePreviewToken(deps.consumedTokens, previewToken, now)) {
     throw new MetaToolkitRefusal('This preview_token was already used. Run a new preview for another change.');
   }
-  deps.consumedTokens.set(previewToken, Number(String(previewToken).split('.')[1]));
 
   const { result, createdId } = await deps.dispatch(userId, preview.metaWriteDispatch);
   if (result?.coalesced) {

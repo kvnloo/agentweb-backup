@@ -114,6 +114,97 @@ describe('formatLeadNotificationPayload', () => {
   });
 });
 
+describe('formatLeadNotificationPayload — a headline sentence (Smartlead reply)', () => {
+  const lead: LeadNotificationPayload = {
+    firstName: 'Jane', lastName: 'Doe', email: 'jane@example.com', company: 'Acme Corp', listName: 'Inbound Leads', listId: 'list_123',
+    crmUrl: 'https://app.example.com/crm?listId=list_123', timestamp: '2026-03-16T12:00:00.000Z', eventType: 'email.received',
+  };
+
+  it('puts the sentence in the header and the fallback, and keeps the fields, the time and the button', () => {
+    const withLine = formatLeadNotificationPayload({ ...lead, headline: 'A new lead "Jane Doe" replied to your campaign' });
+    const without = formatLeadNotificationPayload(lead);
+    expect(withLine.blocks[0].text.text).toBe('A new lead "Jane Doe" replied to your campaign');
+    expect(withLine.text).toBe('A new lead "Jane Doe" replied to your campaign. List: Inbound Leads');
+    expect(JSON.stringify(withLine.text + withLine.blocks)).not.toContain('email.received');
+    expect(withLine.blocks.slice(1)).toEqual(without.blocks.slice(1));
+  });
+
+  it('escapes the fallback text for Slack, so a contact\'s name can not make a link or a mention', () => {
+    const r = formatLeadNotificationPayload({ ...lead, headline: 'A new lead "<!channel> & <https://x.example|Click>" replied to your campaign' });
+    expect(r.text).toContain('&lt;!channel&gt; &amp; &lt;https://x.example|Click&gt;');
+    expect(r.text).not.toContain('<');
+  });
+
+  it('escapes the values it shows when a headline is set, and leaves them alone when it is not', () => {
+    const hostile: LeadNotificationPayload = { ...lead, firstName: '<!channel> & <https://x.example|Click>', lastName: '', email: 'a<b>@example.com', company: 'Acme <!here>', phone: '<tel>', listName: 'List <!channel>' };
+    const withLine = formatLeadNotificationPayload({ ...hostile, headline: 'A new lead replied to your campaign' });
+    const fieldText = withLine.blocks[1].fields.map((f: { text: string }) => f.text).join('\n');
+    expect(fieldText).toContain('&lt;!channel&gt; &amp; &lt;https://x.example|Click&gt;');
+    expect(fieldText).toContain('a&lt;b&gt;@example.com');
+    expect(fieldText).toContain('Acme &lt;!here&gt;');
+    expect(fieldText).toContain('List &lt;!channel&gt;');
+    expect(fieldText).not.toMatch(/<(?!https:\/\/linkedin)/);
+    const plain = formatLeadNotificationPayload(hostile);
+    expect(plain.blocks[1].fields.map((f: { text: string }) => f.text).join('\n')).toContain('<!channel> & <https://x.example|Click>');
+  });
+
+  it('keeps a hostile LinkedIn value to one link and survives non-string values, when a headline is set', () => {
+    const hostile = formatLeadNotificationPayload({
+      ...lead, headline: 'A new lead replied to your campaign', linkedin: 'https://linkedin.com/in/x|y><!channel><https://evil.example|click',
+      phone: 5551234 as unknown as string, company: 42 as unknown as string,
+    });
+    const text = hostile.blocks[1].fields.map((f: { text: string }) => f.text).join('\n');
+    const linkedin = hostile.blocks[1].fields.find((f: { text: string }) => f.text.startsWith('*LinkedIn:*')).text;
+    expect(linkedin).toBe('*LinkedIn:*\n<https://linkedin.com/in/x%7Cy&gt;&lt;!channel&gt;&lt;https://evil.example%7Cclick|Profile>');
+    expect((linkedin.match(/\|/g) || []).length).toBe(1);
+    expect(linkedin).not.toContain('<!channel>');
+    expect(text).toContain('5551234');
+    expect(text).toContain('42');
+    // without a headline the link is exactly what it was
+    const plain = formatLeadNotificationPayload({ ...lead, linkedin: 'https://linkedin.com/in/janedoe' });
+    expect(plain.blocks[1].fields.find((f: { text: string }) => f.text.startsWith('*LinkedIn:*')).text).toBe('*LinkedIn:*\n<https://linkedin.com/in/janedoe|Profile>');
+  });
+
+  it('shows a LinkedIn value that is not an http(s) address as plain text, never inside <...> where Slack reads !channel, @user and #channel as special links', () => {
+    for (const value of ['!channel', '!here', '@U012ABCDEF', '#C012ABCDEF', '!subteam^S0123', 'javascript:alert(1)', 'ftp://x.example', '<!channel>']) {
+      const r = formatLeadNotificationPayload({ ...lead, headline: 'A new lead replied to your campaign', linkedin: value });
+      const text = r.blocks[1].fields.find((f: { text: string }) => f.text.startsWith('*LinkedIn:*')).text;
+      expect(text).not.toContain('<');
+      expect(text).not.toContain('|Profile');
+    }
+    // an http(s) address is still a link, in any letter case
+    const ok = formatLeadNotificationPayload({ ...lead, headline: 'h', linkedin: 'HTTPS://linkedin.com/in/jane' });
+    expect(ok.blocks[1].fields.find((f: { text: string }) => f.text.startsWith('*LinkedIn:*')).text).toBe('*LinkedIn:*\n<HTTPS://linkedin.com/in/jane|Profile>');
+  });
+
+  it('keeps spaces, tabs, new lines and line separators in a LinkedIn link target from ending or splitting the link', () => {
+    const r = formatLeadNotificationPayload({ ...lead, headline: 'h', linkedin: 'https://linkedin.com/in/a b\tc\nd\u2028e' });
+    const text = r.blocks[1].fields.find((f: { text: string }) => f.text.startsWith('*LinkedIn:*')).text;
+    const link = text.slice(text.indexOf('<'));
+    expect(link).toBe('<https://linkedin.com/in/a%20b%09c%0Ad%E2%80%A8e|Profile>');
+    expect(/\s/.test(link)).toBe(false);
+  });
+
+  it('does not throw when the list name is not a string', () => {
+    expect(() => formatLeadNotificationPayload({ ...lead, headline: 'h', listName: 5 as unknown as string })).not.toThrow();
+    expect(() => formatLeadNotificationPayload({ ...lead, headline: 'h', listName: undefined as unknown as string })).not.toThrow();
+  });
+
+  it('leaves every alert without a headline exactly as it was (the raw event name and the old fallback)', () => {
+    const r = formatLeadNotificationPayload(lead);
+    expect(r.blocks[0].text.text).toBe('email.received');
+    expect(r.text).toBe('email.received: Jane Doe (jane@example.com) — Inbound Leads');
+    const none = formatLeadNotificationPayload({ ...lead, eventType: undefined });
+    expect(none.blocks[0].text.text).toBe('New lead added');
+  });
+
+  it('does not touch the compact format, which never showed an event name', () => {
+    const a = formatLeadNotificationPayload({ ...lead, compact: true });
+    const b = formatLeadNotificationPayload({ ...lead, compact: true, headline: 'A new lead "Jane Doe" replied to your campaign' });
+    expect(b).toEqual(a);
+  });
+});
+
 describe('sendLeadNotification', () => {
   beforeEach(() => {
     mockPostMessage.mockReset();

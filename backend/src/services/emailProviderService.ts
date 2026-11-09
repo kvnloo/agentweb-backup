@@ -25,10 +25,17 @@ export interface EmailSummary {
    */
   receivedAt?: string;
   snippet: string;
+  /**
+   * Recipient headers, when the provider includes them in the summary.
+   * Optional: absent means "unknown", not "empty" (ENG-944).
+   */
+  to?: string;
+  cc?: string;
 }
 
 export interface EmailDetail extends EmailSummary {
   to: string;
+  cc?: string;
   body: string;
   hasAttachments: boolean;
 }

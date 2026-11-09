@@ -2100,13 +2100,28 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
     let ownerUserId: string | undefined;
     try {
       let isSensitive = false;
+      // ENG-2785: owner admin status scopes classification — the Meta Ads tools
+      // only read cross-account data for admin callers. undefined = unknown →
+      // full (safe) classification.
+      let ownerIsAdmin: boolean | undefined;
+      let ownerResolved = false;
+      const resolveOwner = async () => {
+        if (ownerResolved || !ownerUserId) return;
+        ownerResolved = true;
+        try {
+          const owner: any = await userDb.getUserById(ownerUserId);
+          ownerEmail = owner?.email;
+          if (typeof owner?.isAdmin === 'boolean') ownerIsAdmin = owner.isAdmin; // legacy records without isAdmin stay unknown → full classification
+        } catch { /* owner unknown → full classification; resolver restricts to verified admins */ }
+      };
       for (const sessionId of sessionIds) {
         let sessionSensitive = true;
         try {
           const session: any = await chatbotDb.getChatSession(sessionId);
           if (session) {
             ownerUserId = ownerUserId || session.userId;
-            if (!reportContainsCrossAccountData(session.calledFunctions)) {
+            await resolveOwner();
+            if (!reportContainsCrossAccountData(session.calledFunctions, { ownerIsAdmin })) {
               // calledFunctions is a best-effort counter (its write errors are
               // swallowed at the call site), so a successful cross-account tool
               // call can be missing from it. Confirm against the authoritative
@@ -2114,7 +2129,7 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
               // send fires immediately after the run wrote these messages, so an
               // eventually-consistent read could miss a just-written call.
               const messages = await chatbotDb.getMessagesFromMessagesTable(sessionId, true);
-              sessionSensitive = messagesReferenceCrossAccountTool(messages as any);
+              sessionSensitive = messagesReferenceCrossAccountTool(messages as any, { ownerIsAdmin });
             }
           }
           // session falsy → cannot verify → sessionSensitive stays true (closed).
@@ -2126,10 +2141,7 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       }
       // Resolve the owner up front — used both to authorize the owner and to
       // notify them if delivery ends up blocked.
-      try {
-        const owner = ownerUserId ? await userDb.getUserById(ownerUserId) : undefined;
-        ownerEmail = (owner as any)?.email;
-      } catch { /* owner unknown → resolver still restricts to verified admins */ }
+      await resolveOwner();
       const authz = await resolveAuthorizedReportRecipients({ recipients, ownerEmail, isSensitive });
       if (authz.withheld.length > 0) {
         console.warn(`Scheduled report guard: withheld ${authz.withheld.length} unauthorized recipient(s) for session(s) ${sessionIds.join(', ')}: ${authz.withheld.join(', ')}`);
@@ -2965,6 +2977,14 @@ View Session: ${sessionUrl}`;
         } catch (fileError) {
           console.error('Failed to file oncall item, falling back to full email:', fileError);
         }
+      }
+
+      // The tracked issue is the canonical record. Founders asked (2026-11-07) to stop the
+      // redundant "Oncall Alert" emails (e.g. "Meta connection: … token expired"): they were
+      // noise, not actionable. Email only when filing failed, so nothing is silently lost.
+      if (resolvedTrackerUrl) {
+        console.log(`Oncall alert tracked, email skipped: ${resolvedTrackerUrl}`);
+        return;
       }
 
       let html: string;

@@ -9,6 +9,7 @@ import {
 import { isEvaluationUser, EvaluationDenied } from '../services/evaluationPolicy';
 import { Request, Response } from 'express';
 import { AuthenticatedRequest, getUserFromToken, isRealAdmin } from '../middleware/auth';
+import { isSessionOwnerRequest } from '../services/shareViewerIdentity';
 import { agentModeService, AgentModeService, normalizeWorkPlanTitleForMatch, ADMIN_SKILL_TOOL_NAMES, ADMIN_SKILL_VIRTUAL_ID } from '../services/agentModeService';
 import { filterMessagesForClient as filterMessagesForClientPure } from '../utils/adminOnlyMessageFilter';
 import {
@@ -61,7 +62,7 @@ import { CHAT_BRANCHING_ENABLED_SETTING, isChatBranchingSettingEnabled, healLega
 import { compareSaveAlternatives } from '../services/agentMode/compareSaveAlternativesInstance';
 import { LEGACY_MODEL_ALIASES } from '../services/agentMode/llmModelRegistry';
 import { resolveRunFunding } from '../services/funding/runFunding';
-import { isContextLimitError, isProviderNoEndpointsError, isSessionLimitError, isTransientLLMError, isProviderDeserializationError, PROVIDER_DESERIALIZATION_ERROR_CLASS, isWorkerShutdownError, isProviderUnavailableError } from '../utils/agentModeErrors';
+import { isContextLimitError, isProviderNoEndpointsError, isSessionLimitError, isTransientLLMError, isProviderDeserializationError, PROVIDER_DESERIALIZATION_ERROR_CLASS, isWorkerShutdownError, isDrainCeilingShutdownError, isProviderUnavailableError, isQuotaExhaustedError, QUOTA_EXHAUSTED_USER_MESSAGE } from '../utils/agentModeErrors';
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
@@ -90,6 +91,7 @@ import {
   isRunStoreEnabled,
   interactiveIdempotencyKey,
   createSessionIdempotencyKey,
+  planSessionIdempotencyKey,
   claimIdempotency,
   releaseIdempotency,
   recordIdempotencySessionId,
@@ -100,7 +102,8 @@ import {
 import { assertSequentialStepCounts } from '../services/workPlanSteps';
 import { validateModelPin, normalizeRequestedLlmModel, resolvePlanLaunchModel, canonicalPinId } from '../services/agentMode/modelPin';
 import { resolveTurnFunding, type PlanRoute } from '../services/funding/claudeFunding';
-import { ClaudeRouteStopError, claudeStopBody } from '../services/funding/claudeRouteErrors';
+import { ClaudeRouteStopError, claudeStopBody, turnRanNoTools } from '../services/funding/claudeRouteErrors';
+import { CONTINUE_MARKER_KIND, findResumableUserMessage, PLAN_STOP_NOTE_KIND, ResumeNotAvailableError } from '../services/funding/resumeSavedMessage';
 import type { claudeCodeBackend as ClaudeCodeBackendInstance } from '../services/funding/claudeCodeBackendInstance';
 import { workPlanStepModels } from '../services/agentMode/workPlanStepModelsInstance';
 import {
@@ -160,6 +163,11 @@ import {
 import { collectLeadImportTotals, describeLeadImportTotals } from '../utils/leadImportLedger';
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
 import { fileAutoIssue } from '../services/intakeService';
+import {
+  classifyOpenRouterQuotaExhaustion,
+  resolveQuotaDeferral,
+  OPENROUTER_QUOTA_ALERT_CLASS,
+} from '../utils/openRouterKeyLimit';
 import { skillService } from '../services/skillService';
 import { validateWelcomeMessage } from '../utils/welcomeMessageValidation';
 import { validateOpeningAction } from '../utils/openingActionValidation';
@@ -691,6 +699,26 @@ function markRaisedAfterUserMessageSaved(error: unknown): void {
   if (typeof error === 'object' && error !== null) errorsAfterUserMessageSaved.add(error);
 }
 
+/**
+ * ENG-2113: the body of a plan stop. `canUseAgentWebCredits` is the old "resend this request on AgentWeb credits" offer and is true only while NOTHING is saved
+ * (a resend of a saved message would store it twice). A saved message is offered through `agentWebOffer`: 'continue' (known to have run no tool: send
+ * `continueSavedMessage: true`) or 'new_message' (a tool may have run: only a NEW message, and an action may repeat); `null` = no offer. A client must act on
+ * `agentWebOffer`, never on `canUseAgentWebCredits` alone.
+ */
+function planStopResponse(stop: ClaudeRouteStopError, saved: boolean, resumable: boolean) {
+  const body = claudeStopBody(stop);
+  const offered = body.canUseAgentWebCredits;
+  return {
+    ...body,
+    canUseAgentWebCredits: offered && !saved,
+    canContinueSavedMessage: saved && resumable && (offered || stop.retryable),
+    agentWebOffer: !offered ? null : !saved ? ('resend' as const) : resumable ? ('continue' as const) : ('new_message' as const),
+  };
+}
+
+/** ENG-2113: `userMessageKind` of a turn that answers a message already saved by a stopped plan turn (never stored on a message). */
+const RESUME_SAVED_MESSAGE_KIND = 'resume-saved';
+
 function wasRaisedAfterUserMessageSaved(error: unknown): boolean {
   return typeof error === 'object' && error !== null && errorsAfterUserMessageSaved.has(error);
 }
@@ -705,6 +733,30 @@ function wasRaisedAfterUserMessageSaved(error: unknown): boolean {
  */
 function sendRefusalBody<T extends object>(body: T, userMessageSaved: boolean): T & { userMessageSaved: boolean } {
   return { ...body, userMessageSaved };
+}
+
+/**
+ * ENG-2763: one oncall alert per OpenRouter quota-exhaustion class (not per occurrence /
+ * per user). The key stays exhausted until a monthly reset or a limit raise, so a 6h
+ * window keeps it to one open page instead of an "Unknown Error" filing per message.
+ */
+export const QUOTA_EXHAUSTED_ALERT_WINDOW_MS = 6 * 60 * 60 * 1000;
+
+export function sendQuotaExhaustedAlert(error: unknown, sessionId?: string): void {
+  const originalMessage = (error as any)?.originalMessage || (error as any)?.message || 'Unknown error';
+  const quota = classifyOpenRouterQuotaExhaustion((error as any)?.originalError ?? { message: originalMessage });
+  sendAgentModeOncallAlert({
+    dedupeKey: `agent_mode:${OPENROUTER_QUOTA_ALERT_CLASS}`,
+    dedupeWindowMs: QUOTA_EXHAUSTED_ALERT_WINDOW_MS,
+    subject: 'Agent Mode: OpenRouter quota exhausted',
+    message: `Agent Mode generation is failing because the OpenRouter key/credits are exhausted.\n\nError: ${originalMessage}`,
+    sessionId,
+    context: {
+      'Alert Class': OPENROUTER_QUOTA_ALERT_CLASS,
+      ...(quota?.kind ? { 'Quota Kind': quota.kind } : {}),
+      ...(quota?.resetAt ? { 'Resets At': quota.resetAt } : {}),
+    },
+  }).catch(err => console.error('Failed to send quota-exhausted oncall alert:', err));
 }
 
 /**
@@ -2028,7 +2080,7 @@ async function scheduleAutoMediaContinuation(
     sessionId
   )
     .then(async (resolved) => {
-      stillDeferred = hasDeferredMediaBudgetToolCall(resolved?.toolCalls);
+      stillDeferred = !resolved?.truncatedByStepBudget && hasDeferredMediaBudgetToolCall(resolved?.toolCalls);
       if (resolved?.content) {
         const { io } = await import('../server');
         // ENG-1495: resolved is this call's own generateSessionResponse result, so its
@@ -2761,7 +2813,7 @@ async function scheduleAutoWorkPlanContinuation(
     sessionId
   )
     .then(async (resolved) => {
-      stillStalled = hasStalledAutocompleteWorkPlan(resolved?.workPlan, resolved?.toolCalls, resolved?.calledFunctions);
+      stillStalled = !resolved?.truncatedByStepBudget && hasStalledAutocompleteWorkPlan(resolved?.workPlan, resolved?.toolCalls, resolved?.calledFunctions);
       if (resolved?.workPlan?.autocomplete && hasNonRetryableWorkPlanStatusBlock(resolved?.toolCalls)) {
         await postWorkPlanNeedsYouMessage(sessionId, userId);
       }
@@ -4785,6 +4837,8 @@ type RunVerifiedChatResult = {
   }>;
   attempts: number;
   workPlanCompleted: boolean;
+  // ENG-2854: why a failed run stopped when it was not a requirements miss.
+  terminationReason?: 'iteration_limit';
   // ENG-396: set when a headless turn left an unanswered blocking question. The
   // run stopped without proceeding on a guess; a human must answer it. The
   // scheduled caller maps this to a `pending_user_input` outcome and notifies.
@@ -5245,6 +5299,26 @@ async function runVerifiedChatInner(
   // Either way the auto-take is bounded (MAX_AUTO_TAKES) and logged as a
   // delegation. Returns 'autoTake' (caller retries), a 'park' result to return,
   // or null when no question is awaiting.
+  const iterationLimitStopResult = (): RunVerifiedChatResult => ({
+    success: false,
+    terminationReason: 'iteration_limit',
+    content: allContent,
+    toolCalls: allToolCalls,
+    // Score against the truncated turn's content: remainingKeywords is only pruned later.
+    keywordMatches: keywords.filter(k => allContent.toLowerCase().includes(k.toLowerCase())),
+    keywordMisses: keywords.filter(k => !allContent.toLowerCase().includes(k.toLowerCase())),
+    functionCallMatches: requiredFunctions.filter(f =>
+      countCallsForRequirement(f.functionName, allActualFunctionCallsForReporting) >= f.minCount).map(f => f.functionName),
+    functionCallMisses: requiredFunctions.filter(f =>
+      countCallsForRequirement(f.functionName, allActualFunctionCallsForReporting) < f.minCount).map(f => f.functionName),
+    functionStatus: requiredFunctions.map(f => {
+      const actualCount = countCallsForRequirement(f.functionName, allActualFunctionCallsForReporting);
+      return { functionName: f.functionName, requiredCount: f.minCount, actualCount, met: actualCount >= f.minCount };
+    }),
+    attempts: attempt,
+    workPlanCompleted: false,
+  });
+
   const resolveAwaitingUserQuestion = async (): Promise<
     { action: 'autoTake' } | { action: 'park'; result: RunVerifiedChatResult } | null
   > => {
@@ -5487,6 +5561,7 @@ async function runVerifiedChatInner(
         allActualFunctionCallsForReporting.push(
           ...continuationToolCalls.filter((call: any) => call?.name)
         );
+        if (continuationResponse.truncatedByStepBudget) return iterationLimitStopResult();
         // ENG-396: a completion-gate continuation turn can ALSO emit a blocking
         // AskUserQuestion. Route it through the same park/auto-take handler as the
         // main turn instead of falling through and returning success on an
@@ -5637,6 +5712,8 @@ async function runVerifiedChatInner(
       allToolCalls.push(...toolCalls);
 
       allActualFunctionCallsForReporting.push(...toolCalls.filter((call: any) => call?.name));
+      // Exhaustion requires explicit review/resume, never a requirements-driven retry.
+      if (response.truncatedByStepBudget) return iterationLimitStopResult();
 
       // ENG-396: this MAIN turn may have left an unanswered blocking
       // AskUserQuestion — auto-take (full autonomy) or park before doing anything
@@ -6818,7 +6895,7 @@ export async function runScheduledChat(
     const preflightRecipients: string[] = Array.isArray(schedule.emailNotifications)
       ? schedule.emailNotifications.filter(Boolean)
       : [];
-    if (preflightRecipients.length > 0 && scheduleLikelySensitive(schedule)) {
+    if (preflightRecipients.length > 0 && scheduleLikelySensitive(schedule, { ownerIsAdmin: typeof (scheduleOwner as any)?.isAdmin === 'boolean' ? (scheduleOwner as any).isAdmin : undefined })) {
       const authz = await resolveAuthorizedReportRecipients({
         recipients: preflightRecipients,
         ownerEmail: (scheduleOwner as any)?.email,
@@ -8360,14 +8437,15 @@ export async function runScheduledChat(
       await recordReportDeliveryState(
         schedule.scheduleId,
         { runId: finalResult.runId, state: 'generated' },
-        { lastKnownSensitive: reportContainsCrossAccountData(actualFunctionCalls) },
+        { lastKnownSensitive: reportContainsCrossAccountData(actualFunctionCalls, { ownerIsAdmin: typeof (scheduleOwner as any)?.isAdmin === 'boolean' ? (scheduleOwner as any).isAdmin : undefined }) },
       );
     }
 
     // Self-improve: when enabled, run a reflection turn in the same session that may
     // rewrite the schedule's prompt so future runs do better. Runs on test runs too so
     // it's easy to try out. Best-effort — never fails the run.
-    if (schedule.selfImprove === true) {
+    // ENG-2854: an iteration-limit report is the terminal turn; no further model turn.
+    if (schedule.selfImprove === true && result.terminationReason !== 'iteration_limit') {
       try {
         await runScheduleSelfImprovement({
           schedule,
@@ -8558,6 +8636,8 @@ export async function runScheduledChat(
     // resume (published + settled), pause (published + not resumable) and a fresh
     // requeue (nothing published) — never a blind restart over published work.
     const workerShutdownInterrupted = !zeroAssistantOutput && isWorkerShutdownError(error);
+    // ENG-2758: OpenRouter key-limit / credits exhaustion — defer, and alert once per class.
+    const quotaExhaustion = classifyOpenRouterQuotaExhaustion(error);
     let zeroAssistantRequeuedAt: string | undefined;
     if (zeroAssistantOutput || workerShutdownInterrupted) {
       // ENG-971: zero assistant output does NOT mean the run did nothing. A publish
@@ -8785,6 +8865,42 @@ export async function runScheduledChat(
             console.error('Failed to persist published-run job-incomplete message:', persistError);
           }
         }
+      } else if (!isTest && quotaExhaustion) {
+        // ENG-2758: the OpenRouter key/credits are exhausted until a reset, so a
+        // short-interval requeue is guaranteed to fail again. Defer to the stated
+        // reset (else the next natural slot); keep the schedule active and do not
+        // spend a zero-output retry on it.
+        // Anchor the natural-next fallback to the scheduled slot (as the normal
+        // dispatcher does) so the cadence's time-of-day is preserved.
+        const storedSlot = schedule.nextRunTime ? new Date(schedule.nextRunTime) : new Date(NaN);
+        const scheduledSlot = Number.isFinite(storedSlot.getTime()) ? storedSlot : new Date();
+        const deferredTo = resolveQuotaDeferral(
+          quotaExhaustion,
+          new Date(),
+          calculateNextRunTime(
+            schedule.frequency,
+            Number.isFinite(scheduledSlot.getTime()) ? scheduledSlot : new Date(),
+            schedule.frequencyIntervalDays,
+            schedule.scheduleId
+          )
+        );
+        try {
+          // Do not reactivate a schedule the owner paused/stopped while this run was in flight.
+          const current: any = await scheduleDb.getScheduleById(schedule.scheduleId);
+          if (current && current.status && current.status !== 'active') {
+            throw new Error(`schedule status is '${current.status}', not deferring`);
+          }
+          await scheduleDb.updateSchedule(schedule.scheduleId, {
+            status: 'active',
+            nextRunTime: deferredTo,
+            lastZeroAssistantOutputAt: new Date().toISOString(),
+            lastZeroAssistantOutputSessionId: sessionId || '',
+            updatedAt: new Date().toISOString(),
+          });
+          zeroAssistantRequeuedAt = deferredTo;
+        } catch (deferError) {
+          console.error(`Failed to defer quota-exhausted scheduled chat ${schedule.scheduleId}:`, deferError);
+        }
       } else if (!isTest) {
         const nextRetryCount = zeroOutputNextRetryCount;
         if (nextRetryCount <= ZERO_ASSISTANT_MAX_REQUEUES) {
@@ -8949,7 +9065,17 @@ export async function runScheduledChat(
     // event with automatic recovery, not a defect — don't file a Linear issue for
     // it (the deduped oncall alert below still records the occurrence). One that
     // could NOT be requeued (paused, cap exhausted, write failed) still files.
-    const skipAutoIssue = workerShutdownInterrupted && Boolean(zeroAssistantRequeuedAt);
+    // ENG-2750: the same holds when the drain hit BEFORE any assistant output
+    // (zero-output path) — but only for the FIRST requeue. A drain retry is
+    // bounded to one silent attempt; if the retried run fails too, it files.
+    // Only the drain-ceiling shutdown qualifies — a subprocess crash ("Worker
+    // process exited with code ...", OOM / instance replacement) is a real
+    // incident and must still file (CodeRabbit on PR #3844).
+    const drainRequeuedFirstAttempt = isDrainCeilingShutdownError(error)
+      && Boolean(zeroAssistantRequeuedAt)
+      && getZeroAssistantRetryCount(schedule) === 0;
+    const skipAutoIssue = (workerShutdownInterrupted && Boolean(zeroAssistantRequeuedAt))
+      || drainRequeuedFirstAttempt;
     void (skipAutoIssue ? Promise.resolve() : fileAutoIssue({
       title: zeroAssistantOutput
         ? `Scheduled Chat Zero Assistant Output: ${schedule.scheduleName}`
@@ -8969,6 +9095,8 @@ export async function runScheduledChat(
         ...(zeroAssistantRequeuedAt ? { 'Requeued At': zeroAssistantRequeuedAt } : {}),
         'Error Message': errorMessage,
         ...(originalMessage ? { 'Original Error (Bedrock/API)': originalMessage } : {}),
+        // ENG-2758: one canonical per (source x errorClass), not one per schedule.
+        ...(quotaExhaustion ? { 'Alert Class': OPENROUTER_QUOTA_ALERT_CLASS } : {}),
       }
     }))
       .catch(err => console.error('Failed to file scheduled-chat-error issue:', err))
@@ -8982,7 +9110,9 @@ export async function runScheduledChat(
         // One alert per (user, schedule, errorClass) per hour (ENG-145/146
         // class). Gated so flag off = today's exact behavior.
         ...(isRunStoreEnabled()
-          ? { dedupeKey: `scheduled_chat:${userId}:${schedule.scheduleId}:${zeroAssistantOutput ? 'zero_output' : 'run_error'}`, dedupeWindowMs: 60 * 60 * 1000 }
+          ? quotaExhaustion
+            ? { dedupeKey: `scheduled_chat:${OPENROUTER_QUOTA_ALERT_CLASS}`, dedupeWindowMs: 60 * 60 * 1000 }
+            : { dedupeKey: `scheduled_chat:${userId}:${schedule.scheduleId}:${zeroAssistantOutput ? 'zero_output' : 'run_error'}`, dedupeWindowMs: 60 * 60 * 1000 }
           : {}),
         sessionId: sessionId || undefined,
         context: {
@@ -9973,7 +10103,30 @@ async function runSessionTurn(
 
   // ENG-1495: messageIndex of the just-persisted user message, for the return value.
   let userMessageIndex: number | undefined;
-  if (!reusingDanglingDirective) {
+  // ENG-2113: "continue" answers the message a stopped plan turn already saved. Checked again here, right before the save is skipped, so a chat that changed in
+  // between (a second tab, a concurrent turn) can never skip the save of a message that is not already stored.
+  const resumingSavedMessage = userMessageKind === RESUME_SAVED_MESSAGE_KIND;
+  if (resumingSavedMessage) {
+    let found: ReturnType<typeof findResumableUserMessage> = { ok: false };
+    try {
+      const fresh = await chatbotDb.getChatSession(sessionId, true); // strongly consistent, see the request check
+      found = findResumableUserMessage(fresh?.messages);
+    } catch {
+      found = { ok: false };
+    }
+    if (!found.ok || found.content !== userMessage) throw new ResumeNotAvailableError();
+    // The marker goes in BEFORE anything runs: it ends the chat's "continuable" state, so a continue whose own verdict is never saved cannot be continued again,
+    // and a second continue that raced this one finds the marker last. Without it the continue does not start.
+    try {
+      const timestamp = new Date().toISOString();
+      await chatbotDb.addMessageToSession(sessionId, { role: 'assistant', content: 'Continuing your last message.', timestamp, metadata: { timestamp, isErrorMessage: true, kind: CONTINUE_MARKER_KIND } } as ChatMessage);
+    } catch {
+      throw new ResumeNotAvailableError();
+    }
+  }
+  if (resumingSavedMessage) {
+    console.log('AgentMode generateSessionResponse: continuing an already-saved user message (plan stop) — save skipped');
+  } else if (!reusingDanglingDirective) {
     // Add user message to session in database
     console.log('AgentMode generateSessionResponse: Saving user message with attachments:', {
       hasAttachments: !!(userMessageObj.metadata?.attachments && userMessageObj.metadata.attachments.length > 0),
@@ -10093,6 +10246,15 @@ async function runSessionTurn(
   const sessionHistoryForWorker = (updatedSession.messages || []).filter(
     (m: any) => !isRunFailurePlaceholder(m)
   );
+  // ENG-2113: a continue answers the message already in the chat. The plan-stop notes under it are not part of the conversation, and while they sit last the
+  // context builder cannot recognise the saved message as THE current one (it would be sent twice): drop the trailing notes so it is.
+  if (resumingSavedMessage) {
+    while (sessionHistoryForWorker.length > 0) {
+      const last: any = sessionHistoryForWorker[sessionHistoryForWorker.length - 1];
+      if (last?.role === 'assistant' && (last?.metadata?.kind === PLAN_STOP_NOTE_KIND || last?.metadata?.kind === CONTINUE_MARKER_KIND)) sessionHistoryForWorker.pop();
+      else break;
+    }
+  }
 
   // If this session is linked to a GTM work item, update status to agent_in_progress
   if (updatedSession.gtmWorkItem) {
@@ -10987,6 +11149,23 @@ export const agentModeController = {
         return res.status(403).json({ error: 'Unauthorized access to session' });
       }
 
+      // ENG-2113: "continue" answers the message a stopped plan turn already saved, instead of storing it a second time. Only for a turn that is KNOWN to have
+      // run no tool (the stop note says so), and only for exactly that message: anything else is refused and the client sends a new message.
+      let resumeSavedMessage = false;
+      if (req.body.continueSavedMessage === true) {
+        const notContinuable = () => res.status(409).json({ error: 'That message can no longer be continued. Send it again as a new message.', code: 'CONTINUE_NOT_AVAILABLE' });
+        if ((Array.isArray(attachments) ? attachments.length > 0 : !!attachments) || questionAnswer || workPlanInputAnswer || deckAnswer || deckCancel || audioInput) return notContinuable();
+        // Strongly consistent: this read is the guard against skipping a save, so a just-written answer or message must be seen.
+        let found: ReturnType<typeof findResumableUserMessage> = { ok: false };
+        try {
+          found = findResumableUserMessage((await chatbotDb.getChatSession(sessionId, true))?.messages);
+        } catch (readError) {
+          console.error('AgentMode: continue check could not read the chat:', readError instanceof Error ? readError.message : String(readError));
+        }
+        if (!found.ok || found.content !== userMessage) return notContinuable();
+        resumeSavedMessage = true;
+      }
+
       // ENG-2113: whose plan pays for THIS turn, decided once, before anything below mutates state (a stop consumes nothing).
       // No `fundingChoice` in the body = AgentWeb, with no lookups, exactly as before. A stop is a typed answer, never an AgentWeb run.
       let planRoute: PlanRoute | undefined;
@@ -11015,7 +11194,8 @@ export const agentModeController = {
         // Nothing is saved yet. A lookup that failed for any reason other than a typed stop is still a stop (never an AgentWeb run, never a 500).
         const fundingStop = fundingError instanceof ClaudeRouteStopError ? fundingError : new ClaudeRouteStopError('lookup_failed');
         if (!(fundingError instanceof ClaudeRouteStopError)) console.error('AgentMode: plan funding lookup failed:', fundingError instanceof Error ? fundingError.message : String(fundingError));
-        return res.status(fundingStop.httpStatus).json(sendRefusalBody(claudeStopBody(fundingStop), false));
+        // On a continue the message is already in the chat (and nothing ran): say so, so the client never resends it as new.
+        return res.status(fundingStop.httpStatus).json(sendRefusalBody(planStopResponse(fundingStop, resumeSavedMessage, resumeSavedMessage), resumeSavedMessage));
       }
 
       // EXPLICIT = the REQUEST carries a model. A model merely STORED on the session is
@@ -11556,7 +11736,7 @@ export const agentModeController = {
         turnStartMs, // ENG-907: the deadline withGenerationTimeout below enforces
         undefined, // publishAuthorizationOverride — interactive path resolves per turn
         undefined, // approvedRevisionImageSources
-        undefined, // userMessageKind
+        resumeSavedMessage ? RESUME_SAVED_MESSAGE_KIND : undefined, // userMessageKind
         Boolean(questionAnswer || workPlanInputAnswer),
         typeof clientId === 'string' ? clientId : undefined, // ENG-1495
         approvalDeckAnswerMeta, // ENG-1635/1644: structured deck answer stamped on the reply
@@ -11779,7 +11959,7 @@ export const agentModeController = {
       // past this request's own `finally` below, so scheduleAutoMediaContinuation
       // claims the generation lock only after THIS request has released it.
       // ENG-2113: automatic follow-up turns would run on AgentWeb's models; on the plan route the user is asked to continue instead.
-      if (!planRoute && hasDeferredMediaBudgetToolCall(response.toolCalls)) {
+      if (!planRoute && !response.truncatedByStepBudget && hasDeferredMediaBudgetToolCall(response.toolCalls)) {
         setImmediate(() => scheduleAutoMediaContinuation(sessionId, session.userId, selectedModel, 1, false).catch((err) =>
           console.error(`AgentMode: media auto-continuation (soft deferral) failed for session ${sessionId}:`, err),
         ));
@@ -11791,7 +11971,7 @@ export const agentModeController = {
       // "retry" instead of just continuing per the plan's own "never wait on the user"
       // contract, and the session then sat idle for 3+ hours. Auto-fire the continuation
       // ourselves, same setImmediate-after-release pattern as the media case above.
-      if (!planRoute && hasStalledAutocompleteWorkPlan(response.workPlan, response.toolCalls, response.calledFunctions)) {
+      if (!planRoute && !response.truncatedByStepBudget && hasStalledAutocompleteWorkPlan(response.workPlan, response.toolCalls, response.calledFunctions)) {
         setImmediate(() => scheduleAutoWorkPlanContinuation(sessionId, session.userId, selectedModel, 1, false).catch((err) =>
           console.error(`AgentMode: work-plan auto-continuation failed for session ${sessionId}:`, err),
         ));
@@ -11915,6 +12095,13 @@ export const agentModeController = {
         }
       }
     } catch (error) {
+      // ENG-2113: the chat changed (or could not be read) between the continue's request check and the turn: a typed refusal, never an AgentWeb error, a
+      // diagnosis run or a note in the chat. Nothing was saved or run by this request.
+      if (error instanceof ResumeNotAvailableError && !res.headersSent) {
+        if (runSurvivalRunId) void markRunTerminal(runSurvivalRunId, 'failed', { finishReason: 'continue_not_available' });
+        if (req.body?.sessionId) markProgressComplete(req.body.sessionId);
+        return res.status(409).json({ error: 'That message can no longer be continued. Send it again as a new message.', code: 'CONTINUE_NOT_AVAILABLE' });
+      }
       // ENG-669: generateSessionResponse refused the turn's model (e.g. a race with a tier change): the same 422 the
       // pre-flight answers, never a generic 500. Its final gate refuses before anything is persisted; its Work Plan
       // step-model refusal comes after the user message was saved, which the body says (ENG-2641).
@@ -11933,6 +12120,7 @@ export const agentModeController = {
             ? new ClaudeRouteStopError(error instanceof Error && isWorkerShutdownError(error) ? 'server_restarting' : 'turn_failed')
             : undefined;
       if (planStop && !res.headersSent) {
+        const planStopResumable = turnRanNoTools(planStop) || (planStop !== error && turnRanNoTools(error));
         if (planStop !== error) {
           console.error('AgentMode: plan turn failed outside the Claude backend:', error instanceof Error ? error.message : String(error));
           if (wasRaisedAfterUserMessageSaved(error)) markRaisedAfterUserMessageSaved(planStop);
@@ -11947,11 +12135,16 @@ export const agentModeController = {
               role: 'assistant',
               content: planStop.userMessage,
               timestamp: new Date().toISOString(),
-              metadata: { timestamp: new Date().toISOString(), isErrorMessage: true, kind: 'claude-plan-stop', code: planStop.code },
+              // `resumable`: the turn is KNOWN to have run no tool, so the saved message may be answered again without repeating an action.
+              metadata: { timestamp: new Date().toISOString(), isErrorMessage: true, kind: PLAN_STOP_NOTE_KIND, code: planStop.code, resumable: planStopResumable },
             } as ChatMessage).catch((persistErr) => console.error('AgentMode: failed to persist plan stop note:', persistErr));
           }
         }
-        return res.status(planStop.httpStatus).json(sendRefusalBody(claudeStopBody(planStop), wasRaisedAfterUserMessageSaved(planStop)));
+        // `userMessageSaved` + `canContinueSavedMessage` tell the client which offer is safe: not saved = resend; saved and known to have run no tool =
+        // continue (the message is answered again with `continueSavedMessage: true`, never stored twice); saved and a tool may have run = only a new message,
+        // and the client says an action may repeat.
+        const planStopSaved = wasRaisedAfterUserMessageSaved(planStop);
+        return res.status(planStop.httpStatus).json(sendRefusalBody(planStopResponse(planStop, planStopSaved, planStopResumable), planStopSaved));
       }
       console.error('AgentMode: Generate response error:', error);
 
@@ -12013,6 +12206,18 @@ export const agentModeController = {
                   'The server restarted while processing your request. Please send your message again.',
                   publishLedger,
                 ),
+                publishLedger,
+              ),
+              artifactUrls,
+            );
+          } else if (isQuotaExhaustedError(error)) {
+            // ENG-2763: persist the quota message, not diagnosis/retry advice, so a
+            // reload agrees with the 503 PROVIDER_QUOTA_EXHAUSTED response.
+            publishLedger = (await loadPublishLedger(sessionId, turnStartCalledFunctions)) || [];
+            artifactUrls = await loadConfirmedArtifactUrls(sessionId, turnStartMsForDiagnosis);
+            diagnosticContent = appendConfirmedArtifactNotice(
+              appendConfirmedDataWriteNotice(
+                appendConfirmedPublishNotice(QUOTA_EXHAUSTED_USER_MESSAGE, publishLedger),
                 publishLedger,
               ),
               artifactUrls,
@@ -12177,6 +12382,19 @@ export const agentModeController = {
             code: 'RATE_LIMIT',
             suggestion: 'wait_and_retry'
           });
+          return;
+        }
+
+        // ENG-2763: OpenRouter key-limit / credits exhaustion is a known class, not an
+        // unknown error: answer 503 and page once per class, not once per occurrence.
+        if (isQuotaExhaustedError(error)) {
+          sendQuotaExhaustedAlert(error, req.body?.sessionId);
+          res.status(503).json(sendRefusalBody({
+            error: 'AI service at capacity',
+            message: error.message,
+            code: 'PROVIDER_QUOTA_EXHAUSTED',
+            suggestion: 'wait'
+          }, wasRaisedAfterUserMessageSaved(error)));
           return;
         }
 
@@ -13053,6 +13271,17 @@ export const agentModeController = {
         );
       }
 
+      // ENG-2816: the link runs under the owner's userId, so a logged-in owner opening their own link used to
+      // count as a visitor. When the portal sends their login and it is the owner's own, this turn is an owner
+      // turn: the same tools and no anonymous-sender stamp as in their normal view. Anyone else (no login, a
+      // colleague, a delegate or service token, a bad token) stays a visitor, as before. Decided last, after every
+      // link, lock, usage and model check, so it can never stand in for any of them.
+      const viewerIsOwner = await isSessionOwnerRequest(req, session.userId);
+      if (viewerIsOwner) {
+        // Telemetry then reads `regular` rather than `interactive_share`, so leave a trace of this decision (no token).
+        console.log(`[ENG-2816] share link ${session.sessionId}: the viewer is the session owner; running an owner turn`);
+      }
+
       // Use the same generateSessionResponse logic as the regular generateResponse,
       // wrapped in wall-clock timeout to guarantee lock release on hung generation.
       const ishareSenderInfo = {
@@ -13069,7 +13298,7 @@ export const agentModeController = {
           session.userId,
           modelToUse,
           attachments,
-          true, // isInteractiveShare - block admin tools for security
+          !viewerIsOwner, // isInteractiveShare - block admin tools for security (ENG-2816: not for the link's own logged-in owner)
           undefined, // pageContext
           undefined, // isDelegatedAccess
           ishareSenderInfo,
@@ -13238,6 +13467,17 @@ export const agentModeController = {
               ),
               artifactUrls,
             );
+          } else if (isQuotaExhaustedError(error)) {
+            // ENG-2763: see the matching branch in generateResponse.
+            publishLedger = (await loadPublishLedger(shareId, turnStartCalledFunctions)) || [];
+            artifactUrls = await loadConfirmedArtifactUrls(shareId, sharedTurnStartMs);
+            diagnosticContent = appendConfirmedArtifactNotice(
+              appendConfirmedDataWriteNotice(
+                appendConfirmedPublishNotice(QUOTA_EXHAUSTED_USER_MESSAGE, publishLedger),
+                publishLedger,
+              ),
+              artifactUrls,
+            );
           } else {
             const userMessage = req.body?.userMessage || '';
             const diagnosis = await getDiagnosticErrorMessage(error, shareId, userMessage, turnStartCalledFunctions, sharedTurnStartMs);
@@ -13374,6 +13614,19 @@ export const agentModeController = {
             code: 'RATE_LIMIT',
             suggestion: 'wait_and_retry'
           });
+          return;
+        }
+
+        // ENG-2763: OpenRouter key-limit / credits exhaustion is a known class, not an
+        // unknown error: answer 503 and page once per class, not once per occurrence.
+        if (isQuotaExhaustedError(error)) {
+          sendQuotaExhaustedAlert(error, req.params?.shareId);
+          res.status(503).json(sendRefusalBody({
+            error: 'AI service at capacity',
+            message: error.message,
+            code: 'PROVIDER_QUOTA_EXHAUSTED',
+            suggestion: 'wait'
+          }, wasRaisedAfterUserMessageSaved(error)));
           return;
         }
 
@@ -14714,6 +14967,7 @@ export const agentModeController = {
         scheduleId,
         recipients: scheduledChat.emailNotifications,
         ownerEmail: user.email,
+        ownerIsAdmin: typeof (user as any).isAdmin === 'boolean' ? (user as any).isAdmin : undefined,
         schedule: scheduledChat,
       });
       if (createRemediation) {
@@ -15110,6 +15364,7 @@ export const agentModeController = {
           scheduleId,
           recipients: effectiveEmailNotifications,
           ownerEmail: user.email,
+          ownerIsAdmin: typeof (user as any).isAdmin === 'boolean' ? (user as any).isAdmin : undefined,
           schedule: {
             // A changed tool list re-decides sensitivity from scratch; the
             // breadcrumb describes the previous tools.
@@ -15910,6 +16165,7 @@ export const agentModeController = {
           scheduleId,
           recipients: normalizeEmailList(schedule.emailNotifications || []),
           ownerEmail: user.email,
+          ownerIsAdmin: typeof (user as any).isAdmin === 'boolean' ? (user as any).isAdmin : undefined,
           schedule: schedule as any,
         });
         if (toggleRemediation) {
@@ -16252,7 +16508,10 @@ export const agentModeController = {
             && (prefilledWithoutRequest || (valuesProvidedAfterLatestRequest && valuesProvidedAfterLastRun));
 
           // Calculate next run based on the current nextRunTime to preserve the scheduled time
-          const currentNextRun = new Date(schedule.nextRunTime);
+          // An unreadable stored nextRunTime (legacy/operator-edited row) would make
+          // calculateNextRunTime throw 'Invalid time value' on every poll; treat it as due now.
+          const storedNextRun = new Date(schedule.nextRunTime);
+          const currentNextRun = Number.isFinite(storedNextRun.getTime()) ? storedNextRun : new Date();
           const nextRunTime = calculateNextRunTime(schedule.frequency, currentNextRun, schedule.frequencyIntervalDays, schedule.scheduleId);
 
           if (scheduleVariables.length > 0 && !isVariableRequestSatisfied) {
@@ -16740,6 +16999,19 @@ export const agentModeController = {
           return;
         }
 
+        // ENG-2763: OpenRouter key-limit / credits exhaustion is a known class, not an
+        // unknown error: answer 503 and page once per class, not once per occurrence.
+        if (isQuotaExhaustedError(error)) {
+          sendQuotaExhaustedAlert(error, (req as any).conversableSession?.sessionId);
+          res.status(503).json(sendRefusalBody({
+            error: 'AI service at capacity',
+            message: error.message,
+            code: 'PROVIDER_QUOTA_EXHAUSTED',
+            suggestion: 'wait'
+          }, wasRaisedAfterUserMessageSaved(error)));
+          return;
+        }
+
         // ENG-2381: a final upstream provider 5xx is an outage, not an unknown error.
         if (isProviderUnavailableError(error)) {
           res.status(503).json(sendRefusalBody({
@@ -16932,9 +17204,12 @@ export const agentModeController = {
 
   // Create session with predefined work plan (public) — reads from AW-WorkPlans table
   async createSessionWithPlan(req: Request, res: Response) {
+    // ENG-2773 (ENG-783 slice B): same ENG-147 submit-lock createSession uses. Hoisted so the
+    // catch block can give back a held claim after an error unwinds.
+    let planIdemKeyHeld: string | undefined;
     try {
       const { planTitle } = req.params;
-      const { startingMessage } = req.body || {};
+      const { startingMessage, idempotencyKey } = req.body || {};
 
       if (!planTitle) {
         return res.status(400).json({ error: 'Plan title is required' });
@@ -17029,6 +17304,44 @@ export const agentModeController = {
       } catch (planErr) {
         console.error(`AgentMode: createSessionWithPlan "${predefinedPlan.title}" refused — invalid plan structure:`, (planErr as Error).message);
         return res.status(422).json({ error: 'This work plan is misconfigured and cannot be started right now.', code: 'workplan_invalid' });
+      }
+
+      // ENG-2773: cross-restart duplicate-submit lock for a signed-in launcher's client
+      // idempotencyKey (scoped to user + plan, so it never collides with createSession or another
+      // user). Anonymous callers get a fresh random userId per call, so a key could never replay:
+      // they are excluded. Flag off / no key = today's exact behaviour.
+      if (result.user && isRunStoreEnabled() && typeof idempotencyKey === 'string' && idempotencyKey.length > 0) {
+        const idemKey = planSessionIdempotencyKey(
+          userId,
+          normalizeWorkPlanTitleForMatch(planTitle),
+          idempotencyKey,
+        );
+        const claim = await claimIdempotency(idemKey, uuidv4(), IDEM_TTL_INTERACTIVE_S);
+        if (!claim.claimed) {
+          if (claim.sessionId) {
+            const existing: any = await chatbotDb.getChatSession(claim.sessionId);
+            const existingToken = existing?.interactiveShareMetadata?.token;
+            if (existing && existing.userId === userId && existing.workPlan && existingToken) {
+              // Duplicate of a completed launch: return the winner's session (no second session,
+              // no second starting-message run).
+              const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+              return res.json({
+                sessionId: existing.sessionId,
+                redirectUrl: `${customerFrontendUrl}/plan/${encodeURIComponent(planTitle)}/${existing.sessionId}?conversable=${existingToken}`,
+                workPlan: redactWorkPlanForViewer(existing.workPlan, { keepStepModels: true }),
+                conversableToken: existingToken,
+                userId: existing.userId,
+                idempotentReplay: true,
+              });
+            }
+          }
+          return res.status(409).json({
+            error: 'Duplicate submit',
+            message: 'This request was already submitted and is still being processed. Please retry in a moment.',
+            code: 'DUPLICATE_SUBMIT',
+          });
+        }
+        planIdemKeyHeld = idemKey;
       }
 
       // Create session with userId (authenticated or anonymous)
@@ -17169,8 +17482,17 @@ export const agentModeController = {
           sharedAt: new Date().toISOString()
         };
         await chatbotDb.updateSessionInteractiveShareMetadata(session.sessionId, interactiveShareMetadata);
+        // ENG-2773: stamp the winner only once the session is fully built, so a duplicate never
+        // attaches to a half-built one (best effort: on failure losers 409 until the TTL).
+        if (planIdemKeyHeld) {
+          await recordIdempotencySessionId(planIdemKeyHeld, session.sessionId);
+        }
       } catch (launchErr) {
         await deleteNewSessionBestEffort(session.sessionId);
+        if (planIdemKeyHeld) {
+          await releaseIdempotency(planIdemKeyHeld);
+          planIdemKeyHeld = undefined;
+        }
         if (modelSaveFailed) {
           return res.status(503).json({ error: MODEL_SAVE_FAILED_MESSAGE, code: 'model_save_failed' });
         }
@@ -17352,6 +17674,9 @@ export const agentModeController = {
       }
     } catch (error) {
       console.error('AgentMode: Create session with plan error:', error);
+      if (planIdemKeyHeld) {
+        await releaseIdempotency(planIdemKeyHeld);
+      }
       res.status(500).json({ error: 'Failed to create session with plan' });
     }
   },
@@ -17670,6 +17995,8 @@ export const agentModeController = {
         success: result.success,
         message: result.success
           ? `All required functions were called successfully.`
+          : result.terminationReason === 'iteration_limit'
+          ? `Stopped at the iteration limit after ${result.attempts} attempt${result.attempts !== 1 ? 's' : ''}; see the resumable report in content.`
           : `Some required functions were not called enough times after ${result.attempts} attempt${result.attempts !== 1 ? 's' : ''}.`,
         content: result.content,
         toolCalls: result.toolCalls,
@@ -17718,6 +18045,17 @@ export const agentModeController = {
           code: 'PROVIDER_UNAVAILABLE',
           suggestion: 'wait_and_retry',
         });
+      }
+      // ENG-2763: OpenRouter key-limit / credits exhaustion — same 503 + once-per-class
+      // alert as the other generate chains, not a 500 + per-run page.
+      if ((isQuotaExhaustedError(error) || classifyOpenRouterQuotaExhaustion(error)) && !res.headersSent) {
+        sendQuotaExhaustedAlert(error, req.body?.sessionId);
+        return res.status(503).json(sendRefusalBody({
+          error: 'AI service at capacity',
+          message: QUOTA_EXHAUSTED_USER_MESSAGE,
+          code: 'PROVIDER_QUOTA_EXHAUSTED',
+          suggestion: 'wait'
+        }, wasRaisedAfterUserMessageSaved(error)));
       }
       console.error('AgentMode: Verified generate error:', error);
       const sessionId = req.body?.sessionId;

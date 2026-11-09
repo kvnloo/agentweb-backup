@@ -2,6 +2,7 @@ type Tool = { name: string; definition: { description: string; inputSchema: { pr
 const handlers = new Map<string, Tool>();
 jest.mock('../emma/registry', () => ({ emmaToolRegistry: { register: (tool: Tool) => handlers.set(tool.name, tool) } }));
 jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn() }, orgDb: { getOrgById: jest.fn(), updateOrg: jest.fn() } }));
+jest.mock('../services/chatbotService', () => ({ chatbotDb: { getChatSession: jest.fn(), claimMetaWriteManifestDigest: jest.fn() } }));
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { orgDb, userDb } from '../services/db';
@@ -146,9 +147,10 @@ describe('update_hot_lead_call_settings', () => {
     expect(await update({ enabled: false })).toMatchObject({ enabled: false });
   });
 
-  it('enables for an entitled org with a verified phone and a number', async () => {
+  it('does not enable for an entitled org with a verified phone and a number without an attended chat to approve it', async () => {
     cfg().enabled = false;
-    expect(await update({ enabled: true })).toMatchObject({ enabled: true });
+    await expect(update({ enabled: true })).rejects.toThrow('attended chat session');
+    expect(orgDb.updateOrg).not.toHaveBeenCalled();
   });
 
   it.each(['+15555550100 x12', '(415) 555-0100 ext. 5', '+14155550100;ext=7'])('rejects a phone with an extension instead of dropping it: %s', async memberPhone => {
@@ -363,5 +365,39 @@ describe('registration', () => {
 describe('shared-session blocking', () => {
   it.each(['get_hot_lead_call_settings', 'update_hot_lead_call_settings'])('%s is in the shared-session blocked set', name => {
     expect(SHARED_SESSION_BLOCKED_ORG_SETTINGS_TOOLS.has(name)).toBe(true);
+  });
+});
+
+
+describe('ENG-2783: monthly cap and honest read-out through the Emma tools', () => {
+  it('get shows the default 200 when the stored config has no value, and the stored value when an operator raised it', async () => {
+    const without = storedConfigFixture();
+    delete (without as Record<string, unknown>).maxCallsPerMonth;
+    org.hotLeadCall = without;
+    expect(await get()).toMatchObject({ maxCallsPerMonth: 200 });
+    org.hotLeadCall = storedConfigFixture({ maxCallsPerMonth: 1500 });
+    expect(await get()).toMatchObject({ maxCallsPerMonth: 1500 });
+  });
+  it('get carries the Canada warning and the blocker for a Canada-only org', async () => {
+    expect(await get()).toMatchObject({ warnings: [expect.stringContaining('Canadian numbers are not called yet')], canEnable: true });
+    org.hotLeadCall = storedConfigFixture({ allowedCountries: ['CA'] });
+    expect(await get()).toMatchObject({ canEnable: false, blockers: [expect.stringContaining('None of the allowed countries can be called yet')] });
+  });
+  it('update sets a value from 1 to 200', async () => {
+    expect(await update({ maxCallsPerMonth: 50 })).toMatchObject({ success: true, maxCallsPerMonth: 50 });
+    expect(lastWrite()[1].hotLeadCall.maxCallsPerMonth).toBe(50);
+  });
+  it('update refuses a value above 200 with the plain support message and writes nothing', async () => {
+    await expect(update({ maxCallsPerMonth: 201 })).rejects.toThrow('Higher monthly limits are set by AgentWeb support');
+    expect(orgDb.updateOrg).not.toHaveBeenCalled();
+  });
+  it('the tool schema offers 1 to 200 only', () => {
+    const props = handlers.get('update_hot_lead_call_settings')!.definition.inputSchema.properties as Record<string, { minimum: number; maximum: number }>;
+    expect(props.maxCallsPerMonth).toMatchObject({ minimum: 1, maximum: 200 });
+  });
+  it('update keeps a stored 1500 when other fields change', async () => {
+    org.hotLeadCall = storedConfigFixture({ maxCallsPerMonth: 1500 });
+    expect(await update({ maxCallsPerHour: 3 })).toMatchObject({ success: true, maxCallsPerMonth: 1500 });
+    expect(lastWrite()[1].hotLeadCall.maxCallsPerMonth).toBe(1500);
   });
 });
