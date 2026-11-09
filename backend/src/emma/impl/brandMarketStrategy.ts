@@ -610,6 +610,20 @@ async function guardBrandBuildSession(
   };
 }
 
+/** ENG-2875: a founders entry without a non-blank name would silently drop. */
+export function hasBlankFounderName(founders: unknown[]): boolean {
+  return founders.some((f: any) => !f || typeof f.name !== 'string' || !f.name.trim());
+}
+
+/**
+ * ENG-2875: founders writes are additive only from the current brand-build
+ * session while the build is still running (the site scrape). Once the build
+ * is ready, a user reopening that session is making an ordinary edit.
+ */
+export function isScrapeFounderWrite(sessionClaim: string | undefined, brandBuildStatus: unknown): boolean {
+  return Boolean(sessionClaim) && brandBuildStatus === 'building';
+}
+
 /**
  * ENG-2875: merge an incoming founders list onto the stored one.
  * The incoming array is authoritative for membership (founders it omits are
@@ -758,11 +772,21 @@ export async function updateBrandGuidelines(
       // fields are merged onto matching existing founders by normalized name.
       // The current onboarding brand-build session (sessionClaim set) is a
       // site scrape, not a user edit, so it never removes stored founders.
+      // Only while the build is still running is the claimed session the
+      // scrape; a user reopening it after the build is ready edits normally.
       if (brandData && Array.isArray((brandData as any).founders)) {
+        const incomingFounders: any[] = (brandData as any).founders;
+        if (hasBlankFounderName(incomingFounders)) {
+          return {
+            success: false,
+            message: 'Every founder needs a non-empty name. Pass an empty founders array to clear all founders.',
+            error: 'Invalid founders',
+          };
+        }
         updatedBrandData.founders = mergeFounders(
           (existingBrand.brandData as any)?.founders,
-          (brandData as any).founders,
-          { additive: Boolean(sessionClaim) },
+          incomingFounders,
+          { additive: isScrapeFounderWrite(sessionClaim, user.brandBuildStatus) },
         );
       }
 

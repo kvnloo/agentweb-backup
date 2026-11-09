@@ -1,4 +1,4 @@
-import { mergeFounders } from '../brandMarketStrategy';
+import { mergeFounders, hasBlankFounderName, isScrapeFounderWrite } from '../brandMarketStrategy';
 
 describe('mergeFounders (ENG-2875)', () => {
   const existing = [
@@ -42,5 +42,19 @@ describe('mergeFounders (ENG-2875)', () => {
       { name: 'Sam Ortiz' },
     ]);
     expect(mergeFounders(existing, [], { additive: true })).toEqual(existing);
+  });
+});
+
+describe('ENG-2875 founders write guards', () => {
+  it('flags blank/missing founder names but allows an empty list', () => {
+    expect(hasBlankFounderName([{ name: '  ' }])).toBe(true);
+    expect(hasBlankFounderName([{ name: 'A' }, {}])).toBe(true);
+    expect(hasBlankFounderName([])).toBe(false);
+    expect(hasBlankFounderName([{ name: 'A' }])).toBe(false);
+  });
+  it('is additive only for the claimed session while the build is running', () => {
+    expect(isScrapeFounderWrite('2026-11-09T00:00:00Z', 'building')).toBe(true);
+    expect(isScrapeFounderWrite('2026-11-09T00:00:00Z', 'ready')).toBe(false);
+    expect(isScrapeFounderWrite(undefined, 'building')).toBe(false);
   });
 });
