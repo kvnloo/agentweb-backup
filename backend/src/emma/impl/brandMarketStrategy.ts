@@ -610,6 +610,30 @@ async function guardBrandBuildSession(
   };
 }
 
+/**
+ * ENG-2875: merge an incoming founders list onto the stored one.
+ * The incoming array is authoritative for membership (founders it omits are
+ * removed, order follows the incoming list); each incoming founder is
+ * shallow-merged onto the existing founder with the same normalized name so a
+ * partial update (e.g. only voiceExamples) keeps the untouched fields.
+ */
+export function mergeFounders(existing: unknown, incoming: unknown): any[] {
+  const normalize = (name: any) => (typeof name === 'string' ? name.trim().toLowerCase() : '');
+  const existingFounders: any[] = Array.isArray(existing) ? existing : [];
+  const incomingFounders: any[] = Array.isArray(incoming) ? incoming : [];
+  const merged: any[] = [];
+  const seen = new Set<string>();
+  for (const founder of incomingFounders) {
+    if (!founder || !founder.name) continue;
+    const key = normalize(founder.name);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    const match = existingFounders.find(f => f && normalize(f.name) === key);
+    merged.push(match ? { ...match, ...founder } : founder);
+  }
+  return merged;
+}
+
 export async function updateBrandGuidelines(
   updateData: any,
   userId: string,
@@ -706,36 +730,13 @@ export async function updateBrandGuidelines(
         ...brandData
       } as any;
 
-      // Special merge logic for founder profiles (merge by normalized founder name)
+      // ENG-2875: a provided founders array is authoritative for membership;
+      // fields are merged onto matching existing founders by normalized name.
       if (brandData && Array.isArray((brandData as any).founders)) {
-        const normalize = (name: any) =>
-          typeof name === 'string' ? name.trim().toLowerCase() : '';
-
-        const existingFounders: any[] = Array.isArray((existingBrand.brandData as any)?.founders)
-          ? (existingBrand.brandData as any).founders
-          : [];
-        const incomingFounders: any[] = (brandData as any).founders || [];
-
-        const mergedFounders: any[] = [...existingFounders];
-        for (const newFounder of incomingFounders) {
-          if (!newFounder || !newFounder.name) continue;
-          const key = normalize(newFounder.name);
-          if (!key) continue;
-
-          const idx = mergedFounders.findIndex(
-            f => f && normalize(f.name) === key
-          );
-          if (idx >= 0) {
-            // Merge fields so a partial update (e.g. only voiceExamples) preserves other fields
-            mergedFounders[idx] = { ...mergedFounders[idx], ...newFounder };
-          } else {
-            // Append as new founder
-            mergedFounders.push(newFounder);
-          }
-        }
-
-        // Assign the merged array back
-        updatedBrandData.founders = mergedFounders;
+        updatedBrandData.founders = mergeFounders(
+          (existingBrand.brandData as any)?.founders,
+          (brandData as any).founders,
+        );
       }
 
       // Reject SVG files for logo/secondaryLogo assets

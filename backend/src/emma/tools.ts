@@ -2032,7 +2032,7 @@ emmaToolRegistry.register({
                 },
                 required: ['name']
               },
-              description: 'Array of founder profiles'
+              description: 'Complete list of founder profiles. This list replaces the stored founders: always include every founder that should remain (fields you omit are kept for founders matched by name); founders left out are removed.'
             }
           }
         },
