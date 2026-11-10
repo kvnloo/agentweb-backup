@@ -1500,6 +1500,30 @@
     }
   },
   {
+    "name": "get_conversion_summary",
+    "listed": false,
+    "description": "Aggregate lead/conversion counts for your own account over a date range (default: last 30 days, max 366 days): per landing page (unique leads and form-submission conversions), per lead list (leads added), and totals. Counts only — no lead details. Only your own lists and pages are included.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "start_date": {
+          "type": "string",
+          "description": "Inclusive start date, YYYY-MM-DD (UTC)"
+        },
+        "end_date": {
+          "type": "string",
+          "description": "Inclusive end date, YYYY-MM-DD (UTC). Default: today"
+        }
+      },
+      "required": []
+    },
+    "sideEffect": "read",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
     "name": "get_deployment_status",
     "listed": false,
     "description": "Check the Vercel build/deployment status of a landing page. Use this after deploy_landing_page to verify the build succeeded. Note: for code edits, prefer using coding_agent which checks deployment status automatically after edits. The response's launchReadiness field is a SEPARATE signal from status/buildStatus: a page can build and deploy successfully and still not be launch-ready (failed post-deploy smoke test, no conversion tracking installed). Check launchReadiness.ready before telling the user the page is ready to send traffic to — if false, relay launchReadiness.reasons plainly.",
