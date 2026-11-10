@@ -9665,7 +9665,16 @@ emmaToolRegistry.register({
     if (!context?.userId) return { success: false, message: 'Authentication required' };
     // ENG-2907: a non-Google URL (e.g. a luma.com page) used to be sent to Drive
     // verbatim as a fileId, 404, and cluster as a config failure. Refuse it up front.
-    const raw = String(args.url_or_id ?? '').trim();
+    let raw = String(args.url_or_id ?? '').trim();
+    // Unwrap google.com/url?q=<target> redirect links (Opslane P2 on #3960) so a
+    // wrapped Docs link is read, and a wrapped non-Google link is still refused.
+    try {
+      const wrapped = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`);
+      if (/^(www\.)?google\.com$/i.test(wrapped.hostname) && wrapped.pathname === '/url') {
+        const target = wrapped.searchParams.get('q') ?? wrapped.searchParams.get('url');
+        if (target) raw = target.trim();
+      }
+    } catch { /* not a URL; handled below */ }
     // Drive file IDs are [A-Za-z0-9_-]+; anything with a scheme, '/' or '.' is a URL,
     // including scheme-less pastes like "luma.com/event/..." (Opslane P1 on #3960).
     const hasScheme = /^https?:\/\//i.test(raw);

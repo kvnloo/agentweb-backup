@@ -203,6 +203,26 @@ describe('read_google_doc — URL parsing', () => {
     expect(mockReadGoogleFileById).toHaveBeenCalledWith('D9', USER);
   });
 
+  it('unwraps a google.com/url redirect to a Docs link (ENG-2907, Opslane P2)', async () => {
+    mockReadGoogleFileById.mockResolvedValue({ success: true });
+    const tool = await getTool('read_google_doc');
+    await tool.execute(
+      { url_or_id: 'https://www.google.com/url?q=https://docs.google.com/document/d/R1/edit&sa=D' },
+      { userId: USER },
+    );
+    expect(mockReadGoogleFileById).toHaveBeenCalledWith('R1', USER);
+  });
+
+  it('still refuses a google.com/url redirect to a non-Google link (ENG-2907)', async () => {
+    const tool = await getTool('read_google_doc');
+    const result = await tool.execute(
+      { url_or_id: 'https://www.google.com/url?q=https://luma.com/event/x' },
+      { userId: USER },
+    );
+    expect(result.reason).toBe('non_google_url');
+    expect(mockReadGoogleFileById).not.toHaveBeenCalled();
+  });
+
   it('still accepts docs/sheets/drive.google.com URLs (ENG-2907)', async () => {
     mockReadGoogleFileById.mockResolvedValue({ success: true });
     const tool = await getTool('read_google_doc');
