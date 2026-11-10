@@ -8,6 +8,7 @@ import {
   summarizeLearningPhase,
   META_HEALTH_TOOL_NAMES,
 } from '../mcp/metaToolkitHealth';
+import { MetaToolkitRefusal } from '../mcp/metaToolkitErrors';
 
 describe('ENG-2916 account health', () => {
   it('labels a healthy USD account and converts cents to major units', () => {
@@ -64,9 +65,27 @@ describe('ENG-2916 runMetaHealthTool', () => {
     expect(lp).toMatchObject({ account_id: '9', truncated: true, summary: { learning: 1 } });
   });
 
+  it('IN_GRACE_PERIOD still delivers, with a payment warning (ENG-2916 review)', () => {
+    const h = summarizeAccountHealth({ id: 'act_9', currency: 'USD', account_status: 9 });
+    expect(h.can_deliver).toBe(true);
+    expect(h.account_status).toBe('IN_GRACE_PERIOD');
+    expect(h.warnings.join(' ')).toMatch(/payment failed/);
+  });
+
+  it('a Graph error becomes a refusal with Meta\'s message only, never the token', async () => {
+    const err: any = Object.assign(new Error('Request failed with status code 400'), {
+      config: { params: { access_token: 'SECRET' } }, metaError: { code: 190, message: 'Invalid OAuth access token.' },
+    });
+    const readAccountGraph = jest.fn().mockRejectedValue(err);
+    const p = runMetaHealthTool('meta_account_health', 'u', '9', {}, { readAccountGraph });
+    await expect(p).rejects.toBeInstanceOf(MetaToolkitRefusal);
+    await expect(runMetaHealthTool('meta_learning_phase', 'u', '9', {}, { readAccountGraph })).rejects.toThrow(/Invalid OAuth access token/);
+    await expect(runMetaHealthTool('meta_learning_phase', 'u', '9', {}, { readAccountGraph })).rejects.not.toThrow(/SECRET/);
+  });
+
   it('rejects a non-numeric campaign_id before any read', async () => {
     const readAccountGraph = jest.fn();
-    await expect(runMetaHealthTool('meta_learning_phase', 'u', '9', { campaign_id: '1&access_token=x' }, { readAccountGraph })).rejects.toThrow(/numeric/);
+    await expect(runMetaHealthTool('meta_learning_phase', 'u', '9', { campaign_id: '1&access_token=x' }, { readAccountGraph })).rejects.toThrow(MetaToolkitRefusal);
     expect(readAccountGraph).not.toHaveBeenCalled();
   });
 });
