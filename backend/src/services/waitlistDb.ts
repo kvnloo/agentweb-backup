@@ -216,11 +216,16 @@ export const waitlistDb = {
   async deleteByEmail(
     email: string
   ): Promise<{ success: boolean; message?: string }> {
+    if (email.toLowerCase() === '__zoma_free_capacity__') {
+      return { success: false, message: 'Capacity counter cannot be deleted through waitlist CRUD.' };
+    }
     const params = {
       TableName: `${TABLE_PREFIX}AW-Waitlist`,
       Key: {
         email: email.toLowerCase(),
       },
+      // Admission decisions are durable idempotency records, not disposable leads.
+      ConditionExpression: 'attribute_not_exists(zomaStatus)',
     };
 
     try {
