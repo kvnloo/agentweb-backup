@@ -1,6 +1,6 @@
 import axios from 'axios';
 import { getGoogleAdsCredentials } from '../utils/secretsManager';
-import { assertPublicHostname } from '../utils/ssrfGuard';
+import { resolvePinnedPublicAddress } from '../utils/ssrfGuard';
 import { updateAccountTokens } from './connectedAccountsDb'; // sibling in services/
 import { buildUtmSpec, mergeUtmIntoQueryString, mergeUtmIntoUrl, readUtmKeys, utmKeysInQueryString, utmQueryString } from '../utils/adUtm';
 import {
@@ -2545,7 +2545,10 @@ export class GoogleAdsService {
         // server-side fetch: block private/internal hosts, disable redirects (a 302
         // to a private IP would otherwise bypass the guard), and cap the size.
         // Mirrors the established pattern in routes/crm.ts.
-        await assertPublicHostname(asset.data);
+        // ENG-2928: resolve once and PIN the connection to the validated address. A separate
+        // check followed by axios' own DNS lookup can be rebound to an internal address
+        // between the two (this path is now reachable by external Zoma API keys).
+        const pinned = await resolvePinnedPublicAddress(asset.data);
         const MAX_ASSET_BYTES = 10 * 1024 * 1024; // 10 MB
         // `as any` routes around the legacy @types/axios shim in this repo that
         // doesn't carry maxRedirects/validateStatus on its config interface
@@ -2557,7 +2560,12 @@ export class GoogleAdsService {
           maxContentLength: MAX_ASSET_BYTES,
           maxBodyLength: MAX_ASSET_BYTES,
           timeout: 15000,
+          signal: AbortSignal.timeout(15000),
           validateStatus: (s: number) => s >= 200 && s < 300,
+          lookup: (_hostname: string, options: any, callback: any) => {
+            if (typeof options === 'function') callback = options;
+            callback(null, pinned.address, pinned.family);
+          },
         } as any);
         imageBuffer = Buffer.from(response.data as ArrayBuffer);
       } else {

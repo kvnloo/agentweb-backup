@@ -752,6 +752,9 @@ export async function executeGoogleToolkitWrite(
     state = { prior };
     lines.push(`Remove ${prior!.negative ? 'negative ' : ''}keyword ${keywordLabel(prior!)}${prior!.status ? ` (currently ${prior!.status})` : ''}${prior!.adGroup ? ` from ad group ${prior!.adGroup}` : ''}.`);
     lines.push('Removal is permanent: adding the keyword again later creates a new keyword without its history.');
+    if (prior!.negative) {
+      lines.push('Removing this negative keyword lets ads show for these searches again, which can increase spend.');
+    }
   } else if (op === 'AD CREATE') {
     const adGroup = await readParent<GoogleAdGroupState>('Ad group');
     state = { adGroup };
@@ -828,7 +831,8 @@ export async function executeGoogleToolkitWrite(
       ? 'Status: PAUSED — new campaigns, ad groups, keywords, ads and asset groups are always created paused; enabling is a separate preview and approval.'
       : validated.expectedStatus === 'PAUSED'
         ? 'Status: PAUSED — stops delivery.'
-        : op === 'BUDGET CREATE' ? 'A new budget spends nothing until an enabled campaign uses it.' : 'Status: unchanged.');
+        : op === 'BUDGET CREATE' ? 'A new budget spends nothing until an enabled campaign uses it.'
+          : op === 'KEYWORD REMOVE' ? '' : 'Status: unchanged.');
 
   const policy = deps.spendCeilingPolicy();
   if (policy && validated.budgetMicros !== undefined) {
@@ -847,7 +851,7 @@ export async function executeGoogleToolkitWrite(
   const fingerprint = previewFingerprint({ platform: 'google_ads', userId, args: validated.dispatchArgs, state, currency });
   const now = deps.now();
   const secret = deps.secret();
-  const freshPreview = () => previewResponse({ secret, userId, now, fingerprint, preview: lines.join('\n') });
+  const freshPreview = () => previewResponse({ secret, userId, now, fingerprint, preview: lines.filter(Boolean).join('\n') });
 
   if (confirm !== true) return freshPreview();
 
