@@ -102,6 +102,7 @@ describe('ENG-2898 get_conversion_summary', () => {
 
   it('accepts exactly 366 days and defaults to last 30', () => {
     expect(() => resolveRange({ start_date: '2024-01-01', end_date: '2024-12-31' })).not.toThrow();
+    expect(() => resolveRange({ start_date: '2026-02-30', end_date: '2026-03-05' })).toThrow('start_date is not a valid date');
     const r = resolveRange({}, Date.parse('2026-11-10T12:00:00Z'));
     expect(r).toMatchObject({ start: '2026-10-12', end: '2026-11-10' });
   });

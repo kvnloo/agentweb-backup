@@ -26,7 +26,10 @@ function parseDay(value: unknown, field: string): number {
     throw new Error(`${field} must be a date in YYYY-MM-DD format`);
   }
   const ms = Date.parse(`${value.trim()}T00:00:00.000Z`);
-  if (Number.isNaN(ms)) throw new Error(`${field} is not a valid date`);
+  // Round-trip: Date.parse rolls impossible days (2026-02-30) into the next month.
+  if (Number.isNaN(ms) || new Date(ms).toISOString().slice(0, 10) !== value.trim()) {
+    throw new Error(`${field} is not a valid date`);
+  }
   return ms;
 }
 
