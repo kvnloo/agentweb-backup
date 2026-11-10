@@ -15593,10 +15593,20 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
     const apiVersion = process.env.META_API_VERSION || 'v25.0';
     const path = `act_${accountId.replace(/^act_/, '')}${edge ? `/${edge}` : ''}`;
-    const { data } = await axios.get(`https://graph.facebook.com/${apiVersion}/${path}`, {
-      params: { ...params, access_token: accessToken },
-    });
-    return data;
+    try {
+      const { data } = await axios.get(`https://graph.facebook.com/${apiVersion}/${path}`, {
+        params: { ...params, access_token: accessToken },
+        timeout: 30_000,
+        maxContentLength: 5_000_000,
+      });
+      return data;
+    } catch (error: any) {
+      // The axios error carries the access token in its config/URL; re-throw Meta's fields only.
+      const meta = error?.response?.data?.error;
+      const wrapped: any = new Error(String(meta?.error_user_msg || meta?.message || 'Meta request failed.'));
+      wrapped.metaError = meta ? { code: meta.code, error_subcode: meta.error_subcode, message: meta.message } : null;
+      throw wrapped;
+    }
   }
 
   /** Read-back after a toolkit write: status + effective status + budgets, ownership-scoped. */

@@ -16,6 +16,8 @@
  * agentModeService lazily so the manifest never imports the service graph).
  */
 
+import { MetaToolkitRefusal } from './metaToolkitErrors';
+
 export const META_HEALTH_TOOL_NAMES = ['meta_account_health', 'meta_learning_phase'] as const;
 export type MetaHealthToolName = (typeof META_HEALTH_TOOL_NAMES)[number];
 
@@ -68,7 +70,7 @@ const DISABLE_REASON: Record<number, string> = {
 const ZERO_DECIMAL = new Set(['CLP', 'COP', 'CRC', 'HUF', 'ISK', 'IDR', 'JPY', 'KRW', 'PYG', 'TWD', 'VND']);
 export const SPEND_CAP_WARN_RATIO = 0.9;
 
-export const ACCOUNT_FIELDS = 'id,name,currency,account_status,disable_reason,spend_cap,amount_spent,balance';
+export const ACCOUNT_FIELDS = 'id,name,currency,account_status,disable_reason,spend_cap,amount_spent';
 export const ADSET_FIELDS = 'id,name,campaign_id,effective_status,learning_stage_info';
 
 function toMajor(minor: unknown, currency: string): number | null {
@@ -90,8 +92,13 @@ export function summarizeAccountHealth(raw: any) {
   const amountSpent = toMajor(raw?.amount_spent, currency);
   const remaining = spendCap !== null && amountSpent !== null ? Math.max(0, Math.round((spendCap - amountSpent) * 100) / 100) : null;
 
-  const canDeliver = statusCode === 1;
+  // IN_GRACE_PERIOD (9): a payment failed, Meta keeps delivering while it retries the charge.
+  const inGracePeriod = statusCode === 9;
+  const canDeliver = statusCode === 1 || inGracePeriod;
   const warnings: string[] = [];
+  if (inGracePeriod) {
+    warnings.push('Ad account is IN_GRACE_PERIOD: a payment failed. Ads still deliver for now, but delivery stops if the balance is not paid; fix the payment method in Meta Billing.');
+  }
   if (!canDeliver) {
     warnings.push(
       `Ad account is ${status}${reasonCode ? ` (reason: ${disableReason})` : ''}; ads will not deliver. ` +
@@ -170,19 +177,33 @@ export async function runMetaHealthTool(
   args: any,
   deps: MetaHealthDeps = defaultDeps,
 ) {
+  // Graph errors are re-thrown as a refusal with Meta's own message only (never the request).
+  const read = async (edge: '' | 'adsets', params: Record<string, string>) => {
+    try {
+      return await deps.readAccountGraph(userId, accountId, edge, params);
+    } catch (error: any) {
+      throw new MetaToolkitRefusal(`Could not read ${edge ? 'ad sets' : 'the ad account'} from Meta: ${error?.metaError?.message || error?.message || 'Meta request failed'}.`);
+    }
+  };
   if (name === 'meta_account_health') {
-    return summarizeAccountHealth(await deps.readAccountGraph(userId, accountId, '', { fields: ACCOUNT_FIELDS }));
+    return summarizeAccountHealth(await read('', { fields: ACCOUNT_FIELDS }));
   }
   const filtering: any[] = [];
   if (args?.campaign_id !== undefined) {
     const campaignId = String(args.campaign_id);
-    if (!/^\d+$/.test(campaignId)) throw new Error('campaign_id must be a numeric Meta campaign id.');
+    if (!/^\d+$/.test(campaignId)) throw new MetaToolkitRefusal('campaign_id must be a numeric Meta campaign id.');
     filtering.push({ field: 'campaign.id', operator: 'IN', value: [campaignId] });
   }
   if (args?.include_inactive !== true) filtering.push({ field: 'effective_status', operator: 'IN', value: ['ACTIVE'] });
   const params: Record<string, string> = { fields: ADSET_FIELDS, limit: String(MAX_ADSETS) };
   if (filtering.length) params.filtering = JSON.stringify(filtering);
-  const res = await deps.readAccountGraph(userId, accountId, 'adsets', params);
+  const res = await read('adsets', params);
   const data = Array.isArray(res?.data) ? res.data : [];
-  return { account_id: accountId, ...summarizeLearningPhase(data), ...(res?.paging?.next ? { truncated: true } : {}) };
+  return {
+    account_id: accountId,
+    ...summarizeLearningPhase(data),
+    ...(res?.paging?.next
+      ? { truncated: true, note: `Only the first ${MAX_ADSETS} ad sets were read; the summary counts cover those only. Pass campaign_id to narrow it.` }
+      : {}),
+  };
 }
