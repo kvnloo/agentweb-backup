@@ -222,6 +222,14 @@ describe('ENG-2928 keywords', () => {
     expect((await approve(blind, remove)).result).toMatchObject({ success: false, verification: 'UNCONFIRMED' });
   });
 
+  it('REMOVE of a negative keyword warns that it can increase spend (and does not say "Status: unchanged")', async () => {
+    const d = writeDeps();
+    const { preview } = await approve(d, { ...base, entity_type: 'KEYWORD', action: 'REMOVE', criterion_resource_name: NEG_KEYWORD });
+    expect(preview.preview).toContain('Remove negative keyword');
+    expect(preview.preview).toMatch(/can increase spend/);
+    expect(preview.preview).not.toContain('Status: unchanged');
+  });
+
   it('REMOVE of a keyword that does not exist is refused, nothing sent', async () => {
     const d = writeDeps();
     await expect(executeGoogleToolkitWrite('u1', { ...base, entity_type: 'KEYWORD', action: 'REMOVE', criterion_resource_name: `customers/${CID}/adGroupCriteria/66~999` }, 'USD', d))
