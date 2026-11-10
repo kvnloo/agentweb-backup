@@ -2051,7 +2051,8 @@ mcpToolRegistry.register({
     if (!task) return jsonResult({ success: false, error: KB_NOT_FOUND });
     const lowered = fileName.toLowerCase();
     const existingName = lowered === KB_MAIN_FILE
-      ? KB_MAIN_FILE
+      // An attachment stored under this exact case-variant name wins over the main file.
+      ? (fileName !== KB_MAIN_FILE && (task.knowledgeBaseFiles || []).find((f: any) => f?.filename === fileName)?.filename) || KB_MAIN_FILE
       : (task.knowledgeBaseFiles || []).find((f: any) => String(f?.filename ?? '').toLowerCase() === lowered)?.filename;
     if (existingName) {
       // Report the stored name: update_knowledge_base_file_content matches names exactly.
