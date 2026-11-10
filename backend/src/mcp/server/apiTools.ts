@@ -2277,6 +2277,34 @@ mcpToolRegistry.register({
   }
 });
 
+/** Allow-list projection of GET /api/crm/sender-emails shared by list/update sender tools. */
+function projectSenderSettings(data: any) {
+  const senders = Array.isArray(data?.senders) ? data.senders : [];
+  const mailboxes = Array.isArray(data?.connectedEmailAccounts) ? data.connectedEmailAccounts : [];
+  return {
+    senders: senders.map((s: any) => ({
+      id: s?.id ?? null,
+      email: s?.email ?? null,
+      from_name: s?.fromName ?? null,
+      sender_provider: s?.senderProvider ?? null,
+      connected_account_id: s?.connectedAccountId ?? null,
+      daily_limit: s?.dailyLimit ?? null,
+      effective_daily_limit: s?.effectiveDailyLimit ?? null,
+      // null = unknown (uncapped sender, or the usage read failed) — never a fake zero.
+      sent_today: s?.sentTodayKnown === false || typeof s?.sentToday !== 'number' ? null : s.sentToday,
+      warmup_started_at: s?.warmupStartedAt ?? null,
+    })),
+    default_sender_id: data?.defaultSenderId ?? null,
+    default_linkedin_account_id: data?.defaultLinkedInAccountId ?? null,
+    connected_email_accounts: mailboxes.map((a: any) => ({
+      account_id: a?.account_id ?? null,
+      account_name: a?.account_name ?? null,
+      email: a?.email ?? null,
+      platform: a?.platform ?? null,
+    })),
+  };
+}
+
 // ─── Sender Settings (ENG-2868) ─────────────────────────────────────────────
 
 /**
@@ -2296,30 +2324,73 @@ mcpToolRegistry.register({
   },
   execute: async (_args: any, context: any) => {
     const data = await mcpFetch({ method: 'GET', path: '/api/crm/sender-emails', context: ctx(context) });
-    const senders = Array.isArray(data?.senders) ? data.senders : [];
-    const mailboxes = Array.isArray(data?.connectedEmailAccounts) ? data.connectedEmailAccounts : [];
-    return jsonResult({
-      senders: senders.map((s: any) => ({
-        id: s?.id ?? null,
-        email: s?.email ?? null,
-        from_name: s?.fromName ?? null,
-        sender_provider: s?.senderProvider ?? null,
-        connected_account_id: s?.connectedAccountId ?? null,
-        daily_limit: s?.dailyLimit ?? null,
-        effective_daily_limit: s?.effectiveDailyLimit ?? null,
-        // null = unknown (uncapped sender, or the usage read failed) — never a fake zero.
-        sent_today: s?.sentTodayKnown === false || typeof s?.sentToday !== 'number' ? null : s.sentToday,
-        warmup_started_at: s?.warmupStartedAt ?? null,
-      })),
-      default_sender_id: data?.defaultSenderId ?? null,
-      default_linkedin_account_id: data?.defaultLinkedInAccountId ?? null,
-      connected_email_accounts: mailboxes.map((a: any) => ({
-        account_id: a?.account_id ?? null,
-        account_name: a?.account_name ?? null,
-        email: a?.email ?? null,
-        platform: a?.platform ?? null,
-      })),
+    return jsonResult(projectSenderSettings(data));
+  }
+});
+
+// ENG-2897 (ENG-2847.7): set the caller's own default email / LinkedIn sender.
+// Identity is runtime-only (no client_id). Both ids are checked against the
+// caller's OWN config / OWN connected accounts before anything is written, and
+// the existing sender list is re-posted unchanged so only the defaults move.
+// Sequence activation state is never touched.
+mcpToolRegistry.register({
+  name: 'update_sender_settings',
+  definition: {
+    name: 'update_sender_settings',
+    description: 'Set your own default CRM email sender and/or default LinkedIn sender account. default_sender_id must be one of your configured senders (see list_sender_settings); default_linkedin_account_id must be a LinkedIn (unipile) account you own (see list_connected_accounts). Does not change sequences or their activation. Returns the resulting settings as list_sender_settings shows them.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        default_sender_id: { type: 'string', description: 'Sender id from list_sender_settings.senders[].id' },
+        default_linkedin_account_id: { type: 'string', description: 'Your own LinkedIn (unipile) connected account_id' },
+      },
+      required: []
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const senderId = args?.default_sender_id;
+    const linkedInId = args?.default_linkedin_account_id;
+    if (senderId === undefined && linkedInId === undefined) {
+      throw new Error('Provide default_sender_id and/or default_linkedin_account_id');
+    }
+    if (senderId !== undefined && (typeof senderId !== 'string' || !senderId.trim())) {
+      throw new Error('default_sender_id must be a non-empty string');
+    }
+    if (linkedInId !== undefined && (typeof linkedInId !== 'string' || !linkedInId.trim())) {
+      throw new Error('default_linkedin_account_id must be a non-empty string');
+    }
+    const scoped = ctx(context);
+    const current = await mcpFetch({ method: 'GET', path: '/api/crm/sender-emails', context: scoped });
+    const senders: any[] = Array.isArray(current?.senders) ? current.senders : [];
+    if (senderId !== undefined && !senders.some((s: any) => s?.id === senderId)) {
+      throw new Error(`default_sender_id "${senderId}" is not one of your configured senders`);
+    }
+    if (linkedInId !== undefined) {
+      const conn = await mcpFetch({ method: 'GET', path: '/api/oauth/connected-accounts', context: scoped, queryParams: { platform: 'unipile' } });
+      const accounts: any[] = Array.isArray(conn?.accounts) ? conn.accounts : [];
+      const ownsIt = accounts.some((a: any) => a?.platform === 'unipile' && a?.account_id === linkedInId && a?.owned === true);
+      if (!ownsIt) {
+        throw new Error(`default_linkedin_account_id "${linkedInId}" is not a LinkedIn account you own`);
+      }
+    }
+    await mcpFetch({
+      method: 'POST',
+      path: '/api/crm/sender-emails',
+      context: scoped,
+      body: {
+        // Unchanged senders pass the route's grandfather check, so no re-validation side effects.
+        senders: senders.map((s: any) => ({
+          id: s.id, email: s.email, fromName: s.fromName, notes: s.notes,
+          senderType: s.senderType, senderProvider: s.senderProvider,
+          connectedAccountId: s.connectedAccountId, gmailAccountId: s.gmailAccountId,
+          dailyLimit: s.dailyLimit, warmupStartedAt: s.warmupStartedAt,
+        })),
+        defaultSenderId: senderId ?? current?.defaultSenderId ?? null,
+        defaultLinkedInAccountId: linkedInId ?? current?.defaultLinkedInAccountId ?? null,
+      },
     });
+    const after = await mcpFetch({ method: 'GET', path: '/api/crm/sender-emails', context: scoped });
+    return jsonResult(projectSenderSettings(after));
   }
 });
 

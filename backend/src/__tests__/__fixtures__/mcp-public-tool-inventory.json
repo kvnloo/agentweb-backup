@@ -1274,6 +1274,28 @@
     }
   },
   {
+    "name": "export_lead_list",
+    "listed": false,
+    "description": "Export every lead in one of your own CRM lead lists to a CSV file. Returns the export record (exportId, recordCount, filename, fileUrl). Requires editor access to the list; works only on lists your account can edit.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "list_id": {
+          "type": "string",
+          "description": "Lead list ID to export"
+        }
+      },
+      "required": [
+        "list_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
     "name": "freeze_user_account",
     "listed": false,
     "description": "Freeze (deactivate) or unfreeze (reactivate) a user account. Admin only. Use this to disable bot accounts or re-enable legitimate accounts.",
@@ -1993,6 +2015,28 @@
       "required": []
     },
     "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "list_lead_list_exports",
+    "listed": false,
+    "description": "List past CSV exports (newest first, up to 50) for one of your own CRM lead lists.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "list_id": {
+          "type": "string",
+          "description": "Lead list ID"
+        }
+      },
+      "required": [
+        "list_id"
+      ]
+    },
+    "sideEffect": "read",
     "gating": {
       "internalOnly": false,
       "requiresUserAccount": false
@@ -3741,6 +3785,30 @@
         "page_id",
         "context"
       ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "update_sender_settings",
+    "listed": false,
+    "description": "Set your own default CRM email sender and/or default LinkedIn sender account. default_sender_id must be one of your configured senders (see list_sender_settings); default_linkedin_account_id must be a LinkedIn (unipile) account you own (see list_connected_accounts). Does not change sequences or their activation. Returns the resulting settings as list_sender_settings shows them.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "default_sender_id": {
+          "type": "string",
+          "description": "Sender id from list_sender_settings.senders[].id"
+        },
+        "default_linkedin_account_id": {
+          "type": "string",
+          "description": "Your own LinkedIn (unipile) connected account_id"
+        }
+      },
+      "required": []
     },
     "sideEffect": "write",
     "gating": {
