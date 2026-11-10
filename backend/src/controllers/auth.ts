@@ -23,6 +23,7 @@ import { metaService } from "../services/metaService";
 import { emitAppSignal } from "../services/serverSignalEmitter";
 import { MCP_CONSENT_SIGNUP_SOURCE, validateRef } from "../services/journeyAttribution";
 import { noteProductUse, noteSignup } from "../services/journeyMilestones";
+import { emitActivationLogin } from "../services/zomaActivationEvents";
 
 // ENG-1402: server-side half of the CompleteRegistration conversion for our OWN
 // customer-portal signup (not a customer's ad account — reuses sendCapiLeadEvent's
@@ -433,6 +434,7 @@ export const login = async (req: Request, res: Response) => {
       { expiresIn: "90d" }
     );
 
+    void emitActivationLogin(user.userId);
     void emitAppSignal(user as any, "login", { method: "password" });
 
     const { password: _, ...userWithoutPassword } = user;
@@ -747,6 +749,7 @@ export const googleCallback = async (
       { expiresIn: "90d" }
     );
 
+    void emitActivationLogin(user.userId);
     void emitAppSignal(user as any, "login", { method: "google", isNewUser: isNewUser ? 1 : 0 });
     if (isNewUser) void emitAppSignal(user as any, "registration_completed", { method: "google" });
 

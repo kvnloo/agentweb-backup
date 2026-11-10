@@ -1237,6 +1237,7 @@ export class UserDB {
 
     try {
       await this.docClient.put(params).promise();
+      void import('./zomaActivationEvents').then(m => m.emitActivationSignup(userId, itemToCreate.email, itemToCreate.createdAt)).catch(() => undefined);
       // Fire-and-forget CRM signal (B2). Never awaited — signup latency must not
       // depend on AW-ContactEvents. Errors are swallowed inside onUserSignup.
       void onUserSignup({
@@ -1565,6 +1566,47 @@ export class UserDB {
       lastEvaluatedKey = result.LastEvaluatedKey;
     } while (lastEvaluatedKey);
     return counts;
+  }
+
+  /** ENG-2880: first observation is conditional in DynamoDB, not a process-local cache. */
+  async recordZomaActivationEvent(
+    user: { email: string; userId: string },
+    stage: import('./zomaActivationEvents').ActivationStage,
+    event: import('./zomaActivationEvents').ActivationEvent,
+  ): Promise<boolean> {
+    const base = { TableName: this.tableName, Key: { email: user.email } };
+    // Initialize only if absent; concurrent emitters cannot replace an existing map.
+    await this.docClient.update({
+      ...base, UpdateExpression: 'SET #events = if_not_exists(#events, :empty)',
+      ConditionExpression: 'userId = :userId',
+      ExpressionAttributeNames: { '#events': 'zomaActivationEvents' },
+      ExpressionAttributeValues: { ':empty': {}, ':userId': user.userId },
+    }).promise();
+    try {
+      await this.docClient.update({
+        ...base, UpdateExpression: 'SET #events.#stage = :event',
+        ConditionExpression: 'userId = :userId AND attribute_not_exists(#events.#stage)',
+        ExpressionAttributeNames: { '#events': 'zomaActivationEvents', '#stage': stage },
+        ExpressionAttributeValues: { ':event': event, ':userId': user.userId },
+      }).promise();
+      return true;
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') return false;
+      throw error;
+    }
+  }
+
+  /** Admin-only bounded progress scan: no password/token fields, no count-table fan-out. */
+  async listZomaActivationUsers(cursor?: { email: string }) {
+    const result = await this.docClient.scan({
+      TableName: this.tableName, Limit: 250,
+      ProjectionExpression: 'userId, email, createdAt, zomaActivationEvents',
+      ...(cursor ? { ExclusiveStartKey: cursor } : {}),
+    }).promise();
+    return {
+      users: (result.Items ?? []).filter(u => typeof u.userId === 'string' && !u.userId.startsWith('deleted_') && !isEvaluationUser(u.userId)) as import('./zomaActivationEvents').ActivationUser[],
+      cursor: result.LastEvaluatedKey,
+    };
   }
 
   /**

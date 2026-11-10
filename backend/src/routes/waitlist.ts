@@ -142,6 +142,9 @@ router.put("/:email/status", authenticateToken, isAdmin, async (req, res) => {
       status === "invited" ? new Date().toISOString() : undefined
     );
 
+    if (status === 'invited' || status === 'completed') {
+      await import('../services/zomaActivationEvents').then(m => m.emitWaitlistApproval(email)).catch(() => undefined);
+    }
     res.json(entry);
   } catch (error) {
     console.error("Error updating waitlist status:", error);

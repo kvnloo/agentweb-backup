@@ -10,6 +10,7 @@ import authRoutes from "./routes/auth";
 import taskRoutes from "./routes/tasks";
 import waitlistRoutes from "./routes/waitlist";
 import scheduleRoutes from "./routes/schedules";
+import adminZomaActivationRoutes from "./routes/adminZomaActivation";
 import adminRoutes from "./routes/admin";
 import adminUsageRoutes from "./routes/adminUsage";
 import adminZomaScoreboardRoutes from "./routes/adminZomaScoreboard";
@@ -457,6 +458,7 @@ app.use("/api/schedules", scheduleRoutes);
 // response either way. See middleware/agentRunsAuth.ts.
 app.use("/api/admin/agent-runs", authenticateAgentRunsSecretOrAdmin(agentRunsRoutes));
 app.use("/api/admin", adminZomaScoreboardRoutes);
+app.use("/api/admin", adminZomaActivationRoutes);
 app.use("/api/admin", adminRoutes);
 app.use("/api/admin", adminUsageRoutes);
 app.use("/api/admin", mcpUsageAdminRoutes);

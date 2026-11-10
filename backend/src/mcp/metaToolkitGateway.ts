@@ -9,10 +9,11 @@
  *   3. execute through executeMetaToolkitCall (ENG-2268 refuses all external v1 writes),
  *   4. emit exactly ONE usage event per successful call via recordMcpToolUse.
  *
- * Storage: reuses agent API keys, MCP OAuth tokens, connected accounts and MCP usage events
- * only. No new table, key or persistence model (data-plane gate respected).
+ * Usage storage reuses existing MCP usage events. ENG-2880 activation observations
+ * additionally use a gated AW-Users attribute (dark; DATA-PLANE approval required).
  */
 import { withMetaToolkitBackoff } from '../utils/metaToolkitBackoff';
+import { emitActivationLogin, observeActivationWrite } from '../services/zomaActivationEvents';
 import { agentApiKeyService } from '../services/agentApiKeyService';
 import { mcpOAuthService } from './oauth/oauthService';
 import {
@@ -370,6 +371,7 @@ function isReadableFailure(error: unknown): error is Error {
  */
 export async function handleMetaToolkitCall(request: MetaToolkitCallRequest, deps: MetaToolkitGatewayDeps = defaultDeps) {
   const caller = await authenticateMetaToolkitCaller(request.authorization, deps);
+  void emitActivationLogin(caller.userId);
   try {
     return await runAuthenticatedMetaToolkitCall(caller, request, deps);
   } catch (error) {
@@ -623,7 +625,7 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
   if (audienceTool) result = await (deps.executeAudience ?? executeMetaToolkitAudience)(caller.userId, args);
   else if (creativeAsset) result = await (deps.executeCreative ?? executeMetaToolkitCreative)(caller.userId, args);
   else if (lifecycle) result = await (deps.executeLifecycle ?? executeMetaToolkitLifecycle)(caller.userId, args);
-  else if (guardedWrite) result = await (deps.executeWrite ?? executeMetaToolkitWrite)(caller.userId, args);
+  else if (guardedWrite) result = await observeActivationWrite(caller.userId, args, () => (deps.executeWrite ?? executeMetaToolkitWrite)(caller.userId, args));
   else result = await deps.execute(request.toolName, args, { userId: caller.userId, sessionId: request.sessionId });
 
   // ENG-2915: a BULK_CREATE result carries one verdict per creative; each is its own write event.

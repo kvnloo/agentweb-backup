@@ -4,6 +4,7 @@
  * Extracted verbatim from metaAuth.ts so both entry points run one implementation. Callers
  * own authentication and state verification; these functions trust the `userId` they get.
  */
+import { ActivationStage, emitActivation } from './zomaActivationEvents';
 import axios from 'axios';
 import crypto from 'crypto';
 import { getMetaCredentials, getInstagramCredentials } from '../utils/secretsManager';
@@ -366,6 +367,7 @@ export async function connectMetaAdAccounts(params: {
             }
         });
         connectedAccounts.push(account);
+        await emitActivation(userId, ActivationStage.AdAccountConnected);
 
         // ENG-1986: post-reconnect read-back — a 200 from OAuth is not proof the
         // credential reads the account. Best-effort; never fails the connect.

@@ -6,8 +6,9 @@
  * file (Stripe-hosted Checkout, mode=setup — saves a card, charges nothing); then a usable
  * Meta ad-account connection (the existing Meta OAuth connect URL).
  *
- * State is DERIVED, never stored: the user row, connected accounts, and the Stripe
- * customer's payment methods. No table, column or index is added (data-plane gate). A
+ * Readiness is DERIVED: the user row, connected accounts, and the Stripe
+ * customer's payment methods. ENG-2880 optionally records first-observed activation
+ * milestones separately on AW-Users (dark; requires data-plane approval). A
  * Stripe customer created for a user without `stripe_customer_id` carries
  * `metadata.userId` and is found again by search instead of being written to the user row.
  *
@@ -17,6 +18,7 @@
  * link finishes on Zoma's own pages (state `zoma: ZOMA_MCP_SETUP`), the card link returns to
  * Zoma's own page, and the first answer is "Hey, welcome to Zoma." plus one question.
  */
+import { ActivationStage, emitActivation } from '../services/zomaActivationEvents';
 import { userDb } from '../services/db';
 import { stripeService, type UserPaymentMethod } from '../services/stripeService';
 import { buildMetaConnectUrl } from '../services/metaConnectUrl';
@@ -405,6 +407,9 @@ export async function getZomaReadiness(
   }
   readiness.next_step = nextStep(adsExperience, payment, meta, readiness.google_ads) ?? (blocker ? formatMetaPageBlocker(blocker) : null);
   readiness.docs_url = zomaDocsUrl(deps);
+  await emitActivation(userId, ActivationStage.OnboardingStarted);
+  if (meta.ready || readiness.google_ads?.ready) await emitActivation(userId, ActivationStage.AdAccountConnected);
+  if (writes_enabled || readiness.google_ads?.writes_enabled) await emitActivation(userId, ActivationStage.OnboardingCompleted);
   return readiness;
 }
 

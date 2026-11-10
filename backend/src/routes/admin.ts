@@ -2048,6 +2048,7 @@ router.post("/waitlist/:email/create-user", async (req, res) => {
 
     // Update waitlist status to completed
     await waitlistDb.updateStatus(email, 'completed');
+    await import('../services/zomaActivationEvents').then(m => m.emitWaitlistApproval(email)).catch(() => undefined);
 
     res.json({
       message: "User created successfully",
@@ -2217,6 +2218,9 @@ router.put("/waitlist/:email/status", async (req, res) => {
       }
     }
 
+    if (status === 'invited' || status === 'completed') {
+      await import('../services/zomaActivationEvents').then(m => m.emitWaitlistApproval(email)).catch(() => undefined);
+    }
     res.json(entry);
   } catch (error) {
     if (error instanceof WaitlistCapacityCounterError) {
@@ -2380,6 +2384,7 @@ router.post("/waitlist/resend-invitation", async (req, res) => {
         .json({ message: "Failed to send invitation email" });
     }
 
+    await import('../services/zomaActivationEvents').then(m => m.emitWaitlistApproval(email)).catch(() => undefined);
     res.json({ message: "Invitation email resent successfully" });
   } catch (error) {
     console.error("Error resending invitation email:", error);
@@ -2475,6 +2480,7 @@ router.post("/waitlist/invite", async (req, res) => {
       }
     }
 
+    if (sendInvitation) await import('../services/zomaActivationEvents').then(m => m.emitWaitlistApproval(email)).catch(() => undefined);
     res.status(201).json(entry);
   } catch (error) {
     console.error("Error manually adding to waitlist:", error);
