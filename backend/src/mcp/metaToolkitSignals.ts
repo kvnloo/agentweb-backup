@@ -37,13 +37,37 @@ export const SIGNAL_READ_DEFINITIONS = names.map((name) => ({
   },
 }));
 
+/**
+ * Graph pages go back to an external caller: keep the cursors (enough to page with `after`)
+ * and drop paging.next / previous, whose URLs carry the access token.
+ */
+export function sanitizePaging<T>(body: T): T {
+  const b: any = body;
+  if (!b || typeof b !== 'object' || !b.paging) return body;
+  const { paging, ...rest } = b;
+  const cursors = paging?.cursors;
+  return {
+    ...rest,
+    paging: {
+      ...(cursors ? { cursors: { ...(cursors.before !== undefined ? { before: cursors.before } : {}), ...(cursors.after !== undefined ? { after: cursors.after } : {}) } } : {}),
+      has_next: !!paging?.next,
+      has_previous: !!paging?.previous,
+    },
+  } as T;
+}
+
+/** Unix seconds or an ISO date; NaN when neither. */
+function toEpochSeconds(v: string): number {
+  return /^\d{9,10}$/.test(v) ? Number(v) : Date.parse(v) / 1000;
+}
+
 /** Uses the existing Graph HTTP client; credentials are resolved server-side, never caller supplied. */
 export async function executeSignalsRead(
   name: string, args: any, credentials: { accountId: string; accessToken: string },
   graph: Pick<typeof axios, 'get'> = axios,
 ) {
   try {
-    return await runSignalsRead(name, args, credentials, graph);
+    return sanitizePaging(await runSignalsRead(name, args, credentials, graph));
   } catch (error: any) {
     if (error instanceof MetaToolkitRefusal) throw error;
     return signalsReadFailure(error);
@@ -84,7 +108,7 @@ async function runSignalsRead(
   // LLM-driven clients often fill optional fields with ""; treat blank optional strings as absent.
   args = Object.fromEntries(Object.entries(args ?? {}).filter(([k, v]) => !(k !== 'pixel_id' && typeof v === 'string' && v.trim() === '')));
   for (const key of Object.keys(args)) {
-    if (!(key in def.inputSchema.properties)) throw new MetaToolkitRefusal(`Unsupported signals argument: ${key}`);
+    if (!Object.prototype.hasOwnProperty.call(def.inputSchema.properties, key)) throw new MetaToolkitRefusal(`Unsupported signals argument: ${key}`);
   }
   // Credential fallback must never silently switch accounts: the resolved account has to be the one asked for.
   const bare = (id: unknown) => String(id).replace(/^act_/, '');
@@ -96,6 +120,12 @@ async function runSignalsRead(
     if (args[key] !== undefined && typeof args[key] !== 'string') throw new MetaToolkitRefusal(`${key} must be a string.`);
   }
   if (args.aggregation !== undefined && !['event', 'match_keys', 'url', 'host', 'device_type', 'pixel_fire'].includes(args.aggregation)) throw new MetaToolkitRefusal('Unsupported aggregation.');
+  for (const key of ['start_time', 'end_time']) {
+    if (args[key] !== undefined && !Number.isFinite(toEpochSeconds(args[key]))) throw new MetaToolkitRefusal(`${key} must be a unix timestamp or an ISO 8601 date.`);
+  }
+  if (args.start_time !== undefined && args.end_time !== undefined && toEpochSeconds(args.start_time) > toEpochSeconds(args.end_time)) {
+    throw new MetaToolkitRefusal('start_time must be before end_time.');
+  }
   const base = `https://graph.facebook.com/${process.env.META_API_VERSION || 'v25.0'}`;
   const account = `act_${credentials.accountId.replace(/^act_/, '')}`;
   const get = async (path: string, params: Record<string, unknown> = {}) => (await graph.get(`${base}/${path}`, { params: { ...params, access_token: credentials.accessToken }, timeout: 15_000 })).data;

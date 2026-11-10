@@ -188,7 +188,12 @@ const SECRET_KEYS = new Set(['access_token', 'page_access_token', 'accessToken',
  * readers (e.g. PAGE LIST) return the Page access token for internal use; an external
  * caller must never receive it (found in the 2026-10-26 Zoma creative-upload E2E).
  */
+// ENG-2917: Graph paging URLs (paging.next / previous) embed the caller's access token as a
+// query parameter, so strings are scrubbed too, not only credential-named keys.
+const TOKEN_IN_URL = /([?&](?:access_token|appsecret_proof|input_token)=)[^&#\s"']*/gi;
+
 export function stripCredentials<T>(value: T, depth = 0): T {
+  if (typeof value === 'string') return value.replace(TOKEN_IN_URL, '$1[redacted]') as unknown as T;
   if (depth > 12 || value === null || typeof value !== 'object') return value;
   if (Array.isArray(value)) return value.map((v) => stripCredentials(v, depth + 1)) as unknown as T;
   const out: Record<string, unknown> = {};
