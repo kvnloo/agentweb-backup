@@ -122,6 +122,7 @@ export const MCP_TOOL_SIDE_EFFECTS: Readonly<Record<string, McpToolSideEffect>> 
   list_lead_list_exports: 'read',
   inspect_client_usage: 'write',
   export_lead_list: 'write',
+  update_landing_page_files: 'write',
 });
 
 export class UnclassifiedMcpToolError extends Error {

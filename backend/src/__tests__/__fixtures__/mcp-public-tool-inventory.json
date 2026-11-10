@@ -3793,6 +3793,63 @@
     }
   },
   {
+    "name": "update_landing_page_files",
+    "listed": false,
+    "description": "ENG-2896: commit up to 20 files to one of your landing pages in ONE atomic commit on the draft/preview branch (draft/agentweb-preview by default; main is rejected — publish with publish_landing_page_changes). Pass expected_base_sha (from a prior read) to fail with a conflict and write nothing if the branch moved. Returns the new commit SHA.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "page_id": {
+          "type": "string",
+          "description": "The landing page ID"
+        },
+        "files": {
+          "type": "array",
+          "maxItems": 20,
+          "description": "Files to write (max 20). Each: { path, content }.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "Repo path, e.g. \"src/app/page.tsx\""
+              },
+              "content": {
+                "type": "string",
+                "description": "Full new file content"
+              }
+            },
+            "required": [
+              "path",
+              "content"
+            ]
+          }
+        },
+        "commit_message": {
+          "type": "string",
+          "description": "Commit message (optional)"
+        },
+        "branch": {
+          "type": "string",
+          "description": "Target branch. Defaults to \"draft/agentweb-preview\". \"main\" is rejected."
+        },
+        "expected_base_sha": {
+          "type": "string",
+          "description": "Optional 40-char SHA the branch head must equal; otherwise the call fails with a conflict and writes nothing."
+        }
+      },
+      "required": [
+        "page_id",
+        "files"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
     "name": "update_sender_settings",
     "listed": false,
     "description": "Set your own default CRM email sender and/or default LinkedIn sender account. default_sender_id must be one of your configured senders (see list_sender_settings); default_linkedin_account_id must be a LinkedIn (unipile) account you own (see list_connected_accounts). Does not change sequences or their activation. Returns the resulting settings as list_sender_settings shows them.",
