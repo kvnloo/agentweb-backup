@@ -180,6 +180,33 @@ describe('ENG-2823 Google Ads toolkit over MCP JSON-RPC (Google faked at HTTP)',
     expect(mutates()).toHaveLength(1);
   });
 
+  it('campaign goal LIST and guarded UPDATE use the real handler and independent GAQL read-back', async () => {
+    const rn = `customers/${CID}/campaignConversionGoals/77~CONTACT~WEBSITE`;
+    let biddable = true;
+    mockPost.mockImplementation(async (url: string, body: any) => {
+      if (url.endsWith('/campaignConversionGoals:mutate')) {
+        expect(body.operations).toEqual([{ update: { resourceName: rn, biddable: false }, updateMask: 'biddable' }]);
+        biddable = false;
+        return { data: { results: [{ resourceName: rn }] } };
+      }
+      if (body.query?.includes('FROM campaign_conversion_goal')) {
+        return { data: { results: [{ campaign: { name: 'Brand' }, campaignConversionGoal: { resourceName: rn, campaign: `customers/${CID}/campaigns/77`, category: 'CONTACT', origin: 'WEBSITE', biddable } }] } };
+      }
+      return fakeGoogle(url, body);
+    });
+    const list = await call('call_google_ads_api', { customer_id: CID, entity_type: 'CAMPAIGN_CONVERSION_GOAL', action: 'LIST', campaign_id: '77' });
+    expect(list.isError).toBe(false);
+    expect(JSON.stringify(list.result)).toContain(rn);
+    const args = { customer_id: CID, entity_type: 'CAMPAIGN_CONVERSION_GOAL', action: 'UPDATE', resource_name: rn, biddable: false };
+    const preview = await call('call_google_ads_api', args);
+    expect(preview.result.preview).toContain('Brand');
+    expect(mutates()).toHaveLength(0);
+    const confirmed = await call('call_google_ads_api', { ...args, confirm: true, preview_token: preview.result.preview_token });
+    expect(confirmed.result).toMatchObject({ success: true, verification: 'CONFIRMED', biddable: false });
+    expect(mutates()).toHaveLength(1);
+    expect(mockPost.mock.calls.filter(([, body]) => body.query?.includes('campaign_conversion_goal.resource_name ='))).toHaveLength(4);
+  });
+
   it('a timeout on the confirmed mutate is UNCONFIRMED (metered as a write), not "did not apply"', async () => {
     const args = { customer_id: CID, entity_type: 'BUDGET', action: 'CREATE', name: 'New', amount: 25 };
     const preview = await call('call_google_ads_api', args);
