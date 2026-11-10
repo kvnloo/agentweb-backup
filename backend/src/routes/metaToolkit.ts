@@ -176,6 +176,8 @@ router.post('/mcp', async (req: Request, res: Response) => {
             args: params.arguments && typeof params.arguments === 'object' ? params.arguments : {},
             sessionId: req.get('mcp-session-id') ?? undefined,
             userAgent: req.get('user-agent') ?? undefined,
+            // ENG-2906: `?ref=` on the MCP URL; validated (or dropped) when the event is recorded.
+            ref: typeof req.query.ref === 'string' ? req.query.ref : undefined,
           });
           return rpcResult(res, id, { content: toolResultContent(result), isError: false });
         } catch (error) {

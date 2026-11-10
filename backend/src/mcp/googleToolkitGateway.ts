@@ -68,6 +68,7 @@ export async function handleGoogleToolkitCall(
   // A metering failure never makes an executed write look failed (that invites a retry).
   if (write && typeof result?.verification === 'string') {
     await deps.recordWrite({
+      product: 'zoma', // ENG-2906: every toolkit surface is the Zoma product
       userId: caller.userId,
       toolName: request.toolName,
       authMethod: caller.authMethod,
