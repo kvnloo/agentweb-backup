@@ -54,7 +54,11 @@ Return "maybe" when unsure, and "good" for plausible prospects. Missing fields a
 Respond with JSON only: {"verdict":"good"|"maybe"|"bad","reasons":["short reason", ...]} (at most 3 reasons).`;
 
 export function parseVerdict(raw: unknown): LeadFitResult | undefined {
-  let text = typeof raw === 'string' ? raw : raw && typeof raw === 'object' ? (raw as any).content ?? (raw as any).text : undefined;
+  // agentModeService.callLLM returns an OpenAI-style chat completion; accept that shape first.
+  const r = raw as any;
+  let text = typeof raw === 'string' ? raw
+    : raw && typeof raw === 'object' ? (r.choices?.[0]?.message?.content ?? r.content ?? r.text) : undefined;
+  if (Array.isArray(text)) text = text.map((p: any) => (typeof p === 'string' ? p : p?.text ?? '')).join('');
   if (typeof text !== 'string') return;
   text = text.trim().replace(/^```(?:json)?\s*|\s*```$/g, '');
   let parsed: any;

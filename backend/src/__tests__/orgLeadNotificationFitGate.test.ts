@@ -74,7 +74,8 @@ afterEach(() => jest.useRealTimers());
 import { agentModeService } from '../services/agentModeService';
 import { deterministicSignals, parseVerdict } from '../services/leadFitGate';
 const callLLM = () => mock(agentModeService.callLLM);
-const verdict = (v: string) => ({ content: JSON.stringify({ verdict: v, reasons: ['r'] }) });
+// Real agentModeService.callLLM return shape (chat completion), not a {content} stub.
+const verdict = (v: string) => ({ choices: [{ message: { role: 'assistant', content: JSON.stringify({ verdict: v, reasons: ['r'] }) } }] });
 // The Haven junk lead from #haven-agentweb (lead_1794227640000_00df2d997455).
 const junk = () => Object.assign(lead, { firstName: 'Ima', lastName: 'Joke', email: 'ima@proton.me', company: 'india',
   customFields: { source: 'waterheater-landing', message: 'Poop', leadQuality: 'ok' } });
@@ -154,4 +155,5 @@ it('signals and parser are bounded hints', () => {
   expect(deterministicSignals({ email: 'x@proton.me', company: 'india', message: 'Poop' })).toHaveLength(3);
   expect(parseVerdict('```json\n{"verdict":"bad","reasons":["a","b","c","d"]}\n```')?.reasons).toHaveLength(3);
   expect(parseVerdict('{"verdict":"BAD"}')).toBeUndefined();
+  expect(parseVerdict({ choices: [{ message: { content: '{"verdict":"bad","reasons":["prank"]}' } }] })).toEqual({ verdict: 'bad', reasons: ['prank'] });
 });
