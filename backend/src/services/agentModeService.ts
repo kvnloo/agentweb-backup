@@ -15552,6 +15552,13 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     return executeExperimentRead(name, args, credentials);
   }
 
+  /** ENG-2921: read-only account activity log via the account-bound credential resolver. */
+  public async readToolkitMetaActivityLog(userId: string, args: any) {
+    const credentials = await this.getMetaCredentials(userId, args.account_id);
+    const { executeActivityLogRead } = await import('../mcp/metaToolkitDiagnostics');
+    return executeActivityLogRead(args, credentials);
+  }
+
   /**
    * Zoma creative upload: Meta processing state of an uploaded video, ownership-scoped to the
    * selected ad account (a video id addresses a node globally). Returns Meta's preferred
