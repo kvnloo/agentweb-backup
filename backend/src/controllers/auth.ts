@@ -1,4 +1,5 @@
 import { Request, Response } from "express";
+import { isConditionalCheckFailed, mapCreateUserError } from "../utils/createUserError";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { disconnectStaleUserSockets } from "../services/sessionSockets";
@@ -184,6 +185,7 @@ export const register = async (req: Request, res: Response) => {
     // attribution is known and the enrolled lead is missing UTM data.
     const touch = normalizeAttribution(attribution) ?? normalizeAttribution(utm);
 
+    let createUserError: unknown;
     const newUser = await userDb.createUser(
       email,
       userId,
@@ -197,7 +199,10 @@ export const register = async (req: Request, res: Response) => {
       companyNameFromWaitlist, // from waitlist
       useCaseCategoriesFromWaitlist, // from waitlist
       touch // attribution — passes through onUserSignup hook
-    ).catch(() => undefined);
+    ).catch((err: unknown) => {
+      createUserError = err;
+      return undefined;
+    });
 
     // Nothing below this boundary is safe unless createUser persisted the row.
     if (!newUser) {
@@ -206,6 +211,13 @@ export const register = async (req: Request, res: Response) => {
       const raced = await userDb.getUserByEmail(email).catch(() => undefined);
       if (raced) {
         return res.status(400).json({ message: "User already exists" });
+      }
+      // ENG-2899: the email occupies the PK but no account resolves for it
+      // (e.g. a tombstone left by an email change). Say what to do instead
+      // of a retry-forever 503.
+      if (isConditionalCheckFailed(createUserError)) {
+        const mapped = mapCreateUserError(createUserError);
+        return res.status(mapped.status).json(mapped.body);
       }
       console.error("Registration persistence failed before post-create side effects");
       return res.status(503).json({
@@ -310,7 +322,8 @@ export const register = async (req: Request, res: Response) => {
     });
   } catch (error) {
     console.error("Error in register:", error);
-    res.status(500).json({ message: "Error creating user" });
+    const mapped = mapCreateUserError(error);
+    res.status(mapped.status).json(mapped.body);
   }
 };
 

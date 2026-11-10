@@ -85,6 +85,7 @@ export const MCP_TOOL_SIDE_EFFECTS: Readonly<Record<string, McpToolSideEffect>> 
   list_scheduled_chats: 'write',
   list_schedules: 'write',
   list_sender_settings: 'read',
+  get_conversion_summary: 'read',
   list_skills: 'write',
   list_task_executions: 'write',
   list_tasks: 'write',
