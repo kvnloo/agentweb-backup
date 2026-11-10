@@ -118,6 +118,10 @@ export const MCP_TOOL_SIDE_EFFECTS: Readonly<Record<string, McpToolSideEffect>> 
   test_scheduled_chat: 'write',
   update_knowledge_base_file_content: 'write',
   update_landing_page_context: 'write',
+  update_sender_settings: 'write',
+  list_lead_list_exports: 'read',
+  inspect_client_usage: 'write',
+  export_lead_list: 'write',
   update_landing_page_files: 'write',
 });
 
