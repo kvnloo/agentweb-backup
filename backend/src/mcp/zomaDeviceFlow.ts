@@ -37,12 +37,9 @@ import {
 import { isEvaluationUser, requireActiveEvaluation } from '../services/evaluationPolicy';
 import { getJwtSecret } from '../config/jwt';
 import type { MetaFinalizeResult, MetaAdAccountSelection } from '../services/metaOAuthFinalize';
-import { validateRef, ZOMA_DEVICE_OAUTH_CLIENT_ID } from '../services/journeyAttribution';
+import { MCP_CONSENT_SIGNUP_SOURCE, validateRef, ZOMA_DEVICE_OAUTH_CLIENT_ID } from '../services/journeyAttribution';
 import { aliasJourney, anonymousSetupId, trackJourney } from '../services/journeyTracking';
 import { noteProductUse, noteSignup, zomaMilestone } from '../services/journeyMilestones';
-
-/** Approval within this window of account creation counts as a Zoma device signup. */
-const ZOMA_FRESH_SIGNUP_WINDOW_MS = 3600 * 1000;
 
 export const ZOMA_DEVICE_CLIENT_ID = ZOMA_DEVICE_OAUTH_CLIENT_ID;
 export const ZOMA_DEVICE_CLIENT_NAME = 'Zoma (agent setup)';
@@ -280,17 +277,21 @@ export async function completeVerification(
     return { ok: false, message: 'This setup link has expired or was already used.' };
   }
   await track(deps, device.deviceId, grant.userId, 'approval', 'approved');
-  void journeyOnApproval(grant.userId, device, now);
+  void journeyOnApproval(grant.userId, device);
   return { ok: true, deviceId: device.deviceId };
 }
 
-/** ENG-2906: join the anonymous setup to the user, attribute a fresh signup, mark Zoma use. */
-async function journeyOnApproval(userId: string, device: ZomaDeviceRecord, now: number): Promise<void> {
+/**
+ * ENG-2906: join the anonymous setup to the user, attribute a signup made on the consent page
+ * (row stamped signupSource "mcp" — usually already attributed by the consent decision, so this
+ * is a no-op backstop), mark Zoma use.
+ */
+async function journeyOnApproval(userId: string, device: ZomaDeviceRecord): Promise<void> {
   await aliasJourney(userId, anonymousSetupId(device.deviceId));
   await noteSignup(
     userId,
     { product: 'zoma', path: 'zoma_device', client: 'zoma_device', ref: validateRef(device.ref), confidence: 'explicit' },
-    { createdSince: new Date(now - ZOMA_FRESH_SIGNUP_WINDOW_MS).toISOString() },
+    { requireSignupSource: MCP_CONSENT_SIGNUP_SOURCE },
   );
   await noteProductUse(userId, 'zoma');
   await zomaMilestone(userId, 'signed_up', { emit: 'never' });

@@ -19,6 +19,7 @@ import { getMetaToolkitManifest, MetaToolkitRefusal } from '../mcp/metaToolkitMa
 import { googleToolkitEnabled } from '../mcp/zomaToolDefinitions';
 import { rateLimiter } from '../middleware/rateLimiter';
 import { buildMcpAuthChallenge, getBackendUrl, META_TOOLKIT_MCP_RESOURCE_PATH } from '../mcp/oauth/authChallenge';
+import { validateRef } from '../services/journeyAttribution';
 
 /** Per-IP request ceiling, applied before bearer auth so unauthenticated floods are throttled too. */
 export const META_TOOLKIT_MAX_PER_MINUTE = 60;
@@ -201,6 +202,7 @@ router.post('/mcp', async (req: Request, res: Response) => {
             getBackendUrl(),
             req.headers.authorization ? 'invalid_token' : undefined,
             META_TOOLKIT_MCP_RESOURCE_PATH,
+            validateRef(req.query.ref), // ENG-2906: carry ?ref= into the resource metadata
           ),
         );
       }

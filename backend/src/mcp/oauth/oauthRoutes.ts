@@ -18,8 +18,9 @@ import {
   recordMcpOAuthStarted,
   recordMcpOAuthTokenIssued,
 } from '../../services/mcpUsageEventsService';
-import { getBackendUrl, MCP_RESOURCE_PATH, META_TOOLKIT_MCP_RESOURCE_PATH } from './authChallenge';
+import { getBackendUrl, MCP_RESOURCE_PATH, META_TOOLKIT_MCP_RESOURCE_PATH, withRef } from './authChallenge';
 import {
+  MCP_CONSENT_SIGNUP_SOURCE,
   normalizeProduct,
   productFromResource,
   readRef,
@@ -64,9 +65,6 @@ function hasOnlyStringParams(params: Record<string, unknown>, keys: string[]): b
 
 const authorizationParams = ['client_id', 'redirect_uri', 'scope', 'state', 'code_challenge', 'code_challenge_method'];
 
-/** A just-created account (signed up on the consent page) has a createdAt within this window. */
-const FRESH_SIGNUP_WINDOW_MS = 3600 * 1000;
-
 /**
  * ENG-2906 product attribution for an authorization request. The RFC 8707 `resource` is the
  * explicit signal; the first-party Zoma device client is a reliable endpoint hint. Anything
@@ -77,6 +75,32 @@ function authorizationAttribution(clientId: string, resource: unknown): { produc
   if (fromResource.product !== 'unknown') return fromResource;
   if (clientId === ZOMA_DEVICE_OAUTH_CLIENT_ID) return { product: 'zoma', confidence: 'inferred' };
   return fromResource;
+}
+
+/**
+ * ENG-2906: write-once signup attribution for an account created on the MCP consent page. The
+ * register endpoint stamps such rows signupSource "mcp"; any other account (an existing user
+ * approving a new client, however recently created) is never treated as a signup here.
+ */
+function attributeConsentSignup(
+  userId: string,
+  clientId: string,
+  clientType: string,
+  attribution: { product: JourneyProduct; confidence: AttributionConfidence },
+  ref: string | undefined,
+) {
+  const zomaDevice = clientId === ZOMA_DEVICE_OAUTH_CLIENT_ID;
+  void noteSignup(
+    userId,
+    {
+      product: attribution.product,
+      path: zomaDevice ? 'zoma_device' : 'oauth_direct',
+      client: zomaDevice ? 'zoma_device' : clientType,
+      ref,
+      confidence: attribution.confidence,
+    },
+    { requireSignupSource: MCP_CONSENT_SIGNUP_SOURCE },
+  );
 }
 
 export function setupMcpOAuth(app: express.Express) {
@@ -102,12 +126,16 @@ export function setupMcpOAuth(app: express.Express) {
 
   // RFC 9728: one metadata document per protected resource; `resource` must equal the URL
   // the client connected to or MCP clients refuse to start the OAuth flow.
-  const protectedResourceMetadata = (resourcePath: string) => (_req: Request, res: Response) => {
+  // ENG-2906: a valid `ref` on this document's URL (from the 401 challenge, or the SDK's
+  // path-aware discovery, which keeps the server URL's query) is echoed into `resource`. MCP
+  // clients send the metadata's `resource` — not their own server URL — to /oauth/authorize, so
+  // this is the only way `?ref=` on the MCP URL reaches the authorization request.
+  const protectedResourceMetadata = (resourcePath: string) => (req: Request, res: Response) => {
     const baseUrl = getBackendUrl();
 
     res.setHeader('Cache-Control', 'public, max-age=3600');
     res.json({
-      resource: `${baseUrl}${resourcePath}`,
+      resource: withRef(`${baseUrl}${resourcePath}`, validateRef(req.query.ref)),
       authorization_servers: [baseUrl],
       bearer_methods_supported: ['header'],
       scopes_supported: ['mcp:tools'],
@@ -235,6 +263,7 @@ export function setupMcpOAuth(app: express.Express) {
     if (process.env.MCP_OAUTH_SKIP_CONSENT === 'true') {
       const { user } = await getUserFromToken(req);
       if (user) {
+        const clientType = classifyMcpClient({ clientName: client.clientName, userAgent: req.get('user-agent'), redirectUri: actualRedirectUri });
         const { code } = await mcpOAuthService.createAuthorizationCode({
           clientId: client_id,
           userId: user.userId,
@@ -246,6 +275,7 @@ export function setupMcpOAuth(app: express.Express) {
           attributionConfidence: attribution.confidence,
           ...(ref ? { ref } : {}),
         });
+        attributeConsentSignup(user.userId, client_id, clientType, attribution, ref);
 
         const redirectUrl = new URL(actualRedirectUri);
         redirectUrl.searchParams.set('code', code);
@@ -331,26 +361,16 @@ export function setupMcpOAuth(app: express.Express) {
       attributionConfidence: attribution.confidence,
       ...(pending?.ref ? { ref: pending.ref } : {}),
     });
-    // ENG-2906: an account created on this consent page (createdAt within the window) gets its
-    // write-once signup attribution here, where the client and product are finally known.
-    const zomaDevice = client_id === ZOMA_DEVICE_OAUTH_CLIENT_ID;
-    void noteSignup(
-      userId,
-      {
-        product: attribution.product,
-        path: zomaDevice ? 'zoma_device' : 'oauth_direct',
-        client: zomaDevice ? 'zoma_device' : classifyMcpClient({ clientName: client.clientName, redirectUri: redirect_uri }),
-        ref: pending?.ref,
-        confidence: attribution.confidence,
-      },
-      { createdSince: new Date(Date.now() - FRESH_SIGNUP_WINDOW_MS).toISOString() },
-    );
+    // ENG-2906: an account created on this consent page gets its write-once signup attribution
+    // here, where the client and product are finally known.
+    const clientType = classifyMcpClient({ clientName: client.clientName, redirectUri: redirect_uri });
+    attributeConsentSignup(userId, client_id, clientType, attribution, pending?.ref);
     recordMcpOAuthAuthorized({
       product: attribution.product,
       userId,
       clientId: client_id,
       clientName: client.clientName,
-      clientType: classifyMcpClient({ clientName: client.clientName, redirectUri: redirect_uri }),
+      clientType,
       redirectUri: redirect_uri,
       scope: scope || 'mcp:tools',
     }).catch((error) => console.error('[MCP-OAuth] Failed to record OAuth authorization:', error));

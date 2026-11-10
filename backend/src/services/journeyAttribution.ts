@@ -11,6 +11,11 @@
  * UpdateItem can never upsert a ghost user row:
  *   - signupProduct / signupPath / signupClient / signupRef / attributionConfidence:
  *     write-once as a set (`if_not_exists` under attribute_not_exists(signupPath)).
+ *     attributionConfidence on the row (and the person) uses the contract enum
+ *     tracked | inferred | verified: the internal `explicit` is written as `tracked`, and an
+ *     `unknown` confidence is omitted rather than invented.
+ *   - zomaFirstReadAt / zomaFirstWriteAt: write-once milestone timestamps, independent of the
+ *     stage, so first_read is still recorded once when first_write happened first.
  *   - products.<product> = { firstAt, lastAt }: firstAt write-once; lastAt bumped at most once
  *     an hour per user/product (in-process throttle + `lastAt < cutoff` condition).
  *   - zomaStage / zomaStageAt: forward-only via `zomaStage IN (<strictly earlier stages>)`.
@@ -28,8 +33,28 @@ import { META_TOOLKIT_MCP_RESOURCE_PATH, MCP_RESOURCE_PATH, getBackendUrl } from
 export type JourneyProduct = 'zoma' | 'emma_mcp' | 'emma_web' | 'unknown';
 export type KnownProduct = Exclude<JourneyProduct, 'unknown'>;
 export type SignupPath = 'oauth_direct' | 'zoma_device' | 'api_key' | 'webapp';
-/** explicit: the client/user told us (resource, setup endpoint, web form); inferred: from a reliable endpoint hint. */
+/**
+ * Internal derivation confidence. explicit: the client/user told us (resource, setup endpoint,
+ * web form); inferred: from a reliable endpoint hint; unknown: no signal.
+ */
 export type AttributionConfidence = 'explicit' | 'inferred' | 'unknown';
+/** Contract enum stored on the AW-Users row and the person. Nothing emits `verified` yet. */
+export type UserAttributionConfidence = 'tracked' | 'inferred' | 'verified';
+
+/** explicit -> tracked; inferred -> inferred; unknown -> undefined (omitted, never invented). */
+export function toUserAttributionConfidence(confidence: AttributionConfidence | UserAttributionConfidence | undefined): UserAttributionConfidence | undefined {
+  switch (confidence) {
+    case 'explicit':
+    case 'tracked':
+      return 'tracked';
+    case 'inferred':
+      return 'inferred';
+    case 'verified':
+      return 'verified';
+    default:
+      return undefined;
+  }
+}
 
 export const JOURNEY_PRODUCTS: readonly JourneyProduct[] = ['zoma', 'emma_mcp', 'emma_web', 'unknown'];
 export const ZOMA_STAGES = [
@@ -43,6 +68,17 @@ export const ZOMA_STAGES = [
   'ad_live',
 ] as const;
 export type ZomaStage = (typeof ZOMA_STAGES)[number];
+
+/** Write-once milestone timestamps on AW-Users, independent of the forward-only stage. */
+export const ZOMA_MILESTONE_FIELDS = { first_read: 'zomaFirstReadAt', first_write: 'zomaFirstWriteAt' } as const;
+export type ZomaMilestone = keyof typeof ZOMA_MILESTONE_FIELDS;
+
+/**
+ * AW-Users `signupSource` value the register endpoint stamps for an account created on the MCP
+ * OAuth consent page. The consent decision attributes the signup only when this marker is on
+ * the row and no signup attribution exists yet — never from account age alone.
+ */
+export const MCP_CONSENT_SIGNUP_SOURCE = 'mcp';
 
 /** First-party OAuth client used by the Zoma device flow (zomaDeviceFlow re-exports it). */
 export const ZOMA_DEVICE_OAUTH_CLIENT_ID = 'zoma-device-setup';
@@ -130,15 +166,23 @@ function boundedSet(set: Map<string, number>, key: string, value: number) {
   set.set(key, value);
 }
 
+export interface SignupAttributionOptions {
+  /** Only attribute when the row's `signupSource` equals this (e.g. MCP_CONSENT_SIGNUP_SOURCE). */
+  requireSignupSource?: string;
+}
+
 export interface JourneyAttribution {
-  recordSignupAttribution(userId: string, attribution: SignupAttribution, opts?: { createdSince?: string }): Promise<boolean>;
+  recordSignupAttribution(userId: string, attribution: SignupAttribution, opts?: SignupAttributionOptions): Promise<boolean>;
   touchProduct(userId: string, product: JourneyProduct): Promise<'created' | 'touched' | 'throttled' | 'skipped'>;
   advanceZomaStage(userId: string, stage: ZomaStage, opts?: { requireZoma?: boolean }): Promise<boolean>;
+  /** Write-once milestone timestamp; true only for the call that set it. */
+  markZomaMilestone(userId: string, milestone: ZomaMilestone): Promise<boolean>;
 }
 
 export function createJourneyAttribution(deps: JourneyAttributionDeps): JourneyAttribution {
   const touched = new Map<string, number>();
   const stagesSettled = new Map<string, number>();
+  const milestonesSettled = new Map<string, number>();
 
   const userKey = async (userId: string) => {
     const email = typeof userId === 'string' && userId ? await deps.resolveEmail(userId) : undefined;
@@ -153,8 +197,9 @@ export function createJourneyAttribution(deps: JourneyAttributionDeps): JourneyA
         signupProduct: normalizeProduct(attribution.product),
         signupPath: attribution.path,
         signupClient: attribution.client.slice(0, 64),
-        attributionConfidence: attribution.confidence,
       };
+      const confidence = toUserAttributionConfidence(attribution.confidence);
+      if (confidence) fields.attributionConfidence = confidence;
       const ref = validateRef(attribution.ref);
       if (ref) fields.signupRef = ref;
       const names: Record<string, string> = { '#email': 'email' };
@@ -165,10 +210,10 @@ export function createJourneyAttribution(deps: JourneyAttributionDeps): JourneyA
         return `#${k} = if_not_exists(#${k}, :${k})`;
       });
       let condition = 'attribute_exists(#email) AND attribute_not_exists(#signupPath)';
-      if (opts.createdSince) {
-        names['#createdAt'] = 'createdAt';
-        values[':createdSince'] = opts.createdSince;
-        condition += ' AND #createdAt >= :createdSince';
+      if (opts.requireSignupSource) {
+        names['#signupSource'] = 'signupSource';
+        values[':signupSource'] = opts.requireSignupSource;
+        condition += ' AND #signupSource = :signupSource';
       }
       try {
         await deps.update({
@@ -293,6 +338,32 @@ export function createJourneyAttribution(deps: JourneyAttributionDeps): JourneyA
         return false;
       }
     },
+
+    async markZomaMilestone(userId, milestone) {
+      const field = ZOMA_MILESTONE_FIELDS[milestone];
+      if (!field) return false;
+      const memoKey = `${userId}:${milestone}`;
+      if (milestonesSettled.has(memoKey)) return false;
+      const Key = await userKey(userId);
+      if (!Key) return false;
+      try {
+        await deps.update({
+          TableName: deps.tableName,
+          Key,
+          UpdateExpression: 'SET #m = :now',
+          ConditionExpression: 'attribute_exists(#email) AND attribute_not_exists(#m)',
+          ExpressionAttributeNames: { '#email': 'email', '#m': field },
+          ExpressionAttributeValues: { ':now': new Date(deps.now()).toISOString() },
+        });
+        boundedSet(milestonesSettled, memoKey, 1);
+        return true;
+      } catch (error) {
+        if (!isConditionalFailure(error)) throw error;
+        // Already set (permanent): stop writing it on every tool call.
+        boundedSet(milestonesSettled, memoKey, 1);
+        return false;
+      }
+    },
   };
 }
 
@@ -300,7 +371,7 @@ export function createJourneyAttribution(deps: JourneyAttributionDeps): JourneyA
 export const recordSignupAttribution = (
   userId: string,
   attribution: SignupAttribution,
-  opts: { createdSince?: string } = {},
+  opts: SignupAttributionOptions = {},
   deps: JourneyAttributionDeps = defaultDeps(),
 ) => createJourneyAttribution(deps).recordSignupAttribution(userId, attribution, opts);
 export const touchProduct = (userId: string, product: JourneyProduct, deps: JourneyAttributionDeps = defaultDeps()) =>
@@ -338,6 +409,9 @@ function defaultDeps(): JourneyAttributionDeps {
     tableName: tableName('AW-Users'),
   };
 }
+
+export const markZomaMilestone = (userId: string, milestone: ZomaMilestone, deps: JourneyAttributionDeps = defaultDeps()) =>
+  createJourneyAttribution(deps).markZomaMilestone(userId, milestone);
 
 /** Process-wide instance: shares the hourly product throttle and the stage memo. */
 export const journeyAttribution: JourneyAttribution = createJourneyAttribution(defaultDeps());

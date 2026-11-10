@@ -3,7 +3,16 @@
  * (journeyAttribution) with journey events (journeyTracking). Every helper resolves; a failure
  * is logged and dropped, never surfaced to the request.
  */
-import { journeyAttribution, type JourneyProduct, type SignupAttribution, type ZomaStage } from './journeyAttribution';
+import {
+  journeyAttribution,
+  toUserAttributionConfidence,
+  ZOMA_MILESTONE_FIELDS,
+  type JourneyProduct,
+  type SignupAttribution,
+  type SignupAttributionOptions,
+  type ZomaMilestone,
+  type ZomaStage,
+} from './journeyAttribution';
 import { identifyJourney, trackJourney, type JourneyEvent } from './journeyTracking';
 
 function warn(op: string, error: unknown) {
@@ -45,8 +54,10 @@ const STAGE_FOR_EVENT: Partial<Record<JourneyEvent, ZomaStage>> = {
 /**
  * Advance the user's forward-only zomaStage for `event`, then emit the journey event.
  *   emit: 'always'        rare, already-deduplicated moments (connected, card_saved, ...)
- *   emit: 'if_advanced'   per-call moments (first_read / first_write): emitted once, when the
- *                         stage write actually moved forward
+ *   emit: 'if_advanced'   per-call moments: emitted once. first_read / first_write have their own
+ *                         write-once milestone field, so each is emitted exactly once even when
+ *                         the stage already moved past it (first_write before first_read); other
+ *                         events are emitted when the stage write actually moved forward
  *   emit: 'never'         stage only (the event was already emitted elsewhere, e.g. signed_up)
  *   requireZoma           shared Emma/Zoma surfaces (Meta/Google connect, Stripe): only move the
  *                         stage for users who already use Zoma
@@ -69,15 +80,26 @@ export async function zomaMilestone(
     warn(`advance ${event}`, error);
   }
   if (advanced && stage) await identifyJourney(userId, { zomaStage: stage });
-  if (opts.emit === 'always' || advanced) await trackJourney({ userId }, event, opts.props);
+  let firstTime = advanced;
+  if (opts.emit === 'if_advanced' && isMilestone(event)) {
+    firstTime = false;
+    try {
+      firstTime = await journeyAttribution.markZomaMilestone(userId, event);
+    } catch (error) {
+      warn(`milestone ${event}`, error);
+    }
+  }
+  if (opts.emit === 'always' || (opts.emit === 'if_advanced' && firstTime)) await trackJourney({ userId }, event, opts.props);
 }
+
+const isMilestone = (event: JourneyEvent): event is ZomaMilestone => Object.prototype.hasOwnProperty.call(ZOMA_MILESTONE_FIELDS, event);
 
 /**
  * Write-once signup attribution. Emits `signed_up` (and the set-once person properties) only
  * when this call is the one that attributed the signup, so a retry or a returning user never
- * double-counts. Returns whether it wrote.
+ * double-counts. A Zoma signup also moves zomaStage to signed_up. Returns whether it wrote.
  */
-export async function noteSignup(userId: string | undefined, attribution: SignupAttribution, opts: { createdSince?: string } = {}): Promise<boolean> {
+export async function noteSignup(userId: string | undefined, attribution: SignupAttribution, opts: SignupAttributionOptions = {}): Promise<boolean> {
   if (!userId) return false;
   let wrote = false;
   try {
@@ -86,19 +108,21 @@ export async function noteSignup(userId: string | undefined, attribution: Signup
     warn('recordSignupAttribution', error);
   }
   if (!wrote) return false;
+  const confidence = toUserAttributionConfidence(attribution.confidence);
   await identifyJourney(userId, {
     signupProduct: attribution.product,
     signupPath: attribution.path,
     signupClient: attribution.client,
     signupRef: attribution.ref,
-    attributionConfidence: attribution.confidence,
+    attributionConfidence: confidence,
   });
   await trackJourney({ userId }, 'signed_up', {
     product: attribution.product,
     path: attribution.path,
     client: attribution.client,
     ref: attribution.ref,
-    confidence: attribution.confidence,
+    confidence,
   });
+  if (attribution.product === 'zoma') await zomaMilestone(userId, 'signed_up', { emit: 'never' });
   return true;
 }
