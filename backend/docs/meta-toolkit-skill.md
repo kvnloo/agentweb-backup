@@ -61,7 +61,7 @@ Use this when the user has creatives made elsewhere (Higgsfield, Midjourney, Can
 For a batch, repeat steps 1 to 3 for each file, then create one ad per creative. Tell the user what was created and leave everything paused.
 
 ## Writes (CAMPAIGN, AD_SET, AD)
-Allowed: CREATE, and UPDATE of `status` (ACTIVE or PAUSED) or budget. Not available: DELETE and custom audiences. Creatives are covered above.
+Allowed: CREATE, UPDATE of `status` (ACTIVE or PAUSED) or budget, ARCHIVE, DELETE and COPY. Not available: custom audiences. Creatives are covered above.
 
 Every write is two calls to `call_meta_marketing_api`:
 1. Call WITHOUT `confirm`. Nothing changes. You get a PREVIEW and a `preview_token`.
@@ -74,6 +74,13 @@ Rules:
 - Budgets are in MAJOR units of the ad account currency (50 = $50.00; for TWD/JPY, 500 = NT$500 / ¥500). The preview echoes the converted amount — read it back to the user.
 - A write is done only when the result says `verification: CONFIRMED`. `UNCONFIRMED` or `MISMATCH` is not success: tell the user and check the entity before retrying.
 - If a write is refused for a missing payment method or Meta connection, call `zoma_status` and relay its link.
+
+### Archive, delete, copy
+Pass the entity's id (`campaign_id`, `ad_set_id` or `ad_id`); same preview and approval flow as above.
+- `ARCHIVE` stops delivery and keeps the entity and its history. Prefer it over `DELETE`.
+- `DELETE` cannot be undone. Say so to the user before asking for approval.
+- Both are refused when the entity spent in the last 24 hours (or Zoma could not check). Pause it first; only if the user explicitly accepts stopping it while it spends, repeat with `confirm_recent_spend: true` (it is part of the previewed call).
+- `COPY` duplicates the entity, always PAUSED. `params.deep_copy: true` also copies a campaign's ad sets and ads (or an ad set's ads). Put an ad set copy into another campaign with `params.campaign_id`, an ad copy into another ad set with `params.adset_id`. The result's `id` is the new copy.
 
 ## Usage
 Call `zoma_usage` when the user asks what they have used this month. Billing is not enabled yet; usage is only recorded.
