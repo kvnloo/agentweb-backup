@@ -18,7 +18,7 @@ jest.mock('../services/mcpUsageEventsService', () => ({ recordMcpToolUse: jest.f
 jest.mock('../services/agentModeService', () => ({ agentModeService: {} }));
 
 import { executeMetaToolkitLifecycle, type MetaToolkitLifecycleDeps } from '../mcp/metaToolkitLifecycle';
-import { copyMetaNode, readMetaRecentSpend, readOwnedMetaNode, type MetaGraphContext } from '../services/agentMode/metaToolkitLifecycleGraph';
+import { copyMetaNode, readMetaRecentSpend, readOwnedMetaNode, recentSpendWindow, type MetaGraphContext } from '../services/agentMode/metaToolkitLifecycleGraph';
 import { MetaToolkitRefusal } from '../mcp/metaToolkitErrors';
 import { ZomaNotReadyError } from '../mcp/zomaOnboarding';
 import { handleMetaToolkitCall, type MetaToolkitGatewayDeps } from '../mcp/metaToolkitGateway';
@@ -126,6 +126,27 @@ describe('ENG-2922 Meta ARCHIVE / DELETE / COPY', () => {
     expect(mock.archive).not.toHaveBeenCalled();
   });
 
+  it('confirm_recent_spend on an entity still spending confirms (the amount moving does not invalidate)', async () => {
+    const spend = jest.fn().mockResolvedValueOnce(12.3).mockResolvedValue(12.47);
+    const { deps, nodes } = makeDeps({ recentSpend: spend });
+    nodes['900'].effective_status = 'ACTIVE';
+    const preview: any = await executeMetaToolkitLifecycle('u1', args('ARCHIVE', { confirm_recent_spend: true }), deps);
+    nodes['900'].effective_status = 'WITH_ISSUES';
+    const res: any = await executeMetaToolkitLifecycle('u1', { ...args('ARCHIVE', { confirm_recent_spend: true }), confirm: true, preview_token: preview.preview_token }, deps);
+    expect(res).toMatchObject({ verification: 'CONFIRMED' });
+  });
+
+  it('a DELETE that errors and then reads back as gone is UNCONFIRMED, not CONFIRMED', async () => {
+    const { deps, nodes, mock } = makeDeps();
+    let attempted = false;
+    (mock.remove as jest.Mock).mockImplementation(async () => { attempted = true; throw Object.assign(new Error('Permissions error'), { response: { status: 400 } }); });
+    // After the failed call the node is unreadable (e.g. access lost), which is not proof of deletion.
+    (mock.readNode as jest.Mock).mockImplementation(async (_u: string, _a: string, _e: string, id: string) => (attempted ? null : nodes[id] ? { ...nodes[id] } : null));
+    const preview: any = await executeMetaToolkitLifecycle('u1', args('DELETE'), deps);
+    const res: any = await executeMetaToolkitLifecycle('u1', { ...args('DELETE'), confirm: true, preview_token: preview.preview_token }, deps);
+    expect(res).toMatchObject({ success: false, verification: 'UNCONFIRMED' });
+  });
+
   it('spend appearing between preview and confirm invalidates the approval', async () => {
     const spend = jest.fn().mockResolvedValue(0);
     const { deps, mock } = makeDeps({ recentSpend: spend });
@@ -217,10 +238,19 @@ describe('ENG-2922 Graph seam', () => {
     await expect(readOwnedMetaNode(ctx(jest.fn().mockRejectedValue(new Error('500'))), '9')).rejects.toThrow('500');
   });
 
-  it('readMetaRecentSpend sums spend over a yesterday→today window', async () => {
+  it('readMetaRecentSpend sums spend over a window covering the account\'s local today and yesterday in any timezone', async () => {
     const get = jest.fn().mockResolvedValue({ data: { data: [{ spend: '1.25' }, { spend: '2' }] } });
     expect(await readMetaRecentSpend(ctx(get), '9', Date.parse('2026-11-10T05:00:00Z'))).toBeCloseTo(3.25);
-    expect(JSON.parse(get.mock.calls[0][1].params.time_range)).toEqual({ since: '2026-11-09', until: '2026-11-10' });
+    expect(JSON.parse(get.mock.calls[0][1].params.time_range)).toEqual({ since: '2026-11-08', until: '2026-11-11' });
+    // UTC+14 at 20:00Z on 11-10 is local 11-11 10:00 (today) and 11-10 (yesterday); UTC-12 is local 11-10 08:00 and 11-09.
+    for (const [offsetH, today, yesterday] of [[14, '2026-11-11', '2026-11-10'], [-12, '2026-11-10', '2026-11-09'], [10, '2026-11-11', '2026-11-10']] as const) {
+      const now = Date.parse('2026-11-10T20:00:00Z');
+      const w = recentSpendWindow(now);
+      const local = (ms: number) => new Date(ms + offsetH * 3600_000).toISOString().slice(0, 10);
+      expect(local(now)).toBe(today);
+      expect(local(now - 86_400_000)).toBe(yesterday);
+      for (const d of [today, yesterday]) expect(d >= w.since && d <= w.until).toBe(true);
+    }
     await expect(readMetaRecentSpend(ctx(jest.fn().mockResolvedValue({ data: {} })), '9', NOW)).rejects.toThrow();
   });
 

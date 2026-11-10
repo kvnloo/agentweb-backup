@@ -40,7 +40,8 @@ const argsFor = (action: string, entity_type = 'CAMPAIGN') => ({ entity_type, ac
 // ENG-2303 (Harsha, 2026-10-12) superseded D2 for CAMPAIGN/AD_SET/AD CREATE + status/budget
 // UPDATE behind the guarded preview→confirm path (eng2303.metaToolkitWrites.test.ts). Every
 // other write stays refused at the boundary, exactly as D2 required.
-const STILL_EXCLUDED: Array<[string, string]> = [['DELETE', 'CAMPAIGN'], ['CREATE', 'CUSTOM_AUDIENCE'], ['COPY_AD', 'AD'], ['UPDATE', 'AD_CREATIVE'], ['UPLOAD_USERS', 'CUSTOM_AUDIENCE'], ['UPLOAD_IMAGE', 'CAMPAIGN']];
+// ENG-2922: CAMPAIGN/AD_SET/AD DELETE is now a guarded lifecycle write; DELETE on any other entity stays excluded.
+const STILL_EXCLUDED: Array<[string, string]> = [['DELETE', 'AD_CREATIVE'], ['CREATE', 'CUSTOM_AUDIENCE'], ['COPY_AD', 'AD'], ['UPDATE', 'AD_CREATIVE'], ['UPLOAD_USERS', 'CUSTOM_AUDIENCE'], ['UPLOAD_IMAGE', 'CAMPAIGN']];
 
 // Real transport -> gateway -> v1 assertion -> shared registry. Only external dependencies mocked.
 describe('ENG-2268 external write boundary across public entrypoints (non-guarded writes)', () => {
