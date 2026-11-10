@@ -53,7 +53,7 @@ export interface MetaToolkitAudienceDeps {
   /** Add (or remove) one batch (≤10k) of already-hashed identifiers. */
   users: (
     userId: string, accountId: string, audienceId: string, schema: 'EMAIL' | 'PHONE', hashes: string[], remove: boolean,
-  ) => Promise<{ success: boolean; message?: string; received?: number }>;
+  ) => Promise<{ success: boolean; message?: string; received?: number; invalid?: number }>;
   /** Shared sessionless gate for AD_SET UPDATE (never dispatches). */
   previewAdSetUpdate: (userId: string, accountId: string, adSetId: string, params: any) => Promise<any>;
   dispatch: (userId: string, dispatch: any) => Promise<{ result: any; createdId?: string }>;
@@ -74,7 +74,12 @@ const defaultDeps: MetaToolkitAudienceDeps = {
       { id: audienceId, schema: [schema], payload: hashes.map((h) => [h]) },
     );
     const received = r?.result?.num_received;
-    return { success: !!r?.success, message: r?.message, ...(received !== undefined ? { received: Number(received) } : {}) };
+    const invalid = r?.result?.num_invalid_entries;
+    return {
+      success: !!r?.success, message: r?.message,
+      ...(received !== undefined ? { received: Number(received) } : {}),
+      ...(invalid !== undefined ? { invalid: Number(invalid) } : {}),
+    };
   },
   previewAdSetUpdate: async (userId, accountId, adSetId, params) =>
     (await ams()).previewToolkitMetaWrite(userId, 'AD_SET', 'UPDATE', accountId, undefined, adSetId, undefined, params),
@@ -259,6 +264,7 @@ function identifiersFrom(params: any, required: boolean): HashedIdentifiers | nu
 async function sendUsers(ctx: Ctx, audienceId: string, ids: HashedIdentifiers, remove: boolean) {
   const sent = ids.EMAIL.length + ids.PHONE.length;
   let received = 0;
+  let invalid = 0;
   let countsKnown = true;
   for (const schema of ['EMAIL', 'PHONE'] as const) {
     for (const chunk of batches(ids[schema])) {
@@ -269,14 +275,19 @@ async function sendUsers(ctx: Ctx, audienceId: string, ids: HashedIdentifiers, r
       }
       if (r.received === undefined || !Number.isFinite(r.received)) countsKnown = false;
       else received += r.received;
+      if (r.invalid !== undefined && Number.isFinite(r.invalid)) invalid += r.invalid;
     }
   }
-  const verification: WriteVerification = !countsKnown ? 'UNCONFIRMED' : received === sent ? 'CONFIRMED' : 'MISMATCH';
-  return { verification, sent, received };
+  // Meta counts rejected entries in num_received too, so received === sent alone is not success.
+  const verification: WriteVerification = !countsKnown ? 'UNCONFIRMED' : received === sent && invalid === 0 ? 'CONFIRMED' : 'MISMATCH';
+  return { verification, sent, received, invalid };
 }
 
-function usersMessage(remove: boolean, r: { verification: WriteVerification; sent: number; received: number }, audienceId: string) {
+function usersMessage(remove: boolean, r: { verification: WriteVerification; sent: number; received: number; invalid?: number }, audienceId: string) {
   const verb = remove ? 'removal of' : 'upload of';
+  if (r.verification === 'MISMATCH' && r.invalid) {
+    return `Meta received ${r.received} of ${r.sent} hashed identifier(s) for audience ${audienceId} but rejected ${r.invalid} as invalid (check phone numbers include the country code). Check the list before retrying.`;
+  }
   if (r.verification === 'CONFIRMED') return `Meta received the ${verb} all ${r.sent} hashed identifier(s) for audience ${audienceId}. Matching and size updates take Meta up to a few hours.`;
   if (r.verification === 'MISMATCH') return `Meta received ${r.received} of ${r.sent} hashed identifier(s) for audience ${audienceId}. Check the list before retrying.`;
   return `UNCONFIRMED: Meta accepted the ${verb} identifiers for audience ${audienceId} but did not report how many it received. Check the audience with GET before reporting this as done.`;
@@ -421,7 +432,7 @@ async function updateAudience(ctx: Ctx, args: any, params: any) {
     if (!read) verification = 'UNCONFIRMED';
     else if (change.name !== undefined && read.name !== change.name) verification = 'MISMATCH';
     else if (change.description !== undefined && (read.description ?? '') !== change.description) verification = 'MISMATCH';
-    else if (change.rule !== undefined && !read.rule) verification = 'UNCONFIRMED';
+    else if (change.rule !== undefined) verification = ruleVerification(change.rule, read.rule, current.rule);
     return {
       success: verification === 'CONFIRMED',
       verification,
@@ -434,6 +445,27 @@ async function updateAudience(ctx: Ctx, args: any, params: any) {
           : `UNCONFIRMED: Meta accepted the update of audience ${current.id}, but the read-back could not confirm it.`,
     };
   });
+}
+
+/** Canonical JSON (sorted keys) of a rule given as a JSON string or object; null if unparseable. */
+function canonicalRule(rule: unknown): string | null {
+  let value: unknown = rule;
+  if (typeof rule === 'string') {
+    try { value = JSON.parse(rule); } catch { return null; }
+  }
+  if (!value || typeof value !== 'object') return null;
+  const sort = (v: any): any => Array.isArray(v) ? v.map(sort)
+    : v && typeof v === 'object' ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, sort(v[k])])) : v;
+  return JSON.stringify(sort(value));
+}
+
+/** The read-back rule must be the approved rule; still the old rule is MISMATCH; anything else unproven. */
+function ruleVerification(sent: unknown, got: unknown, before: unknown): WriteVerification {
+  const want = canonicalRule(sent);
+  const have = canonicalRule(got);
+  if (!want || !have) return 'UNCONFIRMED';
+  if (have === want) return 'CONFIRMED';
+  return have === canonicalRule(before) ? 'MISMATCH' : 'UNCONFIRMED';
 }
 
 async function changeUsers(ctx: Ctx, args: any, params: any, remove: boolean) {
@@ -462,6 +494,7 @@ async function changeUsers(ctx: Ctx, args: any, params: any, remove: boolean) {
       id: String(audience.id),
       identifiers_sent: sent.sent,
       identifiers_received: sent.received,
+      ...(sent.invalid ? { identifiers_invalid: sent.invalid } : {}),
       message: usersMessage(remove, sent, String(audience.id)),
     };
   });
