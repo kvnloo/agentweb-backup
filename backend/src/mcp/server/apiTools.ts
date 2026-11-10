@@ -2721,6 +2721,69 @@ mcpToolRegistry.register({
   }
 });
 
+export const MAX_LANDING_PAGE_FILES_PER_UPDATE = 20;
+export const LANDING_PAGE_DRAFT_BRANCH = 'draft/agentweb-preview';
+
+mcpToolRegistry.register({
+  name: 'update_landing_page_files',
+  definition: {
+    name: 'update_landing_page_files',
+    description: 'ENG-2896: commit up to 20 files to one of your landing pages in ONE atomic commit on the draft/preview branch (draft/agentweb-preview by default; main is rejected — publish with publish_landing_page_changes). Pass expected_base_sha (from a prior read) to fail with a conflict and write nothing if the branch moved. Returns the new commit SHA.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The landing page ID' },
+        files: {
+          type: 'array',
+          maxItems: MAX_LANDING_PAGE_FILES_PER_UPDATE,
+          description: 'Files to write (max 20). Each: { path, content }.',
+          items: {
+            type: 'object',
+            properties: {
+              path: { type: 'string', description: 'Repo path, e.g. "src/app/page.tsx"' },
+              content: { type: 'string', description: 'Full new file content' }
+            },
+            required: ['path', 'content']
+          }
+        },
+        commit_message: { type: 'string', description: 'Commit message (optional)' },
+        branch: { type: 'string', description: 'Target branch. Defaults to "draft/agentweb-preview". "main" is rejected.' },
+        expected_base_sha: { type: 'string', description: 'Optional 40-char SHA the branch head must equal; otherwise the call fails with a conflict and writes nothing.' }
+      },
+      required: ['page_id', 'files']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const branch: string = args.branch || LANDING_PAGE_DRAFT_BRANCH;
+    if (branch === 'main' || branch === 'refs/heads/main') {
+      throw new Error('update_landing_page_files never writes to main. Omit branch to use the draft/preview branch, then publish with publish_landing_page_changes.');
+    }
+    const files = args.files;
+    if (!Array.isArray(files) || files.length === 0) {
+      throw new Error('files must be a non-empty array of { path, content }.');
+    }
+    if (files.length > MAX_LANDING_PAGE_FILES_PER_UPDATE) {
+      throw new Error(`files must not exceed ${MAX_LANDING_PAGE_FILES_PER_UPDATE} entries per commit (got ${files.length}).`);
+    }
+    for (const f of files) {
+      if (!f || typeof f.path !== 'string' || !f.path || typeof f.content !== 'string') {
+        throw new Error('Each file requires a string path and string content.');
+      }
+    }
+    const data: any = await mcpFetch({
+      method: 'PUT', path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}/update-files`, context: ctx(context),
+      body: {
+        files: files.map((f: any) => ({ file_path: f.path, content: f.content })),
+        commit_message: args.commit_message || `Update ${files.length} file(s) via update_landing_page_files`,
+        branch,
+        ...(args.expected_base_sha ? { expected_base_sha: args.expected_base_sha } : {})
+      }
+    });
+    const commitSha = typeof data?.commit_url === 'string' ? data.commit_url.split('/commit/')[1] : undefined;
+    return jsonResult({ ...data, commit_sha: commitSha });
+  }
+});
+
 mcpToolRegistry.register({
   name: 'list_landing_page_files',
   definition: {

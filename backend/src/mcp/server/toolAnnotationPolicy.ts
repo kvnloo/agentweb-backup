@@ -119,6 +119,7 @@ export const MCP_TOOL_SIDE_EFFECTS: Readonly<Record<string, McpToolSideEffect>> 
   test_scheduled_chat: 'write',
   update_knowledge_base_file_content: 'write',
   update_landing_page_context: 'write',
+  update_landing_page_files: 'write',
 });
 
 export class UnclassifiedMcpToolError extends Error {

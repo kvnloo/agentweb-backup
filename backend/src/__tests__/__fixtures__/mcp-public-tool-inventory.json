@@ -1274,6 +1274,28 @@
     }
   },
   {
+    "name": "export_lead_list",
+    "listed": false,
+    "description": "Export every lead in one of your own CRM lead lists to a CSV file. Returns the export record (exportId, recordCount, filename, fileUrl). Requires editor access to the list; works only on lists your account can edit.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "list_id": {
+          "type": "string",
+          "description": "Lead list ID to export"
+        }
+      },
+      "required": [
+        "list_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
     "name": "freeze_user_account",
     "listed": false,
     "description": "Freeze (deactivate) or unfreeze (reactivate) a user account. Admin only. Use this to disable bot accounts or re-enable legitimate accounts.",
@@ -1993,6 +2015,28 @@
       "required": []
     },
     "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "list_lead_list_exports",
+    "listed": false,
+    "description": "List past CSV exports (newest first, up to 50) for one of your own CRM lead lists.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "list_id": {
+          "type": "string",
+          "description": "Lead list ID"
+        }
+      },
+      "required": [
+        "list_id"
+      ]
+    },
+    "sideEffect": "read",
     "gating": {
       "internalOnly": false,
       "requiresUserAccount": false
@@ -3740,6 +3784,63 @@
       "required": [
         "page_id",
         "context"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "update_landing_page_files",
+    "listed": false,
+    "description": "ENG-2896: commit up to 20 files to one of your landing pages in ONE atomic commit on the draft/preview branch (draft/agentweb-preview by default; main is rejected — publish with publish_landing_page_changes). Pass expected_base_sha (from a prior read) to fail with a conflict and write nothing if the branch moved. Returns the new commit SHA.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "page_id": {
+          "type": "string",
+          "description": "The landing page ID"
+        },
+        "files": {
+          "type": "array",
+          "maxItems": 20,
+          "description": "Files to write (max 20). Each: { path, content }.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "Repo path, e.g. \"src/app/page.tsx\""
+              },
+              "content": {
+                "type": "string",
+                "description": "Full new file content"
+              }
+            },
+            "required": [
+              "path",
+              "content"
+            ]
+          }
+        },
+        "commit_message": {
+          "type": "string",
+          "description": "Commit message (optional)"
+        },
+        "branch": {
+          "type": "string",
+          "description": "Target branch. Defaults to \"draft/agentweb-preview\". \"main\" is rejected."
+        },
+        "expected_base_sha": {
+          "type": "string",
+          "description": "Optional 40-char SHA the branch head must equal; otherwise the call fails with a conflict and writes nothing."
+        }
+      },
+      "required": [
+        "page_id",
+        "files"
       ]
     },
     "sideEffect": "write",

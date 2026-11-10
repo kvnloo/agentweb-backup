@@ -3393,8 +3393,40 @@ describe("PUT /generated/:id/update-files (ENG-497)", () => {
       expect.anything(),
       "Preview a 2-file change",
       4,
-      "draft/agentweb-preview"
+      "draft/agentweb-preview",
+      undefined
     );
+  });
+
+  it("ENG-2896: forwards expected_base_sha to the commit", async () => {
+    const sha = "a".repeat(40);
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/update-files")
+      .send({ commit_message: "msg", branch: "draft/agentweb-preview", expected_base_sha: sha, files: [{ file_path: "ok.txt", content: "x" }] });
+    expect(res.status).toBe(200);
+    expect(mockCommitFilesToRepoMain.mock.calls[0][6]).toBe(sha);
+  });
+
+  it("ENG-2896: malformed expected_base_sha -> 400, commit never attempted", async () => {
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/update-files")
+      .send({ commit_message: "msg", expected_base_sha: "nope", files: [{ file_path: "ok.txt", content: "x" }] });
+    expect(res.status).toBe(400);
+    expect(mockCommitFilesToRepoMain).not.toHaveBeenCalled();
+  });
+
+  it("ENG-2896: base SHA conflict -> 409 with expected/actual", async () => {
+    const err: any = new Error("Branch head is b, expected a.");
+    err.name = "BaseShaConflictError";
+    err.expectedSha = "a".repeat(40);
+    err.actualSha = "b".repeat(40);
+    mockCommitFilesToRepoMain.mockRejectedValueOnce(err);
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/update-files")
+      .send({ commit_message: "msg", branch: "draft/agentweb-preview", expected_base_sha: "a".repeat(40), files: [{ file_path: "ok.txt", content: "x" }] });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/Base SHA conflict.*Nothing was written/);
+    expect(res.body.actual_base_sha).toBe("b".repeat(40));
   });
 
   it("FAIL: no commit_message -> 400", async () => {
