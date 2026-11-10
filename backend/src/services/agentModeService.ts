@@ -15393,6 +15393,12 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       const changes = fields.flatMap(field => {
         const proposed = money.params[field];
         if (proposed === undefined) return [];
+        // A spend cap is a ceiling: adding one to an object Meta read back with no cap only
+        // restricts spend. Requires a real read-back (id present) so a failed read stays unknown.
+        if (field === 'spend_cap' && prior?.id && (prior[field] === undefined || prior[field] === null || prior[field] === '')) {
+          const capped = classifyMetaBudgetChange(proposed, proposed);
+          if (capped.severity !== 'unknown') return [{ field, severity: 'normal' as const, ratio: null, prior: undefined, proposed: capped.proposed }];
+        }
         return [{ field, ...classifyMetaBudgetChange(prior?.[field], proposed) }];
       });
       if (changes.some(change => change.severity === 'unknown')) return { blocked };
