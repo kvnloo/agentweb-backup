@@ -5,7 +5,7 @@ jest.mock('../services/mcpUsageEventsService', () => ({ recordMcpToolUse: jest.f
 jest.mock('../services/agentModeService', () => ({ agentModeService: { readToolkitMetaSignals: jest.fn().mockResolvedValue({ data: [] }) } }));
 import { executeSignalsRead, SIGNAL_READ_DEFINITIONS, SIGNAL_FIELDS } from '../mcp/metaToolkitSignals';
 import { getMetaToolkitManifest } from '../mcp/metaToolkitManifest';
-import { handleMetaToolkitCall } from '../mcp/metaToolkitGateway';
+import { handleMetaToolkitCall, stripCredentials } from '../mcp/metaToolkitGateway';
 import { agentModeService } from '../services/agentModeService';
 const credentials = { accountId: '123', accessToken: 'secret' };
 describe('ENG-2917 signals reads', () => {
@@ -78,6 +78,30 @@ describe('ENG-2917 signals reads', () => {
     await expect(executeSignalsRead('ads_pixel_event_read', args, credentials, { get } as any)).rejects.toThrow();
     expect(get).not.toHaveBeenCalled();
   });
+  it.each(['ads_get_datasets', 'ads_pixel_event_read'])('%s never returns a Graph paging URL (it carries the access token); cursors are kept', async (name) => {
+    const tokenPage = { data: [{ id: '456' }], paging: { cursors: { before: 'b', after: 'a' }, next: 'https://graph.facebook.com/v25.0/x?access_token=secret&after=a', previous: 'https://graph.facebook.com/v25.0/x?access_token=secret&before=b' } };
+    const get = jest.fn().mockResolvedValue({ data: tokenPage });
+    const out: any = await executeSignalsRead(name, name === 'ads_get_datasets' ? {} : { pixel_id: '456' }, credentials, { get } as any);
+    expect(JSON.stringify(out)).not.toContain('secret');
+    expect(out.paging).toEqual({ cursors: { before: 'b', after: 'a' }, has_next: true, has_previous: true });
+  });
+
+  it('stripCredentials redacts tokens inside URL strings for every toolkit response (signals, experiments, registry reads)', () => {
+    const out = stripCredentials({ paging: { next: 'https://graph.facebook.com/x?limit=5&access_token=EAAB123&after=c' }, note: 'ok' });
+    expect(JSON.stringify(out)).not.toContain('EAAB123');
+    expect(out.paging.next).toContain('access_token=[redacted]&after=c');
+  });
+
+  it.each([
+    [{ pixel_id: '456', start_time: 'yesterday' }],
+    [{ pixel_id: '456', start_time: '1767225600', end_time: '1767139200' }],
+    [{ pixel_id: '456', toString: 'x' }],
+  ])('rejects bad stats input %j before Graph calls', async (args) => {
+    const get = jest.fn();
+    await expect(executeSignalsRead('ads_get_dataset_stats', args, credentials, { get } as any)).rejects.toThrow();
+    expect(get).not.toHaveBeenCalled();
+  });
+
   it('treats blank optional strings as absent instead of forwarding them to Graph', async () => {
     const get = jest.fn().mockResolvedValue({ data: { data: [{ id: '456' }] } });
     await executeSignalsRead('ads_get_datasets', { after: '' }, credentials, { get } as any);
