@@ -288,6 +288,27 @@ describe('ENG-2914 UPDATE / ADD_USERS / REMOVE_USERS', () => {
     await expect(executeMetaToolkitAudience('u1', { ...base, action: 'ADD_USERS', audience_id: '501', params: { emails: ['nope'] } }, deps)).rejects.toThrow(/None of the supplied/);
   });
 
+  it('UPDATE rule: CONFIRMED only when Meta reads back the approved rule; still the old rule → MISMATCH', async () => {
+    const newRule = { inclusions: { operator: 'or', rules: [{ retention_seconds: 86400 }] } };
+    let { deps } = makeDeps();
+    let r = await previewThenConfirm({ ...base, action: 'UPDATE', audience_id: '502', params: { rule: newRule } }, deps);
+    expect(r.result).toMatchObject({ verification: 'CONFIRMED' });
+    ({ deps } = makeDeps());
+    const graph = deps.graph as jest.Mock;
+    const real = graph.getMockImplementation()!;
+    graph.mockImplementation(async (u: string, a: string, method: string, path: string, params: any) =>
+      method === 'POST' && path === '502' ? { success: true } : real(u, a, method, path, params));
+    r = await previewThenConfirm({ ...base, action: 'UPDATE', audience_id: '502', params: { rule: newRule } }, deps);
+    expect(r.result).toMatchObject({ success: false, verification: 'MISMATCH' });
+  });
+
+  it('identifiers Meta rejects as invalid are not success even when every one was received', async () => {
+    const { deps } = makeDeps({ users: jest.fn(async (_u, _a, _id, _s, hashes) => ({ success: true, received: hashes.length, invalid: 1 })) });
+    const { result } = await previewThenConfirm({ ...base, action: 'ADD_USERS', audience_id: '501', params: { emails: ['a@b.co', 'c@d.co'] } }, deps);
+    expect(result).toMatchObject({ success: false, verification: 'MISMATCH', identifiers_invalid: 1 });
+    expect(result.message).toMatch(/rejected 1 as invalid/);
+  });
+
   it('a users upload refused for terms → TERMS_NOT_ACCEPTED', async () => {
     const { deps } = makeDeps({ users: jest.fn().mockResolvedValue({ success: false, message: 'You must accept the Custom Audience Terms for this ad account.' }) });
     const { result } = await previewThenConfirm({ ...base, action: 'ADD_USERS', audience_id: '501', params: { emails: ['a@b.co'] } }, deps);
