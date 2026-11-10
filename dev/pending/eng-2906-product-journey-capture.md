@@ -8,9 +8,15 @@
 - AW-Users: write-once `signup*` set, `products.<p>.{firstAt,lastAt}` (hourly), forward-only
   `zomaStage` via `zomaStage IN (<earlier stages>)` — all single conditional UpdateItems with
   `attribute_exists(email)`, no read-modify-write. No backfill; pre-ENG-2906 rows and events have
-  no product (read as "not tracked", not `unknown`).
-- Known gaps: a Google sign-up started from the MCP consent page is attributed `webapp`
-  (confidence `inferred`) — the portal does not tell the backend where it came from. SDK MCP
-  clients that send the protected-resource metadata URL as `resource` drop a `?ref=` from the
-  configured MCP URL; the ref is still recorded on `/mcp` connection and toolkit usage events.
-  `ad_live` is a documented stub; `abandoned` is not emitted.
+  no product (read as "not tracked", not `unknown`). Row/person `attributionConfidence` is
+  `tracked | inferred | verified` (internal `explicit` → `tracked`; `unknown` omitted).
+- OAuth signups are attributed only for rows register stamped `signupSource = "mcp"` (consent
+  page), never by account age. `first_read`/`first_write` have their own write-once fields, so
+  either order emits both once.
+- `?ref=` on the MCP URL reaches `/oauth/authorize` because the 401 challenge and the
+  protected-resource metadata echo it into `resource` (SDK clients send that, not their URL).
+- Known gaps: a Google sign-up that starts from the MCP consent flow (via the portal login page)
+  is attributed `webapp` (confidence `inferred`) — Google OAuth state does not carry the source,
+  and fixing it needs a portal change. A client that ignores both the challenge URL and the
+  server URL's query on discovery still loses `ref` at authorize; it is still recorded on `/mcp`
+  connection and toolkit usage events. `ad_live` is a documented stub; `abandoned` is not emitted.
