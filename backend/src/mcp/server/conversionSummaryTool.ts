@@ -10,6 +10,7 @@
  * No new index: the lead scan is bounded (MAX_LEADS_SCANNED) and the result
  * says `truncated: true` when the bound is hit.
  */
+import { isSessionList } from '../../utils/sessionList';
 import { mcpToolRegistry } from './registry';
 import { mcpFetch } from './httpClient';
 import { ctx, jsonResult } from './toolHelpers';
@@ -96,7 +97,7 @@ mcpToolRegistry.register({
     const listsRaw = await mcpFetch({ method: 'GET', path: '/api/crm/lists', context: scoped });
     const listId = (l: any): string => String(l?.listId ?? l?.id ?? '');
     const lists = (Array.isArray(listsRaw) ? listsRaw : [])
-      .filter((l: any) => l && listId(l) && !l.fromOrgMember && (!l.userId || l.userId === ownerId));
+      .filter((l: any) => l && listId(l) && !l.fromOrgMember && !isSessionList(l) && (!l.userId || l.userId === ownerId));
 
     const pagesRaw = await mcpFetch({ method: 'GET', path: '/api/landing-pages/v0/generated', context: scoped });
     const pages = (Array.isArray(pagesRaw?.pages) ? pagesRaw.pages : [])

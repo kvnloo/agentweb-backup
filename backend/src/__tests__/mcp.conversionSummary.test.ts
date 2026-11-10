@@ -22,6 +22,8 @@ const DATA: Record<string, any> = {
     lists: [
       { id: 'la', userId: 'alice', name: 'Alice LP leads', listType: 'sales' },
       { id: 'lb-shared', userId: 'bob', name: 'Bob org list', fromOrgMember: true },
+      // Opslane run 1790: session lists hold visit rows, not leads.
+      { id: 'ls', userId: 'alice', name: 'Alice sessions', listType: 'session' },
     ],
     pages: [
       { id: 'pa', userId: 'alice', name: 'Alice LP', deployedUrl: 'https://alice.agentwebforms.com/offer?t=secret' },
@@ -35,6 +37,7 @@ const DATA: Record<string, any> = {
         { email: 'old@ex.com', createdAt: '2025-01-01T00:00:00Z', customFields: { lpId: 'pa' } },
       ],
       'lb-shared': [{ email: 'bobsecret@ex.com', createdAt: '2026-11-01T00:00:00Z' }],
+      ls: [{ email: 's1@session.local', createdAt: '2026-11-01T00:00:00Z', customFields: { landingPageId: 'pa' } }],
     },
   },
   bob: {
@@ -68,6 +71,7 @@ describe('ENG-2898 get_conversion_summary', () => {
     expect(out.truncated).toBe(false);
     // Never fetched the org member list's leads.
     expect(mockFetch.mock.calls.some((c: any) => c[0].path.includes('lb-shared'))).toBe(false);
+    expect(mockFetch.mock.calls.some((c: any) => c[0].path.includes('/ls/'))).toBe(false);
   });
 
   it('two principals see no cross-account data', async () => {
