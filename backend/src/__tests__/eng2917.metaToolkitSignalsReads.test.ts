@@ -34,7 +34,7 @@ describe('ENG-2917 signals reads', () => {
     const get = jest.fn().mockResolvedValue({ data: { data: [{ id: '456' }] } });
     const args = ['ads_get_datasets', 'ads_get_customconversions'].includes(name!) ? {} : { pixel_id: '456' };
     await executeSignalsRead(name!, args, credentials, { get } as any);
-    expect(get).toHaveBeenLastCalledWith(expect.stringContaining('/' + path), { params: expect.objectContaining({ access_token: 'secret', ...(fields ? { fields } : {}) }) });
+    expect(get).toHaveBeenLastCalledWith(expect.stringContaining('/' + path), expect.objectContaining({ params: expect.objectContaining({ access_token: 'secret', ...(fields ? { fields } : {}) }) }));
   });
   it('passes stats aggregation and time range', async () => {
     const get = jest.fn().mockResolvedValue({ data: { data: [{ id: '456' }] } });
@@ -65,5 +65,15 @@ describe('ENG-2917 signals reads', () => {
     const get = jest.fn();
     await expect(executeSignalsRead('ads_pixel_event_read', args, credentials, { get } as any)).rejects.toThrow();
     expect(get).not.toHaveBeenCalled();
+  });
+  it('treats blank optional strings as absent instead of forwarding them to Graph', async () => {
+    const get = jest.fn().mockResolvedValue({ data: { data: [{ id: '456' }] } });
+    await executeSignalsRead('ads_get_datasets', { after: '' }, credentials, { get } as any);
+    expect(get.mock.calls[0][1].params).not.toHaveProperty('after');
+    get.mockClear();
+    await executeSignalsRead('ads_get_dataset_stats', { pixel_id: '456', start_time: '', end_time: ' ' }, credentials, { get } as any);
+    const statsParams = get.mock.calls[get.mock.calls.length - 1][1].params;
+    expect(statsParams).not.toHaveProperty('start_time');
+    expect(statsParams).not.toHaveProperty('end_time');
   });
 });

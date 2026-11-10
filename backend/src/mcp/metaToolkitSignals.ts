@@ -43,6 +43,8 @@ export async function executeSignalsRead(
 ) {
   const def = SIGNAL_READ_DEFINITIONS.find((d) => d.name === name);
   if (!def) throw new MetaToolkitRefusal('Unknown signals read tool.');
+  // LLM-driven clients often fill optional fields with ""; treat blank optional strings as absent.
+  args = Object.fromEntries(Object.entries(args ?? {}).filter(([k, v]) => !(k !== 'pixel_id' && typeof v === 'string' && v.trim() === '')));
   for (const key of Object.keys(args)) {
     if (!(key in def.inputSchema.properties)) throw new MetaToolkitRefusal(`Unsupported signals argument: ${key}`);
   }
@@ -53,7 +55,7 @@ export async function executeSignalsRead(
   if (args.aggregation !== undefined && !['event', 'match_keys', 'url', 'host', 'device_type', 'pixel_fire'].includes(args.aggregation)) throw new MetaToolkitRefusal('Unsupported aggregation.');
   const base = `https://graph.facebook.com/${process.env.META_API_VERSION || 'v25.0'}`;
   const account = `act_${credentials.accountId.replace(/^act_/, '')}`;
-  const get = async (path: string, params: Record<string, unknown> = {}) => (await graph.get(`${base}/${path}`, { params: { ...params, access_token: credentials.accessToken } })).data;
+  const get = async (path: string, params: Record<string, unknown> = {}) => (await graph.get(`${base}/${path}`, { params: { ...params, access_token: credentials.accessToken }, timeout: 15_000 })).data;
   const page = { limit: args.limit ?? 100, ...(args.after !== undefined ? { after: args.after } : {}) };
   if (name === 'ads_get_datasets') return get(`${account}/adspixels`, { fields: SIGNAL_FIELDS.datasets, ...page });
   if (name === 'ads_get_customconversions') return get(`${account}/customconversions`, { fields: SIGNAL_FIELDS.conversions, ...page });
@@ -61,7 +63,8 @@ export async function executeSignalsRead(
   // Pixel nodes are globally addressed: prove membership in this selected account before reading.
   let after: string | undefined;
   const seen = new Set<string>();
-  for (;;) {
+  for (let pages = 0; ; pages += 1) {
+    if (pages >= 50) throw new MetaToolkitRefusal('That pixel is not in the selected ad account.');
     const owned = await get(`${account}/adspixels`, { fields: 'id', limit: 100, ...(after ? { after } : {}) });
     if (owned?.data?.some((p: any) => String(p.id) === args.pixel_id)) break;
     const next = owned?.paging?.next ? owned?.paging?.cursors?.after : undefined;
