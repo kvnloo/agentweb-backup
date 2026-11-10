@@ -89,7 +89,9 @@ describe('register — createUser uniqueness conflict (ENG-2899)', () => {
     const res = await request(makeApp()).post('/register').send({ email: 'old@user.com', password: 'ValidPass123!' });
     expect(res.status).toBe(409);
     expect(res.body.code).toBe('email_unavailable');
-    expect(res.body.message).toMatch(/sign(ing)? in|reset/i);
+    expect(res.body.message).toMatch(/contact support/i);
+    // login + forgot-password skip deleted_ tombstones, so never point there (Opslane run 1793).
+    expect(res.body.message).not.toMatch(/sign(ing)? in|reset/i);
     expect(JSON.stringify(res.body)).not.toMatch(/tombstone|deleted|changed/i);
   });
 

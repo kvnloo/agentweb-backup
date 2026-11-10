@@ -30,7 +30,7 @@ export function mapCreateUserError(error: unknown): CreateUserErrorResponse {
       body: {
         code: EMAIL_UNAVAILABLE_CODE,
         message:
-          "This email can't be used to create a new account. If it's yours, try signing in or resetting your password; otherwise contact support.",
+          "This email can't be used to create a new account. Please contact support for help with this address.",
       },
     };
   }
