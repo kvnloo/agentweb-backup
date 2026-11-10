@@ -162,14 +162,19 @@ describe('ENG-2913 post-launch edits', () => {
     expect(deps.dispatch).not.toHaveBeenCalled();
   });
 
-  it('CAMPAIGN bid_strategy + spend_cap are allowed; spend_cap verified in minor units', async () => {
+  it('CAMPAIGN bid_strategy and spend_cap are allowed as separate UPDATEs; spend_cap verified in minor units', async () => {
+    // spend_cap is coalesced by the write rate shaper like a budget, so it is its own UPDATE
+    // (a bundled bid_strategy could otherwise be dropped as "no change").
     const prior = { id: '1', status: 'PAUSED', bid_strategy: 'LOWEST_COST_WITHOUT_CAP' };
-    const deps = makeDeps({
-      previewMoney: jest.fn(async (_u: string, _a: string, p: any) => ({ params: { ...p, spend_cap: 50000 }, confirmation: ' (money submitted: spend_cap: $500.00)' })),
-      readBack: jest.fn().mockResolvedValueOnce(prior).mockResolvedValueOnce(prior).mockResolvedValue({ ...prior, bid_strategy: 'COST_CAP', spend_cap: '50000' }),
+    let deps = makeDeps({
+      readBack: jest.fn().mockResolvedValueOnce(prior).mockResolvedValueOnce(prior).mockResolvedValue({ ...prior, bid_strategy: 'COST_CAP' }),
     });
-    const r: any = await previewThenConfirm(deps, upd('CAMPAIGN', { bid_strategy: 'COST_CAP', spend_cap: 500 }, { campaign_id: '1' }));
-    expect(r.verification).toBe('CONFIRMED');
+    expect(((await previewThenConfirm(deps, upd('CAMPAIGN', { bid_strategy: 'COST_CAP' }, { campaign_id: '1' }))) as any).verification).toBe('CONFIRMED');
+    deps = makeDeps({
+      previewMoney: jest.fn(async (_u: string, _a: string, p: any) => ({ params: { ...p, spend_cap: 50000 }, confirmation: ' (money submitted: spend_cap: $500.00)' })),
+      readBack: jest.fn().mockResolvedValueOnce(prior).mockResolvedValueOnce(prior).mockResolvedValue({ ...prior, spend_cap: '50000' }),
+    });
+    expect(((await previewThenConfirm(deps, upd('CAMPAIGN', { spend_cap: 500 }, { campaign_id: '1' }))) as any).verification).toBe('CONFIRMED');
   });
 
   it.each([
