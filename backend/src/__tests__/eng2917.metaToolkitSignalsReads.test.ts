@@ -76,4 +76,10 @@ describe('ENG-2917 signals reads', () => {
     expect(statsParams).not.toHaveProperty('start_time');
     expect(statsParams).not.toHaveProperty('end_time');
   });
+  it('refuses when resolved credentials belong to a different account', async () => {
+    const get = jest.fn();
+    await expect(executeSignalsRead('ads_get_datasets', { account_id: '999' }, credentials, { get } as any)).rejects.toThrow('do not match');
+    expect(get).not.toHaveBeenCalled();
+    await executeSignalsRead('ads_get_datasets', { account_id: 'act_123' }, credentials, { get: jest.fn().mockResolvedValue({ data: {} }) } as any);
+  });
 });

@@ -48,6 +48,11 @@ export async function executeSignalsRead(
   for (const key of Object.keys(args)) {
     if (!(key in def.inputSchema.properties)) throw new MetaToolkitRefusal(`Unsupported signals argument: ${key}`);
   }
+  // Credential fallback must never silently switch accounts: the resolved account has to be the one asked for.
+  const bare = (id: unknown) => String(id).replace(/^act_/, '');
+  if (args.account_id !== undefined && bare(args.account_id) !== bare(credentials.accountId)) {
+    throw new MetaToolkitRefusal('Resolved Meta credentials do not match the selected ad account.');
+  }
   if (args.limit !== undefined && (!Number.isInteger(args.limit) || args.limit < 1 || args.limit > 100)) throw new MetaToolkitRefusal('limit must be an integer from 1 to 100.');
   for (const key of ['after', 'start_time', 'end_time', 'aggregation']) {
     if (args[key] !== undefined && typeof args[key] !== 'string') throw new MetaToolkitRefusal(`${key} must be a string.`);
