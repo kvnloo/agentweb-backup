@@ -34,7 +34,7 @@ import { META_HEALTH_TOOL_NAMES } from '../mcp/metaToolkitHealth';
 
 // ENG-2303: the toolkit also advertises toolkit-local Zoma onboarding tools (not registry tools).
 // ENG-2916: read-only account health + learning-phase tools sit between the Meta reads and Zoma onboarding.
-const EXPECTED_TOOLKIT_NAMES = [...META_TOOLKIT_V1_TOOL_NAMES, ...META_HEALTH_TOOL_NAMES, ...ZOMA_TOOL_NAMES];
+const EXPECTED_TOOLKIT_NAMES = [...META_TOOLKIT_V1_TOOL_NAMES, 'ads_experiment_list_tests', 'ads_experiment_abtest_get_test', 'ads_experiment_lift_get_test', ...META_HEALTH_TOOL_NAMES, ...ZOMA_TOOL_NAMES];
 
 const ctx = { userId: 'user-1', sessionId: 's-1' };
 
@@ -46,7 +46,7 @@ describe('ENG-2282 Meta Toolkit manifest', () => {
     expect(manifest.map((d: any) => d.name)).toEqual(EXPECTED_TOOLKIT_NAMES);
     expect(emmaToolRegistry.getToolNames().length).toBeGreaterThan(manifest.length + 10);
     for (const def of manifest.filter((d: any) => !d.name.startsWith('zoma_'))) {
-      expect(def.name).toMatch(/meta/);
+      expect(def.name).toMatch(/meta|^ads_/);
       expect(typeof def.description).toBe('string');
       expect(def.inputSchema?.type).toBe('object');
     }

@@ -23,6 +23,7 @@ import { executeMetaToolkitCall, getMetaToolkitManifest, MetaToolkitRefusal } fr
 import { RateLimiter } from '../middleware/rateLimiter';
 import { effectiveApiKeyScopes, findScopeDenial } from './server/apiKeyScopes';
 import { isZomaTool } from './zomaToolDefinitions';
+import { isExperimentRead } from './metaToolkitExperiments';
 import { executeMetaToolkitWrite, isGuardedWriteRequest } from './metaToolkitWrites';
 import { runZomaTool, ZomaNotReadyError } from './zomaOnboarding';
 import { googleToolkitEnabled, META_PROVIDER, resolveProviderAccount } from './zomaProviders';
@@ -273,6 +274,14 @@ export async function handleMetaToolkitCall(
     const health = await (deps.runHealthTool ?? runMetaHealthTool)(request.toolName, caller.userId, accountId, args);
     await meter('meta');
     return stripCredentials(health);
+  }
+
+  // ENG-2919: read-only experiment (ad study) tools; tools:read scope, no write metering.
+  if (isExperimentRead(request.toolName)) {
+    const { agentModeService } = await import('../services/agentModeService');
+    const result = await agentModeService.readToolkitMetaExperiments(caller.userId, request.toolName, args);
+    await meter('meta');
+    return stripCredentials(result);
   }
 
   // ENG-2303 P3: CAMPAIGN/AD_SET/AD CREATE + status/budget UPDATE go through the guarded

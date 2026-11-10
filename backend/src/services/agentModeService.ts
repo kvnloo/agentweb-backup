@@ -15545,6 +15545,13 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     return { result, createdId: AgentModeService.extractDispatchedObjectId(result) };
   }
 
+  /** ENG-2919: read-only experiment tools reuse the account-bound credential resolver. */
+  public async readToolkitMetaExperiments(userId: string, name: string, args: any) {
+    const credentials = await this.getMetaCredentials(userId, args.account_id);
+    const { executeExperimentRead } = await import('../mcp/metaToolkitExperiments');
+    return executeExperimentRead(name, args, credentials);
+  }
+
   /**
    * Zoma creative upload: Meta processing state of an uploaded video, ownership-scoped to the
    * selected ad account (a video id addresses a node globally). Returns Meta's preferred
