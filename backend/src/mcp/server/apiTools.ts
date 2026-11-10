@@ -2348,23 +2348,21 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args: any, context: any) => {
-    const senderId = args?.default_sender_id;
-    const linkedInId = args?.default_linkedin_account_id;
+    // null / "" / whitespace mean "not set" (same as omitting the field), so a
+    // client that always sends both keys can still change just one default.
+    const blankToUndefined = (v: any) => (v === null || (typeof v === 'string' && !v.trim()) ? undefined : v);
+    const senderId = blankToUndefined(args?.default_sender_id);
+    const linkedInId = blankToUndefined(args?.default_linkedin_account_id);
     if (senderId === undefined && linkedInId === undefined) {
       throw new Error('Provide default_sender_id and/or default_linkedin_account_id');
     }
-    if (senderId !== undefined && (typeof senderId !== 'string' || !senderId.trim())) {
-      throw new Error('default_sender_id must be a non-empty string');
+    if (senderId !== undefined && typeof senderId !== 'string') {
+      throw new Error('default_sender_id must be a string');
     }
-    if (linkedInId !== undefined && (typeof linkedInId !== 'string' || !linkedInId.trim())) {
-      throw new Error('default_linkedin_account_id must be a non-empty string');
+    if (linkedInId !== undefined && typeof linkedInId !== 'string') {
+      throw new Error('default_linkedin_account_id must be a string');
     }
     const scoped = ctx(context);
-    const current = await mcpFetch({ method: 'GET', path: '/api/crm/sender-emails', context: scoped });
-    const senders: any[] = Array.isArray(current?.senders) ? current.senders : [];
-    if (senderId !== undefined && !senders.some((s: any) => s?.id === senderId)) {
-      throw new Error(`default_sender_id "${senderId}" is not one of your configured senders`);
-    }
     if (linkedInId !== undefined) {
       const conn = await mcpFetch({ method: 'GET', path: '/api/oauth/connected-accounts', context: scoped, queryParams: { platform: 'unipile' } });
       const accounts: any[] = Array.isArray(conn?.accounts) ? conn.accounts : [];
@@ -2373,24 +2371,48 @@ mcpToolRegistry.register({
         throw new Error(`default_linkedin_account_id "${linkedInId}" is not a LinkedIn account you own`);
       }
     }
-    await mcpFetch({
-      method: 'POST',
-      path: '/api/crm/sender-emails',
-      context: scoped,
-      body: {
-        // Unchanged senders pass the route's grandfather check, so no re-validation side effects.
-        senders: senders.map((s: any) => ({
-          id: s.id, email: s.email, fromName: s.fromName, notes: s.notes,
-          senderType: s.senderType, senderProvider: s.senderProvider,
-          connectedAccountId: s.connectedAccountId, gmailAccountId: s.gmailAccountId,
-          dailyLimit: s.dailyLimit, warmupStartedAt: s.warmupStartedAt,
-        })),
-        defaultSenderId: senderId ?? current?.defaultSenderId ?? null,
-        defaultLinkedInAccountId: linkedInId ?? current?.defaultLinkedInAccountId ?? null,
-      },
+    // The settings route stores the whole config, so this is read-modify-write.
+    // Narrow the lost-update window: re-read right before writing and restart if
+    // anything moved, then verify the stored result and retry if a concurrent
+    // writer overwrote our defaults. Never report a default that is not stored.
+    const fingerprint = (c: any) => JSON.stringify({
+      senders: (Array.isArray(c?.senders) ? c.senders : []).map((s: any) => s),
+      d: c?.defaultSenderId ?? null,
+      l: c?.defaultLinkedInAccountId ?? null,
     });
-    const after = await mcpFetch({ method: 'GET', path: '/api/crm/sender-emails', context: scoped });
-    return jsonResult(projectSenderSettings(after));
+    const MAX_ATTEMPTS = 3;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      const current = await mcpFetch({ method: 'GET', path: '/api/crm/sender-emails', context: scoped });
+      const senders: any[] = Array.isArray(current?.senders) ? current.senders : [];
+      if (senderId !== undefined && !senders.some((s: any) => s?.id === senderId)) {
+        throw new Error(`default_sender_id "${senderId}" is not one of your configured senders`);
+      }
+      const wantSender = senderId ?? current?.defaultSenderId ?? null;
+      const wantLinkedIn = linkedInId ?? current?.defaultLinkedInAccountId ?? null;
+      const recheck = await mcpFetch({ method: 'GET', path: '/api/crm/sender-emails', context: scoped });
+      if (fingerprint(recheck) !== fingerprint(current)) continue;
+      await mcpFetch({
+        method: 'POST',
+        path: '/api/crm/sender-emails',
+        context: scoped,
+        body: {
+          // Unchanged senders pass the route's grandfather check, so no re-validation side effects.
+          senders: senders.map((s: any) => ({
+            id: s.id, email: s.email, fromName: s.fromName, notes: s.notes,
+            senderType: s.senderType, senderProvider: s.senderProvider,
+            connectedAccountId: s.connectedAccountId, gmailAccountId: s.gmailAccountId,
+            dailyLimit: s.dailyLimit, warmupStartedAt: s.warmupStartedAt,
+          })),
+          defaultSenderId: wantSender,
+          defaultLinkedInAccountId: wantLinkedIn,
+        },
+      });
+      const after = await mcpFetch({ method: 'GET', path: '/api/crm/sender-emails', context: scoped });
+      const stored = (senderId === undefined || after?.defaultSenderId === senderId)
+        && (linkedInId === undefined || after?.defaultLinkedInAccountId === linkedInId);
+      if (stored) return jsonResult(projectSenderSettings(after));
+    }
+    throw new Error('Sender settings changed concurrently and the update could not be applied; nothing was reported as saved. Re-read with list_sender_settings and retry.');
   }
 });
 

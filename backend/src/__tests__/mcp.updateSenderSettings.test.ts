@@ -37,8 +37,8 @@ function route(after: any) {
   mockFetch.mockImplementation(async (opts: any) => {
     if (opts.path === '/api/oauth/connected-accounts') return accounts as any;
     if (opts.method === 'POST') return { message: 'ok' } as any;
-    const getCalls = mockFetch.mock.calls.filter((c: any) => c[0].method === 'GET' && c[0].path === '/api/crm/sender-emails').length;
-    return (getCalls > 1 ? after : before) as any;
+    const posted = mockFetch.mock.calls.some((c: any) => c[0].method === 'POST');
+    return (posted ? after : before) as any;
   });
 }
 const posts = () => mockFetch.mock.calls.filter((c: any) => c[0].method === 'POST').map((c: any) => c[0]);
@@ -64,7 +64,7 @@ describe('ENG-2897 update_sender_settings', () => {
   });
 
   it('keeps the existing LinkedIn default when only the email sender changes', async () => {
-    route(before);
+    route({ ...before, defaultSenderId: 's2' });
     await mcpToolRegistry.execute('update_sender_settings', { default_sender_id: 's2' }, CTX);
     expect(posts()[0].body.defaultLinkedInAccountId).toBe('li-old');
     expect(mockFetch.mock.calls.some((c: any) => c[0].path === '/api/oauth/connected-accounts')).toBe(false);
@@ -79,6 +79,35 @@ describe('ENG-2897 update_sender_settings', () => {
     route(before);
     await expect(mcpToolRegistry.execute('update_sender_settings', args, CTX)).rejects.toThrow(msg);
     expect(posts()).toHaveLength(0);
+  });
+
+  it.each([[''], [null], ['   ']])('treats default_linkedin_account_id=%j as not set', async (blank) => {
+    route({ ...before, defaultSenderId: 's2' });
+    const out = parse(await mcpToolRegistry.execute('update_sender_settings',
+      { default_sender_id: 's2', default_linkedin_account_id: blank }, CTX));
+    expect(posts()[0].body).toMatchObject({ defaultSenderId: 's2', defaultLinkedInAccountId: 'li-old' });
+    expect(out.default_sender_id).toBe('s2');
+  });
+
+  it('restarts when the config moves between read and write (no stale full-list overwrite)', async () => {
+    const moved = { ...before, senders: [...before.senders, { id: 's7', email: 'm@acme.com', fromName: 'M' }] };
+    let gets = 0;
+    mockFetch.mockImplementation(async (opts: any) => {
+      if (opts.method === 'POST') return { message: 'ok' } as any;
+      gets++;
+      if (mockFetch.mock.calls.some((c: any) => c[0].method === 'POST')) return { ...moved, defaultSenderId: 's2' } as any;
+      return (gets === 1 ? before : moved) as any;
+    });
+    await mcpToolRegistry.execute('update_sender_settings', { default_sender_id: 's2' }, CTX);
+    expect(posts()).toHaveLength(1);
+    expect(posts()[0].body.senders.map((s: any) => s.id)).toEqual(['s1', 's2', 's7']);
+  });
+
+  it('never reports a default that a concurrent writer overwrote', async () => {
+    route(before); // every read-back still shows s1
+    await expect(mcpToolRegistry.execute('update_sender_settings', { default_sender_id: 's2' }, CTX))
+      .rejects.toThrow(/changed concurrently/);
+    expect(posts()).toHaveLength(3);
   });
 
   it('is a write tool: a tools:read key is denied', () => {
