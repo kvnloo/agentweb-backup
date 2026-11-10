@@ -9663,7 +9663,20 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     if (!context?.userId) return { success: false, message: 'Authentication required' };
-    const fileId = (args.url_or_id as string).match(/\/d\/([a-zA-Z0-9_-]+)/)?.[1] ?? args.url_or_id.trim();
+    // ENG-2907: a non-Google URL (e.g. a luma.com page) used to be sent to Drive
+    // verbatim as a fileId, 404, and cluster as a config failure. Refuse it up front.
+    const raw = String(args.url_or_id ?? '').trim();
+    if (/^https?:\/\//i.test(raw)) {
+      let host = '';
+      try { host = new URL(raw).hostname.toLowerCase(); } catch { /* treated as non-Google below */ }
+      if (!/(^|\.)(docs|drive|sheets)\.google\.com$/.test(host)) {
+        return {
+          success: false,
+          message: `Not a Google Docs/Sheets/Drive URL (${host || raw}): read_google_doc only reads Google files. Use a web page fetch tool for other URLs.`,
+        };
+      }
+    }
+    const fileId = raw.match(/\/d\/([a-zA-Z0-9_-]+)/)?.[1] ?? raw;
     return googleDriveImpl.readGoogleFileById(fileId, context.userId);
   },
 });

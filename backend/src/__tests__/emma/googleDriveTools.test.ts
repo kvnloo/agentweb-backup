@@ -162,6 +162,26 @@ describe('read_google_doc — URL parsing', () => {
     expect(mockReadGoogleFileById).toHaveBeenCalledWith('abc123XYZ_-', USER);
   });
 
+  it('refuses a non-Google URL without calling Drive (ENG-2907)', async () => {
+    const tool = await getTool('read_google_doc');
+    const result = await tool.execute(
+      { url_or_id: 'https://luma.com/event/manage/evt-2y21s7TrBoMkWKw/guests' },
+      { userId: USER },
+    );
+    expect(result.success).toBe(false);
+    expect(result.message).toMatch(/read_google_doc only reads Google files/);
+    expect(mockReadGoogleFileById).not.toHaveBeenCalled();
+  });
+
+  it('still accepts docs/sheets/drive.google.com URLs (ENG-2907)', async () => {
+    mockReadGoogleFileById.mockResolvedValue({ success: true });
+    const tool = await getTool('read_google_doc');
+    await tool.execute({ url_or_id: 'https://sheets.google.com/spreadsheets/d/S1/edit' }, { userId: USER });
+    await tool.execute({ url_or_id: 'https://drive.google.com/file/d/F1/view' }, { userId: USER });
+    expect(mockReadGoogleFileById).toHaveBeenCalledWith('S1', USER);
+    expect(mockReadGoogleFileById).toHaveBeenCalledWith('F1', USER);
+  });
+
   it('uses the raw value as-is when no /d/<id> pattern is present', async () => {
     mockReadGoogleFileById.mockResolvedValue({ success: true, content: 'Doc content' });
     const tool = await getTool('read_google_doc');
