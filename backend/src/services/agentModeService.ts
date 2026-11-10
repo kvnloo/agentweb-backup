@@ -15390,7 +15390,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         : await metaService.getAdSet(accessToken, ad_set_id!, accountId || '');
       // Same currency-aware normalizer the writers use (ENG-2277): every money input is major units.
       const money = await this.normalizeMetaMoneyParams(accountId || '', accessToken, params);
-      const changes = fields.flatMap(field => {
+      type BudgetChange = { field: string; severity: 'unknown' | 'critical' | 'warning' | 'normal'; ratio: number | null; prior: number | undefined; proposed: number | undefined };
+      const changes = fields.flatMap((field): BudgetChange[] => {
         const proposed = money.params[field];
         if (proposed === undefined) return [];
         // A spend cap is a ceiling: adding one to an object Meta read back with no cap only
