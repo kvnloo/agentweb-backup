@@ -52,15 +52,22 @@ export async function readOwnedMetaNode(ctx: MetaGraphContext, id: string): Prom
 }
 
 /**
- * Spend of one node over yesterday + today (UTC dates). Insights are day-grained, so this
- * window always covers at least the last 24 hours. Major units of the account currency.
+ * Spend of one node over at least the last 24 hours, in major units of the account currency.
+ * Insights are day-grained in the AD ACCOUNT's timezone, which can be up to 14 h ahead of or
+ * 12 h behind UTC, so the window is UTC day(now - 48 h) … day(now + 24 h): whatever the account
+ * timezone, it covers the account's local today and yesterday. A future `until` that Meta
+ * rejects fails closed (the caller treats unknown spend as recent spend).
  */
-export async function readMetaRecentSpend(ctx: MetaGraphContext, id: string, now: number): Promise<number> {
+export function recentSpendWindow(now: number): { since: string; until: string } {
   const day = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+  return { since: day(now - 48 * 60 * 60 * 1000), until: day(now + 24 * 60 * 60 * 1000) };
+}
+
+export async function readMetaRecentSpend(ctx: MetaGraphContext, id: string, now: number): Promise<number> {
   const { data } = await ctx.http.get(`${base(ctx)}/${encodeURIComponent(id)}/insights`, {
     params: {
       fields: 'spend',
-      time_range: JSON.stringify({ since: day(now - 24 * 60 * 60 * 1000), until: day(now) }),
+      time_range: JSON.stringify(recentSpendWindow(now)),
       access_token: ctx.accessToken,
     },
   });

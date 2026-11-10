@@ -52,7 +52,9 @@ const graph = async () => import('../services/agentMode/metaToolkitLifecycleGrap
 async function graphContext(userId: string, accountId: string): Promise<MetaGraphContext> {
   const { agentModeService } = await import('../services/agentModeService');
   const axios = (await import('axios')).default;
-  return { http: axios, ...(await agentModeService.getToolkitMetaGraphCredentials(userId, accountId)) };
+  // Bounded: a stalled Graph call must not hold the request open (a hung COPY retried after a
+  // client timeout could create a second copy).
+  return { http: axios.create({ timeout: 30_000 }), ...(await agentModeService.getToolkitMetaGraphCredentials(userId, accountId)) };
 }
 async function metaWriter(userId: string, accountId: string) {
   const { metaService } = await import('../services/metaService');
@@ -169,8 +171,13 @@ export async function executeMetaToolkitLifecycle(userId: string, rawArgs: any, 
 
   const fingerprint = previewFingerprint({
     userId, entity, action, accountId, id, opts,
-    node: { status: node.status ?? null, effective_status: node.effective_status ?? null },
-    destination: destination?.id ?? null, spend, confirmRecentSpend: confirmRecentSpend === true,
+    // Bind the configured status and the spend CATEGORY, not the amount or effective_status:
+    // both move on a live entity between preview and approval, which would turn every
+    // confirm_recent_spend confirmation into PREVIEW_MISMATCH. 0 → spending still invalidates.
+    node: { status: node.status ?? null },
+    destination: destination?.id ?? null,
+    spend: spend === null ? 'unknown' : spend > 0 ? 'spent' : 'none',
+    confirmRecentSpend: confirmRecentSpend === true,
   });
   const now = deps.now();
   const secret = deps.secret();
@@ -230,7 +237,9 @@ export async function executeMetaToolkitLifecycle(userId: string, rawArgs: any, 
   if (applyError && unchanged) {
     return { status: 'FAILED', success: false, message: `Meta refused the ${action}: ${applyError}. Nothing was changed.` };
   }
-  const verification = verifyLifecycle(action, readBack, readFailed);
+  // An unreadable node proves a DELETE only when the delete itself succeeded; after an error
+  // (e.g. the token lost access) "not readable" is not evidence of deletion.
+  const verification = action === 'DELETE' && applyError && !readBack ? 'UNCONFIRMED' : verifyLifecycle(action, readBack, readFailed);
   const base = {
     success: verification === 'CONFIRMED',
     verification,
