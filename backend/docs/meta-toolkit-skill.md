@@ -46,7 +46,7 @@ Reads work without a payment method. Changes to ads need a payment method on fil
 Use this when the user has creatives made elsewhere (Higgsfield, Midjourney, Canva, a designer). You don't need Ads Manager. These calls need no preview because an asset or creative can't spend anything until an ad uses it. They still need the payment method, the Meta connection and ads management.
 
 1. **Get the file to Meta.**
-   - The file already has a public `https` URL: skip to step 2 and pass that URL.
+   - The file already has a public `https` URL (a CDN link, or the direct `.mp4` link of a UGC video): skip to step 2 and pass that URL. A link to a post page (TikTok, Instagram, YouTube) is a web page, not a file; Zoma refuses it, so download the file and use `zoma_prepare_upload`.
    - The file is on the user's computer: call `zoma_prepare_upload` with `{"filename": "hero-01.png"}`, then run the returned `upload_command`, replacing the path with the real local path. It prints nothing on success. Use the returned `file_url` in step 2. Make one call per file. The upload link lasts 15 minutes.
    - Limits: images (.jpg .png .gif .webp) up to 30 MB, videos (.mp4 .mov .m4v .webm) up to 1 GB.
 2. **Upload to the ad account's media library** with `call_meta_marketing_api`, `entity_type: AD_CREATIVE`:
@@ -54,11 +54,17 @@ Use this when the user has creatives made elsewhere (Higgsfield, Midjourney, Can
    - Video: `action: UPLOAD_VIDEO`, `params.video_url`. Zoma waits for Meta to process the video and returns a `video_id` and a `thumbnail_url`. If it says `processing`, call `UPLOAD_VIDEO` again in a minute with only `params.video_id`.
 3. **Build the creative.** Call `action: CREATE` with `params`: `name`, `page_id` (from `PAGE LIST`), `body` (primary text), `title` (headline), `link_url`, an optional `call_to_action_type` (e.g. LEARN_MORE, SHOP_NOW), and the media:
    - Image: `image_hash`.
-   - Video: `video_id` plus a thumbnail, either `image_url: <thumbnail_url>` or an `image_hash`.
-   It returns a `creative_id` once Meta reads it back (`verification: CONFIRMED`).
+   - Video: `video_id`, optionally with your own thumbnail (`image_url` or `image_hash`); without one, Meta's processed thumbnail is used.
+   - Carousel: `carousel_cards` (2–10 cards, each with its own `image_hash`, `image_url` or `video_id`, plus `title` and `link_url`). No top-level image is needed.
+   - Different image per placement: `placement_assets`. No top-level image is needed.
+   It returns a `creative_id` once Meta reads it back (`verification: CONFIRMED`). `MISMATCH` means Meta stored something different from what was sent: do not use that creative.
+
+   **Multi-variant (Advantage+) creative**: one creative with several options that Meta mixes and optimizes. Pass lists instead of the single fields: `headlines` (up to 5, 255 characters each), `bodies` (up to 5), optional `descriptions` (up to 5), and media `image_hashes` and/or `video_ids` (up to 10 each), plus `name`, `page_id`, `link_url` and an optional `call_to_action_type`. Don't also pass the single field for the same thing (e.g. `title` with `headlines`). Images must be uploaded first (`image_hashes`, not URLs); videos must be processed.
+
+   **Bulk**: `action: BULK_CREATE` builds up to 10 creatives in one call. Put the shared fields (`page_id`, `body`/`bodies`, `title`/`headlines`, `link_url`, `call_to_action_type`, `name`) in `params` and one entry per creative in `params.items`, each with its media (`image_hash`, `image_url`, `video_id`, or `video_url` for a video not uploaded yet) and any per-item overrides. Items are named `<name> 1`, `<name> 2`… unless they set `name`. Every item is reported in `results` with its own `verification`; a failed item does not undo the others. Don't re-create items that have a `creative_id`; retry only the failed ones.
 4. **Make the ad.** Call `AD CREATE` with `ad_set_id` and `params: {name, creative_id}`, using the normal preview and approval flow below. The ad is created PAUSED.
 
-For a batch, repeat steps 1 to 3 for each file, then create one ad per creative. Tell the user what was created and leave everything paused.
+For a batch, upload each file (step 1–2) or pass public URLs straight to `BULK_CREATE`, then create one ad per creative. Tell the user what was created and leave everything paused.
 
 ## Writes (CAMPAIGN, AD_SET, AD)
 Allowed: CREATE, and UPDATE of `status` (ACTIVE or PAUSED) or budget. Not available: DELETE and custom audiences. Creatives are covered above.
