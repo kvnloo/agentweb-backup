@@ -28,6 +28,8 @@ import { runZomaTool, ZomaNotReadyError } from './zomaOnboarding';
 import { googleToolkitEnabled, META_PROVIDER, resolveProviderAccount } from './zomaProviders';
 import { validateZomaToken, ZOMA_TOKEN_PREFIX } from './zomaDeviceFlow';
 import { executeMetaToolkitCreative, isCreativeAssetRequest, prepareZomaUpload } from './metaToolkitCreatives';
+import { isLifecycleWriteRequest } from './metaToolkitWriteSurface';
+import { executeMetaToolkitLifecycle } from './metaToolkitLifecycle';
 
 export class MetaToolkitAuthError extends Error {
   readonly status: 401 | 403 | 429;
@@ -73,6 +75,8 @@ export interface MetaToolkitGatewayDeps {
   recordWrite?: typeof recordMcpWriteExecuted;
   /** Creative assets (AD_CREATIVE UPLOAD_IMAGE/UPLOAD_VIDEO/CREATE); defaults to executeMetaToolkitCreative. */
   executeCreative?: (userId: string, args: any) => Promise<any>;
+  /** ENG-2922 ARCHIVE/DELETE/COPY; defaults to executeMetaToolkitLifecycle. */
+  executeLifecycle?: (userId: string, args: any) => Promise<any>;
   /** zoma_prepare_upload; defaults to prepareZomaUpload. */
   prepareUpload?: (userId: string, args: any) => Promise<any>;
 }
@@ -260,23 +264,28 @@ export async function handleMetaToolkitCall(
   assertMetaToolkitScope(
     caller,
     request.toolName,
-    isCreativeAssetRequest(request.toolName, args) || isGuardedWriteRequest(request.toolName, args),
+    isCreativeAssetRequest(request.toolName, args) || isGuardedWriteRequest(request.toolName, args)
+      || isLifecycleWriteRequest(request.toolName, args),
   );
   const accountId = await resolveMetaToolkitAdAccount(caller.userId, args.account_id, deps);
   if (toolAcceptsAccountId(request.toolName)) args.account_id = accountId;
 
   // ENG-2303 P3: CAMPAIGN/AD_SET/AD CREATE + status/budget UPDATE go through the guarded
   // preview→confirm path; every other write stays refused by assertMetaToolkitV1Call.
+  // ENG-2922: ARCHIVE/DELETE/COPY use the same preview→confirm guard (metaToolkitLifecycle.ts).
   const creativeAsset = isCreativeAssetRequest(request.toolName, args);
-  const guardedWrite = creativeAsset || isGuardedWriteRequest(request.toolName, args);
+  const lifecycle = isLifecycleWriteRequest(request.toolName, args);
+  const guardedWrite = creativeAsset || lifecycle || isGuardedWriteRequest(request.toolName, args);
   const result = creativeAsset
     ? await (deps.executeCreative ?? executeMetaToolkitCreative)(caller.userId, args)
-    : guardedWrite
-      ? await (deps.executeWrite ?? executeMetaToolkitWrite)(caller.userId, args)
-      : await deps.execute(request.toolName, args, {
-          userId: caller.userId,
-          sessionId: request.sessionId,
-        });
+    : lifecycle
+      ? await (deps.executeLifecycle ?? executeMetaToolkitLifecycle)(caller.userId, args)
+      : guardedWrite
+        ? await (deps.executeWrite ?? executeMetaToolkitWrite)(caller.userId, args)
+        : await deps.execute(request.toolName, args, {
+            userId: caller.userId,
+            sessionId: request.sessionId,
+          });
 
   // ENG-2303 P4: a write that reached Meta (it has a read-back verdict) is metered as its
   // own event kind. Previews, mismatched confirms and refused/failed writes are not.

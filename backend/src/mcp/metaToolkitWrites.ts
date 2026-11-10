@@ -3,7 +3,8 @@
  * narrow surface, per Harsha 2026-10-12).
  *
  * Allowed: CAMPAIGN / AD_SET / AD  CREATE, and UPDATE of status (ACTIVE|PAUSED) or budget.
- * Still excluded: DELETE, COPY_AD, RETAG_UTM, custom audiences/uploads, launch_*.
+ * Still excluded here: COPY_AD, RETAG_UTM, custom audiences/uploads, launch_*. ARCHIVE / DELETE / COPY
+ * are their own guarded path (ENG-2922, metaToolkitLifecycle.ts).
  * Creative assets (AD_CREATIVE UPLOAD_IMAGE / UPLOAD_VIDEO / CREATE) are metaToolkitCreatives.ts.
  *
  * Flow (preview → confirm, bound):

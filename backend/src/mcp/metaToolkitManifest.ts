@@ -17,13 +17,16 @@ import { metaToolRegistry } from '../emma/metaTools';
 import type { McpToolRegistry } from './server/registry';
 import { isZomaTool, ZOMA_TOOL_DEFINITIONS } from './zomaToolDefinitions';
 import { MetaToolkitRefusal } from './metaToolkitErrors';
-import { GUARDED_WRITE_ACTIONS } from './metaToolkitWriteSurface';
+import { GUARDED_WRITE_ACTIONS, LIFECYCLE_WRITE_ACTIONS } from './metaToolkitWriteSurface';
 
 const CREATIVE_UPLOAD_ACTIONS = ['UPLOAD_IMAGE', 'UPLOAD_VIDEO'] as const;
 
 const META_MARKETING_API_DESCRIPTION =
   'Meta Marketing API for external agents. Reads: LIST, GET, PREVIEW, SEARCH, GET_MATCH_QUALITY. ' +
-  'Guarded writes (CAMPAIGN, AD_SET, AD only): CREATE, and UPDATE of status (ACTIVE/PAUSED) or budget. ' +
+  'Guarded writes (CAMPAIGN, AD_SET, AD only): CREATE, UPDATE of status (ACTIVE/PAUSED) or budget, ' +
+  'ARCHIVE (stops delivery, keeps history), DELETE (irreversible) and COPY (params.deep_copy for CAMPAIGN/AD_SET, ' +
+  'params.campaign_id = destination campaign for an AD_SET copy, params.adset_id = destination ad set for an AD copy; copies are created PAUSED). ' +
+  'ARCHIVE/DELETE are refused when the entity spent in the last 24 hours unless confirm_recent_spend=true after the user explicitly accepts it; prefer pausing first. ' +
   'Every write is two calls: first without confirm (returns a PREVIEW and preview_token, nothing changes), show the preview to the user, ' +
   'then after their explicit approval repeat the exact same call with confirm=true and the preview_token. ' +
   'New campaigns, ad sets and ads are always created PAUSED; activating (status=ACTIVE) is its own separate preview and approval. ' +
@@ -33,7 +36,7 @@ const META_MARKETING_API_DESCRIPTION =
   'AD_CREATIVE UPLOAD_VIDEO (params.video_url) → video_id + thumbnail_url, waits for Meta processing (re-check with params.video_id); ' +
   'AD_CREATIVE CREATE (name, page_id, body, title, link_url, call_to_action_type + image_hash | image_url | video_id with image_url/image_hash thumbnail) → creative_id; ' +
   'then AD CREATE with params.creative_id (guarded preview, created PAUSED). For a file on the user\'s computer call zoma_prepare_upload first. ' +
-  'Use PAGE LIST for page_id. DELETE and custom audiences are not available.';
+  'Use PAGE LIST for page_id. Custom audiences are not available.';
 
 export const META_TOOLKIT_V1_TOOL_NAMES = [
   'list_meta_ads_campaigns',
@@ -63,7 +66,9 @@ function narrowDefinition(definition: any): any {
     delete props.client_id;
     if (def.name === 'call_meta_marketing_api') {
       def.description = META_MARKETING_API_DESCRIPTION;
-      if (props.action?.enum) props.action.enum = [...META_TOOLKIT_V1_ACTIONS, ...GUARDED_WRITE_ACTIONS, ...CREATIVE_UPLOAD_ACTIONS];
+      if (props.action?.enum) {
+        props.action.enum = [...META_TOOLKIT_V1_ACTIONS, ...GUARDED_WRITE_ACTIONS, ...LIFECYCLE_WRITE_ACTIONS, ...CREATIVE_UPLOAD_ACTIONS];
+      }
       props.confirm = {
         type: 'boolean',
         description: 'Writes only. Omit to get a PREVIEW (nothing changes). Set true only after the user explicitly approved that preview, together with its preview_token.',
@@ -71,6 +76,10 @@ function narrowDefinition(definition: any): any {
       props.preview_token = {
         type: 'string',
         description: 'Writes only. The preview_token returned by the preview the user approved. Single use, 15 minutes; the call must repeat the previewed arguments exactly.',
+      };
+      props.confirm_recent_spend = {
+        type: 'boolean',
+        description: 'ARCHIVE/DELETE only. Set true only when the user explicitly accepts stopping an entity that spent in the last 24 hours (or whose spend could not be checked). Part of the previewed arguments.',
       };
       // The waiver replay is not wired through the deck flow (§4).
       if (props.params?.properties) delete props.params.properties.override_tracking_check;

@@ -15582,6 +15582,12 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     };
   }
 
+  /** ENG-2922: resolved account + token for the toolkit's ARCHIVE/DELETE/COPY seam (mcp/metaToolkitLifecycle.ts). */
+  public async getToolkitMetaGraphCredentials(userId: string, account_id: string) {
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    return { accountId, accessToken };
+  }
+
   /** Read-back after a toolkit write: status + effective status + budgets, ownership-scoped. */
   public async readBackMetaWriteTarget(userId: string, account_id: string, entity_type: string, id: string) {
     const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
