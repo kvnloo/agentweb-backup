@@ -299,16 +299,6 @@ export async function updateMarketStrategy(updateData: any, userId: string, opts
         };
       }
 
-      // ENG-2875: reject blank founder names before any write (incl. initial guidelines).
-      const incomingFoundersRaw = (updateData as any)?.brandData?.founders;
-      if (Array.isArray(incomingFoundersRaw) && hasBlankFounderName(incomingFoundersRaw)) {
-        return {
-          success: false,
-          message: 'Every founder needs a non-empty name. Pass an empty founders array to clear all founders.',
-          error: 'Invalid founders',
-        };
-      }
-
       // ENG-2308: refuse / condition writes from a superseded brand-build session.
       const guard = await guardBrandBuildSession(user, userDb, userId, opts.sessionId);
       if (guard.refuse) return supersededResult();
@@ -532,6 +522,11 @@ interface BrandBuildSessionGuard {
    * even after an earlier call flipped the status to ready.
    */
   automatedTurn: boolean;
+  /**
+   * ENG-2875: the session history needed to decide automatedTurn could not be
+   * read. Founder updates must fail (retryable) rather than guess.
+   */
+  historyReadFailed: boolean;
 }
 
 /**
@@ -607,18 +602,20 @@ async function guardBrandBuildSession(
 
   // ENG-2875: once the build is ready, a current-claim session is still the
   // automated turn until a human writes in it. Unknown history defaults to
-  // automated (additive), which never removes stored founders.
+  // automated (additive); an unreadable history fails founder updates instead.
   let turnHumanMessages: number | undefined;
+  let historyReadFailed = false;
   if (claim && user?.brandBuildStatus !== 'building') {
     try {
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const { chatbotDb } = require('../../services/chatbotService');
       turnHumanMessages = countHumanMessages(await chatbotDb.getMessagesFromMessagesTable(sessionId, true));
     } catch (historyErr: any) {
-      console.warn('[brandBuild] session history read failed; treating founders write as automated (additive)', {
+      console.warn('[brandBuild] session history read failed; founder updates in this call will be refused', {
         userId,
         error: historyErr?.message ?? String(historyErr),
       });
+      historyReadFailed = true;
       turnHumanMessages = 0;
     }
   }
@@ -628,6 +625,7 @@ async function guardBrandBuildSession(
     refuse,
     claim,
     automatedTurn,
+    historyReadFailed,
     userWrite: async (patch) => {
       if (!claim) return userDb.updateUser(userId, patch as any);
       try {
@@ -734,9 +732,28 @@ export async function updateBrandGuidelines(
         };
       }
 
+      // ENG-2875: reject blank founder names before any write (incl. initial guidelines).
+      const incomingFoundersRaw = (updateData as any)?.brandData?.founders;
+      if (Array.isArray(incomingFoundersRaw) && hasBlankFounderName(incomingFoundersRaw)) {
+        return {
+          success: false,
+          message: 'Every founder needs a non-empty name. Pass an empty founders array to clear all founders.',
+          error: 'Invalid founders',
+        };
+      }
+
       // ENG-2308: refuse / condition writes from a superseded brand-build session.
       const guard = await guardBrandBuildSession(user, userDb, userId, opts.sessionId);
       if (guard.refuse) return supersededResult();
+      // ENG-2875: without the session history we cannot tell a human removal
+      // from the automated scrape, so fail the founders update (retryable).
+      if (guard.historyReadFailed && Array.isArray(incomingFoundersRaw)) {
+        return {
+          success: false,
+          message: 'Could not verify this session before changing founders. Retry the update.',
+          error: 'Session history unavailable',
+        };
+      }
       const userWrite = guard.userWrite;
       const sessionClaim = guard.claim;
 
