@@ -24,6 +24,14 @@ const mockAttr = {
 jest.mock('../services/journeyAttribution', () => ({ ...jest.requireActual('../services/journeyAttribution'), journeyAttribution: mockAttr }));
 
 jest.mock('../mcp/oauth/oauthService', () => ({ mcpOAuthService: {} }));
+// Keep real rate-limit behavior without process-lifetime cleanup timers in this scoped suite.
+jest.mock('../middleware/rateLimiter', () => {
+  const actual = jest.requireActual('../middleware/rateLimiter');
+  actual.rateLimiter?.destroy();
+  return { ...actual, RateLimiter: class extends actual.RateLimiter {
+    constructor(...args: any[]) { super(...args); this.destroy(); }
+  } };
+});
 jest.mock('../mcp/zomaOnboarding', () => ({ getZomaReadiness: jest.fn(), runZomaTool: jest.fn(), ZomaNotReadyError: class extends Error {} }));
 jest.mock('../services/agentApiKeyService', () => ({ agentApiKeyService: {} }));
 jest.mock('../services/connectedAccountsDb', () => ({ getAccountsByUserIdIncludingOrgShared: jest.fn() }));
