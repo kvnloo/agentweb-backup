@@ -32,7 +32,7 @@ import {
 import { ZOMA_TOOL_NAMES } from '../mcp/zomaToolDefinitions';
 
 // ENG-2303: the toolkit also advertises toolkit-local Zoma onboarding tools (not registry tools).
-const EXPECTED_TOOLKIT_NAMES = [...META_TOOLKIT_V1_TOOL_NAMES, 'ads_get_datasets', 'ads_get_dataset_details', 'ads_get_dataset_stats', 'ads_pixel_event_read', 'ads_get_customconversions', ...ZOMA_TOOL_NAMES];
+const EXPECTED_TOOLKIT_NAMES = [...META_TOOLKIT_V1_TOOL_NAMES, 'ads_get_datasets', 'ads_get_dataset_details', 'ads_get_dataset_stats', 'ads_pixel_event_read', 'ads_get_customconversions', 'ads_experiment_list_tests', 'ads_experiment_abtest_get_test', 'ads_experiment_lift_get_test', ...ZOMA_TOOL_NAMES];
 
 const ctx = { userId: 'user-1', sessionId: 's-1' };
 
