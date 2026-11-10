@@ -182,6 +182,8 @@ describe('case-insensitive name conflicts', () => {
     for (const file_name of ['NOTES.md', 'Knowledge-Base.txt']) {
       const res = await run('create_knowledge_base_file', { kb_id: 'kb-own', file_name, content: 'x' });
       expect(res.success).toBe(false);
+      // The error names the stored file so the caller can update it by exact name.
+      expect(res.error).toContain(file_name === 'NOTES.md' ? '"notes.md"' : '"knowledge-base.txt"');
     }
     expect(writeCalls()).toEqual([]);
   });
