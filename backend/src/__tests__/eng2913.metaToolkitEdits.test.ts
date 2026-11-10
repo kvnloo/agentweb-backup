@@ -56,6 +56,7 @@ function makeDeps(over: Partial<MetaToolkitWriteDeps> = {}, currency = 'USD') {
     })),
     dispatch: jest.fn().mockResolvedValue({ result: { success: true, message: 'Campaign "X" created successfully' }, createdId: '999' }),
     readBack: jest.fn().mockResolvedValue({ id: '999', status: 'PAUSED', effective_status: 'PAUSED', daily_budget: '5000' }),
+    assertCreativeOwned: jest.fn().mockResolvedValue(undefined),
     spendCeilingPolicy: () => null,
     secret: () => 'test-secret',
     now: () => NOW,
@@ -111,15 +112,54 @@ describe('ENG-2913 post-launch edits', () => {
     expect(((await previewThenConfirm(deps, args)) as any).verification).toBe('UNCONFIRMED');
   });
 
-  it('AD creative swap + rename verifies the live creative id and name', async () => {
+  it('AD creative swap verifies the live creative id; a rename verifies the name', async () => {
     const prior = { id: '9', status: 'ACTIVE', name: 'Old', creative_id: '100' };
-    const args = upd('AD', { creative_id: '200', name: 'New' }, { ad_id: '9' });
-    const preview: any = await executeMetaToolkitWrite('u1', args, makeDeps({ readBack: jest.fn().mockResolvedValue(prior) }));
+    const swap = upd('AD', { creative_id: '200' }, { ad_id: '9' });
+    const preview: any = await executeMetaToolkitWrite('u1', swap, makeDeps({ readBack: jest.fn().mockResolvedValue(prior) }));
     expect(preview.preview).toContain('- creative_id: 100 → 200');
-    let deps = makeDeps({ readBack: jest.fn().mockResolvedValueOnce(prior).mockResolvedValueOnce(prior).mockResolvedValue({ ...prior, name: 'New', creative_id: '200' }) });
-    expect(((await previewThenConfirm(deps, args)) as any).verification).toBe('CONFIRMED');
+    let deps = makeDeps({ readBack: jest.fn().mockResolvedValueOnce(prior).mockResolvedValueOnce(prior).mockResolvedValue({ ...prior, creative_id: '200' }) });
+    expect(((await previewThenConfirm(deps, swap)) as any).verification).toBe('CONFIRMED');
+    expect(deps.assertCreativeOwned).toHaveBeenCalledWith('u1', '111', '200');
+    deps = makeDeps({ readBack: jest.fn().mockResolvedValueOnce(prior).mockResolvedValueOnce(prior).mockResolvedValue(prior) });
+    expect(((await previewThenConfirm(deps, swap)) as any).verification).toBe('MISMATCH');
+    const rename = upd('AD', { name: 'New' }, { ad_id: '9' });
     deps = makeDeps({ readBack: jest.fn().mockResolvedValueOnce(prior).mockResolvedValueOnce(prior).mockResolvedValue({ ...prior, name: 'New' }) });
-    expect(((await previewThenConfirm(deps, args)) as any).verification).toBe('MISMATCH');
+    expect(((await previewThenConfirm(deps, rename)) as any).verification).toBe('CONFIRMED');
+  });
+
+  it('refuses a creative swap combined with other ad edits (two Meta updates could leave it half-changed)', async () => {
+    const deps = makeDeps();
+    await expect(executeMetaToolkitWrite('u1', upd('AD', { creative_id: '200', name: 'New' }, { ad_id: '9' }), deps)).rejects.toThrow(/its own UPDATE/);
+    expect(deps.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('refuses a creative from another ad account before issuing a preview token', async () => {
+    const deps = makeDeps({ assertCreativeOwned: jest.fn().mockRejectedValue(new Error('owned by act_999')) });
+    await expect(executeMetaToolkitWrite('u1', upd('AD', { creative_id: '200' }, { ad_id: '9' }), deps)).rejects.toThrow(/not found in ad account 111/);
+    expect(deps.dispatch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['AD_SET', { daily_budget: 50, targeting: { geo_locations: { countries: ['US'] } } }, { ad_set_id: '5' }],
+    ['CAMPAIGN', { spend_cap: 500, bid_strategy: 'COST_CAP' }, { campaign_id: '1' }],
+  ])('refuses a %s budget change bundled with other edits (the rate shaper could drop them as "no change")', async (entity, params, ids) => {
+    const deps = makeDeps();
+    await expect(executeMetaToolkitWrite('u1', upd(entity, params, ids), deps)).rejects.toThrow(/budget or spend cap in its own UPDATE/);
+    expect(deps.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('a schedule change on an ACTIVE ad set is its own change, warned, and held to the enable spend ceiling', async () => {
+    const prior = { id: '5', status: 'ACTIVE', daily_budget: '90000', end_time: '2026-01-01T00:00:00+0000' };
+    let deps = makeDeps({ readBack: jest.fn().mockResolvedValue(prior) });
+    await expect(executeMetaToolkitWrite('u1', upd('AD_SET', { end_time: '2027-01-01T00:00:00Z', bid_strategy: 'COST_CAP' }, { ad_set_id: '5' }), deps))
+      .rejects.toThrow(/schedule in its own UPDATE/);
+    const preview: any = await executeMetaToolkitWrite('u1', upd('AD_SET', { end_time: '2027-01-01T00:00:00Z' }, { ad_set_id: '5' }), deps);
+    expect(preview.preview).toMatch(/ACTIVE: the new schedule can start or extend delivery/);
+    deps = makeDeps({ readBack: jest.fn().mockResolvedValue(prior), spendCeilingPolicy: () => ({ maxDailyBudget: 10000 }) });
+    await expect(executeMetaToolkitWrite('u1', upd('AD_SET', { end_time: '2027-01-01T00:00:00Z' }, { ad_set_id: '5' }), deps)).rejects.toThrow(/schedule of this ACTIVE ad set/);
+    deps = makeDeps({ readBack: jest.fn().mockResolvedValue(null) });
+    await expect(executeMetaToolkitWrite('u1', upd('AD_SET', { end_time: '2027-01-01T00:00:00Z' }, { ad_set_id: '5' }), deps)).rejects.toThrow(/current status/);
+    expect(deps.dispatch).not.toHaveBeenCalled();
   });
 
   it('CAMPAIGN bid_strategy + spend_cap are allowed; spend_cap verified in minor units', async () => {
@@ -139,6 +179,8 @@ describe('ENG-2913 post-launch edits', () => {
     ['targeting not an object', upd('AD_SET', { targeting: 'US' }, { ad_set_id: '5' }), /targeting must be/],
     ['bad exclusion', upd('AD_SET', { targeting: { excluded_custom_audiences: ['777'] } }, { ad_set_id: '5' }), /excluded_custom_audiences/],
     ['bad time', upd('AD_SET', { end_time: 'next friday' }, { ad_set_id: '5' }), /ISO 8601/],
+    ['time without a timezone offset', upd('AD_SET', { end_time: '2026-12-01T09:00' }, { ad_set_id: '5' }), /offset/],
+    ['bare number as a time', upd('AD_SET', { end_time: '1' }, { ad_set_id: '5' }), /ISO 8601/],
     ['end before start', upd('AD_SET', { start_time: '2026-12-02T00:00:00Z', end_time: '2026-12-01T00:00:00Z' }, { ad_set_id: '5' }), /after start_time/],
     ['bad creative id', upd('AD', { creative_id: 'abc' }, { ad_id: '9' }), /creative_id must be/],
     ['activation bundled with an edit', upd('AD_SET', { status: 'ACTIVE', bid_amount: 5 }, { ad_set_id: '5' }), /its own change/],
@@ -158,6 +200,24 @@ describe('ENG-2913 post-launch edits', () => {
     const r: any = await executeMetaToolkitWrite('u1', { ...args, confirm: true, preview_token: preview.preview_token }, deps);
     expect(r.status).toBe('PREVIEW_MISMATCH');
     expect(deps.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('targeting read-back: lists must match exactly; a dropped exclusion list must be gone (no false CONFIRMED)', () => {
+    // Meta kept an extra country / an extra exclusion: not what was approved.
+    expect(targetingApplied({ geo_locations: { countries: ['US'] } }, { geo_locations: { countries: ['US', 'CA'] } })).toBe(false);
+    expect(targetingApplied({ excluded_custom_audiences: [{ id: '1' }] }, { excluded_custom_audiences: [{ id: '1' }, { id: '2' }] })).toBe(false);
+    // "No exclusions": [] matches absent/empty, not a populated list.
+    expect(targetingApplied({ excluded_custom_audiences: [] }, {})).toBe(true);
+    expect(targetingApplied({ excluded_custom_audiences: [] }, { excluded_custom_audiences: [{ id: '1' }] })).toBe(false);
+  });
+
+  it('a full targeting replacement that leaves out exclusions is MISMATCH while Meta still reports them', async () => {
+    const prior = { id: '5', status: 'PAUSED', targeting: { geo_locations: { countries: ['US'] }, excluded_custom_audiences: [{ id: '7' }] } };
+    const args = upd('AD_SET', { targeting: { geo_locations: { countries: ['US'] } } }, { ad_set_id: '5' });
+    let deps = makeDeps({ readBack: jest.fn().mockResolvedValue(prior) });
+    expect(((await previewThenConfirm(deps, args)) as any).verification).toBe('MISMATCH');
+    deps = makeDeps({ readBack: jest.fn().mockResolvedValueOnce(prior).mockResolvedValueOnce(prior).mockResolvedValue({ ...prior, targeting: { geo_locations: { countries: ['US'] } } }) });
+    expect(((await previewThenConfirm(deps, args)) as any).verification).toBe('CONFIRMED');
   });
 
   it('targetingApplied is containment, matching object lists by id', () => {

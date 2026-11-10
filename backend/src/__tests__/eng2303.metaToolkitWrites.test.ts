@@ -55,6 +55,7 @@ function makeDeps(over: Partial<MetaToolkitWriteDeps> = {}, currency = 'USD') {
     })),
     dispatch: jest.fn().mockResolvedValue({ result: { success: true, message: 'Campaign "X" created successfully' }, createdId: '999' }),
     readBack: jest.fn().mockResolvedValue({ id: '999', status: 'PAUSED', effective_status: 'PAUSED', daily_budget: '5000' }),
+    assertCreativeOwned: jest.fn().mockResolvedValue(undefined),
     spendCeilingPolicy: () => null,
     secret: () => 'test-secret',
     now: () => NOW,
