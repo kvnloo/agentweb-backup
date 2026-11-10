@@ -2,7 +2,10 @@
  * ENG-2303 P3 — guarded Meta writes for external MCP agents (lifts ENG-2268 D2 for a
  * narrow surface, per Harsha 2026-10-12).
  *
- * Allowed: CAMPAIGN / AD_SET / AD  CREATE, and UPDATE of status (ACTIVE|PAUSED) or budget.
+ * Allowed: CAMPAIGN / AD_SET / AD  CREATE, and UPDATE of status (ACTIVE|PAUSED), budget, and
+ * (ENG-2913) post-launch edits: CAMPAIGN bid_strategy/spend_cap, AD_SET bid_amount/
+ * bid_strategy/targeting/start_time/end_time, AD creative swap (creative_id) + name. Every
+ * UPDATE preview shows a before → after field diff and the read-back verifies every field.
  * Still excluded: DELETE, COPY_AD, RETAG_UTM, custom audiences/uploads, launch_*.
  * Creative assets (AD_CREATIVE UPLOAD_IMAGE / UPLOAD_VIDEO / CREATE) are metaToolkitCreatives.ts.
  *
@@ -42,10 +45,12 @@ export { GUARDED_WRITE_ENTITIES, GUARDED_WRITE_ACTIONS, isGuardedWriteRequest, P
 export type { WriteVerification };
 
 const UPDATE_FIELDS: Record<string, string[]> = {
-  CAMPAIGN: ['status', 'daily_budget', 'lifetime_budget', 'budget_amount'],
-  AD_SET: ['status', 'daily_budget', 'lifetime_budget'],
-  AD: ['status'],
+  CAMPAIGN: ['status', 'daily_budget', 'lifetime_budget', 'budget_amount', 'bid_strategy', 'spend_cap'],
+  AD_SET: ['status', 'daily_budget', 'lifetime_budget', 'bid_amount', 'bid_strategy', 'targeting', 'start_time', 'end_time'],
+  AD: ['status', 'creative_id', 'name'],
 };
+export const BID_STRATEGIES = ['LOWEST_COST_WITHOUT_CAP', 'LOWEST_COST_WITH_BID_CAP', 'COST_CAP', 'LOWEST_COST_WITH_MIN_ROAS'];
+const TIME_FIELDS = ['start_time', 'end_time'] as const;
 const MONEY_FIELDS = ['budget_amount', 'daily_budget', 'lifetime_budget', 'bid_amount', 'spend_cap'];
 const CEILING_FIELDS = ['daily_budget', 'lifetime_budget', 'spend_cap', 'bid_amount'] as const;
 // Gate-only flags of the internal path; an external caller never supplies these.
@@ -139,7 +144,55 @@ function validateWriteShape(entity: string, action: string, args: any): any {
   if (params.status === 'ACTIVE' && keys.length > 1) {
     throw new MetaToolkitRefusal('Activation (status=ACTIVE) must be its own change with its own preview and approval. Change the budget first, then activate separately.');
   }
+  validateEditFields(params);
   return params;
+}
+
+/** ENG-2913: shape checks for the post-launch edit fields. */
+function validateEditFields(params: any) {
+  if (params.bid_strategy !== undefined && !BID_STRATEGIES.includes(params.bid_strategy)) {
+    throw new MetaToolkitRefusal(`bid_strategy must be one of: ${BID_STRATEGIES.join(', ')}.`);
+  }
+  if (params.bid_strategy === 'LOWEST_COST_WITHOUT_CAP' && params.bid_amount !== undefined) {
+    throw new MetaToolkitRefusal('bid_amount must not be set with LOWEST_COST_WITHOUT_CAP.');
+  }
+  if (params.targeting !== undefined && (!params.targeting || typeof params.targeting !== 'object' || Array.isArray(params.targeting))) {
+    throw new MetaToolkitRefusal('targeting must be a Meta targeting object (e.g. {geo_locations, age_min, excluded_custom_audiences}). Send the full targeting spec; it replaces the current one.');
+  }
+  const excluded = params.targeting?.excluded_custom_audiences;
+  if (excluded !== undefined && (!Array.isArray(excluded) || excluded.some((a: any) => !a || typeof a !== 'object' || !a.id))) {
+    throw new MetaToolkitRefusal('targeting.excluded_custom_audiences must be a list of {id} objects.');
+  }
+  for (const f of TIME_FIELDS) {
+    if (params[f] === undefined) continue;
+    if (typeof params[f] !== 'string' || Number.isNaN(Date.parse(params[f]))) {
+      throw new MetaToolkitRefusal(`${f} must be an ISO 8601 date-time (e.g. 2026-12-01T09:00:00-0800).`);
+    }
+  }
+  if (params.start_time !== undefined && params.end_time !== undefined && Date.parse(params.end_time) <= Date.parse(params.start_time)) {
+    throw new MetaToolkitRefusal('end_time must be after start_time.');
+  }
+  if (params.creative_id !== undefined && !/^\d+$/.test(String(params.creative_id))) {
+    throw new MetaToolkitRefusal('creative_id must be a Meta ad creative id (digits). Create the new creative first (AD_CREATIVE CREATE), then swap it in.');
+  }
+  if (params.name !== undefined && (typeof params.name !== 'string' || !params.name.trim())) {
+    throw new MetaToolkitRefusal('name must be a non-empty string.');
+  }
+}
+
+function show(v: unknown): string {
+  if (v === undefined || v === null || v === '') return '(not set)';
+  return typeof v === 'object' ? JSON.stringify(v) : String(v);
+}
+
+/** ENG-2913: "field: before → after" lines for an UPDATE preview (money shown in minor units). */
+export function fieldDiffLines(params: any, minor: any, prior: Record<string, any> | null): string[] {
+  return Object.keys(params).filter((k) => params[k] !== undefined && k !== 'status').map((k) => {
+    const apiField = k === 'budget_amount' ? 'daily_budget' : k;
+    const after = MONEY_FIELDS.includes(k) ? minor?.[apiField] ?? params[k] : params[k];
+    const before = prior ? prior[apiField] : undefined;
+    return `- ${apiField}: ${prior ? show(before) : '(current value unavailable)'} → ${show(after)}`;
+  });
 }
 
 export function assertAdsManagementGranted(accounts: ConnectedAccount[], accountId: string) {
@@ -211,9 +264,10 @@ export async function executeMetaToolkitWrite(userId: string, rawArgs: any, deps
     const verdict = evaluateMetaSpendCeiling(policy, { field: 'daily_budget', proposed: budget?.daily_budget });
     if (!verdict.allowed) throw new MetaToolkitRefusal(`Enabling this ad set would start spend at its budget. ${verdict.message}`);
   }
+  const priorId = targetId(entity, args);
+  const prior = action === 'UPDATE' && priorId ? await deps.readBack(userId, accountId, entity, priorId).catch(() => null) : null;
+  const diff = action === 'UPDATE' ? fieldDiffLines(params, money.params, prior) : [];
   if (policy) {
-    const id = targetId(entity, args);
-    const prior = action === 'UPDATE' && id ? await deps.readBack(userId, accountId, entity, id).catch(() => null) : null;
     for (const field of CEILING_FIELDS) {
       if (money.params[field] === undefined) continue;
       const verdict = evaluateMetaSpendCeiling(policy, { field, proposed: money.params[field], prior: prior?.[field] });
@@ -234,6 +288,7 @@ export async function executeMetaToolkitWrite(userId: string, rawArgs: any, deps
     userId, entity, action, accountId,
     campaign_id: args.campaign_id, ad_set_id: args.ad_set_id, ad_id: args.ad_id, params,
     summary: preview.summary, budgetAnomaly: preview.budgetAnomaly ?? null, money: money.confirmation,
+    ...(diff.length ? { diff } : {}),
     ...(enableBudgetState ? { enableBudgetState } : {}),
   });
   const now = deps.now();
@@ -243,6 +298,8 @@ export async function executeMetaToolkitWrite(userId: string, rawArgs: any, deps
     String(preview.summary ?? `${action} ${entity}`),
     entity === 'CAMPAIGN' && action === 'CREATE' ? `Objective: ${params.objective} (cannot be changed after creation)` : '',
     money.confirmation ? `Money${money.confirmation}` : '',
+    diff.length ? `Changes (current → proposed):\n${diff.join('\n')}` : '',
+    params.targeting !== undefined ? 'Targeting is replaced as a whole by the proposed spec; anything not in it is removed.' : '',
     statusLine(action, params),
   ].filter(Boolean).join('\n');
   const freshPreview = () => previewResponse({ secret, userId, now, fingerprint, preview: previewText });
@@ -301,10 +358,49 @@ function verify(action: string, params: any, minor: any, readBack: Record<string
   if (!readBack) return 'UNCONFIRMED';
   const expectedStatus = action === 'CREATE' ? 'PAUSED' : params.status;
   if (expectedStatus !== undefined && readBack.status !== expectedStatus) return 'MISMATCH';
-  for (const field of ['daily_budget', 'lifetime_budget'] as const) {
+  for (const field of ['daily_budget', 'lifetime_budget', 'bid_amount', 'spend_cap'] as const) {
     if (minor?.[field] === undefined) continue;
     if (readBack[field] === undefined || readBack[field] === null) return 'UNCONFIRMED';
     if (Number(readBack[field]) !== Number(minor[field])) return 'MISMATCH';
   }
+  if (action !== 'UPDATE') return 'CONFIRMED';
+  for (const field of ['bid_strategy', 'name', 'creative_id'] as const) {
+    if (params[field] === undefined) continue;
+    if (readBack[field] === undefined || readBack[field] === null) return 'UNCONFIRMED';
+    if (String(readBack[field]) !== String(params[field])) return 'MISMATCH';
+  }
+  for (const field of TIME_FIELDS) {
+    if (params[field] === undefined) continue;
+    if (!readBack[field]) return 'UNCONFIRMED';
+    if (Date.parse(readBack[field]) !== Date.parse(params[field])) return 'MISMATCH';
+  }
+  if (params.targeting !== undefined) {
+    if (!readBack.targeting || typeof readBack.targeting !== 'object') return 'UNCONFIRMED';
+    if (!targetingApplied(params.targeting, readBack.targeting)) return 'MISMATCH';
+  }
   return 'CONFIRMED';
+}
+
+/**
+ * Meta enriches targeting on read (names, defaults, automation flags), so the check is
+ * containment: every value sent must be present in what Meta reports. Lists of objects match
+ * by `id`/`key` when they have one; lists of primitives match as sets.
+ */
+export function targetingApplied(sent: any, got: any): boolean {
+  if (Array.isArray(sent)) {
+    if (!Array.isArray(got)) return false;
+    return sent.every((item) => {
+      if (item && typeof item === 'object') {
+        const k = item.id !== undefined ? 'id' : item.key !== undefined ? 'key' : null;
+        const match = k ? got.find((g: any) => g && String(g[k]) === String(item[k])) : undefined;
+        return k ? match !== undefined && targetingApplied(item, match) : got.some((g: any) => targetingApplied(item, g));
+      }
+      return got.map(String).includes(String(item));
+    });
+  }
+  if (sent && typeof sent === 'object') {
+    if (!got || typeof got !== 'object') return false;
+    return Object.keys(sent).every((k) => sent[k] === undefined || targetingApplied(sent[k], got[k]));
+  }
+  return got !== undefined && got !== null && String(got) === String(sent);
 }

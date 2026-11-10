@@ -1,0 +1,168 @@
+process.env.ZOMA_REQUIRE_PAYMENT_METHOD = 'true';
+/**
+ * ENG-2913 (reuses the ENG-2303 harness) — post-launch edits. Original ENG-2303 P3 acceptance (spec: /home/harsha/zoma-build/SPEC.md, "Guarded writes"):
+ *  - a write without a preview is refused (nothing dispatched);
+ *  - a write without a payment method is refused;
+ *  - new entities are created PAUSED (ACTIVE on create refused);
+ *  - ACTIVE needs its own preview + confirm (cannot ride a PAUSED/budget approval);
+ *  - money is echoed in the ad account currency (TWD/JPY zero-decimal, USD cents);
+ *  - granted ads_management (D4) is required; spend ceiling is enforced;
+ *  - a write whose read-back cannot confirm it is UNCONFIRMED, never success.
+ */
+jest.mock('../services/connectedAccountsDb', () => ({ getAccountsByUserIdIncludingOrgShared: jest.fn() }));
+jest.mock('../mcp/zomaOnboarding', () => {
+  const actual = jest.requireActual('../mcp/zomaOnboarding');
+  return { ...actual, assertZomaWriteReady: jest.fn() };
+});
+
+import { normalizeMetaMoney } from '../services/metaService';
+import { targetingApplied } from '../mcp/metaToolkitWrites';
+import { executeMetaToolkitWrite, spendCeilingPolicyFromEnv, type MetaToolkitWriteDeps } from '../mcp/metaToolkitWrites';
+import { MetaToolkitRefusal } from '../mcp/metaToolkitErrors';
+import { ZomaNotReadyError } from '../mcp/zomaOnboarding';
+
+const NOW = 1_800_000_000_000;
+const account = (scopes: unknown = ['ads_read', 'ads_management']) => ({  // 'none' = legacy row with no granted_scopes
+  platform: 'meta',
+  account_id: 'act_111',
+  config: { account_type: 'ad_account', access_token: 'tok', ad_account_id: '111', ...(scopes === 'none' ? {} : { granted_scopes: scopes }) },
+});
+
+function makeDeps(over: Partial<MetaToolkitWriteDeps> = {}, currency = 'USD') {
+  const MONEY = ['budget_amount', 'daily_budget', 'lifetime_budget', 'bid_amount', 'spend_cap'];
+  const deps: MetaToolkitWriteDeps = {
+    assertReady: jest.fn().mockResolvedValue(undefined),
+    listAccounts: jest.fn().mockResolvedValue([account()]),
+    // Real currency normalizer (the one the writers use), fixed account currency.
+    previewMoney: jest.fn(async (_u: string, _a: string, params: any) => {
+      const out = { ...params };
+      const parts: string[] = [];
+      for (const f of MONEY) {
+        if (params[f] === undefined) continue;
+        const m = normalizeMetaMoney(params[f], currency);
+        const api = f === 'budget_amount' ? 'daily_budget' : f;
+        out[api] = m.minorUnits;
+        parts.push(`${api}: ${m.description}`);
+      }
+      delete out.budget_amount;
+      return { params: out, currency, confirmation: ` (money submitted: ${parts.join('; ')})` };
+    }),
+    preview: jest.fn(async (_u: string, entity: string, action: string, accountId: string, c?: string, as?: string, ad?: string, params?: any) => ({
+      success: true,
+      awaitingUserConfirmation: true,
+      summary: `${action} ${entity} on ${accountId}${c ? ` campaign ${c}` : ''}`,
+      metaWriteManifestDigest: 'internal-digest',
+      metaWriteDispatch: { entity_type: entity, action, account_id: accountId, resolvedAccountId: accountId, campaign_id: c, ad_set_id: as, ad_id: ad, params },
+    })),
+    dispatch: jest.fn().mockResolvedValue({ result: { success: true, message: 'Campaign "X" created successfully' }, createdId: '999' }),
+    readBack: jest.fn().mockResolvedValue({ id: '999', status: 'PAUSED', effective_status: 'PAUSED', daily_budget: '5000' }),
+    spendCeilingPolicy: () => null,
+    secret: () => 'test-secret',
+    now: () => NOW,
+    consumedTokens: new Map(),
+    ...over,
+  };
+  return deps as MetaToolkitWriteDeps & Record<string, jest.Mock>;
+}
+
+const createArgs = (params: any = {}) => ({
+  entity_type: 'CAMPAIGN', action: 'CREATE', account_id: '111',
+  params: { name: 'Phoenix Leads', objective: 'OUTCOME_LEADS', daily_budget: 50, ...params },
+});
+
+async function previewThenConfirm(deps: MetaToolkitWriteDeps, args: any) {
+  const preview: any = await executeMetaToolkitWrite('u1', args, deps);
+  expect(preview.status).toBe('PREVIEW');
+  return executeMetaToolkitWrite('u1', { ...args, confirm: true, preview_token: preview.preview_token }, deps);
+}
+
+
+const upd = (entity: string, params: any, id: Record<string, string>) => ({ entity_type: entity, action: 'UPDATE', account_id: '111', ...id, params });
+
+describe('ENG-2913 post-launch edits', () => {
+  it('AD_SET bid/targeting/schedule: preview shows a before → after diff, confirm dispatches and verifies every field', async () => {
+    const targeting = { geo_locations: { countries: ['US'] }, age_min: 25, excluded_custom_audiences: [{ id: '777' }] };
+    const prior = { id: '5', status: 'PAUSED', bid_strategy: 'LOWEST_COST_WITHOUT_CAP', targeting: { geo_locations: { countries: ['CA'] } }, end_time: undefined };
+    const after = {
+      id: '5', status: 'PAUSED', bid_strategy: 'COST_CAP', bid_amount: '1250', end_time: '2026-12-31T23:59:00-0800',
+      targeting: { geo_locations: { countries: ['US'], location_types: ['home'] }, age_min: 25, excluded_custom_audiences: [{ id: '777', name: 'Subscribers' }] },
+    };
+    const readBack = jest.fn().mockResolvedValueOnce(prior).mockResolvedValueOnce(prior).mockResolvedValue(after);
+    const deps = makeDeps({ readBack });
+    const args = upd('AD_SET', { bid_strategy: 'COST_CAP', bid_amount: 12.5, targeting, end_time: '2026-12-31T23:59:00-0800' }, { ad_set_id: '5' });
+    const preview: any = await executeMetaToolkitWrite('u1', args, deps);
+    expect(preview.status).toBe('PREVIEW');
+    expect(preview.preview).toContain('- bid_strategy: LOWEST_COST_WITHOUT_CAP → COST_CAP');
+    expect(preview.preview).toContain('- bid_amount: (not set) → 1250');
+    expect(preview.preview).toContain('"countries":["CA"]');
+    expect(preview.preview).toContain('Targeting is replaced as a whole');
+    expect(deps.dispatch).not.toHaveBeenCalled();
+    const done: any = await executeMetaToolkitWrite('u1', { ...args, confirm: true, preview_token: preview.preview_token }, deps);
+    expect(deps.dispatch).toHaveBeenCalledTimes(1);
+    expect(done.verification).toBe('CONFIRMED');
+  });
+
+  it('a field Meta did not apply is MISMATCH, a field missing from read-back is UNCONFIRMED', async () => {
+    const prior = { id: '5', status: 'PAUSED', bid_strategy: 'LOWEST_COST_WITHOUT_CAP' };
+    const args = upd('AD_SET', { bid_strategy: 'COST_CAP', bid_amount: 10 }, { ad_set_id: '5' });
+    let deps = makeDeps({ readBack: jest.fn().mockResolvedValueOnce(prior).mockResolvedValueOnce(prior).mockResolvedValue({ ...prior, bid_amount: '1000' }) });
+    expect(((await previewThenConfirm(deps, args)) as any).verification).toBe('MISMATCH');
+    deps = makeDeps({ readBack: jest.fn().mockResolvedValueOnce(prior).mockResolvedValueOnce(prior).mockResolvedValue({ id: '5', status: 'PAUSED', bid_strategy: 'COST_CAP' }) });
+    expect(((await previewThenConfirm(deps, args)) as any).verification).toBe('UNCONFIRMED');
+  });
+
+  it('AD creative swap + rename verifies the live creative id and name', async () => {
+    const prior = { id: '9', status: 'ACTIVE', name: 'Old', creative_id: '100' };
+    const args = upd('AD', { creative_id: '200', name: 'New' }, { ad_id: '9' });
+    const preview: any = await executeMetaToolkitWrite('u1', args, makeDeps({ readBack: jest.fn().mockResolvedValue(prior) }));
+    expect(preview.preview).toContain('- creative_id: 100 → 200');
+    let deps = makeDeps({ readBack: jest.fn().mockResolvedValueOnce(prior).mockResolvedValueOnce(prior).mockResolvedValue({ ...prior, name: 'New', creative_id: '200' }) });
+    expect(((await previewThenConfirm(deps, args)) as any).verification).toBe('CONFIRMED');
+    deps = makeDeps({ readBack: jest.fn().mockResolvedValueOnce(prior).mockResolvedValueOnce(prior).mockResolvedValue({ ...prior, name: 'New' }) });
+    expect(((await previewThenConfirm(deps, args)) as any).verification).toBe('MISMATCH');
+  });
+
+  it('CAMPAIGN bid_strategy + spend_cap are allowed; spend_cap verified in minor units', async () => {
+    const prior = { id: '1', status: 'PAUSED', bid_strategy: 'LOWEST_COST_WITHOUT_CAP' };
+    const deps = makeDeps({
+      previewMoney: jest.fn(async (_u: string, _a: string, p: any) => ({ params: { ...p, spend_cap: 50000 }, confirmation: ' (money submitted: spend_cap: $500.00)' })),
+      readBack: jest.fn().mockResolvedValueOnce(prior).mockResolvedValueOnce(prior).mockResolvedValue({ ...prior, bid_strategy: 'COST_CAP', spend_cap: '50000' }),
+    });
+    const r: any = await previewThenConfirm(deps, upd('CAMPAIGN', { bid_strategy: 'COST_CAP', spend_cap: 500 }, { campaign_id: '1' }));
+    expect(r.verification).toBe('CONFIRMED');
+  });
+
+  it.each([
+    ['unknown field', upd('AD', { body: 'new copy' }, { ad_id: '9' }), /can change only/],
+    ['bad bid_strategy', upd('AD_SET', { bid_strategy: 'CHEAPEST' }, { ad_set_id: '5' }), /bid_strategy must be one of/],
+    ['bid_amount with no-cap', upd('AD_SET', { bid_strategy: 'LOWEST_COST_WITHOUT_CAP', bid_amount: 3 }, { ad_set_id: '5' }), /must not be set/],
+    ['targeting not an object', upd('AD_SET', { targeting: 'US' }, { ad_set_id: '5' }), /targeting must be/],
+    ['bad exclusion', upd('AD_SET', { targeting: { excluded_custom_audiences: ['777'] } }, { ad_set_id: '5' }), /excluded_custom_audiences/],
+    ['bad time', upd('AD_SET', { end_time: 'next friday' }, { ad_set_id: '5' }), /ISO 8601/],
+    ['end before start', upd('AD_SET', { start_time: '2026-12-02T00:00:00Z', end_time: '2026-12-01T00:00:00Z' }, { ad_set_id: '5' }), /after start_time/],
+    ['bad creative id', upd('AD', { creative_id: 'abc' }, { ad_id: '9' }), /creative_id must be/],
+    ['activation bundled with an edit', upd('AD_SET', { status: 'ACTIVE', bid_amount: 5 }, { ad_set_id: '5' }), /its own change/],
+  ])('refuses %s with nothing dispatched', async (_n, args, msg) => {
+    const deps = makeDeps();
+    await expect(executeMetaToolkitWrite('u1', args, deps)).rejects.toThrow(msg as RegExp);
+    expect(deps.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('a Meta-state change between preview and confirm invalidates the token (diff is bound)', async () => {
+    const readBack = jest.fn()
+      .mockResolvedValueOnce({ id: '5', status: 'PAUSED', bid_strategy: 'LOWEST_COST_WITHOUT_CAP' })
+      .mockResolvedValue({ id: '5', status: 'PAUSED', bid_strategy: 'LOWEST_COST_WITH_BID_CAP' });
+    const deps = makeDeps({ readBack });
+    const args = upd('AD_SET', { bid_strategy: 'COST_CAP', bid_amount: 5 }, { ad_set_id: '5' });
+    const preview: any = await executeMetaToolkitWrite('u1', args, deps);
+    const r: any = await executeMetaToolkitWrite('u1', { ...args, confirm: true, preview_token: preview.preview_token }, deps);
+    expect(r.status).toBe('PREVIEW_MISMATCH');
+    expect(deps.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('targetingApplied is containment, matching object lists by id', () => {
+    expect(targetingApplied({ excluded_custom_audiences: [{ id: '1' }], age_min: 25 }, { excluded_custom_audiences: [{ id: '1', name: 'x' }], age_min: 25, age_max: 65 })).toBe(true);
+    expect(targetingApplied({ excluded_custom_audiences: [{ id: '1' }] }, { excluded_custom_audiences: [{ id: '2' }] })).toBe(false);
+    expect(targetingApplied({ geo_locations: { countries: ['US'] } }, { geo_locations: { countries: ['CA'] } })).toBe(false);
+  });
+});
