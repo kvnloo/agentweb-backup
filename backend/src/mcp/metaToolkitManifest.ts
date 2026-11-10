@@ -19,7 +19,7 @@ import { isZomaTool, ZOMA_TOOL_DEFINITIONS } from './zomaToolDefinitions';
 import { MetaToolkitRefusal } from './metaToolkitErrors';
 import { GUARDED_WRITE_ACTIONS } from './metaToolkitWriteSurface';
 
-const CREATIVE_UPLOAD_ACTIONS = ['UPLOAD_IMAGE', 'UPLOAD_VIDEO'] as const;
+const CREATIVE_UPLOAD_ACTIONS = ['UPLOAD_IMAGE', 'UPLOAD_VIDEO', 'BULK_CREATE'] as const;
 
 const META_MARKETING_API_DESCRIPTION =
   'Meta Marketing API for external agents. Reads: LIST, GET, PREVIEW, SEARCH, GET_MATCH_QUALITY. ' +
@@ -30,8 +30,11 @@ const META_MARKETING_API_DESCRIPTION =
   'Budgets are in MAJOR units of the ad account currency (e.g. 50 = $50.00); the preview echoes the converted amount. ' +
   'A write is done only when the result says verification CONFIRMED. ' +
   'CREATIVES (no preview needed, they cannot spend until an ad uses them): AD_CREATIVE UPLOAD_IMAGE (params.image_url) → image_hash; ' +
-  'AD_CREATIVE UPLOAD_VIDEO (params.video_url) → video_id + thumbnail_url, waits for Meta processing (re-check with params.video_id); ' +
-  'AD_CREATIVE CREATE (name, page_id, body, title, link_url, call_to_action_type + image_hash | image_url | video_id with image_url/image_hash thumbnail) → creative_id; ' +
+  'AD_CREATIVE UPLOAD_VIDEO (params.video_url: any public https URL of the video FILE, e.g. a UGC .mp4 link, max 1 GB) → video_id + thumbnail_url, waits for Meta processing (re-check with params.video_id); ' +
+  'AD_CREATIVE CREATE (name, page_id, body, title, link_url, call_to_action_type + image_hash | image_url | video_id [Meta thumbnail used if none given]) → creative_id; ' +
+  'or carousel_cards (2-10 cards, each with its own image_hash/image_url/video_id and link_url) or placement_assets, with no top-level image; ' +
+  'or MULTI-VARIANT (Advantage+): headlines[] / bodies[] / descriptions[] (up to 5 each) + image_hashes[] / video_ids[] (up to 10 each) + link_url → one creative Meta optimizes; ' +
+  'AD_CREATIVE BULK_CREATE (params.items: up to 10 creatives, each with its media and optional overrides; other params are shared; items may use video_url) → per-item results, partial success reported; ' +
   'then AD CREATE with params.creative_id (guarded preview, created PAUSED). For a file on the user\'s computer call zoma_prepare_upload first. ' +
   'Use PAGE LIST for page_id. DELETE and custom audiences are not available.';
 

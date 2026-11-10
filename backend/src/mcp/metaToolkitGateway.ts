@@ -282,7 +282,14 @@ export async function handleMetaToolkitCall(
   // own event kind. Previews, mismatched confirms and refused/failed writes are not.
   // A metering failure must not make an executed write look failed (that invites a retry
   // and a duplicate), so it is logged and surfaced on the result instead of thrown.
-  if (guardedWrite && typeof (result as any)?.verification === 'string') {
+  // ENG-2915: a BULK_CREATE result carries one verdict per creative; each is its own write event.
+  const executedWrites: any[] = !guardedWrite
+    ? []
+    : Array.isArray((result as any)?.results)
+      ? (result as any).results
+      : [result];
+  for (const write of executedWrites) {
+    if (typeof write?.verification !== 'string') continue;
     await (deps.recordWrite ?? recordMcpWriteExecuted)({
       userId: caller.userId,
       toolName: request.toolName,
@@ -294,11 +301,11 @@ export async function handleMetaToolkitCall(
       platform: 'meta',
       entityType: String(args.entity_type),
       action: String(args.action),
-      verification: (result as any).verification,
-      objectId: (result as any).id ?? (result as any).image_hash ?? (result as any).video_id ?? undefined,
+      verification: write.verification,
+      objectId: write.id ?? write.creative_id ?? write.image_hash ?? write.video_id ?? undefined,
     }).catch((error) => {
       console.error('[meta-toolkit] write metering failed:', error instanceof Error ? error.message : error);
-      (result as any).metering = 'failed: this write executed but was not recorded in usage';
+      write.metering = 'failed: this write executed but was not recorded in usage';
     });
   }
 

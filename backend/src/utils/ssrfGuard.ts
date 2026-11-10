@@ -364,3 +364,76 @@ export async function fetchPublicHtml(
   const { buffer } = await fetchBufferFollowingRedirects(url, deps, DEFAULT_MAX_REDIRECTS, timeoutMs, maxBytes);
   return buffer.toString('utf8');
 }
+
+export interface MediaProbeDeps {
+  resolvePinned?: (url: string) => Promise<{ hostname: string; address: string; family: number }>;
+  /** Response status + headers only; the body must not be read. */
+  requestHeaders?: (
+    url: string,
+    pinned: { address: string; family: number },
+    timeoutMs: number,
+  ) => Promise<{ status: number; headers: Record<string, any> }>;
+}
+
+/**
+ * ENG-2915: SSRF-safe header probe of a remote media URL before it is handed to a fetcher we do
+ * not control (Meta pulls video file_urls itself; the image upload re-fetches the URL). Same
+ * hop-by-hop rule as fetchBufferFollowingRedirects: every redirect hop is re-resolved and
+ * pinned, so a public URL that redirects to a private address is refused. Only https hops are
+ * followed. Uses GET (not HEAD: presigned and many CDN URLs are signed for GET only) and never
+ * reads the body. Returns the final URL so the fetcher starts at the validated hop.
+ */
+export async function probePublicMediaUrl(
+  startUrl: string,
+  deps: MediaProbeDeps = {},
+  maxRedirects: number = DEFAULT_MAX_REDIRECTS,
+  timeoutMs: number = 15000,
+): Promise<{ finalUrl: string; status: number; contentType: string; contentLength?: number }> {
+  const resolvePinned = deps.resolvePinned ?? resolvePinnedPublicAddress;
+  const requestHeaders = deps.requestHeaders ?? defaultPinnedHeaderRequest;
+  const deadline = Date.now() + timeoutMs;
+  let url = startUrl;
+  for (let hop = 0; hop <= maxRedirects; hop++) {
+    if (new URL(url).protocol !== 'https:') throw new SsrfBlockedError('Only https URLs are followed');
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) throw new Error(`Timed out following redirects after ${timeoutMs}ms`);
+    const pinned = await resolvePinned(url);
+    const res = await requestHeaders(url, pinned, remainingMs);
+    if (res.status >= 300 && res.status < 400) {
+      const location = res.headers?.location ?? res.headers?.Location;
+      if (!location) throw new Error(`Redirect ${res.status} with no Location header`);
+      url = new URL(String(location), url).toString();
+      continue;
+    }
+    const rawType = res.headers?.['content-type'] ?? res.headers?.['Content-Type'] ?? '';
+    const declared = Number(res.headers?.['content-length'] ?? res.headers?.['Content-Length']);
+    return {
+      finalUrl: url,
+      status: res.status,
+      contentType: String(rawType).split(';')[0].trim().toLowerCase(),
+      ...(Number.isFinite(declared) && declared >= 0 ? { contentLength: declared } : {}),
+    };
+  }
+  throw new Error(`Too many redirects (>${maxRedirects})`);
+}
+
+/* istanbul ignore next — network boundary; unit tests inject `requestHeaders` instead. */
+async function defaultPinnedHeaderRequest(
+  url: string,
+  pinned: { address: string; family: number },
+  timeoutMs: number,
+): Promise<{ status: number; headers: Record<string, any> }> {
+  const axios = (await import('axios')).default;
+  const res = await axios.get(url, {
+    responseType: 'stream',
+    timeout: timeoutMs,
+    maxRedirects: 0,
+    validateStatus: () => true,
+    lookup: (_hostname: string, options: any, callback: any) => {
+      if (typeof options === 'function') callback = options;
+      callback(null, pinned.address, pinned.family);
+    },
+  } as any);
+  (res.data as any)?.destroy?.();
+  return { status: res.status, headers: res.headers as any };
+}
