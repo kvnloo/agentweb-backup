@@ -1,3 +1,4 @@
+process.env.ZOMA_REQUIRE_PAYMENT_METHOD = 'true';
 /**
  * ENG-2571 acceptance (Zoma "Pay as you go" billing). Stripe SDK mocked; the route and
  * stripeService run for real.

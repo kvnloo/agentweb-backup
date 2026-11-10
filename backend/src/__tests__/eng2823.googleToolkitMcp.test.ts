@@ -1,3 +1,4 @@
+process.env.ZOMA_REQUIRE_PAYMENT_METHOD = 'true';
 /**
  * ENG-2823 hardening — the Google Ads toolkit end to end over MCP JSON-RPC.
  *

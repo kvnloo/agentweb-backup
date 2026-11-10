@@ -1,3 +1,4 @@
+process.env.ZOMA_REQUIRE_PAYMENT_METHOD = 'true';
 /**
  * Zoma creative upload (Matt's 2026-10-26 feedback): external creatives → Meta media
  * library → creative → paused ad, without Ads Manager.
