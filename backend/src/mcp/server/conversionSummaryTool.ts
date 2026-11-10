@@ -134,7 +134,7 @@ mcpToolRegistry.register({
             method: 'GET',
             path: `/api/crm/lists/${encodeURIComponent(id)}/leads`,
             context: scoped,
-            queryParams: { page: String(page), limit: String(PAGE_SIZE) },
+            queryParams: { page: String(page), limit: String(PAGE_SIZE), engagedOnly: 'false' },
           });
         } catch {
           failed = true;

@@ -147,5 +147,7 @@ describe('ENG-2898 get_conversion_summary', () => {
     expect(out.landing_pages[0]).toMatchObject({ page_id: 'lp-W2', conversions: 3, leads: 3 });
     expect(out.skipped_lists).toEqual([{ list_id: 'L2', name: 'Broken' }]);
     expect(leadsCalls[0].limit).toBe('200');
+    // Opslane run 1792: engaged-only lists must not filter the count to 0.
+    expect(leadsCalls[0].engagedOnly).toBe('false');
   });
 });
