@@ -9666,9 +9666,12 @@ emmaToolRegistry.register({
     // ENG-2907: a non-Google URL (e.g. a luma.com page) used to be sent to Drive
     // verbatim as a fileId, 404, and cluster as a config failure. Refuse it up front.
     const raw = String(args.url_or_id ?? '').trim();
-    if (/^https?:\/\//i.test(raw)) {
+    // Drive file IDs are [A-Za-z0-9_-]+; anything with a scheme, '/' or '.' is a URL,
+    // including scheme-less pastes like "luma.com/event/..." (Opslane P1 on #3960).
+    const hasScheme = /^https?:\/\//i.test(raw);
+    if (hasScheme || /[./]/.test(raw)) {
       let host = '';
-      try { host = new URL(raw).hostname.toLowerCase(); } catch { /* treated as non-Google below */ }
+      try { host = new URL(hasScheme ? raw : `https://${raw}`).hostname.toLowerCase(); } catch { /* treated as non-Google below */ }
       if (!/(^|\.)(docs|drive|sheets)\.google\.com$/.test(host)) {
         return {
           success: false,
