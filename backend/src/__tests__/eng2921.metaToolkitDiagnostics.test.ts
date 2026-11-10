@@ -75,6 +75,21 @@ describe('ENG-2921 account diagnostics', () => {
     expect(get).not.toHaveBeenCalled();
   });
 
+  it('strips token-bearing paging URLs but keeps cursors', async () => {
+    const get = jest.fn().mockResolvedValue({ data: { data: [], paging: {
+      cursors: { after: 'c2' }, next: 'https://graph.facebook.com/x?access_token=secret&after=c2',
+    } } });
+    const result: any = await executeActivityLogRead({}, credentials, { get } as any);
+    expect(result.paging).toEqual({ cursors: { after: 'c2' }, has_next: true, has_previous: false });
+    expect(JSON.stringify(result)).not.toContain('secret');
+  });
+
+  it.each(['../me', '123/../456', ''])('refuses a malformed account id %p before Graph calls', async (accountId) => {
+    const get = jest.fn();
+    await expect(executeActivityLogRead({}, { ...credentials, accountId }, { get } as any)).rejects.toThrow();
+    expect(get).not.toHaveBeenCalled();
+  });
+
   it('treats blank optional strings as absent', async () => {
     const get = jest.fn().mockResolvedValue({ data: { data: [] } });
     await executeActivityLogRead({ after: ' ' }, credentials, { get } as any);

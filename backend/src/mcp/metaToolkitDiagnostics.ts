@@ -91,11 +91,19 @@ export async function executeActivityLogRead(
     if (args[k] !== undefined && !TIME.test(args[k])) throw new MetaToolkitRefusal(`${k} must be an ISO date or unix seconds.`);
   }
   const base = `https://graph.facebook.com/${process.env.META_API_VERSION || 'v25.0'}`;
-  const account = `act_${credentials.accountId.replace(/^act_/, '')}`;
+  const accountId = String(credentials.accountId ?? '').replace(/^act_/, '');
+  if (!/^\d+$/.test(accountId)) throw new MetaToolkitRefusal('The selected Meta ad account id is not valid.');
+  const account = `act_${accountId}`;
   const params: Record<string, unknown> = { fields: ACTIVITY_FIELDS, limit: args.limit ?? 50 };
   for (const k of ['since', 'until', 'after']) if (args[k] !== undefined) params[k] = args[k];
   try {
-    return (await graph.get(`${base}/${account}/activities`, { params: { ...params, access_token: credentials.accessToken }, timeout: 15_000 })).data;
+    const data = (await graph.get(`${base}/${account}/activities`, { params: { ...params, access_token: credentials.accessToken }, timeout: 15_000 })).data;
+    // Graph paging.next/previous URLs embed access_token; return cursors and has-more flags only.
+    if (data?.paging) {
+      const { next, previous, ...rest } = data.paging;
+      return { ...data, paging: { ...rest, has_next: Boolean(next), has_previous: Boolean(previous) } };
+    }
+    return data;
   } catch (error: any) {
     return metaReadFailureResult(error);
   }
