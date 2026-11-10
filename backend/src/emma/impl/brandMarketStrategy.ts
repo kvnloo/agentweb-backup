@@ -714,6 +714,20 @@ export function mergeFounders(
   return [...out, ...merged.filter(m => !existingByName.has(normalize(m.name)))];
 }
 
+/**
+ * ENG-2875: founders update for update_brand_guidelines. An empty incoming
+ * list keeps the stored founders unless clearAll is set (models send
+ * `founders: []` as a default while editing other fields).
+ */
+export function resolveFounderUpdate(
+  existing: unknown,
+  incoming: unknown[],
+  opts: { additive?: boolean; clearAll?: boolean } = {},
+): any[] {
+  if (incoming.length === 0 && !opts.clearAll) return Array.isArray(existing) ? existing : [];
+  return mergeFounders(existing, incoming, { additive: opts.additive });
+}
+
 export async function updateBrandGuidelines(
   updateData: any,
   userId: string,
@@ -737,7 +751,7 @@ export async function updateBrandGuidelines(
       if (Array.isArray(incomingFoundersRaw) && hasBlankFounderName(incomingFoundersRaw)) {
         return {
           success: false,
-          message: 'Every founder needs a non-empty name. Pass an empty founders array to clear all founders.',
+          message: 'Every founder needs a non-empty name. To remove every founder, pass founders: [] with clearAllFounders: true.',
           error: 'Invalid founders',
         };
       }
@@ -821,7 +835,7 @@ export async function updateBrandGuidelines(
       }
 
       // Extract brandData, brandAssets, and optional market-strategy refresh from updateData
-      const { brandData, brandAssets, refreshMarketStrategy, ...otherFields } = updateData;
+      const { brandData, brandAssets, refreshMarketStrategy, clearAllFounders, ...otherFields } = updateData;
 
       // Merge with existing brandData - only update provided fields
       const updatedBrandData = {
@@ -837,10 +851,12 @@ export async function updateBrandGuidelines(
       // scrape; a user reopening it after the build is ready edits normally.
       if (brandData && Array.isArray((brandData as any).founders)) {
         const incomingFounders: any[] = (brandData as any).founders;
-        updatedBrandData.founders = mergeFounders(
+        // ENG-2875: an empty founders array alongside another edit is a model
+        // default, not a removal. Clearing every founder needs clearAllFounders.
+        updatedBrandData.founders = resolveFounderUpdate(
           (existingBrand.brandData as any)?.founders,
           incomingFounders,
-          { additive: guard.automatedTurn },
+          { additive: guard.automatedTurn, clearAll: clearAllFounders === true },
         );
       }
 

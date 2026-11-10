@@ -1,4 +1,6 @@
-import { mergeFounders, hasBlankFounderName, isScrapeFounderWrite } from '../brandMarketStrategy';
+import { mergeFounders, hasBlankFounderName, isScrapeFounderWrite, resolveFounderUpdate } from '../brandMarketStrategy';
+import { readFileSync } from 'fs';
+import { join } from 'path';
 
 describe('mergeFounders (ENG-2875)', () => {
   const existing = [
@@ -61,5 +63,28 @@ describe('ENG-2875 founders write guards', () => {
     expect(isScrapeFounderWrite(claim, 'ready', 1)).toBe(false);
     expect(isScrapeFounderWrite(claim, 'ready')).toBe(false);
     expect(isScrapeFounderWrite(undefined, 'building')).toBe(false);
+  });
+});
+
+describe('ENG-2875 empty founders list and tool contract', () => {
+  const existing = [{ name: 'Dana Ops', jobTitle: 'CEO' }, { name: 'Ravi Chandra', jobTitle: 'CTO' }];
+
+  it('an empty founders list alongside another edit keeps every founder', () => {
+    expect(resolveFounderUpdate(existing, [])).toEqual(existing);
+    expect(resolveFounderUpdate(existing, [], { additive: true })).toEqual(existing);
+  });
+
+  it('clears all founders only with explicit clearAll', () => {
+    expect(resolveFounderUpdate(existing, [], { clearAll: true })).toEqual([]);
+  });
+
+  it('a non-empty list still removes omitted founders', () => {
+    expect(resolveFounderUpdate(existing, [{ name: 'Dana Ops' }])).toEqual([existing[0]]);
+  });
+
+  it('tool description tells Emma omitted founders are removed and how to clear', () => {
+    const text = readFileSync(join(__dirname, '..', '..', 'tools.ts'), 'utf8');
+    expect(text).toMatch(/leave out is removed/);
+    expect(text).toMatch(/clearAllFounders/);
   });
 });
