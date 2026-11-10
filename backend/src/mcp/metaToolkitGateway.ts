@@ -22,12 +22,13 @@ import { recordMcpToolUse, recordMcpWriteExecuted, type McpAuthMethod } from '..
 import { executeMetaToolkitCall, getMetaToolkitManifest, MetaToolkitRefusal } from './metaToolkitManifest';
 import { RateLimiter } from '../middleware/rateLimiter';
 import { effectiveApiKeyScopes, findScopeDenial } from './server/apiKeyScopes';
-import { isZomaTool } from './zomaToolDefinitions';
+import { AUDIENCE_TOOL_NAME, isAudienceWriteRequest, isZomaTool } from './zomaToolDefinitions';
 import { executeMetaToolkitWrite, isGuardedWriteRequest } from './metaToolkitWrites';
 import { runZomaTool, ZomaNotReadyError } from './zomaOnboarding';
 import { googleToolkitEnabled, META_PROVIDER, resolveProviderAccount } from './zomaProviders';
 import { validateZomaToken, ZOMA_TOKEN_PREFIX } from './zomaDeviceFlow';
 import { executeMetaToolkitCreative, isCreativeAssetRequest, prepareZomaUpload } from './metaToolkitCreatives';
+import { executeMetaToolkitAudience } from './metaToolkitAudiences';
 
 export class MetaToolkitAuthError extends Error {
   readonly status: 401 | 403 | 429;
@@ -75,6 +76,8 @@ export interface MetaToolkitGatewayDeps {
   executeCreative?: (userId: string, args: any) => Promise<any>;
   /** zoma_prepare_upload; defaults to prepareZomaUpload. */
   prepareUpload?: (userId: string, args: any) => Promise<any>;
+  /** ENG-2914 zoma_custom_audiences; defaults to executeMetaToolkitAudience. */
+  executeAudience?: (userId: string, args: any) => Promise<any>;
 }
 
 /** Per-credential ceiling, so one key/token cannot exceed its limit by spreading calls across IPs. */
@@ -226,8 +229,12 @@ export async function handleMetaToolkitCall(
     return result;
   }
 
+  // ENG-2914: custom audiences run against the resolved Meta ad account. Reads need
+  // tools:read; every write (and any unknown action) needs tools:execute.
+  const audienceTool = request.toolName === AUDIENCE_TOOL_NAME;
+
   // ENG-2303: onboarding tools must work before Meta is connected, so they skip account resolution.
-  if (isZomaTool(request.toolName)) {
+  if (isZomaTool(request.toolName) && !audienceTool) {
     assertMetaToolkitScope(caller, request.toolName, false);
     let result;
     try {
@@ -260,23 +267,22 @@ export async function handleMetaToolkitCall(
   assertMetaToolkitScope(
     caller,
     request.toolName,
-    isCreativeAssetRequest(request.toolName, args) || isGuardedWriteRequest(request.toolName, args),
+    audienceTool
+      ? isAudienceWriteRequest(args)
+      : isCreativeAssetRequest(request.toolName, args) || isGuardedWriteRequest(request.toolName, args),
   );
   const accountId = await resolveMetaToolkitAdAccount(caller.userId, args.account_id, deps);
-  if (toolAcceptsAccountId(request.toolName)) args.account_id = accountId;
+  if (audienceTool || toolAcceptsAccountId(request.toolName)) args.account_id = accountId;
 
   // ENG-2303 P3: CAMPAIGN/AD_SET/AD CREATE + status/budget UPDATE go through the guarded
   // preview→confirm path; every other write stays refused by assertMetaToolkitV1Call.
   const creativeAsset = isCreativeAssetRequest(request.toolName, args);
-  const guardedWrite = creativeAsset || isGuardedWriteRequest(request.toolName, args);
-  const result = creativeAsset
-    ? await (deps.executeCreative ?? executeMetaToolkitCreative)(caller.userId, args)
-    : guardedWrite
-      ? await (deps.executeWrite ?? executeMetaToolkitWrite)(caller.userId, args)
-      : await deps.execute(request.toolName, args, {
-          userId: caller.userId,
-          sessionId: request.sessionId,
-        });
+  const guardedWrite = audienceTool || creativeAsset || isGuardedWriteRequest(request.toolName, args);
+  let result: any;
+  if (audienceTool) result = await (deps.executeAudience ?? executeMetaToolkitAudience)(caller.userId, args);
+  else if (creativeAsset) result = await (deps.executeCreative ?? executeMetaToolkitCreative)(caller.userId, args);
+  else if (guardedWrite) result = await (deps.executeWrite ?? executeMetaToolkitWrite)(caller.userId, args);
+  else result = await deps.execute(request.toolName, args, { userId: caller.userId, sessionId: request.sessionId });
 
   // ENG-2303 P4: a write that reached Meta (it has a read-back verdict) is metered as its
   // own event kind. Previews, mismatched confirms and refused/failed writes are not.
@@ -292,7 +298,7 @@ export async function handleMetaToolkitCall(
       sessionId: request.sessionId,
       userAgent: request.userAgent,
       platform: 'meta',
-      entityType: String(args.entity_type),
+      entityType: audienceTool ? 'CUSTOM_AUDIENCE' : String(args.entity_type),
       action: String(args.action),
       verification: (result as any).verification,
       objectId: (result as any).id ?? (result as any).image_hash ?? (result as any).video_id ?? undefined,

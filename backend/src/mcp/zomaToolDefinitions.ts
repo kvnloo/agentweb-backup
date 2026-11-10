@@ -12,11 +12,21 @@ export function googleToolkitEnabled(env: NodeJS.ProcessEnv = process.env): bool
   return env.ZOMA_GOOGLE_ADS_ENABLED === 'true';
 }
 
-export const ZOMA_TOOL_NAMES = ['zoma_status', 'zoma_usage', 'zoma_prepare_upload'] as const;
+export const ZOMA_TOOL_NAMES = ['zoma_status', 'zoma_usage', 'zoma_prepare_upload', 'zoma_custom_audiences'] as const;
 export type ZomaToolName = (typeof ZOMA_TOOL_NAMES)[number];
 
 export function isZomaTool(name: string): name is ZomaToolName {
   return (ZOMA_TOOL_NAMES as readonly string[]).includes(name);
+}
+
+/** ENG-2914: custom audiences run against a resolved Meta ad account (routed by the gateway). */
+export const AUDIENCE_TOOL_NAME = 'zoma_custom_audiences';
+export const AUDIENCE_READ_ACTIONS = ['LIST', 'GET', 'LIST_AD_SETS'] as const;
+export const AUDIENCE_WRITE_ACTIONS = ['CREATE', 'UPDATE', 'ADD_USERS', 'REMOVE_USERS', 'DELETE', 'EXCLUDE_CUSTOMERS'] as const;
+
+/** Write-classified for aw_ key scopes: anything that is not an explicit read (unknown actions included). */
+export function isAudienceWriteRequest(args: any): boolean {
+  return !(AUDIENCE_READ_ACTIONS as readonly string[]).includes(String(args?.action));
 }
 
 export const ZOMA_TOOL_DEFINITIONS = [
@@ -43,6 +53,59 @@ export const ZOMA_TOOL_DEFINITIONS = [
         size_bytes: { type: 'number', description: 'Optional file size in bytes, checked against the limit before uploading.' },
       },
       required: ['filename'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'zoma_custom_audiences',
+    description:
+      'Meta custom audiences on the connected ad account. Reads: LIST; GET (audience_id); LIST_AD_SETS (audience_id → ad sets that include or exclude it). ' +
+      'Writes use the same two-call PREVIEW → confirm=true + preview_token flow as other Zoma writes: ' +
+      'CREATE (params.name + source: customer_list | website {pixel_id, retention_days ≤180, url_contains?, event_name?} | engagement {source_type page|ig_business, source_id, event?, retention_days ≤365} | lookalike {origin_audience_id, country, ratio_percent 1-10}); ' +
+      'UPDATE (audience_id; params.name / description / rule); ADD_USERS / REMOVE_USERS (audience_id; params.emails / params.phones as plain text — Zoma normalizes and SHA-256 hashes them, raw values are never stored); ' +
+      'DELETE (audience_id; refused while an active ad set uses it unless confirm_in_use=true); ' +
+      'EXCLUDE_CUSTOMERS (ad_set_ids + params.emails/phones or audience_id: creates or reuses a customer list and adds it to excluded_custom_audiences on those ad sets; the preview shows the targeting diff). ' +
+      'A write is done only when verification is CONFIRMED. If the result is TERMS_NOT_ACCEPTED, relay terms_url so the user accepts Meta\'s Custom Audience Terms, then retry.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['LIST', 'GET', 'LIST_AD_SETS', 'CREATE', 'UPDATE', 'ADD_USERS', 'REMOVE_USERS', 'DELETE', 'EXCLUDE_CUSTOMERS'] },
+        account_id: { type: 'string', description: 'Meta ad account id; needed only when more than one is connected.' },
+        audience_id: { type: 'string', description: 'Custom audience id (GET, LIST_AD_SETS, UPDATE, ADD_USERS, REMOVE_USERS, DELETE; optional for EXCLUDE_CUSTOMERS).' },
+        ad_set_ids: { type: 'array', items: { type: 'string' }, description: 'EXCLUDE_CUSTOMERS: 1-50 ad set ids to exclude the audience from.' },
+        source: {
+          type: 'object',
+          description: 'CREATE only. type: customer_list | website | engagement | lookalike (external_provider is not available yet).',
+          properties: {
+            type: { type: 'string', enum: ['customer_list', 'website', 'engagement', 'lookalike', 'external_provider'] },
+            pixel_id: { type: 'string' },
+            retention_days: { type: 'number' },
+            url_contains: { type: 'string' },
+            event_name: { type: 'string' },
+            source_type: { type: 'string', enum: ['page', 'ig_business'] },
+            source_id: { type: 'string' },
+            event: { type: 'string' },
+            origin_audience_id: { type: 'string' },
+            country: { type: 'string' },
+            ratio_percent: { type: 'number' },
+          },
+        },
+        params: {
+          type: 'object',
+          description: 'name, description, rule (UPDATE), emails / phones (arrays of plain-text strings; phones with country code).',
+          properties: {
+            name: { type: 'string' },
+            description: { type: 'string' },
+            rule: { type: 'object' },
+            emails: { type: 'array', items: { type: 'string' } },
+            phones: { type: 'array', items: { type: 'string' } },
+          },
+        },
+        confirm_in_use: { type: 'boolean', description: 'DELETE only: delete even though an active ad set uses the audience. Only after the user explicitly agreed.' },
+        confirm: { type: 'boolean', description: 'Writes only. Omit to get a PREVIEW. Set true only after the user approved that preview, with its preview_token.' },
+        preview_token: { type: 'string', description: 'Writes only. The preview_token from the approved preview (single use, 15 minutes).' },
+      },
+      required: ['action'],
       additionalProperties: false,
     },
   },

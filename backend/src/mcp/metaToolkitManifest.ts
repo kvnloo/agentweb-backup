@@ -33,7 +33,7 @@ const META_MARKETING_API_DESCRIPTION =
   'AD_CREATIVE UPLOAD_VIDEO (params.video_url) → video_id + thumbnail_url, waits for Meta processing (re-check with params.video_id); ' +
   'AD_CREATIVE CREATE (name, page_id, body, title, link_url, call_to_action_type + image_hash | image_url | video_id with image_url/image_hash thumbnail) → creative_id; ' +
   'then AD CREATE with params.creative_id (guarded preview, created PAUSED). For a file on the user\'s computer call zoma_prepare_upload first. ' +
-  'Use PAGE LIST for page_id. DELETE and custom audiences are not available.';
+  'Use PAGE LIST for page_id. DELETE is not available here; for custom audiences, lookalikes, customer lists and excluding existing customers use zoma_custom_audiences.';
 
 export const META_TOOLKIT_V1_TOOL_NAMES = [
   'list_meta_ads_campaigns',
