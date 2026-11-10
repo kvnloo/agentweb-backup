@@ -7,6 +7,9 @@
 import {
   advanceZomaStage,
   createJourneyAttribution,
+  markZomaMilestone,
+  MCP_CONSENT_SIGNUP_SOURCE,
+  toUserAttributionConfidence,
   productFromRequestPath,
   productFromResource,
   readRef,
@@ -96,17 +99,43 @@ describe('ENG-2906 signup attribution (write-once)', () => {
     ).resolves.toBe(false);
   });
 
-  it('restricts a deferred OAuth signup to a freshly created account via createdAt', async () => {
+  it('restricts a deferred OAuth signup to a row stamped as a consent-page signup, never by account age', async () => {
     const d = deps();
     await recordSignupAttribution(
       'user-1',
       { product: 'emma_mcp', path: 'oauth_direct', client: 'claude_code', confidence: 'explicit' },
-      { createdSince: '2026-11-10T11:00:00.000Z' },
+      { requireSignupSource: MCP_CONSENT_SIGNUP_SOURCE },
       d,
     );
     const params = d.update.mock.calls[0][0];
-    expect(params.ConditionExpression).toContain('#createdAt >= :createdSince');
-    expect(params.ExpressionAttributeValues[':createdSince']).toBe('2026-11-10T11:00:00.000Z');
+    expect(params.ConditionExpression).toContain('#signupSource = :signupSource');
+    expect(params.ExpressionAttributeValues[':signupSource']).toBe('mcp');
+    expect(params.ConditionExpression).not.toContain('createdAt');
+  });
+
+  it('stores attributionConfidence with the contract enum: explicit -> tracked', async () => {
+    const d = deps();
+    await recordSignupAttribution('user-1', { product: 'zoma', path: 'oauth_direct', client: 'claude_code', confidence: 'explicit' }, {}, d);
+    expect(d.update.mock.calls[0][0].ExpressionAttributeValues[':attributionConfidence']).toBe('tracked');
+  });
+
+  it('keeps inferred as inferred and omits an unknown confidence instead of inventing one', async () => {
+    const inferred = deps();
+    await recordSignupAttribution('user-1', { product: 'emma_web', path: 'webapp', client: 'web', confidence: 'inferred' }, {}, inferred);
+    expect(inferred.update.mock.calls[0][0].ExpressionAttributeValues[':attributionConfidence']).toBe('inferred');
+
+    const unknown = deps();
+    await recordSignupAttribution('user-1', { product: 'unknown', path: 'oauth_direct', client: 'unknown', confidence: 'unknown' }, {}, unknown);
+    const params = unknown.update.mock.calls[0][0];
+    expect(params.UpdateExpression).not.toContain('attributionConfidence');
+    expect(params.ExpressionAttributeNames['#attributionConfidence']).toBeUndefined();
+  });
+
+  it('never writes explicit or unknown as a user-row confidence', () => {
+    expect(toUserAttributionConfidence('explicit')).toBe('tracked');
+    expect(toUserAttributionConfidence('inferred')).toBe('inferred');
+    expect(toUserAttributionConfidence('unknown')).toBeUndefined();
+    expect(toUserAttributionConfidence('verified')).toBe('verified');
   });
 
   it('omits signupRef when no valid ref was provided', async () => {
@@ -166,6 +195,35 @@ describe('ENG-2906 zomaStage (forward-only conditional write)', () => {
     await advanceZomaStage('user-1', 'setup_started', {}, d);
     expect(d.update.mock.calls[0][0].ConditionExpression).toContain('attribute_not_exists(#zomaStage)');
     expect(d.update.mock.calls[0][0].ConditionExpression).not.toContain(' IN ');
+  });
+});
+
+describe('ENG-2906 first_read / first_write milestones (independent of the stage)', () => {
+  it('sets each milestone timestamp write-once, keyed by email', async () => {
+    const d = deps();
+    await expect(markZomaMilestone('user-1', 'first_read', d)).resolves.toBe(true);
+    const params = d.update.mock.calls[0][0];
+    expect(params.Key).toEqual({ email: 'owner@acme.com' });
+    expect(params.UpdateExpression).toBe('SET #m = :now');
+    expect(params.ConditionExpression).toBe('attribute_exists(#email) AND attribute_not_exists(#m)');
+    expect(params.ExpressionAttributeNames['#m']).toBe('zomaFirstReadAt');
+    expect(params.ConditionExpression).not.toContain('zomaStage');
+  });
+
+  it('first_read is still recorded after first_write already moved the stage past it', async () => {
+    const d = deps();
+    const attribution = createJourneyAttribution(d);
+    await expect(attribution.markZomaMilestone('user-1', 'first_write')).resolves.toBe(true);
+    await expect(attribution.markZomaMilestone('user-1', 'first_read')).resolves.toBe(true);
+    expect(d.update.mock.calls.map((c) => c[0].ExpressionAttributeNames['#m'])).toEqual(['zomaFirstWriteAt', 'zomaFirstReadAt']);
+  });
+
+  it('an already-set milestone returns false and is not retried in this process', async () => {
+    const d = deps({ update: jest.fn().mockRejectedValue(conditionalFailure()) } as any);
+    const attribution = createJourneyAttribution(d);
+    await expect(attribution.markZomaMilestone('user-1', 'first_read')).resolves.toBe(false);
+    await expect(attribution.markZomaMilestone('user-1', 'first_read')).resolves.toBe(false);
+    expect(d.update).toHaveBeenCalledTimes(1);
   });
 });
 
