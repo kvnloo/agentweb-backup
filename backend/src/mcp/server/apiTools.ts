@@ -12,6 +12,7 @@ import { carryStoredStepModels } from '../../services/agentMode/workPlanStepMode
  * No direct service calls — all tools route through the REST API.
  */
 
+import { createHash } from 'node:crypto';
 import { mcpToolRegistry } from './registry';
 import { mcpFetch } from './httpClient';
 import './adminLookupTools';
@@ -1922,6 +1923,223 @@ mcpToolRegistry.register({
       body: { files: args.files }
     });
     return jsonResult(data);
+  }
+});
+
+// ─── Knowledge base text-file writes, own account only (ENG-2892) ───────────
+//
+// Thin wrappers over the existing KB write routes (POST /api/emma/
+// create-knowledge-base, /attach-knowledge-base-files, /update-knowledge-base-
+// file and DELETE /api/tasks/:taskId/knowledge-base/files/:fileKey). No new
+// storage: the routes own the GCS write and the task record.
+//
+// Ownership is decided here, not by the routes: the delete route also admits
+// admins and org editors, and getTask admits org viewers. These tools act only
+// on a KB whose owner is the calling key's runtime identity, and answer a
+// foreign KB/file exactly like a missing one so existence never leaks. There
+// is no client_id/user override. Every write is read back from the task record
+// before the tool reports success.
+
+export const KB_TEXT_FILE_MAX_BYTES = 1024 * 1024;
+const KB_MAIN_FILE = 'knowledge-base.txt';
+const KB_TEXT_FILE_EXTENSION = /\.(txt|md|markdown)$/i;
+// Control characters other than tab/newline/CR mark binary data.
+const KB_BINARY_CHARS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
+const KB_NOT_FOUND = 'Knowledge base or file not found';
+
+function kbArg(raw: unknown): string {
+  return typeof raw === 'string' ? raw.trim() : '';
+}
+
+/** Returns an error string when `content` is not acceptable KB text, else null. */
+function kbTextContentError(content: unknown): string | null {
+  if (typeof content !== 'string' || content.trim().length === 0) return 'content must be a non-empty text string';
+  const size = Buffer.byteLength(content, 'utf8');
+  if (size > KB_TEXT_FILE_MAX_BYTES) return `content is ${size} bytes; the maximum is ${KB_TEXT_FILE_MAX_BYTES} bytes`;
+  if (KB_BINARY_CHARS.test(content)) return 'content looks binary; only plain text or markdown is accepted';
+  return null;
+}
+
+function kbFileNameError(fileName: string): string | null {
+  if (!fileName) return 'file_name is required';
+  if (!KB_TEXT_FILE_EXTENSION.test(fileName)) return 'file_name must end in .txt, .md or .markdown';
+  return null;
+}
+
+/** The caller's own KB task, or null for a missing or foreign one (indistinguishable). */
+async function loadOwnKnowledgeBase(kbId: string, context: any): Promise<any | null> {
+  const ownerId = context?.userId || context?.agentUserId;
+  if (!kbId || !ownerId) return null;
+  try {
+    const task = await mcpFetch({ method: 'GET', path: `/api/tasks/${encodeURIComponent(kbId)}`, context: ctx(context) });
+    return task && task.userId === ownerId ? task : null;
+  } catch (error: any) {
+    if (/API error \((403|404)\)/.test(String(error?.message))) return null;
+    throw error;
+  }
+}
+
+/** Read back one file's stored key + size from the caller's own KB task. */
+async function readBackKbFile(kbId: string, fileName: string, context: any): Promise<{ file_key: string; size_bytes: number } | null> {
+  const task = await loadOwnKnowledgeBase(kbId, context);
+  if (!task) return null;
+  if (fileName === KB_MAIN_FILE) {
+    return { file_key: `tasks/${task.taskId}/${KB_MAIN_FILE}`, size_bytes: Number(task.knowledgeBaseSize) || 0 };
+  }
+  const matches = (task.knowledgeBaseFiles || []).filter((f: any) => f?.filename === fileName);
+  const entry = matches[matches.length - 1];
+  return entry ? { file_key: entry.key, size_bytes: Number(entry.size) || 0 } : null;
+}
+
+async function verifiedKbWrite(kbId: string, fileName: string, content: string, context: any) {
+  const expected = Buffer.byteLength(content, 'utf8');
+  const stored = await readBackKbFile(kbId, fileName, context);
+  if (!stored || stored.size_bytes !== expected) {
+    return jsonResult({ success: false, error: 'Write could not be verified on read-back', kb_id: kbId, file_name: fileName });
+  }
+  return jsonResult({
+    success: true,
+    kb_id: kbId,
+    file_name: fileName,
+    file_key: stored.file_key,
+    size_bytes: stored.size_bytes,
+    sha256: createHash('sha256').update(content, 'utf8').digest('hex'),
+  });
+}
+
+function routeFailure(data: any) {
+  return jsonResult({ success: false, error: data?.error || data?.message || 'Knowledge base write failed' });
+}
+
+mcpToolRegistry.register({
+  name: 'create_knowledge_base_file',
+  definition: {
+    name: 'create_knowledge_base_file',
+    description: `Create a plain-text or markdown file in one of your own knowledge bases (max ${KB_TEXT_FILE_MAX_BYTES} bytes, no binary). With kb_id, adds file_name to that knowledge base; without kb_id, creates a new private knowledge base named kb_name whose main file (${KB_MAIN_FILE}) holds the content. Returns the stored file key, size and sha256.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        kb_id: { type: 'string', description: 'Your knowledge base ID (from list_knowledge_bases). Omit to create a new knowledge base.' },
+        kb_name: { type: 'string', description: 'Name for the new knowledge base (only when kb_id is omitted)' },
+        file_name: { type: 'string', description: 'File name ending in .txt, .md or .markdown (required with kb_id)' },
+        content: { type: 'string', description: 'File text' }
+      },
+      required: ['content']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const contentError = kbTextContentError(args?.content);
+    if (contentError) return jsonResult({ success: false, error: contentError });
+    const content: string = args.content;
+    const kbId = kbArg(args?.kb_id);
+
+    if (!kbId) {
+      const kbName = kbArg(args?.kb_name);
+      if (!kbName) return jsonResult({ success: false, error: 'kb_name is required when kb_id is omitted' });
+      const data = await mcpFetch({
+        method: 'POST', path: '/api/emma/create-knowledge-base', context: ctx(context),
+        body: { name: kbName, content, knowledge_base_type: 'private' }
+      });
+      if (!data?.success || !data.taskId) return routeFailure(data);
+      return verifiedKbWrite(data.taskId, KB_MAIN_FILE, content, context);
+    }
+
+    const fileName = kbArg(args?.file_name);
+    const nameError = kbFileNameError(fileName);
+    if (nameError) return jsonResult({ success: false, error: nameError });
+    const task = await loadOwnKnowledgeBase(kbId, context);
+    if (!task) return jsonResult({ success: false, error: KB_NOT_FOUND });
+    const lowered = fileName.toLowerCase();
+    const existingName = lowered === KB_MAIN_FILE
+      // An attachment stored under this exact case-variant name wins over the main file.
+      ? (fileName !== KB_MAIN_FILE && (task.knowledgeBaseFiles || []).find((f: any) => f?.filename === fileName)?.filename) || KB_MAIN_FILE
+      : (task.knowledgeBaseFiles || []).find((f: any) => String(f?.filename ?? '').toLowerCase() === lowered)?.filename;
+    if (existingName) {
+      // Report the stored name: update_knowledge_base_file_content matches names exactly.
+      return jsonResult({ success: false, error: `"${existingName}" already exists; use update_knowledge_base_file_content with file_name "${existingName}" to change it` });
+    }
+    const data = await mcpFetch({
+      method: 'POST', path: '/api/emma/attach-knowledge-base-files', context: ctx(context),
+      body: { task_id: task.taskId, files: [{ name: fileName, content }] }
+    });
+    if (!data?.success) return routeFailure(data);
+    return verifiedKbWrite(task.taskId, fileName, content, context);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'update_knowledge_base_file_content',
+  definition: {
+    name: 'update_knowledge_base_file_content',
+    description: `Replace the full content of an existing text or markdown file in one of your own knowledge bases (max ${KB_TEXT_FILE_MAX_BYTES} bytes, no binary). Returns the stored file key, size and sha256.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        kb_id: { type: 'string', description: 'Your knowledge base ID (from list_knowledge_bases)' },
+        file_name: { type: 'string', description: `Existing file name (e.g. ${KB_MAIN_FILE})` },
+        content: { type: 'string', description: 'New file text (replaces the old content)' }
+      },
+      required: ['kb_id', 'file_name', 'content']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const contentError = kbTextContentError(args?.content);
+    if (contentError) return jsonResult({ success: false, error: contentError });
+    const content: string = args.content;
+    const fileName = kbArg(args?.file_name);
+    const nameError = kbFileNameError(fileName);
+    if (nameError) return jsonResult({ success: false, error: nameError });
+    const task = await loadOwnKnowledgeBase(kbArg(args?.kb_id), context);
+    const exists = fileName === KB_MAIN_FILE || (task?.knowledgeBaseFiles || []).some((f: any) => f?.filename === fileName);
+    if (!task || !exists) return jsonResult({ success: false, error: KB_NOT_FOUND });
+    const data = await mcpFetch({
+      method: 'POST', path: '/api/emma/update-knowledge-base-file', context: ctx(context),
+      body: { task_id: task.taskId, file_name: fileName, content, mode: 'replace' }
+    });
+    if (!data?.success) return routeFailure(data);
+    return verifiedKbWrite(task.taskId, fileName, content, context);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'delete_knowledge_base_file',
+  definition: {
+    name: 'delete_knowledge_base_file',
+    description: `Delete one uploaded or attached file from one of your own knowledge bases. The main ${KB_MAIN_FILE} file cannot be deleted. Pass file_key when two files share a name. Returns confirmation that the file is gone.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        kb_id: { type: 'string', description: 'Your knowledge base ID (from list_knowledge_bases)' },
+        file_name: { type: 'string', description: 'File name to delete' },
+        file_key: { type: 'string', description: 'Stored file key (optional; disambiguates duplicate names)' }
+      },
+      required: ['kb_id', 'file_name']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const fileName = kbArg(args?.file_name);
+    const fileKey = kbArg(args?.file_key);
+    if (!fileName) return jsonResult({ success: false, error: 'file_name is required' });
+    if (fileName === KB_MAIN_FILE) return jsonResult({ success: false, error: `The main ${KB_MAIN_FILE} file cannot be deleted` });
+    const task = await loadOwnKnowledgeBase(kbArg(args?.kb_id), context);
+    // Only keys recorded on the caller's own task are ever sent to the delete route.
+    const matches = (task?.knowledgeBaseFiles || []).filter(
+      (f: any) => f?.filename === fileName && typeof f?.key === 'string' && (!fileKey || f.key === fileKey)
+    );
+    if (!task || matches.length === 0) return jsonResult({ success: false, error: KB_NOT_FOUND });
+    if (matches.length > 1) {
+      return jsonResult({ success: false, error: `${matches.length} files are named "${fileName}"; pass file_key`, file_keys: matches.map((f: any) => f.key) });
+    }
+    const key: string = matches[0].key;
+    await mcpFetch({
+      method: 'DELETE',
+      path: `/api/tasks/${encodeURIComponent(task.taskId)}/knowledge-base/files/${encodeURIComponent(key)}`,
+      context: ctx(context)
+    });
+    const after = await loadOwnKnowledgeBase(task.taskId, context);
+    const stillPresent = !after || (after.knowledgeBaseFiles || []).some((f: any) => f?.key === key);
+    if (stillPresent) return jsonResult({ success: false, error: 'Delete could not be confirmed on read-back', kb_id: task.taskId, file_key: key });
+    return jsonResult({ success: true, deleted: true, kb_id: task.taskId, file_name: fileName, file_key: key });
   }
 });
 
