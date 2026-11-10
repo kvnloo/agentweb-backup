@@ -19,6 +19,7 @@ const mockAttr = {
   recordSignupAttribution: jest.fn().mockResolvedValue(true),
   touchProduct: jest.fn().mockResolvedValue('touched'),
   advanceZomaStage: jest.fn().mockResolvedValue(true),
+  markZomaMilestone: jest.fn().mockResolvedValue(true),
 };
 jest.mock('../services/journeyAttribution', () => ({ ...jest.requireActual('../services/journeyAttribution'), journeyAttribution: mockAttr }));
 
@@ -52,6 +53,7 @@ import {
 import { handleMetaToolkitCall, type MetaToolkitGatewayDeps } from '../mcp/metaToolkitGateway';
 import { beginVerification, completeVerification, startSetup, type ZomaDeviceFlowDeps } from '../mcp/zomaDeviceFlow';
 import type { ZomaDeviceRecord } from '../mcp/zomaDeviceStore';
+import { noteSignup, zomaMilestone } from '../services/journeyMilestones';
 
 const flush = () => new Promise((r) => setImmediate(r));
 
@@ -113,14 +115,26 @@ describe('ENG-2906 Meta Toolkit gateway meters as zoma', () => {
     await flush();
     expect(mockAttr.touchProduct).toHaveBeenCalledWith('u1', 'zoma');
     expect(mockAttr.advanceZomaStage).toHaveBeenCalledWith('u1', 'first_read');
+    expect(mockAttr.markZomaMilestone).toHaveBeenCalledWith('u1', 'first_read');
     expect(mockJourney.trackJourney).toHaveBeenCalledWith({ userId: 'u1' }, 'first_read', expect.objectContaining({ product: 'zoma', platform: 'meta' }));
   });
 
-  it('first_read is emitted only when the stage actually advanced', async () => {
-    mockAttr.advanceZomaStage.mockResolvedValueOnce(false);
+  it('first_read is not re-emitted once its milestone is already recorded', async () => {
+    mockAttr.markZomaMilestone.mockResolvedValueOnce(false);
     await handleMetaToolkitCall({ authorization: `Bearer zoma_${'x'.repeat(43)}`, toolName: 'meta_insights', args: {} }, gatewayDeps());
     await flush();
     expect(mockJourney.trackJourney).not.toHaveBeenCalledWith(expect.anything(), 'first_read', expect.anything());
+  });
+
+  it('first_write before first_read does not suppress first_read: emitted once although the stage cannot move back', async () => {
+    // Stage is already first_write, so the forward-only stage write fails for first_read...
+    mockAttr.advanceZomaStage.mockResolvedValueOnce(false);
+    // ...but the first_read milestone field has never been set.
+    mockAttr.markZomaMilestone.mockResolvedValueOnce(true);
+    await handleMetaToolkitCall({ authorization: `Bearer zoma_${'x'.repeat(43)}`, toolName: 'meta_insights', args: {} }, gatewayDeps());
+    await flush();
+    expect(mockJourney.trackJourney).toHaveBeenCalledWith({ userId: 'u1' }, 'first_read', expect.objectContaining({ product: 'zoma' }));
+    expect(mockJourney.identifyJourney).not.toHaveBeenCalledWith('u1', { zomaStage: 'first_read' });
   });
 
   it('an executed write is recorded with product zoma and emits first_write', async () => {
@@ -195,9 +209,41 @@ describe('ENG-2906 Zoma device setup ref + journey', () => {
     expect(mockAttr.recordSignupAttribution).toHaveBeenCalledWith(
       'u7',
       { product: 'zoma', path: 'zoma_device', client: 'zoma_device', ref: 'hn_launch', confidence: 'explicit' },
-      expect.objectContaining({ createdSince: expect.any(String) }),
+      { requireSignupSource: 'mcp' },
     );
     expect(mockAttr.touchProduct).toHaveBeenCalledWith('u7', 'zoma');
     expect(mockAttr.advanceZomaStage).toHaveBeenCalledWith('u7', 'signed_up');
+  });
+});
+
+describe('ENG-2906 noteSignup', () => {
+  it('a zoma signup advances zomaStage to signed_up and reports confidence as tracked', async () => {
+    await expect(
+      noteSignup('u9', { product: 'zoma', path: 'oauth_direct', client: 'claude_code', ref: 'hn', confidence: 'explicit' }),
+    ).resolves.toBe(true);
+    expect(mockAttr.advanceZomaStage).toHaveBeenCalledWith('u9', 'signed_up');
+    expect(mockJourney.identifyJourney).toHaveBeenCalledWith('u9', expect.objectContaining({ signupProduct: 'zoma', attributionConfidence: 'tracked' }));
+    expect(mockJourney.trackJourney).toHaveBeenCalledWith({ userId: 'u9' }, 'signed_up', expect.objectContaining({ confidence: 'tracked' }));
+    // signed_up is emitted once by noteSignup itself, not again by the stage move.
+    expect(mockJourney.trackJourney.mock.calls.filter((c) => c[1] === 'signed_up')).toHaveLength(1);
+  });
+
+  it('a non-zoma signup does not touch zomaStage', async () => {
+    await noteSignup('u9', { product: 'emma_mcp', path: 'oauth_direct', client: 'claude_code', confidence: 'explicit' });
+    expect(mockAttr.advanceZomaStage).not.toHaveBeenCalled();
+  });
+
+  it('a signup that was not written (already attributed / not a consent-page account) emits nothing', async () => {
+    mockAttr.recordSignupAttribution.mockResolvedValueOnce(false);
+    await expect(noteSignup('u9', { product: 'zoma', path: 'oauth_direct', client: 'x', confidence: 'explicit' })).resolves.toBe(false);
+    expect(mockJourney.trackJourney).not.toHaveBeenCalled();
+    expect(mockAttr.advanceZomaStage).not.toHaveBeenCalled();
+  });
+
+  it('card_saved (no milestone field) keeps stage-based if_advanced semantics', async () => {
+    mockAttr.advanceZomaStage.mockResolvedValueOnce(false);
+    await zomaMilestone('u9', 'card_saved', { emit: 'if_advanced', requireZoma: true });
+    expect(mockAttr.markZomaMilestone).not.toHaveBeenCalled();
+    expect(mockJourney.trackJourney).not.toHaveBeenCalled();
   });
 });

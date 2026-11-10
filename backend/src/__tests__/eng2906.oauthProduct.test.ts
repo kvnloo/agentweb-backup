@@ -33,6 +33,7 @@ const mockAttr = {
   recordSignupAttribution: jest.fn().mockResolvedValue(true),
   touchProduct: jest.fn().mockResolvedValue('touched'),
   advanceZomaStage: jest.fn().mockResolvedValue(true),
+  markZomaMilestone: jest.fn().mockResolvedValue(true),
 };
 jest.mock('../services/journeyAttribution', () => ({
   ...jest.requireActual('../services/journeyAttribution'),
@@ -44,12 +45,19 @@ jest.mock('../middleware/auth', () => ({
     req.user = { userId: 'user-9', email: 'o@acme.com', isAdmin: false };
     next();
   },
-  getUserFromToken: jest.fn().mockResolvedValue({}),
+  getUserFromToken: (...a: any[]) => mockGetUserFromToken(...a),
 }));
+const mockGetUserFromToken = jest.fn();
 
 import express from 'express';
 import request from 'supertest';
 import { setupMcpOAuth } from '../mcp/oauth/oauthRoutes';
+import { buildMcpAuthChallenge } from '../mcp/oauth/authChallenge';
+import {
+  discoverOAuthProtectedResourceMetadata,
+  extractWWWAuthenticateParams,
+  selectResourceURL,
+} from '@modelcontextprotocol/sdk/client/auth.js';
 
 const BASE = 'https://api.agentweb.pro';
 function app() {
@@ -69,6 +77,8 @@ beforeEach(() => {
   mockSvc.takePendingAuthorization.mockResolvedValue(null);
   mockSvc.createAuthorizationCode.mockResolvedValue({ code: 'code-1' });
   mockSvc.createTokenPair.mockResolvedValue({ accessToken: 'a', refreshToken: 'r', tokenType: 'Bearer', expiresIn: 3600, scope: 'mcp:tools' });
+  mockGetUserFromToken.mockResolvedValue({});
+  delete process.env.MCP_OAUTH_SKIP_CONSENT;
 });
 
 const authorize = (extra: Record<string, string>) =>
@@ -113,7 +123,7 @@ describe('POST /oauth/authorize/decision product propagation', () => {
       .type('form')
       .send({ client_id: 'c1', redirect_uri: 'http://localhost:9/cb', code_challenge: 'ch', code_challenge_method: 'S256', approved: 'true' });
 
-  it('puts the pending product + ref on the auth code and attributes a fresh OAuth signup', async () => {
+  it('puts the pending product + ref on the auth code and attributes a consent-page OAuth signup', async () => {
     mockSvc.takePendingAuthorization.mockResolvedValue({ product: 'zoma', confidence: 'explicit', ref: 'hn_launch' });
     const res = await decide();
     expect(res.status).toBe(302);
@@ -124,7 +134,8 @@ describe('POST /oauth/authorize/decision product propagation', () => {
     expect(mockAttr.recordSignupAttribution).toHaveBeenCalledWith(
       'user-9',
       { product: 'zoma', path: 'oauth_direct', client: 'claude_code', ref: 'hn_launch', confidence: 'explicit' },
-      expect.objectContaining({ createdSince: expect.any(String) }),
+      // Only a row register stamped signupSource "mcp" qualifies — never account age.
+      { requireSignupSource: 'mcp' },
     );
   });
 
@@ -146,6 +157,80 @@ describe('POST /oauth/authorize/decision product propagation', () => {
     expect(res.status).toBe(302);
     expect(res.headers.location).toContain('code=code-1');
     expect(mockSvc.createAuthorizationCode.mock.calls[0][0]).toMatchObject({ product: 'unknown', attributionConfidence: 'unknown' });
+  });
+});
+
+describe('GET /oauth/authorize skip-consent fast path', () => {
+  it('attributes the consent-page signup with product + ref exactly like the decision path', async () => {
+    process.env.MCP_OAUTH_SKIP_CONSENT = 'true';
+    mockGetUserFromToken.mockResolvedValue({ user: { userId: 'user-5' } });
+    const res = await authorize({ resource: `${BASE}/api/meta-toolkit/mcp?ref=hn_launch` });
+    expect(res.status).toBe(302);
+    expect(res.headers.location).toContain('code=code-1');
+    expect(mockSvc.createAuthorizationCode.mock.calls[0][0]).toMatchObject({ userId: 'user-5', product: 'zoma', attributionConfidence: 'explicit', ref: 'hn_launch' });
+    await flush();
+    expect(mockAttr.recordSignupAttribution).toHaveBeenCalledWith(
+      'user-5',
+      { product: 'zoma', path: 'oauth_direct', client: 'claude_code', ref: 'hn_launch', confidence: 'explicit' },
+      { requireSignupSource: 'mcp' },
+    );
+  });
+
+  it('falls through to the consent page (no attribution) without an authenticated user', async () => {
+    process.env.MCP_OAUTH_SKIP_CONSENT = 'true';
+    const res = await authorize({ resource: `${BASE}/mcp` });
+    expect(res.headers.location).toContain('/oauth/authorize');
+    await flush();
+    expect(mockAttr.recordSignupAttribution).not.toHaveBeenCalled();
+  });
+});
+
+describe('ref survives the 401 challenge -> protected-resource metadata -> authorize chain', () => {
+  const prm = (path: string) => request(app()).get(path);
+
+  it('echoes a valid ref into the metadata resource; drops an invalid one', async () => {
+    expect((await prm('/.well-known/oauth-protected-resource/mcp?ref=hn')).body.resource).toBe(`${BASE}/mcp?ref=hn`);
+    expect((await prm('/.well-known/oauth-protected-resource/api/meta-toolkit/mcp?ref=hn')).body.resource).toBe(`${BASE}/api/meta-toolkit/mcp?ref=hn`);
+    expect((await prm('/.well-known/oauth-protected-resource/mcp?ref=BAD%20REF')).body.resource).toBe(`${BASE}/mcp`);
+    expect((await prm('/.well-known/oauth-protected-resource/mcp')).body.resource).toBe(`${BASE}/mcp`);
+  });
+
+  it('the 401 challenge points at the ref-bearing metadata URL, never an unescaped value', () => {
+    expect(buildMcpAuthChallenge(BASE, undefined, '/mcp', 'hn')).toContain(`resource_metadata="${BASE}/.well-known/oauth-protected-resource/mcp?ref=hn"`);
+    expect(buildMcpAuthChallenge(BASE, undefined, '/mcp', 'a"b')).not.toContain('a"b');
+    expect(buildMcpAuthChallenge(BASE)).toContain(`resource_metadata="${BASE}/.well-known/oauth-protected-resource/mcp"`);
+  });
+
+  // Route the MCP SDK's own discovery fetches into the express app.
+  const sdkFetch = async (url: string | URL) => {
+    const u = new URL(String(url));
+    const res = await request(app()).get(u.pathname + u.search);
+    return new Response(JSON.stringify(res.body), { status: res.status, headers: { 'content-type': 'application/json' } });
+  };
+
+  for (const [label, resourcePath] of [['Emma /mcp', '/mcp'], ['Zoma meta-toolkit', '/api/meta-toolkit/mcp']] as const) {
+    it(`${label}: the SDK sends a resource that still carries ref, and authorize records it`, async () => {
+      const serverUrl = new URL(`${BASE}${resourcePath}?ref=hn_launch`);
+      const challenge = new Response(null, {
+        status: 401,
+        headers: { 'WWW-Authenticate': buildMcpAuthChallenge(BASE, undefined, resourcePath, 'hn_launch') },
+      });
+      const { resourceMetadataUrl } = extractWWWAuthenticateParams(challenge);
+      const metadata = await discoverOAuthProtectedResourceMetadata(serverUrl, { resourceMetadataUrl }, sdkFetch as any);
+      // The SDK prefers the metadata's resource over its own server URL.
+      const resource = await selectResourceURL(serverUrl, {} as any, metadata);
+      expect(resource?.href).toBe(`${BASE}${resourcePath}?ref=hn_launch`);
+
+      await authorize({ resource: resource!.href });
+      expect(mockSvc.savePendingAuthorization).toHaveBeenCalledWith('c1', 'ch', expect.objectContaining({ ref: 'hn_launch', confidence: 'explicit' }));
+    });
+  }
+
+  it('without the challenge, SDK path-aware discovery keeps the server URL query and still carries ref', async () => {
+    const serverUrl = new URL(`${BASE}/mcp?ref=docs`);
+    const metadata = await discoverOAuthProtectedResourceMetadata(serverUrl, {}, sdkFetch as any);
+    const resource = await selectResourceURL(serverUrl, {} as any, metadata);
+    expect(resource?.href).toBe(`${BASE}/mcp?ref=docs`);
   });
 });
 
