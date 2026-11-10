@@ -1,3 +1,4 @@
+process.env.ZOMA_REQUIRE_PAYMENT_METHOD = 'true';
 /**
  * ENG-2303 P2 acceptance (spec: /home/harsha/zoma-build/SPEC.md):
  *  - zoma_status returns the next step with a direct link: no payment method -> Stripe

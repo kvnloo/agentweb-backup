@@ -1,3 +1,4 @@
+process.env.ZOMA_REQUIRE_PAYMENT_METHOD = 'true';
 /**
  * ENG-2303 P3 acceptance (spec: /home/harsha/zoma-build/SPEC.md, "Guarded writes"):
  *  - a write without a preview is refused (nothing dispatched);

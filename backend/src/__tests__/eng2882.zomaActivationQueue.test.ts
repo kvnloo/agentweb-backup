@@ -1,3 +1,4 @@
+process.env.ZOMA_REQUIRE_PAYMENT_METHOD = 'true';
 import {
   ZomaTrackedUser,
   buildTracker,
