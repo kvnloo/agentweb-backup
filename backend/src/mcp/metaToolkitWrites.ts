@@ -51,6 +51,15 @@ const UPDATE_FIELDS: Record<string, string[]> = {
 };
 export const BID_STRATEGIES = ['LOWEST_COST_WITHOUT_CAP', 'LOWEST_COST_WITH_BID_CAP', 'COST_CAP', 'LOWEST_COST_WITH_MIN_ROAS'];
 const TIME_FIELDS = ['start_time', 'end_time'] as const;
+/** ISO 8601 date-time with an explicit offset; Meta reads offsetless times in the ad account's timezone. */
+const ISO_WITH_OFFSET = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})$/;
+/**
+ * Budget fields the write rate shaper coalesces on (metaWriteRateShaper BUDGET_FIELDS): a repeat
+ * of the same budget is answered "no change" without sending, so it must not carry other edits.
+ */
+const SHAPED_BUDGET_FIELDS = ['daily_budget', 'lifetime_budget', 'budget_amount', 'spend_cap'];
+/** Targeting lists that are removed when a full replacement spec leaves them out. */
+const REMOVABLE_TARGETING_LISTS = ['custom_audiences', 'excluded_custom_audiences', 'flexible_spec', 'exclusions'];
 const MONEY_FIELDS = ['budget_amount', 'daily_budget', 'lifetime_budget', 'bid_amount', 'spend_cap'];
 const CEILING_FIELDS = ['daily_budget', 'lifetime_budget', 'spend_cap', 'bid_amount'] as const;
 // Gate-only flags of the internal path; an external caller never supplies these.
@@ -67,6 +76,8 @@ export interface MetaToolkitWriteDeps {
   ) => Promise<any>;
   dispatch: (userId: string, dispatch: any) => Promise<{ result: any; createdId?: string }>;
   readBack: (userId: string, accountId: string, entity: string, id: string) => Promise<Record<string, any> | null>;
+  /** ENG-2913: throws unless the creative belongs to the selected ad account (creative ids are global). */
+  assertCreativeOwned: (userId: string, accountId: string, creativeId: string) => Promise<void>;
   spendCeilingPolicy: () => MetaSpendCeilingPolicy | null;
   secret: () => string;
   now: () => number;
@@ -99,6 +110,7 @@ const defaultDeps: MetaToolkitWriteDeps = {
   preview: async (...a) => (await ams()).previewToolkitMetaWrite(...a),
   dispatch: async (userId, d) => (await ams()).dispatchToolkitConfirmedMetaWrite(userId, d),
   readBack: async (userId, accountId, entity, id) => (await ams()).readBackMetaWriteTarget(userId, accountId, entity, id),
+  assertCreativeOwned: async (userId, accountId, creativeId) => (await ams()).assertToolkitMetaCreativeOwned(userId, accountId, creativeId),
   spendCeilingPolicy: () => spendCeilingPolicyFromEnv(),
   secret: () => getJwtSecret(),
   now: () => Date.now(),
@@ -144,12 +156,25 @@ function validateWriteShape(entity: string, action: string, args: any): any {
   if (params.status === 'ACTIVE' && keys.length > 1) {
     throw new MetaToolkitRefusal('Activation (status=ACTIVE) must be its own change with its own preview and approval. Change the budget first, then activate separately.');
   }
-  validateEditFields(params);
+  validateEditFields(params, keys);
   return params;
 }
 
 /** ENG-2913: shape checks for the post-launch edit fields. */
-function validateEditFields(params: any) {
+function validateEditFields(params: any, keys: string[]) {
+  const others = (fields: string[]) => keys.filter((k) => !fields.includes(k) && k !== 'status');
+  if (keys.some((k) => SHAPED_BUDGET_FIELDS.includes(k)) && others(SHAPED_BUDGET_FIELDS).length) {
+    throw new MetaToolkitRefusal(
+      `Change the budget or spend cap in its own UPDATE, separately from ${others(SHAPED_BUDGET_FIELDS).join(', ')}. ` +
+        'A repeated budget can be answered "no change" without sending anything, which would drop the other edits.',
+    );
+  }
+  if (params.creative_id !== undefined && keys.some((k) => k !== 'creative_id')) {
+    throw new MetaToolkitRefusal(
+      'Swap the creative (creative_id) in its own UPDATE. Meta applies a creative swap and other ad edits as separate updates, ' +
+        'and allows one update per ad about every 30 seconds, so combining them can leave the ad half-changed.',
+    );
+  }
   if (params.bid_strategy !== undefined && !BID_STRATEGIES.includes(params.bid_strategy)) {
     throw new MetaToolkitRefusal(`bid_strategy must be one of: ${BID_STRATEGIES.join(', ')}.`);
   }
@@ -165,8 +190,8 @@ function validateEditFields(params: any) {
   }
   for (const f of TIME_FIELDS) {
     if (params[f] === undefined) continue;
-    if (typeof params[f] !== 'string' || Number.isNaN(Date.parse(params[f]))) {
-      throw new MetaToolkitRefusal(`${f} must be an ISO 8601 date-time (e.g. 2026-12-01T09:00:00-0800).`);
+    if (typeof params[f] !== 'string' || !ISO_WITH_OFFSET.test(params[f]) || Number.isNaN(Date.parse(params[f]))) {
+      throw new MetaToolkitRefusal(`${f} must be an ISO 8601 date-time with a timezone offset (e.g. 2026-12-01T09:00:00-0800).`);
     }
   }
   if (params.start_time !== undefined && params.end_time !== undefined && Date.parse(params.end_time) <= Date.parse(params.start_time)) {
@@ -267,6 +292,37 @@ export async function executeMetaToolkitWrite(userId: string, rawArgs: any, deps
   const priorId = targetId(entity, args);
   const prior = action === 'UPDATE' && priorId ? await deps.readBack(userId, accountId, entity, priorId).catch(() => null) : null;
   const diff = action === 'UPDATE' ? fieldDiffLines(params, money.params, prior) : [];
+  if (action === 'UPDATE' && params.creative_id !== undefined) {
+    try {
+      await deps.assertCreativeOwned(userId, accountId, String(params.creative_id));
+    } catch {
+      throw new MetaToolkitRefusal(`Creative ${params.creative_id} was not found in ad account ${accountId}. Nothing was changed.`);
+    }
+  }
+  // A schedule change on a live ad set can start or extend delivery (e.g. a past end_time moved
+  // into the future), so it gets the same treatment as an activation: its own change, current
+  // status known, and the enable spend ceiling.
+  const scheduleChange = action === 'UPDATE' && TIME_FIELDS.some((f) => params[f] !== undefined);
+  let scheduleBudgetState: Record<string, any> | undefined;
+  if (scheduleChange) {
+    if (!prior?.status) throw new MetaToolkitRefusal('Could not read the current status of this ad set, so its schedule was not changed. Try again.');
+    if (prior.status === 'ACTIVE') {
+      const extra = Object.keys(params).filter((k) => params[k] !== undefined && !TIME_FIELDS.includes(k as any));
+      if (extra.length) {
+        throw new MetaToolkitRefusal(`This ad set is ACTIVE: change its schedule in its own UPDATE, separately from ${extra.join(', ')}.`);
+      }
+      if (policy) {
+        const budget = prior.daily_budget != null && Number(prior.daily_budget) !== 0
+          ? prior
+          : prior.campaign_id
+            ? await deps.readBack(userId, accountId, 'CAMPAIGN', String(prior.campaign_id)).catch(() => null)
+            : null;
+        scheduleBudgetState = { budget };
+        const verdict = evaluateMetaSpendCeiling(policy, { field: 'daily_budget', proposed: budget?.daily_budget });
+        if (!verdict.allowed) throw new MetaToolkitRefusal(`Changing the schedule of this ACTIVE ad set can start spend at its budget. ${verdict.message}`);
+      }
+    }
+  }
   if (policy) {
     for (const field of CEILING_FIELDS) {
       if (money.params[field] === undefined) continue;
@@ -290,6 +346,7 @@ export async function executeMetaToolkitWrite(userId: string, rawArgs: any, deps
     summary: preview.summary, budgetAnomaly: preview.budgetAnomaly ?? null, money: money.confirmation,
     ...(diff.length ? { diff } : {}),
     ...(enableBudgetState ? { enableBudgetState } : {}),
+    ...(scheduleBudgetState ? { scheduleBudgetState } : {}),
   });
   const now = deps.now();
   const secret = deps.secret();
@@ -300,6 +357,7 @@ export async function executeMetaToolkitWrite(userId: string, rawArgs: any, deps
     money.confirmation ? `Money${money.confirmation}` : '',
     diff.length ? `Changes (current → proposed):\n${diff.join('\n')}` : '',
     params.targeting !== undefined ? 'Targeting is replaced as a whole by the proposed spec; anything not in it is removed.' : '',
+    scheduleChange && prior?.status === 'ACTIVE' ? 'This ad set is ACTIVE: the new schedule can start or extend delivery (and spend) as soon as it is applied.' : '',
     statusLine(action, params),
   ].filter(Boolean).join('\n');
   const freshPreview = () => previewResponse({ secret, userId, now, fingerprint, preview: previewText });
@@ -377,18 +435,26 @@ function verify(action: string, params: any, minor: any, readBack: Record<string
   if (params.targeting !== undefined) {
     if (!readBack.targeting || typeof readBack.targeting !== 'object') return 'UNCONFIRMED';
     if (!targetingApplied(params.targeting, readBack.targeting)) return 'MISMATCH';
+    // A full replacement that leaves out a list (e.g. drops all exclusions) must remove it.
+    for (const key of REMOVABLE_TARGETING_LISTS) {
+      if (params.targeting[key] === undefined && Array.isArray(readBack.targeting[key]) && readBack.targeting[key].length) return 'MISMATCH';
+    }
   }
   return 'CONFIRMED';
 }
 
 /**
- * Meta enriches targeting on read (names, defaults, automation flags), so the check is
- * containment: every value sent must be present in what Meta reports. Lists of objects match
- * by `id`/`key` when they have one; lists of primitives match as sets.
+ * Meta enriches targeting on read (names, defaults, automation flags), so objects are checked
+ * by containment: every key sent must be present in what Meta reports. Lists must match
+ * exactly as sets (Meta does not add list items): objects by `id`/`key` when they have one,
+ * primitives by value. An empty list (or null) sent means "none", matched by an absent field.
  */
 export function targetingApplied(sent: any, got: any): boolean {
+  if (sent === null || (Array.isArray(sent) && sent.length === 0)) {
+    return got === undefined || got === null || (Array.isArray(got) && got.length === 0);
+  }
   if (Array.isArray(sent)) {
-    if (!Array.isArray(got)) return false;
+    if (!Array.isArray(got) || got.length !== sent.length) return false;
     return sent.every((item) => {
       if (item && typeof item === 'object') {
         const k = item.id !== undefined ? 'id' : item.key !== undefined ? 'key' : null;

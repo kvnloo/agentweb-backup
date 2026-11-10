@@ -15583,6 +15583,13 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   }
 
   /** Read-back after a toolkit write: status + effective status + budgets, ownership-scoped. */
+  /** ENG-2913: a creative swapped into an ad must belong to the selected ad account (creative ids are global). */
+  public async assertToolkitMetaCreativeOwned(userId: string, account_id: string, creativeId: string): Promise<void> {
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    const creative: any = await metaService.getAdCreative(accessToken, creativeId);
+    MetaService.assertOwnedByAccount(creative?.account_id, creativeId, 'Ad creative', accountId);
+  }
+
   public async readBackMetaWriteTarget(userId: string, account_id: string, entity_type: string, id: string) {
     const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
     return readBackMetaNode(metaService, accountId, accessToken, entity_type, id);
