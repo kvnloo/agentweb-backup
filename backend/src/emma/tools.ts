@@ -1988,13 +1988,13 @@ emmaToolRegistry.register({
   requiresUserAccount: true,
   definition: {
     name: 'update_brand_guidelines',
-    description: 'Update the user\'s brand guidelines. IMPORTANT: Use read_brand_guidelines first to fetch the latest data, then only update the fields that need to be changed. Can update both brand data and brand assets (logos, brand guides, etc.). NOTE: SVG files are NOT allowed for logo or secondaryLogo uploads. If the user provides an SVG file, ask them to convert it to PNG or another raster format first. RE-SETUP SCOPE: when the user asks for a broad brand re-setup or refresh (NOT a single-field edit like changing just the tagline or one color), pass refreshMarketStrategy=true so the same operation also refreshes market strategy positioning by regenerating ICPs and competitors from the updated brand. This REPLACES current ICPs and competitors while preserving the business overview. For a small single-field edit, leave refreshMarketStrategy false/omitted.',
+    description: 'Update the user\'s brand guidelines. IMPORTANT: Use read_brand_guidelines first to fetch the latest data, then only update the fields that need to be changed. FOUNDERS: omit founders unless you are changing founders. If you send founders, send the COMPLETE list — any stored founder you leave out is removed (fields you omit are kept for founders matched by name). An empty founders array is ignored unless clearAllFounders=true. Can update both brand data and brand assets (logos, brand guides, etc.). NOTE: SVG files are NOT allowed for logo or secondaryLogo uploads. If the user provides an SVG file, ask them to convert it to PNG or another raster format first. RE-SETUP SCOPE: when the user asks for a broad brand re-setup or refresh (NOT a single-field edit like changing just the tagline or one color), pass refreshMarketStrategy=true so the same operation also refreshes market strategy positioning by regenerating ICPs and competitors from the updated brand. This REPLACES current ICPs and competitors while preserving the business overview. For a small single-field edit, leave refreshMarketStrategy false/omitted.',
     inputSchema: {
       type: 'object',
       properties: {
         brandData: {
           type: 'object',
-          description: 'Brand data object with only the fields that need to be updated',
+          description: 'Brand data object with only the fields that need to be updated (founders, if sent, is the complete founder list — omitted founders are removed)',
           properties: {
             brandName: { type: 'string', description: 'Brand name' },
             tagline: { type: 'string', description: 'Brand tagline or slogan' },
@@ -2032,7 +2032,7 @@ emmaToolRegistry.register({
                 },
                 required: ['name']
               },
-              description: 'Array of founder profiles'
+              description: 'Complete list of founder profiles. This list replaces the stored founders: always include every founder that should remain (fields you omit are kept for founders matched by name); founders left out are removed.'
             }
           }
         },
@@ -2047,6 +2047,10 @@ emmaToolRegistry.register({
               filename: { type: 'string', description: 'Original filename of the brand asset' }
             }
           }
+        },
+        clearAllFounders: {
+          type: 'boolean',
+          description: 'Set true together with brandData.founders: [] only when the user explicitly asks to remove every founder profile.'
         },
         refreshMarketStrategy: {
           type: 'boolean',
