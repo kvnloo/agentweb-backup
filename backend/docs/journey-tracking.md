@@ -18,6 +18,11 @@ One shared AgentWeb account serves Zoma, Emma MCP and the Emma web app. Product 
 | Portal Google signup | emma_web | inferred |
 | anything else | unknown | unknown |
 
+The confidence column is the internal derivation. On the AW-Users row and the PostHog person /
+`signed_up` event, `attributionConfidence` uses the contract enum `tracked | inferred | verified`:
+`explicit` is written as `tracked`, `inferred` as `inferred`, and `unknown` is omitted. Nothing
+emits `verified` yet.
+
 Every MCP usage event (`Dev-AW-LoopEvents` / prod `AW-LoopEvents`, loop `emma-mcp`) now carries
 `dimensions.product`. Events written before ENG-2906 have no `product`; read a missing value as
 "not tracked", not as `unknown`.
@@ -38,6 +43,14 @@ it onto every successor. A legacy code/token simply has no `product`.
 (or inside the `resource` URL's query), and `POST /api/zoma/setup` (`ref` in body or query —
 stored on the device record and forwarded to the authorize URL). It becomes `signupRef` at signup.
 
+MCP clients send the protected-resource metadata's `resource` (not their own server URL) to
+`/oauth/authorize`, so the ref is carried there by the server: an unauthenticated `/mcp?ref=x`
+(or `/api/meta-toolkit/mcp?ref=x`) gets a 401 whose `resource_metadata` is
+`/.well-known/oauth-protected-resource/<path>?ref=x`, and that document answers
+`resource: <backend>/<path>?ref=x`. The MCP SDK also keeps the server URL's query on path-aware
+metadata discovery, so the ref arrives even without the challenge. `/oauth/authorize` then reads
+it from `resource`. Product derivation ignores the query.
+
 ## AW-Users fields (key: email)
 
 All writes are single conditional `UpdateItem`s guarded by `attribute_exists(email)` (never
@@ -46,7 +59,11 @@ upsert a ghost row, never read-modify-write).
 - `signupProduct`, `signupPath` (`oauth_direct` | `zoma_device` | `api_key` | `webapp`),
   `signupClient`, `signupRef`, `attributionConfidence` — write-once as a set
   (`if_not_exists` under `attribute_not_exists(signupPath)`). OAuth/device signups are only
-  attributed when the account's `createdAt` is within the last hour (created on the consent page).
+  attributed for an account created on the MCP consent page: register stamps such rows
+  `signupSource = "mcp"` and the consent decision (or the `MCP_OAUTH_SKIP_CONSENT` fast path, or
+  the Zoma device approval) requires that marker. Account age is never used, so an existing
+  user approving a new client is never counted as a signup. A `zoma` signup also moves
+  `zomaStage` to `signed_up`.
   `api_key` is reserved: no current surface creates accounts via an API key.
 - `products.<product> = { firstAt, lastAt }` — `firstAt` write-once; `lastAt` bumped at most
   hourly per user/product.
@@ -57,6 +74,9 @@ upsert a ghost row, never read-modify-write).
   `zoma_` token (`connected`) is issued after Meta and payment, so the stage is already past it.
   Shared surfaces (Meta/Google connect, Stripe) only move the stage for users that already have
   `products.zoma`.
+- `zomaFirstReadAt`, `zomaFirstWriteAt` — write-once milestone timestamps
+  (`attribute_not_exists`), independent of the stage, so a first write before the first read
+  still records (and emits) `first_read` once.
 
 **No backfill.** Existing users get these fields only from new events after deploy.
 
@@ -66,7 +86,7 @@ upsert a ghost row, never read-modify-write).
 `zoma_` token issued) · `meta_connected` / `google_connected` · `card_saved` (Stripe-verified
 setup Checkout, or payment readiness at token issue) · `first_read` (first successful toolkit
 read) · `first_write` (first executed toolkit write, `recordMcpWriteExecuted`). `first_*` are
-emitted once, when the stage write moves forward.
+each emitted once, when their milestone field is first set.
 
 - `ad_live` — **stub only.** Hook point: when a delivering ad is first observed (e.g. the Zoma
   insights read returns `effective_status=ACTIVE` with impressions > 0), call
