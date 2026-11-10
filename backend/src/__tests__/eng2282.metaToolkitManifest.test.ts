@@ -32,7 +32,7 @@ import {
 import { ZOMA_TOOL_NAMES } from '../mcp/zomaToolDefinitions';
 
 // ENG-2303: the toolkit also advertises toolkit-local Zoma onboarding tools (not registry tools).
-const EXPECTED_TOOLKIT_NAMES = [...META_TOOLKIT_V1_TOOL_NAMES, ...ZOMA_TOOL_NAMES];
+const EXPECTED_TOOLKIT_NAMES = [...META_TOOLKIT_V1_TOOL_NAMES, 'ads_get_datasets', 'ads_get_dataset_details', 'ads_get_dataset_stats', 'ads_pixel_event_read', 'ads_get_customconversions', ...ZOMA_TOOL_NAMES];
 
 const ctx = { userId: 'user-1', sessionId: 's-1' };
 
@@ -44,7 +44,7 @@ describe('ENG-2282 Meta Toolkit manifest', () => {
     expect(manifest.map((d: any) => d.name)).toEqual(EXPECTED_TOOLKIT_NAMES);
     expect(emmaToolRegistry.getToolNames().length).toBeGreaterThan(manifest.length + 10);
     for (const def of manifest.filter((d: any) => !d.name.startsWith('zoma_'))) {
-      expect(def.name).toMatch(/meta/);
+      expect(def.name).toMatch(/meta|^ads_/);
       expect(typeof def.description).toBe('string');
       expect(def.inputSchema?.type).toBe('object');
     }

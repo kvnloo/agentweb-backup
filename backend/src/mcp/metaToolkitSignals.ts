@@ -1,0 +1,74 @@
+import axios from 'axios';
+import { MetaToolkitRefusal } from './metaToolkitErrors';
+
+export const SIGNAL_FIELDS = {
+  datasets: 'id,name,last_fired_time,is_created_by_business',
+  details: 'id,name,last_fired_time,is_created_by_business,owner_business',
+  conversions: 'id,name,pixel,rule,custom_event_type,is_archived',
+};
+
+const names = ['ads_get_datasets', 'ads_get_dataset_details', 'ads_get_dataset_stats', 'ads_pixel_event_read', 'ads_get_customconversions'] as const;
+export function isSignalsRead(name: string): boolean { return (names as readonly string[]).includes(name); }
+export const SIGNAL_READ_DEFINITIONS = names.map((name) => ({
+  name,
+  description: ({
+    ads_get_datasets: 'List datasets (ad pixels) connected to the selected Meta ad account. Read-only; returns one page and paging cursors.',
+    ads_get_dataset_details: 'Read a dataset/pixel belonging to the selected ad account.',
+    ads_get_dataset_stats: 'Read dataset/pixel event stats for the selected ad account.',
+    ads_pixel_event_read: 'Read existing pixel event rules through the documented event_rules edge. Availability depends on Meta permissions and API version.',
+    ads_get_customconversions: 'List custom conversions in the selected Meta ad account. Read-only; returns one page and paging cursors.',
+  })[name],
+  inputSchema: {
+    type: 'object',
+    properties: {
+      account_id: { type: 'string', description: 'Connected Meta ad account; optional when exactly one is connected.' },
+      ...(!['ads_get_datasets', 'ads_get_customconversions'].includes(name) ? { pixel_id: { type: 'string', pattern: '^[0-9]+$' } } : {}),
+      ...(['ads_get_datasets', 'ads_get_customconversions', 'ads_pixel_event_read'].includes(name) ? {
+        limit: { type: 'integer', minimum: 1, maximum: 100 }, after: { type: 'string' },
+      } : {}),
+      ...(name === 'ads_get_dataset_stats' ? {
+        aggregation: { type: 'string', enum: ['event', 'match_keys', 'url', 'host', 'device_type', 'pixel_fire'] },
+        start_time: { type: 'string' }, end_time: { type: 'string' },
+      } : {}),
+    },
+    ...(!['ads_get_datasets', 'ads_get_customconversions'].includes(name) ? { required: ['pixel_id'] } : {}),
+    additionalProperties: false,
+  },
+}));
+
+/** Uses the existing Graph HTTP client; credentials are resolved server-side, never caller supplied. */
+export async function executeSignalsRead(
+  name: string, args: any, credentials: { accountId: string; accessToken: string },
+  graph: Pick<typeof axios, 'get'> = axios,
+) {
+  const def = SIGNAL_READ_DEFINITIONS.find((d) => d.name === name);
+  if (!def) throw new MetaToolkitRefusal('Unknown signals read tool.');
+  for (const key of Object.keys(args)) {
+    if (!(key in def.inputSchema.properties)) throw new MetaToolkitRefusal(`Unsupported signals argument: ${key}`);
+  }
+  if (args.limit !== undefined && (!Number.isInteger(args.limit) || args.limit < 1 || args.limit > 100)) throw new MetaToolkitRefusal('limit must be an integer from 1 to 100.');
+  for (const key of ['after', 'start_time', 'end_time', 'aggregation']) {
+    if (args[key] !== undefined && typeof args[key] !== 'string') throw new MetaToolkitRefusal(`${key} must be a string.`);
+  }
+  if (args.aggregation !== undefined && !['event', 'match_keys', 'url', 'host', 'device_type', 'pixel_fire'].includes(args.aggregation)) throw new MetaToolkitRefusal('Unsupported aggregation.');
+  const base = `https://graph.facebook.com/${process.env.META_API_VERSION || 'v25.0'}`;
+  const account = `act_${credentials.accountId.replace(/^act_/, '')}`;
+  const get = async (path: string, params: Record<string, unknown> = {}) => (await graph.get(`${base}/${path}`, { params: { ...params, access_token: credentials.accessToken } })).data;
+  const page = { limit: args.limit ?? 100, ...(args.after !== undefined ? { after: args.after } : {}) };
+  if (name === 'ads_get_datasets') return get(`${account}/adspixels`, { fields: SIGNAL_FIELDS.datasets, ...page });
+  if (name === 'ads_get_customconversions') return get(`${account}/customconversions`, { fields: SIGNAL_FIELDS.conversions, ...page });
+  if (typeof args.pixel_id !== 'string' || !/^\d+$/.test(args.pixel_id)) throw new MetaToolkitRefusal('pixel_id must be a numeric string.');
+  // Pixel nodes are globally addressed: prove membership in this selected account before reading.
+  let after: string | undefined;
+  const seen = new Set<string>();
+  for (;;) {
+    const owned = await get(`${account}/adspixels`, { fields: 'id', limit: 100, ...(after ? { after } : {}) });
+    if (owned?.data?.some((p: any) => String(p.id) === args.pixel_id)) break;
+    const next = owned?.paging?.next ? owned?.paging?.cursors?.after : undefined;
+    if (typeof next !== 'string' || !next || seen.has(next)) throw new MetaToolkitRefusal('That pixel is not in the selected ad account.');
+    seen.add(next); after = next;
+  }
+  if (name === 'ads_get_dataset_details') return get(args.pixel_id, { fields: SIGNAL_FIELDS.details });
+  if (name === 'ads_pixel_event_read') return get(`${args.pixel_id}/event_rules`, page);
+  return get(`${args.pixel_id}/stats`, Object.fromEntries(['aggregation', 'start_time', 'end_time'].filter((k) => args[k] !== undefined).map((k) => [k, args[k]])));
+}

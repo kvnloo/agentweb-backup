@@ -20,6 +20,7 @@ import {
 } from '../services/connectedAccountsDb';
 import { recordMcpToolUse, recordMcpWriteExecuted, type McpAuthMethod } from '../services/mcpUsageEventsService';
 import { executeMetaToolkitCall, getMetaToolkitManifest, MetaToolkitRefusal } from './metaToolkitManifest';
+import { isSignalsRead } from './metaToolkitSignals';
 import { RateLimiter } from '../middleware/rateLimiter';
 import { effectiveApiKeyScopes, findScopeDenial } from './server/apiKeyScopes';
 import { isZomaTool } from './zomaToolDefinitions';
@@ -264,6 +265,13 @@ export async function handleMetaToolkitCall(
   );
   const accountId = await resolveMetaToolkitAdAccount(caller.userId, args.account_id, deps);
   if (toolAcceptsAccountId(request.toolName)) args.account_id = accountId;
+
+  if (isSignalsRead(request.toolName)) {
+    const { agentModeService } = await import('../services/agentModeService');
+    const result = await agentModeService.readToolkitMetaSignals(caller.userId, request.toolName, args);
+    await meter('meta');
+    return stripCredentials(result);
+  }
 
   // ENG-2303 P3: CAMPAIGN/AD_SET/AD CREATE + status/budget UPDATE go through the guarded
   // preview→confirm path; every other write stays refused by assertMetaToolkitV1Call.

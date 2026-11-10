@@ -15545,6 +15545,13 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     return { result, createdId: AgentModeService.extractDispatchedObjectId(result) };
   }
 
+  /** Read-only signals tools reuse the same account-bound credential resolver as other toolkit reads. */
+  public async readToolkitMetaSignals(userId: string, name: string, args: any) {
+    const credentials = await this.getMetaCredentials(userId, args.account_id);
+    const { executeSignalsRead } = await import('../mcp/metaToolkitSignals');
+    return executeSignalsRead(name, args, credentials);
+  }
+
   /**
    * Zoma creative upload: Meta processing state of an uploaded video, ownership-scoped to the
    * selected ad account (a video id addresses a node globally). Returns Meta's preferred

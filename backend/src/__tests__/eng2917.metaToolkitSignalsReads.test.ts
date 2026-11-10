@@ -1,0 +1,69 @@
+jest.mock('../services/agentApiKeyService', () => ({ agentApiKeyService: {} }));
+jest.mock('../mcp/oauth/oauthService', () => ({ mcpOAuthService: {} }));
+jest.mock('../services/connectedAccountsDb', () => ({ getAccountsByUserIdIncludingOrgShared: jest.fn() }));
+jest.mock('../services/mcpUsageEventsService', () => ({ recordMcpToolUse: jest.fn(), recordMcpWriteExecuted: jest.fn() }));
+jest.mock('../services/agentModeService', () => ({ agentModeService: { readToolkitMetaSignals: jest.fn().mockResolvedValue({ data: [] }) } }));
+import { executeSignalsRead, SIGNAL_READ_DEFINITIONS, SIGNAL_FIELDS } from '../mcp/metaToolkitSignals';
+import { getMetaToolkitManifest } from '../mcp/metaToolkitManifest';
+import { handleMetaToolkitCall } from '../mcp/metaToolkitGateway';
+import { agentModeService } from '../services/agentModeService';
+const credentials = { accountId: '123', accessToken: 'secret' };
+describe('ENG-2917 signals reads', () => {
+  beforeEach(() => jest.clearAllMocks());
+  it.each(SIGNAL_READ_DEFINITIONS.map(d => [d.name]))('%s is advertised and works with only read scope', async name => {
+    expect(getMetaToolkitManifest().some(d => d.name === name)).toBe(true);
+    const recordWrite = jest.fn();
+    const recordUsage = jest.fn();
+    await handleMetaToolkitCall({ authorization: 'Bearer aw_fixture', toolName: name }, {
+      validateApiKey: jest.fn().mockResolvedValue({ userId: 'u1', keyId: 'k1', scopes: ['tools:read'] }),
+      listAccounts: jest.fn().mockResolvedValue([{ platform: 'meta', account_id: '123', config: { account_type: 'ad_account', ad_account_id: '123', access_token: 'x' } }]),
+      recordUsage, recordWrite, now: () => 0,
+      rateLimiter: { check: () => ({ allowed: true }) },
+    } as any);
+    expect(agentModeService.readToolkitMetaSignals).toHaveBeenCalledWith('u1', name, { account_id: '123' });
+    expect(recordUsage).toHaveBeenCalledTimes(1);
+    expect(recordWrite).not.toHaveBeenCalled();
+  });
+  it.each([
+    ['ads_get_datasets', 'act_123/adspixels', SIGNAL_FIELDS.datasets],
+    ['ads_get_customconversions', 'act_123/customconversions', SIGNAL_FIELDS.conversions],
+    ['ads_get_dataset_details', '456', SIGNAL_FIELDS.details],
+    ['ads_get_dataset_stats', '456/stats', undefined],
+    ['ads_pixel_event_read', '456/event_rules', undefined],
+  ])('%s requests the correct path and fields', async (name, path, fields) => {
+    const get = jest.fn().mockResolvedValue({ data: { data: [{ id: '456' }] } });
+    const args = ['ads_get_datasets', 'ads_get_customconversions'].includes(name!) ? {} : { pixel_id: '456' };
+    await executeSignalsRead(name!, args, credentials, { get } as any);
+    expect(get).toHaveBeenLastCalledWith(expect.stringContaining('/' + path), { params: expect.objectContaining({ access_token: 'secret', ...(fields ? { fields } : {}) }) });
+  });
+  it('passes stats aggregation and time range', async () => {
+    const get = jest.fn().mockResolvedValue({ data: { data: [{ id: '456' }] } });
+    await executeSignalsRead('ads_get_dataset_stats', { pixel_id: '456', aggregation: 'event', start_time: '123', end_time: '234' }, credentials, { get } as any);
+    expect(get.mock.calls[1][1].params).toEqual({ access_token: 'secret', aggregation: 'event', start_time: '123', end_time: '234' });
+  });
+  it('paginates ownership with cursors rather than untrusted next URLs', async () => {
+    const get = jest.fn().mockResolvedValueOnce({ data: { data: [], paging: { next: 'https://untrusted.invalid', cursors: { after: 'next-page' } } } }).mockResolvedValue({ data: { data: [{ id: '456' }] } });
+    await executeSignalsRead('ads_get_dataset_details', { pixel_id: '456' }, credentials, { get } as any);
+    expect(get.mock.calls[1][1].params.after).toBe('next-page');
+    expect(get).toHaveBeenCalledTimes(3);
+  });
+  it('denies keys without read scope before account resolution', async () => {
+    const listAccounts = jest.fn();
+    await expect(handleMetaToolkitCall({ authorization: 'Bearer aw_fixture', toolName: 'ads_get_datasets' }, {
+      validateApiKey: jest.fn().mockResolvedValue({ userId: 'u1', keyId: 'k1', scopes: ['email:read'] }),
+      listAccounts, now: () => 0, rateLimiter: { check: () => ({ allowed: true }) },
+    } as any)).rejects.toMatchObject({ status: 403 });
+    expect(listAccounts).not.toHaveBeenCalled();
+    expect(agentModeService.readToolkitMetaSignals).not.toHaveBeenCalled();
+  });
+  it('refuses foreign pixels before node reads', async () => {
+    const get = jest.fn().mockResolvedValue({ data: { data: [] } });
+    await expect(executeSignalsRead('ads_get_dataset_stats', { pixel_id: '456' }, credentials, { get } as any)).rejects.toThrow('not in the selected');
+    expect(get).toHaveBeenCalledTimes(1);
+  });
+  it.each([{ pixel_id: '../me' }, { pixel_id: '456', access_token: 'evil' }, { pixel_id: '456', limit: 0 }])('rejects invalid input before Graph calls', async args => {
+    const get = jest.fn();
+    await expect(executeSignalsRead('ads_pixel_event_read', args, credentials, { get } as any)).rejects.toThrow();
+    expect(get).not.toHaveBeenCalled();
+  });
+});
