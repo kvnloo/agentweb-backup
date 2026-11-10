@@ -19,8 +19,10 @@ export const MCP_TOOL_SIDE_EFFECTS: Readonly<Record<string, McpToolSideEffect>> 
   assess_client_health: 'write',
   check_account_tracking_health: 'write',
   configure_landing_page_subdomain: 'write',
+  create_knowledge_base_file: 'write',
   create_lead_list: 'write',
   create_schedule_from_template: 'write',
+  delete_knowledge_base_file: 'write',
   delete_landing_page: 'write',
   deploy_landing_page: 'write',
   diagnose_leads_at_zero: 'write',
@@ -114,6 +116,7 @@ export const MCP_TOOL_SIDE_EFFECTS: Readonly<Record<string, McpToolSideEffect>> 
   share_landing_page_with_org: 'write',
   submit_scheduled_chat_variables: 'write',
   test_scheduled_chat: 'write',
+  update_knowledge_base_file_content: 'write',
   update_landing_page_context: 'write',
 });
 
