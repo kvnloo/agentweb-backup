@@ -270,7 +270,8 @@ export async function handleMetaToolkitCall(
   if (isSignalsRead(request.toolName)) {
     const { agentModeService } = await import('../services/agentModeService');
     const result = await agentModeService.readToolkitMetaSignals(caller.userId, request.toolName, args);
-    await meter('meta');
+    // A Meta failure comes back as success:false (not thrown); like a refusal, it is not metered.
+    if ((result as any)?.success !== false) await meter('meta');
     return stripCredentials(result);
   }
 
@@ -278,7 +279,8 @@ export async function handleMetaToolkitCall(
   if (isExperimentRead(request.toolName)) {
     const { agentModeService } = await import('../services/agentModeService');
     const result = await agentModeService.readToolkitMetaExperiments(caller.userId, request.toolName, args);
-    await meter('meta');
+    // A Meta failure comes back as success:false (not thrown); like a refusal, it is not metered.
+    if ((result as any)?.success !== false) await meter('meta');
     return stripCredentials(result);
   }
 

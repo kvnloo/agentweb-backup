@@ -24,6 +24,18 @@ describe('ENG-2917 signals reads', () => {
     expect(recordUsage).toHaveBeenCalledTimes(1);
     expect(recordWrite).not.toHaveBeenCalled();
   });
+  it('does not meter a signals read that Meta failed (success:false)', async () => {
+    (agentModeService.readToolkitMetaSignals as jest.Mock).mockResolvedValueOnce({ success: false, errorClass: 'upstream_5xx' });
+    const recordUsage = jest.fn();
+    const result = await handleMetaToolkitCall({ authorization: 'Bearer aw_fixture', toolName: 'ads_get_datasets' }, {
+      validateApiKey: jest.fn().mockResolvedValue({ userId: 'u1', keyId: 'k1', scopes: ['tools:read'] }),
+      listAccounts: jest.fn().mockResolvedValue([{ platform: 'meta', account_id: '123', config: { account_type: 'ad_account', ad_account_id: '123', access_token: 'x' } }]),
+      recordUsage, recordWrite: jest.fn(), now: () => 0,
+      rateLimiter: { check: () => ({ allowed: true }) },
+    } as any);
+    expect((result as any).success).toBe(false);
+    expect(recordUsage).not.toHaveBeenCalled();
+  });
   it.each([
     ['ads_get_datasets', 'act_123/adspixels', SIGNAL_FIELDS.datasets],
     ['ads_get_customconversions', 'act_123/customconversions', SIGNAL_FIELDS.conversions],
