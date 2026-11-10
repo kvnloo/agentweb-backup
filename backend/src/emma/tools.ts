@@ -9672,9 +9672,13 @@ emmaToolRegistry.register({
     if (hasScheme || /[./]/.test(raw)) {
       let host = '';
       try { host = new URL(hasScheme ? raw : `https://${raw}`).hostname.toLowerCase(); } catch { /* treated as non-Google below */ }
-      if (!/(^|\.)(docs|drive|sheets)\.google\.com$/.test(host)) {
+      if (!/^(docs|drive|sheets)\.google\.com$/.test(host)) {
+        // blocked+reason marks this a by-design refusal (ToolResultPolicyBlockedError)
+        // so a retried bad URL does not trip the repeated-failure breaker (CodeRabbit #3960).
         return {
           success: false,
+          blocked: true,
+          reason: 'non_google_url',
           message: `Not a Google Docs/Sheets/Drive URL (${host || raw}): read_google_doc only reads Google files. Use a web page fetch tool for other URLs.`,
         };
       }

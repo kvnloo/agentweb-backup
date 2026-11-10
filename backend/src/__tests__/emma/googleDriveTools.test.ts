@@ -173,6 +173,18 @@ describe('read_google_doc — URL parsing', () => {
     expect(mockReadGoogleFileById).not.toHaveBeenCalled();
   });
 
+  it('refuses a google.com subdomain outside the three hosts, as a by-design block (ENG-2907)', async () => {
+    const tool = await getTool('read_google_doc');
+    const result = await tool.execute(
+      { url_or_id: 'https://unrelated.docs.google.com/page' },
+      { userId: USER },
+    );
+    expect(result.success).toBe(false);
+    expect(result.blocked).toBe(true);
+    expect(result.reason).toBe('non_google_url');
+    expect(mockReadGoogleFileById).not.toHaveBeenCalled();
+  });
+
   it('refuses a scheme-less non-Google link without calling Drive (ENG-2907)', async () => {
     const tool = await getTool('read_google_doc');
     const result = await tool.execute(
