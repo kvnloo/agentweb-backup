@@ -473,6 +473,7 @@ describe('MCP OAuth Routes', () => {
         clientId: 'client-123',
         clientName: undefined,
         clientType: 'unknown',
+        product: 'unknown', // ENG-2906: every event names its product; no resource here
         redirectUri: 'https://example.com/callback',
         scope: 'mcp:tools',
       });
@@ -597,6 +598,7 @@ describe('MCP OAuth Routes', () => {
         clientId: 'client-123',
         clientName: undefined,
         clientType: 'unknown',
+        product: 'unknown', // ENG-2906: every event names its product; no resource here
         redirectUri: 'https://example.com/callback',
         scope: 'mcp:tools',
       });
