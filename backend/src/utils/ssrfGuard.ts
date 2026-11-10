@@ -67,6 +67,10 @@ function isPrivateIPv4(ip: string): boolean {
   if (((raw & 0xff000000) >>> 0) === 0x00000000) return true;
   // 224.0.0.0/4 (multicast)
   if (((raw & 0xf0000000) >>> 0) === 0xe0000000) return true;
+  // 192.0.0.0/24 (IETF protocol assignments)
+  if (((raw & 0xffffff00) >>> 0) === 0xc0000000) return true;
+  // 198.18.0.0/15 (benchmarking; reachable inside some networks)
+  if (((raw & 0xfffe0000) >>> 0) === 0xc6120000) return true;
   // 240.0.0.0/4 (class E reserved — includes 255.255.255.255 broadcast)
   if (((raw & 0xf0000000) >>> 0) === 0xf0000000) return true;
   return false;
@@ -96,6 +100,19 @@ function isPrivateIPv6(ip: string): boolean {
     return isPrivateIPv4(dotted);
   }
 
+  // ENG-2915: addresses that embed an IPv4 address the network may translate and route to:
+  // 64:ff9b::/96 (NAT64), 2002::/16 (6to4) and ::/96 (deprecated IPv4-compatible). Check the
+  // embedded address; ::/96 itself is never a legitimate destination.
+  const hextets = expandIPv6(lower);
+  if (hextets) {
+    const v4 = (hi: number, lo: number) => `${hi >> 8}.${hi & 0xff}.${lo >> 8}.${lo & 0xff}`;
+    if (hextets[0] === 0x64 && hextets[1] === 0xff9b && hextets.slice(2, 6).every((h) => h === 0)) {
+      return isPrivateIPv4(v4(hextets[6], hextets[7]));
+    }
+    if (hextets[0] === 0x2002) return isPrivateIPv4(v4(hextets[1], hextets[2]));
+    if (hextets.slice(0, 6).every((h) => h === 0)) return true;
+  }
+
   // fc00::/7 (Unique Local Address): first byte 0xfc or 0xfd
   if (/^f[cd][0-9a-f]{2}:/.test(lower)) return true;
 
@@ -111,6 +128,26 @@ function isPrivateIPv6(ip: string): boolean {
   if (/^ff[0-9a-f]{2}:/.test(lower)) return true;
 
   return false;
+}
+
+/** Eight 16-bit groups of an IPv6 address (handles `::` and a trailing dotted IPv4), or null. */
+function expandIPv6(ip: string): number[] | null {
+  let text = ip.split('%')[0];
+  const dotted = text.match(/^(.*:)(\d+\.\d+\.\d+\.\d+)$/);
+  if (dotted) {
+    const n = ipv4ToInt(dotted[2]);
+    if (n === null) return null;
+    text = `${dotted[1]}${(n >>> 16).toString(16)}:${(n & 0xffff).toString(16)}`;
+  }
+  const halves = text.split('::');
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(':') : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+  const fill = halves.length === 2 ? 8 - head.length - tail.length : 0;
+  if (fill < 0) return null;
+  const parts = [...head, ...Array(fill).fill('0'), ...tail];
+  if (parts.length !== 8 || parts.some((h) => !/^[0-9a-f]{1,4}$/.test(h))) return null;
+  return parts.map((h) => parseInt(h, 16));
 }
 
 function isPrivateIP(ip: string): boolean {
@@ -329,6 +366,9 @@ async function defaultPinnedRequest(
   return axios.get(url, {
     responseType: 'arraybuffer',
     timeout: timeoutMs,
+    // axios `timeout` is a socket-idle timer on Node; the signal bounds total time, so a server
+    // that trickles bytes cannot hold the call open.
+    signal: AbortSignal.timeout(timeoutMs),
     // Abort mid-stream once the body exceeds the cap, so an unbounded response
     // is never fully buffered into memory (Greptile P1).
     maxContentLength: maxBytes,
@@ -427,6 +467,7 @@ async function defaultPinnedHeaderRequest(
   const res = await axios.get(url, {
     responseType: 'stream',
     timeout: timeoutMs,
+    signal: AbortSignal.timeout(timeoutMs),
     maxRedirects: 0,
     validateStatus: () => true,
     lookup: (_hostname: string, options: any, callback: any) => {
