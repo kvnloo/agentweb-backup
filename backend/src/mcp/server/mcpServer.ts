@@ -403,6 +403,8 @@ export function setupMcpServer(
               });
             if (!sharedState.isInternal) {
               void recordMcpConnectionAttempt({
+                product: 'emma_mcp',
+                ref: typeof req.query.ref === 'string' ? req.query.ref : undefined,
                 userId: sharedState.agentUserId,
                 authMethod: sharedState.authMethod,
                 apiKeyId: sharedState.apiKeyId,

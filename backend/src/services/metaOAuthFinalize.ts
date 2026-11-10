@@ -14,6 +14,7 @@ import { createAccount, getAccountById, type ConnectedAccount } from './connecte
 import { oauthSessionDb } from './db';
 import { MetaAdAccount, MetaInstagramAccount } from '../types/meta';
 import { raiseMetaConnectionHandoff, verifyMetaAdAccountReadBack } from './metaConnectionHandoff';
+import { zomaMilestone } from './journeyMilestones';
 
 export const META_PRECONNECT_INSTRUCTIONS =
     'Click Edit access, select all current and future Pages, approve all permissions.';
@@ -390,6 +391,12 @@ export async function connectMetaAdAccounts(params: {
     const accountsMissingPages = connectedAccounts
         .filter(acc => (acc.config as Record<string, any> | undefined)?.has_meta_pages === false)
         .map(acc => acc.account_name);
+
+    // ENG-2906: shared by the portal and Zoma setup. Journey event always; zomaStage only for
+    // users who already use Zoma. Fire-and-forget, never affects the connect result.
+    if (connectedAccounts.length > 0) {
+        void zomaMilestone(userId, 'meta_connected', { emit: 'always', requireZoma: true, props: { platform: 'meta' } });
+    }
 
     return { connectedAccounts, accountsMissingPages };
 }

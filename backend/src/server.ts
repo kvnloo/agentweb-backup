@@ -437,6 +437,10 @@ const runDrain = async (reason: string): Promise<void> => {
   await import('./services/funding/claudeCodeBackendInstance')
     .then((m) => m.claudeCodeBackend.flush())
     .catch(() => undefined);
+  // ENG-2906: flush queued product-journey events (PostHog batches in memory).
+  await import('./services/journeyTracking')
+    .then((m) => m.flushJourney())
+    .catch(() => undefined);
   // ENG-2110: pending Claude sign-ins hold a child process and a private temp dir.
   await import('./services/funding/claudeSubscriptionService')
     .then((m) => m.shutdownClaudeSubscriptionService())

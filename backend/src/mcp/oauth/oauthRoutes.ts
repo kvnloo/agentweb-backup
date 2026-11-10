@@ -19,6 +19,17 @@ import {
   recordMcpOAuthTokenIssued,
 } from '../../services/mcpUsageEventsService';
 import { getBackendUrl, MCP_RESOURCE_PATH, META_TOOLKIT_MCP_RESOURCE_PATH } from './authChallenge';
+import {
+  normalizeProduct,
+  productFromResource,
+  readRef,
+  validateRef,
+  ZOMA_DEVICE_OAUTH_CLIENT_ID,
+  type AttributionConfidence,
+  type JourneyProduct,
+} from '../../services/journeyAttribution';
+import { trackJourney } from '../../services/journeyTracking';
+import { noteProductUse, noteSignup, zomaMilestone } from '../../services/journeyMilestones';
 
 /**
  * Middleware: accept the user's JWT either from the Authorization header
@@ -52,6 +63,21 @@ function hasOnlyStringParams(params: Record<string, unknown>, keys: string[]): b
 }
 
 const authorizationParams = ['client_id', 'redirect_uri', 'scope', 'state', 'code_challenge', 'code_challenge_method'];
+
+/** A just-created account (signed up on the consent page) has a createdAt within this window. */
+const FRESH_SIGNUP_WINDOW_MS = 3600 * 1000;
+
+/**
+ * ENG-2906 product attribution for an authorization request. The RFC 8707 `resource` is the
+ * explicit signal; the first-party Zoma device client is a reliable endpoint hint. Anything
+ * else is `unknown`. Attribution only — it never changes what is authorized.
+ */
+function authorizationAttribution(clientId: string, resource: unknown): { product: JourneyProduct; confidence: AttributionConfidence } {
+  const fromResource = productFromResource(resource);
+  if (fromResource.product !== 'unknown') return fromResource;
+  if (clientId === ZOMA_DEVICE_OAUTH_CLIENT_ID) return { product: 'zoma', confidence: 'inferred' };
+  return fromResource;
+}
 
 export function setupMcpOAuth(app: express.Express) {
   // ─── Well-Known Metadata (RFC 8414) ─────────────────────────────────────
@@ -179,7 +205,20 @@ export function setupMcpOAuth(app: express.Express) {
     }
 
     const actualRedirectUri = redirect_uri || client.redirectUris[0];
+    // ENG-2906: the portal consent page posts back only the standard fields, so remember the
+    // product/ref keyed by client + PKCE challenge for the decision. Invalid ref is dropped.
+    const resource = typeof req.query.resource === 'string' ? req.query.resource : undefined;
+    const attribution = authorizationAttribution(client_id, resource);
+    const ref = validateRef(req.query.ref) ?? readRef(resource);
+    if (attribution.product !== 'unknown' || ref) {
+      try {
+        await mcpOAuthService.savePendingAuthorization(client_id, code_challenge, { ...attribution, ...(ref ? { ref } : {}) });
+      } catch (error) {
+        console.error('[MCP-OAuth] Failed to remember authorization attribution (ignored):', error);
+      }
+    }
     recordMcpOAuthStarted({
+      product: attribution.product,
       clientId: client_id,
       clientName: client.clientName,
       clientType: classifyMcpClient({ clientName: client.clientName, userAgent: req.get('user-agent'), redirectUri: actualRedirectUri }),
@@ -203,6 +242,9 @@ export function setupMcpOAuth(app: express.Express) {
           scope: scope || 'mcp:tools',
           codeChallenge: code_challenge,
           codeChallengeMethod: code_challenge_method || 'S256',
+          product: attribution.product,
+          attributionConfidence: attribution.confidence,
+          ...(ref ? { ref } : {}),
         });
 
         const redirectUrl = new URL(actualRedirectUri);
@@ -271,6 +313,13 @@ export function setupMcpOAuth(app: express.Express) {
     }
 
     const userId = (req as any).user.userId;
+    let pending: Awaited<ReturnType<typeof mcpOAuthService.takePendingAuthorization>> = null;
+    try {
+      pending = await mcpOAuthService.takePendingAuthorization(client_id, code_challenge);
+    } catch (error) {
+      console.error('[MCP-OAuth] Failed to read authorization attribution (ignored):', error);
+    }
+    const attribution = pending ?? authorizationAttribution(client_id, undefined);
     const { code } = await mcpOAuthService.createAuthorizationCode({
       clientId: client_id,
       userId,
@@ -278,8 +327,26 @@ export function setupMcpOAuth(app: express.Express) {
       scope: scope || 'mcp:tools',
       codeChallenge: code_challenge,
       codeChallengeMethod: code_challenge_method || 'S256',
+      product: attribution.product,
+      attributionConfidence: attribution.confidence,
+      ...(pending?.ref ? { ref: pending.ref } : {}),
     });
+    // ENG-2906: an account created on this consent page (createdAt within the window) gets its
+    // write-once signup attribution here, where the client and product are finally known.
+    const zomaDevice = client_id === ZOMA_DEVICE_OAUTH_CLIENT_ID;
+    void noteSignup(
+      userId,
+      {
+        product: attribution.product,
+        path: zomaDevice ? 'zoma_device' : 'oauth_direct',
+        client: zomaDevice ? 'zoma_device' : classifyMcpClient({ clientName: client.clientName, redirectUri: redirect_uri }),
+        ref: pending?.ref,
+        confidence: attribution.confidence,
+      },
+      { createdSince: new Date(Date.now() - FRESH_SIGNUP_WINDOW_MS).toISOString() },
+    );
     recordMcpOAuthAuthorized({
+      product: attribution.product,
       userId,
       clientId: client_id,
       clientName: client.clientName,
@@ -336,17 +403,33 @@ async function handleAuthorizationCodeGrant(req: Request, res: Response) {
     return res.status(400).json({ error: 'invalid_grant', error_description: 'Invalid or expired authorization code' });
   }
 
+  // ENG-2906: product from the code; a legacy/unknown code may still name its resource here
+  // (RFC 8707 resource is also sent to the token endpoint).
+  let product = normalizeProduct(codeRecord.product);
+  if (product === 'unknown') product = productFromResource(req.body.resource).product;
+
   // Issue tokens
   const tokens = await mcpOAuthService.createTokenPair({
     clientId: codeRecord.clientId,
     userId: codeRecord.userId,
     scope: codeRecord.scope,
+    product,
   });
+  const clientType = classifyMcpClient({ clientName: client?.clientName, redirectUri: codeRecord.redirectUri });
+  void (async () => {
+    await noteProductUse(codeRecord.userId, product);
+    if (product === 'zoma') {
+      await zomaMilestone(codeRecord.userId, 'connected', { emit: 'always', props: { product, clientType, path: 'oauth' } });
+    } else {
+      await trackJourney({ userId: codeRecord.userId }, 'connected', { product, clientType, path: 'oauth' });
+    }
+  })();
   recordMcpOAuthTokenIssued({
+    product,
     userId: codeRecord.userId,
     clientId: codeRecord.clientId,
     clientName: client?.clientName,
-    clientType: classifyMcpClient({ clientName: client?.clientName, redirectUri: codeRecord.redirectUri }),
+    clientType,
     redirectUri: codeRecord.redirectUri,
     scope: codeRecord.scope,
   }).catch((error) => console.error('[MCP-OAuth] Failed to record OAuth token issue:', error));
