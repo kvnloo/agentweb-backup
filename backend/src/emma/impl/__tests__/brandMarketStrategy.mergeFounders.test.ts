@@ -52,9 +52,14 @@ describe('ENG-2875 founders write guards', () => {
     expect(hasBlankFounderName([])).toBe(false);
     expect(hasBlankFounderName([{ name: 'A' }])).toBe(false);
   });
-  it('is additive only for the claimed session while the build is running', () => {
-    expect(isScrapeFounderWrite('2026-11-09T00:00:00Z', 'building')).toBe(true);
-    expect(isScrapeFounderWrite('2026-11-09T00:00:00Z', 'ready')).toBe(false);
+  it('is additive for the claimed session during the automated turn only', () => {
+    const claim = '2026-11-09T00:00:00Z';
+    expect(isScrapeFounderWrite(claim, 'building')).toBe(true);
+    // a later automated call in the same turn, after status flipped to ready
+    expect(isScrapeFounderWrite(claim, 'ready', 0)).toBe(true);
+    // a human has written in the session: ordinary edit, may remove founders
+    expect(isScrapeFounderWrite(claim, 'ready', 1)).toBe(false);
+    expect(isScrapeFounderWrite(claim, 'ready')).toBe(false);
     expect(isScrapeFounderWrite(undefined, 'building')).toBe(false);
   });
 });

@@ -299,6 +299,16 @@ export async function updateMarketStrategy(updateData: any, userId: string, opts
         };
       }
 
+      // ENG-2875: reject blank founder names before any write (incl. initial guidelines).
+      const incomingFoundersRaw = (updateData as any)?.brandData?.founders;
+      if (Array.isArray(incomingFoundersRaw) && hasBlankFounderName(incomingFoundersRaw)) {
+        return {
+          success: false,
+          message: 'Every founder needs a non-empty name. Pass an empty founders array to clear all founders.',
+          error: 'Invalid founders',
+        };
+      }
+
       // ENG-2308: refuse / condition writes from a superseded brand-build session.
       const guard = await guardBrandBuildSession(user, userDb, userId, opts.sessionId);
       if (guard.refuse) return supersededResult();
@@ -515,6 +525,13 @@ interface BrandBuildSessionGuard {
   userWrite: (patch: Record<string, unknown>) => Promise<any>;
   /** Org-level writes cannot be conditioned on the user's claim, so re-check it consistently just before. */
   assertStillCurrent: () => Promise<void>;
+  /**
+   * ENG-2875: true while this is the automated brand-build turn (current claim,
+   * and either the build is still running or no human has written in the
+   * session yet). A later tool call in the same automated turn stays additive
+   * even after an earlier call flipped the status to ready.
+   */
+  automatedTurn: boolean;
 }
 
 /**
@@ -588,9 +605,29 @@ async function guardBrandBuildSession(
   // old session reopened later: ordinary chat, so no claim condition either.
   const claim = !refuse && sessionClaim && sessionClaim === currentStartedAt ? sessionClaim : undefined;
 
+  // ENG-2875: once the build is ready, a current-claim session is still the
+  // automated turn until a human writes in it. Unknown history defaults to
+  // automated (additive), which never removes stored founders.
+  let turnHumanMessages: number | undefined;
+  if (claim && user?.brandBuildStatus !== 'building') {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { chatbotDb } = require('../../services/chatbotService');
+      turnHumanMessages = countHumanMessages(await chatbotDb.getMessagesFromMessagesTable(sessionId, true));
+    } catch (historyErr: any) {
+      console.warn('[brandBuild] session history read failed; treating founders write as automated (additive)', {
+        userId,
+        error: historyErr?.message ?? String(historyErr),
+      });
+      turnHumanMessages = 0;
+    }
+  }
+  const automatedTurn = isScrapeFounderWrite(claim, user?.brandBuildStatus, turnHumanMessages);
+
   return {
     refuse,
     claim,
+    automatedTurn,
     userWrite: async (patch) => {
       if (!claim) return userDb.updateUser(userId, patch as any);
       try {
@@ -617,11 +654,18 @@ export function hasBlankFounderName(founders: unknown[]): boolean {
 
 /**
  * ENG-2875: founders writes are additive only from the current brand-build
- * session while the build is still running (the site scrape). Once the build
- * is ready, a user reopening that session is making an ordinary edit.
+ * session during its automated turn (the site scrape): while the build is
+ * running, or after it is ready but before any human message in the session.
+ * Once a user writes in that session, edits are ordinary (authoritative).
  */
-export function isScrapeFounderWrite(sessionClaim: string | undefined, brandBuildStatus: unknown): boolean {
-  return Boolean(sessionClaim) && brandBuildStatus === 'building';
+export function isScrapeFounderWrite(
+  sessionClaim: string | undefined,
+  brandBuildStatus: unknown,
+  humanMessages?: number,
+): boolean {
+  if (!sessionClaim) return false;
+  if (brandBuildStatus === 'building') return true;
+  return humanMessages === 0;
 }
 
 /**
@@ -776,17 +820,10 @@ export async function updateBrandGuidelines(
       // scrape; a user reopening it after the build is ready edits normally.
       if (brandData && Array.isArray((brandData as any).founders)) {
         const incomingFounders: any[] = (brandData as any).founders;
-        if (hasBlankFounderName(incomingFounders)) {
-          return {
-            success: false,
-            message: 'Every founder needs a non-empty name. Pass an empty founders array to clear all founders.',
-            error: 'Invalid founders',
-          };
-        }
         updatedBrandData.founders = mergeFounders(
           (existingBrand.brandData as any)?.founders,
           incomingFounders,
-          { additive: isScrapeFounderWrite(sessionClaim, user.brandBuildStatus) },
+          { additive: guard.automatedTurn },
         );
       }
 
