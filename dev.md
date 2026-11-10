@@ -1,3 +1,390 @@
+## ENG-2890: pure rollback-plan builder for reversible campaign actions (2026-11-10)
+
+- `backend/src/services/marketingActionRollback.ts`: `buildRollbackPlan(action, snapshot)` returns the exact inverse (status/budget/bid) for owned ad/adset/campaign edits, else `{reversible:false}`. Fail closed on missing/mismatched snapshot. Shadow only, not wired into any execution path.
+
+## ENG-2888: pure truncated-run credit classifier, dark (2026-11-10)
+
+Added `backend/src/services/agentMode/core/truncatedRunCredit.ts`: classifies finished agent-mode runs (completed / truncated_iteration_limit / failed_before_effect / failed_after_partial_effect) and proposes a credit treatment. Dark: not wired into billing; default config charges full for every class. Wiring + policy are ENG-2836.3.
+
+## ENG-2886: Zoma launch channel attribution helpers (2026-11-09)
+
+Adds `backend/src/services/zomaChannelAttribution.ts`: canonical launch channels, per-channel tracked-link builder, utm/ref/referrer classifier (one channel per visit), and a first-touch funnel reducer. Pure; not yet wired to signup persistence (follow-up, data-plane gated with ENG-2880).
+
+## ENG-2876: Lead notification LLM fit gate, dark (2026-11-09)
+
+- New per-org `leadNotifications.fitGate = { enabled, criteria? }` (default off). When on, each Slack lead notification is judged once at delivery by gemini-3.1-flash-lite (200 tokens, 6s request / 8s total deadline, owner-attributed usage feature `lead_notification_fit`). `bad` suppresses the post and labels the lead `leadFit: bad` in the CRM; good/maybe/any failure posts (fail open).
+- Files: backend/src/services/leadFitGate.ts, orgLeadNotificationService.ts, leadNotificationConfig.ts.
+
+## ENG-2875: Emma brand-guidelines tool can remove founders (2026-11-09)
+
+`update_brand_guidelines` now treats a provided `founders` array as the full membership list (merged by normalized name onto existing entries), so founders omitted by Emma are removed. Helper `mergeFounders` in `backend/src/emma/impl/brandMarketStrategy.ts`.
+
+## ENG-2874: Workspace-wide creative library (2026-11-09)
+
+Images/videos/HTML-report library endpoints now aggregate assets across same-org members (`backend/src/utils/workspaceAssets.ts`), stamping `createdBy`; org-less users see own assets; cross-org members filtered by orgId re-check. UI attribution and per-asset S3 authz are follow-ups.
+
+## ENG-2871: Delete retired Growth Genius backend route/controller/service (2026-11-09)
+
+Removed `/api/growth-genius` (routes/growthGenius.ts, growthGeniusController, growthGeniusService and their tests). Prod nginx showed 0 requests to the path in 30 days. ENG-1761 slice; `GROWTH_GENIUS_CHAT_URL` OAuth redirect untouched.
+
+## ENG-2835: post-payment feedback ask trigger decision (2026-11-09)
+
+Pure `decideFeedbackAsk` (backend/src/services/postPaymentFeedbackTrigger.ts): asks on the 2nd consecutive paid invoice of an app-generated custom subscription link, once per org per 90 days, idempotent on invoice id. Not wired; storage table and email copy are gated follow-ups.
+
+## ENG-2870: LinkedIn identity guard accepts the same full name split differently (2026-11-08)
+
+- `unipileNameMatches` (used by the pre-send `linkedInIdentityCheck`) now accepts when both sides carry first+last and the normalized concatenated full names are identical. Prod session 28f84741 (LinkedIn Outreach – Retail Masivo AR) was refused twice for "Diego Javier Llorente" vs "Diego Javier Llorente" (CRM "Diego"/"Javier Llorente", LinkedIn "Diego Javier"/"Llorente"); the agent burned steps working around it before hitting the step cap. Step cap and resumable-report behaviour unchanged.
+
+## ENG-2867: MCP tools for own CRM lead-list export + export history (2026-11-08)
+
+Added `export_lead_list` (tools:execute) and `list_lead_list_exports` (readOnly) MCP tools wrapping the existing JWT export routes via runtime identity; no client_id override, list_id path-encoded.
+
+## ENG-2868: read-only MCP tool list_sender_settings (2026-11-07)
+
+New readOnly MCP tool `list_sender_settings` wraps GET /api/crm/sender-emails for the calling key owner only (no args select an account) and returns an allow-listed projection: senders with usage/cap, default email sender, default LinkedIn sender, connected mailboxes. Callable with a tools:read key.
+
+## ENG-2865: meta/zoma toolkit enforces aw_ key scopes (2026-11-07)
+
+`/api/meta-toolkit` now applies the main-MCP `tools:read` / `tools:execute` boundary
+(`mcp/server/apiKeyScopes.ts`) to `aw_` keys. Writes (guarded Meta CREATE/UPDATE, creative
+uploads, Google Ads guarded writes, `zoma_prepare_upload`) need `tools:execute`; reads need
+`tools:read`. Denied calls are 403 before any upstream call or metering. Legacy keys without
+`scopes`, OAuth and Zoma-token callers are unchanged. Rollback: revert.
+
+## ENG-2864: branch-aware read/list landing page file MCP tools (2026-11-07)
+
+`read_landing_page_file` and `list_landing_page_files` accept optional `branch` (e.g. `draft/agentweb-preview`) so staged edits can be read back; omitted = main. Auth unchanged.
+
+## ENG-2863: Batch-lookups nudge for serial single-read steps; LinkedIn reads no longer reported as writes (2026-11-07)
+
+- New `backend/src/services/agentMode/core/serialReadSpiral.ts`: after 6 consecutive steps that each issued one read-only tool call, inject one system nudge per turn telling the model to batch independent lookups into one response. Prod session 5bfb9d06 (Every.io Daily ICP Lead Finder) spent 39 of 40 steps this way.
+- `isWriteToolCall` now treats `linkedin_outreach` discovery actions (search-people, get-profile, get-company, search-parameters, list-*) as reads; unknown/missing actions stay writes. The iteration-limit report previously listed 26 LinkedIn profile reads as "completed tool writes".
+
+## ENG-2858: Repair fill_form fields missing name (2026-11-07)
+
+agentToolGatewayService fills a missing `fields[i].name` for playwright_browser_fill_form from element/label/description/field, else ref, fixing the Playwright MCP zod invalid_type at fields[0].name.
+
+## ENG-2856: Pure post-payment feedback-ask trigger (dark) (2026-11-07)
+
+- New `backend/src/services/paymentFeedbackTrigger.ts`: `shouldSendPaymentFeedbackAsk(invoice, { enabled, ledger })` decides whether a paid invoice should trigger the feedback ask. It classifies custom subscription links by `source === custom_subscription_link` + `orgId` on the invoice's subscription metadata (`parent.subscription_details.metadata`, falling back to the pre-Basil root `subscription_details.metadata`).
+- The ask fires on the 2nd consecutive payment: the first `billing_reason: subscription_cycle` invoice (payment #1 is `subscription_create`). Idempotency goes through the injected `PaymentFeedbackAskLedger` port, keyed per subscription, so redelivery (and the `invoice.paid` + `invoice.payment_succeeded` pair) never asks twice and later cycles do not re-ask.
+- Wired into the `invoice.paid` / `invoice.payment_succeeded` webhook path behind `PAYMENT_FEEDBACK_ASK_ENABLED` (default off; only the string `true` enables). When on it only logs the decision: no email, no persistence, no Slack. The ledger is process-local (`InMemoryPaymentFeedbackAskLedger`), which is fine while it only logs; a real send needs a durable ledger. The wiring is wrapped in try/catch and never throws into the webhook.
+- `customSubscriptionLinkCheckout.ts` already stamps `source`/`orgId` on `subscription_data.metadata`; a test now pins it. Subscriptions created before that stamping are not backfilled.
+
+## ENG-2854: Iteration-limit exits report resumable state (2026-11-07)
+
+- AgentMode's final persisted reply now adds a deterministic iteration-limit receipt: completed tool writes and available LP/branch/file/preview identities, uncertain writes, unconfirmed remaining edits/verification, and explicit resume instructions through Yugo / engineering. Model synthesis remains supplementary rather than evidence of completion.
+- Step exhaustion stops verified/scheduled retry attempts and interactive/background media/work-plan continuation chains. Wall-clock-budget continuations and ordinary non-limit exits are unchanged. No schema, billing, or credit-policy changes.
+- TDD: the mocked real loop failed before the implementation (missing LP identity); it now records 39 coding-agent writes and exactly 40 model turns, preserves the final receipt in responseMessages, and does not dispatch the final proposed write. Unit coverage excludes deferred, duplicate, failed and read calls from completed writes, keeps partial-write identities, and excludes raw payload content.
+- Verification: 26 scoped Jest suites / 245 tests pass; backend `npm run typecheck -- --pretty false` passes at the repository's configured 6144 MB heap. Initial 4096 MB typecheck exhausted the heap; worktree-doctor passed after linking the primary checkout's installed backend dependencies.
+- Not tested: live model/LP/staging deployment, production smoke, complete 438-file agentMode-name-matched test set, or advisory CodeRabbit CLI review. This draft changes the iteration-limit user-visible contract intentionally; unchanged core-loop/tool-dispatch characterization tests cover non-limit behavior.
+- Rollback: revert this change; no data migration. Post-deploy smoke: exhaust a controlled LP edit run and verify the persisted final reply identifies its LP/preview branch and offers review/resume without starting another automatic turn.
+
+## ENG-2853: Spend ceiling on ad set/ad group enable (2026-11-07)
+
+- Google ad-group enable resolves its provider parent campaign and budget, applies the same ceiling/refusal as campaign enable, and binds approval to that budget state.
+- Meta ad-set activation checks its current daily budget (or its provider-resolved campaign daily budget for campaign-budgeted sets), refusing over-ceiling or unreadable budgets before dispatch. Approval is bound to the resolved budget state and rechecked at confirmation.
+- Existing configured global policies and units are unchanged; no schema, persistence, or durable confirm tokens added. Lifetime-only budgets with no evaluable daily budget fail closed when a ceiling is configured.
+- Verification: 106 tests passed in five scoped Jest suites, including 12 new acceptance tests. Scoped pure guard/seam/ceiling TypeScript check passed. Full backend type check passed in the pre-push hook after correcting a test-mock return type (the initial explicit 3 GiB run exhausted its heap). Jest reports a worker teardown/open-timer warning.
+- Not tested: live provider writes, production deployment, full test suite. Rollback: revert this commit. Post-deploy smoke: preview an over-ceiling and under-ceiling child enable on each provider without confirming; expect refusal and PREVIEW respectively.
+
+## ENG-2837: forward-lead submission idempotency — feature and recovery limits (2026-11-06)
+
+**What it does.** `POST /api/webhooks/forward-lead` and `/api/leads/public/:listId` dedupe on
+`(listId, submission key)`. Key precedence: `idempotencyKey`, then top-level `submissionId`
+(Flatfee landers), then `customFields.submissionId`. A malformed candidate (non-string,
+whitespace, outside `[A-Za-z0-9._:-]{1,200}`) is skipped and the next one is tried; no valid
+key means the request runs unkeyed, exactly as before. The first request claims the key with a
+conditional put in `AW-Configs` under `userId = __system__:leadSubmissionClaims`
+(`configId = leadSubmission:<sha256(listId\nkey)>`), writes the lead, records the response,
+and only then fires notifications / CAPI / CRM sync. Every repeat replays that stored response
+(`Idempotent-Replayed: true`) with no second write or side effect.
+
+**No expiry, by requirement.** The same key must always replay, so completed claims are never
+deleted. Replay returns the same public body the original got (`success/message/event/leadId/
+listId`, no lead PII); the client-generated UUID key is the replay capability.
+
+**Fail-closed behaviour (intentionally accepted).**
+- Claim store unavailable → 503 retryable, nothing written.
+- Failure before any lead write → claim released, retry processes normally.
+- Failure after a lead write may have started, owner crash, or completion record not written →
+  the claim stays `in_progress` forever. There is no stale takeover (no fencing, so takeover
+  could double-write). Retries get 409 telling the client to contact support if it persists.
+  If the lead was saved, its owner notification / CAPI / CRM sync are withheld.
+- No automated reconciler or alert beyond the `[forward-lead] ENG-2837 ... claim left
+  in_progress` error log. Scope is one submission, never the whole list.
+
+**Operator recovery.** Find the log line (it names list and, for completion failures, leadId).
+Check the lead in `AW-Leads`. If it exists, either re-fire its side effects manually or accept
+the gap, then write the claim as `completed` (or delete it, accepting the next retry may update
+the existing lead via the email path). If no lead exists, delete the claim item
+(`userId = __system__:leadSubmissionClaims`, `configId` as above) so the next retry processes.
+
+**Analytics.** `taskDb.getTaskAnalytics` scans all of `AW-Configs`; it now passes
+`FilterExpression: userId <> :leadSubmissionClaimPartition` so claims are excluded server-side
+(not counted as configs, not loaded into memory). Scan RCU still covers them — a Scan reads
+before it filters.
+
+## ENG-2833: merge-evidence ignores hung Opslane runs (2026-11-06)
+
+`merge-evidence.sh` now drops an Opslane check-run still `queued`/`in_progress` more than `MERGE_EVIDENCE_OPSLANE_STALE_MINUTES` (default 30) after it started. Opslane is not required and its runs hang for hours; fresh runs still hold as PENDING and Opslane failures still block.
+
+## ENG-2808: lead-scoped breaker for add_lead_engagement and sibling lead tools (2026-11-06)
+
+- The tool-failure breaker now scopes add_lead_engagement, get_lead_engagements, update_lead and send_email_to_lead per (list_id, lead_id), like get_lead_details (ENG-969). Three misses on different wrong leads no longer block a corrected call later in the run; repeated misses on the same lead still trip.
+- add_lead_engagement's not-found result carries a `hint` telling the model to resolve the lead via search_leads instead of retrying the same pair.
+
+## ENG-2784: Caps on inbound hot-lead callbacks (2026-11-06)
+
+`/inbound` (a caller dialling the org's Twilio number back) now takes a slot from the existing limit store
+(`AW-MCPSessions`, new `hlc#cap#ih#`, `hlc#cap#id#`, `hlc#in#p#`, `hlc#in#c#` key prefixes only) once a member would be
+rung: org hourly/daily at 2 x `maxCallsPerHour`/`maxCallsPerDay`, per caller 3 an hour and 6 a day (HMAC of org and
+`From`, never the number), and a CallSid marker so a Twilio retry is counted once. Capped calls hear the nobody message
+(`[hotLeadCall] inbound capped <reason> <orgId>`); a store failure fails closed with the unavailable message
+(`[hotLeadCall] inbound limits unavailable`). A missing or withheld `From` skips only the caller counters. See
+`backend/docs/integrations/hot-lead-call.md` (Inbound callbacks).
+
+This supersedes the "no cap" sentence about inbound callbacks in `dev.md`: inbound callbacks are now capped (above).
+
+## ENG-2783: Retry polish: /screen fallback, reschedule search from now, expiry through the real cron (2026-11-06)
+
+Follow-up to the press-2 retry (PR #3920); no new persisted fields.
+
+- `/screen` no longer hangs up on the lead when the retry-eligibility read (lead and org context) throws: it logs one warning (error name only)
+  and serves the two-option prompt (no option 2).
+- A due retry whose lead or org window is closed when the cron runs is moved to the next open minute counted from NOW (`retryDueAt` gained a
+  `delayMs`; the press-time schedule keeps its 60 minutes). Previously the 60 minute delay was added again, which could skip an opening before
+  the give-up time. The +15 minute floor for a transient refusal after the claim is unchanged.
+- Bug fixed: the give-up check (more than 6 hours after `deferral.firstDueAt`) now runs BEFORE the "not due yet" return, so a deferral whose
+  `dueAt` lies in the future but whose `firstDueAt` is older than 6 hours (an operator-written or older-shape record) is claimed and given up with
+  `call.skipped` `retry_expired` instead of waiting. The other two reported fixtures (dueAt moved recently with an old `firstDueAt`; no
+  `firstDueAt` and `dueAt` 6.5h ago) were already given up correctly; all three are now regression tests driving `runHotLeadCallRetryCron()`
+  over the real store.
+- Guard: an unparseable `deferral.firstDueAt` falls back to `dueAt` (it would otherwise make the 6 hour limit NaN and silently disable the expiry).
+
+## ENG-2783: Monthly cap on hot-lead calls per org, customer notices, honest settings read-out (2026-11-06)
+
+Three things for hot-lead calling.
+
+Monthly cap. New owner-approved model field `Organization.hotLeadCall.maxCallsPerMonth` (default 200, min 1, max 2000; a
+config stored without it reads as 200, no migration). Owner routes (Emma `update_hot_lead_call_settings`, REST PUT) may set
+1-200 only and refuse higher values with "Higher monthly limits are set by AgentWeb support"; a stored value above 200 (an
+operator write) is shown and kept when the owner edits other fields. Enforced in `reserveCallSlot` after the hourly and
+daily counters with a new limit-store key `hlc#cap#m#<orgId>#<YYYY-MM org-local>` (TTL 40 days), same unit as the daily cap
+(leads, inbound callbacks not counted), released with the other slots on refusal. Skip reason `org_monthly_cap` on the lead
+timeline; the Slack alert still goes out. New `LimitStore.read` (consistent counter read, notices only).
+
+Customer notices. The org owner gets one email at ceil(80%) of the cap and one at the first refusal, per org per month,
+via `emailService.sendEmail` (non-production suppressed by the resendService guard), de-duplicated by new key prefix
+`hlc#notify#80#` / `hlc#notify#100#<orgId>#<YYYY-MM>` (TTL 40 days). Fire-and-forget, never blocks or fails a call. Log
+a cap of 1-4 sends only the 100% email; a failed 100% send keeps its claim (logged `monthly cap 100% notice failed`), a failed 80% send is retried at the next crossing. The Emma enable approval card now also lists the monthly limit ("N per month"; the digest does not hash card text, so it is unchanged). Log markers `[hotLeadCall] org monthly cap 80% <orgId>` and `... 100% <orgId>` for alarms.
+
+Honest read-out (two P1 findings from the QA tool on the previous PR). The settings read and preview now carry additive
+`warnings` (Canada stored but not called yet); a Canada-only country list and calling hours that never meet the lead window
+(checked at minute resolution across eight days) are blockers (`blockers`/`canEnable`, refuse turning calling on). Preview gains
+`outsideLeadHours` and `skipReason` (`outside_lead_hours`). Docs: `backend/docs/integrations/hot-lead-call.md`.
+
+## ENG-2783: Press 2 'not available now' schedules one retry via a due-retries cron (2026-11-06)
+
+This SUPERSEDES two statements of `eng-2783-lead-prompt.md`: "press 2 retry not built" and "the planned `system.hot_lead_call` deferral fields are NOT added".
+
+The lead prompt again offers three options on the lead's first call when retries are enabled: "Press 1 to be connected now, press 2 if you are not
+available and we will call you again later, or press 3 to stop these calls." (US only). On the retry call, and with `HOT_LEAD_CALL_RETRY` off, it is the
+two-option prompt, so no retry is promised that cannot happen; a 2 then (or with the kill switch off) is an ordinary decline. A 2 at the lead screen records outcome `lead_deferred` (event `call.lead_declined`,
+`reason: not_available_now`); the lead hears "Okay. {name} will call you again later. Goodbye.", the member "The lead is not available
+right now. We will try again later." One retry per lead, ever.
+Replays and a later 1 cannot create a second deferral or connect; a 3 still stops (do-not-call marker and contact status win and
+the deferral is removed).
+
+The retry is due 60 minutes after the press, moved forward minute by minute (up to 36 hours) to the first minute inside the lead-local
+window and the org's calling hours; with none, the 2 is a plain decline. A new cron, `cron/hotLeadCallRetryCron.ts`, armed in
+`server.ts` every 5 minutes (env `HOT_LEAD_CALL_RETRY`: unset = on, `off`/`0`/`false` = off; it does nothing while the global
+`hot_lead_call_mode` kill switch is off), finds due deferrals the way the stuck sweep finds records, claims each with a conditional
+write (exactly once under overlapping runs or instances; a window closed at run time moves the due time, but only inside the 6 hours below) and re-runs the normal dispatch pipeline: every gate again (the existing-record
+short-circuit and `too_old` are ignored), a fresh slot against the hourly, daily and monthly caps, fresh member selection with the
+cooldown, then the normal member and lead screens. Contract: a retry is placed within 6 hours of its FIRST due time (`deferral.firstDueAt`, written at press time) or it is given up with a `call.skipped` `retry_expired` note; it is never moved to another day. Only a permanent refusal (do-not-call, plan lost, another lead holds the number, phone changed, ...) spends the retry; a transient one
+(no one on duty, cooldown, caps, a down store, an error) gives the claim back and tries again 15 minutes later, still inside those 6 hours. The stuck sweep leaves a waiting deferral alone (it is a finished record).
+
+Owner-approved data-plane additions (Anurag): new schemaless fields on the existing `system.hot_lead_call` sidecar map of the lead row
+(`deferral {dueAt, count, firstDueAt}`, `retryClaimToken`, `retryClaimedAt`); NO new table, index or GSI. The retry's restart revives a finished
+record (new `jobKey`, attempt 1, emptied `meteredLegs`/`lastSequence`), and `findLeadsBySystemRecord` gained optional attribute filters.
+Operators cancel a pending retry with a data write (see `backend/docs/integrations/hot-lead-call.md`, "Press 2 and the retry").
+
+## ENG-2783: Lead prompt with callback number and press 3 stop; press 2 retry not built (2026-11-06)
+
+New lead screening prompt (US only; Canada stays refused by `HOT_LEAD_CALL_CA_ENABLED=false`): "This is an automated call from
+{name} about the enquiry you sent us. To reach a person at {name}, call {org number, spoken in 3-3-4 digit groups}. Press 1 to be
+connected now, or press 3 to stop these calls." (The org number rings the team through the existing inbound callback path.)
+Press 1 connects as before; any other key (2 included) or no input is unconfirmed/declined as before. `/screen` aborts the call
+(outcome `aborted`) when the org number is missing or not E.164.
+
+Press 3 = stop: outcome `lead_opted_out` with the existing `call.lead_declined` event (`reason: opted_out`), the lead hears a goodbye,
+the member hears "The lead asked not to be called again", nothing connects, a later 1 cannot reverse it. The org marker is claimed
+up to 3 times in-process before the outcome is recorded; if all fail, an error `[hotLeadCall] do-not-call write failed <orgId>` is
+logged (the stop then rests on that lead's contact status only). New skip gate `do_not_call` (async, after the plan check, dispatch
+and job) and a `/gather` re-check (`call.failed` reason `lead_do_not_call`); both block ONLY on the org marker or a lead status of
+exactly `do-not-contact` (an email unsubscribe, bounce or legacy flag does not block). Press 3 also sets the legacy
+group-email unsubscribe flag, like the CRM's own do-not-contact action.
+
+Owner-approved data-plane additions (Anurag): (1) new key family `hlc#dnc#<keyed digest of org + number>` in the existing
+`AW-MCPSessions` limit store, ~10 year TTL, no raw number (keyed by `JWT_SECRET`: rotating it empties the list, see the docs);
+(2) a new writer of the existing lead `contactStatus` (`do-not-contact`, reason `opted-out`) fields. The planned
+`system.hot_lead_call` deferral fields are NOT added.
+
+NOT built: press 2 "call me again later" (one deferred retry). The job queue has no run-after, so no new infrastructure was
+invented and the prompt does not offer 2. Wording and options: `backend/docs/integrations/hot-lead-call.md`, Known follow-ups.
+
+### Fix: calling-hours/lead-window overlap check is exact (QA P1 on #3918)
+`callingHoursReachLeadWindow` no longer samples every 15 minutes (a calling window shorter than 15 minutes could fall between samples and block
+enabling). It now decides at minute resolution over eight days: the lead window is asked once per UTC hour (its edges are whole hours), and the
+org window is read twice per open hour with the minutes in between computed. Worst case (no overlap) about 75 ms cold.
+
+## ENG-2783: Lead-local calling hours; Canada off at launch (2026-11-06)
+
+Hot-lead calls now also respect the lead's own local time. New `services/voice/leadLocalHours.ts`
+(`isInsideLeadCallWindow`): 10:00 inclusive to 18:00 exclusive (`LEAD_CALL_START_MINUTES`/`LEAD_CALL_END_MINUTES`; a
+business decision, stricter than the legal 08:00-21:00), every day, with no area-code table: a US number must be
+inside the window in both America/New_York and America/Los_Angeles (effectively 13:00-18:00 Eastern); 808 (Pacific/Honolulu) and
+907 (America/Anchorage) must also hold their home zone on top of Eastern and Pacific (a narrow band, since mobile
+numbers move); anything else is refused. New skip reason `outside_lead_hours` (stateless
+gate after `outside_calling_hours`, dispatch and job) and a `/gather` re-check that records `call.failed`
+`lead_outside_hours` and plays the unreachable message without dialling.
+
+Canada is refused in code (`HOT_LEAD_CALL_CA_ENABLED = false`, reason `country_not_allowed`) until the CRTC ADAD
+identification message (email/postal address, local or toll-free number) is built and `leadLocalHours.ts` gets a Canada
+branch; the stored config, default and validation are unchanged.
+No persisted-field or table change. Docs: `backend/docs/integrations/hot-lead-call.md`.
+
+## ENG-2824: required tools survive maxTools truncation (2026-11-05)
+
+callLLM truncated tool lists to a model's maxTools with a plain slice, so a scheduled
+run's required tool (Phoenix schedule: slack_send_message) past position 128 on
+gemini-3.8-flash was never declared and the run failed validation. The truncation now
+keeps the schedule's requiredFunctionCalls first (`backend/src/utils/boundToolsForModel.ts`).
+
+## ENG-2823: Zoma Google Ads toolkit on a provider-pluggable template (2026-11-05)
+
+- The Zoma layer now runs on ad-platform providers (`backend/src/mcp/zomaProviders.ts`): Meta is
+  provider #1 (same resolution rules and messages), Google Ads provider #2. Account resolution
+  (`resolveProviderAccount`), the preview → confirm token guard (`mcp/zomaWriteGuard.ts`, extracted
+  unchanged from `metaToolkitWrites.ts`), setup status, and metering are shared.
+- Google Ads is dark behind `ZOMA_GOOGLE_ADS_ENABLED=true`. With it off, the toolkit lists, accepts
+  and reports exactly what it did before. With it on, `call_google_ads_api` (curated reads + guarded
+  writes) and `call_google_ads_reporting_api` are listed and routed; `zoma_status` shows a Google
+  Ads line with a connect link; either platform is enough to finish setup.
+- `emma/googleAdsTools.ts` now holds the Google handler objects Emma registers (mirrors
+  `emma/metaTools.ts`); the toolkit dispatches through them, so the tracking pre-flight, PAUSED
+  defaults and ENG-592 read-back stay in the path.
+- Google writes: budgets in major currency units (refused, not rounded, past the currency's
+  precision), echoed as micros. Optional ceiling `GOOGLE_TOOLKIT_SPEND_CEILING`
+  (`{"maxDailyBudget": <micros>, "maxChangeRatio": <n>}`; malformed = refuse all budget writes).
+  Shared budgets are disclosed with how many campaigns they cap; attaching a non-shared budget that
+  a campaign already uses is refused before Google is called.
+- Usage events now carry `dimensions.platform` (`meta` | `google_ads`). This is a new key in the
+  existing dimensions map. No table, key or index changed.
+- Same residual as Meta: preview tokens are single-use per process (no durable claim store).
+- Hardening: a confirmed write that fails without a definite answer from Google (timeout,
+  network error, 5xx, or a thrown dispatch) is `UNCONFIRMED` and metered as a write, with a
+  check-before-retry instruction — never "did not apply", which invited a duplicate CREATE.
+  Budget/bid amounts must convert to positive safe-integer micros. With a ceiling set, enabling a
+  campaign is checked at its current budget (fails closed if the budget cannot be read), and the
+  preview names that budget.
+- Live read-only check (2026-11-05, guarded so no mutate URL or DynamoDB write could leave the
+  process): curated reads, the write-path read helper and all write previews ran against a real
+  standalone account and a manager-linked (login-customer-id) INR account. Note: the stored
+  OAuth token is written back to the user row on every refresh, so a "read-only" live run through
+  `googleAdsService` is not DynamoDB-read-only unless `updateAccountTokens` is stubbed.
+
+## ENG-2822: Meta Page access gates ad creation only, not reads (2026-11-05)
+
+`describeMetaAdsCapability` no longer sets `ads_capable:false` when Page access is missing; it reports `can_create_ads:false` + the Page-specific warning. Connected Accounts keeps such accounts active with that reason, and the generic "permission not granted" label now uses `capability_warning`.
+
+## ENG-2821: Pure monthly allowance threshold-crossing evaluator (2026-11-05)
+
+`backend/src/services/allowanceThresholds.ts` adds `evaluateAllowanceThresholds`, returning the
+allowance thresholds (default 75%/90%) newly crossed this billing month given the ones already
+fired. Dark: no persistence, notifications, or copy; not wired. Those stay with ENG-2812.
+
+## ENG-2820: Pure per-session turn/spend circuit-breaker evaluator (2026-11-05)
+
+`backend/src/services/sessionSpendBreaker.ts` adds `evaluateSessionSpendBreaker`, which
+decides continue / pause_for_confirmation / pause_and_notify (scheduled runs) from session
+turns, spend, and caller-supplied caps. A confirmation at turn T suppresses re-trips until the
+next cap multiple. Dark: not imported by any live path; caps, copy, and wiring stay with ENG-2812.
+
+## ENG-2819: Classify email-draft no-contact/DNC refusals as by_design (2026-11-05)
+
+`classifyToolFailureType` now treats update_email_draft_for_lead's deliberate
+no-contact-channel skip (ENG-2082) and do-not-contact refusal as `by_design`,
+so the agent-mode failure-cluster loop stops filing them as handler bugs.
+
+## ENG-2817: Delete dead FEATUREBASE_INTAKE flag-off Notion fallback (2026-11-05)
+
+`fileUserIssue` always files to Linear/Featurebase; the `FEATUREBASE_INTAKE` env read and the
+unreachable `createOncallItem` Notion fallback (and its export in `notionService.ts`) are gone.
+Test mocks that stubbed `createOncallItem` were removed; suites that asserted the filing payload
+via the Notion stub now stub `fileUserIssue` directly. Notion board/webhook/tokens untouched (ENG-23/ENG-8).
+
+## ENG-2816: a logged-in owner on their own share link is the owner, not a visitor (2026-11-05)
+
+First of several changes that make the shared-session tool block hold everywhere (voice and scheduled chats are
+the other two paths, built in later PRs). This one only teaches the text route who the owner is.
+
+**Why.** A share link (`/ishare/<sessionId>?conversable=<token>`) runs the turn under the OWNER's userId with
+`isInteractiveShare=true`, so the server cannot tell the owner from a visitor. The portal also never sent the
+viewer's login on that call, so an owner who opened their own link (for example from a scheduled-run email) was
+treated as a visitor. The next PRs restrict what visitor-made schedules and visitor voice can do; they must never
+restrict the owner, so the owner has to be recognised first.
+
+**What changed.** `generateSharedResponse` (`POST /api/agent-mode/ishare/:shareId/generate` and `/share/:shareId/generate`)
+reads an optional `Authorization: Bearer <jwt>` header after the link itself has been validated.
+`services/shareViewerIdentity.ts` `isSessionOwnerRequest` (it takes the request itself, so the verifier sees what it sees on every other route) answers true only for a normal user login that
+`getUserFromToken` verifies (signature, expiry, session version) and whose user is the session's owner, and that
+is not a delegate token (an admin acting as the owner) or a service self-call token. True means the turn runs with
+`isInteractiveShare=false` (the same tools as the owner's normal view, admin tools included for an admin owner, no
+anonymous-sender stamp). False, which includes every failure, is exactly today's visitor behaviour.
+
+The decision is made last, after every link, lock, usage and model check, and an owner turn logs one line
+(`[ENG-2816] share link <sessionId>: the viewer is the session owner; running an owner turn`, no token), because
+telemetry then reads `regular` instead of `interactive_share`. The portal does not send a sandbox (evaluation) login
+on a share link: the server refuses those on every share route, and such a viewer chats anonymously today.
+
+**Owner turn on a share link, what differs from a visitor turn** (all equal to the owner's normal view of the same
+session): no share block list, admin tools for an admin owner, no anonymous-sender stamp, owner step-model handling,
+`regular` session type. Delegated (admin-support) access is NOT granted by this.
+
+**What did not change.** Nothing else: with no Authorization header the route behaves exactly as before (the portal
+PR is what starts sending it, so this change alone is inert). The link token, expiry, `isActive`, usage gate, session lock and model
+policy checks all run before and independently of this. A login never replaces the link check (a wrong share token
+is still a 401), and a bad login never produces an error (it falls back to a visitor turn). No table, index, IAM,
+or environment change. CORS already allows the `Authorization` header.
+
+**Not covered here (later PRs, same ticket).** Voice (a `viewerToken` field on the socket and the voice guard), the
+schedule marking and run restriction, and the timed-out follow-up turn that drops the flag. Do not ship the voice
+guard or the schedule marking before this and the portal PR are live, or an owner on their own link would be
+restricted.
+
+**Tests.** `__tests__/shareViewerIdentity.test.ts` (13), `__tests__/shareViewerIdentity.realJwt.test.ts` (11, real signed
+tokens: wrong secret, alg none, expired, revoked session version, missing and `deleted_` users, colleague, delegate,
+service, garbage) and `__tests__/agentModeController.ishareOwnerRecognition.test.ts` (8, through the real handler,
+including that delegated access is not granted and that the trace is logged only for an owner). Mutation checks (break
+the code, a test fails): owner never recognised, everyone recognised, delegate or service check removed, owner-id
+comparison removed, owner fed into delegated access, trace removed, verifier handed a copy instead of the request.
+
+**Rollback.** Revert this commit; behaviour returns to "every share-link turn is a visitor turn".
+
+## ENG-2811: Batch lead conversation-status read tool (2026-11-04)
+
+New read-only `get_lead_conversation_statuses` tool returns compact status rows (connection, last message channel/direction/date, reply state) for a whole list (cursor paged) or up to 200 lead_ids in one call, so audits no longer fan out one call per lead. Constant query set; ids outside the list return not_found.
+
+## ENG-2791: Accept `elements` alias for playwright_browser_fill_form `fields` (2026-11-03)
+
+Added `fields: [elements]` to DEFAULT_ARG_ALIASES in agentToolGatewayService so model calls using the upstream `elements` name are repaired instead of schema-rejected. Regression test in agentToolGatewayService.test.ts.
+
+## ENG-2786: list_meta_ads_campaigns missing account_id classified invalid_args (2026-11-03)
+
+Client_id-scoped Meta calls without account_id now throw a usage (invalid_args) error listing the client's candidate account_ids instead of being clustered as config/auth. No auto-select (ENG-1801 invariant kept).
+
 ## ENG-2810: HubSpot Marketing Hub refusals classified as config (2026-11-04)
 
 - `classifyToolFailureType` now maps the hubspotMarketingPreflight "portal does not have Marketing Hub" / "authorised for CRM access only" refusals to `config` instead of `bug`, so the agent-mode failure-cluster loop stops filing handler-bug issues for a portal-plan/grant gap.
