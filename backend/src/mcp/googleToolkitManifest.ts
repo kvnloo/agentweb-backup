@@ -28,6 +28,7 @@ export const GOOGLE_READ_ACTIONS: Record<string, readonly string[]> = {
   AD: ['LIST'],
   BIDDING_STRATEGY: ['LIST'],
   CONVERSION_ACTION: ['LIST'],
+  CAMPAIGN_CONVERSION_GOAL: ['LIST'],
   LOCATION: ['SEARCH'],
 };
 
@@ -35,6 +36,7 @@ export const GOOGLE_GUARDED_WRITES: Record<string, readonly string[]> = {
   BUDGET: ['CREATE', 'UPDATE'],
   CAMPAIGN: ['CREATE', 'UPDATE'],
   AD_GROUP: ['CREATE', 'UPDATE'],
+  CAMPAIGN_CONVERSION_GOAL: ['UPDATE'],
 };
 
 export function isGoogleToolkitTool(name: string): name is GoogleToolkitToolName {
@@ -48,23 +50,24 @@ export function isGoogleGuardedWrite(name: string, args: any): boolean {
 
 // Arguments an external caller may send to call_google_ads_api (schema is narrowed to these).
 const API_ARGS = [
-  'customer_id', 'entity_type', 'action', 'name', 'type', 'budget_resource_name', 'explicitly_shared',
+  'biddable', 'resource_name', 'campaign_id', 'customer_id', 'entity_type', 'action', 'name', 'type', 'budget_resource_name', 'explicitly_shared',
   'bidding_strategy', 'bidding_strategy_resource_name', 'bidding_strategy_target',
   'location_target_ids', 'campaign_resource_name', 'ad_group_resource_name', 'query', 'status',
 ];
 
 const GOOGLE_ADS_API_DESCRIPTION =
   'Google Ads API for external agents. Reads: LIST of BUDGET, CAMPAIGN, AD_GROUP (campaign_resource_name), KEYWORD/AD (ad_group_resource_name), ' +
-  'BIDDING_STRATEGY, CONVERSION_ACTION; LOCATION SEARCH (query). ' +
+  'BIDDING_STRATEGY, CONVERSION_ACTION, CAMPAIGN_CONVERSION_GOAL (campaign_id?); LOCATION SEARCH (query). ' +
   'Guarded writes: BUDGET CREATE (name, amount, explicitly_shared?) / UPDATE (budget_resource_name, amount); ' +
   'CAMPAIGN CREATE (name, type, budget_resource_name, bidding_strategy | bidding_strategy_resource_name, location_target_ids?) / UPDATE (campaign_resource_name, status); ' +
   'AD_GROUP CREATE (name, campaign_resource_name, type, cpc_bid?) / UPDATE (ad_group_resource_name, status). ' +
+  'CAMPAIGN_CONVERSION_GOAL UPDATE (resource_name from LIST, biddable boolean only): preview shows campaign, category, origin and current/new biddable. ' +
   'Every write is two calls: first without confirm (returns a PREVIEW and preview_token, nothing changes), show the preview to the user, ' +
   'then after their explicit approval repeat the exact same call with confirm=true and the preview_token. ' +
   'New campaigns and ad groups are always created PAUSED; enabling (status=ENABLED) is its own separate preview and approval. ' +
   'Budgets are in MAJOR units of the account currency (amount: 50 = $50.00/day); the preview echoes the micros. ' +
   'A shared budget (explicitly_shared) caps every campaign attached to it; the preview names how many. ' +
-  'A write is done only when the result says verification CONFIRMED. REMOVE, keywords/ads/assets writes and conversions are not available.';
+  'A write is done only when the result says verification CONFIRMED. REMOVE, keywords/ads/assets writes and other conversion writes are not available.';
 
 function narrowApiDefinition(definition: any): any {
   const def = JSON.parse(JSON.stringify(definition));
@@ -77,6 +80,9 @@ function narrowApiDefinition(definition: any): any {
   kept.amount = { type: 'number', description: 'BUDGET CREATE/UPDATE: daily budget in MAJOR units of the account currency (50 = $50.00). Converted to micros; the preview echoes both.' };
   kept.cpc_bid = { type: 'number', description: 'AD_GROUP CREATE: max CPC bid in MAJOR units of the account currency (converted to micros).' };
   kept.cpc_bid_ceiling = { type: 'number', description: 'CAMPAIGN CREATE (TARGET_SPEND / TARGET_IMPRESSION_SHARE only): max CPC ceiling in MAJOR units of the account currency.' };
+  kept.biddable = { type: 'boolean', description: 'CAMPAIGN_CONVERSION_GOAL UPDATE only: whether the goal drives campaign bidding.' };
+  kept.resource_name = { type: 'string', description: 'CAMPAIGN_CONVERSION_GOAL UPDATE: customers/<customer_id>/campaignConversionGoals/<campaignId>~<CATEGORY>~<ORIGIN> from LIST.' };
+  kept.campaign_id = { type: 'string', description: 'CAMPAIGN_CONVERSION_GOAL LIST only: optional numeric campaign filter.' };
   kept.confirm = { type: 'boolean', description: 'Writes only. Omit to get a PREVIEW (nothing changes). Set true only after the user explicitly approved that preview, together with its preview_token.' };
   kept.preview_token = { type: 'string', description: 'Writes only. The preview_token returned by the preview the user approved. Single use, 15 minutes; the call must repeat the previewed arguments exactly.' };
   def.description = GOOGLE_ADS_API_DESCRIPTION;
