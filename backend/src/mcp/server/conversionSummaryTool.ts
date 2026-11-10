@@ -60,12 +60,16 @@ const urlKey = (raw: unknown): string => {
   }
 };
 
+// lp_id, lpId, landing-page-id all match: compare letters only, case-insensitive.
+const normKey = (k: string): string => k.toLowerCase().replace(/[^a-z]/g, '');
+
 function leadField(lead: any, ...keys: string[]): string {
+  const wanted = new Set(keys.map(normKey));
   const bags = [lead?.customFields, lead?.lastTouch, lead?.firstTouch, lead?.lastTouch?.extraParams, lead?.firstTouch?.extraParams];
   for (const bag of bags) {
     if (!bag || typeof bag !== 'object') continue;
     for (const [k, v] of Object.entries(bag)) {
-      if (keys.some((key) => key.toLowerCase() === k.toLowerCase()) && typeof v === 'string' && v.trim()) return v.trim();
+      if (wanted.has(normKey(k)) && typeof v === 'string' && v.trim()) return v.trim();
     }
   }
   return '';

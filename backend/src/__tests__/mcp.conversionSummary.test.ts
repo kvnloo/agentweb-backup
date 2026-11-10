@@ -106,6 +106,20 @@ describe('ENG-2898 get_conversion_summary', () => {
     expect(r).toMatchObject({ start: '2026-10-12', end: '2026-11-10' });
   });
 
+  it('Opslane run 1790: lp_id / landing-page-id spellings count as page conversions', async () => {
+    mockFetch.mockImplementation(async (opts: any) => {
+      if (opts.path === '/api/crm/lists') return [{ id: 'L', userId: 'dan', name: 'L' }];
+      if (opts.path === '/api/landing-pages/v0/generated') return { pages: [{ id: 'w3', userId: 'dan', name: 'W3' }] };
+      return { leads: [
+        { email: 'a@x.co', createdAt: '2026-11-01T00:00:00Z', customFields: { lp_id: 'w3' } },
+        { email: 'b@x.co', createdAt: '2026-11-01T00:00:00Z', customFields: { 'landing-page-id': 'w3' } },
+        { email: 'c@x.co', createdAt: '2026-11-01T00:00:00Z', customFields: { landingPageId: 'w3' } },
+      ], hasMore: false };
+    });
+    const out = parse(await run('dan'));
+    expect(out.landing_pages).toEqual([{ page_id: 'w3', name: 'W3', leads: 3, conversions: 3 }]);
+  });
+
   it('is readOnly and callable with a tools:read key', () => {
     const tool = mcpToolRegistry.getTool('get_conversion_summary') as any;
     expect(tool.readOnly).toBe(true);
