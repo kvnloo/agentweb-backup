@@ -2049,7 +2049,8 @@ mcpToolRegistry.register({
     if (nameError) return jsonResult({ success: false, error: nameError });
     const task = await loadOwnKnowledgeBase(kbId, context);
     if (!task) return jsonResult({ success: false, error: KB_NOT_FOUND });
-    if (fileName === KB_MAIN_FILE || (task.knowledgeBaseFiles || []).some((f: any) => f?.filename === fileName)) {
+    const lowered = fileName.toLowerCase();
+    if (lowered === KB_MAIN_FILE || (task.knowledgeBaseFiles || []).some((f: any) => String(f?.filename ?? '').toLowerCase() === lowered)) {
       return jsonResult({ success: false, error: `"${fileName}" already exists; use update_knowledge_base_file_content to change it` });
     }
     const data = await mcpFetch({
@@ -2114,7 +2115,7 @@ mcpToolRegistry.register({
     const fileName = kbArg(args?.file_name);
     const fileKey = kbArg(args?.file_key);
     if (!fileName) return jsonResult({ success: false, error: 'file_name is required' });
-    if (fileName === KB_MAIN_FILE) return jsonResult({ success: false, error: `The main ${KB_MAIN_FILE} file cannot be deleted` });
+    if (fileName.toLowerCase() === KB_MAIN_FILE) return jsonResult({ success: false, error: `The main ${KB_MAIN_FILE} file cannot be deleted` });
     const task = await loadOwnKnowledgeBase(kbArg(args?.kb_id), context);
     // Only keys recorded on the caller's own task are ever sent to the delete route.
     const matches = (task?.knowledgeBaseFiles || []).filter(

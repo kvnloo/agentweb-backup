@@ -176,6 +176,24 @@ describe('foreign identifiers are refused without leaking existence', () => {
   });
 });
 
+describe('case-insensitive name conflicts', () => {
+  it('rejects a create whose name differs only by case from an existing or main file', async () => {
+    fakeBackend(seed());
+    for (const file_name of ['NOTES.md', 'Knowledge-Base.txt']) {
+      const res = await run('create_knowledge_base_file', { kb_id: 'kb-own', file_name, content: 'x' });
+      expect(res.success).toBe(false);
+    }
+    expect(writeCalls()).toEqual([]);
+  });
+
+  it('refuses to delete the main file under a different case', async () => {
+    fakeBackend(seed());
+    const res = await run('delete_knowledge_base_file', { kb_id: 'kb-own', file_name: 'KNOWLEDGE-BASE.TXT' });
+    expect(res.success).toBe(false);
+    expect(writeCalls()).toEqual([]);
+  });
+});
+
 describe('text only, size cap', () => {
   it('rejects oversize content before any API call', async () => {
     const res = await run('create_knowledge_base_file', { kb_id: 'kb-own', file_name: 'big.md', content: 'a'.repeat(KB_TEXT_FILE_MAX_BYTES + 1) });
