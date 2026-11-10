@@ -3,7 +3,7 @@ jest.mock('../mcp/oauth/oauthService', () => ({ mcpOAuthService: {} }));
 jest.mock('../services/connectedAccountsDb', () => ({ getAccountsByUserIdIncludingOrgShared: jest.fn() }));
 jest.mock('../services/mcpUsageEventsService', () => ({ recordMcpToolUse: jest.fn(), recordMcpWriteExecuted: jest.fn() }));
 jest.mock('../services/agentModeService', () => ({ agentModeService: { readToolkitMetaActivityLog: jest.fn().mockResolvedValue({ data: [] }) } }));
-import { ACTIVITY_FIELDS, executeActivityLogRead, explainMetaError } from '../mcp/metaToolkitDiagnostics';
+import { ACTIVITY_FIELDS, executeActivityLogRead, explainMetaError, metaReadFailureResult } from '../mcp/metaToolkitDiagnostics';
 import { getMetaToolkitManifest } from '../mcp/metaToolkitManifest';
 import { handleMetaToolkitCall } from '../mcp/metaToolkitGateway';
 import { agentModeService } from '../services/agentModeService';
@@ -79,5 +79,24 @@ describe('ENG-2921 account diagnostics', () => {
     const get = jest.fn().mockResolvedValue({ data: { data: [] } });
     await executeActivityLogRead({ after: ' ' }, credentials, { get } as any);
     expect(get.mock.calls[0][1].params).not.toHaveProperty('after');
+  });
+
+  it('turns a Meta 190 refusal into a readable reconnect result, not a throw', async () => {
+    const err: any = Object.assign(new Error('Request failed with status code 400'), {
+      response: { status: 400, data: { error: { code: 190, message: 'Error validating access token' } } },
+    });
+    const get = jest.fn().mockRejectedValue(err);
+    const result: any = await executeActivityLogRead({}, credentials, { get } as any);
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('Ask the user to reconnect Meta in Connected Accounts');
+    expect(result.errorClass).toBe('auth');
+    expect(JSON.stringify(result)).not.toContain('secret');
+  });
+
+  it('maps a credential-resolution auth failure to the reconnect result', () => {
+    const authErr = Object.assign(new Error('Meta access token expired'), { isMetaAuthError: true, status: 401 });
+    const result: any = metaReadFailureResult(authErr);
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('reconnect Meta');
   });
 });

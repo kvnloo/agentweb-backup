@@ -1,5 +1,6 @@
 import axios from 'axios';
 import { MetaToolkitRefusal } from './metaToolkitErrors';
+import { classifyMetaReadFailure, META_RECONNECT_MESSAGE, META_PERMISSION_MESSAGE } from '../utils/metaReadErrorClass';
 
 /**
  * ENG-2921 slice 1: read-only account diagnostics. `ads_account_get_activity_logs` reads the
@@ -93,5 +94,32 @@ export async function executeActivityLogRead(
   const account = `act_${credentials.accountId.replace(/^act_/, '')}`;
   const params: Record<string, unknown> = { fields: ACTIVITY_FIELDS, limit: args.limit ?? 50 };
   for (const k of ['since', 'until', 'after']) if (args[k] !== undefined) params[k] = args[k];
-  return (await graph.get(`${base}/${account}/activities`, { params: { ...params, access_token: credentials.accessToken }, timeout: 15_000 })).data;
+  try {
+    return (await graph.get(`${base}/${account}/activities`, { params: { ...params, access_token: credentials.accessToken }, timeout: 15_000 })).data;
+  } catch (error: any) {
+    return metaReadFailureResult(error);
+  }
+}
+
+/**
+ * Turn a Meta refusal (Graph error or credential resolution failure) into a readable tool result
+ * instead of letting the gateway's generic handler return a bare "Meta Toolkit call failed."
+ * Mirrors the campaign-list read (emma/impl/adsApis.ts): reconnect message on an invalid token,
+ * permission message on other credential refusals.
+ */
+export function metaReadFailureResult(error: any) {
+  const failure = classifyMetaReadFailure(error);
+  const graphMessage = error?.response?.data?.error?.message;
+  const base = graphMessage || error?.message || 'Meta refused the activity-log read';
+  const message = failure.kind === 'credential'
+    ? `${base}. ${failure.tokenInvalid || error?.isMetaAuthError ? META_RECONNECT_MESSAGE : META_PERMISSION_MESSAGE}`
+    : failure.kind === 'transient'
+      ? `${base}. Meta is temporarily unavailable or throttling; try again shortly.`
+      : base;
+  return {
+    success: false,
+    message,
+    errorClass: failure.errorClass,
+    errorType: failure.kind === 'credential' ? 'configuration' : failure.kind,
+  };
 }
