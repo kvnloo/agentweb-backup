@@ -108,4 +108,26 @@ describe('ENG-2898 get_conversion_summary', () => {
     const req = { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'get_conversion_summary', arguments: {} } };
     expect(findScopeDenial(req, ['tools:read'], (n) => mcpToolRegistry.getTool(n) as any)).toBeNull();
   });
+  it('Opslane run 1788: reads listId-shaped lists, sourceId/case variants, blank dates, failed lists', async () => {
+    const leadsCalls: any[] = [];
+    mockFetch.mockImplementation(async (opts: any) => {
+      if (opts.path === '/api/crm/lists') return [{ listId: 'L1', userId: 'carol', name: 'Real shape' }, { listId: 'L2', userId: 'carol', name: 'Broken' }];
+      if (opts.path === '/api/landing-pages/v0/generated') return { pages: [{ id: 'lp-W2', userId: 'carol', name: 'P' }] };
+      if (opts.path.includes('/L2/')) throw new Error('500 InternalFailure');
+      leadsCalls.push(opts.queryParams);
+      return {
+        leads: [
+          { email: 'a@x.com', createdAt: new Date().toISOString(), customFields: { sourceId: 'lp-w2' } },
+          { email: 'b@x.com', createdAt: new Date().toISOString(), customFields: { LANDINGPAGEID: 'lp-W2' } },
+          { email: 'c@x.com', createdAt: new Date().toISOString(), customFields: { landing_page_id: 'lp-W2' } },
+        ],
+        hasMore: false,
+      };
+    });
+    const out = parse(await run('carol', { start_date: ' ', end_date: null }));
+    expect(out.lists).toEqual([{ list_id: 'L1', name: 'Real shape', list_type: null, leads: 3 }]);
+    expect(out.landing_pages[0]).toMatchObject({ page_id: 'lp-W2', conversions: 3, leads: 3 });
+    expect(out.skipped_lists).toEqual([{ list_id: 'L2', name: 'Broken' }]);
+    expect(leadsCalls[0].limit).toBe('200');
+  });
 });

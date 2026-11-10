@@ -16,7 +16,8 @@ import { ctx, jsonResult } from './toolHelpers';
 
 export const MAX_RANGE_DAYS = 366;
 export const MAX_LEADS_SCANNED = 10_000;
-const PAGE_SIZE = 500;
+// 200: the leads route fails (InternalFailure) on 500-lead pages of very large lists.
+const PAGE_SIZE = 200;
 const DAY_MS = 86_400_000;
 
 function parseDay(value: unknown, field: string): number {
@@ -29,10 +30,12 @@ function parseDay(value: unknown, field: string): number {
 }
 
 /** Inclusive [start 00:00Z, end 23:59:59.999Z]; default last 30 days. */
+const isUnset = (v: unknown): boolean => v === undefined || v === null || (typeof v === 'string' && !v.trim());
+
 export function resolveRange(args: any, now = Date.now()): { startMs: number; endMs: number; start: string; end: string } {
   const today = Date.parse(new Date(now).toISOString().slice(0, 10) + 'T00:00:00.000Z');
-  const end = args?.end_date !== undefined ? parseDay(args.end_date, 'end_date') : today;
-  const start = args?.start_date !== undefined ? parseDay(args.start_date, 'start_date') : end - 29 * DAY_MS;
+  const end = !isUnset(args?.end_date) ? parseDay(args.end_date, 'end_date') : today;
+  const start = !isUnset(args?.start_date) ? parseDay(args.start_date, 'start_date') : end - 29 * DAY_MS;
   if (start > end) throw new Error('start_date must be on or before end_date');
   const days = Math.round((end - start) / DAY_MS) + 1;
   if (days > MAX_RANGE_DAYS) {
@@ -91,13 +94,14 @@ mcpToolRegistry.register({
     const ownerId = scoped.userId;
 
     const listsRaw = await mcpFetch({ method: 'GET', path: '/api/crm/lists', context: scoped });
+    const listId = (l: any): string => String(l?.listId ?? l?.id ?? '');
     const lists = (Array.isArray(listsRaw) ? listsRaw : [])
-      .filter((l: any) => l && l.id && !l.fromOrgMember && (!l.userId || l.userId === ownerId));
+      .filter((l: any) => l && listId(l) && !l.fromOrgMember && (!l.userId || l.userId === ownerId));
 
     const pagesRaw = await mcpFetch({ method: 'GET', path: '/api/landing-pages/v0/generated', context: scoped });
     const pages = (Array.isArray(pagesRaw?.pages) ? pagesRaw.pages : [])
       .filter((p: any) => p && p.id && p.userId === ownerId);
-    const pageById = new Map<string, any>(pages.map((p: any) => [String(p.id), p]));
+    const pageIdLower = new Map<string, string>(pages.map((p: any) => [String(p.id).toLowerCase(), String(p.id)]));
     const pageByUrl = new Map<string, string>();
     for (const p of pages) {
       for (const u of [p.customDomainUrl, p.deployedUrl]) {
@@ -111,17 +115,26 @@ mcpToolRegistry.register({
     let scanned = 0;
     let truncated = false;
     let totalLeads = 0;
+    const skippedLists: Array<{ list_id: string; name: string | null }> = [];
 
     for (const list of lists) {
+      const id = listId(list);
       let count = 0;
       let page = 1;
+      let failed = false;
       while (!truncated) {
-        const res = await mcpFetch({
-          method: 'GET',
-          path: `/api/crm/lists/${encodeURIComponent(list.id)}/leads`,
-          context: scoped,
-          queryParams: { page: String(page), limit: String(PAGE_SIZE) },
-        });
+        let res: any;
+        try {
+          res = await mcpFetch({
+            method: 'GET',
+            path: `/api/crm/lists/${encodeURIComponent(id)}/leads`,
+            context: scoped,
+            queryParams: { page: String(page), limit: String(PAGE_SIZE) },
+          });
+        } catch {
+          failed = true;
+          break;
+        }
         const leads: any[] = Array.isArray(res?.leads) ? res.leads : [];
         for (const lead of leads) {
           if (scanned >= MAX_LEADS_SCANNED) { truncated = true; break; }
@@ -129,9 +142,9 @@ mcpToolRegistry.register({
           const created = Date.parse(lead?.createdAt ?? '');
           if (Number.isNaN(created) || created < range.startMs || created > range.endMs) continue;
           count++;
-          const idHit = leadField(lead, 'landingPageId', 'lpId');
-          const pageId = (idHit && pageById.has(idHit))
-            ? idHit
+          const idHit = leadField(lead, 'landingPageId', 'lpId', 'landing_page_id', 'sourceId');
+          const pageId = idHit && pageIdLower.has(idHit.toLowerCase())
+            ? pageIdLower.get(idHit.toLowerCase())
             : pageByUrl.get(urlKey(leadField(lead, 'landingUrl', 'landingPageUrl', 'pageUrl')));
           if (!pageId) continue;
           const s = lpStats.get(pageId) ?? { conversions: 0, emails: new Set<string>(), anon: 0 };
@@ -143,8 +156,12 @@ mcpToolRegistry.register({
         if (!res?.hasMore || leads.length === 0) break;
         page++;
       }
+      if (failed) {
+        skippedLists.push({ list_id: id, name: list.name ?? null });
+        continue;
+      }
       totalLeads += count;
-      listRows.push({ list_id: String(list.id), name: list.name ?? null, list_type: list.listType ?? null, leads: count });
+      listRows.push({ list_id: id, name: list.name ?? null, list_type: list.listType ?? null, leads: count });
       if (truncated) break;
     }
 
@@ -169,6 +186,7 @@ mcpToolRegistry.register({
       landing_pages: landingPages,
       lists: listRows,
       truncated,
+      ...(skippedLists.length ? { skipped_lists: skippedLists, skipped_note: 'These lists could not be read; their leads are not counted.' } : {}),
       ...(truncated ? { note: `Stopped after scanning ${MAX_LEADS_SCANNED} leads; counts are partial and cover only the lists scanned so far.` } : {}),
     });
   },
