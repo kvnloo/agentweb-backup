@@ -21,7 +21,13 @@ jest.mock('../services/db', () => ({
   },
   taskDb: {},
   subscriberDb: {},
+  orgDb: {
+    getOrgWithPendingInviteForEmail: jest.fn().mockResolvedValue(null),
+    getOrgsWithAutoJoinDomain: jest.fn().mockResolvedValue([]),
+  },
 }));
+
+jest.mock('../services/serverSignalEmitter', () => ({ emitAppSignal: jest.fn().mockResolvedValue(true) }));
 
 jest.mock('../services/waitlistDb', () => ({
   waitlistDb: { getByEmail: jest.fn().mockResolvedValue(null) },
@@ -85,6 +91,8 @@ const flush = () => new Promise((resolve) => setImmediate(resolve));
 
 beforeEach(() => {
   jest.clearAllMocks();
+  process.env.AGENTWEB_META_PIXEL_ID = 'test-pixel';
+  process.env.AGENTWEB_META_CAPI_ACCESS_TOKEN = 'test-capi';
   mockGetUserByEmail.mockResolvedValue(null);
   mockCreateUser.mockResolvedValue({ userId: 'uuid-u1', email: 'new@user.com', isAdmin: false, roles: ['customer'] });
   mockUpdateUser.mockResolvedValue({ userId: 'uuid-u1' });
