@@ -43,7 +43,11 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 
 function parse(date: string | null | undefined): Date | null {
   if (!date) return null;
-  const d = new Date(date);
+  // Offset-free date-times (e.g. "2026-11-10T09:00") are interpreted as UTC so
+  // results never depend on the server timezone. Date-only strings are already
+  // UTC per the JS spec; explicit offsets/"Z" are honoured unchanged.
+  const offsetFree = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(date);
+  const d = new Date(offsetFree ? `${date}Z` : date);
   return Number.isNaN(d.getTime()) ? null : d;
 }
 

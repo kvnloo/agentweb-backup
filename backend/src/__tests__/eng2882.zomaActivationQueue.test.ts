@@ -67,4 +67,14 @@ describe("ENG-2882 Zoma activation queue", () => {
     expect(helpAlert([])).toBeNull();
     expect(buildTracker(users, tue)).toHaveLength(4);
   });
+
+  it("treats offset-free date-times as UTC regardless of server timezone", () => {
+    // Invited Mon 23:30 UTC, checked Wed 23:45 UTC = 2 business days -> stalled.
+    // A UTC-08 host reading the offset-free string as local time would see only 1.
+    const now = new Date("2026-11-11T23:45:00Z");
+    expect(isStalled({ ...base, dateInvited: "2026-11-09T23:30:00" }, now)).toBe(true);
+    expect(isStalled({ ...base, dateInvited: "2026-11-09T23:30:00Z" }, now)).toBe(true);
+    // Explicit offsets are honoured: Mon 23:30-08:00 = Tue 07:30 UTC -> 1 business day.
+    expect(isStalled({ ...base, dateInvited: "2026-11-09T23:30:00-08:00" }, now)).toBe(false);
+  });
 });
