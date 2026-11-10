@@ -1291,6 +1291,31 @@ export async function handleCallGoogleAdsApi(userId: string, args: {
       return { success: true, assetGroupResourceName: assetGroup.resourceName, ...(creativeTrackingWarning ? { trackingWarning: creativeTrackingWarning } : {}) };
     }
 
+    if (entity_type === 'ASSET_GROUP' && action === 'UPDATE') {
+      // ENG-2928: asset groups are created PAUSED, so a PMax launch needs this. Enabling one
+      // under an ENABLED campaign serves paid traffic instantly — gated like ASSET_GROUP CREATE.
+      if (!args.asset_group_resource_name) return { success: false, error: 'asset_group_resource_name is required for ASSET_GROUP UPDATE' };
+      if (args.status !== 'ENABLED' && args.status !== 'PAUSED') return { success: false, error: 'This tool does not support updating the field(s) requested for ASSET_GROUP — nothing was sent to Google Ads, no changes were made.' };
+      let creativeTrackingWarning: string | undefined;
+      if (args.status === 'ENABLED') {
+        const assetGroup = await googleAdsService.getAssetGroup(userId, customer_id, args.asset_group_resource_name);
+        const gate = await guardCreativeAddition({
+          customerId: customer_id,
+          action: 'ASSET_GROUP_UPDATE',
+          override: overrideTrackingCheck,
+          sessionId: opts?.sessionId,
+          finalUrls: assetGroup?.finalUrls ?? [],
+          resolveParent: async () => (assetGroup
+            ? { campaignResourceName: assetGroup.campaignResourceName, campaignStatus: await googleAdsService.getCampaignStatus(userId, customer_id, assetGroup.campaignResourceName) }
+            : null),
+        });
+        if (!gate.proceed) return gate.blockResult;
+        creativeTrackingWarning = gate.warning;
+      }
+      await googleAdsService.updateAssetGroup(userId, customer_id, args.asset_group_resource_name, { status: args.status });
+      return { success: true, message: 'Asset group updated', ...(creativeTrackingWarning ? { trackingWarning: creativeTrackingWarning } : {}) };
+    }
+
     if (entity_type === 'ASSET_GROUP' && action === 'RETAG_UTM') {
       // ENG-239 PMax retrofit: retags ONE existing asset group, never a list.
       if (!args.asset_group_resource_name) return { success: false, error: 'asset_group_resource_name is required for ASSET_GROUP RETAG_UTM' };
