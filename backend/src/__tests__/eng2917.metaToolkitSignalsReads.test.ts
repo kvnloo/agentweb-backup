@@ -82,4 +82,17 @@ describe('ENG-2917 signals reads', () => {
     expect(get).not.toHaveBeenCalled();
     await executeSignalsRead('ads_get_datasets', { account_id: 'act_123' }, credentials, { get: jest.fn().mockResolvedValue({ data: {} }) } as any);
   });
+  it('returns Meta refusals and outages as an actionable result, never a throw or the token', async () => {
+    const graphErr = (status: number, error?: any) => Object.assign(new Error(`Request failed with status code ${status}`), {
+      response: { status, data: error ? { error } : {} }, config: { url: 'https://graph.facebook.com/x?access_token=secret' },
+    });
+    const ok = jest.fn().mockResolvedValue({ data: { data: [{ id: '456' }] } });
+    const refused = await executeSignalsRead('ads_pixel_event_read', { pixel_id: '456' }, credentials, {
+      get: jest.fn().mockImplementationOnce(ok).mockRejectedValueOnce(graphErr(400, { code: 100, message: 'Unsupported get request.' })),
+    } as any);
+    expect(refused).toMatchObject({ success: false, error: 'Unsupported get request.', errorClass: 'upstream_rejected', metaErrorCode: 100 });
+    const outage = await executeSignalsRead('ads_get_datasets', {}, credentials, { get: jest.fn().mockRejectedValue(graphErr(500)) } as any);
+    expect(outage).toMatchObject({ success: false, errorClass: 'upstream_5xx' });
+    expect(JSON.stringify([refused, outage])).not.toContain('secret');
+  });
 });

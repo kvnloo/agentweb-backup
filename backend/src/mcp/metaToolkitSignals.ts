@@ -1,5 +1,6 @@
 import axios from 'axios';
 import { MetaToolkitRefusal } from './metaToolkitErrors';
+import { classifyMetaReadFailure, META_PERMISSION_MESSAGE, META_RECONNECT_MESSAGE } from '../utils/metaReadErrorClass';
 
 export const SIGNAL_FIELDS = {
   datasets: 'id,name,last_fired_time,is_created_by_business',
@@ -40,6 +41,43 @@ export const SIGNAL_READ_DEFINITIONS = names.map((name) => ({
 export async function executeSignalsRead(
   name: string, args: any, credentials: { accountId: string; accessToken: string },
   graph: Pick<typeof axios, 'get'> = axios,
+) {
+  try {
+    return await runSignalsRead(name, args, credentials, graph);
+  } catch (error: any) {
+    if (error instanceof MetaToolkitRefusal) throw error;
+    return signalsReadFailure(error);
+  }
+}
+
+/**
+ * Meta refusing or failing a signals read is a result the caller can act on (same shape as
+ * list_meta_ads_campaigns), not a 500. Only Meta's own error message is surfaced — never the
+ * request URL, which carries the access token.
+ */
+export function signalsReadFailure(error: any) {
+  const failure = classifyMetaReadFailure(error);
+  const graphError = error?.response?.data?.error;
+  const base = typeof graphError?.message === 'string' && graphError.message
+    ? graphError.message
+    : failure.errorClass === 'timeout' ? 'Meta did not respond in time.' : 'Meta could not complete this read.';
+  const message = failure.kind === 'credential'
+    ? `${base} ${failure.tokenInvalid ? META_RECONNECT_MESSAGE : META_PERMISSION_MESSAGE}`
+    : failure.kind === 'transient' ? `${base} Meta is temporarily unavailable or throttling; try again shortly.` : base;
+  return {
+    success: false,
+    message,
+    error: base,
+    errorClass: failure.errorClass,
+    errorType: failure.kind === 'credential' ? 'configuration' : failure.kind,
+    ...(graphError?.code !== undefined ? { metaErrorCode: graphError.code } : {}),
+    ...(error?.response?.status ? { code: error.response.status } : {}),
+  };
+}
+
+async function runSignalsRead(
+  name: string, args: any, credentials: { accountId: string; accessToken: string },
+  graph: Pick<typeof axios, 'get'>,
 ) {
   const def = SIGNAL_READ_DEFINITIONS.find((d) => d.name === name);
   if (!def) throw new MetaToolkitRefusal('Unknown signals read tool.');
