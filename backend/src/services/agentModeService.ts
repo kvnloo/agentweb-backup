@@ -15545,6 +15545,28 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     return { result, createdId: AgentModeService.extractDispatchedObjectId(result) };
   }
 
+  /** ENG-2919: read-only experiment tools reuse the account-bound credential resolver. */
+  public async readToolkitMetaExperiments(userId: string, name: string, args: any) {
+    const credentials = await this.getMetaCredentials(userId, args.account_id);
+    const { executeExperimentRead } = await import('../mcp/metaToolkitExperiments');
+    return executeExperimentRead(name, args, credentials);
+  }
+
+  /** ENG-2921: read-only account activity log via the account-bound credential resolver. */
+  public async readToolkitMetaActivityLog(userId: string, args: any) {
+    const { executeActivityLogRead, metaReadFailureResult } = await import('../mcp/metaToolkitDiagnostics');
+    const { classifyMetaReadFailure } = await import('../utils/metaReadErrorClass');
+    let credentials: { accountId: string; accessToken: string };
+    try {
+      credentials = await this.getMetaCredentials(userId, args?.account_id);
+    } catch (error: any) {
+      // ENG-2921: an expired/missing Meta connection is a readable reconnect result, not a bare 500.
+      if (classifyMetaReadFailure(error).kind === 'credential') return metaReadFailureResult(error);
+      throw error;
+    }
+    return executeActivityLogRead(args, credentials);
+  }
+
   /**
    * Zoma creative upload: Meta processing state of an uploaded video, ownership-scoped to the
    * selected ad account (a video id addresses a node globally). Returns Meta's preferred

@@ -23,6 +23,8 @@ import { executeMetaToolkitCall, getMetaToolkitManifest, MetaToolkitRefusal } fr
 import { RateLimiter } from '../middleware/rateLimiter';
 import { effectiveApiKeyScopes, findScopeDenial } from './server/apiKeyScopes';
 import { isZomaTool } from './zomaToolDefinitions';
+import { isExperimentRead } from './metaToolkitExperiments';
+import { explainMetaError, isDiagnosticsRead } from './metaToolkitDiagnostics';
 import { executeMetaToolkitWrite, isGuardedWriteRequest } from './metaToolkitWrites';
 import { runZomaTool, ZomaNotReadyError } from './zomaOnboarding';
 import { googleToolkitEnabled, META_PROVIDER, resolveProviderAccount } from './zomaProviders';
@@ -267,8 +269,30 @@ export async function handleMetaToolkitCall(
     isCreativeAssetRequest(request.toolName, args) || isGuardedWriteRequest(request.toolName, args)
       || isLifecycleWriteRequest(request.toolName, args),
   );
+  // ENG-2921: the error explainer is pure (static table) and needs no ad account.
+  if (request.toolName === 'ads_get_errors') {
+    const result = explainMetaError(args);
+    await meter('meta');
+    return result;
+  }
   const accountId = await resolveMetaToolkitAdAccount(caller.userId, args.account_id, deps);
   if (toolAcceptsAccountId(request.toolName)) args.account_id = accountId;
+
+  // ENG-2919: read-only experiment (ad study) tools; tools:read scope, no write metering.
+  if (isExperimentRead(request.toolName)) {
+    const { agentModeService } = await import('../services/agentModeService');
+    const result = await agentModeService.readToolkitMetaExperiments(caller.userId, request.toolName, args);
+    await meter('meta');
+    return stripCredentials(result);
+  }
+
+  // ENG-2921: read-only account activity log; tools:read scope, no write metering.
+  if (isDiagnosticsRead(request.toolName)) {
+    const { agentModeService } = await import('../services/agentModeService');
+    const result = await agentModeService.readToolkitMetaActivityLog(caller.userId, args);
+    await meter('meta');
+    return stripCredentials(result);
+  }
 
   // ENG-2303 P3: CAMPAIGN/AD_SET/AD CREATE + status/budget UPDATE go through the guarded
   // preview→confirm path; every other write stays refused by assertMetaToolkitV1Call.
