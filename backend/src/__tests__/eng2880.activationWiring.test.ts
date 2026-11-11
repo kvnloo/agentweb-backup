@@ -21,7 +21,7 @@ it.each([[false, false], [true, false], [false, true], [true, true]])('readiness
   } as any);
   expect(emitActivation).toHaveBeenCalledWith('u1', S.OnboardingStarted);
   expect((emitActivation as jest.Mock).mock.calls.some(c => c[1] === S.AdAccountConnected)).toBe(connected);
-  expect((emitActivation as jest.Mock).mock.calls.some(c => c[1] === S.OnboardingCompleted)).toBe(paid && connected);
+  expect((emitActivation as jest.Mock).mock.calls.some(c => c[1] === S.OnboardingCompleted)).toBe((process.env.ZOMA_REQUIRE_PAYMENT_METHOD === 'true' ? paid : true) && connected);
 });
 it('unknown account never emits onboarding', async () => {
   await expect(getZomaReadiness('missing', { getUser: async () => undefined } as any)).rejects.toThrow();
