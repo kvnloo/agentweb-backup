@@ -187,6 +187,9 @@ describe('ENG-2913 post-launch edits', () => {
     ['ROAS bidding (no ROAS floor field; unsupported on create)', upd('AD_SET', { bid_strategy: 'LOWEST_COST_WITH_MIN_ROAS' }, { ad_set_id: '5' }), /bid_strategy must be one of/],
     ['an impossible calendar date', upd('AD_SET', { end_time: '2026-02-30T09:00:00-0800' }, { ad_set_id: '5' }), /ISO 8601/],
     ['a PAUSE bundled with a budget (a coalesced budget repeat would drop the pause)', upd('AD_SET', { status: 'PAUSED', daily_budget: 50 }, { ad_set_id: '5' }), /budget or spend cap in its own UPDATE/],
+    ['targeting without locations (it would strip the ad set\'s countries)', upd('AD_SET', { targeting: { excluded_custom_audiences: [{ id: '777' }] } }, { ad_set_id: '5' }), /geo_locations is required/],
+    ['targeting with an empty location list', upd('AD_SET', { targeting: { geo_locations: { countries: [] } } }, { ad_set_id: '5' }), /geo_locations is required/],
+    ['a bid above the create-path safety limit', upd('AD_SET', { bid_strategy: 'COST_CAP', bid_amount: 5000 }, { ad_set_id: '5' }), /safety limit/],
     ['time without a timezone offset', upd('AD_SET', { end_time: '2026-12-01T09:00' }, { ad_set_id: '5' }), /offset/],
     ['bare number as a time', upd('AD_SET', { end_time: '1' }, { ad_set_id: '5' }), /ISO 8601/],
     ['end before start', upd('AD_SET', { start_time: '2026-12-02T00:00:00Z', end_time: '2026-12-01T00:00:00Z' }, { ad_set_id: '5' }), /after start_time/],
@@ -204,6 +207,32 @@ describe('ENG-2913 post-launch edits', () => {
       .mockResolvedValue({ id: '5', status: 'PAUSED', bid_strategy: 'LOWEST_COST_WITH_BID_CAP' });
     const deps = makeDeps({ readBack });
     const args = upd('AD_SET', { bid_strategy: 'COST_CAP', bid_amount: 5 }, { ad_set_id: '5' });
+    const preview: any = await executeMetaToolkitWrite('u1', args, deps);
+    const r: any = await executeMetaToolkitWrite('u1', { ...args, confirm: true, preview_token: preview.preview_token }, deps);
+    expect(r.status).toBe('PREVIEW_MISMATCH');
+    expect(deps.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('a failed Meta lookup of the creative is reported as a Meta problem, not "not found in ad account"', async () => {
+    const deps = makeDeps({ assertCreativeOwned: jest.fn().mockRejectedValue(Object.assign(new Error('Service temporarily unavailable'), { creativeLookupFailed: true })) });
+    await expect(executeMetaToolkitWrite('u1', upd('AD', { creative_id: '200' }, { ad_id: '9' }), deps)).rejects.toThrow(/Could not check creative 200 with Meta right now/);
+    expect(deps.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('a bid_amount alone on a LOWEST_COST_WITHOUT_CAP ad set is refused (Meta would store it unused)', async () => {
+    const deps = makeDeps({ readBack: jest.fn().mockResolvedValue({ id: '5', status: 'ACTIVE', bid_strategy: 'LOWEST_COST_WITHOUT_CAP' }) });
+    await expect(executeMetaToolkitWrite('u1', upd('AD_SET', { bid_amount: 10 }, { ad_set_id: '5' }), deps)).rejects.toThrow(/ignores bid_amount/);
+    expect(deps.dispatch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['targeting', { targeting: { geo_locations: { countries: ['CA'] } } }],
+    ['status', { status: 'ACTIVE' }],
+  ])('an approval does not apply after someone else changed the ad set\'s %s', async (_n, change) => {
+    const before = { id: '5', status: 'PAUSED', bid_strategy: 'COST_CAP', bid_amount: '300', targeting: { geo_locations: { countries: ['US'] } } };
+    const readBack = jest.fn().mockResolvedValueOnce(before).mockResolvedValue({ ...before, ...change });
+    const deps = makeDeps({ readBack });
+    const args = upd('AD_SET', { bid_amount: 5 }, { ad_set_id: '5' });
     const preview: any = await executeMetaToolkitWrite('u1', args, deps);
     const r: any = await executeMetaToolkitWrite('u1', { ...args, confirm: true, preview_token: preview.preview_token }, deps);
     expect(r.status).toBe('PREVIEW_MISMATCH');
