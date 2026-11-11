@@ -13,6 +13,7 @@
  * they are refused at call time. A caller that ignores the schema still cannot reach an
  * excluded action.
  */
+import { SIGNAL_READ_DEFINITIONS } from './metaToolkitSignals';
 import { metaToolRegistry } from '../emma/metaTools';
 import type { McpToolRegistry } from './server/registry';
 import { isZomaTool, ZOMA_TOOL_DEFINITIONS } from './zomaToolDefinitions';
@@ -100,6 +101,7 @@ export function getMetaToolkitManifest(registry: McpToolRegistry = metaToolRegis
   // ENG-2916: read-only account health + learning-phase tools (handled by the gateway).
   return [
     ...metaTools,
+    ...SIGNAL_READ_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
     ...EXPERIMENT_READ_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
     ...DIAGNOSTICS_READ_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
     ...META_HEALTH_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),

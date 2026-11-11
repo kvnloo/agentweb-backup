@@ -15552,6 +15552,13 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     return { result, createdId: AgentModeService.extractDispatchedObjectId(result) };
   }
 
+  /** Read-only signals tools reuse the same account-bound credential resolver as other toolkit reads. */
+  public async readToolkitMetaSignals(userId: string, name: string, args: any) {
+    const credentials = await this.getMetaCredentials(userId, args.account_id);
+    const { executeSignalsRead } = await import('../mcp/metaToolkitSignals');
+    return executeSignalsRead(name, args, credentials);
+  }
+
   /** ENG-2919: read-only experiment tools reuse the account-bound credential resolver. */
   public async readToolkitMetaExperiments(userId: string, name: string, args: any) {
     const credentials = await this.getMetaCredentials(userId, args.account_id);
