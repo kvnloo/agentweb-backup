@@ -15656,7 +15656,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     // ENG-2925 adds a bare numeric node (product / product-set read-back and parent-catalog
     // lookup) and the account's adsets edge (product-set in-use check) for the catalog writes.
     // ENG-2927 adds the account's adspixels edge (event-source pixel ownership).
-    if (!/^(act_\d+(\/(adsets|adspixels))?|\d+(\/(owned_product_catalogs|client_product_catalogs|products|product_sets|product_feeds|diagnostics|external_event_sources))?)$/.test(path)) {
+    if (!/^(act_\d+(\/(adsets|adspixels))?|\d+(\/(owned_product_catalogs|client_product_catalogs|products|product_sets|product_feeds|diagnostics|external_event_sources|uploads|rules))?)$/.test(path)) {
       throw new Error('Unsupported catalog path.');
     }
     const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
@@ -15689,7 +15689,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     userId: string, account_id: string, method: 'POST' | 'DELETE', path: string, params: Record<string, string>,
   ): Promise<any> {
     // ENG-2927: a catalog's external_event_sources edge (connect = POST, disconnect = DELETE).
-    const allowed = method === 'POST' ? /^\d+(\/(products|product_sets|external_event_sources))?$/ : /^\d+(\/external_event_sources)?$/;
+    // ENG-2926: business owned_product_catalogs (catalog create), a catalog's product_feeds, a feed's uploads / rules.
+    const allowed = method === 'POST' ? /^\d+(\/(products|product_sets|external_event_sources|owned_product_catalogs|product_feeds|uploads|rules))?$/ : /^\d+(\/external_event_sources)?$/;
     if (!allowed.test(path)) throw new Error('Unsupported catalog write path.');
     const { accessToken } = await this.getMetaCredentials(userId, account_id);
     const apiVersion = process.env.META_API_VERSION || 'v25.0';
