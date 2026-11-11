@@ -20,6 +20,7 @@ import {
 } from '../services/connectedAccountsDb';
 import { recordMcpToolUse, recordMcpWriteExecuted, type McpAuthMethod } from '../services/mcpUsageEventsService';
 import { executeMetaToolkitCall, getMetaToolkitManifest, MetaToolkitRefusal } from './metaToolkitManifest';
+import { isSignalsRead } from './metaToolkitSignals';
 import { RateLimiter } from '../middleware/rateLimiter';
 import { effectiveApiKeyScopes, findScopeDenial } from './server/apiKeyScopes';
 import { isZomaTool } from './zomaToolDefinitions';
@@ -29,6 +30,7 @@ import { executeMetaToolkitWrite, isGuardedWriteRequest } from './metaToolkitWri
 import { runZomaTool, ZomaNotReadyError } from './zomaOnboarding';
 import { googleToolkitEnabled, META_PROVIDER, resolveProviderAccount } from './zomaProviders';
 import { validateZomaToken, ZOMA_TOKEN_PREFIX } from './zomaDeviceFlow';
+import { isMetaHealthTool, runMetaHealthTool } from './metaToolkitHealth';
 import { executeMetaToolkitCreative, isCreativeAssetRequest, prepareZomaUpload } from './metaToolkitCreatives';
 
 export class MetaToolkitAuthError extends Error {
@@ -75,6 +77,8 @@ export interface MetaToolkitGatewayDeps {
   recordWrite?: typeof recordMcpWriteExecuted;
   /** Creative assets (AD_CREATIVE UPLOAD_IMAGE/UPLOAD_VIDEO/CREATE); defaults to executeMetaToolkitCreative. */
   executeCreative?: (userId: string, args: any) => Promise<any>;
+  /** ENG-2916 read-only health tools; defaults to runMetaHealthTool. */
+  runHealthTool?: typeof runMetaHealthTool;
   /** zoma_prepare_upload; defaults to prepareZomaUpload. */
   prepareUpload?: (userId: string, args: any) => Promise<any>;
 }
@@ -188,7 +192,12 @@ const SECRET_KEYS = new Set(['access_token', 'page_access_token', 'accessToken',
  * readers (e.g. PAGE LIST) return the Page access token for internal use; an external
  * caller must never receive it (found in the 2026-10-26 Zoma creative-upload E2E).
  */
+// ENG-2917: Graph paging URLs (paging.next / previous) embed the caller's access token as a
+// query parameter, so strings are scrubbed too, not only credential-named keys.
+const TOKEN_IN_URL = /([?&](?:access_token|appsecret_proof|input_token)=)[^&#\s"']*/gi;
+
 export function stripCredentials<T>(value: T, depth = 0): T {
+  if (typeof value === 'string') return value.replace(TOKEN_IN_URL, '$1[redacted]') as unknown as T;
   if (depth > 12 || value === null || typeof value !== 'object') return value;
   if (Array.isArray(value)) return value.map((v) => stripCredentials(v, depth + 1)) as unknown as T;
   const out: Record<string, unknown> = {};
@@ -273,11 +282,27 @@ export async function handleMetaToolkitCall(
   const accountId = await resolveMetaToolkitAdAccount(caller.userId, args.account_id, deps);
   if (toolAcceptsAccountId(request.toolName)) args.account_id = accountId;
 
+  if (isSignalsRead(request.toolName)) {
+    const { agentModeService } = await import('../services/agentModeService');
+    const result = await agentModeService.readToolkitMetaSignals(caller.userId, request.toolName, args);
+    // A Meta failure comes back as success:false (not thrown); like a refusal, it is not metered.
+    if ((result as any)?.success !== false) await meter('meta');
+    return stripCredentials(result);
+  }
+
+  // ENG-2916: read-only account health / learning phase on the resolved (owned) account.
+  if (isMetaHealthTool(request.toolName)) {
+    const health = await (deps.runHealthTool ?? runMetaHealthTool)(request.toolName, caller.userId, accountId, args);
+    await meter('meta');
+    return stripCredentials(health);
+  }
+
   // ENG-2919: read-only experiment (ad study) tools; tools:read scope, no write metering.
   if (isExperimentRead(request.toolName)) {
     const { agentModeService } = await import('../services/agentModeService');
     const result = await agentModeService.readToolkitMetaExperiments(caller.userId, request.toolName, args);
-    await meter('meta');
+    // A Meta failure comes back as success:false (not thrown); like a refusal, it is not metered.
+    if ((result as any)?.success !== false) await meter('meta');
     return stripCredentials(result);
   }
 
