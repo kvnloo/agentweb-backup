@@ -128,7 +128,17 @@ async function runSignalsRead(
   }
   const base = `https://graph.facebook.com/${process.env.META_API_VERSION || 'v25.0'}`;
   const account = `act_${credentials.accountId.replace(/^act_/, '')}`;
-  const get = async (path: string, params: Record<string, unknown> = {}) => (await graph.get(`${base}/${path}`, { params: { ...params, access_token: credentials.accessToken }, timeout: 15_000 })).data;
+  // A single transient Meta failure (5xx, throttle, timeout) is retried briefly, like the campaign list.
+  const get = async (path: string, params: Record<string, unknown> = {}) => {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return (await graph.get(`${base}/${path}`, { params: { ...params, access_token: credentials.accessToken }, timeout: 15_000 })).data;
+      } catch (error: any) {
+        if (attempt >= 2 || classifyMetaReadFailure(error).kind !== 'transient') throw error;
+        await new Promise((resolve) => setTimeout(resolve, process.env.NODE_ENV === 'test' ? 0 : 500 * (attempt + 1)));
+      }
+    }
+  };
   const page = { limit: args.limit ?? 100, ...(args.after !== undefined ? { after: args.after } : {}) };
   if (name === 'ads_get_datasets') return get(`${account}/adspixels`, { fields: SIGNAL_FIELDS.datasets, ...page });
   if (name === 'ads_get_customconversions') return get(`${account}/customconversions`, { fields: SIGNAL_FIELDS.conversions, ...page });

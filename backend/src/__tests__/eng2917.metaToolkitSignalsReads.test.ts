@@ -131,4 +131,10 @@ describe('ENG-2917 signals reads', () => {
     expect(outage).toMatchObject({ success: false, errorClass: 'upstream_5xx' });
     expect(JSON.stringify([refused, outage])).not.toContain('secret');
   });
+
+  it('retries one transient Meta failure before returning the read (Opslane P2)', async () => {
+    const get = jest.fn().mockRejectedValueOnce(Object.assign(new Error('Request failed with status code 500'), { response: { status: 500, data: {} } })).mockResolvedValueOnce({ data: { data: [{ id: '1' }] } });
+    await expect(executeSignalsRead('ads_get_datasets', {}, credentials, { get } as any)).resolves.toEqual({ data: [{ id: '1' }] });
+    expect(get).toHaveBeenCalledTimes(2);
+  });
 });
