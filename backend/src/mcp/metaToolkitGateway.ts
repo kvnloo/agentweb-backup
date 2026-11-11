@@ -32,6 +32,8 @@ import { googleToolkitEnabled, META_PROVIDER, resolveProviderAccount } from './z
 import { validateZomaToken, ZOMA_TOKEN_PREFIX } from './zomaDeviceFlow';
 import { isMetaHealthTool, runMetaHealthTool } from './metaToolkitHealth';
 import { isMetaCatalogTool, runMetaCatalogTool } from './metaToolkitCatalogs';
+import { CATALOG_WRITE_KIND, isMetaCatalogWrite, isMetaCatalogWriteTool, runMetaCatalogWriteTool } from './metaToolkitCatalogWrites';
+import { isMetaPagesTool, runMetaPagesTool } from './metaToolkitPages';
 import { executeMetaToolkitCreative, isCreativeAssetRequest, prepareZomaUpload } from './metaToolkitCreatives';
 import { executeMetaToolkitAudience } from './metaToolkitAudiences';
 
@@ -83,6 +85,10 @@ export interface MetaToolkitGatewayDeps {
   runHealthTool?: typeof runMetaHealthTool;
   /** ENG-2918 read-only catalog tools; defaults to runMetaCatalogTool. */
   runCatalogTool?: typeof runMetaCatalogTool;
+  /** ENG-2925 catalog product / product-set writes; defaults to runMetaCatalogWriteTool. */
+  runCatalogWriteTool?: typeof runMetaCatalogWriteTool;
+  /** ENG-2920 read-only Pages/Instagram/Ad Library tools; defaults to runMetaPagesTool. */
+  runPagesTool?: typeof runMetaPagesTool;
   /** zoma_prepare_upload; defaults to prepareZomaUpload. */
   prepareUpload?: (userId: string, args: any) => Promise<any>;
   /** ENG-2914 zoma_custom_audiences; defaults to executeMetaToolkitAudience. */
@@ -235,6 +241,31 @@ export async function handleMetaToolkitCall(
       userAgent: request.userAgent,
     });
 
+  // ENG-2303 P4: a write that reached Meta (it has a read-back verdict) is metered as its
+  // own event kind. Previews, mismatched confirms and refused/failed writes are not.
+  // A metering failure must not make an executed write look failed (that invites a retry
+  // and a duplicate), so it is logged and surfaced on the result instead of thrown.
+  const recordExecutedWrite = async (entityType: string, action: string, result: any) => {
+    if (typeof result?.verification !== 'string') return;
+    await (deps.recordWrite ?? recordMcpWriteExecuted)({
+      userId: caller.userId,
+      toolName: request.toolName,
+      authMethod: caller.authMethod,
+      apiKeyId: caller.apiKeyId,
+      clientId: caller.clientId,
+      sessionId: request.sessionId,
+      userAgent: request.userAgent,
+      platform: 'meta',
+      entityType,
+      action,
+      verification: result.verification,
+      objectId: result.id ?? result.image_hash ?? result.video_id ?? undefined,
+    }).catch((error) => {
+      console.error('[meta-toolkit] write metering failed:', error instanceof Error ? error.message : error);
+      result.metering = 'failed: this write executed but was not recorded in usage';
+    });
+  };
+
   // Creative upload staging needs no Meta account (it only mints an S3 PUT for the caller's own prefix).
   if (request.toolName === 'zoma_prepare_upload') {
     assertMetaToolkitScope(caller, request.toolName, true);
@@ -283,7 +314,7 @@ export async function handleMetaToolkitCall(
     request.toolName,
     audienceTool
       ? isAudienceWriteRequest(args)
-      : isCreativeAssetRequest(request.toolName, args) || isGuardedWriteRequest(request.toolName, args),
+      : isCreativeAssetRequest(request.toolName, args) || isGuardedWriteRequest(request.toolName, args) || isMetaCatalogWrite(request.toolName),
   );
   // ENG-2921: the error explainer is pure (static table) and needs no ad account.
   if (request.toolName === 'ads_get_errors') {
@@ -316,6 +347,23 @@ export async function handleMetaToolkitCall(
     return stripCredentials(catalogs);
   }
 
+  // ENG-2925: catalog product / product-set writes (+ the read-only filter helper), scoped to
+  // the resolved account's business catalogs; executed writes are metered like other writes.
+  if (isMetaCatalogWriteTool(request.toolName)) {
+    const result: any = await (deps.runCatalogWriteTool ?? runMetaCatalogWriteTool)(request.toolName, caller.userId, accountId, args);
+    const kind = CATALOG_WRITE_KIND[request.toolName];
+    if (kind) await recordExecutedWrite(kind.entityType, kind.action, result);
+    await meter('meta');
+    return stripCredentials(result);
+  }
+
+  // ENG-2920: read-only Pages / Instagram / Ad Library tools, scoped to the resolved account.
+  if (isMetaPagesTool(request.toolName)) {
+    const pages = await (deps.runPagesTool ?? runMetaPagesTool)(request.toolName, caller.userId, accountId, args);
+    await meter('meta');
+    return stripCredentials(pages);
+  }
+
   // ENG-2919: read-only experiment (ad study) tools; tools:read scope, no write metering.
   if (isExperimentRead(request.toolName)) {
     const { agentModeService } = await import('../services/agentModeService');
@@ -343,28 +391,8 @@ export async function handleMetaToolkitCall(
   else if (guardedWrite) result = await (deps.executeWrite ?? executeMetaToolkitWrite)(caller.userId, args);
   else result = await deps.execute(request.toolName, args, { userId: caller.userId, sessionId: request.sessionId });
 
-  // ENG-2303 P4: a write that reached Meta (it has a read-back verdict) is metered as its
-  // own event kind. Previews, mismatched confirms and refused/failed writes are not.
-  // A metering failure must not make an executed write look failed (that invites a retry
-  // and a duplicate), so it is logged and surfaced on the result instead of thrown.
-  if (guardedWrite && typeof (result as any)?.verification === 'string') {
-    await (deps.recordWrite ?? recordMcpWriteExecuted)({
-      userId: caller.userId,
-      toolName: request.toolName,
-      authMethod: caller.authMethod,
-      apiKeyId: caller.apiKeyId,
-      clientId: caller.clientId,
-      sessionId: request.sessionId,
-      userAgent: request.userAgent,
-      platform: 'meta',
-      entityType: audienceTool ? 'CUSTOM_AUDIENCE' : String(args.entity_type),
-      action: String(args.action),
-      verification: (result as any).verification,
-      objectId: (result as any).id ?? (result as any).image_hash ?? (result as any).video_id ?? undefined,
-    }).catch((error) => {
-      console.error('[meta-toolkit] write metering failed:', error instanceof Error ? error.message : error);
-      (result as any).metering = 'failed: this write executed but was not recorded in usage';
-    });
+  if (guardedWrite) {
+    await recordExecutedWrite(audienceTool ? 'CUSTOM_AUDIENCE' : String(args.entity_type), String(args.action), result);
   }
 
   await meter('meta');
