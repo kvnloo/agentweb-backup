@@ -9663,7 +9663,36 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     if (!context?.userId) return { success: false, message: 'Authentication required' };
-    const fileId = (args.url_or_id as string).match(/\/d\/([a-zA-Z0-9_-]+)/)?.[1] ?? args.url_or_id.trim();
+    // ENG-2907: a non-Google URL (e.g. a luma.com page) used to be sent to Drive
+    // verbatim as a fileId, 404, and cluster as a config failure. Refuse it up front.
+    let raw = String(args.url_or_id ?? '').trim();
+    // Unwrap google.com/url?q=<target> redirect links (Opslane P2 on #3960) so a
+    // wrapped Docs link is read, and a wrapped non-Google link is still refused.
+    try {
+      const wrapped = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`);
+      if (/^(www\.)?google\.com$/i.test(wrapped.hostname) && wrapped.pathname === '/url') {
+        const target = wrapped.searchParams.get('q') ?? wrapped.searchParams.get('url');
+        if (target) raw = target.trim();
+      }
+    } catch { /* not a URL; handled below */ }
+    // Drive file IDs are [A-Za-z0-9_-]+; anything with a scheme, '/' or '.' is a URL,
+    // including scheme-less pastes like "luma.com/event/..." (Opslane P1 on #3960).
+    const hasScheme = /^https?:\/\//i.test(raw);
+    if (hasScheme || /[./]/.test(raw)) {
+      let host = '';
+      try { host = new URL(hasScheme ? raw : `https://${raw}`).hostname.toLowerCase(); } catch { /* treated as non-Google below */ }
+      if (!/^(docs|drive|sheets)\.google\.com$/.test(host)) {
+        // blocked+reason marks this a by-design refusal (ToolResultPolicyBlockedError)
+        // so a retried bad URL does not trip the repeated-failure breaker (CodeRabbit #3960).
+        return {
+          success: false,
+          blocked: true,
+          reason: 'non_google_url',
+          message: `Not a Google Docs/Sheets/Drive URL (${host || raw}): read_google_doc only reads Google files. Use a web page fetch tool for other URLs.`,
+        };
+      }
+    }
+    const fileId = raw.match(/\/d\/([a-zA-Z0-9_-]+)/)?.[1] ?? raw;
     return googleDriveImpl.readGoogleFileById(fileId, context.userId);
   },
 });
