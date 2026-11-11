@@ -152,6 +152,7 @@ async function main() {
   let planned = 0;
   let applied = 0;
   let skipped = 0;
+  const blockedUsers = new Set<string>();
   for (const { plan, user } of plans) {
     const updates = buildBackfillUpdates(plan, user, usersTable);
     planned += updates.length;
@@ -161,7 +162,17 @@ async function main() {
         await doc.update(update).promise();
         applied++;
       } catch (error) {
-        if ((error as { code?: string })?.code !== 'ConditionalCheckFailedException') throw error;
+        // Legacy rows with NULL orgId violate the existing OrgId GSI. Do not repair
+        // unrelated data in an attribution backfill; report and continue other users.
+        if ((error as { code?: string })?.code === 'ValidationException' && (error as Error).message.includes('secondary index key to unsupported type')) {
+          blockedUsers.add(user.email);
+          console.error(`[eng2906-backfill] legacy index violation: ${user.email}`);
+          break;
+        }
+        if ((error as { code?: string })?.code !== 'ConditionalCheckFailedException') {
+          console.error(`[eng2906-backfill] update failed email=${user.email} applied=${applied} skipped=${skipped}`);
+          throw error;
+        }
         skipped++; // the value appeared since the read: never overwrite it
       }
     }
@@ -195,7 +206,7 @@ async function main() {
         test: count((p) => p.accountFlag === 'test'),
       },
       plannedWrites: planned,
-      ...(apply ? { applied, skippedConditional: skipped } : {}),
+      ...(apply ? { applied, skippedConditional: skipped, blockedUsers: [...blockedUsers] } : {}),
       csv: out,
     }),
   );
