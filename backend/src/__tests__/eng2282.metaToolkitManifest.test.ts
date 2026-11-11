@@ -31,10 +31,11 @@ import {
 } from '../mcp/metaToolkitManifest';
 import { ZOMA_TOOL_NAMES } from '../mcp/zomaToolDefinitions';
 import { META_HEALTH_TOOL_NAMES } from '../mcp/metaToolkitHealth';
+import { META_CATALOG_TOOL_NAMES } from '../mcp/metaToolkitCatalogs';
 
 // ENG-2303: the toolkit also advertises toolkit-local Zoma onboarding tools (not registry tools).
 // ENG-2916: read-only account health + learning-phase tools sit between the Meta reads and Zoma onboarding.
-const EXPECTED_TOOLKIT_NAMES = [...META_TOOLKIT_V1_TOOL_NAMES, 'ads_experiment_list_tests', 'ads_experiment_abtest_get_test', 'ads_experiment_lift_get_test', 'ads_account_get_activity_logs', 'ads_get_errors', ...META_HEALTH_TOOL_NAMES, ...ZOMA_TOOL_NAMES];
+const EXPECTED_TOOLKIT_NAMES = [...META_TOOLKIT_V1_TOOL_NAMES, 'ads_experiment_list_tests', 'ads_experiment_abtest_get_test', 'ads_experiment_lift_get_test', 'ads_account_get_activity_logs', 'ads_get_errors', ...META_HEALTH_TOOL_NAMES, ...META_CATALOG_TOOL_NAMES, ...ZOMA_TOOL_NAMES];
 
 const ctx = { userId: 'user-1', sessionId: 's-1' };
 

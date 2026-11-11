@@ -15638,6 +15638,36 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     }
   }
 
+  /**
+   * ENG-2918: read-only Graph GET for the catalog tools. The path must be the caller's own
+   * account node or a numeric node's catalog edge; metaToolkitCatalogs enforces that catalog
+   * ids belong to the account's business before calling this.
+   */
+  public async readToolkitMetaCatalogGraph(
+    userId: string, account_id: string, path: string, params: Record<string, string>,
+  ): Promise<any> {
+    if (!/^(act_\d+|\d+\/(owned_product_catalogs|client_product_catalogs|products|product_sets|product_feeds))$/.test(path)) {
+      throw new Error('Unsupported catalog path.');
+    }
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    if (path.startsWith('act_') && path !== `act_${accountId.replace(/^act_/, '')}`) throw new Error('Account mismatch.');
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    try {
+      const { data } = await axios.get(`https://graph.facebook.com/${apiVersion}/${path}`, {
+        params: { ...params, access_token: accessToken },
+        timeout: 30_000,
+        maxContentLength: 5_000_000,
+      });
+      return data;
+    } catch (error: any) {
+      // The axios error carries the access token in its config/URL; re-throw Meta's fields only.
+      const meta = error?.response?.data?.error;
+      const wrapped: any = new Error(String(meta?.error_user_msg || meta?.message || 'Meta request failed.'));
+      wrapped.metaError = meta ? { code: meta.code, error_subcode: meta.error_subcode, message: meta.message } : null;
+      throw wrapped;
+    }
+  }
+
   /** ENG-2913: a creative swapped into an ad must belong to the selected ad account (creative ids are global). */
   public async assertToolkitMetaCreativeOwned(userId: string, account_id: string, creativeId: string): Promise<void> {
     const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
