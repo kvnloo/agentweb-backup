@@ -184,6 +184,9 @@ describe('ENG-2913 post-launch edits', () => {
     ['targeting not an object', upd('AD_SET', { targeting: 'US' }, { ad_set_id: '5' }), /targeting must be/],
     ['bad exclusion', upd('AD_SET', { targeting: { excluded_custom_audiences: ['777'] } }, { ad_set_id: '5' }), /excluded_custom_audiences/],
     ['bad time', upd('AD_SET', { end_time: 'next friday' }, { ad_set_id: '5' }), /ISO 8601/],
+    ['ROAS bidding (no ROAS floor field; unsupported on create)', upd('AD_SET', { bid_strategy: 'LOWEST_COST_WITH_MIN_ROAS' }, { ad_set_id: '5' }), /bid_strategy must be one of/],
+    ['an impossible calendar date', upd('AD_SET', { end_time: '2026-02-30T09:00:00-0800' }, { ad_set_id: '5' }), /ISO 8601/],
+    ['a PAUSE bundled with a budget (a coalesced budget repeat would drop the pause)', upd('AD_SET', { status: 'PAUSED', daily_budget: 50 }, { ad_set_id: '5' }), /budget or spend cap in its own UPDATE/],
     ['time without a timezone offset', upd('AD_SET', { end_time: '2026-12-01T09:00' }, { ad_set_id: '5' }), /offset/],
     ['bare number as a time', upd('AD_SET', { end_time: '1' }, { ad_set_id: '5' }), /ISO 8601/],
     ['end before start', upd('AD_SET', { start_time: '2026-12-02T00:00:00Z', end_time: '2026-12-01T00:00:00Z' }, { ad_set_id: '5' }), /after start_time/],
@@ -202,6 +205,25 @@ describe('ENG-2913 post-launch edits', () => {
     const deps = makeDeps({ readBack });
     const args = upd('AD_SET', { bid_strategy: 'COST_CAP', bid_amount: 5 }, { ad_set_id: '5' });
     const preview: any = await executeMetaToolkitWrite('u1', args, deps);
+    const r: any = await executeMetaToolkitWrite('u1', { ...args, confirm: true, preview_token: preview.preview_token }, deps);
+    expect(r.status).toBe('PREVIEW_MISMATCH');
+    expect(deps.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('an unparseable read-back time is UNCONFIRMED, not MISMATCH', async () => {
+    const prior = { id: '5', status: 'PAUSED', end_time: '2026-11-01T00:00:00+0000' };
+    const deps = makeDeps({ readBack: jest.fn().mockResolvedValueOnce(prior).mockResolvedValueOnce(prior).mockResolvedValue({ ...prior, end_time: 'not-a-date' }) });
+    expect(((await previewThenConfirm(deps, upd('AD_SET', { end_time: '2027-01-01T00:00:00Z' }, { ad_set_id: '5' }))) as any).verification).toBe('UNCONFIRMED');
+  });
+
+  it('a schedule preview made while PAUSED does not confirm after the ad set went ACTIVE (no spend policy)', async () => {
+    const readBack = jest.fn()
+      .mockResolvedValueOnce({ id: '5', status: 'PAUSED' })
+      .mockResolvedValue({ id: '5', status: 'ACTIVE' });
+    const deps = makeDeps({ readBack });
+    const args = upd('AD_SET', { end_time: '2027-01-01T00:00:00Z' }, { ad_set_id: '5' });
+    const preview: any = await executeMetaToolkitWrite('u1', args, deps);
+    expect(preview.preview).not.toMatch(/ACTIVE: the new schedule/);
     const r: any = await executeMetaToolkitWrite('u1', { ...args, confirm: true, preview_token: preview.preview_token }, deps);
     expect(r.status).toBe('PREVIEW_MISMATCH');
     expect(deps.dispatch).not.toHaveBeenCalled();
