@@ -15390,9 +15390,16 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         : await metaService.getAdSet(accessToken, ad_set_id!, accountId || '');
       // Same currency-aware normalizer the writers use (ENG-2277): every money input is major units.
       const money = await this.normalizeMetaMoneyParams(accountId || '', accessToken, params);
-      const changes = fields.flatMap(field => {
+      type BudgetChange = { field: string; severity: 'unknown' | 'critical' | 'warning' | 'normal'; ratio: number | null; prior: number | undefined; proposed: number | undefined };
+      const changes = fields.flatMap((field): BudgetChange[] => {
         const proposed = money.params[field];
         if (proposed === undefined) return [];
+        // A spend cap is a ceiling: adding one to an object Meta read back with no cap only
+        // restricts spend. Requires a real read-back (id present) so a failed read stays unknown.
+        if (field === 'spend_cap' && prior?.id && (prior[field] === undefined || prior[field] === null || prior[field] === '')) {
+          const capped = classifyMetaBudgetChange(proposed, proposed);
+          if (capped.severity !== 'unknown') return [{ field, severity: 'normal' as const, ratio: null, prior: undefined, proposed: capped.proposed }];
+        }
         return [{ field, ...classifyMetaBudgetChange(prior?.[field], proposed) }];
       });
       if (changes.some(change => change.severity === 'unknown')) return { blocked };
@@ -15629,6 +15636,24 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       wrapped.metaError = meta ? { code: meta.code, error_subcode: meta.error_subcode, message: meta.message } : null;
       throw wrapped;
     }
+  }
+
+  /** ENG-2913: a creative swapped into an ad must belong to the selected ad account (creative ids are global). */
+  public async assertToolkitMetaCreativeOwned(userId: string, account_id: string, creativeId: string): Promise<void> {
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    let creative: any;
+    try {
+      creative = await metaService.getAdCreative(accessToken, creativeId);
+    } catch (error: any) {
+      // Meta code 100 = the node does not exist or is not visible to this token: a real "not
+      // found". Anything else (5xx, rate limit, network) is a failed lookup, not a verdict.
+      const code = Number(error?.structuredError?.code ?? error?.response?.error?.code);
+      if (code === 100) throw error;
+      const failed: any = new Error(String(error?.structuredError?.error_user_msg || error?.message || 'Meta request failed'));
+      failed.creativeLookupFailed = true;
+      throw failed;
+    }
+    MetaService.assertOwnedByAccount(creative?.account_id, creativeId, 'Ad creative', accountId);
   }
 
   /** Read-back after a toolkit write: status + effective status + budgets, ownership-scoped. */

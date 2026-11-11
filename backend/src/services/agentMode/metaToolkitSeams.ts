@@ -25,6 +25,9 @@ export interface MetaReadBackReader {
 }
 
 const READ_BACK_FIELDS = ['id', 'status', 'effective_status', 'daily_budget', 'lifetime_budget'];
+// ENG-2913: the post-launch edit fields, so every UPDATE can be diffed and verified.
+const CAMPAIGN_EDIT_FIELDS = ['name', 'bid_strategy', 'spend_cap'];
+const AD_SET_EDIT_FIELDS = ['name', 'bid_strategy', 'bid_amount', 'targeting', 'start_time', 'end_time'];
 
 /** Ownership-scoped read-back of one written node: status, effective status, budgets. */
 export async function readBackMetaNode(
@@ -32,9 +35,9 @@ export async function readBackMetaNode(
 ) {
   let node: any;
   if (entityType === 'CAMPAIGN') {
-    node = (await reader.listCampaigns(accountId, accessToken, { campaignId: id, fields: READ_BACK_FIELDS })).campaigns?.[0];
+    node = (await reader.listCampaigns(accountId, accessToken, { campaignId: id, fields: [...READ_BACK_FIELDS, ...CAMPAIGN_EDIT_FIELDS] })).campaigns?.[0];
   } else if (entityType === 'AD_SET') {
-    node = (await reader.listAdSets(accountId, accessToken, undefined, { adSetId: id, fields: [...READ_BACK_FIELDS, 'campaign_id'] })).adSets?.[0];
+    node = (await reader.listAdSets(accountId, accessToken, undefined, { adSetId: id, fields: [...READ_BACK_FIELDS, 'campaign_id', ...AD_SET_EDIT_FIELDS] })).adSets?.[0];
   } else if (entityType === 'AD') {
     node = await reader.getAd(accessToken, id, accountId);
   } else {
@@ -48,5 +51,13 @@ export async function readBackMetaNode(
     daily_budget: node.daily_budget,
     lifetime_budget: node.lifetime_budget,
     ...(entityType === 'AD_SET' ? { campaign_id: node.campaign_id } : {}),
+    ...pick(node, entityType === 'CAMPAIGN' ? CAMPAIGN_EDIT_FIELDS : entityType === 'AD_SET' ? AD_SET_EDIT_FIELDS : ['name']),
+    ...(entityType === 'AD' && node.creative?.id ? { creative_id: String(node.creative.id) } : {}),
   };
+}
+
+function pick(node: any, fields: string[]): Record<string, any> {
+  const out: Record<string, any> = {};
+  for (const f of fields) if (node[f] !== undefined) out[f] = node[f];
+  return out;
 }

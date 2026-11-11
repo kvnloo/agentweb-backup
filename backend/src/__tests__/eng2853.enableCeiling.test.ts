@@ -35,6 +35,7 @@ function fixture(platform: 'google' | 'meta', amount: unknown = 200) {
     previewMoney: jest.fn(),
     preview: jest.fn().mockResolvedValue({ awaitingUserConfirmation: true, summary: 'Enable', metaWriteDispatch: {} }),
     readBack: jest.fn(async (_u, _a, _e, id) => state[id] ? { ...state[id] } : null),
+    assertCreativeOwned: jest.fn().mockResolvedValue(undefined),
   };
   const args = platform === 'google'
     ? { entity_type: 'AD_GROUP', action: 'UPDATE', customer_id: '123', ad_group_resource_name: group, status: 'ENABLED' }

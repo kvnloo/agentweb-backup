@@ -55,6 +55,7 @@ function makeDeps(over: Partial<MetaToolkitWriteDeps> = {}, currency = 'USD') {
     })),
     dispatch: jest.fn().mockResolvedValue({ result: { success: true, message: 'Campaign "X" created successfully' }, createdId: '999' }),
     readBack: jest.fn().mockResolvedValue({ id: '999', status: 'PAUSED', effective_status: 'PAUSED', daily_budget: '5000' }),
+    assertCreativeOwned: jest.fn().mockResolvedValue(undefined),
     spendCeilingPolicy: () => null,
     secret: () => 'test-secret',
     now: () => NOW,
@@ -248,7 +249,7 @@ describe('ENG-2303 read-back node mapping', () => {
 
   it('reads each entity ownership-scoped and maps status/effective_status/budgets', async () => {
     await expect(readBackMetaNode(reader, '111', 'tok', 'CAMPAIGN', '1')).resolves.toEqual({
-      id: '1', status: 'PAUSED', effective_status: 'PAUSED', daily_budget: '5000', lifetime_budget: undefined,
+      id: '1', status: 'PAUSED', effective_status: 'PAUSED', daily_budget: '5000', lifetime_budget: undefined, name: 'x', // ENG-2913: edit fields
     });
     expect(reader.listCampaigns).toHaveBeenCalledWith('111', 'tok', expect.objectContaining({ campaignId: '1' }));
     await expect(readBackMetaNode(reader, '111', 'tok', 'AD_SET', '2')).resolves.toBeNull();
