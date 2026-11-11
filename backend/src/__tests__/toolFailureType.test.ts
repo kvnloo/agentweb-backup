@@ -115,6 +115,12 @@ describe('classifyToolFailureType', () => {
       ).toBe('by_design');
     });
 
+    it('classifies the read_google_doc non-Google URL refusal as by_design (ENG-2907)', () => {
+      expect(
+        classifyToolFailureType('Error', 'Not a Google Docs/Sheets/Drive URL (luma.com): read_google_doc only reads Google files. Use a web page fetch tool for other URLs.'),
+      ).toBe('by_design');
+    });
+
     it('classifies the landing-page share non-member refusal as by_design (ENG-2585)', () => {
       expect(
         classifyToolFailureType('Error', "API error (400): 'x@y.com' is not a member of the page owner's organization"),
