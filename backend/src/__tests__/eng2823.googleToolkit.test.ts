@@ -247,7 +247,8 @@ describe('ENG-2823 Google toolkit manifest and reads', () => {
 
   it('refuses everything outside the curated surface', () => {
     expect(() => assertGoogleToolkitCall('call_google_ads_api', { entity_type: 'CAMPAIGN', action: 'REMOVE' })).toThrow(MetaToolkitRefusal);
-    expect(() => assertGoogleToolkitCall('call_google_ads_api', { entity_type: 'KEYWORD', action: 'ADD' })).toThrow(MetaToolkitRefusal);
+    // ENG-2928 moved KEYWORD ADD into the guarded surface; campaign-level asset attach stays out.
+    expect(() => assertGoogleToolkitCall('call_google_ads_api', { entity_type: 'CAMPAIGN_ASSET', action: 'ATTACH' })).toThrow(MetaToolkitRefusal);
     expect(() => assertGoogleToolkitCall('call_google_ads_api', { entity_type: 'CAMPAIGN', action: 'LIST', client_id: 'x' })).toThrow(MetaToolkitRefusal);
     expect(() => assertGoogleToolkitCall('call_google_ads_api', { entity_type: 'CAMPAIGN', action: 'UPDATE', override_tracking_check: true })).toThrow(MetaToolkitRefusal);
     expect(() => assertGoogleToolkitCall('send_email', {})).toThrow(MetaToolkitRefusal);

@@ -65,11 +65,11 @@ ACTION MATRIX:
               tell the user this explicitly before calling, the same way you would for any change with a wider
               blast radius than it sounds like. Never call in a loop over multiple ads — single-target only,
               one ad per call.
-  ASSET       → UPLOAD
+  ASSET       → UPLOAD (asset_type IMAGE|LOGO|VIDEO|TEXT, name, data: https URL / YouTube id / the text)
   CAMPAIGN_ASSET → ATTACH (campaign_resource_name, assets[{fieldType, assetResourceName?, text?}])
               fieldType values: BUSINESS_NAME (use text), LOGO, SQUARE_MARKETING_IMAGE, MARKETING_IMAGE (use assetResourceName)
               Note: brand guidelines are handled automatically in CAMPAIGN CREATE — use ATTACH only for adding additional campaign-level assets after campaign creation
-  ASSET_GROUP → CREATE, RETAG_UTM (asset_group_resource_name)
+  ASSET_GROUP → CREATE, UPDATE (asset_group_resource_name, status — created PAUSED; ENABLED runs the creative-addition tracking gate), RETAG_UTM (asset_group_resource_name)
               RETAG_UTM (ENG-239 — retrofit UTMs onto a PMax asset group found untagged, e.g. via
               audit_ad_utm_coverage): merges missing UTM keys directly into final_urls (asset groups have no
               final_url_suffix field). No utm_content — {creative} is unsupported on Performance Max, per
@@ -135,7 +135,7 @@ ACTION MATRIX:
         target_partner_search_network: { type: 'boolean', description: 'CAMPAIGN UPDATE only. Controls a separate partner network available only to select eligible accounts. This does not control Google Search Partners; use target_search_network for that. Maps to network_settings.target_partner_search_network.' },
         ad_group_resource_name: { type: 'string', description: 'Required for KEYWORD LIST/ADD, AD LIST/CREATE, AD_GROUP UPDATE. For KEYWORD ADD_NEGATIVE, required only as an alternative to campaign_resource_name (either one works). Not used by KEYWORD REMOVE, which identifies the keyword via criterion_resource_name alone.' },
         ad_resource_name: { type: 'string', description: 'AdGroupAd resource name. Required for AD UPDATE/REMOVE/RETAG_UTM. Obtain from AD LIST.' },
-        asset_group_resource_name: { type: 'string', description: 'Asset group resource name. Required for ASSET_GROUP RETAG_UTM. Obtain from audit_ad_utm_coverage or a GAQL read on asset_group.' },
+        asset_group_resource_name: { type: 'string', description: 'Asset group resource name. Required for ASSET_GROUP UPDATE and RETAG_UTM. Obtain from audit_ad_utm_coverage or a GAQL read on asset_group.' },
         brand_business_name: { type: 'string', description: 'Business name for PMax brand guidelines. Required for PERFORMANCE_MAX CAMPAIGN CREATE when brand guidelines are enforced.' },
         brand_logo_asset_resource_name: { type: 'string', description: 'Logo image asset resource name for PMax brand guidelines. Upload via ASSET UPLOAD first.' },
         criterion_resource_name: { type: 'string', description: 'Criterion resource name. Required for KEYWORD UPDATE and KEYWORD REMOVE (ad group criterion, from KEYWORD LIST) and CAMPAIGN REMOVE_PROXIMITY (campaign criterion, from a raw GAQL query on campaign_criterion).' },
@@ -156,7 +156,7 @@ ACTION MATRIX:
         descriptions: { type: 'array', items: { type: 'string' }, description: 'Ad descriptions. Required for AD CREATE. Min 2 for RSA.' },
         final_url: { type: 'string', description: 'Landing page URL. Required for AD CREATE and ASSET_GROUP CREATE.' },
         image_asset_resource_names: { type: 'array', items: { type: 'string' }, description: 'Image asset resource names. Optional, Display ads only.' },
-        asset_type: { type: 'string', enum: ['IMAGE', 'LOGO', 'VIDEO'], description: 'Asset type for ASSET UPLOAD. Use LOGO for square logo images (internally uploaded as IMAGE). Use IMAGE for marketing images. Use VIDEO for YouTube videos.' },
+        asset_type: { type: 'string', enum: ['IMAGE', 'LOGO', 'VIDEO', 'TEXT'], description: 'Asset type for ASSET UPLOAD. Use LOGO for square logo images (internally uploaded as IMAGE). Use IMAGE for marketing images. Use VIDEO for YouTube videos. Use TEXT for a text asset (data is the text).' },
         data: { type: 'string', description: 'Asset data. For IMAGE/LOGO: a public URL (https://...) — backend will fetch and upload. For VIDEO: YouTube video ID string. for VIDEO.' },
         long_headlines: { type: 'array', items: { type: 'string' }, description: 'Long headlines for ASSET_GROUP CREATE (PMax).' },
         square_image_assets: { type: 'array', items: { type: 'string' }, description: 'Square image asset resource names for ASSET_GROUP CREATE.' },

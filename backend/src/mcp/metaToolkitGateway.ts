@@ -33,6 +33,7 @@ import { validateZomaToken, ZOMA_TOKEN_PREFIX } from './zomaDeviceFlow';
 import { isMetaHealthTool, runMetaHealthTool } from './metaToolkitHealth';
 import { isMetaCatalogTool, runMetaCatalogTool } from './metaToolkitCatalogs';
 import { EVENT_SOURCE_WRITE_KIND, isMetaEventSourceTool, isMetaEventSourceWrite, runMetaEventSourceTool } from './metaToolkitEventSources';
+import { CATALOG_FEED_WRITE_KIND, isMetaCatalogFeedTool, isMetaCatalogFeedWrite, runMetaCatalogFeedTool } from './metaToolkitCatalogFeeds';
 import { CATALOG_WRITE_KIND, isMetaCatalogWrite, isMetaCatalogWriteTool, runMetaCatalogWriteTool } from './metaToolkitCatalogWrites';
 import { isMetaPagesTool, runMetaPagesTool } from './metaToolkitPages';
 import { executeMetaToolkitCreative, isCreativeAssetRequest, prepareZomaUpload } from './metaToolkitCreatives';
@@ -93,6 +94,8 @@ export interface MetaToolkitGatewayDeps {
   runCatalogWriteTool?: typeof runMetaCatalogWriteTool;
   /** ENG-2927 catalog event sources; defaults to runMetaEventSourceTool. */
   runEventSourceTool?: typeof runMetaEventSourceTool;
+  /** ENG-2926 catalog create/update, feeds, upload sessions, feed rules; defaults to runMetaCatalogFeedTool. */
+  runCatalogFeedTool?: typeof runMetaCatalogFeedTool;
   /** ENG-2920 read-only Pages/Instagram/Ad Library tools; defaults to runMetaPagesTool. */
   runPagesTool?: typeof runMetaPagesTool;
   /** zoma_prepare_upload; defaults to prepareZomaUpload. */
@@ -297,7 +300,7 @@ export async function handleMetaToolkitCall(
   if (googleToolkitEnabled()) {
     const google = await import('./googleToolkitGateway');
     if (google.isGoogleToolkitTool(request.toolName)) {
-      assertMetaToolkitScope(caller, request.toolName, google.isGoogleGuardedWrite(request.toolName, request.args ?? {}));
+      assertMetaToolkitScope(caller, request.toolName, google.isGoogleToolkitWrite(request.toolName, request.args ?? {}));
       return stripCredentials(await google.handleGoogleToolkitCall(caller, request, {
         listAccounts: deps.listAccounts,
         now: deps.now,
@@ -314,7 +317,7 @@ export async function handleMetaToolkitCall(
     request.toolName,
     isCreativeAssetRequest(request.toolName, args) || isGuardedWriteRequest(request.toolName, args)
       || isLifecycleWriteRequest(request.toolName, args) || isMetaCatalogWrite(request.toolName)
-      || isMetaEventSourceWrite(request.toolName),
+      || isMetaEventSourceWrite(request.toolName) || isMetaCatalogFeedWrite(request.toolName),
   );
   // ENG-2921: the error explainer is pure (static table) and needs no ad account.
   if (request.toolName === 'ads_get_errors') {
@@ -361,6 +364,15 @@ export async function handleMetaToolkitCall(
   if (isMetaEventSourceTool(request.toolName)) {
     const result: any = await (deps.runEventSourceTool ?? runMetaEventSourceTool)(request.toolName, caller.userId, accountId, args);
     const kind = EVENT_SOURCE_WRITE_KIND[request.toolName];
+    if (kind) await recordExecutedWrite(kind.entityType, kind.action, result);
+    await meter('meta');
+    return stripCredentials(result);
+  }
+
+  // ENG-2926: catalog create/update, product feeds, upload sessions, feed rules.
+  if (isMetaCatalogFeedTool(request.toolName)) {
+    const result: any = await (deps.runCatalogFeedTool ?? runMetaCatalogFeedTool)(request.toolName, caller.userId, accountId, args);
+    const kind = CATALOG_FEED_WRITE_KIND[request.toolName];
     if (kind) await recordExecutedWrite(kind.entityType, kind.action, result);
     await meter('meta');
     return stripCredentials(result);
