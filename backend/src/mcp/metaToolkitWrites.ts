@@ -37,7 +37,8 @@ import { MetaToolkitRefusal } from './metaToolkitErrors';
 import { GUARDED_WRITE_ACTIONS, GUARDED_WRITE_ENTITIES, isGuardedWriteRequest } from './metaToolkitWriteSurface';
 import { adsManagementScopeState, assertZomaWriteReady, ZomaNotReadyError } from './zomaOnboarding';
 import {
-  consumePreviewToken, previewFingerprint, previewResponse, previewTokenMatches,
+  consumePreviewToken, isOutcomeUnknownFailure, previewFingerprint, previewResponse, previewTokenMatches,
+  rememberTokenOutcome, replayTokenOutcome,
   PREVIEW_TOKEN_TTL_MS, type WriteVerification,
 } from './zomaWriteGuard';
 
@@ -84,6 +85,8 @@ export interface MetaToolkitWriteDeps {
   secret: () => string;
   now: () => number;
   consumedTokens: Map<string, number>;
+  /** ENG-2931: outcome per consumed preview token, replayed on a repeat confirm. */
+  tokenOutcomes?: Map<string, { exp: number; outcome: any }>;
 }
 
 /**
@@ -117,6 +120,7 @@ const defaultDeps: MetaToolkitWriteDeps = {
   secret: () => getJwtSecret(),
   now: () => Date.now(),
   consumedTokens: new Map(),
+  tokenOutcomes: new Map(),
 };
 
 function targetId(entity: string, args: any): string | undefined {
@@ -418,57 +422,73 @@ export async function executeMetaToolkitWrite(userId: string, rawArgs: any, deps
     };
   }
   if (!consumePreviewToken(deps.consumedTokens, previewToken, now)) {
+    // ENG-2931: a client that lost the answer and repeats the same confirm gets that outcome back.
+    const replay = replayTokenOutcome((deps.tokenOutcomes ??= new Map()), previewToken, now);
+    if (replay) return replay;
     throw new MetaToolkitRefusal('This preview_token was already used. Run a new preview for another change.');
   }
 
-  // ENG-2931: a throw after the token was consumed (timeout, 5xx, transport) is outcome-unknown:
-  // Meta may have applied it, so it is UNCONFIRMED, never success and never "did not apply".
-  let dispatched: { result: any; createdId?: string | null };
-  try {
-    dispatched = await deps.dispatch(userId, preview.metaWriteDispatch);
-  } catch (error: unknown) {
-    return {
-      success: false,
-      verification: 'UNCONFIRMED' as WriteVerification,
-      id: action === 'CREATE' ? null : (targetId(entity, args) ?? null),
-      message: `UNCONFIRMED: the ${action} ${entity} request failed without a definite answer from Meta (${error instanceof Error ? error.message : String(error)}), so it may or may not have been applied. Do not report this as done and do not retry blindly — check the ${entity} first.`,
-    };
-  }
-  const { result, createdId } = dispatched;
-  if (result?.coalesced) {
-    return { status: 'NO_CHANGE', success: true, message: String(result.message ?? 'No change was needed.') };
-  }
-  if (result?.awaitingUserConfirmation) {
-    return { status: 'NEEDS_NEW_PREVIEW', success: false, message: 'Meta state changed after approval; nothing was sent. Run the preview again.' };
-  }
-  if (!result?.success || result?.blocked || result?.throttled) {
-    return {
-      status: 'FAILED', success: false, message: errorText(result),
-      ...(result?.retryAfterMs ? { retry_after_ms: result.retryAfterMs } : {}),
-    };
-  }
+  const outcome = await (async () => {
+    // ENG-2931: a throw after the token was consumed (timeout, 5xx, transport) is outcome-unknown:
+    // Meta may have applied it, so it is UNCONFIRMED, never success and never "did not apply".
+    let dispatched: { result: any; createdId?: string | null };
+    try {
+      dispatched = await deps.dispatch(userId, preview.metaWriteDispatch);
+    } catch (error: unknown) {
+      return {
+        success: false,
+        verification: 'UNCONFIRMED' as WriteVerification,
+        id: action === 'CREATE' ? null : (targetId(entity, args) ?? null),
+        message: `UNCONFIRMED: the ${action} ${entity} request failed without a definite answer from Meta (${error instanceof Error ? error.message : String(error)}), so it may or may not have been applied. Do not report this as done and do not retry blindly — check the ${entity} first.`,
+      };
+    }
+    const { result, createdId } = dispatched;
+    if (result?.coalesced) {
+      return { status: 'NO_CHANGE', success: true, message: String(result.message ?? 'No change was needed.') };
+    }
+    if (result?.awaitingUserConfirmation) {
+      return { status: 'NEEDS_NEW_PREVIEW', success: false, message: 'Meta state changed after approval; nothing was sent. Run the preview again.' };
+    }
+    if (isOutcomeUnknownFailure(result)) {
+      // ENG-2931: the wrapper caught a transport failure (no response, timeout, 5xx); Meta may
+      // have applied it, so UNCONFIRMED — never a definite "did not apply" that invites a duplicate.
+      return {
+        success: false,
+        verification: 'UNCONFIRMED' as WriteVerification,
+        id: action === 'CREATE' ? null : (targetId(entity, args) ?? null),
+        message: `UNCONFIRMED: the ${action} ${entity} request failed without a definite answer from Meta (${errorText(result)}), so it may or may not have been applied. Do not report this as done and do not retry blindly — check the ${entity} first.`,
+      };
+    }
+    if (!result?.success || result?.blocked || result?.throttled) {
+      return {
+        status: 'FAILED', success: false, message: errorText(result),
+        ...(result?.retryAfterMs ? { retry_after_ms: result.retryAfterMs } : {}),
+      };
+    }
 
-  const id = action === 'CREATE' ? createdId : targetId(entity, args);
-  const readBack = id ? await deps.readBack(userId, accountId, entity, id).catch(() => null) : null;
-  const verification = verify(action, params, money.params, readBack);
-  const base = {
-    success: verification === 'CONFIRMED',
-    verification,
-    id: id ?? null,
-    status: readBack?.status ?? null,
-    effective_status: readBack?.effective_status ?? null,
-    meta_message: String(result.message ?? ''),
-  };
-  if (verification === 'CONFIRMED') {
-    return { ...base, message: `${action} ${entity} confirmed by read-back: id ${id}, status ${readBack!.status}${readBack!.effective_status ? ` (effective ${readBack!.effective_status})` : ''}.` };
-  }
-  if (verification === 'MISMATCH') {
-    return { ...base, message: `Meta accepted the ${action}, but the read-back does not match what was approved. Review ${entity} ${id} before doing anything else.` };
-  }
-  return {
-    ...base,
-    message: `UNCONFIRMED: Meta accepted the ${action} request${id ? ` (id ${id})` : ''}, but the read-back could not confirm it. Do not report this as done and do not retry blindly — check the ${entity} first.`,
-  };
+    const id = action === 'CREATE' ? createdId : targetId(entity, args);
+    const readBack = id ? await deps.readBack(userId, accountId, entity, id).catch(() => null) : null;
+    const verification = verify(action, params, money.params, readBack);
+    const base = {
+      success: verification === 'CONFIRMED',
+      verification,
+      id: id ?? null,
+      status: readBack?.status ?? null,
+      effective_status: readBack?.effective_status ?? null,
+      meta_message: String(result.message ?? ''),
+    };
+    if (verification === 'CONFIRMED') {
+      return { ...base, message: `${action} ${entity} confirmed by read-back: id ${id}, status ${readBack!.status}${readBack!.effective_status ? ` (effective ${readBack!.effective_status})` : ''}.` };
+    }
+    if (verification === 'MISMATCH') {
+      return { ...base, message: `Meta accepted the ${action}, but the read-back does not match what was approved. Review ${entity} ${id} before doing anything else.` };
+    }
+    return {
+      ...base,
+      message: `UNCONFIRMED: Meta accepted the ${action} request${id ? ` (id ${id})` : ''}, but the read-back could not confirm it. Do not report this as done and do not retry blindly — check the ${entity} first.`,
+    };
+  })();
+  return rememberTokenOutcome((deps.tokenOutcomes ??= new Map()), previewToken, outcome);
 }
 
 function verify(action: string, params: any, minor: any, readBack: Record<string, any> | null): WriteVerification {

@@ -34,6 +34,7 @@ import { getAccountsByUserIdIncludingOrgShared, type ConnectedAccount } from '..
 import { MetaToolkitRefusal } from './metaToolkitErrors';
 import { assertZomaWriteReady, ZomaNotReadyError } from './zomaOnboarding';
 import { assertAdsManagementGranted } from './metaToolkitWrites';
+import { isOutcomeUnknownFailure } from './zomaWriteGuard';
 
 export const CREATIVE_ASSET_ACTIONS = ['UPLOAD_IMAGE', 'UPLOAD_VIDEO', 'CREATE'] as const;
 export const ZOMA_UPLOAD_PREFIX = 'zoma-uploads';
@@ -407,6 +408,15 @@ export async function executeMetaToolkitCreative(userId: string, rawArgs: any, d
     };
   }
   const { result, createdId } = dispatched;
+  if (isOutcomeUnknownFailure(result)) {
+    // ENG-2931: the wrapper caught a transport failure; the creative may exist at Meta.
+    return {
+      success: false,
+      verification: 'UNCONFIRMED',
+      id: null,
+      message: `UNCONFIRMED: the creative request failed without a definite answer from Meta (${String(result?.error || result?.message)}), so it may or may not have been created. List the account's creatives before retrying.`,
+    };
+  }
   if (!result?.success || result?.blocked || result?.throttled) {
     return { success: false, status: 'FAILED', message: String(result?.error || result?.message || 'Meta did not create the creative.') };
   }

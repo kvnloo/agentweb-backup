@@ -56,6 +56,35 @@ export function consumePreviewToken(consumed: Map<string, number>, token: string
   return true;
 }
 
+/**
+ * ENG-2931: a provider wrapper that caught a transport failure (no response, timeout,
+ * connection reset, 5xx/408) returns a plain failure, but the write may still have been
+ * applied. Those are outcome-unknown, never a definite "did not apply".
+ */
+export function isOutcomeUnknownFailure(result: any): boolean {
+  if (!result || result.success) return false;
+  const code = Number(result.code ?? result.status_code);
+  if (Number.isFinite(code) && code > 0) return code >= 500 || code === 408;
+  const text = `${result.error ?? ''} ${result.message ?? ''}`;
+  return /no response was received|timed? ?out|ETIMEDOUT|ECONNRESET|ECONNABORTED|socket hang up|network error|EPIPE|EAI_AGAIN/i.test(text);
+}
+
+/**
+ * ENG-2931: outcome remembered per consumed preview token, so a client that lost the answer
+ * and repeats its confirm gets that outcome back instead of a bare "already used". In-process
+ * and TTL-bound like the consumed-token set (no durable store — data-plane gate).
+ */
+export function rememberTokenOutcome(outcomes: Map<string, { exp: number; outcome: any }>, token: string, outcome: any): any {
+  outcomes.set(token, { exp: Number(token.split('.')[1]), outcome });
+  return outcome;
+}
+
+export function replayTokenOutcome(outcomes: Map<string, { exp: number; outcome: any }>, token: string, now: number): any | null {
+  for (const [t, v] of outcomes) if (v.exp <= now) outcomes.delete(t);
+  const hit = outcomes.get(token);
+  return hit ? { ...hit.outcome, replayed: true, note: 'This preview_token was already confirmed; this is the outcome of that confirm. Nothing new was sent.' } : null;
+}
+
 /** The PREVIEW response every provider returns for an unconfirmed call. */
 export function previewResponse(params: { secret: string; userId: string; now: number; fingerprint: string; preview: string }) {
   const exp = params.now + PREVIEW_TOKEN_TTL_MS;

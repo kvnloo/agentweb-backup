@@ -30,8 +30,8 @@ function expectNotSuccess(r: any) {
 
 // ── Meta campaign / ad set / ad writes ───────────────────────────────────────
 
-type Failure = 'provider_error' | 'server_5xx' | 'timeout_throw' | 'missing_id' | 'readback_failure' | 'readback_mismatch';
-const FAILURES: Failure[] = ['provider_error', 'server_5xx', 'timeout_throw', 'missing_id', 'readback_failure', 'readback_mismatch'];
+type Failure = 'lost_answer' | 'provider_error' | 'server_5xx' | 'timeout_throw' | 'missing_id' | 'readback_failure' | 'readback_mismatch';
+const FAILURES: Failure[] = ['lost_answer', 'provider_error', 'server_5xx', 'timeout_throw', 'missing_id', 'readback_failure', 'readback_mismatch'];
 
 const META_CASES = [
   { name: 'CAMPAIGN CREATE', args: { entity_type: 'CAMPAIGN', action: 'CREATE', account_id: '111', params: { name: 'C', objective: 'OUTCOME_LEADS', daily_budget: 50 } }, good: { status: 'PAUSED', daily_budget: '5000' }, bad: { status: 'ACTIVE', daily_budget: '5000' } },
@@ -61,6 +61,8 @@ function metaDeps(failure: Failure | null, c: typeof META_CASES[number]) {
       if (failure === 'provider_error') return { result: { success: false, error: '(#100) Invalid parameter' } };
       if (failure === 'server_5xx') return { result: { success: false, error: 'Meta returned 500', code: 500 } };
       if (failure === 'timeout_throw') throw new Error('ETIMEDOUT');
+      // The agentModeService wrappers catch transport errors and return a plain failure (no code).
+      if (failure === 'lost_answer') return { result: { success: false, message: 'Meta request failed', error: 'The request was made but no response was received' } };
       if (failure === 'missing_id') return { result: { success: true, message: 'created successfully' }, createdId: undefined };
       return { result: { success: true, message: 'created successfully' }, createdId: '999' };
     }) as any,
@@ -106,6 +108,27 @@ describe('ENG-2931 Meta writes never report success on failed/unverified writes'
     expect(r).toMatchObject({ success: false, verification: 'UNCONFIRMED' });
     expect(r.message).toMatch(/do not retry blindly/i);
   });
+
+  it.each(META_CASES.map((c) => [c.name, c] as const))('%s: a wrapper-caught lost answer is UNCONFIRMED, not FAILED', async (_n, c) => {
+    const r: any = await metaConfirm(metaDeps('lost_answer', c), c.args);
+    expect(r).toMatchObject({ success: false, verification: 'UNCONFIRMED' });
+    expect(r.status).not.toBe('FAILED');
+  });
+
+  it('a definite Meta rejection stays FAILED', async () => {
+    const r: any = await metaConfirm(metaDeps('provider_error', META_CASES[0]), META_CASES[0].args);
+    expect(r).toMatchObject({ status: 'FAILED', success: false });
+  });
+
+  it('a repeat confirm with the same token replays the first outcome and sends nothing', async () => {
+    const deps = metaDeps('lost_answer', META_CASES[0]);
+    const args = META_CASES[0].args;
+    const p: any = await executeMetaToolkitWrite('u1', args, deps);
+    const first: any = await executeMetaToolkitWrite('u1', { ...args, confirm: true, preview_token: p.preview_token }, deps);
+    const again: any = await executeMetaToolkitWrite('u1', { ...args, confirm: true, preview_token: p.preview_token }, deps);
+    expect(again).toMatchObject({ verification: first.verification, message: first.message, replayed: true });
+    expect((deps.dispatch as jest.Mock).mock.calls).toHaveLength(1);
+  });
 });
 
 // ── Meta creative assets ─────────────────────────────────────────────────────
@@ -136,6 +159,7 @@ const CREATE = creative('CREATE', { image_hash: 'h', name: 'n', page_id: '42', b
 
 describe('ENG-2931 Meta creative writes never report success on failed/unverified writes', () => {
   const cases: Array<[string, any, Partial<MetaToolkitCreativeDeps>]> = [
+    ['CREATE × wrapper-caught lost answer', CREATE, { dispatch: jest.fn().mockResolvedValue({ result: { success: false, error: 'The request was made but no response was received' } }) }],
     ['CREATE × provider error', CREATE, { dispatch: jest.fn().mockResolvedValue({ result: { success: false, error: '(#100) bad' } }) }],
     ['CREATE × 5xx', CREATE, { dispatch: jest.fn().mockResolvedValue({ result: { success: false, error: '500', code: 500 } }) }],
     ['CREATE × timeout throw', CREATE, { dispatch: jest.fn().mockRejectedValue(new Error('ETIMEDOUT')) }],
@@ -153,6 +177,12 @@ describe('ENG-2931 Meta creative writes never report success on failed/unverifie
   it.each(cases)('%s', async (_n, args, over) => {
     const r: any = await executeMetaToolkitCreative('u1', args, creativeDeps(over));
     expectNotSuccess(r);
+  });
+
+  it('a wrapper-caught lost answer on CREATE is UNCONFIRMED with list-before-retry advice', async () => {
+    const r: any = await executeMetaToolkitCreative('u1', CREATE, creativeDeps({ dispatch: jest.fn().mockResolvedValue({ result: { success: false, error: 'The request was made but no response was received' } }) }));
+    expect(r).toMatchObject({ success: false, verification: 'UNCONFIRMED' });
+    expect(r.message).toMatch(/List the account's creatives/);
   });
 });
 
@@ -213,6 +243,7 @@ async function googleConfirm(deps: GoogleToolkitWriteDeps, args: any) {
 
 describe('ENG-2931 Google writes never report success on failed/unverified writes', () => {
   const rows = GOOGLE_CASES.flatMap((c) => FAILURES
+    .filter((f) => f !== 'lost_answer') // Meta-wrapper shape; Google's own outcomeUnknown path covers it
     .filter((f) => !(f === 'missing_id' && c.args.action === 'UPDATE'))
     .map((f) => [c.name, f, c] as const));
 
