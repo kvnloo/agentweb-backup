@@ -1422,8 +1422,11 @@ router.put("/generated/:id/update-files", editRateLimiter, async (req, res: Resp
     const repoName = repo.replace(".git", "");
     const repoFullName = `${owner}/${repoName}`;
 
-    const { files, commit_message, branch: rawBranch } = req.body;
+    const { files, commit_message, branch: rawBranch, expected_base_sha } = req.body;
     const branch: string = rawBranch || "main";
+    if (expected_base_sha !== undefined && (typeof expected_base_sha !== "string" || !/^[0-9a-f]{40}$/i.test(expected_base_sha))) {
+      return res.status(400).json({ error: "expected_base_sha must be a 40-character commit SHA" });
+    }
     if (!validateBranchName(branch)) {
       return res.status(400).json({ error: "Invalid branch name. Must be 'main' or 'draft/agentweb-preview'." });
     }
@@ -1469,7 +1472,8 @@ router.put("/generated/:id/update-files", editRateLimiter, async (req, res: Resp
       filesToCommit as any,
       commit_message,
       4,
-      branch
+      branch,
+      expected_base_sha
     );
 
     const isStaging = branch !== "main";
@@ -1491,6 +1495,14 @@ router.put("/generated/:id/update-files", editRateLimiter, async (req, res: Resp
   } catch (error: any) {
     const ghStatus = error.response?.status;
     const ghMessage = error.response?.data?.message || error.message;
+    // Matched by name (not instanceof) so route tests that mock v0Service keep working.
+    if (error?.name === "BaseShaConflictError") {
+      return res.status(409).json({
+        error: `Base SHA conflict: ${error.message} Nothing was written.`,
+        expected_base_sha: error.expectedSha,
+        actual_base_sha: error.actualSha,
+      });
+    }
     console.error(`[LP GENERATION] Error with update-files (HTTP ${ghStatus}):`, ghMessage);
     if (ghStatus === 401 || ghStatus === 403) {
       res.status(ghStatus).json({ error: `GitHub auth error: ${ghMessage}` });

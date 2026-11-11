@@ -305,6 +305,8 @@ read_brand_guidelines()
 - `brandData` — Object with fields to update (brandName, tagline, primaryColor, toneOfVoice, etc.)
 - `brandAssets` — Array of asset objects with `type`, `url`, `filename`
 
+**FOUNDERS:** omit `brandData.founders` unless you are changing founders. If you send it, send the COMPLETE list — any stored founder you leave out is removed (fields you omit are kept for founders matched by name). An empty founders array is ignored unless `clearAllFounders: true`.
+
 **Asset types:**
 - `logo` — Primary logo
 - `secondaryLogo` — Alternative logo

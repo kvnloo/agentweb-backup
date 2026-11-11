@@ -71,6 +71,40 @@
     }
   },
   {
+    "name": "create_knowledge_base_file",
+    "listed": false,
+    "description": "Create a plain-text or markdown file in one of your own knowledge bases (max 1048576 bytes, no binary). With kb_id, adds file_name to that knowledge base; without kb_id, creates a new private knowledge base named kb_name whose main file (knowledge-base.txt) holds the content. Returns the stored file key, size and sha256.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "kb_id": {
+          "type": "string",
+          "description": "Your knowledge base ID (from list_knowledge_bases). Omit to create a new knowledge base."
+        },
+        "kb_name": {
+          "type": "string",
+          "description": "Name for the new knowledge base (only when kb_id is omitted)"
+        },
+        "file_name": {
+          "type": "string",
+          "description": "File name ending in .txt, .md or .markdown (required with kb_id)"
+        },
+        "content": {
+          "type": "string",
+          "description": "File text"
+        }
+      },
+      "required": [
+        "content"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
     "name": "create_lead_list",
     "listed": false,
     "description": "Create, update, or delete a lead list. Use action: \"create\", \"get\", \"update\", or \"delete\".",
@@ -174,6 +208,37 @@
       },
       "required": [
         "template_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "delete_knowledge_base_file",
+    "listed": false,
+    "description": "Delete one uploaded or attached file from one of your own knowledge bases. The main knowledge-base.txt file cannot be deleted. Pass file_key when two files share a name. Returns confirmation that the file is gone.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "kb_id": {
+          "type": "string",
+          "description": "Your knowledge base ID (from list_knowledge_bases)"
+        },
+        "file_name": {
+          "type": "string",
+          "description": "File name to delete"
+        },
+        "file_key": {
+          "type": "string",
+          "description": "Stored file key (optional; disambiguates duplicate names)"
+        }
+      },
+      "required": [
+        "kb_id",
+        "file_name"
       ]
     },
     "sideEffect": "write",
@@ -1209,6 +1274,28 @@
     }
   },
   {
+    "name": "export_lead_list",
+    "listed": false,
+    "description": "Export every lead in one of your own CRM lead lists to a CSV file. Returns the export record (exportId, recordCount, filename, fileUrl). Requires editor access to the list; works only on lists your account can edit.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "list_id": {
+          "type": "string",
+          "description": "Lead list ID to export"
+        }
+      },
+      "required": [
+        "list_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
     "name": "freeze_user_account",
     "listed": false,
     "description": "Freeze (deactivate) or unfreeze (reactivate) a user account. Admin only. Use this to disable bot accounts or re-enable legitimate accounts.",
@@ -1407,6 +1494,30 @@
       ]
     },
     "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "get_conversion_summary",
+    "listed": false,
+    "description": "Aggregate lead/conversion counts for your own account over a date range (default: last 30 days, max 366 days): per landing page (unique leads and form-submission conversions), per lead list (leads added), and totals. Counts only — no lead details. Only your own lists and pages are included.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "start_date": {
+          "type": "string",
+          "description": "Inclusive start date, YYYY-MM-DD (UTC)"
+        },
+        "end_date": {
+          "type": "string",
+          "description": "Inclusive end date, YYYY-MM-DD (UTC). Default: today"
+        }
+      },
+      "required": []
+    },
+    "sideEffect": "read",
     "gating": {
       "internalOnly": false,
       "requiresUserAccount": false
@@ -1928,6 +2039,28 @@
       "required": []
     },
     "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "list_lead_list_exports",
+    "listed": false,
+    "description": "List past CSV exports (newest first, up to 50) for one of your own CRM lead lists.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "list_id": {
+          "type": "string",
+          "description": "Lead list ID"
+        }
+      },
+      "required": [
+        "list_id"
+      ]
+    },
+    "sideEffect": "read",
     "gating": {
       "internalOnly": false,
       "requiresUserAccount": false
@@ -3625,6 +3758,38 @@
     }
   },
   {
+    "name": "update_knowledge_base_file_content",
+    "listed": false,
+    "description": "Replace the full content of an existing text or markdown file in one of your own knowledge bases (max 1048576 bytes, no binary). Returns the stored file key, size and sha256.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "kb_id": {
+          "type": "string",
+          "description": "Your knowledge base ID (from list_knowledge_bases)"
+        },
+        "file_name": {
+          "type": "string",
+          "description": "Existing file name (e.g. knowledge-base.txt)"
+        },
+        "content": {
+          "type": "string",
+          "description": "New file text (replaces the old content)"
+        }
+      },
+      "required": [
+        "kb_id",
+        "file_name",
+        "content"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
     "name": "update_landing_page_context",
     "listed": false,
     "description": "Save or update the context field on a landing page — a plain-text description of when to use it, its tone, and target audience. Use this whenever the user provides notes about a landing page (e.g. \"this is for cold outreach targeting SaaS founders\"). Keep it concise (max 500 characters). The context is shown in the UI and used by the agent to pick the best matching page for CTAs.",
@@ -3644,6 +3809,87 @@
         "page_id",
         "context"
       ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "update_landing_page_files",
+    "listed": false,
+    "description": "ENG-2896: commit up to 20 files to one of your landing pages in ONE atomic commit on the draft/preview branch (draft/agentweb-preview by default; main is rejected — publish with publish_landing_page_changes). Pass expected_base_sha (from a prior read) to fail with a conflict and write nothing if the branch moved. Returns the new commit SHA.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "page_id": {
+          "type": "string",
+          "description": "The landing page ID"
+        },
+        "files": {
+          "type": "array",
+          "maxItems": 20,
+          "description": "Files to write (max 20). Each: { path, content }.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "Repo path, e.g. \"src/app/page.tsx\""
+              },
+              "content": {
+                "type": "string",
+                "description": "Full new file content"
+              }
+            },
+            "required": [
+              "path",
+              "content"
+            ]
+          }
+        },
+        "commit_message": {
+          "type": "string",
+          "description": "Commit message (optional)"
+        },
+        "branch": {
+          "type": "string",
+          "description": "Target branch. Defaults to \"draft/agentweb-preview\". \"main\" is rejected."
+        },
+        "expected_base_sha": {
+          "type": "string",
+          "description": "Optional 40-char SHA the branch head must equal; otherwise the call fails with a conflict and writes nothing."
+        }
+      },
+      "required": [
+        "page_id",
+        "files"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "update_sender_settings",
+    "listed": false,
+    "description": "Set your own default CRM email sender and/or default LinkedIn sender account. default_sender_id must be one of your configured senders (see list_sender_settings); default_linkedin_account_id must be a LinkedIn (unipile) account you own (see list_connected_accounts). Does not change sequences or their activation. Returns the resulting settings as list_sender_settings shows them.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "default_sender_id": {
+          "type": "string",
+          "description": "Sender id from list_sender_settings.senders[].id"
+        },
+        "default_linkedin_account_id": {
+          "type": "string",
+          "description": "Your own LinkedIn (unipile) connected account_id"
+        }
+      },
+      "required": []
     },
     "sideEffect": "write",
     "gating": {

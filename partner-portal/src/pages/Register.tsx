@@ -42,8 +42,11 @@ export default function Register() {
     try {
       await register(email, password);
       navigate('/tasks');
-    } catch (err) {
-      setError('Failed to create an account');
+    } catch (err: any) {
+      // ENG-2899: surface the server's actionable message for uniqueness
+      // conflicts (409 email_unavailable); keep the generic text otherwise.
+      const serverMessage = err?.response?.status === 409 ? err?.response?.data?.message : undefined;
+      setError(typeof serverMessage === 'string' && serverMessage ? serverMessage : 'Failed to create an account');
     }
   };
 
